@@ -1,0 +1,18 @@
+changelog:
+  categories:
+    - title: "🚀 Features"
+      labels:
+        - "enhancement"
+        - "feature"
+    - title: "🐛 Bug Fixes"
+      labels:
+        - "fix"
+        - "bug"
+    - title: "📚 Documentation"
+      labels:
+        - "documentation"
+    - title: "🧰 Maintenance & Dependencies"
+      labels:
+        - "dependencies"
+        - "test"
+        - "coverage"

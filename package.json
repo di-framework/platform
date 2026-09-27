@@ -1,0 +1,29 @@
+{
+  "name": "di-framework-platform",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "(MIT OR Apache-2.0)",
+  "author": "@di-framework Contributors",
+  "repository": "https://github.com/di-framework/platform",
+  "workspaces": [
+    "platform/*",
+    "adapters/*"
+  ],
+  "scripts": {
+    "postinstall": "git config core.hooksPath .githooks",
+    "test": "bun test",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "typecheck": "bun x tsc --noEmit"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.13",
+    "@types/bun": "latest",
+    "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

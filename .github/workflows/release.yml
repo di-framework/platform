@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Test
+        run: bun test --coverage
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.x"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Ensure modern npm for OIDC trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Publish public workspace packages
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          echo "Stub tree: workspace packages are private. Extract issues publish 6.0.0 via this workflow (release.yml) after npm trusted publishing is configured."
+
+      - name: Create GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --generate-notes
+            echo "Created GitHub Release $TAG"
+          else
+            echo "GitHub Release $TAG already exists"
+          fi

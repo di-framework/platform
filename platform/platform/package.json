@@ -1,0 +1,16 @@
+{
+  "name": "@di-framework/platform",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "(MIT OR Apache-2.0)",
+  "description": "Stub. Source lands in the v6 extract.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/di-framework/platform",
+    "directory": "platform/platform"
+  },
+  "scripts": {
+    "test": "bun test"
+  }
+}

@@ -1,0 +1,29 @@
+#!/bin/sh
+set -e
+
+echo "[pre-push] Running tests with coverage..."
+cov_log="$(mktemp -t di-framework-pre-push-cov.XXXXXX)"
+cleanup() {
+  rm -f "$cov_log"
+}
+trap cleanup EXIT
+
+if ! bun test --coverage --timeout 60000 >"$cov_log" 2>&1; then
+  echo >&2
+  echo "[pre-push] FAILED: the test/coverage command returned a non-zero exit status." >&2
+  tail -n 120 "$cov_log" >&2 || true
+  echo "[pre-push] Reproduce with: bun test --coverage" >&2
+  exit 1
+fi
+
+if [ -f scripts/check-line-coverage.ts ]; then
+  echo "[pre-push] Checking every reported source file for 100% line coverage..."
+  if ! bun scripts/check-line-coverage.ts; then
+    echo >&2
+    echo "[pre-push] FAILED: one or more source files are below 100% line coverage." >&2
+    echo "[pre-push] Reproduce with: bun test --coverage && bun scripts/check-line-coverage.ts" >&2
+    exit 1
+  fi
+fi
+
+echo "[pre-push] Passed: tests and coverage checks succeeded."
