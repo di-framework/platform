@@ -27,6 +27,11 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .cache
 *.tsbuildinfo
 
+# local Pulumi stack for the backup prototype
+platform/backup-destination/prototype/.pulumi
+platform/backup-destination/prototype/Pulumi.*.yaml
+platform/backup-destination/prototype/node_modules
+
 # IntelliJ based IDEs
 .idea
 

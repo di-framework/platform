@@ -403,6 +403,17 @@ describe('tenant RBAC, quotas, admission policies, and network isolation', () =>
     expect(
       backendNet.spec.ingress[0]?.from[0]?.podSelector?.matchLabels['wasmcloud.com/name'],
     ).toBe('hostgroup');
+    expect(
+      backendNet.spec.ingress[1]?.from[0]?.podSelector?.matchLabels[`${GROUP}/component`],
+    ).toBe('backup-agent');
+    const tenantNet = resources.find(
+      (r) =>
+        r.kind === 'NetworkPolicy' &&
+        r.metadata.name === 'di-tenant-network' &&
+        r.metadata.namespace?.includes('runtime'),
+    );
+    expect(JSON.stringify(tenantNet)).toContain('backup-agent');
+    expect(JSON.stringify(tenantNet)).toContain('backup-operator');
     const redis = resources.find((r) => r.kind === 'Deployment' && r.metadata.name === 'di-redis');
     expect(JSON.stringify(redis)).toContain(`"${GROUP}/component":"backing-service"`);
     const runtimeDev = resources.find(

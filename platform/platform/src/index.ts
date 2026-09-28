@@ -216,5 +216,13 @@ export function createPlatform(args: PlatformArgs) {
     })),
   );
 
-  return { namespace: namespaceResource.metadata.name, tenants, users, release: wasmcloud };
+  return {
+    namespace: namespaceResource.metadata.name,
+    tenants,
+    users,
+    release: wasmcloud,
+    // Tenant custom resources wait for Ready. Callers that install into
+    // di-tenant-* depend on these and do not create the namespaces.
+    tenantResources: tenancy.tenants,
+  };
 }

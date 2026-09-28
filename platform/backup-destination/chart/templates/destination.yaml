@@ -1,0 +1,45 @@
+{{- $secret := .Values.existingSecret -}}
+{{- if and (not $secret) .Values.accessKeyId .Values.secretAccessKey -}}
+{{- $secret = "di-backup-s3" -}}
+{{- end -}}
+{{- if not .Values.bucket -}}
+{{- fail "bucket is required" -}}
+{{- end -}}
+{{- if not $secret -}}
+{{- fail "existingSecret is required (demo accessKeyId and secretAccessKey are not for shared tenants)" -}}
+{{- end -}}
+apiVersion: platform.di-framework.dev/v1alpha1
+kind: BackupDestination
+metadata:
+  name: default
+  namespace: {{ .Release.Namespace }}
+spec:
+  bucket: {{ .Values.bucket | quote }}
+  {{- if .Values.prefix }}
+  prefix: {{ .Values.prefix | quote }}
+  {{- end }}
+  region: {{ .Values.region | quote }}
+  {{- if .Values.endpoint }}
+  endpoint: {{ .Values.endpoint | quote }}
+  {{- end }}
+  credentialsSecretRef:
+    name: {{ $secret | quote }}
+  schedule: {{ .Values.schedule | quote }}
+  retention:
+    successful: {{ .Values.retentionSuccessful }}
+  {{- if .Values.extraEgress }}
+  extraEgress:
+    {{- toYaml .Values.extraEgress | nindent 4 }}
+  {{- end }}
+{{- if and (not .Values.existingSecret) .Values.accessKeyId .Values.secretAccessKey }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: di-backup-s3
+  namespace: {{ .Release.Namespace }}
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: {{ .Values.accessKeyId | quote }}
+  AWS_SECRET_ACCESS_KEY: {{ .Values.secretAccessKey | quote }}
+{{- end }}
