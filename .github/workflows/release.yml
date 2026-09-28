@@ -62,7 +62,7 @@ jobs:
               echo "Skipping $name@$version (already published)"
               continue
             fi
-            if node -e 'const p=require(process.argv[1]); process.exit(p.scripts && p.scripts.build ? 0 : 1)' "$pkg/package.json"; then
+            if node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); process.exit(p.scripts && p.scripts.build ? 0 : 1)' "$pkg/package.json"; then
               echo "Building $name from $pkg"
               (cd "$pkg" && bun run build)
             fi
