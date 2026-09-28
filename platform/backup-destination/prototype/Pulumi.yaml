@@ -1,0 +1,6 @@
+name: di-framework-backup
+runtime:
+  name: nodejs
+  options:
+    typescript: true
+description: Tenant backups on a v6 platform cluster. The Helm release provider installs the chart into the tenant namespace wasmCloud created.

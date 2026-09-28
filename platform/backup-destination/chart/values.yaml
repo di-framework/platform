@@ -1,0 +1,20 @@
+image:
+  repository: di-framework/backup-destination
+  tag: dev
+  pullPolicy: IfNotPresent
+agentImage: di-framework/backup-agent:dev
+bucket: ""
+prefix: ""
+region: us-east-1
+endpoint: ""
+schedule: "0 2 * * *"
+retentionSuccessful: 14
+existingSecret: ""
+accessKeyId: ""
+secretAccessKey: ""
+extraEgress: []
+apiEgress:
+  - cidr: 10.43.0.0/16
+    port: 443
+  - cidr: 172.16.0.0/12
+    port: 6443

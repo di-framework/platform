@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "license": "(MIT OR Apache-2.0)",
-  "description": "Stub. Source lands in the v6 extract.",
+  "description": "Helm chart and operator that back up wasmCloud tenant backing services.",
   "repository": {
     "type": "git",
     "url": "https://github.com/di-framework/platform",
@@ -12,5 +12,9 @@
   },
   "scripts": {
     "test": "bun test"
+  },
+  "dependencies": {
+    "@pulumi/kubernetes": "4.34.0",
+    "@pulumi/pulumi": "3.261.0"
   }
 }

@@ -352,7 +352,7 @@ function tenantResources(
               {
                 key: `${GROUP}/component`,
                 operator: 'NotIn',
-                values: ['backing-service'],
+                values: ['backing-service', 'backup-agent', 'backup-operator'],
               },
             ],
           },
@@ -422,9 +422,8 @@ function tenantResources(
         },
       }),
     );
-  // Backend pods (stock Redis/NATS and future di-bs-* from #450) accept ingress only from
-  // the tenant hostgroup. Developers retain pods/portforward on runtime Roles — that is a
-  // deliberate within-tenant caveat, not network-policy isolation from the tenant developer.
+  // Backend pods accept ingress from the tenant hostgroup and from backup-agent Jobs in
+  // the same runtime namespace. Developers retain pods/portforward on runtime Roles.
   result.push(
     make('networking.k8s.io/v1', 'NetworkPolicy', 'di-bs-backend-network', n.runtimeNamespace, {
       spec: {
@@ -441,6 +440,21 @@ function tenantResources(
                 },
                 podSelector: { matchLabels: { 'wasmcloud.com/name': 'hostgroup' } },
               },
+            ],
+          },
+          {
+            from: [
+              {
+                namespaceSelector: {
+                  matchLabels: { 'kubernetes.io/metadata.name': n.runtimeNamespace },
+                },
+                podSelector: { matchLabels: { [`${GROUP}/component`]: 'backup-agent' } },
+              },
+            ],
+            ports: [
+              { protocol: 'TCP', port: 5432 },
+              { protocol: 'TCP', port: 6379 },
+              { protocol: 'TCP', port: 4222 },
             ],
           },
         ],

@@ -13,8 +13,8 @@ First publish from this remote is **6.0.0**.
 | [`platform/platform`](platform/platform/README.md) | `@di-framework/platform` | Cluster install: Pulumi, CRDs, controller, tenancy, backing services |
 | [`platform/bindings`](platform/bindings/README.md) | `@di-framework/bindings` | Application guest bindings and workload metadata |
 | [`platform/sqlite-component`](platform/sqlite-component/README.md) | `@di-framework/sqlite-component` | `di-framework:sqlite@0.1.0` provider component |
-| [`platform/backup-agent`](platform/backup-agent/README.md) | `@di-framework/backup-agent` | Stub until the backup operator ships |
-| [`platform/backup-destination`](platform/backup-destination/README.md) | `@di-framework/backup-destination` | Stub |
+| [`platform/backup-agent`](platform/backup-agent/README.md) | `@di-framework/backup-agent` | Job image that dumps and restores backing services |
+| [`platform/backup-destination`](platform/backup-destination/README.md) | `@di-framework/backup-destination` | Tenant-namespace Helm operator and HTML console |
 | [`adapters/cloudfoundry`](adapters/cloudfoundry/README.md) | `@di-framework/cloudfoundry` | `VCAP_SERVICES` and `VCAP_APPLICATION` discovery |
 
 ## Develop
