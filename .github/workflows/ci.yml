@@ -33,5 +33,8 @@ jobs:
       - name: Lint
         run: bun run lint
 
+      - name: Dry-run package publish
+        run: bun scripts/publish-workspace.ts --dry-run
+
       - name: Test
         run: bun test --coverage
