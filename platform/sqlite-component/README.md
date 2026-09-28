@@ -172,7 +172,7 @@ that `PRAGMA journal_mode` really returns `delete` and that no `-wal` or stale
 ## Consuming from the JS component
 
 1. **WIT**: copy `wit/world.wit` to
-   `cli-extensions/packages/di-framework-cli-plugin-platform/assets/wit/deps/di-framework-sqlite/package.wit`
+   `cli-extensions/packages/cli-plugin-platform/assets/wit/deps/di-framework-sqlite/package.wit`
    and add `import di-framework:sqlite/database@0.1.0;` to the generated guest
    world (`sqliteProjectRequirements()` in `src/wit.ts` does this).
 2. **JS**: `componentize-qjs`/jco expose the import as an ES module:
@@ -210,7 +210,7 @@ that `PRAGMA journal_mode` really returns `delete` and that no `-wal` or stale
 4. **Ship the artifact**: the plugin package build runs `make publish-asset`,
    which builds the provider from source and copies the WASM, recovered WIT,
    build metadata, and checksums into
-   `cli-extensions/packages/di-framework-cli-plugin-platform/dist/assets/sqlite/`. These generated
+   `cli-extensions/packages/cli-plugin-platform/dist/assets/sqlite/`. These generated
    files ship in the npm package and are ignored by Git. No prebuilt provider is
    checked into the source tree.
 
