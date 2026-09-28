@@ -1,0 +1,41 @@
+[package]
+name = "di-framework-sqlite-component"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+description = "di-framework:sqlite@0.1.0 WebAssembly component: bundled SQLite over the WASI filesystem (rollback journal, no WAL, single writer)."
+repository = "https://github.com/di-framework/di-framework"
+publish = false
+
+[workspace]
+members = ["tests/smoke-consumer"]
+
+[lib]
+name = "di_framework_sqlite"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pinned exactly. Bump deliberately and re-run `make build smoke` (see README).
+wit-bindgen = { version = "=0.61.1", default-features = false, features = ["macros"] }
+# `bundled` compiles the SQLite amalgamation (3.53.2) with wasi-sdk clang.
+# The crate's own `wasm32-wasi-vfs` feature is deliberately NOT enabled: its
+# demovfs copy swallows every PRAGMA (xFileControl returns OK) and has a no-op
+# xTruncate. We ship a corrected VFS in csrc/wasi-vfs.c instead (see build.rs).
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+# Transitive, but pinned here too so the SQLite amalgamation version is fixed
+# independently of rusqlite's semver range.
+libsqlite3-sys = { version = "=0.38.2", default-features = false, features = ["bundled"] }
+
+[build-dependencies]
+cc = "=1.4.5"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+
+[profile.dev]
+panic = "abort"

@@ -1,16 +1,55 @@
 {
   "name": "@di-framework/cloudfoundry",
-  "version": "0.0.0",
-  "private": true,
+  "version": "6.0.0",
+  "description": "Cloud Foundry connector for VCAP_SERVICES discovery, application metadata, and automated DI binding.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "module": "./dist/index.js",
   "type": "module",
   "license": "(MIT OR Apache-2.0)",
-  "description": "Stub. Source lands in the v6 extract.",
+  "author": "@di-framework Contributors",
   "repository": {
     "type": "git",
     "url": "https://github.com/di-framework/platform",
     "directory": "adapters/cloudfoundry"
   },
+  "bugs": {
+    "url": "https://github.com/di-framework/platform/issues"
+  },
+  "homepage": "https://github.com/di-framework/platform",
+  "keywords": [
+    "cloudfoundry",
+    "vcap",
+    "vcap_services",
+    "vcap_application",
+    "tanzu",
+    "spring-cloud-connectors",
+    "dependency-injection",
+    "decorators",
+    "connectors"
+  ],
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "build": "rm -rf dist && bun x tsc -p tsconfig.build.json"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "bun": "./dist/index.js",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "peerDependencies": {
+    "@di-framework/core": "^5",
+    "typescript": "^5"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "devDependencies": {
+    "@di-framework/core": "^5",
+    "@types/bun": "latest"
   }
 }

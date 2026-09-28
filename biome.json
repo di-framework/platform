@@ -7,7 +7,19 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "includes": ["**", "!**/dist", "!**/coverage", "!**/node_modules", "!**/*.d.ts", "!bun.lock"]
+    "includes": [
+      "**",
+      "!**/dist",
+      "!**/coverage",
+      "!**/node_modules",
+      "!**/*.d.ts",
+      "!bun.lock",
+      "!**/target",
+      "!**/.tools",
+      "!**/*.rs",
+      "!**/*.wit",
+      "!**/*.c"
+    ]
   },
   "formatter": {
     "enabled": true,

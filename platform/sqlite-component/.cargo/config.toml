@@ -1,0 +1,33 @@
+# Build configuration for the di-framework:sqlite component.
+#
+# Everything here can be overridden from the environment; values in `[env]`
+# only apply when the variable is not already set (no `force = true`).
+# `scripts/build.sh` sets the same variables explicitly from
+# `scripts/tool-versions.env`, so `make build` and a plain `cargo build
+# --release` produce the same artifact.
+
+[build]
+target = "wasm32-wasip2"
+
+[env]
+# C toolchain used by the `cc` crate to compile the SQLite amalgamation and
+# the WASI VFS shim (`libsqlite3-sys/sqlite3/wasm32-wasi-vfs.c`). Paths are
+# relative to this package directory and point at the pinned wasi-sdk that
+# `scripts/install-tools.sh` unpacks into `.tools/`.
+CC_wasm32_wasip2 = { value = ".tools/wasi-sdk/bin/clang", relative = true }
+AR_wasm32_wasip2 = { value = ".tools/wasi-sdk/bin/llvm-ar", relative = true }
+CFLAGS_wasm32_wasip2 = "--target=wasm32-wasip2 -Os"
+
+# Extra SQLite compile-time options (consumed by libsqlite3-sys' build.rs on
+# top of its own wasi flags: THREADSAFE=0, _WASI_EMULATED_*, LONGDOUBLE=double).
+#
+#  SQLITE_OS_OTHER=1        use csrc/wasi-vfs.c's sqlite3_os_init() instead of os_unix.c
+#  SQLITE_TEMP_STORE=3      temp tables/indices/sorters live in memory; the VFS has no temp files
+#  SQLITE_STMTJRNL_SPILL=-1 statement journals never spill to a temp file
+#  SQLITE_OMIT_WAL          WAL needs file locks + shared memory; neither exists on WASI
+#  SQLITE_OMIT_LOAD_EXTENSION  no dlopen inside a component
+#  SQLITE_DEFAULT_SYNCHRONOUS=2   FULL: fsync journal and db on every commit
+#  SQLITE_MAX_MMAP_SIZE=0   remove mmap code paths entirely
+#  SQLITE_OMIT_SHARED_CACHE one connection per file; shared-cache locking is meaningless here
+#  SQLITE_DEFAULT_MEMSTATUS=0  skip the global memory-statistics mutex bookkeeping
+LIBSQLITE3_FLAGS = "-DSQLITE_OS_OTHER=1 -DSQLITE_TEMP_STORE=3 -DSQLITE_STMTJRNL_SPILL=-1 -DSQLITE_OMIT_WAL -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DEFAULT_SYNCHRONOUS=2 -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_DEFAULT_MEMSTATUS=0"

@@ -1,0 +1,13 @@
+[package]
+name = "sqlite-smoke-consumer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Tiny wasip2 command component that imports di-framework:sqlite/database; composed with the provider via `wac plug` and run under wasmtime by `make smoke`."
+
+[[bin]]
+name = "sqlite-smoke-consumer"
+path = "src/main.rs"
+
+[dependencies]
+wit-bindgen = { version = "=0.61.1", default-features = false, features = ["macros"] }

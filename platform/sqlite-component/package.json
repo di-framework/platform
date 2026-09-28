@@ -1,16 +1,28 @@
 {
   "name": "@di-framework/sqlite-component",
-  "version": "0.0.0",
-  "private": true,
-  "type": "module",
+  "version": "6.0.0",
+  "private": false,
+  "description": "SQLite WebAssembly component (di-framework:sqlite@0.1.0) for platform guests.",
   "license": "(MIT OR Apache-2.0)",
-  "description": "Stub. Source lands in the v6 extract.",
+  "author": "@di-framework Contributors",
   "repository": {
     "type": "git",
     "url": "https://github.com/di-framework/platform",
     "directory": "platform/sqlite-component"
   },
+  "bugs": {
+    "url": "https://github.com/di-framework/platform/issues"
+  },
+  "homepage": "https://github.com/di-framework/platform",
+  "files": [
+    "dist",
+    "README.md",
+    "wit"
+  ],
   "scripts": {
-    "test": "bun test"
+    "build": "make build",
+    "test": "bun test",
+    "smoke": "make smoke",
+    "publish-asset": "make publish-asset"
   }
 }

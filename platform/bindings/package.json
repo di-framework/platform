@@ -1,16 +1,54 @@
 {
   "name": "@di-framework/bindings",
-  "version": "0.0.0",
-  "private": true,
+  "version": "6.0.0",
+  "description": "Native platform WIT service bindings for DI Framework applications.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "module": "./dist/index.js",
   "type": "module",
   "license": "(MIT OR Apache-2.0)",
-  "description": "Stub. Source lands in the v6 extract.",
+  "author": "@di-framework Contributors",
   "repository": {
     "type": "git",
     "url": "https://github.com/di-framework/platform",
     "directory": "platform/bindings"
   },
+  "bugs": {
+    "url": "https://github.com/di-framework/platform/issues"
+  },
+  "homepage": "https://github.com/di-framework/platform",
+  "keywords": [
+    "wasmcloud",
+    "wasi",
+    "wit",
+    "webassembly",
+    "dependency-injection",
+    "decorators"
+  ],
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "build": "rm -rf dist && bun x tsc -p tsconfig.build.json && bun ../../scripts/fix-esm-imports.ts dist"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "bun": "./dist/index.js",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./catalog.json": "./catalog.json"
+  },
+  "peerDependencies": {
+    "@di-framework/core": "^5",
+    "typescript": "^5"
+  },
+  "files": [
+    "dist",
+    "catalog.json",
+    "README.md"
+  ],
+  "devDependencies": {
+    "@di-framework/core": "^5",
+    "@types/bun": "latest"
   }
 }

@@ -1,0 +1,211 @@
+package di-framework:sqlite@0.1.0;
+
+/// Types shared by the `database` interface.
+///
+/// Kept in a separate interface (mirroring `wasmcloud:postgres/types`) so that
+/// values and errors unify when a consumer and a provider are composed with
+/// WAC, and so a future `prepared` or `async` interface can reuse them.
+interface types {
+  /// A structured error reported by SQLite itself.
+  record sqlite-error {
+    /// Primary SQLite result code (e.g. `19` = SQLITE_CONSTRAINT).
+    code: s32,
+    /// Extended result code (e.g. `2067` = SQLITE_CONSTRAINT_UNIQUE).
+    /// Equal to `code` when SQLite provides no extended information.
+    extended-code: s32,
+    /// Human-readable message from `sqlite3_errmsg`.
+    message: string,
+  }
+
+  /// Errors raised by functions in this package. Intentionally non-exhaustive:
+  /// consumers must keep a catch-all arm.
+  variant error {
+    /// The database file could not be opened or created. The guest path must
+    /// live under a directory the host has preopened (a mounted volume).
+    open-failed(string),
+    /// The connection has been closed with `close` and cannot be used again.
+    closed,
+    /// The statement could not be prepared: syntax error, unknown table or
+    /// column, or more than one statement passed to `run`/`query`/`first`.
+    invalid-sql(string),
+    /// Wrong number of parameters or a value that could not be bound.
+    invalid-params(string),
+    /// SQLite failed while executing a prepared statement (constraint
+    /// violation, read-only database, I/O error, ...). Branch on
+    /// `sqlite-error.code` / `extended-code` for machine-readable handling.
+    execution-failed(sqlite-error),
+    /// A column value could not be converted into a `value` (e.g. TEXT that is
+    /// not valid UTF-8).
+    value-conversion-failed(string),
+    /// The database file is locked or busy after the configured busy timeout.
+    /// With the WASI VFS this can only arise from another connection *inside
+    /// the same component instance*; the VFS does not perform file locking.
+    busy,
+    /// `begin`, `commit`, `rollback` (or a savepoint call) was issued in a
+    /// state that does not permit it (e.g. `commit` with no open transaction).
+    invalid-transaction-state(string),
+    /// Any other implementation-specific failure.
+    other(string),
+  }
+
+  /// A dynamically-typed SQLite value, used for parameters and results.
+  variant value {
+    null,
+    integer(s64),
+    real(f64),
+    text(string),
+    blob(list<u8>),
+  }
+
+  /// A result row: `(column-name, value)` pairs in column order. Column names
+  /// are repeated per row on purpose: result sets in the framework (actor
+  /// state, queue jobs, migration bookkeeping) are small and JS consumers turn
+  /// each row straight into an object.
+  type row = list<tuple<string, value>>;
+
+  /// `PRAGMA synchronous` level. `full` is the default and is what the
+  /// framework expects for durable actor / queue state; `normal` trades a
+  /// small durability window (power loss mid-commit) for fewer fsyncs. `off`
+  /// exists for tests only.
+  enum sync-mode {
+    off,
+    normal,
+    full,
+  }
+
+  /// Rollback-journal mode. WAL is intentionally not offered: the WASI VFS
+  /// has neither file locking nor shared memory, both of which WAL needs, and
+  /// SQLite is compiled with `SQLITE_OMIT_WAL`. `delete` is the default and
+  /// the safest choice on WASI preopens (the journal is unlinked after every
+  /// commit); `persist` keeps the journal file and zeroes its header; `memory`
+  /// is for tests only. TRUNCATE is deliberately left out of the surface.
+  enum journal-mode {
+    delete,
+    persist,
+    memory,
+  }
+
+  /// How `begin` acquires its lock. Maps to `BEGIN DEFERRED|IMMEDIATE|EXCLUSIVE`.
+  enum transaction-behavior {
+    deferred,
+    immediate,
+    exclusive,
+  }
+
+  /// Options accepted by `open`. Every field is optional; `none` means the
+  /// documented default.
+  record open-options {
+    /// Create the database file if it does not exist. Default: true.
+    create: option<bool>,
+    /// Open read-only. Default: false.
+    read-only: option<bool>,
+    /// `PRAGMA synchronous`. Default: `full`.
+    synchronous: option<sync-mode>,
+    /// `PRAGMA journal_mode`. Default: `delete`.
+    journal-mode: option<journal-mode>,
+    /// `PRAGMA busy_timeout` in milliseconds. Default: 5000.
+    busy-timeout-ms: option<u32>,
+    /// `PRAGMA foreign_keys`. Default: true.
+    foreign-keys: option<bool>,
+  }
+}
+
+/// Synchronous, single-writer SQLite access backed by the WASI filesystem.
+///
+/// The implementer of this interface is the `di-framework:sqlite` Rust
+/// component. It bundles SQLite (amalgamation) with a minimal WASI VFS: no
+/// file locking, no mmap, no WAL, in-memory temp store. Consequently exactly
+/// one component instance may own a given database file at a time; the
+/// framework enforces `replicas: 1` for actor workloads for this reason.
+///
+/// Paths are guest paths. The host mounts a volume at `mountPath` and the same
+/// string is the guest-visible directory (a WASI preopen), e.g.
+/// `/data/actors/orders/order-42.sqlite`.
+interface database {
+  use types.{error, value, row, open-options, transaction-behavior};
+
+  /// Open (and by default create) the database at `path`, applying the
+  /// pragmas described in `open-options` (rollback journal, `synchronous=FULL`,
+  /// `foreign_keys=ON`, 5 s busy timeout when `options` is `none`). Use
+  /// `:memory:` for an in-memory database.
+  open: func(path: string, options: option<open-options>) -> result<connection, error>;
+
+  /// The bundled SQLite library version, e.g. `3.53.2`.
+  sqlite-version: func() -> string;
+
+  /// An open SQLite connection. Dropping the resource closes it; an open
+  /// transaction is rolled back by SQLite in that case.
+  resource connection {
+    /// Execute one or more `;`-separated statements without parameters and
+    /// discard any results. Intended for DDL / migrations / pragmas. Untrusted
+    /// input must never be interpolated into `sql`.
+    exec: func(sql: string) -> result<_, error>;
+
+    /// Execute a single parameterized statement and return the number of rows
+    /// changed (`sqlite3_changes`). Parameters bind positionally to `?`/`?NNN`.
+    /// Statements that return rows (e.g. `INSERT ... RETURNING`) run to
+    /// completion; their rows are discarded.
+    run: func(sql: string, params: list<value>) -> result<u64, error>;
+
+    /// Execute a single parameterized statement and return all rows.
+    query: func(sql: string, params: list<value>) -> result<list<row>, error>;
+
+    /// Execute a single parameterized statement and return only the first row,
+    /// or `none` when the statement produced no rows.
+    first: func(sql: string, params: list<value>) -> result<option<row>, error>;
+
+    /// `BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE]`. Default: `immediate`, which is
+    /// the right choice for a single-writer file with no lock arbitration.
+    /// Fails with `invalid-transaction-state` if a transaction is already open;
+    /// nest with `savepoint` instead.
+    begin: func(behavior: option<transaction-behavior>) -> result<_, error>;
+
+    /// `COMMIT` the open transaction.
+    commit: func() -> result<_, error>;
+
+    /// `ROLLBACK` the open transaction.
+    rollback: func() -> result<_, error>;
+
+    /// `SAVEPOINT <name>`; usable for nested transactions. `name` must match
+    /// `[A-Za-z_][A-Za-z0-9_]*`.
+    savepoint: func(name: string) -> result<_, error>;
+
+    /// `RELEASE SAVEPOINT <name>`.
+    release-savepoint: func(name: string) -> result<_, error>;
+
+    /// `ROLLBACK TO SAVEPOINT <name>` followed by `RELEASE`, so the savepoint
+    /// is fully unwound.
+    rollback-to-savepoint: func(name: string) -> result<_, error>;
+
+    /// True while a transaction (or savepoint) is open on this connection.
+    in-transaction: func() -> bool;
+
+    /// Rows changed by the most recent `run`/`exec`.
+    changes: func() -> u64;
+
+    /// `sqlite3_last_insert_rowid`.
+    last-insert-rowid: func() -> s64;
+
+    /// Explicitly close the connection. Subsequent calls fail with `closed`.
+    close: func() -> result<_, error>;
+  }
+}
+
+/// The world implemented by the Rust component. WASI imports (filesystem,
+/// clocks, cli, io) are pulled in by the Rust `wasm32-wasip2` target and
+/// therefore do not need to be listed here. `types` is exported explicitly so
+/// the component is self-contained: without it WIT elaboration would turn the
+/// `use types.{...}` into an *import* of `types`, which `wac plug` could not
+/// satisfy from this component.
+world sqlite-provider {
+  export types;
+  export database;
+}
+
+/// The world a consumer (e.g. the componentize-qjs JS component) targets when
+/// it wants a SQLite database. `wac plug` satisfies these imports with the
+/// `sqlite-provider` component's exports.
+world imports {
+  import types;
+  import database;
+}
