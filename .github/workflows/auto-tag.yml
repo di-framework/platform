@@ -1,0 +1,204 @@
+name: Auto Tag
+
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "bun.lock"
+      - "package-lock.json"
+      - "yarn.lock"
+      - "pnpm-lock.yaml"
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Which component to bump"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+concurrency:
+  group: auto-tag
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+  pull-requests: write
+
+jobs:
+  tag:
+    name: Bump version and tag
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      !startsWith(github.event.head_commit.message, 'chore(release):')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+
+      - name: Compute next version
+        id: version
+        run: |
+          set -euo pipefail
+          CURRENT=$(node -p "require('./package.json').version")
+          if [ -z "$CURRENT" ] || [ "$CURRENT" = "undefined" ]; then
+            echo "::error::could not read version from package.json"
+            exit 1
+          fi
+
+          BUMP="${{ github.event.inputs.bump || 'patch' }}"
+          IFS=. read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          PATCH=${PATCH%%-*}
+
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+            *) echo "::error::unknown bump type: $BUMP"; exit 1 ;;
+          esac
+
+          NEXT="$MAJOR.$MINOR.$PATCH"
+
+          if git rev-parse -q --verify "refs/tags/v$NEXT" >/dev/null; then
+            echo "::error::tag v$NEXT already exists"
+            exit 1
+          fi
+
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "next=$NEXT"       >> "$GITHUB_OUTPUT"
+          echo "branch=release/v$NEXT" >> "$GITHUB_OUTPUT"
+          echo "Bumping $CURRENT -> $NEXT ($BUMP)"
+
+      - name: Open release PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT: ${{ steps.version.outputs.next }}
+          CURRENT: ${{ steps.version.outputs.current }}
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Always rebuild the release branch from the job's main tip.
+          # A previous failed run may have left origin/release/vX.Y.Z behind
+          # main; plain push then fails non-fast-forward.
+          git fetch origin main
+          git checkout -B "$BRANCH" origin/main
+
+          # Bump after branch reset so origin/main doesn't wipe package.json.
+          # npm version only rewrites the workspace root. Updating workspaces
+          # with npm also runs an install and writes package-lock.json, so the
+          # published packages are synced with node instead.
+          npm version "$NEXT" --no-git-tag-version --allow-same-version
+          node scripts/sync-workspace-versions.mjs
+
+          git add package.json
+          # Workspace manifests are not all under packages/.
+          git ls-files -m -- '*package.json' | while IFS= read -r f; do
+            git add "$f"
+          done
+          git add -u bun.lock package-lock.json yarn.lock pnpm-lock.yaml 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "::error::nothing to commit for v$NEXT (package.json already at that version?)"
+            exit 1
+          fi
+          git commit -m "chore(release): v$NEXT"
+
+          # Refresh remote-tracking ref so --force-with-lease can replace a stale branch
+          git fetch origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" 2>/dev/null || true
+          git push -u origin "HEAD:refs/heads/$BRANCH" --force-with-lease
+
+          # Prefer an open PR; otherwise create (closed prior attempts don't block)
+          PR=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$PR" ]; then
+            echo "Reusing open PR #$PR"
+          else
+            gh pr create \
+              --title "chore(release): v$NEXT" \
+              --body "$(printf '%s\n' \
+                "Automated version bump \`$CURRENT\` → \`$NEXT\` from Auto Tag." \
+                "" \
+                "The Test workflow runs a Release dry-run on \`release/v*\` PRs" \
+                "(\`mx build --sync-versions\`, packed-manifest audit, and" \
+                "\`npm publish --dry-run\`) before merge." \
+                "" \
+                "After merge, Auto Tag will create tag \`v$NEXT\` and dispatch the Release workflow.")" \
+              --base main \
+              --head "$BRANCH"
+            PR=$(gh pr view "$BRANCH" --json number --jq .number)
+            echo "Opened PR #$PR"
+          fi
+
+          echo "number=$PR" >> "$GITHUB_OUTPUT"
+
+          # Auto-merge when required checks (Test, CodeQL) pass.
+          # Repo allows squash/rebase only (ruleset).
+          gh pr merge "$PR" --auto --squash || {
+            echo "::warning::Could not enable auto-merge (may already be enabled or admin merge required)."
+          }
+
+          echo "### Release PR" >> "$GITHUB_STEP_SUMMARY"
+          echo "Opened/updated PR #$PR for \`v$NEXT\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "Waiting for required checks, then auto-merge." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for PR merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          # Up to ~30 minutes for Test + CodeQL
+          for i in $(seq 1 90); do
+            STATE=$(gh pr view "$PR" --json state,mergedAt --jq '{state,mergedAt}')
+            MERGED=$(echo "$STATE" | jq -r '.mergedAt // empty')
+            OPEN=$(echo "$STATE" | jq -r '.state')
+            if [ -n "$MERGED" ]; then
+              echo "PR #$PR merged at $MERGED"
+              exit 0
+            fi
+            if [ "$OPEN" = "CLOSED" ]; then
+              echo "::error::PR #$PR was closed without merging"
+              exit 1
+            fi
+            echo "Waiting for merge ($i/90)..."
+            sleep 20
+          done
+          echo "::error::Timed out waiting for PR #$PR to merge"
+          exit 1
+
+      - name: Tag merge commit and dispatch Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT: ${{ steps.version.outputs.next }}
+          CURRENT: ${{ steps.version.outputs.current }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
+
+          if git rev-parse -q --verify "refs/tags/v$NEXT" >/dev/null; then
+            echo "Tag v$NEXT already exists"
+          else
+            git tag -a "v$NEXT" -m "Release v$NEXT"
+            git push origin "v$NEXT"
+            echo "Tagged v$NEXT"
+          fi
+
+          # GITHUB_TOKEN tag pushes do not fire `on: push: tags`
+          gh workflow run release.yml --ref "v${NEXT}"
+
+          echo "### Released \`v$NEXT\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Bumped from \`$CURRENT\`. Release workflow dispatched." >> "$GITHUB_STEP_SUMMARY"
