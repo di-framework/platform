@@ -16,6 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install SQLite build toolchain
+        run: |
+          bash platform/sqlite-component/scripts/install-tools.sh --rust
+          echo "$GITHUB_WORKSPACE/platform/sqlite-component/.tools/bin" >> "$GITHUB_PATH"
+
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: Install dependencies

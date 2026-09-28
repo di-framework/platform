@@ -21,6 +21,11 @@ jobs:
         with:
           bun-version: latest
 
+      - name: Install SQLite build toolchain
+        run: |
+          bash platform/sqlite-component/scripts/install-tools.sh --rust
+          echo "$GITHUB_WORKSPACE/platform/sqlite-component/.tools/bin" >> "$GITHUB_PATH"
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
