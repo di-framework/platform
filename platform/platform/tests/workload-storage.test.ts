@@ -144,6 +144,22 @@ describe('tenant host pod', () => {
     };
   }
 
+  it('replaces the host in place only when it holds workload storage', () => {
+    const strategy = (keys: string[]) =>
+      (
+        (
+          tenantResources(tenant(), cfg, { data: { 'ca.crt': 'x' } }, keys).find(
+            (r) => r.kind === 'Deployment' && r.metadata.name === 'hostgroup-tenant-alpha',
+          ) as Resource
+        ).spec as { strategy?: unknown }
+      ).strategy;
+    expect(strategy([])).toBeUndefined();
+    expect(strategy(['mesh'])).toEqual({
+      type: 'RollingUpdate',
+      rollingUpdate: { maxSurge: 0, maxUnavailable: 1 },
+    });
+  });
+
   it('is unchanged when no workload asks for storage', () => {
     const spec = host([]);
     expect(spec.initContainers).toBeUndefined();
