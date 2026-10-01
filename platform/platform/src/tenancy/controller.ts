@@ -11,6 +11,16 @@ import {
   tenantNameFromNamespace,
 } from './backing-service-reconcile';
 import {
+  appendRing,
+  applicationKey,
+  attributeLogs,
+  logsConfigMap,
+  PROJECTION,
+  projectedLines,
+  validLabelValue,
+  type WorkloadIdentity,
+} from './log-projection';
+import {
   assertPostgresOwner,
   ensurePostgresCredentials,
   ensurePostgresStorage,
@@ -71,6 +81,7 @@ const plurals: Record<string, string> = {
   BackingServiceClass: 'backingserviceclasses',
   BackingService: 'backingservices',
   ServiceBinding: 'servicebindings',
+  WorkloadDeployment: 'workloaddeployments',
 };
 export function collection(apiVersion: string, kind: string, namespace?: string): string {
   const plural = plurals[kind];
@@ -125,6 +136,7 @@ export class KubernetesApi implements Api {
           });
           res.on('error', reject);
           res.on('end', () => {
+            const plainText = path.split('?')[0]?.endsWith('/log');
             if ((res.statusCode ?? 500) >= 300) {
               // Do not put API response bodies in logs: they may contain Secret data.
               reject(
@@ -133,6 +145,9 @@ export class KubernetesApi implements Api {
                   `${method} ${path.split('?')[0]} returned ${res.statusCode}`,
                 ),
               );
+            } else if (plainText) {
+              // Pod logs are plain text, never JSON.
+              resolve(text as T);
             } else {
               try {
                 resolve(text ? (JSON.parse(text) as T) : (undefined as T));
@@ -150,6 +165,8 @@ export class KubernetesApi implements Api {
   }
 }
 export class Controller {
+  /** Newest TracingLogger timestamp already projected, per host pod uid. */
+  private readonly logCursors = new Map<string, string>();
   constructor(
     private readonly api: Api,
     private readonly cfg: ControllerConfig,
@@ -880,6 +897,76 @@ export class Controller {
     );
   }
 
+  /**
+   * Publish one logs ConfigMap per console application (#10). Only `wasi:logging` lines the
+   * host attributed to a workload in this tenant are kept. Nothing is written for an
+   * application with no attributed lines, so absence stays the console's unpublished state.
+   */
+  async projectLogs(tenant: Tenant): Promise<void> {
+    const n = names(tenant.metadata.name);
+    const pods = await this.api.call<{
+      items: { metadata: { name: string; uid?: string }; status?: { phase?: string } }[];
+    }>(
+      'GET',
+      `${collection('v1', 'Pod', n.runtimeNamespace)}?labelSelector=${encodeURIComponent(
+        `wasmcloud.com/hostgroup=${n.hostgroup},wasmcloud.com/name=hostgroup`,
+      )}`,
+    );
+    const deployments = (
+      await this.api.call<{ items: { metadata: WorkloadIdentity }[] }>(
+        'GET',
+        `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', n.namespace)}?labelSelector=${encodeURIComponent('app.kubernetes.io/managed-by=di-framework')}`,
+      )
+    ).items.map((item) => item.metadata);
+    const existing = (
+      await this.api.call<{ items: Resource[] }>(
+        'GET',
+        `${collection('v1', 'ConfigMap', n.namespace)}?labelSelector=${encodeURIComponent(
+          `${PROJECTION}=logs,${INSTALLATION}=${this.cfg.installation}`,
+        )}`,
+      )
+    ).items.map((item) => ({ ...item, apiVersion: 'v1', kind: 'ConfigMap' }));
+    const existingByApp = new Map(
+      existing.map((item) => [item.metadata.labels?.['di-framework.dev/application'] ?? '', item]),
+    );
+    const incoming = new Map<string, string[]>();
+    for (const pod of pods.items) {
+      if (pod.status?.phase !== 'Running') continue;
+      const cursorKey = pod.metadata.uid ?? pod.metadata.name;
+      const cursor = this.logCursors.get(cursorKey);
+      const query = cursor
+        ? `sinceTime=${encodeURIComponent(cursor.replace(/\.\d+Z$/, 'Z'))}`
+        : 'tailLines=1000';
+      const text = await this.api.call<string>(
+        'GET',
+        `${collection('v1', 'Pod', n.runtimeNamespace)}/${encodeURIComponent(pod.metadata.name)}/log?${query}`,
+      );
+      let newest = cursor ?? '';
+      for (const [app, lines] of attributeLogs(text ?? '', n.namespace, deployments)) {
+        // A restarted controller resumes after the newest line it already published.
+        const floor = cursor ?? projectedLines(existingByApp.get(app)).at(-1)?.split(' ')[0] ?? '';
+        const fresh = lines.filter((line) => (line.split(' ')[0] ?? '') > floor);
+        for (const line of fresh) {
+          const stamp = line.split(' ')[0] ?? '';
+          if (stamp > newest) newest = stamp;
+        }
+        incoming.set(app, [...(incoming.get(app) ?? []), ...fresh]);
+      }
+      if (newest) this.logCursors.set(cursorKey, newest);
+    }
+    const live = new Set(deployments.map(applicationKey));
+    for (const [app, lines] of incoming) {
+      if (lines.length === 0 || !live.has(app) || !validLabelValue(app)) continue;
+      const merged = appendRing(projectedLines(existingByApp.get(app)), lines);
+      await this.ensure(
+        logsConfigMap(tenant.metadata.name, n.namespace, this.cfg.installation, app, merged),
+      );
+    }
+    for (const [app, configMap] of existingByApp) {
+      if (!live.has(app)) await this.remove(configMap);
+    }
+  }
+
   async tick(): Promise<void> {
     const tenants = await this.list<Tenant>(VERSION, 'Tenant', {
       [INSTALLATION]: this.cfg.installation,
@@ -905,6 +992,16 @@ export class Controller {
         } catch {
           /* Retry on the next poll, including resourceVersion conflicts. */
         }
+      }
+    }
+    for (const tenant of tenants) {
+      if (tenant.spec.suspended || tenant.metadata.deletionTimestamp) continue;
+      try {
+        await this.projectLogs(tenant);
+      } catch (error) {
+        // Log projection is best effort; never let it block reconciliation.
+        const message = error instanceof Error ? error.message : 'Log projection failed';
+        console.error(`Tenant/${tenant.metadata.name} logs: ${message}`);
       }
     }
     const serviceByKey = new Map(
