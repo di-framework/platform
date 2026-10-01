@@ -118,6 +118,20 @@ describe('Kubernetes API transport', () => {
     }
   });
 
+  it('returns pod logs as plain text instead of parsing JSON', async () => {
+    const t = transport(200, 'line one\nline two');
+    try {
+      expect(
+        await new KubernetesApi().call<string>(
+          'GET',
+          '/api/v1/namespaces/di-runtime-alpha/pods/host-0/log?tailLines=1000',
+        ),
+      ).toBe('line one\nline two');
+    } finally {
+      t.restore();
+    }
+  });
+
   it('rejects malformed response JSON', async () => {
     const t = transport(200, 'not-json');
     try {

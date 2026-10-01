@@ -10,7 +10,7 @@ import {
 } from './resources';
 
 /** Controller ConfigMap modules. TypeScript emit does not bundle imports, so
- * `backing-services`, `backing-service-reconcile`, and `service-binding-reconcile`
+ * `backing-services`, `backing-service-reconcile`, `service-binding-reconcile`, and `log-projection`
  * must ship beside `resources` / `controller` (which require them at runtime). */
 export const CONTROLLER_SCRIPT_MODULES = [
   'backing-services',
@@ -18,6 +18,7 @@ export const CONTROLLER_SCRIPT_MODULES = [
   'backing-service-reconcile',
   'service-binding-reconcile',
   'postgres',
+  'log-projection',
   'controller',
 ] as const;
 
@@ -114,7 +115,7 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
     },
     {
       apiGroups: ['runtime.wasmcloud.dev'],
-      resources: ['hosts'],
+      resources: ['hosts', 'workloaddeployments'],
       verbs: ['get', 'list', 'watch'],
     },
     {

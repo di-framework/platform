@@ -334,6 +334,27 @@ function tenantResources(
     make('v1', 'ServiceAccount', 'di-runtime', n.runtimeNamespace, {
       automountServiceAccountToken: false,
     }),
+    // The controller reads hostgroup logs to publish the console logs projection (#10).
+    // Scoped to this tenant's runtime namespace; the host itself keeps no API token.
+    make('rbac.authorization.k8s.io/v1', 'Role', 'di-platform-log-reader', n.runtimeNamespace, {
+      rules: [{ apiGroups: [''], resources: ['pods/log'], verbs: ['get'] }],
+    }),
+    make(
+      'rbac.authorization.k8s.io/v1',
+      'RoleBinding',
+      'di-platform-log-reader',
+      n.runtimeNamespace,
+      {
+        roleRef: {
+          apiGroup: 'rbac.authorization.k8s.io',
+          kind: 'Role',
+          name: 'di-platform-log-reader',
+        },
+        subjects: [
+          { kind: 'ServiceAccount', name: 'di-platform-controller', namespace: cfg.namespace },
+        ],
+      },
+    ),
     make('v1', 'ConfigMap', 'di-tenant-stock', n.namespace, {
       data: {
         backend: 'redis',

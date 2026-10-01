@@ -12,6 +12,8 @@ import {
 export const BS_CONFIG_PREFIX = 'di-bs-';
 /** Controller-managed Secret/ConfigMap prefix for ServiceBinding projection (#451). */
 export const BINDING_CONFIG_PREFIX = 'di-binding-';
+/** Console projection label (logs); only the controller may write objects carrying it. */
+export const PROJECTION_LABEL = 'di-framework.dev/projection';
 /** Transitional warehouse keyvalue ConfigMap; still admitted alongside di-bs-*. */
 export const STOCK_CONFIG_NAME = 'di-tenant-stock';
 
@@ -97,6 +99,11 @@ export function hostInterfaceAllowed(hostInterface: HostInterfaceLike): boolean 
   if (namespace === 'wasi' && (packageName === 'http' || packageName === 'config')) {
     if (hasName || hasReferences) return false;
     return packageName === 'config' || configKeys.every((key) => key === 'host' || key === 'path');
+  }
+  // Guest console output goes through the host TracingLogger, which attributes each line.
+  if (namespace === 'wasi' && packageName === 'logging') {
+    if (hasName || hasReferences || configKeys.length > 0) return false;
+    return hostInterface.interfaces?.length === 1 && hostInterface.interfaces[0] === 'logging';
   }
 
   if (namespace !== 'wasmcloud') return false;
@@ -277,6 +284,10 @@ function hostInterfaceAdmissionExpression(): string {
     (!has(h.config) ||
       (h['package'] == 'http' && h.config.all(k, k in ['host', 'path'])) ||
       h['package'] == 'config'))`;
+  const wasiLogging = `(h['namespace'] == 'wasi' && h['package'] == 'logging' &&
+    ${unnamed} && ${noSecretReferences} && ${noConfigReferences} &&
+    (!has(h.config) || size(h.config) == 0) &&
+    has(h.interfaces) && size(h.interfaces) == 1 && h.interfaces[0] == 'logging')`;
 
   // Unnamed keyvalue is restricted to the transitional stock ConfigMap.
   const stockKeyvalue = `(${unnamed} &&
@@ -317,7 +328,7 @@ function hostInterfaceAdmissionExpression(): string {
           h.secretFrom[0].name == '${BINDING_CONFIG_PREFIX}' + h.name.substring(0, size(h.name) - 9) + '-creds')))))`;
 
   return `!has(variables.w.hostInterfaces) || variables.w.hostInterfaces.all(h,
-    (${wasi} || ${keyvalue} || ${messaging} || ${blobstore} || ${postgres}))`;
+    (${wasi} || ${wasiLogging} || ${keyvalue} || ${messaging} || ${blobstore} || ${postgres}))`;
 }
 
 function workloadPolicy(): AdmissionPolicy {
@@ -359,7 +370,7 @@ function workloadPolicy(): AdmissionPolicy {
       {
         expression: hostInterfaceAdmissionExpression(),
         message:
-          'Only wasi http/config or wasmcloud keyvalue/messaging/blobstore/postgres with controller-managed di-bs-/di-binding- (or transitional di-tenant-stock / default NATS / host blobstore) references are allowed',
+          'Only wasi http/config or logging, or wasmcloud keyvalue/messaging/blobstore/postgres with controller-managed di-bs-/di-binding- (or transitional di-tenant-stock / default NATS / host blobstore) references are allowed',
       },
     ],
   };
@@ -384,6 +395,17 @@ function backendConfigPolicy(namespace: string): AdmissionPolicy {
             ${objectName}.startsWith('${BINDING_CONFIG_PREFIX}'))`,
         message:
           'di-tenant-stock, di-bs-*, and di-binding-* ConfigMaps/Secrets are managed by the platform controller',
+      },
+      {
+        // The console trusts di-framework.dev/projection ConfigMaps (logs, signals); a tenant
+        // must not forge or erase them, under any name.
+        expression: `
+          !request.userInfo.username.startsWith('system:serviceaccount:${namespace}:di-user-') ||
+          !((request.operation != 'DELETE' && has(object.metadata.labels) &&
+              '${PROJECTION_LABEL}' in object.metadata.labels) ||
+            (request.operation != 'CREATE' && has(oldObject.metadata.labels) &&
+              '${PROJECTION_LABEL}' in oldObject.metadata.labels))`,
+        message: 'di-framework.dev/projection ConfigMaps are published by the platform controller',
       },
     ],
   };

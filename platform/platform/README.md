@@ -136,6 +136,28 @@ model, not a claim of developer-proof network isolation.
   Tenant-reconciled infrastructure — not an application `BackingService`. Application
   messaging instances are named `di-bs-<service-name>` and owned by BackingService UIDs.
 
+### Console log projection
+
+The controller publishes one ConfigMap per console application in each tenant
+namespace, `di-logs-<app>`, labeled `di-framework.dev/projection=logs` and
+`di-framework.dev/application=<app>`, with the newest 200 lines in `data.lines`.
+
+- Source: the `hostgroup-<tenant>` pod logs, read through a per-tenant
+  `di-platform-log-reader` Role (`pods/log get` in the runtime namespace only). The
+  host keeps `automountServiceAccountToken: false`.
+- Only lines from the wash `wasi:logging` TracingLogger are kept. Each ends with
+  `workload.name` and `workload.namespace`; the namespace must be the tenant's, and
+  the name maps to a `di-framework`-managed WorkloadDeployment. Its
+  `di-framework.dev/workload` label (else `di-framework.dev/application`) is the
+  console application, so `mesh-collector` and `mesh-site` publish to `mesh`.
+  Raw guest stdout/stderr carries no attribution and is dropped.
+- Lines are redacted (bearer tokens, `key=value` secrets, URL credentials, long
+  tokens) and cut to 500 characters before they are written.
+- No `projection=signals` ConfigMap is written. An application with no attributed
+  lines has no ConfigMap, which the console shows as unpublished.
+- Tenant users cannot create, change, or delete any ConfigMap carrying
+  `di-framework.dev/projection`. `di-viewer` can read it.
+
 ### Contract
 
 This section defines the v1alpha1 shape for independently requestable application

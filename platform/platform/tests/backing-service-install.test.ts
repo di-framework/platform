@@ -106,6 +106,7 @@ describe('backing-service install', () => {
       'backing-service-reconcile',
       'service-binding-reconcile',
       'postgres',
+      'log-projection',
       'controller',
     ]);
     for (const name of CONTROLLER_SCRIPT_MODULES) {
@@ -116,6 +117,7 @@ describe('backing-service install', () => {
       'backing-service-reconcile.js',
       'backing-services.js',
       'controller.js',
+      'log-projection.js',
       'postgres.js',
       'resources.js',
       'service-binding-reconcile.js',
@@ -127,6 +129,7 @@ describe('backing-service install', () => {
     expect(scripts['service-binding-reconcile.js']).toContain('di-binding-');
     expect(scripts['resources.js']).toMatch(/require\(["'].\/backing-services["']\)/);
     expect(scripts['controller.js']).toMatch(/require\(["'].\/resources["']\)/);
+    expect(scripts['controller.js']).toMatch(/require\(["'].\/log-projection["']\)/);
     expect(scripts['controller.js']).toMatch(/require\(["'].\/backing-service-reconcile["']\)/);
     expect(scripts['controller.js']).toMatch(/require\(["'].\/service-binding-reconcile["']\)/);
     expect(controllerScriptHash(scripts)).toMatch(/^[a-f0-9]{64}$/);
