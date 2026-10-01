@@ -44,7 +44,7 @@ test('published implementation provisions tenancy and isolation for an existing 
     }, 'project', 'test', false);
     pulumi.runtime.runInPulumiStack(async () => {
       const {createPlatform} = require('./dist');
-      const platform = createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', httpNodePort:30080, storageRoot:'/var/lib/kubesolo', insecureRegistry:false, networkPolicyEngine:'kube-router' });
+      const platform = createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', httpNodePort:30080, routeUrlPattern:'http://{host}.{tenant}.localhost:28080', storageRoot:'/var/lib/kubesolo', insecureRegistry:false, networkPolicyEngine:'kube-router' });
       await platform.namespace.promise();
       await Promise.all(platform.users.map(u => u.promise()));
       if (platform.kubeconfigs !== undefined) throw new Error('kubeconfigs without apiServer');
@@ -100,9 +100,67 @@ test('published implementation provisions tenancy and isolation for an existing 
       (r) => r.name === 'customresourcedefinition-backingserviceclasses.platform.di-framework.dev',
     ),
   ).toBe(true);
-  expect(resources.find((r) => r.name === 'http-entrypoint')?.inputs.spec.ports[0].nodePort).toBe(
-    30080,
+  const backend = resources.find((r) => r.name === 'http-entrypoint')?.inputs.spec;
+  expect(backend.type).toBe('ClusterIP');
+  expect(backend.ports[0]).toEqual({ name: 'http', port: 80, targetPort: 9191, protocol: 'TCP' });
+  const gateway = (type: string) =>
+    resources.find((r) => r.name === 'http-gateway' && r.type === type)?.inputs;
+  const service = gateway('kubernetes:core/v1:Service');
+  expect(service.metadata.name).toBe('di-platform-gateway');
+  expect(service.spec.type).toBe('NodePort');
+  expect(service.spec.ports[0].nodePort).toBe(30080);
+  expect(gateway('kubernetes:core/v1:ConfigMap').data['gateway.js']).toContain(
+    'function routeRequest',
   );
+  const deployment = gateway('kubernetes:apps/v1:Deployment');
+  expect(deployment.spec.template.spec.automountServiceAccountToken).toBe(false);
+  expect(deployment.spec.template.metadata.annotations['di-framework.dev/script-hash']).toMatch(
+    /^[0-9a-f]{64}$/,
+  );
+  const policy = gateway('kubernetes:networking.k8s.io/v1:NetworkPolicy');
+  expect(policy.spec.egress[1].to[1].namespaceSelector.matchLabels).toEqual({
+    'platform.di-framework.dev/installation': 'di-test',
+  });
+  expect(cfg.routeUrlPattern).toBe('http://{host}.{tenant}.localhost:28080');
+}, 60_000);
+
+test('existing entrypoint derives the route pattern from a loopback HTTP endpoint', () => {
+  const run = (config: Record<string, string>) =>
+    JSON.parse(
+      execFileSync(
+        'node',
+        [
+          '-e',
+          `
+    const pulumi = require('@pulumi/pulumi');
+    pulumi.runtime.setAllConfig(${JSON.stringify(
+      Object.fromEntries(
+        Object.entries({ kubeconfig: join(root, 'package.json'), ...config }).map(([k, v]) => [
+          `project:${k}`,
+          v,
+        ]),
+      ),
+    )});
+    pulumi.runtime.setMocks({
+      newResource: a => ({id:a.name, state:{...a.inputs, metadata:{...a.inputs.metadata, name:a.inputs.metadata?.name ?? a.name}}}),
+      call: a => a.inputs,
+    }, 'project', 'test', false);
+    pulumi.runtime.runInPulumiStack(async () => require('./dist/existing').routeUrlPattern).then((pattern) => console.log(JSON.stringify(pattern ?? null))).catch(e => {console.error(e);process.exitCode=1;});
+  `,
+        ],
+        { cwd: root, encoding: 'utf8' },
+      ),
+    );
+  expect(run({ httpEndpoint: 'http://127.0.0.1:28089' })).toBe(
+    'http://{host}.{tenant}.localhost:28089',
+  );
+  expect(run({ httpEndpoint: 'http://10.0.0.5:30080' })).toBeNull();
+  expect(
+    run({
+      httpEndpoint: 'http://127.0.0.1:28089',
+      routeUrlPattern: 'https://{host}.{tenant}.apps.example.com',
+    }),
+  ).toBe('https://{host}.{tenant}.apps.example.com');
 }, 60_000);
 
 test('kubeconfigs read each token Secret after its User and are a secret output', () => {
@@ -209,9 +267,15 @@ test('local packaged entrypoint provisions Docker and the shared platform', () =
     resources.find((r) => r.name === 'k0s' && r.type.startsWith('command:'))?.inputs.create,
   ).toContain('docker run -d');
   expect(resources.some((r) => r.name === 'oci-registry')).toBe(true);
-  expect(resources.find((r) => r.name === 'http-entrypoint')?.inputs.spec.ports[0].nodePort).toBe(
-    30180,
-  );
+  expect(resources.find((r) => r.name === 'http-entrypoint')?.inputs.spec.type).toBe('ClusterIP');
+  expect(
+    resources.find((r) => r.name === 'http-gateway' && r.type === 'kubernetes:core/v1:Service')
+      ?.inputs.spec.ports[0].nodePort,
+  ).toBe(30180);
+  const controller = resources.find((r) => r.name === 'deployment-di-platform-controller');
+  expect(
+    JSON.parse(controller?.inputs.spec.template.spec.containers[0].env[0].value).routeUrlPattern,
+  ).toBe('http://{host}.{tenant}.localhost:28180');
   expect(
     resources.find((r) => r.type === 'kubernetes:helm.sh/v3:Release')?.inputs.values.operator
       .allowSharedHosts,

@@ -56,9 +56,10 @@ existing-cluster entrypoint.
 
 `kubeconfig` is required (a local file path); `context`, `namespace`, `release`,
 `chart`, `chartVersion`, `httpNodePort`, `timeoutSeconds`, `insecureRegistry`,
-`storageRoot`, `networkPolicyEngine`, `kubernetesEndpoint`, and administrator `values` are optional. `tenants`, `users`,
+`storageRoot`, `networkPolicyEngine`, `kubernetesEndpoint`, `httpEndpoint`, `routeUrlPattern`,
+and administrator `values` are optional. `tenants`, `users`,
 `tenantHostImage`, and `tenantHostImagePullPolicy` use the same declarations as the
-local entrypoint. NodePort zero selects ClusterIP. Registry installation is off
+local entrypoint. NodePort zero makes the HTTP gateway ClusterIP. Registry installation is off
 for existing clusters. Shared hosts are disabled regardless of values overrides. Set `networkPolicyEngine`
 to `kube-router` to install the pinned v2.10.0 policy-only controller on clusters
 without policy enforcement; `existing` leaves policy enforcement to the caller.
@@ -253,6 +254,45 @@ It carries no `volumes`, `volumeMounts`, or host paths.
 - When a workload goes away its volume is dropped from the host; the data stays on the node.
 - A redeploy that rewrites the component list drops the preopen until the next
   controller tick (about 3 s) puts it back.
+
+### Tenant HTTP gateway
+
+The published HTTP port (NodePort `httpNodePort`, 30180 locally) belongs to the
+`di-platform-gateway` Deployment in the platform namespace, a small Node reverse proxy
+(`gateway.js`, loaded from this package into a ConfigMap and run on the controller's
+`node:22.18.0-alpine3.22` image). `wasmcloud-http` stays as the default host group's
+ClusterIP backend.
+
+- `Host: <route-host>.<tenant>.localhost[:port]` goes to
+  `di-http.di-runtime-<tenant>.svc.cluster.local:80` with `Host: <route-host>`. The tenant
+  is the label right before `.localhost` and must be a valid tenant name; the route host
+  is everything before it (it may contain dots). Routing uses the whole name, never a
+  fixed list of hosts.
+- Every other Host (including `localhost` and `127.0.0.1`) goes to
+  `wasmcloud-http.<namespace>.svc.cluster.local:80` with the Host unchanged.
+- A missing or malformed Host, or an absolute-form request target, gets `400`. Upstream
+  connection failures get `502`, an upstream silent for 60 s before responding `504`.
+  Bodies stream both ways and `Upgrade` (WebSocket) requests pass through.
+- `X-Forwarded-For`, `X-Forwarded-Host` (the original Host) and `X-Forwarded-Proto` are
+  always overwritten and `Forwarded` is dropped. Deployed workloads set
+  `DI_CONTROL_REJECT_FORWARDED=1`, so their `/_di/*` control paths stay unreachable from
+  outside.
+- Isolation: the tenant comes only from the Host name. Tenant runtimes still admit only
+  their own namespaces (`di-tenant-network`); a separate `di-tenant-gateway` policy in
+  each `di-runtime-<tenant>` admits the gateway pods, and only them, to the host group on
+  9191. The gateway's own policy limits its egress to cluster DNS and host group port 9191
+  in this installation's namespaces. The pod runs as non-root with a read-only root, drops
+  all capabilities and mounts no ServiceAccount token.
+
+`routeUrlPattern` (`http://{host}.{tenant}.localhost:<httpPort>`) is exported by the local
+entrypoint and returned by `createPlatform`. The existing-cluster entrypoint takes it from
+config `routeUrlPattern`, else derives it from `httpEndpoint` when that is an `http://`
+`127.0.0.1`/`localhost` URL, else leaves it unset. When it is set the controller writes
+ConfigMap `di-platform-routes` into each `di-tenant-<tenant>` namespace with
+`data.urlTemplate` = the pattern with `{tenant}` filled in (for example
+`http://{host}.meshtastic.localhost:28180`), and removes it once the pattern is unset.
+`di-viewer` and `di-developer` can read it; tenant users cannot write it. No ConfigMap
+means no gateway URL is known.
 
 ### Contract
 

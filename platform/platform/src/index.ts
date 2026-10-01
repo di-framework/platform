@@ -1,5 +1,14 @@
 import * as k8s from '@pulumi/kubernetes';
 import * as pulumi from '@pulumi/pulumi';
+import {
+  GATEWAY_NAME,
+  gatewayDeploymentSpec,
+  gatewayNetworkPolicySpec,
+  gatewayScriptHash,
+  gatewayServiceSpec,
+  loadGatewayScript,
+  validateRouteUrlPattern,
+} from './gateway/install';
 import { tenantKubeconfig } from './kubeconfig';
 import { installNetworkPolicy } from './network-policy';
 import {
@@ -29,6 +38,8 @@ export interface PlatformArgs {
   storageRoot?: string;
   insecureRegistry?: boolean;
   values?: Record<string, unknown>;
+  /** `http://{host}.{tenant}.localhost:<port>` for the published gateway port, if any. */
+  routeUrlPattern?: string;
   beforeTenancy?: (release: k8s.helm.v3.Release) => pulumi.Resource;
   /**
    * Kubernetes API server URL that tenant users reach. When set, `kubeconfigs` holds one
@@ -50,6 +61,7 @@ export function createPlatform(args: PlatformArgs) {
   const WASMCLOUD_OPERATOR_VERSION = '2.8.0';
   const REGISTRY_NODE_PORT = args.registryNodePort ?? 30500;
   const HTTP_NODE_PORT = args.httpNodePort ?? 30180;
+  const routeUrlPattern = validateRouteUrlPattern(args.routeUrlPattern);
   const namespaceResource = new k8s.core.v1.Namespace(
     'wasmcloud',
     {
@@ -177,28 +189,53 @@ export function createPlatform(args: PlatformArgs) {
 
   const runtimeShutdown = args.beforeTenancy?.(wasmcloud) ?? wasmcloud;
 
-  new k8s.core.v1.Service(
+  // The default host group's backend. The published port belongs to the gateway below.
+  const httpBackend = new k8s.core.v1.Service(
     'http-entrypoint',
     {
       metadata: { name: 'wasmcloud-http', namespace: namespaceName },
       spec: {
-        type: HTTP_NODE_PORT ? 'NodePort' : 'ClusterIP',
+        type: 'ClusterIP',
         selector: {
           'wasmcloud.com/hostgroup': 'default',
           'wasmcloud.com/name': 'hostgroup',
         },
-        ports: [
-          {
-            name: 'http',
-            port: 80,
-            targetPort: 9191,
-            ...(HTTP_NODE_PORT ? { nodePort: HTTP_NODE_PORT } : {}),
-            protocol: 'TCP',
-          },
-        ],
+        ports: [{ name: 'http', port: 80, targetPort: 9191, protocol: 'TCP' }],
       },
     },
     { provider, dependsOn: [runtimeShutdown] },
+  );
+
+  const gatewayScript = loadGatewayScript();
+  const gatewayScripts = new k8s.core.v1.ConfigMap(
+    'http-gateway',
+    { metadata: { name: GATEWAY_NAME, namespace: namespaceName }, data: gatewayScript },
+    { provider, dependsOn: [namespaceResource] },
+  );
+  const gatewayPolicy = new k8s.networking.v1.NetworkPolicy(
+    'http-gateway',
+    {
+      metadata: { name: GATEWAY_NAME, namespace: namespaceName },
+      spec: gatewayNetworkPolicySpec(namespaceName, scope),
+    },
+    { provider, dependsOn: [namespaceResource] },
+  );
+  const gateway = new k8s.apps.v1.Deployment(
+    'http-gateway',
+    {
+      metadata: { name: GATEWAY_NAME, namespace: namespaceName },
+      spec: gatewayDeploymentSpec(namespaceName, gatewayScriptHash(gatewayScript)),
+    },
+    { provider, dependsOn: [gatewayScripts, gatewayPolicy, httpBackend] },
+  );
+  // Depends on the backend Service so an upgrade frees its old NodePort first.
+  new k8s.core.v1.Service(
+    'http-gateway',
+    {
+      metadata: { name: GATEWAY_NAME, namespace: namespaceName },
+      spec: gatewayServiceSpec(HTTP_NODE_PORT),
+    },
+    { provider, dependsOn: [gateway, httpBackend] },
   );
 
   const tenancy = installTenancy({
@@ -212,6 +249,7 @@ export function createPlatform(args: PlatformArgs) {
     hostImage: config.get('tenantHostImage') ?? 'ghcr.io/wasmcloud/wash:2.8.0',
     hostImagePullPolicy: config.get('tenantHostImagePullPolicy') ?? 'IfNotPresent',
     backingServiceClasses: resolveBackingServiceClasses(config),
+    routeUrlPattern,
   });
   const tenants = tenancy.tenants.map((t) =>
     t.metadata.name.apply((name) => ({ name, ...names(name) })),
@@ -268,6 +306,7 @@ export function createPlatform(args: PlatformArgs) {
     /** `{ [tenant]: { [user]: kubeconfig YAML } }`, secret; undefined without `apiServer`. */
     kubeconfigs,
     release: wasmcloud,
+    routeUrlPattern,
     // Tenant custom resources wait for Ready. Callers that install into
     // di-tenant-* depend on these and do not create the namespaces.
     tenantResources: tenancy.tenants,
