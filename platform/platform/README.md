@@ -230,6 +230,12 @@ the newest host failure per WorkloadDeployment in `data.failures`.
   `workload_start` with both fields, nested spans that repeat them must agree, and
   `wasi:logging` lines never count), so message text cannot pick the workload. They
   are written as `<timestamp> <LEVEL> host: <message>` into the same ring.
+- The ring reserves room for host lines so a chatty guest cannot push failures out
+  within seconds: the newest 50 host lines are kept, guest lines fill the rest of
+  the 200 newest first, and only then older host lines. Lines stay in timestamp
+  order. Each poll re-merges with the published `data.lines`, so this also holds
+  after a controller restart. A guest message that itself starts with `host:` is
+  written as `(guest) host: …` and never counts as a host line.
 - Service crashes are kept too. wash 2.8 runs the service supervisor loop in an
   uninstrumented task, so lines such as `P3 service execution failed …`,
   `max restarts reached, P3 service will not be restarted`, `failed to instantiate P3

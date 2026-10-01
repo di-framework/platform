@@ -30,6 +30,10 @@ const LOGS_PREFIX = 'di-logs-';
 /** The console shows at most 200 lines of 500 characters; stay at that bound. */
 const MAX_LINES = 200;
 const MAX_LINE_LENGTH = 500;
+/** Ring slots reserved for host lines, so a guest flood cannot push failures out. */
+const MAX_HOST_LINES = 50;
+/** A projected host line; guest lines can never take this shape (formatProjectedLine). */
+const HOST_LINE = /^\S+ (WARN|ERROR) host: /;
 
 const QUOTED = '"((?:[^"\\\\]|\\\\.)*)"';
 /**
@@ -227,7 +231,9 @@ export function redactLogText(value: string, max = MAX_LINE_LENGTH): string {
 
 /** Projection line shown by the console: `<timestamp> <LEVEL> <message>`. */
 export function formatProjectedLine(line: GuestLogLine): string {
-  return redactLogText(`${line.timestamp} ${line.level} ${line.message}`);
+  // A guest message that starts like a host line is marked, so it never counts as one.
+  const message = line.message.startsWith('host:') ? `(guest) ${line.message}` : line.message;
+  return redactLogText(`${line.timestamp} ${line.level} ${message}`);
 }
 
 /** Host failure line as the console shows it: `<timestamp> <LEVEL> host: <message>`. */
@@ -412,10 +418,34 @@ export function attributeLogs(
   return result;
 }
 
-/** Keep the newest lines, bounded by count (and so well under the 1 MiB ConfigMap limit). */
-export function appendRing(existing: string[], incoming: string[], max = MAX_LINES): string[] {
-  const merged = [...existing, ...incoming];
-  return merged.length > max ? merged.slice(merged.length - max) : merged;
+/**
+ * Keep the newest lines, bounded by count (and so well under the 1 MiB ConfigMap limit).
+ * The newest `hostMax` host lines are kept first, guest lines fill the rest newest first,
+ * and only then older host lines. `existing` is the published ring (older than
+ * `incoming`, which may interleave several pods and is put in timestamp order); the
+ * result keeps that order.
+ */
+export function appendRing(
+  existing: string[],
+  incoming: string[],
+  max = MAX_LINES,
+  hostMax = MAX_HOST_LINES,
+): string[] {
+  const stamp = (line: string) => line.split(' ')[0] as string;
+  const sorted = [...incoming].sort((a, b) =>
+    stamp(a) < stamp(b) ? -1 : stamp(a) > stamp(b) ? 1 : 0,
+  );
+  const merged = [...existing, ...sorted];
+  if (merged.length <= max) return merged;
+  const keep = new Set<number>();
+  const fill = (limit: number, take: (line: string) => boolean) => {
+    for (let i = merged.length - 1; i >= 0 && keep.size < limit; i--)
+      if (take(merged[i] as string)) keep.add(i);
+  };
+  fill(Math.min(hostMax, max), (line) => HOST_LINE.test(line));
+  fill(max, (line) => !HOST_LINE.test(line));
+  fill(max, () => true);
+  return merged.filter((_, i) => keep.has(i));
 }
 
 /** Existing projected lines from a ConfigMap, newest last. */
@@ -546,8 +576,10 @@ export function logsConfigMap(
 
 export {
   APPLICATION,
+  HOST_LINE,
   LOGS_ANNOTATION,
   LOGS_PREFIX,
+  MAX_HOST_LINES,
   MAX_LINE_LENGTH,
   MAX_LINES,
   PROJECTION,

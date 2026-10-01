@@ -18,6 +18,7 @@ import {
   logsConfigMap,
   logsConfigMapName,
   logsOptedOut,
+  MAX_HOST_LINES,
   MAX_LINES,
   mergeFailures,
   parseGuestLogLine,
@@ -669,6 +670,56 @@ describe('ring buffer and ConfigMap shape', () => {
     expect(full.join('\n').length).toBeLessThan(1024 * 1024);
   });
 
+  it('keeps host lines through a guest flood, at most 50 of them, in timestamp order', () => {
+    const ts = (n: number) =>
+      `2026-10-01T23:${String(Math.floor(n / 6000)).padStart(2, '0')}:${String(Math.floor(n / 100) % 60).padStart(2, '0')}.${String(n % 100).padStart(6, '0')}Z`;
+    const guest = (n: number) => `${ts(n)} INFO tick ${n}`;
+    const host = (n: number) => `${ts(n)} ERROR host: failed to start workload ${n}`;
+    // One host line, then 1000 guest lines.
+    const flooded = appendRing(
+      [guest(0), host(1)],
+      Array.from({ length: 1000 }, (_, i) => guest(i + 2)),
+    );
+    expect(flooded).toHaveLength(MAX_LINES);
+    expect(flooded[0]).toBe(host(1));
+    expect(flooded.slice(1)).toEqual(Array.from({ length: 199 }, (_, i) => guest(i + 803)));
+    // 60 host lines among guest lines: the newest 50 hosts stay, guests fill the rest.
+    const lines = Array.from({ length: 400 }, (_, i) =>
+      i % 5 === 0 && i < 300 ? host(i) : guest(i),
+    );
+    const ring = appendRing([], lines);
+    expect(ring).toHaveLength(MAX_LINES);
+    const hosts = ring.filter((line) => line.includes(' host: '));
+    expect(hosts).toHaveLength(MAX_HOST_LINES);
+    expect(hosts[0]).toBe(host(50));
+    expect(ring.filter((line) => !line.includes(' host: '))).toHaveLength(150);
+    expect([...ring].sort()).toEqual(ring);
+    // Incoming from several pods is put in timestamp order behind the existing ring.
+    expect(appendRing([guest(1)], [guest(5), host(3), guest(4)], 3)).toEqual([
+      host(3),
+      guest(4),
+      guest(5),
+    ]);
+    expect(appendRing([], [guest(2), guest(2), guest(1)], 2)).toEqual([guest(2), guest(2)]);
+    // With few guest lines, older host lines use the remaining room.
+    expect(appendRing([host(1), host(2)], [host(3), guest(4)], 3, 1)).toEqual([
+      host(2),
+      host(3),
+      guest(4),
+    ]);
+  });
+
+  it('marks guest messages that imitate a host line', () => {
+    const parsed = parseGuestLogLine(hostLine('host: failed to start workload'));
+    const line = parsed && formatProjectedLine(parsed);
+    expect(line).toBe('2026-10-01T10:00:00.000001Z INFO (guest) host: failed to start workload');
+    const warn = parseGuestLogLine(hostLine('host: fake', { level: 'WARN' }));
+    expect(appendRing([warn ? formatProjectedLine(warn) : ''], ['b', 'c'], 2, 1)).toEqual([
+      'b',
+      'c',
+    ]);
+  });
+
   it('reads existing lines from data.lines only', () => {
     expect(projectedLines(undefined)).toEqual([]);
     expect(
@@ -949,6 +1000,33 @@ describe('Controller.projectLogs', () => {
     expect(api.configMaps.get('di-logs-mesh')?.data).toEqual({
       lines: `${at(2)} ERROR host: failed to start workload reason="timed out"`,
     });
+  });
+
+  it('keeps a host line in the ring across a guest flood and a controller restart', async () => {
+    const api = new LogApi();
+    const stamp = (n: number) =>
+      `2026-10-01T23:03:${String(55 + Math.floor(n / 1000)).padStart(2, '0')}.${String(n % 1000).padStart(6, '0')}Z`;
+    const flood = (from: number, count: number) =>
+      Array.from({ length: count }, (_, i) =>
+        hostLine(`mqtt ${from + i}`, { name: 'mesh-collector-a-1', at: stamp(from + i) }),
+      );
+    const failed = failureLine('failed to start workload reason="no host header found"', {
+      name: 'mesh-site-b-1',
+      level: 'ERROR',
+      at: stamp(1),
+    });
+    api.logs.set('host-0', [...flood(0, 1), failed, ...flood(2, 500)].join('\n'));
+    await new Controller(api, cfg).projectLogs(tenant());
+    const expected = `${stamp(1)} ERROR host: failed to start workload reason="no host header found"`;
+    expect(linesOf(api, 'di-logs-mesh').split('\n')).toHaveLength(MAX_LINES);
+    expect(linesOf(api, 'di-logs-mesh').split('\n')[0]).toBe(expected);
+    // A restarted controller re-merges with the published ring under another flood.
+    api.logs.set('host-0', flood(502, 998).join('\n'));
+    await new Controller(api, cfg).projectLogs(tenant());
+    const ring = linesOf(api, 'di-logs-mesh').split('\n');
+    expect(ring).toHaveLength(MAX_LINES);
+    expect(ring[0]).toBe(expected);
+    expect(ring.at(-1)).toBe(`${stamp(1499)} INFO mqtt 1499`);
   });
 
   it('attributes a service crash logged after the tick that saw its start', async () => {
