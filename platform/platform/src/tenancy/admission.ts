@@ -172,6 +172,41 @@ export function hostInterfaceAllowed(hostInterface: HostInterfaceLike): boolean 
   return hasReferences || configKeys.length > 0;
 }
 
+interface VolumeLike {
+  name: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Mirrors the workload volume rules in the CEL policy (#11). The controller authors host
+ * volumes and preopens; a tenant update may keep the controller's volumes unchanged.
+ */
+export function workloadVolumesAllowed(input: {
+  username: string;
+  controllerNamespace: string;
+  operation: 'CREATE' | 'UPDATE';
+  volumes?: VolumeLike[];
+  oldVolumes?: VolumeLike[];
+  volumeMounts: { name: string }[][];
+}): boolean {
+  if (
+    input.username === `system:serviceaccount:${input.controllerNamespace}:di-platform-controller`
+  )
+    return true;
+  const volumes = input.volumes ?? [];
+  const kept =
+    input.operation === 'UPDATE' &&
+    input.oldVolumes !== undefined &&
+    input.volumes !== undefined &&
+    JSON.stringify(volumes) === JSON.stringify(input.oldVolumes);
+  if (volumes.length > 0 && !kept) return false;
+  return input.volumeMounts.every(
+    (mounts) =>
+      mounts.length === 0 ||
+      (kept && mounts.every((mount) => volumes.some((volume) => volume.name === mount.name))),
+  );
+}
+
 export function validateBackingServiceAdmission(input: {
   namespace: string;
   type: string;
@@ -331,13 +366,27 @@ function hostInterfaceAdmissionExpression(): string {
     (${wasi} || ${wasiLogging} || ${keyvalue} || ${messaging} || ${blobstore} || ${postgres}))`;
 }
 
-function workloadPolicy(): AdmissionPolicy {
+/**
+ * Host volumes and preopens are platform-owned (#11). Only the controller may set them; a
+ * tenant update may carry the controller's volumes forward unchanged and mount nothing else.
+ */
+function workloadPolicy(namespace: string): AdmissionPolicy {
   return {
     name: 'workloads',
     apiGroups: ['runtime.wasmcloud.dev'],
     resources: ['workloaddeployments'],
     variables: [
       { name: 'w', expression: 'object.spec.template.spec' },
+      {
+        name: 'controller',
+        expression: `request.userInfo.username == 'system:serviceaccount:${namespace}:di-platform-controller'`,
+      },
+      {
+        name: 'keptVolumes',
+        expression: `request.operation == 'UPDATE' &&
+          has(oldObject.spec.template.spec.volumes) && has(variables.w.volumes) &&
+          variables.w.volumes == oldObject.spec.template.spec.volumes`,
+      },
       {
         name: 'locals',
         expression: `
@@ -357,14 +406,17 @@ function workloadPolicy(): AdmissionPolicy {
         message: 'Tenant workloads must target their own environment and cannot select a host ID',
       },
       {
-        expression: '!has(variables.w.volumes) || size(variables.w.volumes) == 0',
+        expression: `variables.controller || variables.keptVolumes ||
+          !has(variables.w.volumes) || size(variables.w.volumes) == 0`,
         message: 'Tenant workloads cannot mount host volumes',
       },
       {
         expression: `variables.locals.all(l,
           (!has(l.allowedHosts) || size(l.allowedHosts) == 0) &&
           (!has(l.allowedHostLoopbackPorts) || size(l.allowedHostLoopbackPorts) == 0) &&
-          (!has(l.volumeMounts) || size(l.volumeMounts) == 0))`,
+          (!has(l.volumeMounts) || size(l.volumeMounts) == 0 || variables.controller ||
+            (variables.keptVolumes &&
+              l.volumeMounts.all(m, variables.w.volumes.exists(v, v.name == m.name)))))`,
         message: 'Tenant guests cannot request network or host filesystem capabilities',
       },
       {
@@ -425,7 +477,7 @@ function ownershipLabelsExpression(installation: string): string {
 export function admissionResources(installation: string, namespace: string): Resource[] {
   const ownershipLabels = ownershipLabelsExpression(installation);
   const policies: AdmissionPolicy[] = [
-    workloadPolicy(),
+    workloadPolicy(namespace),
     backendConfigPolicy(namespace),
     {
       name: 'services',

@@ -102,6 +102,7 @@ describe('backing-service install', () => {
   it('loads compiled backing-services into the controller ConfigMap script map', () => {
     expect([...CONTROLLER_SCRIPT_MODULES]).toEqual([
       'backing-services',
+      'workload-storage',
       'resources',
       'backing-service-reconcile',
       'service-binding-reconcile',
@@ -121,6 +122,7 @@ describe('backing-service install', () => {
       'postgres.js',
       'resources.js',
       'service-binding-reconcile.js',
+      'workload-storage.js',
     ]);
     expect(scripts['backing-services.js']).toContain('BackingServiceClass');
     expect(scripts['backing-services.js']).toContain('keyvalue-redis');

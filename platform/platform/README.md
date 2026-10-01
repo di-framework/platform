@@ -158,6 +158,32 @@ namespace, `di-logs-<app>`, labeled `di-framework.dev/projection=logs` and
 - Tenant users cannot create, change, or delete any ConfigMap carrying
   `di-framework.dev/projection`. `di-viewer` can read it.
 
+### Persistent workload storage
+
+A tenant workload asks for a directory with the annotation
+`di-framework.dev/persistent-storage: "true"` (optionally
+`di-framework.dev/storage-mount: /data/actors`; the default guest path is `/data`).
+It carries no `volumes`, `volumeMounts`, or host paths.
+
+- The directory is `<storageRoot>/di-tenants/<tenant uid>/workloads/<key>`, where `<key>`
+  is the `di-framework.dev/workload` label (else `di-framework.dev/application`).
+  Members of one workload share it; every other workload gets its own.
+- The controller mounts each directory into `hostgroup-<tenant>` (`DirectoryOrCreate`)
+  at `/var/lib/di-framework/workloads/<key>`. A root `storage-owner` init container
+  runs `chown 65532:65532` on those mount points only (not recursively); the host stays
+  uid 65532 with a read-only root. Adding or removing a key rolls the host pod.
+- The controller then merge-patches the WorkloadDeployment (field manager
+  `di-platform-storage`) with one `hostPath` volume at that host path and a
+  `volumeMounts` preopen at the guest path.
+- Admission still denies `volumes` and `volumeMounts` from tenant users. Only the
+  controller ServiceAccount may set them; a tenant update may carry the controller's
+  volumes forward unchanged and mount only those.
+- Persistent storage needs a single tenant runtime replica (`spec.runtime.replicas: 1`).
+  With more, no directory is injected and the controller logs why.
+- When a workload goes away its volume is dropped from the host; the data stays on the node.
+- A redeploy that rewrites the component list drops the preopen until the next
+  controller tick (about 3 s) puts it back.
+
 ### Contract
 
 This section defines the v1alpha1 shape for independently requestable application

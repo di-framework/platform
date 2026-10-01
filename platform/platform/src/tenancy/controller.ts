@@ -60,6 +60,13 @@ import {
   serviceBindingResources,
   sharedBindingConflict,
 } from './service-binding-reconcile';
+import {
+  STORAGE_FIELD_MANAGER,
+  storageKeys,
+  storagePatch,
+  type WorkloadDeployment,
+  wantsStorage,
+} from './workload-storage';
 
 const plurals: Record<string, string> = {
   Namespace: 'namespaces',
@@ -358,7 +365,8 @@ export class Controller {
     const secret = await this.get<{ data: Record<string, string> }>(
       `${collection('v1', 'Secret', this.cfg.namespace)}/wasmcloud-runtime-tls`,
     );
-    const desired = tenantResources(tenant, this.cfg, secret);
+    const workloads = await this.storageWorkloads(tenant);
+    const desired = tenantResources(tenant, this.cfg, secret, storageKeys(workloads));
     let ready = !!secret;
     for (const value of desired) {
       const applied = await this.ensure(value);
@@ -898,6 +906,50 @@ export class Controller {
   }
 
   /**
+   * di-framework WorkloadDeployments in the tenant namespace that asked for persistent
+   * storage. Persistent directories live on one host, so a multi-replica tenant runtime
+   * gets none and the workload fails visibly instead of splitting its data.
+   */
+  private async storageWorkloads(tenant: Tenant): Promise<WorkloadDeployment[]> {
+    const n = names(tenant.metadata.name);
+    const workloads =
+      (
+        await this.api.call<{ items?: WorkloadDeployment[] } | undefined>(
+          'GET',
+          `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', n.namespace)}?labelSelector=${encodeURIComponent('app.kubernetes.io/managed-by=di-framework')}`,
+        )
+      )?.items?.filter(wantsStorage) ?? [];
+    if (workloads.length > 0 && (tenant.spec.runtime?.replicas ?? 1) > 1) {
+      console.error(
+        `Tenant/${tenant.metadata.name} storage: persistent storage needs a single runtime replica`,
+      );
+      return [];
+    }
+    return workloads.map((workload) => ({
+      ...workload,
+      metadata: { ...workload.metadata, namespace: n.namespace },
+    }));
+  }
+
+  /**
+   * Patch the platform-owned volume and preopen into each storage workload (#11). The host
+   * pod already mounts the directory (see tenantResources). Tenant users never author these
+   * fields; admission only lets their updates keep them unchanged.
+   */
+  async reconcileWorkloadStorage(tenant: Tenant): Promise<void> {
+    for (const workload of await this.storageWorkloads(tenant)) {
+      const patch = storagePatch(workload);
+      if (!patch) continue;
+      await this.api.call(
+        'PATCH',
+        `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', patch.metadata.namespace)}/${encodeURIComponent(patch.metadata.name)}?fieldManager=${STORAGE_FIELD_MANAGER}`,
+        patch,
+        'application/merge-patch+json',
+      );
+    }
+  }
+
+  /**
    * Publish one logs ConfigMap per console application (#10). Only `wasi:logging` lines the
    * host attributed to a workload in this tenant are kept. Nothing is written for an
    * application with no attributed lines, so absence stays the console's unpublished state.
@@ -996,6 +1048,12 @@ export class Controller {
     }
     for (const tenant of tenants) {
       if (tenant.spec.suspended || tenant.metadata.deletionTimestamp) continue;
+      try {
+        await this.reconcileWorkloadStorage(tenant);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Storage reconcile failed';
+        console.error(`Tenant/${tenant.metadata.name} storage: ${message}`);
+      }
       try {
         await this.projectLogs(tenant);
       } catch (error) {
