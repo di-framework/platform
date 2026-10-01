@@ -190,7 +190,9 @@ describe('BackingService and ServiceBinding admission helpers', () => {
       true,
     );
     expect(approvedClassName(undefined, 'keyvalue')).toBe(true);
-    expect(approvedClassName('', 'blobstore')).toBe(false);
+    expect(approvedClassName('', 'blobstore')).toBe(true);
+    expect(approvedClassName('', 'objects')).toBe(false);
+    expect(approvedClassName('blobstore-nats', 'blobstore')).toBe(true);
     expect(approvedClassName('keyvalue-redis', 'keyvalue')).toBe(true);
     expect(approvedClassName('evil-class', 'keyvalue')).toBe(false);
     expect(
@@ -220,6 +222,13 @@ describe('BackingService and ServiceBinding admission helpers', () => {
         className: 'messaging-nats',
       }),
     ).toBeUndefined();
+    expect(
+      validateBackingServiceAdmission({
+        namespace: 'di-tenant-alpha',
+        type: 'blobstore',
+        className: 'blobstore-nats',
+      }),
+    ).toBeUndefined();
   });
 
   it('rejects cross-namespace serviceName tricks on bindings', () => {
@@ -237,9 +246,16 @@ describe('BackingService and ServiceBinding admission helpers', () => {
       validateServiceBindingAdmission({
         namespace: 'di-tenant-alpha',
         serviceName: 'stock',
-        capability: 'blobstore',
+        capability: 'objects',
       }),
     ).toMatch(/capability/);
+    expect(
+      validateServiceBindingAdmission({
+        namespace: 'di-tenant-alpha',
+        serviceName: 'catalog',
+        capability: 'blobstore',
+      }),
+    ).toBeUndefined();
     expect(
       validateServiceBindingAdmission({
         namespace: 'di-tenant-alpha',
@@ -286,6 +302,30 @@ describe('hostInterfaceAllowed edge denials', () => {
     expect(hostInterfaceAllowed({ namespace: 'wasi', package: 'cli', interfaces: ['run'] })).toBe(
       false,
     );
+  });
+
+  it('selects a created blobstore only through a managed config reference', () => {
+    const blobstore = (extra: Record<string, unknown>) =>
+      hostInterfaceAllowed({
+        namespace: 'wasmcloud',
+        package: 'blobstore',
+        interfaces: ['blobstore', 'container', 'types'],
+        ...extra,
+      });
+    expect(blobstore({ configFrom: [{ name: 'di-binding-objects' }] })).toBe(true);
+    expect(blobstore({ configFrom: [{ name: 'di-bs-catalog' }] })).toBe(true);
+    expect(blobstore({ configFrom: [{ name: 'di-tenant-stock' }] })).toBe(false);
+    expect(blobstore({ configFrom: [{ name: 'objects' }] })).toBe(false);
+    expect(blobstore({ secretFrom: [{ name: 'di-binding-objects-creds' }] })).toBe(false);
+    expect(blobstore({ name: 'objects', configFrom: [{ name: 'di-binding-objects' }] })).toBe(
+      false,
+    );
+    expect(
+      blobstore({
+        configFrom: [{ name: 'di-binding-objects' }],
+        config: { url: 'nats://evil:4222' },
+      }),
+    ).toBe(false);
   });
 
   it('denies unknown packages and empty named messaging without refs', () => {

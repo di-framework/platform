@@ -77,7 +77,7 @@ describe('backing service CRDs', () => {
       { enum?: string[]; additionalProperties?: boolean }
     >;
     expect(spec.required).toEqual(['type', 'provider', 'visibility']);
-    expect(properties.type?.enum).toEqual(['keyvalue', 'messaging', 'postgres']);
+    expect(properties.type?.enum).toEqual(['keyvalue', 'messaging', 'blobstore', 'postgres']);
     expect(properties.provider?.enum).toEqual(['redis', 'nats', 'postgres']);
     expect(properties.visibility?.enum).toEqual(['AllTenants', 'SelectedTenants']);
     expect(properties.defaults?.additionalProperties).toBeUndefined();
@@ -111,7 +111,7 @@ describe('backing service CRDs', () => {
     const spec = root.properties.spec;
     expect(spec.required).toEqual(['serviceName', 'bindingName', 'capability']);
     const capability = (spec.properties as Record<string, { enum?: string[] }>).capability;
-    expect(capability?.enum).toEqual(['keyvalue', 'messaging', 'postgres']);
+    expect(capability?.enum).toEqual(['keyvalue', 'messaging', 'blobstore', 'postgres']);
     expect(root['x-kubernetes-validations']?.some((v) => v.rule.includes('serviceName'))).toBe(
       true,
     );
@@ -146,6 +146,7 @@ describe('backing service helpers', () => {
     expect(DEFAULT_CLASS_NAMES).toEqual({
       keyvalue: 'keyvalue-redis',
       messaging: 'messaging-nats',
+      blobstore: 'blobstore-nats',
       postgres: 'postgres-dedicated',
     });
     expect(defaultClassName('keyvalue')).toBe('keyvalue-redis');
@@ -154,6 +155,9 @@ describe('backing service helpers', () => {
     expect(compatibleProvider('keyvalue', 'redis')).toBe(true);
     expect(compatibleProvider('keyvalue', 'nats')).toBe(false);
     expect(compatibleProvider('messaging', 'nats')).toBe(true);
+    expect(compatibleProvider('blobstore', 'nats')).toBe(true);
+    expect(compatibleProvider('blobstore', 'redis')).toBe(false);
+    expect(resolveClassName({ type: 'blobstore' })).toBe('blobstore-nats');
   });
 
   it('validates class visibility, defaults uniqueness, and sizing fields', () => {
@@ -167,7 +171,9 @@ describe('backing service helpers', () => {
     ).toBeUndefined();
     expect(
       validateClassSpec({ type: 'keyvalue', provider: 'nats', visibility: 'AllTenants' }),
-    ).toBe('provider must match type (keyvalue+redis, messaging+nats or postgres+postgres)');
+    ).toBe(
+      'provider must match type (keyvalue+redis, messaging+nats, blobstore+nats or postgres+postgres)',
+    );
     expect(
       validateClassSpec({ type: 'messaging', provider: 'nats', visibility: 'SelectedTenants' }),
     ).toBe('allowedTenants is required when SelectedTenants');

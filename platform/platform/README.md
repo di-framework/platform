@@ -114,7 +114,7 @@ model, not a claim of developer-proof network isolation.
   `retainOnDelete` so destroying or upgrading the stack does not cascade-delete
   existing `BackingService` / `ServiceBinding` instances if the cluster remains.
   PostgreSQL retention and recovery are described below.
-- **Default classes** `keyvalue-redis`, `messaging-nats`, and `postgres-dedicated` are platform-owned
+- **Default classes** `keyvalue-redis`, `messaging-nats`, `blobstore-nats`, and `postgres-dedicated` are platform-owned
   cluster CRs (installation label, `visibility: AllTenants`, `default: true`).
   Override with Pulumi config `backingServiceClasses`, or disable seeding with
   `seedDefaultBackingClasses: false`.
@@ -127,6 +127,11 @@ model, not a claim of developer-proof network isolation.
   PLATFORM_TS_ASSETS allowlist for these modules.
 - Scheduler/control-plane NATS remains distinct from application messaging
   `BackingService` instances.
+- **Blobstore** services (`blobstore-nats`) run the same JetStream NATS image as messaging.
+  A `ServiceBinding` with `capability: blobstore` projects ConfigMap `di-binding-<binding>` with
+  `backend: nats` and `url` only. The workload host interface stays unnamed and selects the
+  store with `configFrom`; each guest container is its own object store bucket. Without a
+  binding, the unnamed interface keeps the host default store.
 - Per-tenant **runtime data-plane NATS** (`di-nats`, hostgroup `--data-nats-url`) is
   Tenant-reconciled infrastructure — not an application `BackingService`. Application
   messaging instances are named `di-bs-<service-name>` and owned by BackingService UIDs.
@@ -146,14 +151,14 @@ backing services.
 
 **BackingServiceClass** selects a capability and an approved implementation:
 
-- `spec.type`: `keyvalue` \| `messaging` \| `postgres`
+- `spec.type`: `keyvalue` \| `messaging` \| `blobstore` \| `postgres`
 - `spec.provider`: `redis` \| `nats` \| `postgres`
-- v1 compatibility is fixed: `keyvalue`+`redis`, `messaging`+`nats`, `postgres`+`postgres` (CEL + TypeScript helpers)
+- v1 compatibility is fixed: `keyvalue`+`redis`, `messaging`+`nats`, `blobstore`+`nats`, `postgres`+`postgres` (CEL + TypeScript helpers)
 - `spec.parametersSchema` / `spec.defaults`: typed sizing only (`storage`, `memory`, `cpu`);
   no images, endpoints, hostPaths, or free-form infrastructure knobs
 - `spec.visibility`: `AllTenants` \| `SelectedTenants` (requires `allowedTenants`)
 - `spec.default`: at most one default class per `type`; default names are
-  `keyvalue-redis`, `messaging-nats`, and `postgres-dedicated`
+  `keyvalue-redis`, `messaging-nats`, `blobstore-nats`, and `postgres-dedicated`
 - `spec.storageClassName`: optional PostgreSQL PVC storage class; omission uses the cluster default
 - Immutable after create: `type`, `provider`
 - Status: `Ready` condition and `observedGeneration` only

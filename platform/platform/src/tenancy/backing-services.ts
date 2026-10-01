@@ -1,5 +1,5 @@
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json | undefined };
-export type BackingCapability = 'keyvalue' | 'messaging' | 'postgres';
+export type BackingCapability = 'keyvalue' | 'messaging' | 'blobstore' | 'postgres';
 export type BackingProvider = 'redis' | 'nats' | 'postgres';
 export type ClassVisibility = 'AllTenants' | 'SelectedTenants';
 export type DeletionPolicy = 'Retain' | 'Delete';
@@ -101,16 +101,18 @@ const VERSION = `${GROUP}/v1alpha1`;
 const CLASS = `${GROUP}/class`;
 const SERVICE = `${GROUP}/service`;
 const BINDING = `${GROUP}/binding`;
-const CAPABILITIES = ['keyvalue', 'messaging', 'postgres'] as const;
+const CAPABILITIES = ['keyvalue', 'messaging', 'blobstore', 'postgres'] as const;
 const PROVIDERS = ['redis', 'nats', 'postgres'] as const;
 const DEFAULT_CLASS_NAMES = {
   keyvalue: 'keyvalue-redis',
   messaging: 'messaging-nats',
+  blobstore: 'blobstore-nats',
   postgres: 'postgres-dedicated',
 } as const;
 const COMPATIBLE: Record<BackingCapability, BackingProvider> = {
   keyvalue: 'redis',
   messaging: 'nats',
+  blobstore: 'nats',
   postgres: 'postgres',
 };
 const CREDENTIAL_STATUS_KEYS = [
@@ -244,8 +246,9 @@ const classSpec = {
       message: 'spec.provider is immutable',
     },
     {
-      rule: `(self.type == 'keyvalue' && self.provider == 'redis') || (self.type == 'messaging' && self.provider == 'nats') || (self.type == 'postgres' && self.provider == 'postgres')`,
-      message: 'provider must match type (keyvalue+redis, messaging+nats or postgres+postgres)',
+      rule: `(self.type == 'keyvalue' && self.provider == 'redis') || (self.type == 'messaging' && self.provider == 'nats') || (self.type == 'blobstore' && self.provider == 'nats') || (self.type == 'postgres' && self.provider == 'postgres')`,
+      message:
+        'provider must match type (keyvalue+redis, messaging+nats, blobstore+nats or postgres+postgres)',
     },
     {
       rule: `self.visibility != 'SelectedTenants' || (has(self.allowedTenants) && size(self.allowedTenants) > 0)`,
@@ -391,10 +394,11 @@ function validateSizing(parameters: SizingParameters | undefined): string | unde
 }
 
 function validateClassSpec(spec: BackingServiceClassSpec): string | undefined {
-  if (!CAPABILITIES.includes(spec.type)) return 'type must be keyvalue, messaging or postgres';
+  if (!CAPABILITIES.includes(spec.type))
+    return 'type must be keyvalue, messaging, blobstore or postgres';
   if (!PROVIDERS.includes(spec.provider)) return 'provider must be redis, nats or postgres';
   if (!compatibleProvider(spec.type, spec.provider))
-    return 'provider must match type (keyvalue+redis, messaging+nats or postgres+postgres)';
+    return 'provider must match type (keyvalue+redis, messaging+nats, blobstore+nats or postgres+postgres)';
   if (spec.visibility !== 'AllTenants' && spec.visibility !== 'SelectedTenants')
     return 'visibility must be AllTenants or SelectedTenants';
   if (spec.visibility === 'SelectedTenants') {
@@ -414,7 +418,8 @@ function validateClassSpec(spec: BackingServiceClassSpec): string | undefined {
 }
 
 function validateServiceSpec(spec: BackingServiceSpec): string | undefined {
-  if (!CAPABILITIES.includes(spec.type)) return 'type must be keyvalue, messaging or postgres';
+  if (!CAPABILITIES.includes(spec.type))
+    return 'type must be keyvalue, messaging, blobstore or postgres';
   if (spec.className !== undefined && spec.className !== '' && !validDnsLabel(spec.className))
     return 'className must be a valid DNS label';
   if (
@@ -430,7 +435,7 @@ function validateBindingSpec(spec: ServiceBindingSpec): string | undefined {
   if (!validDnsLabel(spec.serviceName)) return 'serviceName must be a valid DNS label';
   if (!validDnsLabel(spec.bindingName, 63)) return 'bindingName must be a valid DNS label';
   if (!CAPABILITIES.includes(spec.capability))
-    return 'capability must be keyvalue, messaging or postgres';
+    return 'capability must be keyvalue, messaging, blobstore or postgres';
   if (spec.workloadName !== undefined && !validDnsLabel(spec.workloadName, 63))
     return 'workloadName must be a valid DNS label';
   return undefined;

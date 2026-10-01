@@ -101,7 +101,7 @@ export function installTenancy(args: {
   hostImagePullPolicy: string;
   insecureRegistry?: boolean;
   storageRoot?: string;
-  /** When omitted, seeds platform defaults (`keyvalue-redis`, `messaging-nats`). */
+  /** When omitted, seeds platform defaults (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`). */
   backingServiceClasses?: BackingServiceClassDeclaration[];
 }): {
   tenants: k8s.apiextensions.CustomResource[];

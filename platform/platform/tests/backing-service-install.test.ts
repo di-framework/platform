@@ -32,12 +32,13 @@ describe('backing-service install', () => {
     }
   });
 
-  it('seeds platform-owned Redis keyvalue and NATS messaging default classes', () => {
+  it('seeds platform-owned Redis keyvalue, NATS messaging and NATS blobstore default classes', () => {
     const seeds = defaultBackingServiceClasses();
     expect(seeds.map((c) => c.name).sort()).toEqual(
       [
         DEFAULT_CLASS_NAMES.keyvalue,
         DEFAULT_CLASS_NAMES.messaging,
+        DEFAULT_CLASS_NAMES.blobstore,
         DEFAULT_CLASS_NAMES.postgres,
       ].sort(),
     );
@@ -53,7 +54,7 @@ describe('backing-service install', () => {
   it('resolves configurable class seeds from Pulumi-like config', () => {
     expect(
       resolveBackingServiceClasses({ getBoolean: () => undefined, getObject: () => undefined }),
-    ).toHaveLength(3);
+    ).toHaveLength(4);
     expect(
       resolveBackingServiceClasses({
         getBoolean: () => false,
@@ -75,7 +76,7 @@ describe('backing-service install', () => {
     });
     expect(custom.find((c) => c.name === 'keyvalue-redis')?.defaults).toEqual({ memory: '256Mi' });
     expect(custom.map((c) => c.name).sort()).toEqual(
-      ['keyvalue-redis', 'messaging-nats', 'postgres-dedicated'].sort(),
+      ['keyvalue-redis', 'messaging-nats', 'blobstore-nats', 'postgres-dedicated'].sort(),
     );
   });
 

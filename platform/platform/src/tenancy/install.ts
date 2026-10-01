@@ -31,7 +31,7 @@ export type ControllerClusterRoleRule = {
   verbs: string[];
 };
 
-/** Platform-owned default classes (`keyvalue-redis`, `messaging-nats`). */
+/** Platform-owned default classes (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`). */
 export function defaultBackingServiceClasses(): BackingServiceClassDeclaration[] {
   return (Object.keys(DEFAULT_CLASS_NAMES) as BackingCapability[]).map((type) => ({
     name: DEFAULT_CLASS_NAMES[type],
