@@ -29,8 +29,28 @@ and `logs` call; set it to `podman` or another Docker-compatible CLI. It must be
 plain command name or path (letters, digits, `.`, `_`, `/`, `+`, `-`; not starting
 with `-`). Ownership checks use only inspect templates both Docker and Podman
 support. Choose it before the first `pulumi up`; to switch engines, destroy the
-platform and deploy again (this removes cluster state). `tenants`, `users`, and the
-other platform settings are shared with the existing-cluster entrypoint.
+platform and deploy again (this removes cluster state).
+
+`registryMirrors` (default: none) gives the k0s containerd pull-through mirrors.
+It maps a registry host to an ordered list of mirror URLs, for example
+`pulumi config set --path 'registryMirrors["docker.io"][0]' https://mirror.gcr.io`
+or `registryMirrors: { "docker.io": ["https://mirror.gcr.io"] }` in the stack file.
+Before k0s starts, the container writes `/etc/k0s/containerd.d/di-framework-registry-mirrors.toml`
+(pointing the CRI image service at `/etc/containerd/certs.d`) and one
+`/etc/containerd/certs.d/<registry>/hosts.toml` per registry. containerd tries the
+mirrors in order for pulls and falls back to the upstream registry
+(`https://registry-1.docker.io` for `docker.io`, `https://<registry>` otherwise).
+Keys must be lowercase host names or `host:port`. Mirrors must be `http://` or
+`https://` URLs with a lowercase host, an optional port, and an optional path of
+letters, digits, `.`, `_`, `~`, and `-`. Credentials, queries, quotes, whitespace,
+and shell metacharacters are rejected. File contents reach the container through
+environment variables and are never interpolated into a shell command. When the
+setting is unset or `{}`, the generated commands are the same as without it. Set it
+before the first `pulumi up`; changing it later means destroying and redeploying the
+platform.
+
+`tenants`, `users`, and the other platform settings are shared with the
+existing-cluster entrypoint.
 
 ## Existing-cluster configuration
 
