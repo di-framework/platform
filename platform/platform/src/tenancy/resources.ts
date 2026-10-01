@@ -717,8 +717,27 @@ function userResources(user: User, tenants: Tenant[], cfg: ControllerConfig): Re
       binding.metadata.labels![TENANT] = membership.tenant;
       result.push(binding);
     }
+    // A long-lived token for the user's tenant kubeconfig. Kubernetes fills `token` and
+    // `ca.crt`, and deletes the Secret itself if the ServiceAccount goes away.
+    const token = make(
+      'v1',
+      'Secret',
+      userTokenSecretName(user.metadata.name, membership.tenant),
+      cfg.namespace,
+      { type: 'kubernetes.io/service-account-token' },
+    );
+    token.metadata = {
+      ...token.metadata,
+      labels: { ...token.metadata.labels, [TENANT]: membership.tenant },
+      annotations: { 'kubernetes.io/service-account.name': account },
+    };
+    result.push(token);
   }
   return result;
+}
+/** ServiceAccount token Secret backing a user's kubeconfig for one tenant membership. */
+function userTokenSecretName(user: string, tenant: string): string {
+  return `di-user-${user}-${tenant}-token`;
 }
 
 export type {
@@ -772,6 +791,7 @@ export {
   tenantResources,
   USER,
   userResources,
+  userTokenSecretName,
   VERSION,
   validName,
 };

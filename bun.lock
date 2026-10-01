@@ -15,7 +15,7 @@
     },
     "adapters/cloudfoundry": {
       "name": "@di-framework/cloudfoundry",
-      "version": "6.0.1",
+      "version": "6.0.2",
       "devDependencies": {
         "@di-framework/core": "^5",
         "@types/bun": "latest",
@@ -27,11 +27,11 @@
     },
     "platform/backup-agent": {
       "name": "@di-framework/backup-agent",
-      "version": "6.0.1",
+      "version": "6.0.2",
     },
     "platform/backup-destination": {
       "name": "@di-framework/backup-destination",
-      "version": "6.0.1",
+      "version": "6.0.2",
       "dependencies": {
         "@pulumi/kubernetes": "4.34.0",
         "@pulumi/pulumi": "3.261.0",
@@ -39,7 +39,7 @@
     },
     "platform/bindings": {
       "name": "@di-framework/bindings",
-      "version": "6.0.1",
+      "version": "6.0.2",
       "devDependencies": {
         "@di-framework/core": "^5",
         "@types/bun": "latest",
@@ -51,19 +51,21 @@
     },
     "platform/platform": {
       "name": "@di-framework/platform",
-      "version": "6.0.1",
+      "version": "6.0.2",
       "dependencies": {
         "@pulumi/command": "1.2.1",
         "@pulumi/kubernetes": "4.34.0",
         "@pulumi/pulumi": "3.261.0",
+        "js-yaml": "4.3.2",
       },
       "devDependencies": {
+        "@types/js-yaml": "4.0.9",
         "@types/node": "26.1.2",
       },
     },
     "platform/sqlite-component": {
       "name": "@di-framework/sqlite-component",
-      "version": "6.0.1",
+      "version": "6.0.2",
     },
   },
   "packages": {
@@ -222,6 +224,8 @@
     "@types/bun": ["@types/bun@1.4.2", "", { "dependencies": { "bun-types": "1.4.2" } }, "sha512-GimotNn7+ZV0uVArItBbriZsR1oNf0+WTzPkdcFrzShI7k2norL0uzEaJT8T33dWr7O/c9ZDuAFQrctKCi72oQ=="],
 
     "@types/google-protobuf": ["@types/google-protobuf@3.15.12", "", {}, "sha512-40um9QqwHjRS92qnOaDpL7RmDK15NuZYo9HihiJRbYkMQZlWnuH8AdvbMy8/o6lgLmKbDUKa+OALCltHdbOTpQ=="],
+
+    "@types/js-yaml": ["@types/js-yaml@4.0.9", "", {}, "sha512-k4MGaQl5TGo/iipqb2UDG2UwjXziSWkh0uysQelTlJpX1qGlpUZYm8PnO4DxG1qBomtJUdYJ6qR6xdIah10JLg=="],
 
     "@types/node": ["@types/node@26.1.2", "", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-Vu4a5UFA9rIIFJ7rB/Vaafh9lrCQszopTCx6KjFboXTGQbPNasehVR5TEiithSDGyd1DEiUByggTZsg8jukeIg=="],
 

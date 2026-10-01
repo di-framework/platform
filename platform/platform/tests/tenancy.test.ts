@@ -10,8 +10,10 @@ import {
   TENANT,
   type Tenant,
   tenantResources,
+  USER,
   type User,
   userResources,
+  userTokenSecretName,
   VERSION,
 } from '../src/tenancy/resources';
 
@@ -205,7 +207,34 @@ describe('tenant and user resource reconciliation', () => {
     t.metadata.generation = 2;
     expect(userResources(u, [t], cfg)).toHaveLength(1);
     t.metadata.generation = 1;
-    expect(userResources(u, [t], cfg)).toHaveLength(3);
+    expect(userResources(u, [t], cfg)).toHaveLength(4);
+  });
+  it('declares a ServiceAccount token Secret for each ready membership', () => {
+    const u = user();
+    u.spec.memberships.push({ tenant: 'beta', role: 'viewer' });
+    const secrets = userResources(u, [tenant(), tenant('beta')], cfg).filter(
+      (r) => r.kind === 'Secret',
+    );
+    expect(secrets).toEqual([
+      expect.objectContaining({
+        type: 'kubernetes.io/service-account-token',
+        metadata: expect.objectContaining({
+          name: 'di-user-alice-alpha-token',
+          namespace: 'wasmcloud',
+          labels: {
+            [INSTALLATION]: 'test',
+            [OWNER]: 'alice-uid',
+            [USER]: 'alice',
+            [TENANT]: 'alpha',
+          },
+          annotations: { 'kubernetes.io/service-account.name': 'di-user-alice' },
+        }),
+      }),
+      expect.objectContaining({
+        metadata: expect.objectContaining({ name: 'di-user-alice-beta-token' }),
+      }),
+    ]);
+    expect(userTokenSecretName('alice', 'beta')).toBe('di-user-alice-beta-token');
   });
   it('only adopts namespaces explicitly seeded for this installation and tenant', async () => {
     const { api, controller, t } = prepare();
@@ -251,18 +280,53 @@ describe('tenant and user resource reconciliation', () => {
     api.operations = [];
     await controller.reconcileUser(u, [t]);
     const deletes = api.operations.filter((o) => o.method === 'DELETE');
-    expect(deletes).toHaveLength(3);
-    expect(deletes[2]!.path).toContain('/serviceaccounts/di-user-alice');
+    expect(deletes).toHaveLength(4);
+    expect(deletes[2]?.path).toContain('/secrets/di-user-alice-alpha-token');
+    expect(deletes[3]?.path).toContain('/serviceaccounts/di-user-alice');
     expect(
       [...api.objects.values()].filter((r) => r.metadata.labels?.[OWNER] === u.metadata.uid),
     ).toHaveLength(0);
     expect(u.status?.serviceAccount).toBeNull();
+  });
+  it('reports Ready only once Kubernetes populates every token Secret', async () => {
+    const { api, controller, t, u } = prepare();
+    await controller.reconcileUser(u, [t]);
+    const tokenPath = '/api/v1/namespaces/wasmcloud/secrets/di-user-alice-alpha-token';
+    expect(api.objects.get(tokenPath)).toMatchObject({
+      type: 'kubernetes.io/service-account-token',
+      metadata: { annotations: { 'kubernetes.io/service-account.name': 'di-user-alice' } },
+    });
+    expect(u.status?.conditions?.[0]).toMatchObject({ status: 'False', reason: 'TokenPending' });
+    // The token controller fills data outside the controller's server-side-apply field set.
+    const token = api.objects.get(tokenPath);
+    if (token) token.data = { token: 'dG9rZW4=', 'ca.crt': 'Y2E=' };
+    await controller.reconcileUser(u, [t]);
+    expect(u.status?.conditions?.[0]).toMatchObject({ status: 'True', reason: 'Reconciled' });
+    expect(api.objects.get(tokenPath)?.data).toEqual({ token: 'dG9rZW4=', 'ca.crt': 'Y2E=' });
+  });
+  it('deletes the token Secret of a removed membership and keeps the others', async () => {
+    const { api, controller, t, u } = prepare();
+    const beta = tenant('beta');
+    u.spec.memberships.push({ tenant: 'beta', role: 'viewer' });
+    await controller.reconcileUser(u, [t, beta]);
+    const secrets = () =>
+      [...api.objects.values()].filter((r) => r.kind === 'Secret' && r.metadata.labels?.[OWNER]);
+    expect(secrets().map((r) => r.metadata.name)).toEqual([
+      'di-user-alice-alpha-token',
+      'di-user-alice-beta-token',
+    ]);
+    u.spec.memberships = [{ tenant: 'beta', role: 'viewer' }];
+    await controller.reconcileUser(u, [t, beta]);
+    expect(secrets().map((r) => r.metadata.name)).toEqual(['di-user-alice-beta-token']);
   });
   it('removes memberships even when the referenced tenant no longer exists', async () => {
     const { api, controller, t, u } = prepare();
     await controller.reconcileUser(u, [t]);
     await controller.reconcileUser(u, []);
     expect([...api.objects.values()].filter((r) => r.kind === 'RoleBinding')).toHaveLength(0);
+    expect(
+      [...api.objects.values()].filter((r) => r.metadata.name === 'di-user-alice-alpha-token'),
+    ).toHaveLength(0);
     expect(u.status?.conditions?.[0]?.reason).toBe('TenantNotReady');
   });
   it('retains namespaces and stops deployments when a tenant is deleted by default', async () => {

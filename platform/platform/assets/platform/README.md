@@ -77,6 +77,7 @@ values. Changing mirrors later requires destroying and redeploying the platform.
 | `endpoints.kubernetes` | loopback API server URL |
 | `endpoints.registry` | loopback registry URL |
 | `endpoints.http` | loopback HTTP URL |
+| `kubeconfigs` | secret: `{ [tenant]: { [user]: kubeconfig } }`, one per user membership |
 
 ## Lifecycle
 
@@ -159,19 +160,22 @@ tenant; the platform does **not** claim finer credential isolation. Admission
 still blocks CLI/API bypass for forged hostInterfaces and mutation of
 controller-managed config (see `@di-framework/platform` README).
 
-As administrator, use the platform kubeconfig to issue an expiring user token:
+Each membership gets a kubeconfig built from a controller-managed ServiceAccount
+token Secret (`di-user-<user>-<tenant>-token` in `wasmcloud`), with the loopback API
+server, the cluster CA, and the tenant workload namespace selected. Pulumi reads it
+once the User is Ready and exports it in the secret `kubeconfigs` output:
 
 ```sh
-export KUBECONFIG="$(pulumi stack output kubeconfig)"
-kubectl create token di-user-alice -n wasmcloud --duration=8h
+pulumi stack output kubeconfigs --show-secrets | jq -r '.warehouse.alice' > alice.kubeconfig
+chmod 600 alice.kubeconfig
 ```
 
-Build the user's kubeconfig with the same cluster server and CA from the admin
-kubeconfig, this token as its **only** credential, and the tenant workload namespace
-as its context namespace. Do not distribute the admin kubeconfig or its client
-certificate/key. Kubernetes may shorten the requested token lifetime. Tokens are
-never stored in User status or Pulumi outputs. The `users` output identifies the
-ServiceAccount; `tenants` identifies the namespaces and host group.
+The token is the kubeconfig's **only** credential; do not distribute the admin
+kubeconfig or its client certificate/key. `viewer` users get read-only access.
+The token does not expire: removing the membership or suspending the user deletes
+its Secret and invalidates it. Tokens are never stored in User status. The `users`
+output identifies the ServiceAccount; `tenants` identifies the namespaces and host
+group.
 
 Configure a deployment target with the user's kubeconfig,
 `namespace = "di-tenant-warehouse"` and `hostgroup = "tenant-warehouse"`.
