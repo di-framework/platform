@@ -13,9 +13,12 @@ import {
 import {
   appendRing,
   applicationKey,
-  attributeLogs,
+  attributeEntries,
   logsConfigMap,
+  mergeFailures,
   PROJECTION,
+  type ProjectedEntry,
+  projectedFailures,
   projectedLines,
   validLabelValue,
   type WorkloadIdentity,
@@ -980,8 +983,10 @@ export class Controller {
 
   /**
    * Publish one logs ConfigMap per console application (#10). Only `wasi:logging` lines the
-   * host attributed to a workload in this tenant are kept. Nothing is written for an
-   * application with no attributed lines, so absence stays the console's unpublished state.
+   * host attributed to a workload in this tenant, and host WARN/ERROR lines from its
+   * `workload_start` span, are kept. The newest host failure per WorkloadDeployment goes to
+   * `data.failures`. Nothing is written for an application with no attributed lines, so
+   * absence stays the console's unpublished state.
    */
   async projectLogs(tenant: Tenant): Promise<void> {
     const n = names(tenant.metadata.name);
@@ -1011,6 +1016,9 @@ export class Controller {
       existing.map((item) => [item.metadata.labels?.['di-framework.dev/application'] ?? '', item]),
     );
     const incoming = new Map<string, string[]>();
+    // Failures are merged newest-wins by deployment, so they skip the line floor: a
+    // restarted controller re-reading old lines cannot duplicate them, and never loses one.
+    const failures = new Map<string, ProjectedEntry[]>();
     for (const pod of pods.items) {
       if (pod.status?.phase !== 'Running') continue;
       const cursorKey = pod.metadata.uid ?? pod.metadata.name;
@@ -1023,24 +1031,33 @@ export class Controller {
         `${collection('v1', 'Pod', n.runtimeNamespace)}/${encodeURIComponent(pod.metadata.name)}/log?${query}`,
       );
       let newest = cursor ?? '';
-      for (const [app, lines] of attributeLogs(text ?? '', n.namespace, deployments)) {
+      for (const [app, entries] of attributeEntries(text ?? '', n.namespace, deployments)) {
         // A restarted controller resumes after the newest line it already published.
         const floor = cursor ?? projectedLines(existingByApp.get(app)).at(-1)?.split(' ')[0] ?? '';
-        const fresh = lines.filter((line) => (line.split(' ')[0] ?? '') > floor);
-        for (const line of fresh) {
-          const stamp = line.split(' ')[0] ?? '';
-          if (stamp > newest) newest = stamp;
-        }
-        incoming.set(app, [...(incoming.get(app) ?? []), ...fresh]);
+        const fresh = entries.filter((entry) => entry.time > floor);
+        for (const entry of fresh) if (entry.time > newest) newest = entry.time;
+        incoming.set(app, [...(incoming.get(app) ?? []), ...fresh.map((entry) => entry.line)]);
+        failures.set(app, [...(failures.get(app) ?? []), ...entries]);
       }
       if (newest) this.logCursors.set(cursorKey, newest);
     }
     const live = new Set(deployments.map(applicationKey));
     for (const [app, lines] of incoming) {
-      if (lines.length === 0 || !live.has(app) || !validLabelValue(app)) continue;
-      const merged = appendRing(projectedLines(existingByApp.get(app)), lines);
+      if (!live.has(app) || !validLabelValue(app)) continue;
+      const current = existingByApp.get(app);
+      const previous = projectedFailures(current);
+      const members = deployments.filter((d) => applicationKey(d) === app).map((d) => d.name);
+      const merged = mergeFailures(previous, failures.get(app) ?? [], members);
+      if (lines.length === 0 && JSON.stringify(merged) === JSON.stringify(previous)) continue;
       await this.ensure(
-        logsConfigMap(tenant.metadata.name, n.namespace, this.cfg.installation, app, merged),
+        logsConfigMap(
+          tenant.metadata.name,
+          n.namespace,
+          this.cfg.installation,
+          app,
+          appendRing(projectedLines(current), lines),
+          merged,
+        ),
       );
     }
     for (const [app, configMap] of existingByApp) {

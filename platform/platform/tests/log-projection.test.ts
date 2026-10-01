@@ -1,4 +1,6 @@
 import { describe, expect, it, spyOn } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   admissionResources,
   hostInterfaceAllowed,
@@ -8,12 +10,19 @@ import { type Api, ApiError, Controller, collection } from '../src/tenancy/contr
 import {
   appendRing,
   applicationKey,
+  attributeEntries,
   attributeLogs,
+  formatHostLine,
   formatProjectedLine,
+  type HostFailure,
   logsConfigMap,
   logsConfigMapName,
+  logsOptedOut,
   MAX_LINES,
+  mergeFailures,
   parseGuestLogLine,
+  parseHostFailureLine,
+  projectedFailures,
   projectedLines,
   redactLogText,
   resolveWorkload,
@@ -34,6 +43,10 @@ const NS = 'di-tenant-alpha';
 
 function linesOf(api: { configMaps: Map<string, Resource> }, name: string): string {
   return (api.configMaps.get(name)?.data as { lines?: string } | undefined)?.lines ?? '';
+}
+
+function projectedFailuresText(configMap: Resource | undefined): string {
+  return (configMap?.data as { failures?: string } | undefined)?.failures ?? '{}';
 }
 
 /** Shape of a wash 2.8 TracingLogger event: fmt layer, no target, no ANSI. */
@@ -102,6 +115,115 @@ describe('parseGuestLogLine', () => {
   });
 });
 
+/** Real wash 2.8 host log from the `examples` cluster (ANSI stripped), tenant meshtastic. */
+const SAMPLE = readFileSync(join(import.meta.dir, 'fixtures/host-log-sample.txt'), 'utf8');
+const MESH_NS = 'di-tenant-meshtastic';
+const meshDeployments: WorkloadIdentity[] = [
+  { name: 'mesh-collector', labels: { 'di-framework.dev/workload': 'mesh' } },
+  { name: 'mesh-site', labels: { 'di-framework.dev/workload': 'mesh' } },
+];
+const sampleLine = (needle: string) =>
+  SAMPLE.split('\n').find((line) => line.includes(needle)) as string;
+
+/** A host failure line shaped like wash 2.8: outer span, nested span, message. */
+function failureLine(
+  message: string,
+  opts: { name?: string; namespace?: string; at?: string; level?: string; nested?: string } = {},
+): string {
+  const name = opts.name ?? 'mesh-collector-ff55d9589-795c7b5cd6';
+  const namespace = opts.namespace ?? NS;
+  const nested =
+    opts.nested ??
+    `workload_start{workload.id="w-1" workload.name="${name}" workload.namespace="${namespace}"}:`;
+  return `${opts.at ?? '2026-10-01T10:00:00.000001Z'}  ${opts.level ?? 'WARN'} workload_start{workload_id=w-1 workload.name="${name}" workload.namespace="${namespace}"}:${nested} ${message}`;
+}
+
+describe('parseHostFailureLine', () => {
+  it('attributes real host WARN/ERROR lines by their workload_start span fields', () => {
+    expect(
+      parseHostFailureLine(
+        sampleLine(
+          '5d8e1b04-4e6d-48b9-a7af-222f9b257528" workload.name="mesh-collector-ff55d9589-795c7b5cd6" workload.namespace="di-tenant-meshtastic"}: service did not',
+        ),
+      ),
+    ).toEqual({
+      timestamp: '2026-10-01T19:19:39.903159Z',
+      level: 'WARN',
+      workloadName: 'mesh-collector-ff55d9589-795c7b5cd6',
+      namespace: MESH_NS,
+      message:
+        'service did not properly execute workload_id="5d8e1b04-4e6d-48b9-a7af-222f9b257528"',
+    });
+    expect(parseHostFailureLine(sampleLine('ERROR workload_start{workload_id=12fa'))).toMatchObject(
+      {
+        level: 'ERROR',
+        workloadName: 'mesh-site-dd5fc4dc-558f5d4b4',
+        message:
+          'failed to start workload workload_id="12fa33da-760e-4018-9e62-c9722f56bc1b" reason="no host header found"',
+      },
+    );
+    // Three spans deep (resolve_workload), still the same workload.
+    expect(parseHostFailureLine(sampleLine('notify HTTP handler'))?.message).toStartWith(
+      'failed to notify HTTP handler of resolved workload',
+    );
+  });
+
+  it('ignores INFO, other spans, and lines without a span chain', () => {
+    expect(parseHostFailureLine(sampleLine('Starting workload'))).toBeUndefined();
+    expect(parseHostFailureLine(sampleLine('connected to NATS'))).toBeUndefined();
+    expect(
+      parseHostFailureLine('2026-10-01T10:00:00Z  WARN workload_stop{workload_id=x}: oops'),
+    ).toBeUndefined();
+    expect(parseHostFailureLine('2026-10-01T10:00:00Z ERROR no span here')).toBeUndefined();
+    expect(parseHostFailureLine('')).toBeUndefined();
+  });
+
+  it('requires both fields on the outer span and agreement in nested spans', () => {
+    expect(
+      parseHostFailureLine(
+        `2026-10-01T10:00:00Z  WARN workload_start{workload_id=w workload.name="greeter"}: x`,
+      ),
+    ).toBeUndefined();
+    expect(
+      parseHostFailureLine(
+        failureLine('x', {
+          nested: 'workload_start{workload.name="greeter" workload.namespace="di-tenant-alpha"}:',
+        }),
+      ),
+    ).toBeUndefined();
+    expect(
+      parseHostFailureLine(
+        failureLine('x', { nested: 'resolve_workload{workload.namespace="di-tenant-beta"}:' }),
+      ),
+    ).toBeUndefined();
+    // A nested span without workload fields is fine.
+    expect(parseHostFailureLine(failureLine('x', { nested: 'plugin{}:' }))?.message).toBe('x');
+    // Malformed span fields are rejected rather than guessed.
+    expect(
+      parseHostFailureLine(
+        `2026-10-01T10:00:00Z  WARN workload_start{workload.name="a" workload.namespace="${NS}" "junk"}: x`,
+      ),
+    ).toBeUndefined();
+  });
+
+  it('cannot be re-attributed by message text that imitates a span or guest fields', () => {
+    const forged = failureLine(
+      'failed to start workload reason="workload_start{workload.name=\\"greeter\\"}: x"',
+      { level: 'ERROR' },
+    );
+    expect(parseHostFailureLine(forged)?.workloadName).toBe('mesh-collector-ff55d9589-795c7b5cd6');
+    // A guest TracingLogger line is never a host failure, even inside a workload_start span.
+    const guest = `2026-10-01T10:00:00Z  WARN workload_start{workload_id=w workload.name="greeter" workload.namespace="${NS}"}: hi workload.component_id="c" workload.name="greeter" workload.namespace="${NS}" context="x"`;
+    expect(parseHostFailureLine(guest)).toBeUndefined();
+    expect(parseGuestLogLine(guest)?.message).toBe('hi');
+  });
+
+  it('strips terminal colour codes and unescapes quoted span values', () => {
+    const line = `\u001b[2m2026-10-01T10:00:00Z\u001b[0m \u001b[31mERROR\u001b[0m workload_start{workload_id=w workload.name="a\\"b" workload.namespace="${NS}"}: boom\r`;
+    expect(parseHostFailureLine(line)).toMatchObject({ workloadName: 'a"b', message: 'boom' });
+  });
+});
+
 describe('redaction and formatting', () => {
   it('removes bearer tokens, assigned secrets, URL credentials, and long tokens', () => {
     expect(redactLogText('Authorization: Bearer abc.def')).toBe('[redacted]');
@@ -123,6 +245,13 @@ describe('redaction and formatting', () => {
     const parsed = parseGuestLogLine(hostLine('token=abc started'));
     expect(parsed && formatProjectedLine(parsed)).toBe(
       '2026-10-01T10:00:00.000001Z INFO [redacted] started',
+    );
+  });
+
+  it('formats a host failure line with a host: prefix, redacted', () => {
+    const parsed = parseHostFailureLine(failureLine('failed reason="password=hunter2"'));
+    expect(parsed && formatHostLine(parsed)).toBe(
+      '2026-10-01T10:00:00.000001Z WARN host: failed reason="[redacted]',
     );
   });
 });
@@ -157,6 +286,126 @@ describe('workload attribution', () => {
       '2026-10-01T10:00:00.000001Z INFO collector up',
       '2026-10-01T10:00:00.000001Z INFO site up',
     ]);
+  });
+
+  it('attributes every real host failure in the sample to mesh, newest per deployment', () => {
+    const entries = attributeEntries(SAMPLE, MESH_NS, meshDeployments).get('mesh') ?? [];
+    expect(entries.every((entry) => entry.failure)).toBe(true);
+    expect(entries.map((entry) => entry.line)).toContain(
+      '2026-10-01T19:19:39.903159Z WARN host: service did not properly execute workload_id="5d8e1b04-4e6d-48b9-a7af-222f9b257528"',
+    );
+    const failures = mergeFailures({}, entries, ['mesh-collector', 'mesh-site']);
+    expect(failures).toEqual({
+      'mesh-collector': {
+        workload: 'mesh-collector-ff55d9589-795c7b5cd6',
+        time: '2026-10-01T19:19:39.903159Z',
+        level: 'WARN',
+        message:
+          'service did not properly execute workload_id="5d8e1b04-4e6d-48b9-a7af-222f9b257528"',
+      },
+      'mesh-site': {
+        workload: 'mesh-site-86db6d86d4-5b677f4cd5',
+        time: '2026-10-01T18:56:38.649965Z',
+        level: 'ERROR',
+        message:
+          'failed to start workload workload_id="86e465e9-9d32-4663-9998-5ac3c9005420" reason="no host header found"',
+      },
+    });
+    // The running collector (currentReplicaSet mesh-collector-ff55d9589) is FAILED; the
+    // running site (mesh-site-64f85bb94f) is not, its failures belong to old replica sets.
+    expect(failures['mesh-collector']?.workload.startsWith('mesh-collector-ff55d9589-')).toBe(true);
+    expect(failures['mesh-site']?.workload.startsWith('mesh-site-64f85bb94f-')).toBe(false);
+    // Another tenant's namespace attributes nothing.
+    expect(attributeEntries(SAMPLE, NS, meshDeployments).size).toBe(0);
+  });
+
+  it('drops guest lines of an opted-out deployment but keeps its host failures', () => {
+    const optedOut = [
+      { ...deployments[0], annotations: { 'di-framework.dev/logs': 'false' } } as WorkloadIdentity,
+      ...deployments.slice(1),
+    ];
+    expect(logsOptedOut(optedOut[0] as WorkloadIdentity)).toBe(true);
+    expect(logsOptedOut({ name: 'x', annotations: { 'di-framework.dev/logs': 'true' } })).toBe(
+      false,
+    );
+    const text = [
+      hostLine('collector secret output'),
+      hostLine('site up', { name: 'mesh-site' }),
+      failureLine('service did not properly execute', { name: 'mesh-collector-abc-1' }),
+    ].join('\n');
+    expect(attributeLogs(text, NS, optedOut).get('mesh')).toEqual([
+      '2026-10-01T10:00:00.000001Z INFO site up',
+      '2026-10-01T10:00:00.000001Z WARN host: service did not properly execute',
+    ]);
+  });
+});
+
+describe('data.failures', () => {
+  const failure = (time: string, workload = 'mesh-collector-a-1'): HostFailure => ({
+    workload,
+    time,
+    level: 'ERROR',
+    message: 'boom',
+  });
+
+  it('keeps the newest failure per live deployment', () => {
+    const entry = (deployment: string, time: string, withFailure = true) => ({
+      time,
+      line: `${time} ERROR host: boom`,
+      deployment,
+      failure: withFailure ? failure(time) : undefined,
+    });
+    expect(
+      mergeFailures(
+        {
+          'mesh-collector': failure('2026-10-01T10:00:02Z'),
+          gone: failure('2026-10-01T10:00:09Z'),
+        },
+        [
+          entry('mesh-collector', '2026-10-01T10:00:01Z'),
+          entry('mesh-site', '2026-10-01T10:00:03Z'),
+          entry('mesh-site', '2026-10-01T10:00:04Z'),
+          entry('mesh-site', '2026-10-01T10:00:05Z', false),
+          entry('stranger', '2026-10-01T10:00:06Z'),
+        ],
+        ['mesh-collector', 'mesh-site'],
+      ),
+    ).toEqual({
+      'mesh-collector': failure('2026-10-01T10:00:02Z'),
+      'mesh-site': failure('2026-10-01T10:00:04Z'),
+    });
+  });
+
+  it('reads well-formed entries only', () => {
+    const cm = (failures: unknown) =>
+      ({
+        ...logsConfigMap('alpha', NS, 'test', 'mesh', []),
+        data: { lines: '', failures },
+      }) as Resource;
+    expect(projectedFailures(undefined)).toEqual({});
+    expect(projectedFailures(cm(undefined))).toEqual({});
+    expect(projectedFailures(cm('{not json'))).toEqual({});
+    expect(projectedFailures(cm('[]'))).toEqual({});
+    expect(projectedFailures(cm('null'))).toEqual({});
+    expect(
+      projectedFailures(
+        cm(
+          JSON.stringify({
+            ok: { ...failure('t'), extra: 'dropped' },
+            badLevel: { ...failure('t'), level: 'INFO' },
+            noTime: { workload: 'w', level: 'WARN', message: 'm' },
+            empty: null,
+          }),
+        ),
+      ),
+    ).toEqual({ ok: failure('t') });
+  });
+
+  it('writes data.failures only when there are failures', () => {
+    expect(logsConfigMap('alpha', NS, 'test', 'mesh', ['a']).data).toEqual({ lines: 'a' });
+    expect(
+      logsConfigMap('alpha', NS, 'test', 'mesh', ['a'], { 'mesh-site': failure('t') }).data,
+    ).toEqual({ lines: 'a', failures: JSON.stringify({ 'mesh-site': failure('t') }) });
   });
 });
 
@@ -354,6 +603,77 @@ describe('Controller.projectLogs', () => {
       '2026-10-01T10:00:02.000000Z INFO already published',
       '2026-10-01T10:00:05.000000Z INFO new',
     ]);
+  });
+
+  it('publishes host failures, honours the logs opt-out, and survives a restart', async () => {
+    const api = new LogApi();
+    api.workloads = [
+      {
+        metadata: {
+          ...(deployments[0] as WorkloadIdentity),
+          annotations: { 'di-framework.dev/logs': 'false' },
+        },
+      },
+      ...deployments.slice(1).map((d) => ({ metadata: d })),
+    ];
+    const log = [
+      hostLine('collector guest output', { at: '2026-10-01T10:00:01.000000Z' }),
+      failureLine('service did not properly execute', {
+        name: 'mesh-collector-aaa-1',
+        at: '2026-10-01T10:00:02.000000Z',
+      }),
+      failureLine('failed to start workload reason="no host header found"', {
+        name: 'mesh-site-bbb-1',
+        level: 'ERROR',
+        at: '2026-10-01T10:00:03.000000Z',
+      }),
+    ];
+    api.logs.set('host-0', log.join('\n'));
+    await new Controller(api, cfg).projectLogs(tenant());
+    const expectedLines = [
+      '2026-10-01T10:00:02.000000Z WARN host: service did not properly execute',
+      '2026-10-01T10:00:03.000000Z ERROR host: failed to start workload reason="no host header found"',
+    ];
+    const expectedFailures = {
+      'mesh-collector': {
+        workload: 'mesh-collector-aaa-1',
+        time: '2026-10-01T10:00:02.000000Z',
+        level: 'WARN',
+        message: 'service did not properly execute',
+      },
+      'mesh-site': {
+        workload: 'mesh-site-bbb-1',
+        time: '2026-10-01T10:00:03.000000Z',
+        level: 'ERROR',
+        message: 'failed to start workload reason="no host header found"',
+      },
+    };
+    const failuresOf = () => JSON.parse(projectedFailuresText(api.configMaps.get('di-logs-mesh')));
+    expect(linesOf(api, 'di-logs-mesh').split('\n')).toEqual(expectedLines);
+    expect(failuresOf()).toEqual(expectedFailures);
+
+    // A restarted controller re-reads the same tail: no duplicate lines, no lost failures,
+    // and no write at all.
+    let patches = 0;
+    const call = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown) => {
+      if (method === 'PATCH') patches++;
+      return call<T>(method, path, body);
+    };
+    await new Controller(api, cfg).projectLogs(tenant());
+    expect(patches).toBe(0);
+    expect(linesOf(api, 'di-logs-mesh').split('\n')).toEqual(expectedLines);
+    expect(failuresOf()).toEqual(expectedFailures);
+
+    // A ConfigMap written before failures existed: failures older than the line floor
+    // are still recorded, without re-adding the lines.
+    api.configMaps.set(
+      'di-logs-mesh',
+      logsConfigMap('alpha', NS, 'test', 'mesh', ['2026-10-01T10:00:09.000000Z INFO later']),
+    );
+    await new Controller(api, cfg).projectLogs(tenant());
+    expect(linesOf(api, 'di-logs-mesh')).toBe('2026-10-01T10:00:09.000000Z INFO later');
+    expect(failuresOf()).toEqual(expectedFailures);
   });
 
   it('writes nothing without attributed lines and removes projections of removed apps', async () => {
