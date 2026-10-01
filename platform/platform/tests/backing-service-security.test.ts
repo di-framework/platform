@@ -259,6 +259,37 @@ describe('BackingService and ServiceBinding admission helpers', () => {
 });
 
 describe('hostInterfaceAllowed edge denials', () => {
+  it('allows an unnamed blobstore and a cli run service, and rejects configured ones', () => {
+    expect(
+      hostInterfaceAllowed({
+        namespace: 'wasmcloud',
+        package: 'blobstore',
+        interfaces: ['blobstore', 'container', 'types'],
+      }),
+    ).toBe(true);
+    expect(
+      hostInterfaceAllowed({
+        namespace: 'wasmcloud',
+        package: 'blobstore',
+        name: 'objects',
+        interfaces: ['blobstore'],
+      }),
+    ).toBe(false);
+    expect(
+      hostInterfaceAllowed({
+        namespace: 'wasmcloud',
+        package: 'blobstore',
+        config: { url: 'nats://evil:4222' },
+      }),
+    ).toBe(false);
+    expect(hostInterfaceAllowed({ namespace: 'wasi', package: 'cli', interfaces: ['run'] })).toBe(
+      true,
+    );
+    expect(
+      hostInterfaceAllowed({ namespace: 'wasi', package: 'cli', interfaces: ['environment'] }),
+    ).toBe(false);
+  });
+
   it('denies unknown packages and empty named messaging without refs', () => {
     expect(hostInterfaceAllowed({ namespace: 'wasmcloud', package: 'secrets' })).toBe(false);
     expect(
