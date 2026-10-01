@@ -1052,7 +1052,10 @@ export class Controller {
         const floor = cursor ?? projectedLines(existingByApp.get(app)).at(-1)?.split(' ')[0] ?? '';
         const fresh = entries.filter((entry) => entry.time > floor);
         for (const entry of fresh) if (entry.time > newest) newest = entry.time;
-        incoming.set(app, [...(incoming.get(app) ?? []), ...fresh.map((entry) => entry.line)]);
+        incoming.set(app, [
+          ...(incoming.get(app) ?? []),
+          ...fresh.flatMap((entry) => (entry.line ? [entry.line] : [])),
+        ]);
         failures.set(app, [...(failures.get(app) ?? []), ...entries]);
       }
       if (newest) this.logCursors.set(cursorKey, newest);

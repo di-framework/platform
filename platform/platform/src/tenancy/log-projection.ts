@@ -252,12 +252,16 @@ export interface HostFailure {
   message: string;
 }
 
-/** One projected line; `failure` is set for host failure lines. */
+/**
+ * One attributed event. `line` is what the ring shows; `failure` is set for host failure
+ * lines; `start` (host workload name, no line) marks a `Starting workload` line.
+ */
 export interface ProjectedEntry {
   time: string;
-  line: string;
+  line?: string;
   deployment: string;
   failure?: HostFailure;
+  start?: string;
 }
 
 /** True when the WorkloadDeployment opted out of guest log projection. */
@@ -361,9 +365,16 @@ export function attributeEntries(
       if (!workload) continue;
       if (span.level !== 'INFO') {
         failure(workload, span);
-      } else if (workload.service && span.message.startsWith('Starting workload')) {
-        running = running.filter((r) => r.id !== span.workloadId);
-        running.push({ id: span.workloadId, name: span.workloadName, workload });
+      } else if (span.message.startsWith('Starting workload')) {
+        add(workload, {
+          time: span.timestamp,
+          deployment: workload.name,
+          start: span.workloadName,
+        });
+        if (workload.service) {
+          running = running.filter((r) => r.id !== span.workloadId);
+          running.push({ id: span.workloadId, name: span.workloadName, workload });
+        }
       }
       continue;
     }
@@ -396,7 +407,7 @@ export function attributeLogs(
   for (const [app, entries] of attributeEntries(text, namespace, deployments))
     result.set(
       app,
-      entries.map((entry) => entry.line),
+      entries.flatMap((entry) => (entry.line ? [entry.line] : [])),
     );
   return result;
 }
@@ -449,6 +460,9 @@ export function projectedFailures(configMap: Resource | undefined): Record<strin
  * Newest failure per WorkloadDeployment, limited to `deployments` (the application's live
  * members), so the map stays bounded by the application size. A later WARN about the same
  * host workload (e.g. `max restarts reached`) does not replace its ERROR, which says why.
+ * A `Starting workload` of a different host workload, later than the recorded failure,
+ * removes it: the deployment has moved on (e.g. the host retried the same replica set).
+ * Timestamps are compared, so re-reading an older start never removes a newer failure.
  */
 export function mergeFailures(
   existing: Record<string, HostFailure>,
@@ -459,9 +473,19 @@ export function mergeFailures(
   const merged: Record<string, HostFailure> = {};
   for (const [name, failure] of Object.entries(existing))
     if (live.has(name)) merged[name] = failure;
-  for (const entry of entries) {
-    if (!entry.failure || !live.has(entry.deployment)) continue;
+  // Several pods' reads are concatenated; apply events in time order (stable).
+  for (const entry of [...entries].sort((a, b) =>
+    a.time < b.time ? -1 : a.time > b.time ? 1 : 0,
+  )) {
+    if (!live.has(entry.deployment)) continue;
     const current = merged[entry.deployment];
+    if (entry.start) {
+      // A newer host workload of the deployment started after the failure: it is history.
+      if (current && current.time < entry.time && current.workload !== entry.start)
+        delete merged[entry.deployment];
+      continue;
+    }
+    if (!entry.failure) continue;
     if (current && entry.failure.time <= current.time) continue;
     if (
       current?.workload === entry.failure.workload &&

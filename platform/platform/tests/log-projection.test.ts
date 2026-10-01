@@ -236,8 +236,14 @@ describe('service supervisor failures (no span)', () => {
       'mesh-collector-6f67d47bb6-6986d4778b',
     ]);
     // The guest wasi:logging lines are still projected; backtrace lines are not.
-    expect(entries.filter((entry) => !entry.failure)).toHaveLength(2);
-    expect(entries.some((entry) => entry.line.includes('wasm function'))).toBe(false);
+    expect(entries.filter((entry) => !entry.failure && !entry.start)).toHaveLength(2);
+    expect(entries.some((entry) => entry.line?.includes('wasm function'))).toBe(false);
+    // Every Starting workload line is an event too, services or not.
+    expect(entries.filter((entry) => entry.start).map((entry) => entry.start)).toEqual([
+      'mesh-site-68fcf6968f-66f7457f68',
+      'mesh-collector-55dc4445f5-86f7dd895c',
+      'mesh-collector-6f67d47bb6-6986d4778b',
+    ]);
     // The ERROR stays the failure; the later WARN about the same workload does not replace it.
     expect(mergeFailures({}, entries, ['mesh-collector', 'mesh-site'])).toEqual({
       'mesh-collector': {
@@ -469,7 +475,7 @@ describe('workload attribution', () => {
 
   it('attributes every real host failure in the sample to mesh, newest per deployment', () => {
     const entries = attributeEntries(SAMPLE, MESH_NS, meshDeployments).get('mesh') ?? [];
-    expect(entries.every((entry) => entry.failure)).toBe(true);
+    expect(entries.every((entry) => entry.failure || entry.start)).toBe(true);
     expect(entries.map((entry) => entry.line)).toContain(
       '2026-10-01T19:19:39.903159Z WARN host: service did not properly execute workload_id="5d8e1b04-4e6d-48b9-a7af-222f9b257528"',
     );
@@ -482,18 +488,19 @@ describe('workload attribution', () => {
         message:
           'service did not properly execute workload_id="5d8e1b04-4e6d-48b9-a7af-222f9b257528"',
       },
-      'mesh-site': {
-        workload: 'mesh-site-86db6d86d4-5b677f4cd5',
-        time: '2026-10-01T18:56:38.649965Z',
-        level: 'ERROR',
-        message:
-          'failed to start workload workload_id="86e465e9-9d32-4663-9998-5ac3c9005420" reason="no host header found"',
-      },
     });
-    // The running collector (currentReplicaSet mesh-collector-ff55d9589) is FAILED; the
-    // running site (mesh-site-64f85bb94f) is not, its failures belong to old replica sets.
+    // The running collector (currentReplicaSet mesh-collector-ff55d9589) is FAILED. The site's
+    // last failure (mesh-site-86db6d86d4-…) was followed by the start of
+    // mesh-site-64f85bb94f-5c5c6d6856, which removed it.
     expect(failures['mesh-collector']?.workload.startsWith('mesh-collector-ff55d9589-')).toBe(true);
-    expect(failures['mesh-site']?.workload.startsWith('mesh-site-64f85bb94f-')).toBe(false);
+    // Without that start the site keeps its newest failure.
+    const noSiteStart = entries.filter(
+      (entry) => entry.start !== 'mesh-site-64f85bb94f-5c5c6d6856',
+    );
+    expect(mergeFailures({}, noSiteStart, ['mesh-site'])['mesh-site']).toMatchObject({
+      workload: 'mesh-site-86db6d86d4-5b677f4cd5',
+      level: 'ERROR',
+    });
     // Another tenant's namespace attributes nothing.
     expect(attributeEntries(SAMPLE, NS, meshDeployments).size).toBe(0);
   });
@@ -525,6 +532,44 @@ describe('data.failures', () => {
     time,
     level: 'ERROR',
     message: 'boom',
+  });
+
+  it('drops a failure when a different host workload starts later, across reads', () => {
+    const fail = (time: string, workload: string) => ({
+      time,
+      line: `${time} ERROR host: x`,
+      deployment: 'mesh-site',
+      failure: { workload, time, level: 'ERROR' as const, message: 'timed out' },
+    });
+    const start = (time: string, workload: string) => ({
+      time,
+      deployment: 'mesh-site',
+      start: workload,
+    });
+    const old = 'mesh-site-78b9f6d4b6-55b5d9c569';
+    const fresh = 'mesh-site-78b9f6d4b6-5d4d5db5c6';
+    const live = ['mesh-site'];
+    // Same read: failure, then a retry of the same replica set.
+    expect(mergeFailures({}, [fail('t1', old), start('t2', fresh)], live)).toEqual({});
+    // Start in a later read than the failure (existing ConfigMap entry).
+    const recorded = mergeFailures({}, [fail('t1', old)], live);
+    expect(mergeFailures(recorded, [start('t2', fresh)], live)).toEqual({});
+    // Entries out of order (several pods) are applied in time order.
+    expect(mergeFailures({}, [start('t2', fresh), fail('t1', old)], live)).toEqual({});
+    // Re-read (lookback) of an older start, its own workload's start, a start of another
+    // deployment, and a start at the same instant never remove the failure.
+    expect(mergeFailures(recorded, [start('t0', fresh)], live)).toEqual(recorded);
+    expect(mergeFailures(recorded, [start('t2', old)], live)).toEqual(recorded);
+    expect(mergeFailures(recorded, [{ ...start('t2', fresh), deployment: 'other' }], live)).toEqual(
+      recorded,
+    );
+    expect(mergeFailures(recorded, [start('t1', fresh)], live)).toEqual(recorded);
+    // The newer workload failing after its start records as before.
+    expect(
+      mergeFailures(recorded, [start('t2', fresh), fail('t3', fresh)], live)['mesh-site']?.workload,
+    ).toBe(fresh);
+    // No recorded failure: a start is a no-op.
+    expect(mergeFailures({}, [start('t2', fresh)], live)).toEqual({});
   });
 
   it('keeps an ERROR over a later WARN of the same workload only', () => {
@@ -877,6 +922,33 @@ describe('Controller.projectLogs', () => {
     await new Controller(api, cfg).projectLogs(tenant());
     expect(linesOf(api, 'di-logs-mesh')).toBe('2026-10-01T10:00:09.000000Z INFO later');
     expect(failuresOf()).toEqual(expectedFailures);
+  });
+
+  it('clears a failure when the deployment starts a new host workload, dropping the key', async () => {
+    const api = new LogApi();
+    const failed = failureLine('failed to start workload reason="timed out"', {
+      name: 'mesh-site-78b9f6d4b6-55b5d9c569',
+      level: 'ERROR',
+      at: at(2),
+    });
+    api.logs.set(
+      'host-0',
+      [startLine('mesh-site-78b9f6d4b6-55b5d9c569', 'w-1', 1), failed].join('\n'),
+    );
+    const controller = new Controller(api, cfg);
+    await controller.projectLogs(tenant());
+    expect(
+      Object.keys(JSON.parse(projectedFailuresText(api.configMaps.get('di-logs-mesh')))),
+    ).toEqual(['mesh-site']);
+    // The retry's start arrives in a later read, with the failure again in the lookback.
+    api.logs.set(
+      'host-0',
+      [failed, startLine('mesh-site-78b9f6d4b6-5d4d5db5c6', 'w-2', 3)].join('\n'),
+    );
+    await controller.projectLogs(tenant());
+    expect(api.configMaps.get('di-logs-mesh')?.data).toEqual({
+      lines: `${at(2)} ERROR host: failed to start workload reason="timed out"`,
+    });
   });
 
   it('attributes a service crash logged after the tick that saw its start', async () => {

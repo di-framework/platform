@@ -250,7 +250,13 @@ the newest host failure per WorkloadDeployment in `data.failures`.
   The host `workload.name` is `<currentReplicaSet name>-<suffix>`, so a deployment is
   failing when `failures[name].workload` starts with `status.currentReplicaSet.name-`;
   an entry from an older replica set is history. A later WARN about the same host
-  workload (`max restarts reached`) does not replace its ERROR. Entries of deployments that left the
+  workload (`max restarts reached`) does not replace its ERROR. A `Starting workload`
+  line for the deployment with a different host workload name, later than the
+  recorded failure, removes the entry (for example after the host retries the same
+  replica set with a new suffix and that start succeeds). Timestamps are compared,
+  so re-reading an older start never removes a newer failure, and the start may
+  arrive in a later read than the failure. When no entries remain, `data.failures`
+  is dropped. Entries of deployments that left the
   application are dropped on the next write, so the key stays bounded by its member
   count.
 - A restarted controller resumes after the newest published line, so lines are not
