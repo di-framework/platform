@@ -7,6 +7,18 @@ import * as path from 'node:path';
 import * as command from '@pulumi/command';
 import * as k8s from '@pulumi/kubernetes';
 import * as pulumi from '@pulumi/pulumi';
+import {
+  type ContainerScope,
+  containerCli,
+  deleteOwnedContainer,
+  deleteOwnedNetwork,
+  deleteOwnedVolume,
+  readKubeconfig,
+  refuseExistingContainerThenRun,
+  refuseExistingNetworkThenCreate,
+  refuseExistingVolumeThenCreate,
+  shutdownRuntime,
+} from './container-cli';
 import { createPlatform } from './index';
 import { localPathStorageResources } from './local-storage';
 
@@ -17,6 +29,7 @@ const namespaceName = 'wasmcloud';
 const ownershipLabel = 'di-framework.dev.platform-scope';
 
 const config = new pulumi.Config();
+const cli = containerCli(config.get('containerCli'));
 const apiPort = hostPort(config, 'apiPort', 26443);
 const registryPort = hostPort(config, 'registryPort', 25000);
 const httpPort = hostPort(config, 'httpPort', 28180);
@@ -32,45 +45,39 @@ const k0sName = `${scope}-k0s`;
 const k0sDataName = `${scope}-k0s-data`;
 const k0sPodLogsName = `${scope}-k0s-pod-logs`;
 const kubeconfigFile = path.resolve(`.kubeconfig-${stack}`);
+const owned: ContainerScope = { cli, ownershipLabel, scope };
 
 const runtimeNetwork = new command.local.Command('runtime-network', {
-  create: refuseExistingNetworkThenCreate(networkName),
-  delete: deleteOwnedNetwork(networkName),
+  create: refuseExistingNetworkThenCreate(owned, networkName),
+  delete: deleteOwnedNetwork(owned, networkName),
 });
 
 const k0sData = new command.local.Command('k0s-data', {
-  create: refuseExistingVolumeThenCreate(k0sDataName),
-  delete: deleteOwnedVolume(k0sDataName),
+  create: refuseExistingVolumeThenCreate(owned, k0sDataName),
+  delete: deleteOwnedVolume(owned, k0sDataName),
 });
 
 const k0sPodLogs = new command.local.Command('k0s-pod-logs', {
-  create: refuseExistingVolumeThenCreate(k0sPodLogsName),
-  delete: deleteOwnedVolume(k0sPodLogsName),
+  create: refuseExistingVolumeThenCreate(owned, k0sPodLogsName),
+  delete: deleteOwnedVolume(owned, k0sPodLogsName),
 });
 
 const k0s = new command.local.Command(
   'k0s',
   {
-    create: [
-      'set -eu;',
-      `if docker container inspect ${k0sName} >/dev/null 2>&1; then`,
-      `echo "Refusing to replace existing container ${k0sName}" >&2; exit 1; fi;`,
-      'docker run -d',
-      `--name ${k0sName}`,
-      `--hostname ${k0sName}`,
-      `--label ${ownershipLabel}=${scope}`,
-      `--network ${networkName}`,
-      '--privileged',
-      '--tmpfs /run:rw,nosuid,nodev,exec,mode=755',
-      `--mount type=volume,source=${k0sDataName},target=/var/lib/k0s`,
-      `--mount type=volume,source=${k0sPodLogsName},target=/var/log/pods`,
-      `--publish 127.0.0.1:${apiPort}:6443`,
-      `--publish 127.0.0.1:${registryPort}:${REGISTRY_NODE_PORT}`,
-      `--publish 127.0.0.1:${httpPort}:${HTTP_NODE_PORT}`,
-      K0S_IMAGE,
-      'k0s controller --enable-worker --no-taints',
-    ].join(' '),
-    delete: deleteOwnedContainer(k0sName),
+    create: refuseExistingContainerThenRun(owned, {
+      name: k0sName,
+      image: K0S_IMAGE,
+      network: networkName,
+      dataVolume: k0sDataName,
+      podLogsVolume: k0sPodLogsName,
+      publish: [
+        { host: apiPort, container: 6443 },
+        { host: registryPort, container: REGISTRY_NODE_PORT },
+        { host: httpPort, container: HTTP_NODE_PORT },
+      ],
+    }),
+    delete: deleteOwnedContainer(owned, k0sName),
   },
   {
     dependsOn: [runtimeNetwork, k0sData, k0sPodLogs],
@@ -81,18 +88,7 @@ const k0s = new command.local.Command(
 const kubeconfigCommand = new command.local.Command(
   'kubeconfig',
   {
-    create: [
-      'set -eu;',
-      'attempt=0;',
-      `until docker exec ${k0sName} k0s kubectl get --raw=/readyz >/dev/null 2>&1 &&`,
-      `docker exec ${k0sName} k0s kubectl wait node --all --for=condition=Ready --timeout=5s >/dev/null 2>&1; do`,
-      'attempt=$((attempt + 1));',
-      `if [ "$attempt" -ge 90 ]; then docker logs --tail 200 ${k0sName} >&2; exit 1; fi;`,
-      'sleep 2;',
-      'done;',
-      `docker exec ${k0sName} k0s kubeconfig admin |`,
-      `sed -E 's#server: https://[^:]+:6443#server: https://127.0.0.1:${apiPort}#'`,
-    ].join(' '),
+    create: readKubeconfig(cli, k0sName, apiPort),
     logging: command.types.enums.local.Logging.None,
   },
   { dependsOn: [k0s], additionalSecretOutputs: ['stdout'] },
@@ -133,15 +129,7 @@ const platform = createPlatform({
       'runtime-shutdown',
       {
         create: 'true',
-        delete: [
-          'set -eu;',
-          'docker exec "$K0S_NAME" k0s kubectl --namespace "$NAMESPACE"',
-          'delete deployment/hostgroup-default',
-          '--ignore-not-found=true --wait=true --timeout=180s;',
-          'docker exec "$K0S_NAME" k0s kubectl --namespace "$NAMESPACE"',
-          'delete hosts.runtime.wasmcloud.dev --all',
-          '--ignore-not-found=true --wait=true --timeout=180s',
-        ].join(' '),
+        delete: shutdownRuntime(cli),
         environment: { K0S_NAME: k0sName, NAMESPACE: namespaceName },
       },
       { dependsOn: [wasmcloud, kubeconfigFileCommand] },
@@ -181,43 +169,4 @@ function sanitize(value: string): string {
     .replace(/[^a-z0-9-]+/g, '-')
     .replace(/^-+|-+$/g, '');
   return sanitized || 'stack';
-}
-
-function refuseExistingNetworkThenCreate(name: string): string {
-  return [
-    'set -eu;',
-    `if docker network inspect ${name} >/dev/null 2>&1; then`,
-    `echo "Refusing to replace existing network ${name}" >&2; exit 1; fi;`,
-    `docker network create --label ${ownershipLabel}=${scope} ${name}`,
-  ].join(' ');
-}
-
-function refuseExistingVolumeThenCreate(name: string): string {
-  return [
-    'set -eu;',
-    `if docker volume inspect ${name} >/dev/null 2>&1; then`,
-    `echo "Refusing to replace existing volume ${name}" >&2; exit 1; fi;`,
-    `docker volume create --label ${ownershipLabel}=${scope} ${name}`,
-  ].join(' ');
-}
-
-function deleteOwnedContainer(name: string): string {
-  return [
-    `owner="$(docker container inspect --format '{{ index .Config.Labels "${ownershipLabel}" }}' ${name} 2>/dev/null || true)";`,
-    `[ "$owner" != "${scope}" ] || docker container rm --force ${name}`,
-  ].join(' ');
-}
-
-function deleteOwnedNetwork(name: string): string {
-  return [
-    `owner="$(docker network inspect --format '{{ index .Labels "${ownershipLabel}" }}' ${name} 2>/dev/null || true)";`,
-    `[ "$owner" != "${scope}" ] || docker network rm ${name}`,
-  ].join(' ');
-}
-
-function deleteOwnedVolume(name: string): string {
-  return [
-    `owner="$(docker volume inspect --format '{{ index .Labels "${ownershipLabel}" }}' ${name} 2>/dev/null || true)";`,
-    `[ "$owner" != "${scope}" ] || docker volume rm ${name}`,
-  ].join(' ');
 }
