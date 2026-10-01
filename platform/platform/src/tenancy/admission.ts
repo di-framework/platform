@@ -95,11 +95,6 @@ export function hostInterfaceAllowed(hostInterface: HostInterfaceLike): boolean 
     if (hasName || hasReferences) return false;
     return packageName === 'config' || configKeys.every((key) => key === 'host' || key === 'path');
   }
-  // A long-lived workload service exports only wasi:cli/run, with no config.
-  if (namespace === 'wasi' && packageName === 'cli') {
-    if (hasName || hasReferences || configKeys.length > 0) return false;
-    return hostInterface.interfaces?.length === 1 && hostInterface.interfaces[0] === 'run';
-  }
 
   if (namespace !== 'wasmcloud') return false;
   if (packageName === 'postgres') {
@@ -274,10 +269,6 @@ function hostInterfaceAdmissionExpression(): string {
     (!has(h.config) ||
       (h['package'] == 'http' && h.config.all(k, k in ['host', 'path'])) ||
       h['package'] == 'config'))`;
-  const wasiCli = `(h['namespace'] == 'wasi' && h['package'] == 'cli' &&
-    ${unnamed} && ${noSecretReferences} && ${noConfigReferences} &&
-    (!has(h.config) || size(h.config) == 0) &&
-    has(h.interfaces) && size(h.interfaces) == 1 && h.interfaces[0] == 'run')`;
 
   // Unnamed keyvalue is restricted to the transitional stock ConfigMap.
   const stockKeyvalue = `(${unnamed} &&
@@ -317,7 +308,7 @@ function hostInterfaceAdmissionExpression(): string {
           h.secretFrom[0].name == '${BINDING_CONFIG_PREFIX}' + h.name.substring(0, size(h.name) - 9) + '-creds')))))`;
 
   return `!has(variables.w.hostInterfaces) || variables.w.hostInterfaces.all(h,
-    (${wasi} || ${wasiCli} || ${keyvalue} || ${messaging} || ${blobstore} || ${postgres}))`;
+    (${wasi} || ${keyvalue} || ${messaging} || ${blobstore} || ${postgres}))`;
 }
 
 function workloadPolicy(): AdmissionPolicy {
@@ -359,7 +350,7 @@ function workloadPolicy(): AdmissionPolicy {
       {
         expression: hostInterfaceAdmissionExpression(),
         message:
-          'Only wasi http/config or cli run, or wasmcloud keyvalue/messaging/blobstore/postgres with controller-managed di-bs-/di-binding- (or transitional di-tenant-stock / default NATS / host blobstore) references are allowed',
+          'Only wasi http/config or wasmcloud keyvalue/messaging/blobstore/postgres with controller-managed di-bs-/di-binding- (or transitional di-tenant-stock / default NATS / host blobstore) references are allowed',
       },
     ],
   };

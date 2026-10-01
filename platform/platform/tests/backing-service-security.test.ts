@@ -259,7 +259,7 @@ describe('BackingService and ServiceBinding admission helpers', () => {
 });
 
 describe('hostInterfaceAllowed edge denials', () => {
-  it('allows an unnamed blobstore and a cli run service, and rejects configured ones', () => {
+  it('allows an unnamed blobstore, and rejects configured ones and wasi:cli', () => {
     expect(
       hostInterfaceAllowed({
         namespace: 'wasmcloud',
@@ -282,12 +282,10 @@ describe('hostInterfaceAllowed edge denials', () => {
         config: { url: 'nats://evil:4222' },
       }),
     ).toBe(false);
+    // wash runs a long-lived program from spec.template.spec.service, not a host interface.
     expect(hostInterfaceAllowed({ namespace: 'wasi', package: 'cli', interfaces: ['run'] })).toBe(
-      true,
+      false,
     );
-    expect(
-      hostInterfaceAllowed({ namespace: 'wasi', package: 'cli', interfaces: ['environment'] }),
-    ).toBe(false);
   });
 
   it('denies unknown packages and empty named messaging without refs', () => {
@@ -389,6 +387,8 @@ describe('tenant RBAC, quotas, admission policies, and network isolation', () =>
     expect(expr).toContain(BS_CONFIG_PREFIX);
     expect(expr).toContain(BINDING_CONFIG_PREFIX);
     expect(expr).toContain(STOCK_CONFIG_NAME);
+    expect(expr).toContain("h['package'] == 'blobstore'");
+    expect(expr).not.toContain("h['package'] == 'cli'");
     const reserved = policies.find((p) => p.metadata.name === 'test-backend-config');
     expect(JSON.stringify(reserved?.spec)).toContain('secrets');
     expect(JSON.stringify(reserved?.spec)).toContain(BS_CONFIG_PREFIX);
