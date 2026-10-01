@@ -56,6 +56,7 @@ function connectionUrl(endpoint: EndpointSummary, provider: BackingProvider): st
  * Non-secret host plugin keys for a named wasmCloud hostInterface.
  * Keyvalue: backend=redis, url, optional prefix (layout only).
  * Messaging: backend=nats, url (subscriptions stay workload-owned).
+ * Blobstore: backend=nats, url. Each guest container is its own JetStream object store.
  */
 function bindingConfigData(
   binding: ServiceBinding,
@@ -156,18 +157,26 @@ function serviceBindingResources(
 /**
  * Hint for WorkloadDeployment hostInterfaces (#455 will wire this into deploy).
  * Named entries are required for independent Redis/NATS backend selection.
+ * Blobstore stays unnamed: componentize-qjs cannot encode a named blobstore import,
+ * so the binding ConfigMap is the only selector.
  */
 function bindingHostInterfaceProjection(binding: {
   bindingName: string;
-  capability: 'keyvalue' | 'messaging';
+  capability: 'keyvalue' | 'messaging' | 'blobstore';
 }): {
-  name: string;
+  name?: string;
   namespace: 'wasmcloud';
   package: BackingCapability;
   configFrom: { name: string }[];
   secretFrom?: { name: string }[];
 } {
   const pkg = binding.capability;
+  if (pkg === 'blobstore')
+    return {
+      namespace: 'wasmcloud',
+      package: pkg,
+      configFrom: [{ name: bindingProjectionName(binding.bindingName) }],
+    };
   return {
     name: binding.bindingName,
     namespace: 'wasmcloud',

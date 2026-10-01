@@ -148,7 +148,7 @@ function binding(
   spec: {
     serviceName: string;
     bindingName: string;
-    capability: 'keyvalue' | 'messaging';
+    capability: 'keyvalue' | 'messaging' | 'blobstore';
     workloadName?: string;
   },
 ): ServiceBinding {
@@ -191,6 +191,32 @@ describe('service binding helpers', () => {
       namespace: 'wasmcloud',
       package: 'messaging',
       configFrom: [{ name: 'di-binding-sync' }],
+    });
+    // Blobstore stays unnamed; the ConfigMap is the only selector.
+    expect(
+      bindingHostInterfaceProjection({ bindingName: 'objects', capability: 'blobstore' }),
+    ).toEqual({
+      namespace: 'wasmcloud',
+      package: 'blobstore',
+      configFrom: [{ name: 'di-binding-objects' }],
+    });
+  });
+
+  it('projects a blobstore binding as backend nats plus url only', () => {
+    const objects = binding('mesh-objects', {
+      serviceName: 'catalog',
+      bindingName: 'objects',
+      capability: 'blobstore',
+    });
+    expect(
+      bindingConfigData(objects, {
+        host: 'di-bs-catalog.di-runtime-alpha.svc.cluster.local',
+        port: 4222,
+        capability: 'blobstore',
+      }),
+    ).toEqual({
+      backend: 'nats',
+      url: 'nats://di-bs-catalog.di-runtime-alpha.svc.cluster.local:4222',
     });
   });
 

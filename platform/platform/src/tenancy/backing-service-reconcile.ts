@@ -19,7 +19,7 @@ import {
 
 /** Label identifying the owning BackingService name on provisioned infra. */
 const SERVICE = `${GROUP}/service`;
-/** Label identifying capability (keyvalue|messaging) on provisioned infra. */
+/** Label identifying capability (keyvalue|messaging|blobstore) on provisioned infra. */
 const CAPABILITY = `${GROUP}/capability`;
 
 /**

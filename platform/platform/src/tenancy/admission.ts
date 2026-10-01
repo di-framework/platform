@@ -1,4 +1,5 @@
 import {
+  CAPABILITIES,
   DEFAULT_CLASS_NAMES,
   GROUP,
   INSTALLATION,
@@ -52,7 +53,9 @@ export function ownershipLabelsAllowed(
 
 export function approvedClassName(className: string | undefined, type: string): boolean {
   if (className === undefined || className === '') {
-    return type === 'keyvalue' || type === 'messaging' || type === 'postgres';
+    return (
+      type === 'keyvalue' || type === 'messaging' || type === 'blobstore' || type === 'postgres'
+    );
   }
   return APPROVED_CLASS_NAMES.has(className);
 }
@@ -112,9 +115,18 @@ export function hostInterfaceAllowed(hostInterface: HostInterfaceLike): boolean 
     const name = hostInterface.name.slice(0, -suffix.length);
     return !!name && secretFrom.length === 1 && secretFrom[0]?.name === `di-binding-${name}-creds`;
   }
-  // Unnamed blobstore uses the host data store. No URL, bucket list, or secret.
+  // Blobstore stays unnamed. Without references it uses the host data store; a created
+  // service is selected only through a controller-managed di-binding-/di-bs- ConfigMap.
   if (packageName === 'blobstore') {
-    if (hasName || hasReferences || configKeys.length > 0) return false;
+    if (hasName || secretFrom.length > 0 || configKeys.length > 0) return false;
+    if (
+      !configFrom.every(
+        (reference) =>
+          reference.name.startsWith(BINDING_CONFIG_PREFIX) ||
+          reference.name.startsWith(BS_CONFIG_PREFIX),
+      )
+    )
+      return false;
     const interfaces = hostInterface.interfaces ?? [];
     return interfaces.every(
       (iface) => iface === 'blobstore' || iface === 'container' || iface === 'types',
@@ -162,8 +174,8 @@ export function validateBackingServiceAdmission(input: {
 }): string | undefined {
   if (!ownershipLabelsAllowed(input.labels, input.namespace, input.installation))
     return 'BackingService ownership labels must derive from the tenant namespace';
-  if (input.type !== 'keyvalue' && input.type !== 'messaging' && input.type !== 'postgres')
-    return 'BackingService type must be keyvalue, messaging or postgres';
+  if (!(CAPABILITIES as readonly string[]).includes(input.type))
+    return 'BackingService type must be keyvalue, messaging, blobstore or postgres';
   if (!approvedClassName(input.className, input.type))
     return 'BackingService className must be an approved platform default (fail-closed)';
   return undefined;
@@ -180,12 +192,8 @@ export function validateServiceBindingAdmission(input: {
     return 'ServiceBinding ownership labels must derive from the tenant namespace';
   if (!serviceNameSameNamespace(input.serviceName))
     return 'ServiceBinding serviceName must reference a BackingService in the same namespace';
-  if (
-    input.capability !== 'keyvalue' &&
-    input.capability !== 'messaging' &&
-    input.capability !== 'postgres'
-  )
-    return 'ServiceBinding capability must be keyvalue, messaging or postgres';
+  if (!(CAPABILITIES as readonly string[]).includes(input.capability))
+    return 'ServiceBinding capability must be keyvalue, messaging, blobstore or postgres';
   return undefined;
 }
 
@@ -294,7 +302,8 @@ function hostInterfaceAdmissionExpression(): string {
     (${defaultMessaging} || ${namedMessaging}))`;
 
   const blobstore = `(h['namespace'] == 'wasmcloud' && h['package'] == 'blobstore' &&
-    ${unnamed} && ${noSecretReferences} && ${noConfigReferences} &&
+    ${unnamed} && ${noSecretReferences} &&
+    (!has(h.configFrom) || size(h.configFrom) == 0 || h.configFrom.all(c, ${managedConfigName})) &&
     (!has(h.config) || size(h.config) == 0) &&
     (!has(h.interfaces) || h.interfaces.all(i, i in ['blobstore', 'container', 'types'])))`;
 
@@ -418,9 +427,9 @@ export function admissionResources(installation: string, namespace: string): Res
           message: 'BackingService ownership labels must derive from the tenant namespace',
         },
         {
-          expression: `object.spec.type in ['keyvalue', 'messaging', 'postgres'] &&
+          expression: `object.spec.type in ['keyvalue', 'messaging', 'blobstore', 'postgres'] &&
             (!has(object.spec.className) || object.spec.className == '' ||
-              object.spec.className in ['${DEFAULT_CLASS_NAMES.keyvalue}', '${DEFAULT_CLASS_NAMES.messaging}', '${DEFAULT_CLASS_NAMES.postgres}'])`,
+              object.spec.className in ['${DEFAULT_CLASS_NAMES.keyvalue}', '${DEFAULT_CLASS_NAMES.messaging}', '${DEFAULT_CLASS_NAMES.blobstore}', '${DEFAULT_CLASS_NAMES.postgres}'])`,
           message:
             'BackingService className must be an approved platform default (fail-closed for unknown classes)',
         },
@@ -436,11 +445,11 @@ export function admissionResources(installation: string, namespace: string): Res
           message: 'ServiceBinding ownership labels must derive from the tenant namespace',
         },
         {
-          expression: `object.spec.capability in ['keyvalue', 'messaging', 'postgres'] &&
+          expression: `object.spec.capability in ['keyvalue', 'messaging', 'blobstore', 'postgres'] &&
             object.spec.serviceName != '' &&
             !object.spec.serviceName.contains('/') && !object.spec.serviceName.contains('.')`,
           message:
-            'ServiceBinding must reference a same-namespace BackingService with capability keyvalue, messaging or postgres',
+            'ServiceBinding must reference a same-namespace BackingService with capability keyvalue, messaging, blobstore or postgres',
         },
       ],
     },
