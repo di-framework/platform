@@ -1,4 +1,5 @@
 import { backingServiceCrds } from './backing-services';
+import { PRIVATE_IPV4_RANGES } from './egress';
 import { hostStorage } from './workload-storage';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json | undefined };
 export interface Metadata {
@@ -435,16 +436,7 @@ function tenantResources(
             {
               to: [
                 {
-                  ipBlock: {
-                    cidr: '0.0.0.0/0',
-                    except: [
-                      '10.0.0.0/8',
-                      '172.16.0.0/12',
-                      '192.168.0.0/16',
-                      '169.254.0.0/16',
-                      '127.0.0.0/8',
-                    ],
-                  },
+                  ipBlock: { cidr: '0.0.0.0/0', except: [...PRIVATE_IPV4_RANGES] },
                 },
               ],
               ports: [{ protocol: 'TCP', port: 443 }],

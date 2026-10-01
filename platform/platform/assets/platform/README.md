@@ -227,7 +227,7 @@ changes belong in the shared package rather than copied tenancy files.
 Backing-service CRD contracts (`BackingServiceClass`, `BackingService`,
 `ServiceBinding`), authorization boundaries, and runtime feasibility notes live in
 the `@di-framework/platform` package README. Platform install seeds the approved
-default classes (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`), retains CRDs on stack destroy,
+default classes (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`, `egress-public`), retains CRDs on stack destroy,
 ships compiled controller scripts including `backing-services.js`, and enforces
 tenant RBAC / admission / quotas / backend NetworkPolicy isolation (#452).
 

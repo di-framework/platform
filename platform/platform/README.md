@@ -57,7 +57,7 @@ existing-cluster entrypoint.
 `kubeconfig` is required (a local file path); `context`, `namespace`, `release`,
 `chart`, `chartVersion`, `httpNodePort`, `timeoutSeconds`, `insecureRegistry`,
 `storageRoot`, `networkPolicyEngine`, `kubernetesEndpoint`, `httpEndpoint`, `routeUrlPattern`,
-and administrator `values` are optional. `tenants`, `users`,
+`egressAllowedDestinations`, and administrator `values` are optional. `tenants`, `users`,
 `tenantHostImage`, and `tenantHostImagePullPolicy` use the same declarations as the
 local entrypoint. NodePort zero makes the HTTP gateway ClusterIP. Registry installation is off
 for existing clusters. Shared hosts are disabled regardless of values overrides. Set `networkPolicyEngine`
@@ -185,14 +185,17 @@ model, not a claim of developer-proof network isolation.
   `retainOnDelete` so destroying or upgrading the stack does not cascade-delete
   existing `BackingService` / `ServiceBinding` instances if the cluster remains.
   PostgreSQL retention and recovery are described below.
-- **Default classes** `keyvalue-redis`, `messaging-nats`, `blobstore-nats`, and `postgres-dedicated` are platform-owned
+- **Default classes** `keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`,
+  and `egress-public` are platform-owned
   cluster CRs (installation label, `visibility: AllTenants`, `default: true`).
   Override with Pulumi config `backingServiceClasses`, or disable seeding with
-  `seedDefaultBackingClasses: false`.
+  `seedDefaultBackingClasses: false`. `egress-public` approves the Pulumi config list
+  `egressAllowedDestinations` (`host:port` / `*.suffix:port`, default `[]`, which approves nothing).
 - **Controller scripts** are TypeScript sources compiled by `tsc` into
-  `dist/tenancy/*.js` (`backing-services`, `resources`, `backing-service-reconcile`,
+  `dist/tenancy/*.js` (`egress`, `backing-services`, `resources`, `backing-service-reconcile`,
   `service-binding-reconcile`, `postgres`, `controller`). Pulumi loads those compiled files into
-  the controller ConfigMap; `resources.js` requires `./backing-services` at runtime,
+  the controller ConfigMap; `resources.js` requires `./backing-services` (which requires
+  `./egress`) at runtime,
   and `controller.js` requires `resources.js`, `backing-service-reconcile.js`, and
   `service-binding-reconcile.js` and `postgres.js`. There is no runtime `transpileModule` or
   PLATFORM_TS_ASSETS allowlist for these modules.
@@ -206,6 +209,45 @@ model, not a claim of developer-proof network isolation.
 - Per-tenant **runtime data-plane NATS** (`di-nats`, hostgroup `--data-nats-url`) is
   Tenant-reconciled infrastructure — not an application `BackingService`. Application
   messaging instances are named `di-bs-<service-name>` and owned by BackingService UIDs.
+
+### Egress
+
+Tenant guests reach the network only through an approved egress grant. Tenant hosts run
+with `--socket-egress=enforce`, and admission denies `allowedHosts` and
+`allowedIpNameLookups` from tenant users.
+
+- The platform administrator lists what may be reached in the `egress-public` class:
+  Pulumi config `egressAllowedDestinations`, for example
+  `["mqtt.meshtastic.org:1883", "*.example.com:443"]`. Every entry needs a port.
+- A tenant creates a `BackingService` with `type: egress` and `spec.destinations`
+  (`host`, `*.suffix`, `host:port` or `*.suffix:port`). Nothing is provisioned. The service
+  is Ready when the class covers every destination; a destination without a port is
+  approved for each policy port that covers its name. `status.approved` lists the resolved
+  `host:port` entries. Otherwise Ready is False with reason `NotApproved`, naming the
+  destinations the class does not cover.
+- A `ServiceBinding` with `capability: egress` and `workloadName: <WorkloadDeployment>`
+  grants that workload the approved entries (`bindingName` is free; the CLI uses `egress`).
+  On each tick the controller merge-patches every guest of the WorkloadDeployment
+  (`components[].localResources` and `service.localResources`) under field manager
+  `di-platform-egress`, and removes the fields again when no Ready binding grants them. A
+  redeploy that replaces the component list gets them back on the next tick.
+- The controller also keeps NetworkPolicy `di-tenant-egress` in `di-runtime-<tenant>`: the
+  tenant host pods may reach public IPv4 addresses (not 10/8, 172.16/12, 192.168/16,
+  169.254/16, 127/8) on the union of approved TCP ports. It is deleted with the last grant.
+- A tenant update may carry the controller's `allowedHosts` / `allowedIpNameLookups`
+  forward unchanged, or drop them. It cannot add or change them.
+
+What the patch contains follows what wash 2.8 checks under `--socket-egress=enforce`:
+
+| Guest call | wash check | Patch entry |
+| --- | --- | --- |
+| `wasi:sockets` name lookup | name against `allowedIpNameLookups` | each approved name (`*.suffix` kept) |
+| `wasi:sockets` TCP connect | address against `allowedHosts`; only `*` or a literal `ip:port` can match | `<ipv4>:<port>` for each public IPv4 the controller resolves for an exact name |
+| `wasi:http` request | URI against `allowedHosts` | `host:port`, plus `https://host` for 443 and `http://host` for 80 (a portless URI does not match `host:443`) |
+
+The controller resolves names through the cluster resolver on each tick and patches only
+when the answer changes; a failed lookup keeps the last answer. Wildcard destinations
+grant lookups and HTTP only, since no address can be listed for them. IPv6 is not granted.
 
 ### Console log projection
 
@@ -362,14 +404,16 @@ backing services.
 
 **BackingServiceClass** selects a capability and an approved implementation:
 
-- `spec.type`: `keyvalue` \| `messaging` \| `blobstore` \| `postgres`
-- `spec.provider`: `redis` \| `nats` \| `postgres`
-- v1 compatibility is fixed: `keyvalue`+`redis`, `messaging`+`nats`, `blobstore`+`nats`, `postgres`+`postgres` (CEL + TypeScript helpers)
+- `spec.type`: `keyvalue` \| `messaging` \| `blobstore` \| `postgres` \| `egress`
+- `spec.provider`: `redis` \| `nats` \| `postgres` \| `platform`
+- v1 compatibility is fixed: `keyvalue`+`redis`, `messaging`+`nats`, `blobstore`+`nats`, `postgres`+`postgres`, `egress`+`platform` (CEL + TypeScript helpers)
+- `spec.egress.allowedDestinations` (egress only): `host:port` / `*.suffix:port` entries; an
+  egress class takes no sizing or storage class
 - `spec.parametersSchema` / `spec.defaults`: typed sizing only (`storage`, `memory`, `cpu`);
   no images, endpoints, hostPaths, or free-form infrastructure knobs
 - `spec.visibility`: `AllTenants` \| `SelectedTenants` (requires `allowedTenants`)
 - `spec.default`: at most one default class per `type`; default names are
-  `keyvalue-redis`, `messaging-nats`, `blobstore-nats`, and `postgres-dedicated`
+  `keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`, and `egress-public`
 - `spec.storageClassName`: optional PostgreSQL PVC storage class; omission uses the cluster default
 - Immutable after create: `type`, `provider`
 - Status: `Ready` condition and `observedGeneration` only
@@ -380,6 +424,8 @@ backing services.
 - `spec.parameters` may override class defaults for sizing fields only
 - `spec.deletionPolicy`: `Retain` (default) \| `Delete` — controls data/PV retention when
   the PostgreSQL service is deleted
+- `spec.destinations` (egress only, required there): `host`, `*.suffix`, `host:port`, or
+  `*.suffix:port`; `status.approved` lists the approved `host:port` entries
 - Immutable: `type`; `className` once set/resolved
 - Status conditions: `Ready`, `Provisioning`, `Failed`, `Deleting`, plus
   `observedGeneration`, `classRef`, `runtimeNamespace`, and an `endpoint` summary
@@ -397,7 +443,8 @@ spoof cross-tenant ownership by writing labels on the object.
   `hostInterfaces[].name`
 - `spec.capability`: must match the referenced service's `type`
 - `spec.workloadName` is optional documentation/diagnostics only; **authorization is
-  tenant-level in v1**, not per workload
+  tenant-level in v1**, not per workload. Egress bindings require it: it names the
+  WorkloadDeployment that receives the grant
 - Multiple bindings may share one `BackingService` (warehouse `receive` / `take` /
   `sync` sharing `stock`)
 - Status: `Ready` \| `Failed` \| `Deleting`, `observedGeneration`, and
