@@ -22,6 +22,8 @@ import {
   mergeFailures,
   parseGuestLogLine,
   parseHostFailureLine,
+  parseServiceLoopLine,
+  parseWorkloadSpanLine,
   projectedFailures,
   projectedLines,
   redactLogText,
@@ -137,6 +139,183 @@ function failureLine(
     `workload_start{workload.id="w-1" workload.name="${name}" workload.namespace="${namespace}"}:`;
   return `${opts.at ?? '2026-10-01T10:00:00.000001Z'}  ${opts.level ?? 'WARN'} workload_start{workload_id=w-1 workload.name="${name}" workload.namespace="${namespace}"}:${nested} ${message}`;
 }
+
+/** Real wash 2.8 + wasi-tls host log: a P3 service (mesh-collector) crashing on start. */
+const CRASH = readFileSync(join(import.meta.dir, 'fixtures/host-log-service-crash.txt'), 'utf8');
+const serviceDeployments: WorkloadIdentity[] = [
+  { name: 'mesh-collector', labels: { 'di-framework.dev/workload': 'mesh' }, service: true },
+  { name: 'mesh-site', labels: { 'di-framework.dev/workload': 'mesh' } },
+];
+const at = (s: number) => `2026-10-01T10:00:${String(s).padStart(2, '0')}.000000Z`;
+const startLine = (name: string, id: string, s: number, namespace = NS) =>
+  `${at(s)}  INFO workload_start{workload_id=${id} workload.name="${name}" workload.namespace="${namespace}"}: Starting workload workload_id="${id}" namespace="${namespace}" name="${name}"`;
+const stopLine = (id: string, s: number) =>
+  `${at(s)}  INFO workload_stop{workload_id=${id}}: Stopping workload workload_id="${id}"`;
+const loopLine = (
+  s: number,
+  message = 'P3 service execution failed err=trap retries=0',
+  level = 'ERROR',
+) => `${at(s)} ${level} ${message}`;
+const svc: WorkloadIdentity[] = [
+  { name: 'collector', service: true },
+  { name: 'poller', service: true },
+  { name: 'site' },
+];
+const failuresIn = (text: string, list = svc) =>
+  (attributeEntries(text, NS, list).get('collector') ?? [])
+    .concat(attributeEntries(text, NS, list).get('poller') ?? [])
+    .filter((entry) => entry.failure)
+    .map((entry) => [entry.deployment, entry.failure?.workload, entry.failure?.message]);
+
+describe('service supervisor failures (no span)', () => {
+  it('parses every wash 2.8 service loop WARN/ERROR message, and nothing else', () => {
+    expect(parseServiceLoopLine(loopLine(1))).toEqual({
+      timestamp: at(1),
+      level: 'ERROR',
+      summary: 'P3 service execution failed',
+      message: 'P3 service execution failed err=trap retries=0',
+    });
+    for (const message of [
+      'service execution failed err=x retries=1',
+      'max restarts reached, service will not be restarted',
+      'failed to instantiate P3 service err=x',
+      'P3 service exited with error retries=0',
+      'max restarts reached, P3 service will not be restarted',
+      'failed to rebuild P3 service store; giving up err=x',
+      'failed to re-register service HTTP handler on restart err=x',
+      'failed to re-register trigger service messaging handler on restart err=x',
+      'trigger service faulted; max restarts reached err=x',
+      'trigger service faulted; restarting err=x retries=2',
+      'failed to rebuild trigger service store; giving up err=x',
+    ])
+      expect(parseServiceLoopLine(loopLine(1, message, 'WARN'))?.message).toBe(message);
+    // Not at the line start, inside a span, INFO, unknown, raw, or a guest TracingLogger line.
+    expect(parseServiceLoopLine(loopLine(1, 'P3 service execution failedx'))).toBeUndefined();
+    expect(
+      parseServiceLoopLine(loopLine(1, 'P3 service exited successfully', 'INFO')),
+    ).toBeUndefined();
+    expect(
+      parseServiceLoopLine(loopLine(1, 'x{a=1}: P3 service execution failed')),
+    ).toBeUndefined();
+    expect(parseServiceLoopLine('P3 service execution failed')).toBeUndefined();
+    expect(
+      parseServiceLoopLine(
+        `${at(1)} ERROR P3 service execution failed workload.component_id="c" workload.name="collector" workload.namespace="${NS}" context="x"`,
+      ),
+    ).toBeUndefined();
+  });
+
+  it('reads INFO workload_start lines with their workload_id', () => {
+    expect(parseWorkloadSpanLine(startLine('collector-a-1', 'w-1', 1))).toMatchObject({
+      level: 'INFO',
+      workloadId: 'w-1',
+      workloadName: 'collector-a-1',
+    });
+    expect(
+      parseWorkloadSpanLine(
+        `${at(1)}  INFO workload_start{workload.name="collector-a-1" workload.namespace="${NS}"}: Starting workload`,
+      )?.workloadId,
+    ).toBe('');
+    expect(parseHostFailureLine(startLine('collector-a-1', 'w-1', 1))).toBeUndefined();
+  });
+
+  it('attributes the real crash to the service whose start preceded it, with the exception', () => {
+    const entries = attributeEntries(CRASH, MESH_NS, serviceDeployments).get('mesh') ?? [];
+    expect(entries.filter((entry) => entry.failure).map((entry) => entry.line)).toEqual([
+      "2026-10-01T22:15:51.776764Z ERROR host: P3 service execution failed: class constructors must be invoked with 'new'",
+      '2026-10-01T22:15:51.776806Z WARN host: max restarts reached, P3 service will not be restarted',
+      "2026-10-01T22:15:51.792744Z ERROR host: P3 service execution failed: class constructors must be invoked with 'new'",
+      '2026-10-01T22:15:51.792764Z WARN host: max restarts reached, P3 service will not be restarted',
+    ]);
+    expect(
+      entries.filter((entry) => entry.failure).map((entry) => entry.failure?.workload),
+    ).toEqual([
+      'mesh-collector-55dc4445f5-86f7dd895c',
+      'mesh-collector-55dc4445f5-86f7dd895c',
+      'mesh-collector-6f67d47bb6-6986d4778b',
+      'mesh-collector-6f67d47bb6-6986d4778b',
+    ]);
+    // The guest wasi:logging lines are still projected; backtrace lines are not.
+    expect(entries.filter((entry) => !entry.failure)).toHaveLength(2);
+    expect(entries.some((entry) => entry.line.includes('wasm function'))).toBe(false);
+    // The ERROR stays the failure; the later WARN about the same workload does not replace it.
+    expect(mergeFailures({}, entries, ['mesh-collector', 'mesh-site'])).toEqual({
+      'mesh-collector': {
+        workload: 'mesh-collector-6f67d47bb6-6986d4778b',
+        time: '2026-10-01T22:15:51.792744Z',
+        level: 'ERROR',
+        message: "P3 service execution failed: class constructors must be invoked with 'new'",
+      },
+    });
+    // mesh-site is not a service: without the service flag nothing is attributed.
+    const noServices = serviceDeployments.map(({ service: _s, ...d }) => d);
+    expect(
+      (attributeEntries(CRASH, MESH_NS, noServices).get('mesh') ?? []).some((e) => e.failure),
+    ).toBe(false);
+  });
+
+  it('needs a preceding, still running service start in the same text and namespace', () => {
+    expect(failuresIn(loopLine(2))).toEqual([]);
+    expect(failuresIn([loopLine(1), startLine('collector-a-1', 'w-1', 2)].join('\n'))).toEqual([]);
+    expect(
+      failuresIn(
+        [startLine('collector-a-1', 'w-1', 1), stopLine('w-1', 2), loopLine(3)].join('\n'),
+      ),
+    ).toEqual([]);
+    expect(
+      failuresIn([startLine('collector-a-1', 'w-1', 1, 'di-tenant-beta'), loopLine(2)].join('\n')),
+    ).toEqual([]);
+    expect(failuresIn([startLine('stranger-1', 'w-9', 1), loopLine(2)].join('\n'))).toEqual([]);
+    // A non-service start does not take the attribution; a stop of another workload neither.
+    expect(
+      failuresIn(
+        [
+          startLine('collector-a-1', 'w-1', 1),
+          startLine('poller-b-1', 'w-2', 2),
+          startLine('site-c-1', 'w-3', 3),
+          stopLine('w-2', 4),
+          stopLine('w-3', 5),
+          loopLine(6, 'P3 service exited with error retries=0'),
+          // Restarting w-1 moves it to the end without duplicating it.
+          startLine('collector-a-1', 'w-1', 7),
+          stopLine('w-1', 8),
+          loopLine(9),
+        ].join('\n'),
+      ),
+    ).toEqual([['collector', 'collector-a-1', 'P3 service exited with error retries=0']]);
+    // Two services started together: the latest start wins (the documented limit).
+    expect(
+      failuresIn(
+        [startLine('collector-a-1', 'w-1', 1), startLine('poller-b-1', 'w-2', 1), loopLine(2)].join(
+          '\n',
+        ),
+      ),
+    ).toEqual([['poller', 'poller-b-1', 'P3 service execution failed err=trap retries=0']]);
+  });
+
+  it('uses only a panic exception directly before the host line, redacted', () => {
+    const panic = (message: string) => [
+      "thread '<unnamed>' (1) panicked at crates/runtime/src/bindings.rs:369:29:",
+      "Call failed 'async export': Value(Exception(",
+      `Exception { message: Some("${message}"), stack: Some("at x") }`,
+      ')',
+    ];
+    const text = [
+      startLine('collector-a-1', 'w-1', 1),
+      ...panic('bad \\"token=abc\\"\\nnext'),
+      loopLine(2),
+      ...panic('stale'),
+      `${at(3)}  INFO unrelated host line`,
+      loopLine(4),
+      // Guest text cannot fake a host line: raw or wasi:logging output is not stamped as host.
+      'P3 service execution failed err=forged',
+    ].join('\n');
+    expect(failuresIn(text)).toEqual([
+      ['collector', 'collector-a-1', 'P3 service execution failed: bad "[redacted] next'],
+      ['collector', 'collector-a-1', 'P3 service execution failed err=trap retries=0'],
+    ]);
+  });
+});
 
 describe('parseHostFailureLine', () => {
   it('attributes real host WARN/ERROR lines by their workload_start span fields', () => {
@@ -346,6 +525,29 @@ describe('data.failures', () => {
     time,
     level: 'ERROR',
     message: 'boom',
+  });
+
+  it('keeps an ERROR over a later WARN of the same workload only', () => {
+    const entry = (time: string, level: 'WARN' | 'ERROR', workload: string) => ({
+      time,
+      line: '',
+      deployment: 'mesh-collector',
+      failure: { workload, time, level, message: level },
+    });
+    expect(
+      mergeFailures(
+        {},
+        [entry('t1', 'ERROR', 'w-1'), entry('t2', 'WARN', 'w-1')],
+        ['mesh-collector'],
+      )['mesh-collector']?.level,
+    ).toBe('ERROR');
+    expect(
+      mergeFailures(
+        {},
+        [entry('t1', 'ERROR', 'w-1'), entry('t2', 'WARN', 'w-2')],
+        ['mesh-collector'],
+      )['mesh-collector']?.workload,
+    ).toBe('w-2');
   });
 
   it('keeps the newest failure per live deployment', () => {
@@ -575,7 +777,8 @@ describe('Controller.projectLogs', () => {
       ].join('\n'),
     );
     await controller.projectLogs(tenant());
-    expect(api.logQueries.at(-1)).toBe(`?sinceTime=${encodeURIComponent('2026-10-01T10:00:02Z')}`);
+    // The read starts two minutes before the cursor; the floor drops what was published.
+    expect(api.logQueries.at(-1)).toBe(`?sinceTime=${encodeURIComponent('2026-10-01T09:58:02Z')}`);
     expect(linesOf(api, 'di-logs-mesh').split('\n')).toEqual([
       '2026-10-01T10:00:01.000000Z INFO collector up',
       '2026-10-01T10:00:02.000000Z INFO site up',
@@ -674,6 +877,41 @@ describe('Controller.projectLogs', () => {
     await new Controller(api, cfg).projectLogs(tenant());
     expect(linesOf(api, 'di-logs-mesh')).toBe('2026-10-01T10:00:09.000000Z INFO later');
     expect(failuresOf()).toEqual(expectedFailures);
+  });
+
+  it('attributes a service crash logged after the tick that saw its start', async () => {
+    const api = new LogApi();
+    api.workloads = [
+      {
+        metadata: { name: 'collector', labels: { 'di-framework.dev/workload': 'mesh' } },
+        spec: { template: { spec: { service: { image: 'x' } } } },
+      } as never,
+      { metadata: { name: 'site', labels: { 'di-framework.dev/workload': 'mesh' } } },
+    ];
+    const start = startLine('collector-a-1', 'w-1', 1);
+    const guest = hostLine('connecting', {
+      name: 'collector-a-1',
+      at: at(1).replace('.000000', '.000001'),
+    });
+    api.logs.set('host-0', [start, guest].join('\n'));
+    const controller = new Controller(api, cfg);
+    await controller.projectLogs(tenant());
+    expect(projectedFailuresText(api.configMaps.get('di-logs-mesh'))).toBe('{}');
+    // The next read overlaps the cursor, so it sees the start again with the crash.
+    api.logs.set('host-0', [start, guest, loopLine(2)].join('\n'));
+    await controller.projectLogs(tenant());
+    expect(linesOf(api, 'di-logs-mesh').split('\n')).toEqual([
+      `${at(1).replace('.000000', '.000001')} INFO connecting`,
+      `${at(2)} ERROR host: P3 service execution failed err=trap retries=0`,
+    ]);
+    expect(JSON.parse(projectedFailuresText(api.configMaps.get('di-logs-mesh')))).toEqual({
+      collector: {
+        workload: 'collector-a-1',
+        time: at(2),
+        level: 'ERROR',
+        message: 'P3 service execution failed err=trap retries=0',
+      },
+    });
   });
 
   it('writes nothing without attributed lines and removes projections of removed apps', async () => {

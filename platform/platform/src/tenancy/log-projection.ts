@@ -12,6 +12,10 @@ import { INSTALLATION, type Resource, TENANT } from './resources';
  * Host WARN/ERROR events inside a `workload_start{…}` span are kept too (C-FAILURES).
  * The span fields carry `workload.name` and `workload.namespace`; the newest of these
  * per WorkloadDeployment is also published as `data.failures` for console status.
+ *
+ * The host's service supervisor loop runs in an uninstrumented task (wash-runtime
+ * `engine/workload.rs`), so its WARN/ERROR lines carry no span. Those are attributed by
+ * a heuristic; see attributeEntries.
  */
 
 /** Label the console selects on; `logs` is the only projection the platform writes. */
@@ -43,10 +47,39 @@ const TRACING_HEAD =
  * between spans and one space before the message. The chain is matched from the line start,
  * so message text (which can echo guest input, e.g. `reason="…"`) never supplies a span.
  */
-const FAILURE_HEAD = /^(\S+)\s+(WARN|ERROR)\s+((?:[\w.-]+\{(?:[^}"]|"(?:[^"\\]|\\.)*")*\}:)+) /;
+const SPAN_HEAD = /^(\S+)\s+(INFO|WARN|ERROR)\s+((?:[\w.-]+\{(?:[^}"]|"(?:[^"\\]|\\.)*")*\}:)+) /;
 const SPAN = /([\w.-]+)\{((?:[^}"]|"(?:[^"\\]|\\.)*")*)\}:/y;
 /** One `key=value` span field; values are Debug-quoted strings or bare tokens. */
 const SPAN_FIELD = / ?([\w.]+)=(?:"((?:[^"\\]|\\.)*)"|([^\s"]*))/y;
+/**
+ * Span-less WARN/ERROR messages of the wash 2.8 service supervisor loops (plain, P3, and
+ * trigger services). Each is a fixed host string, matched right after the level and
+ * followed only by tracing fields.
+ */
+const SERVICE_LOOP_MESSAGES = [
+  'service execution failed',
+  'max restarts reached, service will not be restarted',
+  'failed to instantiate P3 service',
+  'P3 service exited with error',
+  'P3 service execution failed',
+  'max restarts reached, P3 service will not be restarted',
+  'failed to rebuild P3 service store; giving up',
+  'failed to re-register service HTTP handler on restart',
+  'failed to re-register trigger service messaging handler on restart',
+  'trigger service faulted; max restarts reached',
+  'trigger service faulted; restarting',
+  'failed to rebuild trigger service store; giving up',
+];
+const SERVICE_LOOP = new RegExp(
+  // The messages contain no regular expression metacharacters.
+  `^(\\S+)\\s+(WARN|ERROR)\\s+(${SERVICE_LOOP_MESSAGES.join('|')})(?: (.*))?$`,
+);
+/** `INFO workload_stop{workload_id=…}: Stopping workload …` */
+const WORKLOAD_STOP = /^\S+\s+INFO\s+workload_stop\{workload_id=([^\s}"]+)\}: /;
+/** Any line the host's tracing fmt layer wrote; everything else is raw stdio. */
+const STAMPED = /^\S+\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s/;
+/** Rust panic payload of a guest JS exception, printed raw on stderr before the host error. */
+const PANIC_EXCEPTION = /^Exception \{ message: Some\("((?:[^"\\]|\\.)*)"\)/;
 // biome-ignore lint/suspicious/noControlCharactersInRegex: strip terminal escapes from host output
 const ANSI = /\u001b\[[0-9;]*m/g;
 
@@ -88,7 +121,7 @@ export function parseGuestLogLine(raw: string): GuestLogLine | undefined {
 }
 
 function unescapeDebug(value: string): string {
-  return value.replace(/\\(.)/g, '$1');
+  return value.replace(/\\n/g, ' ').replace(/\\(.)/g, '$1');
 }
 
 /** Fields of one span body, or undefined when the body is not a clean `k=v k=v` list. */
@@ -103,17 +136,23 @@ function spanFields(body: string): Map<string, string> | undefined {
   return fields;
 }
 
+export interface WorkloadSpanLine extends GuestLogLine {
+  /** `workload_id` of the outer `workload_start` span ('' when absent). */
+  workloadId: string;
+}
+
 /**
- * Parse a host WARN/ERROR line emitted inside a `workload_start` span. The outermost span
- * must be `workload_start` with both `workload.name` and `workload.namespace`; nested spans
- * that repeat them must agree. TracingLogger (guest) lines are never host failures.
+ * Parse a host INFO/WARN/ERROR line emitted inside a `workload_start` span. The outermost
+ * span must be `workload_start` with both `workload.name` and `workload.namespace`; nested
+ * spans that repeat them must agree. TracingLogger (guest) lines never match.
  */
-export function parseHostFailureLine(raw: string): GuestLogLine | undefined {
+export function parseWorkloadSpanLine(raw: string): WorkloadSpanLine | undefined {
   const line = cleanLine(raw);
   if (TRACING_TAIL.test(line)) return undefined;
-  const head = FAILURE_HEAD.exec(line);
+  const head = SPAN_HEAD.exec(line);
   if (!head) return undefined;
   const chain = head[3] as string;
+  let workloadId = '';
   let workloadName: string | undefined;
   let namespace: string | undefined;
   SPAN.lastIndex = 0;
@@ -127,6 +166,7 @@ export function parseHostFailureLine(raw: string): GuestLogLine | undefined {
       if (span[1] !== 'workload_start' || !name || !ns) return undefined;
       workloadName = name;
       namespace = ns;
+      workloadId = fields.get('workload_id') ?? '';
     } else if (
       (name !== undefined && name !== workloadName) ||
       (ns !== undefined && ns !== namespace)
@@ -140,6 +180,38 @@ export function parseHostFailureLine(raw: string): GuestLogLine | undefined {
     workloadName: workloadName as string,
     namespace: namespace as string,
     message: line.slice(head[0].length),
+    workloadId,
+  };
+}
+
+/** A host WARN/ERROR line inside a `workload_start` span (see parseWorkloadSpanLine). */
+export function parseHostFailureLine(raw: string): GuestLogLine | undefined {
+  const parsed = parseWorkloadSpanLine(raw);
+  if (!parsed || parsed.level === 'INFO') return undefined;
+  const { workloadId: _id, ...line } = parsed;
+  return line;
+}
+
+export interface ServiceLoopLine {
+  timestamp: string;
+  level: string;
+  /** The fixed host message, e.g. `P3 service execution failed`. */
+  summary: string;
+  /** The whole message including tracing fields. */
+  message: string;
+}
+
+/** Parse a span-less WARN/ERROR line of the host service supervisor loop. */
+export function parseServiceLoopLine(raw: string): ServiceLoopLine | undefined {
+  const line = cleanLine(raw);
+  if (TRACING_TAIL.test(line)) return undefined;
+  const match = SERVICE_LOOP.exec(line);
+  if (!match) return undefined;
+  return {
+    timestamp: match[1] as string,
+    level: match[2] as string,
+    summary: match[3] as string,
+    message: match[4] ? `${match[3]} ${match[4]}` : (match[3] as string),
   };
 }
 
@@ -167,6 +239,8 @@ export interface WorkloadIdentity {
   name: string;
   labels?: Record<string, string>;
   annotations?: Record<string, string>;
+  /** True when the WorkloadDeployment runs a service (`spec.template.spec.service`). */
+  service?: boolean;
 }
 
 /** `data.failures` entry: the newest host failure of one WorkloadDeployment. */
@@ -222,6 +296,15 @@ export function resolveWorkload(
  * namespace, unknown workloads, and guest lines of an opted-out deployment are dropped.
  * Host failures are kept even then: they are platform diagnostics the console needs for
  * status, not guest output.
+ *
+ * Span-less service supervisor lines (`P3 service execution failed`, `max restarts
+ * reached, …`) are attributed to the most recently started service workload of this
+ * namespace in the same text that has not been stopped since: its `Starting workload`
+ * line, inside a `workload_start` span, resolves to a WorkloadDeployment with a service.
+ * Without such a start the line is dropped. The host pod serves one tenant, so this
+ * cannot cross tenants; two services starting together can be confused. When a raw
+ * panic `Exception { message: Some("…") }` line directly precedes the host line (no
+ * host line between), the exception message replaces the tracing fields.
  */
 export function attributeEntries(
   text: string,
@@ -229,27 +312,76 @@ export function attributeEntries(
   deployments: WorkloadIdentity[],
 ): Map<string, ProjectedEntry[]> {
   const result = new Map<string, ProjectedEntry[]>();
-  for (const raw of text.split('\n')) {
-    const guest = parseGuestLogLine(raw);
-    const line = guest ?? parseHostFailureLine(raw);
-    if (!line || line.namespace !== namespace) continue;
-    const workload = resolveWorkload(line.workloadName, deployments);
-    if (!workload || (guest && logsOptedOut(workload))) continue;
-    const entry: ProjectedEntry = guest
-      ? { time: line.timestamp, line: formatProjectedLine(line), deployment: workload.name }
-      : {
-          time: line.timestamp,
-          line: formatHostLine(line),
-          deployment: workload.name,
-          failure: {
-            workload: line.workloadName,
-            time: line.timestamp,
-            level: line.level as HostFailure['level'],
-            message: redactLogText(line.message),
-          },
-        };
+  const add = (workload: WorkloadIdentity, entry: ProjectedEntry) => {
     const key = applicationKey(workload);
     result.set(key, [...(result.get(key) ?? []), entry]);
+  };
+  const failure = (workload: WorkloadIdentity, line: GuestLogLine) =>
+    add(workload, {
+      time: line.timestamp,
+      line: formatHostLine(line),
+      deployment: workload.name,
+      failure: {
+        workload: line.workloadName,
+        time: line.timestamp,
+        level: line.level as HostFailure['level'],
+        message: redactLogText(line.message),
+      },
+    });
+  /** Started, not yet stopped service workloads of this namespace, oldest first. */
+  let running: { id: string; name: string; workload: WorkloadIdentity }[] = [];
+  let exception: string | undefined;
+  for (const raw of text.split('\n')) {
+    const clean = cleanLine(raw);
+    if (!STAMPED.test(clean)) {
+      const panic = PANIC_EXCEPTION.exec(clean);
+      if (panic) exception = unescapeDebug(panic[1] as string);
+      continue;
+    }
+    const pending = exception;
+    exception = undefined;
+    const guest = parseGuestLogLine(raw);
+    if (guest) {
+      const workload =
+        guest.namespace === namespace
+          ? resolveWorkload(guest.workloadName, deployments)
+          : undefined;
+      if (workload && !logsOptedOut(workload))
+        add(workload, {
+          time: guest.timestamp,
+          line: formatProjectedLine(guest),
+          deployment: workload.name,
+        });
+      continue;
+    }
+    const span = parseWorkloadSpanLine(raw);
+    if (span) {
+      if (span.namespace !== namespace) continue;
+      const workload = resolveWorkload(span.workloadName, deployments);
+      if (!workload) continue;
+      if (span.level !== 'INFO') {
+        failure(workload, span);
+      } else if (workload.service && span.message.startsWith('Starting workload')) {
+        running = running.filter((r) => r.id !== span.workloadId);
+        running.push({ id: span.workloadId, name: span.workloadName, workload });
+      }
+      continue;
+    }
+    const stop = WORKLOAD_STOP.exec(clean);
+    if (stop) {
+      running = running.filter((r) => r.id !== stop[1]);
+      continue;
+    }
+    const loop = parseServiceLoopLine(raw);
+    const service = running.at(-1);
+    if (!loop || !service) continue;
+    failure(service.workload, {
+      timestamp: loop.timestamp,
+      level: loop.level,
+      workloadName: service.name,
+      namespace,
+      message: pending ? `${loop.summary}: ${pending}` : loop.message,
+    });
   }
   return result;
 }
@@ -315,7 +447,8 @@ export function projectedFailures(configMap: Resource | undefined): Record<strin
 
 /**
  * Newest failure per WorkloadDeployment, limited to `deployments` (the application's live
- * members), so the map stays bounded by the application size.
+ * members), so the map stays bounded by the application size. A later WARN about the same
+ * host workload (e.g. `max restarts reached`) does not replace its ERROR, which says why.
  */
 export function mergeFailures(
   existing: Record<string, HostFailure>,
@@ -329,7 +462,14 @@ export function mergeFailures(
   for (const entry of entries) {
     if (!entry.failure || !live.has(entry.deployment)) continue;
     const current = merged[entry.deployment];
-    if (!current || entry.failure.time > current.time) merged[entry.deployment] = entry.failure;
+    if (current && entry.failure.time <= current.time) continue;
+    if (
+      current?.workload === entry.failure.workload &&
+      current.level === 'ERROR' &&
+      entry.failure.level === 'WARN'
+    )
+      continue;
+    merged[entry.deployment] = entry.failure;
   }
   return merged;
 }

@@ -175,6 +175,8 @@ export class KubernetesApi implements Api {
     });
   }
 }
+/** How far before the cursor each pod log read starts (see projectLogs). */
+const LOG_LOOKBACK_MS = 120_000;
 export class Controller {
   /** Newest TracingLogger timestamp already projected, per host pod uid. */
   private readonly logCursors = new Map<string, string>();
@@ -998,12 +1000,21 @@ export class Controller {
         `wasmcloud.com/hostgroup=${n.hostgroup},wasmcloud.com/name=hostgroup`,
       )}`,
     );
-    const deployments = (
-      await this.api.call<{ items: { metadata: WorkloadIdentity }[] }>(
+    const deployments: WorkloadIdentity[] = (
+      await this.api.call<{
+        items: {
+          metadata: WorkloadIdentity;
+          spec?: { template?: { spec?: { service?: unknown } } };
+        }[];
+      }>(
         'GET',
         `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', n.namespace)}?labelSelector=${encodeURIComponent('app.kubernetes.io/managed-by=di-framework')}`,
       )
-    ).items.map((item) => item.metadata);
+    ).items.map((item) => ({
+      ...item.metadata,
+      // Span-less service supervisor failures are attributed to services only.
+      service: item.spec?.template?.spec?.service !== undefined,
+    }));
     const existing = (
       await this.api.call<{ items: Resource[] }>(
         'GET',
@@ -1023,8 +1034,13 @@ export class Controller {
       if (pod.status?.phase !== 'Running') continue;
       const cursorKey = pod.metadata.uid ?? pod.metadata.name;
       const cursor = this.logCursors.get(cursorKey);
+      // Re-read a short window before the cursor so a service failure logged just after a
+      // tick still sees its `Starting workload` line. The floor below drops repeated lines
+      // and failures merge idempotently.
       const query = cursor
-        ? `sinceTime=${encodeURIComponent(cursor.replace(/\.\d+Z$/, 'Z'))}`
+        ? `sinceTime=${encodeURIComponent(
+            new Date(Date.parse(cursor) - LOG_LOOKBACK_MS).toISOString().replace(/\.\d+Z$/, 'Z'),
+          )}`
         : 'tailLines=1000';
       const text = await this.api.call<string>(
         'GET',

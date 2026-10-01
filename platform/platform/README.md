@@ -230,12 +230,27 @@ the newest host failure per WorkloadDeployment in `data.failures`.
   `workload_start` with both fields, nested spans that repeat them must agree, and
   `wasi:logging` lines never count), so message text cannot pick the workload. They
   are written as `<timestamp> <LEVEL> host: <message>` into the same ring.
+- Service crashes are kept too. wash 2.8 runs the service supervisor loop in an
+  uninstrumented task, so lines such as `P3 service execution failed …`,
+  `max restarts reached, P3 service will not be restarted`, `failed to instantiate P3
+  service` and the plain and trigger service variants carry no span. Such a line is
+  attributed to the most recently started service in the same log read: the newest
+  `Starting workload` line (inside a `workload_start` span, this tenant's namespace)
+  of a WorkloadDeployment with `spec.template.spec.service` whose `workload_stop` has
+  not followed. Without one the line is dropped. One host pod serves one tenant, so
+  this cannot attribute across tenants; its limit is that two services starting at
+  the same moment can be confused. When the raw panic block right before the line
+  carries a JS `Exception { message: Some("…") }`, the failure reads
+  `P3 service execution failed: <exception message>` (redacted, 500 characters).
+  Each read starts two minutes before the previous cursor, so a crash logged just
+  after a poll still sees its start; already published lines are not repeated.
 - `data.failures` holds the newest host failure per WorkloadDeployment of the
   application, as JSON keyed by the WorkloadDeployment name:
   `{ "workload": "<host workload.name>", "time": "…", "level": "WARN|ERROR", "message": "…" }`.
   The host `workload.name` is `<currentReplicaSet name>-<suffix>`, so a deployment is
   failing when `failures[name].workload` starts with `status.currentReplicaSet.name-`;
-  an entry from an older replica set is history. Entries of deployments that left the
+  an entry from an older replica set is history. A later WARN about the same host
+  workload (`max restarts reached`) does not replace its ERROR. Entries of deployments that left the
   application are dropped on the next write, so the key stays bounded by its member
   count.
 - A restarted controller resumes after the newest published line, so lines are not

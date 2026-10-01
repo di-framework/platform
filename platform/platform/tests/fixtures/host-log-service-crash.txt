@@ -1,0 +1,64 @@
+2026-10-01T22:15:24.810078Z  INFO host memory resolved max_guest_memory=2GiB default_heap_memory=512MiB core_instances=100 pool_reservation=50GiB
+2026-10-01T22:15:24.846678Z  INFO connected to NATS
+2026-10-01T22:15:24.850708Z  INFO connected to NATS
+2026-10-01T22:15:24.850735Z  WARN wasi-tls is enabled but no TLS provider was set; falling back to wasmtime-wasi-tls default — set one via EngineBuilder::with_tls_provider
+2026-10-01T22:15:24.851441Z  INFO wasmcloud:messaging admission ceilings resolved host_total=13 per_component_default=3 host_total_source="derived from the instance pool" per_component_source="derived from the host total"
+2026-10-01T22:15:24.852561Z  INFO HTTP server listening addr=0.0.0.0:9191 protocol="HTTP"
+2026-10-01T22:15:24.852638Z  INFO Host started host_id="d507437c-ac7c-4a11-89e2-6caaf734481a" friendly_name="straight-blade-1078" host_name="10.244.0.14" labels={"hostgroup": "tenant-meshtastic"} version="2.8.0"
+2026-10-01T22:15:24.852735Z  INFO Host provides interfaces count=13 interfaces=["wasi:cli/stdin,environment,stderr,terminal-stdout,terminal-input,terminal-stderr,terminal-stdin,terminal-output,stdout,exit@0.2.0", "wasi:clocks/monotonic-clock,wall-clock@0.2.0", "wasi:clocks/wall-time,monotonic-clock@0.2.0", "wasi:filesystem/preopens,types@0.2.0", "wasi:http/outgoing-handler,types,incoming-handler@0.2.0", "wasi:http/types,handler@0.3.0", "wasi:io/streams,poll,error@0.2.0", "wasi:random/random@0.2.0", "wasi:random/insecure,random,insecure-seed@0.2.0", "wasi:sockets/instance-network,tcp-create-socket,network,udp,tcp,udp-create-socket,ip-name-lookup@0.2.0", "wasi:tls/client,types@0.3.0-draft", "wasmcloud:messaging/handler@0.2.0", "wasmcloud:messaging/handler@0.3.0"]
+2026-10-01T22:15:48.459796Z  INFO workload_start{workload_id=7dbf626e-411d-450f-86cd-49d61fe580d9 workload.name="mesh-site-68fcf6968f-66f7457f68" workload.namespace="di-tenant-meshtastic"}: Starting workload workload_id="7dbf626e-411d-450f-86cd-49d61fe580d9" namespace="di-tenant-meshtastic" name="mesh-site-68fcf6968f-66f7457f68"
+2026-10-01T22:15:50.639255Z  INFO workload_start{workload_id=5d2733bf-99f2-46f1-a5e3-90604b1bfe60 workload.name="mesh-collector-55dc4445f5-86f7dd895c" workload.namespace="di-tenant-meshtastic"}: Starting workload workload_id="5d2733bf-99f2-46f1-a5e3-90604b1bfe60" namespace="di-tenant-meshtastic" name="mesh-collector-55dc4445f5-86f7dd895c"
+2026-10-01T22:15:51.769362Z  WARN wasi.logging.log{level=Level::Warn context="console"}: [DeprecationWarning] [unenv] [node:url] DEP0169: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities. workload.component_id="5cab9278-5cd1-492d-9210-83f75029b4d6" workload.name="mesh-collector-55dc4445f5-86f7dd895c" workload.namespace="di-tenant-meshtastic" context="console"
+
+thread '<unnamed>' (1) panicked at crates/runtime/src/bindings.rs:369:29:
+Call failed 'async export': Value(Exception(
+Exception { message: Some("class constructors must be invoked with 'new'"), stack: Some("    at _EventEmitter (/.di-framework/component.js:4401:3)\n    at call (native)\n    at Stream (/.di-framework/component.js:6060:11)\n    at call (native)\n    at Writable (/.di-framework/component.js:7595:15)\n    at connect (/.di-framework/component.js:14956:25)\n    at MqttClient (/.di-framework/component.js:14918:10)\n    at connect (/.di-framework/component.js:26065:22)\n    at connect (/.di-framework/component.js:34228:49)\n    at <anonymous> (/.di-framework/component.js:34209:32)\n") })
+)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+2026-10-01T22:15:51.776764Z ERROR P3 service execution failed err=error while executing at wasm backtrace:
+    0: 0x8bc9ba - <unknown>!<wasm function 514>
+    1: 0x85df65 - <unknown>!<wasm function 55>
+    2: 0x8adb9f - <unknown>!<wasm function 418>
+    3: 0x873bf7 - <unknown>!<wasm function 206>
+    4: 0x871ad3 - <unknown>!<wasm function 187>
+    5: 0x8ca22e - <unknown>!<wasm function 624>
+    6: 0x8f775e - <unknown>!<wasm function 813>
+    7: 0x8c891b - <unknown>!<wasm function 614>
+    8: 0x8ca22e - <unknown>!<wasm function 624>
+    9: 0x8cc207 - <unknown>!<wasm function 624>
+   10: 0x8cc078 - <unknown>!<wasm function 624>
+   11: 0x8cc078 - <unknown>!<wasm function 624>
+   12: 0x928fb6 - <unknown>!<wasm function 1028>
+   13: 0x8dba24 - <unknown>!<wasm function 631>
+   14: 0x87b924 - <unknown>!<wasm function 234>
+   15: 0x87ae2e - <unknown>!<wasm function 230>
+   16: 0x9922da - <unknown>![async-lift]wasi:cli/run@0.3.0#run retries=0
+2026-10-01T22:15:51.776806Z  WARN max restarts reached, P3 service will not be restarted
+2026-10-01T22:15:51.783640Z  INFO workload_start{workload_id=0ba684a8-682d-44ea-a889-a5ddea032268 workload.name="mesh-collector-6f67d47bb6-6986d4778b" workload.namespace="di-tenant-meshtastic"}: Starting workload workload_id="0ba684a8-682d-44ea-a889-a5ddea032268" namespace="di-tenant-meshtastic" name="mesh-collector-6f67d47bb6-6986d4778b"
+2026-10-01T22:15:51.785020Z  WARN wasi.logging.log{level=Level::Warn context="console"}: [DeprecationWarning] [unenv] [node:url] DEP0169: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities. workload.component_id="507f8561-00f6-4246-8f47-70da478edd4a" workload.name="mesh-collector-6f67d47bb6-6986d4778b" workload.namespace="di-tenant-meshtastic" context="console"
+
+thread '<unnamed>' (1) panicked at crates/runtime/src/bindings.rs:369:29:
+Call failed 'async export': Value(Exception(
+Exception { message: Some("class constructors must be invoked with 'new'"), stack: Some("    at _EventEmitter (/.di-framework/component.js:4401:3)\n    at call (native)\n    at Stream (/.di-framework/component.js:6060:11)\n    at call (native)\n    at Writable (/.di-framework/component.js:7595:15)\n    at connect (/.di-framework/component.js:14956:25)\n    at MqttClient (/.di-framework/component.js:14918:10)\n    at connect (/.di-framework/component.js:26065:22)\n    at connect (/.di-framework/component.js:34228:49)\n    at <anonymous> (/.di-framework/component.js:34209:32)\n") })
+)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+2026-10-01T22:15:51.792744Z ERROR P3 service execution failed err=error while executing at wasm backtrace:
+    0: 0x8bc9ba - <unknown>!<wasm function 514>
+    1: 0x85df65 - <unknown>!<wasm function 55>
+    2: 0x8adb9f - <unknown>!<wasm function 418>
+    3: 0x873bf7 - <unknown>!<wasm function 206>
+    4: 0x871ad3 - <unknown>!<wasm function 187>
+    5: 0x8ca22e - <unknown>!<wasm function 624>
+    6: 0x8f775e - <unknown>!<wasm function 813>
+    7: 0x8c891b - <unknown>!<wasm function 614>
+    8: 0x8ca22e - <unknown>!<wasm function 624>
+    9: 0x8cc207 - <unknown>!<wasm function 624>
+   10: 0x8cc078 - <unknown>!<wasm function 624>
+   11: 0x8cc078 - <unknown>!<wasm function 624>
+   12: 0x928fb6 - <unknown>!<wasm function 1028>
+   13: 0x8dba24 - <unknown>!<wasm function 631>
+   14: 0x87b924 - <unknown>!<wasm function 234>
+   15: 0x87ae2e - <unknown>!<wasm function 230>
+   16: 0x9922da - <unknown>![async-lift]wasi:cli/run@0.3.0#run retries=0
+2026-10-01T22:15:51.792764Z  WARN max restarts reached, P3 service will not be restarted
+2026-10-01T22:15:51.828953Z  INFO workload_stop{workload_id=5d2733bf-99f2-46f1-a5e3-90604b1bfe60}: Stopping workload workload_id="5d2733bf-99f2-46f1-a5e3-90604b1bfe60"
