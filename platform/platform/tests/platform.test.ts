@@ -166,6 +166,64 @@ test('local entrypoint drives the configured container CLI for every container c
   );
 }, 60_000);
 
+const MIRRORS = JSON.stringify({ 'docker.io': ['https://mirror.gcr.io'] });
+
+test('local entrypoint without registry mirrors keeps the k0s command and every command unchanged', () => {
+  const commands = (config: Record<string, string> = {}) =>
+    localResources(config)
+      .filter((r) => r.type.startsWith('command:'))
+      .map((r) => [r.name, r.inputs]);
+  const unset = commands();
+  expect(commands({ 'project:registryMirrors': '{}' })).toEqual(unset);
+  const k0s = Object.fromEntries(unset).k0s;
+  expect(k0s.environment).toBeUndefined();
+  expect(k0s.create).toBe(
+    'set -eu; if docker container inspect di-framework-test-244210e484-k0s >/dev/null 2>&1; then ' +
+      'echo "Refusing to replace existing container di-framework-test-244210e484-k0s" >&2; exit 1; fi; ' +
+      'docker run -d --name di-framework-test-244210e484-k0s --hostname di-framework-test-244210e484-k0s ' +
+      '--label di-framework.dev.platform-scope=di-framework-test-244210e484 ' +
+      '--network di-framework-test-244210e484-network --privileged ' +
+      '--tmpfs /run:rw,nosuid,nodev,exec,mode=755 ' +
+      '--mount type=volume,source=di-framework-test-244210e484-k0s-data,target=/var/lib/k0s ' +
+      '--mount type=volume,source=di-framework-test-244210e484-k0s-pod-logs,target=/var/log/pods ' +
+      '--publish 127.0.0.1:26443:6443 --publish 127.0.0.1:25000:30500 --publish 127.0.0.1:28180:30180 ' +
+      'docker.io/k0sproject/k0s:v1.36.3-k0s.2 k0s controller --enable-worker --no-taints',
+  );
+}, 60_000);
+
+test('local entrypoint configures containerd registry mirrors before k0s starts', () => {
+  const resources = localResources({
+    'project:containerCli': 'podman',
+    'project:registryMirrors': MIRRORS,
+  });
+  const k0s = resources.find((r) => r.name === 'k0s')?.inputs;
+  expect(k0s.create).toContain(
+    '--publish 127.0.0.1:28180:30180 --env K0S_ENTRYPOINT_ROLE=controller+worker ' +
+      '--env DI_K0S_FILE_0 --env DI_K0S_FILE_1 docker.io/k0sproject/k0s:v1.36.3-k0s.2 ' +
+      "sh -c 'set -eu; mkdir -p /etc/k0s/containerd.d /etc/containerd/certs.d/docker.io; " +
+      'printf %s "$DI_K0S_FILE_0" > /etc/k0s/containerd.d/di-framework-registry-mirrors.toml; ' +
+      'printf %s "$DI_K0S_FILE_1" > /etc/containerd/certs.d/docker.io/hosts.toml; ' +
+      "unset DI_K0S_FILE_0 DI_K0S_FILE_1; exec k0s controller --enable-worker --no-taints'",
+  );
+  expect(k0s.environment).toEqual({
+    DI_K0S_FILE_0:
+      '# Managed by @di-framework/platform: registry mirrors.\nversion = 3\n\n' +
+      '[plugins."io.containerd.cri.v1.images".registry]\n  config_path = "/etc/containerd/certs.d"\n',
+    DI_K0S_FILE_1:
+      '# Managed by @di-framework/platform: registry mirrors.\n' +
+      'server = "https://registry-1.docker.io"\n\n' +
+      '[host."https://mirror.gcr.io"]\n  capabilities = ["pull", "resolve"]\n',
+  });
+}, 60_000);
+
+test('local entrypoint rejects registry mirrors with shell or TOML metacharacters', () => {
+  expect(() =>
+    localResources({
+      'project:registryMirrors': JSON.stringify({ 'docker.io': ['https://mirror.gcr.io/"; id'] }),
+    }),
+  ).toThrow('registryMirrors.docker.io entries must be http:// or https:// URLs');
+}, 60_000);
+
 test('local entrypoint rejects a container CLI with shell metacharacters', () => {
   expect(() => localResources({ 'project:containerCli': 'podman; true' })).toThrow(
     'containerCli must be a plain command name or path',

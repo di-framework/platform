@@ -50,6 +50,20 @@ The value must be a plain command name or path. Resources stay owned by the
 engine that created them, so to switch engines destroy the platform first and
 deploy again; that removes cluster state.
 
+## Registry mirrors
+
+To pull images through a mirror (for example when Docker Hub is rate limited or
+unreachable from the container engine), set `registryMirrors` before the first
+deployment. It maps a registry host to an ordered list of mirror URLs; containerd
+tries each mirror and then the registry itself:
+
+```sh
+pulumi config set --path 'registryMirrors["docker.io"][0]' https://mirror.gcr.io
+```
+
+Unset means no mirrors. The `@di-framework/platform` README lists the accepted
+values. Changing mirrors later requires destroying and redeploying the platform.
+
 ## Output contract
 
 | Output | Meaning |

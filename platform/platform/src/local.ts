@@ -21,6 +21,7 @@ import {
 } from './container-cli';
 import { createPlatform } from './index';
 import { localPathStorageResources } from './local-storage';
+import { registryMirrorFiles, registryMirrors } from './registry-mirrors';
 
 const K0S_IMAGE = 'docker.io/k0sproject/k0s:v1.36.3-k0s.2';
 const REGISTRY_NODE_PORT = 30500;
@@ -33,6 +34,7 @@ const cli = containerCli(config.get('containerCli'));
 const apiPort = hostPort(config, 'apiPort', 26443);
 const registryPort = hostPort(config, 'registryPort', 25000);
 const httpPort = hostPort(config, 'httpPort', 28180);
+const mirrorFiles = registryMirrorFiles(registryMirrors(config.getObject('registryMirrors')));
 if (new Set([apiPort, registryPort, httpPort]).size !== 3) {
   throw new Error('apiPort, registryPort, and httpPort must be distinct');
 }
@@ -76,8 +78,12 @@ const k0s = new command.local.Command(
         { host: registryPort, container: REGISTRY_NODE_PORT },
         { host: httpPort, container: HTTP_NODE_PORT },
       ],
+      startupFiles: mirrorFiles,
     }),
     delete: deleteOwnedContainer(owned, k0sName),
+    ...(mirrorFiles.length > 0 && {
+      environment: Object.fromEntries(mirrorFiles.map((file) => [file.variable, file.content])),
+    }),
   },
   {
     dependsOn: [runtimeNetwork, k0sData, k0sPodLogs],

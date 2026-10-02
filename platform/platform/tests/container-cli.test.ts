@@ -103,6 +103,60 @@ describe('container command builders', () => {
     expect(run).toEndWith('k0s controller --enable-worker --no-taints');
   });
 
+  it('writes startup files from forwarded environment variables before execing k0s', () => {
+    const run = refuseExistingContainerThenRun(owned('podman'), {
+      ...k0s,
+      startupFiles: [
+        { path: '/etc/k0s/containerd.d/mirrors.toml', variable: 'DI_K0S_FILE_0' },
+        {
+          path: '/etc/containerd/certs.d/registry.example:5000/hosts.toml',
+          variable: 'DI_K0S_FILE_1',
+        },
+      ],
+    });
+    expect(run).toEndWith(
+      '--publish 127.0.0.1:26443:6443 --publish 127.0.0.1:25000:30500 ' +
+        '--env K0S_ENTRYPOINT_ROLE=controller+worker --env DI_K0S_FILE_0 --env DI_K0S_FILE_1 ' +
+        'docker.io/k0sproject/k0s:test ' +
+        "sh -c 'set -eu; mkdir -p /etc/k0s/containerd.d /etc/containerd/certs.d/registry.example:5000; " +
+        'printf %s "$DI_K0S_FILE_0" > /etc/k0s/containerd.d/mirrors.toml; ' +
+        'printf %s "$DI_K0S_FILE_1" > /etc/containerd/certs.d/registry.example:5000/hosts.toml; ' +
+        "unset DI_K0S_FILE_0 DI_K0S_FILE_1; exec k0s controller --enable-worker --no-taints'",
+    );
+    expect(refuseExistingContainerThenRun(owned('podman'), { ...k0s, startupFiles: [] })).toBe(
+      refuseExistingContainerThenRun(owned('podman'), k0s),
+    );
+  });
+
+  it('rejects startup file paths and variables that would need quoting', () => {
+    for (const path of [
+      '',
+      'relative/file',
+      '/file',
+      '/etc/../x',
+      '/etc/./x',
+      "/etc/x'",
+      '/etc/a b',
+      '/etc/$x',
+      '/etc/x;id',
+    ]) {
+      expect(() =>
+        refuseExistingContainerThenRun(owned('docker'), {
+          ...k0s,
+          startupFiles: [{ path, variable: 'DI_K0S_FILE_0' }],
+        }),
+      ).toThrow('Invalid k0s startup file path');
+    }
+    for (const variable of ['', 'di_file', '0FILE', 'FILE-0', 'FILE;id', 'FILE 0']) {
+      expect(() =>
+        refuseExistingContainerThenRun(owned('docker'), {
+          ...k0s,
+          startupFiles: [{ path: '/etc/k0s/x.toml', variable }],
+        }),
+      ).toThrow('Invalid k0s startup file variable');
+    }
+  });
+
   it('reads the kubeconfig and stops the runtime through the container', () => {
     const kubeconfig = readKubeconfig('podman', 'di-test-k0s', 36443);
     expect(kubeconfig).toContain('until podman exec di-test-k0s k0s kubectl get --raw=/readyz');

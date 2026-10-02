@@ -22,7 +22,11 @@ export interface K0sContainer {
   dataVolume: string;
   podLogsVolume: string;
   publish: { host: number; container: number }[];
+  /** Files written before k0s starts; each content is passed in through the named environment variable. */
+  startupFiles?: { path: string; variable: string }[];
 }
+
+const K0S_COMMAND = 'k0s controller --enable-worker --no-taints';
 
 /** A plain command name or path: no whitespace, quoting, or shell metacharacters. */
 export function containerCli(value: string | undefined): string {
@@ -71,9 +75,44 @@ export function refuseExistingContainerThenRun(target: ContainerScope, k0s: K0sC
     `--mount type=volume,source=${k0s.dataVolume},target=/var/lib/k0s`,
     `--mount type=volume,source=${k0s.podLogsVolume},target=/var/log/pods`,
     ...k0s.publish.map((port) => `--publish 127.0.0.1:${port.host}:${port.container}`),
-    k0s.image,
-    'k0s controller --enable-worker --no-taints',
+    ...startup(k0s.startupFiles ?? [], k0s.image),
   ].join(' ');
+}
+
+/**
+ * Without startup files the image's entrypoint runs k0s directly. With them, a
+ * fixed `sh` script copies each file's content from its environment variable
+ * (forwarded by name from the calling shell, never interpolated) and then
+ * execs k0s. The entrypoint cannot infer the role from `sh`, so it is set.
+ */
+function startup(files: { path: string; variable: string }[], image: string): string[] {
+  if (files.length === 0) return [image, K0S_COMMAND];
+  for (const { path, variable } of files) {
+    if (
+      !/^(\/[A-Za-z0-9._:-]+){2,}$/.test(path) ||
+      path.split('/').some((p) => /^\.\.?$/.test(p))
+    ) {
+      throw new Error(`Invalid k0s startup file path ${JSON.stringify(path)}`);
+    }
+    if (!/^[A-Z][A-Z0-9_]*$/.test(variable)) {
+      throw new Error(`Invalid k0s startup file variable ${JSON.stringify(variable)}`);
+    }
+  }
+  const directories = [...new Set(files.map(({ path }) => path.slice(0, path.lastIndexOf('/'))))];
+  const variables = files.map(({ variable }) => variable);
+  const script = [
+    'set -eu;',
+    `mkdir -p ${directories.join(' ')};`,
+    ...files.map(({ path, variable }) => `printf %s "$${variable}" > ${path};`),
+    `unset ${variables.join(' ')};`,
+    `exec ${K0S_COMMAND}`,
+  ].join(' ');
+  return [
+    '--env K0S_ENTRYPOINT_ROLE=controller+worker',
+    ...variables.map((variable) => `--env ${variable}`),
+    image,
+    `sh -c '${script}'`,
+  ];
 }
 
 /** Waits for the k0s API and node, then prints an admin kubeconfig for the host port. */
