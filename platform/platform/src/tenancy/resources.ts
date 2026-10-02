@@ -61,7 +61,14 @@ export interface ControllerConfig {
   schedulerNatsUrl: string;
   insecureRegistry: boolean;
   storageRoot?: string;
+  /** `http://{host}.{tenant}.localhost:<port>` when the platform gateway is published. */
+  routeUrlPattern?: string;
 }
+/** Platform HTTP gateway (di-framework/kube#2); its pods alone reach tenant hosts on 9191. */
+const GATEWAY_NAME = 'di-platform-gateway';
+const GATEWAY_POD_LABELS = { app: GATEWAY_NAME };
+/** Per-tenant ConfigMap with the gateway URL template; absent means no gateway is known. */
+const ROUTES_CONFIG_NAME = 'di-platform-routes';
 const GROUP = 'platform.di-framework.dev';
 const VERSION = `${GROUP}/v1alpha1`;
 const INSTALLATION = `${GROUP}/installation`;
@@ -446,6 +453,40 @@ function tenantResources(
         },
       }),
     );
+  // di-tenant-network admits only same-tenant traffic; the platform gateway is the one
+  // outside client allowed to reach the tenant hosts' HTTP port.
+  result.push(
+    make('networking.k8s.io/v1', 'NetworkPolicy', 'di-tenant-gateway', n.runtimeNamespace, {
+      spec: {
+        podSelector: {
+          matchLabels: {
+            'wasmcloud.com/hostgroup': n.hostgroup,
+            'wasmcloud.com/name': 'hostgroup',
+          },
+        },
+        policyTypes: ['Ingress'],
+        ingress: [
+          {
+            from: [
+              {
+                namespaceSelector: {
+                  matchLabels: { 'kubernetes.io/metadata.name': cfg.namespace },
+                },
+                podSelector: { matchLabels: GATEWAY_POD_LABELS },
+              },
+            ],
+            ports: [{ protocol: 'TCP', port: 9191 }],
+          },
+        ],
+      },
+    }),
+  );
+  if (cfg.routeUrlPattern)
+    result.push(
+      make('v1', 'ConfigMap', ROUTES_CONFIG_NAME, n.namespace, {
+        data: { urlTemplate: cfg.routeUrlPattern.replaceAll('{tenant}', tenant.metadata.name) },
+      }),
+    );
   // Backend pods accept ingress from the tenant hostgroup and from backup-agent Jobs in
   // the same runtime namespace. Developers retain pods/portforward on runtime Roles.
   result.push(
@@ -782,10 +823,13 @@ export {
 export {
   crds,
   FINALIZER,
+  GATEWAY_NAME,
+  GATEWAY_POD_LABELS,
   GROUP,
   INSTALLATION,
   names,
   OWNER,
+  ROUTES_CONFIG_NAME,
   resource,
   TENANT,
   tenantResources,

@@ -40,6 +40,7 @@ import {
   names,
   OWNER,
   type Resource,
+  ROUTES_CONFIG_NAME,
   resource,
   type ServiceBinding,
   type SizingParameters,
@@ -368,6 +369,7 @@ export class Controller {
     const workloads = await this.storageWorkloads(tenant);
     const desired = tenantResources(tenant, this.cfg, secret, storageKeys(workloads));
     let ready = !!secret;
+    if (!this.cfg.routeUrlPattern) await this.removeRoutes(tenant);
     for (const value of desired) {
       const applied = await this.ensure(value);
       if (value.kind === 'Deployment') {
@@ -405,6 +407,17 @@ export class Controller {
           : 'Waiting for runtime and backend deployments',
       { ...n, httpService: `di-http.${n.runtimeNamespace}.svc.cluster.local` },
     );
+  }
+  /** No gateway is published any more: drop the route template so the console stops linking. */
+  private async removeRoutes(tenant: Tenant): Promise<void> {
+    const routes = await this.get<Resource>(
+      `${collection('v1', 'ConfigMap', names(tenant.metadata.name).namespace)}/${ROUTES_CONFIG_NAME}`,
+    );
+    if (
+      routes?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+      routes.metadata.labels[OWNER] === tenant.metadata.uid
+    )
+      await this.remove(routes);
   }
   async reconcileUser(user: User, tenants: Tenant[]): Promise<void> {
     if (!validName(user.metadata.name)) throw new Error('Invalid user name');

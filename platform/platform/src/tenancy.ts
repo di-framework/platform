@@ -101,6 +101,8 @@ export function installTenancy(args: {
   hostImagePullPolicy: string;
   insecureRegistry?: boolean;
   storageRoot?: string;
+  /** Gateway URL pattern; the controller publishes it per tenant as `di-platform-routes`. */
+  routeUrlPattern?: string;
   /** When omitted, seeds platform defaults (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`). */
   backingServiceClasses?: BackingServiceClassDeclaration[];
 }): {
@@ -268,6 +270,7 @@ export function installTenancy(args: {
                       schedulerNatsUrl: `nats://nats.${namespace}.svc.cluster.local:4222`,
                       insecureRegistry: args.insecureRegistry ?? false,
                       storageRoot: args.storageRoot,
+                      routeUrlPattern: args.routeUrlPattern,
                     }),
                   },
                 ],

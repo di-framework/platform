@@ -128,6 +128,7 @@ const platform = createPlatform({
   provider,
   installation: scope,
   config,
+  routeUrlPattern: `http://{host}.{tenant}.localhost:${httpPort}`,
   registry: true,
   insecureRegistry: true,
   apiServer: `https://127.0.0.1:${apiPort}`,
@@ -149,6 +150,8 @@ export const tenants = platform.tenants;
 export const users = platform.users;
 /** `{ [tenant]: { [user]: kubeconfig } }` (secret): one ServiceAccount-token kubeconfig per membership. */
 export const kubeconfigs = platform.kubeconfigs;
+/** Tenant workloads through the platform gateway: `{host}` and `{tenant}` are substituted. */
+export const routeUrlPattern = platform.routeUrlPattern;
 
 export const schemaVersion = 2;
 export const kubeconfig = kubeconfigFileCommand.id.apply(() => kubeconfigFile);

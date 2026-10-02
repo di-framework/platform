@@ -5,6 +5,7 @@ import {
   INSTALLATION,
   OWNER,
   type Resource,
+  ROUTES_CONFIG_NAME,
   TENANT,
 } from './resources';
 
@@ -443,10 +444,11 @@ function backendConfigPolicy(namespace: string): AdmissionPolicy {
         expression: `
           !request.userInfo.username.startsWith('system:serviceaccount:${namespace}:di-user-') ||
           !(${objectName} == '${STOCK_CONFIG_NAME}' ||
+            ${objectName} == '${ROUTES_CONFIG_NAME}' ||
             ${objectName}.startsWith('${BS_CONFIG_PREFIX}') ||
             ${objectName}.startsWith('${BINDING_CONFIG_PREFIX}'))`,
         message:
-          'di-tenant-stock, di-bs-*, and di-binding-* ConfigMaps/Secrets are managed by the platform controller',
+          'di-tenant-stock, di-platform-routes, di-bs-*, and di-binding-* ConfigMaps/Secrets are managed by the platform controller',
       },
       {
         // The console trusts di-framework.dev/projection ConfigMaps (logs, signals); a tenant
