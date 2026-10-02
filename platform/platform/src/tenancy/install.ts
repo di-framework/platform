@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
+import { validEgressPolicyEntry } from './egress';
 import {
   type BackingCapability,
   type BackingServiceClassSpec,
@@ -10,9 +11,10 @@ import {
 } from './resources';
 
 /** Controller ConfigMap modules. TypeScript emit does not bundle imports, so
- * `backing-services`, `backing-service-reconcile`, `service-binding-reconcile`, and `log-projection`
- * must ship beside `resources` / `controller` (which require them at runtime). */
+ * `egress`, `backing-services`, `backing-service-reconcile`, `service-binding-reconcile`, and
+ * `log-projection` must ship beside `resources` / `controller` (which require them at runtime). */
 export const CONTROLLER_SCRIPT_MODULES = [
+  'egress',
   'backing-services',
   'workload-storage',
   'resources',
@@ -33,11 +35,17 @@ export type ControllerClusterRoleRule = {
   verbs: string[];
 };
 
-/** Platform-owned default classes (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`). */
-export function defaultBackingServiceClasses(): BackingServiceClassDeclaration[] {
+/**
+ * Platform-owned default classes (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`,
+ * `postgres-dedicated`, `egress-public`). `egress-public` approves only
+ * `egressAllowedDestinations`; the default `[]` approves nothing.
+ */
+export function defaultBackingServiceClasses(
+  egressAllowedDestinations: string[] = [],
+): BackingServiceClassDeclaration[] {
   return (Object.keys(DEFAULT_CLASS_NAMES) as BackingCapability[]).map((type) => ({
     name: DEFAULT_CLASS_NAMES[type],
-    ...defaultClassSeed(type),
+    ...defaultClassSeed(type, egressAllowedDestinations),
   }));
 }
 
@@ -46,12 +54,21 @@ export interface BackingClassConfig {
   getObject(key: string): unknown;
 }
 
-/** Resolve class seeds: `seedDefaultBackingClasses` (default true) and optional
- * `backingServiceClasses` overrides/replacements. */
+/** Resolve class seeds: `seedDefaultBackingClasses` (default true), optional
+ * `backingServiceClasses` overrides/replacements, and `egressAllowedDestinations` for the
+ * default `egress-public` class. */
 export function resolveBackingServiceClasses(
   config: BackingClassConfig,
 ): BackingServiceClassDeclaration[] {
   const seedDefaults = config.getBoolean('seedDefaultBackingClasses') ?? true;
+  const egressAllowedDestinations = config.getObject('egressAllowedDestinations') ?? [];
+  if (
+    !Array.isArray(egressAllowedDestinations) ||
+    !egressAllowedDestinations.every(validEgressPolicyEntry)
+  )
+    throw new Error(
+      'egressAllowedDestinations must be a list of host:port or *.suffix:port entries (lowercase, port required)',
+    );
   const configured =
     (config.getObject('backingServiceClasses') as BackingServiceClassDeclaration[] | undefined) ??
     [];
@@ -66,7 +83,9 @@ export function resolveBackingServiceClasses(
   if (new Set(configured.map((c) => c.name)).size !== configured.length)
     throw new Error('Duplicate backingServiceClasses names');
   if (!seedDefaults) return configured;
-  const byName = new Map(defaultBackingServiceClasses().map((c) => [c.name, c]));
+  const byName = new Map(
+    defaultBackingServiceClasses(egressAllowedDestinations as string[]).map((c) => [c.name, c]),
+  );
   for (const cls of configured) byName.set(cls.name, cls);
   return [...byName.values()];
 }
@@ -120,7 +139,8 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
       verbs: ['get', 'list', 'watch'],
     },
     {
-      // Read for the logs projection; patch only adds the platform storage volume (#11).
+      // Read for the logs projection; patch only sets the platform storage volume (#11)
+      // and approved egress (#13).
       apiGroups: ['runtime.wasmcloud.dev'],
       resources: ['workloaddeployments'],
       verbs: ['get', 'list', 'watch', 'patch'],

@@ -6,10 +6,24 @@ import {
   backingServiceResources,
   endpointFor,
   RUNTIME_DATA_NATS,
+  type RuntimeProvider,
   resolveBackingSizing,
   resolveClass,
   tenantNameFromNamespace,
 } from './backing-service-reconcile';
+import {
+  approveEgress,
+  EGRESS_FIELD_MANAGER,
+  EGRESS_NETWORK_POLICY,
+  egressAllowedHosts,
+  egressGrants,
+  egressLookups,
+  egressNetworkPolicySpec,
+  egressPatch,
+  egressPorts,
+  egressResolvableNames,
+  resolveIpv4,
+} from './egress';
 import {
   appendRing,
   applicationKey,
@@ -61,6 +75,7 @@ import {
   bindingSecretName,
   electBindingOwner,
   resolveBindingService,
+  resolveEgressBindingService,
   serviceBindingResources,
   sharedBindingConflict,
 } from './service-binding-reconcile';
@@ -180,9 +195,12 @@ const LOG_LOOKBACK_MS = 120_000;
 export class Controller {
   /** Newest TracingLogger timestamp already projected, per host pod uid. */
   private readonly logCursors = new Map<string, string>();
+  /** Last successful egress name resolution, kept so a failed lookup does not revoke. */
+  private readonly egressAddresses = new Map<string, string[]>();
   constructor(
     private readonly api: Api,
     private readonly cfg: ControllerConfig,
+    private readonly resolveName: (name: string) => Promise<string[]> = resolveIpv4,
   ) {}
   private async get<T>(path: string): Promise<T | undefined> {
     try {
@@ -506,6 +524,10 @@ export class Controller {
       return;
     }
 
+    if (service.spec.type === 'egress') {
+      await this.reconcileEgressService(service, tenant, classes);
+      return;
+    }
     const configuration = await this.resolveBackingServiceConfiguration(service, tenant, classes);
     if (!configuration) return;
     const { cls, sizing } = configuration;
@@ -516,6 +538,51 @@ export class Controller {
     const desired = backingServiceResources(service, tenant, cls, this.cfg, sizing);
     const ready = await this.applyBackingServiceResources(desired);
     await this.updateBackingServiceStatus(service, tenant, cls, ready);
+  }
+
+  /** Egress runs nothing: the service is Ready once its class approves every destination. */
+  private async reconcileEgressService(
+    service: BackingService,
+    tenant: Tenant,
+    classes: BackingServiceClass[],
+  ): Promise<void> {
+    const runtimeNamespace = names(tenant.metadata.name).runtimeNamespace;
+    const resolved = resolveClass(service, classes, tenant.metadata.name);
+    if ('error' in resolved) {
+      await this.status(service, false, 'Failed', resolved.error, { runtimeNamespace });
+      return;
+    }
+    const { cls } = resolved;
+    const { approved, denied } = approveEgress(
+      service.spec.destinations ?? [],
+      cls.spec.egress?.allowedDestinations ?? [],
+    );
+    const extra = {
+      runtimeNamespace,
+      classRef: {
+        name: cls.metadata.name,
+        uid: cls.metadata.uid,
+        generation: cls.metadata.generation,
+      },
+      approved,
+    };
+    if (denied.length > 0) {
+      await this.status(
+        service,
+        false,
+        'NotApproved',
+        `BackingServiceClass ${cls.metadata.name} does not approve ${denied.join(', ')}`,
+        extra,
+      );
+      return;
+    }
+    await this.status(
+      service,
+      !tenant.spec.suspended,
+      tenant.spec.suspended ? 'Suspended' : 'Ready',
+      tenant.spec.suspended ? 'Tenant suspended' : `Approved ${approved.join(', ')}`,
+      extra,
+    );
   }
 
   private async reconcilePostgres(
@@ -780,7 +847,7 @@ export class Controller {
           uid: cls.metadata.uid,
           generation: cls.metadata.generation,
         },
-        endpoint: endpointFor(service, tenant, cls.spec.provider),
+        endpoint: endpointFor(service, tenant, cls.spec.provider as RuntimeProvider),
       },
     );
   }
@@ -809,6 +876,10 @@ export class Controller {
       uid: service?.metadata.uid,
       generation: service?.metadata.generation,
     };
+    if (binding.spec.capability === 'egress') {
+      await this.reconcileEgressBinding(binding, tenant, service, serviceRefBase);
+      return;
+    }
 
     if (binding.metadata.deletionTimestamp) {
       const owner = electBindingOwner(binding.spec.bindingName, peers);
@@ -937,6 +1008,114 @@ export class Controller {
         : 'Service binding configuration projected',
       readyStatus,
     );
+  }
+
+  /**
+   * An egress binding projects nothing. Its Ready status is what grants the service's
+   * approved entries to `spec.workloadName` in {@link reconcileTenantEgress}.
+   */
+  private async reconcileEgressBinding(
+    binding: ServiceBinding,
+    tenant: Tenant,
+    service: BackingService | undefined,
+    serviceRef: { name: string; uid?: string; generation?: number },
+  ): Promise<void> {
+    if (binding.metadata.deletionTimestamp) {
+      await this.status(binding, false, 'Deleting', 'Egress grant revoked', { serviceRef });
+      await this.finalizer(binding, false);
+      return;
+    }
+    const resolved = resolveEgressBindingService(binding, service);
+    if ('error' in resolved) {
+      await this.status(binding, false, 'Failed', resolved.error, { serviceRef });
+      return;
+    }
+    await this.status(
+      binding,
+      !tenant.spec.suspended,
+      tenant.spec.suspended ? 'Suspended' : 'Ready',
+      tenant.spec.suspended
+        ? 'Tenant suspended'
+        : `Egress granted to WorkloadDeployment ${binding.spec.workloadName}`,
+      { serviceRef },
+    );
+  }
+
+  private async egressAddressesFor(name: string): Promise<string[]> {
+    try {
+      const addresses = await this.resolveName(name);
+      this.egressAddresses.set(name, addresses);
+      return addresses;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'lookup failed';
+      console.error(`egress: cannot resolve ${name}: ${message}`);
+      return this.egressAddresses.get(name) ?? [];
+    }
+  }
+
+  /**
+   * Grant approved egress to WorkloadDeployments (#13). Every workload in the tenant
+   * namespace is reconciled, so a removed binding takes its fields away again. The
+   * `di-tenant-egress` NetworkPolicy opens the approved ports to public addresses for the
+   * tenant hosts, and goes away with the last grant.
+   */
+  async reconcileTenantEgress(
+    tenant: Tenant,
+    bindings: ServiceBinding[],
+    services: ReadonlyMap<string, BackingService>,
+  ): Promise<void> {
+    const n = names(tenant.metadata.name);
+    const grants = egressGrants(n.namespace, bindings, services);
+    const all = [...grants.values()].flat();
+    const addresses = new Map<string, string[]>();
+    for (const name of egressResolvableNames(all))
+      addresses.set(name, await this.egressAddressesFor(name));
+    const workloads =
+      (
+        await this.api.call<{ items?: WorkloadDeployment[] } | undefined>(
+          'GET',
+          collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', n.namespace),
+        )
+      )?.items ?? [];
+    for (const workload of workloads) {
+      const approved = grants.get(workload.metadata.name) ?? [];
+      const patch = egressPatch(
+        { ...workload, metadata: { ...workload.metadata, namespace: n.namespace } },
+        egressAllowedHosts(approved, addresses),
+        egressLookups(approved),
+      );
+      if (!patch) continue;
+      await this.api.call(
+        'PATCH',
+        `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', n.namespace)}/${encodeURIComponent(patch.metadata.name)}?fieldManager=${EGRESS_FIELD_MANAGER}`,
+        patch,
+        'application/merge-patch+json',
+      );
+    }
+    const ports = egressPorts(all);
+    if (ports.length > 0) {
+      await this.ensure(
+        resource(
+          tenant,
+          this.cfg.installation,
+          'networking.k8s.io/v1',
+          'NetworkPolicy',
+          EGRESS_NETWORK_POLICY,
+          n.runtimeNamespace,
+          { spec: egressNetworkPolicySpec(n.hostgroup, ports) },
+        ),
+      );
+      return;
+    }
+    const existing = await this.get<Resource>(
+      `${collection('networking.k8s.io/v1', 'NetworkPolicy', n.runtimeNamespace)}/${EGRESS_NETWORK_POLICY}`,
+    );
+    if (
+      existing &&
+      existing.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+      existing.metadata.labels?.[OWNER] === tenant.metadata.uid
+    )
+      await this.remove(existing);
   }
 
   /**
@@ -1182,6 +1361,16 @@ export class Controller {
         } catch {
           /* Retry on the next poll. */
         }
+      }
+    }
+    // After bindings so this tick's Ready changes grant or revoke right away.
+    for (const tenant of tenants) {
+      if (tenant.spec.suspended || tenant.metadata.deletionTimestamp) continue;
+      try {
+        await this.reconcileTenantEgress(tenant, bindings, serviceByKey);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Egress reconcile failed';
+        console.error(`Tenant/${tenant.metadata.name} egress: ${message}`);
       }
     }
   }

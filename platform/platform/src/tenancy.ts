@@ -103,7 +103,7 @@ export function installTenancy(args: {
   storageRoot?: string;
   /** Gateway URL pattern; the controller publishes it per tenant as `di-platform-routes`. */
   routeUrlPattern?: string;
-  /** When omitted, seeds platform defaults (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`). */
+  /** When omitted, seeds platform defaults (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`, `egress-public` approving nothing). */
   backingServiceClasses?: BackingServiceClassDeclaration[];
 }): {
   tenants: k8s.apiextensions.CustomResource[];

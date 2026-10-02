@@ -77,8 +77,14 @@ describe('backing service CRDs', () => {
       { enum?: string[]; additionalProperties?: boolean }
     >;
     expect(spec.required).toEqual(['type', 'provider', 'visibility']);
-    expect(properties.type?.enum).toEqual(['keyvalue', 'messaging', 'blobstore', 'postgres']);
-    expect(properties.provider?.enum).toEqual(['redis', 'nats', 'postgres']);
+    expect(properties.type?.enum).toEqual([
+      'keyvalue',
+      'messaging',
+      'blobstore',
+      'postgres',
+      'egress',
+    ]);
+    expect(properties.provider?.enum).toEqual(['redis', 'nats', 'postgres', 'platform']);
     expect(properties.visibility?.enum).toEqual(['AllTenants', 'SelectedTenants']);
     expect(properties.defaults?.additionalProperties).toBeUndefined();
     expect(properties.parametersSchema?.additionalProperties).toBeUndefined();
@@ -89,6 +95,43 @@ describe('backing service CRDs', () => {
       rules.some((r) => r.includes("self.type == 'keyvalue' && self.provider == 'redis'")),
     ).toBe(true);
     expect(rules.some((r) => r.includes('SelectedTenants'))).toBe(true);
+    expect(
+      rules.some((r) => r.includes("(self.type == 'egress' && self.provider == 'platform')")),
+    ).toBe(true);
+    expect(rules.some((r) => r.includes('!has(self.egress)'))).toBe(true);
+  });
+
+  it('describes egress class policy, service destinations, approved status, and binding target', () => {
+    const classProps = schemaFor('BackingServiceClass').openAPIV3Schema.properties.spec
+      .properties as Record<string, { properties: Record<string, Record<string, unknown>> }>;
+    const allowed = classProps.egress?.properties.allowedDestinations as {
+      maxItems: number;
+      items: { pattern: string; maxLength: number };
+    };
+    expect(allowed.maxItems).toBe(256);
+    const policy = new RegExp(allowed.items.pattern);
+    expect(policy.test('mqtt.meshtastic.org:1883')).toBe(true);
+    expect(policy.test('*.example.com:443')).toBe(true);
+    expect(policy.test('mqtt.meshtastic.org')).toBe(false);
+    expect(policy.test('host:70000')).toBe(false);
+
+    const service = schemaFor('BackingService').openAPIV3Schema.properties;
+    const destinations = (service.spec.properties as Record<string, Record<string, unknown>>)
+      .destinations as { maxItems: number; items: { pattern: string } };
+    expect(destinations.maxItems).toBe(32);
+    const destination = new RegExp(destinations.items.pattern);
+    for (const ok of ['mqtt.meshtastic.org', '*.example.com', 'a.b:1883', '*.example.com:8443'])
+      expect(destination.test(ok)).toBe(true);
+    for (const bad of ['https://a.b', 'a.b/x', '*', '*foo.com', 'a.b:0', 'A.b'])
+      expect(destination.test(bad)).toBe(false);
+    expect(rulesOf(service.spec).some((r) => r.includes('has(self.destinations)'))).toBe(true);
+    expect(service.status.properties.approved).toEqual({
+      type: 'array',
+      items: { type: 'string' },
+    });
+
+    const binding = schemaFor('ServiceBinding').openAPIV3Schema.properties.spec;
+    expect(rulesOf(binding)).toEqual(["self.capability != 'egress' || has(self.workloadName)"]);
   });
 
   it('constrains BackingService parameters, retention default, and immutable type/className', () => {
@@ -111,7 +154,7 @@ describe('backing service CRDs', () => {
     const spec = root.properties.spec;
     expect(spec.required).toEqual(['serviceName', 'bindingName', 'capability']);
     const capability = (spec.properties as Record<string, { enum?: string[] }>).capability;
-    expect(capability?.enum).toEqual(['keyvalue', 'messaging', 'blobstore', 'postgres']);
+    expect(capability?.enum).toEqual(['keyvalue', 'messaging', 'blobstore', 'postgres', 'egress']);
     expect(root['x-kubernetes-validations']?.some((v) => v.rule.includes('serviceName'))).toBe(
       true,
     );
@@ -148,6 +191,7 @@ describe('backing service helpers', () => {
       messaging: 'messaging-nats',
       blobstore: 'blobstore-nats',
       postgres: 'postgres-dedicated',
+      egress: 'egress-public',
     });
     expect(defaultClassName('keyvalue')).toBe('keyvalue-redis');
     expect(resolveClassName({ type: 'messaging' })).toBe('messaging-nats');
@@ -158,6 +202,94 @@ describe('backing service helpers', () => {
     expect(compatibleProvider('blobstore', 'nats')).toBe(true);
     expect(compatibleProvider('blobstore', 'redis')).toBe(false);
     expect(resolveClassName({ type: 'blobstore' })).toBe('blobstore-nats');
+    expect(compatibleProvider('egress', 'platform')).toBe(true);
+    expect(compatibleProvider('egress', 'nats')).toBe(false);
+    expect(resolveClassName({ type: 'egress' })).toBe('egress-public');
+  });
+
+  it('validates egress classes, services, and bindings', () => {
+    const egressClass = {
+      type: 'egress' as const,
+      provider: 'platform' as const,
+      visibility: 'AllTenants' as const,
+    };
+    expect(validateClassSpec(egressClass)).toBeUndefined();
+    expect(
+      validateClassSpec({
+        ...egressClass,
+        egress: { allowedDestinations: ['mqtt.meshtastic.org:1883', '*.example.com:443'] },
+      }),
+    ).toBeUndefined();
+    expect(
+      validateClassSpec({ ...egressClass, egress: { allowedDestinations: ['example.com'] } }),
+    ).toBe('egress.allowedDestinations entries must be host:port or *.suffix:port');
+    expect(
+      validateClassSpec({ ...egressClass, egress: { allowedDestinations: 'x' as never } }),
+    ).toBe('egress.allowedDestinations entries must be host:port or *.suffix:port');
+    expect(validateClassSpec({ ...egressClass, defaults: { memory: '1Gi' } })).toBe(
+      'egress classes take no sizing or storage class',
+    );
+    expect(validateClassSpec({ ...egressClass, provider: 'nats' })).toBe(
+      'provider must match type (keyvalue+redis, messaging+nats, blobstore+nats, postgres+postgres or egress+platform)',
+    );
+    expect(
+      validateClassSpec({
+        type: 'keyvalue',
+        provider: 'redis',
+        visibility: 'AllTenants',
+        egress: { allowedDestinations: [] },
+      }),
+    ).toBe('egress is only valid for type egress');
+    expect(validateClassSpec({ ...egressClass, provider: 'cloud' as never })).toBe(
+      'provider must be redis, nats, postgres or platform',
+    );
+    expect(validateClassSpec({ ...egressClass, type: 'objects' as never })).toBe(
+      'type must be keyvalue, messaging, blobstore, postgres or egress',
+    );
+
+    expect(
+      validateServiceSpec({ type: 'egress', destinations: ['mqtt.meshtastic.org'] }),
+    ).toBeUndefined();
+    expect(validateServiceSpec({ type: 'egress' })).toBe(
+      'egress services need at least one destination',
+    );
+    expect(validateServiceSpec({ type: 'egress', destinations: [] })).toBe(
+      'egress services need at least one destination',
+    );
+    expect(validateServiceSpec({ type: 'egress', destinations: ['https://a.b'] })).toBe(
+      'destinations must be host, *.suffix, host:port or *.suffix:port',
+    );
+    expect(
+      validateServiceSpec({ type: 'egress', destinations: ['a.b'], parameters: { cpu: '1' } }),
+    ).toBe('egress services take no sizing parameters');
+    expect(validateServiceSpec({ type: 'keyvalue', destinations: ['a.b'] })).toBe(
+      'destinations are only valid for type egress',
+    );
+    expect(validateServiceSpec({ type: 'objects' as never })).toBe(
+      'type must be keyvalue, messaging, blobstore, postgres or egress',
+    );
+
+    const egressBinding = { serviceName: 'mesh-egress', bindingName: 'egress' };
+    expect(
+      validateBindingSpec({
+        ...egressBinding,
+        capability: 'egress',
+        workloadName: 'mesh-collector',
+      }),
+    ).toBeUndefined();
+    expect(validateBindingSpec({ ...egressBinding, capability: 'egress' })).toBe(
+      'egress bindings need workloadName',
+    );
+    expect(validateBindingSpec({ ...egressBinding, capability: 'objects' as never })).toBe(
+      'capability must be keyvalue, messaging, blobstore, postgres or egress',
+    );
+    expect(defaultClassSeed('egress', ['a.b:443'])).toEqual({
+      type: 'egress',
+      provider: 'platform',
+      visibility: 'AllTenants',
+      default: true,
+      egress: { allowedDestinations: ['a.b:443'] },
+    });
   });
 
   it('validates class visibility, defaults uniqueness, and sizing fields', () => {
@@ -172,7 +304,7 @@ describe('backing service helpers', () => {
     expect(
       validateClassSpec({ type: 'keyvalue', provider: 'nats', visibility: 'AllTenants' }),
     ).toBe(
-      'provider must match type (keyvalue+redis, messaging+nats, blobstore+nats or postgres+postgres)',
+      'provider must match type (keyvalue+redis, messaging+nats, blobstore+nats, postgres+postgres or egress+platform)',
     );
     expect(
       validateClassSpec({ type: 'messaging', provider: 'nats', visibility: 'SelectedTenants' }),
