@@ -4,11 +4,13 @@ import { readFileSync } from 'node:fs';
 import * as k8s from '@pulumi/kubernetes';
 import * as pulumi from '@pulumi/pulumi';
 import { createPlatform } from './index';
+import { kubeconfigServer } from './kubeconfig';
 
 const config = new pulumi.Config();
 export const kubeconfig = config.require('kubeconfig');
+const adminKubeconfig = readFileSync(kubeconfig, 'utf8');
 const provider = new k8s.Provider('cluster', {
-  kubeconfig: pulumi.secret(readFileSync(kubeconfig, 'utf8')),
+  kubeconfig: pulumi.secret(adminKubeconfig),
   context: config.get('context'),
   enableServerSideApply: true,
 });
@@ -30,11 +32,16 @@ const platform = createPlatform({
   insecureRegistry: config.getBoolean('insecureRegistry') ?? false,
   storageRoot: config.get('storageRoot') ?? '/var/lib/kubesolo',
   values: config.getObject<Record<string, unknown>>('values'),
+  // di-framework-kube sets kubernetesEndpoint; otherwise use the admin context's server.
+  apiServer:
+    config.get('kubernetesEndpoint') ?? kubeconfigServer(adminKubeconfig, config.get('context')),
 });
 export const schemaVersion = 2;
 export const namespace = platform.namespace;
 export const tenants = platform.tenants;
 export const users = platform.users;
+/** `{ [tenant]: { [user]: kubeconfig } }` (secret); absent when no API server URL is known. */
+export const kubeconfigs = platform.kubeconfigs;
 export const endpoints = {
   http: config.get('httpEndpoint'),
   kubernetes: config.get('kubernetesEndpoint'),

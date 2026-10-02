@@ -1,5 +1,6 @@
 import * as k8s from '@pulumi/kubernetes';
 import * as pulumi from '@pulumi/pulumi';
+import { tenantKubeconfig } from './kubeconfig';
 import { installNetworkPolicy } from './network-policy';
 import {
   declarations,
@@ -7,8 +8,10 @@ import {
   resolveBackingServiceClasses,
   seedTenantNamespaces,
 } from './tenancy';
-import { names } from './tenancy/resources';
+import { names, userTokenSecretName } from './tenancy/resources';
 import { platformValues } from './values';
+
+export { kubeconfigServer, type TenantKubeconfigArgs, tenantKubeconfig } from './kubeconfig';
 
 export interface PlatformArgs {
   provider: k8s.Provider;
@@ -27,6 +30,11 @@ export interface PlatformArgs {
   insecureRegistry?: boolean;
   values?: Record<string, unknown>;
   beforeTenancy?: (release: k8s.helm.v3.Release) => pulumi.Resource;
+  /**
+   * Kubernetes API server URL that tenant users reach. When set, `kubeconfigs` holds one
+   * token kubeconfig per user membership; when omitted, `kubeconfigs` is undefined.
+   */
+  apiServer?: pulumi.Input<string>;
 }
 
 /** Shared platform resources; the caller owns cluster creation and Pulumi state. */
@@ -216,10 +224,49 @@ export function createPlatform(args: PlatformArgs) {
     })),
   );
 
+  // Users report Ready only after the controller sees every token Secret populated, so reading
+  // the Secrets after the User resources is reliable. Preview reads eagerly, before the User
+  // exists, so an unknown ID defers the read to the update.
+  const apiServer = args.apiServer;
+  const tokenSecretId = (user: string, tenant: string): pulumi.Input<string> =>
+    pulumi.runtime.isDryRun()
+      ? (pulumi.output(pulumi.unknown) as pulumi.Output<string>)
+      : `${namespaceName}/${userTokenSecretName(user, tenant)}`;
+  const kubeconfigs =
+    apiServer === undefined
+      ? undefined
+      : pulumi.secret(
+          pulumi
+            .all(
+              declared.users.flatMap((user, index) =>
+                user.memberships.map(({ tenant }) => {
+                  const secret = k8s.core.v1.Secret.get(
+                    `user-token-${user.name}-${tenant}`,
+                    tokenSecretId(user.name, tenant),
+                    { provider, dependsOn: tenancy.users.slice(index, index + 1) },
+                  );
+                  return pulumi.all([apiServer, secret.data]).apply(([server, secretData]) => ({
+                    tenant,
+                    user: user.name,
+                    kubeconfig: tenantKubeconfig({ server, tenant, user: user.name, secretData }),
+                  }));
+                }),
+              ),
+            )
+            .apply((entries) => {
+              const result: Record<string, Record<string, string>> = {};
+              for (const { tenant, user, kubeconfig } of entries)
+                result[tenant] = { ...result[tenant], [user]: kubeconfig };
+              return result;
+            }),
+        );
+
   return {
     namespace: namespaceResource.metadata.name,
     tenants,
     users,
+    /** `{ [tenant]: { [user]: kubeconfig YAML } }`, secret; undefined without `apiServer`. */
+    kubeconfigs,
     release: wasmcloud,
     // Tenant custom resources wait for Ready. Callers that install into
     // di-tenant-* depend on these and do not create the namespaces.

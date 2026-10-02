@@ -56,7 +56,7 @@ existing-cluster entrypoint.
 
 `kubeconfig` is required (a local file path); `context`, `namespace`, `release`,
 `chart`, `chartVersion`, `httpNodePort`, `timeoutSeconds`, `insecureRegistry`,
-`storageRoot`, `networkPolicyEngine`, and administrator `values` are optional. `tenants`, `users`,
+`storageRoot`, `networkPolicyEngine`, `kubernetesEndpoint`, and administrator `values` are optional. `tenants`, `users`,
 `tenantHostImage`, and `tenantHostImagePullPolicy` use the same declarations as the
 local entrypoint. NodePort zero selects ClusterIP. Registry installation is off
 for existing clusters. Shared hosts are disabled regardless of values overrides. Set `networkPolicyEngine`
@@ -76,6 +76,43 @@ storage root and a cluster that enforces NetworkPolicy and the generated admissi
 policies. Default roots are `/var/lib/k0s` for local and `/var/lib/kubesolo` for the
 existing-cluster entrypoint. Retained tenant namespaces/data survive resource
 cleanup, but destroying the local cluster removes its volumes.
+
+## Tenant user kubeconfigs
+
+For each declared user and membership, the controller creates a long-lived
+ServiceAccount token Secret `di-user-<user>-<tenant>-token` (type
+`kubernetes.io/service-account-token`) in the platform namespace, owned and labelled
+like the user's other resources. A User reports `Ready` only after Kubernetes has
+populated every one of its token Secrets. Removing a membership, suspending or
+deleting the user, or suspending the tenant deletes the matching Secret and so
+invalidates the token.
+
+After each User is Ready, `createPlatform` reads its token Secrets and builds one
+kubeconfig per membership: the API server and cluster CA (`ca.crt` from the token
+Secret), the token as the only credential, and a context whose namespace is
+`di-tenant-<tenant>`. The result is the secret output
+`kubeconfigs: { [tenant]: { [user]: string } }`, exported by both entrypoints.
+Write one to a file with:
+
+```sh
+pulumi stack output kubeconfigs --show-secrets | jq -r '.meshtastic.dev' > tenant.kubeconfig
+chmod 600 tenant.kubeconfig
+```
+
+The kubeconfig grants exactly the user's tenant role: `developer` users can manage
+tenant workloads and services, `viewer` users get read-only access. The token
+does not expire; rotate it by deleting the Secret (the controller recreates it)
+and running `pulumi up` again.
+
+The API server URL comes from the `apiServer` argument of `createPlatform`. The
+local entrypoint passes its loopback `https://127.0.0.1:<apiPort>`. The existing-cluster
+entrypoint uses `kubernetesEndpoint` (set by `di-framework-kube`) and otherwise the
+server of the admin kubeconfig's selected `context` (or `current-context`). When
+neither resolves to an `https://` URL, `kubeconfigs` is omitted. Previews do not read
+token Secrets, so `kubeconfigs` is only known after `pulumi up`. When upgrading an
+installation whose Users are already Ready, Pulumi does not wait on unchanged Users,
+so the first `pulumi up` can read a token Secret before the upgraded controller has
+created it; run `pulumi up` again once it has.
 
 ## Development
 

@@ -47,6 +47,7 @@ test('published implementation provisions tenancy and isolation for an existing 
       const platform = createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', httpNodePort:30080, storageRoot:'/var/lib/kubesolo', insecureRegistry:false, networkPolicyEngine:'kube-router' });
       await platform.namespace.promise();
       await Promise.all(platform.users.map(u => u.promise()));
+      if (platform.kubeconfigs !== undefined) throw new Error('kubeconfigs without apiServer');
     }).then(() => { console.log(JSON.stringify(resources)); }).catch(e => {console.error(e);process.exitCode=1;});
   `,
     ],
@@ -104,6 +105,69 @@ test('published implementation provisions tenancy and isolation for an existing 
   );
 }, 60_000);
 
+test('kubeconfigs read each token Secret after its User and are a secret output', () => {
+  const output = execFileSync(
+    'node',
+    [
+      '-e',
+      `
+    const pulumi = require('@pulumi/pulumi');
+    const k8s = require('@pulumi/kubernetes');
+    const resources = [];
+    const b64 = s => Buffer.from(s).toString('base64');
+    pulumi.runtime.setAllConfig({'project:tenants': JSON.stringify([{name:'alpha'},{name:'beta'}]), 'project:users': JSON.stringify([{name:'alice',memberships:[{tenant:'alpha',role:'developer'},{tenant:'beta',role:'viewer'}]},{name:'bob',memberships:[{tenant:'alpha',role:'viewer'}]}])});
+    pulumi.runtime.setMocks({
+      newResource: args => {
+        resources.push({type:args.type, name:args.name, id:args.id});
+        if (args.id) return {id:args.id, state:{data:{token:b64('token-' + args.name), 'ca.crt':b64('ca')}}};
+        return {id:args.name, state:{...args.inputs, metadata:{...args.inputs.metadata, name:args.inputs.metadata?.name ?? args.name}}};
+      },
+      call: args => args.inputs,
+    }, 'project', 'test', false);
+    let result;
+    pulumi.runtime.runInPulumiStack(async () => {
+      const {createPlatform} = require('./dist');
+      const platform = createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', apiServer: pulumi.output('https://127.0.0.1:26443') });
+      result = { secret: await pulumi.isSecret(platform.kubeconfigs), value: await platform.kubeconfigs.promise() };
+    }).then(() => { console.log(JSON.stringify({resources, ...result})); }).catch(e => {console.error(e);process.exitCode=1;});
+  `,
+    ],
+    { cwd: root, encoding: 'utf8' },
+  );
+  const { resources, secret, value } = JSON.parse(output) as {
+    resources: { type: string; name: string; id?: string }[];
+    secret: boolean;
+    value: Record<string, Record<string, string>>;
+  };
+  expect(secret).toBe(true);
+  expect(Object.keys(value).sort()).toEqual(['alpha', 'beta']);
+  const { alpha = {}, beta = {} } = value;
+  expect(Object.keys(alpha).sort()).toEqual(['alice', 'bob']);
+  expect(Object.keys(beta)).toEqual(['alice']);
+  expect(beta.alice).toContain('server: "https://127.0.0.1:26443"');
+  expect(beta.alice).toContain('token: "token-user-token-alice-beta"');
+  expect(beta.alice).toContain('namespace: "di-tenant-beta"');
+  const reads = resources.filter((r) => r.id);
+  expect(reads.map((r) => [r.type, r.name, r.id])).toEqual(
+    expect.arrayContaining([
+      [
+        'kubernetes:core/v1:Secret',
+        'user-token-alice-alpha',
+        'wasmcloud/di-user-alice-alpha-token',
+      ],
+      ['kubernetes:core/v1:Secret', 'user-token-alice-beta', 'wasmcloud/di-user-alice-beta-token'],
+      ['kubernetes:core/v1:Secret', 'user-token-bob-alpha', 'wasmcloud/di-user-bob-alpha-token'],
+    ]),
+  );
+  // Each read is registered only once its User custom resource has been created (and is Ready).
+  for (const user of ['alice', 'bob']) {
+    const created = resources.findIndex((r) => r.name === `user-${user}`);
+    expect(created).toBeGreaterThanOrEqual(0);
+    for (const read of reads.filter((r) => r.name.startsWith(`user-token-${user}-`)))
+      expect(created).toBeLessThan(resources.indexOf(read));
+  }
+}, 60_000);
+
 test('local entrypoint retains existing logical names and guarded Docker cleanup', () => {
   const local = readFileSync(join(root, 'src/local.ts'), 'utf8');
   expect(local).toContain('createPlatform({');
@@ -111,6 +175,11 @@ test('local entrypoint retains existing logical names and guarded Docker cleanup
   expect(local).toContain('shutdownRuntime(cli)');
   expect(local).toContain('refuseExistingContainerThenRun(owned');
   expect(local.match(/Logging\.None/g)).toHaveLength(2);
+  expect(local).toContain('apiServer: `https://127.0.0.1:$' + '{apiPort}`');
+  expect(local).toContain('export const kubeconfigs = platform.kubeconfigs;');
+  const existing = readFileSync(join(root, 'src/existing.ts'), 'utf8');
+  expect(existing).toContain("config.get('kubernetesEndpoint') ?? kubeconfigServer(");
+  expect(existing).toContain('export const kubeconfigs = platform.kubeconfigs;');
 });
 
 function localResources(config: Record<string, string> = {}) {

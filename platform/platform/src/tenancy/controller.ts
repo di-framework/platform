@@ -416,13 +416,20 @@ export class Controller {
     });
     for (const binding of bindings)
       if (!desired.some((r) => location(r) === location(binding))) await this.remove(binding);
-    const accounts = await this.list<Resource>('v1', 'ServiceAccount', {
-      [INSTALLATION]: this.cfg.installation,
-      [OWNER]: user.metadata.uid!,
-    });
-    for (const account of accounts)
-      if (!desired.some((r) => location(r) === location(account))) await this.remove(account);
-    for (const value of desired) await this.ensure(value);
+    // Token Secrets go before the ServiceAccount so no orphaned credential outlives it.
+    for (const kind of ['Secret', 'ServiceAccount'])
+      for (const value of await this.list<Resource>('v1', kind, {
+        [INSTALLATION]: this.cfg.installation,
+        [OWNER]: user.metadata.uid!,
+      }))
+        if (!desired.some((r) => location(r) === location(value))) await this.remove(value);
+    let tokens = true;
+    for (const value of desired) {
+      const applied = await this.ensure(value);
+      // Kubernetes populates the token asynchronously; Pulumi reads it once the User is Ready.
+      if (value.kind === 'Secret')
+        tokens &&= !!(applied.data as Record<string, string> | undefined)?.token;
+    }
     if (user.metadata.deletionTimestamp) {
       await this.finalizer(user, false);
       return;
@@ -430,15 +437,24 @@ export class Controller {
     const complete =
       user.spec.suspended ||
       desired.filter((r) => r.kind === 'RoleBinding').length === user.spec.memberships.length * 2;
+    const ready = complete && tokens;
     await this.status(
       user,
-      !!complete,
-      user.spec.suspended ? 'Suspended' : complete ? 'Reconciled' : 'TenantNotReady',
+      !!ready,
+      user.spec.suspended
+        ? 'Suspended'
+        : !complete
+          ? 'TenantNotReady'
+          : ready
+            ? 'Reconciled'
+            : 'TokenPending',
       user.spec.suspended
         ? 'Access revoked and ServiceAccount removed'
-        : complete
-          ? 'Memberships reconciled'
-          : 'Waiting for every referenced tenant to be ready',
+        : !complete
+          ? 'Waiting for every referenced tenant to be ready'
+          : ready
+            ? 'Memberships reconciled'
+            : 'Waiting for Kubernetes to populate the ServiceAccount token Secrets',
       user.spec.suspended
         ? { serviceAccount: null }
         : {

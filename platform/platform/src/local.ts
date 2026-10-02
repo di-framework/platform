@@ -130,6 +130,7 @@ const platform = createPlatform({
   config,
   registry: true,
   insecureRegistry: true,
+  apiServer: `https://127.0.0.1:${apiPort}`,
   beforeTenancy: (wasmcloud) => {
     const runtimeShutdown = new command.local.Command(
       'runtime-shutdown',
@@ -146,6 +147,8 @@ const platform = createPlatform({
 });
 export const tenants = platform.tenants;
 export const users = platform.users;
+/** `{ [tenant]: { [user]: kubeconfig } }` (secret): one ServiceAccount-token kubeconfig per membership. */
+export const kubeconfigs = platform.kubeconfigs;
 
 export const schemaVersion = 2;
 export const kubeconfig = kubeconfigFileCommand.id.apply(() => kubeconfigFile);
