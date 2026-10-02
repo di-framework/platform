@@ -211,19 +211,72 @@ model, not a claim of developer-proof network isolation.
 
 The controller publishes one ConfigMap per console application in each tenant
 namespace, `di-logs-<app>`, labeled `di-framework.dev/projection=logs` and
-`di-framework.dev/application=<app>`, with the newest 200 lines in `data.lines`.
+`di-framework.dev/application=<app>`, with the newest 200 lines in `data.lines` and
+the newest host failure per WorkloadDeployment in `data.failures`.
 
 - Source: the `hostgroup-<tenant>` pod logs, read through a per-tenant
   `di-platform-log-reader` Role (`pods/log get` in the runtime namespace only). The
   host keeps `automountServiceAccountToken: false`.
-- Only lines from the wash `wasi:logging` TracingLogger are kept. Each ends with
+- Guest lines come only from the wash `wasi:logging` TracingLogger. Each ends with
   `workload.name` and `workload.namespace`; the namespace must be the tenant's, and
   the name maps to a `di-framework`-managed WorkloadDeployment. Its
   `di-framework.dev/workload` label (else `di-framework.dev/application`) is the
   console application, so `mesh-collector` and `mesh-site` publish to `mesh`.
   Raw guest stdout/stderr carries no attribution and is dropped.
-- Lines are redacted (bearer tokens, `key=value` secrets, URL credentials, long
-  tokens) and cut to 500 characters before they are written.
+- Host failures are kept too: WARN/ERROR lines the host emits inside a
+  `workload_start{workload_id=… workload.name="…" workload.namespace="…"}` span, such
+  as `service did not properly execute` or `failed to start workload … reason="…"`.
+  They are attributed from the span fields only (the outermost span must be
+  `workload_start` with both fields, nested spans that repeat them must agree, and
+  `wasi:logging` lines never count), so message text cannot pick the workload. They
+  are written as `<timestamp> <LEVEL> host: <message>` into the same ring.
+- The ring reserves room for host lines so a chatty guest cannot push failures out
+  within seconds: the newest 50 host lines are kept, guest lines fill the rest of
+  the 200 newest first, and only then older host lines. Lines stay in timestamp
+  order. Each poll re-merges with the published `data.lines`, so this also holds
+  after a controller restart. A guest message that itself starts with `host:` is
+  written as `(guest) host: …` and never counts as a host line.
+- Service crashes are kept too. wash 2.8 runs the service supervisor loop in an
+  uninstrumented task, so lines such as `P3 service execution failed …`,
+  `max restarts reached, P3 service will not be restarted`, `failed to instantiate P3
+  service` and the plain and trigger service variants carry no span. Such a line is
+  attributed to the most recently started service in the same log read: the newest
+  `Starting workload` line (inside a `workload_start` span, this tenant's namespace)
+  of a WorkloadDeployment with `spec.template.spec.service` whose `workload_stop` has
+  not followed. Without one the line is dropped. One host pod serves one tenant, so
+  this cannot attribute across tenants; its limit is that two services starting at
+  the same moment can be confused. When the raw panic block right before the line
+  carries a JS `Exception { message: Some("…") }`, the failure reads
+  `P3 service execution failed: <exception message>` (redacted, 500 characters).
+  Each read starts two minutes before the previous cursor, so a crash logged just
+  after a poll still sees its start; already published lines are not repeated.
+- `data.failures` holds the newest host failure per WorkloadDeployment of the
+  application, as JSON keyed by the WorkloadDeployment name:
+  `{ "workload": "<host workload.name>", "time": "…", "level": "WARN|ERROR", "message": "…" }`.
+  The host `workload.name` is `<currentReplicaSet name>-<suffix>`, so a deployment is
+  failing when `failures[name].workload` starts with `status.currentReplicaSet.name-`;
+  an entry from an older replica set is history. A later WARN about the same host
+  workload (`max restarts reached`) does not replace its ERROR. A `Starting workload`
+  line for the deployment with a different host workload name, later than the
+  recorded failure, removes the entry (for example after the host retries the same
+  replica set with a new suffix and that start succeeds). Timestamps are compared,
+  so re-reading an older start never removes a newer failure, and the start may
+  arrive in a later read than the failure. When no entries remain, `data.failures`
+  is dropped. Entries of deployments that left the
+  application are dropped on the next write, so the key stays bounded by its member
+  count.
+- A restarted controller resumes after the newest published line, so lines are not
+  repeated. Failures are merged newest-wins by deployment from everything it re-reads,
+  so none are lost, including ones older than that line.
+- `di-framework.dev/logs: "false"` on a WorkloadDeployment (written by the CLI for
+  `"logs": false`) stops its `wasi:logging` lines from being published. Its host
+  failure lines and `data.failures` entry are still published: they are platform
+  diagnostics about the workload, not guest output, and the console needs them for
+  status.
+- Lines and failure messages are redacted (bearer tokens, `key=value` secrets, URL
+  credentials, long tokens) and cut to 500 characters before they are written. Host
+  messages can echo guest text (for example a `reason`), so they get the same
+  treatment.
 - No `projection=signals` ConfigMap is written. An application with no attributed
   lines has no ConfigMap, which the console shows as unpublished.
 - Tenant users cannot create, change, or delete any ConfigMap carrying

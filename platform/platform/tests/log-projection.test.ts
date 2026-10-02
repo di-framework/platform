@@ -1,4 +1,6 @@
 import { describe, expect, it, spyOn } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   admissionResources,
   hostInterfaceAllowed,
@@ -8,12 +10,22 @@ import { type Api, ApiError, Controller, collection } from '../src/tenancy/contr
 import {
   appendRing,
   applicationKey,
+  attributeEntries,
   attributeLogs,
+  formatHostLine,
   formatProjectedLine,
+  type HostFailure,
   logsConfigMap,
   logsConfigMapName,
+  logsOptedOut,
+  MAX_HOST_LINES,
   MAX_LINES,
+  mergeFailures,
   parseGuestLogLine,
+  parseHostFailureLine,
+  parseServiceLoopLine,
+  parseWorkloadSpanLine,
+  projectedFailures,
   projectedLines,
   redactLogText,
   resolveWorkload,
@@ -34,6 +46,10 @@ const NS = 'di-tenant-alpha';
 
 function linesOf(api: { configMaps: Map<string, Resource> }, name: string): string {
   return (api.configMaps.get(name)?.data as { lines?: string } | undefined)?.lines ?? '';
+}
+
+function projectedFailuresText(configMap: Resource | undefined): string {
+  return (configMap?.data as { failures?: string } | undefined)?.failures ?? '{}';
 }
 
 /** Shape of a wash 2.8 TracingLogger event: fmt layer, no target, no ANSI. */
@@ -102,6 +118,298 @@ describe('parseGuestLogLine', () => {
   });
 });
 
+/** Real wash 2.8 host log from the `examples` cluster (ANSI stripped), tenant meshtastic. */
+const SAMPLE = readFileSync(join(import.meta.dir, 'fixtures/host-log-sample.txt'), 'utf8');
+const MESH_NS = 'di-tenant-meshtastic';
+const meshDeployments: WorkloadIdentity[] = [
+  { name: 'mesh-collector', labels: { 'di-framework.dev/workload': 'mesh' } },
+  { name: 'mesh-site', labels: { 'di-framework.dev/workload': 'mesh' } },
+];
+const sampleLine = (needle: string) =>
+  SAMPLE.split('\n').find((line) => line.includes(needle)) as string;
+
+/** A host failure line shaped like wash 2.8: outer span, nested span, message. */
+function failureLine(
+  message: string,
+  opts: { name?: string; namespace?: string; at?: string; level?: string; nested?: string } = {},
+): string {
+  const name = opts.name ?? 'mesh-collector-ff55d9589-795c7b5cd6';
+  const namespace = opts.namespace ?? NS;
+  const nested =
+    opts.nested ??
+    `workload_start{workload.id="w-1" workload.name="${name}" workload.namespace="${namespace}"}:`;
+  return `${opts.at ?? '2026-10-01T10:00:00.000001Z'}  ${opts.level ?? 'WARN'} workload_start{workload_id=w-1 workload.name="${name}" workload.namespace="${namespace}"}:${nested} ${message}`;
+}
+
+/** Real wash 2.8 + wasi-tls host log: a P3 service (mesh-collector) crashing on start. */
+const CRASH = readFileSync(join(import.meta.dir, 'fixtures/host-log-service-crash.txt'), 'utf8');
+const serviceDeployments: WorkloadIdentity[] = [
+  { name: 'mesh-collector', labels: { 'di-framework.dev/workload': 'mesh' }, service: true },
+  { name: 'mesh-site', labels: { 'di-framework.dev/workload': 'mesh' } },
+];
+const at = (s: number) => `2026-10-01T10:00:${String(s).padStart(2, '0')}.000000Z`;
+const startLine = (name: string, id: string, s: number, namespace = NS) =>
+  `${at(s)}  INFO workload_start{workload_id=${id} workload.name="${name}" workload.namespace="${namespace}"}: Starting workload workload_id="${id}" namespace="${namespace}" name="${name}"`;
+const stopLine = (id: string, s: number) =>
+  `${at(s)}  INFO workload_stop{workload_id=${id}}: Stopping workload workload_id="${id}"`;
+const loopLine = (
+  s: number,
+  message = 'P3 service execution failed err=trap retries=0',
+  level = 'ERROR',
+) => `${at(s)} ${level} ${message}`;
+const svc: WorkloadIdentity[] = [
+  { name: 'collector', service: true },
+  { name: 'poller', service: true },
+  { name: 'site' },
+];
+const failuresIn = (text: string, list = svc) =>
+  (attributeEntries(text, NS, list).get('collector') ?? [])
+    .concat(attributeEntries(text, NS, list).get('poller') ?? [])
+    .filter((entry) => entry.failure)
+    .map((entry) => [entry.deployment, entry.failure?.workload, entry.failure?.message]);
+
+describe('service supervisor failures (no span)', () => {
+  it('parses every wash 2.8 service loop WARN/ERROR message, and nothing else', () => {
+    expect(parseServiceLoopLine(loopLine(1))).toEqual({
+      timestamp: at(1),
+      level: 'ERROR',
+      summary: 'P3 service execution failed',
+      message: 'P3 service execution failed err=trap retries=0',
+    });
+    for (const message of [
+      'service execution failed err=x retries=1',
+      'max restarts reached, service will not be restarted',
+      'failed to instantiate P3 service err=x',
+      'P3 service exited with error retries=0',
+      'max restarts reached, P3 service will not be restarted',
+      'failed to rebuild P3 service store; giving up err=x',
+      'failed to re-register service HTTP handler on restart err=x',
+      'failed to re-register trigger service messaging handler on restart err=x',
+      'trigger service faulted; max restarts reached err=x',
+      'trigger service faulted; restarting err=x retries=2',
+      'failed to rebuild trigger service store; giving up err=x',
+    ])
+      expect(parseServiceLoopLine(loopLine(1, message, 'WARN'))?.message).toBe(message);
+    // Not at the line start, inside a span, INFO, unknown, raw, or a guest TracingLogger line.
+    expect(parseServiceLoopLine(loopLine(1, 'P3 service execution failedx'))).toBeUndefined();
+    expect(
+      parseServiceLoopLine(loopLine(1, 'P3 service exited successfully', 'INFO')),
+    ).toBeUndefined();
+    expect(
+      parseServiceLoopLine(loopLine(1, 'x{a=1}: P3 service execution failed')),
+    ).toBeUndefined();
+    expect(parseServiceLoopLine('P3 service execution failed')).toBeUndefined();
+    expect(
+      parseServiceLoopLine(
+        `${at(1)} ERROR P3 service execution failed workload.component_id="c" workload.name="collector" workload.namespace="${NS}" context="x"`,
+      ),
+    ).toBeUndefined();
+  });
+
+  it('reads INFO workload_start lines with their workload_id', () => {
+    expect(parseWorkloadSpanLine(startLine('collector-a-1', 'w-1', 1))).toMatchObject({
+      level: 'INFO',
+      workloadId: 'w-1',
+      workloadName: 'collector-a-1',
+    });
+    expect(
+      parseWorkloadSpanLine(
+        `${at(1)}  INFO workload_start{workload.name="collector-a-1" workload.namespace="${NS}"}: Starting workload`,
+      )?.workloadId,
+    ).toBe('');
+    expect(parseHostFailureLine(startLine('collector-a-1', 'w-1', 1))).toBeUndefined();
+  });
+
+  it('attributes the real crash to the service whose start preceded it, with the exception', () => {
+    const entries = attributeEntries(CRASH, MESH_NS, serviceDeployments).get('mesh') ?? [];
+    expect(entries.filter((entry) => entry.failure).map((entry) => entry.line)).toEqual([
+      "2026-10-01T22:15:51.776764Z ERROR host: P3 service execution failed: class constructors must be invoked with 'new'",
+      '2026-10-01T22:15:51.776806Z WARN host: max restarts reached, P3 service will not be restarted',
+      "2026-10-01T22:15:51.792744Z ERROR host: P3 service execution failed: class constructors must be invoked with 'new'",
+      '2026-10-01T22:15:51.792764Z WARN host: max restarts reached, P3 service will not be restarted',
+    ]);
+    expect(
+      entries.filter((entry) => entry.failure).map((entry) => entry.failure?.workload),
+    ).toEqual([
+      'mesh-collector-55dc4445f5-86f7dd895c',
+      'mesh-collector-55dc4445f5-86f7dd895c',
+      'mesh-collector-6f67d47bb6-6986d4778b',
+      'mesh-collector-6f67d47bb6-6986d4778b',
+    ]);
+    // The guest wasi:logging lines are still projected; backtrace lines are not.
+    expect(entries.filter((entry) => !entry.failure && !entry.start)).toHaveLength(2);
+    expect(entries.some((entry) => entry.line?.includes('wasm function'))).toBe(false);
+    // Every Starting workload line is an event too, services or not.
+    expect(entries.filter((entry) => entry.start).map((entry) => entry.start)).toEqual([
+      'mesh-site-68fcf6968f-66f7457f68',
+      'mesh-collector-55dc4445f5-86f7dd895c',
+      'mesh-collector-6f67d47bb6-6986d4778b',
+    ]);
+    // The ERROR stays the failure; the later WARN about the same workload does not replace it.
+    expect(mergeFailures({}, entries, ['mesh-collector', 'mesh-site'])).toEqual({
+      'mesh-collector': {
+        workload: 'mesh-collector-6f67d47bb6-6986d4778b',
+        time: '2026-10-01T22:15:51.792744Z',
+        level: 'ERROR',
+        message: "P3 service execution failed: class constructors must be invoked with 'new'",
+      },
+    });
+    // mesh-site is not a service: without the service flag nothing is attributed.
+    const noServices = serviceDeployments.map(({ service: _s, ...d }) => d);
+    expect(
+      (attributeEntries(CRASH, MESH_NS, noServices).get('mesh') ?? []).some((e) => e.failure),
+    ).toBe(false);
+  });
+
+  it('needs a preceding, still running service start in the same text and namespace', () => {
+    expect(failuresIn(loopLine(2))).toEqual([]);
+    expect(failuresIn([loopLine(1), startLine('collector-a-1', 'w-1', 2)].join('\n'))).toEqual([]);
+    expect(
+      failuresIn(
+        [startLine('collector-a-1', 'w-1', 1), stopLine('w-1', 2), loopLine(3)].join('\n'),
+      ),
+    ).toEqual([]);
+    expect(
+      failuresIn([startLine('collector-a-1', 'w-1', 1, 'di-tenant-beta'), loopLine(2)].join('\n')),
+    ).toEqual([]);
+    expect(failuresIn([startLine('stranger-1', 'w-9', 1), loopLine(2)].join('\n'))).toEqual([]);
+    // A non-service start does not take the attribution; a stop of another workload neither.
+    expect(
+      failuresIn(
+        [
+          startLine('collector-a-1', 'w-1', 1),
+          startLine('poller-b-1', 'w-2', 2),
+          startLine('site-c-1', 'w-3', 3),
+          stopLine('w-2', 4),
+          stopLine('w-3', 5),
+          loopLine(6, 'P3 service exited with error retries=0'),
+          // Restarting w-1 moves it to the end without duplicating it.
+          startLine('collector-a-1', 'w-1', 7),
+          stopLine('w-1', 8),
+          loopLine(9),
+        ].join('\n'),
+      ),
+    ).toEqual([['collector', 'collector-a-1', 'P3 service exited with error retries=0']]);
+    // Two services started together: the latest start wins (the documented limit).
+    expect(
+      failuresIn(
+        [startLine('collector-a-1', 'w-1', 1), startLine('poller-b-1', 'w-2', 1), loopLine(2)].join(
+          '\n',
+        ),
+      ),
+    ).toEqual([['poller', 'poller-b-1', 'P3 service execution failed err=trap retries=0']]);
+  });
+
+  it('uses only a panic exception directly before the host line, redacted', () => {
+    const panic = (message: string) => [
+      "thread '<unnamed>' (1) panicked at crates/runtime/src/bindings.rs:369:29:",
+      "Call failed 'async export': Value(Exception(",
+      `Exception { message: Some("${message}"), stack: Some("at x") }`,
+      ')',
+    ];
+    const text = [
+      startLine('collector-a-1', 'w-1', 1),
+      ...panic('bad \\"token=abc\\"\\nnext'),
+      loopLine(2),
+      ...panic('stale'),
+      `${at(3)}  INFO unrelated host line`,
+      loopLine(4),
+      // Guest text cannot fake a host line: raw or wasi:logging output is not stamped as host.
+      'P3 service execution failed err=forged',
+    ].join('\n');
+    expect(failuresIn(text)).toEqual([
+      ['collector', 'collector-a-1', 'P3 service execution failed: bad "[redacted] next'],
+      ['collector', 'collector-a-1', 'P3 service execution failed err=trap retries=0'],
+    ]);
+  });
+});
+
+describe('parseHostFailureLine', () => {
+  it('attributes real host WARN/ERROR lines by their workload_start span fields', () => {
+    expect(
+      parseHostFailureLine(
+        sampleLine(
+          '5d8e1b04-4e6d-48b9-a7af-222f9b257528" workload.name="mesh-collector-ff55d9589-795c7b5cd6" workload.namespace="di-tenant-meshtastic"}: service did not',
+        ),
+      ),
+    ).toEqual({
+      timestamp: '2026-10-01T19:19:39.903159Z',
+      level: 'WARN',
+      workloadName: 'mesh-collector-ff55d9589-795c7b5cd6',
+      namespace: MESH_NS,
+      message:
+        'service did not properly execute workload_id="5d8e1b04-4e6d-48b9-a7af-222f9b257528"',
+    });
+    expect(parseHostFailureLine(sampleLine('ERROR workload_start{workload_id=12fa'))).toMatchObject(
+      {
+        level: 'ERROR',
+        workloadName: 'mesh-site-dd5fc4dc-558f5d4b4',
+        message:
+          'failed to start workload workload_id="12fa33da-760e-4018-9e62-c9722f56bc1b" reason="no host header found"',
+      },
+    );
+    // Three spans deep (resolve_workload), still the same workload.
+    expect(parseHostFailureLine(sampleLine('notify HTTP handler'))?.message).toStartWith(
+      'failed to notify HTTP handler of resolved workload',
+    );
+  });
+
+  it('ignores INFO, other spans, and lines without a span chain', () => {
+    expect(parseHostFailureLine(sampleLine('Starting workload'))).toBeUndefined();
+    expect(parseHostFailureLine(sampleLine('connected to NATS'))).toBeUndefined();
+    expect(
+      parseHostFailureLine('2026-10-01T10:00:00Z  WARN workload_stop{workload_id=x}: oops'),
+    ).toBeUndefined();
+    expect(parseHostFailureLine('2026-10-01T10:00:00Z ERROR no span here')).toBeUndefined();
+    expect(parseHostFailureLine('')).toBeUndefined();
+  });
+
+  it('requires both fields on the outer span and agreement in nested spans', () => {
+    expect(
+      parseHostFailureLine(
+        `2026-10-01T10:00:00Z  WARN workload_start{workload_id=w workload.name="greeter"}: x`,
+      ),
+    ).toBeUndefined();
+    expect(
+      parseHostFailureLine(
+        failureLine('x', {
+          nested: 'workload_start{workload.name="greeter" workload.namespace="di-tenant-alpha"}:',
+        }),
+      ),
+    ).toBeUndefined();
+    expect(
+      parseHostFailureLine(
+        failureLine('x', { nested: 'resolve_workload{workload.namespace="di-tenant-beta"}:' }),
+      ),
+    ).toBeUndefined();
+    // A nested span without workload fields is fine.
+    expect(parseHostFailureLine(failureLine('x', { nested: 'plugin{}:' }))?.message).toBe('x');
+    // Malformed span fields are rejected rather than guessed.
+    expect(
+      parseHostFailureLine(
+        `2026-10-01T10:00:00Z  WARN workload_start{workload.name="a" workload.namespace="${NS}" "junk"}: x`,
+      ),
+    ).toBeUndefined();
+  });
+
+  it('cannot be re-attributed by message text that imitates a span or guest fields', () => {
+    const forged = failureLine(
+      'failed to start workload reason="workload_start{workload.name=\\"greeter\\"}: x"',
+      { level: 'ERROR' },
+    );
+    expect(parseHostFailureLine(forged)?.workloadName).toBe('mesh-collector-ff55d9589-795c7b5cd6');
+    // A guest TracingLogger line is never a host failure, even inside a workload_start span.
+    const guest = `2026-10-01T10:00:00Z  WARN workload_start{workload_id=w workload.name="greeter" workload.namespace="${NS}"}: hi workload.component_id="c" workload.name="greeter" workload.namespace="${NS}" context="x"`;
+    expect(parseHostFailureLine(guest)).toBeUndefined();
+    expect(parseGuestLogLine(guest)?.message).toBe('hi');
+  });
+
+  it('strips terminal colour codes and unescapes quoted span values', () => {
+    const line = `\u001b[2m2026-10-01T10:00:00Z\u001b[0m \u001b[31mERROR\u001b[0m workload_start{workload_id=w workload.name="a\\"b" workload.namespace="${NS}"}: boom\r`;
+    expect(parseHostFailureLine(line)).toMatchObject({ workloadName: 'a"b', message: 'boom' });
+  });
+});
+
 describe('redaction and formatting', () => {
   it('removes bearer tokens, assigned secrets, URL credentials, and long tokens', () => {
     expect(redactLogText('Authorization: Bearer abc.def')).toBe('[redacted]');
@@ -123,6 +431,13 @@ describe('redaction and formatting', () => {
     const parsed = parseGuestLogLine(hostLine('token=abc started'));
     expect(parsed && formatProjectedLine(parsed)).toBe(
       '2026-10-01T10:00:00.000001Z INFO [redacted] started',
+    );
+  });
+
+  it('formats a host failure line with a host: prefix, redacted', () => {
+    const parsed = parseHostFailureLine(failureLine('failed reason="password=hunter2"'));
+    expect(parsed && formatHostLine(parsed)).toBe(
+      '2026-10-01T10:00:00.000001Z WARN host: failed reason="[redacted]',
     );
   });
 });
@@ -158,6 +473,188 @@ describe('workload attribution', () => {
       '2026-10-01T10:00:00.000001Z INFO site up',
     ]);
   });
+
+  it('attributes every real host failure in the sample to mesh, newest per deployment', () => {
+    const entries = attributeEntries(SAMPLE, MESH_NS, meshDeployments).get('mesh') ?? [];
+    expect(entries.every((entry) => entry.failure || entry.start)).toBe(true);
+    expect(entries.map((entry) => entry.line)).toContain(
+      '2026-10-01T19:19:39.903159Z WARN host: service did not properly execute workload_id="5d8e1b04-4e6d-48b9-a7af-222f9b257528"',
+    );
+    const failures = mergeFailures({}, entries, ['mesh-collector', 'mesh-site']);
+    expect(failures).toEqual({
+      'mesh-collector': {
+        workload: 'mesh-collector-ff55d9589-795c7b5cd6',
+        time: '2026-10-01T19:19:39.903159Z',
+        level: 'WARN',
+        message:
+          'service did not properly execute workload_id="5d8e1b04-4e6d-48b9-a7af-222f9b257528"',
+      },
+    });
+    // The running collector (currentReplicaSet mesh-collector-ff55d9589) is FAILED. The site's
+    // last failure (mesh-site-86db6d86d4-…) was followed by the start of
+    // mesh-site-64f85bb94f-5c5c6d6856, which removed it.
+    expect(failures['mesh-collector']?.workload.startsWith('mesh-collector-ff55d9589-')).toBe(true);
+    // Without that start the site keeps its newest failure.
+    const noSiteStart = entries.filter(
+      (entry) => entry.start !== 'mesh-site-64f85bb94f-5c5c6d6856',
+    );
+    expect(mergeFailures({}, noSiteStart, ['mesh-site'])['mesh-site']).toMatchObject({
+      workload: 'mesh-site-86db6d86d4-5b677f4cd5',
+      level: 'ERROR',
+    });
+    // Another tenant's namespace attributes nothing.
+    expect(attributeEntries(SAMPLE, NS, meshDeployments).size).toBe(0);
+  });
+
+  it('drops guest lines of an opted-out deployment but keeps its host failures', () => {
+    const optedOut = [
+      { ...deployments[0], annotations: { 'di-framework.dev/logs': 'false' } } as WorkloadIdentity,
+      ...deployments.slice(1),
+    ];
+    expect(logsOptedOut(optedOut[0] as WorkloadIdentity)).toBe(true);
+    expect(logsOptedOut({ name: 'x', annotations: { 'di-framework.dev/logs': 'true' } })).toBe(
+      false,
+    );
+    const text = [
+      hostLine('collector secret output'),
+      hostLine('site up', { name: 'mesh-site' }),
+      failureLine('service did not properly execute', { name: 'mesh-collector-abc-1' }),
+    ].join('\n');
+    expect(attributeLogs(text, NS, optedOut).get('mesh')).toEqual([
+      '2026-10-01T10:00:00.000001Z INFO site up',
+      '2026-10-01T10:00:00.000001Z WARN host: service did not properly execute',
+    ]);
+  });
+});
+
+describe('data.failures', () => {
+  const failure = (time: string, workload = 'mesh-collector-a-1'): HostFailure => ({
+    workload,
+    time,
+    level: 'ERROR',
+    message: 'boom',
+  });
+
+  it('drops a failure when a different host workload starts later, across reads', () => {
+    const fail = (time: string, workload: string) => ({
+      time,
+      line: `${time} ERROR host: x`,
+      deployment: 'mesh-site',
+      failure: { workload, time, level: 'ERROR' as const, message: 'timed out' },
+    });
+    const start = (time: string, workload: string) => ({
+      time,
+      deployment: 'mesh-site',
+      start: workload,
+    });
+    const old = 'mesh-site-78b9f6d4b6-55b5d9c569';
+    const fresh = 'mesh-site-78b9f6d4b6-5d4d5db5c6';
+    const live = ['mesh-site'];
+    // Same read: failure, then a retry of the same replica set.
+    expect(mergeFailures({}, [fail('t1', old), start('t2', fresh)], live)).toEqual({});
+    // Start in a later read than the failure (existing ConfigMap entry).
+    const recorded = mergeFailures({}, [fail('t1', old)], live);
+    expect(mergeFailures(recorded, [start('t2', fresh)], live)).toEqual({});
+    // Entries out of order (several pods) are applied in time order.
+    expect(mergeFailures({}, [start('t2', fresh), fail('t1', old)], live)).toEqual({});
+    // Re-read (lookback) of an older start, its own workload's start, a start of another
+    // deployment, and a start at the same instant never remove the failure.
+    expect(mergeFailures(recorded, [start('t0', fresh)], live)).toEqual(recorded);
+    expect(mergeFailures(recorded, [start('t2', old)], live)).toEqual(recorded);
+    expect(mergeFailures(recorded, [{ ...start('t2', fresh), deployment: 'other' }], live)).toEqual(
+      recorded,
+    );
+    expect(mergeFailures(recorded, [start('t1', fresh)], live)).toEqual(recorded);
+    // The newer workload failing after its start records as before.
+    expect(
+      mergeFailures(recorded, [start('t2', fresh), fail('t3', fresh)], live)['mesh-site']?.workload,
+    ).toBe(fresh);
+    // No recorded failure: a start is a no-op.
+    expect(mergeFailures({}, [start('t2', fresh)], live)).toEqual({});
+  });
+
+  it('keeps an ERROR over a later WARN of the same workload only', () => {
+    const entry = (time: string, level: 'WARN' | 'ERROR', workload: string) => ({
+      time,
+      line: '',
+      deployment: 'mesh-collector',
+      failure: { workload, time, level, message: level },
+    });
+    expect(
+      mergeFailures(
+        {},
+        [entry('t1', 'ERROR', 'w-1'), entry('t2', 'WARN', 'w-1')],
+        ['mesh-collector'],
+      )['mesh-collector']?.level,
+    ).toBe('ERROR');
+    expect(
+      mergeFailures(
+        {},
+        [entry('t1', 'ERROR', 'w-1'), entry('t2', 'WARN', 'w-2')],
+        ['mesh-collector'],
+      )['mesh-collector']?.workload,
+    ).toBe('w-2');
+  });
+
+  it('keeps the newest failure per live deployment', () => {
+    const entry = (deployment: string, time: string, withFailure = true) => ({
+      time,
+      line: `${time} ERROR host: boom`,
+      deployment,
+      failure: withFailure ? failure(time) : undefined,
+    });
+    expect(
+      mergeFailures(
+        {
+          'mesh-collector': failure('2026-10-01T10:00:02Z'),
+          gone: failure('2026-10-01T10:00:09Z'),
+        },
+        [
+          entry('mesh-collector', '2026-10-01T10:00:01Z'),
+          entry('mesh-site', '2026-10-01T10:00:03Z'),
+          entry('mesh-site', '2026-10-01T10:00:04Z'),
+          entry('mesh-site', '2026-10-01T10:00:05Z', false),
+          entry('stranger', '2026-10-01T10:00:06Z'),
+        ],
+        ['mesh-collector', 'mesh-site'],
+      ),
+    ).toEqual({
+      'mesh-collector': failure('2026-10-01T10:00:02Z'),
+      'mesh-site': failure('2026-10-01T10:00:04Z'),
+    });
+  });
+
+  it('reads well-formed entries only', () => {
+    const cm = (failures: unknown) =>
+      ({
+        ...logsConfigMap('alpha', NS, 'test', 'mesh', []),
+        data: { lines: '', failures },
+      }) as Resource;
+    expect(projectedFailures(undefined)).toEqual({});
+    expect(projectedFailures(cm(undefined))).toEqual({});
+    expect(projectedFailures(cm('{not json'))).toEqual({});
+    expect(projectedFailures(cm('[]'))).toEqual({});
+    expect(projectedFailures(cm('null'))).toEqual({});
+    expect(
+      projectedFailures(
+        cm(
+          JSON.stringify({
+            ok: { ...failure('t'), extra: 'dropped' },
+            badLevel: { ...failure('t'), level: 'INFO' },
+            noTime: { workload: 'w', level: 'WARN', message: 'm' },
+            empty: null,
+          }),
+        ),
+      ),
+    ).toEqual({ ok: failure('t') });
+  });
+
+  it('writes data.failures only when there are failures', () => {
+    expect(logsConfigMap('alpha', NS, 'test', 'mesh', ['a']).data).toEqual({ lines: 'a' });
+    expect(
+      logsConfigMap('alpha', NS, 'test', 'mesh', ['a'], { 'mesh-site': failure('t') }).data,
+    ).toEqual({ lines: 'a', failures: JSON.stringify({ 'mesh-site': failure('t') }) });
+  });
 });
 
 describe('ring buffer and ConfigMap shape', () => {
@@ -171,6 +668,56 @@ describe('ring buffer and ConfigMap shape', () => {
     expect(full).toHaveLength(MAX_LINES);
     expect(full.at(-1)).toBe('new');
     expect(full.join('\n').length).toBeLessThan(1024 * 1024);
+  });
+
+  it('keeps host lines through a guest flood, at most 50 of them, in timestamp order', () => {
+    const ts = (n: number) =>
+      `2026-10-01T23:${String(Math.floor(n / 6000)).padStart(2, '0')}:${String(Math.floor(n / 100) % 60).padStart(2, '0')}.${String(n % 100).padStart(6, '0')}Z`;
+    const guest = (n: number) => `${ts(n)} INFO tick ${n}`;
+    const host = (n: number) => `${ts(n)} ERROR host: failed to start workload ${n}`;
+    // One host line, then 1000 guest lines.
+    const flooded = appendRing(
+      [guest(0), host(1)],
+      Array.from({ length: 1000 }, (_, i) => guest(i + 2)),
+    );
+    expect(flooded).toHaveLength(MAX_LINES);
+    expect(flooded[0]).toBe(host(1));
+    expect(flooded.slice(1)).toEqual(Array.from({ length: 199 }, (_, i) => guest(i + 803)));
+    // 60 host lines among guest lines: the newest 50 hosts stay, guests fill the rest.
+    const lines = Array.from({ length: 400 }, (_, i) =>
+      i % 5 === 0 && i < 300 ? host(i) : guest(i),
+    );
+    const ring = appendRing([], lines);
+    expect(ring).toHaveLength(MAX_LINES);
+    const hosts = ring.filter((line) => line.includes(' host: '));
+    expect(hosts).toHaveLength(MAX_HOST_LINES);
+    expect(hosts[0]).toBe(host(50));
+    expect(ring.filter((line) => !line.includes(' host: '))).toHaveLength(150);
+    expect([...ring].sort()).toEqual(ring);
+    // Incoming from several pods is put in timestamp order behind the existing ring.
+    expect(appendRing([guest(1)], [guest(5), host(3), guest(4)], 3)).toEqual([
+      host(3),
+      guest(4),
+      guest(5),
+    ]);
+    expect(appendRing([], [guest(2), guest(2), guest(1)], 2)).toEqual([guest(2), guest(2)]);
+    // With few guest lines, older host lines use the remaining room.
+    expect(appendRing([host(1), host(2)], [host(3), guest(4)], 3, 1)).toEqual([
+      host(2),
+      host(3),
+      guest(4),
+    ]);
+  });
+
+  it('marks guest messages that imitate a host line', () => {
+    const parsed = parseGuestLogLine(hostLine('host: failed to start workload'));
+    const line = parsed && formatProjectedLine(parsed);
+    expect(line).toBe('2026-10-01T10:00:00.000001Z INFO (guest) host: failed to start workload');
+    const warn = parseGuestLogLine(hostLine('host: fake', { level: 'WARN' }));
+    expect(appendRing([warn ? formatProjectedLine(warn) : ''], ['b', 'c'], 2, 1)).toEqual([
+      'b',
+      'c',
+    ]);
   });
 
   it('reads existing lines from data.lines only', () => {
@@ -326,7 +873,8 @@ describe('Controller.projectLogs', () => {
       ].join('\n'),
     );
     await controller.projectLogs(tenant());
-    expect(api.logQueries.at(-1)).toBe(`?sinceTime=${encodeURIComponent('2026-10-01T10:00:02Z')}`);
+    // The read starts two minutes before the cursor; the floor drops what was published.
+    expect(api.logQueries.at(-1)).toBe(`?sinceTime=${encodeURIComponent('2026-10-01T09:58:02Z')}`);
     expect(linesOf(api, 'di-logs-mesh').split('\n')).toEqual([
       '2026-10-01T10:00:01.000000Z INFO collector up',
       '2026-10-01T10:00:02.000000Z INFO site up',
@@ -354,6 +902,166 @@ describe('Controller.projectLogs', () => {
       '2026-10-01T10:00:02.000000Z INFO already published',
       '2026-10-01T10:00:05.000000Z INFO new',
     ]);
+  });
+
+  it('publishes host failures, honours the logs opt-out, and survives a restart', async () => {
+    const api = new LogApi();
+    api.workloads = [
+      {
+        metadata: {
+          ...(deployments[0] as WorkloadIdentity),
+          annotations: { 'di-framework.dev/logs': 'false' },
+        },
+      },
+      ...deployments.slice(1).map((d) => ({ metadata: d })),
+    ];
+    const log = [
+      hostLine('collector guest output', { at: '2026-10-01T10:00:01.000000Z' }),
+      failureLine('service did not properly execute', {
+        name: 'mesh-collector-aaa-1',
+        at: '2026-10-01T10:00:02.000000Z',
+      }),
+      failureLine('failed to start workload reason="no host header found"', {
+        name: 'mesh-site-bbb-1',
+        level: 'ERROR',
+        at: '2026-10-01T10:00:03.000000Z',
+      }),
+    ];
+    api.logs.set('host-0', log.join('\n'));
+    await new Controller(api, cfg).projectLogs(tenant());
+    const expectedLines = [
+      '2026-10-01T10:00:02.000000Z WARN host: service did not properly execute',
+      '2026-10-01T10:00:03.000000Z ERROR host: failed to start workload reason="no host header found"',
+    ];
+    const expectedFailures = {
+      'mesh-collector': {
+        workload: 'mesh-collector-aaa-1',
+        time: '2026-10-01T10:00:02.000000Z',
+        level: 'WARN',
+        message: 'service did not properly execute',
+      },
+      'mesh-site': {
+        workload: 'mesh-site-bbb-1',
+        time: '2026-10-01T10:00:03.000000Z',
+        level: 'ERROR',
+        message: 'failed to start workload reason="no host header found"',
+      },
+    };
+    const failuresOf = () => JSON.parse(projectedFailuresText(api.configMaps.get('di-logs-mesh')));
+    expect(linesOf(api, 'di-logs-mesh').split('\n')).toEqual(expectedLines);
+    expect(failuresOf()).toEqual(expectedFailures);
+
+    // A restarted controller re-reads the same tail: no duplicate lines, no lost failures,
+    // and no write at all.
+    let patches = 0;
+    const call = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown) => {
+      if (method === 'PATCH') patches++;
+      return call<T>(method, path, body);
+    };
+    await new Controller(api, cfg).projectLogs(tenant());
+    expect(patches).toBe(0);
+    expect(linesOf(api, 'di-logs-mesh').split('\n')).toEqual(expectedLines);
+    expect(failuresOf()).toEqual(expectedFailures);
+
+    // A ConfigMap written before failures existed: failures older than the line floor
+    // are still recorded, without re-adding the lines.
+    api.configMaps.set(
+      'di-logs-mesh',
+      logsConfigMap('alpha', NS, 'test', 'mesh', ['2026-10-01T10:00:09.000000Z INFO later']),
+    );
+    await new Controller(api, cfg).projectLogs(tenant());
+    expect(linesOf(api, 'di-logs-mesh')).toBe('2026-10-01T10:00:09.000000Z INFO later');
+    expect(failuresOf()).toEqual(expectedFailures);
+  });
+
+  it('clears a failure when the deployment starts a new host workload, dropping the key', async () => {
+    const api = new LogApi();
+    const failed = failureLine('failed to start workload reason="timed out"', {
+      name: 'mesh-site-78b9f6d4b6-55b5d9c569',
+      level: 'ERROR',
+      at: at(2),
+    });
+    api.logs.set(
+      'host-0',
+      [startLine('mesh-site-78b9f6d4b6-55b5d9c569', 'w-1', 1), failed].join('\n'),
+    );
+    const controller = new Controller(api, cfg);
+    await controller.projectLogs(tenant());
+    expect(
+      Object.keys(JSON.parse(projectedFailuresText(api.configMaps.get('di-logs-mesh')))),
+    ).toEqual(['mesh-site']);
+    // The retry's start arrives in a later read, with the failure again in the lookback.
+    api.logs.set(
+      'host-0',
+      [failed, startLine('mesh-site-78b9f6d4b6-5d4d5db5c6', 'w-2', 3)].join('\n'),
+    );
+    await controller.projectLogs(tenant());
+    expect(api.configMaps.get('di-logs-mesh')?.data).toEqual({
+      lines: `${at(2)} ERROR host: failed to start workload reason="timed out"`,
+    });
+  });
+
+  it('keeps a host line in the ring across a guest flood and a controller restart', async () => {
+    const api = new LogApi();
+    const stamp = (n: number) =>
+      `2026-10-01T23:03:${String(55 + Math.floor(n / 1000)).padStart(2, '0')}.${String(n % 1000).padStart(6, '0')}Z`;
+    const flood = (from: number, count: number) =>
+      Array.from({ length: count }, (_, i) =>
+        hostLine(`mqtt ${from + i}`, { name: 'mesh-collector-a-1', at: stamp(from + i) }),
+      );
+    const failed = failureLine('failed to start workload reason="no host header found"', {
+      name: 'mesh-site-b-1',
+      level: 'ERROR',
+      at: stamp(1),
+    });
+    api.logs.set('host-0', [...flood(0, 1), failed, ...flood(2, 500)].join('\n'));
+    await new Controller(api, cfg).projectLogs(tenant());
+    const expected = `${stamp(1)} ERROR host: failed to start workload reason="no host header found"`;
+    expect(linesOf(api, 'di-logs-mesh').split('\n')).toHaveLength(MAX_LINES);
+    expect(linesOf(api, 'di-logs-mesh').split('\n')[0]).toBe(expected);
+    // A restarted controller re-merges with the published ring under another flood.
+    api.logs.set('host-0', flood(502, 998).join('\n'));
+    await new Controller(api, cfg).projectLogs(tenant());
+    const ring = linesOf(api, 'di-logs-mesh').split('\n');
+    expect(ring).toHaveLength(MAX_LINES);
+    expect(ring[0]).toBe(expected);
+    expect(ring.at(-1)).toBe(`${stamp(1499)} INFO mqtt 1499`);
+  });
+
+  it('attributes a service crash logged after the tick that saw its start', async () => {
+    const api = new LogApi();
+    api.workloads = [
+      {
+        metadata: { name: 'collector', labels: { 'di-framework.dev/workload': 'mesh' } },
+        spec: { template: { spec: { service: { image: 'x' } } } },
+      } as never,
+      { metadata: { name: 'site', labels: { 'di-framework.dev/workload': 'mesh' } } },
+    ];
+    const start = startLine('collector-a-1', 'w-1', 1);
+    const guest = hostLine('connecting', {
+      name: 'collector-a-1',
+      at: at(1).replace('.000000', '.000001'),
+    });
+    api.logs.set('host-0', [start, guest].join('\n'));
+    const controller = new Controller(api, cfg);
+    await controller.projectLogs(tenant());
+    expect(projectedFailuresText(api.configMaps.get('di-logs-mesh'))).toBe('{}');
+    // The next read overlaps the cursor, so it sees the start again with the crash.
+    api.logs.set('host-0', [start, guest, loopLine(2)].join('\n'));
+    await controller.projectLogs(tenant());
+    expect(linesOf(api, 'di-logs-mesh').split('\n')).toEqual([
+      `${at(1).replace('.000000', '.000001')} INFO connecting`,
+      `${at(2)} ERROR host: P3 service execution failed err=trap retries=0`,
+    ]);
+    expect(JSON.parse(projectedFailuresText(api.configMaps.get('di-logs-mesh')))).toEqual({
+      collector: {
+        workload: 'collector-a-1',
+        time: at(2),
+        level: 'ERROR',
+        message: 'P3 service execution failed err=trap retries=0',
+      },
+    });
   });
 
   it('writes nothing without attributed lines and removes projections of removed apps', async () => {
