@@ -1,4 +1,5 @@
 import { backingServiceCrds } from './backing-services';
+import { hostStorage } from './workload-storage';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json | undefined };
 export interface Metadata {
   name: string;
@@ -248,8 +249,10 @@ function tenantResources(
   tenant: Tenant,
   cfg: ControllerConfig,
   schedulerSecret?: { data: Record<string, string> },
+  storageKeys: string[] = [],
 ): Resource[] {
   const n = names(tenant.metadata.name);
+  const storage = hostStorage(tenant, cfg, storageKeys);
   const make = (
     apiVersion: string,
     kind: string,
@@ -569,6 +572,18 @@ function tenantResources(
       make('apps/v1', 'Deployment', `hostgroup-${n.hostgroup}`, n.runtimeNamespace, {
         spec: {
           replicas,
+          // A storage host owns node-local workload directories. A surge pod would run a
+          // second host on them and does not fit the runtime quota, so the old host leaves
+          // first. This stays RollingUpdate: switching type to Recreate under server-side
+          // apply is rejected while the defaulted rollingUpdate block remains.
+          ...(storageKeys.length
+            ? {
+                strategy: {
+                  type: 'RollingUpdate',
+                  rollingUpdate: { maxSurge: 0, maxUnavailable: 1 },
+                },
+              }
+            : {}),
           selector: {
             matchLabels: {
               'wasmcloud.com/hostgroup': n.hostgroup,
@@ -589,6 +604,9 @@ function tenantResources(
                 fsGroup: 65532,
                 seccompProfile: { type: 'RuntimeDefault' },
               },
+              // Persistent workload directories (#11) are created by DirectoryOrCreate as root;
+              // this step hands each one to the host uid before the host starts.
+              ...(storage.initContainers.length ? { initContainers: storage.initContainers } : {}),
               containers: [
                 {
                   name: 'host',
@@ -634,6 +652,7 @@ function tenantResources(
                     { name: 'scheduler', mountPath: '/scheduler', readOnly: true },
                     { name: 'tmp', mountPath: '/tmp' },
                     { name: 'cache', mountPath: '/oci-cache' },
+                    ...storage.volumeMounts,
                   ],
                 },
               ],
@@ -641,6 +660,7 @@ function tenantResources(
                 { name: 'scheduler', secret: { secretName: 'di-scheduler-tls' } },
                 { name: 'tmp', emptyDir: {} },
                 { name: 'cache', emptyDir: {} },
+                ...storage.volumes,
               ],
             },
           },

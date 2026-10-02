@@ -14,6 +14,7 @@ import {
  * must ship beside `resources` / `controller` (which require them at runtime). */
 export const CONTROLLER_SCRIPT_MODULES = [
   'backing-services',
+  'workload-storage',
   'resources',
   'backing-service-reconcile',
   'service-binding-reconcile',
@@ -115,8 +116,14 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
     },
     {
       apiGroups: ['runtime.wasmcloud.dev'],
-      resources: ['hosts', 'workloaddeployments'],
+      resources: ['hosts'],
       verbs: ['get', 'list', 'watch'],
+    },
+    {
+      // Read for the logs projection; patch only adds the platform storage volume (#11).
+      apiGroups: ['runtime.wasmcloud.dev'],
+      resources: ['workloaddeployments'],
+      verbs: ['get', 'list', 'watch', 'patch'],
     },
     {
       apiGroups: ['apps'],
