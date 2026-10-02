@@ -1,6 +1,6 @@
 {
   "name": "@di-framework/sqlite-component",
-  "version": "6.0.2",
+  "version": "6.0.3",
   "private": false,
   "description": "SQLite WebAssembly component (di-framework:sqlite@0.1.0) for platform guests.",
   "license": "(MIT OR Apache-2.0)",
