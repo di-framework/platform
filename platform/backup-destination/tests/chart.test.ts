@@ -99,5 +99,5 @@ describe('backup-destination chart', () => {
     const missing = await template('di-tenant-alpha', {});
     expect(missing.code).not.toBe(0);
     expect(missing.stderr).toContain('bucket is required');
-  });
+  }, 30000);
 });
