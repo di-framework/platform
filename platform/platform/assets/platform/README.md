@@ -2,8 +2,8 @@
 
 This generated Pulumi project provisions platform resources only:
 
-- a pinned k0s controller/worker in a stack- and workspace-scoped Docker network;
-- stack-scoped Docker volumes for k0s state and pod logs;
+- a pinned k0s controller/worker in a stack- and workspace-scoped container network;
+- stack-scoped container volumes for k0s state and pod logs;
 - an in-cluster, pinned OCI registry exposed to the host only through loopback;
 - wasmCloud runtime operator 2.8.0 and its default HTTP host group;
 - a generic loopback HTTP entrypoint.
@@ -37,6 +37,19 @@ push address (`http://127.0.0.1:25000` by default) and cluster pull address
 (`di-framework-registry.wasmcloud.svc.cluster.local:5000`) reach the same
 registry content.
 
+## Container engine
+
+Docker is the default. To run the k0s container with Podman (or another
+Docker-compatible CLI on `PATH`), set `containerCli` before the first deployment:
+
+```sh
+pulumi config set containerCli podman
+```
+
+The value must be a plain command name or path. Resources stay owned by the
+engine that created them, so to switch engines destroy the platform first and
+deploy again; that removes cluster state.
+
 ## Output contract
 
 | Output | Meaning |
@@ -68,9 +81,9 @@ Send the configured project name as the HTTP `Host` header, for example:
 curl -H 'Host: greeter' http://127.0.0.1:28180/
 ```
 
-Platform destroy removes only Docker and Kubernetes resources bearing this
+Platform destroy removes only container-engine and Kubernetes resources bearing this
 project/stack scope, along with the generated kubeconfig. It refuses to adopt
-or replace an already-existing Docker resource with the same name. Teardown
+or replace an already-existing container, network, or volume with the same name. Teardown
 uses the `kubectl` bundled in the scoped k0s container, so no host-side
 `kubectl` installation is needed for platform lifecycle commands.
 

@@ -6,8 +6,9 @@ CRD contracts, controller, admission policies, tenant namespace declarations, an
 HTTP entrypoint. Application WorkloadDeployments remain owned by application
 deployment tooling.
 
-- `@di-framework/platform/local` provisions the isolated Docker/k0s cluster,
-  registry, and platform used by generated CLI projects.
+- `@di-framework/platform/local` provisions the isolated k0s cluster (in Docker,
+  or Podman with `containerCli: podman`), registry, and platform used by generated
+  CLI projects.
 - `@di-framework/platform/existing` reads Pulumi configuration and installs the
   platform on a caller-owned cluster. `di-framework-kube` uses this entrypoint.
 - `createPlatform(args)` installs the shared Kubernetes resources with a supplied
@@ -18,6 +19,18 @@ The CLI and kube must use the same project/backend/stack when operating the same
 installation; sharing source code does not permit two stacks to own its resources.
 The kube entrypoint claims cluster ownership before provisioning and refuses
 unmanaged legacy installations. Other consumers must enforce equivalent ownership.
+
+## Local configuration
+
+`apiPort`, `registryPort`, and `httpPort` (defaults `26443`, `25000`, `28180`)
+choose the distinct loopback host ports. `containerCli` (default `docker`) names
+the container engine command used for every network, volume, container, `exec`,
+and `logs` call; set it to `podman` or another Docker-compatible CLI. It must be a
+plain command name or path (letters, digits, `.`, `_`, `/`, `+`, `-`; not starting
+with `-`). Ownership checks use only inspect templates both Docker and Podman
+support. Choose it before the first `pulumi up`; to switch engines, destroy the
+platform and deploy again (this removes cluster state). `tenants`, `users`, and the
+other platform settings are shared with the existing-cluster entrypoint.
 
 ## Existing-cluster configuration
 

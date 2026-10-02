@@ -108,12 +108,12 @@ test('local entrypoint retains existing logical names and guarded Docker cleanup
   const local = readFileSync(join(root, 'src/local.ts'), 'utf8');
   expect(local).toContain('createPlatform({');
   expect(local).toContain("'runtime-shutdown'");
-  expect(local).toContain('delete deployment/hostgroup-default');
-  expect(local).toContain('Refusing to replace existing container');
+  expect(local).toContain('shutdownRuntime(cli)');
+  expect(local).toContain('refuseExistingContainerThenRun(owned');
   expect(local.match(/Logging\.None/g)).toHaveLength(2);
 });
 
-test('local packaged entrypoint provisions Docker and the shared platform', () => {
+function localResources(config: Record<string, string> = {}) {
   const output = execFileSync(
     'node',
     [
@@ -121,6 +121,7 @@ test('local packaged entrypoint provisions Docker and the shared platform', () =
       `
     const pulumi = require('@pulumi/pulumi');
     const resources = [];
+    pulumi.runtime.setAllConfig(${JSON.stringify(config)});
     pulumi.runtime.setMocks({
       newResource: a => { resources.push(a); return {id:a.name, state:{...a.inputs, stdout:'test-kubeconfig', metadata:{...a.inputs.metadata, name:a.inputs.metadata?.name ?? a.name}}}; },
       call: a => a.inputs,
@@ -128,9 +129,13 @@ test('local packaged entrypoint provisions Docker and the shared platform', () =
     pulumi.runtime.runInPulumiStack(() => require('./dist/local')).then(async () => { await pulumi.runtime.disconnect(); console.log(JSON.stringify(resources)); }).catch(e => {console.error(e);process.exitCode=1;});
   `,
     ],
-    { cwd: root, encoding: 'utf8' },
+    { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
   );
-  const resources = JSON.parse(output) as { type: string; name: string; inputs: any }[];
+  return JSON.parse(output) as { type: string; name: string; inputs: any }[];
+}
+
+test('local packaged entrypoint provisions Docker and the shared platform', () => {
+  const resources = localResources();
   expect(
     resources.find((r) => r.name === 'k0s' && r.type.startsWith('command:'))?.inputs.create,
   ).toContain('docker run -d');
@@ -143,4 +148,26 @@ test('local packaged entrypoint provisions Docker and the shared platform', () =
       .allowSharedHosts,
   ).toBe(false);
   expect(resources.some((r) => r.type === 'kubernetes:apps/v1:DaemonSet')).toBe(false);
+}, 60_000);
+
+test('local entrypoint drives the configured container CLI for every container command', () => {
+  const resources = localResources({ 'project:containerCli': 'podman' });
+  const commands = resources
+    .filter((r) => r.type.startsWith('command:'))
+    .flatMap((r) => [r.inputs.create, r.inputs.delete].filter(Boolean) as string[]);
+  const containerCommands = commands.filter((c) => /\b(run|exec|inspect|rm) /.test(c));
+  expect(containerCommands.length).toBeGreaterThanOrEqual(8);
+  for (const command of commands) {
+    expect(command).not.toMatch(/\bdocker (run|exec|logs|network|volume|container)\b/);
+  }
+  expect(resources.find((r) => r.name === 'k0s')?.inputs.create).toContain('podman run -d');
+  expect(resources.find((r) => r.name === 'runtime-shutdown')?.inputs.delete).toContain(
+    'podman exec "$K0S_NAME"',
+  );
+}, 60_000);
+
+test('local entrypoint rejects a container CLI with shell metacharacters', () => {
+  expect(() => localResources({ 'project:containerCli': 'podman; true' })).toThrow(
+    'containerCli must be a plain command name or path',
+  );
 }, 60_000);
