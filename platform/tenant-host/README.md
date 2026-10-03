@@ -15,6 +15,9 @@ links `wasi:tls/client,types@0.3.0-draft` alongside the default interfaces.
 - Patch: `postgres-invocation-lease.patch` is applied with `git apply` before the build. It keeps
   one postgres connection for the invocation across `BEGIN` / `COMMIT` / `ROLLBACK`, and releases
   that lease when the HTTP call finishes, including when the guest stops before `COMMIT`.
+  Queries outside a transaction keep upstream's bounded row channel. A query on the leased
+  connection is buffered so the connection can be returned before the guest reads, and that
+  buffer stops at 4096 rows or 8 MiB.
 - Feature: `wasi-tls` is declared by the `wash` crate (`wasi-tls = ["wash-runtime/wasi-tls"]`), which
   enables `wasmtime-wasi-tls` (p3, rustls) in `wash-runtime`. Default features (`wasi-webgpu`,
   `wasm_component_model_implements`) stay on, matching upstream's `CARGO_FEATURES` build argument.

@@ -42,10 +42,25 @@ index 9e70b47..cf77dba 100644
      }
  }
 diff --git a/crates/wash-runtime/src/plugin/wasmcloud_postgres/async_p3.rs b/crates/wash-runtime/src/plugin/wasmcloud_postgres/async_p3.rs
-index 568fb16..d6bf234 100644
+index 568fb16..8b18489 100644
 --- a/crates/wash-runtime/src/plugin/wasmcloud_postgres/async_p3.rs
 +++ b/crates/wash-runtime/src/plugin/wasmcloud_postgres/async_p3.rs
-@@ -17,9 +17,10 @@
+@@ -9,17 +9,20 @@
+ //!
+ //! The functions are bound with the `store` bindgen option so `query` can mint a
+ //! `stream<row>` and a completion `future` (via [`StreamReader`]/[`FutureReader`]).
+-//! Rows are streamed incrementally: a background task owns the connection and the
+-//! `tokio_postgres` row stream and feeds rows over a bounded channel (so a slow
+-//! guest exerts backpressure), while the completion future carries any error that
+-//! surfaces partway through. The value model (`pg-value`) is byte-identical to
+-//! the sync binding, so the whole `conversions` body is `include!`d and reused.
++//! Queries outside a transaction stream: a background task owns the connection
++//! and feeds rows over a bounded channel, so a slow guest exerts backpressure.
++//! A query on a leased transaction connection is buffered, with a row and byte
++//! cap, so that connection can be returned before the guest reads the stream.
++//! The completion future carries any error that surfaces partway through. The
++//! value model (`pg-value`) is byte-identical to the sync binding, so the whole
++//! `conversions` body is `include!`d and reused.
  
  use core::pin::Pin;
  use core::task::{Context, Poll};
@@ -53,26 +68,40 @@ index 568fb16..d6bf234 100644
  
  use futures::TryStreamExt as _;
 -use tokio::sync::{mpsc, oneshot};
-+use tokio::sync::{oneshot, Mutex};
++use tokio::sync::{Mutex, mpsc, oneshot};
  use tokio_postgres::types::{ToSql, Type as PgType};
  use wasmtime::StoreContextMut;
  use wasmtime::component::{
-@@ -40,10 +41,6 @@ use super::PgId;
+@@ -40,14 +43,21 @@ use super::PgId;
  #[cfg(feature = "wasm_component_model_implements")]
  use crate::plugin::multiplex::Multiplexer;
  
--/// How many fetched rows may sit buffered between the fetch task and the guest
--/// before the task blocks — bounds host memory and applies backpressure.
--const ROW_CHANNEL_CAPACITY: usize = 16;
--
- mod bindings;
++mod bindings;
++
++use bindings::wasmcloud::postgres0_2_0::types::{DbError, Error, PgValue, Row};
++use bindings::wasmcloud::postgres0_2_0::{prepared, query, types};
++
+ /// How many fetched rows may sit buffered between the fetch task and the guest
+ /// before the task blocks — bounds host memory and applies backpressure.
+ const ROW_CHANNEL_CAPACITY: usize = 16;
  
- use bindings::wasmcloud::postgres0_2_0::types::{DbError, Error, PgValue, Row};
-@@ -116,6 +113,132 @@ async fn client_for(
+-mod bindings;
++/// Rows held on the host when a leased connection must be returned before the
++/// guest reads the stream. Beyond this the query fails instead of growing.
++const LEASED_ROW_CAP: usize = 4_096;
+ 
+-use bindings::wasmcloud::postgres0_2_0::types::{DbError, Error, PgValue, Row};
+-use bindings::wasmcloud::postgres0_2_0::{prepared, query, types};
++/// Summed payload bytes allowed in that leased buffer. Scalars count as 16.
++const LEASED_BYTE_CAP: usize = 8 * 1024 * 1024;
+ 
+ /// The completion `future<result<_, error>>` end returned alongside a query's
+ /// row stream.
+@@ -116,23 +126,158 @@ async fn client_for(
          .map_err(|e| Error::ConnectionFailed(format!("failed to get connection: {e}")))
  }
  
-+#[derive(Clone, Copy, PartialEq, Eq)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 +enum TxBoundary {
 +    None,
 +    Begin,
@@ -201,7 +230,20 @@ index 568fb16..d6bf234 100644
  /// Run `q` on `client` and start streaming its rows.
  ///
  /// The statement is prepared first so the column list is known up front (an
-@@ -129,10 +252,16 @@ async fn stream_query<U>(
+ /// empty result set still reports its columns, and `tokio_postgres`'s row stream
+-/// exposes no column metadata of its own). A background task then owns the
+-/// connection and the row stream, forwarding converted rows over a bounded
+-/// channel and resolving the completion future when the stream ends — or with
+-/// the error, if one surfaces mid-stream.
++/// exposes no column metadata of its own).
++///
++/// Outside a transaction the connection stays with a background task that feeds
++/// a bounded channel. On a leased connection the rows are collected, up to
++/// [`LEASED_ROW_CAP`] and [`LEASED_BYTE_CAP`], and the connection is returned
++/// before this host call returns — the guest reads the stream only after that,
++/// and holding the connection until the read would block the next statement.
+ async fn stream_query<U>(
+     store: &Accessor<U, SharedCtx>,
      client: deadpool_postgres::Client,
      q: String,
      params: Vec<PgValue>,
@@ -219,129 +261,203 @@ index 568fb16..d6bf234 100644
      };
      let columns = stmt
          .columns()
-@@ -140,28 +269,50 @@ async fn stream_query<U>(
+@@ -140,6 +285,31 @@ async fn stream_query<U>(
          .map(|c| c.name().to_string())
          .collect::<Vec<String>>();
  
--    let (row_tx, row_rx) = mpsc::channel::<Row>(ROW_CHANNEL_CAPACITY);
-+    // Finish the query and put a leased connection back before returning to the
-+    // guest. The guest reads the row stream only after this host call returns,
-+    // so holding the connection until that read blocks the next statement.
-+    let rows = match collect_rows(&client, stmt, params).await {
-+        Ok(rows) => rows,
-+        Err(error) => {
-+            if let Some(lease) = restore {
-+                return_client(lease, client).await;
-+            }
-+            return Ok(Err(error));
-+        }
-+    };
 +    if let Some(lease) = restore {
++        let rows = match collect_rows(&client, stmt, params).await {
++            Ok(rows) => rows,
++            Err(error) => {
++                return_client(lease, client).await;
++                return Ok(Err(error));
++            }
++        };
 +        return_client(lease, client).await;
++        let (done_tx, done_rx) = oneshot::channel::<Result<(), Error>>();
++        return store.with(|mut access| {
++            let stream = StreamReader::new(
++                &mut access,
++                RowStreamProducer {
++                    source: RowSource::Buffer {
++                        rows: rows.into_iter(),
++                        done: Some(done_tx),
++                    },
++                },
++            )?;
++            let future = CompletionFuture::new(&mut access, done_rx)?;
++            wasmtime::Result::Ok(Ok((columns, stream, future)))
++        });
 +    }
 +
-+    // Keep every row in the producer. Complete the future only after the guest
-+    // has read the stream; completing it first makes the guest drop the stream.
+     let (row_tx, row_rx) = mpsc::channel::<Row>(ROW_CHANNEL_CAPACITY);
      let (done_tx, done_rx) = oneshot::channel::<Result<(), Error>>();
--    tokio::spawn(async move {
--        let result = drain_query(client, stmt, params, row_tx).await;
--        let _ = done_tx.send(result);
--    });
-+    tracing::info!(
-+        rows = rows.len(),
-+        columns = columns.len(),
-+        "postgres query buffered"
-+    );
+     tokio::spawn(async move {
+@@ -148,7 +318,12 @@ async fn stream_query<U>(
+     });
  
      store.with(|mut access| {
 -        let stream = StreamReader::new(&mut access, RowStreamProducer { rows: row_rx })?;
 +        let stream = StreamReader::new(
 +            &mut access,
 +            RowStreamProducer {
-+                rows: rows.into_iter(),
-+                done: Some(done_tx),
++                source: RowSource::Channel(row_rx),
 +            },
 +        )?;
          let future = CompletionFuture::new(&mut access, done_rx)?;
          wasmtime::Result::Ok(Ok((columns, stream, future)))
      })
- }
- 
--/// Body of the row-fetch task: execute the prepared statement and forward each
--/// converted row to `row_tx`, stopping early if the guest drops the stream.
--async fn drain_query(
--    client: deadpool_postgres::Client,
-+/// Read every row, then release the connection before the guest polls the stream.
-+async fn collect_rows(
-+    client: &deadpool_postgres::Client,
-     stmt: tokio_postgres::Statement,
-     params: Vec<PgValue>,
--    row_tx: mpsc::Sender<Row>,
--) -> Result<(), Error> {
-+) -> Result<Vec<Row>, Error> {
-     let param_refs = params
-         .iter()
-         .map(|p| p as &(dyn ToSql + Sync))
-@@ -171,23 +322,18 @@ async fn drain_query(
-         .await
-         .map_err(|e| to_wit_error(&e))?;
-     let mut stream = std::pin::pin!(stream);
-+    let mut rows = Vec::new();
-     loop {
-         match stream.try_next().await {
--            Ok(Some(row)) => {
--                let values = conversions::row_to_values(&row)?;
--                if row_tx.send(values).await.is_err() {
--                    // Guest dropped the stream; stop fetching.
--                    return Ok(());
--                }
--            }
--            Ok(None) => return Ok(()),
-+            Ok(Some(row)) => rows.push(conversions::row_to_values(&row)?),
-+            Ok(None) => return Ok(rows),
-             Err(e) => return Err(to_wit_error(&e)),
-         }
+@@ -186,8 +361,114 @@ async fn drain_query(
      }
  }
  
++fn leased_result_too_large() -> Error {
++    Error::Other(
++        "postgres query result exceeds the host buffer for a leased connection".to_string(),
++    )
++}
++
++/// Read every row of a leased query, refusing a result that would sit unbounded
++/// in host memory. The caller returns the connection after this finishes.
++async fn collect_rows(
++    client: &deadpool_postgres::Client,
++    stmt: tokio_postgres::Statement,
++    params: Vec<PgValue>,
++) -> Result<Vec<Row>, Error> {
++    let param_refs = params
++        .iter()
++        .map(|p| p as &(dyn ToSql + Sync))
++        .collect::<Vec<_>>();
++    let stream = client
++        .query_raw(&stmt, param_refs)
++        .await
++        .map_err(|e| to_wit_error(&e))?;
++    let mut stream = std::pin::pin!(stream);
++    let mut rows = Vec::new();
++    let mut bytes = 0usize;
++    loop {
++        match stream.try_next().await {
++            Ok(Some(row)) => {
++                let values = conversions::row_to_values(&row)?;
++                let next = bytes.saturating_add(row_payload_bytes(&values));
++                if rows.len() >= LEASED_ROW_CAP || next > LEASED_BYTE_CAP {
++                    return Err(leased_result_too_large());
++                }
++                bytes = next;
++                rows.push(values);
++            }
++            Ok(None) => return Ok(rows),
++            Err(e) => return Err(to_wit_error(&e)),
++        }
++    }
++}
++
++/// Bytes of heap payload in a row. Scalars and unrecognized variants count as 16
++/// so the leased cap still moves when a result is wide but not textual.
++fn row_payload_bytes(row: &Row) -> usize {
++    row.iter().map(value_payload_bytes).sum()
++}
++
++fn value_payload_bytes(value: &PgValue) -> usize {
++    match value {
++        PgValue::Null => 0,
++        PgValue::Text(s)
++        | PgValue::Json(s)
++        | PgValue::Jsonb(s)
++        | PgValue::Xml(s)
++        | PgValue::Name(s)
++        | PgValue::Uuid(s)
++        | PgValue::Cidr(s)
++        | PgValue::Inet(s)
++        | PgValue::TsQuery(s)
++        | PgValue::Numeric(s)
++        | PgValue::Decimal(s)
++        | PgValue::Money(s) => s.len(),
++        PgValue::Bytea(bytes) => bytes.len(),
++        PgValue::TextArray(items)
++        | PgValue::JsonArray(items)
++        | PgValue::JsonbArray(items)
++        | PgValue::XmlArray(items)
++        | PgValue::NameArray(items)
++        | PgValue::UuidArray(items)
++        | PgValue::CidrArray(items)
++        | PgValue::InetArray(items)
++        | PgValue::NumericArray(items)
++        | PgValue::MoneyArray(items) => items.iter().map(String::len).sum(),
++        PgValue::ByteaArray(items) => items.iter().map(Vec::len).sum(),
++        PgValue::Varchar((_, bytes))
++        | PgValue::BitVarying((_, bytes))
++        | PgValue::Varbit((_, bytes)) => bytes.len(),
++        PgValue::Char((_, bytes)) | PgValue::Bit((_, bytes)) => bytes.len(),
++        PgValue::VarcharArray(items) | PgValue::VarbitArray(items) => {
++            items.iter().map(|(_, bytes)| bytes.len()).sum()
++        }
++        PgValue::CharArray(items) | PgValue::BitArray(items) => {
++            items.iter().map(|(_, bytes)| bytes.len()).sum()
++        }
++        PgValue::Hstore(pairs) => pairs
++            .iter()
++            .map(|(key, value)| key.len() + value.as_ref().map(String::len).unwrap_or(0))
++            .sum(),
++        PgValue::TsVector(lexemes) => lexemes.iter().map(|lexeme| lexeme.data.len()).sum(),
++        PgValue::Int8Array(items) => items.len() * 8,
++        PgValue::Float8Array(items) => items.len() * 8,
++        PgValue::Int4Array(items) => items.len() * 4,
++        PgValue::Float4Array(items) => items.len() * 4,
++        PgValue::Int2Array(items) | PgValue::Int2Vector(items) => items.len() * 2,
++        PgValue::Int2VectorArray(items) => items.iter().map(Vec::len).sum::<usize>() * 2,
++        PgValue::BoolArray(items) => items.len(),
++        PgValue::Path(points) | PgValue::Polygon(points) | PgValue::PointArray(points) => {
++            points.len() * 16
++        }
++        PgValue::PathArray(paths) | PgValue::PolygonArray(paths) => {
++            paths.iter().map(Vec::len).sum::<usize>() * 16
++        }
++        _ => 16,
++    }
++}
++
  /// Run a multi-statement batch (no parameters, no row results) on `client`.
 -async fn batch_with_client(client: deadpool_postgres::Client, q: String) -> Result<(), Error> {
 +async fn batch_with_client(client: &deadpool_postgres::Client, q: String) -> Result<(), Error> {
      client.batch_execute(&q).await.map_err(|e| to_wit_error(&e))
  }
  
-@@ -255,7 +401,16 @@ async fn lookup_prepared(
- /// guest, one per poll. When the channel closes (task finished) the stream ends;
- /// the paired completion future — resolved by the task — carries the outcome.
- struct RowStreamProducer {
--    rows: mpsc::Receiver<Row>,
-+    rows: std::vec::IntoIter<Row>,
-+    done: Option<oneshot::Sender<Result<(), Error>>>,
+@@ -251,11 +532,20 @@ async fn lookup_prepared(
+         .map(|e| (e.sql.clone(), e.param_types.clone(), e.database.clone()))
+ }
+ 
+-/// [`StreamProducer`] that forwards rows from the fetch task's channel to the
+-/// guest, one per poll. When the channel closes (task finished) the stream ends;
+-/// the paired completion future — resolved by the task — carries the outcome.
++/// Rows for one query stream. The channel path is the unbounded-result case:
++/// only [`ROW_CHANNEL_CAPACITY`] rows sit in the host. The buffer path exists
++/// so a leased connection can be returned before the guest reads.
++enum RowSource {
++    Channel(mpsc::Receiver<Row>),
++    Buffer {
++        rows: std::vec::IntoIter<Row>,
++        done: Option<oneshot::Sender<Result<(), Error>>>,
++    },
 +}
 +
-+impl RowStreamProducer {
-+    fn finish_ok(&mut self) {
-+        if let Some(done) = self.done.take() {
-+            let _ = done.send(Ok(()));
-+        }
-+    }
++/// [`StreamProducer`] that forwards one row per poll.
+ struct RowStreamProducer {
+-    rows: mpsc::Receiver<Row>,
++    source: RowSource,
  }
  
  impl<D: 'static> StreamProducer<D> for RowStreamProducer {
-@@ -264,26 +419,28 @@ impl<D: 'static> StreamProducer<D> for RowStreamProducer {
- 
-     fn poll_produce<'a>(
-         self: Pin<&mut Self>,
--        cx: &mut Context<'_>,
-+        _cx: &mut Context<'_>,
-         mut store: StoreContextMut<'a, D>,
-         mut dst: Destination<'a, Self::Item, Self::Buffer>,
-         finish: bool,
+@@ -271,19 +561,37 @@ impl<D: 'static> StreamProducer<D> for RowStreamProducer {
      ) -> Poll<wasmtime::Result<StreamResult>> {
          let this = self.get_mut();
          if finish {
 -            // Guest cancelled; dropping the receiver signals the fetch task.
-+            this.finish_ok();
++            if let RowSource::Buffer { done, .. } = &mut this.source
++                && let Some(done) = done.take()
++            {
++                let _ = done.send(Ok(()));
++            }
              return Poll::Ready(Ok(StreamResult::Cancelled));
          }
          if dst.remaining(&mut store) == Some(0) {
@@ -349,21 +465,36 @@ index 568fb16..d6bf234 100644
          }
 -        match this.rows.poll_recv(cx) {
 -            Poll::Ready(Some(row)) => {
-+        match this.rows.next() {
-+            Some(row) => {
-                 dst.set_buffer(Some(row));
-                 Poll::Ready(Ok(StreamResult::Completed))
-             }
+-                dst.set_buffer(Some(row));
+-                Poll::Ready(Ok(StreamResult::Completed))
+-            }
 -            Poll::Ready(None) => Poll::Ready(Ok(StreamResult::Dropped)),
 -            Poll::Pending => Poll::Pending,
-+            None => {
-+                this.finish_ok();
-+                Poll::Ready(Ok(StreamResult::Dropped))
-+            }
++        match &mut this.source {
++            RowSource::Channel(rows) => match rows.poll_recv(cx) {
++                Poll::Ready(Some(row)) => {
++                    dst.set_buffer(Some(row));
++                    Poll::Ready(Ok(StreamResult::Completed))
++                }
++                Poll::Ready(None) => Poll::Ready(Ok(StreamResult::Dropped)),
++                Poll::Pending => Poll::Pending,
++            },
++            RowSource::Buffer { rows, done } => match rows.next() {
++                Some(row) => {
++                    dst.set_buffer(Some(row));
++                    Poll::Ready(Ok(StreamResult::Completed))
++                }
++                None => {
++                    if let Some(done) = done.take() {
++                        let _ = done.send(Ok(()));
++                    }
++                    Poll::Ready(Ok(StreamResult::Dropped))
++                }
++            },
          }
      }
  }
-@@ -321,11 +478,16 @@ impl<U> query::HostWithStore<U> for SharedCtx {
+@@ -321,11 +629,16 @@ impl<U> query::HostWithStore<U> for SharedCtx {
                  "no database configured for this component".to_string(),
              )));
          };
@@ -381,7 +512,7 @@ index 568fb16..d6bf234 100644
      }
  
      async fn query_batch(
-@@ -338,11 +500,29 @@ impl<U> query::HostWithStore<U> for SharedCtx {
+@@ -338,11 +651,29 @@ impl<U> query::HostWithStore<U> for SharedCtx {
                  "no database configured for this component".to_string(),
              )));
          };
@@ -412,7 +543,7 @@ index 568fb16..d6bf234 100644
      }
  }
  
-@@ -357,6 +537,14 @@ impl<U> prepared::HostWithStore<U> for SharedCtx {
+@@ -357,6 +688,14 @@ impl<U> prepared::HostWithStore<U> for SharedCtx {
                  "no database configured for this component".to_string(),
              )));
          };
@@ -427,7 +558,7 @@ index 568fb16..d6bf234 100644
          let client = match client_for(&plugin, &database).await {
              Ok(c) => c,
              Err(e) => return Ok(Err(e)),
-@@ -373,6 +561,13 @@ impl<U> prepared::HostWithStore<U> for SharedCtx {
+@@ -373,6 +712,13 @@ impl<U> prepared::HostWithStore<U> for SharedCtx {
          let Some((sql, param_types, database)) = lookup_prepared(&plugin, &stmt_token).await else {
              return Ok(Err(Error::UnknownPreparedStatement));
          };
@@ -441,7 +572,7 @@ index 568fb16..d6bf234 100644
          let client = match client_for(&plugin, &database).await {
              Ok(c) => c,
              Err(e) => return Ok(Err(e)),
-@@ -401,7 +596,7 @@ impl<U> bindings::named_imports::wasmcloud::postgres0_2_0::query::HostWithStore<
+@@ -401,7 +747,7 @@ impl<U> bindings::named_imports::wasmcloud::postgres0_2_0::query::HostWithStore<
              Ok(c) => c,
              Err(e) => return Ok(Err(Error::ConnectionFailed(e))),
          };
@@ -450,7 +581,7 @@ index 568fb16..d6bf234 100644
      }
  
      async fn query_batch(
-@@ -413,7 +608,7 @@ impl<U> bindings::named_imports::wasmcloud::postgres0_2_0::query::HostWithStore<
+@@ -413,7 +759,7 @@ impl<U> bindings::named_imports::wasmcloud::postgres0_2_0::query::HostWithStore<
              Ok(c) => c,
              Err(e) => return Ok(Err(Error::ConnectionFailed(e))),
          };
@@ -459,15 +590,17 @@ index 568fb16..d6bf234 100644
      }
  }
  
-@@ -491,3 +686,24 @@ pub(super) fn add_named_to_linker(
+@@ -491,3 +837,36 @@ pub(super) fn add_named_to_linker(
      )?;
      Ok(())
  }
 +
 +#[cfg(test)]
 +mod tests {
-+    use super::transaction_boundary;
++    use super::PgValue;
 +    use super::TxBoundary;
++    use super::row_payload_bytes;
++    use super::transaction_boundary;
 +
 +    #[test]
 +    fn transaction_boundary_matches_the_adapter_statements() {
@@ -482,6 +615,16 @@ index 568fb16..d6bf234 100644
 +            transaction_boundary("BEGIN;\nINSERT INTO t VALUES (1);"),
 +            TxBoundary::None
 +        );
++    }
++
++    #[test]
++    fn leased_buffer_counts_text_and_bytea_payloads() {
++        let row = vec![
++            PgValue::Text("hello".into()),
++            PgValue::Bytea(vec![1, 2, 3, 4]),
++            PgValue::Null,
++        ];
++        assert_eq!(row_payload_bytes(&row), 5 + 4);
 +    }
 +}
 diff --git a/crates/wash-runtime/src/plugin/wasmcloud_postgres/conversions.rs b/crates/wash-runtime/src/plugin/wasmcloud_postgres/conversions.rs
