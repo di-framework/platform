@@ -1,6 +1,16 @@
 # Publish the tenant host image: wash 2.8.0 with wasi-tls and the postgres
-# invocation-lease patch. Dispatch-only, matching the npm Release workflow:
-# a maintainer runs it; pull requests and pushes do not publish.
+# invocation-lease patch. Dispatch-only, matching the npm Release workflow.
+#
+# amd64 and arm64 compile at the same time on native runners. One ubuntu-24.04
+# job plus QEMU was spending the arm64 release build in emulation, which is
+# what made a cold publish take the better part of an hour.
+# Each arch also pushes a registry cache manifest (mode=max). That manifest is
+# the metadata that points BuildKit at layer blobs already in GHCR, including
+# the builder stage, so a later publish of the same Dockerfile and patch does
+# not run cargo again. It is not the wash tag itself: inline cache on that tag
+# is min mode and omits the builder stage.
+# cancel-in-progress stays false so a queued publish waits and does not abort
+# one that is already compiling.
 # Auth is GITHUB_TOKEN with packages: write. No registry secret is stored.
 name: Publish tenant host image
 
@@ -10,6 +20,7 @@ on:
 permissions:
   contents: read
   packages: write
+  actions: write
   attestations: write
   id-token: write
 
@@ -18,10 +29,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Push ghcr.io/di-framework/wash:2.8.0-wasi-tls
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            cache: ghcr.io/di-framework/wash:buildcache-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            cache: ghcr.io/di-framework/wash:buildcache-arm64
     steps:
       - name: Require di-framework/platform
         run: |
@@ -34,10 +55,68 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          platforms: arm64
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: platform/tenant-host
+          platforms: ${{ matrix.platform }}
+          provenance: true
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=ghcr.io/di-framework/wash,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ matrix.cache }}
+          cache-to: type=registry,ref=${{ matrix.cache }},mode=max,oci-mediatypes=true,image-manifest=true
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          digest="${{ steps.build.outputs.digest }}"
+          if [[ "${digest}" != sha256:* ]]; then
+            echo "::error::build did not return a digest"
+            exit 1
+          fi
+          mkdir -p "${RUNNER_TEMP}/digests"
+          : > "${RUNNER_TEMP}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wash-digest-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/digests
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Push ghcr.io/di-framework/wash:2.8.0-wasi-tls
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Require di-framework/platform
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY}" != "di-framework/platform" ]]; then
+            echo "::error::This workflow publishes ghcr.io/di-framework/wash and only runs in di-framework/platform"
+            exit 1
+          fi
+
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: wash-digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -49,28 +128,36 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        id: push
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: platform/tenant-host
-          platforms: linux/amd64,linux/arm64
-          push: true
-          provenance: true
-          tags: ghcr.io/di-framework/wash:2.8.0-wasi-tls
-          labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
-
-      - name: Record image digest
-        env:
-          DIGEST: ${{ steps.push.outputs.digest }}
+      - name: Create and push manifest
+        working-directory: ${{ runner.temp }}/digests
         run: |
           set -euo pipefail
-          if [[ -z "${DIGEST}" || "${DIGEST}" != sha256:* ]]; then
-            echo "::error::build did not return an index digest"
+          mapfile -t files < <(find . -type f | sort)
+          if (( ${#files[@]} != 2 )); then
+            echo "::error::expected 2 image digests, found ${#files[@]}"
+            printf '%s\n' "${files[@]}"
             exit 1
           fi
-          ref="ghcr.io/di-framework/wash:2.8.0-wasi-tls@${DIGEST}"
+          args=()
+          for file in "${files[@]}"; do
+            hex="$(basename "${file}")"
+            if [[ ! "${hex}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::unexpected digest file ${hex}"
+              exit 1
+            fi
+            args+=("ghcr.io/di-framework/wash@sha256:${hex}")
+          done
+          docker buildx imagetools create -t ghcr.io/di-framework/wash:2.8.0-wasi-tls "${args[@]}"
+
+      - name: Record image digest
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect ghcr.io/di-framework/wash:2.8.0-wasi-tls | awk '/^Digest:/ { print $2; exit }')"
+          if [[ -z "${digest}" || "${digest}" != sha256:* ]]; then
+            echo "::error::manifest list did not return an index digest"
+            exit 1
+          fi
+          ref="ghcr.io/di-framework/wash:2.8.0-wasi-tls@${digest}"
           echo "Published ${ref}"
           {
             echo "### Tenant host image"

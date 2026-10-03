@@ -36,7 +36,7 @@ podman run --rm localhost/di-framework/wash:2.8.0-wasi-tls --version
 
 `docker build` works the same way (BuildKit is needed for the cache mounts). A cold arm64 build took
 about 10 minutes on 16 cores; the cargo registry and target directory are cache mounts, so rebuilds are
-faster. The result is about 165 MB, the same as the stock image.
+faster. The release link uses `lld`. The result is about 165 MB, the same as the stock image.
 
 At startup the host logs `Host provides interfaces` with `wasi:tls/types,client@0.3.0-draft` in the
 list (the stock image lists the same interfaces without it), followed by one expected
@@ -49,7 +49,12 @@ Reference: `ghcr.io/di-framework/wash:2.8.0-wasi-tls`
 
 The **Publish tenant host image** workflow
 ([`.github/workflows/tenant-host-image.yml`](../../.github/workflows/tenant-host-image.yml))
-builds `linux/amd64` and `linux/arm64` and pushes that tag. It is `workflow_dispatch` only, the
+builds `linux/amd64` and `linux/arm64` on native runners (`ubuntu-24.04` and `ubuntu-24.04-arm`)
+at the same time, then pushes the multi-arch tag. It does not emulate arm64. Each arch also pushes
+a cache manifest, `ghcr.io/di-framework/wash:buildcache-amd64` and `:buildcache-arm64`, with
+`mode=max`. That manifest records which layer blob in GHCR matches each Dockerfile step, including
+the builder stage, and the next build imports it. The wash tag itself is not the cache: inline
+metadata on an image only covers the final stage. It is `workflow_dispatch` only, the
 same explicit publish step this repo uses for npm releases: a maintainer runs it from the Actions
 tab after the workflow file is on `main`
 (`https://github.com/di-framework/platform/actions/workflows/tenant-host-image.yml`).
