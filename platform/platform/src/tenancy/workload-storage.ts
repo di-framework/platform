@@ -150,6 +150,31 @@ export function hostStorage(
 }
 
 /**
+ * Kubernetes JSON objects do not preserve key order. The API server emits map keys
+ * alphabetically, so equality has to ignore order or a stored volume never matches the
+ * one this controller builds and every tick sends another patch.
+ */
+function compareKeys(left: string, right: string): number {
+  if (left < right) return -1;
+  return left > right ? 1 : 0;
+}
+
+function sameStructure(left: unknown, right: unknown): boolean {
+  const ordered = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(ordered);
+    if (value !== null && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+          .sort(([a], [b]) => compareKeys(a, b))
+          .map(([key, nested]) => [key, ordered(nested)]),
+      );
+    }
+    return value;
+  };
+  return JSON.stringify(ordered(left)) === JSON.stringify(ordered(right));
+}
+
+/**
  * The volume and preopen fields the controller owns on a WorkloadDeployment, or undefined
  * when the workload already carries exactly those fields.
  */
@@ -172,8 +197,8 @@ export function storagePatch(workload: WorkloadDeployment): Resource | undefined
     };
   });
   if (
-    JSON.stringify(template.volumes ?? []) === JSON.stringify(volumes) &&
-    JSON.stringify(template.components ?? []) === JSON.stringify(components)
+    sameStructure(template.volumes ?? [], volumes) &&
+    sameStructure(template.components ?? [], components)
   )
     return undefined;
   return {

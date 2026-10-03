@@ -254,6 +254,20 @@ describe('storagePatch', () => {
     ]);
   });
 
+  it('treats the API server key order as already applied', () => {
+    const applied = workload('a');
+    const spec = applied.spec?.template?.spec as NonNullable<
+      NonNullable<WorkloadDeployment['spec']>['template']
+    >['spec'] & { components: { localResources: Record<string, unknown> }[] };
+    spec.volumes = [
+      { hostPath: { path: '/var/lib/di-framework/workloads/a' }, name: 'di-storage' },
+    ];
+    (
+      spec.components[0] as { localResources: Record<string, unknown> }
+    ).localResources.volumeMounts = [{ mountPath: '/data', name: 'di-storage' }];
+    expect(storagePatch(applied)).toBeUndefined();
+  });
+
   it('does nothing for unusable keys, mounts, or a missing template', () => {
     expect(storagePatch(workload('x', { workload: '..' }))).toBeUndefined();
     expect(storagePatch(workload('x', { mount: '/etc' }))).toBeUndefined();
