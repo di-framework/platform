@@ -156,8 +156,7 @@ export function hostStorage(
  */
 function compareKeys(left: string, right: string): number {
   if (left < right) return -1;
-  if (left > right) return 1;
-  return 0;
+  return left > right ? 1 : 0;
 }
 
 function sameStructure(left: unknown, right: unknown): boolean {
