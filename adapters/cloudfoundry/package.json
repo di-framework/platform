@@ -1,6 +1,6 @@
 {
   "name": "@di-framework/cloudfoundry",
-  "version": "6.0.4",
+  "version": "6.0.5",
   "description": "Cloud Foundry connector for VCAP_SERVICES discovery, application metadata, and automated DI binding.",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
