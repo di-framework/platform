@@ -1,0 +1,83 @@
+# Publish the tenant host image: wash 2.8.0 with wasi-tls and the postgres
+# invocation-lease patch. Dispatch-only, matching the npm Release workflow:
+# a maintainer runs it; pull requests and pushes do not publish.
+# Auth is GITHUB_TOKEN with packages: write. No registry secret is stored.
+name: Publish tenant host image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+concurrency:
+  group: publish-tenant-host-image
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Push ghcr.io/di-framework/wash:2.8.0-wasi-tls
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Require di-framework/platform
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY}" != "di-framework/platform" ]]; then
+            echo "::error::This workflow publishes ghcr.io/di-framework/wash and only runs in di-framework/platform"
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: platform/tenant-host
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true
+          tags: ghcr.io/di-framework/wash:2.8.0-wasi-tls
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Record image digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DIGEST}" || "${DIGEST}" != sha256:* ]]; then
+            echo "::error::build did not return an index digest"
+            exit 1
+          fi
+          ref="ghcr.io/di-framework/wash:2.8.0-wasi-tls@${DIGEST}"
+          echo "Published ${ref}"
+          {
+            echo "### Tenant host image"
+            echo
+            echo '```'
+            echo "${ref}"
+            echo '```'
+            echo
+            echo 'Pin `tenantHostImage` to that digest. The tag `2.8.0-wasi-tls` moves on the next publish.'
+          } >> "${GITHUB_STEP_SUMMARY}"

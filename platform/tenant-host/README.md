@@ -12,6 +12,12 @@ links `wasi:tls/client,types@0.3.0-draft` alongside the default interfaces.
 ## What is built
 
 - Source: `git clone --branch v2.8.0`, then the build fails unless `HEAD` is the pinned commit.
+- Patch: `postgres-invocation-lease.patch` is applied with `git apply` before the build. It keeps
+  one postgres connection for the invocation across `BEGIN` / `COMMIT` / `ROLLBACK`, and releases
+  that lease when the HTTP call finishes, including when the guest stops before `COMMIT`.
+  Queries outside a transaction keep upstream's bounded row channel. A query on the leased
+  connection is buffered so the connection can be returned before the guest reads, and that
+  buffer stops at 4096 rows or 8 MiB.
 - Feature: `wasi-tls` is declared by the `wash` crate (`wasi-tls = ["wash-runtime/wasi-tls"]`), which
   enables `wasmtime-wasi-tls` (p3, rustls) in `wash-runtime`. Default features (`wasi-webgpu`,
   `wasm_component_model_implements`) stay on, matching upstream's `CARGO_FEATURES` build argument.
@@ -39,8 +45,24 @@ list (the stock image lists the same interfaces without it), followed by one exp
 
 ## Publish
 
-Nothing publishes this image yet. A `ghcr.io/di-framework/wash:2.8.0-wasi-tls` release needs maintainer
-approval; when approved, push a multi-arch (amd64 + arm64) build and pin consumers by digest.
+Reference: `ghcr.io/di-framework/wash:2.8.0-wasi-tls`
+
+The **Publish tenant host image** workflow
+([`.github/workflows/tenant-host-image.yml`](../../.github/workflows/tenant-host-image.yml))
+builds `linux/amd64` and `linux/arm64` and pushes that tag. It is `workflow_dispatch` only, the
+same explicit publish step this repo uses for npm releases: a maintainer runs it from the Actions
+tab after the workflow file is on `main`
+(`https://github.com/di-framework/platform/actions/workflows/tenant-host-image.yml`).
+The job authenticates with the workflow `GITHUB_TOKEN` (`packages: write`).
+
+The tag is mutable. The workflow summary prints the multi-arch index digest; pin
+`tenantHostImage` to `ghcr.io/di-framework/wash:2.8.0-wasi-tls@<digest>`. The platform default
+`hostImage` stays `ghcr.io/wasmcloud/wash:2.8.0` until a published digest is selected for it.
+
+That GHCR tag is not published yet. The workstation `gh` token available while adding this
+workflow (`repo`, `workflow`) is not accepted by GHCR (`403` invalid token, no `write:packages`
+scope). Running the workflow after it is on `main` is the approval still required. The first
+run also needs the `di-framework` org to allow GitHub Actions to publish packages.
 
 For a local Kubesolo/k0s cluster, push to the platform registry (`di-framework-registry` in
 `wasmcloud`, plain HTTP, ClusterIP) through its port-forward. With a remote podman machine, `127.0.0.1`
@@ -70,7 +92,7 @@ The registry Service is ClusterIP, so a node-pullable reference needs a NodePort
 Set the platform config used by the stack (`tenantHostImage` / `tenantHostImagePullPolicy`):
 
 ```sh
-pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls
+pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:<index-digest>
 pulumi config set tenantHostImagePullPolicy IfNotPresent
 ```
 
@@ -78,10 +100,12 @@ or, with `di-framework-kube`, in the `--platform-config` JSON:
 
 ```json
 {
-  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls",
+  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:<index-digest>",
   "tenantHostImagePullPolicy": "IfNotPresent"
 }
 ```
+
+`<index-digest>` is the multi-arch index digest from the publish workflow summary.
 
 Use `Never` with an image loaded straight into the node, and `Always` for a mutable local tag you
 rebuild. The setting applies to every tenant host group.
