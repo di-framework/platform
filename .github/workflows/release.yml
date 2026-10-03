@@ -33,6 +33,13 @@ jobs:
             bun run build
           fi
 
+      # `bun run build` does not compile @di-framework/sqlite-component. This dry-run
+      # runs `make build` for it and refuses a pack that omits dist/. The pack test
+      # below reads the wasm that build leaves on disk, which is the same order as
+      # the Test workflow.
+      - name: Dry-run package publish
+        run: bun scripts/publish-workspace.ts --dry-run
+
       - name: Test
         run: bun test --coverage
 
