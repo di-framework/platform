@@ -12,8 +12,10 @@ FROM docker.io/library/rust:1.96.0-bookworm@sha256:5e2214abe154fe26e39f64488952e
 ARG WASMCLOUD_TAG
 ARG WASMCLOUD_COMMIT
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev \
+  && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev lld \
   && rm -rf /var/lib/apt/lists/*
+# lld links the wasmtime-sized release binary much faster than GNU ld.
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 COPY postgres-invocation-lease.patch /tmp/postgres-invocation-lease.patch
 RUN git clone --depth 1 --branch "${WASMCLOUD_TAG}" https://github.com/wasmCloud/wasmCloud /src \
   && test "$(git -C /src rev-parse HEAD)" = "${WASMCLOUD_COMMIT}" \
