@@ -19,7 +19,7 @@ import {
 
 /** Label identifying the owning BackingService name on provisioned infra. */
 const SERVICE = `${GROUP}/service`;
-/** Label identifying capability (keyvalue|messaging|blobstore) on provisioned infra. */
+/** Label identifying capability (keyvalue|messaging|blobstore|postgres) on provisioned infra. */
 const CAPABILITY = `${GROUP}/capability`;
 
 /**
@@ -32,8 +32,11 @@ const RUNTIME_DATA_NATS = 'di-nats';
 /** Transitional warehouse Redis still owned by Tenant reconcile (#456 migrates). */
 const TRANSITIONAL_REDIS = 'di-redis';
 
+/** Providers that run a backend pod. `platform` (egress) runs nothing. */
+type RuntimeProvider = Exclude<BackingProvider, 'platform'>;
+
 /** Fixed provider images — never tenant-supplied. */
-const PROVIDER_RUNTIME: Record<BackingProvider, { image: string; port: number; args: string[] }> = {
+const PROVIDER_RUNTIME: Record<RuntimeProvider, { image: string; port: number; args: string[] }> = {
   postgres: { image: 'postgres:18.3-bookworm', port: 5432, args: [] },
   redis: {
     image: 'redis:7.4.5-alpine',
@@ -226,7 +229,7 @@ function backendDeploymentResources(opts: {
   labels: Record<string, string>;
   runtimeNamespace: string;
   name: string;
-  provider: BackingProvider;
+  provider: RuntimeProvider;
   hostPath: string;
   replicas: number;
   sizing?: SizingParameters;
@@ -298,6 +301,7 @@ function backingServiceResources(
 ): Resource[] {
   if (cls.spec.provider === 'postgres')
     throw new Error('PostgreSQL requires the dedicated credentials and PVC reconciliation helpers');
+  if (cls.spec.provider === 'platform') throw new Error('Egress services provision no backend');
   const resourceName = backingServiceResourceName(service.metadata.name);
   if (RESERVED_RUNTIME_NAMES.has(resourceName))
     throw new Error(`Refusing to provision reserved name ${resourceName}`);
@@ -345,7 +349,7 @@ function backingServiceResources(
 function endpointFor(
   service: BackingService,
   tenant: Tenant,
-  provider: BackingProvider,
+  provider: RuntimeProvider,
 ): { host: string; port: number; capability: BackingCapability } {
   const resourceName = backingServiceResourceName(service.metadata.name);
   const n = names(tenant.metadata.name);
@@ -376,6 +380,7 @@ export {
   parseQuantity,
   RESERVED_RUNTIME_NAMES,
   RUNTIME_DATA_NATS,
+  type RuntimeProvider,
   resolveBackingSizing,
   resolveClass,
   runtimeDataNatsHostPath,

@@ -2,8 +2,8 @@
 
 This generated Pulumi project provisions platform resources only:
 
-- a pinned k0s controller/worker in a stack- and workspace-scoped Docker network;
-- stack-scoped Docker volumes for k0s state and pod logs;
+- a pinned k0s controller/worker in a stack- and workspace-scoped container network;
+- stack-scoped container volumes for k0s state and pod logs;
 - an in-cluster, pinned OCI registry exposed to the host only through loopback;
 - wasmCloud runtime operator 2.8.0 and its default HTTP host group;
 - a generic loopback HTTP entrypoint.
@@ -37,6 +37,33 @@ push address (`http://127.0.0.1:25000` by default) and cluster pull address
 (`di-framework-registry.wasmcloud.svc.cluster.local:5000`) reach the same
 registry content.
 
+## Container engine
+
+Docker is the default. To run the k0s container with Podman (or another
+Docker-compatible CLI on `PATH`), set `containerCli` before the first deployment:
+
+```sh
+pulumi config set containerCli podman
+```
+
+The value must be a plain command name or path. Resources stay owned by the
+engine that created them, so to switch engines destroy the platform first and
+deploy again; that removes cluster state.
+
+## Registry mirrors
+
+To pull images through a mirror (for example when Docker Hub is rate limited or
+unreachable from the container engine), set `registryMirrors` before the first
+deployment. It maps a registry host to an ordered list of mirror URLs; containerd
+tries each mirror and then the registry itself:
+
+```sh
+pulumi config set --path 'registryMirrors["docker.io"][0]' https://mirror.gcr.io
+```
+
+Unset means no mirrors. The `@di-framework/platform` README lists the accepted
+values. Changing mirrors later requires destroying and redeploying the platform.
+
 ## Output contract
 
 | Output | Meaning |
@@ -50,6 +77,7 @@ registry content.
 | `endpoints.kubernetes` | loopback API server URL |
 | `endpoints.registry` | loopback registry URL |
 | `endpoints.http` | loopback HTTP URL |
+| `kubeconfigs` | secret: `{ [tenant]: { [user]: kubeconfig } }`, one per user membership |
 
 ## Lifecycle
 
@@ -68,9 +96,9 @@ Send the configured project name as the HTTP `Host` header, for example:
 curl -H 'Host: greeter' http://127.0.0.1:28180/
 ```
 
-Platform destroy removes only Docker and Kubernetes resources bearing this
+Platform destroy removes only container-engine and Kubernetes resources bearing this
 project/stack scope, along with the generated kubeconfig. It refuses to adopt
-or replace an already-existing Docker resource with the same name. Teardown
+or replace an already-existing container, network, or volume with the same name. Teardown
 uses the `kubectl` bundled in the scoped k0s container, so no host-side
 `kubectl` installation is needed for platform lifecycle commands.
 
@@ -132,19 +160,22 @@ tenant; the platform does **not** claim finer credential isolation. Admission
 still blocks CLI/API bypass for forged hostInterfaces and mutation of
 controller-managed config (see `@di-framework/platform` README).
 
-As administrator, use the platform kubeconfig to issue an expiring user token:
+Each membership gets a kubeconfig built from a controller-managed ServiceAccount
+token Secret (`di-user-<user>-<tenant>-token` in `wasmcloud`), with the loopback API
+server, the cluster CA, and the tenant workload namespace selected. Pulumi reads it
+once the User is Ready and exports it in the secret `kubeconfigs` output:
 
 ```sh
-export KUBECONFIG="$(pulumi stack output kubeconfig)"
-kubectl create token di-user-alice -n wasmcloud --duration=8h
+pulumi stack output kubeconfigs --show-secrets | jq -r '.warehouse.alice' > alice.kubeconfig
+chmod 600 alice.kubeconfig
 ```
 
-Build the user's kubeconfig with the same cluster server and CA from the admin
-kubeconfig, this token as its **only** credential, and the tenant workload namespace
-as its context namespace. Do not distribute the admin kubeconfig or its client
-certificate/key. Kubernetes may shorten the requested token lifetime. Tokens are
-never stored in User status or Pulumi outputs. The `users` output identifies the
-ServiceAccount; `tenants` identifies the namespaces and host group.
+The token is the kubeconfig's **only** credential; do not distribute the admin
+kubeconfig or its client certificate/key. `viewer` users get read-only access.
+The token does not expire: removing the membership or suspending the user deletes
+its Secret and invalidates it. Tokens are never stored in User status. The `users`
+output identifies the ServiceAccount; `tenants` identifies the namespaces and host
+group.
 
 Configure a deployment target with the user's kubeconfig,
 `namespace = "di-tenant-warehouse"` and `hostgroup = "tenant-warehouse"`.
@@ -196,7 +227,7 @@ changes belong in the shared package rather than copied tenancy files.
 Backing-service CRD contracts (`BackingServiceClass`, `BackingService`,
 `ServiceBinding`), authorization boundaries, and runtime feasibility notes live in
 the `@di-framework/platform` package README. Platform install seeds the approved
-default classes (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`), retains CRDs on stack destroy,
+default classes (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`, `egress-public`), retains CRDs on stack destroy,
 ships compiled controller scripts including `backing-services.js`, and enforces
 tenant RBAC / admission / quotas / backend NetworkPolicy isolation (#452).
 

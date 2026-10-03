@@ -5,6 +5,7 @@ import {
   INSTALLATION,
   OWNER,
   type Resource,
+  ROUTES_CONFIG_NAME,
   TENANT,
 } from './resources';
 
@@ -54,11 +55,8 @@ export function ownershipLabelsAllowed(
 }
 
 export function approvedClassName(className: string | undefined, type: string): boolean {
-  if (className === undefined || className === '') {
-    return (
-      type === 'keyvalue' || type === 'messaging' || type === 'blobstore' || type === 'postgres'
-    );
-  }
+  if (className === undefined || className === '')
+    return (CAPABILITIES as readonly string[]).includes(type);
   return APPROVED_CLASS_NAMES.has(className);
 }
 
@@ -207,6 +205,42 @@ export function workloadVolumesAllowed(input: {
   );
 }
 
+interface LocalResourcesLike {
+  allowedHosts?: string[];
+  allowedIpNameLookups?: string[];
+  [key: string]: unknown;
+}
+
+/**
+ * Mirrors the workload egress rule in the CEL policy (#13). Only the controller grants
+ * `allowedHosts` / `allowedIpNameLookups`, from an approved egress ServiceBinding. A tenant
+ * update may carry a list forward unchanged from any guest of the previous object.
+ */
+export function workloadEgressAllowed(input: {
+  username: string;
+  controllerNamespace: string;
+  operation: 'CREATE' | 'UPDATE';
+  locals: LocalResourcesLike[];
+  oldLocals?: LocalResourcesLike[];
+}): boolean {
+  if (
+    input.username === `system:serviceaccount:${input.controllerNamespace}:di-platform-controller`
+  )
+    return true;
+  const old = input.operation === 'UPDATE' ? (input.oldLocals ?? []) : [];
+  const kept = (field: 'allowedHosts' | 'allowedIpNameLookups', value: string[] | undefined) =>
+    !value?.length ||
+    old.some(
+      (previous) =>
+        previous[field] !== undefined && JSON.stringify(previous[field]) === JSON.stringify(value),
+    );
+  return input.locals.every(
+    (local) =>
+      kept('allowedHosts', local.allowedHosts) &&
+      kept('allowedIpNameLookups', local.allowedIpNameLookups),
+  );
+}
+
 export function validateBackingServiceAdmission(input: {
   namespace: string;
   type: string;
@@ -217,7 +251,7 @@ export function validateBackingServiceAdmission(input: {
   if (!ownershipLabelsAllowed(input.labels, input.namespace, input.installation))
     return 'BackingService ownership labels must derive from the tenant namespace';
   if (!(CAPABILITIES as readonly string[]).includes(input.type))
-    return 'BackingService type must be keyvalue, messaging, blobstore or postgres';
+    return 'BackingService type must be keyvalue, messaging, blobstore, postgres or egress';
   if (!approvedClassName(input.className, input.type))
     return 'BackingService className must be an approved platform default (fail-closed)';
   return undefined;
@@ -227,6 +261,7 @@ export function validateServiceBindingAdmission(input: {
   namespace: string;
   serviceName: string;
   capability: string;
+  workloadName?: string;
   labels?: Record<string, string>;
   installation?: string;
 }): string | undefined {
@@ -235,7 +270,9 @@ export function validateServiceBindingAdmission(input: {
   if (!serviceNameSameNamespace(input.serviceName))
     return 'ServiceBinding serviceName must reference a BackingService in the same namespace';
   if (!(CAPABILITIES as readonly string[]).includes(input.capability))
-    return 'ServiceBinding capability must be keyvalue, messaging, blobstore or postgres';
+    return 'ServiceBinding capability must be keyvalue, messaging, blobstore, postgres or egress';
+  if (input.capability === 'egress' && !input.workloadName)
+    return 'An egress ServiceBinding must name its WorkloadDeployment in workloadName';
   return undefined;
 }
 
@@ -366,9 +403,20 @@ function hostInterfaceAdmissionExpression(): string {
     (${wasi} || ${wasiLogging} || ${keyvalue} || ${messaging} || ${blobstore} || ${postgres}))`;
 }
 
+function localsOf(spec: string): string {
+  return `
+    (has(${spec}.components)
+      ? ${spec}.components.filter(c, has(c.localResources)).map(c, c.localResources)
+      : []) +
+    (has(${spec}.service) && has(${spec}.service.localResources)
+      ? [${spec}.service.localResources]
+      : [])`;
+}
+
 /**
  * Host volumes and preopens are platform-owned (#11). Only the controller may set them; a
  * tenant update may carry the controller's volumes forward unchanged and mount nothing else.
+ * Egress (`allowedHosts`, `allowedIpNameLookups`) follows the same rule (#13).
  */
 function workloadPolicy(namespace: string): AdmissionPolicy {
   return {
@@ -387,15 +435,10 @@ function workloadPolicy(namespace: string): AdmissionPolicy {
           has(oldObject.spec.template.spec.volumes) && has(variables.w.volumes) &&
           variables.w.volumes == oldObject.spec.template.spec.volumes`,
       },
+      { name: 'locals', expression: localsOf('variables.w') },
       {
-        name: 'locals',
-        expression: `
-          (has(variables.w.components)
-            ? variables.w.components.filter(c, has(c.localResources)).map(c, c.localResources)
-            : []) +
-          (has(variables.w.service) && has(variables.w.service.localResources)
-            ? [variables.w.service.localResources]
-            : [])`,
+        name: 'oldLocals',
+        expression: `request.operation != 'UPDATE' ? [] : ${localsOf('oldObject.spec.template.spec')}`,
       },
     ],
     validations: [
@@ -412,12 +455,21 @@ function workloadPolicy(namespace: string): AdmissionPolicy {
       },
       {
         expression: `variables.locals.all(l,
-          (!has(l.allowedHosts) || size(l.allowedHosts) == 0) &&
           (!has(l.allowedHostLoopbackPorts) || size(l.allowedHostLoopbackPorts) == 0) &&
           (!has(l.volumeMounts) || size(l.volumeMounts) == 0 || variables.controller ||
             (variables.keptVolumes &&
               l.volumeMounts.all(m, variables.w.volumes.exists(v, v.name == m.name)))))`,
         message: 'Tenant guests cannot request network or host filesystem capabilities',
+      },
+      {
+        expression: `variables.controller || variables.locals.all(l,
+          (!has(l.allowedHosts) || size(l.allowedHosts) == 0 ||
+            variables.oldLocals.exists(o, has(o.allowedHosts) && o.allowedHosts == l.allowedHosts)) &&
+          (!has(l.allowedIpNameLookups) || size(l.allowedIpNameLookups) == 0 ||
+            variables.oldLocals.exists(o,
+              has(o.allowedIpNameLookups) && o.allowedIpNameLookups == l.allowedIpNameLookups)))`,
+        message:
+          'Tenant guests cannot set allowedHosts or allowedIpNameLookups; request egress with an egress BackingService and ServiceBinding',
       },
       {
         expression: hostInterfaceAdmissionExpression(),
@@ -443,10 +495,11 @@ function backendConfigPolicy(namespace: string): AdmissionPolicy {
         expression: `
           !request.userInfo.username.startsWith('system:serviceaccount:${namespace}:di-user-') ||
           !(${objectName} == '${STOCK_CONFIG_NAME}' ||
+            ${objectName} == '${ROUTES_CONFIG_NAME}' ||
             ${objectName}.startsWith('${BS_CONFIG_PREFIX}') ||
             ${objectName}.startsWith('${BINDING_CONFIG_PREFIX}'))`,
         message:
-          'di-tenant-stock, di-bs-*, and di-binding-* ConfigMaps/Secrets are managed by the platform controller',
+          'di-tenant-stock, di-platform-routes, di-bs-*, and di-binding-* ConfigMaps/Secrets are managed by the platform controller',
       },
       {
         // The console trusts di-framework.dev/projection ConfigMaps (logs, signals); a tenant
@@ -501,9 +554,9 @@ export function admissionResources(installation: string, namespace: string): Res
           message: 'BackingService ownership labels must derive from the tenant namespace',
         },
         {
-          expression: `object.spec.type in ['keyvalue', 'messaging', 'blobstore', 'postgres'] &&
+          expression: `object.spec.type in ['keyvalue', 'messaging', 'blobstore', 'postgres', 'egress'] &&
             (!has(object.spec.className) || object.spec.className == '' ||
-              object.spec.className in ['${DEFAULT_CLASS_NAMES.keyvalue}', '${DEFAULT_CLASS_NAMES.messaging}', '${DEFAULT_CLASS_NAMES.blobstore}', '${DEFAULT_CLASS_NAMES.postgres}'])`,
+              object.spec.className in ['${DEFAULT_CLASS_NAMES.keyvalue}', '${DEFAULT_CLASS_NAMES.messaging}', '${DEFAULT_CLASS_NAMES.blobstore}', '${DEFAULT_CLASS_NAMES.postgres}', '${DEFAULT_CLASS_NAMES.egress}'])`,
           message:
             'BackingService className must be an approved platform default (fail-closed for unknown classes)',
         },
@@ -519,11 +572,16 @@ export function admissionResources(installation: string, namespace: string): Res
           message: 'ServiceBinding ownership labels must derive from the tenant namespace',
         },
         {
-          expression: `object.spec.capability in ['keyvalue', 'messaging', 'blobstore', 'postgres'] &&
+          expression: `object.spec.capability in ['keyvalue', 'messaging', 'blobstore', 'postgres', 'egress'] &&
             object.spec.serviceName != '' &&
             !object.spec.serviceName.contains('/') && !object.spec.serviceName.contains('.')`,
           message:
-            'ServiceBinding must reference a same-namespace BackingService with capability keyvalue, messaging, blobstore or postgres',
+            'ServiceBinding must reference a same-namespace BackingService with capability keyvalue, messaging, blobstore, postgres or egress',
+        },
+        {
+          expression: `object.spec.capability != 'egress' ||
+            (has(object.spec.workloadName) && object.spec.workloadName != '')`,
+          message: 'An egress ServiceBinding must name its WorkloadDeployment in workloadName',
         },
       ],
     },

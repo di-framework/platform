@@ -1,4 +1,5 @@
 import { backingServiceCrds } from './backing-services';
+import { PRIVATE_IPV4_RANGES } from './egress';
 import { hostStorage } from './workload-storage';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json | undefined };
 export interface Metadata {
@@ -61,7 +62,14 @@ export interface ControllerConfig {
   schedulerNatsUrl: string;
   insecureRegistry: boolean;
   storageRoot?: string;
+  /** `http://{host}.{tenant}.localhost:<port>` when the platform gateway is published. */
+  routeUrlPattern?: string;
 }
+/** Platform HTTP gateway (di-framework/kube#2); its pods alone reach tenant hosts on 9191. */
+const GATEWAY_NAME = 'di-platform-gateway';
+const GATEWAY_POD_LABELS = { app: GATEWAY_NAME };
+/** Per-tenant ConfigMap with the gateway URL template; absent means no gateway is known. */
+const ROUTES_CONFIG_NAME = 'di-platform-routes';
 const GROUP = 'platform.di-framework.dev';
 const VERSION = `${GROUP}/v1alpha1`;
 const INSTALLATION = `${GROUP}/installation`;
@@ -428,22 +436,47 @@ function tenantResources(
             {
               to: [
                 {
-                  ipBlock: {
-                    cidr: '0.0.0.0/0',
-                    except: [
-                      '10.0.0.0/8',
-                      '172.16.0.0/12',
-                      '192.168.0.0/16',
-                      '169.254.0.0/16',
-                      '127.0.0.0/8',
-                    ],
-                  },
+                  ipBlock: { cidr: '0.0.0.0/0', except: [...PRIVATE_IPV4_RANGES] },
                 },
               ],
               ports: [{ protocol: 'TCP', port: 443 }],
             },
           ],
         },
+      }),
+    );
+  // di-tenant-network admits only same-tenant traffic; the platform gateway is the one
+  // outside client allowed to reach the tenant hosts' HTTP port.
+  result.push(
+    make('networking.k8s.io/v1', 'NetworkPolicy', 'di-tenant-gateway', n.runtimeNamespace, {
+      spec: {
+        podSelector: {
+          matchLabels: {
+            'wasmcloud.com/hostgroup': n.hostgroup,
+            'wasmcloud.com/name': 'hostgroup',
+          },
+        },
+        policyTypes: ['Ingress'],
+        ingress: [
+          {
+            from: [
+              {
+                namespaceSelector: {
+                  matchLabels: { 'kubernetes.io/metadata.name': cfg.namespace },
+                },
+                podSelector: { matchLabels: GATEWAY_POD_LABELS },
+              },
+            ],
+            ports: [{ protocol: 'TCP', port: 9191 }],
+          },
+        ],
+      },
+    }),
+  );
+  if (cfg.routeUrlPattern)
+    result.push(
+      make('v1', 'ConfigMap', ROUTES_CONFIG_NAME, n.namespace, {
+        data: { urlTemplate: cfg.routeUrlPattern.replaceAll('{tenant}', tenant.metadata.name) },
       }),
     );
   // Backend pods accept ingress from the tenant hostgroup and from backup-agent Jobs in
@@ -717,8 +750,27 @@ function userResources(user: User, tenants: Tenant[], cfg: ControllerConfig): Re
       binding.metadata.labels![TENANT] = membership.tenant;
       result.push(binding);
     }
+    // A long-lived token for the user's tenant kubeconfig. Kubernetes fills `token` and
+    // `ca.crt`, and deletes the Secret itself if the ServiceAccount goes away.
+    const token = make(
+      'v1',
+      'Secret',
+      userTokenSecretName(user.metadata.name, membership.tenant),
+      cfg.namespace,
+      { type: 'kubernetes.io/service-account-token' },
+    );
+    token.metadata = {
+      ...token.metadata,
+      labels: { ...token.metadata.labels, [TENANT]: membership.tenant },
+      annotations: { 'kubernetes.io/service-account.name': account },
+    };
+    result.push(token);
   }
   return result;
+}
+/** ServiceAccount token Secret backing a user's kubeconfig for one tenant membership. */
+function userTokenSecretName(user: string, tenant: string): string {
+  return `di-user-${user}-${tenant}-token`;
 }
 
 export type {
@@ -763,15 +815,19 @@ export {
 export {
   crds,
   FINALIZER,
+  GATEWAY_NAME,
+  GATEWAY_POD_LABELS,
   GROUP,
   INSTALLATION,
   names,
   OWNER,
+  ROUTES_CONFIG_NAME,
   resource,
   TENANT,
   tenantResources,
   USER,
   userResources,
+  userTokenSecretName,
   VERSION,
   validName,
 };

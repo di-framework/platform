@@ -6,16 +6,33 @@ import {
   backingServiceResources,
   endpointFor,
   RUNTIME_DATA_NATS,
+  type RuntimeProvider,
   resolveBackingSizing,
   resolveClass,
   tenantNameFromNamespace,
 } from './backing-service-reconcile';
 import {
+  approveEgress,
+  EGRESS_FIELD_MANAGER,
+  EGRESS_NETWORK_POLICY,
+  egressAllowedHosts,
+  egressGrants,
+  egressLookups,
+  egressNetworkPolicySpec,
+  egressPatch,
+  egressPorts,
+  egressResolvableNames,
+  resolveIpv4,
+} from './egress';
+import {
   appendRing,
   applicationKey,
-  attributeLogs,
+  attributeEntries,
   logsConfigMap,
+  mergeFailures,
   PROJECTION,
+  type ProjectedEntry,
+  projectedFailures,
   projectedLines,
   validLabelValue,
   type WorkloadIdentity,
@@ -40,6 +57,7 @@ import {
   names,
   OWNER,
   type Resource,
+  ROUTES_CONFIG_NAME,
   resource,
   type ServiceBinding,
   type SizingParameters,
@@ -57,6 +75,7 @@ import {
   bindingSecretName,
   electBindingOwner,
   resolveBindingService,
+  resolveEgressBindingService,
   serviceBindingResources,
   sharedBindingConflict,
 } from './service-binding-reconcile';
@@ -171,12 +190,17 @@ export class KubernetesApi implements Api {
     });
   }
 }
+/** How far before the cursor each pod log read starts (see projectLogs). */
+const LOG_LOOKBACK_MS = 120_000;
 export class Controller {
   /** Newest TracingLogger timestamp already projected, per host pod uid. */
   private readonly logCursors = new Map<string, string>();
+  /** Last successful egress name resolution, kept so a failed lookup does not revoke. */
+  private readonly egressAddresses = new Map<string, string[]>();
   constructor(
     private readonly api: Api,
     private readonly cfg: ControllerConfig,
+    private readonly resolveName: (name: string) => Promise<string[]> = resolveIpv4,
   ) {}
   private async get<T>(path: string): Promise<T | undefined> {
     try {
@@ -368,6 +392,7 @@ export class Controller {
     const workloads = await this.storageWorkloads(tenant);
     const desired = tenantResources(tenant, this.cfg, secret, storageKeys(workloads));
     let ready = !!secret;
+    if (!this.cfg.routeUrlPattern) await this.removeRoutes(tenant);
     for (const value of desired) {
       const applied = await this.ensure(value);
       if (value.kind === 'Deployment') {
@@ -406,6 +431,17 @@ export class Controller {
       { ...n, httpService: `di-http.${n.runtimeNamespace}.svc.cluster.local` },
     );
   }
+  /** No gateway is published any more: drop the route template so the console stops linking. */
+  private async removeRoutes(tenant: Tenant): Promise<void> {
+    const routes = await this.get<Resource>(
+      `${collection('v1', 'ConfigMap', names(tenant.metadata.name).namespace)}/${ROUTES_CONFIG_NAME}`,
+    );
+    if (
+      routes?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+      routes.metadata.labels[OWNER] === tenant.metadata.uid
+    )
+      await this.remove(routes);
+  }
   async reconcileUser(user: User, tenants: Tenant[]): Promise<void> {
     if (!validName(user.metadata.name)) throw new Error('Invalid user name');
     if (!user.metadata.deletionTimestamp) await this.finalizer(user, true);
@@ -416,13 +452,20 @@ export class Controller {
     });
     for (const binding of bindings)
       if (!desired.some((r) => location(r) === location(binding))) await this.remove(binding);
-    const accounts = await this.list<Resource>('v1', 'ServiceAccount', {
-      [INSTALLATION]: this.cfg.installation,
-      [OWNER]: user.metadata.uid!,
-    });
-    for (const account of accounts)
-      if (!desired.some((r) => location(r) === location(account))) await this.remove(account);
-    for (const value of desired) await this.ensure(value);
+    // Token Secrets go before the ServiceAccount so no orphaned credential outlives it.
+    for (const kind of ['Secret', 'ServiceAccount'])
+      for (const value of await this.list<Resource>('v1', kind, {
+        [INSTALLATION]: this.cfg.installation,
+        [OWNER]: user.metadata.uid!,
+      }))
+        if (!desired.some((r) => location(r) === location(value))) await this.remove(value);
+    let tokens = true;
+    for (const value of desired) {
+      const applied = await this.ensure(value);
+      // Kubernetes populates the token asynchronously; Pulumi reads it once the User is Ready.
+      if (value.kind === 'Secret')
+        tokens &&= !!(applied.data as Record<string, string> | undefined)?.token;
+    }
     if (user.metadata.deletionTimestamp) {
       await this.finalizer(user, false);
       return;
@@ -430,15 +473,24 @@ export class Controller {
     const complete =
       user.spec.suspended ||
       desired.filter((r) => r.kind === 'RoleBinding').length === user.spec.memberships.length * 2;
+    const ready = complete && tokens;
     await this.status(
       user,
-      !!complete,
-      user.spec.suspended ? 'Suspended' : complete ? 'Reconciled' : 'TenantNotReady',
+      !!ready,
+      user.spec.suspended
+        ? 'Suspended'
+        : !complete
+          ? 'TenantNotReady'
+          : ready
+            ? 'Reconciled'
+            : 'TokenPending',
       user.spec.suspended
         ? 'Access revoked and ServiceAccount removed'
-        : complete
-          ? 'Memberships reconciled'
-          : 'Waiting for every referenced tenant to be ready',
+        : !complete
+          ? 'Waiting for every referenced tenant to be ready'
+          : ready
+            ? 'Memberships reconciled'
+            : 'Waiting for Kubernetes to populate the ServiceAccount token Secrets',
       user.spec.suspended
         ? { serviceAccount: null }
         : {
@@ -472,6 +524,10 @@ export class Controller {
       return;
     }
 
+    if (service.spec.type === 'egress') {
+      await this.reconcileEgressService(service, tenant, classes);
+      return;
+    }
     const configuration = await this.resolveBackingServiceConfiguration(service, tenant, classes);
     if (!configuration) return;
     const { cls, sizing } = configuration;
@@ -482,6 +538,51 @@ export class Controller {
     const desired = backingServiceResources(service, tenant, cls, this.cfg, sizing);
     const ready = await this.applyBackingServiceResources(desired);
     await this.updateBackingServiceStatus(service, tenant, cls, ready);
+  }
+
+  /** Egress runs nothing: the service is Ready once its class approves every destination. */
+  private async reconcileEgressService(
+    service: BackingService,
+    tenant: Tenant,
+    classes: BackingServiceClass[],
+  ): Promise<void> {
+    const runtimeNamespace = names(tenant.metadata.name).runtimeNamespace;
+    const resolved = resolveClass(service, classes, tenant.metadata.name);
+    if ('error' in resolved) {
+      await this.status(service, false, 'Failed', resolved.error, { runtimeNamespace });
+      return;
+    }
+    const { cls } = resolved;
+    const { approved, denied } = approveEgress(
+      service.spec.destinations ?? [],
+      cls.spec.egress?.allowedDestinations ?? [],
+    );
+    const extra = {
+      runtimeNamespace,
+      classRef: {
+        name: cls.metadata.name,
+        uid: cls.metadata.uid,
+        generation: cls.metadata.generation,
+      },
+      approved,
+    };
+    if (denied.length > 0) {
+      await this.status(
+        service,
+        false,
+        'NotApproved',
+        `BackingServiceClass ${cls.metadata.name} does not approve ${denied.join(', ')}`,
+        extra,
+      );
+      return;
+    }
+    await this.status(
+      service,
+      !tenant.spec.suspended,
+      tenant.spec.suspended ? 'Suspended' : 'Ready',
+      tenant.spec.suspended ? 'Tenant suspended' : `Approved ${approved.join(', ')}`,
+      extra,
+    );
   }
 
   private async reconcilePostgres(
@@ -746,7 +847,7 @@ export class Controller {
           uid: cls.metadata.uid,
           generation: cls.metadata.generation,
         },
-        endpoint: endpointFor(service, tenant, cls.spec.provider),
+        endpoint: endpointFor(service, tenant, cls.spec.provider as RuntimeProvider),
       },
     );
   }
@@ -775,6 +876,10 @@ export class Controller {
       uid: service?.metadata.uid,
       generation: service?.metadata.generation,
     };
+    if (binding.spec.capability === 'egress') {
+      await this.reconcileEgressBinding(binding, tenant, service, serviceRefBase);
+      return;
+    }
 
     if (binding.metadata.deletionTimestamp) {
       const owner = electBindingOwner(binding.spec.bindingName, peers);
@@ -906,6 +1011,114 @@ export class Controller {
   }
 
   /**
+   * An egress binding projects nothing. Its Ready status is what grants the service's
+   * approved entries to `spec.workloadName` in {@link reconcileTenantEgress}.
+   */
+  private async reconcileEgressBinding(
+    binding: ServiceBinding,
+    tenant: Tenant,
+    service: BackingService | undefined,
+    serviceRef: { name: string; uid?: string; generation?: number },
+  ): Promise<void> {
+    if (binding.metadata.deletionTimestamp) {
+      await this.status(binding, false, 'Deleting', 'Egress grant revoked', { serviceRef });
+      await this.finalizer(binding, false);
+      return;
+    }
+    const resolved = resolveEgressBindingService(binding, service);
+    if ('error' in resolved) {
+      await this.status(binding, false, 'Failed', resolved.error, { serviceRef });
+      return;
+    }
+    await this.status(
+      binding,
+      !tenant.spec.suspended,
+      tenant.spec.suspended ? 'Suspended' : 'Ready',
+      tenant.spec.suspended
+        ? 'Tenant suspended'
+        : `Egress granted to WorkloadDeployment ${binding.spec.workloadName}`,
+      { serviceRef },
+    );
+  }
+
+  private async egressAddressesFor(name: string): Promise<string[]> {
+    try {
+      const addresses = await this.resolveName(name);
+      this.egressAddresses.set(name, addresses);
+      return addresses;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'lookup failed';
+      console.error(`egress: cannot resolve ${name}: ${message}`);
+      return this.egressAddresses.get(name) ?? [];
+    }
+  }
+
+  /**
+   * Grant approved egress to WorkloadDeployments (#13). Every workload in the tenant
+   * namespace is reconciled, so a removed binding takes its fields away again. The
+   * `di-tenant-egress` NetworkPolicy opens the approved ports to public addresses for the
+   * tenant hosts, and goes away with the last grant.
+   */
+  async reconcileTenantEgress(
+    tenant: Tenant,
+    bindings: ServiceBinding[],
+    services: ReadonlyMap<string, BackingService>,
+  ): Promise<void> {
+    const n = names(tenant.metadata.name);
+    const grants = egressGrants(n.namespace, bindings, services);
+    const all = [...grants.values()].flat();
+    const addresses = new Map<string, string[]>();
+    for (const name of egressResolvableNames(all))
+      addresses.set(name, await this.egressAddressesFor(name));
+    const workloads =
+      (
+        await this.api.call<{ items?: WorkloadDeployment[] } | undefined>(
+          'GET',
+          collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', n.namespace),
+        )
+      )?.items ?? [];
+    for (const workload of workloads) {
+      const approved = grants.get(workload.metadata.name) ?? [];
+      const patch = egressPatch(
+        { ...workload, metadata: { ...workload.metadata, namespace: n.namespace } },
+        egressAllowedHosts(approved, addresses),
+        egressLookups(approved),
+      );
+      if (!patch) continue;
+      await this.api.call(
+        'PATCH',
+        `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', n.namespace)}/${encodeURIComponent(patch.metadata.name)}?fieldManager=${EGRESS_FIELD_MANAGER}`,
+        patch,
+        'application/merge-patch+json',
+      );
+    }
+    const ports = egressPorts(all);
+    if (ports.length > 0) {
+      await this.ensure(
+        resource(
+          tenant,
+          this.cfg.installation,
+          'networking.k8s.io/v1',
+          'NetworkPolicy',
+          EGRESS_NETWORK_POLICY,
+          n.runtimeNamespace,
+          { spec: egressNetworkPolicySpec(n.hostgroup, ports) },
+        ),
+      );
+      return;
+    }
+    const existing = await this.get<Resource>(
+      `${collection('networking.k8s.io/v1', 'NetworkPolicy', n.runtimeNamespace)}/${EGRESS_NETWORK_POLICY}`,
+    );
+    if (
+      existing &&
+      existing.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+      existing.metadata.labels?.[OWNER] === tenant.metadata.uid
+    )
+      await this.remove(existing);
+  }
+
+  /**
    * di-framework WorkloadDeployments in the tenant namespace that asked for persistent
    * storage. Persistent directories live on one host, so a multi-replica tenant runtime
    * gets none and the workload fails visibly instead of splitting its data.
@@ -951,8 +1164,10 @@ export class Controller {
 
   /**
    * Publish one logs ConfigMap per console application (#10). Only `wasi:logging` lines the
-   * host attributed to a workload in this tenant are kept. Nothing is written for an
-   * application with no attributed lines, so absence stays the console's unpublished state.
+   * host attributed to a workload in this tenant, and host WARN/ERROR lines from its
+   * `workload_start` span, are kept. The newest host failure per WorkloadDeployment goes to
+   * `data.failures`. Nothing is written for an application with no attributed lines, so
+   * absence stays the console's unpublished state.
    */
   async projectLogs(tenant: Tenant): Promise<void> {
     const n = names(tenant.metadata.name);
@@ -964,12 +1179,21 @@ export class Controller {
         `wasmcloud.com/hostgroup=${n.hostgroup},wasmcloud.com/name=hostgroup`,
       )}`,
     );
-    const deployments = (
-      await this.api.call<{ items: { metadata: WorkloadIdentity }[] }>(
+    const deployments: WorkloadIdentity[] = (
+      await this.api.call<{
+        items: {
+          metadata: WorkloadIdentity;
+          spec?: { template?: { spec?: { service?: unknown } } };
+        }[];
+      }>(
         'GET',
         `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', n.namespace)}?labelSelector=${encodeURIComponent('app.kubernetes.io/managed-by=di-framework')}`,
       )
-    ).items.map((item) => item.metadata);
+    ).items.map((item) => ({
+      ...item.metadata,
+      // Span-less service supervisor failures are attributed to services only.
+      service: item.spec?.template?.spec?.service !== undefined,
+    }));
     const existing = (
       await this.api.call<{ items: Resource[] }>(
         'GET',
@@ -982,36 +1206,56 @@ export class Controller {
       existing.map((item) => [item.metadata.labels?.['di-framework.dev/application'] ?? '', item]),
     );
     const incoming = new Map<string, string[]>();
+    // Failures are merged newest-wins by deployment, so they skip the line floor: a
+    // restarted controller re-reading old lines cannot duplicate them, and never loses one.
+    const failures = new Map<string, ProjectedEntry[]>();
     for (const pod of pods.items) {
       if (pod.status?.phase !== 'Running') continue;
       const cursorKey = pod.metadata.uid ?? pod.metadata.name;
       const cursor = this.logCursors.get(cursorKey);
+      // Re-read a short window before the cursor so a service failure logged just after a
+      // tick still sees its `Starting workload` line. The floor below drops repeated lines
+      // and failures merge idempotently.
       const query = cursor
-        ? `sinceTime=${encodeURIComponent(cursor.replace(/\.\d+Z$/, 'Z'))}`
+        ? `sinceTime=${encodeURIComponent(
+            new Date(Date.parse(cursor) - LOG_LOOKBACK_MS).toISOString().replace(/\.\d+Z$/, 'Z'),
+          )}`
         : 'tailLines=1000';
       const text = await this.api.call<string>(
         'GET',
         `${collection('v1', 'Pod', n.runtimeNamespace)}/${encodeURIComponent(pod.metadata.name)}/log?${query}`,
       );
       let newest = cursor ?? '';
-      for (const [app, lines] of attributeLogs(text ?? '', n.namespace, deployments)) {
+      for (const [app, entries] of attributeEntries(text ?? '', n.namespace, deployments)) {
         // A restarted controller resumes after the newest line it already published.
         const floor = cursor ?? projectedLines(existingByApp.get(app)).at(-1)?.split(' ')[0] ?? '';
-        const fresh = lines.filter((line) => (line.split(' ')[0] ?? '') > floor);
-        for (const line of fresh) {
-          const stamp = line.split(' ')[0] ?? '';
-          if (stamp > newest) newest = stamp;
-        }
-        incoming.set(app, [...(incoming.get(app) ?? []), ...fresh]);
+        const fresh = entries.filter((entry) => entry.time > floor);
+        for (const entry of fresh) if (entry.time > newest) newest = entry.time;
+        incoming.set(app, [
+          ...(incoming.get(app) ?? []),
+          ...fresh.flatMap((entry) => (entry.line ? [entry.line] : [])),
+        ]);
+        failures.set(app, [...(failures.get(app) ?? []), ...entries]);
       }
       if (newest) this.logCursors.set(cursorKey, newest);
     }
     const live = new Set(deployments.map(applicationKey));
     for (const [app, lines] of incoming) {
-      if (lines.length === 0 || !live.has(app) || !validLabelValue(app)) continue;
-      const merged = appendRing(projectedLines(existingByApp.get(app)), lines);
+      if (!live.has(app) || !validLabelValue(app)) continue;
+      const current = existingByApp.get(app);
+      const previous = projectedFailures(current);
+      const members = deployments.filter((d) => applicationKey(d) === app).map((d) => d.name);
+      const merged = mergeFailures(previous, failures.get(app) ?? [], members);
+      if (lines.length === 0 && JSON.stringify(merged) === JSON.stringify(previous)) continue;
       await this.ensure(
-        logsConfigMap(tenant.metadata.name, n.namespace, this.cfg.installation, app, merged),
+        logsConfigMap(
+          tenant.metadata.name,
+          n.namespace,
+          this.cfg.installation,
+          app,
+          appendRing(projectedLines(current), lines),
+          merged,
+        ),
       );
     }
     for (const [app, configMap] of existingByApp) {
@@ -1117,6 +1361,16 @@ export class Controller {
         } catch {
           /* Retry on the next poll. */
         }
+      }
+    }
+    // After bindings so this tick's Ready changes grant or revoke right away.
+    for (const tenant of tenants) {
+      if (tenant.spec.suspended || tenant.metadata.deletionTimestamp) continue;
+      try {
+        await this.reconcileTenantEgress(tenant, bindings, serviceByKey);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Egress reconcile failed';
+        console.error(`Tenant/${tenant.metadata.name} egress: ${message}`);
       }
     }
   }

@@ -55,6 +55,7 @@ export interface WorkloadDeployment {
       spec?: {
         volumes?: { name: string; hostPath?: { path: string } }[];
         components?: Component[];
+        service?: { localResources?: LocalResources; [key: string]: unknown };
         [key: string]: unknown;
       };
     };

@@ -1,6 +1,14 @@
+import {
+  EGRESS_DESTINATION_PATTERN,
+  EGRESS_ENTRY_MAX_LENGTH,
+  EGRESS_POLICY_PATTERN,
+  validEgressDestination,
+  validEgressPolicyEntry,
+} from './egress';
+
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json | undefined };
-export type BackingCapability = 'keyvalue' | 'messaging' | 'blobstore' | 'postgres';
-export type BackingProvider = 'redis' | 'nats' | 'postgres';
+export type BackingCapability = 'keyvalue' | 'messaging' | 'blobstore' | 'postgres' | 'egress';
+export type BackingProvider = 'redis' | 'nats' | 'postgres' | 'platform';
 export type ClassVisibility = 'AllTenants' | 'SelectedTenants';
 export type DeletionPolicy = 'Retain' | 'Delete';
 export interface Metadata {
@@ -40,12 +48,16 @@ export interface BackingServiceClassSpec {
   visibility: ClassVisibility;
   allowedTenants?: string[];
   default?: boolean;
+  /** Egress classes only: approved `host:port` / `*.suffix:port` entries. */
+  egress?: { allowedDestinations?: string[] };
 }
 export interface BackingServiceSpec {
   type: BackingCapability;
   className?: string;
   parameters?: SizingParameters;
   deletionPolicy?: DeletionPolicy;
+  /** Egress services only: `host`, `*.suffix`, `host:port` or `*.suffix:port`. */
+  destinations?: string[];
 }
 export interface ServiceBindingSpec {
   serviceName: string;
@@ -68,6 +80,8 @@ export interface BackingServiceStatus {
   classRef?: { name: string; uid?: string; generation?: number };
   endpoint?: EndpointSummary;
   runtimeNamespace?: string;
+  /** Egress services only: approved `host:port` entries. */
+  approved?: string[];
 }
 export interface ServiceBindingStatus {
   conditions?: Condition[];
@@ -101,19 +115,24 @@ const VERSION = `${GROUP}/v1alpha1`;
 const CLASS = `${GROUP}/class`;
 const SERVICE = `${GROUP}/service`;
 const BINDING = `${GROUP}/binding`;
-const CAPABILITIES = ['keyvalue', 'messaging', 'blobstore', 'postgres'] as const;
-const PROVIDERS = ['redis', 'nats', 'postgres'] as const;
+const CAPABILITIES = ['keyvalue', 'messaging', 'blobstore', 'postgres', 'egress'] as const;
+const PROVIDERS = ['redis', 'nats', 'postgres', 'platform'] as const;
+const CAPABILITY_LIST = 'keyvalue, messaging, blobstore, postgres or egress';
+const COMPATIBILITY_LIST =
+  'keyvalue+redis, messaging+nats, blobstore+nats, postgres+postgres or egress+platform';
 const DEFAULT_CLASS_NAMES = {
   keyvalue: 'keyvalue-redis',
   messaging: 'messaging-nats',
   blobstore: 'blobstore-nats',
   postgres: 'postgres-dedicated',
+  egress: 'egress-public',
 } as const;
 const COMPATIBLE: Record<BackingCapability, BackingProvider> = {
   keyvalue: 'redis',
   messaging: 'nats',
   blobstore: 'nats',
   postgres: 'postgres',
+  egress: 'platform',
 };
 const CREDENTIAL_STATUS_KEYS = [
   'password',
@@ -156,6 +175,12 @@ const parameterBound = {
 
   properties: { min: quantity, max: quantity },
 };
+const egressEntries = (pattern: string, maxItems: number) => ({
+  type: 'array',
+  maxItems,
+  'x-kubernetes-list-type': 'set',
+  items: { type: 'string', maxLength: EGRESS_ENTRY_MAX_LENGTH, pattern },
+});
 const conditions = {
   type: 'array',
   'x-kubernetes-list-type': 'map',
@@ -246,9 +271,12 @@ const classSpec = {
       message: 'spec.provider is immutable',
     },
     {
-      rule: `(self.type == 'keyvalue' && self.provider == 'redis') || (self.type == 'messaging' && self.provider == 'nats') || (self.type == 'blobstore' && self.provider == 'nats') || (self.type == 'postgres' && self.provider == 'postgres')`,
-      message:
-        'provider must match type (keyvalue+redis, messaging+nats, blobstore+nats or postgres+postgres)',
+      rule: `(self.type == 'keyvalue' && self.provider == 'redis') || (self.type == 'messaging' && self.provider == 'nats') || (self.type == 'blobstore' && self.provider == 'nats') || (self.type == 'postgres' && self.provider == 'postgres') || (self.type == 'egress' && self.provider == 'platform')`,
+      message: `provider must match type (${COMPATIBILITY_LIST})`,
+    },
+    {
+      rule: `self.type == 'egress' ? !has(self.defaults) && !has(self.parametersSchema) && !has(self.storageClassName) : !has(self.egress)`,
+      message: 'egress classes take only spec.egress; spec.egress is only valid for type egress',
     },
     {
       rule: `self.visibility != 'SelectedTenants' || (has(self.allowedTenants) && size(self.allowedTenants) > 0)`,
@@ -276,6 +304,10 @@ const classSpec = {
       'x-kubernetes-list-type': 'set',
     },
     default: { type: 'boolean', default: false },
+    egress: {
+      type: 'object',
+      properties: { allowedDestinations: egressEntries(EGRESS_POLICY_PATTERN, 256) },
+    },
   },
 };
 
@@ -291,18 +323,30 @@ const serviceSpec = {
       rule: `!has(oldSelf.className) || oldSelf.className == '' || self.className == oldSelf.className`,
       message: 'spec.className is immutable once set',
     },
+    {
+      rule: `self.type == 'egress' ? has(self.destinations) && size(self.destinations) > 0 && !has(self.parameters) : !has(self.destinations)`,
+      message:
+        'egress services need destinations and take no sizing; other types take no destinations',
+    },
   ],
   properties: {
     type: { type: 'string', enum: [...CAPABILITIES] },
     className: { ...nameSchema },
     parameters: sizingObject,
     deletionPolicy: { type: 'string', enum: ['Retain', 'Delete'], default: 'Retain' },
+    destinations: egressEntries(EGRESS_DESTINATION_PATTERN, 32),
   },
 };
 
 const bindingSpec = {
   type: 'object',
   required: ['serviceName', 'bindingName', 'capability'],
+  'x-kubernetes-validations': [
+    {
+      rule: `self.capability != 'egress' || has(self.workloadName)`,
+      message: 'egress bindings name the WorkloadDeployment they grant in workloadName',
+    },
+  ],
   properties: {
     serviceName: nameSchema,
     bindingName: bindingNameSchema,
@@ -339,6 +383,7 @@ const backingServiceCrds = [
       },
     },
     runtimeNamespace: { type: 'string' },
+    approved: { type: 'array', items: { type: 'string' } },
   }),
   crd(
     'ServiceBinding',
@@ -394,11 +439,18 @@ function validateSizing(parameters: SizingParameters | undefined): string | unde
 }
 
 function validateClassSpec(spec: BackingServiceClassSpec): string | undefined {
-  if (!CAPABILITIES.includes(spec.type))
-    return 'type must be keyvalue, messaging, blobstore or postgres';
-  if (!PROVIDERS.includes(spec.provider)) return 'provider must be redis, nats or postgres';
+  if (!CAPABILITIES.includes(spec.type)) return `type must be ${CAPABILITY_LIST}`;
+  if (!PROVIDERS.includes(spec.provider))
+    return 'provider must be redis, nats, postgres or platform';
   if (!compatibleProvider(spec.type, spec.provider))
-    return 'provider must match type (keyvalue+redis, messaging+nats, blobstore+nats or postgres+postgres)';
+    return `provider must match type (${COMPATIBILITY_LIST})`;
+  if (spec.type === 'egress') {
+    if (spec.defaults || spec.parametersSchema || spec.storageClassName)
+      return 'egress classes take no sizing or storage class';
+    const allowed = spec.egress?.allowedDestinations ?? [];
+    if (!Array.isArray(allowed) || !allowed.every(validEgressPolicyEntry))
+      return 'egress.allowedDestinations entries must be host:port or *.suffix:port';
+  } else if (spec.egress) return 'egress is only valid for type egress';
   if (spec.visibility !== 'AllTenants' && spec.visibility !== 'SelectedTenants')
     return 'visibility must be AllTenants or SelectedTenants';
   if (spec.visibility === 'SelectedTenants') {
@@ -418,8 +470,14 @@ function validateClassSpec(spec: BackingServiceClassSpec): string | undefined {
 }
 
 function validateServiceSpec(spec: BackingServiceSpec): string | undefined {
-  if (!CAPABILITIES.includes(spec.type))
-    return 'type must be keyvalue, messaging, blobstore or postgres';
+  if (!CAPABILITIES.includes(spec.type)) return `type must be ${CAPABILITY_LIST}`;
+  if (spec.type === 'egress') {
+    if (!Array.isArray(spec.destinations) || spec.destinations.length === 0)
+      return 'egress services need at least one destination';
+    if (!spec.destinations.every(validEgressDestination))
+      return 'destinations must be host, *.suffix, host:port or *.suffix:port';
+    if (spec.parameters) return 'egress services take no sizing parameters';
+  } else if (spec.destinations) return 'destinations are only valid for type egress';
   if (spec.className !== undefined && spec.className !== '' && !validDnsLabel(spec.className))
     return 'className must be a valid DNS label';
   if (
@@ -434,10 +492,11 @@ function validateServiceSpec(spec: BackingServiceSpec): string | undefined {
 function validateBindingSpec(spec: ServiceBindingSpec): string | undefined {
   if (!validDnsLabel(spec.serviceName)) return 'serviceName must be a valid DNS label';
   if (!validDnsLabel(spec.bindingName, 63)) return 'bindingName must be a valid DNS label';
-  if (!CAPABILITIES.includes(spec.capability))
-    return 'capability must be keyvalue, messaging, blobstore or postgres';
+  if (!CAPABILITIES.includes(spec.capability)) return `capability must be ${CAPABILITY_LIST}`;
   if (spec.workloadName !== undefined && !validDnsLabel(spec.workloadName, 63))
     return 'workloadName must be a valid DNS label';
+  if (spec.capability === 'egress' && spec.workloadName === undefined)
+    return 'egress bindings need workloadName';
   return undefined;
 }
 
@@ -482,7 +541,18 @@ function statusContainsCredentials(status: Record<string, unknown> | undefined):
   return walk(status);
 }
 
-function defaultClassSeed(type: BackingCapability): BackingServiceClassSpec {
+function defaultClassSeed(
+  type: BackingCapability,
+  egressAllowedDestinations: string[] = [],
+): BackingServiceClassSpec {
+  if (type === 'egress')
+    return {
+      type,
+      provider: COMPATIBLE[type],
+      visibility: 'AllTenants',
+      default: true,
+      egress: { allowedDestinations: [...egressAllowedDestinations] },
+    };
   return {
     type,
     provider: COMPATIBLE[type],

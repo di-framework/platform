@@ -12,6 +12,18 @@ import {
 import { crds, DEFAULT_CLASS_NAMES } from '../src/tenancy/resources';
 
 const root = join(import.meta.dir, '..');
+/** Pulumi-like config that answers `backingServiceClasses` and `egressAllowedDestinations`. */
+function config(seed: boolean | undefined, classes?: unknown, egress?: unknown) {
+  return {
+    getBoolean: () => seed,
+    getObject: (key: string) =>
+      key === 'backingServiceClasses'
+        ? classes
+        : key === 'egressAllowedDestinations'
+          ? egress
+          : undefined,
+  };
+}
 const distTenancy = join(root, 'dist', 'tenancy');
 
 describe('backing-service install', () => {
@@ -32,7 +44,7 @@ describe('backing-service install', () => {
     }
   });
 
-  it('seeds platform-owned Redis keyvalue, NATS messaging and NATS blobstore default classes', () => {
+  it('seeds platform-owned keyvalue, messaging, blobstore, postgres and egress default classes', () => {
     const seeds = defaultBackingServiceClasses();
     expect(seeds.map((c) => c.name).sort()).toEqual(
       [
@@ -40,30 +52,65 @@ describe('backing-service install', () => {
         DEFAULT_CLASS_NAMES.messaging,
         DEFAULT_CLASS_NAMES.blobstore,
         DEFAULT_CLASS_NAMES.postgres,
+        DEFAULT_CLASS_NAMES.egress,
       ].sort(),
     );
+    const providers = {
+      postgres: 'postgres',
+      keyvalue: 'redis',
+      messaging: 'nats',
+      blobstore: 'nats',
+      egress: 'platform',
+    };
     for (const seed of seeds) {
       expect(seed.visibility).toBe('AllTenants');
       expect(seed.default).toBe(true);
-      expect(seed.provider).toBe(
-        seed.type === 'postgres' ? 'postgres' : seed.type === 'keyvalue' ? 'redis' : 'nats',
-      );
+      expect(seed.provider).toBe(providers[seed.type] as typeof seed.provider);
     }
   });
 
+  it('seeds egress-public from egressAllowedDestinations, approving nothing by default', () => {
+    const egress = <T extends { name: string }>(classes: T[]) =>
+      classes.find((c) => c.name === 'egress-public');
+    expect(egress(defaultBackingServiceClasses())).toEqual({
+      name: 'egress-public',
+      type: 'egress',
+      provider: 'platform',
+      visibility: 'AllTenants',
+      default: true,
+      egress: { allowedDestinations: [] },
+    });
+    expect(egress(resolveBackingServiceClasses(config(undefined)))).toMatchObject({
+      egress: { allowedDestinations: [] },
+    });
+    expect(
+      egress(
+        resolveBackingServiceClasses(
+          config(undefined, undefined, ['mqtt.meshtastic.org:1883', '*.example.com:443']),
+        ),
+      ),
+    ).toMatchObject({
+      egress: { allowedDestinations: ['mqtt.meshtastic.org:1883', '*.example.com:443'] },
+    });
+    for (const bad of [
+      'mqtt.meshtastic.org',
+      ['mqtt.meshtastic.org'],
+      ['Mqtt.example.com:1883'],
+      ['host:0'],
+      ['host:65536'],
+      ['https://host:443'],
+      [1883],
+    ])
+      expect(() => resolveBackingServiceClasses(config(undefined, undefined, bad))).toThrow(
+        /egressAllowedDestinations/,
+      );
+  });
+
   it('resolves configurable class seeds from Pulumi-like config', () => {
-    expect(
-      resolveBackingServiceClasses({ getBoolean: () => undefined, getObject: () => undefined }),
-    ).toHaveLength(4);
-    expect(
-      resolveBackingServiceClasses({
-        getBoolean: () => false,
-        getObject: () => undefined,
-      }),
-    ).toEqual([]);
-    const custom = resolveBackingServiceClasses({
-      getBoolean: () => true,
-      getObject: () => [
+    expect(resolveBackingServiceClasses(config(undefined))).toHaveLength(5);
+    expect(resolveBackingServiceClasses(config(false))).toEqual([]);
+    const custom = resolveBackingServiceClasses(
+      config(true, [
         {
           name: 'keyvalue-redis',
           type: 'keyvalue' as const,
@@ -72,11 +119,17 @@ describe('backing-service install', () => {
           default: true,
           defaults: { memory: '256Mi' },
         },
-      ],
-    });
+      ]),
+    );
     expect(custom.find((c) => c.name === 'keyvalue-redis')?.defaults).toEqual({ memory: '256Mi' });
     expect(custom.map((c) => c.name).sort()).toEqual(
-      ['keyvalue-redis', 'messaging-nats', 'blobstore-nats', 'postgres-dedicated'].sort(),
+      [
+        'keyvalue-redis',
+        'messaging-nats',
+        'blobstore-nats',
+        'postgres-dedicated',
+        'egress-public',
+      ].sort(),
     );
   });
 
@@ -101,6 +154,7 @@ describe('backing-service install', () => {
 
   it('loads compiled backing-services into the controller ConfigMap script map', () => {
     expect([...CONTROLLER_SCRIPT_MODULES]).toEqual([
+      'egress',
       'backing-services',
       'workload-storage',
       'resources',
@@ -118,6 +172,7 @@ describe('backing-service install', () => {
       'backing-service-reconcile.js',
       'backing-services.js',
       'controller.js',
+      'egress.js',
       'log-projection.js',
       'postgres.js',
       'resources.js',
@@ -134,33 +189,30 @@ describe('backing-service install', () => {
     expect(scripts['controller.js']).toMatch(/require\(["'].\/log-projection["']\)/);
     expect(scripts['controller.js']).toMatch(/require\(["'].\/backing-service-reconcile["']\)/);
     expect(scripts['controller.js']).toMatch(/require\(["'].\/service-binding-reconcile["']\)/);
+    expect(scripts['controller.js']).toMatch(/require\(["'].\/egress["']\)/);
+    expect(scripts['backing-services.js']).toMatch(/require\(["'].\/egress["']\)/);
     expect(controllerScriptHash(scripts)).toMatch(/^[a-f0-9]{64}$/);
     expect(controllerScriptHash(scripts)).toBe(controllerScriptHash(scripts));
     expect(controllerScriptHash({ a: '1' })).not.toBe(controllerScriptHash({ a: '2' }));
   });
 
   it('rejects non-array backingServiceClasses config', () => {
-    expect(() =>
-      resolveBackingServiceClasses({
-        getBoolean: () => false,
-        getObject: () => ({ not: 'an-array' }),
-      }),
-    ).toThrow(/must be an array/);
+    expect(() => resolveBackingServiceClasses(config(false, { not: 'an-array' }))).toThrow(
+      /must be an array/,
+    );
   });
 
   it('rejects invalid backingServiceClasses config', () => {
     expect(() =>
-      resolveBackingServiceClasses({
-        getBoolean: () => false,
-        getObject: () => [
+      resolveBackingServiceClasses(
+        config(false, [
           { name: 'Bad_Name', type: 'keyvalue', provider: 'redis', visibility: 'AllTenants' },
-        ],
-      }),
+        ]),
+      ),
     ).toThrow(/valid names/);
     expect(() =>
-      resolveBackingServiceClasses({
-        getBoolean: () => false,
-        getObject: () => [
+      resolveBackingServiceClasses(
+        config(false, [
           {
             name: 'keyvalue-redis',
             type: 'keyvalue',
@@ -173,8 +225,8 @@ describe('backing-service install', () => {
             provider: 'redis',
             visibility: 'AllTenants',
           },
-        ],
-      }),
+        ]),
+      ),
     ).toThrow(/Duplicate/);
   });
 
@@ -184,6 +236,7 @@ describe('backing-service install', () => {
     expect(readme).toContain('retainOnDelete');
     expect(readme).toContain('dist/tenancy');
     expect(readme).toContain('seedDefaultBackingClasses');
+    expect(readme).toContain('egressAllowedDestinations');
     const install = readFileSync(join(root, 'src/tenancy/install.ts'), 'utf8');
     expect(install).toContain('CONTROLLER_SCRIPT_MODULES');
     expect(install).toContain('backing-services');

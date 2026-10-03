@@ -6,8 +6,9 @@ CRD contracts, controller, admission policies, tenant namespace declarations, an
 HTTP entrypoint. Application WorkloadDeployments remain owned by application
 deployment tooling.
 
-- `@di-framework/platform/local` provisions the isolated Docker/k0s cluster,
-  registry, and platform used by generated CLI projects.
+- `@di-framework/platform/local` provisions the isolated k0s cluster (in Docker,
+  or Podman with `containerCli: podman`), registry, and platform used by generated
+  CLI projects.
 - `@di-framework/platform/existing` reads Pulumi configuration and installs the
   platform on a caller-owned cluster. `di-framework-kube` uses this entrypoint.
 - `createPlatform(args)` installs the shared Kubernetes resources with a supplied
@@ -19,13 +20,46 @@ installation; sharing source code does not permit two stacks to own its resource
 The kube entrypoint claims cluster ownership before provisioning and refuses
 unmanaged legacy installations. Other consumers must enforce equivalent ownership.
 
+## Local configuration
+
+`apiPort`, `registryPort`, and `httpPort` (defaults `26443`, `25000`, `28180`)
+choose the distinct loopback host ports. `containerCli` (default `docker`) names
+the container engine command used for every network, volume, container, `exec`,
+and `logs` call; set it to `podman` or another Docker-compatible CLI. It must be a
+plain command name or path (letters, digits, `.`, `_`, `/`, `+`, `-`; not starting
+with `-`). Ownership checks use only inspect templates both Docker and Podman
+support. Choose it before the first `pulumi up`; to switch engines, destroy the
+platform and deploy again (this removes cluster state).
+
+`registryMirrors` (default: none) gives the k0s containerd pull-through mirrors.
+It maps a registry host to an ordered list of mirror URLs, for example
+`pulumi config set --path 'registryMirrors["docker.io"][0]' https://mirror.gcr.io`
+or `registryMirrors: { "docker.io": ["https://mirror.gcr.io"] }` in the stack file.
+Before k0s starts, the container writes `/etc/k0s/containerd.d/di-framework-registry-mirrors.toml`
+(pointing the CRI image service at `/etc/containerd/certs.d`) and one
+`/etc/containerd/certs.d/<registry>/hosts.toml` per registry. containerd tries the
+mirrors in order for pulls and falls back to the upstream registry
+(`https://registry-1.docker.io` for `docker.io`, `https://<registry>` otherwise).
+Keys must be lowercase host names or `host:port`. Mirrors must be `http://` or
+`https://` URLs with a lowercase host, an optional port, and an optional path of
+letters, digits, `.`, `_`, `~`, and `-`. Credentials, queries, quotes, whitespace,
+and shell metacharacters are rejected. File contents reach the container through
+environment variables and are never interpolated into a shell command. When the
+setting is unset or `{}`, the generated commands are the same as without it. Set it
+before the first `pulumi up`; changing it later means destroying and redeploying the
+platform.
+
+`tenants`, `users`, and the other platform settings are shared with the
+existing-cluster entrypoint.
+
 ## Existing-cluster configuration
 
 `kubeconfig` is required (a local file path); `context`, `namespace`, `release`,
 `chart`, `chartVersion`, `httpNodePort`, `timeoutSeconds`, `insecureRegistry`,
-`storageRoot`, `networkPolicyEngine`, and administrator `values` are optional. `tenants`, `users`,
+`storageRoot`, `networkPolicyEngine`, `kubernetesEndpoint`, `httpEndpoint`, `routeUrlPattern`,
+`egressAllowedDestinations`, and administrator `values` are optional. `tenants`, `users`,
 `tenantHostImage`, and `tenantHostImagePullPolicy` use the same declarations as the
-local entrypoint. NodePort zero selects ClusterIP. Registry installation is off
+local entrypoint. NodePort zero makes the HTTP gateway ClusterIP. Registry installation is off
 for existing clusters. Shared hosts are disabled regardless of values overrides. Set `networkPolicyEngine`
 to `kube-router` to install the pinned v2.10.0 policy-only controller on clusters
 without policy enforcement; `existing` leaves policy enforcement to the caller.
@@ -43,6 +77,43 @@ storage root and a cluster that enforces NetworkPolicy and the generated admissi
 policies. Default roots are `/var/lib/k0s` for local and `/var/lib/kubesolo` for the
 existing-cluster entrypoint. Retained tenant namespaces/data survive resource
 cleanup, but destroying the local cluster removes its volumes.
+
+## Tenant user kubeconfigs
+
+For each declared user and membership, the controller creates a long-lived
+ServiceAccount token Secret `di-user-<user>-<tenant>-token` (type
+`kubernetes.io/service-account-token`) in the platform namespace, owned and labelled
+like the user's other resources. A User reports `Ready` only after Kubernetes has
+populated every one of its token Secrets. Removing a membership, suspending or
+deleting the user, or suspending the tenant deletes the matching Secret and so
+invalidates the token.
+
+After each User is Ready, `createPlatform` reads its token Secrets and builds one
+kubeconfig per membership: the API server and cluster CA (`ca.crt` from the token
+Secret), the token as the only credential, and a context whose namespace is
+`di-tenant-<tenant>`. The result is the secret output
+`kubeconfigs: { [tenant]: { [user]: string } }`, exported by both entrypoints.
+Write one to a file with:
+
+```sh
+pulumi stack output kubeconfigs --show-secrets | jq -r '.meshtastic.dev' > tenant.kubeconfig
+chmod 600 tenant.kubeconfig
+```
+
+The kubeconfig grants exactly the user's tenant role: `developer` users can manage
+tenant workloads and services, `viewer` users get read-only access. The token
+does not expire; rotate it by deleting the Secret (the controller recreates it)
+and running `pulumi up` again.
+
+The API server URL comes from the `apiServer` argument of `createPlatform`. The
+local entrypoint passes its loopback `https://127.0.0.1:<apiPort>`. The existing-cluster
+entrypoint uses `kubernetesEndpoint` (set by `di-framework-kube`) and otherwise the
+server of the admin kubeconfig's selected `context` (or `current-context`). When
+neither resolves to an `https://` URL, `kubeconfigs` is omitted. Previews do not read
+token Secrets, so `kubeconfigs` is only known after `pulumi up`. When upgrading an
+installation whose Users are already Ready, Pulumi does not wait on unchanged Users,
+so the first `pulumi up` can read a token Secret before the upgraded controller has
+created it; run `pulumi up` again once it has.
 
 ## Development
 
@@ -114,14 +185,17 @@ model, not a claim of developer-proof network isolation.
   `retainOnDelete` so destroying or upgrading the stack does not cascade-delete
   existing `BackingService` / `ServiceBinding` instances if the cluster remains.
   PostgreSQL retention and recovery are described below.
-- **Default classes** `keyvalue-redis`, `messaging-nats`, `blobstore-nats`, and `postgres-dedicated` are platform-owned
+- **Default classes** `keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`,
+  and `egress-public` are platform-owned
   cluster CRs (installation label, `visibility: AllTenants`, `default: true`).
   Override with Pulumi config `backingServiceClasses`, or disable seeding with
-  `seedDefaultBackingClasses: false`.
+  `seedDefaultBackingClasses: false`. `egress-public` approves the Pulumi config list
+  `egressAllowedDestinations` (`host:port` / `*.suffix:port`, default `[]`, which approves nothing).
 - **Controller scripts** are TypeScript sources compiled by `tsc` into
-  `dist/tenancy/*.js` (`backing-services`, `resources`, `backing-service-reconcile`,
+  `dist/tenancy/*.js` (`egress`, `backing-services`, `resources`, `backing-service-reconcile`,
   `service-binding-reconcile`, `postgres`, `controller`). Pulumi loads those compiled files into
-  the controller ConfigMap; `resources.js` requires `./backing-services` at runtime,
+  the controller ConfigMap; `resources.js` requires `./backing-services` (which requires
+  `./egress`) at runtime,
   and `controller.js` requires `resources.js`, `backing-service-reconcile.js`, and
   `service-binding-reconcile.js` and `postgres.js`. There is no runtime `transpileModule` or
   PLATFORM_TS_ASSETS allowlist for these modules.
@@ -136,23 +210,115 @@ model, not a claim of developer-proof network isolation.
   Tenant-reconciled infrastructure — not an application `BackingService`. Application
   messaging instances are named `di-bs-<service-name>` and owned by BackingService UIDs.
 
+### Egress
+
+Tenant guests reach the network only through an approved egress grant. Tenant hosts run
+with `--socket-egress=enforce`, and admission denies `allowedHosts` and
+`allowedIpNameLookups` from tenant users.
+
+- The platform administrator lists what may be reached in the `egress-public` class:
+  Pulumi config `egressAllowedDestinations`, for example
+  `["mqtt.meshtastic.org:1883", "*.example.com:443"]`. Every entry needs a port.
+- A tenant creates a `BackingService` with `type: egress` and `spec.destinations`
+  (`host`, `*.suffix`, `host:port` or `*.suffix:port`). Nothing is provisioned. The service
+  is Ready when the class covers every destination; a destination without a port is
+  approved for each policy port that covers its name. `status.approved` lists the resolved
+  `host:port` entries. Otherwise Ready is False with reason `NotApproved`, naming the
+  destinations the class does not cover.
+- A `ServiceBinding` with `capability: egress` and `workloadName: <WorkloadDeployment>`
+  grants that workload the approved entries (`bindingName` is free; the CLI uses `egress`).
+  On each tick the controller merge-patches every guest of the WorkloadDeployment
+  (`components[].localResources` and `service.localResources`) under field manager
+  `di-platform-egress`, and removes the fields again when no Ready binding grants them. A
+  redeploy that replaces the component list gets them back on the next tick.
+- The controller also keeps NetworkPolicy `di-tenant-egress` in `di-runtime-<tenant>`: the
+  tenant host pods may reach public IPv4 addresses (not 10/8, 172.16/12, 192.168/16,
+  169.254/16, 127/8) on the union of approved TCP ports. It is deleted with the last grant.
+- A tenant update may carry the controller's `allowedHosts` / `allowedIpNameLookups`
+  forward unchanged, or drop them. It cannot add or change them.
+
+What the patch contains follows what wash 2.8 checks under `--socket-egress=enforce`:
+
+| Guest call | wash check | Patch entry |
+| --- | --- | --- |
+| `wasi:sockets` name lookup | name against `allowedIpNameLookups` | each approved name (`*.suffix` kept) |
+| `wasi:sockets` TCP connect | address against `allowedHosts`; only `*` or a literal `ip:port` can match | `<ipv4>:<port>` for each public IPv4 the controller resolves for an exact name |
+| `wasi:http` request | URI against `allowedHosts` | `host:port`, plus `https://host` for 443 and `http://host` for 80 (a portless URI does not match `host:443`) |
+
+The controller resolves names through the cluster resolver on each tick and patches only
+when the answer changes; a failed lookup keeps the last answer. Wildcard destinations
+grant lookups and HTTP only, since no address can be listed for them. IPv6 is not granted.
+
 ### Console log projection
 
 The controller publishes one ConfigMap per console application in each tenant
 namespace, `di-logs-<app>`, labeled `di-framework.dev/projection=logs` and
-`di-framework.dev/application=<app>`, with the newest 200 lines in `data.lines`.
+`di-framework.dev/application=<app>`, with the newest 200 lines in `data.lines` and
+the newest host failure per WorkloadDeployment in `data.failures`.
 
 - Source: the `hostgroup-<tenant>` pod logs, read through a per-tenant
   `di-platform-log-reader` Role (`pods/log get` in the runtime namespace only). The
   host keeps `automountServiceAccountToken: false`.
-- Only lines from the wash `wasi:logging` TracingLogger are kept. Each ends with
+- Guest lines come only from the wash `wasi:logging` TracingLogger. Each ends with
   `workload.name` and `workload.namespace`; the namespace must be the tenant's, and
   the name maps to a `di-framework`-managed WorkloadDeployment. Its
   `di-framework.dev/workload` label (else `di-framework.dev/application`) is the
   console application, so `mesh-collector` and `mesh-site` publish to `mesh`.
   Raw guest stdout/stderr carries no attribution and is dropped.
-- Lines are redacted (bearer tokens, `key=value` secrets, URL credentials, long
-  tokens) and cut to 500 characters before they are written.
+- Host failures are kept too: WARN/ERROR lines the host emits inside a
+  `workload_start{workload_id=… workload.name="…" workload.namespace="…"}` span, such
+  as `service did not properly execute` or `failed to start workload … reason="…"`.
+  They are attributed from the span fields only (the outermost span must be
+  `workload_start` with both fields, nested spans that repeat them must agree, and
+  `wasi:logging` lines never count), so message text cannot pick the workload. They
+  are written as `<timestamp> <LEVEL> host: <message>` into the same ring.
+- The ring reserves room for host lines so a chatty guest cannot push failures out
+  within seconds: the newest 50 host lines are kept, guest lines fill the rest of
+  the 200 newest first, and only then older host lines. Lines stay in timestamp
+  order. Each poll re-merges with the published `data.lines`, so this also holds
+  after a controller restart. A guest message that itself starts with `host:` is
+  written as `(guest) host: …` and never counts as a host line.
+- Service crashes are kept too. wash 2.8 runs the service supervisor loop in an
+  uninstrumented task, so lines such as `P3 service execution failed …`,
+  `max restarts reached, P3 service will not be restarted`, `failed to instantiate P3
+  service` and the plain and trigger service variants carry no span. Such a line is
+  attributed to the most recently started service in the same log read: the newest
+  `Starting workload` line (inside a `workload_start` span, this tenant's namespace)
+  of a WorkloadDeployment with `spec.template.spec.service` whose `workload_stop` has
+  not followed. Without one the line is dropped. One host pod serves one tenant, so
+  this cannot attribute across tenants; its limit is that two services starting at
+  the same moment can be confused. When the raw panic block right before the line
+  carries a JS `Exception { message: Some("…") }`, the failure reads
+  `P3 service execution failed: <exception message>` (redacted, 500 characters).
+  Each read starts two minutes before the previous cursor, so a crash logged just
+  after a poll still sees its start; already published lines are not repeated.
+- `data.failures` holds the newest host failure per WorkloadDeployment of the
+  application, as JSON keyed by the WorkloadDeployment name:
+  `{ "workload": "<host workload.name>", "time": "…", "level": "WARN|ERROR", "message": "…" }`.
+  The host `workload.name` is `<currentReplicaSet name>-<suffix>`, so a deployment is
+  failing when `failures[name].workload` starts with `status.currentReplicaSet.name-`;
+  an entry from an older replica set is history. A later WARN about the same host
+  workload (`max restarts reached`) does not replace its ERROR. A `Starting workload`
+  line for the deployment with a different host workload name, later than the
+  recorded failure, removes the entry (for example after the host retries the same
+  replica set with a new suffix and that start succeeds). Timestamps are compared,
+  so re-reading an older start never removes a newer failure, and the start may
+  arrive in a later read than the failure. When no entries remain, `data.failures`
+  is dropped. Entries of deployments that left the
+  application are dropped on the next write, so the key stays bounded by its member
+  count.
+- A restarted controller resumes after the newest published line, so lines are not
+  repeated. Failures are merged newest-wins by deployment from everything it re-reads,
+  so none are lost, including ones older than that line.
+- `di-framework.dev/logs: "false"` on a WorkloadDeployment (written by the CLI for
+  `"logs": false`) stops its `wasi:logging` lines from being published. Its host
+  failure lines and `data.failures` entry are still published: they are platform
+  diagnostics about the workload, not guest output, and the console needs them for
+  status.
+- Lines and failure messages are redacted (bearer tokens, `key=value` secrets, URL
+  credentials, long tokens) and cut to 500 characters before they are written. Host
+  messages can echo guest text (for example a `reason`), so they get the same
+  treatment.
 - No `projection=signals` ConfigMap is written. An application with no attributed
   lines has no ConfigMap, which the console shows as unpublished.
 - Tenant users cannot create, change, or delete any ConfigMap carrying
@@ -184,6 +350,45 @@ It carries no `volumes`, `volumeMounts`, or host paths.
 - A redeploy that rewrites the component list drops the preopen until the next
   controller tick (about 3 s) puts it back.
 
+### Tenant HTTP gateway
+
+The published HTTP port (NodePort `httpNodePort`, 30180 locally) belongs to the
+`di-platform-gateway` Deployment in the platform namespace, a small Node reverse proxy
+(`gateway.js`, loaded from this package into a ConfigMap and run on the controller's
+`node:22.18.0-alpine3.22` image). `wasmcloud-http` stays as the default host group's
+ClusterIP backend.
+
+- `Host: <route-host>.<tenant>.localhost[:port]` goes to
+  `di-http.di-runtime-<tenant>.svc.cluster.local:80` with `Host: <route-host>`. The tenant
+  is the label right before `.localhost` and must be a valid tenant name; the route host
+  is everything before it (it may contain dots). Routing uses the whole name, never a
+  fixed list of hosts.
+- Every other Host (including `localhost` and `127.0.0.1`) goes to
+  `wasmcloud-http.<namespace>.svc.cluster.local:80` with the Host unchanged.
+- A missing or malformed Host, or an absolute-form request target, gets `400`. Upstream
+  connection failures get `502`, an upstream silent for 60 s before responding `504`.
+  Bodies stream both ways and `Upgrade` (WebSocket) requests pass through.
+- `X-Forwarded-For`, `X-Forwarded-Host` (the original Host) and `X-Forwarded-Proto` are
+  always overwritten and `Forwarded` is dropped. Deployed workloads set
+  `DI_CONTROL_REJECT_FORWARDED=1`, so their `/_di/*` control paths stay unreachable from
+  outside.
+- Isolation: the tenant comes only from the Host name. Tenant runtimes still admit only
+  their own namespaces (`di-tenant-network`); a separate `di-tenant-gateway` policy in
+  each `di-runtime-<tenant>` admits the gateway pods, and only them, to the host group on
+  9191. The gateway's own policy limits its egress to cluster DNS and host group port 9191
+  in this installation's namespaces. The pod runs as non-root with a read-only root, drops
+  all capabilities and mounts no ServiceAccount token.
+
+`routeUrlPattern` (`http://{host}.{tenant}.localhost:<httpPort>`) is exported by the local
+entrypoint and returned by `createPlatform`. The existing-cluster entrypoint takes it from
+config `routeUrlPattern`, else derives it from `httpEndpoint` when that is an `http://`
+`127.0.0.1`/`localhost` URL, else leaves it unset. When it is set the controller writes
+ConfigMap `di-platform-routes` into each `di-tenant-<tenant>` namespace with
+`data.urlTemplate` = the pattern with `{tenant}` filled in (for example
+`http://{host}.meshtastic.localhost:28180`), and removes it once the pattern is unset.
+`di-viewer` and `di-developer` can read it; tenant users cannot write it. No ConfigMap
+means no gateway URL is known.
+
 ### Contract
 
 This section defines the v1alpha1 shape for independently requestable application
@@ -199,14 +404,16 @@ backing services.
 
 **BackingServiceClass** selects a capability and an approved implementation:
 
-- `spec.type`: `keyvalue` \| `messaging` \| `blobstore` \| `postgres`
-- `spec.provider`: `redis` \| `nats` \| `postgres`
-- v1 compatibility is fixed: `keyvalue`+`redis`, `messaging`+`nats`, `blobstore`+`nats`, `postgres`+`postgres` (CEL + TypeScript helpers)
+- `spec.type`: `keyvalue` \| `messaging` \| `blobstore` \| `postgres` \| `egress`
+- `spec.provider`: `redis` \| `nats` \| `postgres` \| `platform`
+- v1 compatibility is fixed: `keyvalue`+`redis`, `messaging`+`nats`, `blobstore`+`nats`, `postgres`+`postgres`, `egress`+`platform` (CEL + TypeScript helpers)
+- `spec.egress.allowedDestinations` (egress only): `host:port` / `*.suffix:port` entries; an
+  egress class takes no sizing or storage class
 - `spec.parametersSchema` / `spec.defaults`: typed sizing only (`storage`, `memory`, `cpu`);
   no images, endpoints, hostPaths, or free-form infrastructure knobs
 - `spec.visibility`: `AllTenants` \| `SelectedTenants` (requires `allowedTenants`)
 - `spec.default`: at most one default class per `type`; default names are
-  `keyvalue-redis`, `messaging-nats`, `blobstore-nats`, and `postgres-dedicated`
+  `keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`, and `egress-public`
 - `spec.storageClassName`: optional PostgreSQL PVC storage class; omission uses the cluster default
 - Immutable after create: `type`, `provider`
 - Status: `Ready` condition and `observedGeneration` only
@@ -217,6 +424,8 @@ backing services.
 - `spec.parameters` may override class defaults for sizing fields only
 - `spec.deletionPolicy`: `Retain` (default) \| `Delete` — controls data/PV retention when
   the PostgreSQL service is deleted
+- `spec.destinations` (egress only, required there): `host`, `*.suffix`, `host:port`, or
+  `*.suffix:port`; `status.approved` lists the approved `host:port` entries
 - Immutable: `type`; `className` once set/resolved
 - Status conditions: `Ready`, `Provisioning`, `Failed`, `Deleting`, plus
   `observedGeneration`, `classRef`, `runtimeNamespace`, and an `endpoint` summary
@@ -234,7 +443,8 @@ spoof cross-tenant ownership by writing labels on the object.
   `hostInterfaces[].name`
 - `spec.capability`: must match the referenced service's `type`
 - `spec.workloadName` is optional documentation/diagnostics only; **authorization is
-  tenant-level in v1**, not per workload
+  tenant-level in v1**, not per workload. Egress bindings require it: it names the
+  WorkloadDeployment that receives the grant
 - Multiple bindings may share one `BackingService` (warehouse `receive` / `take` /
   `sync` sharing `stock`)
 - Status: `Ready` \| `Failed` \| `Deleting`, `observedGeneration`, and

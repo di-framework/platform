@@ -185,10 +185,14 @@ function bindingHostInterfaceProjection(binding: {
   };
 }
 
-/** PostgreSQL has one labeled host interface per callable interface. Types stay in WIT. */
+/**
+ * PostgreSQL has one labeled host interface per callable interface. Types stay in WIT.
+ * Egress is not a host interface: the controller patches the workload's localResources.
+ */
 function bindingHostInterfaceProjections(
   binding: Pick<ServiceBinding['spec'], 'bindingName' | 'capability'>,
 ) {
+  if (binding.capability === 'egress') return [];
   if (binding.capability !== 'postgres')
     return [bindingHostInterfaceProjection({ ...binding, capability: binding.capability })];
   return ['query', 'prepared'].map((iface) => ({
@@ -245,6 +249,38 @@ function resolveBindingService(
 }
 
 /**
+ * An egress binding needs a Ready egress service and a WorkloadDeployment to grant. It has
+ * no endpoint or projection; the approved entries live on the service status.
+ */
+function resolveEgressBindingService(
+  binding: ServiceBinding,
+  service: BackingService | undefined,
+): { error: string } | { service: BackingService } {
+  if (!service)
+    return {
+      error: `BackingService ${binding.spec.serviceName} not found in namespace ${binding.metadata.namespace}`,
+    };
+  if (service.spec.type !== 'egress')
+    return {
+      error: `capability egress does not match BackingService ${service.metadata.name} type ${service.spec.type}`,
+    };
+  if (!binding.spec.workloadName)
+    return { error: 'egress bindings need spec.workloadName (the WorkloadDeployment to grant)' };
+  if (service.metadata.deletionTimestamp)
+    return {
+      error: `BackingService ${service.metadata.name} is deleting; new associations are refused`,
+    };
+  if (!serviceIsReady(service))
+    return { error: `BackingService ${service.metadata.name} is not approved` };
+  return { service };
+}
+
+/** Egress bindings project nothing, so they never share or own a binding projection. */
+function projectionPeers(peers: ServiceBinding[]): ServiceBinding[] {
+  return peers.filter((b) => b.spec.capability !== 'egress');
+}
+
+/**
  * Among peers sharing bindingName, elect the lexicographically first non-deleting
  * ServiceBinding as ConfigMap/Secret owner. Callers pass all same-namespace bindings.
  */
@@ -252,7 +288,7 @@ function electBindingOwner(
   bindingName: string,
   peers: ServiceBinding[],
 ): ServiceBinding | undefined {
-  const live = peers
+  const live = projectionPeers(peers)
     .filter((b) => b.spec.bindingName === bindingName && !b.metadata.deletionTimestamp)
     .sort((a, b) => a.metadata.name.localeCompare(b.metadata.name));
   return live[0];
@@ -265,7 +301,7 @@ function sharedBindingConflict(
   binding: ServiceBinding,
   peers: ServiceBinding[],
 ): string | undefined {
-  const siblings = peers.filter(
+  const siblings = projectionPeers(peers).filter(
     (b) =>
       b.spec.bindingName === binding.spec.bindingName &&
       !b.metadata.deletionTimestamp &&
@@ -303,6 +339,7 @@ export {
   electBindingOwner,
   providerForCapability,
   resolveBindingService,
+  resolveEgressBindingService,
   serviceBindingResources,
   serviceIsReady,
   sharedBindingConflict,
