@@ -146,14 +146,21 @@ jobs:
             fi
             args+=("ghcr.io/di-framework/wash@sha256:${hex}")
           done
-          docker buildx imagetools create -t ghcr.io/di-framework/wash:2.8.0-wasi-tls "${args[@]}"
+          # --metadata-file is the index that was just pushed. Piping
+          # `imagetools inspect` into awk exits at the first Digest line, which
+          # closes the pipe and fails this job after the tag is already published.
+          docker buildx imagetools create \
+            --metadata-file "${RUNNER_TEMP}/wash-index.json" \
+            -t ghcr.io/di-framework/wash:2.8.0-wasi-tls \
+            "${args[@]}"
 
       - name: Record image digest
         run: |
           set -euo pipefail
-          digest="$(docker buildx imagetools inspect ghcr.io/di-framework/wash:2.8.0-wasi-tls | awk '/^Digest:/ { print $2; exit }')"
-          if [[ -z "${digest}" || "${digest}" != sha256:* ]]; then
+          digest="$(jq -er '.["containerimage.descriptor"].digest' "${RUNNER_TEMP}/wash-index.json")"
+          if [[ "${digest}" != sha256:* ]]; then
             echo "::error::manifest list did not return an index digest"
+            cat "${RUNNER_TEMP}/wash-index.json"
             exit 1
           fi
           ref="ghcr.io/di-framework/wash:2.8.0-wasi-tls@${digest}"
