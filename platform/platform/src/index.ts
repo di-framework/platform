@@ -48,6 +48,13 @@ export interface PlatformArgs {
   apiServer?: pulumi.Input<string>;
 }
 
+/**
+ * Published wash 2.8.0 with wasi-tls. The tag moves on the next publish; this
+ * digest is the multi-arch index from the tenant-host workflow.
+ */
+const DEFAULT_HOST_IMAGE =
+  'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669';
+
 /** Shared platform resources; the caller owns cluster creation and Pulumi state. */
 export function createPlatform(args: PlatformArgs) {
   const provider = args.provider;
@@ -246,7 +253,7 @@ export function createPlatform(args: PlatformArgs) {
     ...declared,
     insecureRegistry: args.insecureRegistry,
     storageRoot: args.storageRoot,
-    hostImage: config.get('tenantHostImage') ?? 'ghcr.io/wasmcloud/wash:2.8.0',
+    hostImage: config.get('tenantHostImage') ?? DEFAULT_HOST_IMAGE,
     hostImagePullPolicy: config.get('tenantHostImagePullPolicy') ?? 'IfNotPresent',
     backingServiceClasses: resolveBackingServiceClasses(config),
     routeUrlPattern,

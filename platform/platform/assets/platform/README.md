@@ -185,8 +185,9 @@ For shared tenant keyvalue storage, reference the controller-managed ConfigMap
 `di-tenant-stock` in the native keyvalue host interface (transitional). Independent
 services use ConfigMaps named `di-bs-*` and binding-projected Secrets/ConfigMaps
 named `di-binding-*` (#450/#451). The warehouse's HTTP, Redis, and NATS sync flow
-has been verified on the stock `ghcr.io/wasmcloud/wash:2.8.0` image; native
-keyvalue needs no custom image. The warehouse uses this same ConfigMap reference
+has been verified on wash 2.8.0. The platform default host image is
+`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669`,
+which links `wasi:tls`. Native keyvalue needs no custom image. The warehouse uses this same ConfigMap reference
 in its external-cluster setup. Messaging uses the tenant's dedicated NATS backend.
 Tenant admission restricts native interfaces, forbids host volumes and guest
 network capabilities, and reserves `di-tenant-stock`, `di-bs-*`, and
@@ -214,8 +215,8 @@ This is a local development platform. Its registry is shared and unauthenticated
 and its published ports bind to loopback. Remote access, authenticated tenant
 registries, production storage, and stronger resource accounting are separate
 work. Namespace NetworkPolicies require an enforcing CNI (the generated k0s
-cluster uses kube-router). `tenantHostImage` and `tenantHostImagePullPolicy` can
-select a compatible custom wasmCloud runtime image when needed.
+cluster uses kube-router). `tenantHostImage` and `tenantHostImagePullPolicy`
+override the default wasi-tls host image when a stack needs a different runtime.
 
 ## Shared implementation
 
