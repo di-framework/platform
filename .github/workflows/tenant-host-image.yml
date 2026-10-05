@@ -1,11 +1,20 @@
 # Publish the tenant host image: wash 2.8.0 with wasi-tls and the postgres
-# invocation-lease patch. Dispatch-only, matching the npm Release workflow:
-# a maintainer runs it; pull requests and pushes do not publish.
-# Auth is GITHUB_TOKEN with packages: write. No registry secret is stored.
+# invocation-lease patch. Runs when this workflow or its build inputs change.
+# A push to main publishes ghcr.io/di-framework/wash:2.8.0-wasi-tls. A pull
+# request builds the same image and does not push, so the tag is not moved
+# before merge. Auth is GITHUB_TOKEN with packages: write. No registry secret
+# is stored.
 name: Publish tenant host image
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: &image-paths
+      - .github/workflows/tenant-host-image.yml
+      - platform/tenant-host/Dockerfile
+      - platform/tenant-host/postgres-invocation-lease.patch
+  pull_request:
+    paths: *image-paths
 
 permissions:
   contents: read
@@ -14,12 +23,12 @@ permissions:
   id-token: write
 
 concurrency:
-  group: publish-tenant-host-image
-  cancel-in-progress: false
+  group: tenant-host-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   publish:
-    name: Push ghcr.io/di-framework/wash:2.8.0-wasi-tls
+    name: Tenant host image
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -43,6 +52,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -55,13 +65,14 @@ jobs:
         with:
           context: platform/tenant-host
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           provenance: true
           tags: ghcr.io/di-framework/wash:2.8.0-wasi-tls
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
 
       - name: Record image digest
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
@@ -80,4 +91,13 @@ jobs:
             echo '```'
             echo
             echo 'Pin `tenantHostImage` to that digest. The tag `2.8.0-wasi-tls` moves on the next publish.'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Note pull request build
+        if: github.event_name == 'pull_request'
+        run: |
+          {
+            echo "### Tenant host image"
+            echo
+            echo "Built linux/amd64 and linux/arm64. Pull requests do not push, so \`ghcr.io/di-framework/wash:2.8.0-wasi-tls\` stays on the last main publish."
           } >> "${GITHUB_STEP_SUMMARY}"

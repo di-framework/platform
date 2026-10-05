@@ -12,7 +12,10 @@ links `wasi:tls/client,types@0.3.0-draft` alongside the default interfaces.
 ## What is built
 
 - Source: `git clone --branch v2.8.0`, then the build fails unless `HEAD` is the pinned commit.
-- Patch: `postgres-invocation-lease.patch` is applied with `git apply` before the build. It keeps
+  The clone is its own layer. `GIT_TERMINAL_PROMPT=0` keeps a credential prompt from hanging CI.
+- Patch: `postgres-invocation-lease.patch` is applied with `git apply --check` and then `git apply`
+  after the clone, so a patch edit does not download wasmCloud again. The build also requires
+  `release_store_lease` to be present in `http_p3.rs`. The patch keeps
   one postgres connection for the invocation across `BEGIN` / `COMMIT` / `ROLLBACK`, and releases
   that lease when the HTTP call finishes, including when the guest stops before `COMMIT`.
   Queries outside a transaction keep upstream's bounded row channel. A query on the leased
@@ -22,10 +25,15 @@ links `wasi:tls/client,types@0.3.0-draft` alongside the default interfaces.
   enables `wasmtime-wasi-tls` (p3, rustls) in `wash-runtime`. Default features (`wasi-webgpu`,
   `wasm_component_model_implements`) stay on, matching upstream's `CARGO_FEATURES` build argument.
 - Toolchain: Rust 1.96.0 (what `rust-toolchain.toml` pins at the tag), `cargo build --locked`.
+  The builder is the official `rust:1.96.0-bookworm` image, the same choice as
+  `platform-examples/deploy/tenant-host/Containerfile`. Upstream's builder is
+  `cgr.dev/chainguard/rust:latest-dev`, which does not stay on 1.96.0.
 - Runtime: the same Chainguard `wolfi-base` + `git` layout as upstream's image, binary at
-  `/usr/local/bin/wash`, entrypoint `wash`. Base images are pinned by digest.
-- User: `65532:65532` by default. The hostgroup Deployment already sets uid/gid 65532, a read-only root
-  filesystem, `HOME=/tmp`, and writable `/tmp` and `/oci-cache` volumes, so the image needs nothing else.
+  `/usr/local/bin/wash`, entrypoint `wash`. Base images are pinned by digest. Both digests are
+  multi-arch indexes, so the publish workflow can build `linux/amd64` and `linux/arm64`.
+  The image build runs `wash --version` as uid 65532 and fails if wolfi cannot execute the binary.
+- User: `65532:65532`, `HOME=/tmp`, workdir `/tmp`. The hostgroup Deployment sets the same uid/gid,
+  a read-only root filesystem, `HOME=/tmp`, and writable `/tmp` and `/oci-cache` volumes.
 
 ## Build
 
@@ -36,7 +44,9 @@ podman run --rm localhost/di-framework/wash:2.8.0-wasi-tls --version
 
 `docker build` works the same way (BuildKit is needed for the cache mounts). A cold arm64 build took
 about 10 minutes on 16 cores; the cargo registry and target directory are cache mounts, so rebuilds are
-faster. The result is about 165 MB, the same as the stock image.
+faster. The target cache is keyed by architecture, and the registry cache is locked, so an amd64 and
+arm64 build can run together without sharing one `target` directory. The result is about 165 MB, the
+same as the stock image.
 
 At startup the host logs `Host provides interfaces` with `wasi:tls/types,client@0.3.0-draft` in the
 list (the stock image lists the same interfaces without it), followed by one expected
@@ -49,20 +59,19 @@ Reference: `ghcr.io/di-framework/wash:2.8.0-wasi-tls`
 
 The **Publish tenant host image** workflow
 ([`.github/workflows/tenant-host-image.yml`](../../.github/workflows/tenant-host-image.yml))
-builds `linux/amd64` and `linux/arm64` and pushes that tag. It is `workflow_dispatch` only, the
-same explicit publish step this repo uses for npm releases: a maintainer runs it from the Actions
-tab after the workflow file is on `main`
-(`https://github.com/di-framework/platform/actions/workflows/tenant-host-image.yml`).
-The job authenticates with the workflow `GITHUB_TOKEN` (`packages: write`).
+builds `linux/amd64` and `linux/arm64`. It runs when
+`.github/workflows/tenant-host-image.yml`, `platform/tenant-host/Dockerfile`, or
+`platform/tenant-host/postgres-invocation-lease.patch` changes: on a pull request, and on a
+push to `main`. A push to `main` publishes the tag. A pull request builds the image and does
+not push. The publish job authenticates with the workflow `GITHUB_TOKEN` (`packages: write`).
 
 The tag is mutable. The workflow summary prints the multi-arch index digest; pin
 `tenantHostImage` to `ghcr.io/di-framework/wash:2.8.0-wasi-tls@<digest>`. The platform default
 `hostImage` stays `ghcr.io/wasmcloud/wash:2.8.0` until a published digest is selected for it.
 
-That GHCR tag is not published yet. The workstation `gh` token available while adding this
-workflow (`repo`, `workflow`) is not accepted by GHCR (`403` invalid token, no `write:packages`
-scope). Running the workflow after it is on `main` is the approval still required. The first
-run also needs the `di-framework` org to allow GitHub Actions to publish packages.
+That GHCR tag is not published yet. The first run needs the `di-framework` org to allow
+GitHub Actions to publish packages. Merging this workflow to `main` is that first run, because
+the workflow file itself is one of the paths that starts it.
 
 For a local Kubesolo/k0s cluster, push to the platform registry (`di-framework-registry` in
 `wasmcloud`, plain HTTP, ClusterIP) through its port-forward. With a remote podman machine, `127.0.0.1`
