@@ -59,14 +59,11 @@ tab after the workflow file is on `main`
 (`https://github.com/di-framework/platform/actions/workflows/tenant-host-image.yml`).
 The job authenticates with the workflow `GITHUB_TOKEN` (`packages: write`).
 
-The tag is mutable. The workflow summary prints the multi-arch index digest; pin
-`tenantHostImage` to `ghcr.io/di-framework/wash:2.8.0-wasi-tls@<digest>`. The platform default
-`hostImage` stays `ghcr.io/wasmcloud/wash:2.8.0` until a published digest is selected for it.
+The tag is mutable. The platform default `hostImage` is the published index:
 
-That GHCR tag is not published yet. The workstation `gh` token available while adding this
-workflow (`repo`, `workflow`) is not accepted by GHCR (`403` invalid token, no `write:packages`
-scope). Running the workflow after it is on `main` is the approval still required. The first
-run also needs the `di-framework` org to allow GitHub Actions to publish packages.
+`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669`
+
+`tenantHostImage` overrides it. The workflow summary prints the digest of each later publish.
 
 For a local Kubesolo/k0s cluster, push to the platform registry (`di-framework-registry` in
 `wasmcloud`, plain HTTP, ClusterIP) through its port-forward. With a remote podman machine, `127.0.0.1`
@@ -96,7 +93,7 @@ The registry Service is ClusterIP, so a node-pullable reference needs a NodePort
 Set the platform config used by the stack (`tenantHostImage` / `tenantHostImagePullPolicy`):
 
 ```sh
-pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:<index-digest>
+pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669
 pulumi config set tenantHostImagePullPolicy IfNotPresent
 ```
 
@@ -104,7 +101,7 @@ or, with `di-framework-kube`, in the `--platform-config` JSON:
 
 ```json
 {
-  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:<index-digest>",
+  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669",
   "tenantHostImagePullPolicy": "IfNotPresent"
 }
 ```
