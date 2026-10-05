@@ -16,10 +16,16 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 # lld links the wasmtime-sized release binary much faster than GNU ld.
 ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+# Clone the tag, then fail unless HEAD is the pinned commit. A moved tag fails the build.
+# GIT_TERMINAL_PROMPT stops a missing credential from hanging the publish job.
+RUN GIT_TERMINAL_PROMPT=0 git clone --depth 1 --quiet --branch "${WASMCLOUD_TAG}" https://github.com/wasmCloud/wasmCloud /src \
+  && test "$(git -C /src rev-parse HEAD)" = "${WASMCLOUD_COMMIT}"
+# The patch is its own layer so editing it does not clone wasmCloud again.
 COPY postgres-invocation-lease.patch /tmp/postgres-invocation-lease.patch
-RUN git clone --depth 1 --branch "${WASMCLOUD_TAG}" https://github.com/wasmCloud/wasmCloud /src \
-  && test "$(git -C /src rev-parse HEAD)" = "${WASMCLOUD_COMMIT}" \
-  && git -C /src apply /tmp/postgres-invocation-lease.patch
+RUN git -C /src apply --check /tmp/postgres-invocation-lease.patch \
+  && git -C /src apply /tmp/postgres-invocation-lease.patch \
+  && grep -q release_store_lease /src/crates/wash-runtime/src/host/http_p3.rs \
+  && rm /tmp/postgres-invocation-lease.patch
 WORKDIR /src
 # `wasi-tls` is defined by crates/wash (forwarding to wash-runtime/wasi-tls) and is added on top of the
 # default features, exactly like upstream's CARGO_FEATURES build argument.
@@ -37,7 +43,12 @@ LABEL org.opencontainers.image.source="https://github.com/di-framework/platform"
       org.opencontainers.image.version="2.8.0-wasi-tls"
 RUN apk add --no-cache git
 COPY --from=build /out/wash /usr/local/bin/wash
-# The tenant hostgroup Deployment sets uid/gid 65532 and a read-only root filesystem itself; this default
-# only keeps standalone `podman run` from running as root.
+# The hostgroup Deployment runs uid/gid 65532 with a read-only root, HOME=/tmp, and writable
+# /tmp and /oci-cache. Set the same home and workdir here so `podman run` does not run as root
+# and wash does not try to write under /home/nonroot on a read-only root.
+ENV HOME=/tmp
+WORKDIR /tmp
 USER 65532:65532
+# Fail the build when this wolfi userspace cannot execute the binary (glibc mismatch).
+RUN ["/usr/local/bin/wash", "--version"]
 ENTRYPOINT ["/usr/local/bin/wash"]

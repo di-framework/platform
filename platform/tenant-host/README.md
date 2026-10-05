@@ -11,8 +11,8 @@ links `wasi:tls/client,types@0.3.0-draft` alongside the default interfaces.
 
 ## What is built
 
-- Source: `git clone --branch v2.8.0`, then the build fails unless `HEAD` is the pinned commit.
-- Patch: `postgres-invocation-lease.patch` is applied with `git apply` before the build. It keeps
+- Source: `git clone --branch v2.8.0` in its own layer, then the build fails unless `HEAD` is the pinned commit. `GIT_TERMINAL_PROMPT=0` keeps a credential prompt from hanging CI.
+- Patch: `postgres-invocation-lease.patch` is applied with `git apply --check` and then `git apply`, so a patch edit does not download wasmCloud again. The build also requires `release_store_lease` in `http_p3.rs`. The patch keeps
   one postgres connection for the invocation across `BEGIN` / `COMMIT` / `ROLLBACK`, and releases
   that lease when the HTTP call finishes, including when the guest stops before `COMMIT`.
   Queries outside a transaction keep upstream's bounded row channel. A query on the leased
@@ -24,8 +24,7 @@ links `wasi:tls/client,types@0.3.0-draft` alongside the default interfaces.
 - Toolchain: Rust 1.96.0 (what `rust-toolchain.toml` pins at the tag), `cargo build --locked`.
 - Runtime: the same Chainguard `wolfi-base` + `git` layout as upstream's image, binary at
   `/usr/local/bin/wash`, entrypoint `wash`. Base images are pinned by digest.
-- User: `65532:65532` by default. The hostgroup Deployment already sets uid/gid 65532, a read-only root
-  filesystem, `HOME=/tmp`, and writable `/tmp` and `/oci-cache` volumes, so the image needs nothing else.
+- User: `65532:65532`, `HOME=/tmp`, workdir `/tmp`. The hostgroup Deployment sets the same uid/gid, a read-only root filesystem, `HOME=/tmp`, and writable `/tmp` and `/oci-cache` volumes. The image build runs `wash --version` as that user and fails if wolfi cannot execute the binary.
 
 ## Build
 
