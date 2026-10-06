@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -39,6 +39,30 @@ describe('publish workspace packs', () => {
 
     expect(workspacePackageDirs(root)).toEqual(['packages/ok']);
     expect(missingPackedEntries(['dist'], packPaths(join(root, 'packages', 'ok')))).toEqual([]);
+  });
+
+  test('publishes the cloudflare adapter with the other public packages', () => {
+    const rootDir = join(import.meta.dir, '..');
+    const root = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf8')) as {
+      version: string;
+    };
+    const published = workspacePackageDirs(rootDir).flatMap((directory) => {
+      const pkg = JSON.parse(readFileSync(join(rootDir, directory, 'package.json'), 'utf8')) as {
+        name: string;
+        version: string;
+        private?: boolean;
+      };
+      return pkg.private === true ? [] : [`${pkg.name}@${pkg.version}`];
+    });
+
+    expect(published).toContain(`@di-framework/cloudflare@${root.version}`);
+    expect(published.sort()).toEqual([
+      `@di-framework/bindings@${root.version}`,
+      `@di-framework/cloudflare@${root.version}`,
+      `@di-framework/cloudfoundry@${root.version}`,
+      `@di-framework/platform@${root.version}`,
+      `@di-framework/sqlite-component@${root.version}`,
+    ]);
   });
 
   test('sqlite component pack contains the wasm provider', () => {

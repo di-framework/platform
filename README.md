@@ -1,6 +1,6 @@
 # di-framework/platform
 
-Operated wasmCloud platform for di-framework. This repository publishes the cluster installer, application guest bindings, the SQLite provider component, and the Cloud Foundry adapter.
+Operated wasmCloud platform for di-framework. This repository publishes the cluster installer, application guest bindings, the SQLite provider component, and the Cloud Foundry and Cloudflare adapters.
 
 User-facing CLI commands live in `di-framework/cli-extensions` (`@di-framework/cli-plugin-platform`).
 
@@ -15,6 +15,7 @@ First publish from this remote is **6.0.0**.
 | [`platform/sqlite-component`](platform/sqlite-component/README.md) | `@di-framework/sqlite-component` | `di-framework:sqlite@0.1.0` provider component |
 | [`platform/backup-agent`](platform/backup-agent/README.md) | `@di-framework/backup-agent` | Job image that dumps and restores backing services |
 | [`platform/backup-destination`](platform/backup-destination/README.md) | `@di-framework/backup-destination` | Tenant-namespace Helm operator and HTML console |
+| [`adapters/cloudflare`](adapters/cloudflare/README.md) | `@di-framework/cloudflare` | Cloudflare Workers binding discovery and injection |
 | [`adapters/cloudfoundry`](adapters/cloudfoundry/README.md) | `@di-framework/cloudfoundry` | `VCAP_SERVICES` and `VCAP_APPLICATION` discovery |
 
 ## Develop
@@ -29,7 +30,7 @@ bun run lint
 bun run typecheck
 ```
 
-`bun test` builds `@di-framework/platform`, `@di-framework/bindings`, and `@di-framework/cloudfoundry` before the test run. Build the SQLite provider from its package:
+`bun test` builds `@di-framework/platform`, `@di-framework/bindings`, `@di-framework/cloudfoundry`, and `@di-framework/cloudflare` before the test run. Build the SQLite provider from its package:
 
 ```sh
 cd platform/sqlite-component
@@ -133,6 +134,14 @@ Default loopback ports are Kubernetes `26443`, registry `25000`, and HTTP `28180
 `@di-framework/platform/existing` installs the same Kubernetes resources on a caller-owned cluster. `kubeconfig` is a required local file path. `di-framework-kube` uses this entrypoint. Call `createPlatform({ provider, installation })` when another program already owns the cluster and the Pulumi stack.
 
 The CLI and kube share one project, backend, and stack for a given installation. Configuration keys, CRDs, admission, and backing-service contracts are in the [platform README](platform/platform/README.md).
+
+### Cloudflare Workers
+
+```sh
+bun add @di-framework/cloudflare
+```
+
+`@EnableCloudflareBindings()` and `@CloudflareBinding('BINDING_NAME')` inject Worker bindings. Call `setCloudflareBindings(env)` from the fetch handler before resolving services; the binding object is not available at module startup. Built-in classifiers cover KV, D1, R2, Durable Object namespaces, queues, service bindings, Workers AI, Hyperdrive, Vectorize, and Analytics Engine. Wrangler config supplies kinds whose host objects look alike, including assets, email, and Secrets Store. Outside Workers the connector reads `CLOUDFLARE_BINDINGS`. `WorkersAiChatModel` and `WorkersAiEmbeddingModel` from `@di-framework/ai` accept the AI binding, and `VectorizeVectorStore` accepts the Vectorize binding. Examples are in the [Cloudflare README](adapters/cloudflare/README.md).
 
 ### Cloud Foundry
 

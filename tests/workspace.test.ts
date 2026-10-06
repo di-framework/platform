@@ -6,4 +6,5 @@ test('platform workspace publishes the cluster package and guests', () => {
   expect(existsSync('platform/bindings/package.json')).toBe(true);
   expect(existsSync('platform/sqlite-component/Makefile')).toBe(true);
   expect(existsSync('adapters/cloudfoundry/package.json')).toBe(true);
+  expect(existsSync('adapters/cloudflare/package.json')).toBe(true);
 });

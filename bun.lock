@@ -13,9 +13,21 @@
         "typescript": "^5.9.3",
       },
     },
+    "adapters/cloudflare": {
+      "name": "@di-framework/cloudflare",
+      "version": "6.0.6",
+      "devDependencies": {
+        "@di-framework/core": "^5",
+        "@types/bun": "latest",
+      },
+      "peerDependencies": {
+        "@di-framework/core": "^5",
+        "typescript": "^5",
+      },
+    },
     "adapters/cloudfoundry": {
       "name": "@di-framework/cloudfoundry",
-      "version": "6.0.2",
+      "version": "6.0.6",
       "devDependencies": {
         "@di-framework/core": "^5",
         "@types/bun": "latest",
@@ -27,11 +39,11 @@
     },
     "platform/backup-agent": {
       "name": "@di-framework/backup-agent",
-      "version": "6.0.2",
+      "version": "6.0.6",
     },
     "platform/backup-destination": {
       "name": "@di-framework/backup-destination",
-      "version": "6.0.2",
+      "version": "6.0.6",
       "dependencies": {
         "@pulumi/kubernetes": "4.34.0",
         "@pulumi/pulumi": "3.261.0",
@@ -39,7 +51,7 @@
     },
     "platform/bindings": {
       "name": "@di-framework/bindings",
-      "version": "6.0.2",
+      "version": "6.0.6",
       "devDependencies": {
         "@di-framework/core": "^5",
         "@types/bun": "latest",
@@ -51,7 +63,7 @@
     },
     "platform/platform": {
       "name": "@di-framework/platform",
-      "version": "6.0.2",
+      "version": "6.0.6",
       "dependencies": {
         "@pulumi/command": "1.2.1",
         "@pulumi/kubernetes": "4.34.0",
@@ -65,7 +77,7 @@
     },
     "platform/sqlite-component": {
       "name": "@di-framework/sqlite-component",
-      "version": "6.0.2",
+      "version": "6.0.6",
     },
   },
   "packages": {
@@ -92,6 +104,8 @@
     "@di-framework/backup-destination": ["@di-framework/backup-destination@workspace:platform/backup-destination"],
 
     "@di-framework/bindings": ["@di-framework/bindings@workspace:platform/bindings"],
+
+    "@di-framework/cloudflare": ["@di-framework/cloudflare@workspace:adapters/cloudflare"],
 
     "@di-framework/cloudfoundry": ["@di-framework/cloudfoundry@workspace:adapters/cloudfoundry"],
 
