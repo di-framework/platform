@@ -1,0 +1,56 @@
+{
+  "name": "@di-framework/cloudflare",
+  "version": "6.0.6",
+  "description": "Cloudflare Workers connector for binding discovery, wrangler config, and automated DI injection.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "module": "./dist/index.js",
+  "type": "module",
+  "license": "(MIT OR Apache-2.0)",
+  "author": "@di-framework Contributors",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/di-framework/platform",
+    "directory": "adapters/cloudflare"
+  },
+  "bugs": {
+    "url": "https://github.com/di-framework/platform/issues"
+  },
+  "homepage": "https://github.com/di-framework/platform",
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "bindings",
+    "kv",
+    "d1",
+    "r2",
+    "wrangler",
+    "dependency-injection",
+    "decorators",
+    "connectors"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "build": "rm -rf dist && bun x tsc -p tsconfig.build.json"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "bun": "./dist/index.js",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "peerDependencies": {
+    "@di-framework/core": "^5",
+    "typescript": "^5"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "devDependencies": {
+    "@di-framework/core": "^5",
+    "@types/bun": "latest"
+  }
+}
