@@ -4,6 +4,7 @@ import {
   isCloudflare,
   isCloudflarePages,
   isCloudflareWorkers,
+  readProcessEnv,
 } from '../src/detector.ts';
 
 describe('CloudflareDetector', () => {
@@ -45,5 +46,11 @@ describe('CloudflareDetector', () => {
       if (original === undefined) delete process.env.CF_PAGES;
       else process.env.CF_PAGES = original;
     }
+  });
+
+  it('uses an empty env when the runtime has no process', () => {
+    expect(readProcessEnv({})).toEqual({});
+    expect(CloudflareDetector.isPages(readProcessEnv({}))).toBe(false);
+    expect(isCloudflare({}, readProcessEnv({}))).toBe(false);
   });
 });

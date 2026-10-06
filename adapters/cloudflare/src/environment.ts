@@ -1,4 +1,4 @@
-import { CloudflareDetector, type CloudflareRuntimeScope } from './detector';
+import { CloudflareDetector, type CloudflareRuntimeScope, readProcessEnv } from './detector';
 import { type BindingClassifierRegistry, getDefaultRegistry } from './spi/registry';
 import type {
   AiBindingInfo,
@@ -45,7 +45,7 @@ export class CloudflareEnvironment {
 
   constructor(options: CloudflareEnvironmentOptions = {}) {
     this.options = options;
-    this.env = options.env ?? process.env;
+    this.env = options.env ?? readProcessEnv();
     this.scope = options.scope ?? globalThis;
     this.registry = options.registry ?? getDefaultRegistry();
     this.secretNames = new Set(options.secretNames ?? []);

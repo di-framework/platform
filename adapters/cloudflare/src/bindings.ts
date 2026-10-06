@@ -1,4 +1,5 @@
 import { useContainer } from '@di-framework/core/container';
+import { readProcessEnv } from './detector';
 import { CloudflareEnvironment, setCloudflareBindings } from './environment';
 import type { BindingClassifierRegistry } from './spi/registry';
 import type {
@@ -71,7 +72,7 @@ export function lookupCloudflareBinding(
   const found = env.getBinding(name);
   if (found) return found;
 
-  const fallback = readFallbackEnv(options.fallbackEnv, options.env ?? process.env);
+  const fallback = readFallbackEnv(options.fallbackEnv, options.env ?? readProcessEnv());
   if (fallback) {
     return { name, kind: 'var' as const, binding: fallback };
   }
