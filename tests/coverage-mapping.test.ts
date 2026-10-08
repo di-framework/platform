@@ -31,6 +31,8 @@ describe('coverage badge mapping', () => {
       '@di-framework/cloudfoundry',
       '@di-framework/platform',
       '@di-framework/sqlite-component',
+      '@di-framework/tenant-auth',
+      '@di-framework/tenant-cli',
     ]);
     expect(packages.map((pkg) => pkg.slug)).toEqual([
       'backup-agent',
@@ -40,6 +42,8 @@ describe('coverage badge mapping', () => {
       'cloudfoundry',
       'platform',
       'sqlite-component',
+      'tenant-auth',
+      'tenant-cli',
     ]);
     expect(packages.find((pkg) => pkg.slug === 'platform')?.relPath).toBe('platform/platform');
     expect(packages.find((pkg) => pkg.slug === 'cloudfoundry')?.relPath).toBe(
