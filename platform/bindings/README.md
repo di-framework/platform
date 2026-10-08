@@ -67,7 +67,8 @@ Keep an invariant in one statement:
 - `INSERT … SELECT … WHERE NOT EXISTS`
 
 `run` sets `changes` from the rows returned. The provider does not report a command tag, so a
-count is a `RETURNING` list.
+count is a `RETURNING` list. A `changes` value of `0` means no rows came back, which is what an
+`UPDATE` or `DELETE` without `RETURNING` reports even when Postgres modified rows.
 
 `exec` sends its script as one `queryBatch`. The host runs that string on one pooled client, and
 Postgres treats a multi-statement simple query as one implicit transaction.
