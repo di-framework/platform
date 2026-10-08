@@ -12,21 +12,39 @@ import {
   CliError,
   type Credential,
   load,
+  needsRefresh,
   readStore,
   resolveAccount,
   writeStore,
 } from './credentials.ts';
 import { init } from './init.ts';
+import {
+  authorizationUrl,
+  discover,
+  exchangeCode,
+  OidcError,
+  pkce,
+  randomToken,
+  refreshTokens,
+  revokeToken,
+  type TokenResponse,
+} from './oidc.ts';
 
 export interface Io {
   stdout(line: string): void;
   stderr(line: string): void;
   /** Standard input, read whole; used by `--from-file -`. */
   stdin(): string;
+  /** Opens a URL in the user's browser; `main.ts` spawns the platform opener. */
+  open(url: string): void;
   env: NodeJS.ProcessEnv;
   cwd: string;
   fetch?: typeof fetch;
+  /** How long `login` waits for the browser to come back; five minutes by default. */
+  loginTimeoutMs?: number;
 }
+
+const SCOPE = 'openid profile email offline_access';
 
 export interface Parsed {
   command: string;
@@ -116,19 +134,126 @@ function print(io: Io, flags: Record<string, string>, value: unknown, line: (v: 
   io.stdout(flags.json === 'true' ? JSON.stringify(value, null, 2) : line(value as never));
 }
 
-/** Resolves the credential on disk for the account and builds a client with its bearer. */
-function session(
+/**
+ * Resolves the credential on disk for the account, refreshing an identity token that is about to
+ * expire, and builds a client with its bearer.
+ */
+async function session(
   flags: Record<string, string>,
   io: Io,
-): { credential: Credential; client: TenantClient } {
-  const account = resolveAccount(flags.account, io.env, readStore(io.env));
-  const credential = load(account, io.env);
+): Promise<{ credential: Credential; client: TenantClient }> {
+  const store = readStore(io.env);
+  const account = resolveAccount(flags.account, io.env, store);
+  let credential = load(account, io.env);
+  if (needsRefresh(credential)) {
+    credential = await refresh(credential, io);
+    store[account] = credential;
+    writeStore(store, io.env);
+  }
   const client = createClient({
     baseUrl: credential.controller.url,
     token: bearer(credential),
     fetch: io.fetch,
   });
   return { credential, client };
+}
+
+/** The refresh grant at the issuer, with the public client id; identity rotates the token. */
+async function refresh(credential: Credential, io: Io): Promise<Credential> {
+  if (!credential.issuer || !credential.clientId || !credential.refreshToken) {
+    throw new CliError('the login cannot be refreshed; run login again');
+  }
+  const metadata = await discover(credential.issuer, io.fetch);
+  let tokens: TokenResponse;
+  try {
+    tokens = await refreshTokens(
+      metadata,
+      { clientId: credential.clientId, refreshToken: credential.refreshToken },
+      io.fetch,
+    );
+  } catch (error) {
+    if (error instanceof OidcError) {
+      throw new CliError(`the login has expired (${error.message}); run login again`);
+    }
+    throw error;
+  }
+  return { ...credential, ...issued(tokens, credential.refreshToken) };
+}
+
+function issued(tokens: TokenResponse, previousRefresh?: string) {
+  return {
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token ?? previousRefresh,
+    expiresAt: new Date(Date.now() + tokens.expires_in * 1000).toISOString(),
+  };
+}
+
+const page = (text: string, status = 200) =>
+  new Response(
+    `<!doctype html><title>di-tenant</title><p style="font:16px system-ui;padding:24px">${text}</p>`,
+    { status, headers: { 'content-type': 'text/html' } },
+  );
+
+/**
+ * RFC 8252 browser login: a loopback listener on a free port is the redirect URI, the browser
+ * signs in at the issuer, and the code comes back with the PKCE verifier, no client secret.
+ */
+async function browserLogin(
+  info: { account: string; issuer: string; clientId: string },
+  flags: Record<string, string>,
+  io: Io,
+): Promise<TokenResponse> {
+  const metadata = await discover(info.issuer, io.fetch);
+  const { verifier, challenge } = await pkce();
+  const state = randomToken(16);
+  const { promise, resolve, reject } = Promise.withResolvers<string>();
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch(request) {
+      const url = new URL(request.url);
+      if (url.pathname !== '/callback') return page('Not found.', 404);
+      const refused = url.searchParams.get('error');
+      if (refused) {
+        reject(new CliError(`the identity server refused the login: ${refused}`));
+        return page('Login failed. Return to the terminal.', 400);
+      }
+      const code = url.searchParams.get('code');
+      if (!code || url.searchParams.get('state') !== state) {
+        reject(new CliError('the browser returned an unexpected login response'));
+        return page('Login failed. Return to the terminal.', 400);
+      }
+      resolve(code);
+      return page('Signed in. You can close this window and return to the terminal.');
+    },
+  });
+  const redirectUri = `http://127.0.0.1:${server.port}/callback`;
+  try {
+    const url = authorizationUrl(metadata, {
+      clientId: info.clientId,
+      redirectUri,
+      scope: SCOPE,
+      state,
+      nonce: randomToken(16),
+      codeChallenge: challenge,
+    });
+    io.stderr(
+      `Opening your browser to sign in to ${info.account} at ${info.issuer}.\nIf it does not open, visit:\n  ${url}`,
+    );
+    if (flags['no-browser'] !== 'true') io.open(url);
+    const timer = setTimeout(
+      () => reject(new CliError('timed out waiting for the browser login')),
+      io.loginTimeoutMs ?? 300_000,
+    );
+    const code = await promise.finally(() => clearTimeout(timer));
+    return await exchangeCode(
+      metadata,
+      { clientId: info.clientId, redirectUri, code, codeVerifier: verifier },
+      io.fetch,
+    );
+  } finally {
+    await server.stop();
+  }
 }
 
 async function login(flags: Record<string, string>, io: Io): Promise<number> {
@@ -138,25 +263,28 @@ async function login(flags: Record<string, string>, io: Io): Promise<number> {
     throw new CliError(`${controller} serves account ${info.account}, not ${flags.account}`);
   }
   const apiKey = flags['api-key'];
-  if (!apiKey) {
-    io.stderr(
-      `Browser login against ${info.issuer} (client ${info.clientId}) is not implemented in the pilot yet; pass --api-key, or log in with the tenant-auth CLI to seed the credential.`,
-    );
-    return 2;
-  }
-  const who = await createClient({ baseUrl: controller, token: apiKey, fetch: io.fetch }).whoami();
-  const credential: Credential = {
+  const tokens = apiKey ? undefined : await browserLogin(info, flags, io);
+  const token = apiKey ?? (tokens as TokenResponse).access_token;
+  const who = await createClient({ baseUrl: controller, token, fetch: io.fetch }).whoami();
+  const base = {
     account: info.account,
     user: who.user,
     role: who.role,
-    via: 'api-key',
-    apiKey,
     controller: { url: controller },
   };
+  const credential: Credential = apiKey
+    ? { ...base, via: 'api-key', apiKey }
+    : {
+        ...base,
+        via: 'identity',
+        issuer: info.issuer,
+        clientId: info.clientId,
+        ...issued(tokens as TokenResponse),
+      };
   const store = readStore(io.env);
   store[info.account] = credential;
   writeStore(store, io.env);
-  io.stderr(`Logged in to ${info.account} as ${who.user} (${who.role}) via api-key.`);
+  io.stderr(`Logged in to ${info.account} as ${who.user} (${who.role}) via ${credential.via}.`);
   return 0;
 }
 
@@ -167,6 +295,10 @@ export async function run(argv: string[], io: Io): Promise<number> {
     if (error instanceof CliError) {
       io.stderr(error.message);
       return error.exitCode;
+    }
+    if (error instanceof OidcError) {
+      io.stderr(`identity: ${error.message}`);
+      return 1;
     }
     if ((error as ControllerError).name === 'ControllerError') {
       const failure = error as ControllerError;
@@ -187,16 +319,35 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
     case 'login':
       return login(flags, io);
     case 'logout': {
-      const { credential, client } = session(flags, io);
-      await client.logout();
+      // Tell the controller first, while the token is still valid, then revoke the refresh token
+      // at the issuer, then forget the credential. A failure anywhere still forgets it.
       const store = readStore(io.env);
-      delete store[credential.account];
+      const account = resolveAccount(flags.account, io.env, store);
+      const credential = load(account, io.env);
+      try {
+        await createClient({
+          baseUrl: credential.controller.url,
+          token: bearer(credential),
+          fetch: io.fetch,
+        }).logout();
+      } catch {
+        // An expired or already revoked token; nothing to tell the controller.
+      }
+      if (credential.via === 'identity' && credential.refreshToken && credential.issuer) {
+        await revokeToken(
+          await discover(credential.issuer, io.fetch),
+          credential.clientId ?? '',
+          credential.refreshToken,
+          io.fetch,
+        );
+      }
+      delete store[account];
       writeStore(store, io.env);
-      io.stderr(`Logged out of ${credential.account}.`);
+      io.stderr(`Logged out of ${account}.`);
       return 0;
     }
     case 'whoami': {
-      const { client } = session(flags, io);
+      const { client } = await session(flags, io);
       const who = await client.whoami();
       print(io, flags, who, () => `${who.user} (${who.role}) in ${who.account} via ${who.via}`);
       return 0;
@@ -206,7 +357,7 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
       const env = requireEnv(flags);
       const bundle = JSON.parse(readFileSync(requireFlag(flags, 'bundle'), 'utf8')) as DeployBundle;
       bundle.env = env;
-      const { client } = session(flags, io);
+      const { client } = await session(flags, io);
       if (sub === 'preview') {
         const plan = await client.previewDeploy(bundle);
         print(io, flags, plan, () =>
@@ -226,7 +377,7 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
       return 0;
     }
     case 'logs': {
-      const { client } = session(flags, io);
+      const { client } = await session(flags, io);
       const stream = client.logs(requireFlag(flags, 'service'), {
         env: requireEnv(flags),
         deployment: flags.deployment,
@@ -260,7 +411,7 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
         schedule: flags.schedule,
         command: flags.command?.split(' '),
       };
-      const { client } = session(flags, io);
+      const { client } = await session(flags, io);
       const service = await client.createService(request);
       print(
         io,
@@ -272,7 +423,7 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
     }
     case 'deployments': {
       const env = requireEnv(flags);
-      const { client } = session(flags, io);
+      const { client } = await session(flags, io);
       if (sub === 'list') {
         const list = await client.deployments({ env, service: flags.service });
         print(io, flags, list, () =>
@@ -312,7 +463,7 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
     case 'secrets':
     case 'vars': {
       const env = requireEnv(flags);
-      const { client } = session(flags, io);
+      const { client } = await session(flags, io);
       const secret = command === 'secrets';
       if (sub === 'list') {
         const list = secret ? await client.secrets(env) : await client.vars(env);
@@ -342,7 +493,7 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
       return 0;
     }
     case 'proxy': {
-      const { client } = session(flags, io);
+      const { client } = await session(flags, io);
       const sessionInfo = await client.proxy(requireFlag(flags, 'service'), {
         env: requireEnv(flags),
         port: integer(flags, 'port'),

@@ -4,13 +4,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type Io, parseArgs, run, USAGE } from '../src/cli.ts';
 import { type Credential, readStore, writeStore } from '../src/credentials.ts';
+import { pkce } from '../src/oidc.ts';
 import { fakeFetch, type Recorded, sse } from './support/fake-fetch.ts';
+
+async function waitFor(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 200 && !condition(); i++) await new Promise((r) => setTimeout(r, 10));
+  if (!condition()) throw new Error('condition never held');
+}
 
 let scratch: string;
 let env: NodeJS.ProcessEnv;
 const out: string[] = [];
 const err: string[] = [];
 let stdin = '';
+const opened: string[] = [];
 
 const credential: Credential = {
   account: 'acme',
@@ -21,15 +28,33 @@ const credential: Credential = {
   controller: { url: 'https://controller.test' },
 };
 
-function io(fetch?: typeof globalThis.fetch): Io {
+function io(fetch?: typeof globalThis.fetch, loginTimeoutMs?: number): Io {
   return {
     stdout: (line) => out.push(line),
     stderr: (line) => err.push(line),
     stdin: () => stdin,
+    open: (url) => opened.push(url),
     env,
     cwd: scratch,
     fetch,
+    loginTimeoutMs,
   };
+}
+
+const issuer = {
+  issuer: 'https://issuer.test',
+  authorization_endpoint: 'https://issuer.test/oauth2/authorize',
+  token_endpoint: 'https://issuer.test/oauth2/token',
+  revocation_endpoint: 'https://issuer.test/oauth2/revoke',
+};
+
+/** The browser's part: follow the printed authorize URL back to the CLI's loopback callback. */
+async function browserReturns(query: Record<string, string>): Promise<Response> {
+  const authorize = new URL(opened.at(-1) as string);
+  const callback = new URL(authorize.searchParams.get('redirect_uri') as string);
+  const params = { state: authorize.searchParams.get('state') as string, ...query };
+  callback.search = new URLSearchParams(params).toString();
+  return fetch(callback);
 }
 
 const json = (value: unknown, status = 200) => Response.json(value, { status });
@@ -41,6 +66,7 @@ beforeEach(() => {
   out.length = 0;
   err.length = 0;
   stdin = '';
+  opened.length = 0;
   writeStore({ acme: credential }, env);
 });
 afterEach(() => rmSync(scratch, { recursive: true, force: true }));
@@ -83,7 +109,7 @@ describe('run', () => {
   test('login needs a controller, checks the account, and stores an API-key credential', async () => {
     const { fetch, calls } = fakeFetch({
       'GET /v1/auth/info': () =>
-        json({ account: 'acme', issuer: 'https://id.test', clientId: 'cli' }),
+        json({ account: 'acme', issuer: 'https://issuer.test', clientId: 'tenant-cli' }),
       'GET /v1/auth/whoami': () =>
         json({ user: 'bob', account: 'acme', role: 'viewer', via: 'api-key' }),
     });
@@ -96,8 +122,6 @@ describe('run', () => {
       ),
     ).toBe(1);
     expect(err.at(-1)).toContain('serves account acme, not beta');
-    expect(await run(['login', '--controller', 'https://controller.test'], io(fetch))).toBe(2);
-    expect(err.at(-1)).toContain('not implemented in the pilot yet');
     expect(
       await run(
         ['login', '--controller', 'https://controller.test', '--api-key', 'dik_new'],
@@ -107,14 +131,210 @@ describe('run', () => {
     expect(err.at(-1)).toBe('Logged in to acme as bob (viewer) via api-key.');
     expect(readStore(env).acme).toMatchObject({ user: 'bob', apiKey: 'dik_new', via: 'api-key' });
     expect(calls.at(-1)?.headers.authorization).toBe('Bearer dik_new');
+    expect(opened).toEqual([]);
   });
 
-  test('logout revokes at the controller and forgets the account', async () => {
-    const { fetch } = fakeFetch({ 'POST /v1/auth/logout': noContent });
+  test('login runs the PKCE browser flow against the issuer and stores the identity tokens', async () => {
+    let exchange: Recorded | undefined;
+    const { fetch, calls } = fakeFetch({
+      'GET /v1/auth/info': () =>
+        json({ account: 'acme', issuer: 'https://issuer.test', clientId: 'tenant-cli' }),
+      'GET /.well-known/openid-configuration': () => json(issuer),
+      'POST /oauth2/token': (call: Recorded) => {
+        exchange = call;
+        return json({
+          access_token: 'at-1',
+          token_type: 'Bearer',
+          expires_in: 600,
+          refresh_token: 'rt-1',
+          id_token: 'id',
+        });
+      },
+      'GET /v1/auth/whoami': () =>
+        json({ user: 'alice', account: 'acme', role: 'developer', via: 'identity' }),
+    });
+    const pending = run(['login', '--controller', 'https://controller.test'], io(fetch, 5_000));
+    await waitFor(() => opened.length === 1);
+    const authorize = new URL(opened[0] as string);
+    expect(authorize.origin + authorize.pathname).toBe('https://issuer.test/oauth2/authorize');
+    expect(authorize.searchParams.get('client_id')).toBe('tenant-cli');
+    expect(authorize.searchParams.get('scope')).toBe('openid profile email offline_access');
+    expect(authorize.searchParams.get('code_challenge_method')).toBe('S256');
+    expect(authorize.searchParams.get('redirect_uri')).toMatch(
+      /^http:\/\/127\.0\.0\.1:\d+\/callback$/,
+    );
+    expect(err.at(-1)).toContain('Opening your browser to sign in to acme at https://issuer.test');
+
+    const notFound = await fetch(
+      new URL('/other', authorize.searchParams.get('redirect_uri') as string).href,
+    );
+    expect(notFound.status).toBe(404);
+    const returned = await browserReturns({ code: 'the-code' });
+    expect(returned.status).toBe(200);
+    expect(await returned.text()).toContain('Signed in');
+    expect(await pending).toBe(0);
+    expect(err.at(-1)).toBe('Logged in to acme as alice (developer) via identity.');
+
+    // The code went to the token endpoint with the verifier that matches the challenge, no secret.
+    const form = exchange?.body as Record<string, string>;
+    expect(form).toMatchObject({
+      grant_type: 'authorization_code',
+      client_id: 'tenant-cli',
+      code: 'the-code',
+    });
+    expect(form.client_secret).toBeUndefined();
+    expect((await pkce(form.code_verifier)).challenge).toBe(
+      authorize.searchParams.get('code_challenge') as string,
+    );
+    expect(exchange?.headers.authorization).toBeUndefined();
+    expect(calls.find((call) => call.url.endsWith('/v1/auth/whoami'))?.headers.authorization).toBe(
+      'Bearer at-1',
+    );
+    expect(readStore(env).acme).toMatchObject({
+      via: 'identity',
+      user: 'alice',
+      accessToken: 'at-1',
+      refreshToken: 'rt-1',
+      issuer: 'https://issuer.test',
+      clientId: 'tenant-cli',
+    });
+    expect(Date.parse(readStore(env).acme?.expiresAt as string)).toBeGreaterThan(
+      Date.now() + 500_000,
+    );
+  });
+
+  test('login refuses a bad callback, a refusal, a timeout, and an unreachable issuer', async () => {
+    const { fetch } = fakeFetch({
+      'GET /v1/auth/info': () =>
+        json({ account: 'acme', issuer: 'https://issuer.test', clientId: 'tenant-cli' }),
+      'GET /.well-known/openid-configuration': () => json(issuer),
+    });
+    const bad = run(
+      ['login', '--controller', 'https://controller.test', '--no-browser'],
+      io(fetch, 5_000),
+    );
+    await waitFor(() => err.some((line) => line.includes('If it does not open')));
+    expect(opened).toEqual([]);
+    const url = new URL((err.at(-1) as string).split('\n').at(-1)?.trim() as string);
+    opened.push(url.toString());
+    const wrongState = await browserReturns({ code: 'x', state: 'forged' });
+    expect(wrongState.status).toBe(400);
+    expect(await bad).toBe(1);
+    expect(err.at(-1)).toBe('the browser returned an unexpected login response');
+
+    const refused = run(['login', '--controller', 'https://controller.test'], io(fetch, 5_000));
+    await waitFor(() => opened.length === 2);
+    expect((await browserReturns({ error: 'access_denied' })).status).toBe(400);
+    expect(await refused).toBe(1);
+    expect(err.at(-1)).toBe('the identity server refused the login: access_denied');
+
+    expect(await run(['login', '--controller', 'https://controller.test'], io(fetch, 50))).toBe(1);
+    expect(err.at(-1)).toBe('timed out waiting for the browser login');
+
+    const { fetch: down } = fakeFetch({
+      'GET /v1/auth/info': () =>
+        json({ account: 'acme', issuer: 'https://issuer.test', clientId: 'tenant-cli' }),
+      'GET /.well-known/openid-configuration': () => new Response('nope', { status: 503 }),
+    });
+    expect(await run(['login', '--controller', 'https://controller.test'], io(down))).toBe(1);
+    expect(err.at(-1)).toBe('identity: discovery at https://issuer.test answered 503');
+  });
+
+  test('an expiring identity login is refreshed before a command and failures ask for login', async () => {
+    const identity: Credential = {
+      ...credential,
+      via: 'identity',
+      apiKey: undefined,
+      accessToken: 'old',
+      refreshToken: 'rt-old',
+      expiresAt: new Date(Date.now() + 30_000).toISOString(),
+      issuer: 'https://issuer.test',
+      clientId: 'tenant-cli',
+    };
+    writeStore({ acme: identity }, env);
+    let grant: Recorded | undefined;
+    const { fetch, calls } = fakeFetch({
+      'GET /.well-known/openid-configuration': () => json(issuer),
+      'POST /oauth2/token': (call: Recorded) => {
+        grant = call;
+        return json({
+          access_token: 'new',
+          token_type: 'Bearer',
+          expires_in: 600,
+          refresh_token: 'rt-new',
+        });
+      },
+      'GET /v1/auth/whoami': () =>
+        json({ user: 'alice', account: 'acme', role: 'developer', via: 'identity' }),
+    });
+    expect(await run(['whoami'], io(fetch))).toBe(0);
+    expect(grant?.body).toEqual({
+      grant_type: 'refresh_token',
+      client_id: 'tenant-cli',
+      refresh_token: 'rt-old',
+    });
+    expect(calls.at(-1)?.headers.authorization).toBe('Bearer new');
+    expect(readStore(env).acme).toMatchObject({ accessToken: 'new', refreshToken: 'rt-new' });
+    // Fresh now: no second refresh.
+    expect(await run(['whoami'], io(fetch))).toBe(0);
+    expect(calls.filter((call) => call.url.endsWith('/oauth2/token'))).toHaveLength(1);
+
+    writeStore({ acme: identity }, env);
+    const { fetch: expired } = fakeFetch({
+      'GET /.well-known/openid-configuration': () => json(issuer),
+      'POST /oauth2/token': () => json({ error: 'invalid_grant' }, 400),
+    });
+    expect(await run(['whoami'], io(expired))).toBe(1);
+    expect(err.at(-1)).toBe(
+      'the login has expired (token endpoint refused the refresh_token grant: invalid_grant); run login again',
+    );
+
+    writeStore({ acme: { ...identity, issuer: undefined } }, env);
+    expect(await run(['whoami'], io(expired))).toBe(1);
+    expect(err.at(-1)).toBe('the login cannot be refreshed; run login again');
+
+    writeStore({ acme: identity }, env);
+    const broken = (async () => {
+      throw new TypeError('issuer unreachable');
+    }) as unknown as typeof globalThis.fetch;
+    await expect(run(['whoami'], io(broken))).rejects.toThrow('issuer unreachable');
+  });
+
+  test('logout tells the controller, revokes at the issuer, and forgets the account', async () => {
+    const { fetch, calls } = fakeFetch({ 'POST /v1/auth/logout': noContent });
     expect(await run(['logout'], io(fetch))).toBe(0);
     expect(readStore(env)).toEqual({});
+    expect(calls.map((call) => call.url)).toEqual(['https://controller.test/v1/auth/logout']);
     expect(await run(['whoami'], io(fetch))).toBe(1);
     expect(err.at(-1)).toContain('not logged in');
+
+    writeStore(
+      {
+        acme: {
+          ...credential,
+          via: 'identity',
+          apiKey: undefined,
+          accessToken: 'expired',
+          refreshToken: 'rt',
+          expiresAt: '2000-01-01T00:00:00Z',
+          issuer: 'https://issuer.test',
+          clientId: 'tenant-cli',
+        },
+      },
+      env,
+    );
+    const { fetch: issuerFetch, calls: issuerCalls } = fakeFetch({
+      'GET /.well-known/openid-configuration': () => json(issuer),
+      'POST /oauth2/revoke': noContent,
+    });
+    expect(await run(['logout'], io(issuerFetch))).toBe(0);
+    // The expired token skipped the controller; the refresh token was still revoked.
+    expect(issuerCalls.map((call) => `${call.method} ${new URL(call.url).pathname}`)).toEqual([
+      'GET /.well-known/openid-configuration',
+      'POST /oauth2/revoke',
+    ]);
+    expect(issuerCalls[1]?.body).toEqual({ token: 'rt', client_id: 'tenant-cli' });
+    expect(readStore(env)).toEqual({});
   });
 
   test('whoami prints a line or JSON', async () => {

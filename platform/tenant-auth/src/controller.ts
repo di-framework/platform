@@ -24,6 +24,8 @@ export interface ControllerConfig {
   tlsKey?: string;
   /** Lifetime of the ServiceAccount tokens the controller mints for itself to forward with. */
   tokenTtlSeconds: number;
+  /** The identity server's public native client that the tenant CLI logs in with. */
+  cliClientId: string;
 }
 
 export function configFromEnv(env = process.env): ControllerConfig {
@@ -43,6 +45,7 @@ export function configFromEnv(env = process.env): ControllerConfig {
     tlsCert: env.TENANT_CONTROLLER_TLS_CERT,
     tlsKey: env.TENANT_CONTROLLER_TLS_KEY,
     tokenTtlSeconds: Number(env.TENANT_CONTROLLER_TOKEN_TTL ?? 3600),
+    cliClientId: env.TENANT_CONTROLLER_CLI_CLIENT_ID ?? 'tenant-cli',
   };
 }
 
@@ -155,6 +158,14 @@ export class Controller {
   async handle(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === '/-/healthz') return json({ ok: true, tenant: this.config.tenant });
+    // The one public operation of the `/v1` contract: what a CLI needs before it has a credential.
+    if (request.method === 'GET' && url.pathname === '/v1/auth/info') {
+      return json({
+        account: this.config.tenant,
+        issuer: this.provider.issuer,
+        clientId: this.config.cliClientId,
+      });
+    }
     let principal: Principal;
     try {
       principal = await this.identity.resolve(request.headers.get('authorization'));
@@ -176,7 +187,8 @@ export class Controller {
       return status(502, 'ServiceUnavailable', 'the identity provider or cluster is unavailable');
     }
     try {
-      if (url.pathname.startsWith('/-/')) return await this.own(request, url, principal);
+      if (url.pathname.startsWith('/-/') || url.pathname.startsWith('/v1/'))
+        return await this.own(request, url, principal);
       return await this.proxy(request, url, principal);
     } catch (error) {
       if (error instanceof AuthError)
@@ -195,7 +207,14 @@ export class Controller {
 
   private async own(request: Request, url: URL, principal: Principal): Promise<Response> {
     const route = `${request.method} ${url.pathname}`;
-    if (route === 'GET /-/whoami') return json(principal);
+    if (route === 'GET /-/whoami' || route === 'GET /v1/auth/whoami') return json(principal);
+    // The CLI revokes its identity token at the issuer itself; the controller only drops its caches.
+    if (route === 'POST /v1/auth/logout') {
+      this.serviceAccountTokens.delete(principal.user);
+      this.identity.forget(principal.user);
+      this.audit('logout', { user: principal.user, via: principal.via });
+      return new Response(null, { status: 204 });
+    }
     if (route === 'GET /-/keys')
       return json({ keys: await listApiKeys(this.keys, principal.user) });
     if (route === 'POST /-/keys') {

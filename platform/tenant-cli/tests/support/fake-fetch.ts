@@ -20,7 +20,12 @@ export function fakeFetch(
       method: init?.method ?? 'GET',
       url,
       headers,
-      body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined,
+      body:
+        typeof init?.body === 'string'
+          ? JSON.parse(init.body)
+          : init?.body instanceof URLSearchParams
+            ? Object.fromEntries(init.body)
+            : undefined,
     };
     calls.push(recorded);
     const key = `${recorded.method} ${new URL(url).pathname}`;

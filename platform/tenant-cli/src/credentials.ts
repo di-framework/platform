@@ -17,8 +17,18 @@ export interface Credential {
   apiKey?: string;
   /** Access token expiry; absent for API keys. */
   expiresAt?: string;
+  /** Where an identity login refreshes and revokes: the issuer and the public client id. */
+  issuer?: string;
+  clientId?: string;
   controller: { url: string; certificateAuthorityData?: string };
   console?: string;
+}
+
+/** True when an identity token is gone or within a minute of expiring, so it must be refreshed. */
+export function needsRefresh(credential: Credential, now = Date.now()): boolean {
+  if (credential.via !== 'identity' || !credential.refreshToken) return false;
+  if (!credential.accessToken) return true;
+  return credential.expiresAt !== undefined && Date.parse(credential.expiresAt) - now <= 60_000;
 }
 
 export type CredentialStore = Record<string, Credential>;

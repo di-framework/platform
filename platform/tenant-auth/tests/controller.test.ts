@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { allowed, tenantNamespaces } from '../src/controller.ts';
+import { allowed, Controller, configFromEnv, tenantNamespaces } from '../src/controller.ts';
+import { AuthError } from '../src/identity.ts';
 
 describe('controller path policy', () => {
   const t = 'acme';
@@ -37,5 +38,63 @@ describe('controller path policy', () => {
     ['GET', '/-/keys'],
   ])('refuses %s %s', (method, path) => {
     expect(allowed(method, path, t)).toBe(false);
+  });
+});
+
+describe('v1 auth routes', () => {
+  const principal = {
+    user: 'alice',
+    account: 'acme',
+    role: 'developer' as const,
+    via: 'identity' as const,
+    credentialId: 'sub-1',
+  };
+  const forgotten: string[] = [];
+  const controller = new Controller(
+    { ...configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme' }), cliClientId: 'tenant-cli' },
+    {} as never,
+    { issuer: 'https://issuer.test' } as never,
+    {
+      resolve: async (authorization: string | null) => {
+        if (authorization !== 'Bearer ok') throw new AuthError(401, 'a bearer token is required');
+        return principal;
+      },
+      forget: (user: string) => {
+        forgotten.push(user);
+      },
+    } as never,
+    {} as never,
+  );
+  const call = (method: string, path: string, authorization?: string) =>
+    controller.handle(
+      new Request(`https://controller.test${path}`, {
+        method,
+        headers: authorization ? { authorization } : {},
+      }),
+    );
+
+  test('info is public and names the account, issuer, and CLI client', async () => {
+    const response = await call('GET', '/v1/auth/info');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      account: 'acme',
+      issuer: 'https://issuer.test',
+      clientId: 'tenant-cli',
+    });
+    expect(configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme' }).cliClientId).toBe('tenant-cli');
+    expect(
+      configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme', TENANT_CONTROLLER_CLI_CLIENT_ID: 'x' })
+        .cliClientId,
+    ).toBe('x');
+  });
+
+  test('whoami and logout take the bearer', async () => {
+    expect((await call('GET', '/v1/auth/whoami')).status).toBe(401);
+    const who = await call('GET', '/v1/auth/whoami', 'Bearer ok');
+    expect(await who.json()).toEqual(principal);
+    const logout = await call('POST', '/v1/auth/logout', 'Bearer ok');
+    expect(logout.status).toBe(204);
+    expect(forgotten).toEqual(['alice']);
+    expect((await call('GET', '/v1/other', 'Bearer ok')).status).toBe(404);
   });
 });
