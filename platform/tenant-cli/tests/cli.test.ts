@@ -298,6 +298,15 @@ describe('run', () => {
       throw new TypeError('issuer unreachable');
     }) as unknown as typeof globalThis.fetch;
     await expect(run(['whoami'], io(broken))).rejects.toThrow('issuer unreachable');
+
+    writeStore({ acme: identity }, env);
+    const { fetch: dropped } = fakeFetch({
+      'GET /.well-known/openid-configuration': () => json(issuer),
+      'POST /oauth2/token': () => {
+        throw new TypeError('connection reset');
+      },
+    });
+    await expect(run(['whoami'], io(dropped))).rejects.toThrow('connection reset');
   });
 
   test('logout tells the controller, revokes at the issuer, and forgets the account', async () => {
