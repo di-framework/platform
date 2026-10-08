@@ -75,8 +75,10 @@ Postgres treats a multi-statement simple query as one implicit transaction.
 
 `atomicBatch` is for a write-only sequence that must commit or roll back together and that does
 not read between statements. It renders each parameter as a literal (quotes doubled, a negative
-number parenthesized so it cannot form a `--` comment) and submits one `BEGIN; …; COMMIT`
-string. wasmCloud v2.8.0 runs that string on one pooled client:
+number parenthesized so it cannot form a `--` comment) and submits that script as one
+`queryBatch`. The script has no `BEGIN` or `COMMIT`. Postgres runs a multi-statement simple
+query as one implicit transaction and rolls it back on error, returning the pooled client idle.
+wasmCloud v2.8.0 runs that string on one pooled client:
 `crates/wash-runtime/src/plugin/wasmcloud_postgres/async_p3.rs` checks out a single client in
 `query_batch` and calls `client.batch_execute` (`batch_with_client`, line 191).
 

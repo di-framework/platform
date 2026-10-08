@@ -32,9 +32,11 @@ export interface AutocommitDatabase extends SqlDatabase {
    * Writes `statements` as one transaction and returns no rows.
    *
    * Parameters are rendered as SQL literals and the text is submitted as a single
-   * `queryBatch` string: `BEGIN; …; COMMIT`. A quote is doubled. A negative number
-   * is parenthesized so it cannot form a `--` comment. Do not use this when a later
-   * statement must read an earlier one.
+   * `queryBatch` string. The string has no `BEGIN`, `COMMIT`, or `ROLLBACK`.
+   * Postgres treats that multi-statement simple query as one implicit transaction
+   * and rolls it back on error, so the pooled client returns idle. A quote is
+   * doubled. A negative number is parenthesized so it cannot form a `--` comment.
+   * Do not use this when a later statement must read an earlier one.
    *
    * The whole string runs on one pooled client. wasmCloud v2.8.0 (commit
    * `5c4ec4a3d008b3f401d9e763515f434deebc9936`, the wash revision this platform
@@ -44,8 +46,8 @@ export interface AutocommitDatabase extends SqlDatabase {
    * (line 190) calls `client.batch_execute` with that string (line 191). The named
    * import does the same (`query_batch`, line 407; `id.client()`, line 412;
    * `batch_with_client`, line 416). `crates/provider-sqldb-postgres` is not in that
-   * tag. The invocation-lease patch does not split this string: a multi-statement
-   * batch is not a `BEGIN` boundary, so it still reaches one `batch_execute`.
+   * tag. The invocation-lease patch does not split this string, so it still
+   * reaches one `batch_execute`.
    */
   atomicBatch(statements: readonly AtomicStatement[]): Promise<void>;
 }
