@@ -1,0 +1,28 @@
+{
+  "name": "@di-framework/pglite-component",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Postgres wire-protocol provider component (di-framework:pglite@0.1.0) for platform guests.",
+  "license": "(MIT OR Apache-2.0)",
+  "author": "@di-framework Contributors",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/di-framework/platform",
+    "directory": "platform/pglite-component"
+  },
+  "bugs": {
+    "url": "https://github.com/di-framework/platform/issues"
+  },
+  "homepage": "https://github.com/di-framework/platform",
+  "files": [
+    "dist",
+    "README.md",
+    "wit"
+  ],
+  "scripts": {
+    "build": "make build",
+    "test": "bun test",
+    "smoke": "make smoke",
+    "publish-asset": "make publish-asset"
+  }
+}

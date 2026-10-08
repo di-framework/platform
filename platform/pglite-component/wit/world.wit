@@ -1,0 +1,178 @@
+package di-framework:pglite@0.1.0;
+
+/// Types shared by the `database` interface.
+///
+/// Mirrors `di-framework:sqlite/types` on purpose so consumers can switch
+/// between the SQLite and PGlite providers with minimal code changes:
+/// same `value`/`row`/`error` shapes, same connection lifecycle
+/// (`open`/`query`/`run`/`exec`/`first`/transactions/`close`).
+/// Differences from SQLite are documented on the affected items.
+interface types {
+  /// A structured error reported by Postgres itself.
+  record pg-error {
+    /// SQLSTATE code (e.g. `23505` = unique_violation).
+    /// SQLite reports numeric result codes instead.
+    code: string,
+    /// Human-readable message from the server.
+    message: string,
+  }
+
+  /// Errors raised by functions in this package. Intentionally non-exhaustive:
+  /// consumers must keep a catch-all arm.
+  variant error {
+    /// The server could not be reached or the handshake failed. For this
+    /// provider `path` is interpreted as described on `database.open`.
+    open-failed(string),
+    /// The connection has been closed with `close` and cannot be used again.
+    closed,
+    /// The statement could not be prepared or executed: syntax error, unknown
+    /// table or column. Only single statements are accepted by `run`/`query`/`first`
+    /// (unlike `exec`, which allows `;`-separated batches like the SQLite provider).
+    invalid-sql(string),
+    /// Wrong number of parameters or a value that could not be bound.
+    /// Parameters bind positionally to `$1`, `$2`, ... (not `?`/`?NNN`).
+    invalid-params(string),
+    /// Postgres reported an error while executing the statement (constraint
+    /// violation, undefined table, ...). Branch on `pg-error.code` (SQLSTATE)
+    /// for machine-readable handling.
+    execution-failed(pg-error),
+    /// A column value could not be converted into a `value`.
+    value-conversion-failed(string),
+    /// The server closed the connection or it is otherwise unusable.
+    /// Re-`open` to recover.
+    connection-lost(string),
+    /// `begin`, `commit`, `rollback` (or a savepoint call) was issued in a
+    /// state that does not permit it (e.g. `commit` with no open transaction).
+    invalid-transaction-state(string),
+    /// Any other implementation-specific failure.
+    other(string),
+  }
+
+  /// A dynamically-typed value, used for parameters and results.
+  /// Identical to the SQLite provider plus `boolean`: Postgres has a native
+  /// boolean type and the text encoding (`t`/`f`) is lossy without it.
+  variant value {
+    null,
+    integer(s64),
+    real(f64),
+    text(string),
+    blob(list<u8>),
+    boolean(bool),
+  }
+
+  /// A result row: `(column-name, value)` pairs in column order.
+  type row = list<tuple<string, value>>;
+
+  /// Options accepted by `open`. Every field is optional; `none` means the
+  /// documented default.
+  record open-options {
+    /// Database name for the session. Default: `template1`.
+    database: option<string>,
+    /// Statement timeout in milliseconds. Default: none.
+    statement-timeout-ms: option<u32>,
+  }
+}
+
+/// Synchronous Postgres access over the Postgres wire protocol.
+///
+/// The implementer of this interface is the `di-framework:pglite` provider
+/// component. It holds no database engine itself: it speaks pgwire to a
+/// server address (in dev, the native PGlite sidecar; in prod, any
+/// Postgres-compatible endpoint) and translates between wire messages
+/// and these WIT types.
+///
+/// `open` takes a connection target instead of a file path:
+/// `path` is `host:port` or `host:port/database`, e.g.
+/// `192.168.40.230:5433/template1`. The host must be reachable from the
+/// provider component (its loopback is isolated under `wash dev`, so the
+/// sidecar binds a host-reachable address).
+interface database {
+  use types.{error, value, row, open-options};
+
+  /// Connect and run the pgwire handshake (with MD5/Cleartext password from
+  /// the provider configuration when the server requests it).
+  open: func(path: string, options: option<open-options>) -> result<connection, error>;
+
+  /// The server version string, e.g. `17.5`.
+  server-version: func() -> result<string, error>;
+
+  /// An open Postgres connection (one pgwire session). Dropping the resource
+  /// closes it; an open transaction is rolled back by the server in that case.
+  resource connection {
+    /// Execute one or more `;`-separated statements and discard any results.
+    /// Intended for DDL / migrations. Untrusted input must never be
+    /// interpolated into `sql`.
+    exec: func(sql: string) -> result<_, error>;
+
+    /// Execute a single parameterized statement and return the number of rows
+    /// affected (the `CommandComplete` tag count). Parameters bind positionally
+    /// to `$1`, `$2`, ...
+    run: func(sql: string, params: list<value>) -> result<u64, error>;
+
+    /// Execute a single parameterized statement and return all rows.
+    query: func(sql: string, params: list<value>) -> result<list<row>, error>;
+
+    /// Execute a single parameterized statement and return only the first row,
+    /// or `none` when the statement produced no rows.
+    first: func(sql: string, params: list<value>) -> result<option<row>, error>;
+
+    /// `BEGIN`. Fails with `invalid-transaction-state` if a transaction is
+    /// already open on this connection; nest with `savepoint` instead.
+    begin: func() -> result<_, error>;
+
+    /// `COMMIT` the open transaction.
+    commit: func() -> result<_, error>;
+
+    /// `ROLLBACK` the open transaction.
+    rollback: func() -> result<_, error>;
+
+    /// `SAVEPOINT <name>`; usable for nested transactions. `name` must match
+    /// `[A-Za-z_][A-Za-z0-9_]*`.
+    savepoint: func(name: string) -> result<_, error>;
+
+    /// `RELEASE SAVEPOINT <name>`.
+    release-savepoint: func(name: string) -> result<_, error>;
+
+    /// `ROLLBACK TO SAVEPOINT <name>` followed by `RELEASE`, so the savepoint
+    /// is fully unwound.
+    rollback-to-savepoint: func(name: string) -> result<_, error>;
+
+    /// True while a transaction (or savepoint) is open on this connection.
+    /// Tracked client-side from `begin`/`commit`/`rollback` calls.
+    in-transaction: func() -> bool;
+
+    /// Rows affected by the most recent `run`/`exec` on this connection.
+    rows-affected: func() -> u64;
+
+    /// Explicitly close the connection. Subsequent calls fail with `closed`.
+    close: func() -> result<_, error>;
+  }
+}
+
+/// The world implemented by the provider component.
+/// Kept symmetric with the sqlite-component: `types` is exported explicitly
+/// so the component is self-contained for `wac plug`.
+///
+/// Besides the exports, the provider imports what it needs to reach the
+/// server: TCP sockets for pgwire, and the environment for its own
+/// configuration (`PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD` defaults — the
+/// per-link `path` overrides host, port, and database).
+world pglite-provider {
+  import wasi:sockets/network@0.2.0;
+  import wasi:sockets/instance-network@0.2.0;
+  import wasi:sockets/tcp@0.2.0;
+  import wasi:sockets/tcp-create-socket@0.2.0;
+  import wasi:sockets/ip-name-lookup@0.2.0;
+  import wasi:cli/environment@0.2.0;
+  import wasi:cli/stderr@0.2.0;
+  export types;
+  export database;
+}
+
+/// The world a consumer targets when it wants a Postgres database.
+/// `wac plug` satisfies these imports with the `pglite-provider`
+/// component's exports.
+world imports {
+  import types;
+  import database;
+}
