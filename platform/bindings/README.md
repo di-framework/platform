@@ -46,6 +46,52 @@ connection and the selected database; multiple independently credentialed Postgr
 bindings are not supported by this QuickJS path yet. Guests initialize before the
 application, including bindings constructed at module startup.
 
+## Transaction semantics
+
+`wasmcloud:postgres@0.2.0` has `query` and `queryBatch`, and no transaction handle. Each call goes
+to whichever pooled connection is free. A named import (`user-database-query`) is served from a
+per-credential pool with no connection affinity, so a `BEGIN` in one call does not cover the next
+statement. A `COMMIT` can land on a connection that never saw the `BEGIN`, and that connection
+stays `idle in transaction`.
+
+Guests that use `@di-framework/repo` open the binding with `openPostgresDatabase` from
+`@di-framework/bindings/postgres`. The handle is an `AutocommitDatabase`. Every statement is its
+own transaction, and `transaction(fn)` runs `fn` on that same handle. The adapter never sends
+`BEGIN`, `COMMIT`, or `ROLLBACK`. `FOR UPDATE` and advisory locks last only for the statement
+that carries them.
+
+Keep an invariant in one statement:
+
+- a conditional `UPDATE … RETURNING`
+- a data-modifying CTE
+- `INSERT … SELECT … WHERE NOT EXISTS`
+
+`run` sets `changes` from the rows returned. The provider does not report a command tag, so a
+count is a `RETURNING` list.
+
+`exec` sends its script as one `queryBatch`. The host runs that string on one pooled client, and
+Postgres treats a multi-statement simple query as one implicit transaction.
+
+`atomicBatch` is for a write-only sequence that must commit or roll back together and that does
+not read between statements. It renders each parameter as a literal (quotes doubled, a negative
+number parenthesized so it cannot form a `--` comment) and submits one `BEGIN; …; COMMIT`
+string. wasmCloud v2.8.0 runs that string on one pooled client:
+`crates/wash-runtime/src/plugin/wasmcloud_postgres/async_p3.rs` checks out a single client in
+`query_batch` and calls `client.batch_execute` (`batch_with_client`, line 191).
+
+```ts
+import { openPostgresDatabase } from '@di-framework/bindings/postgres';
+
+const db = openPostgresDatabase(database);
+await db.atomicBatch([
+  { sql: 'INSERT INTO t (name, n) VALUES (?, ?)', params: ["o'brien", -1] },
+]);
+```
+
+`@di-framework/repo` is an optional peer of this package. The main `@di-framework/bindings` entry
+leaves it unloaded. Import `@di-framework/bindings/postgres` from a guest that depends on
+`@di-framework/repo`.
+
 Secret material is referenced, never inlined:
 
 ```ts
