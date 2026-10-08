@@ -52,11 +52,20 @@ There is no token argument. Secret and var values come from `--from-file` or std
 stay out of shell history. `init` writes a minimal di-framework seed and creates no platform
 resources.
 
+## Login
+
+`login --controller <url>` asks the controller's one public operation (`GET /v1/auth/info`) for
+the account, the identity issuer, and the public client id, then runs the RFC 8252 flow: a
+loopback listener on a free port is the redirect URI, the browser signs in at the issuer, and the
+code comes back with the PKCE verifier and `client_id` only, no secret. The identity server must
+register that client (`AUTH_CLI_CLIENT_ID`; loopback redirects match on any port). The tokens are
+stored under `$DI_FRAMEWORK_HOME/credentials.json` with the issuer and client id; a token within a
+minute of expiry is refreshed before the next command, and `logout` revokes the refresh token at
+the issuer and tells the controller. `--api-key` skips the browser; `--no-browser` prints the URL
+instead of opening it.
+
 ## What the pilot does not do yet
 
-- Browser login against the identity server (PKCE) and token refresh: `login` takes `--api-key`;
-  a credential written by `../tenant-auth`'s CLI (same `$DI_FRAMEWORK_HOME/credentials.json`)
-  also works.
 - Building the component and rendering the bundle: `deploy` sends a bundle file. The CLI-side
   build that produces it is shared with `cli-plugin-platform` and is the next step.
 - The controller: every operation answers 501. `../tenant-auth`'s controller grows the
