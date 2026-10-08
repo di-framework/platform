@@ -64,7 +64,16 @@ export interface ShieldBadgeJson {
  */
 export const UNMEASURED_PACKAGES: Record<string, string> = {};
 
-const SKIP_DIRECTORIES = new Set(['node_modules', 'dist', 'coverage', '.git', '.tools', 'target']);
+// `.di-framework` is the CLI's generated-assets and plugin cache (gitignored), not a package.
+const SKIP_DIRECTORIES = new Set([
+  'node_modules',
+  'dist',
+  'coverage',
+  '.git',
+  '.tools',
+  'target',
+  '.di-framework',
+]);
 
 let indexedPackages: PackageInfo[] = [];
 let indexedRoot = '';

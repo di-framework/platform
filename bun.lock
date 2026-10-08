@@ -94,6 +94,17 @@
         "@types/js-yaml": "4.0.9",
       },
     },
+    "platform/tenant-cli": {
+      "name": "@di-framework/tenant-cli",
+      "version": "0.0.0",
+      "bin": {
+        "di-tenant": "src/main.ts",
+      },
+      "dependencies": {
+        "@di-framework/core": "^6.0.3",
+        "@di-framework/http": "^6.0.3",
+      },
+    },
   },
   "packages": {
     "@biomejs/biome": ["@biomejs/biome@2.5.14", "", { "optionalDependencies": { "@biomejs/cli-darwin-arm64": "2.5.14", "@biomejs/cli-darwin-x64": "2.5.14", "@biomejs/cli-linux-arm64": "2.5.14", "@biomejs/cli-linux-arm64-musl": "2.5.14", "@biomejs/cli-linux-x64": "2.5.14", "@biomejs/cli-linux-x64-musl": "2.5.14", "@biomejs/cli-win32-arm64": "2.5.14", "@biomejs/cli-win32-x64": "2.5.14" }, "bin": { "biome": "bin/biome" } }, "sha512-0FabLIjd4M/dm8VFI86RMaLLdgepzbdfiAL2R8cr7V81OYYrP1w7Z73KfAwPK5h9SrEBXTzNG2y+mBwPo9xRnw=="],
@@ -126,6 +137,8 @@
 
     "@di-framework/core": ["@di-framework/core@5.3.7", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-1pprg25XRk7uCErGPJI9i11uAKafwShxMhJ4XuW+hxQQQgXegBWVVGMRDNHV5XguFoRCAP77+VxnP1OaWuNqGw=="],
 
+    "@di-framework/http": ["@di-framework/http@6.0.5", "", { "dependencies": { "itty-router": "^5.0.22" }, "peerDependencies": { "@di-framework/core": "^6", "typescript": "^5" } }, "sha512-8LcguW3te2EYDgMfyRuL8g2C80zZgZeJwRhN4fe2hjLLm/6GzAQ/0Qh5W6/nptOpX85FogBwVw7j+GF3d1nGuQ=="],
+
     "@di-framework/platform": ["@di-framework/platform@workspace:platform/platform"],
 
     "@di-framework/repo": ["@di-framework/repo@6.0.5", "", { "peerDependencies": { "@di-framework/core": "^6", "typescript": "^5" } }, "sha512-bUblSkWK/4cIKT78ZN4gkfdpGRf+0xg5oyhKOCuyKmGgTSBVsGLeEqXU7/Df2XFaguXvYp37fnxBQFNBqIMsVA=="],
@@ -133,6 +146,8 @@
     "@di-framework/sqlite-component": ["@di-framework/sqlite-component@workspace:platform/sqlite-component"],
 
     "@di-framework/tenant-auth": ["@di-framework/tenant-auth@workspace:platform/tenant-auth"],
+
+    "@di-framework/tenant-cli": ["@di-framework/tenant-cli@workspace:platform/tenant-cli"],
 
     "@gar/promise-retry": ["@gar/promise-retry@1.0.3", "", {}, "sha512-GmzA9ckNokPypTg10pgpeHNQe7ph+iIKKmhKu3Ob9ANkswreCx7R3cKmY781K8QK3AqVL3xVh9A42JvIAbkkSA=="],
 
@@ -362,6 +377,8 @@
 
     "isexe": ["isexe@2.0.0", "", {}, "sha512-RHxMLp9lnKHGHRng9QFhRCMbYAcVpn69smSGcq3f36xjgVVWThj4qqLbTLlq7Ssj8B+fIQ1EuCEGI2lKsyQeIw=="],
 
+    "itty-router": ["itty-router@5.0.24", "", {}, "sha512-PXij1qGKtE6jg3dLgrTRdh/Frovl5Wc4Av67sD2xfhDPrgNt4u79++/il8/c/OfZGkhD/8uYJub8tjo+H165rA=="],
+
     "jackspeak": ["jackspeak@4.2.3", "", { "dependencies": { "@isaacs/cliui": "^9.0.0" } }, "sha512-ykkVRwrYvFm1nb2AJfKKYPr0emF6IiXDYUaFx4Zn9ZuIH7MrzEZ3sD5RlqGXNRpHtvUHJyOnCEFxOlNDtGo7wg=="],
 
     "js-yaml": ["js-yaml@4.3.2", "", { "dependencies": { "argparse": "^2.0.1" }, "bin": { "js-yaml": "bin/js-yaml.js" } }, "sha512-SFNOvSJ+Dgf/9An904Yx+CgSlIPCkIpao4qo51lpee25TIRejdH3rhR4EZMGoNx3/TP3O+wzWuiTFl4sqbltzA=="],
@@ -547,6 +564,10 @@
     "yargs": ["yargs@17.7.3", "", { "dependencies": { "cliui": "^8.0.1", "escalade": "^3.1.1", "get-caller-file": "^2.0.5", "require-directory": "^2.1.1", "string-width": "^4.2.3", "y18n": "^5.0.5", "yargs-parser": "^21.1.1" } }, "sha512-GZtjxm/J/4TSxuL3FNYjCmLktBTnIw/rVmKSIyKeYAZpmJB2ig9VauCC5xsa82GNKVKDAqpOn3KVzNt0zmrU0g=="],
 
     "yargs-parser": ["yargs-parser@21.1.1", "", {}, "sha512-tVpsJW7DdjecAiFpbIB1e3qxIQsE6NoPc5/eTdrbbIC4h0LVsWhnoa3g+m2HclBIujHzsxZ4VJVA+GUuc2/LBw=="],
+
+    "@di-framework/http/@di-framework/core": ["@di-framework/core@6.0.5", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-ukkAGQfzJlOpebow8+qqgSFuqJHCXubsFraKLGpS1wOYmhKzNrvCFXRVr3iAfK1pC+8WcCjkc6qXXLA/aZKi+Q=="],
+
+    "@di-framework/tenant-cli/@di-framework/core": ["@di-framework/core@6.0.5", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-ukkAGQfzJlOpebow8+qqgSFuqJHCXubsFraKLGpS1wOYmhKzNrvCFXRVr3iAfK1pC+8WcCjkc6qXXLA/aZKi+Q=="],
 
     "@npmcli/git/ini": ["ini@6.0.0", "", {}, "sha512-IBTdIkzZNOpqm7q3dRqJvMaldXjDHWkEDfrwGEQTs5eaQMWV+djAhR+wahyNNMAa+qpbDUhBMVt4ZKNwpPm7xQ=="],
 

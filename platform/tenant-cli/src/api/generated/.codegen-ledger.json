@@ -1,0 +1,17 @@
+{
+  "version": "1",
+  "generatedFiles": [
+    "src/api/generated/auth/v1/contracts.ts",
+    "src/api/generated/auth/v1/http.ts",
+    "src/api/generated/deploy/v1/contracts.ts",
+    "src/api/generated/deploy/v1/http.ts",
+    "src/api/generated/deployments/v1/contracts.ts",
+    "src/api/generated/deployments/v1/http.ts",
+    "src/api/generated/secrets/v1/contracts.ts",
+    "src/api/generated/secrets/v1/http.ts",
+    "src/api/generated/services/v1/contracts.ts",
+    "src/api/generated/services/v1/http.ts",
+    "src/api/generated/vars/v1/contracts.ts",
+    "src/api/generated/vars/v1/http.ts"
+  ]
+}
