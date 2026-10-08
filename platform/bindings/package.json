@@ -36,11 +36,23 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
+    "./postgres": {
+      "types": "./dist/postgres/index.d.ts",
+      "bun": "./dist/postgres/index.js",
+      "import": "./dist/postgres/index.js",
+      "default": "./dist/postgres/index.js"
+    },
     "./catalog.json": "./catalog.json"
   },
   "peerDependencies": {
     "@di-framework/core": "^5",
+    "@di-framework/repo": "^6.0.4",
     "typescript": "^5"
+  },
+  "peerDependenciesMeta": {
+    "@di-framework/repo": {
+      "optional": true
+    }
   },
   "files": [
     "dist",
@@ -49,6 +61,7 @@
   ],
   "devDependencies": {
     "@di-framework/core": "^5",
+    "@di-framework/repo": "^6.0.4",
     "@types/bun": "latest"
   }
 }

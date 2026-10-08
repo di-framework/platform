@@ -54,12 +54,17 @@
       "version": "6.0.6",
       "devDependencies": {
         "@di-framework/core": "^5",
+        "@di-framework/repo": "^6.0.4",
         "@types/bun": "latest",
       },
       "peerDependencies": {
         "@di-framework/core": "^5",
+        "@di-framework/repo": "^6.0.4",
         "typescript": "^5",
       },
+      "optionalPeers": [
+        "@di-framework/repo",
+      ],
     },
     "platform/platform": {
       "name": "@di-framework/platform",
@@ -112,6 +117,8 @@
     "@di-framework/core": ["@di-framework/core@5.3.7", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-1pprg25XRk7uCErGPJI9i11uAKafwShxMhJ4XuW+hxQQQgXegBWVVGMRDNHV5XguFoRCAP77+VxnP1OaWuNqGw=="],
 
     "@di-framework/platform": ["@di-framework/platform@workspace:platform/platform"],
+
+    "@di-framework/repo": ["@di-framework/repo@6.0.5", "", { "peerDependencies": { "@di-framework/core": "^6", "typescript": "^5" } }, "sha512-bUblSkWK/4cIKT78ZN4gkfdpGRf+0xg5oyhKOCuyKmGgTSBVsGLeEqXU7/Df2XFaguXvYp37fnxBQFNBqIMsVA=="],
 
     "@di-framework/sqlite-component": ["@di-framework/sqlite-component@workspace:platform/sqlite-component"],
 
