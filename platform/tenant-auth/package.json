@@ -1,0 +1,24 @@
+{
+  "name": "@di-framework/tenant-auth",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "(MIT OR Apache-2.0)",
+  "description": "Prototype tenant auth broker: identity-server login, short-lived Kubernetes tokens, and tenant-scoped API keys.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/di-framework/platform",
+    "directory": "platform/tenant-auth"
+  },
+  "scripts": {
+    "start": "bun src/server.ts",
+    "cli": "bun src/cli.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "js-yaml": "4.3.2"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "4.0.9"
+  }
+}
