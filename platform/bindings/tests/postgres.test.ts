@@ -53,6 +53,61 @@ function rotatingGuest(
 
 const TRANSACTION_BOUNDARY = /^(BEGIN|COMMIT|ROLLBACK)\b/i;
 
+/**
+ * One pooled client on the simple-query protocol.
+ *
+ * `BEGIN` inside the batch string opens a transaction block. A later error skips
+ * the rest of the string, including `COMMIT`, and the client returns to the pool
+ * aborted. A multi-statement string with no transaction-control command is one
+ * implicit transaction: Postgres rolls it back on error and returns the client idle.
+ */
+function simpleQueryPool(): {
+  guest: PostgresGuest;
+  session: () => 'idle' | 'aborted';
+  batches: string[];
+} {
+  const state: { session: 'idle' | 'aborted' } = { session: 'idle' };
+  const batches: string[] = [];
+  const fail = (code: string, message: string): never => {
+    throw new Error(`PostgreSQL ${code} ${message}`);
+  };
+  const guest: PostgresGuest = {
+    async query() {
+      if (state.session === 'aborted') fail('25P02', 'current transaction is aborted');
+      return table(['one'], [[cell('1')]]);
+    },
+    async queryBatch(sql) {
+      batches.push(sql);
+      if (state.session === 'aborted') fail('25P02', 'current transaction is aborted');
+      const statements = sql
+        .split(';')
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0);
+      let explicit = false;
+      try {
+        for (const statement of statements) {
+          if (/^BEGIN\b/i.test(statement)) {
+            explicit = true;
+            continue;
+          }
+          if (/^(COMMIT|ROLLBACK)\b/i.test(statement)) {
+            explicit = false;
+            state.session = 'idle';
+            continue;
+          }
+          if (statement.includes("'dup'")) fail('23505', 'duplicate key value');
+        }
+        state.session = 'idle';
+      } catch (error) {
+        state.session = explicit ? 'aborted' : 'idle';
+        throw error;
+      }
+      return undefined;
+    },
+  };
+  return { guest, session: () => state.session, batches };
+}
+
 describe('bindParams', () => {
   const id = '11111111-1111-4111-8111-111111111111';
 
@@ -154,6 +209,22 @@ describe('autocommit adapter', () => {
 });
 
 describe('atomicBatch', () => {
+  it('returns the pooled connection idle when a statement fails', async () => {
+    const pool = simpleQueryPool();
+    const sql = openPostgresDatabase(pool.guest);
+    await expect(
+      sql.atomicBatch([
+        { sql: 'INSERT INTO t (id) VALUES (?)', params: ['a'] },
+        { sql: 'INSERT INTO t (id) VALUES (?)', params: ['dup'] },
+      ]),
+    ).rejects.toMatchObject({ code: '23505' });
+    expect(pool.session()).toBe('idle');
+    await expect(sql.query('SELECT 1')).resolves.toEqual([{ one: '1' }]);
+    expect(pool.batches).toEqual([
+      ["INSERT INTO t (id) VALUES ('a')", "INSERT INTO t (id) VALUES ('dup')"].join(';\n') + ';',
+    ]);
+  });
+
   it('escapes quotes and parenthesizes a negative integer', async () => {
     const { guest, calls } = rotatingGuest();
     const sql = openPostgresDatabase(guest);
@@ -164,12 +235,7 @@ describe('atomicBatch', () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.method).toBe('queryBatch');
     expect(calls[0]?.sql).toBe(
-      [
-        'BEGIN;',
-        "INSERT INTO note (body, n) VALUES ('o''brien', (-5));",
-        'SELECT x-(-1);',
-        'COMMIT',
-      ].join('\n'),
+      ["INSERT INTO note (body, n) VALUES ('o''brien', (-5))", 'SELECT x-(-1)'].join(';\n') + ';',
     );
     expect(calls[0]?.sql.includes('--')).toBe(false);
   });
@@ -195,8 +261,8 @@ describe('atomicBatch', () => {
     ]);
     expect(calls).toHaveLength(1);
     const batch = calls[0]?.sql ?? '';
-    expect(batch.startsWith('BEGIN;\n')).toBe(true);
-    expect(batch.endsWith(';\nCOMMIT')).toBe(true);
+    expect(batch.split('\n').some((line) => TRANSACTION_BOUNDARY.test(line))).toBe(false);
+    expect(batch.endsWith(';')).toBe(true);
     expect(batch).toContain('NULL');
     expect(batch).toContain('true');
     expect(batch).toContain('false');

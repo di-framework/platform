@@ -9,7 +9,12 @@ export type AtomicStatement = {
 };
 
 /**
- * Renders `statements` as one `BEGIN; …; COMMIT` script.
+ * Renders `statements` as one multi-statement simple query.
+ *
+ * There is no `BEGIN` or `COMMIT`. Postgres runs the string as one implicit
+ * transaction and rolls it back on error, returning the pooled client idle.
+ * An explicit `BEGIN` whose `COMMIT` is skipped would leave that client
+ * `idle in transaction (aborted)`.
  *
  * Literals use standard SQL quotes (`standard_conforming_strings`): a quote is
  * doubled, and a backslash is not an escape. A negative number is parenthesized
@@ -21,7 +26,9 @@ export function renderAtomicBatch(statements: readonly AtomicStatement[]): strin
   const rendered = statements.map((statement) =>
     renderStatement(statement.sql, statement.params ?? []),
   );
-  return `BEGIN;\n${rendered.join(';\n')};\nCOMMIT`;
+  // No BEGIN/COMMIT: a multi-statement simple query is one implicit transaction
+  // that Postgres rolls back on error without leaving the connection aborted.
+  return `${rendered.join(';\n')};`;
 }
 
 function renderStatement(sql: string, params: readonly unknown[]): string {
