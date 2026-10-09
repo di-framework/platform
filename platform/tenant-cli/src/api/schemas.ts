@@ -96,6 +96,35 @@ export const schemas = {
     required: ['env', 'service', 'component', 'workload', 'bindings', 'secrets'],
   },
 
+  RegistryInfo: {
+    type: 'object',
+    description:
+      "Where a tenant pushes and pulls images: the tenant's own OCI registry. Log in with an identity-server access token or API key as the Basic password.",
+    properties: {
+      url: {
+        type: 'string',
+        format: 'uri',
+        description:
+          "Origin of the tenant's OCI registry: scheme + host[:port], no path. Clients use its host[:port] for login and in image references; an http: origin means plain HTTP.",
+      },
+      repositoryPrefix: {
+        type: 'string',
+        description: 'Namespace inside the tenant registry, when there is one.',
+      },
+      auth: {
+        type: 'string',
+        enum: ['basic-identity'],
+        description:
+          'Basic auth whose password is an identity-server access token or dik_ API key.',
+      },
+      username: {
+        type: 'string',
+        description: 'A fixed hint for the Basic username; the registry ignores it.',
+      },
+    },
+    required: ['url', 'auth', 'username'],
+  },
+
   DeployChange: {
     type: 'object',
     properties: {

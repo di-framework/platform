@@ -32,6 +32,32 @@ Streaming operations (`logs`) are SSE: each `log` event's `data` is one `LogEven
 `end` closes the stream. The spec names this in the operation description; the framing itself is
 `src/client/sse.ts`.
 
+## Registry
+
+Each tenant gets its own OCI registry component in its namespace (platform#83, decision in
+platform#52). Nothing is minted: you log in to the registry with your own identity. Use your
+identity-server access token or a `dik_` API key as the Basic password (the username is ignored).
+The registry asks the tenant controller's `GET /v1/auth/whoami` who the caller is: a developer may
+push and pull, a viewer may only pull.
+
+`GET /v1/deploy/registry` (viewer or developer) returns `RegistryInfo`: the registry `url` (an
+origin: scheme + host[:port], no path), an optional `repositoryPrefix`, `auth` (`basic-identity`)
+and a fixed `username` hint. Until #55/#83 serve it, the endpoint answers 501.
+
+Log in against the host of `url`, not the full URL, then push to
+`<host>/<repositoryPrefix>/<name>:<tag>`:
+
+```text
+oras login <host>
+docker login <host>
+oras push <host>/<repositoryPrefix>/<name>:<tag> ...
+```
+
+An `http:` origin means plain HTTP: pass `oras --plain-http` or `wash --insecure`. The registry is
+expected over HTTPS through the gateway, since the Basic password is an identity credential.
+
+Identity access tokens expire, so a stored `docker login` stops working; a `dik_` API key suits CI.
+
 ## Commands
 
 ```text
