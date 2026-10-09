@@ -24,16 +24,7 @@ test('every contract operation declares a role policy, and a viewer is read-only
   }
   const viewer: string[] = OPERATIONS.filter((name) => permits(name, 'viewer')).sort();
   expect(viewer).toEqual(
-    [
-      'authInfo',
-      'whoami',
-      'logout',
-      'previewDeploy',
-      'logs',
-      'deployments',
-      'deploymentStats',
-      'vars',
-    ].sort(),
+    ['authInfo', 'whoami', 'logout', 'logs', 'deployments', 'deploymentStats', 'vars'].sort(),
   );
 });
 

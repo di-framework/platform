@@ -23,6 +23,8 @@ describe('/v1/deploy', () => {
   let refusal: { status: number; message: string } | undefined;
   /** Answers every request with 401, to show a rejected user token. */
   let rejectToken = false;
+  /** Answers the next PATCH with this response instead of applying it. */
+  let rawPatch: (() => Response) | undefined;
   const api = serve((request: Recorded) => {
     if (request.pathname.endsWith('/token'))
       return json({
@@ -36,6 +38,7 @@ describe('/v1/deploy', () => {
       const object = stored.get(request.pathname);
       return object ? json(object) : json({ message: 'not found' }, 404);
     }
+    if (rawPatch) return rawPatch();
     if (refusal) return json({ message: refusal.message }, refusal.status);
     const object = JSON.parse(request.body) as Json;
     const previous = stored.get(request.pathname);
@@ -78,6 +81,7 @@ describe('/v1/deploy', () => {
     api.requests.length = 0;
     refusal = undefined;
     rejectToken = false;
+    rawPatch = undefined;
   });
 
   const post = (path: string, body: unknown) =>
@@ -134,14 +138,12 @@ describe('/v1/deploy', () => {
     expect(log).toHaveBeenCalledWith(expect.stringContaining('"deploy.applied"'));
   });
 
-  test('injects the vars ConfigMap and every named secret into each guest environment', async () => {
+  test('sets each guest environment to only the vars ConfigMap and the named secrets', async () => {
     const bundle = deployBundle({ env: 'staging', secrets: ['API_TOKEN', 'db'] });
     const template = (bundle.workload.spec as { template: { spec: Json } }).template.spec;
+    const image = (template.components as Json[])[0]?.image;
     template.components = [
-      {
-        name: 'web',
-        localResources: { environment: { configFrom: [{ name: 'mine' }], config: { A: '1' } } },
-      },
+      { name: 'web', image, localResources: { environment: { config: { A: '1' } } } },
     ];
     template.service = { name: 'svc' };
     expect((await post('/v1/deploy', bundle)).status).toBe(202);
@@ -155,10 +157,11 @@ describe('/v1/deploy', () => {
     });
     expect(applied.spec.template.spec.components[0]).toEqual({
       name: 'web',
+      image,
       localResources: {
         environment: {
           config: { A: '1' },
-          configFrom: [{ name: 'mine' }, ...sources.configFrom],
+          configFrom: sources.configFrom,
           secretFrom: sources.secretFrom,
         },
       },
@@ -173,12 +176,12 @@ describe('/v1/deploy', () => {
     const bundle = deployBundle({
       bindings: [{ name: 'out', capability: 'egress', serviceName: 'api', config: {} }],
     });
-    bundle.workload.metadata = { name: 'web-prod', labels: { team: 'a' } };
+    bundle.workload.metadata = { name: 'web-prod', labels: { 'app.di-framework.dev/team': 'a' } };
     expect((await post('/v1/deploy', bundle)).status).toBe(202);
     const [binding, workload] = patches();
     expect((JSON.parse(binding?.body ?? '') as { spec: Json }).spec.workloadName).toBe('web-prod');
     expect((JSON.parse(workload?.body ?? '') as { metadata: Json }).metadata.labels).toEqual({
-      team: 'a',
+      'app.di-framework.dev/team': 'a',
       'di-framework.dev/service': 'web',
       'di-framework.dev/env': 'prod',
     });
@@ -210,7 +213,7 @@ describe('/v1/deploy', () => {
     ]);
 
     const relabelled = deployBundle();
-    relabelled.workload.metadata = { labels: { team: 'b' } };
+    relabelled.workload.metadata = { labels: { 'app.di-framework.dev/team': 'b' } };
     const third = await post('/v1/deploy/preview', relabelled);
     expect(((await third.json()) as { changes: Json[] }).changes[1]?.detail).toBe(
       'metadata.labels',
@@ -300,6 +303,78 @@ describe('/v1/deploy', () => {
     ],
     [{ secrets: ['bad-name'] }, 'secrets[0] must be a secret name'],
     [{ secrets: ['A', 'A'] }, 'secrets[1] repeats A'],
+    [
+      { workload: { spec: { template: { spec: { components: [] } } } } },
+      'workload.spec.template.spec.components must be a non-empty array of objects',
+    ],
+    [
+      { workload: { spec: { template: { spec: { components: ['web'] } } } } },
+      'workload.spec.template.spec.components must be a non-empty array of objects',
+    ],
+    [
+      {
+        workload: {
+          spec: { template: { spec: { components: [{ image: 'r@sha256:ab' }], service: 'svc' } } },
+        },
+      },
+      'workload.spec.template.spec.service must be an object',
+    ],
+    [
+      {
+        workload: {
+          spec: {
+            template: {
+              spec: {
+                components: [
+                  {
+                    image: 'r@sha256:ab',
+                    localResources: { environment: { secretFrom: [{ name: 'di-binding-x' }] } },
+                  },
+                ],
+              },
+            },
+          },
+        },
+      },
+      'workload.spec.template.spec.components[0].localResources.environment.secretFrom is set by the controller',
+    ],
+    [
+      {
+        workload: {
+          spec: {
+            template: {
+              spec: {
+                components: [{ image: 'r@sha256:ab' }],
+                service: { localResources: { environment: { configFrom: [] } } },
+              },
+            },
+          },
+        },
+      },
+      'workload.spec.template.spec.service.localResources.environment.configFrom is set by the controller',
+    ],
+    [
+      {
+        workload: {
+          spec: {
+            template: { spec: { components: [{ image: 'r:latest' }, { image: 'r@sha256:cd' }] } },
+          },
+        },
+      },
+      'workload does not run component.digest: no component image is pinned to it',
+    ],
+    [
+      { workload: { metadata: { finalizers: [] } } },
+      'workload.metadata.finalizers is not allowed; only labels and annotations pass through',
+    ],
+    [
+      { workload: { metadata: { labels: { 'app.di-framework.dev/a': 1 } } } },
+      'workload.metadata.labels must map strings to strings',
+    ],
+    [
+      { workload: { metadata: { annotations: { team: 'a' } } } },
+      'workload.metadata.annotations.team must start with app.di-framework.dev/',
+    ],
   ] as const)(
     'refuses an invalid bundle with 422 before any cluster call (%o)',
     async (overrides, detail) => {
@@ -325,13 +400,35 @@ describe('/v1/deploy', () => {
     }
   });
 
+  test.each([
+    ['a non-JSON 2xx body', () => new Response('not json', { status: 200 })],
+    [
+      'a connection reset mid-body',
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"kind":'));
+              controller.error(new Error('reset'));
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+    ],
+  ])('an apply response that cannot be read (%s) is a 502', async (_name, respond) => {
+    rawPatch = respond;
+    const response = await post('/v1/deploy', deployBundle({ bindings: [] }));
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({ status: 502 });
+  });
+
   test('a token the API server keeps rejecting is a 502', async () => {
     rejectToken = true;
     const response = await post('/v1/deploy', deployBundle({ bindings: [] }));
     expect(response.status).toBe(502);
   });
 
-  test('a preview read the API server refuses is passed through', async () => {
+  test('a token the API server rejects on a preview read is a 502', async () => {
     rejectToken = true;
     const response = await post('/v1/deploy/preview', deployBundle({ bindings: [] }));
     expect(response.status).toBe(502);

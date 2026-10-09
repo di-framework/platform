@@ -38,6 +38,8 @@ const CAPABILITIES = ['keyvalue', 'messaging', 'blobstore', 'postgres', 'egress'
 const DNS_LABEL = /^[a-z]([a-z0-9-]*[a-z0-9])?$/;
 const SECRET_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const KUBE_TIMEOUT_MS = 15_000;
+/** The only label and annotation keys a bundle may set on its workload. */
+const PASSTHROUGH_PREFIX = 'app.di-framework.dev/';
 
 const isObject = (value: unknown): value is Json =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -70,6 +72,20 @@ function invalid(bundle: DeployBundle): string | undefined {
     return `workload.apiVersion must be ${WORKLOAD_API}`;
   const metadata = workload.metadata;
   if (metadata !== undefined && !isObject(metadata)) return 'workload.metadata must be an object';
+  if (metadata) {
+    for (const key of Object.keys(metadata))
+      if (!['name', 'namespace', 'labels', 'annotations'].includes(key))
+        return `workload.metadata.${key} is not allowed; only labels and annotations pass through`;
+    for (const key of ['labels', 'annotations']) {
+      const map = metadata[key];
+      if (map === undefined) continue;
+      if (!isObject(map) || !Object.values(map).every((value) => typeof value === 'string'))
+        return `workload.metadata.${key} must map strings to strings`;
+      for (const name of Object.keys(map))
+        if (!name.startsWith(PASSTHROUGH_PREFIX))
+          return `workload.metadata.${key}.${name} must start with ${PASSTHROUGH_PREFIX}`;
+    }
+  }
   if (metadata?.namespace !== undefined)
     return 'workload.metadata.namespace is set by the controller';
   if (metadata?.name !== undefined && metadata.name !== `${service}-${env}`)
@@ -80,6 +96,28 @@ function invalid(bundle: DeployBundle): string | undefined {
   for (const field of ['hostSelector', 'environment', 'hostId'])
     if (template[field] !== undefined)
       return `workload.spec.template.spec.${field} is set by the controller`;
+  const components = template.components;
+  if (!Array.isArray(components) || components.length === 0 || !components.every(isObject))
+    return 'workload.spec.template.spec.components must be a non-empty array of objects';
+  const guests: [string, unknown][] = components.map((guest, index) => [
+    `components[${index}]`,
+    guest,
+  ]);
+  if (template.service !== undefined) guests.push(['service', template.service]);
+  for (const [at, guest] of guests) {
+    if (!isObject(guest)) return `workload.spec.template.spec.${at} must be an object`;
+    const local = guest.localResources;
+    const environment = isObject(local) ? local.environment : undefined;
+    for (const field of ['configFrom', 'secretFrom'])
+      if (isObject(environment) && environment[field] !== undefined)
+        return `workload.spec.template.spec.${at}.localResources.environment.${field} is set by the controller`;
+  }
+  if (
+    !components.some(
+      (guest) => typeof guest.image === 'string' && guest.image.endsWith(`@${component.digest}`),
+    )
+  )
+    return 'workload does not run component.digest: no component image is pinned to it';
   const seen = new Set<string>();
   for (const [index, binding] of bindings.entries()) {
     const at = `bindings[${index}]`;
@@ -101,21 +139,20 @@ function invalid(bundle: DeployBundle): string | undefined {
   return undefined;
 }
 
-/** Appends the vars and secrets sources to every guest's environment. */
+/** Sets every guest's vars and secrets sources to the controller's own; bundles cannot add any. */
 function inject(template: Json, sources: ReturnType<typeof configSources>): Json {
   const withSources = (guest: unknown) => {
     const target = guest as Json;
     const local = isObject(target.localResources) ? target.localResources : {};
     const environment = isObject(local.environment) ? local.environment : {};
-    const list = (value: unknown) => (Array.isArray(value) ? value : []);
     return {
       ...target,
       localResources: {
         ...local,
         environment: {
           ...environment,
-          configFrom: [...list(environment.configFrom), ...sources.configFrom],
-          secretFrom: [...list(environment.secretFrom), ...sources.secretFrom],
+          configFrom: sources.configFrom,
+          secretFrom: sources.secretFrom,
         },
       },
     };
@@ -192,23 +229,22 @@ async function apply(
   dryRun: boolean,
 ): Promise<KubeObject> {
   const target = `${path}?fieldManager=${FIELD_MANAGER}${dryRun ? '&dryRun=All' : ''}`;
-  let response: Response;
   try {
-    response = await user.fetch('PATCH', target, {
+    const response = await user.fetch('PATCH', target, {
       headers: { Accept: 'application/json', 'Content-Type': 'application/apply-patch+yaml' },
       // JSON is YAML, so the API server reads the object as an apply configuration.
       body: JSON.stringify(object),
       signal: AbortSignal.timeout(KUBE_TIMEOUT_MS),
     });
+    if (response.status === 401) {
+      await response.body?.cancel();
+      throw new KubeError(502, `PATCH ${path} rejected the user's token`);
+    }
+    return await readKubeResponse<KubeObject>('PATCH', path, response);
   } catch (error) {
     if (error instanceof KubeError) throw error;
     throw new KubeError(502, `PATCH ${path} failed: ${String(error)}`);
   }
-  if (response.status === 401) {
-    await response.body?.cancel();
-    throw new KubeError(502, `PATCH ${path} rejected the user's token`);
-  }
-  return readKubeResponse<KubeObject>('PATCH', path, response);
 }
 
 /** Reads the current object as the calling user; undefined when it does not exist yet. */

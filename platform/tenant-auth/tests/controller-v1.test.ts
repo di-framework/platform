@@ -227,20 +227,13 @@ describe('/v1 dispatch', () => {
 
   describe('role policy', () => {
     test.each([
-      ['GET', '/v1/deployments?env=prod', undefined, 501],
-      ['GET', '/v1/deployments/stats?env=prod', undefined, 501],
-      ['GET', '/v1/vars?env=prod', undefined, 501],
-      ['GET', '/v1/services/web/logs?env=prod', undefined, 501],
-      // Reaches the handler, whose bundle validation answers.
-      [
-        'POST',
-        '/v1/deploy/preview',
-        '{"env":"prod","service":"web","component":{"reference":"r","digest":"d"},"workload":{},"bindings":[],"secrets":[]}',
-        422,
-      ],
-    ])('a viewer may call %s %s', async (method, path, body, status) => {
+      ['GET', '/v1/deployments?env=prod', undefined],
+      ['GET', '/v1/deployments/stats?env=prod', undefined],
+      ['GET', '/v1/vars?env=prod', undefined],
+      ['GET', '/v1/services/web/logs?env=prod', undefined],
+    ])('a viewer may call %s %s', async (method, path, body) => {
       const response = await call(method, path, { body, bearer: 'viewer' });
-      expect(response.status).toBe(status);
+      expect(response.status).toBe(501);
     });
 
     test.each([
@@ -258,6 +251,12 @@ describe('/v1 dispatch', () => {
         '/v1/deploy',
         '{"env":"prod","service":"web","component":{"reference":"r","digest":"d"},"workload":{},"bindings":[],"secrets":[]}',
         'deploy',
+      ],
+      [
+        'POST',
+        '/v1/deploy/preview',
+        '{"env":"prod","service":"web","component":{"reference":"r","digest":"d"},"workload":{},"bindings":[],"secrets":[]}',
+        'previewDeploy',
       ],
     ])('a viewer is refused %s %s with 403 problem+json', async (method, path, body, operation) => {
       const response = await call(method, path, { body, bearer: 'viewer' });
