@@ -1,0 +1,17 @@
+# Rust build output
+/target/
+
+# Wash build artifacts
+build
+
+# Local dev blobstore state (wash dev)
+tmp/
+
+# Built artifacts are produced by `make build`; publish them via release
+# assets / OCI, not git.
+/dist/
+
+# Demo artifacts pushed/pulled by `wash oci` / `oras` during the walkthrough
+/component.wasm
+/oci_registry.wasm
+/out.wasm
