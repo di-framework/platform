@@ -115,11 +115,13 @@ fn is_cluster_local(authority: &str) -> bool {
         authority.split(':').next().unwrap_or("")
     };
     let host = host.to_ascii_lowercase();
-    host == "localhost"
-        || host == "::1"
-        || host.starts_with("127.")
-        || ((host.ends_with(".svc") || host.ends_with(".svc.cluster.local"))
-            && !host.starts_with('.'))
+    if host == "localhost" {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    (host.ends_with(".svc") || host.ends_with(".svc.cluster.local")) && !host.starts_with('.')
 }
 
 /// Map a 2xx whoami body to a role. The body must be the contract's
@@ -255,6 +257,10 @@ mod tests {
             "http://c.svc.example.com",
             "http://10.0.0.1:8788",
             "http://[::2]",
+            "http://127.attacker.example",
+            "http://127.0.0.1.nip.io",
+            "http://localhost.evil",
+            "http://127.attacker.example:8788",
         ] {
             assert_eq!(Target::parse(bad), None, "{bad}");
         }

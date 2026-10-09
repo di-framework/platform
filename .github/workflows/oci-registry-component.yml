@@ -23,6 +23,8 @@ env:
 jobs:
   publish:
     name: Push ghcr.io/di-framework/oci-registry
+    # Publish only from main, so a published digest always maps to reviewed code.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -36,6 +38,8 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install build tools
         run: bash platform/sqlite-component/scripts/install-tools.sh --rust
@@ -57,12 +61,17 @@ jobs:
       - name: Push the component
         id: push
         env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}        run: |
           set -euo pipefail
           echo "${GHCR_TOKEN}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
           cd platform/oci-registry/dist
-          echo '{}' > config.json
+          # The Wasm OCI config (oci-wasm WasmConfig, what wkg and wash write):
+          # created, architecture "wasm", os "wasip2" and the layer digests.
+          created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          layer="sha256:$(sha256sum di-framework-oci-registry.wasm | cut -d' ' -f1)"
+          jq -n --arg created "${created}" --arg layer "${layer}" \
+            '{created: $created, architecture: "wasm", os: "wasip2", layerDigests: [$layer]}' \
+            > config.json
           ref="ghcr.io/di-framework/oci-registry:${GITHUB_SHA}"
           oras push "${ref}" \
             --config config.json:application/vnd.wasm.config.v0+json \

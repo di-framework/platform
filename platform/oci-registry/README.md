@@ -151,12 +151,16 @@ host; there is no `wash dev` integration test against a stub controller yet.
 
 ### Publishing
 
-`.github/workflows/oci-registry-component.yml` is dispatch-only. It runs
-`make -C platform/oci-registry build` and pushes
-`dist/di-framework-oci-registry.wasm` to `ghcr.io/di-framework/oci-registry`
-as a canonical Wasm OCI artifact (config `application/vnd.wasm.config.v0+json`,
-layer `application/wasm`), tagged with the commit SHA. The job summary prints
-the manifest digest.
+`.github/workflows/oci-registry-component.yml` is dispatch-only and publishes
+only from `main`. It runs `make -C platform/oci-registry test build` and
+pushes `dist/di-framework-oci-registry.wasm` to
+`ghcr.io/di-framework/oci-registry` in the Wasm OCI layout that `wkg` and
+`wash oci push` produce: one `application/wasm` layer and an
+`application/vnd.wasm.config.v0+json` config carrying `created`,
+`architecture: "wasm"`, `os: "wasip2"` and `layerDigests`. The optional
+`component` (imports/exports) field is omitted. The image is tagged with the
+commit SHA, and the job summary prints the manifest digest. The workflow has
+not been run yet.
 
 Pin deployments by digest, never by tag:
 
