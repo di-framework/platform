@@ -45,6 +45,8 @@ jobs:
         run: make -C platform/pglite-component tools-rust build
 
       - name: Test
+        env:
+          PGLITE_REQUIRE_DIST: '1'
         run: bun test --coverage
 
       - name: Export coverage summary & Shields badge JSON

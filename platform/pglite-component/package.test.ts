@@ -8,8 +8,9 @@ const dist = join(pkgDir, 'dist');
 // `dist/` is gitignored and only produced by `make build` (Docker/Podman +
 // GBs for the PostgreSQL WASI engine). Skip artifact checks when it is absent
 // so contributors who did not touch this package still get green `bun test`.
-// Strict in CI: `CI` forces the checks to run (and fail if `dist/` is missing).
-const built = existsSync(join(dist, 'di-framework-pglite.wasm')) || !!process.env.CI;
+// Jobs that build this component set PGLITE_REQUIRE_DIST=1 to require artifacts.
+const built =
+  existsSync(join(dist, 'di-framework-pglite.wasm')) || process.env.PGLITE_REQUIRE_DIST === '1';
 
 describe('pglite-component package', () => {
   test.skipIf(!built)('dist artifacts exist and agree', () => {
