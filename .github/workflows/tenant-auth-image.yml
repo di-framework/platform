@@ -1,0 +1,77 @@
+# Publish the tenant-auth image (controller and console) to ghcr.io/di-framework/tenant-auth.
+# Dispatch-only, like the tenant host image. The build is a Bun bundle on a stock oven/bun base,
+# so a single ubuntu job builds both architectures: the build stage runs on the builder's
+# platform and the final stage only copies the platform-independent JavaScript (no emulation).
+# Auth is GITHUB_TOKEN with packages: write. No registry secret is stored.
+name: Publish tenant-auth image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-tenant-auth-image
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Push ghcr.io/di-framework/tenant-auth
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Require di-framework/platform
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY}" != "di-framework/platform" ]]; then
+            echo "::error::This workflow publishes ghcr.io/di-framework/tenant-auth and only runs in di-framework/platform"
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: platform/tenant-auth/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          provenance: true
+          push: true
+          tags: ghcr.io/di-framework/tenant-auth:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Record image digest
+        run: |
+          set -euo pipefail
+          digest="${{ steps.build.outputs.digest }}"
+          if [[ "${digest}" != sha256:* ]]; then
+            echo "::error::build did not return a digest"
+            exit 1
+          fi
+          ref="ghcr.io/di-framework/tenant-auth@${digest}"
+          echo "Published ${ref}"
+          {
+            echo "### Tenant-auth image"
+            echo
+            echo '```'
+            echo "${ref}"
+            echo '```'
+            echo
+            echo "Pin the controller and console Deployments to that digest. The ${GITHUB_SHA} tag is informational; only the digest is stable."
+          } >> "${GITHUB_STEP_SUMMARY}"
