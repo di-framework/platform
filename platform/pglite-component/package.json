@@ -1,6 +1,6 @@
 {
   "name": "@di-framework/pglite-component",
-  "version": "0.1.0",
+  "version": "6.0.9",
   "private": true,
   "description": "Embedded PostgreSQL component with persistent WASI storage and no TCP.",
   "license": "(MIT OR Apache-2.0)",
