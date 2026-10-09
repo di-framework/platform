@@ -125,6 +125,10 @@ gateway, which routes by `Host`. A redeploy with new code rolls both pods: the p
 carries a digest of the bundle, because a ConfigMap update alone leaves the running processes on
 the old code.
 
+`GET /v1/services/:service/logs` streams a service's projected log lines as server-sent events.
+Logs are scoped to the tenant namespace, not to an environment: `env` is accepted and ignored,
+because the log projection carries no environment label.
+
 Verified on `authproto` on 2026-10-09 with the guest from identity-server `main` (Argon2 in the
 composed `pqc-subtle` component) and the tenant CLI pilot in `platform/tenant-cli`:
 

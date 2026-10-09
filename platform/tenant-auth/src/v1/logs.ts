@@ -42,6 +42,10 @@ export const timing = {
   heartbeatMs: 15_000,
   backoffBaseMs: 1_000,
   backoffMaxMs: 30_000,
+  /** Bytes the SSE queue holds before it reports backpressure (`desiredSize <= 0`). */
+  queueBytes: 1 << 20,
+  /** Bytes queued for a client that stopped reading before the stream is ended. */
+  queueLimitBytes: 4 << 20,
 };
 
 const DEFAULT_TAIL = 100;
@@ -165,6 +169,9 @@ async function* watchEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<Wa
   }
 }
 
+/** Watch event types that show the watch is alive and advancing. */
+const PROGRESS = new Set(['ADDED', 'MODIFIED', 'DELETED', 'BOOKMARK']);
+
 const byTime = (a: LogEvent, b: LogEvent) =>
   a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0;
 
@@ -173,15 +180,15 @@ const listEvents = (list: ConfigMapList) => (list.items ?? []).flatMap(logEvents
 /** Resolves after `ms`, or as soon as the signal aborts. */
 const sleep = (ms: number, signal: AbortSignal) =>
   new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    signal.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(timer);
-        resolve();
-      },
-      { once: true },
-    );
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
   });
 
 function stream(
@@ -199,90 +206,114 @@ function stream(
     clearInterval(heartbeat);
     abort.abort();
   };
-  return new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const send = (text: string) => controller.enqueue(encoder.encode(text));
-      // Flushes the headers at once, even when the backlog is empty.
-      send(': connected\n\n');
-      const cursor = new Cursor();
-      const live = { ...options, tail: Number.MAX_SAFE_INTEGER };
-      /** Sends the selected events, then marks every event seen, sent or filtered out. */
-      const deliver = (events: LogEvent[], selected: LogEvent[]) => {
-        for (const event of selected) send(sse('log', event));
-        for (const event of events) cursor.sent(event);
-      };
-      const backlog = listEvents(first);
-      deliver(backlog, select(backlog, options));
-      if (!follow) {
-        send(sse('end'));
-        controller.close();
-        return;
-      }
-      heartbeat = setInterval(() => send(': heartbeat\n\n'), timing.heartbeatMs);
-      let resourceVersion = first.metadata?.resourceVersion ?? '';
-      /** The watch expired (410): relist, send what is new, resume from the list's version. */
-      const relist = async () => {
-        const list = await kube.call<ConfigMapList>(
-          'GET',
-          `${collection}?labelSelector=${encodeURIComponent(selector)}`,
-        );
-        const fresh = cursor.fresh(listEvents(list));
-        deliver(fresh, select(fresh, live));
-        resourceVersion = list.metadata?.resourceVersion ?? '';
-      };
-      let idle = 0;
-      try {
-        while (!abort.signal.aborted) {
-          const response = await kube.fetch(
+  let closed = false;
+  return new ReadableStream<Uint8Array>(
+    {
+      async start(controller) {
+        /**
+         * Queues `text` for the client. A client that stops reading lets the queue grow; past
+         * `queueLimitBytes` the watch is stopped and the stream closed, so memory stays bounded.
+         */
+        const send = (text: string) => {
+          if (closed) return;
+          controller.enqueue(encoder.encode(text));
+          if ((controller.desiredSize ?? 0) <= timing.queueBytes - timing.queueLimitBytes) {
+            closed = true;
+            stop();
+            controller.close();
+          }
+        };
+        // Flushes the headers at once, even when the backlog is empty.
+        send(': connected\n\n');
+        const cursor = new Cursor();
+        const live = { ...options, tail: Number.MAX_SAFE_INTEGER };
+        /** Sends the selected events, then marks every event seen, sent or filtered out. */
+        const deliver = (events: LogEvent[], selected: LogEvent[]) => {
+          for (const event of selected) send(sse('log', event));
+          for (const event of events) cursor.sent(event);
+        };
+        const backlog = listEvents(first);
+        deliver(backlog, select(backlog, options));
+        if (!follow) {
+          send(sse('end'));
+          if (closed) return;
+          closed = true;
+          controller.close();
+          return;
+        }
+        heartbeat = setInterval(() => {
+          // A full queue already proves the stream is open; do not grow it further.
+          if ((controller.desiredSize ?? 0) > 0) send(': heartbeat\n\n');
+        }, timing.heartbeatMs);
+        let resourceVersion = first.metadata?.resourceVersion ?? '';
+        /** The watch expired (410): relist, send what is new, resume from the list's version. */
+        const relist = async () => {
+          const list = await kube.call<ConfigMapList>(
             'GET',
-            `${collection}?watch=true&allowWatchBookmarks=true&labelSelector=${encodeURIComponent(selector)}&resourceVersion=${encodeURIComponent(resourceVersion)}`,
-            { headers: { Accept: 'application/json' }, signal: abort.signal },
+            `${collection}?labelSelector=${encodeURIComponent(selector)}`,
           );
-          let delivered = false;
-          let ended = false;
-          if (response.status === 410) {
-            await response.body?.cancel();
-            await relist();
-            delivered = true;
-          } else if (!response.ok || !response.body) {
-            await response.body?.cancel();
-            break;
-          } else {
-            for await (const event of watchEvents(response.body)) {
-              delivered = true;
-              if (event.type === 'ERROR') {
-                if (event.object?.code === 410) await relist();
-                else ended = true;
-                break;
-              }
-              if (event.object?.metadata?.resourceVersion)
-                resourceVersion = event.object.metadata.resourceVersion;
-              if (event.type === 'ADDED' || event.type === 'MODIFIED') {
-                const fresh = cursor.fresh(logEvents(event.object as LogsConfigMap));
-                deliver(fresh, select(fresh, live));
+          const fresh = cursor.fresh(listEvents(list));
+          deliver(fresh, select(fresh, live));
+          resourceVersion = list.metadata?.resourceVersion ?? '';
+        };
+        let idle = 0;
+        try {
+          while (!abort.signal.aborted) {
+            const response = await kube.fetch(
+              'GET',
+              `${collection}?watch=true&allowWatchBookmarks=true&labelSelector=${encodeURIComponent(selector)}&resourceVersion=${encodeURIComponent(resourceVersion)}`,
+              { headers: { Accept: 'application/json' }, signal: abort.signal },
+            );
+            // Only real events count as progress: a relist after a 410 does not, so a server that
+            // keeps expiring watches at the same resourceVersion is retried with backoff.
+            let delivered = false;
+            let ended = false;
+            if (response.status === 410) {
+              await response.body?.cancel();
+              await relist();
+            } else if (!response.ok || !response.body) {
+              await response.body?.cancel();
+              break;
+            } else {
+              for await (const event of watchEvents(response.body)) {
+                if (event.type === 'ERROR') {
+                  if (event.object?.code === 410) await relist();
+                  else ended = true;
+                  break;
+                }
+                if (PROGRESS.has(event.type)) delivered = true;
+                if (event.object?.metadata?.resourceVersion)
+                  resourceVersion = event.object.metadata.resourceVersion;
+                if (event.type === 'ADDED' || event.type === 'MODIFIED') {
+                  const fresh = cursor.fresh(logEvents(event.object as LogsConfigMap));
+                  deliver(fresh, select(fresh, live));
+                }
               }
             }
+            if (ended) break;
+            if (delivered) idle = 0;
+            else {
+              await sleep(
+                Math.min(timing.backoffMaxMs, timing.backoffBaseMs * 2 ** idle),
+                abort.signal,
+              );
+              idle = Math.min(idle + 1, 30);
+            }
           }
-          if (ended) break;
-          if (delivered) idle = 0;
-          else {
-            await sleep(
-              Math.min(timing.backoffMaxMs, timing.backoffBaseMs * 2 ** idle),
-              abort.signal,
-            );
-            idle = Math.min(idle + 1, 30);
-          }
+        } catch {
+          // The client went away (the watch was aborted) or the API server dropped the watch.
         }
-      } catch {
-        // The client went away (the watch was aborted) or the API server dropped the watch.
-      }
-      if (abort.signal.aborted) return;
-      stop();
-      send(sse('end'));
-      controller.close();
+        if (abort.signal.aborted || closed) return;
+        stop();
+        send(sse('end'));
+        if (closed) return;
+        closed = true;
+        controller.close();
+      },
+      cancel: stop,
     },
-    cancel: stop,
-  });
+    new ByteLengthQueuingStrategy({ highWaterMark: timing.queueBytes }),
+  );
 }
 
 /**

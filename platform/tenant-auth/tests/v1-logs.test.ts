@@ -127,6 +127,8 @@ describe('GET /v1/services/:service/logs', () => {
     timing.heartbeatMs = 15_000;
     timing.backoffBaseMs = 1_000;
     timing.backoffMaxMs = 30_000;
+    timing.queueBytes = 1 << 20;
+    timing.queueLimitBytes = 4 << 20;
     onWatch = undefined;
     api.requests.length = 0;
   });
@@ -295,6 +297,7 @@ describe('GET /v1/services/:service/logs', () => {
   };
 
   test('an in-stream 410 relists, sends only new lines, and resumes from the new version', async () => {
+    timing.backoffBaseMs = 20;
     const abort = new AbortController();
     onWatch = () => {
       if (watches.length !== 1) return;
@@ -314,6 +317,7 @@ describe('GET /v1/services/:service/logs', () => {
 
   test('an HTTP 410 relists and re-watches', async () => {
     const abort = new AbortController();
+    timing.backoffBaseMs = 20;
     watchStatuses = [410];
     listed = undefined;
     const opened = new Promise<void>((resolve) => {
@@ -338,17 +342,100 @@ describe('GET /v1/services/:service/logs', () => {
     expect(watches.length).toBe(1);
   });
 
+  /** Opens a follow, keeps reading it for `ms`, then cancels it. */
+  const followFor = async (ms: number) => {
+    const abort = new AbortController();
+    const response = await fetch(`${base}/web/logs?env=prod&follow=true&tail=0`, {
+      signal: abort.signal,
+    });
+    const reader = (response.body as ReadableStream<Uint8Array>).getReader();
+    const reading = (async () => {
+      for (;;) if ((await reader.read()).done) return;
+    })().catch(() => {});
+    await Bun.sleep(ms);
+    abort.abort();
+    await reader.cancel().catch(() => {});
+    await reading;
+  };
+
   test('watches that close empty are retried with a bounded backoff', async () => {
     timing.backoffBaseMs = 20;
     timing.backoffMaxMs = 40;
     onWatch = () => (watches.at(-1) as Watch).end();
-    const abort = new AbortController();
-    await fetch(`${base}/web/logs?env=prod&follow=true&tail=0`, { signal: abort.signal });
-    await Bun.sleep(200);
+    await followFor(200);
     // 20 + 40 + 40 + 40 ... ms between watches: about 5 in 200ms, not hundreds.
     expect(watches.length).toBeGreaterThanOrEqual(2);
     expect(watches.length).toBeLessThanOrEqual(8);
-    abort.abort();
+  });
+
+  test('cancelling the stream interrupts a backoff at once', async () => {
+    timing.backoffBaseMs = 60_000;
+    onWatch = () => (watches.at(-1) as Watch).end();
+    const response = await controller.handle(
+      new Request(`${base}/web/logs?env=prod&follow=true&tail=0`),
+    );
+    while (watches.length < 1) await Bun.sleep(5);
+    await Bun.sleep(20);
+    const started = Date.now();
+    await response.body?.cancel();
+    await Bun.sleep(20);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(watches.length).toBe(1);
+  });
+
+  test('watches that keep answering ERROR 410 back off', async () => {
+    timing.backoffBaseMs = 20;
+    timing.backoffMaxMs = 40;
+    onWatch = () => {
+      const watch = watches.at(-1) as Watch;
+      watch.push({ type: 'ERROR', object: { kind: 'Status', code: 410 } });
+      watch.end();
+    };
+    await followFor(200);
+    expect(watches.length).toBeGreaterThanOrEqual(2);
+    expect(watches.length).toBeLessThanOrEqual(8);
+    expect(lists).toBeLessThanOrEqual(9);
+  });
+
+  test('watches that keep answering HTTP 410 back off', async () => {
+    timing.backoffBaseMs = 20;
+    timing.backoffMaxMs = 40;
+    watchStatus = 410;
+    await followFor(200);
+    const watchCalls = api.requests.filter((r) => r.path.includes('watch=true')).length;
+    expect(watchCalls).toBeGreaterThanOrEqual(2);
+    expect(watchCalls).toBeLessThanOrEqual(8);
+    expect(lists).toBeLessThanOrEqual(9);
+  });
+
+  test('a client that stops reading has its stream closed and the watch aborted', async () => {
+    timing.queueBytes = 16_384;
+    timing.queueLimitBytes = 65_536;
+    const opened = new Promise<void>((resolve) => {
+      onWatch = resolve;
+    });
+    // Called directly and never read, so nothing drains the queue.
+    const response = await controller.handle(
+      new Request(`${base}/web/logs?env=prod&follow=true&tail=0`),
+    );
+    expect(response.status).toBe(200);
+    await opened;
+    const watch = watches[0] as Watch;
+    const filler = 'x'.repeat(4_000);
+    for (let i = 0; i < 100; i++)
+      watch.push({
+        type: 'MODIFIED',
+        object: configMap(
+          'web',
+          [`2020-01-02T00:00:${String(i % 60).padStart(2, '0')}.${i}Z INFO ${filler}`],
+          undefined,
+          String(100 + i),
+        ),
+      });
+    await watch.closed;
+    // The stream ended: draining it terminates instead of waiting for more events.
+    const text = await response.text();
+    expect(text.length).toBeLessThan(100 * 4_100);
   });
 
   test('follow with tail=0 does not replay the backlog on the first update', async () => {
