@@ -6,7 +6,7 @@
 # what made a cold publish take the better part of an hour.
 # Each arch also pushes a registry cache manifest (mode=max). That manifest is
 # the metadata that points BuildKit at layer blobs already in GHCR, including
-# the builder stage, so a later publish of the same Dockerfile and patch does
+# the builder stage, so a later publish of the same Dockerfile does
 # not run cargo again. It is not the wash tag itself: inline cache on that tag
 # is min mode and omits the builder stage.
 # cancel-in-progress stays false so a queued publish waits and does not abort

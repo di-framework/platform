@@ -58,6 +58,8 @@ The tag is mutable. The platform default `hostImage` is the published index:
 
 `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669`
 
+The currently pinned image was published before the patch was dropped, so it still contains the unnamed-import lease until a maintainer republishes and the pin is updated.
+
 `tenantHostImage` overrides it. The workflow summary prints the digest of each later publish.
 
 For a local Kubesolo/k0s cluster, push to the platform registry (`di-framework-registry` in
