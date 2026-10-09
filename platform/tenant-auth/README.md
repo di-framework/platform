@@ -94,9 +94,25 @@ bun scripts/deploy-local.ts --tenant acme ... \
 ```
 
 The `.localhost` issuer makes Bun use loopback, so the sidecar forwards the port to the platform
-gateway, which routes by `Host`. Discovery, JWKS, readiness, the browser login, the console
-pages, and the controller all work this way, with the guest staying healthy under concurrent
-requests.
+gateway, which routes by `Host`. `scripts/deploy-authproto.sh` wraps that command for the
+`authproto` instance and reads the access client secret inside the cluster. A redeploy with new
+code rolls both pods: the pod template carries a digest of the bundle, because a ConfigMap update
+alone leaves the running processes on the old code.
+
+Verified on `authproto` on 2026-10-09 with the guest from identity-server `main` (Argon2 in the
+composed `pqc-subtle` component) and the tenant CLI pilot in `platform/tenant-cli`:
+
+- `GET /v1/auth/info` on the controller returns the guest issuer and `clientId: tenant-cli`.
+- `di-tenant login --controller https://127.0.0.1:8788 --account acme --no-browser` printed the
+  authorize URL at the guest; the browser sign-in as `alice` (a bootstrap user of the guest's
+  directory) plus consent landed on the loopback page, and the CLI stored the credential. `whoami`
+  answered `alice (developer) in acme via identity`.
+- kubectl with the identity token against the controller: `kubectl auth whoami` reported
+  `system:serviceaccount:wasmcloud:di-user-alice`; `get pods -n di-runtime-acme` listed the
+  tenant's pods; `get pods -n wasmcloud` and `get nodes` were refused with `outside account acme`.
+- `logout` revoked at the guest: the old access token then got 401 from `/userinfo` and the
+  refresh token `invalid_grant` from `/oauth2/token`. The credential file was emptied.
+- The identity host logged no errors and no request got a 503 during the flow.
 
 `wasmcloud:postgres@0.2.0` gives the guest `query` calls with no connection affinity: the host's
 Postgres plugin serves the guest's named import from a pool, one free connection per call, so a
@@ -108,10 +124,11 @@ the platform side changed for this.
 
 Setup, in order: deploy the guest, load the runtime secret rows (issuer, JWK, access client
 redirect `<console>/oidc/callback`, bootstrap organization and users, which the guest creates the
-table for on first boot), then let the first request finish bootstrap. That first boot hashes the
-bootstrap passwords with Argon2id, about 30 s per hash in QuickJS, so it outlives the gateway's
-60 s timeout; make one direct request to the host pod (port-forward `9191`, `Host: identity`)
-and wait for it. The guest stores a fingerprint afterwards, so later boots skip the hashing.
+table for on first boot), then let the first request finish bootstrap. The guest hashes the
+bootstrap passwords with Argon2id in a composed Wasm component (milliseconds per hash since
+identity-server#47; it was about 30 s per hash in QuickJS before) and stores a fingerprint, so
+later boots skip the hashing. If a boot ever outlives the gateway's 60 s timeout again, make one
+direct request through the tenant's `di-http` service (`Host: identity`) and wait for it.
 
 ## Run the pieces outside the cluster
 
