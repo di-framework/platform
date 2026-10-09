@@ -1,4 +1,5 @@
 import { schemas } from '../schemas.ts';
+import { validate } from '../validate.ts';
 
 interface RuntimeSchema {
   parse(input: unknown): unknown;
@@ -6,19 +7,22 @@ interface RuntimeSchema {
 }
 
 /**
- * The generated controllers validate through these. The pilot accepts any shape at runtime;
- * the contract is enforced by the JSON schema in the OpenAPI document and by the generated
- * client's types. Runtime validation arrives with the controller implementation.
+ * The generated controllers validate through these: `parse` checks the input against the same
+ * JSON schema the OpenAPI document publishes and throws a `ValidationError` when it does not
+ * match. An absent body counts as `{}` for `Empty`, so bodiless operations validate.
  */
-function accept(input: unknown) {
-  return input;
+function runtime(jsonSchema: object, absent?: unknown): RuntimeSchema {
+  return {
+    parse(input) {
+      const value = input === undefined ? absent : input;
+      validate(jsonSchema, value);
+      return value;
+    },
+    jsonSchema: jsonSchema as Record<string, unknown>,
+  };
 }
 
-function runtime(jsonSchema: object): RuntimeSchema {
-  return { parse: accept, jsonSchema: jsonSchema as Record<string, unknown> };
-}
-
-export const Empty = runtime(schemas.Empty);
+export const Empty = runtime(schemas.Empty, {});
 export const AuthInfo = runtime(schemas.AuthInfo);
 export const Principal = runtime(schemas.Principal);
 export const DeployBundle = runtime(schemas.DeployBundle);

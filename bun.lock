@@ -92,6 +92,7 @@
       "name": "@di-framework/tenant-auth",
       "version": "0.0.0",
       "dependencies": {
+        "@di-framework/tenant-cli": "workspace:*",
         "js-yaml": "4.3.2",
       },
       "devDependencies": {

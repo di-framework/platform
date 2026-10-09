@@ -6,6 +6,8 @@
  * roles, quotas, and admission policies apply unchanged; the Kubernetes token never leaves here.
  */
 import { readFileSync } from 'node:fs';
+import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
+import { dispatch } from '@di-framework/tenant-cli/src/api/routes.ts';
 import { AuthError, IdentityResolver, type Principal } from './identity.ts';
 import { createApiKey, type KeyStore, listApiKeys, revokeApiKey } from './keys.ts';
 import { inClusterCredentials, KubeClient, KubeError, loadKubeconfig } from './kube.ts';
@@ -256,6 +258,13 @@ export class Controller {
         .sort((a, b) => a.user.localeCompare(b.user));
       return json({ members });
     }
+    // Every other operation of the `/v1` contract goes through the generated routes, which
+    // validate the request and answer 501 until the operation is implemented.
+    if (url.pathname.startsWith('/v1/'))
+      return (
+        (await dispatch(request)) ??
+        problem(404, 'Not Found', `${request.method} ${url.pathname} is not a /v1 operation`)
+      );
     return status(404, 'NotFound', `${url.pathname} is not a controller endpoint`);
   }
 
