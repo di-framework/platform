@@ -1,0 +1,16 @@
+package di-framework:pglite-engine@0.1.0;
+
+/// Private in-memory bridge to the bundled PostgreSQL engine. Composed away
+/// at build time; these functions are never host imports in the final artifact.
+interface engine {
+  set-env: func(name: string, value: string) -> s32;
+  start: func(arguments: list<string>) -> s32;
+  initdb: func() -> s32;
+  backend: func();
+  write: func(payload: list<u8>) -> bool;
+  read: func() -> list<u8>;
+  step: func();
+}
+world embedded-engine {
+  export engine;
+}

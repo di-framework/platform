@@ -1,0 +1,165 @@
+package di-framework:pglite@0.1.0;
+
+/// Types shared by the `database` interface.
+///
+/// Mirrors `di-framework:sqlite/types` on purpose so consumers can switch
+/// between the SQLite and PGlite providers with minimal code changes:
+/// same `value`/`row`/`error` shapes, same connection lifecycle
+/// (`open`/`query`/`run`/`exec`/`first`/transactions/`close`).
+/// Differences from SQLite are documented on the affected items.
+interface types {
+  /// A structured error reported by Postgres itself.
+  record pg-error {
+    /// SQLSTATE code (e.g. `23505` = unique_violation).
+    /// SQLite reports numeric result codes instead.
+    code: string,
+    /// Human-readable message from the server.
+    message: string,
+  }
+
+  /// Errors raised by functions in this package. Intentionally non-exhaustive:
+  /// consumers must keep a catch-all arm.
+  variant error {
+    /// The data directory could not be opened, initialization failed, or
+    /// another connection already owns this component instance.
+    open-failed(string),
+    /// The connection has been closed with `close` and cannot be used again.
+    closed,
+    /// The statement could not be prepared or executed: syntax error, unknown
+    /// table or column. Only single statements are accepted by `run`/`query`/`first`
+    /// (unlike `exec`, which allows `;`-separated batches like the SQLite provider).
+    invalid-sql(string),
+    /// Wrong number of parameters or a value that could not be bound.
+    /// Parameters bind positionally to `$1`, `$2`, ... (not `?`/`?NNN`).
+    invalid-params(string),
+    /// Postgres reported an error while executing the statement (constraint
+    /// violation, undefined table, ...). Branch on `pg-error.code` (SQLSTATE)
+    /// for machine-readable handling.
+    execution-failed(pg-error),
+    /// A column value could not be converted into a `value`.
+    value-conversion-failed(string),
+    /// The embedded engine is unusable. Restart the component to recover.
+    connection-lost(string),
+    /// `begin`, `commit`, `rollback` (or a savepoint call) was issued in a
+    /// state that does not permit it (e.g. `commit` with no open transaction).
+    invalid-transaction-state(string),
+    /// Any other implementation-specific failure.
+    other(string),
+  }
+
+  /// A dynamically-typed value, used for parameters and results.
+  /// Identical to the SQLite provider plus `boolean`: Postgres has a native
+  /// boolean type and the text encoding (`t`/`f`) is lossy without it.
+  variant value {
+    null,
+    integer(s64),
+    real(f64),
+    text(string),
+    blob(list<u8>),
+    boolean(bool),
+  }
+
+  /// A result row: `(column-name, value)` pairs in column order.
+  type row = list<tuple<string, value>>;
+
+  /// Options accepted by `open`. Every field is optional; `none` means the
+  /// documented default.
+  record open-options {
+    /// Database name for the session. Only `template1` is currently supported.
+    database: option<string>,
+    /// Reserved: WASI lacks the signal timer used for query cancellation.
+    /// Only none or zero is supported; nonzero values fail open.
+    statement-timeout-ms: option<u32>,
+  }
+}
+
+/// Embedded PostgreSQL access. The engine is bundled into the provider and
+/// queries pass through WebAssembly memory; no sockets or sidecar are used.
+/// Data and runtime files live underneath a directory in a writable WASI
+/// filesystem preopen. The host must grant exclusive ownership of that
+/// directory to one component instance at a time.
+interface database {
+  use types.{error, value, row, open-options};
+
+  /// Open a persistent database root (e.g. `/data/orders`); an empty path
+  /// selects `/data/pglite`. No ephemeral fallback. The root contains `data/`
+  /// (PGDATA), `runtime/` (bundled support files), and bootstrap scratch files.
+  /// Only one open connection and one database root per component instance
+  /// are supported. Close/drop releases the connection for reuse at that root.
+  open: func(path: string, options: option<open-options>) -> result<connection, error>;
+
+  /// The bundled engine version string, `17.5`; does not open a database.
+  server-version: func() -> result<string, error>;
+
+  /// An exclusive handle to the embedded session. Closing or dropping it
+  /// rolls back uncommitted work and resets session state.
+  resource connection {
+    /// Execute one or more `;`-separated statements and discard any results.
+    /// Intended for DDL / migrations. Untrusted input must never be
+    /// interpolated into `sql`.
+    exec: func(sql: string) -> result<_, error>;
+
+    /// Execute a single parameterized statement and return the number of rows
+    /// affected (the `CommandComplete` tag count). Parameters bind positionally
+    /// to `$1`, `$2`, ...
+    run: func(sql: string, params: list<value>) -> result<u64, error>;
+
+    /// Execute a single parameterized statement and return all rows.
+    query: func(sql: string, params: list<value>) -> result<list<row>, error>;
+
+    /// Execute a single parameterized statement and return only the first row,
+    /// or `none` when the statement produced no rows.
+    first: func(sql: string, params: list<value>) -> result<option<row>, error>;
+
+    /// `BEGIN`. Fails with `invalid-transaction-state` if a transaction is
+    /// already open on this connection; nest with `savepoint` instead.
+    begin: func() -> result<_, error>;
+
+    /// `COMMIT` the open transaction.
+    commit: func() -> result<_, error>;
+
+    /// `ROLLBACK` the open transaction.
+    rollback: func() -> result<_, error>;
+
+    /// `SAVEPOINT <name>`; usable for nested transactions. `name` must match
+    /// `[A-Za-z_][A-Za-z0-9_]*`.
+    savepoint: func(name: string) -> result<_, error>;
+
+    /// `RELEASE SAVEPOINT <name>`.
+    release-savepoint: func(name: string) -> result<_, error>;
+
+    /// `ROLLBACK TO SAVEPOINT <name>` followed by `RELEASE`, so the savepoint
+    /// is fully unwound.
+    rollback-to-savepoint: func(name: string) -> result<_, error>;
+
+    /// True while a transaction (or savepoint) is open on this connection.
+    /// Reported by the engine, including transactions issued through `exec`.
+    in-transaction: func() -> bool;
+
+    /// Rows affected by the most recent `run`/`exec` on this connection.
+    rows-affected: func() -> u64;
+
+    /// Explicitly close the connection. Subsequent calls fail with `closed`.
+    close: func() -> result<_, error>;
+  }
+}
+
+/// The world implemented by the provider component.
+/// Kept symmetric with the sqlite-component: `types` is exported explicitly
+/// so the component is self-contained for `wac plug`.
+///
+/// The private engine import is resolved during the provider build. The
+/// shipped artifact has only WASI imports, including filesystem and randomness.
+world pglite-provider {
+  import di-framework:pglite-engine/engine@0.1.0;
+  export types;
+  export database;
+}
+
+/// The world a consumer targets when it wants a Postgres database.
+/// `wac plug` satisfies these imports with the `pglite-provider`
+/// component's exports.
+world imports {
+  import types;
+  import database;
+}
