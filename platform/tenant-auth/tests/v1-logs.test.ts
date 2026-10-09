@@ -1,4 +1,13 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  spyOn,
+  test,
+} from 'bun:test';
 import { events } from '@di-framework/tenant-cli/client';
 import { Controller, configFromEnv } from '../src/controller.ts';
 import type { Principal } from '../src/identity.ts';
