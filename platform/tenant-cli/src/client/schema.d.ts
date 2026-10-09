@@ -104,6 +104,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/deploy/registry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the tenant registry
+         * @description The tenant's own OCI registry: its URL and how to log in. Pull is open to viewers and developers; push needs developer. No credential is minted.
+         */
+        get: operations["registry"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/deployments": {
         parameters: {
             query?: never;
@@ -371,6 +391,23 @@ export interface components {
             bindings: components["schemas"]["Binding"][];
             /** @description Names of tenant secrets the workload references; values never travel. */
             secrets: string[];
+        };
+        /** @description Where a tenant pushes and pulls images: the tenant's own OCI registry. Log in with an identity-server access token or API key as the Basic password. */
+        RegistryInfo: {
+            /**
+             * Format: uri
+             * @description Origin of the tenant's OCI registry: scheme + host[:port], no path. Clients use its host[:port] for login and in image references; an http: origin means plain HTTP.
+             */
+            url: string;
+            /** @description Namespace inside the tenant registry, when there is one. */
+            repositoryPrefix?: string;
+            /**
+             * @description Basic auth whose password is an identity-server access token or dik_ API key.
+             * @enum {string}
+             */
+            auth: "basic-identity";
+            /** @description A fixed hint for the Basic username; the registry ignores it. */
+            username: string;
         };
         DeployChange: {
             /** @enum {string} */
@@ -677,6 +714,41 @@ export interface operations {
                         env: "prod" | "staging";
                         service: string;
                         changes: components["schemas"]["DeployChange"][];
+                    };
+                };
+            };
+        };
+    };
+    registry: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Get the tenant registry */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /**
+                         * Format: uri
+                         * @description Origin of the tenant's OCI registry: scheme + host[:port], no path. Clients use its host[:port] for login and in image references; an http: origin means plain HTTP.
+                         */
+                        url: string;
+                        /** @description Namespace inside the tenant registry, when there is one. */
+                        repositoryPrefix?: string;
+                        /**
+                         * @description Basic auth whose password is an identity-server access token or dik_ API key.
+                         * @enum {string}
+                         */
+                        auth: "basic-identity";
+                        /** @description A fixed hint for the Basic username; the registry ignores it. */
+                        username: string;
                     };
                 };
             };
