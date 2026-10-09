@@ -1,6 +1,6 @@
 {
   "name": "@di-framework/bindings",
-  "version": "6.0.8",
+  "version": "6.0.9",
   "description": "Native platform WIT service bindings for DI Framework applications.",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
