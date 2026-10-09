@@ -2,6 +2,8 @@
 coverageReporter = ["text", "lcov"]
 coverageThreshold = { lines = 1.0, functions = 0 }
 coveragePathIgnorePatterns = [
+  "**/generated/**",
+  "**/*.d.ts",
   "**/tests/**",
   "**/*.test.ts",
   "**/scripts/**",
