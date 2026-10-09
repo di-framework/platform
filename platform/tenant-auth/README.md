@@ -30,10 +30,9 @@ platform controller's tenant reconcile). The tenant CLI is `di-tenant` in `@di-f
   identity-server access and refresh tokens, refreshes and revokes them on the CLI's behalf, and
   renders overview, logs, members, and API-key pages by calling the controller as the user. It
   holds no cluster credential.
-* **CLI** (`di-tenant` in `@di-framework/tenant-cli`): `login` runs the browser flow against the tenant console and stores a
-  JSON credential (tokens and metadata, mode 0600) under `~/.di-framework`. The kubeconfig it
-  writes points at the controller with the identity token, so existing kubectl-based commands
-  keep working. `exec` and `kubeconfig` refresh first.
+* **CLI** (`di-tenant` in `@di-framework/tenant-cli`): `login` runs the browser flow and stores a
+  JSON credential (tokens and metadata, mode 0600) under `~/.di-framework`. It talks to the tenant
+  controller only. See `platform/tenant-cli/README.md` for commands and flags.
 * **API keys**: `dik_<id>_<secret>`, SHA-256 hash stored as a Secret in `di-runtime-<t>`, which
   tenant users cannot read. A key is a bearer token in its own right and acts as its creator,
   only in its tenant. Revocation is deletion.
@@ -93,8 +92,7 @@ bun scripts/deploy-local.ts --tenant acme ... \
 ```
 
 The `.localhost` issuer makes Bun use loopback, so the sidecar forwards the port to the platform
-gateway, which routes by `Host`. `scripts/deploy-authproto.sh` wraps that command for the
-`authproto` instance and reads the access client secret inside the cluster. A redeploy with new
+gateway, which routes by `Host`.  A redeploy with new
 code rolls both pods: the pod template carries a digest of the bundle, because a ConfigMap update
 alone leaves the running processes on the old code.
 
@@ -158,18 +156,7 @@ TENANT_CONSOLE_CONTROLLER_URL=https://127.0.0.1:8788 TENANT_CONSOLE_CONTROLLER_C
 | `TENANT_CONSOLE_CONTROLLER_URL`, `_CONTROLLER_CA` | `https://127.0.0.1:8788` | How the console reaches the controller |
 | `*_HOST`, `*_PORT`, `TENANT_CONSOLE_PUBLIC_URL` | `127.0.0.1`, `8788` / `8787` | Listen address and browser-visible URL |
 
-CLI: `di-tenant` in `@di-framework/tenant-cli`:
-
-```sh
-di-tenant login --account acme --console http://127.0.0.1:8787   # browser flow; prints `export KUBECONFIG=…`
-di-tenant login --api-key dik_…                                   # no browser
-di-tenant exec --account acme -- kubectl get workloaddeployments  # refresh, then run with KUBECONFIG set
-di-tenant kubeconfig --account acme
-di-tenant whoami --account acme
-di-tenant keys create --account acme --name ci --days 7
-di-tenant keys list|revoke <id> --account acme
-di-tenant logout --account acme
-```
+CLI: `di-tenant` in `@di-framework/tenant-cli`; see `platform/tenant-cli/README.md` for commands and flags.
 
 ## HTTP surface
 
