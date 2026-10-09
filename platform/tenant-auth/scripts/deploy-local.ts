@@ -7,6 +7,7 @@
  *   bun scripts/deploy-local.ts --tenant acme --kubeconfig <admin kubeconfig> \
  *     --issuer http://<host-ip>:4180 --client-secret <secret> [--image oven/bun:1-alpine]
  */
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { dump } from 'js-yaml';
@@ -77,6 +78,12 @@ const build = await Bun.build({
 });
 if (!build.success) throw new Error(build.logs.map(String).join('\n'));
 const bundle = (name: string) => readFileSync(join(dist, `${name}.js`), 'utf8');
+// A ConfigMap change alone does not restart pods, so the pod template carries the bundle digest.
+const bundleDigest = createHash('sha256')
+  .update(bundle('controller'))
+  .update(bundle('console'))
+  .digest('hex')
+  .slice(0, 16);
 console.error(
   `bundled controller.js (${bundle('controller').length} bytes) and console.js (${bundle('console').length} bytes)`,
 );
@@ -186,7 +193,10 @@ const deployment = (
     strategy: { type: 'Recreate' },
     selector: { matchLabels: { app: name } },
     template: {
-      metadata: { labels: { ...labels, app: name } },
+      metadata: {
+        labels: { ...labels, app: name },
+        annotations: { 'platform.di-framework.dev/bundle-digest': bundleDigest },
+      },
       spec: {
         serviceAccountName,
         automountServiceAccountToken: true,
