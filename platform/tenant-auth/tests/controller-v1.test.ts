@@ -127,7 +127,7 @@ describe('/v1 dispatch', () => {
     ['GET', '/v1/services/web/logs?env=prod&tail=ten', undefined, 'query.tail must be an integer'],
     ['PUT', '/v1/secrets/db?env=prod', '{}', 'body.value is required'],
     ['PUT', '/v1/secrets/db?env=prod', '{"value":7}', 'body.value must be a string'],
-    ['PUT', '/v1/secrets/db?env=prod', 'not json', 'body must be an object'],
+    ['PUT', '/v1/secrets/db?env=prod', 'not json', 'the request body is not valid JSON'],
     [
       'POST',
       '/v1/services',
@@ -155,6 +155,41 @@ describe('/v1 dispatch', () => {
     expect(response.status).toBe(404);
     expect((await problem(response)).detail).toBe('GET /v1/nothing is not a /v1 operation');
     expect(reachedCluster('/v1')).toBe(false);
+  });
+
+  test.each([
+    ['/v1/deployments/?env=prod', 'GET /v1/deployments/ is not a /v1 operation'],
+    ['/v1/auth/info/', 'GET /v1/auth/info/ is not a /v1 operation'],
+    ['/v1/unknown/path', 'GET /v1/unknown/path is not a /v1 operation'],
+  ])('%s is a 404 problem and is not proxied', async (path, detail) => {
+    const response = await call('GET', path);
+    expect(response.status).toBe(404);
+    expect((await problem(response)).detail).toBe(detail);
+    expect(reachedCluster('/v1')).toBe(false);
+  });
+
+  test.each(['/v1/x/../deployments?env=prod', '/v1/x/%2e%2e/deployments?env=prod'])(
+    '%s is normalised to the operation it names',
+    async (path) => {
+      const response = await call('GET', path);
+      expect(response.status).toBe(501);
+      expect((await problem(response)).detail).toBe(
+        'deployments is not implemented in the pilot yet',
+      );
+    },
+  );
+
+  test('only GET /v1/auth/info is public', async () => {
+    expect((await fetch(`${base}/v1/auth/info`)).status).toBe(200);
+    expect((await fetch(`${base}/v1/auth/info`, { method: 'HEAD' })).status).toBe(401);
+    expect((await fetch(`${base}/v1/auth/info/`)).status).toBe(401);
+    expect((await fetch(`${base}/v1/auth/whoami`)).status).toBe(401);
+  });
+
+  test('a /V1 path goes to the proxy and is denied with 403', async () => {
+    const response = await call('GET', '/V1/deployments?env=prod');
+    expect(response.status).toBe(403);
+    expect(reachedCluster('/V1')).toBe(false);
   });
 
   test('/v1 operations still require a credential', async () => {
