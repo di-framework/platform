@@ -101,7 +101,10 @@ export const schemas = {
     description:
       "Where a tenant pushes and pulls images: the tenant's own OCI registry. Log in with an identity-server access token or API key as the Basic password.",
     properties: {
-      url: { type: 'string', format: 'uri', description:
+      url: {
+        type: 'string',
+        format: 'uri',
+        description:
           "Origin of the tenant's OCI registry: scheme + host[:port], no path. Clients use its host[:port] for login and in image references; an http: origin means plain HTTP.",
       },
       repositoryPrefix: {
