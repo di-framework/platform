@@ -91,7 +91,7 @@ export const USAGE = `di-tenant: the tenant CLI pilot. It talks to the tenant co
   whoami [--account <tenant>]
   deploy preview|apply --env <prod|staging> --bundle <file>
   logs --service <name> --env <env> [--deployment <id>] [--follow] [--since <dur>] [--tail <n>]
-  services create <http|cron|worker> --name <name> --env <env> [--port <n>] [--route <pattern>] [--schedule <cron>] [--command <argv>]
+  services create <keyvalue|messaging|blobstore|postgres|egress> --name <name> --env <env> [--class <class>] [--storage <q>] [--memory <q>] [--cpu <q>] [--deletion-policy <Retain|Delete>] [--destination <host[:port],...>]
   deployments list|stats --env <env> [--service <name>]
   deployments rollback --service <name> --env <env> [--to <id>]
   secrets|vars list --env <env>
@@ -113,6 +113,14 @@ function requireEnv(flags: Record<string, string>): Env {
   if (value !== 'prod' && value !== 'staging') throw new CliError('--env must be prod or staging');
   return value;
 }
+
+const BACKING_TYPES: readonly string[] = [
+  'keyvalue',
+  'messaging',
+  'blobstore',
+  'postgres',
+  'egress',
+];
 
 function integer(flags: Record<string, string>, name: string): number | undefined {
   const value = flags[name];
@@ -397,19 +405,27 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
     }
     case 'services': {
       if (sub !== 'create')
-        throw new CliError('usage: services create <http|cron|worker> --name <name>');
-      const type = rest[0];
-      if (type !== 'http' && type !== 'cron' && type !== 'worker') {
-        throw new CliError('service type must be http, cron, or worker');
+        throw new CliError(
+          'usage: services create <keyvalue|messaging|blobstore|postgres|egress> --name <name>',
+        );
+      const type = rest[0] as CreateServiceRequest['type'];
+      if (!BACKING_TYPES.includes(type)) {
+        throw new CliError(
+          'service type must be keyvalue, messaging, blobstore, postgres, or egress (http, cron and worker services come from deploy)',
+        );
       }
+      const policy = flags['deletion-policy'];
+      if (policy !== undefined && policy !== 'Retain' && policy !== 'Delete')
+        throw new CliError('--deletion-policy must be Retain or Delete');
+      const sizing = { storage: flags.storage, memory: flags.memory, cpu: flags.cpu };
       const request: CreateServiceRequest = {
         env: requireEnv(flags),
         type,
         name: requireFlag(flags, 'name'),
-        port: integer(flags, 'port'),
-        route: flags.route,
-        schedule: flags.schedule,
-        command: flags.command?.split(' '),
+        className: flags.class,
+        parameters: Object.values(sizing).some((v) => v !== undefined) ? sizing : undefined,
+        deletionPolicy: policy,
+        destinations: flags.destination?.split(',').filter((d) => d !== ''),
       };
       const { client } = await session(flags, io);
       const service = await client.createService(request);
@@ -417,7 +433,8 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
         io,
         flags,
         service,
-        () => `created ${service.type} service ${service.name} in ${service.env}`,
+        () =>
+          `created ${service.type} service ${service.name} (${service.className}) in ${service.env}`,
       );
       return 0;
     }
@@ -505,7 +522,7 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
         flags,
         sessionInfo,
         () =>
-          `tunnel to port ${sessionInfo.port}: ${sessionInfo.url} (until ${sessionInfo.expiresAt})`,
+          `proxy session until ${sessionInfo.expiresAt}: send HTTP requests to ${sessionInfo.url}/<path> with your bearer, e.g. curl -H "Authorization: Bearer $TOKEN" ${sessionInfo.url}/`,
       );
       return 0;
     }

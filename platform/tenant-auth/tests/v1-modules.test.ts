@@ -29,6 +29,7 @@ test('every contract operation declares a role policy, and a viewer is read-only
       'whoami',
       'logout',
       'previewDeploy',
+      'registry',
       'logs',
       'deployments',
       'deploymentStats',
@@ -241,8 +242,7 @@ describe('resource modules over real HTTP', () => {
     ['config', 'secrets', 'GET', '/v1/secrets?env=prod'],
     ['logs', 'logs', 'GET', '/v1/services/web/logs?env=prod'],
     ['deploy', 'deployments', 'GET', '/v1/deployments?env=prod'],
-    ['services', 'proxy', 'POST', '/v1/services/web/proxy'],
-  ] as const)(
+  ] as [string, string, string, string][])(
     'the %s module serves %s, with the caller as context',
     async (group, operation, method, path) => {
       const module = MODULES[group] as Record<string, V1Handler>;

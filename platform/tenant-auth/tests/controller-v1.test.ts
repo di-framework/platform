@@ -84,13 +84,7 @@ describe('/v1 dispatch', () => {
     ['PUT', '/v1/secrets/db?env=prod', '{"value":"s3cret"}', 'setSecret'],
     ['PATCH', '/v1/vars/LEVEL?env=prod', '{"value":"debug"}', 'updateVar'],
     ['DELETE', '/v1/vars/LEVEL?env=prod', undefined, 'unsetVar'],
-    [
-      'POST',
-      '/v1/services',
-      '{"env":"prod","type":"http","name":"web","port":8080}',
-      'createService',
-    ],
-    ['POST', '/v1/services/web/proxy', '{"env":"prod"}', 'proxy'],
+    ['GET', '/v1/deploy/registry', undefined, 'registry'],
   ])('%s %s answers 501 problem+json', async (method, path, body, operation) => {
     const response = await call(method, path, { body });
     expect(response.status).toBe(501);
@@ -134,7 +128,7 @@ describe('/v1 dispatch', () => {
       'POST',
       '/v1/services',
       '{"env":"prod","type":"ftp","name":"x"}',
-      'body.type must be one of http, cron, worker',
+      'body.type must be one of keyvalue, messaging, blobstore, postgres, egress',
     ],
     ['POST', '/v1/deploy', '{"env":"prod"}', 'body.service is required'],
   ])('%s %s is refused with 400 before a handler', async (method, path, body, detail) => {
@@ -194,6 +188,10 @@ describe('/v1 dispatch', () => {
     expect(reachedCluster('/V1')).toBe(false);
   });
 
+  test('the registry operation requires a credential', async () => {
+    expect((await fetch(`${base}/v1/deploy/registry`)).status).toBe(401);
+  });
+
   test('/v1 operations still require a credential', async () => {
     const response = await fetch(`${base}/v1/deployments?env=prod`);
     expect(response.status).toBe(401);
@@ -223,6 +221,7 @@ describe('/v1 dispatch', () => {
       ['GET', '/v1/deployments?env=prod', undefined],
       ['GET', '/v1/deployments/stats?env=prod', undefined],
       ['GET', '/v1/vars?env=prod', undefined],
+      ['GET', '/v1/deploy/registry', undefined],
       [
         'POST',
         '/v1/deploy/preview',
@@ -241,7 +240,7 @@ describe('/v1 dispatch', () => {
       ['PUT', '/v1/vars/LEVEL?env=prod', '{"value":"debug"}', 'setVar'],
       ['DELETE', '/v1/vars/LEVEL?env=prod', undefined, 'unsetVar'],
       ['POST', '/v1/deployments/rollback', '{"env":"prod","service":"web"}', 'rollback'],
-      ['POST', '/v1/services', '{"env":"prod","type":"http","name":"web"}', 'createService'],
+      ['POST', '/v1/services', '{"env":"prod","type":"keyvalue","name":"web"}', 'createService'],
       ['POST', '/v1/services/web/proxy', '{"env":"prod"}', 'proxy'],
       [
         'POST',

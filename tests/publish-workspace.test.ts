@@ -62,6 +62,7 @@ describe('publish workspace packs', () => {
       `@di-framework/cloudfoundry@${root.version}`,
       `@di-framework/platform@${root.version}`,
       `@di-framework/sqlite-component@${root.version}`,
+      `@di-framework/tenant-cli@${root.version}`,
     ]);
   });
 

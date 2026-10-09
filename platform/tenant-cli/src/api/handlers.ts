@@ -18,6 +18,7 @@ export const OPERATIONS = [
   'logout',
   'previewDeploy',
   'deploy',
+  'registry',
   'createService',
   'logs',
   'proxy',
@@ -61,6 +62,7 @@ export class TenantControllerHandlers {
   declare logout: Handler;
   declare previewDeploy: Handler;
   declare deploy: Handler;
+  declare registry: Handler;
   declare createService: Handler;
   declare logs: Handler;
   declare proxy: Handler;
