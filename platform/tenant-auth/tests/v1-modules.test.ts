@@ -7,12 +7,39 @@ import { AuthError } from '../src/identity.ts';
 import { KubeClient, KubeError } from '../src/kube.ts';
 import { auth } from '../src/v1/auth.ts';
 import { MODULES, type V1Context, type V1Handler } from '../src/v1/index.ts';
+import { POLICY, permits } from '../src/v1/policy.ts';
 import { json, serve } from './support/servers.ts';
 
 test('every contract operation belongs to exactly one resource module', () => {
   const owned = Object.values(MODULES).flatMap((module) => Object.keys(module));
   expect(owned.sort()).toEqual([...OPERATIONS].sort());
   expect(Object.keys(MODULES).sort()).toEqual(['auth', 'config', 'deploy', 'logs', 'services']);
+});
+
+test('every contract operation declares a role policy, and a viewer is read-only', () => {
+  expect(Object.keys(POLICY).sort()).toEqual([...OPERATIONS].sort());
+  for (const name of OPERATIONS) {
+    expect(POLICY[name].length).toBeGreaterThan(0);
+    expect(permits(name, 'developer')).toBe(true);
+  }
+  const viewer: string[] = OPERATIONS.filter((name) => permits(name, 'viewer')).sort();
+  expect(viewer).toEqual(
+    [
+      'authInfo',
+      'whoami',
+      'logout',
+      'previewDeploy',
+      'logs',
+      'deployments',
+      'deploymentStats',
+      'secrets',
+      'vars',
+    ].sort(),
+  );
+});
+
+test('an operation without a policy is denied to every role', () => {
+  expect(permits('undeclared' as never, 'developer')).toBe(false);
 });
 
 test('the auth stubs answer 501 when reached', async () => {

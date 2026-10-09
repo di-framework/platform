@@ -43,7 +43,7 @@ export const schemas = {
     properties: {
       user: string,
       account: string,
-      role: { type: 'string', enum: ['developer', 'viewer', 'owner'] },
+      role: { type: 'string', enum: ['developer', 'viewer'] },
       via: { type: 'string', enum: ['identity', 'api-key'] },
       credentialId: string,
     },

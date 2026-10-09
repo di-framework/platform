@@ -11,6 +11,8 @@
     "directory": "platform/tenant-auth"
   },
   "scripts": {
+    "start": "bun src/controller.ts",
+    "start:console": "bun src/console.ts",
     "test": "bun test"
   },
   "dependencies": {

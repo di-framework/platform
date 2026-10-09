@@ -335,7 +335,7 @@ export interface components {
             user: string;
             account: string;
             /** @enum {string} */
-            role: "developer" | "viewer" | "owner";
+            role: "developer" | "viewer";
             /** @enum {string} */
             via: "identity" | "api-key";
             credentialId?: string;
@@ -571,7 +571,7 @@ export interface operations {
                         user: string;
                         account: string;
                         /** @enum {string} */
-                        role: "developer" | "viewer" | "owner";
+                        role: "developer" | "viewer";
                         /** @enum {string} */
                         via: "identity" | "api-key";
                         credentialId?: string;

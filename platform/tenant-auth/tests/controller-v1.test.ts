@@ -26,6 +26,7 @@ describe('/v1 dispatch', () => {
     via: 'identity',
     credentialId: 's',
   };
+  const bob: Principal = { ...alice, user: 'bob', role: 'viewer' };
   const kube = new KubeClient({ server: api.url, token: 'admin' }, 'wasmcloud');
   const controller = new Controller(
     configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme' }),
@@ -34,6 +35,7 @@ describe('/v1 dispatch', () => {
     {
       resolve: async (authorization: string | null) => {
         if (authorization === 'Bearer ok') return alice;
+        if (authorization === 'Bearer viewer') return bob;
         throw new AuthError(401, 'a bearer token is required');
       },
       forget: () => {},
@@ -52,11 +54,15 @@ describe('/v1 dispatch', () => {
     api.stop();
   });
 
-  const call = (method: string, path: string, init: { body?: string; type?: string } = {}) =>
+  const call = (
+    method: string,
+    path: string,
+    init: { body?: string; type?: string; bearer?: string } = {},
+  ) =>
     fetch(`${base}${path}`, {
       method,
       headers: {
-        authorization: 'Bearer ok',
+        authorization: `Bearer ${init.bearer ?? 'ok'}`,
         ...(init.body !== undefined ? { 'content-type': init.type ?? 'application/json' } : {}),
       },
       body: init.body,
@@ -213,6 +219,76 @@ describe('/v1 dispatch', () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
       echo: '/api/v1/namespaces/di-tenant-acme/pods?limit=1',
+    });
+  });
+
+  describe('role policy', () => {
+    test.each([
+      ['GET', '/v1/deployments?env=prod', undefined],
+      ['GET', '/v1/deployments/stats?env=prod', undefined],
+      ['GET', '/v1/secrets?env=prod', undefined],
+      ['GET', '/v1/vars?env=prod', undefined],
+      ['GET', '/v1/services/web/logs?env=prod', undefined],
+      [
+        'POST',
+        '/v1/deploy/preview',
+        '{"env":"prod","service":"web","component":{"reference":"r","digest":"d"},"workload":{},"bindings":[],"secrets":[]}',
+      ],
+    ])('a viewer may call %s %s', async (method, path, body) => {
+      const response = await call(method, path, { body, bearer: 'viewer' });
+      expect(response.status).toBe(501);
+    });
+
+    test.each([
+      ['PUT', '/v1/secrets/db?env=prod', '{"value":"s3cret"}', 'setSecret'],
+      ['PATCH', '/v1/secrets/db?env=prod', '{"value":"s3cret"}', 'updateSecret'],
+      ['DELETE', '/v1/secrets/db?env=prod', undefined, 'unsetSecret'],
+      ['PUT', '/v1/vars/LEVEL?env=prod', '{"value":"debug"}', 'setVar'],
+      ['DELETE', '/v1/vars/LEVEL?env=prod', undefined, 'unsetVar'],
+      ['POST', '/v1/deployments/rollback', '{"env":"prod","service":"web"}', 'rollback'],
+      ['POST', '/v1/services', '{"env":"prod","type":"http","name":"web"}', 'createService'],
+      ['POST', '/v1/services/web/proxy', '{"env":"prod"}', 'proxy'],
+      [
+        'POST',
+        '/v1/deploy',
+        '{"env":"prod","service":"web","component":{"reference":"r","digest":"d"},"workload":{},"bindings":[],"secrets":[]}',
+        'deploy',
+      ],
+    ])('a viewer is refused %s %s with 403 problem+json', async (method, path, body, operation) => {
+      const response = await call(method, path, { body, bearer: 'viewer' });
+      expect(response.status).toBe(403);
+      expect(await problem(response)).toEqual({
+        type: 'about:blank',
+        title: 'Forbidden',
+        status: 403,
+        detail: `a viewer may not call ${operation}`,
+      } as never);
+      expect(reachedCluster('/v1')).toBe(false);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('"request.denied"'));
+    });
+
+    test('a developer may call the operations a viewer may not', async () => {
+      const response = await call('PUT', '/v1/secrets/db?env=prod', { body: '{"value":"v"}' });
+      expect(response.status).toBe(501);
+    });
+
+    test('a viewer keeps whoami and logout', async () => {
+      expect(await (await call('GET', '/v1/auth/whoami', { bearer: 'viewer' })).json()).toEqual(
+        bob as never,
+      );
+      expect((await call('POST', '/v1/auth/logout', { bearer: 'viewer' })).status).toBe(204);
+    });
+
+    test('validation still answers before the policy, and no credential is still 401', async () => {
+      expect(
+        (await call('PUT', '/v1/secrets/db?env=prod', { body: '{}', bearer: 'viewer' })).status,
+      ).toBe(400);
+      const anonymous = await fetch(`${base}/v1/secrets/db?env=prod`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: '{"value":"v"}',
+      });
+      expect(anonymous.status).toBe(401);
     });
   });
 });
