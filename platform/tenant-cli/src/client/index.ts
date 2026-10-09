@@ -1,5 +1,7 @@
-import type { components, operations, paths } from './schema';
-import { events } from './sse.ts';
+import type { components, operations, paths } from './schema.js';
+import { events } from './sse';
+
+export { events, type SseEvent } from './sse';
 
 type Json<
   Op extends keyof operations,

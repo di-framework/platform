@@ -32,6 +32,24 @@ Streaming operations (`logs`) are SSE: each `log` event's `data` is one `LogEven
 `end` closes the stream. The spec names this in the operation description; the framing itself is
 `src/client/sse.ts`.
 
+## Using the client
+
+`@di-framework/tenant-cli/client` is the published entry point: the typed `/v1` client
+(`createClient`, `ControllerError`, `events`, and the request/response types). It ships compiled
+(`dist`, with `.d.ts`), so consumers need no `.ts` import support. The package also installs the
+`di-tenant` command, which requires Bun (its shebang is `bun`).
+
+The `./src/api/*` export is workspace-internal: `../tenant-auth` uses it inside this repository, and it
+is not usable from the npm package (`src` is not published).
+
+```ts
+import { createClient } from '@di-framework/tenant-cli/client';
+
+const info = await createClient({ baseUrl: 'https://controller.example' }).authInfo();
+```
+
+`api/v1/openapi.yaml` ships alongside as the contract. `bun run build` produces `dist`.
+
 ## Registry
 
 Each tenant gets its own OCI registry component in its namespace (platform#83, decision in
