@@ -25,9 +25,18 @@ test('problem responses carry a detail only when given one', async () => {
   });
 });
 
-test('runtime schemas accept any input and expose their JSON schema', () => {
-  const bundle = { env: 'prod' };
+test('runtime schemas validate their input and expose their JSON schema', () => {
+  const bundle = {
+    env: 'prod',
+    service: 'web',
+    component: { reference: 'r', digest: 'd' },
+    workload: {},
+    bindings: [],
+    secrets: [],
+  };
   expect(DeployBundle.parse(bundle)).toBe(bundle);
+  expect(() => DeployBundle.parse({ env: 'prod' })).toThrow('body.service is required');
+  expect(Empty.parse(undefined)).toEqual({});
   expect(Empty.jsonSchema).toEqual({ type: 'object' });
   expect(DeployBundle.jsonSchema).toHaveProperty('required');
 });
