@@ -8,7 +8,7 @@ const DEVELOPERS: readonly Role[] = ['developer'];
 
 /**
  * Which tenant roles may call each `/v1` operation. The role is the caller's membership in this
- * tenant on their `User` resource. A viewer is read-only: it may read, preview, and manage its own
+ * tenant on their `User` resource. A viewer is read-only: it may read and manage its own
  * credential, but nothing that changes the tenant. Typed as a full record, so a new contract
  * operation does not compile until it declares a policy.
  */
@@ -16,9 +16,8 @@ export const POLICY: Record<OperationName, readonly Role[]> = {
   authInfo: EVERYONE,
   whoami: EVERYONE,
   logout: EVERYONE,
-  // Viewer-allowed only because the preview is computed from reads; it must never become a
-  // server-side dry-run through `asUser()`, which a viewer's RBAC would not permit.
-  previewDeploy: EVERYONE,
+  // Developer-only: a preview is a server-side dry-run apply, which needs write verbs.
+  previewDeploy: DEVELOPERS,
   deploy: DEVELOPERS,
   // Viewers pull from the tenant registry, so both roles may look it up.
   registry: EVERYONE,

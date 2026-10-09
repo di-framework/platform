@@ -11,13 +11,14 @@ import type { V1Context, V1Handler, V1Module } from './context.ts';
  */
 
 const LABEL = 'platform.di-framework.dev';
-const CONFIG = `${LABEL}/config`;
-const ENV = `${LABEL}/env`;
-const SECRET = `${LABEL}/secret`;
+/** Storage-contract label keys, shared with the deploy lane (platform#55). */
+export const CONFIG = `${LABEL}/config`;
+export const ENV = `${LABEL}/env`;
+export const SECRET = `${LABEL}/secret`;
 const UPDATED_AT = `${LABEL}/updated-at`;
 
 /** A DNS label that starts with a letter, so its environment variable name is valid too. */
-const SECRET_NAME = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
+export const SECRET_NAME = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
 const VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,252}$/;
 
 interface Metadata {
@@ -27,7 +28,7 @@ interface Metadata {
   labels?: Record<string, string>;
   annotations?: Record<string, string>;
 }
-interface Stored {
+export interface Stored {
   metadata: Metadata;
   data?: Record<string, string>;
 }
@@ -39,13 +40,13 @@ export const secretObjectName = (name: string, env: string) => `${name}.${env}`;
 /** The environment variable a secret is injected as. */
 export const secretEnvName = (name: string) => name.toUpperCase().replaceAll('-', '_');
 
-const namespace = (context: V1Context) => `/api/v1/namespaces/di-tenant-${context.tenant}`;
+export const namespace = (context: V1Context) => `/api/v1/namespaces/di-tenant-${context.tenant}`;
 const envOf = (call: HttpCall) => String(call.request.query?.env);
 const nameOf = (call: HttpCall) => call.request.params?.name ?? '';
 const valueIn = (command: unknown) => (command as { value: string }).value;
 const now = () => new Date().toISOString();
 
-async function find(kube: UserKube, path: string): Promise<Stored | undefined> {
+export async function find(kube: UserKube, path: string): Promise<Stored | undefined> {
   try {
     return await kube.call<Stored>('GET', path);
   } catch (error) {

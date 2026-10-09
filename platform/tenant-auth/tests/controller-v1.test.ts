@@ -99,7 +99,7 @@ describe('/v1 dispatch', () => {
     expect(reachedCluster('/v1')).toBe(false);
   });
 
-  test('a deploy bundle that matches the contract reaches its 501 handler', async () => {
+  test('a deploy bundle that matches the contract reaches its handler', async () => {
     const bundle = {
       env: 'prod',
       service: 'web',
@@ -108,8 +108,9 @@ describe('/v1 dispatch', () => {
       bindings: [{ name: 'kv', capability: 'wasi:keyvalue', config: { bucket: 'b' } }],
       secrets: ['db'],
     };
+    // The handler's own bundle validation answers, so the contract let it through.
     for (const path of ['/v1/deploy', '/v1/deploy/preview'])
-      expect((await call('POST', path, { body: JSON.stringify(bundle) })).status).toBe(501);
+      expect((await call('POST', path, { body: JSON.stringify(bundle) })).status).toBe(422);
   });
 
   test.each([
@@ -224,11 +225,6 @@ describe('/v1 dispatch', () => {
       ['GET', '/v1/deployments/stats?env=prod', undefined],
       ['GET', '/v1/services/web/logs?env=prod', undefined],
       ['GET', '/v1/deploy/registry', undefined],
-      [
-        'POST',
-        '/v1/deploy/preview',
-        '{"env":"prod","service":"web","component":{"reference":"r","digest":"d"},"workload":{},"bindings":[],"secrets":[]}',
-      ],
     ])('a viewer may call %s %s', async (method, path, body) => {
       const response = await call(method, path, { body, bearer: 'viewer' });
       expect(response.status).toBe(501);
@@ -249,6 +245,12 @@ describe('/v1 dispatch', () => {
         '/v1/deploy',
         '{"env":"prod","service":"web","component":{"reference":"r","digest":"d"},"workload":{},"bindings":[],"secrets":[]}',
         'deploy',
+      ],
+      [
+        'POST',
+        '/v1/deploy/preview',
+        '{"env":"prod","service":"web","component":{"reference":"r","digest":"d"},"workload":{},"bindings":[],"secrets":[]}',
+        'previewDeploy',
       ],
     ])('a viewer is refused %s %s with 403 problem+json', async (method, path, body, operation) => {
       const response = await call(method, path, { body, bearer: 'viewer' });
