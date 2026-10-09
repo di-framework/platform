@@ -3,7 +3,7 @@
  * Invoked by the patched upstream build recipe as
  * `bun "$DF_PGLITE_SOURCE_PATCH" "$SRC"` (see build-engine.ts).
  */
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { type Args, type Context, parseFlags, run, UsageError } from './lib/cli.ts';
 import { isDirectory } from './lib/fs.ts';
 
@@ -23,9 +23,22 @@ export function parseSourceArgs(argv: string[]): Args<{ source: string }> {
   return { help: false, source };
 }
 
-/** Resolve and validate the engine source directory. */
-export async function resolveSourceDir(source: string, cwd = process.cwd()): Promise<string> {
+/** Engine checkouts live under `target/engine` (see build-engine.ts). */
+export function engineRoot(pkgDir: string): string {
+  return join(pkgDir, 'target', 'engine');
+}
+
+/** Resolve the engine source directory, refusing anything outside `root`. */
+export async function resolveSourceDir(
+  source: string,
+  root: string,
+  cwd = process.cwd(),
+): Promise<string> {
   const resolved = resolve(cwd, source);
+  const base = resolve(root);
+  if (resolved !== base && !resolved.startsWith(`${base}/`)) {
+    throw new Error(`refusing source dir outside ${base}: ${resolved}`);
+  }
   if (!(await isDirectory(resolved))) throw new Error(`source dir does not exist: ${resolved}`);
   return resolved;
 }
@@ -115,7 +128,8 @@ export async function patch(ctx: Context, argv: string[]): Promise<void> {
     console.error(USAGE);
     return;
   }
-  await patchEngineSource(await resolveSourceDir(args.source), ctx.pkgDir);
+  const source = await resolveSourceDir(args.source, engineRoot(ctx.pkgDir));
+  await patchEngineSource(source, ctx.pkgDir);
 }
 
 if (import.meta.main) await run('patch-engine-source', patch);
