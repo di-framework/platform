@@ -39,7 +39,7 @@ login --controller <url> [--account <tenant>] [--api-key <key>]
 logout | whoami
 deploy preview|apply --env <prod|staging> --bundle <file>
 logs --service <name> --env <env> [--deployment <id>] [--follow] [--since <dur>] [--tail <n>]
-services create <http|cron|worker> --name <name> --env <env> [--port] [--route] [--schedule] [--command]
+services create <keyvalue|messaging|blobstore|postgres|egress> --name <name> --env <env> [--class] [--storage] [--memory] [--cpu] [--deletion-policy] [--destination]
 deployments list|stats --env <env> [--service <name>]
 deployments rollback --service <name> --env <env> [--to <id>]
 secrets|vars list|set|update|unset <name> --env <env> [--from-file <path|->]
@@ -70,4 +70,4 @@ instead of opening it.
   build that produces it is shared with `cli-plugin-platform` and is the next step.
 - The controller: every operation answers 501. `../tenant-auth`'s controller grows the
   endpoints behind this contract, importing the generated routes from `src/api/generated`.
-- The `proxy` tunnel transport (WebSocket) is described outside the document.
+- The `proxy` session URL is an HTTP passthrough the controller serves outside the document (`/v1/services/<service>/proxy/<session>/...`); WebSocket is not supported yet.

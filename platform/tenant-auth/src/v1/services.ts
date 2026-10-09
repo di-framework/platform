@@ -1,7 +1,150 @@
-import { notImplemented, type V1Module } from './context.ts';
+import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
+import type { V1Module } from './context.ts';
+import { proxySessions, SERVICE_NAME } from './proxy.ts';
 
-/** `/v1/services` creation and the service HTTP proxy (platform#56). */
+/** The backing-service types admission accepts, with the platform default class of each. */
+export const DEFAULT_CLASSES = {
+  keyvalue: 'keyvalue-redis',
+  messaging: 'messaging-nats',
+  blobstore: 'blobstore-nats',
+  postgres: 'postgres-dedicated',
+  egress: 'egress-public',
+} as const;
+type ServiceType = keyof typeof DEFAULT_CLASSES;
+
+const GROUP_VERSION = 'platform.di-framework.dev/v1alpha1';
+/** Records the `/v1` environment the service was created for. */
+export const ENV_ANNOTATION = 'platform.di-framework.dev/env';
+const QUANTITY = /^[0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|Ti)?$/;
+/** `host`, `*.suffix`, optionally with `:port`; the BackingService egress schema. */
+const DESTINATION =
+  /^(?:\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::([0-9]{1,5}))?$/;
+
+type Sizing = { storage?: string; memory?: string; cpu?: string };
+
+interface CreateServiceCommand {
+  env: string;
+  type: ServiceType;
+  name: string;
+  className?: string;
+  parameters?: Sizing;
+  deletionPolicy?: 'Retain' | 'Delete';
+  destinations?: string[];
+}
+
+interface BackingService {
+  metadata: { name: string; creationTimestamp?: string };
+  spec: {
+    type: ServiceType;
+    className?: string;
+    parameters?: Sizing;
+    deletionPolicy?: 'Retain' | 'Delete';
+    destinations?: string[];
+  };
+}
+
+function destinationValid(value: string): boolean {
+  const match = DESTINATION.exec(value);
+  if (match === null || value.length > 260) return false;
+  return match[1] === undefined || (Number(match[1]) >= 1 && Number(match[1]) <= 65535);
+}
+
+/** The admission rules a request can break, checked before the API server sees it. */
+function invalid(command: CreateServiceCommand): string | undefined {
+  if (command.name.length > 40 || !SERVICE_NAME.test(command.name))
+    return 'name must be a DNS label of at most 40 characters';
+  const fallback = DEFAULT_CLASSES[command.type];
+  if (command.className !== undefined && command.className !== fallback)
+    return `className for ${command.type} must be the platform default ${fallback}`;
+  for (const [key, value] of Object.entries(command.parameters ?? {}))
+    if (!QUANTITY.test(value as string)) return `parameters.${key} must be a quantity such as 1Gi`;
+  if (command.type === 'egress') {
+    if (!command.destinations?.length) return 'an egress service needs at least one destination';
+    const bad = command.destinations.find((d) => !destinationValid(d));
+    if (bad !== undefined) return `destination ${bad} must be host, *.suffix, or either with :port`;
+  } else if (command.destinations !== undefined) {
+    return 'destinations are only allowed on an egress service';
+  }
+  return undefined;
+}
+
+/** `/v1/services` creation and the service HTTP proxy session (platform#56). */
 export const services: V1Module = {
-  createService: notImplemented('createService'),
-  proxy: notImplemented('proxy'),
+  async createService(input, _call, context) {
+    const command = input as CreateServiceCommand;
+    const reason = invalid(command);
+    if (reason) return problem(422, 'Unprocessable Entity', reason);
+    const spec: BackingService['spec'] = { type: command.type };
+    if (command.destinations !== undefined) spec.destinations = command.destinations;
+    if (command.className !== undefined) spec.className = command.className;
+    if (command.parameters !== undefined && Object.keys(command.parameters).length > 0)
+      spec.parameters = command.parameters;
+    if (command.deletionPolicy !== undefined) spec.deletionPolicy = command.deletionPolicy;
+    const namespace = `di-tenant-${context.tenant}`;
+    const created = await context
+      .asUser()
+      .call<BackingService>(
+        'POST',
+        `/apis/${GROUP_VERSION}/namespaces/${namespace}/backingservices`,
+        {
+          apiVersion: GROUP_VERSION,
+          kind: 'BackingService',
+          metadata: { name: command.name, annotations: { [ENV_ANNOTATION]: command.env } },
+          spec,
+        },
+      );
+    context.audit('service.created', {
+      user: context.principal.user,
+      service: command.name,
+      type: command.type,
+      env: command.env,
+    });
+    return Response.json(
+      {
+        name: created.metadata.name,
+        env: command.env,
+        type: created.spec.type,
+        className: created.spec.className || DEFAULT_CLASSES[created.spec.type],
+        ...(created.spec.parameters ? { parameters: created.spec.parameters } : {}),
+        ...(created.spec.deletionPolicy ? { deletionPolicy: created.spec.deletionPolicy } : {}),
+        ...(created.spec.destinations ? { destinations: created.spec.destinations } : {}),
+        createdAt: created.metadata.creationTimestamp ?? new Date().toISOString(),
+      },
+      { status: 201 },
+    );
+  },
+
+  async proxy(input, call, context) {
+    const { env, port } = input as { env: string; port?: number };
+    const service = call.request.params?.service ?? '';
+    if (service.length > 63 || !SERVICE_NAME.test(service))
+      return problem(422, 'Unprocessable Entity', 'service must be a DNS label');
+    if (port !== undefined && port !== 80)
+      return problem(
+        422,
+        'Unprocessable Entity',
+        'only port 80, the tenant HTTP upstream, can be proxied',
+      );
+    const session = proxySessions.issue({
+      tenant: context.tenant,
+      user: context.principal.user,
+      service,
+      env,
+    });
+    context.audit('proxy.session', {
+      user: context.principal.user,
+      service,
+      env,
+      expiresAt: new Date(session.expiresAt).toISOString(),
+    });
+    const origin = new URL((call.request as { url: string }).url).origin;
+    return Response.json(
+      {
+        url: `${origin}/v1/services/${service}/proxy/${session.id}`,
+        port: 80,
+        expiresAt: new Date(session.expiresAt).toISOString(),
+      },
+      { status: 201 },
+    );
+  },
 };

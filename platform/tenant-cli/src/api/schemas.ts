@@ -169,15 +169,32 @@ export const schemas = {
   CreateServiceRequest: {
     type: 'object',
     description:
-      'Type-specific fields follow the type: `port` and `route` for http, `schedule` for cron, `command` for worker.',
+      'A backing service (BackingService) in the environment, shaped like `di-framework platform service create`. `destinations` is required for egress and only allowed there. http, cron and worker services come from the deploy bundle, not from this operation.',
     properties: {
       env: Environment,
-      type: { type: 'string', enum: ['http', 'cron', 'worker'] },
-      name: string,
-      port: integer,
-      route: { type: 'string', description: 'Public route pattern for an http service.' },
-      schedule: { type: 'string', description: 'Cron expression for a cron service.' },
-      command: { type: 'array', items: string, description: 'Entry command of a worker service.' },
+      type: { type: 'string', enum: ['keyvalue', 'messaging', 'blobstore', 'postgres', 'egress'] },
+      name: {
+        type: 'string',
+        description: 'DNS label, at most 40 characters: `^[a-z][a-z0-9]*(-[a-z0-9]+)*$`.',
+      },
+      className: {
+        type: 'string',
+        description:
+          'The platform default class for the type when absent (keyvalue-redis, messaging-nats, blobstore-nats, postgres-dedicated, egress-public); any other class is refused.',
+      },
+      parameters: {
+        type: 'object',
+        description: 'Sizing quantities such as `1Gi` or `500m`.',
+        properties: { storage: string, memory: string, cpu: string },
+        additionalProperties: false,
+      },
+      deletionPolicy: { type: 'string', enum: ['Retain', 'Delete'] },
+      destinations: {
+        type: 'array',
+        items: string,
+        description:
+          'Egress only: hosts the workload may reach (`host`, `*.suffix`, optionally `:port`).',
+      },
     },
     required: ['env', 'type', 'name'],
   },
@@ -187,14 +204,17 @@ export const schemas = {
     properties: {
       name: string,
       env: Environment,
-      type: { type: 'string', enum: ['http', 'cron', 'worker'] },
-      route: string,
-      port: integer,
-      schedule: string,
-      command: { type: 'array', items: string },
+      type: { type: 'string', enum: ['keyvalue', 'messaging', 'blobstore', 'postgres', 'egress'] },
+      className: string,
+      parameters: {
+        type: 'object',
+        properties: { storage: string, memory: string, cpu: string },
+      },
+      deletionPolicy: { type: 'string', enum: ['Retain', 'Delete'] },
+      destinations: { type: 'array', items: string },
       createdAt: dateTime,
     },
-    required: ['name', 'env', 'type', 'createdAt'],
+    required: ['name', 'env', 'type', 'className', 'createdAt'],
   },
 
   LogEvent: {
@@ -265,7 +285,7 @@ export const schemas = {
       env: Environment,
       port: {
         ...integer,
-        description: 'Service port to tunnel to; the service default when absent.',
+        description: 'Service port; only 80, the tenant HTTP upstream, is supported (the default).',
       },
     },
     required: ['env'],
@@ -274,7 +294,7 @@ export const schemas = {
   ProxySession: {
     type: 'object',
     description:
-      'A short-lived tunnel to one service. The CLI connects to `url` with the same bearer; the tunnel transport is WebSocket and is described outside this document.',
+      'A short-lived HTTP session to one service, bound to the caller. Requests to `url` and paths below it carry the same bearer and are forwarded to the service until `expiresAt`. The controller serves the session URL outside this document; WebSocket is not supported yet.',
     properties: {
       url: { type: 'string', format: 'uri' },
       port: integer,

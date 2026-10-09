@@ -18,6 +18,7 @@ import {
 } from './kube.ts';
 import { discover, type ProviderMetadata } from './oidc.ts';
 import { serveV1 } from './v1/index.ts';
+import { PASSTHROUGH, servePassthrough, tenantUpstream } from './v1/proxy.ts';
 
 export interface ControllerConfig {
   tenant: string;
@@ -107,6 +108,8 @@ const json = (body: unknown, code = 200) =>
 
 export class Controller {
   private readonly serviceAccountTokens = new Map<string, { token: string; expiresAt: number }>();
+  /** Where proxy sessions forward to; only overridden by tests. */
+  proxyUpstream: (tenant: string) => string = tenantUpstream;
 
   constructor(
     readonly config: ControllerConfig,
@@ -203,6 +206,15 @@ export class Controller {
       this.audit('request.failed', { path: url.pathname, reason: String(error) });
       return status(502, 'ServiceUnavailable', 'the identity provider or cluster is unavailable');
     }
+    // A proxy session URL (not a contract operation): forwarded to the session's service.
+    const session = PASSTHROUGH.exec(url.pathname);
+    if (session)
+      return servePassthrough(request, url, session, {
+        tenant: this.config.tenant,
+        principal,
+        upstream: this.proxyUpstream(this.config.tenant),
+        audit: (event, fields) => this.audit(event, fields),
+      });
     try {
       if (url.pathname.startsWith('/-/') || url.pathname.startsWith('/v1/'))
         return await this.own(request, url, principal);
