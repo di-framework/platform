@@ -99,6 +99,7 @@ describe('resource modules over real HTTP', () => {
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: (r) => controller.handle(r) });
   const base = `http://127.0.0.1:${server.port}`;
   let log: ReturnType<typeof spyOn>;
+  const lastAudit = () => JSON.parse(String(log.mock.calls.at(-1)?.[0])) as Record<string, unknown>;
   beforeAll(() => {
     log = spyOn(console, 'log').mockImplementation(() => {});
   });
@@ -134,21 +135,45 @@ describe('resource modules over real HTTP', () => {
           status,
           detail: error.message,
         });
+        expect(lastAudit()).toMatchObject({
+          event: 'request.failed',
+          user: 'alice',
+          method: 'GET',
+          path: '/v1/deployments',
+          status,
+          reason: error.message,
+        });
       } finally {
         module.deployments = stub;
       }
     },
   );
 
-  test('leaves other handler errors to the controller', async () => {
+  test('answers an unexpected handler error with a generic 500 and audits it', async () => {
     const module = MODULES.deploy as Record<string, V1Handler>;
     const stub = module.deployments as V1Handler;
     module.deployments = async () => {
-      throw new Error('boom');
+      throw new Error('boom: secret detail');
     };
     try {
       const response = await fetch(`${base}/v1/deployments?env=prod`);
-      expect(response.status).toBe(502);
+      expect(response.status).toBe(500);
+      expect(response.headers.get('content-type')).toBe('application/problem+json');
+      const text = await response.text();
+      expect(text).not.toContain('boom');
+      expect(JSON.parse(text)).toEqual({
+        type: 'about:blank',
+        title: 'Internal Server Error',
+        status: 500,
+        detail: 'the request failed unexpectedly',
+      });
+      expect(lastAudit()).toMatchObject({
+        event: 'request.failed',
+        user: 'alice',
+        path: '/v1/deployments',
+        status: 500,
+        reason: 'Error: boom: secret detail',
+      });
     } finally {
       module.deployments = stub;
     }

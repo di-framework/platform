@@ -63,7 +63,8 @@ const TITLES: Record<number, string> = {
 
 /** Maps an error a handler raised (API server, `asUser`, identity) to a problem response. */
 function failure(error: unknown): Response {
-  if (!(error instanceof KubeError || error instanceof AuthError)) throw error;
+  if (!(error instanceof KubeError || error instanceof AuthError))
+    return problem(500, 'Internal Server Error', 'the request failed unexpectedly');
   if (error.status >= 400 && error.status < 500)
     return problem(error.status, TITLES[error.status] ?? 'Client Error', error.message);
   return problem(502, 'Bad Gateway', error.message);
@@ -75,7 +76,16 @@ export async function serveV1(request: Request, context: V1Context): Promise<Res
   try {
     response = await current.run(context, () => dispatch(request));
   } catch (error) {
-    return failure(error);
+    const result = failure(error);
+    context.audit('request.failed', {
+      user: context.principal.user,
+      method: request.method,
+      path: new URL(request.url).pathname,
+      status: result.status,
+      reason:
+        error instanceof KubeError || error instanceof AuthError ? error.message : String(error),
+    });
+    return result;
   }
   return (
     response ??
