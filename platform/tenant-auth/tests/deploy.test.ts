@@ -22,8 +22,8 @@ describe('/v1/deploy', () => {
   const stored = new Map<string, Json>();
   /** Answers the next PATCH with this status and message instead of applying it. */
   let refusal: { status: number; message: string } | undefined;
-  /** Answers every request with 401, to show a rejected user token. */
-  let rejectToken = false;
+  /** Answers every request (or only PATCHes, or only workload requests) with 401. */
+  let rejectToken: boolean | 'patch' | 'workloads' = false;
   /** Answers the next PATCH with this response instead of applying it. */
   let rawPatch: (() => Response) | undefined;
   const api = serve((request: Recorded) => {
@@ -34,7 +34,12 @@ describe('/v1/deploy', () => {
           expirationTimestamp: new Date(Date.now() + 3_600_000).toISOString(),
         },
       });
-    if (rejectToken) return json({ message: 'Unauthorized' }, 401);
+    if (
+      rejectToken === true ||
+      (rejectToken === 'patch' && request.method === 'PATCH') ||
+      (rejectToken === 'workloads' && request.pathname.startsWith(WORKLOADS))
+    )
+      return json({ message: 'Unauthorized' }, 401);
     if (request.method === 'GET') {
       const object = stored.get(request.pathname);
       return object ? json(object) : json({ message: 'not found' }, 404);
@@ -544,14 +549,19 @@ describe('/v1/deploy', () => {
     expect(await response.json()).toMatchObject({ status: 502 });
   });
 
-  test('a token the API server keeps rejecting is a 502', async () => {
-    rejectToken = true;
+  test('a token the API server keeps rejecting on apply is a 502', async () => {
+    rejectToken = 'patch';
     const response = await post('/v1/deploy', deployBundle({ bindings: [] }));
     expect(response.status).toBe(502);
   });
 
-  test('a token the API server rejects on a preview read is a 502', async () => {
+  test('a token the API server rejects on the config reads is a 502', async () => {
     rejectToken = true;
+    expect((await post('/v1/deploy', deployBundle())).status).toBe(502);
+  });
+
+  test('a token the API server rejects on a preview read is a 502', async () => {
+    rejectToken = 'workloads';
     const response = await post('/v1/deploy/preview', deployBundle({ bindings: [] }));
     expect(response.status).toBe(502);
   });
@@ -566,8 +576,23 @@ describe('/v1/deploy against an unreachable API server', () => {
     );
     const alice = { user: 'alice', account: 'acme', role: 'developer', via: 'identity' } as const;
     const minting = new KubeClient({ server: tokens.url, token: 'admin' }, 'wasmcloud');
-    // Tokens mint against a live server; user requests go to a closed port.
-    const dead = new KubeClient({ server: 'http://127.0.0.1:1', token: 'admin' }, 'wasmcloud');
+    // Tokens mint against a live server; user reads find nothing, and an apply drops the socket.
+    const dropping = Bun.listen({
+      hostname: '127.0.0.1',
+      port: 0,
+      socket: {
+        data(socket, data) {
+          if (data.toString().startsWith('PATCH ')) return void socket.end();
+          socket.end(
+            'HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}',
+          );
+        },
+      },
+    });
+    const dead = new KubeClient(
+      { server: `http://127.0.0.1:${dropping.port}`, token: 'admin' },
+      'wasmcloud',
+    );
     Object.defineProperty(dead, 'call', { value: minting.call.bind(minting) });
     const controller = new Controller(
       configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme' }),
@@ -582,13 +607,14 @@ describe('/v1/deploy against an unreachable API server', () => {
         new Request('http://controller.test/v1/deploy', {
           method: 'POST',
           headers: { authorization: 'Bearer ok', 'content-type': 'application/json' },
-          body: JSON.stringify(deployBundle({ bindings: [] })),
+          body: JSON.stringify(deployBundle({ bindings: [], secrets: [] })),
         }),
       );
       expect(response.status).toBe(502);
     } finally {
       log.mockRestore();
       tokens.stop();
+      dropping.stop(true);
     }
   });
 });
