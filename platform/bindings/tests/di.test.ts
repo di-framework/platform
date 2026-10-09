@@ -3,7 +3,7 @@ import { Container as CoreContainer } from '@di-framework/core/container';
 import { Component, Container } from '@di-framework/core/decorators';
 import { KeyValue } from '../src/bindings/keyvalue.ts';
 import { Postgres } from '../src/bindings/postgres.ts';
-import { WasmCloudBinding } from '../src/decorator.ts';
+import { PlatformBinding } from '../src/decorator.ts';
 import { resetGuests, setGuests } from '../src/guests.ts';
 
 describe('DI resolution', () => {
@@ -14,7 +14,7 @@ describe('DI resolution', () => {
   it('injects binding classes by class identity', () => {
     const container = new CoreContainer();
 
-    @WasmCloudBinding('user-database')
+    @PlatformBinding('user-database')
     @Container({ container })
     class UserDatabase extends Postgres {}
 
@@ -31,7 +31,7 @@ describe('DI resolution', () => {
   it('allows registerValue overrides for tests', () => {
     const container = new CoreContainer();
 
-    @WasmCloudBinding('user-database')
+    @PlatformBinding('user-database')
     @Container({ container })
     class UserDatabase extends Postgres {}
 
@@ -48,11 +48,11 @@ describe('DI resolution', () => {
   it('composes two named key-value bindings in one container', () => {
     const container = new CoreContainer();
 
-    @WasmCloudBinding('sessions')
+    @PlatformBinding('sessions')
     @Container({ container })
     class Sessions extends KeyValue {}
 
-    @WasmCloudBinding('cache')
+    @PlatformBinding('cache')
     @Container({ container })
     class Cache extends KeyValue {}
 
@@ -77,7 +77,7 @@ describe('DI resolution', () => {
       },
     };
 
-    @WasmCloudBinding('sessions')
+    @PlatformBinding('sessions')
     class Sessions extends KeyValue {}
 
     const store = new Sessions();
@@ -95,7 +95,7 @@ describe('DI resolution', () => {
       },
     });
 
-    @WasmCloudBinding('sessions')
+    @PlatformBinding('sessions')
     class Sessions extends KeyValue {}
 
     const store = new Sessions();
@@ -104,7 +104,7 @@ describe('DI resolution', () => {
   });
 
   it('explains a missing guest in unit tests', () => {
-    @WasmCloudBinding('sessions')
+    @PlatformBinding('sessions')
     class Sessions extends KeyValue {}
     expect(() => new Sessions().open('bucket')).toThrow(/no guest implementation/);
   });

@@ -12,7 +12,12 @@ export {
   type CatalogEntry,
   isBindingKind,
 } from './catalog';
-export { WasmCloudBinding, type WasmCloudBindingOptions } from './decorator';
+export {
+  PlatformBinding,
+  type PlatformBindingOptions,
+  WasmCloudBinding,
+  type WasmCloudBindingOptions,
+} from './decorator';
 export {
   type GuestModules,
   resetGuests,
@@ -23,6 +28,7 @@ export {
 export {
   getBindingMetadata,
   isWitIdentifier,
+  type PlatformBindingMetadata,
   WASMCLOUD_BINDING_KEY,
   type WasmCloudBindingMetadata,
 } from './metadata';

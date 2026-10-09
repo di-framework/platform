@@ -2,22 +2,23 @@ import { Postgres } from './bindings/postgres';
 import {
   defineBindingMetadata,
   isWitIdentifier,
+  type PlatformBindingOptions,
   rejectsPlaintextSecret,
   type WasmCloudBindingOptions,
 } from './metadata';
 
-export type { WasmCloudBindingOptions };
+export type { PlatformBindingOptions, WasmCloudBindingOptions };
 
 /**
- * Declares a named wasmCloud host-interface binding on a concrete class.
+ * Declares a named platform host-interface binding on a concrete class.
  * Class identity is the DI token; `name` is the WIT import and hostInterfaces name.
  */
-export function WasmCloudBinding(name: string, options: WasmCloudBindingOptions = {}) {
+export function PlatformBinding(name: string, options: PlatformBindingOptions = {}) {
   // biome-ignore lint/suspicious/noExplicitAny: class decorator constructor
   return <T extends { new (...args: any[]): object }>(ctor: T): T => {
     if (!isWitIdentifier(name)) {
       throw new Error(
-        `WasmCloud binding name "${name}" must be a WIT identifier matching /^[a-z][a-z0-9-]*$/`,
+        `Platform binding name "${name}" must be a WIT identifier matching /^[a-z][a-z0-9-]*$/`,
       );
     }
     if (options.serviceName !== undefined) {
@@ -42,9 +43,14 @@ export function WasmCloudBinding(name: string, options: WasmCloudBindingOptions 
     }
     const secretProblem = rejectsPlaintextSecret(options.config);
     if (secretProblem !== undefined) {
-      throw new Error(`WasmCloud binding "${name}": ${secretProblem}`);
+      throw new Error(`Platform binding "${name}": ${secretProblem}`);
     }
     defineBindingMetadata(ctor, { name, options });
     return ctor;
   };
 }
+
+/**
+ * @deprecated Use `PlatformBinding` instead. This alias will be removed in the next major version.
+ */
+export const WasmCloudBinding = PlatformBinding;

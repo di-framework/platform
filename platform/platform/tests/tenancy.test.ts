@@ -1,5 +1,11 @@
 import { describe, expect, it, spyOn } from 'bun:test';
-import { type Api, ApiError, Controller, collection } from '../src/tenancy/controller';
+import {
+  type Api,
+  ApiError,
+  Controller,
+  collection,
+  summarizeConflict,
+} from '../src/tenancy/controller';
 import {
   type ControllerConfig,
   FINALIZER,
@@ -147,6 +153,46 @@ describe('tenant and user resource reconciliation', () => {
       });
       expect(api.objects.get(key(u))?.status).toBeDefined();
       expect(log).toHaveBeenCalledWith(expect.stringContaining('Refusing to adopt'));
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('names conflicting managers and fields when the hostgroup Deployment patch conflicts', async () => {
+    const { api, controller, t } = prepare();
+    const causes = Array.from({ length: 60 }, (_, i) => ({
+      reason: 'FieldManagerConflict',
+      message: `conflict with "manager-${i}" using apps/v1`,
+      field: `.spec.template.spec.containers[name="host"].env[name="VAR_${i}"].value`,
+    }));
+    const summary = summarizeConflict(
+      JSON.stringify({
+        kind: 'Status',
+        apiVersion: 'v1',
+        status: 'Failure',
+        reason: 'Conflict',
+        message: 'Apply failed with 60 conflicts',
+        details: { name: 'hostgroup-tenant-alpha', group: 'apps', kind: 'deployments', causes },
+        code: 409,
+      }),
+    );
+    const call = api.call.bind(api);
+    spyOn(api, 'call').mockImplementation(async (method: string, path: string, body?: unknown) => {
+      if (method === 'PATCH' && /\/deployments\/hostgroup-/.test(path))
+        throw new ApiError(409, `PATCH ${path} returned 409: ${summary}`);
+      return call(method, path, body);
+    });
+    const log = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await controller.tick();
+      const status = api.objects.get(key(t))?.status as {
+        conditions: { reason: string; message: string }[];
+      };
+      const condition = status.conditions[0]!;
+      expect(condition.reason).toBe('ReconcileError');
+      expect(condition.message).toContain('manager-0: .spec.template.spec.containers');
+      expect(condition.message).toContain('returned 409');
+      expect(condition.message.length).toBeLessThan(1500);
     } finally {
       log.mockRestore();
     }
