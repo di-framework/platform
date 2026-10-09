@@ -14,6 +14,7 @@ mod pgwire;
 
 use std::cell::{RefCell, RefMut};
 
+use engine::POSTGRES_VERSION;
 use exports::di_framework::pglite::database::{Connection, Guest, GuestConnection};
 use exports::di_framework::pglite::types::{Error, OpenOptions, Row, Value};
 use pgwire::{affected_from_tag, to_rows, Session};
@@ -46,17 +47,20 @@ fn is_savepoint_name(name: &str) -> bool {
     bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-fn describe(error: &Error) -> String {
+/// Redacted one-line summary for `stderr`: variant + SQLSTATE only, never the
+/// server message, SQL text, or parameter values (they may carry PII).
+/// Full details still reach the caller via the returned `Error`.
+fn describe_redacted(error: &Error) -> String {
     match error {
-        Error::OpenFailed(text) => format!("open failed: {text}"),
+        Error::OpenFailed(_) => "open failed".to_string(),
         Error::Closed => "connection is closed".to_string(),
-        Error::InvalidSql(text) => format!("invalid sql: {text}"),
-        Error::InvalidParams(text) => format!("invalid params: {text}"),
-        Error::ExecutionFailed(pg) => format!("postgres {}: {}", pg.code, pg.message),
-        Error::ValueConversionFailed(text) => format!("value conversion failed: {text}"),
-        Error::ConnectionLost(text) => format!("connection lost: {text}"),
-        Error::InvalidTransactionState(text) => format!("invalid transaction state: {text}"),
-        Error::Other(text) => text.clone(),
+        Error::InvalidSql(_) => "invalid sql".to_string(),
+        Error::InvalidParams(_) => "invalid params".to_string(),
+        Error::ExecutionFailed(pg) => format!("postgres {}", pg.code),
+        Error::ValueConversionFailed(_) => "value conversion failed".to_string(),
+        Error::ConnectionLost(_) => "connection lost".to_string(),
+        Error::InvalidTransactionState(_) => "invalid transaction state".to_string(),
+        Error::Other(_) => "other".to_string(),
     }
 }
 
@@ -87,7 +91,10 @@ impl Guest for Provider {
     }
 
     fn server_version() -> Result<String, Error> {
-        Ok("17.5".into())
+        // Single source of truth with the engine recipe: `engine::POSTGRES_VERSION`
+        // tracks `PG_VERSION=17.5` in `scripts/build-engine.sh`. The smoke
+        // consumer asserts `version.contains("17.5")`.
+        Ok(POSTGRES_VERSION.into())
     }
 }
 
@@ -97,7 +104,9 @@ impl GuestConnection for DbConn {
 
         let sess = live(&mut guard)?;
         let out = sess.simple(&sql).map_err(|e| {
-            eprintln!("pglite exec failed: {}", describe(&e));
+            // Redacted: server messages/SQL may hold PII; stderr gets only
+            // the variant + SQLSTATE.
+            eprintln!("pglite exec failed: {}", describe_redacted(&e));
             e
         })?;
         guard.last_affected = out
@@ -112,7 +121,7 @@ impl GuestConnection for DbConn {
         let mut guard = locked(self)?;
         let sess = live(&mut guard)?;
         let out = sess.extended(&sql, &params).map_err(|e| {
-            eprintln!("pglite run failed: {}", describe(&e));
+            eprintln!("pglite run failed: {}", describe_redacted(&e));
             e
         })?;
         let affected = out
@@ -128,7 +137,7 @@ impl GuestConnection for DbConn {
         let mut guard = locked(self)?;
         let sess = live(&mut guard)?;
         let out = sess.extended(&sql, &params).map_err(|e| {
-            eprintln!("pglite query failed: {}", describe(&e));
+            eprintln!("pglite query failed: {}", describe_redacted(&e));
             e
         })?;
         to_rows(out)
@@ -216,12 +225,22 @@ impl GuestConnection for DbConn {
     }
 
     fn in_transaction(&self) -> bool {
+        // WIT returns `bool`, so a busy borrow cannot surface as an error
+        // without breaking the `di-framework:pglite@0.1.0` API. Borrows are
+        // method-local and WASM is single-threaded, so contention is
+        // unreachable in practice (it would require re-entrant WIT calls).
+        // Fail closed: report `true` when busy to block a nested `begin`.
         self.0
             .try_borrow()
-            .is_ok_and(|guard| guard.sess.as_ref().is_some_and(Session::in_transaction))
+            .map(|guard| guard.sess.as_ref().is_some_and(Session::in_transaction))
+            .unwrap_or(true)
     }
 
     fn rows_affected(&self) -> u64 {
+        // Same WIT constraint as `in_transaction`: contention is unreachable
+        // (see above). Returning `0` when busy preserves the prior contract;
+        // tracking last-known outside the `RefCell` would require a WIT-visible
+        // state change, noted for a future API revision.
         self.0
             .try_borrow()
             .map(|guard| guard.last_affected)
@@ -233,7 +252,8 @@ impl GuestConnection for DbConn {
         if guard.sess.is_none() {
             return Err(Error::Closed);
         }
-        let result = guard.sess.as_mut().unwrap().close();
+        let sess = guard.sess.as_mut().ok_or(Error::Closed)?;
+        let result = sess.close();
         guard.sess = None;
         result
     }
