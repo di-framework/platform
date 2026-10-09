@@ -85,7 +85,11 @@ describe('/v1/deploy', () => {
             value === undefined ? (key as string) in labels : labels[key as string] === value,
           );
         });
-      return json({ items });
+      // A metadata-only list (PartialObjectMetadataList) drops everything but metadata.
+      const metadataOnly = request.headers.get('accept')?.includes('as=PartialObjectMetadataList');
+      return json({
+        items: metadataOnly ? items.map((object) => ({ metadata: object.metadata })) : items,
+      });
     }
     if (request.method === 'GET') {
       const object = stored.get(request.pathname);
@@ -239,6 +243,8 @@ describe('/v1/deploy', () => {
       name: 'web-prod',
       namespace: 'di-tenant-acme',
       labels: LABELS,
+      // The workload names the revision it runs (platform#55:history).
+      annotations: { 'platform.di-framework.dev/revision': 'web-prod.1' },
     });
     expect(applied.spec.replicas).toBe(1);
     expect(applied.spec.template.spec.environment).toBe('di-tenant-acme');
@@ -857,13 +863,27 @@ describe('/v1/deploy', () => {
       ).toEqual({ secretFrom: [{ name: 'api-token.prod' }] });
     });
 
-    /** Stores a revision as a deploy would have; `state` absent is a revision that went live. */
+    /**
+     * Stores a revision as a deploy would have; `state` absent is a revision that went live.
+     * `running` also stores its WorkloadDeployment naming it, as the deploy applied it.
+     */
     const seedRevision = (
       service: string,
       env: string,
       n: number,
-      options: { createdAt?: string; state?: string; bundle?: string; label?: string } = {},
-    ) =>
+      options: {
+        createdAt?: string;
+        state?: string;
+        bundle?: string;
+        digest?: string;
+        label?: string;
+        component?: string;
+        running?: boolean;
+      } = {},
+    ) => {
+      const bundle =
+        options.bundle ??
+        JSON.stringify(deployBundle({ service, env: env as 'prod', bindings: [] }));
       stored.set(`${REVISIONS}${service}-${env}.${n}`, {
         metadata: {
           name: `di-deploy-${service}-${env}.${n}`,
@@ -875,16 +895,34 @@ describe('/v1/deploy', () => {
           annotations: {
             'platform.di-framework.dev/created-at':
               options.createdAt ?? new Date(Date.UTC(2026, 0, 1, 0, n)).toISOString(),
+            'platform.di-framework.dev/component':
+              options.component ?? JSON.stringify(deployBundle().component),
             ...(options.state ? { 'platform.di-framework.dev/revision-state': options.state } : {}),
           },
         },
         data: {
-          bundle:
-            options.bundle ??
-            JSON.stringify(deployBundle({ service, env: env as 'prod', bindings: [] })),
-          digest: 'sha256:0',
+          bundle,
+          digest:
+            options.digest ??
+            `sha256:${new Bun.CryptoHasher('sha256').update(bundle).digest('hex')}`,
         },
       });
+      if (options.running) runs(`${service}-${env}`, `${service}-${env}.${n}`);
+    };
+    /** Stores (or points) the WorkloadDeployment `name` as one that runs revision `id`. */
+    const runs = (name: string, id: string) => {
+      const key = `${WORKLOADS}/${name}`;
+      const object = (stored.get(key) ?? {
+        metadata: { name, labels: { [MANAGED_BY]: MANAGED_BY_VALUE } },
+      }) as { metadata: Json };
+      stored.set(key, {
+        ...object,
+        metadata: {
+          ...object.metadata,
+          annotations: { 'platform.di-framework.dev/revision': id },
+        },
+      });
+    };
     const stateOf = (id: string) =>
       ((revision(id)?.metadata as Json | undefined)?.annotations as Json | undefined)?.[
         'platform.di-framework.dev/revision-state'
@@ -926,11 +964,131 @@ describe('/v1/deploy', () => {
       expect(writes.map((r) => r.method)).toEqual(['DELETE', 'POST']);
     });
 
-    test('never prunes the running revision of a service, even over the budget', async () => {
-      for (let n = 1; n <= HISTORY_TENANT_BUDGET; n++) seedRevision(`s${n}`, 'prod', 1);
+    test('a live revision whose workload is gone or runs another revision is pruned', async () => {
+      // s1 was destroyed, s2 runs a revision other than its live one; the rest run theirs.
+      for (let n = 1; n <= HISTORY_TENANT_BUDGET; n++)
+        seedRevision(`s${n}`, 'prod', 1, {
+          running: n > 2,
+          createdAt: new Date(Date.UTC(2026, 0, 1, 0, n)).toISOString(),
+        });
+      runs('s2-prod', 's2-prod.9');
       expect((await deployed()).id).toBe('web-prod.1');
-      expect(revisionKeys()).toHaveLength(HISTORY_TENANT_BUDGET + 1);
-      expect(api.requests.some((r) => r.method === 'DELETE')).toBe(false);
+      expect(revisionKeys()).toHaveLength(HISTORY_TENANT_BUDGET);
+      expect(revision('s1-prod.1')).toBeUndefined();
+      expect(revision('s2-prod.1')).toBeDefined();
+      expect(stateOf('s2-prod.1')).toBe('replaced');
+    });
+
+    test('a 507 before anything is applied when running revisions fill the tenant budget', async () => {
+      for (let n = 1; n <= HISTORY_TENANT_BUDGET; n++)
+        seedRevision(`s${n}`, 'prod', 1, { running: true });
+      const response = await post('/v1/deploy', deployBundle());
+      expect(response.status).toBe(507);
+      expect(((await response.json()) as Json).detail).toBe(
+        `the ${HISTORY_TENANT_BUDGET} revisions running workloads fill the tenant's deploy history budget of ${HISTORY_TENANT_BUDGET}, so nothing was applied`,
+      );
+      expect(patches()).toHaveLength(0);
+      expect(revisionKeys()).toHaveLength(HISTORY_TENANT_BUDGET);
+      expect(api.requests.some((r) => ['POST', 'DELETE'].includes(r.method))).toBe(false);
+    });
+
+    test('revisions are listed as metadata only, and only a rollback target is fetched whole', async () => {
+      await deployed(withReplicas(1));
+      await deployed(withReplicas(2));
+      api.requests.length = 0;
+      expect((await post('/v1/deployments/rollback', { env: 'prod', service: 'web' })).status).toBe(
+        202,
+      );
+      const reads = api.requests.filter(
+        (r) => r.method === 'GET' && r.pathname.startsWith(`${CORE}/configmaps`),
+      );
+      const lists = reads.filter((r) => r.path.includes('labelSelector'));
+      expect(lists.length).toBeGreaterThan(0);
+      for (const list of lists)
+        expect(list.headers.get('accept')).toBe(
+          'application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1',
+        );
+      // The target bundle, then the revisions the marks re-read.
+      expect(reads.filter((r) => !r.path.includes('labelSelector'))[0]?.pathname).toBe(
+        `${REVISIONS}web-prod.1`,
+      );
+    });
+
+    test('a bundle cannot set the annotation that names the running revision', async () => {
+      const bundle = deployBundle();
+      bundle.workload.metadata = { annotations: { 'platform.di-framework.dev/revision': 'x' } };
+      const response = await post('/v1/deploy', bundle);
+      expect(response.status).toBe(422);
+      expect(patches()).toHaveLength(0);
+    });
+
+    test('a crash between apply and mark is repaired from the workload on the next read and deploy', async () => {
+      await deployed(withReplicas(1));
+      // The marks of web-prod.2 fail, as when the controller restarts after the apply.
+      putConflicts = UPDATE_ATTEMPTS;
+      await deployed(withReplicas(2));
+      expect(stateOf('web-prod.2')).toBe('pending');
+      expect(stateOf('web-prod.1')).toBe('live');
+      setReady('web-prod', 'True', '2026-10-01T00:00:00Z');
+      expect(await listed()).toEqual([
+        ['web-prod.2', 'ready'],
+        ['web-prod.1', 'pending'],
+      ]);
+      const stats = (await (await get('/v1/deployments/stats?env=prod')).json()) as Json;
+      expect(stats).toMatchObject({ deployments: 2, ready: 1 });
+      // Reads do not write; the next deploy does.
+      expect(stateOf('web-prod.2')).toBe('pending');
+      await deployed(withReplicas(3));
+      expect(stateOf('web-prod.3')).toBe('live');
+      expect(stateOf('web-prod.2')).toBe('replaced');
+      expect(stateOf('web-prod.1')).toBe('replaced');
+      const rollback = await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
+      expect(((await rollback.json()) as Json).id).toBe('web-prod.4');
+      expect(appliedReplicas()).toBe(2);
+    });
+
+    test('out-of-order concurrent applies: the revision the workload runs is the live one', async () => {
+      await deployed(withReplicas(1));
+      // Deploy B reserved web-prod.3 and applied first; deploy A (web-prod.2) applied last, and
+      // both marked their revision live.
+      seedRevision('web', 'prod', 2, {
+        bundle: JSON.stringify(withReplicas(2)),
+        running: true,
+      });
+      seedRevision('web', 'prod', 3, { bundle: JSON.stringify(withReplicas(3)) });
+      expect((await listed('env=prod&service=web')).map(([id]) => id)).toEqual([
+        'web-prod.3',
+        'web-prod.2',
+        'web-prod.1',
+      ]);
+      const response = await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
+      expect(((await response.json()) as Json).id).toBe('web-prod.4');
+      // The default target is the revision before the running web-prod.2, not before web-prod.3.
+      expect(appliedReplicas()).toBe(1);
+      expect(stateOf('web-prod.3')).toBe('replaced');
+      expect(stateOf('web-prod.2')).toBe('replaced');
+      expect(stateOf('web-prod.4')).toBe('live');
+    });
+
+    test('rollback of a stored bundle that fails its digest or is incomplete is a 422', async () => {
+      const cases: [Parameters<typeof seedRevision>[3], string][] = [
+        [{ digest: 'sha256:0' }, 'does not match its stored digest'],
+        [{ bundle: '{not json' }, 'stores a bundle that is not JSON'],
+        [{ bundle: JSON.stringify({ service: 'web', env: 'prod' }) }, 'incomplete bundle'],
+        [
+          { bundle: JSON.stringify({ ...deployBundle({ bindings: [] }), secrets: [1] }) },
+          'incomplete bundle',
+        ],
+      ];
+      for (const [options, detail] of cases) {
+        stored.clear();
+        seedRevision('web', 'prod', 1, { state: 'replaced', ...options });
+        seedRevision('web', 'prod', 2, { running: true });
+        const response = await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
+        expect(response.status).toBe(422);
+        expect(((await response.json()) as Json).detail).toContain(detail);
+      }
+      expect(patches()).toHaveLength(0);
     });
 
     test('a prune that a concurrent deploy already made counts as done', async () => {
@@ -1062,7 +1220,7 @@ describe('/v1/deploy', () => {
     test('order within a service comes from <n>, across services from created-at then name', async () => {
       // web-prod.2 was created on a clock behind web-prod.1's, at the same instant as api-prod.1.
       seedRevision('web', 'prod', 1, { createdAt: '2026-01-02T00:00:00.000Z', state: 'replaced' });
-      seedRevision('web', 'prod', 2, { createdAt: '2026-01-01T00:00:00.000Z' });
+      seedRevision('web', 'prod', 2, { createdAt: '2026-01-01T00:00:00.000Z', running: true });
       seedRevision('api', 'prod', 1, { createdAt: '2026-01-01T00:00:00.000Z' });
       const items = await listed();
       expect(items.map(([id]) => id)).toEqual(['web-prod.2', 'api-prod.1', 'web-prod.1']);
@@ -1080,9 +1238,8 @@ describe('/v1/deploy', () => {
     test('hand-edited revisions are skipped with a logged reason', async () => {
       await deployed();
       seedRevision('web', 'prod', 7, { label: 'seven' });
-      seedRevision('web', 'prod', 8, { bundle: '{not json' });
-      seedRevision('web', 'prod', 9, { bundle: JSON.stringify(deployBundle({ service: 'api' })) });
-      seedRevision('web', 'prod', 10, { bundle: JSON.stringify({ service: 'web', env: 'prod' }) });
+      seedRevision('web', 'prod', 8, { component: '{not json' });
+      seedRevision('web', 'prod', 9, { component: JSON.stringify({ reference: 1 }) });
       seedRevision('web', 'prod', 11, { state: 'unknown' });
       stored.set(`${REVISIONS}web-prod.12`, {
         metadata: {
@@ -1102,9 +1259,8 @@ describe('/v1/deploy', () => {
       );
       for (const reason of [
         'is not a positive integer',
-        'bundle is not JSON',
-        'bundle does not match',
-        'bundle has no component',
+        'component is not JSON',
+        'component is not a component',
         'is not a known state',
         'name is not di-deploy-web-prod.13',
         'service or env label is invalid',

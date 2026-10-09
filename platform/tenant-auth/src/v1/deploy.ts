@@ -38,6 +38,7 @@ interface KubeObject {
     namespace?: string;
     generation?: number;
     labels?: Record<string, string>;
+    annotations?: Record<string, string>;
     [key: string]: unknown;
   };
   spec?: Record<string, unknown>;
@@ -256,11 +257,15 @@ function inject(template: Json, sources: ConfigRefs): Json {
   };
 }
 
-/** The objects a bundle applies, in apply order: bindings first, then the workload. */
+/**
+ * The objects a bundle applies, in apply order: bindings first, then the workload. A deploy names
+ * its `revision` on the workload (`RUNNING`), which a bundle cannot set (`PASSTHROUGH_PREFIX`).
+ */
 function render(
   bundle: DeployBundle,
   tenant: string,
   refs: ConfigRefs,
+  revision?: string,
 ): { path: string; object: KubeObject }[] {
   const namespace = `di-tenant-${tenant}`;
   const name = `${bundle.service}-${bundle.env}`;
@@ -284,6 +289,14 @@ function render(
       name,
       namespace,
       labels: { ...(metadata.labels as Record<string, string>), ...labels },
+      ...(revision
+        ? {
+            annotations: {
+              ...(metadata.annotations as Record<string, string>),
+              [RUNNING]: revision,
+            },
+          }
+        : {}),
     },
     spec: {
       ...spec,
@@ -323,30 +336,47 @@ function render(
   ];
 }
 
+/** Sends one request as the calling user; a rejected token or a network failure is a 502. */
+async function send<T>(
+  user: UserKube,
+  method: string,
+  path: string,
+  headers: Record<string, string>,
+  body?: string,
+): Promise<T> {
+  const bare = path.split('?')[0];
+  try {
+    const response = await user.fetch(method, path, {
+      headers,
+      body,
+      signal: AbortSignal.timeout(KUBE_TIMEOUT_MS),
+    });
+    if (response.status === 401) {
+      await response.body?.cancel();
+      throw new KubeError(502, `${method} ${bare} rejected the user's token`);
+    }
+    return await readKubeResponse<T>(method, path, response);
+  } catch (error) {
+    if (error instanceof KubeError) throw error;
+    throw new KubeError(502, `${method} ${bare} failed: ${String(error)}`);
+  }
+}
+
 /** Server-side applies one object as the calling user; `dryRun` changes nothing. */
-async function apply(
+function apply(
   user: UserKube,
   path: string,
   object: KubeObject,
   dryRun: boolean,
 ): Promise<KubeObject> {
-  const target = `${path}?fieldManager=${FIELD_MANAGER}${dryRun ? '&dryRun=All' : ''}`;
-  try {
-    const response = await user.fetch('PATCH', target, {
-      headers: { Accept: 'application/json', 'Content-Type': 'application/apply-patch+yaml' },
-      // JSON is YAML, so the API server reads the object as an apply configuration.
-      body: JSON.stringify(object),
-      signal: AbortSignal.timeout(KUBE_TIMEOUT_MS),
-    });
-    if (response.status === 401) {
-      await response.body?.cancel();
-      throw new KubeError(502, `PATCH ${path} rejected the user's token`);
-    }
-    return await readKubeResponse<KubeObject>('PATCH', path, response);
-  } catch (error) {
-    if (error instanceof KubeError) throw error;
-    throw new KubeError(502, `PATCH ${path} failed: ${String(error)}`);
-  }
+  // JSON is YAML, so the API server reads the object as an apply configuration.
+  return send<KubeObject>(
+    user,
+    'PATCH',
+    `${path}?fieldManager=${FIELD_MANAGER}${dryRun ? '&dryRun=All' : ''}`,
+    { Accept: 'application/json', 'Content-Type': 'application/apply-patch+yaml' },
+    JSON.stringify(object),
+  );
 }
 
 /** Reads the current object as the calling user; undefined when it does not exist yet. */
@@ -391,12 +421,17 @@ function changedFields(before: KubeObject, after: KubeObject): string[] {
  */
 export const REVISION_PREFIX = 'di-deploy-';
 export const REVISION = 'platform.di-framework.dev/deploy-revision';
+/** The revision id a deploy applied, on the WorkloadDeployment: the source of the running one. */
+export const RUNNING = 'platform.di-framework.dev/revision';
 const CREATED_AT = 'platform.di-framework.dev/created-at';
+/** The bundle's component as JSON, so lists read metadata only. */
+const COMPONENT = 'platform.di-framework.dev/component';
 /** Where the revision is in the reserve-apply-mark protocol (README "Deploy history"). */
 const STATE = 'platform.di-framework.dev/revision-state';
 const STATUS = 'platform.di-framework.dev/status';
 const READY_AT = 'platform.di-framework.dev/ready-at';
 const ROLLBACK_OF = 'platform.di-framework.dev/rollback-of';
+const METADATA_LIST = 'application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1';
 /**
  * The tenant namespace allows `count/configmaps: 100` (resources.ts), shared with `di-vars-<env>`,
  * the `di-logs-*` projections and `kube-root-ca.crt`; revisions stay within these budgets.
@@ -429,7 +464,7 @@ interface RevisionObject {
   [key: string]: unknown;
 }
 
-/** A revision ConfigMap that passed `parseRevision`. */
+/** A revision ConfigMap's metadata that passed `parseRevision`. */
 interface Revision {
   object: RevisionObject;
   id: string;
@@ -438,13 +473,13 @@ interface Revision {
   env: string;
   state: State;
   createdAt: string;
-  bundle: DeployBundle;
+  component: DeployBundle['component'];
 }
 
 const coreNamespace = (tenant: string) => `/api/v1/namespaces/di-tenant-${tenant}`;
 const configmapsPath = (tenant: string) => `${coreNamespace(tenant)}/configmaps`;
-const workloadPath = (tenant: string, name: string) =>
-  `/apis/${WORKLOAD_API}/namespaces/di-tenant-${tenant}/workloaddeployments/${name}`;
+const workloadsPath = (tenant: string) =>
+  `/apis/${WORKLOAD_API}/namespaces/di-tenant-${tenant}/workloaddeployments`;
 const bindingsPath = (tenant: string) =>
   `/apis/${BINDING_API}/namespaces/di-tenant-${tenant}/servicebindings`;
 const validService = (service: unknown): service is string =>
@@ -453,6 +488,8 @@ const INVALID_SERVICE = 'service must be a DNS label of at most 40 characters';
 const groupOf = (revision: { service: string; env: string }) =>
   `${revision.service}-${revision.env}`;
 const nameOf = (revision: Revision) => revision.object.metadata.name;
+const isComponent = (value: unknown): value is DeployBundle['component'] =>
+  isObject(value) && typeof value.reference === 'string' && typeof value.digest === 'string';
 
 /** A revision ConfigMap as a `Revision`, or undefined (logged) when it was edited out of shape. */
 function parseRevision(object: RevisionObject): Revision | undefined {
@@ -469,15 +506,13 @@ function parseRevision(object: RevisionObject): Revision | undefined {
     return skip('service or env label is invalid');
   const id = `${service}-${env}.${label}`;
   if (name !== `${REVISION_PREFIX}${id}`) return skip(`name is not ${REVISION_PREFIX}${id}`);
-  let bundle: unknown;
+  let component: unknown;
   try {
-    bundle = JSON.parse(object.data?.bundle ?? '');
+    component = JSON.parse(annotations[COMPONENT] ?? '');
   } catch {
-    return skip('bundle is not JSON');
+    return skip(`${COMPONENT} is not JSON`);
   }
-  if (!isObject(bundle) || bundle.service !== service || bundle.env !== env)
-    return skip('bundle does not match the service and env labels');
-  if (!isObject(bundle.component)) return skip('bundle has no component');
+  if (!isComponent(component)) return skip(`${COMPONENT} is not a component`);
   const state = annotations[STATE] ?? 'live';
   if (!STATES.includes(state)) return skip(`${STATE} is not a known state`);
   return {
@@ -488,7 +523,7 @@ function parseRevision(object: RevisionObject): Revision | undefined {
     env,
     state: state as State,
     createdAt: annotations[CREATED_AT] ?? '',
-    bundle: bundle as unknown as DeployBundle,
+    component,
   };
 }
 
@@ -512,20 +547,25 @@ function ordered(items: Revision[]): Revision[] {
   return byTime.map((revision) => groups.get(groupOf(revision))?.shift() as Revision);
 }
 
-/** The well-formed revisions in the tenant matching `filter`, newest first (`ordered`). */
+/**
+ * The well-formed revisions in the tenant matching `filter`, newest first (`ordered`). Only their
+ * metadata is listed; `load` fetches the one bundle a rollback needs.
+ */
 async function revisions(
   user: UserKube,
   tenant: string,
-  filter: { env?: string; service?: string } = {},
+  filter: { env?: string; service?: string },
 ): Promise<Revision[]> {
   const selector = [
     REVISION,
     ...(filter.env ? [`${ENV}=${filter.env}`] : []),
     ...(filter.service ? [`${SERVICE_LABEL}=${filter.service}`] : []),
   ];
-  const list = await user.call<{ items?: RevisionObject[] }>(
+  const list = await send<{ items?: RevisionObject[] }>(
+    user,
     'GET',
     `${configmapsPath(tenant)}?labelSelector=${encodeURIComponent(selector.join(','))}`,
+    { Accept: METADATA_LIST },
   );
   return ordered(
     (list.items ?? [])
@@ -535,18 +575,53 @@ async function revisions(
   );
 }
 
-/** The revision running in each service/env: its highest-numbered `live` one. */
-function currents(items: Revision[]): Map<string, Revision> {
-  const result = new Map<string, Revision>();
-  for (const revision of [...items].sort(byNumber))
-    if (revision.state === 'live' && !result.has(groupOf(revision)))
-      result.set(groupOf(revision), revision);
-  return result;
+/** A state change the history read derived from the workloads, to be written back by a deploy. */
+interface Mark {
+  revision: Revision;
+  state: State;
+}
+
+/** The revisions, the tenant's workloads by name, and each service/env's running revision. */
+interface History {
+  items: Revision[];
+  workloads: Map<string, KubeObject>;
+  running: Map<string, Revision>;
+  marks: Mark[];
+}
+
+/**
+ * Reads the history. The running revision of a service/env is the one its WorkloadDeployment
+ * names (`RUNNING`), whatever its ConfigMap says: that revision reads as `live`, and any other
+ * `live` one as `replaced`. This repairs history after a crash between apply and mark, after
+ * out-of-order concurrent applies, and for workloads that were destroyed. `marks` lists what
+ * changed; reads only report them, and the next deploy writes them.
+ */
+async function history(
+  user: UserKube,
+  tenant: string,
+  filter: { env?: string; service?: string } = {},
+): Promise<History> {
+  const items = await revisions(user, tenant, filter);
+  const list = await user.call<{ items?: KubeObject[] }>(
+    'GET',
+    `${workloadsPath(tenant)}?labelSelector=${encodeURIComponent(`${MANAGED_BY}=${MANAGED_BY_VALUE}`)}`,
+  );
+  const workloads = new Map((list.items ?? []).map((item) => [item.metadata.name, item]));
+  const running = new Map<string, Revision>();
+  const marks: Mark[] = [];
+  for (const revision of items) {
+    const named = workloads.get(groupOf(revision))?.metadata.annotations?.[RUNNING] === revision.id;
+    if (named) running.set(groupOf(revision), revision);
+    const state = named ? 'live' : revision.state === 'live' ? 'replaced' : revision.state;
+    if (state === revision.state) continue;
+    marks.push({ revision, state });
+    revision.state = state;
+  }
+  return { items, workloads, running, marks };
 }
 
 /** The live rollout state of a WorkloadDeployment, from its Ready condition. */
-async function liveStatus(user: UserKube, tenant: string, name: string): Promise<Live> {
-  const workload = await current(user, workloadPath(tenant, name));
+function liveStatus(workload: KubeObject | undefined): Live {
   const status = workload?.status as Json | undefined;
   const conditions = status?.conditions;
   const ready = Array.isArray(conditions)
@@ -583,7 +658,7 @@ function deployment(revision: Revision, { status, readyAt }: Live) {
     service: revision.service,
     env: revision.env,
     status,
-    component: revision.bundle.component,
+    component: revision.component,
     createdAt: revision.createdAt,
     ...(readyAt ? { readyAt } : {}),
   };
@@ -613,12 +688,12 @@ async function remove(user: UserKube, path: string): Promise<void> {
 }
 
 /**
- * Makes room for one more revision of `group`: at most `HISTORY_PER_SERVICE_ENV` per service/env
- * and `HISTORY_TENANT_BUDGET` in the tenant, oldest first, never a service/env's running revision.
+ * The revisions to delete to make room for one more of `group`: at most `HISTORY_PER_SERVICE_ENV`
+ * per service/env and `HISTORY_TENANT_BUDGET` in the tenant, oldest first, never a revision a
+ * workload runs. A 507 when the revisions workloads run already fill the tenant budget.
  */
-async function prune(user: UserKube, tenant: string, group: string): Promise<void> {
-  const items = await revisions(user, tenant);
-  const running = new Set([...currents(items).values()]);
+function evictions({ items, running }: History, group: string): Revision[] | Response {
+  const kept = new Set(running.values());
   const counts = new Map<string, number>([[group, 1]]);
   for (const revision of items)
     counts.set(groupOf(revision), (counts.get(groupOf(revision)) ?? 0) + 1);
@@ -626,29 +701,34 @@ async function prune(user: UserKube, tenant: string, group: string): Promise<voi
   const evict = new Set<Revision>();
   for (const revision of oldest) {
     const count = counts.get(groupOf(revision)) ?? 0;
-    if (running.has(revision) || count <= HISTORY_PER_SERVICE_ENV) continue;
+    if (kept.has(revision) || count <= HISTORY_PER_SERVICE_ENV) continue;
     evict.add(revision);
     counts.set(groupOf(revision), count - 1);
   }
   let total = items.length + 1 - evict.size;
   for (const revision of oldest) {
     if (total <= HISTORY_TENANT_BUDGET) break;
-    if (evict.has(revision) || running.has(revision)) continue;
+    if (evict.has(revision) || kept.has(revision)) continue;
     evict.add(revision);
     total--;
   }
-  for (const revision of evict) await remove(user, `${configmapsPath(tenant)}/${nameOf(revision)}`);
+  if (total > HISTORY_TENANT_BUDGET)
+    return problem(
+      507,
+      'Insufficient Storage',
+      `the ${kept.size} revisions running workloads fill the tenant's deploy history budget of ${HISTORY_TENANT_BUDGET}, so nothing was applied`,
+    );
+  return [...evict];
 }
 
-/** Creates the revision as `pending`, taking the next `<n>` when a concurrent deploy took it. */
+/** Creates the revision as `pending` from `first` on, taking the next `<n>` on a 409. */
 async function reserve(
   user: UserKube,
   tenant: string,
   bundle: DeployBundle,
+  first: number,
   rollbackOf?: string,
 ): Promise<Revision | Response> {
-  const existing = await revisions(user, tenant, { env: bundle.env, service: bundle.service });
-  const first = Math.max(0, ...existing.map((revision) => revision.n)) + 1;
   const text = JSON.stringify(bundle);
   for (let n = first; n < first + RESERVE_ATTEMPTS; n++) {
     const object: RevisionObject = {
@@ -660,6 +740,7 @@ async function reserve(
         annotations: {
           [CREATED_AT]: new Date().toISOString(),
           [STATE]: 'pending',
+          [COMPONENT]: JSON.stringify(bundle.component),
           ...(rollbackOf ? { [ROLLBACK_OF]: rollbackOf } : {}),
         },
       },
@@ -712,6 +793,44 @@ async function annotate(
   throw new KubeError(409, `${name} kept changing; its history state was not updated`);
 }
 
+/**
+ * The stored bundle of a rollback target: a 422 when it does not match `data.digest` or is not a
+ * complete bundle for the revision's service and env.
+ */
+async function load(
+  user: UserKube,
+  tenant: string,
+  revision: Revision,
+): Promise<DeployBundle | Response> {
+  const object = (await current(user, `${configmapsPath(tenant)}/${nameOf(revision)}`)) as
+    | RevisionObject
+    | undefined;
+  const text = object?.data?.bundle ?? '';
+  const unprocessable = (reason: string) =>
+    problem(422, 'Unprocessable Entity', `deployment ${revision.id} ${reason}`);
+  if (object?.data?.digest !== sha256(text))
+    return unprocessable('does not match its stored digest');
+  let bundle: unknown;
+  try {
+    bundle = JSON.parse(text);
+  } catch {
+    return unprocessable('stores a bundle that is not JSON');
+  }
+  if (
+    !isObject(bundle) ||
+    bundle.service !== revision.service ||
+    bundle.env !== revision.env ||
+    !isComponent(bundle.component) ||
+    !isObject(bundle.workload) ||
+    !Array.isArray(bundle.bindings) ||
+    !bundle.bindings.every(isObject) ||
+    !Array.isArray(bundle.secrets) ||
+    !bundle.secrets.every((name) => typeof name === 'string')
+  )
+    return unprocessable('stores an incomplete bundle');
+  return bundle as unknown as DeployBundle;
+}
+
 /** ServiceBindings this service/env rendered (labels and name prefix) that `keep` lacks. */
 async function staleBindings(
   user: UserKube,
@@ -735,9 +854,10 @@ async function staleBindings(
 }
 
 /**
- * Prunes history, reserves a `pending` revision, applies the checked bundle and prunes dropped
- * bindings, then marks the revision `live` and the one it replaced `replaced`. A failed apply
- * marks the revision `failed`, so history never names a bundle that did not go live.
+ * Reads the history, prunes it, reserves a `pending` revision, applies the checked bundle naming
+ * the revision on the workload and prunes dropped bindings, then marks the revision `live`, the
+ * one it replaced `replaced`, and writes the repairs `history` found. A failed apply marks the
+ * revision `failed`, so history never names a bundle that did not go live.
  */
 async function rollout(
   bundle: DeployBundle,
@@ -748,15 +868,18 @@ async function rollout(
   const user = context.asUser();
   const { tenant } = context;
   const group = `${bundle.service}-${bundle.env}`;
-  const before = await liveStatus(user, tenant, group);
-  await prune(user, tenant, group);
-  const previous = currents(
-    await revisions(user, tenant, { env: bundle.env, service: bundle.service }),
-  ).get(group);
-  const revision = await reserve(user, tenant, bundle, rollbackOf);
+  const view = await history(user, tenant);
+  const before = liveStatus(view.workloads.get(group));
+  const previous = view.running.get(group);
+  const own = view.items.filter((revision) => groupOf(revision) === group);
+  const first = Math.max(0, ...own.map((revision) => revision.n)) + 1;
+  const evict = evictions(view, group);
+  if (evict instanceof Response) return evict;
+  for (const revision of evict) await remove(user, `${configmapsPath(tenant)}/${nameOf(revision)}`);
+  const revision = await reserve(user, tenant, bundle, first, rollbackOf);
   if (revision instanceof Response) return revision;
   try {
-    const objects = render(bundle, tenant, refs);
+    const objects = render(bundle, tenant, refs, revision.id);
     for (const { path, object } of objects) await apply(user, path, object, false);
     const keep = new Set(objects.map(({ object }) => object.metadata.name));
     for (const stale of await staleBindings(user, tenant, bundle, keep))
@@ -765,7 +888,8 @@ async function rollout(
     await annotate(user, tenant, nameOf(revision), { [STATE]: 'failed' }).catch(() => {});
     throw error;
   }
-  // The change is live: a bookkeeping failure is logged, not reported as a failed deploy.
+  // The change is live: a bookkeeping failure is logged, not reported as a failed deploy; the
+  // workload names this revision, so the next deploy repairs it.
   try {
     await annotate(user, tenant, nameOf(revision), { [STATE]: 'live' });
     if (previous)
@@ -774,6 +898,9 @@ async function rollout(
         [STATUS]: rollbackOf ? 'rolled-back' : before.status,
         ...(before.readyAt ? { [READY_AT]: before.readyAt } : {}),
       });
+    for (const mark of view.marks)
+      if (mark.revision !== previous && !evict.includes(mark.revision))
+        await annotate(user, tenant, nameOf(mark.revision), { [STATE]: mark.state });
   } catch (error) {
     console.log(
       JSON.stringify({
@@ -852,35 +979,34 @@ export const deploy: V1Module = {
   },
   registry: notImplemented('registry'),
   deployments: async (_command, call, context) => {
-    const user = context.asUser();
     const env = String(queryValue(call, 'env'));
     const service = queryValue(call, 'service');
     if (service !== undefined && !validService(service))
       return problem(422, 'Unprocessable Entity', INVALID_SERVICE);
-    const items = await revisions(user, context.tenant, { env, service });
+    const view = await history(context.asUser(), context.tenant, { env, service });
     // The running revision of each service reports the live rollout; the others what they were
     // when they were replaced, or `pending`/`failed` when they never went live.
     const live = new Map<Revision, Live>();
-    for (const [group, revision] of currents(items))
-      live.set(revision, await liveStatus(user, context.tenant, group));
+    for (const [group, revision] of view.running)
+      live.set(revision, liveStatus(view.workloads.get(group)));
     return Response.json({
-      items: items.map((revision) =>
+      items: view.items.map((revision) =>
         deployment(revision, live.get(revision) ?? recorded(revision)),
       ),
     });
   },
   deploymentStats: async (_command, call, context) => {
-    const user = context.asUser();
     const env = String(queryValue(call, 'env'));
+    const view = await history(context.asUser(), context.tenant, { env });
     // Revisions that never went live (`pending`, `failed`) are not deployments.
-    const items = (await revisions(user, context.tenant, { env })).filter(
+    const items = view.items.filter(
       (revision) => revision.state === 'live' || revision.state === 'replaced',
     );
     const services = [...new Set(items.map((revision) => revision.service))];
     let ready = 0;
     let failed = 0;
     for (const service of services) {
-      const { status } = await liveStatus(user, context.tenant, `${service}-${env}`);
+      const { status } = liveStatus(view.workloads.get(`${service}-${env}`));
       if (status === 'ready') ready++;
       if (status === 'failed') failed++;
     }
@@ -896,15 +1022,16 @@ export const deploy: V1Module = {
   rollback: async (command, _call, context) => {
     const { env, service, to } = command as { env: string; service: string; to?: string };
     if (!validService(service)) return problem(422, 'Unprocessable Entity', INVALID_SERVICE);
-    const items = await revisions(context.asUser(), context.tenant, { env, service });
-    const running = currents(items).get(`${service}-${env}`);
+    const user = context.asUser();
+    const view = await history(user, context.tenant, { env, service });
+    const running = view.running.get(`${service}-${env}`);
     // By default, the newest revision that went live before the running one.
     const target = to
-      ? items.find(
+      ? view.items.find(
           (revision) =>
             revision.id === to && (revision.state === 'live' || revision.state === 'replaced'),
         )
-      : items.find(
+      : view.items.find(
           (revision) => revision.state === 'replaced' && (!running || revision.n < running.n),
         );
     if (!target)
@@ -915,7 +1042,8 @@ export const deploy: V1Module = {
           ? `deployment ${to} is not in the history of ${service} in ${env}`
           : `${service} has no earlier deployment in ${env}`,
       );
-    const { bundle } = target;
+    const bundle = await load(user, context.tenant, target);
+    if (bundle instanceof Response) return bundle;
     return checked(bundle, context, (refs) => rollout(bundle, context, refs, target.id));
   },
 };

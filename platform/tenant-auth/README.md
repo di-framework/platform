@@ -294,9 +294,10 @@ Secret.
 
 `/v1/deploy` and `/v1/deployments/rollback` store each deploy as a revision ConfigMap
 `di-deploy-<service>-<env>.<n>` in the tenant namespace (labels `deploy-revision: <n>`,
-service and env; annotation `revision-state`). Within a service/env the integer `<n>` alone
-orders revisions and picks the rollback target; across services the list orders by
-`created-at`, then name.
+service and env; annotations `revision-state` and `component`, plus `data.bundle` and its
+sha256 in `data.digest`). Within a service/env the integer `<n>` alone orders revisions and
+picks the rollback target; across services the list orders by `created-at`, then name. Lists
+read metadata only (`PartialObjectMetadataList`); rollback fetches the one bundle it re-applies.
 
 A deploy runs in this order: prune, reserve the revision as `pending` (on a 409 it takes the
 next `<n>`, at most `RESERVE_ATTEMPTS` times, then answers 409), apply, mark it `live` and the
@@ -305,17 +306,30 @@ one it replaced `replaced`. A failed apply marks it `failed`. `deployments` list
 them. Once the apply succeeded, a failure to mark the revisions is logged as
 `deploy.history-mark-failed` and the deploy still answers 202.
 
+**The workload names the running revision.** The deploy sets the annotation
+`platform.di-framework.dev/revision: <service>-<env>.<n>` on the WorkloadDeployment it applies
+(bundles cannot set it: they may only pass `app.di-framework.dev/` keys through). The running
+revision of a service/env is the one its live WorkloadDeployment names, whatever the
+ConfigMap marks say: list, stats and the default rollback target use it. A `pending` revision
+the workload names reads as `live`, and any other `live` revision as `replaced`, so history
+repairs itself after a crash between apply and mark and after out-of-order concurrent applies.
+Reads only report the repair (viewers stay read-only); the next deploy writes it.
+
 The namespace quota allows `count/configmaps: 100`, shared with `di-vars-<env>`, the `di-logs-*`
 projections and `kube-root-ca.crt`, so history is bounded (constants in `src/v1/deploy.ts`):
 
 * `HISTORY_PER_SERVICE_ENV = 10` revisions per service and env.
 * `HISTORY_TENANT_BUDGET = 40` revisions in the tenant, evicting the oldest across services
-  first. The running (`live`) revision of a service/env is never evicted.
+  first. A revision a WorkloadDeployment runs is never evicted; the last revision of a
+  destroyed or renamed service is.
 
-Pruning happens before the revision is created. If the quota still refuses it (403 `exceeded
-quota`), the deploy answers 507 before anything is applied. Revisions edited by hand out of
-this shape (non-integer label, name not matching the labels, unparsable bundle) are skipped
-and logged as `deploy.revision-skipped`.
+If the revisions running workloads alone fill the budget (only possible when a tenant's
+`spec.resources.workloads` quota is above 40), the deploy answers 507 before anything is
+applied. Pruning happens before the revision is created. If the quota still refuses it (403
+`exceeded quota`), the deploy answers 507 before anything is applied. Revisions edited by hand
+out of this shape (non-integer label, name not matching the labels, bad `component`
+annotation, unknown state) are skipped and logged as `deploy.revision-skipped`. A rollback
+target whose `data.bundle` does not match `data.digest`, or is not a complete bundle, is a 422.
 
 ## HTTP surface
 
