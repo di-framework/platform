@@ -9,11 +9,13 @@ import {
   loadControllerScripts,
 } from './tenancy/install';
 import {
+  assertTenantAuthConfig,
   crds,
   INSTALLATION,
   names,
   type Resource,
   TENANT,
+  type TenantAuthConfig,
   type TenantSpec,
   type UserSpec,
   VERSION,
@@ -103,6 +105,8 @@ export function installTenancy(args: {
   storageRoot?: string;
   /** Gateway URL pattern; the controller publishes it per tenant as `di-platform-routes`. */
   routeUrlPattern?: string;
+  /** Each tenant's controller and console (#58); omitted, the controller deploys neither. */
+  tenantAuth?: TenantAuthConfig;
   /** When omitted, seeds platform defaults (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`, `egress-public` approving nothing). */
   backingServiceClasses?: BackingServiceClassDeclaration[];
 }): {
@@ -111,6 +115,7 @@ export function installTenancy(args: {
   backingServiceClasses: k8s.apiextensions.CustomResource[];
 } {
   const { installation, namespace, provider } = args;
+  assertTenantAuthConfig(args.tenantAuth);
   function createCustom(
     value: Resource,
     dependsOn: pulumi.Resource[] = args.dependsOn,
@@ -271,6 +276,7 @@ export function installTenancy(args: {
                       insecureRegistry: args.insecureRegistry ?? false,
                       storageRoot: args.storageRoot,
                       routeUrlPattern: args.routeUrlPattern,
+                      tenantAuth: args.tenantAuth,
                     }),
                   },
                 ],

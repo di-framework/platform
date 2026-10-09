@@ -389,6 +389,47 @@ ConfigMap `di-platform-routes` into each `di-tenant-<tenant>` namespace with
 `di-viewer` and `di-developer` can read it; tenant users cannot write it. No ConfigMap
 means no gateway URL is known.
 
+### Tenant controller and console
+
+With config `tenantAuth` set, the tenant reconcile deploys each tenant's controller and console
+(`platform/tenant-auth`, #58) and `deploy-local.ts` is no longer needed for them:
+
+```yaml
+tenantAuth:
+  image: ghcr.io/di-framework/tenant-auth@sha256:<digest>   # required, pinned by digest
+  issuer: http://identity.acme.localhost:28180               # identity-server, as pods and browsers name it
+  oauthClient: { id: access, secretName: tenant-auth-oauth } # Secret in the platform namespace; key `clientSecret`
+  issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80  # optional, for a loopback issuer
+  issuerUpstreamPodPort: 8080                                # optional, the pod port behind it
+  issuerIp: 192.0.2.7                                        # optional, when pods cannot resolve the issuer
+  consolePublicUrl: http://console.{tenant}.localhost:28180  # optional; default http://127.0.0.1:8787
+  controllerPublicUrl: https://127.0.0.1:8788                # optional
+```
+
+- Placement and quota: both run in `di-runtime-<tenant>`, next to the `di-http` Service the
+  controller proxies to, and `di-runtime-quota` grows by their limits (`500m` CPU, `448Mi`
+  memory, sidecar included), so `spec.resources` stays the tenant's budget for the host and
+  backing services.
+- OAuth client: until per-tenant clients (#59), every console shares one confidential client.
+  An administrator stores its secret in a Secret in the platform namespace; the reconcile
+  copies it into `tenant-console-oauth` in each runtime namespace. The controller never reads
+  the identity directory. Until that Secret exists the console Deployment cannot start.
+- RBAC: `di-tenant-controller-<tenant>` lets the controller ServiceAccount create tokens only
+  for `di-user-<member>` of the tenant's active (not suspended, not deleted) members. The list
+  is recomputed from the User CRs on every reconcile; with no members the Role has no rule.
+  A suspended tenant keeps the roles and loses the bindings.
+- Network: `tenant-auth-egress` allows the API server endpoints (EndpointSlice
+  `default/kubernetes`), the issuer (upstream namespace or IP), the tenant's host group on
+  9191 (`di-http`'s pod port) and DNS.
+- TLS: the platform controller generates a self-signed P-256 certificate for
+  `tenant-controller` (Secret `tenant-controller-tls`; the console pins it from ConfigMap
+  `tenant-controller-ca`) and replaces it 30 days before it expires.
+- The controller Deployment stays at one replica with `Recreate`: proxy sessions live in its
+  memory. A new image digest rolls both pods.
+- The tenant's Ready condition does not wait for the console.
+
+The reconcile does not adopt objects that `deploy-local.ts` created; delete those first.
+
 ### Contract
 
 This section defines the v1alpha1 shape for independently requestable application

@@ -48,9 +48,11 @@ import {
   postgresServingResources,
 } from './postgres';
 import {
+  assertTenantAuthConfig,
   type BackingService,
   type BackingServiceClass,
   BINDING,
+  COMPONENT,
   type Condition,
   type ControllerConfig,
   FINALIZER,
@@ -64,6 +66,9 @@ import {
   type SizingParameters,
   TENANT,
   type Tenant,
+  type TenantAuthInputs,
+  tenantAuthResources,
+  tenantControllerCertNames,
   tenantResources,
   type User,
   userResources,
@@ -80,6 +85,7 @@ import {
   serviceBindingResources,
   sharedBindingConflict,
 } from './service-binding-reconcile';
+import { certificateValid, selfSignedCertificate } from './tls';
 import {
   STORAGE_FIELD_MANAGER,
   storageKeys,
@@ -101,6 +107,9 @@ const plurals: Record<string, string> = {
   Deployment: 'deployments',
   Role: 'roles',
   RoleBinding: 'rolebindings',
+  ClusterRole: 'clusterroles',
+  ClusterRoleBinding: 'clusterrolebindings',
+  EndpointSlice: 'endpointslices',
   NetworkPolicy: 'networkpolicies',
   Tenant: 'tenants',
   User: 'users',
@@ -367,13 +376,71 @@ export class Controller {
     value.status = status;
   }
   private async revoke(labels: Record<string, string>): Promise<void> {
-    for (const binding of await this.list<Resource>('rbac.authorization.k8s.io/v1', 'RoleBinding', {
-      [INSTALLATION]: this.cfg.installation,
-      ...labels,
-    }))
-      await this.remove(binding);
+    for (const kind of ['RoleBinding', 'ClusterRoleBinding'])
+      for (const binding of await this.list<Resource>('rbac.authorization.k8s.io/v1', kind, {
+        [INSTALLATION]: this.cfg.installation,
+        ...labels,
+      }))
+        await this.remove(binding);
   }
-  async reconcileTenant(tenant: Tenant): Promise<void> {
+  /**
+   * What {@link tenantAuthResources} needs from the cluster: the tenant's active members (from
+   * the User CRs, so a membership change re-renders the TokenRequest `resourceNames` on the next
+   * reconcile), the API server endpoints, the controller certificate (kept until 30 days before
+   * it expires) and the shared OAuth client secret from the platform namespace.
+   */
+  private async tenantAuthInputs(tenant: Tenant, users: User[]): Promise<TenantAuthInputs> {
+    const auth = this.cfg.tenantAuth!;
+    const name = tenant.metadata.name;
+    const members = users
+      .filter(
+        (u) =>
+          !u.spec.suspended &&
+          !u.metadata.deletionTimestamp &&
+          u.spec.memberships.some((m) => m.tenant === name),
+      )
+      .map((u) => u.metadata.name)
+      .sort();
+    const slices = (
+      await this.list<
+        Resource & { endpoints?: { addresses: string[] }[]; ports?: { port: number }[] }
+      >('discovery.k8s.io/v1', 'EndpointSlice', { 'kubernetes.io/service-name': 'kubernetes' })
+    ).filter((s) => s.metadata.namespace === 'default');
+    const apiServer = {
+      addresses: [
+        ...new Set(slices.flatMap((s) => (s.endpoints ?? []).flatMap((e) => e.addresses))),
+      ],
+      port: slices[0]?.ports?.[0]?.port ?? 443,
+    };
+    const existing = await this.get<Resource>(
+      `${collection('v1', 'Secret', names(name).runtimeNamespace)}/tenant-controller-tls`,
+    );
+    const data = existing?.data as Record<string, string> | undefined;
+    const current = data && {
+      cert: Buffer.from(data['tls.crt'] ?? '', 'base64').toString(),
+      key: Buffer.from(data['tls.key'] ?? '', 'base64').toString(),
+    };
+    const certNames = tenantControllerCertNames(name);
+    const tls =
+      current && certificateValid(current.cert, 30)
+        ? current
+        : selfSignedCertificate(
+            `tenant-controller.${names(name).runtimeNamespace}.svc`,
+            certNames.dns,
+            certNames.ips,
+            365,
+          );
+    const oauth = await this.get<{ data?: Record<string, string> }>(
+      `${collection('v1', 'Secret', this.cfg.namespace)}/${auth.oauthClient.secretName}`,
+    );
+    return {
+      members,
+      apiServer,
+      tls,
+      clientSecret: oauth?.data?.[auth.oauthClient.secretKey ?? 'clientSecret'],
+    };
+  }
+  async reconcileTenant(tenant: Tenant, users?: User[]): Promise<void> {
     if (!validName(tenant.metadata.name)) throw new Error('Invalid tenant name');
     if (!tenant.metadata.deletionTimestamp) await this.finalizer(tenant, true);
     const n = names(tenant.metadata.name);
@@ -432,11 +499,25 @@ export class Controller {
     );
     const workloads = await this.storageWorkloads(tenant);
     const desired = tenantResources(tenant, this.cfg, secret, storageKeys(workloads));
+    if (this.cfg.tenantAuth)
+      desired.push(
+        ...tenantAuthResources(
+          tenant,
+          this.cfg,
+          await this.tenantAuthInputs(
+            tenant,
+            users ??
+              (await this.list<User>(VERSION, 'User', { [INSTALLATION]: this.cfg.installation })),
+          ),
+        ),
+      );
     let ready = !!secret;
     if (!this.cfg.routeUrlPattern) await this.removeRoutes(tenant);
     for (const value of desired) {
       const applied = await this.ensure(value);
-      if (value.kind === 'Deployment') {
+      // The tenant's runtime is Ready without its console: Users wait on tenant readiness, and
+      // the console must not hold their bindings back.
+      if (value.kind === 'Deployment' && value.metadata.labels?.[COMPONENT] !== 'tenant-auth') {
         const spec = applied.spec as { replicas: number };
         const status = applied.status as
           | { observedGeneration?: number; readyReplicas?: number; replicas?: number }
@@ -1319,7 +1400,7 @@ export class Controller {
     const tenantByName = new Map(tenants.map((t) => [t.metadata.name, t]));
     for (const value of [...tenants, ...users]) {
       try {
-        if (value.kind === 'Tenant') await this.reconcileTenant(value as Tenant);
+        if (value.kind === 'Tenant') await this.reconcileTenant(value as Tenant, users);
         else await this.reconcileUser(value as User, tenants);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Reconciliation failed';
@@ -1423,6 +1504,7 @@ export async function main(
   const cfg = JSON.parse(process.env.PLATFORM_CONFIG ?? '{}') as ControllerConfig;
   if (!cfg.installation || !cfg.namespace || !cfg.hostImage || !cfg.schedulerNatsUrl)
     throw new Error('Missing PLATFORM_CONFIG');
+  assertTenantAuthConfig(cfg.tenantAuth);
   const controller = new Controller(api, cfg);
   let stopped = false;
   const stop = () => {

@@ -17,6 +17,7 @@ export const CONTROLLER_SCRIPT_MODULES = [
   'egress',
   'backing-services',
   'workload-storage',
+  'tls',
   'resources',
   'backing-service-reconcile',
   'service-binding-reconcile',
@@ -128,6 +129,8 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
       verbs: ['get', 'list', 'watch', 'create', 'patch', 'update', 'delete'],
     },
     { apiGroups: [''], resources: ['pods'], verbs: ['get', 'list', 'watch'] },
+    // The API server endpoints each tenant controller's egress policy allows (#58).
+    { apiGroups: ['discovery.k8s.io'], resources: ['endpointslices'], verbs: ['get', 'list'] },
     {
       apiGroups: ['storage.k8s.io'],
       resources: ['storageclasses'],
@@ -157,7 +160,7 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
     },
     {
       apiGroups: ['rbac.authorization.k8s.io'],
-      resources: ['roles', 'rolebindings'],
+      resources: ['roles', 'rolebindings', 'clusterroles', 'clusterrolebindings'],
       verbs: ['get', 'list', 'watch', 'create', 'patch', 'update', 'delete', 'bind', 'escalate'],
     },
   ];

@@ -157,6 +157,7 @@ describe('backing-service install', () => {
       'egress',
       'backing-services',
       'workload-storage',
+      'tls',
       'resources',
       'backing-service-reconcile',
       'service-binding-reconcile',
@@ -177,6 +178,7 @@ describe('backing-service install', () => {
       'postgres.js',
       'resources.js',
       'service-binding-reconcile.js',
+      'tls.js',
       'workload-storage.js',
     ]);
     expect(scripts['backing-services.js']).toContain('BackingServiceClass');
