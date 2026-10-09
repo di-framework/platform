@@ -83,6 +83,29 @@ function checkQuery(route: Route, url: URL): void {
   }
 }
 
+/**
+ * Reads the body as text, counting bytes as they stream in, and stops at the cap so a body
+ * without a Content-Length cannot be buffered whole. Undefined when the body is too large.
+ */
+async function readCapped(request: Request): Promise<string | undefined> {
+  const stream = request.clone().body;
+  if (!stream) return '';
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_BODY_BYTES) {
+      await reader.cancel();
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
 /** Parses the request body (an absent one reads as `{}`) and checks it against the input schema. */
 function checkBody(route: Route, text: string): void {
   let body: unknown = {};
@@ -111,8 +134,8 @@ export async function dispatch(request: Request): Promise<Response | undefined> 
     checkQuery(route, url);
     if (Number(request.headers.get('content-length') ?? 0) > MAX_BODY_BYTES)
       return problem(413, 'Content Too Large', `the request body exceeds ${MAX_BODY_BYTES} bytes`);
-    const text = request.body ? await request.clone().text() : '';
-    if (text.length > MAX_BODY_BYTES)
+    const text = await readCapped(request);
+    if (text === undefined)
       return problem(413, 'Content Too Large', `the request body exceeds ${MAX_BODY_BYTES} bytes`);
     if (text !== '') {
       // 415 means a body was sent in a format the contract does not accept (RFC 9110 15.5.16).
