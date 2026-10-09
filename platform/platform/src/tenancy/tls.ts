@@ -36,6 +36,19 @@ const name = (commonName: string) =>
 const ECDSA_SHA256 = seq(oid('1.2.840.10045.4.3.2'));
 
 /**
+ * A positive, minimally encoded DER INTEGER body from random bytes: the high bit is cleared (no
+ * sign) and the next bit set, so the leading byte is never a redundant `0x00`, which Go and
+ * BoringSSL reject as a malformed serial.
+ */
+export function serialNumber(random: Buffer): Buffer {
+  const serial = Buffer.from(random);
+  serial[0] = ((serial[0] as number) & 0x7f) | 0x40;
+  return serial;
+}
+/** Clock skew a fresh certificate tolerates: `notBefore` is backdated by this much. */
+const BACKDATE_MS = 5 * 60_000;
+
+/**
  * A self-signed P-256 certificate for `commonName`, the DNS names in `dnsNames` and the IPv4 `ipAddresses`, valid for
  * `days` days. Node has no X.509 writer, so this encodes the DER itself. Like `openssl req -x509`
  * it marks the certificate as a CA, so a client can pin it as its own trust anchor.
@@ -48,8 +61,7 @@ export function selfSignedCertificate(
   now: Date = new Date(),
 ): KeyPair {
   const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
-  const serial = randomBytes(16);
-  serial[0] = (serial[0] as number) & 0x7f;
+  const serial = serialNumber(randomBytes(16));
   const san = seq(
     ...dnsNames.map((dns) => der(0x82, Buffer.from(dns))),
     ...ipAddresses.map((ip) => der(0x87, Buffer.from(ip.split('.').map(Number)))),
@@ -59,7 +71,10 @@ export function selfSignedCertificate(
     der(0x02, serial),
     ECDSA_SHA256,
     name(commonName),
-    seq(time(now), time(new Date(now.getTime() + days * 86_400_000))),
+    seq(
+      time(new Date(now.getTime() - BACKDATE_MS)),
+      time(new Date(now.getTime() + days * 86_400_000)),
+    ),
     name(commonName),
     publicKey.export({ type: 'spki', format: 'der' }),
     der(
@@ -98,5 +113,17 @@ export function certificateValid(
     );
   } catch {
     return false;
+  }
+}
+
+/** The DNS names and IP addresses in `cert`'s subjectAltName; undefined when unreadable. */
+export function certificateNames(cert: string): { dns: string[]; ips: string[] } | undefined {
+  try {
+    const entries = (new X509Certificate(cert).subjectAltName ?? '').split(', ');
+    const pick = (prefix: string) =>
+      entries.filter((e) => e.startsWith(prefix)).map((e) => e.slice(prefix.length));
+    return { dns: pick('DNS:'), ips: pick('IP Address:') };
+  } catch {
+    return undefined;
   }
 }

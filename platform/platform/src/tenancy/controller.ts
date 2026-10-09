@@ -85,7 +85,7 @@ import {
   serviceBindingResources,
   sharedBindingConflict,
 } from './service-binding-reconcile';
-import { certificateValid, selfSignedCertificate } from './tls';
+import { certificateNames, certificateValid, selfSignedCertificate } from './tls';
 import {
   STORAGE_FIELD_MANAGER,
   storageKeys,
@@ -348,6 +348,7 @@ export class Controller {
     reason: string,
     message: string,
     extra: Record<string, unknown> = {},
+    others: Condition[] = [],
   ): Promise<void> {
     const old = value.status?.conditions?.find((c) => c.type === 'Ready');
     const condition: Condition = {
@@ -364,7 +365,15 @@ export class Controller {
     const status = {
       ...extra,
       observedGeneration: value.metadata.generation ?? 1,
-      conditions: [condition],
+      conditions: [
+        condition,
+        ...others.map((c) => {
+          const previous = value.status?.conditions?.find((p) => p.type === c.type);
+          return previous?.status === c.status
+            ? { ...c, lastTransitionTime: previous.lastTransitionTime }
+            : c;
+        }),
+      ],
     };
     if (JSON.stringify(value.status) === JSON.stringify(status)) return;
     await this.api.call(
@@ -400,7 +409,7 @@ export class Controller {
           u.spec.memberships.some((m) => m.tenant === name),
       )
       .map((u) => u.metadata.name)
-      .sort();
+      .sort((a, b) => a.localeCompare(b));
     const slices = (
       await this.list<
         Resource & { endpoints?: { addresses: string[] }[]; ports?: { port: number }[] }
@@ -420,9 +429,11 @@ export class Controller {
       cert: Buffer.from(data['tls.crt'] ?? '', 'base64').toString(),
       key: Buffer.from(data['tls.key'] ?? '', 'base64').toString(),
     };
-    const certNames = tenantControllerCertNames(name);
+    const certNames = tenantControllerCertNames(name, auth);
+    const sameNames = (cert: string) =>
+      JSON.stringify(certificateNames(cert)) === JSON.stringify(certNames);
     const tls =
-      current && certificateValid(current.cert, 30)
+      current && certificateValid(current.cert, 30) && sameNames(current.cert)
         ? current
         : selfSignedCertificate(
             `tenant-controller.${names(name).runtimeNamespace}.svc`,
@@ -446,6 +457,8 @@ export class Controller {
     const n = names(tenant.metadata.name);
     if (tenant.spec.suspended || tenant.metadata.deletionTimestamp)
       await this.revoke({ [TENANT]: tenant.metadata.name });
+    // Namespace deletion does not reach the cluster-scoped and platform-namespace RBAC.
+    if (tenant.metadata.deletionTimestamp) await this.removeTenantAuth(tenant);
     if (tenant.metadata.deletionTimestamp && tenant.spec.deletionPolicy === 'Delete') {
       let remaining = false;
       for (const name of [n.namespace, n.runtimeNamespace]) {
@@ -499,25 +512,11 @@ export class Controller {
     );
     const workloads = await this.storageWorkloads(tenant);
     const desired = tenantResources(tenant, this.cfg, secret, storageKeys(workloads));
-    if (this.cfg.tenantAuth)
-      desired.push(
-        ...tenantAuthResources(
-          tenant,
-          this.cfg,
-          await this.tenantAuthInputs(
-            tenant,
-            users ??
-              (await this.list<User>(VERSION, 'User', { [INSTALLATION]: this.cfg.installation })),
-          ),
-        ),
-      );
     let ready = !!secret;
     if (!this.cfg.routeUrlPattern) await this.removeRoutes(tenant);
     for (const value of desired) {
       const applied = await this.ensure(value);
-      // The tenant's runtime is Ready without its console: Users wait on tenant readiness, and
-      // the console must not hold their bindings back.
-      if (value.kind === 'Deployment' && value.metadata.labels?.[COMPONENT] !== 'tenant-auth') {
+      if (value.kind === 'Deployment') {
         const spec = applied.spec as { replicas: number };
         const status = applied.status as
           | { observedGeneration?: number; readyReplicas?: number; replicas?: number }
@@ -541,6 +540,7 @@ export class Controller {
             ),
         ).length >= (tenant.spec.runtime?.replicas ?? 1);
     }
+    const auth = await this.reconcileTenantAuth(tenant, users);
     await this.status(
       tenant,
       ready,
@@ -551,7 +551,88 @@ export class Controller {
           ? 'Tenant resources are ready'
           : 'Waiting for runtime and backend deployments',
       { ...n, httpService: `di-http.${n.runtimeNamespace}.svc.cluster.local` },
+      auth ? [auth] : [],
     );
+  }
+  /**
+   * The tenant's controller and console (#58), reconciled apart from the tenant itself: a
+   * failure here (an object left by `deploy-local.ts`, a missing permission) is reported on the
+   * `TenantAuthReady` condition and never turns Ready false, so members keep their access.
+   * With `tenantAuth` unset, the pair and its RBAC are pruned and no condition is reported.
+   */
+  private async reconcileTenantAuth(
+    tenant: Tenant,
+    users: User[] | undefined,
+  ): Promise<Condition | undefined> {
+    const condition = (ok: boolean, reason: string, message: string): Condition => ({
+      type: 'TenantAuthReady',
+      status: ok ? 'True' : 'False',
+      reason,
+      message,
+      observedGeneration: tenant.metadata.generation ?? 1,
+      lastTransitionTime: new Date().toISOString(),
+    });
+    try {
+      if (!this.cfg.tenantAuth) {
+        await this.removeTenantAuth(tenant);
+        return undefined;
+      }
+      const desired = tenantAuthResources(
+        tenant,
+        this.cfg,
+        await this.tenantAuthInputs(
+          tenant,
+          users ??
+            (await this.list<User>(VERSION, 'User', { [INSTALLATION]: this.cfg.installation })),
+        ),
+      );
+      let ready = true;
+      for (const value of desired) {
+        const applied = await this.ensure(value);
+        if (value.kind === 'Deployment') {
+          const spec = applied.spec as { replicas: number };
+          const status = applied.status as
+            | { observedGeneration?: number; readyReplicas?: number }
+            | undefined;
+          ready &&=
+            status?.observedGeneration === applied.metadata.generation &&
+            (status?.readyReplicas ?? 0) === spec.replicas;
+        }
+      }
+      return ready
+        ? condition(true, 'Reconciled', 'Tenant controller and console are ready')
+        : condition(false, 'Provisioning', 'Waiting for the tenant controller and console');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Tenant-auth reconcile failed';
+      console.error(`Tenant/${tenant.metadata.name} tenant-auth: ${message}`);
+      return this.cfg.tenantAuth ? condition(false, 'ReconcileError', message) : undefined;
+    }
+  }
+  /**
+   * Delete every tenant-auth object this installation created for `tenant`, including the
+   * cluster-scoped ClusterRole/ClusterRoleBinding and the Role/RoleBinding in the platform
+   * namespace, which namespace deletion does not reach.
+   */
+  private async removeTenantAuth(tenant: Tenant): Promise<void> {
+    const labels = {
+      [INSTALLATION]: this.cfg.installation,
+      [OWNER]: tenant.metadata.uid!,
+      [COMPONENT]: 'tenant-auth',
+    };
+    for (const [apiVersion, kind] of [
+      ['apps/v1', 'Deployment'],
+      ['v1', 'Service'],
+      ['networking.k8s.io/v1', 'NetworkPolicy'],
+      ['rbac.authorization.k8s.io/v1', 'ClusterRoleBinding'],
+      ['rbac.authorization.k8s.io/v1', 'RoleBinding'],
+      ['rbac.authorization.k8s.io/v1', 'ClusterRole'],
+      ['rbac.authorization.k8s.io/v1', 'Role'],
+      ['v1', 'Secret'],
+      ['v1', 'ConfigMap'],
+      ['v1', 'ServiceAccount'],
+    ] as const)
+      for (const value of await this.list<Resource>(apiVersion, kind, labels))
+        await this.remove(value);
   }
   /** No gateway is published any more: drop the route template so the console stops linking. */
   private async removeRoutes(tenant: Tenant): Promise<void> {

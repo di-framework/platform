@@ -8,6 +8,7 @@ import {
   COMPONENT,
   type ControllerConfig,
   INSTALLATION,
+  ISSUER_PROXY_IMAGE,
   OWNER,
   type Resource,
   TENANT,
@@ -16,11 +17,18 @@ import {
   type TenantAuthConfig,
   type TenantAuthInputs,
   tenantAuthResources,
+  tenantControllerCertNames,
   tenantResources,
+  tlsCertDigest,
   type User,
   VERSION,
 } from '../src/tenancy/resources';
-import { certificateValid, selfSignedCertificate } from '../src/tenancy/tls';
+import {
+  certificateNames,
+  certificateValid,
+  selfSignedCertificate,
+  serialNumber,
+} from '../src/tenancy/tls';
 
 const IMAGE = `ghcr.io/di-framework/tenant-auth@sha256:${'a'.repeat(64)}`;
 const auth: TenantAuthConfig = {
@@ -92,7 +100,7 @@ type Deployment = Resource & {
           image: string;
           env: { name: string; value?: string; valueFrom?: unknown }[];
           resources: { limits: { cpu: string; memory: string } };
-          volumeMounts: { name: string; mountPath: string }[];
+          volumeMounts: { name: string; mountPath: string; readOnly?: boolean }[];
           args?: string[];
         }[];
         volumes: Record<string, unknown>[];
@@ -138,9 +146,23 @@ describe('tenant-auth configuration', () => {
   it('ships the certificate module and lets the controller grant cluster RBAC and read endpoints', () => {
     expect(CONTROLLER_SCRIPT_MODULES).toContain('tls');
     const rules = controllerClusterRoleRules();
-    expect(rules.find((r) => r.resources.includes('clusterrolebindings'))?.verbs).toContain(
-      'escalate',
+    const cluster = rules.filter(
+      (r) => r.resources.includes('clusterroles') || r.resources.includes('clusterrolebindings'),
     );
+    expect(cluster).toHaveLength(1);
+    expect(cluster[0]?.resources).toEqual(['clusterroles', 'clusterrolebindings']);
+    expect(cluster[0]?.verbs).toEqual([
+      'get',
+      'list',
+      'watch',
+      'create',
+      'patch',
+      'update',
+      'delete',
+    ]);
+    // Never cluster-admin by proxy: no rule lets it bind or escalate cluster-scoped roles.
+    for (const verb of ['bind', 'escalate']) expect(cluster[0]?.verbs).not.toContain(verb);
+    expect(rules.find((r) => r.resources.includes('rolebindings'))?.verbs).toContain('escalate');
     expect(rules.find((r) => r.apiGroups.includes('discovery.k8s.io'))?.resources).toEqual([
       'endpointslices',
     ]);
@@ -153,6 +175,8 @@ describe('tenant-auth quota', () => {
     expect(addQuantity('1500m', '0.5', 'm')).toBe('2000m');
     expect(addQuantity('4Gi', '448Mi', 'Mi')).toBe('4544Mi');
     expect(addQuantity('1024Ki', '1Mi', 'Mi')).toBe('2Mi');
+    // Integer arithmetic: no float error rounds a sum up.
+    expect(addQuantity('0.1', '0.2', 'm')).toBe('300m');
   });
 
   it('grows the runtime quota by the pair’s limits so the tenant keeps its whole budget', () => {
@@ -230,7 +254,13 @@ describe('tenantAuthResources', () => {
       expect(d.spec.template.spec.containers[0]!.image).toBe(IMAGE);
       expect(d.spec.template.metadata.annotations).toEqual({
         [`${'platform.di-framework.dev'}/image-digest`]: `sha256:${'a'.repeat(64)}`,
+        [`${'platform.di-framework.dev'}/tls-cert-sha256`]: tlsCertDigest(tls.cert),
       });
+      expect(d.spec.template.spec.automountServiceAccountToken).toBe(false);
+      expect(d.spec.template.spec.containers[1]?.image).toBe(ISSUER_PROXY_IMAGE);
+      expect(ISSUER_PROXY_IMAGE).toMatch(/^alpine\/socat@sha256:[0-9a-f]{64}$/);
+      // The sidecar holds no ServiceAccount token.
+      expect(d.spec.template.spec.containers[1]?.volumeMounts).toBeUndefined();
       expect(d.spec.template.spec.volumes[0]).toEqual({ name: 'tmp', emptyDir: {} });
       expect(
         d.spec.template.spec.volumes.some((v) => 'configMap' in v && v.name === 'bundle'),
@@ -241,8 +271,23 @@ describe('tenantAuthResources', () => {
         'TCP:di-platform-gateway.wasmcloud.svc.cluster.local:80',
       ]);
     }
-    expect(controller.spec.template.spec.automountServiceAccountToken).toBe(true);
-    expect(console.spec.template.spec.automountServiceAccountToken).toBe(false);
+    // Only the controller container gets the projected token.
+    expect(controller.spec.template.spec.containers[0]!.volumeMounts).toContainEqual({
+      name: 'service-account',
+      mountPath: '/var/run/secrets/kubernetes.io/serviceaccount',
+      readOnly: true,
+    });
+    expect(
+      controller.spec.template.spec.volumes.find((v) => v.name === 'service-account'),
+    ).toHaveProperty('projected.sources.0.serviceAccountToken.path', 'token');
+    expect(console.spec.template.spec.volumes.some((v) => v.name === 'service-account')).toBe(
+      false,
+    );
+    expect(
+      console.spec.template.spec.containers[0]!.volumeMounts.some(
+        (m) => m.name === 'service-account',
+      ),
+    ).toBe(false);
     expect(env(controller)).toMatchObject({
       TENANT_CONTROLLER_TENANT: 'alpha',
       TENANT_CONTROLLER_PLATFORM_NAMESPACE: 'wasmcloud',
@@ -416,6 +461,30 @@ describe('tenantAuthResources', () => {
     expect(egress(dns)).toHaveLength(3);
   });
 
+  it('renders /128 for IPv6 API server addresses on dual-stack clusters', () => {
+    const resources = tenantAuthResources(tenant(), cfg, {
+      ...inputs,
+      apiServer: { addresses: ['10.0.0.1', 'fd00::1'], port: 6443 },
+    });
+    expect(egress(resources)[0]).toEqual({
+      to: [{ ipBlock: { cidr: '10.0.0.1/32' } }, { ipBlock: { cidr: 'fd00::1/128' } }],
+      ports: [{ protocol: 'TCP', port: 6443 }],
+    });
+  });
+
+  it('rolls both pods when the certificate changes', () => {
+    const digest = (resources: Resource[]) =>
+      (resources.filter((r) => r.kind === 'Deployment') as Deployment[]).map(
+        (d) => d.spec.template.metadata.annotations['platform.di-framework.dev/tls-cert-sha256'],
+      );
+    const renewed = selfSignedCertificate('tenant-controller', ['tenant-controller'], [], 30);
+    const before = digest(tenantAuthResources(tenant(), cfg, inputs));
+    const after = digest(tenantAuthResources(tenant(), cfg, { ...inputs, tls: renewed }));
+    expect(before[0]).toBe(before[1]);
+    expect(after[0]).toBe(after[1]);
+    expect(after[0]).not.toBe(before[0]);
+  });
+
   it('stops the pair and drops its bindings for a suspended tenant', () => {
     const resources = tenantAuthResources(tenant({ suspended: true }), cfg, {
       ...inputs,
@@ -445,6 +514,61 @@ describe('controller certificate', () => {
     expect(certificateValid(pair.cert, 30, now)).toBe(true);
     expect(certificateValid(pair.cert, 30, new Date('2027-09-15T00:00:00Z'))).toBe(false);
     expect(certificateValid('garbage', 30)).toBe(false);
+    // Backdated a few minutes for clock skew.
+    expect(new Date(cert.validFrom).getTime()).toBe(now.getTime() - 5 * 60_000);
+    expect(certificateNames(pair.cert)).toEqual({
+      dns: ['tenant-controller', 'localhost'],
+      ips: ['127.0.0.1'],
+    });
+    expect(certificateNames('garbage')).toBeUndefined();
+  });
+
+  it('encodes every serial as a positive, minimal DER INTEGER', () => {
+    for (const first of [0x00, 0x01, 0x3f, 0x7f, 0x80, 0xff]) {
+      const serial = serialNumber(Buffer.from([first, 0x00, 0x00, 0x01]));
+      // Positive (high bit clear) and minimal (leading byte never a redundant zero).
+      expect((serial[0] as number) & 0x80).toBe(0);
+      expect((serial[0] as number) & 0x40).toBe(0x40);
+      expect(serial.subarray(1)).toEqual(Buffer.from([0x00, 0x00, 0x01]));
+    }
+    const input = Buffer.from([0x00, 0x05]);
+    serialNumber(input);
+    expect(input[0]).toBe(0x00);
+  });
+
+  it('produces certificates that always parse (2,000 generations)', () => {
+    for (let i = 0; i < 2000; i++) {
+      const pair = selfSignedCertificate('svc', ['tenant-controller'], ['127.0.0.1'], 30);
+      expect(() => new X509Certificate(pair.cert)).not.toThrow();
+    }
+  });
+
+  it('covers the controller’s public host besides the in-cluster names', () => {
+    expect(tenantControllerCertNames('alpha')).toEqual({
+      dns: [
+        'tenant-controller',
+        'tenant-controller.di-runtime-alpha.svc',
+        'tenant-controller.di-runtime-alpha.svc.cluster.local',
+        'localhost',
+      ],
+      ips: ['127.0.0.1'],
+    });
+    expect(
+      tenantControllerCertNames('alpha', {
+        ...auth,
+        controllerPublicUrl: 'https://controller.{tenant}.example.com',
+      }).dns,
+    ).toContain('controller.alpha.example.com');
+    expect(
+      tenantControllerCertNames('alpha', { ...auth, controllerPublicUrl: 'https://10.1.2.3:8788' })
+        .ips,
+    ).toEqual(['127.0.0.1', '10.1.2.3']);
+    expect(
+      tenantControllerCertNames('alpha', { ...auth, controllerPublicUrl: 'https://[::1]:8788' }),
+    ).toEqual(tenantControllerCertNames('alpha'));
+    expect(
+      tenantControllerCertNames('alpha', { ...auth, controllerPublicUrl: 'not a url' }),
+    ).toEqual(tenantControllerCertNames('alpha'));
   });
 });
 
@@ -666,6 +790,123 @@ describe('reconcileTenant with tenant-auth', () => {
         labels: { [COMPONENT]: 'tenant-auth', [TENANT]: 'alpha' },
       },
     });
-    await expect(controller.reconcileTenant(t, [])).rejects.toThrow('Refusing to adopt');
+    const log = console.error;
+    console.error = () => {};
+    try {
+      await controller.reconcileTenant(t, []);
+    } finally {
+      console.error = log;
+    }
+    // Reported on its own condition; the tenant stays Ready so members keep their access.
+    const conditions = Object.fromEntries((t.status?.conditions ?? []).map((c) => [c.type, c]));
+    expect(conditions.Ready?.status).toBe('True');
+    expect(conditions.TenantAuthReady).toMatchObject({
+      status: 'False',
+      reason: 'ReconcileError',
+    });
+    expect(conditions.TenantAuthReady?.message).toContain('Refusing to adopt');
+    const alice = user('alice', ['alpha']);
+    api.seed(alice);
+    await controller.reconcileUser(alice, [t]);
+    expect(
+      [...api.objects.values()].some(
+        (r) => r.kind === 'RoleBinding' && r.metadata.labels?.[OWNER] === 'alice-uid',
+      ),
+    ).toBe(true);
   });
+
+  it('reports TenantAuthReady and keeps its transition time while unchanged', async () => {
+    const { api, controller, t } = prepare();
+    api.notReady.add('tenant-console');
+    await controller.reconcileTenant(t, []);
+    const auth = () => t.status?.conditions?.find((c) => c.type === 'TenantAuthReady');
+    expect(auth()).toMatchObject({ status: 'False', reason: 'Provisioning' });
+    const since = auth()!.lastTransitionTime;
+    await controller.reconcileTenant(t, []);
+    expect(auth()?.lastTransitionTime).toBe(since);
+    api.notReady.clear();
+    await controller.reconcileTenant(t, []);
+    expect(auth()).toMatchObject({ status: 'True', reason: 'Reconciled' });
+  });
+
+  it('reissues the certificate when the public controller host changes', async () => {
+    const { api, t } = prepare();
+    await new Controller(api, cfg).reconcileTenant(t, []);
+    const tlsPath = path('Secret', 'di-runtime-alpha', 'tenant-controller-tls');
+    const first = (api.objects.get(tlsPath)!.data as Record<string, string>)['tls.crt'];
+    const moved = new Controller(api, {
+      ...cfg,
+      tenantAuth: { ...auth, controllerPublicUrl: 'https://controller.{tenant}.example.com' },
+    });
+    await moved.reconcileTenant(t, []);
+    const second = (api.objects.get(tlsPath)!.data as Record<string, string>)['tls.crt']!;
+    expect(second).not.toBe(first);
+    expect(new X509Certificate(Buffer.from(second, 'base64').toString()).subjectAltName).toContain(
+      'DNS:controller.alpha.example.com',
+    );
+    const deployment = api.objects.get(
+      path('Deployment', 'di-runtime-alpha', 'tenant-console'),
+    ) as Deployment;
+    expect(
+      deployment.spec.template.metadata.annotations['platform.di-framework.dev/tls-cert-sha256'],
+    ).toBe(tlsCertDigest(Buffer.from(second, 'base64').toString()));
+    await moved.reconcileTenant(t, []);
+    expect((api.objects.get(tlsPath)!.data as Record<string, string>)['tls.crt']).toBe(second);
+  });
+
+  const tenantAuthObjects = (api: MemoryApi) =>
+    [...api.objects.values()].filter((r) => r.metadata.labels?.[COMPONENT] === 'tenant-auth');
+
+  it('prunes the pair, its RBAC and the quota addition when tenantAuth is unset', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t, [user('alice', ['alpha'])]);
+    expect(tenantAuthObjects(api).map((r) => r.kind)).toEqual(
+      expect.arrayContaining(['ClusterRole', 'ClusterRoleBinding', 'Role', 'Deployment']),
+    );
+    const { tenantAuth: _, ...plain } = cfg;
+    await new Controller(api, plain).reconcileTenant(t, []);
+    expect(tenantAuthObjects(api)).toEqual([]);
+    expect(t.status?.conditions?.map((c) => c.type)).toEqual(['Ready']);
+    const quota = api.objects.get(
+      `${collection('v1', 'ResourceQuota', 'di-runtime-alpha')}/di-runtime-quota`,
+    ) as unknown as { spec: { hard: Record<string, string> } };
+    expect(quota.spec.hard['limits.cpu']).toBe('2');
+  });
+
+  it('logs and skips a failed prune when tenantAuth is unset', async () => {
+    const { api, t } = prepare();
+    const { tenantAuth: _, ...plain } = cfg;
+    const failing: Api = {
+      call: <T>(method: string, p: string, body?: unknown) =>
+        p.includes('clusterroles?')
+          ? Promise.reject(new Error('forbidden'))
+          : api.call<T>(method, p, body),
+    };
+    const errors: string[] = [];
+    const log = console.error;
+    console.error = (m: string) => errors.push(m);
+    try {
+      await new Controller(failing, plain).reconcileTenant(t, []);
+    } finally {
+      console.error = log;
+    }
+    expect(errors).toEqual(['Tenant/alpha tenant-auth: forbidden']);
+    expect(t.status?.conditions?.map((c) => c.type)).toEqual(['Ready']);
+  });
+
+  for (const deletionPolicy of ['Delete', 'Retain'] as const)
+    it(`deletes the cluster-scoped and platform-namespace RBAC on tenant deletion (${deletionPolicy})`, async () => {
+      const { api, controller, t } = prepare();
+      await controller.reconcileTenant(t, [user('alice', ['alpha'])]);
+      t.spec.deletionPolicy = deletionPolicy;
+      t.metadata.deletionTimestamp = '2026-01-01T00:00:00Z';
+      await controller.reconcileTenant(t, []);
+      expect(
+        api.objects.get(path('ClusterRole', undefined, 'di-tenant-controller-alpha')),
+      ).toBeUndefined();
+      expect(
+        api.objects.get(path('Role', 'wasmcloud', 'di-tenant-controller-alpha')),
+      ).toBeUndefined();
+      expect(tenantAuthObjects(api)).toEqual([]);
+    });
 });

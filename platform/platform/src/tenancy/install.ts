@@ -160,8 +160,15 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
     },
     {
       apiGroups: ['rbac.authorization.k8s.io'],
-      resources: ['roles', 'rolebindings', 'clusterroles', 'clusterrolebindings'],
+      resources: ['roles', 'rolebindings'],
       verbs: ['get', 'list', 'watch', 'create', 'patch', 'update', 'delete', 'bind', 'escalate'],
+    },
+    // Each tenant controller's `di-tenant-controller-<t>` ClusterRole and its binding (#58). The
+    // controller already holds every permission they grant, so it needs no bind or escalate.
+    {
+      apiGroups: ['rbac.authorization.k8s.io'],
+      resources: ['clusterroles', 'clusterrolebindings'],
+      verbs: ['get', 'list', 'watch', 'create', 'patch', 'update', 'delete'],
     },
   ];
 }

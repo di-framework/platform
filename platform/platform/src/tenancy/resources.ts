@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { backingServiceCrds } from './backing-services';
 import { PRIVATE_IPV4_RANGES } from './egress';
 import { hostStorage } from './workload-storage';
@@ -119,19 +120,20 @@ export function assertTenantAuthConfig(value: TenantAuthConfig | undefined): voi
 }
 /** Container limits of one tenant-auth pair, counted on top of the tenant's own quota. */
 export const TENANT_AUTH_LIMITS = { cpu: '500m', memory: '448Mi' };
+/** Each suffix in thousandths of the base unit, so sums stay integers. */
 const units: Record<string, number> = {
-  m: 0.001,
-  '': 1,
-  Ki: 1024,
-  Mi: 1024 ** 2,
-  Gi: 1024 ** 3,
-  Ti: 1024 ** 4,
+  m: 1,
+  '': 1000,
+  Ki: 1024 * 1000,
+  Mi: 1024 ** 2 * 1000,
+  Gi: 1024 ** 3 * 1000,
+  Ti: 1024 ** 4 * 1000,
 };
 /** `a + b` for quantities in the CRD's pattern; CPU comes back in millicores, memory in Mi. */
 export function addQuantity(a: string, b: string, unit: 'm' | 'Mi'): string {
   const value = (q: string) => {
     const [, n, suffix] = /^([0-9.]+)(m|Ki|Mi|Gi|Ti)?$/.exec(q)!;
-    return Number(n) * (units[suffix ?? ''] as number);
+    return Math.round(Number(n) * (units[suffix ?? ''] as number));
   };
   return `${Math.ceil((value(a) + value(b)) / (units[unit] as number))}${unit}`;
 }
@@ -851,19 +853,55 @@ function userTokenSecretName(user: string, tenant: string): string {
 function loopbackHost(host: string): boolean {
   return host === 'localhost' || host === '127.0.0.1' || host.endsWith('.localhost');
 }
-/** Names the controller's serving certificate covers, in-cluster and through a port-forward. */
-function tenantControllerCertNames(tenant: string): { dns: string[]; ips: string[] } {
-  const ns = names(tenant).runtimeNamespace;
-  return {
-    dns: [
-      'tenant-controller',
-      `tenant-controller.${ns}.svc`,
-      `tenant-controller.${ns}.svc.cluster.local`,
-      'localhost',
-    ],
-    ips: ['127.0.0.1'],
-  };
+/** The controller URL users and CLIs see; `{tenant}` is replaced. */
+function tenantControllerPublicUrl(tenant: string, auth: TenantAuthConfig | undefined): string {
+  return (auth?.controllerPublicUrl ?? 'https://127.0.0.1:8788').replaceAll('{tenant}', tenant);
 }
+/**
+ * Names the controller's serving certificate covers: in-cluster, through a port-forward and the
+ * host of `controllerPublicUrl`, so CLIs verify the hostname they were given.
+ */
+function tenantControllerCertNames(
+  tenant: string,
+  auth?: TenantAuthConfig,
+): { dns: string[]; ips: string[] } {
+  const ns = names(tenant).runtimeNamespace;
+  const dns = [
+    'tenant-controller',
+    `tenant-controller.${ns}.svc`,
+    `tenant-controller.${ns}.svc.cluster.local`,
+    'localhost',
+  ];
+  const ips = ['127.0.0.1'];
+  const host = URL.canParse(tenantControllerPublicUrl(tenant, auth))
+    ? new URL(tenantControllerPublicUrl(tenant, auth)).hostname
+    : '';
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) ips.push(host);
+  else if (host && !host.startsWith('[')) dns.push(host);
+  return { dns: [...new Set(dns)], ips: [...new Set(ips)] };
+}
+/** Digest of the serving certificate; in both pod templates so a renewal rolls the pair. */
+function tlsCertDigest(cert: string): string {
+  return createHash('sha256').update(cert).digest('hex');
+}
+/** The issuer-proxy sidecar, pinned by digest (`alpine/socat:1.8.0.0`). */
+export const ISSUER_PROXY_IMAGE =
+  'alpine/socat@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8';
+/** The ServiceAccount token, CA and namespace, projected into the controller container only. */
+const serviceAccountVolume = () => ({
+  name: 'service-account',
+  projected: {
+    sources: [
+      { serviceAccountToken: { path: 'token', expirationSeconds: 3607 } },
+      { configMap: { name: 'kube-root-ca.crt', items: [{ key: 'ca.crt', path: 'ca.crt' }] } },
+      {
+        downwardAPI: {
+          items: [{ path: 'namespace', fieldRef: { fieldPath: 'metadata.namespace' } }],
+        },
+      },
+    ],
+  },
+});
 /**
  * The tenant's controller and console (#58), ported from `tenant-auth/scripts/deploy-local.ts`.
  * They run in the tenant's runtime namespace, next to the `di-http` Service the controller
@@ -922,12 +960,18 @@ function tenantAuthResources(
         template: {
           metadata: {
             labels: { app, [COMPONENT]: 'tenant-auth', [TENANT]: name },
-            // The image reference rolls the pods; the digest is repeated here for operators.
-            annotations: { [`${GROUP}/image-digest`]: auth.image.split('@')[1] },
+            // The image reference rolls the pods; the digest is repeated here for operators. Both
+            // binaries read the certificate (or CA) once at start, so its digest rolls the pair.
+            annotations: {
+              [`${GROUP}/image-digest`]: auth.image.split('@')[1],
+              [`${GROUP}/tls-cert-sha256`]: tlsCertDigest(inputs.tls.cert),
+            },
           },
           spec: {
             serviceAccountName: app,
-            automountServiceAccountToken: app === 'tenant-controller',
+            // Never automounted: the controller's token is projected into its own container
+            // only, so the issuer-proxy sidecar holds no credential.
+            automountServiceAccountToken: false,
             ...(!loopback && auth.issuerIp
               ? { hostAliases: [{ ip: auth.issuerIp, hostnames: [issuer.hostname] }] }
               : {}),
@@ -966,13 +1010,22 @@ function tenantAuthResources(
                 volumeMounts: [
                   { name: 'tmp', mountPath: '/tmp' },
                   { name: 'mounted', mountPath, readOnly: true },
+                  ...(app === 'tenant-controller'
+                    ? [
+                        {
+                          name: 'service-account',
+                          mountPath: '/var/run/secrets/kubernetes.io/serviceaccount',
+                          readOnly: true,
+                        },
+                      ]
+                    : []),
                 ],
               },
               ...(loopback && sidecarTarget
                 ? [
                     {
                       name: 'issuer-proxy',
-                      image: 'alpine/socat:1.8.0.0',
+                      image: ISSUER_PROXY_IMAGE,
                       args: [
                         `TCP-LISTEN:${issuerPort},fork,reuseaddr,bind=127.0.0.1`,
                         `TCP:${sidecarTarget}`,
@@ -989,6 +1042,7 @@ function tenantAuthResources(
             volumes: [
               { name: 'tmp', emptyDir: {} },
               { name: 'mounted', ...volume },
+              ...(app === 'tenant-controller' ? [serviceAccountVolume()] : []),
             ],
           },
         },
@@ -1004,7 +1058,9 @@ function tenantAuthResources(
   const egress: unknown[] = [];
   if (inputs.apiServer.addresses.length)
     egress.push({
-      to: inputs.apiServer.addresses.map((ip) => ({ ipBlock: { cidr: `${ip}/32` } })),
+      to: inputs.apiServer.addresses.map((ip) => ({
+        ipBlock: { cidr: `${ip}/${ip.includes(':') ? 128 : 32}` },
+      })),
       ports: [{ protocol: 'TCP', port: inputs.apiServer.port }],
     });
   if (auth.issuerUpstream)
@@ -1169,10 +1225,7 @@ function tenantAuthResources(
         TENANT_CONSOLE_PORT: '8787',
         TENANT_CONSOLE_PUBLIC_URL: publicUrl(auth.consolePublicUrl, 'http://127.0.0.1:8787'),
         TENANT_CONSOLE_CONTROLLER_URL: 'https://tenant-controller:8788',
-        TENANT_CONSOLE_CONTROLLER_PUBLIC_URL: publicUrl(
-          auth.controllerPublicUrl,
-          'https://127.0.0.1:8788',
-        ),
+        TENANT_CONSOLE_CONTROLLER_PUBLIC_URL: tenantControllerPublicUrl(name, auth),
         TENANT_CONSOLE_CONTROLLER_CA: '/ca/ca.crt',
       },
       [
@@ -1245,6 +1298,7 @@ export {
   tenantAuthResources,
   tenantControllerCertNames,
   tenantResources,
+  tlsCertDigest,
   USER,
   userResources,
   userTokenSecretName,

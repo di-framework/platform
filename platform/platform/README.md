@@ -418,17 +418,33 @@ tenantAuth:
   for `di-user-<member>` of the tenant's active (not suspended, not deleted) members. The list
   is recomputed from the User CRs on every reconcile; with no members the Role has no rule.
   A suspended tenant keeps the roles and loses the bindings.
-- Network: `tenant-auth-egress` allows the API server endpoints (EndpointSlice
-  `default/kubernetes`), the issuer (upstream namespace or IP), the tenant's host group on
-  9191 (`di-http`'s pod port) and DNS.
+- Network: `tenant-auth-egress` adds egress to the API server endpoints (EndpointSlice
+  `default/kubernetes`, `/32` or `/128`), the issuer (upstream namespace or IP), the tenant's
+  host group on 9191 (`di-http`'s pod port) and DNS, on top of what `di-tenant-network`
+  already allows every pod in the namespace.
+- Credentials: no pod automounts a ServiceAccount token. The controller container alone gets
+  a projected token; the issuer-proxy sidecar (`alpine/socat`, pinned by digest) has none.
 - TLS: the platform controller generates a self-signed P-256 certificate for
-  `tenant-controller` (Secret `tenant-controller-tls`; the console pins it from ConfigMap
-  `tenant-controller-ca`) and replaces it 30 days before it expires.
+  `tenant-controller` and the host of `controllerPublicUrl` (Secret `tenant-controller-tls`;
+  the console pins it from ConfigMap `tenant-controller-ca`). It is replaced 30 days before it
+  expires or when its names change, and the certificate digest in both pod templates rolls
+  the pair. Kubeconfigs the console issued before a renewal embed the old CA and stop working;
+  download a new one.
 - The controller Deployment stays at one replica with `Recreate`: proxy sessions live in its
   memory. A new image digest rolls both pods.
-- The tenant's Ready condition does not wait for the console.
+- Status: problems here are reported on the Tenant's `TenantAuthReady` condition. Ready, and
+  with it every member's access, does not depend on the controller or console.
+- Cleanup: deleting the Tenant deletes the cluster-scoped and platform-namespace objects too;
+  unsetting `tenantAuth` removes every object labelled `platform.di-framework.dev/component:
+  tenant-auth` and the quota addition.
 
-The reconcile does not adopt objects that `deploy-local.ts` created; delete those first.
+The reconcile does not adopt objects that `deploy-local.ts` created (`TenantAuthReady` reports
+`Refusing to adopt`). Delete them first: in `di-runtime-<tenant>` the Deployments, Services,
+ServiceAccounts, Role and RoleBinding `tenant-controller-keys`, NetworkPolicy, Secrets
+`tenant-controller-tls` and `tenant-console-oauth`, and ConfigMaps `tenant-controller-ca` and
+`tenant-auth-bundle`; in the platform namespace the Role and RoleBinding
+`di-tenant-controller-<tenant>`; and the cluster-scoped ClusterRole and ClusterRoleBinding
+`di-tenant-controller-<tenant>`.
 
 ### Contract
 
