@@ -3,3 +3,8 @@
 **/dist
 .git
 .claude
+.env*
+.pulumi
+target
+.tools
+.cache

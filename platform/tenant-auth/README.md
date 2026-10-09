@@ -47,7 +47,7 @@ platform controller's tenant reconcile). The tenant CLI is `di-tenant` in `@di-f
 
 The controller and console ship as one container image, `ghcr.io/di-framework/tenant-auth`, built by
 `platform/tenant-auth/Dockerfile` (context: the repository root). It bundles both entry points with
-`bun build --target bun` onto a stock `oven/bun` Alpine base (itself pinned by digest) and runs as uid
+`bun build --target bun` onto a stock `oven/bun` 1.4 Alpine base (itself pinned by digest) and runs as uid
 1000 on a read-only root. The Deployment picks the process with `command`:
 
 * controller: `bun /app/controller.js` (HTTPS, default `:8788`)
@@ -55,7 +55,13 @@ The controller and console ship as one container image, `ghcr.io/di-framework/te
 
 A container image was chosen over an OCI bundle on a stock Bun image because Kubernetes pulls and
 verifies it natively by digest, with no init step or volume plugin, and one digest pins both the code
-and the runtime. This replaces the ConfigMap bundle.
+and the runtime. It will replace the ConfigMap bundle when `:reconcile` lands. `:reconcile` must:
+
+* drop the `/app` ConfigMap mount (the code is in the image);
+* keep the `/tmp` emptyDir (the root filesystem is read-only);
+* set `TENANT_CONTROLLER_HOST=0.0.0.0` and `TENANT_CONSOLE_HOST=0.0.0.0`;
+* mount the TLS certificate and key (`TENANT_CONTROLLER_TLS_CERT`, `TENANT_CONTROLLER_TLS_KEY`);
+* use the image digest in place of the `bundle-digest` annotation.
 
 Maintainers publish it with the `Publish tenant-auth image` workflow (`workflow_dispatch`); the
 workflow summary prints the reference. **Pin consumers by digest**, never by tag:

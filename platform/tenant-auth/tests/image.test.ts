@@ -38,3 +38,16 @@ test('the publish workflow is dispatch-only and builds the Dockerfile from the r
   expect(workflow).toContain('ghcr.io/di-framework/tenant-auth');
   expect(existsSync(join(pkg, 'Dockerfile.dockerignore'))).toBe(true);
 });
+
+test('the Dockerfile Bun version can read the lockfile version', () => {
+  const lock = readFileSync(join(repo, 'bun.lock'), 'utf8');
+  const lockVersion = Number(lock.match(/"lockfileVersion":\s*(\d+)/)?.[1]);
+  const versions = [...dockerfile.matchAll(/oven\/bun:(\d+)\.(\d+)/g)];
+  expect(versions.length).toBe(2);
+  // Bun 1.3 cannot read lockfileVersion 2; it needs 1.4 or newer.
+  const [needMajor, needMinor] = lockVersion >= 2 ? [1, 4] : [1, 0];
+  for (const [, major, minor] of versions) {
+    const [haveMajor, haveMinor] = [Number(major), Number(minor)];
+    expect(haveMajor > needMajor || (haveMajor === needMajor && haveMinor >= needMinor)).toBe(true);
+  }
+});
