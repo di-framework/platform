@@ -20,6 +20,10 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::{Future, poll_fn};
+use std::pin::pin;
+use std::rc::Rc;
+use std::task::Poll;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -33,6 +37,9 @@ const REALM: &str = "di-framework-tenant-registry";
 pub(crate) const CACHE_TTL_NANOS: u64 = 30 * 1_000_000_000;
 /// Upper bound on cached credentials.
 pub(crate) const CACHE_CAPACITY: usize = 256;
+/// Upper bound on one whoami callback, enforced in the guest on top of the
+/// `wasi:http` request options (which a host may ignore). Expiry denies.
+pub(crate) const WHOAMI_DEADLINE_NANOS: u64 = 12 * 1_000_000_000;
 
 /// The tenant role the controller reports for a credential.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,13 +164,36 @@ pub(crate) enum Decision {
     Forbidden,
 }
 
+/// Run `work` until it finishes or `deadline` fires, whichever is first.
+/// `None` means the deadline won.
+pub(crate) async fn race<W: Future, D: Future<Output = ()>>(
+    work: W,
+    deadline: D,
+) -> Option<W::Output> {
+    let mut work = pin!(work);
+    let mut deadline = pin!(deadline);
+    poll_fn(|cx| {
+        if let Poll::Ready(value) = work.as_mut().poll(cx) {
+            return Poll::Ready(Some(value));
+        }
+        if deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 /// Decide a request from its `Authorization` header and the access it needs.
-pub(crate) async fn authorize<C: Controller>(
+/// The controller call is abandoned (and the request denied) when `deadline`
+/// completes first; a cache hit never waits on it.
+pub(crate) async fn authorize<C: Controller, D: Future<Output = ()>>(
     cache: &RefCell<Cache>,
     controller: &C,
     authorization: Option<&str>,
     access: Access,
     now: u64,
+    deadline: D,
 ) -> Decision {
     let Some(password) = authorization.and_then(basic_password) else {
         return Decision::Challenge;
@@ -172,12 +202,12 @@ pub(crate) async fn authorize<C: Controller>(
     let cached = cache.borrow_mut().get(&key, now);
     let role = match cached {
         Some(role) => role,
-        None => match controller.whoami(&password).await {
-            Whoami::Role(role) => {
+        None => match race(controller.whoami(&password), deadline).await {
+            Some(Whoami::Role(role)) => {
                 cache.borrow_mut().put(key, role, now);
                 role
             }
-            Whoami::Denied => return Decision::Challenge,
+            Some(Whoami::Denied) | None => return Decision::Challenge,
         },
     };
     if role.allows(access) {
@@ -202,7 +232,11 @@ pub(crate) fn basic_password(header: &str) -> Option<String> {
 }
 
 thread_local! {
-    static CACHE: RefCell<Cache> = RefCell::new(Cache::new(CACHE_CAPACITY, CACHE_TTL_NANOS));
+    // Shared by every request this instance serves. `authorize` borrows it
+    // only for a single get or put, never across the controller await, so
+    // concurrent requests in one instance see each other's entries.
+    static CACHE: Rc<RefCell<Cache>> =
+        Rc::new(RefCell::new(Cache::new(CACHE_CAPACITY, CACHE_TTL_NANOS)));
 }
 
 /// Returns `Some(response)` — `401` with a `WWW-Authenticate: Basic` challenge,
@@ -210,14 +244,20 @@ thread_local! {
 pub(crate) async fn require_access(headers: &Fields, method: &Method) -> Option<Response> {
     let access = required_access(method_name(method));
     let authorization = header_str(headers, "authorization");
-    let now = crate::bindings::wasi::clocks::monotonic_clock::now();
+    use crate::bindings::wasi::clocks::monotonic_clock;
+    let now = monotonic_clock::now();
     let controller = crate::controller::TenantController;
-    // The cache lives in a thread-local; take it out for the await (the
-    // component is single-threaded, so nothing else touches it meanwhile).
-    let cache = CACHE.with(|c| c.replace(Cache::new(CACHE_CAPACITY, CACHE_TTL_NANOS)));
-    let cache = RefCell::new(cache);
-    let decision = authorize(&cache, &controller, authorization.as_deref(), access, now).await;
-    CACHE.with(|c| c.replace(cache.into_inner()));
+    let cache = CACHE.with(Rc::clone);
+    let deadline = monotonic_clock::wait_for(WHOAMI_DEADLINE_NANOS);
+    let decision = authorize(
+        &cache,
+        &controller,
+        authorization.as_deref(),
+        access,
+        now,
+        deadline,
+    )
+    .await;
     match decision {
         Decision::Allow => None,
         Decision::Challenge => Some(challenge()),
@@ -332,7 +372,14 @@ mod tests {
         header: Option<&str>,
         method: &str,
     ) -> Decision {
-        block_on(authorize(c, f, header, required_access(method), 0))
+        block_on(authorize(
+            c,
+            f,
+            header,
+            required_access(method),
+            0,
+            std::future::pending(),
+        ))
     }
 
     #[test]
@@ -436,7 +483,16 @@ mod tests {
         let c = RefCell::new(Cache::new(8, 100));
         let f = fake();
         let auth = basic("u", "viewer-token");
-        let at = |now| block_on(authorize(&c, &f, Some(&auth), Access::Read, now));
+        let at = |now| {
+            block_on(authorize(
+                &c,
+                &f,
+                Some(&auth),
+                Access::Read,
+                now,
+                std::future::pending(),
+            ))
+        };
         assert_eq!(at(0), Decision::Allow);
         assert_eq!(at(99), Decision::Allow);
         assert_eq!(f.calls.get(), 1);
@@ -474,6 +530,84 @@ mod tests {
         let mut disabled = Cache::new(0, 10);
         disabled.put([1; 32], Role::Viewer, 0);
         assert_eq!(disabled.len(), 0);
+    }
+
+    /// A controller that accepts the call and never answers.
+    struct HangingController;
+
+    impl Controller for HangingController {
+        async fn whoami(&self, _bearer: &str) -> Whoami {
+            std::future::pending().await
+        }
+    }
+
+    #[test]
+    fn a_hanging_controller_times_out_and_fails_closed() {
+        let c = cache();
+        let auth = basic("u", "dik_developer");
+        for access in [Access::Read, Access::Write] {
+            let decision = block_on(authorize(
+                &c,
+                &HangingController,
+                Some(&auth),
+                access,
+                0,
+                std::future::ready(()),
+            ));
+            assert_eq!(decision, Decision::Challenge);
+        }
+        assert_eq!(c.borrow().len(), 0);
+    }
+
+    #[test]
+    fn concurrent_requests_share_one_cache() {
+        // Two requests interleave: the first is suspended inside its controller
+        // call while the second completes. Both entries must survive.
+        let c = Rc::new(cache());
+        let f = fake();
+        let mut cx = Context::from_waker(Waker::noop());
+        let gate = Cell::new(false);
+        let viewer = basic("u", "viewer-token");
+        let developer = basic("u", "dik_developer");
+        struct Slow<'a>(&'a FakeController, &'a Cell<bool>);
+        impl Controller for Slow<'_> {
+            async fn whoami(&self, bearer: &str) -> Whoami {
+                poll_fn(|_| {
+                    if self.1.get() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                self.0.whoami(bearer).await
+            }
+        }
+        let slow = Slow(&f, &gate);
+        let mut first = pin!(authorize(
+            &c,
+            &slow,
+            Some(&viewer),
+            Access::Read,
+            0,
+            std::future::pending()
+        ));
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            block_on(authorize(
+                &c,
+                &f,
+                Some(&developer),
+                Access::Write,
+                0,
+                std::future::pending()
+            )),
+            Decision::Allow
+        );
+        assert_eq!(c.borrow().len(), 1);
+        gate.set(true);
+        assert_eq!(first.as_mut().poll(&mut cx), Poll::Ready(Decision::Allow));
+        assert_eq!(c.borrow().len(), 2);
     }
 
     #[test]

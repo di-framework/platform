@@ -161,6 +161,8 @@ impl ManifestMetadata {
             .get("subject")
             .and_then(|s| s.get("digest"))
             .and_then(|d| d.as_str())
+            // di-framework: the subject digest becomes part of a referrer key.
+            .filter(|d| crate::validate::is_valid_digest(d))
             .map(str::to_string);
         let artifact_type = value
             .get("artifactType")

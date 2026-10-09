@@ -25,3 +25,4 @@ dev:
       interfaces: [store, reveal]
       config:
         tenant-controller-url: http://127.0.0.1:8080
+        tenant: dev

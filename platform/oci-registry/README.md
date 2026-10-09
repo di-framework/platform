@@ -19,7 +19,18 @@ di-framework changes against that commit:
   Basic credential is replaced by a callback to the tenant controller.
 - `src/controller.rs`: new. Calls `GET /v1/auth/whoami` over outgoing
   `wasi:http/client@0.3.0`.
-- `src/lib.rs`: calls `auth::require_access` instead of `auth::require_basic`.
+- `src/lib.rs`: calls `auth::require_access` instead of `auth::require_basic`,
+  and rejects invalid names, digests, tags and session ids before any storage
+  access (`src/validate.rs`).
+- `src/validate.rs`: new (security fix, a candidate to send upstream). Repository
+  names, digests (`algorithm:encoded`, lowercase hex of the right length for
+  `sha256` / `sha512`), tags and upload session ids are checked against the
+  distribution-spec grammar before they become object keys, so `..` and other
+  separators never reach the blobstore. Violations get `400` with the spec's
+  codes (`NAME_INVALID`, `DIGEST_INVALID`, `TAG_INVALID`,
+  `BLOB_UPLOAD_INVALID`). Upstream built keys from the raw path.
+- `src/manifests.rs`: a manifest `subject` digest is indexed as a referrer only
+  when it is a valid digest (it becomes part of a key).
 - `wit/world.wit`: adds `import wasi:http/client@0.3.0` and
   `wasi:clocks/monotonic-clock@0.3.0`.
 - `wit/deps/`: the resolved WIT dependencies (`wkg wit fetch`, digests in
@@ -29,6 +40,8 @@ di-framework changes against that commit:
 - `Makefile`, `scripts/build.sh`, `rust-toolchain.toml`, `package.json`,
   `package.test.ts`, `.wash/config.yaml` (dev config): di-framework build and
   test wiring, matching `sqlite-component` / `pglite-component`.
+- `.github/workflows/oci-registry-component.yml` (repository root): publishes
+  the built component to GHCR (see [Publishing](#publishing)).
 
 ## Authorization
 
@@ -40,35 +53,67 @@ including the `GET /v2/` probe, the registry:
 1. Rejects a missing, non-Basic or empty-password `Authorization` header with
    `401` and `WWW-Authenticate: Basic realm="di-framework-tenant-registry"`.
 2. Calls `GET <tenant-controller-url>/v1/auth/whoami` with
-   `Authorization: Bearer <password>`.
-3. Maps the operation by method: `GET` / `HEAD` (pull, existence checks, tag
+   `Authorization: Bearer <password>`. The call has a 2 s connect, 5 s
+   first-byte and 5 s between-bytes timeout (`wasi:http` request options), and
+   the guest also abandons it after 12 s by the monotonic clock in case the
+   host ignores those options. A timeout denies (`401`).
+3. Requires a 2xx body shaped like the contract's `Principal` (`user`,
+   `account`, `role`, `via`) whose `account` equals the bind-time `tenant`
+   key. A principal from another tenant's controller is denied.
+4. Maps the operation by method: `GET` / `HEAD` (pull, existence checks, tag
    listing, referrers, the `/v2/` probe) need **read**; `POST` / `PUT` /
    `PATCH` / `DELETE` (uploads, mounts, manifest pushes, deletes) and any other
    method need **write**.
-4. Allows read for `viewer` and `developer`, write for `developer` only. A
+5. Allows read for `viewer` and `developer`, write for `developer` only. A
    `viewer` attempting a write gets `403 DENIED`.
 
 Positive answers are cached for 30 s, at most 256 entries, keyed by the
 SHA-256 of the credential (never the raw token); expired entries are evicted
 first, then the one closest to expiry. Negative answers are never cached.
+The cache is shared by every request one component instance serves and is
+borrowed only for a single lookup or insert, never across the controller call,
+so parallel layer pushes in one instance reuse each other's answers. Whether
+wash reuses a component instance across requests (or instantiates one per
+request, as the plain wasmtime-wasi-http proxy pattern does) has not been
+verified for the tenant host; if it instantiates per request, the cache never
+hits and every request calls the controller.
 
-It **fails closed**: if `tenant-controller-url` is missing or malformed, the
-controller is unreachable, or it answers anything other than a 2xx with a
-`viewer` / `developer` role, the request gets the `401` challenge.
+**Revocation window.** The 30 s registry cache stacks on the controller's own
+caches (membership 15 s, identity claims 60 s; API keys are not cached there).
+Worst cases before a revoked credential stops working at the registry:
+
+| Change                                                   | Worst case |
+| -------------------------------------------------------- | ---------- |
+| API-key revocation or expiry                             | about 30 s |
+| User or tenant suspension, or membership removal         | about 45 s |
+| Identity-token revocation at the issuer                  | about 90 s |
+
+`POST /v1/auth/logout` on the controller does not clear the registry's cache.
+
+It **fails closed**: if `tenant-controller-url` or `tenant` is missing or
+malformed, the controller is unreachable or too slow, or it answers anything
+other than a 2xx `Principal` for this tenant with a `viewer` / `developer`
+role, the request gets the `401` challenge.
 
 ### Configuration
 
-| Key                     | Source                                      | Example                                          |
-| ----------------------- | ------------------------------------------- | ------------------------------------------------ |
-| `tenant-controller-url` | `wasmcloud:secrets` (bind-time config)      | `http://tenant-auth-controller.acme.svc:8080`    |
+| Key                     | Source                                 | Example                                              |
+| ----------------------- | -------------------------------------- | ---------------------------------------------------- |
+| `tenant-controller-url` | `wasmcloud:secrets` (bind-time config) | `https://tenant-controller.di-runtime-acme.svc:8788` |
+| `tenant`                | `wasmcloud:secrets` (bind-time config) | `acme`                                               |
 
-The URL is read through the same `wasmcloud:secrets` `store` + `reveal`
+`https://` is accepted for any host. Plain `http://` is accepted only for
+cluster-local hosts (`*.svc`, `*.svc.cluster.local`) and loopback (for
+`wash dev`); any other `http://` URL denies every request, so a typo cannot
+send tokens off-cluster in cleartext.
+
+Both values are read through the same `wasmcloud:secrets` `store` + `reveal`
 imports upstream already used for its credentials, so the component's import
 surface grows only by `wasi:http/client` and the monotonic clock; no
 `wasi:config` host plugin is required. An optional path prefix is kept
 (`https://host/prefix` calls `/prefix/v1/auth/whoami`).
 
-### Why plain HTTP inside the namespace
+### Plain HTTP to the controller
 
 The tenant controller serves HTTPS with a private CA. A component's outgoing
 `wasi:http` request is made by the host (wash 2.x, wasmtime-wasi-http over
@@ -79,13 +124,16 @@ originates itself over `wasi:sockets`, not the host's HTTP client. So
 `https://` only works when the tenant's private CA is installed in every
 tenant host's trust store, which couples the host image to each tenant's CA.
 
-Chosen: the registry calls the controller over plain HTTP on its in-namespace
-Service address (`http://<controller-service>.<namespace>.svc:<port>`). The
-bearer credential then never leaves the tenant's namespace; `:reconcile` must
-expose that HTTP port only on the cluster network and restrict it with a
-NetworkPolicy to the tenant's host pods. Clients still reach the registry
-itself over TLS through the gateway (`:reconcile` / #58 `:routes`). If the
-CA is later trusted by the host, an `https://` URL works with no code change.
+The component accepts either. If `:reconcile` uses plain HTTP to the
+controller's cluster-local Service, the credential crosses the pod network in
+**cleartext**: a namespace is not a network boundary. The gateway-to-host hop
+is already plain HTTP too, so the Basic credential is cleartext on the pod
+network before the registry sees it. Both hops stay cleartext unless the
+cluster encrypts pod traffic (CNI WireGuard or mesh mTLS). The constraints for
+`:reconcile` (a separate controller listener serving only
+`GET /v1/auth/whoami`, and a NetworkPolicy admitting only the tenant's host
+pods) are recorded on #58. Once the tenant host is confirmed to accept an
+extra trust root, an `https://` URL works with no code change.
 
 ### Build and test
 
@@ -98,7 +146,26 @@ bun test platform/oci-registry   # artifact + provenance checks
 
 `make build` needs rustup (honours `rust-toolchain.toml`: Rust 1.97.1,
 `wasm32-wasip2`) and `wasm-tools`. CI builds and tests it in `.github/workflows/ci.yml`.
-Nothing is published from here yet.
+The wasi:http path (`TenantController::whoami`) is exercised only by a real
+host; there is no `wash dev` integration test against a stub controller yet.
+
+### Publishing
+
+`.github/workflows/oci-registry-component.yml` is dispatch-only. It runs
+`make -C platform/oci-registry build` and pushes
+`dist/di-framework-oci-registry.wasm` to `ghcr.io/di-framework/oci-registry`
+as a canonical Wasm OCI artifact (config `application/vnd.wasm.config.v0+json`,
+layer `application/wasm`), tagged with the commit SHA. The job summary prints
+the manifest digest.
+
+Pin deployments by digest, never by tag:
+
+```
+ghcr.io/di-framework/oci-registry@sha256:<digest from the job summary>
+```
+
+The SHA tag is informational; only the digest is stable. `:reconcile` reads
+the pin from its own manifests, so record the digest there when you publish.
 
 ---
 
@@ -126,8 +193,8 @@ uploads, tag listing, and the referrers API.
 - `cargo` (Rust 2024 edition)
 - `wash` 2.7.0 or later — stock releases build and run wasip3 components,
   enable the async `wasmcloud:blobstore` backend by default, and ship the
-  built-in `wasmcloud:secrets` plugin that delivers the registry's Basic auth
-  credentials from bind-time config.
+  built-in `wasmcloud:secrets` plugin that delivers the registry's
+  controller URL and tenant from bind-time config.
 - Optional, for the walkthrough: [`oras`](https://oras.land/docs/installation)
 
 ## Running with wash
@@ -141,9 +208,11 @@ wiring up an HTTP server and the async blobstore host plugin.
 
 The `dev.host_interfaces` entries in `.wash/config.yaml` route the blobstore
 import to the **filesystem** backend rooted at `tmp/blobstore` (so registry
-contents persist across `wash dev` restarts) and supply the Basic auth
-credentials through the built-in `wasmcloud:secrets` plugin — without the
-secrets entry, the registry denies every request:
+contents persist across `wash dev` restarts) and supply the tenant controller
+URL and tenant through the built-in `wasmcloud:secrets` plugin — without the
+secrets entry, the registry denies every request. Every request needs Basic
+credentials whose password the controller accepts (the examples below use
+`$TOKEN`, an access token or `dik_` API key for the tenant):
 
 ```yaml
 dev:
@@ -160,6 +229,7 @@ dev:
       interfaces: [store, reveal]
       config:
         tenant-controller-url: http://127.0.0.1:8080
+        tenant: dev
 ```
 
 ## Building
@@ -177,7 +247,7 @@ the linker componentizes the result into a wasip3 component (imports
 1. `wasi:http` to receive registry requests (wasip3 `handler@0.3.0`)
 2. `wasmcloud:blobstore` to persist blobs, manifests, and tags
 3. `wasi:random` to mint upload-session identifiers
-4. `wasmcloud:secrets` (`store` + `reveal`) to supply `tenant-controller-url`,
+4. `wasmcloud:secrets` (`store` + `reveal`) to supply `tenant-controller-url` and `tenant`,
    served by the built-in `wasmcloud:secrets` plugin from bind-time config
 5. `wasi:http/client` to call the tenant controller's `/v1/auth/whoami`
 6. `wasi:clocks/monotonic-clock` for the authorization cache TTL
@@ -229,18 +299,18 @@ A few protocol details that the conformance suite exercises:
 ```console
 # Push an artifact
 $ echo 'hello oci world' > hello.txt
-$ oras push --plain-http 127.0.0.1:8000/myrepo/artifact:v1 hello.txt:text/plain
+$ oras push --plain-http -u x -p "$TOKEN" 127.0.0.1:8000/myrepo/artifact:v1 hello.txt:text/plain
 ...
 Pushed [registry] 127.0.0.1:8000/myrepo/artifact:v1
 Digest: sha256:...
 
 # List tags
-$ oras repo tags --plain-http 127.0.0.1:8000/myrepo/artifact
+$ oras repo tags --plain-http -u x -p "$TOKEN" 127.0.0.1:8000/myrepo/artifact
 v1
 
 # Pull it back into a clean directory
 $ mkdir /tmp/pulled && cd /tmp/pulled
-$ oras pull --plain-http 127.0.0.1:8000/myrepo/artifact:v1
+$ oras pull --plain-http -u x -p "$TOKEN" 127.0.0.1:8000/myrepo/artifact:v1
 $ cat hello.txt
 hello oci world
 ```
@@ -253,30 +323,31 @@ toolchain. Push a built component with `wash oci push`, then pull it back with
 any OCI client:
 
 ```console
-# Push a built component to this registry (--insecure = plain HTTP, no auth)
-$ wash oci push --insecure \
+# Push a built component to this registry (--insecure = plain HTTP; the
+# password is your controller credential)
+$ wash oci push --insecure --user x --password "$TOKEN" \
     localhost:8000/library/oci-registry:0.1.0 \
     target/wasm32-wasip2/release/oci_registry.wasm
 OCI command executed successfully.
 
 # Pull it back — wash, wkg, and oras all consume it, byte-for-byte identical
-$ wash oci pull --insecure localhost:8000/library/oci-registry:0.1.0   # -> /tmp/component.wasm
+$ wash oci pull --insecure --user x --password "$TOKEN" localhost:8000/library/oci-registry:0.1.0   # -> /tmp/component.wasm
 $ wkg  oci pull localhost:8000/library/oci-registry:0.1.0 --insecure localhost:8000 -o out.wasm
-$ oras pull --plain-http localhost:8000/library/oci-registry:0.1.0
+$ oras pull --plain-http -u x -p "$TOKEN" localhost:8000/library/oci-registry:0.1.0
 ```
 
 `wash oci push` stores a canonical Wasm OCI artifact — verify what the registry
 is serving:
 
 ```console
-$ curl -s localhost:8000/v2/library/oci-registry/manifests/0.1.0 | jq '{config: .config.mediaType, layer: .layers[0].mediaType, size: .layers[0].size}'
+$ curl -s -u "x:$TOKEN" localhost:8000/v2/library/oci-registry/manifests/0.1.0 | jq '{config: .config.mediaType, layer: .layers[0].mediaType, size: .layers[0].size}'
 {
   "config": "application/vnd.wasm.config.v0+json",
   "layer": "application/wasm",
   "size": 373980
 }
 
-$ curl -s localhost:8000/v2/library/oci-registry/tags/list
+$ curl -s -u "x:$TOKEN" localhost:8000/v2/library/oci-registry/tags/list
 {"name":"library/oci-registry","tags":["0.1.0"]}
 ```
 
@@ -285,29 +356,29 @@ round-trips through the registry unchanged.
 
 > To have a wasmCloud host *run* a component straight from this registry,
 > reference `localhost:8000/library/...:<tag>` as the `image` in a wadm manifest.
-> The host must be configured to allow the insecure (plain-HTTP, no-auth)
-> registry, otherwise it refuses the pull.
+> The host must be configured to allow the insecure (plain-HTTP) registry and
+> given credentials for it, otherwise it refuses the pull.
 
 ## Try it with `curl`
 
 ```console
 # API version check
-$ curl -i http://127.0.0.1:8000/v2/
+$ curl -i -u "x:$TOKEN" http://127.0.0.1:8000/v2/
 HTTP/1.1 200 OK
 docker-distribution-api-version: registry/2.0
 
 # Monolithic blob upload: initiate, then PUT with the digest
 $ BLOB='example blob'
 $ DIGEST="sha256:$(printf '%s' "$BLOB" | shasum -a 256 | cut -d' ' -f1)"
-$ LOC=$(curl -s -D - -o /dev/null -X POST \
+$ LOC=$(curl -s -u "x:$TOKEN" -D - -o /dev/null -X POST \
     http://127.0.0.1:8000/v2/demo/blobs/uploads/ \
     | tr -d '\r' | awk -F': ' 'tolower($1)=="location"{print $2}')
-$ curl -i -X PUT "http://127.0.0.1:8000${LOC}?digest=${DIGEST}" --data-binary "$BLOB"
+$ curl -i -u "x:$TOKEN" -X PUT "http://127.0.0.1:8000${LOC}?digest=${DIGEST}" --data-binary "$BLOB"
 HTTP/1.1 201 Created
 docker-content-digest: sha256:...
 
 # Pull the blob back
-$ curl "http://127.0.0.1:8000/v2/demo/blobs/${DIGEST}"
+$ curl -u "x:$TOKEN" "http://127.0.0.1:8000/v2/demo/blobs/${DIGEST}"
 example blob
 ```
 

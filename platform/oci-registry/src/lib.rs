@@ -48,6 +48,7 @@ mod storage;
 mod tags;
 mod uploads;
 mod util;
+mod validate;
 
 use bindings::exports::wasi::http::handler::Guest as Handler;
 
@@ -121,8 +122,13 @@ async fn dispatch(request: Request) -> Result<Response, String> {
         ));
     };
 
-    let container = ensure_container().await?;
     let route = Route::parse(spec);
+    // di-framework: reject names, digests, tags and sessions outside the
+    // distribution-spec grammar before any of them becomes an object key.
+    if let Some(rejection) = route.as_ref().and_then(|r| validate::reject(r, &query)) {
+        return Ok(rejection);
+    }
+    let container = ensure_container().await?;
 
     // Streaming upload fast-paths: pipe the request body straight into the
     // blobstore while hashing, instead of buffering the whole blob. Monolithic
