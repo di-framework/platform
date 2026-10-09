@@ -269,11 +269,14 @@ export function workloadEnvironmentReferencesAllowed(input: {
   workloadName: string;
   labels?: Record<string, string>;
   locals: EnvironmentReferencesLike[];
+  /** Names from `components[].imagePullSecret.name` and `service.imagePullSecret.name`. */
+  imagePullSecrets?: string[];
 }): boolean {
   if (
     input.username === `system:serviceaccount:${input.controllerNamespace}:di-platform-controller`
   )
     return true;
+  if ((input.imagePullSecrets ?? []).some(isManagedSecretName)) return false;
   const label = input.labels?.[ENV_LABEL];
   const env = (DEPLOY_ENVS as readonly string[]).includes(label ?? '') ? label : undefined;
   const controlSecret = `${input.workloadName}-control`;
@@ -493,6 +496,16 @@ function workloadPolicy(namespace: string): AdmissionPolicy {
       },
       { name: 'locals', expression: localsOf('variables.w') },
       {
+        name: 'pullSecrets',
+        expression: `
+          (has(variables.w.components)
+            ? variables.w.components.filter(c, has(c.imagePullSecret)).map(c, c.imagePullSecret.name)
+            : []) +
+          (has(variables.w.service) && has(variables.w.service.imagePullSecret)
+            ? [variables.w.service.imagePullSecret.name]
+            : [])`,
+      },
+      {
         name: 'oldLocals',
         expression: `request.operation != 'UPDATE' ? [] : ${localsOf('oldObject.spec.template.spec')}`,
       },
@@ -538,6 +551,11 @@ function workloadPolicy(namespace: string): AdmissionPolicy {
                 s.name.matches('^[a-z]([-a-z0-9]{0,61}[a-z0-9])?[.](${DEPLOY_ENVS.join('|')})$')))))))`,
         message:
           'Tenant guests may reference only di-vars-<env> and <name>.<env> Secrets matching their platform.di-framework.dev/env label (never di-binding-*/di-bs-*)',
+      },
+      {
+        expression: `variables.controller || variables.pullSecrets.all(n,
+          !n.startsWith('${BINDING_CONFIG_PREFIX}') && !n.startsWith('${BS_CONFIG_PREFIX}'))`,
+        message: 'Tenant guests cannot use di-binding-*/di-bs-* Secrets as an imagePullSecret',
       },
       {
         expression: hostInterfaceAdmissionExpression(),
