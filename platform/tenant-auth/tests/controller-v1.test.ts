@@ -109,7 +109,7 @@ describe('/v1 dispatch', () => {
     expect(reachedCluster('/v1')).toBe(false);
   });
 
-  test('a deploy bundle that matches the contract reaches its 501 handler', async () => {
+  test('a deploy bundle that matches the contract reaches its handler', async () => {
     const bundle = {
       env: 'prod',
       service: 'web',
@@ -118,8 +118,9 @@ describe('/v1 dispatch', () => {
       bindings: [{ name: 'kv', capability: 'wasi:keyvalue', config: { bucket: 'b' } }],
       secrets: ['db'],
     };
+    // The handler's own bundle validation answers, so the contract let it through.
     for (const path of ['/v1/deploy', '/v1/deploy/preview'])
-      expect((await call('POST', path, { body: JSON.stringify(bundle) })).status).toBe(501);
+      expect((await call('POST', path, { body: JSON.stringify(bundle) })).status).toBe(422);
   });
 
   test.each([
@@ -226,18 +227,20 @@ describe('/v1 dispatch', () => {
 
   describe('role policy', () => {
     test.each([
-      ['GET', '/v1/deployments?env=prod', undefined],
-      ['GET', '/v1/deployments/stats?env=prod', undefined],
-      ['GET', '/v1/vars?env=prod', undefined],
-      ['GET', '/v1/services/web/logs?env=prod', undefined],
+      ['GET', '/v1/deployments?env=prod', undefined, 501],
+      ['GET', '/v1/deployments/stats?env=prod', undefined, 501],
+      ['GET', '/v1/vars?env=prod', undefined, 501],
+      ['GET', '/v1/services/web/logs?env=prod', undefined, 501],
+      // Reaches the handler, whose bundle validation answers.
       [
         'POST',
         '/v1/deploy/preview',
         '{"env":"prod","service":"web","component":{"reference":"r","digest":"d"},"workload":{},"bindings":[],"secrets":[]}',
+        422,
       ],
-    ])('a viewer may call %s %s', async (method, path, body) => {
+    ])('a viewer may call %s %s', async (method, path, body, status) => {
       const response = await call(method, path, { body, bearer: 'viewer' });
-      expect(response.status).toBe(501);
+      expect(response.status).toBe(status);
     });
 
     test.each([
