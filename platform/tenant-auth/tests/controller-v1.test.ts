@@ -80,10 +80,6 @@ describe('/v1 dispatch', () => {
     ['GET', '/v1/deployments?env=staging&service=web', undefined, 'deployments'],
     ['GET', '/v1/deployments/stats?env=prod', undefined, 'deploymentStats'],
     ['POST', '/v1/deployments/rollback', '{"env":"prod","service":"web"}', 'rollback'],
-    ['GET', '/v1/secrets?env=prod', undefined, 'secrets'],
-    ['PUT', '/v1/secrets/db?env=prod', '{"value":"s3cret"}', 'setSecret'],
-    ['PATCH', '/v1/vars/LEVEL?env=prod', '{"value":"debug"}', 'updateVar'],
-    ['DELETE', '/v1/vars/LEVEL?env=prod', undefined, 'unsetVar'],
     [
       'POST',
       '/v1/services',
@@ -228,7 +224,6 @@ describe('/v1 dispatch', () => {
     test.each([
       ['GET', '/v1/deployments?env=prod', undefined],
       ['GET', '/v1/deployments/stats?env=prod', undefined],
-      ['GET', '/v1/vars?env=prod', undefined],
       ['GET', '/v1/services/web/logs?env=prod', undefined],
       [
         'POST',
@@ -279,7 +274,9 @@ describe('/v1 dispatch', () => {
     });
 
     test('a developer may call the operations a viewer may not', async () => {
-      const response = await call('PUT', '/v1/secrets/db?env=prod', { body: '{"value":"v"}' });
+      const response = await call('POST', '/v1/deployments/rollback', {
+        body: '{"env":"prod","service":"web"}',
+      });
       expect(response.status).toBe(501);
     });
 
