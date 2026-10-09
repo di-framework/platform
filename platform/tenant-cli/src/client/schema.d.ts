@@ -396,7 +396,7 @@ export interface components {
         RegistryInfo: {
             /**
              * Format: uri
-             * @description Base URL of the tenant's OCI registry.
+             * @description Origin of the tenant's OCI registry: scheme + host[:port], no path. Clients use its host[:port] for login and in image references; an http: origin means plain HTTP.
              */
             url: string;
             /** @description Namespace inside the tenant registry, when there is one. */
@@ -737,7 +737,7 @@ export interface operations {
                     "application/json": {
                         /**
                          * Format: uri
-                         * @description Base URL of the tenant's OCI registry.
+                         * @description Origin of the tenant's OCI registry: scheme + host[:port], no path. Clients use its host[:port] for login and in image references; an http: origin means plain HTTP.
                          */
                         url: string;
                         /** @description Namespace inside the tenant registry, when there is one. */
