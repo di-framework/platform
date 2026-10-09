@@ -1,5 +1,5 @@
-import { expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
+import { afterAll, expect, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -9,8 +9,11 @@ const run = (cmd: string[], cwd: string) => {
   return result.stdout.toString();
 };
 
+const scratch = mkdtempSync(join(tmpdir(), 'tenant-client-'));
+afterAll(() => rmSync(scratch, { recursive: true, force: true }));
+
 test('a consumer outside the workspace imports ./client from the packed tarball and calls authInfo', () => {
-  const scratch = mkdtempSync(join(tmpdir(), 'tenant-client-'));
+  run(['bun', 'run', 'build'], join(import.meta.dir, '..'));
   run(
     ['bun', 'pm', 'pack', '--ignore-scripts', '--destination', scratch],
     join(import.meta.dir, '..'),
@@ -44,4 +47,32 @@ console.log(JSON.stringify({ info, error: typeof ControllerError, events: typeof
     error: 'function',
     events: 'function',
   });
+
+  // A strict consumer that cannot import .ts files must still compile against the packed types.
+  writeFileSync(
+    join(project, 'tsconfig.json'),
+    JSON.stringify({
+      compilerOptions: {
+        module: 'ESNext',
+        target: 'ESNext',
+        moduleResolution: 'bundler',
+        allowImportingTsExtensions: false,
+        verbatimModuleSyntax: true,
+        strict: true,
+        noEmit: true,
+        types: [],
+        lib: ['ESNext', 'DOM'],
+      },
+      include: ['consumer.ts'],
+    }),
+  );
+  writeFileSync(
+    join(project, 'consumer.ts'),
+    `import { createClient, events, type AuthInfo } from '@di-framework/tenant-cli/client';
+export const info = (baseUrl: string): Promise<AuthInfo> => createClient({ baseUrl }).authInfo();
+export const framing = events;
+`,
+  );
+  const tsc = join(import.meta.dir, '../../../node_modules/typescript/bin/tsc');
+  run(['node', tsc, '-p', 'tsconfig.json'], project);
 });

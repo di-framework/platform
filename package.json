@@ -12,7 +12,7 @@
   ],
   "scripts": {
     "postinstall": "git config core.hooksPath .githooks",
-    "build": "bun --filter @di-framework/platform --filter @di-framework/bindings --filter @di-framework/cloudfoundry --filter @di-framework/cloudflare build",
+    "build": "bun --filter @di-framework/platform --filter @di-framework/bindings --filter @di-framework/cloudfoundry --filter @di-framework/cloudflare --filter @di-framework/tenant-cli build",
     "test": "bun run build && bun test",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",

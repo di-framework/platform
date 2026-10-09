@@ -101,15 +101,13 @@
     },
     "platform/tenant-cli": {
       "name": "@di-framework/tenant-cli",
-      "version": "0.0.0",
+      "version": "6.0.9",
       "bin": {
-        "di-tenant": "src/main.ts",
-      },
-      "dependencies": {
-        "@di-framework/core": "^6.0.3",
-        "@di-framework/http": "^6.0.3",
+        "di-tenant": "dist/main.js",
       },
       "devDependencies": {
+        "@di-framework/core": "^6.0.3",
+        "@di-framework/http": "^6.0.3",
         "openapi-typescript": "7.13.0",
       },
     },

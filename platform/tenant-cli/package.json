@@ -12,31 +12,34 @@
   },
   "homepage": "https://github.com/di-framework/platform",
   "files": [
-    "src",
+    "dist",
+    "api/v1/openapi.yaml",
     "README.md"
   ],
   "exports": {
     "./client": {
-      "types": "./src/client/index.ts",
-      "default": "./src/client/index.ts"
+      "types": "./dist/client/index.d.ts",
+      "bun": "./dist/client/index.js",
+      "import": "./dist/client/index.js",
+      "default": "./dist/client/index.js"
     },
-    "./src/*": "./src/*"
+    "./src/api/*": "./src/api/*",
+    "./package.json": "./package.json"
   },
   "bin": {
-    "di-tenant": "src/main.ts"
+    "di-tenant": "dist/main.js"
   },
   "scripts": {
     "cli": "bun src/main.ts",
     "generate:api": "di-framework generate && bun scripts/generate-openapi.ts",
     "generate:client": "openapi-typescript api/v1/openapi.yaml -o src/client/schema.d.ts",
     "generate": "bun run generate:api && bun run generate:client",
+    "build": "rm -rf dist && bun x tsc -p tsconfig.build.json && cp src/client/schema.d.ts dist/client/schema.d.ts && bun ../../scripts/fix-esm-imports.ts dist",
     "test": "bun test"
   },
-  "dependencies": {
-    "@di-framework/core": "^6.0.3",
-    "@di-framework/http": "^6.0.3"
-  },
   "devDependencies": {
+    "@di-framework/core": "^6.0.3",
+    "@di-framework/http": "^6.0.3",
     "openapi-typescript": "7.13.0"
   }
 }
