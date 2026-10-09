@@ -94,6 +94,44 @@ test('a body above the size cap is a 413', async () => {
   expect(streamed?.status).toBe(413);
 });
 
+test('a chunked body over the cap gets its 413 while the client is still streaming', async () => {
+  const server = Bun.serve({
+    port: 0,
+    fetch: async (request) => (await dispatch(request)) ?? new Response(null, { status: 404 }),
+  });
+  try {
+    // Never closes: the 413 must not wait for the client to finish sending.
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        controller.enqueue(new Uint8Array(65536).fill(32));
+        await Bun.sleep(5);
+      },
+    });
+    const response = await fetch(`http://127.0.0.1:${server.port}/v1/secrets/db?env=prod`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body,
+      signal: AbortSignal.timeout(5000),
+    });
+    expect(response.status).toBe(413);
+  } finally {
+    server.stop(true);
+  }
+});
+
+test('a streamed body under the cap with multi-byte characters is read whole', async () => {
+  const value = 'é'.repeat(1000);
+  const response = await dispatch(
+    new Request('http://controller.test/v1/secrets/db?env=prod', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: new Blob([JSON.stringify({ value })]).stream(),
+    }),
+  );
+  expect(response?.status).not.toBe(400);
+  expect(response?.status).not.toBe(413);
+});
+
 test('errors other than validation failures propagate to the caller', async () => {
   const handlers = useContainer().resolve(TenantControllerHandlers);
   const original = handlers.vars;

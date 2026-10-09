@@ -84,12 +84,14 @@ function checkQuery(route: Route, url: URL): void {
 }
 
 /**
- * Reads the body as text, counting bytes as they stream in, and stops at the cap so a body
- * without a Content-Length cannot be buffered whole. Undefined when the body is too large.
+ * Reads the body, counting bytes as they stream in, and stops at the cap so a body without a
+ * Content-Length cannot be buffered whole. Undefined when the body is too large. The request's
+ * own stream is consumed (no clone: cancelling one branch of a tee never settles while the other
+ * branch is open), so the caller forwards a new request built from the returned bytes.
  */
-async function readCapped(request: Request): Promise<string | undefined> {
-  const stream = request.clone().body;
-  if (!stream) return '';
+async function readCapped(request: Request): Promise<Uint8Array<ArrayBuffer> | undefined> {
+  const stream = request.body;
+  if (!stream) return new Uint8Array();
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -98,12 +100,13 @@ async function readCapped(request: Request): Promise<string | undefined> {
     if (done) break;
     size += value.byteLength;
     if (size > MAX_BODY_BYTES) {
-      await reader.cancel();
+      // Not awaited: the 413 must not wait on the client to finish or close its stream.
+      reader.cancel().catch(() => {});
       return undefined;
     }
     chunks.push(value);
   }
-  return new TextDecoder().decode(Buffer.concat(chunks));
+  return new Uint8Array(Buffer.concat(chunks));
 }
 
 /** Parses the request body (an absent one reads as `{}`) and checks it against the input schema. */
@@ -134,9 +137,15 @@ export async function dispatch(request: Request): Promise<Response | undefined> 
     checkQuery(route, url);
     if (Number(request.headers.get('content-length') ?? 0) > MAX_BODY_BYTES)
       return problem(413, 'Content Too Large', `the request body exceeds ${MAX_BODY_BYTES} bytes`);
-    const text = await readCapped(request);
-    if (text === undefined)
+    const bytes = await readCapped(request);
+    if (bytes === undefined)
       return problem(413, 'Content Too Large', `the request body exceeds ${MAX_BODY_BYTES} bytes`);
+    const text = new TextDecoder().decode(bytes);
+    if (bytes.byteLength > 0) {
+      const headers = new Headers(request.headers);
+      headers.delete('content-length');
+      forward = new Request(request.url, { method: request.method, headers, body: bytes });
+    }
     if (text !== '') {
       // 415 means a body was sent in a format the contract does not accept (RFC 9110 15.5.16).
       const type = (request.headers.get('content-type') ?? '').toLowerCase();
@@ -144,7 +153,7 @@ export async function dispatch(request: Request): Promise<Response | undefined> 
         return problem(415, 'Unsupported Media Type', 'the request body must be application/json');
     }
     checkBody(route, text);
-    if (text === '' && ['POST', 'PUT', 'PATCH'].includes(request.method)) {
+    if (bytes.byteLength === 0 && ['POST', 'PUT', 'PATCH'].includes(request.method)) {
       // A bodiless request passed the schema (its input is Empty); hand the generated route an
       // explicit `{}` so the router's JSON content-type check lets it through.
       const headers = new Headers(request.headers);
