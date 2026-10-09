@@ -41,6 +41,7 @@
     "js-yaml": "4.3.2"
   },
   "devDependencies": {
+    "@marcbachmann/cel-js": "^8.0.0",
     "@types/js-yaml": "4.0.9",
     "@types/node": "26.1.2"
   },

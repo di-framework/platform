@@ -277,7 +277,11 @@ create. On a WorkloadDeployment in `di-tenant-<t>`, every
 - `configFrom[].name` equal to `di-vars-<env>`;
 - `secretFrom[].name` matching `^[a-z]([-a-z0-9]{0,61}[a-z0-9])?\.<env>$` (the `<name>` rule
   above, then `.<env>`), where the part before the dot is not a managed name
-  (`isManagedSecretName`: `di-binding-*`, `di-bs-*`).
+  (`isManagedSecretName`: `di-binding-*`, `di-bs-*`);
+- a WorkloadDeployment may also reference `secretFrom: <its own metadata.name>-control` (the
+  control Secret cli-plugin-platform renders for HTTP workloads under
+  `localResources.environment`), regardless of the env label, unless that name is managed;
+- no `imagePullSecret` (component or service) may be a managed name (`di-binding-*`, `di-bs-*`).
 
 `<env>` is the value of the WorkloadDeployment's `platform.di-framework.dev/env` label: the
 `.<env>` suffix of every referenced Secret and the `di-vars-<env>` name must equal it. Prod and
