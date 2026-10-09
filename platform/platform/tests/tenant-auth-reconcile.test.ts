@@ -629,9 +629,7 @@ describe('reconcileTenant with tenant-auth', () => {
     };
     await controller.reconcileTenant(t, []);
     const renewed = api.objects.get(tlsPath)?.data as Record<string, string> | undefined;
-    expect(renewed?.['tls.crt']).not.toBe(
-      Buffer.from(expiring.cert).toString('base64'),
-    );
+    expect(renewed?.['tls.crt']).not.toBe(Buffer.from(expiring.cert).toString('base64'));
   });
 
   it('waits for the OAuth Secret, defaults the API port, and revokes the ClusterRoleBinding on suspend', async () => {
