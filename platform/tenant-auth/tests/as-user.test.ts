@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, spyOn, test } from 'bun:test';
 import { asUser, KubeClient, KubeError, type UserTokens } from '../src/kube.ts';
 import { json, serve } from './support/servers.ts';
 
@@ -158,4 +158,76 @@ describe('call', () => {
     expect(error.status).toBe(502);
     expect(error.message).toContain('GET /version failed');
   });
+
+  test('maps a failure to mint the user token to KubeError(502), not the mint 404', async () => {
+    const source: UserTokens = {
+      token: async () => {
+        throw new KubeError(404, 'serviceaccounts "di-user-dan" not found');
+      },
+      forget: () => {},
+    };
+    const user = asUser(client, source, { user: 'dan' });
+    const error = (await user.call('GET', '/things').catch((e: KubeError) => e)) as KubeError;
+    expect(error).toBeInstanceOf(KubeError);
+    expect(error.status).toBe(502);
+    expect(error.message).toContain('could not mint a token for dan');
+    expect(error.message).toContain('di-user-dan');
+    const raw = (await user.fetch('GET', '/things').catch((e: KubeError) => e)) as KubeError;
+    expect(raw.status).toBe(502);
+  });
+
+  test('describes a token source that rejects with a non-Error value', async () => {
+    const source: UserTokens = {
+      token: () => Promise.reject('vault sealed'),
+      forget: () => {},
+    };
+    const user = asUser(client, source, { user: 'dan' });
+    const error = (await user.call('GET', '/things').catch((e: KubeError) => e)) as KubeError;
+    expect(error).toBeInstanceOf(KubeError);
+    expect(error.status).toBe(502);
+    expect(error.message).toBe('could not mint a token for dan: vault sealed');
+  });
+
+  test('maps a 401 that persists after the retry to KubeError(502)', async () => {
+    const source = tokens('stale', 'stale');
+    const error = (await asUser(client, source, { user: 'dan' })
+      .call('GET', '/things')
+      .catch((e: KubeError) => e)) as KubeError;
+    expect(error).toBeInstanceOf(KubeError);
+    expect(error.status).toBe(502);
+    expect(error.message).toBe("GET /things rejected the user's token");
+    expect(source.asked).toEqual(['dan', 'dan']);
+  });
+});
+
+test('maps a timeout while reading the body to KubeError(502)', async () => {
+  const slow = serve(
+    () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            // Never closes: the body read only ends when the signal aborts it.
+            controller.enqueue(new TextEncoder().encode('{"partial":'));
+          },
+        }),
+        { headers: { 'Content-Type': 'application/json' } },
+      ),
+  );
+  const timeout = spyOn(AbortSignal, 'timeout').mockImplementation(() => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new DOMException('timed out', 'TimeoutError')), 100);
+    return controller.signal;
+  });
+  try {
+    const client = new KubeClient({ server: slow.url, token: 'admin' }, 'wasmcloud');
+    const error = (await asUser(client, tokens('a'), { user: 'dan' })
+      .call('GET', '/slow')
+      .catch((e: unknown) => e)) as KubeError;
+    expect(error).toBeInstanceOf(KubeError);
+    expect(error.status).toBe(502);
+    expect(error.message).toContain('GET /slow failed');
+  } finally {
+    timeout.mockRestore();
+    slow.stop();
+  }
 });
