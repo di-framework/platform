@@ -1,17 +1,17 @@
 import { describe, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { packageDir } from './lib.ts';
+import { join, resolve } from 'node:path';
 import {
   checkedPath,
   INITDB_DEFAULTS_NEW,
+  parseSourceArgs,
   patchEngineSource,
-  resolveSourceArg,
+  resolveSourceDir,
   SESSION_DEFAULTS_BLOCK,
 } from './patch-engine-source.ts';
 
-const pkgDir = packageDir(import.meta.url);
+const pkgDir = resolve(import.meta.dir, '..');
 
 describe('checkedPath', () => {
   test('allows only the two patchable files inside the source tree', () => {
@@ -24,11 +24,13 @@ describe('checkedPath', () => {
   });
 });
 
-describe('resolveSourceArg', () => {
-  test('rejects missing args and non-directories', async () => {
-    await expect(resolveSourceArg([])).rejects.toThrow('usage');
-    await expect(resolveSourceArg(['-h'])).rejects.toThrow('usage');
-    await expect(resolveSourceArg(['/does/not/exist'])).rejects.toThrow('does not exist');
+describe('source argument', () => {
+  test('requires exactly one source directory', async () => {
+    expect(() => parseSourceArgs([])).toThrow('usage');
+    expect(() => parseSourceArgs(['a', 'b'])).toThrow('usage');
+    expect(parseSourceArgs(['-h'])).toEqual({ help: true });
+    expect(parseSourceArgs(['src'])).toEqual({ help: false, source: 'src' });
+    await expect(resolveSourceDir('/does/not/exist')).rejects.toThrow('does not exist');
   });
 });
 

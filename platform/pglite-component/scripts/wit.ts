@@ -1,16 +1,11 @@
 /** `make wit`: print the WIT recovered from the built component. */
-import { die, loadToolEnv, packageDir, setupEnv } from './lib.ts';
+import { join } from 'node:path';
+import { $ } from 'bun';
+import { type Context, run } from './lib/cli.ts';
 
-if (import.meta.main) {
-  try {
-    const pkgDir = packageDir(import.meta.url);
-    const env = await loadToolEnv(pkgDir);
-    await setupEnv(env);
-    process.chdir(pkgDir);
-    console.log(
-      (await Bun.$`wasm-tools component wit dist/di-framework-pglite.wasm`.text()).trimEnd(),
-    );
-  } catch (error) {
-    die('wit', error instanceof Error ? error.message : String(error));
-  }
+export async function wit(ctx: Context): Promise<void> {
+  const component = join(ctx.pkgDir, 'dist', 'di-framework-pglite.wasm');
+  console.log((await $`wasm-tools component wit ${component}`.text()).trimEnd());
 }
+
+if (import.meta.main) await run('wit', wit);

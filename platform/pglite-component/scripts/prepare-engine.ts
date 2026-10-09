@@ -1,21 +1,15 @@
 /** Fetch pinned inputs and wrap PGlite's core module with a private WIT ABI. */
-import { createHash } from 'node:crypto';
-import { lstat, readdir, readFile, readlink, symlink } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, readlink, rm, symlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join, posix } from 'node:path';
+import { $ } from 'bun';
 import { buildEngineSource } from './build-engine.ts';
-import {
-  die,
-  fetchVerified,
-  fileExists,
-  loadToolEnv,
-  log,
-  mkdir,
-  packageDir,
-  readFileText,
-  requiredPin,
-  rm,
-  setupEnv,
-} from './lib.ts';
+import { type Context, logger, run } from './lib/cli.ts';
+import { fetchVerified } from './lib/fetch.ts';
+import { fileExists } from './lib/fs.ts';
+import { requiredPin } from './lib/versions.ts';
+
+const log = logger('prepare-engine');
 
 export const ARCHIVE_PREFIX = 'tmp/pglite/';
 export const BOOTSTRAP_FILES = ['initdb.boot.txt', 'initdb.single.txt'];
@@ -150,9 +144,9 @@ async function walkExtracted(dir: string, base: string, out: WalkedEntry[]): Pro
  * enforces containment in TypeScript before any file is installed.
  */
 export async function extractRuntime(archive: string, runtimeDir: string): Promise<void> {
-  const scratch = (await Bun.$`mktemp -d`.text()).trim();
+  const scratch = await mkdtemp(join(tmpdir(), 'df-pglite-engine.'));
   try {
-    await Bun.$`tar -xJf ${archive} -C ${scratch}`;
+    await $`tar -xJf ${archive} -C ${scratch}`;
     const walked: WalkedEntry[] = [];
     await walkExtracted(scratch, '', walked);
     const safe = new Set(validateArchiveMembers(walked));
@@ -176,61 +170,59 @@ export async function extractRuntime(archive: string, runtimeDir: string): Promi
   }
 }
 
-export async function prepareEngine(pkgDir?: string): Promise<void> {
-  const dir = pkgDir ?? packageDir(import.meta.url);
-  const env = await loadToolEnv(dir);
-  await setupEnv(env);
-  const out = join(dir, 'target', 'engine');
+export async function prepareEngine(ctx: Context): Promise<void> {
+  const { pkgDir } = ctx;
+  const { pins } = ctx.tools;
+  const out = join(pkgDir, 'target', 'engine');
   await mkdir(out, { recursive: true });
 
-  await buildEngineSource(dir);
+  await buildEngineSource(ctx);
 
   const archive = join(out, 'pglite-source.tar.xz');
-  await fetchVerified(
-    'prepare-engine',
-    requiredPin(env.pins, 'PGLITE_ADAPTER_URL'),
-    join(out, 'adapter.wasm'),
-    requiredPin(env.pins, 'PGLITE_ADAPTER_SHA256'),
-  );
   const adapter = join(out, 'adapter.wasm');
+  await fetchVerified(
+    requiredPin(pins, 'PGLITE_ADAPTER_URL'),
+    adapter,
+    requiredPin(pins, 'PGLITE_ADAPTER_SHA256'),
+    { log },
+  );
 
-  const wasmToolsVersion = await Bun.$`wasm-tools --version`.text().then((s) => s.trim());
-  const stampHash = createHash('sha256');
-  for (const part of [
-    await readFile(archive),
-    await readFile(adapter),
-    await readFile(new URL(import.meta.url).pathname),
-    await readFile(join(dir, 'engine', 'bridge.wat')),
-    await readFile(join(dir, 'wit', 'deps', 'pglite-engine', 'engine.wit')),
-    Buffer.from(wasmToolsVersion),
+  const bridgeWatSource = join(pkgDir, 'engine', 'bridge.wat');
+  const engineWit = join(pkgDir, 'wit', 'deps', 'pglite-engine');
+  const wasmToolsVersion = (await $`wasm-tools --version`.text()).trim();
+  const hasher = new Bun.CryptoHasher('sha256');
+  for (const file of [
+    archive,
+    adapter,
+    import.meta.path,
+    bridgeWatSource,
+    join(engineWit, 'engine.wit'),
   ]) {
-    stampHash.update(part);
+    hasher.update(await Bun.file(file).bytes());
   }
-  const stamp = stampHash.digest('hex');
+  hasher.update(wasmToolsVersion);
+  const stamp = hasher.digest('hex');
   const stampFile = join(out, 'stamp');
-  if ((await fileExists(stampFile)) && (await readFileText(stampFile)) === stamp) return;
+  if ((await fileExists(stampFile)) && (await Bun.file(stampFile).text()) === stamp) return;
 
   const runtime = join(out, 'runtime');
   await mkdir(runtime, { recursive: true });
   await extractRuntime(archive, runtime);
 
-  await Bun.$`wasm-tools print ${join(runtime, 'bin', 'pglite.wasi')} -o ${join(out, 'engine.wat')}`;
-  const wat = await readFileText(join(out, 'engine.wat'));
-  const bridgeWat = await readFileText(join(dir, 'engine', 'bridge.wat'));
-  await Bun.write(join(out, 'bridge.wat'), patchEngineWat(wat, bridgeWat));
-
-  const engineWit = join(dir, 'wit', 'deps', 'pglite-engine');
-  await Bun.$`wasm-tools component embed ${engineWit} --world embedded-engine ${join(out, 'bridge.wat')} -o ${join(out, 'engine.core.wasm')}`;
-  await Bun.$`wasm-tools component new ${join(out, 'engine.core.wasm')} --adapt wasi_snapshot_preview1=${adapter} -o ${join(out, 'engine.wasm')}`;
-  await Bun.$`wasm-tools validate ${join(out, 'engine.wasm')}`;
+  const engineWat = join(out, 'engine.wat');
+  const bridgeWat = join(out, 'bridge.wat');
+  const coreWasm = join(out, 'engine.core.wasm');
+  const engineWasm = join(out, 'engine.wasm');
+  await $`wasm-tools print ${join(runtime, 'bin', 'pglite.wasi')} -o ${engineWat}`;
+  await Bun.write(
+    bridgeWat,
+    patchEngineWat(await Bun.file(engineWat).text(), await Bun.file(bridgeWatSource).text()),
+  );
+  await $`wasm-tools component embed ${engineWit} --world embedded-engine ${bridgeWat} -o ${coreWasm}`;
+  await $`wasm-tools component new ${coreWasm} --adapt wasi_snapshot_preview1=${adapter} -o ${engineWasm}`;
+  await $`wasm-tools validate ${engineWasm}`;
   await Bun.write(stampFile, stamp);
-  log('prepare-engine', 'engine ready');
+  log('engine ready');
 }
 
-if (import.meta.main) {
-  try {
-    await prepareEngine();
-  } catch (error) {
-    die('prepare-engine', error instanceof Error ? error.message : String(error));
-  }
-}
+if (import.meta.main) await run('prepare-engine', prepareEngine);

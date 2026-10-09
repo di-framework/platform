@@ -1,6 +1,13 @@
-/** Component-specific patches on top of the pinned PostgreSQL engine sources. */
+/**
+ * Component-specific patches on top of the pinned PostgreSQL engine sources.
+ * Invoked by the patched upstream build recipe as
+ * `bun "$DF_PGLITE_SOURCE_PATCH" "$SRC"` (see build-engine.ts).
+ */
 import { resolve } from 'node:path';
-import { die, isDirectory, packageDir, readFileText } from './lib.ts';
+import { type Args, type Context, parseFlags, run, UsageError } from './lib/cli.ts';
+import { isDirectory } from './lib/fs.ts';
+
+const USAGE = 'usage: patch-engine-source.ts <engine-source-dir>';
 
 /** Only these two engine sources may be patched. */
 export const ALLOWED_RELATIVE_FILES = new Set([
@@ -8,13 +15,17 @@ export const ALLOWED_RELATIVE_FILES = new Set([
   'pglite-wasm/pg_main.c',
 ]);
 
-/** Resolve and validate the engine source directory CLI argument. */
-export async function resolveSourceArg(argv: string[], cwd = process.cwd()): Promise<string> {
-  if (argv.length !== 1 || !argv[0] || argv[0] === '-h' || argv[0] === '--help') {
-    throw new Error('usage: patch-engine-source.ts <engine-source-dir>');
-  }
-  const candidate = argv[0] as string;
-  const resolved = resolve(cwd, candidate);
+export function parseSourceArgs(argv: string[]): Args<{ source: string }> {
+  const flags = parseFlags(argv, {}, USAGE, { positionals: true });
+  if (flags.help) return flags;
+  const [source, ...extra] = flags.positionals;
+  if (!source || extra.length > 0) throw new UsageError(USAGE);
+  return { help: false, source };
+}
+
+/** Resolve and validate the engine source directory. */
+export async function resolveSourceDir(source: string, cwd = process.cwd()): Promise<string> {
+  const resolved = resolve(cwd, source);
   if (!(await isDirectory(resolved))) throw new Error(`source dir does not exist: ${resolved}`);
   return resolved;
 }
@@ -28,10 +39,9 @@ export function checkedPath(source: string, relative: string): string {
     throw new Error(`refusing unexpected relative path: ${relative}`);
   }
   const resolved = resolve(source, relative);
-  if (resolved !== source && !resolved.startsWith(`${source}/`)) {
+  if (resolved === source || !resolved.startsWith(`${source}/`)) {
     throw new Error(`refusing path outside source dir: ${relative}`);
   }
-  if (resolved === source) throw new Error(`refusing path outside source dir: ${relative}`);
   return resolved;
 }
 
@@ -63,18 +73,18 @@ export const SESSION_DEFAULTS_BLOCK = [
 
 export async function patchEngineSource(source: string, pkgDir: string): Promise<void> {
   const pqcomm = checkedPath(source, 'src/backend/libpq/pqcomm.c');
-  let text = await readFileText(pqcomm);
+  let text = await Bun.file(pqcomm).text();
   const start = text.includes(PQCOMM_MARKER)
     ? text.indexOf(PQCOMM_MARKER)
     : text.indexOf(PQCOMM_FALLBACK_START);
   if (start < 0) throw new Error(`pqcomm.c: patch anchor not found in ${pqcomm}`);
   const end = text.indexOf(PQCOMM_END, start);
   if (end < 0) throw new Error(`pqcomm.c: patch end anchor not found in ${pqcomm}`);
-  const replyBuffer = await readFileText(`${pkgDir}/engine/reply-buffer.c`);
+  const replyBuffer = await Bun.file(`${pkgDir}/engine/reply-buffer.c`).text();
   await Bun.write(pqcomm, `${text.slice(0, start)}${replyBuffer}\n${text.slice(end)}`);
 
   const pgMain = checkedPath(source, 'pglite-wasm/pg_main.c');
-  text = await readFileText(pgMain);
+  text = await Bun.file(pgMain).text();
   const bodyStart = text.indexOf(PG_BACKEND_START);
   if (bodyStart < 0) throw new Error(`pg_main.c: pgl_backend not found in ${pgMain}`);
   const bodyEnd = text.indexOf(PG_BACKEND_END, bodyStart);
@@ -99,17 +109,13 @@ export async function patchEngineSource(source: string, pkgDir: string): Promise
   await Bun.write(pgMain, text);
 }
 
-if (import.meta.main) {
-  const pkgDir = packageDir(import.meta.url);
-  let source: string;
-  try {
-    source = await resolveSourceArg(process.argv.slice(2));
-  } catch (error) {
-    die('patch-engine-source', error instanceof Error ? error.message : String(error));
+export async function patch(ctx: Context, argv: string[]): Promise<void> {
+  const args = parseSourceArgs(argv);
+  if (args.help) {
+    console.error(USAGE);
+    return;
   }
-  try {
-    await patchEngineSource(source, pkgDir);
-  } catch (error) {
-    die('patch-engine-source', error instanceof Error ? error.message : String(error));
-  }
+  await patchEngineSource(await resolveSourceDir(args.source), ctx.pkgDir);
 }
+
+if (import.meta.main) await run('patch-engine-source', patch);
