@@ -4,6 +4,8 @@ import { deployBundle } from '@di-framework/tenant-cli/tests/support/deploy-bund
 import {
   APPLICATION,
   applicationKey,
+  MANAGED_BY,
+  MANAGED_BY_VALUE,
   WORKLOAD,
 } from '../../platform/src/tenancy/log-projection.ts';
 import { Controller, configFromEnv } from '../src/controller.ts';
@@ -20,13 +22,17 @@ const BINDINGS =
 
 type Json = Record<string, unknown>;
 
-/** The labels every rendered object carries for service `web` in `prod`. */
-const LABELS = {
-  'app.kubernetes.io/managed-by': 'di-framework',
-  'app.kubernetes.io/name': 'web',
-  'di-framework.dev/application': 'web',
+/** The labels a rendered ServiceBinding carries for service `web` in `prod`, as the CLI renders. */
+const BINDING_LABELS = {
+  [MANAGED_BY]: MANAGED_BY_VALUE,
   'di-framework.dev/service': 'web',
   'platform.di-framework.dev/env': 'prod',
+};
+/** The labels the rendered WorkloadDeployment carries: `name` is its own name, as the CLI's. */
+const LABELS = {
+  ...BINDING_LABELS,
+  'app.kubernetes.io/name': 'web-prod',
+  [APPLICATION]: 'web',
 };
 
 /**
@@ -166,7 +172,7 @@ describe('/v1/deploy', () => {
       metadata: {
         name: 'web-prod-cache',
         namespace: 'di-tenant-acme',
-        labels: LABELS,
+        labels: BINDING_LABELS,
       },
       spec: { serviceName: 'cache', bindingName: 'cache', capability: 'keyvalue' },
     });
@@ -332,14 +338,22 @@ describe('/v1/deploy', () => {
     const stored_ = stored.get(`${WORKLOADS}/web-prod`) as { metadata: Json };
     const labels = stored_.metadata.labels as Record<string, string>;
     // The selector projectLogs lists WorkloadDeployments with (platform controller.ts).
-    expect(labels['app.kubernetes.io/managed-by']).toBe('di-framework');
+    expect(labels[MANAGED_BY]).toBe(MANAGED_BY_VALUE);
     expect(labels[APPLICATION]).toBe('web');
     expect(labels[WORKLOAD]).toBeUndefined();
     expect(applicationKey({ name: 'web-prod', labels })).toBe('web');
   });
 
+  test('app.kubernetes.io/name is the WorkloadDeployment name, so a CLI destroy of the service spares it', async () => {
+    expect((await post('/v1/deploy', deployBundle({ env: 'staging' }))).status).toBe(202);
+    const labels = (stored.get(`${WORKLOADS}/web-staging`) as { metadata: Json }).metadata
+      .labels as Record<string, string>;
+    expect(labels['app.kubernetes.io/name']).toBe('web-staging');
+    expect(labels[APPLICATION]).toBe('web');
+  });
+
   test.each([
-    'app.kubernetes.io/managed-by',
+    MANAGED_BY,
     'app.kubernetes.io/name',
     'di-framework.dev/application',
     'di-framework.dev/workload',
@@ -351,7 +365,7 @@ describe('/v1/deploy', () => {
     expect(api.requests).toHaveLength(0);
   });
 
-  test('the wasi:http host interface gets the service as its host', async () => {
+  test('the wasi:http host interface gets <service>-<env> as its host', async () => {
     const bundle = deployBundle();
     const hostInterfaces = (bundle.workload as { spec: { template: { spec: Json } } }).spec.template
       .spec.hostInterfaces as Json[];
@@ -367,10 +381,43 @@ describe('/v1/deploy', () => {
         package: 'http',
         version: '0.3.0',
         interfaces: ['handler'],
-        config: { host: 'web' },
+        config: { host: 'web-prod' },
       },
       { namespace: 'wasi', package: 'logging', version: '0.1.0-draft', interfaces: ['logging'] },
     ]);
+  });
+
+  test('staging and prod of one service render distinct hosts', async () => {
+    const hosts: unknown[] = [];
+    for (const env of ['staging', 'prod'] as const) {
+      expect((await post('/v1/deploy', deployBundle({ env }))).status).toBe(202);
+      const applied = JSON.parse(patches().at(-1)?.body ?? '') as {
+        spec: { template: { spec: { hostInterfaces: { config: Json }[] } } };
+      };
+      hosts.push(applied.spec.template.spec.hostInterfaces[0]?.config.host);
+    }
+    expect(hosts).toEqual(['web-staging', 'web-prod']);
+  });
+
+  test('setting the host keeps the other config keys of the wasi:http host interface', async () => {
+    const bundle = deployBundle({ service: 'api' });
+    const hostInterfaces = (bundle.workload as { spec: { template: { spec: Json } } }).spec.template
+      .spec.hostInterfaces as Json[];
+    (hostInterfaces[0] as Json).config = { path: '/api' };
+    expect((await post('/v1/deploy', bundle)).status).toBe(202);
+    const applied = JSON.parse(patches().at(-1)?.body ?? '') as {
+      spec: { template: { spec: { hostInterfaces: Json[] } } };
+    };
+    expect(applied.spec.template.spec.hostInterfaces[0]?.config).toEqual({
+      path: '/api',
+      host: 'api-prod',
+    });
+  });
+
+  test('a bundle for another service passes with the fixture host derived from it', async () => {
+    expect(
+      (await post('/v1/deploy/preview', deployBundle({ service: 'api', env: 'staging' }))).status,
+    ).toBe(200);
   });
 
   test('a workload without host interfaces is applied unchanged', async () => {
@@ -403,7 +450,11 @@ describe('/v1/deploy', () => {
   test.each([
     [
       http({ version: '0.3.0', interfaces: ['handler'], config: { host: 'other' } }),
-      `${at}.config.host must be web, the service name, or absent`,
+      `${at}.config.host must be web-prod, the service and env, or absent`,
+    ],
+    [
+      http({ version: '0.3.0', interfaces: ['handler'], config: { host: 'web' } }),
+      `${at}.config.host must be web-prod, the service and env, or absent`,
     ],
     [
       http({ interfaces: ['incoming-handler'] }),

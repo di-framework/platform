@@ -7,6 +7,7 @@ import type { DeployBundle } from '../../src/client/index.ts';
  * Returns a fresh copy each time, so a test can change it freely.
  */
 export function deployBundle(overrides: Partial<DeployBundle> = {}): DeployBundle {
+  const host = `${overrides.service ?? 'web'}-${overrides.env ?? 'prod'}`;
   return {
     env: 'prod',
     service: 'web',
@@ -34,7 +35,7 @@ export function deployBundle(overrides: Partial<DeployBundle> = {}): DeployBundl
                 package: 'http',
                 version: '0.3.0',
                 interfaces: ['handler'],
-                config: { host: 'web' },
+                config: { host },
               },
               {
                 namespace: 'wasi',

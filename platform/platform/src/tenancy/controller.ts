@@ -29,6 +29,7 @@ import {
   applicationKey,
   attributeEntries,
   logsConfigMap,
+  MANAGED_SELECTOR,
   mergeFailures,
   PROJECTION,
   type ProjectedEntry,
@@ -1169,7 +1170,7 @@ export class Controller {
       (
         await this.api.call<{ items?: WorkloadDeployment[] } | undefined>(
           'GET',
-          `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', n.namespace)}?labelSelector=${encodeURIComponent('app.kubernetes.io/managed-by=di-framework')}`,
+          `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', n.namespace)}?labelSelector=${encodeURIComponent(MANAGED_SELECTOR)}`,
         )
       )?.items?.filter(wantsStorage) ?? [];
     if (workloads.length > 0 && (tenant.spec.runtime?.replicas ?? 1) > 1) {
@@ -1227,7 +1228,7 @@ export class Controller {
         }[];
       }>(
         'GET',
-        `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', n.namespace)}?labelSelector=${encodeURIComponent('app.kubernetes.io/managed-by=di-framework')}`,
+        `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', n.namespace)}?labelSelector=${encodeURIComponent(MANAGED_SELECTOR)}`,
       )
     ).items.map((item) => ({
       ...item.metadata,
