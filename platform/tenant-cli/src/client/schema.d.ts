@@ -236,8 +236,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Create a service
-         * @description Creates an http, cron, or worker service in the environment. Type-specific fields follow the type.
+         * Create a backing service
+         * @description Creates a keyvalue, messaging, blobstore, postgres or egress backing service in the environment as the caller. http, cron and worker services come from the deploy bundle.
          */
         post: operations["createService"];
         delete?: never;
@@ -276,8 +276,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Open a tunnel to a service
-         * @description Issues a short-lived tunnel session to one port of the service. The session URL takes the same bearer.
+         * Open an HTTP session to a service
+         * @description Issues a short-lived HTTP session to the service, bound to the caller. The session URL takes the same bearer.
          */
         post: operations["proxy"];
         delete?: never;
@@ -460,33 +460,42 @@ export interface components {
             /** @description Deployment id to roll back to; the previous one when absent. */
             to?: string;
         };
-        /** @description Type-specific fields follow the type: `port` and `route` for http, `schedule` for cron, `command` for worker. */
+        /** @description A backing service (BackingService) in the environment, shaped like `di-framework platform service create`. `destinations` is required for egress and only allowed there. http, cron and worker services come from the deploy bundle, not from this operation. */
         CreateServiceRequest: {
             /** @enum {string} */
             env: "prod" | "staging";
             /** @enum {string} */
-            type: "http" | "cron" | "worker";
+            type: "keyvalue" | "messaging" | "blobstore" | "postgres" | "egress";
+            /** @description DNS label, at most 40 characters: `^[a-z][a-z0-9]*(-[a-z0-9]+)*$`. */
             name: string;
-            /** Format: int32 */
-            port?: number;
-            /** @description Public route pattern for an http service. */
-            route?: string;
-            /** @description Cron expression for a cron service. */
-            schedule?: string;
-            /** @description Entry command of a worker service. */
-            command?: string[];
+            /** @description The platform default class for the type when absent (keyvalue-redis, messaging-nats, blobstore-nats, postgres-dedicated, egress-public); any other class is refused. */
+            className?: string;
+            /** @description Sizing quantities such as `1Gi` or `500m`. */
+            parameters?: {
+                storage?: string;
+                memory?: string;
+                cpu?: string;
+            };
+            /** @enum {string} */
+            deletionPolicy?: "Retain" | "Delete";
+            /** @description Egress only: hosts the workload may reach (`host`, `*.suffix`, optionally `:port`). */
+            destinations?: string[];
         };
         Service: {
             name: string;
             /** @enum {string} */
             env: "prod" | "staging";
             /** @enum {string} */
-            type: "http" | "cron" | "worker";
-            route?: string;
-            /** Format: int32 */
-            port?: number;
-            schedule?: string;
-            command?: string[];
+            type: "keyvalue" | "messaging" | "blobstore" | "postgres" | "egress";
+            className: string;
+            parameters?: {
+                storage?: string;
+                memory?: string;
+                cpu?: string;
+            };
+            /** @enum {string} */
+            deletionPolicy?: "Retain" | "Delete";
+            destinations?: string[];
             /** Format: date-time */
             createdAt: string;
         };
@@ -531,11 +540,11 @@ export interface components {
             env: "prod" | "staging";
             /**
              * Format: int32
-             * @description Service port to tunnel to; the service default when absent.
+             * @description Service port; only 80, the tenant HTTP upstream, is supported (the default).
              */
             port?: number;
         };
-        /** @description A short-lived tunnel to one service. The CLI connects to `url` with the same bearer; the tunnel transport is WebSocket and is described outside this document. */
+        /** @description A short-lived HTTP session to one service, bound to the caller. Requests to `url` and paths below it carry the same bearer and are forwarded to the service until `expiresAt`. The controller serves the session URL outside this document; WebSocket is not supported yet. */
         ProxySession: {
             /** Format: uri */
             url: string;
@@ -973,21 +982,26 @@ export interface operations {
                     /** @enum {string} */
                     env: "prod" | "staging";
                     /** @enum {string} */
-                    type: "http" | "cron" | "worker";
+                    type: "keyvalue" | "messaging" | "blobstore" | "postgres" | "egress";
+                    /** @description DNS label, at most 40 characters: `^[a-z][a-z0-9]*(-[a-z0-9]+)*$`. */
                     name: string;
-                    /** Format: int32 */
-                    port?: number;
-                    /** @description Public route pattern for an http service. */
-                    route?: string;
-                    /** @description Cron expression for a cron service. */
-                    schedule?: string;
-                    /** @description Entry command of a worker service. */
-                    command?: string[];
+                    /** @description The platform default class for the type when absent (keyvalue-redis, messaging-nats, blobstore-nats, postgres-dedicated, egress-public); any other class is refused. */
+                    className?: string;
+                    /** @description Sizing quantities such as `1Gi` or `500m`. */
+                    parameters?: {
+                        storage?: string;
+                        memory?: string;
+                        cpu?: string;
+                    };
+                    /** @enum {string} */
+                    deletionPolicy?: "Retain" | "Delete";
+                    /** @description Egress only: hosts the workload may reach (`host`, `*.suffix`, optionally `:port`). */
+                    destinations?: string[];
                 };
             };
         };
         responses: {
-            /** @description Create a service */
+            /** @description Create a backing service */
             201: {
                 headers: {
                     [name: string]: unknown;
@@ -998,12 +1012,16 @@ export interface operations {
                         /** @enum {string} */
                         env: "prod" | "staging";
                         /** @enum {string} */
-                        type: "http" | "cron" | "worker";
-                        route?: string;
-                        /** Format: int32 */
-                        port?: number;
-                        schedule?: string;
-                        command?: string[];
+                        type: "keyvalue" | "messaging" | "blobstore" | "postgres" | "egress";
+                        className: string;
+                        parameters?: {
+                            storage?: string;
+                            memory?: string;
+                            cpu?: string;
+                        };
+                        /** @enum {string} */
+                        deletionPolicy?: "Retain" | "Delete";
+                        destinations?: string[];
                         /** Format: date-time */
                         createdAt: string;
                     };
@@ -1063,14 +1081,14 @@ export interface operations {
                     env: "prod" | "staging";
                     /**
                      * Format: int32
-                     * @description Service port to tunnel to; the service default when absent.
+                     * @description Service port; only 80, the tenant HTTP upstream, is supported (the default).
                      */
                     port?: number;
                 };
             };
         };
         responses: {
-            /** @description Open a tunnel to a service */
+            /** @description Open an HTTP session to a service */
             201: {
                 headers: {
                     [name: string]: unknown;

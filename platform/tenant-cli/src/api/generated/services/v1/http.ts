@@ -22,8 +22,8 @@ export class ServicesV1HttpController {
   private handlers!: TenantControllerHandlers;
 
   @Endpoint({
-    summary: 'Create a service',
-    description: 'Creates an http, cron, or worker service in the environment. Type-specific fields follow the type.',
+    summary: 'Create a backing service',
+    description: 'Creates a keyvalue, messaging, blobstore, postgres or egress backing service in the environment as the caller. http, cron and worker services come from the deploy bundle.',
     requestBody: {
       content: {
         'application/json': {
@@ -34,7 +34,7 @@ export class ServicesV1HttpController {
     },
     responses: {
       '201': {
-        description: 'Create a service',
+        description: 'Create a backing service',
       content: {
         'application/json': {
           schema: Service.jsonSchema,
@@ -87,8 +87,8 @@ export class ServicesV1HttpController {
   });
 
   @Endpoint({
-    summary: 'Open a tunnel to a service',
-    description: 'Issues a short-lived tunnel session to one port of the service. The session URL takes the same bearer.',
+    summary: 'Open an HTTP session to a service',
+    description: 'Issues a short-lived HTTP session to the service, bound to the caller. The session URL takes the same bearer.',
     requestBody: {
       content: {
         'application/json': {
@@ -99,7 +99,7 @@ export class ServicesV1HttpController {
     },
     responses: {
       '201': {
-        description: 'Open a tunnel to a service',
+        description: 'Open an HTTP session to a service',
       content: {
         'application/json': {
           schema: ProxySession.jsonSchema,

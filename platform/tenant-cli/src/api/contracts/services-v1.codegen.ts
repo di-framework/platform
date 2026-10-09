@@ -28,9 +28,9 @@ export default manifest(
         method: 'POST',
         path: '/services',
         successStatus: 201,
-        summary: 'Create a service',
+        summary: 'Create a backing service',
         description:
-          'Creates an http, cron, or worker service in the environment. Type-specific fields follow the type.',
+          'Creates a keyvalue, messaging, blobstore, postgres or egress backing service in the environment as the caller. http, cron and worker services come from the deploy bundle.',
       },
       'CreateServiceRequest',
       'Service',
@@ -64,9 +64,9 @@ export default manifest(
         method: 'POST',
         path: '/services/:service/proxy',
         successStatus: 201,
-        summary: 'Open a tunnel to a service',
+        summary: 'Open an HTTP session to a service',
         description:
-          'Issues a short-lived tunnel session to one port of the service. The session URL takes the same bearer.',
+          'Issues a short-lived HTTP session to the service, bound to the caller. The session URL takes the same bearer.',
       },
       'ProxyRequest',
       'ProxySession',

@@ -85,18 +85,11 @@ describe('/v1 dispatch', () => {
     ['PATCH', '/v1/vars/LEVEL?env=prod', '{"value":"debug"}', 'updateVar'],
     ['DELETE', '/v1/vars/LEVEL?env=prod', undefined, 'unsetVar'],
     [
-      'POST',
-      '/v1/services',
-      '{"env":"prod","type":"http","name":"web","port":8080}',
-      'createService',
-    ],
-    [
       'GET',
       '/v1/services/web/logs?env=prod&follow=true&tail=10&since=2026-10-09T00:00:00Z',
       undefined,
       'logs',
     ],
-    ['POST', '/v1/services/web/proxy', '{"env":"prod"}', 'proxy'],
     ['GET', '/v1/deploy/registry', undefined, 'registry'],
   ])('%s %s answers 501 problem+json', async (method, path, body, operation) => {
     const response = await call(method, path, { body });
@@ -141,7 +134,7 @@ describe('/v1 dispatch', () => {
       'POST',
       '/v1/services',
       '{"env":"prod","type":"ftp","name":"x"}',
-      'body.type must be one of http, cron, worker',
+      'body.type must be one of keyvalue, messaging, blobstore, postgres, egress',
     ],
     ['POST', '/v1/deploy', '{"env":"prod"}', 'body.service is required'],
   ])('%s %s is refused with 400 before a handler', async (method, path, body, detail) => {
@@ -254,7 +247,7 @@ describe('/v1 dispatch', () => {
       ['PUT', '/v1/vars/LEVEL?env=prod', '{"value":"debug"}', 'setVar'],
       ['DELETE', '/v1/vars/LEVEL?env=prod', undefined, 'unsetVar'],
       ['POST', '/v1/deployments/rollback', '{"env":"prod","service":"web"}', 'rollback'],
-      ['POST', '/v1/services', '{"env":"prod","type":"http","name":"web"}', 'createService'],
+      ['POST', '/v1/services', '{"env":"prod","type":"keyvalue","name":"web"}', 'createService'],
       ['POST', '/v1/services/web/proxy', '{"env":"prod"}', 'proxy'],
       [
         'POST',

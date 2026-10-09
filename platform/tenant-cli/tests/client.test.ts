@@ -42,9 +42,9 @@ test('every operation hits its contract path with the bearer and the right body'
   expect(await client.logout()).toBeUndefined();
   expect(await client.previewDeploy(bundle)).toEqual({ env: 'prod', service: 'web', changes: [] });
   expect((await client.deploy(bundle)).id).toBe('d1');
-  expect(
-    (await client.createService({ env: 'prod', type: 'http', name: 'web', port: 8080 })).name,
-  ).toBe('web');
+  expect((await client.createService({ env: 'prod', type: 'keyvalue', name: 'web' })).name).toBe(
+    'web',
+  );
   expect((await client.proxy('web app', { env: 'prod' })).port).toBe(8080);
   expect(await client.deployments({ env: 'prod', service: undefined })).toEqual({ items: [] });
   expect((await client.deploymentStats('prod')).services).toBe(1);
