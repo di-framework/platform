@@ -38,7 +38,11 @@ interface WatchEvent {
  * that closes without delivering an event is retried after a bounded exponential backoff, so a
  * misbehaving API server cannot make the controller hammer it as the user.
  */
-export const timing = { heartbeatMs: 15_000, backoffBaseMs: 1_000, backoffMaxMs: 30_000 };
+export const timing = {
+  heartbeatMs: 15_000,
+  backoffBaseMs: 1_000,
+  backoffMaxMs: 30_000,
+};
 
 const DEFAULT_TAIL = 100;
 const LEVELS: Record<string, LogEvent['level']> = {
@@ -191,111 +195,94 @@ function stream(
   const encoder = new TextEncoder();
   const abort = new AbortController();
   let heartbeat: ReturnType<typeof setInterval> | undefined;
-  let demand: (() => void) | undefined;
   const stop = () => {
     clearInterval(heartbeat);
     abort.abort();
-    demand?.();
   };
-  return new ReadableStream<Uint8Array>(
-    {
-      async start(controller) {
-        const send = (text: string) => controller.enqueue(encoder.encode(text));
-        // Flushes the headers at once, even when the backlog is empty.
-        send(': connected\n\n');
-        const cursor = new Cursor();
-        const live = { ...options, tail: Number.MAX_SAFE_INTEGER };
-        /** Sends the selected events, then marks every event seen, sent or filtered out. */
-        const deliver = (events: LogEvent[], selected: LogEvent[]) => {
-          for (const event of selected) send(sse('log', event));
-          for (const event of events) cursor.sent(event);
-        };
-        const backlog = listEvents(first);
-        deliver(backlog, select(backlog, options));
-        if (!follow) {
-          send(sse('end'));
-          controller.close();
-          return;
-        }
-        heartbeat = setInterval(() => send(': heartbeat\n\n'), timing.heartbeatMs);
-        let resourceVersion = first.metadata?.resourceVersion ?? '';
-        /** The watch expired (410): relist, send what is new, resume from the list's version. */
-        const relist = async () => {
-          const list = await kube.call<ConfigMapList>(
-            'GET',
-            `${collection}?labelSelector=${encodeURIComponent(selector)}`,
-          );
-          const fresh = cursor.fresh(listEvents(list));
-          deliver(fresh, select(fresh, live));
-          resourceVersion = list.metadata?.resourceVersion ?? '';
-        };
-        /** Backpressure: stops reading the watch while the client is not reading the stream. */
-        const drained = async () => {
-          while ((controller.desiredSize ?? 1) <= 0 && !abort.signal.aborted)
-            await new Promise<void>((resolve) => {
-              demand = resolve;
-            });
-        };
-        let idle = 0;
-        try {
-          while (!abort.signal.aborted) {
-            const response = await kube.fetch(
-              'GET',
-              `${collection}?watch=true&allowWatchBookmarks=true&labelSelector=${encodeURIComponent(selector)}&resourceVersion=${encodeURIComponent(resourceVersion)}`,
-              { headers: { Accept: 'application/json' }, signal: abort.signal },
-            );
-            let delivered = false;
-            let ended = false;
-            if (response.status === 410) {
-              await response.body?.cancel();
-              await relist();
-              delivered = true;
-            } else if (!response.ok || !response.body) {
-              await response.body?.cancel();
-              break;
-            } else {
-              for await (const event of watchEvents(response.body)) {
-                delivered = true;
-                if (event.type === 'ERROR') {
-                  if (event.object?.code === 410) await relist();
-                  else ended = true;
-                  break;
-                }
-                if (event.object?.metadata?.resourceVersion)
-                  resourceVersion = event.object.metadata.resourceVersion;
-                if (event.type === 'ADDED' || event.type === 'MODIFIED') {
-                  const fresh = cursor.fresh(logEvents(event.object as LogsConfigMap));
-                  deliver(fresh, select(fresh, live));
-                }
-                await drained();
-              }
-            }
-            if (ended) break;
-            if (delivered) idle = 0;
-            else {
-              await sleep(
-                Math.min(timing.backoffMaxMs, timing.backoffBaseMs * 2 ** idle),
-                abort.signal,
-              );
-              idle = Math.min(idle + 1, 30);
-            }
-          }
-        } catch {
-          // The client went away (the watch was aborted) or the API server dropped the watch.
-        }
-        if (abort.signal.aborted) return;
-        stop();
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (text: string) => controller.enqueue(encoder.encode(text));
+      // Flushes the headers at once, even when the backlog is empty.
+      send(': connected\n\n');
+      const cursor = new Cursor();
+      const live = { ...options, tail: Number.MAX_SAFE_INTEGER };
+      /** Sends the selected events, then marks every event seen, sent or filtered out. */
+      const deliver = (events: LogEvent[], selected: LogEvent[]) => {
+        for (const event of selected) send(sse('log', event));
+        for (const event of events) cursor.sent(event);
+      };
+      const backlog = listEvents(first);
+      deliver(backlog, select(backlog, options));
+      if (!follow) {
         send(sse('end'));
         controller.close();
-      },
-      pull() {
-        demand?.();
-      },
-      cancel: stop,
+        return;
+      }
+      heartbeat = setInterval(() => send(': heartbeat\n\n'), timing.heartbeatMs);
+      let resourceVersion = first.metadata?.resourceVersion ?? '';
+      /** The watch expired (410): relist, send what is new, resume from the list's version. */
+      const relist = async () => {
+        const list = await kube.call<ConfigMapList>(
+          'GET',
+          `${collection}?labelSelector=${encodeURIComponent(selector)}`,
+        );
+        const fresh = cursor.fresh(listEvents(list));
+        deliver(fresh, select(fresh, live));
+        resourceVersion = list.metadata?.resourceVersion ?? '';
+      };
+      let idle = 0;
+      try {
+        while (!abort.signal.aborted) {
+          const response = await kube.fetch(
+            'GET',
+            `${collection}?watch=true&allowWatchBookmarks=true&labelSelector=${encodeURIComponent(selector)}&resourceVersion=${encodeURIComponent(resourceVersion)}`,
+            { headers: { Accept: 'application/json' }, signal: abort.signal },
+          );
+          let delivered = false;
+          let ended = false;
+          if (response.status === 410) {
+            await response.body?.cancel();
+            await relist();
+            delivered = true;
+          } else if (!response.ok || !response.body) {
+            await response.body?.cancel();
+            break;
+          } else {
+            for await (const event of watchEvents(response.body)) {
+              delivered = true;
+              if (event.type === 'ERROR') {
+                if (event.object?.code === 410) await relist();
+                else ended = true;
+                break;
+              }
+              if (event.object?.metadata?.resourceVersion)
+                resourceVersion = event.object.metadata.resourceVersion;
+              if (event.type === 'ADDED' || event.type === 'MODIFIED') {
+                const fresh = cursor.fresh(logEvents(event.object as LogsConfigMap));
+                deliver(fresh, select(fresh, live));
+              }
+            }
+          }
+          if (ended) break;
+          if (delivered) idle = 0;
+          else {
+            await sleep(
+              Math.min(timing.backoffMaxMs, timing.backoffBaseMs * 2 ** idle),
+              abort.signal,
+            );
+            idle = Math.min(idle + 1, 30);
+          }
+        }
+      } catch {
+        // The client went away (the watch was aborted) or the API server dropped the watch.
+      }
+      if (abort.signal.aborted) return;
+      stop();
+      send(sse('end'));
+      controller.close();
     },
-    // Room for a burst of events and heartbeats before the watch stops being read.
-    { highWaterMark: 256 },
-  );
+    cancel: stop,
+  });
 }
 
 /**
