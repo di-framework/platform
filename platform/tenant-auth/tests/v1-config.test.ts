@@ -469,6 +469,26 @@ describe('vars', () => {
       expect((await call(method, '/v1/vars/NOPE?env=prod', value)).status).toBe(404);
   });
 
+  test('refuses __proto__ before any cluster call', async () => {
+    const response = await call('PUT', '/v1/vars/__proto__?env=prod', 'x');
+    expect(response.status).toBe(400);
+    expect((await body(response)).detail).toBe('var name "__proto__" is reserved');
+    expect(kubeCalls()).toHaveLength(0);
+  });
+
+  test('Object.prototype names are ordinary vars, never inherited', async () => {
+    await call('PUT', '/v1/vars/A?env=prod', '1');
+    expect((await call('PATCH', '/v1/vars/toString?env=prod', 'x')).status).toBe(404);
+    expect((await call('DELETE', '/v1/vars/constructor?env=prod')).status).toBe(404);
+    expect(store.get(`configmaps/${varsConfigMapName('prod')}`)?.data).toEqual({ A: '1' });
+    expect((await call('PUT', '/v1/vars/constructor?env=prod', 'c')).status).toBe(204);
+    expect(store.get(`configmaps/${varsConfigMapName('prod')}`)?.data).toEqual({
+      A: '1',
+      constructor: 'c',
+    });
+    expect((await call('DELETE', '/v1/vars/constructor?env=prod')).status).toBe(204);
+  });
+
   test('refuses a name that is not an environment variable name', async () => {
     const response = await call('PUT', '/v1/vars/not-a-var?env=prod', 'v');
     expect(response.status).toBe(400);

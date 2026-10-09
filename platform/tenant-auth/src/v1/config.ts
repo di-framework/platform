@@ -165,7 +165,7 @@ async function writeSecret(
   const kube = context.asUser();
   const envName = secretEnvName(name);
   const map = await find(kube, varsPath(context, env));
-  if (map?.data && envName in map.data)
+  if (map?.data && Object.hasOwn(map.data, envName))
     return conflict(`var ${envName} already exists in ${env}; a secret and a var cannot share it`);
   const object = secretObject(name, env, valueIn(command), existing?.metadata.resourceVersion);
   await write(
@@ -220,13 +220,23 @@ const unsetSecret: V1Handler = async (_command, call, context) => {
 
 function timestamps(map: Stored | undefined): Record<string, string> {
   try {
-    return JSON.parse(map?.metadata.annotations?.[UPDATED_AT] ?? '{}') as Record<string, string>;
+    const parsed = JSON.parse(map?.metadata.annotations?.[UPDATED_AT] ?? '{}');
+    return Object.assign(Object.create(null), parsed) as Record<string, string>;
   } catch {
-    return {};
+    return Object.create(null) as Record<string, string>;
   }
 }
 
+/**
+ * `__proto__` is refused: object spreads and many JSON consumers treat it as the prototype, not a
+ * key. Other `Object.prototype` names (`constructor`, `toString`, ...) are ordinary vars, safe
+ * because var data is prototype-free and membership uses `Object.hasOwn`.
+ */
+const RESERVED_VAR_NAMES = new Set(['__proto__']);
+
 function refuseVarName(name: string): Response | undefined {
+  if (RESERVED_VAR_NAMES.has(name))
+    return problem(400, 'Bad Request', `var name ${JSON.stringify(name)} is reserved`);
   if (VAR_NAME.test(name)) return undefined;
   return problem(
     400,
@@ -259,11 +269,12 @@ async function changeVars(
     return problem(404, 'Not Found', `var ${name} does not exist in ${env}`);
   if (existing && existing.metadata.labels?.[CONFIG] !== 'vars')
     return conflict(`${varsConfigMapName(env)} is not a tenant vars ConfigMap`);
-  const data = { ...existing?.data };
+  // Prototype-free, so a name like `toString` is only ever an own key.
+  const data: Record<string, string> = Object.assign(Object.create(null), existing?.data);
   const failed = change(data, name);
   if (failed) return failed;
   const times = timestamps(existing);
-  if (name in data) times[name] = now();
+  if (Object.hasOwn(data, name)) times[name] = now();
   else delete times[name];
   const object = {
     apiVersion: 'v1',
@@ -329,6 +340,8 @@ export const config: V1Module = {
         return undefined;
       },
       true,
+      // Only set can introduce a new name; update and unset act on an existing var, which
+      // already passed this check when it was set, so they need no secret-sharing check.
       secretSharing,
     ),
   updateVar: (command, call, context) =>
@@ -337,7 +350,7 @@ export const config: V1Module = {
       context,
       'var.updated',
       (data, name) => {
-        if (!(name in data)) return missingVar(name, call);
+        if (!Object.hasOwn(data, name)) return missingVar(name, call);
         data[name] = valueIn(command);
         return undefined;
       },
@@ -349,7 +362,7 @@ export const config: V1Module = {
       context,
       'var.unset',
       (data, name) => {
-        if (!(name in data)) return missingVar(name, call);
+        if (!Object.hasOwn(data, name)) return missingVar(name, call);
         delete data[name];
         return undefined;
       },

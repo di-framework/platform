@@ -235,19 +235,13 @@ var named like an existing secret's environment variable, or a secret whose envi
 is an existing var. The deploy lane (platform#55) must still reject a bundle that meets such a
 pair (for example one created out of band) with 422; it never picks a precedence.
 
-**Allowlist for the tenant admission policy (platform#88).** Tenant users may write:
+**WorkloadDeployment references (deploy lane, platform#55).** For a bundle deployed to `<env>`,
+the deploy lane sets the label `platform.di-framework.dev/env: <env>` on the WorkloadDeployment
+and **must** inject the same entries into every one of these paths:
 
-- Secrets whose name matches `^[a-z][-a-z0-9]{0,62}\.(prod|staging)$`, minus the managed
-  prefixes `di-binding-` and `di-bs-`;
-- the ConfigMaps `di-vars-prod` and `di-vars-staging`.
-
-Prod and staging share the `di-tenant-<tenant>` namespace, so the `.<env>` suffix alone does not
-tell a policy which environment a workload runs in. Matching a WorkloadDeployment's references
-to its environment needs an env label on it: platform#55 sets
-`platform.di-framework.dev/env: <env>` on every WorkloadDeployment it renders.
-
-**WorkloadDeployment references.** For a bundle deployed to `<env>`, every component of the
-rendered WorkloadDeployment gets, under `localResources.environment`:
+- `spec.template.spec.components[].localResources.environment` (every component);
+- `spec.template.spec.service.localResources.environment`, when the rendered WorkloadDeployment
+  has a `service`, so the HTTP service and the components see the same config.
 
 ```yaml
 configFrom:
@@ -256,11 +250,27 @@ secretFrom:
   - name: <secret>.<env>        # one entry per name in the bundle's `secrets`
 ```
 
-so each var and each referenced secret reaches the component as an environment variable. A
-bundle that names a secret without a `<secret>.<env>` Secret labelled as above is rejected.
-The same `configFrom` and `secretFrom` entries are allowed under the WorkloadDeployment's
-`template.service` (the deploy lane injects there too), with the same names; no other Secret or
-ConfigMap may be referenced from either place.
+so each var and each referenced secret reaches the workload as an environment variable. A bundle
+that names a secret with no `<secret>.<env>` Secret, or one without the labels above, is rejected
+with 422 (the same status as the var/secret conflict).
+
+**Reference rule for the tenant admission policy (platform#88).** This restricts what a
+WorkloadDeployment may *reference*; it does not restrict which Secrets or ConfigMaps tenants may
+create. On a WorkloadDeployment in `di-tenant-<t>`, every
+`spec.template.spec.components[].localResources.environment` and
+`spec.template.spec.service.localResources.environment` may reference only:
+
+- `configFrom[].name` equal to `di-vars-<env>`;
+- `secretFrom[].name` matching `^[a-z]([-a-z0-9]{0,61}[a-z0-9])?\.<env>$` (the `<name>` rule
+  above, then `.<env>`), where the part before the dot is not a managed name
+  (`isManagedSecretName`: `di-binding-*`, `di-bs-*`).
+
+`<env>` is the value of the WorkloadDeployment's `platform.di-framework.dev/env` label: the
+`.<env>` suffix of every referenced Secret and the `di-vars-<env>` name must equal it. Prod and
+staging share the namespace, so the suffix alone cannot tell which environment a workload runs
+in. A WorkloadDeployment without that label, or with a value other than `prod` or `staging` (for
+example one applied with kubectl), may reference neither a `di-vars-*` ConfigMap nor a tenant
+Secret.
 
 ## HTTP surface
 
