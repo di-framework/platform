@@ -33,7 +33,8 @@ export type CreateServiceRequest = Body<'createService'>;
 export type Service = Json<'createService', 201>;
 export type LogEvent = Json<'logs', 200>;
 export type LogsQuery = Query<'logs'>;
-export type ConfigList = Json<'secrets', 200>;
+export type SecretList = Json<'secrets', 200>;
+export type ConfigList = Json<'vars', 200>;
 export type ProxyRequest = Body<'proxy'>;
 export type ProxySession = Json<'proxy', 201>;
 export type Problem = components['schemas']['Problem'];
@@ -170,7 +171,7 @@ export function createClient(options: ClientOptions) {
     rollback: (request: RollbackRequest) =>
       json<Deployment>({ method: 'POST', path: PATHS.rollback, body: request }),
 
-    secrets: (env: Env) => json<ConfigList>({ method: 'GET', path: PATHS.secrets, query: { env } }),
+    secrets: (env: Env) => json<SecretList>({ method: 'GET', path: PATHS.secrets, query: { env } }),
     setSecret: (env: Env, name: string, value: string) =>
       empty({
         method: 'PUT',

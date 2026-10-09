@@ -1,4 +1,4 @@
-import { ConfigList, ConfigValue, Empty } from './api.schemas.ts';
+import { ConfigList, ConfigValue, Empty, SecretList } from './api.schemas.ts';
 import { env, manifest, operation } from './manifest.ts';
 
 const schema = { module: './api.schemas.ts' };
@@ -6,6 +6,7 @@ const schemas = {
   Empty: { schema: Empty, ...schema },
   ConfigList: { schema: ConfigList, ...schema },
   ConfigValue: { schema: ConfigValue, ...schema },
+  SecretList: { schema: SecretList, ...schema },
 };
 
 /** `secrets` and `vars` share one shape; secrets are write-only on read. */
@@ -24,7 +25,7 @@ function entries(noun: 'secret' | 'var', readDescription: string) {
         parameters: [env],
       },
       'Empty',
-      'ConfigList',
+      noun === 'secret' ? 'SecretList' : 'ConfigList',
     ),
     operation(
       `set${title}`,

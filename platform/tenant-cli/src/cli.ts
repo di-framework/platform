@@ -466,7 +466,9 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
       const { client } = await session(flags, io);
       const secret = command === 'secrets';
       if (sub === 'list') {
-        const list = secret ? await client.secrets(env) : await client.vars(env);
+        const list: { items: { name: string; value?: string }[] } = secret
+          ? await client.secrets(env)
+          : await client.vars(env);
         print(io, flags, list, () =>
           list.items.length === 0
             ? `no ${command} in ${env}`

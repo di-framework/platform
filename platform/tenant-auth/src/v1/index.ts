@@ -14,6 +14,7 @@ import { config } from './config.ts';
 import type { V1Context, V1Handler, V1Module } from './context.ts';
 import { deploy } from './deploy.ts';
 import { logs } from './logs.ts';
+import { permits } from './policy.ts';
 import { services } from './services.ts';
 
 export type { V1Context, V1Handler, V1Module } from './context.ts';
@@ -30,9 +31,22 @@ for (const module of Object.values(MODULES))
     const fallback = target[name].bind(target);
     target[name] = (command, call) => {
       const context = current.getStore();
-      return context
-        ? (module[name] as V1Handler)(command, call, context)
-        : fallback(command, call);
+      if (!context) return fallback(command, call);
+      // The role policy runs after validation and before the resource module.
+      const { user, role } = context.principal;
+      if (!permits(name, role)) {
+        context.audit('request.denied', { user, operation: name, role, status: 403 });
+        return Promise.resolve(
+          problem(
+            403,
+            'Forbidden',
+            role
+              ? `${/^[aeiou]/.test(role) ? 'an' : 'a'} ${role} may not call ${name}`
+              : `a caller without a tenant role may not call ${name}`,
+          ),
+        );
+      }
+      return (module[name] as V1Handler)(command, call, context);
     };
   }
 

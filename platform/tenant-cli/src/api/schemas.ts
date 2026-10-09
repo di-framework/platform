@@ -43,7 +43,7 @@ export const schemas = {
     properties: {
       user: string,
       account: string,
-      role: { type: 'string', enum: ['developer', 'viewer', 'owner'] },
+      role: { type: 'string', enum: ['developer', 'viewer'] },
       via: { type: 'string', enum: ['identity', 'api-key'] },
       credentialId: string,
     },
@@ -227,6 +227,26 @@ export const schemas = {
     properties: {
       env: Environment,
       items: { type: 'array', items: { $ref: '#/components/schemas/ConfigEntry' } },
+    },
+    required: ['env', 'items'],
+  },
+
+  SecretEntry: {
+    type: 'object',
+    description: 'A secret lists its name and update time only; its value never travels on read.',
+    properties: {
+      name: string,
+      updatedAt: dateTime,
+    },
+    required: ['name', 'updatedAt'],
+    additionalProperties: false,
+  },
+
+  SecretList: {
+    type: 'object',
+    properties: {
+      env: Environment,
+      items: { type: 'array', items: { $ref: '#/components/schemas/SecretEntry' } },
     },
     required: ['env', 'items'],
   },

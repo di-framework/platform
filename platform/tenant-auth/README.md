@@ -143,10 +143,16 @@ TENANT_CONSOLE_TENANT=acme TENANT_CONSOLE_CLIENT_ID=tenant-auth TENANT_CONSOLE_C
 TENANT_CONSOLE_CONTROLLER_URL=https://127.0.0.1:8788 TENANT_CONSOLE_CONTROLLER_CA=controller.crt bun src/console.ts
 ```
 
+`bun run start` runs the controller and `bun run start:console` the console.
+
+The runtime variables below are frozen: deployments (#58) depend on these names and defaults, so
+renaming or removing one is a breaking change.
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TENANT_CONTROLLER_TENANT` / `TENANT_CONSOLE_TENANT` | required | The tenant this pair serves |
-| `TENANT_CONTROLLER_KUBECONFIG`, `_CONTEXT` | required | Credential the controller uses (in-cluster: its own ServiceAccount) |
+| `TENANT_CONTROLLER_KUBECONFIG` | none (in-cluster ServiceAccount) | Kubeconfig the controller uses; unset, it uses its own ServiceAccount |
+| `TENANT_CONTROLLER_CONTEXT` | the kubeconfig's `current-context` | Context selected from that kubeconfig |
 | `TENANT_CONTROLLER_PLATFORM_NAMESPACE` | `wasmcloud` | Where `di-user-*` ServiceAccounts live |
 | `TENANT_CONTROLLER_ISSUER` / `TENANT_CONSOLE_ISSUER` | `http://localhost:4180` | identity-server |
 | `TENANT_CONTROLLER_TLS_CERT`, `_TLS_KEY` | none | Serve HTTPS |
@@ -154,7 +160,11 @@ TENANT_CONSOLE_CONTROLLER_URL=https://127.0.0.1:8788 TENANT_CONSOLE_CONTROLLER_C
 | `TENANT_CONTROLLER_CLI_CLIENT_ID` | `tenant-cli` | The identity server's public native client that `GET /v1/auth/info` names for the tenant CLI |
 | `TENANT_CONSOLE_CLIENT_ID`, `_CLIENT_SECRET` | `tenant-auth`, required | The console's confidential OAuth client |
 | `TENANT_CONSOLE_CONTROLLER_URL`, `_CONTROLLER_CA` | `https://127.0.0.1:8788` | How the console reaches the controller |
-| `*_HOST`, `*_PORT`, `TENANT_CONSOLE_PUBLIC_URL` | `127.0.0.1`, `8788` / `8787` | Listen address and browser-visible URL |
+| `TENANT_CONSOLE_CONTROLLER_PUBLIC_URL` | `TENANT_CONSOLE_CONTROLLER_URL` | Controller URL the console shows to users and CLIs |
+| `KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT_HTTPS` | set by Kubernetes, `443` | In-cluster API server when no kubeconfig is given |
+| `TENANT_CONTROLLER_HOST`, `TENANT_CONTROLLER_PORT` | `127.0.0.1`, `8788` | Controller listen address |
+| `TENANT_CONSOLE_HOST`, `TENANT_CONSOLE_PORT` | `127.0.0.1`, `8787` | Console listen address |
+| `TENANT_CONSOLE_PUBLIC_URL` | `http://<TENANT_CONSOLE_HOST>:<TENANT_CONSOLE_PORT>` | Browser-visible console URL |
 
 CLI: `di-tenant` in `@di-framework/tenant-cli`; see `platform/tenant-cli/README.md` for commands and flags.
 

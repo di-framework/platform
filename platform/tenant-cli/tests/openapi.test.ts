@@ -26,6 +26,19 @@ test('the committed document is what the manifests generate', () => {
   expect(readFileSync(fresh, 'utf8')).toBe(readFileSync(openApiSpecFile, 'utf8'));
 });
 
+test('the committed client types are what openapi-typescript generates', () => {
+  const out = join(tmpdir(), `tenant-schema-${process.pid}.d.ts`);
+  const result = Bun.spawnSync(['bun', 'x', 'openapi-typescript', openApiSpecFile, '-o', out], {
+    cwd: join(import.meta.dir, '..'),
+    stdout: 'ignore',
+    stderr: 'pipe',
+  });
+  expect(result.exitCode).toBe(0);
+  expect(readFileSync(out, 'utf8')).toBe(
+    readFileSync(join(import.meta.dir, '../src/client/schema.d.ts'), 'utf8'),
+  );
+}, 30_000);
+
 test('every operation of the contract is in the document, versioned under /v1', () => {
   const ids = operations.map((operation) => operation.operationId).sort();
   expect(ids).toEqual([...OPERATIONS].sort());
