@@ -30,8 +30,8 @@ run() {
 }
 run no-mount 'no mount ok'
 run write 'smoke ok' --dir "$DATA_DIR::/data"
-test -s "$DATA_DIR/pglite/data/PG_VERSION"
-test -s "$DATA_DIR/pglite/data/global/pg_control"
+[[ -s "$DATA_DIR/pglite/data/PG_VERSION" ]]
+[[ -s "$DATA_DIR/pglite/data/global/pg_control" ]]
 run read 'restart ok' --dir "$DATA_DIR::/data"
 run abrupt 'abrupt ok' --dir "$DATA_DIR::/data"
 run read 'restart ok' --dir "$DATA_DIR::/data"

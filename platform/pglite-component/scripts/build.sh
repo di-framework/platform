@@ -45,7 +45,7 @@ else
   # Plain rustc without rustup: rust-toolchain.toml is ignored; check versions by hand.
   rustc --version | grep -q "rustc $RUST_TOOLCHAIN" || log "warning: rustc is not $RUST_TOOLCHAIN ($(rustc --version)); artifact will differ from the pinned build"
   rustc --print target-libdir --target "$RUST_TARGET" >/dev/null 2>&1 \
-    && [ -d "$(rustc --print target-libdir --target "$RUST_TARGET")" ] \
+    && [[ -d "$(rustc --print target-libdir --target "$RUST_TARGET")" ]] \
     || die "rust-std for $RUST_TARGET is not installed and rustup is unavailable; run scripts/install-tools.sh --rust"
 fi
 
@@ -58,7 +58,7 @@ python3 scripts/prepare-engine.py
 cargo build --locked --profile "$PROFILE" --target "$RUST_TARGET" -p di-framework-pglite-component
 
 WASM_IN="target/$RUST_TARGET/$PROFILE_DIR/pglite_provider.wasm"
-[ -f "$WASM_IN" ] || die "expected output missing: $WASM_IN"
+[[ -f "$WASM_IN" ]] || die "expected output missing: $WASM_IN"
 
 # --- validate + stage ---------------------------------------------------------
 mkdir -p dist

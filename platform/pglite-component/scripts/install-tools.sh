@@ -53,29 +53,31 @@ esac
 case "$os" in
   macos) rust_triple="${arch}-apple-darwin"; wac_triple="${arch}-apple-darwin" ;;
   linux) rust_triple="${arch}-unknown-linux-gnu"; wac_triple="${arch}-unknown-linux-musl" ;;
+  *) die "unsupported platform: $os" ;;
 esac
 
 # --- helpers ----------------------------------------------------------------
 sha256_of() {
-  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}';
-  elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}';
+  local _file="$1"
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$_file" | awk '{print $1}';
+  elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$_file" | awk '{print $1}';
   else die "need shasum or sha256sum"; fi
 }
 
 # fetch <url> <dest> <expected-sha256>
 fetch() {
   local url="$1" dest="$2" expected="$3" actual
-  [ -n "$expected" ] || die "no pinned checksum for $(basename "$dest") on this platform; see scripts/tool-versions.env"
-  if [ -f "$dest" ]; then
+  [[ -n "$expected" ]] || die "no pinned checksum for $(basename "$dest") on this platform; see scripts/tool-versions.env"
+  if [[ -f "$dest" ]]; then
     actual="$(sha256_of "$dest")"
-    if [ "$actual" = "$expected" ]; then log "cached  $(basename "$dest")"; return 0; fi
+    if [[ "$actual" = "$expected" ]]; then log "cached  $(basename "$dest")"; return 0; fi
     log "cached $(basename "$dest") has wrong checksum; re-downloading"
     rm -f "$dest"
   fi
   log "fetch   $url"
   curl --fail --location --silent --show-error --retry 3 --output "$dest.part" "$url"
   actual="$(sha256_of "$dest.part")"
-  if [ "$actual" != "$expected" ]; then
+  if [[ "$actual" != "$expected" ]]; then
     rm -f "$dest.part"
     die "checksum mismatch for $(basename "$dest"): expected $expected, got $actual"
   fi
@@ -84,13 +86,13 @@ fetch() {
 }
 
 # indirect lookup of a variable named like WASM_TOOLS_SHA256_aarch64_macos
-lookup() { eval "printf '%s' \"\${$1:-}\""; }
+lookup() { local _name="$1"; eval "printf '%s' \"\${$_name:-}\""; }
 
 # --- wasm-tools ----------------------------------------------------------------
 install_wasm_tools() {
   local name="wasm-tools-${WASM_TOOLS_VERSION}-${arch}-${os}"
   local tgz="$CACHE_DIR/$name.tar.gz"
-  if [ -x "$BIN_DIR/wasm-tools" ] && "$BIN_DIR/wasm-tools" --version 2>/dev/null | grep -q "wasm-tools ${WASM_TOOLS_VERSION}"; then
+  if [[ -x "$BIN_DIR/wasm-tools" ]] && "$BIN_DIR/wasm-tools" --version 2>/dev/null | grep -q "wasm-tools ${WASM_TOOLS_VERSION}"; then
     log "ok      wasm-tools ${WASM_TOOLS_VERSION}"; return 0
   fi
   fetch "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/${name}.tar.gz" \
@@ -105,7 +107,7 @@ install_wasm_tools() {
 install_wac() {
   local name="wac-cli-${wac_triple}"
   local bin="$CACHE_DIR/$name-${WAC_VERSION}"
-  if [ -x "$BIN_DIR/wac" ] && "$BIN_DIR/wac" --version 2>/dev/null | grep -q "wac-cli ${WAC_VERSION}"; then
+  if [[ -x "$BIN_DIR/wac" ]] && "$BIN_DIR/wac" --version 2>/dev/null | grep -q "wac-cli ${WAC_VERSION}"; then
     log "ok      wac ${WAC_VERSION}"; return 0
   fi
   fetch "https://github.com/bytecodealliance/wac/releases/download/v${WAC_VERSION}/${name}" \
@@ -118,7 +120,7 @@ install_wac() {
 install_rust() {
   export RUSTUP_HOME="$TOOLS_DIR/rustup"
   export CARGO_HOME="$TOOLS_DIR/cargo"
-  if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+  if [[ ! -x "$CARGO_HOME/bin/rustup" ]]; then
     local init="$CACHE_DIR/rustup-init-${RUSTUP_VERSION}-${rust_triple}"
     fetch "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${rust_triple}/rustup-init" \
       "$init" "$(lookup "RUSTUP_INIT_SHA256_${rust_triple//-/_}")"
@@ -133,20 +135,20 @@ install_rust() {
   log "ok      rust ${RUST_TOOLCHAIN} + ${RUST_TARGET} (RUSTUP_HOME=$RUSTUP_HOME)"
 }
 
-if [ "$WAC_ONLY" = 1 ]; then
+if [[ "$WAC_ONLY" = 1 ]]; then
   install_wac
   exit 0
 fi
 
 install_wasm_tools
 install_wac
-if [ "$WITH_RUST" = 1 ]; then install_rust; fi
+if [[ "$WITH_RUST" = 1 ]]; then install_rust; fi
 
 cat >&2 <<EOF
 [install-tools] done. Tools directory: $TOOLS_DIR
   export PATH="$BIN_DIR:\$PATH"
 EOF
-if [ "$WITH_RUST" = 1 ]; then
+if [[ "$WITH_RUST" = 1 ]]; then
   cat >&2 <<EOF
   export RUSTUP_HOME="$TOOLS_DIR/rustup" CARGO_HOME="$TOOLS_DIR/cargo"
   export PATH="$TOOLS_DIR/cargo/bin:\$PATH"

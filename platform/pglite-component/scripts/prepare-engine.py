@@ -15,8 +15,12 @@ import urllib.request
 PKG = Path(__file__).resolve().parent.parent
 OUT = PKG / "target/engine"
 OUT.mkdir(parents=True, exist_ok=True)
-PINS = dict(line.split("=", 1) for line in (PKG / "scripts/tool-versions.env").read_text().splitlines()
-            if line and not line.startswith("#") and "=" in line)
+PINS = {
+    key: value
+    for line in (PKG / "scripts/tool-versions.env").read_text().splitlines()
+    if line and not line.startswith("#") and "=" in line
+    for key, value in [line.split("=", 1)]
+}
 
 
 def fetch(url, name, digest):
@@ -67,7 +71,7 @@ with tarfile.open(archive, "r:xz") as tar:
 run("wasm-tools", "print", str(runtime / "bin/pglite.wasi"), "-o", str(OUT / "engine.wat"))
 wat = (OUT / "engine.wat").read_text()
 # Use WASI entropy instead of requiring a host /dev/urandom preopen.
-wat, count = re.subn(r'  \(func \$pg_strong_random .*?\n  \)', '''  (func $pg_strong_random (param i32 i32) (result i32)
+wat, count = re.subn(r' {2}\(func \$pg_strong_random .*?\n {2}\)', '''  (func $pg_strong_random (param i32 i32) (result i32)
     local.get 0
     local.get 1
     call $__imported_wasi_snapshot_preview1_random_get
@@ -76,10 +80,13 @@ wat, count = re.subn(r'  \(func \$pg_strong_random .*?\n  \)', '''  (func $pg_st
 assert count == 1, "engine pg_strong_random ABI changed"
 # Bootstrap scripts live beside runtime/ and data/, both of which are used
 # as cwd during initdb. Equal-length replacement preserves core data offsets.
+# TMP_PREFIX is a WAT text pattern for the engine's baked-in bootstrap path,
+# not a filesystem write: no publicly writable directory is created here.
+TMP_PREFIX = "/tmp/"  # NOSONAR python:S5443 - WAT string constant, not a directory use.
 for name in ("initdb.boot.txt", "initdb.single.txt"):
-    assert wat.count("/tmp/" + name) == 1
-    wat = wat.replace("/tmp/" + name, "./../" + name)
-wat, count = re.subn(r'  \(export "_start" \(func \$_start\)\)\n', '', wat)
+    assert wat.count(TMP_PREFIX + name) == 1  # NOSONAR python:S5443 - count of WAT string pattern.
+    wat = wat.replace(TMP_PREFIX + name, "./../" + name)  # NOSONAR python:S5443 - WAT text rewrite.
+wat, count = re.subn(r' {2}\(export "_start" \(func \$_start\)\)\n', '', wat)
 assert count == 1
 wat = wat.rstrip()[:-1] + (PKG / "engine/bridge.wat").read_text() + '\n)\n'
 (OUT / "bridge.wat").write_text(wat)
