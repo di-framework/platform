@@ -168,6 +168,46 @@ renaming or removing one is a breaking change.
 
 CLI: `di-tenant` in `@di-framework/tenant-cli`; see `platform/tenant-cli/README.md` for commands and flags.
 
+## Secrets and vars storage contract
+
+`/v1/secrets` and `/v1/vars` (platform#53) store tenant configuration in `di-tenant-<tenant>`,
+written with the caller's own identity. The deploy lane (platform#55) injects them as follows.
+
+**Vars.** One ConfigMap per environment:
+
+- name `di-vars-<env>` (`di-vars-prod`, `di-vars-staging`);
+- labels `platform.di-framework.dev/config: vars` and `platform.di-framework.dev/env: <env>`;
+- one data key per var, named like an environment variable (`^[A-Za-z_][A-Za-z0-9_]*$`), holding
+  its value;
+- annotation `platform.di-framework.dev/updated-at`: a JSON object mapping each var name to the
+  RFC 3339 time it was last written.
+
+**Secrets.** One ordinary Secret per secret and environment:
+
+- name `<name>.<env>` (for example `db-password.prod`), where `<name>` is a DNS-1123 label that
+  is not a managed name (`di-binding-*`, `di-bs-*`; see `isManagedSecretName`);
+- labels `platform.di-framework.dev/config: secret`, `platform.di-framework.dev/env: <env>` and
+  `platform.di-framework.dev/secret: <name>`;
+- a single data key, the environment variable name of the secret: `<name>` upper-cased with `-`
+  replaced by `_` (`db-password` becomes `DB_PASSWORD`);
+- annotation `platform.di-framework.dev/updated-at` with the RFC 3339 time of the last write.
+
+The endpoints only touch Secrets that carry the `config: secret` label; values never leave the
+controller on read.
+
+**WorkloadDeployment references.** For a bundle deployed to `<env>`, every component of the
+rendered WorkloadDeployment gets, under `localResources.environment`:
+
+```yaml
+configFrom:
+  - name: di-vars-<env>         # every var of the environment
+secretFrom:
+  - name: <secret>.<env>        # one entry per name in the bundle's `secrets`
+```
+
+so each var and each referenced secret reaches the component as an environment variable. A
+bundle that names a secret without a `<secret>.<env>` Secret labelled as above is rejected.
+
 ## HTTP surface
 
 Controller: `GET /-/healthz` (open); `GET /-/whoami`, `GET|POST /-/keys`, `DELETE /-/keys/:id`,
