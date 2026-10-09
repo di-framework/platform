@@ -6,12 +6,18 @@
  * roles, quotas, and admission policies apply unchanged; the Kubernetes token never leaves here.
  */
 import { readFileSync } from 'node:fs';
-import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
-import { dispatch } from '@di-framework/tenant-cli/src/api/routes.ts';
 import { AuthError, IdentityResolver, type Principal } from './identity.ts';
 import { createApiKey, type KeyStore, listApiKeys, revokeApiKey } from './keys.ts';
-import { inClusterCredentials, KubeClient, KubeError, loadKubeconfig } from './kube.ts';
+import {
+  asUser,
+  inClusterCredentials,
+  KubeClient,
+  KubeError,
+  loadKubeconfig,
+  type UserTokens,
+} from './kube.ts';
 import { discover, type ProviderMetadata } from './oidc.ts';
+import { serveV1 } from './v1/index.ts';
 
 export interface ControllerConfig {
   tenant: string;
@@ -157,6 +163,15 @@ export class Controller {
     return minted.token;
   }
 
+  /** The users' ServiceAccount tokens; forgetting one also drops the cached identity. */
+  private readonly userTokens: UserTokens = {
+    token: (user) => this.serviceAccountToken(user),
+    forget: (user) => {
+      this.serviceAccountTokens.delete(user);
+      this.identity.forget(user);
+    },
+  };
+
   async handle(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === '/-/healthz') return json({ ok: true, tenant: this.config.tenant });
@@ -212,8 +227,7 @@ export class Controller {
     if (route === 'GET /-/whoami' || route === 'GET /v1/auth/whoami') return json(principal);
     // The CLI revokes its identity token at the issuer itself; the controller only drops its caches.
     if (route === 'POST /v1/auth/logout') {
-      this.serviceAccountTokens.delete(principal.user);
-      this.identity.forget(principal.user);
+      this.userTokens.forget(principal.user);
       this.audit('logout', { user: principal.user, via: principal.via });
       return new Response(null, { status: 204 });
     }
@@ -258,13 +272,15 @@ export class Controller {
         .sort((a, b) => a.user.localeCompare(b.user));
       return json({ members });
     }
-    // Every other operation of the `/v1` contract goes through the generated routes, which
-    // validate the request and answer 501 until the operation is implemented.
+    // The `/v1` contract goes through the generated routes, which validate the request and hand
+    // it to the resource modules under `v1/`.
     if (url.pathname.startsWith('/v1/'))
-      return (
-        (await dispatch(request)) ??
-        problem(404, 'Not Found', `${request.method} ${url.pathname} is not a /v1 operation`)
-      );
+      return serveV1(request, {
+        tenant: this.config.tenant,
+        principal,
+        asUser: () => asUser(this.kube, this.userTokens, principal),
+        audit: (event, fields) => this.audit(event, fields),
+      });
     return status(404, 'NotFound', `${url.pathname} is not a controller endpoint`);
   }
 
@@ -289,33 +305,11 @@ export class Controller {
       request.method === 'GET' || request.method === 'HEAD'
         ? undefined
         : await request.arrayBuffer();
-    const forward = async (token: string) => {
-      const headers = new Headers(request.headers);
-      for (const name of [
-        'authorization',
-        'host',
-        'connection',
-        'content-length',
-        'transfer-encoding',
-      ])
-        headers.delete(name);
-      headers.set('Authorization', `Bearer ${token}`);
-      return fetch(`${this.kube.server}${url.pathname}${url.search}`, {
-        method: request.method,
-        headers,
-        body,
-        redirect: 'manual',
-        tls: { ca: this.kube.ca },
-      } as RequestInit);
-    };
-    let upstream = await forward(await this.serviceAccountToken(principal.user));
-    if (upstream.status === 401) {
-      // The cached token belongs to a ServiceAccount that was deleted and recreated (for example
-      // after a suspend and unsuspend). Mint a fresh one and retry once.
-      this.serviceAccountTokens.delete(principal.user);
-      this.identity.forget(principal.user);
-      upstream = await forward(await this.serviceAccountToken(principal.user));
-    }
+    const upstream = await asUser(this.kube, this.userTokens, principal).fetch(
+      request.method,
+      `${url.pathname}${url.search}`,
+      { headers: request.headers, body },
+    );
     this.audit('request.proxied', {
       user: principal.user,
       via: principal.via,

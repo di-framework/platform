@@ -18,6 +18,12 @@ import { routes as varsRoutes } from './generated/vars/v1/http.ts';
 import { problem } from './handlers.ts';
 import { coerceQuery, ValidationError, validate } from './validate.ts';
 
+/**
+ * The container the generated controllers resolve their handlers from. Hosts that install
+ * handlers (the tenant controller) must use this copy, not their own `@di-framework/core`.
+ */
+export { useContainer } from '@di-framework/core/container';
+
 interface Parameter {
   name: string;
   in: string;
