@@ -1,0 +1,27 @@
+package wasmcloud:oci-registry;
+
+// An OCI registry served over wasip3 HTTP, backed by the async, native-stream
+// `wasmcloud:blobstore@0.1.0` interface.
+world oci-registry {
+  import wasmcloud:blobstore/blobstore@0.1.0;
+  import wasmcloud:blobstore/container@0.1.0;
+  import wasmcloud:blobstore/types@0.1.0;
+
+  // Random bytes for upload-session identifiers.
+  import wasi:random/random@0.3.0;
+
+  // Component config (the tenant controller URL), served by the built-in
+  // `wasmcloud:secrets` plugin from bind-time config. Consumed through the async
+  // `wasmcloud:secrets@2.1.0` interface — a host component plugin serves
+  // capability calls across its store boundary, which is inherently async.
+  import wasmcloud:secrets/store@2.1.0;
+  import wasmcloud:secrets/reveal@2.1.0;
+
+  // di-framework: authorization callback to the tenant controller's
+  // `GET /v1/auth/whoami`, and a monotonic clock for the positive-result cache.
+  import wasi:http/client@0.3.0;
+  import wasi:clocks/monotonic-clock@0.3.0;
+
+  // HTTP entrypoint (wasip3 async handler).
+  export wasi:http/handler@0.3.0;
+}
