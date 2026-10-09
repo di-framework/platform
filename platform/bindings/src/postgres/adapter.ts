@@ -46,8 +46,7 @@ export interface AutocommitDatabase extends SqlDatabase {
    * (line 190) calls `client.batch_execute` with that string (line 191). The named
    * import does the same (`query_batch`, line 407; `id.client()`, line 412;
    * `batch_with_client`, line 416). `crates/provider-sqldb-postgres` is not in that
-   * tag. The invocation-lease patch does not split this string, so it still
-   * reaches one `batch_execute`.
+   * tag. Upstream does not split this string, so it reaches one `batch_execute`.
    */
   atomicBatch(statements: readonly AtomicStatement[]): Promise<void>;
 }

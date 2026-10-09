@@ -12,12 +12,7 @@ links `wasi:tls/client,types@0.3.0-draft` alongside the default interfaces.
 ## What is built
 
 - Source: `git clone --branch v2.8.0` in its own layer, then the build fails unless `HEAD` is the pinned commit. `GIT_TERMINAL_PROMPT=0` keeps a credential prompt from hanging CI.
-- Patch: `postgres-invocation-lease.patch` is applied with `git apply --check` and then `git apply`, so a patch edit does not download wasmCloud again. The build also requires `release_store_lease` in `http_p3.rs`. The patch keeps
-  one postgres connection for the invocation across `BEGIN` / `COMMIT` / `ROLLBACK`, and releases
-  that lease when the HTTP call finishes, including when the guest stops before `COMMIT`.
-  Queries outside a transaction keep upstream's bounded row channel. A query on the leased
-  connection is buffered so the connection can be returned before the guest reads, and that
-  buffer stops at 4096 rows or 8 MiB.
+- Limitation: no patches are applied, so the host runs upstream wash 2.8.0 postgres behaviour. Connections are not pinned per invocation, and `BEGIN` ... `COMMIT` across separate queries is not guaranteed to use one connection, for named and unnamed imports alike. Guests should use autocommit or a single batched statement, as the identity guest does (issue #39).
 - Feature: `wasi-tls` is declared by the `wash` crate (`wasi-tls = ["wash-runtime/wasi-tls"]`), which
   enables `wasmtime-wasi-tls` (p3, rustls) in `wash-runtime`. Default features (`wasi-webgpu`,
   `wasm_component_model_implements`) stay on, matching upstream's `CARGO_FEATURES` build argument.
@@ -62,6 +57,8 @@ The job authenticates with the workflow `GITHUB_TOKEN` (`packages: write`).
 The tag is mutable. The platform default `hostImage` is the published index:
 
 `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669`
+
+The currently pinned image was published before the patch was dropped, so it still contains the unnamed-import lease until a maintainer republishes and the pin is updated.
 
 `tenantHostImage` overrides it. The workflow summary prints the digest of each later publish.
 
