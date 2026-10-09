@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -8,6 +8,15 @@ import {
   parsePackedPaths,
   workspacePackageDirs,
 } from '../scripts/publish-workspace.ts';
+
+// sqlite-component wasm is gitignored and only produced by `make build` (requires
+// wasi-sdk). Skip artifact checks when it is absent so contributors without wasi-sdk
+// still get green `bun test`. Jobs that build this component set
+// SQLITE_REQUIRE_DIST=1 to require artifacts.
+const sqliteComponentDir = join(import.meta.dir, '../platform/sqlite-component');
+const sqliteWasmBuilt =
+  existsSync(join(sqliteComponentDir, 'dist/di-framework-sqlite.wasm')) ||
+  process.env.SQLITE_REQUIRE_DIST === '1';
 
 describe('publish workspace packs', () => {
   test('rejects a files entry that the pack omitted', () => {
@@ -65,8 +74,8 @@ describe('publish workspace packs', () => {
     ]);
   });
 
-  test('sqlite component pack contains the wasm provider', () => {
-    const packed = packPaths(join(import.meta.dir, '../platform/sqlite-component'));
+  test.skipIf(!sqliteWasmBuilt)('sqlite component pack contains the wasm provider', () => {
+    const packed = packPaths(sqliteComponentDir);
     expect(packed).toContain('dist/di-framework-sqlite.wasm');
     expect(missingPackedEntries(['dist', 'wit'], packed)).toEqual([]);
   });
