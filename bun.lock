@@ -15,7 +15,7 @@
     },
     "adapters/cloudflare": {
       "name": "@di-framework/cloudflare",
-      "version": "6.0.8",
+      "version": "6.0.9",
       "devDependencies": {
         "@di-framework/core": "^5",
         "@types/bun": "latest",
@@ -27,7 +27,7 @@
     },
     "adapters/cloudfoundry": {
       "name": "@di-framework/cloudfoundry",
-      "version": "6.0.8",
+      "version": "6.0.9",
       "devDependencies": {
         "@di-framework/core": "^5",
         "@types/bun": "latest",
@@ -39,11 +39,11 @@
     },
     "platform/backup-agent": {
       "name": "@di-framework/backup-agent",
-      "version": "6.0.8",
+      "version": "6.0.9",
     },
     "platform/backup-destination": {
       "name": "@di-framework/backup-destination",
-      "version": "6.0.8",
+      "version": "6.0.9",
       "dependencies": {
         "@pulumi/kubernetes": "4.34.0",
         "@pulumi/pulumi": "3.261.0",
@@ -51,7 +51,7 @@
     },
     "platform/bindings": {
       "name": "@di-framework/bindings",
-      "version": "6.0.8",
+      "version": "6.0.9",
       "devDependencies": {
         "@di-framework/core": "^5",
         "@di-framework/repo": "^6.0.4",
@@ -68,11 +68,11 @@
     },
     "platform/pglite-component": {
       "name": "@di-framework/pglite-component",
-      "version": "0.1.0",
+      "version": "6.0.9",
     },
     "platform/platform": {
       "name": "@di-framework/platform",
-      "version": "6.0.8",
+      "version": "6.0.9",
       "dependencies": {
         "@pulumi/command": "1.2.1",
         "@pulumi/kubernetes": "4.34.0",
@@ -86,7 +86,17 @@
     },
     "platform/sqlite-component": {
       "name": "@di-framework/sqlite-component",
-      "version": "6.0.8",
+      "version": "6.0.9",
+    },
+    "platform/tenant-auth": {
+      "name": "@di-framework/tenant-auth",
+      "version": "0.0.0",
+      "dependencies": {
+        "js-yaml": "4.3.2",
+      },
+      "devDependencies": {
+        "@types/js-yaml": "4.0.9",
+      },
     },
     "platform/tenant-cli": {
       "name": "@di-framework/tenant-cli",
@@ -140,6 +150,8 @@
     "@di-framework/repo": ["@di-framework/repo@6.0.5", "", { "peerDependencies": { "@di-framework/core": "^6", "typescript": "^5" } }, "sha512-bUblSkWK/4cIKT78ZN4gkfdpGRf+0xg5oyhKOCuyKmGgTSBVsGLeEqXU7/Df2XFaguXvYp37fnxBQFNBqIMsVA=="],
 
     "@di-framework/sqlite-component": ["@di-framework/sqlite-component@workspace:platform/sqlite-component"],
+
+    "@di-framework/tenant-auth": ["@di-framework/tenant-auth@workspace:platform/tenant-auth"],
 
     "@di-framework/tenant-cli": ["@di-framework/tenant-cli@workspace:platform/tenant-cli"],
 
@@ -560,6 +572,8 @@
     "yargs-parser": ["yargs-parser@21.1.1", "", {}, "sha512-tVpsJW7DdjecAiFpbIB1e3qxIQsE6NoPc5/eTdrbbIC4h0LVsWhnoa3g+m2HclBIujHzsxZ4VJVA+GUuc2/LBw=="],
 
     "@di-framework/http/@di-framework/core": ["@di-framework/core@6.0.6", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-c9OssLKKhhwEbsPb0laCcgJ+9cS+847HVTKAa0epYgRTiWNn8XnicajaAvUhB99vFBrguMDoX2AwrecmdKNQzg=="],
+
+    "@di-framework/repo/@di-framework/core": ["@di-framework/core@6.0.6", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-c9OssLKKhhwEbsPb0laCcgJ+9cS+847HVTKAa0epYgRTiWNn8XnicajaAvUhB99vFBrguMDoX2AwrecmdKNQzg=="],
 
     "@di-framework/tenant-cli/@di-framework/core": ["@di-framework/core@6.0.6", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-c9OssLKKhhwEbsPb0laCcgJ+9cS+847HVTKAa0epYgRTiWNn8XnicajaAvUhB99vFBrguMDoX2AwrecmdKNQzg=="],
 
