@@ -3,11 +3,12 @@ import { deployBundle } from '@di-framework/tenant-cli/tests/support/deploy-bund
 import { Controller, configFromEnv } from '../src/controller.ts';
 import type { Principal } from '../src/identity.ts';
 import { KubeClient } from '../src/kube.ts';
-import { configSources, FIELD_MANAGER } from '../src/v1/deploy.ts';
+import { FIELD_MANAGER } from '../src/v1/deploy.ts';
 import { json, type Recorded, serve } from './support/servers.ts';
 
 const WORKLOADS =
   '/apis/runtime.wasmcloud.dev/v1alpha1/namespaces/di-tenant-acme/workloaddeployments';
+const CORE = '/api/v1/namespaces/di-tenant-acme';
 const BINDINGS =
   '/apis/platform.di-framework.dev/v1alpha1/namespaces/di-tenant-acme/servicebindings';
 
@@ -82,7 +83,34 @@ describe('/v1/deploy', () => {
     refusal = undefined;
     rejectToken = false;
     rawPatch = undefined;
+    for (const env of ['prod', 'staging']) seedSecret('api-token', env);
   });
+
+  /** Stores a tenant Secret as `/v1/secrets` writes it; `labels` replaces its labels. */
+  const seedSecret = (name: string, env: string, labels?: Record<string, string>) =>
+    stored.set(`${CORE}/secrets/${name}.${env}`, {
+      metadata: {
+        name: `${name}.${env}`,
+        labels: labels ?? {
+          'platform.di-framework.dev/config': 'secret',
+          'platform.di-framework.dev/env': env,
+          'platform.di-framework.dev/secret': name,
+        },
+      },
+    });
+  /** Stores an environment's vars ConfigMap as `/v1/vars` writes it. */
+  const seedVars = (env: string, data: Record<string, string>, labels?: Record<string, string>) =>
+    stored.set(`${CORE}/configmaps/di-vars-${env}`, {
+      metadata: {
+        name: `di-vars-${env}`,
+        labels: labels ?? {
+          'platform.di-framework.dev/config': 'vars',
+          'platform.di-framework.dev/env': env,
+        },
+      },
+      data,
+    });
+  const workloads = () => [...stored.keys()].filter((key) => key.startsWith(WORKLOADS));
 
   const post = (path: string, body: unknown) =>
     fetch(`${base}${path}`, {
@@ -118,7 +146,7 @@ describe('/v1/deploy', () => {
       metadata: {
         name: 'web-prod-cache',
         namespace: 'di-tenant-acme',
-        labels: { 'di-framework.dev/service': 'web', 'di-framework.dev/env': 'prod' },
+        labels: { 'di-framework.dev/service': 'web', 'platform.di-framework.dev/env': 'prod' },
       },
       spec: { serviceName: 'cache', bindingName: 'cache', capability: 'keyvalue' },
     });
@@ -130,7 +158,7 @@ describe('/v1/deploy', () => {
     expect(applied.metadata).toEqual({
       name: 'web-prod',
       namespace: 'di-tenant-acme',
-      labels: { 'di-framework.dev/service': 'web', 'di-framework.dev/env': 'prod' },
+      labels: { 'di-framework.dev/service': 'web', 'platform.di-framework.dev/env': 'prod' },
     });
     expect(applied.spec.replicas).toBe(1);
     expect(applied.spec.template.spec.environment).toBe('di-tenant-acme');
@@ -138,38 +166,131 @@ describe('/v1/deploy', () => {
     expect(log).toHaveBeenCalledWith(expect.stringContaining('"deploy.applied"'));
   });
 
-  test('sets each guest environment to only the vars ConfigMap and the named secrets', async () => {
-    const bundle = deployBundle({ env: 'staging', secrets: ['API_TOKEN', 'db'] });
+  test('injects the vars ConfigMap and the named secrets into every component and the service', async () => {
+    seedSecret('db', 'staging');
+    seedVars('staging', { MODE: 'x' });
+    const bundle = deployBundle({ env: 'staging', secrets: ['api-token', 'db'] });
     const template = (bundle.workload.spec as { template: { spec: Json } }).template.spec;
     const image = (template.components as Json[])[0]?.image;
     template.components = [
       { name: 'web', image, localResources: { environment: { config: { A: '1' } } } },
+      { name: 'worker', image },
     ];
     template.service = { name: 'svc' };
-    expect((await post('/v1/deploy', bundle)).status).toBe(202);
+    for (const path of ['/v1/deploy/preview', '/v1/deploy']) {
+      expect((await post(path, bundle)).status).toBeLessThan(300);
+      // Each named Secret was read as the caller before applying.
+      for (const object of ['api-token.staging', 'db.staging'])
+        expect(
+          api.requests
+            .find((r) => r.method === 'GET' && r.pathname === `${CORE}/secrets/${object}`)
+            ?.headers.get('authorization'),
+        ).toBe('Bearer sa-di-user-alice');
+      const applied = JSON.parse(patches().at(-1)?.body ?? '') as {
+        metadata: { labels: Json };
+        spec: { template: { spec: { components: Json[]; service: Json } } };
+      };
+      const sources = {
+        configFrom: [{ name: 'di-vars-staging' }],
+        secretFrom: [{ name: 'api-token.staging' }, { name: 'db.staging' }],
+      };
+      expect(applied.metadata.labels['platform.di-framework.dev/env']).toBe('staging');
+      expect(applied.spec.template.spec.components).toEqual([
+        { name: 'web', image, localResources: { environment: { config: { A: '1' }, ...sources } } },
+        { name: 'worker', image, localResources: { environment: sources } },
+      ]);
+      expect(applied.spec.template.spec.service).toEqual({
+        name: 'svc',
+        localResources: { environment: sources },
+      });
+      api.requests.length = 0;
+    }
+  });
+
+  test('an environment without a vars ConfigMap gets no configFrom', async () => {
+    expect((await post('/v1/deploy', deployBundle({ env: 'staging' }))).status).toBe(202);
     const applied = JSON.parse(patches().at(-1)?.body ?? '') as {
-      spec: { template: { spec: { components: Json[]; service: Json } } };
+      spec: { template: { spec: { components: Json[] } } };
     };
-    const sources = configSources('staging', ['API_TOKEN', 'db']);
-    expect(sources).toEqual({
-      configFrom: [{ name: 'di-vars-staging' }],
-      secretFrom: [{ name: 'di-secret-staging-api-token' }, { name: 'di-secret-staging-db' }],
+    expect(applied.spec.template.spec.components[0]?.localResources).toEqual({
+      environment: { secretFrom: [{ name: 'api-token.staging' }] },
     });
-    expect(applied.spec.template.spec.components[0]).toEqual({
-      name: 'web',
-      image,
-      localResources: {
-        environment: {
-          config: { A: '1' },
-          configFrom: sources.configFrom,
-          secretFrom: sources.secretFrom,
-        },
-      },
-    });
-    expect(applied.spec.template.spec.service).toEqual({
-      name: 'svc',
-      localResources: { environment: sources },
-    });
+  });
+
+  test('a bundle without secrets or vars gets no environment sources', async () => {
+    expect((await post('/v1/deploy', deployBundle({ secrets: [] }))).status).toBe(202);
+    const applied = JSON.parse(patches().at(-1)?.body ?? '') as {
+      spec: { template: { spec: { components: Json[] } } };
+    };
+    expect(applied.spec.template.spec.components[0]?.localResources).toEqual({ environment: {} });
+  });
+
+  test.each([
+    [
+      'a missing secret',
+      () => stored.delete(`${CORE}/secrets/api-token.prod`),
+      'secret api-token does not exist in prod',
+    ],
+    [
+      'a secret without the config label',
+      () =>
+        seedSecret('api-token', 'prod', {
+          'platform.di-framework.dev/env': 'prod',
+          'platform.di-framework.dev/secret': 'api-token',
+        }),
+      'api-token.prod is not a tenant secret for api-token in prod',
+    ],
+    [
+      'a secret labelled for another env',
+      () =>
+        seedSecret('api-token', 'prod', {
+          'platform.di-framework.dev/config': 'secret',
+          'platform.di-framework.dev/env': 'staging',
+          'platform.di-framework.dev/secret': 'api-token',
+        }),
+      'api-token.prod is not a tenant secret for api-token in prod',
+    ],
+    [
+      'a secret labelled with another name',
+      () =>
+        seedSecret('api-token', 'prod', {
+          'platform.di-framework.dev/config': 'secret',
+          'platform.di-framework.dev/env': 'prod',
+          'platform.di-framework.dev/secret': 'other',
+        }),
+      'api-token.prod is not a tenant secret for api-token in prod',
+    ],
+    [
+      'a vars ConfigMap without the config label',
+      () => seedVars('prod', {}, { 'platform.di-framework.dev/env': 'prod' }),
+      'di-vars-prod is not a tenant vars ConfigMap for prod',
+    ],
+    [
+      'a vars ConfigMap labelled for another env',
+      () =>
+        seedVars(
+          'prod',
+          {},
+          {
+            'platform.di-framework.dev/config': 'vars',
+            'platform.di-framework.dev/env': 'staging',
+          },
+        ),
+      'di-vars-prod is not a tenant vars ConfigMap for prod',
+    ],
+    [
+      'a var and a secret with the same environment variable',
+      () => seedVars('prod', { API_TOKEN: 'v' }),
+      'secret api-token and var API_TOKEN are both injected as API_TOKEN in prod',
+    ],
+  ])('%s is a 422 before anything is applied', async (_name, arrange, detail) => {
+    arrange();
+    for (const path of ['/v1/deploy', '/v1/deploy/preview']) {
+      const response = await post(path, deployBundle());
+      expect(response.status).toBe(422);
+      expect(await response.json()).toMatchObject({ status: 422, detail });
+    }
+    expect(patches()).toHaveLength(0);
   });
 
   test('an egress binding names its workload, and workload labels are kept', async () => {
@@ -183,7 +304,7 @@ describe('/v1/deploy', () => {
     expect((JSON.parse(workload?.body ?? '') as { metadata: Json }).metadata.labels).toEqual({
       'app.di-framework.dev/team': 'a',
       'di-framework.dev/service': 'web',
-      'di-framework.dev/env': 'prod',
+      'platform.di-framework.dev/env': 'prod',
     });
   });
 
@@ -201,7 +322,7 @@ describe('/v1/deploy', () => {
     expect(
       patches().every((r) => r.path.endsWith(`fieldManager=${FIELD_MANAGER}&dryRun=All`)),
     ).toBe(true);
-    expect(stored.size).toBe(0);
+    expect(workloads()).toHaveLength(0);
 
     await post('/v1/deploy', deployBundle());
     const changed = deployBundle();
@@ -301,8 +422,9 @@ describe('/v1/deploy', () => {
       { bindings: [{ name: 'c', capability: 'keyvalue', serviceName: 'c', config: { a: 'b' } }] },
       'bindings[0].config is not supported by ServiceBinding',
     ],
-    [{ secrets: ['bad-name'] }, 'secrets[0] must be a secret name'],
-    [{ secrets: ['A', 'A'] }, 'secrets[1] repeats A'],
+    [{ secrets: ['Bad_Name'] }, 'secrets[0] must be a tenant secret name'],
+    [{ secrets: ['di-binding-x'] }, 'secrets[0] must be a tenant secret name'],
+    [{ secrets: ['a', 'a'] }, 'secrets[1] repeats a'],
     [
       { workload: { spec: { template: { spec: { components: [] } } } } },
       'workload.spec.template.spec.components must be a non-empty array of objects',

@@ -37,7 +37,7 @@ export function deployBundle(overrides: Partial<DeployBundle> = {}): DeployBundl
       },
     },
     bindings: [{ name: 'cache', capability: 'keyvalue', serviceName: 'cache' }],
-    secrets: ['API_TOKEN'],
+    secrets: ['api-token'],
     ...overrides,
   };
 }

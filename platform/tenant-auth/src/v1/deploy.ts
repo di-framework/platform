@@ -1,5 +1,18 @@
 import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
+// Shared with platform#53 so names and labels follow one storage contract (README).
+import { isManagedSecretName } from '../../../platform/src/tenancy/admission.ts';
 import { KubeError, readKubeResponse, type UserKube } from '../kube.ts';
+import {
+  CONFIG,
+  ENV,
+  find,
+  namespace as namespacePath,
+  SECRET,
+  SECRET_NAME,
+  secretEnvName,
+  secretObjectName,
+  varsConfigMapName,
+} from './config.ts';
 import { notImplemented, type V1Context, type V1Handler, type V1Module } from './context.ts';
 
 /** The contract's `DeployBundle`, after the generated routes checked its JSON shape. */
@@ -33,10 +46,8 @@ export const FIELD_MANAGER = 'di-tenant-deploy';
 const WORKLOAD_API = 'runtime.wasmcloud.dev/v1alpha1';
 const BINDING_API = 'platform.di-framework.dev/v1alpha1';
 const SERVICE_LABEL = 'di-framework.dev/service';
-const ENV_LABEL = 'di-framework.dev/env';
 const CAPABILITIES = ['keyvalue', 'messaging', 'blobstore', 'postgres', 'egress'];
 const DNS_LABEL = /^[a-z]([a-z0-9-]*[a-z0-9])?$/;
-const SECRET_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const KUBE_TIMEOUT_MS = 15_000;
 /** The only label and annotation keys a bundle may set on its workload. */
 const PASSTHROUGH_PREFIX = 'app.di-framework.dev/';
@@ -44,17 +55,40 @@ const PASSTHROUGH_PREFIX = 'app.di-framework.dev/';
 const isObject = (value: unknown): value is Json =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
+interface ConfigRefs {
+  configFrom: { name: string }[];
+  secretFrom: { name: string }[];
+}
+
 /**
- * Where the workload's vars and secrets live. Provisional until reconciled with platform#53,
- * which owns the vars ConfigMap and Secret naming: one ConfigMap per environment, and one Secret
- * per tenant secret name.
+ * The vars and secrets the workload references, per the storage contract (README "Secrets and
+ * vars storage contract"), checked as the caller; a 422 problem when the bundle cannot use them.
  */
-export function configSources(env: string, secrets: string[]) {
+async function configRefs(
+  bundle: DeployBundle,
+  context: V1Context,
+): Promise<ConfigRefs | Response> {
+  const user = context.asUser();
+  const { env } = bundle;
+  const unprocessable = (detail: string) => problem(422, 'Unprocessable Entity', detail);
+  const vars = await find(user, `${namespacePath(context)}/configmaps/${varsConfigMapName(env)}`);
+  if (vars && (vars.metadata.labels?.[CONFIG] !== 'vars' || vars.metadata.labels?.[ENV] !== env))
+    return unprocessable(`${varsConfigMapName(env)} is not a tenant vars ConfigMap for ${env}`);
+  for (const name of bundle.secrets) {
+    const object = secretObjectName(name, env);
+    const secret = await find(user, `${namespacePath(context)}/secrets/${object}`);
+    if (!secret) return unprocessable(`secret ${name} does not exist in ${env}`);
+    const labels = secret.metadata.labels ?? {};
+    if (labels[CONFIG] !== 'secret' || labels[ENV] !== env || labels[SECRET] !== name)
+      return unprocessable(`${object} is not a tenant secret for ${name} in ${env}`);
+    if (vars?.data && Object.hasOwn(vars.data, secretEnvName(name)))
+      return unprocessable(
+        `secret ${name} and var ${secretEnvName(name)} are both injected as ${secretEnvName(name)} in ${env}`,
+      );
+  }
   return {
-    configFrom: [{ name: `di-vars-${env}` }],
-    secretFrom: secrets.map((name) => ({
-      name: `di-secret-${env}-${name.toLowerCase().replaceAll('_', '-')}`,
-    })),
+    configFrom: vars ? [{ name: varsConfigMapName(env) }] : [],
+    secretFrom: bundle.secrets.map((name) => ({ name: secretObjectName(name, env) })),
   };
 }
 
@@ -133,14 +167,15 @@ function invalid(bundle: DeployBundle): string | undefined {
       return `${at}.config is not supported by ServiceBinding`;
   }
   for (const [index, name] of secrets.entries()) {
-    if (!SECRET_NAME.test(name)) return `secrets[${index}] must be a secret name`;
+    if (!SECRET_NAME.test(name) || isManagedSecretName(name))
+      return `secrets[${index}] must be a tenant secret name`;
     if (secrets.indexOf(name) !== index) return `secrets[${index}] repeats ${name}`;
   }
   return undefined;
 }
 
 /** Sets every guest's vars and secrets sources to the controller's own; bundles cannot add any. */
-function inject(template: Json, sources: ReturnType<typeof configSources>): Json {
+function inject(template: Json, sources: ConfigRefs): Json {
   const withSources = (guest: unknown) => {
     const target = guest as Json;
     const local = isObject(target.localResources) ? target.localResources : {};
@@ -151,8 +186,9 @@ function inject(template: Json, sources: ReturnType<typeof configSources>): Json
         ...local,
         environment: {
           ...environment,
-          configFrom: sources.configFrom,
-          secretFrom: sources.secretFrom,
+          // An empty list is omitted, e.g. no vars ConfigMap means no vars in that env.
+          ...(sources.configFrom.length ? { configFrom: sources.configFrom } : {}),
+          ...(sources.secretFrom.length ? { secretFrom: sources.secretFrom } : {}),
         },
       },
     };
@@ -167,10 +203,14 @@ function inject(template: Json, sources: ReturnType<typeof configSources>): Json
 }
 
 /** The objects a bundle applies, in apply order: bindings first, then the workload. */
-function render(bundle: DeployBundle, tenant: string): { path: string; object: KubeObject }[] {
+function render(
+  bundle: DeployBundle,
+  tenant: string,
+  refs: ConfigRefs,
+): { path: string; object: KubeObject }[] {
   const namespace = `di-tenant-${tenant}`;
   const name = `${bundle.service}-${bundle.env}`;
-  const labels = { [SERVICE_LABEL]: bundle.service, [ENV_LABEL]: bundle.env };
+  const labels = { [SERVICE_LABEL]: bundle.service, [ENV]: bundle.env };
   const metadata = (bundle.workload.metadata ?? {}) as Json;
   const spec = bundle.workload.spec as Json;
   const template = (spec.template as Json).spec as Json;
@@ -188,7 +228,7 @@ function render(bundle: DeployBundle, tenant: string): { path: string; object: K
       template: {
         ...(spec.template as Json),
         spec: {
-          ...inject(template, configSources(bundle.env, bundle.secrets)),
+          ...inject(template, refs),
           environment: namespace,
           hostSelector: { hostgroup: `tenant-${tenant}` },
         },
@@ -280,20 +320,24 @@ function changedFields(before: KubeObject, after: KubeObject): string[] {
 }
 
 const validated =
-  (handler: (bundle: DeployBundle, context: V1Context) => Promise<Response>): V1Handler =>
+  (
+    handler: (bundle: DeployBundle, context: V1Context, refs: ConfigRefs) => Promise<Response>,
+  ): V1Handler =>
   async (command, _call, context) => {
     const bundle = command as DeployBundle;
     const reason = invalid(bundle);
     if (reason) return problem(422, 'Unprocessable Entity', reason);
-    return handler(bundle, context);
+    const refs = await configRefs(bundle, context);
+    if (refs instanceof Response) return refs;
+    return handler(bundle, context, refs);
   };
 
 /** `/v1/deploy` and `/v1/deployments` (platform#55). */
 export const deploy: V1Module = {
-  previewDeploy: validated(async (bundle, context) => {
+  previewDeploy: validated(async (bundle, context, refs) => {
     const user = context.asUser();
     const changes = [];
-    for (const { path, object } of render(bundle, context.tenant)) {
+    for (const { path, object } of render(bundle, context.tenant, refs)) {
       const before = await current(user, path);
       const after = await apply(user, path, object, true);
       const fields = before ? changedFields(before, after) : [];
@@ -306,10 +350,10 @@ export const deploy: V1Module = {
     }
     return Response.json({ env: bundle.env, service: bundle.service, changes });
   }),
-  deploy: validated(async (bundle, context) => {
+  deploy: validated(async (bundle, context, refs) => {
     const user = context.asUser();
     let applied: KubeObject | undefined;
-    for (const { path, object } of render(bundle, context.tenant))
+    for (const { path, object } of render(bundle, context.tenant, refs))
       applied = await apply(user, path, object, false);
     const workload = applied as KubeObject;
     context.audit('deploy.applied', {
