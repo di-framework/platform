@@ -1145,6 +1145,11 @@ function tenantAuthResources(
         { apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list', 'create', 'delete'] },
       ],
     }),
+    // Tenant developers can only write Secrets (#112), so `/v1` reads them as the controller;
+    // writes still go through as the calling user.
+    make(rbac, 'Role', 'tenant-controller-secrets', n.namespace, {
+      rules: [{ apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list'] }],
+    }),
   ];
   // A suspended tenant keeps the roles but loses the bindings (revoked with the members').
   if (!suspended)
@@ -1170,6 +1175,14 @@ function tenantAuthResources(
           apiGroup: 'rbac.authorization.k8s.io',
           kind: 'Role',
           name: 'tenant-controller-keys',
+        },
+        subjects,
+      }),
+      make(rbac, 'RoleBinding', 'tenant-controller-secrets', n.namespace, {
+        roleRef: {
+          apiGroup: 'rbac.authorization.k8s.io',
+          kind: 'Role',
+          name: 'tenant-controller-secrets',
         },
         subjects,
       }),
