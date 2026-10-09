@@ -237,3 +237,68 @@ export class KubeClient {
     );
   }
 }
+
+/** Mints and caches the ServiceAccount tokens a user's requests are sent with. */
+export interface UserTokens {
+  /** A token for the user's `di-user-<user>` ServiceAccount. */
+  token(user: string): Promise<string>;
+  /** Drop a cached token, so the next call mints a fresh one. */
+  forget(user: string): void;
+}
+
+export interface AsUserInit {
+  headers?: HeadersInit;
+  body?: BodyInit;
+}
+
+/** Talks to the API server as one user, with that user's own ServiceAccount and RBAC. */
+export interface UserKube {
+  readonly user: string;
+  /** Sends one request (path with query string) to the API server and returns its raw response. */
+  fetch(method: string, path: string, init?: AsUserInit): Promise<Response>;
+}
+
+/**
+ * Binds the API server to the calling user: requests carry a token for the user's own
+ * `di-user-<user>` ServiceAccount instead of the controller's credential, so the platform's
+ * roles, quotas and admission policies apply to them exactly as they do to the proxy.
+ * Refuses when there is no user.
+ */
+export function asUser(
+  kube: KubeClient,
+  tokens: UserTokens,
+  principal: { user: string } | undefined,
+): UserKube {
+  const user = principal?.user;
+  if (!user) throw new KubeError(401, 'no user to act as');
+  const send = (method: string, path: string, init: AsUserInit, token: string) => {
+    const headers = new Headers(init.headers);
+    for (const name of [
+      'authorization',
+      'host',
+      'connection',
+      'content-length',
+      'transfer-encoding',
+    ])
+      headers.delete(name);
+    headers.set('Authorization', `Bearer ${token}`);
+    return fetch(`${kube.server}${path}`, {
+      method,
+      headers,
+      body: init.body,
+      redirect: 'manual',
+      tls: { ca: kube.ca },
+    } as RequestInit);
+  };
+  return {
+    user,
+    async fetch(method, path, init = {}) {
+      const response = await send(method, path, init, await tokens.token(user));
+      if (response.status !== 401) return response;
+      // The cached token belongs to a ServiceAccount that was deleted and recreated (for example
+      // after a suspend and unsuspend). Mint a fresh one and retry once.
+      tokens.forget(user);
+      return send(method, path, init, await tokens.token(user));
+    },
+  };
+}

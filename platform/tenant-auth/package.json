@@ -14,6 +14,7 @@
     "test": "bun test"
   },
   "dependencies": {
+    "@di-framework/core": "^6.0.3",
     "@di-framework/tenant-cli": "workspace:*",
     "js-yaml": "4.3.2"
   },

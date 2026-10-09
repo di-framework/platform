@@ -92,6 +92,7 @@
       "name": "@di-framework/tenant-auth",
       "version": "0.0.0",
       "dependencies": {
+        "@di-framework/core": "^6.0.3",
         "@di-framework/tenant-cli": "workspace:*",
         "js-yaml": "4.3.2",
       },
@@ -575,6 +576,8 @@
     "@di-framework/http/@di-framework/core": ["@di-framework/core@6.0.6", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-c9OssLKKhhwEbsPb0laCcgJ+9cS+847HVTKAa0epYgRTiWNn8XnicajaAvUhB99vFBrguMDoX2AwrecmdKNQzg=="],
 
     "@di-framework/repo/@di-framework/core": ["@di-framework/core@6.0.6", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-c9OssLKKhhwEbsPb0laCcgJ+9cS+847HVTKAa0epYgRTiWNn8XnicajaAvUhB99vFBrguMDoX2AwrecmdKNQzg=="],
+
+    "@di-framework/tenant-auth/@di-framework/core": ["@di-framework/core@6.0.6", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-c9OssLKKhhwEbsPb0laCcgJ+9cS+847HVTKAa0epYgRTiWNn8XnicajaAvUhB99vFBrguMDoX2AwrecmdKNQzg=="],
 
     "@di-framework/tenant-cli/@di-framework/core": ["@di-framework/core@6.0.6", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-c9OssLKKhhwEbsPb0laCcgJ+9cS+847HVTKAa0epYgRTiWNn8XnicajaAvUhB99vFBrguMDoX2AwrecmdKNQzg=="],
 
