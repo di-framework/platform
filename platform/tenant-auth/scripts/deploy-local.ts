@@ -11,6 +11,13 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { dump } from 'js-yaml';
+import {
+  APPLY_ARGS,
+  assertBundleSize,
+  assertDigestsMatch,
+  sha256,
+  splitManifests,
+} from './apply-helpers.ts';
 
 const root = join(import.meta.dir, '..');
 const dist = join(root, 'dist');
@@ -489,11 +496,17 @@ consoleDeployment.spec.template.spec.containers[0]?.env.push({
   valueFrom: { secretKeyRef: { name: 'tenant-console-oauth', key: 'clientSecret' } },
 });
 
-const yaml = manifests.map((m) => dump(m, { lineWidth: -1 })).join('---\n');
-writeFileSync(join(dist, 'tenant-auth.yaml'), yaml);
-console.error(
-  (await run(['kubectl', '--kubeconfig', kubeconfig, 'apply', '-f', '-'], yaml)).trim(),
-);
+assertBundleSize({ 'controller.js': bundle('controller'), 'console.js': bundle('console') });
+const toYaml = (items: unknown[]) => items.map((m) => dump(m, { lineWidth: -1 })).join('---\n');
+writeFileSync(join(dist, 'tenant-auth.yaml'), toYaml(manifests));
+// Config objects first: a failed bundle update throws (run() rejects on non-zero exit) before any
+// Deployment is applied, so the pods are never recycled onto a stale bundle.
+const { config, workloads } = splitManifests(manifests as { kind?: string }[]);
+for (const part of [config, workloads]) {
+  console.error(
+    (await run(['kubectl', '--kubeconfig', kubeconfig, ...APPLY_ARGS], toYaml(part))).trim(),
+  );
+}
 console.error(
   await kubectl(
     '-n',
@@ -514,6 +527,19 @@ console.error(
     '--timeout=180s',
   ),
 );
+const liveBundle = await kubectl(
+  '-n',
+  namespace,
+  'get',
+  'configmap',
+  'tenant-auth-bundle',
+  '-o',
+  'jsonpath={.data.controller\\.js}',
+);
+const builtDigest = sha256(bundle('controller'));
+const liveDigest = sha256(liveBundle);
+console.error(`controller.js sha256 built=${builtDigest} in-cluster=${liveDigest}`);
+assertDigestsMatch(builtDigest, liveDigest);
 console.log(`Deployed. Reach them from this machine with:
   kubectl --kubeconfig '${kubeconfig}' -n ${namespace} port-forward svc/tenant-controller 8788:8788
   kubectl --kubeconfig '${kubeconfig}' -n ${namespace} port-forward svc/tenant-console 8787:8787
