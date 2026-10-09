@@ -1,5 +1,11 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { deployBundle } from '@di-framework/tenant-cli/tests/support/deploy-bundle.ts';
+// Pinned to the platform's log projection, which keys logs by these labels (platform#103).
+import {
+  APPLICATION,
+  applicationKey,
+  WORKLOAD,
+} from '../../platform/src/tenancy/log-projection.ts';
 import { Controller, configFromEnv } from '../src/controller.ts';
 import type { Principal } from '../src/identity.ts';
 import { KubeClient } from '../src/kube.ts';
@@ -13,6 +19,15 @@ const BINDINGS =
   '/apis/platform.di-framework.dev/v1alpha1/namespaces/di-tenant-acme/servicebindings';
 
 type Json = Record<string, unknown>;
+
+/** The labels every rendered object carries for service `web` in `prod`. */
+const LABELS = {
+  'app.kubernetes.io/managed-by': 'di-framework',
+  'app.kubernetes.io/name': 'web',
+  'di-framework.dev/application': 'web',
+  'di-framework.dev/service': 'web',
+  'platform.di-framework.dev/env': 'prod',
+};
 
 /**
  * The controller over real HTTP, in front of a fake API server that mints `di-user-*` tokens,
@@ -151,7 +166,7 @@ describe('/v1/deploy', () => {
       metadata: {
         name: 'web-prod-cache',
         namespace: 'di-tenant-acme',
-        labels: { 'di-framework.dev/service': 'web', 'platform.di-framework.dev/env': 'prod' },
+        labels: LABELS,
       },
       spec: { serviceName: 'cache', bindingName: 'cache', capability: 'keyvalue' },
     });
@@ -163,7 +178,7 @@ describe('/v1/deploy', () => {
     expect(applied.metadata).toEqual({
       name: 'web-prod',
       namespace: 'di-tenant-acme',
-      labels: { 'di-framework.dev/service': 'web', 'platform.di-framework.dev/env': 'prod' },
+      labels: LABELS,
     });
     expect(applied.spec.replicas).toBe(1);
     expect(applied.spec.template.spec.environment).toBe('di-tenant-acme');
@@ -308,10 +323,117 @@ describe('/v1/deploy', () => {
     expect((JSON.parse(binding?.body ?? '') as { spec: Json }).spec.workloadName).toBe('web-prod');
     expect((JSON.parse(workload?.body ?? '') as { metadata: Json }).metadata.labels).toEqual({
       'app.di-framework.dev/team': 'a',
-      'di-framework.dev/service': 'web',
-      'platform.di-framework.dev/env': 'prod',
+      ...LABELS,
     });
   });
+
+  test('the rendered workload matches the log projection selector and keys logs by service', async () => {
+    expect((await post('/v1/deploy', deployBundle())).status).toBe(202);
+    const stored_ = stored.get(`${WORKLOADS}/web-prod`) as { metadata: Json };
+    const labels = stored_.metadata.labels as Record<string, string>;
+    // The selector projectLogs lists WorkloadDeployments with (platform controller.ts).
+    expect(labels['app.kubernetes.io/managed-by']).toBe('di-framework');
+    expect(labels[APPLICATION]).toBe('web');
+    expect(labels[WORKLOAD]).toBeUndefined();
+    expect(applicationKey({ name: 'web-prod', labels })).toBe('web');
+  });
+
+  test.each([
+    'app.kubernetes.io/managed-by',
+    'app.kubernetes.io/name',
+    'di-framework.dev/application',
+    'di-framework.dev/workload',
+  ])('a bundle cannot set the %s label', async (label) => {
+    const bundle = deployBundle();
+    bundle.workload.metadata = { labels: { [label]: 'other' } };
+    const response = await post('/v1/deploy', bundle);
+    expect(response.status).toBe(422);
+    expect(api.requests).toHaveLength(0);
+  });
+
+  test('the wasi:http host interface gets the service as its host', async () => {
+    const bundle = deployBundle();
+    const hostInterfaces = (bundle.workload as { spec: { template: { spec: Json } } }).spec.template
+      .spec.hostInterfaces as Json[];
+    delete hostInterfaces[0]?.config;
+    expect((await post('/v1/deploy', bundle)).status).toBe(202);
+    const [, workload] = patches();
+    const applied = JSON.parse(workload?.body ?? '') as {
+      spec: { template: { spec: { hostInterfaces: Json[] } } };
+    };
+    expect(applied.spec.template.spec.hostInterfaces).toEqual([
+      {
+        namespace: 'wasi',
+        package: 'http',
+        version: '0.3.0',
+        interfaces: ['handler'],
+        config: { host: 'web' },
+      },
+      { namespace: 'wasi', package: 'logging', version: '0.1.0-draft', interfaces: ['logging'] },
+    ]);
+  });
+
+  test('a workload without host interfaces is applied unchanged', async () => {
+    const bundle = deployBundle();
+    delete (bundle.workload as { spec: { template: { spec: Json } } }).spec.template.spec
+      .hostInterfaces;
+    expect((await post('/v1/deploy', bundle)).status).toBe(202);
+  });
+
+  const http = (entry: Json | string) => ({
+    workload: {
+      spec: {
+        template: {
+          spec: {
+            components: [
+              {
+                image: 'r@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+              },
+            ],
+            hostInterfaces:
+              typeof entry === 'string'
+                ? entry
+                : [{ namespace: 'wasi', package: 'http', ...entry }],
+          },
+        },
+      },
+    },
+  });
+  const at = 'workload.spec.template.spec.hostInterfaces[0]';
+  test.each([
+    [
+      http({ version: '0.3.0', interfaces: ['handler'], config: { host: 'other' } }),
+      `${at}.config.host must be web, the service name, or absent`,
+    ],
+    [
+      http({ interfaces: ['incoming-handler'] }),
+      `${at} declares wasi:http incoming-handler without a version; hosts serve wasi:http@0.3.0 handler`,
+    ],
+    [
+      http({ version: '0.2.0', interfaces: ['handler'] }),
+      `${at} must be wasi:http@0.3.0 with interfaces [handler]`,
+    ],
+    [
+      http({ version: '0.3.0', interfaces: ['client'] }),
+      `${at} must be wasi:http@0.3.0 with interfaces [handler]`,
+    ],
+    [http({ interfaces: 'handler' }), `${at} must be wasi:http@0.3.0 with interfaces [handler]`],
+    [
+      http({ version: '0.3.0', interfaces: ['handler'], config: 'web' }),
+      `${at}.config must be an object`,
+    ],
+    [http('wasi:http'), 'workload.spec.template.spec.hostInterfaces must be an array'],
+  ] as const)(
+    'refuses an unservable wasi:http host interface with 422 (%#)',
+    async (overrides, detail) => {
+      for (const path of ['/v1/deploy', '/v1/deploy/preview']) {
+        const response = await post(path, deployBundle(overrides as never));
+        expect(response.status).toBe(422);
+        expect(await response.json()).toMatchObject({ status: 422, detail });
+      }
+      expect(api.requests).toHaveLength(0);
+    },
+  );
 
   test('preview dry-runs every object and reports create, update and unchanged', async () => {
     const first = await post('/v1/deploy/preview', deployBundle());

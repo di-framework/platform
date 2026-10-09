@@ -29,8 +29,19 @@ export function deployBundle(overrides: Partial<DeployBundle> = {}): DeployBundl
               },
             ],
             hostInterfaces: [
-              { namespace: 'wasi', package: 'http', interfaces: ['incoming-handler'] },
-              { namespace: 'wasi', package: 'logging', interfaces: ['logging'] },
+              {
+                namespace: 'wasi',
+                package: 'http',
+                version: '0.3.0',
+                interfaces: ['handler'],
+                config: { host: 'web' },
+              },
+              {
+                namespace: 'wasi',
+                package: 'logging',
+                version: '0.1.0-draft',
+                interfaces: ['logging'],
+              },
             ],
           },
         },

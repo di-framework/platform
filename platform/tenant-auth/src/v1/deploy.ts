@@ -46,6 +46,13 @@ export const FIELD_MANAGER = 'di-tenant-deploy';
 const WORKLOAD_API = 'runtime.wasmcloud.dev/v1alpha1';
 const BINDING_API = 'platform.di-framework.dev/v1alpha1';
 const SERVICE_LABEL = 'di-framework.dev/service';
+/** Labels cli-plugin-platform renders and the platform's log projection selects on (#103). */
+const MANAGED_BY_LABEL = 'app.kubernetes.io/managed-by';
+const NAME_LABEL = 'app.kubernetes.io/name';
+const APPLICATION_LABEL = 'di-framework.dev/application';
+/** The only `wasi:http` host interface tenant hosts serve, as cli-plugin-platform renders it. */
+const HTTP_VERSION = '0.3.0';
+const HTTP_INTERFACES = ['handler'];
 const CAPABILITIES = ['keyvalue', 'messaging', 'blobstore', 'postgres', 'egress'];
 const DNS_LABEL = /^[a-z]([a-z0-9-]*[a-z0-9])?$/;
 const KUBE_TIMEOUT_MS = 15_000;
@@ -92,6 +99,47 @@ async function configRefs(
   };
 }
 
+const isHttp = (entry: unknown): entry is Json =>
+  isObject(entry) && entry.namespace === 'wasi' && entry.package === 'http';
+
+/** Why the bundle's `wasi:http` host interface cannot be served (#101), or undefined. */
+function invalidHttp(hostInterfaces: unknown, service: string): string | undefined {
+  if (hostInterfaces === undefined) return undefined;
+  if (!Array.isArray(hostInterfaces))
+    return 'workload.spec.template.spec.hostInterfaces must be an array';
+  for (const [index, entry] of hostInterfaces.entries()) {
+    if (!isHttp(entry)) continue;
+    const at = `workload.spec.template.spec.hostInterfaces[${index}]`;
+    const interfaces = entry.interfaces;
+    if (
+      entry.version === undefined &&
+      Array.isArray(interfaces) &&
+      interfaces.includes('incoming-handler')
+    )
+      return `${at} declares wasi:http incoming-handler without a version; hosts serve wasi:http@${HTTP_VERSION} handler`;
+    if (entry.version !== HTTP_VERSION || canonical(interfaces) !== canonical(HTTP_INTERFACES))
+      return `${at} must be wasi:http@${HTTP_VERSION} with interfaces [handler]`;
+    const config = entry.config;
+    if (config !== undefined && !isObject(config)) return `${at}.config must be an object`;
+    if (config?.host !== undefined && config.host !== service)
+      return `${at}.config.host must be ${service}, the service name, or absent`;
+  }
+  return undefined;
+}
+
+/** Sets `config.host` of the `wasi:http` host interface to the service, so hosts route to it. */
+function withHttpHost(template: Json, service: string): Json {
+  if (!Array.isArray(template.hostInterfaces)) return template;
+  return {
+    ...template,
+    hostInterfaces: template.hostInterfaces.map((entry: unknown) =>
+      isHttp(entry)
+        ? { ...entry, config: { ...(entry.config as Json | undefined), host: service } }
+        : entry,
+    ),
+  };
+}
+
 /** Why the bundle cannot be applied, or undefined when it can. */
 function invalid(bundle: DeployBundle): string | undefined {
   const { service, env, component, workload, bindings, secrets } = bundle;
@@ -133,6 +181,8 @@ function invalid(bundle: DeployBundle): string | undefined {
   const components = template.components;
   if (!Array.isArray(components) || components.length === 0 || !components.every(isObject))
     return 'workload.spec.template.spec.components must be a non-empty array of objects';
+  const httpReason = invalidHttp(template.hostInterfaces, service);
+  if (httpReason) return httpReason;
   const guests: [string, unknown][] = components.map((guest, index) => [
     `components[${index}]`,
     guest,
@@ -210,7 +260,13 @@ function render(
 ): { path: string; object: KubeObject }[] {
   const namespace = `di-tenant-${tenant}`;
   const name = `${bundle.service}-${bundle.env}`;
-  const labels = { [SERVICE_LABEL]: bundle.service, [ENV]: bundle.env };
+  const labels = {
+    [MANAGED_BY_LABEL]: 'di-framework',
+    [NAME_LABEL]: bundle.service,
+    [APPLICATION_LABEL]: bundle.service,
+    [SERVICE_LABEL]: bundle.service,
+    [ENV]: bundle.env,
+  };
   const metadata = (bundle.workload.metadata ?? {}) as Json;
   const spec = bundle.workload.spec as Json;
   const template = (spec.template as Json).spec as Json;
@@ -228,7 +284,7 @@ function render(
       template: {
         ...(spec.template as Json),
         spec: {
-          ...inject(template, refs),
+          ...inject(withHttpHost(template, bundle.service), refs),
           environment: namespace,
           hostSelector: { hostgroup: `tenant-${tenant}` },
         },
