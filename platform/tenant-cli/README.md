@@ -37,7 +37,10 @@ Streaming operations (`logs`) are SSE: each `log` event's `data` is one `LogEven
 `@di-framework/tenant-cli/client` is the published entry point: the typed `/v1` client
 (`createClient`, `ControllerError`, `events`, and the request/response types). It ships compiled
 (`dist`, with `.d.ts`), so consumers need no `.ts` import support. The package also installs the
-`di-tenant` command.
+`di-tenant` command, which requires Bun (its shebang is `bun`).
+
+The `./src/api/*` export is workspace-internal: `../tenant-auth` uses it inside this repository, and it
+is not usable from the npm package (`src` is not published).
 
 ```ts
 import { createClient } from '@di-framework/tenant-cli/client';

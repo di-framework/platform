@@ -1,4 +1,4 @@
-import type { components, operations, paths } from './schema';
+import type { components, operations, paths } from './schema.js';
 import { events } from './sse';
 
 export { events, type SseEvent } from './sse';

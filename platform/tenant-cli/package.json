@@ -37,9 +37,11 @@
     "build": "rm -rf dist && bun x tsc -p tsconfig.build.json && cp src/client/schema.d.ts dist/client/schema.d.ts && bun ../../scripts/fix-esm-imports.ts dist",
     "test": "bun test"
   },
-  "devDependencies": {
+  "dependencies": {
     "@di-framework/core": "^6.0.3",
-    "@di-framework/http": "^6.0.3",
+    "@di-framework/http": "^6.0.3"
+  },
+  "devDependencies": {
     "openapi-typescript": "7.13.0"
   }
 }

@@ -76,3 +76,34 @@ export const framing = events;
   const tsc = join(import.meta.dir, '../../../node_modules/typescript/bin/tsc');
   run(['node', tsc, '-p', 'tsconfig.json'], project);
 });
+
+test('a NodeNext consumer with skipLibCheck gets real types, not any', () => {
+  const project = join(scratch, 'consumer');
+  writeFileSync(
+    join(project, 'tsconfig.nodenext.json'),
+    JSON.stringify({
+      compilerOptions: {
+        module: 'NodeNext',
+        moduleResolution: 'NodeNext',
+        target: 'ESNext',
+        strict: true,
+        noEmit: true,
+        skipLibCheck: true,
+        types: [],
+        lib: ['ESNext', 'DOM'],
+      },
+      include: ['nodenext.ts'],
+    }),
+  );
+  // The assignment errors only while AuthInfo is a real object type; if the types collapsed to
+  // any, the expected error disappears and @ts-expect-error itself fails the compile.
+  writeFileSync(
+    join(project, 'nodenext.ts'),
+    `import type { AuthInfo } from '@di-framework/tenant-cli/client';
+// @ts-expect-error a number is not an AuthInfo
+export const bad: AuthInfo = 42;
+`,
+  );
+  const tsc = join(import.meta.dir, '../../../node_modules/typescript/bin/tsc');
+  run(['node', tsc, '-p', 'tsconfig.nodenext.json'], project);
+});

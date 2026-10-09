@@ -105,9 +105,11 @@
       "bin": {
         "di-tenant": "dist/main.js",
       },
-      "devDependencies": {
+      "dependencies": {
         "@di-framework/core": "^6.0.3",
         "@di-framework/http": "^6.0.3",
+      },
+      "devDependencies": {
         "openapi-typescript": "7.13.0",
       },
     },
