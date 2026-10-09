@@ -125,6 +125,7 @@ export class ApiError extends Error {
   constructor(
     public readonly code: number,
     message: string,
+    public readonly responseBody?: string,
   ) {
     super(message);
   }
@@ -164,11 +165,14 @@ export class KubernetesApi implements Api {
           res.on('end', () => {
             const plainText = path.split('?')[0]?.endsWith('/log');
             if ((res.statusCode ?? 500) >= 300) {
-              // Do not put API response bodies in logs: they may contain Secret data.
+              // For 409 conflicts, include the response body which names the conflicting field managers.
+              // Do not put other API response bodies in logs: they may contain Secret data.
+              const responseBody = res.statusCode === 409 ? text : undefined;
               reject(
                 new ApiError(
                   res.statusCode ?? 500,
                   `${method} ${path.split('?')[0]} returned ${res.statusCode}`,
+                  responseBody,
                 ),
               );
             } else if (plainText) {
@@ -1281,7 +1285,11 @@ export class Controller {
         if (value.kind === 'Tenant') await this.reconcileTenant(value as Tenant);
         else await this.reconcileUser(value as User, tenants);
       } catch (error) {
-        const message = error instanceof Error ? error.message : 'Reconciliation failed';
+        let message = error instanceof Error ? error.message : 'Reconciliation failed';
+        // For API 409 conflicts, include the response body which names conflicting field managers
+        if (error instanceof ApiError && error.code === 409 && error.responseBody) {
+          message = `${message}; conflict details: ${error.responseBody}`;
+        }
         console.error(`${value.kind}/${value.metadata.name}: ${message}`);
         try {
           await this.status(value, false, 'ReconcileError', message);

@@ -113,6 +113,33 @@ describe('Kubernetes API transport', () => {
       expect(error).toBeInstanceOf(ApiError);
       expect((error as ApiError).code).toBe(403);
       expect((error as ApiError).message).toBe('GET /api/v1/secrets returned 403');
+      expect((error as ApiError).responseBody).toBeUndefined();
+    } finally {
+      t.restore();
+    }
+  });
+
+  it('includes response body for 409 conflict errors to report conflicting field managers', async () => {
+    const conflictResponse = JSON.stringify({
+      kind: 'Status',
+      apiVersion: 'v1',
+      metadata: {},
+      status: 'Failure',
+      message: 'Apply failed with 1 conflict: conflict with "some-manager" over field "spec.strategy"',
+      reason: 'Conflict',
+      code: 409,
+    });
+    const t = transport(409, conflictResponse);
+    try {
+      const error = await new KubernetesApi()
+        .call('PATCH', '/api/v1/namespaces/di-runtime-identity/deployments/hostgroup-tenant-identity')
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(ApiError);
+      expect((error as ApiError).code).toBe(409);
+      expect((error as ApiError).message).toBe(
+        'PATCH /api/v1/namespaces/di-runtime-identity/deployments/hostgroup-tenant-identity returned 409',
+      );
+      expect((error as ApiError).responseBody).toBe(conflictResponse);
     } finally {
       t.restore();
     }
