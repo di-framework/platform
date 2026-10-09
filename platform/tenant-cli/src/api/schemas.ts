@@ -96,6 +96,26 @@ export const schemas = {
     required: ['env', 'service', 'component', 'workload', 'bindings', 'secrets'],
   },
 
+  PushCredential: {
+    type: 'object',
+    description:
+      'A short-lived bearer token for the registry token-auth flow, scoped to the tenant repository path. It is never a shared registry secret.',
+    properties: {
+      registry: { type: 'string', description: 'Registry host the token is valid for.' },
+      repository: {
+        type: 'string',
+        description: 'Repository path the token is scoped to; push to references under it.',
+      },
+      token: { type: 'string', description: 'Bearer token to present to the registry.' },
+      scope: {
+        type: 'string',
+        description: 'Granted access, for example `repository:acme/*:pull,push`.',
+      },
+      expiresAt: dateTime,
+    },
+    required: ['registry', 'repository', 'token', 'scope', 'expiresAt'],
+  },
+
   DeployChange: {
     type: 'object',
     properties: {

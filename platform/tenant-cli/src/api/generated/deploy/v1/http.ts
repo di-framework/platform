@@ -4,11 +4,13 @@ import { useContainer } from '@di-framework/core/container';
 import { Component } from '@di-framework/core/decorators';
 import { Controller, Endpoint, json, TypedRouter } from '@di-framework/http';
 import { TenantControllerHandlers } from '../../../handlers';
-import { DeployBundle, DeployPlan, Deployment } from '../../../contracts/api.schemas';
+import { DeployBundle, DeployPlan, Deployment, Empty, PushCredential } from '../../../contracts/api.schemas';
 import {
   validateDeployBundle,
   validateDeployPlan,
   validateDeployment,
+  validateEmpty,
+  validatePushCredential,
 } from './contracts';
 
 const routes = TypedRouter();
@@ -88,6 +90,42 @@ export class DeployV1HttpController {
 
     if (output instanceof Response) return output;
     return json(validateDeployPlan(output));
+  });
+
+  @Endpoint({
+    summary: 'Get a registry push credential',
+    description: 'Returns a short-lived registry token scoped to the tenant repository path. The controller mints it as the registry token service; pushes go straight to the registry.',
+    requestBody: {
+      content: {
+        'application/json': {
+          schema: Empty.jsonSchema,
+        },
+      },
+      required: true,
+    },
+    responses: {
+      '200': {
+        description: 'Get a registry push credential',
+      content: {
+        'application/json': {
+          schema: PushCredential.jsonSchema,
+        },
+      },
+      },
+    },
+  })
+  static pushCredential = routes.post('/v1/deploy/push-credential', async (request) => {
+    const self = useContainer().resolve(DeployV1HttpController);
+    const body = (request as { content?: unknown }).content;
+    const command = validateEmpty(body);
+
+    const output = await self.handlers.pushCredential(command, {
+      transport: 'http' as const,
+      request,
+    });
+
+    if (output instanceof Response) return output;
+    return json(validatePushCredential(output));
   });
 }
 

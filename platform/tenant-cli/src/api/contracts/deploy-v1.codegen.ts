@@ -1,4 +1,4 @@
-import { DeployBundle, Deployment, DeployPlan } from './api.schemas.ts';
+import { DeployBundle, Deployment, DeployPlan, Empty, PushCredential } from './api.schemas.ts';
 import { manifest, operation } from './manifest.ts';
 
 const schema = { module: './api.schemas.ts' };
@@ -9,7 +9,9 @@ export default manifest(
   {
     DeployBundle: { schema: DeployBundle, ...schema },
     DeployPlan: { schema: DeployPlan, ...schema },
+    Empty: { schema: Empty, ...schema },
     Deployment: { schema: Deployment, ...schema },
+    PushCredential: { schema: PushCredential, ...schema },
   },
   [
     operation(
@@ -37,6 +39,19 @@ export default manifest(
       },
       'DeployBundle',
       'Deployment',
+    ),
+    operation(
+      'pushCredential',
+      {
+        method: 'POST',
+        path: '/deploy/push-credential',
+        successStatus: 200,
+        summary: 'Get a registry push credential',
+        description:
+          'Returns a short-lived registry token scoped to the tenant repository path. The controller mints it as the registry token service; pushes go straight to the registry.',
+      },
+      'Empty',
+      'PushCredential',
     ),
   ],
 );

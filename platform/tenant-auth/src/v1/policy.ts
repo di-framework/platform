@@ -20,6 +20,8 @@ export const POLICY: Record<OperationName, readonly Role[]> = {
   // server-side dry-run through `asUser()`, which a viewer's RBAC would not permit.
   previewDeploy: EVERYONE,
   deploy: DEVELOPERS,
+  // Developer-only: a push credential writes to the tenant's registry path.
+  pushCredential: DEVELOPERS,
   createService: DEVELOPERS,
   logs: EVERYONE,
   proxy: DEVELOPERS,

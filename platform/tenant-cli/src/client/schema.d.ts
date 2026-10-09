@@ -104,6 +104,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/deploy/push-credential": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Get a registry push credential
+         * @description Returns a short-lived registry token scoped to the tenant repository path. The controller mints it as the registry token service; pushes go straight to the registry.
+         */
+        post: operations["pushCredential"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/deployments": {
         parameters: {
             query?: never;
@@ -371,6 +391,19 @@ export interface components {
             bindings: components["schemas"]["Binding"][];
             /** @description Names of tenant secrets the workload references; values never travel. */
             secrets: string[];
+        };
+        /** @description A short-lived bearer token for the registry token-auth flow, scoped to the tenant repository path. It is never a shared registry secret. */
+        PushCredential: {
+            /** @description Registry host the token is valid for. */
+            registry: string;
+            /** @description Repository path the token is scoped to; push to references under it. */
+            repository: string;
+            /** @description Bearer token to present to the registry. */
+            token: string;
+            /** @description Granted access, for example `repository:acme/*:pull,push`. */
+            scope: string;
+            /** Format: date-time */
+            expiresAt: string;
         };
         DeployChange: {
             /** @enum {string} */
@@ -677,6 +710,41 @@ export interface operations {
                         env: "prod" | "staging";
                         service: string;
                         changes: components["schemas"]["DeployChange"][];
+                    };
+                };
+            };
+        };
+    };
+    pushCredential: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description Get a registry push credential */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description Registry host the token is valid for. */
+                        registry: string;
+                        /** @description Repository path the token is scoped to; push to references under it. */
+                        repository: string;
+                        /** @description Bearer token to present to the registry. */
+                        token: string;
+                        /** @description Granted access, for example `repository:acme/*:pull,push`. */
+                        scope: string;
+                        /** Format: date-time */
+                        expiresAt: string;
                     };
                 };
             };
