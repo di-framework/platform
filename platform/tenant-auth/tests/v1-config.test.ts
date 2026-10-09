@@ -53,6 +53,14 @@ const api = serve((request) => {
   if (!match) return json({ message: 'unexpected' }, 500);
   const [, kind, name] = match;
   const key = `${kind}/${name}`;
+  // RBAC per token, like the platform's Roles (#112): a member's `sa-*` token may only create,
+  // update and delete Secrets; the controller's own token (`admin`) may read them.
+  if (
+    kind === 'secrets' &&
+    request.headers.get('authorization')?.startsWith('Bearer sa-') &&
+    !['POST', 'PUT', 'DELETE'].includes(request.method)
+  )
+    return json({ message: `secrets is forbidden: cannot ${request.method}` }, 403);
   const notFound = () => json({ message: `${kind} "${name}" not found` }, 404);
   switch (request.method) {
     case 'GET': {
@@ -198,6 +206,46 @@ describe('storage names', () => {
   });
 });
 
+describe('write-only Secrets for developers (#112)', () => {
+  const direct = (method: string, path: string, token: string, body?: string) =>
+    fetch(`${api.url}${path}`, {
+      method,
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body,
+    });
+
+  test('a developer token cannot get, list, watch or patch Secrets; the controller can read', async () => {
+    store.set('secrets/db.prod', stamp({ metadata: { name: 'db.prod' }, data: { DB: 'eA==' } }));
+    for (const [method, path] of [
+      ['GET', `${NS}/secrets/db.prod`],
+      ['GET', `${NS}/secrets`],
+      ['GET', `${NS}/secrets?watch=true`],
+      ['PATCH', `${NS}/secrets/db.prod`],
+    ] as const)
+      expect(
+        (await direct(method, path, 'sa-alice', method === 'PATCH' ? '{}' : undefined)).status,
+      ).toBe(403);
+    expect((await direct('GET', `${NS}/secrets/db.prod`, 'admin')).status).toBe(200);
+    expect((await direct('GET', `${NS}/secrets`, 'admin')).status).toBe(200);
+  });
+
+  test('no /v1 response carries a Secret value', async () => {
+    const responses = [
+      await call('PUT', '/v1/secrets/db-password?env=prod', 'hidden-value'),
+      await call('PATCH', '/v1/secrets/db-password?env=prod', 'hidden-value'),
+      await call('GET', '/v1/secrets?env=prod'),
+      await call('PUT', '/v1/vars/DB_PASSWORD?env=prod', 'v'),
+      await call('PUT', '/v1/secrets/db-password?env=prod', 'hidden-value'),
+      await call('DELETE', '/v1/secrets/db-password?env=prod'),
+    ];
+    for (const response of responses) {
+      const text = await response.text();
+      expect(text).not.toContain('hidden-value');
+      expect(text).not.toContain(btoa('hidden-value'));
+    }
+  });
+});
+
 describe('secrets', () => {
   test('set, list, update and unset as the calling user, never returning values', async () => {
     expect((await call('PUT', '/v1/secrets/db-password?env=prod', 's3cret')).status).toBe(204);
@@ -233,9 +281,14 @@ describe('secrets', () => {
     const calls = kubeCalls();
     expect(calls.length).toBeGreaterThan(0);
     for (const request of calls) {
-      expect(request.headers.get('authorization')).toBe('Bearer sa-alice');
       expect(request.pathname.startsWith(NS)).toBe(true);
-      if (request.method !== 'GET') expect(request.pathname.startsWith(`${NS}/secrets`)).toBe(true);
+      // Secret reads run as the controller; every write runs as the caller, never as a PATCH.
+      const secret = request.pathname.startsWith(`${NS}/secrets`);
+      expect(request.headers.get('authorization')).toBe(
+        secret && request.method === 'GET' ? 'Bearer admin' : 'Bearer sa-alice',
+      );
+      expect(request.method).not.toBe('PATCH');
+      if (request.method !== 'GET') expect(secret).toBe(true);
     }
     expect(calls.map((r) => r.method)).toContain('POST');
     expect(calls.map((r) => r.method)).toContain('DELETE');
@@ -426,7 +479,10 @@ describe('vars', () => {
     });
 
     for (const request of kubeCalls()) {
-      expect(request.headers.get('authorization')).toBe('Bearer sa-alice');
+      // The var/secret clash check reads the Secret as the controller (#112).
+      expect(request.headers.get('authorization')).toBe(
+        request.pathname.startsWith(`${NS}/secrets`) ? 'Bearer admin' : 'Bearer sa-alice',
+      );
       expect(request.pathname.startsWith(NS)).toBe(true);
       if (request.method !== 'GET')
         expect(request.pathname.startsWith(`${NS}/configmaps`)).toBe(true);

@@ -89,7 +89,9 @@ The script bundles both entrypoints with `Bun.build`, ships them in a ConfigMap 
 * ServiceAccounts `tenant-controller` and `tenant-console` in `di-runtime-<t>`.
 * RBAC for the controller only: `get` its own `Tenant`, `get`/`list` `User` CRs, `create`
   `serviceaccounts/token` in the platform namespace restricted by `resourceNames` to the tenant's
-  members, and Secrets in its own namespace for API keys. It cannot read tenant Secrets.
+  members, Secrets in its own namespace for API keys, and `get`/`list` on Secrets in
+  `di-tenant-<t>` (#112) so `/v1` can check tenant Secret names, labels and resourceVersions that
+  developers are not allowed to read. It never returns or logs Secret data.
 * A NetworkPolicy adding egress to the API server and the issuer; the tenant policy otherwise
   allows only tenant namespaces, DNS, and public `:443`.
 * Deployments (strategy `Recreate`, 200m CPU limits) and ClusterIP Services.
@@ -232,6 +234,14 @@ the `config: vars` label, the endpoints refuse to write it (409); they never ado
 The endpoints only touch Secrets that carry the `config: secret` label; values never leave the
 controller on read. Writes carry the `resourceVersion` they read (replace and delete), so a
 concurrent write, or a create that races another, is a 409 `changed concurrently; retry`.
+
+**Write-only for developers (#112).** The `di-developer` Role grants Secrets `create`, `update`
+and `delete` only: no `get`, `list` or `watch`, and no `patch`, whose response returns the whole
+object. Viewers have no Secret access. Every Secret read the endpoints and deploy need (the list
+of names and update times, the `resourceVersion` read before replace and delete, the existence
+and label checks, the var/secret clash checks) runs as the tenant controller's own ServiceAccount;
+every Secret write runs as the calling user, as a `POST` create or a `PUT` full replace, never a
+`PATCH`. No response or log carries Secret data.
 
 **One name, one source.** A var and a secret that map to the same environment variable name in
 the same environment are a conflict. The endpoints refuse it at write time with 409: setting a

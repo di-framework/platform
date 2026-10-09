@@ -314,7 +314,10 @@ function tenantResources(
           resources: ['backingservices', 'servicebindings'],
           verbs: editVerbs,
         },
-        { apiGroups: [''], resources: ['services', 'secrets', 'configmaps'], verbs: editVerbs },
+        { apiGroups: [''], resources: ['services', 'configmaps'], verbs: editVerbs },
+        // Write-only Secrets (#112): no get/list/watch, and no patch, whose response returns the
+        // whole object. The tenant controller reads names and labels with its own ServiceAccount.
+        { apiGroups: [''], resources: ['secrets'], verbs: ['create', 'update', 'delete'] },
         { apiGroups: [''], resources: ['events'], verbs: readVerbs },
       ],
     }),

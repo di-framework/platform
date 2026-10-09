@@ -61,6 +61,13 @@ describe('/v1/deploy', () => {
       (rejectToken === 'workloads' && request.pathname.startsWith(WORKLOADS))
     )
       return json({ message: 'Unauthorized' }, 401);
+    // RBAC per token (#112): a member's `sa-*` token may not read or patch Secrets.
+    if (
+      request.pathname.startsWith(`${CORE}/secrets`) &&
+      request.headers.get('authorization')?.startsWith('Bearer sa-') &&
+      ['GET', 'PATCH'].includes(request.method)
+    )
+      return json({ message: 'secrets is forbidden' }, 403);
     if (request.method === 'GET') {
       const object = stored.get(request.pathname);
       return object ? json(object) : json({ message: 'not found' }, 404);
@@ -205,13 +212,13 @@ describe('/v1/deploy', () => {
     template.service = { name: 'svc' };
     for (const path of ['/v1/deploy/preview', '/v1/deploy']) {
       expect((await post(path, bundle)).status).toBeLessThan(300);
-      // Each named Secret was read as the caller before applying.
+      // Each named Secret was checked as the controller before applying (#112).
       for (const object of ['api-token.staging', 'db.staging'])
         expect(
           api.requests
             .find((r) => r.method === 'GET' && r.pathname === `${CORE}/secrets/${object}`)
             ?.headers.get('authorization'),
-        ).toBe('Bearer sa-di-user-alice');
+        ).toBe('Bearer admin');
       const applied = JSON.parse(patches().at(-1)?.body ?? '') as {
         metadata: { labels: Json };
         spec: { template: { spec: { components: Json[]; service: Json } } };

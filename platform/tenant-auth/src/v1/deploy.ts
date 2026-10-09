@@ -86,7 +86,11 @@ async function configRefs(
     return unprocessable(`${varsConfigMapName(env)} is not a tenant vars ConfigMap for ${env}`);
   for (const name of bundle.secrets) {
     const object = secretObjectName(name, env);
-    const secret = await find(user, `${namespacePath(context)}/secrets/${object}`);
+    // Developers cannot read Secrets (#112): the existence and label check runs as the controller.
+    const secret = await find(
+      context.asController(),
+      `${namespacePath(context)}/secrets/${object}`,
+    );
     if (!secret) return unprocessable(`secret ${name} does not exist in ${env}`);
     const labels = secret.metadata.labels ?? {};
     if (labels[CONFIG] !== 'secret' || labels[ENV] !== env || labels[SECRET] !== name)

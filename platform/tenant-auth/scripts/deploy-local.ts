@@ -360,6 +360,25 @@ const manifests: unknown[] = [
     },
     subjects: [{ kind: 'ServiceAccount', name: 'tenant-controller', namespace }],
   },
+  // Developers can write Secrets but not read them (#112): `/v1` reads tenant Secret names,
+  // labels and resourceVersions in the tenant namespace as the controller's own ServiceAccount.
+  {
+    apiVersion: 'rbac.authorization.k8s.io/v1',
+    kind: 'Role',
+    metadata: { name: 'tenant-controller-secret-reader', namespace: `di-tenant-${tenant}`, labels },
+    rules: [{ apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list'] }],
+  },
+  {
+    apiVersion: 'rbac.authorization.k8s.io/v1',
+    kind: 'RoleBinding',
+    metadata: { name: 'tenant-controller-secret-reader', namespace: `di-tenant-${tenant}`, labels },
+    roleRef: {
+      apiGroup: 'rbac.authorization.k8s.io',
+      kind: 'Role',
+      name: 'tenant-controller-secret-reader',
+    },
+    subjects: [{ kind: 'ServiceAccount', name: 'tenant-controller', namespace }],
+  },
   // The tenant egress policy allows only tenant namespaces, DNS, and public :443; add the API server and the issuer.
   {
     apiVersion: 'networking.k8s.io/v1',

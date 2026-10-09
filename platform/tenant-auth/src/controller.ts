@@ -309,6 +309,7 @@ export class Controller {
         tenant: this.config.tenant,
         principal,
         asUser: () => asUser(this.kube, this.userTokens, principal),
+        asController: () => this.kube,
         audit: (event, fields) => this.audit(event, fields),
       });
     return status(404, 'NotFound', `${url.pathname} is not a controller endpoint`);
