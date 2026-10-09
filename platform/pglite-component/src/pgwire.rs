@@ -126,15 +126,22 @@ fn password_message(secret: &str) -> Vec<u8> {
     framed(b'p', &payload)
 }
 
+/// PostgreSQL wire-protocol MD5 challenge response (RFC 1321 via `md5` crate).
+///
+/// This is **not** password storage: the server sends a 4-byte salt during the
+/// startup handshake and mandates `md5(password + user) + salt` as the reply
+/// when it selects auth method 5. We compute it transiently and never persist
+/// the digest. SCRAM is unsupported by this embedded engine build, so MD5 is
+/// protocol-required, not a chosen KDF. Changing it would break the handshake.
 fn md5_password(password: &str, user: &str, salt: &[u8]) -> String {
     let mut first = Vec::new();
     first.extend_from_slice(password.as_bytes());
     first.extend_from_slice(user.as_bytes());
-    let inner = format!("{:x}", md5::compute(first));
+    let inner = format!("{:x}", md5::compute(first)); // NOSONAR -- PG-wire mandated challenge response, not password storage
     let mut second = Vec::new();
     second.extend_from_slice(inner.as_bytes());
     second.extend_from_slice(salt);
-    format!("md5{:x}", md5::compute(second))
+    format!("md5{:x}", md5::compute(second)) // NOSONAR -- PG-wire mandated challenge response, not password storage
 }
 
 /// Fields of an `ErrorResponse`: `(field code, text)`.

@@ -3,9 +3,20 @@ use crate::di_framework::pglite_engine::engine;
 use std::{
     cell::RefCell,
     collections::VecDeque,
+    ffi::OsStr,
     fs,
     path::{Component, Path, PathBuf},
 };
+
+/// Bundled PostgreSQL major version this component was built against.
+///
+/// Must stay in sync with the engine recipe (`PG_VERSION=17.5` in
+/// `scripts/build-engine.sh` via `PGLITE_SOURCE_REF`) and with
+/// `server_version()` in `lib.rs`. The smoke consumer asserts
+/// `version.contains("17.5")`.
+pub(crate) const POSTGRES_VERSION: &str = "17.5";
+/// Major version recorded in `PG_VERSION` for a compatible data directory.
+const POSTGRES_MAJOR: &str = "17";
 
 include!(concat!(env!("OUT_DIR"), "/assets.rs"));
 
@@ -94,7 +105,14 @@ impl Transport {
             return Err("incomplete response from embedded engine".into());
         }
         for byte in out {
-            *byte = self.replies.pop_front().unwrap();
+            // Length was checked above, so a missing byte is unreachable;
+            // return an error instead of panicking (`panic=abort` would trap
+            // the whole engine).
+            let next = self
+                .replies
+                .pop_front()
+                .ok_or_else(|| "incomplete response from embedded engine".to_string())?;
+            *byte = next;
         }
         Ok(())
     }
@@ -110,21 +128,69 @@ impl Drop for Transport {
     }
 }
 
+fn install_asset(runtime: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+    let path = runtime.join(name);
+    // Version-aware: byte comparison refreshes stale assets after an upgrade
+    // and heals truncated files left by a crash mid-boot. Skipping only when
+    // bytes already match keeps warm boots fast.
+    if fs::read(&path).ok().as_deref() == Some(bytes) {
+        return Ok(());
+    }
+    // `parent()` is `None` only for a bare prefix (`""`/`/`); asset names are
+    // always relative (`share/...`, `runtime/password`, ...). Never panic here:
+    // `panic=abort` would trap the whole engine.
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("invalid asset path: {name:?}"))?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("create asset dir {}: {e}", parent.display()))?;
+    // Atomic install: write to a temp file in the same directory, fsync it,
+    // then rename over the destination so a crash never leaves a truncated
+    // file that later boots would mistake for valid.
+    let tmp = {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(OsStr::new(".di-tmp"));
+        PathBuf::from(tmp)
+    };
+    fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    // The bootstrap password is a secret: restrict it even if the host mount
+    // defaults to world-readable files.
+    if name == "password" || name.ends_with("/password") {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        }
+    }
+    fs::File::open(&tmp)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("sync {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("install {}: {e}", path.display()))?;
+    // Make the rename durable: sync the file and its containing directory.
+    fs::File::open(&path)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("sync {}: {e}", path.display()))?;
+    fs::File::open(parent)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("sync dir {}: {e}", parent.display()))?;
+    Ok(())
+}
+
 fn boot(root: &Path) -> Result<(), String> {
     let runtime = root.join("runtime");
     let data = root.join("data");
     fs::create_dir_all(&runtime).map_err(|e| format!("create runtime directory: {e}"))?;
     for (name, bytes) in ASSETS {
-        let path = runtime.join(name);
-        if !path.exists() {
-            fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
-            fs::write(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-        }
+        install_asset(&runtime, name, bytes)?;
     }
+    // Persist directory entries for newly installed assets.
+    fs::File::open(&runtime)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("sync runtime directory: {e}"))?;
     fs::create_dir_all(&data).map_err(|e| e.to_string())?;
     if data.join("PG_VERSION").exists() {
         let version = fs::read_to_string(data.join("PG_VERSION")).map_err(|e| e.to_string())?;
-        if version.trim() != "17" {
+        if version.trim() != POSTGRES_MAJOR {
             return Err(format!(
                 "incompatible PostgreSQL data version: {}",
                 version.trim()
@@ -183,8 +249,12 @@ fn boot(root: &Path) -> Result<(), String> {
     // filesystem before starting the backend, on both fresh and reused clusters.
     let conf = data.join("postgresql.conf");
     let mut config = fs::read_to_string(&conf).map_err(|e| e.to_string())?;
-    const DURABILITY: &str = "\n# di-framework embedded durability\nfsync = on\nsynchronous_commit = on\nfull_page_writes = on\n";
-    if !config.ends_with(DURABILITY) {
+    const DURABILITY_MARKER: &str = "di-framework embedded durability";
+    const DURABILITY: &str =
+        "\n# di-framework embedded durability\nfsync = on\nsynchronous_commit = on\nfull_page_writes = on\n";
+    // `contains` (not `ends_with`): an operator may append settings after our
+    // block, and a crash-retry must not duplicate the block on every boot.
+    if !config.contains(DURABILITY_MARKER) {
         config.push_str(DURABILITY);
         fs::write(&conf, config).map_err(|e| e.to_string())?;
         fs::File::open(&conf)
