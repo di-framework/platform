@@ -43,6 +43,29 @@ platform controller's tenant reconcile). The tenant CLI is `di-tenant` in `@di-f
 * **Audit**: one JSON line per login, refresh, logout, token mint, proxied request, key event,
   and denial. Tokens and keys never appear.
 
+## Image
+
+The controller and console ship as one container image, `ghcr.io/di-framework/tenant-auth`, built by
+`platform/tenant-auth/Dockerfile` (context: the repository root). It bundles both entry points with
+`bun build --target bun` onto a stock `oven/bun` Alpine base (itself pinned by digest) and runs as uid
+1000 on a read-only root. The Deployment picks the process with `command`:
+
+* controller: `bun /app/controller.js` (HTTPS, default `:8788`)
+* console: `bun /app/console.js` (HTTP, default `:8787`)
+
+A container image was chosen over an OCI bundle on a stock Bun image because Kubernetes pulls and
+verifies it natively by digest, with no init step or volume plugin, and one digest pins both the code
+and the runtime. This replaces the ConfigMap bundle.
+
+Maintainers publish it with the `Publish tenant-auth image` workflow (`workflow_dispatch`); the
+workflow summary prints the reference. **Pin consumers by digest**, never by tag:
+
+```yaml
+image: ghcr.io/di-framework/tenant-auth@sha256:<digest from the workflow summary>
+```
+
+Publishing needs the organization to allow Actions to write packages (issue #13).
+
 ## Deploy into a local cluster
 
 ```sh
