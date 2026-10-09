@@ -66,6 +66,10 @@
         "@di-framework/repo",
       ],
     },
+    "platform/oci-registry": {
+      "name": "@di-framework/oci-registry",
+      "version": "6.0.9",
+    },
     "platform/pglite-component": {
       "name": "@di-framework/pglite-component",
       "version": "6.0.9",
@@ -151,6 +155,8 @@
     "@di-framework/core": ["@di-framework/core@5.3.7", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-1pprg25XRk7uCErGPJI9i11uAKafwShxMhJ4XuW+hxQQQgXegBWVVGMRDNHV5XguFoRCAP77+VxnP1OaWuNqGw=="],
 
     "@di-framework/http": ["@di-framework/http@6.0.6", "", { "dependencies": { "itty-router": "^5.0.22" }, "peerDependencies": { "@di-framework/core": "^6", "typescript": "^5" } }, "sha512-rwsJDUa7QxVz7HMd2YUd4DBRk3HV8FqCt9bTXRw+qt6ZcQO6ek1xRCjAcmZTw4jv/PcibpgwB5gxkWUftuwqZw=="],
+
+    "@di-framework/oci-registry": ["@di-framework/oci-registry@workspace:platform/oci-registry"],
 
     "@di-framework/pglite-component": ["@di-framework/pglite-component@workspace:platform/pglite-component"],
 

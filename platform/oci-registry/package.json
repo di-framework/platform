@@ -1,0 +1,21 @@
+{
+  "name": "@di-framework/oci-registry",
+  "version": "6.0.9",
+  "private": true,
+  "description": "Per-tenant OCI registry component authorized through the tenant controller (vendored from wasmCloud examples/oci-registry).",
+  "license": "Apache-2.0",
+  "author": "wasmCloud Team; @di-framework Contributors",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/di-framework/platform",
+    "directory": "platform/oci-registry"
+  },
+  "bugs": {
+    "url": "https://github.com/di-framework/platform/issues"
+  },
+  "homepage": "https://github.com/di-framework/platform",
+  "scripts": {
+    "build": "make build",
+    "test": "make test && bun test"
+  }
+}

@@ -1,0 +1,106 @@
+# Publish the tenant OCI registry component (platform/oci-registry) to
+# ghcr.io/di-framework/oci-registry as a canonical Wasm OCI artifact
+# (config application/vnd.wasm.config.v0+json, layer application/wasm).
+# Dispatch-only, like the tenant-auth and tenant host images. Auth is
+# GITHUB_TOKEN with packages: write. No registry secret is stored.
+name: Publish oci-registry component
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-oci-registry-component
+  cancel-in-progress: false
+
+env:
+  ORAS_VERSION: 1.3.4
+  ORAS_SHA256: f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454
+
+jobs:
+  publish:
+    name: Push ghcr.io/di-framework/oci-registry
+    # Publish only from main, so a published digest always maps to reviewed code.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Require di-framework/platform
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY}" != "di-framework/platform" ]]; then
+            echo "::error::This workflow publishes ghcr.io/di-framework/oci-registry and only runs in di-framework/platform"
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install build tools
+        run: bash platform/sqlite-component/scripts/install-tools.sh --rust
+
+      - name: Build and test the component
+        run: make -C platform/oci-registry test build
+
+      - name: Install oras
+        run: |
+          set -euo pipefail
+          archive="oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLo "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/${archive}"
+          echo "${ORAS_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/oras"
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/oras" oras
+          echo "${RUNNER_TEMP}/oras" >> "${GITHUB_PATH}"
+
+      - name: Push the component
+        id: push
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "${GHCR_TOKEN}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          cd platform/oci-registry/dist
+          # The Wasm OCI config (oci-wasm WasmConfig, what wkg and wash write):
+          # created, architecture "wasm", os "wasip2" and the layer digests.
+          created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          layer="sha256:$(sha256sum di-framework-oci-registry.wasm | cut -d' ' -f1)"
+          jq -n --arg created "${created}" --arg layer "${layer}" \
+            '{created: $created, architecture: "wasm", os: "wasip2", layerDigests: [$layer]}' \
+            > config.json
+          ref="ghcr.io/di-framework/oci-registry:${GITHUB_SHA}"
+          oras push "${ref}" \
+            --config config.json:application/vnd.wasm.config.v0+json \
+            --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --format go-template='{{.digest}}' \
+            di-framework-oci-registry.wasm:application/wasm > "${RUNNER_TEMP}/digest"
+          echo "digest=$(cat "${RUNNER_TEMP}/digest")" >> "${GITHUB_OUTPUT}"
+
+      - name: Record component digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ "${DIGEST}" != sha256:* ]]; then
+            echo "::error::oras push did not return a digest"
+            exit 1
+          fi
+          ref="ghcr.io/di-framework/oci-registry@${DIGEST}"
+          echo "Published ${ref}"
+          {
+            echo "### Tenant OCI registry component"
+            echo
+            echo '```'
+            echo "${ref}"
+            echo '```'
+            echo
+            echo "Wasm SHA-256: \`$(cut -d' ' -f1 < platform/oci-registry/dist/SHA256SUMS | head -1)\`"
+            echo
+            echo "Pin deployments to that digest. The ${GITHUB_SHA} tag is informational; only the digest is stable."
+          } >> "${GITHUB_STEP_SUMMARY}"

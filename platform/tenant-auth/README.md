@@ -252,6 +252,20 @@ that could answer without removing it: `dryRun`, `propagationPolicy` `Orphan` or
 (or `orphanDependents`), and a Secret that already has finalizers or a `deletionTimestamp`. The
 controller's kubectl proxy replaces the body of a successful Secret `DELETE` with a bare `Status`.
 
+Developers replace Secrets they cannot read, so the `tenant-secret-update` policy guards every
+Secret `UPDATE` by a `di-user-*` ServiceAccount (`stringData` is already folded into `data` when
+it runs). It denies, with these exact messages (cli-plugin-platform matches them to map the
+console's Secret reassignment errors):
+
+| Case | Message | CLI status |
+| --- | --- | --- |
+| the target is platform-managed (`di-binding-*`, `di-bs-*`) | `tenant users cannot update platform-managed di-binding-*/di-bs-* Secrets` | 403 |
+| the update drops a key the Secret already has | `tenant users may update a Secret only if it keeps every existing data key` | 409 |
+
+Same-key replaces (the `/v1` secret set and update, the CLI `<workload>-control` Secret) and
+updates that add keys stay allowed. Match by substring: a managed name may also trip the older
+`backend-config` message first.
+
 Write-only stops direct reads, not use: a developer can still deploy a workload that injects a
 tenant Secret of the env (`secretFrom`) and have it print the value in a response or a log.
 Managed `di-bs-*`/`di-binding-*` credentials stay blocked from injection by the workload policy.
@@ -312,6 +326,47 @@ staging share the namespace, so the suffix alone cannot tell which environment a
 in. A WorkloadDeployment without that label, or with a value other than `prod` or `staging` (for
 example one applied with kubectl), may reference neither a `di-vars-*` ConfigMap nor a tenant
 Secret.
+
+## Deploy history
+
+`/v1/deploy` and `/v1/deployments/rollback` store each deploy as a revision ConfigMap
+`di-deploy-<service>-<env>.<n>` in the tenant namespace (labels `deploy-revision: <n>`,
+service and env; annotations `revision-state` and `component`, plus `data.bundle` and its
+sha256 in `data.digest`). Within a service/env the integer `<n>` alone orders revisions and
+picks the rollback target; across services the list orders by `created-at`, then name. Lists
+read metadata only (`PartialObjectMetadataList`); rollback fetches the one bundle it re-applies.
+
+A deploy runs in this order: prune, reserve the revision as `pending` (on a 409 it takes the
+next `<n>`, at most `RESERVE_ATTEMPTS` times, then answers 409), apply, mark it `live` and the
+one it replaced `replaced`. A failed apply marks it `failed`. `deployments` lists `pending` and
+`failed` revisions with that status; `stats` does not count them, and rollback never targets
+them. Once the apply succeeded, a failure to mark the revisions is logged as
+`deploy.history-mark-failed` and the deploy still answers 202.
+
+**The workload names the running revision.** The deploy sets the annotation
+`platform.di-framework.dev/revision: <service>-<env>.<n>` on the WorkloadDeployment it applies
+(bundles cannot set it: they may only pass `app.di-framework.dev/` keys through). The running
+revision of a service/env is the one its live WorkloadDeployment names, whatever the
+ConfigMap marks say: list, stats and the default rollback target use it. A `pending` revision
+the workload names reads as `live`, and any other `live` revision as `replaced`, so history
+repairs itself after a crash between apply and mark and after out-of-order concurrent applies.
+Reads only report the repair (viewers stay read-only); the next deploy writes it.
+
+The namespace quota allows `count/configmaps: 100`, shared with `di-vars-<env>`, the `di-logs-*`
+projections and `kube-root-ca.crt`, so history is bounded (constants in `src/v1/deploy.ts`):
+
+* `HISTORY_PER_SERVICE_ENV = 10` revisions per service and env.
+* `HISTORY_TENANT_BUDGET = 40` revisions in the tenant, evicting the oldest across services
+  first. A revision a WorkloadDeployment runs is never evicted; the last revision of a
+  destroyed or renamed service is.
+
+If the revisions running workloads alone fill the budget (only possible when a tenant's
+`spec.resources.workloads` quota is above 40), the deploy answers 507 before anything is
+applied. Pruning happens before the revision is created. If the quota still refuses it (403
+`exceeded quota`), the deploy answers 507 before anything is applied. Revisions edited by hand
+out of this shape (non-integer label, name not matching the labels, bad `component`
+annotation, unknown state) are skipped and logged as `deploy.revision-skipped`. A rollback
+target whose `data.bundle` does not match `data.digest`, or is not a complete bundle, is a 422.
 
 ## HTTP surface
 

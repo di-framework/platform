@@ -44,9 +44,13 @@ jobs:
       - name: Build embedded PGlite component
         run: make -C platform/pglite-component tools-rust build
 
+      - name: Build and test tenant OCI registry component
+        run: make -C platform/oci-registry test lint build
+
       - name: Test
         env:
           PGLITE_REQUIRE_DIST: '1'
+          OCI_REGISTRY_REQUIRE_DIST: '1'
         run: bun test --coverage
 
       - name: Export coverage summary & Shields badge JSON

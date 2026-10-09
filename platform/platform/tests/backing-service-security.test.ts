@@ -436,6 +436,7 @@ describe('tenant RBAC, quotas, admission policies, and network isolation', () =>
       'test-servicebindings',
       'test-services',
       'test-tenant-secret-delete',
+      'test-tenant-secret-update',
       'test-workloads',
     ]);
     const workloads = policies.find((p) => p.metadata.name === 'test-workloads');
