@@ -231,6 +231,26 @@ export const schemas = {
     required: ['env', 'items'],
   },
 
+  SecretEntry: {
+    type: 'object',
+    description: 'A secret lists its name and update time only; its value never travels on read.',
+    properties: {
+      name: string,
+      updatedAt: dateTime,
+    },
+    required: ['name', 'updatedAt'],
+    additionalProperties: false,
+  },
+
+  SecretList: {
+    type: 'object',
+    properties: {
+      env: Environment,
+      items: { type: 'array', items: { $ref: '#/components/schemas/SecretEntry' } },
+    },
+    required: ['env', 'items'],
+  },
+
   ConfigValue: {
     type: 'object',
     properties: {

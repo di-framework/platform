@@ -4,11 +4,11 @@ import { useContainer } from '@di-framework/core/container';
 import { Component } from '@di-framework/core/decorators';
 import { Controller, Endpoint, json, TypedRouter } from '@di-framework/http';
 import { TenantControllerHandlers } from '../../../handlers';
-import { ConfigList, ConfigValue } from '../../../contracts/api.schemas';
+import { ConfigValue, SecretList } from '../../../contracts/api.schemas';
 import {
-  validateConfigList,
   validateConfigValue,
   validateEmpty,
+  validateSecretList,
 } from './contracts';
 
 const routes = TypedRouter();
@@ -27,7 +27,7 @@ export class SecretsV1HttpController {
         description: 'List secrets',
       content: {
         'application/json': {
-          schema: ConfigList.jsonSchema,
+          schema: SecretList.jsonSchema,
         },
       },
       },
@@ -44,7 +44,7 @@ export class SecretsV1HttpController {
     });
 
     if (output instanceof Response) return output;
-    return json(validateConfigList(output));
+    return json(validateSecretList(output));
   });
 
   @Endpoint({

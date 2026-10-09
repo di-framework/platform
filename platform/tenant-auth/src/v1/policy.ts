@@ -16,6 +16,8 @@ export const POLICY: Record<OperationName, readonly Role[]> = {
   authInfo: EVERYONE,
   whoami: EVERYONE,
   logout: EVERYONE,
+  // Viewer-allowed only because the preview is computed from reads; it must never become a
+  // server-side dry-run through `asUser()`, which a viewer's RBAC would not permit.
   previewDeploy: EVERYONE,
   deploy: DEVELOPERS,
   createService: DEVELOPERS,
@@ -24,7 +26,8 @@ export const POLICY: Record<OperationName, readonly Role[]> = {
   deployments: EVERYONE,
   deploymentStats: EVERYONE,
   rollback: DEVELOPERS,
-  secrets: EVERYONE,
+  // Developer-only: viewer RBAC has no Secret access, and allowing it would leak values via the raw proxy.
+  secrets: DEVELOPERS,
   setSecret: DEVELOPERS,
   updateSecret: DEVELOPERS,
   unsetSecret: DEVELOPERS,

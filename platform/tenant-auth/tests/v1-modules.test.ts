@@ -32,7 +32,6 @@ test('every contract operation declares a role policy, and a viewer is read-only
       'logs',
       'deployments',
       'deploymentStats',
-      'secrets',
       'vars',
     ].sort(),
   );

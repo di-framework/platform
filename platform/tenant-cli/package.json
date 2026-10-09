@@ -16,12 +16,15 @@
   "scripts": {
     "cli": "bun src/main.ts",
     "generate:api": "di-framework generate && bun scripts/generate-openapi.ts",
-    "generate:client": "bun x openapi-typescript api/v1/openapi.yaml -o src/client/schema.d.ts",
+    "generate:client": "openapi-typescript api/v1/openapi.yaml -o src/client/schema.d.ts",
     "generate": "bun run generate:api && bun run generate:client",
     "test": "bun test"
   },
   "dependencies": {
     "@di-framework/core": "^6.0.3",
     "@di-framework/http": "^6.0.3"
+  },
+  "devDependencies": {
+    "openapi-typescript": "7.13.0"
   }
 }

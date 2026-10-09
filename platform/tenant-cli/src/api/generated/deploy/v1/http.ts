@@ -4,7 +4,7 @@ import { useContainer } from '@di-framework/core/container';
 import { Component } from '@di-framework/core/decorators';
 import { Controller, Endpoint, json, TypedRouter } from '@di-framework/http';
 import { TenantControllerHandlers } from '../../../handlers';
-import { DeployBundle, Deployment, DeployPlan } from '../../../contracts/api.schemas';
+import { DeployBundle, DeployPlan, Deployment } from '../../../contracts/api.schemas';
 import {
   validateDeployBundle,
   validateDeployPlan,

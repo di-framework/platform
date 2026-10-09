@@ -36,6 +36,8 @@ describe('/v1 dispatch', () => {
       resolve: async (authorization: string | null) => {
         if (authorization === 'Bearer ok') return alice;
         if (authorization === 'Bearer viewer') return bob;
+        if (authorization === 'Bearer stranger') return { ...alice, role: 'owner' } as never;
+        if (authorization === 'Bearer roleless') return { ...alice, role: undefined } as never;
         throw new AuthError(401, 'a bearer token is required');
       },
       forget: () => {},
@@ -226,7 +228,6 @@ describe('/v1 dispatch', () => {
     test.each([
       ['GET', '/v1/deployments?env=prod', undefined],
       ['GET', '/v1/deployments/stats?env=prod', undefined],
-      ['GET', '/v1/secrets?env=prod', undefined],
       ['GET', '/v1/vars?env=prod', undefined],
       ['GET', '/v1/services/web/logs?env=prod', undefined],
       [
@@ -240,6 +241,7 @@ describe('/v1 dispatch', () => {
     });
 
     test.each([
+      ['GET', '/v1/secrets?env=prod', undefined, 'secrets'],
       ['PUT', '/v1/secrets/db?env=prod', '{"value":"s3cret"}', 'setSecret'],
       ['PATCH', '/v1/secrets/db?env=prod', '{"value":"s3cret"}', 'updateSecret'],
       ['DELETE', '/v1/secrets/db?env=prod', undefined, 'unsetSecret'],
@@ -265,6 +267,15 @@ describe('/v1 dispatch', () => {
       } as never);
       expect(reachedCluster('/v1')).toBe(false);
       expect(log).toHaveBeenCalledWith(expect.stringContaining('"request.denied"'));
+    });
+
+    test.each([
+      ['stranger', 'an owner may not call vars'],
+      ['roleless', 'a caller without a tenant role may not call vars'],
+    ])('a %s principal is refused with 403', async (bearer, detail) => {
+      const response = await call('GET', '/v1/vars?env=prod', { bearer });
+      expect(response.status).toBe(403);
+      expect(await problem(response)).toMatchObject({ status: 403, detail } as never);
     });
 
     test('a developer may call the operations a viewer may not', async () => {

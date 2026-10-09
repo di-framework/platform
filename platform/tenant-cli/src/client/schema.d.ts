@@ -475,6 +475,17 @@ export interface components {
             env: "prod" | "staging";
             items: components["schemas"]["ConfigEntry"][];
         };
+        /** @description A secret lists its name and update time only; its value never travels on read. */
+        SecretEntry: {
+            name: string;
+            /** Format: date-time */
+            updatedAt: string;
+        };
+        SecretList: {
+            /** @enum {string} */
+            env: "prod" | "staging";
+            items: components["schemas"]["SecretEntry"][];
+        };
         ConfigValue: {
             value: string;
         };
@@ -793,7 +804,7 @@ export interface operations {
                     "application/json": {
                         /** @enum {string} */
                         env: "prod" | "staging";
-                        items: components["schemas"]["ConfigEntry"][];
+                        items: components["schemas"]["SecretEntry"][];
                     };
                 };
             };
