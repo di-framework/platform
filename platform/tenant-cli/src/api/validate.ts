@@ -27,18 +27,26 @@ function resolve(schema: Schema): Schema {
   return target;
 }
 
+/** Every `type` value {@link validate} checks. */
+export const SUPPORTED_TYPES: ReadonlySet<string> = new Set([
+  'object',
+  'array',
+  'string',
+  'integer',
+  'boolean',
+]);
+
+/** Every `format` value {@link validate} checks; any other format fails closed. */
+export const SUPPORTED_FORMATS: ReadonlySet<string> = new Set(['date-time', 'uri', 'int32']);
+
 function checkFormat(format: string | undefined, value: string, at: string): void {
+  if (format !== undefined && !SUPPORTED_FORMATS.has(format))
+    throw new Error(`unsupported schema format ${JSON.stringify(format)} at ${at}`);
   if (format === 'date-time' && !(DATE_TIME.test(value) && !Number.isNaN(Date.parse(value))))
     throw new ValidationError(`${at} must be an RFC 3339 date-time`);
   if (format === 'uri' && !URL.canParse(value)) throw new ValidationError(`${at} must be a URI`);
 }
 
-/**
- * Checks a value against the subset of JSON Schema the `/v1` component schemas use: `$ref`,
- * `type` (object, array, string, integer, boolean), `enum`, `required`, `properties`,
- * `additionalProperties` (a schema or `false`), `items`, and the `date-time`, `uri` and `int32` formats.
- * Throws {@link ValidationError} naming the first offending location.
- */
 /** Every keyword {@link validate} enforces or deliberately ignores as an annotation. */
 export const SUPPORTED_KEYWORDS: ReadonlySet<string> = new Set([
   '$ref',
@@ -53,6 +61,12 @@ export const SUPPORTED_KEYWORDS: ReadonlySet<string> = new Set([
   'default',
 ]);
 
+/**
+ * Checks a value against the subset of JSON Schema the `/v1` component schemas use: `$ref`,
+ * `type` (object, array, string, integer, boolean), `enum`, `required`, `properties`,
+ * `additionalProperties` (a schema or `false`), `items`, and the `date-time`, `uri` and `int32` formats.
+ * Throws {@link ValidationError} naming the first offending location.
+ */
 export function validate(input: Schema, value: unknown, at = 'body'): void {
   const schema = resolve(input);
   if (schema.enum && !schema.enum.includes(value))
@@ -87,6 +101,8 @@ export function validate(input: Schema, value: unknown, at = 'body'): void {
       checkFormat(schema.format, value, at);
       return;
     case 'integer':
+      if (schema.format !== undefined && schema.format !== 'int32')
+        throw new Error(`unsupported schema format ${JSON.stringify(schema.format)} at ${at}`);
       if (!Number.isInteger(value)) throw new ValidationError(`${at} must be an integer`);
       if (schema.format === 'int32' && ((value as number) < -INT32 || (value as number) >= INT32))
         throw new ValidationError(`${at} must be a 32-bit integer`);

@@ -5,7 +5,14 @@ import deploy from '../src/api/contracts/deploy-v1.codegen.ts';
 import deployments from '../src/api/contracts/deployments-v1.codegen.ts';
 import services from '../src/api/contracts/services-v1.codegen.ts';
 import { schemas } from '../src/api/schemas.ts';
-import { coerceQuery, SUPPORTED_KEYWORDS, ValidationError, validate } from '../src/api/validate.ts';
+import {
+  coerceQuery,
+  SUPPORTED_FORMATS,
+  SUPPORTED_KEYWORDS,
+  SUPPORTED_TYPES,
+  ValidationError,
+  validate,
+} from '../src/api/validate.ts';
 
 test('additionalProperties false refuses undeclared fields, including inherited names', () => {
   const closed = {
@@ -31,6 +38,10 @@ test('every contract schema and parameter uses only keywords the validator suppo
     if (typeof schema !== 'object' || schema === null) return;
     for (const [key, value] of Object.entries(schema)) {
       if (!SUPPORTED_KEYWORDS.has(key)) unsupported.push(`${at}.${key}`);
+      else if (key === 'type' && !SUPPORTED_TYPES.has(value as string))
+        unsupported.push(`${at}.type=${JSON.stringify(value)}`);
+      else if (key === 'format' && !SUPPORTED_FORMATS.has(value as string))
+        unsupported.push(`${at}.format=${JSON.stringify(value)}`);
       if (key === 'properties')
         for (const [name, child] of Object.entries(value as object)) walk(child, `${at}.${name}`);
       else if (key === 'items' || (key === 'additionalProperties' && typeof value === 'object'))
@@ -45,6 +56,17 @@ test('every contract schema and parameter uses only keywords the validator suppo
   expect(unsupported).toEqual([]);
   walk({ minLength: 1 }, 'probe');
   expect(unsupported).toEqual(['probe.minLength']);
+  walk({ type: 'number', format: 'email' }, 'probe');
+  expect(unsupported).toEqual(['probe.minLength', 'probe.type="number"', 'probe.format="email"']);
+});
+
+test('an unknown format fails closed', () => {
+  expect(() => validate({ type: 'string', format: 'email' }, 'a@b.c')).toThrow(
+    'unsupported schema format "email"',
+  );
+  expect(() => validate({ type: 'integer', format: 'int64' }, 1)).toThrow(
+    'unsupported schema format "int64"',
+  );
 });
 
 const fails = (schema: object, value: unknown, message: string) => {
