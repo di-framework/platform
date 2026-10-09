@@ -141,10 +141,19 @@ export async function dispatch(request: Request): Promise<Response | undefined> 
     if (bytes === undefined)
       return problem(413, 'Content Too Large', `the request body exceeds ${MAX_BODY_BYTES} bytes`);
     const text = new TextDecoder().decode(bytes);
-    if (bytes.byteLength > 0) {
+    if (request.body !== null) {
+      // readCapped consumed the original stream, so forward a rebuilt request even when the
+      // body turned out empty (an empty chunked body or stream); otherwise the router would
+      // read a disturbed body.
       const headers = new Headers(request.headers);
       headers.delete('content-length');
-      forward = new Request(request.url, { method: request.method, headers, body: bytes });
+      headers.delete('transfer-encoding');
+      forward = new Request(request.url, {
+        method: request.method,
+        headers,
+        body: bytes.byteLength > 0 ? bytes : null,
+        signal: request.signal,
+      });
     }
     if (text !== '') {
       // 415 means a body was sent in a format the contract does not accept (RFC 9110 15.5.16).
@@ -159,7 +168,13 @@ export async function dispatch(request: Request): Promise<Response | undefined> 
       const headers = new Headers(request.headers);
       headers.set('content-type', 'application/json');
       headers.delete('content-length');
-      forward = new Request(request.url, { method: request.method, headers, body: '{}' });
+      headers.delete('transfer-encoding');
+      forward = new Request(request.url, {
+        method: request.method,
+        headers,
+        body: '{}',
+        signal: request.signal,
+      });
     }
   } catch (error) {
     if (error instanceof ValidationError) return problem(400, 'Bad Request', error.message);

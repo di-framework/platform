@@ -121,15 +121,64 @@ test('a chunked body over the cap gets its 413 while the client is still streami
 
 test('a streamed body under the cap with multi-byte characters is read whole', async () => {
   const value = 'é'.repeat(1000);
-  const response = await dispatch(
-    new Request('http://controller.test/v1/secrets/db?env=prod', {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: new Blob([JSON.stringify({ value })]).stream(),
-    }),
-  );
-  expect(response?.status).not.toBe(400);
-  expect(response?.status).not.toBe(413);
+  const handlers = useContainer().resolve(TenantControllerHandlers);
+  const original = handlers.setSecret;
+  let received: unknown;
+  handlers.setSecret = (async (command: unknown) => {
+    received = command;
+    return new Response(null, { status: 204 });
+  }) as never;
+  try {
+    const response = await dispatch(
+      new Request('http://controller.test/v1/secrets/db?env=prod', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: new Blob([JSON.stringify({ value })]).stream(),
+      }),
+    );
+    expect(response?.status).toBe(204);
+    expect(received).toEqual({ value });
+  } finally {
+    handlers.setSecret = original;
+  }
+});
+
+test('a DELETE with a present but empty streamed body reaches its handler', async () => {
+  for (const path of ['/v1/vars/a?env=prod', '/v1/secrets/a?env=prod']) {
+    const response = await dispatch(
+      new Request(`http://controller.test${path}`, {
+        method: 'DELETE',
+        body: new ReadableStream({ start: (c) => c.close() }),
+      }),
+    );
+    expect(response?.status).toBe(501);
+  }
+});
+
+test('the forwarded request keeps the caller abort signal', async () => {
+  const handlers = useContainer().resolve(TenantControllerHandlers);
+  const original = handlers.setSecret;
+  let signal: AbortSignal | undefined;
+  handlers.setSecret = (async (_command: unknown, context: { request: Request }) => {
+    signal = context.request.signal;
+    return new Response(null, { status: 204 });
+  }) as never;
+  const controller = new AbortController();
+  try {
+    await dispatch(
+      new Request('http://controller.test/v1/secrets/db?env=prod', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ value: 'x' }),
+        signal: controller.signal,
+      }),
+    );
+    expect(signal?.aborted).toBe(false);
+    controller.abort();
+    expect(signal?.aborted).toBe(true);
+  } finally {
+    handlers.setSecret = original;
+  }
 });
 
 test('errors other than validation failures propagate to the caller', async () => {
