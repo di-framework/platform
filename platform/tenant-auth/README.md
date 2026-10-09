@@ -239,6 +239,16 @@ var named like an existing secret's environment variable, or a secret whose envi
 is an existing var. The deploy lane (platform#55) must still reject a bundle that meets such a
 pair (for example one created out of band) with 422; it never picks a precedence.
 
+**HTTP host and labels (platform#101, #103).** A service's HTTP host is `<service>-<env>`
+(for example `greeter-staging`, `greeter-prod`), the WorkloadDeployment's own name, in every env.
+The deploy lane sets `config.host: <service>-<env>` on the `wasi:http` host interface (keeping
+its other `config` keys) and answers 422 to a bundle that sets a different `config.host`; leave
+it out or set it to that value. The proxy passthrough sends `Host: <service>-<env>` using the
+session's env. The WorkloadDeployment carries `app.kubernetes.io/managed-by: di-framework`,
+`app.kubernetes.io/name: <service>-<env>` (as cli-plugin-platform renders it) and
+`di-framework.dev/application: <service>` (the log projection key); ServiceBindings carry only
+`managed-by` plus the service and env labels.
+
 **WorkloadDeployment references (deploy lane, platform#55).** For a bundle deployed to `<env>`,
 the deploy lane sets the label `platform.di-framework.dev/env: <env>` on the WorkloadDeployment
 and **must** inject the same entries into every one of these paths:

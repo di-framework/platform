@@ -137,8 +137,8 @@ describe('services create and the service proxy', () => {
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   const created = () => api.requests.filter((r) => r.pathname.endsWith('/backingservices'));
-  const openSession = async (service = 'web', bearer = 'ok') => {
-    const response = await call('POST', `/v1/services/${service}/proxy`, { env: 'prod' }, bearer);
+  const openSession = async (service = 'web', bearer = 'ok', env = 'prod') => {
+    const response = await call('POST', `/v1/services/${service}/proxy`, { env }, bearer);
     expect(response.status).toBe(201);
     return (await response.json()) as { url: string; port: number; expiresAt: string };
   };
@@ -322,7 +322,7 @@ describe('services create and the service proxy', () => {
     expect(response.headers.get('x-service')).toBe('yes');
     expect(response.headers.get('set-cookie')).toBeNull();
     const seen = upstream.requests.at(-1);
-    expect(seen?.headers.get('host')).toBe('web');
+    expect(seen?.headers.get('host')).toBe('web-prod');
     expect(seen?.headers.get('x-trace')).toBe('t1');
     expect(seen?.headers.get('content-type')).toBe('text/plain');
     for (const name of ['authorization', 'cookie', 'proxy-authorization'])
@@ -469,7 +469,7 @@ describe('services create and the service proxy', () => {
       expect(response.status).toBe(200);
       const seen = upstream.requests.at(-1);
       expect(seen?.path).toBe(target);
-      expect(seen?.headers.get('host')).toBe('web');
+      expect(seen?.headers.get('host')).toBe('web-prod');
       expect(seen?.headers.get('x-forwarded-for')).toBe('127.0.0.1');
       expect(seen?.headers.get('x-forwarded-host')).toBe(new URL(base).host);
       expect(seen?.headers.get('x-forwarded-proto')).toBe('http');
@@ -478,6 +478,13 @@ describe('services create and the service proxy', () => {
       expect(readsAsExternal(seen?.headers as Headers)).toBe(true);
     },
   );
+
+  test('the passthrough sends the env-qualified host of the session (#101)', async () => {
+    const { url } = await openSession('web', 'ok', 'staging');
+    const response = await fetch(`${url}/x`, { headers: { authorization: 'Bearer ok' } });
+    expect(response.status).toBe(200);
+    expect(upstream.requests.at(-1)?.headers.get('host')).toBe('web-staging');
+  });
 
   test('without a known client address the request still reads as external', () => {
     const request = new Request('http://controller.test/x', { headers: { host: 'c.test' } });

@@ -9,6 +9,8 @@ import {
   test,
 } from 'bun:test';
 import { events } from '@di-framework/tenant-cli/client';
+// The platform's log projection, which writes what this endpoint reads (platform#103).
+import { applicationKey, logsConfigMap } from '../../platform/src/tenancy/log-projection.ts';
 import { Controller, configFromEnv } from '../src/controller.ts';
 import type { Principal } from '../src/identity.ts';
 import { KubeClient } from '../src/kube.ts';
@@ -195,6 +197,34 @@ describe('GET /v1/services/:service/logs', () => {
     expect(decodeURIComponent(list?.path ?? '')).toContain(
       'labelSelector=di-framework.dev/projection=logs,di-framework.dev/application=web',
     );
+  });
+
+  test('finds the projection written for a workload /v1/deploy rendered', async () => {
+    // The labels /v1/deploy renders on service web's WorkloadDeployment (deploy.test.ts).
+    const key = applicationKey({
+      name: 'web-prod',
+      labels: {
+        'app.kubernetes.io/managed-by': 'di-framework',
+        'app.kubernetes.io/name': 'web',
+        'di-framework.dev/application': 'web',
+        'di-framework.dev/service': 'web',
+        'platform.di-framework.dev/env': 'prod',
+      },
+    });
+    const projected = logsConfigMap('acme', 'di-tenant-acme', 'platform', key, [
+      '2020-01-01T10:00:00Z INFO hello',
+    ]);
+    expect(projected.metadata.name).toBe('di-logs-web');
+    listed = { metadata: { resourceVersion: '7' }, items: [projected] };
+    const response = await fetch(`${base}/web/logs?env=prod`);
+    expect(response.status).toBe(200);
+    expect(messages(await read(response))).toEqual(['hello']);
+    const list = api.requests.find((r) => r.pathname.endsWith('/configmaps'));
+    const selector = new URL(`http://x${list?.path}`).searchParams.get('labelSelector') ?? '';
+    for (const term of selector.split(',')) {
+      const [label, value] = term.split('=') as [string, string];
+      expect(projected.metadata.labels?.[label]).toBe(value);
+    }
   });
 
   test('tail keeps the newest lines', async () => {

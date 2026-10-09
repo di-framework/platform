@@ -154,7 +154,7 @@ const STRIPPED_RESPONSE = new Set([
 export function upstreamRequestHeaders(
   request: Request,
   url: URL,
-  service: string,
+  host: string,
   clientAddress?: string,
 ): Headers {
   const named = new Set(
@@ -166,7 +166,7 @@ export function upstreamRequestHeaders(
       return;
     headers.set(name, value);
   });
-  headers.set('host', service);
+  headers.set('host', host);
   headers.set('x-forwarded-for', clientAddress || 'unknown');
   headers.set('x-forwarded-host', request.headers.get('host') || url.host);
   headers.set('x-forwarded-proto', url.protocol.slice(0, -1));
@@ -244,7 +244,12 @@ export async function servePassthrough(
     request.method === 'GET' || request.method === 'HEAD' ? undefined : await readCapped(request);
   if (body === undefined && request.method !== 'GET' && request.method !== 'HEAD')
     return problem(413, 'Content Too Large', `the request body exceeds ${MAX_BODY_BYTES} bytes`);
-  const headers = upstreamRequestHeaders(request, url, service, options.clientAddress);
+  const headers = upstreamRequestHeaders(
+    request,
+    url,
+    `${service}-${session.env}`,
+    options.clientAddress,
+  );
   // An idle timeout, as the gateway has: re-armed on every body chunk, so long downloads and
   // streamed responses keep going while the service keeps sending.
   const idle = new AbortController();

@@ -22,6 +22,11 @@ import { INSTALLATION, type Resource, TENANT } from './resources';
 const PROJECTION = 'di-framework.dev/projection';
 /** Console application name the projection belongs to. */
 const APPLICATION = 'di-framework.dev/application';
+/** Label cli-plugin-platform and the tenant controller put on the objects they manage. */
+const MANAGED_BY = 'app.kubernetes.io/managed-by';
+const MANAGED_BY_VALUE = 'di-framework';
+/** Selects the WorkloadDeployments the projection (and storage reconcile) consider. */
+const MANAGED_SELECTOR = `${MANAGED_BY}=${MANAGED_BY_VALUE}`;
 /** Multi-member workload grouping set by the CLI on WorkloadDeployments. */
 const WORKLOAD = 'di-framework.dev/workload';
 /** WorkloadDeployment annotation; `"false"` opts out of guest (`wasi:logging`) lines. */
@@ -579,6 +584,9 @@ export {
   HOST_LINE,
   LOGS_ANNOTATION,
   LOGS_PREFIX,
+  MANAGED_BY,
+  MANAGED_BY_VALUE,
+  MANAGED_SELECTOR,
   MAX_HOST_LINES,
   MAX_LINE_LENGTH,
   MAX_LINES,
