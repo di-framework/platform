@@ -26,10 +26,10 @@ platform controller's tenant reconcile). The tenant CLI is `di-tenant` in `@di-f
   self-subject reviews so kubectl works). Permissions are the user's own, so developer and viewer
   roles, quotas, and admission policies apply unchanged. It also owns API keys (`/-/keys`), the
   member list (`/-/members`), and `/-/whoami`. It needs no OAuth client secret.
-* **Console** (`src/console.ts`): the OIDC relying party. It signs users in, hands the CLI the
-  identity-server access and refresh tokens, refreshes and revokes them on the CLI's behalf, and
+* **Console** (`src/console.ts`): the OIDC relying party. It signs users in and
   renders overview, logs, members, and API-key pages by calling the controller as the user. It
-  holds no cluster credential.
+  also serves `/cli/*` token endpoints (info, exchange, refresh, logout); no client in this repo
+  uses them now that the prototype CLI is removed. It holds no cluster credential.
 * **CLI** (`di-tenant` in `@di-framework/tenant-cli`): `login` runs the browser flow and stores a
   JSON credential (tokens and metadata, mode 0600) under `~/.di-framework`. It talks to the tenant
   controller only. See `platform/tenant-cli/README.md` for commands and flags.
@@ -92,9 +92,9 @@ bun scripts/deploy-local.ts --tenant acme ... \
 ```
 
 The `.localhost` issuer makes Bun use loopback, so the sidecar forwards the port to the platform
-gateway, which routes by `Host`.  A redeploy with new
-code rolls both pods: the pod template carries a digest of the bundle, because a ConfigMap update
-alone leaves the running processes on the old code.
+gateway, which routes by `Host`. A redeploy with new code rolls both pods: the pod template
+carries a digest of the bundle, because a ConfigMap update alone leaves the running processes on
+the old code.
 
 Verified on `authproto` on 2026-10-09 with the guest from identity-server `main` (Argon2 in the
 composed `pqc-subtle` component) and the tenant CLI pilot in `platform/tenant-cli`:
@@ -164,7 +164,7 @@ Controller: `GET /-/healthz` (open); `GET /-/whoami`, `GET|POST /-/keys`, `DELET
 `GET /-/members` (bearer); everything else is proxied to the API server under the path policy.
 
 Console: `GET /login` (+ `cli_callback`, `cli_state`), `GET /oidc/callback`, `GET /logout`,
-`GET /cli/info`, `POST /cli/exchange`, `POST /cli/refresh`, `POST /cli/logout`; pages `/`,
+`GET /cli/info`, `POST /cli/exchange`, `POST /cli/refresh`, `POST /cli/logout` (unused by any client in this repo now that the prototype CLI is removed); pages `/`,
 `/logs/:app`, `/members`, `/keys`, `POST /keys`, `POST /keys/:id/revoke`.
 
 ## Verified against `di-framework-kube` (instance `authproto`, tenant `acme`)
