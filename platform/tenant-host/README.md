@@ -15,6 +15,7 @@ links `wasi:tls/client,types@0.3.0-draft` alongside the default interfaces.
 - Patch: `postgres-invocation-lease.patch` is applied with `git apply --check` and then `git apply`, so a patch edit does not download wasmCloud again. The build also requires `release_store_lease` in `http_p3.rs`. The patch keeps
   one postgres connection for the invocation across `BEGIN` / `COMMIT` / `ROLLBACK`, and releases
   that lease when the HTTP call finishes, including when the guest stops before `COMMIT`.
+  This applies to both unnamed imports (`wasmcloud:postgres`) and named imports (service bindings).
   Queries outside a transaction keep upstream's bounded row channel. A query on the leased
   connection is buffered so the connection can be returned before the guest reads, and that
   buffer stops at 4096 rows or 8 MiB.

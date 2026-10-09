@@ -115,7 +115,7 @@ index 568fb16..8b18489 100644
 +fn transaction_boundary(sql: &str) -> TxBoundary {
 +    let statement = sql.trim().trim_end_matches(';').trim();
 +    let upper = statement.to_ascii_uppercase();
-+    if upper == "BEGIN" || upper.starts_with("BEGIN ") || upper == "START TRANSACTION" {
++    if upper == "BEGIN" || upper.starts_with("BEGIN ") || upper == "START TRANSACTION" || upper.starts_with("START TRANSACTION ") {
 +        TxBoundary::Begin
 +    } else if upper == "COMMIT" || upper.starts_with("COMMIT ") {
 +        TxBoundary::Commit
@@ -572,21 +572,49 @@ index 568fb16..8b18489 100644
          let client = match client_for(&plugin, &database).await {
              Ok(c) => c,
              Err(e) => return Ok(Err(e)),
-@@ -401,7 +747,7 @@ impl<U> bindings::named_imports::wasmcloud::postgres0_2_0::query::HostWithStore<
+@@ -401,19 +747,57 @@ impl<U> bindings::named_imports::wasmcloud::postgres0_2_0::query::HostWithStore<
              Ok(c) => c,
              Err(e) => return Ok(Err(Error::ConnectionFailed(e))),
          };
 -        stream_query(store, client, q, params).await
++        let store_id = store_id_of(store)?;
++        if let Some(lease) = current_lease(&self.plugin, &store_id).await {
++            let client = borrow_client(&lease).await;
++            return stream_query(store, client, q, params, Some(lease)).await;
++        }
 +        stream_query(store, client, q, params, None).await
      }
- 
+
      async fn query_batch(
-@@ -413,7 +759,7 @@ impl<U> bindings::named_imports::wasmcloud::postgres0_2_0::query::HostWithStore<
+         &mut self,
+         store: &Accessor<U, SharedCtx>,
+         database: String,
+         q: String,
+     ) -> wasmtime::Result<Result<(), Error>> {
+         let client = match get_named_client(&self.named_impl_pg, &database, None).await {
              Ok(c) => c,
              Err(e) => return Ok(Err(Error::ConnectionFailed(e))),
          };
 -        Ok(batch_with_client(client, q).await)
-+        Ok(batch_with_client(&client, q).await)
++        let store_id = store_id_of(store)?;
++        let boundary = transaction_boundary(&q);
++        if boundary == TxBoundary::Begin
++            && let Err(error) = pin_lease(&self.plugin, &store_id, &database).await
++        {
++            return Ok(Err(error));
++        }
++        if let Some(lease) = current_lease(&self.plugin, &store_id).await {
++            let client = borrow_client(&lease).await;
++            let result = batch_with_client(&client, q).await;
++            if result.is_ok() && matches!(boundary, TxBoundary::Commit | TxBoundary::Rollback) {
++                finish_lease(&self.plugin, &store_id).await;
++                drop(client);
++            } else {
++                return_client(lease, client).await;
++            }
++            return Ok(result);
++        }
+         Ok(batch_with_client(&client, q).await)
      }
  }
  
@@ -625,6 +653,18 @@ index 568fb16..8b18489 100644
 +            PgValue::Null,
 +        ];
 +        assert_eq!(row_payload_bytes(&row), 5 + 4);
++    }
++
++    #[test]
++    fn transaction_boundary_recognizes_abort() {
++        assert_eq!(transaction_boundary("ABORT"), TxBoundary::Rollback);
++        assert_eq!(transaction_boundary("  ABORT ;"), TxBoundary::Rollback);
++    }
++
++    #[test]
++    fn transaction_boundary_recognizes_start_transaction() {
++        assert_eq!(transaction_boundary("START TRANSACTION"), TxBoundary::Begin);
++        assert_eq!(transaction_boundary("START TRANSACTION READ ONLY"), TxBoundary::Begin);
 +    }
 +}
 diff --git a/crates/wash-runtime/src/plugin/wasmcloud_postgres/conversions.rs b/crates/wash-runtime/src/plugin/wasmcloud_postgres/conversions.rs
