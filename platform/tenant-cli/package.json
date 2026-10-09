@@ -1,7 +1,7 @@
 {
   "name": "@di-framework/tenant-cli",
-  "version": "0.0.0",
-  "private": true,
+  "version": "6.0.9",
+  "private": false,
   "type": "module",
   "license": "(MIT OR Apache-2.0)",
   "description": "Pilot tenant CLI: talks only to the tenant controller's OpenAPI contract with an identity-server credential; never to Kubernetes.",
@@ -10,14 +10,32 @@
     "url": "https://github.com/di-framework/platform",
     "directory": "platform/tenant-cli"
   },
+  "homepage": "https://github.com/di-framework/platform",
+  "files": [
+    "dist",
+    "api/v1/openapi.yaml",
+    "README.md"
+  ],
+  "exports": {
+    "./client": {
+      "types": "./dist/client/index.d.ts",
+      "bun": "./dist/client/index.js",
+      "import": "./dist/client/index.js",
+      "default": "./dist/client/index.js"
+    },
+    "./src/api/*": "./src/api/*",
+    "./tests/support/*": "./tests/support/*",
+    "./package.json": "./package.json"
+  },
   "bin": {
-    "di-tenant": "src/main.ts"
+    "di-tenant": "dist/main.js"
   },
   "scripts": {
     "cli": "bun src/main.ts",
     "generate:api": "di-framework generate && bun scripts/generate-openapi.ts",
     "generate:client": "openapi-typescript api/v1/openapi.yaml -o src/client/schema.d.ts",
     "generate": "bun run generate:api && bun run generate:client",
+    "build": "rm -rf dist && bun x tsc -p tsconfig.build.json && cp src/client/schema.d.ts dist/client/schema.d.ts && bun ../../scripts/fix-esm-imports.ts dist",
     "test": "bun test"
   },
   "dependencies": {

@@ -99,7 +99,27 @@ describe('run', () => {
     expect(err.at(-1)).toBe('--bundle is required');
     expect(await run(['services', 'list'], io())).toBe(1);
     expect(await run(['services', 'create', 'lambda', '--env', 'prod'], io())).toBe(1);
-    expect(err.at(-1)).toBe('service type must be http, cron, or worker');
+    expect(err.at(-1)).toBe(
+      'service type must be keyvalue, messaging, blobstore, postgres, or egress (http, cron and worker services come from deploy)',
+    );
+    expect(await run(['services', 'create', 'http', '--env', 'prod'], io())).toBe(1);
+    expect(
+      await run(
+        [
+          'services',
+          'create',
+          'postgres',
+          '--name',
+          'db',
+          '--env',
+          'prod',
+          '--deletion-policy',
+          'Keep',
+        ],
+        io(),
+      ),
+    ).toBe(1);
+    expect(err.at(-1)).toBe('--deletion-policy must be Retain or Delete');
     expect(await run(['deployments', 'prune', '--env', 'prod'], io())).toBe(1);
     expect(await run(['secrets', 'rotate', '--env', 'prod'], io())).toBe(1);
     expect(await run(['logs', '--service', 'web', '--env', 'prod', '--tail', 'x'], io())).toBe(1);
@@ -427,76 +447,66 @@ describe('run', () => {
     expect(JSON.parse(out.at(-1) as string)).toMatchObject({ message: 'ok' });
   });
 
-  test('services create carries the type-specific fields', async () => {
+  test('services create sends the backing-service fields', async () => {
     const { fetch, calls } = fakeFetch({
       'POST /v1/services': (call: Recorded) =>
-        json({ ...(call.body as object), createdAt: 'now' }, 201),
+        json({ className: 'postgres-dedicated', ...(call.body as object), createdAt: 'now' }, 201),
     });
     expect(
       await run(
         [
           'services',
           'create',
-          'worker',
+          'postgres',
           '--name',
-          'jobs',
+          'db',
           '--env',
           'prod',
-          '--command',
-          'bun run worker',
+          '--class',
+          'postgres-dedicated',
+          '--storage',
+          '1Gi',
+          '--deletion-policy',
+          'Retain',
         ],
         io(fetch),
       ),
     ).toBe(0);
     expect(calls[0]?.body).toEqual({
       env: 'prod',
-      type: 'worker',
-      name: 'jobs',
-      command: ['bun', 'run', 'worker'],
+      type: 'postgres',
+      name: 'db',
+      className: 'postgres-dedicated',
+      parameters: { storage: '1Gi' },
+      deletionPolicy: 'Retain',
     });
-    expect(out.at(-1)).toBe('created worker service jobs in prod');
+    expect(out.at(-1)).toBe('created postgres service db (postgres-dedicated) in prod');
     expect(
       await run(
         [
           'services',
           'create',
-          'http',
+          'egress',
           '--name',
-          'web',
+          'out',
           '--env',
           'prod',
-          '--port',
-          '8080',
-          '--route',
-          '/api',
+          '--destination',
+          'api.example.com:443,*.example.org',
         ],
         io(fetch),
       ),
     ).toBe(0);
     expect(calls[1]?.body).toEqual({
       env: 'prod',
-      type: 'http',
-      name: 'web',
-      port: 8080,
-      route: '/api',
+      type: 'egress',
+      name: 'out',
+      destinations: ['api.example.com:443', '*.example.org'],
     });
     expect(
-      await run(
-        [
-          'services',
-          'create',
-          'cron',
-          '--name',
-          'nightly',
-          '--env',
-          'prod',
-          '--schedule',
-          '0 2 * * *',
-        ],
-        io(fetch),
-      ),
+      await run(['services', 'create', 'keyvalue', '--name', 'cache', '--env', 'prod'], io(fetch)),
     ).toBe(0);
-    expect(calls[2]?.body).toMatchObject({ type: 'cron', schedule: '0 2 * * *' });
+    expect(calls[2]?.body).toEqual({ env: 'prod', type: 'keyvalue', name: 'cache' });
   });
 
   test('deployments list, stats, and rollback', async () => {
@@ -576,7 +586,7 @@ describe('run', () => {
     expect(err.at(-1)).toBe('usage: vars list|set|update|unset <name>');
   });
 
-  test('vars list shows values and proxy prints the tunnel', async () => {
+  test('vars list shows values and proxy prints the session', async () => {
     const { fetch } = fakeFetch({
       'GET /v1/vars': () =>
         json({
@@ -587,14 +597,19 @@ describe('run', () => {
           ],
         }),
       'POST /v1/services/web/proxy': () =>
-        json({ url: 'wss://controller.test/t/1', port: 8080, expiresAt: 'later' }, 201),
+        json(
+          { url: 'https://controller.test/v1/services/web/proxy/s1', port: 80, expiresAt: 'later' },
+          201,
+        ),
     });
     expect(await run(['vars', 'list', '--env', 'prod'], io(fetch))).toBe(0);
     expect(out.at(-1)).toBe('LEVEL=info\nEMPTY=');
     expect(
-      await run(['proxy', '--service', 'web', '--env', 'prod', '--port', '8080'], io(fetch)),
+      await run(['proxy', '--service', 'web', '--env', 'prod', '--port', '80'], io(fetch)),
     ).toBe(0);
-    expect(out.at(-1)).toBe('tunnel to port 8080: wss://controller.test/t/1 (until later)');
+    expect(out.at(-1)).toBe(
+      'proxy session until later: send HTTP requests to https://controller.test/v1/services/web/proxy/s1/<path> with your bearer, e.g. curl -H "Authorization: Bearer $TOKEN" https://controller.test/v1/services/web/proxy/s1/',
+    );
   });
 
   test('controller errors are reported with their status, other errors propagate', async () => {

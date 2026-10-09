@@ -330,6 +330,7 @@ export const deploy: V1Module = {
       { status: 202 },
     );
   }),
+  registry: notImplemented('registry'),
   deployments: notImplemented('deployments'),
   deploymentStats: notImplemented('deploymentStats'),
   rollback: notImplemented('rollback'),

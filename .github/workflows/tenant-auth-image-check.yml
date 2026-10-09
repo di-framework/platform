@@ -1,0 +1,57 @@
+# Build the tenant-auth image without pushing and smoke-check that both entry points start
+# (a configuration error, not an import error). Catches base-image and lockfile drift before a publish.
+name: Tenant-auth image build
+
+on:
+  pull_request:
+    paths:
+      - 'platform/tenant-auth/**'
+      - 'platform/tenant-cli/**'
+      - 'bun.lock'
+      - '.github/workflows/tenant-auth-image-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and smoke-test tenant-auth image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: platform/tenant-auth/Dockerfile
+          push: false
+          load: true
+          tags: tenant-auth:ci
+
+      - name: Smoke-check entry points
+        run: |
+          set -uo pipefail
+          for entry in controller console; do
+            code=0
+            out="$(docker run --rm tenant-auth:ci bun "/app/${entry}.js" 2>&1)" || code=$?
+            echo "${entry}: exit ${code}"
+            echo "${out}"
+            if [[ ${code} -eq 0 ]] || ! grep -q "is required" <<<"${out}"; then
+              echo "::error::${entry} did not fail with a configuration error"
+              exit 1
+            fi
+            if grep -qiE "cannot find|error: import|module not found" <<<"${out}"; then
+              echo "::error::${entry} hit an import error"
+              exit 1
+            fi
+            if [[ "${entry}" == controller ]] && ! grep -q "TENANT_CONTROLLER_TENANT is required" <<<"${out}"; then
+              echo "::error::controller did not report the missing TENANT_CONTROLLER_TENANT"
+              exit 1
+            fi
+          done

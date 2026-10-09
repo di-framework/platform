@@ -1,4 +1,4 @@
-import { DeployBundle, Deployment, DeployPlan } from './api.schemas.ts';
+import { DeployBundle, Deployment, DeployPlan, Empty, RegistryInfo } from './api.schemas.ts';
 import { manifest, operation } from './manifest.ts';
 
 const schema = { module: './api.schemas.ts' };
@@ -9,7 +9,9 @@ export default manifest(
   {
     DeployBundle: { schema: DeployBundle, ...schema },
     DeployPlan: { schema: DeployPlan, ...schema },
+    Empty: { schema: Empty, ...schema },
     Deployment: { schema: Deployment, ...schema },
+    RegistryInfo: { schema: RegistryInfo, ...schema },
   },
   [
     operation(
@@ -37,6 +39,19 @@ export default manifest(
       },
       'DeployBundle',
       'Deployment',
+    ),
+    operation(
+      'registry',
+      {
+        method: 'GET',
+        path: '/deploy/registry',
+        successStatus: 200,
+        summary: 'Get the tenant registry',
+        description:
+          "The tenant's own OCI registry: its URL and how to log in. Pull is open to viewers and developers; push needs developer. No credential is minted.",
+      },
+      'Empty',
+      'RegistryInfo',
     ),
   ],
 );

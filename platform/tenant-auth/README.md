@@ -43,6 +43,35 @@ platform controller's tenant reconcile). The tenant CLI is `di-tenant` in `@di-f
 * **Audit**: one JSON line per login, refresh, logout, token mint, proxied request, key event,
   and denial. Tokens and keys never appear.
 
+## Image
+
+The controller and console ship as one container image, `ghcr.io/di-framework/tenant-auth`, built by
+`platform/tenant-auth/Dockerfile` (context: the repository root). It bundles both entry points with
+`bun build --target bun` onto a stock `oven/bun` 1.4 Alpine base (itself pinned by digest) and runs as uid
+1000 on a read-only root. The Deployment picks the process with `command`:
+
+* controller: `bun /app/controller.js` (HTTPS, default `:8788`)
+* console: `bun /app/console.js` (HTTP, default `:8787`)
+
+A container image was chosen over an OCI bundle on a stock Bun image because Kubernetes pulls and
+verifies it natively by digest, with no init step or volume plugin, and one digest pins both the code
+and the runtime. It will replace the ConfigMap bundle when `:reconcile` lands. `:reconcile` must:
+
+* drop the `/app` ConfigMap mount (the code is in the image);
+* keep the `/tmp` emptyDir (the root filesystem is read-only);
+* set `TENANT_CONTROLLER_HOST=0.0.0.0` and `TENANT_CONSOLE_HOST=0.0.0.0`;
+* mount the TLS certificate and key (`TENANT_CONTROLLER_TLS_CERT`, `TENANT_CONTROLLER_TLS_KEY`);
+* use the image digest in place of the `bundle-digest` annotation.
+
+Maintainers publish it with the `Publish tenant-auth image` workflow (`workflow_dispatch`); the
+workflow summary prints the reference. **Pin consumers by digest**, never by tag:
+
+```yaml
+image: ghcr.io/di-framework/tenant-auth@sha256:<digest from the workflow summary>
+```
+
+Publishing needs the organization to allow Actions to write packages (issue #13).
+
 ## Deploy into a local cluster
 
 ```sh
@@ -167,6 +196,81 @@ renaming or removing one is a breaking change.
 | `TENANT_CONSOLE_PUBLIC_URL` | `http://<TENANT_CONSOLE_HOST>:<TENANT_CONSOLE_PORT>` | Browser-visible console URL |
 
 CLI: `di-tenant` in `@di-framework/tenant-cli`; see `platform/tenant-cli/README.md` for commands and flags.
+
+## Secrets and vars storage contract
+
+`/v1/secrets` and `/v1/vars` (platform#53) store tenant configuration in `di-tenant-<tenant>`,
+written with the caller's own identity. The deploy lane (platform#55) injects them as follows.
+
+**Vars.** One ConfigMap per environment:
+
+- name `di-vars-<env>` (`di-vars-prod`, `di-vars-staging`);
+- labels `platform.di-framework.dev/config: vars` and `platform.di-framework.dev/env: <env>`;
+- one data key per var, named like an environment variable (`^[A-Za-z_][A-Za-z0-9_]*$`), holding
+  its value;
+- annotation `platform.di-framework.dev/updated-at`: a JSON object mapping each var name to the
+  RFC 3339 time it was last written.
+
+The name `di-vars-<env>` is reserved by this contract. If a ConfigMap of that name exists without
+the `config: vars` label, the endpoints refuse to write it (409); they never adopt it.
+
+**Secrets.** One ordinary Secret per secret and environment:
+
+- name `<name>.<env>` (for example `db-password.prod`), where `<name>` is a DNS-1123 label that
+  starts with a letter (`^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$`, so the derived environment variable
+  name is valid) and is not a managed name (`di-binding-*`, `di-bs-*`; see `isManagedSecretName`);
+- labels `platform.di-framework.dev/config: secret`, `platform.di-framework.dev/env: <env>` and
+  `platform.di-framework.dev/secret: <name>`;
+- a single data key, the environment variable name of the secret: `<name>` upper-cased with `-`
+  replaced by `_` (`db-password` becomes `DB_PASSWORD`);
+- annotation `platform.di-framework.dev/updated-at` with the RFC 3339 time of the last write.
+
+The endpoints only touch Secrets that carry the `config: secret` label; values never leave the
+controller on read. Writes carry the `resourceVersion` they read (replace and delete), so a
+concurrent write, or a create that races another, is a 409 `changed concurrently; retry`.
+
+**One name, one source.** A var and a secret that map to the same environment variable name in
+the same environment are a conflict. The endpoints refuse it at write time with 409: setting a
+var named like an existing secret's environment variable, or a secret whose environment variable
+is an existing var. The deploy lane (platform#55) must still reject a bundle that meets such a
+pair (for example one created out of band) with 422; it never picks a precedence.
+
+**WorkloadDeployment references (deploy lane, platform#55).** For a bundle deployed to `<env>`,
+the deploy lane sets the label `platform.di-framework.dev/env: <env>` on the WorkloadDeployment
+and **must** inject the same entries into every one of these paths:
+
+- `spec.template.spec.components[].localResources.environment` (every component);
+- `spec.template.spec.service.localResources.environment`, when the rendered WorkloadDeployment
+  has a `service`, so the HTTP service and the components see the same config.
+
+```yaml
+configFrom:
+  - name: di-vars-<env>         # every var of the environment
+secretFrom:
+  - name: <secret>.<env>        # one entry per name in the bundle's `secrets`
+```
+
+so each var and each referenced secret reaches the workload as an environment variable. A bundle
+that names a secret with no `<secret>.<env>` Secret, or one without the labels above, is rejected
+with 422 (the same status as the var/secret conflict).
+
+**Reference rule for the tenant admission policy (platform#88).** This restricts what a
+WorkloadDeployment may *reference*; it does not restrict which Secrets or ConfigMaps tenants may
+create. On a WorkloadDeployment in `di-tenant-<t>`, every
+`spec.template.spec.components[].localResources.environment` and
+`spec.template.spec.service.localResources.environment` may reference only:
+
+- `configFrom[].name` equal to `di-vars-<env>`;
+- `secretFrom[].name` matching `^[a-z]([-a-z0-9]{0,61}[a-z0-9])?\.<env>$` (the `<name>` rule
+  above, then `.<env>`), where the part before the dot is not a managed name
+  (`isManagedSecretName`: `di-binding-*`, `di-bs-*`).
+
+`<env>` is the value of the WorkloadDeployment's `platform.di-framework.dev/env` label: the
+`.<env>` suffix of every referenced Secret and the `di-vars-<env>` name must equal it. Prod and
+staging share the namespace, so the suffix alone cannot tell which environment a workload runs
+in. A WorkloadDeployment without that label, or with a value other than `prod` or `staging` (for
+example one applied with kubectl), may reference neither a `di-vars-*` ConfigMap nor a tenant
+Secret.
 
 ## HTTP surface
 

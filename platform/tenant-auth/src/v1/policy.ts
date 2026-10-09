@@ -19,6 +19,8 @@ export const POLICY: Record<OperationName, readonly Role[]> = {
   // Developer-only: a preview is a server-side dry-run apply, which needs write verbs.
   previewDeploy: DEVELOPERS,
   deploy: DEVELOPERS,
+  // Viewers pull from the tenant registry, so both roles may look it up.
+  registry: EVERYONE,
   createService: DEVELOPERS,
   logs: EVERYONE,
   proxy: DEVELOPERS,
