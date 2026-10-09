@@ -1,0 +1,27 @@
+{
+  "name": "@di-framework/tenant-cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "(MIT OR Apache-2.0)",
+  "description": "Pilot tenant CLI: talks only to the tenant controller's OpenAPI contract with an identity-server credential; never to Kubernetes.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/di-framework/platform",
+    "directory": "platform/tenant-cli"
+  },
+  "bin": {
+    "di-tenant": "src/main.ts"
+  },
+  "scripts": {
+    "cli": "bun src/main.ts",
+    "generate:api": "di-framework generate && bun scripts/generate-openapi.ts",
+    "generate:client": "bun x openapi-typescript api/v1/openapi.yaml -o src/client/schema.d.ts",
+    "generate": "bun run generate:api && bun run generate:client",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@di-framework/core": "^6.0.3",
+    "@di-framework/http": "^6.0.3"
+  }
+}
