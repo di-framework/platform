@@ -16,9 +16,12 @@ const GROUP_VERSION = 'platform.di-framework.dev/v1alpha1';
 /** Records the `/v1` environment the service was created for. */
 export const ENV_ANNOTATION = 'platform.di-framework.dev/env';
 const QUANTITY = /^[0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|Ti)?$/;
-/** `host`, `*.suffix`, optionally with `:port`; the BackingService egress schema. */
+/** The BackingService CRD limits on `destinations`: entry length and count. */
+const DESTINATION_MAX_LENGTH = 259;
+const MAX_DESTINATIONS = 32;
+/** `host`, `*.suffix`, optionally with `:port` (no leading zeros); the BackingService egress schema. */
 const DESTINATION =
-  /^(?:\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::([0-9]{1,5}))?$/;
+  /^(?:\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::([1-9][0-9]{0,4}))?$/;
 
 type Sizing = { storage?: string; memory?: string; cpu?: string };
 
@@ -45,7 +48,7 @@ interface BackingService {
 
 function destinationValid(value: string): boolean {
   const match = DESTINATION.exec(value);
-  if (match === null || value.length > 260) return false;
+  if (match === null || value.length > DESTINATION_MAX_LENGTH) return false;
   return match[1] === undefined || (Number(match[1]) >= 1 && Number(match[1]) <= 65535);
 }
 
@@ -60,6 +63,11 @@ function invalid(command: CreateServiceCommand): string | undefined {
     if (!QUANTITY.test(value as string)) return `parameters.${key} must be a quantity such as 1Gi`;
   if (command.type === 'egress') {
     if (!command.destinations?.length) return 'an egress service needs at least one destination';
+    if (command.parameters !== undefined) return 'an egress service takes no sizing parameters';
+    if (command.destinations.length > MAX_DESTINATIONS)
+      return `an egress service takes at most ${MAX_DESTINATIONS} destinations`;
+    if (new Set(command.destinations).size !== command.destinations.length)
+      return 'destinations must not repeat';
     const bad = command.destinations.find((d) => !destinationValid(d));
     if (bad !== undefined) return `destination ${bad} must be host, *.suffix, or either with :port`;
   } else if (command.destinations !== undefined) {
@@ -131,12 +139,16 @@ export const services: V1Module = {
       service,
       env,
     });
+    if (!session)
+      return problem(429, 'Too Many Requests', 'too many live proxy sessions; retry later');
     context.audit('proxy.session', {
       user: context.principal.user,
       service,
       env,
       expiresAt: new Date(session.expiresAt).toISOString(),
     });
+    // The controller has no configured public URL, so the origin is the one the caller reached
+    // (its Host). Behind a gateway host (platform#58) a configured public origin should win.
     const origin = new URL((call.request as { url: string }).url).origin;
     return Response.json(
       {

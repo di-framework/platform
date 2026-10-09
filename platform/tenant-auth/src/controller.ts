@@ -6,6 +6,7 @@
  * roles, quotas, and admission policies apply unchanged; the Kubernetes token never leaves here.
  */
 import { readFileSync } from 'node:fs';
+import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
 import { AuthError, IdentityResolver, type Principal } from './identity.ts';
 import { createApiKey, type KeyStore, listApiKeys, revokeApiKey } from './keys.ts';
 import {
@@ -175,7 +176,11 @@ export class Controller {
     },
   };
 
-  async handle(request: Request): Promise<Response> {
+  /** `server` (Bun's) supplies the caller's address for the proxy's `X-Forwarded-For`. */
+  async handle(
+    request: Request,
+    server?: { requestIP(request: Request): { address: string } | null },
+  ): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === '/-/healthz') return json({ ok: true, tenant: this.config.tenant });
     // The one public operation of the `/v1` contract: what a CLI needs before it has a credential.
@@ -207,14 +212,27 @@ export class Controller {
       return status(502, 'ServiceUnavailable', 'the identity provider or cluster is unavailable');
     }
     // A proxy session URL (not a contract operation): forwarded to the session's service.
+    const clientAddress = server?.requestIP(request)?.address;
     const session = PASSTHROUGH.exec(url.pathname);
-    if (session)
-      return servePassthrough(request, url, session, {
-        tenant: this.config.tenant,
-        principal,
-        upstream: this.proxyUpstream(this.config.tenant),
-        audit: (event, fields) => this.audit(event, fields),
-      });
+    if (session) {
+      try {
+        return await servePassthrough(request, url, session, {
+          tenant: this.config.tenant,
+          principal,
+          upstream: this.proxyUpstream(this.config.tenant),
+          audit: (event, fields) => this.audit(event, fields),
+          clientAddress,
+        });
+      } catch (error) {
+        // A client abort mid-body, or anything else unexpected: audited, never echoed.
+        this.audit('request.failed', {
+          user: principal.user,
+          path: url.pathname,
+          reason: String(error),
+        });
+        return problem(502, 'Bad Gateway', 'the service could not be reached');
+      }
+    }
     try {
       if (url.pathname.startsWith('/-/') || url.pathname.startsWith('/v1/'))
         return await this.own(request, url, principal);
@@ -348,7 +366,7 @@ if (import.meta.main) {
     tls,
     // Token refreshes through the identity guest can take longer than Bun's 10 s default.
     idleTimeout: 120,
-    fetch: (request) => controller.handle(request),
+    fetch: (request, server) => controller.handle(request, server),
   });
   controller.audit('controller.started', {
     url: `${tls ? 'https' : 'http'}://${config.host}:${config.port}`,

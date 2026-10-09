@@ -94,6 +94,6 @@ instead of opening it.
 
 - Building the component and rendering the bundle: `deploy` sends a bundle file. The CLI-side
   build that produces it is shared with `cli-plugin-platform` and is the next step.
-- The controller: every operation answers 501. `../tenant-auth`'s controller grows the
-  endpoints behind this contract, importing the generated routes from `src/api/generated`.
-- The `proxy` session URL is an HTTP passthrough the controller serves outside the document (`/v1/services/<service>/proxy/<session>/...`); WebSocket is not supported yet.
+- The controller: `../tenant-auth` serves `services create` and `services proxy`; operations it
+  does not implement yet answer 501. The controller grows the endpoints behind this contract, importing the generated routes from `src/api/generated`.
+- The `proxy` session URL is an HTTP passthrough the controller serves outside the document (`/v1/services/<service>/proxy/<session>/...`); WebSocket is not supported yet. The session URL takes its origin from the Host the caller reached (the controller has no configured public URL); the passthrough uses a 60 s idle timeout, keeps relative `Location` redirects under the session URL, and marks every request as external with `X-Forwarded-*` so workload control paths stay closed.
