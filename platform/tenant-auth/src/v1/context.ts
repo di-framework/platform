@@ -4,7 +4,7 @@ import {
   problem,
 } from '@di-framework/tenant-cli/src/api/handlers.ts';
 import type { Principal } from '../identity.ts';
-import type { KubeClient, UserKube } from '../kube.ts';
+import { type KubeClient, KubeError, type UserKube } from '../kube.ts';
 
 /** What a `/v1` handler knows about the request beyond the generated command. */
 export interface V1Context {
@@ -32,5 +32,37 @@ export const notImplemented =
   async () =>
     problem(501, 'Not Implemented', `${name} is not implemented in the pilot yet`);
 
-/** Reads through the controller's own credential (`KubeClient` satisfies it). */
-export type SecretReader = Pick<KubeClient, 'call'>;
+/** Reads Secret metadata through the controller's own credential. */
+export interface SecretReader {
+  call<T>(method: 'GET', path: string): Promise<T>;
+}
+
+/** Metadata-only media types, so Secret values never reach the controller process (#112). */
+export const METADATA_LIST =
+  'application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1,application/json';
+export const METADATA_ONE =
+  'application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json';
+
+/**
+ * Wraps the controller's client for `/v1` Secret reads (#112): it asks for metadata only, and a
+ * 401/403 is the controller's own credential failing, not the caller being denied, so it becomes
+ * a 502 whose detail stays in the audit.
+ */
+export function controllerSecretReader(kube: Pick<KubeClient, 'call'>): SecretReader {
+  return {
+    async call<T>(method: 'GET', path: string): Promise<T> {
+      const route = path.split('?')[0] ?? path;
+      const accept = route.endsWith('/secrets') ? METADATA_LIST : METADATA_ONE;
+      try {
+        return await kube.call<T>(method, path, undefined, accept);
+      } catch (error) {
+        if (error instanceof KubeError && (error.status === 401 || error.status === 403))
+          throw new KubeError(
+            502,
+            `controller error: ${method} ${route} was refused to the tenant controller (${error.status}): ${error.message}`,
+          );
+        throw error;
+      }
+    },
+  };
+}

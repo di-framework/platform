@@ -155,6 +155,22 @@ describe('Controller', () => {
     expect(logged).toEqual(['token.minted', 'request.proxied', 'request.proxied']);
   });
 
+  test('never returns the object a Secret DELETE answers with (#112)', async () => {
+    for (const path of [
+      '/api/v1/namespaces/di-tenant-acme/secrets/db.prod',
+      '/api/v1/namespaces/di-tenant-acme/secrets?labelSelector=a%3Db',
+    ]) {
+      const response = await call('DELETE', path);
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(text).not.toContain('echo');
+      expect(JSON.parse(text)).toMatchObject({ kind: 'Status', status: 'Success', code: 200 });
+    }
+    // Other deletes, and failed Secret deletes, pass through unchanged.
+    const other = await call('DELETE', '/api/v1/namespaces/di-tenant-acme/configmaps/x');
+    expect(((await other.json()) as { echo: Record<string, string> }).echo.method).toBe('DELETE');
+  });
+
   test('re-mints once when the cached token is rejected', async () => {
     api.validTokens.clear();
     const response = await call('GET', '/api/v1/namespaces/di-tenant-acme/pods', 'Bearer key');

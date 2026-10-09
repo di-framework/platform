@@ -602,6 +602,58 @@ function backendConfigPolicy(namespace: string): AdmissionPolicy {
   };
 }
 
+/**
+ * Developers may delete tenant Secrets but never read them (#112). A DELETE response carries the
+ * object, data included, so refuse every DELETE that can answer without removing the Secret:
+ * a dry run, an `Orphan`/`Foreground` propagation policy (each adds a finalizer, so the object
+ * is only marked), and a Secret that already has finalizers or a deletionTimestamp. What is left
+ * is a plain delete that removes the Secret; the controller proxy also redacts its response.
+ */
+function tenantSecretDeletePolicy(namespace: string): AdmissionPolicy {
+  return {
+    name: 'tenant-secret-delete',
+    apiGroups: [''],
+    apiVersions: ['v1'],
+    operations: ['DELETE'],
+    resources: ['secrets'],
+    validations: [
+      {
+        expression: `
+          !request.userInfo.username.startsWith('system:serviceaccount:${namespace}:di-user-') ||
+          !((has(request.dryRun) && request.dryRun == true) ||
+            (has(request.options) && has(request.options.propagationPolicy) &&
+              request.options.propagationPolicy in ['Orphan', 'Foreground']) ||
+            (has(request.options) && has(request.options.orphanDependents) &&
+              request.options.orphanDependents == true) ||
+            (has(oldObject.metadata.finalizers) && size(oldObject.metadata.finalizers) > 0) ||
+            has(oldObject.metadata.deletionTimestamp))`,
+        message:
+          'tenant users may delete Secrets only with a plain, non-dry-run delete of a Secret without finalizers',
+      },
+    ],
+  };
+}
+
+/** Mirrors the `tenant-secret-delete` CEL rule (#112). */
+export function tenantSecretDeleteAllowed(input: {
+  username: string;
+  controllerNamespace: string;
+  dryRun?: boolean;
+  options?: { propagationPolicy?: string; orphanDependents?: boolean };
+  finalizers?: string[];
+  deletionTimestamp?: string;
+}): boolean {
+  if (!input.username.startsWith(`system:serviceaccount:${input.controllerNamespace}:di-user-`))
+    return true;
+  return !(
+    input.dryRun === true ||
+    ['Orphan', 'Foreground'].includes(input.options?.propagationPolicy ?? '') ||
+    input.options?.orphanDependents === true ||
+    (input.finalizers ?? []).length > 0 ||
+    input.deletionTimestamp !== undefined
+  );
+}
+
 function ownershipLabelsExpression(installation: string): string {
   return `!has(object.metadata.labels) || (
     (!('${OWNER}' in object.metadata.labels)) &&
@@ -618,6 +670,7 @@ export function admissionResources(installation: string, namespace: string): Res
   const policies: AdmissionPolicy[] = [
     workloadPolicy(namespace),
     backendConfigPolicy(namespace),
+    tenantSecretDeletePolicy(namespace),
     {
       name: 'services',
       apiGroups: [''],

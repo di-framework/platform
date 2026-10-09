@@ -241,7 +241,20 @@ object. Viewers have no Secret access. Every Secret read the endpoints and deplo
 of names and update times, the `resourceVersion` read before replace and delete, the existence
 and label checks, the var/secret clash checks) runs as the tenant controller's own ServiceAccount;
 every Secret write runs as the calling user, as a `POST` create or a `PUT` full replace, never a
-`PATCH`. No response or log carries Secret data.
+`PATCH`. No response or log carries Secret data. Those controller reads ask for metadata only
+(`PartialObjectMetadata`/`PartialObjectMetadataList`), so Secret values never reach the
+controller process, and a 401/403 on them is a controller error (502, detail in the audit as
+`request.failed`), not a denial of the caller.
+
+A Secret `DELETE` answers with the object, data included. The platform's `tenant-secret-delete`
+ValidatingAdmissionPolicy therefore refuses, for `di-user-*` ServiceAccounts, every Secret delete
+that could answer without removing it: `dryRun`, `propagationPolicy` `Orphan` or `Foreground`
+(or `orphanDependents`), and a Secret that already has finalizers or a `deletionTimestamp`. The
+controller's kubectl proxy replaces the body of a successful Secret `DELETE` with a bare `Status`.
+
+Write-only stops direct reads, not use: a developer can still deploy a workload that injects a
+tenant Secret of the env (`secretFrom`) and have it print the value in a response or a log.
+Managed `di-bs-*`/`di-binding-*` credentials stay blocked from injection by the workload policy.
 
 **One name, one source.** A var and a secret that map to the same environment variable name in
 the same environment are a conflict. The endpoints refuse it at write time with 409: setting a
