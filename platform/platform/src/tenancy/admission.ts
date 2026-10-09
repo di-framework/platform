@@ -241,6 +241,56 @@ export function workloadEgressAllowed(input: {
   );
 }
 
+/** WorkloadDeployment label naming the tenant-auth environment it was deployed to (#55). */
+export const ENV_LABEL = 'platform.di-framework.dev/env';
+/** Environments a WorkloadDeployment may reference tenant vars and secrets for (#88). */
+export const DEPLOY_ENVS = ['prod', 'staging'] as const;
+const TENANT_SECRET_NAME = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
+
+interface EnvironmentReferencesLike {
+  environment?: {
+    configFrom?: { name: string }[];
+    secretFrom?: { name: string }[];
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
+/**
+ * Mirrors the environment reference rule in the CEL policy (#88; tenant-auth README "Secrets and
+ * vars storage contract"). A tenant WorkloadDeployment labelled with env `<env>` may reference
+ * only `di-vars-<env>` and `<name>.<env>` Secrets whose `<name>` is not managed; without a valid
+ * env label it may reference neither. The `<workload>-control` Secret cli-plugin-platform renders
+ * for HTTP workloads stays allowed. Secret labels are checked by the deploy lane (#87), not here.
+ */
+export function workloadEnvironmentReferencesAllowed(input: {
+  username: string;
+  controllerNamespace: string;
+  workloadName: string;
+  labels?: Record<string, string>;
+  locals: EnvironmentReferencesLike[];
+}): boolean {
+  if (
+    input.username === `system:serviceaccount:${input.controllerNamespace}:di-platform-controller`
+  )
+    return true;
+  const label = input.labels?.[ENV_LABEL];
+  const env = (DEPLOY_ENVS as readonly string[]).includes(label ?? '') ? label : undefined;
+  const controlSecret = `${input.workloadName}-control`;
+  const secretAllowed = (name: string) => {
+    if (isManagedSecretName(name)) return false;
+    if (name === controlSecret) return true;
+    if (env === undefined || !name.endsWith(`.${env}`)) return false;
+    return TENANT_SECRET_NAME.test(name.slice(0, -(env.length + 1)));
+  };
+  return input.locals.every(
+    ({ environment }) =>
+      (environment?.configFrom ?? []).every(
+        (reference) => env !== undefined && reference.name === `di-vars-${env}`,
+      ) && (environment?.secretFrom ?? []).every((reference) => secretAllowed(reference.name)),
+  );
+}
+
 export function validateBackingServiceAdmission(input: {
   namespace: string;
   type: string;
@@ -435,6 +485,12 @@ function workloadPolicy(namespace: string): AdmissionPolicy {
           has(oldObject.spec.template.spec.volumes) && has(variables.w.volumes) &&
           variables.w.volumes == oldObject.spec.template.spec.volumes`,
       },
+      {
+        name: 'env',
+        expression: `has(object.metadata.labels) && '${ENV_LABEL}' in object.metadata.labels &&
+          object.metadata.labels['${ENV_LABEL}'] in ${JSON.stringify(DEPLOY_ENVS).replaceAll('"', "'")}
+          ? object.metadata.labels['${ENV_LABEL}'] : ''`,
+      },
       { name: 'locals', expression: localsOf('variables.w') },
       {
         name: 'oldLocals',
@@ -470,6 +526,18 @@ function workloadPolicy(namespace: string): AdmissionPolicy {
               has(o.allowedIpNameLookups) && o.allowedIpNameLookups == l.allowedIpNameLookups)))`,
         message:
           'Tenant guests cannot set allowedHosts or allowedIpNameLookups; request egress with an egress BackingService and ServiceBinding',
+      },
+      {
+        expression: `variables.controller || variables.locals.all(l, !has(l.environment) || (
+          (!has(l.environment.configFrom) || l.environment.configFrom.all(c,
+            variables.env != '' && c.name == 'di-vars-' + variables.env)) &&
+          (!has(l.environment.secretFrom) || l.environment.secretFrom.all(s,
+            !s.name.startsWith('${BINDING_CONFIG_PREFIX}') && !s.name.startsWith('${BS_CONFIG_PREFIX}') &&
+            (s.name == object.metadata.name + '-control' ||
+              (variables.env != '' && s.name.endsWith('.' + variables.env) &&
+                s.name.matches('^[a-z]([-a-z0-9]{0,61}[a-z0-9])?[.](${DEPLOY_ENVS.join('|')})$')))))))`,
+        message:
+          'Tenant guests may reference only di-vars-<env> and <name>.<env> Secrets matching their platform.di-framework.dev/env label (never di-binding-*/di-bs-*)',
       },
       {
         expression: hostInterfaceAdmissionExpression(),
