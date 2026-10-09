@@ -17,7 +17,7 @@ import {
   resolveBackingServiceClasses,
   seedTenantNamespaces,
 } from './tenancy';
-import { names, userTokenSecretName } from './tenancy/resources';
+import { names, type TenantAuthConfig, userTokenSecretName } from './tenancy/resources';
 import { platformValues } from './values';
 
 export { kubeconfigServer, type TenantKubeconfigArgs, tenantKubeconfig } from './kubeconfig';
@@ -257,6 +257,7 @@ export function createPlatform(args: PlatformArgs) {
     hostImagePullPolicy: config.get('tenantHostImagePullPolicy') ?? 'IfNotPresent',
     backingServiceClasses: resolveBackingServiceClasses(config),
     routeUrlPattern,
+    tenantAuth: config.getObject<TenantAuthConfig>('tenantAuth'),
   });
   const tenants = tenancy.tenants.map((t) =>
     t.metadata.name.apply((name) => ({ name, ...names(name) })),

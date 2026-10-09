@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { backingServiceCrds } from './backing-services';
 import { PRIVATE_IPV4_RANGES } from './egress';
 import { hostStorage } from './workload-storage';
@@ -64,6 +65,77 @@ export interface ControllerConfig {
   storageRoot?: string;
   /** `http://{host}.{tenant}.localhost:<port>` when the platform gateway is published. */
   routeUrlPattern?: string;
+  /** The per-tenant controller and console (#58); absent, the reconcile deploys neither. */
+  tenantAuth?: TenantAuthConfig;
+}
+/**
+ * Platform-level settings for each tenant's controller and console. The runtime env contract is
+ * the one frozen in `platform/tenant-auth/README.md`.
+ */
+export interface TenantAuthConfig {
+  /** `ghcr.io/di-framework/tenant-auth@sha256:<digest>`; always pinned by digest. */
+  image: string;
+  /** identity-server issuer URL, as both pods and browsers name it. */
+  issuer: string;
+  /**
+   * Until per-tenant clients (#59), every console shares one confidential OAuth client. Its
+   * secret lives in a Secret in the platform namespace that the reconcile copies into each
+   * tenant's runtime namespace; the controller never reads the identity directory.
+   */
+  oauthClient: { id: string; secretName: string; secretKey?: string };
+  /**
+   * For a loopback issuer (`localhost`, `*.localhost`, `127.0.0.1`): the in-cluster
+   * `<service>.<namespace>[.svc...]:<port>` a sidecar forwards the issuer port to.
+   */
+  issuerUpstream?: string;
+  /** The pod port behind `issuerUpstream` (NetworkPolicy matches it after DNAT). */
+  issuerUpstreamPodPort?: number;
+  /** The issuer's IPv4 when pods cannot resolve its hostname. */
+  issuerIp?: string;
+  /** Browser-visible console URL; `{tenant}` is replaced. Default `http://127.0.0.1:8787`. */
+  consolePublicUrl?: string;
+  /** Controller URL shown to users and CLIs; `{tenant}` is replaced. Default `https://127.0.0.1:8788`. */
+  controllerPublicUrl?: string;
+}
+/** Facts the controller gathers from the cluster for {@link tenantAuthResources}. */
+export interface TenantAuthInputs {
+  /** Names of the tenant's active members; each may mint tokens for `di-user-<name>`. */
+  members: string[];
+  /** API server endpoint addresses and port (the `kubernetes` EndpointSlice). */
+  apiServer: { addresses: string[]; port: number };
+  /** The controller's serving certificate and key (PEM). */
+  tls: { cert: string; key: string };
+  /** The shared OAuth client secret, base64 as read from the platform Secret; absent until it exists. */
+  clientSecret?: string;
+}
+const TENANT_AUTH_IMAGE = /^[^@\s]+@sha256:[0-9a-f]{64}$/;
+/** Reject a tenant-auth config that would deploy an unpinned image or miss required fields. */
+export function assertTenantAuthConfig(value: TenantAuthConfig | undefined): void {
+  if (value === undefined) return;
+  if (!TENANT_AUTH_IMAGE.test(value.image ?? ''))
+    throw new Error('tenantAuth.image must be pinned by digest (<repository>@sha256:<digest>)');
+  if (!URL.canParse(value.issuer ?? '')) throw new Error('tenantAuth.issuer must be a URL');
+  if (!value.oauthClient?.id || !value.oauthClient.secretName)
+    throw new Error('tenantAuth.oauthClient needs id and secretName');
+}
+/** Container limits of one tenant-auth pair, counted on top of the tenant's own quota. */
+export const TENANT_AUTH_LIMITS = { cpu: '500m', memory: '448Mi' };
+/** Each suffix in thousandths of the base unit, so sums stay integers. */
+const units: Record<string, number> = {
+  m: 1,
+  '': 1000,
+  Ki: 1024 * 1000,
+  Mi: 1024 ** 2 * 1000,
+  Gi: 1024 ** 3 * 1000,
+  Ti: 1024 ** 4 * 1000,
+};
+/** `a + b` for quantities in the CRD's pattern; CPU comes back in millicores, memory in Mi. */
+export function addQuantity(a: string, b: string, unit: 'm' | 'Mi'): string {
+  const value = (q: string) => {
+    const [, n, suffix] = /^([0-9.]+)(m|Ki|Mi|Gi|Ti)?$/.exec(q)!;
+    return Math.round(Number(n) * (units[suffix ?? ''] as number));
+  };
+  return `${Math.ceil((value(a) + value(b)) / (units[unit] as number))}${unit}`;
 }
 /** Platform HTTP gateway (di-framework/kube#2); its pods alone reach tenant hosts on 9191. */
 const GATEWAY_NAME = 'di-platform-gateway';
@@ -77,6 +149,7 @@ const OWNER = `${GROUP}/owner-uid`;
 const TENANT = `${GROUP}/tenant`;
 const USER = `${GROUP}/user`;
 const FINALIZER = `${GROUP}/cleanup`;
+const COMPONENT = `${GROUP}/component`;
 const nameSchema = {
   type: 'string',
   minLength: 1,
@@ -292,8 +365,14 @@ function tenantResources(
     make('v1', 'ResourceQuota', 'di-runtime-quota', n.runtimeNamespace, {
       spec: {
         hard: {
-          'limits.cpu': resources.cpu ?? '2',
-          'limits.memory': resources.memory ?? '4Gi',
+          // The tenant's controller and console run here too; their limits are added on top
+          // so the tenant keeps its whole budget for the host and backing services (#58).
+          'limits.cpu': cfg.tenantAuth
+            ? addQuantity(resources.cpu ?? '2', TENANT_AUTH_LIMITS.cpu, 'm')
+            : (resources.cpu ?? '2'),
+          'limits.memory': cfg.tenantAuth
+            ? addQuantity(resources.memory ?? '4Gi', TENANT_AUTH_LIMITS.memory, 'Mi')
+            : (resources.memory ?? '4Gi'),
           pods: '20',
           // Aggregate compute/storage budget for runtime + controller-managed di-bs-* backends.
           // Per-service sizing still comes from BackingServiceClass parametersSchema (#450).
@@ -770,6 +849,412 @@ function userResources(user: User, tenants: Tenant[], cfg: ControllerConfig): Re
 function userTokenSecretName(user: string, tenant: string): string {
   return `di-user-${user}-${tenant}-token`;
 }
+/** Bun sends these names to loopback whatever DNS says, so pods reach them through a sidecar. */
+function loopbackHost(host: string): boolean {
+  return host === 'localhost' || host === '127.0.0.1' || host.endsWith('.localhost');
+}
+/** The controller URL users and CLIs see; `{tenant}` is replaced. */
+function tenantControllerPublicUrl(tenant: string, auth: TenantAuthConfig | undefined): string {
+  return (auth?.controllerPublicUrl ?? 'https://127.0.0.1:8788').replaceAll('{tenant}', tenant);
+}
+/**
+ * Names the controller's serving certificate covers: in-cluster, through a port-forward and the
+ * host of `controllerPublicUrl`, so CLIs verify the hostname they were given.
+ */
+function tenantControllerCertNames(
+  tenant: string,
+  auth?: TenantAuthConfig,
+): { dns: string[]; ips: string[] } {
+  const ns = names(tenant).runtimeNamespace;
+  const dns = [
+    'tenant-controller',
+    `tenant-controller.${ns}.svc`,
+    `tenant-controller.${ns}.svc.cluster.local`,
+    'localhost',
+  ];
+  const ips = ['127.0.0.1'];
+  const host = URL.canParse(tenantControllerPublicUrl(tenant, auth))
+    ? new URL(tenantControllerPublicUrl(tenant, auth)).hostname
+    : '';
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) ips.push(host);
+  else if (host && !host.startsWith('[')) dns.push(host);
+  return { dns: [...new Set(dns)], ips: [...new Set(ips)] };
+}
+/** Digest of the serving certificate; in both pod templates so a renewal rolls the pair. */
+function tlsCertDigest(cert: string): string {
+  return createHash('sha256').update(cert).digest('hex');
+}
+/** The issuer-proxy sidecar, pinned by digest (`alpine/socat:1.8.0.0`). */
+export const ISSUER_PROXY_IMAGE =
+  'alpine/socat@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8';
+/** The ServiceAccount token, CA and namespace, projected into the controller container only. */
+const serviceAccountVolume = () => ({
+  name: 'service-account',
+  projected: {
+    sources: [
+      { serviceAccountToken: { path: 'token', expirationSeconds: 3607 } },
+      { configMap: { name: 'kube-root-ca.crt', items: [{ key: 'ca.crt', path: 'ca.crt' }] } },
+      {
+        downwardAPI: {
+          items: [{ path: 'namespace', fieldRef: { fieldPath: 'metadata.namespace' } }],
+        },
+      },
+    ],
+  },
+});
+/**
+ * The tenant's controller and console (#58), ported from `tenant-auth/scripts/deploy-local.ts`.
+ * They run in the tenant's runtime namespace, next to the `di-http` Service the controller
+ * proxies to; the runtime quota grows by {@link TENANT_AUTH_LIMITS} to hold them.
+ */
+function tenantAuthResources(
+  tenant: Tenant,
+  cfg: ControllerConfig,
+  inputs: TenantAuthInputs,
+): Resource[] {
+  const auth = cfg.tenantAuth;
+  if (!auth) return [];
+  const name = tenant.metadata.name;
+  const n = names(name);
+  const namespace = n.runtimeNamespace;
+  const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
+  const make = (
+    apiVersion: string,
+    kind: string,
+    resourceName: string,
+    ns: string | undefined,
+    body: Record<string, unknown>,
+  ) => {
+    const value = resource(tenant, cfg.installation, apiVersion, kind, resourceName, ns, body);
+    value.metadata.labels![COMPONENT] = 'tenant-auth';
+    return value;
+  };
+  const rbac = 'rbac.authorization.k8s.io/v1';
+  const subjects = [{ kind: 'ServiceAccount', name: 'tenant-controller', namespace }];
+  const issuer = new URL(auth.issuer);
+  const issuerPort = Number(issuer.port || (issuer.protocol === 'https:' ? 443 : 80));
+  const issuerIp =
+    auth.issuerIp ?? (/^\d+\.\d+\.\d+\.\d+$/.test(issuer.hostname) ? issuer.hostname : undefined);
+  const loopback = loopbackHost(issuer.hostname);
+  const sidecarTarget = auth.issuerUpstream ?? (auth.issuerIp && `${auth.issuerIp}:${issuerPort}`);
+  const securityContext = {
+    allowPrivilegeEscalation: false,
+    readOnlyRootFilesystem: true,
+    capabilities: { drop: ['ALL'] },
+  };
+  const deployment = (
+    app: 'tenant-controller' | 'tenant-console',
+    port: number,
+    env: Record<string, string>,
+    extraEnv: unknown[],
+    volume: Record<string, unknown>,
+    mountPath: string,
+  ) =>
+    make('apps/v1', 'Deployment', app, namespace, {
+      spec: {
+        // One replica: the controller keeps proxy sessions in memory. Recreate, because a
+        // surge pod would not fit the runtime quota.
+        replicas: suspended ? 0 : 1,
+        strategy: { type: 'Recreate' },
+        selector: { matchLabels: { app } },
+        template: {
+          metadata: {
+            labels: { app, [COMPONENT]: 'tenant-auth', [TENANT]: name },
+            // The image reference rolls the pods; the digest is repeated here for operators. Both
+            // binaries read the certificate (or CA) once at start, so its digest rolls the pair.
+            annotations: {
+              [`${GROUP}/image-digest`]: auth.image.split('@')[1],
+              [`${GROUP}/tls-cert-sha256`]: tlsCertDigest(inputs.tls.cert),
+            },
+          },
+          spec: {
+            serviceAccountName: app,
+            // Never automounted: the controller's token is projected into its own container
+            // only, so the issuer-proxy sidecar holds no credential.
+            automountServiceAccountToken: false,
+            ...(!loopback && auth.issuerIp
+              ? { hostAliases: [{ ip: auth.issuerIp, hostnames: [issuer.hostname] }] }
+              : {}),
+            securityContext: {
+              runAsNonRoot: true,
+              runAsUser: 1000,
+              runAsGroup: 1000,
+              seccompProfile: { type: 'RuntimeDefault' },
+            },
+            containers: [
+              {
+                name: app,
+                image: auth.image,
+                command: [
+                  'bun',
+                  `/app/${app === 'tenant-controller' ? 'controller' : 'console'}.js`,
+                ],
+                env: [
+                  { name: 'TMPDIR', value: '/tmp' },
+                  ...Object.entries(env).map(([k, v]) => ({ name: k, value: v })),
+                  ...extraEnv,
+                ],
+                ports: [{ containerPort: port, name: 'http' }],
+                readinessProbe: {
+                  httpGet:
+                    app === 'tenant-controller'
+                      ? { path: '/-/healthz', port, scheme: 'HTTPS' }
+                      : { path: '/healthz', port, scheme: 'HTTP' },
+                  periodSeconds: 5,
+                },
+                resources: {
+                  requests: { cpu: '50m', memory: '96Mi' },
+                  limits: { cpu: '200m', memory: '192Mi' },
+                },
+                securityContext,
+                volumeMounts: [
+                  { name: 'tmp', mountPath: '/tmp' },
+                  { name: 'mounted', mountPath, readOnly: true },
+                  ...(app === 'tenant-controller'
+                    ? [
+                        {
+                          name: 'service-account',
+                          mountPath: '/var/run/secrets/kubernetes.io/serviceaccount',
+                          readOnly: true,
+                        },
+                      ]
+                    : []),
+                ],
+              },
+              ...(loopback && sidecarTarget
+                ? [
+                    {
+                      name: 'issuer-proxy',
+                      image: ISSUER_PROXY_IMAGE,
+                      args: [
+                        `TCP-LISTEN:${issuerPort},fork,reuseaddr,bind=127.0.0.1`,
+                        `TCP:${sidecarTarget}`,
+                      ],
+                      resources: {
+                        requests: { cpu: '10m', memory: '16Mi' },
+                        limits: { cpu: '50m', memory: '32Mi' },
+                      },
+                      securityContext,
+                    },
+                  ]
+                : []),
+            ],
+            volumes: [
+              { name: 'tmp', emptyDir: {} },
+              { name: 'mounted', ...volume },
+              ...(app === 'tenant-controller' ? [serviceAccountVolume()] : []),
+            ],
+          },
+        },
+      },
+    });
+  const service = (app: string, port: number) =>
+    make('v1', 'Service', app, namespace, {
+      spec: { selector: { app }, ports: [{ port, targetPort: port, name: 'http' }] },
+    });
+  const publicUrl = (pattern: string | undefined, fallback: string) =>
+    (pattern ?? fallback).replaceAll('{tenant}', name);
+  const [upstreamHost = '', upstreamPort = '80'] = (auth.issuerUpstream ?? '').split(':');
+  const egress: unknown[] = [];
+  if (inputs.apiServer.addresses.length)
+    egress.push({
+      to: inputs.apiServer.addresses.map((ip) => ({
+        ipBlock: { cidr: `${ip}/${ip.includes(':') ? 128 : 32}` },
+      })),
+      ports: [{ protocol: 'TCP', port: inputs.apiServer.port }],
+    });
+  if (auth.issuerUpstream)
+    egress.push({
+      to: [
+        {
+          namespaceSelector: {
+            matchLabels: {
+              'kubernetes.io/metadata.name': upstreamHost.split('.')[1] ?? cfg.namespace,
+            },
+          },
+        },
+      ],
+      ports: [
+        ...new Set([Number(upstreamPort), auth.issuerUpstreamPodPort ?? Number(upstreamPort)]),
+      ].map((port) => ({ protocol: 'TCP', port })),
+    });
+  else if (issuerIp)
+    egress.push({
+      to: [{ ipBlock: { cidr: `${issuerIp}/32` } }],
+      ports: [{ protocol: 'TCP', port: issuerPort }],
+    });
+  egress.push(
+    // The service proxy (#56) reaches the tenant hosts through `di-http`; NetworkPolicy sees
+    // the pod port after the Service's DNAT, 9191.
+    {
+      to: [
+        {
+          namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': namespace } },
+          podSelector: {
+            matchLabels: {
+              'wasmcloud.com/hostgroup': n.hostgroup,
+              'wasmcloud.com/name': 'hostgroup',
+            },
+          },
+        },
+      ],
+      ports: [{ protocol: 'TCP', port: 9191 }],
+    },
+    {
+      to: [
+        { namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'kube-system' } } },
+      ],
+      ports: [
+        { protocol: 'UDP', port: 53 },
+        { protocol: 'TCP', port: 53 },
+      ],
+    },
+  );
+  const base64 = (text: string) => Buffer.from(text).toString('base64');
+  const result: Resource[] = [
+    make('v1', 'ServiceAccount', 'tenant-controller', namespace, {
+      automountServiceAccountToken: false,
+    }),
+    make('v1', 'ServiceAccount', 'tenant-console', namespace, {
+      automountServiceAccountToken: false,
+    }),
+    // The tenancy CRs it checks on every request.
+    make(rbac, 'ClusterRole', `di-tenant-controller-${name}`, undefined, {
+      rules: [
+        { apiGroups: [GROUP], resources: ['tenants'], verbs: ['get'], resourceNames: [name] },
+        { apiGroups: [GROUP], resources: ['users'], verbs: ['get', 'list'] },
+      ],
+    }),
+    // TokenRequest only for the tenant's members, recomputed from the User CRs on every
+    // reconcile. With no members there is no rule: empty resourceNames would mean every name.
+    make(rbac, 'Role', `di-tenant-controller-${name}`, cfg.namespace, {
+      rules: inputs.members.length
+        ? [
+            {
+              apiGroups: [''],
+              resources: ['serviceaccounts/token'],
+              verbs: ['create'],
+              resourceNames: inputs.members.map((m) => `di-user-${m}`),
+            },
+          ]
+        : [],
+    }),
+    // API-key Secrets in its own namespace.
+    make(rbac, 'Role', 'tenant-controller-keys', namespace, {
+      rules: [
+        { apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list', 'create', 'delete'] },
+      ],
+    }),
+    // Tenant developers can only write Secrets (#112), so `/v1` reads them as the controller;
+    // writes still go through as the calling user.
+    make(rbac, 'Role', 'tenant-controller-secret-reader', n.namespace, {
+      rules: [{ apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list'] }],
+    }),
+  ];
+  // A suspended tenant keeps the roles but loses the bindings (revoked with the members').
+  if (!suspended)
+    result.push(
+      make(rbac, 'ClusterRoleBinding', `di-tenant-controller-${name}`, undefined, {
+        roleRef: {
+          apiGroup: 'rbac.authorization.k8s.io',
+          kind: 'ClusterRole',
+          name: `di-tenant-controller-${name}`,
+        },
+        subjects,
+      }),
+      make(rbac, 'RoleBinding', `di-tenant-controller-${name}`, cfg.namespace, {
+        roleRef: {
+          apiGroup: 'rbac.authorization.k8s.io',
+          kind: 'Role',
+          name: `di-tenant-controller-${name}`,
+        },
+        subjects,
+      }),
+      make(rbac, 'RoleBinding', 'tenant-controller-keys', namespace, {
+        roleRef: {
+          apiGroup: 'rbac.authorization.k8s.io',
+          kind: 'Role',
+          name: 'tenant-controller-keys',
+        },
+        subjects,
+      }),
+      make(rbac, 'RoleBinding', 'tenant-controller-secret-reader', n.namespace, {
+        roleRef: {
+          apiGroup: 'rbac.authorization.k8s.io',
+          kind: 'Role',
+          name: 'tenant-controller-secret-reader',
+        },
+        subjects,
+      }),
+    );
+  result.push(
+    make('networking.k8s.io/v1', 'NetworkPolicy', 'tenant-auth-egress', namespace, {
+      spec: {
+        podSelector: { matchLabels: { [COMPONENT]: 'tenant-auth' } },
+        policyTypes: ['Egress'],
+        egress,
+      },
+    }),
+    make('v1', 'ConfigMap', 'tenant-controller-ca', namespace, {
+      data: { 'ca.crt': inputs.tls.cert },
+    }),
+    make('v1', 'Secret', 'tenant-controller-tls', namespace, {
+      type: 'kubernetes.io/tls',
+      data: { 'tls.crt': base64(inputs.tls.cert), 'tls.key': base64(inputs.tls.key) },
+    }),
+  );
+  if (inputs.clientSecret)
+    result.push(
+      make('v1', 'Secret', 'tenant-console-oauth', namespace, {
+        type: 'Opaque',
+        data: { clientSecret: inputs.clientSecret },
+      }),
+    );
+  result.push(
+    deployment(
+      'tenant-controller',
+      8788,
+      {
+        TENANT_CONTROLLER_TENANT: name,
+        TENANT_CONTROLLER_PLATFORM_NAMESPACE: cfg.namespace,
+        TENANT_CONTROLLER_ISSUER: auth.issuer,
+        TENANT_CONTROLLER_HOST: '0.0.0.0',
+        TENANT_CONTROLLER_PORT: '8788',
+        TENANT_CONTROLLER_TLS_CERT: '/tls/tls.crt',
+        TENANT_CONTROLLER_TLS_KEY: '/tls/tls.key',
+      },
+      [],
+      { secret: { secretName: 'tenant-controller-tls' } },
+      '/tls',
+    ),
+    deployment(
+      'tenant-console',
+      8787,
+      {
+        TENANT_CONSOLE_TENANT: name,
+        TENANT_CONSOLE_ISSUER: auth.issuer,
+        TENANT_CONSOLE_CLIENT_ID: auth.oauthClient.id,
+        TENANT_CONSOLE_HOST: '0.0.0.0',
+        TENANT_CONSOLE_PORT: '8787',
+        TENANT_CONSOLE_PUBLIC_URL: publicUrl(auth.consolePublicUrl, 'http://127.0.0.1:8787'),
+        TENANT_CONSOLE_CONTROLLER_URL: 'https://tenant-controller:8788',
+        TENANT_CONSOLE_CONTROLLER_PUBLIC_URL: tenantControllerPublicUrl(name, auth),
+        TENANT_CONSOLE_CONTROLLER_CA: '/ca/ca.crt',
+      },
+      [
+        {
+          name: 'TENANT_CONSOLE_CLIENT_SECRET',
+          valueFrom: { secretKeyRef: { name: 'tenant-console-oauth', key: 'clientSecret' } },
+        },
+      ],
+      { configMap: { name: 'tenant-controller-ca' } },
+      '/ca',
+    ),
+    service('tenant-controller', 8788),
+    service('tenant-console', 8787),
+  );
+  return result;
+}
 
 export type {
   BackingCapability,
@@ -811,6 +1296,7 @@ export {
   validateServiceSpec,
 } from './backing-services';
 export {
+  COMPONENT,
   crds,
   FINALIZER,
   GATEWAY_NAME,
@@ -822,7 +1308,10 @@ export {
   ROUTES_CONFIG_NAME,
   resource,
   TENANT,
+  tenantAuthResources,
+  tenantControllerCertNames,
   tenantResources,
+  tlsCertDigest,
   USER,
   userResources,
   userTokenSecretName,
