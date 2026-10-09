@@ -64,16 +64,8 @@ export interface ShieldBadgeJson {
  */
 export const UNMEASURED_PACKAGES: Record<string, string> = {};
 
-// `.di-framework` is the CLI's generated-assets and plugin cache (gitignored), not a package.
-const SKIP_DIRECTORIES = new Set([
-  'node_modules',
-  'dist',
-  'coverage',
-  '.git',
-  '.tools',
-  'target',
-  '.di-framework',
-]);
+/** Hidden directories (tool caches, local agent state) are skipped as well. */
+const SKIP_DIRECTORIES = new Set(['node_modules', 'dist', 'coverage', 'target']);
 
 let indexedPackages: PackageInfo[] = [];
 let indexedRoot = '';
@@ -118,7 +110,9 @@ function collectPackages(dir: string, root: string, packages: PackageInfo[]): vo
   }
 
   for (const entry of entries) {
-    if (!entry.isDirectory() || SKIP_DIRECTORIES.has(entry.name)) continue;
+    if (!entry.isDirectory() || entry.name.startsWith('.') || SKIP_DIRECTORIES.has(entry.name)) {
+      continue;
+    }
     collectPackages(join(dir, entry.name), root, packages);
   }
 }

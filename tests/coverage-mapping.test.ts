@@ -53,6 +53,14 @@ describe('coverage badge mapping', () => {
     );
   });
 
+  it('skips hidden directories such as local agent plugin state', () => {
+    const root = mkdtempSync(join(tmpdir(), 'cov-hidden-'));
+    writePackage(root, 'platform/real', '@di-framework/real');
+    writePackage(root, '.di-framework/plugin', '@di-framework/plugin');
+    writePackage(root, '.tools/cache', '@di-framework/cached');
+    expect(getWorkspacePackages(root).map((pkg) => pkg.name)).toEqual(['@di-framework/real']);
+  });
+
   it('maps source files onto package slugs and ignores tests', () => {
     getWorkspacePackages(repoRoot);
     expect(getPackageSlugFromPath('platform/platform/src/index.ts')).toBe('platform');
