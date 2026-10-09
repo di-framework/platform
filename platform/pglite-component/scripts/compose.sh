@@ -14,13 +14,13 @@ PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=env.sh
 . "$PKG_DIR/scripts/env.sh"
 
-[ $# -ge 2 ] || { sed -n '2,11p' "$0"; exit 2; }
+[[ $# -ge 2 ]] || { sed -n '2,11p' "$0"; exit 2; }
 APP="$1"; OUT="$2"; PROVIDER="${3:-$PKG_DIR/dist/di-framework-pglite.wasm}"
 
 command -v wac >/dev/null 2>&1 || { echo "wac not found; run scripts/install-tools.sh" >&2; exit 1; }
 command -v wasm-tools >/dev/null 2>&1 || { echo "wasm-tools not found; run scripts/install-tools.sh" >&2; exit 1; }
-[ -f "$APP" ] || { echo "consumer component not found: $APP" >&2; exit 1; }
-[ -f "$PROVIDER" ] || { echo "provider component not found: $PROVIDER (run make build)" >&2; exit 1; }
+[[ -f "$APP" ]] || { echo "consumer component not found: $APP" >&2; exit 1; }
+[[ -f "$PROVIDER" ]] || { echo "provider component not found: $PROVIDER (run make build)" >&2; exit 1; }
 
 wac --version >&2
 wac plug --plug "$PROVIDER" "$APP" -o "$OUT"

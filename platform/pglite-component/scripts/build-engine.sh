@@ -8,16 +8,14 @@ ENGINE_DIR="$PKG_DIR/target/engine"
 SOURCE_DIR="$ENGINE_DIR/source"
 mkdir -p "$ENGINE_DIR"
 STAMP="$(cat "$0" "$PKG_DIR/scripts/tool-versions.env" "$PKG_DIR/scripts/patch-engine-source.py" "$PKG_DIR/engine/reply-buffer.c" | shasum -a 256 | cut -d' ' -f1)"
-if [ -f "$ENGINE_DIR/source-stamp" ] && [ "$(cat "$ENGINE_DIR/source-stamp")" = "$STAMP" ] && [ -s "$ENGINE_DIR/pglite-source.tar.xz" ]; then
+if [[ -f "$ENGINE_DIR/source-stamp" ]] && [[ "$(cat "$ENGINE_DIR/source-stamp")" = "$STAMP" ]] && [[ -s "$ENGINE_DIR/pglite-source.tar.xz" ]]; then
   exit 0
 fi
 command -v docker >/dev/null || { echo 'engine build needs Docker or a Docker-compatible Podman context' >&2; exit 1; }
 # Respect an explicitly selected context. Do not change the user's global one.
-if [ -z "${DOCKER_CONTEXT:-}" ] && ! docker info >/dev/null 2>&1; then
-  if docker --context podman info >/dev/null 2>&1; then export DOCKER_CONTEXT=podman; fi
-fi
+if [[ -z "${DOCKER_CONTEXT:-}" ]] && ! docker info >/dev/null 2>&1 && docker --context podman info >/dev/null 2>&1; then export DOCKER_CONTEXT=podman; fi
 docker info >/dev/null
-if [ ! -d "$SOURCE_DIR/.git" ]; then
+if [[ ! -d "$SOURCE_DIR/.git" ]]; then
   mkdir -p "$SOURCE_DIR"
   git -C "$SOURCE_DIR" init -q
   git -C "$SOURCE_DIR" remote add origin https://github.com/moznion/wasipg.git
