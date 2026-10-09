@@ -55,13 +55,13 @@ Put binding classes in `src/bindings.ts`. The platform CLI discovers that file, 
 
 ```ts
 import { Container } from '@di-framework/core/decorators';
-import { KeyValue, Postgres, PlatformBinding } from '@di-framework/bindings';
+import { KeyValue, Postgres, WasmCloudBinding } from '@di-framework/bindings';
 
-@PlatformBinding('user-database', { config: { database: 'orders' } })
+@WasmCloudBinding('user-database', { config: { database: 'orders' } })
 @Container()
 export class UserDatabase extends Postgres {}
 
-@PlatformBinding('sessions', { interfaces: ['store', 'atomics'] })
+@WasmCloudBinding('sessions', { interfaces: ['store', 'atomics'] })
 @Container()
 export class Sessions extends KeyValue {}
 ```
@@ -90,9 +90,9 @@ di-framework platform service create postgres --name orders --target alpha \
 ```
 
 ```ts
-import { Postgres, PlatformBinding } from '@di-framework/bindings';
+import { Postgres, WasmCloudBinding } from '@di-framework/bindings';
 
-@PlatformBinding('orders-db', { serviceName: 'orders' })
+@WasmCloudBinding('orders-db', { serviceName: 'orders' })
 export class OrdersDatabase extends Postgres {}
 ```
 

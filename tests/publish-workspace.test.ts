@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -8,11 +8,6 @@ import {
   parsePackedPaths,
   workspacePackageDirs,
 } from '../scripts/publish-workspace.ts';
-
-// Strict in CI: `CI` forces the checks to run (and fail if `dist/` is missing).
-const sqliteBuilt =
-  existsSync(join(import.meta.dir, '../platform/sqlite-component/dist/di-framework-sqlite.wasm')) ||
-  !!process.env.CI;
 
 describe('publish workspace packs', () => {
   test('rejects a files entry that the pack omitted', () => {
@@ -70,7 +65,7 @@ describe('publish workspace packs', () => {
     ]);
   });
 
-  test.skipIf(!sqliteBuilt)('sqlite component pack contains the wasm provider', () => {
+  test('sqlite component pack contains the wasm provider', () => {
     const packed = packPaths(join(import.meta.dir, '../platform/sqlite-component'));
     expect(packed).toContain('dist/di-framework-sqlite.wasm');
     expect(missingPackedEntries(['dist', 'wit'], packed)).toEqual([]);

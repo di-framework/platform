@@ -14,17 +14,17 @@ Terraform, Crossplane, Helm, or another infrastructure layer.
 
 ```ts
 import { Component, Container } from '@di-framework/core/decorators';
-import { KeyValue, Postgres, PlatformBinding } from '@di-framework/bindings';
+import { KeyValue, Postgres, WasmCloudBinding } from '@di-framework/bindings';
 
-@PlatformBinding('user-database')
+@WasmCloudBinding('user-database')
 @Container()
 export class UserDatabase extends Postgres {}
 
-@PlatformBinding('sessions', { interfaces: ['store', 'atomics'] })
+@WasmCloudBinding('sessions', { interfaces: ['store', 'atomics'] })
 @Container()
 export class Sessions extends KeyValue {}
 
-@PlatformBinding('cache')
+@WasmCloudBinding('cache')
 @Container()
 export class Cache extends KeyValue {}
 ```
@@ -98,7 +98,7 @@ leaves it unloaded. Import `@di-framework/bindings/postgres` from a guest that d
 Secret material is referenced, never inlined:
 
 ```ts
-@PlatformBinding('user-database', { secretFrom: 'orders-user-database' })
+@WasmCloudBinding('user-database', { secretFrom: 'orders-user-database' })
 @Container()
 export class UserDatabase extends Postgres {}
 ```
@@ -136,7 +136,7 @@ testContainer.registerValue(UserDatabase, new FakeUserDatabase());
 ## Managed PostgreSQL (upcoming release)
 
 ```ts
-@PlatformBinding('orders-db', { serviceName: 'orders' })
+@WasmCloudBinding('orders-db', { serviceName: 'orders' })
 export class OrdersDatabase extends Postgres {}
 ```
 

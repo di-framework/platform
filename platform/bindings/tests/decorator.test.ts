@@ -42,6 +42,10 @@ describe('PlatformBinding', () => {
 });
 
 describe('WasmCloudBinding (deprecated alias)', () => {
+  it('is the same function as PlatformBinding', () => {
+    expect(WasmCloudBinding).toBe(PlatformBinding);
+  });
+
   it('works as an alias to PlatformBinding', () => {
     @WasmCloudBinding('user-database', {
       interfaces: ['query'],

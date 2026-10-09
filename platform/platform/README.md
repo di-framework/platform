@@ -600,12 +600,12 @@ di-framework platform service create postgres --name audit --target alpha --wait
 Declare the bindings in `src/bindings.ts` (or the project's configured bindings file):
 
 ```typescript
-import { Postgres, PlatformBinding } from '@di-framework/bindings';
+import { Postgres, WasmCloudBinding } from '@di-framework/bindings';
 
-@PlatformBinding('orders-db', { serviceName: 'orders' })
+@WasmCloudBinding('orders-db', { serviceName: 'orders' })
 export class OrdersDatabase extends Postgres {}
 
-@PlatformBinding('audit-db', { serviceName: 'audit' })
+@WasmCloudBinding('audit-db', { serviceName: 'audit' })
 export class AuditDatabase extends Postgres {}
 ```
 
