@@ -1,4 +1,4 @@
-import { DeployBundle, Deployment, DeployPlan, Empty, PushCredential } from './api.schemas.ts';
+import { DeployBundle, Deployment, DeployPlan, Empty, RegistryInfo } from './api.schemas.ts';
 import { manifest, operation } from './manifest.ts';
 
 const schema = { module: './api.schemas.ts' };
@@ -11,7 +11,7 @@ export default manifest(
     DeployPlan: { schema: DeployPlan, ...schema },
     Empty: { schema: Empty, ...schema },
     Deployment: { schema: Deployment, ...schema },
-    PushCredential: { schema: PushCredential, ...schema },
+    RegistryInfo: { schema: RegistryInfo, ...schema },
   },
   [
     operation(
@@ -41,17 +41,17 @@ export default manifest(
       'Deployment',
     ),
     operation(
-      'pushCredential',
+      'registry',
       {
-        method: 'POST',
-        path: '/deploy/push-credential',
+        method: 'GET',
+        path: '/deploy/registry',
         successStatus: 200,
-        summary: 'Get a registry push credential',
+        summary: 'Get the tenant registry',
         description:
-          'Returns a short-lived registry token scoped to the tenant repository path. The controller mints it as the registry token service; pushes go straight to the registry.',
+          "The tenant's own OCI registry: its URL and how to log in. Pull is open to viewers and developers; push needs developer. No credential is minted.",
       },
       'Empty',
-      'PushCredential',
+      'RegistryInfo',
     ),
   ],
 );

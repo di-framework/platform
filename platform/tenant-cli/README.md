@@ -32,15 +32,17 @@ Streaming operations (`logs`) are SSE: each `log` event's `data` is one `LogEven
 `end` closes the stream. The spec names this in the operation description; the framing itself is
 `src/client/sse.ts`.
 
-## Registry push credential
+## Registry
 
-`POST /v1/deploy/push-credential` (developer only) returns a `PushCredential`: registry host,
-repository path, a bearer token, its scope and `expiresAt`. Decision (platform#52): the controller
-does not proxy pushes. The platform registry is CNCF Distribution, which supports the Docker token
-auth spec, so the controller acts as the token service and signs a short-lived JWT (target 15
-minutes) whose access claim is `repository:<account>/*:pull,push`; the registry enforces scope and
-expiry. The CLI presents it as a bearer token and users never hold shared registry secrets. The
-registry must be configured with `auth.token`, and the controller mints the token, in #55.
+Each tenant gets its own OCI registry component in its namespace (platform#83, decision in
+platform#52). Nothing is minted: you log in to the registry with your own identity. Use your
+identity-server access token or a `dik_` API key as the Basic password (the username is ignored).
+The registry asks the tenant controller's `GET /v1/auth/whoami` who the caller is: a developer may
+push and pull, a viewer may only pull.
+
+`GET /v1/deploy/registry` (viewer or developer) returns `RegistryInfo`: the registry `url`, an
+optional `repositoryPrefix`, `auth` (`basic-identity`) and a fixed `username` hint. Push images to
+`<url>/<repositoryPrefix>/...` after logging in with that username and your token or key.
 
 ## Commands
 

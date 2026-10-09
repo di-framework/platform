@@ -29,6 +29,7 @@ test('every contract operation declares a role policy, and a viewer is read-only
       'whoami',
       'logout',
       'previewDeploy',
+      'registry',
       'logs',
       'deployments',
       'deploymentStats',

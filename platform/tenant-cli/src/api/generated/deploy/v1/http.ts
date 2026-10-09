@@ -4,13 +4,13 @@ import { useContainer } from '@di-framework/core/container';
 import { Component } from '@di-framework/core/decorators';
 import { Controller, Endpoint, json, TypedRouter } from '@di-framework/http';
 import { TenantControllerHandlers } from '../../../handlers';
-import { DeployBundle, DeployPlan, Deployment, Empty, PushCredential } from '../../../contracts/api.schemas';
+import { DeployBundle, DeployPlan, Deployment, RegistryInfo } from '../../../contracts/api.schemas';
 import {
   validateDeployBundle,
   validateDeployPlan,
   validateDeployment,
   validateEmpty,
-  validatePushCredential,
+  validateRegistryInfo,
 } from './contracts';
 
 const routes = TypedRouter();
@@ -93,39 +93,31 @@ export class DeployV1HttpController {
   });
 
   @Endpoint({
-    summary: 'Get a registry push credential',
-    description: 'Returns a short-lived registry token scoped to the tenant repository path. The controller mints it as the registry token service; pushes go straight to the registry.',
-    requestBody: {
-      content: {
-        'application/json': {
-          schema: Empty.jsonSchema,
-        },
-      },
-      required: true,
-    },
+    summary: 'Get the tenant registry',
+    description: 'The tenant\'s own OCI registry: its URL and how to log in. Pull is open to viewers and developers; push needs developer. No credential is minted.',
     responses: {
       '200': {
-        description: 'Get a registry push credential',
+        description: 'Get the tenant registry',
       content: {
         'application/json': {
-          schema: PushCredential.jsonSchema,
+          schema: RegistryInfo.jsonSchema,
         },
       },
       },
     },
   })
-  static pushCredential = routes.post('/v1/deploy/push-credential', async (request) => {
+  static registry = routes.get('/v1/deploy/registry', async (request) => {
     const self = useContainer().resolve(DeployV1HttpController);
-    const body = (request as { content?: unknown }).content;
+    const body = (request as { content?: unknown }).content ?? {};
     const command = validateEmpty(body);
 
-    const output = await self.handlers.pushCredential(command, {
+    const output = await self.handlers.registry(command, {
       transport: 'http' as const,
       request,
     });
 
     if (output instanceof Response) return output;
-    return json(validatePushCredential(output));
+    return json(validateRegistryInfo(output));
   });
 }
 

@@ -97,6 +97,7 @@ describe('/v1 dispatch', () => {
       'logs',
     ],
     ['POST', '/v1/services/web/proxy', '{"env":"prod"}', 'proxy'],
+    ['GET', '/v1/deploy/registry', undefined, 'registry'],
   ])('%s %s answers 501 problem+json', async (method, path, body, operation) => {
     const response = await call(method, path, { body });
     expect(response.status).toBe(501);
@@ -200,6 +201,10 @@ describe('/v1 dispatch', () => {
     expect(reachedCluster('/V1')).toBe(false);
   });
 
+  test('the registry operation requires a credential', async () => {
+    expect((await fetch(`${base}/v1/deploy/registry`)).status).toBe(401);
+  });
+
   test('/v1 operations still require a credential', async () => {
     const response = await fetch(`${base}/v1/deployments?env=prod`);
     expect(response.status).toBe(401);
@@ -230,6 +235,7 @@ describe('/v1 dispatch', () => {
       ['GET', '/v1/deployments/stats?env=prod', undefined],
       ['GET', '/v1/vars?env=prod', undefined],
       ['GET', '/v1/services/web/logs?env=prod', undefined],
+      ['GET', '/v1/deploy/registry', undefined],
       [
         'POST',
         '/v1/deploy/preview',

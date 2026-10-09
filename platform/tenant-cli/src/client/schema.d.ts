@@ -104,20 +104,20 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/deploy/push-credential": {
+    "/v1/deploy/registry": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get?: never;
-        put?: never;
         /**
-         * Get a registry push credential
-         * @description Returns a short-lived registry token scoped to the tenant repository path. The controller mints it as the registry token service; pushes go straight to the registry.
+         * Get the tenant registry
+         * @description The tenant's own OCI registry: its URL and how to log in. Pull is open to viewers and developers; push needs developer. No credential is minted.
          */
-        post: operations["pushCredential"];
+        get: operations["registry"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -392,18 +392,22 @@ export interface components {
             /** @description Names of tenant secrets the workload references; values never travel. */
             secrets: string[];
         };
-        /** @description A short-lived bearer token for the registry token-auth flow, scoped to the tenant repository path. It is never a shared registry secret. */
-        PushCredential: {
-            /** @description Registry host the token is valid for. */
-            registry: string;
-            /** @description Repository path the token is scoped to; push to references under it. */
-            repository: string;
-            /** @description Bearer token to present to the registry. */
-            token: string;
-            /** @description Granted access, for example `repository:acme/*:pull,push`. */
-            scope: string;
-            /** Format: date-time */
-            expiresAt: string;
+        /** @description Where a tenant pushes and pulls images: the tenant's own OCI registry. Log in with an identity-server access token or API key as the Basic password. */
+        RegistryInfo: {
+            /**
+             * Format: uri
+             * @description Base URL of the tenant's OCI registry.
+             */
+            url: string;
+            /** @description Namespace inside the tenant registry, when there is one. */
+            repositoryPrefix?: string;
+            /**
+             * @description Basic auth whose password is an identity-server access token or dik_ API key.
+             * @enum {string}
+             */
+            auth: "basic-identity";
+            /** @description A fixed hint for the Basic username; the registry ignores it. */
+            username: string;
         };
         DeployChange: {
             /** @enum {string} */
@@ -715,36 +719,36 @@ export interface operations {
             };
         };
     };
-    pushCredential: {
+    registry: {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        requestBody?: {
-            content: {
-                "application/json": Record<string, never>;
-            };
-        };
+        requestBody?: never;
         responses: {
-            /** @description Get a registry push credential */
+            /** @description Get the tenant registry */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": {
-                        /** @description Registry host the token is valid for. */
-                        registry: string;
-                        /** @description Repository path the token is scoped to; push to references under it. */
-                        repository: string;
-                        /** @description Bearer token to present to the registry. */
-                        token: string;
-                        /** @description Granted access, for example `repository:acme/*:pull,push`. */
-                        scope: string;
-                        /** Format: date-time */
-                        expiresAt: string;
+                        /**
+                         * Format: uri
+                         * @description Base URL of the tenant's OCI registry.
+                         */
+                        url: string;
+                        /** @description Namespace inside the tenant registry, when there is one. */
+                        repositoryPrefix?: string;
+                        /**
+                         * @description Basic auth whose password is an identity-server access token or dik_ API key.
+                         * @enum {string}
+                         */
+                        auth: "basic-identity";
+                        /** @description A fixed hint for the Basic username; the registry ignores it. */
+                        username: string;
                     };
                 };
             };
