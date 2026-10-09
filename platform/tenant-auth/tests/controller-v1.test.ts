@@ -80,12 +80,6 @@ describe('/v1 dispatch', () => {
     ['GET', '/v1/deployments?env=staging&service=web', undefined, 'deployments'],
     ['GET', '/v1/deployments/stats?env=prod', undefined, 'deploymentStats'],
     ['POST', '/v1/deployments/rollback', '{"env":"prod","service":"web"}', 'rollback'],
-    [
-      'GET',
-      '/v1/services/web/logs?env=prod&follow=true&tail=10&since=2026-10-09T00:00:00Z',
-      undefined,
-      'logs',
-    ],
     ['GET', '/v1/deploy/registry', undefined, 'registry'],
   ])('%s %s answers 501 problem+json', async (method, path, body, operation) => {
     const response = await call(method, path, { body });
@@ -223,7 +217,6 @@ describe('/v1 dispatch', () => {
     test.each([
       ['GET', '/v1/deployments?env=prod', undefined],
       ['GET', '/v1/deployments/stats?env=prod', undefined],
-      ['GET', '/v1/services/web/logs?env=prod', undefined],
       ['GET', '/v1/deploy/registry', undefined],
     ])('a viewer may call %s %s', async (method, path, body) => {
       const response = await call(method, path, { body, bearer: 'viewer' });

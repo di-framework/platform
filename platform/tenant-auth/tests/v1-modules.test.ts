@@ -250,7 +250,8 @@ describe('resource modules over real HTTP', () => {
         headers: { 'content-type': 'application/json' },
         body: method === 'POST' ? '{"env":"prod"}' : undefined,
       });
-      expect(before.status).toBe(501);
+      // logs is implemented (v1-logs.test.ts): this fake publishes no logs, so it answers 404.
+      expect(before.status).toBe(group === 'logs' ? 404 : 501);
 
       module[operation] = async (_command, _call, context) => {
         const upstream = await context
