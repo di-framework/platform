@@ -2,7 +2,7 @@ import { defineMetadata, getOwnMetadata } from '@di-framework/core/container';
 
 export const WASMCLOUD_BINDING_KEY = 'di:wasmcloud-binding';
 
-export type WasmCloudBindingOptions = {
+export type PlatformBindingOptions = {
   /** Same-namespace managed PostgreSQL BackingService. */
   serviceName?: string;
   interfaces?: string[];
@@ -11,10 +11,20 @@ export type WasmCloudBindingOptions = {
   config?: Record<string, string>;
 };
 
-export type WasmCloudBindingMetadata = {
+/**
+ * @deprecated Use `PlatformBindingOptions` instead. This alias will be removed in the next major version.
+ */
+export type WasmCloudBindingOptions = PlatformBindingOptions;
+
+export type PlatformBindingMetadata = {
   name: string;
-  options: WasmCloudBindingOptions;
+  options: PlatformBindingOptions;
 };
+
+/**
+ * @deprecated Use `PlatformBindingMetadata` instead. This alias will be removed in the next major version.
+ */
+export type WasmCloudBindingMetadata = PlatformBindingMetadata;
 
 const SECRET_CONFIG_KEYS = new Set([
   'password',
@@ -45,10 +55,10 @@ export function rejectsPlaintextSecret(
   return undefined;
 }
 
-export function defineBindingMetadata(target: object, metadata: WasmCloudBindingMetadata): void {
+export function defineBindingMetadata(target: object, metadata: PlatformBindingMetadata): void {
   defineMetadata(WASMCLOUD_BINDING_KEY, metadata, target);
 }
 
-export function getBindingMetadata(target: object): WasmCloudBindingMetadata | undefined {
-  return getOwnMetadata(WASMCLOUD_BINDING_KEY, target) as WasmCloudBindingMetadata | undefined;
+export function getBindingMetadata(target: object): PlatformBindingMetadata | undefined {
+  return getOwnMetadata(WASMCLOUD_BINDING_KEY, target) as PlatformBindingMetadata | undefined;
 }
