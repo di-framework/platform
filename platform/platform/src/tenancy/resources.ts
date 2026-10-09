@@ -1147,7 +1147,7 @@ function tenantAuthResources(
     }),
     // Tenant developers can only write Secrets (#112), so `/v1` reads them as the controller;
     // writes still go through as the calling user.
-    make(rbac, 'Role', 'tenant-controller-secrets', n.namespace, {
+    make(rbac, 'Role', 'tenant-controller-secret-reader', n.namespace, {
       rules: [{ apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list'] }],
     }),
   ];
@@ -1178,11 +1178,11 @@ function tenantAuthResources(
         },
         subjects,
       }),
-      make(rbac, 'RoleBinding', 'tenant-controller-secrets', n.namespace, {
+      make(rbac, 'RoleBinding', 'tenant-controller-secret-reader', n.namespace, {
         roleRef: {
           apiGroup: 'rbac.authorization.k8s.io',
           kind: 'Role',
-          name: 'tenant-controller-secrets',
+          name: 'tenant-controller-secret-reader',
         },
         subjects,
       }),

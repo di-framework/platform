@@ -226,11 +226,11 @@ describe('tenantAuthResources', () => {
       'ClusterRole//di-tenant-controller-alpha',
       'Role/wasmcloud/di-tenant-controller-alpha',
       'Role/di-runtime-alpha/tenant-controller-keys',
-      'Role/di-tenant-alpha/tenant-controller-secrets',
+      'Role/di-tenant-alpha/tenant-controller-secret-reader',
       'ClusterRoleBinding//di-tenant-controller-alpha',
       'RoleBinding/wasmcloud/di-tenant-controller-alpha',
       'RoleBinding/di-runtime-alpha/tenant-controller-keys',
-      'RoleBinding/di-tenant-alpha/tenant-controller-secrets',
+      'RoleBinding/di-tenant-alpha/tenant-controller-secret-reader',
       'NetworkPolicy/di-runtime-alpha/tenant-auth-egress',
       'ConfigMap/di-runtime-alpha/tenant-controller-ca',
       'Secret/di-runtime-alpha/tenant-controller-tls',
@@ -465,17 +465,17 @@ describe('tenantAuthResources', () => {
 
   it('lets the controller only read Secrets in the tenant namespace (#112)', () => {
     const resources = tenantAuthResources(tenant(), cfg, inputs);
-    const role = find(resources, 'Role', 'tenant-controller-secrets');
+    const role = find(resources, 'Role', 'tenant-controller-secret-reader');
     expect(role?.metadata.namespace).toBe('di-tenant-alpha');
     expect(role?.rules).toEqual([
       { apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list'] },
     ]);
-    const binding = find(resources, 'RoleBinding', 'tenant-controller-secrets');
+    const binding = find(resources, 'RoleBinding', 'tenant-controller-secret-reader');
     expect(binding?.metadata.namespace).toBe('di-tenant-alpha');
     expect(binding?.roleRef).toEqual({
       apiGroup: 'rbac.authorization.k8s.io',
       kind: 'Role',
-      name: 'tenant-controller-secrets',
+      name: 'tenant-controller-secret-reader',
     });
     expect(binding?.subjects).toEqual([
       { kind: 'ServiceAccount', name: 'tenant-controller', namespace: 'di-runtime-alpha' },

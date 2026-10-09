@@ -417,7 +417,7 @@ tenantAuth:
 - RBAC: `di-tenant-controller-<tenant>` lets the controller ServiceAccount create tokens only
   for `di-user-<member>` of the tenant's active (not suspended, not deleted) members. The list
   is recomputed from the User CRs on every reconcile; with no members the Role has no rule.
-  A suspended tenant keeps the roles and loses the bindings. `tenant-controller-secrets` in
+  A suspended tenant keeps the roles and loses the bindings. `tenant-controller-secret-reader` in
   `di-tenant-<tenant>` lets it `get`/`list` Secrets there, because tenant developers can only
   write them (#112); writes still go through as the calling user.
 - Network: `tenant-auth-egress` adds egress to the API server endpoints (EndpointSlice
