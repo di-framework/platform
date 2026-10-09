@@ -144,7 +144,7 @@ describe('tenant host pod', () => {
     };
   }
 
-  it('replaces the host in place only when it holds workload storage', () => {
+  it('replaces the host in place with or without workload storage', () => {
     const strategy = (keys: string[]) =>
       (
         (
@@ -153,11 +153,12 @@ describe('tenant host pod', () => {
           ) as Resource
         ).spec as { strategy?: unknown }
       ).strategy;
-    expect(strategy([])).toBeUndefined();
-    expect(strategy(['mesh'])).toEqual({
+    const expected = {
       type: 'RollingUpdate',
       rollingUpdate: { maxSurge: 0, maxUnavailable: 1 },
-    });
+    };
+    expect(strategy([])).toEqual(expected);
+    expect(strategy(['mesh'])).toEqual(expected);
   });
 
   it('is unchanged when no workload asks for storage', () => {

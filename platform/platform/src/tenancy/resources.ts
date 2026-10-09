@@ -605,18 +605,16 @@ function tenantResources(
       make('apps/v1', 'Deployment', `hostgroup-${n.hostgroup}`, n.runtimeNamespace, {
         spec: {
           replicas,
-          // A storage host owns node-local workload directories. A surge pod would run a
-          // second host on them and does not fit the runtime quota, so the old host leaves
-          // first. This stays RollingUpdate: switching type to Recreate under server-side
-          // apply is rejected while the defaulted rollingUpdate block remains.
-          ...(storageKeys.length
-            ? {
-                strategy: {
-                  type: 'RollingUpdate',
-                  rollingUpdate: { maxSurge: 0, maxUnavailable: 1 },
-                },
-              }
-            : {}),
+          // The old host leaves before its replacement starts, never a surge pod. A storage
+          // host owns node-local workload directories a second host must not share, and the
+          // runtime quota (limits.cpu) leaves no room for a surge host, so a template change
+          // would otherwise stall with the old host running. This stays RollingUpdate:
+          // switching type to Recreate under server-side apply is rejected while the
+          // defaulted rollingUpdate block remains.
+          strategy: {
+            type: 'RollingUpdate',
+            rollingUpdate: { maxSurge: 0, maxUnavailable: 1 },
+          },
           selector: {
             matchLabels: {
               'wasmcloud.com/hostgroup': n.hostgroup,
