@@ -121,11 +121,48 @@ function location(value: Resource | Owned): string {
 export interface Api {
   call<T>(method: string, path: string, body?: unknown, contentType?: string): Promise<T>;
 }
+const CONFLICT_SUMMARY_LIMIT = 1024;
+/**
+ * Summarize a Kubernetes Status 409 body as the conflicting managers and fields.
+ * The raw body is never retained; non-JSON and non-Status bodies yield undefined.
+ */
+export function summarizeConflict(body: string): string | undefined {
+  let status: unknown;
+  try {
+    status = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (typeof status !== 'object' || status === null) return undefined;
+  const s = status as {
+    kind?: unknown;
+    message?: unknown;
+    details?: { causes?: { reason?: unknown; message?: unknown; field?: unknown }[] };
+  };
+  if (s.kind !== 'Status') return undefined;
+  const causes = Array.isArray(s.details?.causes) ? s.details.causes : [];
+  const pairs = causes
+    .filter((c) => c && c.reason === 'FieldManagerConflict')
+    .map((c) => {
+      const manager = /conflict with "([^"]*)"/.exec(String(c.message ?? ''))?.[1];
+      const field = typeof c.field === 'string' ? c.field : undefined;
+      return manager && field ? `${manager}: ${field}` : (manager ?? field);
+    })
+    .filter((v): v is string => Boolean(v));
+  const summary = pairs.length
+    ? pairs.join('; ')
+    : typeof s.message === 'string'
+      ? s.message
+      : undefined;
+  if (!summary) return undefined;
+  return summary.length > CONFLICT_SUMMARY_LIMIT
+    ? `${summary.slice(0, CONFLICT_SUMMARY_LIMIT)}...`
+    : summary;
+}
 export class ApiError extends Error {
   constructor(
     public readonly code: number,
     message: string,
-    public readonly responseBody?: string,
   ) {
     super(message);
   }
@@ -165,14 +202,13 @@ export class KubernetesApi implements Api {
           res.on('end', () => {
             const plainText = path.split('?')[0]?.endsWith('/log');
             if ((res.statusCode ?? 500) >= 300) {
-              // For 409 conflicts, include the response body which names the conflicting field managers.
-              // Do not put other API response bodies in logs: they may contain Secret data.
-              const responseBody = res.statusCode === 409 ? text : undefined;
+              // Only a parsed 409 conflict summary is surfaced; other API response bodies
+              // stay out of errors and logs because they may contain Secret data.
+              const conflict = res.statusCode === 409 ? summarizeConflict(text) : undefined;
               reject(
                 new ApiError(
                   res.statusCode ?? 500,
-                  `${method} ${path.split('?')[0]} returned ${res.statusCode}`,
-                  responseBody,
+                  `${method} ${path.split('?')[0]} returned ${res.statusCode}${conflict ? `: ${conflict}` : ''}`,
                 ),
               );
             } else if (plainText) {
@@ -1285,11 +1321,7 @@ export class Controller {
         if (value.kind === 'Tenant') await this.reconcileTenant(value as Tenant);
         else await this.reconcileUser(value as User, tenants);
       } catch (error) {
-        let message = error instanceof Error ? error.message : 'Reconciliation failed';
-        // For API 409 conflicts, include the response body which names conflicting field managers
-        if (error instanceof ApiError && error.code === 409 && error.responseBody) {
-          message = `${message}; conflict details: ${error.responseBody}`;
-        }
+        const message = error instanceof Error ? error.message : 'Reconciliation failed';
         console.error(`${value.kind}/${value.metadata.name}: ${message}`);
         try {
           await this.status(value, false, 'ReconcileError', message);

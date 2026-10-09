@@ -113,36 +113,83 @@ describe('Kubernetes API transport', () => {
       expect(error).toBeInstanceOf(ApiError);
       expect((error as ApiError).code).toBe(403);
       expect((error as ApiError).message).toBe('GET /api/v1/secrets returned 403');
-      expect((error as ApiError).responseBody).toBeUndefined();
     } finally {
       t.restore();
     }
   });
 
-  it('includes response body for 409 conflict errors to report conflicting field managers', async () => {
-    const conflictResponse = JSON.stringify({
+  const conflictBody = (extra: object = {}) =>
+    JSON.stringify({
       kind: 'Status',
       apiVersion: 'v1',
       metadata: {},
       status: 'Failure',
-      message: 'Apply failed with 1 conflict: conflict with "some-manager" over field "spec.strategy"',
+      message:
+        'Apply failed with 2 conflicts: conflicts with "kubectl-client-side-apply" using apps/v1: .spec.replicas',
       reason: 'Conflict',
+      details: {
+        name: 'hostgroup-tenant-identity',
+        group: 'apps',
+        kind: 'deployments',
+        causes: [
+          {
+            reason: 'FieldManagerConflict',
+            message: 'conflict with "kubectl-client-side-apply" using apps/v1',
+            field: '.spec.replicas',
+          },
+          {
+            reason: 'FieldManagerConflict',
+            message: 'conflict with "helm" using apps/v1',
+            field: '.spec.template.spec.containers[name="host"].image',
+          },
+        ],
+      },
       code: 409,
+      ...extra,
     });
-    const t = transport(409, conflictResponse);
+  const conflictPath =
+    '/api/v1/namespaces/di-runtime-identity/deployments/hostgroup-tenant-identity';
+  const conflictPrefix = `PATCH ${conflictPath} returned 409`;
+
+  async function conflictError(body: string): Promise<ApiError> {
+    const t = transport(409, body);
     try {
-      const error = await new KubernetesApi()
-        .call('PATCH', '/api/v1/namespaces/di-runtime-identity/deployments/hostgroup-tenant-identity')
-        .catch((e) => e);
-      expect(error).toBeInstanceOf(ApiError);
-      expect((error as ApiError).code).toBe(409);
-      expect((error as ApiError).message).toBe(
-        'PATCH /api/v1/namespaces/di-runtime-identity/deployments/hostgroup-tenant-identity returned 409',
-      );
-      expect((error as ApiError).responseBody).toBe(conflictResponse);
+      return (await new KubernetesApi().call('PATCH', conflictPath).catch((e) => e)) as ApiError;
     } finally {
       t.restore();
     }
+  }
+
+  it('names conflicting managers and fields from a 409 Status body', async () => {
+    const error = await conflictError(conflictBody());
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.code).toBe(409);
+    expect(error.message).toBe(
+      `${conflictPrefix}: kubectl-client-side-apply: .spec.replicas; helm: .spec.template.spec.containers[name="host"].image`,
+    );
+    expect(Object.keys(error)).not.toContain('responseBody');
+  });
+
+  it('falls back to the Status message when there are no causes', async () => {
+    const error = await conflictError(conflictBody({ details: undefined }));
+    expect(error.message).toContain('Apply failed with 2 conflicts');
+  });
+
+  it('ignores 409 bodies that are not JSON or not a Status', async () => {
+    expect((await conflictError('private-secret-data')).message).toBe(conflictPrefix);
+    expect((await conflictError(JSON.stringify({ kind: 'Secret', message: 'x' }))).message).toBe(
+      conflictPrefix,
+    );
+    expect((await conflictError('null')).message).toBe(conflictPrefix);
+    expect((await conflictError(JSON.stringify({ kind: 'Status' }))).message).toBe(conflictPrefix);
+  });
+
+  it('caps the conflict summary at about 1 KiB', async () => {
+    const error = await conflictError(
+      conflictBody({ details: undefined, message: 'x'.repeat(5000) }),
+    );
+    expect(error.message.length).toBeLessThanOrEqual(conflictPrefix.length + 2 + 1024 + 3);
+    expect(error.message.endsWith('...')).toBe(true);
   });
 
   it('returns pod logs as plain text instead of parsing JSON', async () => {
