@@ -110,16 +110,33 @@ describe('resource modules over real HTTP', () => {
   });
 
   test.each([
-    ['an RBAC refusal', new KubeError(403, 'secrets is forbidden'), 403, 'Forbidden'],
-    ['a missing object', new KubeError(404, 'secrets "x" not found'), 404, 'Not Found'],
-    ['a conflict', new KubeError(409, 'already exists'), 409, 'Conflict'],
-    ['the no-user refusal', new KubeError(401, 'no user to act as'), 401, 'Unauthorized'],
-    ['an unusual 4xx', new KubeError(418, 'teapot'), 418, 'Client Error'],
-    ['an upstream failure', new KubeError(503, 'etcd is down'), 502, 'Bad Gateway'],
-    ['an identity error', new AuthError(403, 'not a member'), 403, 'Forbidden'],
+    [
+      'an RBAC refusal',
+      new KubeError(403, 'secrets is forbidden'),
+      403,
+      'Forbidden',
+      'request.denied',
+    ],
+    [
+      'a missing object',
+      new KubeError(404, 'secrets "x" not found'),
+      404,
+      'Not Found',
+      'request.failed',
+    ],
+    ['a conflict', new KubeError(409, 'already exists'), 409, 'Conflict', 'request.failed'],
+    [
+      'the no-user refusal',
+      new KubeError(401, 'no user to act as'),
+      401,
+      'Unauthorized',
+      'request.denied',
+    ],
+    ['an unusual 4xx', new KubeError(418, 'teapot'), 418, 'Client Error', 'request.failed'],
+    ['an identity error', new AuthError(403, 'not a member'), 403, 'Forbidden', 'request.denied'],
   ] as const)(
     'maps %s raised in a handler to problem+json',
-    async (_name, error, status, title) => {
+    async (_name, error, status, title, event) => {
       const module = MODULES.deploy as Record<string, V1Handler>;
       const stub = module.deployments as V1Handler;
       module.deployments = async () => {
@@ -136,7 +153,7 @@ describe('resource modules over real HTTP', () => {
           detail: error.message,
         });
         expect(lastAudit()).toMatchObject({
-          event: 'request.failed',
+          event,
           user: 'alice',
           method: 'GET',
           path: '/v1/deployments',
@@ -148,6 +165,47 @@ describe('resource modules over real HTTP', () => {
       }
     },
   );
+
+  test.each([
+    ['an upstream failure', new KubeError(503, 'etcd is down in kube-system')],
+    [
+      'a token mint failure',
+      new KubeError(
+        502,
+        'could not mint a token for alice: serviceaccounts "di-user-alice" not found in di-runtime-acme',
+      ),
+    ],
+    ['a timeout', new KubeError(504, 'GET /api/v1/namespaces/di-runtime-acme/secrets timed out')],
+  ] as const)('hides the detail of %s behind a fixed 502 and audits it', async (_name, error) => {
+    const module = MODULES.deploy as Record<string, V1Handler>;
+    const stub = module.deployments as V1Handler;
+    module.deployments = async () => {
+      throw error;
+    };
+    try {
+      const response = await fetch(`${base}/v1/deployments?env=prod`);
+      expect(response.status).toBe(502);
+      const text = await response.text();
+      expect(text).not.toContain(error.message);
+      expect(text).not.toContain('di-user-');
+      expect(text).not.toContain('di-runtime-acme');
+      expect(JSON.parse(text)).toEqual({
+        type: 'about:blank',
+        title: 'Bad Gateway',
+        status: 502,
+        detail: 'the cluster request failed',
+      });
+      expect(lastAudit()).toMatchObject({
+        event: 'request.failed',
+        user: 'alice',
+        path: '/v1/deployments',
+        status: 502,
+        reason: error.message,
+      });
+    } finally {
+      module.deployments = stub;
+    }
+  });
 
   test('answers an unexpected handler error with a generic 500 and audits it', async () => {
     const module = MODULES.deploy as Record<string, V1Handler>;

@@ -328,7 +328,8 @@ export function asUser(
     try {
       return await tokens.token(user);
     } catch (error) {
-      throw new KubeError(502, `could not mint a token for ${user}: ${(error as Error).message}`);
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new KubeError(502, `could not mint a token for ${user}: ${reason}`);
     }
   };
   const once = async (method: string, path: string, init: AsUserInit) => {

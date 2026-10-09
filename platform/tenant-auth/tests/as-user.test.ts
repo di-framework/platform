@@ -176,6 +176,18 @@ describe('call', () => {
     expect(raw.status).toBe(502);
   });
 
+  test('describes a token source that rejects with a non-Error value', async () => {
+    const source: UserTokens = {
+      token: () => Promise.reject('vault sealed'),
+      forget: () => {},
+    };
+    const user = asUser(client, source, { user: 'dan' });
+    const error = (await user.call('GET', '/things').catch((e: KubeError) => e)) as KubeError;
+    expect(error).toBeInstanceOf(KubeError);
+    expect(error.status).toBe(502);
+    expect(error.message).toBe('could not mint a token for dan: vault sealed');
+  });
+
   test('maps a 401 that persists after the retry to KubeError(502)', async () => {
     const source = tokens('stale', 'stale');
     const error = (await asUser(client, source, { user: 'dan' })
