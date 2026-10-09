@@ -168,7 +168,7 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
     {
       apiGroups: ['rbac.authorization.k8s.io'],
       resources: ['clusterroles', 'clusterrolebindings'],
-      verbs: ['get', 'list', 'watch', 'create', 'patch', 'update', 'delete'],
+      verbs: ['get', 'list', 'create', 'patch', 'delete'],
     },
   ];
 }

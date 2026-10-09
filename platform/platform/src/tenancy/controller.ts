@@ -242,6 +242,19 @@ export class KubernetesApi implements Api {
 }
 /** How far before the cursor each pod log read starts (see projectLogs). */
 const LOG_LOOKBACK_MS = 120_000;
+const TENANT_AUTH_KINDS = [
+  ['apps/v1', 'Deployment'],
+  ['v1', 'Service'],
+  ['networking.k8s.io/v1', 'NetworkPolicy'],
+  ['rbac.authorization.k8s.io/v1', 'ClusterRoleBinding'],
+  ['rbac.authorization.k8s.io/v1', 'RoleBinding'],
+  ['rbac.authorization.k8s.io/v1', 'ClusterRole'],
+  ['rbac.authorization.k8s.io/v1', 'Role'],
+  ['v1', 'Secret'],
+  ['v1', 'ConfigMap'],
+  ['v1', 'ServiceAccount'],
+] as const;
+
 export class Controller {
   /** Newest TracingLogger timestamp already projected, per host pod uid. */
   private readonly logCursors = new Map<string, string>();
@@ -458,7 +471,10 @@ export class Controller {
     if (tenant.spec.suspended || tenant.metadata.deletionTimestamp)
       await this.revoke({ [TENANT]: tenant.metadata.name });
     // Namespace deletion does not reach the cluster-scoped and platform-namespace RBAC.
-    if (tenant.metadata.deletionTimestamp) await this.removeTenantAuth(tenant);
+    if (tenant.metadata.deletionTimestamp) {
+      this.tenantAuthClean = false;
+      await this.removeTenantAuth(tenant);
+    }
     if (tenant.metadata.deletionTimestamp && tenant.spec.deletionPolicy === 'Delete') {
       let remaining = false;
       for (const name of [n.namespace, n.runtimeNamespace]) {
@@ -574,7 +590,7 @@ export class Controller {
     });
     try {
       if (!this.cfg.tenantAuth) {
-        await this.removeTenantAuth(tenant);
+        await this.pruneTenantAuth();
         return undefined;
       }
       const desired = tenantAuthResources(
@@ -619,20 +635,29 @@ export class Controller {
       [OWNER]: tenant.metadata.uid!,
       [COMPONENT]: 'tenant-auth',
     };
-    for (const [apiVersion, kind] of [
-      ['apps/v1', 'Deployment'],
-      ['v1', 'Service'],
-      ['networking.k8s.io/v1', 'NetworkPolicy'],
-      ['rbac.authorization.k8s.io/v1', 'ClusterRoleBinding'],
-      ['rbac.authorization.k8s.io/v1', 'RoleBinding'],
-      ['rbac.authorization.k8s.io/v1', 'ClusterRole'],
-      ['rbac.authorization.k8s.io/v1', 'Role'],
-      ['v1', 'Secret'],
-      ['v1', 'ConfigMap'],
-      ['v1', 'ServiceAccount'],
-    ] as const)
+    for (const [apiVersion, kind] of TENANT_AUTH_KINDS)
       for (const value of await this.list<Resource>(apiVersion, kind, labels))
         await this.remove(value);
+  }
+  /** True once a sweep found no tenant-auth objects; reset when a Tenant is deleted. */
+  private tenantAuthClean = false;
+  /**
+   * With `tenantAuth` unset, delete every tenant-auth object of this installation. Each kind is
+   * listed once (not once per Tenant), and after a sweep finds nothing the sweep is skipped
+   * until a Tenant is deleted.
+   */
+  private async pruneTenantAuth(): Promise<void> {
+    if (this.tenantAuthClean) return;
+    let found = false;
+    for (const [apiVersion, kind] of TENANT_AUTH_KINDS)
+      for (const value of await this.list<Resource>(apiVersion, kind, {
+        [INSTALLATION]: this.cfg.installation,
+        [COMPONENT]: 'tenant-auth',
+      })) {
+        found = true;
+        await this.remove(value);
+      }
+    this.tenantAuthClean = !found;
   }
   /** No gateway is published any more: drop the route template so the console stops linking. */
   private async removeRoutes(tenant: Tenant): Promise<void> {

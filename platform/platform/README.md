@@ -444,7 +444,8 @@ The reconcile does not adopt objects that `deploy-local.ts` created (`TenantAuth
 `Refusing to adopt`). Delete them first: in `di-runtime-<tenant>` the Deployments, Services,
 ServiceAccounts, Role and RoleBinding `tenant-controller-keys`, NetworkPolicy, Secrets
 `tenant-controller-tls` and `tenant-console-oauth`, and ConfigMaps `tenant-controller-ca` and
-`tenant-auth-bundle`; in the platform namespace the Role and RoleBinding
+`tenant-auth-bundle`; in `di-tenant-<tenant>` the Role and RoleBinding
+`tenant-controller-secret-reader`; in the platform namespace the Role and RoleBinding
 `di-tenant-controller-<tenant>`; and the cluster-scoped ClusterRole and ClusterRoleBinding
 `di-tenant-controller-<tenant>`.
 

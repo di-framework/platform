@@ -151,15 +151,7 @@ describe('tenant-auth configuration', () => {
     );
     expect(cluster).toHaveLength(1);
     expect(cluster[0]?.resources).toEqual(['clusterroles', 'clusterrolebindings']);
-    expect(cluster[0]?.verbs).toEqual([
-      'get',
-      'list',
-      'watch',
-      'create',
-      'patch',
-      'update',
-      'delete',
-    ]);
+    expect(cluster[0]?.verbs).toEqual(['get', 'list', 'create', 'patch', 'delete']);
     // Never cluster-admin by proxy: no rule lets it bind or escalate cluster-scoped roles.
     for (const verb of ['bind', 'escalate']) expect(cluster[0]?.verbs).not.toContain(verb);
     expect(rules.find((r) => r.resources.includes('rolebindings'))?.verbs).toContain('escalate');
@@ -892,6 +884,37 @@ describe('reconcileTenant with tenant-auth', () => {
       `${collection('v1', 'ResourceQuota', 'di-runtime-alpha')}/di-runtime-quota`,
     ) as unknown as { spec: { hard: Record<string, string> } };
     expect(quota.spec.hard['limits.cpu']).toBe('2');
+  });
+
+  it('lists each kind once per sweep and stops sweeping once nothing is left (tenantAuth unset)', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t, [user('alice', ['alpha'])]);
+    const lists: string[] = [];
+    const counting: Api = {
+      call: <T>(method: string, p: string, body?: unknown) => {
+        if (method === 'GET' && p.includes(encodeURIComponent(`${COMPONENT}=tenant-auth`)))
+          lists.push(p);
+        return api.call<T>(method, p, body);
+      },
+    };
+    const { tenantAuth: _, ...plain } = cfg;
+    const unset = new Controller(counting, plain);
+    const other = tenant();
+    await unset.reconcileTenant(t, []);
+    expect(lists).toHaveLength(10);
+    expect(tenantAuthObjects(api)).toEqual([]);
+    lists.length = 0;
+    await unset.reconcileTenant(t, []);
+    await unset.reconcileTenant(other, []);
+    expect(lists).toHaveLength(10);
+    lists.length = 0;
+    await unset.reconcileTenant(t, []);
+    await unset.reconcileTenant(other, []);
+    expect(lists).toHaveLength(0);
+    t.metadata.deletionTimestamp = '2026-01-01T00:00:00Z';
+    await unset.reconcileTenant(t, []);
+    await unset.reconcileTenant(other, []);
+    expect(lists.length).toBeGreaterThan(0);
   });
 
   it('logs and skips a failed prune when tenantAuth is unset', async () => {
