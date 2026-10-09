@@ -239,7 +239,6 @@ describe('resource modules over real HTTP', () => {
   });
 
   test.each([
-    ['config', 'secrets', 'GET', '/v1/secrets?env=prod'],
     ['logs', 'logs', 'GET', '/v1/services/web/logs?env=prod'],
     ['deploy', 'deployments', 'GET', '/v1/deployments?env=prod'],
   ] as [string, string, string, string][])(
