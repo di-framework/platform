@@ -1,0 +1,115 @@
+/** Component-specific patches on top of the pinned PostgreSQL engine sources. */
+import { resolve } from 'node:path';
+import { die, isDirectory, packageDir, readFileText } from './lib.ts';
+
+/** Only these two engine sources may be patched. */
+export const ALLOWED_RELATIVE_FILES = new Set([
+  'src/backend/libpq/pqcomm.c',
+  'pglite-wasm/pg_main.c',
+]);
+
+/** Resolve and validate the engine source directory CLI argument. */
+export async function resolveSourceArg(argv: string[], cwd = process.cwd()): Promise<string> {
+  if (argv.length !== 1 || !argv[0] || argv[0] === '-h' || argv[0] === '--help') {
+    throw new Error('usage: patch-engine-source.ts <engine-source-dir>');
+  }
+  const candidate = argv[0] as string;
+  const resolved = resolve(cwd, candidate);
+  if (!(await isDirectory(resolved))) throw new Error(`source dir does not exist: ${resolved}`);
+  return resolved;
+}
+
+/**
+ * Resolve an allowlisted relative file inside `source`, refusing anything
+ * that would escape the source tree.
+ */
+export function checkedPath(source: string, relative: string): string {
+  if (!ALLOWED_RELATIVE_FILES.has(relative)) {
+    throw new Error(`refusing unexpected relative path: ${relative}`);
+  }
+  const resolved = resolve(source, relative);
+  if (resolved !== source && !resolved.startsWith(`${source}/`)) {
+    throw new Error(`refusing path outside source dir: ${relative}`);
+  }
+  if (resolved === source) throw new Error(`refusing path outside source dir: ${relative}`);
+  return resolved;
+}
+
+export const PQCOMM_MARKER = '/* di-framework: collect CMA replies';
+export const PQCOMM_FALLBACK_START = 'static int\ninternal_putbytes(const char *s, size_t len) {';
+export const PQCOMM_END = '\nstatic int\nsocket_flush';
+export const PG_BACKEND_START = '     void pgl_backend()';
+export const PG_BACKEND_END = '  backend_started:;';
+export const PG_DEFAULTS_MARKER = '/* di-framework: application session defaults */';
+
+/** C bytes replacing initdb's insecure `"-F", "-O", "-j"` defaults. */
+export const INITDB_DEFAULTS_NEW = [
+  '"-O", "-j",',
+  '            "-c", "search_path=\\"$user\\", public",',
+  '            "-c", "fsync=on",',
+  '            "-c", "synchronous_commit=on",',
+  '            "-c", "full_page_writes=on",',
+].join('\n');
+
+/** Session defaults installed after bootstrap (matches the old Python patch byte-for-byte). */
+export const SESSION_DEFAULTS_BLOCK = [
+  '    /* di-framework: application session defaults */',
+  '    SetConfigOption("search_path", "\\"$user\\", public", PGC_USERSET, PGC_S_OVERRIDE);',
+  '    SetConfigOption("exit_on_error", "off", PGC_USERSET, PGC_S_OVERRIDE);',
+  '    SetConfigOption("ignore_invalid_pages", "off", PGC_POSTMASTER, PGC_S_OVERRIDE);',
+  '    ResetAllOptions();',
+  '',
+].join('\n');
+
+export async function patchEngineSource(source: string, pkgDir: string): Promise<void> {
+  const pqcomm = checkedPath(source, 'src/backend/libpq/pqcomm.c');
+  let text = await readFileText(pqcomm);
+  const start = text.includes(PQCOMM_MARKER)
+    ? text.indexOf(PQCOMM_MARKER)
+    : text.indexOf(PQCOMM_FALLBACK_START);
+  if (start < 0) throw new Error(`pqcomm.c: patch anchor not found in ${pqcomm}`);
+  const end = text.indexOf(PQCOMM_END, start);
+  if (end < 0) throw new Error(`pqcomm.c: patch end anchor not found in ${pqcomm}`);
+  const replyBuffer = await readFileText(`${pkgDir}/engine/reply-buffer.c`);
+  await Bun.write(pqcomm, `${text.slice(0, start)}${replyBuffer}\n${text.slice(end)}`);
+
+  const pgMain = checkedPath(source, 'pglite-wasm/pg_main.c');
+  text = await readFileText(pgMain);
+  const bodyStart = text.indexOf(PG_BACKEND_START);
+  if (bodyStart < 0) throw new Error(`pg_main.c: pgl_backend not found in ${pgMain}`);
+  const bodyEnd = text.indexOf(PG_BACKEND_END, bodyStart);
+  if (bodyEnd < 0) throw new Error(`pg_main.c: backend_started not found in ${pgMain}`);
+  const oldDefaults = '"-F", "-O", "-j",';
+  const body = text.slice(bodyStart, bodyEnd);
+  if (body.includes(oldDefaults)) {
+    const occurrences = body.split(oldDefaults).length - 1;
+    if (occurrences !== 2) {
+      throw new Error(`pg_main.c: expected 2 initdb default blocks, found ${occurrences}`);
+    }
+    text =
+      text.slice(0, bodyStart) +
+      body.replaceAll(oldDefaults, INITDB_DEFAULTS_NEW) +
+      text.slice(bodyEnd);
+  }
+  if (!text.includes(PG_DEFAULTS_MARKER)) {
+    if (!text.includes(PG_BACKEND_END))
+      throw new Error('pg_main.c: session defaults insert failed');
+    text = text.replace(PG_BACKEND_END, `${PG_BACKEND_END}\n${SESSION_DEFAULTS_BLOCK}`);
+  }
+  await Bun.write(pgMain, text);
+}
+
+if (import.meta.main) {
+  const pkgDir = packageDir(import.meta.url);
+  let source: string;
+  try {
+    source = await resolveSourceArg(process.argv.slice(2));
+  } catch (error) {
+    die('patch-engine-source', error instanceof Error ? error.message : String(error));
+  }
+  try {
+    await patchEngineSource(source, pkgDir);
+  } catch (error) {
+    die('patch-engine-source', error instanceof Error ? error.message : String(error));
+  }
+}

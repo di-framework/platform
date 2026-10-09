@@ -139,7 +139,7 @@ annotations provide storage; they do not enforce database ownership.
 - `src/pgwire.rs`: PostgreSQL message encoding and typed rows, over memory.
 - `src/engine.rs`: persistent filesystem setup and exclusive engine access.
 - `engine/bridge.wat`: private canonical ABI bridge to the core engine.
-- `scripts/prepare-engine.py`: pinned engine preparation and componentization.
+- `scripts/prepare-engine.ts`: pinned engine preparation and componentization (all build scripts are Bun TypeScript; see `scripts/`).
 - `wit/deps/pglite-engine/engine.wit`: internal interface, composed away at build.
 
 Engine provenance and modifications are described in `engine/NOTICE`.

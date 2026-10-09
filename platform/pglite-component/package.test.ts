@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const pkgDir = import.meta.dir;
@@ -44,6 +44,32 @@ describe('pglite-component package', () => {
   test('component sources exist', () => {
     for (const file of ['Makefile', 'Cargo.toml', 'wit/world.wit']) {
       expect(existsSync(join(pkgDir, file)), file).toBe(true);
+    }
+  });
+
+  // Build scripts are Bun TypeScript (testable, auto-escaped shell). Guard the
+  // migration: every build script must exist as .ts and no .sh/.py may remain.
+  test('build scripts are TypeScript', () => {
+    const scripts = join(pkgDir, 'scripts');
+    const names = readdirSync(scripts);
+    for (const file of [
+      'lib.ts',
+      'env.ts',
+      'install-tools.ts',
+      'build.ts',
+      'build-engine.ts',
+      'patch-engine-source.ts',
+      'prepare-engine.ts',
+      'compose.ts',
+      'smoke.ts',
+      'check.ts',
+      'wit.ts',
+    ]) {
+      expect(existsSync(join(scripts, file)), file).toBe(true);
+    }
+    for (const name of names) {
+      expect(name.endsWith('.sh'), name).toBe(false);
+      expect(name.endsWith('.py'), name).toBe(false);
     }
   });
 });
