@@ -1,7 +1,7 @@
 # Rust build output
 /target/
 
-# Hermetic toolchain installed by scripts/install-tools.sh
+# Hermetic toolchain installed by scripts/install-tools.ts
 /.tools/
 
 # Built artifacts are produced by `make build`; publish them via release

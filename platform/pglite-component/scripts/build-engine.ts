@@ -1,19 +1,12 @@
 /** Build the PostgreSQL WASI engine with real setjmp/longjmp error recovery. */
-import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import {
-  die,
-  fileExists,
-  isDirectory,
-  loadToolEnv,
-  log,
-  mkdir,
-  packageDir,
-  readFileText,
-  requiredPin,
-  setupEnv,
-} from './lib.ts';
+import { $ } from 'bun';
+import { type Context, logger, run } from './lib/cli.ts';
+import { fileExists, isDirectory } from './lib/fs.ts';
+import { requiredPin } from './lib/versions.ts';
+
+const log = logger('build-engine');
 
 /** Files whose contents form the source-tree stamp (mirrors the old shell STAMP). */
 export const STAMP_FILES = [
@@ -23,11 +16,11 @@ export const STAMP_FILES = [
 ] as const;
 
 export async function sourceStamp(pkgDir: string, selfPath: string): Promise<string> {
-  const hash = createHash('sha256');
+  const hasher = new Bun.CryptoHasher('sha256');
   for (const file of [selfPath, ...STAMP_FILES.map((f) => join(pkgDir, f))]) {
-    hash.update(await readFile(file));
+    hasher.update(await Bun.file(file).bytes());
   }
-  return hash.digest('hex');
+  return hasher.digest('hex');
 }
 
 /**
@@ -80,55 +73,55 @@ export function patchUpstreamBuild(
   return { versionsEnv: patchedVersions, buildSh: patchedBuild };
 }
 
-export async function buildEngineSource(pkgDir?: string): Promise<void> {
-  const dir = pkgDir ?? packageDir(import.meta.url);
-  const env = await loadToolEnv(dir);
-  await setupEnv(env);
-  const engineDir = join(dir, 'target', 'engine');
+export async function buildEngineSource(ctx: Context): Promise<void> {
+  const { pkgDir } = ctx;
+  const engineDir = join(pkgDir, 'target', 'engine');
   const sourceDir = join(engineDir, 'source');
   await mkdir(engineDir, { recursive: true });
 
-  const stamp = await sourceStamp(dir, new URL(import.meta.url).pathname);
+  const stamp = await sourceStamp(pkgDir, import.meta.path);
   const stampFile = join(engineDir, 'source-stamp');
   const tarball = join(engineDir, 'pglite-source.tar.xz');
   if (
     (await fileExists(stampFile)) &&
-    (await readFileText(stampFile)) === stamp &&
+    (await Bun.file(stampFile).text()) === stamp &&
     (await fileExists(tarball)) &&
     Bun.file(tarball).size > 0
   ) {
     return;
   }
 
-  if (!Bun.which('docker')) {
-    die('build-engine', 'engine build needs Docker or a Docker-compatible Podman context');
+  if (!Bun.which('docker', { PATH: ctx.env.PATH })) {
+    throw new Error('engine build needs Docker or a Docker-compatible Podman context');
   }
-  if (!process.env.DOCKER_CONTEXT) {
-    const dockerOk = (await Bun.$`docker info`.nothrow().quiet()).exitCode === 0;
+  let env = ctx.env;
+  if (!env.DOCKER_CONTEXT) {
+    const dockerOk = (await $`docker info`.nothrow().quiet()).exitCode === 0;
     if (!dockerOk) {
-      const podmanOk = (await Bun.$`docker --context podman info`.nothrow().quiet()).exitCode === 0;
-      if (podmanOk) process.env.DOCKER_CONTEXT = 'podman';
+      const podmanOk = (await $`docker --context podman info`.nothrow().quiet()).exitCode === 0;
+      if (podmanOk) env = { ...env, DOCKER_CONTEXT: 'podman' };
     }
   }
-  await Bun.$`docker info`.quiet();
+  await $`docker info`.env(env).quiet();
 
   if (!(await isDirectory(join(sourceDir, '.git')))) {
     await mkdir(sourceDir, { recursive: true });
-    await Bun.$`git -C ${sourceDir} init -q`;
-    await Bun.$`git -C ${sourceDir} remote add origin https://github.com/moznion/wasipg.git`;
+    await $`git -C ${sourceDir} init -q`;
+    await $`git -C ${sourceDir} remote add origin https://github.com/moznion/wasipg.git`;
   }
-  const sourceRef = requiredPin(env.pins, 'PGLITE_SOURCE_REF');
-  await Bun.$`git -C ${sourceDir} fetch --depth 1 origin ${sourceRef}`;
-  await Bun.$`git -C ${sourceDir} checkout FETCH_HEAD -- build NOTICE LICENSE`;
+  const sourceRef = requiredPin(ctx.tools.pins, 'PGLITE_SOURCE_REF');
+  await $`git -C ${sourceDir} fetch --depth 1 origin ${sourceRef}`;
+  await $`git -C ${sourceDir} checkout FETCH_HEAD -- build NOTICE LICENSE`;
 
   const versionsEnvPath = join(sourceDir, 'build', 'versions.env');
   const buildShPath = join(sourceDir, 'build', 'build.sh');
+  const patchScript = join(pkgDir, 'scripts', 'patch-engine-source.ts');
   const patched = patchUpstreamBuild(
-    await readFileText(versionsEnvPath),
-    await readFileText(buildShPath),
-    requiredPin(env.pins, 'PGLITE_SDK_SHA256_X86_64'),
-    requiredPin(env.pins, 'PGLITE_WASI_SDK_SHA256_X86_64'),
-    join(dir, 'scripts', 'patch-engine-source.ts'),
+    await Bun.file(versionsEnvPath).text(),
+    await Bun.file(buildShPath).text(),
+    requiredPin(ctx.tools.pins, 'PGLITE_SDK_SHA256_X86_64'),
+    requiredPin(ctx.tools.pins, 'PGLITE_WASI_SDK_SHA256_X86_64'),
+    patchScript,
   );
   await Bun.write(versionsEnvPath, patched.versionsEnv);
   await Bun.write(buildShPath, patched.buildSh);
@@ -137,21 +130,15 @@ export async function buildEngineSource(pkgDir?: string): Promise<void> {
   // daemons and omitting its Go-specific pristine-database packaging step.
   // Do not reuse shared upstream FAST volumes: clean source builds avoid stale
   // objects compiled with a different compiler or recovery configuration.
-  await Bun.$`bash ${join(sourceDir, 'build', 'build.sh')}`.env({
-    ...process.env,
-    DF_PGLITE_SOURCE_PATCH: join(dir, 'scripts', 'patch-engine-source.ts'),
+  await $`bash ${buildShPath}`.env({
+    ...env,
+    DF_PGLITE_SOURCE_PATCH: patchScript,
     FAST: 'false',
   });
 
-  await Bun.$`cp ${join(sourceDir, 'build', 'out', 'pglite-wasi.tar.xz')} ${tarball}`;
+  await Bun.write(tarball, Bun.file(join(sourceDir, 'build', 'out', 'pglite-wasi.tar.xz')));
   await Bun.write(stampFile, stamp);
-  log('build-engine', 'engine source ready');
+  log('engine source ready');
 }
 
-if (import.meta.main) {
-  try {
-    await buildEngineSource();
-  } catch (error) {
-    die('build-engine', error instanceof Error ? error.message : String(error));
-  }
-}
+if (import.meta.main) await run('build-engine', buildEngineSource);

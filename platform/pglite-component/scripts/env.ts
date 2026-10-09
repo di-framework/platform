@@ -3,13 +3,14 @@
  *
  *   eval "$(bun scripts/env.ts)"
  *
- * The build scripts themselves import `setupEnv` from lib.ts, so this is only
- * needed for interactive shells and Makefile recipes that spawn tools directly.
+ * The build scripts apply the same environment themselves (see lib/cli.ts),
+ * so this is only needed for interactive shells and ad-hoc tool invocations.
  */
-import { exportEnvLines, loadToolEnv, packageDir } from './lib.ts';
+import { type Context, run } from './lib/cli.ts';
+import { exportEnvLines } from './lib/toolchain.ts';
 
-if (import.meta.main) {
-  const pkgDir = packageDir(import.meta.url);
-  const env = await loadToolEnv(pkgDir);
-  for (const line of await exportEnvLines(env)) console.log(line);
+export async function printEnv(ctx: Context): Promise<void> {
+  for (const line of exportEnvLines(ctx.toolsEnv)) console.log(line);
 }
+
+if (import.meta.main) await run('env', printEnv);
