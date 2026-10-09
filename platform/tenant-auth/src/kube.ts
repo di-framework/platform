@@ -322,15 +322,25 @@ export function asUser(
       tls: { ca: kube.ca },
     } as RequestInit);
   };
+  // A failure to mint the user's token (for example a missing `di-user-<user>` ServiceAccount)
+  // is the controller's problem, not the target object's: it must not surface as that 404.
+  const token = async () => {
+    try {
+      return await tokens.token(user);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new KubeError(502, `could not mint a token for ${user}: ${reason}`);
+    }
+  };
   const once = async (method: string, path: string, init: AsUserInit) => {
-    const response = await send(method, path, init, await tokens.token(user));
+    const response = await send(method, path, init, await token());
     if (response.status !== 401) return response;
     // The cached token belongs to a ServiceAccount that was deleted and recreated (for example
     // after a suspend and unsuspend). Release the rejected response, mint a fresh token and
     // retry once.
     await response.body?.cancel();
     tokens.forget(user);
-    return send(method, path, init, await tokens.token(user));
+    return send(method, path, init, await token());
   };
   return {
     user,
@@ -338,18 +348,22 @@ export function asUser(
     async call<T>(method: string, path: string, body?: unknown): Promise<T> {
       const headers: Record<string, string> = { Accept: 'application/json' };
       if (body !== undefined) headers['Content-Type'] = 'application/json';
-      let response: Response;
       try {
-        response = await once(method, path, {
+        const response = await once(method, path, {
           headers,
           body: body === undefined ? undefined : JSON.stringify(body),
           signal: AbortSignal.timeout(KUBE_TIMEOUT_MS),
         });
+        // Still rejected after a freshly minted token: the controller's credentials are broken.
+        if (response.status === 401) {
+          await response.body?.cancel();
+          throw new KubeError(502, `${method} ${path.split('?')[0]} rejected the user's token`);
+        }
+        return await readKubeResponse<T>(method, path, response);
       } catch (error) {
         if (error instanceof KubeError) throw error;
         throw new KubeError(502, `${method} ${path.split('?')[0]} failed: ${String(error)}`);
       }
-      return readKubeResponse<T>(method, path, response);
     },
   };
 }

@@ -63,10 +63,12 @@ const TITLES: Record<number, string> = {
 
 /** Maps an error a handler raised (API server, `asUser`, identity) to a problem response. */
 function failure(error: unknown): Response {
-  if (!(error instanceof KubeError || error instanceof AuthError)) throw error;
+  if (!(error instanceof KubeError || error instanceof AuthError))
+    return problem(500, 'Internal Server Error', 'the request failed unexpectedly');
   if (error.status >= 400 && error.status < 500)
     return problem(error.status, TITLES[error.status] ?? 'Client Error', error.message);
-  return problem(502, 'Bad Gateway', error.message);
+  // A 5xx detail can carry upstream text, ServiceAccount names or namespaces: it stays in the audit.
+  return problem(502, 'Bad Gateway', 'the cluster request failed');
 }
 
 /** Serves one authenticated `/v1` request; a path that names no operation gets a 404 problem. */
@@ -75,7 +77,18 @@ export async function serveV1(request: Request, context: V1Context): Promise<Res
   try {
     response = await current.run(context, () => dispatch(request));
   } catch (error) {
-    return failure(error);
+    const result = failure(error);
+    // 401 and 403 are refusals, audited like the controller's other denials.
+    const denied = result.status === 401 || result.status === 403;
+    context.audit(denied ? 'request.denied' : 'request.failed', {
+      user: context.principal.user,
+      method: request.method,
+      path: new URL(request.url).pathname,
+      status: result.status,
+      reason:
+        error instanceof KubeError || error instanceof AuthError ? error.message : String(error),
+    });
+    return result;
   }
   return (
     response ??
