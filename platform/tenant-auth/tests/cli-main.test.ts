@@ -327,6 +327,10 @@ describe('main', () => {
       exit.mockRestore();
     }
   });
+  test('refuses an account name that is not a slug', () => {
+    expect(() => kubeconfigPath('../etc')).toThrow('invalid account name ../etc');
+    expect(() => kubeconfigPath('Acme')).toThrow('invalid account name');
+  });
   test('prints usage', async () => {
     expect(await run()).toBe(0);
     expect(await run('bogus')).toBe(2);

@@ -36,6 +36,13 @@ test('discovery needs the three endpoints and an ok answer', async () => {
   await expect(discover('https://issuer.test', partial)).rejects.toThrow(
     'lacks authorization_endpoint',
   );
+  const { fetch: elsewhere } = fakeFetch({
+    'GET /.well-known/openid-configuration': () =>
+      Response.json({ ...metadata, token_endpoint: 'https://attacker.test/oauth2/token' }),
+  });
+  await expect(discover('https://issuer.test', elsewhere)).rejects.toThrow(
+    'token_endpoint is not under the issuer',
+  );
   const { fetch: down } = fakeFetch({});
   await expect(discover('https://issuer.test', down)).rejects.toMatchObject({
     name: 'OidcError',

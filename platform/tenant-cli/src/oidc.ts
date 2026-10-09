@@ -56,6 +56,18 @@ export async function discover(issuer: string, doFetch: Fetch = fetch): Promise<
   for (const field of ['issuer', 'authorization_endpoint', 'token_endpoint'] as const) {
     if (!metadata[field]) throw new OidcError(`discovery at ${issuer} lacks ${field}`);
   }
+  // The CLI only ever talks to the issuer it was pointed at: a document that names endpoints
+  // elsewhere would send the authorization code or refresh token to another host.
+  const origin = new URL(issuer).origin;
+  for (const field of [
+    'authorization_endpoint',
+    'token_endpoint',
+    'revocation_endpoint',
+  ] as const) {
+    const endpoint = metadata[field];
+    if (endpoint && new URL(endpoint).origin !== origin)
+      throw new OidcError(`discovery at ${issuer}: ${field} is not under the issuer`);
+  }
   return metadata as ProviderMetadata;
 }
 

@@ -9,6 +9,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { dump } from 'js-yaml';
 
+class CliError extends Error {}
+
 export interface Credential {
   console: string;
   account: string;
@@ -26,7 +28,14 @@ export type CredentialStore = Record<string, Credential>;
 
 export const home = () => process.env.DI_FRAMEWORK_HOME ?? join(homedir(), '.di-framework');
 const credentialsPath = () => join(home(), 'credentials.json');
-export const kubeconfigPath = (account: string) => join(home(), 'kubeconfigs', `${account}.yaml`);
+const ACCOUNT = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
+/** Values that end up in terminal output came from a server; keep them to one line. */
+const plain = (value: unknown) => String(value).replace(/\n|\r/g, '');
+/** The account names a file, so only a tenant slug is accepted. */
+export const kubeconfigPath = (account: string) => {
+  if (!ACCOUNT.test(account)) throw new CliError(`invalid account name ${plain(account)}`);
+  return join(home(), 'kubeconfigs', `${account}.yaml`);
+};
 const DEFAULT_CONSOLE = process.env.TENANT_CONSOLE_URL ?? 'http://127.0.0.1:8787';
 
 function ensureDir(path: string): void {
@@ -111,8 +120,6 @@ export function parseArgs(argv: string[]): {
   }
   return { command, flags, rest };
 }
-
-class CliError extends Error {}
 
 async function http<T>(
   base: string,
@@ -298,9 +305,11 @@ export async function main(argv: string[]): Promise<number> {
       save(credential);
       const path = writeKubeconfig(credential);
       console.error(
-        `Logged in to ${credential.account} as ${credential.user} (${credential.role}) via ${credential.via}.`,
+        plain(
+          `Logged in to ${credential.account} as ${credential.user} (${credential.role}) via ${credential.via}.`,
+        ),
       );
-      console.log(`export KUBECONFIG=${path}`);
+      console.log(plain(`export KUBECONFIG=${path}`));
       return 0;
     }
     case 'kubeconfig': {
@@ -324,16 +333,14 @@ export async function main(argv: string[]): Promise<number> {
       const credential = await fresh(load(needAccount()));
       const who = await controller<Record<string, unknown>>(credential, '/-/whoami');
       console.log(
-        JSON.stringify(
-          {
+        plain(
+          JSON.stringify({
             ...who,
             console: credential.console,
             controller: credential.controller.url,
             tokenExpiresAt: credential.expiresAt,
             kubeconfig: kubeconfigPath(credential.account),
-          },
-          null,
-          2,
+          }),
         ),
       );
       return 0;
@@ -359,7 +366,7 @@ export async function main(argv: string[]): Promise<number> {
       const [action = 'list', id] = rest;
       if (action === 'list') {
         const { keys } = await controller<{ keys: unknown[] }>(credential, '/-/keys');
-        console.log(JSON.stringify(keys, null, 2));
+        console.log(plain(JSON.stringify(keys)));
       } else if (action === 'create') {
         const days = Number(flags.days ?? 7);
         const issued = await controller<{ id: string; secret: string; expiresAt: string }>(
@@ -368,12 +375,14 @@ export async function main(argv: string[]): Promise<number> {
           jsonInit({ name: flags.name ?? 'cli', ttlSeconds: Math.round(days * 86_400) }),
         );
         console.error(
-          `Created key ${issued.id}, expires ${issued.expiresAt}. Copy it now; it is not shown again.`,
+          plain(
+            `Created key ${issued.id}, expires ${issued.expiresAt}. Copy it now; it is not shown again.`,
+          ),
         );
-        console.log(issued.secret);
+        console.log(plain(issued.secret));
       } else if (action === 'revoke' && id) {
         await controller(credential, `/-/keys/${id}`, { method: 'DELETE' });
-        console.error(`Revoked key ${id}.`);
+        console.error(plain(`Revoked key ${id}.`));
       } else
         throw new CliError(
           'usage: keys list | keys create --name <n> --days <d> | keys revoke <id>',
