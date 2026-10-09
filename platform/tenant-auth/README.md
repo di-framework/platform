@@ -211,10 +211,14 @@ written with the caller's own identity. The deploy lane (platform#55) injects th
 - annotation `platform.di-framework.dev/updated-at`: a JSON object mapping each var name to the
   RFC 3339 time it was last written.
 
+The name `di-vars-<env>` is reserved by this contract. If a ConfigMap of that name exists without
+the `config: vars` label, the endpoints refuse to write it (409); they never adopt it.
+
 **Secrets.** One ordinary Secret per secret and environment:
 
 - name `<name>.<env>` (for example `db-password.prod`), where `<name>` is a DNS-1123 label that
-  is not a managed name (`di-binding-*`, `di-bs-*`; see `isManagedSecretName`);
+  starts with a letter (`^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$`, so the derived environment variable
+  name is valid) and is not a managed name (`di-binding-*`, `di-bs-*`; see `isManagedSecretName`);
 - labels `platform.di-framework.dev/config: secret`, `platform.di-framework.dev/env: <env>` and
   `platform.di-framework.dev/secret: <name>`;
 - a single data key, the environment variable name of the secret: `<name>` upper-cased with `-`
@@ -222,7 +226,25 @@ written with the caller's own identity. The deploy lane (platform#55) injects th
 - annotation `platform.di-framework.dev/updated-at` with the RFC 3339 time of the last write.
 
 The endpoints only touch Secrets that carry the `config: secret` label; values never leave the
-controller on read.
+controller on read. Writes carry the `resourceVersion` they read (replace and delete), so a
+concurrent write, or a create that races another, is a 409 `changed concurrently; retry`.
+
+**One name, one source.** A var and a secret that map to the same environment variable name in
+the same environment are a conflict. The endpoints refuse it at write time with 409: setting a
+var named like an existing secret's environment variable, or a secret whose environment variable
+is an existing var. The deploy lane (platform#55) must still reject a bundle that meets such a
+pair (for example one created out of band) with 422; it never picks a precedence.
+
+**Allowlist for the tenant admission policy (platform#88).** Tenant users may write:
+
+- Secrets whose name matches `^[a-z][-a-z0-9]{0,62}\.(prod|staging)$`, minus the managed
+  prefixes `di-binding-` and `di-bs-`;
+- the ConfigMaps `di-vars-prod` and `di-vars-staging`.
+
+Prod and staging share the `di-tenant-<tenant>` namespace, so the `.<env>` suffix alone does not
+tell a policy which environment a workload runs in. Matching a WorkloadDeployment's references
+to its environment needs an env label on it: platform#55 sets
+`platform.di-framework.dev/env: <env>` on every WorkloadDeployment it renders.
 
 **WorkloadDeployment references.** For a bundle deployed to `<env>`, every component of the
 rendered WorkloadDeployment gets, under `localResources.environment`:
@@ -236,6 +258,9 @@ secretFrom:
 
 so each var and each referenced secret reaches the component as an environment variable. A
 bundle that names a secret without a `<secret>.<env>` Secret labelled as above is rejected.
+The same `configFrom` and `secretFrom` entries are allowed under the WorkloadDeployment's
+`template.service` (the deploy lane injects there too), with the same names; no other Secret or
+ConfigMap may be referenced from either place.
 
 ## HTTP surface
 

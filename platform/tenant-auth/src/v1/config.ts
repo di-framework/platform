@@ -1,4 +1,6 @@
 import { type HttpCall, problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
+// Intentional cross-package import (platform#53): the managed-name predicate must stay the one
+// the admission policy enforces, so it is shared from the platform package, not copied.
 import { isManagedSecretName } from '../../../platform/src/tenancy/admission.ts';
 import { KubeError, type UserKube } from '../kube.ts';
 import type { V1Context, V1Handler, V1Module } from './context.ts';
@@ -14,7 +16,8 @@ const ENV = `${LABEL}/env`;
 const SECRET = `${LABEL}/secret`;
 const UPDATED_AT = `${LABEL}/updated-at`;
 
-const SECRET_NAME = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
+/** A DNS label that starts with a letter, so its environment variable name is valid too. */
+const SECRET_NAME = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
 const VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,252}$/;
 
 interface Metadata {
@@ -51,16 +54,46 @@ async function find(kube: UserKube, path: string): Promise<Stored | undefined> {
   }
 }
 
-/** Replaces an object read earlier; a concurrent write surfaces as a 409 the caller can retry. */
-async function replace(kube: UserKube, path: string, object: Stored, what: string) {
+/** Runs a write; a 409 (stale resourceVersion, or a create that raced) becomes a retry problem. */
+async function guarded(write: () => Promise<unknown>, what: string) {
   try {
-    await kube.call('PUT', path, object);
+    await write();
   } catch (error) {
     if (error instanceof KubeError && error.status === 409)
       throw new KubeError(409, `${what} changed concurrently; retry`);
     throw error;
   }
 }
+
+/** Replaces an object read earlier, or creates it when none existed. */
+function write(
+  kube: UserKube,
+  path: string,
+  collection: string,
+  object: unknown,
+  existed: boolean,
+  what: string,
+) {
+  return guarded(
+    () => (existed ? kube.call('PUT', path, object) : kube.call('POST', collection, object)),
+    what,
+  );
+}
+
+/** Deletes an object only if it is still the version read earlier. */
+function remove(kube: UserKube, path: string, resourceVersion: string | undefined, what: string) {
+  return guarded(
+    () =>
+      kube.call('DELETE', path, {
+        apiVersion: 'v1',
+        kind: 'DeleteOptions',
+        ...(resourceVersion ? { preconditions: { resourceVersion } } : {}),
+      }),
+    what,
+  );
+}
+
+const conflict = (detail: string) => problem(409, 'Conflict', detail);
 
 const noContent = () => new Response(null, { status: 204 });
 
@@ -69,11 +102,18 @@ const noContent = () => new Response(null, { status: 204 });
 /** Refuses names that are not DNS labels or that the platform manages; undefined when fine. */
 function refuseSecretName(name: string): Response | undefined {
   if (!SECRET_NAME.test(name))
-    return problem(400, 'Bad Request', `secret name ${JSON.stringify(name)} must be a DNS label`);
+    return problem(
+      400,
+      'Bad Request',
+      `secret name ${JSON.stringify(name)} must be a DNS label starting with a letter`,
+    );
   if (isManagedSecretName(name))
     return problem(403, 'Forbidden', `${name} is a platform-managed secret name`);
   return undefined;
 }
+
+const varsPath = (context: V1Context, env: string) =>
+  `${namespace(context)}/configmaps/${varsConfigMapName(env)}`;
 
 const secretPath = (context: V1Context, name: string, env: string) =>
   `${namespace(context)}/secrets/${secretObjectName(name, env)}`;
@@ -123,10 +163,19 @@ async function writeSecret(
   const existing = await existingSecret(context, name, env, mustExist);
   if (existing instanceof Response) return existing;
   const kube = context.asUser();
+  const envName = secretEnvName(name);
+  const map = await find(kube, varsPath(context, env));
+  if (map?.data && envName in map.data)
+    return conflict(`var ${envName} already exists in ${env}; a secret and a var cannot share it`);
   const object = secretObject(name, env, valueIn(command), existing?.metadata.resourceVersion);
-  if (existing)
-    await replace(kube, secretPath(context, name, env), object as never, `secret ${name}`);
-  else await kube.call('POST', `${namespace(context)}/secrets`, object);
+  await write(
+    kube,
+    secretPath(context, name, env),
+    `${namespace(context)}/secrets`,
+    object,
+    existing !== undefined,
+    `secret ${name}`,
+  );
   context.audit(mustExist ? 'secret.updated' : 'secret.set', {
     user: context.principal.user,
     name,
@@ -143,7 +192,7 @@ const secrets: V1Handler = async (_command, call, context) => {
     .call<{ items: Stored[] }>('GET', `${namespace(context)}/secrets?labelSelector=${selector}`);
   const items = list.items
     .map(({ metadata }) => ({
-      name: metadata.labels?.[SECRET] ?? metadata.name,
+      name: metadata.labels?.[SECRET] ?? metadata.name.replace(new RegExp(`\\.${env}$`), ''),
       updatedAt: metadata.annotations?.[UPDATED_AT] ?? metadata.creationTimestamp ?? '',
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -157,15 +206,17 @@ const unsetSecret: V1Handler = async (_command, call, context) => {
   if (refused) return refused;
   const existing = await existingSecret(context, name, env, true);
   if (existing instanceof Response) return existing;
-  await context.asUser().call('DELETE', secretPath(context, name, env));
+  await remove(
+    context.asUser(),
+    secretPath(context, name, env),
+    existing?.metadata.resourceVersion,
+    `secret ${name}`,
+  );
   context.audit('secret.unset', { user: context.principal.user, name, env });
   return noContent();
 };
 
 // ---- vars ------------------------------------------------------------------------------------
-
-const varsPath = (context: V1Context, env: string) =>
-  `${namespace(context)}/configmaps/${varsConfigMapName(env)}`;
 
 function timestamps(map: Stored | undefined): Record<string, string> {
   try {
@@ -193,16 +244,21 @@ async function changeVars(
   event: string,
   change: VarChange,
   createIfMissing: boolean,
+  precheck?: (context: V1Context, name: string, env: string) => Promise<Response | undefined>,
 ): Promise<Response> {
   const name = nameOf(call);
   const env = envOf(call);
   const refused = refuseVarName(name);
   if (refused) return refused;
+  const blocked = await precheck?.(context, name, env);
+  if (blocked) return blocked;
   const kube = context.asUser();
   const path = varsPath(context, env);
   const existing = await find(kube, path);
   if (!existing && !createIfMissing)
     return problem(404, 'Not Found', `var ${name} does not exist in ${env}`);
+  if (existing && existing.metadata.labels?.[CONFIG] !== 'vars')
+    return conflict(`${varsConfigMapName(env)} is not a tenant vars ConfigMap`);
   const data = { ...existing?.data };
   const failed = change(data, name);
   if (failed) return failed;
@@ -220,10 +276,27 @@ async function changeVars(
     },
     data,
   };
-  if (existing) await replace(kube, path, object, `the ${env} vars`);
-  else await kube.call('POST', `${namespace(context)}/configmaps`, object);
+  await write(
+    kube,
+    path,
+    `${namespace(context)}/configmaps`,
+    object,
+    existing !== undefined,
+    `the ${env} vars`,
+  );
   context.audit(event, { user: context.principal.user, name, env });
   return noContent();
+}
+
+/** A 409 when a tenant secret in `env` is already injected under the var's name. */
+async function secretSharing(context: V1Context, name: string, env: string) {
+  const secret = name.toLowerCase().replaceAll('_', '-');
+  if (secretEnvName(secret) !== name || !SECRET_NAME.test(secret)) return undefined;
+  const found = await find(context.asUser(), secretPath(context, secret, env));
+  if (found?.metadata.labels?.[CONFIG] !== 'secret') return undefined;
+  return conflict(
+    `secret ${secret} is injected as ${name} in ${env}; a secret and a var cannot share it`,
+  );
 }
 
 const missingVar = (name: string, call: HttpCall) =>
@@ -256,6 +329,7 @@ export const config: V1Module = {
         return undefined;
       },
       true,
+      secretSharing,
     ),
   updateVar: (command, call, context) =>
     changeVars(

@@ -28,6 +28,14 @@ let failPut: number | undefined;
 /** When set, every GET of a named object answers 500. */
 let failGet = false;
 let corruptAnnotation = false;
+/** When set, runs once after the next GET of this key is answered: a concurrent writer. */
+let raceAfterGet: { key: string; run: () => void } | undefined;
+
+/** Answers 409 when `expected` is set and differs from the stored version, like the API server. */
+const stale = (key: string, expected: string | undefined) =>
+  expected !== undefined && store.get(key)?.metadata.resourceVersion !== expected
+    ? json({ message: 'the object has been modified; please apply your changes' }, 409)
+    : undefined;
 
 const api = serve((request) => {
   if (request.pathname.endsWith('/token')) {
@@ -51,6 +59,11 @@ const api = serve((request) => {
       if (name) {
         if (failGet) return json({ message: 'boom' }, 500);
         const found = store.get(key);
+        if (raceAfterGet?.key === key) {
+          const race = raceAfterGet;
+          raceAfterGet = undefined;
+          queueMicrotask(race.run);
+        }
         if (!found) return notFound();
         if (corruptAnnotation && found.metadata.annotations)
           return json({
@@ -84,12 +97,22 @@ const api = serve((request) => {
         return json({ message: 'the object has been modified' }, status);
       }
       if (!store.has(key)) return notFound();
-      store.set(key, stamp(JSON.parse(request.body) as Stored));
+      const replacement = JSON.parse(request.body) as Stored;
+      const conflict = stale(key, replacement.metadata.resourceVersion);
+      if (conflict) return conflict;
+      store.set(key, stamp(replacement));
       return json(store.get(key));
     }
-    case 'DELETE':
-      if (!store.delete(key)) return notFound();
+    case 'DELETE': {
+      if (!store.has(key)) return notFound();
+      const options = request.body
+        ? (JSON.parse(request.body) as { preconditions?: { resourceVersion?: string } })
+        : {};
+      const conflict = stale(key, options.preconditions?.resourceVersion);
+      if (conflict) return conflict;
+      store.delete(key);
       return json({});
+    }
   }
   return json({}, 405);
 });
@@ -158,7 +181,14 @@ beforeEach(() => {
   failPut = undefined;
   failGet = false;
   corruptAnnotation = false;
+  raceAfterGet = undefined;
 });
+
+/** Simulates another writer bumping the stored object's resource version. */
+const bump = (key: string) => () => {
+  const found = store.get(key);
+  if (found) store.set(key, stamp({ ...found }));
+};
 
 describe('storage names', () => {
   test('follow the README contract', () => {
@@ -204,7 +234,8 @@ describe('secrets', () => {
     expect(calls.length).toBeGreaterThan(0);
     for (const request of calls) {
       expect(request.headers.get('authorization')).toBe('Bearer sa-alice');
-      expect(request.pathname.startsWith(`${NS}/secrets`)).toBe(true);
+      expect(request.pathname.startsWith(NS)).toBe(true);
+      if (request.method !== 'GET') expect(request.pathname.startsWith(`${NS}/secrets`)).toBe(true);
     }
     expect(calls.map((r) => r.method)).toContain('POST');
     expect(calls.map((r) => r.method)).toContain('DELETE');
@@ -236,7 +267,7 @@ describe('secrets', () => {
       env: 'prod',
       items: [
         { name: 'a', updatedAt: '' },
-        { name: 'b.prod', updatedAt: '2026-01-01T00:00:00Z' },
+        { name: 'b', updatedAt: '2026-01-01T00:00:00Z' },
       ],
     });
   });
@@ -282,12 +313,52 @@ describe('secrets', () => {
     expect(store.get('secrets/foreign.prod')).toEqual({ metadata: { name: 'foreign.prod' } });
   });
 
-  test('a concurrent change is a 409 the caller can retry', async () => {
+  test('refuses a name starting with a digit, whose env var would be invalid', async () => {
+    const response = await call('PUT', '/v1/secrets/1password?env=prod', 'v');
+    expect(response.status).toBe(400);
+    expect((await body(response)).detail).toBe(
+      'secret name "1password" must be a DNS label starting with a letter',
+    );
+    expect(kubeCalls()).toHaveLength(0);
+  });
+
+  test('a write between read and replace is a 409 the caller can retry', async () => {
     await call('PUT', '/v1/secrets/db?env=prod', 'one');
-    failPut = 409;
+    raceAfterGet = { key: 'secrets/db.prod', run: bump('secrets/db.prod') };
     const response = await call('PUT', '/v1/secrets/db?env=prod', 'two');
     expect(response.status).toBe(409);
     expect((await body(response)).detail).toBe('secret db changed concurrently; retry');
+    expect(store.get('secrets/db.prod')?.data).toEqual({ DB: btoa('one') });
+  });
+
+  test('a create that races another create is the same retry problem', async () => {
+    raceAfterGet = {
+      key: 'secrets/db.prod',
+      run: () => store.set('secrets/db.prod', stamp({ metadata: { name: 'db.prod' } })),
+    };
+    const response = await call('PUT', '/v1/secrets/db?env=prod', 'v');
+    expect(response.status).toBe(409);
+    expect((await body(response)).detail).toBe('secret db changed concurrently; retry');
+  });
+
+  test('unset deletes only the version it read', async () => {
+    await call('PUT', '/v1/secrets/db?env=prod', 'one');
+    raceAfterGet = { key: 'secrets/db.prod', run: bump('secrets/db.prod') };
+    const response = await call('DELETE', '/v1/secrets/db?env=prod');
+    expect(response.status).toBe(409);
+    expect(store.has('secrets/db.prod')).toBe(true);
+  });
+
+  test('refuses a secret whose env var name is already a var in that env', async () => {
+    await call('PUT', '/v1/vars/DB_PASSWORD?env=prod', 'plain');
+    const response = await call('PUT', '/v1/secrets/db-password?env=prod', 's');
+    expect(response.status).toBe(409);
+    expect((await body(response)).detail).toBe(
+      'var DB_PASSWORD already exists in prod; a secret and a var cannot share it',
+    );
+    expect(store.has('secrets/db-password.prod')).toBe(false);
+    // Another environment is unaffected.
+    expect((await call('PUT', '/v1/secrets/db-password?env=staging', 's')).status).toBe(204);
   });
 
   test('a server failure on write is a generic 502', async () => {
@@ -356,7 +427,9 @@ describe('vars', () => {
 
     for (const request of kubeCalls()) {
       expect(request.headers.get('authorization')).toBe('Bearer sa-alice');
-      expect(request.pathname.startsWith(`${NS}/configmaps`)).toBe(true);
+      expect(request.pathname.startsWith(NS)).toBe(true);
+      if (request.method !== 'GET')
+        expect(request.pathname.startsWith(`${NS}/configmaps`)).toBe(true);
     }
   });
 
@@ -418,11 +491,49 @@ describe('vars', () => {
     });
   });
 
-  test('a concurrent change is a 409 the caller can retry', async () => {
+  test('a write between read and replace is a 409 the caller can retry', async () => {
     await call('PUT', '/v1/vars/A?env=prod', '1');
-    failPut = 409;
+    raceAfterGet = { key: 'configmaps/di-vars-prod', run: bump('configmaps/di-vars-prod') };
     const response = await call('PUT', '/v1/vars/A?env=prod', '2');
     expect(response.status).toBe(409);
     expect((await body(response)).detail).toBe('the prod vars changed concurrently; retry');
+    expect(store.get('configmaps/di-vars-prod')?.data).toEqual({ A: '1' });
+  });
+
+  test('a create that races another create is the same retry problem', async () => {
+    raceAfterGet = {
+      key: 'configmaps/di-vars-prod',
+      run: () =>
+        store.set('configmaps/di-vars-prod', stamp({ metadata: { name: 'di-vars-prod' } })),
+    };
+    const response = await call('PUT', '/v1/vars/A?env=prod', '1');
+    expect(response.status).toBe(409);
+    expect((await body(response)).detail).toBe('the prod vars changed concurrently; retry');
+  });
+
+  test('refuses a var whose name a secret in that env is injected as', async () => {
+    await call('PUT', '/v1/secrets/db-password?env=prod', 's');
+    const response = await call('PUT', '/v1/vars/DB_PASSWORD?env=prod', 'plain');
+    expect(response.status).toBe(409);
+    expect((await body(response)).detail).toBe(
+      'secret db-password is injected as DB_PASSWORD in prod; a secret and a var cannot share it',
+    );
+    // Names a secret cannot produce, and other environments, are unaffected.
+    expect((await call('PUT', '/v1/vars/db_password?env=prod', 'x')).status).toBe(204);
+    expect((await call('PUT', '/v1/vars/DB_PASSWORD?env=staging', 'x')).status).toBe(204);
+  });
+
+  test('an unlabelled di-vars ConfigMap is refused, never adopted', async () => {
+    store.set('configmaps/di-vars-prod', { metadata: { name: 'di-vars-prod' }, data: { X: '1' } });
+    for (const [method, value] of [
+      ['PUT', 'v'],
+      ['PATCH', 'v'],
+      ['DELETE', undefined],
+    ] as const) {
+      const response = await call(method, '/v1/vars/X?env=prod', value);
+      expect(response.status).toBe(409);
+      expect((await body(response)).detail).toBe('di-vars-prod is not a tenant vars ConfigMap');
+    }
+    expect(store.get('configmaps/di-vars-prod')?.metadata.labels).toBeUndefined();
   });
 });
