@@ -171,7 +171,8 @@ interface Exchange {
   controller: Credential['controller'];
 }
 
-function openBrowser(url: string): void {
+/** Open the system browser; the spawn is injectable so tests never open one. */
+export function openBrowser(url: string, spawn: typeof Bun.spawn = Bun.spawn): void {
   const command =
     process.platform === 'darwin'
       ? ['open', url]
@@ -179,7 +180,7 @@ function openBrowser(url: string): void {
         ? ['cmd', '/c', 'start', '', url]
         : ['xdg-open', url];
   try {
-    Bun.spawn(command, { stdout: 'ignore', stderr: 'ignore' });
+    spawn(command, { stdout: 'ignore', stderr: 'ignore' });
   } catch {}
 }
 
@@ -213,7 +214,7 @@ async function browserLogin(consoleUrl: string, open: boolean): Promise<Exchange
     if (open) openBrowser(url.toString());
     const timeout = setTimeout(
       () => reject(new CliError('timed out waiting for the browser login')),
-      300_000,
+      Number(process.env.TENANT_AUTH_LOGIN_TIMEOUT_MS ?? 300_000),
     );
     const code = await promise.finally(() => clearTimeout(timeout));
     return await http<Exchange>(consoleUrl, '/cli/exchange', jsonInit({ code }));
@@ -391,12 +392,10 @@ export async function main(argv: string[]): Promise<number> {
   }
 }
 
-if (import.meta.main) {
-  main(process.argv.slice(2)).then(
-    (code) => process.exit(code),
-    (error) => {
-      console.error(error instanceof CliError ? error.message : String(error));
-      process.exit(1);
-    },
-  );
+/** Print an escaped error the way the CLI reports it and exit 1. */
+export function exitWithError(error: unknown): never {
+  console.error(error instanceof CliError ? error.message : String(error));
+  return process.exit(1);
 }
+
+if (import.meta.main) main(process.argv.slice(2)).then(process.exit, exitWithError);
