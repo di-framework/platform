@@ -4,11 +4,13 @@ import { useContainer } from '@di-framework/core/container';
 import { Component } from '@di-framework/core/decorators';
 import { Controller, Endpoint, json, TypedRouter } from '@di-framework/http';
 import { TenantControllerHandlers } from '../../../handlers';
-import { DeployBundle, DeployPlan, Deployment } from '../../../contracts/api.schemas';
+import { DeployBundle, DeployPlan, Deployment, RegistryInfo } from '../../../contracts/api.schemas';
 import {
   validateDeployBundle,
   validateDeployPlan,
   validateDeployment,
+  validateEmpty,
+  validateRegistryInfo,
 } from './contracts';
 
 const routes = TypedRouter();
@@ -88,6 +90,34 @@ export class DeployV1HttpController {
 
     if (output instanceof Response) return output;
     return json(validateDeployPlan(output));
+  });
+
+  @Endpoint({
+    summary: 'Get the tenant registry',
+    description: 'The tenant\'s own OCI registry: its URL and how to log in. Pull is open to viewers and developers; push needs developer. No credential is minted.',
+    responses: {
+      '200': {
+        description: 'Get the tenant registry',
+      content: {
+        'application/json': {
+          schema: RegistryInfo.jsonSchema,
+        },
+      },
+      },
+    },
+  })
+  static registry = routes.get('/v1/deploy/registry', async (request) => {
+    const self = useContainer().resolve(DeployV1HttpController);
+    const body = (request as { content?: unknown }).content ?? {};
+    const command = validateEmpty(body);
+
+    const output = await self.handlers.registry(command, {
+      transport: 'http' as const,
+      request,
+    });
+
+    if (output instanceof Response) return output;
+    return json(validateRegistryInfo(output));
   });
 }
 
