@@ -13,7 +13,8 @@
 #   make clean          remove target/ and dist/
 #   make distclean      ...and .tools/
 #
-# All scripts read scripts/tool-versions.env; bump versions + checksums there.
+# All build scripts are Bun TypeScript in scripts/ and read
+# scripts/tool-versions.env; bump versions + checksums there.
 # The engine source build uses its own pinned WASI SDK in Docker/Podman.
 
 SHELL := /usr/bin/env bash
@@ -29,30 +30,28 @@ PLUGIN_ASSET_DIR ?= $(PKG_DIR)/dist
 .PHONY: tools tools-rust build debug smoke wit check compose publish-asset versions clean distclean
 
 tools:
-	scripts/install-tools.sh
+	bun scripts/install-tools.ts
 
 tools-rust:
-	scripts/install-tools.sh --rust
+	bun scripts/install-tools.ts --rust
 
 build:
-	scripts/build.sh
+	bun scripts/build.ts
 
 debug:
-	scripts/build.sh --debug
+	bun scripts/build.ts --debug
 
 smoke: build
-	scripts/smoke.sh
+	bun scripts/smoke.ts
 
 wit:
-	. scripts/env.sh && wasm-tools component wit dist/di-framework-pglite.wasm
+	bun scripts/wit.ts
 
 check:
-	. scripts/env.sh && python3 scripts/prepare-engine.py
-	. scripts/env.sh && cargo check --locked --target "$$RUST_TARGET" -p di-framework-pglite-component
+	bun scripts/check.ts
 
 compose:
-	@[ -n "$(APP)" ] && [ -n "$(OUT)" ] || { echo "usage: make compose APP=app.wasm OUT=composed.wasm"; exit 2; }
-	scripts/compose.sh "$(APP)" "$(OUT)"
+	bun scripts/compose.ts "$(APP)" "$(OUT)"
 
 publish-asset: build
 	mkdir -p "$(PLUGIN_ASSET_DIR)"
