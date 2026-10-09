@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
   checkedPath,
+  engineRoot,
   INITDB_DEFAULTS_NEW,
   parseSourceArgs,
   patchEngineSource,
@@ -30,7 +31,11 @@ describe('source argument', () => {
     expect(() => parseSourceArgs(['a', 'b'])).toThrow('usage');
     expect(parseSourceArgs(['-h'])).toEqual({ help: true });
     expect(parseSourceArgs(['src'])).toEqual({ help: false, source: 'src' });
-    await expect(resolveSourceDir('/does/not/exist')).rejects.toThrow('does not exist');
+    await expect(resolveSourceDir('/does/not/exist', '/does')).rejects.toThrow('does not exist');
+    await expect(resolveSourceDir('../../etc', '/does/not', '/does/not/exist')).rejects.toThrow(
+      'outside',
+    );
+    expect(engineRoot('/pkg')).toBe('/pkg/target/engine');
   });
 });
 

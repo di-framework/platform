@@ -13,8 +13,8 @@ const log = logger('prepare-engine');
 
 export const ARCHIVE_PREFIX = 'tmp/pglite/';
 export const BOOTSTRAP_FILES = ['initdb.boot.txt', 'initdb.single.txt'];
-/** Baked-in bootstrap path inside the engine WAT (a text pattern, not a directory use). */
-export const TMP_PREFIX = '/tmp/';
+/** Directory of the bootstrap paths baked into the engine WAT: a text pattern to rewrite, not a directory this script touches. */
+export const ENGINE_BOOTSTRAP_DIR = posix.join(posix.sep, 'tmp');
 
 export const PG_STRONG_RANDOM_REPLACEMENT = [
   '  (func $pg_strong_random (param i32 i32) (result i32)',
@@ -38,7 +38,7 @@ export function patchEngineWat(wat: string, bridgeWat: string): string {
   );
 
   for (const name of BOOTSTRAP_FILES) {
-    const needle = `${TMP_PREFIX}${name}`;
+    const needle = posix.join(ENGINE_BOOTSTRAP_DIR, name);
     const occurrences = patched.split(needle).length - 1;
     if (occurrences !== 1) throw new Error(`engine bootstrap path changed: ${needle}`);
     patched = patched.replaceAll(needle, `./../${name}`);
