@@ -61,9 +61,38 @@ describe('/v1/deploy', () => {
       (rejectToken === 'workloads' && request.pathname.startsWith(WORKLOADS))
     )
       return json({ message: 'Unauthorized' }, 401);
+    const selector = new URL(request.path, 'http://x').searchParams.get('labelSelector');
+    if (request.method === 'GET' && selector !== null) {
+      const wanted = selector.split(',').map((term) => term.split('='));
+      const items = [...stored.entries()]
+        .filter(([key]) => key.startsWith(`${request.pathname}/`))
+        .map(([, object]) => object)
+        .filter((object) => {
+          const labels = ((object.metadata as Json).labels ?? {}) as Record<string, string>;
+          return wanted.every(([key, value]) =>
+            value === undefined ? (key as string) in labels : labels[key as string] === value,
+          );
+        });
+      return json({ items });
+    }
     if (request.method === 'GET') {
       const object = stored.get(request.pathname);
       return object ? json(object) : json({ message: 'not found' }, 404);
+    }
+    if (request.method === 'POST') {
+      const object = JSON.parse(request.body) as Json;
+      const key = `${request.pathname}/${(object.metadata as Json).name}`;
+      if (stored.has(key)) return json({ message: 'already exists' }, 409);
+      stored.set(key, object);
+      return json(object, 201);
+    }
+    if (request.method === 'PUT') {
+      stored.set(request.pathname, JSON.parse(request.body) as Json);
+      return json(JSON.parse(request.body));
+    }
+    if (request.method === 'DELETE') {
+      stored.delete(request.pathname);
+      return json({ status: 'Success' });
     }
     if (rawPatch) return rawPatch();
     if (refusal) return json({ message: refusal.message }, refusal.status);
@@ -84,12 +113,13 @@ describe('/v1/deploy', () => {
     via: 'identity',
     credentialId: 's',
   };
+  let caller: Principal = alice;
   const kube = new KubeClient({ server: api.url, token: 'admin' }, 'wasmcloud');
   const controller = new Controller(
     configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme' }),
     kube,
     { issuer: 'https://issuer.test' } as never,
-    { resolve: async () => alice, forget: () => {} } as never,
+    { resolve: async () => caller, forget: () => {} } as never,
     { kube, namespace: 'di-runtime-acme', tenant: 'acme' },
   );
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: (r) => controller.handle(r) });
@@ -109,6 +139,7 @@ describe('/v1/deploy', () => {
     refusal = undefined;
     rejectToken = false;
     rawPatch = undefined;
+    caller = alice;
     for (const env of ['prod', 'staging']) seedSecret('api-token', env);
   });
 
@@ -731,6 +762,297 @@ describe('/v1/deploy', () => {
   test('a token the API server rejects on the config reads is a 502', async () => {
     rejectToken = true;
     expect((await post('/v1/deploy', deployBundle())).status).toBe(502);
+  });
+
+  describe('history (platform#55:history)', () => {
+    const REVISIONS = `${CORE}/configmaps/di-deploy-`;
+    const revision = (id: string) => stored.get(`${REVISIONS}${id}`) as Json | undefined;
+    const revisionKeys = () => [...stored.keys()].filter((key) => key.startsWith(REVISIONS));
+    const get = (path: string) =>
+      fetch(`${base}${path}`, { headers: { authorization: 'Bearer ok' } });
+    const deployed = async (bundle = deployBundle()) => {
+      const response = await post('/v1/deploy', bundle);
+      expect(response.status).toBe(202);
+      return (await response.json()) as Json;
+    };
+    const withReplicas = (replicas: number, overrides = {}) => {
+      const bundle = deployBundle(overrides);
+      (bundle.workload.spec as Json).replicas = replicas;
+      return bundle;
+    };
+    /** Sets the live Ready condition the platform reports on a WorkloadDeployment. */
+    const setReady = (name: string, status: string, lastTransitionTime?: string) => {
+      const key = `${WORKLOADS}/${name}`;
+      stored.set(key, {
+        ...(stored.get(key) as Json),
+        status: { conditions: [{ type: 'Ready', status, lastTransitionTime }] },
+      });
+    };
+    const appliedReplicas = () =>
+      (JSON.parse(patches().at(-1)?.body ?? '') as { spec: { replicas: number } }).spec.replicas;
+
+    test('each deploy stores a labelled revision ConfigMap with the bundle and its digest', async () => {
+      expect((await deployed()).id).toBe('web-prod.1');
+      const second = withReplicas(2);
+      expect(await deployed(second)).toMatchObject({ id: 'web-prod.2', status: 'pending' });
+      const stored2 = revision('web-prod.2') as {
+        metadata: { labels: Record<string, string>; annotations: Record<string, string> };
+        data: { bundle: string; digest: string };
+      };
+      expect(stored2.metadata.labels).toEqual({
+        'platform.di-framework.dev/deploy-revision': '2',
+        'di-framework.dev/service': 'web',
+        'platform.di-framework.dev/env': 'prod',
+      });
+      expect(JSON.parse(stored2.data.bundle)).toEqual(second);
+      const hex = new Bun.CryptoHasher('sha256').update(stored2.data.bundle).digest('hex');
+      expect(stored2.data.digest).toBe(`sha256:${hex}`);
+      // Every cluster call is made with the caller's own token.
+      for (const request of api.requests.filter((r) => !r.pathname.endsWith('/token')))
+        expect(request.headers.get('authorization')).toBe('Bearer sa-di-user-alice');
+      expect(
+        api.requests.some((r) => r.method === 'POST' && r.pathname === `${CORE}/configmaps`),
+      ).toBe(true);
+    });
+
+    test('revisions are not vars and not logs', async () => {
+      await deployed();
+      const vars = await get('/v1/vars?env=prod');
+      expect(vars.status).toBe(200);
+      expect(await vars.json()).toEqual({ env: 'prod', items: [] });
+      expect((await get('/v1/services/web/logs?env=prod')).status).toBe(404);
+      // A redeploy still treats the environment as having no vars ConfigMap.
+      await deployed();
+      const applied = JSON.parse(patches().at(-1)?.body ?? '') as {
+        spec: { template: { spec: { components: Json[] } } };
+      };
+      expect(
+        (
+          (applied.spec.template.spec.components[0] as { localResources: Json })
+            .localResources as Json
+        ).environment,
+      ).toEqual({ secretFrom: [{ name: 'api-token.prod' }] });
+    });
+
+    test('keeps the last 20 revisions per service and environment', async () => {
+      for (let n = 1; n <= 20; n++)
+        stored.set(`${REVISIONS}web-prod.${n}`, {
+          metadata: {
+            name: `di-deploy-web-prod.${n}`,
+            labels: {
+              'platform.di-framework.dev/deploy-revision': String(n),
+              'di-framework.dev/service': 'web',
+              'platform.di-framework.dev/env': 'prod',
+            },
+            annotations: {
+              'platform.di-framework.dev/created-at': new Date(Date.UTC(2026, 0, n)).toISOString(),
+            },
+          },
+          data: { bundle: JSON.stringify(deployBundle()), digest: 'sha256:0' },
+        });
+      await deployed(deployBundle({ env: 'staging' }));
+      expect((await deployed()).id).toBe('web-prod.21');
+      expect(revisionKeys().filter((key) => key.includes('web-prod'))).toHaveLength(20);
+      expect(revision('web-prod.1')).toBeUndefined();
+      expect(revision('web-prod.2')).toBeDefined();
+      expect(revision('web-staging.1')).toBeDefined();
+    });
+
+    test('a bundle too big to store is a 422 before anything is applied', async () => {
+      const bundle = deployBundle();
+      bundle.workload.metadata = {
+        annotations: { 'app.di-framework.dev/blob': 'x'.repeat(1_000_000) },
+      };
+      const response = await post('/v1/deploy', bundle);
+      expect(response.status).toBe(422);
+      expect(((await response.json()) as Json).detail).toContain('deploy history stores at most');
+      expect(patches()).toHaveLength(0);
+      expect(revisionKeys()).toHaveLength(0);
+    });
+
+    test('deployments lists revisions newest first with live and recorded status', async () => {
+      await deployed();
+      setReady('web-prod', 'True', '2026-10-01T00:00:00Z');
+      await deployed(withReplicas(2));
+      setReady('web-prod', 'Unknown');
+      // Revisions of different services order by creation time, which has millisecond precision.
+      await Bun.sleep(5);
+      await deployed(deployBundle({ service: 'api', bindings: [] }));
+      setReady('api-prod', 'False');
+
+      const response = await get('/v1/deployments?env=prod');
+      expect(response.status).toBe(200);
+      const { items } = (await response.json()) as { items: Json[] };
+      expect(items.map((item) => [item.id, item.status])).toEqual([
+        ['api-prod.1', 'failed'],
+        ['web-prod.2', 'rolling'],
+        ['web-prod.1', 'ready'],
+      ]);
+      expect(items[2]).toMatchObject({
+        service: 'web',
+        env: 'prod',
+        component: deployBundle().component,
+        readyAt: '2026-10-01T00:00:00Z',
+      });
+      expect(typeof items[0]?.createdAt).toBe('string');
+
+      setReady('web-prod', 'True', '2026-10-02T00:00:00Z');
+      const filtered = (await (await get('/v1/deployments?env=prod&service=web')).json()) as {
+        items: Json[];
+      };
+      expect(filtered.items.map((item) => item.id)).toEqual(['web-prod.2', 'web-prod.1']);
+      expect(filtered.items[0]).toMatchObject({ status: 'ready', readyAt: '2026-10-02T00:00:00Z' });
+      expect(
+        ((await (await get('/v1/deployments?env=staging')).json()) as { items: Json[] }).items,
+      ).toEqual([]);
+    });
+
+    test('deploymentStats summarizes the revisions and the live workloads', async () => {
+      await deployed();
+      await deployed();
+      await deployed(deployBundle({ service: 'api', bindings: [] }));
+      await deployed(deployBundle({ service: 'job', bindings: [] }));
+      setReady('web-prod', 'True');
+      setReady('api-prod', 'False');
+      const stats = (await (await get('/v1/deployments/stats?env=prod')).json()) as Json;
+      expect(stats).toMatchObject({
+        env: 'prod',
+        services: 3,
+        deployments: 4,
+        ready: 1,
+        failed: 1,
+      });
+      expect(typeof stats.lastDeployedAt).toBe('string');
+      expect(await (await get('/v1/deployments/stats?env=staging')).json()).toEqual({
+        env: 'staging',
+        services: 0,
+        deployments: 0,
+        ready: 0,
+        failed: 0,
+      });
+    });
+
+    test('rollback re-applies the previous revision and records it as a new one', async () => {
+      await deployed(withReplicas(1));
+      await deployed(withReplicas(3));
+      const response = await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
+      expect(response.status).toBe(202);
+      expect(await response.json()).toMatchObject({ id: 'web-prod.3', status: 'pending' });
+      expect(appliedReplicas()).toBe(1);
+      const applied = JSON.parse(patches().at(-1)?.body ?? '') as {
+        spec: { template: { spec: Json } };
+      };
+      // Rendered like a deploy: namespace environment, host selector and injected secrets.
+      expect(applied.spec.template.spec.hostSelector).toEqual({ hostgroup: 'tenant-acme' });
+      expect(
+        (((revision('web-prod.3') as Json).metadata as Json).annotations as Json)[
+          'platform.di-framework.dev/rollback-of'
+        ],
+      ).toBe('web-prod.1');
+      const { items } = (await (await get('/v1/deployments?env=prod&service=web')).json()) as {
+        items: Json[];
+      };
+      expect(items.map((item) => [item.id, item.status])).toEqual([
+        ['web-prod.3', 'pending'],
+        ['web-prod.2', 'rolled-back'],
+        ['web-prod.1', 'pending'],
+      ]);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('"deploy.rolled-back"'));
+    });
+
+    test('rollback --to re-applies the named revision', async () => {
+      await deployed(withReplicas(1));
+      await deployed(withReplicas(2));
+      await deployed(withReplicas(3));
+      const response = await post('/v1/deployments/rollback', {
+        env: 'prod',
+        service: 'web',
+        to: 'web-prod.1',
+      });
+      expect(response.status).toBe(202);
+      expect(((await response.json()) as Json).id).toBe('web-prod.4');
+      expect(appliedReplicas()).toBe(1);
+    });
+
+    test('rollback to a missing revision, or with no earlier one, is a 404', async () => {
+      await deployed();
+      for (const body of [
+        { env: 'prod', service: 'web', to: 'web-prod.9' },
+        { env: 'prod', service: 'web', to: 'api-prod.1' },
+        { env: 'prod', service: 'web' },
+      ]) {
+        const response = await post('/v1/deployments/rollback', body);
+        expect(response.status).toBe(404);
+      }
+    });
+
+    test('rollback validates the stored bundle again', async () => {
+      seedSecret('db', 'prod');
+      await deployed(deployBundle({ secrets: ['api-token', 'db'] }));
+      await deployed();
+      stored.delete(`${CORE}/secrets/db.prod`);
+      const response = await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
+      expect(response.status).toBe(422);
+      expect(((await response.json()) as Json).detail).toBe('secret db does not exist in prod');
+    });
+
+    test('bindings a bundle no longer declares are pruned, and preview reports them as delete', async () => {
+      const both = deployBundle({
+        bindings: [
+          { name: 'cache', capability: 'keyvalue', serviceName: 'cache' },
+          { name: 'queue', capability: 'messaging', serviceName: 'queue' },
+        ],
+      });
+      await deployed(both);
+      // Another service's binding with the same env is not this deploy's to prune.
+      stored.set(`${BINDINGS}/api-prod-queue`, {
+        metadata: {
+          name: 'api-prod-queue',
+          labels: { ...BINDING_LABELS, 'di-framework.dev/service': 'api' },
+        },
+      });
+      const preview = await post('/v1/deploy/preview', deployBundle());
+      expect(((await preview.json()) as { changes: Json[] }).changes).toContainEqual({
+        kind: 'delete',
+        resource: 'ServiceBinding',
+        name: 'web-prod-queue',
+      });
+      expect(stored.has(`${BINDINGS}/web-prod-queue`)).toBe(true);
+
+      await deployed();
+      expect(stored.has(`${BINDINGS}/web-prod-queue`)).toBe(false);
+      expect(stored.has(`${BINDINGS}/web-prod-cache`)).toBe(true);
+      expect(stored.has(`${BINDINGS}/api-prod-queue`)).toBe(true);
+
+      // Rolling back to the bundle with the queue binding brings it back; forward prunes it again.
+      await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
+      expect(stored.has(`${BINDINGS}/web-prod-queue`)).toBe(true);
+      await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
+      expect(stored.has(`${BINDINGS}/web-prod-queue`)).toBe(false);
+      const deletes = api.requests.filter((r) => r.method === 'DELETE');
+      expect(
+        deletes.every((r) => r.headers.get('authorization') === 'Bearer sa-di-user-alice'),
+      ).toBe(true);
+    });
+
+    test('a viewer may list and summarize deployments but not roll back', async () => {
+      await deployed();
+      await deployed();
+      caller = { ...alice, user: 'vic', role: 'viewer' };
+      expect((await get('/v1/deployments?env=prod')).status).toBe(200);
+      expect((await get('/v1/deployments/stats?env=prod')).status).toBe(200);
+      expect((await post('/v1/deployments/rollback', { env: 'prod', service: 'web' })).status).toBe(
+        403,
+      );
+      expect((await post('/v1/deploy', deployBundle())).status).toBe(403);
+      const reads = api.requests.filter(
+        (r) =>
+          !r.pathname.endsWith('/token') &&
+          r.headers.get('authorization') === 'Bearer sa-di-user-vic',
+      );
+      expect(reads.length).toBeGreaterThan(0);
+      expect(reads.every((r) => r.method === 'GET')).toBe(true);
+    });
   });
 
   test('a token the API server rejects on a preview read is a 502', async () => {

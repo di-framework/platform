@@ -1,4 +1,4 @@
-import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
+import { type HttpCall, problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
 // Shared with platform#53 so names and labels follow one storage contract (README).
 import { isManagedSecretName } from '../../../platform/src/tenancy/admission.ts';
 import {
@@ -381,63 +381,312 @@ function changedFields(before: KubeObject, after: KubeObject): string[] {
   return changed;
 }
 
-const validated =
-  (
-    handler: (bundle: DeployBundle, context: V1Context, refs: ConfigRefs) => Promise<Response>,
-  ): V1Handler =>
-  async (command, _call, context) => {
-    const bundle = command as DeployBundle;
-    const reason = invalid(bundle);
-    if (reason) return problem(422, 'Unprocessable Entity', reason);
-    const refs = await configRefs(bundle, context);
-    if (refs instanceof Response) return refs;
-    return handler(bundle, context, refs);
+// ---- revisions (platform#55:history) ----------------------------------------------------------
+
+/**
+ * Each successful deploy is stored as a revision ConfigMap `di-deploy-<service>-<env>.<n>`. The
+ * name prefix and the revision label keep them apart from the #53 vars ConfigMaps
+ * (`di-vars-<env>`, label `config: vars`) and from the log projection, which selects on
+ * `di-framework.dev/projection`; revisions carry neither.
+ */
+export const REVISION_PREFIX = 'di-deploy-';
+export const REVISION = 'platform.di-framework.dev/deploy-revision';
+const CREATED_AT = 'platform.di-framework.dev/created-at';
+const STATUS = 'platform.di-framework.dev/status';
+const READY_AT = 'platform.di-framework.dev/ready-at';
+const ROLLBACK_OF = 'platform.di-framework.dev/rollback-of';
+/** Revisions kept per service and environment; older ones are pruned. */
+export const HISTORY_LIMIT = 20;
+/** A ConfigMap holds at most 1 MiB; this leaves room for metadata and the digest. */
+export const MAX_STORED_BUNDLE_BYTES = 900 * 1024;
+
+type Status = 'pending' | 'rolling' | 'ready' | 'failed' | 'rolled-back';
+interface Live {
+  status: Status;
+  readyAt?: string;
+}
+
+interface Revision {
+  metadata: {
+    name: string;
+    resourceVersion?: string;
+    labels?: Record<string, string>;
+    annotations?: Record<string, string>;
   };
+  data?: Record<string, string>;
+  [key: string]: unknown;
+}
+
+const coreNamespace = (tenant: string) => `/api/v1/namespaces/di-tenant-${tenant}`;
+const workloadPath = (tenant: string, name: string) =>
+  `/apis/${WORKLOAD_API}/namespaces/di-tenant-${tenant}/workloaddeployments/${name}`;
+const bindingsPath = (tenant: string) =>
+  `/apis/${BINDING_API}/namespaces/di-tenant-${tenant}/servicebindings`;
+const revisionNumber = (revision: Revision) => Number(revision.metadata.labels?.[REVISION]);
+const revisionId = (revision: Revision) => revision.metadata.name.slice(REVISION_PREFIX.length);
+const createdAt = (revision: Revision) => revision.metadata.annotations?.[CREATED_AT] ?? '';
+const serviceOf = (revision: Revision) => revision.metadata.labels?.[SERVICE_LABEL] ?? '';
+
+/** The revisions in `env`, of one service or all, newest first. */
+async function revisions(
+  user: UserKube,
+  tenant: string,
+  env: string,
+  service?: string,
+): Promise<Revision[]> {
+  const selector = [REVISION, `${ENV}=${env}`, ...(service ? [`${SERVICE_LABEL}=${service}`] : [])];
+  const list = await user.call<{ items?: Revision[] }>(
+    'GET',
+    `${coreNamespace(tenant)}/configmaps?labelSelector=${encodeURIComponent(selector.join(','))}`,
+  );
+  return (list.items ?? [])
+    .filter((item) => item.metadata.name.startsWith(REVISION_PREFIX))
+    .sort(
+      (a, b) => createdAt(b).localeCompare(createdAt(a)) || revisionNumber(b) - revisionNumber(a),
+    );
+}
+
+/** The live rollout state of a WorkloadDeployment, from its Ready condition. */
+async function liveStatus(user: UserKube, tenant: string, name: string): Promise<Live> {
+  const workload = await current(user, workloadPath(tenant, name));
+  const conditions = (workload?.status as Json | undefined)?.conditions;
+  const ready = Array.isArray(conditions)
+    ? (conditions as Json[]).find((condition) => condition.type === 'Ready')
+    : undefined;
+  if (ready?.status === 'True')
+    return {
+      status: 'ready',
+      ...(typeof ready.lastTransitionTime === 'string'
+        ? { readyAt: ready.lastTransitionTime }
+        : {}),
+    };
+  if (ready?.status === 'False') return { status: 'failed' };
+  return { status: ready ? 'rolling' : 'pending' };
+}
+
+const sha256 = (text: string) =>
+  `sha256:${new Bun.CryptoHasher('sha256').update(text).digest('hex')}`;
+
+/** The contract's `Deployment` for one revision. */
+function deployment(revision: Revision, { status, readyAt }: Live) {
+  const bundle = JSON.parse(revision.data?.bundle ?? '{}') as DeployBundle;
+  return {
+    id: revisionId(revision),
+    service: bundle.service,
+    env: bundle.env,
+    status,
+    component: bundle.component,
+    createdAt: createdAt(revision),
+    ...(readyAt ? { readyAt } : {}),
+  };
+}
+
+/** Records a revision after a successful apply, marks the one it replaced, and prunes the oldest. */
+async function record(
+  user: UserKube,
+  tenant: string,
+  bundle: DeployBundle,
+  before: Live,
+  rollbackOf?: string,
+): Promise<Revision> {
+  const existing = await revisions(user, tenant, bundle.env, bundle.service);
+  const n = Math.max(0, ...existing.map(revisionNumber)) + 1;
+  const text = JSON.stringify(bundle);
+  const revision: Revision = {
+    apiVersion: 'v1',
+    kind: 'ConfigMap',
+    metadata: {
+      name: `${REVISION_PREFIX}${bundle.service}-${bundle.env}.${n}`,
+      labels: { [REVISION]: String(n), [SERVICE_LABEL]: bundle.service, [ENV]: bundle.env },
+      annotations: {
+        [CREATED_AT]: new Date().toISOString(),
+        ...(rollbackOf ? { [ROLLBACK_OF]: rollbackOf } : {}),
+      },
+    },
+    data: { bundle: text, digest: sha256(text) },
+  };
+  const configmaps = `${coreNamespace(tenant)}/configmaps`;
+  await user.call('POST', configmaps, revision);
+  const [previous] = existing;
+  if (previous) {
+    const annotations = {
+      ...previous.metadata.annotations,
+      [STATUS]: rollbackOf ? 'rolled-back' : before.status,
+      ...(before.readyAt ? { [READY_AT]: before.readyAt } : {}),
+    };
+    await user.call('PUT', `${configmaps}/${previous.metadata.name}`, {
+      ...previous,
+      metadata: { ...previous.metadata, annotations },
+    });
+  }
+  for (const old of existing.slice(HISTORY_LIMIT - 1))
+    await user.call('DELETE', `${configmaps}/${old.metadata.name}`);
+  return revision;
+}
+
+/** ServiceBindings this service/env owns (by the labels `render` sets) that `keep` lacks. */
+async function staleBindings(
+  user: UserKube,
+  tenant: string,
+  bundle: DeployBundle,
+  keep: Set<string>,
+): Promise<string[]> {
+  const selector = [
+    `${MANAGED_BY}=${MANAGED_BY_VALUE}`,
+    `${SERVICE_LABEL}=${bundle.service}`,
+    `${ENV}=${bundle.env}`,
+  ].join(',');
+  const list = await user.call<{ items?: KubeObject[] }>(
+    'GET',
+    `${bindingsPath(tenant)}?labelSelector=${encodeURIComponent(selector)}`,
+  );
+  return (list.items ?? []).map((item) => item.metadata.name).filter((name) => !keep.has(name));
+}
+
+/** Applies a checked bundle, prunes dropped bindings, and records it as a new revision. */
+async function rollout(
+  bundle: DeployBundle,
+  context: V1Context,
+  refs: ConfigRefs,
+  rollbackOf?: string,
+): Promise<Response> {
+  const user = context.asUser();
+  const { tenant } = context;
+  const before = await liveStatus(user, tenant, `${bundle.service}-${bundle.env}`);
+  const objects = render(bundle, tenant, refs);
+  for (const { path, object } of objects) await apply(user, path, object, false);
+  const keep = new Set(objects.map(({ object }) => object.metadata.name));
+  for (const stale of await staleBindings(user, tenant, bundle, keep))
+    await user.call('DELETE', `${bindingsPath(tenant)}/${stale}`);
+  const revision = await record(user, tenant, bundle, before, rollbackOf);
+  context.audit(rollbackOf ? 'deploy.rolled-back' : 'deploy.applied', {
+    user: context.principal.user,
+    env: bundle.env,
+    service: bundle.service,
+    digest: bundle.component.digest,
+    revision: revisionId(revision),
+    ...(rollbackOf ? { to: rollbackOf } : {}),
+  });
+  return Response.json(deployment(revision, { status: 'pending' }), { status: 202 });
+}
+
+/** Validates the bundle and the vars and secrets it uses, then runs `handler`. */
+async function checked(
+  bundle: DeployBundle,
+  context: V1Context,
+  handler: (refs: ConfigRefs) => Promise<Response>,
+): Promise<Response> {
+  const reason = invalid(bundle);
+  if (reason) return problem(422, 'Unprocessable Entity', reason);
+  const refs = await configRefs(bundle, context);
+  if (refs instanceof Response) return refs;
+  return handler(refs);
+}
+
+const queryValue = (call: HttpCall, name: string) => {
+  const raw = call.request.query?.[name];
+  return Array.isArray(raw) ? raw[0] : raw;
+};
 
 /** `/v1/deploy` and `/v1/deployments` (platform#55). */
 export const deploy: V1Module = {
-  previewDeploy: validated(async (bundle, context, refs) => {
-    const user = context.asUser();
-    const changes = [];
-    for (const { path, object } of render(bundle, context.tenant, refs)) {
-      const before = await current(user, path);
-      const after = await apply(user, path, object, true);
-      const fields = before ? changedFields(before, after) : [];
-      changes.push({
-        kind: !before ? 'create' : fields.length ? 'update' : 'unchanged',
-        resource: object.kind,
-        name: object.metadata.name,
-        ...(fields.length ? { detail: fields.join(', ') } : {}),
-      });
-    }
-    return Response.json({ env: bundle.env, service: bundle.service, changes });
-  }),
-  deploy: validated(async (bundle, context, refs) => {
-    const user = context.asUser();
-    let applied: KubeObject | undefined;
-    for (const { path, object } of render(bundle, context.tenant, refs))
-      applied = await apply(user, path, object, false);
-    const workload = applied as KubeObject;
-    context.audit('deploy.applied', {
-      user: context.principal.user,
-      env: bundle.env,
-      service: bundle.service,
-      digest: bundle.component.digest,
+  previewDeploy: async (command, _call, context) => {
+    const bundle = command as DeployBundle;
+    return checked(bundle, context, async (refs) => {
+      const user = context.asUser();
+      const changes = [];
+      const objects = render(bundle, context.tenant, refs);
+      for (const { path, object } of objects) {
+        const before = await current(user, path);
+        const after = await apply(user, path, object, true);
+        const fields = before ? changedFields(before, after) : [];
+        changes.push({
+          kind: !before ? 'create' : fields.length ? 'update' : 'unchanged',
+          resource: object.kind,
+          name: object.metadata.name,
+          ...(fields.length ? { detail: fields.join(', ') } : {}),
+        });
+      }
+      const keep = new Set(objects.map(({ object }) => object.metadata.name));
+      for (const stale of await staleBindings(user, context.tenant, bundle, keep))
+        changes.push({ kind: 'delete', resource: 'ServiceBinding', name: stale });
+      return Response.json({ env: bundle.env, service: bundle.service, changes });
     });
-    return Response.json(
-      {
-        id: `${workload.metadata.name}.${workload.metadata.generation ?? 1}`,
-        service: bundle.service,
-        env: bundle.env,
-        status: 'pending',
-        component: bundle.component,
-        createdAt: new Date().toISOString(),
-      },
-      { status: 202 },
-    );
-  }),
+  },
+  deploy: async (command, _call, context) => {
+    const bundle = command as DeployBundle;
+    return checked(bundle, context, async (refs) => {
+      const size = new TextEncoder().encode(JSON.stringify(bundle)).byteLength;
+      if (size > MAX_STORED_BUNDLE_BYTES)
+        return problem(
+          422,
+          'Unprocessable Entity',
+          `bundle is ${size} bytes; deploy history stores at most ${MAX_STORED_BUNDLE_BYTES}`,
+        );
+      return rollout(bundle, context, refs);
+    });
+  },
   registry: notImplemented('registry'),
-  deployments: notImplemented('deployments'),
-  deploymentStats: notImplemented('deploymentStats'),
-  rollback: notImplemented('rollback'),
+  deployments: async (_command, call, context) => {
+    const user = context.asUser();
+    const env = String(queryValue(call, 'env'));
+    const items = await revisions(user, context.tenant, env, queryValue(call, 'service'));
+    // The newest revision of each service reports the live rollout; older ones what they were
+    // when they were replaced.
+    const live = new Map<Revision, Live>();
+    const seen = new Set<string>();
+    for (const revision of items) {
+      if (seen.has(serviceOf(revision))) continue;
+      seen.add(serviceOf(revision));
+      live.set(revision, await liveStatus(user, context.tenant, `${serviceOf(revision)}-${env}`));
+    }
+    return Response.json({
+      items: items.map((revision) => {
+        const annotations = revision.metadata.annotations ?? {};
+        return deployment(
+          revision,
+          live.get(revision) ?? {
+            status: (annotations[STATUS] as Status | undefined) ?? 'pending',
+            readyAt: annotations[READY_AT],
+          },
+        );
+      }),
+    });
+  },
+  deploymentStats: async (_command, call, context) => {
+    const user = context.asUser();
+    const env = String(queryValue(call, 'env'));
+    const items = await revisions(user, context.tenant, env);
+    const services = [...new Set(items.map(serviceOf))];
+    let ready = 0;
+    let failed = 0;
+    for (const service of services) {
+      const { status } = await liveStatus(user, context.tenant, `${service}-${env}`);
+      if (status === 'ready') ready++;
+      if (status === 'failed') failed++;
+    }
+    return Response.json({
+      env,
+      services: services.length,
+      deployments: items.length,
+      ready,
+      failed,
+      ...(items[0] ? { lastDeployedAt: createdAt(items[0]) } : {}),
+    });
+  },
+  rollback: async (command, _call, context) => {
+    const { env, service, to } = command as { env: string; service: string; to?: string };
+    const items = await revisions(context.asUser(), context.tenant, env, service);
+    const target = to ? items.find((revision) => revisionId(revision) === to) : items[1];
+    if (!target)
+      return problem(
+        404,
+        'Not Found',
+        to
+          ? `deployment ${to} is not in the history of ${service} in ${env}`
+          : `${service} has no earlier deployment in ${env}`,
+      );
+    const bundle = JSON.parse(target.data?.bundle as string) as DeployBundle;
+    return checked(bundle, context, (refs) => rollout(bundle, context, refs, revisionId(target)));
+  },
 };

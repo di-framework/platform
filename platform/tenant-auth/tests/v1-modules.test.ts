@@ -239,7 +239,7 @@ describe('resource modules over real HTTP', () => {
 
   test.each([
     ['logs', 'logs', 'GET', '/v1/services/web/logs?env=prod'],
-    ['deploy', 'deployments', 'GET', '/v1/deployments?env=prod'],
+    ['deploy', 'registry', 'GET', '/v1/deploy/registry'],
   ] as [string, string, string, string][])(
     'the %s module serves %s, with the caller as context',
     async (group, operation, method, path) => {

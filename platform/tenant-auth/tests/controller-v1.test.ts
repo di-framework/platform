@@ -75,23 +75,20 @@ describe('/v1 dispatch', () => {
   };
   const reachedCluster = (path: string) => api.requests.some((r) => r.pathname.startsWith(path));
 
-  test.each([
-    ['GET', '/v1/deployments?env=prod', undefined, 'deployments'],
-    ['GET', '/v1/deployments?env=staging&service=web', undefined, 'deployments'],
-    ['GET', '/v1/deployments/stats?env=prod', undefined, 'deploymentStats'],
-    ['POST', '/v1/deployments/rollback', '{"env":"prod","service":"web"}', 'rollback'],
-    ['GET', '/v1/deploy/registry', undefined, 'registry'],
-  ])('%s %s answers 501 problem+json', async (method, path, body, operation) => {
-    const response = await call(method, path, { body });
-    expect(response.status).toBe(501);
-    expect(await problem(response)).toEqual({
-      type: 'about:blank',
-      title: 'Not Implemented',
-      status: 501,
-      detail: `${operation} is not implemented in the pilot yet`,
-    } as never);
-    expect(reachedCluster('/v1')).toBe(false);
-  });
+  test.each([['GET', '/v1/deploy/registry', undefined, 'registry']])(
+    '%s %s answers 501 problem+json',
+    async (method, path, body, operation) => {
+      const response = await call(method, path, { body });
+      expect(response.status).toBe(501);
+      expect(await problem(response)).toEqual({
+        type: 'about:blank',
+        title: 'Not Implemented',
+        status: 501,
+        detail: `${operation} is not implemented in the pilot yet`,
+      } as never);
+      expect(reachedCluster('/v1')).toBe(false);
+    },
+  );
 
   test('a deploy bundle that matches the contract reaches its handler', async () => {
     const bundle = {
@@ -161,14 +158,12 @@ describe('/v1 dispatch', () => {
     expect(reachedCluster('/v1')).toBe(false);
   });
 
-  test.each(['/v1/x/../deployments?env=prod', '/v1/x/%2e%2e/deployments?env=prod'])(
+  test.each(['/v1/x/../deploy/registry', '/v1/x/%2e%2e/deploy/registry'])(
     '%s is normalised to the operation it names',
     async (path) => {
       const response = await call('GET', path);
       expect(response.status).toBe(501);
-      expect((await problem(response)).detail).toBe(
-        'deployments is not implemented in the pilot yet',
-      );
+      expect((await problem(response)).detail).toBe('registry is not implemented in the pilot yet');
     },
   );
 
@@ -220,7 +215,7 @@ describe('/v1 dispatch', () => {
       ['GET', '/v1/deploy/registry', undefined],
     ])('a viewer may call %s %s', async (method, path, body) => {
       const response = await call(method, path, { body, bearer: 'viewer' });
-      expect(response.status).toBe(501);
+      expect(response.status).not.toBe(403);
     });
 
     test.each([
@@ -271,7 +266,7 @@ describe('/v1 dispatch', () => {
       const response = await call('POST', '/v1/deployments/rollback', {
         body: '{"env":"prod","service":"web"}',
       });
-      expect(response.status).toBe(501);
+      expect(response.status).not.toBe(403);
     });
 
     test('a viewer keeps whoami and logout', async () => {
