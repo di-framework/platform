@@ -593,6 +593,7 @@ export class Controller {
         await this.pruneTenantAuth();
         return undefined;
       }
+      this.tenantAuthClean = false;
       const desired = tenantAuthResources(
         tenant,
         this.cfg,
