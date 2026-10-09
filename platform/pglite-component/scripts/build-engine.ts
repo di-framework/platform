@@ -73,7 +73,10 @@ export function patchUpstreamBuild(
   );
   const runIndex = patchedBuild.indexOf('docker run --rm');
   if (runIndex < 0) throw new Error('upstream build.sh: `docker run --rm` anchor not found');
-  patchedBuild = `${patchedBuild.slice(0, runIndex)}${containerBlock}${patchedBuild.slice(runIndex)}`;
+  // Everything from the upstream `docker run --rm` onward is replaced: the
+  // volume-mount transfer breaks on remote daemons and the Go-based pristine
+  // database packaging is not needed here.
+  patchedBuild = `${patchedBuild.slice(0, runIndex)}${containerBlock}`;
   return { versionsEnv: patchedVersions, buildSh: patchedBuild };
 }
 
