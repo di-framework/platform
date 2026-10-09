@@ -1,7 +1,7 @@
 {
   "name": "@di-framework/tenant-cli",
-  "version": "0.0.0",
-  "private": true,
+  "version": "6.0.9",
+  "private": false,
   "type": "module",
   "license": "(MIT OR Apache-2.0)",
   "description": "Pilot tenant CLI: talks only to the tenant controller's OpenAPI contract with an identity-server credential; never to Kubernetes.",
@@ -9,6 +9,18 @@
     "type": "git",
     "url": "https://github.com/di-framework/platform",
     "directory": "platform/tenant-cli"
+  },
+  "homepage": "https://github.com/di-framework/platform",
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "exports": {
+    "./client": {
+      "types": "./src/client/index.ts",
+      "default": "./src/client/index.ts"
+    },
+    "./src/*": "./src/*"
   },
   "bin": {
     "di-tenant": "src/main.ts"

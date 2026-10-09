@@ -1,6 +1,8 @@
 import type { components, operations, paths } from './schema';
 import { events } from './sse.ts';
 
+export { events, type SseEvent } from './sse.ts';
+
 type Json<
   Op extends keyof operations,
   Status extends number,
