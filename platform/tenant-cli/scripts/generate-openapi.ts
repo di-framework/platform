@@ -34,6 +34,15 @@ export function writeOpenApiSpec(path = openApiSpecFile): string {
       const method = operationId.slice(operationId.lastIndexOf('.') + 1);
       (operation as { operationId: string }).operationId = method;
       if (!PUBLIC.has(method)) (operation as { security?: unknown }).security = [{ identity: [] }];
+      // An `Empty` input reads a missing body as `{}`, so the body is optional on the wire.
+      const body = (operation as { requestBody?: { required?: boolean; content?: unknown } })
+        .requestBody;
+      const content = body?.content as Record<string, { schema?: unknown }> | undefined;
+      if (
+        body &&
+        JSON.stringify(content?.['application/json']?.schema) === JSON.stringify(schemas.Empty)
+      )
+        body.required = false;
     }
   }
   const withComponents = document as { components?: Record<string, unknown> };

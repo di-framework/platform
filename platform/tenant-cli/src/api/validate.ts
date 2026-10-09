@@ -36,9 +36,23 @@ function checkFormat(format: string | undefined, value: string, at: string): voi
 /**
  * Checks a value against the subset of JSON Schema the `/v1` component schemas use: `$ref`,
  * `type` (object, array, string, integer, boolean), `enum`, `required`, `properties`,
- * `additionalProperties`, `items`, and the `date-time`, `uri` and `int32` formats.
+ * `additionalProperties` (a schema or `false`), `items`, and the `date-time`, `uri` and `int32` formats.
  * Throws {@link ValidationError} naming the first offending location.
  */
+/** Every keyword {@link validate} enforces or deliberately ignores as an annotation. */
+export const SUPPORTED_KEYWORDS: ReadonlySet<string> = new Set([
+  '$ref',
+  'type',
+  'format',
+  'enum',
+  'properties',
+  'required',
+  'additionalProperties',
+  'items',
+  'description',
+  'default',
+]);
+
 export function validate(input: Schema, value: unknown, at = 'body'): void {
   const schema = resolve(input);
   if (schema.enum && !schema.enum.includes(value))
@@ -49,10 +63,14 @@ export function validate(input: Schema, value: unknown, at = 'body'): void {
         throw new ValidationError(`${at} must be an object`);
       const record = value as Record<string, unknown>;
       for (const name of schema.required ?? [])
-        if (record[name] === undefined) throw new ValidationError(`${at}.${name} is required`);
+        if (!Object.hasOwn(record, name) || record[name] === undefined)
+          throw new ValidationError(`${at}.${name} is required`);
       for (const [name, item] of Object.entries(record)) {
-        const property = schema.properties?.[name];
-        if (property) validate(property, item, `${at}.${name}`);
+        const properties = schema.properties ?? {};
+        if (Object.hasOwn(properties, name))
+          validate(properties[name] as Schema, item, `${at}.${name}`);
+        else if (schema.additionalProperties === false)
+          throw new ValidationError(`${at}.${name} is not allowed`);
         else if (typeof schema.additionalProperties === 'object')
           validate(schema.additionalProperties, item, `${at}.${name}`);
       }
@@ -76,6 +94,10 @@ export function validate(input: Schema, value: unknown, at = 'body'): void {
     case 'boolean':
       if (typeof value !== 'boolean') throw new ValidationError(`${at} must be a boolean`);
       return;
+    case undefined:
+      return;
+    default:
+      throw new Error(`unsupported schema type ${JSON.stringify(schema.type)} at ${at}`);
   }
 }
 

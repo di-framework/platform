@@ -30,17 +30,24 @@ interface Route {
   method: string;
   pattern: RegExp;
   query: Parameter[];
+  input: Record<string, unknown>;
 }
+
+/** Largest request body `/v1` accepts; deploy bundles and config values are small. */
+export const MAX_BODY_BYTES = 1024 * 1024;
 
 /** Every operation's method, path pattern and query parameters, read from the manifests. */
 export const ROUTES: Route[] = [auth, deploy, deployments, secrets, vars, services].flatMap(
   (manifest) =>
-    Object.entries(manifest.operations).map(([operation, { http }]) => {
+    Object.entries(manifest.operations).map(([operation, { http, input }]) => {
       const path = `${manifest.http.prefix}${http?.path}`.replace(/:\w+/g, '[^/]+');
       return {
         operation,
         method: http?.method as string,
         pattern: new RegExp(`^${path}$`),
+        input: (
+          manifest.schemas as Record<string, { schema: { jsonSchema: Record<string, unknown> } }>
+        )[input]?.schema.jsonSchema as Record<string, unknown>,
         query: ((http?.parameters ?? []) as unknown as Parameter[]).filter((p) => p.in === 'query'),
       };
     }),
@@ -76,26 +83,62 @@ function checkQuery(route: Route, url: URL): void {
   }
 }
 
+/** Parses the request body (an absent one reads as `{}`) and checks it against the input schema. */
+function checkBody(route: Route, text: string): void {
+  let body: unknown = {};
+  if (text !== '') {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      throw new ValidationError('the request body is not valid JSON');
+    }
+  }
+  validate(route.input, body);
+}
+
 /**
  * Serves one `/v1` request through the generated routes. Returns undefined when the request
  * names no contract operation, so the caller decides how to answer it. Requests that do not
- * match the contract (query parameters, content type, body) get a 400 or 415 problem before
- * reaching a handler.
+ * match the contract (query parameters, content type, size, body) get a 400, 413 or 415 problem
+ * before reaching a handler. A handler result that breaks the response contract gets a 500.
  */
 export async function dispatch(request: Request): Promise<Response | undefined> {
   const url = new URL(request.url);
   const route = match(request.method, url.pathname);
   if (!route) return undefined;
+  let forward = request;
   try {
     checkQuery(route, url);
-    if (['POST', 'PUT', 'PATCH'].includes(request.method)) {
+    if (Number(request.headers.get('content-length') ?? 0) > MAX_BODY_BYTES)
+      return problem(413, 'Content Too Large', `the request body exceeds ${MAX_BODY_BYTES} bytes`);
+    const text = request.body ? await request.clone().text() : '';
+    if (text.length > MAX_BODY_BYTES)
+      return problem(413, 'Content Too Large', `the request body exceeds ${MAX_BODY_BYTES} bytes`);
+    if (text !== '') {
+      // 415 means a body was sent in a format the contract does not accept (RFC 9110 15.5.16).
       const type = (request.headers.get('content-type') ?? '').toLowerCase();
       if (!type.includes('application/json') && !type.includes('+json'))
         return problem(415, 'Unsupported Media Type', 'the request body must be application/json');
     }
-    return (await router.fetch(request)) as Response;
+    checkBody(route, text);
+    if (text === '' && ['POST', 'PUT', 'PATCH'].includes(request.method)) {
+      // A bodiless request passed the schema (its input is Empty); hand the generated route an
+      // explicit `{}` so the router's JSON content-type check lets it through.
+      const headers = new Headers(request.headers);
+      headers.set('content-type', 'application/json');
+      headers.delete('content-length');
+      forward = new Request(request.url, { method: request.method, headers, body: '{}' });
+    }
   } catch (error) {
     if (error instanceof ValidationError) return problem(400, 'Bad Request', error.message);
+    throw error;
+  }
+  try {
+    return (await router.fetch(forward)) as Response;
+  } catch (error) {
+    // The request was already checked, so a validation failure here is a handler result that
+    // breaks the response contract: a server bug, not the client's.
+    if (error instanceof ValidationError) return problem(500, 'Internal Server Error');
     throw error;
   }
 }

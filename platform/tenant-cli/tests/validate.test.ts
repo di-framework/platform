@@ -1,5 +1,51 @@
 import { expect, test } from 'bun:test';
-import { coerceQuery, ValidationError, validate } from '../src/api/validate.ts';
+import auth from '../src/api/contracts/auth-v1.codegen.ts';
+import { secrets, vars } from '../src/api/contracts/config-v1.codegen.ts';
+import deploy from '../src/api/contracts/deploy-v1.codegen.ts';
+import deployments from '../src/api/contracts/deployments-v1.codegen.ts';
+import services from '../src/api/contracts/services-v1.codegen.ts';
+import { schemas } from '../src/api/schemas.ts';
+import { coerceQuery, SUPPORTED_KEYWORDS, ValidationError, validate } from '../src/api/validate.ts';
+
+test('additionalProperties false refuses undeclared fields, including inherited names', () => {
+  const closed = {
+    type: 'object',
+    properties: { a: { type: 'string' } },
+    additionalProperties: false,
+  };
+  fails(closed, { b: 1 }, 'body.b is not allowed');
+  fails(closed, { constructor: 1 }, 'body.constructor is not allowed');
+  fails(closed, JSON.parse('{"__proto__":1}'), 'body.__proto__ is not allowed');
+  fails({ type: 'object', required: ['toString'] }, {}, 'body.toString is required');
+  expect(() => validate(closed, { a: 'x' })).not.toThrow();
+});
+
+test('an unsupported type fails closed', () => {
+  expect(() => validate({ type: 'number' }, 1)).toThrow('unsupported schema type "number"');
+  expect(() => validate({ type: ['string', 'null'] } as never, 'x')).toThrow('unsupported');
+});
+
+test('every contract schema and parameter uses only keywords the validator supports', () => {
+  const unsupported: string[] = [];
+  const walk = (schema: unknown, at: string): void => {
+    if (typeof schema !== 'object' || schema === null) return;
+    for (const [key, value] of Object.entries(schema)) {
+      if (!SUPPORTED_KEYWORDS.has(key)) unsupported.push(`${at}.${key}`);
+      if (key === 'properties')
+        for (const [name, child] of Object.entries(value as object)) walk(child, `${at}.${name}`);
+      else if (key === 'items' || (key === 'additionalProperties' && typeof value === 'object'))
+        walk(value, `${at}.${key}`);
+    }
+  };
+  for (const [name, schema] of Object.entries(schemas)) walk(schema, name);
+  for (const manifest of [auth, deploy, deployments, secrets, vars, services])
+    for (const [operation, { http }] of Object.entries(manifest.operations))
+      for (const parameter of (http?.parameters ?? []) as { name: string; schema: unknown }[])
+        walk(parameter.schema, `${operation}.${parameter.name}`);
+  expect(unsupported).toEqual([]);
+  walk({ minLength: 1 }, 'probe');
+  expect(unsupported).toEqual(['probe.minLength']);
+});
 
 const fails = (schema: object, value: unknown, message: string) => {
   expect(() => validate(schema, value)).toThrow(new ValidationError(message));
