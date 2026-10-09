@@ -1,5 +1,5 @@
-# Publish the tenant host image: wash 2.8.0 with wasi-tls and the postgres
-# invocation-lease patch. Dispatch-only, matching the npm Release workflow.
+# Publish the tenant host image: wash 2.8.0 with wasi-tls.
+# Dispatch-only, matching the npm Release workflow.
 #
 # amd64 and arm64 compile at the same time on native runners. One ubuntu-24.04
 # job plus QEMU was spending the arm64 release build in emulation, which is

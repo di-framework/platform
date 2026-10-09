@@ -20,12 +20,6 @@ ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 # GIT_TERMINAL_PROMPT stops a missing credential from hanging the publish job.
 RUN GIT_TERMINAL_PROMPT=0 git clone --depth 1 --quiet --branch "${WASMCLOUD_TAG}" https://github.com/wasmCloud/wasmCloud /src \
   && test "$(git -C /src rev-parse HEAD)" = "${WASMCLOUD_COMMIT}"
-# The patch is its own layer so editing it does not clone wasmCloud again.
-COPY postgres-invocation-lease.patch /tmp/postgres-invocation-lease.patch
-RUN git -C /src apply --check /tmp/postgres-invocation-lease.patch \
-  && git -C /src apply /tmp/postgres-invocation-lease.patch \
-  && grep -q release_store_lease /src/crates/wash-runtime/src/host/http_p3.rs \
-  && rm /tmp/postgres-invocation-lease.patch
 WORKDIR /src
 # `wasi-tls` is defined by crates/wash (forwarding to wash-runtime/wasi-tls) and is added on top of the
 # default features, exactly like upstream's CARGO_FEATURES build argument.
