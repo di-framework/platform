@@ -15,7 +15,7 @@
     },
     "adapters/cloudflare": {
       "name": "@di-framework/cloudflare",
-      "version": "6.0.6",
+      "version": "6.0.8",
       "devDependencies": {
         "@di-framework/core": "^5",
         "@types/bun": "latest",
@@ -27,7 +27,7 @@
     },
     "adapters/cloudfoundry": {
       "name": "@di-framework/cloudfoundry",
-      "version": "6.0.6",
+      "version": "6.0.8",
       "devDependencies": {
         "@di-framework/core": "^5",
         "@types/bun": "latest",
@@ -39,11 +39,11 @@
     },
     "platform/backup-agent": {
       "name": "@di-framework/backup-agent",
-      "version": "6.0.6",
+      "version": "6.0.8",
     },
     "platform/backup-destination": {
       "name": "@di-framework/backup-destination",
-      "version": "6.0.6",
+      "version": "6.0.8",
       "dependencies": {
         "@pulumi/kubernetes": "4.34.0",
         "@pulumi/pulumi": "3.261.0",
@@ -51,7 +51,7 @@
     },
     "platform/bindings": {
       "name": "@di-framework/bindings",
-      "version": "6.0.6",
+      "version": "6.0.8",
       "devDependencies": {
         "@di-framework/core": "^5",
         "@di-framework/repo": "^6.0.4",
@@ -66,9 +66,13 @@
         "@di-framework/repo",
       ],
     },
+    "platform/pglite-component": {
+      "name": "@di-framework/pglite-component",
+      "version": "0.1.0",
+    },
     "platform/platform": {
       "name": "@di-framework/platform",
-      "version": "6.0.6",
+      "version": "6.0.8",
       "dependencies": {
         "@pulumi/command": "1.2.1",
         "@pulumi/kubernetes": "4.34.0",
@@ -82,7 +86,7 @@
     },
     "platform/sqlite-component": {
       "name": "@di-framework/sqlite-component",
-      "version": "6.0.6",
+      "version": "6.0.8",
     },
   },
   "packages": {
@@ -115,6 +119,8 @@
     "@di-framework/cloudfoundry": ["@di-framework/cloudfoundry@workspace:adapters/cloudfoundry"],
 
     "@di-framework/core": ["@di-framework/core@5.3.7", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-1pprg25XRk7uCErGPJI9i11uAKafwShxMhJ4XuW+hxQQQgXegBWVVGMRDNHV5XguFoRCAP77+VxnP1OaWuNqGw=="],
+
+    "@di-framework/pglite-component": ["@di-framework/pglite-component@workspace:platform/pglite-component"],
 
     "@di-framework/platform": ["@di-framework/platform@workspace:platform/platform"],
 

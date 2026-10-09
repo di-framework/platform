@@ -1,0 +1,31 @@
+[package]
+name = "di-framework-pglite-component"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+description = "di-framework:pglite@0.1.0 WebAssembly component: embedded PostgreSQL with persistent WASI filesystem storage and no sockets."
+repository = "https://github.com/di-framework/platform"
+publish = false
+
+[workspace]
+members = ["tests/smoke-consumer"]
+
+[lib]
+name = "pglite_provider"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pinned exactly. Bump deliberately and re-run `make build smoke` (see README).
+wit-bindgen = { version = "=0.61.1", default-features = false, features = ["macros"] }
+md5 = "=0.7.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+
+[profile.dev]
+panic = "abort"

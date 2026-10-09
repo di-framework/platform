@@ -29,6 +29,7 @@ describe('coverage badge mapping', () => {
       '@di-framework/bindings',
       '@di-framework/cloudflare',
       '@di-framework/cloudfoundry',
+      '@di-framework/pglite-component',
       '@di-framework/platform',
       '@di-framework/sqlite-component',
     ]);
@@ -38,6 +39,7 @@ describe('coverage badge mapping', () => {
       'bindings',
       'cloudflare',
       'cloudfoundry',
+      'pglite-component',
       'platform',
       'sqlite-component',
     ]);

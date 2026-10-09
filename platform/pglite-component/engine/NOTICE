@@ -1,0 +1,81 @@
+di-framework embedded PGlite component
+
+The provider bundles PostgreSQL 17.5 (PGlite WASI), originally maintained by
+ElectricSQL. PostgreSQL's license is reproduced in POSTGRESQL-COPYRIGHT.
+The upstream bindings license and WASI adapter license are reproduced in
+PGLITE-BINDINGS-LICENSE and WASMTIME-LICENSE.
+
+Sources:
+https://github.com/electric-sql/postgres-pglite
+https://github.com/electric-sql/pglite-bindings
+https://github.com/moznion/wasipg
+https://github.com/bytecodealliance/wasmtime/tree/v29.0.1
+
+The engine is compiled with PostgreSQL setjmp/longjmp recovery lowered to
+standardized WebAssembly exceptions. di-framework adds a private canonical
+ABI bridge, uses WASI randomness instead of a /dev/urandom preopen, and keeps
+bootstrap files within the database's persistent filesystem mount. A growable,
+bounded memory buffer replaces socket-file spillover for query replies. Backend
+startup restores application session defaults after bootstrap and enables
+durable writes.
+
+The engine's core module, support files, adapter, and the provider are
+composed into one deployable artifact. Engine code executes in the Wasm
+runtime; no native database process or socket transport is used.
+
+wasipg
+Copyright 2026 Taiki Kawakami (a.k.a moznion) https://moznion.net
+
+This product includes software developed as part of the wasipg project,
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The Apache-2.0 grant covers the Go library, the build recipes, and the
+tests in this repository. It does NOT cover the third-party software
+listed below, which is redistributed — in source-patch form here, and in
+binary form in the released bundle artifacts — under its own license.
+
+--------------------------------------------------------------------------
+PostgreSQL
+--------------------------------------------------------------------------
+
+The released artifacts (pglite.wasi, pglite-wasi.tar.xz,
+pgdata-pristine.tar.xz) are builds of PostgreSQL 17.5, taken from the
+electric-sql/postgres-pglite fork (branch REL_17_5_WASM-pglite; the exact
+commit is pinned in build/versions.env). PostgreSQL and that fork are
+distributed under the PostgreSQL License, reproduced in the COPYRIGHT
+file shipped alongside the artifacts and inside pglite-wasi.tar.xz:
+
+    Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+    Portions Copyright (c) 1994, The Regents of the University of California
+
+The patches under build/patches/ are modifications of that source tree
+and are likewise governed by the PostgreSQL License; see
+build/patches/README.md.
+
+--------------------------------------------------------------------------
+zlib
+--------------------------------------------------------------------------
+
+The PostgreSQL module statically links zlib 1.2.13, distributed under the
+zlib License:
+
+    Copyright (C) 1995-2022 Jean-loup Gailly and Mark Adler
+
+--------------------------------------------------------------------------
+Go module dependencies
+--------------------------------------------------------------------------
+
+The Go library depends on modules fetched at build time by consumers
+(github.com/jackc/pgx/v5 — MIT; github.com/tetratelabs/wazero —
+Apache-2.0; github.com/ulikunitz/xz — BSD-3-Clause). They are not
+redistributed in this repository or in the bundle artifacts; their
+licenses accompany the modules themselves.
+
+--------------------------------------------------------------------------
+wasi-libc / wasi-sdk
+--------------------------------------------------------------------------
+
+The PostgreSQL module and gate/testdata/sjlj.wasm statically link
+wasi-libc from wasi-sdk 33, distributed under
+"Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT". The shadow headers
+under build/hotfix/ are derived from wasi-libc headers.

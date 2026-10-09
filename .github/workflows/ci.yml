@@ -41,6 +41,9 @@ jobs:
       - name: Dry-run package publish
         run: bun scripts/publish-workspace.ts --dry-run
 
+      - name: Build embedded PGlite component
+        run: make -C platform/pglite-component tools-rust build
+
       - name: Test
         run: bun test --coverage
 
