@@ -52,6 +52,9 @@ interface Watch {
 describe('GET /v1/services/:service/logs', () => {
   let watches: Watch[] = [];
   let watchStatus = 200;
+  let watchStatuses: number[] = [];
+  let listed: unknown;
+  let lists = 0;
   let onWatch: (() => void) | undefined;
   const api = serve((request: Recorded) => {
     if (request.pathname.endsWith('/serviceaccounts/di-user-alice/token'))
@@ -65,7 +68,8 @@ describe('GET /v1/services/:service/logs', () => {
     if (request.pathname !== '/api/v1/namespaces/di-tenant-acme/configmaps')
       return json({ message: 'not found' }, 404);
     if (url.searchParams.get('watch') === 'true') {
-      if (watchStatus !== 200) return json({ message: 'gone' }, watchStatus);
+      const status = watchStatuses.shift() ?? watchStatus;
+      if (status !== 200) return json({ message: 'gone' }, status);
       let control!: ReadableStreamDefaultController<Uint8Array>;
       let closed!: () => void;
       const watch: Watch = {
@@ -90,7 +94,8 @@ describe('GET /v1/services/:service/logs', () => {
     }
     const selector = url.searchParams.get('labelSelector') ?? '';
     const items = selector.endsWith('application=web') ? [WEB] : [];
-    return json({ metadata: { resourceVersion: '42' }, items });
+    lists++;
+    return json(listed ?? { metadata: { resourceVersion: '42' }, items });
   });
   const viewer: Principal = {
     user: 'alice',
@@ -116,6 +121,12 @@ describe('GET /v1/services/:service/logs', () => {
   afterEach(() => {
     watches = [];
     watchStatus = 200;
+    watchStatuses = [];
+    listed = undefined;
+    lists = 0;
+    timing.heartbeatMs = 15_000;
+    timing.backoffBaseMs = 1_000;
+    timing.backoffMaxMs = 30_000;
     onWatch = undefined;
     api.requests.length = 0;
   });
@@ -180,6 +191,8 @@ describe('GET /v1/services/:service/logs', () => {
 
   test.each([
     ['since=yesterday', 'since must be'],
+    ['since=5', 'since must be'],
+    ['since=2020-01-01', 'since must be'],
     ['tail=-1', 'tail must be'],
   ])('rejects %s', async (query, detail) => {
     const response = await fetch(`${base}/web/logs?env=prod&${query}`);
@@ -245,14 +258,119 @@ describe('GET /v1/services/:service/logs', () => {
 
     abort.abort();
     await (watches[1] as Watch).closed;
-    timing.heartbeatMs = 15_000;
   });
 
   test('follow ends the stream when the watch is refused', async () => {
-    watchStatus = 410;
+    watchStatus = 403;
     const out = await read(await fetch(`${base}/web/logs?env=prod&follow=true&tail=1`));
     expect(messages(out)).toEqual(['fourth']);
     expect(out.at(-1)?.event).toBe('end');
+  });
+
+  /** Reads a follow stream as text, chunk by chunk. */
+  const follow = async (query: string, signal: AbortSignal) => {
+    const response = await fetch(`${base}/web/logs?env=prod&follow=true&${query}`, { signal });
+    const reader = response.body?.getReader() as ReadableStreamDefaultReader<Uint8Array>;
+    const decoder = new TextDecoder();
+    const state = { text: '' };
+    const until = async (needle: string) => {
+      while (!state.text.includes(needle)) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        state.text += decoder.decode(value);
+      }
+    };
+    return { state, until };
+  };
+  const RELISTED = {
+    metadata: { resourceVersion: '50' },
+    items: [
+      configMap(
+        'web',
+        ['2020-01-01T10:03:00Z WARN fourth', '2020-01-01T10:05:00Z INFO relisted'],
+        undefined,
+        '50',
+      ),
+    ],
+  };
+
+  test('an in-stream 410 relists, sends only new lines, and resumes from the new version', async () => {
+    const abort = new AbortController();
+    onWatch = () => {
+      if (watches.length !== 1) return;
+      listed = RELISTED;
+      (watches[0] as Watch).push({ type: 'ERROR', object: { kind: 'Status', code: 410 } });
+    };
+    const s = await follow('tail=1', abort.signal);
+    await s.until('relisted');
+    while (watches.length < 2) await Bun.sleep(5);
+    expect(s.state.text.split('fourth').length).toBe(2);
+    expect(s.state.text.split('relisted').length).toBe(2);
+    expect(watches[1]?.path).toContain('resourceVersion=50');
+    expect(lists).toBe(2);
+    abort.abort();
+    await (watches[1] as Watch).closed;
+  });
+
+  test('an HTTP 410 relists and re-watches', async () => {
+    const abort = new AbortController();
+    watchStatuses = [410];
+    listed = undefined;
+    const opened = new Promise<void>((resolve) => {
+      onWatch = resolve;
+    });
+    const first = await fetch(`${base}/web/logs?env=prod&follow=true&tail=1`, {
+      signal: abort.signal,
+    });
+    await opened;
+    expect(lists).toBe(2);
+    expect(watches[0]?.path).toContain('resourceVersion=42');
+    abort.abort();
+    await first.body?.cancel().catch(() => {});
+    await (watches[0] as Watch).closed;
+  });
+
+  test('any other ERROR event ends the stream', async () => {
+    onWatch = () =>
+      (watches[0] as Watch).push({ type: 'ERROR', object: { kind: 'Status', code: 500 } });
+    const out = await read(await fetch(`${base}/web/logs?env=prod&follow=true&tail=0`));
+    expect(out.at(-1)).toEqual({ event: 'end', data: '' });
+    expect(watches.length).toBe(1);
+  });
+
+  test('watches that close empty are retried with a bounded backoff', async () => {
+    timing.backoffBaseMs = 20;
+    timing.backoffMaxMs = 40;
+    onWatch = () => (watches.at(-1) as Watch).end();
+    const abort = new AbortController();
+    await fetch(`${base}/web/logs?env=prod&follow=true&tail=0`, { signal: abort.signal });
+    await Bun.sleep(200);
+    // 20 + 40 + 40 + 40 ... ms between watches: about 5 in 200ms, not hundreds.
+    expect(watches.length).toBeGreaterThanOrEqual(2);
+    expect(watches.length).toBeLessThanOrEqual(8);
+    abort.abort();
+  });
+
+  test('follow with tail=0 does not replay the backlog on the first update', async () => {
+    const abort = new AbortController();
+    const opened = new Promise<void>((resolve) => {
+      onWatch = resolve;
+    });
+    const s = await follow('tail=0', abort.signal);
+    await opened;
+    (watches[0] as Watch).push({
+      type: 'MODIFIED',
+      object: configMap(
+        'web',
+        ['2020-01-01T10:00:00Z INFO first', '2020-01-01T10:06:00Z INFO newer'],
+        undefined,
+        '43',
+      ),
+    });
+    await s.until('newer');
+    expect(s.state.text).not.toContain('first');
+    abort.abort();
+    await (watches[0] as Watch).closed;
   });
 
   test('follow ends the stream when the watch sends garbage', async () => {

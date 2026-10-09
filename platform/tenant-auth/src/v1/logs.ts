@@ -1,5 +1,7 @@
 import type { HttpCall } from '@di-framework/tenant-cli/src/api/handlers.ts';
 import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
+// Imported across packages on purpose (platform#54): the controller reads the ConfigMaps the
+// platform's log projection writes, so it shares that module's format instead of copying it.
 import {
   APPLICATION,
   PROJECTION,
@@ -28,11 +30,15 @@ interface ConfigMapList {
 }
 interface WatchEvent {
   type: string;
-  object?: LogsConfigMap & { metadata?: { resourceVersion?: string } };
+  object?: LogsConfigMap & { metadata?: { resourceVersion?: string }; code?: number };
 }
 
-/** Stream timing. The heartbeat keeps gateways from closing an idle `--follow` stream. */
-export const timing = { heartbeatMs: 15_000 };
+/**
+ * Stream timing. The heartbeat keeps gateways from closing an idle `--follow` stream. A watch
+ * that closes without delivering an event is retried after a bounded exponential backoff, so a
+ * misbehaving API server cannot make the controller hammer it as the user.
+ */
+export const timing = { heartbeatMs: 15_000, backoffBaseMs: 1_000, backoffMaxMs: 30_000 };
 
 const DEFAULT_TAIL = 100;
 const LEVELS: Record<string, LogEvent['level']> = {
@@ -45,6 +51,7 @@ const LEVELS: Record<string, LogEvent['level']> = {
 /** A projected line: `<timestamp> <LEVEL> <message>` (formatProjectedLine, formatHostLine). */
 const LINE = /^(\S+) (TRACE|DEBUG|INFO|WARN|ERROR) (.*)$/s;
 const DURATION = /^(\d+)(s|m|h|d)$/;
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/i;
 const UNIT_MS: Record<string, number> = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 };
 
 /** `since` as an RFC 3339 lower bound: a duration such as `10m`, or a timestamp. */
@@ -55,7 +62,7 @@ function sinceBound(since: string | undefined, now = Date.now()): string | undef
     return new Date(
       now - Number(duration[1]) * (UNIT_MS[duration[2] as string] as number),
     ).toISOString();
-  const time = Date.parse(since);
+  const time = RFC3339.test(since) ? Date.parse(since) : Number.NaN;
   return Number.isNaN(time) ? null : new Date(time).toISOString();
 }
 
@@ -154,6 +161,25 @@ async function* watchEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<Wa
   }
 }
 
+const byTime = (a: LogEvent, b: LogEvent) =>
+  a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0;
+
+const listEvents = (list: ConfigMapList) => (list.items ?? []).flatMap(logEvents).sort(byTime);
+
+/** Resolves after `ms`, or as soon as the signal aborts. */
+const sleep = (ms: number, signal: AbortSignal) =>
+  new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+
 function stream(
   kube: UserKube,
   collection: string,
@@ -165,62 +191,119 @@ function stream(
   const encoder = new TextEncoder();
   const abort = new AbortController();
   let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let demand: (() => void) | undefined;
   const stop = () => {
     clearInterval(heartbeat);
     abort.abort();
+    demand?.();
   };
-  return new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const send = (text: string) => controller.enqueue(encoder.encode(text));
-      const cursor = new Cursor();
-      const emit = (events: LogEvent[]) => {
-        for (const event of events) {
-          cursor.sent(event);
-          send(sse('log', event));
+  return new ReadableStream<Uint8Array>(
+    {
+      async start(controller) {
+        const send = (text: string) => controller.enqueue(encoder.encode(text));
+        // Flushes the headers at once, even when the backlog is empty.
+        send(': connected\n\n');
+        const cursor = new Cursor();
+        const live = { ...options, tail: Number.MAX_SAFE_INTEGER };
+        /** Sends the selected events, then marks every event seen, sent or filtered out. */
+        const deliver = (events: LogEvent[], selected: LogEvent[]) => {
+          for (const event of selected) send(sse('log', event));
+          for (const event of events) cursor.sent(event);
+        };
+        const backlog = listEvents(first);
+        deliver(backlog, select(backlog, options));
+        if (!follow) {
+          send(sse('end'));
+          controller.close();
+          return;
         }
-      };
-      const backlog = (first.items ?? []).flatMap(logEvents);
-      backlog.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
-      emit(select(backlog, options));
-      if (!follow) {
+        heartbeat = setInterval(() => send(': heartbeat\n\n'), timing.heartbeatMs);
+        let resourceVersion = first.metadata?.resourceVersion ?? '';
+        /** The watch expired (410): relist, send what is new, resume from the list's version. */
+        const relist = async () => {
+          const list = await kube.call<ConfigMapList>(
+            'GET',
+            `${collection}?labelSelector=${encodeURIComponent(selector)}`,
+          );
+          const fresh = cursor.fresh(listEvents(list));
+          deliver(fresh, select(fresh, live));
+          resourceVersion = list.metadata?.resourceVersion ?? '';
+        };
+        /** Backpressure: stops reading the watch while the client is not reading the stream. */
+        const drained = async () => {
+          while ((controller.desiredSize ?? 1) <= 0 && !abort.signal.aborted)
+            await new Promise<void>((resolve) => {
+              demand = resolve;
+            });
+        };
+        let idle = 0;
+        try {
+          while (!abort.signal.aborted) {
+            const response = await kube.fetch(
+              'GET',
+              `${collection}?watch=true&allowWatchBookmarks=true&labelSelector=${encodeURIComponent(selector)}&resourceVersion=${encodeURIComponent(resourceVersion)}`,
+              { headers: { Accept: 'application/json' }, signal: abort.signal },
+            );
+            let delivered = false;
+            let ended = false;
+            if (response.status === 410) {
+              await response.body?.cancel();
+              await relist();
+              delivered = true;
+            } else if (!response.ok || !response.body) {
+              await response.body?.cancel();
+              break;
+            } else {
+              for await (const event of watchEvents(response.body)) {
+                delivered = true;
+                if (event.type === 'ERROR') {
+                  if (event.object?.code === 410) await relist();
+                  else ended = true;
+                  break;
+                }
+                if (event.object?.metadata?.resourceVersion)
+                  resourceVersion = event.object.metadata.resourceVersion;
+                if (event.type === 'ADDED' || event.type === 'MODIFIED') {
+                  const fresh = cursor.fresh(logEvents(event.object as LogsConfigMap));
+                  deliver(fresh, select(fresh, live));
+                }
+                await drained();
+              }
+            }
+            if (ended) break;
+            if (delivered) idle = 0;
+            else {
+              await sleep(
+                Math.min(timing.backoffMaxMs, timing.backoffBaseMs * 2 ** idle),
+                abort.signal,
+              );
+              idle = Math.min(idle + 1, 30);
+            }
+          }
+        } catch {
+          // The client went away (the watch was aborted) or the API server dropped the watch.
+        }
+        if (abort.signal.aborted) return;
+        stop();
         send(sse('end'));
         controller.close();
-        return;
-      }
-      heartbeat = setInterval(() => send(': heartbeat\n\n'), timing.heartbeatMs);
-      const live = { ...options, tail: Number.MAX_SAFE_INTEGER };
-      let resourceVersion = first.metadata?.resourceVersion ?? '';
-      try {
-        while (!abort.signal.aborted) {
-          const response = await kube.fetch(
-            'GET',
-            `${collection}?watch=true&allowWatchBookmarks=true&labelSelector=${encodeURIComponent(selector)}&resourceVersion=${encodeURIComponent(resourceVersion)}`,
-            { headers: { Accept: 'application/json' }, signal: abort.signal },
-          );
-          if (!response.ok || !response.body) {
-            await response.body?.cancel();
-            break;
-          }
-          for await (const event of watchEvents(response.body)) {
-            if (event.object?.metadata?.resourceVersion)
-              resourceVersion = event.object.metadata.resourceVersion;
-            if (event.type === 'ADDED' || event.type === 'MODIFIED')
-              emit(select(cursor.fresh(logEvents(event.object as LogsConfigMap)), live));
-          }
-        }
-      } catch {
-        // The client went away (the watch was aborted) or the API server dropped the watch.
-      }
-      if (abort.signal.aborted) return;
-      stop();
-      send(sse('end'));
-      controller.close();
+      },
+      pull() {
+        demand?.();
+      },
+      cancel: stop,
     },
-    cancel: stop,
-  });
+    // Room for a burst of events and heartbeats before the watch stops being read.
+    { highWaterMark: 256 },
+  );
 }
 
-/** `GET /v1/services/:service/logs` (platform#54): the `logs` projection as server-sent events. */
+/**
+ * `GET /v1/services/:service/logs` (platform#54): the `logs` projection as server-sent events.
+ * `env` is accepted and ignored: the log ConfigMaps carry no environment label. The `deployment`
+ * filter only sees lines attributed through `data.failures`, which keeps the newest host failure
+ * per deployment, so older failure lines of a deployment are attributed to the application.
+ */
 async function serveLogs(_command: unknown, call: HttpCall, context: V1Context): Promise<Response> {
   const service = call.request.params?.service ?? '';
   const query = call.request.query ?? {};
