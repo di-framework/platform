@@ -32,6 +32,7 @@ describe('coverage badge mapping', () => {
       '@di-framework/pglite-component',
       '@di-framework/platform',
       '@di-framework/sqlite-component',
+      '@di-framework/tenant-auth',
       '@di-framework/tenant-cli',
     ]);
     expect(packages.map((pkg) => pkg.slug)).toEqual([
@@ -43,6 +44,7 @@ describe('coverage badge mapping', () => {
       'pglite-component',
       'platform',
       'sqlite-component',
+      'tenant-auth',
       'tenant-cli',
     ]);
     expect(packages.find((pkg) => pkg.slug === 'platform')?.relPath).toBe('platform/platform');
