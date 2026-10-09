@@ -298,7 +298,8 @@ A deploy runs in this order: prune, reserve the revision as `pending` (on a 409 
 next `<n>`, at most `RESERVE_ATTEMPTS` times, then answers 409), apply, mark it `live` and the
 one it replaced `replaced`. A failed apply marks it `failed`. `deployments` lists `pending` and
 `failed` revisions with that status; `stats` does not count them, and rollback never targets
-them by default.
+them. Once the apply succeeded, a failure to mark the revisions is logged as
+`deploy.history-mark-failed` and the deploy still answers 202.
 
 The namespace quota allows `count/configmaps: 100`, shared with `di-vars-<env>`, the `di-logs-*`
 projections and `kube-root-ca.crt`, so history is bounded (constants in `src/v1/deploy.ts`):

@@ -994,6 +994,8 @@ describe('/v1/deploy', () => {
       await deployed();
       expect(stateOf('web-prod.1')).toBe('replaced');
       expect(stateOf('web-prod.2')).toBe('failed');
+      const toFailed = { env: 'prod', service: 'web', to: 'web-prod.2' };
+      expect((await post('/v1/deployments/rollback', toFailed)).status).toBe(404);
       const rollback = await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
       expect(((await rollback.json()) as Json).id).toBe('web-prod.4');
       expect(
@@ -1028,9 +1030,11 @@ describe('/v1/deploy', () => {
       expect(stateOf('web-prod.1')).toBe('replaced');
     });
 
-    test(`a revision that keeps changing is a 409 after ${UPDATE_ATTEMPTS} tries`, async () => {
+    test(`a revision that keeps changing after ${UPDATE_ATTEMPTS} tries is logged, and the deploy still answers 202`, async () => {
       putConflicts = UPDATE_ATTEMPTS;
-      expect((await post('/v1/deploy', deployBundle())).status).toBe(409);
+      expect((await post('/v1/deploy', deployBundle())).status).toBe(202);
+      expect(workloads()).toHaveLength(1);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('"deploy.history-mark-failed"'));
     });
 
     test('a revision deleted while it is marked is skipped', async () => {

@@ -765,13 +765,24 @@ async function rollout(
     await annotate(user, tenant, nameOf(revision), { [STATE]: 'failed' }).catch(() => {});
     throw error;
   }
-  await annotate(user, tenant, nameOf(revision), { [STATE]: 'live' });
-  if (previous)
-    await annotate(user, tenant, nameOf(previous), {
-      [STATE]: 'replaced',
-      [STATUS]: rollbackOf ? 'rolled-back' : before.status,
-      ...(before.readyAt ? { [READY_AT]: before.readyAt } : {}),
-    });
+  // The change is live: a bookkeeping failure is logged, not reported as a failed deploy.
+  try {
+    await annotate(user, tenant, nameOf(revision), { [STATE]: 'live' });
+    if (previous)
+      await annotate(user, tenant, nameOf(previous), {
+        [STATE]: 'replaced',
+        [STATUS]: rollbackOf ? 'rolled-back' : before.status,
+        ...(before.readyAt ? { [READY_AT]: before.readyAt } : {}),
+      });
+  } catch (error) {
+    console.log(
+      JSON.stringify({
+        event: 'deploy.history-mark-failed',
+        revision: revision.id,
+        error: String(error),
+      }),
+    );
+  }
   context.audit(rollbackOf ? 'deploy.rolled-back' : 'deploy.applied', {
     user: context.principal.user,
     env: bundle.env,
@@ -889,7 +900,10 @@ export const deploy: V1Module = {
     const running = currents(items).get(`${service}-${env}`);
     // By default, the newest revision that went live before the running one.
     const target = to
-      ? items.find((revision) => revision.id === to && revision.state !== 'pending')
+      ? items.find(
+          (revision) =>
+            revision.id === to && (revision.state === 'live' || revision.state === 'replaced'),
+        )
       : items.find(
           (revision) => revision.state === 'replaced' && (!running || revision.n < running.n),
         );
