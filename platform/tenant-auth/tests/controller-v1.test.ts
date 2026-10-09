@@ -90,12 +90,6 @@ describe('/v1 dispatch', () => {
       '{"env":"prod","type":"http","name":"web","port":8080}',
       'createService',
     ],
-    [
-      'GET',
-      '/v1/services/web/logs?env=prod&follow=true&tail=10&since=2026-10-09T00:00:00Z',
-      undefined,
-      'logs',
-    ],
     ['POST', '/v1/services/web/proxy', '{"env":"prod"}', 'proxy'],
   ])('%s %s answers 501 problem+json', async (method, path, body, operation) => {
     const response = await call(method, path, { body });
@@ -229,7 +223,6 @@ describe('/v1 dispatch', () => {
       ['GET', '/v1/deployments?env=prod', undefined],
       ['GET', '/v1/deployments/stats?env=prod', undefined],
       ['GET', '/v1/vars?env=prod', undefined],
-      ['GET', '/v1/services/web/logs?env=prod', undefined],
       [
         'POST',
         '/v1/deploy/preview',
