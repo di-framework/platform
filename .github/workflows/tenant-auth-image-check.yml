@@ -38,8 +38,8 @@ jobs:
         run: |
           set -uo pipefail
           for entry in controller console; do
-            out="$(docker run --rm tenant-auth:ci bun "/app/${entry}.js" 2>&1)"
-            code=$?
+            code=0
+            out="$(docker run --rm tenant-auth:ci bun "/app/${entry}.js" 2>&1)" || code=$?
             echo "${entry}: exit ${code}"
             echo "${out}"
             if [[ ${code} -eq 0 ]] || ! grep -q "is required" <<<"${out}"; then
