@@ -130,6 +130,29 @@ export function loadKubeconfig(path: string, contextName?: string): KubeCredenti
   };
 }
 
+/**
+ * Reads an API server response: a non-2xx status becomes a `KubeError` carrying the server's
+ * `message`, and a JSON body (or nothing, for an empty one) is returned.
+ */
+export async function readKubeResponse<T>(
+  method: string,
+  path: string,
+  response: Response,
+): Promise<T> {
+  const text = await response.text();
+  if (!response.ok) {
+    let reason = `${method} ${path.split('?')[0]} returned ${response.status}`;
+    try {
+      const parsed = JSON.parse(text) as { message?: string };
+      if (parsed.message) reason = parsed.message;
+    } catch {}
+    throw new KubeError(response.status, reason);
+  }
+  return (text ? JSON.parse(text) : undefined) as T;
+}
+
+const KUBE_TIMEOUT_MS = 15_000;
+
 const usersPath = `/apis/${PLATFORM_GROUP}/${PLATFORM_VERSION}/users`;
 const tenantsPath = `/apis/${PLATFORM_GROUP}/${PLATFORM_VERSION}/tenants`;
 
@@ -160,18 +183,9 @@ export class KubeClient {
       body: body === undefined ? undefined : JSON.stringify(body),
       // Bun-specific: pin the cluster CA and present the client certificate when there is no token.
       tls: { ca, ...(token ? {} : { cert, key }) },
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(KUBE_TIMEOUT_MS),
     } as RequestInit);
-    const text = await response.text();
-    if (!response.ok) {
-      let reason = `${method} ${path.split('?')[0]} returned ${response.status}`;
-      try {
-        const parsed = JSON.parse(text) as { message?: string };
-        if (parsed.message) reason = parsed.message;
-      } catch {}
-      throw new KubeError(response.status, reason);
-    }
-    return (text ? JSON.parse(text) : undefined) as T;
+    return readKubeResponse<T>(method, path, response);
   }
 
   private async optional<T>(path: string): Promise<T | undefined> {
@@ -248,7 +262,9 @@ export interface UserTokens {
 
 export interface AsUserInit {
   headers?: HeadersInit;
-  body?: BodyInit;
+  /** Buffered, so the single retry after a rejected token can resend it. */
+  body?: string | ArrayBuffer | Uint8Array;
+  signal?: AbortSignal;
 }
 
 /** Talks to the API server as one user, with that user's own ServiceAccount and RBAC. */
@@ -256,7 +272,24 @@ export interface UserKube {
   readonly user: string;
   /** Sends one request (path with query string) to the API server and returns its raw response. */
   fetch(method: string, path: string, init?: AsUserInit): Promise<Response>;
+  /**
+   * Sends one JSON request and parses the JSON reply, like `KubeClient.call`: a non-2xx answer
+   * throws `KubeError` with the API server's message, and a network failure or the 15 s timeout
+   * throws `KubeError(502)`.
+   */
+  call<T>(method: string, path: string, body?: unknown): Promise<T>;
 }
+
+/** Caller headers never forwarded to the API server: credentials, identity and hop-by-hop. */
+const STRIPPED = new Set([
+  'authorization',
+  'proxy-authorization',
+  'cookie',
+  'host',
+  'connection',
+  'content-length',
+  'transfer-encoding',
+]);
 
 /**
  * Binds the API server to the calling user: requests carry a token for the user's own
@@ -273,32 +306,50 @@ export function asUser(
   if (!user) throw new KubeError(401, 'no user to act as');
   const send = (method: string, path: string, init: AsUserInit, token: string) => {
     const headers = new Headers(init.headers);
-    for (const name of [
-      'authorization',
-      'host',
-      'connection',
-      'content-length',
-      'transfer-encoding',
-    ])
-      headers.delete(name);
+    const names: string[] = [];
+    headers.forEach((_value, name) => {
+      names.push(name);
+    });
+    for (const name of names)
+      if (STRIPPED.has(name) || name.startsWith('impersonate-')) headers.delete(name);
     headers.set('Authorization', `Bearer ${token}`);
     return fetch(`${kube.server}${path}`, {
       method,
       headers,
       body: init.body,
       redirect: 'manual',
+      signal: init.signal,
       tls: { ca: kube.ca },
     } as RequestInit);
   };
+  const once = async (method: string, path: string, init: AsUserInit) => {
+    const response = await send(method, path, init, await tokens.token(user));
+    if (response.status !== 401) return response;
+    // The cached token belongs to a ServiceAccount that was deleted and recreated (for example
+    // after a suspend and unsuspend). Release the rejected response, mint a fresh token and
+    // retry once.
+    await response.body?.cancel();
+    tokens.forget(user);
+    return send(method, path, init, await tokens.token(user));
+  };
   return {
     user,
-    async fetch(method, path, init = {}) {
-      const response = await send(method, path, init, await tokens.token(user));
-      if (response.status !== 401) return response;
-      // The cached token belongs to a ServiceAccount that was deleted and recreated (for example
-      // after a suspend and unsuspend). Mint a fresh one and retry once.
-      tokens.forget(user);
-      return send(method, path, init, await tokens.token(user));
+    fetch: (method, path, init = {}) => once(method, path, init),
+    async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+      const headers: Record<string, string> = { Accept: 'application/json' };
+      if (body !== undefined) headers['Content-Type'] = 'application/json';
+      let response: Response;
+      try {
+        response = await once(method, path, {
+          headers,
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal: AbortSignal.timeout(KUBE_TIMEOUT_MS),
+        });
+      } catch (error) {
+        if (error instanceof KubeError) throw error;
+        throw new KubeError(502, `${method} ${path.split('?')[0]} failed: ${String(error)}`);
+      }
+      return readKubeResponse<T>(method, path, response);
     },
   };
 }

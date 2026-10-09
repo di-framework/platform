@@ -5,9 +5,10 @@
  * per-request context reaches them through async local storage.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { useContainer } from '@di-framework/core/container';
 import { problem, TenantControllerHandlers } from '@di-framework/tenant-cli/src/api/handlers.ts';
-import { dispatch } from '@di-framework/tenant-cli/src/api/routes.ts';
+import { dispatch, useContainer } from '@di-framework/tenant-cli/src/api/routes.ts';
+import { AuthError } from '../identity.ts';
+import { KubeError } from '../kube.ts';
 import { auth } from './auth.ts';
 import { config } from './config.ts';
 import type { V1Context, V1Handler, V1Module } from './context.ts';
@@ -23,13 +24,45 @@ export const MODULES: Record<string, V1Module> = { auth, config, logs, deploy, s
 const current = new AsyncLocalStorage<V1Context>();
 const target = useContainer().resolve(TenantControllerHandlers);
 for (const module of Object.values(MODULES))
-  for (const name of Object.keys(module) as (keyof V1Module)[])
-    target[name] = (command, call) =>
-      (module[name] as V1Handler)(command, call, current.getStore() as V1Context);
+  for (const name of Object.keys(module) as (keyof V1Module)[]) {
+    // Outside `serveV1` (for example tenant-cli's own tests, which share this module registry)
+    // there is no context, so the contract's original handler answers instead.
+    const fallback = target[name].bind(target);
+    target[name] = (command, call) => {
+      const context = current.getStore();
+      return context
+        ? (module[name] as V1Handler)(command, call, context)
+        : fallback(command, call);
+    };
+  }
+
+const TITLES: Record<number, string> = {
+  400: 'Bad Request',
+  401: 'Unauthorized',
+  403: 'Forbidden',
+  404: 'Not Found',
+  409: 'Conflict',
+  410: 'Gone',
+  422: 'Unprocessable Entity',
+  429: 'Too Many Requests',
+};
+
+/** Maps an error a handler raised (API server, `asUser`, identity) to a problem response. */
+function failure(error: unknown): Response {
+  if (!(error instanceof KubeError || error instanceof AuthError)) throw error;
+  if (error.status >= 400 && error.status < 500)
+    return problem(error.status, TITLES[error.status] ?? 'Client Error', error.message);
+  return problem(502, 'Bad Gateway', error.message);
+}
 
 /** Serves one authenticated `/v1` request; a path that names no operation gets a 404 problem. */
 export async function serveV1(request: Request, context: V1Context): Promise<Response> {
-  const response = await current.run(context, () => dispatch(request));
+  let response: Response | undefined;
+  try {
+    response = await current.run(context, () => dispatch(request));
+  } catch (error) {
+    return failure(error);
+  }
   return (
     response ??
     problem(

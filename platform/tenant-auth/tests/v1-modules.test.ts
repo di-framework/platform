@@ -1,8 +1,10 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import { OPERATIONS } from '@di-framework/tenant-cli/src/api/handlers.ts';
+import { dispatch } from '@di-framework/tenant-cli/src/api/routes.ts';
 import { Controller, configFromEnv } from '../src/controller.ts';
 import type { Principal } from '../src/identity.ts';
-import { KubeClient } from '../src/kube.ts';
+import { AuthError } from '../src/identity.ts';
+import { KubeClient, KubeError } from '../src/kube.ts';
 import { auth } from '../src/v1/auth.ts';
 import { MODULES, type V1Context, type V1Handler } from '../src/v1/index.ts';
 import { json, serve } from './support/servers.ts';
@@ -22,6 +24,23 @@ test('the auth stubs answer 501 when reached', async () => {
     );
     expect(response.status).toBe(501);
     expect(((await response.json()) as { detail: string }).detail).toContain(name);
+  }
+});
+
+test('outside serveV1 the original contract handler answers', async () => {
+  const module = MODULES.deploy as Record<string, V1Handler>;
+  const stub = module.deployments as V1Handler;
+  let called = false;
+  module.deployments = async () => {
+    called = true;
+    return Response.json({});
+  };
+  try {
+    const response = await dispatch(new Request('http://controller/v1/deployments?env=prod'));
+    expect(response?.status).toBe(501);
+    expect(called).toBe(false);
+  } finally {
+    module.deployments = stub;
   }
 });
 
@@ -61,6 +80,52 @@ describe('resource modules over real HTTP', () => {
     log.mockRestore();
     server.stop(true);
     api.stop();
+  });
+
+  test.each([
+    ['an RBAC refusal', new KubeError(403, 'secrets is forbidden'), 403, 'Forbidden'],
+    ['a missing object', new KubeError(404, 'secrets "x" not found'), 404, 'Not Found'],
+    ['a conflict', new KubeError(409, 'already exists'), 409, 'Conflict'],
+    ['the no-user refusal', new KubeError(401, 'no user to act as'), 401, 'Unauthorized'],
+    ['an unusual 4xx', new KubeError(418, 'teapot'), 418, 'Client Error'],
+    ['an upstream failure', new KubeError(503, 'etcd is down'), 502, 'Bad Gateway'],
+    ['an identity error', new AuthError(403, 'not a member'), 403, 'Forbidden'],
+  ] as const)(
+    'maps %s raised in a handler to problem+json',
+    async (_name, error, status, title) => {
+      const module = MODULES.deploy as Record<string, V1Handler>;
+      const stub = module.deployments as V1Handler;
+      module.deployments = async () => {
+        throw error;
+      };
+      try {
+        const response = await fetch(`${base}/v1/deployments?env=prod`);
+        expect(response.status).toBe(status);
+        expect(response.headers.get('content-type')).toBe('application/problem+json');
+        expect(await response.json()).toEqual({
+          type: 'about:blank',
+          title,
+          status,
+          detail: error.message,
+        });
+      } finally {
+        module.deployments = stub;
+      }
+    },
+  );
+
+  test('leaves other handler errors to the controller', async () => {
+    const module = MODULES.deploy as Record<string, V1Handler>;
+    const stub = module.deployments as V1Handler;
+    module.deployments = async () => {
+      throw new Error('boom');
+    };
+    try {
+      const response = await fetch(`${base}/v1/deployments?env=prod`);
+      expect(response.status).toBe(502);
+    } finally {
+      module.deployments = stub;
+    }
   });
 
   test.each([
