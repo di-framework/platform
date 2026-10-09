@@ -286,6 +286,32 @@ in. A WorkloadDeployment without that label, or with a value other than `prod` o
 example one applied with kubectl), may reference neither a `di-vars-*` ConfigMap nor a tenant
 Secret.
 
+## Deploy history
+
+`/v1/deploy` and `/v1/deployments/rollback` store each deploy as a revision ConfigMap
+`di-deploy-<service>-<env>.<n>` in the tenant namespace (labels `deploy-revision: <n>`,
+service and env; annotation `revision-state`). Within a service/env the integer `<n>` alone
+orders revisions and picks the rollback target; across services the list orders by
+`created-at`, then name.
+
+A deploy runs in this order: prune, reserve the revision as `pending` (on a 409 it takes the
+next `<n>`, at most `RESERVE_ATTEMPTS` times, then answers 409), apply, mark it `live` and the
+one it replaced `replaced`. A failed apply marks it `failed`. `deployments` lists `pending` and
+`failed` revisions with that status; `stats` does not count them, and rollback never targets
+them by default.
+
+The namespace quota allows `count/configmaps: 100`, shared with `di-vars-<env>`, the `di-logs-*`
+projections and `kube-root-ca.crt`, so history is bounded (constants in `src/v1/deploy.ts`):
+
+* `HISTORY_PER_SERVICE_ENV = 10` revisions per service and env.
+* `HISTORY_TENANT_BUDGET = 40` revisions in the tenant, evicting the oldest across services
+  first. The running (`live`) revision of a service/env is never evicted.
+
+Pruning happens before the revision is created. If the quota still refuses it (403 `exceeded
+quota`), the deploy answers 507 before anything is applied. Revisions edited by hand out of
+this shape (non-integer label, name not matching the labels, unparsable bundle) are skipped
+and logged as `deploy.revision-skipped`.
+
 ## HTTP surface
 
 Controller: `GET /-/healthz` (open); `GET /-/whoami`, `GET|POST /-/keys`, `DELETE /-/keys/:id`,

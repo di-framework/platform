@@ -11,7 +11,13 @@ import {
 import { Controller, configFromEnv } from '../src/controller.ts';
 import type { Principal } from '../src/identity.ts';
 import { KubeClient } from '../src/kube.ts';
-import { FIELD_MANAGER } from '../src/v1/deploy.ts';
+import {
+  FIELD_MANAGER,
+  HISTORY_PER_SERVICE_ENV,
+  HISTORY_TENANT_BUDGET,
+  RESERVE_ATTEMPTS,
+  UPDATE_ATTEMPTS,
+} from '../src/v1/deploy.ts';
 import { json, type Recorded, serve } from './support/servers.ts';
 
 const WORKLOADS =
@@ -47,6 +53,12 @@ describe('/v1/deploy', () => {
   let rejectToken: boolean | 'patch' | 'workloads' = false;
   /** Answers the next PATCH with this response instead of applying it. */
   let rawPatch: (() => Response) | undefined;
+  /** Answers the next ConfigMap POSTs with these instead of creating them. */
+  const postFailures: { status: number; message: string }[] = [];
+  /** Answers this many next PUTs with 409, as a concurrent writer would cause. */
+  let putConflicts = 0;
+  /** Paths a concurrent deploy deletes just before this one does: the DELETE gets a 404. */
+  const raced = new Set<string>();
   const api = serve((request: Recorded) => {
     if (request.pathname.endsWith('/token'))
       return json({
@@ -80,6 +92,8 @@ describe('/v1/deploy', () => {
       return object ? json(object) : json({ message: 'not found' }, 404);
     }
     if (request.method === 'POST') {
+      const failure = postFailures.shift();
+      if (failure) return json({ message: failure.message }, failure.status);
       const object = JSON.parse(request.body) as Json;
       const key = `${request.pathname}/${(object.metadata as Json).name}`;
       if (stored.has(key)) return json({ message: 'already exists' }, 409);
@@ -87,11 +101,17 @@ describe('/v1/deploy', () => {
       return json(object, 201);
     }
     if (request.method === 'PUT') {
+      if (putConflicts > 0) {
+        putConflicts--;
+        return json({ message: 'the object has been modified' }, 409);
+      }
+      if (!stored.has(request.pathname)) return json({ message: 'not found' }, 404);
       stored.set(request.pathname, JSON.parse(request.body) as Json);
       return json(JSON.parse(request.body));
     }
     if (request.method === 'DELETE') {
-      stored.delete(request.pathname);
+      if (raced.delete(request.pathname)) stored.delete(request.pathname);
+      if (!stored.delete(request.pathname)) return json({ message: 'not found' }, 404);
       return json({ status: 'Success' });
     }
     if (rawPatch) return rawPatch();
@@ -139,6 +159,9 @@ describe('/v1/deploy', () => {
     refusal = undefined;
     rejectToken = false;
     rawPatch = undefined;
+    postFailures.length = 0;
+    putConflicts = 0;
+    raced.clear();
     caller = alice;
     for (const env of ['prod', 'staging']) seedSecret('api-token', env);
   });
@@ -834,28 +857,290 @@ describe('/v1/deploy', () => {
       ).toEqual({ secretFrom: [{ name: 'api-token.prod' }] });
     });
 
-    test('keeps the last 20 revisions per service and environment', async () => {
-      for (let n = 1; n <= 20; n++)
-        stored.set(`${REVISIONS}web-prod.${n}`, {
-          metadata: {
-            name: `di-deploy-web-prod.${n}`,
-            labels: {
-              'platform.di-framework.dev/deploy-revision': String(n),
-              'di-framework.dev/service': 'web',
-              'platform.di-framework.dev/env': 'prod',
-            },
-            annotations: {
-              'platform.di-framework.dev/created-at': new Date(Date.UTC(2026, 0, n)).toISOString(),
-            },
+    /** Stores a revision as a deploy would have; `state` absent is a revision that went live. */
+    const seedRevision = (
+      service: string,
+      env: string,
+      n: number,
+      options: { createdAt?: string; state?: string; bundle?: string; label?: string } = {},
+    ) =>
+      stored.set(`${REVISIONS}${service}-${env}.${n}`, {
+        metadata: {
+          name: `di-deploy-${service}-${env}.${n}`,
+          labels: {
+            'platform.di-framework.dev/deploy-revision': options.label ?? String(n),
+            'di-framework.dev/service': service,
+            'platform.di-framework.dev/env': env,
           },
-          data: { bundle: JSON.stringify(deployBundle()), digest: 'sha256:0' },
-        });
+          annotations: {
+            'platform.di-framework.dev/created-at':
+              options.createdAt ?? new Date(Date.UTC(2026, 0, 1, 0, n)).toISOString(),
+            ...(options.state ? { 'platform.di-framework.dev/revision-state': options.state } : {}),
+          },
+        },
+        data: {
+          bundle:
+            options.bundle ??
+            JSON.stringify(deployBundle({ service, env: env as 'prod', bindings: [] })),
+          digest: 'sha256:0',
+        },
+      });
+    const stateOf = (id: string) =>
+      ((revision(id)?.metadata as Json | undefined)?.annotations as Json | undefined)?.[
+        'platform.di-framework.dev/revision-state'
+      ];
+    const listed = async (query = 'env=prod') =>
+      ((await (await get(`/v1/deployments?${query}`)).json()) as { items: Json[] }).items.map(
+        (item) => [item.id, item.status],
+      );
+
+    test(`keeps at most ${HISTORY_PER_SERVICE_ENV} revisions per service and environment`, async () => {
+      for (let n = 1; n <= 10; n++) seedRevision('web', 'prod', n, { state: 'replaced' });
+      seedRevision('web', 'prod', 10);
       await deployed(deployBundle({ env: 'staging' }));
-      expect((await deployed()).id).toBe('web-prod.21');
-      expect(revisionKeys().filter((key) => key.includes('web-prod'))).toHaveLength(20);
+      expect((await deployed()).id).toBe('web-prod.11');
+      expect(revisionKeys().filter((key) => key.includes('web-prod'))).toHaveLength(10);
       expect(revision('web-prod.1')).toBeUndefined();
       expect(revision('web-prod.2')).toBeDefined();
       expect(revision('web-staging.1')).toBeDefined();
+      expect(stateOf('web-prod.11')).toBe('live');
+      expect(stateOf('web-prod.10')).toBe('replaced');
+    });
+
+    test(`keeps at most ${HISTORY_TENANT_BUDGET} revisions in the tenant, oldest first, before creating`, async () => {
+      // Four services with ten revisions each fill the budget; `a` is the oldest.
+      for (const [index, service] of ['a', 'b', 'c', 'd'].entries())
+        for (let n = 1; n <= 10; n++)
+          seedRevision(service, 'prod', n, {
+            createdAt: new Date(Date.UTC(2026, 0, 1 + index, 0, n)).toISOString(),
+            ...(n < 10 ? { state: 'replaced' } : {}),
+          });
+      expect((await deployed()).id).toBe('web-prod.1');
+      expect(revisionKeys()).toHaveLength(HISTORY_TENANT_BUDGET);
+      expect(revision('a-prod.1')).toBeUndefined();
+      expect(revision('a-prod.2')).toBeDefined();
+      // The delete ran before the create.
+      const writes = api.requests.filter(
+        (r) => r.pathname.startsWith(`${CORE}/configmaps`) && ['POST', 'DELETE'].includes(r.method),
+      );
+      expect(writes.map((r) => r.method)).toEqual(['DELETE', 'POST']);
+    });
+
+    test('never prunes the running revision of a service, even over the budget', async () => {
+      for (let n = 1; n <= HISTORY_TENANT_BUDGET; n++) seedRevision(`s${n}`, 'prod', 1);
+      expect((await deployed()).id).toBe('web-prod.1');
+      expect(revisionKeys()).toHaveLength(HISTORY_TENANT_BUDGET + 1);
+      expect(api.requests.some((r) => r.method === 'DELETE')).toBe(false);
+    });
+
+    test('a prune that a concurrent deploy already made counts as done', async () => {
+      for (let n = 1; n <= 10; n++) seedRevision('web', 'prod', n, { state: 'replaced' });
+      seedRevision('web', 'prod', 10);
+      raced.add(`${REVISIONS}web-prod.1`);
+      expect((await deployed()).id).toBe('web-prod.11');
+      expect(revision('web-prod.1')).toBeUndefined();
+    });
+
+    test('a full ConfigMap quota is a 507 before anything is applied', async () => {
+      postFailures.push({
+        status: 403,
+        message: 'configmaps "di-deploy-web-prod.1" is forbidden: exceeded quota: di-tenant-quota',
+      });
+      const response = await post('/v1/deploy', deployBundle());
+      expect(response.status).toBe(507);
+      expect(((await response.json()) as Json).detail).toContain('nothing was applied');
+      expect(patches()).toHaveLength(0);
+      expect(workloads()).toHaveLength(0);
+      expect(revisionKeys()).toHaveLength(0);
+    });
+
+    test('another refusal of the revision POST is passed through before anything is applied', async () => {
+      postFailures.push({ status: 403, message: 'forbidden' });
+      expect((await post('/v1/deploy', deployBundle())).status).toBe(403);
+      expect(patches()).toHaveLength(0);
+    });
+
+    test('a revision number a concurrent deploy took is skipped for the next one', async () => {
+      postFailures.push({ status: 409, message: 'already exists' });
+      expect((await deployed()).id).toBe('web-prod.2');
+      expect(stateOf('web-prod.2')).toBe('live');
+    });
+
+    test(`${RESERVE_ATTEMPTS} taken revision numbers are a 409 before anything is applied`, async () => {
+      for (let attempt = 0; attempt < RESERVE_ATTEMPTS; attempt++)
+        postFailures.push({ status: 409, message: 'already exists' });
+      const response = await post('/v1/deploy', deployBundle());
+      expect(response.status).toBe(409);
+      expect(patches()).toHaveLength(0);
+    });
+
+    test('a revision is pending while it applies, and failed when the apply fails', async () => {
+      await deployed();
+      rawPatch = () => {
+        expect(stateOf('web-prod.2')).toBe('pending');
+        return json({ message: 'admission webhook denied' }, 422);
+      };
+      expect((await post('/v1/deploy', withReplicas(2))).status).toBe(422);
+      expect(stateOf('web-prod.2')).toBe('failed');
+      expect(stateOf('web-prod.1')).toBe('live');
+      expect(await listed()).toEqual([
+        ['web-prod.2', 'failed'],
+        ['web-prod.1', 'pending'],
+      ]);
+      const stats = (await (await get('/v1/deployments/stats?env=prod')).json()) as Json;
+      expect(stats).toMatchObject({ services: 1, deployments: 1 });
+      // The next deploy replaces the revision that went live, not the failed one.
+      rawPatch = undefined;
+      await deployed();
+      expect(stateOf('web-prod.1')).toBe('replaced');
+      expect(stateOf('web-prod.2')).toBe('failed');
+      const rollback = await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
+      expect(((await rollback.json()) as Json).id).toBe('web-prod.4');
+      expect(
+        (((revision('web-prod.4') as Json).metadata as Json).annotations as Json)[
+          'platform.di-framework.dev/rollback-of'
+        ],
+      ).toBe('web-prod.1');
+    });
+
+    test('a pending revision of a deploy still applying is listed but not counted', async () => {
+      await deployed();
+      seedRevision('web', 'prod', 2, { state: 'pending' });
+      expect(await listed()).toEqual([
+        ['web-prod.2', 'pending'],
+        ['web-prod.1', 'pending'],
+      ]);
+      const stats = (await (await get('/v1/deployments/stats?env=prod')).json()) as Json;
+      expect(stats).toMatchObject({ deployments: 1 });
+      const rollback = await post('/v1/deployments/rollback', {
+        env: 'prod',
+        service: 'web',
+        to: 'web-prod.2',
+      });
+      expect(rollback.status).toBe(404);
+    });
+
+    test('marking revisions re-reads them after a 409', async () => {
+      await deployed();
+      putConflicts = 2;
+      expect((await deployed()).id).toBe('web-prod.2');
+      expect(stateOf('web-prod.2')).toBe('live');
+      expect(stateOf('web-prod.1')).toBe('replaced');
+    });
+
+    test(`a revision that keeps changing is a 409 after ${UPDATE_ATTEMPTS} tries`, async () => {
+      putConflicts = UPDATE_ATTEMPTS;
+      expect((await post('/v1/deploy', deployBundle())).status).toBe(409);
+    });
+
+    test('a revision deleted while it is marked is skipped', async () => {
+      await deployed();
+      // A concurrent deploy prunes web-prod.1 between this deploy's read and its write.
+      const original = stored.get.bind(stored);
+      let reads = 0;
+      const spy = spyOn(stored, 'get').mockImplementation((key: string) => {
+        if (key === `${REVISIONS}web-prod.1` && ++reads === 1) {
+          const object = original(key);
+          stored.delete(key);
+          return object;
+        }
+        return original(key);
+      });
+      try {
+        putConflicts = 0;
+        const response = await post('/v1/deploy', withReplicas(2));
+        expect(response.status).toBe(202);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    test('order within a service comes from <n>, across services from created-at then name', async () => {
+      // web-prod.2 was created on a clock behind web-prod.1's, at the same instant as api-prod.1.
+      seedRevision('web', 'prod', 1, { createdAt: '2026-01-02T00:00:00.000Z', state: 'replaced' });
+      seedRevision('web', 'prod', 2, { createdAt: '2026-01-01T00:00:00.000Z' });
+      seedRevision('api', 'prod', 1, { createdAt: '2026-01-01T00:00:00.000Z' });
+      const items = await listed();
+      expect(items.map(([id]) => id)).toEqual(['web-prod.2', 'api-prod.1', 'web-prod.1']);
+      const response = await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
+      expect(response.status).toBe(202);
+      expect(((await response.json()) as Json).id).toBe('web-prod.3');
+      expect(
+        (((revision('web-prod.3') as Json).metadata as Json).annotations as Json)[
+          'platform.di-framework.dev/rollback-of'
+        ],
+      ).toBe('web-prod.1');
+      expect(stateOf('web-prod.2')).toBe('replaced');
+    });
+
+    test('hand-edited revisions are skipped with a logged reason', async () => {
+      await deployed();
+      seedRevision('web', 'prod', 7, { label: 'seven' });
+      seedRevision('web', 'prod', 8, { bundle: '{not json' });
+      seedRevision('web', 'prod', 9, { bundle: JSON.stringify(deployBundle({ service: 'api' })) });
+      seedRevision('web', 'prod', 10, { bundle: JSON.stringify({ service: 'web', env: 'prod' }) });
+      seedRevision('web', 'prod', 11, { state: 'unknown' });
+      stored.set(`${REVISIONS}web-prod.12`, {
+        metadata: {
+          name: 'di-deploy-web-prod.12',
+          labels: {
+            'platform.di-framework.dev/deploy-revision': '13',
+            'di-framework.dev/service': 'web',
+            'platform.di-framework.dev/env': 'prod',
+          },
+        },
+      });
+      seedRevision('Web', 'prod', 14);
+      expect(await listed()).toEqual([['web-prod.1', 'pending']]);
+      expect((await deployed()).id).toBe('web-prod.2');
+      expect((await post('/v1/deployments/rollback', { env: 'prod', service: 'web' })).status).toBe(
+        202,
+      );
+      for (const reason of [
+        'is not a positive integer',
+        'bundle is not JSON',
+        'bundle does not match',
+        'bundle has no component',
+        'is not a known state',
+        'name is not di-deploy-web-prod.13',
+        'service or env label is invalid',
+      ])
+        expect(log).toHaveBeenCalledWith(expect.stringContaining(reason));
+    });
+
+    test('a service that is not a DNS label is a 422 before any selector is built', async () => {
+      const list = await get('/v1/deployments?env=prod&service=a,b');
+      expect(list.status).toBe(422);
+      const rollback = await post('/v1/deployments/rollback', { env: 'prod', service: 'a,b' });
+      expect(rollback.status).toBe(422);
+      expect(api.requests.some((r) => r.pathname.startsWith(`${CORE}/configmaps`))).toBe(false);
+    });
+
+    test('a revision reports rolling until the platform observes the applied generation', async () => {
+      await deployed();
+      const key = `${WORKLOADS}/web-prod`;
+      const object = stored.get(key) as { metadata: Json };
+      stored.set(key, {
+        ...object,
+        metadata: { ...object.metadata, generation: 2 },
+        status: {
+          observedGeneration: 1,
+          conditions: [
+            { type: 'Ready', status: 'True', lastTransitionTime: '2026-01-01T00:00:00Z' },
+          ],
+        },
+      });
+      expect(await listed()).toEqual([['web-prod.1', 'rolling']]);
+      stored.set(key, {
+        ...object,
+        metadata: { ...object.metadata, generation: 2 },
+        status: {
+          conditions: [
+            { type: 'Ready', status: 'True', observedGeneration: 2, lastTransitionTime: 'x' },
+          ],
+        },
+      });
+      expect(await listed()).toEqual([['web-prod.1', 'ready']]);
     });
 
     test('a bundle too big to store is a 422 before anything is applied', async () => {
@@ -875,10 +1160,13 @@ describe('/v1/deploy', () => {
       setReady('web-prod', 'True', '2026-10-01T00:00:00Z');
       await deployed(withReplicas(2));
       setReady('web-prod', 'Unknown');
-      // Revisions of different services order by creation time, which has millisecond precision.
-      await Bun.sleep(5);
       await deployed(deployBundle({ service: 'api', bindings: [] }));
       setReady('api-prod', 'False');
+      // Created in the same instant: services order by name, revisions of one service by <n>.
+      for (const id of ['web-prod.1', 'web-prod.2', 'api-prod.1'])
+        (((revision(id) as Json).metadata as Json).annotations as Json)[
+          'platform.di-framework.dev/created-at'
+        ] = '2026-01-01T00:00:00.000Z';
 
       const response = await get('/v1/deployments?env=prod');
       expect(response.status).toBe(200);
@@ -1077,7 +1365,13 @@ describe('/v1/deploy against an unreachable API server', () => {
       port: 0,
       socket: {
         data(socket, data) {
-          if (data.toString().startsWith('PATCH ')) return void socket.end();
+          const head = data.toString();
+          if (head.startsWith('PATCH ')) return void socket.end();
+          // History lists find no revisions, and the revision reservation succeeds.
+          if (head.startsWith('POST ') || head.includes('labelSelector='))
+            return void socket.end(
+              'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}',
+            );
           socket.end(
             'HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}',
           );

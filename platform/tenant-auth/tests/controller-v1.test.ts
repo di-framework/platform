@@ -10,7 +10,7 @@ import { json, serve } from './support/servers.ts';
  */
 describe('/v1 dispatch', () => {
   const api = serve((request) => {
-    if (request.pathname.endsWith('/serviceaccounts/di-user-alice/token'))
+    if (/\/serviceaccounts\/di-user-(alice|bob)\/token$/.test(request.pathname))
       return json({
         status: {
           token: 'sa',
@@ -210,13 +210,32 @@ describe('/v1 dispatch', () => {
 
   describe('role policy', () => {
     test.each([
-      ['GET', '/v1/deployments?env=prod', undefined],
-      ['GET', '/v1/deployments/stats?env=prod', undefined],
-      ['GET', '/v1/deploy/registry', undefined],
-    ])('a viewer may call %s %s', async (method, path, body) => {
-      const response = await call(method, path, { body, bearer: 'viewer' });
-      expect(response.status).not.toBe(403);
-    });
+      ['GET', '/v1/deployments?env=prod', 200, { items: [] }],
+      [
+        'GET',
+        '/v1/deployments/stats?env=prod',
+        200,
+        { env: 'prod', services: 0, deployments: 0, ready: 0, failed: 0 },
+      ],
+      [
+        'GET',
+        '/v1/deploy/registry',
+        501,
+        {
+          type: 'about:blank',
+          title: 'Not Implemented',
+          status: 501,
+          detail: 'registry is not implemented in the pilot yet',
+        },
+      ],
+    ] as [string, string, number, unknown][])(
+      'a viewer may call %s %s',
+      async (method, path, status, body) => {
+        const response = await call(method, path, { bearer: 'viewer' });
+        expect(response.status).toBe(status);
+        expect(await response.json()).toEqual(body as never);
+      },
+    );
 
     test.each([
       ['GET', '/v1/secrets?env=prod', undefined, 'secrets'],
@@ -266,7 +285,13 @@ describe('/v1 dispatch', () => {
       const response = await call('POST', '/v1/deployments/rollback', {
         body: '{"env":"prod","service":"web"}',
       });
-      expect(response.status).not.toBe(403);
+      expect(response.status).toBe(404);
+      expect(await problem(response)).toEqual({
+        type: 'about:blank',
+        title: 'Not Found',
+        status: 404,
+        detail: 'web has no earlier deployment in prod',
+      } as never);
     });
 
     test('a viewer keeps whoami and logout', async () => {

@@ -18,7 +18,7 @@ import {
   secretObjectName,
   varsConfigMapName,
 } from './config.ts';
-import { notImplemented, type V1Context, type V1Handler, type V1Module } from './context.ts';
+import { notImplemented, type V1Context, type V1Module } from './context.ts';
 
 /** The contract's `DeployBundle`, after the generated routes checked its JSON shape. */
 interface DeployBundle {
@@ -384,29 +384,41 @@ function changedFields(before: KubeObject, after: KubeObject): string[] {
 // ---- revisions (platform#55:history) ----------------------------------------------------------
 
 /**
- * Each successful deploy is stored as a revision ConfigMap `di-deploy-<service>-<env>.<n>`. The
- * name prefix and the revision label keep them apart from the #53 vars ConfigMaps
- * (`di-vars-<env>`, label `config: vars`) and from the log projection, which selects on
- * `di-framework.dev/projection`; revisions carry neither.
+ * Each deploy is stored as a revision ConfigMap `di-deploy-<service>-<env>.<n>`. The name prefix
+ * and the revision label keep them apart from the #53 vars ConfigMaps (`di-vars-<env>`, label
+ * `config: vars`) and from the log projection, which selects on `di-framework.dev/projection`;
+ * revisions carry neither.
  */
 export const REVISION_PREFIX = 'di-deploy-';
 export const REVISION = 'platform.di-framework.dev/deploy-revision';
 const CREATED_AT = 'platform.di-framework.dev/created-at';
+/** Where the revision is in the reserve-apply-mark protocol (README "Deploy history"). */
+const STATE = 'platform.di-framework.dev/revision-state';
 const STATUS = 'platform.di-framework.dev/status';
 const READY_AT = 'platform.di-framework.dev/ready-at';
 const ROLLBACK_OF = 'platform.di-framework.dev/rollback-of';
-/** Revisions kept per service and environment; older ones are pruned. */
-export const HISTORY_LIMIT = 20;
+/**
+ * The tenant namespace allows `count/configmaps: 100` (resources.ts), shared with `di-vars-<env>`,
+ * the `di-logs-*` projections and `kube-root-ca.crt`; revisions stay within these budgets.
+ */
+export const HISTORY_PER_SERVICE_ENV = 10;
+export const HISTORY_TENANT_BUDGET = 40;
+/** How many revision numbers a deploy tries when concurrent deploys take the same one. */
+export const RESERVE_ATTEMPTS = 5;
+/** How many times a revision update is retried after a 409 from a concurrent writer. */
+export const UPDATE_ATTEMPTS = 5;
 /** A ConfigMap holds at most 1 MiB; this leaves room for metadata and the digest. */
 export const MAX_STORED_BUNDLE_BYTES = 900 * 1024;
 
 type Status = 'pending' | 'rolling' | 'ready' | 'failed' | 'rolled-back';
+type State = 'pending' | 'live' | 'replaced' | 'failed';
+const STATES: readonly string[] = ['pending', 'live', 'replaced', 'failed'];
 interface Live {
   status: Status;
   readyAt?: string;
 }
 
-interface Revision {
+interface RevisionObject {
   metadata: {
     name: string;
     resourceVersion?: string;
@@ -417,42 +429,139 @@ interface Revision {
   [key: string]: unknown;
 }
 
+/** A revision ConfigMap that passed `parseRevision`. */
+interface Revision {
+  object: RevisionObject;
+  id: string;
+  n: number;
+  service: string;
+  env: string;
+  state: State;
+  createdAt: string;
+  bundle: DeployBundle;
+}
+
 const coreNamespace = (tenant: string) => `/api/v1/namespaces/di-tenant-${tenant}`;
+const configmapsPath = (tenant: string) => `${coreNamespace(tenant)}/configmaps`;
 const workloadPath = (tenant: string, name: string) =>
   `/apis/${WORKLOAD_API}/namespaces/di-tenant-${tenant}/workloaddeployments/${name}`;
 const bindingsPath = (tenant: string) =>
   `/apis/${BINDING_API}/namespaces/di-tenant-${tenant}/servicebindings`;
-const revisionNumber = (revision: Revision) => Number(revision.metadata.labels?.[REVISION]);
-const revisionId = (revision: Revision) => revision.metadata.name.slice(REVISION_PREFIX.length);
-const createdAt = (revision: Revision) => revision.metadata.annotations?.[CREATED_AT] ?? '';
-const serviceOf = (revision: Revision) => revision.metadata.labels?.[SERVICE_LABEL] ?? '';
+const validService = (service: unknown): service is string =>
+  typeof service === 'string' && DNS_LABEL.test(service) && service.length <= 40;
+const INVALID_SERVICE = 'service must be a DNS label of at most 40 characters';
+const groupOf = (revision: { service: string; env: string }) =>
+  `${revision.service}-${revision.env}`;
+const nameOf = (revision: Revision) => revision.object.metadata.name;
 
-/** The revisions in `env`, of one service or all, newest first. */
+/** A revision ConfigMap as a `Revision`, or undefined (logged) when it was edited out of shape. */
+function parseRevision(object: RevisionObject): Revision | undefined {
+  const { name, labels = {}, annotations = {} } = object.metadata;
+  const skip = (reason: string) => {
+    console.log(JSON.stringify({ event: 'deploy.revision-skipped', name, reason }));
+    return undefined;
+  };
+  const label = labels[REVISION] ?? '';
+  if (!/^[1-9][0-9]{0,8}$/.test(label)) return skip(`${REVISION} is not a positive integer`);
+  const service = labels[SERVICE_LABEL];
+  const env = labels[ENV];
+  if (!validService(service) || (env !== 'prod' && env !== 'staging'))
+    return skip('service or env label is invalid');
+  const id = `${service}-${env}.${label}`;
+  if (name !== `${REVISION_PREFIX}${id}`) return skip(`name is not ${REVISION_PREFIX}${id}`);
+  let bundle: unknown;
+  try {
+    bundle = JSON.parse(object.data?.bundle ?? '');
+  } catch {
+    return skip('bundle is not JSON');
+  }
+  if (!isObject(bundle) || bundle.service !== service || bundle.env !== env)
+    return skip('bundle does not match the service and env labels');
+  if (!isObject(bundle.component)) return skip('bundle has no component');
+  const state = annotations[STATE] ?? 'live';
+  if (!STATES.includes(state)) return skip(`${STATE} is not a known state`);
+  return {
+    object,
+    id,
+    n: Number(label),
+    service,
+    env,
+    state: state as State,
+    createdAt: annotations[CREATED_AT] ?? '',
+    bundle: bundle as unknown as DeployBundle,
+  };
+}
+
+/** Within one service/env, `<n>` alone orders revisions, newest first. */
+const byNumber = (a: Revision, b: Revision) => b.n - a.n;
+
+/**
+ * Newest first. Each service/env keeps the slots `created-at` (tiebreak: name) gives it, filled
+ * in `<n>` order, so a clock step can reorder services but never revisions of one service/env.
+ */
+function ordered(items: Revision[]): Revision[] {
+  const byTime = [...items].sort(
+    (a, b) => b.createdAt.localeCompare(a.createdAt) || nameOf(a).localeCompare(nameOf(b)),
+  );
+  const groups = new Map<string, Revision[]>();
+  for (const revision of [...items].sort(byNumber)) {
+    const group = groups.get(groupOf(revision)) ?? [];
+    group.push(revision);
+    groups.set(groupOf(revision), group);
+  }
+  return byTime.map((revision) => groups.get(groupOf(revision))?.shift() as Revision);
+}
+
+/** The well-formed revisions in the tenant matching `filter`, newest first (`ordered`). */
 async function revisions(
   user: UserKube,
   tenant: string,
-  env: string,
-  service?: string,
+  filter: { env?: string; service?: string } = {},
 ): Promise<Revision[]> {
-  const selector = [REVISION, `${ENV}=${env}`, ...(service ? [`${SERVICE_LABEL}=${service}`] : [])];
-  const list = await user.call<{ items?: Revision[] }>(
+  const selector = [
+    REVISION,
+    ...(filter.env ? [`${ENV}=${filter.env}`] : []),
+    ...(filter.service ? [`${SERVICE_LABEL}=${filter.service}`] : []),
+  ];
+  const list = await user.call<{ items?: RevisionObject[] }>(
     'GET',
-    `${coreNamespace(tenant)}/configmaps?labelSelector=${encodeURIComponent(selector.join(','))}`,
+    `${configmapsPath(tenant)}?labelSelector=${encodeURIComponent(selector.join(','))}`,
   );
-  return (list.items ?? [])
-    .filter((item) => item.metadata.name.startsWith(REVISION_PREFIX))
-    .sort(
-      (a, b) => createdAt(b).localeCompare(createdAt(a)) || revisionNumber(b) - revisionNumber(a),
-    );
+  return ordered(
+    (list.items ?? [])
+      .filter((item) => item.metadata.name.startsWith(REVISION_PREFIX))
+      .map(parseRevision)
+      .filter((revision): revision is Revision => revision !== undefined),
+  );
+}
+
+/** The revision running in each service/env: its highest-numbered `live` one. */
+function currents(items: Revision[]): Map<string, Revision> {
+  const result = new Map<string, Revision>();
+  for (const revision of [...items].sort(byNumber))
+    if (revision.state === 'live' && !result.has(groupOf(revision)))
+      result.set(groupOf(revision), revision);
+  return result;
 }
 
 /** The live rollout state of a WorkloadDeployment, from its Ready condition. */
 async function liveStatus(user: UserKube, tenant: string, name: string): Promise<Live> {
   const workload = await current(user, workloadPath(tenant, name));
-  const conditions = (workload?.status as Json | undefined)?.conditions;
+  const status = workload?.status as Json | undefined;
+  const conditions = status?.conditions;
   const ready = Array.isArray(conditions)
     ? (conditions as Json[]).find((condition) => condition.type === 'Ready')
     : undefined;
+  // Until the platform observed the applied generation, Ready describes the previous spec.
+  const observed = ready?.observedGeneration ?? status?.observedGeneration;
+  const generation = workload?.metadata.generation;
+  if (
+    ready &&
+    typeof observed === 'number' &&
+    typeof generation === 'number' &&
+    observed < generation
+  )
+    return { status: 'rolling' };
   if (ready?.status === 'True')
     return {
       status: 'ready',
@@ -469,62 +578,141 @@ const sha256 = (text: string) =>
 
 /** The contract's `Deployment` for one revision. */
 function deployment(revision: Revision, { status, readyAt }: Live) {
-  const bundle = JSON.parse(revision.data?.bundle ?? '{}') as DeployBundle;
   return {
-    id: revisionId(revision),
-    service: bundle.service,
-    env: bundle.env,
+    id: revision.id,
+    service: revision.service,
+    env: revision.env,
     status,
-    component: bundle.component,
-    createdAt: createdAt(revision),
+    component: revision.bundle.component,
+    createdAt: revision.createdAt,
     ...(readyAt ? { readyAt } : {}),
   };
 }
 
-/** Records a revision after a successful apply, marks the one it replaced, and prunes the oldest. */
-async function record(
+/** What a revision that is not running reports: its recorded status, or that it never went live. */
+function recorded(revision: Revision): Live {
+  if (revision.state === 'pending' || revision.state === 'failed')
+    return { status: revision.state };
+  const annotations = revision.object.metadata.annotations ?? {};
+  return {
+    status: (annotations[STATUS] as Status | undefined) ?? 'pending',
+    ...(annotations[READY_AT] ? { readyAt: annotations[READY_AT] } : {}),
+  };
+}
+
+const hasStatus = (error: unknown, status: number) =>
+  error instanceof KubeError && error.status === status;
+
+/** Deletes `path`; an object a concurrent deploy already deleted counts as deleted. */
+async function remove(user: UserKube, path: string): Promise<void> {
+  try {
+    await user.call('DELETE', path);
+  } catch (error) {
+    if (!hasStatus(error, 404)) throw error;
+  }
+}
+
+/**
+ * Makes room for one more revision of `group`: at most `HISTORY_PER_SERVICE_ENV` per service/env
+ * and `HISTORY_TENANT_BUDGET` in the tenant, oldest first, never a service/env's running revision.
+ */
+async function prune(user: UserKube, tenant: string, group: string): Promise<void> {
+  const items = await revisions(user, tenant);
+  const running = new Set([...currents(items).values()]);
+  const counts = new Map<string, number>([[group, 1]]);
+  for (const revision of items)
+    counts.set(groupOf(revision), (counts.get(groupOf(revision)) ?? 0) + 1);
+  const oldest = [...items].reverse();
+  const evict = new Set<Revision>();
+  for (const revision of oldest) {
+    const count = counts.get(groupOf(revision)) ?? 0;
+    if (running.has(revision) || count <= HISTORY_PER_SERVICE_ENV) continue;
+    evict.add(revision);
+    counts.set(groupOf(revision), count - 1);
+  }
+  let total = items.length + 1 - evict.size;
+  for (const revision of oldest) {
+    if (total <= HISTORY_TENANT_BUDGET) break;
+    if (evict.has(revision) || running.has(revision)) continue;
+    evict.add(revision);
+    total--;
+  }
+  for (const revision of evict) await remove(user, `${configmapsPath(tenant)}/${nameOf(revision)}`);
+}
+
+/** Creates the revision as `pending`, taking the next `<n>` when a concurrent deploy took it. */
+async function reserve(
   user: UserKube,
   tenant: string,
   bundle: DeployBundle,
-  before: Live,
   rollbackOf?: string,
-): Promise<Revision> {
-  const existing = await revisions(user, tenant, bundle.env, bundle.service);
-  const n = Math.max(0, ...existing.map(revisionNumber)) + 1;
+): Promise<Revision | Response> {
+  const existing = await revisions(user, tenant, { env: bundle.env, service: bundle.service });
+  const first = Math.max(0, ...existing.map((revision) => revision.n)) + 1;
   const text = JSON.stringify(bundle);
-  const revision: Revision = {
-    apiVersion: 'v1',
-    kind: 'ConfigMap',
-    metadata: {
-      name: `${REVISION_PREFIX}${bundle.service}-${bundle.env}.${n}`,
-      labels: { [REVISION]: String(n), [SERVICE_LABEL]: bundle.service, [ENV]: bundle.env },
-      annotations: {
-        [CREATED_AT]: new Date().toISOString(),
-        ...(rollbackOf ? { [ROLLBACK_OF]: rollbackOf } : {}),
+  for (let n = first; n < first + RESERVE_ATTEMPTS; n++) {
+    const object: RevisionObject = {
+      apiVersion: 'v1',
+      kind: 'ConfigMap',
+      metadata: {
+        name: `${REVISION_PREFIX}${bundle.service}-${bundle.env}.${n}`,
+        labels: { [REVISION]: String(n), [SERVICE_LABEL]: bundle.service, [ENV]: bundle.env },
+        annotations: {
+          [CREATED_AT]: new Date().toISOString(),
+          [STATE]: 'pending',
+          ...(rollbackOf ? { [ROLLBACK_OF]: rollbackOf } : {}),
+        },
       },
-    },
-    data: { bundle: text, digest: sha256(text) },
-  };
-  const configmaps = `${coreNamespace(tenant)}/configmaps`;
-  await user.call('POST', configmaps, revision);
-  const [previous] = existing;
-  if (previous) {
-    const annotations = {
-      ...previous.metadata.annotations,
-      [STATUS]: rollbackOf ? 'rolled-back' : before.status,
-      ...(before.readyAt ? { [READY_AT]: before.readyAt } : {}),
+      data: { bundle: text, digest: sha256(text) },
     };
-    await user.call('PUT', `${configmaps}/${previous.metadata.name}`, {
-      ...previous,
-      metadata: { ...previous.metadata, annotations },
-    });
+    try {
+      await user.call('POST', configmapsPath(tenant), object);
+      return parseRevision(object) as Revision;
+    } catch (error) {
+      if (hasStatus(error, 409)) continue;
+      if (hasStatus(error, 403) && /exceeded quota/i.test((error as Error).message))
+        return problem(
+          507,
+          'Insufficient Storage',
+          `the tenant's ConfigMap quota is full, so nothing was applied: ${(error as Error).message}`,
+        );
+      throw error;
+    }
   }
-  for (const old of existing.slice(HISTORY_LIMIT - 1))
-    await user.call('DELETE', `${configmaps}/${old.metadata.name}`);
-  return revision;
+  return problem(
+    409,
+    'Conflict',
+    `concurrent deploys of ${bundle.service} in ${bundle.env} took ${RESERVE_ATTEMPTS} revision numbers; nothing was applied`,
+  );
 }
 
-/** ServiceBindings this service/env owns (by the labels `render` sets) that `keep` lacks. */
+/** Read-modify-writes a revision's annotations, re-reading after a 409; a deleted one is skipped. */
+async function annotate(
+  user: UserKube,
+  tenant: string,
+  name: string,
+  change: Record<string, string>,
+): Promise<void> {
+  const path = `${configmapsPath(tenant)}/${name}`;
+  for (let attempt = 0; attempt < UPDATE_ATTEMPTS; attempt++) {
+    const object = await current(user, path);
+    if (!object) return;
+    const { metadata } = object as unknown as RevisionObject;
+    try {
+      await user.call('PUT', path, {
+        ...object,
+        metadata: { ...metadata, annotations: { ...metadata.annotations, ...change } },
+      });
+      return;
+    } catch (error) {
+      if (hasStatus(error, 404)) return;
+      if (!hasStatus(error, 409)) throw error;
+    }
+  }
+  throw new KubeError(409, `${name} kept changing; its history state was not updated`);
+}
+
+/** ServiceBindings this service/env rendered (labels and name prefix) that `keep` lacks. */
 async function staleBindings(
   user: UserKube,
   tenant: string,
@@ -540,10 +728,17 @@ async function staleBindings(
     'GET',
     `${bindingsPath(tenant)}?labelSelector=${encodeURIComponent(selector)}`,
   );
-  return (list.items ?? []).map((item) => item.metadata.name).filter((name) => !keep.has(name));
+  const prefix = `${bundle.service}-${bundle.env}-`;
+  return (list.items ?? [])
+    .map((item) => item.metadata.name)
+    .filter((name) => name.startsWith(prefix) && !keep.has(name));
 }
 
-/** Applies a checked bundle, prunes dropped bindings, and records it as a new revision. */
+/**
+ * Prunes history, reserves a `pending` revision, applies the checked bundle and prunes dropped
+ * bindings, then marks the revision `live` and the one it replaced `replaced`. A failed apply
+ * marks the revision `failed`, so history never names a bundle that did not go live.
+ */
 async function rollout(
   bundle: DeployBundle,
   context: V1Context,
@@ -552,19 +747,37 @@ async function rollout(
 ): Promise<Response> {
   const user = context.asUser();
   const { tenant } = context;
-  const before = await liveStatus(user, tenant, `${bundle.service}-${bundle.env}`);
-  const objects = render(bundle, tenant, refs);
-  for (const { path, object } of objects) await apply(user, path, object, false);
-  const keep = new Set(objects.map(({ object }) => object.metadata.name));
-  for (const stale of await staleBindings(user, tenant, bundle, keep))
-    await user.call('DELETE', `${bindingsPath(tenant)}/${stale}`);
-  const revision = await record(user, tenant, bundle, before, rollbackOf);
+  const group = `${bundle.service}-${bundle.env}`;
+  const before = await liveStatus(user, tenant, group);
+  await prune(user, tenant, group);
+  const previous = currents(
+    await revisions(user, tenant, { env: bundle.env, service: bundle.service }),
+  ).get(group);
+  const revision = await reserve(user, tenant, bundle, rollbackOf);
+  if (revision instanceof Response) return revision;
+  try {
+    const objects = render(bundle, tenant, refs);
+    for (const { path, object } of objects) await apply(user, path, object, false);
+    const keep = new Set(objects.map(({ object }) => object.metadata.name));
+    for (const stale of await staleBindings(user, tenant, bundle, keep))
+      await remove(user, `${bindingsPath(tenant)}/${stale}`);
+  } catch (error) {
+    await annotate(user, tenant, nameOf(revision), { [STATE]: 'failed' }).catch(() => {});
+    throw error;
+  }
+  await annotate(user, tenant, nameOf(revision), { [STATE]: 'live' });
+  if (previous)
+    await annotate(user, tenant, nameOf(previous), {
+      [STATE]: 'replaced',
+      [STATUS]: rollbackOf ? 'rolled-back' : before.status,
+      ...(before.readyAt ? { [READY_AT]: before.readyAt } : {}),
+    });
   context.audit(rollbackOf ? 'deploy.rolled-back' : 'deploy.applied', {
     user: context.principal.user,
     env: bundle.env,
     service: bundle.service,
     digest: bundle.component.digest,
-    revision: revisionId(revision),
+    revision: revision.id,
     ...(rollbackOf ? { to: rollbackOf } : {}),
   });
   return Response.json(deployment(revision, { status: 'pending' }), { status: 202 });
@@ -630,34 +843,29 @@ export const deploy: V1Module = {
   deployments: async (_command, call, context) => {
     const user = context.asUser();
     const env = String(queryValue(call, 'env'));
-    const items = await revisions(user, context.tenant, env, queryValue(call, 'service'));
-    // The newest revision of each service reports the live rollout; older ones what they were
-    // when they were replaced.
+    const service = queryValue(call, 'service');
+    if (service !== undefined && !validService(service))
+      return problem(422, 'Unprocessable Entity', INVALID_SERVICE);
+    const items = await revisions(user, context.tenant, { env, service });
+    // The running revision of each service reports the live rollout; the others what they were
+    // when they were replaced, or `pending`/`failed` when they never went live.
     const live = new Map<Revision, Live>();
-    const seen = new Set<string>();
-    for (const revision of items) {
-      if (seen.has(serviceOf(revision))) continue;
-      seen.add(serviceOf(revision));
-      live.set(revision, await liveStatus(user, context.tenant, `${serviceOf(revision)}-${env}`));
-    }
+    for (const [group, revision] of currents(items))
+      live.set(revision, await liveStatus(user, context.tenant, group));
     return Response.json({
-      items: items.map((revision) => {
-        const annotations = revision.metadata.annotations ?? {};
-        return deployment(
-          revision,
-          live.get(revision) ?? {
-            status: (annotations[STATUS] as Status | undefined) ?? 'pending',
-            readyAt: annotations[READY_AT],
-          },
-        );
-      }),
+      items: items.map((revision) =>
+        deployment(revision, live.get(revision) ?? recorded(revision)),
+      ),
     });
   },
   deploymentStats: async (_command, call, context) => {
     const user = context.asUser();
     const env = String(queryValue(call, 'env'));
-    const items = await revisions(user, context.tenant, env);
-    const services = [...new Set(items.map(serviceOf))];
+    // Revisions that never went live (`pending`, `failed`) are not deployments.
+    const items = (await revisions(user, context.tenant, { env })).filter(
+      (revision) => revision.state === 'live' || revision.state === 'replaced',
+    );
+    const services = [...new Set(items.map((revision) => revision.service))];
     let ready = 0;
     let failed = 0;
     for (const service of services) {
@@ -671,13 +879,20 @@ export const deploy: V1Module = {
       deployments: items.length,
       ready,
       failed,
-      ...(items[0] ? { lastDeployedAt: createdAt(items[0]) } : {}),
+      ...(items[0] ? { lastDeployedAt: items[0].createdAt } : {}),
     });
   },
   rollback: async (command, _call, context) => {
     const { env, service, to } = command as { env: string; service: string; to?: string };
-    const items = await revisions(context.asUser(), context.tenant, env, service);
-    const target = to ? items.find((revision) => revisionId(revision) === to) : items[1];
+    if (!validService(service)) return problem(422, 'Unprocessable Entity', INVALID_SERVICE);
+    const items = await revisions(context.asUser(), context.tenant, { env, service });
+    const running = currents(items).get(`${service}-${env}`);
+    // By default, the newest revision that went live before the running one.
+    const target = to
+      ? items.find((revision) => revision.id === to && revision.state !== 'pending')
+      : items.find(
+          (revision) => revision.state === 'replaced' && (!running || revision.n < running.n),
+        );
     if (!target)
       return problem(
         404,
@@ -686,7 +901,7 @@ export const deploy: V1Module = {
           ? `deployment ${to} is not in the history of ${service} in ${env}`
           : `${service} has no earlier deployment in ${env}`,
       );
-    const bundle = JSON.parse(target.data?.bundle as string) as DeployBundle;
-    return checked(bundle, context, (refs) => rollout(bundle, context, refs, revisionId(target)));
+    const { bundle } = target;
+    return checked(bundle, context, (refs) => rollout(bundle, context, refs, target.id));
   },
 };
