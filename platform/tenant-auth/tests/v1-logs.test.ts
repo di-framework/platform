@@ -1,10 +1,10 @@
-import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { events } from '@di-framework/tenant-cli/client';
 import { Controller, configFromEnv } from '../src/controller.ts';
 import type { Principal } from '../src/identity.ts';
 import { KubeClient } from '../src/kube.ts';
 import { logEvents, timing } from '../src/v1/logs.ts';
-import { json, type Recorded, serve } from './support/servers.ts';
+import { type FakeServer, json, type Recorded, serve } from './support/servers.ts';
 
 const configMap = (application: string, lines: string[], failures?: unknown, rv = '1') => ({
   metadata: {
@@ -56,7 +56,12 @@ describe('GET /v1/services/:service/logs', () => {
   let listed: unknown;
   let lists = 0;
   let onWatch: (() => void) | undefined;
-  const api = serve((request: Recorded) => {
+  /** Awaited before answering every list after the first (a relist). */
+  let onRelist: (() => Promise<void>) | undefined;
+  /** Bumped after every test: a fake API answers 503 once it is no longer current. */
+  let generation = 0;
+  const handler = (mine: number) => async (request: Recorded) => {
+    if (mine !== generation) return json({ message: 'stale test server' }, 503);
     if (request.pathname.endsWith('/serviceaccounts/di-user-alice/token'))
       return json({
         status: {
@@ -95,8 +100,9 @@ describe('GET /v1/services/:service/logs', () => {
     const selector = url.searchParams.get('labelSelector') ?? '';
     const items = selector.endsWith('application=web') ? [WEB] : [];
     lists++;
+    if (lists > 1 && onRelist) await onRelist();
     return json(listed ?? { metadata: { resourceVersion: '42' }, items });
-  });
+  };
   const viewer: Principal = {
     user: 'alice',
     account: 'acme',
@@ -104,21 +110,35 @@ describe('GET /v1/services/:service/logs', () => {
     via: 'identity',
     credentialId: 's',
   };
-  const kube = new KubeClient({ server: api.url, token: 'admin' }, 'wasmcloud');
-  const controller = new Controller(
-    configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme' }),
-    kube,
-    { issuer: 'https://issuer.test' } as never,
-    { resolve: async () => viewer, forget: () => {} } as never,
-    { kube, namespace: 'di-runtime-acme', tenant: 'acme' },
-  );
-  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: (r) => controller.handle(r) });
-  const base = `http://127.0.0.1:${server.port}/v1/services`;
+  // A fresh fake API, client, controller and server per test, so a previous test's follow loop
+  // can never reach the next test's state.
+  let api: FakeServer;
+  let controller: Controller;
+  let server: ReturnType<typeof Bun.serve>;
+  let base: string;
+  beforeEach(() => {
+    api = serve(handler(generation));
+    const kube = new KubeClient({ server: api.url, token: 'admin' }, 'wasmcloud');
+    controller = new Controller(
+      configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme' }),
+      kube,
+      { issuer: 'https://issuer.test' } as never,
+      { resolve: async () => viewer, forget: () => {} } as never,
+      { kube, namespace: 'di-runtime-acme', tenant: 'acme' },
+    );
+    const current = controller;
+    server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: (r) => current.handle(r) });
+    base = `http://127.0.0.1:${server.port}/v1/services`;
+  });
   let log: ReturnType<typeof spyOn>;
   beforeAll(() => {
     log = spyOn(console, 'log').mockImplementation(() => {});
   });
   afterEach(() => {
+    // Retire this test's servers before resetting state, so late requests get a 503.
+    generation++;
+    api.stop();
+    server.stop(true);
     watches = [];
     watchStatus = 200;
     watchStatuses = [];
@@ -130,12 +150,10 @@ describe('GET /v1/services/:service/logs', () => {
     timing.queueBytes = 1 << 20;
     timing.queueLimitBytes = 4 << 20;
     onWatch = undefined;
-    api.requests.length = 0;
+    onRelist = undefined;
   });
   afterAll(() => {
     log.mockRestore();
-    server.stop(true);
-    api.stop();
   });
 
   const read = async (response: Response) => {
@@ -381,6 +399,36 @@ describe('GET /v1/services/:service/logs', () => {
     await Bun.sleep(20);
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(watches.length).toBe(1);
+  });
+
+  test('a disconnect during a relist ends start() without backing off', async () => {
+    timing.backoffBaseMs = 60_000;
+    watchStatuses = [410];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const relisting = new Promise<void>((resolve) => {
+      onRelist = () => {
+        resolve();
+        return gate;
+      };
+    });
+    const response = await controller.handle(
+      new Request(`${base}/web/logs?env=prod&follow=true&tail=0`),
+    );
+    await relisting;
+    await response.body?.cancel();
+    const timeout = spyOn(globalThis, 'setTimeout');
+    try {
+      release();
+      await Bun.sleep(50);
+      expect(timeout.mock.calls.some(([, ms]) => (ms ?? 0) >= 1_000)).toBe(false);
+    } finally {
+      timeout.mockRestore();
+    }
+    const watchCalls = api.requests.filter((r) => r.path.includes('watch=true')).length;
+    expect(watchCalls).toBe(1);
   });
 
   test('watches that keep answering ERROR 410 back off', async () => {

@@ -180,6 +180,10 @@ const listEvents = (list: ConfigMapList) => (list.items ?? []).flatMap(logEvents
 /** Resolves after `ms`, or as soon as the signal aborts. */
 const sleep = (ms: number, signal: AbortSignal) =>
   new Promise<void>((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
     const onAbort = () => {
       clearTimeout(timer);
       resolve();
@@ -271,6 +275,7 @@ function stream(
             if (response.status === 410) {
               await response.body?.cancel();
               await relist();
+              if (abort.signal.aborted) break;
             } else if (!response.ok || !response.body) {
               await response.body?.cancel();
               break;
@@ -290,7 +295,7 @@ function stream(
                 }
               }
             }
-            if (ended) break;
+            if (ended || abort.signal.aborted) break;
             if (delivered) idle = 0;
             else {
               await sleep(
