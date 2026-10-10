@@ -202,8 +202,9 @@ renaming or removing one is a breaking change.
 | `TENANT_CONTROLLER_REGISTRY_FRONT_PORT` | none | TLS listener (the controller certificate) that forwards every request, credentials included, to the tenant hosts as the registry (platform#83) |
 | `TENANT_CONTROLLER_REGISTRY_HOST` | `registry` | `Host` the registry front sends: the registry workload's `wasi:http` host; `/v1/deploy` refuses a `<service>-<env>` equal to it |
 | `TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES` | `536870912` (512 MiB) | Largest request body the registry front accepts; larger is `413` |
-| `TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS` | `60000` | Wait for the registry's response headers; then `504` |
-| `TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT` | `16` | Registry front requests at once; more are `503` |
+| `TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS` | `60000` | Wait for the registry's response headers, counted from when the request body has been forwarded in full; then `504` |
+| `TENANT_CONTROLLER_REGISTRY_UPLOAD_IDLE_TIMEOUT_MS` | `60000` | How long an upload may deliver no byte while the front waits for one; then `408`. A steady upload of any length succeeds |
+| `TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT` | `16` | Registry front requests at once; more are `503`. Requests without Basic credentials get the registry's `401` challenge at the front and take no slot |
 | `TENANT_CONTROLLER_REGISTRY_URL` | none | Registry origin `GET /v1/deploy/registry` returns; `{tenant}` is replaced. https, or http only for loopback and `*.svc` hosts |
 | `TENANT_CONSOLE_HOST`, `TENANT_CONSOLE_PORT` | `127.0.0.1`, `8787` | Console listen address |
 | `TENANT_CONSOLE_PUBLIC_URL` | `http://<TENANT_CONSOLE_HOST>:<TENANT_CONSOLE_PORT>` | Browser-visible console URL |

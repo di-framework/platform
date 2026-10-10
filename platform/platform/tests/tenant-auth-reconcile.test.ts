@@ -1461,7 +1461,10 @@ describe('tenant registry (#83:reconcile)', () => {
   });
 
   it('renders the registry workload, the whoami listener and the registry front', () => {
-    const resources = tenantAuthResources(tenant(), registryCfg, inputs);
+    const resources = tenantAuthResources(tenant(), registryCfg, {
+      ...inputs,
+      registryServing: true,
+    });
     const workload = find(resources, 'WorkloadDeployment', REGISTRY_WORKLOAD) as Workload;
     expect(workload.metadata.namespace).toBe('di-tenant-alpha');
     expect(workload.metadata.labels).toMatchObject({
@@ -1555,6 +1558,21 @@ describe('tenant registry (#83:reconcile)', () => {
         ingress: [{ ports: [{ protocol: 'TCP', port: 8790 }] }],
       },
     });
+    // Until the registry serves (W4), the controller has no registry front and no registry URL.
+    const closed = env(
+      find(
+        tenantAuthResources(tenant(), registryCfg, inputs),
+        'Deployment',
+        'tenant-controller',
+      ) as Deployment,
+    );
+    expect(closed).toMatchObject({
+      TENANT_CONTROLLER_WHOAMI_PORT: '8789',
+      TENANT_CONTROLLER_REGISTRY_HOST: 'registry',
+    });
+    expect(closed).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_FRONT_PORT');
+    expect(closed).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_URL');
+    expect(closed).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT');
     // Without a registry, none of it.
     const plain = tenantAuthResources(tenant(), { ...registryCfg, tenantAuth: auth }, inputs);
     expect(find(plain, 'WorkloadDeployment', REGISTRY_WORKLOAD)).toBeUndefined();
@@ -1792,5 +1810,163 @@ describe('tenant registry (#83:reconcile)', () => {
     expect(patched).toEqual([
       `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', 'di-tenant-alpha')}/${REGISTRY_WORKLOAD}?fieldManager=di-platform-egress`,
     ]);
+  });
+
+  it('renders the registry front limits from tenantAuth.registry.limits (S6)', () => {
+    const limited: TenantAuthConfig = {
+      ...withRegistry,
+      registry: {
+        component: COMPONENT_REF,
+        limits: {
+          maxBodyBytes: 1024,
+          upstreamTimeoutMs: 5000,
+          maxConcurrent: 4,
+          uploadIdleTimeoutMs: 7000,
+        },
+      },
+    };
+    expect(() => assertTenantAuthConfig(limited)).not.toThrow();
+    const controller = env(
+      find(
+        tenantAuthResources(tenant(), { ...registryCfg, tenantAuth: limited }, inputs),
+        'Deployment',
+        'tenant-controller',
+      ) as Deployment,
+    );
+    expect(controller).toMatchObject({
+      TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES: '1024',
+      TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS: '5000',
+      TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT: '4',
+      TENANT_CONTROLLER_REGISTRY_UPLOAD_IDLE_TIMEOUT_MS: '7000',
+    });
+    // Only the limits that are set are rendered.
+    const one = env(
+      find(
+        tenantAuthResources(
+          tenant(),
+          {
+            ...registryCfg,
+            tenantAuth: {
+              ...withRegistry,
+              registry: { component: COMPONENT_REF, limits: { maxConcurrent: 2 } },
+            },
+          },
+          inputs,
+        ),
+        'Deployment',
+        'tenant-controller',
+      ) as Deployment,
+    );
+    expect(one.TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT).toBe('2');
+    expect(one).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES');
+    for (const bad of [0, -1, 1.5, Number.NaN])
+      expect(() =>
+        assertTenantAuthConfig({
+          ...withRegistry,
+          registry: { component: COMPONENT_REF, limits: { upstreamTimeoutMs: bad } },
+        }),
+      ).toThrow('tenantAuth.registry.limits.upstreamTimeoutMs must be a positive integer');
+  });
+
+  describe('registry host conflicts and readiness (W4)', () => {
+    const controllerPath = path('Deployment', 'di-runtime-alpha', 'tenant-controller');
+    const frontEnv = (api: MemoryApi) =>
+      env(api.objects.get(controllerPath) as unknown as Deployment);
+    const claimant = (name: string, config: Record<string, string>, labels = {}) => ({
+      apiVersion: 'runtime.wasmcloud.dev/v1alpha1',
+      kind: 'WorkloadDeployment',
+      metadata: { name, namespace: 'di-tenant-alpha', labels },
+      spec: {
+        template: {
+          spec: {
+            hostInterfaces: [
+              { namespace: 'wasmcloud', package: 'secrets', config: { host: 'registry' } },
+              { namespace: 'wasi', package: 'http', interfaces: ['handler'], config },
+            ],
+          },
+        },
+      },
+    });
+    const claimantPath = (name: string) =>
+      `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', 'di-tenant-alpha')}/${name}`;
+    const quiet = async (run: () => Promise<void>) => {
+      const log = console.error;
+      console.error = () => {};
+      try {
+        await run();
+      } finally {
+        console.error = log;
+      }
+    };
+
+    it('keeps the front closed until the registry is Ready', async () => {
+      const { api, t } = prepare();
+      const controller = new Controller(api, registryCfg);
+      await controller.reconcileTenant(t, []);
+      expect(frontEnv(api)).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_FRONT_PORT');
+      expect(frontEnv(api)).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_URL');
+      api.objects.get(wdPath)!.status = { conditions: ready };
+      await controller.reconcileTenant(t, []);
+      expect(frontEnv(api).TENANT_CONTROLLER_REGISTRY_FRONT_PORT).toBe('8790');
+      expect(authCondition(t)).toMatchObject({ status: 'True', reason: 'Reconciled' });
+      // The registry stops being Ready: the front closes again.
+      api.objects.get(wdPath)!.status = {};
+      await controller.reconcileTenant(t, []);
+      expect(frontEnv(api)).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_FRONT_PORT');
+      expect(authCondition(t)).toMatchObject({ status: 'False', reason: 'Provisioning' });
+    });
+
+    it('refuses to serve a host another workload claims, and recovers once it is removed', async () => {
+      const { api, t } = prepare();
+      // A tenant workload created before the reservation, claiming the host in another case.
+      api.seed(claimant('own-registry', { host: 'Registry' }));
+      const controller = new Controller(api, registryCfg);
+      await quiet(() => controller.reconcileTenant(t, []));
+      api.objects.get(wdPath)!.status = { conditions: ready };
+      await controller.reconcileTenant(t, []);
+      expect(authCondition(t)).toMatchObject({
+        status: 'False',
+        reason: 'RegistryHostConflict',
+        message:
+          'WorkloadDeployment own-registry claims the tenant registry host registry; the registry is not served until it is removed',
+      });
+      expect(frontEnv(api)).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_FRONT_PORT');
+      expect(t.status?.conditions?.find((c) => c.type === 'Ready')?.status).toBe('True');
+      api.objects.delete(claimantPath('own-registry'));
+      await controller.reconcileTenant(t, []);
+      expect(authCondition(t)).toMatchObject({ status: 'True', reason: 'Reconciled' });
+      expect(frontEnv(api).TENANT_CONTROLLER_REGISTRY_FRONT_PORT).toBe('8790');
+    });
+
+    it('finds claims through host-aliases and after a registry label change', async () => {
+      const { api, t } = prepare();
+      api.seed(claimant('aliased', { host: 'web', 'host-aliases': 'a.b, REGISTRY.' }));
+      await quiet(() => new Controller(api, registryCfg).reconcileTenant(t, []));
+      expect(authCondition(t)?.message).toStartWith('WorkloadDeployment aliased claims');
+      api.objects.delete(claimantPath('aliased'));
+      // Hosts that merely contain the label, and non-http interfaces, are no claim.
+      api.seed(claimant('web', { host: 'registry-ui', 'host-aliases': 'x' }));
+      api.seed({ ...claimant('bare', {}), spec: {} });
+      api.objects.get(wdPath)!.status = { conditions: ready };
+      await new Controller(api, registryCfg).reconcileTenant(t, []);
+      expect(authCondition(t)).toMatchObject({ reason: 'Reconciled' });
+      // The operator moves the registry to a label a tenant workload already serves.
+      api.seed(claimant('oci-app', { host: 'oci' }));
+      const moved: ControllerConfig = {
+        ...registryCfg,
+        tenantAuth: {
+          ...withRegistry,
+          registry: { component: COMPONENT_REF, publicUrl: 'https://oci.{tenant}.localhost:28180' },
+        },
+      };
+      await new Controller(api, moved).reconcileTenant(t, []);
+      expect(authCondition(t)).toMatchObject({
+        reason: 'RegistryHostConflict',
+        message: expect.stringContaining(
+          'WorkloadDeployment oci-app claims the tenant registry host oci',
+        ),
+      });
+      expect(frontEnv(api)).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_FRONT_PORT');
+    });
   });
 });

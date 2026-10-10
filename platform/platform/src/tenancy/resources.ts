@@ -119,6 +119,23 @@ export interface TenantRegistryConfig {
    * Default `https://127.0.0.1:8790`, a port-forward to the registry front.
    */
   publicUrl?: string;
+  /**
+   * Bounds of the controller's registry front, each optional (the controller's default applies):
+   * rendered as `TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES`, `_UPSTREAM_TIMEOUT_MS`,
+   * `_MAX_CONCURRENT` and `_UPLOAD_IDLE_TIMEOUT_MS` on the controller Deployment.
+   */
+  limits?: TenantRegistryLimits;
+}
+/** Registry front bounds (S6 of the #83 review); positive integers. */
+export interface TenantRegistryLimits {
+  /** Largest request body, in bytes (default 512 MiB). */
+  maxBodyBytes?: number;
+  /** Wait for the registry's response headers once the request body is sent, in ms (default 60000). */
+  upstreamTimeoutMs?: number;
+  /** Registry requests in flight at once (default 16). */
+  maxConcurrent?: number;
+  /** How long an upload may deliver no byte before it is cut off, in ms (default 60000). */
+  uploadIdleTimeoutMs?: number;
 }
 /** The controller's plain-HTTP listener serving only `GET /v1/auth/whoami` (#83). */
 export const WHOAMI_PORT = 8789;
@@ -137,6 +154,12 @@ export interface TenantAuthInputs {
   tls: { cert: string; key: string };
   /** The shared OAuth client secret, base64 as read from the platform Secret; absent until it exists. */
   clientSecret?: string;
+  /**
+   * Whether the registry front may forward to the registry (W4 of the #83 review): true only when
+   * `di-tenant-registry` is Ready and no other workload claims its host. Otherwise the controller
+   * is rendered without the front listener, so credentials are never sent to the tenant hosts.
+   */
+  registryServing?: boolean;
 }
 const TENANT_AUTH_IMAGE = /^[^@\s]+@sha256:[0-9a-f]{64}$/;
 /** Reject a tenant-auth config that would deploy an unpinned image or miss required fields. */
@@ -154,6 +177,9 @@ export function assertTenantAuthConfig(value: TenantAuthConfig | undefined): voi
     );
   if (value.registry.publicUrl !== undefined && !URL.canParse(value.registry.publicUrl))
     throw new Error('tenantAuth.registry.publicUrl must be a URL');
+  for (const [key, limit] of Object.entries(value.registry.limits ?? {}))
+    if (!Number.isSafeInteger(limit) || (limit as number) < 1)
+      throw new Error(`tenantAuth.registry.limits.${key} must be a positive integer`);
 }
 /** Route-host labels the platform gateway forwards to each tenant's console and controller. */
 export interface TenantAuthRoutes {
@@ -245,6 +271,18 @@ export function registryHttpHost(auth: TenantAuthConfig | undefined): string {
     (auth?.registry?.publicUrl ?? '').toLowerCase(),
   );
   return match && ROUTE_LABEL.test(match[1] as string) ? (match[1] as string) : 'registry';
+}
+/** The controller env for the registry front's bounds; unset limits keep the controller default. */
+function registryLimitsEnv(limits: TenantRegistryLimits | undefined): Record<string, string> {
+  const env: Record<string, string> = {};
+  const set = (name: string, value: number | undefined) => {
+    if (value !== undefined) env[`TENANT_CONTROLLER_REGISTRY_${name}`] = String(value);
+  };
+  set('MAX_BODY_BYTES', limits?.maxBodyBytes);
+  set('UPSTREAM_TIMEOUT_MS', limits?.upstreamTimeoutMs);
+  set('MAX_CONCURRENT', limits?.maxConcurrent);
+  set('UPLOAD_IDLE_TIMEOUT_MS', limits?.uploadIdleTimeoutMs);
+  return env;
 }
 /** The registry origin users log in to, with `{tenant}` replaced. */
 export function tenantRegistryPublicUrl(
@@ -1527,8 +1565,13 @@ function tenantAuthResources(
         ...(registry
           ? {
               TENANT_CONTROLLER_WHOAMI_PORT: String(WHOAMI_PORT),
-              TENANT_CONTROLLER_REGISTRY_FRONT_PORT: String(REGISTRY_FRONT_PORT),
               TENANT_CONTROLLER_REGISTRY_HOST: registryHost,
+              ...registryLimitsEnv(registry.limits),
+            }
+          : {}),
+        ...(registry && inputs.registryServing
+          ? {
+              TENANT_CONTROLLER_REGISTRY_FRONT_PORT: String(REGISTRY_FRONT_PORT),
               TENANT_CONTROLLER_REGISTRY_URL: tenantRegistryPublicUrl(name, auth),
             }
           : {}),

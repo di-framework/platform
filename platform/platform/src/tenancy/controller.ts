@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { request } from 'node:https';
 import { setTimeout } from 'node:timers/promises';
+import { claimsRegistryHost } from './admission';
 import {
   backingServiceResourceName,
   backingServiceResources,
@@ -63,6 +64,7 @@ import {
   REGISTRY_WORKLOAD,
   type Resource,
   ROUTES_CONFIG_NAME,
+  registryHttpHost,
   resource,
   runtimeQuota,
   type ServiceBinding,
@@ -635,15 +637,15 @@ export class Controller {
         return undefined;
       }
       this.tenantAuthClean = false;
-      const desired = tenantAuthResources(
-        tenant,
-        this.cfg,
-        await this.tenantAuthInputs(
+      const registry = await this.registryState(tenant);
+      const desired = tenantAuthResources(tenant, this.cfg, {
+        ...(await this.tenantAuthInputs(
           tenant,
           users ??
             (await this.list<User>(VERSION, 'User', { [INSTALLATION]: this.cfg.installation })),
-        ),
-      );
+        )),
+        registryServing: registry.serving,
+      });
       // Gateway policies for hosts that are no longer routed, pruned before anything is applied
       // so de-routing holds even when a later apply fails.
       const namespace = names(tenant.metadata.name).runtimeNamespace;
@@ -700,6 +702,15 @@ export class Controller {
       }
       const { problems } = tenantAuthRoutes(this.cfg.tenantAuth, this.cfg.routeUrlPattern);
       if (problems.length) return condition(false, 'RouteError', problems.join('; '));
+      if (registry.conflict)
+        return condition(
+          false,
+          'RegistryHostConflict',
+          `WorkloadDeployment ${registry.conflict} claims the tenant registry host ` +
+            `${registryHttpHost(this.cfg.tenantAuth)}; the registry is not served until it is removed`,
+        );
+      // The front opens only on the poll after the registry is Ready.
+      if (this.cfg.tenantAuth.registry && !suspended) ready &&= registry.serving;
       const what = this.cfg.tenantAuth.registry
         ? 'tenant controller, console and registry'
         : 'tenant controller and console';
@@ -721,6 +732,59 @@ export class Controller {
       }
       return condition(false, 'ReconcileError', message);
     }
+  }
+  /**
+   * Whether the registry front may forward (W4 of the #83 review). Admission checks only writes,
+   * so a workload that claimed the registry host before the reservation (or before a
+   * `registry.publicUrl` change) keeps its route, and wash picks randomly among claimants. The
+   * front is therefore enabled only while the controller-owned `di-tenant-registry` is Ready and
+   * no other workload claims its host through `wasi:http` `config.host` or `host-aliases`.
+   * `conflict` names the first claimant.
+   */
+  private async registryState(tenant: Tenant): Promise<{ serving: boolean; conflict?: string }> {
+    if (!this.cfg.tenantAuth?.registry) return { serving: false };
+    const label = registryHttpHost(this.cfg.tenantAuth);
+    const workloads = await this.list<
+      Resource & {
+        spec?: {
+          template?: {
+            spec?: {
+              hostInterfaces?: {
+                namespace?: string;
+                package?: string;
+                config?: Record<string, unknown>;
+              }[];
+            };
+          };
+        };
+        status?: { conditions?: Condition[] };
+      }
+    >(
+      'runtime.wasmcloud.dev/v1alpha1',
+      'WorkloadDeployment',
+      {},
+      names(tenant.metadata.name).namespace,
+    );
+    const owned = (w: Resource) =>
+      w.metadata.name === REGISTRY_WORKLOAD &&
+      w.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+      w.metadata.labels[OWNER] === tenant.metadata.uid;
+    const claims = (w: (typeof workloads)[number]) =>
+      (w.spec?.template?.spec?.hostInterfaces ?? []).some((h) => {
+        if (h.namespace !== 'wasi' || h.package !== 'http') return false;
+        const { host, 'host-aliases': aliases } = h.config ?? {};
+        const hosts = [
+          ...(typeof host === 'string' ? [host] : []),
+          ...(typeof aliases === 'string' ? aliases.split(',') : []),
+        ];
+        return hosts.some((value) => claimsRegistryHost(value.trim(), label));
+      });
+    const conflict = workloads.find((w) => !owned(w) && claims(w))?.metadata.name;
+    const ready = workloads.some(
+      (w) =>
+        owned(w) && !!w.status?.conditions?.some((c) => c.type === 'Ready' && c.status === 'True'),
+    );
+    return { serving: ready && !conflict, conflict };
   }
   /** Whether the tenant-auth Deployments of `tenant` exist, i.e. the quota may stay raised. */
   private async tenantAuthDeployed(tenant: Tenant): Promise<boolean> {

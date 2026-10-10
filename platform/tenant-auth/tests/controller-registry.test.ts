@@ -140,13 +140,37 @@ describe('registry listeners', () => {
 
   test('the registry front relays the registry challenge unchanged', async () => {
     const response = await controller.handleRegistry(
-      new Request('https://registry.acme.localhost/v2/'),
+      new Request('https://registry.acme.localhost/v2/', {
+        headers: { authorization: 'Basic eDpiYWQ=' },
+      }),
     );
     expect(response.status).toBe(401);
     expect(response.headers.get('www-authenticate')).toBe(
       'Basic realm="di-framework-tenant-registry"',
     );
-    expect(hosts.requests.at(-1)!.headers.get('authorization')).toBeNull();
+  });
+
+  test('the registry front answers requests without Basic credentials with the registry challenge (S5)', async () => {
+    const before = hosts.requests.length;
+    for (const init of [
+      {},
+      { headers: { authorization: 'Bearer token' } },
+      { method: 'PUT', body: 'layer-bytes' },
+    ] as RequestInit[]) {
+      const response = await controller.handleRegistry(
+        new Request('https://registry.acme.localhost/v2/app/blobs/uploads/1', init),
+      );
+      expect(response.status).toBe(401);
+      expect(response.headers.get('www-authenticate')).toBe(
+        'Basic realm="di-framework-tenant-registry"',
+      );
+      expect(response.headers.get('docker-distribution-api-version')).toBe('registry/2.0');
+      expect(response.headers.get('content-type')).toBe('application/json');
+      expect(await response.json()).toEqual({
+        errors: [{ code: 'UNAUTHORIZED', message: 'authentication required' }],
+      });
+    }
+    expect(hosts.requests.length).toBe(before);
   });
 
   test('an unreachable registry is a 502 problem', async () => {
@@ -158,7 +182,11 @@ describe('registry listeners', () => {
       {} as never,
     );
     down.proxyUpstream = () => 'http://127.0.0.1:1';
-    const response = await down.handleRegistry(new Request('https://registry.acme.localhost/v2/'));
+    const response = await down.handleRegistry(
+      new Request('https://registry.acme.localhost/v2/', {
+        headers: { authorization: 'Basic eDpvaw==' },
+      }),
+    );
     expect(response.status).toBe(502);
     expect(response.headers.get('content-type')).toBe('application/problem+json');
   });
@@ -171,6 +199,7 @@ describe('registry front limits', () => {
     TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES: '8',
     TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS: '150',
     TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT: '1',
+    TENANT_CONTROLLER_REGISTRY_UPLOAD_IDLE_TIMEOUT_MS: '100',
   });
   const controller = new Controller(
     limited,
@@ -189,6 +218,11 @@ describe('registry front limits', () => {
     async fetch(request) {
       const { pathname } = new URL(request.url);
       signals.set(pathname, request.signal);
+      if (pathname === '/hang-after-body') {
+        await request.text();
+        await hold.promise;
+        return new Response('late');
+      }
       if (pathname === '/hang') {
         await hold.promise;
         return new Response('late');
@@ -226,7 +260,24 @@ describe('registry front limits', () => {
     upstream.stop(true);
   });
   const call = (path: string, init: RequestInit = {}) =>
-    controller.handleRegistry(new Request(`https://registry.acme.localhost${path}`, init));
+    controller.handleRegistry(
+      new Request(`https://registry.acme.localhost${path}`, {
+        ...init,
+        headers: { authorization: 'Basic eDpvaw==', ...(init.headers as Record<string, string>) },
+      }),
+    );
+  /** A body that sends `chunks` pieces `everyMs` apart, then ends (or stalls when `stall`). */
+  const trickle = (chunks: number, everyMs: number, stall = false) =>
+    new ReadableStream<Uint8Array>({
+      async pull(c) {
+        if (chunks-- <= 0) {
+          if (stall) return new Promise<void>(() => {});
+          return c.close();
+        }
+        await Bun.sleep(everyMs);
+        c.enqueue(new TextEncoder().encode('x'));
+      },
+    });
   /** The single slot is free again: a plain request goes through. */
   const free = async () => {
     const response = await call('/v2/');
@@ -238,6 +289,7 @@ describe('registry front limits', () => {
     const defaults = configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme' });
     expect(defaults.registryMaxBodyBytes).toBe(512 * 1024 * 1024);
     expect(defaults.registryUpstreamTimeoutMs).toBe(60_000);
+    expect(defaults.registryUploadIdleTimeoutMs).toBe(60_000);
     expect(defaults.registryMaxConcurrent).toBe(16);
     expect(REGISTRY_IDLE_TIMEOUT_SECONDS).toBeGreaterThan(0);
     expect(REGISTRY_IDLE_TIMEOUT_SECONDS).toBeLessThanOrEqual(255);
@@ -287,6 +339,11 @@ describe('registry front limits', () => {
     const busy = await call('/v2/');
     expect(busy.status).toBe(503);
     expect(busy.headers.get('content-type')).toBe('application/problem+json');
+    // Unauthenticated requests are challenged without a slot, even while none is free (S5).
+    const anonymous = await controller.handleRegistry(
+      new Request('https://registry.acme.localhost/v2/'),
+    );
+    expect(anonymous.status).toBe(401);
     client.abort();
     expect((await pending).status).toBe(502);
     await Bun.sleep(20);
@@ -317,6 +374,42 @@ describe('registry front limits', () => {
   test('a response without a body frees the slot at once', async () => {
     const response = await call('/v2/', { method: 'HEAD' });
     expect(response.status).toBe(200);
+    await free();
+  });
+
+  test('a steady upload longer than the header timeout succeeds (W5)', async () => {
+    // 8 bytes, 50 ms apart: 400 ms in all, well past the 150 ms header timeout.
+    const response = await call('/v2/app/blobs/uploads/1', {
+      method: 'PUT',
+      body: trickle(8, 50),
+      duplex: 'half',
+    } as RequestInit);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('ok xxxxxxxx');
+    await free();
+  });
+
+  test('a stalled upload is cut off with 408 and frees the slot (W5)', async () => {
+    const response = await call('/v2/app/blobs/uploads/1', {
+      method: 'PUT',
+      body: trickle(1, 10, true),
+      duplex: 'half',
+    } as RequestInit);
+    expect(response.status).toBe(408);
+    expect(response.headers.get('content-type')).toBe('application/problem+json');
+    expect(await response.text()).not.toContain('127.0.0.1');
+    await free();
+  });
+
+  test('the header timeout starts once the body is sent, then answers 504 (W5)', async () => {
+    hold = Promise.withResolvers<void>();
+    const response = await call('/hang-after-body', {
+      method: 'PUT',
+      body: trickle(4, 50),
+      duplex: 'half',
+    } as RequestInit);
+    expect(response.status).toBe(504);
+    hold.resolve();
     await free();
   });
 });

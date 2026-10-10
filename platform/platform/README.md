@@ -490,6 +490,11 @@ tenantAuth:
   registry:                                                  # optional: each tenant's own OCI registry (#83)
     component: ghcr.io/di-framework/oci-registry@sha256:<digest>  # required, pinned by digest
     publicUrl: https://registry.{tenant}.localhost:28180     # optional; default https://127.0.0.1:8790
+    limits:                                                  # optional; each field optional, defaults shown
+      maxBodyBytes: 536870912                                # TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES
+      upstreamTimeoutMs: 60000                               # TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS
+      maxConcurrent: 16                                      # TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT
+      uploadIdleTimeoutMs: 60000                             # TENANT_CONTROLLER_REGISTRY_UPLOAD_IDLE_TIMEOUT_MS
 ```
 
 - Placement and quota: both run in `di-runtime-<tenant>`, next to the `di-http` Service the
@@ -565,6 +570,14 @@ tenantAuth:
     and reserved even while no registry is configured. Other deletes by tenant users and every
     request of the platform controller pass. `/v1/deploy` also refuses a `<service>-<env>` equal
     to the registry host with `422`.
+    Admission checks only writes, so a workload that already claimed the host (created before
+    the policy, or before a `registry.publicUrl` change moved the registry to its host) would
+    keep its route, and wash picks randomly among claimants. Each reconcile therefore lists the
+    tenant's WorkloadDeployments; while any workload other than the platform's
+    `di-tenant-registry` claims the host through `wasi:http` `config.host` or `host-aliases`
+    (in any case), the registry is not served and `TenantAuthReady` is `False` with reason
+    `RegistryHostConflict`, naming the workload. Deleting it clears the conflict on the next
+    poll.
   - TLS and routing: users reach the registry at `publicUrl` through the controller's registry
     front (`8790`), a TLS listener with the controller certificate (which also names the
     registry's public host) that forwards every request to `di-http` with `Host: <label>`.
@@ -581,14 +594,26 @@ tenantAuth:
     The default `publicUrl` needs `pods/portforward` in `di-runtime-<tenant>`, which only
     `di-runtime-developer` has, so viewers cannot pull through it; with a published gateway, use
     the routed `https://registry.{tenant}.localhost:<gateway port>` instead.
-  - Limits: the front is reachable without credentials (the component authenticates), so it
-    allows 16 requests at once (`503` beyond; `TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT`),
-    bodies up to 512 MiB (`413`; `TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES`), 60 s for the
-    registry's response headers (`504`; `TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS`) and a
-    120 s socket idle timeout that data flow resets. A client that disconnects aborts the
-    upstream request. Error answers carry no upstream detail.
+  - Front enablement: the controller is rendered with the registry front
+    (`TENANT_CONTROLLER_REGISTRY_FRONT_PORT`) and `TENANT_CONTROLLER_REGISTRY_URL` only while
+    `di-tenant-registry` is `Ready` and there is no host conflict, so the front never forwards
+    credentials to a host that is not serving the registry. Enabling or closing it rolls the
+    controller pod; `TenantAuthReady` stays `Provisioning` until the front is open.
+  - Limits: the front is reachable without credentials (the component authenticates). A request
+    without Basic credentials gets the registry's own challenge (`401`,
+    `WWW-Authenticate: Basic realm="di-framework-tenant-registry"`) from the front, so
+    `docker login` and `oras login` work and such requests take no slot. Otherwise it allows 16
+    requests at once (`503` beyond), bodies up to 512 MiB (`413`), an upload that delivers no
+    byte for 60 s is cut off (`408`), and once the body is forwarded in full the registry has
+    60 s for its response headers (`504`); a steady upload of any length succeeds. A 120 s
+    socket idle timeout that data flow resets also applies. Tune them with
+    `tenantAuth.registry.limits` (rendered as the `TENANT_CONTROLLER_REGISTRY_*` env above; a
+    hand edit of the Deployment is reverted). There is no per-client limit: the front sees the
+    gateway as the peer of every routed connection, so a per-IP cap would be a global one. An
+    authenticating client can still hold slots up to these bounds. A client that disconnects
+    aborts the upstream request. Error answers carry no upstream detail.
   - `TENANT_CONTROLLER_REGISTRY_URL` on the controller is `publicUrl` with `{tenant}` replaced,
-    so `GET /v1/deploy/registry` returns it. Policy `tenant-registry-gateway` admits only the
+    so `GET /v1/deploy/registry` returns it while the registry is served. Policy `tenant-registry-gateway` admits only the
     gateway to `8790`, and the gateway's egress gains that port.
   - Quota: the registry adds one WorkloadDeployment to `di-tenant-quota`, raised in the
     tenant-auth step right before the registry is applied and kept only while it exists, so the

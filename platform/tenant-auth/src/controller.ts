@@ -67,11 +67,17 @@ export interface ControllerConfig {
    */
   registryMaxBodyBytes: number;
   /**
-   * How long the registry front waits for the registry's response headers
-   * (`TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS`, default 60 s); then it answers 504.
-   * Streaming bodies are bounded by the listener's idle timeout instead.
+   * How long the registry front waits for the registry's response headers once the request body
+   * has been forwarded in full (`TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS`, default 60 s);
+   * then it answers 504. Response bodies are bounded by the listener's idle timeout.
    */
   registryUpstreamTimeoutMs: number;
+  /**
+   * How long an upload may go without delivering a byte while the front waits for one
+   * (`TENANT_CONTROLLER_REGISTRY_UPLOAD_IDLE_TIMEOUT_MS`, default 60 s); then the upload is cut
+   * off with 408. A steady upload of any length succeeds; a stalled one cannot hold a slot.
+   */
+  registryUploadIdleTimeoutMs: number;
   /**
    * Registry requests in flight at once (`TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT`, default
    * 16); more are answered 503, so the front never starves the tenant API in the same process.
@@ -171,6 +177,51 @@ function releasing(
   });
 }
 
+/**
+ * Relays an upload and reports how it ends: `stalled` when no byte arrived for `idleMs` while one
+ * was wanted (the read is cancelled), `done` once the body has been read in full.
+ */
+function watchingUpload(
+  body: ReadableStream<Uint8Array>,
+  idleMs: number,
+  on: { stalled: () => void; done: () => void },
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const timer = setTimeout(() => {
+        on.stalled();
+        reader.cancel().catch(() => {});
+      }, idleMs);
+      try {
+        const { done, value } = await reader.read();
+        if (!done) return controller.enqueue(value);
+        on.done();
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+}
+
+/** The registry's own challenge (`platform/oci-registry` `auth::challenge`), answered at the front. */
+function registryChallenge(): Response {
+  return new Response('{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}', {
+    status: 401,
+    headers: {
+      'www-authenticate': 'Basic realm="di-framework-tenant-registry"',
+      'content-type': 'application/json',
+      'docker-distribution-api-version': 'registry/2.0',
+    },
+  });
+}
+
 /** Headers never relayed back from the registry: hop-by-hop. */
 const HOP_BY_HOP_RESPONSE = new Set(['connection', 'keep-alive', 'transfer-encoding']);
 
@@ -208,6 +259,11 @@ export function configFromEnv(env = process.env): ControllerConfig {
     registryUpstreamTimeoutMs: positiveInteger(
       env.TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS,
       'TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS',
+      60_000,
+    ),
+    registryUploadIdleTimeoutMs: positiveInteger(
+      env.TENANT_CONTROLLER_REGISTRY_UPLOAD_IDLE_TIMEOUT_MS,
+      'TENANT_CONTROLLER_REGISTRY_UPLOAD_IDLE_TIMEOUT_MS',
       60_000,
     ),
     registryMaxConcurrent: positiveInteger(
@@ -458,9 +514,12 @@ export class Controller {
    *
    * It is reachable without credentials, so it is bounded: at most `registryMaxConcurrent`
    * requests at once (503 beyond), bodies up to `registryMaxBodyBytes` (413 beyond; the listener
-   * enforces the same cap on chunked bodies), and `registryUpstreamTimeoutMs` for the registry's
-   * response headers (504). A client that goes away aborts the upstream request, and a failed
-   * upstream ends the client response. Error answers never carry upstream details.
+   * enforces the same cap on chunked bodies), an upload that delivers nothing for
+   * `registryUploadIdleTimeoutMs` is cut off (408), and once the body is forwarded in full the
+   * registry has `registryUpstreamTimeoutMs` for its response headers (504). A request without
+   * Basic credentials gets the registry's own challenge here and takes no slot, since the
+   * registry would challenge it anyway. A client that goes away aborts the upstream request, and
+   * a failed upstream ends the client response. Error answers never carry upstream details.
    */
   async handleRegistry(
     request: Request,
@@ -478,6 +537,11 @@ export class Controller {
         'Content Too Large',
         `request bodies are limited to ${this.config.registryMaxBodyBytes} bytes`,
       );
+    const authorization = request.headers.get('authorization');
+    if (!/^basic /i.test(authorization ?? '')) {
+      await request.body?.cancel().catch(() => {});
+      return registryChallenge();
+    }
     if (this.registryInFlight >= this.config.registryMaxConcurrent)
       return problem(503, 'Service Unavailable', 'the tenant registry is busy; retry shortly');
     this.registryInFlight++;
@@ -493,12 +557,23 @@ export class Controller {
       this.config.registryHost,
       server?.requestIP(request)?.address,
     );
-    const authorization = request.headers.get('authorization');
-    if (authorization) headers.set('authorization', authorization);
+    headers.set('authorization', authorization as string);
     if (length) headers.set('content-length', length);
-    // The upstream request ends with the client's, or when the headers take too long.
+    // The upstream request ends with the client's, when the upload stalls, or when the headers
+    // take too long once the body has been sent (W5 of the platform#83 review).
     const timeout = new AbortController();
-    const timer = setTimeout(() => timeout.abort(), this.config.registryUpstreamTimeoutMs);
+    const stall = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const armHeaderTimer = () => {
+      timer = setTimeout(() => timeout.abort(), this.config.registryUpstreamTimeoutMs);
+    };
+    const body = request.body
+      ? watchingUpload(request.body, this.config.registryUploadIdleTimeoutMs, {
+          stalled: () => stall.abort(),
+          done: armHeaderTimer,
+        })
+      : null;
+    if (!body) armHeaderTimer();
     let upstream: Response;
     try {
       upstream = await fetch(
@@ -506,21 +581,23 @@ export class Controller {
         {
           method: request.method,
           headers,
-          body: request.body,
+          body,
           duplex: 'half',
           redirect: 'manual',
           decompress: false,
-          signal: AbortSignal.any([request.signal, timeout.signal]),
+          signal: AbortSignal.any([request.signal, timeout.signal, stall.signal]),
         } as RequestInit,
       );
     } catch (error) {
       release();
       const timedOut = timeout.signal.aborted;
+      const stalled = stall.signal.aborted;
       this.audit('request.failed', {
         path: url.pathname,
         listener: 'registry',
-        reason: timedOut ? 'upstream timeout' : String(error),
+        reason: stalled ? 'upload stalled' : timedOut ? 'upstream timeout' : String(error),
       });
+      if (stalled) return problem(408, 'Request Timeout', 'the request body stopped arriving');
       return timedOut
         ? problem(504, 'Gateway Timeout', 'the tenant registry did not answer in time')
         : problem(502, 'Bad Gateway', 'the tenant registry could not be reached');
