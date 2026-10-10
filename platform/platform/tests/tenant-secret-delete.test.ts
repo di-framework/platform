@@ -1,24 +1,9 @@
 import { describe, expect, it } from 'bun:test';
 import { evaluate } from '@marcbachmann/cel-js';
-import { admissionResources, tenantSecretDeleteAllowed } from '../src/tenancy/admission';
+import { tenantSecretDeleteAllowed } from '../src/tenancy/admission';
+import { controller, developer, loadPolicy, tenantController } from './support/cel-policy';
 
-const developer = 'system:serviceaccount:wasmcloud:di-user-dev';
-const controller = 'system:serviceaccount:wasmcloud:di-platform-controller';
-const tenantController = 'system:serviceaccount:di-runtime-acme:tenant-controller';
-
-const resources = admissionResources('test', 'wasmcloud');
-const policy = resources.find(
-  (r) => r.kind === 'ValidatingAdmissionPolicy' && r.metadata.name === 'test-tenant-secret-delete',
-);
-const binding = resources.find(
-  (r) =>
-    r.kind === 'ValidatingAdmissionPolicyBinding' &&
-    r.metadata.name === 'test-tenant-secret-delete',
-);
-const spec = policy?.spec as {
-  matchConstraints: { resourceRules: { operations: string[]; resources: string[] }[] };
-  validations: { expression: string }[];
-};
+const { spec, binding } = loadPolicy('tenant-secret-delete');
 
 interface Case {
   username: string;
