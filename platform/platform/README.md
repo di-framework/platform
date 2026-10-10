@@ -646,9 +646,14 @@ tenantAuth:
       pull-only listener (`TENANT_CONTROLLER_REGISTRY_PULL_PORT=8791`), which is the registry front
       restricted to `GET`/`HEAD` (`405` otherwise), so nothing can be pushed or deleted through it.
       It forwards to `di-http` with `Host: <registry label>` like the front, and is open only while
-      the front is (same suspension and `RegistryHostConflict` gate). `tenant-auth-network` admits
-      only the tenant's host pods to `8791`; the hosts already reach the runtime namespace through
-      `di-tenant-network`, so pulls never leave the tenant's namespaces.
+      the front is (same suspension and `RegistryHostConflict` gate). It has its own concurrency
+      pool (the front's `registryMaxConcurrent` slots are not shared) and never forwards a request
+      body (capped at 1 KiB by the listener). `tenant-auth-network` admits only the tenant's host
+      pods to `8789` and `8791`; the hosts already reach the runtime namespace through
+      `di-tenant-network`, so pulls never leave the tenant's namespaces. NetworkPolicy does not
+      apply to `kubectl port-forward`: `di-runtime-developer` grants `pods/portforward`, so a
+      developer can reach `8789` and `8791` directly. That yields nothing without a credential:
+      the registry still authorizes every request through whoami, and no file is served.
     - Credential: Secret `di-tenant-registry-pull` in `di-runtime-<tenant>` holds a random
       32-byte token (`token`) and a Docker config for `tenant-registry.di-runtime-<tenant>.svc`
       (`config.json`, Basic `tenant-host:<token>`). The platform controller generates it and keeps
@@ -657,8 +662,11 @@ tenantAuth:
       next to its certificate and reads it on every call. A rotation therefore needs no restart
       beyond the kubelet's Secret sync and the registry's short positive whoami cache. The
       controller's whoami listener, and only it (the main listener never does), answers
-      `Bearer <token>` as `{user: system:tenant-host, role: viewer, via: host-pull}`, so the
-      registry allows pulls only. It is not a user's identity token, and tenant users cannot
+      `Bearer <token>` as `{user: system:tenant-host, role: viewer, via: host-pull}`, and the
+      registry (`role_from_body`) caps `via: host-pull` at viewer whatever role is claimed, so the
+      credential allows pulls only. The public registry front (`8790`) refuses the token as a Basic
+      password with the registry's `401` challenge, without forwarding, so it works only through
+      the pull listener. It is not a user's identity token, and tenant users cannot
       read it: `di-runtime-*` roles grant no Secret access and no `pods/exec`, the host pod spec
       holds only a Secret volume reference, and Wasm guests see no host files outside their
       preopened storage.
@@ -671,9 +679,15 @@ tenantAuth:
       every wash pull plain HTTP, the local install's default) the listener is plain HTTP
       (`TENANT_CONTROLLER_REGISTRY_PULL_TLS=false`) on Service port 80, and no CA is mounted; the
       host credential then crosses the pod network in clear, as the whoami callback does.
-    - Rollout: the hosts are wired (env, volumes, CA) only once the registry WorkloadDeployment,
-      the pull Secret and (over TLS) the CA exist, so a host never starts without its files; that
-      first wiring, and unsetting the registry, each roll the hosts once. Unsetting
+    - Rollout: the hosts are wired (env, volumes, CA) from desired state: while
+      `tenantAuth.registry` is set, the registry WorkloadDeployment exists and the tenant is not
+      suspended, whether or not the pull Secret exists at that moment. The Secret volume is
+      optional, so a host started mid-rotation pulls anonymously until the kubelet syncs it, and
+      deleting the Secret to rotate the token leaves the host template unchanged. Over TLS the
+      template keeps the last known CA digest while `tenant-controller-ca` is missing, so only a
+      different CA rolls the hosts. The first wiring, a CA renewal, and unsetting the registry
+      each roll the hosts once. A failed lookup of that wiring is reported on `TenantAuthReady`
+      (`HostPullError`) and leaves the hosts as they were. Unsetting
       `tenantAuth.registry` also deletes the pull Secret and Service.
     - Alternative not taken: anonymous pull restricted by NetworkPolicy to the tenant's host pods.
       The registry authorizes every request through whoami, so it would need an

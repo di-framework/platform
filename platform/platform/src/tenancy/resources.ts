@@ -202,9 +202,9 @@ export interface TenantAuthInputs {
   hostPullToken?: string;
 }
 /**
- * How the tenant hosts pull from their registry (#83 `:host-pull`), rendered only once the
- * registry and its pull Secret exist: wash reads the Docker config from that Secret, and over TLS
- * trusts the tenant CA (`caDigest`, the digest of `tenant-controller-ca`, which rolls the hosts
+ * How the tenant hosts pull from their registry (#83 `:host-pull`), rendered once the registry
+ * is deployed, whether or not its pull Secret exists yet: wash reads the Docker config from that
+ * Secret, and over TLS trusts the tenant CA (`caDigest`, the digest of `tenant-controller-ca`, which rolls the hosts
  * when the certificate is renewed, since wash loads `--oci-ca-path` once at start).
  */
 export interface HostPull {
@@ -398,6 +398,8 @@ const GATEWAY_POD_LABELS = { app: GATEWAY_NAME };
 const ROUTES_CONFIG_NAME = 'di-platform-routes';
 const GROUP = 'platform.di-framework.dev';
 const VERSION = `${GROUP}/v1alpha1`;
+/** The host template annotation carrying the digest of the tenant CA the hosts trust. */
+export const REGISTRY_CA_ANNOTATION = `${GROUP}/registry-ca-sha256`;
 const INSTALLATION = `${GROUP}/installation`;
 const OWNER = `${GROUP}/owner-uid`;
 const TENANT = `${GROUP}/tenant`;
@@ -817,7 +819,7 @@ function tenantResources(
         spec: {
           // Broad tenant↔runtime allow for non-backend pods. Backends use di-bs-backend-network;
           // the tenant controller and console use tenant-auth-network, which admits the tenant
-          // hosts only to the controller's whoami listener (#83).
+          // hosts only to the controller's whoami (8789) and registry pull (8791) listeners (#83).
           podSelector: {
             matchExpressions: [
               {
@@ -1027,7 +1029,7 @@ function tenantResources(
             metadata: {
               labels: { 'wasmcloud.com/hostgroup': n.hostgroup, 'wasmcloud.com/name': 'hostgroup' },
               ...(hostPull?.caDigest
-                ? { annotations: { [`${GROUP}/registry-ca-sha256`]: hostPull.caDigest } }
+                ? { annotations: { [REGISTRY_CA_ANNOTATION]: hostPull.caDigest } }
                 : {}),
             },
             spec: {
@@ -1587,7 +1589,8 @@ function tenantAuthResources(
   );
   // The pair is left out of di-tenant-network, so this is all the traffic it is part of beyond
   // the gateway policies below: the same egress as the tenant's other pods, the console's calls
-  // to the controller, and (with a registry) the tenant hosts' calls to the whoami listener only.
+  // to the controller, and (with a registry) the tenant hosts' calls to the whoami (8789) and
+  // registry pull (8791) listeners only.
   result.push(
     make('networking.k8s.io/v1', 'NetworkPolicy', 'tenant-auth-network', namespace, {
       spec: {

@@ -1,0 +1,7 @@
+{
+  "user": "system:tenant-host",
+  "account": "acme",
+  "role": "viewer",
+  "via": "host-pull",
+  "credentialId": "host-pull"
+}

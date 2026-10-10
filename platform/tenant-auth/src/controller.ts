@@ -111,6 +111,12 @@ export interface ControllerConfig {
 
 /** Idle timeout of the registry front's client sockets; any data flow resets it (Bun's max is 255). */
 export const REGISTRY_IDLE_TIMEOUT_SECONDS = 120;
+
+/**
+ * The body cap on the hosts' pull listener (S2 of the platform#83 `:host-pull` review): it serves
+ * GET and HEAD only and never forwards a body, so anything larger is refused by the listener.
+ */
+export const REGISTRY_PULL_MAX_BODY_BYTES = 1024;
 const DEFAULT_REGISTRY_MAX_BODY_BYTES = 512 * 1024 * 1024;
 
 function positiveInteger(value: string | undefined, name: string, fallback: number): number {
@@ -558,14 +564,36 @@ export class Controller {
    * once; a missing or empty file accepts nothing.
    */
   private isHostPullToken(authorization: string | null): boolean {
-    if (!this.config.hostPullTokenFile || !authorization?.startsWith('Bearer ')) return false;
+    if (!authorization?.startsWith('Bearer ')) return false;
+    return this.matchesHostPullToken(authorization.slice(7).trim());
+  }
+
+  /**
+   * Whether `authorization` is Basic credentials whose password is the host pull token (W2 of the
+   * platform#83 `:host-pull` review). The public registry front refuses those, so the host
+   * credential works only through the hosts' pull listener.
+   */
+  private isHostPullBasic(authorization: string): boolean {
+    let decoded: string;
+    try {
+      decoded = atob(authorization.slice(6).trim());
+    } catch {
+      return false;
+    }
+    const colon = decoded.indexOf(':');
+    return colon >= 0 && this.matchesHostPullToken(decoded.slice(colon + 1).trim());
+  }
+
+  /** Constant-time comparison against the current token file; a missing or empty file matches nothing. */
+  private matchesHostPullToken(candidate: string): boolean {
+    if (!this.config.hostPullTokenFile) return false;
     let expected: Buffer;
     try {
       expected = Buffer.from(readFileSync(this.config.hostPullTokenFile, 'utf8').trim());
     } catch {
       return false;
     }
-    const presented = Buffer.from(authorization.slice(7).trim());
+    const presented = Buffer.from(candidate);
     return (
       expected.length > 0 &&
       presented.length === expected.length &&
@@ -587,7 +615,9 @@ export class Controller {
       response.headers.set('allow', 'GET, HEAD');
       return response;
     }
-    return this.handleRegistry(request, server);
+    // A pull never carries a body (S2): whatever arrives (the listener caps it) is dropped.
+    await request.body?.cancel().catch(() => {});
+    return this.forwardRegistry(request, server, this.pullPool, false);
   }
 
   /**
@@ -608,6 +638,33 @@ export class Controller {
     request: Request,
     server?: { requestIP(request: Request): { address: string } | null },
   ): Promise<Response> {
+    // The host pull token is for the hosts' pull listener only (W2): refused here, unforwarded.
+    const authorization = request.headers.get('authorization');
+    if (/^basic /i.test(authorization ?? '') && this.isHostPullBasic(authorization as string)) {
+      await request.body?.cancel().catch(() => {});
+      this.audit('request.denied', {
+        method: request.method,
+        path: new URL(request.url).pathname,
+        listener: 'registry',
+        status: 401,
+        reason: 'the host pull credential is not accepted on the public registry front',
+      });
+      return registryChallenge();
+    }
+    return this.forwardRegistry(request, server, this.frontPool, true);
+  }
+
+  /**
+   * Forwards one registry request upstream, holding a slot of `pool` while it is in flight. The
+   * front and the hosts' pull listener have separate pools (S1), so public traffic cannot starve
+   * host pulls. `withBody` is false for the pull listener, which never forwards a body (S2).
+   */
+  private async forwardRegistry(
+    request: Request,
+    server: { requestIP(request: Request): { address: string } | null } | undefined,
+    pool: { inFlight: number },
+    withBody: boolean,
+  ): Promise<Response> {
     const url = new URL(request.url);
     const length = request.headers.get('content-length');
     // A length that is not a number counts as too large.
@@ -625,14 +682,14 @@ export class Controller {
       await request.body?.cancel().catch(() => {});
       return registryChallenge();
     }
-    if (this.registryInFlight >= this.config.registryMaxConcurrent)
+    if (pool.inFlight >= this.config.registryMaxConcurrent)
       return problem(503, 'Service Unavailable', 'the tenant registry is busy; retry shortly');
-    this.registryInFlight++;
+    pool.inFlight++;
     let released = false;
     const release = () => {
       if (released) return;
       released = true;
-      this.registryInFlight--;
+      pool.inFlight--;
     };
     const headers = upstreamRequestHeaders(
       request,
@@ -641,7 +698,7 @@ export class Controller {
       server?.requestIP(request)?.address,
     );
     headers.set('authorization', authorization as string);
-    if (length) headers.set('content-length', length);
+    if (length && withBody) headers.set('content-length', length);
     // The upstream request ends with the client's, when the upload stalls, or when the headers
     // take too long once the body has been sent (W5 of the platform#83 review).
     const timeout = new AbortController();
@@ -653,12 +710,13 @@ export class Controller {
       if (answered) return;
       timer = setTimeout(() => timeout.abort(), this.config.registryUpstreamTimeoutMs);
     };
-    const body = request.body
-      ? watchingUpload(request.body, this.config.registryUploadIdleTimeoutMs, {
-          stalled: () => stall.abort(),
-          done: armHeaderTimer,
-        })
-      : null;
+    const body =
+      withBody && request.body
+        ? watchingUpload(request.body, this.config.registryUploadIdleTimeoutMs, {
+            stalled: () => stall.abort(),
+            done: armHeaderTimer,
+          })
+        : null;
     if (!body) armHeaderTimer();
     let upstream: Response;
     try {
@@ -702,7 +760,9 @@ export class Controller {
   }
 
   /** Registry front requests in flight (see {@link handleRegistry}). */
-  private registryInFlight = 0;
+  private readonly frontPool = { inFlight: 0 };
+  /** Host pull listener requests in flight (see {@link handleRegistryPull}); separate from the front's (S1). */
+  private readonly pullPool = { inFlight: 0 };
 
   // The controller's own API: identity, API keys, members.
 
@@ -859,6 +919,7 @@ if (import.meta.main) {
       port: config.registryPullPort,
       tls: config.registryPullTls ? tls : undefined,
       idleTimeout: REGISTRY_IDLE_TIMEOUT_SECONDS,
+      maxRequestBodySize: REGISTRY_PULL_MAX_BODY_BYTES,
       fetch: (request, server) => controller.handleRegistryPull(request, server),
     });
   controller.audit('controller.started', {

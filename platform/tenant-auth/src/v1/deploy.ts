@@ -955,13 +955,19 @@ async function checked(
  */
 function publicRegistryImage(bundle: DeployBundle, context: V1Context): string | undefined {
   if (!context.registryUrl || !context.registryPullHost) return undefined;
-  const publicHost = new URL(context.registryUrl).host.toLowerCase();
+  const publicUrl = new URL(context.registryUrl);
+  // `URL.host` drops a default port, so its explicit spelling is checked too (S3 of the review).
+  const publicHosts = [publicUrl.host.toLowerCase()];
+  if (!publicUrl.port)
+    publicHosts.push(`${publicUrl.hostname}:${publicUrl.protocol === 'http:' ? 80 : 443}`);
   const template = (bundle.workload.spec as { template: { spec: Record<string, unknown> } })
     .template.spec;
   const guests = [...(template.components as Record<string, unknown>[]), template.service];
   for (const guest of guests) {
     const image = (guest as { image?: unknown } | undefined)?.image;
-    if (typeof image !== 'string' || !image.toLowerCase().startsWith(`${publicHost}/`)) continue;
+    if (typeof image !== 'string') continue;
+    const publicHost = publicHosts.find((host) => image.toLowerCase().startsWith(`${host}/`));
+    if (!publicHost) continue;
     const repository = image.slice(publicHost.length + 1);
     return (
       `${image} names the tenant registry's public origin, which hosts cannot pull from; ` +

@@ -841,6 +841,42 @@ describe('/v1/deploy', () => {
   });
 
   test.each([
+    ['https://registry.acme.example', 'registry.acme.example:443', 'REGISTRY.Acme.example:443'],
+    ['http://registry.acme.svc', 'registry.acme.svc:80', 'Registry.ACME.svc:80'],
+  ])('also catches the explicit default port of %s, in any case (S3)', async (url, port, mixed) => {
+    const pulling = new Controller(
+      configFromEnv({
+        TENANT_CONTROLLER_TENANT: 'acme',
+        TENANT_CONTROLLER_REGISTRY_HOST: 'registry',
+        TENANT_CONTROLLER_REGISTRY_URL: url,
+        TENANT_CONTROLLER_REGISTRY_PULL_HOST: 'tenant-registry.di-runtime-acme.svc',
+      }),
+      kube,
+      { issuer: 'https://issuer.test' } as never,
+      { resolve: async () => alice, forget: () => {} } as never,
+      { kube, namespace: 'di-runtime-acme', tenant: 'acme' },
+    );
+    const digest = deployBundle().component.digest;
+    for (const host of [new URL(url).host, port, mixed]) {
+      const bundle = deployBundle();
+      const spec = (bundle.workload as { spec: { template: { spec: Record<string, unknown> } } })
+        .spec.template.spec;
+      (spec.components as { image: string }[])[0]!.image = `${host}/web@${digest}`;
+      const response = await pulling.handle(
+        new Request('http://controller.test/v1/deploy/preview', {
+          method: 'POST',
+          headers: { authorization: 'Bearer ok', 'content-type': 'application/json' },
+          body: JSON.stringify(bundle),
+        }),
+      );
+      expect(response.status).toBe(422);
+      expect((await response.json()).detail).toContain(
+        `reference tenant-registry.di-runtime-acme.svc/web@${digest} in the workload`,
+      );
+    }
+  });
+
+  test.each([
     [403, 'workloaddeployments is forbidden', 'Forbidden'],
     [409, 'Apply failed with 1 conflict', 'Conflict'],
     [422, 'denied by ValidatingAdmissionPolicy', 'Unprocessable Entity'],

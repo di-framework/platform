@@ -1,8 +1,13 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Controller, configFromEnv, HOST_PULL_USER } from '../src/controller.ts';
+import {
+  Controller,
+  configFromEnv,
+  HOST_PULL_USER,
+  REGISTRY_PULL_MAX_BODY_BYTES,
+} from '../src/controller.ts';
 import { AuthError } from '../src/identity.ts';
 import { serve } from './support/servers.ts';
 
@@ -85,13 +90,16 @@ describe('host pull', () => {
     const before = resolved.length;
     const response = await whoami(controller, `Bearer ${TOKEN}`);
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({
-      user: HOST_PULL_USER,
-      account: 'acme',
-      role: 'viewer',
-      via: 'host-pull',
-      credentialId: 'host-pull',
-    });
+    // The contract with the registry (C1 of the :host-pull review): the same fixture is parsed by
+    // `role_from_body` in platform/oci-registry/src/controller.rs, so the two sides cannot drift.
+    const fixture = JSON.parse(
+      readFileSync(
+        join(import.meta.dir, '../../oci-registry/fixtures/whoami-host-pull.json'),
+        'utf8',
+      ),
+    );
+    expect(fixture.user).toBe(HOST_PULL_USER);
+    expect(await response.json()).toEqual(fixture);
     // Never handed to the identity resolver.
     expect(resolved.length).toBe(before);
   });
@@ -162,6 +170,84 @@ describe('host pull', () => {
         )
       ).text(),
     ).toBe('pulled GET /v2/app/manifests/1.0');
+  });
+
+  const front = (target: Controller, authorization: string, init: RequestInit = {}) =>
+    target.handleRegistry(
+      new Request('https://registry.acme.example/v2/app/manifests/1.0', {
+        ...init,
+        headers: { authorization },
+      }),
+    );
+
+  test('the public registry front refuses the host token as a Basic password, unforwarded', async () => {
+    const before = hosts.requests.length;
+    for (const authorization of [
+      `Basic ${btoa(`tenant-host:${TOKEN}`)}`,
+      `basic ${btoa(`anyone:${TOKEN}`)}`,
+      `Basic ${btoa(`:${TOKEN}`)}`,
+    ]) {
+      const response = await front(controller, authorization);
+      expect(response.status).toBe(401);
+      expect(response.headers.get('www-authenticate')).toBe(
+        'Basic realm="di-framework-tenant-registry"',
+      );
+    }
+    const upload = await front(controller, `Basic ${btoa(`x:${TOKEN}`)}`, {
+      method: 'PUT',
+      body: 'layer',
+    });
+    expect(upload.status).toBe(401);
+    expect(hosts.requests.length).toBe(before);
+    // Other Basic credentials, malformed ones included, still reach the registry.
+    for (const authorization of [
+      `Basic ${btoa(`x:${TOKEN}x`)}`,
+      `Basic ${btoa(TOKEN)}`,
+      'Basic %%%not-base64',
+      'Basic eDpvaw==',
+    ]) {
+      expect((await front(controller, authorization)).status).toBe(200);
+    }
+    expect(hosts.requests.length).toBe(before + 4);
+    // With no token file configured, nothing is refused for being the host token.
+    const unset = make({ TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE: undefined });
+    unset.proxyUpstream = () => hosts.url;
+    expect((await front(unset, `Basic ${btoa(`x:${TOKEN}`)}`)).status).toBe(200);
+  });
+
+  test('the front refuses a rotated host token at once, and the old one is an ordinary credential', async () => {
+    const rotated = 'q'.repeat(43);
+    writeFileSync(tokenFile, rotated);
+    try {
+      expect((await front(controller, `Basic ${btoa(`x:${rotated}`)}`)).status).toBe(401);
+      expect((await front(controller, `Basic ${btoa(`x:${TOKEN}`)}`)).status).toBe(200);
+      // The pull listener still forwards the rotated token.
+      const pull = await controller.handleRegistryPull(
+        new Request('https://tenant-registry.di-runtime-acme.svc/v2/', {
+          headers: { authorization: `Basic ${btoa(`tenant-host:${rotated}`)}` },
+        }),
+      );
+      expect(pull.status).toBe(200);
+    } finally {
+      writeFileSync(tokenFile, TOKEN);
+    }
+  });
+
+  test('the pull listener never forwards a request body, and caps it small', async () => {
+    expect(REGISTRY_PULL_MAX_BODY_BYTES).toBeLessThanOrEqual(4096);
+    const response = await controller.handleRegistryPull(
+      new Request('https://tenant-registry.di-runtime-acme.svc/v2/app/manifests/1.0', {
+        method: 'GET',
+        headers: { authorization: 'Basic eDpvaw==', 'content-length': '4' },
+        // A GET with a body is unusual but possible on the wire; Request allows it via duplex.
+        body: 'junk',
+        duplex: 'half',
+      } as RequestInit),
+    );
+    expect(response.status).toBe(200);
+    const seen = hosts.requests.at(-1)!;
+    expect(seen.headers.get('content-length')).not.toBe('4');
+    expect(seen.body ?? '').toBe('');
   });
 
   test('the pull listener refuses every write, whatever the credential', async () => {

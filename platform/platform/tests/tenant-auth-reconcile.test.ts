@@ -2273,7 +2273,7 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     expect(auths.filter((r) => JSON.stringify(r).includes(TOKEN))).toEqual([]);
   });
 
-  it('wires the hosts once the registry, its pull Secret and the tenant CA exist', async () => {
+  it('wires the hosts once the registry and the tenant CA exist, and rotation leaves them alone', async () => {
     const { api, t } = prepare();
     const controller = new Controller(api, tlsCfg);
     await controller.reconcileTenant(t, []);
@@ -2288,45 +2288,116 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     expect(host(api).spec.template.metadata.annotations).toEqual({
       'platform.di-framework.dev/registry-ca-sha256': tlsCertDigest(ca),
     });
+    const template = JSON.stringify(host(api).spec.template);
     // The token is kept across reconciles.
     expect(token(api)).toBe(first);
-    // Deleting the Secret rotates it; a malformed one is replaced too.
+    // Deleting the Secret rotates it, and the host template stays byte-identical across the
+    // rotation (W1 of the :host-pull review): the wiring comes from desired state, not the Secret.
     api.objects.delete(pullSecretPath);
     await controller.reconcileTenant(t, []);
+    expect(JSON.stringify(host(api).spec.template)).toBe(template);
     const second = token(api);
     expect(second).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(second).not.toBe(first);
+    await controller.reconcileTenant(t, []);
+    expect(JSON.stringify(host(api).spec.template)).toBe(template);
+    expect(token(api)).toBe(second);
+    // A malformed one is replaced too.
     (api.objects.get(pullSecretPath)!.data as Record<string, string>).token =
       Buffer.from('short').toString('base64');
     await controller.reconcileTenant(t, []);
     expect(token(api)).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(JSON.stringify(host(api).spec.template)).toBe(template);
   });
 
-  it('waits for the pull Secret and the CA before wiring the hosts', async () => {
+  it('keeps the hosts wired while the pull Secret cannot be recreated', async () => {
     const { api, t } = prepare();
     const controller = new Controller(api, tlsCfg);
     await controller.reconcileTenant(t, []);
+    await controller.reconcileTenant(t, []);
+    const template = JSON.stringify(host(api).spec.template);
     const log = console.error;
     console.error = () => {};
     try {
-      // The Secret is missing at the next tenant step: the hosts are not wired.
       api.objects.delete(pullSecretPath);
       api.fail = (method, p) =>
         method === 'PATCH' && p === pullSecretPath ? new ApiError(500, 'boom') : undefined;
       await controller.reconcileTenant(t, []);
-      expect(env(host(api))).not.toHaveProperty('DOCKER_CONFIG');
-      api.fail = undefined;
-      await controller.reconcileTenant(t, []);
-      // The CA is missing at the next tenant step: still not wired.
-      api.objects.delete(hostPath);
-      api.objects.delete(caPath);
-      api.fail = (method, p) =>
-        method === 'PATCH' && p === caPath ? new ApiError(500, 'boom') : undefined;
-      await controller.reconcileTenant(t, []);
-      expect(env(host(api))).not.toHaveProperty('DOCKER_CONFIG');
+      expect(JSON.stringify(host(api).spec.template)).toBe(template);
     } finally {
+      api.fail = undefined;
       console.error = log;
     }
+  });
+
+  it('does not roll the hosts while the CA ConfigMap is temporarily missing', async () => {
+    const { api, t } = prepare();
+    const controller = new Controller(api, tlsCfg);
+    await controller.reconcileTenant(t, []);
+    await controller.reconcileTenant(t, []);
+    const template = JSON.stringify(host(api).spec.template);
+    expect(template).toContain('registry-ca-sha256');
+    const log = console.error;
+    console.error = () => {};
+    try {
+      // The tenant-auth step cannot recreate it either, so it stays missing across the tick.
+      api.fail = (method, p) =>
+        method === 'PATCH' && p === caPath ? new ApiError(500, 'boom') : undefined;
+      api.objects.delete(caPath);
+      await controller.reconcileTenant(t, []);
+      expect(JSON.stringify(host(api).spec.template)).toBe(template);
+      // A restarted controller reads the last digest from the host template.
+      api.objects.delete(caPath);
+      await new Controller(api, tlsCfg).reconcileTenant(t, []);
+      expect(JSON.stringify(host(api).spec.template)).toBe(template);
+      // With neither a CA nor a known digest, the hosts get the credential and no CA yet.
+      api.objects.delete(caPath);
+      api.objects.delete(hostPath);
+      await new Controller(api, tlsCfg).reconcileTenant(t, []);
+      expect(env(host(api)).DOCKER_CONFIG).toBe('/registry-auth');
+      expect(host(api).spec.template.metadata.annotations).toBeUndefined();
+    } finally {
+      api.fail = undefined;
+      console.error = log;
+    }
+    // Once the CA is back, the hosts trust it.
+    await controller.reconcileTenant(t, []);
+    await controller.reconcileTenant(t, []);
+    expect(JSON.stringify(host(api).spec.template)).toBe(template);
+  });
+
+  it('reports a failed host wiring lookup on TenantAuthReady, not as a reconcile error', async () => {
+    const { api, t } = prepare();
+    const controller = new Controller(api, tlsCfg);
+    await controller.reconcileTenant(t, []);
+    await controller.reconcileTenant(t, []);
+    const template = JSON.stringify(host(api).spec.template);
+    const conditions = () =>
+      Object.fromEntries((t.status?.conditions ?? []).map((c) => [c.type, c]));
+    let failures = 0;
+    api.fail = (method, p) =>
+      method === 'GET' && p === caPath && failures++ === 0
+        ? new ApiError(500, 'configmaps unavailable')
+        : undefined;
+    // Known wiring: the hosts keep it.
+    await controller.reconcileTenant(t, []);
+    expect(JSON.stringify(host(api).spec.template)).toBe(template);
+    expect(conditions().Ready?.reason).not.toBe('ReconcileError');
+    expect(conditions().TenantAuthReady).toMatchObject({
+      status: 'False',
+      reason: 'HostPullError',
+    });
+    expect(conditions().TenantAuthReady?.message).toContain('configmaps unavailable');
+    // Unknown wiring (a restarted controller): the host Deployment is left untouched this tick.
+    failures = 0;
+    const patches = api.patches.length;
+    await new Controller(api, tlsCfg).reconcileTenant(t, []);
+    expect(api.patches.slice(patches).some((entry) => entry.startsWith(hostPath))).toBe(false);
+    expect(JSON.stringify(host(api).spec.template)).toBe(template);
+    expect(conditions().TenantAuthReady?.reason).toBe('HostPullError');
+    api.fail = undefined;
+    await controller.reconcileTenant(t, []);
+    expect(conditions().TenantAuthReady?.reason).not.toBe('HostPullError');
   });
 
   it('wires the hosts without a CA when they pull over plain HTTP', async () => {

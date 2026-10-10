@@ -63,6 +63,7 @@ import {
   NAMESPACE_ROLE,
   names,
   OWNER,
+  REGISTRY_CA_ANNOTATION,
   REGISTRY_PULL_SECRET,
   REGISTRY_PULL_SERVICE,
   REGISTRY_WORKLOAD,
@@ -493,26 +494,43 @@ export class Controller {
     const token = Buffer.from(existing?.data?.token ?? '', 'base64').toString();
     return HOST_PULL_TOKEN.test(token) ? token : randomBytes(32).toString('base64url');
   }
+  /** The host wiring last rendered per tenant (W1/S6 of the #83 `:host-pull` review). */
+  private readonly hostPulls = new Map<string, HostPull | undefined>();
   /**
-   * How the tenant hosts pull from the registry (#83 `:host-pull`), or undefined until the
-   * registry, its pull Secret and (over TLS) the tenant CA exist, so a host never starts against
-   * a credential or CA file that is not there yet. Rendering it rolls the hosts once.
+   * How the tenant hosts pull from the registry (#83 `:host-pull`), decided from desired state
+   * (W1 of the review): wired while `tenantAuth.registry` is set, the registry is deployed and
+   * the tenant is not suspended, whether or not the pull Secret exists right now. Its volume is
+   * optional, so a host started during a rotation pulls anonymously until the kubelet syncs it.
+   * Over TLS the CA digest is the current `tenant-controller-ca`'s; while that ConfigMap is
+   * missing the last known digest (remembered here, else read from the host template) is kept,
+   * so only a different CA rolls the hosts.
    */
   private async hostPull(tenant: Tenant, registryDeployed: boolean): Promise<HostPull | undefined> {
-    if (!registryDeployed) return undefined;
-    const namespace = names(tenant.metadata.name).runtimeNamespace;
-    if (
-      !(await this.get<Resource>(
-        `${collection('v1', 'Secret', namespace)}/${REGISTRY_PULL_SECRET}`,
-      ))
-    )
-      return undefined;
+    const name = tenant.metadata.name;
+    const wiring = await this.hostPullWiring(tenant, registryDeployed);
+    this.hostPulls.set(name, wiring);
+    return wiring;
+  }
+  private async hostPullWiring(
+    tenant: Tenant,
+    registryDeployed: boolean,
+  ): Promise<HostPull | undefined> {
+    if (!registryDeployed || tenant.spec.suspended) return undefined;
     if (this.cfg.insecureRegistry) return {};
+    const n = names(tenant.metadata.name);
     const ca = await this.get<{ data?: Record<string, string> }>(
-      `${collection('v1', 'ConfigMap', namespace)}/tenant-controller-ca`,
+      `${collection('v1', 'ConfigMap', n.runtimeNamespace)}/tenant-controller-ca`,
     );
     const cert = ca?.data?.['ca.crt'];
-    return cert ? { caDigest: tlsCertDigest(cert) } : undefined;
+    if (cert) return { caDigest: tlsCertDigest(cert) };
+    const known =
+      this.hostPulls.get(tenant.metadata.name)?.caDigest ??
+      (
+        await this.get<{ spec?: { template?: { metadata?: Resource['metadata'] } } }>(
+          `${collection('apps/v1', 'Deployment', n.runtimeNamespace)}/hostgroup-${n.hostgroup}`,
+        )
+      )?.spec?.template?.metadata?.annotations?.[REGISTRY_CA_ANNOTATION];
+    return known ? { caDigest: known } : {};
   }
   async reconcileTenant(tenant: Tenant, users?: User[]): Promise<void> {
     if (!validName(tenant.metadata.name)) throw new Error('Invalid tenant name');
@@ -588,6 +606,17 @@ export class Controller {
     );
     const workloads = await this.storageWorkloads(tenant);
     const registryDeployed = await this.registryDeployed(tenant);
+    // A failed lookup here is reported on TenantAuthReady, not as a reconcile error (S6 of the
+    // #83 `:host-pull` review): the hosts keep the last wiring, or are left untouched this tick.
+    let hostPull: HostPull | undefined;
+    let hostPullFailure: unknown;
+    try {
+      hostPull = await this.hostPull(tenant, registryDeployed);
+    } catch (error) {
+      hostPullFailure = error;
+      hostPull = this.hostPulls.get(tenant.metadata.name);
+    }
+    const hostsKnown = !hostPullFailure || this.hostPulls.has(tenant.metadata.name);
     // The quota keeps the tenant-auth addition only while its Deployments exist; the
     // tenant-auth step below is the one that raises it (#121).
     const desired = tenantResources(
@@ -598,7 +627,11 @@ export class Controller {
       await this.tenantAuthDeployed(tenant),
       registryDeployed,
       await this.tenantAuthNetworkApplied(tenant),
-      await this.hostPull(tenant, registryDeployed),
+      hostPull,
+    ).filter(
+      (value) =>
+        hostsKnown ||
+        !(value.kind === 'Deployment' && value.metadata.name === `hostgroup-${n.hostgroup}`),
     );
     let ready = !!secret;
     let failure: unknown;
@@ -635,7 +668,17 @@ export class Controller {
     }
     // Tenant-auth is independent of the tenant's own objects: a failed apply above (such as a
     // hostgroup 409) must not keep it from reconciling or from reporting TenantAuthReady (#121).
-    const auth = await this.reconcileTenantAuth(tenant, users);
+    let auth = await this.reconcileTenantAuth(tenant, users);
+    if (hostPullFailure && auth) {
+      const message =
+        hostPullFailure instanceof Error ? hostPullFailure.message : String(hostPullFailure);
+      auth = {
+        ...auth,
+        status: 'False',
+        reason: 'HostPullError',
+        message: `Tenant host registry wiring could not be read: ${message}`,
+      };
+    }
     if (failure) {
       const message = failure instanceof Error ? failure.message : 'Reconciliation failed';
       console.error(`Tenant/${tenant.metadata.name}: ${message}`);
