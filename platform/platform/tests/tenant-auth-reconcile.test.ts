@@ -968,8 +968,9 @@ describe('tenant-auth reconcile ordering (#121)', () => {
   const quotaPath = `${collection('v1', 'ResourceQuota', 'di-runtime-alpha')}/di-runtime-quota`;
   const hostgroupPath = path('Deployment', 'di-runtime-alpha', 'hostgroup-tenant-alpha');
   const cpu = (api: MemoryApi) =>
-    (api.objects.get(quotaPath) as unknown as { spec: { hard: Record<string, string> } }).spec
-      .hard['limits.cpu'];
+    (api.objects.get(quotaPath) as unknown as { spec: { hard: Record<string, string> } }).spec.hard[
+      'limits.cpu'
+    ];
   const conditions = (t: Tenant) =>
     Object.fromEntries((t.status?.conditions ?? []).map((c) => [c.type, c]));
   const quiet = async (run: () => Promise<void>) => {
