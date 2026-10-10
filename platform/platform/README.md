@@ -518,7 +518,8 @@ tenantAuth:
   host group on 9191 (`di-http`'s pod port) and DNS. The pair is not selected by
   `di-tenant-network`; `tenant-auth-network` gives it the same egress that policy gives the
   tenant's other pods, and admits only the console to the controller's `8788` and, with a
-  registry, only the tenant's host pods to the whoami listener (`8789`). Tenant workloads no
+  registry, only the tenant's host pods to the whoami listener (`8789`) and the pull listener
+  (`8791`). Tenant workloads no
   longer reach the console or the controller from inside the cluster. The pair leaves
   `di-tenant-network` only once its own `tenant-auth-network` exists, so on an upgrade (or when
   the tenant-auth step fails before that policy) it keeps the broad policy until the next poll.
@@ -598,8 +599,10 @@ tenantAuth:
     (`TENANT_CONTROLLER_REGISTRY_FRONT_PORT`) and `TENANT_CONTROLLER_REGISTRY_URL` only while
     the tenant is not suspended and no other WorkloadDeployment claims the registry host.
     Registry readiness is not part of the gate, so a registry rollout or blip never restarts the
-    controller: while `di-tenant-registry` is not `Ready` the front answers 502/504 and
-    `TenantAuthReady` reports `Provisioning`. Tenant users cannot create a claimant (admission);
+    controller: while `di-tenant-registry` is not `Ready` the front relays whatever the tenant
+    host answers for a request to a host it has no route for (502 only when `di-http` cannot be
+    reached, 504 when its response headers time out), and `TenantAuthReady` reports
+    `Provisioning`. Tenant users cannot create a claimant (admission);
     one written by any other requester (an operator, a CD service account) is detected on the
     next reconcile (polled every 3 s), which closes the front, so it can receive credentials for
     at most that poll plus the controller's `Recreate` rollout. Opening or closing the front
@@ -634,8 +637,54 @@ tenantAuth:
     while it does not exist). Roll the ClusterRole before the new controller (`pulumi up`
     applies both; a hand-rolled upgrade must apply the ClusterRole first), or the registry
     reports `403` on `TenantAuthReady` until it does.
-  - Hosts pulling from the registry (setting the tenant hosts' registry config to it) is
-    `#83:host-pull`, not this step.
+  - Host pull (`#83:host-pull`): the tenant's hosts pull workload components from the tenant
+    registry with a namespace-scoped host credential.
+    - Reference: users push to `publicUrl`; workloads reference the same repository as
+      `tenant-registry.di-runtime-<tenant>.svc/<repository>[:tag|@digest]` (no port). `/v1/deploy`
+      refuses an image on the public origin and names this reference instead.
+    - Path: Service `tenant-registry` in `di-runtime-<tenant>` points at the controller's
+      pull-only listener (`TENANT_CONTROLLER_REGISTRY_PULL_PORT=8791`), which is the registry front
+      restricted to `GET`/`HEAD` (`405` otherwise), so nothing can be pushed or deleted through it.
+      It forwards to `di-http` with `Host: <registry label>` like the front, and is open only while
+      the front is (same suspension and `RegistryHostConflict` gate). `tenant-auth-network` admits
+      only the tenant's host pods to `8791`; the hosts already reach the runtime namespace through
+      `di-tenant-network`, so pulls never leave the tenant's namespaces.
+    - Credential: Secret `di-tenant-registry-pull` in `di-runtime-<tenant>` holds a random
+      32-byte token (`token`) and a Docker config for `tenant-registry.di-runtime-<tenant>.svc`
+      (`config.json`, Basic `tenant-host:<token>`). The platform controller generates it and keeps
+      it across reconciles; delete the Secret to rotate it. The host mounts `config.json` as
+      `DOCKER_CONFIG=/registry-auth`, which wash reads on every pull; the controller mounts `token`
+      next to its certificate and reads it on every call. A rotation therefore needs no restart
+      beyond the kubelet's Secret sync and the registry's short positive whoami cache. The
+      controller's whoami listener, and only it (the main listener never does), answers
+      `Bearer <token>` as `{user: system:tenant-host, role: viewer, via: host-pull}`, so the
+      registry allows pulls only. It is not a user's identity token, and tenant users cannot
+      read it: `di-runtime-*` roles grant no Secret access and no `pods/exec`, the host pod spec
+      holds only a Secret volume reference, and Wasm guests see no host files outside their
+      preopened storage.
+    - TLS: by default the pull listener serves the controller certificate (whose SANs now include
+      `tenant-registry.di-runtime-<tenant>.svc[.cluster.local]`) on Service port 443, and the hosts
+      trust it through `--oci-ca-path=/registry-ca/ca.crt` from ConfigMap `tenant-controller-ca`.
+      wash loads that file once at start, so the host template carries
+      `platform.di-framework.dev/registry-ca-sha256` and a certificate renewal rolls the hosts on
+      the next poll. With `insecureRegistry` (hosts run `--allow-insecure-registries`, which makes
+      every wash pull plain HTTP, the local install's default) the listener is plain HTTP
+      (`TENANT_CONTROLLER_REGISTRY_PULL_TLS=false`) on Service port 80, and no CA is mounted; the
+      host credential then crosses the pod network in clear, as the whoami callback does.
+    - Rollout: the hosts are wired (env, volumes, CA) only once the registry WorkloadDeployment,
+      the pull Secret and (over TLS) the CA exist, so a host never starts without its files; that
+      first wiring, and unsetting the registry, each roll the hosts once. Unsetting
+      `tenantAuth.registry` also deletes the pull Secret and Service.
+    - Alternative not taken: anonymous pull restricted by NetworkPolicy to the tenant's host pods.
+      The registry authorizes every request through whoami, so it would need an
+      unauthenticated bypass in `platform/oci-registry` keyed on something the component cannot
+      verify (it does not see the peer address, and a `Host` value can be sent by any pod that
+      reaches `di-http`, including tenant workloads and, unless reserved, the gateway). Its only
+      gate would be NetworkPolicy, which some CNIs do not enforce; the credential still holds
+      there. wash supports both per-component `imagePullSecret` (materialized by the operator from
+      the workload's namespace, where developers can write Secrets) and a host-wide Docker
+      config; the host Docker config keeps the credential out of every namespace tenant users can
+      write.
 - The controller Deployment stays at one replica with `Recreate`: proxy sessions live in its
   memory. A new image digest rolls both pods.
 - Status: problems here are reported on the Tenant's `TenantAuthReady` condition. Ready, and

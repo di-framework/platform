@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { request } from 'node:https';
 import { setTimeout } from 'node:timers/promises';
@@ -57,10 +58,13 @@ import {
   type Condition,
   type ControllerConfig,
   FINALIZER,
+  type HostPull,
   INSTALLATION,
   NAMESPACE_ROLE,
   names,
   OWNER,
+  REGISTRY_PULL_SECRET,
+  REGISTRY_PULL_SERVICE,
   REGISTRY_WORKLOAD,
   type Resource,
   ROUTES_CONFIG_NAME,
@@ -77,6 +81,7 @@ import {
   tenantControllerCertNames,
   tenantQuota,
   tenantResources,
+  tlsCertDigest,
   type User,
   userResources,
   VERSION,
@@ -249,6 +254,8 @@ export class KubernetesApi implements Api {
 }
 /** How far before the cursor each pod log read starts (see projectLogs). */
 const LOG_LOOKBACK_MS = 120_000;
+/** A generated host pull token: 32 random bytes, base64url. */
+const HOST_PULL_TOKEN = /^[A-Za-z0-9_-]{43}$/;
 const TENANT_AUTH_KINDS = [
   ['apps/v1', 'Deployment'],
   ['v1', 'Service'],
@@ -472,7 +479,40 @@ export class Controller {
       apiServer,
       tls,
       clientSecret: oauth?.data?.[auth.oauthClient.secretKey ?? 'clientSecret'],
+      ...(auth.registry ? { hostPullToken: await this.hostPullToken(name) } : {}),
     };
+  }
+  /**
+   * The host pull token (#83 `:host-pull`): the one in `di-tenant-registry-pull` while it is well
+   * formed, otherwise a new random one. Deleting the Secret therefore rotates it.
+   */
+  private async hostPullToken(tenant: string): Promise<string> {
+    const existing = await this.get<{ data?: Record<string, string> }>(
+      `${collection('v1', 'Secret', names(tenant).runtimeNamespace)}/${REGISTRY_PULL_SECRET}`,
+    );
+    const token = Buffer.from(existing?.data?.token ?? '', 'base64').toString();
+    return HOST_PULL_TOKEN.test(token) ? token : randomBytes(32).toString('base64url');
+  }
+  /**
+   * How the tenant hosts pull from the registry (#83 `:host-pull`), or undefined until the
+   * registry, its pull Secret and (over TLS) the tenant CA exist, so a host never starts against
+   * a credential or CA file that is not there yet. Rendering it rolls the hosts once.
+   */
+  private async hostPull(tenant: Tenant, registryDeployed: boolean): Promise<HostPull | undefined> {
+    if (!registryDeployed) return undefined;
+    const namespace = names(tenant.metadata.name).runtimeNamespace;
+    if (
+      !(await this.get<Resource>(
+        `${collection('v1', 'Secret', namespace)}/${REGISTRY_PULL_SECRET}`,
+      ))
+    )
+      return undefined;
+    if (this.cfg.insecureRegistry) return {};
+    const ca = await this.get<{ data?: Record<string, string> }>(
+      `${collection('v1', 'ConfigMap', namespace)}/tenant-controller-ca`,
+    );
+    const cert = ca?.data?.['ca.crt'];
+    return cert ? { caDigest: tlsCertDigest(cert) } : undefined;
   }
   async reconcileTenant(tenant: Tenant, users?: User[]): Promise<void> {
     if (!validName(tenant.metadata.name)) throw new Error('Invalid tenant name');
@@ -547,6 +587,7 @@ export class Controller {
       `${collection('v1', 'Secret', this.cfg.namespace)}/wasmcloud-runtime-tls`,
     );
     const workloads = await this.storageWorkloads(tenant);
+    const registryDeployed = await this.registryDeployed(tenant);
     // The quota keeps the tenant-auth addition only while its Deployments exist; the
     // tenant-auth step below is the one that raises it (#121).
     const desired = tenantResources(
@@ -555,8 +596,9 @@ export class Controller {
       secret,
       storageKeys(workloads),
       await this.tenantAuthDeployed(tenant),
-      await this.registryDeployed(tenant),
+      registryDeployed,
       await this.tenantAuthNetworkApplied(tenant),
+      await this.hostPull(tenant, registryDeployed),
     );
     let ready = !!secret;
     let failure: unknown;
@@ -666,6 +708,18 @@ export class Controller {
       }
       // The registry is no longer configured: remove it, then give its workload slot back.
       if (!this.cfg.tenantAuth.registry) {
+        // The host pull credential and Service go with it (#83 `:host-pull`).
+        for (const [kind, stale] of [
+          ['Secret', REGISTRY_PULL_SECRET],
+          ['Service', REGISTRY_PULL_SERVICE],
+        ] as const) {
+          const value = await this.get<Resource>(`${collection('v1', kind, namespace)}/${stale}`);
+          if (
+            value?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+            value.metadata.labels[OWNER] === tenant.metadata.uid
+          )
+            await this.remove(value);
+        }
         const stale = await this.get<Resource>(
           `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', names(tenant.metadata.name).namespace)}/${REGISTRY_WORKLOAD}`,
         );

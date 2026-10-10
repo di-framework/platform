@@ -10,9 +10,12 @@ import {
   INSTALLATION,
   ISSUER_PROXY_IMAGE,
   OWNER,
+  REGISTRY_PULL_SECRET,
+  REGISTRY_PULL_SERVICE,
   REGISTRY_WORKLOAD,
   type Resource,
   registryHttpHost,
+  registryPullHost,
   TENANT,
   TENANT_AUTH_LIMITS,
   type Tenant,
@@ -1520,6 +1523,7 @@ describe('tenant registry (#83:reconcile)', () => {
       { containerPort: 8788, name: 'http' },
       { containerPort: 8789, name: 'whoami' },
       { containerPort: 8790, name: 'registry' },
+      { containerPort: 8791, name: 'pull' },
     ]);
     expect(find(resources, 'Service', 'tenant-controller')).toMatchObject({
       spec: {
@@ -1547,7 +1551,10 @@ describe('tenant registry (#83:reconcile)', () => {
                 },
               },
             ],
-            ports: [{ protocol: 'TCP', port: 8789 }],
+            ports: [
+              { protocol: 'TCP', port: 8789 },
+              { protocol: 'TCP', port: 8791 },
+            ],
           },
         ],
       },
@@ -2008,5 +2015,369 @@ describe('tenant registry (#83:reconcile)', () => {
       });
       expect(frontEnv(api)).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_FRONT_PORT');
     });
+  });
+});
+
+describe('tenant registry host pull (#83:host-pull)', () => {
+  const COMPONENT_REF = `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}`;
+  const withRegistry: TenantAuthConfig = {
+    ...auth,
+    registry: { component: COMPONENT_REF, publicUrl: 'https://registry.{tenant}.localhost:28180' },
+  };
+  const tlsCfg: ControllerConfig = {
+    ...cfg,
+    insecureRegistry: false,
+    routeUrlPattern: 'http://{host}.{tenant}.localhost:28180',
+    tenantAuth: withRegistry,
+  };
+  const insecureCfg: ControllerConfig = { ...tlsCfg, insecureRegistry: true };
+  const TOKEN = 't'.repeat(43);
+  const pullSecretPath = path('Secret', 'di-runtime-alpha', REGISTRY_PULL_SECRET);
+  const pullServicePath = path('Service', 'di-runtime-alpha', REGISTRY_PULL_SERVICE);
+  const hostPath = path('Deployment', 'di-runtime-alpha', 'hostgroup-tenant-alpha');
+  const caPath = path('ConfigMap', 'di-runtime-alpha', 'tenant-controller-ca');
+  const decode = (value: string) => Buffer.from(value, 'base64').toString();
+  const token = (api: MemoryApi) =>
+    decode((api.objects.get(pullSecretPath)!.data as Record<string, string>).token!);
+  const host = (resources: Resource[] | MemoryApi) =>
+    (Array.isArray(resources)
+      ? find(resources, 'Deployment', 'hostgroup-tenant-alpha')
+      : resources.objects.get(hostPath)) as unknown as Deployment;
+  const schedulerSecret = { data: { 'ca.crt': 'test' } };
+  const rulesOf = (role: Resource | undefined) =>
+    (role as unknown as { rules: { resources: string[]; verbs: string[] }[] }).rules;
+
+  it('renders the pull Secret, the pull listener and the pull Service', () => {
+    const resources = tenantAuthResources(tenant(), tlsCfg, {
+      ...inputs,
+      registryServing: true,
+      hostPullToken: TOKEN,
+    });
+    const secret = find(resources, 'Secret', REGISTRY_PULL_SECRET)!;
+    expect(secret.metadata.namespace).toBe('di-runtime-alpha');
+    expect(secret.metadata.labels).toMatchObject({
+      [COMPONENT]: 'tenant-auth',
+      [OWNER]: 'alpha-uid',
+    });
+    const data = secret.data as Record<string, string>;
+    expect(decode(data.token!)).toBe(TOKEN);
+    expect(JSON.parse(decode(data['config.json']!))).toEqual({
+      auths: {
+        'tenant-registry.di-runtime-alpha.svc': {
+          auth: Buffer.from(`tenant-host:${TOKEN}`).toString('base64'),
+        },
+      },
+    });
+    expect(registryPullHost('alpha')).toBe('tenant-registry.di-runtime-alpha.svc');
+    const controller = find(resources, 'Deployment', 'tenant-controller') as Deployment;
+    expect(env(controller)).toMatchObject({
+      TENANT_CONTROLLER_REGISTRY_PULL_PORT: '8791',
+      TENANT_CONTROLLER_REGISTRY_PULL_HOST: 'tenant-registry.di-runtime-alpha.svc',
+      TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE: '/tls/host-pull-token',
+    });
+    expect(env(controller)).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_PULL_TLS');
+    // The token is a file next to the certificate, so a rotation reaches the pod without a restart.
+    expect(controller.spec.template.spec.volumes).toContainEqual({
+      name: 'mounted',
+      projected: {
+        sources: [
+          { secret: { name: 'tenant-controller-tls' } },
+          {
+            secret: {
+              name: REGISTRY_PULL_SECRET,
+              items: [{ key: 'token', path: 'host-pull-token' }],
+            },
+          },
+        ],
+      },
+    });
+    expect(JSON.stringify(controller.spec.template)).not.toContain(TOKEN);
+    expect(find(resources, 'Service', REGISTRY_PULL_SERVICE)).toMatchObject({
+      metadata: { namespace: 'di-runtime-alpha', labels: { [COMPONENT]: 'tenant-auth' } },
+      spec: {
+        selector: { app: 'tenant-controller' },
+        ports: [{ name: 'pull', port: 443, targetPort: 8791 }],
+      },
+    });
+    // Plain HTTP on port 80 when wash pulls everything over plain HTTP.
+    const insecure = tenantAuthResources(tenant(), insecureCfg, {
+      ...inputs,
+      registryServing: true,
+      hostPullToken: TOKEN,
+    });
+    expect(
+      env(find(insecure, 'Deployment', 'tenant-controller') as Deployment)
+        .TENANT_CONTROLLER_REGISTRY_PULL_TLS,
+    ).toBe('false');
+    expect(find(insecure, 'Service', REGISTRY_PULL_SERVICE)).toMatchObject({
+      spec: { ports: [{ name: 'pull', port: 80, targetPort: 8791 }] },
+    });
+  });
+
+  it('opens the pull listener only while the front is served, and needs the token for the Secret', () => {
+    const closed = tenantAuthResources(tenant(), tlsCfg, { ...inputs, hostPullToken: TOKEN });
+    const closedEnv = env(find(closed, 'Deployment', 'tenant-controller') as Deployment);
+    expect(closedEnv).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_PULL_PORT');
+    expect(closedEnv.TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE).toBe('/tls/host-pull-token');
+    const tokenless = tenantAuthResources(tenant(), tlsCfg, { ...inputs, registryServing: true });
+    expect(find(tokenless, 'Secret', REGISTRY_PULL_SECRET)).toBeUndefined();
+    const controller = find(tokenless, 'Deployment', 'tenant-controller') as Deployment;
+    expect(env(controller)).not.toHaveProperty('TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE');
+    expect(controller.spec.template.spec.volumes).toContainEqual({
+      name: 'mounted',
+      secret: { secretName: 'tenant-controller-tls' },
+    });
+    // Without a registry, a stray token renders nothing.
+    const plain = tenantAuthResources(
+      tenant(),
+      { ...tlsCfg, tenantAuth: auth },
+      { ...inputs, registryServing: true, hostPullToken: TOKEN },
+    );
+    expect(find(plain, 'Secret', REGISTRY_PULL_SECRET)).toBeUndefined();
+    expect(find(plain, 'Service', REGISTRY_PULL_SERVICE)).toBeUndefined();
+  });
+
+  it('admits only the tenant host pods to the pull listener', () => {
+    const resources = tenantAuthResources(tenant(), tlsCfg, {
+      ...inputs,
+      registryServing: true,
+      hostPullToken: TOKEN,
+    });
+    const policies = resources.filter((r) => r.kind === 'NetworkPolicy') as unknown as {
+      metadata: { name: string };
+      spec: { ingress?: { from: unknown[]; ports?: { port: number }[] }[] };
+    }[];
+    const admitting = policies.flatMap((p) =>
+      (p.spec.ingress ?? [])
+        .filter((rule) => rule.ports?.some((port) => port.port === 8791))
+        .map((rule) => ({ policy: p.metadata.name, from: rule.from })),
+    );
+    expect(admitting).toEqual([
+      {
+        policy: 'tenant-auth-network',
+        from: [
+          {
+            namespaceSelector: {
+              matchLabels: { 'kubernetes.io/metadata.name': 'di-runtime-alpha' },
+            },
+            podSelector: {
+              matchLabels: {
+                'wasmcloud.com/hostgroup': 'tenant-alpha',
+                'wasmcloud.com/name': 'hostgroup',
+              },
+            },
+          },
+        ],
+      },
+    ]);
+    // Every ingress rule on the tenant-auth pods names its ports, so none opens 8791 implicitly.
+    for (const p of policies.filter((p) => p.metadata.name.startsWith('tenant-')))
+      for (const rule of p.spec.ingress ?? []) expect(rule.ports?.length).toBeGreaterThan(0);
+  });
+
+  it('covers the pull Service in the controller certificate', () => {
+    expect(tenantControllerCertNames('alpha', withRegistry).dns).toEqual(
+      expect.arrayContaining([
+        'tenant-registry.di-runtime-alpha.svc',
+        'tenant-registry.di-runtime-alpha.svc.cluster.local',
+      ]),
+    );
+    expect(tenantControllerCertNames('alpha', auth).dns).not.toContain(
+      'tenant-registry.di-runtime-alpha.svc',
+    );
+  });
+
+  it('configures the hosts with the Docker config and, over TLS, the tenant CA', () => {
+    const none = host(tenantResources(tenant(), tlsCfg, schedulerSecret));
+    expect(env(none)).not.toHaveProperty('DOCKER_CONFIG');
+    expect(none.spec.template.metadata.annotations).toBeUndefined();
+    expect(none.spec.template.spec.containers[0]!.args).not.toContain(
+      '--oci-ca-path=/registry-ca/ca.crt',
+    );
+    expect(JSON.stringify(none.spec.template.spec.volumes)).not.toContain('registry-');
+
+    const withCa = host(
+      tenantResources(tenant(), tlsCfg, schedulerSecret, [], false, true, false, {
+        caDigest: 'abc',
+      }),
+    );
+    const container = withCa.spec.template.spec.containers[0]!;
+    expect(container.args).toContain('--oci-ca-path=/registry-ca/ca.crt');
+    expect(container.args).not.toContain('--allow-insecure-registries');
+    expect(env(withCa).DOCKER_CONFIG).toBe('/registry-auth');
+    expect(withCa.spec.template.metadata.annotations).toEqual({
+      'platform.di-framework.dev/registry-ca-sha256': 'abc',
+    });
+    expect(container.volumeMounts).toEqual(
+      expect.arrayContaining([
+        { name: 'registry-auth', mountPath: '/registry-auth', readOnly: true },
+        { name: 'registry-ca', mountPath: '/registry-ca', readOnly: true },
+      ]),
+    );
+    expect(withCa.spec.template.spec.volumes).toEqual(
+      expect.arrayContaining([
+        {
+          name: 'registry-auth',
+          secret: {
+            secretName: REGISTRY_PULL_SECRET,
+            optional: true,
+            items: [{ key: 'config.json', path: 'config.json' }],
+          },
+        },
+        {
+          name: 'registry-ca',
+          configMap: { name: 'tenant-controller-ca', items: [{ key: 'ca.crt', path: 'ca.crt' }] },
+        },
+      ]),
+    );
+    // Plain HTTP: the credential only, no CA.
+    const plain = host(
+      tenantResources(tenant(), insecureCfg, schedulerSecret, [], false, true, false, {}),
+    );
+    expect(env(plain).DOCKER_CONFIG).toBe('/registry-auth');
+    expect(plain.spec.template.spec.containers[0]!.args).toContain('--allow-insecure-registries');
+    expect(plain.spec.template.spec.containers[0]!.args).not.toContain(
+      '--oci-ca-path=/registry-ca/ca.crt',
+    );
+    expect(JSON.stringify(plain.spec.template.spec.volumes)).not.toContain('registry-ca');
+  });
+
+  it('keeps no credential where a tenant user can read it', () => {
+    const resources = tenantResources(tenant(), tlsCfg, schedulerSecret, [], false, true, false, {
+      caDigest: 'abc',
+    });
+    // Runtime-namespace roles (where the pull Secret lives) grant no Secret access and no exec.
+    for (const name of ['di-runtime-viewer', 'di-runtime-developer'])
+      for (const rule of rulesOf(find(resources, 'Role', name))) {
+        expect(rule.resources).not.toContain('secrets');
+        expect(rule.resources).not.toContain('pods/exec');
+        expect(rule.resources).not.toContain('pods/attach');
+      }
+    // Tenant-namespace developers write Secrets but never read them (#112).
+    const developer = rulesOf(find(resources, 'Role', 'di-developer'));
+    const secretRules = developer.filter((r) => r.resources.includes('secrets'));
+    expect(secretRules.length).toBeGreaterThan(0);
+    for (const rule of secretRules)
+      for (const verb of ['get', 'list', 'watch', 'patch']) expect(rule.verbs).not.toContain(verb);
+    // The host pod holds a Secret volume reference, never the token itself.
+    expect(JSON.stringify(host(resources))).not.toContain(TOKEN);
+    const auths = tenantAuthResources(tenant(), tlsCfg, {
+      ...inputs,
+      registryServing: true,
+      hostPullToken: TOKEN,
+    });
+    // The token appears in the runtime-namespace pull Secret only, and nowhere in clear.
+    expect(
+      auths.filter((r) => JSON.stringify(r).includes(Buffer.from(TOKEN).toString('base64'))),
+    ).toEqual([find(auths, 'Secret', REGISTRY_PULL_SECRET)!]);
+    expect(auths.filter((r) => JSON.stringify(r).includes(TOKEN))).toEqual([]);
+  });
+
+  it('wires the hosts once the registry, its pull Secret and the tenant CA exist', async () => {
+    const { api, t } = prepare();
+    const controller = new Controller(api, tlsCfg);
+    await controller.reconcileTenant(t, []);
+    // The tenant step ran before the registry existed, so the hosts are not wired yet.
+    expect(env(host(api))).not.toHaveProperty('DOCKER_CONFIG');
+    const first = token(api);
+    expect(first).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(api.objects.get(pullServicePath)).toBeDefined();
+    await controller.reconcileTenant(t, []);
+    expect(env(host(api)).DOCKER_CONFIG).toBe('/registry-auth');
+    const ca = (api.objects.get(caPath)!.data as Record<string, string>)['ca.crt']!;
+    expect(host(api).spec.template.metadata.annotations).toEqual({
+      'platform.di-framework.dev/registry-ca-sha256': tlsCertDigest(ca),
+    });
+    // The token is kept across reconciles.
+    expect(token(api)).toBe(first);
+    // Deleting the Secret rotates it; a malformed one is replaced too.
+    api.objects.delete(pullSecretPath);
+    await controller.reconcileTenant(t, []);
+    const second = token(api);
+    expect(second).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(second).not.toBe(first);
+    (api.objects.get(pullSecretPath)!.data as Record<string, string>).token =
+      Buffer.from('short').toString('base64');
+    await controller.reconcileTenant(t, []);
+    expect(token(api)).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  });
+
+  it('waits for the pull Secret and the CA before wiring the hosts', async () => {
+    const { api, t } = prepare();
+    const controller = new Controller(api, tlsCfg);
+    await controller.reconcileTenant(t, []);
+    const log = console.error;
+    console.error = () => {};
+    try {
+      // The Secret is missing at the next tenant step: the hosts are not wired.
+      api.objects.delete(pullSecretPath);
+      api.fail = (method, p) =>
+        method === 'PATCH' && p === pullSecretPath ? new ApiError(500, 'boom') : undefined;
+      await controller.reconcileTenant(t, []);
+      expect(env(host(api))).not.toHaveProperty('DOCKER_CONFIG');
+      api.fail = undefined;
+      await controller.reconcileTenant(t, []);
+      // The CA is missing at the next tenant step: still not wired.
+      api.objects.delete(hostPath);
+      api.objects.delete(caPath);
+      api.fail = (method, p) =>
+        method === 'PATCH' && p === caPath ? new ApiError(500, 'boom') : undefined;
+      await controller.reconcileTenant(t, []);
+      expect(env(host(api))).not.toHaveProperty('DOCKER_CONFIG');
+    } finally {
+      console.error = log;
+    }
+  });
+
+  it('wires the hosts without a CA when they pull over plain HTTP', async () => {
+    const { api, t } = prepare();
+    const controller = new Controller(api, insecureCfg);
+    await controller.reconcileTenant(t, []);
+    await controller.reconcileTenant(t, []);
+    expect(env(host(api)).DOCKER_CONFIG).toBe('/registry-auth');
+    expect(host(api).spec.template.spec.containers[0]!.args).not.toContain(
+      '--oci-ca-path=/registry-ca/ca.crt',
+    );
+    expect(api.objects.get(pullServicePath)).toMatchObject({
+      spec: { ports: [{ port: 80, targetPort: 8791 }] },
+    });
+  });
+
+  it('removes the pull Secret and Service with the registry, and leaves foreign ones', async () => {
+    const { api, t } = prepare();
+    await new Controller(api, tlsCfg).reconcileTenant(t, []);
+    await new Controller(api, tlsCfg).reconcileTenant(t, []);
+    const without = new Controller(api, { ...tlsCfg, tenantAuth: auth });
+    await without.reconcileTenant(t, []);
+    expect(api.objects.get(pullSecretPath)).toBeUndefined();
+    expect(api.objects.get(pullServicePath)).toBeUndefined();
+    // The hosts drop the pull configuration once the registry is gone.
+    await without.reconcileTenant(t, []);
+    expect(env(host(api))).not.toHaveProperty('DOCKER_CONFIG');
+    for (const [kind, name] of [
+      ['Secret', REGISTRY_PULL_SECRET],
+      ['Service', REGISTRY_PULL_SERVICE],
+    ] as const)
+      api.seed({ apiVersion: 'v1', kind, metadata: { name, namespace: 'di-runtime-alpha' } });
+    await without.reconcileTenant(t, []);
+    expect(api.objects.get(pullSecretPath)).toBeDefined();
+    expect(api.objects.get(pullServicePath)).toBeDefined();
+  });
+
+  it('needs only Secret, Service and ConfigMap verbs the platform ClusterRole grants', async () => {
+    const { api, t } = prepare();
+    await new Controller(api, tlsCfg).reconcileTenant(t, []);
+    await new Controller(api, tlsCfg).reconcileTenant(t, []);
+    await new Controller(api, { ...tlsCfg, tenantAuth: auth }).reconcileTenant(t, []);
+    for (const resource of ['secrets', 'services', 'configmaps']) {
+      const used = [...api.verbs]
+        .filter((entry) => entry.endsWith(` ${resource}`))
+        .map((entry) => entry.split(' ')[0]);
+      expect(used).toContain('get');
+      const granted = controllerClusterRoleRules()
+        .filter((r) => r.resources.includes(resource))
+        .flatMap((r) => r.verbs);
+      for (const verb of used) expect(granted).toContain(verb as string);
+    }
   });
 });

@@ -201,6 +201,10 @@ renaming or removing one is a breaking change.
 | `TENANT_CONTROLLER_WHOAMI_PORT` | none | Plain-HTTP listener serving only `GET /v1/auth/whoami` (problem+json errors), for the tenant registry's callback (platform#83) |
 | `TENANT_CONTROLLER_REGISTRY_FRONT_PORT` | none | TLS listener (the controller certificate) that forwards every request, credentials included, to the tenant hosts as the registry (platform#83) |
 | `TENANT_CONTROLLER_REGISTRY_HOST` | `registry` | `Host` the registry front sends: the registry workload's `wasi:http` host; `/v1/deploy` refuses a `<service>-<env>` equal to it |
+| `TENANT_CONTROLLER_REGISTRY_PULL_PORT` | none | The tenant hosts' pull-only listener (platform#83 `:host-pull`): the registry front for `GET`/`HEAD` only (`405` otherwise). NetworkPolicy admits only the tenant host pods |
+| `TENANT_CONTROLLER_REGISTRY_PULL_TLS` | `true` | `false` serves the pull listener over plain HTTP, for platforms whose hosts run `--allow-insecure-registries` (every wash pull is then plain HTTP) |
+| `TENANT_CONTROLLER_REGISTRY_PULL_HOST` | none | In-cluster registry host workloads reference (`tenant-registry.di-runtime-<tenant>.svc`); `/v1/deploy` refuses a guest image on the public registry origin and names this host instead |
+| `TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE` | none | File holding the host pull token. The whoami listener (only) answers `Bearer <token>` as `{user: system:tenant-host, role: viewer, via: host-pull}`, so the registry allows pulls and nothing else. Read on every call, so a rotated token applies without a restart |
 | `TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES` | `536870912` (512 MiB) | Largest request body the registry front accepts; larger is `413` |
 | `TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS` | `60000` | Wait for the registry's response headers, counted from when the request body has been forwarded in full; then `504` |
 | `TENANT_CONTROLLER_REGISTRY_UPLOAD_IDLE_TIMEOUT_MS` | `60000` | How long an upload may deliver no byte while the front waits for one; then `408`. A steady upload of any length succeeds |

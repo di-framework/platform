@@ -5,6 +5,7 @@
  * and forwards only requests that stay inside the tenant's namespaces. The platform's existing
  * roles, quotas, and admission policies apply unchanged; the Kubernetes token never leaves here.
  */
+import { timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
 import { AuthError, IdentityResolver, type Principal } from './identity.ts';
@@ -89,6 +90,23 @@ export interface ControllerConfig {
    * 16); more are answered 503, so the front never starves the tenant API in the same process.
    */
   registryMaxConcurrent: number;
+  /**
+   * The tenant hosts' pull-only listener (platform#83 `:host-pull`): GET and HEAD forwarded like
+   * the registry front. NetworkPolicy admits only the host pods. Unset: none.
+   */
+  registryPullPort?: number;
+  /** Whether the pull listener uses TLS (default); false when hosts pull over plain HTTP. */
+  registryPullTls: boolean;
+  /**
+   * In-cluster registry host workloads reference (`TENANT_CONTROLLER_REGISTRY_PULL_HOST`);
+   * `/v1/deploy` points users at it when a workload names the public origin instead.
+   */
+  registryPullHost?: string;
+  /**
+   * File holding the host pull token (`TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE`): the whoami
+   * listener answers it as a pull-only principal. Read on every call, so rotation needs no restart.
+   */
+  hostPullTokenFile?: string;
 }
 
 /** Idle timeout of the registry front's client sockets; any data flow resets it (Bun's max is 255). */
@@ -228,6 +246,9 @@ function registryChallenge(): Response {
   });
 }
 
+/** The user the whoami listener reports for the host pull token. */
+export const HOST_PULL_USER = 'system:tenant-host';
+
 /** Headers never relayed back from the registry: hop-by-hop. */
 const HOP_BY_HOP_RESPONSE = new Set(['connection', 'keep-alive', 'transfer-encoding']);
 
@@ -278,6 +299,13 @@ export function configFromEnv(env = process.env): ControllerConfig {
       'TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT',
       16,
     ),
+    registryPullPort: optionalPort(
+      env.TENANT_CONTROLLER_REGISTRY_PULL_PORT,
+      'TENANT_CONTROLLER_REGISTRY_PULL_PORT',
+    ),
+    registryPullTls: env.TENANT_CONTROLLER_REGISTRY_PULL_TLS !== 'false',
+    registryPullHost: env.TENANT_CONTROLLER_REGISTRY_PULL_HOST || undefined,
+    hostPullTokenFile: env.TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE || undefined,
   };
 }
 
@@ -488,8 +516,17 @@ export class Controller {
       response.headers.set('allow', 'GET');
       return response;
     }
+    const authorization = request.headers.get('authorization');
+    if (this.isHostPullToken(authorization))
+      return json({
+        user: HOST_PULL_USER,
+        account: this.config.tenant,
+        role: 'viewer',
+        via: 'host-pull',
+        credentialId: 'host-pull',
+      });
     try {
-      return json(await this.identity.resolve(request.headers.get('authorization')));
+      return json(await this.identity.resolve(authorization));
     } catch (error) {
       if (error instanceof AuthError) {
         this.audit('request.denied', {
@@ -512,6 +549,45 @@ export class Controller {
       });
       return problem(502, 'Bad Gateway', 'the identity provider or cluster is unavailable');
     }
+  }
+
+  /**
+   * Whether `authorization` is `Bearer <host pull token>` (platform#83 `:host-pull`). Only the
+   * whoami listener, which NetworkPolicy opens to the tenant's host pods alone, accepts it; the
+   * main listener never does. The token file is read each time, so a rotated token applies at
+   * once; a missing or empty file accepts nothing.
+   */
+  private isHostPullToken(authorization: string | null): boolean {
+    if (!this.config.hostPullTokenFile || !authorization?.startsWith('Bearer ')) return false;
+    let expected: Buffer;
+    try {
+      expected = Buffer.from(readFileSync(this.config.hostPullTokenFile, 'utf8').trim());
+    } catch {
+      return false;
+    }
+    const presented = Buffer.from(authorization.slice(7).trim());
+    return (
+      expected.length > 0 &&
+      presented.length === expected.length &&
+      timingSafeEqual(presented, expected)
+    );
+  }
+
+  /**
+   * The hosts' pull listener (platform#83 `:host-pull`): the registry front for GET and HEAD only,
+   * so nothing can be pushed or deleted through it whatever credential arrives.
+   */
+  async handleRegistryPull(
+    request: Request,
+    server?: { requestIP(request: Request): { address: string } | null },
+  ): Promise<Response> {
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      await request.body?.cancel().catch(() => {});
+      const response = problem(405, 'Method Not Allowed', 'this listener only serves pulls');
+      response.headers.set('allow', 'GET, HEAD');
+      return response;
+    }
+    return this.handleRegistry(request, server);
   }
 
   /**
@@ -689,6 +765,7 @@ export class Controller {
         registryUrl: this.config.registryUrl,
         registryConfigured: this.config.registryConfigured,
         registryHost: this.config.registryHost,
+        registryPullHost: this.config.registryPullHost,
         asUser: () => asUser(this.kube, this.userTokens, principal),
         asController: () => controllerSecretReader(this.kube),
         audit: (event, fields) => this.audit(event, fields),
@@ -775,6 +852,15 @@ if (import.meta.main) {
       maxRequestBodySize: config.registryMaxBodyBytes,
       fetch: (request, server) => controller.handleRegistry(request, server),
     });
+  // The tenant hosts' pulls (platform#83 `:host-pull`): TLS unless they pull over plain HTTP.
+  if (config.registryPullPort)
+    Bun.serve({
+      hostname: config.host,
+      port: config.registryPullPort,
+      tls: config.registryPullTls ? tls : undefined,
+      idleTimeout: REGISTRY_IDLE_TIMEOUT_SECONDS,
+      fetch: (request, server) => controller.handleRegistryPull(request, server),
+    });
   controller.audit('controller.started', {
     url: `${tls ? 'https' : 'http'}://${config.host}:${config.port}`,
     issuer: config.issuer,
@@ -782,5 +868,6 @@ if (import.meta.main) {
     namespaces: tenantNamespaces(config.tenant),
     whoamiPort: config.whoamiPort,
     registryFrontPort: config.registryFrontPort,
+    registryPullPort: config.registryPullPort,
   });
 }

@@ -941,9 +941,34 @@ async function checked(
       'Unprocessable Entity',
       `${host} is reserved for the tenant registry; choose another service name`,
     );
+  const pull = publicRegistryImage(bundle, context);
+  if (pull) return problem(422, 'Unprocessable Entity', pull);
   const refs = await configRefs(bundle, context);
   if (refs instanceof Response) return refs;
   return handler(refs);
+}
+
+/**
+ * Why a guest image names the tenant registry's public origin (platform#83 `:host-pull`), which
+ * the hosts cannot pull from: users push to `registryUrl`, and workloads reference the same
+ * repository on the in-cluster `registryPullHost`. Undefined when every image is fine.
+ */
+function publicRegistryImage(bundle: DeployBundle, context: V1Context): string | undefined {
+  if (!context.registryUrl || !context.registryPullHost) return undefined;
+  const publicHost = new URL(context.registryUrl).host.toLowerCase();
+  const template = (bundle.workload.spec as { template: { spec: Record<string, unknown> } })
+    .template.spec;
+  const guests = [...(template.components as Record<string, unknown>[]), template.service];
+  for (const guest of guests) {
+    const image = (guest as { image?: unknown } | undefined)?.image;
+    if (typeof image !== 'string' || !image.toLowerCase().startsWith(`${publicHost}/`)) continue;
+    const repository = image.slice(publicHost.length + 1);
+    return (
+      `${image} names the tenant registry's public origin, which hosts cannot pull from; ` +
+      `push there, but reference ${context.registryPullHost}/${repository} in the workload`
+    );
+  }
+  return undefined;
 }
 
 const queryValue = (call: HttpCall, name: string) => {

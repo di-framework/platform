@@ -787,6 +787,59 @@ describe('/v1/deploy', () => {
     expect(response.status).not.toBe(422);
   });
 
+  test("points a workload that names the registry's public origin at the in-cluster pull host (platform#83 :host-pull)", async () => {
+    const pulling = new Controller(
+      configFromEnv({
+        TENANT_CONTROLLER_TENANT: 'acme',
+        TENANT_CONTROLLER_REGISTRY_HOST: 'registry',
+        TENANT_CONTROLLER_REGISTRY_URL: 'https://Registry.acme.localhost:28180',
+        TENANT_CONTROLLER_REGISTRY_PULL_HOST: 'tenant-registry.di-runtime-acme.svc',
+      }),
+      kube,
+      { issuer: 'https://issuer.test' } as never,
+      { resolve: async () => alice, forget: () => {} } as never,
+      { kube, namespace: 'di-runtime-acme', tenant: 'acme' },
+    );
+    const digest = deployBundle().component.digest;
+    const send = (path: string, bundle: unknown) =>
+      pulling.handle(
+        new Request(`http://controller.test${path}`, {
+          method: 'POST',
+          headers: { authorization: 'Bearer ok', 'content-type': 'application/json' },
+          body: JSON.stringify(bundle),
+        }),
+      );
+    const withImages = (component: string, service?: string) => {
+      const bundle = deployBundle();
+      const spec = (bundle.workload as { spec: { template: { spec: Record<string, unknown> } } })
+        .spec.template.spec;
+      (spec.components as { image: string }[])[0]!.image = component;
+      if (service) spec.service = { name: 'svc', image: service };
+      return bundle;
+    };
+    const publicImage = `registry.acme.localhost:28180/web@${digest}`;
+    for (const [bundle, image] of [
+      [withImages(publicImage), publicImage],
+      [withImages(`tenant-registry.di-runtime-acme.svc/web@${digest}`, publicImage), publicImage],
+    ] as const)
+      for (const path of ['/v1/deploy', '/v1/deploy/preview']) {
+        const response = await send(path, bundle);
+        expect(response.status).toBe(422);
+        expect(await response.json()).toMatchObject({
+          detail:
+            `${image} names the tenant registry's public origin, which hosts cannot pull from; ` +
+            `push there, but reference tenant-registry.di-runtime-acme.svc/web@${digest} in the workload`,
+        });
+      }
+    expect(api.requests).toHaveLength(0);
+    // The in-cluster reference passes this check.
+    const ok = await send(
+      '/v1/deploy/preview',
+      withImages(`tenant-registry.di-runtime-acme.svc/web@${digest}`),
+    );
+    expect(ok.status).not.toBe(422);
+  });
+
   test.each([
     [403, 'workloaddeployments is forbidden', 'Forbidden'],
     [409, 'Apply failed with 1 conflict', 'Conflict'],
