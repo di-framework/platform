@@ -364,7 +364,7 @@ function tenantResources(
   cfg: ControllerConfig,
   schedulerSecret?: { data: Record<string, string> },
   storageKeys: string[] = [],
-  tenantAuthQuota = !!cfg.tenantAuth,
+  tenantAuthQuota = false,
 ): Resource[] {
   const n = names(tenant.metadata.name);
   const storage = hostStorage(tenant, cfg, storageKeys);

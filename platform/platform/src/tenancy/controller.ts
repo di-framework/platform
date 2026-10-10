@@ -278,13 +278,14 @@ export class Controller {
     apiVersion: string,
     kind: string,
     labels: Record<string, string>,
+    namespace?: string,
   ): Promise<T[]> {
     const selector = Object.entries(labels)
       .map(([key, value]) => `${key}=${value}`)
       .join(',');
     const result = await this.api.call<{ items: T[] }>(
       'GET',
-      `${collection(apiVersion, kind)}?labelSelector=${encodeURIComponent(selector)}`,
+      `${collection(apiVersion, kind, namespace)}?labelSelector=${encodeURIComponent(selector)}`,
     );
     // Core Kubernetes list items may omit TypeMeta even though individual GETs include it.
     return result.items.map((item) => ({ ...item, apiVersion, kind }));
@@ -524,6 +525,8 @@ export class Controller {
         true,
       );
     }
+    // Everything above and these reads can still throw before the try block below; such a
+    // failure rejects the tick and skips tenant-auth until the next poll.
     const secret = await this.get<{ data: Record<string, string> }>(
       `${collection('v1', 'Secret', this.cfg.namespace)}/wasmcloud-runtime-tls`,
     );
@@ -660,11 +663,16 @@ export class Controller {
   /** Whether the tenant-auth Deployments of `tenant` exist, i.e. the quota may stay raised. */
   private async tenantAuthDeployed(tenant: Tenant): Promise<boolean> {
     if (!this.cfg.tenantAuth) return false;
-    const deployments = await this.list<Resource>('apps/v1', 'Deployment', {
-      [INSTALLATION]: this.cfg.installation,
-      [OWNER]: tenant.metadata.uid!,
-      [COMPONENT]: 'tenant-auth',
-    });
+    const deployments = await this.list<Resource>(
+      'apps/v1',
+      'Deployment',
+      {
+        [INSTALLATION]: this.cfg.installation,
+        [OWNER]: tenant.metadata.uid!,
+        [COMPONENT]: 'tenant-auth',
+      },
+      names(tenant.metadata.name).runtimeNamespace,
+    );
     return deployments.length > 0;
   }
   /**

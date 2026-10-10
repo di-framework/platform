@@ -174,7 +174,11 @@ describe('tenant-auth quota', () => {
   it('grows the runtime quota by the pair’s limits so the tenant keeps its whole budget', () => {
     const quota = (c: ControllerConfig, spec: Tenant['spec'] = {}) =>
       (
-        find(tenantResources(tenant(spec), c), 'ResourceQuota', 'di-runtime-quota') as unknown as {
+        find(
+          tenantResources(tenant(spec), c, undefined, [], !!c.tenantAuth),
+          'ResourceQuota',
+          'di-runtime-quota',
+        ) as unknown as {
           spec: { hard: Record<string, string> };
         }
       ).spec.hard;
@@ -615,8 +619,10 @@ class MemoryApi implements Api {
         items: [...this.objects.values()]
           .filter(
             (v) =>
-              collection(v.apiVersion, v.kind) === url.pathname &&
-              labels.every(([k, x]) => v.metadata.labels?.[k!] === x),
+              [
+                collection(v.apiVersion, v.kind),
+                collection(v.apiVersion, v.kind, v.metadata.namespace),
+              ].includes(url.pathname) && labels.every(([k, x]) => v.metadata.labels?.[k!] === x),
           )
           .map(({ apiVersion: _version, kind: _kind, ...item }) => item),
       } as T;
@@ -1029,6 +1035,11 @@ describe('tenant-auth reconcile ordering (#121)', () => {
     await controller.reconcileTenant(t, [alice]);
     expect(conditions(t).Ready?.status).toBe('True');
     expect(cpu(api)).toBe('2500m');
+    // A steady-state tick with the pair present never lowers the quota to the base value.
+    const before = api.patches.length;
+    await controller.reconcileTenant(t, [alice]);
+    expect(api.patches.slice(before)).not.toContain(`${quotaPath} 2`);
+    expect(cpu(api)).toBe('2500m');
     await controller.reconcileUser(alice, [t]);
     expect(
       [...api.objects.values()].some(
@@ -1061,5 +1072,7 @@ describe('tenant-auth reconcile ordering (#121)', () => {
     const c = conditions(t);
     expect(c.Ready).toMatchObject({ status: 'False', reason: 'ReconcileError' });
     expect(c.TenantAuthReady).toMatchObject({ status: 'False', reason: 'ReconcileError' });
+    // The raise landed, the lowering conflicted, and the next poll retries it.
+    expect(cpu(api)).toBe('2500m');
   });
 });
