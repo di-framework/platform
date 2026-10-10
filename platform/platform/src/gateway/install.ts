@@ -1,7 +1,14 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
-import { GATEWAY_NAME, GATEWAY_POD_LABELS, INSTALLATION, TENANT } from '../tenancy/resources';
+import {
+  GATEWAY_NAME,
+  GATEWAY_POD_LABELS,
+  INSTALLATION,
+  NAMESPACE_ROLE,
+  TENANT,
+  type TenantAuthRoutes,
+} from '../tenancy/resources';
 import type { GatewayConfig } from './gateway';
 
 export { GATEWAY_NAME, GATEWAY_POD_LABELS };
@@ -46,10 +53,15 @@ export function gatewayScriptHash(scripts: Record<string, string>): string {
 }
 
 /** Gateway Deployment spec. It needs no Kubernetes API access, so it mounts no token. */
-export function gatewayDeploymentSpec(namespace: string, scriptHash: string) {
+export function gatewayDeploymentSpec(
+  namespace: string,
+  scriptHash: string,
+  tenantAuthRoutes: TenantAuthRoutes = {},
+) {
   const config: GatewayConfig = {
     port: GATEWAY_PORT,
     defaultUpstream: `wasmcloud-http.${namespace}.svc.cluster.local`,
+    ...(Object.keys(tenantAuthRoutes).length ? { tenantAuthRoutes } : {}),
   };
   return {
     replicas: 1,
@@ -112,22 +124,41 @@ export function gatewayServiceSpec(nodePort: number) {
   };
 }
 
-/** Gateway egress: cluster DNS and host group HTTP only (default and tenant runtimes).
- * Tenant runtimes admit it through their own `di-tenant-gateway` policy. */
-export function gatewayNetworkPolicySpec(namespace: string, installation: string) {
+/** Gateway egress: cluster DNS and host group HTTP only (default and tenant runtimes), plus the
+ * routed tenant console (8787) and controller (8788) ports when tenant-auth routes are set.
+ * Tenant runtimes admit it through their own `di-tenant-gateway` / `tenant-*-gateway` policies. */
+export function gatewayNetworkPolicySpec(
+  namespace: string,
+  installation: string,
+  tenantAuthRoutes: TenantAuthRoutes = {},
+) {
+  const tenantNamespaces: Selector = {
+    matchLabels: { [INSTALLATION]: installation },
+    matchExpressions: [{ key: TENANT, operator: 'Exists' }],
+  };
+  const routed = [
+    ...(tenantAuthRoutes.console ? [['tenant-console', 8787] as const] : []),
+    ...(tenantAuthRoutes.controller ? [['tenant-controller', 8788] as const] : []),
+  ].map(([app, port]) => ({
+    to: [
+      {
+        // Only this installation's `di-runtime-<tenant>` namespaces run the pair.
+        namespaceSelector: {
+          ...tenantNamespaces,
+          matchLabels: { ...tenantNamespaces.matchLabels, [NAMESPACE_ROLE]: 'runtime' },
+        },
+        podSelector: { matchLabels: { app } },
+      },
+    ],
+    ports: [{ protocol: 'TCP', port }],
+  }));
   const hostgroup: Selector = { matchLabels: { 'wasmcloud.com/name': 'hostgroup' } };
   const hosts: { namespaceSelector: Selector; podSelector: Selector }[] = [
     {
       namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': namespace } },
       podSelector: hostgroup,
     },
-    {
-      namespaceSelector: {
-        matchLabels: { [INSTALLATION]: installation },
-        matchExpressions: [{ key: TENANT, operator: 'Exists' }],
-      },
-      podSelector: hostgroup,
-    },
+    { namespaceSelector: tenantNamespaces, podSelector: hostgroup },
   ];
   return {
     podSelector: { matchLabels: GATEWAY_POD_LABELS },
@@ -151,6 +182,7 @@ export function gatewayNetworkPolicySpec(namespace: string, installation: string
         ],
       },
       { to: hosts, ports: [{ protocol: 'TCP', port: 9191 }] },
+      ...routed,
     ],
   };
 }

@@ -13,7 +13,7 @@ import {
   routeUrlPatternFor,
   validateRouteUrlPattern,
 } from '../src/gateway/install';
-import { INSTALLATION, TENANT } from '../src/tenancy/resources';
+import { INSTALLATION, NAMESPACE_ROLE, TENANT } from '../src/tenancy/resources';
 
 describe('route URL pattern', () => {
   it('derives the pattern from a loopback HTTP endpoint only', () => {
@@ -118,5 +118,48 @@ describe('gateway resources', () => {
         podSelector: { matchLabels: { 'wasmcloud.com/name': 'hostgroup' } },
       },
     ]);
+  });
+});
+
+describe('tenant-auth gateway routes (#58:routes)', () => {
+  const routes = { console: 'console', controller: 'controller' };
+
+  it('passes the routes to the gateway only when there are any', () => {
+    const env = (spec: ReturnType<typeof gatewayDeploymentSpec>) =>
+      JSON.parse(spec.template.spec.containers[0]!.env[0]!.value);
+    expect(env(gatewayDeploymentSpec('wasmcloud', 'abc', routes)).tenantAuthRoutes).toEqual(routes);
+    expect(env(gatewayDeploymentSpec('wasmcloud', 'abc', {}))).not.toHaveProperty(
+      'tenantAuthRoutes',
+    );
+  });
+
+  it('lets the gateway reach the routed console and controller ports and nothing more', () => {
+    // Only runtime namespaces, not every namespace of the tenant.
+    const tenants = {
+      matchLabels: { [INSTALLATION]: 'di-test', [NAMESPACE_ROLE]: 'runtime' },
+      matchExpressions: [{ key: TENANT, operator: 'Exists' }],
+    };
+    const policy = gatewayNetworkPolicySpec('wasmcloud', 'di-test', routes);
+    expect(policy.egress.slice(2)).toEqual([
+      {
+        to: [
+          { namespaceSelector: tenants, podSelector: { matchLabels: { app: 'tenant-console' } } },
+        ],
+        ports: [{ protocol: 'TCP', port: 8787 }],
+      },
+      {
+        to: [
+          {
+            namespaceSelector: tenants,
+            podSelector: { matchLabels: { app: 'tenant-controller' } },
+          },
+        ],
+        ports: [{ protocol: 'TCP', port: 8788 }],
+      },
+    ]);
+    expect(
+      gatewayNetworkPolicySpec('wasmcloud', 'di-test', { console: 'console' }).egress,
+    ).toHaveLength(3);
+    expect(gatewayNetworkPolicySpec('wasmcloud', 'di-test').egress).toHaveLength(2);
   });
 });

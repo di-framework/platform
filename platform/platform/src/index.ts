@@ -17,7 +17,12 @@ import {
   resolveBackingServiceClasses,
   seedTenantNamespaces,
 } from './tenancy';
-import { names, type TenantAuthConfig, userTokenSecretName } from './tenancy/resources';
+import {
+  names,
+  type TenantAuthConfig,
+  tenantAuthRoutes,
+  userTokenSecretName,
+} from './tenancy/resources';
 import { platformValues } from './values';
 
 export { kubeconfigServer, type TenantKubeconfigArgs, tenantKubeconfig } from './kubeconfig';
@@ -213,6 +218,9 @@ export function createPlatform(args: PlatformArgs) {
     { provider, dependsOn: [runtimeShutdown] },
   );
 
+  const tenantAuth = config.getObject<TenantAuthConfig>('tenantAuth');
+  // Gateway routes for each tenant's console and controller hosts (#58).
+  const { routes: tenantAuthRouteHosts } = tenantAuthRoutes(tenantAuth, routeUrlPattern);
   const gatewayScript = loadGatewayScript();
   const gatewayScripts = new k8s.core.v1.ConfigMap(
     'http-gateway',
@@ -223,7 +231,7 @@ export function createPlatform(args: PlatformArgs) {
     'http-gateway',
     {
       metadata: { name: GATEWAY_NAME, namespace: namespaceName },
-      spec: gatewayNetworkPolicySpec(namespaceName, scope),
+      spec: gatewayNetworkPolicySpec(namespaceName, scope, tenantAuthRouteHosts),
     },
     { provider, dependsOn: [namespaceResource] },
   );
@@ -231,7 +239,11 @@ export function createPlatform(args: PlatformArgs) {
     'http-gateway',
     {
       metadata: { name: GATEWAY_NAME, namespace: namespaceName },
-      spec: gatewayDeploymentSpec(namespaceName, gatewayScriptHash(gatewayScript)),
+      spec: gatewayDeploymentSpec(
+        namespaceName,
+        gatewayScriptHash(gatewayScript),
+        tenantAuthRouteHosts,
+      ),
     },
     { provider, dependsOn: [gatewayScripts, gatewayPolicy, httpBackend] },
   );
@@ -257,7 +269,7 @@ export function createPlatform(args: PlatformArgs) {
     hostImagePullPolicy: config.get('tenantHostImagePullPolicy') ?? 'IfNotPresent',
     backingServiceClasses: resolveBackingServiceClasses(config),
     routeUrlPattern,
-    tenantAuth: config.getObject<TenantAuthConfig>('tenantAuth'),
+    tenantAuth,
   });
   const tenants = tenancy.tenants.map((t) =>
     t.metadata.name.apply((name) => ({ name, ...names(name) })),

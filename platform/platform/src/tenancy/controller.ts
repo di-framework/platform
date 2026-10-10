@@ -57,6 +57,7 @@ import {
   type ControllerConfig,
   FINALIZER,
   INSTALLATION,
+  NAMESPACE_ROLE,
   names,
   OWNER,
   type Resource,
@@ -69,6 +70,7 @@ import {
   type Tenant,
   type TenantAuthInputs,
   tenantAuthResources,
+  tenantAuthRoutes,
   tenantControllerCertNames,
   tenantResources,
   type User,
@@ -520,10 +522,18 @@ export class Controller {
       return;
     }
     for (const name of [n.namespace, n.runtimeNamespace]) {
-      await this.ensure(
-        resource(tenant, this.cfg.installation, 'v1', 'Namespace', name, undefined, {}),
-        true,
+      const namespace = resource(
+        tenant,
+        this.cfg.installation,
+        'v1',
+        'Namespace',
+        name,
+        undefined,
+        {},
       );
+      // The gateway's egress to the tenant console and controller selects runtime namespaces only.
+      if (name === n.runtimeNamespace) namespace.metadata.labels![NAMESPACE_ROLE] = 'runtime';
+      await this.ensure(namespace, true);
     }
     // Everything above and these reads can still throw before the try block below; such a
     // failure rejects the tick and skips tenant-auth until the next poll.
@@ -628,6 +638,20 @@ export class Controller {
             (await this.list<User>(VERSION, 'User', { [INSTALLATION]: this.cfg.installation })),
         ),
       );
+      // Gateway policies for hosts that are no longer routed, pruned before anything is applied
+      // so de-routing holds even when a later apply fails.
+      const namespace = names(tenant.metadata.name).runtimeNamespace;
+      for (const policy of ['tenant-console-gateway', 'tenant-controller-gateway']) {
+        if (desired.some((value) => value.metadata.name === policy)) continue;
+        const stale = await this.get<Resource>(
+          `${collection('networking.k8s.io/v1', 'NetworkPolicy', namespace)}/${policy}`,
+        );
+        if (
+          stale?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+          stale.metadata.labels[OWNER] === tenant.metadata.uid
+        )
+          await this.remove(stale);
+      }
       // Raise the quota right before the pair so its pods fit when they are created (#121).
       await this.ensure(runtimeQuota(tenant, this.cfg, true));
       let ready = true;
@@ -643,6 +667,8 @@ export class Controller {
             (status?.readyReplicas ?? 0) === spec.replicas;
         }
       }
+      const { problems } = tenantAuthRoutes(this.cfg.tenantAuth, this.cfg.routeUrlPattern);
+      if (problems.length) return condition(false, 'RouteError', problems.join('; '));
       return ready
         ? condition(true, 'Reconciled', 'Tenant controller and console are ready')
         : condition(false, 'Provisioning', 'Waiting for the tenant controller and console');

@@ -10,6 +10,7 @@ import {
   type ControllerConfig,
   FINALIZER,
   INSTALLATION,
+  NAMESPACE_ROLE,
   names,
   OWNER,
   type Resource,
@@ -296,6 +297,11 @@ describe('tenant and user resource reconciliation', () => {
     expect(api.objects.get('/api/v1/namespaces/di-tenant-alpha')?.metadata.labels?.[OWNER]).toBe(
       'alpha-uid',
     );
+    // Only the runtime namespace is marked for the gateway's tenant-auth egress.
+    const role = (name: string) =>
+      api.objects.get(`/api/v1/namespaces/${name}`)?.metadata.labels?.[NAMESPACE_ROLE];
+    expect(role('di-runtime-alpha')).toBe('runtime');
+    expect(role('di-tenant-alpha')).toBeUndefined();
     expect(t.status?.conditions?.[0]?.status).toBe('True');
   });
   it('refuses to adopt a foreign namespace', async () => {
