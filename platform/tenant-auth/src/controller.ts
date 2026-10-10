@@ -44,25 +44,43 @@ export interface ControllerConfig {
   registryUrl?: string;
 }
 
-/** Resolves `{tenant}` in a registry URL pattern and checks it is a bare http(s) origin. */
+/**
+ * True for hosts where plain `http://` cannot leave the machine or cluster: loopback and in-cluster
+ * Service names. Same rule as `platform/oci-registry` (`is_cluster_local`).
+ */
+function isClusterLocal(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  if (host === 'localhost' || host === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(host)) return true;
+  return (host.endsWith('.svc') || host.endsWith('.svc.cluster.local')) && !host.startsWith('.');
+}
+
+/**
+ * Resolves `{tenant}` in a registry URL pattern and checks it is a bare http(s) origin. Clients send
+ * their identity token or `dik_` key to this origin as the Basic password, so plain `http://` is
+ * accepted only for loopback and in-cluster hosts. Errors never echo the value, which may carry a
+ * credential.
+ */
 export function registryOrigin(pattern: string | undefined, tenant: string): string | undefined {
   if (!pattern) return undefined;
-  const value = pattern.replaceAll('{tenant}', tenant);
+  const name = 'TENANT_CONTROLLER_REGISTRY_URL';
   let url: URL;
   try {
-    url = new URL(value);
+    url = new URL(pattern.replaceAll('{tenant}', tenant));
   } catch {
-    throw new Error(`TENANT_CONTROLLER_REGISTRY_URL is not a URL: ${value}`);
+    throw new Error(`${name} is not a URL`);
   }
-  if (
-    !['http:', 'https:'].includes(url.protocol) ||
-    url.username ||
-    url.password ||
-    url.pathname !== '/' ||
-    url.search ||
-    url.hash
-  )
-    throw new Error(`TENANT_CONTROLLER_REGISTRY_URL must be an http(s) origin: ${value}`);
+  if (!['http:', 'https:'].includes(url.protocol))
+    throw new Error(`${name} must be an http(s) origin: unsupported scheme`);
+  if (url.username || url.password)
+    throw new Error(`${name} must be an http(s) origin: userinfo is not allowed`);
+  if (url.pathname !== '/' || url.search || url.hash)
+    throw new Error(
+      `${name} must be an http(s) origin: path, query and fragment are not allowed (${url.host})`,
+    );
+  if (url.protocol === 'http:' && !isClusterLocal(url.hostname))
+    throw new Error(
+      `${name} must use https:// unless the host is loopback or *.svc / *.svc.cluster.local (${url.host})`,
+    );
   return url.origin;
 }
 

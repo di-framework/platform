@@ -1,60 +1,31 @@
-import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
-import { Controller, configFromEnv } from '../src/controller.ts';
-import { AuthError, type Principal } from '../src/identity.ts';
-import { KubeClient } from '../src/kube.ts';
-import { json, serve } from './support/servers.ts';
+import { describe, expect, test } from 'bun:test';
+import { alice, bob, servedController } from './support/controller.ts';
+import { json } from './support/servers.ts';
 
 /**
  * The controller served over real HTTP, in front of a fake API server that mints tokens and
  * echoes everything else, so a request that leaks to the Kubernetes proxy is visible.
  */
 describe('/v1 dispatch', () => {
-  const api = serve((request) => {
-    if (/\/serviceaccounts\/di-user-(alice|bob)\/token$/.test(request.pathname))
-      return json({
-        status: {
-          token: 'sa',
-          expirationTimestamp: new Date(Date.now() + 3_600_000).toISOString(),
-        },
-      });
-    return json({ echo: request.path });
+  const served = servedController({
+    api: (request) => {
+      if (/\/serviceaccounts\/di-user-(alice|bob)\/token$/.test(request.pathname))
+        return json({
+          status: {
+            token: 'sa',
+            expirationTimestamp: new Date(Date.now() + 3_600_000).toISOString(),
+          },
+        });
+      return json({ echo: request.path });
+    },
+    principals: {
+      ok: alice,
+      viewer: bob,
+      stranger: { ...alice, role: 'owner' } as never,
+      roleless: { ...alice, role: undefined } as never,
+    },
   });
-  const alice: Principal = {
-    user: 'alice',
-    account: 'acme',
-    role: 'developer',
-    via: 'identity',
-    credentialId: 's',
-  };
-  const bob: Principal = { ...alice, user: 'bob', role: 'viewer' };
-  const kube = new KubeClient({ server: api.url, token: 'admin' }, 'wasmcloud');
-  const controller = new Controller(
-    configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme' }),
-    kube,
-    { issuer: 'https://issuer.test' } as never,
-    {
-      resolve: async (authorization: string | null) => {
-        if (authorization === 'Bearer ok') return alice;
-        if (authorization === 'Bearer viewer') return bob;
-        if (authorization === 'Bearer stranger') return { ...alice, role: 'owner' } as never;
-        if (authorization === 'Bearer roleless') return { ...alice, role: undefined } as never;
-        throw new AuthError(401, 'a bearer token is required');
-      },
-      forget: () => {},
-    } as never,
-    { kube, namespace: 'di-runtime-acme', tenant: 'acme' },
-  );
-  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: (r) => controller.handle(r) });
-  const base = `http://127.0.0.1:${server.port}`;
-  let log: ReturnType<typeof spyOn>;
-  beforeAll(() => {
-    log = spyOn(console, 'log').mockImplementation(() => {});
-  });
-  afterAll(() => {
-    log.mockRestore();
-    server.stop(true);
-    api.stop();
-  });
+  const { api, base } = served;
 
   const call = (
     method: string,
@@ -266,7 +237,7 @@ describe('/v1 dispatch', () => {
         detail: `a viewer may not call ${operation}`,
       } as never);
       expect(reachedCluster('/v1')).toBe(false);
-      expect(log).toHaveBeenCalledWith(expect.stringContaining('"request.denied"'));
+      expect(served.log).toHaveBeenCalledWith(expect.stringContaining('"request.denied"'));
     });
 
     test.each([
