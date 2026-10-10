@@ -52,6 +52,67 @@ platform.
 `tenants`, `users`, and the other platform settings are shared with the
 existing-cluster entrypoint.
 
+Each `tenants` entry is a Tenant CR: `name` is the CR name and every other key is its
+`spec`. For example, `tenants: [{ name: identity, runtime: { coreInstances: 300 } }]`.
+
+### Tenant host core instances
+
+`spec.runtime.coreInstances` (integer, `1`–`10000`, default `100`) sets
+`WASH_CORE_INSTANCES` on the tenant's hostgroup Deployment. The CRD schema enforces the
+bounds, and `pulumi up` rejects an out-of-range `tenants[].runtime.coreInstances` before
+it reaches the cluster. Changing the value changes the host pod template, so it rolls the
+tenant host.
+
+Do not `kubectl set env` the hostgroup Deployment. An Update like that takes ownership of
+the env value away from `di-platform-controller`, and every later server-side apply
+of that Deployment fails with 409, which blocks the whole apply (not only the env field;
+see `docs/hostgroup-409-diagnosis.md`). The controller never force-applies. To clear a
+hand edit that already exists, run this procedure once per Deployment. For `identity`
+(live value `300`):
+
+> **Warning (rollout):** step 1 is the controller's first successful apply on
+> `hostgroup-tenant-identity` since 2026-10-07. It lands the #104 `strategy` and any
+> pod-template changes accumulated since, so identity's single host may roll once.
+
+```sh
+T=identity
+OWNERS='.metadata.managedFields[] | select([.fieldsV1 | .. | objects | select(has("k:{\"name\":\"WASH_CORE_INSTANCES\"}")) | .["k:{\"name\":\"WASH_CORE_INSTANCES\"}"] | has("f:value")] | any) | .manager'
+```
+
+1. Set identity's `coreInstances: 300` in the `di-framework-kube:tenants` config
+   (`tenants: [{ name: identity, runtime: { coreInstances: 300 } }]`) and run `pulumi up`.
+2. Wait until the Tenant is `Ready=True` and `di-platform-controller` owns `f:value` on the
+   `WASH_CORE_INSTANCES` env entry. Do not continue until both hold:
+
+   ```sh
+   kubectl get tenant $T -o json | jq -r '.status.conditions[] | select(.type=="Ready") | .status'   # True
+   kubectl get deploy hostgroup-tenant-$T -n di-runtime-$T --show-managed-fields -o json | jq -r "$OWNERS"
+   # must list di-platform-controller (and still kubectl-set)
+   ```
+
+3. Remove the stale `kubectl-set` entry. The two `test` ops make the patch atomic: it
+   applies only if that index still holds the `kubectl-set` `Update` entry.
+
+   ```sh
+   i=$(kubectl get deploy hostgroup-tenant-$T -n di-runtime-$T --show-managed-fields -o json \
+     | jq '.metadata.managedFields | map(.manager=="kubectl-set" and .operation=="Update") | index(true)')
+   if [ "$i" = null ]; then echo "no kubectl-set entry; nothing to remove"; else
+     kubectl patch deploy hostgroup-tenant-$T -n di-runtime-$T --type=json \
+       -p "[{\"op\":\"test\",\"path\":\"/metadata/managedFields/$i/manager\",\"value\":\"kubectl-set\"},{\"op\":\"test\",\"path\":\"/metadata/managedFields/$i/operation\",\"value\":\"Update\"},{\"op\":\"remove\",\"path\":\"/metadata/managedFields/$i\"}]"
+   fi
+   ```
+
+4. Re-check that only `di-platform-controller` owns the value:
+
+   ```sh
+   kubectl get deploy hostgroup-tenant-$T -n di-runtime-$T --show-managed-fields -o json | jq -r "$OWNERS"
+   # must print exactly: di-platform-controller
+   ```
+
+The order matters. If step 3 runs before the controller owns the value (step 2), removing
+`kubectl-set` leaves `WASH_CORE_INSTANCES` unowned, and the next apply sets `"100"`,
+rolling the host back from 300.
+
 ## Existing-cluster configuration
 
 `kubeconfig` is required (a local file path); `context`, `namespace`, `release`,

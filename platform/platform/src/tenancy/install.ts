@@ -5,10 +5,44 @@ import { validEgressPolicyEntry } from './egress';
 import {
   type BackingCapability,
   type BackingServiceClassSpec,
+  CORE_INSTANCES,
   DEFAULT_CLASS_NAMES,
   defaultClassSeed,
+  INSTALLATION,
+  type Resource,
+  type TenantSpec,
+  VERSION,
   validName,
 } from './resources';
+
+/** One `tenants` Pulumi config entry, for example `{ name: identity, runtime: { coreInstances: 300 } }`. */
+export interface TenantDeclaration extends TenantSpec {
+  name: string;
+}
+/** Rejects settings the Tenant CRD schema would reject, before `pulumi up` reaches the cluster. */
+export function assertTenantDeclaration(tenant: TenantDeclaration): void {
+  const core = tenant.runtime?.coreInstances;
+  if (
+    core !== undefined &&
+    (!Number.isInteger(core) || core < CORE_INSTANCES.minimum || core > CORE_INSTANCES.maximum)
+  )
+    throw new Error(
+      `Tenant ${tenant.name} runtime.coreInstances must be an integer from ${CORE_INSTANCES.minimum} to ${CORE_INSTANCES.maximum}`,
+    );
+}
+/** The Tenant CR for one `tenants` config entry: everything but `name` is the spec. */
+export function tenantObject({ name, ...spec }: TenantDeclaration, installation: string): Resource {
+  return {
+    apiVersion: VERSION,
+    kind: 'Tenant',
+    metadata: {
+      name,
+      labels: { [INSTALLATION]: installation },
+      annotations: { 'pulumi.com/waitFor': 'condition=Ready' },
+    },
+    spec,
+  } as Resource;
+}
 
 /** Controller ConfigMap modules. TypeScript emit does not bundle imports, so
  * `egress`, `backing-services`, `backing-service-reconcile`, `service-binding-reconcile`, and

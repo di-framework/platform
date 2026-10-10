@@ -2,11 +2,14 @@ import * as k8s from '@pulumi/kubernetes';
 import type * as pulumi from '@pulumi/pulumi';
 import { admissionResources } from './tenancy/admission';
 import {
+  assertTenantDeclaration,
   type BackingServiceClassDeclaration,
   controllerClusterRoleRules,
   controllerScriptHash,
   defaultBackingServiceClasses,
   loadControllerScripts,
+  type TenantDeclaration,
+  tenantObject,
 } from './tenancy/install';
 import {
   assertTenantAuthConfig,
@@ -16,7 +19,6 @@ import {
   type Resource,
   TENANT,
   type TenantAuthConfig,
-  type TenantSpec,
   type UserSpec,
   VERSION,
   validName,
@@ -32,11 +34,10 @@ export {
   defaultBackingServiceClasses,
   loadControllerScripts,
   resolveBackingServiceClasses,
+  type TenantDeclaration,
+  tenantObject,
 } from './tenancy/install';
 
-export interface TenantDeclaration extends TenantSpec {
-  name: string;
-}
 export interface UserDeclaration extends UserSpec {
   name: string;
 }
@@ -57,6 +58,7 @@ export function declarations(config: pulumi.Config): {
     if (new Set(values.map((v) => v.name)).size !== values.length)
       throw new Error(`Duplicate ${kind} names`);
   }
+  for (const tenant of tenants) assertTenantDeclaration(tenant);
   for (const user of users) {
     if (
       !Array.isArray(user.memberships) ||
@@ -299,20 +301,8 @@ export function installTenancy(args: {
     },
     [...definitions, ...policies, ...backingServiceClasses, binding, scripts, network],
   );
-  const tenants = args.tenants.map(({ name, ...spec }) =>
-    createCustom(
-      {
-        apiVersion: VERSION,
-        kind: 'Tenant',
-        metadata: {
-          name,
-          labels: { [INSTALLATION]: installation },
-          annotations: { 'pulumi.com/waitFor': 'condition=Ready' },
-        },
-        spec,
-      } as Resource,
-      [controller, ...args.dependsOn],
-    ),
+  const tenants = args.tenants.map((tenant) =>
+    createCustom(tenantObject(tenant, installation), [controller, ...args.dependsOn]),
   );
   const users = args.users.map(({ name, ...spec }) =>
     createCustom(
