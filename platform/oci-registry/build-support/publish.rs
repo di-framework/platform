@@ -6,10 +6,10 @@ use std::{
     env,
     error::Error,
     fs,
-    io::Read,
+    io::{Read, Write},
     path::Path,
     process::{Command, Output, Stdio},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -222,17 +222,19 @@ struct DockerConfigDir {
 
 impl DockerConfigDir {
     fn new(registries: &[&str], username: &str, password: &str) -> Result<Self> {
-        let path = env::temp_dir().join(format!(
-            "wash-docker-{}-{}",
-            std::process::id(),
-            Instant::now().elapsed().as_nanos()
-        ));
-        fs::create_dir_all(&path)?;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = env::temp_dir().join(format!("wash-docker-{}-{nanos}", std::process::id()));
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o700));
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().mode(0o700).create(&path)?;
         }
+        #[cfg(not(unix))]
+        fs::create_dir(&path)?;
+
         let auth = base64_encode(format!("{username}:{password}").as_bytes());
         let mut auths = serde_json::Map::new();
         for &reg in registries {
@@ -247,15 +249,19 @@ impl DockerConfigDir {
             }
         }
         let config_file = path.join("config.json");
-        fs::write(
-            &config_file,
-            serde_json::to_vec_pretty(&serde_json::json!({ "auths": auths }))?,
-        )?;
+        let contents = serde_json::to_vec_pretty(&serde_json::json!({ "auths": auths }))?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&config_file, fs::Permissions::from_mode(0o600));
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&config_file)?;
+            file.write_all(&contents)?;
         }
+        #[cfg(not(unix))]
+        fs::write(&config_file, contents)?;
         Ok(Self { path })
     }
 }
@@ -421,11 +427,14 @@ pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<(
     // Verify the immutable manifest returned by the push, not a movable tag.
     // Download to a temporary path outside dist/ so failed or unverified artifacts
     // never pollute the build output, and clean up on all paths via drop guard.
-    let pulled = env::temp_dir().join(format!(
-        "wash-pulled-{}-{}.wasm",
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
-    ));
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pulled = env::temp_dir().join(format!("wash-pulled-{}-{nanos}.wasm", std::process::id()));
+    if pulled.exists() {
+        let _ = fs::remove_file(&pulled);
+    }
     let _pulled_guard = TempFileGuard(pulled.clone());
     let mut pull: Vec<String> = vec![
         "oci".to_owned(),
