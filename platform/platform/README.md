@@ -409,7 +409,9 @@ tenantAuth:
 - Placement and quota: both run in `di-runtime-<tenant>`, next to the `di-http` Service the
   controller proxies to, and `di-runtime-quota` grows by their limits (`500m` CPU, `448Mi`
   memory, sidecar included), so `spec.resources` stays the tenant's budget for the host and
-  backing services.
+  backing services. The tenant step keeps the base quota; only the tenant-auth step raises it,
+  right before it applies the pair, and it lowers it again if the pair does not exist after a
+  failed apply. Quota changes do not evict running pods.
 - OAuth client: until per-tenant clients (#59), every console shares one confidential client.
   An administrator stores its secret in a Secret in the platform namespace; the reconcile
   copies it into `tenant-console-oauth` in each runtime namespace. The controller never reads
@@ -435,7 +437,10 @@ tenantAuth:
 - The controller Deployment stays at one replica with `Recreate`: proxy sessions live in its
   memory. A new image digest rolls both pods.
 - Status: problems here are reported on the Tenant's `TenantAuthReady` condition. Ready, and
-  with it every member's access, does not depend on the controller or console.
+  with it every member's access, does not depend on the controller or console. Tenant-auth
+  reconciles even when the tenant's own objects fail to apply (such as a hostgroup conflict);
+  then two conditions are reported: `Ready` False with reason `ReconcileError` and the
+  conflict text, and `TenantAuthReady` for the pair itself.
 - Cleanup: deleting the Tenant deletes the cluster-scoped and platform-namespace objects too;
   unsetting `tenantAuth` removes every object labelled `platform.di-framework.dev/component:
   tenant-auth` and the quota addition.

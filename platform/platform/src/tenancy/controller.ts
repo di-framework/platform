@@ -62,6 +62,7 @@ import {
   type Resource,
   ROUTES_CONFIG_NAME,
   resource,
+  runtimeQuota,
   type ServiceBinding,
   type SizingParameters,
   TENANT,
@@ -277,13 +278,14 @@ export class Controller {
     apiVersion: string,
     kind: string,
     labels: Record<string, string>,
+    namespace?: string,
   ): Promise<T[]> {
     const selector = Object.entries(labels)
       .map(([key, value]) => `${key}=${value}`)
       .join(',');
     const result = await this.api.call<{ items: T[] }>(
       'GET',
-      `${collection(apiVersion, kind)}?labelSelector=${encodeURIComponent(selector)}`,
+      `${collection(apiVersion, kind, namespace)}?labelSelector=${encodeURIComponent(selector)}`,
     );
     // Core Kubernetes list items may omit TypeMeta even though individual GETs include it.
     return result.items.map((item) => ({ ...item, apiVersion, kind }));
@@ -523,40 +525,63 @@ export class Controller {
         true,
       );
     }
+    // Everything above and these reads can still throw before the try block below; such a
+    // failure rejects the tick and skips tenant-auth until the next poll.
     const secret = await this.get<{ data: Record<string, string> }>(
       `${collection('v1', 'Secret', this.cfg.namespace)}/wasmcloud-runtime-tls`,
     );
     const workloads = await this.storageWorkloads(tenant);
-    const desired = tenantResources(tenant, this.cfg, secret, storageKeys(workloads));
+    // The quota keeps the tenant-auth addition only while its Deployments exist; the
+    // tenant-auth step below is the one that raises it (#121).
+    const desired = tenantResources(
+      tenant,
+      this.cfg,
+      secret,
+      storageKeys(workloads),
+      await this.tenantAuthDeployed(tenant),
+    );
     let ready = !!secret;
-    if (!this.cfg.routeUrlPattern) await this.removeRoutes(tenant);
-    for (const value of desired) {
-      const applied = await this.ensure(value);
-      if (value.kind === 'Deployment') {
-        const spec = applied.spec as { replicas: number };
-        const status = applied.status as
-          | { observedGeneration?: number; readyReplicas?: number; replicas?: number }
-          | undefined;
-        ready &&=
-          status?.observedGeneration === applied.metadata.generation &&
-          (status?.readyReplicas ?? 0) === spec.replicas &&
-          (spec.replicas !== 0 || (status?.replicas ?? 0) === 0);
+    let failure: unknown;
+    try {
+      if (!this.cfg.routeUrlPattern) await this.removeRoutes(tenant);
+      for (const value of desired) {
+        const applied = await this.ensure(value);
+        if (value.kind === 'Deployment') {
+          const spec = applied.spec as { replicas: number };
+          const status = applied.status as
+            | { observedGeneration?: number; readyReplicas?: number; replicas?: number }
+            | undefined;
+          ready &&=
+            status?.observedGeneration === applied.metadata.generation &&
+            (status?.readyReplicas ?? 0) === spec.replicas &&
+            (spec.replicas !== 0 || (status?.replicas ?? 0) === 0);
+        }
       }
+      if (ready && !tenant.spec.suspended && !tenant.metadata.deletionTimestamp) {
+        const hosts = await this.list<Resource>('runtime.wasmcloud.dev/v1alpha1', 'Host', {
+          hostgroup: n.hostgroup,
+        });
+        ready =
+          hosts.filter(
+            (h) =>
+              h.environment === n.namespace &&
+              (h.status as { conditions?: Condition[] } | undefined)?.conditions?.some(
+                (c) => c.type === 'Ready' && c.status === 'True',
+              ),
+          ).length >= (tenant.spec.runtime?.replicas ?? 1);
+      }
+    } catch (error) {
+      failure = error;
     }
-    if (ready && !tenant.spec.suspended && !tenant.metadata.deletionTimestamp) {
-      const hosts = await this.list<Resource>('runtime.wasmcloud.dev/v1alpha1', 'Host', {
-        hostgroup: n.hostgroup,
-      });
-      ready =
-        hosts.filter(
-          (h) =>
-            h.environment === n.namespace &&
-            (h.status as { conditions?: Condition[] } | undefined)?.conditions?.some(
-              (c) => c.type === 'Ready' && c.status === 'True',
-            ),
-        ).length >= (tenant.spec.runtime?.replicas ?? 1);
-    }
+    // Tenant-auth is independent of the tenant's own objects: a failed apply above (such as a
+    // hostgroup 409) must not keep it from reconciling or from reporting TenantAuthReady (#121).
     const auth = await this.reconcileTenantAuth(tenant, users);
+    if (failure) {
+      const message = failure instanceof Error ? failure.message : 'Reconciliation failed';
+      console.error(`Tenant/${tenant.metadata.name}: ${message}`);
+      await this.status(tenant, false, 'ReconcileError', message, {}, auth ? [auth] : []);
+      return;
+    }
     await this.status(
       tenant,
       ready,
@@ -603,6 +628,8 @@ export class Controller {
             (await this.list<User>(VERSION, 'User', { [INSTALLATION]: this.cfg.installation })),
         ),
       );
+      // Raise the quota right before the pair so its pods fit when they are created (#121).
+      await this.ensure(runtimeQuota(tenant, this.cfg, true));
       let ready = true;
       for (const value of desired) {
         const applied = await this.ensure(value);
@@ -622,8 +649,31 @@ export class Controller {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Tenant-auth reconcile failed';
       console.error(`Tenant/${tenant.metadata.name} tenant-auth: ${message}`);
-      return this.cfg.tenantAuth ? condition(false, 'ReconcileError', message) : undefined;
+      if (!this.cfg.tenantAuth) return undefined;
+      try {
+        // Never leave the quota raised for a pair that was not applied (#121).
+        if (!(await this.tenantAuthDeployed(tenant)))
+          await this.ensure(runtimeQuota(tenant, this.cfg, false));
+      } catch {
+        /* The tenant step lowers it on the next poll. */
+      }
+      return condition(false, 'ReconcileError', message);
     }
+  }
+  /** Whether the tenant-auth Deployments of `tenant` exist, i.e. the quota may stay raised. */
+  private async tenantAuthDeployed(tenant: Tenant): Promise<boolean> {
+    if (!this.cfg.tenantAuth) return false;
+    const deployments = await this.list<Resource>(
+      'apps/v1',
+      'Deployment',
+      {
+        [INSTALLATION]: this.cfg.installation,
+        [OWNER]: tenant.metadata.uid!,
+        [COMPONENT]: 'tenant-auth',
+      },
+      names(tenant.metadata.name).runtimeNamespace,
+    );
+    return deployments.length > 0;
   }
   /**
    * Delete every tenant-auth object this installation created for `tenant`, including the

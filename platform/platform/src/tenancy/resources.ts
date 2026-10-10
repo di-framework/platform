@@ -326,11 +326,45 @@ function resource(
 }
 const readVerbs = ['get', 'list', 'watch'];
 const editVerbs = [...readVerbs, 'create', 'update', 'patch', 'delete'];
+/**
+ * The tenant's runtime quota. With `withTenantAuth` the tenant controller and console limits are
+ * added on top, so the tenant keeps its whole budget for the host and backing services (#58).
+ * The controller raises it only in the tenant-auth step, right before it applies those
+ * Deployments, and keeps it raised only while they exist (#121).
+ */
+function runtimeQuota(tenant: Tenant, cfg: ControllerConfig, withTenantAuth: boolean): Resource {
+  const resources = tenant.spec.resources ?? {};
+  return resource(
+    tenant,
+    cfg.installation,
+    'v1',
+    'ResourceQuota',
+    'di-runtime-quota',
+    names(tenant.metadata.name).runtimeNamespace,
+    {
+      spec: {
+        hard: {
+          'limits.cpu': withTenantAuth
+            ? addQuantity(resources.cpu ?? '2', TENANT_AUTH_LIMITS.cpu, 'm')
+            : (resources.cpu ?? '2'),
+          'limits.memory': withTenantAuth
+            ? addQuantity(resources.memory ?? '4Gi', TENANT_AUTH_LIMITS.memory, 'Mi')
+            : (resources.memory ?? '4Gi'),
+          pods: '20',
+          // Aggregate compute/storage budget for runtime + controller-managed di-bs-* backends.
+          // Per-service sizing still comes from BackingServiceClass parametersSchema (#450).
+          'requests.storage': '50Gi',
+        },
+      },
+    },
+  );
+}
 function tenantResources(
   tenant: Tenant,
   cfg: ControllerConfig,
   schedulerSecret?: { data: Record<string, string> },
   storageKeys: string[] = [],
+  tenantAuthQuota = false,
 ): Resource[] {
   const n = names(tenant.metadata.name);
   const storage = hostStorage(tenant, cfg, storageKeys);
@@ -362,24 +396,7 @@ function tenantResources(
         },
       },
     }),
-    make('v1', 'ResourceQuota', 'di-runtime-quota', n.runtimeNamespace, {
-      spec: {
-        hard: {
-          // The tenant's controller and console run here too; their limits are added on top
-          // so the tenant keeps its whole budget for the host and backing services (#58).
-          'limits.cpu': cfg.tenantAuth
-            ? addQuantity(resources.cpu ?? '2', TENANT_AUTH_LIMITS.cpu, 'm')
-            : (resources.cpu ?? '2'),
-          'limits.memory': cfg.tenantAuth
-            ? addQuantity(resources.memory ?? '4Gi', TENANT_AUTH_LIMITS.memory, 'Mi')
-            : (resources.memory ?? '4Gi'),
-          pods: '20',
-          // Aggregate compute/storage budget for runtime + controller-managed di-bs-* backends.
-          // Per-service sizing still comes from BackingServiceClass parametersSchema (#450).
-          'requests.storage': '50Gi',
-        },
-      },
-    }),
+    runtimeQuota(tenant, cfg, tenantAuthQuota),
     make('rbac.authorization.k8s.io/v1', 'Role', 'di-developer', n.namespace, {
       rules: [
         workloadRead,
@@ -1310,6 +1327,7 @@ export {
   OWNER,
   ROUTES_CONFIG_NAME,
   resource,
+  runtimeQuota,
   TENANT,
   tenantAuthResources,
   tenantControllerCertNames,
