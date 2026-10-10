@@ -18,7 +18,7 @@ import {
   secretObjectName,
   varsConfigMapName,
 } from './config.ts';
-import { notImplemented, type V1Context, type V1Module } from './context.ts';
+import type { V1Context, V1Module } from './context.ts';
 
 /** The contract's `DeployBundle`, after the generated routes checked its JSON shape. */
 interface DeployBundle {
@@ -981,7 +981,13 @@ export const deploy: V1Module = {
       return rollout(bundle, context, refs);
     });
   },
-  registry: notImplemented('registry'),
+  // The credential is the caller's own identity token or API key, which the registry checks
+  // against this controller's whoami (platform#83); nothing is minted and no Secret is read.
+  registry: async (_command, _call, context) => {
+    if (!context.registryUrl)
+      return problem(503, 'Service Unavailable', 'no registry is configured for this tenant');
+    return Response.json({ url: context.registryUrl, auth: 'basic-identity', username: 'token' });
+  },
   deployments: async (_command, call, context) => {
     const env = String(queryValue(call, 'env'));
     const service = queryValue(call, 'service');

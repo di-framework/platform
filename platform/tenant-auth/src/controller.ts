@@ -37,6 +37,51 @@ export interface ControllerConfig {
   tokenTtlSeconds: number;
   /** The identity server's public native client that the tenant CLI logs in with. */
   cliClientId: string;
+  /**
+   * Origin of the tenant's own OCI registry (platform#83), or undefined when the platform has not
+   * configured one. Set from `TENANT_CONTROLLER_REGISTRY_URL`, where `{tenant}` stands for the tenant.
+   */
+  registryUrl?: string;
+}
+
+/**
+ * True for hosts where plain `http://` cannot leave the machine or cluster: loopback and in-cluster
+ * Service names. Same rule as `platform/oci-registry` (`is_cluster_local`).
+ */
+function isClusterLocal(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  if (host === 'localhost' || host === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(host)) return true;
+  return (host.endsWith('.svc') || host.endsWith('.svc.cluster.local')) && !host.startsWith('.');
+}
+
+/**
+ * Resolves `{tenant}` in a registry URL pattern and checks it is a bare http(s) origin. Clients send
+ * their identity token or `dik_` key to this origin as the Basic password, so plain `http://` is
+ * accepted only for loopback and in-cluster hosts. Errors never echo the value, which may carry a
+ * credential.
+ */
+export function registryOrigin(pattern: string | undefined, tenant: string): string | undefined {
+  if (!pattern) return undefined;
+  const name = 'TENANT_CONTROLLER_REGISTRY_URL';
+  let url: URL;
+  try {
+    url = new URL(pattern.replaceAll('{tenant}', tenant));
+  } catch {
+    throw new Error(`${name} is not a URL`);
+  }
+  if (!['http:', 'https:'].includes(url.protocol))
+    throw new Error(`${name} must be an http(s) origin: unsupported scheme`);
+  if (url.username || url.password)
+    throw new Error(`${name} must be an http(s) origin: userinfo is not allowed`);
+  if (url.pathname !== '/' || url.search || url.hash)
+    throw new Error(
+      `${name} must be an http(s) origin: path, query and fragment are not allowed (${url.host})`,
+    );
+  if (url.protocol === 'http:' && !isClusterLocal(url.hostname))
+    throw new Error(
+      `${name} must use https:// unless the host is loopback or *.svc / *.svc.cluster.local (${url.host})`,
+    );
+  return url.origin;
 }
 
 export function configFromEnv(env = process.env): ControllerConfig {
@@ -45,8 +90,9 @@ export function configFromEnv(env = process.env): ControllerConfig {
     if (!value) throw new Error(`${name} is required`);
     return value;
   };
+  const tenant = required('TENANT_CONTROLLER_TENANT');
   return {
-    tenant: required('TENANT_CONTROLLER_TENANT'),
+    tenant,
     kubeconfig: env.TENANT_CONTROLLER_KUBECONFIG,
     context: env.TENANT_CONTROLLER_CONTEXT,
     platformNamespace: env.TENANT_CONTROLLER_PLATFORM_NAMESPACE ?? 'wasmcloud',
@@ -57,6 +103,7 @@ export function configFromEnv(env = process.env): ControllerConfig {
     tlsKey: env.TENANT_CONTROLLER_TLS_KEY,
     tokenTtlSeconds: Number(env.TENANT_CONTROLLER_TOKEN_TTL ?? 3600),
     cliClientId: env.TENANT_CONTROLLER_CLI_CLIENT_ID ?? 'tenant-cli',
+    registryUrl: registryOrigin(env.TENANT_CONTROLLER_REGISTRY_URL, tenant),
   };
 }
 
@@ -312,6 +359,7 @@ export class Controller {
       return serveV1(request, {
         tenant: this.config.tenant,
         principal,
+        registryUrl: this.config.registryUrl,
         asUser: () => asUser(this.kube, this.userTokens, principal),
         asController: () => controllerSecretReader(this.kube),
         audit: (event, fields) => this.audit(event, fields),

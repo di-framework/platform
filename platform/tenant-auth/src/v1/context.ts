@@ -10,6 +10,8 @@ import { type KubeClient, KubeError, type UserKube } from '../kube.ts';
 export interface V1Context {
   tenant: string;
   principal: Principal;
+  /** Origin of the tenant's OCI registry, when the platform configured one (platform#83). */
+  registryUrl?: string;
   /** The API server as the calling user (their `di-user-<user>` ServiceAccount). */
   asUser(): UserKube;
   /**

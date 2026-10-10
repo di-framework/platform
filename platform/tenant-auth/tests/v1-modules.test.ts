@@ -251,7 +251,8 @@ describe('resource modules over real HTTP', () => {
         body: method === 'POST' ? '{"env":"prod"}' : undefined,
       });
       // logs is implemented (v1-logs.test.ts): this fake publishes no logs, so it answers 404.
-      expect(before.status).toBe(group === 'logs' ? 404 : 501);
+      // registry is implemented (v1-registry.test.ts): no registry is configured here, so 503.
+      expect(before.status).toBe(group === 'logs' ? 404 : 503);
 
       module[operation] = async (_command, _call, context) => {
         const upstream = await context
