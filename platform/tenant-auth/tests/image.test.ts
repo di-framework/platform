@@ -31,10 +31,14 @@ test('the entry points bundle for Bun', async () => {
   expect(result.outputs).toHaveLength(2);
 });
 
-test('the publish workflow is dispatch-only and builds the Dockerfile from the repo root', () => {
+test('the publish workflow is dispatch-only and uses the Rust builder with smoke checks', () => {
   expect(workflow).toMatch(/on:\s+workflow_dispatch:\s+permissions:/);
-  expect(workflow).toContain('file: platform/tenant-auth/Dockerfile');
-  expect(workflow).toContain('context: .');
+  expect(workflow).toContain('uses: ./.github/actions/setup-tenant-auth-builder');
+  expect(workflow).toContain('cargo build -p tenant-auth-image --locked');
+  expect(workflow).toContain('./target/debug/tenant-auth-image');
+  expect(workflow).toContain("SMOKE_CHECK: 'true'");
+  expect(workflow).toContain('arch: amd64');
+  expect(workflow).toContain('arch: arm64');
   expect(workflow).toContain('ghcr.io/di-framework/tenant-auth');
   expect(existsSync(join(pkg, 'Dockerfile.dockerignore'))).toBe(true);
 });
