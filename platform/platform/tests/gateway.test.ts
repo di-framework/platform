@@ -820,6 +820,7 @@ describe('edge timeouts and HTTP handoff (#58:routes)', () => {
   let gateway: Server;
   let edge: NetServer;
   let port: number;
+  const upgraded: Socket[] = [];
 
   beforeEach(async () => {
     upstream = createServer((req, res) => {
@@ -827,6 +828,7 @@ describe('edge timeouts and HTTP handoff (#58:routes)', () => {
       res.end(`ok ${req.url}`);
     });
     upstream.on('upgrade', (_req, socket: Socket) => {
+      upgraded.push(socket);
       socket.write(
         'HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n',
       );
@@ -853,6 +855,9 @@ describe('edge timeouts and HTTP handoff (#58:routes)', () => {
   afterEach(async () => {
     gateway.closeAllConnections();
     gateway.close();
+    // Upgraded sockets are not HTTP connections, so closeAllConnections leaves them open and
+    // the servers would wait for them.
+    for (const socket of upgraded.splice(0)) socket.destroy();
     await new Promise((resolve) => edge.close(resolve));
     upstream.closeAllConnections();
     await new Promise((resolve) => upstream.close(resolve));
