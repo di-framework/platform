@@ -175,10 +175,114 @@ fn tail(text: &str, max: usize) -> &str {
     }
 }
 
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = match chunk.first() {
+            Some(&b) => b,
+            None => continue,
+        };
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let idx0 = (b0 >> 2) as usize;
+        let idx1 = (((b0 & 0x03) << 4) | (b1 >> 4)) as usize;
+        if let Some(&c0) = TABLE.get(idx0) {
+            out.push(c0 as char);
+        }
+        if let Some(&c1) = TABLE.get(idx1) {
+            out.push(c1 as char);
+        }
+        if chunk.len() > 1 {
+            let idx2 = (((b1 & 0x0f) << 2) | (b2 >> 6)) as usize;
+            if let Some(&c2) = TABLE.get(idx2) {
+                out.push(c2 as char);
+            }
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            let idx3 = (b2 & 0x3f) as usize;
+            if let Some(&c3) = TABLE.get(idx3) {
+                out.push(c3 as char);
+            }
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Short-lived docker-style configuration directory with 0700 dir and 0600 file
+/// permissions, feeding credentials via `DOCKER_CONFIG` so passwords are not
+/// exposed in argv (`/proc/<pid>/cmdline`, `ps`, or process error output).
+struct DockerConfigDir {
+    path: std::path::PathBuf,
+}
+
+impl DockerConfigDir {
+    fn new(registries: &[&str], username: &str, password: &str) -> Result<Self> {
+        let path = env::temp_dir().join(format!(
+            "wash-docker-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        fs::create_dir_all(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o700));
+        }
+        let auth = base64_encode(format!("{username}:{password}").as_bytes());
+        let mut auths = serde_json::Map::new();
+        for &reg in registries {
+            for key in [
+                reg.to_owned(),
+                format!("https://{reg}"),
+                format!("https://{reg}/v2/"),
+                registry_host(reg).to_owned(),
+                format!("https://{}", registry_host(reg)),
+            ] {
+                auths.insert(key, serde_json::json!({ "auth": auth }));
+            }
+        }
+        let config_file = path.join("config.json");
+        fs::write(
+            &config_file,
+            serde_json::to_vec_pretty(&serde_json::json!({ "auths": auths }))?,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&config_file, fs::Permissions::from_mode(0o600));
+        }
+        Ok(Self { path })
+    }
+}
+
+impl Drop for DockerConfigDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Guard to remove a temporary file on all paths (success, error, or panic).
+struct TempFileGuard(std::path::PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 /// Run `wash` with a deadline; kill it if it overruns.
-fn run_wash(args: &[String], timeout: Duration) -> Result<Output> {
-    let mut child = Command::new("wash")
-        .args(args)
+fn run_wash(args: &[String], envs: &[(&str, &Path)], timeout: Duration) -> Result<Output> {
+    let mut command = Command::new("wash");
+    command.args(args);
+    for (key, val) in envs {
+        command.env(key, val);
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -283,6 +387,19 @@ pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<(
         Some((username, _)) => eprintln!("[oci-registry] Registry auth: basic user {username}"),
     }
 
+    let docker_config = match &credentials {
+        Some((username, password)) => Some(DockerConfigDir::new(
+            &[&registry, &cluster_registry],
+            username,
+            password,
+        )?),
+        None => None,
+    };
+    let wash_envs: Vec<(&str, &Path)> = match &docker_config {
+        Some(config) => vec![("DOCKER_CONFIG", &config.path)],
+        None => vec![],
+    };
+
     let mut push: Vec<String> = vec![
         "oci".to_owned(),
         "push".to_owned(),
@@ -293,22 +410,23 @@ pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<(
     if insecure {
         push.push("--insecure".to_owned());
     }
-    if let Some((username, password)) = &credentials {
-        push.push("--user".to_owned());
-        push.push(username.clone());
-        push.push("--password".to_owned());
-        push.push(password.clone());
-    }
     push.push(destination.clone());
     push.push(dist.join(spec.wasm_file).to_string_lossy().into_owned());
-    let output = run_wash(&push, Duration::from_secs(300))?;
+    let output = run_wash(&push, &wash_envs, Duration::from_secs(300))?;
     check_output(&output, "oci push")?;
     let manifest_digest = push_digest(&output.stdout)?;
     let local = format!("{registry}/{repository}@{manifest_digest}");
     let cluster = format!("{cluster_registry}/{repository}@{manifest_digest}");
 
     // Verify the immutable manifest returned by the push, not a movable tag.
-    let pulled = dist.join("pulled.wasm");
+    // Download to a temporary path outside dist/ so failed or unverified artifacts
+    // never pollute the build output, and clean up on all paths via drop guard.
+    let pulled = env::temp_dir().join(format!(
+        "wash-pulled-{}-{}.wasm",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    ));
+    let _pulled_guard = TempFileGuard(pulled.clone());
     let mut pull: Vec<String> = vec![
         "oci".to_owned(),
         "pull".to_owned(),
@@ -317,22 +435,16 @@ pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<(
     if insecure {
         pull.push("--insecure".to_owned());
     }
-    if let Some((username, password)) = &credentials {
-        pull.push("--user".to_owned());
-        pull.push(username.clone());
-        pull.push("--password".to_owned());
-        pull.push(password.clone());
-    }
     pull.push(local.clone());
     pull.push(pulled.to_string_lossy().into_owned());
-    let output = run_wash(&pull, Duration::from_secs(300))?;
+    let output = run_wash(&pull, &wash_envs, Duration::from_secs(300))?;
     check_output(&output, "oci pull")?;
     let round_tripped = fs::read(&pulled)?;
     if round_tripped != wasm {
         return Err("pulled Wasm differs from the local build".into());
     }
 
-    fs::remove_file(&pulled)?;
+    drop(_pulled_guard);
     let report = dist.join(spec.report_file_name);
     fs::write(
         &report,
@@ -491,5 +603,49 @@ mod tests {
         assert!(validate_reference("https://ghcr.io", "repo", "v1").is_err());
         assert!(validate_reference("ghcr.io", "repo/../escape", "v1").is_err());
         assert!(validate_reference("ghcr.io", "repo", "-invalid").is_err());
+    }
+
+    #[test]
+    fn base64_roundtrip_vectors() {
+        for (input, expected) in [
+            (b"".as_slice(), ""),
+            (b"f".as_slice(), "Zg=="),
+            (b"fo".as_slice(), "Zm8="),
+            (b"foo".as_slice(), "Zm9v"),
+            (b"foob".as_slice(), "Zm9vYg=="),
+            (b"fooba".as_slice(), "Zm9vYmE="),
+            (b"foobar".as_slice(), "Zm9vYmFy"),
+            (b"user:pass".as_slice(), "dXNlcjpwYXNz"),
+        ] {
+            assert_eq!(base64_encode(input), expected);
+        }
+    }
+
+    #[test]
+    fn docker_config_dir_lifecycle() {
+        let path = {
+            let config =
+                DockerConfigDir::new(&["ghcr.io", "127.0.0.1:5000"], "alice", "secret").unwrap();
+            assert!(config.path.is_dir());
+            let content = fs::read_to_string(config.path.join("config.json")).unwrap();
+            assert!(content.contains("ghcr.io"));
+            assert!(content.contains("127.0.0.1:5000"));
+            assert!(content.contains(&base64_encode(b"alice:secret")));
+            config.path.clone()
+        };
+        // Verify drop cleaned up the directory.
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn temp_file_guard_removes_on_drop() {
+        let temp_path =
+            env::temp_dir().join(format!("test-temp-file-guard-{}", std::process::id()));
+        fs::write(&temp_path, b"temp").unwrap();
+        assert!(temp_path.is_file());
+        {
+            let _guard = TempFileGuard(temp_path.clone());
+        }
+        assert!(!temp_path.exists());
     }
 }
