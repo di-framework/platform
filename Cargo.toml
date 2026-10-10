@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = [
+    "platform/tenant-auth",
+    "platform/oci-registry/build-support",
+]
+# Keep the existing Wasm component workspaces independent of the host tools.
+exclude = [
+    "platform/oci-registry",
+    "platform/sqlite-component",
+    "platform/pglite-component",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+oci-builder = { git = "https://github.com/geoffsee/oci-lib", tag = "v0.1.10" }

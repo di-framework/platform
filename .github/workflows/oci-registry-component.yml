@@ -1,8 +1,4 @@
-# Publish the tenant OCI registry component (platform/oci-registry) to
-# ghcr.io/di-framework/oci-registry as a canonical Wasm OCI artifact
-# (config application/vnd.wasm.config.v0+json, layer application/wasm).
-# Dispatch-only, like the tenant-auth and tenant host images. Auth is
-# GITHUB_TOKEN with packages: write. No registry secret is stored.
+# Publish the canonical Wasm OCI artifact through the Rust publisher and wash.
 name: Publish oci-registry component
 
 on:
@@ -16,14 +12,9 @@ concurrency:
   group: publish-oci-registry-component
   cancel-in-progress: false
 
-env:
-  ORAS_VERSION: 1.3.4
-  ORAS_SHA256: f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454
-
 jobs:
   publish:
     name: Push ghcr.io/di-framework/oci-registry
-    # Publish only from main, so a published digest always maps to reviewed code.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -31,8 +22,8 @@ jobs:
       - name: Require di-framework/platform
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REPOSITORY}" != "di-framework/platform" ]]; then
-            echo "::error::This workflow publishes ghcr.io/di-framework/oci-registry and only runs in di-framework/platform"
+          if [[ "$GITHUB_REPOSITORY" != di-framework/platform ]]; then
+            echo '::error::Only di-framework/platform can publish this component'
             exit 1
           fi
 
@@ -41,96 +32,56 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install build tools
-        run: bash platform/sqlite-component/scripts/install-tools.sh --rust
+      - name: Set up Rust and native dependencies
+        uses: ./.github/actions/setup-tenant-auth-builder
 
-      - name: Build and test the component
-        run: make -C platform/oci-registry test build
-
-      - name: Install oras
+      - name: Install Wasm build tools
         run: |
           set -euo pipefail
-          archive="oras_${ORAS_VERSION}_linux_amd64.tar.gz"
-          curl -fsSLo "${RUNNER_TEMP}/${archive}" \
-            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/${archive}"
-          echo "${ORAS_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
-          mkdir -p "${RUNNER_TEMP}/oras"
-          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/oras" oras
-          echo "${RUNNER_TEMP}/oras" >> "${GITHUB_PATH}"
+          rustup target add --toolchain 1.97.1 wasm32-wasip2
+          bash platform/sqlite-component/scripts/install-tools.sh
+          echo "$GITHUB_WORKSPACE/platform/sqlite-component/.tools/bin" >> "$GITHUB_PATH"
 
-      - name: Push the component
-        id: push
+      - name: Set up wash CLI
+        uses: wasmCloud/setup-wash-action@47756fa211cc82f392c57e39504f43ef46fc0b3e # v2.1.0
+        with:
+          wash-version: v2.5.2
+
+      - name: Test component and publisher
+        run: |
+          set -euo pipefail
+          make -C platform/oci-registry test
+          cargo test --locked -p oci-registry-publisher
+
+      - name: Build, push, and verify component
         env:
+          PUSH: 'true'
+          DI_OCI_REGISTRY: ghcr.io
+          DI_OCI_CLUSTER_REGISTRY: ghcr.io
+          DI_OCI_REPOSITORY: di-framework/oci-registry
+          DI_OCI_TAG: ${{ github.sha }}
+          GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          echo "${GHCR_TOKEN}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
-          cd platform/oci-registry/dist
-          # The Wasm OCI config (oci-wasm WasmConfig, what wkg and wash write):
-          # created, architecture "wasm", os "wasip2", the layer digests and,
-          # because the CNCF Wasm OCI layout requires it for wasip2, the
-          # `component` field listing the world's imports and exports (read
-          # from the WIT that `make build` recovered from the component).
-          created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          layer="sha256:$(sha256sum di-framework-oci-registry.wasm | cut -d' ' -f1)"
-          # Items of the root (first) world only, at its top level: dependency
-          # packages printed after it may declare worlds of their own, and
-          # inline interfaces nest their own items.
-          wit_items() {
-            awk -v kind="$1" '
-              done { next }
-              !inside && /^[[:space:]]*world[[:space:]]+[^[:space:]{]+[[:space:]]*\{/ { inside = 1; depth = 0 }
-              inside {
-                if (depth == 1 && match($0, "^[[:space:]]*" kind "[[:space:]]+[^;{[:space:]]+;")) {
-                  item = substr($0, RSTART, RLENGTH)
-                  sub("^[[:space:]]*" kind "[[:space:]]+", "", item)
-                  sub(";$", "", item)
-                  print item
-                }
-                depth += gsub(/\{/, "{") - gsub(/\}/, "}")
-                if (depth == 0) done = 1
-              }' di-framework-oci-registry.wit | jq -R . | jq -s .
-          }
-          imports="$(wit_items import)"
-          exports="$(wit_items export)"
-          # Hosts serve the component through wasi:http@0.3.0 handler only.
-          if ! jq -e 'index("wasi:http/handler@0.3.0") != null' <<<"${exports}" >/dev/null; then
-            echo "::error::di-framework-oci-registry.wit does not export wasi:http/handler@0.3.0"
-            exit 1
-          fi
-          jq -n --arg created "${created}" --arg layer "${layer}" \
-            --argjson imports "${imports}" --argjson exports "${exports}" \
-            '{created: $created, architecture: "wasm", os: "wasip2", layerDigests: [$layer],
-              component: {imports: $imports, exports: $exports}}' \
-            > config.json
-          ref="ghcr.io/di-framework/oci-registry:${GITHUB_SHA}"
-          oras push "${ref}" \
-            --config config.json:application/vnd.wasm.config.v0+json \
-            --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
-            --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
-            --format go-template='{{.digest}}' \
-            di-framework-oci-registry.wasm:application/wasm > "${RUNNER_TEMP}/digest"
-          echo "digest=$(cat "${RUNNER_TEMP}/digest")" >> "${GITHUB_OUTPUT}"
+        run: cargo run --locked -p oci-registry-publisher
 
       - name: Record component digest
-        env:
-          DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
-          if [[ "${DIGEST}" != sha256:* ]]; then
-            echo "::error::oras push did not return a digest"
-            exit 1
-          fi
-          ref="ghcr.io/di-framework/oci-registry@${DIGEST}"
-          echo "Published ${ref}"
+          report=platform/oci-registry/dist/publish-report.json
+          digest="$(jq -er '.manifestDigest | select(test("^sha256:[0-9a-f]{64}$"))' "$report")"
+          ref="ghcr.io/di-framework/oci-registry@${digest}"
+          printf 'Published %s\n' "$ref"
           {
-            echo "### Tenant OCI registry component"
+            echo '### Tenant OCI registry component'
             echo
-            echo '```'
-            echo "${ref}"
-            echo '```'
+            printf '```\n%s\n```\n' "$ref"
             echo
-            echo "Wasm SHA-256: \`$(cut -d' ' -f1 < platform/oci-registry/dist/SHA256SUMS | head -1)\`"
-            echo
-            echo "Pin deployments to that digest. The ${GITHUB_SHA} tag is informational; only the digest is stable."
-          } >> "${GITHUB_STEP_SUMMARY}"
+            echo 'The component was pulled by digest and verified against the local build.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload publish report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: oci-registry-publish-report
+          path: platform/oci-registry/dist/publish-report.json
+          if-no-files-found: error
