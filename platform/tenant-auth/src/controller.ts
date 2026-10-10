@@ -37,6 +37,33 @@ export interface ControllerConfig {
   tokenTtlSeconds: number;
   /** The identity server's public native client that the tenant CLI logs in with. */
   cliClientId: string;
+  /**
+   * Origin of the tenant's own OCI registry (platform#83), or undefined when the platform has not
+   * configured one. Set from `TENANT_CONTROLLER_REGISTRY_URL`, where `{tenant}` stands for the tenant.
+   */
+  registryUrl?: string;
+}
+
+/** Resolves `{tenant}` in a registry URL pattern and checks it is a bare http(s) origin. */
+export function registryOrigin(pattern: string | undefined, tenant: string): string | undefined {
+  if (!pattern) return undefined;
+  const value = pattern.replaceAll('{tenant}', tenant);
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`TENANT_CONTROLLER_REGISTRY_URL is not a URL: ${value}`);
+  }
+  if (
+    !['http:', 'https:'].includes(url.protocol) ||
+    url.username ||
+    url.password ||
+    url.pathname !== '/' ||
+    url.search ||
+    url.hash
+  )
+    throw new Error(`TENANT_CONTROLLER_REGISTRY_URL must be an http(s) origin: ${value}`);
+  return url.origin;
 }
 
 export function configFromEnv(env = process.env): ControllerConfig {
@@ -45,8 +72,9 @@ export function configFromEnv(env = process.env): ControllerConfig {
     if (!value) throw new Error(`${name} is required`);
     return value;
   };
+  const tenant = required('TENANT_CONTROLLER_TENANT');
   return {
-    tenant: required('TENANT_CONTROLLER_TENANT'),
+    tenant,
     kubeconfig: env.TENANT_CONTROLLER_KUBECONFIG,
     context: env.TENANT_CONTROLLER_CONTEXT,
     platformNamespace: env.TENANT_CONTROLLER_PLATFORM_NAMESPACE ?? 'wasmcloud',
@@ -57,6 +85,7 @@ export function configFromEnv(env = process.env): ControllerConfig {
     tlsKey: env.TENANT_CONTROLLER_TLS_KEY,
     tokenTtlSeconds: Number(env.TENANT_CONTROLLER_TOKEN_TTL ?? 3600),
     cliClientId: env.TENANT_CONTROLLER_CLI_CLIENT_ID ?? 'tenant-cli',
+    registryUrl: registryOrigin(env.TENANT_CONTROLLER_REGISTRY_URL, tenant),
   };
 }
 
@@ -312,6 +341,7 @@ export class Controller {
       return serveV1(request, {
         tenant: this.config.tenant,
         principal,
+        registryUrl: this.config.registryUrl,
         asUser: () => asUser(this.kube, this.userTokens, principal),
         asController: () => controllerSecretReader(this.kube),
         audit: (event, fields) => this.audit(event, fields),

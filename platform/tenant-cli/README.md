@@ -60,7 +60,9 @@ push and pull, a viewer may only pull.
 
 `GET /v1/deploy/registry` (viewer or developer) returns `RegistryInfo`: the registry `url` (an
 origin: scheme + host[:port], no path), an optional `repositoryPrefix`, `auth` (`basic-identity`)
-and a fixed `username` hint. Until #55/#83 serve it, the endpoint answers 501.
+and a fixed `username` hint (`token`). The tenant controller reads the origin from
+`TENANT_CONTROLLER_REGISTRY_URL` (`{tenant}` is replaced by the tenant); until the platform sets it
+(#83), the endpoint answers 503 `no registry is configured for this tenant`.
 
 Log in against the host of `url`, not the full URL, then push to
 `<host>/<repositoryPrefix>/<name>:<tag>`:
