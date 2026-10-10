@@ -1090,12 +1090,16 @@ describe('tenant-auth gateway routes (#58:routes)', () => {
   it('routes gateway-shaped public URLs only while the gateway is published', () => {
     expect(tenantAuthRoutes(routed, pattern)).toEqual({
       routes: { console: 'console', controller: 'controller' },
+      urls: {
+        console: 'http://console.{tenant}.localhost:28180',
+        controller: 'https://controller.{tenant}.localhost:28180',
+      },
       problems: [],
     });
     // Unset and default URLs, or no gateway, keep today's unrouted behaviour.
-    expect(tenantAuthRoutes(undefined, pattern)).toEqual({ routes: {}, problems: [] });
+    expect(tenantAuthRoutes(undefined, pattern)).toEqual({ routes: {}, urls: {}, problems: [] });
     const { consolePublicUrl: _c, controllerPublicUrl: _k, ...plain } = routed;
-    expect(tenantAuthRoutes(plain, pattern)).toEqual({ routes: {}, problems: [] });
+    expect(tenantAuthRoutes(plain, pattern)).toEqual({ routes: {}, urls: {}, problems: [] });
     expect(
       tenantAuthRoutes(
         {
@@ -1105,14 +1109,36 @@ describe('tenant-auth gateway routes (#58:routes)', () => {
         },
         pattern,
       ),
-    ).toEqual({ routes: {}, problems: [] });
-    expect(tenantAuthRoutes(routed, undefined)).toEqual({ routes: {}, problems: [] });
+    ).toEqual({ routes: {}, urls: {}, problems: [] });
+    expect(tenantAuthRoutes(routed, undefined)).toEqual({ routes: {}, urls: {}, problems: [] });
     expect(
       tenantAuthRoutes(
         { ...auth, consolePublicUrl: 'http://ui.{tenant}.localhost/' },
         'http://{host}.{tenant}.localhost',
       ).routes,
     ).toEqual({ console: 'ui' });
+    // Scheme default ports count: https://…localhost is 443, http://… on :80 is the default.
+    expect(
+      tenantAuthRoutes(
+        {
+          ...auth,
+          consolePublicUrl: 'http://console.{tenant}.localhost:80',
+          controllerPublicUrl: 'https://controller.{tenant}.localhost:80',
+        },
+        'http://{host}.{tenant}.localhost',
+      ).routes,
+    ).toEqual({ console: 'console', controller: 'controller' });
+    // Upper-case schemes and hosts are normalized, and the published URL is the lower-case one.
+    expect(
+      tenantAuthRoutes(
+        { ...auth, consolePublicUrl: 'HTTP://Console.{tenant}.LOCALHOST:28180' },
+        'HTTP://{host}.{tenant}.localhost:28180',
+      ),
+    ).toEqual({
+      routes: { console: 'console' },
+      urls: { console: 'http://console.{tenant}.localhost:28180' },
+      problems: [],
+    });
   });
 
   it('reports gateway-shaped URLs the gateway cannot route', () => {
@@ -1136,8 +1162,28 @@ describe('tenant-auth gateway routes (#58:routes)', () => {
         'http://{host}.{tenant}.localhost',
       ).problems,
     ).toEqual([
-      'tenantAuth.consolePublicUrl must use the gateway port (default)',
-      'tenantAuth.controllerPublicUrl must use the gateway port (default)',
+      'tenantAuth.consolePublicUrl must use the gateway port 80',
+      'tenantAuth.controllerPublicUrl must use the gateway port 80',
+    ]);
+    // https://…localhost without a port dials 443, not the gateway's default 80.
+    expect(
+      tenantAuthRoutes(
+        {
+          ...routed,
+          consolePublicUrl: undefined,
+          controllerPublicUrl: 'https://controller.{tenant}.localhost',
+        },
+        'http://{host}.{tenant}.localhost',
+      ),
+    ).toEqual({
+      routes: {},
+      urls: {},
+      problems: ['tenantAuth.controllerPublicUrl must use the gateway port 80'],
+    });
+    // A TLS-terminating (https://) gateway pattern cannot carry controller passthrough.
+    expect(tenantAuthRoutes(routed, 'https://{host}.{tenant}.localhost:28180').problems).toEqual([
+      'tenantAuth.consolePublicUrl cannot be routed: routeUrlPattern must use http://',
+      'tenantAuth.controllerPublicUrl cannot be routed: routeUrlPattern must use http://',
     ]);
     expect(problems({ controllerPublicUrl: 'https://console.{tenant}.localhost:28180' })).toEqual([
       'tenantAuth.controllerPublicUrl must not share the console host',

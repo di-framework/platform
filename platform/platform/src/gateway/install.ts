@@ -5,6 +5,7 @@ import {
   GATEWAY_NAME,
   GATEWAY_POD_LABELS,
   INSTALLATION,
+  NAMESPACE_ROLE,
   TENANT,
   type TenantAuthRoutes,
 } from '../tenancy/resources';
@@ -139,7 +140,16 @@ export function gatewayNetworkPolicySpec(
     ...(tenantAuthRoutes.console ? [['tenant-console', 8787] as const] : []),
     ...(tenantAuthRoutes.controller ? [['tenant-controller', 8788] as const] : []),
   ].map(([app, port]) => ({
-    to: [{ namespaceSelector: tenantNamespaces, podSelector: { matchLabels: { app } } }],
+    to: [
+      {
+        // Only this installation's `di-runtime-<tenant>` namespaces run the pair.
+        namespaceSelector: {
+          ...tenantNamespaces,
+          matchLabels: { ...tenantNamespaces.matchLabels, [NAMESPACE_ROLE]: 'runtime' },
+        },
+        podSelector: { matchLabels: { app } },
+      },
+    ],
     ports: [{ protocol: 'TCP', port }],
   }));
   const hostgroup: Selector = { matchLabels: { 'wasmcloud.com/name': 'hostgroup' } };

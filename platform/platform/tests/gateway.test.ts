@@ -729,3 +729,216 @@ describe('tenant-auth routes (#58:routes)', () => {
     expect(refused).toBe(true);
   });
 });
+
+describe('serverName parser (#58:routes)', () => {
+  const u16 = (n: number) => [n >> 8, n & 0xff];
+  const ext = (type: number, data: number[], length = data.length) => [
+    ...u16(type),
+    ...u16(length),
+    ...data,
+  ];
+  const sniEntry = (name: string, nameType = 0, nameLength = name.length) => [
+    nameType,
+    ...u16(nameLength),
+    ...Buffer.from(name),
+  ];
+  const sni = (name: string, nameType = 0, nameLength = name.length) => {
+    const entry = sniEntry(name, nameType, nameLength);
+    return ext(0, [...u16(entry.length), ...entry]);
+  };
+  /** A minimal ClientHello record; overrides corrupt one length field at a time. */
+  const clientHello = (
+    extensions: number[][],
+    o: { handshakeType?: number; extensionsLength?: number; recordLength?: number } = {},
+  ) => {
+    const all = extensions.flat();
+    const body = [
+      ...[3, 3],
+      ...new Array(32).fill(0),
+      0, // session id
+      ...[0, 2, 0x13, 0x01], // cipher suites
+      ...[1, 0], // compression methods
+      ...u16(o.extensionsLength ?? all.length),
+      ...all,
+    ];
+    const handshake = [o.handshakeType ?? 1, 0, ...u16(body.length), ...body];
+    return Buffer.from([0x16, 3, 1, ...u16(o.recordLength ?? handshake.length), ...handshake]);
+  };
+  const name = 'controller.alpha.localhost';
+
+  it.each([
+    [
+      'a hello with several extensions before SNI',
+      clientHello([ext(10, [0, 2, 0, 29]), ext(13, [0]), sni(name)]),
+      name,
+    ],
+    ['a hello without SNI', clientHello([ext(10, [0, 2, 0, 29])]), undefined],
+    [
+      'a handshake that is not a ClientHello',
+      clientHello([sni(name)], { handshakeType: 2 }),
+      undefined,
+    ],
+    ['a name type other than host_name', clientHello([sni(name, 1)]), undefined],
+    ['an SNI name length larger than its extension', clientHello([sni(name, 0, 200)]), undefined],
+    [
+      'an SNI list longer than its extension',
+      clientHello([ext(0, [0, 40, ...sniEntry(name)])]),
+      undefined,
+    ],
+    [
+      'an extension length that overruns the extensions',
+      clientHello([ext(10, [0, 2], 500)]),
+      undefined,
+    ],
+    [
+      'an extensions length that overruns the hello',
+      clientHello([sni(name)], { extensionsLength: 900 }),
+      undefined,
+    ],
+    ['a hello split across records', clientHello([sni(name)], { recordLength: 20 }), undefined],
+    ['a record longer than the buffer', clientHello([sni(name)]).subarray(0, 60), undefined],
+    ['a record that is not a handshake', Buffer.from([0x17, 3, 3, 0, 4, 1, 0, 0, 0]), undefined],
+    ['a truncated record', Buffer.from([0x16, 3, 1, 0, 1, 1]), undefined],
+  ] as [string, Buffer, string | undefined][])('%s', (_label, record, expected) => {
+    expect(serverName(record)).toBe(expected);
+  });
+
+  it('rejects a record over 16 KiB even when every byte is present', () => {
+    const extensions = [ext(21, new Array(16_400).fill(0)), sni(name)];
+    expect(clientHello(extensions).readUInt16BE(3)).toBeGreaterThan(16_384);
+    expect(serverName(clientHello(extensions))).toBeUndefined();
+    // The same hello padded to just under the limit still parses.
+    expect(serverName(clientHello([ext(21, new Array(16_000).fill(0)), sni(name)]))).toBe(name);
+  });
+});
+
+describe('edge timeouts and HTTP handoff (#58:routes)', () => {
+  const pem = selfSignedCertificate('tenant-controller', ['controller.alpha.localhost'], [], 30);
+  let upstream: Server;
+  let controller: TlsServer;
+  let gateway: Server;
+  let edge: NetServer;
+  let port: number;
+
+  beforeEach(async () => {
+    upstream = createServer((req, res) => {
+      req.resume();
+      res.end(`ok ${req.url}`);
+    });
+    upstream.on('upgrade', (_req, socket: Socket) => {
+      socket.write(
+        'HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n',
+      );
+      socket.on('data', (data) => socket.write(`echo:${data}`));
+    });
+    const upstreamPort = await listen(upstream);
+    // A controller that keeps the session open until the client goes away.
+    controller = createTlsServer({ cert: pem.cert, key: pem.key }, (socket) => socket.write('hi'));
+    await new Promise<void>((resolve) => controller.listen(0, '127.0.0.1', resolve));
+    const controllerPort = (controller.address() as { port: number }).port;
+    const options: GatewayOptions = {
+      defaultUpstream: { hostname: '127.0.0.1', port: upstreamPort },
+      tenantUpstream: () => ({ hostname: '127.0.0.1', port: upstreamPort }),
+      tenantAuthRoutes: { console: 'console', controller: 'controller' },
+      controllerUpstream: () => ({ hostname: '127.0.0.1', port: controllerPort }),
+      classifyTimeoutMs: 100,
+      passthroughIdleMs: 200,
+    };
+    gateway = createGateway(options);
+    edge = createEdge(gateway, options);
+    port = await listen(edge as Server);
+  });
+
+  afterEach(async () => {
+    gateway.closeAllConnections();
+    gateway.close();
+    await new Promise((resolve) => edge.close(resolve));
+    upstream.closeAllConnections();
+    await new Promise((resolve) => upstream.close(resolve));
+    controller.close();
+  });
+
+  /** Open a raw connection, write `bytes`, and resolve with how long it stayed open. */
+  const openFor = (bytes: number[]) =>
+    new Promise<number>((resolve) => {
+      const started = Date.now();
+      const socket = connect(port, '127.0.0.1', () => {
+        if (bytes.length) socket.write(Buffer.from(bytes));
+      });
+      socket.on('error', () => {});
+      socket.on('close', () => resolve(Date.now() - started));
+    });
+
+  it('closes a connection that stalls before it is classified', async () => {
+    expect(await openFor([0x16, 3, 1])).toBeLessThan(1_000);
+    expect(await openFor([0x16, 3, 1, 0, 60, ...new Array(40).fill(0)])).toBeLessThan(1_000);
+    expect(await openFor([])).toBeLessThan(1_000);
+  });
+
+  it('closes a record header claiming more than 16 KiB without waiting for it', async () => {
+    expect(await openFor([0x16, 3, 1, 0x40, 0x01])).toBeLessThan(80);
+  });
+
+  /** Write each chunk after a pause and collect everything the gateway answers. */
+  const converse = (chunks: string[], pause = 0) =>
+    new Promise<string>((resolve) => {
+      let data = '';
+      const socket = connect(port, '127.0.0.1', async () => {
+        for (const chunk of chunks) {
+          socket.write(chunk);
+          await Bun.sleep(pause);
+        }
+        await Bun.sleep(100);
+        socket.destroy();
+        resolve(data);
+      });
+      socket.setEncoding('utf8');
+      socket.on('data', (chunk) => {
+        data += chunk;
+      });
+    });
+
+  it('keeps a classified HTTP connection alive past the classification timeout', async () => {
+    const get = (path: string) => `GET ${path} HTTP/1.1\r\nHost: site.alpha.localhost\r\n\r\n`;
+    const data = await converse([get('/a'), get('/b'), get('/c')], 150);
+    expect(data.match(/ok \/[abc]/g)).toEqual(['ok /a', 'ok /b', 'ok /c']);
+  });
+
+  it('relays a WebSocket upgrade through the edge in both directions', async () => {
+    const data = await converse(
+      [
+        'GET /ws HTTP/1.1\r\nHost: site.alpha.localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n',
+        'ping',
+      ],
+      150,
+    );
+    expect(data).toContain('101 Switching Protocols');
+    expect(data).toContain('echo:ping');
+  });
+
+  it('closes an idle controller passthrough after the idle timeout', async () => {
+    const result = await new Promise<{ data: string; open: number }>((resolve) => {
+      let data = '';
+      let secured = 0;
+      const socket = tlsConnect({
+        host: '127.0.0.1',
+        port,
+        servername: 'controller.alpha.localhost',
+        ca: pem.cert,
+      });
+      socket.on('secureConnect', () => {
+        secured = Date.now();
+      });
+      socket.setEncoding('utf8');
+      socket.on('data', (chunk) => {
+        data += chunk;
+      });
+      socket.on('error', () => {});
+      socket.on('close', () => resolve({ data, open: Date.now() - secured }));
+    });
+    expect(result.data).toBe('hi');
+    // Classified within 100 ms, so the pipe outlives the classification timeout.
+    expect(result.open).toBeGreaterThanOrEqual(150);
+    expect(result.open).toBeLessThan(2_000);
+  });
+});

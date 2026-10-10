@@ -131,51 +131,61 @@ export interface TenantAuthRoutes {
   controller?: string;
 }
 const ROUTE_LABEL = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+const DEFAULT_PORTS: Record<string, string> = { http: '80', https: '443' };
 /**
  * Which tenant-auth public URLs the gateway routes, from config alone so the gateway and the
  * controller agree. A URL whose host is `<label>.{tenant}.localhost` asks for a route; it gets one
- * when the gateway is published (`routeUrlPattern`) on the same port and the scheme fits (console
- * `http`, controller `https`). Any other URL (the `127.0.0.1` defaults), or any URL while no
- * gateway is published, is left unrouted; a gateway-shaped URL the published gateway cannot route
- * is returned as a problem for `TenantAuthReady`.
+ * when the gateway is published (`routeUrlPattern`, which must be `http://`, since a TLS
+ * terminator in front of the gateway breaks controller passthrough) on the same effective port
+ * (scheme defaults applied: http 80, https 443) and the scheme fits (console `http`, controller
+ * `https`). Schemes and hosts are compared in lower case. Any other URL (the `127.0.0.1`
+ * defaults), or any URL while no gateway is published, is left unrouted; a gateway-shaped URL the
+ * published gateway cannot route is returned as a problem for `TenantAuthReady`. `urls` holds the
+ * normalized (lower-case) public URL of each routed host.
  */
 export function tenantAuthRoutes(
   auth: TenantAuthConfig | undefined,
   routeUrlPattern: string | undefined,
-): { routes: TenantAuthRoutes; problems: string[] } {
+): { routes: TenantAuthRoutes; urls: TenantAuthRoutes; problems: string[] } {
   const routes: TenantAuthRoutes = {};
+  const urls: TenantAuthRoutes = {};
   const problems: string[] = [];
-  const gatewayPort = /:(\d+)$/.exec(routeUrlPattern ?? '')?.[1] ?? '';
+  const pattern = /^([a-z]+):\/\/[^/]*?(?::(\d+))?$/.exec((routeUrlPattern ?? '').toLowerCase());
+  const gatewayScheme = pattern?.[1] ?? '';
+  const gatewayPort = pattern?.[2] ?? DEFAULT_PORTS[gatewayScheme] ?? '';
   const wanted = [
     ['console', 'consolePublicUrl', 'http'],
     ['controller', 'controllerPublicUrl', 'https'],
   ] as const;
   for (const [key, field, scheme] of wanted) {
-    const match = /^([a-z]+):\/\/([^/:]+)\.\{tenant\}\.localhost(?::(\d+))?\/?$/.exec(
-      auth?.[field] ?? '',
-    );
+    const url = (auth?.[field] ?? '').toLowerCase();
+    const match = /^([a-z]+):\/\/([^/:]+)\.\{tenant\}\.localhost(?::(\d+))?\/?$/.exec(url);
     // No published gateway: nothing to route through (a port-forward or hosts entry serves it).
     if (!match || !routeUrlPattern) continue;
-    const [, protocol, label, port = ''] = match as unknown as [string, string, string, string?];
-    if (protocol !== scheme) problems.push(`tenantAuth.${field} must use ${scheme}://`);
+    const [, protocol, label, port] = match as unknown as [string, string, string, string?];
+    const effectivePort = port ?? DEFAULT_PORTS[protocol];
+    if (gatewayScheme !== 'http')
+      problems.push(`tenantAuth.${field} cannot be routed: routeUrlPattern must use http://`);
+    else if (protocol !== scheme) problems.push(`tenantAuth.${field} must use ${scheme}://`);
     else if (!ROUTE_LABEL.test(label)) problems.push(`tenantAuth.${field} host label is invalid`);
-    else if (port !== gatewayPort)
-      problems.push(`tenantAuth.${field} must use the gateway port ${gatewayPort || '(default)'}`);
+    else if (effectivePort !== gatewayPort)
+      problems.push(`tenantAuth.${field} must use the gateway port ${gatewayPort}`);
     else if (routes.console === label)
       problems.push(`tenantAuth.${field} must not share the console host`);
-    else routes[key] = label;
+    else {
+      routes[key] = label;
+      urls[key] = url;
+    }
   }
-  return { routes, problems };
+  return { routes, urls, problems };
 }
 /** `consoleUrl` / `controllerUrl` for `di-platform-routes`, only for hosts the gateway routes. */
 function routedTenantAuthUrls(tenant: string, cfg: ControllerConfig): Record<string, string> {
-  const { routes } = tenantAuthRoutes(cfg.tenantAuth, cfg.routeUrlPattern);
-  const urls: Record<string, string> = {};
-  if (routes.console)
-    urls.consoleUrl = cfg.tenantAuth!.consolePublicUrl!.replaceAll('{tenant}', tenant);
-  if (routes.controller)
-    urls.controllerUrl = cfg.tenantAuth!.controllerPublicUrl!.replaceAll('{tenant}', tenant);
-  return urls;
+  const { urls } = tenantAuthRoutes(cfg.tenantAuth, cfg.routeUrlPattern);
+  const result: Record<string, string> = {};
+  if (urls.console) result.consoleUrl = urls.console.replaceAll('{tenant}', tenant);
+  if (urls.controller) result.controllerUrl = urls.controller.replaceAll('{tenant}', tenant);
+  return result;
 }
 /** Container limits of one tenant-auth pair, counted on top of the tenant's own quota. */
 export const TENANT_AUTH_LIMITS = { cpu: '500m', memory: '448Mi' };
@@ -209,6 +219,8 @@ const TENANT = `${GROUP}/tenant`;
 const USER = `${GROUP}/user`;
 const FINALIZER = `${GROUP}/cleanup`;
 const COMPONENT = `${GROUP}/component`;
+/** Marks a tenant's runtime namespace (`di-runtime-<tenant>`), so policies can select only those. */
+const NAMESPACE_ROLE = `${GROUP}/namespace-role`;
 const nameSchema = {
   type: 'string',
   minLength: 1,
@@ -1422,6 +1434,7 @@ export {
   GATEWAY_POD_LABELS,
   GROUP,
   INSTALLATION,
+  NAMESPACE_ROLE,
   names,
   OWNER,
   ROUTES_CONFIG_NAME,

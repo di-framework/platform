@@ -57,6 +57,7 @@ import {
   type ControllerConfig,
   FINALIZER,
   INSTALLATION,
+  NAMESPACE_ROLE,
   names,
   OWNER,
   type Resource,
@@ -521,10 +522,18 @@ export class Controller {
       return;
     }
     for (const name of [n.namespace, n.runtimeNamespace]) {
-      await this.ensure(
-        resource(tenant, this.cfg.installation, 'v1', 'Namespace', name, undefined, {}),
-        true,
+      const namespace = resource(
+        tenant,
+        this.cfg.installation,
+        'v1',
+        'Namespace',
+        name,
+        undefined,
+        {},
       );
+      // The gateway's egress to the tenant console and controller selects runtime namespaces only.
+      if (name === n.runtimeNamespace) namespace.metadata.labels![NAMESPACE_ROLE] = 'runtime';
+      await this.ensure(namespace, true);
     }
     // Everything above and these reads can still throw before the try block below; such a
     // failure rejects the tick and skips tenant-auth until the next poll.

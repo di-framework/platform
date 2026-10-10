@@ -13,7 +13,7 @@ import {
   routeUrlPatternFor,
   validateRouteUrlPattern,
 } from '../src/gateway/install';
-import { INSTALLATION, TENANT } from '../src/tenancy/resources';
+import { INSTALLATION, NAMESPACE_ROLE, TENANT } from '../src/tenancy/resources';
 
 describe('route URL pattern', () => {
   it('derives the pattern from a loopback HTTP endpoint only', () => {
@@ -134,8 +134,9 @@ describe('tenant-auth gateway routes (#58:routes)', () => {
   });
 
   it('lets the gateway reach the routed console and controller ports and nothing more', () => {
+    // Only runtime namespaces, not every namespace of the tenant.
     const tenants = {
-      matchLabels: { [INSTALLATION]: 'di-test' },
+      matchLabels: { [INSTALLATION]: 'di-test', [NAMESPACE_ROLE]: 'runtime' },
       matchExpressions: [{ key: TENANT, operator: 'Exists' }],
     };
     const policy = gatewayNetworkPolicySpec('wasmcloud', 'di-test', routes);

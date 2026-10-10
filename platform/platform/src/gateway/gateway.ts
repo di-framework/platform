@@ -50,6 +50,10 @@ export interface GatewayOptions {
   consoleUpstream?: (tenant: string) => Upstream;
   /** Where a controller TLS connection is sent; only overridden by tests. */
   controllerUpstream?: (tenant: string) => Upstream;
+  /** Edge only: time a new connection has to send enough bytes to be classified (default 10 s). */
+  classifyTimeoutMs?: number;
+  /** Edge only: idle time allowed on a controller passthrough pipe (default 5 min). */
+  passthroughIdleMs?: number;
 }
 
 /** Same rule as tenant names in the platform CRDs (`validName`). */
@@ -103,24 +107,56 @@ export function controllerUpstream(tenant: string): Upstream {
   return { hostname: `tenant-controller.di-runtime-${tenant}.svc.cluster.local`, port: 8788 };
 }
 
-/** The SNI host name of a complete TLS ClientHello record, if it carries one. */
+/** Largest TLS plaintext record: a 5-byte header and at most 16 KiB of body (RFC 8446 5.1). */
+const MAX_RECORD = 5 + 16_384;
+
+class Malformed extends Error {}
+
+function check(ok: boolean): void {
+  if (!ok) throw new Malformed();
+}
+
+/**
+ * The SNI host name of a TLS ClientHello, if the first record holds the whole hello and it
+ * carries a `host_name` entry. Every length is bounded by the record, handshake, extensions and
+ * extension that contain it; anything that overruns returns `undefined` rather than clamping.
+ * A ClientHello split across several TLS records is not reassembled: it returns `undefined`, so
+ * the edge closes that connection (clients send the hello in one record in practice).
+ */
 export function serverName(record: Buffer): string | undefined {
   try {
-    // record header (5), handshake header (4), version (2), random (32)
-    let at = 5 + 4 + 2 + 32;
-    at += 1 + record.readUInt8(at); // session id
-    at += 2 + record.readUInt16BE(at); // cipher suites
-    at += 1 + record.readUInt8(at); // compression methods
-    const end = at + 2 + record.readUInt16BE(at);
-    at += 2;
-    while (at + 4 <= end) {
-      const type = record.readUInt16BE(at);
-      const length = record.readUInt16BE(at + 2);
-      at += 4;
-      // server_name: list length (2), name type (1, 0 = host_name), name length (2), name
-      if (type === 0 && record.readUInt8(at + 2) === 0)
-        return record.toString('ascii', at + 5, at + 5 + record.readUInt16BE(at + 3));
-      at += length;
+    check(record.length >= 9 && record[0] === 0x16 && record[5] === 0x01); // ClientHello
+    const recordEnd = 5 + record.readUInt16BE(3);
+    const end = 9 + record.readUIntBE(6, 3);
+    check(recordEnd <= MAX_RECORD && recordEnd <= record.length && end <= recordEnd);
+    let at = 9;
+    const skip = (size: number) => {
+      at += size;
+      check(at <= end);
+    };
+    const read = (size: 1 | 2) => {
+      skip(size);
+      return record.readUIntBE(at - size, size);
+    };
+    skip(2 + 32); // version, random
+    skip(read(1)); // session id
+    skip(read(2)); // cipher suites
+    skip(read(1)); // compression methods
+    const extensionsEnd = read(2) + at;
+    check(extensionsEnd <= end);
+    while (at < extensionsEnd) {
+      const type = read(2);
+      const extensionEnd = read(2) + at;
+      check(extensionEnd <= extensionsEnd);
+      if (type === 0) {
+        // server_name: list length (2), name type (1, 0 = host_name), name length (2), name
+        const listEnd = read(2) + at;
+        check(listEnd <= extensionEnd && read(1) === 0);
+        const nameEnd = read(2) + at;
+        check(nameEnd <= listEnd);
+        return record.toString('ascii', at, nameEnd);
+      }
+      at = extensionEnd;
     }
   } catch {
     /* truncated or malformed */
@@ -128,9 +164,9 @@ export function serverName(record: Buffer): string | undefined {
   return undefined;
 }
 
-/** Bytes needed before the first TLS record is complete (capped at one maximum-size record). */
+/** Bytes needed before the first TLS record is complete. */
 function recordLength(buffer: Buffer): number {
-  return buffer.length < 5 ? 5 : Math.min(5 + buffer.readUInt16BE(3), 5 + 16_384);
+  return buffer.length < 5 ? 5 : 5 + buffer.readUInt16BE(3);
 }
 
 /** Pipe a TLS connection for `<controller>.<tenant>.localhost` to that tenant's controller. */
@@ -142,12 +178,19 @@ function passThrough(socket: Socket, hello: Buffer, options: GatewayOptions): vo
   }
   const target = (options.controllerUpstream ?? controllerUpstream)(route.tenant);
   const upstream = connect(target.port, target.hostname);
+  const close = () => {
+    socket.destroy();
+    upstream.destroy();
+  };
+  const idle = options.passthroughIdleMs ?? 300_000;
+  socket.setTimeout(idle, close);
+  upstream.setTimeout(idle, close);
   upstream.on('error', (error) => {
     console.error(`${target.hostname}: ${error.message || error.name}`);
-    socket.destroy();
+    close();
   });
-  socket.on('close', () => upstream.destroy());
-  upstream.on('close', () => socket.destroy());
+  socket.on('close', close);
+  upstream.on('close', close);
   upstream.write(hello);
   socket.pipe(upstream).pipe(socket);
   socket.resume();
@@ -156,17 +199,30 @@ function passThrough(socket: Socket, hello: Buffer, options: GatewayOptions): vo
 /**
  * The gateway's listener when the controller is routed: it peeks at each connection, passes a
  * TLS handshake (first byte 0x16) through by SNI, and hands anything else to the HTTP `server`.
+ * A connection must be classified within `classifyTimeoutMs` (slowloris), and at most one
+ * maximum-size TLS record (plus the read that completes it) is buffered; a record header that
+ * claims more is closed at once. The timeout is cleared before the handoff, so the HTTP server's
+ * own timeouts, or the passthrough idle timeout, take over.
  */
 export function createEdge(server: Server, options: GatewayOptions): NetServer {
   return createNetServer((socket) => {
     socket.on('error', () => socket.destroy());
+    const stalled = () => socket.destroy();
+    socket.setTimeout(options.classifyTimeoutMs ?? 10_000, stalled);
     let buffer = Buffer.alloc(0);
     const onData = (chunk: Buffer) => {
       buffer = Buffer.concat([buffer, chunk]);
-      if (buffer[0] === 0x16 && buffer.length < recordLength(buffer)) return;
+      const needed = buffer[0] === 0x16 ? recordLength(buffer) : 0;
+      if (needed > MAX_RECORD) {
+        socket.destroy();
+        return;
+      }
+      if (buffer.length < needed) return;
       socket.off('data', onData);
       socket.pause();
-      if (buffer[0] === 0x16) {
+      socket.setTimeout(0);
+      socket.off('timeout', stalled);
+      if (needed) {
         passThrough(socket, buffer, options);
         return;
       }
