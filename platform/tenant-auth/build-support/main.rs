@@ -81,6 +81,7 @@ fn run() -> Result<()> {
                 .write_all(record.message.as_bytes());
         });
         request.tag = Some(local_ref.clone());
+        request.isolation = oci_builder::Isolation::Chroot;
         request.labels.insert(
             "org.opencontainers.image.revision".to_owned(),
             revision.clone(),
@@ -152,8 +153,19 @@ fn enabled(name: &str) -> Result<bool> {
     }
 }
 
+struct TempFileGuard<'a>(&'a Path);
+
+impl<'a> Drop for TempFileGuard<'a> {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.0);
+    }
+}
+
 fn smoke_check(builder: &Builder, context: &Path, image: &str) -> Result<()> {
     let dockerfile = context.join("tenant-auth-smoke.Dockerfile");
+    if dockerfile.exists() {
+        let _ = fs::remove_file(&dockerfile);
+    }
     // Expected configuration errors establish that both bundles load imports.
     fs::write(
         &dockerfile,
@@ -174,6 +186,7 @@ RUN set -eu; \
 "#
         ),
     )?;
+    let _cleanup = TempFileGuard(&dockerfile);
     let mut request = BuildRequest::new(&dockerfile, context).with_log(|record| {
         let _ = std::io::stderr()
             .lock()
