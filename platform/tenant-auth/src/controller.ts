@@ -564,7 +564,10 @@ export class Controller {
     const timeout = new AbortController();
     const stall = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // A registry that answers before the upload ends (a 401, say) must not be aborted later.
+    let answered = false;
     const armHeaderTimer = () => {
+      if (answered) return;
       timer = setTimeout(() => timeout.abort(), this.config.registryUpstreamTimeoutMs);
     };
     const body = request.body
@@ -602,6 +605,7 @@ export class Controller {
         ? problem(504, 'Gateway Timeout', 'the tenant registry did not answer in time')
         : problem(502, 'Bad Gateway', 'the tenant registry could not be reached');
     } finally {
+      answered = true;
       clearTimeout(timer);
     }
     const out = new Headers();

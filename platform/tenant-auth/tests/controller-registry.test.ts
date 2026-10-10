@@ -218,6 +218,18 @@ describe('registry front limits', () => {
     async fetch(request) {
       const { pathname } = new URL(request.url);
       signals.set(pathname, request.signal);
+      if (pathname === '/early')
+        return new Response(
+          new ReadableStream({
+            async start(c) {
+              c.enqueue(new TextEncoder().encode('early '));
+              await Bun.sleep(400);
+              c.enqueue(new TextEncoder().encode('done'));
+              c.close();
+            },
+          }),
+          { status: 401 },
+        );
       if (pathname === '/hang-after-body') {
         await request.text();
         await hold.promise;
@@ -410,6 +422,18 @@ describe('registry front limits', () => {
     } as RequestInit);
     expect(response.status).toBe(504);
     hold.resolve();
+    await free();
+  });
+
+  test('a registry that answers before the upload ends is not cut off later (W5)', async () => {
+    const response = await call('/early', {
+      method: 'PUT',
+      body: trickle(3, 30),
+      duplex: 'half',
+    } as RequestInit);
+    expect(response.status).toBe(401);
+    // The body keeps streaming past the 150 ms header timeout after the upload has ended.
+    expect(await response.text()).toBe('early done');
     await free();
   });
 });
