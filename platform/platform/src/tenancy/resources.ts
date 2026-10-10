@@ -615,7 +615,6 @@ function tenantResources(
   ) => resource(tenant, cfg.installation, apiVersion, kind, name, namespace, body);
   const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
   const replicas = suspended ? 0 : (tenant.spec.runtime?.replicas ?? 1);
-  const resources = tenant.spec.resources ?? {};
   const workloadRead = {
     apiGroups: ['runtime.wasmcloud.dev'],
     resources: ['workloaddeployments', 'workloads', 'workloadreplicasets', 'artifacts'],
