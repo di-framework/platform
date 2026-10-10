@@ -73,6 +73,13 @@ describe('/v1/deploy', () => {
       (rejectToken === 'workloads' && request.pathname.startsWith(WORKLOADS))
     )
       return json({ message: 'Unauthorized' }, 401);
+    // RBAC per token (#112): a member's `sa-*` token may not read or patch Secrets.
+    if (
+      request.pathname.startsWith(`${CORE}/secrets`) &&
+      request.headers.get('authorization')?.startsWith('Bearer sa-') &&
+      ['GET', 'PATCH'].includes(request.method)
+    )
+      return json({ message: 'secrets is forbidden' }, 403);
     const selector = new URL(request.path, 'http://x').searchParams.get('labelSelector');
     if (request.method === 'GET' && selector !== null) {
       const wanted = selector.split(',').map((term) => term.split('='));
@@ -265,13 +272,13 @@ describe('/v1/deploy', () => {
     template.service = { name: 'svc' };
     for (const path of ['/v1/deploy/preview', '/v1/deploy']) {
       expect((await post(path, bundle)).status).toBeLessThan(300);
-      // Each named Secret was read as the caller before applying.
+      // Each named Secret was checked as the controller before applying (#112).
       for (const object of ['api-token.staging', 'db.staging'])
         expect(
           api.requests
             .find((r) => r.method === 'GET' && r.pathname === `${CORE}/secrets/${object}`)
             ?.headers.get('authorization'),
-        ).toBe('Bearer sa-di-user-alice');
+        ).toBe('Bearer admin');
       const applied = JSON.parse(patches().at(-1)?.body ?? '') as {
         metadata: { labels: Json };
         spec: { template: { spec: { components: Json[]; service: Json } } };
@@ -836,9 +843,14 @@ describe('/v1/deploy', () => {
       expect(JSON.parse(stored2.data.bundle)).toEqual(second);
       const hex = new Bun.CryptoHasher('sha256').update(stored2.data.bundle).digest('hex');
       expect(stored2.data.digest).toBe(`sha256:${hex}`);
-      // Every cluster call is made with the caller's own token.
+      // Every cluster call is made with the caller's own token, except the Secret existence
+      // checks, which run as the controller (#112).
       for (const request of api.requests.filter((r) => !r.pathname.endsWith('/token')))
-        expect(request.headers.get('authorization')).toBe('Bearer sa-di-user-alice');
+        expect(request.headers.get('authorization')).toBe(
+          request.method === 'GET' && request.pathname.startsWith(`${CORE}/secrets/`)
+            ? 'Bearer admin'
+            : 'Bearer sa-di-user-alice',
+        );
       expect(
         api.requests.some((r) => r.method === 'POST' && r.pathname === `${CORE}/configmaps`),
       ).toBe(true);
@@ -1442,6 +1454,13 @@ describe('/v1/deploy', () => {
       const response = await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
       expect(response.status).toBe(422);
       expect(((await response.json()) as Json).detail).toBe('secret db does not exist in prod');
+      // The re-validation reads the Secret as the controller (#112).
+      expect(
+        api.requests
+          .filter((r) => r.method === 'GET' && r.pathname === `${CORE}/secrets/db.prod`)
+          .at(-1)
+          ?.headers.get('authorization'),
+      ).toBe('Bearer admin');
     });
 
     test('bindings a bundle no longer declares are pruned, and preview reports them as delete', async () => {

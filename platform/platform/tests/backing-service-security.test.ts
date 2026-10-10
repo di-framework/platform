@@ -390,6 +390,22 @@ describe('tenant RBAC, quotas, admission policies, and network isolation', () =>
     expect(JSON.stringify(viewer.rules)).not.toContain('backingserviceclasses');
   });
 
+  it('makes Secrets write-only for developers and invisible to viewers (#112)', () => {
+    type Rule = { apiGroups: string[]; resources: string[]; verbs: string[] };
+    const resources = tenantResources(tenant(), cfg, { data: { 'tls.key': 'private' } });
+    const rules = (name: string) =>
+      resources
+        .filter((r) => r.kind === 'Role' && r.metadata.name === name)
+        .flatMap((r) => (r as unknown as { rules: Rule[] }).rules)
+        .filter((r) => r.apiGroups.includes('') && r.resources.includes('secrets'));
+    const developer = rules('di-developer');
+    expect(developer).toHaveLength(1);
+    expect([...(developer[0]?.verbs ?? [])].sort()).toEqual(['create', 'delete', 'update']);
+    expect(rules('di-runtime-developer')).toEqual([]);
+    expect(rules('di-viewer')).toEqual([]);
+    expect(rules('di-runtime-viewer')).toEqual([]);
+  });
+
   it('quotas concurrent BackingService and ServiceBinding counts plus runtime storage budget', () => {
     const resources = tenantResources(
       {
@@ -419,6 +435,8 @@ describe('tenant RBAC, quotas, admission policies, and network isolation', () =>
       'test-backingservices',
       'test-servicebindings',
       'test-services',
+      'test-tenant-secret-delete',
+      'test-tenant-secret-update',
       'test-workloads',
     ]);
     const workloads = policies.find((p) => p.metadata.name === 'test-workloads');

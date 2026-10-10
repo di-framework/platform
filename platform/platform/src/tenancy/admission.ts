@@ -602,6 +602,112 @@ function backendConfigPolicy(namespace: string): AdmissionPolicy {
   };
 }
 
+/**
+ * Developers may delete tenant Secrets but never read them (#112). A DELETE response carries the
+ * object, data included, so refuse every DELETE that can answer without removing the Secret:
+ * a dry run, an `Orphan`/`Foreground` propagation policy (each adds a finalizer, so the object
+ * is only marked), and a Secret that already has finalizers or a deletionTimestamp. What is left
+ * is a plain delete that removes the Secret; the controller proxy also redacts its response.
+ */
+function tenantSecretDeletePolicy(namespace: string): AdmissionPolicy {
+  return {
+    name: 'tenant-secret-delete',
+    apiGroups: [''],
+    apiVersions: ['v1'],
+    operations: ['DELETE'],
+    resources: ['secrets'],
+    validations: [
+      {
+        expression: `
+          !request.userInfo.username.startsWith('system:serviceaccount:${namespace}:di-user-') ||
+          !((has(request.dryRun) && request.dryRun == true) ||
+            (has(request.options) && has(request.options.propagationPolicy) &&
+              request.options.propagationPolicy in ['Orphan', 'Foreground']) ||
+            (has(request.options) && has(request.options.orphanDependents) &&
+              request.options.orphanDependents == true) ||
+            (has(oldObject.metadata.finalizers) && size(oldObject.metadata.finalizers) > 0) ||
+            has(oldObject.metadata.deletionTimestamp))`,
+        message:
+          'tenant users may delete Secrets only with a plain, non-dry-run delete of a Secret without finalizers',
+      },
+    ],
+  };
+}
+
+/** Mirrors the `tenant-secret-delete` CEL rule (#112). */
+export function tenantSecretDeleteAllowed(input: {
+  username: string;
+  controllerNamespace: string;
+  dryRun?: boolean;
+  options?: { propagationPolicy?: string; orphanDependents?: boolean };
+  finalizers?: string[];
+  deletionTimestamp?: string;
+}): boolean {
+  if (!input.username.startsWith(`system:serviceaccount:${input.controllerNamespace}:di-user-`))
+    return true;
+  return !(
+    input.dryRun === true ||
+    ['Orphan', 'Foreground'].includes(input.options?.propagationPolicy ?? '') ||
+    input.options?.orphanDependents === true ||
+    (input.finalizers ?? []).length > 0 ||
+    input.deletionTimestamp !== undefined
+  );
+}
+
+/** Denial for a tenant user's UPDATE of a platform-managed Secret (#112; the CLI maps it to 403). */
+export const SECRET_UPDATE_MANAGED_MESSAGE =
+  'tenant users cannot update platform-managed di-binding-*/di-bs-* Secrets';
+/** Denial for a tenant user's UPDATE that drops an existing Secret key (#112; the CLI maps it to 409). */
+export const SECRET_UPDATE_KEYS_MESSAGE =
+  'tenant users may update a Secret only if it keeps every existing data key';
+
+/**
+ * Developers replace tenant Secrets they cannot read (#112), so the console's Secret reassignment
+ * must not clobber a platform-managed Secret or silently drop keys it cannot see. Each UPDATE by a
+ * `di-user-*` service account must target an unmanaged name and keep every key of the old object
+ * (stringData is already folded into data at admission). Same-key replaces (the `/v1` set and
+ * update, the CLI control Secret) stay allowed.
+ */
+function tenantSecretUpdatePolicy(namespace: string): AdmissionPolicy {
+  const developer = `request.userInfo.username.startsWith('system:serviceaccount:${namespace}:di-user-')`;
+  return {
+    name: 'tenant-secret-update',
+    apiGroups: [''],
+    apiVersions: ['v1'],
+    operations: ['UPDATE'],
+    resources: ['secrets'],
+    validations: [
+      {
+        expression: `!${developer} ||
+          !(object.metadata.name.startsWith('${BS_CONFIG_PREFIX}') ||
+            object.metadata.name.startsWith('${BINDING_CONFIG_PREFIX}'))`,
+        message: SECRET_UPDATE_MANAGED_MESSAGE,
+      },
+      {
+        expression: `!${developer} || !has(oldObject.data) ||
+          oldObject.data.all(k, has(object.data) && k in object.data)`,
+        message: SECRET_UPDATE_KEYS_MESSAGE,
+      },
+    ],
+  };
+}
+
+/** Mirrors the `tenant-secret-update` CEL rules (#112): the denial message, or undefined if allowed. */
+export function tenantSecretUpdateDenial(input: {
+  username: string;
+  controllerNamespace: string;
+  name: string;
+  oldKeys?: string[];
+  newKeys?: string[];
+}): string | undefined {
+  if (!input.username.startsWith(`system:serviceaccount:${input.controllerNamespace}:di-user-`))
+    return undefined;
+  if (isManagedSecretName(input.name)) return SECRET_UPDATE_MANAGED_MESSAGE;
+  const kept = new Set(input.newKeys ?? []);
+  if ((input.oldKeys ?? []).some((key) => !kept.has(key))) return SECRET_UPDATE_KEYS_MESSAGE;
+  return undefined;
+}
+
 function ownershipLabelsExpression(installation: string): string {
   return `!has(object.metadata.labels) || (
     (!('${OWNER}' in object.metadata.labels)) &&
@@ -618,6 +724,8 @@ export function admissionResources(installation: string, namespace: string): Res
   const policies: AdmissionPolicy[] = [
     workloadPolicy(namespace),
     backendConfigPolicy(namespace),
+    tenantSecretDeletePolicy(namespace),
+    tenantSecretUpdatePolicy(namespace),
     {
       name: 'services',
       apiGroups: [''],

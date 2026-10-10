@@ -3,7 +3,7 @@ import { type HttpCall, problem } from '@di-framework/tenant-cli/src/api/handler
 // the admission policy enforces, so it is shared from the platform package, not copied.
 import { isManagedSecretName } from '../../../platform/src/tenancy/admission.ts';
 import { KubeError, type UserKube } from '../kube.ts';
-import type { V1Context, V1Handler, V1Module } from './context.ts';
+import type { SecretReader, V1Context, V1Handler, V1Module } from './context.ts';
 
 /**
  * `/v1/secrets` and `/v1/vars` (platform#53). The storage layout is the contract the deploy lane
@@ -46,7 +46,7 @@ const nameOf = (call: HttpCall) => call.request.params?.name ?? '';
 const valueIn = (command: unknown) => (command as { value: string }).value;
 const now = () => new Date().toISOString();
 
-export async function find(kube: UserKube, path: string): Promise<Stored | undefined> {
+export async function find(kube: SecretReader, path: string): Promise<Stored | undefined> {
   try {
     return await kube.call<Stored>('GET', path);
   } catch (error) {
@@ -126,7 +126,7 @@ async function existingSecret(
   env: string,
   missingIsError: boolean,
 ): Promise<Stored | Response | undefined> {
-  const found = await find(context.asUser(), secretPath(context, name, env));
+  const found = await find(context.asController(), secretPath(context, name, env));
   if (!found)
     return missingIsError
       ? problem(404, 'Not Found', `secret ${name} does not exist in ${env}`)
@@ -189,7 +189,7 @@ const secrets: V1Handler = async (_command, call, context) => {
   const env = envOf(call);
   const selector = encodeURIComponent(`${CONFIG}=secret,${ENV}=${env}`);
   const list = await context
-    .asUser()
+    .asController()
     .call<{ items: Stored[] }>('GET', `${namespace(context)}/secrets?labelSelector=${selector}`);
   const items = list.items
     .map(({ metadata }) => ({
@@ -304,7 +304,7 @@ async function changeVars(
 async function secretSharing(context: V1Context, name: string, env: string) {
   const secret = name.toLowerCase().replaceAll('_', '-');
   if (secretEnvName(secret) !== name || !SECRET_NAME.test(secret)) return undefined;
-  const found = await find(context.asUser(), secretPath(context, secret, env));
+  const found = await find(context.asController(), secretPath(context, secret, env));
   if (found?.metadata.labels?.[CONFIG] !== 'secret') return undefined;
   return conflict(
     `secret ${secret} is injected as ${name} in ${env}; a secret and a var cannot share it`,

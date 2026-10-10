@@ -30,6 +30,8 @@ let failGet = false;
 let corruptAnnotation = false;
 /** When set, runs once after the next GET of this key is answered: a concurrent writer. */
 let raceAfterGet: { key: string; run: () => void } | undefined;
+/** When set, Secret reads with the controller's own token answer this status. */
+let refuseController: number | undefined;
 
 /** Answers 409 when `expected` is set and differs from the stored version, like the API server. */
 const stale = (key: string, expected: string | undefined) =>
@@ -53,6 +55,26 @@ const api = serve((request) => {
   if (!match) return json({ message: 'unexpected' }, 500);
   const [, kind, name] = match;
   const key = `${kind}/${name}`;
+  // RBAC per token, like the platform's Roles (#112): a member's `sa-*` token may only create,
+  // update and delete Secrets; the controller's own token (`admin`) may read them.
+  if (
+    kind === 'secrets' &&
+    request.headers.get('authorization')?.startsWith('Bearer sa-') &&
+    !['POST', 'PUT', 'DELETE'].includes(request.method)
+  )
+    return json({ message: `secrets is forbidden: cannot ${request.method}` }, 403);
+  if (
+    kind === 'secrets' &&
+    refuseController &&
+    request.headers.get('authorization') === 'Bearer admin'
+  )
+    return json(
+      {
+        message:
+          'secrets is forbidden: User "system:serviceaccount:di-runtime-acme:tenant-controller"',
+      },
+      refuseController,
+    );
   const notFound = () => json({ message: `${kind} "${name}" not found` }, 404);
   switch (request.method) {
     case 'GET': {
@@ -182,6 +204,7 @@ beforeEach(() => {
   failGet = false;
   corruptAnnotation = false;
   raceAfterGet = undefined;
+  refuseController = undefined;
 });
 
 /** Simulates another writer bumping the stored object's resource version. */
@@ -195,6 +218,93 @@ describe('storage names', () => {
     expect(varsConfigMapName('prod')).toBe('di-vars-prod');
     expect(secretObjectName('db-password', 'staging')).toBe('db-password.staging');
     expect(secretEnvName('db-password')).toBe('DB_PASSWORD');
+  });
+});
+
+describe('write-only Secrets for developers (#112)', () => {
+  const direct = (method: string, path: string, token: string, body?: string) =>
+    fetch(`${api.url}${path}`, {
+      method,
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body,
+    });
+
+  // This checks the fake's RBAC branch only; the real enforcement proof is the Role-rule test in
+  // platform/platform/tests/backing-service-security.test.ts.
+  test('a developer token cannot get, list, watch or patch Secrets; the controller can read', async () => {
+    store.set('secrets/db.prod', stamp({ metadata: { name: 'db.prod' }, data: { DB: 'eA==' } }));
+    for (const [method, path] of [
+      ['GET', `${NS}/secrets/db.prod`],
+      ['GET', `${NS}/secrets`],
+      ['GET', `${NS}/secrets?watch=true`],
+      ['PATCH', `${NS}/secrets/db.prod`],
+    ] as const)
+      expect(
+        (await direct(method, path, 'sa-alice', method === 'PATCH' ? '{}' : undefined)).status,
+      ).toBe(403);
+    expect((await direct('GET', `${NS}/secrets/db.prod`, 'admin')).status).toBe(200);
+    expect((await direct('GET', `${NS}/secrets`, 'admin')).status).toBe(200);
+  });
+
+  test('no /v1 response carries a Secret value', async () => {
+    const responses = [
+      await call('PUT', '/v1/secrets/db-password?env=prod', 'hidden-value'),
+      await call('PATCH', '/v1/secrets/db-password?env=prod', 'hidden-value'),
+      await call('GET', '/v1/secrets?env=prod'),
+      await call('PUT', '/v1/vars/DB_PASSWORD?env=prod', 'v'),
+      await call('PUT', '/v1/secrets/db-password?env=prod', 'hidden-value'),
+      await call('DELETE', '/v1/secrets/db-password?env=prod'),
+    ];
+    for (const response of responses) {
+      const text = await response.text();
+      expect(text).not.toContain('hidden-value');
+      expect(text).not.toContain(btoa('hidden-value'));
+    }
+    // Nor does any audit event.
+    const audit = JSON.stringify(log.mock.calls);
+    expect(audit).toContain('secret.set');
+    expect(audit).not.toContain('hidden-value');
+    expect(audit).not.toContain(btoa('hidden-value'));
+  });
+
+  test('controller Secret reads ask for metadata only', async () => {
+    await call('PUT', '/v1/secrets/db-password?env=prod', 'x');
+    await call('GET', '/v1/secrets?env=prod');
+    const reads = kubeCalls().filter(
+      (r) => r.method === 'GET' && r.pathname.startsWith(`${NS}/secrets`),
+    );
+    expect(reads.length).toBeGreaterThanOrEqual(2);
+    for (const read of reads) {
+      const accept = read.headers.get('accept') ?? '';
+      expect(accept).toContain(
+        read.pathname === `${NS}/secrets`
+          ? 'as=PartialObjectMetadataList;g=meta.k8s.io;v=v1'
+          : 'as=PartialObjectMetadata;g=meta.k8s.io;v=v1',
+      );
+    }
+  });
+
+  test('a refused controller read is a 502 controller error, not a denial of the caller', async () => {
+    for (const code of [401, 403]) {
+      refuseController = code;
+      log.mockClear();
+      for (const response of [
+        await call('GET', '/v1/secrets?env=prod'),
+        await call('PUT', '/v1/secrets/db-password?env=prod', 'x'),
+      ]) {
+        expect(response.status).toBe(502);
+        const text = await response.text();
+        expect(text).toContain('the cluster request failed');
+        expect(text).not.toContain('tenant-controller');
+      }
+      const events = (log.mock.calls as unknown[][]).map(
+        ([line]) => JSON.parse(String(line)) as { event: string; reason?: string },
+      );
+      expect(events.some((e) => e.event === 'request.denied')).toBe(false);
+      const failed = events.filter((e) => e.event === 'request.failed');
+      expect(failed).toHaveLength(2);
+      for (const event of failed) expect(event.reason).toStartWith('controller error:');
+    }
   });
 });
 
@@ -233,9 +343,14 @@ describe('secrets', () => {
     const calls = kubeCalls();
     expect(calls.length).toBeGreaterThan(0);
     for (const request of calls) {
-      expect(request.headers.get('authorization')).toBe('Bearer sa-alice');
       expect(request.pathname.startsWith(NS)).toBe(true);
-      if (request.method !== 'GET') expect(request.pathname.startsWith(`${NS}/secrets`)).toBe(true);
+      // Secret reads run as the controller; every write runs as the caller, never as a PATCH.
+      const secret = request.pathname.startsWith(`${NS}/secrets`);
+      expect(request.headers.get('authorization')).toBe(
+        secret && request.method === 'GET' ? 'Bearer admin' : 'Bearer sa-alice',
+      );
+      expect(request.method).not.toBe('PATCH');
+      if (request.method !== 'GET') expect(secret).toBe(true);
     }
     expect(calls.map((r) => r.method)).toContain('POST');
     expect(calls.map((r) => r.method)).toContain('DELETE');
@@ -426,7 +541,10 @@ describe('vars', () => {
     });
 
     for (const request of kubeCalls()) {
-      expect(request.headers.get('authorization')).toBe('Bearer sa-alice');
+      // The var/secret clash check reads the Secret as the controller (#112).
+      expect(request.headers.get('authorization')).toBe(
+        request.pathname.startsWith(`${NS}/secrets`) ? 'Bearer admin' : 'Bearer sa-alice',
+      );
       expect(request.pathname.startsWith(NS)).toBe(true);
       if (request.method !== 'GET')
         expect(request.pathname.startsWith(`${NS}/configmaps`)).toBe(true);

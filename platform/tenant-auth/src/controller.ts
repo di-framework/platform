@@ -18,6 +18,7 @@ import {
   type UserTokens,
 } from './kube.ts';
 import { discover, type ProviderMetadata } from './oidc.ts';
+import { controllerSecretReader } from './v1/context.ts';
 import { serveV1 } from './v1/index.ts';
 import { PASSTHROUGH, servePassthrough, tenantUpstream } from './v1/proxy.ts';
 
@@ -87,6 +88,9 @@ export function allowed(method: string, pathname: string, tenant: string): boole
   return false;
 }
 
+/** Secret objects and collections in any namespace, as the raw proxy sees them. */
+const SECRET_PATH = /^\/api\/v1\/namespaces\/[^/]+\/secrets(\/|$)/;
+
 /** A Kubernetes Status object, so kubectl prints the reason instead of a parse error. */
 const status = (code: number, reason: string, message: string) =>
   new Response(
@@ -94,7 +98,7 @@ const status = (code: number, reason: string, message: string) =>
       kind: 'Status',
       apiVersion: 'v1',
       metadata: {},
-      status: 'Failure',
+      status: code < 400 ? 'Success' : 'Failure',
       message,
       reason,
       code,
@@ -309,6 +313,7 @@ export class Controller {
         tenant: this.config.tenant,
         principal,
         asUser: () => asUser(this.kube, this.userTokens, principal),
+        asController: () => controllerSecretReader(this.kube),
         audit: (event, fields) => this.audit(event, fields),
       });
     return status(404, 'NotFound', `${url.pathname} is not a controller endpoint`);
@@ -347,6 +352,12 @@ export class Controller {
       path: url.pathname,
       status: upstream.status,
     });
+    // A Secret DELETE answers with the deleted object, data included (#112): developers may delete
+    // Secrets but never read them, so a successful one is reported as a bare Status.
+    if (request.method === 'DELETE' && SECRET_PATH.test(url.pathname) && upstream.ok) {
+      await upstream.body?.cancel();
+      return status(upstream.status, 'Success', 'secret deleted; its contents are not returned');
+    }
     const out = new Headers(upstream.headers);
     for (const name of ['content-length', 'transfer-encoding', 'connection']) out.delete(name);
     return new Response(upstream.body, { status: upstream.status, headers: out });

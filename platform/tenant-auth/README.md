@@ -89,7 +89,9 @@ The script bundles both entrypoints with `Bun.build`, ships them in a ConfigMap 
 * ServiceAccounts `tenant-controller` and `tenant-console` in `di-runtime-<t>`.
 * RBAC for the controller only: `get` its own `Tenant`, `get`/`list` `User` CRs, `create`
   `serviceaccounts/token` in the platform namespace restricted by `resourceNames` to the tenant's
-  members, and Secrets in its own namespace for API keys. It cannot read tenant Secrets.
+  members, Secrets in its own namespace for API keys, and `get`/`list` on Secrets in
+  `di-tenant-<t>` (#112) so `/v1` can check tenant Secret names, labels and resourceVersions that
+  developers are not allowed to read. It never returns or logs Secret data.
 * A NetworkPolicy adding egress to the API server and the issuer; the tenant policy otherwise
   allows only tenant namespaces, DNS, and public `:443`.
 * Deployments (strategy `Recreate`, 200m CPU limits) and ClusterIP Services.
@@ -232,6 +234,41 @@ the `config: vars` label, the endpoints refuse to write it (409); they never ado
 The endpoints only touch Secrets that carry the `config: secret` label; values never leave the
 controller on read. Writes carry the `resourceVersion` they read (replace and delete), so a
 concurrent write, or a create that races another, is a 409 `changed concurrently; retry`.
+
+**Write-only for developers (#112).** The `di-developer` Role grants Secrets `create`, `update`
+and `delete` only: no `get`, `list` or `watch`, and no `patch`, whose response returns the whole
+object. Viewers have no Secret access. Every Secret read the endpoints and deploy need (the list
+of names and update times, the `resourceVersion` read before replace and delete, the existence
+and label checks, the var/secret clash checks) runs as the tenant controller's own ServiceAccount;
+every Secret write runs as the calling user, as a `POST` create or a `PUT` full replace, never a
+`PATCH`. No response or log carries Secret data. Those controller reads ask for metadata only
+(`PartialObjectMetadata`/`PartialObjectMetadataList`), so Secret values never reach the
+controller process, and a 401/403 on them is a controller error (502, detail in the audit as
+`request.failed`), not a denial of the caller.
+
+A Secret `DELETE` answers with the object, data included. The platform's `tenant-secret-delete`
+ValidatingAdmissionPolicy therefore refuses, for `di-user-*` ServiceAccounts, every Secret delete
+that could answer without removing it: `dryRun`, `propagationPolicy` `Orphan` or `Foreground`
+(or `orphanDependents`), and a Secret that already has finalizers or a `deletionTimestamp`. The
+controller's kubectl proxy replaces the body of a successful Secret `DELETE` with a bare `Status`.
+
+Developers replace Secrets they cannot read, so the `tenant-secret-update` policy guards every
+Secret `UPDATE` by a `di-user-*` ServiceAccount (`stringData` is already folded into `data` when
+it runs). It denies, with these exact messages (cli-plugin-platform matches them to map the
+console's Secret reassignment errors):
+
+| Case | Message | CLI status |
+| --- | --- | --- |
+| the target is platform-managed (`di-binding-*`, `di-bs-*`) | `tenant users cannot update platform-managed di-binding-*/di-bs-* Secrets` | 403 |
+| the update drops a key the Secret already has | `tenant users may update a Secret only if it keeps every existing data key` | 409 |
+
+Same-key replaces (the `/v1` secret set and update, the CLI `<workload>-control` Secret) and
+updates that add keys stay allowed. Match by substring: a managed name may also trip the older
+`backend-config` message first.
+
+Write-only stops direct reads, not use: a developer can still deploy a workload that injects a
+tenant Secret of the env (`secretFrom`) and have it print the value in a response or a log.
+Managed `di-bs-*`/`di-binding-*` credentials stay blocked from injection by the workload policy.
 
 **One name, one source.** A var and a secret that map to the same environment variable name in
 the same environment are a conflict. The endpoints refuse it at write time with 409: setting a

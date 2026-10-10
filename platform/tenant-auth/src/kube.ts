@@ -170,11 +170,16 @@ export class KubeClient {
     return this.credentials.ca;
   }
 
-  async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+  async call<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    accept = 'application/json',
+  ): Promise<T> {
     const { server, ca, tokenFile, cert, key } = this.credentials;
     const token =
       this.credentials.token ?? (tokenFile ? readFileSync(tokenFile, 'utf8').trim() : undefined);
-    const headers: Record<string, string> = { Accept: 'application/json' };
+    const headers: Record<string, string> = { Accept: accept };
     if (token) headers.Authorization = `Bearer ${token}`;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     const response = await fetch(`${server}${path}`, {
