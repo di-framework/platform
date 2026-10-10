@@ -1,5 +1,32 @@
 # Tenant OCI registry (`platform/oci-registry`)
 
+## Local Rust publisher
+
+From the repository root, `cargo run --locked -p oci-registry-publisher` builds
+the release Wasm component, validates it with `wasm-tools`, recovers its WIT,
+and writes the component, WIT, build metadata, and checksums to `dist/`.
+Use `-- --check` to validate an existing build without rebuilding or publishing.
+The component retains its independent Cargo workspace and pinned toolchain.
+
+`PUSH=true cargo run --locked -p oci-registry-publisher` (or `make publish-local`
+here) also publishes through `wash oci push`, pulls by the returned manifest
+digest, verifies the bytes, and writes `dist/publish-report.json`. This preserves
+the reference branch's Wasm OCI format; `oci-builder` builds container images,
+so this component flow still needs `wash` on PATH.
+
+Defaults are `DI_OCI_REGISTRY=127.0.0.1:25001`,
+`DI_OCI_REPOSITORY=di-framework/oci-registry`, and a content-derived tag.
+`DI_OCI_TAG`, `DI_OCI_DIST_DIR`, and `DI_OCI_CLUSTER_REGISTRY` override the tag,
+artifact directory, and reported in-cluster registry respectively.
+`DI_OCI_PROTOCOL=https|http|auto` defaults to `auto` (HTTP for local/private
+addresses, HTTPS otherwise). Credentials use `DI_OCI_USERNAME`/`DI_OCI_PASSWORD`,
+then `GHCR_USERNAME`/`GHCR_TOKEN`, then `GITHUB_ACTOR`/`GITHUB_TOKEN`.
+
+Cargo's `build.rs` only tracks compile-time inputs. Publication requires an
+explicit executable run with `PUSH=true`. The dispatch-only publish workflow
+installs Rust, Go/native build dependencies, Wasm tools, and wash before running
+the publisher. Pull requests build and validate without publishing.
+
 Per-tenant OCI registry component for the di-framework platform (#83
 `:component`, decision on #52). Each tenant gets its own registry in its
 namespace; the tenant controller decides who may pull and push.

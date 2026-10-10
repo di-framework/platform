@@ -1,8 +1,5 @@
-# Publish the tenant-auth image (controller and console) to ghcr.io/di-framework/tenant-auth.
-# Dispatch-only, like the tenant host image. The build is a Bun bundle on a stock oven/bun base,
-# so a single ubuntu job builds both architectures: the build stage runs on the builder's
-# platform and the final stage only copies the platform-independent JavaScript (no emulation).
-# Auth is GITHUB_TOKEN with packages: write. No registry secret is stored.
+# Build/push each architecture with Rust/embedded Buildah on a native runner.
+# ORAS assembles the published manifests into one multi-architecture image index.
 name: Publish tenant-auth image
 
 on:
@@ -10,68 +7,115 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: publish-tenant-auth-image
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Push ghcr.io/di-framework/tenant-auth
-    runs-on: ubuntu-24.04
+  publish-platform:
+    name: Push tenant-auth (${{ matrix.arch }})
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
       - name: Require di-framework/platform
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REPOSITORY}" != "di-framework/platform" ]]; then
-            echo "::error::This workflow publishes ghcr.io/di-framework/tenant-auth and only runs in di-framework/platform"
+          if [[ "$GITHUB_REPOSITORY" != di-framework/platform ]]; then
+            echo '::error::Only di-framework/platform can publish this image'
             exit 1
           fi
 
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
 
-      - name: Build and push
-        id: build
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: platform/tenant-auth/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          provenance: true
-          push: true
-          tags: ghcr.io/di-framework/tenant-auth:${{ github.sha }}
-          labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Set up native image builder
+        uses: ./.github/actions/setup-tenant-auth-builder
 
-      - name: Record image digest
+      - name: Compile the Rust builder
+        run: cargo build -p tenant-auth-image --locked
+
+      - name: Build, smoke-check, and push
+        env:
+          PUSH: 'true'
+          SMOKE_CHECK: 'true'
+          BUILDAH_ISOLATION: chroot
+          DI_OCI_REGISTRY: ghcr.io
+          DI_OCI_REPOSITORY: di-framework/tenant-auth
+          DI_OCI_TAG: ${{ github.sha }}-${{ matrix.arch }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          digest="${{ steps.build.outputs.digest }}"
-          if [[ "${digest}" != sha256:* ]]; then
-            echo "::error::build did not return a digest"
-            exit 1
-          fi
-          ref="ghcr.io/di-framework/tenant-auth@${digest}"
-          echo "Published ${ref}"
+          sudo --preserve-env=PUSH,SMOKE_CHECK,BUILDAH_ISOLATION,DI_OCI_REGISTRY,DI_OCI_REPOSITORY,DI_OCI_TAG,GHCR_USERNAME,GHCR_TOKEN \
+            ./target/debug/tenant-auth-image
+
+      - name: Upload platform publish report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: tenant-auth-${{ matrix.arch }}
+          path: platform/tenant-auth/dist/publish-report.json
+          if-no-files-found: error
+
+  publish-index:
+    name: Publish multi-architecture tenant-auth index
+    needs: publish-platform
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Install index verification tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq ca-certificates
+
+      - name: Download platform publish reports
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: tenant-auth-*
+          path: reports
+
+      - name: Set up ORAS
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
+        with:
+          version: '1.3.4'
+
+      - name: Assemble and verify image index
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | oras login ghcr.io --username "$GHCR_USERNAME" --password-stdin
+          amd64="$(jq -er '.manifestDigest | select(test("^sha256:[0-9a-f]{64}$"))' reports/tenant-auth-amd64/publish-report.json)"
+          arm64="$(jq -er '.manifestDigest | select(test("^sha256:[0-9a-f]{64}$"))' reports/tenant-auth-arm64/publish-report.json)"
+          ref="ghcr.io/di-framework/tenant-auth:${GITHUB_SHA}"
+          oras manifest index create "$ref" "$amd64" "$arm64"
+          oras manifest fetch "$ref" > index.json
+          jq -e '[.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]' index.json
+          digest="$(oras manifest fetch --descriptor "$ref" | jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))')"
+          pinned="ghcr.io/di-framework/tenant-auth@${digest}"
+          printf 'Published %s\n' "$pinned"
           {
-            echo "### Tenant-auth image"
+            echo '### Tenant-auth image'
             echo
-            echo '```'
-            echo "${ref}"
-            echo '```'
+            printf '```\n%s\n```\n' "$pinned"
             echo
-            echo "Pin the controller and console Deployments to that digest. The ${GITHUB_SHA} tag is informational; only the digest is stable."
-          } >> "${GITHUB_STEP_SUMMARY}"
+            echo 'Pin the controller and console Deployments to this digest. Both linux/amd64 and linux/arm64 are included.'
+          } >> "$GITHUB_STEP_SUMMARY"

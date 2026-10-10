@@ -1,5 +1,27 @@
 # @di-framework/tenant-auth
 
+## Local Rust image tooling
+
+From the repository root, `cargo run --locked -p tenant-auth-image` builds the
+image into local storage. Set `SMOKE_CHECK=true` to check both bundled entry
+points. `PUSH=true` additionally publishes the image; `make publish` in this
+directory enables both publishing and the smoke check.
+
+The tool uses `oci-builder` from the `oci-lib` Git tag `v0.1.10`, declared in the root workspace.
+The library handles the macOS guest and entitlement. The consumer does not
+patch the guest, TLS, or MTU. Its signature policy accepts unsigned Bun base
+images and local storage images, with HTTPS verification enabled.
+
+Registry defaults: `DI_OCI_REGISTRY=ghcr.io`,
+`DI_OCI_REPOSITORY=di-framework/tenant-auth`, and `DI_OCI_TAG` defaults to Git
+HEAD. Set `DI_OCI_USERNAME`/`DI_OCI_PASSWORD`, `GHCR_USERNAME`/`GHCR_TOKEN`, or
+`GITHUB_ACTOR`/`GITHUB_TOKEN` for publication. Successful pushes write
+`dist/publish-report.json` with the immutable manifest digest.
+
+`cargo build` compiles the tool; image operations run only when the executable
+is invoked. CI builds and smoke-checks on native Linux amd64 and arm64 runners;
+the dispatch-only publish workflow combines their manifests into an OCI index.
+
 Per-tenant access for the platform without sharing cluster credentials. One **controller** and
 one **console** run per tenant, in the tenant's namespace. Users hold only identity-server tokens
 or tenant API keys; Kubernetes tokens never leave the controller.

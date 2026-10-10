@@ -1,5 +1,4 @@
-# Build the tenant-auth image without pushing and smoke-check that both entry points start
-# (a configuration error, not an import error). Catches base-image and lockfile drift before a publish.
+# Exercise the Rust/embedded Buildah path and both bundled entry points.
 name: Tenant-auth image build
 
 on:
@@ -7,51 +6,84 @@ on:
     paths:
       - 'platform/tenant-auth/**'
       - 'platform/tenant-cli/**'
+      - 'platform/oci-registry/**'
+      - 'platform/sqlite-component/scripts/**'
+      - 'platform/platform/src/tenancy/**'
+      - 'package.json'
       - 'bun.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - '.github/actions/setup-tenant-auth-builder/**'
       - '.github/workflows/tenant-auth-image-check.yml'
+      - '.github/workflows/tenant-auth-image.yml'
+      - '.github/workflows/oci-registry-component.yml'
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build and smoke-test tenant-auth image
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    name: Build and smoke-test tenant-auth (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Build (no push)
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: .
-          file: platform/tenant-auth/Dockerfile
-          push: false
-          load: true
-          tags: tenant-auth:ci
+          persist-credentials: false
 
-      - name: Smoke-check entry points
+      - name: Set up native image builder
+        uses: ./.github/actions/setup-tenant-auth-builder
+
+      - name: Check and compile the Rust builder
         run: |
-          set -uo pipefail
-          for entry in controller console; do
-            code=0
-            out="$(docker run --rm tenant-auth:ci bun "/app/${entry}.js" 2>&1)" || code=$?
-            echo "${entry}: exit ${code}"
-            echo "${out}"
-            if [[ ${code} -eq 0 ]] || ! grep -q "is required" <<<"${out}"; then
-              echo "::error::${entry} did not fail with a configuration error"
-              exit 1
-            fi
-            if grep -qiE "cannot find|error: import|module not found" <<<"${out}"; then
-              echo "::error::${entry} hit an import error"
-              exit 1
-            fi
-            if [[ "${entry}" == controller ]] && ! grep -q "TENANT_CONTROLLER_TENANT is required" <<<"${out}"; then
-              echo "::error::controller did not report the missing TENANT_CONTROLLER_TENANT"
-              exit 1
-            fi
-          done
+          set -euo pipefail
+          cargo fmt --all --check
+          cargo clippy --workspace --locked --all-targets -- -D warnings
+          cargo test --workspace --locked
+          cargo build -p tenant-auth-image --locked
+
+      - name: Build and smoke-check image (no push)
+        env:
+          PUSH: 'false'
+          SMOKE_CHECK: 'true'
+          BUILDAH_ISOLATION: chroot
+          DI_OCI_TAG: ci-${{ github.sha }}-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          sudo --preserve-env=PUSH,SMOKE_CHECK,BUILDAH_ISOLATION,DI_OCI_TAG \
+            ./target/debug/tenant-auth-image
+
+  component:
+    name: Build and validate OCI registry component
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust and native dependencies
+        uses: ./.github/actions/setup-tenant-auth-builder
+
+      - name: Install Wasm build tools
+        run: |
+          set -euo pipefail
+          rustup target add --toolchain 1.97.1 wasm32-wasip2
+          bash platform/sqlite-component/scripts/install-tools.sh
+          echo "$GITHUB_WORKSPACE/platform/sqlite-component/.tools/bin" >> "$GITHUB_PATH"
+
+      - name: Test and build the component (no push)
+        env:
+          PUSH: 'false'
+        run: make -C platform/oci-registry test build

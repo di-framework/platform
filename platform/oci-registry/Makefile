@@ -14,10 +14,13 @@ SHELL := /usr/bin/env bash
 # rustup's proxies first, so rust-toolchain.toml selects the pinned toolchain.
 export PATH := $(or $(CARGO_HOME),$(HOME)/.cargo)/bin:$(PATH)
 
-.PHONY: build debug test lint wit clean
+.PHONY: build debug publish-local test lint wit clean
 
 build:
-	scripts/build.sh
+	PUSH=false cargo run --locked --manifest-path build-support/Cargo.toml
+
+publish-local:
+	PUSH=true cargo run --locked --manifest-path build-support/Cargo.toml
 
 debug:
 	scripts/build.sh --debug

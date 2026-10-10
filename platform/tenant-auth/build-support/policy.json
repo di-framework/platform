@@ -1,0 +1,11 @@
+{
+  "default": [{ "type": "reject" }],
+  "transports": {
+    "docker": {
+      "docker.io/oven/bun": [{ "type": "insecureAcceptAnything" }]
+    },
+    "containers-storage": {
+      "": [{ "type": "insecureAcceptAnything" }]
+    }
+  }
+}
