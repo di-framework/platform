@@ -638,6 +638,20 @@ export class Controller {
             (await this.list<User>(VERSION, 'User', { [INSTALLATION]: this.cfg.installation })),
         ),
       );
+      // Gateway policies for hosts that are no longer routed, pruned before anything is applied
+      // so de-routing holds even when a later apply fails.
+      const namespace = names(tenant.metadata.name).runtimeNamespace;
+      for (const policy of ['tenant-console-gateway', 'tenant-controller-gateway']) {
+        if (desired.some((value) => value.metadata.name === policy)) continue;
+        const stale = await this.get<Resource>(
+          `${collection('networking.k8s.io/v1', 'NetworkPolicy', namespace)}/${policy}`,
+        );
+        if (
+          stale?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+          stale.metadata.labels[OWNER] === tenant.metadata.uid
+        )
+          await this.remove(stale);
+      }
       // Raise the quota right before the pair so its pods fit when they are created (#121).
       await this.ensure(runtimeQuota(tenant, this.cfg, true));
       let ready = true;
@@ -652,19 +666,6 @@ export class Controller {
             status?.observedGeneration === applied.metadata.generation &&
             (status?.readyReplicas ?? 0) === spec.replicas;
         }
-      }
-      // Gateway policies for hosts that are no longer routed.
-      const namespace = names(tenant.metadata.name).runtimeNamespace;
-      for (const policy of ['tenant-console-gateway', 'tenant-controller-gateway']) {
-        if (desired.some((value) => value.metadata.name === policy)) continue;
-        const stale = await this.get<Resource>(
-          `${collection('networking.k8s.io/v1', 'NetworkPolicy', namespace)}/${policy}`,
-        );
-        if (
-          stale?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
-          stale.metadata.labels[OWNER] === tenant.metadata.uid
-        )
-          await this.remove(stale);
       }
       const { problems } = tenantAuthRoutes(this.cfg.tenantAuth, this.cfg.routeUrlPattern);
       if (problems.length) return condition(false, 'RouteError', problems.join('; '));

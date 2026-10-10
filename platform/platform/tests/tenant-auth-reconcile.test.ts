@@ -1276,4 +1276,19 @@ describe('tenant-auth gateway routes (#58:routes)', () => {
     });
     expect(t.status?.conditions?.find((c) => c.type === 'Ready')?.status).toBe('True');
   });
+
+  it('prunes an unrouted gateway policy even when a later apply fails', async () => {
+    const { api, t } = prepare();
+    const path = `${collection('networking.k8s.io/v1', 'NetworkPolicy', 'di-runtime-alpha')}/tenant-controller-gateway`;
+    await new Controller(api, routedCfg).reconcileTenant(t, []);
+    expect(api.objects.get(path)).toBeDefined();
+    api.fail = (method, p) =>
+      method === 'PATCH' && p.includes('/deployments/') ? new ApiError(409, 'conflict') : undefined;
+    await new Controller(api, {
+      ...routedCfg,
+      tenantAuth: { ...routed, controllerPublicUrl: 'https://127.0.0.1:8788' },
+    }).reconcileTenant(t, []);
+    expect(api.objects.get(path)).toBeUndefined();
+    expect(t.status?.conditions?.find((c) => c.type === 'TenantAuthReady')?.status).toBe('False');
+  });
 });
