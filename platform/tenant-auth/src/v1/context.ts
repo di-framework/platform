@@ -12,6 +12,8 @@ export interface V1Context {
   principal: Principal;
   /** Origin of the tenant's OCI registry, when the platform configured one (platform#83). */
   registryUrl?: string;
+  /** Whether a registry is configured, even while it is not served (no `registryUrl`). */
+  registryConfigured?: boolean;
   /**
    * The registry workload's `wasi:http` host (platform#83). A deploy never claims it, since the
    * registry front sends registry users' credentials to whatever serves it.

@@ -48,6 +48,12 @@ export interface ControllerConfig {
    */
   registryUrl?: string;
   /**
+   * Whether the platform configured a registry for this tenant (`TENANT_CONTROLLER_REGISTRY_HOST`
+   * is set). With no `registryUrl` it is configured but not served (a host conflict or a
+   * suspended tenant), which `GET /v1/deploy/registry` reports differently from none.
+   */
+  registryConfigured: boolean;
+  /**
    * Plain-HTTP listener serving only `GET /v1/auth/whoami`, for the tenant registry component on
    * the tenant's hosts (platform#83). NetworkPolicy admits only the host pods to it. Unset: none.
    */
@@ -250,6 +256,7 @@ export function configFromEnv(env = process.env): ControllerConfig {
       env.TENANT_CONTROLLER_REGISTRY_FRONT_PORT,
       'TENANT_CONTROLLER_REGISTRY_FRONT_PORT',
     ),
+    registryConfigured: !!env.TENANT_CONTROLLER_REGISTRY_HOST,
     registryHost: env.TENANT_CONTROLLER_REGISTRY_HOST || 'registry',
     registryMaxBodyBytes: positiveInteger(
       env.TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES,
@@ -680,6 +687,7 @@ export class Controller {
         tenant: this.config.tenant,
         principal,
         registryUrl: this.config.registryUrl,
+        registryConfigured: this.config.registryConfigured,
         registryHost: this.config.registryHost,
         asUser: () => asUser(this.kube, this.userTokens, principal),
         asController: () => controllerSecretReader(this.kube),

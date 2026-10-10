@@ -1866,6 +1866,21 @@ describe('tenant registry (#83:reconcile)', () => {
           registry: { component: COMPONENT_REF, limits: { upstreamTimeoutMs: bad } },
         }),
       ).toThrow('tenantAuth.registry.limits.upstreamTimeoutMs must be a positive integer');
+    expect(() =>
+      assertTenantAuthConfig({
+        ...withRegistry,
+        registry: { component: COMPONENT_REF, limits: { maxConcurency: 4 } as never },
+      }),
+    ).toThrow(
+      'tenantAuth.registry.limits.maxConcurency is not a known limit (maxBodyBytes, upstreamTimeoutMs, maxConcurrent, uploadIdleTimeoutMs)',
+    );
+    for (const bad of ['4', 4, null, [4]])
+      expect(() =>
+        assertTenantAuthConfig({
+          ...withRegistry,
+          registry: { component: COMPONENT_REF, limits: bad as never },
+        }),
+      ).toThrow('tenantAuth.registry.limits must be an object');
   });
 
   describe('registry host conflicts and readiness (W4)', () => {
@@ -1899,21 +1914,46 @@ describe('tenant registry (#83:reconcile)', () => {
       }
     };
 
-    it('keeps the front closed until the registry is Ready', async () => {
+    const template = (api: MemoryApi) =>
+      JSON.stringify((api.objects.get(controllerPath) as unknown as Deployment).spec.template);
+
+    it('opens the front without waiting for registry readiness, which never restarts the controller', async () => {
       const { api, t } = prepare();
       const controller = new Controller(api, registryCfg);
       await controller.reconcileTenant(t, []);
-      expect(frontEnv(api)).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_FRONT_PORT');
-      expect(frontEnv(api)).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_URL');
+      expect(frontEnv(api).TENANT_CONTROLLER_REGISTRY_FRONT_PORT).toBe('8790');
+      expect(frontEnv(api)).toHaveProperty('TENANT_CONTROLLER_REGISTRY_URL');
+      expect(authCondition(t)).toMatchObject({ status: 'False', reason: 'Provisioning' });
+      const opened = template(api);
+      api.objects.get(wdPath)!.status = { conditions: ready };
+      await controller.reconcileTenant(t, []);
+      expect(authCondition(t)).toMatchObject({ status: 'True', reason: 'Reconciled' });
+      expect(template(api)).toBe(opened);
+      // The registry stops being Ready after the front opened: TenantAuthReady reports it, and the
+      // controller's env and pod template stay as they are (W6).
+      api.objects.get(wdPath)!.status = {};
+      await controller.reconcileTenant(t, []);
+      expect(authCondition(t)).toMatchObject({ status: 'False', reason: 'Provisioning' });
+      expect(template(api)).toBe(opened);
+      expect(frontEnv(api).TENANT_CONTROLLER_REGISTRY_FRONT_PORT).toBe('8790');
+    });
+
+    it('closes an open front when a claimant appears, and while the tenant is suspended', async () => {
+      const { api, t } = prepare();
+      const controller = new Controller(api, registryCfg);
+      await controller.reconcileTenant(t, []);
       api.objects.get(wdPath)!.status = { conditions: ready };
       await controller.reconcileTenant(t, []);
       expect(frontEnv(api).TENANT_CONTROLLER_REGISTRY_FRONT_PORT).toBe('8790');
-      expect(authCondition(t)).toMatchObject({ status: 'True', reason: 'Reconciled' });
-      // The registry stops being Ready: the front closes again.
-      api.objects.get(wdPath)!.status = {};
-      await controller.reconcileTenant(t, []);
+      api.seed(claimant('late', { host: 'registry' }));
+      await quiet(() => controller.reconcileTenant(t, []));
+      expect(authCondition(t)).toMatchObject({ reason: 'RegistryHostConflict' });
       expect(frontEnv(api)).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_FRONT_PORT');
-      expect(authCondition(t)).toMatchObject({ status: 'False', reason: 'Provisioning' });
+      expect(frontEnv(api)).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_URL');
+      api.objects.delete(claimantPath('late'));
+      await controller.reconcileTenant({ ...t, spec: { ...t.spec, suspended: true } }, []);
+      expect(frontEnv(api)).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_FRONT_PORT');
+      expect(frontEnv(api)).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_URL');
     });
 
     it('refuses to serve a host another workload claims, and recovers once it is removed', async () => {

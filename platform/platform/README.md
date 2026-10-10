@@ -596,9 +596,14 @@ tenantAuth:
     the routed `https://registry.{tenant}.localhost:<gateway port>` instead.
   - Front enablement: the controller is rendered with the registry front
     (`TENANT_CONTROLLER_REGISTRY_FRONT_PORT`) and `TENANT_CONTROLLER_REGISTRY_URL` only while
-    `di-tenant-registry` is `Ready` and there is no host conflict, so the front never forwards
-    credentials to a host that is not serving the registry. Enabling or closing it rolls the
-    controller pod; `TenantAuthReady` stays `Provisioning` until the front is open.
+    the tenant is not suspended and no other WorkloadDeployment claims the registry host.
+    Registry readiness is not part of the gate, so a registry rollout or blip never restarts the
+    controller: while `di-tenant-registry` is not `Ready` the front answers 502/504 and
+    `TenantAuthReady` reports `Provisioning`. Tenant users cannot create a claimant (admission);
+    one written by any other requester (an operator, a CD service account) is detected on the
+    next reconcile (polled every 3 s), which closes the front, so it can receive credentials for
+    at most that poll plus the controller's `Recreate` rollout. Opening or closing the front
+    rolls the controller pod.
   - Limits: the front is reachable without credentials (the component authenticates). A request
     without Basic credentials gets the registry's own challenge (`401`,
     `WWW-Authenticate: Basic realm="di-framework-tenant-registry"`) from the front, so

@@ -63,7 +63,9 @@ origin: scheme + host[:port], no path), an optional `repositoryPrefix`, `auth` (
 and a fixed `username` hint (`token`). The tenant controller reads the origin from
 `TENANT_CONTROLLER_REGISTRY_URL` (`{tenant}` is replaced by the tenant), which the platform sets
 when its `tenantAuth.registry` config is present; otherwise the endpoint answers 503
-`no registry is configured for this tenant`. The origin must be `https://`; plain `http://` is
+`no registry is configured for this tenant`. While a registry is configured but not served (a
+host conflict or a suspended tenant) it answers 503 `the tenant registry is not available; see
+the Tenant's TenantAuthReady condition`. The origin must be `https://`; plain `http://` is
 accepted only for loopback (`localhost`, `127.0.0.0/8`, `[::1]`) and in-cluster hosts (`*.svc`,
 `*.svc.cluster.local`).
 

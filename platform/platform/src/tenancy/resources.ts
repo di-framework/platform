@@ -155,9 +155,11 @@ export interface TenantAuthInputs {
   /** The shared OAuth client secret, base64 as read from the platform Secret; absent until it exists. */
   clientSecret?: string;
   /**
-   * Whether the registry front may forward to the registry (W4 of the #83 review): true only when
-   * `di-tenant-registry` is Ready and no other workload claims its host. Otherwise the controller
-   * is rendered without the front listener, so credentials are never sent to the tenant hosts.
+   * Whether the registry front may forward to the registry (W4/W6 of the #83 review): true only
+   * when the tenant is not suspended and no other workload claims the registry host. Registry
+   * readiness is deliberately not part of it, so it never changes the controller's pod template.
+   * Otherwise the controller is rendered without the front listener, so credentials are never
+   * sent to the tenant hosts.
    */
   registryServing?: boolean;
 }
@@ -177,10 +179,24 @@ export function assertTenantAuthConfig(value: TenantAuthConfig | undefined): voi
     );
   if (value.registry.publicUrl !== undefined && !URL.canParse(value.registry.publicUrl))
     throw new Error('tenantAuth.registry.publicUrl must be a URL');
-  for (const [key, limit] of Object.entries(value.registry.limits ?? {}))
+  const limits: unknown = value.registry.limits === undefined ? {} : value.registry.limits;
+  if (typeof limits !== 'object' || limits === null || Array.isArray(limits))
+    throw new Error('tenantAuth.registry.limits must be an object');
+  for (const [key, limit] of Object.entries(limits)) {
+    if (!REGISTRY_LIMIT_KEYS.includes(key))
+      throw new Error(
+        `tenantAuth.registry.limits.${key} is not a known limit (${REGISTRY_LIMIT_KEYS.join(', ')})`,
+      );
     if (!Number.isSafeInteger(limit) || (limit as number) < 1)
       throw new Error(`tenantAuth.registry.limits.${key} must be a positive integer`);
+  }
 }
+const REGISTRY_LIMIT_KEYS = [
+  'maxBodyBytes',
+  'upstreamTimeoutMs',
+  'maxConcurrent',
+  'uploadIdleTimeoutMs',
+];
 /** Route-host labels the platform gateway forwards to each tenant's console and controller. */
 export interface TenantAuthRoutes {
   /** `console` in `http://console.{tenant}.localhost:<port>`: plain HTTP to `tenant-console:8787`. */

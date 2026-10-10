@@ -709,8 +709,6 @@ export class Controller {
           `WorkloadDeployment ${registry.conflict} claims the tenant registry host ` +
             `${registryHttpHost(this.cfg.tenantAuth)}; the registry is not served until it is removed`,
         );
-      // The front opens only on the poll after the registry is Ready.
-      if (this.cfg.tenantAuth.registry && !suspended) ready &&= registry.serving;
       const what = this.cfg.tenantAuth.registry
         ? 'tenant controller, console and registry'
         : 'tenant controller and console';
@@ -737,9 +735,11 @@ export class Controller {
    * Whether the registry front may forward (W4 of the #83 review). Admission checks only writes,
    * so a workload that claimed the registry host before the reservation (or before a
    * `registry.publicUrl` change) keeps its route, and wash picks randomly among claimants. The
-   * front is therefore enabled only while the controller-owned `di-tenant-registry` is Ready and
-   * no other workload claims its host through `wasi:http` `config.host` or `host-aliases`.
-   * `conflict` names the first claimant.
+   * front is therefore enabled only while the tenant is not suspended and no other workload claims
+   * the registry host through `wasi:http` `config.host` or `host-aliases`. The registry's own
+   * readiness is not part of the gate (W6): an unready registry has no route, so nothing else sees
+   * the credentials, and gating on it would restart the controller on every registry blip. It is
+   * reported on `TenantAuthReady` instead. `conflict` names the first claimant.
    */
   private async registryState(tenant: Tenant): Promise<{ serving: boolean; conflict?: string }> {
     if (!this.cfg.tenantAuth?.registry) return { serving: false };
@@ -780,11 +780,8 @@ export class Controller {
         return hosts.some((value) => claimsRegistryHost(value.trim(), label));
       });
     const conflict = workloads.find((w) => !owned(w) && claims(w))?.metadata.name;
-    const ready = workloads.some(
-      (w) =>
-        owned(w) && !!w.status?.conditions?.some((c) => c.type === 'Ready' && c.status === 'True'),
-    );
-    return { serving: ready && !conflict, conflict };
+    const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
+    return { serving: !suspended && !conflict, conflict };
   }
   /** Whether the tenant-auth Deployments of `tenant` exist, i.e. the quota may stay raised. */
   private async tenantAuthDeployed(tenant: Tenant): Promise<boolean> {

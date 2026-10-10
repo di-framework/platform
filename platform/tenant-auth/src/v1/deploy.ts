@@ -992,6 +992,12 @@ export const deploy: V1Module = {
   // The credential is the caller's own identity token or API key, which the registry checks
   // against this controller's whoami (platform#83); nothing is minted and no Secret is read.
   registry: async (_command, _call, context) => {
+    if (!context.registryUrl && context.registryConfigured)
+      return problem(
+        503,
+        'Service Unavailable',
+        "the tenant registry is not available; see the Tenant's TenantAuthReady condition",
+      );
     if (!context.registryUrl)
       return problem(503, 'Service Unavailable', 'no registry is configured for this tenant');
     return Response.json({ url: context.registryUrl, auth: 'basic-identity', username: 'token' });
