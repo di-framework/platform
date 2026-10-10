@@ -171,7 +171,13 @@ function recordLength(buffer: Buffer): number {
 
 /** Pipe a TLS connection for `<controller>.<tenant>.localhost` to that tenant's controller. */
 function passThrough(socket: Socket, hello: Buffer, options: GatewayOptions): void {
-  const route = routeRequest(serverName(hello));
+  const name = serverName(hello);
+  // Fail closed, logged once per connection; never log the hello or the name it carries.
+  if (name === undefined)
+    console.error(
+      `${socket.remoteAddress}: closing a TLS connection whose ClientHello has no readable server name (malformed, or split across records)`,
+    );
+  const route = routeRequest(name);
   if (route.kind !== 'tenant' || route.host !== options.tenantAuthRoutes?.controller) {
     socket.destroy();
     return;
@@ -199,16 +205,17 @@ function passThrough(socket: Socket, hello: Buffer, options: GatewayOptions): vo
 /**
  * The gateway's listener when the controller is routed: it peeks at each connection, passes a
  * TLS handshake (first byte 0x16) through by SNI, and hands anything else to the HTTP `server`.
- * A connection must be classified within `classifyTimeoutMs` (slowloris), and at most one
- * maximum-size TLS record (plus the read that completes it) is buffered; a record header that
- * claims more is closed at once. The timeout is cleared before the handoff, so the HTTP server's
- * own timeouts, or the passthrough idle timeout, take over.
+ * A connection must be classified within `classifyTimeoutMs` of being accepted, a wall-clock
+ * deadline that trickled bytes do not extend (slowloris), and at most one maximum-size TLS record
+ * (plus the read that completes it) is buffered; a record header that claims more is closed at
+ * once. The deadline is cleared before the handoff, so the HTTP server's own timeouts, or the
+ * passthrough idle timeout, take over.
  */
 export function createEdge(server: Server, options: GatewayOptions): NetServer {
   return createNetServer((socket) => {
+    const deadline = setTimeout(() => socket.destroy(), options.classifyTimeoutMs ?? 10_000);
     socket.on('error', () => socket.destroy());
-    const stalled = () => socket.destroy();
-    socket.setTimeout(options.classifyTimeoutMs ?? 10_000, stalled);
+    socket.once('close', () => clearTimeout(deadline));
     let buffer = Buffer.alloc(0);
     const onData = (chunk: Buffer) => {
       buffer = Buffer.concat([buffer, chunk]);
@@ -220,8 +227,7 @@ export function createEdge(server: Server, options: GatewayOptions): NetServer {
       if (buffer.length < needed) return;
       socket.off('data', onData);
       socket.pause();
-      socket.setTimeout(0);
-      socket.off('timeout', stalled);
+      clearTimeout(deadline);
       if (needed) {
         passThrough(socket, buffer, options);
         return;

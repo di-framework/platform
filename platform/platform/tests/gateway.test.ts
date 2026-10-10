@@ -875,6 +875,41 @@ describe('edge timeouts and HTTP handoff (#58:routes)', () => {
     expect(await openFor([])).toBeLessThan(1_000);
   });
 
+  it('closes a trickling connection at the classification deadline', async () => {
+    // A 16 KiB record header, then one byte every half-timeout: an idle timeout never fires.
+    const open = await new Promise<number>((resolve) => {
+      const started = Date.now();
+      let timer: ReturnType<typeof setInterval> | undefined;
+      const socket = connect(port, '127.0.0.1', () => {
+        socket.write(Buffer.from([0x16, 3, 1, 0x40, 0x00]));
+        timer = setInterval(() => socket.write(Buffer.from([0])), 50);
+      });
+      socket.on('error', () => {});
+      socket.on('close', () => {
+        clearInterval(timer);
+        resolve(Date.now() - started);
+      });
+    });
+    expect(open).toBeGreaterThanOrEqual(90);
+    expect(open).toBeLessThan(400);
+  });
+
+  it('logs a TLS connection whose ClientHello it cannot parse, without its bytes', async () => {
+    const logged: string[] = [];
+    const error = spyOn(console, 'error').mockImplementation((message: string) => {
+      logged.push(message);
+    });
+    try {
+      // A complete record whose handshake type is not ClientHello.
+      expect(await openFor([0x16, 3, 1, 0, 4, 2, 0, 0, 0])).toBeLessThan(80);
+    } finally {
+      error.mockRestore();
+    }
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toContain('no readable server name');
+    expect(logged[0]).toContain('127.0.0.1');
+  });
+
   it('closes a record header claiming more than 16 KiB without waiting for it', async () => {
     expect(await openFor([0x16, 3, 1, 0x40, 0x01])).toBeLessThan(80);
   });

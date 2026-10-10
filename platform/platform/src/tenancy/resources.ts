@@ -179,12 +179,19 @@ export function tenantAuthRoutes(
   }
   return { routes, urls, problems };
 }
+/**
+ * Replace the `{tenant}` placeholder in a tenant-auth public URL, in any case: routing matches it
+ * case-insensitively, so the published route, the certificate SANs and the console's URLs agree.
+ */
+function expandTenant(url: string, tenant: string): string {
+  return url.replace(/\{tenant\}/gi, tenant);
+}
 /** `consoleUrl` / `controllerUrl` for `di-platform-routes`, only for hosts the gateway routes. */
 function routedTenantAuthUrls(tenant: string, cfg: ControllerConfig): Record<string, string> {
   const { urls } = tenantAuthRoutes(cfg.tenantAuth, cfg.routeUrlPattern);
   const result: Record<string, string> = {};
-  if (urls.console) result.consoleUrl = urls.console.replaceAll('{tenant}', tenant);
-  if (urls.controller) result.controllerUrl = urls.controller.replaceAll('{tenant}', tenant);
+  if (urls.console) result.consoleUrl = expandTenant(urls.console, tenant);
+  if (urls.controller) result.controllerUrl = expandTenant(urls.controller, tenant);
   return result;
 }
 /** Container limits of one tenant-auth pair, counted on top of the tenant's own quota. */
@@ -955,7 +962,7 @@ function loopbackHost(host: string): boolean {
 }
 /** The controller URL users and CLIs see; `{tenant}` is replaced. */
 function tenantControllerPublicUrl(tenant: string, auth: TenantAuthConfig | undefined): string {
-  return (auth?.controllerPublicUrl ?? 'https://127.0.0.1:8788').replaceAll('{tenant}', tenant);
+  return expandTenant(auth?.controllerPublicUrl ?? 'https://127.0.0.1:8788', tenant);
 }
 /**
  * Names the controller's serving certificate covers: in-cluster, through a port-forward and the
@@ -1153,7 +1160,7 @@ function tenantAuthResources(
       spec: { selector: { app }, ports: [{ port, targetPort: port, name: 'http' }] },
     });
   const publicUrl = (pattern: string | undefined, fallback: string) =>
-    (pattern ?? fallback).replaceAll('{tenant}', name);
+    expandTenant(pattern ?? fallback, name);
   const [upstreamHost = '', upstreamPort = '80'] = (auth.issuerUpstream ?? '').split(':');
   const egress: unknown[] = [];
   if (inputs.apiServer.addresses.length)
