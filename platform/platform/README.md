@@ -63,22 +63,6 @@ bounds, and `pulumi up` rejects an out-of-range `tenants[].runtime.coreInstances
 it reaches the cluster. Changing the value changes the host pod template, so it rolls the
 tenant host.
 
-#### Upgrading to a version that adds a Tenant spec field
-
-`pulumi up` cannot add a Tenant spec field to the CRD and set it on an existing Tenant in
-one update. The preview dry-runs the Tenant against the live CRD schema, before the CRD
-is updated, and fails with:
-
-```text
-failed to create typed patch object (/identity; platform.di-framework.dev/v1alpha1, Kind=Tenant): .spec.runtime.coreInstances: field not declared in schema
-```
-
-The provider has no per-resource way to skip that dry-run that is safe (no force-apply,
-no field-manager change), so upgrade in two steps: first run `pulumi up` with the new
-package and the field unset (this updates the CRD schema, controller and tenant-auth
-image), then set the field (for example `runtime.coreInstances`) and run `pulumi up`
-again.
-
 Do not `kubectl set env` the hostgroup Deployment. An Update like that takes ownership of
 the env value away from `di-platform-controller`, and every later server-side apply
 of that Deployment fails with 409, which blocks the whole apply (not only the env field;
@@ -99,6 +83,10 @@ OWNERS='.metadata.managedFields[] | select([.fieldsV1 | .. | objects | select(ha
    unset (see "Upgrading to a version that adds a Tenant spec field"), then set identity's
    `coreInstances: 300` in the `di-framework-kube:tenants` config
    (`tenants: [{ name: identity, runtime: { coreInstances: 300 } }]`) and run `pulumi up`.
+   On a cluster that has the `kubectl set env` hand edit, the first `pulumi up` (with
+   `coreInstances` unset) makes the controller declare `"100"` against the live `300`. That
+   still 409s, so the Tenant stays not Ready and nothing rolls back. This is expected until
+   the second `pulumi up` sets 300.
 2. Wait until the Tenant is `Ready=True` and `di-platform-controller` owns `f:value` on the
    `WASH_CORE_INSTANCES` env entry. Do not continue until both hold:
 
@@ -130,6 +118,22 @@ OWNERS='.metadata.managedFields[] | select([.fieldsV1 | .. | objects | select(ha
 The order matters. If step 3 runs before the controller owns the value (step 2), removing
 `kubectl-set` leaves `WASH_CORE_INSTANCES` unowned, and the next apply sets `"100"`,
 rolling the host back from 300.
+
+#### Upgrading to a version that adds a Tenant spec field
+
+`pulumi up` cannot add a Tenant spec field to the CRD and set it on an existing Tenant in
+one update. The preview dry-runs the Tenant against the live CRD schema, before the CRD
+is updated, and fails with:
+
+```text
+failed to create typed patch object (/identity; platform.di-framework.dev/v1alpha1, Kind=Tenant): .spec.runtime.coreInstances: field not declared in schema
+```
+
+The provider cannot skip that dry-run for one resource without force-applying or changing
+the field manager, so upgrade in two steps. This order applies to any new Tenant field:
+first run `pulumi up` with the new package and the field unset (this updates the CRD
+schema, controller and tenant-auth image), then set the field (for example
+`runtime.coreInstances`) and run `pulumi up` again.
 
 ## Existing-cluster configuration
 
