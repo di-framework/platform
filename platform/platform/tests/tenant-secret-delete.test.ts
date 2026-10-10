@@ -1,9 +1,16 @@
 import { describe, expect, it } from 'bun:test';
 import { evaluate } from '@marcbachmann/cel-js';
 import { tenantSecretDeleteAllowed } from '../src/tenancy/admission';
-import { controller, developer, loadPolicy, tenantController } from './support/cel-policy';
+import {
+  controller,
+  developer,
+  expectSecretPolicyMatch,
+  loadPolicy,
+  tenantController,
+} from './support/cel-policy';
 
-const { spec, binding } = loadPolicy('tenant-secret-delete');
+const policy = loadPolicy('tenant-secret-delete');
+const { spec } = policy;
 
 interface Case {
   username: string;
@@ -37,11 +44,7 @@ const both = (c: Case) => {
 
 describe('tenant-secret-delete admission (#112)', () => {
   it('matches Secret DELETEs in tenant namespaces', () => {
-    expect(spec.matchConstraints.resourceRules).toEqual([
-      expect.objectContaining({ operations: ['DELETE'], resources: ['secrets'] }),
-    ]);
-    expect(JSON.stringify(binding?.spec)).toContain('"operator":"Exists"');
-    expect(binding?.spec).toMatchObject({ validationActions: ['Deny'] });
+    expectSecretPolicyMatch(policy, 'DELETE');
   });
 
   it('allows a plain delete by a developer', () => {

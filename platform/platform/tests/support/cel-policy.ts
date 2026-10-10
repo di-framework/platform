@@ -1,3 +1,4 @@
+import { expect } from 'bun:test';
 import { admissionResources } from '../../src/tenancy/admission';
 
 export const developer = 'system:serviceaccount:wasmcloud:di-user-dev';
@@ -20,4 +21,16 @@ export const loadPolicy = (suffix: string) => {
     (r) => r.kind === 'ValidatingAdmissionPolicyBinding' && r.metadata.name === name,
   );
   return { spec: policy?.spec as unknown as PolicySpec, binding };
+};
+
+/** Asserts the policy matches `operation` on Secrets and its binding denies in tenant namespaces. */
+export const expectSecretPolicyMatch = (
+  { spec, binding }: ReturnType<typeof loadPolicy>,
+  operation: string,
+) => {
+  expect(spec.matchConstraints.resourceRules).toEqual([
+    expect.objectContaining({ operations: [operation], resources: ['secrets'] }),
+  ]);
+  expect(JSON.stringify(binding?.spec)).toContain('"operator":"Exists"');
+  expect(binding?.spec).toMatchObject({ validationActions: ['Deny'] });
 };

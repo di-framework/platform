@@ -5,9 +5,16 @@ import {
   SECRET_UPDATE_MANAGED_MESSAGE,
   tenantSecretUpdateDenial,
 } from '../src/tenancy/admission';
-import { controller, developer, loadPolicy, tenantController } from './support/cel-policy';
+import {
+  controller,
+  developer,
+  expectSecretPolicyMatch,
+  loadPolicy,
+  tenantController,
+} from './support/cel-policy';
 
-const { spec, binding } = loadPolicy('tenant-secret-update');
+const policy = loadPolicy('tenant-secret-update');
+const { spec } = policy;
 
 interface Case {
   username: string;
@@ -41,11 +48,7 @@ const both = (c: Case) => {
 
 describe('tenant-secret-update admission (#112)', () => {
   it('matches Secret UPDATEs in tenant namespaces', () => {
-    expect(spec.matchConstraints.resourceRules).toEqual([
-      expect.objectContaining({ operations: ['UPDATE'], resources: ['secrets'] }),
-    ]);
-    expect(JSON.stringify(binding?.spec)).toContain('"operator":"Exists"');
-    expect(binding?.spec).toMatchObject({ validationActions: ['Deny'] });
+    expectSecretPolicyMatch(policy, 'UPDATE');
   });
 
   it('denies a developer update of a platform-managed Secret', () => {
