@@ -4,6 +4,10 @@
  *
  * `Host: <route-host>.<tenant>.localhost[:port]` reaches only that tenant's `di-http` Service,
  * with `Host: <route-host>`. Every other Host reaches the default host group unchanged.
+ *
+ * With tenant-auth routes configured (#58), `<console>.<tenant>.localhost` reaches that tenant's
+ * `tenant-console` over HTTP, and a TLS connection whose SNI is `<controller>.<tenant>.localhost`
+ * is passed through, unterminated, to `tenant-controller`, which serves its own certificate.
  */
 import {
   Agent,
@@ -15,10 +19,17 @@ import {
   type Server,
   type ServerResponse,
 } from 'node:http';
+import {
+  connect,
+  createServer as createNetServer,
+  type Server as NetServer,
+  type Socket,
+} from 'node:net';
 import type { Duplex } from 'node:stream';
 
 export type Route =
   | { kind: 'tenant'; tenant: string; host: string }
+  | { kind: 'console'; tenant: string }
   | { kind: 'default' }
   | { kind: 'invalid'; reason: string };
 
@@ -33,6 +44,12 @@ export interface GatewayOptions {
   tenantUpstream?: (tenant: string) => Upstream;
   /** Idle time allowed on an upstream connection before the response completes. */
   upstreamTimeoutMs?: number;
+  /** Route-host labels for each tenant's console and controller; absent, neither is routed. */
+  tenantAuthRoutes?: { console?: string; controller?: string };
+  /** Where a console route is sent; only overridden by tests. */
+  consoleUpstream?: (tenant: string) => Upstream;
+  /** Where a controller TLS connection is sent; only overridden by tests. */
+  controllerUpstream?: (tenant: string) => Upstream;
 }
 
 /** Same rule as tenant names in the platform CRDs (`validName`). */
@@ -76,6 +93,89 @@ export function routeRequest(hostHeader: string | undefined): Route {
 
 export function tenantUpstream(tenant: string): Upstream {
   return { hostname: `di-http.di-runtime-${tenant}.svc.cluster.local`, port: 80 };
+}
+
+export function consoleUpstream(tenant: string): Upstream {
+  return { hostname: `tenant-console.di-runtime-${tenant}.svc.cluster.local`, port: 8787 };
+}
+
+export function controllerUpstream(tenant: string): Upstream {
+  return { hostname: `tenant-controller.di-runtime-${tenant}.svc.cluster.local`, port: 8788 };
+}
+
+/** The SNI host name of a complete TLS ClientHello record, if it carries one. */
+export function serverName(record: Buffer): string | undefined {
+  try {
+    // record header (5), handshake header (4), version (2), random (32)
+    let at = 5 + 4 + 2 + 32;
+    at += 1 + record.readUInt8(at); // session id
+    at += 2 + record.readUInt16BE(at); // cipher suites
+    at += 1 + record.readUInt8(at); // compression methods
+    const end = at + 2 + record.readUInt16BE(at);
+    at += 2;
+    while (at + 4 <= end) {
+      const type = record.readUInt16BE(at);
+      const length = record.readUInt16BE(at + 2);
+      at += 4;
+      // server_name: list length (2), name type (1, 0 = host_name), name length (2), name
+      if (type === 0 && record.readUInt8(at + 2) === 0)
+        return record.toString('ascii', at + 5, at + 5 + record.readUInt16BE(at + 3));
+      at += length;
+    }
+  } catch {
+    /* truncated or malformed */
+  }
+  return undefined;
+}
+
+/** Bytes needed before the first TLS record is complete (capped at one maximum-size record). */
+function recordLength(buffer: Buffer): number {
+  return buffer.length < 5 ? 5 : Math.min(5 + buffer.readUInt16BE(3), 5 + 16_384);
+}
+
+/** Pipe a TLS connection for `<controller>.<tenant>.localhost` to that tenant's controller. */
+function passThrough(socket: Socket, hello: Buffer, options: GatewayOptions): void {
+  const route = routeRequest(serverName(hello));
+  if (route.kind !== 'tenant' || route.host !== options.tenantAuthRoutes?.controller) {
+    socket.destroy();
+    return;
+  }
+  const target = (options.controllerUpstream ?? controllerUpstream)(route.tenant);
+  const upstream = connect(target.port, target.hostname);
+  upstream.on('error', (error) => {
+    console.error(`${target.hostname}: ${error.message || error.name}`);
+    socket.destroy();
+  });
+  socket.on('close', () => upstream.destroy());
+  upstream.on('close', () => socket.destroy());
+  upstream.write(hello);
+  socket.pipe(upstream).pipe(socket);
+  socket.resume();
+}
+
+/**
+ * The gateway's listener when the controller is routed: it peeks at each connection, passes a
+ * TLS handshake (first byte 0x16) through by SNI, and hands anything else to the HTTP `server`.
+ */
+export function createEdge(server: Server, options: GatewayOptions): NetServer {
+  return createNetServer((socket) => {
+    socket.on('error', () => socket.destroy());
+    let buffer = Buffer.alloc(0);
+    const onData = (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (buffer[0] === 0x16 && buffer.length < recordLength(buffer)) return;
+      socket.off('data', onData);
+      socket.pause();
+      if (buffer[0] === 0x16) {
+        passThrough(socket, buffer, options);
+        return;
+      }
+      socket.unshift(buffer);
+      server.emit('connection', socket);
+      socket.resume();
+    };
+    socket.on('data', onData);
+  });
 }
 
 /** Drop hop-by-hop headers, including any named by `Connection`. */
@@ -135,6 +235,14 @@ function target(
   if (!req.url?.startsWith('/')) return { error: 'malformed request target' };
   const route = routeRequest(req.headers.host);
   if (route.kind === 'invalid') return { error: route.reason };
+  if (route.kind === 'tenant' && options.tenantAuthRoutes?.controller === route.host)
+    return { error: 'the controller host is served over TLS only' };
+  if (route.kind === 'tenant' && options.tenantAuthRoutes?.console === route.host)
+    // The console builds its links from its public URL, so it keeps the original Host.
+    return {
+      route: { kind: 'console', tenant: route.tenant },
+      upstream: (options.consoleUpstream ?? consoleUpstream)(route.tenant),
+    };
   const upstream =
     route.kind === 'tenant'
       ? (options.tenantUpstream ?? tenantUpstream)(route.tenant)
@@ -250,6 +358,7 @@ export interface GatewayConfig {
   port?: number;
   defaultUpstream: string;
   upstreamTimeoutMs?: number;
+  tenantAuthRoutes?: { console?: string; controller?: string };
 }
 
 export function main(
@@ -258,12 +367,19 @@ export function main(
 ): Server {
   const cfg = JSON.parse(env.GATEWAY_CONFIG ?? '{}') as Partial<GatewayConfig>;
   if (!cfg.defaultUpstream) throw new Error('Missing GATEWAY_CONFIG');
-  const server = createGateway({
+  const options: GatewayOptions = {
     defaultUpstream: { hostname: cfg.defaultUpstream, port: 80 },
     upstreamTimeoutMs: cfg.upstreamTimeoutMs,
+    tenantAuthRoutes: cfg.tenantAuthRoutes,
+  };
+  const server = createGateway(options);
+  // TLS passthrough needs the raw connection, so a routed controller puts the edge in front.
+  const listener = cfg.tenantAuthRoutes?.controller ? createEdge(server, options) : server;
+  listener.listen(cfg.port ?? 8080);
+  signals.once('SIGTERM', () => {
+    listener.close();
+    if (listener !== server) server.close();
   });
-  server.listen(cfg.port ?? 8080);
-  signals.once('SIGTERM', () => server.close());
   return server;
 }
 

@@ -123,6 +123,60 @@ export function assertTenantAuthConfig(value: TenantAuthConfig | undefined): voi
   if (!value.oauthClient?.id || !value.oauthClient.secretName)
     throw new Error('tenantAuth.oauthClient needs id and secretName');
 }
+/** Route-host labels the platform gateway forwards to each tenant's console and controller. */
+export interface TenantAuthRoutes {
+  /** `console` in `http://console.{tenant}.localhost:<port>`: plain HTTP to `tenant-console:8787`. */
+  console?: string;
+  /** `controller` in `https://controller.{tenant}.localhost:<port>`: TLS passthrough to `tenant-controller:8788`. */
+  controller?: string;
+}
+const ROUTE_LABEL = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+/**
+ * Which tenant-auth public URLs the gateway routes, from config alone so the gateway and the
+ * controller agree. A URL whose host is `<label>.{tenant}.localhost` asks for a route; it gets one
+ * when the gateway is published (`routeUrlPattern`) on the same port and the scheme fits (console
+ * `http`, controller `https`). Any other URL (the `127.0.0.1` defaults), or any URL while no
+ * gateway is published, is left unrouted; a gateway-shaped URL the published gateway cannot route
+ * is returned as a problem for `TenantAuthReady`.
+ */
+export function tenantAuthRoutes(
+  auth: TenantAuthConfig | undefined,
+  routeUrlPattern: string | undefined,
+): { routes: TenantAuthRoutes; problems: string[] } {
+  const routes: TenantAuthRoutes = {};
+  const problems: string[] = [];
+  const gatewayPort = /:(\d+)$/.exec(routeUrlPattern ?? '')?.[1] ?? '';
+  const wanted = [
+    ['console', 'consolePublicUrl', 'http'],
+    ['controller', 'controllerPublicUrl', 'https'],
+  ] as const;
+  for (const [key, field, scheme] of wanted) {
+    const match = /^([a-z]+):\/\/([^/:]+)\.\{tenant\}\.localhost(?::(\d+))?\/?$/.exec(
+      auth?.[field] ?? '',
+    );
+    // No published gateway: nothing to route through (a port-forward or hosts entry serves it).
+    if (!match || !routeUrlPattern) continue;
+    const [, protocol, label, port = ''] = match as unknown as [string, string, string, string?];
+    if (protocol !== scheme) problems.push(`tenantAuth.${field} must use ${scheme}://`);
+    else if (!ROUTE_LABEL.test(label)) problems.push(`tenantAuth.${field} host label is invalid`);
+    else if (port !== gatewayPort)
+      problems.push(`tenantAuth.${field} must use the gateway port ${gatewayPort || '(default)'}`);
+    else if (routes.console === label)
+      problems.push(`tenantAuth.${field} must not share the console host`);
+    else routes[key] = label;
+  }
+  return { routes, problems };
+}
+/** `consoleUrl` / `controllerUrl` for `di-platform-routes`, only for hosts the gateway routes. */
+function routedTenantAuthUrls(tenant: string, cfg: ControllerConfig): Record<string, string> {
+  const { routes } = tenantAuthRoutes(cfg.tenantAuth, cfg.routeUrlPattern);
+  const urls: Record<string, string> = {};
+  if (routes.console)
+    urls.consoleUrl = cfg.tenantAuth!.consolePublicUrl!.replaceAll('{tenant}', tenant);
+  if (routes.controller)
+    urls.controllerUrl = cfg.tenantAuth!.controllerPublicUrl!.replaceAll('{tenant}', tenant);
+  return urls;
+}
 /** Container limits of one tenant-auth pair, counted on top of the tenant's own quota. */
 export const TENANT_AUTH_LIMITS = { cpu: '500m', memory: '448Mi' };
 /** Each suffix in thousandths of the base unit, so sums stay integers. */
@@ -583,7 +637,10 @@ function tenantResources(
   if (cfg.routeUrlPattern)
     result.push(
       make('v1', 'ConfigMap', ROUTES_CONFIG_NAME, n.namespace, {
-        data: { urlTemplate: cfg.routeUrlPattern.replaceAll('{tenant}', tenant.metadata.name) },
+        data: {
+          urlTemplate: cfg.routeUrlPattern.replaceAll('{tenant}', tenant.metadata.name),
+          ...routedTenantAuthUrls(tenant.metadata.name, cfg),
+        },
       }),
     );
   // Backend pods accept ingress from the tenant hostgroup and from backup-agent Jobs in
@@ -1226,6 +1283,37 @@ function tenantAuthResources(
         egress,
       },
     }),
+  );
+  // The platform gateway reaches the routed ports only: the console over HTTP, the controller
+  // as TLS passthrough (it terminates with its own certificate).
+  const { routes } = tenantAuthRoutes(auth, cfg.routeUrlPattern);
+  const routed = [
+    ...(routes.console ? [['tenant-console', 8787] as const] : []),
+    ...(routes.controller ? [['tenant-controller', 8788] as const] : []),
+  ];
+  for (const [app, port] of routed)
+    result.push(
+      make('networking.k8s.io/v1', 'NetworkPolicy', `${app}-gateway`, namespace, {
+        spec: {
+          podSelector: { matchLabels: { app } },
+          policyTypes: ['Ingress'],
+          ingress: [
+            {
+              from: [
+                {
+                  namespaceSelector: {
+                    matchLabels: { 'kubernetes.io/metadata.name': cfg.namespace },
+                  },
+                  podSelector: { matchLabels: GATEWAY_POD_LABELS },
+                },
+              ],
+              ports: [{ protocol: 'TCP', port }],
+            },
+          ],
+        },
+      }),
+    );
+  result.push(
     make('v1', 'ConfigMap', 'tenant-controller-ca', namespace, {
       data: { 'ca.crt': inputs.tls.cert },
     }),

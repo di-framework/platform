@@ -7,16 +7,32 @@ import {
   request,
   type Server,
 } from 'node:http';
-import { connect, type Socket } from 'node:net';
 import {
+  connect,
+  createServer as createNetServer,
+  type Server as NetServer,
+  type Socket,
+} from 'node:net';
+import {
+  createServer as createTlsServer,
+  type Server as TlsServer,
+  connect as tlsConnect,
+} from 'node:tls';
+import {
+  consoleUpstream,
+  controllerUpstream,
+  createEdge,
   createGateway,
   endToEndHeaders,
+  type GatewayOptions,
   main,
   routeRequest,
+  serverName,
   tenantUpstream,
   upstreamHeaders,
 } from '../src/gateway/gateway';
 import { validName } from '../src/tenancy/resources';
+import { selfSignedCertificate } from '../src/tenancy/tls';
 
 describe('routeRequest', () => {
   it('routes <route-host>.<tenant>.localhost to the tenant with the route host', () => {
@@ -525,5 +541,191 @@ describe('gateway process', () => {
     signals.emit('SIGTERM');
     await closed;
     expect(server.listening).toBe(false);
+  });
+});
+
+describe('tenant-auth routes (#58:routes)', () => {
+  const pem = selfSignedCertificate('tenant-controller', ['controller.alpha.localhost'], [], 30);
+  let upstream: Server;
+  let controller: TlsServer;
+  let gateway: Server;
+  let edge: NetServer;
+  let port: number;
+  let upstreamPort: number;
+  let controllerPort: number;
+  const seen: IncomingHttpHeaders[] = [];
+  let log: ReturnType<typeof spyOn>;
+
+  beforeEach(async () => {
+    seen.length = 0;
+    log = spyOn(console, 'error').mockImplementation(() => {});
+    upstream = createServer((req, res) => {
+      seen.push(req.headers);
+      req.resume();
+      res.end(`upstream ${req.headers.host}`);
+    });
+    upstreamPort = await listen(upstream);
+    controller = createTlsServer({ cert: pem.cert, key: pem.key }, (socket) =>
+      socket.end('controller says hi'),
+    );
+    await new Promise<void>((resolve) => controller.listen(0, '127.0.0.1', resolve));
+    controllerPort = (controller.address() as { port: number }).port;
+    const options: GatewayOptions = {
+      defaultUpstream: { hostname: '127.0.0.1', port: upstreamPort },
+      tenantUpstream: () => ({ hostname: '127.0.0.1', port: upstreamPort }),
+      tenantAuthRoutes: { console: 'console', controller: 'controller' },
+      consoleUpstream: (tenant) => {
+        expect(tenant).toBe('alpha');
+        return { hostname: '127.0.0.1', port: upstreamPort };
+      },
+      controllerUpstream: (tenant) => {
+        expect(tenant).toBe('alpha');
+        return { hostname: '127.0.0.1', port: controllerPort };
+      },
+    };
+    gateway = createGateway(options);
+    edge = createEdge(gateway, options);
+    port = await listen(edge as Server);
+  });
+
+  afterEach(async () => {
+    log.mockRestore();
+    gateway.closeAllConnections();
+    gateway.close();
+    await new Promise((resolve) => edge.close(resolve));
+    upstream.closeAllConnections();
+    await new Promise((resolve) => upstream.close(resolve));
+    controller.close();
+  });
+
+  /** TLS through the gateway; resolves with what the far end sent, or `closed`. */
+  const tlsThrough = (servername?: string, target = port) =>
+    new Promise<string>((resolve) => {
+      const socket = tlsConnect({ host: '127.0.0.1', port: target, servername, ca: pem.cert });
+      let data = '';
+      socket.setEncoding('utf8');
+      socket.on('data', (chunk) => {
+        data += chunk;
+      });
+      socket.on('error', () => resolve('closed'));
+      socket.on('close', () => resolve(data || 'closed'));
+    });
+
+  it('names the in-cluster console and controller Services', () => {
+    expect(consoleUpstream('alpha')).toEqual({
+      hostname: 'tenant-console.di-runtime-alpha.svc.cluster.local',
+      port: 8787,
+    });
+    expect(controllerUpstream('alpha')).toEqual({
+      hostname: 'tenant-controller.di-runtime-alpha.svc.cluster.local',
+      port: 8788,
+    });
+  });
+
+  it('sends the console host to the console with its original Host', async () => {
+    const res = await send(port, { headers: { host: 'console.alpha.localhost:28180' } });
+    expect(res.body).toBe('upstream console.alpha.localhost:28180');
+    expect(seen[0]?.['x-forwarded-host']).toBe('console.alpha.localhost:28180');
+    // Other route hosts still reach the tenant workloads, and other hosts the default group.
+    expect((await send(port, { headers: { host: 'site.alpha.localhost' } })).body).toBe(
+      'upstream site',
+    );
+    expect((await send(port, { headers: { host: 'example.com' } })).body).toBe(
+      'upstream example.com',
+    );
+  });
+
+  it('serves the controller host over TLS only', async () => {
+    const res = await send(port, { headers: { host: 'controller.alpha.localhost:28180' } });
+    expect(res.status).toBe(400);
+    expect(res.body).toContain('the controller host is served over TLS only');
+  });
+
+  it('passes TLS for the controller host through to the controller certificate', async () => {
+    expect(await tlsThrough('controller.alpha.localhost')).toBe('controller says hi');
+  });
+
+  it('closes TLS for any other server name, or none', async () => {
+    expect(await tlsThrough('console.alpha.localhost')).toBe('closed');
+    expect(await tlsThrough('controller.example.com')).toBe('closed');
+    expect(await tlsThrough(undefined)).toBe('closed');
+  });
+
+  it('reassembles a ClientHello split across reads', async () => {
+    // Capture a real ClientHello, then replay it in pieces.
+    const hello = await new Promise<Buffer>((resolve) => {
+      const capture = createNetServer((socket) =>
+        socket.once('data', (chunk: Buffer) => {
+          socket.destroy();
+          capture.close();
+          resolve(chunk);
+        }),
+      );
+      capture.listen(0, '127.0.0.1', () => {
+        const client = tlsConnect({
+          host: '127.0.0.1',
+          port: (capture.address() as { port: number }).port,
+          servername: 'controller.alpha.localhost',
+        });
+        client.on('error', () => {});
+      });
+    });
+    expect(serverName(hello)).toBe('controller.alpha.localhost');
+    const reply = await new Promise<number>((resolve) => {
+      const socket = connect(port, '127.0.0.1', async () => {
+        socket.write(hello.subarray(0, 3));
+        await Bun.sleep(20);
+        socket.write(hello.subarray(3, 40));
+        await Bun.sleep(20);
+        socket.write(hello.subarray(40));
+      });
+      socket.once('data', (chunk: Buffer) => {
+        socket.destroy();
+        resolve(chunk[0] as number);
+      });
+    });
+    expect(reply).toBe(0x16); // the controller's ServerHello
+  });
+
+  it('closes the client when the controller is unreachable', async () => {
+    await new Promise((resolve) => controller.close(resolve));
+    controller = createTlsServer({});
+    expect(await tlsThrough('controller.alpha.localhost')).toBe('closed');
+    expect(log).toHaveBeenCalled();
+  });
+
+  it('finds no server name in a truncated record', () => {
+    expect(serverName(Buffer.from([0x16, 3, 1, 0, 1, 1]))).toBeUndefined();
+  });
+
+  it('listens through the edge when the controller is routed, and stops on SIGTERM', async () => {
+    const free = createNetServer();
+    const target = await listen(free as Server);
+    await new Promise((resolve) => free.close(resolve));
+    const signals = new EventEmitter();
+    const server = main(
+      {
+        GATEWAY_CONFIG: JSON.stringify({
+          port: target,
+          defaultUpstream: '127.0.0.1',
+          tenantAuthRoutes: { controller: 'controller' },
+        }),
+      },
+      signals,
+    );
+    expect(server.listening).toBe(false); // the edge listens in front of it
+    await Bun.sleep(20);
+    expect(await tlsThrough('other.alpha.localhost', target)).toBe('closed');
+    signals.emit('SIGTERM');
+    await Bun.sleep(20);
+    const refused = await new Promise<boolean>((resolve) => {
+      const socket = connect(target, '127.0.0.1');
+      socket.on('connect', () => {
+        socket.destroy();
+        resolve(false);
+      });
+      socket.on('error', () => resolve(true));
+    });
+    expect(refused).toBe(true);
   });
 });

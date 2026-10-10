@@ -120,3 +120,45 @@ describe('gateway resources', () => {
     ]);
   });
 });
+
+describe('tenant-auth gateway routes (#58:routes)', () => {
+  const routes = { console: 'console', controller: 'controller' };
+
+  it('passes the routes to the gateway only when there are any', () => {
+    const env = (spec: ReturnType<typeof gatewayDeploymentSpec>) =>
+      JSON.parse(spec.template.spec.containers[0]!.env[0]!.value);
+    expect(env(gatewayDeploymentSpec('wasmcloud', 'abc', routes)).tenantAuthRoutes).toEqual(routes);
+    expect(env(gatewayDeploymentSpec('wasmcloud', 'abc', {}))).not.toHaveProperty(
+      'tenantAuthRoutes',
+    );
+  });
+
+  it('lets the gateway reach the routed console and controller ports and nothing more', () => {
+    const tenants = {
+      matchLabels: { [INSTALLATION]: 'di-test' },
+      matchExpressions: [{ key: TENANT, operator: 'Exists' }],
+    };
+    const policy = gatewayNetworkPolicySpec('wasmcloud', 'di-test', routes);
+    expect(policy.egress.slice(2)).toEqual([
+      {
+        to: [
+          { namespaceSelector: tenants, podSelector: { matchLabels: { app: 'tenant-console' } } },
+        ],
+        ports: [{ protocol: 'TCP', port: 8787 }],
+      },
+      {
+        to: [
+          {
+            namespaceSelector: tenants,
+            podSelector: { matchLabels: { app: 'tenant-controller' } },
+          },
+        ],
+        ports: [{ protocol: 'TCP', port: 8788 }],
+      },
+    ]);
+    expect(
+      gatewayNetworkPolicySpec('wasmcloud', 'di-test', { console: 'console' }).egress,
+    ).toHaveLength(3);
+    expect(gatewayNetworkPolicySpec('wasmcloud', 'di-test').egress).toHaveLength(2);
+  });
+});

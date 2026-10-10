@@ -495,6 +495,25 @@ tenantAuth:
   expires or when its names change, and the certificate digest in both pod templates rolls
   the pair. Kubeconfigs the console issued before a renewal embed the old CA and stop working;
   download a new one.
+- Routes: when the platform gateway is published (`routeUrlPattern`), a public URL whose host is
+  `<label>.{tenant}.localhost` on the gateway port is routed through it, so a new Tenant gets a
+  reachable console and controller with no script. Set, for example,
+  `consolePublicUrl: http://console.{tenant}.localhost:28180` and
+  `controllerPublicUrl: https://controller.{tenant}.localhost:28180`. The console route is
+  plain HTTP to `tenant-console:8787` with the original `Host`. The controller route is TLS
+  passthrough: the gateway reads only the SNI name and pipes the connection to
+  `tenant-controller:8788`, so the controller's own certificate (covering the public host) and
+  the CA the console embeds in kubeconfigs still verify end to end; plain HTTP to the controller
+  host gets `400`. The routed URLs are added to `di-platform-routes` as `consoleUrl` and
+  `controllerUrl`. Policies `tenant-console-gateway` and `tenant-controller-gateway` admit only
+  the gateway pods, each to its own port, and the gateway's egress gains only those two ports
+  in this installation's tenant namespaces. A routed label takes that host away from tenant
+  workloads (`console.<tenant>.localhost` no longer reaches `di-http`). The default
+  `127.0.0.1` URLs, unset URLs, other hosts, and any URL while no gateway is published stay
+  unrouted, as before. A gateway-shaped URL the gateway cannot route (wrong scheme, port, or a
+  host shared by both) is reported on `TenantAuthReady` with reason `RouteError`; `Ready` is
+  unaffected. The routes are config, not per-Tenant objects: the gateway policies carry the
+  `tenant-auth` component label and are removed with the rest of the pair.
 - The controller Deployment stays at one replica with `Recreate`: proxy sessions live in its
   memory. A new image digest rolls both pods.
 - Status: problems here are reported on the Tenant's `TenantAuthReady` condition. Ready, and

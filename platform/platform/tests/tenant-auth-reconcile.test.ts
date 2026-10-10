@@ -17,6 +17,7 @@ import {
   type TenantAuthConfig,
   type TenantAuthInputs,
   tenantAuthResources,
+  tenantAuthRoutes,
   tenantControllerCertNames,
   tenantResources,
   tlsCertDigest,
@@ -1074,5 +1075,159 @@ describe('tenant-auth reconcile ordering (#121)', () => {
     expect(c.TenantAuthReady).toMatchObject({ status: 'False', reason: 'ReconcileError' });
     // The raise landed, the lowering conflicted, and the next poll retries it.
     expect(cpu(api)).toBe('2500m');
+  });
+});
+
+describe('tenant-auth gateway routes (#58:routes)', () => {
+  const pattern = 'http://{host}.{tenant}.localhost:28180';
+  const routed: TenantAuthConfig = {
+    ...auth,
+    consolePublicUrl: 'http://console.{tenant}.localhost:28180',
+    controllerPublicUrl: 'https://controller.{tenant}.localhost:28180',
+  };
+  const routedCfg: ControllerConfig = { ...cfg, routeUrlPattern: pattern, tenantAuth: routed };
+
+  it('routes gateway-shaped public URLs only while the gateway is published', () => {
+    expect(tenantAuthRoutes(routed, pattern)).toEqual({
+      routes: { console: 'console', controller: 'controller' },
+      problems: [],
+    });
+    // Unset and default URLs, or no gateway, keep today's unrouted behaviour.
+    expect(tenantAuthRoutes(undefined, pattern)).toEqual({ routes: {}, problems: [] });
+    const { consolePublicUrl: _c, controllerPublicUrl: _k, ...plain } = routed;
+    expect(tenantAuthRoutes(plain, pattern)).toEqual({ routes: {}, problems: [] });
+    expect(
+      tenantAuthRoutes(
+        {
+          ...auth,
+          consolePublicUrl: 'http://127.0.0.1:8787',
+          controllerPublicUrl: 'https://127.0.0.1:8788',
+        },
+        pattern,
+      ),
+    ).toEqual({ routes: {}, problems: [] });
+    expect(tenantAuthRoutes(routed, undefined)).toEqual({ routes: {}, problems: [] });
+    expect(
+      tenantAuthRoutes(
+        { ...auth, consolePublicUrl: 'http://ui.{tenant}.localhost/' },
+        'http://{host}.{tenant}.localhost',
+      ).routes,
+    ).toEqual({ console: 'ui' });
+  });
+
+  it('reports gateway-shaped URLs the gateway cannot route', () => {
+    const problems = (overrides: Partial<TenantAuthConfig>) =>
+      tenantAuthRoutes({ ...routed, ...overrides }, pattern).problems;
+    expect(problems({ consolePublicUrl: 'https://console.{tenant}.localhost:28180' })).toEqual([
+      'tenantAuth.consolePublicUrl must use http://',
+    ]);
+    expect(problems({ controllerPublicUrl: 'http://controller.{tenant}.localhost:28180' })).toEqual(
+      ['tenantAuth.controllerPublicUrl must use https://'],
+    );
+    expect(problems({ consolePublicUrl: 'http://a.b.{tenant}.localhost:28180' })).toEqual([
+      'tenantAuth.consolePublicUrl host label is invalid',
+    ]);
+    expect(problems({ consolePublicUrl: 'http://console.{tenant}.localhost:9999' })).toEqual([
+      'tenantAuth.consolePublicUrl must use the gateway port 28180',
+    ]);
+    expect(
+      tenantAuthRoutes(
+        { ...routed, consolePublicUrl: 'http://console.{tenant}.localhost:1' },
+        'http://{host}.{tenant}.localhost',
+      ).problems,
+    ).toEqual([
+      'tenantAuth.consolePublicUrl must use the gateway port (default)',
+      'tenantAuth.controllerPublicUrl must use the gateway port (default)',
+    ]);
+    expect(problems({ controllerPublicUrl: 'https://console.{tenant}.localhost:28180' })).toEqual([
+      'tenantAuth.controllerPublicUrl must not share the console host',
+    ]);
+  });
+
+  it('admits the gateway to the routed ports only and publishes the URLs', () => {
+    const resources = tenantAuthResources(tenant(), routedCfg, inputs);
+    for (const [app, port] of [
+      ['tenant-console', 8787],
+      ['tenant-controller', 8788],
+    ] as const)
+      expect(find(resources, 'NetworkPolicy', `${app}-gateway`)).toMatchObject({
+        metadata: { namespace: 'di-runtime-alpha', labels: { [COMPONENT]: 'tenant-auth' } },
+        spec: {
+          podSelector: { matchLabels: { app } },
+          policyTypes: ['Ingress'],
+          ingress: [
+            {
+              from: [
+                {
+                  namespaceSelector: {
+                    matchLabels: { 'kubernetes.io/metadata.name': 'wasmcloud' },
+                  },
+                  podSelector: { matchLabels: { app: 'di-platform-gateway' } },
+                },
+              ],
+              ports: [{ protocol: 'TCP', port }],
+            },
+          ],
+        },
+      });
+    const consoleOnly = tenantAuthResources(
+      tenant(),
+      { ...routedCfg, tenantAuth: { ...routed, controllerPublicUrl: undefined } },
+      inputs,
+    );
+    expect(find(consoleOnly, 'NetworkPolicy', 'tenant-controller-gateway')).toBeUndefined();
+    expect(find(consoleOnly, 'NetworkPolicy', 'tenant-console-gateway')).toBeDefined();
+    const unrouted = tenantAuthResources(tenant(), cfg, inputs);
+    expect(unrouted.filter((r) => r.metadata.name.endsWith('-gateway'))).toEqual([]);
+
+    const routes = (c: ControllerConfig) =>
+      find(tenantResources(tenant(), c, undefined), 'ConfigMap', 'di-platform-routes')?.data;
+    expect(routes(routedCfg)).toEqual({
+      urlTemplate: 'http://{host}.alpha.localhost:28180',
+      consoleUrl: 'http://console.alpha.localhost:28180',
+      controllerUrl: 'https://controller.alpha.localhost:28180',
+    });
+    expect(routes({ ...cfg, routeUrlPattern: pattern, tenantAuth: undefined })).toEqual({
+      urlTemplate: 'http://{host}.alpha.localhost:28180',
+    });
+  });
+
+  it('applies the routes, prunes unrouted policies and reports problems on TenantAuthReady', async () => {
+    const { api, t } = prepare();
+    const policy = (name: string) =>
+      api.objects.get(
+        `${collection('networking.k8s.io/v1', 'NetworkPolicy', 'di-runtime-alpha')}/${name}`,
+      );
+    await new Controller(api, routedCfg).reconcileTenant(t, []);
+    expect(policy('tenant-console-gateway')).toBeDefined();
+    expect(policy('tenant-controller-gateway')).toBeDefined();
+    const authCondition = () => t.status?.conditions?.find((c) => c.type === 'TenantAuthReady');
+    expect(authCondition()).toMatchObject({ status: 'True', reason: 'Reconciled' });
+
+    // Moving the controller off the gateway drops its policy and keeps the console's.
+    await new Controller(api, {
+      ...routedCfg,
+      tenantAuth: { ...routed, controllerPublicUrl: 'https://127.0.0.1:8788' },
+    }).reconcileTenant(t, []);
+    expect(policy('tenant-controller-gateway')).toBeUndefined();
+    expect(policy('tenant-console-gateway')).toBeDefined();
+
+    // A policy of the same name this installation does not own is left alone.
+    api.seed({
+      apiVersion: 'networking.k8s.io/v1',
+      kind: 'NetworkPolicy',
+      metadata: { name: 'tenant-controller-gateway', namespace: 'di-runtime-alpha' },
+    });
+    await new Controller(api, {
+      ...routedCfg,
+      tenantAuth: { ...routed, controllerPublicUrl: 'http://controller.{tenant}.localhost:28180' },
+    }).reconcileTenant(t, []);
+    expect(policy('tenant-controller-gateway')).toBeDefined();
+    expect(authCondition()).toMatchObject({
+      status: 'False',
+      reason: 'RouteError',
+      message: 'tenantAuth.controllerPublicUrl must use https://',
+    });
+    expect(t.status?.conditions?.find((c) => c.type === 'Ready')?.status).toBe('True');
   });
 });

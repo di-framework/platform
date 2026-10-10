@@ -69,6 +69,7 @@ import {
   type Tenant,
   type TenantAuthInputs,
   tenantAuthResources,
+  tenantAuthRoutes,
   tenantControllerCertNames,
   tenantResources,
   type User,
@@ -643,6 +644,21 @@ export class Controller {
             (status?.readyReplicas ?? 0) === spec.replicas;
         }
       }
+      // Gateway policies for hosts that are no longer routed.
+      const namespace = names(tenant.metadata.name).runtimeNamespace;
+      for (const policy of ['tenant-console-gateway', 'tenant-controller-gateway']) {
+        if (desired.some((value) => value.metadata.name === policy)) continue;
+        const stale = await this.get<Resource>(
+          `${collection('networking.k8s.io/v1', 'NetworkPolicy', namespace)}/${policy}`,
+        );
+        if (
+          stale?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+          stale.metadata.labels[OWNER] === tenant.metadata.uid
+        )
+          await this.remove(stale);
+      }
+      const { problems } = tenantAuthRoutes(this.cfg.tenantAuth, this.cfg.routeUrlPattern);
+      if (problems.length) return condition(false, 'RouteError', problems.join('; '));
       return ready
         ? condition(true, 'Reconciled', 'Tenant controller and console are ready')
         : condition(false, 'Provisioning', 'Waiting for the tenant controller and console');
