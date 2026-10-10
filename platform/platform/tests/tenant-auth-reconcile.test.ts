@@ -592,11 +592,20 @@ function key(value: Resource | Tenant | User): string {
 class MemoryApi implements Api {
   objects = new Map<string, Resource>();
   notReady = new Set<string>();
+  /** Every PATCH in order, as `<path> <limits.cpu>` for quotas so the raise can be ordered. */
+  patches: string[] = [];
+  fail?: (method: string, path: string, body: unknown) => Error | undefined;
   seed(value: Resource | Tenant | User): void {
     this.objects.set(key(value), structuredClone(value) as Resource);
   }
   async call<T>(method: string, path: string, body?: unknown): Promise<T> {
     const url = new URL(path, 'https://kubernetes');
+    const failure = this.fail?.(method, url.pathname, body);
+    if (failure) throw failure;
+    if (method === 'PATCH')
+      this.patches.push(
+        `${url.pathname} ${(body as { spec?: { hard?: Record<string, string> } })?.spec?.hard?.['limits.cpu'] ?? ''}`.trim(),
+      );
     if (method === 'GET' && url.searchParams.has('labelSelector')) {
       const labels = url.searchParams
         .get('labelSelector')!
@@ -953,4 +962,103 @@ describe('reconcileTenant with tenant-auth', () => {
       ).toBeUndefined();
       expect(tenantAuthObjects(api)).toEqual([]);
     });
+});
+
+describe('tenant-auth reconcile ordering (#121)', () => {
+  const quotaPath = `${collection('v1', 'ResourceQuota', 'di-runtime-alpha')}/di-runtime-quota`;
+  const hostgroupPath = path('Deployment', 'di-runtime-alpha', 'hostgroup-tenant-alpha');
+  const cpu = (api: MemoryApi) =>
+    (api.objects.get(quotaPath) as unknown as { spec: { hard: Record<string, string> } }).spec
+      .hard['limits.cpu'];
+  const conditions = (t: Tenant) =>
+    Object.fromEntries((t.status?.conditions ?? []).map((c) => [c.type, c]));
+  const quiet = async (run: () => Promise<void>) => {
+    const log = console.error;
+    console.error = () => {};
+    try {
+      await run();
+    } finally {
+      console.error = log;
+    }
+  };
+  const conflict = () =>
+    new ApiError(409, 'Apply failed: conflict with "kubectl-set": WASH_CORE_INSTANCES');
+  const leftover = (api: MemoryApi) =>
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'ServiceAccount',
+      metadata: {
+        name: 'tenant-controller',
+        namespace: 'di-runtime-alpha',
+        labels: { [COMPONENT]: 'tenant-auth', [TENANT]: 'alpha' },
+      },
+    });
+
+  it('reconciles tenant-auth past a hostgroup 409 and reports the conflict on Ready', async () => {
+    const { api, controller, t } = prepare();
+    api.fail = (method, p) => (method === 'PATCH' && p === hostgroupPath ? conflict() : undefined);
+    const alice = user('alice', ['alpha']);
+    api.seed(alice);
+    await quiet(() => controller.reconcileTenant(t, [alice]));
+    const c = conditions(t);
+    expect(c.Ready).toMatchObject({ status: 'False', reason: 'ReconcileError' });
+    expect(c.Ready?.message).toContain('kubectl-set');
+    expect(c.TenantAuthReady).toMatchObject({ status: 'True', reason: 'Reconciled' });
+    expect(
+      api.objects.get(path('Deployment', 'di-runtime-alpha', 'tenant-controller')),
+    ).toBeDefined();
+    expect(tokenNames(api)).toEqual(['di-user-alice']);
+    // The tenant step kept the base quota; the tenant-auth step raised it before the pair.
+    const raised = api.patches.indexOf(`${quotaPath} 2500m`);
+    const pair = api.patches.findIndex((p) => p.endsWith('/deployments/tenant-controller'));
+    expect(api.patches.indexOf(`${quotaPath} 2`)).toBeLessThan(raised);
+    expect(raised).toBeGreaterThan(-1);
+    expect(raised).toBeLessThan(pair);
+    expect(cpu(api)).toBe('2500m');
+    // Member access still follows Ready alone, as before: a Not-Ready tenant grants no
+    // bindings, and tenant-auth succeeding does not change that.
+    await controller.reconcileUser(alice, [t]);
+    expect(
+      [...api.objects.values()].some(
+        (r) => r.kind === 'RoleBinding' && r.metadata.labels?.[OWNER] === 'alice-uid',
+      ),
+    ).toBe(false);
+    // Once the conflict clears the tenant is Ready and keeps the raised quota.
+    api.fail = undefined;
+    await controller.reconcileTenant(t, [alice]);
+    expect(conditions(t).Ready?.status).toBe('True');
+    expect(cpu(api)).toBe('2500m');
+    await controller.reconcileUser(alice, [t]);
+    expect(
+      [...api.objects.values()].some(
+        (r) => r.kind === 'RoleBinding' && r.metadata.labels?.[OWNER] === 'alice-uid',
+      ),
+    ).toBe(true);
+  });
+
+  it('never leaves the quota raised when the pair was not applied', async () => {
+    const { api, controller, t } = prepare();
+    leftover(api);
+    await quiet(() => controller.reconcileTenant(t, []));
+    expect(conditions(t).TenantAuthReady).toMatchObject({ status: 'False' });
+    expect(
+      api.objects.get(path('Deployment', 'di-runtime-alpha', 'tenant-controller')),
+    ).toBeUndefined();
+    expect(cpu(api)).toBe('2');
+  });
+
+  it('reports both failures when neither the tenant nor the quota rollback can be applied', async () => {
+    const { api, controller, t } = prepare();
+    leftover(api);
+    api.fail = (method, p, body) =>
+      method === 'PATCH' &&
+      p === quotaPath &&
+      (body as { spec: { hard: Record<string, string> } }).spec.hard['limits.cpu'] === '2'
+        ? conflict()
+        : undefined;
+    await quiet(() => controller.reconcileTenant(t, []));
+    const c = conditions(t);
+    expect(c.Ready).toMatchObject({ status: 'False', reason: 'ReconcileError' });
+    expect(c.TenantAuthReady).toMatchObject({ status: 'False', reason: 'ReconcileError' });
+  });
 });
