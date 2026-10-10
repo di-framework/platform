@@ -36,6 +36,6 @@ No, as long as identity-server's Pulumi patch keeps the same values. Pulumi's `D
 ## What each owner should do
 
 - Platform: no strategy knob needed. Ship the #64 controller so future 409s name their managers. Do not add `force=true`.
-- Clearing the current 409 is an operator action (not done here). The live `300` conflicts with the declared `100`: either the cluster operator force-applies the declared value as the controller, or the platform gains the knob below and the Tenant declares 300.
+- Clearing the current 409 is an operator action (not done here). The live `300` conflicts with the declared `100`. Do not force-apply the declared value: that rolls identity back to `100`. Declare `coreInstances: 300` on the Tenant (the knob below) and follow the ownership cleanup in `README.md` ("Tenant host core instances").
 - identity-server#49: drop the `strategy` block from `tenant-host-rollout` and `tenant-host-secrets` (the platform owns it since #104), keeping only the pod-template annotations (`host-image` digest, `runtime-secrets` digest), which do not overlap platform-owned fields. Never edit env on the platform-owned Deployment by hand.
 - #38 design: yes, it needs a platform knob. `WASH_CORE_INSTANCES` is hard-coded to `100` in `resources.ts`. Add a per-Tenant setting (for example `spec.runtime.coreInstances`, default `100`) that the controller applies, so a tenant needing 300 declares it on the Tenant CR and nobody patches the Deployment out of band.
