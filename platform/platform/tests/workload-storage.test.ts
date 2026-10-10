@@ -477,14 +477,14 @@ describe('storage admission and install', () => {
     expect(policy).toContain('variables.controller || variables.keptVolumes');
   });
 
-  it('ships workload-storage with the controller and grants only patch on workloads', () => {
+  it('ships workload-storage with the controller and grants patch, plus create/delete for the registry (#83)', () => {
     expect(CONTROLLER_SCRIPT_MODULES).toContain('workload-storage');
     expect(
       controllerClusterRoleRules().find((r) => r.resources.includes('workloaddeployments')),
     ).toEqual({
       apiGroups: ['runtime.wasmcloud.dev'],
       resources: ['workloaddeployments'],
-      verbs: ['get', 'list', 'watch', 'patch'],
+      verbs: ['get', 'list', 'watch', 'create', 'patch', 'delete'],
     });
   });
 });

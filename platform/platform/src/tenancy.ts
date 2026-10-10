@@ -17,6 +17,7 @@ import {
   INSTALLATION,
   names,
   type Resource,
+  registryHttpHost,
   TENANT,
   type TenantAuthConfig,
   type UserSpec,
@@ -156,7 +157,11 @@ export function installTenancy(args: {
   // BackingService / ServiceBinding instances if the cluster outlives the stack.
   // Full volume/data retention for BackingService is owned by #453.
   const definitions = crds.map((value) => create(value, args.dependsOn, { retainOnDelete: true }));
-  const policies = admissionResources(installation, namespace).map((value) => create(value));
+  const policies = admissionResources(
+    installation,
+    namespace,
+    registryHttpHost(args.tenantAuth),
+  ).map((value) => create(value));
   const script = loadControllerScripts();
   const scriptHash = controllerScriptHash(script);
   const serviceAccount = create({

@@ -112,3 +112,23 @@ describe('GET /v1/deploy/registry', () => {
     expect((await get()).status).toBe(401);
   });
 });
+
+/** A registry that is configured but not served (host conflict or suspension, platform#83). */
+describe('GET /v1/deploy/registry while the registry is not served', () => {
+  const served = servedController({
+    env: { TENANT_CONTROLLER_REGISTRY_HOST: 'registry' },
+    principals: { 'tok-viewer-9c1e': bob },
+  });
+
+  test('says the registry is not available, not that none is configured', async () => {
+    const response = await fetch(`${served.base}/v1/deploy/registry`, {
+      headers: { authorization: 'Bearer tok-viewer-9c1e' },
+    });
+    expect(response.status).toBe(503);
+    const body = (await response.json()) as { detail?: string };
+    expect(body.detail).toBe(
+      "the tenant registry is not available; see the Tenant's TenantAuthReady condition",
+    );
+    expect(configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme' }).registryConfigured).toBe(false);
+  });
+});

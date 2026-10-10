@@ -487,6 +487,14 @@ tenantAuth:
   issuerIp: 192.0.2.7                                        # optional, when pods cannot resolve the issuer
   consolePublicUrl: http://console.{tenant}.localhost:28180  # optional; default http://127.0.0.1:8787
   controllerPublicUrl: https://127.0.0.1:8788                # optional
+  registry:                                                  # optional: each tenant's own OCI registry (#83)
+    component: ghcr.io/di-framework/oci-registry@sha256:<digest>  # required, pinned by digest
+    publicUrl: https://registry.{tenant}.localhost:28180     # optional; default https://127.0.0.1:8790
+    limits:                                                  # optional; each field optional, defaults shown
+      maxBodyBytes: 536870912                                # TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES
+      upstreamTimeoutMs: 60000                               # TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS
+      maxConcurrent: 16                                      # TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT
+      uploadIdleTimeoutMs: 60000                             # TENANT_CONTROLLER_REGISTRY_UPLOAD_IDLE_TIMEOUT_MS
 ```
 
 - Placement and quota: both run in `di-runtime-<tenant>`, next to the `di-http` Service the
@@ -507,8 +515,13 @@ tenantAuth:
   write them (#112); writes still go through as the calling user.
 - Network: `tenant-auth-egress` adds egress to the API server endpoints (EndpointSlice
   `default/kubernetes`, `/32` or `/128`), the issuer (upstream namespace or IP), the tenant's
-  host group on 9191 (`di-http`'s pod port) and DNS, on top of what `di-tenant-network`
-  already allows every pod in the namespace.
+  host group on 9191 (`di-http`'s pod port) and DNS. The pair is not selected by
+  `di-tenant-network`; `tenant-auth-network` gives it the same egress that policy gives the
+  tenant's other pods, and admits only the console to the controller's `8788` and, with a
+  registry, only the tenant's host pods to the whoami listener (`8789`). Tenant workloads no
+  longer reach the console or the controller from inside the cluster. The pair leaves
+  `di-tenant-network` only once its own `tenant-auth-network` exists, so on an upgrade (or when
+  the tenant-auth step fails before that policy) it keeps the broad policy until the next poll.
 - Credentials: no pod automounts a ServiceAccount token. The controller container alone gets
   a projected token; the issuer-proxy sidecar (`alpine/socat`, pinned by digest) has none.
 - TLS: the platform controller generates a self-signed P-256 certificate for
@@ -536,6 +549,93 @@ tenantAuth:
   host shared by both) is reported on `TenantAuthReady` with reason `RouteError`; `Ready` is
   unaffected. The routes are config, not per-Tenant objects: the gateway policies carry the
   `tenant-auth` component label and are removed with the rest of the pair.
+- Registry (`tenantAuth.registry`, #83): each tenant gets the `platform/oci-registry` component
+  as WorkloadDeployment `di-tenant-registry` in `di-tenant-<tenant>`, on the tenant's own hosts.
+  Its storage is the unnamed `wasmcloud:blobstore` with no references, which is the host data
+  store on the tenant's `di-nats` (JetStream on the tenant's host path). Its `wasmcloud:secrets`
+  bind-time config names the tenant and the controller's whoami-only listener,
+  `http://tenant-controller.di-runtime-<tenant>.svc:8789`: plain HTTP, in-cluster, which the
+  component accepts for `*.svc` only. The listener serves nothing but `GET /v1/auth/whoami`
+  (same answer as `8788`, problem+json errors), so the registry needs no trust in the
+  controller's private CA. Admission admits `wasmcloud:secrets` from the platform controller
+  only, so a tenant cannot repoint the callback; the component's only egress is that URL
+  (`allowedHosts`), and the egress reconcile leaves it alone.
+  - Reservation: the front sends every registry user's Basic credentials to whatever serves the
+    registry host on the tenant's `di-http`, so policy `<installation>-reserved-workloads`
+    (CREATE, UPDATE and DELETE) denies `di-user-*` ServiceAccounts, and therefore `/v1/deploy`,
+    any change to `di-tenant-registry` or to a WorkloadDeployment labelled
+    `platform.di-framework.dev/component: tenant-auth` (on the new or the old object), and any
+    WorkloadDeployment whose `wasi:http` `config.host` is the registry host in any case, with a
+    trailing dot or a port. The host is rendered from `registry.publicUrl` (default `registry`)
+    and reserved even while no registry is configured. Other deletes by tenant users and every
+    request of the platform controller pass. `/v1/deploy` also refuses a `<service>-<env>` equal
+    to the registry host with `422`.
+    Admission checks only writes, so a workload that already claimed the host (created before
+    the policy, or before a `registry.publicUrl` change moved the registry to its host) would
+    keep its route, and wash picks randomly among claimants. Each reconcile therefore lists the
+    tenant's WorkloadDeployments; while any workload other than the platform's
+    `di-tenant-registry` claims the host through `wasi:http` `config.host` or `host-aliases`
+    (in any case), the registry is not served and `TenantAuthReady` is `False` with reason
+    `RegistryHostConflict`, naming the workload. Deleting it clears the conflict on the next
+    poll.
+  - TLS and routing: users reach the registry at `publicUrl` through the controller's registry
+    front (`8790`), a TLS listener with the controller certificate (which also names the
+    registry's public host) that forwards every request to `di-http` with `Host: <label>`.
+    A `publicUrl` of `https://<label>.{tenant}.localhost` on the gateway port is routed: the
+    gateway passes TLS whose SNI is that host through to the front, exactly as for the
+    controller, and answers plain HTTP for it with `400`. The gateway knows the registry's
+    HTTP host whenever a registry is configured, so that `400` holds even when users reach the
+    registry by port-forward (`kubectl port-forward svc/tenant-controller 8790`, the default
+    `https://127.0.0.1:8790`). Credentials therefore never cross plain HTTP off-cluster; the
+    front-to-host and registry-to-controller hops are plain HTTP on the pod network, as the
+    gateway-to-host hop already is. The alternative, terminating TLS at the gateway, would put
+    every tenant's private key in the platform namespace; TLS passthrough keeps keys per tenant.
+    Clients must trust the tenant's CA (ConfigMap `tenant-controller-ca`), as for the controller.
+    The default `publicUrl` needs `pods/portforward` in `di-runtime-<tenant>`, which only
+    `di-runtime-developer` has, so viewers cannot pull through it; with a published gateway, use
+    the routed `https://registry.{tenant}.localhost:<gateway port>` instead.
+  - Front enablement: the controller is rendered with the registry front
+    (`TENANT_CONTROLLER_REGISTRY_FRONT_PORT`) and `TENANT_CONTROLLER_REGISTRY_URL` only while
+    the tenant is not suspended and no other WorkloadDeployment claims the registry host.
+    Registry readiness is not part of the gate, so a registry rollout or blip never restarts the
+    controller: while `di-tenant-registry` is not `Ready` the front answers 502/504 and
+    `TenantAuthReady` reports `Provisioning`. Tenant users cannot create a claimant (admission);
+    one written by any other requester (an operator, a CD service account) is detected on the
+    next reconcile (polled every 3 s), which closes the front, so it can receive credentials for
+    at most that poll plus the controller's `Recreate` rollout. Opening or closing the front
+    rolls the controller pod.
+  - Limits: the front is reachable without credentials (the component authenticates). A request
+    without Basic credentials gets the registry's own challenge (`401`,
+    `WWW-Authenticate: Basic realm="di-framework-tenant-registry"`) from the front, so
+    `docker login` and `oras login` work and such requests take no slot. Otherwise it allows 16
+    requests at once (`503` beyond), bodies up to 512 MiB (`413`), an upload that delivers no
+    byte for 60 s is cut off (`408`), and once the body is forwarded in full the registry has
+    60 s for its response headers (`504`); a steady upload of any length succeeds. A 120 s
+    socket idle timeout that data flow resets also applies. Tune them with
+    `tenantAuth.registry.limits` (rendered as the `TENANT_CONTROLLER_REGISTRY_*` env above; a
+    hand edit of the Deployment is reverted). There is no per-client limit: the front sees the
+    gateway as the peer of every routed connection, so a per-IP cap would be a global one. An
+    authenticating client can still hold slots up to these bounds. A client that disconnects
+    aborts the upstream request. Error answers carry no upstream detail.
+  - `TENANT_CONTROLLER_REGISTRY_URL` on the controller is `publicUrl` with `{tenant}` replaced,
+    so `GET /v1/deploy/registry` returns it while the registry is served. Policy `tenant-registry-gateway` admits only the
+    gateway to `8790`, and the gateway's egress gains that port.
+  - Quota: the registry adds one WorkloadDeployment to `di-tenant-quota`, raised in the
+    tenant-auth step right before the registry is applied and kept only while it exists, so the
+    tenant keeps all of `spec.resources.workloads`. It runs on the tenant host, so the runtime
+    quota is unchanged.
+  - Status: the registry's readiness (its WorkloadDeployment `Ready` condition) and problems are
+    reported on `TenantAuthReady`, never on `Ready`. A `publicUrl` the gateway cannot route is a
+    `RouteError` there.
+  - Unsetting `tenantAuth.registry` deletes the workload and gives the quota slot back; the
+    controller's extra listeners and env go with the next rollout.
+  - RBAC: the platform controller's ClusterRole grants `create` and `delete` on
+    `workloaddeployments` for the registry (its server-side apply is authorized as `create`
+    while it does not exist). Roll the ClusterRole before the new controller (`pulumi up`
+    applies both; a hand-rolled upgrade must apply the ClusterRole first), or the registry
+    reports `403` on `TenantAuthReady` until it does.
+  - Hosts pulling from the registry (setting the tenant hosts' registry config to it) is
+    `#83:host-pull`, not this step.
 - The controller Deployment stays at one replica with `Recreate`: proxy sessions live in its
   memory. A new image digest rolls both pods.
 - Status: problems here are reported on the Tenant's `TenantAuthReady` condition. Ready, and
@@ -545,7 +645,7 @@ tenantAuth:
   conflict text, and `TenantAuthReady` for the pair itself.
 - Cleanup: deleting the Tenant deletes the cluster-scoped and platform-namespace objects too;
   unsetting `tenantAuth` removes every object labelled `platform.di-framework.dev/component:
-  tenant-auth` and the quota addition.
+  tenant-auth` (the registry WorkloadDeployment included) and the quota addition.
 
 The reconcile does not adopt objects that `deploy-local.ts` created (`TenantAuthReady` reports
 `Refusing to adopt`). Delete them first: in `di-runtime-<tenant>` the Deployments, Services,

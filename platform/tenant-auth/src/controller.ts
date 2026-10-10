@@ -20,7 +20,12 @@ import {
 import { discover, type ProviderMetadata } from './oidc.ts';
 import { controllerSecretReader } from './v1/context.ts';
 import { serveV1 } from './v1/index.ts';
-import { PASSTHROUGH, servePassthrough, tenantUpstream } from './v1/proxy.ts';
+import {
+  PASSTHROUGH,
+  servePassthrough,
+  tenantUpstream,
+  upstreamRequestHeaders,
+} from './v1/proxy.ts';
 
 export interface ControllerConfig {
   tenant: string;
@@ -42,6 +47,60 @@ export interface ControllerConfig {
    * configured one. Set from `TENANT_CONTROLLER_REGISTRY_URL`, where `{tenant}` stands for the tenant.
    */
   registryUrl?: string;
+  /**
+   * Whether the platform configured a registry for this tenant (`TENANT_CONTROLLER_REGISTRY_HOST`
+   * is set). With no `registryUrl` it is configured but not served (a host conflict or a
+   * suspended tenant), which `GET /v1/deploy/registry` reports differently from none.
+   */
+  registryConfigured: boolean;
+  /**
+   * Plain-HTTP listener serving only `GET /v1/auth/whoami`, for the tenant registry component on
+   * the tenant's hosts (platform#83). NetworkPolicy admits only the host pods to it. Unset: none.
+   */
+  whoamiPort?: number;
+  /**
+   * TLS listener (same certificate as `port`) that fronts the tenant registry: every request is
+   * forwarded to the tenant hosts with `Host: registryHost`. The gateway passes TLS for the
+   * registry's public host through to it, so registry credentials never cross plain HTTP before
+   * the cluster. Unset: none.
+   */
+  registryFrontPort?: number;
+  /** The registry workload's `wasi:http` host, sent as `Host` upstream. Default `registry`. */
+  registryHost: string;
+  /**
+   * Largest request body the registry front accepts (`TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES`,
+   * default 512 MiB, well above a Wasm component layer); larger is answered 413.
+   */
+  registryMaxBodyBytes: number;
+  /**
+   * How long the registry front waits for the registry's response headers once the request body
+   * has been forwarded in full (`TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS`, default 60 s);
+   * then it answers 504. Response bodies are bounded by the listener's idle timeout.
+   */
+  registryUpstreamTimeoutMs: number;
+  /**
+   * How long an upload may go without delivering a byte while the front waits for one
+   * (`TENANT_CONTROLLER_REGISTRY_UPLOAD_IDLE_TIMEOUT_MS`, default 60 s); then the upload is cut
+   * off with 408. A steady upload of any length succeeds; a stalled one cannot hold a slot.
+   */
+  registryUploadIdleTimeoutMs: number;
+  /**
+   * Registry requests in flight at once (`TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT`, default
+   * 16); more are answered 503, so the front never starves the tenant API in the same process.
+   */
+  registryMaxConcurrent: number;
+}
+
+/** Idle timeout of the registry front's client sockets; any data flow resets it (Bun's max is 255). */
+export const REGISTRY_IDLE_TIMEOUT_SECONDS = 120;
+const DEFAULT_REGISTRY_MAX_BODY_BYTES = 512 * 1024 * 1024;
+
+function positiveInteger(value: string | undefined, name: string, fallback: number): number {
+  if (!value) return fallback;
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 1)
+    throw new Error(`${name} must be a positive integer`);
+  return number;
 }
 
 /**
@@ -84,6 +143,94 @@ export function registryOrigin(pattern: string | undefined, tenant: string): str
   return url.origin;
 }
 
+function optionalPort(value: string | undefined, name: string): number | undefined {
+  if (!value) return undefined;
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535)
+    throw new Error(`${name} must be a TCP port`);
+  return port;
+}
+
+/**
+ * Relays `body` and calls `release` once it ends: drained, failed, or cancelled by the client
+ * (which also cancels the upstream body, aborting its request).
+ */
+function releasing(
+  body: ReadableStream<Uint8Array> | null,
+  release: () => void,
+): ReadableStream<Uint8Array> | null {
+  if (!body) {
+    release();
+    return null;
+  }
+  const reader = body.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (!done) return controller.enqueue(value);
+        release();
+        controller.close();
+      } catch (error) {
+        release();
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      release();
+      return reader.cancel(reason);
+    },
+  });
+}
+
+/**
+ * Relays an upload and reports how it ends: `stalled` when no byte arrived for `idleMs` while one
+ * was wanted (the read is cancelled), `done` once the body has been read in full.
+ */
+function watchingUpload(
+  body: ReadableStream<Uint8Array>,
+  idleMs: number,
+  on: { stalled: () => void; done: () => void },
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const timer = setTimeout(() => {
+        on.stalled();
+        reader.cancel().catch(() => {});
+      }, idleMs);
+      try {
+        const { done, value } = await reader.read();
+        if (!done) return controller.enqueue(value);
+        on.done();
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+}
+
+/** The registry's own challenge (`platform/oci-registry` `auth::challenge`), answered at the front. */
+function registryChallenge(): Response {
+  return new Response('{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}', {
+    status: 401,
+    headers: {
+      'www-authenticate': 'Basic realm="di-framework-tenant-registry"',
+      'content-type': 'application/json',
+      'docker-distribution-api-version': 'registry/2.0',
+    },
+  });
+}
+
+/** Headers never relayed back from the registry: hop-by-hop. */
+const HOP_BY_HOP_RESPONSE = new Set(['connection', 'keep-alive', 'transfer-encoding']);
+
 export function configFromEnv(env = process.env): ControllerConfig {
   const required = (name: string) => {
     const value = env[name];
@@ -104,6 +251,33 @@ export function configFromEnv(env = process.env): ControllerConfig {
     tokenTtlSeconds: Number(env.TENANT_CONTROLLER_TOKEN_TTL ?? 3600),
     cliClientId: env.TENANT_CONTROLLER_CLI_CLIENT_ID ?? 'tenant-cli',
     registryUrl: registryOrigin(env.TENANT_CONTROLLER_REGISTRY_URL, tenant),
+    whoamiPort: optionalPort(env.TENANT_CONTROLLER_WHOAMI_PORT, 'TENANT_CONTROLLER_WHOAMI_PORT'),
+    registryFrontPort: optionalPort(
+      env.TENANT_CONTROLLER_REGISTRY_FRONT_PORT,
+      'TENANT_CONTROLLER_REGISTRY_FRONT_PORT',
+    ),
+    registryConfigured: !!env.TENANT_CONTROLLER_REGISTRY_HOST,
+    registryHost: env.TENANT_CONTROLLER_REGISTRY_HOST || 'registry',
+    registryMaxBodyBytes: positiveInteger(
+      env.TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES,
+      'TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES',
+      DEFAULT_REGISTRY_MAX_BODY_BYTES,
+    ),
+    registryUpstreamTimeoutMs: positiveInteger(
+      env.TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS,
+      'TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS',
+      60_000,
+    ),
+    registryUploadIdleTimeoutMs: positiveInteger(
+      env.TENANT_CONTROLLER_REGISTRY_UPLOAD_IDLE_TIMEOUT_MS,
+      'TENANT_CONTROLLER_REGISTRY_UPLOAD_IDLE_TIMEOUT_MS',
+      60_000,
+    ),
+    registryMaxConcurrent: positiveInteger(
+      env.TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT,
+      'TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT',
+      16,
+    ),
   };
 }
 
@@ -301,6 +475,159 @@ export class Controller {
     }
   }
 
+  /**
+   * The whoami-only listener (platform#83): `GET /v1/auth/whoami` with the same answer as the
+   * main listener, and nothing else. Every error is a problem+json, as the `/v1` contract says.
+   */
+  async handleWhoami(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname !== '/v1/auth/whoami')
+      return problem(404, 'Not Found', 'this listener serves only GET /v1/auth/whoami');
+    if (request.method !== 'GET') {
+      const response = problem(405, 'Method Not Allowed', 'only GET is allowed');
+      response.headers.set('allow', 'GET');
+      return response;
+    }
+    try {
+      return json(await this.identity.resolve(request.headers.get('authorization')));
+    } catch (error) {
+      if (error instanceof AuthError) {
+        this.audit('request.denied', {
+          method: request.method,
+          path: url.pathname,
+          listener: 'whoami',
+          status: error.status,
+          reason: error.message,
+        });
+        return problem(
+          error.status,
+          error.status === 401 ? 'Unauthorized' : 'Forbidden',
+          error.message,
+        );
+      }
+      this.audit('request.failed', {
+        path: url.pathname,
+        listener: 'whoami',
+        reason: String(error),
+      });
+      return problem(502, 'Bad Gateway', 'the identity provider or cluster is unavailable');
+    }
+  }
+
+  /**
+   * The registry front (platform#83): forwards every request, credentials included (the registry
+   * authorizes it by calling whoami), to the tenant hosts with `Host: registryHost`, streaming
+   * both bodies. The controller does not authenticate here; it only terminates TLS.
+   *
+   * It is reachable without credentials, so it is bounded: at most `registryMaxConcurrent`
+   * requests at once (503 beyond), bodies up to `registryMaxBodyBytes` (413 beyond; the listener
+   * enforces the same cap on chunked bodies), an upload that delivers nothing for
+   * `registryUploadIdleTimeoutMs` is cut off (408), and once the body is forwarded in full the
+   * registry has `registryUpstreamTimeoutMs` for its response headers (504). A request without
+   * Basic credentials gets the registry's own challenge here and takes no slot, since the
+   * registry would challenge it anyway. A client that goes away aborts the upstream request, and
+   * a failed upstream ends the client response. Error answers never carry upstream details.
+   */
+  async handleRegistry(
+    request: Request,
+    server?: { requestIP(request: Request): { address: string } | null },
+  ): Promise<Response> {
+    const url = new URL(request.url);
+    const length = request.headers.get('content-length');
+    // A length that is not a number counts as too large.
+    if (
+      length &&
+      (Number.isNaN(Number(length)) || Number(length) > this.config.registryMaxBodyBytes)
+    )
+      return problem(
+        413,
+        'Content Too Large',
+        `request bodies are limited to ${this.config.registryMaxBodyBytes} bytes`,
+      );
+    const authorization = request.headers.get('authorization');
+    if (!/^basic /i.test(authorization ?? '')) {
+      await request.body?.cancel().catch(() => {});
+      return registryChallenge();
+    }
+    if (this.registryInFlight >= this.config.registryMaxConcurrent)
+      return problem(503, 'Service Unavailable', 'the tenant registry is busy; retry shortly');
+    this.registryInFlight++;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      this.registryInFlight--;
+    };
+    const headers = upstreamRequestHeaders(
+      request,
+      url,
+      this.config.registryHost,
+      server?.requestIP(request)?.address,
+    );
+    headers.set('authorization', authorization as string);
+    if (length) headers.set('content-length', length);
+    // The upstream request ends with the client's, when the upload stalls, or when the headers
+    // take too long once the body has been sent (W5 of the platform#83 review).
+    const timeout = new AbortController();
+    const stall = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // A registry that answers before the upload ends (a 401, say) must not be aborted later.
+    let answered = false;
+    const armHeaderTimer = () => {
+      if (answered) return;
+      timer = setTimeout(() => timeout.abort(), this.config.registryUpstreamTimeoutMs);
+    };
+    const body = request.body
+      ? watchingUpload(request.body, this.config.registryUploadIdleTimeoutMs, {
+          stalled: () => stall.abort(),
+          done: armHeaderTimer,
+        })
+      : null;
+    if (!body) armHeaderTimer();
+    let upstream: Response;
+    try {
+      upstream = await fetch(
+        `${this.proxyUpstream(this.config.tenant)}${url.pathname}${url.search}`,
+        {
+          method: request.method,
+          headers,
+          body,
+          duplex: 'half',
+          redirect: 'manual',
+          decompress: false,
+          signal: AbortSignal.any([request.signal, timeout.signal, stall.signal]),
+        } as RequestInit,
+      );
+    } catch (error) {
+      release();
+      const timedOut = timeout.signal.aborted;
+      const stalled = stall.signal.aborted;
+      this.audit('request.failed', {
+        path: url.pathname,
+        listener: 'registry',
+        reason: stalled ? 'upload stalled' : timedOut ? 'upstream timeout' : String(error),
+      });
+      if (stalled) return problem(408, 'Request Timeout', 'the request body stopped arriving');
+      return timedOut
+        ? problem(504, 'Gateway Timeout', 'the tenant registry did not answer in time')
+        : problem(502, 'Bad Gateway', 'the tenant registry could not be reached');
+    } finally {
+      answered = true;
+      clearTimeout(timer);
+    }
+    const out = new Headers();
+    upstream.headers.forEach((value, name) => {
+      if (!HOP_BY_HOP_RESPONSE.has(name)) out.append(name, value);
+    });
+    return new Response(releasing(upstream.body, release), {
+      status: upstream.status,
+      headers: out,
+    });
+  }
+
+  /** Registry front requests in flight (see {@link handleRegistry}). */
+  private registryInFlight = 0;
+
   // The controller's own API: identity, API keys, members.
 
   private async own(request: Request, url: URL, principal: Principal): Promise<Response> {
@@ -360,6 +687,8 @@ export class Controller {
         tenant: this.config.tenant,
         principal,
         registryUrl: this.config.registryUrl,
+        registryConfigured: this.config.registryConfigured,
+        registryHost: this.config.registryHost,
         asUser: () => asUser(this.kube, this.userTokens, principal),
         asController: () => controllerSecretReader(this.kube),
         audit: (event, fields) => this.audit(event, fields),
@@ -427,10 +756,31 @@ if (import.meta.main) {
     idleTimeout: 120,
     fetch: (request, server) => controller.handle(request, server),
   });
+  // The registry's whoami callback stays inside the cluster, so it is plain HTTP (platform#83).
+  if (config.whoamiPort)
+    Bun.serve({
+      hostname: config.host,
+      port: config.whoamiPort,
+      idleTimeout: 120,
+      fetch: (request) => controller.handleWhoami(request),
+    });
+  if (config.registryFrontPort)
+    Bun.serve({
+      hostname: config.host,
+      port: config.registryFrontPort,
+      tls,
+      // Bounded (W2 of the platform#83 review): data flow resets the idle timeout, and bodies
+      // beyond the cap are refused here too when they are chunked.
+      idleTimeout: REGISTRY_IDLE_TIMEOUT_SECONDS,
+      maxRequestBodySize: config.registryMaxBodyBytes,
+      fetch: (request, server) => controller.handleRegistry(request, server),
+    });
   controller.audit('controller.started', {
     url: `${tls ? 'https' : 'http'}://${config.host}:${config.port}`,
     issuer: config.issuer,
     cluster: controller.kube.server,
     namespaces: tenantNamespaces(config.tenant),
+    whoamiPort: config.whoamiPort,
+    registryFrontPort: config.registryFrontPort,
   });
 }

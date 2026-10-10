@@ -101,7 +101,49 @@ export interface TenantAuthConfig {
   consolePublicUrl?: string;
   /** Controller URL shown to users and CLIs; `{tenant}` is replaced. Default `https://127.0.0.1:8788`. */
   controllerPublicUrl?: string;
+  /** Each tenant's own OCI registry (#83); absent, no registry is deployed. */
+  registry?: TenantRegistryConfig;
 }
+/**
+ * The per-tenant registry: the `platform/oci-registry` component, run as a WorkloadDeployment on
+ * the tenant's own hosts and backed by their data-plane blobstore. Its whoami callback goes to
+ * the controller's plain-HTTP whoami listener; users reach it through the controller's TLS
+ * registry front.
+ */
+export interface TenantRegistryConfig {
+  /** `ghcr.io/di-framework/oci-registry@sha256:<digest>`; always pinned by digest. */
+  component: string;
+  /**
+   * Registry origin users log in to; `{tenant}` is replaced. `https://<label>.{tenant}.localhost:<port>`
+   * on the gateway port is routed through the gateway (TLS passthrough to the registry front).
+   * Default `https://127.0.0.1:8790`, a port-forward to the registry front.
+   */
+  publicUrl?: string;
+  /**
+   * Bounds of the controller's registry front, each optional (the controller's default applies):
+   * rendered as `TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES`, `_UPSTREAM_TIMEOUT_MS`,
+   * `_MAX_CONCURRENT` and `_UPLOAD_IDLE_TIMEOUT_MS` on the controller Deployment.
+   */
+  limits?: TenantRegistryLimits;
+}
+/** Registry front bounds (S6 of the #83 review); positive integers. */
+export interface TenantRegistryLimits {
+  /** Largest request body, in bytes (default 512 MiB). */
+  maxBodyBytes?: number;
+  /** Wait for the registry's response headers once the request body is sent, in ms (default 60000). */
+  upstreamTimeoutMs?: number;
+  /** Registry requests in flight at once (default 16). */
+  maxConcurrent?: number;
+  /** How long an upload may deliver no byte before it is cut off, in ms (default 60000). */
+  uploadIdleTimeoutMs?: number;
+}
+/** The controller's plain-HTTP listener serving only `GET /v1/auth/whoami` (#83). */
+export const WHOAMI_PORT = 8789;
+/** The controller's TLS front for the tenant registry (#83). */
+export const REGISTRY_FRONT_PORT = 8790;
+/** The registry WorkloadDeployment in each tenant namespace. */
+export const REGISTRY_WORKLOAD = 'di-tenant-registry';
+const DEFAULT_REGISTRY_URL = `https://127.0.0.1:${REGISTRY_FRONT_PORT}`;
 /** Facts the controller gathers from the cluster for {@link tenantAuthResources}. */
 export interface TenantAuthInputs {
   /** Names of the tenant's active members; each may mint tokens for `di-user-<name>`. */
@@ -112,6 +154,14 @@ export interface TenantAuthInputs {
   tls: { cert: string; key: string };
   /** The shared OAuth client secret, base64 as read from the platform Secret; absent until it exists. */
   clientSecret?: string;
+  /**
+   * Whether the registry front may forward to the registry (W4/W6 of the #83 review): true only
+   * when the tenant is not suspended and no other workload claims the registry host. Registry
+   * readiness is deliberately not part of it, so it never changes the controller's pod template.
+   * Otherwise the controller is rendered without the front listener, so credentials are never
+   * sent to the tenant hosts.
+   */
+  registryServing?: boolean;
 }
 const TENANT_AUTH_IMAGE = /^[^@\s]+@sha256:[0-9a-f]{64}$/;
 /** Reject a tenant-auth config that would deploy an unpinned image or miss required fields. */
@@ -122,13 +172,42 @@ export function assertTenantAuthConfig(value: TenantAuthConfig | undefined): voi
   if (!URL.canParse(value.issuer ?? '')) throw new Error('tenantAuth.issuer must be a URL');
   if (!value.oauthClient?.id || !value.oauthClient.secretName)
     throw new Error('tenantAuth.oauthClient needs id and secretName');
+  if (value.registry === undefined) return;
+  if (!TENANT_AUTH_IMAGE.test(value.registry.component ?? ''))
+    throw new Error(
+      'tenantAuth.registry.component must be pinned by digest (<repository>@sha256:<digest>)',
+    );
+  if (value.registry.publicUrl !== undefined && !URL.canParse(value.registry.publicUrl))
+    throw new Error('tenantAuth.registry.publicUrl must be a URL');
+  const limits: unknown = value.registry.limits === undefined ? {} : value.registry.limits;
+  if (typeof limits !== 'object' || limits === null || Array.isArray(limits))
+    throw new Error('tenantAuth.registry.limits must be an object');
+  for (const [key, limit] of Object.entries(limits)) {
+    if (!REGISTRY_LIMIT_KEYS.includes(key))
+      throw new Error(
+        `tenantAuth.registry.limits.${key} is not a known limit (${REGISTRY_LIMIT_KEYS.join(', ')})`,
+      );
+    if (!Number.isSafeInteger(limit) || (limit as number) < 1)
+      throw new Error(`tenantAuth.registry.limits.${key} must be a positive integer`);
+  }
 }
+const REGISTRY_LIMIT_KEYS = [
+  'maxBodyBytes',
+  'upstreamTimeoutMs',
+  'maxConcurrent',
+  'uploadIdleTimeoutMs',
+];
 /** Route-host labels the platform gateway forwards to each tenant's console and controller. */
 export interface TenantAuthRoutes {
   /** `console` in `http://console.{tenant}.localhost:<port>`: plain HTTP to `tenant-console:8787`. */
   console?: string;
   /** `controller` in `https://controller.{tenant}.localhost:<port>`: TLS passthrough to `tenant-controller:8788`. */
   controller?: string;
+  /**
+   * The registry workload's `wasi:http` host (#83): TLS for `<registry>.{tenant}.localhost` is
+   * passed through to the controller's registry front (8790); plain HTTP to it is refused.
+   */
+  registry?: string;
 }
 const ROUTE_LABEL = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
 const DEFAULT_PORTS: Record<string, string> = { http: '80', https: '443' };
@@ -153,12 +232,24 @@ export function tenantAuthRoutes(
   const pattern = /^([a-z]+):\/\/[^/]*?(?::(\d+))?$/.exec((routeUrlPattern ?? '').toLowerCase());
   const gatewayScheme = pattern?.[1] ?? '';
   const gatewayPort = pattern?.[2] ?? DEFAULT_PORTS[gatewayScheme] ?? '';
-  const wanted = [
-    ['console', 'consolePublicUrl', 'http'],
-    ['controller', 'controllerPublicUrl', 'https'],
-  ] as const;
-  for (const [key, field, scheme] of wanted) {
-    const url = (auth?.[field] ?? '').toLowerCase();
+  const wanted: [keyof TenantAuthRoutes, string, string, string | undefined][] = [
+    ['console', 'consolePublicUrl', 'http', auth?.consolePublicUrl],
+    ['controller', 'controllerPublicUrl', 'https', auth?.controllerPublicUrl],
+    ...(auth?.registry
+      ? [
+          ['registry', 'registry.publicUrl', 'https', auth.registry.publicUrl] as [
+            'registry',
+            string,
+            string,
+            string | undefined,
+          ],
+        ]
+      : []),
+  ];
+  const owner = (label: string) =>
+    (Object.keys(routes) as (keyof TenantAuthRoutes)[]).find((key) => routes[key] === label);
+  for (const [key, field, scheme, value] of wanted) {
+    const url = (value ?? '').toLowerCase();
     const match = /^([a-z]+):\/\/([^/:]+)\.\{tenant\}\.localhost(?::(\d+))?\/?$/.exec(url);
     // No published gateway: nothing to route through (a port-forward or hosts entry serves it).
     if (!match || !routeUrlPattern) continue;
@@ -170,14 +261,51 @@ export function tenantAuthRoutes(
     else if (!ROUTE_LABEL.test(label)) problems.push(`tenantAuth.${field} host label is invalid`);
     else if (effectivePort !== gatewayPort)
       problems.push(`tenantAuth.${field} must use the gateway port ${gatewayPort}`);
-    else if (routes.console === label)
-      problems.push(`tenantAuth.${field} must not share the console host`);
+    else if (owner(label))
+      problems.push(`tenantAuth.${field} must not share the ${owner(label)} host`);
     else {
       routes[key] = label;
       urls[key] = url;
     }
   }
+  // The registry's HTTP host is always known to a published gateway, so a plain-HTTP request for
+  // it is refused even when users reach the registry another way (a port-forward).
+  if (auth?.registry && routeUrlPattern && !routes.registry) {
+    const label = registryHttpHost(auth);
+    const shared = `tenantAuth.registry.publicUrl must not share the ${owner(label)} host`;
+    if (!owner(label)) routes.registry = label;
+    else if (!problems.includes(shared)) problems.push(shared);
+  }
   return { routes, urls, problems };
+}
+/**
+ * The registry workload's `wasi:http` host: the route label of a gateway-shaped
+ * `registry.publicUrl`, otherwise `registry`. The controller's registry front sends it as `Host`.
+ */
+export function registryHttpHost(auth: TenantAuthConfig | undefined): string {
+  const match = /^[a-z]+:\/\/([^/:]+)\.\{tenant\}\.localhost(?::\d+)?\/?$/.exec(
+    (auth?.registry?.publicUrl ?? '').toLowerCase(),
+  );
+  return match && ROUTE_LABEL.test(match[1] as string) ? (match[1] as string) : 'registry';
+}
+/** The controller env for the registry front's bounds; unset limits keep the controller default. */
+function registryLimitsEnv(limits: TenantRegistryLimits | undefined): Record<string, string> {
+  const env: Record<string, string> = {};
+  const set = (name: string, value: number | undefined) => {
+    if (value !== undefined) env[`TENANT_CONTROLLER_REGISTRY_${name}`] = String(value);
+  };
+  set('MAX_BODY_BYTES', limits?.maxBodyBytes);
+  set('UPSTREAM_TIMEOUT_MS', limits?.upstreamTimeoutMs);
+  set('MAX_CONCURRENT', limits?.maxConcurrent);
+  set('UPLOAD_IDLE_TIMEOUT_MS', limits?.uploadIdleTimeoutMs);
+  return env;
+}
+/** The registry origin users log in to, with `{tenant}` replaced. */
+export function tenantRegistryPublicUrl(
+  tenant: string,
+  auth: TenantAuthConfig | undefined,
+): string {
+  return expandTenant(auth?.registry?.publicUrl ?? DEFAULT_REGISTRY_URL, tenant).replace(/\/$/, '');
 }
 /**
  * Replace the `{tenant}` placeholder in a tenant-auth public URL, in any case: routing matches it
@@ -440,12 +568,101 @@ function runtimeQuota(tenant: Tenant, cfg: ControllerConfig, withTenantAuth: boo
     },
   );
 }
+/**
+ * The tenant namespace quota. With `withRegistry` one WorkloadDeployment is added for the tenant
+ * registry (#83), so it never takes one of the tenant's own. Like {@link runtimeQuota}, it is
+ * raised only in the tenant-auth step right before the registry is applied, and stays raised
+ * only while the registry exists.
+ */
+function tenantQuota(tenant: Tenant, cfg: ControllerConfig, withRegistry: boolean): Resource {
+  const resources = tenant.spec.resources ?? {};
+  return resource(
+    tenant,
+    cfg.installation,
+    'v1',
+    'ResourceQuota',
+    'di-tenant-quota',
+    names(tenant.metadata.name).namespace,
+    {
+      spec: {
+        hard: {
+          'count/workloaddeployments.runtime.wasmcloud.dev': String(
+            (resources.workloads ?? 20) + (withRegistry ? 1 : 0),
+          ),
+          [`count/backingservices.${GROUP}`]: String(resources.backingServices ?? 10),
+          [`count/servicebindings.${GROUP}`]: String(resources.serviceBindings ?? 40),
+          'count/secrets': '100',
+          'count/configmaps': '100',
+          'count/services': '100',
+        },
+      },
+    },
+  );
+}
+/**
+ * Egress of `di-tenant-network`: the tenant's own namespaces, cluster DNS, the platform's NATS
+ * and registry, and public HTTPS. Tenant-auth pods get the same through `tenant-auth-network`.
+ */
+function tenantNetworkEgress(tenant: string, cfg: ControllerConfig): unknown[] {
+  const n = names(tenant);
+  return [
+    {
+      to: [n.namespace, n.runtimeNamespace].map((name) => ({
+        namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': name } },
+      })),
+    },
+    {
+      to: [
+        {
+          namespaceSelector: {
+            matchLabels: { 'kubernetes.io/metadata.name': 'kube-system' },
+          },
+          podSelector: {
+            matchExpressions: [{ key: 'k8s-app', operator: 'In', values: ['kube-dns', 'coredns'] }],
+          },
+        },
+      ],
+      ports: [
+        { protocol: 'UDP', port: 53 },
+        { protocol: 'TCP', port: 53 },
+      ],
+    },
+    {
+      to: [
+        {
+          namespaceSelector: {
+            matchLabels: { 'kubernetes.io/metadata.name': cfg.namespace },
+          },
+        },
+      ],
+      ports: [
+        { protocol: 'TCP', port: 4222 },
+        { protocol: 'TCP', port: 5000 },
+      ],
+    },
+    {
+      to: [
+        {
+          ipBlock: { cidr: '0.0.0.0/0', except: [...PRIVATE_IPV4_RANGES] },
+        },
+      ],
+      ports: [{ protocol: 'TCP', port: 443 }],
+    },
+  ];
+}
 function tenantResources(
   tenant: Tenant,
   cfg: ControllerConfig,
   schedulerSecret?: { data: Record<string, string> },
   storageKeys: string[] = [],
   tenantAuthQuota = false,
+  registryQuota = false,
+  /**
+   * Whether this tenant's `tenant-auth-network` exists (#83): only then are the tenant-auth pods
+   * left out of `di-tenant-network`, so an upgrade never isolates them before their own policy
+   * is in place, and a failed tenant-auth step keeps them on the broad policy.
+   */
+  tenantAuthNetwork = false,
 ): Resource[] {
   const n = names(tenant.metadata.name);
   const storage = hostStorage(tenant, cfg, storageKeys);
@@ -458,25 +675,13 @@ function tenantResources(
   ) => resource(tenant, cfg.installation, apiVersion, kind, name, namespace, body);
   const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
   const replicas = suspended ? 0 : (tenant.spec.runtime?.replicas ?? 1);
-  const resources = tenant.spec.resources ?? {};
   const workloadRead = {
     apiGroups: ['runtime.wasmcloud.dev'],
     resources: ['workloaddeployments', 'workloads', 'workloadreplicasets', 'artifacts'],
     verbs: readVerbs,
   };
   const result = [
-    make('v1', 'ResourceQuota', 'di-tenant-quota', n.namespace, {
-      spec: {
-        hard: {
-          'count/workloaddeployments.runtime.wasmcloud.dev': String(resources.workloads ?? 20),
-          [`count/backingservices.${GROUP}`]: String(resources.backingServices ?? 10),
-          [`count/servicebindings.${GROUP}`]: String(resources.serviceBindings ?? 40),
-          'count/secrets': '100',
-          'count/configmaps': '100',
-          'count/services': '100',
-        },
-      },
-    }),
+    tenantQuota(tenant, cfg, registryQuota),
     runtimeQuota(tenant, cfg, tenantAuthQuota),
     make('rbac.authorization.k8s.io/v1', 'Role', 'di-developer', n.namespace, {
       rules: [
@@ -558,13 +763,20 @@ function tenantResources(
     result.push(
       make('networking.k8s.io/v1', 'NetworkPolicy', 'di-tenant-network', namespace, {
         spec: {
-          // Broad tenant↔runtime allow for non-backend pods. Backends use di-bs-backend-network.
+          // Broad tenant↔runtime allow for non-backend pods. Backends use di-bs-backend-network;
+          // the tenant controller and console use tenant-auth-network, which admits the tenant
+          // hosts only to the controller's whoami listener (#83).
           podSelector: {
             matchExpressions: [
               {
                 key: `${GROUP}/component`,
                 operator: 'NotIn',
-                values: ['backing-service', 'backup-agent', 'backup-operator'],
+                values: [
+                  'backing-service',
+                  'backup-agent',
+                  'backup-operator',
+                  ...(tenantAuthNetwork ? ['tenant-auth'] : []),
+                ],
               },
             ],
           },
@@ -576,52 +788,7 @@ function tenantResources(
               })),
             },
           ],
-          egress: [
-            {
-              to: [n.namespace, n.runtimeNamespace].map((name) => ({
-                namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': name } },
-              })),
-            },
-            {
-              to: [
-                {
-                  namespaceSelector: {
-                    matchLabels: { 'kubernetes.io/metadata.name': 'kube-system' },
-                  },
-                  podSelector: {
-                    matchExpressions: [
-                      { key: 'k8s-app', operator: 'In', values: ['kube-dns', 'coredns'] },
-                    ],
-                  },
-                },
-              ],
-              ports: [
-                { protocol: 'UDP', port: 53 },
-                { protocol: 'TCP', port: 53 },
-              ],
-            },
-            {
-              to: [
-                {
-                  namespaceSelector: {
-                    matchLabels: { 'kubernetes.io/metadata.name': cfg.namespace },
-                  },
-                },
-              ],
-              ports: [
-                { protocol: 'TCP', port: 4222 },
-                { protocol: 'TCP', port: 5000 },
-              ],
-            },
-            {
-              to: [
-                {
-                  ipBlock: { cidr: '0.0.0.0/0', except: [...PRIVATE_IPV4_RANGES] },
-                },
-              ],
-              ports: [{ protocol: 'TCP', port: 443 }],
-            },
-          ],
+          egress: tenantNetworkEgress(tenant.metadata.name, cfg),
         },
       }),
     );
@@ -983,8 +1150,15 @@ function tenantControllerCertNames(
   const host = URL.canParse(tenantControllerPublicUrl(tenant, auth))
     ? new URL(tenantControllerPublicUrl(tenant, auth)).hostname
     : '';
-  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) ips.push(host);
-  else if (host && !host.startsWith('[')) dns.push(host);
+  // The registry front serves the same certificate, so it also names the registry's public host.
+  const registry =
+    auth?.registry && URL.canParse(tenantRegistryPublicUrl(tenant, auth))
+      ? new URL(tenantRegistryPublicUrl(tenant, auth)).hostname
+      : '';
+  for (const name of [host, registry]) {
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(name)) ips.push(name);
+    else if (name && !name.startsWith('[')) dns.push(name);
+  }
   return { dns: [...new Set(dns)], ips: [...new Set(ips)] };
 }
 /** Digest of the serving certificate; in both pod templates so a renewal rolls the pair. */
@@ -1056,6 +1230,7 @@ function tenantAuthResources(
     extraEnv: unknown[],
     volume: Record<string, unknown>,
     mountPath: string,
+    extraPorts: { containerPort: number; name: string }[] = [],
   ) =>
     make('apps/v1', 'Deployment', app, namespace, {
       spec: {
@@ -1101,7 +1276,7 @@ function tenantAuthResources(
                   ...Object.entries(env).map(([k, v]) => ({ name: k, value: v })),
                   ...extraEnv,
                 ],
-                ports: [{ containerPort: port, name: 'http' }],
+                ports: [{ containerPort: port, name: 'http' }, ...extraPorts],
                 readinessProbe: {
                   httpGet:
                     app === 'tenant-controller'
@@ -1155,10 +1330,24 @@ function tenantAuthResources(
         },
       },
     });
-  const service = (app: string, port: number) =>
+  const service = (app: string, port: number, extra: { port: number; name: string }[] = []) =>
     make('v1', 'Service', app, namespace, {
-      spec: { selector: { app }, ports: [{ port, targetPort: port, name: 'http' }] },
+      spec: {
+        selector: { app },
+        ports: [{ port, targetPort: port, name: 'http' }, ...extra].map((value) => ({
+          ...value,
+          targetPort: value.port,
+        })),
+      },
     });
+  const registry = auth.registry;
+  const registryHost = registryHttpHost(auth);
+  const hostPods = {
+    namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': namespace } },
+    podSelector: {
+      matchLabels: { 'wasmcloud.com/hostgroup': n.hostgroup, 'wasmcloud.com/name': 'hostgroup' },
+    },
+  };
   const publicUrl = (pattern: string | undefined, fallback: string) =>
     expandTenant(pattern ?? fallback, name);
   const [upstreamHost = '', upstreamPort = '80'] = (auth.issuerUpstream ?? '').split(':');
@@ -1303,16 +1492,45 @@ function tenantAuthResources(
       },
     }),
   );
+  // The pair is left out of di-tenant-network, so this is all the traffic it is part of beyond
+  // the gateway policies below: the same egress as the tenant's other pods, the console's calls
+  // to the controller, and (with a registry) the tenant hosts' calls to the whoami listener only.
+  result.push(
+    make('networking.k8s.io/v1', 'NetworkPolicy', 'tenant-auth-network', namespace, {
+      spec: {
+        podSelector: { matchLabels: { [COMPONENT]: 'tenant-auth' } },
+        policyTypes: ['Ingress', 'Egress'],
+        ingress: [
+          {
+            from: [
+              {
+                namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': namespace } },
+                podSelector: { matchLabels: { app: 'tenant-console' } },
+              },
+            ],
+            ports: [{ protocol: 'TCP', port: 8788 }],
+          },
+          ...(registry
+            ? [{ from: [hostPods], ports: [{ protocol: 'TCP', port: WHOAMI_PORT }] }]
+            : []),
+        ],
+        egress: tenantNetworkEgress(name, cfg),
+      },
+    }),
+  );
   // The platform gateway reaches the routed ports only: the console over HTTP, the controller
-  // as TLS passthrough (it terminates with its own certificate).
+  // and the registry front as TLS passthrough (they terminate with the controller certificate).
   const { routes } = tenantAuthRoutes(auth, cfg.routeUrlPattern);
   const routed = [
-    ...(routes.console ? [['tenant-console', 8787] as const] : []),
-    ...(routes.controller ? [['tenant-controller', 8788] as const] : []),
+    ...(routes.console ? [['tenant-console', 'tenant-console', 8787] as const] : []),
+    ...(routes.controller ? [['tenant-controller', 'tenant-controller', 8788] as const] : []),
+    ...(routes.registry
+      ? [['tenant-registry', 'tenant-controller', REGISTRY_FRONT_PORT] as const]
+      : []),
   ];
-  for (const [app, port] of routed)
+  for (const [policy, app, port] of routed)
     result.push(
-      make('networking.k8s.io/v1', 'NetworkPolicy', `${app}-gateway`, namespace, {
+      make('networking.k8s.io/v1', 'NetworkPolicy', `${policy}-gateway`, namespace, {
         spec: {
           podSelector: { matchLabels: { app } },
           policyTypes: ['Ingress'],
@@ -1360,10 +1578,29 @@ function tenantAuthResources(
         TENANT_CONTROLLER_PORT: '8788',
         TENANT_CONTROLLER_TLS_CERT: '/tls/tls.crt',
         TENANT_CONTROLLER_TLS_KEY: '/tls/tls.key',
+        ...(registry
+          ? {
+              TENANT_CONTROLLER_WHOAMI_PORT: String(WHOAMI_PORT),
+              TENANT_CONTROLLER_REGISTRY_HOST: registryHost,
+              ...registryLimitsEnv(registry.limits),
+            }
+          : {}),
+        ...(registry && inputs.registryServing
+          ? {
+              TENANT_CONTROLLER_REGISTRY_FRONT_PORT: String(REGISTRY_FRONT_PORT),
+              TENANT_CONTROLLER_REGISTRY_URL: tenantRegistryPublicUrl(name, auth),
+            }
+          : {}),
       },
       [],
       { secret: { secretName: 'tenant-controller-tls' } },
       '/tls',
+      registry
+        ? [
+            { containerPort: WHOAMI_PORT, name: 'whoami' },
+            { containerPort: REGISTRY_FRONT_PORT, name: 'registry' },
+          ]
+        : [],
     ),
     deployment(
       'tenant-console',
@@ -1388,10 +1625,88 @@ function tenantAuthResources(
       { configMap: { name: 'tenant-controller-ca' } },
       '/ca',
     ),
-    service('tenant-controller', 8788),
+    service(
+      'tenant-controller',
+      8788,
+      registry
+        ? [
+            { port: WHOAMI_PORT, name: 'whoami' },
+            { port: REGISTRY_FRONT_PORT, name: 'registry' },
+          ]
+        : [],
+    ),
     service('tenant-console', 8787),
   );
+  if (registry) result.push(registryWorkload(tenant, cfg, registry, registryHost));
   return result;
+}
+/**
+ * The tenant registry (#83): `platform/oci-registry` on the tenant's own hosts. Its storage is
+ * the unnamed blobstore with no references, i.e. the host data store on the tenant's `di-nats`.
+ * The component reads the whoami URL and the tenant through `wasmcloud:secrets` bind-time config;
+ * admission admits that interface from the platform controller only, so a tenant cannot repoint
+ * it. The plain-HTTP whoami URL is in-cluster (`*.svc`), as the component requires.
+ */
+function registryWorkload(
+  tenant: Tenant,
+  cfg: ControllerConfig,
+  registry: TenantRegistryConfig,
+  host: string,
+): Resource {
+  const name = tenant.metadata.name;
+  const n = names(name);
+  const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
+  const whoami = `tenant-controller.${n.runtimeNamespace}.svc:${WHOAMI_PORT}`;
+  const value = resource(
+    tenant,
+    cfg.installation,
+    'runtime.wasmcloud.dev/v1alpha1',
+    'WorkloadDeployment',
+    REGISTRY_WORKLOAD,
+    n.namespace,
+    {
+      spec: {
+        replicas: suspended ? 0 : 1,
+        template: {
+          spec: {
+            environment: n.namespace,
+            hostSelector: { hostgroup: n.hostgroup },
+            components: [
+              {
+                name: 'oci-registry',
+                image: registry.component,
+                // Hosts run with --socket-egress=enforce; the whoami call is the only egress.
+                localResources: { allowedHosts: [whoami] },
+              },
+            ],
+            hostInterfaces: [
+              {
+                namespace: 'wasi',
+                package: 'http',
+                version: '0.3.0',
+                interfaces: ['handler'],
+                config: { host },
+              },
+              {
+                namespace: 'wasmcloud',
+                package: 'blobstore',
+                version: '0.1.0',
+                interfaces: ['blobstore', 'container', 'types'],
+              },
+              {
+                namespace: 'wasmcloud',
+                package: 'secrets',
+                interfaces: ['store', 'reveal'],
+                config: { 'tenant-controller-url': `http://${whoami}`, tenant: name },
+              },
+            ],
+          },
+        },
+      },
+    },
+  );
+  value.metadata.labels![COMPONENT] = 'tenant-auth';
+  return value;
 }
 
 export type {
@@ -1445,11 +1760,13 @@ export {
   names,
   OWNER,
   ROUTES_CONFIG_NAME,
+  registryWorkload,
   resource,
   runtimeQuota,
   TENANT,
   tenantAuthResources,
   tenantControllerCertNames,
+  tenantQuota,
   tenantResources,
   tlsCertDigest,
   USER,

@@ -162,4 +162,12 @@ describe('tenant-auth gateway routes (#58:routes)', () => {
     ).toHaveLength(3);
     expect(gatewayNetworkPolicySpec('wasmcloud', 'di-test').egress).toHaveLength(2);
   });
+
+  it('reaches the controller registry front when the registry is routed (#83)', () => {
+    const egress = gatewayNetworkPolicySpec('wasmcloud', 'di-test', { registry: 'registry' })
+      .egress as { to: { podSelector: unknown }[]; ports: unknown[] }[];
+    expect(egress).toHaveLength(3);
+    expect(egress[2]?.to[0]?.podSelector).toEqual({ matchLabels: { app: 'tenant-controller' } });
+    expect(egress[2]?.ports).toEqual([{ protocol: 'TCP', port: 8790 }]);
+  });
 });

@@ -933,6 +933,14 @@ async function checked(
 ): Promise<Response> {
   const reason = invalid(bundle);
   if (reason) return problem(422, 'Unprocessable Entity', reason);
+  // The workload's HTTP host is `<service>-<env>`; it must not be the tenant registry's.
+  const host = `${bundle.service}-${bundle.env}`;
+  if (host === context.registryHost?.toLowerCase())
+    return problem(
+      422,
+      'Unprocessable Entity',
+      `${host} is reserved for the tenant registry; choose another service name`,
+    );
   const refs = await configRefs(bundle, context);
   if (refs instanceof Response) return refs;
   return handler(refs);
@@ -984,6 +992,12 @@ export const deploy: V1Module = {
   // The credential is the caller's own identity token or API key, which the registry checks
   // against this controller's whoami (platform#83); nothing is minted and no Secret is read.
   registry: async (_command, _call, context) => {
+    if (!context.registryUrl && context.registryConfigured)
+      return problem(
+        503,
+        'Service Unavailable',
+        "the tenant registry is not available; see the Tenant's TenantAuthReady condition",
+      );
     if (!context.registryUrl)
       return problem(503, 'Service Unavailable', 'no registry is configured for this tenant');
     return Response.json({ url: context.registryUrl, auth: 'basic-identity', username: 'token' });

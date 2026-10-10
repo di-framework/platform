@@ -176,11 +176,13 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
       verbs: ['get', 'list', 'watch'],
     },
     {
-      // Read for the logs projection; patch only sets the platform storage volume (#11)
-      // and approved egress (#13).
+      // Read for the logs projection; patch sets the platform storage volume (#11) and approved
+      // egress (#13). create and delete serve only the tenant registry workload (#83): its
+      // server-side apply is authorized as create while it does not exist, and unsetting
+      // tenantAuth.registry deletes it. No update: every write is a server-side apply PATCH.
       apiGroups: ['runtime.wasmcloud.dev'],
       resources: ['workloaddeployments'],
-      verbs: ['get', 'list', 'watch', 'patch'],
+      verbs: ['get', 'list', 'watch', 'create', 'patch', 'delete'],
     },
     {
       apiGroups: ['apps'],

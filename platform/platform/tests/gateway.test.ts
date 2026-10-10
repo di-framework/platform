@@ -26,6 +26,7 @@ import {
   endToEndHeaders,
   type GatewayOptions,
   main,
+  registryUpstream,
   routeRequest,
   serverName,
   tenantUpstream,
@@ -819,6 +820,7 @@ describe('edge timeouts and HTTP handoff (#58:routes)', () => {
   let gateway: Server;
   let edge: NetServer;
   let port: number;
+  const upgraded: Socket[] = [];
 
   beforeEach(async () => {
     upstream = createServer((req, res) => {
@@ -826,6 +828,7 @@ describe('edge timeouts and HTTP handoff (#58:routes)', () => {
       res.end(`ok ${req.url}`);
     });
     upstream.on('upgrade', (_req, socket: Socket) => {
+      upgraded.push(socket);
       socket.write(
         'HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n',
       );
@@ -852,6 +855,9 @@ describe('edge timeouts and HTTP handoff (#58:routes)', () => {
   afterEach(async () => {
     gateway.closeAllConnections();
     gateway.close();
+    // Upgraded sockets are not HTTP connections, so closeAllConnections leaves them open and
+    // the servers would wait for them.
+    for (const socket of upgraded.splice(0)) socket.destroy();
     await new Promise((resolve) => edge.close(resolve));
     upstream.closeAllConnections();
     await new Promise((resolve) => upstream.close(resolve));
@@ -975,5 +981,91 @@ describe('edge timeouts and HTTP handoff (#58:routes)', () => {
     // Classified within 100 ms, so the pipe outlives the classification timeout.
     expect(result.open).toBeGreaterThanOrEqual(150);
     expect(result.open).toBeLessThan(2_000);
+  });
+});
+
+describe('tenant registry route (#83:reconcile)', () => {
+  const pem = selfSignedCertificate('tenant-controller', ['registry.alpha.localhost'], [], 30);
+  let front: TlsServer;
+  let gateway: Server;
+  let edge: NetServer;
+  let port: number;
+  let log: ReturnType<typeof spyOn>;
+
+  beforeEach(async () => {
+    log = spyOn(console, 'error').mockImplementation(() => {});
+    front = createTlsServer({ cert: pem.cert, key: pem.key }, (socket) =>
+      socket.end('registry front says hi'),
+    );
+    await new Promise<void>((resolve) => front.listen(0, '127.0.0.1', resolve));
+    const frontPort = (front.address() as { port: number }).port;
+    const options: GatewayOptions = {
+      defaultUpstream: { hostname: '127.0.0.1', port: 1 },
+      tenantAuthRoutes: { registry: 'registry' },
+      registryUpstream: (tenant) => {
+        expect(tenant).toBe('alpha');
+        return { hostname: '127.0.0.1', port: frontPort };
+      },
+    };
+    gateway = createGateway(options);
+    edge = createEdge(gateway, options);
+    port = await listen(edge as Server);
+  });
+
+  afterEach(async () => {
+    log.mockRestore();
+    gateway.close();
+    await new Promise((resolve) => edge.close(resolve));
+    front.close();
+  });
+
+  const tlsThrough = (servername: string) =>
+    new Promise<string>((resolve) => {
+      const socket = tlsConnect({ host: '127.0.0.1', port, servername, ca: pem.cert });
+      let data = '';
+      socket.setEncoding('utf8');
+      socket.on('data', (chunk) => {
+        data += chunk;
+      });
+      socket.on('error', () => resolve('closed'));
+      socket.on('close', () => resolve(data || 'closed'));
+    });
+
+  it('names the controller registry front', () => {
+    expect(registryUpstream('alpha')).toEqual({
+      hostname: 'tenant-controller.di-runtime-alpha.svc.cluster.local',
+      port: 8790,
+    });
+  });
+
+  it('passes TLS for the registry host through to the registry front', async () => {
+    expect(await tlsThrough('registry.alpha.localhost')).toBe('registry front says hi');
+    expect(await tlsThrough('controller.alpha.localhost')).toBe('closed');
+  });
+
+  it('refuses the registry host over plain HTTP', async () => {
+    const res = await send(port, { headers: { host: 'registry.alpha.localhost:28180' } });
+    expect(res.status).toBe(400);
+    expect(res.body).toContain('the registry host is served over TLS only');
+  });
+
+  it('listens through the edge when only the registry is routed', async () => {
+    const free = createNetServer();
+    const target = await listen(free as Server);
+    await new Promise((resolve) => free.close(resolve));
+    const signals = new EventEmitter();
+    const server = main(
+      {
+        GATEWAY_CONFIG: JSON.stringify({
+          port: target,
+          defaultUpstream: '127.0.0.1',
+          tenantAuthRoutes: { registry: 'registry' },
+        }),
+      },
+      signals,
+    );
+    expect(server.listening).toBe(false); // the edge listens in front of it
+    signals.emit('SIGTERM');
+    await Bun.sleep(20);
   });
 });

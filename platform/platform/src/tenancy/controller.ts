@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { request } from 'node:https';
 import { setTimeout } from 'node:timers/promises';
+import { claimsRegistryHost } from './admission';
 import {
   backingServiceResourceName,
   backingServiceResources,
@@ -60,8 +61,10 @@ import {
   NAMESPACE_ROLE,
   names,
   OWNER,
+  REGISTRY_WORKLOAD,
   type Resource,
   ROUTES_CONFIG_NAME,
+  registryHttpHost,
   resource,
   runtimeQuota,
   type ServiceBinding,
@@ -72,6 +75,7 @@ import {
   tenantAuthResources,
   tenantAuthRoutes,
   tenantControllerCertNames,
+  tenantQuota,
   tenantResources,
   type User,
   userResources,
@@ -256,6 +260,8 @@ const TENANT_AUTH_KINDS = [
   ['v1', 'Secret'],
   ['v1', 'ConfigMap'],
   ['v1', 'ServiceAccount'],
+  // The tenant registry (#83) carries the same component label.
+  ['runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment'],
 ] as const;
 
 export class Controller {
@@ -549,6 +555,8 @@ export class Controller {
       secret,
       storageKeys(workloads),
       await this.tenantAuthDeployed(tenant),
+      await this.registryDeployed(tenant),
+      await this.tenantAuthNetworkApplied(tenant),
     );
     let ready = !!secret;
     let failure: unknown;
@@ -629,19 +637,23 @@ export class Controller {
         return undefined;
       }
       this.tenantAuthClean = false;
-      const desired = tenantAuthResources(
-        tenant,
-        this.cfg,
-        await this.tenantAuthInputs(
+      const registry = await this.registryState(tenant);
+      const desired = tenantAuthResources(tenant, this.cfg, {
+        ...(await this.tenantAuthInputs(
           tenant,
           users ??
             (await this.list<User>(VERSION, 'User', { [INSTALLATION]: this.cfg.installation })),
-        ),
-      );
+        )),
+        registryServing: registry.serving,
+      });
       // Gateway policies for hosts that are no longer routed, pruned before anything is applied
       // so de-routing holds even when a later apply fails.
       const namespace = names(tenant.metadata.name).runtimeNamespace;
-      for (const policy of ['tenant-console-gateway', 'tenant-controller-gateway']) {
+      for (const policy of [
+        'tenant-console-gateway',
+        'tenant-controller-gateway',
+        'tenant-registry-gateway',
+      ]) {
         if (desired.some((value) => value.metadata.name === policy)) continue;
         const stale = await this.get<Resource>(
           `${collection('networking.k8s.io/v1', 'NetworkPolicy', namespace)}/${policy}`,
@@ -652,11 +664,32 @@ export class Controller {
         )
           await this.remove(stale);
       }
-      // Raise the quota right before the pair so its pods fit when they are created (#121).
+      // The registry is no longer configured: remove it, then give its workload slot back.
+      if (!this.cfg.tenantAuth.registry) {
+        const stale = await this.get<Resource>(
+          `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', names(tenant.metadata.name).namespace)}/${REGISTRY_WORKLOAD}`,
+        );
+        if (
+          stale?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+          stale.metadata.labels[OWNER] === tenant.metadata.uid
+        ) {
+          await this.remove(stale);
+          await this.ensure(tenantQuota(tenant, this.cfg, false));
+        }
+      }
+      // Raise the quota right before the pair so its pods fit when they are created (#121), and
+      // the tenant quota right before the registry so it takes no workload slot of the tenant's.
       await this.ensure(runtimeQuota(tenant, this.cfg, true));
+      if (this.cfg.tenantAuth.registry) await this.ensure(tenantQuota(tenant, this.cfg, true));
       let ready = true;
+      const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
       for (const value of desired) {
         const applied = await this.ensure(value);
+        if (value.kind === 'WorkloadDeployment' && !suspended) {
+          const conditions = (applied.status as { conditions?: Condition[] } | undefined)
+            ?.conditions;
+          ready &&= !!conditions?.some((c) => c.type === 'Ready' && c.status === 'True');
+        }
         if (value.kind === 'Deployment') {
           const spec = applied.spec as { replicas: number };
           const status = applied.status as
@@ -669,9 +702,19 @@ export class Controller {
       }
       const { problems } = tenantAuthRoutes(this.cfg.tenantAuth, this.cfg.routeUrlPattern);
       if (problems.length) return condition(false, 'RouteError', problems.join('; '));
+      if (registry.conflict)
+        return condition(
+          false,
+          'RegistryHostConflict',
+          `WorkloadDeployment ${registry.conflict} claims the tenant registry host ` +
+            `${registryHttpHost(this.cfg.tenantAuth)}; the registry is not served until it is removed`,
+        );
+      const what = this.cfg.tenantAuth.registry
+        ? 'tenant controller, console and registry'
+        : 'tenant controller and console';
       return ready
-        ? condition(true, 'Reconciled', 'Tenant controller and console are ready')
-        : condition(false, 'Provisioning', 'Waiting for the tenant controller and console');
+        ? condition(true, 'Reconciled', `T${what.slice(1)} are ready`)
+        : condition(false, 'Provisioning', `Waiting for the ${what}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Tenant-auth reconcile failed';
       console.error(`Tenant/${tenant.metadata.name} tenant-auth: ${message}`);
@@ -680,11 +723,65 @@ export class Controller {
         // Never leave the quota raised for a pair that was not applied (#121).
         if (!(await this.tenantAuthDeployed(tenant)))
           await this.ensure(runtimeQuota(tenant, this.cfg, false));
+        if (!(await this.registryDeployed(tenant)))
+          await this.ensure(tenantQuota(tenant, this.cfg, false));
       } catch {
         /* The tenant step lowers it on the next poll. */
       }
       return condition(false, 'ReconcileError', message);
     }
+  }
+  /**
+   * Whether the registry front may forward (W4 of the #83 review). Admission checks only writes,
+   * so a workload that claimed the registry host before the reservation (or before a
+   * `registry.publicUrl` change) keeps its route, and wash picks randomly among claimants. The
+   * front is therefore enabled only while the tenant is not suspended and no other workload claims
+   * the registry host through `wasi:http` `config.host` or `host-aliases`. The registry's own
+   * readiness is not part of the gate (W6): an unready registry has no route, so nothing else sees
+   * the credentials, and gating on it would restart the controller on every registry blip. It is
+   * reported on `TenantAuthReady` instead. `conflict` names the first claimant.
+   */
+  private async registryState(tenant: Tenant): Promise<{ serving: boolean; conflict?: string }> {
+    if (!this.cfg.tenantAuth?.registry) return { serving: false };
+    const label = registryHttpHost(this.cfg.tenantAuth);
+    const workloads = await this.list<
+      Resource & {
+        spec?: {
+          template?: {
+            spec?: {
+              hostInterfaces?: {
+                namespace?: string;
+                package?: string;
+                config?: Record<string, unknown>;
+              }[];
+            };
+          };
+        };
+        status?: { conditions?: Condition[] };
+      }
+    >(
+      'runtime.wasmcloud.dev/v1alpha1',
+      'WorkloadDeployment',
+      {},
+      names(tenant.metadata.name).namespace,
+    );
+    const owned = (w: Resource) =>
+      w.metadata.name === REGISTRY_WORKLOAD &&
+      w.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+      w.metadata.labels[OWNER] === tenant.metadata.uid;
+    const claims = (w: (typeof workloads)[number]) =>
+      (w.spec?.template?.spec?.hostInterfaces ?? []).some((h) => {
+        if (h.namespace !== 'wasi' || h.package !== 'http') return false;
+        const { host, 'host-aliases': aliases } = h.config ?? {};
+        const hosts = [
+          ...(typeof host === 'string' ? [host] : []),
+          ...(typeof aliases === 'string' ? aliases.split(',') : []),
+        ];
+        return hosts.some((value) => claimsRegistryHost(value.trim(), label));
+      });
+    const conflict = workloads.find((w) => !owned(w) && claims(w))?.metadata.name;
+    const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
+    return { serving: !suspended && !conflict, conflict };
   }
   /** Whether the tenant-auth Deployments of `tenant` exist, i.e. the quota may stay raised. */
   private async tenantAuthDeployed(tenant: Tenant): Promise<boolean> {
@@ -700,6 +797,36 @@ export class Controller {
       names(tenant.metadata.name).runtimeNamespace,
     );
     return deployments.length > 0;
+  }
+  /**
+   * Whether this tenant's `tenant-auth-network` exists, i.e. `di-tenant-network` may leave the
+   * tenant-auth pods out (S1 of the #83 review): it is applied by the tenant-auth step, which
+   * runs after the tenant step, so the narrowing follows on the next poll.
+   */
+  private async tenantAuthNetworkApplied(tenant: Tenant): Promise<boolean> {
+    if (!this.cfg.tenantAuth) return false;
+    const policy = await this.get<Resource>(
+      `${collection('networking.k8s.io/v1', 'NetworkPolicy', names(tenant.metadata.name).runtimeNamespace)}/tenant-auth-network`,
+    );
+    return (
+      policy?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+      policy.metadata.labels[OWNER] === tenant.metadata.uid
+    );
+  }
+  /** Whether the tenant registry of `tenant` exists, i.e. the tenant quota may stay raised. */
+  private async registryDeployed(tenant: Tenant): Promise<boolean> {
+    if (!this.cfg.tenantAuth?.registry) return false;
+    const workloads = await this.list<Resource>(
+      'runtime.wasmcloud.dev/v1alpha1',
+      'WorkloadDeployment',
+      {
+        [INSTALLATION]: this.cfg.installation,
+        [OWNER]: tenant.metadata.uid!,
+        [COMPONENT]: 'tenant-auth',
+      },
+      names(tenant.metadata.name).namespace,
+    );
+    return workloads.length > 0;
   }
   /**
    * Delete every tenant-auth object this installation created for `tenant`, including the
@@ -1383,6 +1510,13 @@ export class Controller {
         )
       )?.items ?? [];
     for (const workload of workloads) {
+      // The tenant registry's egress (its whoami call) is the platform's own, not a grant.
+      if (
+        workload.metadata.name === REGISTRY_WORKLOAD &&
+        workload.metadata.labels?.[OWNER] === tenant.metadata.uid &&
+        workload.metadata.labels?.[INSTALLATION] === this.cfg.installation
+      )
+        continue;
       const approved = grants.get(workload.metadata.name) ?? [];
       const patch = egressPatch(
         { ...workload, metadata: { ...workload.metadata, namespace: n.namespace } },

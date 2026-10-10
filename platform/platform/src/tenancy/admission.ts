@@ -4,6 +4,7 @@ import {
   GROUP,
   INSTALLATION,
   OWNER,
+  REGISTRY_WORKLOAD,
   type Resource,
   ROUTES_CONFIG_NAME,
   TENANT,
@@ -85,7 +86,10 @@ export interface HostInterfaceLike {
  * Mirrors the workload ValidatingAdmissionPolicy CEL (fail-closed).
  * Unnamed backend selection is denied except the transitional stock keyvalue path.
  */
-export function hostInterfaceAllowed(hostInterface: HostInterfaceLike): boolean {
+export function hostInterfaceAllowed(
+  hostInterface: HostInterfaceLike,
+  requester?: { username: string; controllerNamespace: string },
+): boolean {
   const { namespace, package: packageName, name } = hostInterface;
   const configFrom = hostInterface.configFrom ?? [];
   const secretFrom = hostInterface.secretFrom ?? [];
@@ -105,6 +109,14 @@ export function hostInterfaceAllowed(hostInterface: HostInterfaceLike): boolean 
   }
 
   if (namespace !== 'wasmcloud') return false;
+  // Bind-time config for the tenant registry (#83): only the platform controller may set it.
+  if (packageName === 'secrets')
+    return (
+      requester?.username ===
+        `system:serviceaccount:${requester?.controllerNamespace}:di-platform-controller` &&
+      !hasName &&
+      !hasReferences
+    );
   if (packageName === 'postgres') {
     if (configKeys.length > 0 || configFrom.length > 0) return false;
     if (!hasName)
@@ -452,8 +464,14 @@ function hostInterfaceAdmissionExpression(): string {
          (h.interfaces == ['prepared'] && h.name.endsWith('-prepared') && size(h.name) > 9 &&
           h.secretFrom[0].name == '${BINDING_CONFIG_PREFIX}' + h.name.substring(0, size(h.name) - 9) + '-creds')))))`;
 
+  // Bind-time config for the tenant registry (#83): only the platform controller may set it, so a
+  // tenant can neither repoint the registry's whoami URL nor read other config through it.
+  const secrets = `(variables.controller && h['namespace'] == 'wasmcloud' &&
+    h['package'] == 'secrets' && ${unnamed} && ${noSecretReferences} && ${noConfigReferences})`;
+
   return `!has(variables.w.hostInterfaces) || variables.w.hostInterfaces.all(h,
-    (${wasi} || ${wasiLogging} || ${keyvalue} || ${messaging} || ${blobstore} || ${postgres}))`;
+    (${wasi} || ${wasiLogging} || ${keyvalue} || ${messaging} || ${blobstore} || ${postgres} ||
+      ${secrets}))`;
 }
 
 function localsOf(spec: string): string {
@@ -561,6 +579,106 @@ function workloadPolicy(namespace: string): AdmissionPolicy {
         expression: hostInterfaceAdmissionExpression(),
         message:
           'Only wasi http/config or logging, or wasmcloud keyvalue/messaging/blobstore/postgres with controller-managed di-bs-/di-binding- (or transitional di-tenant-stock / default NATS / host blobstore) references are allowed',
+      },
+    ],
+  };
+}
+
+/** The tenant registry WorkloadDeployment the platform controller owns in each tenant namespace (#83). */
+export const REGISTRY_WORKLOAD_NAME = REGISTRY_WORKLOAD;
+/** Label value marking platform-owned tenant-auth objects, including the registry workload. */
+export const TENANT_AUTH_COMPONENT = 'tenant-auth';
+const COMPONENT_LABEL = `${GROUP}/component`;
+/** Denial for a tenant user's change to the platform-owned registry workload (#83). */
+export const REGISTRY_RESERVED_MESSAGE =
+  'di-tenant-registry and WorkloadDeployments labelled platform.di-framework.dev/component=tenant-auth are managed by the platform controller';
+/** Denial for a tenant user's workload claiming the registry's wasi:http host (#83). */
+export const REGISTRY_HOST_MESSAGE =
+  "Tenant workloads cannot claim the tenant registry's wasi:http host";
+
+/**
+ * Whether a `wasi:http` `config.host` claims the registry host: compared in lower case, also with
+ * a trailing dot or a port, since a Host header match ignores case and either may be normalized.
+ */
+export function claimsRegistryHost(host: string, registryHost: string): boolean {
+  const value = host.toLowerCase();
+  const label = registryHost.toLowerCase();
+  return value === label || value === `${label}.` || value.startsWith(`${label}:`);
+}
+
+interface ReservedWorkloadLike {
+  metadata?: { name?: string; labels?: Record<string, string> };
+  spec?: { template?: { spec?: { hostInterfaces?: HostInterfaceLike[] } } };
+}
+
+/**
+ * Mirrors the `reserved-workloads` CEL rules (#83): the denial message, or undefined if allowed.
+ * The registry front sends every registry user's credentials to whatever serves the registry host
+ * on the tenant's `di-http`, so a tenant user may neither change the registry workload (by name or
+ * by the tenant-auth label, on the new or the old object) nor serve that host from another one.
+ */
+export function reservedWorkloadDenial(input: {
+  username: string;
+  controllerNamespace: string;
+  operation: 'CREATE' | 'UPDATE' | 'DELETE';
+  registryHost: string;
+  object?: ReservedWorkloadLike;
+  oldObject?: ReservedWorkloadLike;
+}): string | undefined {
+  if (!input.username.startsWith(`system:serviceaccount:${input.controllerNamespace}:di-user-`))
+    return undefined;
+  const current = input.operation === 'DELETE' ? undefined : input.object;
+  const old = input.operation === 'CREATE' ? undefined : input.oldObject;
+  const name = (input.operation === 'DELETE' ? old : current)?.metadata?.name;
+  const labelled = (value: ReservedWorkloadLike | undefined) =>
+    value?.metadata?.labels?.[COMPONENT_LABEL] === TENANT_AUTH_COMPONENT;
+  if (name === REGISTRY_WORKLOAD_NAME || labelled(current) || labelled(old))
+    return REGISTRY_RESERVED_MESSAGE;
+  const claims = (current?.spec?.template?.spec?.hostInterfaces ?? []).some(
+    (h) =>
+      h.namespace === 'wasi' &&
+      h.package === 'http' &&
+      typeof h.config?.host === 'string' &&
+      claimsRegistryHost(h.config.host, input.registryHost),
+  );
+  return claims ? REGISTRY_HOST_MESSAGE : undefined;
+}
+
+/**
+ * Reserve the tenant registry against tenant users (#83), on CREATE, UPDATE and DELETE. Only
+ * `di-user-*` requests are checked, so the controller, the wasmCloud operator and every other
+ * delete keep working; a tenant user's other deletes pass because only the name and the label of
+ * the old object are inspected.
+ */
+function reservedWorkloadPolicy(namespace: string, registryHost: string): AdmissionPolicy {
+  const developer = `request.userInfo.username.startsWith('system:serviceaccount:${namespace}:di-user-')`;
+  const label = registryHost.toLowerCase();
+  const labelled = (value: string) =>
+    `(has(${value}.metadata.labels) && '${COMPONENT_LABEL}' in ${value}.metadata.labels &&
+      ${value}.metadata.labels['${COMPONENT_LABEL}'] == '${TENANT_AUTH_COMPONENT}')`;
+  return {
+    name: 'reserved-workloads',
+    apiGroups: ['runtime.wasmcloud.dev'],
+    resources: ['workloaddeployments'],
+    operations: ['CREATE', 'UPDATE', 'DELETE'],
+    validations: [
+      {
+        expression: `!${developer} || !(
+          (request.operation == 'DELETE' ? oldObject.metadata.name : object.metadata.name) == '${REGISTRY_WORKLOAD_NAME}' ||
+          (request.operation != 'DELETE' && ${labelled('object')}) ||
+          (request.operation != 'CREATE' && ${labelled('oldObject')}))`,
+        message: REGISTRY_RESERVED_MESSAGE,
+      },
+      {
+        expression: `!${developer} || request.operation == 'DELETE' ||
+          !has(object.spec.template.spec.hostInterfaces) ||
+          !object.spec.template.spec.hostInterfaces.exists(h,
+            h['namespace'] == 'wasi' && h['package'] == 'http' &&
+            has(h.config) && 'host' in h.config && (
+              h.config['host'].lowerAscii() == '${label}' ||
+              h.config['host'].lowerAscii() == '${label}.' ||
+              h.config['host'].lowerAscii().startsWith('${label}:')))`,
+        message: REGISTRY_HOST_MESSAGE,
       },
     ],
   };
@@ -719,10 +837,16 @@ function ownershipLabelsExpression(installation: string): string {
 }
 
 /** The controller's runtime credentials must never become guest capabilities. */
-export function admissionResources(installation: string, namespace: string): Resource[] {
+export function admissionResources(
+  installation: string,
+  namespace: string,
+  /** The registry workload's `wasi:http` host (`registryHttpHost`), reserved against tenant users. */
+  registryHost = 'registry',
+): Resource[] {
   const ownershipLabels = ownershipLabelsExpression(installation);
   const policies: AdmissionPolicy[] = [
     workloadPolicy(namespace),
+    reservedWorkloadPolicy(namespace, registryHost),
     backendConfigPolicy(namespace),
     tenantSecretDeletePolicy(namespace),
     tenantSecretUpdatePolicy(namespace),

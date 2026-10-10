@@ -8,6 +8,10 @@
  * With tenant-auth routes configured (#58), `<console>.<tenant>.localhost` reaches that tenant's
  * `tenant-console` over HTTP, and a TLS connection whose SNI is `<controller>.<tenant>.localhost`
  * is passed through, unterminated, to `tenant-controller`, which serves its own certificate.
+ * With a tenant registry (#83), TLS for `<registry>.<tenant>.localhost` is passed through to the
+ * controller's registry front (8790), which terminates it with the same certificate and forwards
+ * to the tenant hosts; plain HTTP to that host is refused, so registry credentials never cross
+ * plain HTTP outside the cluster.
  */
 import {
   Agent,
@@ -45,11 +49,13 @@ export interface GatewayOptions {
   /** Idle time allowed on an upstream connection before the response completes. */
   upstreamTimeoutMs?: number;
   /** Route-host labels for each tenant's console and controller; absent, neither is routed. */
-  tenantAuthRoutes?: { console?: string; controller?: string };
+  tenantAuthRoutes?: { console?: string; controller?: string; registry?: string };
   /** Where a console route is sent; only overridden by tests. */
   consoleUpstream?: (tenant: string) => Upstream;
   /** Where a controller TLS connection is sent; only overridden by tests. */
   controllerUpstream?: (tenant: string) => Upstream;
+  /** Where a registry TLS connection is sent; only overridden by tests. */
+  registryUpstream?: (tenant: string) => Upstream;
   /** Edge only: time a new connection has to send enough bytes to be classified (default 10 s). */
   classifyTimeoutMs?: number;
   /** Edge only: idle time allowed on a controller passthrough pipe (default 5 min). */
@@ -105,6 +111,10 @@ export function consoleUpstream(tenant: string): Upstream {
 
 export function controllerUpstream(tenant: string): Upstream {
   return { hostname: `tenant-controller.di-runtime-${tenant}.svc.cluster.local`, port: 8788 };
+}
+
+export function registryUpstream(tenant: string): Upstream {
+  return { hostname: `tenant-controller.di-runtime-${tenant}.svc.cluster.local`, port: 8790 };
 }
 
 /** Largest TLS plaintext record: a 5-byte header and at most 16 KiB of body (RFC 8446 5.1). */
@@ -169,7 +179,10 @@ function recordLength(buffer: Buffer): number {
   return buffer.length < 5 ? 5 : 5 + buffer.readUInt16BE(3);
 }
 
-/** Pipe a TLS connection for `<controller>.<tenant>.localhost` to that tenant's controller. */
+/**
+ * Pipe a TLS connection for `<controller>.<tenant>.localhost` to that tenant's controller, or for
+ * `<registry>.<tenant>.localhost` to the controller's registry front.
+ */
 function passThrough(socket: Socket, hello: Buffer, options: GatewayOptions): void {
   const name = serverName(hello);
   // Fail closed, logged once per connection; never log the hello or the name it carries.
@@ -178,11 +191,20 @@ function passThrough(socket: Socket, hello: Buffer, options: GatewayOptions): vo
       `${socket.remoteAddress}: closing a TLS connection whose ClientHello has no readable server name (malformed, or split across records)`,
     );
   const route = routeRequest(name);
-  if (route.kind !== 'tenant' || route.host !== options.tenantAuthRoutes?.controller) {
+  const routes = options.tenantAuthRoutes;
+  const upstreamFor =
+    route.kind !== 'tenant'
+      ? undefined
+      : route.host === routes?.controller
+        ? (options.controllerUpstream ?? controllerUpstream)
+        : route.host === routes?.registry
+          ? (options.registryUpstream ?? registryUpstream)
+          : undefined;
+  if (route.kind !== 'tenant' || !upstreamFor) {
     socket.destroy();
     return;
   }
-  const target = (options.controllerUpstream ?? controllerUpstream)(route.tenant);
+  const target = upstreamFor(route.tenant);
   const upstream = connect(target.port, target.hostname);
   const close = () => {
     socket.destroy();
@@ -299,6 +321,8 @@ function target(
   if (route.kind === 'invalid') return { error: route.reason };
   if (route.kind === 'tenant' && options.tenantAuthRoutes?.controller === route.host)
     return { error: 'the controller host is served over TLS only' };
+  if (route.kind === 'tenant' && options.tenantAuthRoutes?.registry === route.host)
+    return { error: 'the registry host is served over TLS only' };
   if (route.kind === 'tenant' && options.tenantAuthRoutes?.console === route.host)
     // The console builds its links from its public URL, so it keeps the original Host.
     return {
@@ -420,7 +444,7 @@ export interface GatewayConfig {
   port?: number;
   defaultUpstream: string;
   upstreamTimeoutMs?: number;
-  tenantAuthRoutes?: { console?: string; controller?: string };
+  tenantAuthRoutes?: { console?: string; controller?: string; registry?: string };
 }
 
 export function main(
@@ -435,8 +459,12 @@ export function main(
     tenantAuthRoutes: cfg.tenantAuthRoutes,
   };
   const server = createGateway(options);
-  // TLS passthrough needs the raw connection, so a routed controller puts the edge in front.
-  const listener = cfg.tenantAuthRoutes?.controller ? createEdge(server, options) : server;
+  // TLS passthrough needs the raw connection, so a routed controller or registry puts the edge
+  // in front.
+  const listener =
+    cfg.tenantAuthRoutes?.controller || cfg.tenantAuthRoutes?.registry
+      ? createEdge(server, options)
+      : server;
   listener.listen(cfg.port ?? 8080);
   signals.once('SIGTERM', () => {
     listener.close();

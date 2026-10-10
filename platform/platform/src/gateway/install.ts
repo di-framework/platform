@@ -125,7 +125,8 @@ export function gatewayServiceSpec(nodePort: number) {
 }
 
 /** Gateway egress: cluster DNS and host group HTTP only (default and tenant runtimes), plus the
- * routed tenant console (8787) and controller (8788) ports when tenant-auth routes are set.
+ * routed tenant console (8787), controller (8788) and registry front (8790) ports when
+ * tenant-auth routes are set.
  * Tenant runtimes admit it through their own `di-tenant-gateway` / `tenant-*-gateway` policies. */
 export function gatewayNetworkPolicySpec(
   namespace: string,
@@ -139,6 +140,8 @@ export function gatewayNetworkPolicySpec(
   const routed = [
     ...(tenantAuthRoutes.console ? [['tenant-console', 8787] as const] : []),
     ...(tenantAuthRoutes.controller ? [['tenant-controller', 8788] as const] : []),
+    // The tenant registry's TLS front runs in the controller pod (#83:reconcile).
+    ...(tenantAuthRoutes.registry ? [['tenant-controller', 8790] as const] : []),
   ].map(([app, port]) => ({
     to: [
       {
