@@ -5,6 +5,7 @@
  * and forwards only requests that stay inside the tenant's namespaces. The platform's existing
  * roles, quotas, and admission policies apply unchanged; the Kubernetes token never leaves here.
  */
+import { timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
 import { AuthError, IdentityResolver, type Principal } from './identity.ts';
@@ -89,10 +90,33 @@ export interface ControllerConfig {
    * 16); more are answered 503, so the front never starves the tenant API in the same process.
    */
   registryMaxConcurrent: number;
+  /**
+   * The tenant hosts' pull-only listener (platform#83 `:host-pull`): GET and HEAD forwarded like
+   * the registry front. NetworkPolicy admits only the host pods. Unset: none.
+   */
+  registryPullPort?: number;
+  /** Whether the pull listener uses TLS (default); false when hosts pull over plain HTTP. */
+  registryPullTls: boolean;
+  /**
+   * In-cluster registry host workloads reference (`TENANT_CONTROLLER_REGISTRY_PULL_HOST`);
+   * `/v1/deploy` points users at it when a workload names the public origin instead.
+   */
+  registryPullHost?: string;
+  /**
+   * File holding the host pull token (`TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE`): the whoami
+   * listener answers it as a pull-only principal. Read on every call, so rotation needs no restart.
+   */
+  hostPullTokenFile?: string;
 }
 
 /** Idle timeout of the registry front's client sockets; any data flow resets it (Bun's max is 255). */
 export const REGISTRY_IDLE_TIMEOUT_SECONDS = 120;
+
+/**
+ * The body cap on the hosts' pull listener (S2 of the platform#83 `:host-pull` review): it serves
+ * GET and HEAD only and never forwards a body, so anything larger is refused by the listener.
+ */
+export const REGISTRY_PULL_MAX_BODY_BYTES = 1024;
 const DEFAULT_REGISTRY_MAX_BODY_BYTES = 512 * 1024 * 1024;
 
 function positiveInteger(value: string | undefined, name: string, fallback: number): number {
@@ -228,6 +252,9 @@ function registryChallenge(): Response {
   });
 }
 
+/** The user the whoami listener reports for the host pull token. */
+export const HOST_PULL_USER = 'system:tenant-host';
+
 /** Headers never relayed back from the registry: hop-by-hop. */
 const HOP_BY_HOP_RESPONSE = new Set(['connection', 'keep-alive', 'transfer-encoding']);
 
@@ -278,6 +305,13 @@ export function configFromEnv(env = process.env): ControllerConfig {
       'TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT',
       16,
     ),
+    registryPullPort: optionalPort(
+      env.TENANT_CONTROLLER_REGISTRY_PULL_PORT,
+      'TENANT_CONTROLLER_REGISTRY_PULL_PORT',
+    ),
+    registryPullTls: env.TENANT_CONTROLLER_REGISTRY_PULL_TLS !== 'false',
+    registryPullHost: env.TENANT_CONTROLLER_REGISTRY_PULL_HOST || undefined,
+    hostPullTokenFile: env.TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE || undefined,
   };
 }
 
@@ -488,8 +522,17 @@ export class Controller {
       response.headers.set('allow', 'GET');
       return response;
     }
+    const authorization = request.headers.get('authorization');
+    if (this.isHostPullToken(authorization))
+      return json({
+        user: HOST_PULL_USER,
+        account: this.config.tenant,
+        role: 'viewer',
+        via: 'host-pull',
+        credentialId: 'host-pull',
+      });
     try {
-      return json(await this.identity.resolve(request.headers.get('authorization')));
+      return json(await this.identity.resolve(authorization));
     } catch (error) {
       if (error instanceof AuthError) {
         this.audit('request.denied', {
@@ -515,6 +558,69 @@ export class Controller {
   }
 
   /**
+   * Whether `authorization` is `Bearer <host pull token>` (platform#83 `:host-pull`). Only the
+   * whoami listener, which NetworkPolicy opens to the tenant's host pods alone, accepts it; the
+   * main listener never does. The token file is read each time, so a rotated token applies at
+   * once; a missing or empty file accepts nothing.
+   */
+  private isHostPullToken(authorization: string | null): boolean {
+    if (!authorization?.startsWith('Bearer ')) return false;
+    return this.matchesHostPullToken(authorization.slice(7).trim());
+  }
+
+  /**
+   * Whether `authorization` is Basic credentials whose password is the host pull token (W2 of the
+   * platform#83 `:host-pull` review). The public registry front refuses those, so the host
+   * credential works only through the hosts' pull listener.
+   */
+  private isHostPullBasic(authorization: string): boolean {
+    let decoded: string;
+    try {
+      decoded = atob(authorization.slice(6).trim());
+    } catch {
+      return false;
+    }
+    const colon = decoded.indexOf(':');
+    return colon >= 0 && this.matchesHostPullToken(decoded.slice(colon + 1).trim());
+  }
+
+  /** Constant-time comparison against the current token file; a missing or empty file matches nothing. */
+  private matchesHostPullToken(candidate: string): boolean {
+    if (!this.config.hostPullTokenFile) return false;
+    let expected: Buffer;
+    try {
+      expected = Buffer.from(readFileSync(this.config.hostPullTokenFile, 'utf8').trim());
+    } catch {
+      return false;
+    }
+    const presented = Buffer.from(candidate);
+    return (
+      expected.length > 0 &&
+      presented.length === expected.length &&
+      timingSafeEqual(presented, expected)
+    );
+  }
+
+  /**
+   * The hosts' pull listener (platform#83 `:host-pull`): the registry front for GET and HEAD only,
+   * so nothing can be pushed or deleted through it whatever credential arrives.
+   */
+  async handleRegistryPull(
+    request: Request,
+    server?: { requestIP(request: Request): { address: string } | null },
+  ): Promise<Response> {
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      await request.body?.cancel().catch(() => {});
+      const response = problem(405, 'Method Not Allowed', 'this listener only serves pulls');
+      response.headers.set('allow', 'GET, HEAD');
+      return response;
+    }
+    // A pull never carries a body (S2): whatever arrives (the listener caps it) is dropped.
+    await request.body?.cancel().catch(() => {});
+    return this.forwardRegistry(request, server, this.pullPool, false);
+  }
+
+  /**
    * The registry front (platform#83): forwards every request, credentials included (the registry
    * authorizes it by calling whoami), to the tenant hosts with `Host: registryHost`, streaming
    * both bodies. The controller does not authenticate here; it only terminates TLS.
@@ -531,6 +637,33 @@ export class Controller {
   async handleRegistry(
     request: Request,
     server?: { requestIP(request: Request): { address: string } | null },
+  ): Promise<Response> {
+    // The host pull token is for the hosts' pull listener only (W2): refused here, unforwarded.
+    const authorization = request.headers.get('authorization');
+    if (/^basic /i.test(authorization ?? '') && this.isHostPullBasic(authorization as string)) {
+      await request.body?.cancel().catch(() => {});
+      this.audit('request.denied', {
+        method: request.method,
+        path: new URL(request.url).pathname,
+        listener: 'registry',
+        status: 401,
+        reason: 'the host pull credential is not accepted on the public registry front',
+      });
+      return registryChallenge();
+    }
+    return this.forwardRegistry(request, server, this.frontPool, true);
+  }
+
+  /**
+   * Forwards one registry request upstream, holding a slot of `pool` while it is in flight. The
+   * front and the hosts' pull listener have separate pools (S1), so public traffic cannot starve
+   * host pulls. `withBody` is false for the pull listener, which never forwards a body (S2).
+   */
+  private async forwardRegistry(
+    request: Request,
+    server: { requestIP(request: Request): { address: string } | null } | undefined,
+    pool: { inFlight: number },
+    withBody: boolean,
   ): Promise<Response> {
     const url = new URL(request.url);
     const length = request.headers.get('content-length');
@@ -549,14 +682,14 @@ export class Controller {
       await request.body?.cancel().catch(() => {});
       return registryChallenge();
     }
-    if (this.registryInFlight >= this.config.registryMaxConcurrent)
+    if (pool.inFlight >= this.config.registryMaxConcurrent)
       return problem(503, 'Service Unavailable', 'the tenant registry is busy; retry shortly');
-    this.registryInFlight++;
+    pool.inFlight++;
     let released = false;
     const release = () => {
       if (released) return;
       released = true;
-      this.registryInFlight--;
+      pool.inFlight--;
     };
     const headers = upstreamRequestHeaders(
       request,
@@ -565,7 +698,7 @@ export class Controller {
       server?.requestIP(request)?.address,
     );
     headers.set('authorization', authorization as string);
-    if (length) headers.set('content-length', length);
+    if (length && withBody) headers.set('content-length', length);
     // The upstream request ends with the client's, when the upload stalls, or when the headers
     // take too long once the body has been sent (W5 of the platform#83 review).
     const timeout = new AbortController();
@@ -577,12 +710,13 @@ export class Controller {
       if (answered) return;
       timer = setTimeout(() => timeout.abort(), this.config.registryUpstreamTimeoutMs);
     };
-    const body = request.body
-      ? watchingUpload(request.body, this.config.registryUploadIdleTimeoutMs, {
-          stalled: () => stall.abort(),
-          done: armHeaderTimer,
-        })
-      : null;
+    const body =
+      withBody && request.body
+        ? watchingUpload(request.body, this.config.registryUploadIdleTimeoutMs, {
+            stalled: () => stall.abort(),
+            done: armHeaderTimer,
+          })
+        : null;
     if (!body) armHeaderTimer();
     let upstream: Response;
     try {
@@ -626,7 +760,9 @@ export class Controller {
   }
 
   /** Registry front requests in flight (see {@link handleRegistry}). */
-  private registryInFlight = 0;
+  private readonly frontPool = { inFlight: 0 };
+  /** Host pull listener requests in flight (see {@link handleRegistryPull}); separate from the front's (S1). */
+  private readonly pullPool = { inFlight: 0 };
 
   // The controller's own API: identity, API keys, members.
 
@@ -689,6 +825,7 @@ export class Controller {
         registryUrl: this.config.registryUrl,
         registryConfigured: this.config.registryConfigured,
         registryHost: this.config.registryHost,
+        registryPullHost: this.config.registryPullHost,
         asUser: () => asUser(this.kube, this.userTokens, principal),
         asController: () => controllerSecretReader(this.kube),
         audit: (event, fields) => this.audit(event, fields),
@@ -775,6 +912,16 @@ if (import.meta.main) {
       maxRequestBodySize: config.registryMaxBodyBytes,
       fetch: (request, server) => controller.handleRegistry(request, server),
     });
+  // The tenant hosts' pulls (platform#83 `:host-pull`): TLS unless they pull over plain HTTP.
+  if (config.registryPullPort)
+    Bun.serve({
+      hostname: config.host,
+      port: config.registryPullPort,
+      tls: config.registryPullTls ? tls : undefined,
+      idleTimeout: REGISTRY_IDLE_TIMEOUT_SECONDS,
+      maxRequestBodySize: REGISTRY_PULL_MAX_BODY_BYTES,
+      fetch: (request, server) => controller.handleRegistryPull(request, server),
+    });
   controller.audit('controller.started', {
     url: `${tls ? 'https' : 'http'}://${config.host}:${config.port}`,
     issuer: config.issuer,
@@ -782,5 +929,6 @@ if (import.meta.main) {
     namespaces: tenantNamespaces(config.tenant),
     whoamiPort: config.whoamiPort,
     registryFrontPort: config.registryFrontPort,
+    registryPullPort: config.registryPullPort,
   });
 }

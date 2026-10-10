@@ -19,6 +19,11 @@ export interface V1Context {
    * registry front sends registry users' credentials to whatever serves it.
    */
   registryHost?: string;
+  /**
+   * The in-cluster registry host the tenant's hosts pull from (platform#83 `:host-pull`), e.g.
+   * `tenant-registry.di-runtime-<tenant>.svc`. Workload images must name it, not `registryUrl`.
+   */
+  registryPullHost?: string;
   /** The API server as the calling user (their `di-user-<user>` ServiceAccount). */
   asUser(): UserKube;
   /**

@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { request } from 'node:https';
 import { setTimeout } from 'node:timers/promises';
@@ -57,10 +58,14 @@ import {
   type Condition,
   type ControllerConfig,
   FINALIZER,
+  type HostPull,
   INSTALLATION,
   NAMESPACE_ROLE,
   names,
   OWNER,
+  REGISTRY_CA_ANNOTATION,
+  REGISTRY_PULL_SECRET,
+  REGISTRY_PULL_SERVICE,
   REGISTRY_WORKLOAD,
   type Resource,
   ROUTES_CONFIG_NAME,
@@ -77,6 +82,7 @@ import {
   tenantControllerCertNames,
   tenantQuota,
   tenantResources,
+  tlsCertDigest,
   type User,
   userResources,
   VERSION,
@@ -249,6 +255,8 @@ export class KubernetesApi implements Api {
 }
 /** How far before the cursor each pod log read starts (see projectLogs). */
 const LOG_LOOKBACK_MS = 120_000;
+/** A generated host pull token: 32 random bytes, base64url. */
+const HOST_PULL_TOKEN = /^[A-Za-z0-9_-]{43}$/;
 const TENANT_AUTH_KINDS = [
   ['apps/v1', 'Deployment'],
   ['v1', 'Service'],
@@ -472,7 +480,57 @@ export class Controller {
       apiServer,
       tls,
       clientSecret: oauth?.data?.[auth.oauthClient.secretKey ?? 'clientSecret'],
+      ...(auth.registry ? { hostPullToken: await this.hostPullToken(name) } : {}),
     };
+  }
+  /**
+   * The host pull token (#83 `:host-pull`): the one in `di-tenant-registry-pull` while it is well
+   * formed, otherwise a new random one. Deleting the Secret therefore rotates it.
+   */
+  private async hostPullToken(tenant: string): Promise<string> {
+    const existing = await this.get<{ data?: Record<string, string> }>(
+      `${collection('v1', 'Secret', names(tenant).runtimeNamespace)}/${REGISTRY_PULL_SECRET}`,
+    );
+    const token = Buffer.from(existing?.data?.token ?? '', 'base64').toString();
+    return HOST_PULL_TOKEN.test(token) ? token : randomBytes(32).toString('base64url');
+  }
+  /** The host wiring last rendered per tenant (W1/S6 of the #83 `:host-pull` review). */
+  private readonly hostPulls = new Map<string, HostPull | undefined>();
+  /**
+   * How the tenant hosts pull from the registry (#83 `:host-pull`), decided from desired state
+   * (W1 of the review): wired while `tenantAuth.registry` is set, the registry is deployed and
+   * the tenant is not suspended, whether or not the pull Secret exists right now. Its volume is
+   * optional, so a host started during a rotation pulls anonymously until the kubelet syncs it.
+   * Over TLS the CA digest is the current `tenant-controller-ca`'s; while that ConfigMap is
+   * missing the last known digest (remembered here, else read from the host template) is kept,
+   * so only a different CA rolls the hosts.
+   */
+  private async hostPull(tenant: Tenant, registryDeployed: boolean): Promise<HostPull | undefined> {
+    const name = tenant.metadata.name;
+    const wiring = await this.hostPullWiring(tenant, registryDeployed);
+    this.hostPulls.set(name, wiring);
+    return wiring;
+  }
+  private async hostPullWiring(
+    tenant: Tenant,
+    registryDeployed: boolean,
+  ): Promise<HostPull | undefined> {
+    if (!registryDeployed || tenant.spec.suspended) return undefined;
+    if (this.cfg.insecureRegistry) return {};
+    const n = names(tenant.metadata.name);
+    const ca = await this.get<{ data?: Record<string, string> }>(
+      `${collection('v1', 'ConfigMap', n.runtimeNamespace)}/tenant-controller-ca`,
+    );
+    const cert = ca?.data?.['ca.crt'];
+    if (cert) return { caDigest: tlsCertDigest(cert) };
+    const known =
+      this.hostPulls.get(tenant.metadata.name)?.caDigest ??
+      (
+        await this.get<{ spec?: { template?: { metadata?: Resource['metadata'] } } }>(
+          `${collection('apps/v1', 'Deployment', n.runtimeNamespace)}/hostgroup-${n.hostgroup}`,
+        )
+      )?.spec?.template?.metadata?.annotations?.[REGISTRY_CA_ANNOTATION];
+    return known ? { caDigest: known } : {};
   }
   async reconcileTenant(tenant: Tenant, users?: User[]): Promise<void> {
     if (!validName(tenant.metadata.name)) throw new Error('Invalid tenant name');
@@ -547,6 +605,18 @@ export class Controller {
       `${collection('v1', 'Secret', this.cfg.namespace)}/wasmcloud-runtime-tls`,
     );
     const workloads = await this.storageWorkloads(tenant);
+    const registryDeployed = await this.registryDeployed(tenant);
+    // A failed lookup here is reported on TenantAuthReady, not as a reconcile error (S6 of the
+    // #83 `:host-pull` review): the hosts keep the last wiring, or are left untouched this tick.
+    let hostPull: HostPull | undefined;
+    let hostPullFailure: unknown;
+    try {
+      hostPull = await this.hostPull(tenant, registryDeployed);
+    } catch (error) {
+      hostPullFailure = error;
+      hostPull = this.hostPulls.get(tenant.metadata.name);
+    }
+    const hostsKnown = !hostPullFailure || this.hostPulls.has(tenant.metadata.name);
     // The quota keeps the tenant-auth addition only while its Deployments exist; the
     // tenant-auth step below is the one that raises it (#121).
     const desired = tenantResources(
@@ -555,8 +625,13 @@ export class Controller {
       secret,
       storageKeys(workloads),
       await this.tenantAuthDeployed(tenant),
-      await this.registryDeployed(tenant),
+      registryDeployed,
       await this.tenantAuthNetworkApplied(tenant),
+      hostPull,
+    ).filter(
+      (value) =>
+        hostsKnown ||
+        !(value.kind === 'Deployment' && value.metadata.name === `hostgroup-${n.hostgroup}`),
     );
     let ready = !!secret;
     let failure: unknown;
@@ -593,7 +668,17 @@ export class Controller {
     }
     // Tenant-auth is independent of the tenant's own objects: a failed apply above (such as a
     // hostgroup 409) must not keep it from reconciling or from reporting TenantAuthReady (#121).
-    const auth = await this.reconcileTenantAuth(tenant, users);
+    let auth = await this.reconcileTenantAuth(tenant, users);
+    if (hostPullFailure && auth) {
+      const message =
+        hostPullFailure instanceof Error ? hostPullFailure.message : String(hostPullFailure);
+      auth = {
+        ...auth,
+        status: 'False',
+        reason: 'HostPullError',
+        message: `Tenant host registry wiring could not be read: ${message}`,
+      };
+    }
     if (failure) {
       const message = failure instanceof Error ? failure.message : 'Reconciliation failed';
       console.error(`Tenant/${tenant.metadata.name}: ${message}`);
@@ -666,6 +751,18 @@ export class Controller {
       }
       // The registry is no longer configured: remove it, then give its workload slot back.
       if (!this.cfg.tenantAuth.registry) {
+        // The host pull credential and Service go with it (#83 `:host-pull`).
+        for (const [kind, stale] of [
+          ['Secret', REGISTRY_PULL_SECRET],
+          ['Service', REGISTRY_PULL_SERVICE],
+        ] as const) {
+          const value = await this.get<Resource>(`${collection('v1', kind, namespace)}/${stale}`);
+          if (
+            value?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+            value.metadata.labels[OWNER] === tenant.metadata.uid
+          )
+            await this.remove(value);
+        }
         const stale = await this.get<Resource>(
           `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', names(tenant.metadata.name).namespace)}/${REGISTRY_WORKLOAD}`,
         );

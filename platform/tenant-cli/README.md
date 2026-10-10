@@ -86,6 +86,23 @@ tenant's CA (ConfigMap `tenant-controller-ca`) as you do for the controller, for
 
 Identity access tokens expire, so a stored `docker login` stops working; a `dik_` API key suits CI.
 
+### Which reference a workload uses
+
+Push to the registry's public origin (`url` above), but reference the same repository on the
+in-cluster pull host in the workload you deploy: tenant hosts pull from
+`tenant-registry.di-runtime-<tenant>.svc` (no port), with a platform-managed pull credential, not
+from the public origin, which is a gateway or port-forward address the hosts cannot use. Both
+names serve the same repositories:
+
+```text
+oras push registry.acme.localhost:28180/web:1.0.0 ...            # push (your credential)
+# workload component image:
+tenant-registry.di-runtime-acme.svc/web@sha256:<digest>           # pull (the tenant's hosts)
+```
+
+`/v1/deploy` and `/v1/deploy/preview` refuse (`422`) a bundle whose component or service image
+names the public origin, and the problem `detail` gives the in-cluster reference to use instead.
+
 ## Commands
 
 ```text

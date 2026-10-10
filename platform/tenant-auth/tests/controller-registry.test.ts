@@ -356,6 +356,14 @@ describe('registry front limits', () => {
       new Request('https://registry.acme.localhost/v2/'),
     );
     expect(anonymous.status).toBe(401);
+    // Host pulls have their own pool (S1 of the :host-pull review): a busy front cannot starve them.
+    const pull = await controller.handleRegistryPull(
+      new Request('https://tenant-registry.di-runtime-acme.svc/v2/', {
+        headers: { authorization: 'Basic eDpvaw==' },
+      }),
+    );
+    expect(pull.status).toBe(200);
+    expect(await pull.text()).toBe('ok ');
     client.abort();
     expect((await pending).status).toBe(502);
     await Bun.sleep(20);

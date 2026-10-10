@@ -137,7 +137,9 @@ fn is_cluster_local(authority: &str) -> bool {
 
 /// Map a 2xx whoami body to a role. The body must be the contract's
 /// `Principal` (`user`, `account`, `role`, `via` all present) and its `account`
-/// must be `tenant`; anything else denies.
+/// must be `tenant`; anything else denies. `via: "host-pull"` is the tenant
+/// hosts' pull credential (platform#83): it is capped at [`Role::Viewer`]
+/// whatever `role` the body claims, so the registry itself limits it to pulls.
 pub(crate) fn role_from_body(body: &[u8], tenant: &str) -> Whoami {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return Whoami::Denied;
@@ -148,8 +150,13 @@ pub(crate) fn role_from_body(body: &[u8], tenant: &str) -> Whoami {
     else {
         return Whoami::Denied;
     };
-    if tenant.is_empty() || account != tenant || !matches!(via, "identity" | "api-key") {
+    if tenant.is_empty() || account != tenant {
         return Whoami::Denied;
+    }
+    match via {
+        "identity" | "api-key" => {}
+        "host-pull" => return Whoami::Role(Role::Viewer),
+        _ => return Whoami::Denied,
     }
     Role::parse(role).map_or(Whoami::Denied, Whoami::Role)
 }
@@ -319,6 +326,44 @@ mod tests {
             b"{}",
         ] {
             assert_eq!(role_from_body(body, "acme"), Whoami::Denied);
+        }
+    }
+
+    /// The exact body the tenant controller answers for the host pull token;
+    /// `platform/tenant-auth/tests/controller-host-pull.test.ts` pins the same
+    /// fixture, so the two sides cannot drift.
+    const HOST_PULL_FIXTURE: &[u8] = include_bytes!("../fixtures/whoami-host-pull.json");
+
+    #[test]
+    fn host_pull_body_from_the_controller_is_a_viewer() {
+        assert_eq!(
+            role_from_body(HOST_PULL_FIXTURE, "acme"),
+            Whoami::Role(Role::Viewer)
+        );
+        assert_eq!(role_from_body(HOST_PULL_FIXTURE, "other"), Whoami::Denied);
+    }
+
+    #[test]
+    fn host_pull_is_capped_at_viewer_whatever_role_it_claims() {
+        for role in ["viewer", "developer", "admin", "owner"] {
+            let body = format!(
+                r#"{{"user":"system:tenant-host","account":"acme","role":"{role}","via":"host-pull"}}"#
+            );
+            assert_eq!(
+                role_from_body(body.as_bytes(), "acme"),
+                Whoami::Role(Role::Viewer),
+                "{role}"
+            );
+        }
+        for via in ["Host-Pull", "host-pull ", "hostpull", ""] {
+            let body = format!(
+                r#"{{"user":"system:tenant-host","account":"acme","role":"viewer","via":"{via}"}}"#
+            );
+            assert_eq!(
+                role_from_body(body.as_bytes(), "acme"),
+                Whoami::Denied,
+                "{via:?}"
+            );
         }
     }
 
