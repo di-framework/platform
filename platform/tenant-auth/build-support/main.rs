@@ -166,6 +166,7 @@ fn smoke_check(builder: &Builder, context: &Path, image: &str) -> Result<()> {
     if dockerfile.exists() {
         let _ = fs::remove_file(&dockerfile);
     }
+    let _cleanup = TempFileGuard(&dockerfile);
     // Expected configuration errors establish that both bundles load imports.
     fs::write(
         &dockerfile,
@@ -186,7 +187,6 @@ RUN set -eu; \
 "#
         ),
     )?;
-    let _cleanup = TempFileGuard(&dockerfile);
     let mut request = BuildRequest::new(&dockerfile, context).with_log(|record| {
         let _ = std::io::stderr()
             .lock()
