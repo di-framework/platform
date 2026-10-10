@@ -1,6 +1,6 @@
 {
   "name": "@di-framework/cloudflare",
-  "version": "6.0.9",
+  "version": "6.0.10",
   "description": "Cloudflare Workers connector for binding discovery, wrangler config, and automated DI injection.",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
