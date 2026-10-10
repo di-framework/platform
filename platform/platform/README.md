@@ -52,6 +52,47 @@ platform.
 `tenants`, `users`, and the other platform settings are shared with the
 existing-cluster entrypoint.
 
+Each `tenants` entry is a Tenant CR: `name` is the CR name and every other key is its
+`spec`. For example, `tenants: [{ name: identity, runtime: { coreInstances: 300 } }]`.
+
+### Tenant host core instances
+
+`spec.runtime.coreInstances` (integer, `1`–`10000`, default `100`) sets
+`WASH_CORE_INSTANCES` on the tenant's hostgroup Deployment. The CRD schema enforces the
+bounds, and `pulumi up` rejects an out-of-range `tenants[].runtime.coreInstances` before
+it reaches the cluster. Changing the value changes the host pod template, so it rolls the
+tenant host.
+
+Do not `kubectl set env` the hostgroup Deployment. An Update like that takes ownership of
+the env value away from `di-platform-controller`, and every later server-side apply
+of that Deployment fails with 409 until the ownership is cleared (see
+`docs/hostgroup-409-diagnosis.md`). The controller never force-applies. To clear a hand
+edit that already exists (one time, per Deployment):
+
+1. Set `runtime.coreInstances` on the Tenant to the live value (for example `300`) and
+   apply it, so the controller declares the same value it finds live.
+2. Remove the stale `kubectl-set` entry from `metadata.managedFields`:
+
+   ```sh
+   T=<tenant>
+   i=$(kubectl get deploy hostgroup-tenant-$T -n di-runtime-$T --show-managed-fields -o json \
+     | jq '.metadata.managedFields | map(.manager) | index("kubectl-set")')
+   kubectl patch deploy hostgroup-tenant-$T -n di-runtime-$T --type=json \
+     -p "[{\"op\":\"test\",\"path\":\"/metadata/managedFields/$i/manager\",\"value\":\"kubectl-set\"},{\"op\":\"remove\",\"path\":\"/metadata/managedFields/$i\"}]"
+   ```
+
+   Or, instead, re-apply the live Deployment once as the controller, forcing only the
+   conflicting field over (apply the whole live object, not a fragment: a fragment
+   applied under `di-platform-controller` would drop every other field that manager owns):
+
+   ```sh
+   kubectl get deploy hostgroup-tenant-$T -n di-runtime-$T -o json \
+     | jq 'del(.metadata.managedFields, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.generation, .status)' \
+     | kubectl apply --server-side --force-conflicts --field-manager=di-platform-controller -f -
+   ```
+
+   Either way, the controller's next reconcile applies without a 409.
+
 ## Existing-cluster configuration
 
 `kubeconfig` is required (a local file path); `context`, `namespace`, `release`,

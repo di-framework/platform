@@ -25,7 +25,11 @@ export interface Condition {
 export interface TenantSpec {
   suspended?: boolean;
   deletionPolicy?: 'Retain' | 'Delete';
-  runtime?: { replicas?: number };
+  runtime?: {
+    replicas?: number;
+    /** `WASH_CORE_INSTANCES` for the tenant host (default 100, 1–10000). Changing it rolls the host. */
+    coreInstances?: number;
+  };
   resources?: {
     cpu?: string;
     memory?: string;
@@ -36,6 +40,7 @@ export interface TenantSpec {
     serviceBindings?: number;
   };
 }
+export const CORE_INSTANCES = { default: 100, minimum: 1, maximum: 10000 } as const;
 export interface UserSpec {
   suspended?: boolean;
   memberships: { tenant: string; role: 'developer' | 'viewer' }[];
@@ -234,7 +239,10 @@ const crds = [
         runtime: {
           type: 'object',
           default: {},
-          properties: { replicas: { type: 'integer', minimum: 1, maximum: 10, default: 1 } },
+          properties: {
+            replicas: { type: 'integer', minimum: 1, maximum: 10, default: 1 },
+            coreInstances: { type: 'integer', ...CORE_INSTANCES },
+          },
         },
         resources: {
           type: 'object',
@@ -748,7 +756,10 @@ function tenantResources(
                     },
                     { name: 'WASH_HOST_MAX_GUEST_MEMORY', value: '2Gi' },
                     { name: 'WASH_DEFAULT_HEAP_MEMORY', value: '512MiB' },
-                    { name: 'WASH_CORE_INSTANCES', value: '100' },
+                    {
+                      name: 'WASH_CORE_INSTANCES',
+                      value: String(tenant.spec.runtime?.coreInstances ?? CORE_INSTANCES.default),
+                    },
                   ],
                   ports: [{ name: 'http', containerPort: 9191 }],
                   readinessProbe: { tcpSocket: { port: 'http' }, initialDelaySeconds: 5 },
