@@ -933,6 +933,14 @@ async function checked(
 ): Promise<Response> {
   const reason = invalid(bundle);
   if (reason) return problem(422, 'Unprocessable Entity', reason);
+  // The workload's HTTP host is `<service>-<env>`; it must not be the tenant registry's.
+  const host = `${bundle.service}-${bundle.env}`;
+  if (context.registryHost && host === context.registryHost.toLowerCase())
+    return problem(
+      422,
+      'Unprocessable Entity',
+      `${host} is reserved for the tenant registry; choose another service name`,
+    );
   const refs = await configRefs(bundle, context);
   if (refs instanceof Response) return refs;
   return handler(refs);

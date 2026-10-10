@@ -603,6 +603,12 @@ function tenantResources(
   storageKeys: string[] = [],
   tenantAuthQuota = false,
   registryQuota = false,
+  /**
+   * Whether this tenant's `tenant-auth-network` exists (#83): only then are the tenant-auth pods
+   * left out of `di-tenant-network`, so an upgrade never isolates them before their own policy
+   * is in place, and a failed tenant-auth step keeps them on the broad policy.
+   */
+  tenantAuthNetwork = false,
 ): Resource[] {
   const n = names(tenant.metadata.name);
   const storage = hostStorage(tenant, cfg, storageKeys);
@@ -711,7 +717,12 @@ function tenantResources(
               {
                 key: `${GROUP}/component`,
                 operator: 'NotIn',
-                values: ['backing-service', 'backup-agent', 'backup-operator', 'tenant-auth'],
+                values: [
+                  'backing-service',
+                  'backup-agent',
+                  'backup-operator',
+                  ...(tenantAuthNetwork ? ['tenant-auth'] : []),
+                ],
               },
             ],
           },

@@ -12,6 +12,11 @@ export interface V1Context {
   principal: Principal;
   /** Origin of the tenant's OCI registry, when the platform configured one (platform#83). */
   registryUrl?: string;
+  /**
+   * The registry workload's `wasi:http` host (platform#83). A deploy never claims it, since the
+   * registry front sends registry users' credentials to whatever serves it.
+   */
+  registryHost?: string;
   /** The API server as the calling user (their `di-user-<user>` ServiceAccount). */
   asUser(): UserKube;
   /**

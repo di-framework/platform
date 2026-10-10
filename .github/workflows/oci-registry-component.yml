@@ -73,11 +73,29 @@ jobs:
           # from the WIT that `make build` recovered from the component).
           created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           layer="sha256:$(sha256sum di-framework-oci-registry.wasm | cut -d' ' -f1)"
-          wit_items() { sed -nE "s/^[[:space:]]*$1 ([^;{ ]+);.*/\\1/p" di-framework-oci-registry.wit | jq -R . | jq -s .; }
+          # Items of the root (first) world only, at its top level: dependency
+          # packages printed after it may declare worlds of their own, and
+          # inline interfaces nest their own items.
+          wit_items() {
+            awk -v kind="$1" '
+              done { next }
+              !inside && /^[[:space:]]*world[[:space:]]+[^[:space:]{]+[[:space:]]*\{/ { inside = 1; depth = 0 }
+              inside {
+                if (depth == 1 && match($0, "^[[:space:]]*" kind "[[:space:]]+[^;{[:space:]]+;")) {
+                  item = substr($0, RSTART, RLENGTH)
+                  sub("^[[:space:]]*" kind "[[:space:]]+", "", item)
+                  sub(";$", "", item)
+                  print item
+                }
+                depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+                if (depth == 0) done = 1
+              }' di-framework-oci-registry.wit | jq -R . | jq -s .
+          }
           imports="$(wit_items import)"
           exports="$(wit_items export)"
-          if [[ "$(jq length <<<"${exports}")" == 0 ]]; then
-            echo "::error::no exports found in di-framework-oci-registry.wit"
+          # Hosts serve the component through wasi:http@0.3.0 handler only.
+          if ! jq -e 'index("wasi:http/handler@0.3.0") != null' <<<"${exports}" >/dev/null; then
+            echo "::error::di-framework-oci-registry.wit does not export wasi:http/handler@0.3.0"
             exit 1
           fi
           jq -n --arg created "${created}" --arg layer "${layer}" \

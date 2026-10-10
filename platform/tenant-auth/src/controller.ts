@@ -61,6 +61,34 @@ export interface ControllerConfig {
   registryFrontPort?: number;
   /** The registry workload's `wasi:http` host, sent as `Host` upstream. Default `registry`. */
   registryHost: string;
+  /**
+   * Largest request body the registry front accepts (`TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES`,
+   * default 512 MiB, well above a Wasm component layer); larger is answered 413.
+   */
+  registryMaxBodyBytes: number;
+  /**
+   * How long the registry front waits for the registry's response headers
+   * (`TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS`, default 60 s); then it answers 504.
+   * Streaming bodies are bounded by the listener's idle timeout instead.
+   */
+  registryUpstreamTimeoutMs: number;
+  /**
+   * Registry requests in flight at once (`TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT`, default
+   * 16); more are answered 503, so the front never starves the tenant API in the same process.
+   */
+  registryMaxConcurrent: number;
+}
+
+/** Idle timeout of the registry front's client sockets; any data flow resets it (Bun's max is 255). */
+export const REGISTRY_IDLE_TIMEOUT_SECONDS = 120;
+const DEFAULT_REGISTRY_MAX_BODY_BYTES = 512 * 1024 * 1024;
+
+function positiveInteger(value: string | undefined, name: string, fallback: number): number {
+  if (!value) return fallback;
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 1)
+    throw new Error(`${name} must be a positive integer`);
+  return number;
 }
 
 /**
@@ -111,6 +139,38 @@ function optionalPort(value: string | undefined, name: string): number | undefin
   return port;
 }
 
+/**
+ * Relays `body` and calls `release` once it ends: drained, failed, or cancelled by the client
+ * (which also cancels the upstream body, aborting its request).
+ */
+function releasing(
+  body: ReadableStream<Uint8Array> | null,
+  release: () => void,
+): ReadableStream<Uint8Array> | null {
+  if (!body) {
+    release();
+    return null;
+  }
+  const reader = body.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (!done) return controller.enqueue(value);
+        release();
+        controller.close();
+      } catch (error) {
+        release();
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      release();
+      return reader.cancel(reason);
+    },
+  });
+}
+
 /** Headers never relayed back from the registry: hop-by-hop. */
 const HOP_BY_HOP_RESPONSE = new Set(['connection', 'keep-alive', 'transfer-encoding']);
 
@@ -140,6 +200,21 @@ export function configFromEnv(env = process.env): ControllerConfig {
       'TENANT_CONTROLLER_REGISTRY_FRONT_PORT',
     ),
     registryHost: env.TENANT_CONTROLLER_REGISTRY_HOST || 'registry',
+    registryMaxBodyBytes: positiveInteger(
+      env.TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES,
+      'TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES',
+      DEFAULT_REGISTRY_MAX_BODY_BYTES,
+    ),
+    registryUpstreamTimeoutMs: positiveInteger(
+      env.TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS,
+      'TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS',
+      60_000,
+    ),
+    registryMaxConcurrent: positiveInteger(
+      env.TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT,
+      'TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT',
+      16,
+    ),
   };
 }
 
@@ -380,12 +455,34 @@ export class Controller {
    * The registry front (platform#83): forwards every request, credentials included (the registry
    * authorizes it by calling whoami), to the tenant hosts with `Host: registryHost`, streaming
    * both bodies. The controller does not authenticate here; it only terminates TLS.
+   *
+   * It is reachable without credentials, so it is bounded: at most `registryMaxConcurrent`
+   * requests at once (503 beyond), bodies up to `registryMaxBodyBytes` (413 beyond; the listener
+   * enforces the same cap on chunked bodies), and `registryUpstreamTimeoutMs` for the registry's
+   * response headers (504). A client that goes away aborts the upstream request, and a failed
+   * upstream ends the client response. Error answers never carry upstream details.
    */
   async handleRegistry(
     request: Request,
     server?: { requestIP(request: Request): { address: string } | null },
   ): Promise<Response> {
     const url = new URL(request.url);
+    const length = request.headers.get('content-length');
+    if (length && !(Number(length) <= this.config.registryMaxBodyBytes))
+      return problem(
+        413,
+        'Content Too Large',
+        `request bodies are limited to ${this.config.registryMaxBodyBytes} bytes`,
+      );
+    if (this.registryInFlight >= this.config.registryMaxConcurrent)
+      return problem(503, 'Service Unavailable', 'the tenant registry is busy; retry shortly');
+    this.registryInFlight++;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      this.registryInFlight--;
+    };
     const headers = upstreamRequestHeaders(
       request,
       url,
@@ -394,8 +491,10 @@ export class Controller {
     );
     const authorization = request.headers.get('authorization');
     if (authorization) headers.set('authorization', authorization);
-    const length = request.headers.get('content-length');
     if (length) headers.set('content-length', length);
+    // The upstream request ends with the client's, or when the headers take too long.
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(), this.config.registryUpstreamTimeoutMs);
     let upstream: Response;
     try {
       upstream = await fetch(
@@ -407,22 +506,35 @@ export class Controller {
           duplex: 'half',
           redirect: 'manual',
           decompress: false,
+          signal: AbortSignal.any([request.signal, timeout.signal]),
         } as RequestInit,
       );
     } catch (error) {
+      release();
+      const timedOut = timeout.signal.aborted;
       this.audit('request.failed', {
         path: url.pathname,
         listener: 'registry',
-        reason: String(error),
+        reason: timedOut ? 'upstream timeout' : String(error),
       });
-      return problem(502, 'Bad Gateway', 'the tenant registry could not be reached');
+      return timedOut
+        ? problem(504, 'Gateway Timeout', 'the tenant registry did not answer in time')
+        : problem(502, 'Bad Gateway', 'the tenant registry could not be reached');
+    } finally {
+      clearTimeout(timer);
     }
     const out = new Headers();
     upstream.headers.forEach((value, name) => {
       if (!HOP_BY_HOP_RESPONSE.has(name)) out.append(name, value);
     });
-    return new Response(upstream.body, { status: upstream.status, headers: out });
+    return new Response(releasing(upstream.body, release), {
+      status: upstream.status,
+      headers: out,
+    });
   }
+
+  /** Registry front requests in flight (see {@link handleRegistry}). */
+  private registryInFlight = 0;
 
   // The controller's own API: identity, API keys, members.
 
@@ -483,6 +595,7 @@ export class Controller {
         tenant: this.config.tenant,
         principal,
         registryUrl: this.config.registryUrl,
+        registryHost: this.config.registryHost,
         asUser: () => asUser(this.kube, this.userTokens, principal),
         asController: () => controllerSecretReader(this.kube),
         audit: (event, fields) => this.audit(event, fields),
@@ -563,9 +676,10 @@ if (import.meta.main) {
       hostname: config.host,
       port: config.registryFrontPort,
       tls,
-      // Layer uploads and pulls can stay silent longer than Bun's default; 0 disables it.
-      idleTimeout: 0,
-      maxRequestBodySize: Number.MAX_SAFE_INTEGER,
+      // Bounded (W2 of the platform#83 review): data flow resets the idle timeout, and bodies
+      // beyond the cap are refused here too when they are chunked.
+      idleTimeout: REGISTRY_IDLE_TIMEOUT_SECONDS,
+      maxRequestBodySize: config.registryMaxBodyBytes,
       fetch: (request, server) => controller.handleRegistry(request, server),
     });
   controller.audit('controller.started', {

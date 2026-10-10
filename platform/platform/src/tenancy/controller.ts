@@ -554,6 +554,7 @@ export class Controller {
       storageKeys(workloads),
       await this.tenantAuthDeployed(tenant),
       await this.registryDeployed(tenant),
+      await this.tenantAuthNetworkApplied(tenant),
     );
     let ready = !!secret;
     let failure: unknown;
@@ -735,6 +736,21 @@ export class Controller {
       names(tenant.metadata.name).runtimeNamespace,
     );
     return deployments.length > 0;
+  }
+  /**
+   * Whether this tenant's `tenant-auth-network` exists, i.e. `di-tenant-network` may leave the
+   * tenant-auth pods out (S1 of the #83 review): it is applied by the tenant-auth step, which
+   * runs after the tenant step, so the narrowing follows on the next poll.
+   */
+  private async tenantAuthNetworkApplied(tenant: Tenant): Promise<boolean> {
+    if (!this.cfg.tenantAuth) return false;
+    const policy = await this.get<Resource>(
+      `${collection('networking.k8s.io/v1', 'NetworkPolicy', names(tenant.metadata.name).runtimeNamespace)}/tenant-auth-network`,
+    );
+    return (
+      policy?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+      policy.metadata.labels[OWNER] === tenant.metadata.uid
+    );
   }
   /** Whether the tenant registry of `tenant` exists, i.e. the tenant quota may stay raised. */
   private async registryDeployed(tenant: Tenant): Promise<boolean> {

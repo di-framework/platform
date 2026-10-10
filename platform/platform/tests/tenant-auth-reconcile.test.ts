@@ -604,8 +604,30 @@ class MemoryApi implements Api {
   /** Every PATCH in order, as `<path> <limits.cpu>` for quotas so the raise can be ordered. */
   patches: string[] = [];
   fail?: (method: string, path: string, body: unknown) => Error | undefined;
+  /** RBAC verbs each request needs, as `<verb> <resource>`; a server-side apply of a missing object is a create. */
+  verbs = new Set<string>();
   seed(value: Resource | Tenant | User): void {
     this.objects.set(key(value), structuredClone(value) as Resource);
+  }
+  private authorize(method: string, url: URL, exists: boolean): void {
+    const parts = url.pathname.split('/').filter(Boolean);
+    const at = parts.indexOf('namespaces');
+    const resource = at >= 0 ? parts[at + 2] : parts[parts[0] === 'api' ? 2 : 3];
+    const verb =
+      method === 'GET'
+        ? url.searchParams.has('labelSelector')
+          ? 'list'
+          : 'get'
+        : method === 'PATCH'
+          ? exists
+            ? 'patch'
+            : 'create'
+          : method === 'DELETE'
+            ? 'delete'
+            : method === 'PUT'
+              ? 'update'
+              : 'create';
+    this.verbs.add(`${verb} ${resource}`);
   }
   async call<T>(method: string, path: string, body?: unknown): Promise<T> {
     const url = new URL(path, 'https://kubernetes');
@@ -616,6 +638,7 @@ class MemoryApi implements Api {
         `${url.pathname} ${(body as { spec?: { hard?: Record<string, string> } })?.spec?.hard?.['limits.cpu'] ?? ''}`.trim(),
       );
     if (method === 'GET' && url.searchParams.has('labelSelector')) {
+      this.authorize(method, url, true);
       const labels = url.searchParams
         .get('labelSelector')!
         .split(',')
@@ -634,6 +657,7 @@ class MemoryApi implements Api {
     }
     const target = url.pathname.replace(/\/status$/, '');
     const existing = this.objects.get(target);
+    this.authorize(method, url, existing !== undefined);
     if (method === 'GET') {
       if (!existing) throw new ApiError(404, 'Not found');
       return structuredClone(existing) as T;
@@ -1548,7 +1572,7 @@ describe('tenant registry (#83:reconcile)', () => {
   });
 
   it('keeps tenant-auth pods out of di-tenant-network and grows the workload quota by one', () => {
-    const resources = tenantResources(tenant(), cfg, undefined, [], false, true);
+    const resources = tenantResources(tenant(), cfg, undefined, [], false, true, true);
     const key = 'count/workloaddeployments.runtime.wasmcloud.dev';
     expect(hard(find(resources, 'ResourceQuota', 'di-tenant-quota'))[key]).toBe('21');
     expect(
@@ -1632,6 +1656,78 @@ describe('tenant registry (#83:reconcile)', () => {
     expect(api.objects.get(wdPath)).toBeDefined();
   });
 
+  it('narrows di-tenant-network only once tenant-auth-network exists (S1)', async () => {
+    const networkPath = `${collection('networking.k8s.io/v1', 'NetworkPolicy', 'di-runtime-alpha')}/di-tenant-network`;
+    const authNetworkPath = `${collection('networking.k8s.io/v1', 'NetworkPolicy', 'di-runtime-alpha')}/tenant-auth-network`;
+    const excluded = (api: MemoryApi) =>
+      (
+        api.objects.get(networkPath) as unknown as {
+          spec: { podSelector: { matchExpressions: { values: string[] }[] } };
+        }
+      ).spec.podSelector.matchExpressions[0]!.values.includes('tenant-auth');
+    // A tenant-auth step that fails before its network policy keeps the pair on the broad policy.
+    const failing = prepare();
+    failing.api.fail = (method, p) =>
+      method === 'PATCH' && p === authNetworkPath ? new ApiError(500, 'boom') : undefined;
+    const log = console.error;
+    console.error = () => {};
+    try {
+      for (let poll = 0; poll < 2; poll++)
+        await new Controller(failing.api, registryCfg).reconcileTenant(failing.t, []);
+    } finally {
+      console.error = log;
+    }
+    expect(failing.api.objects.get(authNetworkPath)).toBeUndefined();
+    expect(excluded(failing.api)).toBe(false);
+    // Otherwise the first poll applies tenant-auth-network, and the next one narrows.
+    const { api, t } = prepare();
+    const controller = new Controller(api, registryCfg);
+    await controller.reconcileTenant(t, []);
+    expect(api.objects.get(authNetworkPath)).toBeDefined();
+    expect(excluded(api)).toBe(false);
+    await controller.reconcileTenant(t, []);
+    expect(excluded(api)).toBe(true);
+    // A tenant-auth-network this installation does not own does not count.
+    api.objects.get(authNetworkPath)!.metadata.labels = {};
+    await controller.reconcileTenant(t, []);
+    expect(excluded(api)).toBe(false);
+  });
+
+  it('needs only WorkloadDeployment verbs the platform ClusterRole grants (#83 C2)', async () => {
+    const { api, t } = prepare();
+    await new Controller(api, registryCfg).reconcileTenant(t, []);
+    await new Controller(api, { ...registryCfg, tenantAuth: auth }).reconcileTenant(t, []);
+    const used = [...api.verbs]
+      .filter((entry) => entry.endsWith(' workloaddeployments'))
+      .map((entry) => entry.split(' ')[0]);
+    // The registry is created (a server-side apply of a missing object) and deleted.
+    expect(used).toContain('create');
+    expect(used).toContain('delete');
+    const granted = controllerClusterRoleRules().find((r) =>
+      r.resources.includes('workloaddeployments'),
+    )?.verbs;
+    for (const verb of used) expect(granted).toContain(verb);
+  });
+
+  it('keeps unlabelled user workloads when the registry or tenant-auth is removed (S2)', async () => {
+    const { api, t } = prepare();
+    const user = `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', 'di-tenant-alpha')}/web-prod`;
+    api.seed({
+      apiVersion: 'runtime.wasmcloud.dev/v1alpha1',
+      kind: 'WorkloadDeployment',
+      metadata: { name: 'web-prod', namespace: 'di-tenant-alpha' },
+    });
+    await new Controller(api, registryCfg).reconcileTenant(t, []);
+    await new Controller(api, { ...registryCfg, tenantAuth: auth }).reconcileTenant(t, []);
+    expect(api.objects.get(wdPath)).toBeUndefined();
+    expect(api.objects.get(user)).toBeDefined();
+    await new Controller(api, registryCfg).reconcileTenant(t, []);
+    const { tenantAuth: _, ...plain } = registryCfg;
+    await new Controller(api, plain).reconcileTenant(t, []);
+    expect(api.objects.get(wdPath)).toBeUndefined();
+    expect(api.objects.get(user)).toBeDefined();
+  });
+
   it('removes the registry with the rest of tenant-auth when tenantAuth is unset', async () => {
     const { api, t } = prepare();
     await new Controller(api, registryCfg).reconcileTenant(t, []);
@@ -1662,16 +1758,17 @@ describe('tenant registry (#83:reconcile)', () => {
         template: { spec: { components: [{ name, localResources: { allowedHosts: [host] } }] } },
       },
     });
-    const items = [
-      {
-        metadata: {
-          name: REGISTRY_WORKLOAD,
-          labels: { [OWNER]: 'alpha-uid', [INSTALLATION]: 'test' },
+    const items: { metadata: { name: string; labels?: Record<string, string> }; spec: unknown }[] =
+      [
+        {
+          metadata: {
+            name: REGISTRY_WORKLOAD,
+            labels: { [OWNER]: 'alpha-uid', [INSTALLATION]: 'test' },
+          },
+          ...component('oci-registry', 'x:1'),
         },
-        ...component('oci-registry', 'x:1'),
-      },
-      { metadata: { name: 'web-prod' }, ...component('web', 'y:1') },
-    ];
+        { metadata: { name: 'web-prod' }, ...component('web', 'y:1') },
+      ];
     const api: Api = {
       call: async <T>(method: string, p: string) => {
         if (method === 'GET' && p.endsWith('/workloaddeployments')) return { items } as T;
@@ -1683,6 +1780,17 @@ describe('tenant registry (#83:reconcile)', () => {
     await new Controller(api, registryCfg).reconcileTenantEgress(tenant(), [], new Map());
     expect(patched).toEqual([
       `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', 'di-tenant-alpha')}/web-prod?fieldManager=di-platform-egress`,
+    ]);
+    // A tenant's own di-tenant-registry without the platform labels is not skipped (S2): its
+    // egress is stripped like any other workload's.
+    patched.length = 0;
+    items.splice(0, items.length, {
+      metadata: { name: REGISTRY_WORKLOAD, labels: {} },
+      ...component('oci-registry', 'x:1'),
+    });
+    await new Controller(api, registryCfg).reconcileTenantEgress(tenant(), [], new Map());
+    expect(patched).toEqual([
+      `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', 'di-tenant-alpha')}/${REGISTRY_WORKLOAD}?fieldManager=di-platform-egress`,
     ]);
   });
 });

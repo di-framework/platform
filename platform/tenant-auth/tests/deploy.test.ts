@@ -754,6 +754,39 @@ describe('/v1/deploy', () => {
     },
   );
 
+  test("refuses a deploy whose host is the tenant registry's (platform#83)", async () => {
+    const reserved = new Controller(
+      configFromEnv({
+        TENANT_CONTROLLER_TENANT: 'acme',
+        TENANT_CONTROLLER_REGISTRY_HOST: 'Web-Prod',
+      }),
+      kube,
+      { issuer: 'https://issuer.test' } as never,
+      { resolve: async () => alice, forget: () => {} } as never,
+      { kube, namespace: 'di-runtime-acme', tenant: 'acme' },
+    );
+    for (const path of ['/v1/deploy', '/v1/deploy/preview']) {
+      const response = await reserved.handle(
+        new Request(`http://controller.test${path}`, {
+          method: 'POST',
+          headers: { authorization: 'Bearer ok', 'content-type': 'application/json' },
+          body: JSON.stringify(deployBundle()),
+        }),
+      );
+      expect(response.status).toBe(422);
+      expect(await response.json()).toMatchObject({
+        detail: 'web-prod is reserved for the tenant registry; choose another service name',
+      });
+    }
+    expect(api.requests).toHaveLength(0);
+    // With the default registry host, a service named registry deploys as registry-<env>.
+    const response = await post(
+      '/v1/deploy/preview',
+      deployBundle({ service: 'registry', bindings: [], secrets: [] }),
+    );
+    expect(response.status).not.toBe(422);
+  });
+
   test.each([
     [403, 'workloaddeployments is forbidden', 'Forbidden'],
     [409, 'Apply failed with 1 conflict', 'Conflict'],

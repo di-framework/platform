@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
-import { Controller, configFromEnv } from '../src/controller.ts';
+import { Controller, configFromEnv, REGISTRY_IDLE_TIMEOUT_SECONDS } from '../src/controller.ts';
 import { AuthError, type Principal } from '../src/identity.ts';
 import { serve } from './support/servers.ts';
 
@@ -161,5 +161,162 @@ describe('registry listeners', () => {
     const response = await down.handleRegistry(new Request('https://registry.acme.localhost/v2/'));
     expect(response.status).toBe(502);
     expect(response.headers.get('content-type')).toBe('application/problem+json');
+  });
+});
+
+/** The registry front's limits (W2 of the platform#83 review). */
+describe('registry front limits', () => {
+  const limited = configFromEnv({
+    TENANT_CONTROLLER_TENANT: 'acme',
+    TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES: '8',
+    TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS: '150',
+    TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT: '1',
+  });
+  const controller = new Controller(
+    limited,
+    {} as never,
+    { issuer: 'https://issuer.test' } as never,
+    {} as never,
+    {} as never,
+  );
+  /** Upstream request signals by path, to see whether the front aborted them. */
+  const signals = new Map<string, AbortSignal>();
+  let hold = Promise.withResolvers<void>();
+  const upstream = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    idleTimeout: 0,
+    async fetch(request) {
+      const { pathname } = new URL(request.url);
+      signals.set(pathname, request.signal);
+      if (pathname === '/hang') {
+        await hold.promise;
+        return new Response('late');
+      }
+      if (pathname === '/stream')
+        return new Response(
+          new ReadableStream({
+            async pull(c) {
+              c.enqueue(new TextEncoder().encode('chunk'));
+              await hold.promise;
+            },
+          }),
+        );
+      if (pathname === '/broken')
+        return new Response(
+          new ReadableStream({
+            start(c) {
+              c.enqueue(new TextEncoder().encode('partial'));
+              setTimeout(() => c.error(new Error('upstream secret detail')), 20);
+            },
+          }),
+        );
+      if (request.method === 'HEAD') return new Response(null, { status: 200 });
+      return new Response(`ok ${await request.text()}`);
+    },
+  });
+  controller.proxyUpstream = () => `http://127.0.0.1:${upstream.port}`;
+  let log: ReturnType<typeof spyOn>;
+  beforeAll(() => {
+    log = spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterAll(() => {
+    log.mockRestore();
+    hold.resolve();
+    upstream.stop(true);
+  });
+  const call = (path: string, init: RequestInit = {}) =>
+    controller.handleRegistry(new Request(`https://registry.acme.localhost${path}`, init));
+  /** The single slot is free again: a plain request goes through. */
+  const free = async () => {
+    const response = await call('/v2/');
+    expect(response.status).toBe(200);
+    await response.text();
+  };
+
+  test('reads the limits from the environment, with defaults', () => {
+    const defaults = configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme' });
+    expect(defaults.registryMaxBodyBytes).toBe(512 * 1024 * 1024);
+    expect(defaults.registryUpstreamTimeoutMs).toBe(60_000);
+    expect(defaults.registryMaxConcurrent).toBe(16);
+    expect(REGISTRY_IDLE_TIMEOUT_SECONDS).toBeGreaterThan(0);
+    expect(REGISTRY_IDLE_TIMEOUT_SECONDS).toBeLessThanOrEqual(255);
+    for (const bad of ['0', '-1', 'x', '1.5'])
+      expect(() =>
+        configFromEnv({
+          TENANT_CONTROLLER_TENANT: 'acme',
+          TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT: bad,
+        }),
+      ).toThrow('TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT must be a positive integer');
+  });
+
+  test('refuses a declared body over the cap with 413 before contacting the registry', async () => {
+    signals.clear();
+    for (const length of ['9', 'nonsense']) {
+      const response = await call('/v2/app/blobs/uploads/1', {
+        method: 'PUT',
+        headers: { 'content-length': length },
+        body: 'x'.repeat(9),
+      });
+      expect(response.status).toBe(413);
+      expect(response.headers.get('content-type')).toBe('application/problem+json');
+    }
+    expect(signals.size).toBe(0);
+    const ok = await call('/v2/app/blobs/uploads/1', { method: 'PUT', body: '12345678' });
+    expect(await ok.text()).toBe('ok 12345678');
+  });
+
+  test('answers 504 without upstream details when the registry does not answer in time', async () => {
+    hold = Promise.withResolvers<void>();
+    const response = await call('/hang');
+    expect(response.status).toBe(504);
+    const body = await response.text();
+    expect(body).toContain('did not answer in time');
+    expect(body).not.toContain('127.0.0.1');
+    await Bun.sleep(20);
+    expect(signals.get('/hang')?.aborted).toBe(true);
+    hold.resolve();
+    await free();
+  });
+
+  test('answers 503 beyond the concurrency limit and frees the slot when the client goes away', async () => {
+    hold = Promise.withResolvers<void>();
+    const client = new AbortController();
+    const pending = call('/hang', { signal: client.signal });
+    await Bun.sleep(20);
+    const busy = await call('/v2/');
+    expect(busy.status).toBe(503);
+    expect(busy.headers.get('content-type')).toBe('application/problem+json');
+    client.abort();
+    expect((await pending).status).toBe(502);
+    await Bun.sleep(20);
+    expect(signals.get('/hang')?.aborted).toBe(true);
+    hold.resolve();
+    await free();
+  });
+
+  test('a client that stops reading cancels the upstream body and frees the slot', async () => {
+    hold = Promise.withResolvers<void>();
+    const response = await call('/stream');
+    const reader = response.body!.getReader();
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe('chunk');
+    await reader.cancel();
+    await Bun.sleep(20);
+    expect(signals.get('/stream')?.aborted).toBe(true);
+    hold.resolve();
+    await free();
+  });
+
+  test('a failed upstream body ends the client response and frees the slot', async () => {
+    const response = await call('/broken');
+    expect(response.text()).rejects.toBeDefined();
+    await Bun.sleep(50);
+    await free();
+  });
+
+  test('a response without a body frees the slot at once', async () => {
+    const response = await call('/v2/', { method: 'HEAD' });
+    expect(response.status).toBe(200);
+    await free();
   });
 });
