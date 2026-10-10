@@ -452,8 +452,14 @@ function hostInterfaceAdmissionExpression(): string {
          (h.interfaces == ['prepared'] && h.name.endsWith('-prepared') && size(h.name) > 9 &&
           h.secretFrom[0].name == '${BINDING_CONFIG_PREFIX}' + h.name.substring(0, size(h.name) - 9) + '-creds')))))`;
 
+  // Bind-time config for the tenant registry (#83): only the platform controller may set it, so a
+  // tenant can neither repoint the registry's whoami URL nor read other config through it.
+  const secrets = `(variables.controller && h['namespace'] == 'wasmcloud' &&
+    h['package'] == 'secrets' && ${unnamed} && ${noSecretReferences} && ${noConfigReferences})`;
+
   return `!has(variables.w.hostInterfaces) || variables.w.hostInterfaces.all(h,
-    (${wasi} || ${wasiLogging} || ${keyvalue} || ${messaging} || ${blobstore} || ${postgres}))`;
+    (${wasi} || ${wasiLogging} || ${keyvalue} || ${messaging} || ${blobstore} || ${postgres} ||
+      ${secrets}))`;
 }
 
 function localsOf(spec: string): string {

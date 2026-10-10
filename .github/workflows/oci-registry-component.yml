@@ -67,11 +67,23 @@ jobs:
           echo "${GHCR_TOKEN}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
           cd platform/oci-registry/dist
           # The Wasm OCI config (oci-wasm WasmConfig, what wkg and wash write):
-          # created, architecture "wasm", os "wasip2" and the layer digests.
+          # created, architecture "wasm", os "wasip2", the layer digests and,
+          # because the CNCF Wasm OCI layout requires it for wasip2, the
+          # `component` field listing the world's imports and exports (read
+          # from the WIT that `make build` recovered from the component).
           created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           layer="sha256:$(sha256sum di-framework-oci-registry.wasm | cut -d' ' -f1)"
+          wit_items() { sed -nE "s/^[[:space:]]*$1 ([^;{ ]+);.*/\\1/p" di-framework-oci-registry.wit | jq -R . | jq -s .; }
+          imports="$(wit_items import)"
+          exports="$(wit_items export)"
+          if [[ "$(jq length <<<"${exports}")" == 0 ]]; then
+            echo "::error::no exports found in di-framework-oci-registry.wit"
+            exit 1
+          fi
           jq -n --arg created "${created}" --arg layer "${layer}" \
-            '{created: $created, architecture: "wasm", os: "wasip2", layerDigests: [$layer]}' \
+            --argjson imports "${imports}" --argjson exports "${exports}" \
+            '{created: $created, architecture: "wasm", os: "wasip2", layerDigests: [$layer],
+              component: {imports: $imports, exports: $exports}}' \
             > config.json
           ref="ghcr.io/di-framework/oci-registry:${GITHUB_SHA}"
           oras push "${ref}" \

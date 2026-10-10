@@ -110,7 +110,18 @@ impl Target {
 /// and loopback (for `wash dev`).
 fn is_cluster_local(authority: &str) -> bool {
     let host = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split_once(']').map_or("", |(host, _)| host)
+        // After `]` only nothing or `:<digits>` (a port) may follow.
+        match rest.split_once(']') {
+            Some((host, "")) => host,
+            Some((host, port))
+                if port.len() > 1
+                    && port.starts_with(':')
+                    && port[1..].bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                host
+            }
+            _ => return false,
+        }
     } else {
         authority.split(':').next().unwrap_or("")
     };
@@ -245,6 +256,7 @@ mod tests {
             "http://localhost:8788",
             "http://127.0.0.1:8788",
             "http://[::1]:8788",
+            "http://[::1]",
             "https://controller.example.com",
         ] {
             assert!(Target::parse(ok).is_some(), "{ok}");
@@ -261,6 +273,12 @@ mod tests {
             "http://127.0.0.1.nip.io",
             "http://localhost.evil",
             "http://127.attacker.example:8788",
+            "http://[::1]evil.example",
+            "http://[::1].attacker.example",
+            "http://[::1]:",
+            "http://[::1]:80x",
+            "http://[::1]:8788:1",
+            "http://[::1",
         ] {
             assert_eq!(Target::parse(bad), None, "{bad}");
         }

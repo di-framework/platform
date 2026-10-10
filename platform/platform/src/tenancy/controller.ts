@@ -60,6 +60,7 @@ import {
   NAMESPACE_ROLE,
   names,
   OWNER,
+  REGISTRY_WORKLOAD,
   type Resource,
   ROUTES_CONFIG_NAME,
   resource,
@@ -72,6 +73,7 @@ import {
   tenantAuthResources,
   tenantAuthRoutes,
   tenantControllerCertNames,
+  tenantQuota,
   tenantResources,
   type User,
   userResources,
@@ -256,6 +258,8 @@ const TENANT_AUTH_KINDS = [
   ['v1', 'Secret'],
   ['v1', 'ConfigMap'],
   ['v1', 'ServiceAccount'],
+  // The tenant registry (#83) carries the same component label.
+  ['runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment'],
 ] as const;
 
 export class Controller {
@@ -549,6 +553,7 @@ export class Controller {
       secret,
       storageKeys(workloads),
       await this.tenantAuthDeployed(tenant),
+      await this.registryDeployed(tenant),
     );
     let ready = !!secret;
     let failure: unknown;
@@ -641,7 +646,11 @@ export class Controller {
       // Gateway policies for hosts that are no longer routed, pruned before anything is applied
       // so de-routing holds even when a later apply fails.
       const namespace = names(tenant.metadata.name).runtimeNamespace;
-      for (const policy of ['tenant-console-gateway', 'tenant-controller-gateway']) {
+      for (const policy of [
+        'tenant-console-gateway',
+        'tenant-controller-gateway',
+        'tenant-registry-gateway',
+      ]) {
         if (desired.some((value) => value.metadata.name === policy)) continue;
         const stale = await this.get<Resource>(
           `${collection('networking.k8s.io/v1', 'NetworkPolicy', namespace)}/${policy}`,
@@ -652,11 +661,32 @@ export class Controller {
         )
           await this.remove(stale);
       }
-      // Raise the quota right before the pair so its pods fit when they are created (#121).
+      // The registry is no longer configured: remove it, then give its workload slot back.
+      if (!this.cfg.tenantAuth.registry) {
+        const stale = await this.get<Resource>(
+          `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', names(tenant.metadata.name).namespace)}/${REGISTRY_WORKLOAD}`,
+        );
+        if (
+          stale?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+          stale.metadata.labels[OWNER] === tenant.metadata.uid
+        ) {
+          await this.remove(stale);
+          await this.ensure(tenantQuota(tenant, this.cfg, false));
+        }
+      }
+      // Raise the quota right before the pair so its pods fit when they are created (#121), and
+      // the tenant quota right before the registry so it takes no workload slot of the tenant's.
       await this.ensure(runtimeQuota(tenant, this.cfg, true));
+      if (this.cfg.tenantAuth.registry) await this.ensure(tenantQuota(tenant, this.cfg, true));
       let ready = true;
+      const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
       for (const value of desired) {
         const applied = await this.ensure(value);
+        if (value.kind === 'WorkloadDeployment' && !suspended) {
+          const conditions = (applied.status as { conditions?: Condition[] } | undefined)
+            ?.conditions;
+          ready &&= !!conditions?.some((c) => c.type === 'Ready' && c.status === 'True');
+        }
         if (value.kind === 'Deployment') {
           const spec = applied.spec as { replicas: number };
           const status = applied.status as
@@ -669,9 +699,12 @@ export class Controller {
       }
       const { problems } = tenantAuthRoutes(this.cfg.tenantAuth, this.cfg.routeUrlPattern);
       if (problems.length) return condition(false, 'RouteError', problems.join('; '));
+      const what = this.cfg.tenantAuth.registry
+        ? 'tenant controller, console and registry'
+        : 'tenant controller and console';
       return ready
-        ? condition(true, 'Reconciled', 'Tenant controller and console are ready')
-        : condition(false, 'Provisioning', 'Waiting for the tenant controller and console');
+        ? condition(true, 'Reconciled', `T${what.slice(1)} are ready`)
+        : condition(false, 'Provisioning', `Waiting for the ${what}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Tenant-auth reconcile failed';
       console.error(`Tenant/${tenant.metadata.name} tenant-auth: ${message}`);
@@ -680,6 +713,8 @@ export class Controller {
         // Never leave the quota raised for a pair that was not applied (#121).
         if (!(await this.tenantAuthDeployed(tenant)))
           await this.ensure(runtimeQuota(tenant, this.cfg, false));
+        if (!(await this.registryDeployed(tenant)))
+          await this.ensure(tenantQuota(tenant, this.cfg, false));
       } catch {
         /* The tenant step lowers it on the next poll. */
       }
@@ -700,6 +735,21 @@ export class Controller {
       names(tenant.metadata.name).runtimeNamespace,
     );
     return deployments.length > 0;
+  }
+  /** Whether the tenant registry of `tenant` exists, i.e. the tenant quota may stay raised. */
+  private async registryDeployed(tenant: Tenant): Promise<boolean> {
+    if (!this.cfg.tenantAuth?.registry) return false;
+    const workloads = await this.list<Resource>(
+      'runtime.wasmcloud.dev/v1alpha1',
+      'WorkloadDeployment',
+      {
+        [INSTALLATION]: this.cfg.installation,
+        [OWNER]: tenant.metadata.uid!,
+        [COMPONENT]: 'tenant-auth',
+      },
+      names(tenant.metadata.name).namespace,
+    );
+    return workloads.length > 0;
   }
   /**
    * Delete every tenant-auth object this installation created for `tenant`, including the
@@ -1383,6 +1433,13 @@ export class Controller {
         )
       )?.items ?? [];
     for (const workload of workloads) {
+      // The tenant registry's egress (its whoami call) is the platform's own, not a grant.
+      if (
+        workload.metadata.name === REGISTRY_WORKLOAD &&
+        workload.metadata.labels?.[OWNER] === tenant.metadata.uid &&
+        workload.metadata.labels?.[INSTALLATION] === this.cfg.installation
+      )
+        continue;
       const approved = grants.get(workload.metadata.name) ?? [];
       const patch = egressPatch(
         { ...workload, metadata: { ...workload.metadata, namespace: n.namespace } },

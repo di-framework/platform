@@ -10,7 +10,9 @@ import {
   INSTALLATION,
   ISSUER_PROXY_IMAGE,
   OWNER,
+  REGISTRY_WORKLOAD,
   type Resource,
+  registryHttpHost,
   TENANT,
   TENANT_AUTH_LIMITS,
   type Tenant,
@@ -19,6 +21,7 @@ import {
   tenantAuthResources,
   tenantAuthRoutes,
   tenantControllerCertNames,
+  tenantRegistryPublicUrl,
   tenantResources,
   tlsCertDigest,
   type User,
@@ -229,6 +232,7 @@ describe('tenantAuthResources', () => {
       'RoleBinding/di-runtime-alpha/tenant-controller-keys',
       'RoleBinding/di-tenant-alpha/tenant-controller-secret-reader',
       'NetworkPolicy/di-runtime-alpha/tenant-auth-egress',
+      'NetworkPolicy/di-runtime-alpha/tenant-auth-network',
       'ConfigMap/di-runtime-alpha/tenant-controller-ca',
       'Secret/di-runtime-alpha/tenant-controller-tls',
       'Secret/di-runtime-alpha/tenant-console-oauth',
@@ -917,12 +921,12 @@ describe('reconcileTenant with tenant-auth', () => {
     const unset = new Controller(counting, plain);
     const other = tenant();
     await unset.reconcileTenant(t, []);
-    expect(lists).toHaveLength(10);
+    expect(lists).toHaveLength(11); // TENANT_AUTH_KINDS, the registry WorkloadDeployment included
     expect(tenantAuthObjects(api)).toEqual([]);
     lists.length = 0;
     await unset.reconcileTenant(t, []);
     await unset.reconcileTenant(other, []);
-    expect(lists).toHaveLength(10);
+    expect(lists).toHaveLength(11); // TENANT_AUTH_KINDS, the registry WorkloadDeployment included
     lists.length = 0;
     await unset.reconcileTenant(t, []);
     await unset.reconcileTenant(other, []);
@@ -1327,5 +1331,358 @@ describe('tenant-auth gateway routes (#58:routes)', () => {
     }).reconcileTenant(t, []);
     expect(api.objects.get(path)).toBeUndefined();
     expect(t.status?.conditions?.find((c) => c.type === 'TenantAuthReady')?.status).toBe('False');
+  });
+});
+
+describe('tenant registry (#83:reconcile)', () => {
+  const COMPONENT_REF = `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}`;
+  const pattern = 'http://{host}.{tenant}.localhost:28180';
+  const withRegistry: TenantAuthConfig = {
+    ...auth,
+    registry: { component: COMPONENT_REF, publicUrl: 'https://registry.{tenant}.localhost:28180' },
+  };
+  const registryCfg: ControllerConfig = {
+    ...cfg,
+    routeUrlPattern: pattern,
+    tenantAuth: withRegistry,
+  };
+  const wdPath = `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', 'di-tenant-alpha')}/${REGISTRY_WORKLOAD}`;
+  const tenantQuotaPath = `${collection('v1', 'ResourceQuota', 'di-tenant-alpha')}/di-tenant-quota`;
+  const workloads = (api: MemoryApi) =>
+    (api.objects.get(tenantQuotaPath) as unknown as { spec: { hard: Record<string, string> } }).spec
+      .hard['count/workloaddeployments.runtime.wasmcloud.dev'];
+  const authCondition = (t: Tenant) =>
+    t.status?.conditions?.find((c) => c.type === 'TenantAuthReady');
+  type Workload = Resource & {
+    spec: {
+      replicas: number;
+      template: {
+        spec: {
+          environment: string;
+          hostSelector: Record<string, string>;
+          components: unknown[];
+          hostInterfaces: unknown[];
+        };
+      };
+    };
+  };
+  const hard = (value: Resource | undefined) =>
+    (value as unknown as { spec: { hard: Record<string, string> } }).spec.hard;
+
+  it('requires a digest-pinned registry component and a URL', () => {
+    expect(() => assertTenantAuthConfig(withRegistry)).not.toThrow();
+    expect(() =>
+      assertTenantAuthConfig({
+        ...auth,
+        registry: { component: 'ghcr.io/di-framework/oci-registry:latest' },
+      }),
+    ).toThrow('tenantAuth.registry.component must be pinned by digest');
+    expect(() =>
+      assertTenantAuthConfig({ ...auth, registry: {} as { component: string } }),
+    ).toThrow('tenantAuth.registry.component must be pinned by digest');
+    expect(() =>
+      assertTenantAuthConfig({
+        ...auth,
+        registry: { component: COMPONENT_REF, publicUrl: 'not a url' },
+      }),
+    ).toThrow('tenantAuth.registry.publicUrl must be a URL');
+  });
+
+  it('routes the registry host through the gateway and always blocks it over plain HTTP', () => {
+    expect(tenantAuthRoutes(withRegistry, pattern)).toMatchObject({
+      routes: { console: 'console', registry: 'registry' },
+      urls: { registry: 'https://registry.{tenant}.localhost:28180' },
+      problems: [],
+    });
+    // A port-forwarded registry still has its HTTP host refused by a published gateway.
+    const forwarded = { ...auth, registry: { component: COMPONENT_REF } };
+    expect(tenantAuthRoutes(forwarded, pattern).routes.registry).toBe('registry');
+    expect(tenantAuthRoutes(forwarded, pattern).urls.registry).toBeUndefined();
+    expect(tenantAuthRoutes(forwarded, undefined).routes).toEqual({});
+    const oci = {
+      ...auth,
+      registry: { component: COMPONENT_REF, publicUrl: 'https://oci.{tenant}.localhost:28180' },
+    };
+    expect(tenantAuthRoutes(oci, pattern).routes.registry).toBe('oci');
+    const at = (publicUrl: string) =>
+      tenantAuthRoutes({ ...auth, registry: { component: COMPONENT_REF, publicUrl } }, pattern)
+        .problems;
+    expect(at('http://registry.{tenant}.localhost:28180')).toEqual([
+      'tenantAuth.registry.publicUrl must use https://',
+    ]);
+    expect(at('https://console.{tenant}.localhost:28180')).toEqual([
+      'tenantAuth.registry.publicUrl must not share the console host',
+    ]);
+    expect(
+      tenantAuthRoutes(
+        { ...forwarded, consolePublicUrl: 'http://registry.{tenant}.localhost:28180' },
+        pattern,
+      ).problems,
+    ).toEqual(['tenantAuth.registry.publicUrl must not share the console host']);
+  });
+
+  it('names the registry HTTP host from a gateway-shaped URL, else registry', () => {
+    const at = (publicUrl: string) =>
+      registryHttpHost({ ...auth, registry: { component: COMPONENT_REF, publicUrl } });
+    expect(registryHttpHost(undefined)).toBe('registry');
+    expect(registryHttpHost(withRegistry)).toBe('registry');
+    expect(at('https://OCI.{tenant}.localhost')).toBe('oci');
+    expect(at('https://a_b.{tenant}.localhost')).toBe('registry');
+    expect(tenantRegistryPublicUrl('alpha', withRegistry)).toBe(
+      'https://registry.alpha.localhost:28180',
+    );
+    expect(
+      tenantRegistryPublicUrl('alpha', { ...auth, registry: { component: COMPONENT_REF } }),
+    ).toBe('https://127.0.0.1:8790');
+  });
+
+  it('renders the registry workload, the whoami listener and the registry front', () => {
+    const resources = tenantAuthResources(tenant(), registryCfg, inputs);
+    const workload = find(resources, 'WorkloadDeployment', REGISTRY_WORKLOAD) as Workload;
+    expect(workload.metadata.namespace).toBe('di-tenant-alpha');
+    expect(workload.metadata.labels).toMatchObject({
+      [COMPONENT]: 'tenant-auth',
+      [OWNER]: 'alpha-uid',
+      [INSTALLATION]: 'test',
+    });
+    expect(workload.spec.replicas).toBe(1);
+    const spec = workload.spec.template.spec;
+    expect(spec.environment).toBe('di-tenant-alpha');
+    expect(spec.hostSelector).toEqual({ hostgroup: 'tenant-alpha' });
+    expect(spec.components).toEqual([
+      {
+        name: 'oci-registry',
+        image: COMPONENT_REF,
+        localResources: { allowedHosts: ['tenant-controller.di-runtime-alpha.svc:8789'] },
+      },
+    ]);
+    expect(spec.hostInterfaces).toEqual([
+      {
+        namespace: 'wasi',
+        package: 'http',
+        version: '0.3.0',
+        interfaces: ['handler'],
+        config: { host: 'registry' },
+      },
+      {
+        namespace: 'wasmcloud',
+        package: 'blobstore',
+        version: '0.1.0',
+        interfaces: ['blobstore', 'container', 'types'],
+      },
+      {
+        namespace: 'wasmcloud',
+        package: 'secrets',
+        interfaces: ['store', 'reveal'],
+        config: {
+          'tenant-controller-url': 'http://tenant-controller.di-runtime-alpha.svc:8789',
+          tenant: 'alpha',
+        },
+      },
+    ]);
+    const controller = find(resources, 'Deployment', 'tenant-controller') as Deployment;
+    expect(env(controller)).toMatchObject({
+      TENANT_CONTROLLER_WHOAMI_PORT: '8789',
+      TENANT_CONTROLLER_REGISTRY_FRONT_PORT: '8790',
+      TENANT_CONTROLLER_REGISTRY_HOST: 'registry',
+      TENANT_CONTROLLER_REGISTRY_URL: 'https://registry.alpha.localhost:28180',
+    });
+    expect(
+      (controller.spec.template.spec.containers[0] as unknown as { ports: unknown[] }).ports,
+    ).toEqual([
+      { containerPort: 8788, name: 'http' },
+      { containerPort: 8789, name: 'whoami' },
+      { containerPort: 8790, name: 'registry' },
+    ]);
+    expect(find(resources, 'Service', 'tenant-controller')).toMatchObject({
+      spec: {
+        ports: [
+          { port: 8788, targetPort: 8788, name: 'http' },
+          { port: 8789, targetPort: 8789, name: 'whoami' },
+          { port: 8790, targetPort: 8790, name: 'registry' },
+        ],
+      },
+    });
+    // Only the tenant hosts reach the whoami listener; only the gateway the registry front.
+    expect(find(resources, 'NetworkPolicy', 'tenant-auth-network')).toMatchObject({
+      spec: {
+        podSelector: { matchLabels: { [COMPONENT]: 'tenant-auth' } },
+        ingress: [
+          { ports: [{ protocol: 'TCP', port: 8788 }] },
+          {
+            from: [
+              {
+                podSelector: {
+                  matchLabels: {
+                    'wasmcloud.com/hostgroup': 'tenant-alpha',
+                    'wasmcloud.com/name': 'hostgroup',
+                  },
+                },
+              },
+            ],
+            ports: [{ protocol: 'TCP', port: 8789 }],
+          },
+        ],
+      },
+    });
+    expect(find(resources, 'NetworkPolicy', 'tenant-registry-gateway')).toMatchObject({
+      spec: {
+        podSelector: { matchLabels: { app: 'tenant-controller' } },
+        ingress: [{ ports: [{ protocol: 'TCP', port: 8790 }] }],
+      },
+    });
+    // Without a registry, none of it.
+    const plain = tenantAuthResources(tenant(), { ...registryCfg, tenantAuth: auth }, inputs);
+    expect(find(plain, 'WorkloadDeployment', REGISTRY_WORKLOAD)).toBeUndefined();
+    expect(env(find(plain, 'Deployment', 'tenant-controller') as Deployment)).not.toHaveProperty(
+      'TENANT_CONTROLLER_REGISTRY_URL',
+    );
+    const plainNetwork = find(plain, 'NetworkPolicy', 'tenant-auth-network') as unknown as {
+      spec: { ingress: unknown[] };
+    };
+    expect(plainNetwork.spec.ingress).toHaveLength(1);
+    // A suspended tenant keeps the registry at zero replicas.
+    const suspended = tenantAuthResources(tenant({ suspended: true }), registryCfg, inputs);
+    const stopped = find(suspended, 'WorkloadDeployment', REGISTRY_WORKLOAD) as Workload;
+    expect(stopped.spec.replicas).toBe(0);
+  });
+
+  it('keeps tenant-auth pods out of di-tenant-network and grows the workload quota by one', () => {
+    const resources = tenantResources(tenant(), cfg, undefined, [], false, true);
+    const key = 'count/workloaddeployments.runtime.wasmcloud.dev';
+    expect(hard(find(resources, 'ResourceQuota', 'di-tenant-quota'))[key]).toBe('21');
+    expect(
+      hard(find(tenantResources(tenant(), cfg), 'ResourceQuota', 'di-tenant-quota'))[key],
+    ).toBe('20');
+    const network = find(resources, 'NetworkPolicy', 'di-tenant-network') as unknown as {
+      spec: { podSelector: { matchExpressions: { values: string[] }[] }; egress: unknown[] };
+    };
+    expect(network.spec.podSelector.matchExpressions[0]!.values).toContain('tenant-auth');
+    // The pair keeps exactly the egress it had through di-tenant-network.
+    const pair = find(
+      tenantAuthResources(tenant(), registryCfg, inputs),
+      'NetworkPolicy',
+      'tenant-auth-network',
+    ) as unknown as { spec: { egress: unknown[] } };
+    expect(pair.spec.egress).toEqual(network.spec.egress);
+  });
+
+  it('covers the registry public host in the controller certificate', () => {
+    expect(tenantControllerCertNames('alpha', withRegistry).dns).toContain(
+      'registry.alpha.localhost',
+    );
+    expect(
+      tenantControllerCertNames('alpha', {
+        ...auth,
+        registry: { component: COMPONENT_REF, publicUrl: 'https://10.1.2.3:8790' },
+      }).ips,
+    ).toContain('10.1.2.3');
+  });
+
+  it('deploys the registry after raising the workload quota and reports it on TenantAuthReady', async () => {
+    const { api, t } = prepare();
+    const controller = new Controller(api, registryCfg);
+    await controller.reconcileTenant(t, []);
+    expect(api.objects.get(wdPath)).toBeDefined();
+    const workload = api.patches.indexOf(wdPath);
+    expect(api.patches.lastIndexOf(tenantQuotaPath, workload)).toBeGreaterThan(-1);
+    expect(workloads(api)).toBe('21');
+    expect(authCondition(t)).toMatchObject({
+      status: 'False',
+      reason: 'Provisioning',
+      message: 'Waiting for the tenant controller, console and registry',
+    });
+    expect(t.status?.conditions?.find((c) => c.type === 'Ready')?.status).toBe('True');
+    api.objects.get(wdPath)!.status = { conditions: ready };
+    await controller.reconcileTenant(t, []);
+    expect(authCondition(t)).toMatchObject({
+      status: 'True',
+      reason: 'Reconciled',
+      message: 'Tenant controller, console and registry are ready',
+    });
+    // The tenant step keeps the slot while the registry exists.
+    expect(workloads(api)).toBe('21');
+    // A suspended tenant does not wait for its stopped registry.
+    api.objects.get(wdPath)!.status = {};
+    t.spec.suspended = true;
+    await controller.reconcileTenant(t, []);
+    expect(authCondition(t)).toMatchObject({ reason: 'Reconciled' });
+  });
+
+  it('removes the registry and its quota slot when the registry is unset', async () => {
+    const { api, t } = prepare();
+    await new Controller(api, registryCfg).reconcileTenant(t, []);
+    expect(api.objects.get(wdPath)).toBeDefined();
+    const without = new Controller(api, { ...registryCfg, tenantAuth: auth });
+    await without.reconcileTenant(t, []);
+    expect(api.objects.get(wdPath)).toBeUndefined();
+    expect(workloads(api)).toBe('20');
+    expect(
+      api.objects.get(
+        `${collection('networking.k8s.io/v1', 'NetworkPolicy', 'di-runtime-alpha')}/tenant-registry-gateway`,
+      ),
+    ).toBeUndefined();
+    // A workload of that name this installation does not own is left alone.
+    api.seed({
+      apiVersion: 'runtime.wasmcloud.dev/v1alpha1',
+      kind: 'WorkloadDeployment',
+      metadata: { name: REGISTRY_WORKLOAD, namespace: 'di-tenant-alpha' },
+    });
+    await without.reconcileTenant(t, []);
+    expect(api.objects.get(wdPath)).toBeDefined();
+  });
+
+  it('removes the registry with the rest of tenant-auth when tenantAuth is unset', async () => {
+    const { api, t } = prepare();
+    await new Controller(api, registryCfg).reconcileTenant(t, []);
+    const { tenantAuth: _, ...plain } = registryCfg;
+    await new Controller(api, plain).reconcileTenant(t, []);
+    expect(api.objects.get(wdPath)).toBeUndefined();
+  });
+
+  it('gives the quota slot back when the registry could not be applied', async () => {
+    const { api, t } = prepare();
+    api.fail = (method, p) =>
+      method === 'PATCH' && p === wdPath ? new ApiError(409, 'conflict') : undefined;
+    const log = console.error;
+    console.error = () => {};
+    try {
+      await new Controller(api, registryCfg).reconcileTenant(t, []);
+    } finally {
+      console.error = log;
+    }
+    expect(authCondition(t)).toMatchObject({ status: 'False', reason: 'ReconcileError' });
+    expect(workloads(api)).toBe('20');
+  });
+
+  it('leaves the registry’s own egress out of the egress grants', async () => {
+    const patched: string[] = [];
+    const component = (name: string, host: string) => ({
+      spec: {
+        template: { spec: { components: [{ name, localResources: { allowedHosts: [host] } }] } },
+      },
+    });
+    const items = [
+      {
+        metadata: {
+          name: REGISTRY_WORKLOAD,
+          labels: { [OWNER]: 'alpha-uid', [INSTALLATION]: 'test' },
+        },
+        ...component('oci-registry', 'x:1'),
+      },
+      { metadata: { name: 'web-prod' }, ...component('web', 'y:1') },
+    ];
+    const api: Api = {
+      call: async <T>(method: string, p: string) => {
+        if (method === 'GET' && p.endsWith('/workloaddeployments')) return { items } as T;
+        if (method === 'PATCH') patched.push(p);
+        if (method === 'GET') throw new ApiError(404, 'Not found');
+        return {} as T;
+      },
+    };
+    await new Controller(api, registryCfg).reconcileTenantEgress(tenant(), [], new Map());
+    expect(patched).toEqual([
+      `${collection('runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment', 'di-tenant-alpha')}/web-prod?fieldManager=di-platform-egress`,
+    ]);
   });
 });

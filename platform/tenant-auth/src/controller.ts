@@ -20,7 +20,12 @@ import {
 import { discover, type ProviderMetadata } from './oidc.ts';
 import { controllerSecretReader } from './v1/context.ts';
 import { serveV1 } from './v1/index.ts';
-import { PASSTHROUGH, servePassthrough, tenantUpstream } from './v1/proxy.ts';
+import {
+  PASSTHROUGH,
+  servePassthrough,
+  tenantUpstream,
+  upstreamRequestHeaders,
+} from './v1/proxy.ts';
 
 export interface ControllerConfig {
   tenant: string;
@@ -42,6 +47,20 @@ export interface ControllerConfig {
    * configured one. Set from `TENANT_CONTROLLER_REGISTRY_URL`, where `{tenant}` stands for the tenant.
    */
   registryUrl?: string;
+  /**
+   * Plain-HTTP listener serving only `GET /v1/auth/whoami`, for the tenant registry component on
+   * the tenant's hosts (platform#83). NetworkPolicy admits only the host pods to it. Unset: none.
+   */
+  whoamiPort?: number;
+  /**
+   * TLS listener (same certificate as `port`) that fronts the tenant registry: every request is
+   * forwarded to the tenant hosts with `Host: registryHost`. The gateway passes TLS for the
+   * registry's public host through to it, so registry credentials never cross plain HTTP before
+   * the cluster. Unset: none.
+   */
+  registryFrontPort?: number;
+  /** The registry workload's `wasi:http` host, sent as `Host` upstream. Default `registry`. */
+  registryHost: string;
 }
 
 /**
@@ -84,6 +103,17 @@ export function registryOrigin(pattern: string | undefined, tenant: string): str
   return url.origin;
 }
 
+function optionalPort(value: string | undefined, name: string): number | undefined {
+  if (!value) return undefined;
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535)
+    throw new Error(`${name} must be a TCP port`);
+  return port;
+}
+
+/** Headers never relayed back from the registry: hop-by-hop. */
+const HOP_BY_HOP_RESPONSE = new Set(['connection', 'keep-alive', 'transfer-encoding']);
+
 export function configFromEnv(env = process.env): ControllerConfig {
   const required = (name: string) => {
     const value = env[name];
@@ -104,6 +134,12 @@ export function configFromEnv(env = process.env): ControllerConfig {
     tokenTtlSeconds: Number(env.TENANT_CONTROLLER_TOKEN_TTL ?? 3600),
     cliClientId: env.TENANT_CONTROLLER_CLI_CLIENT_ID ?? 'tenant-cli',
     registryUrl: registryOrigin(env.TENANT_CONTROLLER_REGISTRY_URL, tenant),
+    whoamiPort: optionalPort(env.TENANT_CONTROLLER_WHOAMI_PORT, 'TENANT_CONTROLLER_WHOAMI_PORT'),
+    registryFrontPort: optionalPort(
+      env.TENANT_CONTROLLER_REGISTRY_FRONT_PORT,
+      'TENANT_CONTROLLER_REGISTRY_FRONT_PORT',
+    ),
+    registryHost: env.TENANT_CONTROLLER_REGISTRY_HOST || 'registry',
   };
 }
 
@@ -301,6 +337,93 @@ export class Controller {
     }
   }
 
+  /**
+   * The whoami-only listener (platform#83): `GET /v1/auth/whoami` with the same answer as the
+   * main listener, and nothing else. Every error is a problem+json, as the `/v1` contract says.
+   */
+  async handleWhoami(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname !== '/v1/auth/whoami')
+      return problem(404, 'Not Found', 'this listener serves only GET /v1/auth/whoami');
+    if (request.method !== 'GET') {
+      const response = problem(405, 'Method Not Allowed', 'only GET is allowed');
+      response.headers.set('allow', 'GET');
+      return response;
+    }
+    try {
+      return json(await this.identity.resolve(request.headers.get('authorization')));
+    } catch (error) {
+      if (error instanceof AuthError) {
+        this.audit('request.denied', {
+          method: request.method,
+          path: url.pathname,
+          listener: 'whoami',
+          status: error.status,
+          reason: error.message,
+        });
+        return problem(
+          error.status,
+          error.status === 401 ? 'Unauthorized' : 'Forbidden',
+          error.message,
+        );
+      }
+      this.audit('request.failed', {
+        path: url.pathname,
+        listener: 'whoami',
+        reason: String(error),
+      });
+      return problem(502, 'Bad Gateway', 'the identity provider or cluster is unavailable');
+    }
+  }
+
+  /**
+   * The registry front (platform#83): forwards every request, credentials included (the registry
+   * authorizes it by calling whoami), to the tenant hosts with `Host: registryHost`, streaming
+   * both bodies. The controller does not authenticate here; it only terminates TLS.
+   */
+  async handleRegistry(
+    request: Request,
+    server?: { requestIP(request: Request): { address: string } | null },
+  ): Promise<Response> {
+    const url = new URL(request.url);
+    const headers = upstreamRequestHeaders(
+      request,
+      url,
+      this.config.registryHost,
+      server?.requestIP(request)?.address,
+    );
+    const authorization = request.headers.get('authorization');
+    if (authorization) headers.set('authorization', authorization);
+    const length = request.headers.get('content-length');
+    if (length) headers.set('content-length', length);
+    let upstream: Response;
+    try {
+      upstream = await fetch(
+        `${this.proxyUpstream(this.config.tenant)}${url.pathname}${url.search}`,
+        {
+          method: request.method,
+          headers,
+          body: request.body,
+          duplex: 'half',
+          redirect: 'manual',
+          decompress: false,
+        } as RequestInit,
+      );
+    } catch (error) {
+      this.audit('request.failed', {
+        path: url.pathname,
+        listener: 'registry',
+        reason: String(error),
+      });
+      return problem(502, 'Bad Gateway', 'the tenant registry could not be reached');
+    }
+    const out = new Headers();
+    upstream.headers.forEach((value, name) => {
+      if (!HOP_BY_HOP_RESPONSE.has(name)) out.append(name, value);
+    });
+    return new Response(upstream.body, { status: upstream.status, headers: out });
+  }
+
   // The controller's own API: identity, API keys, members.
 
   private async own(request: Request, url: URL, principal: Principal): Promise<Response> {
@@ -427,10 +550,30 @@ if (import.meta.main) {
     idleTimeout: 120,
     fetch: (request, server) => controller.handle(request, server),
   });
+  // The registry's whoami callback stays inside the cluster, so it is plain HTTP (platform#83).
+  if (config.whoamiPort)
+    Bun.serve({
+      hostname: config.host,
+      port: config.whoamiPort,
+      idleTimeout: 120,
+      fetch: (request) => controller.handleWhoami(request),
+    });
+  if (config.registryFrontPort)
+    Bun.serve({
+      hostname: config.host,
+      port: config.registryFrontPort,
+      tls,
+      // Layer uploads and pulls can stay silent longer than Bun's default; 0 disables it.
+      idleTimeout: 0,
+      maxRequestBodySize: Number.MAX_SAFE_INTEGER,
+      fetch: (request, server) => controller.handleRegistry(request, server),
+    });
   controller.audit('controller.started', {
     url: `${tls ? 'https' : 'http'}://${config.host}:${config.port}`,
     issuer: config.issuer,
     cluster: controller.kube.server,
     namespaces: tenantNamespaces(config.tenant),
+    whoamiPort: config.whoamiPort,
+    registryFrontPort: config.registryFrontPort,
   });
 }

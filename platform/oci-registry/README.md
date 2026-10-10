@@ -124,16 +124,22 @@ originates itself over `wasi:sockets`, not the host's HTTP client. So
 `https://` only works when the tenant's private CA is installed in every
 tenant host's trust store, which couples the host image to each tenant's CA.
 
-The component accepts either. If `:reconcile` uses plain HTTP to the
-controller's cluster-local Service, the credential crosses the pod network in
-**cleartext**: a namespace is not a network boundary. The gateway-to-host hop
-is already plain HTTP too, so the Basic credential is cleartext on the pod
-network before the registry sees it. Both hops stay cleartext unless the
-cluster encrypts pod traffic (CNI WireGuard or mesh mTLS). The constraints for
-`:reconcile` (a separate controller listener serving only
-`GET /v1/auth/whoami`, and a NetworkPolicy admitting only the tenant's host
-pods) are recorded on #58. Once the tenant host is confirmed to accept an
-extra trust root, an `https://` URL works with no code change.
+The component accepts either. `:reconcile` (platform#83) uses plain HTTP to a
+separate controller listener, `http://tenant-controller.di-runtime-<tenant>.svc:8789`,
+which serves only `GET /v1/auth/whoami`; a NetworkPolicy admits only the
+tenant's host pods to it (see the `tenantAuth` section of
+`platform/platform/README.md`). The credential crosses the pod network in
+**cleartext** there: a namespace is not a network boundary. The hop from the
+controller's TLS registry front to the host is plain HTTP too, so the Basic
+credential is cleartext on the pod network before the registry sees it. Both
+hops stay cleartext unless the cluster encrypts pod traffic (CNI WireGuard or
+mesh mTLS); off-cluster, users reach the registry only over TLS. Once the
+tenant host is confirmed to accept an extra trust root, an `https://` URL
+works with no code change.
+
+A bracketed IPv6 authority counts as cluster-local only when it is loopback
+and is followed by nothing or by `:<digits>`; `http://[::1]evil.example` and
+the like are rejected.
 
 ### Build and test
 
@@ -157,8 +163,10 @@ pushes `dist/di-framework-oci-registry.wasm` to
 `ghcr.io/di-framework/oci-registry` in the Wasm OCI layout that `wkg` and
 `wash oci push` produce: one `application/wasm` layer and an
 `application/vnd.wasm.config.v0+json` config carrying `created`,
-`architecture: "wasm"`, `os: "wasip2"` and `layerDigests`. The optional
-`component` (imports/exports) field is omitted. The image is tagged with the
+`architecture: "wasm"`, `os: "wasip2"`, `layerDigests` and the `component`
+field (the world's `imports` and `exports`, read from the WIT `make build`
+recovers from the component), which the CNCF Wasm OCI layout requires for
+`wasip2`. The image is tagged with the
 commit SHA, and the job summary prints the manifest digest. The workflow has
 not been run yet.
 
@@ -168,8 +176,9 @@ Pin deployments by digest, never by tag:
 ghcr.io/di-framework/oci-registry@sha256:<digest from the job summary>
 ```
 
-The SHA tag is informational; only the digest is stable. `:reconcile` reads
-the pin from its own manifests, so record the digest there when you publish.
+The SHA tag is informational; only the digest is stable. The tenancy reconcile
+takes the pin from the platform config `tenantAuth.registry.component`, so set
+the digest there when you publish.
 
 ---
 

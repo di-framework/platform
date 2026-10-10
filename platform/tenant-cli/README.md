@@ -61,8 +61,11 @@ push and pull, a viewer may only pull.
 `GET /v1/deploy/registry` (viewer or developer) returns `RegistryInfo`: the registry `url` (an
 origin: scheme + host[:port], no path), an optional `repositoryPrefix`, `auth` (`basic-identity`)
 and a fixed `username` hint (`token`). The tenant controller reads the origin from
-`TENANT_CONTROLLER_REGISTRY_URL` (`{tenant}` is replaced by the tenant); until the platform sets it
-(#83), the endpoint answers 503 `no registry is configured for this tenant`.
+`TENANT_CONTROLLER_REGISTRY_URL` (`{tenant}` is replaced by the tenant), which the platform sets
+when its `tenantAuth.registry` config is present; otherwise the endpoint answers 503
+`no registry is configured for this tenant`. The origin must be `https://`; plain `http://` is
+accepted only for loopback (`localhost`, `127.0.0.0/8`, `[::1]`) and in-cluster hosts (`*.svc`,
+`*.svc.cluster.local`).
 
 Log in against the host of `url`, not the full URL, then push to
 `<host>/<repositoryPrefix>/<name>:<tag>`:
@@ -73,8 +76,11 @@ docker login <host>
 oras push <host>/<repositoryPrefix>/<name>:<tag> ...
 ```
 
-An `http:` origin means plain HTTP: pass `oras --plain-http` or `wash --insecure`. The registry is
-expected over HTTPS through the gateway, since the Basic password is an identity credential.
+An `http:` origin means plain HTTP (loopback or in-cluster only): pass `oras --plain-http` or
+`wash --insecure`. The platform serves the registry over HTTPS through the gateway, since the Basic
+password is an identity credential. Its certificate is the tenant controller's, so trust the
+tenant's CA (ConfigMap `tenant-controller-ca`) as you do for the controller, for example
+`oras login --ca-file` or `/etc/docker/certs.d/<host>/ca.crt`.
 
 Identity access tokens expire, so a stored `docker login` stops working; a `dik_` API key suits CI.
 

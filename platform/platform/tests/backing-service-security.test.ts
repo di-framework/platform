@@ -455,6 +455,20 @@ describe('tenant RBAC, quotas, admission policies, and network isolation', () =>
     expect(JSON.stringify(bindings).toLowerCase()).toContain('fail');
   });
 
+  it('admits wasmcloud:secrets bind-time config from the platform controller only (#83)', () => {
+    const workloads = admissionResources('test', 'wasmcloud').find(
+      (r) => r.kind === 'ValidatingAdmissionPolicy' && r.metadata.name === 'test-workloads',
+    ) as unknown as { spec: { validations: { expression: string }[] } };
+    const hostInterfaces = workloads.spec.validations.find((v) =>
+      v.expression.includes('variables.w.hostInterfaces.all'),
+    )!.expression;
+    expect(hostInterfaces).toMatch(
+      /\(variables\.controller && h\['namespace'\] == 'wasmcloud' &&\s+h\['package'\] == 'secrets'/,
+    );
+    // Tenant users still cannot ask for it.
+    expect(hostInterfaceAllowed({ namespace: 'wasmcloud', package: 'secrets' })).toBe(false);
+  });
+
   it('emits CEL expressions with balanced parentheses', () => {
     const policies = admissionResources('test', 'wasmcloud').filter(
       (resource) => resource.kind === 'ValidatingAdmissionPolicy',
