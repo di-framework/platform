@@ -111,9 +111,9 @@ describe('tenant registry reservation (#83 C1)', () => {
       REGISTRY_HOST_MESSAGE,
     );
     expect(deny(tenantUser, 'DELETE', undefined, workload('web-prod'))).toBeUndefined();
-    expect(deny(tenantUser, 'CREATE', workload('web-prod', {}, [http('web-prod')]))).toBe(
-      undefined,
-    );
+    expect(
+      deny(tenantUser, 'CREATE', workload('web-prod', {}, [http('web-prod')])),
+    ).toBeUndefined();
     for (const user of lookAlikes)
       expect(deny(user, 'DELETE', undefined, registry)).toBeUndefined();
   });

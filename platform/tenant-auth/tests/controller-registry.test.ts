@@ -309,7 +309,7 @@ describe('registry front limits', () => {
 
   test('a failed upstream body ends the client response and frees the slot', async () => {
     const response = await call('/broken');
-    expect(response.text()).rejects.toBeDefined();
+    await expect(response.text()).rejects.toBeDefined();
     await Bun.sleep(50);
     await free();
   });

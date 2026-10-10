@@ -468,7 +468,11 @@ export class Controller {
   ): Promise<Response> {
     const url = new URL(request.url);
     const length = request.headers.get('content-length');
-    if (length && !(Number(length) <= this.config.registryMaxBodyBytes))
+    // A length that is not a number counts as too large.
+    if (
+      length &&
+      (Number.isNaN(Number(length)) || Number(length) > this.config.registryMaxBodyBytes)
+    )
       return problem(
         413,
         'Content Too Large',

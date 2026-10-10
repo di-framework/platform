@@ -935,7 +935,7 @@ async function checked(
   if (reason) return problem(422, 'Unprocessable Entity', reason);
   // The workload's HTTP host is `<service>-<env>`; it must not be the tenant registry's.
   const host = `${bundle.service}-${bundle.env}`;
-  if (context.registryHost && host === context.registryHost.toLowerCase())
+  if (host === context.registryHost?.toLowerCase())
     return problem(
       422,
       'Unprocessable Entity',
