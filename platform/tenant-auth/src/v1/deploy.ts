@@ -18,7 +18,7 @@ import {
   secretObjectName,
   varsConfigMapName,
 } from './config.ts';
-import { type V1Context, type V1Module } from './context.ts';
+import type { V1Context, V1Module } from './context.ts';
 
 /** The contract's `DeployBundle`, after the generated routes checked its JSON shape. */
 interface DeployBundle {
