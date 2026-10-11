@@ -1829,10 +1829,10 @@ index eb825f8..e2f0754 100644
          // Strings flowing in from the proto wire are parsed into typed
 diff --git a/crates/wash-runtime/tests/integration_exclusive_topology.rs b/crates/wash-runtime/tests/integration_exclusive_topology.rs
 new file mode 100644
-index 0000000..e73bd31
+index 0000000..77cd1b3
 --- /dev/null
 +++ b/crates/wash-runtime/tests/integration_exclusive_topology.rs
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,186 @@
 +//! Which workloads may contain an exclusive component.
 +//!
 +//! An exclusive component (`di-framework.dev/exclusive-instance: "true"` in its
@@ -1951,22 +1951,31 @@ index 0000000..e73bd31
 +async fn an_exclusive_component_nobody_links_is_not_refused_for_its_links() -> Result<()> {
 +    let (_addr, host) = start_host_with_dev_router("127.0.0.1:0").await?;
 +
-+    let result = host.workload_start(linked_chain("caller")).await;
-+    if let Err(err) = result {
-+        let message = format!("{err:#}");
-+        assert!(
-+            !message.contains("marked exclusive"),
-+            "the caller is linked by nobody: {message}"
-+        );
-+    }
++    // A refused workload comes back as `Ok` with an error state, so the status
++    // is what has to be checked.
++    let status = host
++        .workload_start(linked_chain("caller"))
++        .await?
++        .workload_status;
++    assert!(
++        !status.message.contains("marked exclusive"),
++        "the caller is linked by nobody: {status:?}"
++    );
++    assert_eq!(
++        status.workload_state,
++        wash_runtime::types::WorkloadState::Running,
++        "{status:?}"
++    );
 +    Ok(())
 +}
 +
 +/// A single exclusive component that imports only host interfaces still
-+/// loads, and concurrent requests to it are served one store at a time: each
-+/// read-modify-write of the counter sees the previous one.
++/// loads, and concurrent requests to it queue instead of failing. (This does
++/// not measure serialization: the counter increments atomically, so 1..=6 is
++/// the answer whether or not requests overlap. That is covered by the
++/// live-store tests in `instance_pool::exclusive_tests`.)
 +#[tokio::test]
-+async fn a_single_exclusive_component_loads_and_serializes() -> Result<()> {
++async fn a_single_exclusive_component_loads_and_queues() -> Result<()> {
 +    let (addr, host) = start_host_with_dev_router("127.0.0.1:0").await?;
 +
 +    let request = component_workload_request(
@@ -2005,7 +2014,7 @@ index 0000000..e73bd31
 +    assert_eq!(
 +        counts,
 +        vec![1, 2, 3, 4, 5, 6],
-+        "serialized requests each see the previous counter value"
++        "every queued request is served"
 +    );
 +
 +    Ok(())

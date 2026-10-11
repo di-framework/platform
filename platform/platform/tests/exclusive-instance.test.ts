@@ -4,6 +4,7 @@ import {
   admissionResources,
   EXCLUSIVE_INSTANCE_KEY,
   EXCLUSIVE_INSTANCE_MESSAGE,
+  EXCLUSIVE_SERVICE_MESSAGE,
   workloadExclusiveInstanceAllowed,
 } from '../src/tenancy/admission';
 import type { Resource } from '../src/tenancy/resources';
@@ -38,6 +39,13 @@ describe('exclusive instance opt-in (#136)', () => {
     );
   });
 
+  it('refuses the opt-in on the service, which the host ignores', () => {
+    expect(workloadExclusiveInstanceAllowed([], exclusive('true'))).toBe(false);
+    expect(workloadExclusiveInstanceAllowed([], exclusive('false'))).toBe(false);
+    expect(workloadExclusiveInstanceAllowed([], { config: { LOG: 'debug' } })).toBe(true);
+    expect(workloadExclusiveInstanceAllowed([], {})).toBe(true);
+  });
+
   it('is not fooled by inherited properties', () => {
     const config = Object.create({ [EXCLUSIVE_INSTANCE_KEY]: 'junk' }) as Record<string, unknown>;
     expect(workloadExclusiveInstanceAllowed([{ config }])).toBe(true);
@@ -54,6 +62,7 @@ describe('CEL parity with workloadExclusiveInstanceAllowed (#136)', () => {
     validations: { expression: string; message: string }[];
   };
   const rule = spec.validations.find((v) => v.message === EXCLUSIVE_INSTANCE_MESSAGE);
+  const serviceRule = spec.validations.find((v) => v.message === EXCLUSIVE_SERVICE_MESSAGE);
 
   const celAllowed = (object: unknown, request: unknown): boolean => {
     const variables: Record<string, unknown> = {};
@@ -61,13 +70,16 @@ describe('CEL parity with workloadExclusiveInstanceAllowed (#136)', () => {
       const expression = spec.variables.find((v) => v.name === name)?.expression as string;
       variables[name] = evaluate(expression, { request, object, variables });
     }
-    return (
-      evaluate((rule as { expression: string }).expression, { request, object, variables }) === true
+    return [rule, serviceRule].every(
+      (r) =>
+        evaluate((r as { expression: string }).expression, { request, object, variables }) === true,
     );
   };
 
   it('is a validation of the workloads policy that applies to every user', () => {
     expect(rule).toBeDefined();
+    expect(serviceRule).toBeDefined();
+    expect(serviceRule?.expression).not.toContain('variables.controller');
     expect(rule?.expression).not.toContain('variables.controller');
     expect(rule?.expression).toContain(`'${EXCLUSIVE_INSTANCE_KEY}' in l.config`);
     expect(rule?.expression).toContain("in ['true','false']");
@@ -115,7 +127,10 @@ describe('CEL parity with workloadExclusiveInstanceAllowed (#136)', () => {
                   },
                 },
               };
-              const expected = workloadExclusiveInstanceAllowed([local]);
+              const expected =
+                path === 'service'
+                  ? workloadExclusiveInstanceAllowed([local], local)
+                  : workloadExclusiveInstanceAllowed([local]);
               const actual = celAllowed(object, { userInfo: { username }, operation: 'CREATE' });
               if (actual !== expected)
                 throw new Error(

@@ -80,6 +80,14 @@ normally.
 Consequences. Calls to an exclusive component are serialised, so its throughput is one call at a
 time. Waiting calls hold their request open for up to the wait timeout.
 
+**Where a refusal shows up.** The WorkloadDeployment only reports not ready, with the Sync condition
+`workload is not operational: WORKLOAD_STATE_ERROR`; the operator does not carry the start error
+into the status. The reason ("component 'X' imports 'Y', which is marked exclusive ... `wac plug`")
+is in the tenant host log under `failed to start workload`.
+
+The opt-in applies to components only. The service ignores it, so platform admission rejects the key
+on `service.localResources.config`.
+
 **Scope.** This is one host process. The opt-in is read from workload components only. The
 optional `host-component-plugins` feature (off in this image) builds its plugin stores from host
 configuration, outside `localResources.config`, so those stores take no lease and are not covered. The tenant host Deployment's rollout must not overlap pods:
@@ -100,7 +108,8 @@ rotation by `maxInvocations`, the shared deadline and cancellation of a queued c
 at most one live store, and the drain, rotation and timed-out tests hold the old store's teardown
 open to show the replacement is not built until it is released.
 `tests/integration_exclusive_topology.rs` (needs the prebuilt test fixtures) covers the layout rule
-and a lone exclusive component serialising real requests. Run them against a checkout of the pinned commit with the patch applied:
+and a lone exclusive component loading and queueing real requests (it does not measure
+serialization; the live-store tests do). Run them against a checkout of the pinned commit with the patch applied:
 
 ```sh
 git clone https://github.com/wasmCloud/wasmCloud /tmp/wasmcloud && cd /tmp/wasmcloud

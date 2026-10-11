@@ -265,6 +265,7 @@ export const EXCLUSIVE_INSTANCE_KEY = 'di-framework.dev/exclusive-instance';
 /** The only values the exclusive entry may take. The host treats anything else as `true`. */
 export const EXCLUSIVE_INSTANCE_VALUES = ['true', 'false'] as const;
 export const EXCLUSIVE_INSTANCE_MESSAGE = `localResources.config['${EXCLUSIVE_INSTANCE_KEY}'] must be "true" or "false"`;
+export const EXCLUSIVE_SERVICE_MESSAGE = `localResources.config['${EXCLUSIVE_INSTANCE_KEY}'] applies to components only, not to the service`;
 
 /**
  * Mirrors the exclusive-instance rule in the CEL policy (#136). A tenant may opt its own
@@ -272,7 +273,13 @@ export const EXCLUSIVE_INSTANCE_MESSAGE = `localResources.config['${EXCLUSIVE_IN
  * host would have to guess at is refused: the host fails closed to exclusive, so a typo such as
  * `"ture"` would otherwise queue every call silently.
  */
-export function workloadExclusiveInstanceAllowed(locals: LocalResourcesLike[]): boolean {
+export function workloadExclusiveInstanceAllowed(
+  locals: LocalResourcesLike[],
+  service?: LocalResourcesLike,
+): boolean {
+  // The host reads the opt-in from components only; a service would silently ignore it.
+  if (service?.config !== undefined && Object.hasOwn(service.config, EXCLUSIVE_INSTANCE_KEY))
+    return false;
   return locals.every((local) => {
     const config = local.config;
     if (config === undefined || !Object.hasOwn(config, EXCLUSIVE_INSTANCE_KEY)) return true;
@@ -592,6 +599,12 @@ function workloadPolicy(namespace: string): AdmissionPolicy {
           !('${EXCLUSIVE_INSTANCE_KEY}' in l.config) ||
           l.config['${EXCLUSIVE_INSTANCE_KEY}'] in ${JSON.stringify(EXCLUSIVE_INSTANCE_VALUES).replaceAll('"', "'")})`,
         message: EXCLUSIVE_INSTANCE_MESSAGE,
+      },
+      {
+        expression: `!has(variables.w.service) || !has(variables.w.service.localResources) ||
+          !has(variables.w.service.localResources.config) ||
+          !('${EXCLUSIVE_INSTANCE_KEY}' in variables.w.service.localResources.config)`,
+        message: EXCLUSIVE_SERVICE_MESSAGE,
       },
       {
         expression: `variables.controller || variables.locals.all(l, !has(l.environment) || (
