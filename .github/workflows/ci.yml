@@ -45,7 +45,7 @@ jobs:
         run: make -C platform/pglite-component tools-rust build
 
       - name: Install wasmtime
-        uses: bytecodealliance/actions/wasmtime/setup@v1
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1
         with:
           version: 'v48.0.1'
 
