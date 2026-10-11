@@ -154,6 +154,7 @@ describe('backing-service install', () => {
 
   it('loads compiled backing-services into the controller ConfigMap script map', () => {
     expect([...CONTROLLER_SCRIPT_MODULES]).toEqual([
+      'admission',
       'egress',
       'backing-services',
       'workload-storage',
@@ -170,6 +171,7 @@ describe('backing-service install', () => {
     }
     const scripts = loadControllerScripts(distTenancy);
     expect(Object.keys(scripts).sort()).toEqual([
+      'admission.js',
       'backing-service-reconcile.js',
       'backing-services.js',
       'controller.js',
@@ -191,11 +193,34 @@ describe('backing-service install', () => {
     expect(scripts['controller.js']).toMatch(/require\(["'].\/log-projection["']\)/);
     expect(scripts['controller.js']).toMatch(/require\(["'].\/backing-service-reconcile["']\)/);
     expect(scripts['controller.js']).toMatch(/require\(["'].\/service-binding-reconcile["']\)/);
+    expect(scripts['controller.js']).toMatch(/require\(["'].\/admission["']\)/);
     expect(scripts['controller.js']).toMatch(/require\(["'].\/egress["']\)/);
     expect(scripts['backing-services.js']).toMatch(/require\(["'].\/egress["']\)/);
     expect(controllerScriptHash(scripts)).toMatch(/^[a-f0-9]{64}$/);
     expect(controllerScriptHash(scripts)).toBe(controllerScriptHash(scripts));
     expect(controllerScriptHash({ a: '1' })).not.toBe(controllerScriptHash({ a: '2' }));
+  });
+
+  it('every relative require() in loaded scripts references a shipped module', () => {
+    const scripts = loadControllerScripts(distTenancy);
+    const scriptNames = new Set(Object.keys(scripts).map((name) => name.replace(/\.js$/, '')));
+    const requirePattern = /require\(["'](\.[^"']*?)["']\)/g;
+
+    for (const [, scriptContent] of Object.entries(scripts)) {
+      let match: RegExpExecArray | null;
+      match = requirePattern.exec(scriptContent);
+      while (match !== null) {
+        const requirePath = match[1];
+        if (requirePath !== undefined) {
+          // Only check relative requires that load from the same directory (./x)
+          if (requirePath.startsWith('./')) {
+            const moduleName = requirePath.replace(/^\.\//, '');
+            expect(scriptNames).toContain(moduleName);
+          }
+        }
+        match = requirePattern.exec(scriptContent);
+      }
+    }
   });
 
   it('rejects non-array backingServiceClasses config', () => {
