@@ -73,6 +73,12 @@
     "platform/pglite-component": {
       "name": "@di-framework/pglite-component",
       "version": "6.0.10",
+      "devDependencies": {
+        "@di-framework/repo": "^6.0.7",
+      },
+      "peerDependencies": {
+        "@di-framework/repo": "^6.0.7",
+      },
     },
     "platform/platform": {
       "name": "@di-framework/platform",
@@ -628,6 +634,8 @@
 
     "@di-framework/http/@di-framework/core": ["@di-framework/core@6.0.6", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-c9OssLKKhhwEbsPb0laCcgJ+9cS+847HVTKAa0epYgRTiWNn8XnicajaAvUhB99vFBrguMDoX2AwrecmdKNQzg=="],
 
+    "@di-framework/pglite-component/@di-framework/repo": ["@di-framework/repo@6.0.7", "", { "peerDependencies": { "@di-framework/core": "^6", "typescript": "^5" } }, "sha512-jRdu/5OZIghKB5/28duDh+MZUyF/T1qabDXEIeIopO/O8WiOf9zpy3ZKkGBBzTTnQ29GcpyXV/2p/2Ta0+X8kA=="],
+
     "@di-framework/repo/@di-framework/core": ["@di-framework/core@6.0.6", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-c9OssLKKhhwEbsPb0laCcgJ+9cS+847HVTKAa0epYgRTiWNn8XnicajaAvUhB99vFBrguMDoX2AwrecmdKNQzg=="],
 
     "@di-framework/tenant-cli/@di-framework/core": ["@di-framework/core@6.0.6", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-c9OssLKKhhwEbsPb0laCcgJ+9cS+847HVTKAa0epYgRTiWNn8XnicajaAvUhB99vFBrguMDoX2AwrecmdKNQzg=="],
@@ -689,6 +697,8 @@
     "validate-npm-package-license/spdx-expression-parse": ["spdx-expression-parse@3.0.1", "", { "dependencies": { "spdx-exceptions": "^2.1.0", "spdx-license-ids": "^3.0.0" } }, "sha512-cbqHunsQWnJNE6KhVSMsMeH5H/L9EpymbzqTQ3uLwNCLZ1Q481oWaofqH7nO6V07xlXwY6PhQdQ2IedWx/ZK4Q=="],
 
     "write-file-atomic/signal-exit": ["signal-exit@4.1.0", "", {}, "sha512-bzyZ1e88w9O1iNJbKnOlvYTrWPDl46O1bG0D3XInv+9tkPrxrN8jUUTiFlDkkmKWgn1M6CfIA13SuGqOa9Korw=="],
+
+    "@di-framework/pglite-component/@di-framework/repo/@di-framework/core": ["@di-framework/core@6.0.6", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-c9OssLKKhhwEbsPb0laCcgJ+9cS+847HVTKAa0epYgRTiWNn8XnicajaAvUhB99vFBrguMDoX2AwrecmdKNQzg=="],
 
     "@npmcli/git/which/isexe": ["isexe@4.0.0", "", {}, "sha512-FFUtZMpoZ8RqHS3XeXEmHWLA4thH+ZxCv2lOiPIn1Xc7CxrqhWzNSDzD+/chS/zbYezmiwWLdQC09JdQKmthOw=="],
 

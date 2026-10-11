@@ -316,6 +316,23 @@ describe('pglite SqlDatabase adapter', () => {
     });
   }
 
+  test('surfaces an undefined-table execution-failed as code 42P01', async () => {
+    const { connection } = fakeConnection({
+      fail: (op) =>
+        op === 'query'
+          ? {
+              tag: 'execution-failed',
+              val: { code: '42P01', message: 'relation "t" does not exist' },
+            }
+          : undefined,
+    });
+    const db = createSqlDatabaseFromWasmPgliteConnection(connection);
+    const failure = await db.query('SELECT * FROM t').catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(WasmPgliteError);
+    expect((failure as WasmPgliteError).code).toBe('42P01');
+    expect((failure as WasmPgliteError).message.startsWith('PostgreSQL 42P01')).toBe(true);
+  });
+
   test('defaults parameters, missing rows, and missing change counts', async () => {
     const { connection } = fakeConnection({ rows: [], changes: undefined });
     const db = createSqlDatabaseFromWasmPgliteConnection(connection);
