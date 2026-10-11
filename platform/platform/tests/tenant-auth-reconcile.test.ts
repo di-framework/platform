@@ -2275,7 +2275,7 @@ describe('tenant registry host pull (#83:host-pull)', () => {
         ports: [{ name: 'pull', port: 443, targetPort: 8791 }],
       },
     });
-    // Plain HTTP on port 80 when wash pulls everything over plain HTTP.
+    // TLS on port 443 even when insecureRegistry is true (tenant hosts always use TLS).
     const insecure = tenantAuthResources(tenant(), insecureCfg, {
       ...inputs,
       registryServing: true,
@@ -2283,10 +2283,9 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     });
     expect(
       env(find(insecure, 'Deployment', 'tenant-controller') as Deployment)
-        .TENANT_CONTROLLER_REGISTRY_PULL_TLS,
-    ).toBe('false');
+    ).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_PULL_TLS');
     expect(find(insecure, 'Service', REGISTRY_PULL_SERVICE)).toMatchObject({
-      spec: { ports: [{ name: 'pull', port: 80, targetPort: 8791 }] },
+      spec: { ports: [{ name: 'pull', port: 443, targetPort: 8791 }] },
     });
   });
 
@@ -2406,12 +2405,12 @@ describe('tenant registry host pull (#83:host-pull)', () => {
         },
       ]),
     );
-    // Plain HTTP: the credential only, no CA.
+    // Tenant hosts always use TLS, even when insecureRegistry is true.
     const plain = host(
       tenantResources(tenant(), insecureCfg, schedulerSecret, [], false, true, false, {}),
     );
     expect(env(plain).DOCKER_CONFIG).toBe('/registry-auth');
-    expect(plain.spec.template.spec.containers[0]!.args).toContain('--allow-insecure-registries');
+    expect(plain.spec.template.spec.containers[0]!.args).not.toContain('--allow-insecure-registries');
     expect(plain.spec.template.spec.containers[0]!.args).not.toContain(
       '--oci-ca-path=/registry-ca/ca.crt',
     );
@@ -2576,17 +2575,17 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     expect(conditions().TenantAuthReady?.reason).not.toBe('HostPullError');
   });
 
-  it('wires the hosts without a CA when they pull over plain HTTP', async () => {
+  it('wires the hosts with TLS for the pull listener even when insecureRegistry is true', async () => {
     const { api, t } = prepare();
     const controller = new Controller(api, insecureCfg);
     await controller.reconcileTenant(t, []);
     await controller.reconcileTenant(t, []);
     expect(env(host(api)).DOCKER_CONFIG).toBe('/registry-auth');
-    expect(host(api).spec.template.spec.containers[0]!.args).not.toContain(
+    expect(host(api).spec.template.spec.containers[0]!.args).toContain(
       '--oci-ca-path=/registry-ca/ca.crt',
     );
     expect(api.objects.get(pullServicePath)).toMatchObject({
-      spec: { ports: [{ port: 80, targetPort: 8791 }] },
+      spec: { ports: [{ port: 443, targetPort: 8791 }] },
     });
   });
 

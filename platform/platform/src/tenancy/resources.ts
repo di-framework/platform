@@ -1066,7 +1066,6 @@ function tenantResources(
                     '--oci-cache-dir=/oci-cache',
                     '--http-addr=0.0.0.0:9191',
                     '--socket-egress=enforce',
-                    ...(cfg.insecureRegistry ? ['--allow-insecure-registries'] : []),
                     // The tenant registry's pull Service serves the controller certificate.
                     ...(hostPull?.caDigest ? ['--oci-ca-path=/registry-ca/ca.crt'] : []),
                   ],
@@ -1720,7 +1719,6 @@ function tenantAuthResources(
               TENANT_CONTROLLER_REGISTRY_FRONT_PORT: String(REGISTRY_FRONT_PORT),
               TENANT_CONTROLLER_REGISTRY_URL: tenantRegistryPublicUrl(name, auth),
               TENANT_CONTROLLER_REGISTRY_PULL_PORT: String(REGISTRY_PULL_PORT),
-              ...(cfg.insecureRegistry ? { TENANT_CONTROLLER_REGISTRY_PULL_TLS: 'false' } : {}),
             }
           : {}),
       },
@@ -1785,8 +1783,7 @@ function tenantAuthResources(
     ),
     service('tenant-console', 8787),
   );
-  // The hosts pull through this Service with no port in the reference: 443 (TLS) normally, 80
-  // when `insecureRegistry` makes wash use plain HTTP for every pull.
+  // The hosts pull through this Service with no port in the reference: 443 (TLS).
   if (registry)
     result.push(
       make('v1', 'Service', REGISTRY_PULL_SERVICE, namespace, {
@@ -1795,7 +1792,7 @@ function tenantAuthResources(
           ports: [
             {
               name: 'pull',
-              port: cfg.insecureRegistry ? 80 : 443,
+              port: 443,
               targetPort: REGISTRY_PULL_PORT,
             },
           ],
