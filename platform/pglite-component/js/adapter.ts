@@ -19,7 +19,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   AsyncMutex,
-  contextLock,
   guardedStatements,
   isWasmResult,
   leaseGuard,
@@ -51,7 +50,14 @@ export type WasmPgValue =
 
 export type WasmPgRow = Array<[string, WasmPgValue]>;
 
-/** Guest-side view of the `connection` resource. */
+/**
+ * Guest-side view of the `connection` resource.
+ *
+ * TODO(#153): members use method syntax, so `tsc` compares their parameters
+ * bivariantly and the drift guard does not notice a removed or narrowed `value`
+ * case. Declare them as property signatures (`strictFunctionTypes`) once
+ * `integer` stops allowing `number`.
+ */
 export interface WasmPgliteConnection {
   exec(sql: string): WasmMaybeResult<void>;
   run(sql: string, params: WasmPgValue[]): WasmMaybeResult<bigint | number>;
@@ -161,6 +167,9 @@ const MIN_SAFE = BigInt(Number.MIN_SAFE_INTEGER);
  * - `bigint` in the safe integer range becomes `integer`; a larger one is sent
  *   as `text` (OID 0), so PostgreSQL parses it for an `int8`/`numeric` column
  *   without rounding through a double.
+ * - A `number` that is an integer outside the safe range throws a `TypeError`
+ *   (pass a `bigint` or string for `int8`); other non-safe numbers, including
+ *   NaN and Infinity, are `real` (`float8`).
  * - `Date` becomes `timestamp` (RFC 3339 UTC); plain objects and arrays become
  *   `json`. Arrays are not PostgreSQL arrays: pass a literal such as `'{a,b}'`.
  */
@@ -168,7 +177,7 @@ export function toWasmPgValue(value: unknown): WasmPgValue {
   if (value === null || value === undefined) return { tag: 'null' };
   switch (typeof value) {
     case 'bigint':
-      // componentize-qjs lowers WIT s64 from JS numbers (f64), not BigInt.
+      // componentize-qjs lowers WIT s64 from JS numbers (f64), not BigInt (#153).
       if (value >= MIN_SAFE && value <= MAX_SAFE) {
         return { tag: 'integer', val: Number(value) };
       }
@@ -177,6 +186,14 @@ export function toWasmPgValue(value: unknown): WasmPgValue {
       if (Number.isSafeInteger(value)) {
         return { tag: 'integer', val: value };
       }
+      if (Number.isInteger(value)) {
+        // An integral double past 2^53 has already lost its low bits, and the
+        // column is most likely int8; sending float8 would fail or round silently.
+        throw new TypeError(
+          `Cannot bind ${value} as a PostgreSQL parameter: it is an integer outside the safe range. Pass a bigint or a decimal string for int8 (or a string such as '1e300' for float8)`,
+        );
+      }
+      // Fractions, NaN and +/-Infinity are valid float8 values in PostgreSQL.
       return { tag: 'real', val: value };
     case 'boolean':
       return { tag: 'boolean', val: value };
@@ -414,7 +431,13 @@ function descendsFrom(scope: TransactionScope, ancestor: TransactionScope): bool
 export function createSqlDatabaseFromWasmPgliteConnection(
   connection: WasmPgliteConnection,
 ): SqlDatabase {
-  const locked = contextLock(new AsyncMutex());
+  const mutex = new AsyncMutex();
+  // The outer handle joins a running root transaction from its own async
+  // context for as long as that transaction's lease is active. The lease ends
+  // before COMMIT/ROLLBACK is issued (see `enter`), unlike `contextLock`, which
+  // would keep it until the holder returns.
+  const held = new AsyncLocalStorage<SqlLease>();
+  const locked: SqlGuard = (fn) => (held.getStore()?.active ? fn() : mutex.run(fn));
   // Statements a transaction's callers issue concurrently reach the connection
   // one at a time, even when the binding returns promises (see `leaseGuard`).
   const wire = new AsyncMutex();
@@ -469,9 +492,14 @@ export function createSqlDatabaseFromWasmPgliteConnection(
       await invoke(open);
       try {
         const result = await activeScope.run(scope, () => fn(scope.view));
+        // End the lease before COMMIT / RELEASE is issued: a statement that
+        // arrives late waits for the mutex and runs after the transaction,
+        // instead of reaching the wire between the close and the end of the lease.
+        scope.lease.active = false;
         await invoke(close);
         return result;
       } catch (error) {
+        scope.lease.active = false;
         try {
           await invoke(undo);
         } catch {}
@@ -500,8 +528,10 @@ export function createSqlDatabaseFromWasmPgliteConnection(
   // A view runs directly while its scope is open, from any async context: the
   // scope's lease is cleared before the mutex is released. Once the scope has
   // ended, the view takes the mutex like the outer handle.
-  const createScope = (parent?: TransactionScope): TransactionScope => {
-    const lease: SqlLease = { active: true };
+  const createScope = (
+    parent?: TransactionScope,
+    lease: SqlLease = { active: true },
+  ): TransactionScope => {
     const scope: TransactionScope = {
       parent,
       children: new AsyncMutex(),
@@ -520,15 +550,20 @@ export function createSqlDatabaseFromWasmPgliteConnection(
     transaction: async <T>(fn: (db: SqlDatabase) => Promise<T>): Promise<T> => {
       const current = liveScope();
       if (current) return nest(current, fn);
-      return locked(() =>
+      const root = (lease?: SqlLease) =>
         enter(
-          createScope(),
+          createScope(undefined, lease),
           fn,
           () => connection.begin(),
           () => connection.commit(),
           () => connection.rollback(),
-        ),
-      );
+        );
+      if (held.getStore()?.active) return root();
+      return mutex.run(() => {
+        // The root scope's lease doubles as the outer handle's join lease.
+        const lease: SqlLease = { active: true };
+        return held.run(lease, () => root(lease));
+      });
     },
     close: () => locked(() => invoke(() => connection.close())),
   } as SqlDatabase;
@@ -550,7 +585,9 @@ let cachedModule: Promise<WasmPgliteModule> | undefined;
  *
  * The module's types come from `wit.d.ts`, generated from `wit/world.wit`. The
  * conversion below has no cast, so a WIT change that breaks the adapter's view
- * of the interface fails the typecheck.
+ * of the interface fails the typecheck. The check covers method names, arity
+ * and result types, not the parameter variants (see the TODO on
+ * `WasmPgliteConnection`).
  */
 export function loadWasmPgliteModule(): Promise<WasmPgliteModule> {
   cachedModule ??= import('di-framework:pglite/database@0.2.0')

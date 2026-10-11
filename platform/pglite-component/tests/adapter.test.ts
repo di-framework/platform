@@ -39,9 +39,13 @@ describe('pglite value conversion', () => {
     expect(toWasmPgValue(undefined)).toEqual({ tag: 'null' });
     expect(toWasmPgValue(42)).toEqual({ tag: 'integer', val: 42 });
     expect(toWasmPgValue(1.5)).toEqual({ tag: 'real', val: 1.5 });
-    expect(toWasmPgValue(Number.MAX_SAFE_INTEGER + 2)).toEqual({
+    expect(() => toWasmPgValue(Number.MAX_SAFE_INTEGER + 2)).toThrow(/bigint or a decimal string/);
+    expect(() => toWasmPgValue(-(2 ** 60))).toThrow(TypeError);
+    expect(() => toWasmPgValue(1e300)).toThrow(/outside the safe range/);
+    expect(toWasmPgValue(Number.NaN)).toEqual({ tag: 'real', val: Number.NaN });
+    expect(toWasmPgValue(Number.POSITIVE_INFINITY)).toEqual({
       tag: 'real',
-      val: Number.MAX_SAFE_INTEGER + 2,
+      val: Number.POSITIVE_INFINITY,
     });
     expect(toWasmPgValue(42n)).toEqual({ tag: 'integer', val: 42 });
     expect(toWasmPgValue(2n ** 62n)).toEqual({ tag: 'text', val: '4611686018427387904' });
@@ -666,6 +670,28 @@ describe('pglite SqlDatabase adapter', () => {
       'RELEASE di_sp_2',
       'COMMIT',
     ]);
+  });
+
+  test('a view statement issued while COMMIT is in flight runs after the transaction, in lock order', async () => {
+    const { connection, log } = fakeConnection();
+    const slowCommit: WasmPgliteConnection = {
+      ...connection,
+      commit: (() =>
+        (async () => {
+          await tick(15);
+          return connection.commit();
+        })()) as WasmPgliteConnection['commit'],
+    };
+    const db = createSqlDatabaseFromWasmPgliteConnection(slowCommit);
+    let late!: Promise<unknown>;
+    const done = db.transaction(async (tx) => {
+      // Unawaited: fires while COMMIT is on the wire.
+      late = tick(5).then(() => tx.run('LATE ?', [1]));
+    });
+    // Queued on the mutex before LATE is issued, so it must run first.
+    const outer = db.run('OUTER ?', [1]);
+    await Promise.all([done, late, outer]);
+    expect(log).toEqual(['BEGIN', 'COMMIT', 'run OUTER $1', 'run LATE $1']);
   });
 
   test('statements issued together inside a transaction reach an async binding one at a time', async () => {
