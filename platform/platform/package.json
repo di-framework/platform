@@ -35,7 +35,7 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@kubernetes/client-node": "^0.22.3",
+    "@kubernetes/client-node": "2.0.0",
     "@pulumi/command": "1.2.1",
     "@pulumi/kubernetes": "4.34.0",
     "@pulumi/pulumi": "3.261.0",

@@ -1,4 +1,3 @@
-import { AppsV1Api, CoreV1Api, KubeConfig } from '@kubernetes/client-node';
 import * as k8s from '@pulumi/kubernetes';
 import * as pulumi from '@pulumi/pulumi';
 import {
@@ -24,6 +23,8 @@ import {
   tenantAuthRoutes,
   userTokenSecretName,
 } from './tenancy/resources';
+import { secretReaderFromKubeconfig } from './token-secret-reader';
+import { waitForTokenSecret } from './token-wait';
 import { platformValues } from './values';
 
 export { kubeconfigServer, type TenantKubeconfigArgs, tenantKubeconfig } from './kubeconfig';
@@ -52,6 +53,16 @@ export interface PlatformArgs {
    * token kubeconfig per user membership; when omitted, `kubeconfigs` is undefined.
    */
   apiServer?: pulumi.Input<string>;
+  /**
+   * Admin kubeconfig YAML, the same one `provider` uses. Required with `apiServer`: after each User
+   * is Ready, the program polls the Kubernetes API with this kubeconfig (and `kubeContext`) until
+   * the user's token Secret has `data.token`. The ambient `$KUBECONFIG` is never read. If the
+   * kubeconfig uses an `exec` credential plugin, that plugin runs for these reads as it does for
+   * `provider`.
+   */
+  kubeconfig?: pulumi.Input<string>;
+  /** Context of `kubeconfig` that `provider` uses; defaults to the kubeconfig's current context. */
+  kubeContext?: pulumi.Input<string | undefined>;
 }
 
 /**
@@ -60,86 +71,6 @@ export interface PlatformArgs {
  */
 const DEFAULT_HOST_IMAGE =
   'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669';
-
-// For testing: allow injecting a mock API client
-let testApiClient: CoreV1Api | null = null;
-
-export function _setTestApiClient(client: CoreV1Api | null) {
-  testApiClient = client;
-}
-
-/**
- * Waits for a token Secret to exist with data.token set.
- * Polls with exponential backoff, up to ~5 minutes, then fails.
- * Only runs during update; returns unknown during preview.
- * In environments without a real cluster (e.g., tests), skips polling and returns the ID.
- */
-async function waitForTokenSecret(
-  namespace: string,
-  secretName: string,
-): Promise<string> {
-  if (pulumi.runtime.isDryRun()) {
-    return pulumi.getStack(); // Return something that won't be used in preview
-  }
-
-  let api: CoreV1Api | null = testApiClient;
-
-  if (!api) {
-    let kc: KubeConfig | null = null;
-    try {
-      kc = new KubeConfig();
-      kc.loadFromDefault();
-    } catch {
-      // No kubeconfig available (test environment), skip polling
-      return `${namespace}/${secretName}`;
-    }
-
-    try {
-      api = kc.makeApiClient(CoreV1Api);
-    } catch {
-      // Can't create API client, skip polling
-      return `${namespace}/${secretName}`;
-    }
-  }
-
-  const maxAttempts = process.env.TOKEN_WAIT_MAX_ATTEMPTS
-    ? parseInt(process.env.TOKEN_WAIT_MAX_ATTEMPTS, 10)
-    : 60; // Up to ~5 minutes with exponential backoff (60 = ~5 min, 5 = ~30 sec for testing)
-  let lastError: Error | null = null;
-
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    try {
-      const secret = await api.readNamespacedSecret(secretName, namespace);
-      // Verify that the secret has the token data
-      if (secret.body.data?.token) {
-        // Return the resource ID that Pulumi expects
-        return `${namespace}/${secretName}`;
-      }
-    } catch (e) {
-      const error = e as Error;
-      lastError = error;
-      // Check if it's a 404 (not found) or other error
-      const is404 = error.message?.includes('404') || (error as any).statusCode === 404;
-      if (!is404) {
-        // For non-404 errors (e.g., connection errors), bail out
-        // This allows tests without a real cluster to proceed
-        return `${namespace}/${secretName}`;
-      }
-      // For 404, continue retrying
-    }
-
-    if (attempt < maxAttempts - 1) {
-      // Exponential backoff: starts at 1s, doubles every 10 attempts, capped at 10s
-      const delayMs = Math.min(1000 * Math.pow(2, Math.floor(attempt / 10)), 10000);
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-  }
-
-  // Timed out waiting for Secret
-  throw new Error(
-    `Failed to read Secret ${namespace}/${secretName} with data.token after ${maxAttempts} attempts: ${lastError?.message || 'not found'}`,
-  );
-}
 
 /** Shared platform resources; the caller owns cluster creation and Pulumi state. */
 export function createPlatform(args: PlatformArgs) {
@@ -368,12 +299,28 @@ export function createPlatform(args: PlatformArgs) {
   // exists, so an unknown ID defers the read to the update. During update, poll until the Secret
   // exists with data.token, as the controller may not have created it yet.
   const apiServer = args.apiServer;
-  const tokenSecretId = (user: string, tenant: string): pulumi.Input<string> => {
-    if (pulumi.runtime.isDryRun()) {
-      return pulumi.output(pulumi.unknown) as pulumi.Output<string>;
-    }
+  const adminKubeconfig = args.kubeconfig;
+  if (apiServer !== undefined && adminKubeconfig === undefined)
+    throw new Error('createPlatform: apiServer requires kubeconfig (the one provider uses)');
+  // In preview the ID is unknown, so nothing is read. On update the wait runs inside an apply on
+  // the User, which resolves only after the User is applied and Ready, so the budget starts then.
+  const tokenSecretId = (
+    user: string,
+    tenant: string,
+    userResource: pulumi.CustomResource,
+  ): pulumi.Input<string> => {
+    if (pulumi.runtime.isDryRun()) return pulumi.output(pulumi.unknown) as pulumi.Output<string>;
     const secretName = userTokenSecretName(user, tenant);
-    return pulumi.output(waitForTokenSecret(namespaceName, secretName));
+    return pulumi
+      .all([userResource.id, adminKubeconfig, args.kubeContext])
+      .apply(async ([, kubeconfig, context]) => {
+        await waitForTokenSecret({
+          namespace: namespaceName,
+          name: secretName,
+          readSecret: secretReaderFromKubeconfig(kubeconfig as string, context),
+        });
+        return `${namespaceName}/${secretName}`;
+      });
   };
   const kubeconfigs =
     apiServer === undefined
@@ -385,7 +332,7 @@ export function createPlatform(args: PlatformArgs) {
                 user.memberships.map(({ tenant }) => {
                   const secret = k8s.core.v1.Secret.get(
                     `user-token-${user.name}-${tenant}`,
-                    tokenSecretId(user.name, tenant),
+                    tokenSecretId(user.name, tenant, tenancy.users[index] as pulumi.CustomResource),
                     { provider, dependsOn: tenancy.users.slice(index, index + 1) },
                   );
                   return pulumi.all([apiServer, secret.data]).apply(([server, secretData]) => ({
