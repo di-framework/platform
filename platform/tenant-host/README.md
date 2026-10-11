@@ -51,7 +51,8 @@ value as `true`. The entry is also visible to the guest through `wasi:config/sto
 
 **What the patch does.** An exclusive component has one warm instance serving one call at a time
 (`poolSize` and `maxConcurrency` are ignored; `maxInvocations` is honoured). The guarantee is made
-below the pool, with two FIFO gates per exclusive component:
+below the pool, with two FIFO gates per exclusive component, shared across workloads on the host
+(see [Across revisions](#across-revisions)):
 
 - A call permit is taken before a call is offered to the pool. Callers queue in arrival order and
   hold the permit until the call's in-flight slot on the warm instance is released, so the instance
@@ -76,6 +77,45 @@ component's lease for as long as the importer lives and its other calls could no
 the pieces with `wac plug` and mark the composed component exclusive. A single exclusive component
 that imports only host interfaces (keyvalue, config, logging and so on) loads and is serialised
 normally.
+
+<a id="across-revisions"></a>**Across revisions (#152).** A `Recreate` rollout starts the next revision
+of a workload 5–25 ms before the old one stops, and each revision is a separate workload with its
+own pools. The gates therefore are not per pool: the host keeps one registry of them, and a
+component gets its gates from it when the workload is resolved, after its volume mounts are
+canonicalized. The key is:
+
+- with volume mounts: the canonical host paths of the component's mounts (sorted, duplicates
+  removed). Any component on the host with the same set of mounts shares the gates, whatever its
+  workload, namespace or revision;
+- with no mount: the workload's namespace plus the component's name.
+
+So the new revision's first call queues behind the old revision. Its first store waits, within the
+same `WASH_EXCLUSIVE_WAIT_TIMEOUT_SECS` deadline, until the old revision's store is dropped. A store
+lease keeps its gate alive, so a store that outlives its workload (a call still finishing) still
+holds the next revision back. Stopping a workload drops its warm instances and stops its exclusive
+components admitting calls. A call of the old revision that was queued, or arrives late, fails with
+an error instead of opening the component again, so the new revision waits only for calls already
+in flight. This holds for every path that opens the component: the pooled calls, linked calls and
+the stores built through `new_store` (p2 HTTP and the messaging plugins), which check the stopped
+flag before and after waiting for the store lease. A registry entry goes away once no pool, permit or
+store refers to its gates.
+
+Limits of the guarantee:
+
+- Mounts are compared as whole sets. Two exclusive components whose mounts only partly overlap get
+  separate gates, so do not give the same directory to two different exclusive components.
+- The same applies across revisions of one component: if the next revision changes its mount set
+  (for example `{/data}` becomes `{/data, /cache}`, or it mounts a parent or child directory), it
+  gets a new gate and the 5-25 ms overlap with the old revision is back for that rollout. Keep
+  the mount set of an exclusive component the same across revisions. The `pglite` component mounts
+  only `/data`, so it is not affected.
+- The registry lives in one wash host process. Two host processes on the same node that mount the
+  same hostPath (for example a revision scheduled onto a different host pod) do not share a gate.
+- Two exclusive components with the same mounts (or the same name and namespace and no mounts) can
+  never both be serving: the one that starts second waits for the first to stop and fails once the
+  wait times out. With no mount the key is only the namespace and the name, so an unrelated
+  workload that reuses them is held back the same way; the host logs a warning naming the
+  component and namespace when a component with no mount attaches a gate that is already live.
 
 Consequences. Calls to an exclusive component are serialised, so its throughput is one call at a
 time. Waiting calls hold their request open for up to the wait timeout.
@@ -106,7 +146,21 @@ concurrent calls through the dispatch path against real stores and counts live s
 saturation, FIFO order, the creation race, a trap, a timed-out call, drain with a call in flight,
 rotation by `maxInvocations`, the shared deadline and cancellation of a queued caller. Each asserts
 at most one live store, and the drain, rotation and timed-out tests hold the old store's teardown
-open to show the replacement is not built until it is released.
+open to show the replacement is not built until it is released. The cross-revision tests build
+workloads the way the host does (`Engine::initialize_workload`, then `resolve`) and stop them the
+way `workload_stop` does. They cover these cases:
+
+- two revisions mounting one host path share a gate: the second's first call waits until the first
+  is stopped, a late call to the stopped one is refused, and the registry entry is dead once both
+  are gone;
+- different host paths run side by side;
+- with no mount, the same namespace and name share a gate, and different namespaces do not;
+- a store that outlives its workload still holds the next revision back;
+- a caller queued on the shared call permit when the workload is stopped is refused once admitted
+  and builds nothing, and an instance being built during the stop is dropped instead of installed,
+  so the next revision proceeds;
+- a store requested through `new_store` for a stopped workload is refused;
+- a symlink to the old revision's directory shares its gate (the key is the canonical path).
 `tests/integration_exclusive_topology.rs` (needs the prebuilt test fixtures) covers the layout rule
 and a lone exclusive component loading and queueing real requests (it does not measure
 serialization; the live-store tests do). Run them against a checkout of the pinned commit with the patch applied:
