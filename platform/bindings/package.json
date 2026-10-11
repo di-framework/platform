@@ -46,7 +46,7 @@
   },
   "peerDependencies": {
     "@di-framework/core": "^5",
-    "@di-framework/repo": "^6.0.4",
+    "@di-framework/repo": "^6.1.0",
     "typescript": "^5"
   },
   "peerDependenciesMeta": {
@@ -63,7 +63,7 @@
   ],
   "devDependencies": {
     "@di-framework/core": "^5",
-    "@di-framework/repo": "^6.0.4",
+    "@di-framework/repo": "^6.1.0",
     "@types/bun": "latest"
   }
 }

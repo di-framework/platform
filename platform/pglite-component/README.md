@@ -30,7 +30,7 @@ published by the platform release workflow. It contains:
 | `@di-framework/pglite-component/wit/*` | The source WIT (`wit/world.wit` and its `deps/`) for bindings generators |
 
 `BUILD-INFO.txt`, `SHA256SUMS` and `THIRD-PARTY-NOTICES.txt` ship next to the
-wasm. The adapter needs `@di-framework/repo` `^6.0.7` as a peer dependency.
+wasm. The adapter needs `@di-framework/repo` `^6.1.0` as a peer dependency.
 
 The release job builds the wasm from source with the same `make` targets as
 CI, runs `make unit smoke` against it, and refuses to publish a pack without

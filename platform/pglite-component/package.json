@@ -59,9 +59,9 @@
     "publish-asset": "make publish-asset"
   },
   "peerDependencies": {
-    "@di-framework/repo": "^6.0.7"
+    "@di-framework/repo": "^6.1.0"
   },
   "devDependencies": {
-    "@di-framework/repo": "^6.0.7"
+    "@di-framework/repo": "^6.1.0"
   }
 }
