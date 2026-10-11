@@ -96,3 +96,59 @@ pub(crate) fn error_response(status: u16, code: &str, message: &str) -> Response
 pub(crate) fn method_not_allowed() -> Response {
     error_response(405, "UNSUPPORTED", "method not allowed for this route")
 }
+
+/// Headers for a manifest or blob `GET`/`HEAD` response.
+///
+/// A `HEAD` response has an empty body and the runtime rejects a declared `content-length` with an
+/// empty body, so `HEAD` carries the size in the `docker-content-length` side header instead (the
+/// tenant controller restores `Content-Length` from it). `GET` carries a real `content-length`.
+pub(crate) fn entity_headers(
+    head: bool,
+    content_type: String,
+    digest: String,
+    len: usize,
+) -> Vec<(String, String)> {
+    let length_header = if head {
+        "docker-content-length"
+    } else {
+        "content-length"
+    };
+    vec![
+        ("content-type".to_string(), content_type),
+        ("docker-content-digest".to_string(), digest),
+        (length_header.to_string(), len.to_string()),
+    ]
+}
+
+#[cfg(test)]
+mod entity_header_tests {
+    use super::entity_headers;
+
+    fn get<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn head_uses_side_header_and_no_content_length() {
+        let h = entity_headers(true, "application/json".into(), "sha256:ab".into(), 1234);
+        assert_eq!(get(&h, "docker-content-length"), Some("1234"));
+        assert_eq!(get(&h, "content-length"), None);
+        assert_eq!(get(&h, "content-type"), Some("application/json"));
+        assert_eq!(get(&h, "docker-content-digest"), Some("sha256:ab"));
+    }
+
+    #[test]
+    fn get_uses_content_length_and_no_side_header() {
+        let h = entity_headers(
+            false,
+            "application/octet-stream".into(),
+            "sha256:ab".into(),
+            0,
+        );
+        assert_eq!(get(&h, "content-length"), Some("0"));
+        assert_eq!(get(&h, "docker-content-length"), None);
+    }
+}

@@ -366,6 +366,12 @@ const json = (body: unknown, code = 200) =>
     headers: { 'Content-Type': 'application/json' },
   });
 
+/** A `docker-content-length` value usable as `Content-Length`: plain digits, safe integer (a duplicated header joins with a comma and fails). */
+export function parseSideContentLength(value: string | null): string | undefined {
+  if (value === null || !/^\d+$/.test(value)) return undefined;
+  return Number.isSafeInteger(Number(value)) ? String(Number(value)) : undefined;
+}
+
 export class Controller {
   private readonly serviceAccountTokens = new Map<string, { token: string; expiresAt: number }>();
   /** Where proxy sessions forward to; only overridden by tests. */
@@ -756,10 +762,12 @@ export class Controller {
         out.append(name, value);
       }
     });
-    // For HEAD responses, set Content-Length from the docker-content-length side header
-    // if present, since wash runtime rejects a declared length with an empty body.
-    if (request.method === 'HEAD' && dockerContentLength) {
-      out.set('content-length', dockerContentLength);
+    // Bun.serve writes an implicit `Content-Length: 0` on a HEAD response with an empty body, which
+    // misreports the entity size. The registry therefore sends the size as `docker-content-length`
+    // on HEAD; restore it here. Accept only a single plain-digit safe integer, otherwise drop it.
+    if (request.method === 'HEAD') {
+      const length = parseSideContentLength(dockerContentLength);
+      if (length !== undefined) out.set('content-length', length);
     }
     return new Response(releasing(upstream.body, release), {
       status: upstream.status,

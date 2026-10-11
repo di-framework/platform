@@ -1,5 +1,10 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
-import { Controller, configFromEnv, REGISTRY_IDLE_TIMEOUT_SECONDS } from '../src/controller.ts';
+import {
+  Controller,
+  configFromEnv,
+  parseSideContentLength,
+  REGISTRY_IDLE_TIMEOUT_SECONDS,
+} from '../src/controller.ts';
 import { AuthError, type Principal } from '../src/identity.ts';
 import { serve } from './support/servers.ts';
 
@@ -53,6 +58,12 @@ describe('registry listeners', () => {
           'docker-content-digest': 'sha256:abc123',
           'docker-content-length': '5678',
         },
+      });
+    }
+    if (request.method === 'GET' && request.path.includes('/blobs/sha256:withside')) {
+      return new Response('hello', {
+        status: 200,
+        headers: { 'docker-content-length': '999', 'docker-content-digest': 'sha256:withside' },
       });
     }
     return new Response(`echo ${request.method} ${request.path} ${request.body}`, {
@@ -183,6 +194,41 @@ describe('registry listeners', () => {
     expect(response.headers.get('content-type')).toBe('application/json');
     // HEAD response has no body
     expect(await response.text()).toBe('');
+  });
+
+  test('GET strips a stray docker-content-length and keeps the body-derived Content-Length (S1)', async () => {
+    const response = await controller.handleRegistry(
+      new Request('https://registry.acme.localhost/v2/app/blobs/sha256:withside', {
+        headers: { authorization: 'Basic eDpvaw==' },
+      }),
+    );
+    expect(response.headers.get('docker-content-length')).toBeNull();
+    expect(response.headers.get('content-length')).toBe('5');
+    expect(await response.text()).toBe('hello');
+  });
+
+  test('parseSideContentLength accepts only a single plain-digit safe integer (W2)', () => {
+    expect(parseSideContentLength('1234')).toBe('1234');
+    expect(parseSideContentLength('0')).toBe('0');
+    for (const bad of [
+      'abc',
+      '-5',
+      '1e3',
+      '1.5',
+      ' 7',
+      '',
+      '9007199254740993',
+      '99999999999999999999',
+      '5, 5',
+    ]) {
+      expect(parseSideContentLength(bad)).toBeUndefined();
+    }
+    expect(parseSideContentLength(null)).toBeUndefined();
+    // A duplicated header is joined by Headers.get and therefore rejected.
+    const dup = new Headers();
+    dup.append('docker-content-length', '5');
+    dup.append('docker-content-length', '5');
+    expect(parseSideContentLength(dup.get('docker-content-length'))).toBeUndefined();
   });
 
   test('the registry front answers requests without Basic credentials with the registry challenge (S5)', async () => {
