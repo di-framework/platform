@@ -58,6 +58,9 @@ interface Spec {
   readOnly: string[];
   /** The job the pin job waits for and takes the digest from. */
   pinAfter: string;
+  pinIf: string;
+  /** bot/pin-<pinName> */
+  pinName: string;
   artifacts: string[];
 }
 
@@ -72,6 +75,9 @@ const SPECS: Spec[] = [
     publish: ['build', 'merge'],
     readOnly: [],
     pinAfter: 'merge',
+    pinIf:
+      "${{ !cancelled() && (needs.merge.result == 'success' || needs.merge.result == 'failure') && github.ref == 'refs/heads/main' }}",
+    pinName: 'wash',
     artifacts: ['wash-wasi-tls', 'wash-wasi-tls-exclusive'],
   },
   {
@@ -99,6 +105,9 @@ const SPECS: Spec[] = [
     publish: ['publish-platform', 'publish-index'],
     readOnly: [],
     pinAfter: 'publish-index',
+    pinIf:
+      "${{ !cancelled() && needs.publish-index.result == 'success' && github.ref == 'refs/heads/main' }}",
+    pinName: 'tenant-auth',
     artifacts: ['tenant-auth'],
   },
   {
@@ -127,6 +136,9 @@ const SPECS: Spec[] = [
     publish: ['publish'],
     readOnly: ['build'],
     pinAfter: 'publish',
+    pinIf:
+      "${{ !cancelled() && needs.publish.result == 'success' && github.ref == 'refs/heads/main' }}",
+    pinName: 'pglite-component',
     artifacts: ['pglite-component'],
   },
   {
@@ -150,6 +162,9 @@ const SPECS: Spec[] = [
     publish: ['publish'],
     readOnly: [],
     pinAfter: 'publish',
+    pinIf:
+      "${{ !cancelled() && needs.publish.result == 'success' && github.ref == 'refs/heads/main' }}",
+    pinName: 'oci-registry',
     artifacts: ['oci-registry'],
   },
 ];
@@ -185,6 +200,8 @@ describe.each(SPECS)('$file', (spec) => {
     const run = check?.steps?.map((s) => s.run ?? '').join('\n') ?? '';
     expect(run).toContain(`bun scripts/source-check.ts --workflow ${spec.file}`);
     expect(run).toContain(`--image ${spec.image}`);
+    // A re-run of an older push publishes nothing (W2).
+    expect(run).toContain('--require-main-tip "${GITHUB_SHA}"');
   });
 
   test('workflow_dispatch always builds: the check is forced, never skipped', () => {
@@ -208,7 +225,9 @@ describe.each(SPECS)('$file', (spec) => {
     for (const job of Object.values(jobs)) expect(job.if ?? '').not.toContain("'skipped'");
     for (const [name, job] of Object.entries(jobs)) {
       if (name === 'check-source' || name === spec.first) continue;
-      expect(job.if, name).toMatch(/^\$\{\{ !cancelled\(\) && needs\.[\w-]+\.result == 'success'/);
+      expect(job.if, name).toMatch(
+        /^\$\{\{ !cancelled\(\) && \(?needs\.[\w-]+\.result == 'success'/,
+      );
     }
   });
 
@@ -248,9 +267,7 @@ describe.each(SPECS)('$file', (spec) => {
     const pin = jobs.pin;
     expect(pin?.permissions).toEqual({ contents: 'write', 'pull-requests': 'write' });
     expect(needsOf(pin ?? {})).toContain(spec.pinAfter);
-    expect(pin?.if).toBe(
-      `\${{ !cancelled() && needs.${spec.pinAfter}.result == 'success' && github.ref == 'refs/heads/main' }}`,
-    );
+    expect(pin?.if).toBe(spec.pinIf);
     for (const [name, job] of Object.entries(jobs)) {
       if (name === 'pin') continue;
       expect(job.permissions?.contents, name).not.toBe('write');
@@ -258,12 +275,20 @@ describe.each(SPECS)('$file', (spec) => {
     }
     const open = pin?.steps?.find((s) => s.uses === './.github/actions/open-pin-pr');
     expect(open?.with?.token).toBe('${{ secrets.GITHUB_TOKEN }}');
-    const artifact = open?.with?.artifact ?? '';
-    const names = artifact.includes('matrix.variant.name')
-      ? ['wasi-tls', 'wasi-tls-exclusive'].map((v) => `wash-${v}`)
-      : [artifact];
+    expect(open?.with?.name).toBe(spec.pinName);
+    // One PR per run: the pin job has no matrix.
+    expect(pin?.strategy).toBeUndefined();
+    const pins = open?.with?.pins ?? '';
+    const names = pins.includes('steps.pins.outputs.pins')
+      ? [...text.matchAll(/for name in ([\w -]+); do/g)].flatMap((m) =>
+          (m[1] ?? '')
+            .trim()
+            .split(/\s+/)
+            .map((v) => `wash-${v}`),
+        )
+      : [pins.split(' ')[0]];
     expect(names).toEqual(spec.artifacts);
-    for (const name of names) expect(ARTIFACTS[name], name).toBeDefined();
+    for (const name of names) expect(ARTIFACTS[name ?? ''], name).toBeDefined();
   });
 
   test('one non-cancelling concurrency group per artifact', () => {
@@ -278,6 +303,35 @@ describe.each(SPECS)('$file', (spec) => {
       expect(ref).toMatch(/@[0-9a-f]{40}$/);
     }
   });
+});
+
+test('every job that runs oras sets it up first (C1)', () => {
+  const installs = (step: { uses?: string; run?: string; name?: string }) =>
+    step.uses?.startsWith('oras-project/setup-oras@') ||
+    step.uses === './.github/actions/setup-source-check' ||
+    /oras_\$\{version\}_linux_amd64\.tar\.gz/.test(step.run ?? '');
+  let checked = 0;
+  for (const spec of SPECS) {
+    for (const [name, job] of Object.entries(parse(spec.file).jobs)) {
+      const steps = (job.steps ?? []) as { uses?: string; run?: string; name?: string }[];
+      // check-source runs oras inside scripts/source-check.ts.
+      const usesOras = steps.some(
+        (s) =>
+          /(^|[\s|(])oras\s/m.test(s.run ?? '') || /scripts\/source-check\.ts/.test(s.run ?? ''),
+      );
+      if (!usesOras) continue;
+      checked++;
+      const first = steps.findIndex(
+        (s) =>
+          !installs(s) &&
+          (/(^|[\s|(])oras\s/m.test(s.run ?? '') || /scripts\/source-check\.ts/.test(s.run ?? '')),
+      );
+      const setup = steps.findIndex(installs);
+      expect(setup, `${spec.file} ${name}`).toBeGreaterThanOrEqual(0);
+      expect(setup, `${spec.file} ${name}`).toBeLessThan(first);
+    }
+  }
+  expect(checked).toBeGreaterThanOrEqual(7);
 });
 
 test('the four publish workflows use distinct concurrency groups', () => {
@@ -326,19 +380,21 @@ describe('composite actions', () => {
   const open = read('.github/actions/open-pin-pr/action.yml');
   const setup = read('.github/actions/setup-source-check/action.yml');
 
-  test('the pin PR is bot/pin-<artifact>, titled with the digest, and says CI needs a maintainer', () => {
-    expect(open).toContain('branch="bot/pin-${ARTIFACT}"');
-    expect(open).toContain('title="chore: pin ${ARTIFACT} to ${DIGEST}"');
-    expect(open).toContain('bun scripts/pin-artifact.ts "${ARTIFACT}" "${DIGEST}"');
+  test('the pin PR is bot/pin-<name>, titled with the digest, and says CI needs a maintainer', () => {
+    expect(open).toContain('branch="bot/pin-${NAME}"');
+    expect(open).toContain('title="chore: pin ${summary[0]}"');
+    expect(open).toContain('bun scripts/pin-artifact.ts "${args[@]}"');
+    expect(open).toContain('git ls-remote origin refs/heads/main');
     expect(open).toContain('A maintainer has to approve and run this PR');
     expect(open).toContain('GitHub does not trigger workflows for pull requests');
     expect(open).toContain('gh pr edit');
     expect(open).toContain('gh pr create --base main');
   });
 
-  test('pin actions by SHA and use no stored secret', () => {
+  test('pin actions and the Bun version by SHA and use no stored secret', () => {
     for (const text of [open, setup]) {
       expect(text).not.toContain('secrets.');
+      expect(text).toContain("bun-version: '1.4.2'");
       for (const [, ref] of text.matchAll(/uses:\s+(\S+)/g)) expect(ref).toMatch(/@[0-9a-f]{40}$/);
     }
   });

@@ -12,7 +12,9 @@
  * is deliberately not a target: changing the default host is a reviewed decision, not a
  * side effect of a publish. Host variants only update the "Published images" table.
  *
- * Usage (from the repository root): bun scripts/pin-artifact.ts <artifact> <sha256:digest>
+ * Usage (from the repository root):
+ *   bun scripts/pin-artifact.ts <artifact> <sha256:digest> [<artifact> <sha256:digest> ...]
+ * Several pairs make one combined edit (the tenant host pins both variants in one PR).
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -102,11 +104,27 @@ export function pinArtifact(root: string, artifact: string, digest: string): str
   return changed;
 }
 
+/** `[artifact, digest, artifact, digest, ...]` to pairs. */
+export function parsePairs(argv: string[]): [string, string][] {
+  if (argv.length === 0 || argv.length % 2 !== 0) {
+    throw new Error('usage: bun scripts/pin-artifact.ts <artifact> <sha256:digest> [...]');
+  }
+  const pairs: [string, string][] = [];
+  for (let i = 0; i < argv.length; i += 2) pairs.push([argv[i] as string, argv[i + 1] as string]);
+  return pairs;
+}
+
 if (import.meta.main) {
-  const [artifact, digest] = Bun.argv.slice(2);
-  if (!artifact || !digest) {
-    console.error('usage: bun scripts/pin-artifact.ts <artifact> <sha256:digest>');
+  let pairs: [string, string][];
+  try {
+    pairs = parsePairs(Bun.argv.slice(2));
+  } catch (error) {
+    console.error((error as Error).message);
     process.exit(2);
   }
-  for (const file of pinArtifact(process.cwd(), artifact, digest)) console.log(file);
+  const changed = new Set<string>();
+  for (const [artifact, digest] of pairs) {
+    for (const file of pinArtifact(process.cwd(), artifact, digest)) changed.add(file);
+  }
+  for (const file of changed) console.log(file);
 }

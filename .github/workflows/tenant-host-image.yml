@@ -12,7 +12,9 @@
 #
 # Skip if published: check-source hashes the committed files in on.push.paths, salted with the
 # variant (scripts/source-check.ts). On a push, a variant whose wash:src-<hash> tag already
-# exists is dropped from the build matrix. merge adds src-<hash> to the same multi-arch index.
+# exists is dropped from the build matrix, and so is every variant when the run's commit is no
+# longer the tip of main (a re-run of an older push). merge adds src-<hash> to the same multi-arch
+# index. pin opens one bot/pin-wash PR for the variants this run published.
 #
 # amd64 and arm64 compile at the same time on native runners. One ubuntu-24.04
 # job plus QEMU was spending the arm64 release build in emulation, which is
@@ -104,7 +106,9 @@ jobs:
                 ;;
             esac
             out="$(bun scripts/source-check.ts --workflow .github/workflows/tenant-host-image.yml \
-              --image ghcr.io/di-framework/wash --salt "${name}" "${force[@]}")"
+              --image ghcr.io/di-framework/wash --salt "${name}" \
+              --require-main-tip "${GITHUB_SHA}" "${force[@]}")"
+            printf '%s\n' "${out}"
             hash="$(sed -n 's/^hash=//p' <<<"${out}")"
             skip="$(sed -n 's/^skip=//p' <<<"${out}")"
             if [[ "${skip}" == "true" ]]; then
@@ -201,7 +205,9 @@ jobs:
   merge:
     name: Push ${{ matrix.variant.name }} tags
     needs: [check-source, build]
-    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    # Per variant: a failed build of one variant fails only that variant's merge (it finds
+    # fewer than 2 digests); the other variant still publishes and gets pinned.
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'failure') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -278,6 +284,7 @@ jobs:
           TAG: ${{ matrix.variant.tag }}
           PATCHES: ${{ matrix.variant.patches }}
           SOURCE_HASH: ${{ matrix.variant.hash }}
+          VARIANT: ${{ matrix.variant.name }}
         run: |
           set -euo pipefail
           digest="$(jq -er '.["containerimage.descriptor"].digest' "${RUNNER_TEMP}/wash-index.json")"
@@ -287,7 +294,7 @@ jobs:
             exit 1
           fi
           mkdir -p "${RUNNER_TEMP}/pin"
-          printf '%s\n' "${digest}" > "${RUNNER_TEMP}/pin/digest"
+          printf '%s\n' "${digest}" > "${RUNNER_TEMP}/pin/${VARIANT}"
           ref="ghcr.io/di-framework/wash:${TAG}@${digest}"
           echo "Published ${ref}"
           {
@@ -317,42 +324,49 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # Opens or updates bot/pin-wash-<variant>, which rewrites only the published-images table in
-  # platform/tenant-host/README.md. It never changes DEFAULT_HOST_IMAGE.
+  # One PR, bot/pin-wash, for every variant this run published: the variants' rows in the
+  # published-images table of platform/tenant-host/README.md are adjacent, so separate PRs would
+  # conflict. A variant whose merge failed has no wash-pin-* artifact and is left out; recover it
+  # by dispatching the workflow for that variant. It never changes DEFAULT_HOST_IMAGE.
   pin:
-    name: Open pin PR for ${{ matrix.variant.name }}
+    name: Open pin PR
     needs: [check-source, merge]
-    if: ${{ !cancelled() && needs.merge.result == 'success' && github.ref == 'refs/heads/main' }}
+    if: ${{ !cancelled() && (needs.merge.result == 'success' || needs.merge.result == 'failure') && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
       pull-requests: write
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        variant: ${{ fromJson(needs.check-source.outputs.variants) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Download published digest
+      - name: Download published digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: wash-pin-${{ matrix.variant.name }}
+          pattern: wash-pin-*
           path: ${{ runner.temp }}/pin
+          merge-multiple: true
 
-      - name: Read published digest
-        id: digest
+      - name: Collect published digests
+        id: pins
         run: |
           set -euo pipefail
-          digest="$(tr -d '[:space:]' < "${RUNNER_TEMP}/pin/digest")"
-          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          pins=''
+          for name in wasi-tls wasi-tls-exclusive; do
+            file="${RUNNER_TEMP}/pin/${name}"
+            [[ -f "${file}" ]] || continue
+            pins+="wash-${name} $(tr -d '[:space:]' < "${file}")"$'\n'
+          done
+          {
+            echo 'pins<<EOF'
+            printf '%s' "${pins}"
+            echo 'EOF'
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Open pin PR
         uses: ./.github/actions/open-pin-pr
         with:
-          artifact: wash-${{ matrix.variant.name }}
-          digest: ${{ steps.digest.outputs.digest }}
+          name: wash
+          pins: ${{ steps.pins.outputs.pins }}
           token: ${{ secrets.GITHUB_TOKEN }}

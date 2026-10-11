@@ -166,8 +166,11 @@ with the variant name; `scripts/source-check.ts`) and skips any variant whose
 `ghcr.io/di-framework/wash:src-<hash>` tag already exists, so an unrelated commit publishes nothing.
 A publish adds `src-<hash>` to the same multi-arch index as the variant tag. The jobs that push
 authenticate with the workflow `GITHUB_TOKEN` (`packages: write`). After a publish, a separate job
-(`contents: write`, `pull-requests: write`) opens or updates the PR `bot/pin-wash-<variant>`, which
-updates the table below with `scripts/pin-artifact.ts`. GitHub does not run workflows on a PR that
+(`contents: write`, `pull-requests: write`) opens or updates one PR, `bot/pin-wash`, which updates
+the rows of every variant that run published in the table below with `scripts/pin-artifact.ts`.
+A re-run of an older push publishes and pins nothing: both steps first check that the run's
+commit is still the tip of `main`. Each variant merges on its own, so one variant's failed build
+does not hold back the other; to publish and pin the failed variant, dispatch the workflow for it. GitHub does not run workflows on a PR that
 `GITHUB_TOKEN` opened, so a maintainer has to start its checks (close and reopen it) before merging.
 
 Latest published images (multi-arch index digests; the bot PR keeps this table current):

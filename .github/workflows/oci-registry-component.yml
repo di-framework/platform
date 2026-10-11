@@ -66,7 +66,7 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC2086 # FORCE is empty or one flag
           bun scripts/source-check.ts --workflow .github/workflows/oci-registry-component.yml \
-            --image ghcr.io/di-framework/oci-registry ${FORCE} >> "${GITHUB_OUTPUT}"
+            --image ghcr.io/di-framework/oci-registry --require-main-tip "${GITHUB_SHA}" ${FORCE} --github-output
 
   publish:
     name: Push ghcr.io/di-framework/oci-registry
@@ -146,6 +146,11 @@ jobs:
             echo 'The component was pulled by digest and verified against the local build.'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Set up ORAS
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
+        with:
+          version: '1.3.4'
+
       - name: Tag with source hash
         env:
           SOURCE_HASH: ${{ needs.check-source.outputs.source-hash }}
@@ -185,6 +190,6 @@ jobs:
       - name: Open pin PR
         uses: ./.github/actions/open-pin-pr
         with:
-          artifact: oci-registry
-          digest: ${{ needs.publish.outputs.digest }}
+          name: oci-registry
+          pins: oci-registry ${{ needs.publish.outputs.digest }}
           token: ${{ secrets.GITHUB_TOKEN }}

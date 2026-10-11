@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { ARTIFACTS, pinArtifact, pinText } from '../scripts/pin-artifact';
+import { ARTIFACTS, parsePairs, pinArtifact, pinText } from '../scripts/pin-artifact';
 
 const repo = resolve(import.meta.dir, '..');
 const DIGEST = `sha256:${'1'.repeat(64)}`;
@@ -114,5 +114,141 @@ describe('pinArtifact against the repository files', () => {
       stderr: 'pipe',
     });
     expect(usage.exitCode).toBe(2);
+  });
+});
+
+test('parsePairs reads artifact/digest pairs', () => {
+  expect(parsePairs(['a', DIGEST, 'b', OTHER])).toEqual([
+    ['a', DIGEST],
+    ['b', OTHER],
+  ]);
+  expect(() => parsePairs([])).toThrow('usage');
+  expect(() => parsePairs(['a'])).toThrow('usage');
+});
+
+test('the CLI pins several artifacts in one edit', () => {
+  const root = copyTargets();
+  const result = Bun.spawnSync(
+    [
+      process.execPath,
+      join(repo, 'scripts/pin-artifact.ts'),
+      'wash-wasi-tls',
+      DIGEST,
+      'wash-wasi-tls-exclusive',
+      OTHER,
+    ],
+    { cwd: root, stdout: 'pipe', stderr: 'pipe' },
+  );
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout.toString().trim()).toBe('platform/tenant-host/README.md');
+  const readme = readFileSync(join(root, 'platform/tenant-host/README.md'), 'utf8');
+  expect(readme).toContain(`wash:2.8.0-wasi-tls@${DIGEST}`);
+  expect(readme).toContain(`wash:2.8.0-wasi-tls-exclusive@${OTHER}`);
+});
+
+describe('.github/actions/open-pin-pr against a local origin', () => {
+  const action = Bun.YAML.parse(
+    readFileSync(join(repo, '.github/actions/open-pin-pr/action.yml'), 'utf8'),
+  ) as { runs: { steps: { name: string; run?: string }[] } };
+  const script = action.runs.steps.find((s) => s.name === 'Commit pins and open PR')?.run ?? '';
+
+  function sandbox() {
+    const base = mkdtempSync(join(tmpdir(), 'open-pin-pr-'));
+    const git = (cwd: string, ...args: string[]) => {
+      const r = Bun.spawnSync(['git', '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
+        cwd,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      if (r.exitCode !== 0) throw new Error(r.stderr.toString());
+      return r.stdout.toString().trim();
+    };
+    const origin = join(base, 'origin.git');
+    const work = join(base, 'work');
+    git(base, 'init', '-q', '--bare', '-b', 'main', origin);
+    git(base, 'clone', '-q', origin, work);
+    const targets = copyTargets();
+    cpSync(targets, work, { recursive: true });
+    mkdirSync(join(work, 'scripts'));
+    cpSync(join(repo, 'scripts/pin-artifact.ts'), join(work, 'scripts/pin-artifact.ts'));
+    git(work, 'add', '.');
+    git(work, 'commit', '-q', '-m', 'one');
+    const old = git(work, 'rev-parse', 'HEAD');
+    writeFileSync(join(work, 'x'), 'x\n');
+    git(work, 'add', '.');
+    git(work, 'commit', '-q', '-m', 'two');
+    git(work, 'push', '-q', 'origin', 'HEAD:main');
+    // A fake gh that records its arguments and reports no open PR.
+    const bin = join(base, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$*" >> "${base}/gh.log"\n`);
+    chmodSync(join(bin, 'gh'), 0o755);
+    const run = (sha: string, pins: string) =>
+      Bun.spawnSync(['bash', '-c', script], {
+        cwd: work,
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: {
+          ...process.env,
+          PATH: `${bin}:${dirname(process.execPath)}:${process.env.PATH}`,
+          GITHUB_SHA: sha,
+          NAME: 'wash',
+          PINS: pins,
+          GH_TOKEN: 'x',
+          RUN_URL: 'https://example.invalid/run',
+          RUNNER_TEMP: base,
+          GIT_AUTHOR_NAME: 't',
+          GIT_COMMITTER_NAME: 't',
+        },
+      });
+    return {
+      base,
+      origin,
+      tip: git(work, 'rev-parse', 'HEAD'),
+      old,
+      run,
+      branches: () => git(base, '--git-dir', origin, 'branch', '--list'),
+      log: (ref: string) => git(base, '--git-dir', origin, 'log', '--format=%s', ref),
+      files: (ref: string) =>
+        git(base, '--git-dir', origin, 'diff', '--name-only', `${ref}~1`, ref),
+    };
+  }
+
+  test('both wash variants land in one commit on one branch, bot/pin-wash (W1)', () => {
+    const box = sandbox();
+    const result = box.run(box.tip, `wash-wasi-tls ${DIGEST}\nwash-wasi-tls-exclusive ${OTHER}\n`);
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(box.branches()).toContain('bot/pin-wash');
+    expect(box.log('bot/pin-wash').split('\n')[0]).toBe(
+      `chore: pin wash: wash-wasi-tls to ${DIGEST}; wash-wasi-tls-exclusive to ${OTHER}`,
+    );
+    expect(box.files('bot/pin-wash')).toBe('platform/tenant-host/README.md');
+    const gh = readFileSync(join(box.base, 'gh.log'), 'utf8');
+    expect(gh).toContain('pr list --head bot/pin-wash');
+    expect(gh).toContain('pr create --base main --head bot/pin-wash');
+    const body = readFileSync(join(box.base, 'pin-pr-body.md'), 'utf8');
+    expect(body).toContain('A maintainer has to approve and run this PR');
+  });
+
+  test('a single pin is titled "chore: pin <artifact> to <digest>"', () => {
+    const box = sandbox();
+    const result = box.run(box.tip, `pglite-component ${DIGEST}`);
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(box.log('bot/pin-wash').split('\n')[0]).toBe(`chore: pin pglite-component to ${DIGEST}`);
+  });
+
+  test('a stale run (not the tip of main) pins nothing and succeeds (W2)', () => {
+    const box = sandbox();
+    const result = box.run(box.old, `wash-wasi-tls ${DIGEST}`);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString()).toContain('::notice::');
+    expect(box.branches()).not.toContain('bot/pin-wash');
+  });
+
+  test('an empty pin list is a no-op, and a bad digest fails before any push', () => {
+    const box = sandbox();
+    expect(box.run(box.tip, '').exitCode).toBe(0);
+    expect(box.run(box.tip, 'wash-wasi-tls sha256:nope').exitCode).toBe(1);
+    expect(box.branches()).not.toContain('bot/pin-wash');
   });
 });

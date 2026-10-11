@@ -71,7 +71,7 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC2086 # FORCE is empty or one flag
           bun scripts/source-check.ts --workflow .github/workflows/pglite-component-publish.yml \
-            --image ghcr.io/di-framework/pglite-component ${FORCE} >> "${GITHUB_OUTPUT}"
+            --image ghcr.io/di-framework/pglite-component --require-main-tip "${GITHUB_SHA}" ${FORCE} --github-output
 
   build:
     name: Build and test pglite component
@@ -289,6 +289,6 @@ jobs:
       - name: Open pin PR
         uses: ./.github/actions/open-pin-pr
         with:
-          artifact: pglite-component
-          digest: ${{ needs.publish.outputs.digest }}
+          name: pglite-component
+          pins: pglite-component ${{ needs.publish.outputs.digest }}
           token: ${{ secrets.GITHUB_TOKEN }}
