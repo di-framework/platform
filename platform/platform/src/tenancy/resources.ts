@@ -1793,10 +1793,11 @@ function tenantAuthResources(
 }
 /**
  * The tenant registry (#83): `platform/oci-registry` on the tenant's own hosts. Its storage is
- * the unnamed blobstore with no references, i.e. the host data store on the tenant's `di-nats`.
- * The component reads the whoami URL and the tenant through `wasmcloud:secrets` bind-time config;
- * admission admits that interface from the platform controller only, so a tenant cannot repoint
- * it. The plain-HTTP whoami URL is in-cluster (`*.svc`), as the component requires.
+ * the unnamed blobstore, configured with the NATS backend pointing to the tenant's `di-nats`
+ * for persistent blob and manifest storage. The component reads the whoami URL and the tenant
+ * through `wasmcloud:secrets` bind-time config; admission admits that interface from the
+ * platform controller only, so a tenant cannot repoint it. The plain-HTTP whoami URL is
+ * in-cluster (`*.svc`), as the component requires.
  */
 function registryWorkload(
   tenant: Tenant,
@@ -1843,6 +1844,10 @@ function registryWorkload(
                 package: 'blobstore',
                 version: '0.1.0',
                 interfaces: ['blobstore', 'container', 'types'],
+                config: {
+                  backend: 'nats',
+                  url: `nats://di-nats.${n.runtimeNamespace}.svc.cluster.local:4222`,
+                },
               },
               {
                 namespace: 'wasmcloud',
