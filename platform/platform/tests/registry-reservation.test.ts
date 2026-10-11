@@ -287,7 +287,7 @@ describe('wasmcloud:secrets bind-time config (#83 W1)', () => {
       ...config,
     },
   });
-  const variants: [string, HostInterfaceLike[]][] = [
+  const variants: [string, HostInterfaceLike[], string?][] = [
     ['registry shape', [http('registry'), blobstoreNats(), secrets()]],
     ['rendered registry', renderedRegistryInterfaces()],
     [
@@ -299,6 +299,9 @@ describe('wasmcloud:secrets bind-time config (#83 W1)', () => {
       'nats look-alike host',
       [blobstoreNats({ url: 'nats://di-nats.di-runtime-alpha.svc.cluster.local:4222.evil' })],
     ],
+    ['nats extra interface', [{ ...blobstoreNats(), interfaces: ['blobstore', 'evil'] }]],
+    ['nats other tenant namespace', [blobstoreNats()], 'di-tenant-beta'],
+    ['nats non-tenant namespace', [blobstoreNats()], 'default'],
     ['nats extra key', [blobstoreNats({ extra: 'x' })]],
     ['nats named', [{ ...blobstoreNats(), name: 'other' }]],
     ['nats configFrom', [{ ...blobstoreNats(), configFrom: [{ name: 'di-bs-x' }] }]],
@@ -316,13 +319,14 @@ describe('wasmcloud:secrets bind-time config (#83 W1)', () => {
     let cases = 0;
     for (const username of users)
       for (const operation of ['CREATE', 'UPDATE'])
-        for (const [label, hostInterfaces] of variants) {
+        for (const [label, hostInterfaces, ns = 'di-tenant-alpha'] of variants) {
           const object = workload(REGISTRY_WORKLOAD, undefined, hostInterfaces);
+          object.metadata.namespace = ns;
           const expected = hostInterfaces.every((h) =>
             hostInterfaceAllowed(h, {
               username,
               controllerNamespace: 'wasmcloud',
-              workloadNamespace: 'di-tenant-alpha',
+              workloadNamespace: ns,
             }),
           );
           const actual = celAllowed(username, operation, object);

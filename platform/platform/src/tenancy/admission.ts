@@ -82,10 +82,6 @@ export interface HostInterfaceLike {
   config?: Record<string, unknown>;
 }
 
-/**
- * Mirrors the workload ValidatingAdmissionPolicy CEL (fail-closed).
- * Unnamed backend selection is denied except the transitional stock keyvalue path.
- */
 function registryBlobstoreAllowed(
   hostInterface: HostInterfaceLike,
   requester?: { username: string; controllerNamespace: string; workloadNamespace?: string },
@@ -107,6 +103,10 @@ function registryBlobstoreAllowed(
   );
 }
 
+/**
+ * Mirrors the workload ValidatingAdmissionPolicy CEL (fail-closed).
+ * Unnamed backend selection is denied except the transitional stock keyvalue path.
+ */
 export function hostInterfaceAllowed(
   hostInterface: HostInterfaceLike,
   requester?: { username: string; controllerNamespace: string; workloadNamespace?: string },
@@ -159,6 +159,13 @@ export function hostInterfaceAllowed(
   // (#150), and only against the NATS in the workload's own runtime namespace.
   if (packageName === 'blobstore') {
     if (hasName || secretFrom.length > 0) return false;
+    const interfaces = hostInterface.interfaces ?? [];
+    if (
+      !interfaces.every(
+        (iface) => iface === 'blobstore' || iface === 'container' || iface === 'types',
+      )
+    )
+      return false;
     if (configKeys.length > 0) return registryBlobstoreAllowed(hostInterface, requester);
     if (
       !configFrom.every(
@@ -168,10 +175,7 @@ export function hostInterfaceAllowed(
       )
     )
       return false;
-    const interfaces = hostInterface.interfaces ?? [];
-    return interfaces.every(
-      (iface) => iface === 'blobstore' || iface === 'container' || iface === 'types',
-    );
+    return true;
   }
   if (packageName !== 'keyvalue' && packageName !== 'messaging') return false;
   if (!configFrom.every((reference) => isManagedConfigName(reference.name))) return false;
