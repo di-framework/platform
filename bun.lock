@@ -15,7 +15,7 @@
     },
     "adapters/cloudflare": {
       "name": "@di-framework/cloudflare",
-      "version": "6.0.10",
+      "version": "6.0.9",
       "devDependencies": {
         "@di-framework/core": "^5",
         "@types/bun": "latest",
@@ -27,7 +27,7 @@
     },
     "adapters/cloudfoundry": {
       "name": "@di-framework/cloudfoundry",
-      "version": "6.0.10",
+      "version": "6.0.9",
       "devDependencies": {
         "@di-framework/core": "^5",
         "@types/bun": "latest",
@@ -39,11 +39,11 @@
     },
     "platform/backup-agent": {
       "name": "@di-framework/backup-agent",
-      "version": "6.0.10",
+      "version": "6.0.9",
     },
     "platform/backup-destination": {
       "name": "@di-framework/backup-destination",
-      "version": "6.0.10",
+      "version": "6.0.9",
       "dependencies": {
         "@pulumi/kubernetes": "4.34.0",
         "@pulumi/pulumi": "3.261.0",
@@ -51,7 +51,7 @@
     },
     "platform/bindings": {
       "name": "@di-framework/bindings",
-      "version": "6.0.10",
+      "version": "6.0.9",
       "devDependencies": {
         "@di-framework/core": "^5",
         "@di-framework/repo": "^6.0.4",
@@ -68,15 +68,15 @@
     },
     "platform/oci-registry": {
       "name": "@di-framework/oci-registry",
-      "version": "6.0.10",
+      "version": "6.0.9",
     },
     "platform/pglite-component": {
       "name": "@di-framework/pglite-component",
-      "version": "6.0.10",
+      "version": "6.0.9",
     },
     "platform/platform": {
       "name": "@di-framework/platform",
-      "version": "6.0.10",
+      "version": "6.0.9",
       "dependencies": {
         "@pulumi/command": "1.2.1",
         "@pulumi/kubernetes": "4.34.0",
@@ -91,11 +91,11 @@
     },
     "platform/sqlite-component": {
       "name": "@di-framework/sqlite-component",
-      "version": "6.0.10",
+      "version": "6.0.9",
     },
     "platform/tenant-auth": {
       "name": "@di-framework/tenant-auth",
-      "version": "6.0.10",
+      "version": "0.0.0",
       "dependencies": {
         "@di-framework/tenant-cli": "workspace:*",
         "js-yaml": "4.3.2",
@@ -106,7 +106,7 @@
     },
     "platform/tenant-cli": {
       "name": "@di-framework/tenant-cli",
-      "version": "6.0.10",
+      "version": "6.0.9",
       "bin": {
         "di-tenant": "dist/main.js",
       },

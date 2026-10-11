@@ -1,0 +1,1553 @@
+diff --git a/crates/wash-runtime/src/engine/ctx.rs b/crates/wash-runtime/src/engine/ctx.rs
+index 0388738..d9fcf1d 100644
+--- a/crates/wash-runtime/src/engine/ctx.rs
++++ b/crates/wash-runtime/src/engine/ctx.rs
+@@ -80,6 +80,10 @@ pub struct SharedCtx {
+     /// The in-flight calls on this store whose dispatchers may abandon them;
+     /// read by the store's epoch callback. See [`crate::engine::abandon`].
+     pub abandoned: Arc<crate::engine::abandon::AbandonedCalls>,
++    /// Store leases on the exclusive components this store holds, released when
++    /// the store is dropped. Declared last so they outlive every field above;
++    /// see [`crate::engine::instance_pool`].
++    pub(crate) leases: Vec<crate::engine::instance_pool::StoreLease>,
+ }
+ 
+ /// The identity of whoever is invoking a host component plugin, used to
+@@ -105,6 +109,7 @@ impl SharedCtx {
+             exporter_instances: Default::default(),
+             resource_registry: None,
+             abandoned: Arc::default(),
++            leases: Vec::new(),
+         }
+     }
+ 
+diff --git a/crates/wash-runtime/src/engine/instance_driver.rs b/crates/wash-runtime/src/engine/instance_driver.rs
+index f7f8d3d..3897332 100644
+--- a/crates/wash-runtime/src/engine/instance_driver.rs
++++ b/crates/wash-runtime/src/engine/instance_driver.rs
+@@ -49,7 +49,7 @@ use wasmtime::error::Context as _;
+ use wasmtime_wasi_http::p3::bindings::Service;
+ 
+ use crate::engine::ctx::SharedCtx;
+-use crate::engine::instance_pool::ComponentInstance;
++use crate::engine::instance_pool::{CallPermit, ComponentInstance};
+ use crate::host::http::ServiceHttpJob;
+ use crate::host::trigger_service::HttpTask;
+ 
+@@ -111,11 +111,40 @@ impl DriverState {
+ /// in a way that leaves guest state indeterminate.
+ pub(crate) struct PoolSlot {
+     state: Arc<DriverState>,
++    /// Whether the task ran to the end. A slot dropped before that belongs to a
++    /// task that was torn down mid-call, which is what a guest trap does to
++    /// every call on the store.
++    settled: bool,
+     /// Frees this call's slot when the slot is dropped, however the task ends.
+     _in_flight: InFlightGuard,
+ }
+ 
++impl Drop for PoolSlot {
++    /// A task torn down mid-call leaves the instance faulted, so retire it
++    /// before the in-flight slot (a field, dropped after this) is released: a
++    /// caller admitted the moment that slot frees must not be handed an
++    /// instance that is dying.
++    fn drop(&mut self) {
++        if !self.settled {
++            self.state.retire();
++        }
++    }
++}
++
+ impl PoolSlot {
++    fn new(state: Arc<DriverState>, in_flight: InFlightGuard) -> Self {
++        Self {
++            state,
++            settled: false,
++            _in_flight: in_flight,
++        }
++    }
++
++    /// The task ran to the end, so dropping the slot is an ordinary release.
++    pub(crate) fn settle(&mut self) {
++        self.settled = true;
++    }
++
+     /// Stop this instance admitting: it drains what it took, ends its run loop,
+     /// and its store's teardown ends any guest work still running on it.
+     ///
+@@ -144,7 +173,7 @@ struct LinkedTask {
+ }
+ 
+ impl AccessorTask<SharedCtx> for LinkedTask {
+-    async fn run(self, accessor: &Accessor<SharedCtx>) -> wasmtime::Result<()> {
++    async fn run(mut self, accessor: &Accessor<SharedCtx>) -> wasmtime::Result<()> {
+         let LinkedJob {
+             func_idx,
+             params,
+@@ -172,6 +201,7 @@ impl AccessorTask<SharedCtx> for LinkedTask {
+             Ok(func) => func,
+             Err(e) => {
+                 let _ = reply.send(Err(e));
++                self.slot.settle();
+                 return Ok(());
+             }
+         };
+@@ -225,6 +255,7 @@ impl AccessorTask<SharedCtx> for LinkedTask {
+         // The caller may have gone; its call still ran to completion, because
+         // a guest subtask cannot be cancelled from the host.
+         let _ = reply.send(outcome);
++        self.slot.settle();
+         Ok(())
+     }
+ }
+@@ -232,16 +263,28 @@ impl AccessorTask<SharedCtx> for LinkedTask {
+ /// Releases an instance's in-flight slot when the call it admitted ends,
+ /// however it ends. Held by the task, so a cancelled or trapped call frees its
+ /// slot just as a completed one does.
+-pub(crate) struct InFlightGuard(Arc<DriverState>);
++pub(crate) struct InFlightGuard {
++    state: Arc<DriverState>,
++    /// The call permit of an exclusive component's call. A field, so it drops
++    /// after the slot is released in `Drop::drop` below: the caller admitted
++    /// next finds the instance idle, not still counting this call.
++    call: Option<CallPermit>,
++}
++
++impl InFlightGuard {
++    fn new(state: Arc<DriverState>) -> Self {
++        Self { state, call: None }
++    }
++}
+ 
+ impl Drop for InFlightGuard {
+     fn drop(&mut self) {
+         // `fetch_sub` returns the previous count, so `1` means this was the
+         // last call in flight. A retired instance is finished at that point.
+-        if self.0.in_flight.fetch_sub(1, Ordering::SeqCst) == 1
+-            && self.0.retired.load(Ordering::SeqCst)
++        if self.state.in_flight.fetch_sub(1, Ordering::SeqCst) == 1
++            && self.state.retired.load(Ordering::SeqCst)
+         {
+-            self.0.drained.notify_one();
++            self.state.drained.notify_one();
+         }
+     }
+ }
+@@ -329,19 +372,13 @@ impl InstanceDriver {
+                                     req,
+                                     resp_tx,
+                                     abandoned,
+-                                    pool_slot: Some(PoolSlot {
+-                                        state: Arc::clone(&task_state),
+-                                        _in_flight: guard,
+-                                    }),
++                                    pool_slot: Some(PoolSlot::new(Arc::clone(&task_state), guard)),
+                                 })
+                             }
+                             InstanceJob::Linked(job) => accessor.spawn(LinkedTask {
+                                 instance,
+                                 job,
+-                                slot: PoolSlot {
+-                                    state: Arc::clone(&task_state),
+-                                    _in_flight: guard,
+-                                },
++                                slot: PoolSlot::new(Arc::clone(&task_state), guard),
+                             }),
+                         };
+                         if let Err(e) = spawned {
+@@ -368,6 +405,13 @@ impl InstanceDriver {
+         }
+     }
+ 
++    /// Retire this instance as a timed-out call would, for tests that drive the
++    /// drain from outside the call.
++    #[cfg(test)]
++    pub(crate) fn retire(&self) {
++        self.state.retire();
++    }
++
+     /// Calls in flight on this instance right now.
+     pub(crate) fn in_flight(&self) -> usize {
+         self.state.in_flight.load(Ordering::SeqCst)
+@@ -403,7 +447,7 @@ impl InstanceDriver {
+         if !claimed {
+             return None;
+         }
+-        let guard = InFlightGuard(Arc::clone(&self.state));
++        let guard = InFlightGuard::new(Arc::clone(&self.state));
+ 
+         // Count the call against this instance's budget. Admission past the
+         // limit is refused, not just noted: racing callers can all get here
+@@ -465,21 +509,33 @@ impl InstanceDriver {
+     /// Hand a call to this instance. Returns the job again if the instance
+     /// could not take it, so the caller can try elsewhere. Boxed because the
+     /// refusal carries the whole request back.
+-    pub(crate) fn try_send(&self, job: InstanceJob) -> Result<(), InstanceJob> {
++    ///
++    /// An exclusive component's call permit moves into the instance's in-flight
++    /// slot with the job, and is released when that slot is. When the job is
++    /// returned the permit is left in `permit`, still the caller's.
++    pub(crate) fn try_send(
++        &self,
++        job: InstanceJob,
++        permit: &mut Option<CallPermit>,
++    ) -> Result<(), InstanceJob> {
+         // An instance without the HTTP export can only fail such a call.
+         // Declining it sends the request to a store of its own, where the
+         // binding is built per request and its error reaches the client.
+         if !self.serves_http && matches!(job, InstanceJob::Http(_)) {
+             return Err(job);
+         }
+-        let Some(guard) = self.try_admit() else {
++        let Some(mut guard) = self.try_admit() else {
+             return Err(job);
+         };
++        guard.call = permit.take();
+         // Capacity equals `max_concurrency` and admission already claimed a
+         // slot, so this only fails if the driver task has gone.
+         self.tx.try_send((job, guard)).map_err(|e| match e {
+-            tokio::sync::mpsc::error::TrySendError::Full((job, _))
+-            | tokio::sync::mpsc::error::TrySendError::Closed((job, _)) => job,
++            tokio::sync::mpsc::error::TrySendError::Full((job, mut guard))
++            | tokio::sync::mpsc::error::TrySendError::Closed((job, mut guard)) => {
++                *permit = guard.call.take();
++                job
++            }
+         })
+     }
+ }
+diff --git a/crates/wash-runtime/src/engine/instance_pool.rs b/crates/wash-runtime/src/engine/instance_pool.rs
+index 9be47f2..ea2b276 100644
+--- a/crates/wash-runtime/src/engine/instance_pool.rs
++++ b/crates/wash-runtime/src/engine/instance_pool.rs
+@@ -31,6 +31,30 @@
+ //!    the instance the same way — the guest work cannot be cancelled from the
+ //!    host, so draining and dropping the store is what ends it.
+ //!
++//! An *exclusive* component ([`InstancePolicy::Exclusive`], opted into with the
++//! [`EXCLUSIVE_INSTANCE_KEY`] entry of its `local_resources.config`) is one that
++//! must never have two stores alive at once, because the state behind it
++//! (an embedded database's data directory, say) tolerates exactly one opener.
++//! Every escape hatch above (the one-shot store a saturated pool serves a call
++//! from, the replacement built while a retired instance drains, the instance a
++//! trap leaves behind until its task is dropped) would open it a second time.
++//! The guarantee is therefore made below the pool, in two FIFO gates per
++//! exclusive component (see [`ExclusiveGate`]):
++//!
++//!  * a *store lease* is taken before any store holding the component is built,
++//!    on every path (warm instance, one-shot store, service, messaging), and
++//!    lives in the store's own context ([`crate::engine::ctx::SharedCtx`]), so
++//!    it is released exactly when the store is dropped: on completion, trap,
++//!    timeout, drain or cancellation. That alone bounds live stores at one;
++//!  * a *call permit* is taken before a call is offered to the pool, so
++//!    callers queue in arrival order instead of racing for the instance or
++//!    each other's creation. It travels with the call's in-flight slot and is
++//!    released only after that slot, so the single instance is idle by the time
++//!    the next caller is admitted. Replacement creation happens under it.
++//!
++//! A call that cannot get either gate within the exclusive wait fails with an
++//! error. It is never served from a store of its own.
++//!
+ //! Two further consequences of an instance outliving a call, both of which a
+ //! component opts into along with the pooling:
+ //!
+@@ -47,6 +71,7 @@ use std::collections::{BTreeMap, HashSet};
+ use std::num::NonZeroUsize;
+ use std::sync::{Arc, Mutex, MutexGuard};
+ 
++use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+ use wasmtime::component::Instance;
+ 
+ use crate::engine::ctx::SharedCtx;
+@@ -54,6 +79,83 @@ use crate::engine::instance_driver::{InstanceDriver, InstanceJob};
+ use crate::engine::workload::WorkloadComponent;
+ use crate::types::Component;
+ 
++/// The `local_resources.config` entry that makes a component exclusive. Any
++/// value other than `false` opts in: an unrecognised value fails closed.
++pub const EXCLUSIVE_INSTANCE_KEY: &str = "di-framework.dev/exclusive-instance";
++
++/// Held for the lifetime of a store of an exclusive component. See the module
++/// docs.
++pub(crate) type StoreLease = OwnedSemaphorePermit;
++
++/// Held by one call of an exclusive component from admission until its
++/// in-flight slot is released. See the module docs.
++pub(crate) type CallPermit = OwnedSemaphorePermit;
++
++/// The two single-permit semaphores behind an exclusive component. tokio's
++/// semaphore queues waiters in FIFO order and removes a waiter whose future is
++/// dropped, so a caller that goes away stops holding up the line.
++struct ExclusiveGate {
++    calls: Arc<Semaphore>,
++    stores: Arc<Semaphore>,
++}
++
++impl ExclusiveGate {
++    fn new() -> Self {
++        Self {
++            calls: Arc::new(Semaphore::new(1)),
++            stores: Arc::new(Semaphore::new(1)),
++        }
++    }
++}
++
++/// Wait for `semaphore`, no longer than the exclusive wait.
++async fn acquire(semaphore: Arc<Semaphore>, what: &str) -> anyhow::Result<OwnedSemaphorePermit> {
++    acquire_within(semaphore, what, crate::timeouts::exclusive_wait()).await
++}
++
++async fn acquire_within(
++    semaphore: Arc<Semaphore>,
++    what: &str,
++    wait: std::time::Duration,
++) -> anyhow::Result<OwnedSemaphorePermit> {
++    match tokio::time::timeout(wait, semaphore.acquire_owned()).await {
++        Ok(Ok(permit)) => Ok(permit),
++        Ok(Err(_closed)) => anyhow::bail!("exclusive {what} gate closed"),
++        Err(_) => anyhow::bail!(
++            "timed out after {wait:?} waiting for the exclusive component's {what}: \
++             another call or its store has not finished"
++        ),
++    }
++}
++
++/// Take a store lease on each gate in `gates`, in the order given. Callers pass
++/// them in component-id order so that two stores needing the same pair of
++/// components cannot each hold one and wait for the other.
++///
++/// Must be called without any workload lock held: the wait can be long, and the
++/// store that is being waited for may need that lock to finish.
++pub(crate) async fn lease_stores(gates: Vec<Arc<Semaphore>>) -> anyhow::Result<Vec<StoreLease>> {
++    let mut leases = Vec::with_capacity(gates.len());
++    for gate in gates {
++        leases.push(acquire(gate, "store lease").await?);
++    }
++    Ok(leases)
++}
++
++/// The store-lease gates of the exclusive components among `ids`, ordered by
++/// component id. A store holds every component linked into it, so all of them
++/// count, not only the one the call targets.
++pub(crate) fn store_gates(
++    components: &BTreeMap<Arc<str>, WorkloadComponent>,
++    ids: &[Arc<str>],
++) -> Vec<Arc<Semaphore>> {
++    components
++        .iter()
++        .filter(|(id, _)| ids.contains(id))
++        .filter_map(|(_, component)| component.instances.store_gate())
++        .collect()
++}
++
+ /// The pool that may keep `component_id`'s instances warm, or `None` when
+ /// every call must get a store of its own.
+ ///
+@@ -99,7 +201,10 @@ pub(crate) enum Dispatch {
+     NeedsInstance(InstanceJob),
+     /// Every warm instance is busy and the pool is full. Serve it from a store
+     /// of its own — which is what an unpooled component pays for every call,
+-    /// so pooling never adds latency it did not save.
++    /// so pooling never adds latency it did not save. An exclusive pool never
++    /// serves it that way: its callers hold a call permit and so find the one
++    /// instance idle, and reaching this there is an error (see
++    /// [`InstancePool::is_exclusive`]).
+     Saturated(InstanceJob),
+ }
+ 
+@@ -147,6 +252,16 @@ pub enum InstancePolicy {
+         /// it can take more.
+         max_concurrency: NonZeroUsize,
+     },
++    /// One warm instance serving one call at a time, with no second store of
++    /// the component alive at any moment: no one-shot store on saturation, no
++    /// replacement before the retired instance's store is dropped, no overlap
++    /// on a trap or timeout. See the module docs. Pool size and concurrency are
++    /// fixed at one, so the invalid combinations do not exist to be rejected.
++    #[non_exhaustive]
++    Exclusive {
++        /// `None` when the instance may serve calls indefinitely.
++        max_invocations: Option<NonZeroUsize>,
++    },
+ }
+ 
+ impl InstancePolicy {
+@@ -155,6 +270,13 @@ impl InstancePolicy {
+     /// Takes the whole component rather than its limits so that a limit added
+     /// to [`Component`] later reaches this without changing the signature.
+     pub fn from_component(component: &Component) -> Self {
++        if Self::requests_exclusive(&component.local_resources.config) {
++            return Self::Exclusive {
++                max_invocations: usize::try_from(component.max_invocations)
++                    .ok()
++                    .and_then(NonZeroUsize::new),
++            };
++        }
+         Self::from_limits(
+             component.pool_size,
+             component.max_invocations,
+@@ -162,6 +284,27 @@ impl InstancePolicy {
+         )
+     }
+ 
++    /// Whether `config` opts the component into exclusivity. Only an explicit
++    /// `false` opts out; a value that is neither `true` nor `false` is treated
++    /// as `true`, because the wrong guess in the other direction is the overlap
++    /// this exists to prevent.
++    fn requests_exclusive(config: &std::collections::HashMap<String, String>) -> bool {
++        match config.get(EXCLUSIVE_INSTANCE_KEY).map(|v| v.trim()) {
++            None => false,
++            Some(v) if v.eq_ignore_ascii_case("false") => false,
++            Some(v) => {
++                if !v.eq_ignore_ascii_case("true") {
++                    tracing::warn!(
++                        key = EXCLUSIVE_INSTANCE_KEY,
++                        value = v,
++                        "unrecognised exclusivity value; treating the component as exclusive"
++                    );
++                }
++                true
++            }
++        }
++    }
++
+     /// Decode the wire limits. Anything that does not name a positive pool
+     /// size, whether unset (`-1`), zero or negative, means instances are not
+     /// kept; an unset `max_concurrency` means one call at a time.
+@@ -179,7 +322,7 @@ impl InstancePolicy {
+ 
+     /// Whether this component keeps instances warm at all.
+     pub fn keeps_instances_warm(&self) -> bool {
+-        matches!(self, Self::Warm { .. })
++        matches!(self, Self::Warm { .. } | Self::Exclusive { .. })
+     }
+ 
+     /// Guest calls this component may have in flight at once: every warm
+@@ -191,7 +334,7 @@ impl InstancePolicy {
+     /// (see `crate::host::http_client`).
+     pub fn call_concurrency(&self) -> usize {
+         match self {
+-            Self::Ephemeral => 1,
++            Self::Ephemeral | Self::Exclusive { .. } => 1,
+             Self::Warm {
+                 pool_size,
+                 max_concurrency,
+@@ -210,6 +353,8 @@ pub(crate) struct InstancePool {
+     /// they arrive over HTTP or from another component in the workload.
+     drivers: Mutex<Vec<Arc<InstanceDriver>>>,
+     policy: InstancePolicy,
++    /// Present exactly when the policy is [`InstancePolicy::Exclusive`].
++    gate: Option<ExclusiveGate>,
+ }
+ 
+ impl InstancePool {
+@@ -217,6 +362,29 @@ impl InstancePool {
+         Self {
+             drivers: Mutex::new(Vec::new()),
+             policy,
++            gate: matches!(policy, InstancePolicy::Exclusive { .. }).then(ExclusiveGate::new),
++        }
++    }
++
++    /// Whether this component must never have two stores alive at once.
++    pub(crate) fn is_exclusive(&self) -> bool {
++        self.gate.is_some()
++    }
++
++    /// The gate a store of this component takes a lease on, if exclusive.
++    pub(crate) fn store_gate(&self) -> Option<Arc<Semaphore>> {
++        self.gate.as_ref().map(|g| Arc::clone(&g.stores))
++    }
++
++    /// Wait in line for this exclusive component. `None` for a component that
++    /// is not exclusive, which is never made to wait. Take the permit before
++    /// [`Self::offer`] and keep it until the call is handed over.
++    pub(crate) async fn admit_call(&self) -> anyhow::Result<Option<CallPermit>> {
++        match &self.gate {
++            Some(gate) => acquire(Arc::clone(&gate.calls), "call permit")
++                .await
++                .map(Some),
++            None => Ok(None),
+         }
+     }
+ 
+@@ -249,7 +417,8 @@ impl InstancePool {
+         self.policy.call_concurrency()
+     }
+ 
+-    /// The instance limits, or `None` when this component keeps none.
++    /// The instance limits, or `None` when this component keeps none. An
++    /// exclusive component's are fixed at one instance and one call at a time.
+     fn limits(&self) -> Option<(usize, Option<usize>, usize)> {
+         match self.policy {
+             InstancePolicy::Ephemeral => None,
+@@ -262,6 +431,9 @@ impl InstancePool {
+                 max_invocations.map(NonZeroUsize::get),
+                 max_concurrency.get(),
+             )),
++            InstancePolicy::Exclusive { max_invocations } => {
++                Some((1, max_invocations.map(NonZeroUsize::get), 1))
++            }
+         }
+     }
+ 
+@@ -272,7 +444,12 @@ impl InstancePool {
+     /// as [`Dispatch::NeedsInstance`] rather than creating one itself — that
+     /// keeps a request that a warm instance can already serve from paying for
+     /// a store it will not use.
+-    pub(crate) fn offer(&self, job: InstanceJob) -> Dispatch {
++    ///
++    /// `permit` is the caller's call permit, if its component is exclusive. A
++    /// warm instance that takes the call takes the permit with it, to be
++    /// released with the call's in-flight slot; otherwise it stays with the
++    /// caller.
++    pub(crate) fn offer(&self, job: InstanceJob, permit: &mut Option<CallPermit>) -> Dispatch {
+         let Some((pool_size, _, _)) = self.limits() else {
+             return Dispatch::Saturated(job);
+         };
+@@ -290,7 +467,7 @@ impl InstancePool {
+ 
+         let mut job = job;
+         for driver in drivers.iter() {
+-            match driver.try_send(job) {
++            match driver.try_send(job, permit) {
+                 Ok(()) => return Dispatch::Sent,
+                 Err(returned) => job = returned,
+             }
+@@ -303,6 +480,42 @@ impl InstancePool {
+         }
+     }
+ 
++    /// Offer a call to the pool, building an instance with `build` when the
++    /// pool has room for one. `Ok(Err(job))` hands back a call the pool
++    /// declined, for the caller to serve from a store of its own.
++    ///
++    /// An exclusive pool never declines: a caller holding the call permit finds
++    /// the one instance idle or the pool empty, so reaching saturation there
++    /// means the permit was not held, and serving the call from a store of its
++    /// own is exactly what exclusivity forbids. That is an error instead.
++    /// `build` runs under the caller's call permit, so a replacement is only
++    /// ever created by the one caller admitted, and its store lease waits for
++    /// the previous store to be dropped.
++    pub(crate) async fn dispatch<B, Fut>(
++        &self,
++        job: InstanceJob,
++        permit: &mut Option<CallPermit>,
++        build: B,
++    ) -> anyhow::Result<Result<(), InstanceJob>>
++    where
++        B: FnOnce() -> Fut,
++        Fut: std::future::Future<Output = anyhow::Result<ComponentInstance>>,
++    {
++        match self.offer(job, permit) {
++            Dispatch::Sent => Ok(Ok(())),
++            // The pool has room. The caller builds and instantiates the store,
++            // where awaiting is allowed and where a component that fails to
++            // instantiate reports that failure to this call rather than only
++            // to the log.
++            Dispatch::NeedsInstance(job) => Ok(self.install(build().await?, job, permit)),
++            Dispatch::Saturated(_) if self.is_exclusive() => anyhow::bail!(
++                "exclusive component is saturated despite holding its call permit; \
++                 refusing to serve the call from a store of its own"
++            ),
++            Dispatch::Saturated(job) => Ok(Err(job)),
++        }
++    }
++
+     /// Add an instance built for a [`Dispatch::NeedsInstance`] and give it the
+     /// call. Racing callers can both be told to build one; the loser's is
+     /// dropped and its call offered to the winner's instead.
+@@ -310,6 +523,7 @@ impl InstancePool {
+         &self,
+         instance: ComponentInstance,
+         job: InstanceJob,
++        permit: &mut Option<CallPermit>,
+     ) -> Result<(), InstanceJob> {
+         let Some((pool_size, max_invocations, max_concurrency)) = self.limits() else {
+             return Err(job);
+@@ -317,7 +531,7 @@ impl InstancePool {
+         let mut drivers = self.lock_drivers();
+         if drivers.len() >= pool_size {
+             drop(drivers);
+-            return match self.offer(job) {
++            return match self.offer(job, permit) {
+                 Dispatch::Sent => Ok(()),
+                 Dispatch::NeedsInstance(job) | Dispatch::Saturated(job) => Err(job),
+             };
+@@ -329,7 +543,7 @@ impl InstancePool {
+         ));
+         drivers.push(Arc::clone(&driver));
+         drop(drivers);
+-        driver.try_send(job)
++        driver.try_send(job, permit)
+     }
+ 
+     /// Whether this component keeps instances warm at all.
+@@ -362,6 +576,9 @@ fn sort_least_busy(drivers: &mut [Arc<InstanceDriver>]) {
+     drivers.sort_by_cached_key(|d| d.in_flight());
+ }
+ 
++#[cfg(test)]
++mod exclusive_tests;
++
+ #[cfg(test)]
+ mod tests {
+     use std::sync::Arc;
+diff --git a/crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs b/crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs
+new file mode 100644
+index 0000000..aaecc56
+--- /dev/null
++++ b/crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs
+@@ -0,0 +1,533 @@
++//! Exclusive components never have two stores alive at once.
++//!
++//! These drive real concurrency through the production dispatch path
++//! ([`InstancePool::admit_call`] then [`InstancePool::dispatch`], which builds
++//! and installs real [`wasmtime::Store`]s holding real component instances and
++//! hands real jobs to real [`InstanceDriver`]s) and count live stores. The
++//! counter is a value the test pushes into each store's resource table, which
++//! the store drops before its leases (see `SharedCtx`), so it falls before the
++//! next store can be admitted: a store built without waiting for the previous
++//! one to be dropped would show up as a peak of two.
++//!
++//! The guest is a small component with three exports: `ok` returns at once,
++//! `slow` computes for a while without yielding, and `trap` traps.
++
++use std::sync::Arc;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::time::{Duration, Instant};
++
++use wasmtime::component::{Component, Linker};
++
++use super::*;
++use crate::engine::abandon::{AbandonedCallPolicy, DispatchedCall, arm_epoch_deadline};
++use crate::engine::ctx::Ctx;
++use crate::engine::instance_driver::LinkedJob;
++
++const GUEST: &str = r#"
++(component
++  (core module $m
++    (func (export "ok") (result i32) i32.const 7)
++    (func (export "slow") (result i32)
++      (local $i i32)
++      (local.set $i (i32.const 150000000))
++      (loop $spin
++        (local.set $i (i32.sub (local.get $i) (i32.const 1)))
++        (br_if $spin (local.get $i)))
++      i32.const 7)
++    (func (export "trap") (result i32) unreachable))
++  (core instance $i (instantiate $m))
++  (func (export "ok") (result u32) (canon lift (core func $i "ok")))
++  (func (export "slow") (result u32) (canon lift (core func $i "slow")))
++  (func (export "trap") (result u32) (canon lift (core func $i "trap"))))
++"#;
++
++/// Live-store accounting shared by every store a rig builds.
++#[derive(Default)]
++struct Live {
++    now: AtomicUsize,
++    peak: AtomicUsize,
++    created: AtomicUsize,
++}
++
++/// Lives in a store's resource table: counts the store while it exists.
++struct LiveStore(Arc<Live>);
++
++impl LiveStore {
++    fn enter(live: &Arc<Live>) -> Self {
++        let now = live.now.fetch_add(1, Ordering::SeqCst) + 1;
++        live.peak.fetch_max(now, Ordering::SeqCst);
++        live.created.fetch_add(1, Ordering::SeqCst);
++        Self(Arc::clone(live))
++    }
++}
++
++impl Drop for LiveStore {
++    fn drop(&mut self) {
++        // Tearing a store down takes a while (closing files, flushing a
++        // database), and the store still counts as live throughout. A
++        // replacement that did not wait for it would be built in this window.
++        std::thread::sleep(Duration::from_millis(60));
++        self.0.now.fetch_sub(1, Ordering::SeqCst);
++    }
++}
++
++struct Rig {
++    pool: Arc<InstancePool>,
++    live: Arc<Live>,
++    engine: crate::engine::Engine,
++    component: Component,
++    linker: Linker<SharedCtx>,
++}
++
++impl Rig {
++    fn exclusive(max_invocations: Option<usize>) -> Arc<Self> {
++        let policy = InstancePolicy::Exclusive {
++            max_invocations: max_invocations.and_then(NonZeroUsize::new),
++        };
++        Self::with_policy(policy)
++    }
++
++    fn with_policy(policy: InstancePolicy) -> Arc<Self> {
++        let engine = crate::engine::Engine::builder()
++            .build()
++            .expect("engine builds");
++        let bytes = wat::parse_str(GUEST).expect("guest is valid");
++        let component = Component::new(engine.inner(), bytes).expect("guest compiles");
++        let linker = Linker::new(engine.inner());
++        Arc::new(Self {
++            pool: Arc::new(InstancePool::new(policy)),
++            live: Arc::default(),
++            engine,
++            component,
++            linker,
++        })
++    }
++
++    /// What the call sites' `build` closures do: take the store lease the way
++    /// `new_store` does, build a real store that carries it, instantiate the
++    /// guest into it.
++    async fn build(&self) -> anyhow::Result<ComponentInstance> {
++        let gates: Vec<_> = self.pool.store_gate().into_iter().collect();
++        let leases = lease_stores(gates).await?;
++        let mut ctx = SharedCtx::new(Ctx::builder("wk", "guest").build());
++        ctx.leases = leases;
++        ctx.table.push(LiveStore::enter(&self.live))?;
++        let mut store = wasmtime::Store::new(self.engine.inner(), ctx);
++        arm_epoch_deadline(&mut store, AbandonedCallPolicy::Trap);
++        let instance = self
++            .linker
++            .instantiate_async(&mut store, &self.component)
++            .await?;
++        Ok(ComponentInstance { store, instance })
++    }
++
++    /// One call as a call site makes it: wait in line, offer it to the pool
++    /// (building an instance if told to), then wait for the reply for at most
++    /// `give_up_after`. Returns the guest's answer.
++    async fn call(
++        self: &Arc<Self>,
++        export: &'static str,
++        give_up_after: Duration,
++    ) -> anyhow::Result<u32> {
++        let mut permit = self.pool.admit_call().await?;
++        let (reply, reply_rx) = tokio::sync::oneshot::channel();
++        let flag = DispatchedCall::new("test", Duration::from_secs(60)).flag();
++        let func_idx = self
++            .component
++            .get_export_index(None, export)
++            .expect("guest exports it");
++        let job = InstanceJob::Linked(Box::new(LinkedJob {
++            func_idx,
++            params: vec![],
++            results_len: 1,
++            import_name: Arc::from("test"),
++            export_name: Arc::from(export),
++            reply,
++            abandoned: flag,
++        }));
++        let rig = Arc::clone(self);
++        let outcome = self
++            .pool
++            .dispatch(job, &mut permit, || async move { rig.build().await })
++            .await?;
++        anyhow::ensure!(
++            outcome.is_ok(),
++            "an exclusive pool must not decline a call to a store of its own"
++        );
++        let vals = tokio::time::timeout(give_up_after, reply_rx)
++            .await
++            .map_err(|_| anyhow::anyhow!("gave up waiting for the reply"))?
++            .map_err(|_| anyhow::anyhow!("the instance dropped the call"))?
++            .map_err(|e| anyhow::anyhow!("{e:#}"))?;
++        match vals.as_slice() {
++            [wasmtime::component::Val::U32(v)] => Ok(*v),
++            other => anyhow::bail!("unexpected results {other:?}"),
++        }
++    }
++
++    fn peak(&self) -> usize {
++        self.live.peak.load(Ordering::SeqCst)
++    }
++
++    fn created(&self) -> usize {
++        self.live.created.load(Ordering::SeqCst)
++    }
++
++    /// Wait until every store has been dropped.
++    async fn settled(&self) {
++        let deadline = Instant::now() + Duration::from_secs(20);
++        while self.live.now.load(Ordering::SeqCst) != 0 {
++            assert!(Instant::now() < deadline, "a store was never dropped");
++            tokio::time::sleep(Duration::from_millis(5)).await;
++        }
++    }
++}
++
++const PATIENT: Duration = Duration::from_secs(30);
++
++/// N callers at once, each holding the instance for a while. They queue for the
++/// one warm instance: none is served from a store of its own, only one store is
++/// ever built, and at most one is ever alive.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn saturation_queues_on_the_one_instance() {
++    let rig = Rig::exclusive(None);
++
++    let calls: Vec<_> = (0..12)
++        .map(|_| {
++            let rig = Arc::clone(&rig);
++            tokio::spawn(async move { rig.call("slow", PATIENT).await })
++        })
++        .collect();
++    for call in calls {
++        assert_eq!(call.await.unwrap().expect("every queued call is served"), 7);
++    }
++
++    assert_eq!(rig.peak(), 1, "at most one store may be alive");
++    assert_eq!(rig.created(), 1, "the queue is served by one warm instance");
++}
++
++/// The line is first come, first served.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn callers_are_served_in_arrival_order() {
++    let rig = Rig::exclusive(None);
++    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
++
++    let mut calls = Vec::new();
++    for n in 0..6 {
++        let (rig, order) = (Arc::clone(&rig), Arc::clone(&order));
++        calls.push(tokio::spawn(async move {
++            let answer = rig.call("slow", PATIENT).await;
++            order.lock().unwrap().push(n);
++            answer
++        }));
++        // Arrive one after another, well within the first call's duration.
++        tokio::time::sleep(Duration::from_millis(5)).await;
++    }
++    for call in calls {
++        call.await.unwrap().expect("served");
++    }
++
++    assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3, 4, 5]);
++    assert_eq!(rig.peak(), 1);
++}
++
++/// Two first calls racing on an empty pool build one instance between them: the
++/// second waits for the first rather than building a store it would then throw
++/// away.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn racing_first_calls_build_one_instance() {
++    let rig = Rig::exclusive(None);
++
++    let calls: Vec<_> = (0..8)
++        .map(|_| {
++            let rig = Arc::clone(&rig);
++            tokio::spawn(async move { rig.call("ok", PATIENT).await })
++        })
++        .collect();
++    for call in calls {
++        call.await.unwrap().expect("served");
++    }
++
++    assert_eq!(rig.created(), 1, "exactly one instantiation");
++    assert_eq!(rig.peak(), 1);
++}
++
++/// A trap faults the instance and fails the call. The calls queued behind it
++/// are served by a replacement that is only built once the faulted store has
++/// been dropped.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn a_trap_is_replaced_only_after_its_store_is_gone() {
++    let rig = Rig::exclusive(None);
++
++    rig.call("ok", PATIENT).await.expect("warm up");
++    let trapper = {
++        let rig = Arc::clone(&rig);
++        tokio::spawn(async move { rig.call("trap", PATIENT).await })
++    };
++    tokio::time::sleep(Duration::from_millis(2)).await;
++    let behind: Vec<_> = (0..6)
++        .map(|_| {
++            let rig = Arc::clone(&rig);
++            tokio::spawn(async move { rig.call("slow", PATIENT).await })
++        })
++        .collect();
++
++    assert!(trapper.await.unwrap().is_err(), "the trapping call fails");
++    for call in behind {
++        assert_eq!(call.await.unwrap().expect("served after the trap"), 7);
++    }
++
++    assert_eq!(
++        rig.peak(),
++        1,
++        "the replacement waited for the faulted store"
++    );
++    assert_eq!(rig.created(), 2, "one instance before the trap, one after");
++}
++
++/// A caller that gives up on a slow call does not free the instance: the
++/// guest is still running on it, so the next caller waits for the work to end
++/// and for the store to be dropped. The instance is retired (as a timed-out
++/// call retires it), so its replacement is built afterwards.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn a_timed_out_call_still_holds_the_line_until_its_store_is_gone() {
++    let rig = Rig::exclusive(None);
++
++    let started = Instant::now();
++    let abandoned = {
++        let rig = Arc::clone(&rig);
++        tokio::spawn(async move { rig.call("slow", Duration::from_millis(1)).await })
++    };
++    assert!(
++        abandoned.await.unwrap().is_err(),
++        "the caller gave up before the reply"
++    );
++    // What the instance does on a call that timed out: stop admitting, drain,
++    // drop the store.
++    for driver in rig.pool.lock_drivers().iter() {
++        driver.retire();
++    }
++
++    let behind: Vec<_> = (0..4)
++        .map(|_| {
++            let rig = Arc::clone(&rig);
++            tokio::spawn(async move { rig.call("ok", PATIENT).await })
++        })
++        .collect();
++    for call in behind {
++        assert_eq!(call.await.unwrap().expect("served after the timeout"), 7);
++    }
++
++    assert_eq!(rig.peak(), 1, "no second store beside the abandoned one");
++    assert_eq!(rig.created(), 2);
++    // The calls behind could not start before the slow guest work ended.
++    assert!(
++        started.elapsed() >= Duration::from_millis(30),
++        "the line waited for the abandoned work"
++    );
++}
++
++/// Retiring an instance with a call in flight (`max_invocations` spent, or a
++/// timeout) drains it. The replacement is built under the next caller's
++/// permit, and its store lease only comes once the retired store is dropped.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn drain_with_a_call_in_flight_releases_before_the_replacement() {
++    let rig = Rig::exclusive(None);
++
++    let in_flight = {
++        let rig = Arc::clone(&rig);
++        tokio::spawn(async move { rig.call("slow", PATIENT).await })
++    };
++    // The call is on the instance; retire it mid-call.
++    loop {
++        let retired = {
++            let drivers = rig.pool.lock_drivers();
++            drivers.first().is_some_and(|driver| {
++                let busy = driver.in_flight() == 1;
++                if busy {
++                    driver.retire();
++                }
++                busy
++            })
++        };
++        if retired {
++            break;
++        }
++        tokio::time::sleep(Duration::from_millis(1)).await;
++    }
++
++    let behind = {
++        let rig = Arc::clone(&rig);
++        tokio::spawn(async move { rig.call("ok", PATIENT).await })
++    };
++
++    assert_eq!(in_flight.await.unwrap().expect("drains to completion"), 7);
++    assert_eq!(behind.await.unwrap().expect("replacement serves"), 7);
++    assert_eq!(rig.peak(), 1, "the replacement waited for the drain");
++    assert_eq!(rig.created(), 2);
++}
++
++/// `max_invocations` retires and replaces the instance over and over without
++/// ever overlapping two stores.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn rotation_by_invocation_budget_never_overlaps() {
++    let rig = Rig::exclusive(Some(2));
++
++    let calls: Vec<_> = (0..9)
++        .map(|_| {
++            let rig = Arc::clone(&rig);
++            tokio::spawn(async move { rig.call("slow", PATIENT).await })
++        })
++        .collect();
++    for call in calls {
++        call.await.unwrap().expect("served");
++    }
++
++    assert_eq!(rig.peak(), 1);
++    assert_eq!(rig.created(), 5, "nine calls at two per instance");
++}
++
++/// The store lease, on its own, is what bounds live stores: a store built on a
++/// path that skips the call permit entirely (a cold store, a service, a
++/// messaging delivery) still waits for the live one to be dropped.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_store_built_around_the_call_permit_still_waits_for_the_live_one() {
++    let rig = Rig::exclusive(None);
++
++    let first = rig.build().await.expect("first store");
++    let second = {
++        let rig = Arc::clone(&rig);
++        tokio::spawn(async move { rig.build().await })
++    };
++    tokio::time::sleep(Duration::from_millis(100)).await;
++    assert!(!second.is_finished(), "must wait while the first is alive");
++    assert_eq!(rig.live.now.load(Ordering::SeqCst), 1);
++
++    drop(first);
++    let second = second.await.unwrap().expect("built once the first is gone");
++    assert_eq!(rig.peak(), 1);
++    drop(second);
++    rig.settled().await;
++}
++
++/// A store with a lease releases it when it is dropped, trap or no trap: the
++/// lease lives in the store's own context.
++#[tokio::test]
++async fn dropping_a_store_releases_its_lease() {
++    let rig = Rig::exclusive(None);
++    let gate = rig.pool.store_gate().expect("exclusive");
++    assert_eq!(gate.available_permits(), 1);
++
++    let built = rig.build().await.expect("store");
++    assert_eq!(
++        gate.available_permits(),
++        0,
++        "the live store holds the lease"
++    );
++    drop(built);
++    assert_eq!(
++        gate.available_permits(),
++        1,
++        "dropping it releases the lease"
++    );
++}
++
++/// Waiting is bounded: a caller that cannot get its turn fails with an error
++/// rather than hanging, and never runs anywhere else.
++#[tokio::test]
++async fn waiting_for_a_turn_is_bounded() {
++    let gate = Arc::new(Semaphore::new(1));
++    let _held = gate.clone().acquire_owned().await.unwrap();
++
++    let err = acquire_within(gate, "call permit", Duration::from_millis(20))
++        .await
++        .expect_err("the permit is never freed");
++    assert!(err.to_string().contains("timed out"), "{err}");
++}
++
++/// A caller that goes away while queued leaves the line and holds nobody up.
++#[tokio::test]
++async fn a_cancelled_waiter_leaves_the_line() {
++    let rig = Rig::exclusive(None);
++    let held = rig.pool.admit_call().await.unwrap();
++
++    let waiter = {
++        let pool = Arc::clone(&rig.pool);
++        tokio::spawn(async move { pool.admit_call().await })
++    };
++    tokio::time::sleep(Duration::from_millis(20)).await;
++    waiter.abort();
++    let _ = waiter.await;
++
++    drop(held);
++    let next = tokio::time::timeout(Duration::from_secs(5), rig.pool.admit_call())
++        .await
++        .expect("not stuck behind a cancelled waiter")
++        .unwrap();
++    assert!(next.is_some());
++}
++
++/// The opt-in is read from the component's config, and only an explicit
++/// `false` opts out of an entry that is present.
++#[test]
++fn the_config_entry_selects_the_exclusive_policy() {
++    let with = |value: Option<&str>, max_invocations: i32| {
++        let mut component = crate::types::Component {
++            max_invocations,
++            pool_size: 4,
++            max_concurrency: 8,
++            ..Default::default()
++        };
++        if let Some(value) = value {
++            component
++                .local_resources
++                .config
++                .insert(EXCLUSIVE_INSTANCE_KEY.to_string(), value.to_string());
++        }
++        InstancePolicy::from_component(&component)
++    };
++
++    let exclusive = |max_invocations| InstancePolicy::Exclusive {
++        max_invocations: NonZeroUsize::new(max_invocations),
++    };
++    assert_eq!(
++        with(Some("true"), 0),
++        InstancePolicy::Exclusive {
++            max_invocations: None
++        }
++    );
++    assert_eq!(with(Some(" TRUE "), 50), exclusive(50));
++    // Pool size and concurrency do not widen an exclusive component.
++    assert_eq!(
++        with(Some("true"), -1),
++        InstancePolicy::Exclusive {
++            max_invocations: None
++        }
++    );
++    // Fails closed on a value it does not understand.
++    assert_eq!(
++        with(Some("yes"), 0),
++        InstancePolicy::Exclusive {
++            max_invocations: None
++        }
++    );
++    // Opting out, or never opting in, leaves the pooled policy as it was.
++    for policy in [with(Some("false"), 0), with(None, 0)] {
++        assert!(matches!(policy, InstancePolicy::Warm { .. }), "{policy:?}");
++        assert!(!InstancePool::new(policy).is_exclusive());
++    }
++
++    let pool = InstancePool::new(exclusive(3));
++    assert!(pool.is_exclusive());
++    assert_eq!(pool.call_concurrency(), 1);
++    assert_eq!(pool.limits(), Some((1, Some(3), 1)));
++}
++
++/// A component that did not opt in is never made to wait.
++#[tokio::test]
++async fn non_exclusive_components_are_not_gated() {
++    let rig = Rig::with_policy(InstancePolicy::from_limits(2, 0, 0));
++    assert!(rig.pool.store_gate().is_none());
++    assert!(rig.pool.admit_call().await.unwrap().is_none());
++    assert!(lease_stores(vec![]).await.unwrap().is_empty());
++}
+diff --git a/crates/wash-runtime/src/engine/linked_call.rs b/crates/wash-runtime/src/engine/linked_call.rs
+index 9f1bf20..8681b06 100644
+--- a/crates/wash-runtime/src/engine/linked_call.rs
++++ b/crates/wash-runtime/src/engine/linked_call.rs
+@@ -36,7 +36,7 @@ use crate::engine::abandon::{AbandonedCallPolicy, arm_epoch_deadline};
+ use crate::engine::ctx::SharedTlsProvider;
+ use crate::engine::ctx::{AccessorActiveCtxGuard, Ctx, SharedCtx, StoreActiveCtxGuard};
+ use crate::engine::instance_driver::{InstanceJob, LinkedJob};
+-use crate::engine::instance_pool::{self, ComponentInstance, Dispatch, InstancePool};
++use crate::engine::instance_pool::{self, ComponentInstance, InstancePool};
+ use crate::engine::store::relocate::{self, Relocated, bridgeable_element_type};
+ use crate::engine::store::stream_pump::Done;
+ use crate::engine::value::{carries_cross_store_handle, lift_results, lower_params};
+@@ -322,6 +322,7 @@ pub(crate) async fn new_store_from_templates(
+     linked: &[ComponentCtxTemplate],
+     linked_instances: &[(Arc<str>, InstancePre<SharedCtx>)],
+     is_service: bool,
++    leases: Vec<crate::engine::instance_pool::StoreLease>,
+ ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
+     let store_id = uuid::Uuid::new_v4().to_string();
+     let all_volume_mounts = std::iter::once(active)
+@@ -337,6 +338,9 @@ pub(crate) async fn new_store_from_templates(
+     )
+     .await?;
+     let mut shared_ctx = SharedCtx::new(active_ctx);
++    // The store owns the leases from here: they are released when it is
++    // dropped, and if building it fails below, when `shared_ctx` is.
++    shared_ctx.leases = leases;
+ 
+     for linked in linked {
+         let linked_ctx = build_ctx_from_template(
+@@ -409,8 +413,9 @@ async fn new_ephemeral_store(
+     #[cfg(not(feature = "wasi-tls"))]
+     let template_of = component_ctx_template_from_metadata;
+ 
+-    let (active, linked, linked_instances) = {
++    let (active, linked, linked_instances, gates) = {
+         let components = call.components.read().await;
++        let gates = instance_pool::store_gates(&components, &component_ids);
+         let active = template_of(
+             &components
+                 .get(&call.active_component_id)
+@@ -438,9 +443,13 @@ async fn new_ephemeral_store(
+                 })?,
+             ));
+         }
+-        (active, linked, linked_instances)
++        (active, linked, linked_instances, gates)
+     };
+ 
++    // Waited for with the component map unlocked: the store being waited for
++    // may need the lock to finish.
++    let leases = instance_pool::lease_stores(gates).await?;
++
+     new_store_from_templates(
+         &call.engine,
+         call.http_handler.clone(),
+@@ -448,6 +457,7 @@ async fn new_ephemeral_store(
+         &linked,
+         &linked_instances,
+         false,
++        leases,
+     )
+     .await
+ }
+@@ -741,6 +751,17 @@ async fn invoke_ephemeral_plain(
+     // them back, so the cold path below reuses that allocation rather than
+     // cloning them a second time.
+     let mut declined_params = None;
++    // An exclusive callee's call permit, held from here until this function
++    // returns: across the pooled call, the creation of its instance, and any
++    // store this call ends up running in. Declared before the cold store below
++    // so it is dropped after it.
++    let mut permit = match pool.as_ref() {
++        Some(pool) => pool
++            .admit_call()
++            .await
++            .map_err(|e| wasmtime::format_err!("{e:#}"))?,
++        None => None,
++    };
+ 
+     if let Some(pool) = pool.as_ref() {
+         let (reply, reply_rx) = tokio::sync::oneshot::channel();
+@@ -760,21 +781,16 @@ async fn invoke_ephemeral_plain(
+             reply,
+             abandoned: call.flag(),
+         }));
+-        let outcome = match pool.offer(job) {
+-            Dispatch::Sent => Ok(()),
+-            // The pool has room. Build and instantiate the store out here,
+-            // where awaiting is allowed and where a component that fails to
+-            // instantiate reports that failure to this call rather than only
+-            // to the log.
+-            Dispatch::NeedsInstance(job) => {
+-                let mut store = new_ephemeral_store(ephemeral_call).await.map_err(|e| {
+-                    wasmtime::format_err!("new pooled store creation failed: {e:#}")
+-                })?;
++        let outcome = pool
++            .dispatch(job, &mut permit, || async {
++                let mut store = new_ephemeral_store(ephemeral_call)
++                    .await
++                    .map_err(|e| anyhow::anyhow!("new pooled store creation failed: {e:#}"))?;
+                 let instance = inv.pre.instantiate_async(&mut store).await?;
+-                pool.install(ComponentInstance { store, instance }, job)
+-            }
+-            Dispatch::Saturated(job) => Err(job),
+-        };
++                Ok(ComponentInstance { store, instance })
++            })
++            .await
++            .map_err(|e| wasmtime::format_err!("{e:#}"))?;
+         match outcome {
+             Ok(()) => {
+                 let vals = call
+diff --git a/crates/wash-runtime/src/engine/mod.rs b/crates/wash-runtime/src/engine/mod.rs
+index b894375..df141c1 100644
+--- a/crates/wash-runtime/src/engine/mod.rs
++++ b/crates/wash-runtime/src/engine/mod.rs
+@@ -221,7 +221,7 @@ pub mod abandon;
+ pub mod ctx;
+ pub(crate) mod instance_driver;
+ pub(crate) mod instance_pool;
+-pub use instance_pool::InstancePolicy;
++pub use instance_pool::{EXCLUSIVE_INSTANCE_KEY, InstancePolicy};
+ pub mod host_memory;
+ pub(crate) mod linked_call;
+ pub(crate) mod store;
+diff --git a/crates/wash-runtime/src/engine/workload.rs b/crates/wash-runtime/src/engine/workload.rs
+index b8f06ab..b6ea105 100644
+--- a/crates/wash-runtime/src/engine/workload.rs
++++ b/crates/wash-runtime/src/engine/workload.rs
+@@ -621,19 +621,30 @@ struct ServiceStoreRecipe {
+     active_template: ComponentCtxTemplate,
+     linked_templates: Vec<ComponentCtxTemplate>,
+     linked_instances: Vec<(Arc<str>, wasmtime::component::InstancePre<SharedCtx>)>,
++    /// Store-lease gates of the exclusive components linked into the store.
++    store_gates: Vec<Arc<tokio::sync::Semaphore>>,
+ }
+ 
+ impl ServiceStoreRecipe {
+     /// Build a fresh service store (`is_service = true` so `cli/run` may bind
+     /// its loopback socket).
+     async fn build(&self) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
++        self.build_with(true).await
++    }
++
++    /// Build a fresh store, waiting for the lease of every exclusive component
++    /// linked into it. The lease is held by the store until it is dropped, so a
++    /// restarted incarnation waits for the previous one to be gone.
++    async fn build_with(&self, is_service: bool) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
++        let leases = instance_pool::lease_stores(self.store_gates.clone()).await?;
+         new_store_from_templates(
+             &self.engine,
+             self.http_handler.clone(),
+             &self.active_template,
+             &self.linked_templates,
+             &self.linked_instances,
+-            true,
++            is_service,
++            leases,
+         )
+         .await
+     }
+@@ -1481,12 +1492,17 @@ impl ResolvedWorkload {
+         &self,
+         component_id: &str,
+     ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
+-        let (engine, active_template, linked_templates, linked_instances) = {
++        let (engine, active_template, linked_templates, linked_instances, gates) = {
+             let components = self.components.read().await;
+             let component = components
+                 .get(component_id)
+                 .context("component ID not found in workload")?;
+             let metadata = &component.metadata;
++            // Every exclusive component in this store, the one called and the
++            // ones linked into it, needs its store lease.
++            let mut held: Vec<Arc<str>> = metadata.linked_components.iter().cloned().collect();
++            held.push(Arc::from(component_id));
++            let gates = instance_pool::store_gates(&components, &held);
+             let active_template = self.component_ctx_template(metadata);
+             let mut linked_templates = Vec::with_capacity(metadata.linked_components.len());
+             let mut linked_instances = Vec::with_capacity(metadata.linked_components.len());
+@@ -1502,8 +1518,12 @@ impl ResolvedWorkload {
+                 active_template,
+                 linked_templates,
+                 linked_instances,
++                gates,
+             )
+         };
++        // Waited for with the component map unlocked: the store being waited
++        // for may need the lock to finish.
++        let leases = instance_pool::lease_stores(gates).await?;
+         new_store_from_templates(
+             &engine,
+             self.http_handler.clone(),
+@@ -1511,6 +1531,7 @@ impl ResolvedWorkload {
+             &linked_templates,
+             &linked_instances,
+             false,
++            leases,
+         )
+         .await
+     }
+@@ -1554,15 +1575,7 @@ impl ResolvedWorkload {
+         is_service: bool,
+     ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
+         let recipe = self.service_store_recipe(metadata).await?;
+-        new_store_from_templates(
+-            &recipe.engine,
+-            recipe.http_handler.clone(),
+-            &recipe.active_template,
+-            &recipe.linked_templates,
+-            &recipe.linked_instances,
+-            is_service,
+-        )
+-        .await
++        recipe.build_with(is_service).await
+     }
+ 
+     /// Capture everything needed to (re)build this service's store, so the
+@@ -1577,9 +1590,10 @@ impl ResolvedWorkload {
+             .iter()
+             .cloned()
+             .collect::<Vec<_>>();
+-        let linked_metadata = {
++        let (store_gates, linked_metadata) = {
+             let components = self.components.read().await;
+-            linked_component_ids
++            let store_gates = instance_pool::store_gates(&components, &linked_component_ids);
++            let linked_metadata = linked_component_ids
+                 .iter()
+                 .map(|linked_component_id| {
+                     components
+@@ -1589,7 +1603,8 @@ impl ResolvedWorkload {
+                             format!("linked component '{linked_component_id}' not found")
+                         })
+                 })
+-                .collect::<wasmtime::Result<Vec<_>>>()?
++                .collect::<wasmtime::Result<Vec<_>>>()?;
++            (store_gates, linked_metadata)
+         };
+         let active_template = self.component_ctx_template(metadata);
+         let linked_templates = linked_metadata
+@@ -1610,6 +1625,7 @@ impl ResolvedWorkload {
+             active_template,
+             linked_templates,
+             linked_instances,
++            store_gates,
+         })
+     }
+ 
+diff --git a/crates/wash-runtime/src/host/http.rs b/crates/wash-runtime/src/host/http.rs
+index 93ebb90..a9a6b91 100644
+--- a/crates/wash-runtime/src/host/http.rs
++++ b/crates/wash-runtime/src/host/http.rs
+@@ -1972,31 +1972,33 @@ async fn invoke_component_handler(
+         // alongside whatever else that instance already has in flight. Only
+         // when every warm instance is full and the pool is at `pool_size` does
+         // the request fall through to a store of its own.
++        // An exclusive component's call permit: queued for in arrival order, then
++        // held across the pooled call, the creation of its instance and any cold
++        // store below, so one store of it is ever alive. Declared out here so a
++        // call that falls through to the cold path still holds it.
++        let mut permit = match pool.as_ref() {
++            Some(pool) => pool.admit_call().await?,
++            None => None,
++        };
+         let req = if let Some(pool) = pool.as_ref() {
+             use crate::engine::instance_driver::InstanceJob;
+-            use crate::engine::instance_pool::Dispatch;
+             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+             let call = DispatchedCall::new("HTTP (pooled)", crate::timeouts::http_response());
+-            let outcome = match pool.offer(InstanceJob::Http(Box::new(ServiceHttpJob {
+-                req,
+-                resp_tx,
+-                abandoned: call.flag(),
+-            }))) {
+-                Dispatch::Sent => Ok(()),
+-                // The pool has room. Build and instantiate the store out here,
+-                // where awaiting is allowed and where a component that fails
+-                // to instantiate reports that failure to this request rather
+-                // than only to the log.
+-                Dispatch::NeedsInstance(job) => {
+-                    let mut store = workload_handle.new_store(component_id).await?;
+-                    let instance = instance_pre.instantiate_async(&mut store).await?;
+-                    pool.install(
+-                        crate::engine::instance_pool::ComponentInstance { store, instance },
+-                        job,
+-                    )
+-                }
+-                Dispatch::Saturated(job) => Err(job),
+-            };
++            let outcome = pool
++                .dispatch(
++                    InstanceJob::Http(Box::new(ServiceHttpJob {
++                        req,
++                        resp_tx,
++                        abandoned: call.flag(),
++                    })),
++                    &mut permit,
++                    || async {
++                        let mut store = workload_handle.new_store(component_id).await?;
++                        let instance = instance_pre.instantiate_async(&mut store).await?;
++                        Ok(crate::engine::instance_pool::ComponentInstance { store, instance })
++                    },
++                )
++                .await?;
+             match outcome {
+                 Ok(()) => {
+                     let (resp, watch) = call
+diff --git a/crates/wash-runtime/src/host/trigger_service/http.rs b/crates/wash-runtime/src/host/trigger_service/http.rs
+index 9e70b47..4ff3d07 100644
+--- a/crates/wash-runtime/src/host/trigger_service/http.rs
++++ b/crates/wash-runtime/src/host/trigger_service/http.rs
+@@ -79,7 +79,7 @@ impl AccessorTask<SharedCtx> for HttpTask {
+             req,
+             resp_tx,
+             abandoned,
+-            pool_slot,
++            mut pool_slot,
+         } = self;
+ 
+         // The epoch deadline measures this call's own execution, so re-arm it
+@@ -103,6 +103,10 @@ impl AccessorTask<SharedCtx> for HttpTask {
+         let (frame_tx, frame_rx) =
+             tokio::sync::mpsc::channel::<Result<hyper::body::Frame<bytes::Bytes>, P2ErrorCode>>(4);
+         let mut resp_tx = Some(resp_tx);
++        // Set when the handler traps, which leaves a pooled instance's guest
++        // state indeterminate.
++        let trapped = std::sync::atomic::AtomicBool::new(false);
++        let trapped_ref = &trapped;
+ 
+         let handler_fut = async move {
+             let response = match service.handle(accessor, wasi_req).await {
+@@ -119,6 +123,7 @@ impl AccessorTask<SharedCtx> for HttpTask {
+                     return Ok(());
+                 }
+                 Err(e) => {
++                    trapped_ref.store(true, std::sync::atomic::Ordering::SeqCst);
+                     if let Some(tx) = resp_tx.take() {
+                         let _ =
+                             tx.send(Err(anyhow::anyhow!(e).context("service HTTP handler trap")));
+@@ -219,6 +224,15 @@ impl AccessorTask<SharedCtx> for HttpTask {
+                 None => tracing::error!("service HTTP response timed out"),
+             },
+         }
++        if let Some(slot) = pool_slot.as_mut() {
++            if trapped.load(std::sync::atomic::Ordering::SeqCst) {
++                // The same remedy as a timeout: the trap poisoned the store, so
++                // stop admitting before the slot frees and a queued call is
++                // handed this instance.
++                slot.retire_instance();
++            }
++            slot.settle();
++        }
+         Ok(())
+     }
+ }
+diff --git a/crates/wash-runtime/src/timeouts.rs b/crates/wash-runtime/src/timeouts.rs
+index 189cb74..78a93a8 100644
+--- a/crates/wash-runtime/src/timeouts.rs
++++ b/crates/wash-runtime/src/timeouts.rs
+@@ -85,6 +85,11 @@ declare_timeouts! {
+     http_response = ("WASH_HTTP_RESPONSE_TIMEOUT_SECS", 600);
+     /// Max wall-clock for a trigger service to acknowledge a delivered message.
+     messaging_deliver = ("WASH_MESSAGING_DELIVER_TIMEOUT_SECS", 600);
++    /// Max wall-clock a call to an exclusive component (see
++    /// [`crate::engine::InstancePolicy::Exclusive`]) waits in line, for the
++    /// component's call permit and for the previous store to be dropped,
++    /// before it fails. It never falls back to a store of its own.
++    exclusive_wait = ("WASH_EXCLUSIVE_WAIT_TIMEOUT_SECS", 600);
+     /// How long an abandoned call may keep running before its store acts on the
+     /// abandonment (see [`crate::engine::abandon`]). This is what makes
+     /// abandonment safe to signal on every disconnect: a healthy guest finishes
+diff --git a/crates/wash-runtime/src/washlet/mod.rs b/crates/wash-runtime/src/washlet/mod.rs
+index eb825f8..e2f0754 100644
+--- a/crates/wash-runtime/src/washlet/mod.rs
++++ b/crates/wash-runtime/src/washlet/mod.rs
+@@ -877,6 +877,40 @@ mod tests {
+         );
+     }
+ 
++    /// The exclusive opt-in rides in the component's `local_resources.config`,
++    /// which the operator copies from the CRD verbatim, so no wire field is
++    /// needed. It has to survive the wire conversion and decode to the policy.
++    #[test]
++    fn wire_exclusive_config_reaches_the_runtime() {
++        let wire = types::v2::Component {
++            name: "pglite".to_string(),
++            max_invocations: 100,
++            ..Default::default()
++        };
++        let wire_resources = types::v2::LocalResources {
++            config: std::collections::HashMap::from([(
++                crate::engine::EXCLUSIVE_INSTANCE_KEY.to_string(),
++                "true".to_string(),
++            )]),
++            ..Default::default()
++        };
++        let component = component_from_wire(
++            &wire,
++            LoadedComponent {
++                bytes: b"\0asm".as_slice().into(),
++                digest: None,
++            },
++            wire_resources.try_into().expect("local resources convert"),
++        );
++
++        assert_eq!(
++            crate::engine::InstancePolicy::from_component(&component),
++            crate::engine::InstancePolicy::Exclusive {
++                max_invocations: std::num::NonZeroUsize::new(100),
++            }
++        );
++    }
++
+     #[test]
+     fn try_from_v2_local_resources_parses_allowed_hosts() {
+         // Strings flowing in from the proto wire are parsed into typed

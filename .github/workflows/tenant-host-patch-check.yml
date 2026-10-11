@@ -1,0 +1,122 @@
+# Prove the wasmCloud patches in platform/tenant-host apply to the pinned source and that the
+# patched wash-runtime builds and passes the pool and dispatch tests (#136).
+#
+# tenant-host-image.yml is dispatch-only, so before this job a patch that did not apply, or did not
+# compile, only showed up at publish time. The job checks wasmCloud out at the commit pinned by
+# WASMCLOUD_COMMIT in the Dockerfile, applies every patch with `git apply` (after `--check`), then
+# builds wash-runtime and runs the tests that cover the patch. It does not run the whole
+# wash-runtime suite: that needs prebuilt wasm fixtures and Docker services this job does not set up.
+#
+# Bounded: one job, 60 minutes, superseded runs are cancelled. Cached: cargo registry and the target
+# directory are keyed on the pinned commit and the patch contents; debug info is off to keep the
+# cache small. A push to main with the same paths refreshes the cache that pull requests restore.
+name: Tenant-host patch check
+
+on:
+  pull_request:
+    paths:
+      - 'platform/tenant-host/**'
+      - '.github/workflows/tenant-host-patch-check.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'platform/tenant-host/**'
+      - '.github/workflows/tenant-host-patch-check.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tenant-host-patch-check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  patch:
+    name: Apply patches and test wash-runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read the pinned wasmCloud commit
+        id: pin
+        run: |
+          set -euo pipefail
+          commit="$(sed -n 's/^ARG WASMCLOUD_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' platform/tenant-host/Dockerfile)"
+          if [[ ! "${commit}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not read WASMCLOUD_COMMIT from platform/tenant-host/Dockerfile"
+            exit 1
+          fi
+          echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout wasmCloud at the pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: wasmCloud/wasmCloud
+          ref: ${{ steps.pin.outputs.commit }}
+          path: wasmcloud
+          persist-credentials: false
+
+      - name: Verify the checkout is the pinned commit
+        run: |
+          set -euo pipefail
+          test "$(git -C wasmcloud rev-parse HEAD)" = "${{ steps.pin.outputs.commit }}"
+
+      - name: Apply the patches
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(platform/tenant-host/*.patch)
+          if (( ${#patches[@]} == 0 )); then
+            echo "::error::no patches found in platform/tenant-host"
+            exit 1
+          fi
+          for patch in "${patches[@]}"; do
+            echo "Applying ${patch}"
+            git -C wasmcloud apply --check "${GITHUB_WORKSPACE}/${patch}"
+            git -C wasmcloud apply "${GITHUB_WORKSPACE}/${patch}"
+          done
+          git -C wasmcloud diff --stat
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          # rust-toolchain.toml at the pinned commit pins 1.96.0.
+          toolchain: '1.96.0'
+
+      - name: Install protobuf compiler
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            wasmcloud/target
+          key: tenant-host-wash-runtime-${{ runner.os }}-${{ steps.pin.outputs.commit }}-${{ hashFiles('platform/tenant-host/*.patch') }}
+          restore-keys: |
+            tenant-host-wash-runtime-${{ runner.os }}-${{ steps.pin.outputs.commit }}-
+
+      - name: Build patched wash-runtime
+        working-directory: wasmcloud
+        run: cargo build -p wash-runtime --locked
+
+      - name: Test the pool and dispatch paths
+        working-directory: wasmcloud
+        # instance_pool and instance_driver cover the exclusive gates, queueing, trap, timeout and
+        # drain tests; wire_ covers the opt-in surviving the wire conversion.
+        run: cargo test -p wash-runtime --locked --lib -- instance_pool instance_driver wire_

@@ -12,7 +12,7 @@ links `wasi:tls/client,types@0.3.0-draft` alongside the default interfaces.
 ## What is built
 
 - Source: `git clone --branch v2.8.0` in its own layer, then the build fails unless `HEAD` is the pinned commit. `GIT_TERMINAL_PROMPT=0` keeps a credential prompt from hanging CI.
-- Patches: an exclusive queueing pool policy (`0001-exclusive-pool-policy.patch`) is applied to support components that require mutual exclusion, such as pglite, which must never have overlapping instances. The patch adds an opt-in `exclusive` flag to the `Warm` instance policy: when set, a component's single warm instance queues calls instead of spawning one-shot stores on saturation, and draining instances are fully released before their replacements start.
+- Patches: none by default. The `wasi-tls-exclusive` variant applies `0001-exclusive-instance.patch` (see [Exclusive instances](#exclusive-instances-wasi-tls-exclusive)). The patch is `git diff` output against the pinned commit; the build runs `git apply --check` and fails if it does not apply. Pull requests that touch this directory apply it to the pinned commit and run its tests (`.github/workflows/tenant-host-patch-check.yml`).
 - Limitation: the host still runs upstream wash 2.8.0 postgres behavior for non-exclusive workloads. Connections are not pinned per invocation, and `BEGIN` ... `COMMIT` across separate queries is not guaranteed to use one connection, for named and unnamed imports alike. Guests should use autocommit or a single batched statement, as the identity guest does (issue #39).
 - Feature: `wasi-tls` is declared by the `wash` crate (`wasi-tls = ["wash-runtime/wasi-tls"]`), which
   enables `wasmtime-wasi-tls` (p3, rustls) in `wash-runtime`. Default features (`wasi-webgpu`,
@@ -22,11 +22,89 @@ links `wasi:tls/client,types@0.3.0-draft` alongside the default interfaces.
   `/usr/local/bin/wash`, entrypoint `wash`. Base images are pinned by digest.
 - User: `65532:65532`, `HOME=/tmp`, workdir `/tmp`. The hostgroup Deployment sets the same uid/gid, a read-only root filesystem, `HOME=/tmp`, and writable `/tmp` and `/oci-cache` volumes. The image build runs `wash --version` as that user and fails if wolfi cannot execute the binary.
 
+## Exclusive instances (`wasi-tls-exclusive`)
+
+Why the "no patches" stance changed (#136). Stock wash 2.8.0 serves a call "from a store of its own"
+when a component's warm pool is saturated, and while a retired instance drains it builds a
+replacement beside it (`crates/wash-runtime/src/engine/instance_pool.rs` at the pinned commit). A
+component that owns state tolerating exactly one opener, such as the embedded PostgreSQL in
+`di-framework:pglite` on its persistent directory, would be opened twice. Configuration cannot turn
+that off, so the variant carries a patch.
+
+**Opting in.** Set an entry on the component's `localResources.config`:
+
+```yaml
+components:
+  - name: pglite
+    localResources:
+      config:
+        di-framework.dev/exclusive-instance: "true"
+```
+
+The runtime operator copies `localResources.config` to the host verbatim, so this needs no change to
+the WorkloadDeployment CRD, the proto or the operator. `maxConcurrency: 1` was not used: it is already
+what a pooled component gets by default, so it cannot say "exclusive" without changing the meaning of
+workloads that set it today. Platform admission accepts only `"true"` or `"false"` for this key
+(`workloadExclusiveInstanceAllowed`, mirrored in the workloads CEL policy); the host treats any other
+value as `true`. The entry is also visible to the guest through `wasi:config/store`, like any
+`localResources.config` entry. Components without it behave exactly as on stock wash.
+
+**What the patch does.** An exclusive component has one warm instance serving one call at a time
+(`poolSize` and `maxConcurrency` are ignored; `maxInvocations` is honoured). The guarantee is made
+below the pool, with two FIFO gates per exclusive component:
+
+- A call permit is taken before a call is offered to the pool. Callers queue in arrival order and
+  hold the permit until the call's in-flight slot on the warm instance is released, so the instance
+  is idle when the next caller is admitted. A replacement instance is created only by the caller
+  holding the permit, so racing first calls build one instance.
+- A store lease is taken before any store holding the component is built, on every path (warm
+  instance, a fallback store, a service, messaging), and is released when that store is dropped. A
+  retired, trapped or timed-out instance keeps its lease until its store is gone, so the replacement
+  waits for it. A store that links an exclusive component holds that component's lease too.
+
+A call that cannot get a gate within `WASH_EXCLUSIVE_WAIT_TIMEOUT_SECS` (600) fails with an error. It
+is never served from a store of its own. A call that traps or times out retires the instance, and
+calls queued behind it are served by the replacement.
+
+Consequences. Calls to an exclusive component are serialised, so its throughput is one call at a
+time. A long-lived service store that links an exclusive component holds its lease for the service's
+life, and calls to the component then time out; do not link one into a service. Waiting calls hold
+their request open for up to the wait timeout.
+
+**Scope.** This is one host process. The tenant host Deployment's rollout must not overlap pods:
+`maxSurge: 0, maxUnavailable: 1` (#104), or a second pod would open the same directory. The
+persistent directory is a `hostPath`, so it is per node; there is no overlap protection across nodes,
+and a pod rescheduled to another node sees a different directory.
+
+**Image.** Published under its own tag, `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive`, with
+`org.opencontainers.image.version=2.8.0-wasi-tls-exclusive` and
+`dev.di-framework.wash.patches=0001-exclusive-instance.patch`. It never moves the canonical
+`2.8.0-wasi-tls` tag, and `DEFAULT_HOST_IMAGE` stays on the canonical digest. Use it only by setting
+`tenantHostImage` (digest-pinned) on a stack that needs it until it is proven.
+
+**Tests.** `crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs` in the patch runs real
+concurrent calls through the dispatch path against real stores and counts live stores. It covers
+saturation, FIFO order, the creation race, a trap, a timed-out call, drain with a call in flight,
+rotation by `maxInvocations`, and cancellation of a queued caller. Each asserts at most one live
+store. Run them against a checkout of the pinned commit with the patch applied:
+
+```sh
+git clone https://github.com/wasmCloud/wasmCloud /tmp/wasmcloud && cd /tmp/wasmcloud
+git checkout 5c4ec4a3d008b3f401d9e763515f434deebc9936
+git apply /path/to/platform/tenant-host/0001-exclusive-instance.patch
+cargo test -p wash-runtime --lib -- instance_pool instance_driver wire_
+```
+
 ## Build
 
 ```sh
 podman build -t localhost/di-framework/wash:2.8.0-wasi-tls platform/tenant-host
 podman run --rm localhost/di-framework/wash:2.8.0-wasi-tls --version
+
+# the exclusive variant
+podman build -t localhost/di-framework/wash:2.8.0-wasi-tls-exclusive \
+  --build-arg WASH_PATCHES=0001-exclusive-instance.patch \
+  --build-arg IMAGE_VERSION=2.8.0-wasi-tls-exclusive platform/tenant-host
 ```
 
 `docker build` works the same way (BuildKit is needed for the cache mounts). A cold arm64 build took
@@ -40,13 +118,16 @@ list (the stock image lists the same interfaces without it), followed by one exp
 
 ## Publish
 
-Reference: `ghcr.io/di-framework/wash:2.8.0-wasi-tls`
+Reference: `ghcr.io/di-framework/wash:2.8.0-wasi-tls` (stock source), or
+`ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive` (with the exclusive-instance patch).
 
 The **Publish tenant host image** workflow
 ([`.github/workflows/tenant-host-image.yml`](../../.github/workflows/tenant-host-image.yml))
-builds `linux/amd64` and `linux/arm64` on native runners (`ubuntu-24.04` and `ubuntu-24.04-arm`)
+takes a `variant` input, `wasi-tls-exclusive` (default) or `wasi-tls`. Each variant pushes only its
+own tag; a patched build cannot be published on the canonical tag. It builds `linux/amd64` and
+`linux/arm64` on native runners (`ubuntu-24.04` and `ubuntu-24.04-arm`)
 at the same time, then pushes the multi-arch tag. It does not emulate arm64. Each arch also pushes
-a cache manifest, `ghcr.io/di-framework/wash:buildcache-amd64` and `:buildcache-arm64`, with
+a cache manifest per variant, `ghcr.io/di-framework/wash:buildcache-<tag>-amd64` and `-arm64`, with
 `mode=max`. That manifest records which layer blob in GHCR matches each Dockerfile step, including
 the builder stage, and the next build imports it. The wash tag itself is not the cache: inline
 metadata on an image only covers the final stage. It is `workflow_dispatch` only, the
@@ -55,7 +136,7 @@ tab after the workflow file is on `main`
 (`https://github.com/di-framework/platform/actions/workflows/tenant-host-image.yml`).
 The job authenticates with the workflow `GITHUB_TOKEN` (`packages: write`).
 
-The tag is mutable. The platform default `hostImage` is the published index:
+The tags are mutable. The platform default `hostImage` is the published canonical (unpatched) index:
 
 `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669`
 

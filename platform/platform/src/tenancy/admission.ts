@@ -220,6 +220,7 @@ export function workloadVolumesAllowed(input: {
 interface LocalResourcesLike {
   allowedHosts?: string[];
   allowedIpNameLookups?: string[];
+  config?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
@@ -251,6 +252,34 @@ export function workloadEgressAllowed(input: {
       kept('allowedHosts', local.allowedHosts) &&
       kept('allowedIpNameLookups', local.allowedIpNameLookups),
   );
+}
+
+/**
+ * `localResources.config` entry that makes a component exclusive on the patched tenant host
+ * (#136): at most one store of it is ever alive, and calls queue for it instead of being served
+ * from stores of their own. It rides in the existing `config` map, which the runtime operator
+ * copies to the host verbatim, so the WorkloadDeployment CRD does not change. Keep in sync with
+ * `EXCLUSIVE_INSTANCE_KEY` in `tenant-host/0001-exclusive-instance.patch`.
+ */
+export const EXCLUSIVE_INSTANCE_KEY = 'di-framework.dev/exclusive-instance';
+/** The only values the exclusive entry may take. The host treats anything else as `true`. */
+export const EXCLUSIVE_INSTANCE_VALUES = ['true', 'false'] as const;
+export const EXCLUSIVE_INSTANCE_MESSAGE = `localResources.config['${EXCLUSIVE_INSTANCE_KEY}'] must be "true" or "false"`;
+
+/**
+ * Mirrors the exclusive-instance rule in the CEL policy (#136). A tenant may opt its own
+ * components in (it only narrows what its own workload does on its own host), but a value the
+ * host would have to guess at is refused: the host fails closed to exclusive, so a typo such as
+ * `"ture"` would otherwise queue every call silently.
+ */
+export function workloadExclusiveInstanceAllowed(locals: LocalResourcesLike[]): boolean {
+  return locals.every((local) => {
+    const config = local.config;
+    if (config === undefined || !Object.hasOwn(config, EXCLUSIVE_INSTANCE_KEY)) return true;
+    return (EXCLUSIVE_INSTANCE_VALUES as readonly unknown[]).includes(
+      config[EXCLUSIVE_INSTANCE_KEY],
+    );
+  });
 }
 
 /** WorkloadDeployment label naming the tenant-auth environment it was deployed to (#55). */
@@ -557,6 +586,12 @@ function workloadPolicy(namespace: string): AdmissionPolicy {
               has(o.allowedIpNameLookups) && o.allowedIpNameLookups == l.allowedIpNameLookups)))`,
         message:
           'Tenant guests cannot set allowedHosts or allowedIpNameLookups; request egress with an egress BackingService and ServiceBinding',
+      },
+      {
+        expression: `variables.locals.all(l, !has(l.config) ||
+          !('${EXCLUSIVE_INSTANCE_KEY}' in l.config) ||
+          l.config['${EXCLUSIVE_INSTANCE_KEY}'] in ${JSON.stringify(EXCLUSIVE_INSTANCE_VALUES).replaceAll('"', "'")})`,
+        message: EXCLUSIVE_INSTANCE_MESSAGE,
       },
       {
         expression: `variables.controller || variables.locals.all(l, !has(l.environment) || (
