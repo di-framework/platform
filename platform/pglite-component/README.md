@@ -46,6 +46,27 @@ and persistence across separate runtime processes. It also exits a runtime
 with an open transaction and verifies that committed rows survive and the
 uncommitted row is absent after restart. No scripted database server is used.
 
+## Publishing to GHCR
+
+The pglite component is published to GitHub Container Registry (GHCR) as an OCI wasm component. The publication is triggered manually from the GitHub Actions UI.
+
+### Dispatch the workflow
+
+1. Open [Workflows](https://github.com/di-framework/platform/actions/workflows/pglite-component-publish.yml).
+2. Click **Run workflow** > **main branch** > **Run workflow**.
+
+The workflow:
+- Builds the component with `make tools-rust smoke`.
+- Publishes to `ghcr.io/di-framework/pglite-component` with an immutable digest tag.
+- Pulls the artifact back by digest and compares the bytes.
+- Records the digest to the job summary.
+
+### Artifact location
+
+The digest appears in **Details** > **Record component digest** > **Step summary**.
+
+**Note:** The GHCR package must be made public by an org admin after the first publish. Until then, only members with access to di-framework/platform can pull it.
+
 ## Use from an application
 
 The application imports `di-framework:pglite/database@0.2.0`. For a JavaScript
@@ -69,13 +90,24 @@ try {
 }
 ```
 
-Compose the application with the provider:
+Compose the application with the provider. For a local build:
 
 ```sh
 make compose APP=path/to/app.wasm OUT=path/to/app.composed.wasm
 mkdir -p ./data
 wasmtime run --dir ./data::/data path/to/app.composed.wasm
 ```
+
+To use the published OCI component from GHCR instead (pin by digest for reproducibility):
+
+```sh
+export PGLITE_REF='ghcr.io/di-framework/pglite-component@sha256:<digest>'
+wac plug path/to/app.wasm -n di-framework:pglite "${PGLITE_REF}" -o path/to/app.composed.wasm
+mkdir -p ./data
+wasmtime run --dir ./data::/data path/to/app.composed.wasm
+```
+
+Consumers (like cli-extensions) pin the component by digest.
 
 That invocation is for a command component; serve HTTP components using your
 normal host while granting the same filesystem preopen. The final component

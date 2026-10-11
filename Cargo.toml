@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "platform/tenant-auth",
     "platform/oci-registry/build-support",
+    "platform/pglite-component/build-support",
 ]
 # Keep the existing Wasm component workspaces independent of the host tools.
 exclude = [

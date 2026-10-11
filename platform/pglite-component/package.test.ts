@@ -69,4 +69,17 @@ describe('pglite-component package', () => {
     const legacy = [...new Bun.Glob('**/*.{sh,py}').scanSync(scripts)];
     expect(legacy).toEqual([]);
   });
+
+  test('the publish workflow is dispatch-only and gates on main branch', () => {
+    const repo = join(pkgDir, '..', '..');
+    const workflow = readFileSync(
+      join(repo, '.github/workflows/pglite-component-publish.yml'),
+      'utf8',
+    );
+    expect(workflow).toMatch(/on:\s+workflow_dispatch:/);
+    expect(workflow).toContain("if: github.ref == 'refs/heads/main'");
+    expect(workflow).toContain('ghcr.io/di-framework/pglite-component');
+    expect(workflow).toContain('make -C platform/pglite-component tools-rust smoke');
+    expect(workflow).toContain('cargo run --locked -p pglite-component-publisher');
+  });
 });
