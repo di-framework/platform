@@ -1499,6 +1499,10 @@ describe('tenant registry (#83:reconcile)', () => {
         package: 'blobstore',
         version: '0.1.0',
         interfaces: ['blobstore', 'container', 'types'],
+        config: {
+          backend: 'nats',
+          url: 'nats://di-nats.di-runtime-alpha.svc.cluster.local:4222',
+        },
       },
       {
         namespace: 'wasmcloud',

@@ -132,8 +132,8 @@ export function hostInterfaceAllowed(
     const name = hostInterface.name.slice(0, -suffix.length);
     return !!name && secretFrom.length === 1 && secretFrom[0]?.name === `di-binding-${name}-creds`;
   }
-  // Blobstore stays unnamed. Without references it uses the host data store; a created
-  // service is selected only through a controller-managed di-binding-/di-bs- ConfigMap.
+  // Blobstore stays unnamed. It is configured by the controller with backend and URL;
+  // a created service is selected only through a controller-managed di-binding-/di-bs- ConfigMap.
   if (packageName === 'blobstore') {
     if (hasName || secretFrom.length > 0 || configKeys.length > 0) return false;
     if (
