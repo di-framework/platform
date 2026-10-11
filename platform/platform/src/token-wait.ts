@@ -2,6 +2,8 @@
 export type SecretDataReader = (
   namespace: string,
   name: string,
+  /** Aborted when the per-request budget runs out; the reader must cancel its request. */
+  signal?: AbortSignal,
 ) => Promise<Record<string, string> | undefined>;
 
 export interface TokenWaitOptions {
@@ -55,11 +57,18 @@ async function readWithTimeout(
   requestTimeoutMs: number,
 ): Promise<Record<string, string> | undefined> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const controller = new AbortController();
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new RequestTimeout('request timed out')), requestTimeoutMs);
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new RequestTimeout('request timed out'));
+    }, requestTimeoutMs);
   });
   try {
-    return await Promise.race([options.readSecret(options.namespace, options.name), timeout]);
+    return await Promise.race([
+      options.readSecret(options.namespace, options.name, controller.signal),
+      timeout,
+    ]);
   } finally {
     clearTimeout(timer);
   }

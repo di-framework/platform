@@ -30,6 +30,9 @@
     },
     "./package.json": "./package.json"
   },
+  "engines": {
+    "node": ">=22.19"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "test": "bun test"

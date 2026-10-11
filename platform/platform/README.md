@@ -188,7 +188,9 @@ tenant workloads and services, `viewer` users get read-only access. The token
 does not expire; rotate it by deleting the Secret (the controller recreates it)
 and running `pulumi up` again.
 
-The API server URL comes from the `apiServer` argument of `createPlatform`. The
+The API server URL comes from the `apiServer` argument of `createPlatform`. When
+`apiServer` is set, `kubeconfig` is now required too: the program uses it to read the token
+Secrets, and `createPlatform` throws without it. Both entrypoints already pass it. The
 local entrypoint passes its loopback `https://127.0.0.1:<apiPort>`. The existing-cluster
 entrypoint uses `kubernetesEndpoint` (set by `di-framework-kube`) and otherwise the
 server of the admin kubeconfig's selected `context` (or `current-context`). When
@@ -207,8 +209,14 @@ for Secret wasmcloud/di-user-<user>-<tenant>-token to have data.token (last obse
 where the observation is `Secret not found (HTTP 404)`, `Secret exists without data.token`,
 an HTTP status or a connection error code; it never includes a Secret body. A Secret that
 never appears usually means the Tenant or User is not Ready or the controller is not
-running; check `kubectl -n wasmcloud get users,tenants`. If the admin kubeconfig uses an
+running; check `kubectl get users.platform.di-framework.dev,tenants.platform.di-framework.dev` (both are cluster-scoped, so no `-n`). If the admin kubeconfig uses an
 `exec` credential plugin, that plugin runs for these reads as it does for the provider.
+
+## Requirements
+
+Node.js 22.19 or newer (`engines.node`). `@kubernetes/client-node` 2 loads ES modules through
+`require`, and its `undici` 8 dependency declares `>=22.19`. Pulumi runs this package under
+whatever `node` is on `PATH`; `di-framework-kube` does not pin a version.
 
 ## Development
 

@@ -1,4 +1,10 @@
-import { CoreV1Api, KubeConfig } from '@kubernetes/client-node';
+import {
+  CoreV1Api,
+  KubeConfig,
+  Observable,
+  type RequestContext,
+  type ResponseContext,
+} from '@kubernetes/client-node';
 import type { SecretDataReader } from './token-wait';
 
 /**
@@ -12,5 +18,20 @@ export function secretReaderFromKubeconfig(kubeconfig: string, context?: string)
   kc.loadFromString(kubeconfig);
   if (context) kc.setCurrentContext(context);
   const api = kc.makeApiClient(CoreV1Api);
-  return async (namespace, name) => (await api.readNamespacedSecret({ name, namespace })).data;
+  return async (namespace, name, signal) => {
+    const options = signal
+      ? {
+          middleware: [
+            {
+              pre: (ctx: RequestContext) => {
+                ctx.setSignal(signal);
+                return new Observable(Promise.resolve(ctx));
+              },
+              post: (res: ResponseContext) => new Observable(Promise.resolve(res)),
+            },
+          ],
+        }
+      : undefined;
+    return (await api.readNamespacedSecret({ name, namespace }, options)).data;
+  };
 }

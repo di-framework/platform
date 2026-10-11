@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -117,6 +118,20 @@ test('a hung request is abandoned after the per-request timeout and retried', as
   });
   await waitForTokenSecret({ ...options, requestTimeoutMs: 10 });
   expect(calls).toBe(2);
+});
+
+test('the per-request timeout aborts the signal handed to the reader', async () => {
+  const signals: AbortSignal[] = [];
+  let calls = 0;
+  const { options } = harness((_ns, _name, signal) => {
+    calls++;
+    if (signal) signals.push(signal);
+    return calls === 1 ? new Promise(() => {}) : Promise.resolve({ token: 'dA==' });
+  });
+  await waitForTokenSecret({ ...options, requestTimeoutMs: 10 });
+  expect(signals).toHaveLength(2);
+  expect(signals[0]?.aborted).toBe(true);
+  expect(signals[1]?.aborted).toBe(false);
 });
 
 test('uses real timers and clock by default', async () => {
@@ -244,12 +259,81 @@ test('HTTP failures surface as errors the poller retries and then reports by sta
   status = 200;
 });
 
-test('an unreachable API server fails with an error class, not a skip', async () => {
-  const read = secretReaderFromKubeconfig(kubeconfigFor({ down: 'https://127.0.0.1:1' }, 'down'));
+test('a refused connection fails with an error class, not a skip', async () => {
+  // Bind an ephemeral port, then close it so nothing listens there.
+  const probe = Bun.serve({ port: 0, fetch: () => new Response('') });
+  const closedPort = probe.port;
+  probe.stop(true);
+  const read = secretReaderFromKubeconfig(
+    kubeconfigFor({ down: `https://127.0.0.1:${closedPort}` }, 'down'),
+  );
   const { options } = harness(read, { timeoutMs: 3000 });
   await expect(waitForTokenSecret(options)).rejects.toThrow(
-    /to have data\.token \(last observation: \S+\)/,
+    /to have data\.token \(last observation: (ECONNREFUSED|ConnectionRefused|\S+)\)/,
   );
+});
+
+test('under node, a server certificate the kubeconfig CA does not vouch for is rejected', () => {
+  const other = selfSignedCert();
+  const output = execFileSync(
+    'node',
+    [
+      '-e',
+      `
+    const fs = require('fs');
+    const https = require('https');
+    const { secretReaderFromKubeconfig } = require('./dist/token-secret-reader');
+    const server = https.createServer({ key: fs.readFileSync(process.env.TLS_KEY), cert: fs.readFileSync(process.env.TLS_CERT) }, (req, res) => res.end('{}'));
+    server.listen(0, '127.0.0.1', async () => {
+      const url = 'https://127.0.0.1:' + server.address().port;
+      const kc = ['apiVersion: v1', 'kind: Config', 'current-context: c', 'clusters:', '- name: c', '  cluster:', '    server: ' + url,
+        '    certificate-authority-data: ' + Buffer.from(fs.readFileSync(process.env.OTHER_CERT)).toString('base64'),
+        'users:', '- name: u', '  user:', '    token: t', 'contexts:', '- name: c', '  context:', '    cluster: c', '    user: u', ''].join('\\n');
+      try { await secretReaderFromKubeconfig(kc)('ns', 'n'); console.log('NO_ERROR'); }
+      catch (e) { console.log(JSON.stringify({ code: e.code ?? null, cause: e.cause && e.cause.code ? e.cause.code : null })); }
+      server.close();
+    });
+  `,
+    ],
+    {
+      cwd: join(import.meta.dir, '..'),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        NODE_TLS_REJECT_UNAUTHORIZED: '1',
+        TLS_KEY: tls.keyPath,
+        TLS_CERT: tls.certPath,
+        OTHER_CERT: other.certPath,
+      },
+    },
+  );
+  expect(output.trim()).not.toBe('NO_ERROR');
+  expect(output).toMatch(/DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT|UNABLE_TO_VERIFY/);
+}, 30_000);
+
+test('a request that exceeds the per-request timeout is aborted at the transport', async () => {
+  let aborted = false;
+  const hung = Bun.serve({
+    port: 0,
+    tls: { key: tls.key, cert: tls.cert },
+    fetch(req) {
+      return new Promise<Response>(() => {
+        req.signal.addEventListener('abort', () => {
+          aborted = true;
+        });
+      });
+    },
+  });
+  servers.push(hung);
+  const read = secretReaderFromKubeconfig(
+    kubeconfigFor({ hung: `https://127.0.0.1:${hung.port}` }, 'hung'),
+  );
+  const { options } = harness(read, { timeoutMs: 100 });
+  await expect(waitForTokenSecret({ ...options, requestTimeoutMs: 100 })).rejects.toThrow(
+    'last observation: RequestTimeout',
+  );
+  for (let i = 0; i < 50 && !aborted; i++) await Bun.sleep(20);
+  expect(aborted).toBe(true);
 });
 
 test('an unknown context throws at construction', () => {
