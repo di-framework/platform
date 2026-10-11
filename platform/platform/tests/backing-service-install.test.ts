@@ -26,6 +26,22 @@ function config(seed: boolean | undefined, classes?: unknown, egress?: unknown) 
 }
 const distTenancy = join(root, 'dist', 'tenancy');
 
+function checkRelativeRequires(
+  content: string,
+  shipped: Set<string>,
+): { found: number; missing: string[] } {
+  const missing: string[] = [];
+  let found = 0;
+  for (const m of content.matchAll(/require\(["'](\.[^"']*?)["']\)/g)) {
+    const spec = m[1] ?? '';
+    found++;
+    if (!/^\.\/[^/]+$/.test(spec) || !shipped.has(spec.slice(2).replace(/\.js$/, ''))) {
+      missing.push(spec);
+    }
+  }
+  return { found, missing };
+}
+
 describe('backing-service install', () => {
   it('includes backing-service CRDs with status subresources in the platform crds list', () => {
     const kinds = crds.map((c) => (c as { spec: { names: { kind: string } } }).spec.names.kind);
@@ -154,6 +170,7 @@ describe('backing-service install', () => {
 
   it('loads compiled backing-services into the controller ConfigMap script map', () => {
     expect([...CONTROLLER_SCRIPT_MODULES]).toEqual([
+      'admission',
       'egress',
       'backing-services',
       'workload-storage',
@@ -170,6 +187,7 @@ describe('backing-service install', () => {
     }
     const scripts = loadControllerScripts(distTenancy);
     expect(Object.keys(scripts).sort()).toEqual([
+      'admission.js',
       'backing-service-reconcile.js',
       'backing-services.js',
       'controller.js',
@@ -191,11 +209,32 @@ describe('backing-service install', () => {
     expect(scripts['controller.js']).toMatch(/require\(["'].\/log-projection["']\)/);
     expect(scripts['controller.js']).toMatch(/require\(["'].\/backing-service-reconcile["']\)/);
     expect(scripts['controller.js']).toMatch(/require\(["'].\/service-binding-reconcile["']\)/);
+    expect(scripts['controller.js']).toMatch(/require\(["'].\/admission["']\)/);
     expect(scripts['controller.js']).toMatch(/require\(["'].\/egress["']\)/);
     expect(scripts['backing-services.js']).toMatch(/require\(["'].\/egress["']\)/);
     expect(controllerScriptHash(scripts)).toMatch(/^[a-f0-9]{64}$/);
     expect(controllerScriptHash(scripts)).toBe(controllerScriptHash(scripts));
     expect(controllerScriptHash({ a: '1' })).not.toBe(controllerScriptHash({ a: '2' }));
+  });
+
+  it('every relative require() in loaded scripts references a shipped module', () => {
+    const scripts = loadControllerScripts(distTenancy);
+    const scriptNames = new Set(Object.keys(scripts).map((name) => name.replace(/\.js$/, '')));
+    let total = 0;
+    for (const [name, content] of Object.entries(scripts)) {
+      const { found, missing } = checkRelativeRequires(content, scriptNames);
+      total += found;
+      expect(missing, `${name} has unshipped relative requires`).toEqual([]);
+    }
+    expect(total).toBeGreaterThan(0);
+  });
+
+  it('closure check rejects ../x and accepts ./x.js', () => {
+    const names = new Set(['x']);
+    expect(checkRelativeRequires("require('./x.js')", names).missing).toEqual([]);
+    expect(checkRelativeRequires("require('./x')", names).missing).toEqual([]);
+    expect(checkRelativeRequires("require('../x')", names).missing).toEqual(['../x']);
+    expect(checkRelativeRequires("require('./y')", names).missing).toEqual(['./y']);
   });
 
   it('rejects non-array backingServiceClasses config', () => {

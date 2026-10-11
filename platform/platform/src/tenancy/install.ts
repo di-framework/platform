@@ -45,9 +45,10 @@ export function tenantObject({ name, ...spec }: TenantDeclaration, installation:
 }
 
 /** Controller ConfigMap modules. TypeScript emit does not bundle imports, so
- * `egress`, `backing-services`, `backing-service-reconcile`, `service-binding-reconcile`, and
+ * `admission`, `egress`, `backing-services`, `backing-service-reconcile`, `service-binding-reconcile`, and
  * `log-projection` must ship beside `resources` / `controller` (which require them at runtime). */
 export const CONTROLLER_SCRIPT_MODULES = [
+  'admission',
   'egress',
   'backing-services',
   'workload-storage',
