@@ -6,7 +6,8 @@
 #   wasi-tls            ghcr.io/di-framework/wash:2.8.0-wasi-tls            stock source, no patches
 #   wasi-tls-exclusive  ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive  + 0001-exclusive-instance.patch
 # The image labels name the variant and the patches applied. The platform default hostImage stays
-# pinned to the canonical digest; the exclusive variant is only used via tenantHostLocalImage.
+# pinned to the canonical digest; the exclusive variant is only used by setting tenantHostImage to its digest.
+# The exclusive build is never the default: select it explicitly.
 #
 # amd64 and arm64 compile at the same time on native runners. One ubuntu-24.04
 # job plus QEMU was spending the arm64 release build in emulation, which is
@@ -25,12 +26,12 @@ on:
   workflow_dispatch:
     inputs:
       variant:
-        description: Image variant (the exclusive one is published under its own tag)
+        description: Image variant (select wasi-tls-exclusive explicitly; it is published under its own tag)
         type: choice
         options:
-          - wasi-tls-exclusive
           - wasi-tls
-        default: wasi-tls-exclusive
+          - wasi-tls-exclusive
+        default: wasi-tls
 
 permissions:
   contents: read
@@ -226,6 +227,6 @@ jobs:
             echo "Pin \`tenantHostImage\` to that digest. The tag \`${TAG}\` moves on the next publish of this variant."
             if [[ -n "${PATCHES}" ]]; then
               echo
-              echo 'This is a patched build. Use it only through `tenantHostLocalImage` until it is proven; do not change `DEFAULT_HOST_IMAGE`.'
+              echo 'This is a patched build. Use it only by setting `tenantHostImage` (digest-pinned) until it is proven; do not change `DEFAULT_HOST_IMAGE`.'
             fi
           } >> "${GITHUB_STEP_SUMMARY}"

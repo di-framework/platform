@@ -4,7 +4,8 @@
 # tenant-host-image.yml is dispatch-only, so before this job a patch that did not apply, or did not
 # compile, only showed up at publish time. The job checks wasmCloud out at the commit pinned by
 # WASMCLOUD_COMMIT in the Dockerfile, applies every patch with `git apply` (after `--check`), then
-# builds wash-runtime and runs the tests that cover the patch. It does not run the whole
+# builds wash-runtime with the image's `wasi-tls` feature, lints it with clippy -D warnings, and runs
+# the tests that cover the patch. It does not run the whole
 # wash-runtime suite: that needs prebuilt wasm fixtures and Docker services this job does not set up.
 #
 # Bounded: one job, 60 minutes, superseded runs are cancelled. Cached: cargo registry and the target
@@ -111,12 +112,21 @@ jobs:
           restore-keys: |
             tenant-host-wash-runtime-${{ runner.os }}-${{ steps.pin.outputs.commit }}-
 
+      # The image builds wash with `wasi-tls`, which compiles branches (such as the one in
+      # new_ephemeral_store) that a default-features build skips.
       - name: Build patched wash-runtime
         working-directory: wasmcloud
-        run: cargo build -p wash-runtime --locked
+        run: cargo build -p wash-runtime --locked --features wasi-tls
+
+      - name: Lint patched wash-runtime
+        working-directory: wasmcloud
+        run: |
+          set -euo pipefail
+          cargo clippy -p wash-runtime --locked --features wasi-tls -- -D warnings
+          cargo clippy -p wash-runtime --locked --features wasi-tls --lib --profile test -- -D warnings
 
       - name: Test the pool and dispatch paths
         working-directory: wasmcloud
         # instance_pool and instance_driver cover the exclusive gates, queueing, trap, timeout and
         # drain tests; wire_ covers the opt-in surviving the wire conversion.
-        run: cargo test -p wash-runtime --locked --lib -- instance_pool instance_driver wire_
+        run: cargo test -p wash-runtime --locked --features wasi-tls --lib -- instance_pool instance_driver wire_

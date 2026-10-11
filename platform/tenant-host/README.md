@@ -60,18 +60,29 @@ below the pool, with two FIFO gates per exclusive component:
 - A store lease is taken before any store holding the component is built, on every path (warm
   instance, a fallback store, a service, messaging), and is released when that store is dropped. A
   retired, trapped or timed-out instance keeps its lease until its store is gone, so the replacement
-  waits for it. A store that links an exclusive component holds that component's lease too.
+  waits for it.
 
-A call that cannot get a gate within `WASH_EXCLUSIVE_WAIT_TIMEOUT_SECS` (600) fails with an error. It
-is never served from a store of its own. A call that traps or times out retires the instance, and
-calls queued behind it are served by the replacement.
+A call has one deadline for both gates together: `WASH_EXCLUSIVE_WAIT_TIMEOUT_SECS` (default 600),
+counted from when the call joins the line, covering the wait for the call permit and the wait for the
+store lease. A call that cannot get both within it fails with an error; it is never served from a
+store of its own. (The call's own execution timeout, such as `WASH_HTTP_RESPONSE_TIMEOUT_SECS`, then
+applies as for any call.) A call that traps or times out retires the instance, and calls queued
+behind it are served by the replacement.
+
+**Supported layout.** An exclusive component must not be linked (imported) by another component of
+the workload, and the host refuses to load a workload where it is, with an error naming both. Every
+store of an importer instantiates its exporters, so an importer would hold the exclusive
+component's lease for as long as the importer lives and its other calls could not queue. Compose
+the pieces with `wac plug` and mark the composed component exclusive. A single exclusive component
+that imports only host interfaces (keyvalue, config, logging and so on) loads and is serialised
+normally.
 
 Consequences. Calls to an exclusive component are serialised, so its throughput is one call at a
-time. A long-lived service store that links an exclusive component holds its lease for the service's
-life, and calls to the component then time out; do not link one into a service. Waiting calls hold
-their request open for up to the wait timeout.
+time. Waiting calls hold their request open for up to the wait timeout.
 
-**Scope.** This is one host process. The tenant host Deployment's rollout must not overlap pods:
+**Scope.** This is one host process. The opt-in is read from workload components only. The
+optional `host-component-plugins` feature (off in this image) builds its plugin stores from host
+configuration, outside `localResources.config`, so those stores take no lease and are not covered. The tenant host Deployment's rollout must not overlap pods:
 `maxSurge: 0, maxUnavailable: 1` (#104), or a second pod would open the same directory. The
 persistent directory is a `hostPath`, so it is per node; there is no overlap protection across nodes,
 and a pod rescheduled to another node sees a different directory.
@@ -85,14 +96,17 @@ and a pod rescheduled to another node sees a different directory.
 **Tests.** `crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs` in the patch runs real
 concurrent calls through the dispatch path against real stores and counts live stores. It covers
 saturation, FIFO order, the creation race, a trap, a timed-out call, drain with a call in flight,
-rotation by `maxInvocations`, and cancellation of a queued caller. Each asserts at most one live
-store. Run them against a checkout of the pinned commit with the patch applied:
+rotation by `maxInvocations`, the shared deadline and cancellation of a queued caller. Each asserts
+at most one live store, and the drain, rotation and timed-out tests hold the old store's teardown
+open to show the replacement is not built until it is released.
+`tests/integration_exclusive_topology.rs` (needs the prebuilt test fixtures) covers the layout rule
+and a lone exclusive component serialising real requests. Run them against a checkout of the pinned commit with the patch applied:
 
 ```sh
 git clone https://github.com/wasmCloud/wasmCloud /tmp/wasmcloud && cd /tmp/wasmcloud
 git checkout 5c4ec4a3d008b3f401d9e763515f434deebc9936
 git apply /path/to/platform/tenant-host/0001-exclusive-instance.patch
-cargo test -p wash-runtime --lib -- instance_pool instance_driver wire_
+cargo test -p wash-runtime --features wasi-tls --lib -- instance_pool instance_driver wire_
 ```
 
 ## Build
@@ -106,6 +120,9 @@ podman build -t localhost/di-framework/wash:2.8.0-wasi-tls-exclusive \
   --build-arg WASH_PATCHES=0001-exclusive-instance.patch \
   --build-arg IMAGE_VERSION=2.8.0-wasi-tls-exclusive platform/tenant-host
 ```
+
+The build fails if `WASH_PATCHES` and `IMAGE_VERSION` disagree (patches under the canonical version,
+or a patched version with no patches).
 
 `docker build` works the same way (BuildKit is needed for the cache mounts). A cold arm64 build took
 about 10 minutes on 16 cores; the cargo registry and target directory are cache mounts, so rebuilds are
@@ -123,7 +140,8 @@ Reference: `ghcr.io/di-framework/wash:2.8.0-wasi-tls` (stock source), or
 
 The **Publish tenant host image** workflow
 ([`.github/workflows/tenant-host-image.yml`](../../.github/workflows/tenant-host-image.yml))
-takes a `variant` input, `wasi-tls-exclusive` (default) or `wasi-tls`. Each variant pushes only its
+takes a `variant` input, `wasi-tls` (default) or `wasi-tls-exclusive`; the exclusive build has to
+be selected explicitly. Each variant pushes only its
 own tag; a patched build cannot be published on the canonical tag. It builds `linux/amd64` and
 `linux/arm64` on native runners (`ubuntu-24.04` and `ubuntu-24.04-arm`)
 at the same time, then pushes the multi-arch tag. It does not emulate arm64. Each arch also pushes

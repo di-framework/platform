@@ -20,6 +20,18 @@ FROM docker.io/library/rust@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da
 ARG WASMCLOUD_TAG
 ARG WASMCLOUD_COMMIT
 ARG WASH_PATCHES
+ARG IMAGE_VERSION
+# A patched build must not be labelled as the canonical stock version, and a stock build must not
+# claim to be patched: fail fast rather than publish a mislabelled image.
+RUN set -eu; \
+    if [ -n "${WASH_PATCHES}" ] && [ "${IMAGE_VERSION}" = "2.8.0-wasi-tls" ]; then \
+      echo "WASH_PATCHES is set but IMAGE_VERSION is the canonical 2.8.0-wasi-tls; pass IMAGE_VERSION=2.8.0-wasi-tls-exclusive" >&2; \
+      exit 1; \
+    fi; \
+    if [ -z "${WASH_PATCHES}" ] && [ "${IMAGE_VERSION}" != "2.8.0-wasi-tls" ]; then \
+      echo "IMAGE_VERSION ${IMAGE_VERSION} names a patched variant but WASH_PATCHES is empty" >&2; \
+      exit 1; \
+    fi
 RUN apt-get update \
   && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev lld \
   && rm -rf /var/lib/apt/lists/*
