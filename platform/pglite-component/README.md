@@ -55,15 +55,18 @@ The pglite component is published to GitHub Container Registry (GHCR) as an OCI 
 1. Open [Workflows](https://github.com/di-framework/platform/actions/workflows/pglite-component-publish.yml).
 2. Click **Run workflow** > **main branch** > **Run workflow**.
 
-The workflow:
-- Builds the component with `make tools-rust smoke`.
-- Publishes to `ghcr.io/di-framework/pglite-component` with an immutable digest tag.
-- Pulls the artifact back by digest and compares the bytes.
-- Records the digest to the job summary.
+The workflow has two jobs:
+- `build` (no write token) runs the same targets as `ci.yml`: `make tools-rust`, `make unit smoke` (which runs `make build`, composing the provider with the engine via `wac plug`), then the publisher crates' clippy and tests.
+- `publish` (`packages: write`) downloads the tested `dist/` and runs `pglite-component-publisher`. It never rebuilds or modifies `dist/`. It checks `SHA256SUMS`, requires the export `di-framework:pglite/database@0.2.0` and rejects any import that is not `wasi:*`, then pushes `ghcr.io/di-framework/pglite-component` with two tags (the commit SHA and the WIT package version, `0.2.0`) and pulls each back by the manifest digest to compare bytes.
+
+Tags are movable. Only the `@sha256:...` digest is immutable, so pin consumers by digest.
 
 ### Artifact location
 
-The digest appears in **Details** > **Record component digest** > **Step summary**.
+The digest is in **Details** > **Record component digest** > **Step summary**, and in the `pglite-publish-report` artifact (`publish-report.json`).
+The first digest is not recorded here yet: it exists only after the first dispatch from `main`, and a follow-up commit will add it below.
+
+Published digest: _pending first publish_
 
 **Note:** The GHCR package must be made public by an org admin after the first publish. Until then, only members with access to di-framework/platform can pull it.
 
@@ -102,7 +105,8 @@ To use the published OCI component from GHCR instead (pin by digest for reproduc
 
 ```sh
 export PGLITE_REF='ghcr.io/di-framework/pglite-component@sha256:<digest>'
-wac plug path/to/app.wasm -n di-framework:pglite "${PGLITE_REF}" -o path/to/app.composed.wasm
+wash oci pull "${PGLITE_REF}" pglite.wasm
+wac plug --plug pglite.wasm path/to/app.wasm -o path/to/app.composed.wasm
 mkdir -p ./data
 wasmtime run --dir ./data::/data path/to/app.composed.wasm
 ```

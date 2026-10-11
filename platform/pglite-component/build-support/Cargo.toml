@@ -5,7 +5,7 @@ workspace = "../../.."
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Build and publish the pglite Wasm component"
+description = "Validate and publish the built pglite Wasm component"
 build = "build.rs"
 
 [[bin]]
@@ -13,5 +13,4 @@ name = "pglite-component-publisher"
 path = "main.rs"
 
 [dependencies]
-serde_json = "1.0"
-sha2 = "0.10"
+wasm-component-publisher = { path = "../../wasm-component-publisher" }

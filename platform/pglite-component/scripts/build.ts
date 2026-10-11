@@ -139,9 +139,12 @@ export async function buildComponent(ctx: Context, options: BuildOptions): Promi
     ].join('\n'),
   );
   const sums = await Promise.all(
-    ['di-framework-pglite.wasm', 'di-framework-pglite.wit', 'THIRD-PARTY-NOTICES.txt'].map(
-      async (name) => `${await sha256File(join(dist, name))}  ${name}`,
-    ),
+    [
+      'di-framework-pglite.wasm',
+      'di-framework-pglite.wit',
+      'BUILD-INFO.txt',
+      'THIRD-PARTY-NOTICES.txt',
+    ].map(async (name) => `${await sha256File(join(dist, name))}  ${name}`),
   );
   await Bun.write(join(dist, 'SHA256SUMS'), `${sums.join('\n')}\n`);
 

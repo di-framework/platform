@@ -51,7 +51,7 @@ jobs:
         run: |
           set -euo pipefail
           make -C platform/oci-registry test
-          cargo test --locked -p oci-registry-publisher
+          cargo test --locked -p wasm-component-publisher -p oci-registry-publisher
 
       - name: Build, push, and verify component
         env:

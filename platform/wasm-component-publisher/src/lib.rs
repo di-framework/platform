@@ -1,5 +1,6 @@
-//! Validate and publish Wasm components using the reference branch's wash flow.
-//! Invoked explicitly by the publisher executable, never during compilation.
+//! Validate and publish Wasm components with `wash`, shared by every component
+//! publisher in this workspace. Invoked explicitly by a publisher executable,
+//! never during compilation.
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -29,6 +30,14 @@ pub struct ComponentSpec {
     pub default_repository: &'static str,
     /// Publish report file name under the component dist directory.
     pub report_file_name: &'static str,
+    /// Log prefix, e.g. `oci-registry`, printed as `[oci-registry] ...`.
+    pub log_prefix: &'static str,
+    /// Extra (human-friendly) tag pushed next to `DI_OCI_TAG`, e.g. the WIT
+    /// package version `0.2.0`. Tags are movable; only digests are immutable.
+    pub version_tag: Option<String>,
+    /// When set, every top-level world import must start with one of these
+    /// prefixes (e.g. `wasi:`), so an unresolved plug cannot be published.
+    pub import_prefixes: Option<&'static [&'static str]>,
 }
 
 fn setting(name: &str, default: &str) -> Result<String> {
@@ -353,6 +362,7 @@ fn check_output(output: &Output, what: &str) -> Result<()> {
     .into())
 }
 
+/// Validate `dist/` and, when `push_enabled`, push and verify it.
 pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<()> {
     let dist = package.join(env::var_os("DI_OCI_DIST_DIR").unwrap_or_else(|| "dist".into()));
     let sums = fs::read_to_string(dist.join("SHA256SUMS"))
@@ -363,13 +373,15 @@ pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<(
     // BUILD-INFO.txt is checksum-verified here; its timestamp now lives in
     // the config `wash` generates, so only its presence matters here.
     let _ = read_checked(spec.build_info_file)?;
-    let (_, exports) = world_items(&wit)?;
+    let (imports, exports) = world_items(&wit)?;
+    check_imports(&imports, spec.import_prefixes)?;
     if !exports.iter().any(|item| item == spec.required_export) {
         return Err(format!("built WIT lacks {}", spec.required_export).into());
     }
     let wasm_digest = digest(&wasm);
+    let log = spec.log_prefix;
     if !push_enabled {
-        eprintln!("[oci-registry] Validated {wasm_digest}; PUSH=true to publish");
+        eprintln!("[{log}] Validated {wasm_digest}; PUSH=true to publish");
         return Ok(());
     }
     let short_hash: String = format!("{:x}", Sha256::digest(&wasm))
@@ -385,12 +397,11 @@ pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<(
     )?;
     validate_reference(&registry, &repository, &tag)?;
     validate_reference(&cluster_registry, &repository, &tag)?;
-    let destination = format!("{registry}/{repository}:{tag}");
     let insecure = use_insecure(&registry)?;
     let credentials = registry_credentials()?;
     match &credentials {
-        None => eprintln!("[oci-registry] Registry auth: anonymous"),
-        Some((username, _)) => eprintln!("[oci-registry] Registry auth: basic user {username}"),
+        None => eprintln!("[{log}] Registry auth: anonymous"),
+        Some((username, _)) => eprintln!("[{log}] Registry auth: basic user {username}"),
     }
 
     let docker_config = match &credentials {
@@ -406,6 +417,62 @@ pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<(
         None => vec![],
     };
 
+    let mut tags = vec![tag.clone()];
+    if let Some(version) = &spec.version_tag
+        && *version != tag
+    {
+        validate_reference(&registry, &repository, version)?;
+        tags.push(version.clone());
+    }
+    let wasm_path = dist.join(spec.wasm_file);
+    let mut pushed = Vec::new();
+    for tag in &tags {
+        let destination = format!("{registry}/{repository}:{tag}");
+        let manifest_digest = push_and_verify(
+            &destination,
+            &format!("{registry}/{repository}"),
+            &wasm_path,
+            &wasm,
+            insecure,
+            &wash_envs,
+        )?;
+        eprintln!("[{log}] Pushed tag: {destination} -> {manifest_digest}");
+        pushed.push((destination, manifest_digest));
+    }
+    // The first (commit) tag's manifest digest is the canonical reference; a
+    // tag can move, the digest cannot.
+    let manifest_digest = pushed[0].1.clone();
+    let local = format!("{registry}/{repository}@{manifest_digest}");
+    let cluster = format!("{cluster_registry}/{repository}@{manifest_digest}");
+    let report = dist.join(spec.report_file_name);
+    let tag_digests: Vec<Value> = pushed
+        .iter()
+        .map(|(tag, digest)| serde_json::json!({ "tag": tag, "manifestDigest": digest }))
+        .collect();
+    fs::write(
+        &report,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "tag": pushed[0].0, "tags": tag_digests, "wasmDigest": wasm_digest,
+            "manifestDigest": manifest_digest, "localComponent": local, "clusterComponent": cluster,
+        }))?,
+    )?;
+    eprintln!("[{log}] Verified Wasm: {wasm_digest}");
+    eprintln!("[{log}] Local component: {local}");
+    eprintln!("[{log}] Cluster component: {cluster}");
+    eprintln!("[{log}] Publish report: {}", report.display());
+    Ok(())
+}
+
+/// Push `wasm_path` to `destination`, then pull it back by the manifest digest
+/// that `wash` returned (not by the movable tag) and compare the bytes.
+fn push_and_verify(
+    destination: &str,
+    repo_ref: &str,
+    wasm_path: &Path,
+    wasm: &[u8],
+    insecure: bool,
+    wash_envs: &[(&str, &Path)],
+) -> Result<String> {
     let mut push: Vec<String> = vec![
         "oci".to_owned(),
         "push".to_owned(),
@@ -416,17 +483,14 @@ pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<(
     if insecure {
         push.push("--insecure".to_owned());
     }
-    push.push(destination.clone());
-    push.push(dist.join(spec.wasm_file).to_string_lossy().into_owned());
-    let output = run_wash(&push, &wash_envs, Duration::from_secs(300))?;
+    push.push(destination.to_owned());
+    push.push(wasm_path.to_string_lossy().into_owned());
+    let output = run_wash(&push, wash_envs, Duration::from_secs(300))?;
     check_output(&output, "oci push")?;
     let manifest_digest = push_digest(&output.stdout)?;
-    let local = format!("{registry}/{repository}@{manifest_digest}");
-    let cluster = format!("{cluster_registry}/{repository}@{manifest_digest}");
 
-    // Verify the immutable manifest returned by the push, not a movable tag.
-    // Download to a temporary path outside dist/ so failed or unverified artifacts
-    // never pollute the build output, and clean up on all paths via drop guard.
+    // Download to a temporary path outside dist/ so failed or unverified
+    // artifacts never pollute the build output; the guard cleans up on all paths.
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -444,30 +508,14 @@ pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<(
     if insecure {
         pull.push("--insecure".to_owned());
     }
-    pull.push(local.clone());
+    pull.push(format!("{repo_ref}@{manifest_digest}"));
     pull.push(pulled.to_string_lossy().into_owned());
-    let output = run_wash(&pull, &wash_envs, Duration::from_secs(300))?;
+    let output = run_wash(&pull, wash_envs, Duration::from_secs(300))?;
     check_output(&output, "oci pull")?;
-    let round_tripped = fs::read(&pulled)?;
-    if round_tripped != wasm {
+    if fs::read(&pulled)? != wasm {
         return Err("pulled Wasm differs from the local build".into());
     }
-
-    drop(_pulled_guard);
-    let report = dist.join(spec.report_file_name);
-    fs::write(
-        &report,
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "tag": destination, "wasmDigest": wasm_digest,
-            "manifestDigest": manifest_digest, "localComponent": local, "clusterComponent": cluster,
-        }))?,
-    )?;
-    eprintln!("[oci-registry] Verified Wasm: {wasm_digest}");
-    eprintln!("[oci-registry] Pushed tag: {destination}");
-    eprintln!("[oci-registry] Local component: {local}");
-    eprintln!("[oci-registry] Cluster component: {cluster}");
-    eprintln!("[oci-registry] Publish report: {}", report.display());
-    Ok(())
+    Ok(manifest_digest)
 }
 
 /// `wash oci push --output json` prints `{"success":true,"data":{"digest":"sha256:…"}}`.
@@ -496,6 +544,22 @@ fn push_digest(stdout: &[u8]) -> Result<String> {
             tail(&String::from_utf8_lossy(stdout), 1000)
         )
         .into()),
+    }
+}
+
+/// Reject any world import outside `allowed` prefixes (when a policy is set).
+fn check_imports(imports: &[String], allowed: Option<&[&str]>) -> Result<()> {
+    let Some(prefixes) = allowed else {
+        return Ok(());
+    };
+    match imports
+        .iter()
+        .find(|item| !prefixes.iter().any(|prefix| item.starts_with(prefix)))
+    {
+        Some(bad) => {
+            Err(format!("built WIT has unexpected import {bad}; allowed: {prefixes:?}").into())
+        }
+        None => Ok(()),
     }
 }
 
@@ -604,6 +668,19 @@ mod tests {
         assert_eq!(imports, ["wasi:http/client@0.3.0"]);
         assert!(exports.is_empty());
         assert!(world_items("world truncated {\n").is_err());
+    }
+
+    #[test]
+    fn rejects_imports_outside_the_allowed_prefixes() {
+        let wasi = ["wasi:io/streams@0.2.6".to_owned()];
+        let plug = [
+            "wasi:io/streams@0.2.6".to_owned(),
+            "di-framework:pglite-engine/engine@0.1.0".to_owned(),
+        ];
+        assert!(check_imports(&wasi, Some(&["wasi:"])).is_ok());
+        assert!(check_imports(&plug, None).is_ok());
+        let error = check_imports(&plug, Some(&["wasi:"])).unwrap_err();
+        assert!(error.to_string().contains("pglite-engine"));
     }
 
     #[test]

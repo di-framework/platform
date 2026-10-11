@@ -1,4 +1,6 @@
-# Publish the canonical Wasm OCI artifact through the Rust publisher and wash.
+# Publish the tested, composed pglite Wasm component (engine plugged in) to GHCR.
+# The build job runs the same make targets as ci.yml and holds no write token;
+# the publish job only validates and pushes the already-tested dist/.
 name: Publish pglite component
 
 on:
@@ -6,18 +8,17 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: publish-pglite-component
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Push ghcr.io/di-framework/pglite-component
+  build:
+    name: Build and test pglite component
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Require di-framework/platform
         run: |
@@ -32,38 +33,93 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Rust and native dependencies
-        uses: ./.github/actions/setup-tenant-auth-builder
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: latest
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: '1.97.1'
+          targets: wasm32-wasip2
+          components: clippy
+
+      - name: Install wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1
+        with:
+          version: 'v48.0.1'
+
+      - name: Cache engine build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            platform/pglite-component/target/engine
+            platform/pglite-component/.tools
+          key: pglite-engine-${{ hashFiles('platform/pglite-component/engine/**', 'platform/pglite-component/scripts/tool-versions.env', 'platform/pglite-component/scripts/build-engine.ts', 'platform/pglite-component/scripts/patch-engine-source.ts', 'platform/pglite-component/scripts/prepare-engine.ts', 'platform/pglite-component/wit/deps/pglite-engine/**') }}
+          restore-keys: |
+            pglite-engine-
 
       - name: Install Wasm build tools
         run: |
           set -euo pipefail
-          rustup target add --toolchain 1.97.1 wasm32-wasip2
-          bash platform/pglite-component/scripts/install-tools.sh
+          make -C platform/pglite-component tools-rust
           echo "$GITHUB_WORKSPACE/platform/pglite-component/.tools/bin" >> "$GITHUB_PATH"
+
+      - name: Test publisher crates
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p wasm-component-publisher -p pglite-component-publisher --all-targets -- -D warnings
+          cargo test --locked -p wasm-component-publisher -p pglite-component-publisher
+
+      # `smoke` runs `build`, which wac-plugs the engine into the provider.
+      - name: Build and test composed component against the real engine
+        run: make -C platform/pglite-component unit smoke
+
+      - name: Validate the tested artifact without publishing
+        run: cargo run --locked -p pglite-component-publisher -- --check
+
+      - name: Upload tested dist
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: pglite-dist
+          path: platform/pglite-component/dist/
+          if-no-files-found: error
+
+  publish:
+    name: Push ghcr.io/di-framework/pglite-component
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: '1.97.1'
 
       - name: Set up wash CLI
         uses: wasmCloud/setup-wash-action@47756fa211cc82f392c57e39504f43ef46fc0b3e # v2.1.0
         with:
           wash-version: v2.5.2
 
-      - name: Cache engine build
-        id: cache-engine
-        uses: actions/cache@v4
+      - name: Download tested dist
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          path: |
-            platform/pglite-component/target/engine
-            platform/pglite-component/.tools
-          key: pglite-engine-${{ hashFiles('platform/pglite-component/engine/**', 'platform/pglite-component/scripts/tool-versions.env') }}
-          restore-keys: |
-            pglite-engine-
+          name: pglite-dist
+          path: platform/pglite-component/dist
 
-      - name: Build and test component
-        run: |
-          set -euo pipefail
-          make -C platform/pglite-component tools-rust smoke
-
-      - name: Build, push, and verify component
+      # The publisher re-verifies SHA256SUMS, the exported database interface
+      # and that every import is wasi:*, then pushes the commit and version
+      # tags and pulls each back by digest.
+      - name: Push and verify component
         env:
           PUSH: 'true'
           DI_OCI_REGISTRY: ghcr.io
@@ -86,7 +142,8 @@ jobs:
             echo
             printf '```\n%s\n```\n' "$ref"
             echo
-            echo 'The component was pulled by digest and verified against the local build.'
+            echo 'Tags (movable): the commit SHA and the WIT package version.'
+            echo 'Only the digest above is immutable. Each tag was pulled back by digest and byte-compared with the tested build.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload publish report
