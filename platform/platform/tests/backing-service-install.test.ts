@@ -26,6 +26,22 @@ function config(seed: boolean | undefined, classes?: unknown, egress?: unknown) 
 }
 const distTenancy = join(root, 'dist', 'tenancy');
 
+function checkRelativeRequires(
+  content: string,
+  shipped: Set<string>,
+): { found: number; missing: string[] } {
+  const missing: string[] = [];
+  let found = 0;
+  for (const m of content.matchAll(/require\(["'](\.[^"']*?)["']\)/g)) {
+    const spec = m[1] ?? '';
+    found++;
+    if (!/^\.\/[^/]+$/.test(spec) || !shipped.has(spec.slice(2).replace(/\.js$/, ''))) {
+      missing.push(spec);
+    }
+  }
+  return { found, missing };
+}
+
 describe('backing-service install', () => {
   it('includes backing-service CRDs with status subresources in the platform crds list', () => {
     const kinds = crds.map((c) => (c as { spec: { names: { kind: string } } }).spec.names.kind);
@@ -204,23 +220,21 @@ describe('backing-service install', () => {
   it('every relative require() in loaded scripts references a shipped module', () => {
     const scripts = loadControllerScripts(distTenancy);
     const scriptNames = new Set(Object.keys(scripts).map((name) => name.replace(/\.js$/, '')));
-    const requirePattern = /require\(["'](\.[^"']*?)["']\)/g;
-
-    for (const [, scriptContent] of Object.entries(scripts)) {
-      let match: RegExpExecArray | null;
-      match = requirePattern.exec(scriptContent);
-      while (match !== null) {
-        const requirePath = match[1];
-        if (requirePath !== undefined) {
-          // Only check relative requires that load from the same directory (./x)
-          if (requirePath.startsWith('./')) {
-            const moduleName = requirePath.replace(/^\.\//, '');
-            expect(scriptNames).toContain(moduleName);
-          }
-        }
-        match = requirePattern.exec(scriptContent);
-      }
+    let total = 0;
+    for (const [name, content] of Object.entries(scripts)) {
+      const { found, missing } = checkRelativeRequires(content, scriptNames);
+      total += found;
+      expect(missing, `${name} has unshipped relative requires`).toEqual([]);
     }
+    expect(total).toBeGreaterThan(0);
+  });
+
+  it('closure check rejects ../x and accepts ./x.js', () => {
+    const names = new Set(['x']);
+    expect(checkRelativeRequires("require('./x.js')", names).missing).toEqual([]);
+    expect(checkRelativeRequires("require('./x')", names).missing).toEqual([]);
+    expect(checkRelativeRequires("require('../x')", names).missing).toEqual(['../x']);
+    expect(checkRelativeRequires("require('./y')", names).missing).toEqual(['./y']);
   });
 
   it('rejects non-array backingServiceClasses config', () => {
