@@ -20,7 +20,7 @@ import {
   tenantAuthResources,
   VERSION,
 } from '../src/tenancy/resources';
-import { selfSignedCertificate } from '../src/tenancy/tls';
+import { caCertificate, leafCertificate } from '../src/tenancy/tls';
 
 const controllerUser = 'system:serviceaccount:wasmcloud:di-platform-controller';
 const tenantUser = 'system:serviceaccount:wasmcloud:di-user-dev';
@@ -246,7 +246,12 @@ function renderedRegistryInterfaces(): HostInterfaceLike[] {
       },
     },
   };
-  const tls = selfSignedCertificate('tenant-controller', ['tenant-controller'], [], 30);
+  const ca = caCertificate('tenant-controller CA', 30);
+  const tls = {
+    ...leafCertificate('tenant-controller', ['tenant-controller'], [], 30, ca.cert, ca.key),
+    caCert: ca.cert,
+    caKey: ca.key,
+  };
   const rendered = tenantAuthResources(tenant, cfg, {
     members: ['alice'],
     apiServer: { addresses: ['10.0.0.1'], port: 6443 },
