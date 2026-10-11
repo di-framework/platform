@@ -54,12 +54,12 @@
       "version": "6.0.10",
       "devDependencies": {
         "@di-framework/core": "^5",
-        "@di-framework/repo": "^6.0.4",
+        "@di-framework/repo": "^6.1.0",
         "@types/bun": "latest",
       },
       "peerDependencies": {
         "@di-framework/core": "^5",
-        "@di-framework/repo": "^6.0.4",
+        "@di-framework/repo": "^6.1.0",
         "typescript": "^5",
       },
       "optionalPeers": [
@@ -74,10 +74,10 @@
       "name": "@di-framework/pglite-component",
       "version": "6.0.10",
       "devDependencies": {
-        "@di-framework/repo": "^6.0.7",
+        "@di-framework/repo": "^6.1.0",
       },
       "peerDependencies": {
-        "@di-framework/repo": "^6.0.7",
+        "@di-framework/repo": "^6.1.0",
       },
     },
     "platform/platform": {
@@ -169,7 +169,7 @@
 
     "@di-framework/platform": ["@di-framework/platform@workspace:platform/platform"],
 
-    "@di-framework/repo": ["@di-framework/repo@6.0.5", "", { "peerDependencies": { "@di-framework/core": "^6", "typescript": "^5" } }, "sha512-bUblSkWK/4cIKT78ZN4gkfdpGRf+0xg5oyhKOCuyKmGgTSBVsGLeEqXU7/Df2XFaguXvYp37fnxBQFNBqIMsVA=="],
+    "@di-framework/repo": ["@di-framework/repo@6.1.0", "", { "peerDependencies": { "@di-framework/core": "^6", "typescript": "^5" } }, "sha512-z0WL6ruBeR4ESY6GczSKimZi9B3U3cshxVNCRAS5qjkOK5hvOtO4prZU4pxEI94vYQ+ru0GLh+IyFixTjDxfuA=="],
 
     "@di-framework/sqlite-component": ["@di-framework/sqlite-component@workspace:platform/sqlite-component"],
 
@@ -737,8 +737,6 @@
 
     "@di-framework/http/@di-framework/core": ["@di-framework/core@6.0.6", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-c9OssLKKhhwEbsPb0laCcgJ+9cS+847HVTKAa0epYgRTiWNn8XnicajaAvUhB99vFBrguMDoX2AwrecmdKNQzg=="],
 
-    "@di-framework/pglite-component/@di-framework/repo": ["@di-framework/repo@6.0.7", "", { "peerDependencies": { "@di-framework/core": "^6", "typescript": "^5" } }, "sha512-jRdu/5OZIghKB5/28duDh+MZUyF/T1qabDXEIeIopO/O8WiOf9zpy3ZKkGBBzTTnQ29GcpyXV/2p/2Ta0+X8kA=="],
-
     "@di-framework/repo/@di-framework/core": ["@di-framework/core@6.0.6", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-c9OssLKKhhwEbsPb0laCcgJ+9cS+847HVTKAa0epYgRTiWNn8XnicajaAvUhB99vFBrguMDoX2AwrecmdKNQzg=="],
 
     "@di-framework/tenant-cli/@di-framework/core": ["@di-framework/core@6.0.6", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-c9OssLKKhhwEbsPb0laCcgJ+9cS+847HVTKAa0epYgRTiWNn8XnicajaAvUhB99vFBrguMDoX2AwrecmdKNQzg=="],
@@ -817,7 +815,6 @@
 
     "write-file-atomic/signal-exit": ["signal-exit@4.1.0", "", {}, "sha512-bzyZ1e88w9O1iNJbKnOlvYTrWPDl46O1bG0D3XInv+9tkPrxrN8jUUTiFlDkkmKWgn1M6CfIA13SuGqOa9Korw=="],
 
-    "@di-framework/pglite-component/@di-framework/repo/@di-framework/core": ["@di-framework/core@6.0.6", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-c9OssLKKhhwEbsPb0laCcgJ+9cS+847HVTKAa0epYgRTiWNn8XnicajaAvUhB99vFBrguMDoX2AwrecmdKNQzg=="],
     "@kubernetes/client-node/@types/node/undici-types": ["undici-types@8.9.0", "", {}, "sha512-KTDyRTYX8sWmKXAikPHHSyc63CRPETMctyjKFupcC6OBLXT3xsN0e9aF7m+mIXutFWpUXuedtowG7iLOzp0kQg=="],
 
     "@npmcli/git/which/isexe": ["isexe@4.0.0", "", {}, "sha512-FFUtZMpoZ8RqHS3XeXEmHWLA4thH+ZxCv2lOiPIn1Xc7CxrqhWzNSDzD+/chS/zbYezmiwWLdQC09JdQKmthOw=="],
