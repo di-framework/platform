@@ -226,6 +226,113 @@ test('kubeconfigs read each token Secret after its User and are a secret output'
   }
 }, 60_000);
 
+test('token Secret read polls until Secret exists with data.token', () => {
+  const output = execFileSync(
+    'node',
+    [
+      '-e',
+      `
+    const pulumi = require('@pulumi/pulumi');
+    const k8s = require('@pulumi/kubernetes');
+    const resources = [];
+    const b64 = s => Buffer.from(s).toString('base64');
+
+    // Mock API that returns Secret on the third attempt
+    let callCount = 0;
+    const mockApi = {
+      readNamespacedSecret: async (name, namespace) => {
+        callCount++;
+        if (callCount < 3) {
+          const err = new Error('Not found');
+          err.statusCode = 404;
+          throw err;
+        }
+        return { body: { data: { token: b64('test-token-' + name) } } };
+      }
+    };
+
+    pulumi.runtime.setAllConfig({'project:tenants': JSON.stringify([{name:'alpha'}]), 'project:users': JSON.stringify([{name:'alice',memberships:[{tenant:'alpha',role:'developer'}]}])});
+    pulumi.runtime.setMocks({
+      newResource: args => {
+        resources.push({type:args.type, name:args.name, id:args.id});
+        if (args.id) return {id:args.id, state:{data:{token:b64('token-' + args.name), 'ca.crt':b64('ca')}}};
+        return {id:args.name, state:{...args.inputs, metadata:{...args.inputs.metadata, name:args.inputs.metadata?.name ?? args.name}}};
+      },
+      call: args => args.inputs,
+    }, 'project', 'test', false);
+
+    let result;
+    pulumi.runtime.runInPulumiStack(async () => {
+      const {createPlatform, _setTestApiClient} = require('./dist');
+      _setTestApiClient(mockApi);
+      const platform = createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', apiServer: pulumi.output('https://127.0.0.1:26443') });
+      result = { secret: await pulumi.isSecret(platform.kubeconfigs), value: await platform.kubeconfigs.promise() };
+    }).then(() => { console.log(JSON.stringify({resources, ...result, callCount})); }).catch(e => {console.error(e);process.exitCode=1;});
+  `,
+    ],
+    { cwd: root, encoding: 'utf8' },
+  );
+  const parsed = JSON.parse(output) as {
+    resources: { type: string; name: string; id?: string }[];
+    secret: boolean;
+    value: Record<string, Record<string, string>>;
+    callCount: number;
+  };
+  expect(parsed.secret).toBe(true);
+  expect(parsed.value['alpha']?.['alice']).toBeDefined();
+  expect(parsed.callCount).toBe(3); // Verify it took 3 attempts
+}, 60_000);
+
+test('token Secret read fails with clear error when Secret never appears', () => {
+  let errorOccurred = false;
+  try {
+    const output = execFileSync(
+      'node',
+      [
+        '-e',
+        `
+      const pulumi = require('@pulumi/pulumi');
+      const k8s = require('@pulumi/kubernetes');
+
+      // Mock API that always returns 404
+      const mockApi = {
+        readNamespacedSecret: async (name, namespace) => {
+          const err = new Error('Not found');
+          err.statusCode = 404;
+          throw err;
+        }
+      };
+
+      pulumi.runtime.setAllConfig({'project:tenants': JSON.stringify([{name:'alpha'}]), 'project:users': JSON.stringify([{name:'alice',memberships:[{tenant:'alpha',role:'developer'}]}])});
+      pulumi.runtime.setMocks({
+        newResource: args => { return {id:args.name, state:{...args.inputs, metadata:{...args.inputs.metadata, name:args.inputs.metadata?.name ?? args.name}}}; },
+        call: args => args.inputs,
+      }, 'project', 'test', false);
+
+      pulumi.runtime.runInPulumiStack(async () => {
+        const {createPlatform, _setTestApiClient} = require('./dist');
+        _setTestApiClient(mockApi);
+        const platform = createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', apiServer: pulumi.output('https://127.0.0.1:26443') });
+        await platform.kubeconfigs.promise();
+      }).catch(e => {
+        console.log(JSON.stringify({error: e.message}));
+      });
+    `,
+      ],
+      { cwd: root, encoding: 'utf8', env: { ...process.env, TOKEN_WAIT_MAX_ATTEMPTS: '5' } },
+    );
+  } catch (e) {
+    // The error is expected, capture it
+    const errorMsg = (e as any).stderr?.toString() || (e as any).toString();
+    if (errorMsg.includes('Failed to read Secret')) {
+      errorOccurred = true;
+      expect(errorMsg).toContain('Failed to read Secret');
+      expect(errorMsg).toContain('di-user-alice-alpha-token');
+    }
+  }
+  expect(errorOccurred).toBe(true);
+}, 60_000);
+
 test('local entrypoint retains existing logical names and guarded Docker cleanup', () => {
   const local = readFileSync(join(root, 'src/local.ts'), 'utf8');
   expect(local).toContain('createPlatform({');
