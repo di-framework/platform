@@ -265,5 +265,77 @@ fn main() {
         .unwrap()
         .is_none());
     reopened.close().unwrap();
+
+    // --- WIT 0.2.0: JSON and timestamp types, OID 0 for text parameters ---
+    // Create a table with jsonb and timestamptz columns
+    db.exec("CREATE TABLE typed_data (id serial primary key, data jsonb, ts timestamptz)")
+        .expect("create typed table");
+
+    // Insert with JSON and timestamp values
+    let json_val = r#"{"name":"test","value":42}"#;
+    let ts_val = "2024-01-15T10:30:00Z";
+    db.run(
+        "INSERT INTO typed_data (data, ts) VALUES ($1::jsonb, $2::timestamptz)",
+        &[Value::Json(json_val.to_string()), Value::Timestamp(ts_val.to_string())],
+    )
+    .expect("insert json and timestamp");
+
+    // Query back and verify types
+    let row = db
+        .first("SELECT data, ts FROM typed_data WHERE id = 1", &[])
+        .expect("select json/timestamp")
+        .expect("row found");
+
+    // JSON comes back as Value::Json with the string content
+    match col(&row, "data") {
+        Value::Json(j) => {
+            assert!(j.contains("test"), "json should contain 'test'");
+            assert!(j.contains("42"), "json should contain '42'");
+        }
+        other => panic!("expected json, got {other:?}"),
+    }
+
+    // Timestamp comes back as Value::Timestamp
+    match col(&row, "ts") {
+        Value::Timestamp(t) => {
+            assert!(t.contains("2024"), "timestamp should contain year");
+        }
+        other => panic!("expected timestamp, got {other:?}"),
+    }
+
+    // Test OID 0 parameter: text parameter should work with timestamptz and uuid comparisons
+    db.exec("CREATE TABLE identities (id uuid primary key, created_at timestamptz)")
+        .expect("create identities table");
+
+    // Insert with explicit casts from text (OID 0 allows this)
+    db.run(
+        "INSERT INTO identities (id, created_at) VALUES ($1::uuid, $2::timestamptz)",
+        &[
+            Value::Text("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            Value::Text("2024-01-01T00:00:00Z".to_string()),
+        ],
+    )
+    .expect("insert with text parameters cast to uuid/timestamptz");
+
+    // Query using text parameter in WHERE clause (OID 0 allows comparison)
+    let found = db
+        .first(
+            "SELECT id FROM identities WHERE id = $1::uuid",
+            &[Value::Text("550e8400-e29b-41d4-a716-446655440000".to_string())],
+        )
+        .expect("select with text parameter cast to uuid")
+        .expect("identity found");
+    assert!(!found.is_empty(), "should find identity by uuid");
+
+    // Test SQLSTATE codes for constraint violations with the new types
+    let json_dup = db.run(
+        "INSERT INTO typed_data (id, data) VALUES (1, $1::jsonb)",
+        &[Value::Json(r#"{"dup":"value"}"#.to_string())],
+    );
+    assert!(
+        matches!(json_dup, Err(Error::ExecutionFailed(e)) if e.code == "23505"),
+        "duplicate id should return SQLSTATE 23505"
+    );
+
     println!("smoke ok");
 }

@@ -19,6 +19,8 @@ const OID_INT4: u32 = 23;
 const OID_TEXT: u32 = 25;
 const OID_FLOAT4: u32 = 700;
 const OID_FLOAT8: u32 = 701;
+const OID_JSON: u32 = 114;
+const OID_TIMESTAMP_TZ: u32 = 1184;
 
 /// One exclusive session on the embedded engine.
 pub struct Session {
@@ -558,6 +560,8 @@ fn decode_cell(oid: u32, cell: Option<String>) -> Result<Value, Error> {
             .map(Value::Real)
             .map_err(|_| Error::ValueConversionFailed(format!("invalid float {text:?}"))),
         OID_BYTEA => decode_bytea(&text),
+        OID_JSON => Ok(Value::Json(text)),
+        OID_TIMESTAMP_TZ => Ok(Value::Timestamp(text)),
         _ => Ok(Value::Text(text)),
     }
 }
@@ -622,7 +626,7 @@ fn encode_param(value: &Value) -> Result<(u32, Option<Vec<u8>>), Error> {
                     "PostgreSQL text cannot contain NUL".into(),
                 ));
             }
-            Ok((OID_TEXT, Some(s.as_bytes().to_vec())))
+            Ok((0, Some(s.as_bytes().to_vec())))
         }
         Value::Blob(bytes) => {
             let mut hex = Vec::with_capacity(bytes.len() * 2 + 2);
@@ -635,6 +639,22 @@ fn encode_param(value: &Value) -> Result<(u32, Option<Vec<u8>>), Error> {
         }
         Value::Boolean(true) => Ok((OID_BOOL, Some(b"TRUE".to_vec()))),
         Value::Boolean(false) => Ok((OID_BOOL, Some(b"FALSE".to_vec()))),
+        Value::Json(s) => {
+            if s.contains('\0') {
+                return Err(Error::InvalidParams(
+                    "PostgreSQL json cannot contain NUL".into(),
+                ));
+            }
+            Ok((OID_JSON, Some(s.as_bytes().to_vec())))
+        }
+        Value::Timestamp(s) => {
+            if s.contains('\0') {
+                return Err(Error::InvalidParams(
+                    "PostgreSQL timestamp cannot contain NUL".into(),
+                ));
+            }
+            Ok((OID_TIMESTAMP_TZ, Some(s.as_bytes().to_vec())))
+        }
     }
 }
 
@@ -702,6 +722,27 @@ mod tests {
     }
 
     #[test]
+    fn param_encoding_text_uses_oid_zero() {
+        let (oid, bytes) = encode_param(&Value::Text("hello".to_string()))
+            .expect("encode text");
+        assert_eq!(oid, 0, "text parameters should use OID 0 (unknown)");
+        assert_eq!(bytes, Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn param_encoding_json_and_timestamp() {
+        let (oid, bytes) = encode_param(&Value::Json(r#"{"key":"value"}"#.to_string()))
+            .expect("encode json");
+        assert_eq!(oid, OID_JSON);
+        assert_eq!(bytes, Some(r#"{"key":"value"}"#.as_bytes().to_vec()));
+
+        let (oid, bytes) = encode_param(&Value::Timestamp("2024-01-01T12:00:00Z".to_string()))
+            .expect("encode timestamp");
+        assert_eq!(oid, OID_TIMESTAMP_TZ);
+        assert_eq!(bytes, Some("2024-01-01T12:00:00Z".as_bytes().to_vec()));
+    }
+
+    #[test]
     fn cell_decoding_by_oid() {
         assert!(matches!(
             decode_cell(OID_BOOL, Some("t".to_string())),
@@ -727,6 +768,14 @@ mod tests {
         assert!(matches!(
             decode_cell(OID_BYTEA, Some("\\x0102".to_string())),
             Ok(Value::Blob(_))
+        ));
+        assert!(matches!(
+            decode_cell(OID_JSON, Some(r#"{"key":"value"}"#.to_string())),
+            Ok(Value::Json(_))
+        ));
+        assert!(matches!(
+            decode_cell(OID_TIMESTAMP_TZ, Some("2024-01-01T12:00:00Z".to_string())),
+            Ok(Value::Timestamp(_))
         ));
         assert!(matches!(
             decode_cell(OID_BOOL, Some("maybe".to_string())),

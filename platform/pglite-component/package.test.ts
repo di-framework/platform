@@ -27,8 +27,8 @@ describe('pglite-component package', () => {
 
   test.skipIf(!built)('built WIT exports the database interface', () => {
     const wit = readFileSync(join(dist, 'di-framework-pglite.wit'), 'utf8');
-    expect(wit).toContain('export di-framework:pglite/database@0.1.0');
-    expect(wit).toContain('export di-framework:pglite/types@0.1.0');
+    expect(wit).toContain('export di-framework:pglite/database@0.2.0');
+    expect(wit).toContain('export di-framework:pglite/types@0.2.0');
     expect(wit).toContain('import wasi:filesystem/preopens@');
     expect(wit).not.toContain('import wasi:sockets/');
     expect(wit).not.toContain('import di-framework:pglite-engine/');
@@ -37,7 +37,7 @@ describe('pglite-component package', () => {
   // Source-only: mirrors `sqlite-component` and always runs, even without a build.
   test('source WIT declares the database package', () => {
     const source = readFileSync(join(pkgDir, 'wit', 'world.wit'), 'utf8');
-    expect(source).toContain('package di-framework:pglite@0.1.0');
+    expect(source).toContain('package di-framework:pglite@0.2.0');
     expect(source).toContain('world pglite-provider');
   });
 

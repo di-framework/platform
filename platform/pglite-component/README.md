@@ -48,11 +48,11 @@ uncommitted row is absent after restart. No scripted database server is used.
 
 ## Use from an application
 
-The application imports `di-framework:pglite/database@0.1.0`. For a JavaScript
+The application imports `di-framework:pglite/database@0.2.0`. For a JavaScript
 component built with the framework's component toolchain:
 
 ```ts
-import { open } from 'di-framework:pglite/database@0.1.0';
+import { open } from 'di-framework:pglite/database@0.2.0';
 
 const db = open('/data/orders', undefined);
 try {
@@ -84,13 +84,31 @@ standardized WebAssembly exception handling for PostgreSQL error recovery.
 
 The public interface retains `exec`, `run`, `query`, `first`, transactions,
 savepoints, `rows-affected`, `close`, and `server-version`. PostgreSQL parameters
-use `$1`, `$2`, etc. `server-version()` reports the bundled engine without
+use `$1`, `$2`, etc. Text parameters are sent with OID 0 (unknown type), allowing
+PostgreSQL to infer the type from context; comparisons against `uuid`, `timestamptz`,
+and `jsonb` columns work correctly. `server-version()` reports the bundled engine without
 opening a database. Only the `template1` database is currently supported;
 other `open-options.database` values are rejected. Requests must fit the engine's
 input buffer; each serialized result is limited to 64 MiB and stays in memory.
 Larger results return a PostgreSQL program-limit error. Signal-based statement
 timeouts are unavailable in this WASI engine: nonzero `statement-timeout-ms`
 options fail explicitly. Use host execution limits for runaway queries.
+
+## Typed values (0.2.0+)
+
+Results include typed values for PostgreSQL-specific types:
+- `integer`, `real`, `boolean`, `text`, `blob` for standard SQL types
+- `json` for `jsonb` and `json` columns, returned as a JSON string
+- `timestamp` for `timestamp with time zone` columns, returned in ISO 8601 format
+
+Parameters accept the same value types. Text parameters are sent with OID 0
+(unknown), allowing PostgreSQL to infer the type from context or cast explicitly.
+
+Error handling surfaces SQLSTATE codes through `error.code`, enabling
+machine-readable handling of constraint violations and other conditions:
+- `"23505"` = unique violation
+- `"22012"` = division by zero
+- `"54000"` = result too large
 
 ## Persistence and ownership
 
