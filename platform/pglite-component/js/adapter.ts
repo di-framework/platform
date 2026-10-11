@@ -399,6 +399,8 @@ interface TransactionScope {
   readonly parent?: TransactionScope;
   readonly children: AsyncMutex;
   readonly lease: SqlLease;
+  /** Runs directly while the lease is active, else defers to the parent scope's guard. */
+  readonly guard: SqlGuard;
 }
 
 function descendsFrom(scope: TransactionScope, ancestor: TransactionScope): boolean {
@@ -526,20 +528,30 @@ export function createSqlDatabaseFromWasmPgliteConnection(
   };
 
   // A view runs directly while its scope is open, from any async context: the
-  // scope's lease is cleared before the mutex is released. Once the scope has
-  // ended, the view takes the mutex like the outer handle.
+  // scope's lease is cleared before the mutex is released. Once a savepoint has
+  // ended, its view falls back to the parent scope, which is still open and
+  // may be awaiting the caller; taking the root mutex there would deadlock. A
+  // root view, whose transaction holds that mutex, takes it like the outer handle.
   const createScope = (
     parent?: TransactionScope,
     lease: SqlLease = { active: true },
   ): TransactionScope => {
+    const guard = leaseGuard(lease, parent ? parent.guard : locked);
     const scope: TransactionScope = {
       parent,
       children: new AsyncMutex(),
       lease,
+      guard,
       view: {
-        ...statementsVia(leaseGuard(lease, locked)),
-        // A view kept past its scope opens a fresh transaction instead.
-        transaction: (fn) => (lease.active ? nest(scope, fn) : database.transaction(fn)),
+        ...statementsVia(guard),
+        // A view kept past its scope opens its transaction on the parent scope
+        // (or, for a root view, a fresh transaction).
+        transaction: (fn) =>
+          lease.active
+            ? nest(scope, fn)
+            : parent
+              ? parent.view.transaction(fn)
+              : database.transaction(fn),
       } as SqlDatabase,
     };
     return scope;
@@ -550,19 +562,18 @@ export function createSqlDatabaseFromWasmPgliteConnection(
     transaction: async <T>(fn: (db: SqlDatabase) => Promise<T>): Promise<T> => {
       const current = liveScope();
       if (current) return nest(current, fn);
-      const root = (lease?: SqlLease) =>
-        enter(
-          createScope(undefined, lease),
-          fn,
-          () => connection.begin(),
-          () => connection.commit(),
-          () => connection.rollback(),
-        );
-      if (held.getStore()?.active) return root();
       return mutex.run(() => {
         // The root scope's lease doubles as the outer handle's join lease.
         const lease: SqlLease = { active: true };
-        return held.run(lease, () => root(lease));
+        return held.run(lease, () =>
+          enter(
+            createScope(undefined, lease),
+            fn,
+            () => connection.begin(),
+            () => connection.commit(),
+            () => connection.rollback(),
+          ),
+        );
       });
     },
     close: () => locked(() => invoke(() => connection.close())),

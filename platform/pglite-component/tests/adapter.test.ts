@@ -672,26 +672,171 @@ describe('pglite SqlDatabase adapter', () => {
     ]);
   });
 
+  /** `connection` with `op` (a promise-returning binding) that takes `ms` before it runs. */
+  const slowing = <K extends 'commit' | 'rollback' | 'releaseSavepoint'>(
+    connection: WasmPgliteConnection,
+    op: K,
+    ms = 15,
+  ): WasmPgliteConnection => ({
+    ...connection,
+    [op]: ((...args: unknown[]) =>
+      (async () => {
+        await tick(ms);
+        return (connection[op] as (...a: unknown[]) => unknown)(...args);
+      })()) as WasmPgliteConnection[K],
+  });
+  /** Resolves with a promise that `fn` settles later; lets a test await work `fn` starts. */
+  const deferred = <T>() => {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  };
+
   test('a view statement issued while COMMIT is in flight runs after the transaction, in lock order', async () => {
     const { connection, log } = fakeConnection();
-    const slowCommit: WasmPgliteConnection = {
-      ...connection,
-      commit: (() =>
-        (async () => {
-          await tick(15);
-          return connection.commit();
-        })()) as WasmPgliteConnection['commit'],
-    };
-    const db = createSqlDatabaseFromWasmPgliteConnection(slowCommit);
-    let late!: Promise<unknown>;
+    const db = createSqlDatabaseFromWasmPgliteConnection(slowing(connection, 'commit'));
+    const started = deferred<Promise<unknown>>();
     const done = db.transaction(async (tx) => {
       // Unawaited: fires while COMMIT is on the wire.
-      late = tick(5).then(() => tx.run('LATE ?', [1]));
+      started.resolve(tick(5).then(() => tx.run('LATE ?', [1])));
     });
     // Queued on the mutex before LATE is issued, so it must run first.
     const outer = db.run('OUTER ?', [1]);
+    const late = await started.promise;
     await Promise.all([done, late, outer]);
     expect(log).toEqual(['BEGIN', 'COMMIT', 'run OUTER $1', 'run LATE $1']);
+  });
+
+  test('an outer-handle statement from the transaction context during COMMIT runs after it, in lock order', async () => {
+    const { connection, log } = fakeConnection();
+    const db = createSqlDatabaseFromWasmPgliteConnection(slowing(connection, 'commit'));
+    const started = deferred<Promise<unknown>>();
+    const done = db.transaction(async () => {
+      // The timer continuation inherits the transaction's async context.
+      started.resolve(tick(5).then(() => db.run('LATE OUTER ?', [1])));
+    });
+    const waiting = db.run('WAITING ?', [1]);
+    const late = await started.promise;
+    await Promise.all([done, late, waiting]);
+    expect(log).toEqual(['BEGIN', 'COMMIT', 'run WAITING $1', 'run LATE OUTER $1']);
+  });
+
+  test('a statement issued while ROLLBACK is in flight runs after it, in lock order', async () => {
+    for (const via of ['view', 'outer'] as const) {
+      const { connection, log } = fakeConnection();
+      const db = createSqlDatabaseFromWasmPgliteConnection(slowing(connection, 'rollback'));
+      const started = deferred<Promise<unknown>>();
+      const done = db.transaction(async (tx) => {
+        started.resolve(tick(5).then(() => (via === 'view' ? tx : db).run('LATE ?', [1])));
+        throw new Error('fail');
+      });
+      const waiting = db.run('WAITING ?', [1]);
+      const late = await started.promise;
+      await expect(done).rejects.toThrow('fail');
+      await Promise.all([late, waiting]);
+      expect(log).toEqual(['BEGIN', 'ROLLBACK', 'run WAITING $1', 'run LATE $1']);
+    }
+  });
+
+  test('a savepoint view retained by an earlier worker, used while RELEASE is in flight, joins the open parent', async () => {
+    const { connection, log } = fakeConnection();
+    // Promise-returning bindings, as componentized hosts provide.
+    const asyncConnection = slowing(
+      {
+        ...connection,
+        run: ((...args: Parameters<WasmPgliteConnection['run']>) =>
+          Promise.resolve(connection.run(...args))) as WasmPgliteConnection['run'],
+      },
+      'releaseSavepoint',
+    );
+    const db = createSqlDatabaseFromWasmPgliteConnection(asyncConnection);
+    const worker = startWorker();
+    const result = await withTimeout(
+      db.transaction(async (tx) => {
+        let late!: Promise<void>;
+        await tx.transaction(async (savepoint) => {
+          // Runs in the worker's context, after the savepoint callback returned.
+          late = worker.run(async () => {
+            await tick(5);
+            await savepoint.run('LATE ?', [1]);
+          });
+        });
+        // The root callback waits on the worker; the mutex is held until it returns.
+        await late;
+        return 'ok';
+      }),
+    );
+    await worker.stop();
+    expect(result).toBe('ok');
+    expect(log).toEqual(['BEGIN', 'SAVEPOINT di_sp_1', 'RELEASE di_sp_1', 'run LATE $1', 'COMMIT']);
+  });
+
+  test('a transaction opened on a closed savepoint view, awaited by the root callback, nests on the parent', async () => {
+    const { connection, log } = fakeConnection();
+    const db = createSqlDatabaseFromWasmPgliteConnection(slowing(connection, 'releaseSavepoint'));
+    const worker = startWorker();
+    const result = await withTimeout(
+      db.transaction(async (tx) => {
+        let late!: Promise<void>;
+        await tx.transaction(async (savepoint) => {
+          late = worker.run(async () => {
+            await tick(5);
+            await savepoint.transaction(async (inner) => {
+              await inner.run('LATE ?', [1]);
+            });
+          });
+        });
+        await late;
+        return 'ok';
+      }),
+    );
+    await worker.stop();
+    expect(result).toBe('ok');
+    expect(log).toEqual([
+      'BEGIN',
+      'SAVEPOINT di_sp_1',
+      'RELEASE di_sp_1',
+      'SAVEPOINT di_sp_2',
+      'run LATE $1',
+      'RELEASE di_sp_2',
+      'COMMIT',
+    ]);
+  });
+
+  test('a transaction requested from the context of BEGIN waits for the open transaction', async () => {
+    const { connection, log } = fakeConnection();
+    const reentrant = deferred<Promise<unknown>>();
+    let db!: SqlDatabase;
+    const withBegin: WasmPgliteConnection = {
+      ...connection,
+      begin: () => {
+        // Runs in the root transaction's async context, before its callback.
+        if (log.length === 0) {
+          reentrant.resolve(db.transaction(async (inner) => inner.run('REENTRANT ?', [1])));
+        }
+        return connection.begin();
+      },
+    };
+    db = createSqlDatabaseFromWasmPgliteConnection(withBegin);
+    await withTimeout(
+      db.transaction(async (tx) => {
+        await tx.run('OUTER ?', [1]);
+        await tick(5);
+        await tx.run('OUTER 2 ?', [1]);
+      }),
+    );
+    await withTimeout(reentrant.promise);
+    expect(log).toEqual([
+      'BEGIN',
+      'run OUTER $1',
+      'run OUTER 2 $1',
+      'COMMIT',
+      'BEGIN',
+      'run REENTRANT $1',
+      'COMMIT',
+    ]);
   });
 
   test('statements issued together inside a transaction reach an async binding one at a time', async () => {
