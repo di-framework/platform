@@ -4,6 +4,23 @@ name: Publish tenant-auth image
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'platform/tenant-auth/**'
+      - 'platform/tenant-cli/**'
+      - 'platform/oci-registry/**'
+      - 'platform/wasm-component-publisher/**'
+      - 'platform/pglite-component/build-support/**'
+      - 'platform/sqlite-component/scripts/**'
+      - 'platform/platform/src/tenancy/**'
+      - 'package.json'
+      - 'bun.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - '.github/actions/setup-tenant-auth-builder/**'
+      - '.github/workflows/tenant-auth-image.yml'
 
 permissions:
   contents: read

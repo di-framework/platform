@@ -31,8 +31,10 @@ test('the entry points bundle for Bun', async () => {
   expect(result.outputs).toHaveLength(2);
 });
 
-test('the publish workflow is dispatch-only and uses the Rust builder with smoke checks', () => {
-  expect(workflow).toMatch(/on:\s+workflow_dispatch:\s+permissions:/);
+test('the publish workflow triggers on both dispatch and push, and uses the Rust builder with smoke checks', () => {
+  expect(workflow).toContain('workflow_dispatch:');
+  expect(workflow).toContain('push:');
+  expect(workflow).toContain('branches: [main]');
   expect(workflow).toContain('uses: ./.github/actions/setup-tenant-auth-builder');
   expect(workflow).toContain('cargo build -p tenant-auth-image --locked');
   expect(workflow).toContain('./target/debug/tenant-auth-image');

@@ -1,5 +1,5 @@
 # Publish the tenant host image: wash 2.8.0 with wasi-tls.
-# Dispatch-only, matching the npm Release workflow.
+# On workflow_dispatch, builds the selected variant. On push to main, builds both variants.
 #
 # Two variants, chosen by the `variant` input. Each has its own tag and its own cache, so a patched
 # build can never move the canonical tag (#136):
@@ -32,6 +32,11 @@ on:
           - wasi-tls
           - wasi-tls-exclusive
         default: wasi-tls
+  push:
+    branches: [main]
+    paths:
+      - 'platform/tenant-host/**'
+      - '.github/workflows/tenant-host-image.yml'
 
 permissions:
   contents: read
@@ -45,38 +50,37 @@ concurrency:
 
 jobs:
   variant:
-    name: Resolve variant
+    name: Resolve variants
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      tag: ${{ steps.resolve.outputs.tag }}
-      patches: ${{ steps.resolve.outputs.patches }}
+      variants: ${{ steps.resolve.outputs.variants }}
     steps:
-      - name: Resolve tag and patches
+      - name: Resolve variants for this trigger
         id: resolve
         env:
           VARIANT: ${{ inputs.variant }}
+          TRIGGER: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          case "${VARIANT}" in
-            wasi-tls) patches='' ;;
-            wasi-tls-exclusive) patches='0001-exclusive-instance.patch' ;;
-            *)
-              echo "::error::unknown variant '${VARIANT}'"
-              exit 1
-              ;;
-          esac
-          echo "tag=2.8.0-${VARIANT}" >> "${GITHUB_OUTPUT}"
-          echo "patches=${patches}" >> "${GITHUB_OUTPUT}"
+          if [[ "${TRIGGER}" == "workflow_dispatch" ]]; then
+            # On dispatch, use the selected variant
+            variants="[{\"name\":\"${VARIANT}\"}]"
+          else
+            # On push to main, build both variants
+            variants='[{"name":"wasi-tls"},{"name":"wasi-tls-exclusive"}]'
+          fi
+          echo "variants=${variants}" >> "${GITHUB_OUTPUT}"
 
   build:
-    name: Build ${{ matrix.platform }}
+    name: Build ${{ matrix.variant.name }} on ${{ matrix.platform }}
     needs: variant
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
+        variant: ${{ fromJson(needs.variant.outputs.variants) }}
         include:
           - platform: linux/amd64
             runner: ubuntu-24.04
@@ -92,6 +96,23 @@ jobs:
             echo "::error::This workflow publishes ghcr.io/di-framework/wash and only runs in di-framework/platform"
             exit 1
           fi
+
+      - name: Resolve tag and patches
+        id: variant
+        env:
+          VARIANT: ${{ matrix.variant.name }}
+        run: |
+          set -euo pipefail
+          case "${VARIANT}" in
+            wasi-tls) patches='' ;;
+            wasi-tls-exclusive) patches='0001-exclusive-instance.patch' ;;
+            *)
+              echo "::error::unknown variant '${VARIANT}'"
+              exit 1
+              ;;
+          esac
+          echo "tag=2.8.0-${VARIANT}" >> "${GITHUB_OUTPUT}"
+          echo "patches=${patches}" >> "${GITHUB_OUTPUT}"
 
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -114,13 +135,13 @@ jobs:
           platforms: ${{ matrix.platform }}
           provenance: true
           build-args: |
-            WASH_PATCHES=${{ needs.variant.outputs.patches }}
-            IMAGE_VERSION=${{ needs.variant.outputs.tag }}
+            WASH_PATCHES=${{ steps.variant.outputs.patches }}
+            IMAGE_VERSION=${{ steps.variant.outputs.tag }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
           outputs: type=image,name=ghcr.io/di-framework/wash,push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=registry,ref=ghcr.io/di-framework/wash:buildcache-${{ needs.variant.outputs.tag }}-${{ matrix.arch }}
-          cache-to: type=registry,ref=ghcr.io/di-framework/wash:buildcache-${{ needs.variant.outputs.tag }}-${{ matrix.arch }},mode=max,oci-mediatypes=true,image-manifest=true
+          cache-from: type=registry,ref=ghcr.io/di-framework/wash:buildcache-${{ steps.variant.outputs.tag }}-${{ matrix.arch }}
+          cache-to: type=registry,ref=ghcr.io/di-framework/wash:buildcache-${{ steps.variant.outputs.tag }}-${{ matrix.arch }},mode=max,oci-mediatypes=true,image-manifest=true
 
       - name: Export digest
         run: |
@@ -136,16 +157,20 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wash-digest-${{ needs.variant.outputs.tag }}-${{ strategy.job-index }}
+          name: wash-digest-${{ steps.variant.outputs.tag }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests
           if-no-files-found: error
           retention-days: 1
 
   merge:
-    name: Push ghcr.io/di-framework/wash tag
+    name: Push tenant host image tags
     needs: [variant, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJson(needs.variant.outputs.variants) }}
     steps:
       - name: Require di-framework/platform
         run: |
@@ -155,10 +180,27 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve tag and patches
+        id: variant
+        env:
+          VARIANT: ${{ matrix.variant.name }}
+        run: |
+          set -euo pipefail
+          case "${VARIANT}" in
+            wasi-tls) patches='' ;;
+            wasi-tls-exclusive) patches='0001-exclusive-instance.patch' ;;
+            *)
+              echo "::error::unknown variant '${VARIANT}'"
+              exit 1
+              ;;
+          esac
+          echo "tag=2.8.0-${VARIANT}" >> "${GITHUB_OUTPUT}"
+          echo "patches=${patches}" >> "${GITHUB_OUTPUT}"
+
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: wash-digest-${{ needs.variant.outputs.tag }}-*
+          pattern: wash-digest-${{ steps.variant.outputs.tag }}-*
           path: ${{ runner.temp }}/digests
           merge-multiple: true
 
@@ -175,7 +217,7 @@ jobs:
       - name: Create and push manifest
         working-directory: ${{ runner.temp }}/digests
         env:
-          TAG: ${{ needs.variant.outputs.tag }}
+          TAG: ${{ steps.variant.outputs.tag }}
         run: |
           set -euo pipefail
           mapfile -t files < <(find . -type f | sort)
@@ -203,8 +245,8 @@ jobs:
 
       - name: Record image digest
         env:
-          TAG: ${{ needs.variant.outputs.tag }}
-          PATCHES: ${{ needs.variant.outputs.patches }}
+          TAG: ${{ steps.variant.outputs.tag }}
+          PATCHES: ${{ steps.variant.outputs.patches }}
         run: |
           set -euo pipefail
           digest="$(jq -er '.["containerimage.descriptor"].digest' "${RUNNER_TEMP}/wash-index.json")"
@@ -216,7 +258,7 @@ jobs:
           ref="ghcr.io/di-framework/wash:${TAG}@${digest}"
           echo "Published ${ref}"
           {
-            echo "### Tenant host image"
+            echo "### Tenant host image (${PATCHES:-wasi-tls})"
             echo
             echo '```'
             echo "${ref}"

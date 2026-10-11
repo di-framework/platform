@@ -3,6 +3,12 @@ name: Publish oci-registry component
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'platform/oci-registry/**'
+      - 'platform/wasm-component-publisher/**'
+      - '.github/workflows/oci-registry-component.yml'
 
 permissions:
   contents: read
@@ -13,9 +19,55 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  check-source:
+    name: Check if source already published
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      source-hash: ${{ steps.hash.outputs.source-hash }}
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compute source hash
+        id: hash
+        run: |
+          set -euo pipefail
+          hash=$(git ls-tree -r HEAD -- \
+            platform/oci-registry \
+            platform/wasm-component-publisher | sha256sum | cut -d' ' -f1)
+          echo "source-hash=${hash}" >> "${GITHUB_OUTPUT}"
+          echo "Source hash: ${hash}"
+
+      - name: Check if already published
+        id: check
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          hash="${{ steps.hash.outputs.source-hash }}"
+          tag="src-${hash}"
+          if echo "${GHCR_TOKEN}" | oras login ghcr.io --username "${{ github.actor }}" --password-stdin 2>&1; then
+            if oras manifest fetch "ghcr.io/di-framework/oci-registry:${tag}" >/dev/null 2>&1; then
+              echo "Source hash tag already exists: ${tag}"
+              echo "skip=true" >> "${GITHUB_OUTPUT}"
+            else
+              echo "skip=false" >> "${GITHUB_OUTPUT}"
+            fi
+          else
+            echo "Could not login to GHCR, will proceed with build"
+            echo "skip=false" >> "${GITHUB_OUTPUT}"
+          fi
+
   publish:
     name: Push ghcr.io/di-framework/oci-registry
-    if: github.ref == 'refs/heads/main'
+    needs: check-source
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || needs.check-source.outputs.skip != 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -68,12 +120,14 @@ jobs:
         run: target/debug/oci-registry-publisher
 
       - name: Record component digest
+        id: digest
         run: |
           set -euo pipefail
           report=platform/oci-registry/dist/publish-report.json
           digest="$(jq -er '.manifestDigest | select(test("^sha256:[0-9a-f]{64}$"))' "$report")"
           ref="ghcr.io/di-framework/oci-registry@${digest}"
           printf 'Published %s\n' "$ref"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
           {
             echo '### Tenant OCI registry component'
             echo
@@ -81,6 +135,29 @@ jobs:
             echo
             echo 'The component was pulled by digest and verified against the local build.'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install oras
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          version=1.3.4
+          sha256=f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454
+          curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/oras.tar.gz "https://github.com/oras-project/oras/releases/download/v${version}/oras_${version}_linux_amd64.tar.gz"
+          echo "${sha256}  /tmp/oras.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/oras.tar.gz -C /usr/local/bin oras
+
+      - name: Tag with source hash
+        if: github.event_name == 'push'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_HASH: ${{ needs.check-source.outputs.source-hash }}
+        run: |
+          set -euo pipefail
+          echo "${GHCR_TOKEN}" | oras login ghcr.io --username "${{ github.actor }}" --password-stdin
+          digest="${{ steps.digest.outputs.digest }}"
+          tag="src-${SOURCE_HASH}"
+          oras tag "ghcr.io/di-framework/oci-registry@${digest}" "${tag}"
+          echo "Tagged with: ${tag}"
 
       - name: Upload publish report
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
