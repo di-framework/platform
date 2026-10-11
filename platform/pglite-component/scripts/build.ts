@@ -6,6 +6,7 @@ import { type Args, type Context, logger, parseFlags, run } from './lib/cli.ts';
 import { sha256File } from './lib/fetch.ts';
 import { fileExists, isDirectory } from './lib/fs.ts';
 import { requiredPin } from './lib/versions.ts';
+import { databaseInterface, readWitVersion } from './lib/wit-version.ts';
 import { prepareEngine } from './prepare-engine.ts';
 
 const log = logger('build');
@@ -100,10 +101,10 @@ export async function buildComponent(ctx: Context, options: BuildOptions): Promi
   const wit = await $`wasm-tools component wit ${wasmOut}`.text();
   await Bun.write(join(dist, 'di-framework-pglite.wit'), wit);
 
-  if (!wit.includes('export di-framework:pglite/database@0.1.0')) {
-    throw new Error(
-      'component does not export di-framework:pglite/database@0.1.0 (see dist/di-framework-pglite.wit)',
-    );
+  const witVersion = await readWitVersion(pkgDir);
+  const database = databaseInterface(witVersion);
+  if (!wit.includes(`export ${database}`)) {
+    throw new Error(`component does not export ${database} (see dist/di-framework-pglite.wit)`);
   }
   if (/(^|\s)import (wasi:sockets|di-framework:pglite-engine)/m.test(wit)) {
     throw new Error('unexpected socket or unresolved engine import in bundled provider');
@@ -121,7 +122,7 @@ export async function buildComponent(ctx: Context, options: BuildOptions): Promi
   await Bun.write(
     join(dist, 'BUILD-INFO.txt'),
     [
-      'component:       di-framework:pglite@0.1.0',
+      `component:       di-framework:pglite@${witVersion}`,
       `profile:         ${profile}`,
       `built:           ${built}`,
       `rustc:           ${rustcVersion}`,

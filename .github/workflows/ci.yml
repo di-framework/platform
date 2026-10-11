@@ -44,6 +44,14 @@ jobs:
       - name: Build embedded PGlite component
         run: make -C platform/pglite-component tools-rust build
 
+      - name: Install wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1
+        with:
+          version: 'v48.0.1'
+
+      - name: Test embedded PGlite component against the real engine
+        run: make -C platform/pglite-component unit smoke
+
       - name: Build and test tenant OCI registry component
         run: make -C platform/oci-registry test lint build
 
