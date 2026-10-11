@@ -21,6 +21,9 @@ ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 RUN GIT_TERMINAL_PROMPT=0 git clone --depth 1 --quiet --branch "${WASMCLOUD_TAG}" https://github.com/wasmCloud/wasmCloud /src \
   && test "$(git -C /src rev-parse HEAD)" = "${WASMCLOUD_COMMIT}"
 WORKDIR /src
+# Apply the exclusive pool policy patch for pglite (#136).
+COPY 0001-exclusive-pool-policy.patch .
+RUN git apply 0001-exclusive-pool-policy.patch
 # `wasi-tls` is defined by crates/wash (forwarding to wash-runtime/wasi-tls) and is added on top of the
 # default features, exactly like upstream's CARGO_FEATURES build argument.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

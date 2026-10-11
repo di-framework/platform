@@ -12,7 +12,8 @@ links `wasi:tls/client,types@0.3.0-draft` alongside the default interfaces.
 ## What is built
 
 - Source: `git clone --branch v2.8.0` in its own layer, then the build fails unless `HEAD` is the pinned commit. `GIT_TERMINAL_PROMPT=0` keeps a credential prompt from hanging CI.
-- Limitation: no patches are applied, so the host runs upstream wash 2.8.0 postgres behaviour. Connections are not pinned per invocation, and `BEGIN` ... `COMMIT` across separate queries is not guaranteed to use one connection, for named and unnamed imports alike. Guests should use autocommit or a single batched statement, as the identity guest does (issue #39).
+- Patches: an exclusive queueing pool policy (`0001-exclusive-pool-policy.patch`) is applied to support components that require mutual exclusion, such as pglite, which must never have overlapping instances. The patch adds an opt-in `exclusive` flag to the `Warm` instance policy: when set, a component's single warm instance queues calls instead of spawning one-shot stores on saturation, and draining instances are fully released before their replacements start.
+- Limitation: the host still runs upstream wash 2.8.0 postgres behavior for non-exclusive workloads. Connections are not pinned per invocation, and `BEGIN` ... `COMMIT` across separate queries is not guaranteed to use one connection, for named and unnamed imports alike. Guests should use autocommit or a single batched statement, as the identity guest does (issue #39).
 - Feature: `wasi-tls` is declared by the `wash` crate (`wasi-tls = ["wash-runtime/wasi-tls"]`), which
   enables `wasmtime-wasi-tls` (p3, rustls) in `wash-runtime`. Default features (`wasi-webgpu`,
   `wasm_component_model_implements`) stay on, matching upstream's `CARGO_FEATURES` build argument.
