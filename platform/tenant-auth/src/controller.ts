@@ -750,9 +750,17 @@ export class Controller {
       clearTimeout(timer);
     }
     const out = new Headers();
+    const dockerContentLength = upstream.headers.get('docker-content-length');
     upstream.headers.forEach((value, name) => {
-      if (!HOP_BY_HOP_RESPONSE.has(name)) out.append(name, value);
+      if (!HOP_BY_HOP_RESPONSE.has(name) && name !== 'docker-content-length') {
+        out.append(name, value);
+      }
     });
+    // For HEAD responses, set Content-Length from the docker-content-length side header
+    // if present, since wash runtime rejects a declared length with an empty body.
+    if (request.method === 'HEAD' && dockerContentLength) {
+      out.set('content-length', dockerContentLength);
+    }
     return new Response(releasing(upstream.body, release), {
       status: upstream.status,
       headers: out,

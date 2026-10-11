@@ -39,6 +39,22 @@ describe('registry listeners', () => {
         status: 401,
         headers: { 'www-authenticate': 'Basic realm="di-framework-tenant-registry"' },
       });
+    // For HEAD requests on manifest and blob endpoints, return docker-content-length
+    // instead of Content-Length (simulating the registry component behavior where
+    // wash runtime rejects a declared length with an empty body).
+    if (
+      request.method === 'HEAD' &&
+      (request.path.includes('/manifests/') || request.path.includes('/blobs/'))
+    ) {
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'docker-content-digest': 'sha256:abc123',
+          'docker-content-length': '5678',
+        },
+      });
+    }
     return new Response(`echo ${request.method} ${request.path} ${request.body}`, {
       status: 202,
       headers: { location: '/v2/app/blobs/uploads/1', 'docker-upload-uuid': '1' },
@@ -148,6 +164,25 @@ describe('registry listeners', () => {
     expect(response.headers.get('www-authenticate')).toBe(
       'Basic realm="di-framework-tenant-registry"',
     );
+  });
+
+  test('HEAD responses convert docker-content-length to Content-Length and strip the side header', async () => {
+    const response = await controller.handleRegistry(
+      new Request('https://registry.acme.localhost/v2/app/blobs/sha256:abc123', {
+        method: 'HEAD',
+        headers: { authorization: 'Basic eDpvaw==' },
+      }),
+    );
+    expect(response.status).toBe(200);
+    // Content-Length should be set from docker-content-length
+    expect(response.headers.get('content-length')).toBe('5678');
+    // docker-content-length should be stripped (not sent to client)
+    expect(response.headers.get('docker-content-length')).toBeNull();
+    // Other headers should be preserved
+    expect(response.headers.get('docker-content-digest')).toBe('sha256:abc123');
+    expect(response.headers.get('content-type')).toBe('application/json');
+    // HEAD response has no body
+    expect(await response.text()).toBe('');
   });
 
   test('the registry front answers requests without Basic credentials with the registry challenge (S5)', async () => {

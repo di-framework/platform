@@ -79,17 +79,21 @@ pub(crate) async fn handle_manifest(
                 .and_then(|b| String::from_utf8(b).ok())
                 .unwrap_or_else(|| DEFAULT_MANIFEST_MEDIA_TYPE.to_string());
 
+            let len = data.len().to_string();
             if matches!(method, Method::Head) {
+                // HEAD carries no body, so Content-Length cannot be set directly (wash runtime
+                // rejects a declared length with an empty body). Instead, use a side header
+                // (docker-content-length) that the HTTP front can use to set Content-Length.
                 return Ok(respond_owned(
                     200,
                     vec![
                         ("content-type".to_string(), media_type),
                         ("docker-content-digest".to_string(), digest),
+                        ("docker-content-length".to_string(), len),
                     ],
                     Vec::new(),
                 ));
             }
-            let len = data.len().to_string();
             Ok(respond_owned(
                 200,
                 vec![

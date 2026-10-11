@@ -43,9 +43,25 @@ describe('host pull', () => {
       {} as never,
     );
   const controller = make();
-  const hosts = serve(
-    (request) => new Response(`pulled ${request.method} ${request.path}`, { status: 200 }),
-  );
+  const hosts = serve((request) => {
+    // For HEAD requests on manifest and blob endpoints, return docker-content-length
+    // instead of Content-Length (simulating the registry component behavior where
+    // wash runtime rejects a declared length with an empty body).
+    if (
+      request.method === 'HEAD' &&
+      (request.path.includes('/manifests/') || request.path.includes('/blobs/'))
+    ) {
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'docker-content-digest': 'sha256:abc123',
+          'docker-content-length': '1234',
+        },
+      });
+    }
+    return new Response(`pulled ${request.method} ${request.path}`, { status: 200 });
+  });
   controller.proxyUpstream = () => hosts.url;
   let log: ReturnType<typeof spyOn>;
   beforeAll(() => {
@@ -170,6 +186,25 @@ describe('host pull', () => {
         )
       ).text(),
     ).toBe('pulled GET /v2/app/manifests/1.0');
+  });
+
+  test('HEAD responses convert docker-content-length to Content-Length and strip the side header', async () => {
+    const response = await controller.handleRegistryPull(
+      new Request('https://tenant-registry.di-runtime-acme.svc/v2/app/manifests/sha256:abc123', {
+        method: 'HEAD',
+        headers: { authorization: `Basic ${btoa(`tenant-host:${TOKEN}`)}` },
+      }),
+    );
+    expect(response.status).toBe(200);
+    // Content-Length should be set from docker-content-length
+    expect(response.headers.get('content-length')).toBe('1234');
+    // docker-content-length should be stripped (not sent to client)
+    expect(response.headers.get('docker-content-length')).toBeNull();
+    // Other headers should be preserved
+    expect(response.headers.get('docker-content-digest')).toBe('sha256:abc123');
+    expect(response.headers.get('content-type')).toBe('application/json');
+    // HEAD response has no body
+    expect(await response.text()).toBe('');
   });
 
   const front = (target: Controller, authorization: string, init: RequestInit = {}) =>
