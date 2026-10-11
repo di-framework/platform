@@ -30,11 +30,15 @@
     },
     "./package.json": "./package.json"
   },
+  "engines": {
+    "node": ">=22.19"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "test": "bun test"
   },
   "dependencies": {
+    "@kubernetes/client-node": "2.0.0",
     "@pulumi/command": "1.2.1",
     "@pulumi/kubernetes": "4.34.0",
     "@pulumi/pulumi": "3.261.0",

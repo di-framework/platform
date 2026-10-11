@@ -23,6 +23,8 @@ import {
   tenantAuthRoutes,
   userTokenSecretName,
 } from './tenancy/resources';
+import { secretReaderFromKubeconfig } from './token-secret-reader';
+import { waitForTokenSecret } from './token-wait';
 import { platformValues } from './values';
 
 export { kubeconfigServer, type TenantKubeconfigArgs, tenantKubeconfig } from './kubeconfig';
@@ -51,6 +53,16 @@ export interface PlatformArgs {
    * token kubeconfig per user membership; when omitted, `kubeconfigs` is undefined.
    */
   apiServer?: pulumi.Input<string>;
+  /**
+   * Admin kubeconfig YAML, the same one `provider` uses. Required with `apiServer`: after each User
+   * is Ready, the program polls the Kubernetes API with this kubeconfig (and `kubeContext`) until
+   * the user's token Secret has `data.token`. The ambient `$KUBECONFIG` is never read. If the
+   * kubeconfig uses an `exec` credential plugin, that plugin runs for these reads as it does for
+   * `provider`.
+   */
+  kubeconfig?: pulumi.Input<string>;
+  /** Context of `kubeconfig` that `provider` uses; defaults to the kubeconfig's current context. */
+  kubeContext?: pulumi.Input<string | undefined>;
 }
 
 /**
@@ -284,12 +296,32 @@ export function createPlatform(args: PlatformArgs) {
 
   // Users report Ready only after the controller sees every token Secret populated, so reading
   // the Secrets after the User resources is reliable. Preview reads eagerly, before the User
-  // exists, so an unknown ID defers the read to the update.
+  // exists, so an unknown ID defers the read to the update. During update, poll until the Secret
+  // exists with data.token, as the controller may not have created it yet.
   const apiServer = args.apiServer;
-  const tokenSecretId = (user: string, tenant: string): pulumi.Input<string> =>
-    pulumi.runtime.isDryRun()
-      ? (pulumi.output(pulumi.unknown) as pulumi.Output<string>)
-      : `${namespaceName}/${userTokenSecretName(user, tenant)}`;
+  const adminKubeconfig = args.kubeconfig;
+  if (apiServer !== undefined && adminKubeconfig === undefined)
+    throw new Error('createPlatform: apiServer requires kubeconfig (the one provider uses)');
+  // In preview the ID is unknown, so nothing is read. On update the wait runs inside an apply on
+  // the User, which resolves only after the User is applied and Ready, so the budget starts then.
+  const tokenSecretId = (
+    user: string,
+    tenant: string,
+    userResource: pulumi.CustomResource,
+  ): pulumi.Input<string> => {
+    if (pulumi.runtime.isDryRun()) return pulumi.output(pulumi.unknown) as pulumi.Output<string>;
+    const secretName = userTokenSecretName(user, tenant);
+    return pulumi
+      .all([userResource.id, adminKubeconfig, args.kubeContext])
+      .apply(async ([, kubeconfig, context]) => {
+        await waitForTokenSecret({
+          namespace: namespaceName,
+          name: secretName,
+          readSecret: secretReaderFromKubeconfig(kubeconfig as string, context),
+        });
+        return `${namespaceName}/${secretName}`;
+      });
+  };
   const kubeconfigs =
     apiServer === undefined
       ? undefined
@@ -300,7 +332,7 @@ export function createPlatform(args: PlatformArgs) {
                 user.memberships.map(({ tenant }) => {
                   const secret = k8s.core.v1.Secret.get(
                     `user-token-${user.name}-${tenant}`,
-                    tokenSecretId(user.name, tenant),
+                    tokenSecretId(user.name, tenant, tenancy.users[index] as pulumi.CustomResource),
                     { provider, dependsOn: tenancy.users.slice(index, index + 1) },
                   );
                   return pulumi.all([apiServer, secret.data]).apply(([server, secretData]) => ({

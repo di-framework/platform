@@ -188,15 +188,35 @@ tenant workloads and services, `viewer` users get read-only access. The token
 does not expire; rotate it by deleting the Secret (the controller recreates it)
 and running `pulumi up` again.
 
-The API server URL comes from the `apiServer` argument of `createPlatform`. The
+The API server URL comes from the `apiServer` argument of `createPlatform`. When
+`apiServer` is set, `kubeconfig` is now required too: the program uses it to read the token
+Secrets, and `createPlatform` throws without it. Both entrypoints already pass it. The
 local entrypoint passes its loopback `https://127.0.0.1:<apiPort>`. The existing-cluster
 entrypoint uses `kubernetesEndpoint` (set by `di-framework-kube`) and otherwise the
 server of the admin kubeconfig's selected `context` (or `current-context`). When
 neither resolves to an `https://` URL, `kubeconfigs` is omitted. Previews do not read
-token Secrets, so `kubeconfigs` is only known after `pulumi up`. When upgrading an
-installation whose Users are already Ready, Pulumi does not wait on unchanged Users,
-so the first `pulumi up` can read a token Secret before the upgraded controller has
-created it; run `pulumi up` again once it has.
+token Secrets, so `kubeconfigs` is only known after `pulumi up`.
+
+During `pulumi up`, each token Secret is read only after its User is applied and Ready. The
+program polls the Kubernetes API, using the same admin kubeconfig and context as the
+Kubernetes provider (the `kubeconfig` and `kubeContext` arguments of `createPlatform`, which
+both entrypoints set; `$KUBECONFIG` is never consulted), until the Secret has `data.token`.
+This covers an upgrade where the User is already Ready and the upgraded controller has not
+yet recreated the Secret. A missing Secret, a Secret without a token and every read failure
+(HTTP status, auth, TLS, connection) are retried with backoff for up to 5 minutes, each
+request limited to 10 seconds. Then `pulumi up` fails with `Timed out after 300000 ms waiting
+for Secret wasmcloud/di-user-<user>-<tenant>-token to have data.token (last observation: ...)`,
+where the observation is `Secret not found (HTTP 404)`, `Secret exists without data.token`,
+an HTTP status or a connection error code; it never includes a Secret body. A Secret that
+never appears usually means the Tenant or User is not Ready or the controller is not
+running; check `kubectl get users.platform.di-framework.dev,tenants.platform.di-framework.dev` (both are cluster-scoped, so no `-n`). If the admin kubeconfig uses an
+`exec` credential plugin, that plugin runs for these reads as it does for the provider.
+
+## Requirements
+
+Node.js 22.19 or newer (`engines.node`). `@kubernetes/client-node` 2 loads ES modules through
+`require`, and its `undici` 8 dependency declares `>=22.19`. Pulumi runs this package under
+whatever `node` is on `PATH`; `di-framework-kube` does not pin a version.
 
 ## Development
 
