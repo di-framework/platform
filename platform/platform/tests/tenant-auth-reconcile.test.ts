@@ -2281,9 +2281,9 @@ describe('tenant registry host pull (#83:host-pull)', () => {
       registryServing: true,
       hostPullToken: TOKEN,
     });
-    expect(
-      env(find(insecure, 'Deployment', 'tenant-controller') as Deployment)
-    ).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_PULL_TLS');
+    expect(env(find(insecure, 'Deployment', 'tenant-controller') as Deployment)).not.toHaveProperty(
+      'TENANT_CONTROLLER_REGISTRY_PULL_TLS',
+    );
     expect(find(insecure, 'Service', REGISTRY_PULL_SERVICE)).toMatchObject({
       spec: { ports: [{ name: 'pull', port: 443, targetPort: 8791 }] },
     });
@@ -2410,7 +2410,9 @@ describe('tenant registry host pull (#83:host-pull)', () => {
       tenantResources(tenant(), insecureCfg, schedulerSecret, [], false, true, false, {}),
     );
     expect(env(plain).DOCKER_CONFIG).toBe('/registry-auth');
-    expect(plain.spec.template.spec.containers[0]!.args).not.toContain('--allow-insecure-registries');
+    expect(plain.spec.template.spec.containers[0]!.args).not.toContain(
+      '--allow-insecure-registries',
+    );
     expect(plain.spec.template.spec.containers[0]!.args).not.toContain(
       '--oci-ca-path=/registry-ca/ca.crt',
     );
