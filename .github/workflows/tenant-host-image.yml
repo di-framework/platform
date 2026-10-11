@@ -1,13 +1,16 @@
 # Publish the tenant host image: wash 2.8.0 with wasi-tls.
 # Dispatch-only, matching the npm Release workflow.
 #
-# Two variants, chosen by the `variant` input. Each has its own tag and its own cache, so a patched
-# build can never move the canonical tag (#136):
-#   wasi-tls            ghcr.io/di-framework/wash:2.8.0-wasi-tls            stock source, no patches
+# Two variants, chosen by the `variant` input. Each has its own tag and its own cache. The tag -> patch
+# set mapping lives in one place, platform/tenant-host/variants, read by the `variant` resolver job
+# below (whose outputs every later job consumes) and checked again by the Dockerfile, which fails a
+# build whose WASH_PATCHES is not exactly the set listed for its IMAGE_VERSION:
+#   wasi-tls            ghcr.io/di-framework/wash:2.8.0-wasi-tls            + 0002-insecure-registry-allowlist.patch
 #   wasi-tls-exclusive  ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive  + 0001-exclusive-instance.patch
-# The image labels name the variant and the patches applied. The platform default hostImage stays
-# pinned to the canonical digest; the exclusive variant is only used by setting tenantHostImage to its digest.
-# The exclusive build is never the default: select it explicitly.
+#                                                                            + 0002-insecure-registry-allowlist.patch
+# The image labels name the variant and the patches applied. wasi-tls is the canonical tag, the one
+# the platform default hostImage is pinned to; the exclusive variant is only used by setting
+# tenantHostImage to its digest. The exclusive build is never the default: select it explicitly.
 #
 # amd64 and arm64 compile at the same time on native runners. One ubuntu-24.04
 # job plus QEMU was spending the arm64 release build in emulation, which is
@@ -51,23 +54,40 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       patches: ${{ steps.resolve.outputs.patches }}
+      canonical: ${{ steps.resolve.outputs.canonical }}
     steps:
+      - name: Checkout the variant table
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: platform/tenant-host/variants
+          sparse-checkout-cone-mode: false
+
+      # The only variant -> patches mapping in this workflow. Jobs that build or tag the image take
+      # the tag and patch set from this job's outputs, never from a copy of the table.
       - name: Resolve tag and patches
         id: resolve
         env:
           VARIANT: ${{ inputs.variant }}
         run: |
           set -euo pipefail
-          case "${VARIANT}" in
-            wasi-tls) patches='' ;;
-            wasi-tls-exclusive) patches='0001-exclusive-instance.patch' ;;
-            *)
-              echo "::error::unknown variant '${VARIANT}'"
-              exit 1
-              ;;
-          esac
-          echo "tag=2.8.0-${VARIANT}" >> "${GITHUB_OUTPUT}"
-          echo "patches=${patches}" >> "${GITHUB_OUTPUT}"
+          table=platform/tenant-host/variants
+          tag="2.8.0-${VARIANT}"
+          if ! patches="$(awk -v tag="${tag}" '$1 == tag { $1 = ""; sub(/^ +/, ""); print; found = 1 } END { exit !found }' "${table}")"; then
+            echo "::error::variant '${VARIANT}' (tag ${tag}) is not listed in ${table}"
+            exit 1
+          fi
+          canonical="$(awk '$1 !~ /^#/ && NF { print $1; exit }' "${table}")"
+          is_canonical=false
+          if [[ "${tag}" == "${canonical}" ]]; then
+            is_canonical=true
+          fi
+          {
+            echo "tag=${tag}"
+            echo "patches=${patches}"
+            echo "canonical=${is_canonical}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Resolved ${VARIANT}: tag ${tag}, patches '${patches}', canonical ${is_canonical}"
 
   build:
     name: Build ${{ matrix.platform }}
@@ -205,6 +225,7 @@ jobs:
         env:
           TAG: ${{ needs.variant.outputs.tag }}
           PATCHES: ${{ needs.variant.outputs.patches }}
+          CANONICAL: ${{ needs.variant.outputs.canonical }}
         run: |
           set -euo pipefail
           digest="$(jq -er '.["containerimage.descriptor"].digest' "${RUNNER_TEMP}/wash-index.json")"
@@ -225,8 +246,10 @@ jobs:
             echo "Patches applied: \`${PATCHES:-none}\`"
             echo
             echo "Pin \`tenantHostImage\` to that digest. The tag \`${TAG}\` moves on the next publish of this variant."
-            if [[ -n "${PATCHES}" ]]; then
-              echo
-              echo 'This is a patched build. Use it only by setting `tenantHostImage` (digest-pinned) until it is proven; do not change `DEFAULT_HOST_IMAGE`.'
+            echo
+            if [[ "${CANONICAL}" == "true" ]]; then
+              echo "This is the canonical tag. Repin \`DEFAULT_HOST_IMAGE\` to this digest in a separate, reviewed change."
+            else
+              echo "This variant is not the default. Use it only by setting \`tenantHostImage\` (digest-pinned); do not change \`DEFAULT_HOST_IMAGE\`."
             fi
           } >> "${GITHUB_STEP_SUMMARY}"

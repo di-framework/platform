@@ -1,16 +1,27 @@
-# Prove the wasmCloud patches in platform/tenant-host apply to the pinned source and that the
-# patched wash-runtime builds and passes the pool and dispatch tests (#136).
+# Prove every tenant host image variant's patch set applies to the pinned wasmCloud source, and that
+# the patched wash and wash-runtime build, lint, format-check and pass the tests that cover the
+# patches (#136, #175).
 #
 # tenant-host-image.yml is dispatch-only, so before this job a patch that did not apply, or did not
-# compile, only showed up at publish time. The job checks wasmCloud out at the commit pinned by
-# WASMCLOUD_COMMIT in the Dockerfile, applies every patch with `git apply` (after `--check`), then
-# builds wash-runtime with the image's `wasi-tls` feature, lints it with clippy -D warnings, and runs
-# the tests that cover the patch. It does not run the whole
-# wash-runtime suite: that needs prebuilt wasm fixtures and Docker services this job does not set up.
+# compile, only showed up at publish time. One job per row of platform/tenant-host/variants (the
+# same table the Dockerfile and the publish workflow read), each with that variant's patches applied
+# in order, so the canonical set (0002 alone) and the exclusive stack (0001 + 0002) are both checked.
+# Each job checks wasmCloud out at the commit pinned by WASMCLOUD_COMMIT in the Dockerfile, runs
+# `git apply --check` then `git apply` per patch, then:
+#   - `cargo fmt --all -- --check`;
+#   - builds and lints (clippy -D warnings, lib and test profile) `-p wash` and `-p wash-runtime` with
+#     the image's `wasi-tls` feature;
+#   - checks and lints `-p wash --features wasi-tls,host-component-plugins`, a feature the image does
+#     not enable but the patches must not break;
+#   - runs the patch tests by name and fails if any named test did not run. The allowlist tests
+#     (0002) run for every variant; the pool and dispatch tests (0001) run where 0001 is applied.
+# It does not run the whole suites: they need prebuilt wasm fixtures and Docker services this job
+# does not set up.
 #
-# Bounded: one job, 60 minutes, superseded runs are cancelled. Cached: cargo registry and the target
-# directory are keyed on the pinned commit and the patch contents; debug info is off to keep the
-# cache small. A push to main with the same paths refreshes the cache that pull requests restore.
+# Bounded: one job per variant, 90 minutes each, superseded runs are cancelled. Cached per variant:
+# cargo registry and the target directory are keyed on the pinned commit, the variant and the patch
+# contents; debug info is off to keep the cache small. A push to main with the same paths refreshes
+# the cache that pull requests restore.
 name: Tenant-host patch check
 
 on:
@@ -38,10 +49,59 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  patch:
-    name: Apply patches and test wash-runtime
+  variants:
+    name: Read the variant table
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.table.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: platform/tenant-host
+          sparse-checkout-cone-mode: false
+
+      # Every listed patch must exist, and every patch file must belong to some variant, so a patch
+      # cannot be added without being built and tested here.
+      - name: Build the matrix from platform/tenant-host/variants
+        id: table
+        run: |
+          set -euo pipefail
+          dir=platform/tenant-host
+          matrix="$(awk '$1 !~ /^#/ && NF { tag = $1; $1 = ""; sub(/^ +/, ""); print tag "\t" $0 }' "${dir}/variants" \
+            | jq -Rnc '[inputs | split("\t") | {tag: .[0], patches: .[1]}]')"
+          if [[ "$(jq 'length' <<<"${matrix}")" == 0 ]]; then
+            echo "::error::no variants listed in ${dir}/variants"
+            exit 1
+          fi
+          mapfile -t listed < <(jq -r '.[].patches | split(" ")[] | select(. != "")' <<<"${matrix}" | sort -u)
+          for patch in "${listed[@]}"; do
+            if [[ ! -f "${dir}/${patch}" ]]; then
+              echo "::error::${dir}/variants lists ${patch}, which does not exist"
+              exit 1
+            fi
+          done
+          shopt -s nullglob
+          for file in "${dir}"/*.patch; do
+            if ! printf '%s\n' "${listed[@]}" | grep -qxF "$(basename "${file}")"; then
+              echo "::error::${file} is not applied by any variant in ${dir}/variants"
+              exit 1
+            fi
+          done
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+          jq . <<<"${matrix}"
+
+  patch:
+    name: Patch check (${{ matrix.tag }})
+    needs: variants
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.variants.outputs.matrix) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -72,19 +132,20 @@ jobs:
           set -euo pipefail
           test "$(git -C wasmcloud rev-parse HEAD)" = "${{ steps.pin.outputs.commit }}"
 
-      - name: Apply the patches
+      - name: Apply the variant's patches in order
+        env:
+          PATCHES: ${{ matrix.patches }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          patches=(platform/tenant-host/*.patch)
+          read -ra patches <<<"${PATCHES}"
           if (( ${#patches[@]} == 0 )); then
-            echo "::error::no patches found in platform/tenant-host"
+            echo "::error::variant ${{ matrix.tag }} lists no patches"
             exit 1
           fi
           for patch in "${patches[@]}"; do
             echo "Applying ${patch}"
-            git -C wasmcloud apply --check "${GITHUB_WORKSPACE}/${patch}"
-            git -C wasmcloud apply "${GITHUB_WORKSPACE}/${patch}"
+            git -C wasmcloud apply --check "${GITHUB_WORKSPACE}/platform/tenant-host/${patch}"
+            git -C wasmcloud apply "${GITHUB_WORKSPACE}/platform/tenant-host/${patch}"
           done
           git -C wasmcloud diff --stat
 
@@ -93,6 +154,7 @@ jobs:
         with:
           # rust-toolchain.toml at the pinned commit pins 1.96.0.
           toolchain: '1.96.0'
+          components: clippy, rustfmt
 
       - name: Install protobuf compiler
         run: |
@@ -108,25 +170,78 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             wasmcloud/target
-          key: tenant-host-wash-runtime-${{ runner.os }}-${{ steps.pin.outputs.commit }}-${{ hashFiles('platform/tenant-host/*.patch') }}
+          key: tenant-host-wash-${{ runner.os }}-${{ steps.pin.outputs.commit }}-${{ matrix.tag }}-${{ hashFiles('platform/tenant-host/*.patch') }}
           restore-keys: |
-            tenant-host-wash-runtime-${{ runner.os }}-${{ steps.pin.outputs.commit }}-
+            tenant-host-wash-${{ runner.os }}-${{ steps.pin.outputs.commit }}-${{ matrix.tag }}-
+
+      - name: Check formatting
+        working-directory: wasmcloud
+        run: cargo fmt --all -- --check
 
       # The image builds wash with `wasi-tls`, which compiles branches (such as the one in
       # new_ephemeral_store) that a default-features build skips.
-      - name: Build patched wash-runtime
+      - name: Build patched wash and wash-runtime
         working-directory: wasmcloud
-        run: cargo build -p wash-runtime --locked --features wasi-tls
+        run: |
+          set -euo pipefail
+          cargo build -p wash-runtime --locked --features wasi-tls
+          cargo build -p wash --locked --features wasi-tls
 
-      - name: Lint patched wash-runtime
+      - name: Lint patched wash and wash-runtime
         working-directory: wasmcloud
         run: |
           set -euo pipefail
           cargo clippy -p wash-runtime --locked --features wasi-tls -- -D warnings
           cargo clippy -p wash-runtime --locked --features wasi-tls --lib --profile test -- -D warnings
+          cargo clippy -p wash --locked --features wasi-tls -- -D warnings
+          cargo clippy -p wash --locked --features wasi-tls --lib --profile test -- -D warnings
 
-      - name: Test the pool and dispatch paths
+      # Off in the image, but a supported wash feature: its plugin OciConfig must compile and
+      # carry the allowlist.
+      - name: Check wash with host-component-plugins
         working-directory: wasmcloud
-        # instance_pool and instance_driver cover the exclusive gates, queueing, trap, timeout and
-        # drain tests; wire_ covers the opt-in surviving the wire conversion.
-        run: cargo test -p wash-runtime --locked --features wasi-tls --lib -- instance_pool instance_driver wire_
+        run: |
+          set -euo pipefail
+          cargo check -p wash --locked --features wasi-tls,host-component-plugins
+          cargo clippy -p wash --locked --features wasi-tls,host-component-plugins --lib --profile test -- -D warnings
+
+      # 0002: protocol selection (unit and against a loopback listener), washlet propagation, and
+      # `wash host` flag/env parsing. 0001 (when applied): the exclusive gates, queueing, trap,
+      # timeout and drain tests (instance_pool, instance_driver) and the opt-in surviving the wire
+      # conversion (wire_). Each name below must have run and passed.
+      - name: Test the patches
+        working-directory: wasmcloud
+        env:
+          PATCHES: ${{ matrix.patches }}
+        run: |
+          set -euo pipefail
+          runtime_filters=(insecure_registr client_protocol test_image_pull_secret_to_oci_config)
+          required=(
+            oci::tests::client_protocol_insecure_registries_empty_is_https_for_all
+            oci::tests::client_protocol_insecure_registries_listed_is_https_except
+            oci::tests::client_protocol_insecure_registries_overridden_by_allow_insecure
+            oci::tests::pull_insecure_registries_listed_registry_uses_http
+            oci::tests::pull_insecure_registries_other_registry_uses_https
+            oci::tests::pull_insecure_registries_allow_insecure_uses_http_for_all
+            washlet::tests::test_image_pull_secret_to_oci_config_insecure_registries
+            cli::host::insecure_registry_tests::insecure_registry_defaults_to_empty
+            cli::host::insecure_registry_tests::insecure_registry_flag_is_repeatable_and_comma_delimited
+            cli::host::insecure_registry_tests::insecure_registry_env_is_a_comma_list_and_trimmed
+            cli::host::insecure_registry_tests::insecure_registry_flag_overrides_env
+            cli::host::insecure_registry_tests::insecure_registry_rejects_empty_entries
+            cli::host::insecure_registry_tests::insecure_registry_rejects_scheme_prefixed_entries
+            cli::host::insecure_registry_tests::insecure_registry_rejects_paths
+          )
+          if [[ " ${PATCHES} " == *" 0001-exclusive-instance.patch "* ]]; then
+            runtime_filters+=(instance_pool instance_driver wire_)
+            required+=(engine::instance_pool::exclusive_tests::)
+          fi
+          log="${RUNNER_TEMP}/patch-tests.log"
+          cargo test -p wash-runtime --locked --features wasi-tls --lib -- "${runtime_filters[@]}" 2>&1 | tee "${log}"
+          cargo test -p wash --locked --features wasi-tls,host-component-plugins --lib -- insecure_registry 2>&1 | tee -a "${log}"
+          for name in "${required[@]}"; do
+            if ! grep -qE "^test ${name}[^ ]* \.\.\. ok$" "${log}"; then
+              echo "::error::required test ${name} did not run and pass"
+              exit 1
+            fi
+          done
