@@ -51,6 +51,22 @@ interface types {
   /// Identical to the SQLite provider plus `boolean`: Postgres has a native
   /// boolean type and the text encoding (`t`/`f`) is lossy without it.
   /// `json` and `timestamp` are new in 0.2.0 for PostgreSQL-specific types.
+  ///
+  /// Results (session is `DateStyle=ISO`, `TimeZone=UTC`):
+  /// - `bool` -> `boolean`; `int2`/`int4`/`int8` -> `integer` (`int8` too);
+  ///   `float4`/`float8` -> `real`; `bytea` -> `blob`.
+  /// - `json` and `jsonb` -> `json` (JSON text).
+  /// - `timestamptz` -> `timestamp`, RFC 3339 in UTC (`2024-01-15T10:30:00Z`,
+  ///   fractional seconds kept). `infinity` and `-infinity` are returned as
+  ///   those literals.
+  /// - `timestamp` (no zone) and `date` -> `text` (`2024-01-15 10:30:00`,
+  ///   `2024-01-15`).
+  /// - `uuid` and `numeric` -> `text`; arrays -> `text` as PostgreSQL array
+  ///   literals (`{a,b}`); all other types -> `text`.
+  ///
+  /// Parameters: `text`, `json` and `timestamp` are sent with unknown type
+  /// (OID 0) so PostgreSQL infers the type from context; a parameter with no
+  /// context (`SELECT $1 IS NULL`) needs a cast.
   variant value {
     null,
     integer(s64),

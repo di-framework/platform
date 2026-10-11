@@ -3,13 +3,14 @@ import { join, resolve } from 'node:path';
 import { $ } from 'bun';
 import { type Args, type Context, parseFlags, run, UsageError } from './lib/cli.ts';
 import { fileExists } from './lib/fs.ts';
+import { databaseInterface, readWitVersion } from './lib/wit-version.ts';
 
 const USAGE = [
   'compose a consumer component with the PGlite provider',
   '',
   '  compose.ts <app.wasm> <out.wasm> [provider.wasm]',
   '',
-  'The consumer must import `di-framework:pglite/database@0.1.0`.',
+  'The consumer must import the `di-framework:pglite/database` version in wit/world.wit.',
 ].join('\n');
 
 export interface ComposeArgs {
@@ -53,8 +54,9 @@ export async function composeConsumer(ctx: Context, { app, out, provider }: Comp
   await $`wac plug --plug ${provider} ${app} -o ${out}`;
   await $`wasm-tools validate --features all ${out}`;
   const wit = await $`wasm-tools component wit ${out}`.text();
-  if (wit.includes('import di-framework:pglite/database@0.1.0')) {
-    throw new Error(`${out} still imports di-framework:pglite/database@0.1.0; plug did not apply`);
+  const database = databaseInterface(await readWitVersion(ctx.pkgDir));
+  if (wit.includes(`import ${database}`)) {
+    throw new Error(`${out} still imports ${database}; plug did not apply`);
   }
   console.error(`[compose] ok: ${out}`);
   console.error(wit.match(/^world root[\s\S]*?^}/m)?.[0] ?? wit);

@@ -20,6 +20,7 @@ const OID_TEXT: u32 = 25;
 const OID_FLOAT4: u32 = 700;
 const OID_FLOAT8: u32 = 701;
 const OID_JSON: u32 = 114;
+const OID_JSONB: u32 = 3802;
 const OID_TIMESTAMP_TZ: u32 = 1184;
 
 /// One exclusive session on the embedded engine.
@@ -109,6 +110,9 @@ fn startup_message(user: &str, database: &str) -> Vec<u8> {
         ("user", user),
         ("database", database),
         ("client_encoding", "UTF8"),
+        // Pin text output formats so decoded values are unambiguous.
+        ("DateStyle", "ISO"),
+        ("TimeZone", "UTC"),
         ("application_name", "pglite-provider-component"),
     ] {
         push_cstring(&mut body, key);
@@ -213,6 +217,10 @@ impl Session {
         }
         session.sock.mark_healthy();
         session.authenticated = true;
+        // `close` runs DISCARD ALL and a reused backend never sees a startup
+        // packet, so pin the text output formats on every open.
+        session.simple("SET DateStyle = 'ISO, MDY'")?;
+        session.simple("SET TimeZone = 'UTC'")?;
         Ok(session)
     }
 
@@ -560,9 +568,27 @@ fn decode_cell(oid: u32, cell: Option<String>) -> Result<Value, Error> {
             .map(Value::Real)
             .map_err(|_| Error::ValueConversionFailed(format!("invalid float {text:?}"))),
         OID_BYTEA => decode_bytea(&text),
-        OID_JSON => Ok(Value::Json(text)),
-        OID_TIMESTAMP_TZ => Ok(Value::Timestamp(text)),
+        OID_JSON | OID_JSONB => Ok(Value::Json(text)),
+        OID_TIMESTAMP_TZ => Ok(Value::Timestamp(normalize_timestamptz(text))),
         _ => Ok(Value::Text(text)),
+    }
+}
+
+/// Rewrite a `timestamptz` rendered under `DateStyle=ISO`, `TimeZone=UTC`
+/// (`2024-01-15 10:30:00.5+00`) as RFC 3339 (`2024-01-15T10:30:00.5Z`).
+/// `infinity`, `-infinity` and anything else not of that shape (for example
+/// BC dates) pass through unchanged.
+fn normalize_timestamptz(text: String) -> String {
+    match text.strip_suffix("+00") {
+        Some(body) if body.len() > 11 && body.as_bytes().get(10) == Some(&b' ') => {
+            let mut out = String::with_capacity(body.len() + 1);
+            out.push_str(&body[..10]);
+            out.push('T');
+            out.push_str(&body[11..]);
+            out.push('Z');
+            out
+        }
+        _ => text,
     }
 }
 
@@ -645,7 +671,7 @@ fn encode_param(value: &Value) -> Result<(u32, Option<Vec<u8>>), Error> {
                     "PostgreSQL json cannot contain NUL".into(),
                 ));
             }
-            Ok((OID_JSON, Some(s.as_bytes().to_vec())))
+            Ok((0, Some(s.as_bytes().to_vec())))
         }
         Value::Timestamp(s) => {
             if s.contains('\0') {
@@ -653,7 +679,7 @@ fn encode_param(value: &Value) -> Result<(u32, Option<Vec<u8>>), Error> {
                     "PostgreSQL timestamp cannot contain NUL".into(),
                 ));
             }
-            Ok((OID_TIMESTAMP_TZ, Some(s.as_bytes().to_vec())))
+            Ok((0, Some(s.as_bytes().to_vec())))
         }
     }
 }
@@ -723,22 +749,21 @@ mod tests {
 
     #[test]
     fn param_encoding_text_uses_oid_zero() {
-        let (oid, bytes) = encode_param(&Value::Text("hello".to_string()))
-            .expect("encode text");
+        let (oid, bytes) = encode_param(&Value::Text("hello".to_string())).expect("encode text");
         assert_eq!(oid, 0, "text parameters should use OID 0 (unknown)");
         assert_eq!(bytes, Some(b"hello".to_vec()));
     }
 
     #[test]
     fn param_encoding_json_and_timestamp() {
-        let (oid, bytes) = encode_param(&Value::Json(r#"{"key":"value"}"#.to_string()))
-            .expect("encode json");
-        assert_eq!(oid, OID_JSON);
+        let (oid, bytes) =
+            encode_param(&Value::Json(r#"{"key":"value"}"#.to_string())).expect("encode json");
+        assert_eq!(oid, 0);
         assert_eq!(bytes, Some(r#"{"key":"value"}"#.as_bytes().to_vec()));
 
         let (oid, bytes) = encode_param(&Value::Timestamp("2024-01-01T12:00:00Z".to_string()))
             .expect("encode timestamp");
-        assert_eq!(oid, OID_TIMESTAMP_TZ);
+        assert_eq!(oid, 0);
         assert_eq!(bytes, Some("2024-01-01T12:00:00Z".as_bytes().to_vec()));
     }
 
@@ -774,8 +799,26 @@ mod tests {
             Ok(Value::Json(_))
         ));
         assert!(matches!(
-            decode_cell(OID_TIMESTAMP_TZ, Some("2024-01-01T12:00:00Z".to_string())),
-            Ok(Value::Timestamp(_))
+            decode_cell(OID_JSONB, Some(r#"{"key": "value"}"#.to_string())),
+            Ok(Value::Json(_))
+        ));
+        assert!(matches!(
+            decode_cell(OID_TIMESTAMP_TZ, Some("2024-01-01 12:00:00+00".to_string())),
+            Ok(Value::Timestamp(t)) if t == "2024-01-01T12:00:00Z"
+        ));
+        assert!(matches!(
+            decode_cell(OID_TIMESTAMP_TZ, Some("2024-01-01 12:00:00.25+00".to_string())),
+            Ok(Value::Timestamp(t)) if t == "2024-01-01T12:00:00.25Z"
+        ));
+        for lit in ["infinity", "-infinity", "0044-03-15 00:00:00+00 BC"] {
+            assert!(matches!(
+                decode_cell(OID_TIMESTAMP_TZ, Some(lit.to_string())),
+                Ok(Value::Timestamp(t)) if t == lit
+            ));
+        }
+        assert!(matches!(
+            decode_cell(1114, Some("2024-01-01 12:00:00".to_string())),
+            Ok(Value::Text(_))
         ));
         assert!(matches!(
             decode_cell(OID_BOOL, Some("maybe".to_string())),
