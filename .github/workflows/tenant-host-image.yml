@@ -1,6 +1,14 @@
 # Publish the tenant host image: wash 2.8.0 with wasi-tls.
 # Dispatch-only, matching the npm Release workflow.
 #
+# Two variants, chosen by the `variant` input. Each has its own tag and its own cache, so a patched
+# build can never move the canonical tag (#136):
+#   wasi-tls            ghcr.io/di-framework/wash:2.8.0-wasi-tls            stock source, no patches
+#   wasi-tls-exclusive  ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive  + 0001-exclusive-instance.patch
+# The image labels name the variant and the patches applied. The platform default hostImage stays
+# pinned to the canonical digest; the exclusive variant is only used by setting tenantHostImage to its digest.
+# The exclusive build is never the default: select it explicitly.
+#
 # amd64 and arm64 compile at the same time on native runners. One ubuntu-24.04
 # job plus QEMU was spending the arm64 release build in emulation, which is
 # what made a cold publish take the better part of an hour.
@@ -16,6 +24,14 @@ name: Publish tenant host image
 
 on:
   workflow_dispatch:
+    inputs:
+      variant:
+        description: Image variant (select wasi-tls-exclusive explicitly; it is published under its own tag)
+        type: choice
+        options:
+          - wasi-tls
+          - wasi-tls-exclusive
+        default: wasi-tls
 
 permissions:
   contents: read
@@ -28,8 +44,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  variant:
+    name: Resolve variant
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      patches: ${{ steps.resolve.outputs.patches }}
+    steps:
+      - name: Resolve tag and patches
+        id: resolve
+        env:
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          set -euo pipefail
+          case "${VARIANT}" in
+            wasi-tls) patches='' ;;
+            wasi-tls-exclusive) patches='0001-exclusive-instance.patch' ;;
+            *)
+              echo "::error::unknown variant '${VARIANT}'"
+              exit 1
+              ;;
+          esac
+          echo "tag=2.8.0-${VARIANT}" >> "${GITHUB_OUTPUT}"
+          echo "patches=${patches}" >> "${GITHUB_OUTPUT}"
+
   build:
     name: Build ${{ matrix.platform }}
+    needs: variant
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -38,10 +80,10 @@ jobs:
         include:
           - platform: linux/amd64
             runner: ubuntu-24.04
-            cache: ghcr.io/di-framework/wash:buildcache-amd64
+            arch: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
-            cache: ghcr.io/di-framework/wash:buildcache-arm64
+            arch: arm64
     steps:
       - name: Require di-framework/platform
         run: |
@@ -71,11 +113,14 @@ jobs:
           context: platform/tenant-host
           platforms: ${{ matrix.platform }}
           provenance: true
+          build-args: |
+            WASH_PATCHES=${{ needs.variant.outputs.patches }}
+            IMAGE_VERSION=${{ needs.variant.outputs.tag }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
           outputs: type=image,name=ghcr.io/di-framework/wash,push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=registry,ref=${{ matrix.cache }}
-          cache-to: type=registry,ref=${{ matrix.cache }},mode=max,oci-mediatypes=true,image-manifest=true
+          cache-from: type=registry,ref=ghcr.io/di-framework/wash:buildcache-${{ needs.variant.outputs.tag }}-${{ matrix.arch }}
+          cache-to: type=registry,ref=ghcr.io/di-framework/wash:buildcache-${{ needs.variant.outputs.tag }}-${{ matrix.arch }},mode=max,oci-mediatypes=true,image-manifest=true
 
       - name: Export digest
         run: |
@@ -91,14 +136,14 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wash-digest-${{ strategy.job-index }}
+          name: wash-digest-${{ needs.variant.outputs.tag }}-${{ strategy.job-index }}
           path: ${{ runner.temp }}/digests
           if-no-files-found: error
           retention-days: 1
 
   merge:
-    name: Push ghcr.io/di-framework/wash:2.8.0-wasi-tls
-    needs: build
+    name: Push ghcr.io/di-framework/wash tag
+    needs: [variant, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -113,7 +158,7 @@ jobs:
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: wash-digest-*
+          pattern: wash-digest-${{ needs.variant.outputs.tag }}-*
           path: ${{ runner.temp }}/digests
           merge-multiple: true
 
@@ -129,6 +174,8 @@ jobs:
 
       - name: Create and push manifest
         working-directory: ${{ runner.temp }}/digests
+        env:
+          TAG: ${{ needs.variant.outputs.tag }}
         run: |
           set -euo pipefail
           mapfile -t files < <(find . -type f | sort)
@@ -151,10 +198,13 @@ jobs:
           # closes the pipe and fails this job after the tag is already published.
           docker buildx imagetools create \
             --metadata-file "${RUNNER_TEMP}/wash-index.json" \
-            -t ghcr.io/di-framework/wash:2.8.0-wasi-tls \
+            -t "ghcr.io/di-framework/wash:${TAG}" \
             "${args[@]}"
 
       - name: Record image digest
+        env:
+          TAG: ${{ needs.variant.outputs.tag }}
+          PATCHES: ${{ needs.variant.outputs.patches }}
         run: |
           set -euo pipefail
           digest="$(jq -er '.["containerimage.descriptor"].digest' "${RUNNER_TEMP}/wash-index.json")"
@@ -163,7 +213,7 @@ jobs:
             cat "${RUNNER_TEMP}/wash-index.json"
             exit 1
           fi
-          ref="ghcr.io/di-framework/wash:2.8.0-wasi-tls@${digest}"
+          ref="ghcr.io/di-framework/wash:${TAG}@${digest}"
           echo "Published ${ref}"
           {
             echo "### Tenant host image"
@@ -172,5 +222,11 @@ jobs:
             echo "${ref}"
             echo '```'
             echo
-            echo 'Pin `tenantHostImage` to that digest. The tag `2.8.0-wasi-tls` moves on the next publish.'
+            echo "Patches applied: \`${PATCHES:-none}\`"
+            echo
+            echo "Pin \`tenantHostImage\` to that digest. The tag \`${TAG}\` moves on the next publish of this variant."
+            if [[ -n "${PATCHES}" ]]; then
+              echo
+              echo 'This is a patched build. Use it only by setting `tenantHostImage` (digest-pinned) until it is proven; do not change `DEFAULT_HOST_IMAGE`.'
+            fi
           } >> "${GITHUB_STEP_SUMMARY}"

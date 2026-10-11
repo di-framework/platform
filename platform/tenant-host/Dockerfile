@@ -2,15 +2,36 @@
 # The stock ghcr.io/wasmcloud/wash:2.8.0 image is a default-features build, so components that import
 # wasi:tls/client@0.3.0-draft (the node:tls shim) fail to start on it. This mirrors upstream's Dockerfile
 # at the same tag (Chainguard wolfi-base runtime, git, /usr/local/bin/wash entrypoint) with the feature on.
-# Maintainers publish ghcr.io/di-framework/wash:2.8.0-wasi-tls with
-# .github/workflows/tenant-host-image.yml (workflow_dispatch). Pin consumers by digest.
+# Maintainers publish it with .github/workflows/tenant-host-image.yml (workflow_dispatch). Pin consumers
+# by digest.
+#
+# Variants. With no WASH_PATCHES the build is stock wash 2.8.0 + wasi-tls, published as
+# ghcr.io/di-framework/wash:2.8.0-wasi-tls. WASH_PATCHES names patch files from this directory to apply
+# to the pinned source, and the result is published under its own tag, never the canonical one:
+# 0001-exclusive-instance.patch -> ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive (#136).
 ARG WASMCLOUD_TAG=v2.8.0
 ARG WASMCLOUD_COMMIT=5c4ec4a3d008b3f401d9e763515f434deebc9936
+ARG WASH_PATCHES=""
+ARG IMAGE_VERSION=2.8.0-wasi-tls
 
-# rust-toolchain.toml at the tag pins 1.96.0.
-FROM docker.io/library/rust:1.96.0-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS build
+# rust-toolchain.toml at the tag pins 1.96.0. Pinned by digest alone (rust:1.96.0-bookworm): a tag
+# next to a digest is ignored by the runtime and flagged by Sonar.
+FROM docker.io/library/rust@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS build
 ARG WASMCLOUD_TAG
 ARG WASMCLOUD_COMMIT
+ARG WASH_PATCHES
+ARG IMAGE_VERSION
+# A patched build must not be labelled as the canonical stock version, and a stock build must not
+# claim to be patched: fail fast rather than publish a mislabelled image.
+RUN set -eu; \
+    if [ -n "${WASH_PATCHES}" ] && [ "${IMAGE_VERSION}" = "2.8.0-wasi-tls" ]; then \
+      echo "WASH_PATCHES is set but IMAGE_VERSION is the canonical 2.8.0-wasi-tls; pass IMAGE_VERSION=2.8.0-wasi-tls-exclusive" >&2; \
+      exit 1; \
+    fi; \
+    if [ -z "${WASH_PATCHES}" ] && [ "${IMAGE_VERSION}" != "2.8.0-wasi-tls" ]; then \
+      echo "IMAGE_VERSION ${IMAGE_VERSION} names a patched variant but WASH_PATCHES is empty" >&2; \
+      exit 1; \
+    fi
 RUN apt-get update \
   && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev lld \
   && rm -rf /var/lib/apt/lists/*
@@ -21,6 +42,15 @@ ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 RUN GIT_TERMINAL_PROMPT=0 git clone --depth 1 --quiet --branch "${WASMCLOUD_TAG}" https://github.com/wasmCloud/wasmCloud /src \
   && test "$(git -C /src rev-parse HEAD)" = "${WASMCLOUD_COMMIT}"
 WORKDIR /src
+# Apply the requested patches (none by default). They are `git diff` output against the pinned commit,
+# checked in CI (.github/workflows/tenant-host-patch-check.yml). `--check` first so a patch that no
+# longer applies fails the build with the file name, not half-applied.
+COPY *.patch /patches/
+RUN set -eu; \
+    for patch in ${WASH_PATCHES}; do \
+      git apply --check "/patches/${patch}"; \
+      git apply "/patches/${patch}"; \
+    done
 # `wasi-tls` is defined by crates/wash (forwarding to wash-runtime/wasi-tls) and is added on top of the
 # default features, exactly like upstream's CARGO_FEATURES build argument.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -32,9 +62,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM cgr.dev/chainguard/wolfi-base@sha256:d59fd2d1d21e913b12a8d56064e9aaf61f818289bd18b17132a0c4fde2358cea
 ARG WASMCLOUD_TAG
 ARG WASMCLOUD_COMMIT
+ARG WASH_PATCHES
+ARG IMAGE_VERSION
 LABEL org.opencontainers.image.source="https://github.com/di-framework/platform" \
-      org.opencontainers.image.description="wash ${WASMCLOUD_TAG} with wasi:tls (wasmCloud ${WASMCLOUD_COMMIT})" \
-      org.opencontainers.image.version="2.8.0-wasi-tls"
+      org.opencontainers.image.description="wash ${WASMCLOUD_TAG} with wasi:tls (wasmCloud ${WASMCLOUD_COMMIT}); patches: ${WASH_PATCHES:-none}" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      dev.di-framework.wash.patches="${WASH_PATCHES}"
 RUN apk add --no-cache git
 COPY --from=build /out/wash /usr/local/bin/wash
 # The hostgroup Deployment runs uid/gid 65532 with a read-only root, HOME=/tmp, and writable
