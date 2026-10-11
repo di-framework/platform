@@ -1,8 +1,8 @@
 {
   "name": "@di-framework/pglite-component",
   "version": "6.0.10",
-  "private": true,
-  "description": "Embedded PostgreSQL component with persistent WASI storage and no TCP.",
+  "type": "module",
+  "description": "Embedded PostgreSQL component with persistent WASI storage and no TCP, plus its SqlDatabase adapter for @di-framework/repo.",
   "license": "(MIT OR Apache-2.0)",
   "author": "@di-framework Contributors",
   "repository": {
@@ -14,15 +14,52 @@
     "url": "https://github.com/di-framework/platform/issues"
   },
   "homepage": "https://github.com/di-framework/platform",
+  "keywords": [
+    "postgresql",
+    "pglite",
+    "wasi",
+    "wit",
+    "webassembly",
+    "component-model",
+    "di-framework"
+  ],
+  "main": "./dist/js/index.js",
+  "types": "./dist/js/index.d.ts",
+  "module": "./dist/js/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/js/index.d.ts",
+      "bun": "./dist/js/index.js",
+      "import": "./dist/js/index.js",
+      "default": "./dist/js/index.js"
+    },
+    "./wasm": "./dist/di-framework-pglite.wasm",
+    "./wit": "./dist/di-framework-pglite.wit",
+    "./wit/*": "./wit/*",
+    "./package.json": "./package.json"
+  },
   "files": [
-    "dist",
+    "dist/js",
+    "dist/di-framework-pglite.wasm",
+    "dist/di-framework-pglite.wit",
+    "dist/BUILD-INFO.txt",
+    "dist/SHA256SUMS",
+    "dist/THIRD-PARTY-NOTICES.txt",
     "README.md",
     "wit"
   ],
   "scripts": {
-    "build": "make build",
+    "build": "bun run build:adapter && make build",
+    "build:adapter": "bun scripts/wit-types.ts --check && rm -rf dist/js && bun x tsc -p tsconfig.build.json && bun ../../scripts/fix-esm-imports.ts dist/js",
+    "wit-types": "bun scripts/wit-types.ts",
     "test": "bun test",
     "smoke": "make smoke",
     "publish-asset": "make publish-asset"
+  },
+  "peerDependencies": {
+    "@di-framework/repo": "^6.0.7"
+  },
+  "devDependencies": {
+    "@di-framework/repo": "^6.0.7"
   }
 }
