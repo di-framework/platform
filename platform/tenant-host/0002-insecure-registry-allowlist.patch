@@ -1,0 +1,98 @@
+diff --git a/crates/wash-runtime/src/host/mod.rs b/crates/wash-runtime/src/host/mod.rs
+index d37cc1c..6544899 100644
+--- a/crates/wash-runtime/src/host/mod.rs
++++ b/crates/wash-runtime/src/host/mod.rs
+@@ -1165,6 +1165,11 @@ pub struct HostConfig {
+     /// may name the same bundles; a second host naming *different* ones fails
+     /// to build, rather than running on trust it did not ask for.
+     pub oci_ca_paths: Vec<PathBuf>,
++    /// Per-registry allowlist for insecure (HTTP) OCI registries.
++    /// Registries in this list will use plain HTTP instead of HTTPS.
++    /// This is more selective than `allow_oci_insecure`, which switches all
++    /// registries to HTTP.
++    pub insecure_registries: Vec<String>,
+ }
+ 
+ impl Default for HostConfig {
+@@ -1174,6 +1179,7 @@ impl Default for HostConfig {
+             oci_pull_timeout: Duration::from_secs(30).into(),
+             oci_cache_dir: None,
+             oci_ca_paths: Vec::new(),
++            insecure_registries: Vec::new(),
+         }
+     }
+ }
+diff --git a/crates/wash-runtime/src/oci.rs b/crates/wash-runtime/src/oci.rs
+index e18dafc..d812656 100644
+--- a/crates/wash-runtime/src/oci.rs
++++ b/crates/wash-runtime/src/oci.rs
+@@ -268,6 +268,9 @@ pub struct OciConfig {
+     /// Timeout for OCI operations (pull, push, etc.)
+     /// If None, uses default timeout from oci-client
+     pub timeout: Option<Duration>,
++    /// Per-registry allowlist for insecure (HTTP) OCI registries.
++    /// Registries in this list will use plain HTTP instead of HTTPS.
++    pub insecure_registries: Vec<String>,
+ }
+ 
+ impl OciConfig {
+@@ -610,6 +613,8 @@ pub async fn pull_component(
+     let client_config = ClientConfig {
+         protocol: if config.insecure {
+             ClientProtocol::Http
++        } else if !config.insecure_registries.is_empty() {
++            ClientProtocol::HttpsExcept(config.insecure_registries.clone())
+         } else {
+             ClientProtocol::Https
+         },
+@@ -772,6 +777,8 @@ pub async fn push_component(
+     let client_config = ClientConfig {
+         protocol: if config.insecure {
+             ClientProtocol::Http
++        } else if !config.insecure_registries.is_empty() {
++            ClientProtocol::HttpsExcept(config.insecure_registries.clone())
+         } else {
+             ClientProtocol::Https
+         },
+diff --git a/crates/wash-runtime/src/washlet/mod.rs b/crates/wash-runtime/src/washlet/mod.rs
+index eb825f8..5fea326 100644
+--- a/crates/wash-runtime/src/washlet/mod.rs
++++ b/crates/wash-runtime/src/washlet/mod.rs
+@@ -409,6 +409,7 @@ fn image_pull_secret_to_oci_config(
+     };
+     oci_config.cache_dir = config.oci_cache_dir.clone();
+     oci_config.insecure = config.allow_oci_insecure;
++    oci_config.insecure_registries = config.insecure_registries.clone();
+     oci_config.timeout = config.oci_pull_timeout;
+ 
+     oci_config
+diff --git a/crates/wash/src/cli/host.rs b/crates/wash/src/cli/host.rs
+index 1643684..5d0a6bc 100644
+--- a/crates/wash/src/cli/host.rs
++++ b/crates/wash/src/cli/host.rs
+@@ -287,6 +287,17 @@ pub struct HostCommand {
+     #[arg(long = "oci-ca-path", env = "WASH_OCI_CA_PATHS", value_delimiter = ',')]
+     pub oci_ca_paths: Vec<PathBuf>,
+ 
++    /// Per-registry allowlist for insecure (HTTP) OCI registries.
++    /// Registries in this list will use plain HTTP instead of HTTPS, while
++    /// others require HTTPS. This is more selective than `--allow-insecure-registries`,
++    /// which switches all registries to HTTP.
++    ///
++    /// Accepts a comma-separated list and/or repeated flags. Values are
++    /// registry hostnames with optional ports (e.g. "localhost:5000" or
++    /// "di-framework-registry.wasmcloud.svc.cluster.local:5000").
++    #[arg(long = "insecure-registry", env = "WASH_INSECURE_REGISTRIES", value_delimiter = ',')]
++    pub insecure_registries: Vec<String>,
++
+     /// Timeout for pulling artifacts from OCI registries
+     #[arg(long = "registry-pull-timeout", value_parser = humantime::parse_duration, default_value = "30s")]
+     pub registry_pull_timeout: Duration,
+@@ -468,6 +479,7 @@ impl CliCommand for HostCommand {
+             oci_pull_timeout: Some(self.registry_pull_timeout),
+             oci_cache_dir: self.oci_cache_dir.clone(),
+             oci_ca_paths: self.oci_ca_paths.clone(),
++            insecure_registries: self.insecure_registries.clone(),
+         };
+ 
+         // The host applies these itself when it is built, but host component

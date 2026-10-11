@@ -2,21 +2,34 @@
 
 Runtime image for tenant host groups (`tenant-<name>` Deployments in `di-runtime-<name>`). It is
 `wash` from wasmCloud tag `v2.8.0` (commit `5c4ec4a3d008b3f401d9e763515f434deebc9936`) built with the
-opt-in `wasi-tls` cargo feature.
+opt-in `wasi-tls` cargo feature and a per-registry insecure allowlist for OCI registries.
 
 The stock `ghcr.io/wasmcloud/wash:2.8.0` image is a default-features build. Its host world has no
 `wasi:tls`, so a component that imports `wasi:tls/client@0.3.0-draft` (the node:tls shim, for example
 the meshtastic `mesh-collector`) fails with `service did not properly execute`. With this image the host
 links `wasi:tls/client,types@0.3.0-draft` alongside the default interfaces.
 
+## Patches
+
+Two patches are applied to the canonical images:
+
+- **0002-insecure-registry-allowlist.patch**: adds `--insecure-registry` CLI flag and `WASH_INSECURE_REGISTRIES` environment variable for per-registry HTTP allowlisting (issue #149). Allows a host to use plain HTTP for specific registries (e.g., `di-framework-registry.wasmcloud.svc.cluster.local:5000`) while keeping HTTPS enforcement for others. Repeatable, comma-delimited list of host[:port] entries.
+- **0001-exclusive-instance.patch**: adds exclusive queueing pool policy for workload revisions, keeping a single storage revision open at a time (issue #136). Opt-in per-component via `localResources.config` key `di-framework.dev/exclusive-instance: "true"`.
+
+## Variants
+
+Published tags:
+
+- **`ghcr.io/di-framework/wash:2.8.0-wasi-tls`** (canonical): wasi-tls feature + 0002-insecure-registry-allowlist patch. Use this for local Kubesolo/k0s clusters and any deployment that pulls from in-cluster registries.
+- **`ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive`**: wasi-tls feature + both 0001-exclusive-instance and 0002-insecure-registry-allowlist patches. Use this for workloads that require exclusive instance access (e.g., pglite with persistent storage).
+
 ## What is built
 
 - Source: `git clone --branch v2.8.0` in its own layer, then the build fails unless `HEAD` is the pinned commit. `GIT_TERMINAL_PROMPT=0` keeps a credential prompt from hanging CI.
-- Patches: none by default. The `wasi-tls-exclusive` variant applies `0001-exclusive-instance.patch` (see [Exclusive instances](#exclusive-instances-wasi-tls-exclusive)). The patch is `git diff` output against the pinned commit; the build runs `git apply --check` and fails if it does not apply. Pull requests that touch this directory apply it to the pinned commit and run its tests (`.github/workflows/tenant-host-patch-check.yml`).
-- Limitation: the host still runs upstream wash 2.8.0 postgres behavior for non-exclusive workloads. Connections are not pinned per invocation, and `BEGIN` ... `COMMIT` across separate queries is not guaranteed to use one connection, for named and unnamed imports alike. Guests should use autocommit or a single batched statement, as the identity guest does (issue #39).
 - Feature: `wasi-tls` is declared by the `wash` crate (`wasi-tls = ["wash-runtime/wasi-tls"]`), which
   enables `wasmtime-wasi-tls` (p3, rustls) in `wash-runtime`. Default features (`wasi-webgpu`,
   `wasm_component_model_implements`) stay on, matching upstream's `CARGO_FEATURES` build argument.
+- Patches: applied in order after cloning; each patch is checked with `git apply --check` before applying. Pull requests that touch this directory test patches against the pinned commit (`.github/workflows/tenant-host-patch-check.yml`).
 - Toolchain: Rust 1.96.0 (what `rust-toolchain.toml` pins at the tag), `cargo build --locked`.
 - Runtime: the same Chainguard `wolfi-base` + `git` layout as upstream's image, binary at
   `/usr/local/bin/wash`, entrypoint `wash`. Base images are pinned by digest.
@@ -95,11 +108,11 @@ configuration, outside `localResources.config`, so those stores take no lease an
 persistent directory is a `hostPath`, so it is per node; there is no overlap protection across nodes,
 and a pod rescheduled to another node sees a different directory.
 
-**Image.** Published under its own tag, `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive`, with
-`org.opencontainers.image.version=2.8.0-wasi-tls-exclusive` and
-`dev.di-framework.wash.patches=0001-exclusive-instance.patch`. It never moves the canonical
-`2.8.0-wasi-tls` tag, and `DEFAULT_HOST_IMAGE` stays on the canonical digest. Use it only by setting
-`tenantHostImage` (digest-pinned) on a stack that needs it until it is proven.
+**Image.** The canonical `ghcr.io/di-framework/wash:2.8.0-wasi-tls` now includes both
+0002-insecure-registry-allowlist and 0001-exclusive-instance patches (published after this patch merged).
+A second variant `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive` includes the same patches
+with `dev.di-framework.wash.patches=0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch`.
+Use the exclusive variant by setting `tenantHostImage` (digest-pinned) on a stack that needs it.
 
 **Tests.** `crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs` in the patch runs real
 concurrent calls through the dispatch path against real stores and counts live stores. It covers

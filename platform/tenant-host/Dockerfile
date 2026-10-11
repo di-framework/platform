@@ -5,13 +5,14 @@
 # Maintainers publish it with .github/workflows/tenant-host-image.yml (workflow_dispatch). Pin consumers
 # by digest.
 #
-# Variants. With no WASH_PATCHES the build is stock wash 2.8.0 + wasi-tls, published as
-# ghcr.io/di-framework/wash:2.8.0-wasi-tls. WASH_PATCHES names patch files from this directory to apply
-# to the pinned source, and the result is published under its own tag, never the canonical one:
-# 0001-exclusive-instance.patch -> ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive (#136).
+# Variants. With WASH_PATCHES="0002-insecure-registry-allowlist.patch" the build is stock wash 2.8.0 +
+# wasi-tls + per-registry insecure allowlist, published as ghcr.io/di-framework/wash:2.8.0-wasi-tls (#149).
+# With WASH_PATCHES="0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch" the result
+# includes both exclusive-instance (#136) and per-registry allowlist patches, published as
+# ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive.
 ARG WASMCLOUD_TAG=v2.8.0
 ARG WASMCLOUD_COMMIT=5c4ec4a3d008b3f401d9e763515f434deebc9936
-ARG WASH_PATCHES=""
+ARG WASH_PATCHES="0002-insecure-registry-allowlist.patch"
 ARG IMAGE_VERSION=2.8.0-wasi-tls
 
 # rust-toolchain.toml at the tag pins 1.96.0. Pinned by digest alone (rust:1.96.0-bookworm): a tag
