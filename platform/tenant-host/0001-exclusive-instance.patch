@@ -217,10 +217,10 @@ index f7f8d3d..3897332 100644
      }
  }
 diff --git a/crates/wash-runtime/src/engine/instance_pool.rs b/crates/wash-runtime/src/engine/instance_pool.rs
-index 9be47f2..101182b 100644
+index 9be47f2..e373b43 100644
 --- a/crates/wash-runtime/src/engine/instance_pool.rs
 +++ b/crates/wash-runtime/src/engine/instance_pool.rs
-@@ -31,6 +31,30 @@
+@@ -31,6 +31,42 @@
  //!    the instance the same way — the guest work cannot be cancelled from the
  //!    host, so draining and dropping the store is what ends it.
  //!
@@ -248,18 +248,37 @@ index 9be47f2..101182b 100644
 +//! A call that cannot get either gate within the exclusive wait fails with an
 +//! error. It is never served from a store of its own.
 +//!
++//! The gates are not the pool's own. A rollout starts the next revision of a
++//! workload, a separate workload with separate pools, before the old one has
++//! stopped, so the gate comes from the host-wide [`ExclusiveGates`] registry
++//! held by the [`crate::engine::Engine`], keyed by a [`GateKey`]: the canonical
++//! host paths of the component's volume mounts, or with none its workload's
++//! namespace and its own name. It is attached when the workload is resolved,
++//! after the mounts are canonicalized. The new revision's first store then
++//! waits, within the same deadline, for the old revision's last store to be
++//! dropped. Stopping a workload ([`InstancePool::clear`]) drops its warm
++//! instances and stops its pools admitting calls, so the old revision lets go
++//! as soon as its in-flight calls end.
++//!
  //! Two further consequences of an instance outliving a call, both of which a
  //! component opts into along with the pooling:
  //!
-@@ -47,6 +71,7 @@ use std::collections::{BTreeMap, HashSet};
+@@ -43,10 +79,12 @@
+ //!    calls. A guest that spawns background work and relies on it being torn
+ //!    down with the call should not be pooled.
+ 
+-use std::collections::{BTreeMap, HashSet};
++use std::collections::{BTreeMap, HashMap, HashSet};
  use std::num::NonZeroUsize;
- use std::sync::{Arc, Mutex, MutexGuard};
+-use std::sync::{Arc, Mutex, MutexGuard};
++use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
++use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
  
 +use tokio::sync::{OwnedSemaphorePermit, Semaphore};
  use wasmtime::component::Instance;
  
  use crate::engine::ctx::SharedCtx;
-@@ -54,6 +79,105 @@ use crate::engine::instance_driver::{InstanceDriver, InstanceJob};
+@@ -54,6 +92,242 @@ use crate::engine::instance_driver::{InstanceDriver, InstanceJob};
  use crate::engine::workload::WorkloadComponent;
  use crate::types::Component;
  
@@ -269,7 +288,25 @@ index 9be47f2..101182b 100644
 +
 +/// Held for the lifetime of a store of an exclusive component. See the module
 +/// docs.
-+pub(crate) type StoreLease = OwnedSemaphorePermit;
++///
++/// Keeps its [`ExclusiveGate`] alive, so the gate stays in the host's
++/// [`ExclusiveGates`] registry for as long as any store of the component is
++/// alive, even after the workload that built the store has been dropped: a
++/// later revision then finds the same gate and waits for that store.
++pub(crate) struct StoreLease {
++    _permit: OwnedSemaphorePermit,
++    _gate: Arc<ExclusiveGate>,
++}
++
++impl std::fmt::Debug for StoreLease {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("StoreLease").finish_non_exhaustive()
++    }
++}
++
++/// The error a call to an exclusive component gets once its workload is being
++/// torn down.
++const STOPPING: &str = "the exclusive component's workload is stopping; the call is not served";
 +
 +/// When a call to an exclusive component must have had both its gates by.
 +pub(crate) type Deadline = tokio::time::Instant;
@@ -288,13 +325,18 @@ index 9be47f2..101182b 100644
 +/// the store lease that follows is charged to the same budget.
 +pub(crate) struct CallPermit {
 +    _permit: OwnedSemaphorePermit,
++    _gate: Arc<ExclusiveGate>,
 +    deadline: Deadline,
 +}
 +
 +/// The two single-permit semaphores behind an exclusive component. tokio's
 +/// semaphore queues waiters in FIFO order and removes a waiter whose future is
 +/// dropped, so a caller that goes away stops holding up the line.
-+struct ExclusiveGate {
++///
++/// One gate is shared by every component on the host that resolves to the same
++/// [`GateKey`] (see [`ExclusiveGates`]), so successive revisions of a workload,
++/// which are separate workloads with separate pools, queue on one line.
++pub(crate) struct ExclusiveGate {
 +    calls: Arc<Semaphore>,
 +    stores: Arc<Semaphore>,
 +}
@@ -305,6 +347,116 @@ index 9be47f2..101182b 100644
 +            calls: Arc::new(Semaphore::new(1)),
 +            stores: Arc::new(Semaphore::new(1)),
 +        }
++    }
++}
++
++/// The store-lease side of an [`ExclusiveGate`], as handed to
++/// [`lease_stores`]. Derefs to the store semaphore.
++#[derive(Clone)]
++pub(crate) struct StoreGate(Arc<ExclusiveGate>);
++
++#[cfg(test)]
++impl StoreGate {
++    /// Take the store lease directly, as a store that is already alive holds it.
++    pub(crate) async fn acquire_owned(
++        self,
++    ) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
++        Arc::clone(&self.0.stores).acquire_owned().await
++    }
++}
++
++impl std::ops::Deref for StoreGate {
++    type Target = Semaphore;
++
++    fn deref(&self) -> &Semaphore {
++        &self.0.stores
++    }
++}
++
++/// What an exclusive component's gate is shared by.
++///
++/// The state an exclusive component protects lives behind its volume mounts, so
++/// a component with mounts is keyed by their canonical host paths
++/// ([`crate::engine::volumes::ResolvedVolumeMount::host_path`], sorted and
++/// deduplicated): any two components on the host mounting the same set of
++/// directories share one gate, whichever workload or revision they belong to.
++/// A component without mounts is keyed by its workload's namespace and its own
++/// name, which is what stays the same from one revision to the next.
++#[derive(Clone, Debug, PartialEq, Eq, Hash)]
++pub(crate) enum GateKey {
++    /// Canonical host paths of the component's volume mounts.
++    Volumes(Vec<std::path::PathBuf>),
++    /// Namespace of the component's workload, and the component's name.
++    Named {
++        namespace: Arc<str>,
++        component: Arc<str>,
++    },
++}
++
++impl GateKey {
++    /// The key for a component with the given canonical mount `host_paths`, in
++    /// `namespace`, named `component`.
++    pub(crate) fn for_component(
++        host_paths: impl IntoIterator<Item = std::path::PathBuf>,
++        namespace: &Arc<str>,
++        component: &Arc<str>,
++    ) -> Self {
++        let mut paths: Vec<_> = host_paths.into_iter().collect();
++        paths.sort();
++        paths.dedup();
++        if paths.is_empty() {
++            Self::Named {
++                namespace: Arc::clone(namespace),
++                component: Arc::clone(component),
++            }
++        } else {
++            Self::Volumes(paths)
++        }
++    }
++}
++
++/// The host's exclusive gates, by [`GateKey`]. Held by the
++/// [`crate::engine::Engine`] (clones share one registry), so it spans every
++/// workload the host runs.
++///
++/// Entries are weak: a gate lives as long as a pool, a call permit or a store
++/// lease refers to it, and a key whose gate is gone gets a fresh one. Dead
++/// entries are pruned whenever a gate is looked up.
++#[derive(Clone, Default)]
++pub(crate) struct ExclusiveGates(Arc<Mutex<HashMap<GateKey, Weak<ExclusiveGate>>>>);
++
++impl std::fmt::Debug for ExclusiveGates {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ExclusiveGates").finish_non_exhaustive()
++    }
++}
++
++impl ExclusiveGates {
++    fn lock(&self) -> MutexGuard<'_, HashMap<GateKey, Weak<ExclusiveGate>>> {
++        // Every critical section leaves the map consistent, so a poisoned lock
++        // is safe to keep using.
++        self.0.lock().unwrap_or_else(|poisoned| {
++            self.0.clear_poison();
++            poisoned.into_inner()
++        })
++    }
++
++    /// The live gate for `key`, creating it if there is none.
++    pub(crate) fn gate_for(&self, key: GateKey) -> Arc<ExclusiveGate> {
++        let mut gates = self.lock();
++        gates.retain(|_, gate| gate.strong_count() > 0);
++        if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
++            return gate;
++        }
++        let gate = Arc::new(ExclusiveGate::new());
++        gates.insert(key, Arc::downgrade(&gate));
++        gate
++    }
++
++    /// The registry's entry for `key`, live or not.
++    #[cfg(test)]
++    pub(crate) fn entry(&self, key: &GateKey) -> Option<Weak<ExclusiveGate>> {
++        self.lock().get(key).cloned()
 +    }
 +}
 +
@@ -334,7 +486,7 @@ index 9be47f2..101182b 100644
 +/// Must be called without any workload lock held: the wait can be long, and the
 +/// store that is being waited for may need that lock to finish.
 +pub(crate) async fn lease_stores(
-+    gates: Vec<Arc<Semaphore>>,
++    gates: Vec<StoreGate>,
 +    deadline: Option<Deadline>,
 +) -> anyhow::Result<Vec<StoreLease>> {
 +    if gates.is_empty() {
@@ -342,8 +494,12 @@ index 9be47f2..101182b 100644
 +    }
 +    let deadline = deadline.unwrap_or_else(|| Deadline::now() + crate::timeouts::exclusive_wait());
 +    let mut leases = Vec::with_capacity(gates.len());
-+    for gate in gates {
-+        leases.push(acquire_until(gate, "store lease", deadline).await?);
++    for StoreGate(gate) in gates {
++        let permit = acquire_until(Arc::clone(&gate.stores), "store lease", deadline).await?;
++        leases.push(StoreLease {
++            _permit: permit,
++            _gate: gate,
++        });
 +    }
 +    Ok(leases)
 +}
@@ -354,7 +510,7 @@ index 9be47f2..101182b 100644
 +pub(crate) fn store_gates(
 +    components: &BTreeMap<Arc<str>, WorkloadComponent>,
 +    ids: &[Arc<str>],
-+) -> Vec<Arc<Semaphore>> {
++) -> Vec<StoreGate> {
 +    components
 +        .iter()
 +        .filter(|(id, _)| ids.contains(id))
@@ -365,7 +521,7 @@ index 9be47f2..101182b 100644
  /// The pool that may keep `component_id`'s instances warm, or `None` when
  /// every call must get a store of its own.
  ///
-@@ -99,7 +223,10 @@ pub(crate) enum Dispatch {
+@@ -99,7 +373,10 @@ pub(crate) enum Dispatch {
      NeedsInstance(InstanceJob),
      /// Every warm instance is busy and the pool is full. Serve it from a store
      /// of its own — which is what an unpooled component pays for every call,
@@ -377,7 +533,7 @@ index 9be47f2..101182b 100644
      Saturated(InstanceJob),
  }
  
-@@ -147,6 +274,16 @@ pub enum InstancePolicy {
+@@ -147,6 +424,16 @@ pub enum InstancePolicy {
          /// it can take more.
          max_concurrency: NonZeroUsize,
      },
@@ -394,7 +550,7 @@ index 9be47f2..101182b 100644
  }
  
  impl InstancePolicy {
-@@ -155,6 +292,13 @@ impl InstancePolicy {
+@@ -155,6 +442,13 @@ impl InstancePolicy {
      /// Takes the whole component rather than its limits so that a limit added
      /// to [`Component`] later reaches this without changing the signature.
      pub fn from_component(component: &Component) -> Self {
@@ -408,7 +564,7 @@ index 9be47f2..101182b 100644
          Self::from_limits(
              component.pool_size,
              component.max_invocations,
-@@ -162,6 +306,27 @@ impl InstancePolicy {
+@@ -162,6 +456,27 @@ impl InstancePolicy {
          )
      }
  
@@ -436,7 +592,7 @@ index 9be47f2..101182b 100644
      /// Decode the wire limits. Anything that does not name a positive pool
      /// size, whether unset (`-1`), zero or negative, means instances are not
      /// kept; an unset `max_concurrency` means one call at a time.
-@@ -179,7 +344,7 @@ impl InstancePolicy {
+@@ -179,7 +494,7 @@ impl InstancePolicy {
  
      /// Whether this component keeps instances warm at all.
      pub fn keeps_instances_warm(&self) -> bool {
@@ -445,7 +601,7 @@ index 9be47f2..101182b 100644
      }
  
      /// Guest calls this component may have in flight at once: every warm
-@@ -191,7 +356,7 @@ impl InstancePolicy {
+@@ -191,7 +506,7 @@ impl InstancePolicy {
      /// (see `crate::host::http_client`).
      pub fn call_concurrency(&self) -> usize {
          match self {
@@ -454,31 +610,73 @@ index 9be47f2..101182b 100644
              Self::Warm {
                  pool_size,
                  max_concurrency,
-@@ -210,6 +375,8 @@ pub(crate) struct InstancePool {
+@@ -210,6 +525,16 @@ pub(crate) struct InstancePool {
      /// they arrive over HTTP or from another component in the workload.
      drivers: Mutex<Vec<Arc<InstanceDriver>>>,
      policy: InstancePolicy,
-+    /// Present exactly when the policy is [`InstancePolicy::Exclusive`].
-+    gate: Option<ExclusiveGate>,
++    /// The gate of an exclusive component; never set for any other. Attached
++    /// from the host's [`ExclusiveGates`] once the workload's volume mounts are
++    /// resolved (see [`Self::attach_gate`]); a pool that is used before then,
++    /// or never attached, gets a gate of its own.
++    gate: OnceLock<Arc<ExclusiveGate>>,
++    /// Set by [`Self::clear`] when the workload is torn down. A stopped pool
++    /// admits no further calls and builds no further instances, so callers of
++    /// a stopped revision that were queued on a gate it shares with the next
++    /// revision step aside instead of opening the component again.
++    stopped: AtomicBool,
  }
  
  impl InstancePool {
-@@ -217,9 +384,43 @@ impl InstancePool {
+@@ -217,9 +542,82 @@ impl InstancePool {
          Self {
              drivers: Mutex::new(Vec::new()),
              policy,
-+            gate: matches!(policy, InstancePolicy::Exclusive { .. }).then(ExclusiveGate::new),
++            gate: OnceLock::new(),
++            stopped: AtomicBool::new(false),
          }
      }
  
 +    /// Whether this component must never have two stores alive at once.
 +    pub(crate) fn is_exclusive(&self) -> bool {
-+        self.gate.is_some()
++        matches!(self.policy, InstancePolicy::Exclusive { .. })
++    }
++
++    /// The exclusive gate, `None` for a component that is not exclusive.
++    fn gate(&self) -> Option<&Arc<ExclusiveGate>> {
++        self.is_exclusive()
++            .then(|| self.gate.get_or_init(|| Arc::new(ExclusiveGate::new())))
++    }
++
++    /// Share `gate` (the host-wide gate for this component's [`GateKey`]) for
++    /// an exclusive component. Does nothing for one that is not exclusive.
++    ///
++    /// Must run before the component serves anything: it fails if the pool
++    /// already uses a different gate.
++    pub(crate) fn attach_gate(&self, gate: Arc<ExclusiveGate>) -> anyhow::Result<()> {
++        if !self.is_exclusive() {
++            return Ok(());
++        }
++        let attached = self.gate.get_or_init(|| Arc::clone(&gate));
++        anyhow::ensure!(
++            Arc::ptr_eq(attached, &gate),
++            "exclusive component's gate was attached after it was first used"
++        );
++        Ok(())
 +    }
 +
 +    /// The gate a store of this component takes a lease on, if exclusive.
-+    pub(crate) fn store_gate(&self) -> Option<Arc<Semaphore>> {
-+        self.gate.as_ref().map(|g| Arc::clone(&g.stores))
++    pub(crate) fn store_gate(&self) -> Option<StoreGate> {
++        self.gate().map(|g| StoreGate(Arc::clone(g)))
++    }
++
++    /// Whether the workload this pool belongs to has been torn down.
++    fn is_stopped(&self) -> bool {
++        self.stopped.load(AtomicOrdering::SeqCst)
++    }
++
++    fn ensure_running(&self) -> anyhow::Result<()> {
++        anyhow::ensure!(!self.is_stopped(), STOPPING);
++        Ok(())
 +    }
 +
 +    /// Wait in line for this exclusive component. `None` for a component that
@@ -493,13 +691,18 @@ index 9be47f2..101182b 100644
 +        &self,
 +        wait: std::time::Duration,
 +    ) -> anyhow::Result<Option<CallPermit>> {
-+        let Some(gate) = &self.gate else {
++        let Some(gate) = self.gate() else {
 +            return Ok(None);
 +        };
++        self.ensure_running()?;
 +        let deadline = Deadline::now() + wait;
 +        let permit = acquire_until(Arc::clone(&gate.calls), "call permit", deadline).await?;
++        // The gate may be shared with a later revision: a caller of this one
++        // that was queued while it was torn down lets the line move on.
++        self.ensure_running()?;
 +        Ok(Some(CallPermit {
 +            _permit: permit,
++            _gate: Arc::clone(gate),
 +            deadline,
 +        }))
 +    }
@@ -507,7 +710,7 @@ index 9be47f2..101182b 100644
      /// Lock the driver list, recovering it if a panic poisoned the lock.
      ///
      /// Treating a poisoned lock as "no pool" would disable pooling for the
-@@ -249,7 +450,8 @@ impl InstancePool {
+@@ -249,7 +647,8 @@ impl InstancePool {
          self.policy.call_concurrency()
      }
  
@@ -517,7 +720,7 @@ index 9be47f2..101182b 100644
      fn limits(&self) -> Option<(usize, Option<usize>, usize)> {
          match self.policy {
              InstancePolicy::Ephemeral => None,
-@@ -262,6 +464,9 @@ impl InstancePool {
+@@ -262,6 +661,9 @@ impl InstancePool {
                  max_invocations.map(NonZeroUsize::get),
                  max_concurrency.get(),
              )),
@@ -527,7 +730,7 @@ index 9be47f2..101182b 100644
          }
      }
  
-@@ -272,7 +477,12 @@ impl InstancePool {
+@@ -272,7 +674,12 @@ impl InstancePool {
      /// as [`Dispatch::NeedsInstance`] rather than creating one itself — that
      /// keeps a request that a warm instance can already serve from paying for
      /// a store it will not use.
@@ -541,7 +744,7 @@ index 9be47f2..101182b 100644
          let Some((pool_size, _, _)) = self.limits() else {
              return Dispatch::Saturated(job);
          };
-@@ -290,7 +500,7 @@ impl InstancePool {
+@@ -290,7 +697,7 @@ impl InstancePool {
  
          let mut job = job;
          for driver in drivers.iter() {
@@ -550,7 +753,7 @@ index 9be47f2..101182b 100644
                  Ok(()) => return Dispatch::Sent,
                  Err(returned) => job = returned,
              }
-@@ -303,6 +513,46 @@ impl InstancePool {
+@@ -303,6 +710,56 @@ impl InstancePool {
          }
      }
  
@@ -575,6 +778,9 @@ index 9be47f2..101182b 100644
 +        B: FnOnce(Option<Deadline>) -> Fut,
 +        Fut: std::future::Future<Output = anyhow::Result<ComponentInstance>>,
 +    {
++        if self.is_exclusive() {
++            self.ensure_running()?;
++        }
 +        match self.offer(job, permit) {
 +            Dispatch::Sent => Ok(Ok(())),
 +            // The pool has room. The caller builds and instantiates the store,
@@ -584,7 +790,14 @@ index 9be47f2..101182b 100644
 +            Dispatch::NeedsInstance(job) => {
 +                // The lease wait inside `build` shares the call's deadline.
 +                let deadline = permit.as_ref().map(CallPermit::deadline);
-+                Ok(self.install(build(deadline).await?, job, permit))
++                match self.install(build(deadline).await?, job, permit) {
++                    // Torn down while the instance was being built: it has been
++                    // dropped, and the call must not go anywhere else.
++                    Err(_) if self.is_exclusive() && self.is_stopped() => {
++                        anyhow::bail!(STOPPING)
++                    }
++                    installed => Ok(installed),
++                }
 +            }
 +            Dispatch::Saturated(_) if self.is_exclusive() => anyhow::bail!(
 +                "exclusive component is saturated despite holding its call permit; \
@@ -597,7 +810,7 @@ index 9be47f2..101182b 100644
      /// Add an instance built for a [`Dispatch::NeedsInstance`] and give it the
      /// call. Racing callers can both be told to build one; the loser's is
      /// dropped and its call offered to the winner's instead.
-@@ -310,6 +560,7 @@ impl InstancePool {
+@@ -310,14 +767,22 @@ impl InstancePool {
          &self,
          instance: ComponentInstance,
          job: InstanceJob,
@@ -605,8 +818,15 @@ index 9be47f2..101182b 100644
      ) -> Result<(), InstanceJob> {
          let Some((pool_size, max_invocations, max_concurrency)) = self.limits() else {
              return Err(job);
-@@ -317,7 +568,7 @@ impl InstancePool {
+         };
          let mut drivers = self.lock_drivers();
++        // Checked under the lock `clear` takes, so an exclusive instance is
++        // never installed into a pool that has already been emptied.
++        if self.is_exclusive() && self.is_stopped() {
++            drop(drivers);
++            drop(instance);
++            return Err(job);
++        }
          if drivers.len() >= pool_size {
              drop(drivers);
 -            return match self.offer(job) {
@@ -614,7 +834,7 @@ index 9be47f2..101182b 100644
                  Dispatch::Sent => Ok(()),
                  Dispatch::NeedsInstance(job) | Dispatch::Saturated(job) => Err(job),
              };
-@@ -329,7 +580,7 @@ impl InstancePool {
+@@ -329,7 +794,7 @@ impl InstancePool {
          ));
          drivers.push(Arc::clone(&driver));
          drop(drivers);
@@ -623,7 +843,22 @@ index 9be47f2..101182b 100644
      }
  
      /// Whether this component keeps instances warm at all.
-@@ -362,6 +613,9 @@ fn sort_least_busy(drivers: &mut [Arc<InstanceDriver>]) {
+@@ -341,8 +806,14 @@ impl InstancePool {
+     /// Dropping a driver's handle closes its channel, which ends its store's
+     /// run loop. This does not wait for a drain: calls still in flight on
+     /// those instances end with the store they were running on.
++    ///
++    /// It also marks the pool stopped. For an exclusive component that means
++    /// no further call is admitted or instance built, so once the instances
++    /// taken here have finished their calls, nothing of this workload holds
++    /// the component's gate and the next revision's first call proceeds.
+     pub(crate) fn clear(&self) {
+         let mut drivers = self.lock_drivers();
++        self.stopped.store(true, AtomicOrdering::SeqCst);
+         drop(std::mem::take(&mut *drivers));
+     }
+ }
+@@ -362,6 +833,9 @@ fn sort_least_busy(drivers: &mut [Arc<InstanceDriver>]) {
      drivers.sort_by_cached_key(|d| d.in_flight());
  }
  
@@ -635,10 +870,10 @@ index 9be47f2..101182b 100644
      use std::sync::Arc;
 diff --git a/crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs b/crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs
 new file mode 100644
-index 0000000..53fb4c9
+index 0000000..ba3d606
 --- /dev/null
 +++ b/crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs
-@@ -0,0 +1,654 @@
+@@ -0,0 +1,1002 @@
 +//! Exclusive components never have two stores alive at once.
 +//!
 +//! These drive real concurrency through the production dispatch path
@@ -759,16 +994,41 @@ index 0000000..53fb4c9
 +        let engine = crate::engine::Engine::builder()
 +            .build()
 +            .expect("engine builds");
++        Self::on_pool(engine, Arc::new(InstancePool::new(policy)), Arc::default())
++    }
++
++    /// A rig driving `pool`, counting its stores in `live`.
++    fn on_pool(
++        engine: crate::engine::Engine,
++        pool: Arc<InstancePool>,
++        live: Arc<Live>,
++    ) -> Arc<Self> {
 +        let bytes = wat::parse_str(GUEST).expect("guest is valid");
 +        let component = Component::new(engine.inner(), bytes).expect("guest compiles");
 +        let linker = Linker::new(engine.inner());
 +        Arc::new(Self {
-+            pool: Arc::new(InstancePool::new(policy)),
-+            live: Arc::default(),
++            pool,
++            live,
 +            engine,
 +            component,
 +            linker,
 +        })
++    }
++
++    /// A rig driving the pool of the one component of `workload`, as the host
++    /// resolved it.
++    async fn on_workload(
++        engine: &crate::engine::Engine,
++        workload: &crate::engine::workload::ResolvedWorkload,
++        live: &Arc<Live>,
++    ) -> Arc<Self> {
++        let pool = {
++            let components = workload.components();
++            let components = components.read().await;
++            let component = components.values().next().expect("one component");
++            Arc::clone(&component.instances)
++        };
++        Self::on_pool(engine.clone(), pool, Arc::clone(live))
 +    }
 +
 +    /// What the call sites' `build` closures do: take the store lease the way
@@ -1293,6 +1553,329 @@ index 0000000..53fb4c9
 +        started.elapsed()
 +    );
 +}
++
++// --- Across workloads (#152) ------------------------------------------------
++//
++// A Recreate rollout starts the next revision of a workload before the old one
++// has stopped, and each revision is a workload of its own with pools of its
++// own. The gate therefore comes from the host's registry, keyed by what the
++// component would open twice: its volume mounts' canonical host paths, or with
++// none its namespace and name. These build the workloads the way the host does
++// (`Engine::initialize_workload` then `resolve`), stop them the way it does
++// (`unbind_all_plugins`, which `workload_stop` runs) and drive calls through
++// their real pools.
++
++/// An exclusive component running the test guest, mounting `host_path` if
++/// given, in a workload of its own on `engine`, initialized and resolved the
++/// way the host does it.
++async fn exclusive_workload(
++    engine: &crate::engine::Engine,
++    namespace: &str,
++    workload_name: &str,
++    host_path: Option<&std::path::Path>,
++) -> crate::engine::workload::ResolvedWorkload {
++    let mut local_resources = crate::types::LocalResources::default();
++    local_resources
++        .config
++        .insert(EXCLUSIVE_INSTANCE_KEY.to_string(), "true".to_string());
++    let mut volumes = Vec::new();
++    if let Some(host_path) = host_path {
++        volumes.push(crate::types::Volume {
++            name: "data".to_string(),
++            volume_type: crate::types::VolumeType::HostPath(crate::types::HostPathVolume {
++                local_path: host_path.to_string_lossy().into_owned(),
++            }),
++        });
++        local_resources
++            .volume_mounts
++            .push(crate::types::VolumeMount {
++                name: "data".to_string(),
++                mount_path: "/data".to_string(),
++                read_only: false,
++            });
++    }
++    let workload = crate::types::Workload {
++        namespace: namespace.to_string(),
++        name: workload_name.to_string(),
++        annotations: Default::default(),
++        service: None,
++        components: vec![crate::types::Component {
++            name: "pglite".to_string(),
++            bytes: wat::parse_str(GUEST).expect("guest is valid").into(),
++            local_resources,
++            ..Default::default()
++        }],
++        host_interfaces: vec![],
++        volumes,
++    };
++    engine
++        .initialize_workload(uuid::Uuid::new_v4().to_string(), workload)
++        .expect("workload initializes")
++        .resolve(None, Arc::new(crate::host::http::NullServer::default()))
++        .await
++        .expect("workload resolves")
++}
++
++fn one_engine() -> crate::engine::Engine {
++    crate::engine::Engine::builder()
++        .build()
++        .expect("engine builds")
++}
++
++fn same_gate(a: &Rig, b: &Rig) -> bool {
++    Arc::ptr_eq(
++        a.pool.gate().expect("exclusive"),
++        b.pool.gate().expect("exclusive"),
++    )
++}
++
++/// Assert `call` is still waiting after a while, and that only one store has
++/// been built between the rigs counting into `live`.
++async fn assert_still_waiting<T>(call: &tokio::task::JoinHandle<T>, live: &Live) {
++    tokio::time::sleep(Duration::from_millis(300)).await;
++    assert!(
++        !call.is_finished(),
++        "the next revision ran while the old one held the component"
++    );
++    assert_eq!(live.created.load(Ordering::SeqCst), 1);
++    assert_eq!(live.now.load(Ordering::SeqCst), 1);
++}
++
++/// Wait until the registry's entry for `key` can no longer be upgraded.
++async fn gate_released(engine: &crate::engine::Engine, key: &GateKey) {
++    let deadline = Instant::now() + Duration::from_secs(20);
++    loop {
++        let entry = engine
++            .exclusive_gates
++            .entry(key)
++            .expect("the key was registered");
++        if entry.upgrade().is_none() {
++            return;
++        }
++        assert!(Instant::now() < deadline, "the gate was never released");
++        tokio::time::sleep(Duration::from_millis(5)).await;
++    }
++}
++
++/// Two revisions mounting the same host path share one gate: the new
++/// revision's first call waits while the old revision's warm instance holds the
++/// component, and proceeds once the old workload is stopped. Once both are
++/// stopped, nothing holds the gate and its registry entry is dead.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn revisions_mounting_one_host_path_share_one_gate() {
++    let dir = tempfile::tempdir().expect("temp dir");
++    let engine = one_engine();
++    let live = Arc::<Live>::default();
++
++    let old = exclusive_workload(&engine, "tenant", "pglite-rev1", Some(dir.path())).await;
++    let new = exclusive_workload(&engine, "tenant", "pglite-rev2", Some(dir.path())).await;
++    let old_rig = Rig::on_workload(&engine, &old, &live).await;
++    let new_rig = Rig::on_workload(&engine, &new, &live).await;
++    assert!(same_gate(&old_rig, &new_rig), "one gate per host path");
++
++    // The old revision is serving: its warm instance holds the store lease.
++    assert_eq!(old_rig.call("ok", PATIENT).await.expect("old serves"), 7);
++
++    let first_call = {
++        let new_rig = Arc::clone(&new_rig);
++        tokio::spawn(async move { new_rig.call("ok", PATIENT).await })
++    };
++    assert_still_waiting(&first_call, &live).await;
++
++    // Stop the old revision the way `workload_stop` does.
++    old.unbind_all_plugins().await.expect("old stops");
++    assert_eq!(
++        first_call
++            .await
++            .unwrap()
++            .expect("served once the old revision is gone"),
++        7
++    );
++    assert_eq!(old_rig.peak(), 1, "never two stores of the component");
++    assert_eq!(old_rig.created(), 2);
++
++    // A late call to the stopped revision is refused rather than built.
++    let err = old_rig
++        .call("ok", PATIENT)
++        .await
++        .expect_err("a stopped revision serves nothing");
++    assert!(err.to_string().contains("stopping"), "{err}");
++    assert_eq!(old_rig.created(), 2);
++
++    // Stop the new revision too, and let everything go.
++    new.unbind_all_plugins().await.expect("new stops");
++    let key = GateKey::Volumes(vec![
++        std::fs::canonicalize(dir.path()).expect("canonical path"),
++    ]);
++    drop((old_rig, new_rig, old, new));
++    gate_released(&engine, &key).await;
++    assert_eq!(live.now.load(Ordering::SeqCst), 0);
++}
++
++/// Components mounting different host paths have gates of their own and run
++/// side by side.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn different_host_paths_run_concurrently() {
++    let (one, two) = (
++        tempfile::tempdir().expect("temp dir"),
++        tempfile::tempdir().expect("temp dir"),
++    );
++    let engine = one_engine();
++    let live = Arc::<Live>::default();
++
++    let a = exclusive_workload(&engine, "tenant", "pglite", Some(one.path())).await;
++    let b = exclusive_workload(&engine, "tenant", "pglite", Some(two.path())).await;
++    let (a_rig, b_rig) = (
++        Rig::on_workload(&engine, &a, &live).await,
++        Rig::on_workload(&engine, &b, &live).await,
++    );
++    assert!(!same_gate(&a_rig, &b_rig));
++
++    assert_eq!(a_rig.call("ok", PATIENT).await.expect("a serves"), 7);
++    let b_call = tokio::time::timeout(Duration::from_secs(5), b_rig.call("ok", PATIENT))
++        .await
++        .expect("b does not wait for a")
++        .expect("b serves");
++    assert_eq!(b_call, 7);
++    assert_eq!(
++        live.now.load(Ordering::SeqCst),
++        2,
++        "both warm instances are alive at once"
++    );
++
++    a.unbind_all_plugins().await.unwrap();
++    b.unbind_all_plugins().await.unwrap();
++    a_rig.settled().await;
++}
++
++/// Without a mount, two workloads share a gate when the namespace and the
++/// component's name match: the second waits for the first to stop.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn unmounted_components_share_a_gate_by_namespace_and_name() {
++    let engine = one_engine();
++    let live = Arc::<Live>::default();
++
++    let old = exclusive_workload(&engine, "tenant", "pglite-rev1", None).await;
++    let new = exclusive_workload(&engine, "tenant", "pglite-rev2", None).await;
++    let old_rig = Rig::on_workload(&engine, &old, &live).await;
++    let new_rig = Rig::on_workload(&engine, &new, &live).await;
++    assert!(same_gate(&old_rig, &new_rig));
++
++    assert_eq!(old_rig.call("ok", PATIENT).await.expect("old serves"), 7);
++    let first_call = {
++        let new_rig = Arc::clone(&new_rig);
++        tokio::spawn(async move { new_rig.call("ok", PATIENT).await })
++    };
++    assert_still_waiting(&first_call, &live).await;
++
++    old.unbind_all_plugins().await.unwrap();
++    assert_eq!(first_call.await.unwrap().expect("served"), 7);
++    assert_eq!(old_rig.peak(), 1);
++
++    new.unbind_all_plugins().await.unwrap();
++    let key = GateKey::Named {
++        namespace: Arc::from("tenant"),
++        component: Arc::from("pglite"),
++    };
++    drop((old_rig, new_rig, old, new));
++    gate_released(&engine, &key).await;
++}
++
++/// The same component name in another namespace has a gate of its own.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn different_namespaces_do_not_share_a_gate() {
++    let engine = one_engine();
++    let live = Arc::<Live>::default();
++
++    let a = exclusive_workload(&engine, "tenant-a", "pglite", None).await;
++    let b = exclusive_workload(&engine, "tenant-b", "pglite", None).await;
++    let (a_rig, b_rig) = (
++        Rig::on_workload(&engine, &a, &live).await,
++        Rig::on_workload(&engine, &b, &live).await,
++    );
++    assert!(!same_gate(&a_rig, &b_rig));
++
++    assert_eq!(a_rig.call("ok", PATIENT).await.expect("a serves"), 7);
++    let b_call = tokio::time::timeout(Duration::from_secs(5), b_rig.call("ok", PATIENT))
++        .await
++        .expect("b does not wait for a")
++        .expect("b serves");
++    assert_eq!(b_call, 7);
++
++    a.unbind_all_plugins().await.unwrap();
++    b.unbind_all_plugins().await.unwrap();
++    a_rig.settled().await;
++}
++
++/// A store that outlives its workload's pool (a call still running when the
++/// workload is dropped) keeps the gate alive through its lease, so the next
++/// revision gets the same gate and waits for that store.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_store_outliving_its_workload_keeps_the_gate() {
++    let dir = tempfile::tempdir().expect("temp dir");
++    let engine = one_engine();
++    let live = Arc::<Live>::default();
++
++    let old = exclusive_workload(&engine, "tenant", "pglite-rev1", Some(dir.path())).await;
++    let old_rig = Rig::on_workload(&engine, &old, &live).await;
++    let orphan = old_rig.build(None).await.expect("old store");
++    old.unbind_all_plugins().await.unwrap();
++    drop((old_rig, old));
++
++    let new = exclusive_workload(&engine, "tenant", "pglite-rev2", Some(dir.path())).await;
++    let new_rig = Rig::on_workload(&engine, &new, &live).await;
++    let first_call = {
++        let new_rig = Arc::clone(&new_rig);
++        tokio::spawn(async move { new_rig.call("ok", PATIENT).await })
++    };
++    assert_still_waiting(&first_call, &live).await;
++
++    drop(orphan);
++    assert_eq!(first_call.await.unwrap().expect("served"), 7);
++    assert_eq!(new_rig.peak(), 1);
++    new.unbind_all_plugins().await.unwrap();
++}
++
++/// The registry hands out one live gate per key and a fresh one once the old
++/// gate is gone, pruning dead entries as it goes.
++#[test]
++fn the_registry_shares_live_gates_and_forgets_dead_ones() {
++    let gates = ExclusiveGates::default();
++    let key = |p: &str| {
++        GateKey::for_component(
++            [std::path::PathBuf::from(p)],
++            &Arc::from("ns"),
++            &Arc::from("c"),
++        )
++    };
++
++    let first = gates.gate_for(key("/data"));
++    assert!(Arc::ptr_eq(&first, &gates.gate_for(key("/data"))));
++    assert!(!Arc::ptr_eq(&first, &gates.gate_for(key("/other"))));
++    // Order and duplicates of the mounts do not matter.
++    assert_eq!(
++        GateKey::for_component(
++            ["/b", "/a", "/b"].map(std::path::PathBuf::from),
++            &Arc::from("ns"),
++            &Arc::from("c")
++        ),
++        GateKey::Volumes(vec!["/a".into(), "/b".into()])
++    );
++
++    let weak = Arc::downgrade(&first);
++    drop(first);
++    assert!(weak.upgrade().is_none());
++    assert!(
++        gates
++            .entry(&key("/data"))
++            .is_some_and(|w| w.upgrade().is_none())
++    );
++    let _again = gates.gate_for(key("/again"));
++    assert!(
++        gates.entry(&key("/data")).is_none(),
++        "dead entries are pruned"
++    );
++}
 diff --git a/crates/wash-runtime/src/engine/linked_call.rs b/crates/wash-runtime/src/engine/linked_call.rs
 index 9f1bf20..272626a 100644
 --- a/crates/wash-runtime/src/engine/linked_call.rs
@@ -1441,7 +2024,7 @@ index 9f1bf20..272626a 100644
  
      let params_buf = declined_params.unwrap_or_else(|| params.to_vec());
 diff --git a/crates/wash-runtime/src/engine/mod.rs b/crates/wash-runtime/src/engine/mod.rs
-index b894375..df141c1 100644
+index b894375..d22535a 100644
 --- a/crates/wash-runtime/src/engine/mod.rs
 +++ b/crates/wash-runtime/src/engine/mod.rs
 @@ -221,7 +221,7 @@ pub mod abandon;
@@ -1453,8 +2036,37 @@ index b894375..df141c1 100644
  pub mod host_memory;
  pub(crate) mod linked_call;
  pub(crate) mod store;
+@@ -291,6 +291,10 @@ pub struct Engine {
+     /// somewhere else would miss the env override (applied inside
+     /// [`new_pooling_config`]) and drift the moment either side changed.
+     total_core_instances: Option<u32>,
++    /// The exclusive gates of every workload on this engine, shared by its
++    /// clones, so that successive revisions of a workload queue on one gate
++    /// per exclusive component. See [`instance_pool::ExclusiveGates`].
++    pub(crate) exclusive_gates: instance_pool::ExclusiveGates,
+ }
+ 
+ impl std::fmt::Debug for Engine {
+@@ -493,7 +497,8 @@ impl Engine {
+             service,
+             workload_components,
+             host_interfaces,
+-        );
++        )
++        .with_exclusive_gates(self.exclusive_gates.clone());
+ 
+         #[cfg(feature = "wasi-tls")]
+         let workload = workload.maybe_with_tls_provider(self.tls_provider.clone());
+@@ -1095,6 +1100,7 @@ impl EngineBuilder {
+             #[cfg(feature = "wasi-tls")]
+             tls_provider: self.tls_provider,
+             total_core_instances,
++            exclusive_gates: Default::default(),
+         })
+     }
+ }
 diff --git a/crates/wash-runtime/src/engine/workload.rs b/crates/wash-runtime/src/engine/workload.rs
-index b8f06ab..83a5f1f 100644
+index b8f06ab..a8061a6 100644
 --- a/crates/wash-runtime/src/engine/workload.rs
 +++ b/crates/wash-runtime/src/engine/workload.rs
 @@ -621,19 +621,30 @@ struct ServiceStoreRecipe {
@@ -1462,7 +2074,7 @@ index b8f06ab..83a5f1f 100644
      linked_templates: Vec<ComponentCtxTemplate>,
      linked_instances: Vec<(Arc<str>, wasmtime::component::InstancePre<SharedCtx>)>,
 +    /// Store-lease gates of the exclusive components linked into the store.
-+    store_gates: Vec<Arc<tokio::sync::Semaphore>>,
++    store_gates: Vec<instance_pool::StoreGate>,
  }
  
  impl ServiceStoreRecipe {
@@ -1489,7 +2101,48 @@ index b8f06ab..83a5f1f 100644
          )
          .await
      }
-@@ -1148,6 +1159,54 @@ impl ResolvedWorkload {
+@@ -945,6 +956,40 @@ impl ResolvedWorkload {
+         &self.host_interfaces
+     }
+ 
++    /// Give each exclusive component the host-wide gate for its
++    /// [`instance_pool::GateKey`]: the canonical host paths of its volume
++    /// mounts, or, with none, the workload's namespace and the component's
++    /// name. Needs the mounts resolved.
++    async fn attach_exclusive_gates(
++        &self,
++        gates: &instance_pool::ExclusiveGates,
++    ) -> anyhow::Result<()> {
++        let components = self.components.read().await;
++        for component in components.values() {
++            if !component.instances.is_exclusive() {
++                continue;
++            }
++            anyhow::ensure!(
++                component.metadata.volume_mounts.is_empty()
++                    || !component.metadata.resolved_volume_mounts.is_empty(),
++                "exclusive component '{}' has unresolved volume mounts",
++                component.name()
++            );
++            let key = instance_pool::GateKey::for_component(
++                component
++                    .metadata
++                    .resolved_volume_mounts
++                    .iter()
++                    .map(|mount| mount.host_path.clone()),
++                &component.metadata.workload_namespace,
++                &component.name,
++            );
++            debug!(component = component.name(), ?key, "exclusive gate");
++            component.instances.attach_gate(gates.gate_for(key))?;
++        }
++        Ok(())
++    }
++
+     async fn resolve_component_volume_mounts(
+         &self,
+         component_ids: &[Arc<str>],
+@@ -1148,6 +1193,54 @@ impl ResolvedWorkload {
              res?;
          }
  
@@ -1544,7 +2197,7 @@ index b8f06ab..83a5f1f 100644
          Ok(())
      }
  
-@@ -1481,12 +1540,27 @@ impl ResolvedWorkload {
+@@ -1481,12 +1574,27 @@ impl ResolvedWorkload {
          &self,
          component_id: &str,
      ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
@@ -1573,7 +2226,7 @@ index b8f06ab..83a5f1f 100644
              let active_template = self.component_ctx_template(metadata);
              let mut linked_templates = Vec::with_capacity(metadata.linked_components.len());
              let mut linked_instances = Vec::with_capacity(metadata.linked_components.len());
-@@ -1502,8 +1576,12 @@ impl ResolvedWorkload {
+@@ -1502,8 +1610,12 @@ impl ResolvedWorkload {
                  active_template,
                  linked_templates,
                  linked_instances,
@@ -1586,7 +2239,7 @@ index b8f06ab..83a5f1f 100644
          new_store_from_templates(
              &engine,
              self.http_handler.clone(),
-@@ -1511,6 +1589,7 @@ impl ResolvedWorkload {
+@@ -1511,6 +1623,7 @@ impl ResolvedWorkload {
              &linked_templates,
              &linked_instances,
              false,
@@ -1594,7 +2247,7 @@ index b8f06ab..83a5f1f 100644
          )
          .await
      }
-@@ -1554,15 +1633,7 @@ impl ResolvedWorkload {
+@@ -1554,15 +1667,7 @@ impl ResolvedWorkload {
          is_service: bool,
      ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
          let recipe = self.service_store_recipe(metadata).await?;
@@ -1611,7 +2264,7 @@ index b8f06ab..83a5f1f 100644
      }
  
      /// Capture everything needed to (re)build this service's store, so the
-@@ -1577,9 +1648,10 @@ impl ResolvedWorkload {
+@@ -1577,9 +1682,10 @@ impl ResolvedWorkload {
              .iter()
              .cloned()
              .collect::<Vec<_>>();
@@ -1624,7 +2277,7 @@ index b8f06ab..83a5f1f 100644
                  .iter()
                  .map(|linked_component_id| {
                      components
-@@ -1589,7 +1661,8 @@ impl ResolvedWorkload {
+@@ -1589,7 +1695,8 @@ impl ResolvedWorkload {
                              format!("linked component '{linked_component_id}' not found")
                          })
                  })
@@ -1634,7 +2287,7 @@ index b8f06ab..83a5f1f 100644
          };
          let active_template = self.component_ctx_template(metadata);
          let linked_templates = linked_metadata
-@@ -1610,6 +1683,7 @@ impl ResolvedWorkload {
+@@ -1610,6 +1717,7 @@ impl ResolvedWorkload {
              active_template,
              linked_templates,
              linked_instances,
@@ -1642,6 +2295,58 @@ index b8f06ab..83a5f1f 100644
          })
      }
  
+@@ -1937,6 +2045,10 @@ pub struct UnresolvedWorkload {
+     /// TLS provider override for `wasi:tls` client connections in this workload.
+     #[cfg(feature = "wasi-tls")]
+     tls_provider: Option<SharedTlsProvider>,
++    /// The host's exclusive gates, which the workload's exclusive components
++    /// take theirs from when it is resolved. A workload built without an
++    /// engine's registry gets one of its own.
++    exclusive_gates: instance_pool::ExclusiveGates,
+ }
+ 
+ impl UnresolvedWorkload {
+@@ -1979,9 +2091,19 @@ impl UnresolvedWorkload {
+             host_interfaces,
+             #[cfg(feature = "wasi-tls")]
+             tls_provider: None,
++            exclusive_gates: Default::default(),
+         }
+     }
+ 
++    /// Take exclusive components' gates from `gates`, the host's registry, so
++    /// that they are shared with every other workload on the host (another
++    /// revision of this one, in particular) whose exclusive components resolve
++    /// to the same [`instance_pool::GateKey`].
++    pub(crate) fn with_exclusive_gates(mut self, gates: instance_pool::ExclusiveGates) -> Self {
++        self.exclusive_gates = gates;
++        self
++    }
++
+     /// Iterates the workload's components in manifest order.
+     fn components_in_manifest_order(&self) -> impl Iterator<Item = &WorkloadComponent> {
+         self.component_order
+@@ -2535,6 +2657,20 @@ impl UnresolvedWorkload {
+             bail!(e);
+         }
+ 
++        // Exclusive components share their gate host-wide, keyed by the mounts
++        // canonicalized just above. Attached before anything can call them.
++        if let Err(e) = resolved_workload
++            .attach_exclusive_gates(&self.exclusive_gates)
++            .await
++        {
++            warn!(
++                error = ?e,
++                "failed to attach exclusive gates, unbinding all plugins"
++            );
++            let _ = resolved_workload.unbind_all_plugins().await;
++            bail!(e);
++        }
++
+         // Notify plugins of the resolved workload
+         for (plugin, component_ids) in bound_plugins.iter() {
+             debug!(
 diff --git a/crates/wash-runtime/src/host/http.rs b/crates/wash-runtime/src/host/http.rs
 index 93ebb90..9810e41 100644
 --- a/crates/wash-runtime/src/host/http.rs
@@ -1829,10 +2534,10 @@ index eb825f8..e2f0754 100644
          // Strings flowing in from the proto wire are parsed into typed
 diff --git a/crates/wash-runtime/tests/integration_exclusive_topology.rs b/crates/wash-runtime/tests/integration_exclusive_topology.rs
 new file mode 100644
-index 0000000..77cd1b3
+index 0000000..8e24270
 --- /dev/null
 +++ b/crates/wash-runtime/tests/integration_exclusive_topology.rs
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,277 @@
 +//! Which workloads may contain an exclusive component.
 +//!
 +//! An exclusive component (`di-framework.dev/exclusive-instance: "true"` in its
@@ -1855,10 +2560,12 @@ index 0000000..77cd1b3
 +
 +mod common;
 +use common::{
-+    component_workload_request, http_counter_host_interfaces, start_host_with_dev_router,
++    component_workload_request, http_counter_host_interfaces, http_only_host_interfaces,
++    json_u64_field, start_host_with_dev_router, start_host_with_dynamic_router,
 +};
 +
 +const HTTP_COUNTER_WASM: &[u8] = include_bytes!("wasm/http_counter.wasm");
++const HTTP_SLEEPER_WASM: &[u8] = include_bytes!("wasm/http_sleeper.wasm");
 +const CALLER_WASM: &[u8] = include_bytes!("wasm/inter_component_call_caller.wasm");
 +const MIDDLEWARE_WASM: &[u8] = include_bytes!("wasm/inter_component_call_middleware.wasm");
 +const CALLEE_WASM: &[u8] = include_bytes!("wasm/inter_component_call_callee.wasm");
@@ -2017,5 +2724,94 @@ index 0000000..77cd1b3
 +        "every queued request is served"
 +    );
 +
++    Ok(())
++}
++
++/// `request`, with its component mounting `host_path` read-write.
++fn mounting(
++    mut request: wash_runtime::types::WorkloadStartRequest,
++    host_path: &std::path::Path,
++) -> wash_runtime::types::WorkloadStartRequest {
++    use wash_runtime::types::{HostPathVolume, Volume, VolumeMount, VolumeType};
++    request.workload.volumes.push(Volume {
++        name: "data".to_string(),
++        volume_type: VolumeType::HostPath(HostPathVolume {
++            local_path: host_path.to_string_lossy().into_owned(),
++        }),
++    });
++    for component in &mut request.workload.components {
++        component.local_resources.volume_mounts.push(VolumeMount {
++            name: "data".to_string(),
++            mount_path: "/data".to_string(),
++            read_only: false,
++        });
++    }
++    request
++}
++
++async fn served(client: &reqwest::Client, addr: std::net::SocketAddr, host: &str) -> Result<u64> {
++    let response = client
++        .get(format!("http://{addr}/"))
++        .header("HOST", host)
++        .send()
++        .await?;
++    anyhow::ensure!(response.status().is_success(), "{}", response.status());
++    Ok(json_u64_field(&response.text().await?, "served"))
++}
++
++/// Two revisions of a workload whose exclusive component mounts the same host
++/// directory are two workloads on one host, as during a `Recreate` rollout
++/// (#152). The new revision's first request waits while the old revision's
++/// warm instance holds the directory, and is served by an instance of its own
++/// once the old revision is stopped. (A p3 guest, so that the old revision
++/// keeps a warm instance between requests; the p2 path drops its store after
++/// each one.)
++#[tokio::test]
++async fn a_new_revision_waits_for_the_old_one_on_the_same_host_path() -> Result<()> {
++    // Routed by Host header, so each revision is reached on its own name.
++    let (addr, host) = start_host_with_dynamic_router("127.0.0.1:0").await?;
++    let dir = tempfile::tempdir()?;
++
++    let revision = |name: &str| {
++        let mut request = component_workload_request(
++            "sleeper",
++            name,
++            HTTP_SLEEPER_WASM,
++            resources(true),
++            http_only_host_interfaces(name),
++        );
++        request.workload.components[0].max_invocations = 0;
++        mounting(request, dir.path())
++    };
++    let old = revision("rev1");
++    let old_id = old.workload_id.clone();
++    for request in [old, revision("rev2")] {
++        let status = host.workload_start(request).await?.workload_status;
++        anyhow::ensure!(
++            status.workload_state == wash_runtime::types::WorkloadState::Running,
++            "{status:?}"
++        );
++    }
++
++    let client = reqwest::Client::new();
++    // The old revision serves, and keeps its instance warm.
++    assert_eq!(served(&client, addr, "rev1").await?, 1);
++
++    let first = {
++        let client = client.clone();
++        tokio::spawn(async move { served(&client, addr, "rev2").await })
++    };
++    tokio::time::sleep(Duration::from_millis(500)).await;
++    assert!(
++        !first.is_finished(),
++        "the new revision was served while the old one held the directory"
++    );
++
++    host.workload_stop(wash_runtime::types::WorkloadStopRequest {
++        workload_id: old_id,
++    })
++    .await?;
++    let count = timeout(Duration::from_secs(60), first).await???;
++    assert_eq!(count, 1, "served by the new revision's own instance");
 +    Ok(())
 +}
