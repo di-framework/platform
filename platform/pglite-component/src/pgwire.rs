@@ -185,8 +185,9 @@ fn server_error(body: &[u8]) -> Error {
             message = text;
         }
     }
-    // Syntax and access problems are a client bug; everything else is a
-    // failed execution on an otherwise healthy connection.
+    // Only 42601 (syntax error) and 42P18 (un-inferable parameter type) are
+    // invalid-sql; every other class-42 code (42501, 42P01, 42703, ...) is an
+    // execution-failed carrying its SQLSTATE.
     if code == "42601" || code == "42P18" {
         // 42601: syntax_error
         // 42P18: indeterminate_datatype (parameter needs a cast)
@@ -756,6 +757,10 @@ mod tests {
         match server_error(&error_body("42703", "column does not exist")) {
             Error::ExecutionFailed(pg) => assert_eq!(pg.code, "42703"),
             other => panic!("expected execution-failed for 42703, got {other:?}"),
+        }
+        match server_error(&error_body("42501", "permission denied")) {
+            Error::ExecutionFailed(pg) => assert_eq!(pg.code, "42501"),
+            other => panic!("expected execution-failed for 42501, got {other:?}"),
         }
         match server_error(&error_body("23505", "duplicate key")) {
             Error::ExecutionFailed(pg) => assert_eq!(pg.code, "23505"),

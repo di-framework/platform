@@ -172,6 +172,11 @@ longer type a parameter that has no context: `SELECT $1 IS NULL` now fails with
 `could not determine data type of parameter $1`. Add a cast, for example
 `SELECT $1::text IS NULL`.
 
+Error mapping changed: undefined table (42P01), undefined column (42703) and
+every other class-42 code except 42601 (syntax error) and 42P18 (un-inferable
+parameter type) moved from `invalid-sql` to `execution-failed`. Branch on
+`pg-error.code` instead of the variant for those cases.
+
 Error handling surfaces SQLSTATE codes through `error.code`, enabling
 machine-readable handling of constraint violations and other conditions:
 - `"23505"` = unique violation
