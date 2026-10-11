@@ -1,0 +1,190 @@
+# Publish the tested, composed pglite Wasm component (engine plugged in) to GHCR.
+# The build job runs the same make targets as ci.yml and holds no write token;
+# the publish job only validates and pushes the already-tested dist/.
+name: Publish pglite component
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-pglite-component
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and test pglite component
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      wasm_sha256: ${{ steps.dist.outputs.wasm_sha256 }}
+    steps:
+      - name: Require di-framework/platform
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REPOSITORY" != di-framework/platform ]]; then
+            echo '::error::Only di-framework/platform can publish this component'
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: latest
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: '1.97.1'
+          targets: wasm32-wasip2
+          components: clippy
+
+      - name: Install wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1
+        with:
+          version: 'v48.0.1'
+
+      - name: Cache engine build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            platform/pglite-component/target/engine
+            platform/pglite-component/.tools
+          key: pglite-engine-${{ hashFiles('platform/pglite-component/engine/**', 'platform/pglite-component/scripts/tool-versions.env', 'platform/pglite-component/scripts/build-engine.ts', 'platform/pglite-component/scripts/patch-engine-source.ts', 'platform/pglite-component/scripts/prepare-engine.ts', 'platform/pglite-component/wit/deps/pglite-engine/**') }}
+          restore-keys: |
+            pglite-engine-
+
+      - name: Install Wasm build tools
+        run: |
+          set -euo pipefail
+          make -C platform/pglite-component tools-rust
+          echo "$GITHUB_WORKSPACE/platform/pglite-component/.tools/bin" >> "$GITHUB_PATH"
+
+      - name: Test publisher crates
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p wasm-component-publisher -p pglite-component-publisher --all-targets -- -D warnings
+          cargo test --locked -p wasm-component-publisher -p pglite-component-publisher
+
+      # `smoke` runs `build`, which wac-plugs the engine into the provider.
+      - name: Build and test composed component against the real engine
+        run: make -C platform/pglite-component unit smoke
+
+      - name: Validate the tested artifact without publishing
+        run: cargo run --locked -p pglite-component-publisher -- --check
+
+      - name: Record tested wasm digest
+        id: dist
+        run: |
+          set -euo pipefail
+          sum="$(sha256sum platform/pglite-component/dist/di-framework-pglite.wasm | cut -d' ' -f1)"
+          echo "wasm_sha256=${sum}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload tested dist
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: pglite-dist
+          path: platform/pglite-component/dist/
+          if-no-files-found: error
+
+  publish:
+    name: Push ghcr.io/di-framework/pglite-component
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: '1.97.1'
+
+      - name: Set up wash CLI
+        uses: wasmCloud/setup-wash-action@47756fa211cc82f392c57e39504f43ef46fc0b3e # v2.1.0
+        with:
+          wash-version: v2.5.2
+
+      # oras points the version tag at the manifest wash pushed, so every tag
+      # shares one digest. Pinned by version and checksum.
+      - name: Install oras
+        run: |
+          set -euo pipefail
+          version=1.3.4
+          sha256=f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454
+          curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/oras.tar.gz "https://github.com/oras-project/oras/releases/download/v${version}/oras_${version}_linux_amd64.tar.gz"
+          echo "${sha256}  /tmp/oras.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/oras.tar.gz -C /usr/local/bin oras
+          oras version
+
+      - name: Build publisher (no credentials in scope)
+        run: cargo build --locked -p pglite-component-publisher
+
+      - name: Download tested dist
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: pglite-dist
+          path: platform/pglite-component/dist
+
+      - name: Verify dist is the tested build
+        env:
+          EXPECTED_SHA256: ${{ needs.build.outputs.wasm_sha256 }}
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum platform/pglite-component/dist/di-framework-pglite.wasm | cut -d' ' -f1)"
+          if [[ -z "$EXPECTED_SHA256" || "$actual" != "$EXPECTED_SHA256" ]]; then
+            echo "::error::downloaded wasm ($actual) differs from the tested build ($EXPECTED_SHA256)"
+            exit 1
+          fi
+
+      # The publisher re-verifies SHA256SUMS, the exported database interface
+      # and that every import is wasi:*, then pushes the commit and version
+      # tag, pulls it back by digest, and points the
+      # version tag at that same manifest.
+      - name: Push and verify component
+        env:
+          PUSH: 'true'
+          DI_OCI_REGISTRY: ghcr.io
+          DI_OCI_CLUSTER_REGISTRY: ghcr.io
+          DI_OCI_REPOSITORY: di-framework/pglite-component
+          DI_OCI_TAG: ${{ github.sha }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: target/debug/pglite-component-publisher
+
+      - name: Record component digest
+        run: |
+          set -euo pipefail
+          report=platform/pglite-component/dist/publish-report.json
+          digest="$(jq -er '.manifestDigest | select(test("^sha256:[0-9a-f]{64}$"))' "$report")"
+          ref="ghcr.io/di-framework/pglite-component@${digest}"
+          printf 'Published %s\n' "$ref"
+          {
+            echo '### PGlite component'
+            echo
+            printf '```\n%s\n```\n' "$ref"
+            echo
+            echo 'Tags (movable): the commit SHA and the WIT package version, both pointing at the digest above.'
+            echo 'Only the digest is immutable. The pushed manifest was pulled back by digest and byte-compared with the tested build.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload publish report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: pglite-publish-report
+          path: platform/pglite-component/dist/publish-report.json
+          if-no-files-found: error

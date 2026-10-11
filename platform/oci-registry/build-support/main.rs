@@ -2,7 +2,7 @@
 use sha2::{Digest, Sha256};
 use std::{env, error::Error, fs, path::Path, process::Command};
 
-mod publish;
+use wasm_component_publisher as publish;
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 fn main() {
@@ -45,6 +45,9 @@ fn run() -> Result<()> {
             required_export: "wasi:http/handler@0.3.0",
             default_repository: "di-framework/oci-registry",
             report_file_name: "publish-report.json",
+            log_prefix: "oci-registry",
+            version_tag: None,
+            import_prefixes: None,
         },
         push && !check,
     )

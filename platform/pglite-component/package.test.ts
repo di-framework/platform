@@ -69,4 +69,29 @@ describe('pglite-component package', () => {
     const legacy = [...new Bun.Glob('**/*.{sh,py}').scanSync(scripts)];
     expect(legacy).toEqual([]);
   });
+
+  test('the publish workflow is dispatch-only and gates on main branch', () => {
+    const repo = join(pkgDir, '..', '..');
+    const workflow = readFileSync(
+      join(repo, '.github/workflows/pglite-component-publish.yml'),
+      'utf8',
+    );
+    expect(workflow).toMatch(/on:\s+workflow_dispatch:/);
+    expect(workflow).toContain("if: github.ref == 'refs/heads/main'");
+    expect(workflow).toContain('ghcr.io/di-framework/pglite-component');
+    expect(workflow).toContain('make -C platform/pglite-component tools-rust');
+    expect(workflow).toContain('make -C platform/pglite-component unit smoke');
+    expect(workflow).toContain(
+      'cargo test --locked -p wasm-component-publisher -p pglite-component-publisher',
+    );
+    expect(workflow).not.toContain('install-tools.sh');
+    for (const line of workflow.split('\n')) {
+      const ref = line.match(/uses:\s+(\S+)@(\S+)/);
+      if (ref?.[1] && ref[2]) expect(ref[2], line).toMatch(/^[0-9a-f]{40}$/);
+    }
+    expect(workflow).toContain('cargo run --locked -p pglite-component-publisher');
+    expect(workflow).toContain('target/debug/pglite-component-publisher');
+    expect(workflow).toContain('sha256sum -c -');
+    expect(workflow).toContain('wasm_sha256');
+  });
 });

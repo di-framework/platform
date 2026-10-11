@@ -46,6 +46,30 @@ and persistence across separate runtime processes. It also exits a runtime
 with an open transaction and verifies that committed rows survive and the
 uncommitted row is absent after restart. No scripted database server is used.
 
+## Publishing to GHCR
+
+The pglite component is published to GitHub Container Registry (GHCR) as an OCI wasm component. The publication is triggered manually from the GitHub Actions UI.
+
+### Dispatch the workflow
+
+1. Open [Workflows](https://github.com/di-framework/platform/actions/workflows/pglite-component-publish.yml).
+2. Click **Run workflow** > **main branch** > **Run workflow**.
+
+The workflow has two jobs:
+- `build` (no write token) runs the same targets as `ci.yml`: `make tools-rust`, `make unit smoke` (which runs `make build`, composing the provider with the engine via `wac plug`), then the publisher crates' clippy and tests.
+- `publish` (`packages: write`) downloads the tested `dist/` and runs `pglite-component-publisher`. It never rebuilds or modifies `dist/`. It checks `SHA256SUMS`, requires the export `di-framework:pglite/database@0.2.0` and rejects any import that is not `wasi:*`, then pushes `ghcr.io/di-framework/pglite-component:<commit sha>` once, pulls it back by the manifest digest to compare bytes, then points the version tag (`0.2.0`, the WIT package version) at that same manifest with `oras tag` and asserts both tags resolve to one digest. The `build` job passes the tested wasm sha256 to `publish`, which verifies it before pushing.
+
+Tags are movable. `0.2.0` always points to the latest `main` publish for WIT package 0.2.0, and re-dispatching a commit also moves its SHA tag. Only the `@sha256:...` digest is immutable, so consumers pin by digest.
+
+### Artifact location
+
+The digest is in **Details** > **Record component digest** > **Step summary**, and in the `pglite-publish-report` artifact (`publish-report.json`).
+The first digest is not recorded here yet: it exists only after the first dispatch from `main`, and a follow-up commit will add it below.
+
+Published digest: _pending first publish_
+
+**Note:** The GHCR package must be made public by an org admin after the first publish. Until then, only members with access to di-framework/platform can pull it.
+
 ## Use from an application
 
 The application imports `di-framework:pglite/database@0.2.0`. For a JavaScript
@@ -69,13 +93,25 @@ try {
 }
 ```
 
-Compose the application with the provider:
+Compose the application with the provider. For a local build:
 
 ```sh
 make compose APP=path/to/app.wasm OUT=path/to/app.composed.wasm
 mkdir -p ./data
 wasmtime run --dir ./data::/data path/to/app.composed.wasm
 ```
+
+To use the published OCI component from GHCR instead (pin by digest for reproducibility):
+
+```sh
+export PGLITE_REF='ghcr.io/di-framework/pglite-component@sha256:<digest>'
+wash oci pull "${PGLITE_REF}" pglite.wasm
+wac plug --plug pglite.wasm path/to/app.wasm -o path/to/app.composed.wasm
+mkdir -p ./data
+wasmtime run --dir ./data::/data path/to/app.composed.wasm
+```
+
+Consumers (like cli-extensions) pin the component by digest.
 
 That invocation is for a command component; serve HTTP components using your
 normal host while granting the same filesystem preopen. The final component

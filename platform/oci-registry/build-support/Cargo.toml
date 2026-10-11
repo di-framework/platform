@@ -15,3 +15,4 @@ path = "main.rs"
 [dependencies]
 serde_json = "1.0"
 sha2 = "0.10"
+wasm-component-publisher = { path = "../../wasm-component-publisher" }

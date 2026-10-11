@@ -1,0 +1,16 @@
+[package]
+name = "pglite-component-publisher"
+version = "0.0.0"
+workspace = "../../.."
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Validate and publish the built pglite Wasm component"
+build = "build.rs"
+
+[[bin]]
+name = "pglite-component-publisher"
+path = "main.rs"
+
+[dependencies]
+wasm-component-publisher = { path = "../../wasm-component-publisher" }
