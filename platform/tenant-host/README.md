@@ -95,13 +95,27 @@ lease keeps its gate alive, so a store that outlives its workload (a call still 
 holds the next revision back. Stopping a workload drops its warm instances and stops its exclusive
 components admitting calls. A call of the old revision that was queued, or arrives late, fails with
 an error instead of opening the component again, so the new revision waits only for calls already
-in flight. A registry entry goes away once no pool, permit or store refers to its gates.
+in flight. This holds for every path that opens the component: the pooled calls, linked calls and
+the stores built through `new_store` (p2 HTTP and the messaging plugins), which check the stopped
+flag before and after waiting for the store lease. A registry entry goes away once no pool, permit or
+store refers to its gates.
 
-Mounts are compared as whole sets. Two exclusive components whose mounts only partly overlap get
-separate gates, so do not give the same directory to two different exclusive components. Two
-exclusive components with the same mounts (or the same name and namespace and no mounts) can never
-both be serving: the one that starts second waits for the first to stop and fails once the wait
-times out.
+Limits of the guarantee:
+
+- Mounts are compared as whole sets. Two exclusive components whose mounts only partly overlap get
+  separate gates, so do not give the same directory to two different exclusive components.
+- The same applies across revisions of one component: if the next revision changes its mount set
+  (for example `{/data}` becomes `{/data, /cache}`, or it mounts a parent or child directory), it
+  gets a new gate and the 5-25 ms overlap with the old revision is back for that rollout. Keep
+  the mount set of an exclusive component the same across revisions. The `pglite` component mounts
+  only `/data`, so it is not affected.
+- The registry lives in one wash host process. Two host processes on the same node that mount the
+  same hostPath (for example a revision scheduled onto a different host pod) do not share a gate.
+- Two exclusive components with the same mounts (or the same name and namespace and no mounts) can
+  never both be serving: the one that starts second waits for the first to stop and fails once the
+  wait times out. With no mount the key is only the namespace and the name, so an unrelated
+  workload that reuses them is held back the same way; the host logs a warning naming the
+  component and namespace when a component with no mount attaches a gate that is already live.
 
 Consequences. Calls to an exclusive component are serialised, so its throughput is one call at a
 time. Waiting calls hold their request open for up to the wait timeout.
@@ -141,7 +155,12 @@ way `workload_stop` does. They cover these cases:
   are gone;
 - different host paths run side by side;
 - with no mount, the same namespace and name share a gate, and different namespaces do not;
-- a store that outlives its workload still holds the next revision back.
+- a store that outlives its workload still holds the next revision back;
+- a caller queued on the shared call permit when the workload is stopped is refused once admitted
+  and builds nothing, and an instance being built during the stop is dropped instead of installed,
+  so the next revision proceeds;
+- a store requested through `new_store` for a stopped workload is refused;
+- a symlink to the old revision's directory shares its gate (the key is the canonical path).
 `tests/integration_exclusive_topology.rs` (needs the prebuilt test fixtures) covers the layout rule
 and a lone exclusive component loading and queueing real requests (it does not measure
 serialization; the live-store tests do). Run them against a checkout of the pinned commit with the patch applied:
