@@ -64,6 +64,7 @@ describe('publish workspace packs', () => {
       `@di-framework/bindings@${root.version}`,
       `@di-framework/cloudflare@${root.version}`,
       `@di-framework/cloudfoundry@${root.version}`,
+      `@di-framework/pglite-component@${root.version}`,
       `@di-framework/platform@${root.version}`,
       `@di-framework/sqlite-component@${root.version}`,
       `@di-framework/tenant-cli@${root.version}`,
@@ -74,6 +75,40 @@ describe('publish workspace packs', () => {
     const packed = packPaths(join(import.meta.dir, '../platform/sqlite-component'));
     expect(packed).toContain('dist/di-framework-sqlite.wasm');
     expect(missingPackedEntries(['dist', 'wit'], packed)).toEqual([]);
+  });
+
+  // The pglite wasm needs the engine build (Docker); jobs that run it set
+  // PGLITE_REQUIRE_DIST=1, everyone else skips unless dist/ is on disk.
+  const pgliteDir = join(import.meta.dir, '../platform/pglite-component');
+  const pgliteBuilt =
+    process.env.PGLITE_REQUIRE_DIST === '1' ||
+    existsSync(join(pgliteDir, 'dist/di-framework-pglite.wasm'));
+
+  test.skipIf(!pgliteBuilt)('pglite component pack contains the adapter and the wasm', () => {
+    const pkg = JSON.parse(readFileSync(join(pgliteDir, 'package.json'), 'utf8')) as {
+      files: string[];
+    };
+    const packed = packPaths(pgliteDir);
+    for (const file of [
+      'dist/di-framework-pglite.wasm',
+      'dist/di-framework-pglite.wit',
+      'dist/SHA256SUMS',
+      'dist/js/index.js',
+      'dist/js/index.d.ts',
+      'wit/world.wit',
+    ]) {
+      expect(packed).toContain(file);
+    }
+    expect(missingPackedEntries(pkg.files, packed)).toEqual([]);
+  });
+
+  test('pglite component refuses a pack without its wasm or adapter', () => {
+    const pkg = JSON.parse(
+      readFileSync(join(import.meta.dir, '../platform/pglite-component/package.json'), 'utf8'),
+    ) as { files: string[] };
+    expect(missingPackedEntries(pkg.files, ['package.json', 'wit/world.wit'])).toEqual(
+      expect.arrayContaining(['dist/js', 'dist/di-framework-pglite.wasm']),
+    );
   });
 
   test('missingLicenses requires both license files with no fail-open', () => {
@@ -135,10 +170,6 @@ describe('publish workspace packs', () => {
       expect(missingLicenses(packPaths(join(rootDir, directory)))).toEqual([]);
     });
   }
-
-  const pgliteBuilt =
-    existsSync(join(rootDir, 'platform/pglite-component/dist/di-framework-pglite.wasm')) ||
-    process.env.PGLITE_REQUIRE_DIST === '1';
 
   test.skipIf(!pgliteBuilt)('pglite-component pack includes THIRD-PARTY-NOTICES.txt', () => {
     const packed = packPaths(join(rootDir, 'platform/pglite-component'));
