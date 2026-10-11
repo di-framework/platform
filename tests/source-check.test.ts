@@ -13,6 +13,11 @@ import {
 } from '../scripts/source-check';
 
 const repo = resolve(import.meta.dir, '..');
+// Git hooks (pre-push runs this suite) export GIT_DIR and friends; they would point every git
+// command these tests spawn at the hook's repository instead of the one in `cwd`.
+const env = Object.fromEntries(
+  Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')),
+);
 
 const TREE = [
   '100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tplatform/tenant-host/Dockerfile',
@@ -168,7 +173,7 @@ test('the CLI hashes the committed inputs of a real workflow; --force never asks
         salt,
         '--force',
       ],
-      { cwd: repo, stdout: 'pipe', stderr: 'pipe' },
+      { env, cwd: repo, stdout: 'pipe', stderr: 'pipe' },
     );
   const first = run('wasi-tls');
   expect(first.exitCode).toBe(0);
@@ -186,6 +191,7 @@ function cloneWithHistory(): { clone: string; old: string; tip: string } {
   const base = mkdtempSync(join(tmpdir(), 'source-check-'));
   const git = (cwd: string, ...args: string[]) => {
     const r = Bun.spawnSync(['git', '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
+      env,
       cwd,
       stdout: 'pipe',
       stderr: 'pipe',
@@ -204,7 +210,7 @@ function cloneWithHistory(): { clone: string; old: string; tip: string } {
   writeFileSync(join(work, 'x'), 'x\n');
   git(work, 'add', '.');
   git(work, 'commit', '-q', '-m', 'two');
-  git(work, 'push', '-q', 'origin', 'HEAD:main');
+  git(work, 'push', '-q', origin, 'HEAD:main');
   return { clone: work, old, tip: git(work, 'rev-parse', 'HEAD') };
 }
 
@@ -226,7 +232,7 @@ test('a re-run of an older push skips without asking the registry; --force still
         cwd: clone,
         stdout: 'pipe',
         stderr: 'pipe',
-        env: { ...process.env, PATH: `${dirname(process.execPath)}:/usr/bin:/bin` },
+        env: { ...env, PATH: `${dirname(process.execPath)}:/usr/bin:/bin` },
       },
     );
   const stale = cli('--require-main-tip', old);
@@ -255,7 +261,7 @@ test('--github-output appends the outputs to $GITHUB_OUTPUT', () => {
       '--force',
       '--github-output',
     ],
-    { cwd: clone, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, GITHUB_OUTPUT: file } },
+    { cwd: clone, stdout: 'pipe', stderr: 'pipe', env: { ...env, GITHUB_OUTPUT: file } },
   );
   expect(r.exitCode).toBe(0);
   expect(readFileSync(file, 'utf8')).toMatch(

@@ -5,6 +5,11 @@ import { dirname, join, resolve } from 'node:path';
 import { ARTIFACTS, parsePairs, pinArtifact, pinText } from '../scripts/pin-artifact';
 
 const repo = resolve(import.meta.dir, '..');
+// Git hooks (pre-push runs this suite) export GIT_DIR and friends; they would point every git
+// command these tests spawn at the hook's repository instead of the one in `cwd`.
+const env = Object.fromEntries(
+  Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')),
+);
 const DIGEST = `sha256:${'1'.repeat(64)}`;
 const OTHER = `sha256:${'2'.repeat(64)}`;
 
@@ -105,11 +110,12 @@ describe('pinArtifact against the repository files', () => {
     const root = copyTargets();
     const result = Bun.spawnSync(
       ['bun', join(repo, 'scripts/pin-artifact.ts'), 'pglite-component', DIGEST],
-      { cwd: root, stdout: 'pipe', stderr: 'pipe' },
+      { env, cwd: root, stdout: 'pipe', stderr: 'pipe' },
     );
     expect(result.exitCode).toBe(0);
     expect(result.stdout.toString().trim()).toBe('platform/pglite-component/README.md');
     const usage = Bun.spawnSync(['bun', join(repo, 'scripts/pin-artifact.ts')], {
+      env,
       cwd: root,
       stderr: 'pipe',
     });
@@ -137,7 +143,7 @@ test('the CLI pins several artifacts in one edit', () => {
       'wash-wasi-tls-exclusive',
       OTHER,
     ],
-    { cwd: root, stdout: 'pipe', stderr: 'pipe' },
+    { env, cwd: root, stdout: 'pipe', stderr: 'pipe' },
   );
   expect(result.exitCode).toBe(0);
   expect(result.stdout.toString().trim()).toBe('platform/tenant-host/README.md');
@@ -156,6 +162,7 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
     const base = mkdtempSync(join(tmpdir(), 'open-pin-pr-'));
     const git = (cwd: string, ...args: string[]) => {
       const r = Bun.spawnSync(['git', '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
+        env,
         cwd,
         stdout: 'pipe',
         stderr: 'pipe',
@@ -177,7 +184,7 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
     writeFileSync(join(work, 'x'), 'x\n');
     git(work, 'add', '.');
     git(work, 'commit', '-q', '-m', 'two');
-    git(work, 'push', '-q', 'origin', 'HEAD:main');
+    git(work, 'push', '-q', origin, 'HEAD:main');
     // A fake gh that records its arguments and reports no open PR.
     const bin = join(base, 'bin');
     mkdirSync(bin);
@@ -189,7 +196,7 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
         stdout: 'pipe',
         stderr: 'pipe',
         env: {
-          ...process.env,
+          ...env,
           PATH: `${bin}:${dirname(process.execPath)}:${process.env.PATH}`,
           GITHUB_SHA: sha,
           NAME: 'wash',

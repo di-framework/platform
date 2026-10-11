@@ -10,6 +10,11 @@ import { ARTIFACTS } from '../scripts/pin-artifact';
 import { matchesPathFilter, pushPaths } from '../scripts/source-check';
 
 const repo = resolve(import.meta.dir, '..');
+// Git hooks (pre-push runs this suite) export GIT_DIR and friends; they would point every git
+// command these tests spawn at the hook's repository instead of the one in `cwd`.
+const env = Object.fromEntries(
+  Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')),
+);
 
 type Permissions = Record<string, string>;
 interface Job {
@@ -410,7 +415,7 @@ test('the tenant host resolves variant patches in one place and hashes every pat
     for (const step of steps) expect(step.run ?? '', job).not.toContain('case ');
   }
   const filter = pushPaths(text);
-  for (const file of Bun.spawnSync(['git', 'ls-files', 'platform/tenant-host'], { cwd: repo })
+  for (const file of Bun.spawnSync(['git', 'ls-files', 'platform/tenant-host'], { env, cwd: repo })
     .stdout.toString()
     .trim()
     .split('\n')) {
