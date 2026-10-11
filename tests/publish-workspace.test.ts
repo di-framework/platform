@@ -1,12 +1,15 @@
 import { describe, expect, test } from 'bun:test';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  copyLicenseFiles,
+  assertRootLicenses,
+  LICENSE_FILES,
+  missingLicenses,
   missingPackedEntries,
   packPaths,
   parsePackedPaths,
+  publishWorkspaces,
   workspacePackageDirs,
 } from '../scripts/publish-workspace.ts';
 
@@ -73,77 +76,72 @@ describe('publish workspace packs', () => {
     expect(missingPackedEntries(['dist', 'wit'], packed)).toEqual([]);
   });
 
-  test('public packages include LICENSE files in their packs after copying', () => {
-    const root = mkdtempSync(join(tmpdir(), 'publish-license-'));
-    mkdirSync(join(root, 'packages', 'test', 'dist'), { recursive: true });
-    // Create root license files
-    writeFileSync(join(root, 'LICENSE-MIT'), 'MIT License content\n');
-    writeFileSync(join(root, 'LICENSE-APACHE'), 'Apache 2.0 License content\n');
-    // Create a test package with license files in the files array (as they should be declared)
-    writeFileSync(
-      join(root, 'package.json'),
-      JSON.stringify({ private: true, workspaces: ['packages/*'] }),
-    );
-    writeFileSync(
-      join(root, 'packages', 'test', 'package.json'),
-      JSON.stringify({
-        name: 'test-package',
-        version: '0.0.0',
-        files: ['dist', 'LICENSE-MIT', 'LICENSE-APACHE'],
-      }),
-    );
-    writeFileSync(join(root, 'packages', 'test', 'dist', 'index.js'), 'export {}\n');
-
-    // Copy license files as the publish script does
-    const pkgDir = join(root, 'packages', 'test');
-    copyLicenseFiles(pkgDir, root);
-
-    // Verify files were copied
-    expect(existsSync(join(pkgDir, 'LICENSE-MIT'))).toBe(true);
-    expect(existsSync(join(pkgDir, 'LICENSE-APACHE'))).toBe(true);
-
-    // Verify they are in the pack
-    const packed = packPaths(pkgDir);
-    expect(packed).toContain('LICENSE-MIT');
-    expect(packed).toContain('LICENSE-APACHE');
+  test('missingLicenses requires both license files with no fail-open', () => {
+    expect(missingLicenses(['package.json'])).toEqual(['LICENSE-MIT', 'LICENSE-APACHE']);
+    expect(missingLicenses(['LICENSE-MIT'])).toEqual(['LICENSE-APACHE']);
+    expect(missingLicenses(['LICENSE-MIT', 'LICENSE-APACHE'])).toEqual([]);
   });
 
-  test('all public packages in the real workspace include LICENSE files', () => {
-    const rootDir = join(import.meta.dir, '..');
-    const publicPackages = workspacePackageDirs(rootDir).filter((directory) => {
-      const pkg = JSON.parse(
+  test('a missing root license throws', () => {
+    const root = mkdtempSync(join(tmpdir(), 'publish-license-'));
+    expect(() => assertRootLicenses(root)).toThrow('LICENSE-MIT');
+    writeFileSync(join(root, 'LICENSE-MIT'), 'mit\n');
+    expect(() => assertRootLicenses(root)).toThrow('LICENSE-APACHE');
+    writeFileSync(join(root, 'LICENSE-APACHE'), 'apache\n');
+    expect(() => assertRootLicenses(root)).not.toThrow();
+  });
+
+  test('publishWorkspaces refuses to run without root licenses', () => {
+    const root = mkdtempSync(join(tmpdir(), 'publish-license-'));
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ private: true, workspaces: [] }));
+    expect(() => publishWorkspaces(root, true)).toThrow('LICENSE-MIT');
+  });
+
+  // pglite-component is private until #145 publishes it; it must already carry licenses.
+  const rootDir = join(import.meta.dir, '..');
+  const licensedDirs = [
+    ...new Set([
+      ...workspacePackageDirs(rootDir).filter(
+        (directory) =>
+          (
+            JSON.parse(readFileSync(join(rootDir, directory, 'package.json'), 'utf8')) as {
+              private?: boolean;
+            }
+          ).private !== true,
+      ),
+      'platform/pglite-component',
+    ]),
+  ];
+
+  test('there are public packages to check', () => {
+    expect(licensedDirs.length).toBeGreaterThan(1);
+  });
+
+  for (const directory of licensedDirs) {
+    test(`${directory} commits byte-identical license files listed in files`, () => {
+      const manifest = JSON.parse(
         readFileSync(join(rootDir, directory, 'package.json'), 'utf8'),
-      ) as { private?: boolean };
-      return pkg.private !== true;
+      ) as { files?: string[] };
+      for (const license of LICENSE_FILES) {
+        expect(manifest.files ?? [], `${directory} files`).toContain(license);
+        const copy = readFileSync(join(rootDir, directory, license));
+        expect(copy.equals(readFileSync(join(rootDir, license))), `${directory}/${license}`).toBe(
+          true,
+        );
+      }
     });
 
-    expect(publicPackages.length).toBeGreaterThan(0);
+    test(`${directory} pack includes both license files`, () => {
+      expect(missingLicenses(packPaths(join(rootDir, directory)))).toEqual([]);
+    });
+  }
 
-    for (const directory of publicPackages) {
-      const pkgDir = join(rootDir, directory);
-      const pkg = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')) as {
-        name: string;
-      };
+  const pgliteBuilt =
+    existsSync(join(rootDir, 'platform/pglite-component/dist/di-framework-pglite.wasm')) ||
+    process.env.PGLITE_REQUIRE_DIST === '1';
 
-      // Copy license files as the publish script does
-      copyLicenseFiles(pkgDir, rootDir);
-
-      // Verify files were copied
-      expect(existsSync(join(pkgDir, 'LICENSE-MIT'))).toBe(true);
-      expect(existsSync(join(pkgDir, 'LICENSE-APACHE'))).toBe(true);
-
-      // Verify they are in the pack
-      const packed = packPaths(pkgDir);
-      expect(packed).toContain('LICENSE-MIT');
-      expect(packed).toContain('LICENSE-APACHE');
-    }
-  });
-
-  test('pglite-component preserves THIRD-PARTY-NOTICES.txt', () => {
-    const pglitePath = join(import.meta.dir, '../platform/pglite-component');
-    const packed = packPaths(pglitePath);
-    if (existsSync(join(pglitePath, 'dist/THIRD-PARTY-NOTICES.txt'))) {
-      expect(packed).toContain('dist/THIRD-PARTY-NOTICES.txt');
-    }
+  test.skipIf(!pgliteBuilt)('pglite-component pack includes THIRD-PARTY-NOTICES.txt', () => {
+    const packed = packPaths(join(rootDir, 'platform/pglite-component'));
+    expect(packed).toContain('dist/THIRD-PARTY-NOTICES.txt');
   });
 });

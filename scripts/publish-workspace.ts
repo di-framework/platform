@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const packedLine = /^packed\s+\S+\s+(.+)$/;
@@ -65,15 +65,20 @@ function readPackage(pkgDir: string): PackageManifest {
   return JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')) as PackageManifest;
 }
 
-export function copyLicenseFiles(pkgDir: string, rootDir: string): void {
-  const licenseFiles = ['LICENSE-MIT', 'LICENSE-APACHE'];
-  for (const filename of licenseFiles) {
-    const src = join(rootDir, filename);
-    const dst = join(pkgDir, filename);
-    if (existsSync(src)) {
-      copyFileSync(src, dst);
+export const LICENSE_FILES = ['LICENSE-MIT', 'LICENSE-APACHE'] as const;
+
+/** Throws unless every license file is committed at the repository root. */
+export function assertRootLicenses(rootDir: string): void {
+  for (const license of LICENSE_FILES) {
+    if (!existsSync(join(rootDir, license))) {
+      throw new Error(`root ${license} is missing; cannot publish without license files`);
     }
   }
+}
+
+/** License files absent from a pack. Never fails open: all are always required. */
+export function missingLicenses(packedPaths: string[]): string[] {
+  return LICENSE_FILES.filter((license) => !packedPaths.includes(license));
 }
 
 function alreadyPublished(name: string, version: string): boolean {
@@ -85,6 +90,7 @@ function alreadyPublished(name: string, version: string): boolean {
 }
 
 export function publishWorkspaces(rootDir = process.cwd(), dryRun = false): string[] {
+  assertRootLicenses(rootDir);
   const published: string[] = [];
   for (const directory of workspacePackageDirs(rootDir)) {
     const pkgDir = join(rootDir, directory);
@@ -93,7 +99,7 @@ export function publishWorkspaces(rootDir = process.cwd(), dryRun = false): stri
       console.log(`Skipping ${pkg.name} (private)`);
       continue;
     }
-    if (!dryRun && pkg.scripts?.build) {
+    if (pkg.scripts?.build) {
       console.log(`Building ${pkg.name} from ${directory}`);
       const build = Bun.spawnSync(['bun', 'run', 'build'], {
         cwd: pkgDir,
@@ -102,18 +108,13 @@ export function publishWorkspaces(rootDir = process.cwd(), dryRun = false): stri
       });
       if (build.exitCode !== 0) throw new Error(`build failed for ${pkg.name}`);
     }
-    // Copy license files from root to package directory
-    copyLicenseFiles(pkgDir, rootDir);
     const packed = packPaths(pkgDir);
     const missing = missingPackedEntries(pkg.files, packed);
-    // Check that license files are in the pack
-    const requiredLicenses = ['LICENSE-MIT', 'LICENSE-APACHE'];
-    for (const license of requiredLicenses) {
-      if (existsSync(join(pkgDir, license)) && !packed.includes(license)) {
-        throw new Error(
-          `${pkg.name}@${pkg.version} pack is missing ${license}. Refusing to publish.`,
-        );
-      }
+    const missingLicense = missingLicenses(packed);
+    if (missingLicense.length > 0) {
+      throw new Error(
+        `${pkg.name}@${pkg.version} pack is missing ${missingLicense.join(', ')}. Refusing to publish.`,
+      );
     }
     if (missing.length > 0) {
       throw new Error(
