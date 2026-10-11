@@ -44,3 +44,9 @@ platform/backup-destination/prototype/node_modules
 # Rust / wasm toolchain (sqlite-component)
 target
 .tools
+
+# License files copied at publish time (not committed)
+/platform/*/LICENSE-MIT
+/platform/*/LICENSE-APACHE
+/adapters/*/LICENSE-MIT
+/adapters/*/LICENSE-APACHE

@@ -46,7 +46,9 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
   ],
   "devDependencies": {
     "@di-framework/core": "^5",
