@@ -525,12 +525,16 @@ tenantAuth:
   the tenant-auth step fails before that policy) it keeps the broad policy until the next poll.
 - Credentials: no pod automounts a ServiceAccount token. The controller container alone gets
   a projected token; the issuer-proxy sidecar (`alpine/socat`, pinned by digest) has none.
-- TLS: the platform controller generates a self-signed P-256 certificate for
-  `tenant-controller` and the host of `controllerPublicUrl` (Secret `tenant-controller-tls`;
-  the console pins it from ConfigMap `tenant-controller-ca`). It is replaced 30 days before it
-  expires or when its names change, and the certificate digest in both pod templates rolls
-  the pair. Kubeconfigs the console issued before a renewal embed the old CA and stop working;
-  download a new one.
+- TLS: the platform controller generates a per-tenant P-256 CA (`CA:TRUE, pathlen:0`, valid ten
+  years) and a leaf it signs (`CA:FALSE`, server auth, 365 days) for `tenant-controller` and the host
+  of `controllerPublicUrl`. The leaf, its key and `ca.crt` are in Secret `tenant-controller-tls`; the
+  console and the hosts pin only the CA, from ConfigMap `tenant-controller-ca`. The CA key is in
+  Secret `tenant-controller-ca-key` in the same runtime namespace, which no pod mounts and no
+  tenant role can read. The leaf is replaced 30 days before it expires, when its names change, or
+  when it no longer verifies against the stored CA; the CA is replaced only near its own expiry or
+  when its key is missing. A leaf renewal therefore keeps the CA, so hosts do not roll and
+  kubeconfigs the console issued stay valid; the leaf digest in both pod templates rolls the pair.
+  A Secret from before the CA existed (one `CA:TRUE` certificate, no `ca.crt`) is replaced once.
 - Routes: when the platform gateway is published (`routeUrlPattern`), a public URL whose host is
   `<label>.{tenant}.localhost` on the gateway port is routed through it, so a new Tenant gets a
   reachable console and controller with no script. Set, for example,
@@ -670,11 +674,12 @@ tenantAuth:
       read it: `di-runtime-*` roles grant no Secret access and no `pods/exec`, the host pod spec
       holds only a Secret volume reference, and Wasm guests see no host files outside their
       preopened storage.
-    - TLS: by default the pull listener serves the controller certificate (whose SANs now include
+    - TLS: by default the pull listener serves the controller leaf certificate (whose SANs now include
       `tenant-registry.di-runtime-<tenant>.svc[.cluster.local]`) on Service port 443, and the hosts
-      trust it through `--oci-ca-path=/registry-ca/ca.crt` from ConfigMap `tenant-controller-ca`.
+      trust the tenant CA that signed it through `--oci-ca-path=/registry-ca/ca.crt` from ConfigMap
+      `tenant-controller-ca`. A CA:TRUE end-entity certificate is rejected by wash (rustls), hence the split.
       wash loads that file once at start, so the host template carries
-      `platform.di-framework.dev/registry-ca-sha256` and a certificate renewal rolls the hosts on
+      `platform.di-framework.dev/registry-ca-sha256` and a CA replacement (not a leaf renewal) rolls the hosts on
       the next poll. With `insecureRegistry` (hosts run `--allow-insecure-registries`, which makes
       every wash pull plain HTTP, the local install's default) the listener is plain HTTP
       (`TENANT_CONTROLLER_REGISTRY_PULL_TLS=false`) on Service port 80, and no CA is mounted; the
@@ -713,7 +718,7 @@ tenantAuth:
 The reconcile does not adopt objects that `deploy-local.ts` created (`TenantAuthReady` reports
 `Refusing to adopt`). Delete them first: in `di-runtime-<tenant>` the Deployments, Services,
 ServiceAccounts, Role and RoleBinding `tenant-controller-keys`, NetworkPolicy, Secrets
-`tenant-controller-tls` and `tenant-console-oauth`, and ConfigMaps `tenant-controller-ca` and
+`tenant-controller-tls`, `tenant-controller-ca-key` and `tenant-console-oauth`, and ConfigMaps `tenant-controller-ca` and
 `tenant-auth-bundle`; in `di-tenant-<tenant>` the Role and RoleBinding
 `tenant-controller-secret-reader`; in the platform namespace the Role and RoleBinding
 `di-tenant-controller-<tenant>`; and the cluster-scoped ClusterRole and ClusterRoleBinding

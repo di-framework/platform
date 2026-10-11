@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import { X509Certificate } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { createPrivateKey, X509Certificate } from 'node:crypto';
 import { type Api, ApiError, Controller, collection, main } from '../src/tenancy/controller';
 import { CONTROLLER_SCRIPT_MODULES, controllerClusterRoleRules } from '../src/tenancy/install';
 import {
@@ -31,8 +32,12 @@ import {
   VERSION,
 } from '../src/tenancy/resources';
 import {
+  caCertificate,
   certificateNames,
   certificateValid,
+  holdsCaKey,
+  issuedBy,
+  leafCertificate,
   selfSignedCertificate,
   serialNumber,
 } from '../src/tenancy/tls';
@@ -86,7 +91,13 @@ function user(name: string, tenants: string[], extra: Partial<User['spec']> = {}
     spec: { memberships: tenants.map((t) => ({ tenant: t, role: 'developer' })), ...extra },
   };
 }
-const tls = selfSignedCertificate('tenant-controller', ['tenant-controller'], [], 30);
+/** A CA plus a leaf it signed, as the controller stores them. */
+function tlsFixture(dnsName = 'tenant-controller', days = 30): TenantAuthInputs['tls'] {
+  const ca = caCertificate('tenant-controller CA', 3650);
+  const leaf = leafCertificate('tenant-controller', [dnsName], [], days, ca.cert, ca.key);
+  return { ...leaf, caCert: ca.cert, caKey: ca.key };
+}
+const tls = tlsFixture();
 const inputs: TenantAuthInputs = {
   members: ['alice', 'bob'],
   apiServer: { addresses: ['10.0.0.1'], port: 6443 },
@@ -238,6 +249,7 @@ describe('tenantAuthResources', () => {
       'NetworkPolicy/di-runtime-alpha/tenant-auth-network',
       'ConfigMap/di-runtime-alpha/tenant-controller-ca',
       'Secret/di-runtime-alpha/tenant-controller-tls',
+      'Secret/di-runtime-alpha/tenant-controller-ca-key',
       'Secret/di-runtime-alpha/tenant-console-oauth',
       'Deployment/di-runtime-alpha/tenant-controller',
       'Deployment/di-runtime-alpha/tenant-console',
@@ -326,7 +338,15 @@ describe('tenantAuthResources', () => {
     expect(find(resources, 'Secret', 'tenant-controller-tls')?.data).toEqual({
       'tls.crt': Buffer.from(tls.cert).toString('base64'),
       'tls.key': Buffer.from(tls.key).toString('base64'),
+      'ca.crt': Buffer.from(tls.caCert).toString('base64'),
     });
+    expect(find(resources, 'Secret', 'tenant-controller-ca-key')?.data).toEqual({
+      'ca.key': Buffer.from(tls.caKey).toString('base64'),
+    });
+    // The CA key is never mounted or referenced by a pod.
+    expect(JSON.stringify(resources.filter((r) => r.kind === 'Deployment'))).not.toContain(
+      'tenant-controller-ca-key',
+    );
   });
 
   it('limits TokenRequest to the members and never renders empty resourceNames', () => {
@@ -502,7 +522,7 @@ describe('tenantAuthResources', () => {
       (resources.filter((r) => r.kind === 'Deployment') as Deployment[]).map(
         (d) => d.spec.template.metadata.annotations['platform.di-framework.dev/tls-cert-sha256'],
       );
-    const renewed = selfSignedCertificate('tenant-controller', ['tenant-controller'], [], 30);
+    const renewed = tlsFixture();
     const before = digest(tenantAuthResources(tenant(), cfg, inputs));
     const after = digest(tenantAuthResources(tenant(), cfg, { ...inputs, tls: renewed }));
     expect(before[0]).toBe(before[1]);
@@ -546,6 +566,68 @@ describe('controller certificate', () => {
       ips: ['127.0.0.1'],
     });
     expect(certificateNames('garbage')).toBeUndefined();
+  });
+
+  it('issues a CA and a distinct leaf that verifies against it', () => {
+    const now = new Date('2026-10-01T00:00:00Z');
+    const ca = caCertificate('tenant-controller CA (di-runtime-alpha)', 3650, now);
+    const leaf = leafCertificate(
+      'tenant-controller.di-runtime-alpha.svc',
+      ['tenant-controller', 'localhost'],
+      ['127.0.0.1'],
+      365,
+      ca.cert,
+      ca.key,
+      now,
+    );
+    const caX = new X509Certificate(ca.cert);
+    const leafX = new X509Certificate(leaf.cert);
+    expect(caX.ca).toBe(true);
+    expect(caX.subject).toBe('CN=tenant-controller CA (di-runtime-alpha)');
+    expect(caX.issuer).toBe(caX.subject);
+    expect(caX.subjectAltName).toBeUndefined();
+    expect(leafX.ca).toBe(false);
+    expect(leafX.subject).toBe('CN=tenant-controller.di-runtime-alpha.svc');
+    expect(leafX.issuer).toBe(caX.subject);
+    expect(leafX.subject).not.toBe(leafX.issuer);
+    expect(leafX.subjectAltName).toBe('DNS:tenant-controller, DNS:localhost, IP Address:127.0.0.1');
+    expect(leafX.keyUsage).toEqual(['1.3.6.1.5.5.7.3.1']);
+    expect(leafX.checkIssued(caX)).toBe(true);
+    expect(leafX.verify(caX.publicKey)).toBe(true);
+    expect(leafX.verify(leafX.publicKey)).toBe(false);
+    expect(leafX.checkPrivateKey(createPrivateKey(leaf.key))).toBe(true);
+    expect(caX.checkPrivateKey(createPrivateKey(ca.key))).toBe(true);
+    expect(new Date(leafX.validFrom).getTime()).toBe(now.getTime() - 5 * 60_000);
+    expect(issuedBy(ca.cert, leaf.cert, leaf.key)).toBe(true);
+    expect(holdsCaKey(ca.cert, ca.key)).toBe(true);
+  });
+
+  it('encodes the CA and leaf extensions RFC 5280 requires', () => {
+    const ca = caCertificate('CA', 30);
+    const leaf = leafCertificate('leaf', ['a'], [], 30, ca.cert, ca.key);
+    const text = (pem: string) =>
+      execFileSync('openssl', ['x509', '-noout', '-text'], { input: pem }).toString();
+    const caText = text(ca.cert);
+    expect(caText).toMatch(/Basic Constraints: critical\s+CA:TRUE, pathlen:0/);
+    expect(caText).toMatch(/Key Usage: critical\s+Certificate Sign, CRL Sign/);
+    expect(caText).toContain('Subject Key Identifier');
+    const leafText = text(leaf.cert);
+    expect(leafText).toMatch(/Key Usage: critical\s+Digital Signature/);
+    const ski = /Subject Key Identifier:\s+(\S+)/.exec(caText)?.[1];
+    expect(leafText).toMatch(new RegExp(`Authority Key Identifier:\\s+${ski}`));
+  });
+
+  it('rejects mismatched pairs without throwing', () => {
+    const ca = caCertificate('CA', 30);
+    const other = caCertificate('CA2', 30);
+    const leaf = leafCertificate('leaf', ['a'], [], 30, ca.cert, ca.key);
+    expect(issuedBy(other.cert, leaf.cert, leaf.key)).toBe(false);
+    expect(issuedBy(ca.cert, leaf.cert, other.key)).toBe(false);
+    expect(issuedBy(leaf.cert, leaf.cert, leaf.key)).toBe(false);
+    expect(issuedBy('', leaf.cert, leaf.key)).toBe(false);
+    expect(holdsCaKey(ca.cert, other.key)).toBe(false);
+    expect(holdsCaKey(leaf.cert, leaf.key)).toBe(false);
+    expect(holdsCaKey('', '')).toBe(false);
   });
 
   it('encodes every serial as a positive, minimal DER INTEGER', () => {
@@ -794,26 +876,116 @@ describe('reconcileTenant with tenant-auth', () => {
     expect(tokenNames(api)).toEqual(['di-user-dave', 'di-user-frank']);
   });
 
-  it('keeps a valid controller certificate and replaces one that is expiring', async () => {
+  const tlsPath = path('Secret', 'di-runtime-alpha', 'tenant-controller-tls');
+  const caKeyPath = path('Secret', 'di-runtime-alpha', 'tenant-controller-ca-key');
+  const caMapPath = path('ConfigMap', 'di-runtime-alpha', 'tenant-controller-ca');
+  const decode = (data: Record<string, string> | undefined, key: string) =>
+    Buffer.from(data?.[key] ?? '', 'base64').toString();
+  const encode = (value: string) => Buffer.from(value).toString('base64');
+
+  it('issues a CA and a leaf, keeps both while valid, and publishes only the CA', async () => {
     const { api, controller, t } = prepare();
     await controller.reconcileTenant(t, []);
-    const tlsPath = path('Secret', 'di-runtime-alpha', 'tenant-controller-tls');
     const first = api.objects.get(tlsPath)?.data as Record<string, string>;
-    const cert = new X509Certificate(Buffer.from(first['tls.crt']!, 'base64').toString());
+    const cert = new X509Certificate(decode(first, 'tls.crt'));
+    const caPem = decode(first, 'ca.crt');
+    expect(caPem).not.toBe('');
     expect(cert.subjectAltName).toContain('DNS:tenant-controller.di-runtime-alpha.svc');
-    expect(
-      api.objects.get(path('ConfigMap', 'di-runtime-alpha', 'tenant-controller-ca'))?.data,
-    ).toEqual({ 'ca.crt': Buffer.from(first['tls.crt']!, 'base64').toString() });
-    expect(cert.ca).toBe(true);
+    expect(cert.ca).toBe(false);
+    expect(api.objects.get(caMapPath)?.data).toEqual({ 'ca.crt': caPem });
+    expect(issuedBy(caPem, decode(first, 'tls.crt'), decode(first, 'tls.key'))).toBe(true);
+    const keys = api.objects.get(caKeyPath)?.data as Record<string, string>;
+    expect(holdsCaKey(caPem, decode(keys, 'ca.key'))).toBe(true);
     await controller.reconcileTenant(t, []);
     expect(api.objects.get(tlsPath)?.data).toEqual(first);
-    const expiring = selfSignedCertificate('x', ['x'], [], 10);
+    expect(api.objects.get(caKeyPath)?.data).toEqual(keys);
+  });
+
+  it('renews an expiring leaf under the same CA', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t, []);
+    const first = api.objects.get(tlsPath)?.data as Record<string, string>;
+    const keys = api.objects.get(caKeyPath)?.data as Record<string, string>;
+    const expiring = leafCertificate(
+      'x',
+      ['x'],
+      [],
+      10,
+      decode(first, 'ca.crt'),
+      decode(keys, 'ca.key'),
+    );
     api.objects.get(tlsPath)!.data = {
-      'tls.crt': Buffer.from(expiring.cert).toString('base64'),
+      ...first,
+      'tls.crt': encode(expiring.cert),
+      'tls.key': encode(expiring.key),
     };
     await controller.reconcileTenant(t, []);
-    const renewed = api.objects.get(tlsPath)?.data as Record<string, string> | undefined;
-    expect(renewed?.['tls.crt']).not.toBe(Buffer.from(expiring.cert).toString('base64'));
+    const renewed = api.objects.get(tlsPath)?.data as Record<string, string>;
+    expect(renewed['tls.crt']).not.toBe(encode(expiring.cert));
+    expect(renewed['ca.crt']).toBe(first['ca.crt']);
+    expect(
+      issuedBy(decode(renewed, 'ca.crt'), decode(renewed, 'tls.crt'), decode(renewed, 'tls.key')),
+    ).toBe(true);
+  });
+
+  it('reissues both when ca.crt does not match the stored leaf or key', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t, []);
+    const first = api.objects.get(tlsPath)?.data as Record<string, string>;
+    const stranger = caCertificate('other CA', 3650);
+    api.objects.get(tlsPath)!.data = { ...first, 'ca.crt': encode(stranger.cert) };
+    await controller.reconcileTenant(t, []);
+    const repaired = api.objects.get(tlsPath)?.data as Record<string, string>;
+    expect(repaired['ca.crt']).not.toBe(encode(stranger.cert));
+    expect(
+      issuedBy(
+        decode(repaired, 'ca.crt'),
+        decode(repaired, 'tls.crt'),
+        decode(repaired, 'tls.key'),
+      ),
+    ).toBe(true);
+    expect(api.objects.get(caMapPath)?.data).toEqual({ 'ca.crt': decode(repaired, 'ca.crt') });
+  });
+
+  it('reissues when the stored CA key is missing or is not the CA key', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t, []);
+    const first = api.objects.get(tlsPath)?.data as Record<string, string>;
+    api.objects.delete(caKeyPath);
+    await controller.reconcileTenant(t, []);
+    const second = api.objects.get(tlsPath)?.data as Record<string, string>;
+    expect(second['ca.crt']).not.toBe(first['ca.crt']);
+    api.objects.get(caKeyPath)!.data = { 'ca.key': encode(caCertificate('o', 30).key) };
+    await controller.reconcileTenant(t, []);
+    const third = api.objects.get(tlsPath)?.data as Record<string, string>;
+    expect(third['ca.crt']).not.toBe(second['ca.crt']);
+  });
+
+  it('migrates main’s single CA:TRUE certificate once, then stays stable', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t, []);
+    const current = api.objects.get(tlsPath)?.data as Record<string, string>;
+    const names = certificateNames(decode(current, 'tls.crt'))!;
+    const old = selfSignedCertificate(
+      'tenant-controller.di-runtime-alpha.svc',
+      names.dns,
+      names.ips,
+      365,
+    );
+    api.objects.get(tlsPath)!.data = { 'tls.crt': encode(old.cert), 'tls.key': encode(old.key) };
+    api.objects.delete(caKeyPath);
+    api.objects.get(caMapPath)!.data = { 'ca.crt': old.cert };
+    await controller.reconcileTenant(t, []);
+    const migrated = api.objects.get(tlsPath)?.data as Record<string, string>;
+    expect(migrated['tls.crt']).not.toBe(encode(old.cert));
+    expect(new X509Certificate(decode(migrated, 'tls.crt')).ca).toBe(false);
+    expect(api.objects.get(caMapPath)?.data).toEqual({ 'ca.crt': decode(migrated, 'ca.crt') });
+    const ca = api.objects.get(caMapPath)?.data;
+    const keys = api.objects.get(caKeyPath)?.data;
+    await controller.reconcileTenant(t, []);
+    expect(api.objects.get(tlsPath)?.data).toEqual(migrated);
+    expect(api.objects.get(caMapPath)?.data).toEqual(ca);
+    expect(api.objects.get(caKeyPath)?.data).toEqual(keys);
   });
 
   it('waits for the OAuth Secret, defaults the API port, and revokes the ClusterRoleBinding on suspend', async () => {
