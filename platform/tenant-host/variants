@@ -1,0 +1,10 @@
+# Tenant host image variants: the one authoritative image tag -> patch set table.
+#
+# One variant per line: the image tag (IMAGE_VERSION), then the patch files from this directory that
+# the build applies to the pinned wasmCloud source, in order (WASH_PATCHES). Read by:
+#   - Dockerfile: the build fails unless WASH_PATCHES is exactly the set listed for IMAGE_VERSION;
+#   - .github/workflows/tenant-host-image.yml: the publish job's resolver passes the listed set;
+#   - .github/workflows/tenant-host-patch-check.yml: one CI job per line.
+# The first line is the canonical tag (the platform default host image). Patch names hold no spaces.
+2.8.0-wasi-tls            0002-insecure-registry-allowlist.patch
+2.8.0-wasi-tls-exclusive  0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch

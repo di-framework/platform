@@ -54,12 +54,12 @@
       "version": "6.0.10",
       "devDependencies": {
         "@di-framework/core": "^5",
-        "@di-framework/repo": "^6.0.4",
+        "@di-framework/repo": "^6.1.0",
         "@types/bun": "latest",
       },
       "peerDependencies": {
         "@di-framework/core": "^5",
-        "@di-framework/repo": "^6.0.4",
+        "@di-framework/repo": "^6.1.0",
         "typescript": "^5",
       },
       "optionalPeers": [
@@ -73,6 +73,12 @@
     "platform/pglite-component": {
       "name": "@di-framework/pglite-component",
       "version": "6.0.10",
+      "devDependencies": {
+        "@di-framework/repo": "^6.1.0",
+      },
+      "peerDependencies": {
+        "@di-framework/repo": "^6.1.0",
+      },
     },
     "platform/platform": {
       "name": "@di-framework/platform",
@@ -163,7 +169,7 @@
 
     "@di-framework/platform": ["@di-framework/platform@workspace:platform/platform"],
 
-    "@di-framework/repo": ["@di-framework/repo@6.0.5", "", { "peerDependencies": { "@di-framework/core": "^6", "typescript": "^5" } }, "sha512-bUblSkWK/4cIKT78ZN4gkfdpGRf+0xg5oyhKOCuyKmGgTSBVsGLeEqXU7/Df2XFaguXvYp37fnxBQFNBqIMsVA=="],
+    "@di-framework/repo": ["@di-framework/repo@6.1.0", "", { "peerDependencies": { "@di-framework/core": "^6", "typescript": "^5" } }, "sha512-z0WL6ruBeR4ESY6GczSKimZi9B3U3cshxVNCRAS5qjkOK5hvOtO4prZU4pxEI94vYQ+ru0GLh+IyFixTjDxfuA=="],
 
     "@di-framework/sqlite-component": ["@di-framework/sqlite-component@workspace:platform/sqlite-component"],
 

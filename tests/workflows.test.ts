@@ -502,40 +502,115 @@ test('the tenant host resolves variants in one place, from platform/tenant-host/
   }
 });
 
-test('the resolver reads the variants table when it exists and falls back to the same rows', () => {
+describe('the check-source resolver reads platform/tenant-host/variants', () => {
   const workflow = parse('.github/workflows/tenant-host-image.yml');
-  const step = workflow.jobs['check-source']?.steps?.find((s) => (s.run ?? '').includes('table='));
-  const script = step?.run ?? '';
-  // Run only the table parsing: stop before the per-variant source check.
-  const parse_ = script.slice(0, script.indexOf("all='[]'"));
-  const rows = (cwd: string) =>
-    Bun.spawnSync(['bash', '-c', `${parse_}\nprintf '%s\\n' "\${rows}"`], {
-      cwd,
-      env,
+  const script =
+    workflow.jobs['check-source']?.steps?.find((s) => (s.run ?? '').includes('table='))?.run ?? '';
+
+  /**
+   * Run the resolver in a directory holding `table` as platform/tenant-host/variants, with a stub
+   * `bun` standing in for scripts/source-check.ts (never published, never stale).
+   */
+  function resolve(table: string, trigger: string, variant = '') {
+    const dir = mkdtempSync(join(tmpdir(), 'variants-'));
+    mkdirSync(join(dir, 'platform/tenant-host'), { recursive: true });
+    writeFileSync(join(dir, 'platform/tenant-host/variants'), table);
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, 'bun'),
+      `#!/bin/sh\necho "hash=${'a'.repeat(64)}"\necho "skip=false"\necho "args=$*" >> "${dir}/bun.log"\n`,
+    );
+    chmodSync(join(bin, 'bun'), 0o755);
+    const output = join(dir, 'out');
+    writeFileSync(output, '');
+    const result = Bun.spawnSync(['bash', '-c', script], {
+      cwd: dir,
       stdout: 'pipe',
-    })
-      .stdout.toString()
-      .trim()
-      .split('\n');
-  const dir = mkdtempSync(join(tmpdir(), 'variants-'));
-  expect(rows(dir)).toEqual([
-    '2.8.0-wasi-tls\t',
-    '2.8.0-wasi-tls-exclusive\t0001-exclusive-instance.patch',
-  ]);
-  mkdirSync(join(dir, 'platform/tenant-host'), { recursive: true });
-  writeFileSync(
-    join(dir, 'platform/tenant-host/variants'),
-    [
-      '# comment',
-      '2.8.0-wasi-tls            0002-insecure-registry-allowlist.patch',
-      '2.8.0-wasi-tls-exclusive  0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch',
-      '',
-    ].join('\n'),
-  );
-  expect(rows(dir)).toEqual([
-    '2.8.0-wasi-tls\t0002-insecure-registry-allowlist.patch',
-    '2.8.0-wasi-tls-exclusive\t0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch',
-  ]);
+      stderr: 'pipe',
+      env: {
+        ...env,
+        PATH: `${bin}:${process.env.PATH}`,
+        TRIGGER: trigger,
+        VARIANT: variant,
+        GITHUB_OUTPUT: output,
+      },
+    });
+    const out = readFileSync(output, 'utf8');
+    const value = (key: string) => out.match(new RegExp(`^${key}=(.*)$`, 'm'))?.[1] ?? 'null';
+    return {
+      exitCode: result.exitCode,
+      stdout: result.stdout.toString(),
+      variants: JSON.parse(value('variants')) as {
+        name: string;
+        tag: string;
+        patches: string;
+        canonical: boolean;
+      }[],
+      all: JSON.parse(value('all')) as string[],
+      bun: (() => {
+        try {
+          return readFileSync(join(dir, 'bun.log'), 'utf8');
+        } catch {
+          return '';
+        }
+      })(),
+    };
+  }
+
+  const table = read('platform/tenant-host/variants');
+
+  test('on push every row of the real table is a candidate, the first row is canonical', () => {
+    const r = resolve(table, 'push');
+    expect(r.exitCode).toBe(0);
+    const rows = table
+      .split('\n')
+      .filter((line) => line.trim() && !line.startsWith('#'))
+      .map((line) => line.trim().split(/\s+/));
+    expect(r.variants.map((v) => [v.tag, ...v.patches.split(' ')])).toEqual(rows);
+    expect(r.variants.map((v) => v.canonical)).toEqual(rows.map((_, i) => i === 0));
+    expect(r.all).toEqual(rows.map(([tag]) => (tag ?? '').replace(/^2\.8\.0-/, '')));
+    // Every variant the table lists has a pin target.
+    for (const name of r.all) expect(ARTIFACTS[`wash-${name}`], name).toBeDefined();
+    expect(r.bun.match(/--stale-guard/g)).toHaveLength(rows.length);
+  });
+
+  test('comment lines are skipped, wherever they are', () => {
+    const r = resolve('# a\n2.8.0-x  p1.patch p2.patch\n  # b\n\n2.8.0-y\n', 'push');
+    expect(r.exitCode).toBe(0);
+    expect(r.variants).toEqual([
+      {
+        name: 'x',
+        tag: '2.8.0-x',
+        patches: 'p1.patch p2.patch',
+        hash: 'a'.repeat(64),
+        canonical: true,
+      },
+      { name: 'y', tag: '2.8.0-y', patches: '', hash: 'a'.repeat(64), canonical: false },
+    ] as never);
+  });
+
+  test('a dispatch builds only the selected variant, forced', () => {
+    const r = resolve(table, 'workflow_dispatch', 'wasi-tls-exclusive');
+    expect(r.exitCode).toBe(0);
+    expect(r.variants.map((v) => v.tag)).toEqual(['2.8.0-wasi-tls-exclusive']);
+    expect(r.variants[0]?.canonical).toBe(false);
+    expect(r.bun).toContain('--force');
+    expect(r.bun).not.toContain('--stale-guard');
+  });
+
+  test('a dispatch of an unlisted variant fails', () => {
+    const r = resolve(table, 'workflow_dispatch', 'nope');
+    expect(r.exitCode).not.toBe(0);
+    expect(r.stdout).toContain('is not listed');
+  });
+
+  test('merge reports the canonical flag from the resolver, not from the patch set', () => {
+    const record = workflow.jobs.merge?.steps?.find((s) => (s.run ?? '').includes('CANONICAL'));
+    expect(record?.env?.CANONICAL).toBe('${{ matrix.variant.canonical }}');
+    expect(record?.run).toContain('if [[ "${CANONICAL}" == "true" ]]; then');
+    expect(record?.run).not.toContain('-n "${PATCHES}"');
+  });
 });
 
 describe('scripts/wash-pins.sh (the wash pin set)', () => {

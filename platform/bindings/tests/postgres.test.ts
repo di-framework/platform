@@ -206,6 +206,36 @@ describe('autocommit adapter', () => {
     expect(await sql.query('SELECT 1')).toEqual([{ one: '1' }]);
     expect(calls.map((call) => call.method)).toEqual(['query']);
   });
+
+  it('returns JSON-safe float8 and big-serial cells lifted as BigInt (componentize-qjs di.5)', async () => {
+    // componentize-qjs 0.4.4-di.5 lifts WIT `u64`/`s64` as `BigInt`, so a `hashable-f64`
+    // mantissa and a `big-serial` payload arrive as `bigint`. @di-framework/repo < 6.1.0
+    // returned these raw, and `JSON.stringify` threw on the row.
+    const float8 = (mantissa: bigint, exponent: number, sign: number) => ({
+      tag: 'float8' as const,
+      val: [mantissa, exponent, sign],
+    });
+    const bigSerial = (val: bigint) => ({ tag: 'big-serial' as const, val });
+    const { guest } = rotatingGuest({
+      query: async () =>
+        table(
+          ['score', 'delta', 'id', 'seq'],
+          [
+            [
+              float8(0x18000000000000n, -52, 1), // 1.5
+              float8(0x12000000000000n, -51, -1), // -2.25
+              bigSerial(9007199254740993n), // 2^53 + 1, not a safe integer
+              bigSerial(42n),
+            ],
+          ],
+        ),
+    });
+    const sql = openPostgresDatabase(guest);
+
+    const rows = await sql.query('SELECT score, delta, id, seq FROM t');
+    expect(rows).toEqual([{ score: 1.5, delta: -2.25, id: '9007199254740993', seq: 42 }]);
+    expect(JSON.parse(JSON.stringify(rows))).toEqual(rows);
+  });
 });
 
 describe('atomicBatch', () => {
@@ -347,9 +377,9 @@ describe('postgres subpath packaging', () => {
       import: './dist/postgres/index.js',
       default: './dist/postgres/index.js',
     });
-    expect(packageJson.peerDependencies['@di-framework/repo']).toBe('^6.0.4');
+    expect(packageJson.peerDependencies['@di-framework/repo']).toBe('^6.1.0');
     expect(packageJson.peerDependenciesMeta['@di-framework/repo']?.optional).toBe(true);
-    expect(packageJson.devDependencies['@di-framework/repo']).toBe('^6.0.4');
+    expect(packageJson.devDependencies['@di-framework/repo']).toBe('^6.1.0');
 
     const root = new URL('../src/', import.meta.url);
     const offenders = sourceFiles(root).filter((file) =>

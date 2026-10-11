@@ -1,0 +1,491 @@
+diff --git a/crates/wash-runtime/src/host/mod.rs b/crates/wash-runtime/src/host/mod.rs
+index d37cc1c..5deb7b3 100644
+--- a/crates/wash-runtime/src/host/mod.rs
++++ b/crates/wash-runtime/src/host/mod.rs
+@@ -1165,6 +1165,13 @@ pub struct HostConfig {
+     /// may name the same bundles; a second host naming *different* ones fails
+     /// to build, rather than running on trust it did not ask for.
+     pub oci_ca_paths: Vec<PathBuf>,
++    /// Per-registry allowlist for insecure (HTTP) OCI registries, as
++    /// `host[:port]` entries. Workload pulls from a listed registry use plain
++    /// HTTP; every other registry stays on HTTPS. This is more selective than
++    /// `allow_oci_insecure`, which switches all registries to HTTP and wins
++    /// when both are set. Matching is exact; see
++    /// [`OciConfig::insecure_registries`](crate::oci::OciConfig::insecure_registries).
++    pub insecure_registries: Vec<String>,
+ }
+ 
+ impl Default for HostConfig {
+@@ -1174,6 +1181,7 @@ impl Default for HostConfig {
+             oci_pull_timeout: Duration::from_secs(30).into(),
+             oci_cache_dir: None,
+             oci_ca_paths: Vec::new(),
++            insecure_registries: Vec::new(),
+         }
+     }
+ }
+diff --git a/crates/wash-runtime/src/oci.rs b/crates/wash-runtime/src/oci.rs
+index e18dafc..d70bdaa 100644
+--- a/crates/wash-runtime/src/oci.rs
++++ b/crates/wash-runtime/src/oci.rs
+@@ -268,6 +268,36 @@ pub struct OciConfig {
+     /// Timeout for OCI operations (pull, push, etc.)
+     /// If None, uses default timeout from oci-client
+     pub timeout: Option<Duration>,
++    /// Per-registry allowlist for insecure (HTTP) OCI registries: entries in
++    /// `host[:port]` form, with no scheme or path. A reference whose registry
++    /// is listed is pulled and pushed over plain HTTP; every other registry
++    /// stays on HTTPS. Ignored when `insecure` is set, since that already
++    /// switches every registry to HTTP.
++    ///
++    /// Matching is oci-client's `ClientProtocol::HttpsExcept`: an exact,
++    /// case-sensitive string comparison with `Reference::resolve_registry()`.
++    /// Ports are not normalised (`reg` does not match `reg:80`), short and
++    /// fully qualified names are different entries (`reg:5000` does not match
++    /// `reg.ns.svc.cluster.local:5000`), and `docker.io` resolves to
++    /// `index.docker.io`. List the registry exactly as workload references
++    /// spell it.
++    pub insecure_registries: Vec<String>,
++}
++
++/// The transport oci-client uses for a pull or push with `config`.
++///
++/// `insecure` wins and switches every registry to plain HTTP. Otherwise a
++/// non-empty `insecure_registries` allowlist keeps HTTPS for every registry
++/// except the listed ones (exact `host[:port]` match, see
++/// [`OciConfig::insecure_registries`]), and an empty one means HTTPS for all.
++fn client_protocol(config: &OciConfig) -> ClientProtocol {
++    if config.insecure {
++        ClientProtocol::Http
++    } else if config.insecure_registries.is_empty() {
++        ClientProtocol::Https
++    } else {
++        ClientProtocol::HttpsExcept(config.insecure_registries.clone())
++    }
+ }
+ 
+ impl OciConfig {
+@@ -608,11 +638,7 @@ pub async fn pull_component(
+ 
+     // Configure OCI client
+     let client_config = ClientConfig {
+-        protocol: if config.insecure {
+-            ClientProtocol::Http
+-        } else {
+-            ClientProtocol::Https
+-        },
++        protocol: client_protocol(&config),
+         extra_root_certificates: extra_ca_certificates(),
+         ..Default::default()
+     };
+@@ -762,6 +788,9 @@ pub async fn push_component(
+         .await
+         .with_context(|| "component data is not a valid WebAssembly component")?;
+ 
++    // Chosen before the credentials are moved out of `config`.
++    let protocol = client_protocol(&config);
++
+     // Setup credential resolver
+     let credential_resolver = CredentialResolver::new(config.credentials);
+     let auth = credential_resolver
+@@ -770,11 +799,7 @@ pub async fn push_component(
+ 
+     // Configure OCI client
+     let client_config = ClientConfig {
+-        protocol: if config.insecure {
+-            ClientProtocol::Http
+-        } else {
+-            ClientProtocol::Https
+-        },
++        protocol,
+         extra_root_certificates: extra_ca_certificates(),
+         ..Default::default()
+     };
+@@ -1143,6 +1168,114 @@ mod tests {
+         assert!(config.insecure);
+     }
+ 
++    #[test]
++    fn client_protocol_insecure_registries_empty_is_https_for_all() {
++        assert_eq!(
++            client_protocol(&OciConfig::default()),
++            ClientProtocol::Https
++        );
++    }
++
++    #[test]
++    fn client_protocol_insecure_registries_listed_is_https_except() {
++        let config = OciConfig {
++            insecure_registries: vec!["localhost:5000".to_string(), "reg:5000".to_string()],
++            ..Default::default()
++        };
++        assert_eq!(
++            client_protocol(&config),
++            ClientProtocol::HttpsExcept(vec!["localhost:5000".to_string(), "reg:5000".to_string()])
++        );
++    }
++
++    #[test]
++    fn client_protocol_insecure_registries_overridden_by_allow_insecure() {
++        let config = OciConfig {
++            insecure: true,
++            insecure_registries: vec!["localhost:5000".to_string()],
++            ..Default::default()
++        };
++        assert_eq!(client_protocol(&config), ClientProtocol::Http);
++    }
++
++    /// Pulls `<127.0.0.1:port>/probe/component:1` against a loopback listener
++    /// built with `make_config(registry)` and reports what the client opened
++    /// the connection with: `"http"` for a plaintext request line, `"https"`
++    /// for a TLS ClientHello. The listener answers nothing, so the pull itself
++    /// fails; only the scheme the client picked is observed.
++    async fn first_connection_scheme(make_config: impl FnOnce(&str) -> OciConfig) -> &'static str {
++        use tokio::io::AsyncReadExt as _;
++
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
++            .await
++            .expect("bind a loopback listener");
++        let registry = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
++        let mut config = make_config(&registry);
++        config.timeout = Some(Duration::from_secs(5));
++        let reference = format!("{registry}/probe/component:1");
++
++        let accept = async move {
++            let (mut socket, _) = listener.accept().await.expect("accept the client");
++            let mut first = [0u8; 4];
++            socket
++                .read_exact(&mut first)
++                .await
++                .expect("read the first bytes");
++            first
++        };
++        let pull = pull_component(&reference, config, OciPullPolicy::Always);
++        let (first, pulled) = tokio::time::timeout(Duration::from_secs(30), async {
++            tokio::join!(accept, pull)
++        })
++        .await
++        .expect("the client connects to the probe listener");
++        assert!(pulled.is_err(), "the probe listener serves no image");
++
++        if first[0] == 0x16 {
++            "https"
++        } else if matches!(&first, b"GET " | b"HEAD" | b"POST" | b"PUT ") {
++            "http"
++        } else {
++            panic!("unrecognised first bytes {first:?}")
++        }
++    }
++
++    #[tokio::test]
++    async fn pull_insecure_registries_listed_registry_uses_http() {
++        let scheme = first_connection_scheme(|registry| OciConfig {
++            insecure_registries: vec![registry.to_string()],
++            ..Default::default()
++        })
++        .await;
++        assert_eq!(scheme, "http");
++    }
++
++    #[tokio::test]
++    async fn pull_insecure_registries_other_registry_uses_https() {
++        // The same host on another port, and the host without a port, are
++        // different entries: matching is exact on `host[:port]`.
++        let scheme = first_connection_scheme(|registry| {
++            let host = registry.split(':').next().unwrap().to_string();
++            OciConfig {
++                insecure_registries: vec![host, "127.0.0.1:1".to_string()],
++                ..Default::default()
++            }
++        })
++        .await;
++        assert_eq!(scheme, "https");
++    }
++
++    #[tokio::test]
++    async fn pull_insecure_registries_allow_insecure_uses_http_for_all() {
++        let scheme = first_connection_scheme(|_| OciConfig {
++            insecure: true,
++            insecure_registries: vec!["somewhere-else:5000".to_string()],
++            ..Default::default()
++        })
++        .await;
++        assert_eq!(scheme, "http");
++    }
++
+     #[test]
+     fn test_cache_manager_path_generation() {
+         let temp_dir = TempDir::new().unwrap();
+diff --git a/crates/wash-runtime/src/washlet/mod.rs b/crates/wash-runtime/src/washlet/mod.rs
+index eb825f8..9edbd07 100644
+--- a/crates/wash-runtime/src/washlet/mod.rs
++++ b/crates/wash-runtime/src/washlet/mod.rs
+@@ -409,6 +409,7 @@ fn image_pull_secret_to_oci_config(
+     };
+     oci_config.cache_dir = config.oci_cache_dir.clone();
+     oci_config.insecure = config.allow_oci_insecure;
++    oci_config.insecure_registries = config.insecure_registries.clone();
+     oci_config.timeout = config.oci_pull_timeout;
+ 
+     oci_config
+@@ -980,6 +981,28 @@ mod tests {
+         let config = image_pull_secret_to_oci_config(&host_config, &secret);
+         assert!(config.credentials.is_none());
+         assert!(!config.insecure);
++        assert!(config.insecure_registries.is_empty());
++    }
++
++    #[tokio::test]
++    async fn test_image_pull_secret_to_oci_config_insecure_registries() {
++        let host_config = HostConfig {
++            allow_oci_insecure: false,
++            insecure_registries: vec![
++                "di-framework-registry:5000".to_string(),
++                "localhost:5000".to_string(),
++            ],
++            ..Default::default()
++        };
++        let secret = Some(types::v2::ImagePullSecret {
++            username: "testuser".to_string(),
++            password: "testpass".to_string(),
++        });
++        for secret in [None, secret] {
++            let config = image_pull_secret_to_oci_config(&host_config, &secret);
++            assert!(!config.insecure);
++            assert_eq!(config.insecure_registries, host_config.insecure_registries);
++        }
+     }
+ 
+     #[tokio::test]
+diff --git a/crates/wash/src/cli/host.rs b/crates/wash/src/cli/host.rs
+index 1643684..0e5b8b5 100644
+--- a/crates/wash/src/cli/host.rs
++++ b/crates/wash/src/cli/host.rs
+@@ -287,6 +287,32 @@ pub struct HostCommand {
+     #[arg(long = "oci-ca-path", env = "WASH_OCI_CA_PATHS", value_delimiter = ',')]
+     pub oci_ca_paths: Vec<PathBuf>,
+ 
++    /// Per-registry allowlist for insecure (HTTP) OCI registries.
++    /// Registries in this list are pulled over plain HTTP, while every other
++    /// registry still requires HTTPS. This is more selective than
++    /// `--allow-insecure-registries`, which switches all registries to HTTP
++    /// and wins when both are given. Applies to workload components, host
++    /// component plugins, and washlet artifacts alike.
++    ///
++    /// Accepts a comma-separated list and/or repeated flags. Each entry is a
++    /// registry `host[:port]` with no scheme or path (e.g. "localhost:5000").
++    /// Surrounding whitespace is trimmed; empty entries and entries with a
++    /// scheme ("http://...") are rejected.
++    ///
++    /// Matching is an exact, case-sensitive comparison with the registry part
++    /// of the component reference: no default port is assumed ("reg" does
++    /// not match "reg:80"), and a short name does not match its fully
++    /// qualified form ("reg:5000" does not match
++    /// "reg.ns.svc.cluster.local:5000"). List the registry exactly as
++    /// workload references spell it.
++    #[arg(
++        long = "insecure-registry",
++        env = "WASH_INSECURE_REGISTRIES",
++        value_delimiter = ',',
++        value_parser = parse_insecure_registry
++    )]
++    pub insecure_registries: Vec<String>,
++
+     /// Timeout for pulling artifacts from OCI registries
+     #[arg(long = "registry-pull-timeout", value_parser = humantime::parse_duration, default_value = "30s")]
+     pub registry_pull_timeout: Duration,
+@@ -468,7 +494,26 @@ impl CliCommand for HostCommand {
+             oci_pull_timeout: Some(self.registry_pull_timeout),
+             oci_cache_dir: self.oci_cache_dir.clone(),
+             oci_ca_paths: self.oci_ca_paths.clone(),
++            insecure_registries: self.insecure_registries.clone(),
+         };
++        if self.allow_insecure_registries {
++            tracing::warn!(
++                "--allow-insecure-registries is set: every OCI registry is pulled over plain HTTP"
++            );
++        }
++        if !self.insecure_registries.is_empty() {
++            if self.allow_insecure_registries {
++                tracing::warn!(
++                    insecure_registries = ?self.insecure_registries,
++                    "--insecure-registry has no effect while --allow-insecure-registries is set"
++                );
++            } else {
++                info!(
++                    insecure_registries = ?self.insecure_registries,
++                    "OCI registries pulled over plain HTTP (exact host[:port] match); all others use HTTPS"
++                );
++            }
++        }
+ 
+         // The host applies these itself when it is built, but host component
+         // plugins are pulled before that. Install them here too — the same
+@@ -651,6 +696,7 @@ impl CliCommand for HostCommand {
+                 insecure: self.allow_insecure_registries,
+                 cache_dir: self.oci_cache_dir.clone(),
+                 timeout: Some(self.registry_pull_timeout),
++                insecure_registries: self.insecure_registries.clone(),
+             };
+             let native_plugins = cluster_host_builder.native_plugins();
+             let http_handler = cluster_host_builder.http_handler();
+@@ -715,6 +761,159 @@ impl CliCommand for HostCommand {
+     }
+ }
+ 
++/// Parses one `--insecure-registry` / `WASH_INSECURE_REGISTRIES` entry.
++///
++/// The entry is compared verbatim with a reference's registry, so anything
++/// that could never match is refused here instead of silently falling back to
++/// HTTPS: it is trimmed, and an empty entry (e.g. from a trailing comma), a
++/// scheme prefix, a path, or embedded whitespace is an error.
++fn parse_insecure_registry(value: &str) -> Result<String, String> {
++    let entry = value.trim();
++    if entry.is_empty() {
++        return Err("empty registry entry; expected host[:port], e.g. localhost:5000".to_string());
++    }
++    if entry.contains("://") {
++        return Err(format!(
++            "'{entry}' has a scheme; expected host[:port] without one, e.g. localhost:5000"
++        ));
++    }
++    if entry.contains('/') || entry.chars().any(char::is_whitespace) {
++        return Err(format!(
++            "'{entry}' is not a registry host[:port]; remove any path or whitespace"
++        ));
++    }
++    Ok(entry.to_string())
++}
++
++#[cfg(test)]
++mod insecure_registry_tests {
++    use super::HostCommand;
++    use clap::Parser;
++
++    /// Set only in the child process `parse` spawns; holds the arguments to
++    /// parse, separated by U+001F.
++    const CHILD_ARGS: &str = "WASH_TEST_INSECURE_REGISTRY_ARGS";
++    const ENV: &str = "WASH_INSECURE_REGISTRIES";
++    const PROBE: &str = "cli::host::insecure_registry_tests::insecure_registry_parse_probe";
++
++    #[derive(Debug, Parser)]
++    struct Cli {
++        #[command(flatten)]
++        host: HostCommand,
++    }
++
++    /// Parses `wash host <args>` with `WASH_INSECURE_REGISTRIES` set to `env`
++    /// (or unset) and returns the allowlist, or the parse error's message.
++    ///
++    /// The environment is process-global and this crate denies the `unsafe`
++    /// that `std::env::set_var` needs, so the parse runs in a child copy of
++    /// this test binary, given exactly the environment under test, that runs
++    /// only [`insecure_registry_parse_probe`].
++    fn parse(args: &[&str], env: Option<&str>) -> Result<Vec<String>, String> {
++        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
++        child
++            .args([PROBE, "--exact", "--nocapture", "--test-threads=1"])
++            .env(CHILD_ARGS, args.join("\u{1f}"))
++            .env_remove(ENV);
++        if let Some(value) = env {
++            child.env(ENV, value);
++        }
++        let output = child.output().expect("run the parse probe");
++        let stdout = String::from_utf8_lossy(&output.stdout);
++        assert!(output.status.success(), "parse probe failed: {stdout}");
++        let line = stdout
++            .lines()
++            .find_map(|line| line.split_once("PROBE ").map(|(_, result)| result))
++            .unwrap_or_else(|| panic!("parse probe printed no result: {stdout}"));
++        let result: Result<Vec<String>, String> =
++            serde_json::from_str(line).expect("parse probe result is JSON");
++        result
++    }
++
++    /// Does nothing in a normal test run. In the child spawned by `parse`, it
++    /// parses the arguments it was given and prints the result for the parent.
++    #[test]
++    fn insecure_registry_parse_probe() {
++        let Ok(args) = std::env::var(CHILD_ARGS) else {
++            return;
++        };
++        let args = args.split('\u{1f}').filter(|arg| !arg.is_empty());
++        let result: Result<Vec<String>, String> =
++            Cli::try_parse_from(std::iter::once("wash").chain(args))
++                .map(|cli| cli.host.insecure_registries)
++                .map_err(|err| err.to_string());
++        println!("PROBE {}", serde_json::to_string(&result).unwrap());
++    }
++
++    #[test]
++    fn insecure_registry_defaults_to_empty() {
++        assert_eq!(parse(&[], None).unwrap(), Vec::<String>::new());
++    }
++
++    #[test]
++    fn insecure_registry_flag_is_repeatable_and_comma_delimited() {
++        assert_eq!(
++            parse(
++                &[
++                    "--insecure-registry",
++                    "localhost:5000",
++                    "--insecure-registry",
++                    "di-framework-registry:5000,reg.example:8080",
++                ],
++                None,
++            )
++            .unwrap(),
++            vec![
++                "localhost:5000",
++                "di-framework-registry:5000",
++                "reg.example:8080"
++            ],
++        );
++    }
++
++    #[test]
++    fn insecure_registry_env_is_a_comma_list_and_trimmed() {
++        assert_eq!(
++            parse(&[], Some("localhost:5000, di-framework-registry:5000 ")).unwrap(),
++            vec!["localhost:5000", "di-framework-registry:5000"],
++        );
++        assert_eq!(
++            parse(&[], Some("localhost:5000")).unwrap(),
++            vec!["localhost:5000"]
++        );
++    }
++
++    #[test]
++    fn insecure_registry_flag_overrides_env() {
++        assert_eq!(
++            parse(&["--insecure-registry", "a:1"], Some("b:2,c:3")).unwrap(),
++            vec!["a:1"],
++        );
++    }
++
++    #[test]
++    fn insecure_registry_rejects_empty_entries() {
++        let err = parse(&[], Some("localhost:5000,")).unwrap_err();
++        assert!(err.contains("empty registry entry"), "{err}");
++        let err = parse(&["--insecure-registry", " "], None).unwrap_err();
++        assert!(err.contains("empty registry entry"), "{err}");
++    }
++
++    #[test]
++    fn insecure_registry_rejects_scheme_prefixed_entries() {
++        let err = parse(&["--insecure-registry", "http://localhost:5000"], None).unwrap_err();
++        assert!(err.contains("has a scheme"), "{err}");
++        let err = parse(&[], Some("https://reg:5000")).unwrap_err();
++        assert!(err.contains("has a scheme"), "{err}");
++    }
++
++    #[test]
++    fn insecure_registry_rejects_paths() {
++        let err = parse(&["--insecure-registry", "reg:5000/ns"], None).unwrap_err();
++        assert!(err.contains("not a registry host[:port]"), "{err}");
++    }
++}
++
+ #[cfg(all(test, feature = "host-component-plugins"))]
+ mod tests {
+     use super::host_plugin_registry_credentials;

@@ -38,11 +38,13 @@ jobs:
       - name: Lint
         run: bun run lint
 
-      - name: Dry-run package publish
-        run: bun scripts/publish-workspace.ts --dry-run
-
+      # Builds the engine before the dry-run, which runs the package's `bun run build`
+      # (adapter + `make build`) and then reuses the engine and cargo caches.
       - name: Build embedded PGlite component
         run: make -C platform/pglite-component tools-rust build
+
+      - name: Dry-run package publish
+        run: bun scripts/publish-workspace.ts --dry-run
 
       - name: Install wasmtime
         uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1
