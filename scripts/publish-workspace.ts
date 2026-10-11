@@ -65,6 +65,22 @@ function readPackage(pkgDir: string): PackageManifest {
   return JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')) as PackageManifest;
 }
 
+export const LICENSE_FILES = ['LICENSE-MIT', 'LICENSE-APACHE'] as const;
+
+/** Throws unless every license file is committed at the repository root. */
+export function assertRootLicenses(rootDir: string): void {
+  for (const license of LICENSE_FILES) {
+    if (!existsSync(join(rootDir, license))) {
+      throw new Error(`root ${license} is missing; cannot publish without license files`);
+    }
+  }
+}
+
+/** License files absent from a pack. Never fails open: all are always required. */
+export function missingLicenses(packedPaths: string[]): string[] {
+  return LICENSE_FILES.filter((license) => !packedPaths.includes(license));
+}
+
 function alreadyPublished(name: string, version: string): boolean {
   const result = Bun.spawnSync(['bun', 'pm', 'view', `${name}@${version}`, 'version'], {
     stdout: 'pipe',
@@ -74,6 +90,7 @@ function alreadyPublished(name: string, version: string): boolean {
 }
 
 export function publishWorkspaces(rootDir = process.cwd(), dryRun = false): string[] {
+  assertRootLicenses(rootDir);
   const published: string[] = [];
   for (const directory of workspacePackageDirs(rootDir)) {
     const pkgDir = join(rootDir, directory);
@@ -93,6 +110,12 @@ export function publishWorkspaces(rootDir = process.cwd(), dryRun = false): stri
     }
     const packed = packPaths(pkgDir);
     const missing = missingPackedEntries(pkg.files, packed);
+    const missingLicense = missingLicenses(packed);
+    if (missingLicense.length > 0) {
+      throw new Error(
+        `${pkg.name}@${pkg.version} pack is missing ${missingLicense.join(', ')}. Refusing to publish.`,
+      );
+    }
     if (missing.length > 0) {
       throw new Error(
         `${pkg.name}@${pkg.version} pack is missing ${missing.join(', ')}. Refusing to publish.`,
