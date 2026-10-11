@@ -2,17 +2,71 @@
 
 Runtime image for tenant host groups (`tenant-<name>` Deployments in `di-runtime-<name>`). It is
 `wash` from wasmCloud tag `v2.8.0` (commit `5c4ec4a3d008b3f401d9e763515f434deebc9936`) built with the
-opt-in `wasi-tls` cargo feature.
+opt-in `wasi-tls` cargo feature and a per-registry insecure allowlist for OCI registries.
 
 The stock `ghcr.io/wasmcloud/wash:2.8.0` image is a default-features build. Its host world has no
 `wasi:tls`, so a component that imports `wasi:tls/client@0.3.0-draft` (the node:tls shim, for example
 the meshtastic `mesh-collector`) fails with `service did not properly execute`. With this image the host
 links `wasi:tls/client,types@0.3.0-draft` alongside the default interfaces.
 
+## Variants and patches
+
+[`variants`](variants) is the one table that maps an image tag to the patches applied to the pinned
+source, in order. The Dockerfile fails a build whose `WASH_PATCHES` is not exactly the set listed for
+its `IMAGE_VERSION`, the publish workflow takes the set from it, and the patch-check workflow runs one
+job per row. Both variants carry 0002:
+
+| Tag | Patches (in order) | Use |
+| --- | --- | --- |
+| `ghcr.io/di-framework/wash:2.8.0-wasi-tls` (canonical, the build default) | `0002-insecure-registry-allowlist.patch` | Every tenant host, including local Kubesolo/k0s clusters that pull from the in-cluster plain-HTTP registry. |
+| `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive` | `0001-exclusive-instance.patch` `0002-insecure-registry-allowlist.patch` | Only stacks that need exclusive instances (pglite on a persistent directory), by setting `tenantHostImage`. |
+
+- **0002-insecure-registry-allowlist.patch** (#149, #175) adds `wash host --insecure-registry
+  <host[:port]>` and the `WASH_INSECURE_REGISTRIES` environment variable: a per-registry plain-HTTP
+  allowlist. See [Insecure registry allowlist](#insecure-registry-allowlist).
+- **0001-exclusive-instance.patch** (#136) adds the exclusive queueing pool policy, opted into per
+  component with `localResources.config` key `di-framework.dev/exclusive-instance: "true"`. See
+  [Exclusive instances](#exclusive-instances-wasi-tls-exclusive).
+
+## Insecure registry allowlist
+
+`--allow-insecure-registries` switches every OCI pull to plain HTTP, GHCR included (#171). 0002 adds
+a selective alternative: registries named with `--insecure-registry` (repeatable, comma-delimited) or
+`WASH_INSECURE_REGISTRIES` (comma-delimited) are pulled over plain HTTP, and every other registry
+stays on HTTPS. It applies to workload components, washlet artifacts and host component plugins.
+`--allow-insecure-registries` still wins when both are given (the host logs a warning). At startup
+the host logs the effective allowlist.
+
+```sh
+wash host --insecure-registry di-framework-registry.wasmcloud.svc.cluster.local:5000
+WASH_INSECURE_REGISTRIES=di-framework-registry.wasmcloud.svc.cluster.local:5000,localhost:5000 wash host
+```
+
+Entries are `host[:port]`. Surrounding whitespace is trimmed; an empty entry (for example from a
+trailing comma), an entry with a scheme (`http://reg:5000`), a path or embedded whitespace is
+rejected when the host starts.
+
+**Matching is exact.** The allowlist is oci-client 0.17's `ClientProtocol::HttpsExcept`, which
+compares each entry with the reference's `Reference::resolve_registry()` as a plain string:
+
+- case-sensitive;
+- no default-port normalisation: `reg` does not match `reg:80` or `reg:443`;
+- no name resolution: `reg:5000` does not match `reg.ns.svc.cluster.local:5000` or the registry's IP;
+- `docker.io` references resolve to `index.docker.io`.
+
+So pass the registry exactly as workload references spell it. The local stack's pull address is
+`di-framework-registry.<namespace>.svc.cluster.local:5000` (`registry.pull` in
+`platform/platform/src/local.ts`), so that is the entry to pass for it; references written as
+`di-framework-registry:5000/...` need that short spelling listed too.
+
 ## What is built
 
 - Source: `git clone --branch v2.8.0` in its own layer, then the build fails unless `HEAD` is the pinned commit. `GIT_TERMINAL_PROMPT=0` keeps a credential prompt from hanging CI.
-- Patches: none by default. The `wasi-tls-exclusive` variant applies `0001-exclusive-instance.patch` (see [Exclusive instances](#exclusive-instances-wasi-tls-exclusive)). The patch is `git diff` output against the pinned commit; the build runs `git apply --check` and fails if it does not apply. Pull requests that touch this directory apply it to the pinned commit and run its tests (`.github/workflows/tenant-host-patch-check.yml`).
+- Patches: the variant's set from [`variants`](variants), applied in order after cloning (see
+  [Variants and patches](#variants-and-patches)). Each is `git diff` output against the pinned
+  commit; the build runs `git apply --check` first and fails if it does not apply. Pull requests that
+  touch this directory apply each variant's set to the pinned commit and run the patch tests
+  (`.github/workflows/tenant-host-patch-check.yml`).
 - Limitation: the host still runs upstream wash 2.8.0 postgres behavior for non-exclusive workloads. Connections are not pinned per invocation, and `BEGIN` ... `COMMIT` across separate queries is not guaranteed to use one connection, for named and unnamed imports alike. Guests should use autocommit or a single batched statement, as the identity guest does (issue #39).
 - Feature: `wasi-tls` is declared by the `wash` crate (`wasi-tls = ["wash-runtime/wasi-tls"]`), which
   enables `wasmtime-wasi-tls` (p3, rustls) in `wash-runtime`. Default features (`wasi-webgpu`,
@@ -137,7 +191,8 @@ and a pod rescheduled to another node sees a different directory.
 
 **Image.** Published under its own tag, `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive`, with
 `org.opencontainers.image.version=2.8.0-wasi-tls-exclusive` and
-`dev.di-framework.wash.patches=0001-exclusive-instance.patch`. It never moves the canonical
+`dev.di-framework.wash.patches=0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch`
+(0001 stacked with the allowlist patch every variant carries). It never moves the canonical
 `2.8.0-wasi-tls` tag, and `DEFAULT_HOST_IMAGE` stays on the canonical digest. Use it only by setting
 `tenantHostImage` (digest-pinned) on a stack that needs it until it is proven.
 
@@ -163,14 +218,36 @@ way `workload_stop` does. They cover these cases:
 - a symlink to the old revision's directory shares its gate (the key is the canonical path).
 `tests/integration_exclusive_topology.rs` (needs the prebuilt test fixtures) covers the layout rule
 and a lone exclusive component loading and queueing real requests (it does not measure
-serialization; the live-store tests do). Run them against a checkout of the pinned commit with the patch applied:
+serialization; the live-store tests do). See [Tests](#tests) for the commands.
+
+## Tests
+
+The patch-check workflow runs these for every row of [`variants`](variants). Locally, against a
+checkout of the pinned commit:
 
 ```sh
 git clone https://github.com/wasmCloud/wasmCloud /tmp/wasmcloud && cd /tmp/wasmcloud
 git checkout 5c4ec4a3d008b3f401d9e763515f434deebc9936
-git apply /path/to/platform/tenant-host/0001-exclusive-instance.patch
-cargo test -p wash-runtime --features wasi-tls --lib -- instance_pool instance_driver wire_
+P=/path/to/platform/tenant-host
+
+# canonical (2.8.0-wasi-tls): 0002 alone
+git apply "$P/0002-insecure-registry-allowlist.patch"
+cargo test -p wash-runtime --features wasi-tls --lib -- insecure_registr client_protocol test_image_pull_secret_to_oci_config
+cargo test -p wash --features wasi-tls,host-component-plugins --lib -- insecure_registry
+
+# exclusive (2.8.0-wasi-tls-exclusive), on a clean checkout: 0001 then 0002
+git checkout -- . && git clean -fd
+git apply "$P/0001-exclusive-instance.patch" && git apply "$P/0002-insecure-registry-allowlist.patch"
+cargo test -p wash-runtime --features wasi-tls --lib -- insecure_registr client_protocol test_image_pull_secret_to_oci_config instance_pool instance_driver wire_
+cargo test -p wash --features wasi-tls,host-component-plugins --lib -- insecure_registry
 ```
+
+0002's tests cover protocol selection (an allowlisted `host:port` is pulled over HTTP and anything
+else over HTTPS, checked against a loopback listener; `--allow-insecure-registries` makes every pull
+HTTP), the allowlist reaching the washlet's pull config, and `wash host` parsing of repeated flags,
+the comma-delimited `WASH_INSECURE_REGISTRIES`, trimming, and rejected entries. CI also runs
+`cargo fmt --all -- --check`, clippy `-D warnings` for `-p wash` and `-p wash-runtime`, and
+`cargo check -p wash --features wasi-tls,host-component-plugins`.
 
 ## Build
 
@@ -180,12 +257,13 @@ podman run --rm localhost/di-framework/wash:2.8.0-wasi-tls --version
 
 # the exclusive variant
 podman build -t localhost/di-framework/wash:2.8.0-wasi-tls-exclusive \
-  --build-arg WASH_PATCHES=0001-exclusive-instance.patch \
+  --build-arg "WASH_PATCHES=0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch" \
   --build-arg IMAGE_VERSION=2.8.0-wasi-tls-exclusive platform/tenant-host
 ```
 
-The build fails if `WASH_PATCHES` and `IMAGE_VERSION` disagree (patches under the canonical version,
-or a patched version with no patches).
+The defaults are the canonical row. The build fails unless `WASH_PATCHES` is exactly the patch set
+[`variants`](variants) lists for `IMAGE_VERSION` (same patches, same order), and fails for an
+`IMAGE_VERSION` that is not listed.
 
 `docker build` works the same way (BuildKit is needed for the cache mounts). A cold arm64 build took
 about 10 minutes on 16 cores; the cargo registry and target directory are cache mounts, so rebuilds are
@@ -198,14 +276,15 @@ list (the stock image lists the same interfaces without it), followed by one exp
 
 ## Publish
 
-Reference: `ghcr.io/di-framework/wash:2.8.0-wasi-tls` (stock source), or
-`ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive` (with the exclusive-instance patch).
+Reference: `ghcr.io/di-framework/wash:2.8.0-wasi-tls` (with the allowlist patch, 0002), or
+`ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive` (0001 and 0002).
 
 The **Publish tenant host image** workflow
 ([`.github/workflows/tenant-host-image.yml`](../../.github/workflows/tenant-host-image.yml))
 takes a `variant` input, `wasi-tls` (default) or `wasi-tls-exclusive`; the exclusive build has to
 be selected explicitly. Each variant pushes only its
-own tag; a patched build cannot be published on the canonical tag. It builds `linux/amd64` and
+own tag, with the patch set its resolver job reads from [`variants`](variants); a set that does not
+match the tag fails the Dockerfile check, so neither tag can be published with the other's patches. It builds `linux/amd64` and
 `linux/arm64` on native runners (`ubuntu-24.04` and `ubuntu-24.04-arm`)
 at the same time, then pushes the multi-arch tag. It does not emulate arm64. Each arch also pushes
 a cache manifest per variant, `ghcr.io/di-framework/wash:buildcache-<tag>-amd64` and `-arm64`, with
@@ -217,13 +296,16 @@ tab after the workflow file is on `main`
 (`https://github.com/di-framework/platform/actions/workflows/tenant-host-image.yml`).
 The job authenticates with the workflow `GITHUB_TOKEN` (`packages: write`).
 
-The tags are mutable. The platform default `hostImage` is the published canonical (unpatched) index:
+The tags are mutable. The platform default `hostImage` is still pinned to an index of the canonical
+tag published before 0002 existed, so it has no `--insecure-registry`:
 
 `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669`
 
 The currently pinned image was published before the patch was dropped, so it still contains the unnamed-import lease until a maintainer republishes and the pin is updated.
 
 `tenantHostImage` overrides it. The workflow summary prints the digest of each later publish.
+Switching the platform from `--allow-insecure-registries` to `--insecure-registry <host:port>` and
+repinning `DEFAULT_HOST_IMAGE` to a canonical index built with 0002 is a follow-up under #149.
 
 For a local Kubesolo/k0s cluster, push to the platform registry (`di-framework-registry` in
 `wasmcloud`, plain HTTP, ClusterIP) through its port-forward. With a remote podman machine, `127.0.0.1`
