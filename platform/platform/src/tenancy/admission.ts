@@ -94,15 +94,14 @@ function registryBlobstoreAllowed(
     ? tenantNameFromNamespace(requester.workloadNamespace)
     : undefined;
   const config = hostInterface.config ?? {};
-  const keys = Object.keys(config).sort();
+  const keys = Object.keys(config);
   return (
     requester?.username ===
       `system:serviceaccount:${requester?.controllerNamespace}:di-platform-controller` &&
     tenant !== undefined &&
     (hostInterface.configFrom ?? []).length === 0 &&
     keys.length === 2 &&
-    keys[0] === 'backend' &&
-    keys[1] === 'url' &&
+    keys.every((key) => key === 'backend' || key === 'url') &&
     config.backend === 'nats' &&
     config.url === `nats://di-nats.di-runtime-${tenant}.svc.cluster.local:4222`
   );
