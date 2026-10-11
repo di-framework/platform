@@ -343,3 +343,24 @@ describe('composite actions', () => {
     }
   });
 });
+
+test('the tenant host resolves variant patches in one place and hashes every patch file', () => {
+  const text = read('.github/workflows/tenant-host-image.yml');
+  // Only check-source maps a variant to its patches; build and merge read the matrix entry.
+  expect(text.match(/case "\$\{name\}" in/g)).toHaveLength(1);
+  expect(text.match(/\.patch'/g)?.length).toBeGreaterThan(0);
+  for (const job of ['build', 'merge']) {
+    const steps = parse('.github/workflows/tenant-host-image.yml').jobs[job]?.steps ?? [];
+    for (const step of steps) expect(step.run ?? '', job).not.toContain('case ');
+  }
+  const filter = pushPaths(text);
+  for (const file of Bun.spawnSync(['git', 'ls-files', 'platform/tenant-host'], { cwd: repo })
+    .stdout.toString()
+    .trim()
+    .split('\n')) {
+    expect(matchesPathFilter(filter, file), file).toBe(!file.endsWith('.md'));
+  }
+  expect(
+    matchesPathFilter(filter, 'platform/tenant-host/0002-insecure-registry-allowlist.patch'),
+  ).toBe(true);
+});
