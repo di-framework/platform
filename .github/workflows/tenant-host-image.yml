@@ -1,13 +1,18 @@
 # Publish the tenant host image: wash 2.8.0 with wasi-tls.
-# On workflow_dispatch, builds the selected variant. On push to main, builds both variants.
 #
-# Two variants, chosen by the `variant` input. Each has its own tag and its own cache, so a patched
-# build can never move the canonical tag (#136):
+# Triggers (#172): a push to main that touches platform/tenant-host/** or this file builds both
+# variants; workflow_dispatch builds the selected variant and always builds it (reruns).
+#
+# Two variants. Each has its own tag and its own cache, so a patched build can never move the
+# canonical tag (#136):
 #   wasi-tls            ghcr.io/di-framework/wash:2.8.0-wasi-tls            stock source, no patches
 #   wasi-tls-exclusive  ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive  + 0001-exclusive-instance.patch
-# The image labels name the variant and the patches applied. The platform default hostImage stays
-# pinned to the canonical digest; the exclusive variant is only used by setting tenantHostImage to its digest.
-# The exclusive build is never the default: select it explicitly.
+# The image labels name the variant and the patches applied. The platform default hostImage
+# (DEFAULT_HOST_IMAGE) stays pinned to the canonical digest; the pin job below never changes it.
+#
+# Skip if published: check-source hashes the committed files in on.push.paths, salted with the
+# variant (scripts/source-check.ts). On a push, a variant whose wash:src-<hash> tag already
+# exists is dropped from the build matrix. merge adds src-<hash> to the same multi-arch index.
 #
 # amd64 and arm64 compile at the same time on native runners. One ubuntu-24.04
 # job plus QEMU was spending the arm64 release build in emulation, which is
@@ -19,7 +24,11 @@
 # is min mode and omits the builder stage.
 # cancel-in-progress stays false so a queued publish waits and does not abort
 # one that is already compiling.
-# Auth is GITHUB_TOKEN with packages: write. No registry secret is stored.
+#
+# Permissions: workflow default contents: read. check-source reads packages; build pushes the
+# per-arch images by digest and the registry cache, and merge pushes the tags, so both hold
+# packages: write; only pin holds contents: write and pull-requests: write.
+# Auth is GITHUB_TOKEN. No registry secret is stored.
 name: Publish tenant host image
 
 on:
@@ -37,25 +46,39 @@ on:
     paths:
       - 'platform/tenant-host/**'
       - '.github/workflows/tenant-host-image.yml'
+      - '!**/*.md'
 
 permissions:
   contents: read
-  packages: write
-  attestations: write
-  id-token: write
 
 concurrency:
   group: publish-tenant-host-image
   cancel-in-progress: false
 
 jobs:
-  variant:
-    name: Resolve variants
+  check-source:
+    name: Resolve variants and skip published sources
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
     outputs:
       variants: ${{ steps.resolve.outputs.variants }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up source check
+        uses: ./.github/actions/setup-source-check
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # One source of truth for each variant's tag and patches; build and merge read them
+      # from the matrix.
       - name: Resolve variants for this trigger
         id: resolve
         env:
@@ -63,31 +86,58 @@ jobs:
           TRIGGER: ${{ github.event_name }}
         run: |
           set -euo pipefail
+          force=()
           if [[ "${TRIGGER}" == "workflow_dispatch" ]]; then
-            # On dispatch, use the selected variant
-            variants="[{\"name\":\"${VARIANT}\"}]"
+            candidates=("${VARIANT}")
+            force=(--force)
           else
-            # On push to main, build both variants
-            variants='[{"name":"wasi-tls"},{"name":"wasi-tls-exclusive"}]'
+            candidates=(wasi-tls wasi-tls-exclusive)
           fi
+          variants='[]'
+          for name in "${candidates[@]}"; do
+            case "${name}" in
+              wasi-tls) patches='' ;;
+              wasi-tls-exclusive) patches='0001-exclusive-instance.patch' ;;
+              *)
+                echo "::error::unknown variant '${name}'"
+                exit 1
+                ;;
+            esac
+            out="$(bun scripts/source-check.ts --workflow .github/workflows/tenant-host-image.yml \
+              --image ghcr.io/di-framework/wash --salt "${name}" "${force[@]}")"
+            hash="$(sed -n 's/^hash=//p' <<<"${out}")"
+            skip="$(sed -n 's/^skip=//p' <<<"${out}")"
+            if [[ "${skip}" == "true" ]]; then
+              echo "${name}: ghcr.io/di-framework/wash:src-${hash} already published; skipping"
+              continue
+            fi
+            variants="$(jq -c --arg name "${name}" --arg patches "${patches}" --arg hash "${hash}" \
+              '. + [{name: $name, tag: ("2.8.0-" + $name), patches: $patches, hash: $hash}]' <<<"${variants}")"
+          done
+          echo "Variants to build: ${variants}"
           echo "variants=${variants}" >> "${GITHUB_OUTPUT}"
 
   build:
     name: Build ${{ matrix.variant.name }} on ${{ matrix.platform }}
-    needs: variant
+    needs: check-source
+    if: ${{ !cancelled() && needs.check-source.result == 'success' && needs.check-source.outputs.variants != '[]' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
-        variant: ${{ fromJson(needs.variant.outputs.variants) }}
+        variant: ${{ fromJson(needs.check-source.outputs.variants) }}
+        arch: [amd64, arm64]
         include:
-          - platform: linux/amd64
+          - arch: amd64
+            platform: linux/amd64
             runner: ubuntu-24.04
-            arch: amd64
-          - platform: linux/arm64
+          - arch: arm64
+            platform: linux/arm64
             runner: ubuntu-24.04-arm
-            arch: arm64
     steps:
       - name: Require di-framework/platform
         run: |
@@ -97,25 +147,10 @@ jobs:
             exit 1
           fi
 
-      - name: Resolve tag and patches
-        id: variant
-        env:
-          VARIANT: ${{ matrix.variant.name }}
-        run: |
-          set -euo pipefail
-          case "${VARIANT}" in
-            wasi-tls) patches='' ;;
-            wasi-tls-exclusive) patches='0001-exclusive-instance.patch' ;;
-            *)
-              echo "::error::unknown variant '${VARIANT}'"
-              exit 1
-              ;;
-          esac
-          echo "tag=2.8.0-${VARIANT}" >> "${GITHUB_OUTPUT}"
-          echo "patches=${patches}" >> "${GITHUB_OUTPUT}"
-
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -135,42 +170,47 @@ jobs:
           platforms: ${{ matrix.platform }}
           provenance: true
           build-args: |
-            WASH_PATCHES=${{ steps.variant.outputs.patches }}
-            IMAGE_VERSION=${{ steps.variant.outputs.tag }}
+            WASH_PATCHES=${{ matrix.variant.patches }}
+            IMAGE_VERSION=${{ matrix.variant.tag }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
           outputs: type=image,name=ghcr.io/di-framework/wash,push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=registry,ref=ghcr.io/di-framework/wash:buildcache-${{ steps.variant.outputs.tag }}-${{ matrix.arch }}
-          cache-to: type=registry,ref=ghcr.io/di-framework/wash:buildcache-${{ steps.variant.outputs.tag }}-${{ matrix.arch }},mode=max,oci-mediatypes=true,image-manifest=true
+          cache-from: type=registry,ref=ghcr.io/di-framework/wash:buildcache-${{ matrix.variant.tag }}-${{ matrix.arch }}
+          cache-to: type=registry,ref=ghcr.io/di-framework/wash:buildcache-${{ matrix.variant.tag }}-${{ matrix.arch }},mode=max,oci-mediatypes=true,image-manifest=true
 
       - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          digest="${{ steps.build.outputs.digest }}"
-          if [[ "${digest}" != sha256:* ]]; then
+          if [[ "${DIGEST}" != sha256:* ]]; then
             echo "::error::build did not return a digest"
             exit 1
           fi
           mkdir -p "${RUNNER_TEMP}/digests"
-          : > "${RUNNER_TEMP}/digests/${digest#sha256:}"
+          : > "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wash-digest-${{ steps.variant.outputs.tag }}-${{ matrix.arch }}
+          name: wash-digest-${{ matrix.variant.tag }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests
           if-no-files-found: error
           retention-days: 1
 
   merge:
-    name: Push tenant host image tags
-    needs: [variant, build]
+    name: Push ${{ matrix.variant.name }} tags
+    needs: [check-source, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
-        variant: ${{ fromJson(needs.variant.outputs.variants) }}
+        variant: ${{ fromJson(needs.check-source.outputs.variants) }}
     steps:
       - name: Require di-framework/platform
         run: |
@@ -180,27 +220,10 @@ jobs:
             exit 1
           fi
 
-      - name: Resolve tag and patches
-        id: variant
-        env:
-          VARIANT: ${{ matrix.variant.name }}
-        run: |
-          set -euo pipefail
-          case "${VARIANT}" in
-            wasi-tls) patches='' ;;
-            wasi-tls-exclusive) patches='0001-exclusive-instance.patch' ;;
-            *)
-              echo "::error::unknown variant '${VARIANT}'"
-              exit 1
-              ;;
-          esac
-          echo "tag=2.8.0-${VARIANT}" >> "${GITHUB_OUTPUT}"
-          echo "patches=${patches}" >> "${GITHUB_OUTPUT}"
-
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: wash-digest-${{ steps.variant.outputs.tag }}-*
+          pattern: wash-digest-${{ matrix.variant.tag }}-*
           path: ${{ runner.temp }}/digests
           merge-multiple: true
 
@@ -214,12 +237,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The variant tag and src-<hash> go on the same index in one call.
       - name: Create and push manifest
         working-directory: ${{ runner.temp }}/digests
         env:
-          TAG: ${{ steps.variant.outputs.tag }}
+          TAG: ${{ matrix.variant.tag }}
+          SOURCE_HASH: ${{ matrix.variant.hash }}
         run: |
           set -euo pipefail
+          if [[ ! "${SOURCE_HASH}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::missing source hash for ${TAG}"
+            exit 1
+          fi
           mapfile -t files < <(find . -type f | sort)
           if (( ${#files[@]} != 2 )); then
             echo "::error::expected 2 image digests, found ${#files[@]}"
@@ -240,21 +269,25 @@ jobs:
           # closes the pipe and fails this job after the tag is already published.
           docker buildx imagetools create \
             --metadata-file "${RUNNER_TEMP}/wash-index.json" \
-            -t "ghcr.io/di-framework/wash:${TAG}" \
+            --tag "ghcr.io/di-framework/wash:${TAG}" \
+            --tag "ghcr.io/di-framework/wash:src-${SOURCE_HASH}" \
             "${args[@]}"
 
       - name: Record image digest
         env:
-          TAG: ${{ steps.variant.outputs.tag }}
-          PATCHES: ${{ steps.variant.outputs.patches }}
+          TAG: ${{ matrix.variant.tag }}
+          PATCHES: ${{ matrix.variant.patches }}
+          SOURCE_HASH: ${{ matrix.variant.hash }}
         run: |
           set -euo pipefail
           digest="$(jq -er '.["containerimage.descriptor"].digest' "${RUNNER_TEMP}/wash-index.json")"
-          if [[ "${digest}" != sha256:* ]]; then
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::error::manifest list did not return an index digest"
             cat "${RUNNER_TEMP}/wash-index.json"
             exit 1
           fi
+          mkdir -p "${RUNNER_TEMP}/pin"
+          printf '%s\n' "${digest}" > "${RUNNER_TEMP}/pin/digest"
           ref="ghcr.io/di-framework/wash:${TAG}@${digest}"
           echo "Published ${ref}"
           {
@@ -266,9 +299,60 @@ jobs:
             echo
             echo "Patches applied: \`${PATCHES:-none}\`"
             echo
+            echo "Also tagged \`src-${SOURCE_HASH}\` (hash of the committed inputs)."
+            echo
             echo "Pin \`tenantHostImage\` to that digest. The tag \`${TAG}\` moves on the next publish of this variant."
             if [[ -n "${PATCHES}" ]]; then
               echo
+              # shellcheck disable=SC2016 # the backticks are Markdown, not expansions
               echo 'This is a patched build. Use it only by setting `tenantHostImage` (digest-pinned) until it is proven; do not change `DEFAULT_HOST_IMAGE`.'
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload published digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wash-pin-${{ matrix.variant.name }}
+          path: ${{ runner.temp }}/pin
+          if-no-files-found: error
+          retention-days: 1
+
+  # Opens or updates bot/pin-wash-<variant>, which rewrites only the published-images table in
+  # platform/tenant-host/README.md. It never changes DEFAULT_HOST_IMAGE.
+  pin:
+    name: Open pin PR for ${{ matrix.variant.name }}
+    needs: [check-source, merge]
+    if: ${{ !cancelled() && needs.merge.result == 'success' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        variant: ${{ fromJson(needs.check-source.outputs.variants) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download published digest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wash-pin-${{ matrix.variant.name }}
+          path: ${{ runner.temp }}/pin
+
+      - name: Read published digest
+        id: digest
+        run: |
+          set -euo pipefail
+          digest="$(tr -d '[:space:]' < "${RUNNER_TEMP}/pin/digest")"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Open pin PR
+        uses: ./.github/actions/open-pin-pr
+        with:
+          artifact: wash-${{ matrix.variant.name }}
+          digest: ${{ steps.digest.outputs.digest }}
+          token: ${{ secrets.GITHUB_TOKEN }}

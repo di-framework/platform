@@ -1,0 +1,71 @@
+# Open or update the bot PR that pins one published artifact (#172).
+# The caller job checks the repository out (with credentials, to push the branch) and holds
+# contents: write and pull-requests: write; no other job in the publish workflows does.
+# scripts/pin-artifact.ts makes the edit; this action only commits, pushes and opens the PR.
+name: Open pin PR
+description: Rewrite an artifact's documented digest pins and open or update bot/pin-<artifact>.
+inputs:
+  artifact:
+    description: Artifact key in scripts/pin-artifact.ts (tenant-auth, oci-registry, pglite-component, wash-<variant>)
+    required: true
+  digest:
+    description: Published sha256 digest
+    required: true
+  token:
+    description: Token for gh; the workflow GITHUB_TOKEN
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      with:
+        bun-version: latest
+
+    - name: Commit pins and open PR
+      shell: bash
+      env:
+        ARTIFACT: ${{ inputs.artifact }}
+        DIGEST: ${{ inputs.digest }}
+        GH_TOKEN: ${{ inputs.token }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          echo "::error::not a sha256 digest: ${DIGEST}"
+          exit 1
+        fi
+        branch="bot/pin-${ARTIFACT}"
+        title="chore: pin ${ARTIFACT} to ${DIGEST}"
+        bun scripts/pin-artifact.ts "${ARTIFACT}" "${DIGEST}"
+        if git diff --quiet; then
+          echo "${ARTIFACT} is already pinned to ${DIGEST} on ${GITHUB_SHA}; no PR needed"
+          exit 0
+        fi
+        git config user.name 'github-actions[bot]'
+        git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+        git switch -C "${branch}"
+        git commit -am "${title}"
+        git push --force origin "HEAD:refs/heads/${branch}"
+        body="${RUNNER_TEMP}/pin-pr-body.md"
+        {
+          echo "Automated pin after a successful publish of \`${ARTIFACT}\` ([run](${RUN_URL}), source commit ${GITHUB_SHA})."
+          echo
+          echo "Digest: \`${DIGEST}\`"
+          echo
+          echo 'Files rewritten by `scripts/pin-artifact.ts`:'
+          echo
+          git diff --name-only HEAD~1 HEAD | sed 's/^/- `/; s/$/`/'
+          echo
+          echo '**A maintainer has to approve and run this PR'"'"'s workflows before it can merge.**'
+          echo 'It was opened with `GITHUB_TOKEN`, and GitHub does not trigger workflows for pull requests'
+          echo 'that `GITHUB_TOKEN` creates or updates, so no checks start on their own. Close and reopen'
+          echo 'the PR (or push a commit to the branch) to run CI, then review and merge as usual.'
+        } > "${body}"
+        existing="$(gh pr list --head "${branch}" --base main --state open --json number --jq '.[0].number // empty')"
+        if [[ -n "${existing}" ]]; then
+          gh pr edit "${existing}" --title "${title}" --body-file "${body}"
+          echo "Updated PR #${existing}"
+        else
+          gh pr create --base main --head "${branch}" --title "${title}" --body-file "${body}"
+        fi

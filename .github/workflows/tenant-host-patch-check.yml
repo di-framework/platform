@@ -1,9 +1,10 @@
 # Prove the wasmCloud patches in platform/tenant-host apply to the pinned source and that the
 # patched wash-runtime builds and passes the pool and dispatch tests (#136).
 #
-# tenant-host-image.yml is dispatch-only, so before this job a patch that did not apply, or did not
-# compile, only showed up at publish time. The job checks wasmCloud out at the commit pinned by
-# WASMCLOUD_COMMIT in the Dockerfile, applies every patch with `git apply` (after `--check`), then
+# tenant-host-image.yml only runs on main (on push and dispatch), so without this job a patch that
+# did not apply, or did not compile, would only show up at publish time, after merge. The job checks
+# wasmCloud out at the commit pinned by WASMCLOUD_COMMIT in the Dockerfile, applies every patch
+# with `git apply` (after `--check`), then
 # builds wash-runtime with the image's `wasi-tls` feature, lints it with clippy -D warnings, and runs
 # the tests that cover the patch. It does not run the whole
 # wash-runtime suite: that needs prebuilt wasm fixtures and Docker services this job does not set up.

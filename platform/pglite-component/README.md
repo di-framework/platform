@@ -48,25 +48,20 @@ uncommitted row is absent after restart. No scripted database server is used.
 
 ## Publishing to GHCR
 
-The pglite component is published to GitHub Container Registry (GHCR) as an OCI wasm component. The publication is triggered manually from the GitHub Actions UI.
+The pglite component is published to GitHub Container Registry (GHCR) as an OCI wasm component. [The workflow](https://github.com/di-framework/platform/actions/workflows/pglite-component-publish.yml) runs by itself on each push to `main` that changes one of its input paths (`on.push.paths`). `workflow_dispatch` stays available for reruns and always builds.
 
-### Dispatch the workflow
-
-1. Open [Workflows](https://github.com/di-framework/platform/actions/workflows/pglite-component-publish.yml).
-2. Click **Run workflow** > **main branch** > **Run workflow**.
-
-The workflow has two jobs:
+The workflow has four jobs:
+- `check-source` (`packages: read`) hashes the committed input files (`scripts/source-check.ts`). On a push it skips the build when `ghcr.io/di-framework/pglite-component:src-<hash>` already exists, so commits that do not change the component publish nothing.
 - `build` (no write token) runs the same targets as `ci.yml`: `make tools-rust`, `make unit smoke` (which runs `make build`, composing the provider with the engine via `wac plug`), then the publisher crates' clippy and tests.
-- `publish` (`packages: write`) downloads the tested `dist/` and runs `pglite-component-publisher`. It never rebuilds or modifies `dist/`. It checks `SHA256SUMS`, requires the export `di-framework:pglite/database@0.2.0` and rejects any import that is not `wasi:*`, then pushes `ghcr.io/di-framework/pglite-component:<commit sha>` once, pulls it back by the manifest digest to compare bytes, then points the version tag (`0.2.0`, the WIT package version) at that same manifest with `oras tag` and asserts both tags resolve to one digest. The `build` job passes the tested wasm sha256 to `publish`, which verifies it before pushing.
+- `publish` (`packages: write`) downloads the tested `dist/` and runs `pglite-component-publisher`. It never rebuilds or modifies `dist/`. It checks `SHA256SUMS`, requires the export `di-framework:pglite/database@0.2.0` and rejects any import that is not `wasi:*`, then pushes `ghcr.io/di-framework/pglite-component:<commit sha>` once, pulls it back by the manifest digest to compare bytes, then points the version tag (`0.2.0`, the WIT package version) at that same manifest with `oras tag` and asserts both tags resolve to one digest. The `build` job passes the tested wasm sha256 to `publish`, which verifies it before pushing. It also tags the manifest `src-<hash>`.
+- `pin` (`contents: write`, `pull-requests: write`) opens or updates the PR `bot/pin-pglite-component`, "chore: pin pglite-component to <digest>", which rewrites the digests in this README with `scripts/pin-artifact.ts`. GitHub does not run workflows on a PR that `GITHUB_TOKEN` opened, so a maintainer has to start its checks (close and reopen it) before merging.
 
-Tags are movable. `0.2.0` always points to the latest `main` publish for WIT package 0.2.0, and re-dispatching a commit also moves its SHA tag. Only the `@sha256:...` digest is immutable, so consumers pin by digest.
+Tags are movable. `0.2.0` always points to the latest `main` publish for WIT package 0.2.0, and re-running a commit also moves its SHA tag. Only the `@sha256:...` digest is immutable, so consumers pin by digest.
 
 ### Artifact location
 
 The digest is in **Details** > **Record component digest** > **Step summary**, and in the `pglite-publish-report` artifact (`publish-report.json`).
-The first digest is not recorded here yet: it exists only after the first dispatch from `main`, and a follow-up commit will add it below.
-
-Published digest: _pending first publish_
+Published digest: `ghcr.io/di-framework/pglite-component@sha256:<pending first publish>`
 
 **Note:** The GHCR package must be made public by an org admin after the first publish. Until then, only members with access to di-framework/platform can pull it.
 

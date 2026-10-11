@@ -1,6 +1,13 @@
 # Publish the tested, composed pglite Wasm component (engine plugged in) to GHCR.
 # The build job runs the same make targets as ci.yml and holds no write token;
 # the publish job only validates and pushes the already-tested dist/.
+#
+# Triggers (#172): a push to main that touches one of the paths below, and workflow_dispatch.
+# check-source hashes the committed files in on.push.paths (scripts/source-check.ts); on a push
+# the build is skipped when ghcr.io/di-framework/pglite-component:src-<hash> already exists. A
+# dispatch always builds. publish tags the manifest src-<hash>, and pin opens the bot PR
+# "chore: pin pglite-component to <digest>" (scripts/pin-artifact.ts). Only pin holds
+# contents: write and pull-requests: write; only publish holds packages: write.
 name: Publish pglite component
 
 on:
@@ -14,6 +21,7 @@ on:
       - 'platform/pglite-component/build-support/**'
       - 'platform/pglite-component/scripts/**'
       - 'platform/pglite-component/Makefile'
+      - 'platform/pglite-component/build.rs'
       - 'platform/pglite-component/Cargo.toml'
       - 'platform/pglite-component/Cargo.lock'
       - 'platform/pglite-component/rust-toolchain.toml'
@@ -22,6 +30,7 @@ on:
       - 'Cargo.lock'
       - '.cargo/**'
       - '.github/workflows/pglite-component-publish.yml'
+      - '!**/*.md'
 
 permissions:
   contents: read
@@ -33,77 +42,45 @@ concurrency:
 jobs:
   check-source:
     name: Check if source already published
-    if: github.event_name == 'push'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: read
     outputs:
-      source-hash: ${{ steps.hash.outputs.source-hash }}
+      source-hash: ${{ steps.check.outputs.hash }}
       skip: ${{ steps.check.outputs.skip }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
 
-      - name: Compute source hash
-        id: hash
-        run: |
-          set -euo pipefail
-          hash=$(git ls-tree -r HEAD -- \
-            platform/pglite-component/src \
-            platform/pglite-component/wit \
-            platform/pglite-component/engine \
-            platform/pglite-component/build-support \
-            platform/pglite-component/scripts \
-            platform/pglite-component/Makefile \
-            platform/pglite-component/Cargo.toml \
-            platform/pglite-component/Cargo.lock \
-            platform/pglite-component/rust-toolchain.toml \
-            platform/wasm-component-publisher \
-            Cargo.toml \
-            Cargo.lock \
-            .cargo \
-            .github/workflows/pglite-component-publish.yml | sha256sum | cut -d' ' -f1)
-          echo "source-hash=${hash}" >> "${GITHUB_OUTPUT}"
-          echo "Source hash: ${hash}"
+      - name: Set up source check
+        uses: ./.github/actions/setup-source-check
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up oras
-        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
-
+      # On a push, skip=true when pglite-component:src-<hash> exists; a dispatch always builds.
       - name: Check if already published
         id: check
         env:
-          SOURCE_HASH: ${{ steps.hash.outputs.source-hash }}
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
         run: |
           set -euo pipefail
-          tag="src-${SOURCE_HASH}"
-          if echo "${GHCR_TOKEN}" | oras login ghcr.io --username "${GHCR_USERNAME}" --password-stdin 2>/dev/null; then
-            if oras manifest fetch "ghcr.io/di-framework/pglite-component:${tag}" >/dev/null 2>&1; then
-              echo "Source hash tag already exists: ${tag}"
-              echo "skip=true" >> "${GITHUB_OUTPUT}"
-            else
-              echo "skip=false" >> "${GITHUB_OUTPUT}"
-            fi
-          else
-            echo "Could not authenticate to GHCR, will proceed with build"
-            echo "skip=false" >> "${GITHUB_OUTPUT}"
-          fi
+          # shellcheck disable=SC2086 # FORCE is empty or one flag
+          bun scripts/source-check.ts --workflow .github/workflows/pglite-component-publish.yml \
+            --image ghcr.io/di-framework/pglite-component ${FORCE} >> "${GITHUB_OUTPUT}"
 
   build:
     name: Build and test pglite component
     needs: check-source
-    if: >-
-      ${{ github.ref == 'refs/heads/main' && !cancelled() &&
-      (needs.check-source.result == 'skipped' ||
-      (needs.check-source.result == 'success' && needs.check-source.outputs.skip != 'true')) }}
+    if: ${{ !cancelled() && needs.check-source.result == 'success' && needs.check-source.outputs.skip != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions:
+      contents: read
     outputs:
       wasm_sha256: ${{ steps.dist.outputs.wasm_sha256 }}
     steps:
@@ -183,14 +160,14 @@ jobs:
   publish:
     name: Push ghcr.io/di-framework/pglite-component
     needs: [check-source, build]
-    if: >-
-      ${{ github.ref == 'refs/heads/main' && !cancelled() &&
-      needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.build.result == 'success' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -266,6 +243,7 @@ jobs:
           {
             echo '### PGlite component'
             echo
+            # shellcheck disable=SC2016 # the backticks are Markdown, not expansions
             printf '```\n%s\n```\n' "$ref"
             echo
             echo 'Tags (movable): the commit SHA and the WIT package version, both pointing at the digest above.'
@@ -273,7 +251,6 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Tag with source hash
-        if: github.event_name == 'push' && needs.check-source.outputs.source-hash
         env:
           SOURCE_HASH: ${{ needs.check-source.outputs.source-hash }}
           GHCR_USERNAME: ${{ github.actor }}
@@ -281,10 +258,13 @@ jobs:
           DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
           set -euo pipefail
-          echo "${GHCR_TOKEN}" | oras login ghcr.io --username "${GHCR_USERNAME}" --password-stdin
-          tag="src-${SOURCE_HASH}"
-          oras tag "ghcr.io/di-framework/pglite-component@${DIGEST}" "${tag}"
-          echo "Tagged with: ${tag}"
+          if [[ ! "${SOURCE_HASH}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo '::error::missing source hash'
+            exit 1
+          fi
+          printf '%s' "${GHCR_TOKEN}" | oras login ghcr.io --username "${GHCR_USERNAME}" --password-stdin
+          oras tag "ghcr.io/di-framework/pglite-component@${DIGEST}" "src-${SOURCE_HASH}"
+          echo "Tagged ghcr.io/di-framework/pglite-component@${DIGEST} with src-${SOURCE_HASH}"
 
       - name: Upload publish report
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -292,3 +272,23 @@ jobs:
           name: pglite-publish-report
           path: platform/pglite-component/dist/publish-report.json
           if-no-files-found: error
+
+  pin:
+    name: Open pin PR
+    needs: publish
+    if: ${{ !cancelled() && needs.publish.result == 'success' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Open pin PR
+        uses: ./.github/actions/open-pin-pr
+        with:
+          artifact: pglite-component
+          digest: ${{ needs.publish.outputs.digest }}
+          token: ${{ secrets.GITHUB_TOKEN }}
