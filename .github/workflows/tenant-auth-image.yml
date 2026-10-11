@@ -67,11 +67,12 @@ jobs:
         id: check
         env:
           FORCE: ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
+          SOURCE_CHECK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC2086 # FORCE is empty or one flag
           bun scripts/source-check.ts --workflow .github/workflows/tenant-auth-image.yml \
-            --image ghcr.io/di-framework/tenant-auth --require-main-tip "${GITHUB_SHA}" ${FORCE} --github-output
+            --image ghcr.io/di-framework/tenant-auth --stale-guard ${FORCE} --github-output
 
   publish-platform:
     name: Push tenant-auth (${{ matrix.arch }})
@@ -144,6 +145,11 @@ jobs:
     outputs:
       digest: ${{ steps.index.outputs.digest }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Install index verification tools
         run: |
           set -euo pipefail
@@ -161,7 +167,17 @@ jobs:
         with:
           version: '1.3.4'
 
+      # Right before the tags move: a re-run of an older push whose inputs main has since
+      # changed stops here (check-source is not re-run by "Re-run failed jobs").
+      - name: Stop if main has newer inputs
+        id: guard
+        uses: ./.github/actions/source-guard
+        with:
+          workflow: .github/workflows/tenant-auth-image.yml
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Assemble and verify image index
+        if: steps.guard.outputs.stale != 'true'
         id: index
         env:
           GHCR_USERNAME: ${{ github.actor }}
@@ -197,7 +213,7 @@ jobs:
   pin:
     name: Open pin PR
     needs: publish-index
-    if: ${{ !cancelled() && needs.publish-index.result == 'success' && github.ref == 'refs/heads/main' }}
+    if: ${{ !cancelled() && needs.publish-index.result == 'success' && needs.publish-index.outputs.digest != '' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -211,5 +227,6 @@ jobs:
         uses: ./.github/actions/open-pin-pr
         with:
           name: tenant-auth
+          workflow: .github/workflows/tenant-auth-image.yml
           pins: tenant-auth ${{ needs.publish-index.outputs.digest }}
           token: ${{ secrets.GITHUB_TOKEN }}

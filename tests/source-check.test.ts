@@ -1,23 +1,21 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import {
   classifyFetch,
+  descriptorDigest,
   filterTree,
   matchesPathFilter,
   parseArgs,
   pushPaths,
   sourceHash,
   staleNotice,
+  tokenConfig,
 } from '../scripts/source-check';
+import { git, sandboxClone, spawnEnv } from './helpers/spawn-env';
 
 const repo = resolve(import.meta.dir, '..');
-// Git hooks (pre-push runs this suite) export GIT_DIR and friends; they would point every git
-// command these tests spawn at the hook's repository instead of the one in `cwd`.
-const env = Object.fromEntries(
-  Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')),
-);
+const env = spawnEnv;
 
 const TREE = [
   '100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tplatform/tenant-host/Dockerfile',
@@ -105,20 +103,31 @@ describe('classifyFetch', () => {
 });
 
 describe('staleNotice', () => {
-  const tip = 'a'.repeat(40);
-  test('the tip of main is current', () => {
-    expect(staleNotice(tip, `${tip}\trefs/heads/main\n`)).toBeUndefined();
+  const own = 'a'.repeat(64);
+  test('the same inputs on main are current, whatever the commit', () => {
+    expect(staleNotice(own, own)).toBeUndefined();
   });
 
-  test('an older commit is stale', () => {
-    expect(staleNotice('b'.repeat(40), `${tip}\trefs/heads/main\n`)).toContain(
-      'no longer the tip of main',
-    );
+  test('different inputs on main are stale', () => {
+    expect(staleNotice(own, 'b'.repeat(64))).toContain('the inputs on main have changed');
   });
+});
 
-  test('an unreadable remote is an error', () => {
-    expect(() => staleNotice(tip, '')).toThrow('cannot read the tip of main');
-  });
+test('descriptorDigest reads the digest of an oras descriptor', () => {
+  const digest = `sha256:${'c'.repeat(64)}`;
+  expect(descriptorDigest(JSON.stringify({ mediaType: 'x', digest, size: 1 }))).toBe(digest);
+  expect(() => descriptorDigest('{}')).toThrow('no sha256 digest');
+});
+
+test('tokenConfig authenticates the fetch through GIT_CONFIG_* only when a token is given', () => {
+  expect(tokenConfig(undefined)).toEqual({});
+  expect(tokenConfig('')).toEqual({});
+  const config = tokenConfig('t0k');
+  expect(config.GIT_CONFIG_COUNT).toBe('1');
+  expect(config.GIT_CONFIG_KEY_0).toBe('http.https://github.com/.extraheader');
+  expect(config.GIT_CONFIG_VALUE_0).toBe(
+    `AUTHORIZATION: basic ${Buffer.from('x-access-token:t0k').toString('base64')}`,
+  );
 });
 
 describe('parseArgs', () => {
@@ -128,28 +137,32 @@ describe('parseArgs', () => {
       image: 'ghcr.io/x/y',
       salt: '',
       force: false,
+      staleGuard: false,
+      registry: true,
       githubOutput: false,
     });
     expect(
-      parseArgs(['--force', '--workflow', 'w.yml', '--image', 'i', '--salt', 'wasi-tls']),
+      parseArgs([
+        '--force',
+        '--workflow',
+        'w.yml',
+        '--image',
+        'i',
+        '--salt',
+        'wasi-tls',
+        '--stale-guard',
+        '--no-registry',
+        '--github-output',
+      ]),
     ).toEqual({
       workflow: 'w.yml',
       image: 'i',
       salt: 'wasi-tls',
       force: true,
-      githubOutput: false,
+      staleGuard: true,
+      registry: false,
+      githubOutput: true,
     });
-    expect(
-      parseArgs([
-        '--workflow',
-        'w',
-        '--image',
-        'i',
-        '--require-main-tip',
-        'abc',
-        '--github-output',
-      ]),
-    ).toMatchObject({ sha: 'abc', githubOutput: true });
   });
 
   test('rejects missing and unknown arguments', () => {
@@ -186,71 +199,121 @@ test('the CLI hashes the committed inputs of a real workflow; --force never asks
   expect(run('wasi-tls-exclusive').stdout.toString()).not.toBe(out);
 });
 
-/** A clone whose origin is a local bare repository; main has two commits. */
-function cloneWithHistory(): { clone: string; old: string; tip: string } {
-  const base = mkdtempSync(join(tmpdir(), 'source-check-'));
-  const git = (cwd: string, ...args: string[]) => {
-    const r = Bun.spawnSync(['git', '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
-      env,
-      cwd,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    if (r.exitCode !== 0) throw new Error(r.stderr.toString());
-    return r.stdout.toString().trim();
-  };
-  const origin = join(base, 'origin.git');
-  const work = join(base, 'work');
-  git(base, 'init', '-q', '--bare', '-b', 'main', origin);
-  git(base, 'clone', '-q', origin, work);
-  writeFileSync(join(work, 'w.yml'), "on:\n  push:\n    paths:\n      - '**'\n");
+/**
+ * A sandbox whose origin's main is `checkout` plus one newer commit. The clone stays at the
+ * first commit, as a queued or re-run job for an older push would. `newer` names the file the
+ * newer commit changes: inside the filter (`src/`) or outside it.
+ */
+function behindMain(newer: 'src/a' | 'docs/b') {
+  const { base, origin, work } = sandboxClone('source-check-');
+  writeFileSync(join(work, 'w.yml'), "on:\n  push:\n    paths:\n      - 'src/**'\n");
+  mkdirSync(join(work, 'src'));
+  mkdirSync(join(work, 'docs'));
+  writeFileSync(join(work, 'src/a'), 'one\n');
+  writeFileSync(join(work, 'docs/b'), 'one\n');
   git(work, 'add', '.');
   git(work, 'commit', '-q', '-m', 'one');
   const old = git(work, 'rev-parse', 'HEAD');
-  writeFileSync(join(work, 'x'), 'x\n');
-  git(work, 'add', '.');
-  git(work, 'commit', '-q', '-m', 'two');
+  writeFileSync(join(work, newer), 'two\n');
+  git(work, 'commit', '-q', '-am', 'two');
   git(work, 'push', '-q', origin, 'HEAD:main');
-  return { clone: work, old, tip: git(work, 'rev-parse', 'HEAD') };
+  git(work, 'checkout', '-q', '--detach', old);
+  return { base, work };
 }
 
-test('a re-run of an older push skips without asking the registry; --force still builds (W2)', () => {
-  const { clone, old } = cloneWithHistory();
-  const cli = (...extra: string[]) =>
-    Bun.spawnSync(
-      [
-        process.execPath,
-        join(repo, 'scripts/source-check.ts'),
-        '--workflow',
-        'w.yml',
-        '--image',
-        'r/i',
-        ...extra,
-      ],
-      // No oras on PATH: reaching the registry would fail the run.
-      {
-        cwd: clone,
-        stdout: 'pipe',
-        stderr: 'pipe',
-        env: { ...env, PATH: `${dirname(process.execPath)}:/usr/bin:/bin` },
-      },
-    );
-  const stale = cli('--require-main-tip', old);
-  expect(stale.exitCode).toBe(0);
-  const out = stale.stdout.toString();
-  expect(out).toContain('::notice::');
-  expect(out).toContain('no longer the tip of main');
-  expect(out).toContain('skip=true');
-  const forced = cli('--require-main-tip', old, '--force');
-  expect(forced.exitCode).toBe(0);
-  expect(forced.stdout.toString()).toContain('skip=false');
+/** A PATH with bun and a stub `oras` whose answer is fixed by `script`. */
+function stubOras(base: string, script: string): string {
+  const bin = join(base, 'bin');
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, 'oras'), `#!/bin/sh\n${script}\n`);
+  chmodSync(join(bin, 'oras'), 0o755);
+  return `${bin}:${process.env.PATH}`;
+}
+
+function cli(cwd: string, path: string, ...extra: string[]) {
+  return Bun.spawnSync(
+    [
+      process.execPath,
+      join(repo, 'scripts/source-check.ts'),
+      '--workflow',
+      'w.yml',
+      '--image',
+      'r/i',
+      ...extra,
+    ],
+    { cwd, stdout: 'pipe', stderr: 'pipe', env: { ...env, PATH: path } },
+  );
+}
+
+const ABSENT = 'echo "Error: r/i:src-x: not found" >&2; exit 1';
+const FAIL = 'echo "registry must not be asked" >&2; exit 99';
+
+describe('--stale-guard compares inputs, not commits (#173 C1)', () => {
+  test('an unrelated newer commit on main is not stale: the run still publishes', () => {
+    const { base, work } = behindMain('docs/b');
+    const result = cli(work, stubOras(base, ABSENT), '--stale-guard');
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    const out = result.stdout.toString();
+    expect(out).toContain('stale=false');
+    expect(out).toContain('skip=false');
+  });
+
+  test('a newer commit that changes the inputs makes the run stale, without asking the registry', () => {
+    const { base, work } = behindMain('src/a');
+    const result = cli(work, stubOras(base, FAIL), '--stale-guard');
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    const out = result.stdout.toString();
+    expect(out).toContain('::notice::the inputs on main have changed');
+    expect(out).toContain('stale=true');
+    expect(out).toContain('skip=true');
+  });
+
+  test('--no-registry checks staleness only', () => {
+    const fresh = behindMain('docs/b');
+    const out = cli(fresh.work, stubOras(fresh.base, FAIL), '--stale-guard', '--no-registry');
+    expect(out.exitCode, out.stderr.toString()).toBe(0);
+    expect(out.stdout.toString()).toContain('stale=false');
+    expect(out.stdout.toString()).toContain('skip=false');
+  });
+
+  test('--force (workflow_dispatch) neither checks staleness nor asks the registry', () => {
+    const { base, work } = behindMain('src/a');
+    const result = cli(work, stubOras(base, FAIL), '--stale-guard', '--force');
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(result.stdout.toString()).toContain('stale=false');
+    expect(result.stdout.toString()).toContain('skip=false');
+  });
+});
+
+describe('registry lookup', () => {
+  test('a published source is skipped and reports its digest', () => {
+    const { base, work } = behindMain('docs/b');
+    const digest = `sha256:${'d'.repeat(64)}`;
+    const result = cli(work, stubOras(base, `echo '{"digest":"${digest}"}'`));
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(result.stdout.toString()).toContain('skip=true');
+    expect(result.stdout.toString()).toContain(`digest=${digest}`);
+  });
+
+  test('"denied" is treated as unpublished, with a warning (S3)', () => {
+    const { base, work } = behindMain('docs/b');
+    const result = cli(work, stubOras(base, 'echo "denied: requested access" >&2; exit 1'));
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(result.stdout.toString()).toContain('::warning::');
+    expect(result.stdout.toString()).toContain('skip=false');
+  });
+
+  test('an unknown registry failure fails the run', () => {
+    const { base, work } = behindMain('docs/b');
+    expect(cli(work, stubOras(base, FAIL)).exitCode).not.toBe(0);
+  });
 });
 
 test('--github-output appends the outputs to $GITHUB_OUTPUT', () => {
-  const { clone } = cloneWithHistory();
-  const file = join(clone, '..', 'out');
+  const { base, work } = behindMain('docs/b');
+  const file = join(base, 'out');
   writeFileSync(file, '');
-  const r = Bun.spawnSync(
+  const result = Bun.spawnSync(
     [
       process.execPath,
       join(repo, 'scripts/source-check.ts'),
@@ -261,10 +324,10 @@ test('--github-output appends the outputs to $GITHUB_OUTPUT', () => {
       '--force',
       '--github-output',
     ],
-    { cwd: clone, stdout: 'pipe', stderr: 'pipe', env: { ...env, GITHUB_OUTPUT: file } },
+    { cwd: work, stdout: 'pipe', stderr: 'pipe', env: { ...env, GITHUB_OUTPUT: file } },
   );
-  expect(r.exitCode).toBe(0);
+  expect(result.exitCode).toBe(0);
   expect(readFileSync(file, 'utf8')).toMatch(
-    /^hash=[0-9a-f]{64}\ntag=src-[0-9a-f]{64}\nskip=false\n$/,
+    /^hash=[0-9a-f]{64}\ntag=src-[0-9a-f]{64}\nstale=false\nskip=false\ndigest=\n$/,
   );
 });

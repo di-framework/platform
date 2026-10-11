@@ -3,13 +3,10 @@ import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { ARTIFACTS, parsePairs, pinArtifact, pinText } from '../scripts/pin-artifact';
+import { git, sandboxClone, spawnEnv } from './helpers/spawn-env';
 
 const repo = resolve(import.meta.dir, '..');
-// Git hooks (pre-push runs this suite) export GIT_DIR and friends; they would point every git
-// command these tests spawn at the hook's repository instead of the one in `cwd`.
-const env = Object.fromEntries(
-  Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')),
-);
+const env = spawnEnv;
 const DIGEST = `sha256:${'1'.repeat(64)}`;
 const OTHER = `sha256:${'2'.repeat(64)}`;
 
@@ -158,39 +155,39 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
   ) as { runs: { steps: { name: string; run?: string }[] } };
   const script = action.runs.steps.find((s) => s.name === 'Commit pins and open PR')?.run ?? '';
 
-  function sandbox() {
-    const base = mkdtempSync(join(tmpdir(), 'open-pin-pr-'));
-    const git = (cwd: string, ...args: string[]) => {
-      const r = Bun.spawnSync(['git', '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
-        env,
-        cwd,
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-      if (r.exitCode !== 0) throw new Error(r.stderr.toString());
-      return r.stdout.toString().trim();
-    };
-    const origin = join(base, 'origin.git');
-    const work = join(base, 'work');
-    git(base, 'init', '-q', '--bare', '-b', 'main', origin);
-    git(base, 'clone', '-q', origin, work);
-    const targets = copyTargets();
-    cpSync(targets, work, { recursive: true });
+  /**
+   * A local origin and a clone at the first commit. With `newer`, origin's main has one more
+   * commit that changes that file: `src/a` is an input of the sandbox workflow (w.yml), `docs/b`
+   * is not.
+   */
+  function sandbox(newer?: 'src/a' | 'docs/b') {
+    const { base, origin, work } = sandboxClone('open-pin-pr-');
+    cpSync(copyTargets(), work, { recursive: true });
     mkdirSync(join(work, 'scripts'));
-    cpSync(join(repo, 'scripts/pin-artifact.ts'), join(work, 'scripts/pin-artifact.ts'));
+    for (const file of ['pin-artifact.ts', 'source-check.ts']) {
+      cpSync(join(repo, 'scripts', file), join(work, 'scripts', file));
+    }
+    writeFileSync(join(work, 'w.yml'), "on:\n  push:\n    paths:\n      - 'src/**'\n");
+    mkdirSync(join(work, 'src'));
+    mkdirSync(join(work, 'docs'));
+    writeFileSync(join(work, 'src/a'), 'one\n');
+    writeFileSync(join(work, 'docs/b'), 'one\n');
     git(work, 'add', '.');
     git(work, 'commit', '-q', '-m', 'one');
-    const old = git(work, 'rev-parse', 'HEAD');
-    writeFileSync(join(work, 'x'), 'x\n');
-    git(work, 'add', '.');
-    git(work, 'commit', '-q', '-m', 'two');
+    const first = git(work, 'rev-parse', 'HEAD');
     git(work, 'push', '-q', origin, 'HEAD:main');
+    if (newer) {
+      writeFileSync(join(work, newer), 'two\n');
+      git(work, 'commit', '-q', '-am', 'two');
+      git(work, 'push', '-q', origin, 'HEAD:main');
+      git(work, 'checkout', '-q', '--detach', first);
+    }
     // A fake gh that records its arguments and reports no open PR.
     const bin = join(base, 'bin');
     mkdirSync(bin);
     writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$*" >> "${base}/gh.log"\n`);
     chmodSync(join(bin, 'gh'), 0o755);
-    const run = (sha: string, pins: string) =>
+    const run = (pins: string, event = 'push') =>
       Bun.spawnSync(['bash', '-c', script], {
         cwd: work,
         stdout: 'pipe',
@@ -198,21 +195,18 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
         env: {
           ...env,
           PATH: `${bin}:${dirname(process.execPath)}:${process.env.PATH}`,
-          GITHUB_SHA: sha,
+          GITHUB_SHA: first,
+          EVENT: event,
           NAME: 'wash',
+          WORKFLOW: 'w.yml',
           PINS: pins,
           GH_TOKEN: 'x',
           RUN_URL: 'https://example.invalid/run',
           RUNNER_TEMP: base,
-          GIT_AUTHOR_NAME: 't',
-          GIT_COMMITTER_NAME: 't',
         },
       });
     return {
       base,
-      origin,
-      tip: git(work, 'rev-parse', 'HEAD'),
-      old,
       run,
       branches: () => git(base, '--git-dir', origin, 'branch', '--list'),
       log: (ref: string) => git(base, '--git-dir', origin, 'log', '--format=%s', ref),
@@ -223,7 +217,7 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
 
   test('both wash variants land in one commit on one branch, bot/pin-wash (W1)', () => {
     const box = sandbox();
-    const result = box.run(box.tip, `wash-wasi-tls ${DIGEST}\nwash-wasi-tls-exclusive ${OTHER}\n`);
+    const result = box.run(`wash-wasi-tls ${DIGEST}\nwash-wasi-tls-exclusive ${OTHER}\n`);
     expect(result.exitCode, result.stderr.toString()).toBe(0);
     expect(box.branches()).toContain('bot/pin-wash');
     expect(box.log('bot/pin-wash').split('\n')[0]).toBe(
@@ -239,23 +233,38 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
 
   test('a single pin is titled "chore: pin <artifact> to <digest>"', () => {
     const box = sandbox();
-    const result = box.run(box.tip, `pglite-component ${DIGEST}`);
+    const result = box.run(`pglite-component ${DIGEST}`);
     expect(result.exitCode, result.stderr.toString()).toBe(0);
     expect(box.log('bot/pin-wash').split('\n')[0]).toBe(`chore: pin pglite-component to ${DIGEST}`);
   });
 
-  test('a stale run (not the tip of main) pins nothing and succeeds (W2)', () => {
-    const box = sandbox();
-    const result = box.run(box.old, `wash-wasi-tls ${DIGEST}`);
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.toString()).toContain('::notice::');
+  test('an unrelated newer commit on main does not stop the pin (#173 C1)', () => {
+    const box = sandbox('docs/b');
+    const result = box.run(`wash-wasi-tls ${DIGEST}`);
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(result.stdout.toString()).toContain('stale=false');
+    expect(box.branches()).toContain('bot/pin-wash');
+  });
+
+  test('newer inputs on main make a push run stale: it pins nothing and succeeds (W2)', () => {
+    const box = sandbox('src/a');
+    const result = box.run(`wash-wasi-tls ${DIGEST}`);
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(result.stdout.toString()).toContain('::notice::the inputs on main have changed');
     expect(box.branches()).not.toContain('bot/pin-wash');
+  });
+
+  test('workflow_dispatch pins even when main has newer inputs', () => {
+    const box = sandbox('src/a');
+    const result = box.run(`wash-wasi-tls ${DIGEST}`, 'workflow_dispatch');
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(box.branches()).toContain('bot/pin-wash');
   });
 
   test('an empty pin list is a no-op, and a bad digest fails before any push', () => {
     const box = sandbox();
-    expect(box.run(box.tip, '').exitCode).toBe(0);
-    expect(box.run(box.tip, 'wash-wasi-tls sha256:nope').exitCode).toBe(1);
+    expect(box.run('').exitCode).toBe(0);
+    expect(box.run('wash-wasi-tls sha256:nope').exitCode).toBe(1);
     expect(box.branches()).not.toContain('bot/pin-wash');
   });
 });

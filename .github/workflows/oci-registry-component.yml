@@ -62,11 +62,12 @@ jobs:
         id: check
         env:
           FORCE: ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
+          SOURCE_CHECK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC2086 # FORCE is empty or one flag
           bun scripts/source-check.ts --workflow .github/workflows/oci-registry-component.yml \
-            --image ghcr.io/di-framework/oci-registry --require-main-tip "${GITHUB_SHA}" ${FORCE} --github-output
+            --image ghcr.io/di-framework/oci-registry --stale-guard ${FORCE} --github-output
 
   publish:
     name: Push ghcr.io/di-framework/oci-registry
@@ -117,7 +118,17 @@ jobs:
       - name: Build publisher (no credentials in scope)
         run: cargo build --locked -p oci-registry-publisher
 
+      # Right before the tags move: a re-run of an older push whose inputs main has since
+      # changed stops here (check-source is not re-run by "Re-run failed jobs").
+      - name: Stop if main has newer inputs
+        id: guard
+        uses: ./.github/actions/source-guard
+        with:
+          workflow: .github/workflows/oci-registry-component.yml
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build, push, and verify component
+        if: steps.guard.outputs.stale != 'true'
         env:
           PUSH: 'true'
           DI_OCI_REGISTRY: ghcr.io
@@ -129,6 +140,7 @@ jobs:
         run: target/debug/oci-registry-publisher
 
       - name: Record component digest
+        if: steps.guard.outputs.stale != 'true'
         id: digest
         run: |
           set -euo pipefail
@@ -152,6 +164,7 @@ jobs:
           version: '1.3.4'
 
       - name: Tag with source hash
+        if: steps.guard.outputs.stale != 'true'
         env:
           SOURCE_HASH: ${{ needs.check-source.outputs.source-hash }}
           GHCR_USERNAME: ${{ github.actor }}
@@ -168,6 +181,7 @@ jobs:
           echo "Tagged ghcr.io/di-framework/oci-registry@${DIGEST} with src-${SOURCE_HASH}"
 
       - name: Upload publish report
+        if: steps.guard.outputs.stale != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: oci-registry-publish-report
@@ -177,7 +191,7 @@ jobs:
   pin:
     name: Open pin PR
     needs: publish
-    if: ${{ !cancelled() && needs.publish.result == 'success' && github.ref == 'refs/heads/main' }}
+    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.publish.outputs.digest != '' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -191,5 +205,6 @@ jobs:
         uses: ./.github/actions/open-pin-pr
         with:
           name: oci-registry
+          workflow: .github/workflows/oci-registry-component.yml
           pins: oci-registry ${{ needs.publish.outputs.digest }}
           token: ${{ secrets.GITHUB_TOKEN }}

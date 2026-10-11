@@ -6,17 +6,17 @@
  * filter matches (with GitHub's ordering and `!` exclusions), so the files that
  * trigger a publish and the files that decide whether one is needed are the same
  * set. It hashes `git ls-tree -r HEAD` lines (mode, blob id and path of each
- * committed file), not the working tree, so it is deterministic for a commit. An optional salt separates artifacts built from the same inputs
- * (the tenant host variants).
+ * committed file), not the working tree, so it is deterministic for a commit. An optional
+ * salt separates artifacts built from the same inputs (the tenant host variants).
  *
  * Usage:
  *   bun scripts/source-check.ts --workflow <file> --image <ghcr.io/org/name> [--salt <s>]
- *     [--force] [--require-main-tip <sha>] [--github-output]
+ *     [--force] [--stale-guard] [--no-registry] [--github-output]
  *
- * Prints `hash=`, `tag=` and `skip=` lines (and appends them to `$GITHUB_OUTPUT` with
- * `--github-output`). Without `--force` (workflow_dispatch), `skip=true` when
- * `<image>:src-<hash>` already exists, or when `--require-main-tip` names a commit that is no
- * longer the tip of origin/main (a re-run of an older push).
+ * Prints `hash=`, `tag=`, `stale=`, `skip=` and `digest=` lines (and appends them to
+ * `$GITHUB_OUTPUT` with `--github-output`). With `--force` (workflow_dispatch) nothing is
+ * skipped. Otherwise `stale=true skip=true` when `--stale-guard` finds different inputs at the
+ * tip of origin/main, and `skip=true digest=<digest>` when `<image>:src-<hash>` already exists.
  */
 import { createHash } from 'node:crypto';
 import { appendFileSync, readFileSync } from 'node:fs';
@@ -77,38 +77,77 @@ export function classifyFetch(exitCode: number, stderr: string): 'present' | 'ab
 }
 
 /**
- * A re-run of an older push must not republish (moving the mutable tags backwards) or pin an
- * older digest. `lsRemote` is `git ls-remote origin refs/heads/main`; returns a notice when
- * `sha` is no longer the tip of main, undefined when it is.
+ * Staleness is about the source, not the commit (#172 review): a run is stale only when the
+ * filtered inputs at the tip of main hash differently from this run's. An unrelated newer commit
+ * (docs, another package) leaves the hash alone, so the run still publishes and pins; a newer
+ * change to the inputs means a newer run will publish and pin that source, so this one must not
+ * move tags or pins backwards. Returns a notice when stale, undefined otherwise.
  */
-export function staleNotice(sha: string, lsRemote: string): string | undefined {
-  const tip = lsRemote.split(/\s/)[0] ?? '';
-  if (!/^[0-9a-f]{40}$/.test(tip)) throw new Error(`cannot read the tip of main: ${lsRemote}`);
-  if (tip === sha) return undefined;
-  return `${sha} is no longer the tip of main (${tip}); a re-run of an older push publishes nothing`;
+export function staleNotice(own: string, tip: string): string | undefined {
+  if (own === tip) return undefined;
+  return `the inputs on main have changed since this commit (source ${own.slice(0, 12)}, main ${tip.slice(0, 12)}); the run for the newer source publishes and pins, so this one does nothing`;
 }
 
-interface Args {
+/** The digest in `oras manifest fetch --descriptor` output. */
+export function descriptorDigest(json: string): string {
+  const digest = (JSON.parse(json) as { digest?: unknown }).digest;
+  if (typeof digest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(digest)) {
+    throw new Error(`descriptor has no sha256 digest: ${json}`);
+  }
+  return digest;
+}
+
+/**
+ * `GIT_CONFIG_*` variables that authenticate the fetch of main with a read token (passed as
+ * SOURCE_CHECK_TOKEN), without putting it on the command line. Without a token the fetch is
+ * anonymous, which only works while di-framework/platform is public.
+ */
+export function tokenConfig(token: string | undefined): Record<string, string> {
+  if (!token) return {};
+  const basic = Buffer.from(`x-access-token:${token}`).toString('base64');
+  return {
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+    GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`,
+  };
+}
+
+export interface Args {
   workflow: string;
   image: string;
   salt: string;
+  /** workflow_dispatch: always build; neither the staleness guard nor the registry is asked. */
   force: boolean;
-  /** Skip unless this commit is still the tip of origin/main (ignored with --force). */
-  sha?: string;
+  /** Compare this commit's input hash with the tip of origin/main's; stale means skip. */
+  staleGuard: boolean;
+  /** Ask the registry for <image>:src-<hash> (default); --no-registry checks staleness only. */
+  registry: boolean;
   /** Also append the outputs to $GITHUB_OUTPUT. */
   githubOutput: boolean;
 }
 
 export function parseArgs(argv: string[]): Args {
-  const args: Partial<Args> = { salt: '', force: false, githubOutput: false };
+  const args: Partial<Args> = {
+    salt: '',
+    force: false,
+    staleGuard: false,
+    registry: true,
+    githubOutput: false,
+  };
+  const flags: Record<string, keyof Args> = {
+    '--force': 'force',
+    '--stale-guard': 'staleGuard',
+    '--github-output': 'githubOutput',
+  };
   for (let i = 0; i < argv.length; i++) {
-    const flag = argv[i];
-    if (flag === '--force') {
-      args.force = true;
+    const flag = argv[i] as string;
+    const key = flags[flag];
+    if (key) {
+      (args as Record<string, unknown>)[key] = true;
       continue;
     }
-    if (flag === '--github-output') {
-      args.githubOutput = true;
+    if (flag === '--no-registry') {
+      args.registry = false;
       continue;
     }
     const value = argv[i + 1];
@@ -117,15 +156,21 @@ export function parseArgs(argv: string[]): Args {
     if (flag === '--workflow') args.workflow = value;
     else if (flag === '--image') args.image = value;
     else if (flag === '--salt') args.salt = value;
-    else if (flag === '--require-main-tip') args.sha = value;
     else throw new Error(`unknown argument ${flag}`);
   }
   if (!args.workflow || !args.image) throw new Error('--workflow and --image are required');
   return args as Args;
 }
 
-function run(cmd: string[]): { exitCode: number; stdout: string; stderr: string } {
-  const result = Bun.spawnSync(cmd, { stdout: 'pipe', stderr: 'pipe' });
+function run(
+  cmd: string[],
+  env?: Record<string, string>,
+): { exitCode: number; stdout: string; stderr: string } {
+  const result = Bun.spawnSync(cmd, {
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: env ? { ...process.env, ...env } : undefined,
+  });
   return {
     exitCode: result.exitCode,
     stdout: result.stdout.toString(),
@@ -133,22 +178,40 @@ function run(cmd: string[]): { exitCode: number; stdout: string; stderr: string 
   };
 }
 
-/** Decide whether to skip; annotations go to stdout so the Actions runner shows them. */
-function decide(args: Args, tag: string): boolean {
-  const ref = `${args.image}:${tag}`;
+function treeHash(rev: string, filter: string[], salt: string): string {
+  const tree = run(['git', '-c', 'core.quotePath=false', 'ls-tree', '-r', '--full-tree', rev]);
+  if (tree.exitCode !== 0) throw new Error(`git ls-tree ${rev} failed: ${tree.stderr}`);
+  return sourceHash(filterTree(tree.stdout, filter), salt);
+}
+
+interface Result {
+  hash: string;
+  stale: boolean;
+  skip: boolean;
+  digest: string;
+}
+
+/** Annotations go to stdout so the Actions runner shows them. */
+export function check(args: Args, filter: string[]): Result {
+  const hash = treeHash('HEAD', filter, args.salt);
+  const ref = `${args.image}:src-${hash}`;
   if (args.force) {
     console.log(`::notice::workflow_dispatch: building regardless of ${ref}`);
-    return false;
+    return { hash, stale: false, skip: false, digest: '' };
   }
-  if (args.sha) {
-    const remote = run(['git', 'ls-remote', 'origin', 'refs/heads/main']);
-    if (remote.exitCode !== 0) throw new Error(`git ls-remote failed: ${remote.stderr}`);
-    const notice = staleNotice(args.sha, remote.stdout);
+  if (args.staleGuard) {
+    const fetch = run(
+      ['git', 'fetch', '--quiet', '--no-tags', '--depth=1', 'origin', 'refs/heads/main'],
+      tokenConfig(process.env.SOURCE_CHECK_TOKEN),
+    );
+    if (fetch.exitCode !== 0) throw new Error(`git fetch of main failed: ${fetch.stderr}`);
+    const notice = staleNotice(hash, treeHash('FETCH_HEAD', filter, args.salt));
     if (notice) {
       console.log(`::notice::${notice}`);
-      return true;
+      return { hash, stale: true, skip: true, digest: '' };
     }
   }
+  if (!args.registry) return { hash, stale: false, skip: false, digest: '' };
   const fetch = run(['oras', 'manifest', 'fetch', '--descriptor', ref]);
   const state = classifyFetch(fetch.exitCode, fetch.stderr);
   if (state === 'denied') {
@@ -156,22 +219,29 @@ function decide(args: Args, tag: string): boolean {
       `::warning::${ref}: registry answered "denied"; treating it as unpublished (expected only before the package's first push)`,
     );
   }
-  console.log(state === 'present' ? `${ref} exists; skipping` : `${ref} absent; building`);
-  return state === 'present';
+  if (state !== 'present') {
+    console.log(`${ref} absent; building`);
+    return { hash, stale: false, skip: false, digest: '' };
+  }
+  console.log(`${ref} exists; skipping`);
+  return { hash, stale: false, skip: true, digest: descriptorDigest(fetch.stdout) };
 }
 
 if (import.meta.main) {
   const args = parseArgs(Bun.argv.slice(2));
   const filter = pushPaths(readFileSync(args.workflow, 'utf8'));
-  const tree = run(['git', '-c', 'core.quotePath=false', 'ls-tree', '-r', '--full-tree', 'HEAD']);
-  if (tree.exitCode !== 0) throw new Error(`git ls-tree failed: ${tree.stderr}`);
-  const hash = sourceHash(filterTree(tree.stdout, filter), args.salt);
-  const tag = `src-${hash}`;
-  const skip = decide(args, tag);
-  const outputs = `hash=${hash}\ntag=${tag}\nskip=${skip}\n`;
+  const result = check(args, filter);
+  const outputs = [
+    `hash=${result.hash}`,
+    `tag=src-${result.hash}`,
+    `stale=${result.stale}`,
+    `skip=${result.skip}`,
+    `digest=${result.digest}`,
+    '',
+  ].join('\n');
   process.stdout.write(outputs);
-  const file = process.env.GITHUB_OUTPUT;
   if (args.githubOutput) {
+    const file = process.env.GITHUB_OUTPUT;
     if (!file) throw new Error('--github-output needs $GITHUB_OUTPUT');
     appendFileSync(file, outputs);
   }

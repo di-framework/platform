@@ -4,17 +4,15 @@
  * triggers and paths, the skip-if-published gate, least-privilege permissions, and the pin job.
  */
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { ARTIFACTS } from '../scripts/pin-artifact';
 import { matchesPathFilter, pushPaths } from '../scripts/source-check';
+import { spawnEnv } from './helpers/spawn-env';
 
 const repo = resolve(import.meta.dir, '..');
-// Git hooks (pre-push runs this suite) export GIT_DIR and friends; they would point every git
-// command these tests spawn at the hook's repository instead of the one in `cwd`.
-const env = Object.fromEntries(
-  Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')),
-);
+const env = spawnEnv;
 
 type Permissions = Record<string, string>;
 interface Job {
@@ -67,6 +65,8 @@ interface Spec {
   /** bot/pin-<pinName> */
   pinName: string;
   artifacts: string[];
+  /** The job that moves mutable tags, and its steps that the source guard gates. */
+  guarded: { job: string; steps: string[] };
 }
 
 const SPECS: Spec[] = [
@@ -83,6 +83,7 @@ const SPECS: Spec[] = [
     pinIf:
       "${{ !cancelled() && (needs.merge.result == 'success' || needs.merge.result == 'failure') && github.ref == 'refs/heads/main' }}",
     pinName: 'wash',
+    guarded: { job: 'merge', steps: ['Create and push manifest', 'Record image digest'] },
     artifacts: ['wash-wasi-tls', 'wash-wasi-tls-exclusive'],
   },
   {
@@ -111,8 +112,9 @@ const SPECS: Spec[] = [
     readOnly: [],
     pinAfter: 'publish-index',
     pinIf:
-      "${{ !cancelled() && needs.publish-index.result == 'success' && github.ref == 'refs/heads/main' }}",
+      "${{ !cancelled() && needs.publish-index.result == 'success' && needs.publish-index.outputs.digest != '' && github.ref == 'refs/heads/main' }}",
     pinName: 'tenant-auth',
+    guarded: { job: 'publish-index', steps: ['Assemble and verify image index'] },
     artifacts: ['tenant-auth'],
   },
   {
@@ -142,8 +144,17 @@ const SPECS: Spec[] = [
     readOnly: ['build'],
     pinAfter: 'publish',
     pinIf:
-      "${{ !cancelled() && needs.publish.result == 'success' && github.ref == 'refs/heads/main' }}",
+      "${{ !cancelled() && needs.publish.result == 'success' && needs.publish.outputs.digest != '' && github.ref == 'refs/heads/main' }}",
     pinName: 'pglite-component',
+    guarded: {
+      job: 'publish',
+      steps: [
+        'Push and verify component',
+        'Record component digest',
+        'Tag with source hash',
+        'Upload publish report',
+      ],
+    },
     artifacts: ['pglite-component'],
   },
   {
@@ -168,8 +179,17 @@ const SPECS: Spec[] = [
     readOnly: [],
     pinAfter: 'publish',
     pinIf:
-      "${{ !cancelled() && needs.publish.result == 'success' && github.ref == 'refs/heads/main' }}",
+      "${{ !cancelled() && needs.publish.result == 'success' && needs.publish.outputs.digest != '' && github.ref == 'refs/heads/main' }}",
     pinName: 'oci-registry',
+    guarded: {
+      job: 'publish',
+      steps: [
+        'Build, push, and verify component',
+        'Record component digest',
+        'Tag with source hash',
+        'Upload publish report',
+      ],
+    },
     artifacts: ['oci-registry'],
   },
 ];
@@ -206,7 +226,10 @@ describe.each(SPECS)('$file', (spec) => {
     expect(run).toContain(`bun scripts/source-check.ts --workflow ${spec.file}`);
     expect(run).toContain(`--image ${spec.image}`);
     // A re-run of an older push publishes nothing (W2).
-    expect(run).toContain('--require-main-tip "${GITHUB_SHA}"');
+    expect(run).toContain('--stale-guard');
+    expect(
+      check?.steps?.some((s) => s.env?.SOURCE_CHECK_TOKEN === '${{ secrets.GITHUB_TOKEN }}'),
+    ).toBe(true);
   });
 
   test('workflow_dispatch always builds: the check is forced, never skipped', () => {
@@ -215,7 +238,7 @@ describe.each(SPECS)('$file', (spec) => {
     const forced = steps.some(
       (s) =>
         s.env?.FORCE === "${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}" ||
-        /TRIGGER}" == "workflow_dispatch" \]\]; then[\s\S]*force=\(--force\)/.test(s.run ?? ''),
+        /TRIGGER}" == "workflow_dispatch" \]\]; then[\s\S]*args=\(--force\)/.test(s.run ?? ''),
     );
     expect(forced).toBe(true);
     // check-source never has a trigger condition, so dispatch cannot leave it skipped.
@@ -270,7 +293,11 @@ describe.each(SPECS)('$file', (spec) => {
 
   test('only the pin job can push branches and open PRs, after a successful publish', () => {
     const pin = jobs.pin;
-    expect(pin?.permissions).toEqual({ contents: 'write', 'pull-requests': 'write' });
+    expect(pin?.permissions).toEqual(
+      spec.pinName === 'wash'
+        ? { contents: 'write', packages: 'read', 'pull-requests': 'write' }
+        : { contents: 'write', 'pull-requests': 'write' },
+    );
     expect(needsOf(pin ?? {})).toContain(spec.pinAfter);
     expect(pin?.if).toBe(spec.pinIf);
     for (const [name, job] of Object.entries(jobs)) {
@@ -281,19 +308,46 @@ describe.each(SPECS)('$file', (spec) => {
     const open = pin?.steps?.find((s) => s.uses === './.github/actions/open-pin-pr');
     expect(open?.with?.token).toBe('${{ secrets.GITHUB_TOKEN }}');
     expect(open?.with?.name).toBe(spec.pinName);
+    expect(open?.with?.workflow).toBe(spec.file);
     // One PR per run: the pin job has no matrix.
     expect(pin?.strategy).toBeUndefined();
     const pins = open?.with?.pins ?? '';
-    const names = pins.includes('steps.pins.outputs.pins')
-      ? [...text.matchAll(/for name in ([\w -]+); do/g)].flatMap((m) =>
-          (m[1] ?? '')
-            .trim()
-            .split(/\s+/)
-            .map((v) => `wash-${v}`),
+    if (spec.pinName === 'wash') {
+      // Every variant, resolved from the registry for this source (not only this run's builds).
+      expect(pins).toBe('${{ steps.pins.outputs.pins }}');
+      const resolve = pin?.steps?.find((s) => s.run === 'bash scripts/wash-pins.sh');
+      expect(resolve?.env?.VARIANTS).toBe('${{ needs.check-source.outputs.all }}');
+    } else {
+      expect(pins).toBe(`${spec.pinName} \${{ needs.${spec.pinAfter}.outputs.digest }}`);
+    }
+    for (const name of spec.artifacts) expect(ARTIFACTS[name], name).toBeDefined();
+  });
+
+  test('the job that moves tags re-checks the source right before, and is gated on it', () => {
+    const steps = jobs[spec.guarded.job]?.steps ?? [];
+    const names = steps.map((s) => (s as { name?: string }).name);
+    const guard = steps.findIndex((s) => s.uses === './.github/actions/source-guard');
+    expect(guard).toBeGreaterThanOrEqual(0);
+    expect(steps[guard]?.with?.workflow).toBe(spec.file);
+    expect(steps[guard]?.with?.token).toBe('${{ secrets.GITHUB_TOKEN }}');
+    expect(names.indexOf('Checkout repository')).toBeLessThan(guard);
+    for (const name of spec.guarded.steps) {
+      const index = names.indexOf(name);
+      expect(index, name).toBeGreaterThan(guard);
+      expect((steps[index] as { if?: string }).if, name).toBe(
+        "steps.guard.outputs.stale != 'true'",
+      );
+    }
+    // Every step that pushes or tags comes after the guard.
+    steps.forEach((step, index) => {
+      if (
+        /oras tag|imagetools create|PUSH: 'true'/.test(
+          `${step.run ?? ''}${JSON.stringify(step.env ?? {})}`,
         )
-      : [pins.split(' ')[0]];
-    expect(names).toEqual(spec.artifacts);
-    for (const name of names) expect(ARTIFACTS[name ?? ''], name).toBeDefined();
+      ) {
+        expect(index, (step as { name?: string }).name).toBeGreaterThan(guard);
+      }
+    });
   });
 
   test('one non-cancelling concurrency group per artifact', () => {
@@ -322,14 +376,16 @@ test('every job that runs oras sets it up first (C1)', () => {
       // check-source runs oras inside scripts/source-check.ts.
       const usesOras = steps.some(
         (s) =>
-          /(^|[\s|(])oras\s/m.test(s.run ?? '') || /scripts\/source-check\.ts/.test(s.run ?? ''),
+          /(^|[\s|(])oras\s/m.test(s.run ?? '') ||
+          /scripts\/(source-check\.ts|wash-pins\.sh)/.test(s.run ?? ''),
       );
       if (!usesOras) continue;
       checked++;
       const first = steps.findIndex(
         (s) =>
           !installs(s) &&
-          (/(^|[\s|(])oras\s/m.test(s.run ?? '') || /scripts\/source-check\.ts/.test(s.run ?? '')),
+          (/(^|[\s|(])oras\s/m.test(s.run ?? '') ||
+            /scripts\/(source-check\.ts|wash-pins\.sh)/.test(s.run ?? '')),
       );
       const setup = steps.findIndex(installs);
       expect(setup, `${spec.file} ${name}`).toBeGreaterThanOrEqual(0);
@@ -347,7 +403,9 @@ test('the four publish workflows use distinct concurrency groups', () => {
 test('the tenant host publishes both variants on push, as a native two-arch matrix', () => {
   const workflow = parse('.github/workflows/tenant-host-image.yml');
   const run = workflow.jobs['check-source']?.steps?.map((s) => s.run ?? '').join('\n') ?? '';
-  expect(run).toContain('candidates=(wasi-tls wasi-tls-exclusive)');
+  // On a push every listed variant is checked (and only skipped when published or stale).
+  expect(run).toContain('args=(--stale-guard)');
+  expect(run).toContain('done <<<"${rows}"');
   expect(run).toContain('--salt "${name}"');
   const matrix = workflow.jobs.build?.strategy?.matrix;
   expect(matrix?.arch).toEqual(['amd64', 'arm64']);
@@ -384,12 +442,24 @@ test('no pin target is an input of any publish workflow, so merging a pin PR pub
 describe('composite actions', () => {
   const open = read('.github/actions/open-pin-pr/action.yml');
   const setup = read('.github/actions/setup-source-check/action.yml');
+  const guard = read('.github/actions/source-guard/action.yml');
+
+  test('the source guard compares inputs with main, and never stops a dispatch', () => {
+    expect(guard).toContain('--stale-guard --no-registry ${FORCE} --github-output');
+    expect(guard).toContain(
+      "FORCE: ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}",
+    );
+    expect(guard).toContain('SOURCE_CHECK_TOKEN: ${{ inputs.token }}');
+  });
 
   test('the pin PR is bot/pin-<name>, titled with the digest, and says CI needs a maintainer', () => {
     expect(open).toContain('branch="bot/pin-${NAME}"');
     expect(open).toContain('title="chore: pin ${summary[0]}"');
     expect(open).toContain('bun scripts/pin-artifact.ts "${args[@]}"');
-    expect(open).toContain('git ls-remote origin refs/heads/main');
+    expect(open).toContain(
+      'bun scripts/source-check.ts --workflow "${WORKFLOW}" --image unused --stale-guard --no-registry',
+    );
+    expect(open).toContain('if [[ "${EVENT}" == "push" ]]; then');
     expect(open).toContain('A maintainer has to approve and run this PR');
     expect(open).toContain('GitHub does not trigger workflows for pull requests');
     expect(open).toContain('gh pr edit');
@@ -397,7 +467,7 @@ describe('composite actions', () => {
   });
 
   test('pin actions and the Bun version by SHA and use no stored secret', () => {
-    for (const text of [open, setup]) {
+    for (const text of [open, setup, guard]) {
       expect(text).not.toContain('secrets.');
       expect(text).toContain("bun-version: '1.4.2'");
       for (const [, ref] of text.matchAll(/uses:\s+(\S+)/g)) expect(ref).toMatch(/@[0-9a-f]{40}$/);
@@ -405,14 +475,20 @@ describe('composite actions', () => {
   });
 });
 
-test('the tenant host resolves variant patches in one place and hashes every patch file', () => {
+test('the tenant host resolves variants in one place, from platform/tenant-host/variants', () => {
   const text = read('.github/workflows/tenant-host-image.yml');
-  // Only check-source maps a variant to its patches; build and merge read the matrix entry.
-  expect(text.match(/case "\$\{name\}" in/g)).toHaveLength(1);
-  expect(text.match(/\.patch'/g)?.length).toBeGreaterThan(0);
-  for (const job of ['build', 'merge']) {
-    const steps = parse('.github/workflows/tenant-host-image.yml').jobs[job]?.steps ?? [];
-    for (const step of steps) expect(step.run ?? '', job).not.toContain('case ');
+  const workflow = parse('.github/workflows/tenant-host-image.yml');
+  const resolver = workflow.jobs['check-source']?.steps?.map((s) => s.run ?? '').join('\n') ?? '';
+  // The table (#176) is read only by check-source; build, merge and pin take its outputs.
+  expect(resolver).toContain('table=platform/tenant-host/variants');
+  for (const [name, job] of Object.entries(workflow.jobs)) {
+    if (name === 'check-source') continue;
+    for (const step of job.steps ?? []) expect(step.run ?? '', name).not.toContain('variants');
+  }
+  for (const job of ['build', 'merge', 'pin']) {
+    for (const step of workflow.jobs[job]?.steps ?? []) {
+      expect(step.run ?? '', job).not.toContain('.patch');
+    }
   }
   const filter = pushPaths(text);
   for (const file of Bun.spawnSync(['git', 'ls-files', 'platform/tenant-host'], { env, cwd: repo })
@@ -421,7 +497,117 @@ test('the tenant host resolves variant patches in one place and hashes every pat
     .split('\n')) {
     expect(matchesPathFilter(filter, file), file).toBe(!file.endsWith('.md'));
   }
-  expect(
-    matchesPathFilter(filter, 'platform/tenant-host/0002-insecure-registry-allowlist.patch'),
-  ).toBe(true);
+  for (const file of ['variants', '0002-insecure-registry-allowlist.patch']) {
+    expect(matchesPathFilter(filter, `platform/tenant-host/${file}`), file).toBe(true);
+  }
+});
+
+test('the resolver reads the variants table when it exists and falls back to the same rows', () => {
+  const workflow = parse('.github/workflows/tenant-host-image.yml');
+  const step = workflow.jobs['check-source']?.steps?.find((s) => (s.run ?? '').includes('table='));
+  const script = step?.run ?? '';
+  // Run only the table parsing: stop before the per-variant source check.
+  const parse_ = script.slice(0, script.indexOf("all='[]'"));
+  const rows = (cwd: string) =>
+    Bun.spawnSync(['bash', '-c', `${parse_}\nprintf '%s\\n' "\${rows}"`], {
+      cwd,
+      env,
+      stdout: 'pipe',
+    })
+      .stdout.toString()
+      .trim()
+      .split('\n');
+  const dir = mkdtempSync(join(tmpdir(), 'variants-'));
+  expect(rows(dir)).toEqual([
+    '2.8.0-wasi-tls\t',
+    '2.8.0-wasi-tls-exclusive\t0001-exclusive-instance.patch',
+  ]);
+  mkdirSync(join(dir, 'platform/tenant-host'), { recursive: true });
+  writeFileSync(
+    join(dir, 'platform/tenant-host/variants'),
+    [
+      '# comment',
+      '2.8.0-wasi-tls            0002-insecure-registry-allowlist.patch',
+      '2.8.0-wasi-tls-exclusive  0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch',
+      '',
+    ].join('\n'),
+  );
+  expect(rows(dir)).toEqual([
+    '2.8.0-wasi-tls\t0002-insecure-registry-allowlist.patch',
+    '2.8.0-wasi-tls-exclusive\t0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch',
+  ]);
+});
+
+describe('scripts/wash-pins.sh (the wash pin set)', () => {
+  // A stub oras that publishes only the src-<hash> tags listed in $PUBLISHED.
+  function run(published: string[]) {
+    const base = mkdtempSync(join(tmpdir(), 'wash-pins-'));
+    const bin = join(base, 'bin');
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, 'oras'),
+      [
+        '#!/bin/sh',
+        'ref="$4"',
+        'for tag in $PUBLISHED; do',
+        '  case "$ref" in *":$tag") echo "{\\"digest\\":\\"sha256:$(printf %064d 0 | tr 0 "${tag#src-}" | cut -c1-64)\\"}"; exit 0 ;; esac',
+        'done',
+        'echo "Error: $ref: not found" >&2; exit 1',
+        '',
+      ].join('\n'),
+    );
+    chmodSync(join(bin, 'oras'), 0o755);
+    const output = join(base, 'out');
+    writeFileSync(output, '');
+    const result = Bun.spawnSync(['bash', 'scripts/wash-pins.sh'], {
+      cwd: repo,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: {
+        ...env,
+        PATH: `${bin}:${process.env.PATH}`,
+        VARIANTS: '["wasi-tls","wasi-tls-exclusive"]',
+        PUBLISHED: published.join(' '),
+        GITHUB_OUTPUT: output,
+      },
+    });
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    const pins = readFileSync(output, 'utf8').match(/^pins<<EOF\n([\s\S]*)EOF\n$/)?.[1];
+    expect(pins).toBeDefined();
+    return (pins ?? '').split('\n').filter(Boolean);
+  }
+
+  function tag(salt: string): string {
+    const out = Bun.spawnSync(
+      [
+        process.execPath,
+        'scripts/source-check.ts',
+        '--workflow',
+        '.github/workflows/tenant-host-image.yml',
+        '--image',
+        'x',
+        '--salt',
+        salt,
+        '--force',
+      ],
+      { cwd: repo, env, stdout: 'pipe' },
+    ).stdout.toString();
+    return out.match(/^tag=(src-[0-9a-f]{64})$/m)?.[1] ?? '';
+  }
+
+  test('pins every variant published for this source, not only what this run built (W1)', () => {
+    const pins = run([tag('wasi-tls'), tag('wasi-tls-exclusive')]);
+    expect(pins.map((line) => line.split(' ')[0])).toEqual([
+      'wash-wasi-tls',
+      'wash-wasi-tls-exclusive',
+    ]);
+    for (const line of pins) expect(line).toMatch(/^wash-[\w-]+ sha256:[0-9a-f]{64}$/);
+  });
+
+  test('a variant not yet published for this source keeps its current row', () => {
+    expect(run([tag('wasi-tls-exclusive')]).map((line) => line.split(' ')[0])).toEqual([
+      'wash-wasi-tls-exclusive',
+    ]);
+    expect(run([])).toEqual([]);
+  });
 });

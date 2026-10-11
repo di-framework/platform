@@ -10,6 +10,9 @@ inputs:
   name:
     description: Branch suffix, bot/pin-<name>
     required: true
+  workflow:
+    description: The publish workflow; on a push the pin is skipped when main has newer inputs
+    required: true
   pins:
     description: One "<artifact> <sha256:digest>" per line; artifact keys from scripts/pin-artifact.ts
     required: true
@@ -28,6 +31,8 @@ runs:
       shell: bash
       env:
         NAME: ${{ inputs.name }}
+        WORKFLOW: ${{ inputs.workflow }}
+        EVENT: ${{ github.event_name }}
         PINS: ${{ inputs.pins }}
         GH_TOKEN: ${{ inputs.token }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -38,10 +43,14 @@ runs:
           exit 1
         fi
         # A re-run of an older push must not replace a newer pending pin with an older digest.
-        tip="$(git ls-remote origin refs/heads/main | cut -f1)"
-        if [[ "${tip}" != "${GITHUB_SHA}" ]]; then
-          echo "::notice::${GITHUB_SHA} is no longer the tip of main (${tip}); not pinning from a stale run"
-          exit 0
+        # Stale means main has different inputs (scripts/source-check.ts), not merely a newer
+        # commit: then the run for the newer source pins. workflow_dispatch always pins.
+        if [[ "${EVENT}" == "push" ]]; then
+          guard="$(bun scripts/source-check.ts --workflow "${WORKFLOW}" --image unused --stale-guard --no-registry)"
+          printf '%s\n' "${guard}"
+          if grep -qx 'stale=true' <<<"${guard}"; then
+            exit 0
+          fi
         fi
         args=()
         summary=()

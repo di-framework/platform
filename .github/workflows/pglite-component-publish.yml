@@ -67,11 +67,12 @@ jobs:
         id: check
         env:
           FORCE: ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
+          SOURCE_CHECK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC2086 # FORCE is empty or one flag
           bun scripts/source-check.ts --workflow .github/workflows/pglite-component-publish.yml \
-            --image ghcr.io/di-framework/pglite-component --require-main-tip "${GITHUB_SHA}" ${FORCE} --github-output
+            --image ghcr.io/di-framework/pglite-component --stale-guard ${FORCE} --github-output
 
   build:
     name: Build and test pglite component
@@ -220,7 +221,17 @@ jobs:
       # and that every import is wasi:*, then pushes the commit and version
       # tag, pulls it back by digest, and points the
       # version tag at that same manifest.
+      # Right before the tags move: a re-run of an older push whose inputs main has since
+      # changed stops here (check-source is not re-run by "Re-run failed jobs").
+      - name: Stop if main has newer inputs
+        id: guard
+        uses: ./.github/actions/source-guard
+        with:
+          workflow: .github/workflows/pglite-component-publish.yml
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Push and verify component
+        if: steps.guard.outputs.stale != 'true'
         env:
           PUSH: 'true'
           DI_OCI_REGISTRY: ghcr.io
@@ -232,6 +243,7 @@ jobs:
         run: target/debug/pglite-component-publisher
 
       - name: Record component digest
+        if: steps.guard.outputs.stale != 'true'
         id: digest
         run: |
           set -euo pipefail
@@ -251,6 +263,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Tag with source hash
+        if: steps.guard.outputs.stale != 'true'
         env:
           SOURCE_HASH: ${{ needs.check-source.outputs.source-hash }}
           GHCR_USERNAME: ${{ github.actor }}
@@ -267,6 +280,7 @@ jobs:
           echo "Tagged ghcr.io/di-framework/pglite-component@${DIGEST} with src-${SOURCE_HASH}"
 
       - name: Upload publish report
+        if: steps.guard.outputs.stale != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: pglite-publish-report
@@ -276,7 +290,7 @@ jobs:
   pin:
     name: Open pin PR
     needs: publish
-    if: ${{ !cancelled() && needs.publish.result == 'success' && github.ref == 'refs/heads/main' }}
+    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.publish.outputs.digest != '' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -290,5 +304,6 @@ jobs:
         uses: ./.github/actions/open-pin-pr
         with:
           name: pglite-component
+          workflow: .github/workflows/pglite-component-publish.yml
           pins: pglite-component ${{ needs.publish.outputs.digest }}
           token: ${{ secrets.GITHUB_TOKEN }}

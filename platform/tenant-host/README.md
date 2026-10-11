@@ -166,11 +166,18 @@ with the variant name; `scripts/source-check.ts`) and skips any variant whose
 `ghcr.io/di-framework/wash:src-<hash>` tag already exists, so an unrelated commit publishes nothing.
 A publish adds `src-<hash>` to the same multi-arch index as the variant tag. The jobs that push
 authenticate with the workflow `GITHUB_TOKEN` (`packages: write`). After a publish, a separate job
-(`contents: write`, `pull-requests: write`) opens or updates one PR, `bot/pin-wash`, which updates
-the rows of every variant that run published in the table below with `scripts/pin-artifact.ts`.
-A re-run of an older push publishes and pins nothing: both steps first check that the run's
-commit is still the tip of `main`. Each variant merges on its own, so one variant's failed build
-does not hold back the other; to publish and pin the failed variant, dispatch the workflow for it. GitHub does not run workflows on a PR that
+(`contents: write`, `pull-requests: write`, `packages: read`) opens or updates one PR, `bot/pin-wash`. It reads each
+variant's digest from its `src-<hash>` tag for the current source and updates every published
+variant's row in the table below with `scripts/pin-artifact.ts`, so a run that built only one
+variant never drops the other's pending pin.
+
+A push run is stale when the inputs on `main` (the same filtered, hashed files) differ from its
+own; an unrelated newer commit does not make it stale. A stale run publishes and pins nothing,
+because the run for the newer source does both. The check runs in `check-source`, again right
+before `merge` moves the tags (so "Re-run failed jobs" on an older run is caught too), and in the
+pin step. A dispatch always builds. Each variant merges on its own, so one variant's failed build
+does not hold back the other; to publish and pin the failed variant, dispatch the workflow for it.
+GitHub does not run workflows on a PR that
 `GITHUB_TOKEN` opened, so a maintainer has to start its checks (close and reopen it) before merging.
 
 Latest published images (multi-arch index digests; the bot PR keeps this table current):
