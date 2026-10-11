@@ -90,5 +90,8 @@ describe('pglite-component package', () => {
       if (ref?.[1] && ref[2]) expect(ref[2], line).toMatch(/^[0-9a-f]{40}$/);
     }
     expect(workflow).toContain('cargo run --locked -p pglite-component-publisher');
+    expect(workflow).toContain('target/debug/pglite-component-publisher');
+    expect(workflow).toContain('sha256sum -c -');
+    expect(workflow).toContain('wasm_sha256');
   });
 });

@@ -8,7 +8,9 @@ use wasm_component_publisher as publish;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const REQUIRED_EXPORT: &str = "di-framework:pglite/database@0.2.0";
+/// Derived from `wit/world.wit` by `build.rs`, so a WIT bump moves the required
+/// export and the version tag together.
+const REQUIRED_EXPORT: &str = concat!("di-framework:pglite/database@", env!("PGLITE_WIT_VERSION"));
 
 fn main() {
     if let Err(error) = run() {
@@ -52,4 +54,24 @@ fn run() -> Result<()> {
         },
         push && !check,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::REQUIRED_EXPORT;
+
+    #[test]
+    fn required_export_matches_the_wit_package_version() {
+        let wit = include_str!("../wit/world.wit");
+        let version = wit
+            .lines()
+            .next()
+            .and_then(|l| l.strip_prefix("package di-framework:pglite@"))
+            .and_then(|l| l.strip_suffix(';'))
+            .expect("world.wit starts with the package declaration");
+        assert_eq!(
+            REQUIRED_EXPORT,
+            format!("di-framework:pglite/database@{version}")
+        );
+    }
 }

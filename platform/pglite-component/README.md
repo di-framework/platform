@@ -57,9 +57,9 @@ The pglite component is published to GitHub Container Registry (GHCR) as an OCI 
 
 The workflow has two jobs:
 - `build` (no write token) runs the same targets as `ci.yml`: `make tools-rust`, `make unit smoke` (which runs `make build`, composing the provider with the engine via `wac plug`), then the publisher crates' clippy and tests.
-- `publish` (`packages: write`) downloads the tested `dist/` and runs `pglite-component-publisher`. It never rebuilds or modifies `dist/`. It checks `SHA256SUMS`, requires the export `di-framework:pglite/database@0.2.0` and rejects any import that is not `wasi:*`, then pushes `ghcr.io/di-framework/pglite-component` with two tags (the commit SHA and the WIT package version, `0.2.0`) and pulls each back by the manifest digest to compare bytes.
+- `publish` (`packages: write`) downloads the tested `dist/` and runs `pglite-component-publisher`. It never rebuilds or modifies `dist/`. It checks `SHA256SUMS`, requires the export `di-framework:pglite/database@0.2.0` and rejects any import that is not `wasi:*`, then pushes `ghcr.io/di-framework/pglite-component:<commit sha>` once, pulls it back by the manifest digest to compare bytes, then points the version tag (`0.2.0`, the WIT package version) at that same manifest with `oras tag` and asserts both tags resolve to one digest. The `build` job passes the tested wasm sha256 to `publish`, which verifies it before pushing.
 
-Tags are movable. Only the `@sha256:...` digest is immutable, so pin consumers by digest.
+Tags are movable. `0.2.0` always points to the latest `main` publish for WIT package 0.2.0, and re-dispatching a commit also moves its SHA tag. Only the `@sha256:...` digest is immutable, so consumers pin by digest.
 
 ### Artifact location
 

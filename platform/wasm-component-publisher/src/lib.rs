@@ -292,7 +292,17 @@ impl Drop for TempFileGuard {
 
 /// Run `wash` with a deadline; kill it if it overruns.
 fn run_wash(args: &[String], envs: &[(&str, &Path)], timeout: Duration) -> Result<Output> {
-    let mut command = Command::new("wash");
+    run_tool("wash", args, envs, timeout)
+}
+
+/// Run an external registry tool (`wash`, `oras`) with a deadline.
+fn run_tool(
+    program: &str,
+    args: &[String],
+    envs: &[(&str, &Path)],
+    timeout: Duration,
+) -> Result<Output> {
+    let mut command = Command::new(program);
     command.args(args);
     for (key, val) in envs {
         command.env(key, val);
@@ -303,10 +313,9 @@ fn run_wash(args: &[String], envs: &[(&str, &Path)], timeout: Duration) -> Resul
         .spawn()
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                "wash not found on PATH; install wash 2.5.2 (https://wasmcloud.com/docs/installation)"
-                    .to_owned()
+                format!("{program} not found on PATH (wash 2.5.2 and oras are required)")
             } else {
-                format!("failed to run wash: {error}")
+                format!("failed to run {program}: {error}")
             }
         })?;
     // Drain both pipes while waiting: a full pipe must not stall the child.
@@ -324,7 +333,7 @@ fn run_wash(args: &[String], envs: &[(&str, &Path)], timeout: Duration) -> Resul
     loop {
         match child
             .try_wait()
-            .map_err(|error| format!("failed to wait on wash: {error}"))?
+            .map_err(|error| format!("failed to wait on {program}: {error}"))?
         {
             Some(status) => {
                 return Ok(Output {
@@ -339,7 +348,7 @@ fn run_wash(args: &[String], envs: &[(&str, &Path)], timeout: Duration) -> Resul
                 let _ = stdout.join();
                 let _ = stderr.join();
                 return Err(format!(
-                    "wash oci {} timed out after {} seconds",
+                    "{program} {} timed out after {} seconds",
                     args.first().map(String::as_str).unwrap_or_default(),
                     timeout.as_secs()
                 )
@@ -348,6 +357,50 @@ fn run_wash(args: &[String], envs: &[(&str, &Path)], timeout: Duration) -> Resul
             None => std::thread::sleep(Duration::from_millis(100)),
         }
     }
+}
+
+/// `oras tag <repo>@<digest> <tag>...`: point `tags` at an existing manifest.
+fn tag_args(insecure: bool, repo_ref: &str, digest: &str, tags: &[String]) -> Vec<String> {
+    let mut args = vec!["tag".to_owned()];
+    if insecure {
+        args.push("--plain-http".to_owned());
+    }
+    args.push(format!("{repo_ref}@{digest}"));
+    args.extend(tags.iter().cloned());
+    args
+}
+
+/// The manifest digest a tag currently resolves to (`oras resolve`).
+fn resolve_tag(
+    repo_ref: &str,
+    tag: &str,
+    insecure: bool,
+    envs: &[(&str, &Path)],
+) -> Result<String> {
+    let mut args = vec!["resolve".to_owned()];
+    if insecure {
+        args.push("--plain-http".to_owned());
+    }
+    args.push(format!("{repo_ref}:{tag}"));
+    let output = run_tool("oras", &args, envs, Duration::from_secs(120))?;
+    check_tool_output(&output, "oras resolve")?;
+    let resolved = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !is_digest(&resolved) {
+        return Err(format!("oras resolve returned no digest: {}", tail(&resolved, 200)).into());
+    }
+    Ok(resolved)
+}
+
+fn check_tool_output(output: &Output, what: &str) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{what} failed ({}): {}",
+        output.status,
+        tail(&String::from_utf8_lossy(&output.stderr), 2000)
+    )
+    .into())
 }
 
 fn check_output(output: &Output, what: &str) -> Result<()> {
@@ -425,34 +478,47 @@ pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<(
         tags.push(version.clone());
     }
     let wasm_path = dist.join(spec.wasm_file);
-    let mut pushed = Vec::new();
-    for tag in &tags {
-        let destination = format!("{registry}/{repository}:{tag}");
-        let manifest_digest = push_and_verify(
-            &destination,
-            &format!("{registry}/{repository}"),
-            &wasm_path,
-            &wasm,
-            insecure,
-            &wash_envs,
-        )?;
-        eprintln!("[{log}] Pushed tag: {destination} -> {manifest_digest}");
-        pushed.push((destination, manifest_digest));
+    let repo_ref = format!("{registry}/{repository}");
+    let destination = format!("{repo_ref}:{tag}");
+    // One push, one manifest digest. Extra tags are pointed at that same
+    // manifest (a second `wash oci push` would create a new manifest because
+    // wash stamps a creation time into the config).
+    let manifest_digest = push_and_verify(
+        &destination,
+        &repo_ref,
+        &wasm_path,
+        &wasm,
+        insecure,
+        &wash_envs,
+    )?;
+    eprintln!("[{log}] Pushed tag: {destination} -> {manifest_digest}");
+    let extra_tags = &tags[1..];
+    if !extra_tags.is_empty() {
+        let args = tag_args(insecure, &repo_ref, &manifest_digest, extra_tags);
+        let output = run_tool("oras", &args, &wash_envs, Duration::from_secs(120))?;
+        check_tool_output(&output, "oras tag")?;
+        for extra in extra_tags {
+            let resolved = resolve_tag(&repo_ref, extra, insecure, &wash_envs)?;
+            if resolved != manifest_digest {
+                return Err(format!(
+                    "tag {extra} resolves to {resolved}, expected {manifest_digest}"
+                )
+                .into());
+            }
+            eprintln!("[{log}] Tagged {repo_ref}:{extra} -> {manifest_digest}");
+        }
     }
-    // The first (commit) tag's manifest digest is the canonical reference; a
-    // tag can move, the digest cannot.
-    let manifest_digest = pushed[0].1.clone();
-    let local = format!("{registry}/{repository}@{manifest_digest}");
+    let local = format!("{repo_ref}@{manifest_digest}");
     let cluster = format!("{cluster_registry}/{repository}@{manifest_digest}");
     let report = dist.join(spec.report_file_name);
-    let tag_digests: Vec<Value> = pushed
+    let tag_digests: Vec<Value> = tags
         .iter()
-        .map(|(tag, digest)| serde_json::json!({ "tag": tag, "manifestDigest": digest }))
+        .map(|tag| serde_json::json!({ "tag": format!("{repo_ref}:{tag}"), "manifestDigest": manifest_digest }))
         .collect();
     fs::write(
         &report,
         serde_json::to_vec_pretty(&serde_json::json!({
-            "tag": pushed[0].0, "tags": tag_digests, "wasmDigest": wasm_digest,
+            "tag": destination, "tags": tag_digests, "wasmDigest": wasm_digest,
             "manifestDigest": manifest_digest, "localComponent": local, "clusterComponent": cluster,
         }))?,
     )?;
@@ -592,14 +658,20 @@ fn world_items(wit: &str) -> Result<(Vec<String>, Vec<String>)> {
         }
         if depth == 1 {
             for (kind, items) in [("import ", &mut imports), ("export ", &mut exports)] {
-                if let Some(item) = line
-                    .strip_prefix(kind)
-                    .and_then(|item| item.strip_suffix(';'))
-                {
-                    if item.contains(char::is_whitespace) || item.contains('{') {
-                        return Err("expected named top-level WIT interfaces".into());
+                if let Some(rest) = line.strip_prefix(kind) {
+                    match rest.strip_suffix(';') {
+                        Some(item)
+                            if !item.contains(char::is_whitespace) && !item.contains('{') =>
+                        {
+                            items.push(item.to_owned());
+                        }
+                        _ => {
+                            return Err(format!(
+                                "expected named top-level WIT interfaces, got `{line}`"
+                            )
+                            .into());
+                        }
                     }
-                    items.push(item.to_owned());
                 }
             }
         }
@@ -668,6 +740,31 @@ mod tests {
         assert_eq!(imports, ["wasi:http/client@0.3.0"]);
         assert!(exports.is_empty());
         assert!(world_items("world truncated {\n").is_err());
+    }
+
+    #[test]
+    fn inline_imports_and_exports_are_rejected() {
+        for item in [
+            "import engine: interface {",
+            "import run: func();",
+            "export handler: interface {",
+        ] {
+            let wit = format!("world root {{\n  {item}\n  }}\n}}\n");
+            assert!(world_items(&wit).is_err(), "{item}");
+        }
+    }
+
+    #[test]
+    fn tag_args_point_extra_tags_at_the_pushed_digest() {
+        let tags = ["0.2.0".to_owned(), "stable".to_owned()];
+        assert_eq!(
+            tag_args(false, "ghcr.io/o/r", "sha256:abc", &tags),
+            ["tag", "ghcr.io/o/r@sha256:abc", "0.2.0", "stable"]
+        );
+        assert_eq!(
+            tag_args(true, "localhost:5000/r", "sha256:abc", &tags[..1])[..2],
+            ["tag", "--plain-http"]
+        );
     }
 
     #[test]

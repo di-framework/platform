@@ -53,6 +53,9 @@ jobs:
           make -C platform/oci-registry test
           cargo test --locked -p wasm-component-publisher -p oci-registry-publisher
 
+      - name: Build publisher (no credentials in scope)
+        run: cargo build --locked -p oci-registry-publisher
+
       - name: Build, push, and verify component
         env:
           PUSH: 'true'
@@ -62,7 +65,7 @@ jobs:
           DI_OCI_TAG: ${{ github.sha }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: cargo run --locked -p oci-registry-publisher
+        run: target/debug/oci-registry-publisher
 
       - name: Record component digest
         run: |
