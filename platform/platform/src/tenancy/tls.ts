@@ -60,11 +60,12 @@ const BACKDATE_MS = 5 * 60_000;
 /** One X.509 extension; `value` is the DER of its extnValue contents. */
 const extension = (id: string, value: Buffer, critical = false): Buffer =>
   seq(oid(id), ...(critical ? [BOOLEAN_TRUE] : []), der(0x04, value));
-/** A key identifier: SHA-1 of the SubjectPublicKeyInfo (RFC 5280 §4.2.1.2 allows any unique method). */
+/** A key identifier: SHA-256 of the SubjectPublicKeyInfo truncated to 160 bits (RFC 7093 §2). */
 const keyId = (key: KeyObject): Buffer =>
-  createHash('sha1')
+  createHash('sha256')
     .update(key.export({ type: 'spki', format: 'der' }))
-    .digest();
+    .digest()
+    .subarray(0, 20);
 const subjectKeyId = (key: KeyObject) => extension('2.5.29.14', der(0x04, keyId(key)));
 const authorityKeyId = (key: KeyObject) => extension('2.5.29.35', seq(der(0x80, keyId(key))));
 /** A keyUsage extension (critical) with the named bit numbers set (0 digitalSignature, 5 keyCertSign, 6 cRLSign). */
