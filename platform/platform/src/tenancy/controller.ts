@@ -75,7 +75,9 @@ import {
   type ServiceBinding,
   type SizingParameters,
   TENANT,
+  TENANT_CONTROLLER_CA_KEY_SECRET,
   type Tenant,
+  type TenantAuthConfig,
   type TenantAuthInputs,
   tenantAuthResources,
   tenantAuthRoutes,
@@ -98,7 +100,14 @@ import {
   serviceBindingResources,
   sharedBindingConflict,
 } from './service-binding-reconcile';
-import { certificateNames, certificateValid, selfSignedCertificate } from './tls';
+import {
+  caCertificate,
+  certificateNames,
+  certificateValid,
+  holdsCaKey,
+  issuedBy,
+  leafCertificate,
+} from './tls';
 import {
   STORAGE_FIELD_MANAGER,
   storageKeys,
@@ -257,6 +266,9 @@ export class KubernetesApi implements Api {
 const LOG_LOOKBACK_MS = 120_000;
 /** A generated host pull token: 32 random bytes, base64url. */
 const HOST_PULL_TOKEN = /^[A-Za-z0-9_-]{43}$/;
+/** Lifetime of the controller CA, and how long before expiry it is replaced (days). */
+const CA_DAYS = 3650;
+const CA_RENEW_DAYS = 90;
 const TENANT_AUTH_KINDS = [
   ['apps/v1', 'Deployment'],
   ['v1', 'Service'],
@@ -452,26 +464,7 @@ export class Controller {
       ],
       port: slices[0]?.ports?.[0]?.port ?? 443,
     };
-    const existing = await this.get<Resource>(
-      `${collection('v1', 'Secret', names(name).runtimeNamespace)}/tenant-controller-tls`,
-    );
-    const data = existing?.data as Record<string, string> | undefined;
-    const current = data && {
-      cert: Buffer.from(data['tls.crt'] ?? '', 'base64').toString(),
-      key: Buffer.from(data['tls.key'] ?? '', 'base64').toString(),
-    };
-    const certNames = tenantControllerCertNames(name, auth);
-    const sameNames = (cert: string) =>
-      JSON.stringify(certificateNames(cert)) === JSON.stringify(certNames);
-    const tls =
-      current && certificateValid(current.cert, 30) && sameNames(current.cert)
-        ? current
-        : selfSignedCertificate(
-            `tenant-controller.${names(name).runtimeNamespace}.svc`,
-            certNames.dns,
-            certNames.ips,
-            365,
-          );
+    const tls = await this.controllerTls(name, auth);
     const oauth = await this.get<{ data?: Record<string, string> }>(
       `${collection('v1', 'Secret', this.cfg.namespace)}/${auth.oauthClient.secretName}`,
     );
@@ -482,6 +475,54 @@ export class Controller {
       clientSecret: oauth?.data?.[auth.oauthClient.secretKey ?? 'clientSecret'],
       ...(auth.registry ? { hostPullToken: await this.hostPullToken(name) } : {}),
     };
+  }
+  /**
+   * The controller's TLS material: a long-lived CA and a leaf it signed. Both are reused while they
+   * verify against each other (the leaf by the CA's signature and key, the CA as `CA:TRUE` with its
+   * stored key), so a leaf renewal keeps the CA and does not roll the hosts or invalidate kubeconfigs.
+   * A Secret from before the CA existed has no `ca.crt` and is replaced once.
+   */
+  private async controllerTls(
+    tenant: string,
+    auth: TenantAuthConfig,
+  ): Promise<TenantAuthInputs['tls']> {
+    const runtimeNamespace = names(tenant).runtimeNamespace;
+    const read = async (secret: string, key: string) =>
+      Buffer.from(
+        (
+          await this.get<{ data?: Record<string, string> }>(
+            `${collection('v1', 'Secret', runtimeNamespace)}/${secret}`,
+          )
+        )?.data?.[key] ?? '',
+        'base64',
+      ).toString();
+    const [cert, key, caCert, caKey] = await Promise.all([
+      read('tenant-controller-tls', 'tls.crt'),
+      read('tenant-controller-tls', 'tls.key'),
+      read('tenant-controller-tls', 'ca.crt'),
+      read(TENANT_CONTROLLER_CA_KEY_SECRET, 'ca.key'),
+    ]);
+    const certNames = tenantControllerCertNames(tenant, auth);
+    const ca =
+      holdsCaKey(caCert, caKey) && certificateValid(caCert, CA_RENEW_DAYS)
+        ? { cert: caCert, key: caKey }
+        : caCertificate(`tenant-controller CA (${runtimeNamespace})`, CA_DAYS);
+    if (
+      ca.cert === caCert &&
+      certificateValid(cert, 30) &&
+      JSON.stringify(certificateNames(cert)) === JSON.stringify(certNames) &&
+      issuedBy(caCert, cert, key)
+    )
+      return { cert, key, caCert, caKey };
+    const leaf = leafCertificate(
+      `tenant-controller.${runtimeNamespace}.svc`,
+      certNames.dns,
+      certNames.ips,
+      365,
+      ca.cert,
+      ca.key,
+    );
+    return { ...leaf, caCert: ca.cert, caKey: ca.key };
   }
   /**
    * The host pull token (#83 `:host-pull`): the one in `di-tenant-registry-pull` while it is well

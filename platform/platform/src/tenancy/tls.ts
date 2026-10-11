@@ -1,4 +1,12 @@
-import { generateKeyPairSync, randomBytes, sign, X509Certificate } from 'node:crypto';
+import {
+  createHash,
+  createPrivateKey,
+  generateKeyPairSync,
+  type KeyObject,
+  randomBytes,
+  sign,
+  X509Certificate,
+} from 'node:crypto';
 
 /** A PEM certificate and its PKCS#8 PEM private key. */
 export interface KeyPair {
@@ -34,6 +42,7 @@ const time = (date: Date) =>
 const name = (commonName: string) =>
   seq(der(0x31, seq(oid('2.5.4.3'), der(0x0c, Buffer.from(commonName)))));
 const ECDSA_SHA256 = seq(oid('1.2.840.10045.4.3.2'));
+const BOOLEAN_TRUE = der(0x01, Buffer.from([0xff]));
 
 /**
  * A positive, minimally encoded DER INTEGER body from random bytes: the high bit is cleared (no
@@ -48,10 +57,125 @@ export function serialNumber(random: Buffer): Buffer {
 /** Clock skew a fresh certificate tolerates: `notBefore` is backdated by this much. */
 const BACKDATE_MS = 5 * 60_000;
 
+/** One X.509 extension; `value` is the DER of its extnValue contents. */
+const extension = (id: string, value: Buffer, critical = false): Buffer =>
+  seq(oid(id), ...(critical ? [BOOLEAN_TRUE] : []), der(0x04, value));
+/** A key identifier: SHA-256 of the SubjectPublicKeyInfo truncated to 160 bits (RFC 7093 §2). */
+const keyId = (key: KeyObject): Buffer =>
+  createHash('sha256')
+    .update(key.export({ type: 'spki', format: 'der' }))
+    .digest()
+    .subarray(0, 20);
+const subjectKeyId = (key: KeyObject) => extension('2.5.29.14', der(0x04, keyId(key)));
+const authorityKeyId = (key: KeyObject) => extension('2.5.29.35', seq(der(0x80, keyId(key))));
+/** A keyUsage extension (critical) with the named bit numbers set (0 digitalSignature, 5 keyCertSign, 6 cRLSign). */
+const keyUsage = (...bits: number[]) => {
+  const byte = bits.reduce((acc, bit) => acc | (0x80 >> bit), 0);
+  const unused = 31 - Math.clz32(byte & -byte); // trailing zero bits, as DER requires
+  return extension('2.5.29.15', der(0x03, Buffer.from([unused, byte])), true);
+};
+const subjectAltName = (dnsNames: string[], ipAddresses: string[]) =>
+  extension(
+    '2.5.29.17',
+    seq(
+      ...dnsNames.map((dns) => der(0x82, Buffer.from(dns))),
+      ...ipAddresses.map((ip) => der(0x87, Buffer.from(ip.split('.').map(Number)))),
+    ),
+  );
+const pem = (label: string, body: Buffer): string =>
+  `-----BEGIN ${label}-----\n${(body.toString('base64').match(/.{1,64}/g) ?? []).join('\n')}\n-----END ${label}-----\n`;
+const pkcs8 = (key: KeyObject) => key.export({ type: 'pkcs8', format: 'pem' }) as string;
+
+/** The DER children of the constructed element at the start of `buf`. */
+function children(buf: Buffer): Buffer[] {
+  const first = buf[1] as number;
+  const out: Buffer[] = [];
+  for (let at = first & 0x80 ? 2 + (first & 0x7f) : 2; at < buf.length; ) {
+    const lead = buf[at + 1] as number;
+    const width = lead & 0x80 ? lead & 0x7f : 0;
+    const length = width ? buf.readUIntBE(at + 2, width) : lead;
+    out.push(buf.subarray(at, at + 2 + width + length));
+    at += 2 + width + length;
+  }
+  return out;
+}
+
+/** The subject Name of a PEM certificate as DER, so a leaf can carry it verbatim as its issuer. */
+function subjectDer(cert: string): Buffer {
+  const fields = children(children(new X509Certificate(cert).raw)[0] as Buffer);
+  return fields[(fields[0] as Buffer)[0] === 0xa0 ? 5 : 4] as Buffer;
+}
+
+interface Issue {
+  subject: Buffer;
+  /** The issuer Name as DER; the subject itself for a self-signed certificate. */
+  issuer: Buffer;
+  publicKey: KeyObject;
+  signingKey: KeyObject;
+  extensions: Buffer[];
+  days: number;
+  now: Date;
+}
+
+/** Sign and PEM-encode a v3 certificate. Node has no X.509 writer, so this encodes the DER itself. */
+function issueCertificate(i: Issue): string {
+  const tbs = seq(
+    der(0xa0, der(0x02, Buffer.from([2]))),
+    der(0x02, serialNumber(randomBytes(16))),
+    ECDSA_SHA256,
+    i.issuer,
+    seq(
+      time(new Date(i.now.getTime() - BACKDATE_MS)),
+      time(new Date(i.now.getTime() + i.days * 86_400_000)),
+    ),
+    i.subject,
+    i.publicKey.export({ type: 'spki', format: 'der' }),
+    der(0xa3, seq(...i.extensions)),
+  );
+  return pem(
+    'CERTIFICATE',
+    seq(tbs, ECDSA_SHA256, der(0x03, Buffer.from([0]), sign('sha256', tbs, i.signingKey))),
+  );
+}
+
+/** A fresh P-256 key pair, a self-signed `Issue` for it, and the result of issuing that. */
+function selfIssued(
+  commonName: string,
+  days: number,
+  now: Date,
+  extensions: (publicKey: KeyObject) => Buffer[],
+): KeyPair {
+  const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const subject = name(commonName);
+  const cert = issueCertificate({
+    subject,
+    issuer: subject,
+    publicKey,
+    signingKey: privateKey,
+    days,
+    now,
+    extensions: extensions(publicKey),
+  });
+  return { cert, key: pkcs8(privateKey) };
+}
+
 /**
- * A self-signed P-256 certificate for `commonName`, the DNS names in `dnsNames` and the IPv4 `ipAddresses`, valid for
- * `days` days. Node has no X.509 writer, so this encodes the DER itself. Like `openssl req -x509`
- * it marks the certificate as a CA, so a client can pin it as its own trust anchor.
+ * A P-256 certificate authority: a self-signed certificate that may only sign end-entity
+ * certificates (`CA:TRUE, pathlen:0`, keyUsage `keyCertSign, cRLSign`, an SKI) and carries no SANs.
+ */
+export function caCertificate(commonName: string, days: number, now: Date = new Date()): KeyPair {
+  return selfIssued(commonName, days, now, (publicKey) => [
+    extension('2.5.29.19', seq(BOOLEAN_TRUE, der(0x02, Buffer.from([0]))), true),
+    keyUsage(5, 6),
+    subjectKeyId(publicKey),
+  ]);
+}
+
+/**
+ * A self-signed P-256 certificate for `commonName` that is its own trust anchor, with the SANs
+ * given. Like `openssl req -x509` it marks itself `CA:TRUE`. The controller uses `caCertificate`
+ * plus `leafCertificate`; this stays for fixtures and the single-certificate layout older
+ * clusters hold.
  */
 export function selfSignedCertificate(
   commonName: string,
@@ -60,44 +184,79 @@ export function selfSignedCertificate(
   days: number,
   now: Date = new Date(),
 ): KeyPair {
+  return selfIssued(commonName, days, now, () => [
+    extension('2.5.29.19', seq(BOOLEAN_TRUE), true),
+    subjectAltName(dnsNames, ipAddresses),
+  ]);
+}
+
+/**
+ * A P-256 end-entity (`CA:FALSE`) server certificate for `commonName`, the DNS names and IPv4
+ * addresses given, signed by `caKey`. Its issuer is the subject of `caCert`, so OpenSSL-based
+ * clients do not mistake it for self-signed, and its AKI matches the CA's SKI.
+ */
+export function leafCertificate(
+  commonName: string,
+  dnsNames: string[],
+  ipAddresses: string[],
+  days: number,
+  caCert: string,
+  caKey: string,
+  now: Date = new Date(),
+): KeyPair {
   const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
-  const serial = serialNumber(randomBytes(16));
-  const san = seq(
-    ...dnsNames.map((dns) => der(0x82, Buffer.from(dns))),
-    ...ipAddresses.map((ip) => der(0x87, Buffer.from(ip.split('.').map(Number)))),
-  );
-  const tbs = seq(
-    der(0xa0, der(0x02, Buffer.from([2]))),
-    der(0x02, serial),
-    ECDSA_SHA256,
-    name(commonName),
-    seq(
-      time(new Date(now.getTime() - BACKDATE_MS)),
-      time(new Date(now.getTime() + days * 86_400_000)),
-    ),
-    name(commonName),
-    publicKey.export({ type: 'spki', format: 'der' }),
-    der(
-      0xa3,
-      seq(
-        seq(
-          oid('2.5.29.19'),
-          der(0x01, Buffer.from([0xff])),
-          der(0x04, seq(der(0x01, Buffer.from([0xff])))),
-        ),
-        seq(oid('2.5.29.17'), der(0x04, san)),
-      ),
-    ),
-  );
-  const cert = seq(tbs, ECDSA_SHA256, der(0x03, Buffer.from([0]), sign('sha256', tbs, privateKey)));
-  const pem = cert
-    .toString('base64')
-    .match(/.{1,64}/g)!
-    .join('\n');
-  return {
-    cert: `-----BEGIN CERTIFICATE-----\n${pem}\n-----END CERTIFICATE-----\n`,
-    key: privateKey.export({ type: 'pkcs8', format: 'pem' }) as string,
-  };
+  const cert = issueCertificate({
+    subject: name(commonName),
+    issuer: subjectDer(caCert),
+    publicKey,
+    signingKey: createPrivateKey(caKey),
+    days,
+    now,
+    extensions: [
+      extension('2.5.29.19', seq(), true),
+      keyUsage(0),
+      extension('2.5.29.37', seq(oid('1.3.6.1.5.5.7.3.1'))),
+      subjectAltName(dnsNames, ipAddresses),
+      subjectKeyId(publicKey),
+      authorityKeyId(new X509Certificate(caCert).publicKey),
+    ],
+  });
+  return { cert, key: pkcs8(privateKey) };
+}
+
+/** `check` on the parsed certificates; false when anything is unreadable. */
+function parsed(check: () => boolean): boolean {
+  try {
+    return check();
+  } catch {
+    return false;
+  }
+}
+
+/** True when `key` (PEM) is the private key of the CA certificate `ca` (PEM). */
+export function holdsCaKey(ca: string, key: string): boolean {
+  return parsed(() => {
+    const caX = new X509Certificate(ca);
+    return caX.ca && caX.checkPrivateKey(createPrivateKey(key));
+  });
+}
+
+/**
+ * True when `leaf` is an end-entity certificate that `ca` issued and signed, and `leafKey` is its
+ * private key.
+ */
+export function issuedBy(ca: string, leaf: string, leafKey: string): boolean {
+  return parsed(() => {
+    const caX = new X509Certificate(ca);
+    const leafX = new X509Certificate(leaf);
+    return (
+      caX.ca &&
+      !leafX.ca &&
+      leafX.checkIssued(caX) &&
+      leafX.verify(caX.publicKey) &&
+      leafX.checkPrivateKey(createPrivateKey(leafKey))
+    );
+  });
 }
 
 /** True when `cert` (PEM) is still valid `marginDays` from `now`; false when unreadable. */

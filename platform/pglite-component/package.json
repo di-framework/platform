@@ -46,7 +46,9 @@
     "dist/SHA256SUMS",
     "dist/THIRD-PARTY-NOTICES.txt",
     "README.md",
-    "wit"
+    "wit",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
   ],
   "scripts": {
     "build": "bun run build:adapter && make build",

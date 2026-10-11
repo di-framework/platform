@@ -183,8 +183,11 @@ export interface TenantAuthInputs {
   members: string[];
   /** API server endpoint addresses and port (the `kubernetes` EndpointSlice). */
   apiServer: { addresses: string[]; port: number };
-  /** The controller's serving certificate and key (PEM). */
-  tls: { cert: string; key: string };
+  /**
+   * The controller's serving leaf certificate and key, the CA certificate that issued it (the trust
+   * anchor clients pin) and the CA key (PEM). The CA key is kept in a Secret nothing mounts.
+   */
+  tls: { cert: string; key: string; caCert: string; caKey: string };
   /** The shared OAuth client secret, base64 as read from the platform Secret; absent until it exists. */
   clientSecret?: string;
   /**
@@ -1257,6 +1260,8 @@ function tenantControllerCertNames(
   return { dns: [...new Set(dns)], ips: [...new Set(ips)] };
 }
 /** Digest of the serving certificate; in both pod templates so a renewal rolls the pair. */
+/** The Secret holding the controller CA's private key; no pod mounts it. */
+const TENANT_CONTROLLER_CA_KEY_SECRET = 'tenant-controller-ca-key';
 function tlsCertDigest(cert: string): string {
   return createHash('sha256').update(cert).digest('hex');
 }
@@ -1656,11 +1661,20 @@ function tenantAuthResources(
     );
   result.push(
     make('v1', 'ConfigMap', 'tenant-controller-ca', namespace, {
-      data: { 'ca.crt': inputs.tls.cert },
+      data: { 'ca.crt': inputs.tls.caCert },
     }),
     make('v1', 'Secret', 'tenant-controller-tls', namespace, {
       type: 'kubernetes.io/tls',
-      data: { 'tls.crt': base64(inputs.tls.cert), 'tls.key': base64(inputs.tls.key) },
+      data: {
+        'tls.crt': base64(inputs.tls.cert),
+        'tls.key': base64(inputs.tls.key),
+        'ca.crt': base64(inputs.tls.caCert),
+      },
+    }),
+    // Not mounted by any pod: lets a leaf renewal keep the CA (and so the hosts and kubeconfigs).
+    make('v1', 'Secret', TENANT_CONTROLLER_CA_KEY_SECRET, namespace, {
+      type: 'Opaque',
+      data: { 'ca.key': base64(inputs.tls.caKey) },
     }),
   );
   const hostPullToken = registry ? inputs.hostPullToken : undefined;
@@ -1793,10 +1807,11 @@ function tenantAuthResources(
 }
 /**
  * The tenant registry (#83): `platform/oci-registry` on the tenant's own hosts. Its storage is
- * the unnamed blobstore with no references, i.e. the host data store on the tenant's `di-nats`.
- * The component reads the whoami URL and the tenant through `wasmcloud:secrets` bind-time config;
- * admission admits that interface from the platform controller only, so a tenant cannot repoint
- * it. The plain-HTTP whoami URL is in-cluster (`*.svc`), as the component requires.
+ * the unnamed blobstore, configured with the NATS backend pointing to the tenant's `di-nats`
+ * for persistent blob and manifest storage. The component reads the whoami URL and the tenant
+ * through `wasmcloud:secrets` bind-time config; admission admits that interface from the
+ * platform controller only, so a tenant cannot repoint it. The plain-HTTP whoami URL is
+ * in-cluster (`*.svc`), as the component requires.
  */
 function registryWorkload(
   tenant: Tenant,
@@ -1843,6 +1858,10 @@ function registryWorkload(
                 package: 'blobstore',
                 version: '0.1.0',
                 interfaces: ['blobstore', 'container', 'types'],
+                config: {
+                  backend: 'nats',
+                  url: `nats://di-nats.${n.runtimeNamespace}.svc.cluster.local:4222`,
+                },
               },
               {
                 namespace: 'wasmcloud',
@@ -1915,6 +1934,7 @@ export {
   resource,
   runtimeQuota,
   TENANT,
+  TENANT_CONTROLLER_CA_KEY_SECRET,
   tenantAuthResources,
   tenantControllerCertNames,
   tenantQuota,

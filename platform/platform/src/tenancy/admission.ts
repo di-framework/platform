@@ -82,13 +82,34 @@ export interface HostInterfaceLike {
   config?: Record<string, unknown>;
 }
 
+function registryBlobstoreAllowed(
+  hostInterface: HostInterfaceLike,
+  requester?: { username: string; controllerNamespace: string; workloadNamespace?: string },
+): boolean {
+  const tenant = requester?.workloadNamespace
+    ? tenantNameFromNamespace(requester.workloadNamespace)
+    : undefined;
+  const config = hostInterface.config ?? {};
+  const keys = Object.keys(config);
+  return (
+    requester?.username ===
+      `system:serviceaccount:${requester?.controllerNamespace}:di-platform-controller` &&
+    tenant !== undefined &&
+    (hostInterface.configFrom ?? []).length === 0 &&
+    keys.length === 2 &&
+    keys.every((key) => key === 'backend' || key === 'url') &&
+    config.backend === 'nats' &&
+    config.url === `nats://di-nats.di-runtime-${tenant}.svc.cluster.local:4222`
+  );
+}
+
 /**
  * Mirrors the workload ValidatingAdmissionPolicy CEL (fail-closed).
  * Unnamed backend selection is denied except the transitional stock keyvalue path.
  */
 export function hostInterfaceAllowed(
   hostInterface: HostInterfaceLike,
-  requester?: { username: string; controllerNamespace: string },
+  requester?: { username: string; controllerNamespace: string; workloadNamespace?: string },
 ): boolean {
   const { namespace, package: packageName, name } = hostInterface;
   const configFrom = hostInterface.configFrom ?? [];
@@ -132,10 +153,20 @@ export function hostInterfaceAllowed(
     const name = hostInterface.name.slice(0, -suffix.length);
     return !!name && secretFrom.length === 1 && secretFrom[0]?.name === `di-binding-${name}-creds`;
   }
-  // Blobstore stays unnamed. Without references it uses the host data store; a created
-  // service is selected only through a controller-managed di-binding-/di-bs- ConfigMap.
+  // Tenant blobstore stays unnamed with no inline config. Without references it is wash's
+  // in-memory default (#154); a created service is selected only through a controller-managed
+  // di-binding-/di-bs- ConfigMap. Only the controller may set the registry's nats backend config
+  // (#150), and only against the NATS in the workload's own runtime namespace.
   if (packageName === 'blobstore') {
-    if (hasName || secretFrom.length > 0 || configKeys.length > 0) return false;
+    if (hasName || secretFrom.length > 0) return false;
+    const interfaces = hostInterface.interfaces ?? [];
+    if (
+      !interfaces.every(
+        (iface) => iface === 'blobstore' || iface === 'container' || iface === 'types',
+      )
+    )
+      return false;
+    if (configKeys.length > 0) return registryBlobstoreAllowed(hostInterface, requester);
     if (
       !configFrom.every(
         (reference) =>
@@ -144,10 +175,7 @@ export function hostInterfaceAllowed(
       )
     )
       return false;
-    const interfaces = hostInterface.interfaces ?? [];
-    return interfaces.every(
-      (iface) => iface === 'blobstore' || iface === 'container' || iface === 'types',
-    );
+    return true;
   }
   if (packageName !== 'keyvalue' && packageName !== 'messaging') return false;
   if (!configFrom.every((reference) => isManagedConfigName(reference.name))) return false;
@@ -485,11 +513,18 @@ function hostInterfaceAdmissionExpression(): string {
       h.config.all(k, k in ['subscriptions', 'consumer_group', 'max_in_flight', 'admission_wait'])) &&
     (${defaultMessaging} || ${namedMessaging}))`;
 
+  // Controller-only (#150): the registry's nats backend against its own runtime namespace's NATS.
+  const registryNats = `(variables.controller && ${noConfigReferences} &&
+    object.metadata.namespace.startsWith('di-tenant-') &&
+    size(h.config) == 2 && has(h.config.backend) && has(h.config.url) &&
+    h.config.backend == 'nats' &&
+    h.config.url == 'nats://di-nats.di-runtime-' + object.metadata.namespace.substring(10) +
+      '.svc.cluster.local:4222')`;
   const blobstore = `(h['namespace'] == 'wasmcloud' && h['package'] == 'blobstore' &&
     ${unnamed} && ${noSecretReferences} &&
     (!has(h.configFrom) || size(h.configFrom) == 0 || h.configFrom.all(c, ${managedConfigName})) &&
-    (!has(h.config) || size(h.config) == 0) &&
-    (!has(h.interfaces) || h.interfaces.all(i, i in ['blobstore', 'container', 'types'])))`;
+    (!has(h.interfaces) || h.interfaces.all(i, i in ['blobstore', 'container', 'types'])) &&
+    (!has(h.config) || size(h.config) == 0 || ${registryNats}))`;
 
   const postgres = `(h['namespace'] == 'wasmcloud' && h['package'] == 'postgres' &&
     !${hasInlineConfig} && ${noConfigReferences} && has(h.interfaces) &&

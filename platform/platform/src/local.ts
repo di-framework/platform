@@ -131,6 +131,7 @@ const platform = createPlatform({
   routeUrlPattern: `http://{host}.{tenant}.localhost:${httpPort}`,
   registry: true,
   insecureRegistry: true,
+  kubeconfig: kubeconfigContents,
   apiServer: `https://127.0.0.1:${apiPort}`,
   beforeTenancy: (wasmcloud) => {
     const runtimeShutdown = new command.local.Command(

@@ -10,7 +10,17 @@ import {
   REGISTRY_WORKLOAD_NAME,
   reservedWorkloadDenial,
 } from '../src/tenancy/admission';
-import { GROUP, REGISTRY_WORKLOAD, type Resource } from '../src/tenancy/resources';
+import {
+  type ControllerConfig,
+  GROUP,
+  INSTALLATION,
+  REGISTRY_WORKLOAD,
+  type Resource,
+  type Tenant,
+  tenantAuthResources,
+  VERSION,
+} from '../src/tenancy/resources';
+import { caCertificate, leafCertificate } from '../src/tenancy/tls';
 
 const controllerUser = 'system:serviceaccount:wasmcloud:di-platform-controller';
 const tenantUser = 'system:serviceaccount:wasmcloud:di-user-dev';
@@ -40,7 +50,7 @@ function policy(name: string, registryHost?: string): Spec & { operations: strin
 }
 
 type Workload = {
-  metadata: { name: string; labels?: Record<string, string> };
+  metadata: { name: string; namespace?: string; labels?: Record<string, string> };
   spec: { template: { spec: { hostInterfaces?: HostInterfaceLike[] } } };
 };
 const workload = (
@@ -48,7 +58,7 @@ const workload = (
   labels?: Record<string, string>,
   hostInterfaces?: HostInterfaceLike[],
 ): Workload => ({
-  metadata: { name, ...(labels ? { labels } : {}) },
+  metadata: { name, namespace: 'di-tenant-alpha', ...(labels ? { labels } : {}) },
   spec: { template: { spec: hostInterfaces ? { hostInterfaces } : {} } },
 });
 const http = (host?: string): HostInterfaceLike => ({
@@ -204,6 +214,53 @@ describe('tenant registry reservation (#83 C1)', () => {
   }
 });
 
+/** The registry's hostInterfaces, exactly as the controller renders them (#150). */
+function renderedRegistryInterfaces(): HostInterfaceLike[] {
+  const tenant: Tenant = {
+    apiVersion: VERSION,
+    kind: 'Tenant',
+    metadata: {
+      name: 'alpha',
+      uid: 'alpha-uid',
+      generation: 1,
+      labels: { [INSTALLATION]: 'test' },
+    },
+    spec: {},
+  };
+  const cfg: ControllerConfig = {
+    installation: 'test',
+    namespace: 'wasmcloud',
+    hostImage: 'wash:test',
+    schedulerNatsUrl: 'nats://nats:4222',
+    insecureRegistry: true,
+    tenantAuth: {
+      image: `ghcr.io/di-framework/tenant-auth@sha256:${'a'.repeat(64)}`,
+      issuer: 'http://identity.alpha.localhost:28180',
+      oauthClient: { id: 'access', secretName: 'tenant-auth-oauth' },
+      issuerUpstream: 'di-platform-gateway.wasmcloud.svc.cluster.local:80',
+      issuerUpstreamPodPort: 8080,
+      consolePublicUrl: 'http://console.{tenant}.localhost:28180',
+      registry: {
+        component: `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}`,
+        publicUrl: 'https://registry.{tenant}.localhost:28180',
+      },
+    },
+  };
+  const ca = caCertificate('tenant-controller CA', 30);
+  const tls = {
+    ...leafCertificate('tenant-controller', ['tenant-controller'], [], 30, ca.cert, ca.key),
+    caCert: ca.cert,
+    caKey: ca.key,
+  };
+  const rendered = tenantAuthResources(tenant, cfg, {
+    members: ['alice'],
+    apiServer: { addresses: ['10.0.0.1'], port: 6443 },
+    tls,
+    clientSecret: 'c2VjcmV0',
+  }).find((r) => r.metadata.name === REGISTRY_WORKLOAD)!;
+  return (rendered.spec as Workload['spec']).template.spec.hostInterfaces!;
+}
+
 describe('wasmcloud:secrets bind-time config (#83 W1)', () => {
   const spec = policy('workloads');
   const rule = spec.validations.find((v) =>
@@ -225,8 +282,35 @@ describe('wasmcloud:secrets bind-time config (#83 W1)', () => {
     config: { 'tenant-controller-url': 'http://tenant-controller.di-runtime-alpha.svc:8789' },
     ...extra,
   });
-  const variants: [string, HostInterfaceLike[]][] = [
-    ['registry shape', [http('registry'), secrets()]],
+  const blobstoreNats = (config: Record<string, string> = {}): HostInterfaceLike => ({
+    namespace: 'wasmcloud',
+    package: 'blobstore',
+    interfaces: ['blobstore', 'container', 'types'],
+    config: {
+      backend: 'nats',
+      url: 'nats://di-nats.di-runtime-alpha.svc.cluster.local:4222',
+      ...config,
+    },
+  });
+  const variants: [string, HostInterfaceLike[], string?][] = [
+    ['registry shape', [http('registry'), blobstoreNats(), secrets()]],
+    ['rendered registry', renderedRegistryInterfaces()],
+    [
+      'nats tenant-agnostic url',
+      [blobstoreNats({ url: 'nats://di-nats.di-runtime-beta.svc.cluster.local:4222' })],
+    ],
+    ['nats other backend', [blobstoreNats({ backend: 'redis' })]],
+    [
+      'nats look-alike host',
+      [blobstoreNats({ url: 'nats://di-nats.di-runtime-alpha.svc.cluster.local:4222.evil' })],
+    ],
+    ['nats extra interface', [{ ...blobstoreNats(), interfaces: ['blobstore', 'evil'] }]],
+    ['nats other tenant namespace', [blobstoreNats()], 'di-tenant-beta'],
+    ['nats non-tenant namespace', [blobstoreNats()], 'default'],
+    ['nats extra key', [blobstoreNats({ extra: 'x' })]],
+    ['nats named', [{ ...blobstoreNats(), name: 'other' }]],
+    ['nats configFrom', [{ ...blobstoreNats(), configFrom: [{ name: 'di-bs-x' }] }]],
+    ['blobstore empty config', [{ ...blobstoreNats(), config: {} }]],
     ['bare', [secrets({ config: undefined, interfaces: undefined })]],
     ['named', [secrets({ name: 'other' })]],
     ['empty name', [secrets({ name: '' })]],
@@ -240,10 +324,15 @@ describe('wasmcloud:secrets bind-time config (#83 W1)', () => {
     let cases = 0;
     for (const username of users)
       for (const operation of ['CREATE', 'UPDATE'])
-        for (const [label, hostInterfaces] of variants) {
+        for (const [label, hostInterfaces, ns = 'di-tenant-alpha'] of variants) {
           const object = workload(REGISTRY_WORKLOAD, undefined, hostInterfaces);
+          object.metadata.namespace = ns;
           const expected = hostInterfaces.every((h) =>
-            hostInterfaceAllowed(h, { username, controllerNamespace: 'wasmcloud' }),
+            hostInterfaceAllowed(h, {
+              username,
+              controllerNamespace: 'wasmcloud',
+              workloadNamespace: ns,
+            }),
           );
           const actual = celAllowed(username, operation, object);
           if (actual !== expected)
@@ -271,6 +360,34 @@ describe('wasmcloud:secrets bind-time config (#83 W1)', () => {
       );
     // Without a requester the mirror is fail-closed.
     expect(hostInterfaceAllowed(secrets())).toBe(false);
+  });
+
+  it('admits the rendered registry blobstore for the controller only, and only exactly', () => {
+    const rendered = renderedRegistryInterfaces();
+    const blob = rendered.find((h) => h.package === 'blobstore')!;
+    expect(blob.config).toEqual({
+      backend: 'nats',
+      url: 'nats://di-nats.di-runtime-alpha.svc.cluster.local:4222',
+    });
+    const registry = workload(REGISTRY_WORKLOAD, undefined, rendered);
+    for (const operation of ['CREATE', 'UPDATE'])
+      expect(celAllowed(controllerUser, operation, registry)).toBe(true);
+    for (const username of [tenantUser, ...lookAlikes])
+      for (const operation of ['CREATE', 'UPDATE'])
+        expect(celAllowed(username, operation, registry)).toBe(false);
+    for (const config of [
+      { backend: 'nats', url: 'nats://evil.example:4222' },
+      { backend: 'nats', url: 'nats://di-nats.di-runtime-beta.svc.cluster.local:4222' },
+      { backend: 's3', url: 'nats://di-nats.di-runtime-alpha.svc.cluster.local:4222' },
+      { backend: 'nats' },
+    ])
+      expect(
+        celAllowed(controllerUser, 'CREATE', workload('x', undefined, [{ ...blob, config }])),
+      ).toBe(false);
+    // The mirror is fail-closed without a workload namespace.
+    expect(
+      hostInterfaceAllowed(blob, { username: controllerUser, controllerNamespace: 'wasmcloud' }),
+    ).toBe(false);
   });
 
   it('lets a tenant update that drops secrets through this rule, but not the reservation', () => {
