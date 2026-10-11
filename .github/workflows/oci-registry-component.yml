@@ -8,11 +8,17 @@ on:
     paths:
       - 'platform/oci-registry/**'
       - 'platform/wasm-component-publisher/**'
+      - 'platform/sqlite-component/scripts/**'
+      - 'package.json'
+      - 'bun.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - '.github/actions/setup-tenant-auth-builder/**'
       - '.github/workflows/oci-registry-component.yml'
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: publish-oci-registry-component
@@ -24,6 +30,9 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: read
     outputs:
       source-hash: ${{ steps.hash.outputs.source-hash }}
       skip: ${{ steps.check.outputs.skip }}
@@ -40,19 +49,29 @@ jobs:
           set -euo pipefail
           hash=$(git ls-tree -r HEAD -- \
             platform/oci-registry \
-            platform/wasm-component-publisher | sha256sum | cut -d' ' -f1)
+            platform/wasm-component-publisher \
+            platform/sqlite-component/scripts \
+            Cargo.toml \
+            Cargo.lock \
+            .cargo \
+            .github/actions/setup-tenant-auth-builder \
+            .github/workflows/oci-registry-component.yml | sha256sum | cut -d' ' -f1)
           echo "source-hash=${hash}" >> "${GITHUB_OUTPUT}"
           echo "Source hash: ${hash}"
+
+      - name: Set up oras
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
 
       - name: Check if already published
         id: check
         env:
+          SOURCE_HASH: ${{ steps.hash.outputs.source-hash }}
+          GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          hash="${{ steps.hash.outputs.source-hash }}"
-          tag="src-${hash}"
-          if echo "${GHCR_TOKEN}" | oras login ghcr.io --username "${{ github.actor }}" --password-stdin 2>&1; then
+          tag="src-${SOURCE_HASH}"
+          if echo "${GHCR_TOKEN}" | oras login ghcr.io --username "${GHCR_USERNAME}" --password-stdin 2>/dev/null; then
             if oras manifest fetch "ghcr.io/di-framework/oci-registry:${tag}" >/dev/null 2>&1; then
               echo "Source hash tag already exists: ${tag}"
               echo "skip=true" >> "${GITHUB_OUTPUT}"
@@ -60,14 +79,20 @@ jobs:
               echo "skip=false" >> "${GITHUB_OUTPUT}"
             fi
           else
-            echo "Could not login to GHCR, will proceed with build"
+            echo "Could not authenticate to GHCR, will proceed with build"
             echo "skip=false" >> "${GITHUB_OUTPUT}"
           fi
 
   publish:
     name: Push ghcr.io/di-framework/oci-registry
     needs: check-source
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || needs.check-source.outputs.skip != 'true')
+    if: >-
+      ${{ github.ref == 'refs/heads/main' && !cancelled() &&
+      (needs.check-source.result == 'skipped' ||
+      (needs.check-source.result == 'success' && needs.check-source.outputs.skip != 'true')) }}
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -136,27 +161,18 @@ jobs:
             echo 'The component was pulled by digest and verified against the local build.'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install oras
-        if: github.event_name == 'push'
-        run: |
-          set -euo pipefail
-          version=1.3.4
-          sha256=f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454
-          curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/oras.tar.gz "https://github.com/oras-project/oras/releases/download/v${version}/oras_${version}_linux_amd64.tar.gz"
-          echo "${sha256}  /tmp/oras.tar.gz" | sha256sum -c -
-          sudo tar -xzf /tmp/oras.tar.gz -C /usr/local/bin oras
-
       - name: Tag with source hash
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && needs.check-source.outputs.source-hash
         env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_HASH: ${{ needs.check-source.outputs.source-hash }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
           set -euo pipefail
-          echo "${GHCR_TOKEN}" | oras login ghcr.io --username "${{ github.actor }}" --password-stdin
-          digest="${{ steps.digest.outputs.digest }}"
+          echo "${GHCR_TOKEN}" | oras login ghcr.io --username "${GHCR_USERNAME}" --password-stdin
           tag="src-${SOURCE_HASH}"
-          oras tag "ghcr.io/di-framework/oci-registry@${digest}" "${tag}"
+          oras tag "ghcr.io/di-framework/oci-registry@${DIGEST}" "${tag}"
           echo "Tagged with: ${tag}"
 
       - name: Upload publish report

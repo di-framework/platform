@@ -12,11 +12,15 @@ on:
       - 'platform/pglite-component/wit/**'
       - 'platform/pglite-component/engine/**'
       - 'platform/pglite-component/build-support/**'
+      - 'platform/pglite-component/scripts/**'
       - 'platform/pglite-component/Makefile'
       - 'platform/pglite-component/Cargo.toml'
       - 'platform/pglite-component/Cargo.lock'
       - 'platform/pglite-component/rust-toolchain.toml'
       - 'platform/wasm-component-publisher/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
       - '.github/workflows/pglite-component-publish.yml'
 
 permissions:
@@ -32,6 +36,9 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: read
     outputs:
       source-hash: ${{ steps.hash.outputs.source-hash }}
       skip: ${{ steps.check.outputs.skip }}
@@ -51,23 +58,32 @@ jobs:
             platform/pglite-component/wit \
             platform/pglite-component/engine \
             platform/pglite-component/build-support \
+            platform/pglite-component/scripts \
             platform/pglite-component/Makefile \
             platform/pglite-component/Cargo.toml \
             platform/pglite-component/Cargo.lock \
             platform/pglite-component/rust-toolchain.toml \
-            platform/wasm-component-publisher | sha256sum | cut -d' ' -f1)
+            platform/wasm-component-publisher \
+            Cargo.toml \
+            Cargo.lock \
+            .cargo \
+            .github/workflows/pglite-component-publish.yml | sha256sum | cut -d' ' -f1)
           echo "source-hash=${hash}" >> "${GITHUB_OUTPUT}"
           echo "Source hash: ${hash}"
+
+      - name: Set up oras
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
 
       - name: Check if already published
         id: check
         env:
+          SOURCE_HASH: ${{ steps.hash.outputs.source-hash }}
+          GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          hash="${{ steps.hash.outputs.source-hash }}"
-          tag="src-${hash}"
-          if echo "${GHCR_TOKEN}" | oras login ghcr.io --username "${{ github.actor }}" --password-stdin 2>&1; then
+          tag="src-${SOURCE_HASH}"
+          if echo "${GHCR_TOKEN}" | oras login ghcr.io --username "${GHCR_USERNAME}" --password-stdin 2>/dev/null; then
             if oras manifest fetch "ghcr.io/di-framework/pglite-component:${tag}" >/dev/null 2>&1; then
               echo "Source hash tag already exists: ${tag}"
               echo "skip=true" >> "${GITHUB_OUTPUT}"
@@ -75,14 +91,17 @@ jobs:
               echo "skip=false" >> "${GITHUB_OUTPUT}"
             fi
           else
-            echo "Could not login to GHCR, will proceed with build"
+            echo "Could not authenticate to GHCR, will proceed with build"
             echo "skip=false" >> "${GITHUB_OUTPUT}"
           fi
 
   build:
     name: Build and test pglite component
     needs: check-source
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || needs.check-source.outputs.skip != 'true')
+    if: >-
+      ${{ github.ref == 'refs/heads/main' && !cancelled() &&
+      (needs.check-source.result == 'skipped' ||
+      (needs.check-source.result == 'success' && needs.check-source.outputs.skip != 'true')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     outputs:
@@ -164,7 +183,9 @@ jobs:
   publish:
     name: Push ghcr.io/di-framework/pglite-component
     needs: [check-source, build]
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      ${{ github.ref == 'refs/heads/main' && !cancelled() &&
+      needs.build.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -254,14 +275,15 @@ jobs:
       - name: Tag with source hash
         if: github.event_name == 'push' && needs.check-source.outputs.source-hash
         env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_HASH: ${{ needs.check-source.outputs.source-hash }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
           set -euo pipefail
-          echo "${GHCR_TOKEN}" | oras login ghcr.io --username "${{ github.actor }}" --password-stdin
-          digest="${{ steps.digest.outputs.digest }}"
+          echo "${GHCR_TOKEN}" | oras login ghcr.io --username "${GHCR_USERNAME}" --password-stdin
           tag="src-${SOURCE_HASH}"
-          oras tag "ghcr.io/di-framework/pglite-component@${digest}" "${tag}"
+          oras tag "ghcr.io/di-framework/pglite-component@${DIGEST}" "${tag}"
           echo "Tagged with: ${tag}"
 
       - name: Upload publish report

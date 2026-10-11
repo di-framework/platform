@@ -70,14 +70,27 @@ describe('pglite-component package', () => {
     expect(legacy).toEqual([]);
   });
 
-  test('the publish workflow is dispatch-only and gates on main branch', () => {
+  test('the publish workflow triggers on dispatch and push with skip-if-published', () => {
     const repo = join(pkgDir, '..', '..');
     const workflow = readFileSync(
       join(repo, '.github/workflows/pglite-component-publish.yml'),
       'utf8',
     );
-    expect(workflow).toMatch(/on:\s+workflow_dispatch:/);
-    expect(workflow).toContain("if: github.ref == 'refs/heads/main'");
+    // Both triggers present
+    expect(workflow).toContain('workflow_dispatch:');
+    expect(workflow).toContain('push:');
+    expect(workflow).toContain('branches: [main]');
+    // Check-source job for skip-if-published
+    expect(workflow).toContain('check-source:');
+    expect(workflow).toContain('if: github.event_name == \'push\'');
+    expect(workflow).toContain('git ls-tree -r HEAD');
+    expect(workflow).toContain('oras manifest fetch');
+    expect(workflow).toContain('src-');
+    // Build and publish gates
+    expect(workflow).toContain("github.ref == 'refs/heads/main'");
+    expect(workflow).toContain("!cancelled()");
+    expect(workflow).toContain('needs.check-source.result');
+    // Main workflow features
     expect(workflow).toContain('ghcr.io/di-framework/pglite-component');
     expect(workflow).toContain('make -C platform/pglite-component tools-rust');
     expect(workflow).toContain('make -C platform/pglite-component unit smoke');
