@@ -9,7 +9,7 @@ export function selfSignedCert(): { key: string; cert: string; keyPath: string; 
   const keyPath = join(dir, 'key.pem');
   const certPath = join(dir, 'cert.pem');
   execFileSync(
-    'openssl',
+    '/usr/bin/openssl',
     [
       'req',
       '-x509',

@@ -81,7 +81,7 @@ export async function waitForTokenSecret(options: TokenWaitOptions): Promise<voi
 
   for (let attempt = 0; ; attempt++) {
     try {
-      const data = await readWithTimeout(options, requestTimeoutMs);
+      const data = await readWithTimeout(options, requestTimeoutMs); // NOSONAR: sequential polling
       if (data?.token) return;
       last = 'Secret exists without data.token';
     } catch (error) {
@@ -89,7 +89,7 @@ export async function waitForTokenSecret(options: TokenWaitOptions): Promise<voi
     }
     const remaining = deadline - now();
     if (remaining <= 0) break;
-    await sleep(Math.min(tokenWaitDelayMs(attempt), remaining));
+    await sleep(Math.min(tokenWaitDelayMs(attempt), remaining)); // NOSONAR: polls are sequential by design
   }
 
   throw new Error(
