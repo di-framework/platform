@@ -25,9 +25,11 @@ interface types {
     open-failed(string),
     /// The connection has been closed with `close` and cannot be used again.
     closed,
-    /// The statement could not be prepared or executed: syntax error, unknown
-    /// table or column. Only single statements are accepted by `run`/`query`/`first`
-    /// (unlike `exec`, which allows `;`-separated batches like the SQLite provider).
+    /// The SQL was rejected before execution. Causes: a syntax error (42601),
+    /// an undeterminable parameter type (42P18), a bad savepoint name, a NUL
+    /// byte in the SQL, or more than one statement passed to `run`/`query`/
+    /// `first` (the server reports that as a syntax error; unlike `exec`,
+    /// which allows `;`-separated batches like the SQLite provider).
     invalid-sql(string),
     /// Wrong number of parameters or a value that could not be bound.
     /// Parameters bind positionally to `$1`, `$2`, ... (not `?`/`?NNN`).

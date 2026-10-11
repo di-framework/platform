@@ -185,9 +185,12 @@ fn server_error(body: &[u8]) -> Error {
             message = text;
         }
     }
-    // Syntax and access problems are a client bug; everything else is a
-    // failed execution on an otherwise healthy connection.
-    if code.starts_with("42") {
+    // Only 42601 (syntax error) and 42P18 (un-inferable parameter type) are
+    // invalid-sql; every other class-42 code (42501, 42P01, 42703, ...) is an
+    // execution-failed carrying its SQLSTATE.
+    if code == "42601" || code == "42P18" {
+        // 42601: syntax_error
+        // 42P18: indeterminate_datatype (parameter needs a cast)
         Error::InvalidSql(message)
     } else if code.starts_with("25") || code.starts_with("3B") {
         Error::InvalidTransactionState(message)
@@ -737,13 +740,31 @@ mod tests {
 
     #[test]
     fn error_mapping_by_sqlstate() {
+        // 42601 (syntax_error) and 42P18 (indeterminate_datatype) map to invalid-sql
         assert!(matches!(
             server_error(&error_body("42601", "syntax error")),
             Error::InvalidSql(_)
         ));
+        assert!(matches!(
+            server_error(&error_body("42P18", "could not determine data type")),
+            Error::InvalidSql(_)
+        ));
+        // Other 42xxx codes map to execution-failed with the code preserved
+        match server_error(&error_body("42P01", "relation does not exist")) {
+            Error::ExecutionFailed(pg) => assert_eq!(pg.code, "42P01"),
+            other => panic!("expected execution-failed for 42P01, got {other:?}"),
+        }
+        match server_error(&error_body("42703", "column does not exist")) {
+            Error::ExecutionFailed(pg) => assert_eq!(pg.code, "42703"),
+            other => panic!("expected execution-failed for 42703, got {other:?}"),
+        }
+        match server_error(&error_body("42501", "permission denied")) {
+            Error::ExecutionFailed(pg) => assert_eq!(pg.code, "42501"),
+            other => panic!("expected execution-failed for 42501, got {other:?}"),
+        }
         match server_error(&error_body("23505", "duplicate key")) {
             Error::ExecutionFailed(pg) => assert_eq!(pg.code, "23505"),
-            other => panic!("expected execution-failed, got {other:?}"),
+            other => panic!("expected execution-failed for 23505, got {other:?}"),
         }
     }
 
