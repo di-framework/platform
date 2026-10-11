@@ -209,6 +209,13 @@ fn main() {
         db.query("SELECT $1::bigint", &[]),
         Err(Error::InvalidParams(_))
     ));
+    // Class-42 errors other than syntax and indeterminate type should produce execution-failed
+    assert!(
+        matches!(db.query("SELECT * FROM missing_table", &[]), Err(Error::ExecutionFailed(e)) if e.code == "42P01")
+    );
+    assert!(
+        matches!(db.query("SELECT nonexistent_column FROM tasks", &[]), Err(Error::ExecutionFailed(e)) if e.code == "42703")
+    );
     assert!(db.first("SELECT 42::bigint AS n", &[]).unwrap().is_some());
 
     // Full PostgreSQL unwinding also applies inside procedural exception blocks.
