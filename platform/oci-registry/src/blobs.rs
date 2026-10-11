@@ -2,7 +2,9 @@
 //! with digest verification, and cross-repository mount.
 
 use crate::bindings;
-use crate::http::{error_response, method_not_allowed, respond, respond_owned, stream_response};
+use crate::http::{
+    entity_headers, error_response, method_not_allowed, respond, respond_owned, stream_response,
+};
 use crate::keys::blob_key;
 use crate::storage::{
     blob_err, copy_object, delete_object, has_object, object_size, open_object_stream,
@@ -25,22 +27,15 @@ pub(crate) async fn handle_blob(
                 return Ok(error_response(404, "BLOB_UNKNOWN", "blob unknown"));
             }
             let size = object_size(container, &key).await?;
-            let headers = vec![
-                (
-                    "content-type".to_string(),
-                    "application/octet-stream".to_string(),
-                ),
-                ("docker-content-digest".to_string(), digest.to_string()),
-                ("content-length".to_string(), size.to_string()),
-            ];
-            if matches!(method, Method::Head) {
-                // HEAD carries no body, so Content-Length is omitted (a declared
-                // length with an empty body is rejected by the runtime).
-                return Ok(respond_owned(
-                    200,
-                    headers.into_iter().take(2).collect(),
-                    Vec::new(),
-                ));
+            let head = matches!(method, Method::Head);
+            let headers = entity_headers(
+                head,
+                "application/octet-stream".to_string(),
+                digest.to_string(),
+                size as usize,
+            );
+            if head {
+                return Ok(respond_owned(200, headers, Vec::new()));
             }
             // Stream the blob straight from the blobstore into the HTTP response
             // body: the reader returned by `get-data` is handed to the response

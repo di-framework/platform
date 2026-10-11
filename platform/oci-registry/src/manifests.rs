@@ -1,6 +1,6 @@
 //! Manifest push/pull/delete and the `subject`/referrer metadata extracted on push.
 
-use crate::http::{error_response, method_not_allowed, respond, respond_owned};
+use crate::http::{entity_headers, error_response, method_not_allowed, respond, respond_owned};
 use crate::keys::{manifest_key, media_type_key, referrer_key, tag_key};
 use crate::storage::{delete_object, has_object, read_object, write_object};
 use crate::util::{is_digest, sha256_digest};
@@ -79,25 +79,12 @@ pub(crate) async fn handle_manifest(
                 .and_then(|b| String::from_utf8(b).ok())
                 .unwrap_or_else(|| DEFAULT_MANIFEST_MEDIA_TYPE.to_string());
 
-            if matches!(method, Method::Head) {
-                return Ok(respond_owned(
-                    200,
-                    vec![
-                        ("content-type".to_string(), media_type),
-                        ("docker-content-digest".to_string(), digest),
-                    ],
-                    Vec::new(),
-                ));
-            }
-            let len = data.len().to_string();
+            let head = matches!(method, Method::Head);
+            let headers = entity_headers(head, media_type, digest, data.len());
             Ok(respond_owned(
                 200,
-                vec![
-                    ("content-type".to_string(), media_type),
-                    ("docker-content-digest".to_string(), digest),
-                    ("content-length".to_string(), len),
-                ],
-                data,
+                headers,
+                if head { Vec::new() } else { data },
             ))
         }
         Method::Delete => {
