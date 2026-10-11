@@ -226,7 +226,7 @@ impl GuestConnection for DbConn {
 
     fn in_transaction(&self) -> bool {
         // WIT returns `bool`, so a busy borrow cannot surface as an error
-        // without breaking the `di-framework:pglite@0.1.0` API. Borrows are
+        // without breaking the `di-framework:pglite@0.2.0` API. Borrows are
         // method-local and WASM is single-threaded, so contention is
         // unreachable in practice (it would require re-entrant WIT calls).
         // Fail closed: report `true` when busy to block a nested `begin`.

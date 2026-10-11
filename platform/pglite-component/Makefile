@@ -1,4 +1,4 @@
-# di-framework:pglite@0.1.0 component
+# di-framework:pglite@0.2.0 component
 #
 #   make tools          install pinned wasm-tools + wac into .tools/ (checksum-verified)
 #   make tools-rust     ...plus a hermetic rustup + Rust 1.97.1 + wasm32-wasip2 (if you lack rustup)
@@ -6,6 +6,7 @@
 #   make debug          debug build
 #   make smoke          build tests/smoke-consumer, `wac plug` it with the provider,
 #                       run under wasmtime with persistent storage and no networking
+#   make unit           cargo test --lib (host unit tests)
 #   make wit            print the WIT recovered from the built component
 #   make check          cargo check for the wasm target
 #   make compose APP=path/to/app.wasm OUT=path/to/composed.wasm
@@ -27,7 +28,7 @@ export DF_PGLITE_TOOLS_DIR := $(TOOLS_DIR)
 
 PLUGIN_ASSET_DIR ?= $(PKG_DIR)/dist
 
-.PHONY: tools tools-rust build debug smoke wit check compose publish-asset versions clean distclean
+.PHONY: tools tools-rust build debug smoke unit wit check compose publish-asset versions clean distclean
 
 tools:
 	bun scripts/install-tools.ts
@@ -43,6 +44,9 @@ debug:
 
 smoke: build
 	bun scripts/smoke.ts
+
+unit:
+	bun scripts/unit.ts
 
 wit:
 	bun scripts/wit.ts

@@ -48,11 +48,11 @@ uncommitted row is absent after restart. No scripted database server is used.
 
 ## Use from an application
 
-The application imports `di-framework:pglite/database@0.1.0`. For a JavaScript
+The application imports `di-framework:pglite/database@0.2.0`. For a JavaScript
 component built with the framework's component toolchain:
 
 ```ts
-import { open } from 'di-framework:pglite/database@0.1.0';
+import { open } from 'di-framework:pglite/database@0.2.0';
 
 const db = open('/data/orders', undefined);
 try {
@@ -84,13 +84,63 @@ standardized WebAssembly exception handling for PostgreSQL error recovery.
 
 The public interface retains `exec`, `run`, `query`, `first`, transactions,
 savepoints, `rows-affected`, `close`, and `server-version`. PostgreSQL parameters
-use `$1`, `$2`, etc. `server-version()` reports the bundled engine without
+use `$1`, `$2`, etc. Text parameters are sent with OID 0 (unknown type), allowing
+PostgreSQL to infer the type from context; comparisons against `uuid`, `timestamptz`,
+and `jsonb` columns work correctly (see Typed values). `server-version()` reports the bundled engine without
 opening a database. Only the `template1` database is currently supported;
 other `open-options.database` values are rejected. Requests must fit the engine's
 input buffer; each serialized result is limited to 64 MiB and stays in memory.
 Larger results return a PostgreSQL program-limit error. Signal-based statement
 timeouts are unavailable in this WASI engine: nonzero `statement-timeout-ms`
 options fail explicitly. Use host execution limits for runaway queries.
+
+## Typed values (0.2.0+)
+
+Every `open` pins `DateStyle=ISO` and `TimeZone=UTC` (set in the startup packet and re-applied
+on each open, since `close` runs `DISCARD ALL`), so text output is deterministic. Result mapping by
+PostgreSQL type:
+
+| PostgreSQL type | `value` variant | Format |
+| --- | --- | --- |
+| `bool` | `boolean` | |
+| `int2`, `int4`, `int8` | `integer` | `int8` is `integer` (`s64`); node-pg returns a string |
+| `float4`, `float8` | `real` | |
+| `bytea` | `blob` | |
+| `json`, `jsonb` | `json` | JSON text; `jsonb` is re-rendered by PostgreSQL (`{"a": 1}`) |
+| `timestamptz` | `timestamp` | RFC 3339 in UTC, e.g. `2024-01-15T10:30:00Z`, fractional seconds kept (`...:00.123Z`). `infinity` and `-infinity` are returned as those literals; BC dates are returned unmodified (`0044-03-15 00:00:00+00 BC`) |
+| `timestamp` (no zone) | `text` | `2024-01-15 10:30:00` (ISO, space separator, no offset). Deliberately not `timestamp`, which always denotes an instant |
+| `date` | `text` | `2024-01-15` |
+| `uuid`, `numeric` | `text` | canonical PostgreSQL text (`12.50` keeps its scale) |
+| arrays | `text` | PostgreSQL array literal, e.g. `{a,b}` |
+| everything else | `text` | |
+
+Parameters are typed as follows. `integer`, `real`, `boolean` and `blob` are
+sent as `int8`, `float8`, `bool` and `bytea`. `text`, `json` and `timestamp`
+are all sent with OID 0 (unknown), so PostgreSQL infers the type from context:
+a `json` parameter works against `json` and `jsonb` columns and with `jsonb`
+operators (`@>`, `=`), and a `timestamp` parameter against `timestamptz` and
+`timestamp` columns. Send RFC 3339 for `timestamp`; any string PostgreSQL
+accepts for the inferred type works.
+
+Column type OIDs are not exposed: adding them to `row` would change its shape
+and break every existing consumer, and the variants above plus Text for the
+rest cover the adapters' needs. A separate additive API can be added later.
+
+### Migrating from 0.1.0
+
+Bump consumers and composition pins to `di-framework:pglite/database@0.2.0`
+(the `value` variant gained cases, so 0.1.0 bindings do not link). Text
+parameters were previously sent as `text` (OID 25); they are now OID 0. That
+fixes `uuid = $1`, `timestamptz < $1` and `jsonb @> $1`, but PostgreSQL can no
+longer type a parameter that has no context: `SELECT $1 IS NULL` now fails with
+`could not determine data type of parameter $1`. Add a cast, for example
+`SELECT $1::text IS NULL`.
+
+Error handling surfaces SQLSTATE codes through `error.code`, enabling
+machine-readable handling of constraint violations and other conditions:
+- `"23505"` = unique violation
+- `"22012"` = division by zero
+- `"54000"` = result too large
 
 ## Persistence and ownership
 
