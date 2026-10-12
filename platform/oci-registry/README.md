@@ -21,6 +21,9 @@ artifact directory, and reported in-cluster registry respectively.
 `DI_OCI_PROTOCOL=https|http|auto` defaults to `auto` (HTTP for local/private
 addresses, HTTPS otherwise). Credentials use `DI_OCI_USERNAME`/`DI_OCI_PASSWORD`,
 then `GHCR_USERNAME`/`GHCR_TOKEN`, then `GITHUB_ACTOR`/`GITHUB_TOKEN`.
+The publisher hands them to `wash` and `oras` only through a temporary
+`DOCKER_CONFIG` and removes the password and token variables from the tools'
+environment. Tool output in errors has those secrets masked.
 
 Cargo's `build.rs` only tracks compile-time inputs. Publication requires an
 explicit executable run with `PUSH=true`. The publish workflow
@@ -203,6 +206,32 @@ bot PR (`bot/pin-oci-registry`, `chore: pin oci-registry to <digest>`) updates t
 digest below and in `platform/platform/README.md`; GitHub does not run workflows
 on a PR that `GITHUB_TOKEN` opened, so a maintainer has to start its checks
 (close and reopen it) before merging.
+
+#### One-time setup: give this repository write access to the package
+
+The workflow pushes with the job's `GITHUB_TOKEN`. A GHCR package that this
+repository's Actions created belongs to the repository, so the token can write
+to it. `ghcr.io/di-framework/oci-registry` was created before the workflow
+existed, by a manual push with personal credentials. Its only tag is
+`sha256-65cd22367040`, which is the publisher's default when `DI_OCI_TAG` is
+unset. That makes it very likely the package is not linked to
+`di-framework/platform` and the token cannot push to it. Every automatic publish
+so far has failed at `wash oci push`. pglite-component and tenant-auth were
+first pushed by Actions, and their pushes succeed with the same token.
+
+An organization owner (or a package admin) fixes this once:
+
+1. Open the package settings at
+   `https://github.com/orgs/di-framework/packages/container/oci-registry/settings`.
+2. Under **Manage Actions access**, choose **Add Repository**, select
+   `di-framework/platform`, and set its role to **Write**.
+3. Optional: under **Inherited access** (or **Connect repository** on the
+   package page), link the package to `di-framework/platform`, so it inherits
+   the repository's permissions.
+
+Then re-run the failed workflow, or dispatch it from `main`. A token that
+lacks access shows up in the publisher error as the registry's denial on
+`stdout` or `stderr`, for example `denied` or `permission_denied`.
 
 Pin deployments by digest, never by tag. Latest published:
 
