@@ -51,6 +51,8 @@ jobs:
     outputs:
       source-hash: ${{ steps.check.outputs.hash }}
       skip: ${{ steps.check.outputs.skip }}
+      stale: ${{ steps.check.outputs.stale }}
+      digest: ${{ steps.check.outputs.digest }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -287,10 +289,67 @@ jobs:
           path: platform/pglite-component/dist/publish-report.json
           if-no-files-found: error
 
+  # A revert to an already-published source skips the build; point the moving version tag back at
+  # that source's digest. scripts/retag.sh leaves a tag that already points there alone, and the
+  # guard stops a run whose inputs main has since changed.
+  realign:
+    name: Point the version tag at the published source
+    needs: check-source
+    if: ${{ !cancelled() && needs.check-source.result == 'success' && needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Stop if main has newer inputs
+        id: guard
+        uses: ./.github/actions/source-guard
+        with:
+          workflow: .github/workflows/pglite-component-publish.yml
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up ORAS
+        if: steps.guard.outputs.stale != 'true'
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
+        with:
+          version: '1.3.4'
+
+      - name: Retag
+        if: steps.guard.outputs.stale != 'true'
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ghcr.io/di-framework/pglite-component
+          DIGEST: ${{ needs.check-source.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # The version tag the publisher moves: the WIT package version (build-support/build.rs).
+          TAGS="$(sed -n 's/^package di-framework:pglite@\(.*\);$/\1/p' platform/pglite-component/wit/world.wit)"
+          if [[ -z "${TAGS}" ]]; then
+            echo '::error::no WIT package version in platform/pglite-component/wit/world.wit'
+            exit 1
+          fi
+          export TAGS
+          printf '%s' "${GHCR_TOKEN}" | oras login ghcr.io --username "${GHCR_USERNAME}" --password-stdin
+          bash scripts/retag.sh
+
   pin:
     name: Open pin PR
-    needs: publish
-    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.publish.outputs.digest != '' && github.ref == 'refs/heads/main' }}
+    # After a publish, or when this push's source was already published (a revert to an older
+    # source, or a pin PR closed unmerged): then check-source's digest is pinned again.
+    # pin-artifact.ts finds nothing to change when main already has it, so that is a no-op.
+    needs: [check-source, publish, realign]
+    if: >-
+      ${{ !cancelled() && github.ref == 'refs/heads/main' &&
+      ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') ||
+      (needs.check-source.result == 'success' && needs.check-source.outputs.skip == 'true' &&
+      needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -305,5 +364,5 @@ jobs:
         with:
           name: pglite-component
           workflow: .github/workflows/pglite-component-publish.yml
-          pins: pglite-component ${{ needs.publish.outputs.digest }}
+          pins: pglite-component ${{ needs.publish.outputs.digest || needs.check-source.outputs.digest }}
           token: ${{ secrets.GITHUB_TOKEN }}

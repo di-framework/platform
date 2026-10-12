@@ -205,9 +205,26 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
           RUNNER_TEMP: base,
         },
       });
+    /** Pin `artifact` to `digest` on main itself, as a merged pin PR would. */
+    const pinOnMain = (artifact: string, digest: string) => {
+      pinArtifact(work, artifact, digest);
+      git(work, 'commit', '-q', '-am', `pin ${artifact}`);
+      git(work, 'push', '-q', origin, 'HEAD:main');
+    };
+    const ghCalls = () => {
+      try {
+        return readFileSync(join(base, 'gh.log'), 'utf8').trim().split('\n').filter(Boolean);
+      } catch {
+        return [];
+      }
+    };
     return {
       base,
       run,
+      pinOnMain,
+      ghCalls,
+      /** A fresh checkout of the run's commit, as the next workflow run gets. */
+      fresh: () => git(work, 'checkout', '-q', '-f', '--detach', first),
       branches: () => git(base, '--git-dir', origin, 'branch', '--list'),
       log: (ref: string) => git(base, '--git-dir', origin, 'log', '--format=%s', ref),
       files: (ref: string) =>
@@ -259,6 +276,34 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
     const result = box.run(`wash-wasi-tls ${DIGEST}`, 'workflow_dispatch');
     expect(result.exitCode, result.stderr.toString()).toBe(0);
     expect(box.branches()).toContain('bot/pin-wash');
+  });
+
+  test('main already pinned to the digest: no branch, no PR (an ordinary push stays quiet)', () => {
+    const box = sandbox();
+    box.pinOnMain('pglite-component', DIGEST);
+    const result = box.run(`pglite-component ${DIGEST}`);
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(result.stdout.toString()).toContain('Already pinned');
+    expect(box.branches()).not.toContain('bot/pin-wash');
+    expect(box.ghCalls()).toEqual([]);
+  });
+
+  test('a revert re-pins the older digest over the one main has (#173 W1)', () => {
+    const box = sandbox();
+    box.pinOnMain('pglite-component', OTHER);
+    const result = box.run(`pglite-component ${DIGEST}`);
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(box.log('bot/pin-wash').split('\n')[0]).toBe(`chore: pin pglite-component to ${DIGEST}`);
+  });
+
+  test('a pin PR closed unmerged is recreated by the next run', () => {
+    const box = sandbox();
+    expect(box.run(`pglite-component ${DIGEST}`).exitCode).toBe(0);
+    box.fresh();
+    // The stub reports no open PR, as after the first one was closed without merging.
+    const result = box.run(`pglite-component ${DIGEST}`);
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(box.ghCalls().filter((c) => c.startsWith('pr create'))).toHaveLength(2);
   });
 
   test('an empty pin list is a no-op, and a bad digest fails before any push', () => {

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
   classifyFetch,
@@ -330,4 +331,98 @@ test('--github-output appends the outputs to $GITHUB_OUTPUT', () => {
   expect(readFileSync(file, 'utf8')).toMatch(
     /^hash=[0-9a-f]{64}\ntag=src-[0-9a-f]{64}\nstale=false\nskip=false\ndigest=\n$/,
   );
+});
+
+describe('a revert to an already-published source (#173 W1)', () => {
+  /** Commits A, B (an input change) and a revert to A, all on main; the clone is at the revert. */
+  function revert() {
+    const { base, origin, work } = sandboxClone('revert-');
+    writeFileSync(join(work, 'w.yml'), "on:\n  push:\n    paths:\n      - 'src/**'\n");
+    mkdirSync(join(work, 'src'));
+    writeFileSync(join(work, 'src/a'), 'A\n');
+    git(work, 'add', '.');
+    git(work, 'commit', '-q', '-m', 'A');
+    const a = git(work, 'rev-parse', 'HEAD');
+    writeFileSync(join(work, 'src/a'), 'B\n');
+    git(work, 'commit', '-q', '-am', 'B');
+    git(work, 'revert', '--no-edit', 'HEAD');
+    git(work, 'push', '-q', origin, 'HEAD:main');
+    return { base, work, a };
+  }
+
+  test('the revert hashes to A, so check-source finds A published: skip, not stale, with its digest', () => {
+    const { base, work, a } = revert();
+    const hashOf = (rev: string) => {
+      git(work, 'checkout', '-q', '--detach', rev);
+      const out = cli(work, process.env.PATH ?? '', '--force').stdout.toString();
+      git(work, 'checkout', '-q', '-');
+      return out.match(/^hash=(\w+)$/m)?.[1];
+    };
+    const hashA = hashOf(a);
+    expect(hashA).toBeDefined();
+    const digestA = `sha256:${'a'.repeat(64)}`;
+    // oras knows only A's src tag.
+    const path = stubOras(
+      base,
+      `case "$4" in *:src-${hashA}) echo '{"digest":"${digestA}"}' ;; *) echo "Error: $4: not found" >&2; exit 1 ;; esac`,
+    );
+    const result = cli(work, path, '--stale-guard');
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    const out = result.stdout.toString();
+    expect(out).toContain(`hash=${hashA}`);
+    expect(out).toContain('stale=false');
+    expect(out).toContain('skip=true');
+    expect(out).toContain(`digest=${digestA}`);
+  });
+});
+
+describe('scripts/retag.sh', () => {
+  const A = `sha256:${'a'.repeat(64)}`;
+  const B = `sha256:${'b'.repeat(64)}`;
+
+  /** A stub oras whose moving tag currently points at `current` ('' = no such tag). */
+  function retag(current: string, digest = A, tags = '0.2.0') {
+    const base = mkdtempSync(join(tmpdir(), 'retag-'));
+    const log = join(base, 'oras.log');
+    writeFileSync(log, '');
+    const path = stubOras(
+      base,
+      [
+        `echo "$*" >> "${log}"`,
+        'if [ "$1 $2" = "manifest fetch" ]; then',
+        current ? `  echo '{"digest":"${current}"}'` : '  echo "Error: not found" >&2; exit 1',
+        'fi',
+      ].join('\n'),
+    );
+    const result = Bun.spawnSync(['bash', join(repo, 'scripts/retag.sh')], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { ...env, PATH: path, IMAGE: 'ghcr.io/x/y', DIGEST: digest, TAGS: tags },
+    });
+    return { result, calls: readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) };
+  }
+
+  test('a moving tag on another build goes back to the published digest', () => {
+    const { result, calls } = retag(B);
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(calls).toContain(`tag ghcr.io/x/y@${A} 0.2.0`);
+    expect(result.stdout.toString()).toContain(`moved ghcr.io/x/y:0.2.0 from ${B} to ${A}`);
+  });
+
+  test('a tag that already points at the digest is left alone (no churn)', () => {
+    const { result, calls } = retag(A);
+    expect(result.exitCode).toBe(0);
+    expect(calls.filter((c) => c.startsWith('tag '))).toEqual([]);
+    expect(result.stdout.toString()).toContain('already points at');
+  });
+
+  test('a missing tag is created; bad input is refused before any tag moves', () => {
+    expect(retag('').calls).toContain(`tag ghcr.io/x/y@${A} 0.2.0`);
+    const bad = retag(B, 'sha256:nope');
+    expect(bad.result.exitCode).not.toBe(0);
+    expect(bad.calls).toEqual([]);
+    const badTag = retag(B, A, '../x');
+    expect(badTag.result.exitCode).not.toBe(0);
+    expect(badTag.calls.filter((c) => c.startsWith('tag '))).toEqual([]);
+  });
 });

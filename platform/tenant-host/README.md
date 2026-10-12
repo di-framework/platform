@@ -303,13 +303,18 @@ authenticate with the workflow `GITHUB_TOKEN` (`packages: write`). After a publi
 (`contents: write`, `pull-requests: write`, `packages: read`) opens or updates one PR, `bot/pin-wash`. It reads each
 variant's digest from its `src-<hash>` tag for the current source and updates every published
 variant's row in the table below with `scripts/pin-artifact.ts`, so a run that built only one
-variant never drops the other's pending pin.
+variant never drops the other's pending pin. The pin job also runs when a push publishes nothing
+because its source is already published, for example after a revert to an older source, or after
+a pin PR was closed unmerged: it re-pins that source and opens no PR when `main` already has it. On
+the same path the `realign` job points the moving `2.8.0-<variant>` tag back at that source's
+`src-<hash>` digest (`scripts/retag.sh`, which leaves a tag that is already there alone).
 
 A push run is stale when the inputs on `main` (the same filtered, hashed files) differ from its
 own; an unrelated newer commit does not make it stale. A stale run publishes and pins nothing,
 because the run for the newer source does both. The check runs in `check-source`, again right
 before `merge` moves the tags (so "Re-run failed jobs" on an older run is caught too), and in the
-pin step. A dispatch always builds. Each variant merges on its own, so one variant's failed build
+pin step, and the build job checks it too, so a stale re-run leaves the `buildcache-*` tags alone.
+A dispatch always builds. Each variant merges on its own, so one variant's failed build
 does not hold back the other; to publish and pin the failed variant, dispatch the workflow for it.
 GitHub does not run workflows on a PR that
 `GITHUB_TOKEN` opened, so a maintainer has to start its checks (close and reopen it) before merging.

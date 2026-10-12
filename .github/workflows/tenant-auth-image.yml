@@ -52,6 +52,8 @@ jobs:
     outputs:
       source-hash: ${{ steps.check.outputs.hash }}
       skip: ${{ steps.check.outputs.skip }}
+      stale: ${{ steps.check.outputs.stale }}
+      digest: ${{ steps.check.outputs.digest }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -212,8 +214,15 @@ jobs:
 
   pin:
     name: Open pin PR
-    needs: publish-index
-    if: ${{ !cancelled() && needs.publish-index.result == 'success' && needs.publish-index.outputs.digest != '' && github.ref == 'refs/heads/main' }}
+    # After a publish, or when this push's source was already published (a revert to an older
+    # source, or a pin PR closed unmerged): then check-source's digest is pinned again.
+    # pin-artifact.ts finds nothing to change when main already has it, so that is a no-op.
+    needs: [check-source, publish-index]
+    if: >-
+      ${{ !cancelled() && github.ref == 'refs/heads/main' &&
+      ((needs.publish-index.result == 'success' && needs.publish-index.outputs.digest != '') ||
+      (needs.check-source.result == 'success' && needs.check-source.outputs.skip == 'true' &&
+      needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -228,5 +237,5 @@ jobs:
         with:
           name: tenant-auth
           workflow: .github/workflows/tenant-auth-image.yml
-          pins: tenant-auth ${{ needs.publish-index.outputs.digest }}
+          pins: tenant-auth ${{ needs.publish-index.outputs.digest || needs.check-source.outputs.digest }}
           token: ${{ secrets.GITHUB_TOKEN }}

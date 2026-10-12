@@ -62,6 +62,8 @@ interface Spec {
   /** The job the pin job waits for and takes the digest from. */
   pinAfter: string;
   pinIf: string;
+  /** The job that re-points moving tags when the source is already published (a revert). */
+  realign?: { job: string; tags: string };
   /** bot/pin-<pinName> */
   pinName: string;
   artifacts: string[];
@@ -77,11 +79,12 @@ const SPECS: Spec[] = [
     first: 'build',
     firstIf:
       "${{ !cancelled() && needs.check-source.result == 'success' && needs.check-source.outputs.variants != '[]' }}",
-    publish: ['build', 'merge'],
+    publish: ['build', 'merge', 'realign'],
     readOnly: [],
     pinAfter: 'merge',
     pinIf:
-      "${{ !cancelled() && (needs.merge.result == 'success' || needs.merge.result == 'failure') && github.ref == 'refs/heads/main' }}",
+      "${{ !cancelled() && needs.check-source.result == 'success' && needs.check-source.outputs.stale != 'true' && github.ref == 'refs/heads/main' }}",
+    realign: { job: 'realign', tags: '${{ matrix.variant.tag }}' },
     pinName: 'wash',
     guarded: { job: 'merge', steps: ['Create and push manifest', 'Record image digest'] },
     artifacts: ['wash-wasi-tls', 'wash-wasi-tls-exclusive'],
@@ -112,7 +115,7 @@ const SPECS: Spec[] = [
     readOnly: [],
     pinAfter: 'publish-index',
     pinIf:
-      "${{ !cancelled() && needs.publish-index.result == 'success' && needs.publish-index.outputs.digest != '' && github.ref == 'refs/heads/main' }}",
+      "${{ !cancelled() && github.ref == 'refs/heads/main' && ((needs.publish-index.result == 'success' && needs.publish-index.outputs.digest != '') || (needs.check-source.result == 'success' && needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
     pinName: 'tenant-auth',
     guarded: { job: 'publish-index', steps: ['Assemble and verify image index'] },
     artifacts: ['tenant-auth'],
@@ -140,11 +143,12 @@ const SPECS: Spec[] = [
     ],
     first: 'build',
     firstIf: CHECKED,
-    publish: ['publish'],
+    publish: ['publish', 'realign'],
     readOnly: ['build'],
+    realign: { job: 'realign', tags: 'wit' },
     pinAfter: 'publish',
     pinIf:
-      "${{ !cancelled() && needs.publish.result == 'success' && needs.publish.outputs.digest != '' && github.ref == 'refs/heads/main' }}",
+      "${{ !cancelled() && github.ref == 'refs/heads/main' && ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') || (needs.check-source.result == 'success' && needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
     pinName: 'pglite-component',
     guarded: {
       job: 'publish',
@@ -179,7 +183,7 @@ const SPECS: Spec[] = [
     readOnly: [],
     pinAfter: 'publish',
     pinIf:
-      "${{ !cancelled() && needs.publish.result == 'success' && needs.publish.outputs.digest != '' && github.ref == 'refs/heads/main' }}",
+      "${{ !cancelled() && github.ref == 'refs/heads/main' && ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') || (needs.check-source.result == 'success' && needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
     pinName: 'oci-registry',
     guarded: {
       job: 'publish',
@@ -254,7 +258,7 @@ describe.each(SPECS)('$file', (spec) => {
     for (const [name, job] of Object.entries(jobs)) {
       if (name === 'check-source' || name === spec.first) continue;
       expect(job.if, name).toMatch(
-        /^\$\{\{ !cancelled\(\) && \(?needs\.[\w-]+\.result == 'success'/,
+        /^\$\{\{ !cancelled\(\) && .*needs\.[\w-]+\.result == 'success'/,
       );
     }
   });
@@ -300,6 +304,16 @@ describe.each(SPECS)('$file', (spec) => {
     );
     expect(needsOf(pin ?? {})).toContain(spec.pinAfter);
     expect(pin?.if).toBe(spec.pinIf);
+    // Pin also runs when the source is already published (a revert, a closed pin PR), never when
+    // main has newer inputs.
+    expect(pin?.if).toContain("needs.check-source.outputs.stale != 'true'");
+    expect(needsOf(pin ?? {})).toContain('check-source');
+    if (spec.pinName !== 'wash') {
+      expect(pin?.if).toContain("needs.check-source.outputs.skip == 'true'");
+      const out = jobs['check-source']?.outputs ?? {};
+      expect(out.stale).toBe('${{ steps.check.outputs.stale }}');
+      expect(out.digest).toBe('${{ steps.check.outputs.digest }}');
+    }
     for (const [name, job] of Object.entries(jobs)) {
       if (name === 'pin') continue;
       expect(job.permissions?.contents, name).not.toBe('write');
@@ -318,7 +332,9 @@ describe.each(SPECS)('$file', (spec) => {
       const resolve = pin?.steps?.find((s) => s.run === 'bash scripts/wash-pins.sh');
       expect(resolve?.env?.VARIANTS).toBe('${{ needs.check-source.outputs.all }}');
     } else {
-      expect(pins).toBe(`${spec.pinName} \${{ needs.${spec.pinAfter}.outputs.digest }}`);
+      expect(pins).toBe(
+        `${spec.pinName} \${{ needs.${spec.pinAfter}.outputs.digest || needs.check-source.outputs.digest }}`,
+      );
     }
     for (const name of spec.artifacts) expect(ARTIFACTS[name], name).toBeDefined();
   });
@@ -348,6 +364,35 @@ describe.each(SPECS)('$file', (spec) => {
         expect(index, (step as { name?: string }).name).toBeGreaterThan(guard);
       }
     });
+  });
+
+  test('a revert re-points moving tags only through the guard, and never for a stale run', () => {
+    const realign = spec.realign ? jobs[spec.realign.job] : undefined;
+    if (!spec.realign) {
+      // tenant-auth and oci-registry only push commit-SHA tags; nothing moves.
+      expect(jobs.realign).toBeUndefined();
+      return;
+    }
+    expect(realign?.permissions).toEqual({ contents: 'read', packages: 'write' });
+    expect(realign?.if).toContain("needs.check-source.outputs.stale != 'true'");
+    expect(realign?.if).toContain("github.ref == 'refs/heads/main'");
+    const steps = (realign?.steps ?? []) as {
+      name?: string;
+      uses?: string;
+      if?: string;
+      run?: string;
+      env?: Record<string, string>;
+    }[];
+    const guard = steps.findIndex((s) => s.uses === './.github/actions/source-guard');
+    const retag = steps.findIndex((s) => (s.run ?? '').includes('bash scripts/retag.sh'));
+    expect(guard).toBeGreaterThanOrEqual(0);
+    expect(retag).toBeGreaterThan(guard);
+    expect(steps[retag]?.if).toBe("steps.guard.outputs.stale != 'true'");
+    if (spec.realign.tags === 'wit') {
+      expect(steps[retag]?.run).toContain('platform/pglite-component/wit/world.wit');
+    } else {
+      expect(steps[retag]?.env?.TAGS).toBe(spec.realign.tags);
+    }
   });
 
   test('one non-cancelling concurrency group per artifact', () => {
@@ -511,7 +556,7 @@ describe('the check-source resolver reads platform/tenant-host/variants', () => 
    * Run the resolver in a directory holding `table` as platform/tenant-host/variants, with a stub
    * `bun` standing in for scripts/source-check.ts (never published, never stale).
    */
-  function resolve(table: string, trigger: string, variant = '') {
+  function resolve(table: string, trigger: string, variant = '', answer = 'echo "skip=false"') {
     const dir = mkdtempSync(join(tmpdir(), 'variants-'));
     mkdirSync(join(dir, 'platform/tenant-host'), { recursive: true });
     writeFileSync(join(dir, 'platform/tenant-host/variants'), table);
@@ -519,7 +564,7 @@ describe('the check-source resolver reads platform/tenant-host/variants', () => 
     mkdirSync(bin);
     writeFileSync(
       join(bin, 'bun'),
-      `#!/bin/sh\necho "hash=${'a'.repeat(64)}"\necho "skip=false"\necho "args=$*" >> "${dir}/bun.log"\n`,
+      `#!/bin/sh\necho "hash=${'a'.repeat(64)}"\n${answer}\necho "args=$*" >> "${dir}/bun.log"\n`,
     );
     chmodSync(join(bin, 'bun'), 0o755);
     const output = join(dir, 'out');
@@ -548,6 +593,8 @@ describe('the check-source resolver reads platform/tenant-host/variants', () => 
         canonical: boolean;
       }[],
       all: JSON.parse(value('all')) as string[],
+      published: JSON.parse(value('published')) as { name: string; tag: string; digest: string }[],
+      stale: value('stale'),
       bun: (() => {
         try {
           return readFileSync(join(dir, 'bun.log'), 'utf8');
@@ -597,6 +644,65 @@ describe('the check-source resolver reads platform/tenant-host/variants', () => 
     expect(r.variants[0]?.canonical).toBe(false);
     expect(r.bun).toContain('--force');
     expect(r.bun).not.toContain('--stale-guard');
+  });
+
+  test('an already-published source is handed to realign and pin, not built (a revert)', () => {
+    const digest = `sha256:${'e'.repeat(64)}`;
+    const r = resolve(
+      table,
+      'push',
+      '',
+      `echo "stale=false"; echo "skip=true"; echo "digest=${digest}"`,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(r.variants).toEqual([]);
+    expect(r.stale).toBe('false');
+    expect(r.published.map((v) => [v.name, v.tag, v.digest])).toEqual([
+      ['wasi-tls', '2.8.0-wasi-tls', digest],
+      ['wasi-tls-exclusive', '2.8.0-wasi-tls-exclusive', digest],
+    ]);
+  });
+
+  test('a stale run builds nothing and hands nothing to realign', () => {
+    const r = resolve(table, 'push', '', 'echo "stale=true"; echo "skip=true"; echo "digest="');
+    expect(r.exitCode).toBe(0);
+    expect(r.variants).toEqual([]);
+    expect(r.published).toEqual([]);
+    expect(r.stale).toBe('true');
+  });
+
+  test('the dispatch choices are exactly the table rows (S2)', () => {
+    const options = (
+      workflow.on.workflow_dispatch as {
+        inputs: { variant: { options: string[]; default: string } };
+      }
+    ).inputs.variant;
+    const tags = table
+      .split('\n')
+      .filter((line) => line.trim() && !line.trim().startsWith('#'))
+      .map((line) => (line.trim().split(/\s+/)[0] ?? '').replace(/^2\.8\.0-/, ''));
+    expect(options.options).toEqual(tags);
+    expect(options.default).toBe(tags[0] ?? '');
+  });
+
+  test('a stale re-run of build leaves the buildcache tags alone (S1)', () => {
+    const steps = (workflow.jobs.build?.steps ?? []) as {
+      name?: string;
+      uses?: string;
+      if?: string;
+    }[];
+    const guard = steps.findIndex((s) => s.uses === './.github/actions/source-guard');
+    expect(guard).toBeGreaterThanOrEqual(0);
+    for (const name of [
+      'Log in to GHCR',
+      'Build and push by digest',
+      'Export digest',
+      'Upload digest',
+    ]) {
+      const index = steps.findIndex((s) => s.name === name);
+      expect(index, name).toBeGreaterThan(guard);
+      expect(steps[index]?.if, name).toBe("steps.guard.outputs.stale != 'true'");
+    }
   });
 
   test('a dispatch of an unlisted variant fails', () => {
