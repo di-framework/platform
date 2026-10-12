@@ -28,14 +28,14 @@ export interface Context {
 
 /** The `channel` pinned in rust-toolchain.toml. */
 export function toolchainChannel(toml: string): string {
-  const channel = toml.match(/^channel\s*=\s*"([^"]+)"/m)?.[1];
+  const channel = /^channel\s*=\s*"([^"]+)"/m.exec(toml)?.[1];
   if (!channel) throw new Error('rust-toolchain.toml has no channel');
   return channel;
 }
 
 /** The WIT package version, which is also the published version tag. */
 export function witPackageVersion(wit: string): string {
-  const version = wit.match(/^package di-framework:pglite-encfs@([^;\s]+);/m)?.[1];
+  const version = /^package di-framework:pglite-encfs@([^;\s]+);/m.exec(wit)?.[1];
   if (!version)
     throw new Error('wit/world.wit must start with package di-framework:pglite-encfs@<version>;');
   return version;
@@ -71,16 +71,17 @@ export async function createContext(base: Env = process.env): Promise<Context> {
   return { pkgDir: PKG_DIR, pgliteDir: PGLITE_DIR, toolchain, env };
 }
 
+const INSTALL_HINTS: Record<string, string> = {
+  wasmtime: 'install wasmtime 48 (https://wasmtime.dev)',
+  cargo: 'install rustup, or run make -C ../pglite-component tools-rust',
+  rustup: 'install rustup, or run make -C ../pglite-component tools-rust',
+};
+
 /** Fail early with the command that installs a missing tool. */
 export function requireTools(ctx: Context, tools: string[]): void {
   for (const tool of tools) {
     if (!Bun.which(tool, { PATH: ctx.env.PATH })) {
-      const hint =
-        tool === 'wasmtime'
-          ? 'install wasmtime 48 (https://wasmtime.dev)'
-          : tool === 'cargo' || tool === 'rustup'
-            ? 'install rustup, or run make -C ../pglite-component tools-rust'
-            : 'run make tools';
+      const hint = INSTALL_HINTS[tool] ?? 'run make tools';
       throw new Error(`${tool} not found on PATH; ${hint}`);
     }
   }

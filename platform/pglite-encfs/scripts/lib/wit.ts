@@ -11,30 +11,40 @@ export interface WorldItems {
  * (`import x: interface { ... }`) items are rejected, as in the publisher.
  */
 export function worldItems(wit: string): WorldItems {
+  const lines = wit.split('\n').map((line) => line.trim());
+  const start = lines.findIndex((line) => /^world \S+ \{$/.test(line));
+  if (start < 0) throw new Error('no complete world in WIT');
   const items: WorldItems = { imports: [], exports: [] };
   let depth = 0;
-  let inside = false;
-  for (const raw of wit.split('\n')) {
-    const line = raw.trim();
-    if (!inside && /^world \S+ \{$/.test(line)) inside = true;
-    if (!inside) continue;
-    if (depth === 1) {
-      const match = line.match(/^(import|export) (.+);$/);
-      if (match) {
-        const [, kind, name] = match as [string, 'import' | 'export', string];
-        if (/[\s{]/.test(name)) throw new Error(`expected a named interface, got \`${line}\``);
-        (kind === 'import' ? items.imports : items.exports).push(name);
-      } else if (/^(import|export) /.test(line)) {
-        throw new Error(`expected a named interface, got \`${line}\``);
-      }
-    }
-    for (const ch of line) {
-      if (ch === '{') depth++;
-      else if (ch === '}') depth--;
-    }
+  for (const line of lines.slice(start)) {
+    if (depth === 1) addWorldItem(items, line);
+    depth += braceDelta(line);
     if (depth === 0) return items;
   }
   throw new Error('no complete world in WIT');
+}
+
+/** Record a top-level `import name;` or `export name;` line of a world. */
+function addWorldItem(items: WorldItems, line: string): void {
+  if (!/^(import|export) /.test(line)) return;
+  const match = /^(import|export) ([^\s{;]+);$/.exec(line);
+  if (!match) throw new Error(`expected a named interface, got \`${line}\``);
+  const [, kind, name] = match as unknown as [string, 'import' | 'export', string];
+  (kind === 'import' ? items.imports : items.exports).push(name);
+}
+
+function braceDelta(line: string): number {
+  let delta = 0;
+  for (const ch of line) {
+    if (ch === '{') delta++;
+    else if (ch === '}') delta--;
+  }
+  return delta;
+}
+
+/** Sorted copy, by code point. */
+export function sortedNames(list: readonly string[]): string[] {
+  return [...list].sort((a, b) => a.localeCompare(b));
 }
 
 /** Interfaces encfs must export: everything that carries filesystem-owned resources, plus env. */
@@ -63,7 +73,7 @@ export function compositionProblems(
   composed?: WorldItems,
 ): string[] {
   const problems: string[] = [];
-  const sorted = (list: readonly string[]) => [...list].sort();
+  const sorted = sortedNames;
   const same = (a: readonly string[], b: readonly string[]) =>
     JSON.stringify(sorted(a)) === JSON.stringify(sorted(b));
   if (!same(encfs.exports, ENCFS_EXPORTS)) {

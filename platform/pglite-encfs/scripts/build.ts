@@ -20,7 +20,7 @@ import {
   WIT_FILE,
   witPackageVersion,
 } from './lib/env.ts';
-import { ENCFS_EXPORTS, worldItems } from './lib/wit.ts';
+import { ENCFS_EXPORTS, sortedNames, worldItems } from './lib/wit.ts';
 
 const log = logger('build');
 
@@ -67,7 +67,7 @@ export async function build(ctx: Context): Promise<string> {
 
   // The export set is fixed; that every import and export matches pglite is checked in smoke.
   const { imports, exports } = worldItems(wit);
-  if (JSON.stringify([...exports].sort()) !== JSON.stringify([...ENCFS_EXPORTS].sort())) {
+  if (JSON.stringify(sortedNames(exports)) !== JSON.stringify(sortedNames(ENCFS_EXPORTS))) {
     throw new Error(`exports ${exports.join(', ')}; expected ${ENCFS_EXPORTS.join(', ')}`);
   }
   const stray = imports.filter((name) => !name.startsWith('wasi:'));
@@ -101,4 +101,8 @@ export async function build(ctx: Context): Promise<string> {
   return wasm;
 }
 
-if (import.meta.main) await run('build', async (ctx) => void (await build(ctx)));
+if (import.meta.main) {
+  await run('build', async (ctx) => {
+    await build(ctx);
+  });
+}

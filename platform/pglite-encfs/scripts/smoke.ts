@@ -214,7 +214,7 @@ async function tear(
 }
 
 function checkAb(output: string): { a: number; b: number } {
-  const match = output.match(/^check-ab A=(\d+) B=(\d+)$/m);
+  const match = /^check-ab A=(\d+) B=(\d+)$/m.exec(output);
   if (!match) throw new Error('no check-ab result');
   return { a: Number(match[1]), b: Number(match[2]) };
 }
@@ -376,7 +376,7 @@ export async function smoke(ctx: Context): Promise<void> {
       { current: keyB, previous: keyA },
       'marker-read ok',
     );
-    const count = Number(rotated.match(/re-wrapped (\d+) file keys/)?.[1] ?? -1);
+    const count = Number(/re-wrapped (\d+) file keys/.exec(rotated)?.[1] ?? -1);
     if (count < headers)
       throw new Error(`rotation re-wrapped ${count} of at least ${headers} files`);
     const afterRotation = await assertEncrypted(data, keyCheckValue(keyB), raw);
