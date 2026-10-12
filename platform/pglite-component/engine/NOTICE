@@ -3,13 +3,16 @@ di-framework embedded PGlite component
 The provider bundles PostgreSQL 17.5 (PGlite WASI), originally maintained by
 ElectricSQL. PostgreSQL's license is reproduced in POSTGRESQL-COPYRIGHT.
 The upstream bindings license and WASI adapter license are reproduced in
-PGLITE-BINDINGS-LICENSE and WASMTIME-LICENSE.
+PGLITE-BINDINGS-LICENSE and WASMTIME-LICENSE. The engine statically links
+the pgcrypto extension and OpenSSL libcrypto; their notices are in
+PGCRYPTO-NOTICES and the OpenSSL license (Apache-2.0) in OPENSSL-LICENSE.
 
 Sources:
 https://github.com/electric-sql/postgres-pglite
 https://github.com/electric-sql/pglite-bindings
 https://github.com/moznion/wasipg
 https://github.com/bytecodealliance/wasmtime/tree/v29.0.1
+https://github.com/openssl/openssl/releases/tag/openssl-3.5.9
 
 The engine is compiled with PostgreSQL setjmp/longjmp recovery lowered to
 standardized WebAssembly exceptions. di-framework adds a private canonical

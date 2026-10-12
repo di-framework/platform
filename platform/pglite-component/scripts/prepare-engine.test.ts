@@ -83,6 +83,12 @@ describe('patchEngineWat', () => {
     '  (func $pg_strong_random (param i32 i32) (result i32)',
     '    unreachable',
     '  )',
+    '  (func $df_ext_dlsym (param i32) (result i32)',
+    '    unreachable',
+    '  )',
+    '  (func $pg_digest (param i32) (result i32)',
+    '    unreachable',
+    '  )',
     '  (data "/tmp/initdb.boot.txt")',
     '  (data "/tmp/initdb.single.txt")',
     '  (export "_start" (func $_start))',
@@ -102,6 +108,13 @@ describe('patchEngineWat', () => {
   });
 
   test('fails closed when the engine ABI changes', () => {
-    expect(() => patchEngineWat('(module)', '(elem)')).toThrow('pg_strong_random');
+    const withoutRandom = wat.replace('$pg_strong_random', '$other_random');
+    expect(() => patchEngineWat(withoutRandom, '(elem)')).toThrow('pg_strong_random');
+  });
+
+  test('fails closed when pgcrypto is not linked into the engine', () => {
+    for (const name of ['df_ext_dlsym', 'pg_digest']) {
+      expect(() => patchEngineWat(wat.replace(`$${name} `, '$gone '), '(elem)')).toThrow(name);
+    }
   });
 });

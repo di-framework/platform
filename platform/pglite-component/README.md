@@ -250,6 +250,25 @@ machine-readable handling of constraint violations and other conditions:
 - `"22012"` = division by zero
 - `"54000"` = result too large
 
+## Extensions
+
+The engine cannot load shared libraries, so extensions are linked into it
+statically. It includes `plpgsql` and `pgcrypto`. Enable pgcrypto from a migration:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+SELECT pgp_sym_decrypt(pgp_sym_encrypt('secret', 'key'), 'key');
+SELECT encode(digest('a', 'sha256'), 'hex');
+SELECT crypt('password', gen_salt('bf'));
+```
+
+pgcrypto links a static `libcrypto` built from the pinned OpenSSL 3.5 LTS
+source (`OPENSSL_*` in `scripts/tool-versions.env`, Apache-2.0). Every salt,
+PGP session key and padding byte comes from `pg_strong_random`, which the
+engine routes to the host's WASI `random` interface. `gen_random_uuid()` is
+built into PostgreSQL and works without the extension. Other contrib modules
+are not included. The WIT interface does not change.
+
 ## Persistence and ownership
 
 For an `open("/data/orders", ...)` call:
@@ -299,6 +318,7 @@ annotations provide storage; they do not enforce database ownership.
 - `src/pgwire.rs`: PostgreSQL message encoding and typed rows, over memory.
 - `src/engine.rs`: persistent filesystem setup and exclusive engine access.
 - `engine/bridge.wat`: private canonical ABI bridge to the core engine.
+- `engine/build-pgcrypto.sh`: builds OpenSSL libcrypto and pgcrypto in the engine container and generates pgcrypto's static `dlsym` table; `scripts/patch-engine-source.ts` links both into the engine.
 - `scripts/prepare-engine.ts`: pinned engine preparation and componentization (all build scripts are Bun TypeScript; see `scripts/`).
 - `wit/deps/pglite-engine/engine.wit`: internal interface, composed away at build.
 
