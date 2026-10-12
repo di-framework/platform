@@ -1,0 +1,41 @@
+[package]
+name = "di-framework-pglite-encfs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+description = "Encrypting wasi:filesystem@0.2.9 layer for the di-framework pglite component: AES-256-XTS at rest, plugged between pglite and the host."
+repository = "https://github.com/di-framework/platform"
+publish = false
+
+# Standalone like ../pglite-component: the root workspace excludes this crate
+# and only builds build-support/ (the publisher).
+[workspace]
+
+[lib]
+name = "pglite_encfs"
+crate-type = ["cdylib"]
+
+# Pinned exactly. Bump deliberately and re-run `make unit smoke` (see README).
+[dependencies]
+aes = { version = "=0.8.4", features = ["zeroize"] }
+base64 = { version = "=0.22.1", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "=0.10.1", default-features = false }
+hkdf = "=0.12.4"
+sha2 = { version = "=0.10.9", default-features = false }
+xts-mode = "=0.5.1"
+zeroize = { version = "=1.9.1", default-features = false, features = ["alloc"] }
+
+# Only the Wasm build has the WIT bindings; host builds run the unit tests.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen = { version = "=0.61.1", default-features = false, features = ["macros", "realloc", "bitflags"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+
+[profile.dev]
+panic = "abort"
