@@ -281,8 +281,11 @@ Reference: `ghcr.io/di-framework/wash:2.8.0-wasi-tls` (with the allowlist patch,
 
 The **Publish tenant host image** workflow
 ([`.github/workflows/tenant-host-image.yml`](../../.github/workflows/tenant-host-image.yml))
-takes a `variant` input, `wasi-tls` (default) or `wasi-tls-exclusive`; the exclusive build has to
-be selected explicitly. Each variant pushes only its
+runs by itself on every push to `main` that changes `platform/tenant-host/**` (including
+[`variants`](variants)) or the workflow, and then builds every variant listed in `variants`,
+`wasi-tls` and `wasi-tls-exclusive`. A manual run (`workflow_dispatch`) takes a `variant` input,
+`wasi-tls` (default) or `wasi-tls-exclusive`; the exclusive build has to be selected explicitly,
+and a dispatch always builds. Each variant pushes only its
 own tag, with the patch set its resolver job reads from [`variants`](variants); a set that does not
 match the tag fails the Dockerfile check, so neither tag can be published with the other's patches. It builds `linux/amd64` and
 `linux/arm64` on native runners (`ubuntu-24.04` and `ubuntu-24.04-arm`)
@@ -290,11 +293,40 @@ at the same time, then pushes the multi-arch tag. It does not emulate arm64. Eac
 a cache manifest per variant, `ghcr.io/di-framework/wash:buildcache-<tag>-amd64` and `-arm64`, with
 `mode=max`. That manifest records which layer blob in GHCR matches each Dockerfile step, including
 the builder stage, and the next build imports it. The wash tag itself is not the cache: inline
-metadata on an image only covers the final stage. It is `workflow_dispatch` only, the
-same explicit publish step this repo uses for npm releases: a maintainer runs it from the Actions
-tab after the workflow file is on `main`
-(`https://github.com/di-framework/platform/actions/workflows/tenant-host-image.yml`).
-The job authenticates with the workflow `GITHUB_TOKEN` (`packages: write`).
+metadata on an image only covers the final stage.
+
+On a push, the first job hashes the committed input files (the workflow's `paths:` filter, salted
+with the variant name; `scripts/source-check.ts`) and skips any variant whose
+`ghcr.io/di-framework/wash:src-<hash>` tag already exists, so an unrelated commit publishes nothing.
+A publish adds `src-<hash>` to the same multi-arch index as the variant tag. The jobs that push
+authenticate with the workflow `GITHUB_TOKEN` (`packages: write`). After a publish, a separate job
+(`contents: write`, `pull-requests: write`, `packages: read`) opens or updates one PR, `bot/pin-wash`. It reads each
+variant's digest from its `src-<hash>` tag for the current source and updates every published
+variant's row in the table below with `scripts/pin-artifact.ts`, so a run that built only one
+variant never drops the other's pending pin. The pin job also runs when a push publishes nothing
+because its source is already published, for example after a revert to an older source, or after
+a pin PR was closed unmerged: it re-pins that source and opens no PR when `main` already has it. On
+the same path the `realign` job points the moving `2.8.0-<variant>` tag back at that source's
+`src-<hash>` digest (`scripts/retag.sh`, which leaves a tag that is already there alone).
+
+A push run is stale when the inputs on `main` (the same filtered, hashed files) differ from its
+own; an unrelated newer commit does not make it stale. A stale run publishes and pins nothing,
+because the run for the newer source does both. The check runs in `check-source`, again right
+before `merge` moves the tags (so "Re-run failed jobs" on an older run is caught too), and in the
+pin step, and the build job checks it too, so a stale re-run leaves the `buildcache-*` tags alone.
+A dispatch always builds. Each variant merges on its own, so one variant's failed build
+does not hold back the other; to publish and pin the failed variant, dispatch the workflow for it.
+GitHub does not run workflows on a PR that
+`GITHUB_TOKEN` opened, so a maintainer has to start its checks (close and reopen it) before merging.
+
+Latest published images (multi-arch index digests; the bot PR keeps this table current):
+
+| Variant | Image |
+| --- | --- |
+| `wasi-tls` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669` |
+| `wasi-tls-exclusive` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:<pending first publish>` |
+
+The pin PR never changes the platform default (`DEFAULT_HOST_IMAGE`); a maintainer moves it by hand.
 
 The tags are mutable. The platform default `hostImage` is still pinned to an index of the canonical
 tag published before 0002 existed, so it has no `--insecure-registry`:

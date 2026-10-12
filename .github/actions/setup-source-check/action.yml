@@ -1,0 +1,28 @@
+# Tools for the skip-if-published check of the publish workflows (#172): Bun runs
+# scripts/source-check.ts, which asks GHCR for <image>:src-<hash> with oras. The caller job
+# holds only contents: read and packages: read.
+name: Set up source check
+description: Install Bun and oras and log oras in to GHCR for scripts/source-check.ts.
+inputs:
+  token:
+    description: Token with packages read; the workflow GITHUB_TOKEN
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      with:
+        bun-version: '1.4.2'
+
+    - name: Set up ORAS
+      uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
+      with:
+        version: '1.3.4'
+
+    - name: Log in to GHCR
+      shell: bash
+      env:
+        GHCR_USERNAME: ${{ github.actor }}
+        GHCR_TOKEN: ${{ inputs.token }}
+      run: printf '%s' "${GHCR_TOKEN}" | oras login ghcr.io --username "${GHCR_USERNAME}" --password-stdin

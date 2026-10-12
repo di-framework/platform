@@ -70,14 +70,13 @@ describe('pglite-component package', () => {
     expect(legacy).toEqual([]);
   });
 
-  test('the publish workflow is dispatch-only and gates on main branch', () => {
+  test('the publish workflow builds before it publishes', () => {
+    // Triggers, skip-if-published and permissions: tests/workflows.test.ts.
     const repo = join(pkgDir, '..', '..');
     const workflow = readFileSync(
       join(repo, '.github/workflows/pglite-component-publish.yml'),
       'utf8',
     );
-    expect(workflow).toMatch(/on:\s+workflow_dispatch:/);
-    expect(workflow).toContain("if: github.ref == 'refs/heads/main'");
     expect(workflow).toContain('ghcr.io/di-framework/pglite-component');
     expect(workflow).toContain('make -C platform/pglite-component tools-rust');
     expect(workflow).toContain('make -C platform/pglite-component unit smoke');

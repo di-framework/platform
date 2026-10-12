@@ -2,8 +2,8 @@
 # The stock ghcr.io/wasmcloud/wash:2.8.0 image is a default-features build, so components that import
 # wasi:tls/client@0.3.0-draft (the node:tls shim) fail to start on it. This mirrors upstream's Dockerfile
 # at the same tag (Chainguard wolfi-base runtime, git, /usr/local/bin/wash entrypoint) with the feature on.
-# Maintainers publish it with .github/workflows/tenant-host-image.yml (workflow_dispatch). Pin consumers
-# by digest.
+# .github/workflows/tenant-host-image.yml publishes it on each push to main that changes this directory
+# (workflow_dispatch reruns it). Pin consumers by digest.
 #
 # Variants. `variants` in this directory is the one tag -> patch set table; the build fails unless
 # WASH_PATCHES is exactly the set it lists for IMAGE_VERSION, so a mislabelled image cannot be built:

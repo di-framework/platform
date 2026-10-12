@@ -2,8 +2,8 @@
 # the patched wash and wash-runtime build, lint, format-check and pass the tests that cover the
 # patches (#136, #175).
 #
-# tenant-host-image.yml is dispatch-only, so before this job a patch that did not apply, or did not
-# compile, only showed up at publish time. One job per row of platform/tenant-host/variants (the
+# tenant-host-image.yml only runs on main (on push and dispatch), so without this job a patch that
+# did not apply, or did not compile, would only show up at publish time, after merge. One job per row of platform/tenant-host/variants (the
 # same table the Dockerfile and the publish workflow read), each with that variant's patches applied
 # in order, so the canonical set (0002 alone) and the exclusive stack (0001 + 0002) are both checked.
 # Each job checks wasmCloud out at the commit pinned by WASMCLOUD_COMMIT in the Dockerfile, runs

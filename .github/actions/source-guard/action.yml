@@ -1,0 +1,43 @@
+# Last check before a publish job moves mutable tags (#172 review): on a push, stop if the
+# workflow's inputs at the tip of main differ from this commit's. "Re-run failed jobs" does not
+# re-run check-source, so a re-run of an older push is only caught here; the run for the newer
+# source publishes and pins instead. An unrelated newer commit leaves the hash alone and does
+# not stop anything. workflow_dispatch is never stopped. The caller has checked out the commit.
+name: Source guard
+description: Output stale=true when main has newer inputs for this workflow than this commit.
+inputs:
+  workflow:
+    description: The publish workflow file, whose on.push.paths are the inputs
+    required: true
+  salt:
+    description: Variant salt of the source hash
+    required: false
+    default: ''
+  token:
+    description: Read token for fetching main (the workflow GITHUB_TOKEN)
+    required: true
+outputs:
+  stale:
+    description: "'true' when this run must not publish or pin"
+    value: ${{ steps.guard.outputs.stale }}
+runs:
+  using: composite
+  steps:
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      with:
+        bun-version: '1.4.2'
+
+    - name: Compare inputs with main
+      id: guard
+      shell: bash
+      env:
+        WORKFLOW: ${{ inputs.workflow }}
+        SALT: ${{ inputs.salt }}
+        SOURCE_CHECK_TOKEN: ${{ inputs.token }}
+        FORCE: ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
+      run: |
+        set -euo pipefail
+        # shellcheck disable=SC2086 # FORCE is empty or one flag
+        bun scripts/source-check.ts --workflow "${WORKFLOW}" --image unused --salt "${SALT}" \
+          --stale-guard --no-registry ${FORCE} --github-output

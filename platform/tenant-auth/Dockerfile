@@ -1,8 +1,8 @@
 # Tenant-auth image: the tenant controller and console bundled for Bun on a stock oven/bun base.
 # Build with the repository root as the context:
 #   docker build -f platform/tenant-auth/Dockerfile .
-# Maintainers publish ghcr.io/di-framework/tenant-auth with
-# .github/workflows/tenant-auth-image.yml (workflow_dispatch). Pin consumers by digest.
+# .github/workflows/tenant-auth-image.yml publishes ghcr.io/di-framework/tenant-auth on each push to
+# main that changes its inputs (workflow_dispatch reruns it). Pin consumers by digest.
 # One image carries both entry points; the Deployment picks one with `command`:
 #   bun /app/controller.js    (HTTPS on TENANT_CONTROLLER_PORT, default 8788)
 #   bun /app/console.js       (HTTP on TENANT_CONSOLE_PORT, default 8787)
