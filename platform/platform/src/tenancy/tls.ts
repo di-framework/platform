@@ -115,6 +115,8 @@ interface Issue {
   extensions: Buffer[];
   days: number;
   now: Date;
+  /** The latest `notAfter` allowed; a leaf never outlives the CA that signed it. */
+  notAfterCap?: Date;
 }
 
 /** Sign and PEM-encode a v3 certificate. Node has no X.509 writer, so this encodes the DER itself. */
@@ -126,7 +128,14 @@ function issueCertificate(i: Issue): string {
     i.issuer,
     seq(
       time(new Date(i.now.getTime() - BACKDATE_MS)),
-      time(new Date(i.now.getTime() + i.days * 86_400_000)),
+      time(
+        new Date(
+          Math.min(
+            i.now.getTime() + i.days * 86_400_000,
+            i.notAfterCap?.getTime() ?? Number.POSITIVE_INFINITY,
+          ),
+        ),
+      ),
     ),
     i.subject,
     i.publicKey.export({ type: 'spki', format: 'der' }),
@@ -193,7 +202,8 @@ export function selfSignedCertificate(
 /**
  * A P-256 end-entity (`CA:FALSE`) server certificate for `commonName`, the DNS names and IPv4
  * addresses given, signed by `caKey`. Its issuer is the subject of `caCert`, so OpenSSL-based
- * clients do not mistake it for self-signed, and its AKI matches the CA's SKI.
+ * clients do not mistake it for self-signed, and its AKI matches the CA's SKI. Its `notAfter` is
+ * `days` from `now`, capped at the CA's `notAfter`.
  */
 export function leafCertificate(
   commonName: string,
@@ -205,6 +215,7 @@ export function leafCertificate(
   now: Date = new Date(),
 ): KeyPair {
   const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const ca = new X509Certificate(caCert);
   const cert = issueCertificate({
     subject: name(commonName),
     issuer: subjectDer(caCert),
@@ -212,13 +223,14 @@ export function leafCertificate(
     signingKey: createPrivateKey(caKey),
     days,
     now,
+    notAfterCap: new Date(ca.validTo),
     extensions: [
       extension('2.5.29.19', seq(), true),
       keyUsage(0),
       extension('2.5.29.37', seq(oid('1.3.6.1.5.5.7.3.1'))),
       subjectAltName(dnsNames, ipAddresses),
       subjectKeyId(publicKey),
-      authorityKeyId(new X509Certificate(caCert).publicKey),
+      authorityKeyId(ca.publicKey),
     ],
   });
   return { cert, key: pkcs8(privateKey) };

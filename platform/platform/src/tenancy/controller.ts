@@ -330,12 +330,18 @@ export class Controller {
       if (!(error instanceof ApiError && error.code === 404)) throw error;
     }
   }
+  /**
+   * Server-side apply `value` unless a foreign object holds its name. `fetched` holds objects this
+   * pass already read, keyed by path, so the adoption check does not GET them again.
+   */
   private async ensure(
     value: Resource,
     bootstrap = false,
     adoptSameBinding = false,
+    fetched?: ReadonlyMap<string, Resource | undefined>,
   ): Promise<Resource> {
-    const existing = await this.get<Resource>(location(value));
+    const path = location(value);
+    const existing = fetched?.has(path) ? fetched.get(path) : await this.get<Resource>(path);
     const labels = existing?.metadata.labels;
     const sameBinding =
       adoptSameBinding &&
@@ -441,7 +447,11 @@ export class Controller {
    * reconcile), the API server endpoints, the controller certificate (kept until 30 days before
    * it expires) and the shared OAuth client secret from the platform namespace.
    */
-  private async tenantAuthInputs(tenant: Tenant, users: User[]): Promise<TenantAuthInputs> {
+  private async tenantAuthInputs(
+    tenant: Tenant,
+    users: User[],
+    fetched: Map<string, Resource | undefined>,
+  ): Promise<TenantAuthInputs> {
     const auth = this.cfg.tenantAuth!;
     const name = tenant.metadata.name;
     const members = users
@@ -464,7 +474,7 @@ export class Controller {
       ],
       port: slices[0]?.ports?.[0]?.port ?? 443,
     };
-    const tls = await this.controllerTls(name, auth);
+    const tls = await this.controllerTls(name, auth, fetched);
     const oauth = await this.get<{ data?: Record<string, string> }>(
       `${collection('v1', 'Secret', this.cfg.namespace)}/${auth.oauthClient.secretName}`,
     );
@@ -480,28 +490,32 @@ export class Controller {
    * The controller's TLS material: a long-lived CA and a leaf it signed. Both are reused while they
    * verify against each other (the leaf by the CA's signature and key, the CA as `CA:TRUE` with its
    * stored key), so a leaf renewal keeps the CA and does not roll the hosts or invalidate kubeconfigs.
-   * A Secret from before the CA existed has no `ca.crt` and is replaced once.
+   * A Secret from before the CA existed has no `ca.crt` and is replaced once. The Secrets read
+   * are recorded in `fetched`, so applying them later in the pass does not read them again.
    */
   private async controllerTls(
     tenant: string,
     auth: TenantAuthConfig,
+    fetched: Map<string, Resource | undefined>,
   ): Promise<TenantAuthInputs['tls']> {
     const runtimeNamespace = names(tenant).runtimeNamespace;
-    const read = async (secret: string, key: string) =>
-      Buffer.from(
-        (
-          await this.get<{ data?: Record<string, string> }>(
-            `${collection('v1', 'Secret', runtimeNamespace)}/${secret}`,
-          )
-        )?.data?.[key] ?? '',
-        'base64',
-      ).toString();
-    const [cert, key, caCert, caKey] = await Promise.all([
-      read('tenant-controller-tls', 'tls.crt'),
-      read('tenant-controller-tls', 'tls.key'),
-      read('tenant-controller-tls', 'ca.crt'),
-      read(TENANT_CONTROLLER_CA_KEY_SECRET, 'ca.key'),
+    // One GET per Secret: several keys are decoded from each.
+    const secret = async (secretName: string) => {
+      const path = `${collection('v1', 'Secret', runtimeNamespace)}/${secretName}`;
+      const value = await this.get<Resource & { data?: Record<string, string> }>(path);
+      fetched.set(path, value);
+      return (key: string) => Buffer.from(value?.data?.[key] ?? '', 'base64').toString();
+    };
+    const [tlsSecret, caKeySecret] = await Promise.all([
+      secret('tenant-controller-tls'),
+      secret(TENANT_CONTROLLER_CA_KEY_SECRET),
     ]);
+    const [cert, key, caCert, caKey] = [
+      tlsSecret('tls.crt'),
+      tlsSecret('tls.key'),
+      tlsSecret('ca.crt'),
+      caKeySecret('ca.key'),
+    ];
     const certNames = tenantControllerCertNames(tenant, auth);
     const ca =
       holdsCaKey(caCert, caKey) && certificateValid(caCert, CA_RENEW_DAYS)
@@ -764,11 +778,14 @@ export class Controller {
       }
       this.tenantAuthClean = false;
       const registry = await this.registryState(tenant);
+      // Objects read while computing the inputs, reused by the adoption check below.
+      const fetched = new Map<string, Resource | undefined>();
       const desired = tenantAuthResources(tenant, this.cfg, {
         ...(await this.tenantAuthInputs(
           tenant,
           users ??
             (await this.list<User>(VERSION, 'User', { [INSTALLATION]: this.cfg.installation })),
+          fetched,
         )),
         registryServing: registry.serving,
       });
@@ -822,7 +839,7 @@ export class Controller {
       let ready = true;
       const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
       for (const value of desired) {
-        const applied = await this.ensure(value);
+        const applied = await this.ensure(value, false, false, fetched);
         if (value.kind === 'WorkloadDeployment' && !suspended) {
           const conditions = (applied.status as { conditions?: Condition[] } | undefined)
             ?.conditions;

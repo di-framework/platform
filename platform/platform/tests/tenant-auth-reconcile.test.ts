@@ -602,6 +602,18 @@ describe('controller certificate', () => {
     expect(holdsCaKey(ca.cert, ca.key)).toBe(true);
   });
 
+  it("caps the leaf's notAfter at the CA's notAfter", () => {
+    const now = new Date('2026-10-01T00:00:00Z');
+    const ca = caCertificate('CA', 100, now);
+    const caEnd = new Date(new X509Certificate(ca.cert).validTo).getTime();
+    const capped = leafCertificate('leaf', ['a'], [], 365, ca.cert, ca.key, now);
+    expect(new Date(new X509Certificate(capped.cert).validTo).getTime()).toBe(caEnd);
+    const shorter = leafCertificate('leaf', ['a'], [], 30, ca.cert, ca.key, now);
+    expect(new Date(new X509Certificate(shorter.cert).validTo).getTime()).toBe(
+      now.getTime() + 30 * 86_400_000,
+    );
+  });
+
   it('encodes the CA and leaf extensions RFC 5280 requires', () => {
     const ca = caCertificate('CA', 30);
     const leaf = leafCertificate('leaf', ['a'], [], 30, ca.cert, ca.key);
@@ -899,6 +911,21 @@ describe('reconcileTenant with tenant-auth', () => {
     await controller.reconcileTenant(t, []);
     expect(api.objects.get(tlsPath)?.data).toEqual(first);
     expect(api.objects.get(caKeyPath)?.data).toEqual(keys);
+  });
+
+  it('reads each controller TLS Secret once per reconcile pass', async () => {
+    const { api, controller, t } = prepare();
+    const gets = new Map<string, number>();
+    api.fail = (method, p) => {
+      if (method === 'GET') gets.set(p, (gets.get(p) ?? 0) + 1);
+      return undefined;
+    };
+    for (let pass = 1; pass <= 2; pass++) {
+      gets.clear();
+      await controller.reconcileTenant(t, []);
+      expect(gets.get(tlsPath)).toBe(1);
+      expect(gets.get(caKeyPath)).toBe(1);
+    }
   });
 
   it('renews an expiring leaf under the same CA', async () => {

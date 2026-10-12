@@ -549,10 +549,18 @@ tenantAuth:
   years) and a leaf it signs (`CA:FALSE`, server auth, 365 days) for `tenant-controller` and the host
   of `controllerPublicUrl`. The leaf, its key and `ca.crt` are in Secret `tenant-controller-tls`; the
   console and the hosts pin only the CA, from ConfigMap `tenant-controller-ca`. The CA key is in
-  Secret `tenant-controller-ca-key` in the same runtime namespace, which no pod mounts and no
-  tenant role can read. The leaf is replaced 30 days before it expires, when its names change, or
-  when it no longer verifies against the stored CA; the CA is replaced only near its own expiry or
-  when its key is missing. A leaf renewal therefore keeps the CA, so hosts do not roll and
+  Secret `tenant-controller-ca-key` in the same runtime namespace. No pod mounts it and no tenant
+  member role can read it, but the tenant controller's ServiceAccount can: its
+  `tenant-controller-keys` Role (for API-key Secrets) grants `get` on every Secret in that
+  namespace. The leaf is replaced 30 days before it expires, when its names change, or when it no
+  longer verifies against the stored CA. The leaf's `notAfter` never passes the CA's. The CA is
+  replaced only when one of these holds:
+  - it expires within 90 days;
+  - its key is missing or does not match it;
+  - `ca.crt` is missing from `tenant-controller-tls`, for example because that Secret was
+    deleted.
+
+  A leaf renewal therefore keeps the CA, so hosts do not roll and
   kubeconfigs the console issued stay valid; the leaf digest in both pod templates rolls the pair.
   A Secret from before the CA existed (one `CA:TRUE` certificate, no `ca.crt`) is replaced once.
 - Routes: when the platform gateway is published (`routeUrlPattern`), a public URL whose host is
