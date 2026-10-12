@@ -861,3 +861,83 @@ describe('scripts/wash-pins.sh (the wash pin set)', () => {
     expect(run([])).toEqual([]);
   });
 });
+
+describe('digest artifacts: no download pattern reaches another artifact', () => {
+  /** The variant tags, in table order, from platform/tenant-host/variants. */
+  const tags = read('platform/tenant-host/variants')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '' && !line.startsWith('#'))
+    .map((line) => line.split(/\s+/)[0] ?? '');
+  const workflow = parse('.github/workflows/tenant-host-image.yml');
+  const arches = workflow.jobs.build?.strategy?.matrix?.arch as string[];
+  const withOf = (job: string, action: string) =>
+    (workflow.jobs[job]?.steps ?? [])
+      .filter((s) => s.uses?.startsWith(`${action}@`))
+      .map((s) => s.with ?? {});
+  const render = (template: string, tag: string, arch = '') =>
+    template.replaceAll('${{ matrix.variant.tag }}', tag).replaceAll('${{ matrix.arch }}', arch);
+  /** The artifact names one variant's build uploads (one per arch). */
+  const uploads = (tag: string) =>
+    withOf('build', 'actions/upload-artifact').flatMap((w) =>
+      arches.map((arch) => render(w.name ?? '', tag, arch)),
+    );
+  /** The artifact names one variant's merge downloads, simulated over `candidates`. */
+  const downloads = (tag: string, candidates: string[]) =>
+    candidates.filter((name) =>
+      withOf('merge', 'actions/download-artifact').some((w) =>
+        w.pattern !== undefined
+          ? new Bun.Glob(render(w.pattern, tag)).match(name)
+          : render(w.name ?? '', tag) === name,
+      ),
+    );
+
+  test('the table and the build matrix are read', () => {
+    expect(tags).toEqual(['2.8.0-wasi-tls', '2.8.0-wasi-tls-exclusive']);
+    expect(arches).toEqual(['amd64', 'arm64']);
+    expect(withOf('build', 'actions/upload-artifact')).toHaveLength(1);
+    expect(withOf('merge', 'actions/download-artifact')).toHaveLength(arches.length);
+  });
+
+  test('every variant merges exactly its own per-arch digests, even when one tag prefixes another', () => {
+    // 2.8.0-wasi-tls prefixes 2.8.0-wasi-tls-exclusive: a `<tag>-*` pattern took both variants'
+    // digests and the canonical merge found 4 (#186). Also check hypothetical tags.
+    const sets = [tags, [...tags, '2.8.0-wasi-tls-amd64', '2.8.0', '2.8.0-wasi-tls-exclusive-x']];
+    for (const set of sets) {
+      const all = set.flatMap(uploads);
+      expect(new Set(all).size).toBe(all.length);
+      for (const tag of set) {
+        expect(uploads(tag)).toHaveLength(arches.length);
+        expect(downloads(tag, all).sort(), tag).toEqual(uploads(tag).sort());
+      }
+    }
+  });
+
+  test('the tenant-auth index downloads only the per-arch publish reports', () => {
+    const auth = parse('.github/workflows/tenant-auth-image.yml');
+    const include = (auth.jobs['publish-platform']?.strategy?.matrix?.include ?? []) as {
+      arch: string;
+    }[];
+    const authArches = include.map((i) => i.arch);
+    expect(authArches).toEqual(['amd64', 'arm64']);
+    const names = Object.values(auth.jobs).flatMap((job) =>
+      (job.steps ?? [])
+        .filter((s) => s.uses?.startsWith('actions/upload-artifact@'))
+        .flatMap((s) =>
+          (s.with?.name ?? '').includes('${{ matrix.arch }}')
+            ? authArches.map((arch) => (s.with?.name ?? '').replaceAll('${{ matrix.arch }}', arch))
+            : [s.with?.name ?? ''],
+        ),
+    );
+    const patterns = Object.values(auth.jobs).flatMap((job) =>
+      (job.steps ?? [])
+        .filter((s) => s.uses?.startsWith('actions/download-artifact@'))
+        .map((s) => s.with?.pattern ?? s.with?.name ?? ''),
+    );
+    expect(patterns).toHaveLength(1);
+    const glob = new Bun.Glob(patterns[0] ?? '');
+    expect(names.filter((n) => glob.match(n)).sort()).toEqual(
+      authArches.map((arch) => `tenant-auth-${arch}`).sort(),
+    );
+  });
+});
