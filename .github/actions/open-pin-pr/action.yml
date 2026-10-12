@@ -68,6 +68,15 @@ runs:
           exit 0
         fi
         branch="bot/pin-${NAME}"
+        # The bot's own open PR on exactly this branch. `--head` matches exactly only without
+        # `--author` (which switches gh to the search API, where it is a prefix match and
+        # bot/pin-wash would also find bot/pin-wash-*), so the author and the branch are both
+        # checked in jq. A human-authored PR on the same branch is never touched.
+        own_pr() {
+          BRANCH="${branch}" gh pr list --head "${branch}" --base main --state open \
+            --json number,author,headRefName \
+            --jq 'map(select(.author.login == "app/github-actions" and .headRefName == env.BRANCH)) | .[0].number // empty'
+        }
         if (( ${#summary[@]} == 1 )); then
           title="chore: pin ${summary[0]}"
         else
@@ -77,14 +86,13 @@ runs:
         bun scripts/pin-artifact.ts "${args[@]}"
         if git diff --quiet; then
           echo "Already pinned on ${GITHUB_SHA}; no PR needed"
-          # main already pins every published variant of the current source, so an open pin PR on
-          # this branch is for another source (e.g. "pin to B" after a revert to A) or redundant;
-          # merging it could only pin a build main no longer has. Close it. Only the bot's own
-          # bot/pin-<name> branch is matched.
-          existing="$(gh pr list --head "${branch}" --base main --state open --author app/github-actions --json number --jq '.[0].number // empty')"
+          # main already pins every published variant of the current source, so the bot's open pin
+          # PR on this branch (own_pr) is for another source (e.g. "pin to B" after a revert to A)
+          # or redundant; merging it could only pin a build main no longer has. Close it.
+          existing="$(own_pr)"
           if [[ -n "${existing}" ]]; then
             joined="$(printf '%s; ' "${summary[@]}")"
-            gh pr close "${existing}" --delete-branch --comment "Superseded: main already pins the current source (${joined%; }, as of ${GITHUB_SHA}). This PR would pin a different build, or nothing new, so it is closed."
+            gh pr close "${existing}" --delete-branch --comment "Superseded: main already pins the current source (${joined%; }, as of ${GITHUB_SHA}). This PR on ${branch} would pin a different build, or nothing new, so it is closed and ${branch} deleted; the next publish of a different source opens a new one."
             echo "::notice::closed superseded pin PR #${existing}"
           fi
           exit 0
@@ -109,7 +117,7 @@ runs:
           echo 'that `GITHUB_TOKEN` creates or updates, so no checks start on their own. Close and reopen'
           echo 'the PR (or push a commit to the branch) to run CI, then review and merge as usual.'
         } > "${body}"
-        existing="$(gh pr list --head "${branch}" --base main --state open --author app/github-actions --json number --jq '.[0].number // empty')"
+        existing="$(own_pr)"
         if [[ -n "${existing}" ]]; then
           gh pr edit "${existing}" --title "${title}" --body-file "${body}"
           echo "Updated PR #${existing}"

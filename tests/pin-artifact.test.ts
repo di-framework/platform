@@ -149,6 +149,17 @@ test('the CLI pins several artifacts in one edit', () => {
   expect(readme).toContain(`wash:2.8.0-wasi-tls-exclusive@${OTHER}`);
 });
 
+interface OpenPr {
+  number: number;
+  headRefName: string;
+  author: { login: string };
+}
+const botPr = (number: number, headRefName: string): OpenPr => ({
+  number,
+  headRefName,
+  author: { login: 'app/github-actions' },
+});
+
 describe('.github/actions/open-pin-pr against a local origin', () => {
   const action = Bun.YAML.parse(
     readFileSync(join(repo, '.github/actions/open-pin-pr/action.yml'), 'utf8'),
@@ -185,13 +196,34 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
     // A fake gh that records its arguments and reports no open PR.
     const bin = join(base, 'bin');
     mkdirSync(bin);
-    // A fake gh that records its arguments; `pr list` reports $OPEN_PR (empty: no open PR).
+    // A fake gh that records its arguments. `pr list` answers from $OPEN_PRS, a JSON list of
+    // {number, headRefName, author: {login}}, the way the real one does: `--head` is an exact
+    // match, except that `--author` switches to search, where `--head` is a prefix match. The
+    // `--jq` filter is applied with the caller's environment.
     writeFileSync(
       join(bin, 'gh'),
-      `#!/bin/sh\necho "$*" >> "${base}/gh.log"\nif [ "$1 $2" = "pr list" ]; then echo "\${OPEN_PR:-}"; fi\n`,
+      [
+        '#!/bin/bash',
+        `printf '%s\\n' "$*" >> "${base}/gh.log"`,
+        '[[ "$1 $2" == "pr list" ]] || exit 0',
+        'head="" filter="." search=false',
+        'while (( $# )); do',
+        '  case "$1" in',
+        '    --head) head="$2"; shift ;;',
+        '    --jq) filter="$2"; shift ;;',
+        '    --author) search=true; shift ;;',
+        '  esac',
+        '  shift',
+        'done',
+        'jq -r --arg head "$head" --argjson search "$search" \\',
+        `  '[.[] | select(if $search then (.headRefName | startswith($head)) else .headRefName == $head end)]' \\`,
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion
+        '  <<<"${OPEN_PRS:-[]}" | jq -r "$filter"',
+        '',
+      ].join('\n'),
     );
     chmodSync(join(bin, 'gh'), 0o755);
-    const run = (pins: string, event = 'push', openPr = '') =>
+    const run = (pins: string, event = 'push', openPrs: OpenPr[] = []) =>
       Bun.spawnSync(['bash', '-c', script], {
         cwd: work,
         stdout: 'pipe',
@@ -203,7 +235,7 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
           EVENT: event,
           NAME: 'wash',
           WORKFLOW: 'w.yml',
-          OPEN_PR: openPr,
+          OPEN_PRS: JSON.stringify(openPrs),
           PINS: pins,
           GH_TOKEN: 'x',
           RUN_URL: 'https://example.invalid/run',
@@ -292,16 +324,16 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
     expect(box.branches()).not.toContain('bot/pin-wash');
     // Only the read-only lookup of an open bot PR; nothing is opened, edited or closed.
     expect(box.ghCalls().filter((c) => !c.startsWith('pr list'))).toEqual([]);
-    expect(box.ghCalls()).toEqual([
-      'pr list --head bot/pin-wash --base main --state open --author app/github-actions --json number --jq .[0].number // empty',
-    ]);
+    expect(box.ghCalls()).toHaveLength(1);
+    expect(box.ghCalls()[0]).toStartWith('pr list --head bot/pin-wash --base main --state open');
+    expect(box.ghCalls()[0]).not.toContain('--author');
   });
 
   test('main already pinned: an open pin PR for another build is closed with its branch (#173 W1)', () => {
     // "pin to B" is open; main was reverted to A, which main already pins.
     const box = sandbox();
     box.pinOnMain('pglite-component', DIGEST);
-    const result = box.run(`pglite-component ${DIGEST}`, 'push', '42');
+    const result = box.run(`pglite-component ${DIGEST}`, 'push', [botPr(42, 'bot/pin-wash')]);
     expect(result.exitCode, result.stderr.toString()).toBe(0);
     const close = box.ghCalls().filter((c) => c.startsWith('pr close'));
     expect(close).toHaveLength(1);
@@ -309,6 +341,7 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
       'pr close 42 --delete-branch --comment Superseded: main already pins',
     );
     expect(close[0]).toContain(`pglite-component to ${DIGEST}`);
+    expect(close[0]).toContain('This PR on bot/pin-wash would pin');
     expect(box.ghCalls().some((c) => /^pr (create|edit)/.test(c))).toBe(false);
   });
 
@@ -318,7 +351,7 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
     // without reading the PR, so it treats both the same.
     const box = sandbox();
     box.pinOnMain('pglite-component', DIGEST);
-    box.run(`pglite-component ${DIGEST}`, 'push', '7');
+    box.run(`pglite-component ${DIGEST}`, 'push', [botPr(7, 'bot/pin-wash')]);
     expect(box.ghCalls().filter((c) => c.startsWith('pr close 7 --delete-branch'))).toHaveLength(1);
   });
 
@@ -338,6 +371,43 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
     const result = box.run(`pglite-component ${DIGEST}`);
     expect(result.exitCode, result.stderr.toString()).toBe(0);
     expect(box.ghCalls().filter((c) => c.startsWith('pr create'))).toHaveLength(2);
+  });
+
+  test('a bot PR on a longer branch (bot/pin-wash-x) is neither closed nor edited', () => {
+    const others = [botPr(9, 'bot/pin-wash-x')];
+    const pinned = sandbox();
+    pinned.pinOnMain('pglite-component', DIGEST);
+    expect(pinned.run(`pglite-component ${DIGEST}`, 'push', others).exitCode).toBe(0);
+    expect(pinned.ghCalls().filter((c) => !c.startsWith('pr list'))).toEqual([]);
+    const fresh = sandbox();
+    const result = fresh.run(`pglite-component ${DIGEST}`, 'push', others);
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(fresh.ghCalls().some((c) => /^pr (edit|close) 9\b/.test(c))).toBe(false);
+    expect(
+      fresh.ghCalls().some((c) => c.startsWith('pr create --base main --head bot/pin-wash ')),
+    ).toBe(true);
+  });
+
+  test('a human-authored PR on the bot branch is neither closed nor edited', () => {
+    const human = [{ number: 5, headRefName: 'bot/pin-wash', author: { login: 'someone' } }];
+    const box = sandbox();
+    box.pinOnMain('pglite-component', DIGEST);
+    expect(box.run(`pglite-component ${DIGEST}`, 'push', human).exitCode).toBe(0);
+    expect(box.ghCalls().filter((c) => !c.startsWith('pr list'))).toEqual([]);
+    const fresh = sandbox();
+    fresh.run(`pglite-component ${DIGEST}`, 'push', human);
+    expect(fresh.ghCalls().some((c) => /^pr (edit|close) 5\b/.test(c))).toBe(false);
+  });
+
+  test("the bot's own open PR on the branch is edited, not duplicated", () => {
+    const box = sandbox();
+    const result = box.run(`pglite-component ${DIGEST}`, 'push', [
+      botPr(9, 'bot/pin-wash-x'),
+      botPr(3, 'bot/pin-wash'),
+    ]);
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(box.ghCalls().some((c) => c.startsWith('pr edit 3 --title'))).toBe(true);
+    expect(box.ghCalls().some((c) => c.startsWith('pr create'))).toBe(false);
   });
 
   test('an empty pin list is a no-op, and a bad digest fails before any push', () => {
