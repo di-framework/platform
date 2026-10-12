@@ -10,8 +10,17 @@
 //!   holds.
 //! - A write past the end first zero-fills the gap with encrypted zeros: a hole
 //!   left by the host would read back as garbage, not zeros.
-//! - Shrinking to a partial unit rewrites that unit, then truncates. A crash in
-//!   between leaves a longer file with a valid tail.
+//! - Torn and interrupted writes behave like plaintext at 16-byte block
+//!   granularity, except at a final partial block: changing the length of a
+//!   unit that ends mid-block re-encrypts its last full block and the partial
+//!   block (ciphertext stealing, or the sub-block mask). A crash in the middle
+//!   of such a resize or append can therefore garble up to 31 durable bytes
+//!   just before the old or new end of file (see the
+//!   `unaligned_resizes_bound_crash_damage` test, and #206). Relation and WAL I/O is in
+//!   whole 8 KiB pages and never hits this.
+//! - Sizes are capped at [`MAX_SIZE`], and a write may extend a file by at
+//!   most [`MAX_GAP`] of zero fill, so absurd offsets fail instead of writing
+//!   terabytes of encrypted zeros.
 //!
 //! The functions are generic over [`Storage`] so the host build can test them
 //! against memory.
@@ -22,6 +31,10 @@ use crate::header::HEADER_LEN;
 /// Zero-fill and extension happen in chunks of this many bytes, so a large
 /// `set-size` never needs a buffer of the full size.
 pub const FILL_CHUNK: u64 = 1 << 20;
+/// Largest logical file size (1 TiB; PostgreSQL segments are 1 GiB).
+pub const MAX_SIZE: u64 = 1 << 40;
+/// Largest zero fill one write or `set-size` may add (one PostgreSQL segment).
+pub const MAX_GAP: u64 = 1 << 30;
 
 /// Positional I/O on the physical file.
 pub trait Storage {
@@ -39,6 +52,8 @@ pub enum FileError<E> {
     Storage(E),
     /// The physical file is shorter than its logical size implies.
     Truncated,
+    /// The write would pass [`MAX_SIZE`] or zero-fill more than [`MAX_GAP`].
+    TooLarge,
 }
 
 impl<E> From<E> for FileError<E> {
@@ -93,6 +108,13 @@ impl<S: Storage> EncryptedFile<'_, S> {
     /// Write `data` at `offset`, extending the file as needed.
     pub fn write(&self, offset: u64, data: &[u8]) -> FileResult<(), S::Error> {
         let mut size = self.size()?;
+        offset
+            .checked_add(data.len() as u64)
+            .filter(|&end| end <= MAX_SIZE)
+            .ok_or(FileError::TooLarge)?;
+        if offset.saturating_sub(size) > MAX_GAP {
+            return Err(FileError::TooLarge);
+        }
         while size < offset {
             let fill = (offset - size).min(FILL_CHUNK);
             self.write_within(size, &vec![0; fill as usize], size)?;
@@ -140,6 +162,7 @@ impl<S: Storage> EncryptedFile<'_, S> {
         if data.is_empty() {
             return Ok(());
         }
+        // `write` checked that `end` is at most MAX_SIZE.
         let end = offset + data.len() as u64;
         let new_size = size.max(end);
         let (first, last) = (offset / UNIT, (end - 1) / UNIT);
@@ -416,6 +439,167 @@ pub(crate) mod tests {
         assert_eq!(
             file.write(0, b"x").unwrap_err(),
             FileError::Storage("stat failed")
+        );
+    }
+
+    #[test]
+    fn absurd_offsets_fail_instead_of_filling_terabytes() {
+        let (c, m) = (cipher(), with_header());
+        let file = EncryptedFile {
+            cipher: &c,
+            storage: &m,
+        };
+        assert_eq!(file.write(u64::MAX, b"x").unwrap_err(), FileError::TooLarge);
+        assert_eq!(file.write(MAX_SIZE, b"x").unwrap_err(), FileError::TooLarge);
+        assert_eq!(
+            file.write(MAX_GAP + 1, b"x").unwrap_err(),
+            FileError::TooLarge
+        );
+        assert_eq!(file.set_size(MAX_GAP + 1).unwrap_err(), FileError::TooLarge);
+        assert_eq!(m.0.borrow().len() as u64, HEADER_LEN, "nothing was written");
+        file.write(10, b"x").unwrap();
+        assert_eq!(file.size().unwrap(), 11);
+    }
+
+    /// Storage that loses the effect of a crash: `set_len` never happens, and
+    /// bytes written past the current end never reach the disk.
+    struct Crashing(Memory);
+    impl Storage for Crashing {
+        type Error = ();
+        fn size(&self) -> Result<u64, ()> {
+            self.0.size()
+        }
+        fn read_at(&self, o: u64, l: u64) -> Result<Vec<u8>, ()> {
+            self.0.read_at(o, l)
+        }
+        fn write_at(&self, o: u64, d: &[u8]) -> Result<(), ()> {
+            let len = self.0.size()?;
+            let keep = len.saturating_sub(o).min(d.len() as u64) as usize;
+            self.0.write_at(o, &d[..keep])
+        }
+        fn set_len(&self, _: u64) -> Result<(), ()> {
+            Err(())
+        }
+    }
+
+    /// Bytes of `durable` that read back differently after a simulated crash.
+    fn damage(storage: &Memory, durable: &[u8]) -> Vec<usize> {
+        let c = cipher();
+        let file = EncryptedFile {
+            cipher: &c,
+            storage,
+        };
+        let (now, _) = file.read(durable.len() as u64, 0).unwrap();
+        (0..durable.len())
+            .filter(|&i| now[i] != durable[i])
+            .collect()
+    }
+
+    fn assert_bounded(damaged: &[usize], durable_len: usize, aligned: bool, case: &str) {
+        if aligned {
+            assert!(
+                damaged.is_empty(),
+                "{case}: aligned lengths must not lose bytes: {damaged:?}"
+            );
+        }
+        let floor = (durable_len / 16 * 16).saturating_sub(16);
+        assert!(
+            damaged.len() <= 31,
+            "{case}: {} bytes damaged",
+            damaged.len()
+        );
+        assert!(
+            damaged.iter().all(|&i| i >= floor),
+            "{case}: damage before {floor}: {damaged:?}"
+        );
+    }
+
+    #[test]
+    fn unaligned_resizes_bound_crash_damage() {
+        // W2 of the #201 review: XTS keeps torn writes plaintext-like only for whole
+        // 16-byte blocks. Changing the length of a unit that ends mid-block
+        // re-encrypts its last full block and the partial one, so a crash between
+        // that rewrite and the size change garbles at most 31 bytes just before the
+        // durable end; aligned lengths lose nothing.
+        let c = cipher();
+        let data: Vec<u8> = (0..3 * UNIT as usize)
+            .map(|i| (i * 7 % 251) as u8 + 1)
+            .collect();
+        let lengths = [
+            5,
+            16,
+            17,
+            31,
+            32,
+            4000,
+            4001,
+            4095,
+            4096,
+            4096 + 17,
+            8192 + 33,
+        ];
+        for &old in &lengths {
+            for &new in &lengths {
+                let setup = |len: usize| {
+                    let m = with_header();
+                    EncryptedFile {
+                        cipher: &c,
+                        storage: &m,
+                    }
+                    .write(0, &data[..len])
+                    .unwrap();
+                    Crashing(m)
+                };
+                let aligned = old % 16 == 0 && new % 16 == 0;
+                if new < old {
+                    // Shrink: the tail unit is rewritten, then the crash skips set_len.
+                    let s = setup(old);
+                    let crashed = EncryptedFile {
+                        cipher: &c,
+                        storage: &s,
+                    }
+                    .set_size(new as u64);
+                    assert!(crashed.is_err());
+                    let case = format!("shrink {old}->{new}");
+                    assert_bounded(&damage(&s.0, &data[..new]), new, aligned, &case);
+                } else if new > old {
+                    // Append: the new ciphertext lands, the size never grows.
+                    let s = setup(old);
+                    EncryptedFile {
+                        cipher: &c,
+                        storage: &s,
+                    }
+                    .write(old as u64, &data[old..new])
+                    .unwrap();
+                    let case = format!("append {old}->{new}");
+                    assert_bounded(&damage(&s.0, &data[..old]), old, aligned, &case);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_review_reproduction_damages_17_bytes() {
+        // set_size(4001) on a 4096-byte file, crash before set_len: bytes 3984..=4000.
+        let c = cipher();
+        let data: Vec<u8> = (0..4096usize).map(|i| (i % 251) as u8 + 1).collect();
+        let m = with_header();
+        EncryptedFile {
+            cipher: &c,
+            storage: &m,
+        }
+        .write(0, &data)
+        .unwrap();
+        let s = Crashing(m);
+        assert!(EncryptedFile {
+            cipher: &c,
+            storage: &s
+        }
+        .set_size(4001)
+        .is_err());
+        assert_eq!(
+            damage(&s.0, &data[..4001]),
+            (3984..=4000).collect::<Vec<_>>()
         );
     }
 

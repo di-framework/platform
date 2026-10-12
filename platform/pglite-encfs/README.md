@@ -51,6 +51,7 @@ Before pglite can touch a preopen, encfs checks the `.di-encfs` marker at its ro
 |---|---|
 | marker matches `DI_PGLITE_KEY` | start |
 | empty directory (`lost+found` ignored) | write the marker, start |
+| empty or short marker, no other data (a crash during the first start) | write the marker again, start |
 | marker matches `DI_PGLITE_KEY_PREVIOUS` | rotate (below), start |
 | marker matches neither key | **refused** (`access`) |
 | `DI_PGLITE_KEY` missing or invalid | **refused** (`access`) |
@@ -58,7 +59,8 @@ Before pglite can touch a preopen, encfs checks the `.di-encfs` marker at its ro
 
 - **A refusal changes nothing.** It locks the whole preopen before anything is written. pglite surfaces it as `open-failed(...)`, and encfs prints the reason to stderr (for example, `pglite-encfs: the data directory was encrypted with a different key ...`).
 - **No partial encryption.** encfs never encrypts an existing plaintext directory in place, and never accepts a mix of plaintext and encrypted files.
-- **Per-file checks.** A file wrapped under another key fails with `access`. A file without a header, or a header that does not authenticate, fails with `io`.
+- **Per-file checks.** A file wrapped under another key fails with `access`. A file without a header, or a header that does not authenticate, fails with `io`. That includes a plaintext file of any size dropped into an encrypted directory: it is neither read nor rewritten.
+- **Atomic marker.** The marker is written to `.di-encfs.tmp`, synced and renamed into place. pglite can reach neither name; paths are normalized (`.`, `..`, `//`) before the check.
 
 ### Key custody: losing the key means losing the data
 
@@ -105,24 +107,27 @@ Keys:
 
 Header lifecycle:
 - An empty file has no header.
-- The header is written with the first byte of data and is never removed. Truncating to zero keeps it, so a file id never changes while its inode exists.
+- The header is written with the first byte of data and synced before any data follows it. It is never removed: truncating to zero keeps it, so a file id never changes while its inode exists.
+- A file no longer than a header whose start is all zero (a crash made its size durable before its header) holds no data. It is treated as empty and sealed with a new header on its first write, and rotation skips it. A zero header on a longer file, or non-zero bytes that are not a header, are refused.
 
 Data units:
 - AES-256-XTS over 4 KiB units with tweak = unit index. The scheme is length-preserving: logical size = physical size − 4096.
 - A final partial unit of 16 bytes or more uses ciphertext stealing.
 - A final unit shorter than 16 bytes is XORed with an AES block keyed by the tweak key. This only happens in tiny files such as `PG_VERSION`, and two versions of such a tail with the same length leak their XOR.
+- Logical sizes are capped at 1 TiB, and one write or `set-size` may zero-fill at most 1 GiB past the end of file (`file-too-large` otherwise).
 
 ### Crash consistency
 
 - **Write path.** encfs caches nothing. Each logical write becomes one host `pwrite`, after a read-modify-write of a partial first or last unit, and `sync`/`sync-data` pass straight through. PostgreSQL's fsync ordering is therefore preserved.
-- **Torn writes.** XTS encrypts each 16-byte block independently and deterministically. A write torn at a sector boundary therefore decrypts to old sectors followed by new sectors, which is exactly what PostgreSQL expects from a plain disk.
+- **Torn writes, whole blocks.** XTS encrypts each 16-byte block independently and deterministically. A write of whole 16-byte blocks torn at a sector boundary therefore decrypts to old sectors followed by new sectors, which is exactly what PostgreSQL expects from a plain disk. Relation and WAL I/O is always in whole 8 KiB pages.
   - Already-durable WAL records keep identical ciphertext when the WAL tail page is rewritten.
   - `make smoke` checks three power-loss tears; in each, the fsynced commit survives:
     - the last WAL write in flight
     - a rewrite of the WAL page that already holds an fsynced commit
     - a `pg_control` rewrite
   - An AEAD codec failed the last two cases in the spike: a lost commit, and `PANIC` on `pg_control`. A crash-safe AEAD design is the follow-up #200.
-- **Shrinking `set-size`.** Shrinking to a partial unit rewrites that unit and then truncates. A crash in between leaves a longer file with a valid tail.
+- **Unaligned ends: up to 31 bytes.** Ciphertext stealing and the sub-block mask make the encryption of a unit's last full block and partial block depend on the unit's length. Changing the length of a unit that ends mid-block (a shrink to, or an append at, an offset that is not a multiple of 16) re-encrypts those durable bytes. A crash between that rewrite and the size change can garble up to 31 bytes just before the durable end of file. Lengths that are multiples of 16 lose nothing. The bound is pinned by `unaligned_resizes_bound_crash_damage`; a length-independent tail encoding is tracked in #206.
+- **New files.** The header is synced before the first data write, so a crash leaves either a fresh file (re-sealed on the next write) or a valid header. `make smoke` zeroes and shortens the files of a freshly created table after a crash, and WAL redo rebuilds it.
 
 ## Threat model
 
@@ -138,6 +143,7 @@ Data units:
 - **A compromised guest.** It sees the plaintext through SQL.
 - **Live memory, core dumps, or swap.**
 - **Tampering.** XTS has no integrity, so modified ciphertext decrypts to garbage instead of failing. Rollback or replay of old ciphertext is also not detected.
+- **Swaps and replay.** Headers are not bound to paths: a whole file (header and data) moved to another path decrypts cleanly there, and an older ciphertext block replayed at the same position of the same file decrypts to the older plaintext. Blocks moved to other positions decrypt to garbage. None of this is detected; the header's AAD binds the file id, not the path. The integrity mode (#200) is where this can be addressed.
 - **Metadata.** File names (relfilenode numbers, WAL segment names), file counts, sizes, timestamps and access patterns are visible. Between two snapshots, which 16-byte blocks changed is also visible.
 - **Availability.** Deleting the key bricks the database by design.
 
@@ -169,16 +175,20 @@ make smoke    # needs wasmtime 48 and ../pglite-component/dist (make -C ../pglit
               # or PGLITE_ENCFS_PGLITE_WASM=/path/to/di-framework-pglite.wasm
 ```
 
+**Dependencies.** Every crate is pinned with `=`. Apart from `xts-mode`, the crypto crates (`aes`, `chacha20poly1305`, `hkdf`, `sha2`, `zeroize`) are RustCrypto. `xts-mode` is a small single-maintainer crate: before bumping it, re-run `make unit`. The known answers in `src/testdata/xts-kat.txt` (the full IEEE 1619 vector 10 and ciphertext-stealing lengths 16–4096, generated by an independent IEEE 1619 reference on OpenSSL AES-256-ECB) must still pass, and any new length class should be cross-checked against that reference first.
+
 **Toolchain.** Rust is pinned in `rust-toolchain.toml` (1.97.1, the same as pglite-component). The crate builds for `wasm32-unknown-unknown` and is wrapped with `wasm-tools component new`, so std adds no WASI imports of its own. Crates are pinned with `=`.
 
 **Unit tests** (`src/*.rs`) cover:
-- the XTS codec (an IEEE 1619 vector, torn-sector behaviour, tiny tails)
+- the XTS codec (all 512 bytes of IEEE 1619 vector 10, independent ciphertext-stealing known answers, torn-sector behaviour, tiny tails)
+- the crash bound for unaligned resizes and appends, and the size caps
+- fresh-file classification after a crash during creation, and refusal of plaintext of any size
 - the header layout and authentication
 - wrong-key detection
 - rotation re-wrapping
 - size semantics against a plaintext model under random writes and resizes
 - key parsing
-- the root-marker decision table
+- the root-marker decision table, including a partial marker after a crash, and marker path normalization
 
 **`make smoke`** plugs encfs into the pglite wasm and the pglite smoke consumer (`../pglite-component/tests/smoke-consumer`) and runs everything under wasmtime with no network:
 - **Interface fit.** encfs's exports are exactly pglite's WASI imports, and the composed provider keeps pglite's imports and exports.
@@ -186,7 +196,8 @@ make smoke    # needs wasmtime 48 and ../pglite-component/dist (make -C ../pglit
 - **Ciphertext on disk.**
   - Every file carries a header under the key's KCV.
   - No row, catalog or config string, and no key material, appears on disk. A plaintext control run shows each of those strings does appear without encryption.
-- **Refusals.** A wrong key, a missing key, an invalid key and a legacy plaintext directory are each refused, with the tree byte-identical afterwards.
+- **Refusals.** A wrong key, a missing key, an invalid key and a legacy plaintext directory are each refused, with the tree byte-identical afterwards. A plaintext file dropped into the encrypted directory is refused and left unchanged.
+- **Crashes during setup.** The first start succeeds over an empty marker. After a table is created and committed and the process dies, its new files are zeroed or shortened (size durable, header not); the next start re-seals them and WAL redo restores the row.
 - **Torn writes.** The three power-loss cases above.
 - **Rotation.** Every header is re-wrapped, an interrupted rotation resumes, and the old key is refused afterwards.
 

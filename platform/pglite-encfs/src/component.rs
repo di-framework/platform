@@ -51,9 +51,11 @@ use xfs::ErrorCode;
 
 use crate::codec::UnitCipher;
 use crate::file::{logical_size, EncryptedFile, FileError, Storage};
-use crate::header::{FileId, Header, HeaderError, DEK_LEN, HEADER_LEN, HEADER_USED};
+use crate::header::{
+    classify, FileId, Header, HeaderError, HeaderState, DEK_LEN, HEADER_LEN, HEADER_USED,
+};
 use crate::keys::{is_key_variable, Kek, KeyRing};
-use crate::marker::{self, Lock, RootDecision, MARKER_LEN, MARKER_NAME};
+use crate::marker::{self, Lock, RootDecision, MARKER_LEN, MARKER_NAME, MARKER_TMP_NAME};
 
 type R<T> = Result<T, ErrorCode>;
 
@@ -70,8 +72,9 @@ const STREAM_WRITE_BUDGET: u64 = 1 << 20;
 
 struct State {
     keys: KeyRing,
-    /// File id → unwrapped cipher. A file's DEK never changes.
-    ciphers: RefCell<BTreeMap<FileId, Rc<UnitCipher>>>,
+    /// Full header bytes → unwrapped cipher. Keyed by the whole header, not
+    /// the file id, so every header in use has been authenticated.
+    ciphers: RefCell<BTreeMap<[u8; HEADER_USED], Rc<UnitCipher>>>,
 }
 
 thread_local! {
@@ -175,6 +178,7 @@ fn host(error: hfs::ErrorCode) -> ErrorCode {
 fn file_error(path: &str, error: FileError<hfs::ErrorCode>) -> ErrorCode {
     match error {
         FileError::Storage(code) => host(code),
+        FileError::TooLarge => ErrorCode::FileTooLarge,
         FileError::Truncated => {
             log(&format!(
                 "{path}: physical file is shorter than its size; refusing"
@@ -279,46 +283,45 @@ impl File {
         Ok(self.host.stat().map_err(host)?.size)
     }
 
-    /// The file's cipher, or `None` while it is empty (no header yet).
+    /// The file's cipher, or `None` while it is fresh: empty, or left with a
+    /// short or zero header by a crash during its creation (see [`classify`]).
+    /// `access` for another key, `io` for plaintext, foreign or damaged files.
     fn cipher(&self) -> R<Option<Rc<UnitCipher>>> {
         if let Some(cipher) = self.cipher.borrow().as_ref() {
             return Ok(Some(cipher.clone()));
         }
-        if self.physical_size()? == 0 {
+        let physical = self.physical_size()?;
+        if physical == 0 {
             return Ok(None);
         }
-        self.load().map(Some)
-    }
-
-    /// Parse the header and unwrap the file key: `access` for another key,
-    /// `io` for plaintext, foreign or damaged files.
-    fn load(&self) -> R<Rc<UnitCipher>> {
+        let start = read_header(&self.host).map_err(host)?;
+        let header = match classify(&start, physical).map_err(|e| header_error(&self.path, e))? {
+            HeaderState::Fresh => return Ok(None),
+            HeaderState::Sealed(header) => header,
+        };
         let state = state();
         let kek = current_key(&state)?;
-        let bytes = read_header(&self.host).map_err(host)?;
-        let header = Header::parse(&bytes).map_err(|e| header_error(&self.path, e))?;
-        let file_id = header.file_id();
-        let cached = state.ciphers.borrow().get(&file_id).cloned();
+        let cached = state.ciphers.borrow().get(header.as_bytes()).cloned();
         let cipher = match cached {
-            Some(cipher) => {
-                // Cached under this id, but the header must still be ours.
-                if !kek.matches(header.kcv()) {
-                    return Err(header_error(&self.path, HeaderError::WrongKey));
-                }
-                cipher
-            }
+            // The same bytes were authenticated under the current key before.
+            Some(cipher) => cipher,
             None => {
                 let dek = header.open(kek).map_err(|e| header_error(&self.path, e))?;
                 let cipher = Rc::new(UnitCipher::new(&dek));
-                state.ciphers.borrow_mut().insert(file_id, cipher.clone());
+                state
+                    .ciphers
+                    .borrow_mut()
+                    .insert(*header.as_bytes(), cipher.clone());
                 cipher
             }
         };
         *self.cipher.borrow_mut() = Some(cipher.clone());
-        Ok(cipher)
+        Ok(Some(cipher))
     }
 
-    /// The cipher for a write, writing a fresh header to an empty file first.
+    /// The cipher for a write, sealing a fresh header first. The header is
+    /// synced before any data can follow it, so a crash never leaves data
+    /// behind a missing header.
     fn cipher_for_write(&self) -> R<Rc<UnitCipher>> {
         if let Some(cipher) = self.cipher()? {
             return Ok(cipher);
@@ -331,8 +334,12 @@ impl File {
         let mut block = vec![0u8; HEADER_LEN as usize];
         block[..HEADER_USED].copy_from_slice(header.as_bytes());
         HostStorage(&self.host).write_at(0, &block).map_err(host)?;
+        self.host.sync_data().map_err(host)?;
         let cipher = Rc::new(UnitCipher::new(&dek));
-        state.ciphers.borrow_mut().insert(file_id, cipher.clone());
+        state
+            .ciphers
+            .borrow_mut()
+            .insert(*header.as_bytes(), cipher.clone());
         *self.cipher.borrow_mut() = Some(cipher.clone());
         Ok(cipher)
     }
@@ -397,21 +404,10 @@ impl File {
 fn open_root(dir: &hfs::Descriptor) -> Result<(), ErrorCode> {
     let state = state();
     let marker = read_marker(dir)?;
-    let has_data = marker.is_none() && root_has_data(dir)?;
+    let has_data = root_has_data(dir)?;
     match marker::decide(&state.keys, marker.as_deref(), has_data) {
         RootDecision::Ready => Ok(()),
-        RootDecision::Initialize => {
-            let kek = current_key(&state)?;
-            let file = dir
-                .open_at(
-                    hfs::PathFlags::empty(),
-                    MARKER_NAME,
-                    hfs::OpenFlags::CREATE | hfs::OpenFlags::EXCLUSIVE,
-                    hfs::DescriptorFlags::READ | hfs::DescriptorFlags::WRITE,
-                )
-                .map_err(host)?;
-            write_marker(dir, &file, kek)
-        }
+        RootDecision::Initialize => write_marker(dir, current_key(&state)?),
         RootDecision::Rotate => {
             let (current, previous) = (
                 current_key(&state)?,
@@ -419,15 +415,7 @@ fn open_root(dir: &hfs::Descriptor) -> Result<(), ErrorCode> {
             );
             let count = rewrap_tree(dir, previous, current, true)?;
             dir.sync().map_err(host)?;
-            let file = dir
-                .open_at(
-                    hfs::PathFlags::empty(),
-                    MARKER_NAME,
-                    hfs::OpenFlags::empty(),
-                    hfs::DescriptorFlags::READ | hfs::DescriptorFlags::WRITE,
-                )
-                .map_err(host)?;
-            write_marker(dir, &file, current)?;
+            write_marker(dir, current)?;
             log(&format!(
                 "key rotation complete: re-wrapped {count} file keys; DI_PGLITE_KEY_PREVIOUS can be removed"
             ));
@@ -460,6 +448,7 @@ fn read_marker(dir: &hfs::Descriptor) -> R<Option<Vec<u8>>> {
     }
 }
 
+/// Whether the root has entries other than volume metadata and our markers.
 fn root_has_data(dir: &hfs::Descriptor) -> R<bool> {
     let entries = dir.read_directory().map_err(host)?;
     while let Some(entry) = entries.read_directory_entry().map_err(host)? {
@@ -470,12 +459,23 @@ fn root_has_data(dir: &hfs::Descriptor) -> R<bool> {
     Ok(false)
 }
 
-/// The marker is 24 bytes in one sector, so the write is atomic.
-fn write_marker(dir: &hfs::Descriptor, file: &hfs::Descriptor, kek: &Kek) -> R<()> {
-    HostStorage(file)
+/// Write the marker for `kek` atomically: a synced temporary file renamed
+/// over the marker, then a directory sync.
+fn write_marker(dir: &hfs::Descriptor, kek: &Kek) -> R<()> {
+    let file = dir
+        .open_at(
+            hfs::PathFlags::empty(),
+            MARKER_TMP_NAME,
+            hfs::OpenFlags::CREATE | hfs::OpenFlags::TRUNCATE,
+            hfs::DescriptorFlags::READ | hfs::DescriptorFlags::WRITE,
+        )
+        .map_err(host)?;
+    HostStorage(&file)
         .write_at(0, &marker::encode(kek.kcv()))
         .map_err(host)?;
     file.sync().map_err(host)?;
+    dir.rename_at(MARKER_TMP_NAME, dir, MARKER_NAME)
+        .map_err(host)?;
     dir.sync().map_err(host)
 }
 
@@ -485,7 +485,10 @@ fn rewrap_tree(dir: &hfs::Descriptor, from: &Kek, to: &Kek, root: bool) -> R<usi
     let mut count = 0;
     let entries = dir.read_directory().map_err(host)?;
     while let Some(entry) = entries.read_directory_entry().map_err(host)? {
-        if root && entry.name == MARKER_NAME {
+        if root
+            && marker::is_volume_metadata(&entry.name)
+            && entry.type_ != hfs::DescriptorType::Directory
+        {
             continue;
         }
         match entry.type_ {
@@ -509,11 +512,17 @@ fn rewrap_tree(dir: &hfs::Descriptor, from: &Kek, to: &Kek, root: bool) -> R<usi
                         hfs::DescriptorFlags::READ | hfs::DescriptorFlags::WRITE,
                     )
                     .map_err(host)?;
-                if file.stat().map_err(host)?.size == 0 {
+                let physical = file.stat().map_err(host)?.size;
+                if physical == 0 {
                     continue;
                 }
-                let header = Header::parse(&read_header(&file).map_err(host)?)
-                    .map_err(|e| header_error(&entry.name, e))?;
+                let start = read_header(&file).map_err(host)?;
+                // A file left fresh by a crash has no key to re-wrap.
+                let header =
+                    match classify(&start, physical).map_err(|e| header_error(&entry.name, e))? {
+                        HeaderState::Fresh => continue,
+                        HeaderState::Sealed(header) => header,
+                    };
                 if to.matches(header.kcv()) {
                     continue;
                 }
@@ -820,7 +829,7 @@ impl Descriptor {
         match self {
             Descriptor::Locked { error, .. } => Err(*error),
             Descriptor::Passthrough { root: true, .. }
-                if path.is_some_and(|p| p.trim_start_matches("./") == MARKER_NAME) =>
+                if path.is_some_and(marker::is_marker_path) =>
             {
                 Err(ErrorCode::Access)
             }
@@ -850,7 +859,12 @@ impl xfs::GuestDirectoryEntryStream for DirectoryEntryStream {
     fn read_directory_entry(&self) -> R<Option<xfs::DirectoryEntry>> {
         loop {
             match self.host.read_directory_entry().map_err(host)? {
-                Some(entry) if self.hide_marker && entry.name == MARKER_NAME => continue,
+                Some(entry)
+                    if self.hide_marker
+                        && (entry.name == MARKER_NAME || entry.name == MARKER_TMP_NAME) =>
+                {
+                    continue
+                }
                 entry => {
                     return Ok(entry.map(|e| xfs::DirectoryEntry {
                         type_: guest_type(e.type_),
@@ -1016,10 +1030,8 @@ impl xfs::GuestDescriptor for Descriptor {
             path,
             cipher: RefCell::default(),
         };
-        if stat.size > 0 {
-            // Refuse another key's or a plaintext file before anything can change it.
-            file.load()?;
-        } else {
+        // Refuse another key's or a plaintext file before anything can change it.
+        if file.cipher()?.is_none() {
             current_key(&state())?;
         }
         if truncate {

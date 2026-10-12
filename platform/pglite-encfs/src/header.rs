@@ -64,6 +64,33 @@ pub enum HeaderError {
     Tampered,
 }
 
+/// What the start of a regular file holds.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HeaderState {
+    /// No data can be in the file yet: it is empty, or a crash while it was
+    /// being created left its size durable but not its header, so the file is
+    /// no longer than a header and its start (short or full) is all zero. A
+    /// fresh header is sealed on the first write.
+    Fresh,
+    Sealed(Header),
+}
+
+/// Classify a regular file of `physical` bytes whose first bytes are `start`
+/// (up to [`HEADER_USED`] of them).
+///
+/// Anything else without a valid header is refused: a zero header on a file
+/// longer than [`HEADER_LEN`] (it may hold data; the header is synced before
+/// any data is written, so a crash cannot produce that state), and any
+/// non-zero bytes that are not a header, however short (a plaintext file must
+/// never be read as an empty encrypted one).
+pub fn classify(start: &[u8], physical: u64) -> Result<HeaderState, HeaderError> {
+    let start = &start[..start.len().min(HEADER_USED)];
+    if physical <= HEADER_LEN && start.iter().all(|&b| b == 0) {
+        return Ok(HeaderState::Fresh);
+    }
+    Header::parse(start).map(HeaderState::Sealed)
+}
+
 /// A parsed header (magic, version and codec already checked).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Header {
@@ -236,6 +263,56 @@ mod tests {
                 codec: 2
             }
         );
+    }
+
+    #[test]
+    fn short_or_zero_headers_without_room_for_data_are_fresh() {
+        // A crash while creating a file: the size became durable, the header did not.
+        for (start, physical) in [
+            (&[][..], 0),
+            (&[0u8; 40][..], 40),
+            (&[0u8; HEADER_USED][..], HEADER_LEN),
+            (&[0u8; HEADER_USED][..], 100),
+            (&[0u8; 100][..], 100),
+        ] {
+            assert_eq!(
+                classify(start, physical),
+                Ok(HeaderState::Fresh),
+                "{physical}"
+            );
+        }
+        let sealed = sealed();
+        assert_eq!(
+            classify(sealed.as_bytes(), HEADER_LEN),
+            Ok(HeaderState::Sealed(sealed.clone()))
+        );
+        assert_eq!(
+            classify(sealed.as_bytes(), HEADER_LEN + 8192),
+            Ok(HeaderState::Sealed(sealed))
+        );
+    }
+
+    #[test]
+    fn files_that_may_hold_data_still_need_a_header() {
+        // Longer than a header: zero or plaintext starts are refused, never re-sealed.
+        assert_eq!(
+            classify(&[0u8; HEADER_USED], HEADER_LEN + 1),
+            Err(HeaderError::NotEncrypted)
+        );
+        assert_eq!(
+            classify(&[b'x'; HEADER_USED], HEADER_LEN + 8192),
+            Err(HeaderError::NotEncrypted)
+        );
+        // Non-zero bytes that are not a header are refused at any size: a small
+        // plaintext file must not be read as an empty encrypted one.
+        assert_eq!(
+            classify(&[b'x'; HEADER_USED], 200),
+            Err(HeaderError::NotEncrypted)
+        );
+        assert_eq!(classify(b"17\n", 3), Err(HeaderError::NotEncrypted));
+        let mut half = [0u8; HEADER_USED];
+        half[..8].copy_from_slice(MAGIC);
+        assert_eq!(classify(&half[..20], 20), Err(HeaderError::NotEncrypted));
     }
 
     #[test]

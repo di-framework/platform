@@ -305,7 +305,13 @@ export async function smoke(ctx: Context): Promise<void> {
 
     // initdb, the full smoke suite, restart and abrupt-exit restart, encrypted.
     await h.run(enc, null, 'no-mount', A, 'no mount ok');
+    // A crash during the first start could leave an empty marker (#201 review W3):
+    // an otherwise empty root is initialized again, not refused as corrupt.
+    await writeFile(join(data, MARKER_FILE), '');
     await h.run(enc, data, 'write', A, 'smoke ok');
+    if (await Bun.file(join(data, `${MARKER_FILE}.tmp`)).exists()) {
+      throw new Error('marker temp file left behind');
+    }
     for (const file of ['PG_VERSION', join('global', 'pg_control')]) {
       if (!(await Bun.file(join(data, 'pglite', 'data', file)).exists()))
         throw new Error(`${file} missing`);
@@ -335,6 +341,47 @@ export async function smoke(ctx: Context): Promise<void> {
     await h.run(enc, data, 'marker-read', A, 'marker-read ok');
     // A plaintext directory is refused, not migrated or mixed.
     await h.refused(enc, plain, A, 'no encryption marker');
+
+    // A plaintext file inside an encrypted directory is refused, never read or
+    // rewritten. postgresql.auto.conf is optional, so PostgreSQL logs the I/O
+    // error and starts without it.
+    const autoConf = join(data, 'pglite', 'data', 'postgresql.auto.conf');
+    const savedConf = await readFile(autoConf);
+    const intruder = Buffer.from('# plaintext dropped into an encrypted directory\n');
+    await writeFile(autoConf, intruder);
+    const intruded = await h.run(enc, data, 'marker-read', A, 'marker-read ok');
+    if (!intruded.includes('postgresql.auto.conf: no encryption header; refusing')) {
+      throw new Error('a plaintext file was not refused');
+    }
+    if (!(await readFile(autoConf)).equals(intruder))
+      throw new Error('the plaintext file was changed');
+    await writeFile(autoConf, savedConf);
+    await h.run(enc, data, 'marker-read', A, 'marker-read ok');
+
+    // A crash while creating a file (#201 review W1): the new relation files'
+    // size is durable but their header is not (zeroed, or cut short). They hold
+    // no data, so they are re-sealed and WAL redo rebuilds the table.
+    const beforeCreate = new Set(await regularFiles(data));
+    await h.run(enc, data, 'create-commit', A, 'create-commit ok');
+    const created = (await regularFiles(data)).filter(
+      (f) => !beforeCreate.has(f) && /\/pglite\/data\/base\//.test(f),
+    );
+    if (created.length === 0) throw new Error('create-commit made no relation file');
+    const afterCreate = await snapshot(data, join(work, 'after-create'));
+    for (const [length, label] of [
+      [HEADER_LEN, 'zeroed header'],
+      [100, 'short header'],
+    ] as const) {
+      const crashed = await snapshot(afterCreate, join(work, 'crashed-create'));
+      for (const file of created)
+        await writeFile(join(crashed, relative(data, file)), new Uint8Array(length));
+      const result = await h.run(enc, crashed, 'check-fresh', A, /^check-fresh /);
+      if (!/^check-fresh N=1$/m.test(result))
+        throw new Error(`${label}: committed row lost after redo`);
+      log(`crash during file creation (${label}, ${created.length} files): redo ok`);
+      await rm(crashed, { recursive: true, force: true });
+    }
+    await rm(afterCreate, { recursive: true, force: true });
 
     // Power-loss torn writes after two fsynced, never-checkpointed commits.
     await h.run(enc, data, 'commit-a', A, 'commit-a ok');

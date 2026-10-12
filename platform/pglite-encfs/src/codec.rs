@@ -4,10 +4,13 @@
 //!   differently.
 //! - Length-preserving: a unit's ciphertext is exactly as long as its plaintext.
 //! - Each 16-byte block is encrypted independently under its (unit, block)
-//!   tweak, and the mode is deterministic. A write torn at any sector boundary
-//!   therefore decrypts to old sectors followed by new ones, which is exactly
-//!   what PostgreSQL's crash recovery expects from a plain disk.
-//! - A final partial unit of 16 bytes or more uses ciphertext stealing.
+//!   tweak, and the mode is deterministic. A write of whole blocks torn at any
+//!   sector boundary therefore decrypts to old sectors followed by new ones,
+//!   which is exactly what PostgreSQL's crash recovery expects from a plain
+//!   disk.
+//! - A final partial unit of 16 bytes or more uses ciphertext stealing. Its
+//!   last full block and partial block depend on the unit's length, so a
+//!   length change re-encrypts them (see `file` for the crash bound and #206).
 //! - A final unit shorter than one AES block (tiny files such as `PG_VERSION`)
 //!   is XORed with `AES_k2(tweak(unit) ^ (0x80 | len) << 120)`. That is
 //!   deterministic: two versions of such a tail with the same length leak their
@@ -111,21 +114,55 @@ mod tests {
         }
     }
 
+    const KAT: &str = include_str!("testdata/xts-kat.txt");
+
+    fn kat_cipher() -> UnitCipher {
+        let mut dek = [0u8; DEK_LEN];
+        dek[..32].copy_from_slice(&hex(
+            "2718281828459045235360287471352662497757247093699959574966967627",
+        ));
+        dek[32..].copy_from_slice(&hex(
+            "3141592653589793238462643383279502884197169399375105820974944592",
+        ));
+        UnitCipher::new(&dek)
+    }
+
     #[test]
     fn known_answer_ieee_1619_vector_10() {
-        // IEEE P1619/D16 XTS-AES-256 vector 10: key1 = 2718281828..., key2 = 3141592653...,
-        // data unit sequence number 0xff, 512 bytes of 00..ff 00..ff.
-        let key1 = hex("2718281828459045235360287471352662497757247093699959574966967627");
-        let key2 = hex("3141592653589793238462643383279502884197169399375105820974944592");
-        let mut dek = [0u8; DEK_LEN];
-        dek[..32].copy_from_slice(&key1);
-        dek[32..].copy_from_slice(&key2);
+        // All 512 bytes of IEEE P1619/D16 XTS-AES-256 vector 10.
+        let expected = KAT.lines().find_map(|l| l.strip_prefix("v10 ")).unwrap();
         let mut buf: Vec<u8> = (0..512).map(|i| i as u8).collect();
-        UnitCipher::new(&dek).encrypt(0xff, &mut buf);
-        assert_eq!(
-            buf[..32],
-            hex("1c3b3a102f770386e4836c99e370cf9bea00803f5e482357a4ae12d414a3e63b")[..]
-        );
+        kat_cipher().encrypt(0xff, &mut buf);
+        assert_eq!(buf, hex(expected));
+        kat_cipher().decrypt(0xff, &mut buf);
+        assert_eq!(buf, (0..512).map(|i| i as u8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn known_answers_with_ciphertext_stealing() {
+        // Partial-block lengths pin the stealing layout, independently of xts-mode.
+        let c = kat_cipher();
+        let mut checked = 0;
+        for line in KAT.lines().filter_map(|l| l.strip_prefix("kat ")) {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let (unit, len): (u64, usize) =
+                (fields[0].parse().unwrap(), fields[1].parse().unwrap());
+            let plain: Vec<u8> = (0..len).map(|i| ((7 * i + 3) % 256) as u8).collect();
+            let mut buf = plain.clone();
+            c.encrypt(unit, &mut buf);
+            let got = match fields[2].strip_prefix("sha256:") {
+                Some(_) => {
+                    use sha2::Digest;
+                    format!("sha256:{:x}", sha2::Sha256::digest(&buf))
+                }
+                None => buf.iter().map(|b| format!("{b:02x}")).collect(),
+            };
+            assert_eq!(got, fields[2], "unit {unit} len {len}");
+            c.decrypt(unit, &mut buf);
+            assert_eq!(buf, plain);
+            checked += 1;
+        }
+        assert_eq!(checked, 21);
     }
 
     #[test]

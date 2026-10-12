@@ -514,6 +514,24 @@ fn durability_mode(db: &Connection, mode: &str) -> bool {
             // `exit` runs no destructors: the connection is never closed.
             std::process::exit(0);
         }
+        // A table created and committed (WAL-fsynced) right before an abrupt
+        // exit: its relation files are new, so a crash can catch them mid-creation.
+        "create-commit" => {
+            db.exec("CREATE TABLE fresh (v text)").unwrap();
+            db.run(
+                "INSERT INTO fresh (v) VALUES ($1)",
+                &[Value::Text("fresh".into())],
+            )
+            .unwrap();
+            println!("create-commit ok");
+            // `exit` runs no destructors: the connection is never closed.
+            std::process::exit(0);
+        }
+        "check-fresh" => {
+            let n = count("SELECT count(*)::int8 FROM fresh", &[]);
+            db.close().unwrap();
+            println!("check-fresh N={n}");
+        }
         "check-ab" => {
             let committed = |tag: &str| {
                 count(

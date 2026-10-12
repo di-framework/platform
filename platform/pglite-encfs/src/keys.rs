@@ -13,6 +13,7 @@
 
 use base64::alphabet;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+use base64::DecodeSliceError;
 use base64::Engine as _;
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
 use hkdf::Hkdf;
@@ -73,18 +74,30 @@ const fn lenient(alphabet: &alphabet::Alphabet) -> GeneralPurpose {
 const ENGINES: [GeneralPurpose; 2] = [lenient(&alphabet::STANDARD), lenient(&alphabet::URL_SAFE)];
 
 /// Decode a base64 master key. Surrounding whitespace is ignored.
+///
+/// Decoding writes only into wiped buffers, including attempts with the wrong
+/// alphabet and inputs that are too long.
 pub fn parse_master_key(text: &str) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyError> {
     let text = text.trim();
-    let decoded = ENGINES
-        .iter()
-        .find_map(|engine| engine.decode(text).ok().map(Zeroizing::new))
-        .ok_or(KeyError::NotBase64)?;
-    if decoded.len() != MASTER_KEY_LEN {
-        return Err(KeyError::WrongLength);
+    let mut wrong_length = false;
+    for engine in &ENGINES {
+        // Room for one extra byte, so a longer key is detected rather than cut.
+        let mut buf = Zeroizing::new([0u8; MASTER_KEY_LEN + 1]);
+        match engine.decode_slice(text, buf.as_mut()) {
+            Ok(MASTER_KEY_LEN) => {
+                let mut key = Zeroizing::new([0u8; MASTER_KEY_LEN]);
+                key.copy_from_slice(&buf[..MASTER_KEY_LEN]);
+                return Ok(key);
+            }
+            Ok(_) | Err(DecodeSliceError::OutputSliceTooSmall) => wrong_length = true,
+            Err(DecodeSliceError::DecodeError(_)) => {}
+        }
     }
-    let mut key = Zeroizing::new([0u8; MASTER_KEY_LEN]);
-    key.copy_from_slice(&decoded);
-    Ok(key)
+    Err(if wrong_length {
+        KeyError::WrongLength
+    } else {
+        KeyError::NotBase64
+    })
 }
 
 /// Key-encryption key and key-check value derived from one master key.
@@ -95,7 +108,10 @@ pub struct Kek {
 
 impl Kek {
     pub fn derive(master: &[u8; MASTER_KEY_LEN]) -> Kek {
-        let hkdf = Hkdf::<Sha256>::new(Some(HKDF_SALT), master);
+        // The returned PRK copy is wiped; the HMAC state inside `Hkdf` cannot be
+        // (hmac/sha2 have no zeroize support) and is dropped here.
+        let (mut prk, hkdf) = Hkdf::<Sha256>::extract(Some(HKDF_SALT), master);
+        prk.as_mut_slice().zeroize();
         let mut key = Zeroizing::new([0u8; 32]);
         let mut kcv = [0u8; KCV_LEN];
         // Both lengths are far below HKDF-SHA256's 8160-byte limit.

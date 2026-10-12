@@ -10,13 +10,36 @@ use crate::keys::{Kcv, KeyRing, KCV_LEN};
 
 /// File name of the marker, hidden from listings of the root.
 pub const MARKER_NAME: &str = ".di-encfs";
+/// The marker is written here, synced, then renamed over [`MARKER_NAME`], so a
+/// crash never leaves a partial marker in place.
+pub const MARKER_TMP_NAME: &str = ".di-encfs.tmp";
 pub const MARKER_MAGIC: &[u8; 8] = b"DIPGKEY1";
 pub const MARKER_LEN: usize = MARKER_MAGIC.len() + KCV_LEN;
 
 /// Entries that do not make a root "non-empty": ext4 volume roots (PVCs)
-/// always carry `lost+found`.
+/// always carry `lost+found`, and the marker files are ours.
 pub fn is_volume_metadata(name: &str) -> bool {
-    name == "lost+found"
+    name == "lost+found" || is_marker_name(name)
+}
+
+fn is_marker_name(name: &str) -> bool {
+    name == MARKER_NAME || name == MARKER_TMP_NAME
+}
+
+/// Whether `path`, relative to a preopen root, names a marker file once `.`,
+/// `..` and repeated slashes are resolved. pglite must never reach them.
+pub fn is_marker_path(path: &str) -> bool {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            name => parts.push(name),
+        }
+    }
+    matches!(parts.as_slice(), [name] if is_marker_name(name))
 }
 
 pub fn encode(kcv: &Kcv) -> [u8; MARKER_LEN] {
@@ -77,6 +100,10 @@ impl Lock {
 
 /// Decide from the marker contents (`None` when absent) and whether the root
 /// has other entries (see [`is_volume_metadata`]).
+///
+/// An empty or short marker in a root without data is what a crash during the
+/// first start could leave behind before markers were written atomically; it
+/// is initialized again rather than reported as corrupt.
 pub fn decide(keys: &KeyRing, marker: Option<&[u8]>, has_data: bool) -> RootDecision {
     let Some(current) = keys.current() else {
         return RootDecision::Locked(Lock::NoKey);
@@ -88,6 +115,9 @@ pub fn decide(keys: &KeyRing, marker: Option<&[u8]>, has_data: bool) -> RootDeci
             RootDecision::Initialize
         };
     };
+    if marker.len() < MARKER_LEN && !has_data {
+        return RootDecision::Initialize;
+    }
     if marker.len() != MARKER_LEN || &marker[..MARKER_MAGIC.len()] != MARKER_MAGIC {
         return RootDecision::Locked(Lock::CorruptMarker);
     }
@@ -188,6 +218,53 @@ mod tests {
                 decide(&ring(Some(1), None), Some(m), true),
                 RootDecision::Locked(Lock::CorruptMarker)
             );
+        }
+        // A full-length marker with the wrong magic is corrupt even in an empty root.
+        assert_eq!(
+            decide(&ring(Some(1), None), Some(&bad_magic), false),
+            RootDecision::Locked(Lock::CorruptMarker)
+        );
+    }
+
+    #[test]
+    fn a_partial_marker_in_an_empty_root_is_initialized_again() {
+        // W3 of the #201 review: a crash during the first start.
+        for m in [&b""[..], &marker(1)[..MARKER_LEN - 1], &marker(1)[..8]] {
+            assert_eq!(
+                decide(&ring(Some(1), None), Some(m), false),
+                RootDecision::Initialize
+            );
+        }
+        assert_eq!(
+            decide(&ring(None, None), Some(b""), false),
+            RootDecision::Locked(Lock::NoKey)
+        );
+        assert!(is_volume_metadata(MARKER_NAME) && is_volume_metadata(MARKER_TMP_NAME));
+    }
+
+    #[test]
+    fn marker_paths_are_recognized_after_normalization() {
+        for path in [
+            ".di-encfs",
+            "./.di-encfs",
+            ".//.di-encfs",
+            "pglite/../.di-encfs",
+            "pglite/data/../../.di-encfs",
+            "/.di-encfs",
+            ".di-encfs.tmp",
+            "../.di-encfs",
+        ] {
+            assert!(is_marker_path(path), "{path}");
+        }
+        for path in [
+            "pglite/.di-encfs",
+            ".di-encfs2",
+            "pglite",
+            "",
+            ".",
+            "a/../b/.di-encfs",
+        ] {
+            assert!(!is_marker_path(path), "{path}");
         }
     }
 
