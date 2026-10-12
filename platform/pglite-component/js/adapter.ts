@@ -426,9 +426,15 @@ function descendsFrom(scope: TransactionScope, ancestor: TransactionScope): bool
  * `fn`'s own async context (tracked with AsyncLocalStorage); from anywhere else
  * it waits for the mutex, which deadlocks if `fn` awaits it.
  *
- * Joining lasts only while the transaction is open. A continuation that runs
- * after it ends, such as a timer scheduled inside `fn` or a retained callback
- * view, takes the mutex like any other caller.
+ * Sibling savepoints are queued on their parent. `transaction()` on a view,
+ * called from an async context outside an open sibling savepoint, waits for
+ * that sibling to finish; if the sibling awaits that call, it waits forever.
+ *
+ * Joining lasts only while a transaction is open. A savepoint view kept after
+ * its savepoint ends joins the nearest open ancestor, so its work commits or
+ * rolls back with that ancestor. Once the root transaction has ended, a
+ * retained view, like a timer scheduled inside `fn`, takes the mutex like any
+ * other caller.
  */
 export function createSqlDatabaseFromWasmPgliteConnection(
   connection: WasmPgliteConnection,
