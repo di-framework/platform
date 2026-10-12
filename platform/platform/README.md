@@ -551,9 +551,11 @@ tenantAuth:
   console and the hosts pin only the CA, from ConfigMap `tenant-controller-ca`. The CA key is in
   Secret `tenant-controller-ca-key` in the same runtime namespace. No pod mounts it and no tenant
   member role can read it, but the tenant controller's ServiceAccount can: its
-  `tenant-controller-keys` Role (for API-key Secrets) grants `get` on every Secret in that
-  namespace. The leaf is replaced 30 days before it expires, when its names change, or when it no
-  longer verifies against the stored CA. The leaf's `notAfter` never passes the CA's. The CA is
+  `tenant-controller-keys` Role (for API-key Secrets) grants `get`, `list`, `create` and `delete`
+  on every Secret in that namespace. With `delete` it can also remove `tenant-controller-ca-key` or
+  `tenant-controller-tls`, which makes the platform controller issue a new CA and roll the hosts.
+  The leaf is replaced 30 days before it expires, when its names change, or when it no longer
+  verifies against the stored CA. The leaf's `notAfter` never passes the CA's. The CA is
   replaced only when one of these holds:
   - it expires within 90 days;
   - its key is missing or does not match it;
