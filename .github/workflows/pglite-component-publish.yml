@@ -346,10 +346,10 @@ jobs:
     # pin-artifact.ts finds nothing to change when main already has it, so that is a no-op.
     needs: [check-source, publish, realign]
     if: >-
-      ${{ !cancelled() && github.ref == 'refs/heads/main' &&
+      ${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' &&
       ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') ||
-      (needs.check-source.result == 'success' && needs.check-source.outputs.skip == 'true' &&
-      needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}
+      (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' &&
+      needs.check-source.outputs.digest != '')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

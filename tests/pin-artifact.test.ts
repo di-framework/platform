@@ -185,9 +185,13 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
     // A fake gh that records its arguments and reports no open PR.
     const bin = join(base, 'bin');
     mkdirSync(bin);
-    writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$*" >> "${base}/gh.log"\n`);
+    // A fake gh that records its arguments; `pr list` reports $OPEN_PR (empty: no open PR).
+    writeFileSync(
+      join(bin, 'gh'),
+      `#!/bin/sh\necho "$*" >> "${base}/gh.log"\nif [ "$1 $2" = "pr list" ]; then echo "\${OPEN_PR:-}"; fi\n`,
+    );
     chmodSync(join(bin, 'gh'), 0o755);
-    const run = (pins: string, event = 'push') =>
+    const run = (pins: string, event = 'push', openPr = '') =>
       Bun.spawnSync(['bash', '-c', script], {
         cwd: work,
         stdout: 'pipe',
@@ -199,6 +203,7 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
           EVENT: event,
           NAME: 'wash',
           WORKFLOW: 'w.yml',
+          OPEN_PR: openPr,
           PINS: pins,
           GH_TOKEN: 'x',
           RUN_URL: 'https://example.invalid/run',
@@ -285,7 +290,36 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
     expect(result.exitCode, result.stderr.toString()).toBe(0);
     expect(result.stdout.toString()).toContain('Already pinned');
     expect(box.branches()).not.toContain('bot/pin-wash');
-    expect(box.ghCalls()).toEqual([]);
+    // Only the read-only lookup of an open bot PR; nothing is opened, edited or closed.
+    expect(box.ghCalls().filter((c) => !c.startsWith('pr list'))).toEqual([]);
+    expect(box.ghCalls()).toEqual([
+      'pr list --head bot/pin-wash --base main --state open --author app/github-actions --json number --jq .[0].number // empty',
+    ]);
+  });
+
+  test('main already pinned: an open pin PR for another build is closed with its branch (#173 W1)', () => {
+    // "pin to B" is open; main was reverted to A, which main already pins.
+    const box = sandbox();
+    box.pinOnMain('pglite-component', DIGEST);
+    const result = box.run(`pglite-component ${DIGEST}`, 'push', '42');
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    const close = box.ghCalls().filter((c) => c.startsWith('pr close'));
+    expect(close).toHaveLength(1);
+    expect(close[0]).toStartWith(
+      'pr close 42 --delete-branch --comment Superseded: main already pins',
+    );
+    expect(close[0]).toContain(`pglite-component to ${DIGEST}`);
+    expect(box.ghCalls().some((c) => /^pr (create|edit)/.test(c))).toBe(false);
+  });
+
+  test('main already pinned: an open pin PR that matches main is closed too, as redundant', () => {
+    // Its change is already on main, so merging it is a no-op; closing keeps one open bot PR per
+    // artifact at most, and the no-diff path cannot tell "matches main" from "another build"
+    // without reading the PR, so it treats both the same.
+    const box = sandbox();
+    box.pinOnMain('pglite-component', DIGEST);
+    box.run(`pglite-component ${DIGEST}`, 'push', '7');
+    expect(box.ghCalls().filter((c) => c.startsWith('pr close 7 --delete-branch'))).toHaveLength(1);
   });
 
   test('a revert re-pins the older digest over the one main has (#173 W1)', () => {

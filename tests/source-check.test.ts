@@ -424,5 +424,9 @@ describe('scripts/retag.sh', () => {
     const badTag = retag(B, A, '../x');
     expect(badTag.result.exitCode).not.toBe(0);
     expect(badTag.calls.filter((c) => c.startsWith('tag '))).toEqual([]);
+    // A bad second tag is refused before the first one moves.
+    const second = retag(B, A, '0.2.0 ../x');
+    expect(second.result.exitCode).not.toBe(0);
+    expect(second.calls).toEqual([]);
   });
 });

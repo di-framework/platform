@@ -115,7 +115,7 @@ const SPECS: Spec[] = [
     readOnly: [],
     pinAfter: 'publish-index',
     pinIf:
-      "${{ !cancelled() && github.ref == 'refs/heads/main' && ((needs.publish-index.result == 'success' && needs.publish-index.outputs.digest != '') || (needs.check-source.result == 'success' && needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
+      "${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' && ((needs.publish-index.result == 'success' && needs.publish-index.outputs.digest != '') || (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
     pinName: 'tenant-auth',
     guarded: { job: 'publish-index', steps: ['Assemble and verify image index'] },
     artifacts: ['tenant-auth'],
@@ -148,7 +148,7 @@ const SPECS: Spec[] = [
     realign: { job: 'realign', tags: 'wit' },
     pinAfter: 'publish',
     pinIf:
-      "${{ !cancelled() && github.ref == 'refs/heads/main' && ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') || (needs.check-source.result == 'success' && needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
+      "${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' && ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') || (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
     pinName: 'pglite-component',
     guarded: {
       job: 'publish',
@@ -183,7 +183,7 @@ const SPECS: Spec[] = [
     readOnly: [],
     pinAfter: 'publish',
     pinIf:
-      "${{ !cancelled() && github.ref == 'refs/heads/main' && ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') || (needs.check-source.result == 'success' && needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
+      "${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' && ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') || (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
     pinName: 'oci-registry',
     guarded: {
       job: 'publish',
@@ -257,9 +257,16 @@ describe.each(SPECS)('$file', (spec) => {
     for (const job of Object.values(jobs)) expect(job.if ?? '').not.toContain("'skipped'");
     for (const [name, job] of Object.entries(jobs)) {
       if (name === 'check-source' || name === spec.first) continue;
-      expect(job.if, name).toMatch(
-        /^\$\{\{ !cancelled\(\) && .*needs\.[\w-]+\.result == 'success'/,
-      );
+      // Each later job's condition begins with a success check of a job it needs, and that job
+      // is check-source or itself runs only after it, so nothing runs past a failed or skipped check.
+      const first = job.if?.match(
+        /^\$\{\{ !cancelled\(\) && \(?needs\.([\w-]+)\.result == 'success'/,
+      )?.[1];
+      expect(first, name).toBeDefined();
+      expect(needsOf(job), name).toContain(first ?? '');
+      const dependsOnCheck = (job: string): boolean =>
+        job === 'check-source' || needsOf(jobs[job] ?? {}).some(dependsOnCheck);
+      expect(dependsOnCheck(first ?? ''), name).toBe(true);
     }
   });
 

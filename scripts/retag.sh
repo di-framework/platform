@@ -14,11 +14,14 @@ if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   echo "::error::not a sha256 digest: ${DIGEST}"
   exit 1
 fi
+# Validate every tag before moving any, so bad input never leaves a partial retag.
 for tag in ${TAGS}; do
   if [[ ! "${tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]]; then
     echo "::error::not a tag: ${tag}"
     exit 1
   fi
+done
+for tag in ${TAGS}; do
   current=''
   if out="$(oras manifest fetch --descriptor "${IMAGE}:${tag}" 2>/dev/null)"; then
     current="$(jq -r '.digest // empty' <<<"${out}")"

@@ -77,6 +77,16 @@ runs:
         bun scripts/pin-artifact.ts "${args[@]}"
         if git diff --quiet; then
           echo "Already pinned on ${GITHUB_SHA}; no PR needed"
+          # main already pins every published variant of the current source, so an open pin PR on
+          # this branch is for another source (e.g. "pin to B" after a revert to A) or redundant;
+          # merging it could only pin a build main no longer has. Close it. Only the bot's own
+          # bot/pin-<name> branch is matched.
+          existing="$(gh pr list --head "${branch}" --base main --state open --author app/github-actions --json number --jq '.[0].number // empty')"
+          if [[ -n "${existing}" ]]; then
+            joined="$(printf '%s; ' "${summary[@]}")"
+            gh pr close "${existing}" --delete-branch --comment "Superseded: main already pins the current source (${joined%; }, as of ${GITHUB_SHA}). This PR would pin a different build, or nothing new, so it is closed."
+            echo "::notice::closed superseded pin PR #${existing}"
+          fi
           exit 0
         fi
         git config user.name 'github-actions[bot]'
@@ -99,7 +109,7 @@ runs:
           echo 'that `GITHUB_TOKEN` creates or updates, so no checks start on their own. Close and reopen'
           echo 'the PR (or push a commit to the branch) to run CI, then review and merge as usual.'
         } > "${body}"
-        existing="$(gh pr list --head "${branch}" --base main --state open --json number --jq '.[0].number // empty')"
+        existing="$(gh pr list --head "${branch}" --base main --state open --author app/github-actions --json number --jq '.[0].number // empty')"
         if [[ -n "${existing}" ]]; then
           gh pr edit "${existing}" --title "${title}" --body-file "${body}"
           echo "Updated PR #${existing}"
