@@ -87,7 +87,7 @@ Tags are movable. `0.2.0` always points to the latest `main` publish for WIT pac
 ### Artifact location
 
 The digest is in **Details** > **Record component digest** > **Step summary**, and in the `pglite-publish-report` artifact (`publish-report.json`).
-Published digest: `ghcr.io/di-framework/pglite-component@sha256:8bc30505cf28b1a65f72588da692d2ba3d79a6a2025c9256341a8625967a3286`
+Published digest: `ghcr.io/di-framework/pglite-component@sha256:9a00ac39f202ede852d0ce0e43dbb27c5626c3e3e613d63d5916c990394a7d5e`
 
 **Note:** The GHCR package must be made public by an org admin after the first publish. Until then, only members with access to di-framework/platform can pull it.
 
@@ -125,7 +125,7 @@ wasmtime run --dir ./data::/data path/to/app.composed.wasm
 To use the published OCI component from GHCR instead (pin by digest for reproducibility):
 
 ```sh
-export PGLITE_REF='ghcr.io/di-framework/pglite-component@sha256:8bc30505cf28b1a65f72588da692d2ba3d79a6a2025c9256341a8625967a3286'
+export PGLITE_REF='ghcr.io/di-framework/pglite-component@sha256:9a00ac39f202ede852d0ce0e43dbb27c5626c3e3e613d63d5916c990394a7d5e'
 wash oci pull "${PGLITE_REF}" pglite.wasm
 wac plug --plug pglite.wasm path/to/app.wasm -o path/to/app.composed.wasm
 mkdir -p ./data
