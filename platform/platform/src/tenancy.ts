@@ -105,6 +105,8 @@ export function installTenancy(args: {
   hostImage: string;
   hostImagePullPolicy: string;
   insecureRegistry?: boolean;
+  /** Tenant hosts' `--insecure-registry` entries (#149). */
+  insecureRegistries?: string[];
   storageRoot?: string;
   /** Gateway URL pattern; the controller publishes it per tenant as `di-platform-routes`. */
   routeUrlPattern?: string;
@@ -281,6 +283,7 @@ export function installTenancy(args: {
                       hostImagePullPolicy: args.hostImagePullPolicy,
                       schedulerNatsUrl: `nats://nats.${namespace}.svc.cluster.local:4222`,
                       insecureRegistry: args.insecureRegistry ?? false,
+                      insecureRegistries: args.insecureRegistries ?? [],
                       storageRoot: args.storageRoot,
                       routeUrlPattern: args.routeUrlPattern,
                       tenantAuth: args.tenantAuth,

@@ -323,21 +323,21 @@ Latest published images (multi-arch index digests; the bot PR keeps this table c
 
 | Variant | Image |
 | --- | --- |
-| `wasi-tls` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669` |
-| `wasi-tls-exclusive` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:4214f5318638fe29c0aecf484c4cdeb04ab4859c93f8c728727348381631bdf3` |
+| `wasi-tls` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad` |
+| `wasi-tls-exclusive` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:0ee414e9db4b0d4fc923eb477f1b1afd20f707b8ab3e552957575ff4f8e6a528` |
 
 The pin PR never changes the platform default (`DEFAULT_HOST_IMAGE`); a maintainer moves it by hand.
 
-The tags are mutable. The platform default `hostImage` is still pinned to an index of the canonical
-tag published before 0002 existed, so it has no `--insecure-registry`:
+The tags are mutable. The platform default `hostImage` is pinned to the canonical index built with
+0002 (and without the unnamed-import lease, #13):
 
-`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669`
-
-The currently pinned image was published before the patch was dropped, so it still contains the unnamed-import lease until a maintainer republishes and the pin is updated.
+`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad`
 
 `tenantHostImage` overrides it. The workflow summary prints the digest of each later publish.
-Switching the platform from `--allow-insecure-registries` to `--insecure-registry <host:port>` and
-repinning `DEFAULT_HOST_IMAGE` to a canonical index built with 0002 is a follow-up under #149.
+Tenant hosts never run `--allow-insecure-registries`; with `insecureRegistry` they get
+`--insecure-registry di-framework-registry.<namespace>.svc.cluster.local:5000` (the platform
+registry, as `registry.pull` spells it) plus each `insecureRegistries` entry (#149). An override
+image must therefore include 0002.
 
 For a local Kubesolo/k0s cluster, push to the platform registry (`di-framework-registry` in
 `wasmcloud`, plain HTTP, ClusterIP) through its port-forward. With a remote podman machine, `127.0.0.1`
@@ -367,7 +367,7 @@ The registry Service is ClusterIP, so a node-pullable reference needs a NodePort
 Set the platform config used by the stack (`tenantHostImage` / `tenantHostImagePullPolicy`):
 
 ```sh
-pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669
+pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad
 pulumi config set tenantHostImagePullPolicy IfNotPresent
 ```
 
@@ -375,7 +375,7 @@ or, with `di-framework-kube`, in the `--platform-config` JSON:
 
 ```json
 {
-  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669",
+  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad",
   "tenantHostImagePullPolicy": "IfNotPresent"
 }
 ```

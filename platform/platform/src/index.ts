@@ -9,6 +9,11 @@ import {
   loadGatewayScript,
   validateRouteUrlPattern,
 } from './gateway/install';
+import {
+  PLATFORM_REGISTRY_PORT,
+  PLATFORM_REGISTRY_SERVICE,
+  tenantInsecureRegistries,
+} from './insecure-registries';
 import { tenantKubeconfig } from './kubeconfig';
 import { installNetworkPolicy } from './network-policy';
 import {
@@ -27,6 +32,7 @@ import { secretReaderFromKubeconfig } from './token-secret-reader';
 import { waitForTokenSecret } from './token-wait';
 import { platformValues } from './values';
 
+export { platformRegistryPullHost, tenantInsecureRegistries } from './insecure-registries';
 export { kubeconfigServer, type TenantKubeconfigArgs, tenantKubeconfig } from './kubeconfig';
 
 export interface PlatformArgs {
@@ -43,7 +49,18 @@ export interface PlatformArgs {
   registry?: boolean;
   registryNodePort?: number;
   storageRoot?: string;
+  /**
+   * Plain-HTTP registries. The platform host group runs `--allow-insecure-registries`; tenant
+   * hosts get `--insecure-registry` for the platform registry (with `registry`) and for each of
+   * `insecureRegistries` only, so every other pull stays TLS.
+   */
   insecureRegistry?: boolean;
+  /**
+   * Further `host[:port]` registries tenant hosts may pull from over plain HTTP, spelled exactly as
+   * workload references spell them. Requires `insecureRegistry`. Defaults to config
+   * `insecureRegistries`.
+   */
+  insecureRegistries?: string[];
   values?: Record<string, unknown>;
   /** `http://{host}.{tenant}.localhost:<port>` for the published gateway port, if any. */
   routeUrlPattern?: string;
@@ -66,11 +83,11 @@ export interface PlatformArgs {
 }
 
 /**
- * Published wash 2.8.0 with wasi-tls. The tag moves on the next publish; this
- * digest is the multi-arch index from the tenant-host workflow.
+ * Published wash 2.8.0 with wasi-tls and patch 0002 (`--insecure-registry`, #149). The tag moves on
+ * the next publish; this digest is the multi-arch index from the tenant-host workflow.
  */
-const DEFAULT_HOST_IMAGE =
-  'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669';
+export const DEFAULT_HOST_IMAGE =
+  'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad';
 
 /** Shared platform resources; the caller owns cluster creation and Pulumi state. */
 export function createPlatform(args: PlatformArgs) {
@@ -86,6 +103,12 @@ export function createPlatform(args: PlatformArgs) {
   const REGISTRY_NODE_PORT = args.registryNodePort ?? 30500;
   const HTTP_NODE_PORT = args.httpNodePort ?? 30180;
   const routeUrlPattern = validateRouteUrlPattern(args.routeUrlPattern);
+  const insecureRegistries = tenantInsecureRegistries({
+    insecureRegistry: args.insecureRegistry,
+    registry: args.registry,
+    namespace: namespaceName,
+    extra: args.insecureRegistries ?? config.getObject<string[]>('insecureRegistries'),
+  });
   const namespaceResource = new k8s.core.v1.Namespace(
     'wasmcloud',
     {
@@ -140,14 +163,14 @@ export function createPlatform(args: PlatformArgs) {
         return new k8s.core.v1.Service(
           'oci-registry',
           {
-            metadata: { name: 'di-framework-registry', namespace: namespaceName },
+            metadata: { name: PLATFORM_REGISTRY_SERVICE, namespace: namespaceName },
             spec: {
               type: 'NodePort',
               selector: registryLabels,
               ports: [
                 {
                   name: 'registry',
-                  port: 5000,
+                  port: PLATFORM_REGISTRY_PORT,
                   targetPort: 'registry',
                   nodePort: REGISTRY_NODE_PORT,
                 },
@@ -276,6 +299,7 @@ export function createPlatform(args: PlatformArgs) {
     dependsOn: [runtimeShutdown, ...(networkPolicy ? [networkPolicy] : [])],
     ...declared,
     insecureRegistry: args.insecureRegistry,
+    insecureRegistries,
     storageRoot: args.storageRoot,
     hostImage: config.get('tenantHostImage') ?? DEFAULT_HOST_IMAGE,
     hostImagePullPolicy: config.get('tenantHostImagePullPolicy') ?? 'IfNotPresent',

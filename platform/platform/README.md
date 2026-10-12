@@ -138,12 +138,15 @@ schema, controller and tenant-auth image), then set the field (for example
 ## Existing-cluster configuration
 
 `kubeconfig` is required (a local file path); `context`, `namespace`, `release`,
-`chart`, `chartVersion`, `httpNodePort`, `timeoutSeconds`, `insecureRegistry`,
+`chart`, `chartVersion`, `httpNodePort`, `timeoutSeconds`, `insecureRegistry`, `insecureRegistries`,
 `storageRoot`, `networkPolicyEngine`, `kubernetesEndpoint`, `httpEndpoint`, `routeUrlPattern`,
 `egressAllowedDestinations`, and administrator `values` are optional. `tenants`, `users`,
 `tenantHostImage`, and `tenantHostImagePullPolicy` use the same declarations as the
 local entrypoint. NodePort zero makes the HTTP gateway ClusterIP. Registry installation is off
-for existing clusters. Shared hosts are disabled regardless of values overrides. Set `networkPolicyEngine`
+for existing clusters. `insecureRegistry` gives the platform host group
+`--allow-insecure-registries`; tenant hosts get `--insecure-registry` only for each
+`insecureRegistries` entry (a list of `host[:port]`, spelled exactly as workload references spell
+the registry, requires `insecureRegistry`), so their other pulls stay TLS (#149). Shared hosts are disabled regardless of values overrides. Set `networkPolicyEngine`
 to `kube-router` to install the pinned v2.10.0 policy-only controller on clusters
 without policy enforcement; `existing` leaves policy enforcement to the caller.
 Managed Kubesolo enables it by default. This mode preserves the existing CNI and
@@ -700,10 +703,13 @@ tenantAuth:
       `tenant-controller-ca`. A CA:TRUE end-entity certificate is rejected by wash (rustls), hence the split.
       wash loads that file once at start, so the host template carries
       `platform.di-framework.dev/registry-ca-sha256` and a CA replacement (not a leaf renewal) rolls the hosts on
-      the next poll. With `insecureRegistry` (hosts run `--allow-insecure-registries`, which makes
-      every wash pull plain HTTP, the local install's default) the listener is plain HTTP
-      (`TENANT_CONTROLLER_REGISTRY_PULL_TLS=false`) on Service port 80, and no CA is mounted; the
-      host credential then crosses the pod network in clear, as the whoami callback does.
+      the next poll. The listener is TLS with `insecureRegistry` too (#149): only the platform host
+      group runs `--allow-insecure-registries`. Tenant hosts instead get one
+      `--insecure-registry <host:port>` (wash patch 0002) per plain-HTTP registry: the platform
+      registry as workload references spell it (`registry.pull`,
+      `di-framework-registry.<namespace>.svc.cluster.local:5000`, when the install has one) and each
+      `insecureRegistries` entry. wash matches these exactly (case-sensitive, no default port), so
+      every other pull, this listener and GHCR included, stays TLS.
     - Rollout: the hosts are wired (env, volumes, CA) from desired state: while
       `tenantAuth.registry` is set, the registry WorkloadDeployment exists and the tenant is not
       suspended, whether or not the pull Secret exists at that moment. The Secret volume is

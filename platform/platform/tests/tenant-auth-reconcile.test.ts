@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { createPrivateKey, X509Certificate } from 'node:crypto';
+import { platformRegistryPullHost } from '../src/insecure-registries';
 import { type Api, ApiError, Controller, collection, main } from '../src/tenancy/controller';
 import { CONTROLLER_SCRIPT_MODULES, controllerClusterRoleRules } from '../src/tenancy/install';
 import {
@@ -2206,7 +2207,13 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     routeUrlPattern: 'http://{host}.{tenant}.localhost:28180',
     tenantAuth: withRegistry,
   };
-  const insecureCfg: ControllerConfig = { ...tlsCfg, insecureRegistry: true };
+  // What createPlatform passes for a local install (`registry: true`, `insecureRegistry: true`).
+  const PLATFORM_REGISTRY = platformRegistryPullHost('wasmcloud');
+  const insecureCfg: ControllerConfig = {
+    ...tlsCfg,
+    insecureRegistry: true,
+    insecureRegistries: [PLATFORM_REGISTRY],
+  };
   const TOKEN = 't'.repeat(43);
   const pullSecretPath = path('Secret', 'di-runtime-alpha', REGISTRY_PULL_SECRET);
   const pullServicePath = path('Service', 'di-runtime-alpha', REGISTRY_PULL_SERVICE);
@@ -2405,18 +2412,29 @@ describe('tenant registry host pull (#83:host-pull)', () => {
         },
       ]),
     );
-    // Tenant hosts always use TLS, even when insecureRegistry is true.
-    const plain = host(
-      tenantResources(tenant(), insecureCfg, schedulerSecret, [], false, true, false, {}),
-    );
-    expect(env(plain).DOCKER_CONFIG).toBe('/registry-auth');
-    expect(plain.spec.template.spec.containers[0]!.args).not.toContain(
-      '--allow-insecure-registries',
-    );
-    expect(plain.spec.template.spec.containers[0]!.args).not.toContain(
-      '--oci-ca-path=/registry-ca/ca.crt',
-    );
-    expect(JSON.stringify(plain.spec.template.spec.volumes)).not.toContain('registry-ca');
+    expect(container.args).not.toContain('--insecure-registry');
+  });
+
+  it('allowlists only the platform registry for plain HTTP on an insecure install (#149)', () => {
+    const render = (config: ControllerConfig) =>
+      tenantResources(tenant(), config, schedulerSecret, [], false, true, false, {
+        caDigest: 'abc',
+      });
+    const secure = render(tlsCfg);
+    const insecure = render(insecureCfg);
+    const args = host(insecure).spec.template.spec.containers[0]!.args as string[];
+    expect(args).not.toContain('--allow-insecure-registries');
+    // The pull listener stays TLS: the CA is still mounted and trusted.
+    expect(args).toContain('--oci-ca-path=/registry-ca/ca.crt');
+    // The exact spelling of `registry.pull` in local.ts, which wash matches verbatim.
+    expect(PLATFORM_REGISTRY).toBe('di-framework-registry.wasmcloud.svc.cluster.local:5000');
+    const at = args.indexOf('--insecure-registry');
+    expect(args.slice(at, at + 2)).toEqual(['--insecure-registry', PLATFORM_REGISTRY]);
+    expect(args.filter((arg) => arg === '--insecure-registry')).toHaveLength(1);
+    // Otherwise the insecure install renders exactly what the TLS install does.
+    const container = host(insecure).spec.template.spec.containers[0]!;
+    container.args = args.filter((_, i) => i !== at && i !== at + 1);
+    expect(insecure).toEqual(secure);
   });
 
   it('keeps no credential where a tenant user can read it', () => {
@@ -2583,9 +2601,10 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     await controller.reconcileTenant(t, []);
     await controller.reconcileTenant(t, []);
     expect(env(host(api)).DOCKER_CONFIG).toBe('/registry-auth');
-    expect(host(api).spec.template.spec.containers[0]!.args).toContain(
-      '--oci-ca-path=/registry-ca/ca.crt',
-    );
+    const args = host(api).spec.template.spec.containers[0]!.args as string[];
+    expect(args).toContain('--oci-ca-path=/registry-ca/ca.crt');
+    expect(args).not.toContain('--allow-insecure-registries');
+    expect(args.join(' ')).toContain(`--insecure-registry ${PLATFORM_REGISTRY}`);
     expect(api.objects.get(pullServicePath)).toMatchObject({
       spec: { ports: [{ port: 443, targetPort: 8791 }] },
     });

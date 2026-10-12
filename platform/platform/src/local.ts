@@ -19,7 +19,7 @@ import {
   refuseExistingVolumeThenCreate,
   shutdownRuntime,
 } from './container-cli';
-import { createPlatform } from './index';
+import { createPlatform, platformRegistryPullHost } from './index';
 import { localPathStorageResources } from './local-storage';
 import { registryMirrorFiles, registryMirrors } from './registry-mirrors';
 
@@ -128,6 +128,7 @@ const platform = createPlatform({
   provider,
   installation: scope,
   config,
+  namespace: namespaceName,
   routeUrlPattern: `http://{host}.{tenant}.localhost:${httpPort}`,
   registry: true,
   insecureRegistry: true,
@@ -159,7 +160,8 @@ export const kubeconfig = kubeconfigFileCommand.id.apply(() => kubeconfigFile);
 export const namespace = platform.namespace;
 export const registry = {
   push: `http://127.0.0.1:${registryPort}`,
-  pull: `di-framework-registry.${namespaceName}.svc.cluster.local:5000`,
+  // The tenant hosts' `--insecure-registry` entry is this same spelling (#149).
+  pull: platformRegistryPullHost(namespaceName),
   insecure: true,
 };
 export const endpoints = {
