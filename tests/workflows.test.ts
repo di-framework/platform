@@ -1,6 +1,6 @@
 // biome-ignore-all lint/suspicious/noTemplateCurlyInString: the assertions match literal GitHub Actions `${{ }}` and shell `${VAR}` text.
 /**
- * The four GHCR publish workflows publish by themselves when their inputs change on main (#172):
+ * The GHCR publish workflows publish by themselves when their inputs change on main (#172):
  * triggers and paths, the skip-if-published gate, least-privilege permissions, and the pin job.
  */
 import { describe, expect, test } from 'bun:test';
@@ -63,7 +63,7 @@ interface Spec {
   pinAfter: string;
   pinIf: string;
   /** The job that re-points moving tags when the source is already published (a revert). */
-  realign?: { job: string; tags: string };
+  realign?: { job: string; tags: string; wit?: string };
   /** bot/pin-<pinName> */
   pinName: string;
   artifacts: string[];
@@ -145,7 +145,7 @@ const SPECS: Spec[] = [
     firstIf: CHECKED,
     publish: ['publish', 'realign'],
     readOnly: ['build'],
-    realign: { job: 'realign', tags: 'wit' },
+    realign: { job: 'realign', tags: 'wit', wit: 'platform/pglite-component/wit/world.wit' },
     pinAfter: 'publish',
     pinIf:
       "${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' && ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') || (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
@@ -160,6 +160,38 @@ const SPECS: Spec[] = [
       ],
     },
     artifacts: ['pglite-component'],
+  },
+  {
+    file: '.github/workflows/pglite-encfs-publish.yml',
+    image: 'ghcr.io/di-framework/pglite-encfs',
+    paths: [
+      'platform/pglite-encfs/**',
+      'platform/wasm-component-publisher/**',
+      'Cargo.toml',
+      'Cargo.lock',
+      '.cargo/**',
+      '.github/workflows/pglite-encfs-publish.yml',
+      '!**/*.md',
+    ],
+    first: 'build',
+    firstIf: CHECKED,
+    publish: ['publish', 'realign'],
+    readOnly: ['build'],
+    realign: { job: 'realign', tags: 'wit', wit: 'platform/pglite-encfs/wit/world.wit' },
+    pinAfter: 'publish',
+    pinIf:
+      "${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' && ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') || (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
+    pinName: 'pglite-encfs',
+    guarded: {
+      job: 'publish',
+      steps: [
+        'Push and verify component',
+        'Record component digest',
+        'Tag with source hash',
+        'Upload publish report',
+      ],
+    },
+    artifacts: ['pglite-encfs'],
   },
   {
     file: '.github/workflows/oci-registry-component.yml',
@@ -396,7 +428,7 @@ describe.each(SPECS)('$file', (spec) => {
     expect(retag).toBeGreaterThan(guard);
     expect(steps[retag]?.if).toBe("steps.guard.outputs.stale != 'true'");
     if (spec.realign.tags === 'wit') {
-      expect(steps[retag]?.run).toContain('platform/pglite-component/wit/world.wit');
+      expect(steps[retag]?.run).toContain(spec.realign.wit ?? '');
     } else {
       expect(steps[retag]?.env?.TAGS).toBe(spec.realign.tags);
     }
@@ -447,7 +479,7 @@ test('every job that runs oras sets it up first (C1)', () => {
   expect(checked).toBeGreaterThanOrEqual(7);
 });
 
-test('the four publish workflows use distinct concurrency groups', () => {
+test('the publish workflows use distinct concurrency groups', () => {
   const groups = SPECS.map((spec) => parse(spec.file).concurrency.group);
   expect(new Set(groups).size).toBe(SPECS.length);
 });

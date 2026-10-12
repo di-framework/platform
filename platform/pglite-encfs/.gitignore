@@ -1,0 +1,5 @@
+# Rust build output (cargo, smoke logs and data under target/smoke)
+/target/
+
+# Built by `make build`; published to GHCR, not git.
+/dist/

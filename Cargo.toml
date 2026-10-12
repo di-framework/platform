@@ -5,12 +5,14 @@ members = [
     "platform/wasm-component-publisher",
     "platform/oci-registry/build-support",
     "platform/pglite-component/build-support",
+    "platform/pglite-encfs/build-support",
 ]
 # Keep the existing Wasm component workspaces independent of the host tools.
 exclude = [
     "platform/oci-registry",
     "platform/sqlite-component",
     "platform/pglite-component",
+    "platform/pglite-encfs",
 ]
 
 [workspace.package]

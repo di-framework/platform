@@ -42,6 +42,9 @@ export const ARTIFACTS: Record<string, PinTarget[]> = {
   'pglite-component': [
     { file: 'platform/pglite-component/README.md', ref: 'ghcr.io/di-framework/pglite-component' },
   ],
+  'pglite-encfs': [
+    { file: 'platform/pglite-encfs/README.md', ref: 'ghcr.io/di-framework/pglite-encfs' },
+  ],
   'wash-wasi-tls': [
     {
       file: HOST_README,

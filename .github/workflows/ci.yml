@@ -54,6 +54,10 @@ jobs:
       - name: Test embedded PGlite component against the real engine
         run: make -C platform/pglite-component unit smoke
 
+      # Plugs pglite-encfs into the pglite component built above and runs the encryption matrix.
+      - name: Test pglite-encfs (encryption at rest) against the real engine
+        run: make -C platform/pglite-encfs tools unit smoke
+
       - name: Build and test tenant OCI registry component
         run: make -C platform/oci-registry test lint build
 

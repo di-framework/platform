@@ -63,6 +63,16 @@ fn main() {
         ),
         Err(Error::OpenFailed(_))
     ));
+    if mode == "refused" {
+        // A storage layer below the engine (pglite-encfs with a wrong or
+        // missing key) must make open fail cleanly, not trap.
+        assert!(matches!(
+            open("/data/pglite", None),
+            Err(Error::OpenFailed(_))
+        ));
+        println!("refused ok");
+        return;
+    }
     let db: Connection = open("/data/pglite", None).expect("open");
     assert!(matches!(
         open("/data/pglite", None),
@@ -81,6 +91,9 @@ fn main() {
             .is_none());
         db.close().expect("close read");
         println!("restart ok");
+        return;
+    }
+    if durability_mode(&db, &mode) {
         return;
     }
     if mode == "abrupt" {
@@ -445,4 +458,75 @@ fn main() {
 
     db.close().unwrap();
     println!("smoke ok");
+}
+
+/// Rows whose text must never appear in the data directory when it is
+/// encrypted (pglite-encfs `make smoke` greps for it).
+const MARKER: &str = "PGLITE-SMOKE-PLAINTEXT-MARKER";
+const MARKER_ROWS: i64 = 200;
+/// The marker rows only: commit-a/commit-b add rows of their own.
+const MARKER_COUNT: &str =
+    "SELECT count(*)::int8 FROM markers WHERE v LIKE 'PGLITE-SMOKE-PLAINTEXT-MARKER-%'";
+
+/// Modes for storage layers below the engine (pglite-encfs `make smoke`).
+/// Returns true when `mode` was one of them.
+fn durability_mode(db: &Connection, mode: &str) -> bool {
+    let count =
+        |sql: &str, params: &[Value]| int(&db.first(sql, params).unwrap().expect("count row")[0].1);
+    match mode {
+        // 200 committed rows plus a checkpoint, so they reach relation files too.
+        "marker-write" => {
+            db.exec("DROP TABLE IF EXISTS markers; CREATE TABLE markers (id serial primary key, v text)")
+                .unwrap();
+            db.begin().unwrap();
+            for i in 0..MARKER_ROWS {
+                db.run(
+                    "INSERT INTO markers (v) VALUES ($1)",
+                    &[Value::Text(format!("{MARKER}-{i:04}"))],
+                )
+                .unwrap();
+            }
+            db.commit().unwrap();
+            db.exec("CHECKPOINT").unwrap();
+            db.close().unwrap();
+            println!("marker-write ok");
+        }
+        "marker-read" => {
+            assert_eq!(count(MARKER_COUNT, &[]), MARKER_ROWS);
+            let row = db
+                .first("SELECT min(v) AS lo FROM markers", &[])
+                .unwrap()
+                .unwrap();
+            assert_eq!(text(col(&row, "lo")), format!("{MARKER}-0000"));
+            db.close().unwrap();
+            println!("marker-read ok");
+        }
+        // One autocommitted (WAL-fsynced) row, then exit without close or
+        // checkpoint, so the commit lives only in the WAL.
+        "commit-a" | "commit-b" => {
+            let tag = if mode == "commit-a" { "A" } else { "B" };
+            db.run(
+                "INSERT INTO markers (v) VALUES ($1)",
+                &[Value::Text(format!("commit-{tag}"))],
+            )
+            .unwrap();
+            println!("{mode} ok");
+            // `exit` runs no destructors: the connection is never closed.
+            std::process::exit(0);
+        }
+        "check-ab" => {
+            let committed = |tag: &str| {
+                count(
+                    "SELECT count(*)::int8 FROM markers WHERE v = $1",
+                    &[Value::Text(format!("commit-{tag}"))],
+                )
+            };
+            let (a, b) = (committed("A"), committed("B"));
+            assert_eq!(count(MARKER_COUNT, &[]), MARKER_ROWS);
+            db.close().unwrap();
+            println!("check-ab A={a} B={b}");
+        }
+        _ => return false,
+    }
+    true
 }
