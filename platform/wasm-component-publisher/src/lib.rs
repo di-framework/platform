@@ -304,6 +304,11 @@ fn run_tool(
 ) -> Result<Output> {
     let mut command = Command::new(program);
     command.args(args);
+    // Tools reach registry credentials only through `DOCKER_CONFIG`; they
+    // never inherit the raw password or token, so they cannot echo it.
+    for name in CREDENTIAL_ENV {
+        command.env_remove(name);
+    }
     for (key, val) in envs {
         command.env(key, val);
     }
@@ -384,9 +389,18 @@ fn resolve_tag(
     args.push(format!("{repo_ref}:{tag}"));
     let output = run_tool("oras", &args, envs, Duration::from_secs(120))?;
     check_tool_output(&output, "oras resolve")?;
-    let resolved = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    resolved_digest(&output.stdout, &secret_values())
+}
+
+/// The digest `oras resolve` printed, or an error carrying its masked output.
+fn resolved_digest(stdout: &[u8], secrets: &[String]) -> Result<String> {
+    let resolved = String::from_utf8_lossy(stdout).trim().to_owned();
     if !is_digest(&resolved) {
-        return Err(format!("oras resolve returned no digest: {}", tail(&resolved, 200)).into());
+        return Err(format!(
+            "oras resolve returned no digest: {}",
+            tool_text(stdout, secrets, 200)
+        )
+        .into());
     }
     Ok(resolved)
 }
@@ -402,20 +416,60 @@ fn check_output(output: &Output, what: &str) -> Result<()> {
     check_tool_output(output, &format!("wash {what}"))
 }
 
+/// Environment variables the publisher reads registry passwords or tokens
+/// from. `run_tool` removes them from every tool's environment.
+const CREDENTIAL_ENV: [&str; 3] = ["DI_OCI_PASSWORD", "GHCR_TOKEN", "GITHUB_TOKEN"];
+
 /// Registry secrets that must never reach an error message: the password or
-/// token from the environment, and the base64 `user:password` auth written
-/// to the `DOCKER_CONFIG` file. Credentials never go in argv or the tool env.
+/// token from the environment (raw, JSON-escaped and percent-encoded), and
+/// the base64 `user:password` auth written to the `DOCKER_CONFIG` file.
+/// Credentials never go in argv, and `run_tool` strips `CREDENTIAL_ENV` from
+/// the tool env, so tools only see the auth inside `DOCKER_CONFIG`. Masking
+/// is the second layer, in case a tool echoes what it read from there.
 fn secret_values() -> Vec<String> {
-    let mut secrets: Vec<String> = ["DI_OCI_PASSWORD", "GHCR_TOKEN", "GITHUB_TOKEN"]
+    let mut secrets: Vec<String> = Vec::new();
+    for value in CREDENTIAL_ENV
         .iter()
         .filter_map(|name| env::var(name).ok())
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .collect();
+    {
+        secrets.extend(encoded_forms(&value));
+    }
     if let Ok(Some((username, password))) = registry_credentials() {
         secrets.push(base64_encode(format!("{username}:{password}").as_bytes()));
     }
+    secrets.sort();
+    secrets.dedup();
     secrets
+}
+
+/// `value` as a tool might print it: raw, JSON-escaped (as inside
+/// `wash --output json`) and percent-encoded (as inside a URL).
+fn encoded_forms(value: &str) -> Vec<String> {
+    let json = serde_json::to_string(value).unwrap_or_default();
+    let json = json
+        .strip_prefix('"')
+        .and_then(|j| j.strip_suffix('"'))
+        .unwrap_or_default()
+        .to_owned();
+    let mut forms = vec![value.to_owned(), json, percent_encode(value)];
+    forms.retain(|form| !form.is_empty());
+    forms.dedup();
+    forms
+}
+
+/// RFC 3986 percent-encoding: everything but unreserved characters.
+fn percent_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 fn redact(text: &str, secrets: &[String]) -> String {
@@ -431,6 +485,15 @@ fn redact(text: &str, secrets: &[String]) -> String {
     })
 }
 
+/// Tool output fit for an error message: trimmed, `secrets` masked, and only
+/// then cut to its last `max` bytes, so the cut cannot split a secret and
+/// leave a fragment of it unmasked. Every error that carries tool output
+/// goes through here.
+fn tool_text(bytes: &[u8], secrets: &[String], max: usize) -> String {
+    let text = redact(String::from_utf8_lossy(bytes).trim(), secrets);
+    tail(&text, max).to_owned()
+}
+
 /// `<what> failed (<status>): stdout: ...; stderr: ...`, each stream trimmed,
 /// redacted, then cut to its last 2000 bytes. `wash --output json` reports
 /// its failures on stdout and can leave stderr empty.
@@ -438,8 +501,8 @@ fn failure_message(what: &str, output: &Output, secrets: &[String]) -> String {
     let streams: Vec<String> = [("stdout", &output.stdout), ("stderr", &output.stderr)]
         .into_iter()
         .filter_map(|(name, bytes)| {
-            let text = redact(String::from_utf8_lossy(bytes).trim(), secrets);
-            (!text.is_empty()).then(|| format!("{name}: {}", tail(&text, 2000)))
+            let text = tool_text(bytes, secrets, 2000);
+            (!text.is_empty()).then(|| format!("{name}: {text}"))
         })
         .collect();
     let detail = if streams.is_empty() {
@@ -588,7 +651,7 @@ fn push_and_verify(
     push.push(wasm_path.to_string_lossy().into_owned());
     let output = run_wash(&push, wash_envs, Duration::from_secs(300))?;
     check_output(&output, "oci push")?;
-    let manifest_digest = push_digest(&output.stdout)?;
+    let manifest_digest = push_digest(&output.stdout, &secret_values())?;
 
     // Download to a temporary path outside dist/ so failed or unverified
     // artifacts never pollute the build output; the guard cleans up on all paths.
@@ -620,19 +683,14 @@ fn push_and_verify(
 }
 
 /// `wash oci push --output json` prints `{"success":true,"data":{"digest":"sha256:…"}}`.
-fn push_digest(stdout: &[u8]) -> Result<String> {
-    let parsed: Value = serde_json::from_slice(stdout).map_err(|_| {
-        format!(
-            "cannot parse wash push output: {}",
-            tail(&String::from_utf8_lossy(stdout), 1000)
-        )
-    })?;
+/// Errors carry wash's stdout, masked, since wash can exit 0 with
+/// `{"success":false,...}`.
+fn push_digest(stdout: &[u8], secrets: &[String]) -> Result<String> {
+    let shown = || tool_text(stdout, secrets, 1000);
+    let parsed: Value = serde_json::from_slice(stdout)
+        .map_err(|_| format!("cannot parse wash push output: {}", shown()))?;
     if parsed.get("success").and_then(Value::as_bool) != Some(true) {
-        return Err(format!(
-            "wash push reported failure: {}",
-            tail(&String::from_utf8_lossy(stdout), 1000)
-        )
-        .into());
+        return Err(format!("wash push reported failure: {}", shown()).into());
     }
     match parsed
         .get("data")
@@ -640,11 +698,7 @@ fn push_digest(stdout: &[u8]) -> Result<String> {
         .and_then(Value::as_str)
     {
         Some(digest) if is_digest(digest) => Ok(digest.to_owned()),
-        _ => Err(format!(
-            "wash push returned no digest: {}",
-            tail(&String::from_utf8_lossy(stdout), 1000)
-        )
-        .into()),
+        _ => Err(format!("wash push returned no digest: {}", shown()).into()),
     }
 }
 
@@ -813,21 +867,155 @@ mod tests {
         );
     }
 
+    /// Asserts that no fragment of `secret` of 4 or more bytes is in `message`.
+    fn assert_no_fragment(message: &str, secret: &str) {
+        for len in 4..=secret.len() {
+            for start in 0..=secret.len() - len {
+                let fragment = &secret[start..start + len];
+                assert!(!message.contains(fragment), "{fragment:?} in {message}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secrets_straddling_the_cut_are_masked_before_it() {
+        let secret = "ghs_Q7wZ9xK2vT4mN8pR";
+        let secrets = vec![secret.to_owned()];
+        // The 2000-byte cut lands inside the secret: cut-then-mask would keep
+        // its last 15 bytes, which no longer match the secret and survive.
+        let stdout = format!("{}{secret}{}", "a".repeat(10), "b".repeat(1985));
+        let message = failure_message("wash oci push", &exited(1, &stdout, ""), &secrets);
+        assert_no_fragment(&message, secret);
+        assert_eq!(
+            message,
+            format!(
+                "wash oci push failed (exit status: 1): stdout: aaaaa[REDACTED]{}",
+                "b".repeat(1985)
+            )
+        );
+        // The same holds for the 1000-byte cut on push results and the
+        // 200-byte cut on `oras resolve` output.
+        let push = format!("{}{secret}{}", "a".repeat(10), "b".repeat(985));
+        let error = push_digest(push.as_bytes(), &secrets)
+            .unwrap_err()
+            .to_string();
+        assert_no_fragment(&error, secret);
+        assert!(
+            error.ends_with(&format!("aaaaa[REDACTED]{}", "b".repeat(985))),
+            "{error}"
+        );
+        let resolved = format!("{}{secret}{}", "a".repeat(10), "b".repeat(185));
+        let error = resolved_digest(resolved.as_bytes(), &secrets)
+            .unwrap_err()
+            .to_string();
+        assert_no_fragment(&error, secret);
+        assert!(
+            error.ends_with(&format!("aaaaa[REDACTED]{}", "b".repeat(185))),
+            "{error}"
+        );
+    }
+
     #[test]
     fn rejects_unsuccessful_or_malformed_push_results() {
-        for value in [
-            br#"{"success":false,"data":{"digest":"sha256:abc"}}"#.as_slice(),
-            br#"{"success":true,"data":{"digest":"sha256:abc"}}"#.as_slice(),
-            br#"{"success":true}"#.as_slice(),
-            b"not json".as_slice(),
+        let secrets = vec![
+            "s3cr3t-token".to_owned(),
+            base64_encode(b"bot:s3cr3t-token"),
+        ];
+        let auth = base64_encode(b"bot:s3cr3t-token");
+        for (value, reason) in [
+            (
+                r#"{"success":false,"data":{"digest":"sha256:abc"}}"#.to_owned(),
+                "wash push reported failure",
+            ),
+            (
+                r#"{"success":true,"data":{"digest":"sha256:abc"}}"#.to_owned(),
+                "wash push returned no digest",
+            ),
+            (
+                r#"{"success":true}"#.to_owned(),
+                "wash push returned no digest",
+            ),
+            ("not json".to_owned(), "cannot parse wash push output"),
+            // wash exits 0 but reports failure, echoing a credential.
+            (
+                r#"{"success":false,"message":"denied for s3cr3t-token"}"#.to_owned(),
+                "wash push reported failure",
+            ),
+            (
+                format!(r#"{{"success":true,"data":{{"auth":"{auth}"}}}}"#),
+                "wash push returned no digest",
+            ),
+            (
+                "unauthorized: token s3cr3t-token".to_owned(),
+                "cannot parse wash push output",
+            ),
         ] {
-            assert!(push_digest(value).is_err());
+            let error = push_digest(value.as_bytes(), &secrets)
+                .unwrap_err()
+                .to_string();
+            assert!(error.starts_with(reason), "{error}");
+            assert!(!error.contains("s3cr3t"), "{error}");
+            assert!(!error.contains(&auth), "{error}");
         }
+        let error = push_digest(
+            br#"{"success":false,"message":"denied for s3cr3t-token"}"#,
+            &secrets,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            error,
+            r#"wash push reported failure: {"success":false,"message":"denied for [REDACTED]"}"#
+        );
         let digest = format!("sha256:{}", "a".repeat(64));
         let output =
             serde_json::to_vec(&serde_json::json!({"success":true,"data":{"digest":digest}}))
                 .unwrap();
-        assert_eq!(push_digest(&output).unwrap(), digest);
+        assert_eq!(push_digest(&output, &secrets).unwrap(), digest);
+    }
+
+    #[test]
+    fn oras_resolve_output_without_a_digest_is_masked() {
+        let secrets = vec!["s3cr3t-token".to_owned()];
+        let error = resolved_digest(b"  error: s3cr3t-token rejected\n", &secrets)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "oras resolve returned no digest: error: [REDACTED] rejected"
+        );
+        let digest = format!("sha256:{}", "c".repeat(64));
+        assert_eq!(
+            resolved_digest(format!("{digest}\n").as_bytes(), &secrets).unwrap(),
+            digest
+        );
+    }
+
+    #[test]
+    fn free_form_passwords_are_masked_in_encoded_forms() {
+        let password = r#"p@ss "w/rd"\+%"#;
+        let forms = encoded_forms(password);
+        assert_eq!(
+            forms,
+            [
+                password.to_owned(),
+                r#"p@ss \"w/rd\"\\+%"#.to_owned(),
+                "p%40ss%20%22w%2Frd%22%5C%2B%25".to_owned(),
+            ]
+        );
+        let json = serde_json::json!({"success": false, "message": format!("bad {password}")});
+        let url = format!("https://u:{}@ghcr.io/v2/", percent_encode(password));
+        for text in [json.to_string(), url, format!("raw {password}")] {
+            let masked = redact(&text, &forms);
+            assert!(masked.contains("[REDACTED]"), "{masked}");
+            assert!(
+                !masked.contains("w/rd") && !masked.contains("w%2Frd"),
+                "{masked}"
+            );
+        }
+        // Tokens made of unreserved characters have a single form.
+        assert_eq!(encoded_forms("ghs_abc123"), ["ghs_abc123"]);
     }
 
     #[test]

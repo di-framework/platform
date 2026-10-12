@@ -21,6 +21,9 @@ artifact directory, and reported in-cluster registry respectively.
 `DI_OCI_PROTOCOL=https|http|auto` defaults to `auto` (HTTP for local/private
 addresses, HTTPS otherwise). Credentials use `DI_OCI_USERNAME`/`DI_OCI_PASSWORD`,
 then `GHCR_USERNAME`/`GHCR_TOKEN`, then `GITHUB_ACTOR`/`GITHUB_TOKEN`.
+The publisher hands them to `wash` and `oras` only through a temporary
+`DOCKER_CONFIG` and removes the password and token variables from the tools'
+environment. Tool output in errors has those secrets masked.
 
 Cargo's `build.rs` only tracks compile-time inputs. Publication requires an
 explicit executable run with `PUSH=true`. The publish workflow

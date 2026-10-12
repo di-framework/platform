@@ -64,7 +64,8 @@ fn version_tag_points_at_the_pushed_manifest() {
         &format!(
             "echo \"wash $*\" >> '{log}'\n\
              if [ -n \"$FAKE_PUSH_FAIL\" ]; then\n\
-               echo \"{{\\\"success\\\":false,\\\"message\\\":\\\"denied for $GHCR_TOKEN\\\"}}\"; exit 1\n\
+               auth=$(sed -n 's/.*\"auth\": *\"\\([^\"]*\\)\".*/\\1/p' \"$DOCKER_CONFIG/config.json\" | head -n 1)\n\
+               echo \"{{\\\"success\\\":false,\\\"message\\\":\\\"denied for $auth\\\",\\\"env\\\":\\\"[$GHCR_TOKEN$GITHUB_TOKEN$DI_OCI_PASSWORD]\\\"}}\"; exit 1\n\
              fi\n\
              case \"$2\" in\n\
                push) echo '{{\"success\":true,\"data\":{{\"digest\":\"{DIGEST}\"}}}}' ;;\n\
@@ -157,21 +158,40 @@ fn version_tag_points_at_the_pushed_manifest() {
     assert!(!calls.contains("oras"), "{calls}");
 
     // A failed push reports what wash printed on stdout (its --output json
-    // error), with the registry token masked.
+    // error). wash never inherits the token env; it sees the credential only
+    // as the base64 auth in DOCKER_CONFIG, and that is masked when echoed.
     unsafe {
         env::set_var("FAKE_PUSH_FAIL", "1");
         env::set_var("GHCR_USERNAME", "bot");
         env::set_var("GHCR_TOKEN", "ghs_faketoken123");
+        env::set_var("GITHUB_TOKEN", "ghs_othertoken456");
+        env::set_var("DI_OCI_PASSWORD", "di-password-789");
     }
     let error = run(&package, &single, true).unwrap_err().to_string();
     assert!(
         error.starts_with("wash oci push failed (exit status: 1): stdout: {\"success\":false"),
         "{error}"
     );
-    assert!(error.contains("denied for [REDACTED]"), "{error}");
-    assert!(!error.contains("ghs_faketoken123"), "{error}");
+    assert!(
+        error.contains("\"message\":\"denied for [REDACTED]\",\"env\":\"[]\""),
+        "{error}"
+    );
+    for secret in [
+        "ghs_faketoken123",
+        "ghs_othertoken456",
+        "di-password-789",
+        "Ym90OmRpLXBhc3N3b3JkLTc4OQ==",
+    ] {
+        assert!(!error.contains(secret), "{error}");
+    }
     unsafe {
-        for key in ["FAKE_PUSH_FAIL", "GHCR_USERNAME", "GHCR_TOKEN"] {
+        for key in [
+            "FAKE_PUSH_FAIL",
+            "GHCR_USERNAME",
+            "GHCR_TOKEN",
+            "GITHUB_TOKEN",
+            "DI_OCI_PASSWORD",
+        ] {
             env::remove_var(key);
         }
     }
