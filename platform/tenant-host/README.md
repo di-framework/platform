@@ -324,7 +324,7 @@ Latest published images (multi-arch index digests; the bot PR keeps this table c
 | Variant | Image |
 | --- | --- |
 | `wasi-tls` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669` |
-| `wasi-tls-exclusive` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:<pending first publish>` |
+| `wasi-tls-exclusive` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:4214f5318638fe29c0aecf484c4cdeb04ab4859c93f8c728727348381631bdf3` |
 
 The pin PR never changes the platform default (`DEFAULT_HOST_IMAGE`); a maintainer moves it by hand.
 
