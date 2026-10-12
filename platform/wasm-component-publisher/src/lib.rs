@@ -177,11 +177,11 @@ fn validate_reference(registry: &str, repository: &str, tag: &str) -> Result<()>
 }
 
 fn tail(text: &str, max: usize) -> &str {
-    let start = text.len().saturating_sub(max);
-    match text.get(start..) {
-        Some(slice) => slice,
-        None => text,
+    let mut start = text.len().saturating_sub(max);
+    while !text.is_char_boundary(start) {
+        start += 1;
     }
+    &text[start..]
 }
 
 fn base64_encode(input: &[u8]) -> String {
@@ -395,24 +395,59 @@ fn check_tool_output(output: &Output, what: &str) -> Result<()> {
     if output.status.success() {
         return Ok(());
     }
-    Err(format!(
-        "{what} failed ({}): {}",
-        output.status,
-        tail(&String::from_utf8_lossy(&output.stderr), 2000)
-    )
-    .into())
+    Err(failure_message(what, output, &secret_values()).into())
 }
 
 fn check_output(output: &Output, what: &str) -> Result<()> {
-    if output.status.success() {
-        return Ok(());
+    check_tool_output(output, &format!("wash {what}"))
+}
+
+/// Registry secrets that must never reach an error message: the password or
+/// token from the environment, and the base64 `user:password` auth written
+/// to the `DOCKER_CONFIG` file. Credentials never go in argv or the tool env.
+fn secret_values() -> Vec<String> {
+    let mut secrets: Vec<String> = ["DI_OCI_PASSWORD", "GHCR_TOKEN", "GITHUB_TOKEN"]
+        .iter()
+        .filter_map(|name| env::var(name).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect();
+    if let Ok(Some((username, password))) = registry_credentials() {
+        secrets.push(base64_encode(format!("{username}:{password}").as_bytes()));
     }
-    Err(format!(
-        "wash {what} failed ({}): {}",
-        output.status,
-        tail(&String::from_utf8_lossy(&output.stderr), 2000)
-    )
-    .into())
+    secrets
+}
+
+fn redact(text: &str, secrets: &[String]) -> String {
+    let mut secrets: Vec<&str> = secrets
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Longest first, so a secret that contains another is masked whole.
+    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    secrets.into_iter().fold(text.to_owned(), |text, secret| {
+        text.replace(secret, "[REDACTED]")
+    })
+}
+
+/// `<what> failed (<status>): stdout: ...; stderr: ...`, each stream trimmed,
+/// redacted, then cut to its last 2000 bytes. `wash --output json` reports
+/// its failures on stdout and can leave stderr empty.
+fn failure_message(what: &str, output: &Output, secrets: &[String]) -> String {
+    let streams: Vec<String> = [("stdout", &output.stdout), ("stderr", &output.stderr)]
+        .into_iter()
+        .filter_map(|(name, bytes)| {
+            let text = redact(String::from_utf8_lossy(bytes).trim(), secrets);
+            (!text.is_empty()).then(|| format!("{name}: {}", tail(&text, 2000)))
+        })
+        .collect();
+    let detail = if streams.is_empty() {
+        "no output on stdout or stderr".to_owned()
+    } else {
+        streams.join("; ")
+    };
+    format!("{what} failed ({}): {detail}", output.status)
 }
 
 /// Validate `dist/` and, when `push_enabled`, push and verify it.
@@ -714,6 +749,68 @@ mod tests {
         fs::write(dir.join("component.wasm"), b"modified").unwrap();
         assert!(checked_bytes(&dir, "component.wasm", &sums).is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn exited(code: i32, stdout: &str, stderr: &str) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+        Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_failures_carry_stdout_and_stderr_without_secrets() {
+        let secrets = vec![
+            "s3cr3t-token".to_owned(),
+            base64_encode(b"bot:s3cr3t-token"),
+        ];
+        // wash --output json fails on stdout with an empty stderr (#188).
+        let push = exited(
+            1,
+            "{\"success\":false,\"message\":\"denied: permission_denied: write_package\"}\n",
+            "",
+        );
+        let message = failure_message("wash oci push", &push, &secrets);
+        assert!(
+            message.starts_with("wash oci push failed (exit status: 1): stdout: {"),
+            "{message}"
+        );
+        assert!(
+            message.contains("permission_denied: write_package"),
+            "{message}"
+        );
+        assert!(!message.contains("stderr"), "{message}");
+
+        let both = exited(
+            2,
+            "  pushing ghcr.io/o/r:t with s3cr3t-token  \n",
+            &format!("\nauth {} rejected\n", base64_encode(b"bot:s3cr3t-token")),
+        );
+        let message = failure_message("oras tag", &both, &secrets);
+        assert_eq!(
+            message,
+            "oras tag failed (exit status: 2): stdout: pushing ghcr.io/o/r:t with [REDACTED]; \
+             stderr: auth [REDACTED] rejected"
+        );
+        assert!(!message.contains("s3cr3t"));
+
+        let silent = failure_message("wash oci pull", &exited(1, " \n", ""), &secrets);
+        assert_eq!(
+            silent,
+            "wash oci pull failed (exit status: 1): no output on stdout or stderr"
+        );
+
+        let long = format!("{}é{}", "x".repeat(10), "y".repeat(1999));
+        let message = failure_message("t", &exited(1, &long, ""), &[]);
+        // The 2000-byte cut lands inside `é`: it moves to the next char boundary.
+        assert_eq!(
+            message,
+            format!("t failed (exit status: 1): stdout: {}", "y".repeat(1999))
+        );
     }
 
     #[test]
