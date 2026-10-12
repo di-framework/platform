@@ -75,7 +75,13 @@ test('published implementation provisions tenancy and isolation for an existing 
   const controller = resources.find((r) => r.name === 'deployment-di-platform-controller');
   const cfg = JSON.parse(controller?.inputs.spec.template.spec.containers[0].env[0].value);
   expect(cfg.storageRoot).toBe('/var/lib/kubesolo');
-  expect(cfg.insecureRegistry).toBe(false);
+  expect(cfg).not.toHaveProperty('insecureRegistry');
+  // A TLS install: no plain-HTTP registry anywhere.
+  expect(cfg.insecureRegistries).toEqual([]);
+  // wash 2.8.0-wasi-tls with patch 0002 (`--insecure-registry`, #149).
+  expect(cfg.hostImage).toBe(
+    'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad',
+  );
   const scripts = resources.find((r) => r.name === 'configmap-di-platform-controller')?.inputs.data;
   expect(scripts['controller.js']).toContain('class Controller');
   expect(scripts['resources.js']).toContain('tenantResources');
@@ -124,6 +130,76 @@ test('published implementation provisions tenancy and isolation for an existing 
     'platform.di-framework.dev/installation': 'di-test',
   });
   expect(cfg.routeUrlPattern).toBe('http://{host}.{tenant}.localhost:28080');
+}, 60_000);
+
+test('an insecure install keeps the platform flag and allowlists only its registry for tenants', () => {
+  const output = execFileSync(
+    'node',
+    [
+      '-e',
+      `
+    const pulumi = require('@pulumi/pulumi');
+    const k8s = require('@pulumi/kubernetes');
+    const resources = [];
+    pulumi.runtime.setAllConfig({'project:tenants': JSON.stringify([{name:'alpha'}]), 'project:insecureRegistries': JSON.stringify(['examples-registry.wasmcloud.svc.cluster.local:5000'])});
+    pulumi.runtime.setMocks({
+      newResource: args => { resources.push(args); return {id:args.name, state:{...args.inputs, metadata:{...args.inputs.metadata, name:args.inputs.metadata?.name ?? args.name}}}; },
+      call: args => args.inputs,
+    }, 'project', 'test', false);
+    pulumi.runtime.runInPulumiStack(async () => {
+      const {createPlatform} = require('./dist');
+      const platform = createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', registry:true, insecureRegistry:true });
+      await platform.namespace.promise();
+      await Promise.all(platform.tenants.map(t => t.promise()));
+    }).then(() => { console.log(JSON.stringify(resources)); }).catch(e => {console.error(e);process.exitCode=1;});
+  `,
+    ],
+    { cwd: root, encoding: 'utf8' },
+  );
+  const resources = JSON.parse(output) as { type: string; name: string; inputs: any }[];
+  // The platform host group (stock wasmCloud image) still pulls every registry over plain HTTP.
+  const release = resources.find((r) => r.type === 'kubernetes:helm.sh/v3:Release');
+  expect(release?.inputs.values.runtime.extraArgs).toEqual(['--allow-insecure-registries']);
+  const registry = resources.find(
+    (r) => r.name === 'oci-registry' && r.type === 'kubernetes:core/v1:Service',
+  );
+  expect(registry?.inputs.metadata).toMatchObject({
+    name: 'di-framework-registry',
+    namespace: 'wasmcloud',
+  });
+  expect(registry?.inputs.spec.ports[0].port).toBe(5000);
+  // Tenant hosts: the platform registry as registry.pull spells it, then the configured ones.
+  const controller = resources.find((r) => r.name === 'deployment-di-platform-controller');
+  const cfg = JSON.parse(controller?.inputs.spec.template.spec.containers[0].env[0].value);
+  // The controller needs only the allowlist; `insecureRegistry` itself is Helm-only.
+  expect(cfg).not.toHaveProperty('insecureRegistry');
+  expect(cfg.insecureRegistries).toEqual([
+    'di-framework-registry.wasmcloud.svc.cluster.local:5000',
+    'examples-registry.wasmcloud.svc.cluster.local:5000',
+  ]);
+}, 60_000);
+
+test('an insecure install refuses a tenantHostImage that predates patch 0002', () => {
+  const old =
+    'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669';
+  const output = execFileSync(
+    'node',
+    [
+      '-e',
+      `
+    const pulumi = require('@pulumi/pulumi');
+    const k8s = require('@pulumi/kubernetes');
+    pulumi.runtime.setAllConfig({'project:tenantHostImage': '${old}'});
+    pulumi.runtime.setMocks({ newResource: a => ({id:a.name, state:a.inputs}), call: a => a.inputs }, 'project', 'test', false);
+    try {
+      require('./dist').createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', registry:true, insecureRegistry:true });
+      console.log('created');
+    } catch (e) { console.log(e.message); }
+  `,
+    ],
+    { cwd: root, encoding: 'utf8' },
+  );
+  expect(output).toContain(`tenantHostImage ${old} predates wash patch 0002`);
 }, 60_000);
 
 test('existing entrypoint derives the route pattern from a loopback HTTP endpoint', () => {

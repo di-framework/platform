@@ -571,7 +571,6 @@ export class Controller {
     registryDeployed: boolean,
   ): Promise<HostPull | undefined> {
     if (!registryDeployed || tenant.spec.suspended) return undefined;
-    if (this.cfg.insecureRegistry) return {};
     const n = names(tenant.metadata.name);
     const ca = await this.get<{ data?: Record<string, string> }>(
       `${collection('v1', 'ConfigMap', n.runtimeNamespace)}/tenant-controller-ca`,

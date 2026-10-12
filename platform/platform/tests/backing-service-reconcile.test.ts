@@ -38,7 +38,6 @@ const cfg: ControllerConfig = {
   namespace: 'wasmcloud',
   hostImage: 'wash:test',
   schedulerNatsUrl: 'nats://nats:4222',
-  insecureRegistry: true,
 };
 
 function key(value: Resource | Tenant | BackingService | BackingServiceClass): string {

@@ -66,7 +66,12 @@ export interface ControllerConfig {
   hostImage: string;
   hostImagePullPolicy?: string;
   schedulerNatsUrl: string;
-  insecureRegistry: boolean;
+  /**
+   * Exact `host[:port]` registries tenant hosts pull from over plain HTTP, one
+   * `--insecure-registry` each (wash patch 0002): the platform registry on local installs. Every
+   * other pull, the tenant registry's pull listener included, stays TLS.
+   */
+  insecureRegistries?: string[];
   storageRoot?: string;
   /** `http://{host}.{tenant}.localhost:<port>` when the platform gateway is published. */
   routeUrlPattern?: string;
@@ -146,9 +151,8 @@ export const REGISTRY_WORKLOAD = 'di-tenant-registry';
 const DEFAULT_REGISTRY_URL = `https://127.0.0.1:${REGISTRY_FRONT_PORT}`;
 /**
  * The controller's pull-only listener for the tenant's own hosts (#83 `:host-pull`): GET and HEAD
- * forwarded like the registry front, TLS with the controller certificate unless the platform runs
- * hosts with `--allow-insecure-registries` (`insecureRegistry`), which switches every wash pull
- * to plain HTTP.
+ * forwarded like the registry front, always TLS with the controller certificate. Tenant hosts
+ * allow plain HTTP only for the registries in `insecureRegistries` (#149), never this one.
  */
 export const REGISTRY_PULL_PORT = 8791;
 /** The Service hosts pull through: `<REGISTRY_PULL_SERVICE>.di-runtime-<tenant>.svc`. */
@@ -162,9 +166,8 @@ export const REGISTRY_PULL_SECRET = 'di-tenant-registry-pull';
 /** The Basic username in the host's Docker config; the registry ignores it. */
 const REGISTRY_PULL_USER = 'tenant-host';
 /**
- * The registry host workload references use: the in-cluster pull Service, without a port (443
- * over TLS, 80 when `insecureRegistry` makes wash pull over plain HTTP), so one reference works
- * in both modes.
+ * The registry host workload references use: the in-cluster pull Service, without a port (443,
+ * TLS).
  */
 export function registryPullHost(tenant: string): string {
   return `${REGISTRY_PULL_SERVICE}.${names(tenant).runtimeNamespace}.svc`;
@@ -1066,7 +1069,8 @@ function tenantResources(
                     '--oci-cache-dir=/oci-cache',
                     '--http-addr=0.0.0.0:9191',
                     '--socket-egress=enforce',
-                    ...(cfg.insecureRegistry ? ['--allow-insecure-registries'] : []),
+                    // Plain HTTP only for these exact registries; never --allow-insecure-registries (#149).
+                    ...(cfg.insecureRegistries ?? []).flatMap((r) => ['--insecure-registry', r]),
                     // The tenant registry's pull Service serves the controller certificate.
                     ...(hostPull?.caDigest ? ['--oci-ca-path=/registry-ca/ca.crt'] : []),
                   ],
@@ -1720,7 +1724,6 @@ function tenantAuthResources(
               TENANT_CONTROLLER_REGISTRY_FRONT_PORT: String(REGISTRY_FRONT_PORT),
               TENANT_CONTROLLER_REGISTRY_URL: tenantRegistryPublicUrl(name, auth),
               TENANT_CONTROLLER_REGISTRY_PULL_PORT: String(REGISTRY_PULL_PORT),
-              ...(cfg.insecureRegistry ? { TENANT_CONTROLLER_REGISTRY_PULL_TLS: 'false' } : {}),
             }
           : {}),
       },
@@ -1785,8 +1788,7 @@ function tenantAuthResources(
     ),
     service('tenant-console', 8787),
   );
-  // The hosts pull through this Service with no port in the reference: 443 (TLS) normally, 80
-  // when `insecureRegistry` makes wash use plain HTTP for every pull.
+  // The hosts pull through this Service with no port in the reference: 443 (TLS).
   if (registry)
     result.push(
       make('v1', 'Service', REGISTRY_PULL_SERVICE, namespace, {
@@ -1795,7 +1797,7 @@ function tenantAuthResources(
           ports: [
             {
               name: 'pull',
-              port: cfg.insecureRegistry ? 80 : 443,
+              port: 443,
               targetPort: REGISTRY_PULL_PORT,
             },
           ],

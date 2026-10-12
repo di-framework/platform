@@ -181,8 +181,8 @@ composed `pqc-subtle` component) and the tenant CLI pilot in `platform/tenant-cl
 
 `wasmcloud:postgres@0.2.0` gives the guest `query` calls with no connection affinity: the host's
 Postgres plugin serves the guest's named import from a pool, one free connection per call, so a
-`BEGIN` on one call never covers the next. (The invocation-lease patch in `platform/tenant-host`
-pins a connection only for the unnamed import, which this guest does not use.) The identity guest
+`BEGIN` on one call never covers the next. (No shipped tenant host image pins a connection per
+invocation: the invocation-lease patch was dropped, #63, #13.) The identity guest
 therefore runs in autocommit and keeps every single-use and last-owner rule in one statement; see
 "Transaction semantics on wasmCloud" in identity-server's `docs/guest-http-api.md`. Nothing on
 the platform side changed for this.
@@ -235,7 +235,7 @@ renaming or removing one is a breaking change.
 | `TENANT_CONTROLLER_REGISTRY_FRONT_PORT` | none | TLS listener (the controller certificate) that forwards every request, credentials included, to the tenant hosts as the registry (platform#83) |
 | `TENANT_CONTROLLER_REGISTRY_HOST` | `registry` | `Host` the registry front sends: the registry workload's `wasi:http` host; `/v1/deploy` refuses a `<service>-<env>` equal to it |
 | `TENANT_CONTROLLER_REGISTRY_PULL_PORT` | none | The tenant hosts' pull-only listener (platform#83 `:host-pull`): the registry front for `GET`/`HEAD` only (`405` otherwise). NetworkPolicy admits only the tenant host pods |
-| `TENANT_CONTROLLER_REGISTRY_PULL_TLS` | `true` | `false` serves the pull listener over plain HTTP, for platforms whose hosts run `--allow-insecure-registries` (every wash pull is then plain HTTP) |
+| `TENANT_CONTROLLER_REGISTRY_PULL_TLS` | `true` | `false` serves the pull listener over plain HTTP. The platform never sets it: tenant hosts pull this listener over TLS and allow plain HTTP only for the registries named with `--insecure-registry` (platform#149) |
 | `TENANT_CONTROLLER_REGISTRY_PULL_HOST` | none | In-cluster registry host workloads reference (`tenant-registry.di-runtime-<tenant>.svc`); `/v1/deploy` refuses a guest image on the public registry origin and names this host instead |
 | `TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE` | none | File holding the host pull token. The whoami listener (only) answers `Bearer <token>` as `{user: system:tenant-host, role: viewer, via: host-pull}`, so the registry allows pulls and nothing else. Read on every call, so a rotated token applies without a restart |
 | `TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES` | `536870912` (512 MiB) | Largest request body the registry front accepts; larger is `413` |
