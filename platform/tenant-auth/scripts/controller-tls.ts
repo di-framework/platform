@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   caCertificate,
@@ -40,7 +41,9 @@ export function ensureControllerTls(
   namespace: string,
   now: Date = new Date(),
 ): ControllerTlsFiles {
-  mkdirSync(dir, { recursive: true });
+  // `mode` applies only when a path is created, so set it on an existing directory or file too.
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
   const files: ControllerTlsFiles = {
     caCrt: join(dir, 'ca.crt'),
     caKey: join(dir, 'ca.key'),
@@ -48,7 +51,10 @@ export function ensureControllerTls(
     key: join(dir, 'tls.key'),
   };
   const read = (path: string) => (existsSync(path) ? readFileSync(path, 'utf8') : '');
-  const write = (path: string, pem: string) => writeFileSync(path, pem, { mode: 0o600 });
+  const write = (path: string, pem: string) => {
+    writeFileSync(path, pem, { mode: 0o600 });
+    chmodSync(path, 0o600);
+  };
 
   let ca = { cert: read(files.caCrt), key: read(files.caKey) };
   const keepCa = holdsCaKey(ca.cert, ca.key) && certificateValid(ca.cert, CA_RENEW_DAYS, now);
@@ -82,4 +88,19 @@ export function ensureControllerTls(
     write(files.crt, leaf.cert);
   }
   return files;
+}
+
+/** The pod template annotation that carries {@link controllerTlsDigest}. */
+export const TLS_DIGEST_ANNOTATION = 'platform.di-framework.dev/tls-cert-sha256';
+
+/**
+ * Digest of the certificates the pods load at startup: the leaf the controller serves and the CA the
+ * console pins. Both pod templates carry it, as the platform controller's `tls-cert-sha256` does,
+ * so replacing the pair rolls the pods even when the bundle is unchanged.
+ */
+export function controllerTlsDigest(files: Pick<ControllerTlsFiles, 'caCrt' | 'crt'>): string {
+  return createHash('sha256')
+    .update(readFileSync(files.crt))
+    .update(readFileSync(files.caCrt))
+    .digest('hex');
 }

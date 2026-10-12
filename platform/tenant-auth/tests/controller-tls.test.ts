@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { X509Certificate } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { selfSignedCertificate } from '../../platform/src/tenancy/tls.ts';
-import { ensureControllerTls } from '../scripts/controller-tls.ts';
+import { controllerTlsDigest, ensureControllerTls } from '../scripts/controller-tls.ts';
 
 const NAMESPACE = 'di-runtime-acme';
 const dirs: string[] = [];
@@ -74,5 +74,38 @@ describe('deploy-local controller TLS', () => {
     expect(read(renewed.caCrt)).toBe(ca);
     expect(read(renewed.crt)).not.toBe(leaf);
     expect(new X509Certificate(read(renewed.crt)).checkIssued(new X509Certificate(ca))).toBe(true);
+  });
+
+  test('the pod template digest changes exactly when the certificates change', () => {
+    const dir = tempDir();
+    const now = new Date();
+    const first = ensureControllerTls(dir, NAMESPACE, now);
+    const digest = controllerTlsDigest(first);
+    expect(digest).toMatch(/^[0-9a-f]{64}$/);
+    // Kept pair: same digest, so an unchanged bundle does not roll the pods.
+    expect(controllerTlsDigest(ensureControllerTls(dir, NAMESPACE, now))).toBe(digest);
+    // Leaf renewal under the same CA rolls both pods.
+    const renewed = ensureControllerTls(dir, NAMESPACE, new Date(now.getTime() + 340 * 86_400_000));
+    expect(read(renewed.caCrt)).toBe(read(first.caCrt));
+    const afterRenewal = controllerTlsDigest(renewed);
+    expect(afterRenewal).not.toBe(digest);
+    // A new CA (the migration from a single CA:TRUE certificate) rolls them too.
+    rmSync(renewed.caCrt);
+    const migrated = controllerTlsDigest(ensureControllerTls(dir, NAMESPACE, now));
+    expect(migrated).not.toBe(afterRenewal);
+    expect(migrated).not.toBe(digest);
+  });
+
+  test('tightens the modes of an existing directory and key files', () => {
+    const dir = tempDir();
+    const first = ensureControllerTls(dir, NAMESPACE);
+    // An older run (or openssl under a 022 umask) left them group- and world-readable.
+    chmodSync(dir, 0o755);
+    for (const path of [first.caKey, first.key, first.crt, first.caCrt]) chmodSync(path, 0o644);
+    rmSync(first.caCrt);
+    const files = ensureControllerTls(dir, NAMESPACE);
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+    for (const path of [files.caKey, files.key, files.crt, files.caCrt])
+      expect(statSync(path).mode & 0o777).toBe(0o600);
   });
 });
