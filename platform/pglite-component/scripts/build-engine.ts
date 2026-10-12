@@ -3,6 +3,7 @@ import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { $ } from 'bun';
 import { type Context, logger, run } from './lib/cli.ts';
+import { fetchVerified } from './lib/fetch.ts';
 import { fileExists, isDirectory } from './lib/fs.ts';
 import { requiredPin } from './lib/versions.ts';
 
@@ -13,6 +14,7 @@ export const STAMP_FILES = [
   'scripts/patch-engine-source.ts',
   'scripts/tool-versions.env',
   'engine/reply-buffer.c',
+  'engine/build-pgcrypto.sh',
 ] as const;
 
 export async function sourceStamp(pkgDir: string, selfPath: string): Promise<string> {
@@ -126,6 +128,19 @@ export async function buildEngineSource(ctx: Context): Promise<void> {
   await Bun.write(versionsEnvPath, patched.versionsEnv);
   await Bun.write(buildShPath, patched.buildSh);
 
+  // pgcrypto links libcrypto built from this checksum-verified OpenSSL source;
+  // patch-engine-source.ts copies it into the container's source tree.
+  const openssl = join(
+    engineDir,
+    `openssl-${requiredPin(ctx.tools.pins, 'OPENSSL_VERSION')}.tar.gz`,
+  );
+  await fetchVerified(
+    requiredPin(ctx.tools.pins, 'OPENSSL_URL'),
+    openssl,
+    requiredPin(ctx.tools.pins, 'OPENSSL_SHA256'),
+    { log },
+  );
+
   // Keep the upstream build recipe, adapting file transfer for remote container
   // daemons and omitting its Go-specific pristine-database packaging step.
   // Do not reuse shared upstream FAST volumes: clean source builds avoid stale
@@ -133,6 +148,7 @@ export async function buildEngineSource(ctx: Context): Promise<void> {
   await $`bash ${buildShPath}`.env({
     ...env,
     DF_PGLITE_SOURCE_PATCH: patchScript,
+    DF_PGLITE_OPENSSL_TARBALL: openssl,
     FAST: 'false',
   });
 

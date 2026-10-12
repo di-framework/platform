@@ -21,6 +21,16 @@ const USAGE = [
 
 const FLAGS = { debug: { type: 'boolean' } } as const;
 
+/** engine/ files concatenated, in order, into dist/THIRD-PARTY-NOTICES.txt. */
+export const THIRD_PARTY_NOTICE_FILES = [
+  'NOTICE',
+  'POSTGRESQL-COPYRIGHT',
+  'PGCRYPTO-NOTICES',
+  'OPENSSL-LICENSE',
+  'PGLITE-BINDINGS-LICENSE',
+  'WASMTIME-LICENSE',
+] as const;
+
 export interface BuildOptions {
   profile: 'release' | 'dev';
   profileDir: 'release' | 'debug';
@@ -111,9 +121,7 @@ export async function buildComponent(ctx: Context, options: BuildOptions): Promi
   }
 
   const notices = await Promise.all(
-    ['NOTICE', 'POSTGRESQL-COPYRIGHT', 'PGLITE-BINDINGS-LICENSE', 'WASMTIME-LICENSE'].map((f) =>
-      Bun.file(join(pkgDir, 'engine', f)).text(),
-    ),
+    THIRD_PARTY_NOTICE_FILES.map((f) => Bun.file(join(pkgDir, 'engine', f)).text()),
   );
   await Bun.write(join(dist, 'THIRD-PARTY-NOTICES.txt'), notices.join(''));
 
@@ -131,6 +139,7 @@ export async function buildComponent(ctx: Context, options: BuildOptions): Promi
       `wit-bindgen:     ${requiredPin(pins, 'WIT_BINDGEN_VERSION')}`,
       `md5:             ${requiredPin(pins, 'MD5_VERSION')}`,
       'engine:          PostgreSQL 17.5, persistent WASI filesystem',
+      `extensions:      plpgsql, pgcrypto (OpenSSL ${requiredPin(pins, 'OPENSSL_VERSION')} libcrypto)`,
       `engine-source:   https://github.com/moznion/wasipg/tree/${requiredPin(pins, 'PGLITE_SOURCE_REF')}`,
       `adapter-sha256:  ${requiredPin(pins, 'PGLITE_ADAPTER_SHA256')}`,
       `engine-sha256:   ${await sha256File(join(engineDir, 'engine.core.wasm'))}`,

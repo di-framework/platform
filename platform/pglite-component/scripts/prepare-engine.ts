@@ -25,9 +25,21 @@ export const PG_STRONG_RANDOM_REPLACEMENT = [
   '  )',
 ].join('\n');
 
+/**
+ * Functions that must be linked into the engine: the static-extension dlsym
+ * hook and one pgcrypto entry point. Missing names mean pgcrypto was dropped
+ * from the WASI link and `CREATE EXTENSION pgcrypto` would fail at runtime.
+ */
+export const REQUIRED_ENGINE_FUNCS = ['df_ext_dlsym', 'pg_digest'] as const;
+
 /** Rewrite the extracted engine WAT: WASI entropy, relocatable bootstrap paths. */
 export function patchEngineWat(wat: string, bridgeWat: string): string {
   let patched = wat;
+  for (const name of REQUIRED_ENGINE_FUNCS) {
+    if (!patched.includes(`(func $${name} `)) {
+      throw new Error(`engine is missing statically linked function ${name} (pgcrypto)`);
+    }
+  }
   const randomMatches = patched.match(/ {2}\(func \$pg_strong_random .*?\n {2}\)/s);
   if (randomMatches?.length !== 1 || !randomMatches[0]) {
     throw new Error('engine pg_strong_random ABI changed');

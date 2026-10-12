@@ -89,6 +89,12 @@ fn main() {
             .first("SELECT id FROM tasks WHERE payload = 'uncommitted'", &[])
             .unwrap()
             .is_none());
+        // pgcrypto created by the write run resolves again in a fresh engine.
+        let row = db
+            .first("SELECT encode(digest('a', 'sha256'), 'hex') AS h", &[])
+            .expect("pgcrypto after restart")
+            .unwrap();
+        assert_eq!(text(col(&row, "h")), SHA256_A);
         db.close().expect("close read");
         println!("restart ok");
         return;
@@ -456,8 +462,63 @@ fn main() {
         "duplicate id should return SQLSTATE 23505"
     );
 
+    pgcrypto(&db);
+
     db.close().unwrap();
     println!("smoke ok");
+}
+
+const SHA256_A: &str = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb";
+
+/// pgcrypto is statically linked into the engine with OpenSSL libcrypto;
+/// its salts, session keys and padding come from WASI random_get.
+fn pgcrypto(db: &Connection) {
+    db.exec("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+        .expect("CREATE EXTENSION pgcrypto");
+    let one = |sql: &str| -> String {
+        let row = db
+            .first(sql, &[])
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+            .unwrap_or_else(|| panic!("{sql}: no row"));
+        text(&row[0].1)
+    };
+    assert_eq!(
+        one("SELECT pgp_sym_decrypt(pgp_sym_encrypt('x', 'k'), 'k') AS v"),
+        "x"
+    );
+    assert_eq!(one("SELECT encode(digest('a', 'sha256'), 'hex') AS v"), SHA256_A);
+    assert_eq!(
+        one("SELECT encode(hmac('a', 'k', 'sha1'), 'hex') AS v"),
+        "40e7d441cadb17b07f050341aa23a6820ed81c8b"
+    );
+    let uuid = one("SELECT gen_random_uuid()::text AS v");
+    assert_eq!(uuid.len(), 36, "{uuid}");
+    assert_eq!(&uuid[14..15], "4", "version-4 uuid {uuid}");
+    let hash = one("SELECT crypt('pw', gen_salt('bf')) AS v");
+    assert!(hash.starts_with("$2a$06$"), "bcrypt hash {hash}");
+    let check = db
+        .first(
+            "SELECT (crypt('pw', $1::text) = $1::text)::text AS ok, (crypt('nope', $1::text) = $1::text)::text AS bad",
+            &[Value::Text(hash.clone())],
+        )
+        .expect("crypt verify")
+        .unwrap();
+    assert_eq!(text(col(&check, "ok")), "true");
+    assert_eq!(text(col(&check, "bad")), "false");
+    // Fresh randomness per call: salts and PGP session keys never repeat.
+    assert_ne!(one("SELECT gen_salt('bf') AS v"), one("SELECT gen_salt('bf') AS v"));
+    assert_eq!(
+        one("SELECT (pgp_sym_encrypt('x', 'k') <> pgp_sym_encrypt('x', 'k'))::text AS v"),
+        "true"
+    );
+    assert_eq!(one("SELECT length(gen_random_bytes(32))::text AS v"), "32");
+    // A wrong key is an ordinary, recoverable SQL error.
+    assert!(matches!(
+        db.first("SELECT pgp_sym_decrypt(pgp_sym_encrypt('x', 'k'), 'wrong')", &[]),
+        Err(Error::ExecutionFailed(_))
+    ));
+    assert_eq!(one("SELECT 'still usable'::text AS v"), "still usable");
+    println!("pgcrypto ok");
 }
 
 /// Rows whose text must never appear in the data directory when it is

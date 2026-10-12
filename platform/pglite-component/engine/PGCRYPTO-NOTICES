@@ -1,0 +1,87 @@
+
+--------------------------------------------------------------------------
+pgcrypto (PostgreSQL 17.5 contrib/pgcrypto)
+--------------------------------------------------------------------------
+
+pgcrypto is part of PostgreSQL and is distributed under the PostgreSQL
+License (POSTGRESQL-COPYRIGHT). Several of its source files carry these
+additional notices, reproduced as their licenses require for binary
+distribution.
+
+px.c, px-hmac.c, px-crypt.c, mbuf.c, openssl.c, pgcrypto.c, pgp*.c and
+their headers:
+
+    Copyright (c) 2001 Marko Kreen
+    Copyright (c) 2005 Marko Kreen
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in the
+       documentation and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+    ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+    FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+    DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+    OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+    HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+    LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+    OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+    SUCH DAMAGE.
+
+crypt-des.c (FreeSec: libcrypt for NetBSD):
+
+    Copyright (c) 1994 David Burren
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in the
+       documentation and/or other materials provided with the distribution.
+    3. Neither the name of the author nor the names of other contributors
+       may be used to endorse or promote products derived from this software
+       without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+    ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+    FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+    DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+    OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+    HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+    LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+    OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+    SUCH DAMAGE.
+
+crypt-md5.c: imported from FreeBSD, original by Poul-Henning Kamp.
+
+crypt-blowfish.c and crypt-gensalt.c: written by Solar Designer
+<solar at openwall.com> in 1998-2002 and placed in the public domain.
+
+--------------------------------------------------------------------------
+OpenSSL 3.5.9 (libcrypto)
+--------------------------------------------------------------------------
+
+pgcrypto links a static libcrypto built from the OpenSSL 3.5.9 release
+source (https://github.com/openssl/openssl/releases/tag/openssl-3.5.9),
+distributed under the Apache License, Version 2.0, reproduced in
+OPENSSL-LICENSE:
+
+    Copyright (c) 1998-2026 The OpenSSL Project Authors
+    Copyright (c) 1995-1998 Eric A. Young, Tim J. Hudson
+
+It is compiled for wasm32-wasip1 without assembly, threads, sockets,
+engines, loadable modules or configuration autoloading; no OpenSSL source
+file is modified.

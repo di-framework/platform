@@ -87,7 +87,7 @@ Tags are movable. `0.2.0` always points to the latest `main` publish for WIT pac
 ### Artifact location
 
 The digest is in **Details** > **Record component digest** > **Step summary**, and in the `pglite-publish-report` artifact (`publish-report.json`).
-Published digest: `ghcr.io/di-framework/pglite-component@sha256:8bc30505cf28b1a65f72588da692d2ba3d79a6a2025c9256341a8625967a3286`
+Published digest: `ghcr.io/di-framework/pglite-component@sha256:9a00ac39f202ede852d0ce0e43dbb27c5626c3e3e613d63d5916c990394a7d5e`
 
 **Note:** The GHCR package must be made public by an org admin after the first publish. Until then, only members with access to di-framework/platform can pull it.
 
@@ -125,7 +125,7 @@ wasmtime run --dir ./data::/data path/to/app.composed.wasm
 To use the published OCI component from GHCR instead (pin by digest for reproducibility):
 
 ```sh
-export PGLITE_REF='ghcr.io/di-framework/pglite-component@sha256:8bc30505cf28b1a65f72588da692d2ba3d79a6a2025c9256341a8625967a3286'
+export PGLITE_REF='ghcr.io/di-framework/pglite-component@sha256:9a00ac39f202ede852d0ce0e43dbb27c5626c3e3e613d63d5916c990394a7d5e'
 wash oci pull "${PGLITE_REF}" pglite.wasm
 wac plug --plug pglite.wasm path/to/app.wasm -o path/to/app.composed.wasm
 mkdir -p ./data
@@ -250,6 +250,25 @@ machine-readable handling of constraint violations and other conditions:
 - `"22012"` = division by zero
 - `"54000"` = result too large
 
+## Extensions
+
+The engine cannot load shared libraries, so extensions are linked into it
+statically. It includes `plpgsql` and `pgcrypto`. Enable pgcrypto from a migration:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+SELECT pgp_sym_decrypt(pgp_sym_encrypt('secret', 'key'), 'key');
+SELECT encode(digest('a', 'sha256'), 'hex');
+SELECT crypt('password', gen_salt('bf'));
+```
+
+pgcrypto links a static `libcrypto` built from the pinned OpenSSL 3.5 LTS
+source (`OPENSSL_*` in `scripts/tool-versions.env`, Apache-2.0). Every salt,
+PGP session key and padding byte comes from `pg_strong_random`, which the
+engine routes to the host's WASI `random` interface. `gen_random_uuid()` is
+built into PostgreSQL and works without the extension. Other contrib modules
+are not included. The WIT interface does not change.
+
 ## Persistence and ownership
 
 For an `open("/data/orders", ...)` call:
@@ -299,6 +318,7 @@ annotations provide storage; they do not enforce database ownership.
 - `src/pgwire.rs`: PostgreSQL message encoding and typed rows, over memory.
 - `src/engine.rs`: persistent filesystem setup and exclusive engine access.
 - `engine/bridge.wat`: private canonical ABI bridge to the core engine.
+- `engine/build-pgcrypto.sh`: builds OpenSSL libcrypto and pgcrypto in the engine container and generates pgcrypto's static `dlsym` table; `scripts/patch-engine-source.ts` links both into the engine.
 - `scripts/prepare-engine.ts`: pinned engine preparation and componentization (all build scripts are Bun TypeScript; see `scripts/`).
 - `wit/deps/pglite-engine/engine.wit`: internal interface, composed away at build.
 
