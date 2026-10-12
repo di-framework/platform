@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'bun:test';
-import { platformRegistryPullHost, tenantInsecureRegistries } from '../src/insecure-registries';
+import {
+  assertHostImageSupportsAllowlist,
+  platformRegistryPullHost,
+  tenantInsecureRegistries,
+} from '../src/insecure-registries';
 
 describe('tenant insecure registries (#149)', () => {
   const PLATFORM = 'di-framework-registry.wasmcloud.svc.cluster.local:5000';
@@ -42,5 +46,29 @@ describe('tenant insecure registries (#149)', () => {
     expect(() => tenantInsecureRegistries({ namespace: 'n', extra: ['reg:5000'] })).toThrow(
       'insecureRegistries requires insecureRegistry: true',
     );
+  });
+
+  it('refuses an insecureRegistries value that is not a list', () => {
+    for (const extra of ['reg:5000', { reg: 5000 }])
+      expect(() =>
+        tenantInsecureRegistries({
+          insecureRegistry: true,
+          namespace: 'n',
+          extra: extra as unknown as string[],
+        }),
+      ).toThrow('insecureRegistries must be a list of host[:port]');
+  });
+
+  it('refuses a tenantHostImage built before patch 0002 once the allowlist is non-empty', () => {
+    const old =
+      'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669';
+    expect(() => assertHostImageSupportsAllowlist(old, [PLATFORM])).toThrow(
+      `tenantHostImage ${old} predates wash patch 0002 and rejects --insecure-registry`,
+    );
+    // Without an allowlist the old image gets no --insecure-registry and still starts.
+    expect(() => assertHostImageSupportsAllowlist(old, [])).not.toThrow();
+    const current =
+      'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad';
+    expect(() => assertHostImageSupportsAllowlist(current, [PLATFORM])).not.toThrow();
   });
 });

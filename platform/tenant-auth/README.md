@@ -176,8 +176,8 @@ composed `pqc-subtle` component) and the tenant CLI pilot in `platform/tenant-cl
 
 `wasmcloud:postgres@0.2.0` gives the guest `query` calls with no connection affinity: the host's
 Postgres plugin serves the guest's named import from a pool, one free connection per call, so a
-`BEGIN` on one call never covers the next. (The invocation-lease patch in `platform/tenant-host`
-pins a connection only for the unnamed import, which this guest does not use.) The identity guest
+`BEGIN` on one call never covers the next. (No shipped tenant host image pins a connection per
+invocation: the invocation-lease patch was dropped, #63, #13.) The identity guest
 therefore runs in autocommit and keeps every single-use and last-owner rule in one statement; see
 "Transaction semantics on wasmCloud" in identity-server's `docs/guest-http-api.md`. Nothing on
 the platform side changed for this.

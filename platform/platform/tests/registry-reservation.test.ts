@@ -232,7 +232,6 @@ function renderedRegistryInterfaces(): HostInterfaceLike[] {
     namespace: 'wasmcloud',
     hostImage: 'wash:test',
     schedulerNatsUrl: 'nats://nats:4222',
-    insecureRegistry: true,
     tenantAuth: {
       image: `ghcr.io/di-framework/tenant-auth@sha256:${'a'.repeat(64)}`,
       issuer: 'http://identity.alpha.localhost:28180',

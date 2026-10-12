@@ -32,6 +32,10 @@ export function tenantInsecureRegistries(args: {
   extra?: readonly string[];
 }): string[] {
   const extra = args.extra ?? [];
+  if (!Array.isArray(extra))
+    throw new Error(
+      `insecureRegistries must be a list of host[:port]; received ${JSON.stringify(extra)}`,
+    );
   for (const entry of extra) {
     if (typeof entry !== 'string' || !HOST_PORT.test(entry))
       throw new Error(
@@ -44,4 +48,25 @@ export function tenantInsecureRegistries(args: {
   }
   const own = args.registry ? [platformRegistryPullHost(args.namespace)] : [];
   return [...new Set([...own, ...extra])];
+}
+
+/**
+ * Published tenant host images built before wash patch 0002 (#176): they reject
+ * `--insecure-registry`, so tenant hosts on them crash-loop once the allowlist is non-empty.
+ */
+export const PRE_ALLOWLIST_HOST_IMAGE_DIGESTS: readonly string[] = [
+  'sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669',
+];
+
+/** Refuses a `tenantHostImage` known to predate patch 0002 when tenant hosts get an allowlist. */
+export function assertHostImageSupportsAllowlist(
+  hostImage: string,
+  insecureRegistries: readonly string[],
+): void {
+  if (!insecureRegistries.length) return;
+  const digest = PRE_ALLOWLIST_HOST_IMAGE_DIGESTS.find((d) => hostImage.endsWith(`@${d}`));
+  if (digest)
+    throw new Error(
+      `tenantHostImage ${hostImage} predates wash patch 0002 and rejects --insecure-registry, which tenant hosts now get for ${insecureRegistries.join(', ')}; use an image built with 0002 (see platform/tenant-host/README.md) or unset tenantHostImage`,
+    );
 }

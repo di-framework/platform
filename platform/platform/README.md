@@ -135,6 +135,38 @@ first run `pulumi up` with the new package and the field unset (this updates the
 schema, controller and tenant-auth image), then set the field (for example
 `runtime.coreInstances`) and run `pulumi up` again.
 
+#### Upgrading to exact plain-HTTP registries for tenant hosts (#149)
+
+Before this change, `insecureRegistry` gave tenant hosts `--allow-insecure-registries`, so
+they pulled every registry over plain HTTP. Tenant hosts now get one `--insecure-registry` per
+allowlisted registry and pull everything else over TLS. Check three things before `pulumi up`:
+
+- **Existing-cluster installs with `insecureRegistry`.** The existing entrypoint installs no
+  platform registry, so its allowlist is empty unless you set `insecureRegistries`. List every
+  plain-HTTP registry that tenant workload references use, as `host:port` with no scheme or path,
+  spelled exactly as the references spell it (wash matches case-sensitively and does not add a
+  default port). For example, kube's examples registry is pulled as
+  `examples-registry.<ns>.svc.cluster.local:5000/examples`, so the entry is
+  `examples-registry.<ns>.svc.cluster.local:5000`:
+
+  ```sh
+  pulumi config set --path 'insecureRegistries[0]' examples-registry.<ns>.svc.cluster.local:5000
+  ```
+
+  Set it before or with the upgrade. Without it, tenant workloads from those registries fail to
+  pull. Local installs need nothing: they allowlist the platform registry themselves.
+- **`tenantHostImage` overrides.** Tenant hosts get `--insecure-registry` whenever the allowlist is
+  not empty, which is always the case on a local install. The image must be built with wash patch
+  0002, for example the published
+  `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad`
+  or the matching `wasi-tls-exclusive` digest in `platform/tenant-host/README.md`. Older images
+  reject the argument and the tenant hosts crash-loop. `createPlatform` refuses the known older
+  default, `…@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669`, with an error
+  naming the image; it cannot recognise other pre-0002 builds of your own. Unset `tenantHostImage`
+  to use the default.
+- **Tenant hosts roll once.** The default host image, the host args and, on insecure installs,
+  the mounted controller CA all change, so each tenant host group restarts on the upgrade.
+
 ## Existing-cluster configuration
 
 `kubeconfig` is required (a local file path); `context`, `namespace`, `release`,

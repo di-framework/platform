@@ -66,8 +66,6 @@ export interface ControllerConfig {
   hostImage: string;
   hostImagePullPolicy?: string;
   schedulerNatsUrl: string;
-  /** The platform host group runs `--allow-insecure-registries`; tenant hosts never do (#149). */
-  insecureRegistry: boolean;
   /**
    * Exact `host[:port]` registries tenant hosts pull from over plain HTTP, one
    * `--insecure-registry` each (wash patch 0002): the platform registry on local installs. Every

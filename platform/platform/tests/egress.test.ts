@@ -52,7 +52,6 @@ const cfg: ControllerConfig = {
   namespace: 'wasmcloud',
   hostImage: 'wash:test',
   schedulerNatsUrl: 'nats://nats:4222',
-  insecureRegistry: true,
 };
 const NS = names('alpha').namespace;
 const RUNTIME = names('alpha').runtimeNamespace;

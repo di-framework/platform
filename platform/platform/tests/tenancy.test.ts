@@ -29,7 +29,6 @@ const cfg: ControllerConfig = {
   namespace: 'wasmcloud',
   hostImage: 'wash:test',
   schedulerNatsUrl: 'nats://nats:4222',
-  insecureRegistry: true,
 };
 const ready = [
   {

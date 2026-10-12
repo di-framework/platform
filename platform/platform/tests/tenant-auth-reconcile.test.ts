@@ -57,7 +57,6 @@ const cfg: ControllerConfig = {
   namespace: 'wasmcloud',
   hostImage: 'wash:test',
   schedulerNatsUrl: 'nats://nats:4222',
-  insecureRegistry: true,
   tenantAuth: auth,
 };
 const ready = [
@@ -2203,7 +2202,6 @@ describe('tenant registry host pull (#83:host-pull)', () => {
   };
   const tlsCfg: ControllerConfig = {
     ...cfg,
-    insecureRegistry: false,
     routeUrlPattern: 'http://{host}.{tenant}.localhost:28180',
     tenantAuth: withRegistry,
   };
@@ -2211,7 +2209,6 @@ describe('tenant registry host pull (#83:host-pull)', () => {
   const PLATFORM_REGISTRY = platformRegistryPullHost('wasmcloud');
   const insecureCfg: ControllerConfig = {
     ...tlsCfg,
-    insecureRegistry: true,
     insecureRegistries: [PLATFORM_REGISTRY],
   };
   const TOKEN = 't'.repeat(43);
@@ -2282,12 +2279,14 @@ describe('tenant registry host pull (#83:host-pull)', () => {
         ports: [{ name: 'pull', port: 443, targetPort: 8791 }],
       },
     });
-    // TLS on port 443 even when insecureRegistry is true (tenant hosts always use TLS).
+    // TLS on port 443 even with a plain-HTTP allowlist (tenant hosts always use TLS for it).
     const insecure = tenantAuthResources(tenant(), insecureCfg, {
       ...inputs,
       registryServing: true,
       hostPullToken: TOKEN,
     });
+    // The allowlist only reaches the tenant hosts' args; tenant-auth renders identically.
+    expect(insecure).toEqual(resources);
     expect(env(find(insecure, 'Deployment', 'tenant-controller') as Deployment)).not.toHaveProperty(
       'TENANT_CONTROLLER_REGISTRY_PULL_TLS',
     );

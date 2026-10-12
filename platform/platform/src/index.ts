@@ -10,6 +10,7 @@ import {
   validateRouteUrlPattern,
 } from './gateway/install';
 import {
+  assertHostImageSupportsAllowlist,
   PLATFORM_REGISTRY_PORT,
   PLATFORM_REGISTRY_SERVICE,
   tenantInsecureRegistries,
@@ -109,6 +110,8 @@ export function createPlatform(args: PlatformArgs) {
     namespace: namespaceName,
     extra: args.insecureRegistries ?? config.getObject<string[]>('insecureRegistries'),
   });
+  const tenantHostImage = config.get('tenantHostImage') ?? DEFAULT_HOST_IMAGE;
+  assertHostImageSupportsAllowlist(tenantHostImage, insecureRegistries);
   const namespaceResource = new k8s.core.v1.Namespace(
     'wasmcloud',
     {
@@ -298,10 +301,9 @@ export function createPlatform(args: PlatformArgs) {
     provider,
     dependsOn: [runtimeShutdown, ...(networkPolicy ? [networkPolicy] : [])],
     ...declared,
-    insecureRegistry: args.insecureRegistry,
     insecureRegistries,
     storageRoot: args.storageRoot,
-    hostImage: config.get('tenantHostImage') ?? DEFAULT_HOST_IMAGE,
+    hostImage: tenantHostImage,
     hostImagePullPolicy: config.get('tenantHostImagePullPolicy') ?? 'IfNotPresent',
     backingServiceClasses: resolveBackingServiceClasses(config),
     routeUrlPattern,
