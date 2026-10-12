@@ -30,11 +30,14 @@ async function sha256File(path: string): Promise<string> {
     .digest('hex');
 }
 
-/** Make sure the pinned toolchain has the Wasm target and lint components. */
+/**
+ * Make sure the pinned toolchain has the Wasm targets (this crate's, and
+ * wasm32-wasip2 for the pglite smoke consumer) and the lint components.
+ */
 export async function ensureToolchain(ctx: Context): Promise<void> {
   requireTools(ctx, ['cargo']);
   if (Bun.which('rustup', { PATH: ctx.env.PATH })) {
-    await $`rustup target add --toolchain ${ctx.toolchain} ${RUST_TARGET}`.quiet();
+    await $`rustup target add --toolchain ${ctx.toolchain} ${RUST_TARGET} wasm32-wasip2`.quiet();
     await $`rustup component add --toolchain ${ctx.toolchain} clippy rustfmt`.quiet();
   }
 }
