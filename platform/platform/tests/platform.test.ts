@@ -1,8 +1,10 @@
 import { expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { platformValues } from '../src/values';
+import { selfSignedCert } from './support/tls';
 
 const root = join(import.meta.dir, '..');
 
@@ -163,7 +165,32 @@ test('existing entrypoint derives the route pattern from a loopback HTTP endpoin
   ).toBe('https://{host}.{tenant}.apps.example.com');
 }, 60_000);
 
-test('kubeconfigs read each token Secret after its User and are a secret output', () => {
+// Child-process helpers: a fake Kubernetes API that serves Secrets with a token, and a
+// kubeconfig that points at it. `hits` records every request path per server.
+const FAKE_API = `
+  const https = require('https');
+  const tls = { key: fs.readFileSync(process.env.TLS_KEY), cert: fs.readFileSync(process.env.TLS_CERT) };
+  const b64 = s => Buffer.from(s).toString('base64');
+  function startApi(label, hits) {
+    const server = https.createServer(tls, (req, res) => {
+      hits.push({ label, path: req.url });
+      const name = decodeURIComponent(req.url.split('/').pop());
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ kind: 'Secret', apiVersion: 'v1', metadata: { name, namespace: 'wasmcloud' }, data: { token: b64('api-token-' + name) } }));
+    });
+    return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve({ server, url: 'https://127.0.0.1:' + server.address().port })));
+  }
+  const kubeconfigFor = (url, context = 'ctx') => [
+    'apiVersion: v1', 'kind: Config', 'current-context: ' + context,
+    'clusters:', '- name: c', '  cluster:', '    server: ' + url, '    certificate-authority-data: ' + Buffer.from(tls.cert).toString('base64'),
+    'users:', '- name: u', '  user:', '    token: admin-token',
+    'contexts:', '- name: ' + context, '  context:', '    cluster: c', '    user: u', '',
+  ].join('\\n');
+`;
+
+test('kubeconfigs wait on the provider kubeconfig after each User, not the ambient KUBECONFIG', () => {
+  const cert = selfSignedCert();
+  const decoyKubeconfig = join(mkdtempSync(join(tmpdir(), 'decoy-')), 'config');
   const output = execFileSync(
     'node',
     [
@@ -171,28 +198,64 @@ test('kubeconfigs read each token Secret after its User and are a secret output'
       `
     const pulumi = require('@pulumi/pulumi');
     const k8s = require('@pulumi/kubernetes');
+    const fs = require('fs');
+    ${FAKE_API}
     const resources = [];
-    const b64 = s => Buffer.from(s).toString('base64');
-    pulumi.runtime.setAllConfig({'project:tenants': JSON.stringify([{name:'alpha'},{name:'beta'}]), 'project:users': JSON.stringify([{name:'alice',memberships:[{tenant:'alpha',role:'developer'},{tenant:'beta',role:'viewer'}]},{name:'bob',memberships:[{tenant:'alpha',role:'viewer'}]}])});
-    pulumi.runtime.setMocks({
-      newResource: args => {
-        resources.push({type:args.type, name:args.name, id:args.id});
-        if (args.id) return {id:args.id, state:{data:{token:b64('token-' + args.name), 'ca.crt':b64('ca')}}};
-        return {id:args.name, state:{...args.inputs, metadata:{...args.inputs.metadata, name:args.inputs.metadata?.name ?? args.name}}};
-      },
-      call: args => args.inputs,
-    }, 'project', 'test', false);
-    let result;
-    pulumi.runtime.runInPulumiStack(async () => {
-      const {createPlatform} = require('./dist');
-      const platform = createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', apiServer: pulumi.output('https://127.0.0.1:26443') });
-      result = { secret: await pulumi.isSecret(platform.kubeconfigs), value: await platform.kubeconfigs.promise() };
-    }).then(() => { console.log(JSON.stringify({resources, ...result})); }).catch(e => {console.error(e);process.exitCode=1;});
+    const hits = [];
+    let hitsWhenUserDone;
+    (async () => {
+      const real = await startApi('real', hits);
+      const decoy = await startApi('decoy', hits);
+      fs.writeFileSync(${JSON.stringify(decoyKubeconfig)}, kubeconfigFor(decoy.url, 'decoy'));
+      pulumi.runtime.setAllConfig({'project:tenants': JSON.stringify([{name:'alpha'},{name:'beta'}]), 'project:users': JSON.stringify([{name:'alice',memberships:[{tenant:'alpha',role:'developer'},{tenant:'beta',role:'viewer'}]},{name:'bob',memberships:[{tenant:'alpha',role:'viewer'}]}])});
+      pulumi.runtime.setMocks({
+        newResource: async args => {
+          resources.push({type:args.type, name:args.name, id:args.id});
+          if (args.id) return {id:args.id, state:{data:{token:b64('token-' + args.name), 'ca.crt':b64('ca')}}};
+          if (args.name === 'user-bob') { await new Promise(r => setTimeout(r, 300)); hitsWhenUserDone = hits.filter(h => h.path.includes('bob')).length; }
+          return {id:args.name, state:{...args.inputs, metadata:{...args.inputs.metadata, name:args.inputs.metadata?.name ?? args.name}}};
+        },
+        call: args => args.inputs,
+      }, 'project', 'test', false);
+      let result;
+      await pulumi.runtime.runInPulumiStack(async () => {
+        const {createPlatform} = require('./dist');
+        const platform = createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', apiServer: pulumi.output('https://127.0.0.1:26443'), kubeconfig: pulumi.secret(kubeconfigFor(real.url)), kubeContext: 'ctx' });
+        result = { secret: await pulumi.isSecret(platform.kubeconfigs), value: await platform.kubeconfigs.promise() };
+      });
+      console.log(JSON.stringify({resources, hits, hitsWhenUserDone, ...result}));
+      real.server.close(); decoy.server.close();
+    })().catch(e => {console.error(e);process.exitCode=1;});
   `,
     ],
-    { cwd: root, encoding: 'utf8' },
+    {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        KUBECONFIG: decoyKubeconfig,
+        TLS_KEY: cert.keyPath,
+        TLS_CERT: cert.certPath,
+      },
+    },
   );
-  const { resources, secret, value } = JSON.parse(output) as {
+  const parsed = JSON.parse(output) as {
+    hits: { label: string; path: string }[];
+    hitsWhenUserDone: number;
+  };
+  // Only the provider's cluster is contacted, never the ambient one.
+  expect(parsed.hits.length).toBeGreaterThanOrEqual(3);
+  expect(parsed.hits.every((h) => h.label === 'real')).toBe(true);
+  expect(parsed.hits.map((h) => h.path)).toEqual(
+    expect.arrayContaining([
+      '/api/v1/namespaces/wasmcloud/secrets/di-user-alice-alpha-token',
+      '/api/v1/namespaces/wasmcloud/secrets/di-user-alice-beta-token',
+      '/api/v1/namespaces/wasmcloud/secrets/di-user-bob-alpha-token',
+    ]),
+  );
+  // No poll for a user's Secret starts before that User resource has been registered.
+  expect(parsed.hitsWhenUserDone).toBe(0);
+  const { resources, secret, value } = parsed as unknown as {
     resources: { type: string; name: string; id?: string }[];
     secret: boolean;
     value: Record<string, Record<string, string>>;
@@ -355,6 +418,27 @@ test('local entrypoint rejects registry mirrors with shell or TOML metacharacter
       'project:registryMirrors': JSON.stringify({ 'docker.io': ['https://mirror.gcr.io/"; id'] }),
     }),
   ).toThrow('registryMirrors.docker.io entries must be http:// or https:// URLs');
+}, 60_000);
+
+test('apiServer without the provider kubeconfig fails loudly instead of skipping the wait', () => {
+  expect(() =>
+    execFileSync(
+      'node',
+      [
+        '-e',
+        `
+    const pulumi = require('@pulumi/pulumi');
+    const k8s = require('@pulumi/kubernetes');
+    pulumi.runtime.setAllConfig({'project:tenants': '[]', 'project:users': '[]'});
+    pulumi.runtime.setMocks({ newResource: a => ({id:a.name, state:a.inputs}), call: a => a.inputs }, 'project', 'test', false);
+    pulumi.runtime.runInPulumiStack(async () => {
+      require('./dist').createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', apiServer:'https://127.0.0.1:26443' });
+    }).catch(e => {console.error(e.message);process.exitCode=1;});
+  `,
+      ],
+      { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+    ),
+  ).toThrow();
 }, 60_000);
 
 test('local entrypoint rejects a container CLI with shell metacharacters', () => {

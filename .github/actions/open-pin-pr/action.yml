@@ -1,0 +1,126 @@
+# Open or update the bot PR that pins published artifacts (#172).
+# The caller job checks the repository out (with credentials, to push the branch) and holds
+# contents: write and pull-requests: write; no other job in the publish workflows does.
+# scripts/pin-artifact.ts makes the edit; this action only commits, pushes and opens the PR.
+# Several pins (the tenant host's variants) go into one commit on one branch, so their adjacent
+# README rows never land as two conflicting PRs.
+name: Open pin PR
+description: Rewrite artifacts' documented digest pins and open or update bot/pin-<name>.
+inputs:
+  name:
+    description: Branch suffix, bot/pin-<name>
+    required: true
+  workflow:
+    description: The publish workflow; on a push the pin is skipped when main has newer inputs
+    required: true
+  pins:
+    description: One "<artifact> <sha256:digest>" per line; artifact keys from scripts/pin-artifact.ts
+    required: true
+  token:
+    description: Token for gh; the workflow GITHUB_TOKEN
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      with:
+        bun-version: '1.4.2'
+
+    - name: Commit pins and open PR
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        WORKFLOW: ${{ inputs.workflow }}
+        EVENT: ${{ github.event_name }}
+        PINS: ${{ inputs.pins }}
+        GH_TOKEN: ${{ inputs.token }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        if [[ ! "${NAME}" =~ ^[a-z0-9-]+$ ]]; then
+          echo "::error::bad pin name: ${NAME}"
+          exit 1
+        fi
+        # A re-run of an older push must not replace a newer pending pin with an older digest.
+        # Stale means main has different inputs (scripts/source-check.ts), not merely a newer
+        # commit: then the run for the newer source pins. workflow_dispatch always pins.
+        if [[ "${EVENT}" == "push" ]]; then
+          guard="$(bun scripts/source-check.ts --workflow "${WORKFLOW}" --image unused --stale-guard --no-registry)"
+          printf '%s\n' "${guard}"
+          if grep -qx 'stale=true' <<<"${guard}"; then
+            exit 0
+          fi
+        fi
+        args=()
+        summary=()
+        while read -r artifact digest; do
+          [[ -z "${artifact}" ]] && continue
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::not a sha256 digest for ${artifact}: ${digest}"
+            exit 1
+          fi
+          args+=("${artifact}" "${digest}")
+          summary+=("${artifact} to ${digest}")
+        done <<<"${PINS}"
+        if (( ${#args[@]} == 0 )); then
+          echo "::notice::nothing was published; no pin PR"
+          exit 0
+        fi
+        branch="bot/pin-${NAME}"
+        # The bot's own open PR on exactly this branch. `--head` matches exactly only without
+        # `--author` (which switches gh to the search API, where it is a prefix match and
+        # bot/pin-wash would also find bot/pin-wash-*), so the author and the branch are both
+        # checked in jq. A human-authored PR on the same branch is never touched.
+        own_pr() {
+          BRANCH="${branch}" gh pr list --head "${branch}" --base main --state open \
+            --json number,author,headRefName \
+            --jq 'map(select(.author.login == "app/github-actions" and .headRefName == env.BRANCH)) | .[0].number // empty'
+        }
+        if (( ${#summary[@]} == 1 )); then
+          title="chore: pin ${summary[0]}"
+        else
+          joined="$(printf '%s; ' "${summary[@]}")"
+          title="chore: pin ${NAME}: ${joined%; }"
+        fi
+        bun scripts/pin-artifact.ts "${args[@]}"
+        if git diff --quiet; then
+          echo "Already pinned on ${GITHUB_SHA}; no PR needed"
+          # main already pins every published variant of the current source, so the bot's open pin
+          # PR on this branch (own_pr) is for another source (e.g. "pin to B" after a revert to A)
+          # or redundant; merging it could only pin a build main no longer has. Close it.
+          existing="$(own_pr)"
+          if [[ -n "${existing}" ]]; then
+            joined="$(printf '%s; ' "${summary[@]}")"
+            gh pr close "${existing}" --delete-branch --comment "Superseded: main already pins the current source (${joined%; }, as of ${GITHUB_SHA}). This PR on ${branch} would pin a different build, or nothing new, so it is closed and ${branch} deleted; the next publish of a different source opens a new one."
+            echo "::notice::closed superseded pin PR #${existing}"
+          fi
+          exit 0
+        fi
+        git config user.name 'github-actions[bot]'
+        git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+        git switch -C "${branch}"
+        git commit -am "${title}"
+        git push --force origin "HEAD:refs/heads/${branch}"
+        body="${RUNNER_TEMP}/pin-pr-body.md"
+        {
+          echo "Automated pin after a successful publish ([run](${RUN_URL}), source commit ${GITHUB_SHA})."
+          echo
+          for line in "${summary[@]}"; do echo "- \`${line}\`"; done
+          echo
+          echo 'Files rewritten by `scripts/pin-artifact.ts`:'
+          echo
+          git diff --name-only HEAD~1 HEAD | sed 's/^/- `/; s/$/`/'
+          echo
+          echo '**A maintainer has to approve and run this PR'"'"'s workflows before it can merge.**'
+          echo 'It was opened with `GITHUB_TOKEN`, and GitHub does not trigger workflows for pull requests'
+          echo 'that `GITHUB_TOKEN` creates or updates, so no checks start on their own. Close and reopen'
+          echo 'the PR (or push a commit to the branch) to run CI, then review and merge as usual.'
+        } > "${body}"
+        existing="$(own_pr)"
+        if [[ -n "${existing}" ]]; then
+          gh pr edit "${existing}" --title "${title}" --body-file "${body}"
+          echo "Updated PR #${existing}"
+        else
+          gh pr create --base main --head "${branch}" --title "${title}" --body-file "${body}"
+        fi

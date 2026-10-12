@@ -14,7 +14,9 @@
   "files": [
     "dist",
     "api/v1/openapi.yaml",
-    "README.md"
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
   ],
   "exports": {
     "./client": {

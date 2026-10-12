@@ -23,7 +23,7 @@ addresses, HTTPS otherwise). Credentials use `DI_OCI_USERNAME`/`DI_OCI_PASSWORD`
 then `GHCR_USERNAME`/`GHCR_TOKEN`, then `GITHUB_ACTOR`/`GITHUB_TOKEN`.
 
 Cargo's `build.rs` only tracks compile-time inputs. Publication requires an
-explicit executable run with `PUSH=true`. The dispatch-only publish workflow
+explicit executable run with `PUSH=true`. The publish workflow
 installs Rust, Go/native build dependencies, Wasm tools, and wash before running
 the publisher. Pull requests build and validate without publishing.
 
@@ -184,8 +184,12 @@ host; there is no `wash dev` integration test against a stub controller yet.
 
 ### Publishing
 
-`.github/workflows/oci-registry-component.yml` is dispatch-only and publishes
-only from `main`. It runs `make -C platform/oci-registry test build` and
+`.github/workflows/oci-registry-component.yml` runs on each push to `main` that
+changes its input paths, and on `workflow_dispatch`; it publishes only from `main`.
+On a push it first hashes the committed inputs (`scripts/source-check.ts`) and
+skips the publish when `ghcr.io/di-framework/oci-registry:src-<hash>` already
+exists; a manual run always publishes. A publish adds that `src-<hash>` tag to the
+pushed manifest. It runs `make -C platform/oci-registry test build` and
 pushes `dist/di-framework-oci-registry.wasm` to
 `ghcr.io/di-framework/oci-registry` in the Wasm OCI layout that `wkg` and
 `wash oci push` produce: one `application/wasm` layer and an
@@ -194,13 +198,16 @@ pushes `dist/di-framework-oci-registry.wasm` to
 field (the world's `imports` and `exports`, read from the WIT `make build`
 recovers from the component), which the CNCF Wasm OCI layout requires for
 `wasip2`. The image is tagged with the
-commit SHA, and the job summary prints the manifest digest. The workflow has
-not been run yet.
+commit SHA, and the job summary prints the manifest digest. After a publish, a
+bot PR (`bot/pin-oci-registry`, `chore: pin oci-registry to <digest>`) updates the
+digest below and in `platform/platform/README.md`; GitHub does not run workflows
+on a PR that `GITHUB_TOKEN` opened, so a maintainer has to start its checks
+(close and reopen it) before merging.
 
-Pin deployments by digest, never by tag:
+Pin deployments by digest, never by tag. Latest published:
 
 ```
-ghcr.io/di-framework/oci-registry@sha256:<digest from the job summary>
+ghcr.io/di-framework/oci-registry@sha256:<pending first automatic publish>
 ```
 
 The SHA tag is informational; only the digest is stable. The tenancy reconcile

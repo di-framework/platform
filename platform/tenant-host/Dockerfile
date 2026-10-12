@@ -2,16 +2,17 @@
 # The stock ghcr.io/wasmcloud/wash:2.8.0 image is a default-features build, so components that import
 # wasi:tls/client@0.3.0-draft (the node:tls shim) fail to start on it. This mirrors upstream's Dockerfile
 # at the same tag (Chainguard wolfi-base runtime, git, /usr/local/bin/wash entrypoint) with the feature on.
-# Maintainers publish it with .github/workflows/tenant-host-image.yml (workflow_dispatch). Pin consumers
-# by digest.
+# .github/workflows/tenant-host-image.yml publishes it on each push to main that changes this directory
+# (workflow_dispatch reruns it). Pin consumers by digest.
 #
-# Variants. With no WASH_PATCHES the build is stock wash 2.8.0 + wasi-tls, published as
-# ghcr.io/di-framework/wash:2.8.0-wasi-tls. WASH_PATCHES names patch files from this directory to apply
-# to the pinned source, and the result is published under its own tag, never the canonical one:
-# 0001-exclusive-instance.patch -> ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive (#136).
+# Variants. `variants` in this directory is the one tag -> patch set table; the build fails unless
+# WASH_PATCHES is exactly the set it lists for IMAGE_VERSION, so a mislabelled image cannot be built:
+#   2.8.0-wasi-tls            0002-insecure-registry-allowlist.patch (#149, #175; the canonical default)
+#   2.8.0-wasi-tls-exclusive  0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch (#136)
+# The defaults below are the canonical row, so a plain `podman build` builds the canonical image.
 ARG WASMCLOUD_TAG=v2.8.0
 ARG WASMCLOUD_COMMIT=5c4ec4a3d008b3f401d9e763515f434deebc9936
-ARG WASH_PATCHES=""
+ARG WASH_PATCHES="0002-insecure-registry-allowlist.patch"
 ARG IMAGE_VERSION=2.8.0-wasi-tls
 
 # rust-toolchain.toml at the tag pins 1.96.0. Pinned by digest alone (rust:1.96.0-bookworm): a tag
@@ -21,15 +22,17 @@ ARG WASMCLOUD_TAG
 ARG WASMCLOUD_COMMIT
 ARG WASH_PATCHES
 ARG IMAGE_VERSION
-# A patched build must not be labelled as the canonical stock version, and a stock build must not
-# claim to be patched: fail fast rather than publish a mislabelled image.
+# Fail fast unless WASH_PATCHES is exactly the patch set `variants` lists for IMAGE_VERSION (same
+# patches, same order; runs of whitespace are ignored), so a mislabelled image is never published.
+COPY variants /tenant-host/variants
 RUN set -eu; \
-    if [ -n "${WASH_PATCHES}" ] && [ "${IMAGE_VERSION}" = "2.8.0-wasi-tls" ]; then \
-      echo "WASH_PATCHES is set but IMAGE_VERSION is the canonical 2.8.0-wasi-tls; pass IMAGE_VERSION=2.8.0-wasi-tls-exclusive" >&2; \
+    if ! expected="$(awk -v tag="${IMAGE_VERSION}" '$1 == tag { $1 = ""; sub(/^ +/, ""); print; found = 1 } END { exit !found }' /tenant-host/variants)"; then \
+      echo "IMAGE_VERSION ${IMAGE_VERSION} is not a variant listed in platform/tenant-host/variants" >&2; \
       exit 1; \
     fi; \
-    if [ -z "${WASH_PATCHES}" ] && [ "${IMAGE_VERSION}" != "2.8.0-wasi-tls" ]; then \
-      echo "IMAGE_VERSION ${IMAGE_VERSION} names a patched variant but WASH_PATCHES is empty" >&2; \
+    actual="$(echo ${WASH_PATCHES})"; \
+    if [ "${actual}" != "${expected}" ]; then \
+      echo "WASH_PATCHES '${actual}' does not match the patch set for ${IMAGE_VERSION}: '${expected}'" >&2; \
       exit 1; \
     fi
 RUN apt-get update \
@@ -42,7 +45,7 @@ ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 RUN GIT_TERMINAL_PROMPT=0 git clone --depth 1 --quiet --branch "${WASMCLOUD_TAG}" https://github.com/wasmCloud/wasmCloud /src \
   && test "$(git -C /src rev-parse HEAD)" = "${WASMCLOUD_COMMIT}"
 WORKDIR /src
-# Apply the requested patches (none by default). They are `git diff` output against the pinned commit,
+# Apply the variant's patches in order. They are `git diff` output against the pinned commit,
 # checked in CI (.github/workflows/tenant-host-patch-check.yml). `--check` first so a patch that no
 # longer applies fails the build with the file name, not half-applied.
 COPY *.patch /patches/

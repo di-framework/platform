@@ -34,6 +34,8 @@ const platform = createPlatform({
   storageRoot: config.get('storageRoot') ?? '/var/lib/kubesolo',
   values: config.getObject<Record<string, unknown>>('values'),
   // di-framework-kube sets kubernetesEndpoint; otherwise use the admin context's server.
+  kubeconfig: adminKubeconfig,
+  kubeContext: config.get('context'),
   apiServer:
     config.get('kubernetesEndpoint') ?? kubeconfigServer(adminKubeconfig, config.get('context')),
   routeUrlPattern: config.get('routeUrlPattern') ?? routeUrlPatternFor(config.get('httpEndpoint')),

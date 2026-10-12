@@ -46,7 +46,7 @@
   },
   "peerDependencies": {
     "@di-framework/core": "^5",
-    "@di-framework/repo": "^6.0.4",
+    "@di-framework/repo": "^6.1.0",
     "typescript": "^5"
   },
   "peerDependenciesMeta": {
@@ -57,11 +57,13 @@
   "files": [
     "dist",
     "catalog.json",
-    "README.md"
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
   ],
   "devDependencies": {
     "@di-framework/core": "^5",
-    "@di-framework/repo": "^6.0.4",
+    "@di-framework/repo": "^6.1.0",
     "@types/bun": "latest"
   }
 }

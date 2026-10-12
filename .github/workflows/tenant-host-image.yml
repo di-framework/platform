@@ -1,13 +1,28 @@
 # Publish the tenant host image: wash 2.8.0 with wasi-tls.
-# Dispatch-only, matching the npm Release workflow.
 #
-# Two variants, chosen by the `variant` input. Each has its own tag and its own cache, so a patched
-# build can never move the canonical tag (#136):
-#   wasi-tls            ghcr.io/di-framework/wash:2.8.0-wasi-tls            stock source, no patches
+# Triggers (#172): a push to main that touches platform/tenant-host/** (including the variants
+# table) or this file builds every listed variant; workflow_dispatch builds the selected variant
+# and always builds it (reruns).
+#
+# Variants. Each has its own tag and its own cache. The tag -> patch set mapping lives in one place,
+# platform/tenant-host/variants, read by the check-source resolver job below (whose outputs every
+# later job consumes) and checked again by the Dockerfile, which fails a build whose WASH_PATCHES is
+# not exactly the set listed for its IMAGE_VERSION:
+#   wasi-tls            ghcr.io/di-framework/wash:2.8.0-wasi-tls            + 0002-insecure-registry-allowlist.patch
 #   wasi-tls-exclusive  ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive  + 0001-exclusive-instance.patch
-# The image labels name the variant and the patches applied. The platform default hostImage stays
-# pinned to the canonical digest; the exclusive variant is only used by setting tenantHostImage to its digest.
-# The exclusive build is never the default: select it explicitly.
+#                                                                            + 0002-insecure-registry-allowlist.patch
+# The image labels name the variant and the patches applied. wasi-tls (the table's first row) is the
+# canonical tag, the one the platform default hostImage (DEFAULT_HOST_IMAGE) is pinned to; the
+# exclusive variant is only used by setting tenantHostImage to its digest. The pin job below never
+# changes DEFAULT_HOST_IMAGE.
+#
+# Skip if published: check-source hashes the committed files in on.push.paths, salted with the
+# variant (scripts/source-check.ts). On a push, a variant whose wash:src-<hash> tag already
+# exists is dropped from the build matrix. Every variant is dropped when main already has
+# different inputs (a newer source, whose own run publishes); an unrelated newer commit changes
+# nothing. merge re-checks that right before it moves tags, which also covers "Re-run failed
+# jobs", and adds src-<hash> to the same multi-arch index. pin opens one bot/pin-wash PR that pins
+# every variant published for this source, resolved from the registry.
 #
 # amd64 and arm64 compile at the same time on native runners. One ubuntu-24.04
 # job plus QEMU was spending the arm64 release build in emulation, which is
@@ -19,7 +34,11 @@
 # is min mode and omits the builder stage.
 # cancel-in-progress stays false so a queued publish waits and does not abort
 # one that is already compiling.
-# Auth is GITHUB_TOKEN with packages: write. No registry secret is stored.
+#
+# Permissions: workflow default contents: read. check-source reads packages; build pushes the
+# per-arch images by digest and the registry cache, and merge pushes the tags, so both hold
+# packages: write; only pin holds contents: write and pull-requests: write.
+# Auth is GITHUB_TOKEN. No registry secret is stored.
 name: Publish tenant host image
 
 on:
@@ -32,58 +51,133 @@ on:
           - wasi-tls
           - wasi-tls-exclusive
         default: wasi-tls
+  push:
+    branches: [main]
+    paths:
+      - 'platform/tenant-host/**'
+      - '.github/workflows/tenant-host-image.yml'
+      - '!**/*.md'
 
 permissions:
   contents: read
-  packages: write
-  attestations: write
-  id-token: write
 
 concurrency:
   group: publish-tenant-host-image
   cancel-in-progress: false
 
 jobs:
-  variant:
-    name: Resolve variant
+  check-source:
+    name: Resolve variants and skip published sources
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
     outputs:
-      tag: ${{ steps.resolve.outputs.tag }}
-      patches: ${{ steps.resolve.outputs.patches }}
+      variants: ${{ steps.resolve.outputs.variants }}
+      all: ${{ steps.resolve.outputs.all }}
+      published: ${{ steps.resolve.outputs.published }}
+      stale: ${{ steps.resolve.outputs.stale }}
     steps:
-      - name: Resolve tag and patches
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up source check
+        uses: ./.github/actions/setup-source-check
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The only variant -> patches mapping in this workflow. build, merge and pin take the tag,
+      # patch set and canonical flag from this job's outputs, never from a copy of the table.
+      - name: Resolve variants for this trigger
         id: resolve
         env:
           VARIANT: ${{ inputs.variant }}
+          TRIGGER: ${{ github.event_name }}
+          SOURCE_CHECK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          case "${VARIANT}" in
-            wasi-tls) patches='' ;;
-            wasi-tls-exclusive) patches='0001-exclusive-instance.patch' ;;
-            *)
-              echo "::error::unknown variant '${VARIANT}'"
-              exit 1
-              ;;
-          esac
-          echo "tag=2.8.0-${VARIANT}" >> "${GITHUB_OUTPUT}"
-          echo "patches=${patches}" >> "${GITHUB_OUTPUT}"
+          table=platform/tenant-host/variants
+          # "<tag>\t<patches>" per row; comment and blank lines skipped. The first row is canonical.
+          rows="$(awk '$1 !~ /^#/ && NF { tag = $1; $1 = ""; sub(/^ +/, ""); print tag "\t" $0 }' "${table}")"
+          canonical="$(awk '$1 !~ /^#/ && NF { print $1; exit }' "${table}")"
+          if [[ -z "${rows}" || -z "${canonical}" ]]; then
+            echo "::error::${table} lists no variants"
+            exit 1
+          fi
+          if [[ "${TRIGGER}" == "workflow_dispatch" ]] && ! awk -v tag="2.8.0-${VARIANT}" '$1 !~ /^#/ && $1 == tag { found = 1 } END { exit !found }' "${table}"; then
+            echo "::error::variant '${VARIANT}' (tag 2.8.0-${VARIANT}) is not listed in ${table}"
+            exit 1
+          fi
+          all='[]'
+          variants='[]'
+          published='[]'
+          stale=false
+          while IFS=$'\t' read -r tag patches; do
+            name="${tag#2.8.0-}"
+            all="$(jq -c --arg name "${name}" '. + [$name]' <<<"${all}")"
+            args=(--stale-guard)
+            if [[ "${TRIGGER}" == "workflow_dispatch" ]]; then
+              [[ "${name}" == "${VARIANT}" ]] || continue
+              args=(--force)
+            fi
+            out="$(bun scripts/source-check.ts --workflow .github/workflows/tenant-host-image.yml \
+              --image ghcr.io/di-framework/wash --salt "${name}" "${args[@]}")"
+            printf '%s\n' "${out}"
+            hash="$(sed -n 's/^hash=//p' <<<"${out}")"
+            if grep -qx 'stale=true' <<<"${out}"; then
+              stale=true
+              continue
+            fi
+            if grep -qx 'skip=true' <<<"${out}"; then
+              # Already published: realign re-points the moving tag at it (a revert) and pin
+              # re-pins it.
+              digest="$(sed -n 's/^digest=//p' <<<"${out}")"
+              echo "${name}: ${digest} is already published for this source"
+              published="$(jq -c --arg name "${name}" --arg tag "${tag}" --arg digest "${digest}" \
+                '. + [{name: $name, tag: $tag, digest: $digest}]' <<<"${published}")"
+              continue
+            fi
+            is_canonical=false
+            if [[ "${tag}" == "${canonical}" ]]; then
+              is_canonical=true
+            fi
+            variants="$(jq -c --arg name "${name}" --arg tag "${tag}" --arg patches "${patches}" \
+              --arg hash "${hash}" --argjson canonical "${is_canonical}" \
+              '. + [{name: $name, tag: $tag, patches: $patches, hash: $hash, canonical: $canonical}]' <<<"${variants}")"
+          done <<<"${rows}"
+          echo "Variants to build: ${variants}"
+          {
+            echo "variants=${variants}"
+            echo "all=${all}"
+            echo "published=${published}"
+            echo "stale=${stale}"
+          } >> "${GITHUB_OUTPUT}"
 
   build:
-    name: Build ${{ matrix.platform }}
-    needs: variant
+    name: Build ${{ matrix.variant.name }} on ${{ matrix.platform }}
+    needs: check-source
+    if: ${{ !cancelled() && needs.check-source.result == 'success' && needs.check-source.outputs.variants != '[]' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
+        variant: ${{ fromJson(needs.check-source.outputs.variants) }}
+        arch: [amd64, arm64]
         include:
-          - platform: linux/amd64
+          - arch: amd64
+            platform: linux/amd64
             runner: ubuntu-24.04
-            arch: amd64
-          - platform: linux/arm64
+          - arch: arm64
+            platform: linux/arm64
             runner: ubuntu-24.04-arm
-            arch: arm64
     steps:
       - name: Require di-framework/platform
         run: |
@@ -95,11 +189,24 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A stale re-run must not move the buildcache-* tags back to an older source.
+      - name: Stop if main has newer inputs
+        id: guard
+        uses: ./.github/actions/source-guard
+        with:
+          workflow: .github/workflows/tenant-host-image.yml
+          salt: ${{ matrix.variant.name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
+        if: steps.guard.outputs.stale != 'true'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
+        if: steps.guard.outputs.stale != 'true'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -107,6 +214,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push by digest
+        if: steps.guard.outputs.stale != 'true'
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -114,38 +222,51 @@ jobs:
           platforms: ${{ matrix.platform }}
           provenance: true
           build-args: |
-            WASH_PATCHES=${{ needs.variant.outputs.patches }}
-            IMAGE_VERSION=${{ needs.variant.outputs.tag }}
+            WASH_PATCHES=${{ matrix.variant.patches }}
+            IMAGE_VERSION=${{ matrix.variant.tag }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
           outputs: type=image,name=ghcr.io/di-framework/wash,push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=registry,ref=ghcr.io/di-framework/wash:buildcache-${{ needs.variant.outputs.tag }}-${{ matrix.arch }}
-          cache-to: type=registry,ref=ghcr.io/di-framework/wash:buildcache-${{ needs.variant.outputs.tag }}-${{ matrix.arch }},mode=max,oci-mediatypes=true,image-manifest=true
+          cache-from: type=registry,ref=ghcr.io/di-framework/wash:buildcache-${{ matrix.variant.tag }}-${{ matrix.arch }}
+          cache-to: type=registry,ref=ghcr.io/di-framework/wash:buildcache-${{ matrix.variant.tag }}-${{ matrix.arch }},mode=max,oci-mediatypes=true,image-manifest=true
 
       - name: Export digest
+        if: steps.guard.outputs.stale != 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          digest="${{ steps.build.outputs.digest }}"
-          if [[ "${digest}" != sha256:* ]]; then
+          if [[ "${DIGEST}" != sha256:* ]]; then
             echo "::error::build did not return a digest"
             exit 1
           fi
           mkdir -p "${RUNNER_TEMP}/digests"
-          : > "${RUNNER_TEMP}/digests/${digest#sha256:}"
+          : > "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
+        if: steps.guard.outputs.stale != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wash-digest-${{ needs.variant.outputs.tag }}-${{ strategy.job-index }}
+          name: wash-digest-${{ matrix.variant.tag }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests
           if-no-files-found: error
           retention-days: 1
 
   merge:
-    name: Push ghcr.io/di-framework/wash tag
-    needs: [variant, build]
+    name: Push ${{ matrix.variant.name }} tags
+    needs: [check-source, build]
+    # Per variant: a failed build of one variant fails only that variant's merge (its digest
+    # download finds no artifact); the other variant still publishes and gets pinned.
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'failure') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJson(needs.check-source.outputs.variants) }}
     steps:
       - name: Require di-framework/platform
         run: |
@@ -155,29 +276,63 @@ jobs:
             exit 1
           fi
 
-      - name: Download digests
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Right before the tags move: a re-run of an older push whose inputs main has since
+      # changed stops here (check-source is not re-run by "Re-run failed jobs").
+      - name: Stop if main has newer inputs
+        id: guard
+        uses: ./.github/actions/source-guard
+        with:
+          workflow: .github/workflows/tenant-host-image.yml
+          salt: ${{ matrix.variant.name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # By exact name, one step per build arch: never a `wash-digest-<tag>-*` pattern. A tag can
+      # prefix another (2.8.0-wasi-tls prefixes 2.8.0-wasi-tls-exclusive), and the pattern then took
+      # the other variant's digests too (#186).
+      - name: Download amd64 digest
+        if: steps.guard.outputs.stale != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: wash-digest-${{ needs.variant.outputs.tag }}-*
+          name: wash-digest-${{ matrix.variant.tag }}-amd64
           path: ${{ runner.temp }}/digests
-          merge-multiple: true
+
+      - name: Download arm64 digest
+        if: steps.guard.outputs.stale != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wash-digest-${{ matrix.variant.tag }}-arm64
+          path: ${{ runner.temp }}/digests
 
       - name: Set up Docker Buildx
+        if: steps.guard.outputs.stale != 'true'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
+        if: steps.guard.outputs.stale != 'true'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The variant tag and src-<hash> go on the same index in one call.
       - name: Create and push manifest
+        if: steps.guard.outputs.stale != 'true'
         working-directory: ${{ runner.temp }}/digests
         env:
-          TAG: ${{ needs.variant.outputs.tag }}
+          TAG: ${{ matrix.variant.tag }}
+          SOURCE_HASH: ${{ matrix.variant.hash }}
         run: |
           set -euo pipefail
+          if [[ ! "${SOURCE_HASH}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::missing source hash for ${TAG}"
+            exit 1
+          fi
           mapfile -t files < <(find . -type f | sort)
           if (( ${#files[@]} != 2 )); then
             echo "::error::expected 2 image digests, found ${#files[@]}"
@@ -198,17 +353,21 @@ jobs:
           # closes the pipe and fails this job after the tag is already published.
           docker buildx imagetools create \
             --metadata-file "${RUNNER_TEMP}/wash-index.json" \
-            -t "ghcr.io/di-framework/wash:${TAG}" \
+            --tag "ghcr.io/di-framework/wash:${TAG}" \
+            --tag "ghcr.io/di-framework/wash:src-${SOURCE_HASH}" \
             "${args[@]}"
 
       - name: Record image digest
+        if: steps.guard.outputs.stale != 'true'
         env:
-          TAG: ${{ needs.variant.outputs.tag }}
-          PATCHES: ${{ needs.variant.outputs.patches }}
+          TAG: ${{ matrix.variant.tag }}
+          PATCHES: ${{ matrix.variant.patches }}
+          SOURCE_HASH: ${{ matrix.variant.hash }}
+          CANONICAL: ${{ matrix.variant.canonical }}
         run: |
           set -euo pipefail
           digest="$(jq -er '.["containerimage.descriptor"].digest' "${RUNNER_TEMP}/wash-index.json")"
-          if [[ "${digest}" != sha256:* ]]; then
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::error::manifest list did not return an index digest"
             cat "${RUNNER_TEMP}/wash-index.json"
             exit 1
@@ -216,7 +375,7 @@ jobs:
           ref="ghcr.io/di-framework/wash:${TAG}@${digest}"
           echo "Published ${ref}"
           {
-            echo "### Tenant host image"
+            echo "### Tenant host image (${TAG})"
             echo
             echo '```'
             echo "${ref}"
@@ -224,9 +383,102 @@ jobs:
             echo
             echo "Patches applied: \`${PATCHES:-none}\`"
             echo
+            echo "Also tagged \`src-${SOURCE_HASH}\` (hash of the committed inputs)."
+            echo
             echo "Pin \`tenantHostImage\` to that digest. The tag \`${TAG}\` moves on the next publish of this variant."
-            if [[ -n "${PATCHES}" ]]; then
-              echo
-              echo 'This is a patched build. Use it only by setting `tenantHostImage` (digest-pinned) until it is proven; do not change `DEFAULT_HOST_IMAGE`.'
+            echo
+            if [[ "${CANONICAL}" == "true" ]]; then
+              echo "This is the canonical tag. Repin \`DEFAULT_HOST_IMAGE\` to this digest in a separate, reviewed change."
+            else
+              echo "This variant is not the default. Use it only by setting \`tenantHostImage\` (digest-pinned); do not change \`DEFAULT_HOST_IMAGE\`."
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
+
+  # A push whose source is already published (a revert to an older source) builds nothing; point
+  # each such variant's moving tag back at its src-<hash> digest. scripts/retag.sh leaves a tag that
+  # already points there alone, and the guard stops a run whose inputs main has since changed.
+  realign:
+    name: Point ${{ matrix.variant.tag }} at the published source
+    needs: check-source
+    if: ${{ !cancelled() && needs.check-source.result == 'success' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.published != '[]' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJson(needs.check-source.outputs.published) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Stop if main has newer inputs
+        id: guard
+        uses: ./.github/actions/source-guard
+        with:
+          workflow: .github/workflows/tenant-host-image.yml
+          salt: ${{ matrix.variant.name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up ORAS
+        if: steps.guard.outputs.stale != 'true'
+        uses: ./.github/actions/setup-oras
+
+      - name: Retag
+        if: steps.guard.outputs.stale != 'true'
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ghcr.io/di-framework/wash
+          DIGEST: ${{ matrix.variant.digest }}
+          TAGS: ${{ matrix.variant.tag }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${GHCR_TOKEN}" | oras login ghcr.io --username "${GHCR_USERNAME}" --password-stdin
+          bash scripts/retag.sh
+
+  # One PR, bot/pin-wash, that pins every variant published for this commit's source: the
+  # variants' rows in platform/tenant-host/README.md are adjacent, so separate PRs would conflict,
+  # and a run that built one variant (a dispatch, or a run where the other variant's build failed)
+  # must not drop the other's pending pin. Each variant's digest is read from its
+  # wash:src-<hash> tag, so the PR is a snapshot of the registry, not of this run. A variant not
+  # yet published for this source keeps its current row; recover a failed variant by dispatching
+  # the workflow for it. It never changes DEFAULT_HOST_IMAGE.
+  pin:
+    name: Open pin PR
+    # Also on a push that published nothing (every variant already published for this source, e.g.
+    # a revert): the registry snapshot re-pins it, and a no-change run opens no PR.
+    needs: [check-source, merge, realign]
+    if: ${{ !cancelled() && needs.check-source.result == 'success' && needs.check-source.outputs.stale != 'true' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      packages: read
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up source check
+        uses: ./.github/actions/setup-source-check
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve published digests
+        id: pins
+        env:
+          VARIANTS: ${{ needs.check-source.outputs.all }}
+        run: bash scripts/wash-pins.sh
+
+      - name: Open pin PR
+        uses: ./.github/actions/open-pin-pr
+        with:
+          name: wash
+          workflow: .github/workflows/tenant-host-image.yml
+          pins: ${{ steps.pins.outputs.pins }}
+          token: ${{ secrets.GITHUB_TOKEN }}

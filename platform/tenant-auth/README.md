@@ -20,7 +20,7 @@ HEAD. Set `DI_OCI_USERNAME`/`DI_OCI_PASSWORD`, `GHCR_USERNAME`/`GHCR_TOKEN`, or
 
 `cargo build` compiles the tool; image operations run only when the executable
 is invoked. CI builds and smoke-checks on native Linux amd64 and arm64 runners;
-the dispatch-only publish workflow combines their manifests into an OCI index.
+the publish workflow (on each push to `main` that changes its inputs) combines their manifests into an OCI index.
 
 Per-tenant access for the platform without sharing cluster credentials. One **controller** and
 one **console** run per tenant, in the tenant's namespace. Users hold only identity-server tokens
@@ -85,11 +85,17 @@ and the runtime. It will replace the ConfigMap bundle when `:reconcile` lands. `
 * mount the TLS certificate and key (`TENANT_CONTROLLER_TLS_CERT`, `TENANT_CONTROLLER_TLS_KEY`);
 * use the image digest in place of the `bundle-digest` annotation.
 
-Maintainers publish it with the `Publish tenant-auth image` workflow (`workflow_dispatch`); the
-workflow summary prints the reference. **Pin consumers by digest**, never by tag:
+The `Publish tenant-auth image` workflow publishes it by itself on each push to `main` that changes
+one of its input paths, unless `ghcr.io/di-framework/tenant-auth:src-<hash>` (a hash of those
+committed inputs, `scripts/source-check.ts`) already exists. A manual run (`workflow_dispatch`)
+always builds. The workflow summary prints the reference, and a bot PR (`bot/pin-tenant-auth`,
+`chore: pin tenant-auth to <digest>`) updates the digest below and in `platform/platform/README.md`.
+GitHub does not run workflows on a PR that `GITHUB_TOKEN` opened, so a maintainer has to start its
+checks (close and reopen it) before merging. **Pin consumers by digest**, never by tag. Latest
+published:
 
 ```yaml
-image: ghcr.io/di-framework/tenant-auth@sha256:<digest from the workflow summary>
+image: ghcr.io/di-framework/tenant-auth@sha256:7a57d4241e876ef253bd50bd921a2a890af9dabc49842e8de465038a57b08f08
 ```
 
 Publishing needs the organization to allow Actions to write packages (issue #13).
