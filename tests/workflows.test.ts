@@ -418,7 +418,7 @@ describe.each(SPECS)('$file', (spec) => {
 
 test('every job that runs oras sets it up first (C1)', () => {
   const installs = (step: { uses?: string; run?: string; name?: string }) =>
-    step.uses?.startsWith('oras-project/setup-oras@') ||
+    step.uses === './.github/actions/setup-oras' ||
     step.uses === './.github/actions/setup-source-check' ||
     /oras_\$\{version\}_linux_amd64\.tar\.gz/.test(step.run ?? '');
   let checked = 0;
@@ -522,8 +522,70 @@ describe('composite actions', () => {
     for (const text of [open, setup, guard]) {
       expect(text).not.toContain('secrets.');
       expect(text).toContain("bun-version: '1.4.2'");
-      for (const [, ref] of text.matchAll(/uses:\s+(\S+)/g)) expect(ref).toMatch(/@[0-9a-f]{40}$/);
+      for (const [, ref] of text.matchAll(/uses:\s+(\S+)/g)) {
+        if (ref?.startsWith('./.github/actions/')) continue;
+        expect(ref).toMatch(/@[0-9a-f]{40}$/);
+      }
     }
+  });
+});
+
+describe('ORAS is pinned to 1.3.4 by sha256 everywhere', () => {
+  // setup-oras's built-in release table at the pinned SHA has no 1.3.4, so its `version` input
+  // fails ("official ORAS CLI releases does not contain version 1.3.4"). Every install goes
+  // through .github/actions/setup-oras, which passes the official asset `url` and `checksum`.
+  const OFFICIAL: Record<string, string> = {
+    amd64: 'f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454',
+    arm64: '15702c6e3a4a56a8bd8ac5c17efdbcab56d9bada661ccbcf017f5b10c1d89399',
+  };
+  const action = read('.github/actions/setup-oras/action.yml');
+  const files = [
+    ...new Bun.Glob('.github/workflows/*.yml').scanSync({ cwd: repo }),
+    ...new Bun.Glob('.github/actions/*/action.yml').scanSync({ cwd: repo }),
+  ];
+
+  test('the setup-oras action installs the official 1.3.4 asset per runner arch, by url and checksum', () => {
+    expect(action).toContain('version=1.3.4');
+    expect(action).toContain(
+      'https://github.com/oras-project/oras/releases/download/v${version}/oras_${version}_linux_${arch}.tar.gz',
+    );
+    for (const [runnerArch, arch] of [
+      ['X64', 'amd64'],
+      ['ARM64', 'arm64'],
+    ] as const) {
+      expect(action).toMatch(
+        new RegExp(`${runnerArch}\\)\\s+arch=${arch}\\s+sha256=${OFFICIAL[arch]}\\s+;;`),
+      );
+    }
+    expect(action).toContain('url: ${{ steps.asset.outputs.url }}');
+    expect(action).toContain('checksum: ${{ steps.asset.outputs.checksum }}');
+    const installs = [...action.matchAll(/uses:\s+oras-project\/setup-oras@[0-9a-f]{40}/g)];
+    expect(installs).toHaveLength(1);
+    expect(action).not.toMatch(/^\s*version:/m);
+  });
+
+  test('no workflow or other action calls setup-oras by version; inline installs pin a sha256', () => {
+    let calls = 0;
+    for (const file of files) {
+      if (file === '.github/actions/setup-oras/action.yml') continue;
+      const text = read(file);
+      expect(text, file).not.toContain('oras-project/setup-oras@');
+      calls += text.match(/uses:\s+\.\/\.github\/actions\/setup-oras\s*$/gm)?.length ?? 0;
+      // Inline installs (pglite-component-publish build job) fetch the same asset and check it.
+      const inline = text.match(/oras_\$\{version\}_linux_/g)?.length ?? 0;
+      const pinned = [
+        ...text.matchAll(
+          /version=(\S+)\n\s*sha256=(\S+)\n[^\n]*oras_\$\{version\}_linux_(amd64|arm64)\.tar\.gz"\n\s*echo "\$\{sha256\} {2}\S+" \| sha256sum -c -/g,
+        ),
+      ];
+      expect(pinned.length, file).toBe(inline);
+      for (const [, version, sha256, arch] of pinned) {
+        expect(version, file).toBe('1.3.4');
+        expect(sha256, file).toBe(OFFICIAL[arch as string]);
+      }
+    }
+    // setup-source-check plus the four retag/index steps.
+    expect(calls).toBeGreaterThanOrEqual(5);
   });
 });
 
