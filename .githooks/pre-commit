@@ -1,4 +1,27 @@
 #!/bin/sh
 set -e
+
+# biome reads staged paths from the working tree, not the index. A staged path that also has
+# unstaged changes would be checked against content this commit does not record, so refuse it.
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+partial=$(git diff --name-only | while IFS= read -r file; do
+  printf '%s\n' "$staged" | grep -Fxq -- "$file" && printf '%s\n' "$file"
+done || true)
+if [ -n "$partial" ]; then
+  echo "[pre-commit] FAILED: these staged files also have unstaged changes:" >&2
+  printf '%s\n' "$partial" | sed 's/^/  /' >&2
+  echo "[pre-commit] biome checks the working tree, so it would not check what this commit records." >&2
+  echo "[pre-commit] Stage the changes ('git add <file>') or discard them ('git restore <file>'), and commit again." >&2
+  exit 1
+fi
+
 bun typecheck
-bun x biome check --staged --write --files-ignore-unknown=true --no-errors-on-unmatched
+
+# Check the staged files without --write. Writing here would change the working
+# tree but not the index, so the commit would record the unformatted content.
+if ! bun x biome check --staged --files-ignore-unknown=true --no-errors-on-unmatched; then
+  echo >&2
+  echo "[pre-commit] FAILED: biome found lint or format errors in staged files." >&2
+  echo "[pre-commit] Run 'bun run lint:fix', review the changes, stage them, and commit again." >&2
+  exit 1
+fi

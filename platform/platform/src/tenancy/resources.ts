@@ -1259,9 +1259,9 @@ function tenantControllerCertNames(
     dns.push(registryPullHost(tenant), `${registryPullHost(tenant)}.cluster.local`);
   return { dns: [...new Set(dns)], ips: [...new Set(ips)] };
 }
-/** Digest of the serving certificate; in both pod templates so a renewal rolls the pair. */
 /** The Secret holding the controller CA's private key; no pod mounts it. */
 const TENANT_CONTROLLER_CA_KEY_SECRET = 'tenant-controller-ca-key';
+/** Digest of the serving certificate; in both pod templates so a renewal rolls the pair. */
 function tlsCertDigest(cert: string): string {
   return createHash('sha256').update(cert).digest('hex');
 }

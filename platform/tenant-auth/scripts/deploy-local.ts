@@ -8,7 +8,7 @@
  *     --issuer http://<host-ip>:4180 --client-secret <secret> [--image oven/bun:1-alpine]
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { dump } from 'js-yaml';
 import {
@@ -18,6 +18,11 @@ import {
   sha256,
   splitManifests,
 } from './apply-helpers.ts';
+import {
+  controllerTlsDigest,
+  ensureControllerTls,
+  TLS_DIGEST_ANNOTATION,
+} from './controller-tls.ts';
 
 const root = join(import.meta.dir, '..');
 const dist = join(root, 'dist');
@@ -95,33 +100,12 @@ console.error(
   `bundled controller.js (${bundle('controller').length} bytes) and console.js (${bundle('console').length} bytes)`,
 );
 
-// 2. A private certificate for the controller: kubectl and the console pin it.
-const tlsDir = join(dist, 'tls');
-mkdirSync(tlsDir, { recursive: true });
-const crt = join(tlsDir, 'tls.crt');
-const key = join(tlsDir, 'tls.key');
-if (!existsSync(crt)) {
-  await run([
-    'openssl',
-    'req',
-    '-x509',
-    '-newkey',
-    'ec',
-    '-pkeyopt',
-    'ec_paramgen_curve:prime256v1',
-    '-nodes',
-    '-keyout',
-    key,
-    '-out',
-    crt,
-    '-days',
-    '30',
-    '-subj',
-    `/CN=tenant-controller.${namespace}.svc`,
-    '-addext',
-    `subjectAltName=DNS:tenant-controller,DNS:tenant-controller.${namespace}.svc,DNS:localhost,IP:127.0.0.1`,
-  ]);
-}
+// 2. The controller's TLS: a CA (pinned by kubectl and the console) and a leaf it signed, which the
+// controller serves. A single CA:TRUE certificate would fail rustls clients (#148, #164).
+const tls = ensureControllerTls(join(dist, 'tls'), namespace);
+// The pods read these files once at startup, so a new pair (a migration or a leaf renewal) must
+// change the pod templates to reach them.
+const tlsDigest = controllerTlsDigest(tls);
 
 // 3. Facts from the cluster: which members get TokenRequest, where the API server is.
 interface User {
@@ -202,7 +186,10 @@ const deployment = (
     template: {
       metadata: {
         labels: { ...labels, app: name },
-        annotations: { 'platform.di-framework.dev/bundle-digest': bundleDigest },
+        annotations: {
+          'platform.di-framework.dev/bundle-digest': bundleDigest,
+          [TLS_DIGEST_ANNOTATION]: tlsDigest,
+        },
       },
       spec: {
         serviceAccountName,
@@ -447,14 +434,18 @@ const manifests: unknown[] = [
     apiVersion: 'v1',
     kind: 'ConfigMap',
     metadata: { name: 'tenant-controller-ca', namespace, labels },
-    data: { 'ca.crt': readFileSync(crt, 'utf8') },
+    data: { 'ca.crt': readFileSync(tls.caCrt, 'utf8') },
   },
   {
     apiVersion: 'v1',
     kind: 'Secret',
     metadata: { name: 'tenant-controller-tls', namespace, labels },
     type: 'kubernetes.io/tls',
-    stringData: { 'tls.crt': readFileSync(crt, 'utf8'), 'tls.key': readFileSync(key, 'utf8') },
+    stringData: {
+      'tls.crt': readFileSync(tls.crt, 'utf8'),
+      'tls.key': readFileSync(tls.key, 'utf8'),
+      'ca.crt': readFileSync(tls.caCrt, 'utf8'),
+    },
   },
   {
     apiVersion: 'v1',
@@ -517,7 +508,10 @@ consoleDeployment.spec.template.spec.containers[0]?.env.push({
 
 assertBundleSize({ 'controller.js': bundle('controller'), 'console.js': bundle('console') });
 const toYaml = (items: unknown[]) => items.map((m) => dump(m, { lineWidth: -1 })).join('---\n');
-writeFileSync(join(dist, 'tenant-auth.yaml'), toYaml(manifests));
+// The manifest holds the leaf key and the OAuth client secret.
+const manifestPath = join(dist, 'tenant-auth.yaml');
+writeFileSync(manifestPath, toYaml(manifests), { mode: 0o600 });
+chmodSync(manifestPath, 0o600);
 // Config objects first: a failed bundle update throws (run() rejects on non-zero exit) before any
 // Deployment is applied, so the pods are never recycled onto a stale bundle.
 const { config, workloads } = splitManifests(manifests as { kind?: string }[]);
@@ -562,4 +556,4 @@ assertDigestsMatch(builtDigest, liveDigest);
 console.log(`Deployed. Reach them from this machine with:
   kubectl --kubeconfig '${kubeconfig}' -n ${namespace} port-forward svc/tenant-controller 8788:8788
   kubectl --kubeconfig '${kubeconfig}' -n ${namespace} port-forward svc/tenant-console 8787:8787
-Controller CA: ${crt}`);
+Controller CA: ${tls.caCrt}`);

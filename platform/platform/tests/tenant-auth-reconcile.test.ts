@@ -602,6 +602,18 @@ describe('controller certificate', () => {
     expect(holdsCaKey(ca.cert, ca.key)).toBe(true);
   });
 
+  it("caps the leaf's notAfter at the CA's notAfter", () => {
+    const now = new Date('2026-10-01T00:00:00Z');
+    const ca = caCertificate('CA', 100, now);
+    const caEnd = new Date(new X509Certificate(ca.cert).validTo).getTime();
+    const capped = leafCertificate('leaf', ['a'], [], 365, ca.cert, ca.key, now);
+    expect(new Date(new X509Certificate(capped.cert).validTo).getTime()).toBe(caEnd);
+    const shorter = leafCertificate('leaf', ['a'], [], 30, ca.cert, ca.key, now);
+    expect(new Date(new X509Certificate(shorter.cert).validTo).getTime()).toBe(
+      now.getTime() + 30 * 86_400_000,
+    );
+  });
+
   it('encodes the CA and leaf extensions RFC 5280 requires', () => {
     const ca = caCertificate('CA', 30);
     const leaf = leafCertificate('leaf', ['a'], [], 30, ca.cert, ca.key);
@@ -901,6 +913,21 @@ describe('reconcileTenant with tenant-auth', () => {
     expect(api.objects.get(caKeyPath)?.data).toEqual(keys);
   });
 
+  it('reads each controller TLS Secret once per reconcile pass', async () => {
+    const { api, controller, t } = prepare();
+    const gets = new Map<string, number>();
+    api.fail = (method, p) => {
+      if (method === 'GET') gets.set(p, (gets.get(p) ?? 0) + 1);
+      return undefined;
+    };
+    for (let pass = 1; pass <= 2; pass++) {
+      gets.clear();
+      await controller.reconcileTenant(t, []);
+      expect(gets.get(tlsPath)).toBe(1);
+      expect(gets.get(caKeyPath)).toBe(1);
+    }
+  });
+
   it('renews an expiring leaf under the same CA', async () => {
     const { api, controller, t } = prepare();
     await controller.reconcileTenant(t, []);
@@ -1045,6 +1072,59 @@ describe('reconcileTenant with tenant-auth', () => {
         (r) => r.kind === 'RoleBinding' && r.metadata.labels?.[OWNER] === 'alice-uid',
       ),
     ).toBe(true);
+  });
+
+  it('refuses to adopt a tenant-controller-tls Secret left by deploy-local.ts through the cached read', async () => {
+    const { api, controller, t } = prepare();
+    const ns = 'di-runtime-alpha';
+    const ca = caCertificate(`tenant-controller CA (${ns})`, 3650);
+    const leaf = leafCertificate(
+      `tenant-controller.${ns}.svc`,
+      ['tenant-controller', `tenant-controller.${ns}.svc`, 'localhost'],
+      ['127.0.0.1'],
+      365,
+      ca.cert,
+      ca.key,
+    );
+    const foreign = {
+      'tls.crt': encode(leaf.cert),
+      'tls.key': encode(leaf.key),
+      'ca.crt': encode(ca.cert),
+    };
+    // The labels and keys deploy-local.ts writes; no installation label.
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: {
+        name: 'tenant-controller-tls',
+        namespace: ns,
+        labels: { [COMPONENT]: 'tenant-auth', [TENANT]: 'alpha' },
+      },
+      type: 'kubernetes.io/tls',
+      data: foreign,
+    } as Resource);
+    let gets = 0;
+    api.fail = (method, p) => {
+      if (method === 'GET' && p === tlsPath) gets++;
+      return undefined;
+    };
+    const log = console.error;
+    console.error = () => {};
+    try {
+      await controller.reconcileTenant(t, []);
+    } finally {
+      console.error = log;
+    }
+    const conditions = Object.fromEntries((t.status?.conditions ?? []).map((c) => [c.type, c]));
+    expect(conditions.TenantAuthReady).toMatchObject({ status: 'False', reason: 'ReconcileError' });
+    expect(conditions.TenantAuthReady?.message).toContain(
+      `Refusing to adopt Secret ${ns}/tenant-controller-tls`,
+    );
+    // ensure() took the Secret from the pass's cache, not a second GET, and still refused it.
+    expect(gets).toBe(1);
+    const kept = api.objects.get(tlsPath);
+    expect(kept?.data).toEqual(foreign);
+    expect(kept?.metadata.labels?.[INSTALLATION]).toBeUndefined();
   });
 
   it('reports TenantAuthReady and keeps its transition time while unchanged', async () => {

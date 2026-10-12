@@ -112,7 +112,12 @@ kubectl -n di-runtime-acme port-forward svc/tenant-console 8787:8787 &
 ```
 
 The script bundles both entrypoints with `Bun.build`, ships them in a ConfigMap (as
-`di-platform-controller` does), generates a private certificate for the controller, and applies:
+`di-platform-controller` does), generates the controller's TLS in `dist/tls`, and applies it with
+the rest. The TLS is a private CA (`ca.crt`, `ca.key`) and a `CA:FALSE` leaf it signed (`tls.crt`,
+`tls.key`), the layout the platform controller uses. The controller serves the leaf, and the
+console pins `ca.crt` from ConfigMap `tenant-controller-ca`. The files are kept across runs while
+they still verify. An older `dist/tls` that holds a single `CA:TRUE` certificate is replaced: wash
+host pulls reject that certificate (`CaUsedAsEndEntity`). The script applies:
 
 * ServiceAccounts `tenant-controller` and `tenant-console` in `di-runtime-<t>`.
 * RBAC for the controller only: `get` its own `Tenant`, `get`/`list` `User` CRs, `create`
