@@ -97,11 +97,25 @@ export function sourceOf(world: World, dest: DestinationView | undefined, name: 
 const DNS_LABEL = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
 const HELD_BY = /^(Backup|BackupRestore)\/[a-z0-9]([-.a-z0-9]{0,251}[a-z0-9])?$/;
 
+const DNS_SUBDOMAIN = /^[a-z0-9]([-.a-z0-9]{0,251}[a-z0-9])?$/;
+
+/** The BackupDestination an entry names, when it still exists. */
+function entryDestination(world: World, entry: HeldEntry): DestinationView | undefined {
+  const destinations = world.destinations ?? (world.destination ? [world.destination] : []);
+  return destinations.find((item) => item.name === entry.destination);
+}
+
 /**
  * Why the sweeper refuses a ledger entry, or undefined when it is one the operator could have
  * written: a workload name, whole replicas within bounds, a `Backup/` or `BackupRestore/` holder,
- * a timestamp, and an existing destination that has the workload as a source. A refused entry is
- * dropped and never scaled.
+ * a timestamp, a workload that is not platform-reserved, and a destination that has the workload
+ * as a source. A refused entry is dropped and never scaled.
+ *
+ * An entry whose destination is gone (#254) is still one the operator wrote: it names the
+ * destination it was written for, and it is kept when the workload is listed with a platform
+ * storage volume, as every workload the operator ever stops is. There is no spec left to say the
+ * workload is not a source, and leaving it at 0 would be a silent outage. A destination that
+ * exists and no longer names the workload is a decision: that entry is refused.
  */
 export function heldEntryProblem(world: World, name: string, entry: HeldEntry): string | undefined {
   if (!DNS_LABEL.test(name)) return 'name';
@@ -109,12 +123,39 @@ export function heldEntryProblem(world: World, name: string, entry: HeldEntry): 
   if (entry.replicas > MAX_HELD_REPLICAS) return 'replicas';
   if (!HELD_BY.test(entry.heldBy)) return 'heldBy';
   if (Number.isNaN(Date.parse(entry.since))) return 'since';
-  const destinations = world.destinations ?? (world.destination ? [world.destination] : []);
-  const dest = destinations.find((item) => item.name === entry.destination);
-  if (!dest) return 'destination';
   const current = (world.workloads ?? []).find((item) => item.name === name);
   if (reservedWorkload(name, current)) return 'reserved';
+  if (!entry.destination || !DNS_SUBDOMAIN.test(entry.destination)) return 'destination';
+  const dest = entryDestination(world, entry);
+  if (!dest) return current && storageKeyOf(current) ? undefined : 'destination';
   return sourceOf(world, dest, name) ? undefined : 'not-a-source';
+}
+
+/** Why an entry was refused, in words, for its Event and log line. */
+function refusal(problem: string, entry: HeldEntry): string {
+  switch (problem) {
+    case 'name':
+      return 'the name is not a WorkloadDeployment name';
+    case 'replicas':
+      return `replicas is not a whole number from 0 to ${MAX_HELD_REPLICAS}`;
+    case 'heldBy':
+      return 'the holder is not Backup/<name> or BackupRestore/<name>';
+    case 'since':
+      return 'the timestamp does not parse';
+    case 'reserved':
+      return 'the workload is managed by the platform';
+    case 'not-a-source':
+      return `the workload is not a source of BackupDestination ${entry.destination}`;
+    default:
+      return entry.destination
+        ? `BackupDestination ${entry.destination} is gone and the workload is not listed with a platform storage volume`
+        : 'the entry names no BackupDestination';
+  }
+}
+
+/** Event messages are bounded; a forged entry may carry anything. */
+function bounded(text: string): string {
+  return text.length > 1024 ? `${text.slice(0, 1021)}...` : text;
 }
 
 /** The volume path's tail under any storageRoot. */
@@ -1041,8 +1082,11 @@ export function advanceVolumes(world: World, blocked?: string): Action[] {
  * Defense in depth (W6): the ledger is out of tenant reach, but an entry is still only acted on
  * when it is one the operator could have written ({@link heldEntryProblem}): a source of an
  * existing destination, never a platform-reserved workload, with bounded replicas. Anything else
- * is dropped unscaled. A workload a running operation holds by its own status (members, which
- * tenants cannot write) is left to that operation, whatever its entry claims.
+ * is dropped unscaled, and says so (#254): a Warning Event `HeldReplicasDropped` on the ledger
+ * in the runtime namespace, and a log line, written after the ledger write lands, because the
+ * workload may be left at 0. An entry whose destination is gone is given back, with a Normal
+ * Event `HeldReplicasReleased`. A workload a running operation holds by its own status (members,
+ * which tenants cannot write) is left to that operation, whatever its entry claims.
  */
 export function releaseOrphans(world: World): Action[] {
   if (!volumeStateKnown(world)) return [];
@@ -1060,19 +1104,40 @@ export function releaseOrphans(world: World): Action[] {
   );
   const actions: Action[] = [];
   const release: Record<string, null> = {};
+  // Signals go after the ledger write: an entry is reported once it is really gone.
+  const signals: Action[] = [];
+  const signal = (eventType: 'Normal' | 'Warning', reason: string, text: string) => {
+    const message = bounded(text);
+    signals.push({ type: 'log', message }, { type: 'event', eventType, reason, message });
+  };
   for (const [name, entry] of Object.entries(world.ledger?.entries ?? {})) {
     if (running.has(entry.heldBy) || holding.has(name)) continue;
     release[name] = null;
-    if (heldEntryProblem(world, name, entry)) continue;
     const current = (world.workloads ?? []).find((item) => item.name === name);
+    const problem = heldEntryProblem(world, name, entry);
+    if (problem) {
+      signal(
+        'Warning',
+        'HeldReplicasDropped',
+        `held-replicas entry for WorkloadDeployment ${name} (${entry.replicas} replicas, held by ${entry.heldBy}) dropped without scaling: ${refusal(problem, entry)}. It keeps its current replicas${current ? ` (${current.replicas})` : ''}; scale it by hand if it should run.`,
+      );
+      continue;
+    }
     if (!current || current.replicas === 0) {
       actions.push({ type: 'scale-workload', name, replicas: entry.replicas });
+      if (!entryDestination(world, entry)) {
+        signal(
+          'Normal',
+          'HeldReplicasReleased',
+          `WorkloadDeployment ${name} got its ${entry.replicas} replicas back from ${entry.heldBy}; its BackupDestination ${entry.destination} is gone.`,
+        );
+      }
     }
   }
   if (Object.keys(release).length > 0) {
     actions.push({ type: 'ledger', set: release, resourceVersion: world.ledger?.resourceVersion });
   }
-  return actions;
+  return [...actions, ...signals];
 }
 
 function begin(

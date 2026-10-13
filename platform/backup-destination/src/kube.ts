@@ -707,7 +707,41 @@ export async function applyActions(
           `/apis/batch/v1/namespaces/${world.runtimeNamespace}/jobs/${action.name}?propagationPolicy=Background`,
         ),
       );
+    } else if (action.type === 'event') {
+      await recordEvent(client, world, action);
     }
+  }
+}
+
+/**
+ * Post an Event on the held-replicas ledger in the runtime namespace, where tenant roles read
+ * events. A signal, not a step: a failure is logged and the tick goes on.
+ */
+async function recordEvent(
+  client: KubeClient,
+  world: World,
+  action: Extract<Action, { type: 'event' }>,
+): Promise<void> {
+  const namespace = world.runtimeNamespace;
+  try {
+    await client.post(`/api/v1/namespaces/${namespace}/events`, {
+      apiVersion: 'v1',
+      kind: 'Event',
+      metadata: { generateName: `${LEDGER}.`, namespace },
+      involvedObject: { apiVersion: 'v1', kind: 'ConfigMap', name: LEDGER, namespace },
+      type: action.eventType,
+      reason: action.reason,
+      message: action.message,
+      source: { component: 'di-backup-operator' },
+      reportingComponent: 'di-backup-operator',
+      firstTimestamp: world.now,
+      lastTimestamp: world.now,
+      count: 1,
+    });
+  } catch (error) {
+    console.error(
+      `event ${action.reason} not recorded: ${error instanceof Error ? error.message : 'post failed'}`,
+    );
   }
 }
 

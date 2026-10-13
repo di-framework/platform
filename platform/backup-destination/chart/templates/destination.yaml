@@ -10,6 +10,10 @@
 {{- $element := printf "(\\*|(%s)(-(%s))?)(/[1-9][0-9]*)?" . . -}}
 {{- $parts = append $parts (printf "%s(,%s)*" $element $element) -}}
 {{- end -}}
+{{- /* The CRD's maxLength (#254 S2); the value written is the trimmed one. */ -}}
+{{- if gt (len $schedule) 128 -}}
+{{- fail (printf "schedule must be at most 128 characters (it has %d)" (len $schedule)) -}}
+{{- end -}}
 {{- if and (ne $schedule "none") (not (regexMatch (printf "^%s$" (join " " $parts)) $schedule)) -}}
 {{- fail (printf "schedule %q must be a five-field UTC cron (minute hour day month weekday) or \"none\"" $schedule) -}}
 {{- end -}}
@@ -43,6 +47,9 @@
 {{- if not $sourceSchedule -}}
 {{- fail (printf "source %s: schedule is required: set a five-field UTC cron, or \"none\" for on-demand backups only (there is no default since #250)" .workloadName) -}}
 {{- end -}}
+{{- if gt (len $sourceSchedule) 128 -}}
+{{- fail (printf "source %s: schedule must be at most 128 characters (it has %d)" .workloadName (len $sourceSchedule)) -}}
+{{- end -}}
 {{- if and (ne $sourceSchedule "none") (not (regexMatch (printf "^%s$" (join " " $parts)) $sourceSchedule)) -}}
 {{- fail (printf "source %s: schedule %q must be a five-field UTC cron (minute hour day month weekday) or \"none\"" .workloadName $sourceSchedule) -}}
 {{- end -}}
@@ -61,7 +68,9 @@
 {{- $picked := list -}}
 {{- range .root.Values.sources -}}
 {{- if or (not .destination) (eq .destination $kind) -}}
-{{- $picked = append $picked (omit . "destination" | merge (dict "kind" "workload-volume")) -}}
+{{- /* The schedule checked above is the one written: trimmed, as the CRD pattern needs (#254 S1). */ -}}
+{{- $schedule := .schedule | default "" | toString | trim -}}
+{{- $picked = append $picked (omit . "destination" | merge (dict "kind" "workload-volume" "schedule" $schedule)) -}}
 {{- end -}}
 {{- end -}}
 {{- if $picked }}
