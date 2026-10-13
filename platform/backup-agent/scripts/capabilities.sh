@@ -44,8 +44,13 @@ for volume in "$src" "$claim" "$workloads" "$out"; do "$ENGINE" volume create "$
   chmod 0700 /workloads/identity
 '
 
-common="--rm --user 0:0 --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges
-  -e HOME=/tmp -e TMPDIR=/tmp -e RCLONE_CONFIG=/tmp/rclone.conf -e BACKUP_WORKDIR=/tmp
+# As in the Job: the root (and /tmp) is read-only; only /scratch, the volume and the claim are not.
+# podman mounts a tmpfs on /tmp under --read-only unless told not to; docker never does.
+readonly_tmp=""
+[ "$(basename "$ENGINE")" = podman ] && readonly_tmp="--read-only-tmpfs=false"
+common="--rm --user 0:0 --read-only $readonly_tmp --tmpfs /scratch --cap-drop ALL
+  --security-opt no-new-privileges -e HOME=/scratch -e TMPDIR=/scratch
+  -e RCLONE_CONFIG=/scratch/rclone.conf -e BACKUP_WORKDIR=/scratch
   -e TERMINATION_LOG=/out/termination -e BACKUP_DESTINATION_TYPE=pvc
   -e BACKUP_PVC_MOUNT_PATH=/backup-pvc -e BACKUP_OBJECT_PREFIX=w/identity/uid/20261013T000000Z
   -e BACKUP_WORKLOAD_NAME=identity -e BACKUP_STORAGE_KEY=identity
@@ -67,6 +72,13 @@ expect() {
     *) echo "FAIL $label (exit $code): $got"; fail=1 ;;
   esac
 }
+
+# shellcheck disable=SC2086
+if "$ENGINE" run $common --entrypoint sh "$IMAGE" -c 'touch /tmp/x' >/dev/null 2>&1; then
+  echo "FAIL /tmp is writable: the run would not prove the agent needs only /scratch"; fail=1
+else
+  echo "ok   /tmp is read-only; only /scratch, the volume and the claim are writable"
+fi
 
 backup="-e BACKUP_KIND=workload-volume -e BACKUP_SOURCE_DIR=/source -v $src:/source:ro"
 restore="-e BACKUP_KIND=restore-workload-volume -e BACKUP_TARGET_ROOT=/workloads -v $workloads:/workloads"

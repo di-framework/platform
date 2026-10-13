@@ -22,7 +22,7 @@ interface LeaseObject {
 
 /** Kubernetes MicroTime: RFC 3339 with exactly six fractional digits. */
 export function microTime(now: Date): string {
-  return now.toISOString().replace(/\.(\d{3})Z$/, '.$1000Z');
+  return now.toISOString().replace(/\.(\d{3})Z$/, (_, millis: string) => `.${millis}000Z`);
 }
 
 function leasePath(namespace: string, name = ''): string {

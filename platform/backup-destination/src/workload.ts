@@ -576,6 +576,9 @@ function sourceFor(dest: DestinationView | undefined, workloadName: string | und
   return dest?.spec.sources?.find((item) => item.workloadName === workloadName);
 }
 
+/** The volume Jobs' emptyDir: their only writable path besides the volume and the claim. */
+const SCRATCH = '/scratch';
+
 const DEFAULT_RESOURCES = {
   requests: { cpu: '50m', memory: '64Mi' },
   limits: { cpu: '100m', memory: '128Mi' },
@@ -679,10 +682,11 @@ export function volumeJobBody(input: {
               env: [
                 { name: 'BACKUP_KIND', value: agentKind },
                 { name: 'BACKUP_OBJECT_PREFIX', value: volume.objectPrefix ?? '' },
-                { name: 'BACKUP_WORKDIR', value: '/tmp' },
-                { name: 'HOME', value: '/tmp' },
-                { name: 'TMPDIR', value: '/tmp' },
-                { name: 'RCLONE_CONFIG', value: '/tmp/rclone.conf' },
+                // The root filesystem is read-only: everything writable is the pod's own scratch.
+                { name: 'BACKUP_WORKDIR', value: SCRATCH },
+                { name: 'HOME', value: SCRATCH },
+                { name: 'TMPDIR', value: SCRATCH },
+                { name: 'RCLONE_CONFIG', value: `${SCRATCH}/rclone.conf` },
                 { name: 'BACKUP_WORKLOAD_NAME', value: input.workloadName },
                 { name: 'BACKUP_STORAGE_KEY', value: volume.storageKey ?? '' },
                 { name: 'BACKUP_STAMP', value: volume.scaleDownStartedAt ?? world.now },
@@ -701,7 +705,7 @@ export function volumeJobBody(input: {
               terminationMessagePath: '/dev/termination-log',
               terminationMessagePolicy: 'File',
               volumeMounts: [
-                { name: 'scratch', mountPath: '/tmp' },
+                { name: 'scratch', mountPath: SCRATCH },
                 restore
                   ? { name: 'workloads', mountPath: mount, ...(probe ? { readOnly: true } : {}) }
                   : { name: 'source', mountPath: mount, readOnly: true },

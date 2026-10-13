@@ -149,7 +149,9 @@ describe('cold copy of a workload volume', () => {
     expect(text).toContain('"add":["DAC_READ_SEARCH"]');
     expect(text).toContain('"readOnlyRootFilesystem":true');
     expect(text).toContain('"seccompProfile":{"type":"RuntimeDefault"}');
-    expect(text).toContain('{"name":"RCLONE_CONFIG","value":"/tmp/rclone.conf"}');
+    expect(text).toContain('{"name":"RCLONE_CONFIG","value":"/scratch/rclone.conf"}');
+    expect(text).toContain('{"name":"scratch","mountPath":"/scratch"}');
+    expect(text).toContain('{"name":"BACKUP_WORKDIR","value":"/scratch"}');
     expect(text).toContain('"backoffLimit":0');
     expect(text).toContain('"ttlSecondsAfterFinished":604800');
     expect(text).toContain('"activeDeadlineSeconds":3600');
