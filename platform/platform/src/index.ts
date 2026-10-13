@@ -34,6 +34,7 @@ import {
 import { secretReaderFromKubeconfig } from './token-secret-reader';
 import { waitForTokenSecret } from './token-wait';
 import { platformValues } from './values';
+import { operatorHostNamespaces, tenantListerFromKubeconfig } from './watched-namespaces';
 
 export { platformRegistryPullHost, tenantInsecureRegistries } from './insecure-registries';
 export { kubeconfigServer, type TenantKubeconfigArgs, tenantKubeconfig } from './kubeconfig';
@@ -84,7 +85,9 @@ export interface PlatformArgs {
    * is Ready, the program polls the Kubernetes API with this kubeconfig (and `kubeContext`) until
    * the user's token Secret has `data.token`. The ambient `$KUBECONFIG` is never read. If the
    * kubeconfig uses an `exec` credential plugin, that plugin runs for these reads as it does for
-   * `provider`.
+   * `provider`. On every update (never in preview) it also lists the installation's Tenants, so a
+   * removed tenant's runtime namespace stays watched by the wasmCloud operator until its Tenant is
+   * deleted (#227); without it, only declared tenants are watched.
    */
   kubeconfig?: pulumi.Input<string>;
   /** Context of `kubeconfig` that `provider` uses; defaults to the kubeconfig's current context. */
@@ -214,11 +217,29 @@ export function createPlatform(args: PlatformArgs) {
 
   const tenantNamespaces = seedTenantNamespaces(declared.tenants, scope, provider);
 
-  const initialDeps: pulumi.Resource[] = [
-    namespaceResource,
-    ...(registryService ? [registryService] : []),
-    ...tenantNamespaces,
-  ];
+  // A removed tenant's runtime namespace stays watched while Pulumi deletes its Tenant, which it
+  // does after this Helm update (#227). Preview never reads the cluster.
+  const adminKubeconfig = args.kubeconfig;
+  const resolveHostNamespaces = (kubeconfig?: string, context?: string) =>
+    operatorHostNamespaces({
+      platformNamespace: namespaceName,
+      declared: declared.tenants.map((t) => t.name),
+      dryRun: pulumi.runtime.isDryRun(),
+      listTenants:
+        kubeconfig === undefined
+          ? undefined
+          : tenantListerFromKubeconfig(kubeconfig, scope, context),
+      log: { info: (m) => pulumi.log.info(m), warn: (m) => pulumi.log.warn(m) },
+    });
+  const watchedNamespaces: pulumi.Input<string[]> =
+    pulumi.runtime.isDryRun() || adminKubeconfig === undefined
+      ? resolveHostNamespaces()
+      : // The namespace list is not secret, though the kubeconfig it was read with is.
+        pulumi.unsecret(
+          pulumi
+            .all([adminKubeconfig, args.kubeContext])
+            .apply(([kubeconfig, context]) => resolveHostNamespaces(kubeconfig, context)),
+        );
 
   const wasmcloud = new k8s.helm.v3.Release(
     'wasmcloud',
@@ -231,44 +252,44 @@ export function createPlatform(args: PlatformArgs) {
       atomic: true,
       cleanupOnFail: true,
       timeout: args.timeoutSeconds ?? 600,
-      values: platformValues(args.values ?? {}, {
-        gateway: { enabled: false },
-        operator: {
-          allowSharedHosts: false,
-          hostNamespaces: [
-            namespaceName,
-            ...declared.tenants.map((t) => names(t.name).runtimeNamespace),
-          ],
-        },
-        runtime: {
-          extraArgs: args.insecureRegistry ? ['--allow-insecure-registries'] : [],
-          resources: {
-            requests: { cpu: '250m', memory: '256Mi' },
-            limits: { memory: '2Gi' },
-            defaultHeapMemory: '512MiB',
-            coreInstances: '100',
-          },
-          hostGroups: [
-            {
-              name: 'default',
-              replicas: 1,
-              service: { type: 'ClusterIP' },
-              webgpu: { enabled: false },
-              http: { enabled: true, port: 9191 },
+      values: pulumi.output(watchedNamespaces).apply((hostNamespaces) =>
+        platformValues(args.values ?? {}, {
+          gateway: { enabled: false },
+          operator: { allowSharedHosts: false, hostNamespaces },
+          runtime: {
+            extraArgs: args.insecureRegistry ? ['--allow-insecure-registries'] : [],
+            resources: {
+              requests: { cpu: '250m', memory: '256Mi' },
+              limits: { memory: '2Gi' },
+              defaultHeapMemory: '512MiB',
+              coreInstances: '100',
             },
-          ],
-        },
-      }),
+            hostGroups: [
+              {
+                name: 'default',
+                replicas: 1,
+                service: { type: 'ClusterIP' },
+                webgpu: { enabled: false },
+                http: { enabled: true, port: 9191 },
+              },
+            ],
+          },
+        }),
+      ),
     },
     {
       provider,
-      dependsOn: initialDeps,
+      dependsOn: [
+        namespaceResource,
+        ...(registryService ? [registryService] : []),
+        ...tenantNamespaces,
+      ],
     },
   );
 
   const runtimeShutdown = args.beforeTenancy?.(wasmcloud) ?? wasmcloud;
 
-  // Gateway and network resources
+  // The default host group's backend. The published port belongs to the gateway below.
   const httpBackend = new k8s.core.v1.Service(
     'http-entrypoint',
     {
@@ -322,10 +343,6 @@ export function createPlatform(args: PlatformArgs) {
     { provider, dependsOn: [gateway, httpBackend] },
   );
 
-  // Install tenancy: creates the controller, CRDs, and Tenant CustomResources (#227).
-  // When tenants are removed from the config, the Tenant CustomResources are deleted.
-  // The Helm release should be updated only after tenants are fully deleted and drained
-  // (hosts removed), so the operator can still watch their namespaces during cleanup.
   const tenancy = installTenancy({
     installation: scope,
     namespace: namespaceName,
@@ -370,7 +387,6 @@ export function createPlatform(args: PlatformArgs) {
   // exists, so an unknown ID defers the read to the update. During update, poll until the Secret
   // exists with data.token, as the controller may not have created it yet.
   const apiServer = args.apiServer;
-  const adminKubeconfig = args.kubeconfig;
   if (apiServer !== undefined && adminKubeconfig === undefined)
     throw new Error('createPlatform: apiServer requires kubeconfig (the one provider uses)');
   // In preview the ID is unknown, so nothing is read. On update the wait runs inside an apply on
