@@ -5,7 +5,10 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import { load } from 'js-yaml';
+import { CORE_SCHEMA, load, mergeTag } from 'js-yaml';
+
+/** js-yaml 5 dropped merge keys (`<<: *anchor`) from its default schema; kubeconfigs use them. */
+const KUBECONFIG_SCHEMA = CORE_SCHEMA.withTags(mergeTag);
 
 export const PLATFORM_GROUP = 'platform.di-framework.dev';
 export const PLATFORM_VERSION = 'v1alpha1';
@@ -101,7 +104,7 @@ const decode = (value: string) => Buffer.from(value, 'base64').toString('utf8');
 
 /** Resolve one context of a kubeconfig file into connection credentials. */
 export function loadKubeconfig(path: string, contextName?: string): KubeCredentials {
-  const doc = load(readFileSync(path, 'utf8')) as Kubeconfig;
+  const doc = load(readFileSync(path, 'utf8'), { schema: KUBECONFIG_SCHEMA }) as Kubeconfig;
   const name = contextName ?? doc['current-context'];
   const context = doc.contexts?.find((c) => c.name === name)?.context;
   if (!context) throw new Error(`kubeconfig ${path} has no context ${name ?? '(current)'}`);
