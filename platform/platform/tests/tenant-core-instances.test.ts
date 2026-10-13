@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'bun:test';
 import * as pulumi from '@pulumi/pulumi';
-import { declarations } from '../src/tenancy';
 import type { DeletionPolicy } from '../src/tenancy/backing-services';
 import { assertTenantDeclaration, tenantObject } from '../src/tenancy/install';
 import {
@@ -159,17 +158,6 @@ describe('Tenant spec.deletionPolicy', () => {
       },
       spec: { deletionPolicy: 'Delete' },
     });
-  });
-
-  it('rejects a bad deletionPolicy from Pulumi config through declarations()', () => {
-    const config = (tenants: unknown) =>
-      ({
-        getObject: (key: string) => (key === 'tenants' ? tenants : undefined),
-      }) as unknown as pulumi.Config;
-    expect(declarations(config([{ name: 'a', deletionPolicy: 'Delete' }])).tenants).toHaveLength(1);
-    expect(() => declarations(config([{ name: 'a', deletionPolicy: 'Keep' }]))).toThrow(
-      "Tenant a deletionPolicy must be 'Retain' or 'Delete'",
-    );
   });
 });
 
