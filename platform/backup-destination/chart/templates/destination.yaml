@@ -23,6 +23,33 @@
 {{- fail "either existingClaimName or volumeClaimTemplate.size is required for PVC destination type" -}}
 {{- end -}}
 {{- end -}}
+{{- range .Values.sources -}}
+{{- if not .workloadName -}}
+{{- fail "every source needs a workloadName" -}}
+{{- end -}}
+{{- if and (eq $type "both") (not .destination) -}}
+{{- fail (printf "source %s needs destination s3 or pvc when type is both" .workloadName) -}}
+{{- end -}}
+{{- if and .destination (not (has .destination (list "s3" "pvc"))) -}}
+{{- fail (printf "source %s: destination must be s3 or pvc" .workloadName) -}}
+{{- end -}}
+{{- if and .destination (ne $type "both") (ne .destination $type) -}}
+{{- fail (printf "source %s: destination %s is not rendered with type %s" .workloadName .destination $type) -}}
+{{- end -}}
+{{- end -}}
+{{- define "backup.sources" -}}
+{{- $kind := .kind -}}
+{{- $picked := list -}}
+{{- range .root.Values.sources -}}
+{{- if or (not .destination) (eq .destination $kind) -}}
+{{- $picked = append $picked (omit . "destination" | merge (dict "kind" "workload-volume")) -}}
+{{- end -}}
+{{- end -}}
+{{- if $picked }}
+  sources:
+    {{- toYaml $picked | nindent 4 }}
+{{- end -}}
+{{- end -}}
 {{- define "backup.common" -}}
   {{- if .Values.prefix }}
   prefix: {{ .Values.prefix | quote }}
@@ -53,6 +80,7 @@ spec:
     name: {{ $secret | quote }}
   schedule: {{ .Values.schedule | default "0 2 * * *" | quote }}
   {{- include "backup.common" . }}
+  {{- include "backup.sources" (dict "root" . "kind" "s3") }}
 {{- end }}
 {{- if $pvc }}
 ---
@@ -78,6 +106,7 @@ spec:
   schedule: {{ .Values.schedule | quote }}
   {{- end }}
   {{- include "backup.common" . }}
+  {{- include "backup.sources" (dict "root" . "kind" "pvc") }}
 {{- end }}
 {{- if and $pvc .Values.volumeClaimTemplate.size (not .Values.existingClaimName) }}
 ---

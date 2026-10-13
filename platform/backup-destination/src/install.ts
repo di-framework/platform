@@ -23,6 +23,40 @@ export interface BackupDestinationInstall {
   accessKeyId?: pulumi.Input<string>;
   secretAccessKey?: pulumi.Input<string>;
   extraEgress?: pulumi.Input<pulumi.Input<{ cidr: string; port: number; protocol?: string }>[]>;
+  /**
+   * The platform's storageRoot. Leave it unset and the operator takes it from the path the
+   * tenant host pods mount, so it cannot disagree with the platform. When set, that path must
+   * match it; pass the same value the platform installation uses.
+   */
+  storageRoot?: pulumi.Input<string>;
+  /**
+   * Workload volumes to copy cold (#232). No schedule means on-demand only; no retention means
+   * every backup is kept. `destination` picks `s3` or `pvc` when `type` is `both`.
+   */
+  sources?: pulumi.Input<
+    {
+      workloadName: string;
+      schedule?: string;
+      retention?: {
+        keepLast?: number;
+        daily?: number;
+        weekly?: number;
+        monthly?: number;
+        failed?: number;
+      };
+      scaleDownTimeoutSeconds?: number;
+      copyTimeoutSeconds?: number;
+      /** Placement probe and copy Job start deadline (default 120). */
+      startTimeoutSeconds?: number;
+      /** Copy Job resources; the default is requests 50m/64Mi, limits 100m/128Mi. */
+      resources?: {
+        requests?: { cpu?: string; memory?: string };
+        limits?: { cpu?: string; memory?: string };
+      };
+      suspend?: boolean;
+      destination?: 's3' | 'pvc';
+    }[]
+  >;
   agentImage?: pulumi.Input<string>;
   imageRepository?: pulumi.Input<string>;
   imageTag?: pulumi.Input<string>;
@@ -52,6 +86,8 @@ export function backupReleaseArgs(install: BackupDestinationInstall): k8s.helm.v
   if (install.accessKeyId !== undefined) values.accessKeyId = install.accessKeyId;
   if (install.secretAccessKey !== undefined) values.secretAccessKey = install.secretAccessKey;
   if (install.extraEgress !== undefined) values.extraEgress = install.extraEgress;
+  if (install.storageRoot !== undefined) values.storageRoot = install.storageRoot;
+  if (install.sources !== undefined) values.sources = install.sources;
   if (install.agentImage !== undefined) values.agentImage = install.agentImage;
   const image: Record<string, pulumi.Input<string>> = {};
   if (install.imageRepository !== undefined) image.repository = install.imageRepository;

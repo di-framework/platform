@@ -24,6 +24,21 @@ rules:
     resources: ["networkpolicies"]
     resourceNames: ["di-backup-agent-network"]
     verbs: ["get", "patch", "update"]
+  # The held-replicas ledger (#232): the replicas a workload-volume copy holds at 0, kept
+  # outside the Backup so a deleted Backup cannot strand them. It lives here because tenant
+  # roles cannot write ConfigMaps in the runtime namespace. create cannot be name-scoped.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["di-backup-held-replicas"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  # Workload volumes (#232): the tenant uid on the host Deployment names the node directory.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: [{{ printf "hostgroup-tenant-%s" (include "backup.tenant" . | trim) | quote }}]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

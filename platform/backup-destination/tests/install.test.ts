@@ -72,6 +72,22 @@ describe('backup helm release', () => {
     });
   });
 
+  test('passes workload-volume sources and the storage root through', () => {
+    const sources = [
+      { workloadName: 'identity', schedule: '30 3 * * *', retention: { keepLast: 7 } },
+    ];
+    expect(
+      backupReleaseArgs({
+        tenant: 'alpha',
+        chart: '/chart',
+        type: 'pvc',
+        existingClaimName: 'c',
+        storageRoot: '/var/lib/k0s',
+        sources,
+      }).values,
+    ).toEqual({ type: 'pvc', existingClaimName: 'c', storageRoot: '/var/lib/k0s', sources });
+  });
+
   test('rejects a namespace that is not a tenant name', () => {
     expect(() => backupReleaseArgs({ tenant: 'Wasm', chart: '/chart', bucket: 'b' })).toThrow(
       /wasmCloud tenant name/,

@@ -52,6 +52,7 @@ const destinations = (out: string) =>
 async function template(
   namespace: string,
   values: Record<string, string>,
+  typed: Record<string, string> = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const args = [
     await helm(),
@@ -63,6 +64,7 @@ async function template(
     '--include-crds',
   ];
   for (const [key, value] of Object.entries(values)) args.push('--set-string', `${key}=${value}`);
+  for (const [key, value] of Object.entries(typed)) args.push('--set', `${key}=${value}`);
   const child = Bun.spawn(args, { stdout: 'pipe', stderr: 'pipe' });
   const code = await child.exited;
   return {
@@ -202,5 +204,195 @@ describe('backup-destination chart', () => {
     const unknown = await template('di-tenant-alpha', { type: 'nfs' });
     expect(unknown.code).not.toBe(0);
     expect(unknown.stderr).toContain('type must be s3, pvc, or both');
+  }, 30000);
+
+  test('grants the operator only namespaced workload access and passes the storage root', async () => {
+    const rendered = await template('di-tenant-alpha', {
+      bucket: 'b',
+      existingSecret: 's',
+      storageRoot: '/var/lib/k0s',
+    });
+    expect(rendered.code).toBe(0);
+    expect(rendered.stdout).not.toContain('kind: ClusterRole');
+    const roles = rendered.stdout.split('\n---\n').filter((doc) => doc.includes('kind: Role\n'));
+    const tenant = roles.find((doc) => doc.includes('namespace: di-tenant-alpha')) ?? '';
+    const runtime = roles.find((doc) => doc.includes('namespace: di-runtime-alpha')) ?? '';
+    expect(tenant).toContain(
+      'resources: ["workloaddeployments", "workloadreplicasets", "workloads"]\n    verbs: ["get", "list"]',
+    );
+    expect(tenant).toContain(
+      'resources: ["workloaddeployments/scale"]\n    verbs: ["get", "patch"]',
+    );
+    expect(tenant).not.toMatch(
+      /workloaddeployments"[^\n]*\n\s*verbs: \[[^\]]*"(patch|update|create|delete)"/,
+    );
+    expect(runtime).toContain(
+      'resources: ["deployments"]\n    resourceNames: ["hostgroup-tenant-alpha"]\n    verbs: ["get"]',
+    );
+    expect(rendered.stdout).toContain('- name: STORAGE_ROOT\n              value: "/var/lib/k0s"');
+    // Unset: the operator takes the root from the host pods' mount.
+    const discovered = await template('di-tenant-alpha', { bucket: 'b', existingSecret: 's' });
+    expect(discovered.stdout).toContain('- name: STORAGE_ROOT\n              value: ""');
+    // The Secret get is limited to the one Secret the chart's destination names.
+    expect(tenant).toContain(
+      'resources: ["secrets"]\n    resourceNames: ["s"]\n    verbs: ["get"]',
+    );
+    expect(tenant).not.toMatch(/resources: \["secrets"\]\n\s*verbs/);
+    const created = await template('di-tenant-alpha', {
+      bucket: 'b',
+      accessKeyId: 'a',
+      secretAccessKey: 'k',
+    });
+    expect(created.stdout).toContain('resourceNames: ["di-backup-s3"]');
+    const pvcOnly = await template('di-tenant-alpha', {
+      type: 'pvc',
+      existingClaimName: 'c',
+    });
+    const pvcTenant = pvcOnly.stdout
+      .split('\n---\n')
+      .find((doc) => doc.includes('kind: Role\n') && doc.includes('namespace: di-tenant-alpha'));
+    expect(pvcTenant).toBeDefined();
+    expect(pvcTenant).not.toContain('resources: ["secrets"]');
+    // The ledger and the Lease, each limited to its one object where the verb allows it. The
+    // ledger is in the runtime namespace (W6): tenant users can edit ConfigMaps in their own.
+    expect(runtime).toContain(
+      'resources: ["configmaps"]\n    resourceNames: ["di-backup-held-replicas"]\n    verbs: ["get", "patch"]',
+    );
+    expect(runtime).toContain('resources: ["configmaps"]\n    verbs: ["create"]');
+    expect(tenant).not.toContain('configmaps');
+    expect(tenant).toContain(
+      'resources: ["leases"]\n    resourceNames: ["di-backup-operator"]\n    verbs: ["get", "patch"]',
+    );
+    expect(runtime).not.toMatch(/resources: \["configmaps"\]\n\s*verbs: \[[^\]]*"list"/);
+    // Never two operator pods at once.
+    expect(rendered.stdout).toContain('strategy:\n    type: Recreate');
+    expect(rendered.stdout).toContain(
+      '- name: POD_NAME\n              valueFrom:\n                fieldRef:\n                  fieldPath: metadata.name',
+    );
+  }, 30000);
+
+  test('the CRDs validate schedules, names, and request shapes', async () => {
+    const crds = await Bun.file(
+      join(import.meta.dir, '..', 'chart', 'crds', 'backups.yaml'),
+    ).text();
+    const patterns = [...crds.matchAll(/schedule:\n\s+type: string\n\s+pattern: '([^']+)'/g)].map(
+      (match) => new RegExp(match[1] ?? ''),
+    );
+    expect(patterns).toHaveLength(2);
+    for (const pattern of patterns) {
+      for (const valid of ['0 2 * * *', '*/15 0-2 1,15 1-6 1-5', '30 3 * * 7', '0 0 1 1/3 *']) {
+        expect(pattern.test(valid)).toBe(true);
+      }
+      for (const invalid of ['a b c d e', '0 2 * *', '0 2 * * * *', '0  2 * * *', 'x/5 * * * *']) {
+        expect(pattern.test(invalid)).toBe(false);
+      }
+    }
+    const secret =
+      /name:\n\s+type: string\n\s+minLength: 1\n\s+maxLength: 253\n\s+pattern: '([^']+)'/.exec(
+        crds,
+      );
+    const subdomain = new RegExp(secret?.[1] ?? '^$');
+    expect(subdomain.test('di-backup-s3')).toBe(true);
+    expect(subdomain.test('a.b-c')).toBe(true);
+    expect(subdomain.test('../x')).toBe(false);
+    expect(subdomain.test('x/y')).toBe(false);
+    expect(crds).toContain('rule: "self.type != \'workload-volume\' || has(self.source)"');
+    expect(crds).toContain("rule: '!has(self.expectedKcv) || has(self.targetWorkloadName)'");
+    expect(crds).toMatch(
+      /source:\n(.*\n){4}\s+workloadName:\n\s+type: string\n\s+maxLength: 63\n\s+pattern: '\^\[a-z0-9\]/,
+    );
+    expect(crds).toContain('startTimeoutSeconds: { type: integer, minimum: 30, maximum: 1800 }');
+    // Status fields the operator writes must be in the schema, or the API server prunes them.
+    for (const field of [
+      'placingStartedAt',
+      'probeJob',
+      'copyJob',
+      'abortedJob',
+      'outcome',
+      'restoringPath',
+    ]) {
+      expect(crds.split(`${field}:`).length - 1).toBe(2);
+    }
+    expect(
+      crds.split("enum: ['Placing', 'ScalingDown', 'Copying', 'ScalingUp', 'Done']").length - 1,
+    ).toBe(2);
+    expect(crds).toContain('scheduleStatus: { type: string }');
+  });
+
+  test('renders workload-volume sources without inventing a schedule or retention', async () => {
+    const sources = {
+      'sources[0].workloadName': 'identity',
+      'sources[0].destination': 'pvc',
+      'sources[1].workloadName': 'reports',
+      'sources[1].destination': 's3',
+    };
+    const both = await template(
+      'di-tenant-alpha',
+      {
+        type: 'both',
+        bucket: 'b',
+        existingSecret: 's',
+        'volumeClaimTemplate.size': '5Gi',
+        ...sources,
+        'sources[0].schedule': '30 3 * * *',
+      },
+      {
+        'sources[0].retention.keepLast': '7',
+        'sources[0].scaleDownTimeoutSeconds': '120',
+        'sources[0].startTimeoutSeconds': '90',
+      },
+    );
+    expect(both.code).toBe(0);
+    const destinations = both.stdout
+      .split('\n---\n')
+      .filter((doc) => doc.includes('v1alpha1\nkind: BackupDestination\n'));
+    const [s3, pvc] = destinations;
+    expect(s3).toContain('- kind: workload-volume\n      workloadName: reports');
+    expect(s3).not.toContain('identity');
+    expect(s3?.slice(s3.indexOf('sources:'))).not.toContain('schedule');
+    expect(pvc).toContain('workloadName: identity');
+    expect(pvc).toContain('keepLast: 7');
+    expect(pvc).toContain('scaleDownTimeoutSeconds: 120');
+    expect(pvc).toContain('startTimeoutSeconds: 90');
+    expect(pvc).toContain('schedule: 30 3 * * *');
+    expect(pvc).not.toContain('reports');
+    expect(both.stdout).not.toContain('destination: pvc');
+
+    const single = await template('di-tenant-alpha', {
+      bucket: 'b',
+      existingSecret: 's',
+      'sources[0].workloadName': 'identity',
+    });
+    expect(single.stdout).toContain('workloadName: identity');
+    const none = await template('di-tenant-alpha', { bucket: 'b', existingSecret: 's' });
+    const noneDestination = none.stdout
+      .split('\n---\n')
+      .find((doc) => doc.includes('v1alpha1\nkind: BackupDestination\n'));
+    expect(noneDestination).not.toContain('sources:');
+
+    const refusals: [Record<string, string>, string][] = [
+      [
+        { type: 'both', 'volumeClaimTemplate.size': '1Gi', 'sources[0].workloadName': 'x' },
+        'needs destination s3 or pvc',
+      ],
+      [
+        { 'sources[0].workloadName': 'x', 'sources[0].destination': 'nfs' },
+        'destination must be s3 or pvc',
+      ],
+      [
+        { 'sources[0].workloadName': 'x', 'sources[0].destination': 'pvc' },
+        'is not rendered with type s3',
+      ],
+      [{ 'sources[0].schedule': '* * * * *' }, 'every source needs a workloadName'],
+    ];
+    for (const [values, message] of refusals) {
+      const refused = await template('di-tenant-alpha', {
+        bucket: 'b',
+        existingSecret: 's',
+        ...values,
+      });
+      expect(refused.code).not.toBe(0);
+      expect(refused.stderr).toContain(message);
+    }
   }, 30000);
 });
