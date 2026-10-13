@@ -381,6 +381,16 @@ model, not a claim of developer-proof network isolation.
   and `controller.js` requires `resources.js`, `backing-service-reconcile.js`, and
   `service-binding-reconcile.js` and `postgres.js`. There is no runtime `transpileModule` or
   PLATFORM_TS_ASSETS allowlist for these modules.
+- **Removing a tenant** from config: Pulumi updates the wasmCloud Helm release before it
+  deletes the Tenant, and the runtime operator must keep watching `di-runtime-<tenant>` to
+  release its host pods' finalizers while the controller drains the tenant (#227). So on
+  `pulumi up` the operator's `hostNamespaces` list the declared tenants plus every Tenant of
+  the installation that still exists, read with the admin `kubeconfig`. The namespace stops
+  being watched on the next `up`, after the Tenant is gone. Under either `deletionPolicy` the
+  Tenant is removed once its hosts are stopped (`Retain` keeps only the namespaces and data),
+  so a retained namespace is not watched. Previews never read the cluster and show the
+  declared tenants only. A failed Tenant list fails `up` with `Cannot list the Tenants of
+  installation <name> ... (#227): <HTTP status or error code>`.
 - Scheduler/control-plane NATS remains distinct from application messaging
   `BackingService` instances.
 - **Blobstore** services (`blobstore-nats`) run the same JetStream NATS image as messaging.

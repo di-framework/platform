@@ -1,12 +1,58 @@
 import { expect, test } from 'bun:test';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { platformValues } from '../src/values';
 import { selfSignedCert } from './support/tls';
 
 const root = join(import.meta.dir, '..');
+
+// Child-process helpers: a plain-HTTP fake Kubernetes API that lists the Tenants in $TENANTS (a JSON
+// array of names), or answers $TENANT_API_STATUS, and records every request path in `tenantHits`.
+// createPlatform lists the installation's Tenants with the provider kubeconfig on a real update
+// (#227). One fixed port keeps the kubeconfig, and so every command input, identical across runs.
+const TENANT_API_PORT = (() => {
+  const server = Bun.serve({ port: 0, fetch: () => new Response() });
+  const port = server.port;
+  server.stop(true);
+  return port;
+})();
+const TENANT_API_KUBECONFIG = [
+  'apiVersion: v1',
+  'kind: Config',
+  'current-context: c',
+  'clusters:',
+  '- name: c',
+  '  cluster:',
+  `    server: http://127.0.0.1:${TENANT_API_PORT}`,
+  '    insecure-skip-tls-verify: true',
+  'users:',
+  '- name: u',
+  '  user:',
+  '    token: admin-token',
+  'contexts:',
+  '- name: c',
+  '  context:',
+  '    cluster: c',
+  '    user: u',
+  '',
+].join('\n');
+const TENANT_API = `
+  const http = require('http');
+  const tenantHits = [];
+  const tenantApiKubeconfig = ${JSON.stringify(TENANT_API_KUBECONFIG)};
+  function startTenantApi() {
+    const server = http.createServer((req, res) => {
+      tenantHits.push(req.url);
+      res.setHeader('content-type', 'application/json');
+      res.statusCode = Number(process.env.TENANT_API_STATUS || 200);
+      if (res.statusCode !== 200) return res.end('{"kind":"Status","message":"secret detail"}');
+      res.end(JSON.stringify({ items: JSON.parse(process.env.TENANTS || '[]').map(name => ({ metadata: { name } })) }));
+    });
+    return new Promise(resolve => server.listen(${TENANT_API_PORT}, '127.0.0.1', () => { server.unref(); resolve(); }));
+  }
+`;
 
 test('administrator overrides cannot enable shared hosts or escape watched namespaces', () => {
   const defaults = {
@@ -203,6 +249,8 @@ test('an insecure install refuses a tenantHostImage that predates patch 0002', (
 }, 60_000);
 
 test('existing entrypoint derives the route pattern from a loopback HTTP endpoint', () => {
+  const kubeconfigFile = join(mkdtempSync(join(tmpdir(), 'existing-')), 'config');
+  writeFileSync(kubeconfigFile, TENANT_API_KUBECONFIG);
   const run = (config: Record<string, string>) =>
     JSON.parse(
       execFileSync(
@@ -211,9 +259,10 @@ test('existing entrypoint derives the route pattern from a loopback HTTP endpoin
           '-e',
           `
     const pulumi = require('@pulumi/pulumi');
+    ${TENANT_API}
     pulumi.runtime.setAllConfig(${JSON.stringify(
       Object.fromEntries(
-        Object.entries({ kubeconfig: join(root, 'package.json'), ...config }).map(([k, v]) => [
+        Object.entries({ kubeconfig: kubeconfigFile, ...config }).map(([k, v]) => [
           `project:${k}`,
           v,
         ]),
@@ -223,7 +272,7 @@ test('existing entrypoint derives the route pattern from a loopback HTTP endpoin
       newResource: a => ({id:a.name, state:{...a.inputs, metadata:{...a.inputs.metadata, name:a.inputs.metadata?.name ?? a.name}}}),
       call: a => a.inputs,
     }, 'project', 'test', false);
-    pulumi.runtime.runInPulumiStack(async () => require('./dist/existing').routeUrlPattern).then((pattern) => console.log(JSON.stringify(pattern ?? null))).catch(e => {console.error(e);process.exitCode=1;});
+    startTenantApi().then(() => pulumi.runtime.runInPulumiStack(async () => require('./dist/existing').routeUrlPattern)).then((pattern) => console.log(JSON.stringify(pattern ?? null))).catch(e => {console.error(e);process.exitCode=1;});
   `,
         ],
         { cwd: root, encoding: 'utf8' },
@@ -365,6 +414,104 @@ test('kubeconfigs wait on the provider kubeconfig after each User, not the ambie
   }
 }, 60_000);
 
+/**
+ * Runs createPlatform with the provider kubeconfig against the fake Tenant API, with `declared`
+ * tenants in config and `cluster` as the Tenants that exist. Returns the Helm release's
+ * operator.hostNamespaces, the API request paths and the Pulumi log, or the failure.
+ */
+function operatorNamespaces(options: {
+  declared: string[];
+  cluster?: string[];
+  dryRun?: boolean;
+  status?: number;
+}): { hits?: string[]; hostNamespaces?: string[]; failure?: string; log: string } {
+  const tenants = JSON.stringify(options.declared.map((name) => ({ name })));
+  const child = spawnSync(
+    'node',
+    [
+      '-e',
+      `
+    const pulumi = require('@pulumi/pulumi');
+    const k8s = require('@pulumi/kubernetes');
+    ${TENANT_API}
+    const resources = [];
+    pulumi.runtime.setAllConfig({ 'project:tenants': ${JSON.stringify(tenants)} });
+    pulumi.runtime.setMocks({
+      newResource: a => { resources.push(a); return {id:a.name, state:{...a.inputs, metadata:{...a.inputs.metadata, name:a.inputs.metadata?.name ?? a.name}}}; },
+      call: a => a.inputs,
+    }, 'project', 'test', ${options.dryRun === true});
+    startTenantApi().then(() => pulumi.runtime.runInPulumiStack(async () => {
+      const platform = require('./dist').createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', kubeconfig: pulumi.secret(tenantApiKubeconfig) });
+      await platform.release.urn.promise();
+    })).then(() => {
+      const release = resources.find(r => r.type === 'kubernetes:helm.sh/v3:Release');
+      console.log(JSON.stringify({ hits: tenantHits, hostNamespaces: release.inputs.values.operator.hostNamespaces }));
+    }).catch(e => { console.error(e.message); process.exitCode = 1; });
+  `,
+    ],
+    {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        TENANTS: JSON.stringify(options.cluster ?? []),
+        TENANT_API_STATUS: String(options.status ?? 200),
+      },
+    },
+  );
+  // Pulumi logs info to stdout and warnings and errors to stderr when no engine is attached.
+  const log = `${child.stdout}${child.stderr}`;
+  if (child.status !== 0) return { failure: child.stderr, log };
+  return {
+    ...(JSON.parse(child.stdout.trim().split('\n').at(-1) as string) as {
+      hits: string[];
+      hostNamespaces: string[];
+    }),
+    log,
+  };
+}
+
+test('removing a tenant keeps its runtime namespace watched until its Tenant is gone (#227)', () => {
+  // The up that drops beta from config: Pulumi updates the release before it deletes the Tenant,
+  // so the operator must still watch di-runtime-beta to release its host pods' finalizers.
+  const removing = operatorNamespaces({ declared: ['alpha'], cluster: ['alpha', 'beta'] });
+  expect(removing.failure).toBeUndefined();
+  expect(removing.hostNamespaces).toEqual(['wasmcloud', 'di-runtime-alpha', 'di-runtime-beta']);
+  // Read through tenancy/removal's lister (the #228 Retain check may list Tenants as well).
+  expect(removing.hits).toContain(
+    '/apis/platform.di-framework.dev/v1alpha1/tenants?labelSelector=platform.di-framework.dev%2Finstallation%3Ddi-test',
+  );
+  expect(removing.log).toContain('Tenant beta is no longer declared but still exists');
+  // The next up, after the Tenant is gone: the namespace stops being watched.
+  const removed = operatorNamespaces({ declared: ['alpha'], cluster: ['alpha'] });
+  expect(removed.hostNamespaces).toEqual(['wasmcloud', 'di-runtime-alpha']);
+  expect(removed.log).not.toContain('no longer declared');
+}, 60_000);
+
+test('preview computes watched namespaces from config, not from the cluster', () => {
+  const preview = operatorNamespaces({
+    declared: ['alpha'],
+    cluster: ['alpha', 'beta'],
+    dryRun: true,
+  });
+  expect(preview.failure).toBeUndefined();
+  // The cluster still lists beta, yet preview watches the declared tenants only: the list is not
+  // read for hostNamespaces (the unit test proves the lister is never called in preview). The
+  // #228 Retain check is separate and may still read the cluster in preview.
+  expect(preview.hostNamespaces).toEqual(['wasmcloud', 'di-runtime-alpha']);
+  expect(preview.log).toContain(
+    'stops being watched on the next up, after the Tenant is gone (#227)',
+  );
+}, 60_000);
+
+test('an unreadable Tenant list fails the update with a clear message, not a shrunk list', () => {
+  const failed = operatorNamespaces({ declared: ['alpha'], cluster: ['beta'], status: 403 });
+  expect(failed.failure).toContain(
+    "Cannot list the Tenants of installation di-test, which keep a removed tenant's runtime namespace watched by the wasmCloud operator until the Tenant is deleted (#227): HTTP 403",
+  );
+  expect(failed.failure).not.toContain('secret detail');
+}, 60_000);
+
 test('local entrypoint retains existing logical names and guarded Docker cleanup', () => {
   const local = readFileSync(join(root, 'src/local.ts'), 'utf8');
   expect(local).toContain('createPlatform({');
@@ -386,13 +533,14 @@ function localResources(config: Record<string, string> = {}) {
       '-e',
       `
     const pulumi = require('@pulumi/pulumi');
+    ${TENANT_API}
     const resources = [];
     pulumi.runtime.setAllConfig(${JSON.stringify(config)});
     pulumi.runtime.setMocks({
-      newResource: a => { resources.push(a); return {id:a.name, state:{...a.inputs, stdout:'test-kubeconfig', metadata:{...a.inputs.metadata, name:a.inputs.metadata?.name ?? a.name}}}; },
+      newResource: a => { resources.push(a); return {id:a.name, state:{...a.inputs, stdout:tenantApiKubeconfig, metadata:{...a.inputs.metadata, name:a.inputs.metadata?.name ?? a.name}}}; },
       call: a => a.inputs,
     }, 'project', 'test', false);
-    pulumi.runtime.runInPulumiStack(() => require('./dist/local')).then(async () => { await pulumi.runtime.disconnect(); console.log(JSON.stringify(resources)); }).catch(e => {console.error(e);process.exitCode=1;});
+    startTenantApi().then(() => pulumi.runtime.runInPulumiStack(() => require('./dist/local'))).then(async () => { await pulumi.runtime.disconnect(); console.log(JSON.stringify(resources)); }).catch(e => {console.error(e);process.exitCode=1;});
   `,
     ],
     { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
