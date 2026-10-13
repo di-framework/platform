@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { deployBundle } from '@di-framework/tenant-cli/tests/support/deploy-bundle.ts';
+import type { Socket } from 'bun';
 // Pinned to the platform's log projection, which keys logs by these labels (platform#103).
 import {
   APPLICATION,
@@ -889,23 +890,10 @@ describe('/v1/deploy', () => {
     }
   });
 
-  test.each([
-    ['a non-JSON 2xx body', () => new Response('not json', { status: 200 })],
-    [
-      'a connection reset mid-body',
-      () =>
-        new Response(
-          new ReadableStream({
-            start(controller) {
-              controller.enqueue(new TextEncoder().encode('{"kind":'));
-              controller.error(new Error('reset'));
-            },
-          }),
-          { status: 200, headers: { 'content-type': 'application/json' } },
-        ),
-    ],
-  ])('an apply response that cannot be read (%s) is a 502', async (_name, respond) => {
-    rawPatch = respond;
+  // A connection reset mid-body is covered against a raw socket below: erroring a `ReadableStream`
+  // inside `Bun.serve` makes Bun log the stream error to stderr (platform#248).
+  test('an apply response that cannot be read (a non-JSON 2xx body) is a 502', async () => {
+    rawPatch = () => new Response('not json', { status: 200 });
     const response = await post('/v1/deploy', deployBundle({ bindings: [] }));
     expect(response.status).toBe(502);
     expect(await response.json()).toMatchObject({ status: 502 });
@@ -1652,7 +1640,17 @@ describe('/v1/deploy', () => {
 });
 
 describe('/v1/deploy against an unreachable API server', () => {
-  test('a network failure on apply is a 502', async () => {
+  test.each([
+    ['the socket drops before a response', (socket: Socket) => void socket.end()],
+    [
+      // Promises 64 bytes, sends 8 and closes: the body read fails as on a connection reset.
+      'a connection reset mid-body',
+      (socket: Socket) =>
+        void socket.end(
+          'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 64\r\nconnection: close\r\n\r\n{"kind":',
+        ),
+    ],
+  ])('a network failure on apply (%s) is a 502', async (_name, onPatch) => {
     const tokens = serve(() =>
       json({
         status: { token: 't', expirationTimestamp: new Date(Date.now() + 3_600_000).toISOString() },
@@ -1667,7 +1665,7 @@ describe('/v1/deploy against an unreachable API server', () => {
       socket: {
         data(socket, data) {
           const head = data.toString();
-          if (head.startsWith('PATCH ')) return void socket.end();
+          if (head.startsWith('PATCH ')) return onPatch(socket);
           // History lists find no revisions, and the revision reservation succeeds.
           if (head.startsWith('POST ') || head.includes('labelSelector='))
             return void socket.end(
@@ -1701,6 +1699,7 @@ describe('/v1/deploy against an unreachable API server', () => {
         }),
       );
       expect(response.status).toBe(502);
+      expect(await response.json()).toMatchObject({ status: 502 });
     } finally {
       log.mockRestore();
       tokens.stop();

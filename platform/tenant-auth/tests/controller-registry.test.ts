@@ -329,15 +329,6 @@ describe('registry front limits', () => {
             },
           }),
         );
-      if (pathname === '/broken')
-        return new Response(
-          new ReadableStream({
-            start(c) {
-              c.enqueue(new TextEncoder().encode('partial'));
-              setTimeout(() => c.error(new Error('upstream secret detail')), 20);
-            },
-          }),
-        );
       if (request.method === 'HEAD') return new Response(null, { status: 200 });
       return new Response(`ok ${await request.text()}`);
     },
@@ -466,8 +457,29 @@ describe('registry front limits', () => {
   });
 
   test('a failed upstream body ends the client response and frees the slot', async () => {
-    const response = await call('/broken');
-    await expect(response.text()).rejects.toBeDefined();
+    // A raw socket, not `Bun.serve`: it promises 64 bytes, sends 7 and closes the connection, so
+    // the body fails mid-stream as a connection reset would. Erroring a `ReadableStream` inside
+    // `Bun.serve` instead makes Bun log the stream error to stderr (platform#248).
+    const broken = Bun.listen({
+      hostname: '127.0.0.1',
+      port: 0,
+      socket: {
+        data(socket) {
+          socket.write('HTTP/1.1 200 OK\r\ncontent-length: 64\r\n\r\npartial');
+          setTimeout(() => socket.end(), 20);
+        },
+      },
+    });
+    const upstream = controller.proxyUpstream;
+    controller.proxyUpstream = () => `http://127.0.0.1:${broken.port}`;
+    try {
+      const response = await call('/v2/app/blobs/sha256:broken');
+      expect(response.status).toBe(200);
+      await expect(response.text()).rejects.toBeDefined();
+    } finally {
+      controller.proxyUpstream = upstream;
+      broken.stop(true);
+    }
     await Bun.sleep(50);
     await free();
   });
