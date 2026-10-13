@@ -275,8 +275,10 @@ describe('Controller.start', () => {
         TENANT_CONTROLLER_ISSUER: issuer.url,
       }),
     );
+    // Discovery happens in the background; give it a moment to complete
+    await new Promise((resolve) => setTimeout(resolve, 100));
     expect(controller.kube.server).toBe('https://k8s.test');
-    expect(controller.provider.issuer).toBe(issuer.url);
+    expect(controller.provider?.issuer).toBe(issuer.url);
     expect(controller.keys).toMatchObject({ namespace: 'di-runtime-acme', tenant: 'acme' });
     expect(controller.identity.tenant).toBe('acme');
   });

@@ -34,20 +34,26 @@ export function servedController(options: {
 }): ServedController {
   const api = serve(options.api ?? (() => json({})));
   const kube = new KubeClient({ server: api.url, token: 'admin' }, 'wasmcloud');
+  const provider = { issuer: 'https://issuer.test' } as never;
+  const mockIdentityResolver = {
+    resolve: async (authorization: string | null) => {
+      const bearer = authorization?.replace(/^Bearer /, '');
+      if (bearer && Object.hasOwn(options.principals, bearer)) return options.principals[bearer];
+      throw new AuthError(401, 'a bearer token is required');
+    },
+    forget: () => {},
+    setProvider: () => {}, // No-op for tests
+  } as never;
   const controller = new Controller(
     configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme', ...options.env }),
     kube,
-    { issuer: 'https://issuer.test' } as never,
-    {
-      resolve: async (authorization: string | null) => {
-        const bearer = authorization?.replace(/^Bearer /, '');
-        if (bearer && Object.hasOwn(options.principals, bearer)) return options.principals[bearer];
-        throw new AuthError(401, 'a bearer token is required');
-      },
-      forget: () => {},
-    } as never,
+    provider,
+    mockIdentityResolver,
     { kube, namespace: 'di-runtime-acme', tenant: 'acme' },
   );
+  // Manually set discovery state to complete for tests
+  (controller as any).discoveryState = { status: 'complete', provider };
+
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: (r) => controller.handle(r) });
   const served = { api, base: `http://127.0.0.1:${server.port}` } as ServedController;
   beforeAll(() => {
