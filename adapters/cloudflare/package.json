@@ -42,7 +42,7 @@
     }
   },
   "peerDependencies": {
-    "@di-framework/core": "^5",
+    "@di-framework/core": "^6",
     "typescript": "^5"
   },
   "files": [
@@ -52,7 +52,7 @@
     "LICENSE-APACHE"
   ],
   "devDependencies": {
-    "@di-framework/core": "^5",
+    "@di-framework/core": "^6",
     "@types/bun": "latest"
   }
 }

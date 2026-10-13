@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import ts from 'typescript';
+import ts from '@typescript/typescript6';
 
 /** Add Node ESM extensions to emitted files while keeping source imports extensionless. */
 export function fixEsmImports(directory: string): void {

@@ -21,8 +21,7 @@
     "noUncheckedIndexedAccess": true,
     "noUnusedLocals": false,
     "noUnusedParameters": false,
-    "noPropertyAccessFromIndexSignature": false,
-    "baseUrl": "."
+    "noPropertyAccessFromIndexSignature": false
   },
   "include": ["**/*.ts"],
   "exclude": [
