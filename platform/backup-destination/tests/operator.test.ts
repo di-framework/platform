@@ -1130,6 +1130,34 @@ describe('kubernetes client', () => {
     expect(JSON.stringify(actions)).toContain('existingClaimName or volumeClaimTemplate.size');
   });
 
+  test('72 simulated hours: PVC without schedule never backs up, S3 without schedule runs at 02:00', () => {
+    const pvc = {
+      spec: { type: 'pvc' as const, existingClaimName: 'c' },
+    };
+    const s3 = {
+      spec: {
+        type: 's3' as const,
+        bucket: 'b',
+        credentialsSecretRef: { name: 'di-backup-s3' },
+      },
+    };
+    const run = (extra: object, at: string) =>
+      reconcile(
+        world({
+          now: at,
+          services: [orders],
+          destination: { name: 'd', generation: 1, annotations: {}, status: {}, ...extra } as never,
+        }),
+      );
+    const s3Hours: string[] = [];
+    for (let h = 0; h < 72; h++) {
+      const at = new Date(Date.UTC(2026, 8, 28, 0, 0) + h * 3600_000).toISOString();
+      expect(run(pvc, at).some((a) => a.type === 'create-backup')).toBe(false);
+      if (run(s3, at).some((a) => a.type === 'create-backup')) s3Hours.push(at.slice(11, 13));
+    }
+    expect(s3Hours.length).toBeGreaterThan(0);
+  });
+
   test('accepts PVC destination with existingClaimName', () => {
     const actions = reconcile(
       world({

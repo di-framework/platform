@@ -529,10 +529,12 @@ export function reconcile(world: World): Action[] {
     );
     return actions;
   }
-  const schedule = dest.spec.schedule || SCHEDULE;
+  // Only S3 destinations fall back to the default schedule (main's behavior for existing
+  // objects). A PVC destination without a schedule only takes on-demand backups.
+  const schedule = dest.spec.schedule || (destinationType(dest.spec) === 's3' ? SCHEDULE : '');
   const forced = dest.annotations[BACKUP_NOW];
   const due =
-    isDue(schedule, status.lastAttemptTime, new Date(world.now)) ||
+    (!!schedule && isDue(schedule, status.lastAttemptTime, new Date(world.now))) ||
     (!!forced && (!status.lastAttemptTime || forced > status.lastAttemptTime));
   const services = enrolled(world);
   if (due) status = { ...status, lastAttemptTime: world.now, skipped: 0 };

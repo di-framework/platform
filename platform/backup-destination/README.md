@@ -14,7 +14,7 @@ The operator pod serves an HTML console on `di-backup-console:8080` and creates 
 
 ## Destinations
 
-`type` picks where backups go: `s3` (the default), `pvc`, or `both`. Each destination is its own `BackupDestination` with its own status; the chart gives them the same `schedule` and retention. With `both`, `default` is the S3 destination and `pvc` the claim. Agent Jobs run one at a time across all destinations. Every destination writes the same layout: `<prefix>/<service>/<uid>/<UTC stamp>/` with the data and `manifest.json` (the sha256 is in the manifest and the Backup status), and retention deletes from either kind the same way. A restore reads from the destination that holds the source backup.
+`type` picks where backups go: `s3` (the default), `pvc`, or `both`. Each destination is its own `BackupDestination` with its own status; they share retention. `schedule` applies to an S3 destination (default `0 2 * * *`) and to a PVC destination only when set; a PVC destination without a schedule never runs scheduled backups and only takes on-demand ones (backup-now annotation). With `both`, `default` is the S3 destination and `pvc` the claim. Agent Jobs run one at a time across all destinations. Every destination writes the same layout: `<prefix>/<service>/<uid>/<UTC stamp>/` with the data and `manifest.json` (the sha256 is in the manifest and the Backup status), and retention deletes from either kind the same way. A restore reads from the destination that holds the source backup.
 
 ### S3
 

@@ -4,7 +4,8 @@ image:
   pullPolicy: IfNotPresent
 agentImage: di-framework/backup-agent:dev
 # s3, pvc, or both. With both, BackupDestination default is S3 and BackupDestination pvc is the
-# claim; each runs on the same schedule and retention below.
+# claim; both use the retention below. The schedule applies to S3 (default 0 2 * * *) and to PVC
+# only when set: a PVC destination without a schedule takes on-demand backups only.
 type: s3
 bucket: ""
 prefix: ""

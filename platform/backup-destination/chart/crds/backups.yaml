@@ -44,6 +44,8 @@ spec:
                   x-kubernetes-validations:
                     - rule: "!self.split('/').exists(p, p == '..' || p == '.')"
                       message: prefix must not contain . or .. segments
+                    - rule: "self == '' || self.split('/').exists(p, p != '')"
+                      message: prefix must contain a non-empty segment
                     - rule: '!oldSelf.hasValue() || oldSelf.value() == '''' || self == oldSelf.value()'
                       message: prefix is immutable once set
                       optionalOldSelf: true

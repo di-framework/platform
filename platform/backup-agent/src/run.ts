@@ -500,8 +500,14 @@ const STALE_MINUTES = '1440';
  * `<service>/<uid>/<stamp>/<file>` depth. It never follows symlinks and skips `lost+found`.
  */
 const SWEEP_SCRIPT = `
-root="$1"; minutes="$2"
+root="$1"; minutes="$2"; mount="$3"
 [ -d "$root" ] && [ ! -L "$root" ] || exit 0
+# Refuse the claim root itself, and any root that resolves outside the mount (symlinked segment).
+real=$(cd "$root" 2>/dev/null && pwd -P) || exit 0
+base=$(cd "$mount" 2>/dev/null && pwd -P) || exit 0
+[ "$real" != "$base" ] || exit 0
+case "$real" in "$base"/*) ;; *) exit 0 ;; esac
+root="$real"
 find "$root" -mindepth 4 -maxdepth 4 -type f ! -path "$root/lost+found/*" -mmin +"$minutes" |
 while IFS= read -r f; do
   case "$f" in
@@ -518,15 +524,16 @@ export async function sweepPvc(
   prefixes: Iterable<string>,
 ): Promise<void> {
   for (const prefix of prefixes) {
-    const root = prefix ? `${mount}/${prefix}` : mount;
-    await io.exec(['sh', '-c', SWEEP_SCRIPT, 'sweep', root, STALE_MINUTES]);
+    const clean = prefix.split('/').filter(Boolean).join('/');
+    if (!clean) continue; // never sweep the claim root
+    await io.exec(['sh', '-c', SWEEP_SCRIPT, 'sweep', `${mount}/${clean}`, STALE_MINUTES, mount]);
   }
 }
 
 /** A key is `<prefix>/<service>/<uid>/<stamp>/<file>`; the prefix is what remains after those 4. */
 function keyPrefix(key: string): string | undefined {
   const parts = key.split('/');
-  return parts.length >= 4 ? parts.slice(0, -4).join('/') : undefined;
+  return parts.length >= 4 ? parts.slice(0, -4).filter(Boolean).join('/') : undefined;
 }
 
 async function gcPvc(io: AgentIo, request: AgentRequest): Promise<number> {

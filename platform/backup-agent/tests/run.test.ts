@@ -658,4 +658,40 @@ describe('sweepPvc on a real tree', () => {
       expect(await exists(kept)).toBe(true);
     await rm(mount, { recursive: true, force: true });
   });
+
+  test('refuses the claim root and symlinked prefixes', async () => {
+    const { mkdir, symlink, utimes, stat } = await import('node:fs/promises');
+    const mount = await mkdtemp(join(tmpdir(), 'sweep-'));
+    const outside = await mkdtemp(join(tmpdir(), 'outside-'));
+    const old = new Date(Date.now() - 3 * 86400_000);
+    const put = async (base: string, path: string) => {
+      const full = join(base, path);
+      await mkdir(join(full, '..'), { recursive: true });
+      await writeFile(full, 'x');
+      await utimes(full, old, old);
+    };
+    await put(mount, 'a/b/c/d/data.dump'); // would match from the claim root
+    await put(outside, 'a/b/c/data.dump');
+    await put(outside, 'x/a/b/c/data.dump');
+    await symlink(outside, join(mount, 'bk'));
+    await mkdir(join(mount, 'mid'), { recursive: true });
+    await symlink(outside, join(mount, 'mid/link'));
+    const io = {
+      async exec(argv: string[]) {
+        const proc = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe' });
+        return { code: await proc.exited, stdout: '', stderr: '' };
+      },
+    } as AgentIo;
+    await sweepPvc(io, mount, ['/', '', 'bk/', 'mid/link', 'mid/link/x']);
+    const exists = (p: string) =>
+      stat(p).then(
+        () => true,
+        () => false,
+      );
+    expect(await exists(join(mount, 'a/b/c/d/data.dump'))).toBe(true);
+    expect(await exists(join(outside, 'a/b/c/data.dump'))).toBe(true);
+    expect(await exists(join(outside, 'x/a/b/c/data.dump'))).toBe(true);
+    await rm(mount, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  });
 });
