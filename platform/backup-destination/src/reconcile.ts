@@ -6,13 +6,18 @@ import {
   type DestinationStatus,
   type DestinationView,
   DUMP_CAP_BYTES,
+  destinationType,
+  type Egress,
   endpointAllowed,
   GROUP,
   type JobView,
   jobName,
+  PVC_CLAIM,
+  PVC_MOUNT,
   parseBytes,
   postgresConnectionSecret,
   type RestoreView,
+  RUNTIME_SECRET,
   SCHEDULE,
   type ServiceStatus,
   type ServiceView,
@@ -43,6 +48,7 @@ function resultOf(message: string | undefined): Result | undefined {
 }
 
 function condition(
+  name: string,
   status: DestinationStatus,
   reason: string,
   message: string,
@@ -50,6 +56,7 @@ function condition(
 ): Action {
   return {
     type: 'destination-status',
+    name,
     status: {
       ...status,
       conditions: [
@@ -126,7 +133,7 @@ export function jobBody(input: {
   const kind = input.agentKind;
   const storage = input.storage ?? service?.storage ?? '1Gi';
   const dest = input.world.destination;
-  const destType = dest?.spec.type ?? 's3';
+  const destType = destinationType(dest?.spec);
   const env: { name: string; value?: string; valueFrom?: unknown }[] = [
     { name: 'BACKUP_KIND', value: kind },
     { name: 'BACKUP_BUCKET', value: dest?.spec.bucket ?? '' },
@@ -136,7 +143,7 @@ export function jobBody(input: {
     { name: 'BACKUP_DESTINATION_TYPE', value: destType },
   ];
   if (destType === 'pvc') {
-    env.push({ name: 'BACKUP_PVC_MOUNT_PATH', value: '/backup-pvc' });
+    env.push({ name: 'BACKUP_PVC_MOUNT_PATH', value: PVC_MOUNT });
   }
   if (dest?.spec.endpoint) {
     env.push({ name: 'BACKUP_ENDPOINT', value: dest.spec.endpoint });
@@ -168,6 +175,7 @@ export function jobBody(input: {
     [`${GROUP}/backup-kind`]: input.backupKind,
     ...(service ? { [`${GROUP}/service`]: service.name } : {}),
     ...(input.backupName ? { [`${GROUP}/backup-name`]: input.backupName } : {}),
+    ...(dest ? { [`${GROUP}/destination`]: dest.name } : {}),
   };
   return {
     apiVersion: 'batch/v1',
@@ -192,11 +200,10 @@ export function jobBody(input: {
               name: 'backup-agent',
               image: input.world.agentImage,
               env,
-              envFrom: [
-                {
-                  secretRef: { name: 'di-backup-destination', optional: false },
-                },
-              ],
+              // Only S3 has credentials. A PVC destination never creates the runtime Secret.
+              ...(destType === 's3'
+                ? { envFrom: [{ secretRef: { name: RUNTIME_SECRET, optional: false } }] }
+                : {}),
               resources: {
                 requests: { cpu: '50m', memory: '64Mi', 'ephemeral-storage': storage },
                 limits: { cpu: '100m', memory: '128Mi' },
@@ -205,7 +212,7 @@ export function jobBody(input: {
               terminationMessagePolicy: 'File',
               volumeMounts: [
                 { name: 'scratch', mountPath: '/tmp' },
-                ...(destType === 'pvc' ? [{ name: 'backup-pvc', mountPath: '/backup-pvc' }] : []),
+                ...(destType === 'pvc' ? [{ name: 'backup-pvc', mountPath: PVC_MOUNT }] : []),
               ],
             },
           ],
@@ -216,7 +223,7 @@ export function jobBody(input: {
                   {
                     name: 'backup-pvc',
                     persistentVolumeClaim: {
-                      claimName: dest?.spec.existingClaimName || 'di-backup-pvc',
+                      claimName: dest?.spec.existingClaimName || PVC_CLAIM,
                     },
                   },
                 ]
@@ -399,27 +406,54 @@ export function reconcile(world: World): Action[] {
     services: [...(dest.status.services ?? [])],
   };
   if (dest.spec.suspend) {
-    actions.push(condition(status, 'TenantSuspended', 'Tenant backups are suspended', false));
+    actions.push(
+      condition(dest.name, status, 'TenantSuspended', 'Tenant backups are suspended', false),
+    );
     return actions;
   }
   if (!endpointAllowed(dest.spec.endpoint)) {
     actions.push(
-      condition(status, 'EndpointRejected', 'Endpoint must be HTTPS or cluster-local HTTP', false),
+      condition(
+        dest.name,
+        status,
+        'EndpointRejected',
+        'Endpoint must be HTTPS or cluster-local HTTP',
+        false,
+      ),
     );
     return actions;
   }
-  if (dest.spec.type === 's3') {
+  if (destinationType(dest.spec) === 's3') {
+    if (world.s3Owner && world.s3Owner !== dest.name) {
+      actions.push(
+        condition(
+          dest.name,
+          status,
+          'ConfigInvalid',
+          `Only one S3 destination per tenant: ${world.s3Owner} holds the runtime credentials`,
+          false,
+        ),
+      );
+      return actions;
+    }
+    if (!dest.spec.bucket) {
+      actions.push(condition(dest.name, status, 'ConfigInvalid', 'S3 bucket is missing', false));
+      return actions;
+    }
     const secretName = dest.spec.credentialsSecretRef?.name ?? '';
     const keys = new Set(world.credentialKeys);
     if (!secretName || !keys.has('AWS_ACCESS_KEY_ID') || !keys.has('AWS_SECRET_ACCESS_KEY')) {
-      actions.push(condition(status, 'CredentialsInvalid', 'S3 credentials are missing', false));
+      actions.push(
+        condition(dest.name, status, 'CredentialsInvalid', 'S3 credentials are missing', false),
+      );
       return actions;
     }
     if (!world.runtimeSecretPresent) actions.push({ type: 'copy-credentials', secretName });
-  } else if (dest.spec.type === 'pvc') {
+  } else {
     if (!dest.spec.existingClaimName && !dest.spec.volumeClaimTemplate?.size) {
       actions.push(
         condition(
+          dest.name,
           status,
           'ConfigInvalid',
           'PVC destination must have existingClaimName or volumeClaimTemplate.size',
@@ -429,19 +463,21 @@ export function reconcile(world: World): Action[] {
       return actions;
     }
   }
-  const wanted = dest.spec.extraEgress ?? [];
+  const wanted = world.wantedEgress ?? dest.spec.extraEgress ?? [];
   if (JSON.stringify(world.networkEgress) !== JSON.stringify(wanted)) {
     actions.push({ type: 'sync-egress', extraEgress: wanted });
   }
   observe(world, actions);
-  if (world.jobs.some((job) => job.phase === 'Running')) {
-    actions.push(condition(status, 'BackupInProgress', 'A backup job is running', true));
+  if (world.busy || world.jobs.some((job) => job.phase === 'Running')) {
+    actions.push(condition(dest.name, status, 'BackupInProgress', 'A backup job is running', true));
     return actions;
   }
   const restore = activeRestore(world);
   if (restore && !actions.some((action) => action.type === 'restore-status')) {
     restoreActions(world, restore, actions);
-    actions.push(condition(status, 'RestoreInProgress', `Restoring ${restore.name}`, true));
+    actions.push(
+      condition(dest.name, status, 'RestoreInProgress', `Restoring ${restore.name}`, true),
+    );
     return actions;
   }
   const keep = dest.spec.retention?.successful ?? 14;
@@ -472,7 +508,9 @@ export function reconcile(world: World): Action[] {
         storage: '256Mi',
       }),
     });
-    actions.push(condition(status, 'RetentionInProgress', 'Deleting expired backups', true));
+    actions.push(
+      condition(dest.name, status, 'RetentionInProgress', 'Deleting expired backups', true),
+    );
     return actions;
   }
   const schedule = dest.spec.schedule || SCHEDULE;
@@ -579,13 +617,83 @@ export function reconcile(world: World): Action[] {
   const reason = pending.length > 0 ? 'BackupInProgress' : 'DestinationReady';
   actions.push(
     condition(
+      dest.name,
       status,
       reason,
       reason === 'DestinationReady'
-        ? 'Credentials copied'
+        ? destinationType(dest.spec) === 's3'
+          ? 'Credentials copied'
+          : 'Claim configured'
         : `Backing up ${next?.name ?? 'services'}`,
       true,
     ),
   );
+  return actions;
+}
+
+function unionEgress(destinations: DestinationView[]): Egress[] {
+  const seen = new Set<string>();
+  const union: Egress[] = [];
+  for (const rule of destinations.flatMap((item) => item.spec.extraEgress ?? [])) {
+    const key = `${rule.cidr}|${rule.port}|${rule.protocol}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    union.push(rule);
+  }
+  return union;
+}
+
+/** Jobs from before #233 carry no destination label: attribute them through their backup. */
+function jobOwner(job: JobView, world: World, owner: (backup: string) => string | undefined) {
+  if (job.destinationName) return job.destinationName;
+  if (job.backupKind === 'gc') return job.gcBackups?.map(owner).find(Boolean);
+  if (job.backupKind === 'dump') return job.backupName ? owner(job.backupName) : undefined;
+  const restore = world.restores.find((item) => item.name === job.backupName);
+  return restore ? owner(restore.sourceBackupName) : undefined;
+}
+
+/**
+ * Reconcile every BackupDestination in the tenant (#233: S3, PVC, or both). Each one keeps its
+ * own schedule, retention, and status. Agent Jobs stay one at a time across all of them, the
+ * agent NetworkPolicy gets the union of their extraEgress, and only one S3 destination may
+ * exist because the runtime credentials Secret is a single object.
+ */
+export function reconcileAll(world: World): Action[] {
+  const destinations = world.destinations ?? (world.destination ? [world.destination] : []);
+  const first = destinations[0]?.name;
+  const known = new Set(destinations.map((item) => item.name));
+  const owner = (name: string): string | undefined => {
+    const backup = world.backups.find((item) => item.name === name);
+    if (!backup) return undefined;
+    return known.has(backup.destinationName) ? backup.destinationName : first;
+  };
+  const s3Owner = destinations.find((item) => destinationType(item.spec) === 's3')?.name;
+  const wantedEgress = unionEgress(destinations);
+  const actions: Action[] = [];
+  let started = false;
+  for (const dest of destinations) {
+    const backups = world.backups.filter((item) => owner(item.name) === dest.name);
+    const restores = world.restores.filter(
+      (item) => (owner(item.sourceBackupName) ?? first) === dest.name,
+    );
+    const jobs = world.jobs.filter((job) => (jobOwner(job, world, owner) ?? first) === dest.name);
+    const elsewhere = world.jobs.some((job) => job.phase === 'Running' && !jobs.includes(job));
+    const next = reconcile({
+      ...world,
+      destination: dest,
+      backups,
+      restores,
+      jobs,
+      busy: started || elsewhere,
+      wantedEgress,
+      s3Owner,
+    });
+    for (const action of next) {
+      if (action.type === 'sync-egress' && actions.some((item) => item.type === 'sync-egress'))
+        continue;
+      if (action.type === 'create-job') started = true;
+      actions.push(action);
+    }
+  }
   return actions;
 }

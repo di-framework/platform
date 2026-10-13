@@ -12,18 +12,18 @@ The operator pod serves an HTML console on `di-backup-console:8080` and creates 
 
 `existingSecret` selects a Secret you create. `accessKeyId` and `secretAccessKey` render Secret `di-backup-s3` and are only for a private demo; those values stay in Helm release history.
 
-## Backup Destinations
+## Destinations
 
-Backups can be stored in S3 or to a PersistentVolumeClaim (PVC).
+`type` picks where backups go: `s3` (the default), `pvc`, or `both`. Each destination is its own `BackupDestination` with its own status; the chart gives them the same `schedule` and retention. With `both`, `default` is the S3 destination and `pvc` the claim. Agent Jobs run one at a time across all destinations. Every destination writes the same layout: `<prefix>/<service>/<uid>/<UTC stamp>/` with the data and `manifest.json` (the sha256 is in the manifest and the Backup status), and retention deletes from either kind the same way. A restore reads from the destination that holds the source backup.
 
-### S3 Destinations (recommended)
+### S3
 
-S3 is the recommended destination. It provides durability, geographic distribution, and protection against node loss. Configure with `existingSecret` or the demo credentials above.
+Configure `bucket` plus `existingSecret`, or the demo credentials above. The operator copies the keys into Secret `di-backup-destination` in `di-runtime-<name>`, so a tenant can have only one S3 destination.
 
-### PVC Destinations
+### PVC
 
-PVCs can be used as local backup destinations via `existingClaimName` (reference an existing PVC) or `volumeClaimTemplate` (create a new PVC with a storageClass and size). The backup agent mounts the PVC and writes data with the same directory layout as S3.
+Set `existingClaimName` to a claim that already exists in `di-runtime-<name>` (agent Jobs run there and a pod can only mount a claim in its own namespace), or `volumeClaimTemplate.size` (and optionally `storageClassName`) for the chart to create claim `di-backup-pvc` there. The chart creates that claim with `helm.sh/resource-policy: keep`, so uninstalling the release leaves the claim and its backups in place; delete it yourself when you no longer need them. A PVC destination needs no credentials and no egress.
 
-**Node loss risk:** PVCs are bound to specific nodes. If a node is lost, backups stored on that node's PVC become inaccessible unless the storage is replicated or durable across zones. For production workloads that require durable backups, use S3 instead.
+**A PVC on the same node or VM as the data does not protect against losing that node.** With a node-local storage class such as `local-path`, the backups live on the same disk as the BackingService data. Use it for fast local restores, and add an S3 destination (`type: both`) for an off-host copy.
 
 The packages stay private. Image tags `di-framework/backup-destination:dev` and `di-framework/backup-agent:dev` are imported into Kubesolo (`imagePullPolicy: Never`), not published to GHCR.

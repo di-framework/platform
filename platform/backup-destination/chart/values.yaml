@@ -3,16 +3,21 @@ image:
   tag: dev
   pullPolicy: IfNotPresent
 agentImage: di-framework/backup-agent:dev
+# s3, pvc, or both. With both, BackupDestination default is S3 and BackupDestination pvc is the
+# claim; each runs on the same schedule and retention below.
 type: s3
 bucket: ""
 prefix: ""
 region: us-east-1
 endpoint: ""
+# UTC cron for BackingService dumps. Empty leaves the operator default, 0 2 * * *.
 schedule: ""
 retentionSuccessful: 14
 existingSecret: ""
 accessKeyId: ""
 secretAccessKey: ""
+# PVC destination: an existing claim in di-runtime-<tenant>, or a size (and optional storage
+# class) for the chart to create claim di-backup-pvc there. A created claim survives uninstall.
 existingClaimName: ""
 volumeClaimTemplate:
   storageClassName: ""

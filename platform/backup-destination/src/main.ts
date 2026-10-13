@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { handle } from './console.ts';
 import { applyActions, type KubeClient, loadWorld } from './kube.ts';
 import { runtimeNamespaceFor } from './model.ts';
-import { reconcile } from './reconcile.ts';
+import { reconcileAll } from './reconcile.ts';
 
 const serviceAccountCa = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt';
 const clusterCa = existsSync(serviceAccountCa) ? readFileSync(serviceAccountCa, 'utf8') : undefined;
@@ -52,7 +52,7 @@ const client = clusterClient();
 
 async function tick(): Promise<void> {
   const world = await loadWorld(client, tenantNamespace, agentImage, new Date().toISOString());
-  await applyActions(client, world, reconcile(world));
+  await applyActions(client, world, reconcileAll(world));
 }
 
 Bun.serve({

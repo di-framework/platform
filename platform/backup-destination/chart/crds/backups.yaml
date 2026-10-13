@@ -23,11 +23,19 @@ spec:
           properties:
             spec:
               type: object
-              required: [type]
+              x-kubernetes-validations:
+                - rule: "self.type != 's3' || (has(self.bucket) && has(self.credentialsSecretRef) && has(self.credentialsSecretRef.name))"
+                  message: an s3 destination needs bucket and credentialsSecretRef.name
+                - rule: "self.type != 'pvc' || has(self.existingClaimName) || (has(self.volumeClaimTemplate) && has(self.volumeClaimTemplate.size))"
+                  message: a pvc destination needs existingClaimName or volumeClaimTemplate.size
+                - rule: "self.type == oldSelf.type"
+                  message: type is immutable; create another BackupDestination instead
               properties:
                 type:
                   type: string
                   enum: ['s3', 'pvc']
+                  # Destinations created before #233 have no type; they are S3.
+                  default: s3
                 bucket: { type: string, minLength: 1 }
                 prefix:
                   type: string
@@ -45,12 +53,14 @@ spec:
                   type: object
                   properties:
                     name: { type: string, minLength: 1 }
+                # A claim in the runtime namespace (di-runtime-<tenant>), where agent Jobs run.
                 existingClaimName: { type: string, minLength: 1 }
+                # Read by the chart, which creates claim di-backup-pvc. The operator creates no claims.
                 volumeClaimTemplate:
                   type: object
                   properties:
                     storageClassName: { type: string }
-                    size: { type: string }
+                    size: { type: string, minLength: 1 }
                 schedule: { type: string }
                 retention:
                   type: object

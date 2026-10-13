@@ -110,7 +110,7 @@ export function parseRequest(env: Record<string, string | undefined>): AgentRequ
     region: env.BACKUP_REGION ?? 'us-east-1',
     pgUser: env.PGUSER ?? 'app',
     pgDatabase: env.PGDATABASE ?? 'app',
-    destinationType: (env.BACKUP_DESTINATION_TYPE ?? 's3') as 's3' | 'pvc',
+    destinationType: env.BACKUP_DESTINATION_TYPE === 'pvc' ? 'pvc' : 's3',
     pvcMountPath: env.BACKUP_PVC_MOUNT_PATH,
   };
 }
@@ -138,25 +138,39 @@ async function copyToS3(
   return io.exec(['rclone', 'copyto', file, remote(request, name)], { env: rcloneEnv(request) });
 }
 
+/** Object keys come from Backup status. Refuse anything that could leave the claim. */
+export function safeKey(key: string): boolean {
+  return (
+    !!key && !key.startsWith('/') && !key.split('/').some((part) => part === '..' || part === '.')
+  );
+}
+
+function pvcPath(request: AgentRequest, name: string): string | undefined {
+  const key = objectKey(request, name);
+  if (!request.pvcMountPath || !safeKey(key)) return undefined;
+  return `${request.pvcMountPath}/${key}`;
+}
+
+/**
+ * Copy with `cp`, not through memory: a dump can be several GiB and the Job has 128Mi. The file
+ * lands under a `.partial` name and is renamed into place, so a reader never sees half of it.
+ */
 async function copyToPvc(
   io: AgentIo,
   request: AgentRequest,
   file: string,
   name: string,
 ): Promise<ExecResult> {
-  if (!request.pvcMountPath) {
-    return { code: 1, stdout: '', stderr: 'PVC mount path not set' };
-  }
-  const destDir = `${request.pvcMountPath}/${request.prefix}`;
-  const destFile = `${destDir}/${name}`;
+  const target = pvcPath(request, name);
+  if (!target) return { code: 1, stdout: '', stderr: 'PvcPathInvalid' };
   try {
-    await io.mkdir(destDir);
-    const data = await io.readFile(file);
-    await io.writeFile(destFile, data);
-    return { code: 0, stdout: '', stderr: '' };
+    await io.mkdir(target.slice(0, target.lastIndexOf('/')));
   } catch (err) {
     return { code: 1, stdout: '', stderr: String(err) };
   }
+  const copied = await io.exec(['cp', file, `${target}.partial`]);
+  if (copied.code !== 0) return copied;
+  return io.exec(['mv', '-f', `${target}.partial`, target]);
 }
 
 function manifest(tool: string, format: string, digest: string): string {
@@ -200,6 +214,7 @@ async function uploadDump(
 
 function requireTarget(request: AgentRequest): string | undefined {
   if (!request.host || !request.port) return 'MissingTarget';
+  if (request.destinationType === 'pvc') return request.pvcMountPath ? undefined : 'MissingClaim';
   if (!request.bucket) return 'MissingBucket';
   return undefined;
 }
@@ -368,17 +383,12 @@ async function downloadFromPvc(
   name: string,
   file: string,
 ): Promise<number | undefined> {
-  if (!request.pvcMountPath) {
-    return finish(io, request.terminationLog, { ok: false, error: 'PvcMountPathNotSet' });
-  }
-  try {
-    const srcFile = `${request.pvcMountPath}/${request.prefix}/${name}`;
-    const data = await io.readFile(srcFile);
-    await io.writeFile(file, data);
-    return undefined;
-  } catch (_err) {
+  const source = pvcPath(request, name);
+  if (!source) return finish(io, request.terminationLog, { ok: false, error: 'PvcPathInvalid' });
+  const copied = await io.exec(['cp', source, file]);
+  if (copied.code !== 0)
     return finish(io, request.terminationLog, { ok: false, error: 'DownloadFailed' });
-  }
+  return undefined;
 }
 
 async function download(
@@ -468,13 +478,21 @@ async function gcPvc(io: AgentIo, request: AgentRequest): Promise<number> {
     .split('\n')
     .map((key) => key.trim())
     .filter(Boolean);
+  if (!keys.every(safeKey)) {
+    return finish(io, request.terminationLog, { ok: false, error: 'PvcPathInvalid' });
+  }
+  const directories = new Set<string>();
   for (const key of keys) {
-    const file = `${request.pvcMountPath}/${key}`;
     try {
-      await io.remove(file);
+      await io.remove(`${request.pvcMountPath}/${key}`);
     } catch (_err) {
       return finish(io, request.terminationLog, { ok: false, error: 'GcFailed' });
     }
+    if (key.includes('/')) directories.add(key.slice(0, key.lastIndexOf('/')));
+  }
+  // The `<source>/<stamp>/` directory goes too once it is empty. rmdir refuses a non-empty one.
+  for (const directory of directories) {
+    await io.exec(['rmdir', `${request.pvcMountPath}/${directory}`]);
   }
   return finish(io, request.terminationLog, { ok: true, tool: 'rm', format: 'delete' });
 }

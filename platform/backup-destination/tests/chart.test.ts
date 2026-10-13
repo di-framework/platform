@@ -100,4 +100,57 @@ describe('backup-destination chart', () => {
     expect(missing.code).not.toBe(0);
     expect(missing.stderr).toContain('bucket is required');
   }, 30000);
+
+  test('renders a PVC destination, both destinations, and refuses an incomplete one', async () => {
+    const created = await template('di-tenant-alpha', {
+      type: 'pvc',
+      'volumeClaimTemplate.size': '20Gi',
+      'volumeClaimTemplate.storageClassName': 'local-path',
+    });
+    expect(created.code).toBe(0);
+    const claim = created.stdout
+      .split('\n---\n')
+      .find((doc) => doc.includes('kind: PersistentVolumeClaim'));
+    expect(claim).toContain('name: di-backup-pvc');
+    expect(claim).toContain('namespace: di-runtime-alpha');
+    expect(claim).toContain('helm.sh/resource-policy: keep');
+    expect(claim).toContain('storageClassName: "local-path"');
+    expect(claim).toContain('storage: "20Gi"');
+    const [only, ...others] = created.stdout
+      .split('\n---\n')
+      .filter((doc) => doc.includes('v1alpha1\nkind: BackupDestination\n'));
+    expect(others).toEqual([]);
+    expect(only).toContain('type: pvc');
+    expect(only).not.toContain('bucket:');
+    expect(only).not.toContain('credentialsSecretRef');
+    expect(created.stdout).not.toContain('kind: Secret');
+
+    const existing = await template('di-tenant-alpha', { type: 'pvc', existingClaimName: 'mine' });
+    expect(existing.code).toBe(0);
+    expect(existing.stdout).toContain('existingClaimName: "mine"');
+    expect(existing.stdout).not.toContain('kind: PersistentVolumeClaim');
+
+    const both = await template('di-tenant-alpha', {
+      type: 'both',
+      bucket: 'tenant-alpha-backups',
+      existingSecret: 'di-backup-s3',
+      'volumeClaimTemplate.size': '5Gi',
+    });
+    expect(both.code).toBe(0);
+    const destinations = both.stdout
+      .split('\n---\n')
+      .filter((doc) => doc.includes('v1alpha1\nkind: BackupDestination\n'));
+    expect(destinations).toHaveLength(2);
+    expect(destinations[0]).toContain('name: default');
+    expect(destinations[0]).toContain('type: s3');
+    expect(destinations[1]).toContain('name: pvc');
+    expect(destinations[1]).toContain('type: pvc');
+
+    const incomplete = await template('di-tenant-alpha', { type: 'pvc' });
+    expect(incomplete.code).not.toBe(0);
+    expect(incomplete.stderr).toContain('existingClaimName or volumeClaimTemplate.size');
+    const unknown = await template('di-tenant-alpha', { type: 'nfs' });
+    expect(unknown.code).not.toBe(0);
+    expect(unknown.stderr).toContain('type must be s3, pvc, or both');
+  }, 30000);
 });

@@ -6,7 +6,14 @@ const TENANT = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
 export interface BackupDestinationInstall {
   tenant: string;
   chart: string;
-  bucket: pulumi.Input<string>;
+  /** `s3` (the default), `pvc`, or `both`. */
+  type?: 's3' | 'pvc' | 'both';
+  /** Required for `s3` and `both`. */
+  bucket?: pulumi.Input<string>;
+  /** PVC destination: a claim that already exists in `di-runtime-<tenant>`. */
+  existingClaimName?: pulumi.Input<string>;
+  /** PVC destination: the chart creates claim `di-backup-pvc` with this size and class. */
+  volumeClaimTemplate?: pulumi.Input<{ storageClassName?: string; size: string }>;
   endpoint?: pulumi.Input<string>;
   region?: pulumi.Input<string>;
   prefix?: pulumi.Input<string>;
@@ -29,7 +36,12 @@ export function backupReleaseArgs(install: BackupDestinationInstall): k8s.helm.v
       'tenant must be a wasmCloud tenant name (1–40 lowercase letters, digits, hyphens; starting with a letter)',
     );
   }
-  const values: Record<string, pulumi.Input<unknown>> = { bucket: install.bucket };
+  const values: Record<string, pulumi.Input<unknown>> = {};
+  if (install.type !== undefined) values.type = install.type;
+  if (install.bucket !== undefined) values.bucket = install.bucket;
+  if (install.existingClaimName !== undefined) values.existingClaimName = install.existingClaimName;
+  if (install.volumeClaimTemplate !== undefined)
+    values.volumeClaimTemplate = install.volumeClaimTemplate;
   if (install.endpoint !== undefined) values.endpoint = install.endpoint;
   if (install.region !== undefined) values.region = install.region;
   if (install.prefix !== undefined) values.prefix = install.prefix;
