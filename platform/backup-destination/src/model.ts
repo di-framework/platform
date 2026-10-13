@@ -42,7 +42,20 @@ export interface WorkloadVolumeSource {
   retention?: Retention;
   scaleDownTimeoutSeconds?: number;
   copyTimeoutSeconds?: number;
+  /**
+   * How long the placement probe, and then the copy Job, may take to start running. Past it the
+   * operation gives up: before the scale-down for the probe, or with the replicas given back at
+   * once for the copy.
+   */
+  startTimeoutSeconds?: number;
+  /** Requests and limits of the copy (and restore) Job. The default always fits: 100m/128Mi. */
+  resources?: JobResources;
   suspend?: boolean;
+}
+
+export interface JobResources {
+  requests?: { cpu?: string; memory?: string };
+  limits?: { cpu?: string; memory?: string };
 }
 
 export interface DestinationSpec {
@@ -67,8 +80,15 @@ export interface DestinationSpec {
 export interface SourceStatus {
   kind: 'workload-volume';
   workloadName: string;
-  /** Last time the schedule fired (or was first seen). Scheduling counts from here. */
+  /** Last time the schedule fired (or was armed). Scheduling counts from here. */
   lastScheduledTime?: string;
+  /** The schedule `lastScheduledTime` counts for. A different schedule re-arms the source. */
+  schedule?: string;
+  /**
+   * `Armed` counts toward the next fire. `Suspended`, `OnDemand` (no schedule) and
+   * `ScheduleInvalid` never fire, and leaving any of them re-arms the schedule from that moment.
+   */
+  scheduleStatus?: 'Armed' | 'Suspended' | 'OnDemand' | 'ScheduleInvalid';
   lastBackupName?: string;
   lastReason?: string;
   lastSuccessTime?: string;
@@ -77,11 +97,38 @@ export interface SourceStatus {
   lastScaleDownTime?: string;
 }
 
-/** Progress of a cold copy or restore, kept in status so an operator restart resumes it. */
+/** The terminal status an operation reached, kept while its replicas are given back. */
+export interface VolumeOutcome {
+  phase: 'Succeeded' | 'Failed';
+  reason: string;
+  message: string;
+  digest?: string;
+  bytes?: number;
+  objectKey?: string;
+  fileCount?: number;
+  encfsKcv?: string;
+  imageDigest?: string;
+  replacedPath?: string;
+  restoringPath?: string;
+}
+
+/**
+ * Progress of a cold copy or restore, kept in status so an operator restart resumes it.
+ * Placing -> ScalingDown -> Copying -> ScalingUp -> Done. Placing holds nothing; from
+ * ScalingDown on the replicas are on record here and in the held-replicas ledger.
+ */
 export interface VolumeProgress {
-  stage?: 'ScalingDown' | 'Copying' | 'Done';
+  stage?: 'Placing' | 'ScalingDown' | 'Copying' | 'ScalingUp' | 'Done';
   /** Every WorkloadDeployment sharing the volume, with the replicas to give back. */
   members?: { name: string; replicas: number }[];
+  placingStartedAt?: string;
+  /** Deterministic names, so two reconcilers cannot start two Jobs for one operation. */
+  probeJob?: string;
+  copyJob?: string;
+  /** A Job that was stopped: the replicas wait until its pods are gone (bounded). */
+  abortedJob?: string;
+  abortedAt?: string;
+  outcome?: VolumeOutcome;
   scaleDownStartedAt?: string;
   stoppedAt?: string;
   restoredAt?: string;
@@ -95,6 +142,7 @@ export interface VolumeProgress {
   encfsKcv?: string;
   imageDigest?: string;
   replacedPath?: string;
+  restoringPath?: string;
 }
 
 export interface WorkloadView {
@@ -116,7 +164,28 @@ export interface HostView {
   name: string;
   node?: string;
   ready: boolean;
+  /** Being deleted. It may still run instances, so it still counts for placement. */
+  terminating?: boolean;
   hostPaths: string[];
+}
+
+/** One WorkloadDeployment an operation holds at 0, and the replicas to give back. */
+export interface HeldEntry {
+  replicas: number;
+  /** `Backup/<name>` or `BackupRestore/<name>`. */
+  heldBy: string;
+  since: string;
+}
+
+/**
+ * The held-replicas ledger, a ConfigMap in the tenant namespace. It outlives the Backup or
+ * BackupRestore that wrote it: a sweeper gives the replicas back for any entry whose operation
+ * is gone or finished, and a new operation never records 0 for a held workload.
+ */
+export interface Ledger {
+  /** Absent while the ConfigMap does not exist. */
+  resourceVersion?: string;
+  entries: Record<string, HeldEntry>;
 }
 
 export interface ServiceStatus {
@@ -177,6 +246,9 @@ export interface BackupView {
   className: string;
   storage: string;
   createdAt: string;
+  resourceVersion?: string;
+  finalizers?: string[];
+  deleting?: boolean;
   /** Set for a workload-volume backup; serviceName then holds the workload name. */
   source?: { kind: 'workload-volume'; workloadName: string };
   volume?: VolumeProgress;
@@ -194,11 +266,21 @@ export interface RestoreView {
   phase?: 'Running' | 'Succeeded' | 'Failed';
   reason?: string;
   volume?: VolumeProgress;
+  resourceVersion?: string;
+  finalizers?: string[];
+  deleting?: boolean;
 }
 
 export interface JobView {
   name: string;
-  backupKind: 'dump' | 'restore' | 'probe' | 'gc' | 'volume-copy' | 'volume-restore';
+  backupKind:
+    | 'dump'
+    | 'restore'
+    | 'probe'
+    | 'gc'
+    | 'volume-copy'
+    | 'volume-restore'
+    | 'volume-probe';
   serviceName: string;
   phase: 'Running' | 'Succeeded' | 'Failed';
   message?: string;
@@ -208,6 +290,10 @@ export interface JobView {
   destinationName?: string;
   /** Reason of the Job's Failed condition, such as DeadlineExceeded. */
   failedReason?: string;
+  /** A pod of the Job got as far as running its container. */
+  started?: boolean;
+  /** Pods of the Job that have not finished, terminating ones included. */
+  activePods?: number;
 }
 
 export interface World {
@@ -227,13 +313,21 @@ export interface World {
   s3Owner?: string;
   /** Claims that do not exist in the runtime namespace. Absent when the lookup was not possible. */
   missingClaims?: string[];
-  /** Tenant WorkloadDeployments (#232). */
+  /**
+   * Tenant WorkloadDeployments (#232). Undefined means unknown: a list (or the ledger, or the
+   * tenant host Deployment) could not be read. No volume step runs on unknown state.
+   */
   workloads?: WorkloadView[];
+  /** The held-replicas ledger; undefined exactly when `workloads` is. */
+  ledger?: Ledger;
   /** Tenant host pods and the hostPath directories they mount. */
   hosts?: HostView[];
   /** The Tenant's uid, which names its node directories. */
   tenantUid?: string;
-  /** The platform's storageRoot (`/var/lib/kubesolo` on Kubesolo). */
+  /**
+   * The platform's storageRoot. When unset, it is taken from the path the tenant host pods
+   * mount for the workload.
+   */
   storageRoot?: string;
   services: ServiceView[];
   backups: BackupView[];
@@ -251,10 +345,35 @@ export type Action =
   | { type: 'copy-credentials'; secretName: string }
   | { type: 'sync-egress'; extraEgress: Egress[] }
   | { type: 'create-backup'; body: Record<string, unknown> }
-  | { type: 'backup-status'; name: string; status: Record<string, unknown> }
+  | {
+      type: 'backup-status';
+      name: string;
+      status: Record<string, unknown>;
+      /** Precondition: the write fails with 409 when the object changed since it was read. */
+      resourceVersion?: string;
+    }
   | { type: 'delete-backup'; name: string }
   | { type: 'create-job'; body: Record<string, unknown> }
-  | { type: 'restore-status'; name: string; status: Record<string, unknown> }
+  | {
+      type: 'restore-status';
+      name: string;
+      status: Record<string, unknown>;
+      resourceVersion?: string;
+    }
+  | {
+      type: 'finalizers';
+      resource: 'backups' | 'backuprestores';
+      name: string;
+      finalizers: string[];
+      resourceVersion?: string;
+    }
+  | {
+      type: 'ledger';
+      /** null removes the entry. */
+      set: Record<string, HeldEntry | null>;
+      /** Absent: the ConfigMap does not exist yet and is created. */
+      resourceVersion?: string;
+    }
   | { type: 'create-restore'; body: Record<string, unknown> }
   | { type: 'scale-workload'; name: string; replicas: number }
   | { type: 'delete-job'; name: string };
@@ -265,11 +384,19 @@ export function destinationType(spec: Pick<DestinationSpec, 'type'> | undefined)
 }
 
 export const WORKLOAD_VOLUME = 'workload-volume';
-export const STORAGE_ROOT = '/var/lib/kubesolo';
 export const SCALE_DOWN_TIMEOUT_SECONDS = 300;
 export const COPY_TIMEOUT_SECONDS = 3600;
-/** How long a copy Job may be absent or overdue before the operation gives up. */
+export const START_TIMEOUT_SECONDS = 120;
+/** How long a copy Job may be absent or overdue, or a stopped Job's pods linger, before giving up. */
 export const JOB_GRACE_SECONDS = 120;
+/** Finished volume Jobs keep their result this long, so an operator outage does not lose it. */
+export const VOLUME_JOB_TTL_SECONDS = 7 * 24 * 3600;
+/** On a running Backup or BackupRestore: removed only once its replicas are back. */
+export const FINALIZER = `${GROUP}/restore-replicas`;
+/** The held-replicas ledger ConfigMap in the tenant namespace. */
+export const LEDGER = 'di-backup-held-replicas';
+/** The Lease the operator replicas elect a leader with. */
+export const LEASE = 'di-backup-operator';
 
 // Mirrors platform/platform/src/tenancy/workload-storage.ts; tests/workload.test.ts checks parity.
 const STORAGE_ANNOTATION = 'di-framework.dev/persistent-storage';
@@ -343,6 +470,20 @@ export function jobName(prefix: string, service: string, unix: number): string {
   const stamp = String(unix);
   const room = 63 - prefix.length - stamp.length - hash.length - 3;
   return `${prefix}-${service.slice(0, Math.max(1, room))}-${stamp}-${hash}`;
+}
+
+/** A Job name derived from the operation's name only, at most 63 characters. */
+export function opJobName(prefix: string, name: string): string {
+  const base = `${prefix}-${name}`;
+  if (base.length <= 63) return base;
+  const hash = createHash('sha256').update(name).digest('hex').slice(0, 8);
+  return `${prefix}-${name.slice(0, 63 - prefix.length - hash.length - 2)}-${hash}`;
+}
+
+/** The HTTP status of a failed API call, when the client reports one. */
+export function statusOf(error: unknown): number | undefined {
+  const status = (error as { status?: unknown } | undefined)?.status;
+  return typeof status === 'number' ? status : undefined;
 }
 
 export function backupKindFor(type: ServiceView['type']): 'postgres' | 'redis' | 'nats' {

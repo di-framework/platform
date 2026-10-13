@@ -24,8 +24,10 @@ volumeClaimTemplate:
   storageClassName: ""
   size: ""
 # The platform's storageRoot: workload volumes live in
-# <storageRoot>/di-tenants/<tenant uid>/workloads/<key> on the node. Kubesolo uses /var/lib/kubesolo.
-storageRoot: /var/lib/kubesolo
+# <storageRoot>/di-tenants/<tenant uid>/workloads/<key> on the node. Leave it empty and the
+# operator takes it from the path the tenant host pods mount, which always matches the
+# platform. Set it (Kubesolo: /var/lib/kubesolo, k0s: /var/lib/k0s) to also require that path.
+storageRoot: ""
 # Workload volumes to copy cold (#232). Each entry:
 #   workloadName: identity          # a WorkloadDeployment with platform storage (required)
 #   schedule: "30 3 * * *"          # UTC cron; leave it out for on-demand backups only
@@ -37,6 +39,9 @@ storageRoot: /var/lib/kubesolo
 #     failed: 5
 #   scaleDownTimeoutSeconds: 300    # optional
 #   copyTimeoutSeconds: 3600        # optional
+#   startTimeoutSeconds: 120        # optional: probe and copy Job start deadline
+#   resources:                      # optional: copy Job; default 50m/64Mi, limit 100m/128Mi
+#     limits: { cpu: "1", memory: 512Mi }
 #   destination: pvc                # s3 or pvc; required when type is both
 # There is no default schedule and no default retention.
 sources: []

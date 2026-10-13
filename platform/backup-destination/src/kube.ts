@@ -5,8 +5,11 @@ import {
   destinationType,
   type Egress,
   GROUP,
+  type HeldEntry,
   type HostView,
   type JobView,
+  LEDGER,
+  type Ledger,
   OWNER_UID_LABEL,
   PVC_CLAIM,
   pickS3Owner,
@@ -15,6 +18,7 @@ import {
   runtimeNamespaceFor,
   type ServiceView,
   STORAGE_VOLUME,
+  statusOf,
   VERSION,
   type VolumeProgress,
   type WorkloadView,
@@ -22,6 +26,16 @@ import {
 } from './model.ts';
 
 const RUNTIME = '/apis/runtime.wasmcloud.dev/v1alpha1';
+
+/** A failed API call. `status` lets callers tell a 404 or a 409 from anything else. */
+export class KubeError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
 export interface KubeClient {
   get(path: string): Promise<unknown>;
@@ -48,6 +62,8 @@ interface Item {
     annotations?: Record<string, string>;
     labels?: Record<string, string>;
     deletionTimestamp?: string;
+    resourceVersion?: string;
+    finalizers?: string[];
   };
   spec?: Record<string, unknown>;
   status?: Record<string, unknown>;
@@ -161,14 +177,16 @@ function hostViews(pods: unknown, hostgroup: string): HostView[] {
       | { nodeName?: string; volumes?: { hostPath?: { path?: string } }[] }
       | undefined;
     const conditions = (pod.status?.conditions ?? []) as { type?: string; status?: string }[];
+    const terminating = !!pod.metadata?.deletionTimestamp;
     return [
       {
         name: pod.metadata?.name ?? '',
         node: spec?.nodeName,
         ready:
           pod.status?.phase === 'Running' &&
-          !pod.metadata?.deletionTimestamp &&
+          !terminating &&
           conditions.some((condition) => condition.type === 'Ready' && condition.status === 'True'),
+        ...(terminating ? { terminating } : {}),
         hostPaths: (spec?.volumes ?? []).flatMap((volume) =>
           volume.hostPath?.path ? [volume.hostPath.path] : [],
         ),
@@ -181,6 +199,114 @@ function volumeOf(status: Record<string, unknown> | undefined): VolumeProgress |
   return record(status?.volume) as VolumeProgress | undefined;
 }
 
+/** Fields every Backup and BackupRestore view carries for concurrency and deletion. */
+function objectMeta(item: Item) {
+  return {
+    ...(item.metadata?.resourceVersion ? { resourceVersion: item.metadata.resourceVersion } : {}),
+    ...(item.metadata?.finalizers?.length ? { finalizers: item.metadata.finalizers } : {}),
+    ...(item.metadata?.deletionTimestamp ? { deleting: true } : {}),
+  };
+}
+
+function entryOf(value: string): HeldEntry | undefined {
+  try {
+    const parsed = JSON.parse(value) as Partial<HeldEntry>;
+    if (typeof parsed?.replicas !== 'number' || typeof parsed.heldBy !== 'string') return undefined;
+    return { replicas: parsed.replicas, heldBy: parsed.heldBy, since: String(parsed.since ?? '') };
+  } catch {
+    return undefined;
+  }
+}
+
+function ledgerOf(value: unknown): Ledger {
+  const item = (value ?? {}) as Item;
+  const entries: Record<string, HeldEntry> = {};
+  for (const [name, text] of Object.entries(item.data ?? {})) {
+    const entry = entryOf(text);
+    if (entry) entries[name] = entry;
+  }
+  return {
+    ...(item.metadata?.resourceVersion ? { resourceVersion: item.metadata.resourceVersion } : {}),
+    entries,
+  };
+}
+
+/** A positive 404 is "absent"; any other failure is "unknown" and rejects. */
+function absentOn404<T>(promise: Promise<T>): Promise<T | undefined> {
+  return promise.catch((error: unknown) => {
+    if (statusOf(error) === 404) return undefined;
+    throw error;
+  });
+}
+
+interface PodLike {
+  metadata?: { ownerReferences?: { kind?: string; name?: string }[] };
+  status?: {
+    phase?: string;
+    containerStatuses?: { state?: { running?: unknown; terminated?: unknown } }[];
+  };
+}
+
+/** Per Job: did a pod get as far as running, and how many pods have not finished. */
+function jobPods(pods: unknown): Map<string, { started: boolean; active: number }> {
+  const found = new Map<string, { started: boolean; active: number }>();
+  for (const pod of items(pods) as PodLike[]) {
+    const job = pod.metadata?.ownerReferences?.find((owner) => owner.kind === 'Job')?.name;
+    if (!job) continue;
+    const phase = pod.status?.phase;
+    const ran =
+      phase === 'Running' ||
+      phase === 'Succeeded' ||
+      phase === 'Failed' ||
+      (pod.status?.containerStatuses ?? []).some(
+        (status) => status.state?.running || status.state?.terminated,
+      );
+    const done = phase === 'Succeeded' || phase === 'Failed';
+    const seen = found.get(job) ?? { started: false, active: 0 };
+    found.set(job, { started: seen.started || ran, active: seen.active + (done ? 0 : 1) });
+  }
+  return found;
+}
+
+/**
+ * Workload volume state (#232), read in full or not at all. A failed list is never an empty
+ * list: it would read as "no workloads, no instances", which skips scale-ups and starts copies
+ * on live volumes. Unknown state stops every volume step until a tick reads it whole.
+ */
+async function volumeState(
+  client: KubeClient,
+  tenantNamespace: string,
+  runtimeNamespace: string,
+): Promise<{
+  deployments?: unknown;
+  replicaSets?: unknown;
+  instances?: unknown;
+  hostgroup?: unknown;
+  ledger?: Ledger;
+}> {
+  const tenant = tenantNamespace.slice('di-tenant-'.length);
+  const runtime = `${RUNTIME}/namespaces/${tenantNamespace}`;
+  try {
+    const [deployments, replicaSets, instances, hostgroup, ledger] = await Promise.all([
+      client.get(`${runtime}/workloaddeployments`),
+      client.get(`${runtime}/workloadreplicasets`),
+      client.get(`${runtime}/workloads`),
+      absentOn404(
+        client.get(
+          `/apis/apps/v1/namespaces/${runtimeNamespace}/deployments/hostgroup-tenant-${tenant}`,
+        ),
+      ),
+      absentOn404(client.get(`/api/v1/namespaces/${tenantNamespace}/configmaps/${LEDGER}`)),
+    ]);
+    return { deployments, replicaSets, instances, hostgroup, ledger: ledgerOf(ledger) };
+  } catch (error) {
+    console.error(
+      `workload volume state unknown, volume steps wait: ${error instanceof Error ? error.message : 'read failed'}`,
+    );
+    return {};
+  }
+}
+
 export async function loadWorld(
   client: KubeClient,
   tenantNamespace: string,
@@ -191,17 +317,8 @@ export async function loadWorld(
   const runtimeNamespace = runtimeNamespaceFor(tenantNamespace);
   const tenant = tenantNamespace.slice('di-tenant-'.length);
   const base = `/apis/${VERSION}/namespaces/${tenantNamespace}`;
-  const runtime = `${RUNTIME}/namespaces/${tenantNamespace}`;
-  const none = () => ({ items: [] });
-  // Workload volumes (#232). A chart without the RBAC for these still backs up services.
-  const [deployments, replicaSets, instances, hostgroup] = await Promise.all([
-    client.get(`${runtime}/workloaddeployments`).catch(none),
-    client.get(`${runtime}/workloadreplicasets`).catch(none),
-    client.get(`${runtime}/workloads`).catch(none),
-    client
-      .get(`/apis/apps/v1/namespaces/${runtimeNamespace}/deployments/hostgroup-tenant-${tenant}`)
-      .catch(() => undefined),
-  ]);
+  // Workload volumes (#232). Without them (no RBAC, API trouble) services are still backed up.
+  const volumes = await volumeState(client, tenantNamespace, runtimeNamespace);
   const [destinations, services, backups, restores, jobs, pods, policy] = await Promise.all([
     client.get(`${base}/backupdestinations`),
     client.get(`${base}/backingservices`),
@@ -256,6 +373,7 @@ export async function loadWorld(
         ),
       ]
     : undefined;
+  const podsByJob = jobPods(pods);
   const messages = new Map<string, string>();
   for (const pod of items(pods)) {
     const statuses = (pod.status?.containerStatuses ?? []) as {
@@ -331,6 +449,7 @@ export async function loadWorld(
             : {}),
           ...(volumeOf(item.status) ? { volume: volumeOf(item.status) } : {}),
           ...(typeof item.status?.message === 'string' ? { message: item.status.message } : {}),
+          ...objectMeta(item),
         },
       ];
     }),
@@ -351,6 +470,7 @@ export async function loadWorld(
           phase: phaseOf(item.status),
           reason: typeof item.status?.reason === 'string' ? item.status.reason : undefined,
           ...(volumeOf(item.status) ? { volume: volumeOf(item.status) } : {}),
+          ...objectMeta(item),
         },
       ];
     }),
@@ -364,9 +484,11 @@ export async function loadWorld(
         kind !== 'probe' &&
         kind !== 'gc' &&
         kind !== 'volume-copy' &&
-        kind !== 'volume-restore'
+        kind !== 'volume-restore' &&
+        kind !== 'volume-probe'
       )
         return [];
+      const pods = podsByJob.get(item.metadata.name);
       return [
         {
           name: item.metadata.name,
@@ -378,15 +500,22 @@ export async function loadWorld(
           gcBackups: item.metadata.annotations?.[`${GROUP}/gc-backups`]?.split(',').filter(Boolean),
           destinationName: labels[`${GROUP}/destination`],
           failedReason: failedReason(item),
+          started: pods?.started ?? false,
+          activePods: pods?.active ?? 0,
         },
       ];
     }),
     runtimeSecretPresent: runtimeSecrets,
     credentialKeys: Object.keys(credential?.data ?? {}),
     networkEgress: egressOf(policy),
-    workloads: workloadViews(deployments, replicaSets, instances),
+    ...(volumes.ledger
+      ? {
+          workloads: workloadViews(volumes.deployments, volumes.replicaSets, volumes.instances),
+          ledger: volumes.ledger,
+        }
+      : {}),
     hosts: hostViews(pods, `tenant-${tenant}`),
-    tenantUid: (hostgroup as Item | undefined)?.metadata?.labels?.[OWNER_UID_LABEL],
+    tenantUid: (volumes.hostgroup as Item | undefined)?.metadata?.labels?.[OWNER_UID_LABEL],
     storageRoot,
   };
 }
@@ -426,11 +555,51 @@ function egressOf(policy: unknown): Egress[] {
   return found;
 }
 
+/** Ignore one HTTP status: a 409 on a create (already exists) or a 404 on a delete. */
+async function except(status: number, call: Promise<unknown>): Promise<unknown> {
+  return call.catch((error: unknown) => {
+    if (statusOf(error) === status) return undefined;
+    throw error;
+  });
+}
+
+function versionOf(response: unknown): string | undefined {
+  const version = (response as Item | undefined)?.metadata?.resourceVersion;
+  return typeof version === 'string' ? version : undefined;
+}
+
+/**
+ * Optimistic concurrency across the writes of one tick. An action carries the resourceVersion
+ * its object had when the world was read; once this tick has written that object, the version
+ * the API returned replaces it. A write whose object changed in between fails with 409, which
+ * stops the tick: a stale reconciler cannot overwrite what a newer one wrote.
+ */
+class Versions {
+  private seen = new Map<string, string>();
+
+  precondition(key: string, read: string | undefined): { resourceVersion: string } | object {
+    const version = this.seen.get(key) ?? read;
+    return version ? { resourceVersion: version } : {};
+  }
+
+  record(key: string, response: unknown): void {
+    const version = versionOf(response);
+    if (version) this.seen.set(key, version);
+  }
+}
+
+/**
+ * Apply actions in order and stop at the first failure, so a later action never runs without
+ * the earlier ones (replicas are recorded before they are scaled; they are back before the
+ * outcome is written).
+ */
 export async function applyActions(
   client: KubeClient,
   world: World,
   actions: Action[],
 ): Promise<void> {
+  const versions = new Versions();
+  const crd = `/apis/${VERSION}/namespaces/${world.tenantNamespace}`;
   for (const action of actions) {
     if (action.type === 'destination-status') {
       const name = action.name ?? world.destination?.name;
@@ -477,36 +646,90 @@ export async function applyActions(
       });
     } else if (action.type === 'create-backup' || action.type === 'create-restore') {
       const kind = action.type === 'create-backup' ? 'backups' : 'backuprestores';
-      await client.post(
-        `/apis/${VERSION}/namespaces/${world.tenantNamespace}/${kind}`,
-        action.body,
+      // Names are deterministic (a schedule fire, a console request): a 409 is the same request.
+      await except(409, client.post(`${crd}/${kind}`, action.body));
+    } else if (action.type === 'backup-status' || action.type === 'restore-status') {
+      const kind = action.type === 'backup-status' ? 'backups' : 'backuprestores';
+      const key = `${kind}/${action.name}`;
+      const response = await client.patch(`${crd}/${key}/status`, {
+        metadata: versions.precondition(key, action.resourceVersion),
+        status: action.status,
+      });
+      versions.record(key, response);
+    } else if (action.type === 'finalizers') {
+      const key = `${action.resource}/${action.name}`;
+      const response = await except(
+        404,
+        client.patch(`${crd}/${key}`, {
+          metadata: {
+            ...versions.precondition(key, action.resourceVersion),
+            finalizers: action.finalizers,
+          },
+        }),
       );
-    } else if (action.type === 'backup-status') {
-      await client.patch(
-        `/apis/${VERSION}/namespaces/${world.tenantNamespace}/backups/${action.name}/status`,
-        { status: action.status },
-      );
-    } else if (action.type === 'restore-status') {
-      await client.patch(
-        `/apis/${VERSION}/namespaces/${world.tenantNamespace}/backuprestores/${action.name}/status`,
-        { status: action.status },
-      );
+      versions.record(key, response);
+    } else if (action.type === 'ledger') {
+      await writeLedger(client, world, action, versions);
     } else if (action.type === 'delete-backup') {
-      await client.remove(
-        `/apis/${VERSION}/namespaces/${world.tenantNamespace}/backups/${action.name}`,
-      );
+      await except(404, client.remove(`${crd}/backups/${action.name}`));
     } else if (action.type === 'create-job') {
       const meta = (action.body.metadata ?? {}) as { namespace?: string };
-      await client.post(`/apis/batch/v1/namespaces/${meta.namespace}/jobs`, action.body);
+      // Volume Job names come from the operation: a 409 means the Job already runs.
+      await except(
+        409,
+        client.post(`/apis/batch/v1/namespaces/${meta.namespace}/jobs`, action.body),
+      );
     } else if (action.type === 'scale-workload') {
-      await client.patch(
-        `${RUNTIME}/namespaces/${world.tenantNamespace}/workloaddeployments/${action.name}/scale`,
-        { spec: { replicas: action.replicas } },
+      // A 404 is the only proof a member is gone; anything else fails the tick and is retried.
+      await except(
+        404,
+        client.patch(
+          `${RUNTIME}/namespaces/${world.tenantNamespace}/workloaddeployments/${action.name}/scale`,
+          { spec: { replicas: action.replicas } },
+        ),
       );
     } else if (action.type === 'delete-job') {
-      await client.remove(
-        `/apis/batch/v1/namespaces/${world.runtimeNamespace}/jobs/${action.name}?propagationPolicy=Background`,
+      await except(
+        404,
+        client.remove(
+          `/apis/batch/v1/namespaces/${world.runtimeNamespace}/jobs/${action.name}?propagationPolicy=Background`,
+        ),
       );
     }
   }
+}
+
+/** Set or remove held-replicas entries; the first write creates the ConfigMap. */
+async function writeLedger(
+  client: KubeClient,
+  world: World,
+  action: Extract<Action, { type: 'ledger' }>,
+  versions: Versions,
+): Promise<void> {
+  const path = `/api/v1/namespaces/${world.tenantNamespace}/configmaps`;
+  const data = Object.fromEntries(
+    Object.entries(action.set).map(([name, entry]) => [name, entry ? JSON.stringify(entry) : null]),
+  );
+  const precondition = versions.precondition('ledger', action.resourceVersion);
+  if (!('resourceVersion' in precondition)) {
+    const created = Object.fromEntries(
+      Object.entries(data).filter((pair): pair is [string, string] => pair[1] !== null),
+    );
+    if (Object.keys(created).length === 0) return;
+    // A 409 here means another writer created it first: fail, and the next tick reads it.
+    const response = await client.post(path, {
+      apiVersion: 'v1',
+      kind: 'ConfigMap',
+      metadata: {
+        name: LEDGER,
+        namespace: world.tenantNamespace,
+        labels: { [`${GROUP}/component`]: 'backup-operator' },
+      },
+      data: created,
+    });
+    versions.record('ledger', response);
+    return;
+  }
+  const response = await client.patch(`${path}/${LEDGER}`, { metadata: precondition, data });
+  versions.record('ledger', response);
 }

@@ -32,6 +32,7 @@ import {
   advanceVolumes,
   backupKeys,
   expiredSources,
+  releaseOrphans,
   scheduleSources,
   sourceRows,
   startNext,
@@ -616,7 +617,7 @@ export function reconcile(world: World): Action[] {
   if (run && pending.length === 0 && completed.length > 0 && !status.lastSuccessTime) {
     status = { ...status, lastSuccessTime: world.now };
   }
-  const copying = volume.some((action) => action.type === 'scale-workload');
+  const copying = volume.some((action) => action.type === 'create-job');
   const reason = pending.length > 0 || copying ? 'BackupInProgress' : 'DestinationReady';
   actions.push(
     condition(
@@ -628,7 +629,7 @@ export function reconcile(world: World): Action[] {
           ? 'Credentials copied'
           : 'Claim configured'
         : copying
-          ? 'Stopping a workload for a cold copy'
+          ? 'Placing a workload volume copy'
           : `Backing up ${next?.name ?? 'services'}`,
       true,
     ),
@@ -694,7 +695,8 @@ export function reconcileAll(world: World): Action[] {
   });
   const s3Owner = pickS3Owner(destinations)?.name;
   const wantedEgress = unionEgress(destinations);
-  const actions: Action[] = [];
+  // Replicas held by an operation that is gone or finished come back first.
+  const actions: Action[] = releaseOrphans(world);
   // Copies whose destination was deleted mid-way still give their replicas back.
   const orphans = scoped(ORPHAN);
   actions.push(

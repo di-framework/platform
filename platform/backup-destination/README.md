@@ -57,53 +57,80 @@ sources:
     destination: pvc         # s3 or pvc; required only with type: both
 ```
 
-The chart renders each entry into `BackupDestination.spec.sources`. Set `storageRoot` to the platform's storage root (the chart default `/var/lib/kubesolo` matches Kubesolo).
+Optional per source: `scaleDownTimeoutSeconds` (default 300), `copyTimeoutSeconds` (default 3600), `startTimeoutSeconds` (default 120: how long the placement probe, then the copy Job, may take to start), `suspend`, and `resources` for the copy Job (default requests 50m/64Mi, limits 100m/128Mi; that default always fits, because a stopped workload frees no quota). A larger limit shortens the downtime of a large volume when the tenant has headroom.
+
+The chart renders each entry into `BackupDestination.spec.sources`. Leave `storageRoot` empty (the default): the operator then takes the root from the path the tenant host pods mount, which always matches the platform's `storageRoot`. When you set it (Kubesolo: `/var/lib/kubesolo`, k0s: `/var/lib/k0s`), the host pods must mount exactly that path, or the backup fails with `VolumeNotMounted` and nothing is stopped.
 
 **There is no default schedule and no default retention.**
-- **Schedule.** A source without `schedule` is never backed up on a schedule. "Back up now" on the console, or a `Backup` you create, still works. A schedule seen for the first time starts counting from that moment: it never fires for a time before it was set. A run missed while the destination was suspended or busy happens once, when it can.
+- **Schedule.** A source without `schedule` is never backed up on a schedule. "Back up now" on the console, or a `Backup` you create, still works.
+  - A schedule is armed when it is first seen, when it changes, and when the source is unsuspended. It never fires for a time before that, so an edit or an unsuspend never stops a workload at once.
+  - A fire while a backup of the same source is still queued or running is skipped, and the console answers 409 to a second "Back up now". A workload is never stopped twice for one request.
+  - The CRD accepts five fields of numbers, `*`, ranges, steps and lists. A value out of range (`99 * * * *`) shows `scheduleStatus: ScheduleInvalid` in `status.sources[]` and on the console, and never runs. A run missed while the destination was busy happens once, when it can.
 - **Retention.** A source without a rule keeps every backup.
   - **Successful backups.** A backup is kept when any rule keeps it: it is one of the newest `keepLast`, or it is the newest backup of one of the newest `daily` UTC days, `weekly` ISO weeks or `monthly` UTC months that have a backup. As soon as one of these four rules is set, every successful backup no rule keeps is deleted, objects included.
-  - **Failed attempts.** `failed` keeps that many of the newest failed attempts and deletes the older records.
+  - **Failed attempts.** `failed` keeps that many of the newest failed attempts and deletes the older records. A failed copy that recorded no object key is pruned by its object prefix, so objects it may have written are not orphaned.
   - **Retention never deletes a backup a restore is reading.** Removing a source from the list deletes none of its backups.
   - BackingService dumps keep their own `retentionSuccessful` and never touch workload-volume backups.
 
 ### A cold copy
 
-1. The operator records `spec.replicas` of every WorkloadDeployment that shares the volume (members sharing `di-framework.dev/workload`) in the Backup's `status.volume`. Then it scales them to 0 through the `scale` subresource.
-2. It waits until none of them has a `Workload` left, for up to `scaleDownTimeoutSeconds` (default 300).
-3. It runs a Job on the node whose tenant host mounts that exact path. The Job is pinned with node affinity and mounts the directory read-only. It runs as root with only `DAC_READ_SEARCH`, so it can read the host uid's files.
-4. The agent records every regular file's sha256, size and mode. It refuses links and devices. It writes `data.tar`, `SHA256SUMS` and `manifest.json` (written last) under `<prefix>/workload-volumes/<name>/<uid>/<UTC stamp>/` on the S3 or PVC destination.
-   - The manifest holds the UTC stamp, the image and its digest (when the image is pinned by digest), the file and directory counts, and the bytes.
-   - When the volume has a `.di-encfs` marker, the manifest also holds the encfs KCV: bytes 8..24 of the marker, as hex.
-   - If anything in the volume changed during the copy, the backup fails with `SourceChanged`.
+Each step is written to the Backup's `status.volume` before the next action, so an operator restart carries on where it stopped.
+
+1. **Placing.** The operator finds the one node that holds the volume. Every tenant host pod mounts every storage directory of the tenant, so the hosts that mount this path (ready, starting or terminating) are the only places its instances can have written. If they span more than one node, the backup fails with `VolumeAmbiguous` and nothing is stopped. It then runs a short probe Job on that node, which mounts the hostPath and the destination claim (no credentials, non-root, no capabilities). Only when the probe succeeds does anything stop. A probe that fails, or does not finish within `startTimeoutSeconds`, ends the backup (`PlacementFailed`, `PlacementTimeout`) with no downtime. A misplaced claim, a full quota, or an image that cannot be pulled therefore costs nothing.
+2. **ScalingDown.** It records `spec.replicas` of every WorkloadDeployment that shares the volume (members sharing `di-framework.dev/workload`). The record goes in `status.volume.members` and in the held-replicas ledger, the ConfigMap `di-backup-held-replicas`. Then it scales them to 0 through the `scale` subresource. It waits until none of them has a `Workload` left, for up to `scaleDownTimeoutSeconds`. If the volume moved to another node meanwhile, the backup fails with `VolumeMoved`.
+3. **Copying.** It runs the copy Job on that node, pinned with node affinity, mounting the directory read-only.
+   - The Job runs as root with only `DAC_READ_SEARCH`, a read-only root filesystem and the `RuntimeDefault` seccomp profile.
+   - A Job that does not start within `startTimeoutSeconds` is stopped, and the replicas come back at once (`CopyNotStarted`).
+   - The agent reads the volume once: `tar` streams through a reader that hashes every file on its way to the destination, so the manifest describes the archived bytes. It refuses links and devices, and it writes `data.tar`, `SHA256SUMS` and `manifest.json` (last) under `<prefix>/workload-volumes/<name>/<uid>/<UTC stamp>/`.
+   - The manifest holds the UTC stamp, the image and its digest (when pinned by digest), the counts, the bytes, the owner of every entry, and the encfs KCV (bytes 8..24 of `.di-encfs`) when the volume has a marker.
+   - If anything in the volume changed during the copy (size, mtime, ctime, inode or mode), the backup fails with `SourceChanged`.
+   - On S3 the part size grows with the volume, so a stream is never cut off at 10,000 parts.
    - Ciphertext is copied as stored. Nothing is decrypted, and no Secret is read.
-5. The operator gives every recorded WorkloadDeployment its replicas back on success, on failure, on a scale-down timeout, on a copy timeout (`copyTimeoutSeconds`, default 3600), when the Job disappears, and when the destination is suspended or deleted. The terminal status is written only after the replicas are back. Every step is in status, so an operator restart carries on where it stopped.
+4. **ScalingUp.** The outcome is recorded first. Then every member still at 0 gets its replicas back, the ledger entries go, and only then is the terminal status written. A member somebody raised meanwhile keeps their count. This happens on success, on failure, on every timeout, when the Job disappears, when the destination is suspended or deleted, and when the Backup is deleted. If a Job had to be stopped, the replicas wait (at most 120 s) until its pod is gone, so a restore can never run beside the workload.
 
 The workload is down from the scale-down to the scale-up. `Backup.status.volume.scaleDownSeconds`, `BackupDestination.status.sources[].lastScaleDownSeconds` and the console show how long that was.
 
+### Replicas always come back
+
+- **Unknown is not empty.** If the workload lists, the tenant host Deployment or the ledger cannot be read, the volume state is unknown for that tick. No volume step runs and nothing terminal is written, and the next tick retries. A member is skipped only on a 404 from the scale write itself.
+- **Deleting a running Backup or BackupRestore** is safe. It carries the finalizer `platform.di-framework.dev/restore-replicas` from the moment it starts, and the operator treats deletion as "finish now": stop the Job, give the replicas back, then drop the finalizer.
+- **The ledger outlives the request.** If a running request vanishes anyway (finalizer stripped by hand), a sweeper gives every entry it held back from the ledger. A new copy never starts while a member is still held, so it never records 0 as the replicas to give back.
+- **One reconciler.** The operator Deployment uses `Recreate`, ticks never overlap, and only the holder of the Lease `di-backup-operator` reconciles. Every status and ledger write carries a `resourceVersion` precondition, so a stale reconciler cannot overwrite a newer result. Job and scheduled-Backup names are derived from the request (or the fire time), so a repeated create is a harmless 409.
+
 ### Restore
 
-Create a `BackupRestore` with `targetWorkloadName` (the console has a form). The operator scales the target and its members to 0, waits, and runs a Job pinned to the target's node. That Job mounts the tenant's `workloads` directory read-write, with `CHOWN`, `DAC_OVERRIDE` and `FOWNER`. The agent:
-- refuses a non-empty target unless `force: true`. With `force`, the old entries move to `<key>.replaced-<stamp>` next to it. The entries move, not the directory, because the tenant host has the directory itself mounted;
-- extracts into a staging directory next to the target;
-- checks that `SHA256SUMS` matches the manifest, that every file and directory matches it (nothing missing, nothing extra), and every sha256;
-- checks that the restored marker's KCV equals the manifest's;
+Create a `BackupRestore` with `targetWorkloadName` (the console has a form). An `expectedKcv` that differs from the KCV the backup recorded is refused before anything stops (`KcvMismatch`). The operator places, stops, and runs the restore Job on the target's node like a copy. That Job mounts the tenant's `workloads` directory read-write, as root with only `CHOWN` and `DAC_OVERRIDE`. The agent:
+- refuses a non-empty target unless `force: true`, and refuses a target it cannot read (`TargetUnreadable`) instead of treating it as empty. With `force`, the old entries move to `<key>.replaced-<stamp>` next to it. The entries move, not the directory, because the tenant host has the directory itself mounted;
+- checks that `SHA256SUMS` matches the manifest;
+- lists the archive before extracting anything: any member that is not a regular file or directory named by the manifest with its size is refused (`ArchiveRejected`);
+- extracts into `<key>.restoring-<stamp>` next to the target, and checks that every file and directory matches the manifest (nothing missing, nothing extra), every sha256, and the marker's KCV;
 - with `expectedKcv`, also requires that value. Restoring over data whose marker carries a different KCV is refused unless `expectedKcv` names the backup's KCV;
-- moves the files into place and hands them to uid 65532.
+- moves the files into place and gives every entry the owner the manifest recorded. Backups taken before owners were recorded get the host uid 65532.
 
-Then the replicas come back, whatever the outcome.
+Then the replicas come back, whatever the outcome. If replicas were raised while the restore ran, it reports `ScaledDuringRestore`; the restored data is in place.
+
+**Leftover directories.** Nothing old is ever deleted for you.
+- `<key>.replaced-<stamp>` holds the data a forced restore replaced. Its name is in `status.volume.replacedPath`.
+- A restore that failed part-way leaves `<key>.restoring-<stamp>`, named in `status.volume.restoringPath`, and the replaced data if any.
+
+Both sit in `<storageRoot>/di-tenants/<tenant uid>/workloads/` on the node and hold ciphertext. Once the workload runs well, remove them on the node, for example with a short Job pinned to the node that mounts that directory.
 
 ### Permissions
 
 The operator's Role in `di-tenant-<name>` adds:
 - `get`/`list` on `workloaddeployments`, `workloadreplicasets` and `workloads`;
-- `get`/`patch` on `workloaddeployments/scale` only.
+- `get`/`patch` on `workloaddeployments/scale` only. The WorkloadDeployment itself is never written. Platform admission re-validates every update to it, and the spec stays out of reach;
+- `get`/`patch` on the ConfigMap `di-backup-held-replicas` and the Lease `di-backup-operator`, by name, plus `create` for each (`create` cannot be limited by name);
+- `get` on the one S3 credentials Secret the chart's destination names. It no longer lists Secrets. A destination created by hand that names another Secret reports `CredentialsInvalid`.
 
-In `di-runtime-<name>` it adds `get` on the one Deployment `hostgroup-tenant-<name>`, whose owner-uid label names the tenant directory. There is no ClusterRole. The operator reads only the S3 credentials Secret its destination names; it no longer lists Secrets.
+In `di-runtime-<name>` it adds `get` on the one Deployment `hostgroup-tenant-<name>`, whose owner-uid label names the tenant directory. There is no ClusterRole.
+
+Run `sh ../backup-agent/scripts/capabilities.sh` to check the Job security contexts in a container: each capability set is run as granted, and once with one capability fewer.
 
 **Limits.**
 - The copy is cold: the workload is unavailable while it runs.
-- With a node-local PVC destination, the claim must be usable on the workload's node; with `local-path` that is the same node. Otherwise the Job never schedules and fails with `CopyTimeout`, and the replicas come back.
+- With a node-local PVC destination, the claim must be usable on the workload's node; with `local-path` that is the same node. The placement probe finds out before anything stops.
+- Images pinned by tag record `imageDigest: null`; the copy Job gets no registry access to resolve them.
 - Live copies need a pglite/encfs snapshot API and are out of scope.
 
 The packages stay private. Image tags `di-framework/backup-destination:dev` and `di-framework/backup-agent:dev` are imported into Kubesolo (`imagePullPolicy: Never`), not published to GHCR.

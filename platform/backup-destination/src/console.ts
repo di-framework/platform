@@ -11,7 +11,7 @@ import {
   type WorkloadVolumeSource,
   type World,
 } from './model.ts';
-import { requestBackup } from './workload.ts';
+import { backupInFlight, requestBackup } from './workload.ts';
 
 const NAME = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
 
@@ -45,8 +45,9 @@ function sourceItem(
   source: WorkloadVolumeSource,
   row: SourceStatus | undefined,
 ): string {
+  const invalid = row?.scheduleStatus === 'ScheduleInvalid' ? ', invalid: it never runs' : '';
   const schedule = source.schedule
-    ? `schedule ${escapeHtml(source.schedule)} (UTC)${source.suspend ? ', suspended' : ''}`
+    ? `schedule ${escapeHtml(source.schedule)} (UTC)${source.suspend ? ', suspended' : ''}${invalid}`
     : 'no schedule (on demand only)';
   return `<li>${escapeHtml(source.workloadName)}: ${schedule}; retention ${escapeHtml(retentionText(source.retention))}; last ${escapeHtml(row?.lastReason ?? 'none')}; last scale-to-0 ${downtime(row?.lastScaleDownSeconds)}
 <form method="post" action="/backups"><input type="hidden" name="destination" value="${escapeHtml(destination.name)}"><input type="hidden" name="workload" value="${escapeHtml(source.workloadName)}"><button type="submit">Back up ${escapeHtml(source.workloadName)} now (stops it)</button></form></li>`;
@@ -157,6 +158,8 @@ export function handle(
       if (!destination?.spec.sources?.some((source) => source.workloadName === workload)) {
         return { status: 400, html: render(world), actions };
       }
+      // One queued or running copy per source: a second request would stop it twice.
+      if (backupInFlight(world, workload)) return { status: 409, html: render(world), actions };
       actions.push(requestBackup(world, destination, workload));
     } else if (destination) {
       actions.push({ type: 'annotate', name: destination.name, key: BACKUP_NOW, value: world.now });

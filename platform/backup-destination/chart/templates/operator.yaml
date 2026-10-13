@@ -16,10 +16,31 @@ rules:
   - apiGroups: ["platform.di-framework.dev"]
     resources: ["backupdestinations/status", "backuprestores/status", "backups/status"]
     verbs: ["get", "patch", "update"]
-  # The S3 credentials Secret the destination names; the operator never lists Secrets.
+  {{- $secret := include "backup.s3Secret" . | trim }}
+  {{- if $secret }}
+  # Only the S3 credentials Secret this release's destination names; never a list.
   - apiGroups: [""]
     resources: ["secrets"]
+    resourceNames: [{{ $secret | quote }}]
     verbs: ["get"]
+  {{- end }}
+  # The held-replicas ledger (#232): the replicas a workload-volume copy holds at 0, kept
+  # outside the Backup so a deleted Backup cannot strand them. create cannot be name-scoped.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["di-backup-held-replicas"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  # One reconciler at a time across operator pods.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["di-backup-operator"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
   # Workload volumes (#232): find a workload's instances and hold its replicas at 0 while its
   # volume is copied. Only the scale subresource is writable; the spec is not.
   - apiGroups: ["runtime.wasmcloud.dev"]
@@ -50,6 +71,9 @@ metadata:
   namespace: {{ .Release.Namespace }}
 spec:
   replicas: 1
+  # Never two operator pods at once; the Lease covers anything that still overlaps.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: di-backup-operator
@@ -72,10 +96,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: AGENT_IMAGE
               value: {{ .Values.agentImage | quote }}
+            # Empty: taken from the path the tenant host pods mount.
             - name: STORAGE_ROOT
-              value: {{ required "storageRoot is required" .Values.storageRoot | quote }}
+              value: {{ .Values.storageRoot | default "" | quote }}
           readinessProbe:
             httpGet:
               path: /

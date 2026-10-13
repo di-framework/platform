@@ -1,6 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { handle } from './console.ts';
-import { applyActions, type KubeClient, loadWorld } from './kube.ts';
+import { applyActions, type KubeClient, KubeError, loadWorld } from './kube.ts';
+import { leaderTick, releaseLease } from './leader.ts';
 import { runtimeNamespaceFor } from './model.ts';
 import { reconcileAll } from './reconcile.ts';
 
@@ -10,6 +13,7 @@ const clusterCa = existsSync(serviceAccountCa) ? readFileSync(serviceAccountCa, 
 const tenantNamespace = process.env.TENANT_NAMESPACE ?? '';
 const agentImage = process.env.AGENT_IMAGE ?? 'di-framework/backup-agent:dev';
 const storageRoot = process.env.STORAGE_ROOT || undefined;
+const identity = `${process.env.POD_NAME || hostname()}-${randomUUID().slice(0, 8)}`;
 runtimeNamespaceFor(tenantNamespace);
 
 function clusterClient(): KubeClient {
@@ -35,7 +39,9 @@ function clusterClient(): KubeClient {
       // certificate is signed by the in-cluster CA and named for the Service.
       tls: clusterCa ? { ca: clusterCa, serverName: 'kubernetes.default.svc' } : undefined,
     } as RequestInit);
-    if (!response.ok) throw new Error(`${method} ${path} failed: ${response.status}`);
+    if (!response.ok) {
+      throw new KubeError(response.status, `${method} ${path} failed: ${response.status}`);
+    }
     if (response.status === 204) return undefined;
     return response.json();
   }
@@ -51,16 +57,26 @@ function clusterClient(): KubeClient {
 
 const client = clusterClient();
 
-async function tick(): Promise<void> {
-  const world = await loadWorld(
-    client,
-    tenantNamespace,
-    agentImage,
-    new Date().toISOString(),
-    storageRoot,
-  );
-  await applyActions(client, world, reconcileAll(world));
-}
+// No overlapping ticks, and only the Lease holder reconciles (#232 W2).
+const tick = leaderTick({
+  client,
+  namespace: tenantNamespace,
+  identity,
+  async reconcile() {
+    const world = await loadWorld(
+      client,
+      tenantNamespace,
+      agentImage,
+      new Date().toISOString(),
+      storageRoot,
+    );
+    await applyActions(client, world, reconcileAll(world));
+  },
+});
+
+process.on('SIGTERM', () => {
+  void releaseLease(client, tenantNamespace, identity).finally(() => process.exit(0));
+});
 
 Bun.serve({
   hostname: '0.0.0.0',

@@ -23,7 +23,11 @@ export interface BackupDestinationInstall {
   accessKeyId?: pulumi.Input<string>;
   secretAccessKey?: pulumi.Input<string>;
   extraEgress?: pulumi.Input<pulumi.Input<{ cidr: string; port: number; protocol?: string }>[]>;
-  /** The platform's storageRoot; the chart's default is `/var/lib/kubesolo`. */
+  /**
+   * The platform's storageRoot. Leave it unset and the operator takes it from the path the
+   * tenant host pods mount, so it cannot disagree with the platform. When set, that path must
+   * match it; pass the same value the platform installation uses.
+   */
   storageRoot?: pulumi.Input<string>;
   /**
    * Workload volumes to copy cold (#232). No schedule means on-demand only; no retention means
@@ -42,6 +46,13 @@ export interface BackupDestinationInstall {
       };
       scaleDownTimeoutSeconds?: number;
       copyTimeoutSeconds?: number;
+      /** Placement probe and copy Job start deadline (default 120). */
+      startTimeoutSeconds?: number;
+      /** Copy Job resources; the default is requests 50m/64Mi, limits 100m/128Mi. */
+      resources?: {
+        requests?: { cpu?: string; memory?: string };
+        limits?: { cpu?: string; memory?: string };
+      };
       suspend?: boolean;
       destination?: 's3' | 'pvc';
     }[]

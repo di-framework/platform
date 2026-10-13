@@ -230,16 +230,91 @@ describe('backup-destination chart', () => {
       'resources: ["deployments"]\n    resourceNames: ["hostgroup-tenant-alpha"]\n    verbs: ["get"]',
     );
     expect(rendered.stdout).toContain('- name: STORAGE_ROOT\n              value: "/var/lib/k0s"');
-    const fallback = await template('di-tenant-alpha', { bucket: 'b', existingSecret: 's' });
-    expect(fallback.stdout).toContain('value: "/var/lib/kubesolo"');
-    const empty = await template('di-tenant-alpha', {
+    // Unset: the operator takes the root from the host pods' mount.
+    const discovered = await template('di-tenant-alpha', { bucket: 'b', existingSecret: 's' });
+    expect(discovered.stdout).toContain('- name: STORAGE_ROOT\n              value: ""');
+    // The Secret get is limited to the one Secret the chart's destination names.
+    expect(tenant).toContain(
+      'resources: ["secrets"]\n    resourceNames: ["s"]\n    verbs: ["get"]',
+    );
+    expect(tenant).not.toMatch(/resources: \["secrets"\]\n\s*verbs/);
+    const created = await template('di-tenant-alpha', {
       bucket: 'b',
-      existingSecret: 's',
-      storageRoot: '',
+      accessKeyId: 'a',
+      secretAccessKey: 'k',
     });
-    expect(empty.code).not.toBe(0);
-    expect(empty.stderr).toContain('storageRoot is required');
+    expect(created.stdout).toContain('resourceNames: ["di-backup-s3"]');
+    const pvcOnly = await template('di-tenant-alpha', {
+      type: 'pvc',
+      existingClaimName: 'c',
+    });
+    const pvcTenant = pvcOnly.stdout
+      .split('\n---\n')
+      .find((doc) => doc.includes('kind: Role\n') && doc.includes('namespace: di-tenant-alpha'));
+    expect(pvcTenant).toBeDefined();
+    expect(pvcTenant).not.toContain('resources: ["secrets"]');
+    // The ledger and the Lease, each limited to its one object where the verb allows it.
+    expect(tenant).toContain(
+      'resources: ["configmaps"]\n    resourceNames: ["di-backup-held-replicas"]\n    verbs: ["get", "patch"]',
+    );
+    expect(tenant).toContain(
+      'resources: ["leases"]\n    resourceNames: ["di-backup-operator"]\n    verbs: ["get", "patch"]',
+    );
+    expect(tenant).not.toMatch(/resources: \["configmaps"\]\n\s*verbs: \[[^\]]*"list"/);
+    // Never two operator pods at once.
+    expect(rendered.stdout).toContain('strategy:\n    type: Recreate');
+    expect(rendered.stdout).toContain(
+      '- name: POD_NAME\n              valueFrom:\n                fieldRef:\n                  fieldPath: metadata.name',
+    );
   }, 30000);
+
+  test('the CRDs validate schedules, names, and request shapes', async () => {
+    const crds = await Bun.file(
+      join(import.meta.dir, '..', 'chart', 'crds', 'backups.yaml'),
+    ).text();
+    const patterns = [...crds.matchAll(/schedule:\n\s+type: string\n\s+pattern: '([^']+)'/g)].map(
+      (match) => new RegExp(match[1] ?? ''),
+    );
+    expect(patterns).toHaveLength(2);
+    for (const pattern of patterns) {
+      for (const valid of ['0 2 * * *', '*/15 0-2 1,15 1-6 1-5', '30 3 * * 7', '0 0 1 1/3 *']) {
+        expect(pattern.test(valid)).toBe(true);
+      }
+      for (const invalid of ['a b c d e', '0 2 * *', '0 2 * * * *', '0  2 * * *', 'x/5 * * * *']) {
+        expect(pattern.test(invalid)).toBe(false);
+      }
+    }
+    const secret =
+      /name:\n\s+type: string\n\s+minLength: 1\n\s+maxLength: 253\n\s+pattern: '([^']+)'/.exec(
+        crds,
+      );
+    const subdomain = new RegExp(secret?.[1] ?? '^$');
+    expect(subdomain.test('di-backup-s3')).toBe(true);
+    expect(subdomain.test('a.b-c')).toBe(true);
+    expect(subdomain.test('../x')).toBe(false);
+    expect(subdomain.test('x/y')).toBe(false);
+    expect(crds).toContain('rule: "self.type != \'workload-volume\' || has(self.source)"');
+    expect(crds).toContain("rule: '!has(self.expectedKcv) || has(self.targetWorkloadName)'");
+    expect(crds).toMatch(
+      /source:\n(.*\n){4}\s+workloadName:\n\s+type: string\n\s+maxLength: 63\n\s+pattern: '\^\[a-z0-9\]/,
+    );
+    expect(crds).toContain('startTimeoutSeconds: { type: integer, minimum: 30, maximum: 1800 }');
+    // Status fields the operator writes must be in the schema, or the API server prunes them.
+    for (const field of [
+      'placingStartedAt',
+      'probeJob',
+      'copyJob',
+      'abortedJob',
+      'outcome',
+      'restoringPath',
+    ]) {
+      expect(crds.split(`${field}:`).length - 1).toBe(2);
+    }
+    expect(
+      crds.split("enum: ['Placing', 'ScalingDown', 'Copying', 'ScalingUp', 'Done']").length - 1,
+    ).toBe(2);
+    expect(crds).toContain('scheduleStatus: { type: string }');
+  });
 
   test('renders workload-volume sources without inventing a schedule or retention', async () => {
     const sources = {
@@ -258,7 +333,11 @@ describe('backup-destination chart', () => {
         ...sources,
         'sources[0].schedule': '30 3 * * *',
       },
-      { 'sources[0].retention.keepLast': '7', 'sources[0].scaleDownTimeoutSeconds': '120' },
+      {
+        'sources[0].retention.keepLast': '7',
+        'sources[0].scaleDownTimeoutSeconds': '120',
+        'sources[0].startTimeoutSeconds': '90',
+      },
     );
     expect(both.code).toBe(0);
     const destinations = both.stdout
@@ -271,6 +350,7 @@ describe('backup-destination chart', () => {
     expect(pvc).toContain('workloadName: identity');
     expect(pvc).toContain('keepLast: 7');
     expect(pvc).toContain('scaleDownTimeoutSeconds: 120');
+    expect(pvc).toContain('startTimeoutSeconds: 90');
     expect(pvc).toContain('schedule: 30 3 * * *');
     expect(pvc).not.toContain('reports');
     expect(both.stdout).not.toContain('destination: pvc');

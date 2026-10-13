@@ -59,7 +59,12 @@ spec:
                 credentialsSecretRef:
                   type: object
                   properties:
-                    name: { type: string, minLength: 1 }
+                    # A Secret name (DNS subdomain); the operator puts it in a request path.
+                    name:
+                      type: string
+                      minLength: 1
+                      maxLength: 253
+                      pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
                 # A claim in the runtime namespace (di-runtime-<tenant>), where agent Jobs run.
                 existingClaimName: { type: string, minLength: 1 }
                 # Read by the chart, which creates claim di-backup-pvc. The operator creates no claims.
@@ -68,7 +73,10 @@ spec:
                   properties:
                     storageClassName: { type: string }
                     size: { type: string, minLength: 1 }
-                schedule: { type: string }
+                # Five-field UTC cron. Values out of range are reported, and never run.
+                schedule:
+                  type: string
+                  pattern: '^(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)*$'
                 retention:
                   type: object
                   properties:
@@ -100,9 +108,11 @@ spec:
                         maxLength: 63
                         pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
                       # UTC cron. No default: without it the source is backed up on demand only.
+                      # Numbers, *, ranges, steps, and lists in each of five fields. A value out
+                      # of range shows as ScheduleInvalid in the status row and never runs.
                       schedule:
                         type: string
-                        pattern: '^\S+ \S+ \S+ \S+ \S+$'
+                        pattern: '^(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)*$'
                       # No default: without a rule every backup is kept.
                       retention:
                         type: object
@@ -116,6 +126,24 @@ spec:
                       scaleDownTimeoutSeconds: { type: integer, minimum: 10, maximum: 3600 }
                       # The copy Job's activeDeadlineSeconds.
                       copyTimeoutSeconds: { type: integer, minimum: 60, maximum: 86400 }
+                      # How long the placement probe, then the copy Job, may take to start.
+                      # The probe runs before the scale-down; a copy Job that does not start
+                      # in time gives the replicas back at once.
+                      startTimeoutSeconds: { type: integer, minimum: 30, maximum: 1800 }
+                      # Copy Job resources. Default requests 50m/64Mi, limits 100m/128Mi.
+                      resources:
+                        type: object
+                        properties:
+                          requests:
+                            type: object
+                            properties:
+                              cpu: { type: string, pattern: '^[0-9]+(\.[0-9]+)?m?$' }
+                              memory: { type: string, pattern: '^[0-9]+(Ki|Mi|Gi|Ti|k|M|G|T)?$' }
+                          limits:
+                            type: object
+                            properties:
+                              cpu: { type: string, pattern: '^[0-9]+(\.[0-9]+)?m?$' }
+                              memory: { type: string, pattern: '^[0-9]+(Ki|Mi|Gi|Ti|k|M|G|T)?$' }
                       suspend: { type: boolean }
             status:
               type: object
@@ -128,6 +156,8 @@ spec:
                       kind: { type: string }
                       workloadName: { type: string }
                       lastScheduledTime: { type: string }
+                      schedule: { type: string }
+                      scheduleStatus: { type: string }
                       lastBackupName: { type: string }
                       lastReason: { type: string }
                       lastSuccessTime: { type: string }
@@ -194,7 +224,10 @@ spec:
                   required: [kind, workloadName]
                   properties:
                     kind: { type: string, enum: ['workload-volume'] }
-                    workloadName: { type: string, minLength: 1 }
+                    workloadName:
+                      type: string
+                      maxLength: 63
+                      pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
               x-kubernetes-validations:
                 - rule: 'self.serviceName == oldSelf.serviceName && self.uid == oldSelf.uid && self.type == oldSelf.type && self.className == oldSelf.className'
                   message: backup identity is immutable
@@ -202,6 +235,8 @@ spec:
                   message: backup source is immutable
                 - rule: "!has(self.source) || (self.type == 'workload-volume' && self.serviceName == self.source.workloadName)"
                   message: a workload-volume backup has type workload-volume and names its workload in serviceName
+                - rule: "self.type != 'workload-volume' || has(self.source)"
+                  message: a workload-volume backup needs source
             status:
               type: object
               properties:
@@ -215,7 +250,17 @@ spec:
                   type: object
                   description: Progress of a workload-volume copy or restore (#232).
                   properties:
-                    stage: { type: string, enum: ['ScalingDown', 'Copying', 'Done'] }
+                    stage:
+                      type: string
+                      enum: ['Placing', 'ScalingDown', 'Copying', 'ScalingUp', 'Done']
+                    placingStartedAt: { type: string }
+                    probeJob: { type: string }
+                    copyJob: { type: string }
+                    abortedJob: { type: string }
+                    abortedAt: { type: string }
+                    # The result, kept while the replicas are given back.
+                    outcome: { type: object, x-kubernetes-preserve-unknown-fields: true }
+                    restoringPath: { type: string }
                     members:
                       type: array
                       items:
@@ -268,6 +313,8 @@ spec:
                   message: set exactly one of targetServiceName and targetWorkloadName
                 - rule: '!has(self.force) || has(self.targetWorkloadName)'
                   message: force applies to a workload-volume restore
+                - rule: '!has(self.expectedKcv) || has(self.targetWorkloadName)'
+                  message: expectedKcv applies to a workload-volume restore
                 - rule: 'self == oldSelf'
                   message: a restore request is immutable
               properties:
@@ -298,7 +345,17 @@ spec:
                   type: object
                   description: Progress of a workload-volume copy or restore (#232).
                   properties:
-                    stage: { type: string, enum: ['ScalingDown', 'Copying', 'Done'] }
+                    stage:
+                      type: string
+                      enum: ['Placing', 'ScalingDown', 'Copying', 'ScalingUp', 'Done']
+                    placingStartedAt: { type: string }
+                    probeJob: { type: string }
+                    copyJob: { type: string }
+                    abortedJob: { type: string }
+                    abortedAt: { type: string }
+                    # The result, kept while the replicas are given back.
+                    outcome: { type: object, x-kubernetes-preserve-unknown-fields: true }
+                    restoringPath: { type: string }
                     members:
                       type: array
                       items:
