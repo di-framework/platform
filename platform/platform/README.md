@@ -650,7 +650,7 @@ With config `tenantAuth` set, the tenant reconcile deploys each tenant's control
 
 ```yaml
 tenantAuth:
-  image: ghcr.io/di-framework/tenant-auth@sha256:08de65c629e10f10c7b5a994e1d5f917cbaa477660a0016fe207f32025c9de60   # required, pinned by digest
+  image: ghcr.io/di-framework/tenant-auth@sha256:2cd409ec6a67639fdf09c565b497c2524228e10de7b2cde0bf6d83857b4a1e6c   # required, pinned by digest
   issuer: http://identity.acme.localhost:28180               # identity-server, as pods and browsers name it
   oauthClient: { id: access, secretName: tenant-auth-oauth } # Secret in the platform namespace; key `clientSecret`
   issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80  # optional, for a loopback issuer
