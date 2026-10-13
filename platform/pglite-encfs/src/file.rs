@@ -11,13 +11,23 @@
 //! - A write past the end first zero-fills the gap with encrypted zeros: a hole
 //!   left by the host would read back as garbage, not zeros.
 //! - Torn and interrupted writes behave like plaintext at 16-byte block
-//!   granularity, except at a final partial block: changing the length of a
-//!   unit that ends mid-block re-encrypts its last full block and the partial
-//!   block (ciphertext stealing, or the sub-block mask). A crash in the middle
-//!   of such a resize or append can therefore garble up to 31 durable bytes
-//!   just before the old or new end of file (see the
-//!   `unaligned_resizes_bound_crash_damage` test, and #206). Relation and WAL I/O is in
-//!   whole 8 KiB pages and never hits this.
+//!   granularity. At a final partial block it depends on the file's codec
+//!   (see `codec`):
+//!   - Codec 3 (new files): the ciphertext of complete blocks and of the bytes
+//!     already in a partial block does not depend on the unit's length. A
+//!     shrink or an append that stays inside one block, or starts or ends on a
+//!     block boundary, rewrites no durable byte differently. Only a resize that
+//!     completes a partial block (append) or splits a complete one (shrink)
+//!     re-encrypts that block's durable partial bytes, so a crash between that
+//!     write and the size change garbles at most 15 bytes just before the
+//!     durable end of file.
+//!   - Codec 2 (files created by v1): changing the length of a unit that ends
+//!     mid-block re-encrypts its last full block and the partial block
+//!     (ciphertext stealing, or the sub-block mask), so a crash can garble up
+//!     to 31 durable bytes.
+//!
+//!   Both bounds are pinned by `unaligned_resizes_bound_crash_damage` (#206).
+//!   Relation and WAL I/O is in whole 8 KiB pages and never hits either.
 //! - Sizes are capped at [`MAX_SIZE`], and a write may extend a file by at
 //!   most [`MAX_GAP`] of zero fill, so absurd offsets fail instead of writing
 //!   terabytes of encrypted zeros.
@@ -202,6 +212,7 @@ impl<S: Storage> EncryptedFile<'_, S> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::codec::Codec;
     use std::cell::RefCell;
 
     /// In-memory physical file.
@@ -234,8 +245,12 @@ pub(crate) mod tests {
         }
     }
 
+    fn cipher_with(codec: Codec) -> UnitCipher {
+        UnitCipher::new(codec, &core::array::from_fn(|i| i as u8 ^ 0x5A))
+    }
+
     fn cipher() -> UnitCipher {
-        UnitCipher::new(&core::array::from_fn(|i| i as u8 ^ 0x5A))
+        cipher_with(Codec::NEW_FILES)
     }
 
     /// A file whose header has been written (content irrelevant here).
@@ -483,8 +498,8 @@ pub(crate) mod tests {
     }
 
     /// Bytes of `durable` that read back differently after a simulated crash.
-    fn damage(storage: &Memory, durable: &[u8]) -> Vec<usize> {
-        let c = cipher();
+    fn damage(codec: Codec, storage: &Memory, durable: &[u8]) -> Vec<usize> {
+        let c = cipher_with(codec);
         let file = EncryptedFile {
             cipher: &c,
             storage,
@@ -495,117 +510,315 @@ pub(crate) mod tests {
             .collect()
     }
 
-    fn assert_bounded(damaged: &[usize], durable_len: usize, aligned: bool, case: &str) {
-        if aligned {
-            assert!(
-                damaged.is_empty(),
-                "{case}: aligned lengths must not lose bytes: {damaged:?}"
-            );
-        }
-        let floor = (durable_len / 16 * 16).saturating_sub(16);
-        assert!(
-            damaged.len() <= 31,
-            "{case}: {} bytes damaged",
-            damaged.len()
-        );
-        assert!(
-            damaged.iter().all(|&i| i >= floor),
-            "{case}: damage before {floor}: {damaged:?}"
-        );
-    }
-
-    #[test]
-    fn unaligned_resizes_bound_crash_damage() {
-        // W2 of the #201 review: XTS keeps torn writes plaintext-like only for whole
-        // 16-byte blocks. Changing the length of a unit that ends mid-block
-        // re-encrypts its last full block and the partial one, so a crash between
-        // that rewrite and the size change garbles at most 31 bytes just before the
-        // durable end; aligned lengths lose nothing.
-        let c = cipher();
-        let data: Vec<u8> = (0..3 * UNIT as usize)
-            .map(|i| (i * 7 % 251) as u8 + 1)
-            .collect();
-        let lengths = [
-            5,
-            16,
-            17,
-            31,
-            32,
-            4000,
-            4001,
-            4095,
-            4096,
-            4096 + 17,
-            8192 + 33,
-        ];
-        for &old in &lengths {
-            for &new in &lengths {
-                let setup = |len: usize| {
-                    let m = with_header();
-                    EncryptedFile {
-                        cipher: &c,
-                        storage: &m,
-                    }
-                    .write(0, &data[..len])
-                    .unwrap();
-                    Crashing(m)
-                };
-                let aligned = old % 16 == 0 && new % 16 == 0;
-                if new < old {
-                    // Shrink: the tail unit is rewritten, then the crash skips set_len.
-                    let s = setup(old);
-                    let crashed = EncryptedFile {
-                        cipher: &c,
-                        storage: &s,
-                    }
-                    .set_size(new as u64);
-                    assert!(crashed.is_err());
-                    let case = format!("shrink {old}->{new}");
-                    assert_bounded(&damage(&s.0, &data[..new]), new, aligned, &case);
-                } else if new > old {
-                    // Append: the new ciphertext lands, the size never grows.
-                    let s = setup(old);
-                    EncryptedFile {
-                        cipher: &c,
-                        storage: &s,
-                    }
-                    .write(old as u64, &data[old..new])
-                    .unwrap();
-                    let case = format!("append {old}->{new}");
-                    assert_bounded(&damage(&s.0, &data[..old]), old, aligned, &case);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn the_review_reproduction_damages_17_bytes() {
-        // set_size(4001) on a 4096-byte file, crash before set_len: bytes 3984..=4000.
-        let c = cipher();
-        let data: Vec<u8> = (0..4096usize).map(|i| (i % 251) as u8 + 1).collect();
+    /// Simulate a crash in the middle of resizing a file from `old` to `new`
+    /// bytes of `data`, and return the durable bytes it garbled.
+    fn crash_resize(codec: Codec, data: &[u8], old: usize, new: usize) -> Vec<usize> {
+        let c = cipher_with(codec);
         let m = with_header();
         EncryptedFile {
             cipher: &c,
             storage: &m,
         }
-        .write(0, &data)
+        .write(0, &data[..old])
         .unwrap();
         let s = Crashing(m);
-        assert!(EncryptedFile {
+        let file = EncryptedFile {
             cipher: &c,
-            storage: &s
+            storage: &s,
+        };
+        if new < old {
+            // Shrink: the tail unit is rewritten, then the crash skips set_len.
+            assert!(file.set_size(new as u64).is_err());
+            damage(codec, &s.0, &data[..new])
+        } else {
+            // Append: the new ciphertext lands, the size never grows.
+            file.write(old as u64, &data[old..new]).unwrap();
+            damage(codec, &s.0, &data[..old])
         }
-        .set_size(4001)
-        .is_err());
+    }
+
+    /// Lengths around block and unit edges, including several inside the
+    /// block 4000..4016.
+    const RESIZE_LENGTHS: [usize; 17] = [
+        5,
+        15,
+        16,
+        17,
+        20,
+        31,
+        32,
+        4000,
+        4001,
+        4005,
+        4015,
+        4095,
+        4096,
+        4096 + 1,
+        4096 + 17,
+        8192 + 33,
+        8192 + 40,
+    ];
+
+    fn resize_data() -> Vec<u8> {
+        (0..3 * UNIT as usize)
+            .map(|i| (i * 7 % 251) as u8 + 1)
+            .collect()
+    }
+
+    #[test]
+    fn unaligned_resizes_bound_crash_damage() {
+        // W2 of the #201 review, fixed by codec 3 (#206). Complete blocks never
+        // change their ciphertext with the length, and a partial block's bytes
+        // are a prefix of a length-independent keystream. A crash between the
+        // tail rewrite and the size change therefore loses nothing for a shrink
+        // or append inside one block (or on a block boundary). Only completing
+        // a partial block (append) or splitting a complete one (shrink)
+        // re-encrypts that block's durable partial bytes: at most 15, all in
+        // the block that holds the durable end.
+        let data = resize_data();
+        let mut bounded = 0;
+        let mut lossy = 0;
+        for &old in &RESIZE_LENGTHS {
+            for &new in &RESIZE_LENGTHS {
+                if new == old {
+                    continue;
+                }
+                let damaged = crash_resize(Codec::XtsTail, &data, old, new);
+                let (case, durable) = if new < old {
+                    (format!("shrink {old}->{new}"), new)
+                } else {
+                    (format!("append {old}->{new}"), old)
+                };
+                let same_block = old / 16 == new / 16;
+                if durable % 16 == 0 || same_block {
+                    assert!(damaged.is_empty(), "{case}: lost {damaged:?}");
+                } else {
+                    bounded += 1;
+                    lossy += usize::from(!damaged.is_empty());
+                    let floor = durable / 16 * 16;
+                    assert!(damaged.len() <= 15, "{case}: lost {damaged:?}");
+                    assert!(
+                        damaged.iter().all(|&i| (floor..durable).contains(&i)),
+                        "{case}: damage outside {floor}..{durable}: {damaged:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            bounded > 0,
+            "the completing and splitting cases are covered"
+        );
+        assert!(lossy > 0, "the bound is not vacuous: some case loses bytes");
+    }
+
+    #[test]
+    fn codec_2_files_keep_their_31_byte_bound() {
+        // Files created by v1 keep codec 2, and with it the old bound: changing
+        // the length of a unit that ends mid-block re-encrypts its last full
+        // block and the partial one; aligned lengths lose nothing.
+        let data = resize_data();
+        for &old in &RESIZE_LENGTHS {
+            for &new in &RESIZE_LENGTHS {
+                if new == old {
+                    continue;
+                }
+                let damaged = crash_resize(Codec::XtsStealing, &data, old, new);
+                let durable = old.min(new);
+                let case = format!("{old}->{new}");
+                if old % 16 == 0 && new % 16 == 0 {
+                    assert!(damaged.is_empty(), "{case}: lost {damaged:?}");
+                }
+                let floor = (durable / 16 * 16).saturating_sub(16);
+                assert!(damaged.len() <= 31, "{case}: lost {damaged:?}");
+                assert!(
+                    damaged.iter().all(|&i| i >= floor),
+                    "{case}: damage before {floor}: {damaged:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_review_reproduction() {
+        // set_size(4001) on a 4096-byte file, crash before set_len. Codec 2
+        // garbles bytes 3984..=4000; codec 3 can only touch byte 4000, the one
+        // durable byte of the block that the shrink splits.
+        let data: Vec<u8> = (0..4096usize).map(|i| (i % 251) as u8 + 1).collect();
         assert_eq!(
-            damage(&s.0, &data[..4001]),
+            crash_resize(Codec::XtsStealing, &data, 4096, 4001),
             (3984..=4000).collect::<Vec<_>>()
         );
+        assert_eq!(crash_resize(Codec::XtsTail, &data, 4096, 4001), vec![4000]);
+        // Appending 1 byte to a 4000-byte file: codec 2 garbles 3984..3999,
+        // codec 3 loses nothing.
+        assert_eq!(
+            crash_resize(Codec::XtsStealing, &data, 4000, 4001),
+            (3984..4000).collect::<Vec<_>>()
+        );
+        assert!(crash_resize(Codec::XtsTail, &data, 4000, 4001).is_empty());
+        // Inside one block: codec 2 still loses bytes, codec 3 nothing.
+        assert!(!crash_resize(Codec::XtsStealing, &data, 4001, 4002).is_empty());
+        assert!(crash_resize(Codec::XtsTail, &data, 4001, 4002).is_empty());
+        assert!(crash_resize(Codec::XtsTail, &data, 4005, 4001).is_empty());
+    }
+
+    #[test]
+    fn codec_3_round_trips_at_block_and_unit_edges() {
+        for len in [0usize, 1, 15, 16, 17, 31, 4095, 4096, 4097] {
+            let (c, m) = (cipher_with(Codec::XtsTail), with_header());
+            let file = EncryptedFile {
+                cipher: &c,
+                storage: &m,
+            };
+            let data: Vec<u8> = (0..len).map(|i| (i * 13 % 251) as u8 + 1).collect();
+            file.write(0, &data).unwrap();
+            assert_eq!(m.0.borrow().len(), HEADER_LEN as usize + len, "len {len}");
+            assert_eq!(read_all(&file), data, "len {len}");
+            if len >= 4 {
+                assert!(
+                    !m.0.borrow().windows(4).any(|w| w == &data[..4]),
+                    "len {len} is not plaintext on disk"
+                );
+            }
+            // Growing the file by small appends never changes the ciphertext
+            // already on disk, except for the durable bytes of a partial block
+            // that the append completes.
+            let (c2, m2) = (cipher_with(Codec::XtsTail), with_header());
+            let grown = EncryptedFile {
+                cipher: &c2,
+                storage: &m2,
+            };
+            let mut at = 0;
+            for step in [1usize, 7, 16, 3, 13, 30].iter().cycle() {
+                if at == len {
+                    break;
+                }
+                let end = (at + step).min(len);
+                let before = m2.0.borrow().clone();
+                grown.write(at as u64, &data[at..end]).unwrap();
+                let block = at / 16 * 16;
+                let stable = if at / 16 == end / 16 { at } else { block };
+                let h = HEADER_LEN as usize;
+                assert_eq!(
+                    m2.0.borrow()[h..h + stable],
+                    before[h..h + stable],
+                    "len {len}: append {at}..{end}"
+                );
+                at = end;
+            }
+            assert_eq!(*m2.0.borrow(), *m.0.borrow(), "len {len}");
+        }
+    }
+
+    /// Fixtures written by the v1 (codec 2) build before #206, see
+    /// `testdata/codec2`: master key `[0x11; 32]`, DEK byte i = 3i + 1,
+    /// plaintext byte i = (13i + 5) % 251, one `write(0, ..)` per length.
+    const CODEC2_FIXTURES: [(usize, &[u8]); 11] = [
+        (0, include_bytes!("testdata/codec2/len-0.bin")),
+        (3, include_bytes!("testdata/codec2/len-3.bin")),
+        (15, include_bytes!("testdata/codec2/len-15.bin")),
+        (16, include_bytes!("testdata/codec2/len-16.bin")),
+        (17, include_bytes!("testdata/codec2/len-17.bin")),
+        (31, include_bytes!("testdata/codec2/len-31.bin")),
+        (4001, include_bytes!("testdata/codec2/len-4001.bin")),
+        (4095, include_bytes!("testdata/codec2/len-4095.bin")),
+        (4096, include_bytes!("testdata/codec2/len-4096.bin")),
+        (4097, include_bytes!("testdata/codec2/len-4097.bin")),
+        (8225, include_bytes!("testdata/codec2/len-8225.bin")),
+    ];
+
+    fn fixture_plain(len: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i * 13 + 5) % 251) as u8).collect()
+    }
+
+    /// Open a fixture as the component does: parse the header, unwrap the DEK
+    /// and pick the cipher for the header's codec.
+    fn open_fixture(bytes: &[u8]) -> (crate::header::Header, UnitCipher) {
+        use crate::header::{classify, HeaderState};
+        let kek = crate::keys::Kek::derive(&[0x11; 32]);
+        let header = match classify(bytes, bytes.len() as u64).unwrap() {
+            HeaderState::Sealed(header) => header,
+            HeaderState::Fresh => panic!("fixture has a header"),
+        };
+        let dek = header.open(&kek).unwrap();
+        let expected: [u8; 64] =
+            core::array::from_fn(|i| (i as u8).wrapping_mul(3).wrapping_add(1));
+        assert_eq!(*dek, expected);
+        let cipher = UnitCipher::new(header.codec(), &dek);
+        (header, cipher)
+    }
+
+    #[test]
+    fn codec_2_fixtures_from_v1_still_read() {
+        for (len, bytes) in CODEC2_FIXTURES {
+            assert_eq!(bytes.len(), HEADER_LEN as usize + len);
+            let (header, c) = open_fixture(bytes);
+            assert_eq!(header.codec(), Codec::XtsStealing, "len {len}");
+            let m = Memory(RefCell::new(bytes.to_vec()));
+            let file = EncryptedFile {
+                cipher: &c,
+                storage: &m,
+            };
+            assert_eq!(read_all(&file), fixture_plain(len), "len {len}");
+            // The codec-2 writer is unchanged: rewriting the same plaintext
+            // reproduces the v1 bytes exactly.
+            file.write(0, &fixture_plain(len)).unwrap();
+            assert_eq!(&m.0.borrow()[..], bytes, "len {len}");
+        }
+    }
+
+    #[test]
+    fn codec_2_files_stay_codec_2_when_written() {
+        // A file keeps its codec for life: appends, overwrites and shrinks of
+        // a v1 file keep codec 2 and its header, and stay readable.
+        let (_, bytes) = CODEC2_FIXTURES[6];
+        let (header, c) = open_fixture(bytes);
+        let m = Memory(RefCell::new(bytes.to_vec()));
+        let file = EncryptedFile {
+            cipher: &c,
+            storage: &m,
+        };
+        let mut model = fixture_plain(4001);
+        file.write(4001, b"appended").unwrap();
+        model.extend_from_slice(b"appended");
+        file.write(10, b"overwrite").unwrap();
+        model[10..19].copy_from_slice(b"overwrite");
+        file.set_size(4003).unwrap();
+        model.truncate(4003);
+        assert_eq!(read_all(&file), model);
+        assert_eq!(
+            &m.0.borrow()[..HEADER_LEN as usize],
+            &bytes[..HEADER_LEN as usize]
+        );
+        // Same bytes as a fresh codec-2 file with that content.
+        let fresh = Memory(RefCell::new(bytes[..HEADER_LEN as usize].to_vec()));
+        EncryptedFile {
+            cipher: &c,
+            storage: &fresh,
+        }
+        .write(0, &model)
+        .unwrap();
+        assert_eq!(*fresh.0.borrow(), *m.0.borrow());
+        // Decoding it as codec 3 would garble the stolen tail: the codec matters.
+        let dek = header.open(&crate::keys::Kek::derive(&[0x11; 32])).unwrap();
+        let wrong = UnitCipher::new(Codec::XtsTail, &dek);
+        let misread = read_all(&EncryptedFile {
+            cipher: &wrong,
+            storage: &m,
+        });
+        assert_eq!(misread[..3984], model[..3984]);
+        assert_ne!(misread[3984..], model[3984..]);
     }
 
     #[test]
     fn matches_a_plaintext_model_under_random_operations() {
-        let (c, m) = (cipher(), with_header());
+        for codec in [Codec::XtsStealing, Codec::XtsTail] {
+            random_operations_match_the_model(codec);
+        }
+    }
+
+    fn random_operations_match_the_model(codec: Codec) {
+        let (c, m) = (cipher_with(codec), with_header());
         let file = EncryptedFile {
             cipher: &c,
             storage: &m,

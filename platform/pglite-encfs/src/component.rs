@@ -49,7 +49,7 @@ use bindings::wasi::random::random as hrand;
 
 use xfs::ErrorCode;
 
-use crate::codec::UnitCipher;
+use crate::codec::{Codec, UnitCipher};
 use crate::file::{logical_size, EncryptedFile, FileError, Storage};
 use crate::header::{
     classify, FileId, Header, HeaderError, HeaderState, DEK_LEN, HEADER_LEN, HEADER_USED,
@@ -61,9 +61,16 @@ type R<T> = Result<T, ErrorCode>;
 
 /// Lets a deploy check that a composed provider really contains this layer;
 /// the section survives `wac plug`, which nests the component unchanged.
+/// `write-codec=N`: the codec this build creates new files with. 3 (#206) can
+/// only be read by builds that know codec 3. Advisory: nothing parses the value
+/// yet.
 #[used]
 #[link_section = "di-framework:pglite-encfs"]
-static BUILD_MARKER: [u8; 26] = *b"format=1 codec=aes-256-xts";
+static BUILD_MARKER: [u8; 40] = if cfg!(feature = "write-codec-3") {
+    *b"format=1 codec=aes-256-xts write-codec=3"
+} else {
+    *b"format=1 codec=aes-256-xts write-codec=2"
+};
 
 /// Write buffers that stream writers may hand over at once.
 const STREAM_WRITE_BUDGET: u64 = 1 << 20;
@@ -307,7 +314,7 @@ impl File {
             Some(cipher) => cipher,
             None => {
                 let dek = header.open(kek).map_err(|e| header_error(&self.path, e))?;
-                let cipher = Rc::new(UnitCipher::new(&dek));
+                let cipher = Rc::new(UnitCipher::new(header.codec(), &dek));
                 state
                     .ciphers
                     .borrow_mut()
@@ -330,12 +337,12 @@ impl File {
         let kek = current_key(&state)?;
         let file_id: FileId = random();
         let dek = Zeroizing::new(random::<DEK_LEN>());
-        let header = Header::seal(kek, &file_id, &dek, &random());
+        let header = Header::seal(kek, Codec::NEW_FILES, &file_id, &dek, &random());
         let mut block = vec![0u8; HEADER_LEN as usize];
         block[..HEADER_USED].copy_from_slice(header.as_bytes());
         HostStorage(&self.host).write_at(0, &block).map_err(host)?;
         self.host.sync_data().map_err(host)?;
-        let cipher = Rc::new(UnitCipher::new(&dek));
+        let cipher = Rc::new(UnitCipher::new(Codec::NEW_FILES, &dek));
         state
             .ciphers
             .borrow_mut()

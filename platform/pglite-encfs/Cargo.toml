@@ -30,6 +30,13 @@ zeroize = { version = "=1.9.1", default-features = false, features = ["alloc"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wit-bindgen = { version = "=0.61.1", default-features = false, features = ["macros", "realloc", "bitflags"] }
 
+# Writing codec-3 files is opt-in (#206): a default build reads codec 2 and 3
+# but creates codec 2, so a deployment can always roll back to this release.
+# A later release flips the default once every reader can open codec 3.
+[features]
+default = []
+write-codec-3 = []
+
 [profile.release]
 opt-level = 3
 lto = true
