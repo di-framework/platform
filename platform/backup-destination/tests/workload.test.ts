@@ -94,6 +94,8 @@ describe('cold copy of a workload volume', () => {
       'finalizers',
       'create-job',
       'destination-status',
+      // The first reconcile logs the destination's NoSchedule state once (#250).
+      'log',
     ]);
     expect(place[0]).toMatchObject({
       status: {
@@ -1139,9 +1141,27 @@ describe('schedule and retention', () => {
       expect(performance.now() - started).toBeLessThan(2000);
       expect(cluster.world.backups).toEqual([]);
       if (schedule !== '0 0 31 2 *') {
-        expect(cluster.destination()?.status.sources?.[0]?.scheduleStatus).toBe('ScheduleInvalid');
+        expect(cluster.destination()?.status.sources?.[0]?.scheduleStatus).toBe('InvalidSchedule');
         expect(render(cluster.world)).toContain('invalid: it never runs');
       }
+    }
+  });
+
+  test('a source with schedule "none" is on demand only and never fires (#250)', () => {
+    for (const schedule of ['none', ' none ', undefined]) {
+      const cluster = new Cluster(
+        volumeWorld({
+          destination: pvcDestination({
+            sources: [{ kind: 'workload-volume', workloadName: 'identity', schedule }],
+          }),
+        }),
+      );
+      for (let i = 0; i < 30; i += 1) cluster.tick(3600);
+      expect(cluster.world.backups).toEqual([]);
+      const row = cluster.destination()?.status.sources?.[0];
+      expect(row?.scheduleStatus).toBe('OnDemand');
+      expect(row?.schedule).toBeUndefined();
+      expect(render(cluster.world)).toContain('no schedule (on demand only)');
     }
   });
 

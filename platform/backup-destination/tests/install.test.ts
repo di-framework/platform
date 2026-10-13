@@ -120,9 +120,48 @@ describe('backup helm release', () => {
         type: 'pvc',
         existingClaimName: 'c',
         storageRoot: '/var/lib/k0s',
+        schedule: 'none',
         sources,
       }).values,
-    ).toEqual({ type: 'pvc', existingClaimName: 'c', storageRoot: '/var/lib/k0s', sources });
+    ).toEqual({
+      type: 'pvc',
+      existingClaimName: 'c',
+      storageRoot: '/var/lib/k0s',
+      schedule: 'none',
+      sources,
+    });
+  });
+
+  test('requires an explicit schedule or "none" on every workload-volume source (#250)', () => {
+    const base = { tenant: 'alpha', chart: '/chart', type: 'pvc' as const, schedule: 'none' };
+    const sourcesOf = (install: BackupDestinationInstall) =>
+      (backupReleaseArgs(install).values as Record<string, unknown>).sources;
+    const none = [{ workloadName: 'identity', schedule: 'none' }];
+    expect(sourcesOf({ ...base, sources: none })).toEqual(none);
+    for (const schedule of [undefined, '', '  ']) {
+      expect(() =>
+        backupReleaseArgs({
+          ...base,
+          sources: [{ workloadName: 'identity', schedule }] as unknown as typeof none,
+        }),
+      ).toThrow('source identity: schedule is required');
+    }
+    for (const schedule of ['nightly', 'nonesuch', 'none 0 2 * * *', '99 * * * *']) {
+      expect(() =>
+        backupReleaseArgs({ ...base, sources: [{ workloadName: 'x', schedule }] }),
+      ).toThrow('source x: schedule must be a five-field UTC cron');
+    }
+    // An Output (a whole list or one schedule) is passed through; the chart validates it.
+    const output = pulumi.output(none);
+    expect(sourcesOf({ ...base, sources: output })).toBe(output);
+    const lazy = [{ workloadName: 'x', schedule: pulumi.output('0 1 * * *') }];
+    expect(sourcesOf({ ...base, sources: lazy as unknown as typeof none })).toBe(lazy);
+    expect(() =>
+      backupReleaseArgs({ ...base, sources: [null, 'x'] as unknown as typeof none }),
+    ).not.toThrow();
+    expect(() =>
+      backupReleaseArgs({ ...base, sources: [{ schedule: 7 }] as unknown as typeof none }),
+    ).toThrow('source ?: schedule is required');
   });
 
   test('rejects a namespace that is not a tenant name', () => {

@@ -47,7 +47,7 @@ helm upgrade backups platform/backup-destination/chart -n di-tenant-<name> --reu
 helm upgrade backups platform/backup-destination/chart -n di-tenant-<name> --reuse-values --set-string schedule=none
 ```
 
-With Pulumi, `installBackupDestination` now requires `install.schedule` (`'0 2 * * *'` or `'none'`). An existing `BackupDestination` object without `spec.schedule` (for example one applied by hand) stops taking scheduled backups after the operator upgrade and reports `Scheduled=False`, reason `NoSchedule`; list the destinations that are `NoSchedule` or `InvalidSchedule` with:
+With Pulumi, `installBackupDestination` now requires `install.schedule` (`'0 2 * * *'` or `'none'`). The same goes for every workload-volume source: each entry in `sources` needs its own `schedule` (a cron or `none`), and the CRD accepts `none` for both the destination and its sources. An existing `BackupDestination` object without `spec.schedule` (for example one applied by hand) stops taking scheduled backups after the operator upgrade and reports `Scheduled=False`, reason `NoSchedule`; list the destinations that are `NoSchedule` or `InvalidSchedule` with:
 
 ```sh
 kubectl get backupdestinations -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} {.status.conditions[?(@.type=="Scheduled")].reason}{"\n"}{end}' | grep -E 'NoSchedule|InvalidSchedule'
@@ -62,7 +62,7 @@ A WorkloadDeployment with platform storage (`di-framework.dev/persistent-storage
 ```yaml
 sources:
   - workloadName: identity
-    schedule: "30 3 * * *"   # UTC cron; omit for on-demand backups only
+    schedule: "30 3 * * *"   # required: UTC cron, or "none" for on-demand backups only
     retention:               # omit to keep every backup
       keepLast: 7
       daily: 7
@@ -77,10 +77,10 @@ Optional per source: `scaleDownTimeoutSeconds` (default 300), `copyTimeoutSecond
 The chart renders each entry into `BackupDestination.spec.sources`. Leave `storageRoot` empty (the default): the operator then takes the root from the path the tenant host pods mount, which always matches the platform's `storageRoot`. When you set it (Kubesolo: `/var/lib/kubesolo`, k0s: `/var/lib/k0s`), the host pods must mount exactly that path, or the backup fails with `VolumeNotMounted` and nothing is stopped.
 
 **There is no default schedule and no default retention.**
-- **Schedule.** A source without `schedule` is never backed up on a schedule. "Back up now" on the console, or a `Backup` you create, still works.
+- **Schedule.** Every source needs `schedule` (#250): a five-field UTC cron, or `none` for on-demand backups only. The chart and `installBackupDestination` refuse a source without one; a `BackupDestination` applied by hand with a source that has no `schedule` is treated like `none` (`scheduleStatus: OnDemand`). Either way it is never backed up on a schedule, and "Back up now" on the console, or a `Backup` you create, still works.
   - A schedule is armed when it is first seen, when it changes, and when the source is unsuspended. It never fires for a time before that, so an edit or an unsuspend never stops a workload at once.
   - A fire while a backup of the same source is still queued or running is skipped, and the console answers 409 to a second "Back up now". A workload is never stopped twice for one request.
-  - The CRD accepts five fields of numbers, `*`, ranges, steps and lists. A value out of range (`99 * * * *`) shows `scheduleStatus: ScheduleInvalid` in `status.sources[]` and on the console, and never runs. A run missed while the destination was busy happens once, when it can.
+  - The CRD accepts `none` or five fields of numbers, `*`, ranges, steps and lists. A value out of range (`99 * * * *`) shows `scheduleStatus: InvalidSchedule` in `status.sources[]` and on the console, and never runs. A run missed while the destination was busy happens once, when it can.
 - **Retention.** A source without a rule keeps every backup.
   - **Successful backups.** A backup is kept when any rule keeps it: it is one of the newest `keepLast`, or it is the newest backup of one of the newest `daily` UTC days, `weekly` ISO weeks or `monthly` UTC months that have a backup. As soon as one of these four rules is set, every successful backup no rule keeps is deleted, objects included.
   - **Failed attempts.** `failed` keeps that many of the newest failed attempts and deletes the older records. A failed copy that recorded no object key is pruned by its object prefix, so objects it may have written are not orphaned.

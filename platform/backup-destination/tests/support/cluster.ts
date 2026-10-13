@@ -38,7 +38,9 @@ export function pvcDestination(overrides: Partial<DestinationView['spec']> = {})
     spec: {
       type: 'pvc',
       existingClaimName: 'claim',
-      sources: [{ kind: 'workload-volume', workloadName: 'identity' }],
+      // Explicit, as the chart requires (#250): on-demand only, for the destination and source.
+      schedule: 'none',
+      sources: [{ kind: 'workload-volume', workloadName: 'identity', schedule: 'none' }],
       ...overrides,
     },
     // Service dumps are not due: the tests here are about workload volumes.

@@ -89,10 +89,10 @@ export interface SourceStatus {
   /** The schedule `lastScheduledTime` counts for. A different schedule re-arms the source. */
   schedule?: string;
   /**
-   * `Armed` counts toward the next fire. `Suspended`, `OnDemand` (no schedule) and
-   * `ScheduleInvalid` never fire, and leaving any of them re-arms the schedule from that moment.
+   * `Armed` counts toward the next fire. `Suspended`, `OnDemand` (no schedule, or `none`) and
+   * `InvalidSchedule` never fire, and leaving any of them re-arms the schedule from that moment.
    */
-  scheduleStatus?: 'Armed' | 'Suspended' | 'OnDemand' | 'ScheduleInvalid';
+  scheduleStatus?: 'Armed' | 'Suspended' | 'OnDemand' | 'InvalidSchedule';
   lastBackupName?: string;
   lastReason?: string;
   lastSuccessTime?: string;

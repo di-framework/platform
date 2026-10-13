@@ -348,15 +348,36 @@ describe('backup-destination chart', () => {
     const crds = await Bun.file(
       join(import.meta.dir, '..', 'chart', 'crds', 'backups.yaml'),
     ).text();
-    const patterns = [...crds.matchAll(/schedule:\n\s+type: string\n\s+pattern: '([^']+)'/g)].map(
-      (match) => new RegExp(match[1] ?? ''),
-    );
+    const patterns = [
+      ...crds.matchAll(/schedule:\n\s+type: string\n\s+maxLength: 128\n\s+pattern: '([^']+)'/g),
+    ].map((match) => new RegExp(match[1] ?? ''));
+    // The destination schedule and the workload-volume source schedule (#232).
     expect(patterns).toHaveLength(2);
     for (const pattern of patterns) {
-      for (const valid of ['0 2 * * *', '*/15 0-2 1,15 1-6 1-5', '30 3 * * 7', '0 0 1 1/3 *']) {
+      for (const valid of [
+        '0 2 * * *',
+        '*/15 0-2 1,15 1-6 1-5',
+        '30 3 * * 7',
+        '0 0 1 1/3 *',
+        'none',
+      ]) {
         expect(pattern.test(valid)).toBe(true);
       }
-      for (const invalid of ['a b c d e', '0 2 * *', '0 2 * * * *', '0  2 * * *', 'x/5 * * * *']) {
+      for (const invalid of [
+        'a b c d e',
+        '0 2 * *',
+        '0 2 * * * *',
+        '0  2 * * *',
+        'x/5 * * * *',
+        // "none" is a whole value: the alternation stays inside the anchors (#250).
+        'nonesuch',
+        'none 0 2 * * *',
+        'xnone',
+        'none ',
+        ' none',
+        'NONE',
+        'nonesuch 0 2 * * *',
+      ]) {
         expect(pattern.test(invalid)).toBe(false);
       }
     }
@@ -398,6 +419,7 @@ describe('backup-destination chart', () => {
       'sources[0].destination': 'pvc',
       'sources[1].workloadName': 'reports',
       'sources[1].destination': 's3',
+      'sources[1].schedule': 'none',
     };
     const both = await template(
       'di-tenant-alpha',
@@ -420,9 +442,12 @@ describe('backup-destination chart', () => {
       .split('\n---\n')
       .filter((doc) => doc.includes('v1alpha1\nkind: BackupDestination\n'));
     const [s3, pvc] = destinations;
-    expect(s3).toContain('- kind: workload-volume\n      workloadName: reports');
+    expect(s3).toContain(
+      '- kind: workload-volume\n      schedule: none\n      workloadName: reports',
+    );
     expect(s3).not.toContain('identity');
-    expect(s3?.slice(s3.indexOf('sources:'))).not.toContain('schedule');
+    expect(s3?.slice(s3.indexOf('sources:'))).toContain('schedule: none');
+    expect(s3?.slice(s3.indexOf('sources:'))).not.toMatch(/schedule: [0-9*]/);
     expect(pvc).toContain('workloadName: identity');
     expect(pvc).toContain('keepLast: 7');
     expect(pvc).toContain('scaleDownTimeoutSeconds: 120');
@@ -435,7 +460,9 @@ describe('backup-destination chart', () => {
       bucket: 'b',
       existingSecret: 's',
       'sources[0].workloadName': 'identity',
+      'sources[0].schedule': 'none',
     });
+    expect(single.code).toBe(0);
     expect(single.stdout).toContain('workloadName: identity');
     const none = await template('di-tenant-alpha', { bucket: 'b', existingSecret: 's' });
     const noneDestination = none.stdout
@@ -445,16 +472,43 @@ describe('backup-destination chart', () => {
 
     const refusals: [Record<string, string>, string][] = [
       [
-        { type: 'both', 'volumeClaimTemplate.size': '1Gi', 'sources[0].workloadName': 'x' },
+        {
+          type: 'both',
+          'volumeClaimTemplate.size': '1Gi',
+          'sources[0].workloadName': 'x',
+          'sources[0].schedule': 'none',
+        },
         'needs destination s3 or pvc',
       ],
       [
-        { 'sources[0].workloadName': 'x', 'sources[0].destination': 'nfs' },
+        {
+          'sources[0].workloadName': 'x',
+          'sources[0].schedule': 'none',
+          'sources[0].destination': 'nfs',
+        },
         'destination must be s3 or pvc',
       ],
       [
-        { 'sources[0].workloadName': 'x', 'sources[0].destination': 'pvc' },
+        {
+          'sources[0].workloadName': 'x',
+          'sources[0].schedule': 'none',
+          'sources[0].destination': 'pvc',
+        },
         'is not rendered with type s3',
+      ],
+      // No default source schedule either (#250).
+      [{ 'sources[0].workloadName': 'x' }, 'source x: schedule is required'],
+      [
+        { 'sources[0].workloadName': 'x', 'sources[0].schedule': '  ' },
+        'source x: schedule is required',
+      ],
+      [
+        { 'sources[0].workloadName': 'x', 'sources[0].schedule': 'nonesuch' },
+        'source x: schedule "nonesuch" must be a five-field UTC cron',
+      ],
+      [
+        { 'sources[0].workloadName': 'x', 'sources[0].schedule': '99 * * * *' },
+        'must be a five-field UTC cron',
       ],
       [{ 'sources[0].schedule': '* * * * *' }, 'every source needs a workloadName'],
     ];

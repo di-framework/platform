@@ -38,6 +38,14 @@
 {{- if not .workloadName -}}
 {{- fail "every source needs a workloadName" -}}
 {{- end -}}
+{{- /* No default source schedule either (#250): a cron, or "none" for on-demand only. */ -}}
+{{- $sourceSchedule := .schedule | default "" | toString | trim -}}
+{{- if not $sourceSchedule -}}
+{{- fail (printf "source %s: schedule is required: set a five-field UTC cron, or \"none\" for on-demand backups only (there is no default since #250)" .workloadName) -}}
+{{- end -}}
+{{- if and (ne $sourceSchedule "none") (not (regexMatch (printf "^%s$" (join " " $parts)) $sourceSchedule)) -}}
+{{- fail (printf "source %s: schedule %q must be a five-field UTC cron (minute hour day month weekday) or \"none\"" .workloadName $sourceSchedule) -}}
+{{- end -}}
 {{- if and (eq $type "both") (not .destination) -}}
 {{- fail (printf "source %s needs destination s3 or pvc when type is both" .workloadName) -}}
 {{- end -}}

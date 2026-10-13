@@ -5,9 +5,9 @@ import {
   type DestinationView,
   destinationType,
   jobName,
+  NO_SCHEDULE,
   type Retention,
   type SourceStatus,
-  NO_SCHEDULE,
   VERSION,
   type WorkloadVolumeSource,
   type World,
@@ -47,10 +47,11 @@ function sourceItem(
   source: WorkloadVolumeSource,
   row: SourceStatus | undefined,
 ): string {
-  const invalid = row?.scheduleStatus === 'ScheduleInvalid' ? ', invalid: it never runs' : '';
-  const schedule = source.schedule
-    ? `schedule ${escapeHtml(source.schedule)} (UTC)${source.suspend ? ', suspended' : ''}${invalid}`
-    : 'no schedule (on demand only)';
+  const invalid = row?.scheduleStatus === 'InvalidSchedule' ? ', invalid: it never runs' : '';
+  const schedule =
+    source.schedule && source.schedule.trim() !== NO_SCHEDULE
+      ? `schedule ${escapeHtml(source.schedule)} (UTC)${source.suspend ? ', suspended' : ''}${invalid}`
+      : 'no schedule (on demand only)';
   return `<li>${escapeHtml(source.workloadName)}: ${schedule}; retention ${escapeHtml(retentionText(source.retention))}; last ${escapeHtml(row?.lastReason ?? 'none')}; last scale-to-0 ${downtime(row?.lastScaleDownSeconds)}
 <form method="post" action="/backups"><input type="hidden" name="destination" value="${escapeHtml(destination.name)}"><input type="hidden" name="workload" value="${escapeHtml(source.workloadName)}"><button type="submit">Back up ${escapeHtml(source.workloadName)} now (stops it)</button></form></li>`;
 }
