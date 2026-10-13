@@ -13,10 +13,17 @@
  *   5. Power-loss torn writes (the spike's cases) keep fsynced commits.
  *   6. Rotation re-wraps every header, resumes after a crash before the
  *      marker flips, and then refuses the old key.
- *   7. Codecs (#206): a fresh directory holds only codec-3 files. A directory
- *      initialized by the published v1 build (codec 2) keeps working: this
- *      build reads it, writes to it, and creates codec-3 files next to the
- *      codec-2 ones.
+ *   7. Codecs (#206). Two variants are built: the default (publishes; writes
+ *      codec 2, so a rollback to it stays possible) and `write-codec-3`.
+ *      - A fresh directory holds only the codec the variant writes.
+ *      - A directory initialized by the published v1 build (codec 2) keeps
+ *        working: the codec-3 variant reads it, writes to it, and creates
+ *        codec-3 files next to the codec-2 ones.
+ *      - Rollback: v1 over that mixed directory, after a clean shutdown and
+ *        after an abrupt exit, must fail loudly (never start and lose
+ *        commits), and the new builds then still recover every commit. The
+ *        default variant also reads the mixed directory and never creates
+ *        codec-3 files.
  *
  * pglite: $PGLITE_ENCFS_PGLITE_WASM, else ../pglite-component/dist (make build there).
  * v1 encfs: $PGLITE_ENCFS_V1_WASM, else fetched anonymously from ghcr.io by its
@@ -50,6 +57,8 @@ const CODEC_TAIL = 3;
 /**
  * The v1 build (codec 2 only), as published by #201/#211: the Wasm layer of
  * ghcr.io/di-framework/pglite-encfs@sha256:46863e8bc92be13104f4be1b489f5500ba008f51f4662f382a211f7a78a5d414.
+ * Do NOT sync this with the README pin: the publish bot rewrites that one to
+ * the latest release, and the codec-2 and rollback tests need exactly v1.
  */
 const V1_REPOSITORY = 'di-framework/pglite-encfs';
 const V1_WASM_SHA256 = '041784d169d3bc1f80136af6399fc7a54d8635600c8ff02275c00a68cca274cf';
@@ -108,6 +117,49 @@ class Harness {
     keys: Keys,
     expected: string | RegExp,
   ): Promise<string> {
+    const { output, code, name, signal } = await this.exec(composed, dataDir, mode, keys);
+    const lines = output.split('\n');
+    const found =
+      typeof expected === 'string' ? lines.includes(expected) : lines.some((l) => expected.test(l));
+    if (code !== 0 || !found) {
+      console.error(lines.slice(-60).join('\n'));
+      const why = signal ? `signal ${signal}` : `exit ${code}`;
+      throw new Error(`${name}: ${why}, expected ${expected}`);
+    }
+    log(
+      `${mode}: ${typeof expected === 'string' ? expected : lines.find((l) => expected.test(l))}`,
+    );
+    return output;
+  }
+
+  /** A run that must fail, loudly, and say `reason`. Returns its output. */
+  async fails(
+    composed: string,
+    dataDir: string,
+    mode: string,
+    keys: Keys,
+    reason: string,
+    ok: RegExp,
+  ): Promise<string> {
+    const { output, code, name } = await this.exec(composed, dataDir, mode, keys);
+    if (code === 0 || output.split('\n').some((l) => ok.test(l))) {
+      console.error(output.split('\n').slice(-60).join('\n'));
+      throw new Error(`${name}: expected a failure, got exit ${code} (${ok} printed)`);
+    }
+    if (!output.includes(reason)) {
+      console.error(output.split('\n').slice(-60).join('\n'));
+      throw new Error(`${name}: failed without "${reason}"`);
+    }
+    log(`${mode}: failed as expected ("${reason}", exit ${code})`);
+    return output;
+  }
+
+  private async exec(
+    composed: string,
+    dataDir: string | null,
+    mode: string,
+    keys: Keys,
+  ): Promise<{ output: string; code: number; name: string; signal: string | null }> {
     const args = ['wasmtime', 'run'];
     if (dataDir) args.push('--dir', `${dataDir}::/data`);
     args.push('--env', `PGLITE_SMOKE_MODE=${mode}`);
@@ -135,18 +187,7 @@ class Harness {
     for (const secret of this.secrets) {
       if (output.includes(secret)) throw new Error(`${name}: key material in the output`);
     }
-    const lines = output.split('\n');
-    const found =
-      typeof expected === 'string' ? lines.includes(expected) : lines.some((l) => expected.test(l));
-    if (code !== 0 || !found) {
-      console.error(lines.slice(-60).join('\n'));
-      const why = proc.signalCode ? `signal ${proc.signalCode}` : `exit ${code}`;
-      throw new Error(`${name}: ${why}, expected ${expected}`);
-    }
-    log(
-      `${mode}: ${typeof expected === 'string' ? expected : lines.find((l) => expected.test(l))}`,
-    );
-    return output;
+    return { output, code, name, signal: proc.signalCode };
   }
 
   /** A start that must be refused before anything on disk changes. */
@@ -199,11 +240,48 @@ async function codecCounts(dataDir: string): Promise<Map<number, number>> {
   return counts;
 }
 
+/** Paths (relative) of the codec-3 files in a directory. */
+async function codec3Files(dataDir: string): Promise<string[]> {
+  const out: string[] = [];
+  for (const file of await regularFiles(dataDir)) {
+    if (file === join(dataDir, MARKER_FILE)) continue;
+    const bytes = await readFile(file);
+    if (bytes.length >= HEADER_LEN && bytes[CODEC_AT] === CODEC_TAIL)
+      out.push(relative(dataDir, file));
+  }
+  return out;
+}
+
+/** Describe a codec census, and require both codecs to be present. */
+function checkCodecsMixed(counts: Map<number, number>): string {
+  if (!counts.get(CODEC_STEALING) || !counts.get(CODEC_TAIL))
+    throw new Error(`expected a mixed codec-2/3 directory: ${describeCodecs(counts)}`);
+  return describeCodecs(counts);
+}
+
 function describeCodecs(counts: Map<number, number>): string {
   return [...counts.entries()]
     .sort(([a], [b]) => a - b)
     .map(([codec, n]) => `${n} codec-${codec}`)
     .join(', ');
+}
+
+const FETCH_TIMEOUT_MS = 60_000;
+
+/** GET with a per-attempt timeout and one retry; throws unless the response is ok. */
+async function fetchRetry(url: string, init: RequestInit = {}): Promise<Response> {
+  let last: unknown;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch(url, { ...init, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      if (res.ok) return res;
+      last = new Error(`HTTP ${res.status}`);
+    } catch (error) {
+      last = error;
+    }
+    log(`fetch ${new URL(url).pathname} failed (attempt ${attempt}): ${String(last)}`);
+  }
+  throw new Error(`${url}: ${String(last)}`);
 }
 
 /** The v1 encfs component, checked against its pinned digest. */
@@ -213,13 +291,13 @@ async function v1Component(ctx: Context, smokeDir: string): Promise<string> {
   if (local) {
     bytes = new Uint8Array(await readFile(local));
   } else {
-    const auth = await fetch(`https://ghcr.io/token?scope=repository:${V1_REPOSITORY}:pull`);
-    if (!auth.ok) throw new Error(`ghcr.io token: HTTP ${auth.status}`);
-    const { token } = (await auth.json()) as { token: string };
-    const blob = await fetch(`https://ghcr.io/v2/${V1_REPOSITORY}/blobs/sha256:${V1_WASM_SHA256}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!blob.ok) throw new Error(`v1 encfs blob: HTTP ${blob.status}`);
+    const auth = await fetchRetry(`https://ghcr.io/token?scope=repository:${V1_REPOSITORY}:pull`);
+    const { token } = (await auth.json()) as { token?: unknown };
+    if (typeof token !== 'string' || token === '') throw new Error('ghcr.io token: none returned');
+    const blob = await fetchRetry(
+      `https://ghcr.io/v2/${V1_REPOSITORY}/blobs/sha256:${V1_WASM_SHA256}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
     bytes = new Uint8Array(await blob.arrayBuffer());
   }
   const digest = createHash('sha256').update(bytes).digest('hex');
@@ -281,10 +359,17 @@ function checkAb(output: string): { a: number; b: number } {
   return { a: Number(match[1]), b: Number(match[2]) };
 }
 
-async function compose(ctx: Context, smokeDir: string, pglite: string, encfs: string) {
+async function compose(
+  ctx: Context,
+  smokeDir: string,
+  pglite: string,
+  encfs: string,
+  tag: string,
+  writeCodec: 2 | 3,
+) {
   const witOf = async (wasm: string) =>
     worldItems(await $`wasm-tools component wit ${wasm}`.text());
-  const pgliteEnc = join(smokeDir, 'pglite-enc.wasm');
+  const pgliteEnc = join(smokeDir, `pglite-enc-${tag}.wasm`);
   await $`wac plug --plug ${encfs} ${pglite} -o ${pgliteEnc}`;
   await $`wasm-tools validate --features all ${pgliteEnc}`;
   const problems = compositionProblems(
@@ -293,9 +378,14 @@ async function compose(ctx: Context, smokeDir: string, pglite: string, encfs: st
     await witOf(pgliteEnc),
   );
   if (problems.length > 0) throw new Error(`encfs does not fit pglite:\n${problems.join('\n')}`);
-  if (!(await readFile(pgliteEnc)).includes(CUSTOM_SECTION)) {
+  const provider = await readFile(pgliteEnc);
+  if (!provider.includes(CUSTOM_SECTION)) {
     throw new Error(`composed provider lacks the ${CUSTOM_SECTION} custom section`);
   }
+  const marker = `codec=aes-256-xts write-codec=${writeCodec}`;
+  const other = `write-codec=${writeCodec === 2 ? 3 : 2}`;
+  if (!provider.includes(marker) || provider.includes(other))
+    throw new Error(`composed provider (${tag}) does not advertise ${marker}`);
   log(`interfaces match pglite; ${pgliteEnc}`);
 
   // The pglite smoke consumer, built from its own workspace with its own toolchain file.
@@ -305,8 +395,8 @@ async function compose(ctx: Context, smokeDir: string, pglite: string, encfs: st
     .env({ ...ctx.env, CARGO_TARGET_DIR: consumerTarget });
   const consumer = join(consumerTarget, 'wasm32-wasip2', 'release', 'pglite-smoke-consumer.wasm');
   const composed = {
-    encrypted: join(smokeDir, 'encrypted.wasm'),
-    plain: join(smokeDir, 'plain.wasm'),
+    encrypted: join(smokeDir, `encrypted-${tag}.wasm`),
+    plain: join(smokeDir, `plain-${tag}.wasm`),
   };
   for (const [out, provider] of [
     [composed.encrypted, pgliteEnc],
@@ -350,7 +440,11 @@ export async function smoke(ctx: Context): Promise<void> {
   await rm(smokeDir, { recursive: true, force: true });
   const logDir = join(smokeDir, 'logs');
   await mkdir(logDir, { recursive: true });
-  const composed = await compose(ctx, smokeDir, pglite, encfs);
+  // `encfs` (dist/) is the default build, which writes codec 2; the matrix below
+  // runs on the opt-in write-codec-3 build so codec 3 stays fully covered.
+  const encfs3 = await build(ctx, { writeCodec3: true, outDir: join(smokeDir, 'codec3') });
+  const composedDefault = await compose(ctx, smokeDir, pglite, encfs, 'default', 2);
+  const composed = await compose(ctx, smokeDir, pglite, encfs3, 'codec3', 3);
 
   // Standard base64 for A, unpadded base64url for B: both alphabets are accepted.
   const rawA = randomBytes(32);
@@ -403,6 +497,18 @@ export async function smoke(ctx: Context): Promise<void> {
     if (fresh.get(CODEC_TAIL) !== headers)
       throw new Error(`a fresh directory is not all codec 3: ${describeCodecs(fresh)}`);
     log(`fresh directory: ${describeCodecs(fresh)}`);
+
+    // The default build writes codec 2 only: a deployment can roll back to it.
+    const dflt = join(work, 'default');
+    await mkdir(dflt);
+    await h.run(composedDefault.encrypted, dflt, 'write', A, 'smoke ok');
+    await h.run(composedDefault.encrypted, dflt, 'abrupt', A, 'abrupt ok');
+    await h.run(composedDefault.encrypted, dflt, 'read', A, 'restart ok');
+    const dfltHeaders = await assertEncrypted(dflt, keyCheckValue(keyA), raw);
+    const dfltCodecs = await codecCounts(dflt);
+    if (dfltCodecs.get(CODEC_STEALING) !== dfltHeaders)
+      throw new Error(`the default build wrote codec 3: ${describeCodecs(dfltCodecs)}`);
+    log(`default build, fresh directory: ${describeCodecs(dfltCodecs)}`);
 
     // Refusals leave the tree byte-identical.
     await h.refused(enc, data, B, 'encrypted with a different key');
@@ -549,6 +655,8 @@ export async function smoke(ctx: Context): Promise<void> {
     if (ab.a !== 1 || ab.b !== 1)
       throw new Error(`v1 directory lost commits: ${JSON.stringify(ab)}`);
     await h.run(enc, legacy, 'create-commit', A, 'create-commit ok');
+    // The state right after an abrupt exit, kept for the rollback checks below.
+    const abrupt = await snapshot(legacy, join(work, 'legacy-abrupt'));
     if (!/^check-fresh N=1$/m.test(await h.run(enc, legacy, 'check-fresh', A, /^check-fresh /)))
       throw new Error('v1 directory: committed row lost');
     await h.run(enc, legacy, 'marker-read', A, 'marker-read ok');
@@ -557,6 +665,63 @@ export async function smoke(ctx: Context): Promise<void> {
     if (!after.get(CODEC_STEALING) || !after.get(CODEC_TAIL))
       throw new Error(`expected codec-2 and codec-3 files side by side: ${describeCodecs(after)}`);
     log(`v1 directory after this build wrote to it: ${describeCodecs(after)}`);
+
+    // Rollback (#206 review W2): v1 over the mixed directory must fail loudly,
+    // never start, end WAL replay early and drop commits. Tried after a clean
+    // shutdown and after an abrupt exit, directly on the directories (no
+    // copy), then this build must still recover everything.
+    const REFUSAL = 'unsupported header (format 1, codec 3)';
+    const abruptBefore = checkCodecsMixed(await codecCounts(abrupt));
+    await h.fails(v1, legacy, 'read', A, REFUSAL, /^restart ok$/);
+    await h.fails(v1, abrupt, 'check-ab', A, REFUSAL, /^check-ab /);
+    await h.fails(v1, abrupt, 'check-fresh', A, REFUSAL, /^check-fresh /);
+    log(`v1 refuses the mixed directory (clean and abrupt); abrupt codecs: ${abruptBefore}`);
+    for (const [label, dir] of [
+      ['clean', legacy],
+      ['abrupt', abrupt],
+    ] as const) {
+      await h.run(enc, dir, 'read', A, 'restart ok');
+      const rolled = checkAb(await h.run(enc, dir, 'check-ab', A, /^check-ab /));
+      if (rolled.a !== 1 || rolled.b !== 1)
+        throw new Error(`${label}: commits lost after the v1 attempt: ${JSON.stringify(rolled)}`);
+      if (!/^check-fresh N=1$/m.test(await h.run(enc, dir, 'check-fresh', A, /^check-fresh /)))
+        throw new Error(`${label}: committed row lost after the v1 attempt`);
+    }
+    await rm(abrupt, { recursive: true, force: true });
+
+    // Narrow case: one start and one abruptly stopped commit by this build on a
+    // v1 directory. PostgreSQL's recovery treats a WAL read error as end of WAL,
+    // so this is where v1 could silently drop commits. It does not: the start
+    // rewrites replorigin_checkpoint and pg_internal.init (codec 3), and
+    // PostgreSQL PANICs on reading the former before it replays any WAL.
+    const narrow = join(work, 'legacy-narrow');
+    await mkdir(narrow);
+    await h.run(v1, narrow, 'write', A, 'smoke ok');
+    await h.run(v1, narrow, 'marker-write', A, 'marker-write ok');
+    await h.run(enc, narrow, 'commit-a', A, 'commit-a ok');
+    const narrowCodec3 = await codec3Files(narrow);
+    log(`narrow case: codec-3 files: ${narrowCodec3.join(', ') || 'none'}`);
+    if (narrowCodec3.length === 0) throw new Error('the narrow case wrote no codec-3 file');
+    await h.fails(v1, narrow, 'check-ab', A, REFUSAL, /^check-ab /);
+    if (checkAb(await h.run(enc, narrow, 'check-ab', A, /^check-ab /)).a !== 1)
+      throw new Error('narrow case: commit A lost after the v1 attempt');
+    await rm(narrow, { recursive: true, force: true });
+
+    // The default build (writes codec 2) reads the mixed directory too, keeps
+    // every commit, and creates no codec-3 files.
+    const mixed = await codecCounts(legacy);
+    await h.run(composedDefault.encrypted, legacy, 'read', A, 'restart ok');
+    await h.run(composedDefault.encrypted, legacy, 'abrupt', A, 'abrupt ok');
+    await h.run(composedDefault.encrypted, legacy, 'marker-read', A, 'marker-read ok');
+    const viaDefault = checkAb(
+      await h.run(composedDefault.encrypted, legacy, 'check-ab', A, /^check-ab /),
+    );
+    if (viaDefault.a !== 1 || viaDefault.b !== 1)
+      throw new Error(`default build lost commits: ${JSON.stringify(viaDefault)}`);
+    const afterDefault = await codecCounts(legacy);
+    if ((afterDefault.get(CODEC_TAIL) ?? 0) > (mixed.get(CODEC_TAIL) ?? 0))
+      throw new Error(`the default build created codec-3 files: ${describeCodecs(afterDefault)}`);
+    log(`default build over the mixed directory: ${describeCodecs(afterDefault)}`);
   } finally {
     await rm(work, { recursive: true, force: true });
   }
