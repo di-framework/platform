@@ -236,7 +236,7 @@ lacks access shows up in the publisher error as the registry's denial on
 Pin deployments by digest, never by tag. Latest published:
 
 ```
-ghcr.io/di-framework/oci-registry@sha256:a92bf0b24662149bf3a6256723dd7eb59533090d9385a62b71c2ed2b89e9361a
+ghcr.io/di-framework/oci-registry@sha256:77469c031147bcf635469dc8acc21bbcd88977964586775b196db69ed21c0cea
 ```
 
 The SHA tag is informational; only the digest is stable. The tenancy reconcile
