@@ -5,12 +5,14 @@ import {
   type DestinationView,
   destinationType,
   jobName,
+  NO_SCHEDULE,
   type Retention,
   type SourceStatus,
   VERSION,
   type WorkloadVolumeSource,
   type World,
 } from './model.ts';
+import { validCron } from './schedule.ts';
 import { backupInFlight, requestBackup } from './workload.ts';
 
 const NAME = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
@@ -45,12 +47,21 @@ function sourceItem(
   source: WorkloadVolumeSource,
   row: SourceStatus | undefined,
 ): string {
-  const invalid = row?.scheduleStatus === 'ScheduleInvalid' ? ', invalid: it never runs' : '';
-  const schedule = source.schedule
-    ? `schedule ${escapeHtml(source.schedule)} (UTC)${source.suspend ? ', suspended' : ''}${invalid}`
-    : 'no schedule (on demand only)';
+  const invalid = row?.scheduleStatus === 'InvalidSchedule' ? ', invalid: it never runs' : '';
+  const schedule =
+    source.schedule && source.schedule.trim() !== NO_SCHEDULE
+      ? `schedule ${escapeHtml(source.schedule)} (UTC)${source.suspend ? ', suspended' : ''}${invalid}`
+      : 'no schedule (on demand only)';
   return `<li>${escapeHtml(source.workloadName)}: ${schedule}; retention ${escapeHtml(retentionText(source.retention))}; last ${escapeHtml(row?.lastReason ?? 'none')}; last scale-to-0 ${downtime(row?.lastScaleDownSeconds)}
 <form method="post" action="/backups"><input type="hidden" name="destination" value="${escapeHtml(destination.name)}"><input type="hidden" name="workload" value="${escapeHtml(source.workloadName)}"><button type="submit">Back up ${escapeHtml(source.workloadName)} now (stops it)</button></form></li>`;
+}
+
+function scheduleLine(destination: DestinationView): string {
+  const schedule = destination.spec.schedule?.trim();
+  if (!schedule || schedule === NO_SCHEDULE) return 'Schedule: none — on-demand only';
+  return validCron(schedule)
+    ? `Schedule: ${schedule} (UTC)`
+    : `Schedule: ${schedule} is not a valid cron — no scheduled backups run`;
 }
 
 function destinationSection(destination: DestinationView): string {
@@ -63,6 +74,7 @@ function destinationSection(destination: DestinationView): string {
     .join('');
   return `<h2>Destination ${escapeHtml(destination.name)} (${destinationType(destination.spec)})</h2>
 <p>${escapeHtml(ready?.reason ?? 'Unknown')} ${escapeHtml(ready?.message ?? '')}</p>
+<p>${escapeHtml(scheduleLine(destination))}</p>
 <p>Skipped ${destination.status.skipped ?? 0}. Enrolled ${destination.status.enrolledServices ?? 0}.</p>
 <ul>${services}</ul>
 <form method="post" action="/backups"><input type="hidden" name="destination" value="${escapeHtml(destination.name)}"><button type="submit">Backup now</button></form>${

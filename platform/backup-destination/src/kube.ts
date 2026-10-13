@@ -616,7 +616,9 @@ export async function applyActions(
   const versions = new Versions();
   const crd = `/apis/${VERSION}/namespaces/${world.tenantNamespace}`;
   for (const action of actions) {
-    if (action.type === 'destination-status') {
+    if (action.type === 'log') {
+      console.log(action.message);
+    } else if (action.type === 'destination-status') {
       const name = action.name ?? world.destination?.name;
       if (!name) continue;
       await client.patch(

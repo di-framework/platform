@@ -11,6 +11,7 @@ import {
   type JobView,
   jobName,
   MAX_HELD_REPLICAS,
+  NO_SCHEDULE,
   OWNER_OBJECT_LABEL,
   opJobName,
   REGISTRY_WORKLOAD,
@@ -1235,7 +1236,7 @@ function armed(row: SourceStatus, source: WorkloadVolumeSource, now: string): So
 /**
  * Sources whose schedule fired since it last did. A schedule is armed when first seen, when it
  * changes, and when it leaves suspension or invalidity: it never fires for a time before that,
- * so an edit or an unsuspend never stops a workload at once. No schedule, no runs. A fire while
+ * so an edit or an unsuspend never stops a workload at once. No schedule (or "none"), no runs. A fire while
  * a backup of the source is still queued or running is skipped.
  */
 export function scheduleSources(
@@ -1247,11 +1248,12 @@ export function scheduleSources(
   const now = new Date(world.now);
   const next = rows.map((row): SourceStatus => {
     const source = sourceFor(dest, row.workloadName);
-    if (!source?.schedule) {
+    // No schedule, or "none" (#250): on demand only. There is no fallback cron.
+    if (!source?.schedule || source.schedule.trim() === NO_SCHEDULE) {
       const { schedule: _schedule, ...rest } = row;
       return { ...rest, scheduleStatus: 'OnDemand' };
     }
-    if (!validCron(source.schedule)) return { ...row, scheduleStatus: 'ScheduleInvalid' };
+    if (!validCron(source.schedule)) return { ...row, scheduleStatus: 'InvalidSchedule' };
     if (source.suspend) return { ...row, scheduleStatus: 'Suspended' };
     if (
       !row.lastScheduledTime ||

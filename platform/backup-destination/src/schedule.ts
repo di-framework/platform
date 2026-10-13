@@ -39,7 +39,7 @@ function parse(expression: string): Fields | undefined {
 
 /**
  * Five-field UTC cron: numbers, `*`, ranges, steps, and lists, each value in its field's range.
- * Anything else is invalid and never fires; the status row says `ScheduleInvalid`.
+ * Anything else is invalid and never fires; the status row says `InvalidSchedule`.
  */
 export function validCron(expression: string): boolean {
   return parse(expression) !== undefined;

@@ -73,10 +73,16 @@ spec:
                   properties:
                     storageClassName: { type: string }
                     size: { type: string, minLength: 1 }
-                # Five-field UTC cron. Values out of range are reported, and never run.
+                # Five-field UTC cron, or "none". Values out of range are reported
+                # (InvalidSchedule), and never run.
                 schedule:
                   type: string
-                  pattern: '^(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)*$'
+                  maxLength: 128
+                  pattern: '^(none|(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)*)$'
+                  description: >-
+                    Five-field UTC cron for scheduled backups, or "none". There is no default:
+                    without a schedule the destination takes only on-demand backups (backup-now)
+                    and reports Scheduled=False with reason NoSchedule. "none" means the same.
                 retention:
                   type: object
                   properties:
@@ -107,12 +113,15 @@ spec:
                         type: string
                         maxLength: 63
                         pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
-                      # UTC cron. No default: without it the source is backed up on demand only.
-                      # Numbers, *, ranges, steps, and lists in each of five fields. A value out
-                      # of range shows as ScheduleInvalid in the status row and never runs.
+                      # UTC cron, or "none" for on-demand backups only. No default: the chart and
+                      # installBackupDestination require one (#250); an object without it is
+                      # treated as "none". Numbers, *, ranges, steps, and lists in each of five
+                      # fields. A value out of range shows as InvalidSchedule in the status row
+                      # and never runs.
                       schedule:
                         type: string
-                        pattern: '^(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)*$'
+                        maxLength: 128
+                        pattern: '^(none|(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)* (\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)*)$'
                       # No default: without a rule every backup is kept.
                       retention:
                         type: object

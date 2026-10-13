@@ -14,7 +14,7 @@ The operator pod serves an HTML console on `di-backup-console:8080` and creates 
 
 ## Destinations
 
-`type` picks where backups go: `s3` (the default), `pvc`, or `both`. Each destination is its own `BackupDestination` with its own status; they share retention. `schedule` applies to an S3 destination (default `0 2 * * *`) and to a PVC destination only when set; a PVC destination without a schedule never runs scheduled backups and only takes on-demand ones (backup-now annotation). With `both`, `default` is the S3 destination and `pvc` the claim. Agent Jobs run one at a time across all destinations. Every destination writes the same layout: `<prefix>/<service>/<uid>/<UTC stamp>/` with the data and `manifest.json` (the sha256 is in the manifest and the Backup status), and retention deletes from either kind the same way. A restore reads from the destination that holds the source backup.
+`type` picks where backups go: `s3` (the default), `pvc`, or `both`. Each destination is its own `BackupDestination` with its own status; they share retention. `schedule` is required and has no default; it applies to every destination the release renders. Set a five-field UTC cron (`0 2 * * *` is nightly at 02:00), or `none` to take only on-demand backups (console **Backup now** or the backup-now annotation). The chart refuses to render without it, and refuses anything else. A `BackupDestination` without a schedule (or with `none`) never runs scheduled backups: the operator sets condition `Scheduled=False`, reason `NoSchedule`, and logs it once. With a cron it sets `Scheduled=True`; a schedule the operator cannot parse (such as `60 * * * *`) sets `Scheduled=False`, reason `InvalidSchedule`, and never fires. The chart and `installBackupDestination` reject those too. With `both`, `default` is the S3 destination and `pvc` the claim. Agent Jobs run one at a time across all destinations. Every destination writes the same layout: `<prefix>/<service>/<uid>/<UTC stamp>/` with the data and `manifest.json` (the sha256 is in the manifest and the Backup status), and retention deletes from either kind the same way. A restore reads from the destination that holds the source backup.
 
 ### S3
 
@@ -26,7 +26,7 @@ Set `existingClaimName` to a claim that already exists in `di-runtime-<name>` (a
 
 **A PVC on the same node or VM as the data does not protect against losing that node.** With a node-local storage class such as `local-path`, the backups live on the same disk as the BackingService data. Use it for fast local restores, and add an S3 destination (`type: both`) for an off-host copy.
 
-A missing claim is detected early: the operator lists claims in `di-runtime-<name>` and sets the PVC destination to `ClaimMissing` without starting a Job, so a misspelled `existingClaimName` cannot hold up S3 backups. `prefix` must not contain `.` or `..` segments (the CRD rejects it) and is at most 1024 characters. A leading `/` is still accepted and ignored. Retention deletes single files and removes the emptied stamp, UID, and service directories. It also removes `*.partial` files and manifest-less data files older than a day, which a killed Job leaves behind. That sweep stays inside `<mount>/<prefix>` at `<service>/<uid>/<stamp>/` depth, never follows symlinks, and skips `lost+found`. It runs only when retention has something to delete, so a claim that fills with leftovers before then is reclaimed on the next retention pass.
+A missing claim is detected early: the operator lists claims in `di-runtime-<name>` and sets the PVC destination to `ClaimMissing` without starting a Job, so a misspelled `existingClaimName` cannot hold up S3 backups. `prefix` must not contain `.` or `..` segments (the CRD rejects it) and is at most 1024 characters. A leading `/` is still accepted and ignored. The prefix must keep at least one non-empty segment, for S3 too, so a new destination cannot write at the bucket root (`prefix: "/"`): leave `prefix` empty for the default `di-framework/<name>`, or name a segment such as `backups`. One rule for both kinds keeps retention and the PVC sweep inside a tree the destination owns. Retention deletes single files and removes the emptied stamp, UID, and service directories. It also removes `*.partial` files and manifest-less data files older than a day, which a killed Job leaves behind. That sweep stays inside `<mount>/<prefix>` at `<service>/<uid>/<stamp>/` depth, never follows symlinks, and skips `lost+found`. It runs only when retention has something to delete, so a claim that fills with leftovers before then is reclaimed on the next retention pass.
 
 ## Upgrading
 
@@ -38,6 +38,21 @@ kubectl apply --server-side -f platform/backup-destination/chart/crds/backups.ya
 
 Without it the old schema rejects `type` and `existingClaimName` and still requires `bucket`; S3-only releases keep working. Existing destinations read back as `type: s3`.
 
+**Breaking (#250): `schedule` has no default.** Earlier charts rendered `schedule: "0 2 * * *"` for S3 when the value was unset, and the operator also fell back to it. Both fallbacks are gone, so `helm upgrade` of a release that never set `schedule` now fails with `schedule is required: ...` instead of silently stopping backups. Set it explicitly on upgrade:
+
+```sh
+# Keep the old nightly backups (what an unset schedule used to mean)
+helm upgrade backups platform/backup-destination/chart -n di-tenant-<name> --reuse-values --set-string schedule='0 2 * * *'
+# Or take only on-demand backups
+helm upgrade backups platform/backup-destination/chart -n di-tenant-<name> --reuse-values --set-string schedule=none
+```
+
+With Pulumi, `installBackupDestination` now requires `install.schedule` (`'0 2 * * *'` or `'none'`). The same goes for every workload-volume source: each entry in `sources` needs its own `schedule` (a cron or `none`), and the CRD accepts `none` for both the destination and its sources. An existing `BackupDestination` object without `spec.schedule` (for example one applied by hand) stops taking scheduled backups after the operator upgrade and reports `Scheduled=False`, reason `NoSchedule`; list the destinations that are `NoSchedule` or `InvalidSchedule` with:
+
+```sh
+kubectl get backupdestinations -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} {.status.conditions[?(@.type=="Scheduled")].reason}{"\n"}{end}' | grep -E 'NoSchedule|InvalidSchedule'
+```
+
 A `BackupDestination`'s `type` is immutable. The S3 destination is always named `default` and the PVC destination always `pvc`, so a release can move from `type: s3` to `type: both` (adds `pvc`) without touching `default`. Moving from `s3` to `pvc` only: go through `both` first. If you then drop S3 (`type: pvc`), Helm deletes `default`; its existing Backups keep their `destinationName` and fall back to the first remaining destination, which does not hold their data, so keep `both` while those backups matter. A tenant can have only one S3 destination; if more exist, the oldest by creation time holds the runtime credentials and the others report `ConfigInvalid`. The operator needs `list` on `persistentvolumeclaims` in `di-runtime-<name>` (in the chart's runtime Role) for the claim check.
 
 ## Workload volumes
@@ -47,7 +62,7 @@ A WorkloadDeployment with platform storage (`di-framework.dev/persistent-storage
 ```yaml
 sources:
   - workloadName: identity
-    schedule: "30 3 * * *"   # UTC cron; omit for on-demand backups only
+    schedule: "30 3 * * *"   # required: UTC cron, or "none" for on-demand backups only
     retention:               # omit to keep every backup
       keepLast: 7
       daily: 7
@@ -62,10 +77,10 @@ Optional per source: `scaleDownTimeoutSeconds` (default 300), `copyTimeoutSecond
 The chart renders each entry into `BackupDestination.spec.sources`. Leave `storageRoot` empty (the default): the operator then takes the root from the path the tenant host pods mount, which always matches the platform's `storageRoot`. When you set it (Kubesolo: `/var/lib/kubesolo`, k0s: `/var/lib/k0s`), the host pods must mount exactly that path, or the backup fails with `VolumeNotMounted` and nothing is stopped.
 
 **There is no default schedule and no default retention.**
-- **Schedule.** A source without `schedule` is never backed up on a schedule. "Back up now" on the console, or a `Backup` you create, still works.
+- **Schedule.** Every source needs `schedule` (#250): a five-field UTC cron, or `none` for on-demand backups only. The chart and `installBackupDestination` refuse a source without one; a `BackupDestination` applied by hand with a source that has no `schedule` is treated like `none` (`scheduleStatus: OnDemand`). Either way it is never backed up on a schedule, and "Back up now" on the console, or a `Backup` you create, still works.
   - A schedule is armed when it is first seen, when it changes, and when the source is unsuspended. It never fires for a time before that, so an edit or an unsuspend never stops a workload at once.
   - A fire while a backup of the same source is still queued or running is skipped, and the console answers 409 to a second "Back up now". A workload is never stopped twice for one request.
-  - The CRD accepts five fields of numbers, `*`, ranges, steps and lists. A value out of range (`99 * * * *`) shows `scheduleStatus: ScheduleInvalid` in `status.sources[]` and on the console, and never runs. A run missed while the destination was busy happens once, when it can.
+  - The CRD accepts `none` or five fields of numbers, `*`, ranges, steps and lists. A value out of range (`99 * * * *`) shows `scheduleStatus: InvalidSchedule` in `status.sources[]` and on the console, and never runs. A run missed while the destination was busy happens once, when it can.
 - **Retention.** A source without a rule keeps every backup.
   - **Successful backups.** A backup is kept when any rule keeps it: it is one of the newest `keepLast`, or it is the newest backup of one of the newest `daily` UTC days, `weekly` ISO weeks or `monthly` UTC months that have a backup. As soon as one of these four rules is set, every successful backup no rule keeps is deleted, objects included.
   - **Failed attempts.** `failed` keeps that many of the newest failed attempts and deletes the older records. A failed copy that recorded no object key is pruned by its object prefix, so objects it may have written are not orphaned.

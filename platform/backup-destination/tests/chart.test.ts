@@ -49,9 +49,10 @@ const destinations = (out: string) =>
     .filter((doc) => /^kind: BackupDestination$/m.test(doc))
     .join('\n---\n');
 
+/** Renders with `schedule: 0 2 * * *` (required since #250) unless a test overrides it; null omits a value. */
 async function template(
   namespace: string,
-  values: Record<string, string>,
+  values: Record<string, string | null>,
   typed: Record<string, string> = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const args = [
@@ -63,7 +64,9 @@ async function template(
     namespace,
     '--include-crds',
   ];
-  for (const [key, value] of Object.entries(values)) args.push('--set-string', `${key}=${value}`);
+  for (const [key, value] of Object.entries({ schedule: '0 2 * * *', ...values })) {
+    if (value !== null) args.push('--set-string', `${key}=${value.replaceAll(',', '\\,')}`);
+  }
   for (const [key, value] of Object.entries(typed)) args.push('--set', `${key}=${value}`);
   const child = Bun.spawn(args, { stdout: 'pipe', stderr: 'pipe' });
   const code = await child.exited;
@@ -133,22 +136,92 @@ describe('backup-destination chart', () => {
     expect(text).not.toContain("!self.startsWith('/')");
   });
 
-  test('schedule: S3 keeps its written default; PVC writes none unless set', async () => {
+  test('schedule is required for s3, pvc, and both, with no default (#250)', async () => {
+    const kinds: Record<string, Record<string, string>> = {
+      s3: { bucket: 'b', existingSecret: 's' },
+      pvc: { type: 'pvc', 'volumeClaimTemplate.size': '1Gi' },
+      both: { type: 'both', bucket: 'b', existingSecret: 's', 'volumeClaimTemplate.size': '1Gi' },
+    };
+    for (const values of Object.values(kinds)) {
+      for (const schedule of [null, '', '  ']) {
+        const missing = await template('di-tenant-alpha', { ...values, schedule });
+        expect(missing.code).not.toBe(0);
+        expect(missing.stderr).toContain('schedule is required');
+        expect(missing.stderr).toContain('"none" for on-demand backups only');
+      }
+      const bad = await template('di-tenant-alpha', { ...values, schedule: 'nightly' });
+      expect(bad.code).not.toBe(0);
+      expect(bad.stderr).toContain('schedule "nightly" must be a five-field UTC cron');
+      const short = await template('di-tenant-alpha', { ...values, schedule: '0 2 * *' });
+      expect(short.code).not.toBe(0);
+      const none = await template('di-tenant-alpha', { ...values, schedule: 'none' });
+      expect(none.code).toBe(0);
+      expect(destinations(none.stdout)).toContain('kind: BackupDestination');
+      expect(destinations(none.stdout)).not.toContain('schedule:');
+    }
+    const values = await Bun.file(`${import.meta.dir}/../chart/values.yaml`).text();
+    expect(values).toMatch(/^schedule: ""$/m);
+  });
+
+  test('schedule rejects crons the operator can never fire, and accepts valid ones', async () => {
+    const base = { bucket: 'b', existingSecret: 's' };
+    for (const schedule of [
+      '60 * * * *',
+      '*/0 * * * *',
+      '5- * * * *',
+      '- - - - -',
+      '* 24 * * *',
+      '* * 0 * *',
+      '* * 32 * *',
+      '* * * 13 *',
+      '* * * * 8',
+      '1,,2 * * * *',
+      '*-5 * * * *',
+      '0  2 * * *',
+      '0 2 * * * *',
+    ]) {
+      const result = await template('di-tenant-alpha', { ...base, schedule });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain('must be a five-field UTC cron');
+    }
+    for (const schedule of [
+      '0 2 * * *',
+      '*/15 0-2 1,15 1-6 1-5',
+      '30 3 * * 7',
+      '0 0 29 2 *',
+      '59 23 31 12 0-7/7',
+      'none',
+    ]) {
+      const result = await template('di-tenant-alpha', { ...base, schedule });
+      expect(result.stderr).toBe('');
+      expect(result.code).toBe(0);
+    }
+  });
+
+  test('an explicit cron is written to every rendered destination', async () => {
     const s3 = await template('di-tenant-alpha', { bucket: 'b', existingSecret: 's' });
-    expect(destinations(s3.stdout)).toContain('schedule: "0 2 * * *"');
+    expect(destinations(s3.stdout).match(/schedule: "0 2 \* \* \*"/g)?.length).toBe(1);
     const pvc = await template('di-tenant-alpha', {
       type: 'pvc',
       'volumeClaimTemplate.size': '1Gi',
+      schedule: '30 3 * * 0',
     });
-    expect(destinations(pvc.stdout)).not.toContain('schedule:');
+    expect(destinations(pvc.stdout)).toContain('schedule: "30 3 * * 0"');
     const both = await template('di-tenant-alpha', {
       type: 'both',
       bucket: 'b',
       existingSecret: 's',
       'volumeClaimTemplate.size': '1Gi',
-      schedule: '5 1 * * *',
+      schedule: '*/15 1-5 * * 1-3',
     });
-    expect(destinations(both.stdout).match(/schedule: "5 1 \* \* \*"/g)?.length).toBe(2);
+    expect(both.code).toBe(0);
+    expect(destinations(both.stdout).match(/schedule: "\*\/15 1-5 \* \* 1-3"/g)?.length).toBe(2);
+  });
+
+  test('the CRD describes schedule without a default', async () => {
+    const text = await Bun.file(`${import.meta.dir}/../chart/crds/backups.yaml`).text();
+    expect(text).toContain('There is no default');
+    expect(text).toContain('NoSchedule');
   });
 
   test('renders a PVC destination, both destinations, and refuses an incomplete one', async () => {
@@ -275,15 +348,36 @@ describe('backup-destination chart', () => {
     const crds = await Bun.file(
       join(import.meta.dir, '..', 'chart', 'crds', 'backups.yaml'),
     ).text();
-    const patterns = [...crds.matchAll(/schedule:\n\s+type: string\n\s+pattern: '([^']+)'/g)].map(
-      (match) => new RegExp(match[1] ?? ''),
-    );
+    const patterns = [
+      ...crds.matchAll(/schedule:\n\s+type: string\n\s+maxLength: 128\n\s+pattern: '([^']+)'/g),
+    ].map((match) => new RegExp(match[1] ?? ''));
+    // The destination schedule and the workload-volume source schedule (#232).
     expect(patterns).toHaveLength(2);
     for (const pattern of patterns) {
-      for (const valid of ['0 2 * * *', '*/15 0-2 1,15 1-6 1-5', '30 3 * * 7', '0 0 1 1/3 *']) {
+      for (const valid of [
+        '0 2 * * *',
+        '*/15 0-2 1,15 1-6 1-5',
+        '30 3 * * 7',
+        '0 0 1 1/3 *',
+        'none',
+      ]) {
         expect(pattern.test(valid)).toBe(true);
       }
-      for (const invalid of ['a b c d e', '0 2 * *', '0 2 * * * *', '0  2 * * *', 'x/5 * * * *']) {
+      for (const invalid of [
+        'a b c d e',
+        '0 2 * *',
+        '0 2 * * * *',
+        '0  2 * * *',
+        'x/5 * * * *',
+        // "none" is a whole value: the alternation stays inside the anchors (#250).
+        'nonesuch',
+        'none 0 2 * * *',
+        'xnone',
+        'none ',
+        ' none',
+        'NONE',
+        'nonesuch 0 2 * * *',
+      ]) {
         expect(pattern.test(invalid)).toBe(false);
       }
     }
@@ -325,6 +419,7 @@ describe('backup-destination chart', () => {
       'sources[0].destination': 'pvc',
       'sources[1].workloadName': 'reports',
       'sources[1].destination': 's3',
+      'sources[1].schedule': 'none',
     };
     const both = await template(
       'di-tenant-alpha',
@@ -347,9 +442,12 @@ describe('backup-destination chart', () => {
       .split('\n---\n')
       .filter((doc) => doc.includes('v1alpha1\nkind: BackupDestination\n'));
     const [s3, pvc] = destinations;
-    expect(s3).toContain('- kind: workload-volume\n      workloadName: reports');
+    expect(s3).toContain(
+      '- kind: workload-volume\n      schedule: none\n      workloadName: reports',
+    );
     expect(s3).not.toContain('identity');
-    expect(s3?.slice(s3.indexOf('sources:'))).not.toContain('schedule');
+    expect(s3?.slice(s3.indexOf('sources:'))).toContain('schedule: none');
+    expect(s3?.slice(s3.indexOf('sources:'))).not.toMatch(/schedule: [0-9*]/);
     expect(pvc).toContain('workloadName: identity');
     expect(pvc).toContain('keepLast: 7');
     expect(pvc).toContain('scaleDownTimeoutSeconds: 120');
@@ -362,7 +460,9 @@ describe('backup-destination chart', () => {
       bucket: 'b',
       existingSecret: 's',
       'sources[0].workloadName': 'identity',
+      'sources[0].schedule': 'none',
     });
+    expect(single.code).toBe(0);
     expect(single.stdout).toContain('workloadName: identity');
     const none = await template('di-tenant-alpha', { bucket: 'b', existingSecret: 's' });
     const noneDestination = none.stdout
@@ -372,16 +472,43 @@ describe('backup-destination chart', () => {
 
     const refusals: [Record<string, string>, string][] = [
       [
-        { type: 'both', 'volumeClaimTemplate.size': '1Gi', 'sources[0].workloadName': 'x' },
+        {
+          type: 'both',
+          'volumeClaimTemplate.size': '1Gi',
+          'sources[0].workloadName': 'x',
+          'sources[0].schedule': 'none',
+        },
         'needs destination s3 or pvc',
       ],
       [
-        { 'sources[0].workloadName': 'x', 'sources[0].destination': 'nfs' },
+        {
+          'sources[0].workloadName': 'x',
+          'sources[0].schedule': 'none',
+          'sources[0].destination': 'nfs',
+        },
         'destination must be s3 or pvc',
       ],
       [
-        { 'sources[0].workloadName': 'x', 'sources[0].destination': 'pvc' },
+        {
+          'sources[0].workloadName': 'x',
+          'sources[0].schedule': 'none',
+          'sources[0].destination': 'pvc',
+        },
         'is not rendered with type s3',
+      ],
+      // No default source schedule either (#250).
+      [{ 'sources[0].workloadName': 'x' }, 'source x: schedule is required'],
+      [
+        { 'sources[0].workloadName': 'x', 'sources[0].schedule': '  ' },
+        'source x: schedule is required',
+      ],
+      [
+        { 'sources[0].workloadName': 'x', 'sources[0].schedule': 'nonesuch' },
+        'source x: schedule "nonesuch" must be a five-field UTC cron',
+      ],
+      [
+        { 'sources[0].workloadName': 'x', 'sources[0].schedule': '99 * * * *' },
+        'must be a five-field UTC cron',
       ],
       [{ 'sources[0].schedule': '* * * * *' }, 'every source needs a workloadName'],
     ];

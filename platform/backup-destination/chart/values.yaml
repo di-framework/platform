@@ -4,14 +4,15 @@ image:
   pullPolicy: IfNotPresent
 agentImage: di-framework/backup-agent:dev
 # s3, pvc, or both. With both, BackupDestination default is S3 and BackupDestination pvc is the
-# claim; both use the retention below. The schedule applies to S3 (default 0 2 * * *) and to PVC
-# only when set: a PVC destination without a schedule takes on-demand backups only.
+# claim; both use the schedule and retention below.
 type: s3
 bucket: ""
 prefix: ""
 region: us-east-1
 endpoint: ""
-# UTC cron for BackingService dumps.
+# Required, no default: a five-field UTC cron for BackingService dumps (for example "0 2 * * *"),
+# or "none" for on-demand backups only (console Backup now / backup-now annotation). Rendering
+# fails while it is unset.
 schedule: ""
 retentionSuccessful: 14
 existingSecret: ""
@@ -30,7 +31,7 @@ volumeClaimTemplate:
 storageRoot: ""
 # Workload volumes to copy cold (#232). Each entry:
 #   workloadName: identity          # a WorkloadDeployment with platform storage (required)
-#   schedule: "30 3 * * *"          # UTC cron; leave it out for on-demand backups only
+#   schedule: "30 3 * * *"          # required: UTC cron, or "none" for on-demand backups only
 #   retention:                      # leave it out to keep every backup
 #     keepLast: 7
 #     daily: 7
