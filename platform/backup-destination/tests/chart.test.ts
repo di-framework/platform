@@ -65,7 +65,7 @@ async function template(
     '--include-crds',
   ];
   for (const [key, value] of Object.entries({ schedule: '0 2 * * *', ...values })) {
-    if (value !== null) args.push('--set-string', `${key}=${value}`);
+    if (value !== null) args.push('--set-string', `${key}=${value.replaceAll(',', '\\,')}`);
   }
   for (const [key, value] of Object.entries(typed)) args.push('--set', `${key}=${value}`);
   const child = Bun.spawn(args, { stdout: 'pipe', stderr: 'pipe' });
@@ -161,6 +161,41 @@ describe('backup-destination chart', () => {
     }
     const values = await Bun.file(`${import.meta.dir}/../chart/values.yaml`).text();
     expect(values).toMatch(/^schedule: ""$/m);
+  });
+
+  test('schedule rejects crons the operator can never fire, and accepts valid ones', async () => {
+    const base = { bucket: 'b', existingSecret: 's' };
+    for (const schedule of [
+      '60 * * * *',
+      '*/0 * * * *',
+      '5- * * * *',
+      '- - - - -',
+      '* 24 * * *',
+      '* * 0 * *',
+      '* * 32 * *',
+      '* * * 13 *',
+      '* * * * 8',
+      '1,,2 * * * *',
+      '*-5 * * * *',
+      '0  2 * * *',
+      '0 2 * * * *',
+    ]) {
+      const result = await template('di-tenant-alpha', { ...base, schedule });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain('must be a five-field UTC cron');
+    }
+    for (const schedule of [
+      '0 2 * * *',
+      '*/15 0-2 1,15 1-6 1-5',
+      '30 3 * * 7',
+      '0 0 29 2 *',
+      '59 23 31 12 0-7/7',
+      'none',
+    ]) {
+      const result = await template('di-tenant-alpha', { ...base, schedule });
+      expect(result.stderr).toBe('');
+      expect(result.code).toBe(0);
+    }
   });
 
   test('an explicit cron is written to every rendered destination', async () => {

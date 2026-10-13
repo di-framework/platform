@@ -94,6 +94,16 @@ describe('backup helm release', () => {
         'schedule must be a five-field UTC cron (such as "0 2 * * *") or "none"',
       );
     }
+    for (const schedule of ['60 * * * *', '*/0 * * * *', '5- * * * *', '- - - - -', '0 24 * * *']) {
+      expect(() => backupReleaseArgs({ ...typed, schedule })).toThrow('five-field UTC cron');
+    }
+    // A JS caller can omit it despite the type.
+    expect(() =>
+      backupReleaseArgs({
+        tenant: 'alpha',
+        chart: '/chart',
+      } as unknown as BackupDestinationInstall),
+    ).toThrow('schedule is required');
     // An Output is passed through; the chart validates it when it renders.
     const output = pulumi.output('0 2 * * *');
     expect(backupReleaseArgs({ ...typed, schedule: output }).values).toEqual({ schedule: output });

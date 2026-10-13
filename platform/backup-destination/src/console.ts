@@ -7,10 +7,12 @@ import {
   jobName,
   type Retention,
   type SourceStatus,
+  NO_SCHEDULE,
   VERSION,
   type WorkloadVolumeSource,
   type World,
 } from './model.ts';
+import { validCron } from './schedule.ts';
 import { backupInFlight, requestBackup } from './workload.ts';
 
 const NAME = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
@@ -53,6 +55,14 @@ function sourceItem(
 <form method="post" action="/backups"><input type="hidden" name="destination" value="${escapeHtml(destination.name)}"><input type="hidden" name="workload" value="${escapeHtml(source.workloadName)}"><button type="submit">Back up ${escapeHtml(source.workloadName)} now (stops it)</button></form></li>`;
 }
 
+function scheduleLine(destination: DestinationView): string {
+  const schedule = destination.spec.schedule?.trim();
+  if (!schedule || schedule === NO_SCHEDULE) return 'Schedule: none — on-demand only';
+  return validCron(schedule)
+    ? `Schedule: ${schedule} (UTC)`
+    : `Schedule: ${schedule} is not a valid cron — no scheduled backups run`;
+}
+
 function destinationSection(destination: DestinationView): string {
   const ready = destination.status.conditions?.find((condition) => condition.type === 'Ready');
   const services = (destination.status.services ?? [])
@@ -63,6 +73,7 @@ function destinationSection(destination: DestinationView): string {
     .join('');
   return `<h2>Destination ${escapeHtml(destination.name)} (${destinationType(destination.spec)})</h2>
 <p>${escapeHtml(ready?.reason ?? 'Unknown')} ${escapeHtml(ready?.message ?? '')}</p>
+<p>${escapeHtml(scheduleLine(destination))}</p>
 <p>Skipped ${destination.status.skipped ?? 0}. Enrolled ${destination.status.enrolledServices ?? 0}.</p>
 <ul>${services}</ul>
 <form method="post" action="/backups"><input type="hidden" name="destination" value="${escapeHtml(destination.name)}"><button type="submit">Backup now</button></form>${

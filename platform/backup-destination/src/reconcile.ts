@@ -26,7 +26,7 @@ import {
   VERSION,
   type World,
 } from './model.ts';
-import { isDue } from './schedule.ts';
+import { isDue, validCron } from './schedule.ts';
 import {
   activeVolumeOps,
   advanceVolumes,
@@ -435,6 +435,14 @@ function scheduleOf(dest: DestinationView): string | undefined {
 
 function scheduledCondition(dest: DestinationView): Condition {
   const schedule = scheduleOf(dest);
+  if (schedule && !validCron(schedule)) {
+    return {
+      type: 'Scheduled',
+      status: 'False',
+      reason: 'InvalidSchedule',
+      message: `Schedule "${schedule}" is not a valid five-field UTC cron: no scheduled backups run`,
+    };
+  }
   return schedule
     ? {
         type: 'Scheduled',

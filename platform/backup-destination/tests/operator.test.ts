@@ -788,6 +788,15 @@ describe('console', () => {
     });
     const html = render(current);
     expect(html).toContain('di-backup-orders-1');
+    expect(html).toContain('Schedule: 0 2 * * * (UTC)');
+    const withCron = (schedule: string) =>
+      render({
+        ...current,
+        destination: { ...current.destination!, spec: { ...current.destination!.spec, schedule } },
+      });
+    expect(withCron('0 2 * * *')).toContain('Schedule: 0 2 * * * (UTC)');
+    expect(withCron('none')).toContain('Schedule: none — on-demand only');
+    expect(withCron('60 * * * *')).toContain('not a valid cron');
     expect(html).toContain('&lt;orders&gt;');
     expect(html).not.toContain('AWS_SECRET_ACCESS_KEY');
     expect(html).not.toContain('super-secret-password');
@@ -1705,6 +1714,21 @@ describe('explicit schedules, no fallback (#250)', () => {
       expect(scheduledOf(actions)[0]?.reason).toBe('NoSchedule');
     }
   });
+
+  for (const bad of ['60 * * * *', '*/0 * * * *', '5- * * * *', '- - - - -']) {
+    test(`72 simulated hours: schedule "${bad}" never fires and reports InvalidSchedule`, () => {
+      const ticks = simulate({ ...s3Spec, schedule: bad }, 15);
+      expect(ticks.flat().some((a) => a.type === 'create-backup' || a.type === 'create-job')).toBe(
+        false,
+      );
+      for (const actions of ticks) {
+        const [scheduled] = scheduledOf(actions);
+        expect(scheduled?.status).toBe('False');
+        expect(scheduled?.reason).toBe('InvalidSchedule');
+      }
+      expect(ticks.flat().filter((a) => a.type === 'log').length).toBe(1);
+    });
+  }
 
   test('logs again only when the Scheduled condition changes', () => {
     const noSchedule = {

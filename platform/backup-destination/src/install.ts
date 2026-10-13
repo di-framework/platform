@@ -1,8 +1,8 @@
 import * as k8s from '@pulumi/kubernetes';
 import type * as pulumi from '@pulumi/pulumi';
+import { validCron } from './schedule.ts';
 
 const TENANT = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
-const CRON = /^[0-9*,/-]+(\s+[0-9*,/-]+){4}$/;
 
 export interface BackupDestinationInstall {
   tenant: string;
@@ -75,11 +75,15 @@ export function backupReleaseArgs(install: BackupDestinationInstall): k8s.helm.v
       'tenant must be a wasmCloud tenant name (1–40 lowercase letters, digits, hyphens; starting with a letter)',
     );
   }
-  // An Output is checked by the chart when it renders.
+  // A missing schedule throws here too (a JS caller can omit it); an Output is checked by the
+  // chart when it renders.
+  if (install.schedule === undefined || install.schedule === null) {
+    throw new Error('schedule is required: a five-field UTC cron (such as "0 2 * * *") or "none"');
+  }
   if (
     typeof install.schedule === 'string' &&
     install.schedule.trim() !== 'none' &&
-    !CRON.test(install.schedule.trim())
+    !validCron(install.schedule)
   ) {
     throw new Error('schedule must be a five-field UTC cron (such as "0 2 * * *") or "none"');
   }
