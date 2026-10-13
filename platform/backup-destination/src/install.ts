@@ -1,6 +1,8 @@
 import * as k8s from '@pulumi/kubernetes';
 import type * as pulumi from '@pulumi/pulumi';
-import { validCron } from './schedule.ts';
+// Extensionless: the prototype Pulumi program compiles this file with ts-node, which
+// emits CommonJS and rejects '.ts' specifiers (TS5097).
+import { validCron } from './schedule';
 
 const TENANT = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
 
