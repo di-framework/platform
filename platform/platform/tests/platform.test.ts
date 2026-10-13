@@ -477,9 +477,10 @@ test('removing a tenant keeps its runtime namespace watched until its Tenant is 
   const removing = operatorNamespaces({ declared: ['alpha'], cluster: ['alpha', 'beta'] });
   expect(removing.failure).toBeUndefined();
   expect(removing.hostNamespaces).toEqual(['wasmcloud', 'di-runtime-alpha', 'di-runtime-beta']);
-  expect(removing.hits).toEqual([
+  // Read through tenancy/removal's lister (the #228 Retain check may list Tenants as well).
+  expect(removing.hits).toContain(
     '/apis/platform.di-framework.dev/v1alpha1/tenants?labelSelector=platform.di-framework.dev%2Finstallation%3Ddi-test',
-  ]);
+  );
   expect(removing.log).toContain('Tenant beta is no longer declared but still exists');
   // The next up, after the Tenant is gone: the namespace stops being watched.
   const removed = operatorNamespaces({ declared: ['alpha'], cluster: ['alpha'] });
@@ -487,14 +488,16 @@ test('removing a tenant keeps its runtime namespace watched until its Tenant is 
   expect(removed.log).not.toContain('no longer declared');
 }, 60_000);
 
-test('preview computes watched namespaces from config without calling the Kubernetes API', () => {
+test('preview computes watched namespaces from config, not from the cluster', () => {
   const preview = operatorNamespaces({
     declared: ['alpha'],
     cluster: ['alpha', 'beta'],
     dryRun: true,
   });
   expect(preview.failure).toBeUndefined();
-  expect(preview.hits).toEqual([]);
+  // The cluster still lists beta, yet preview watches the declared tenants only: the list is not
+  // read for hostNamespaces (the unit test proves the lister is never called in preview). The
+  // #228 Retain check is separate and may still read the cluster in preview.
   expect(preview.hostNamespaces).toEqual(['wasmcloud', 'di-runtime-alpha']);
   expect(preview.log).toContain(
     'stops being watched on the next up, after the Tenant is gone (#227)',

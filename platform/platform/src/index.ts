@@ -34,7 +34,7 @@ import {
 import { secretReaderFromKubeconfig } from './token-secret-reader';
 import { waitForTokenSecret } from './token-wait';
 import { platformValues } from './values';
-import { operatorHostNamespaces, tenantListerFromKubeconfig } from './watched-namespaces';
+import { operatorHostNamespaces } from './watched-namespaces';
 
 export { platformRegistryPullHost, tenantInsecureRegistries } from './insecure-registries';
 export { kubeconfigServer, type TenantKubeconfigArgs, tenantKubeconfig } from './kubeconfig';
@@ -223,12 +223,14 @@ export function createPlatform(args: PlatformArgs) {
   const resolveHostNamespaces = (kubeconfig?: string, context?: string) =>
     operatorHostNamespaces({
       platformNamespace: namespaceName,
+      installation: scope,
       declared: declared.tenants.map((t) => t.name),
       dryRun: pulumi.runtime.isDryRun(),
+      // async, so an unusable kubeconfig rejects into the caller's error handling.
       listTenants:
         kubeconfig === undefined
           ? undefined
-          : tenantListerFromKubeconfig(kubeconfig, scope, context),
+          : async (installation) => tenantListerFromKubeconfig(kubeconfig, context)(installation),
       log: { info: (m) => pulumi.log.info(m), warn: (m) => pulumi.log.warn(m) },
     });
   const watchedNamespaces: pulumi.Input<string[]> =

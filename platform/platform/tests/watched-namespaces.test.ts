@@ -1,9 +1,23 @@
-import { afterAll, beforeAll, expect, test } from 'bun:test';
-import {
-  type HostNamespacesArgs,
-  operatorHostNamespaces,
-  tenantListerFromKubeconfig,
-} from '../src/watched-namespaces';
+import { expect, test } from 'bun:test';
+import type { LiveTenant } from '../src/tenancy/removal';
+import { type HostNamespacesArgs, operatorHostNamespaces } from '../src/watched-namespaces';
+
+/** A `tenancy/removal` lister stub that records the installation it is asked for. */
+function live(...tenants: string[]) {
+  const asked: string[] = [];
+  const list = async (installation: string): Promise<LiveTenant[]> => {
+    asked.push(installation);
+    return tenants.map((name) => ({ metadata: { name } }));
+  };
+  return { asked, list };
+}
+
+/** An API error as client-node raises it: an HTTP status code and the response body. */
+class ApiError extends Error {
+  constructor(readonly code: number) {
+    super(`HTTP-Code: ${code}\nBody: {"message":"secret detail"}`);
+  }
+}
 
 function recorder() {
   const info: string[] = [];
@@ -19,14 +33,21 @@ function args(
   extra: Partial<HostNamespacesArgs>,
   log: HostNamespacesArgs['log'],
 ): HostNamespacesArgs {
-  return { platformNamespace: 'wasmcloud', declared: ['alpha'], dryRun: false, log, ...extra };
+  return {
+    platformNamespace: 'wasmcloud',
+    installation: 'di-test',
+    declared: ['alpha'],
+    dryRun: false,
+    log,
+    ...extra,
+  };
 }
 
 test('a removed tenant whose Tenant still exists keeps its runtime namespace watched (#227)', async () => {
   const { info, warn, log } = recorder();
-  const namespaces = await operatorHostNamespaces(
-    args({ listTenants: async () => ['zeta', 'beta', 'alpha', 'beta'] }, log),
-  );
+  const cluster = live('zeta', 'beta', 'alpha', 'beta');
+  const namespaces = await operatorHostNamespaces(args({ listTenants: cluster.list }, log));
+  expect(cluster.asked).toEqual(['di-test']);
   // Declared first, then the removed ones once each, sorted, so the Helm values are stable.
   expect(namespaces).toEqual([
     'wasmcloud',
@@ -43,14 +64,14 @@ test('a removed tenant whose Tenant still exists keeps its runtime namespace wat
 
 test('once the removed Tenant is gone, its runtime namespace is no longer watched', async () => {
   const { info, log } = recorder();
-  expect(await operatorHostNamespaces(args({ listTenants: async () => ['alpha'] }, log))).toEqual([
+  expect(await operatorHostNamespaces(args({ listTenants: live('alpha').list }, log))).toEqual([
     'wasmcloud',
     'di-runtime-alpha',
   ]);
   // A declared tenant whose Tenant does not exist yet (a first up) is watched too.
   expect(
     await operatorHostNamespaces(
-      args({ declared: ['alpha', 'gamma'], listTenants: async () => [] }, log),
+      args({ declared: ['alpha', 'gamma'], listTenants: live().list }, log),
     ),
   ).toEqual(['wasmcloud', 'di-runtime-alpha', 'di-runtime-gamma']);
   expect(info).toEqual([]);
@@ -58,20 +79,11 @@ test('once the removed Tenant is gone, its runtime namespace is no longer watche
 
 test('preview never lists Tenants and says when a removed namespace stops being watched', async () => {
   const { info, warn, log } = recorder();
-  let calls = 0;
+  const cluster = live('beta');
   const namespaces = await operatorHostNamespaces(
-    args(
-      {
-        dryRun: true,
-        listTenants: async () => {
-          calls++;
-          return ['beta'];
-        },
-      },
-      log,
-    ),
+    args({ dryRun: true, listTenants: cluster.list }, log),
   );
-  expect(calls).toBe(0);
+  expect(cluster.asked).toEqual([]);
   expect(namespaces).toEqual(['wasmcloud', 'di-runtime-alpha']);
   expect(warn).toEqual([]);
   expect(info).toHaveLength(1);
@@ -86,102 +98,39 @@ test('without the admin kubeconfig only declared tenants are watched, with a war
   expect(warn[0]).toContain('Pass kubeconfig to createPlatform');
 });
 
-test('a failed Tenant list fails the computation rather than shrinking the list', async () => {
+test('a missing Tenant CRD (first install) means no removed tenants', async () => {
   const { log } = recorder();
-  await expect(
+  const listTenants = async () => {
+    throw new ApiError(404);
+  };
+  expect(await operatorHostNamespaces(args({ listTenants }, log))).toEqual([
+    'wasmcloud',
+    'di-runtime-alpha',
+  ]);
+});
+
+test('API errors fail the update with a clear message, never the response body', async () => {
+  const { log } = recorder();
+  const failing = (error: unknown) =>
     operatorHostNamespaces(
       args(
         {
           listTenants: async () => {
-            throw new Error('boom');
+            throw error;
           },
         },
         log,
       ),
-    ),
-  ).rejects.toThrow('boom');
-});
-
-// A plain-HTTP fake Kubernetes API for the lister (client-node allows http only without TLS verify).
-const hits: { path: string; auth: string | null }[] = [];
-let status = 200;
-let tenants: unknown = { items: [{ metadata: { name: 'alpha' } }, { metadata: {} }] };
-let server: ReturnType<typeof Bun.serve>;
-let url = '';
-
-const kubeconfigFor = (clusters: Record<string, string>, current: string) =>
-  `${[
-    'apiVersion: v1',
-    'kind: Config',
-    `current-context: ${current}`,
-    'clusters:',
-    ...Object.entries(clusters).flatMap(([n, s]) => [
-      `- name: ${n}`,
-      '  cluster:',
-      `    server: ${s}`,
-      '    insecure-skip-tls-verify: true',
-    ]),
-    'users:',
-    ...Object.keys(clusters).flatMap((n) => [`- name: ${n}`, '  user:', `    token: tok-${n}`]),
-    'contexts:',
-    ...Object.keys(clusters).flatMap((n) => [
-      `- name: ${n}`,
-      '  context:',
-      `    cluster: ${n}`,
-      `    user: ${n}`,
-    ]),
-  ].join('\n')}\n`;
-
-beforeAll(() => {
-  server = Bun.serve({
-    port: 0,
-    fetch(req) {
-      const u = new URL(req.url);
-      hits.push({ path: `${u.pathname}${u.search}`, auth: req.headers.get('authorization') });
-      if (status !== 200)
-        return new Response('{"kind":"Status","message":"secret detail"}', { status });
-      return Response.json(tenants);
-    },
-  });
-  url = `http://127.0.0.1:${server.port}`;
-});
-afterAll(() => server.stop(true));
-
-test('tenantListerFromKubeconfig lists the installation Tenants with the given context', async () => {
-  hits.length = 0;
-  status = 200;
-  tenants = { items: [{ metadata: { name: 'alpha' } }, { metadata: {} }] };
-  const yaml = kubeconfigFor({ first: 'http://127.0.0.1:1', second: url }, 'first');
-  expect(await tenantListerFromKubeconfig(yaml, 'di-test', 'second')()).toEqual(['alpha']);
-  expect(hits).toEqual([
-    {
-      path: '/apis/platform.di-framework.dev/v1alpha1/tenants?labelSelector=platform.di-framework.dev%2Finstallation%3Ddi-test',
-      auth: 'Bearer tok-second',
-    },
-  ]);
-  // A list without items, and the kubeconfig's own current context without one given.
-  tenants = {};
-  expect(
-    await tenantListerFromKubeconfig(kubeconfigFor({ only: url }, 'only'), 'di-test')(),
-  ).toEqual([]);
-});
-
-test('a missing Tenant CRD (first install) lists no Tenants', async () => {
-  status = 404;
-  expect(await tenantListerFromKubeconfig(kubeconfigFor({ c: url }, 'c'), 'di-test')()).toEqual([]);
-});
-
-test('API errors name the installation and status, never the response body', async () => {
-  status = 403;
-  const failure = tenantListerFromKubeconfig(kubeconfigFor({ c: url }, 'c'), 'di-test')();
-  await expect(failure).rejects.toThrow(
+    );
+  const forbidden = failing(new ApiError(403));
+  await expect(forbidden).rejects.toThrow(
     "Cannot list the Tenants of installation di-test, which keep a removed tenant's runtime namespace watched by the wasmCloud operator until the Tenant is deleted (#227): HTTP 403",
   );
-  await expect(failure).rejects.not.toThrow('secret detail');
-});
-
-test('an unusable kubeconfig fails with the same message and without its contents', async () => {
-  const failure = tenantListerFromKubeconfig('token: hunter2', 'di-test')();
-  await expect(failure).rejects.toThrow('Cannot list the Tenants of installation di-test');
-  await expect(failure).rejects.not.toThrow('hunter2');
+  await expect(forbidden).rejects.not.toThrow('secret detail');
+  // A connection failure names its code; an unusable kubeconfig names only the error class.
+  await expect(
+    failing(Object.assign(new Error('connect'), { code: 'ECONNREFUSED' })),
+  ).rejects.toThrow('(#227): ECONNREFUSED');
+  await expect(failing(new Error('token: hunter2'))).rejects.toThrow('(#227): Error');
+  await expect(failing(new Error('token: hunter2'))).rejects.not.toThrow('hunter2');
 });

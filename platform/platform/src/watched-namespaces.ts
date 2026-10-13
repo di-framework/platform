@@ -1,52 +1,17 @@
-import { CustomObjectsApi, KubeConfig } from '@kubernetes/client-node';
-import { GROUP, INSTALLATION, names } from './tenancy/resources';
+import type { TenantLister } from './tenancy/removal';
+import { names } from './tenancy/resources';
 import { describeReadError } from './token-wait';
-
-/** Names of the installation's Tenant objects that exist in the cluster right now. */
-export type TenantLister = () => Promise<string[]>;
-
-/**
- * Lists the installation's Tenants with exactly the kubeconfig (and optional context) that the
- * program's provider uses, like `secretReaderFromKubeconfig`. A missing Tenant CRD (HTTP 404, a
- * first install) means no Tenants. Any other failure, an unusable kubeconfig included, names the
- * installation and the HTTP status, error code or error class, never a response body or the
- * kubeconfig.
- */
-export function tenantListerFromKubeconfig(
-  kubeconfig: string,
-  installation: string,
-  context?: string,
-): TenantLister {
-  return async () => {
-    let list: { items?: { metadata?: { name?: string } }[] };
-    try {
-      const kc = new KubeConfig();
-      kc.loadFromString(kubeconfig);
-      if (context) kc.setCurrentContext(context);
-      list = await kc.makeApiClient(CustomObjectsApi).listClusterCustomObject({
-        group: GROUP,
-        version: 'v1alpha1',
-        plural: 'tenants',
-        labelSelector: `${INSTALLATION}=${installation}`,
-      });
-    } catch (error) {
-      if ((error as { code?: unknown } | null)?.code === 404) return [];
-      throw new Error(
-        `Cannot list the Tenants of installation ${installation}, which keep a removed tenant's runtime namespace watched by the wasmCloud operator until the Tenant is deleted (#227): ${describeReadError(error)}`,
-      );
-    }
-    return (list.items ?? []).flatMap((item) => (item.metadata?.name ? [item.metadata.name] : []));
-  };
-}
 
 export interface HostNamespacesArgs {
   /** The platform namespace; always watched, first. */
   platformNamespace: string;
+  /** The installation whose Tenants are listed. */
+  installation: string;
   /** Tenant names in the stack config. */
   declared: string[];
   /** `pulumi.runtime.isDryRun()`: a preview never reads the cluster. */
   dryRun: boolean;
-  /** Absent when the program has no admin kubeconfig. */
+  /** `tenancy/removal`'s lister on the admin kubeconfig; absent without one. */
   listTenants?: TenantLister;
   log: { info(message: string): void; warn(message: string): void };
 }
@@ -77,8 +42,20 @@ export async function operatorHostNamespaces(args: HostNamespacesArgs): Promise<
     );
     return declaredNamespaces;
   }
+  let live: string[];
+  try {
+    live = (await args.listTenants(args.installation)).map((t) => t.metadata.name);
+  } catch (error) {
+    // No Tenant CRD yet (a first install): no Tenants. Anything else fails the update rather
+    // than shrinking the list; the message never carries a response body or the kubeconfig.
+    if ((error as { code?: unknown } | null)?.code !== 404)
+      throw new Error(
+        `Cannot list the Tenants of installation ${args.installation}, which keep a removed tenant's runtime namespace watched by the wasmCloud operator until the Tenant is deleted (#227): ${describeReadError(error)}`,
+      );
+    live = [];
+  }
   const declared = new Set(args.declared);
-  const draining = [...new Set(await args.listTenants())]
+  const draining = [...new Set(live)]
     .filter((t) => !declared.has(t))
     .sort((a, b) => a.localeCompare(b));
   for (const tenant of draining)
