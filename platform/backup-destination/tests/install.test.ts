@@ -1,7 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import * as k8s from '@pulumi/kubernetes';
 import * as pulumi from '@pulumi/pulumi';
-import { backupReleaseArgs, installBackupDestination } from '../src/install.ts';
+import {
+  type BackupDestinationInstall,
+  backupReleaseArgs,
+  installBackupDestination,
+} from '../src/install.ts';
 
 describe('backup helm release', () => {
   test('targets the wasmCloud tenant namespace and does not create it', () => {
@@ -9,13 +13,14 @@ describe('backup helm release', () => {
       tenant: 'alpha',
       chart: '/charts/backup-destination',
       bucket: 'tenant-alpha-backups',
+      schedule: '0 2 * * *',
     });
     expect(release).toEqual({
       name: 'backups',
       namespace: 'di-tenant-alpha',
       createNamespace: false,
       chart: '/charts/backup-destination',
-      values: { bucket: 'tenant-alpha-backups' },
+      values: { bucket: 'tenant-alpha-backups', schedule: '0 2 * * *' },
     });
   });
 
@@ -52,12 +57,119 @@ describe('backup helm release', () => {
     });
   });
 
-  test('rejects a namespace that is not a tenant name', () => {
-    expect(() => backupReleaseArgs({ tenant: 'Wasm', chart: '/chart', bucket: 'b' })).toThrow(
-      /wasmCloud tenant name/,
-    );
+  test('passes a PVC destination through without a bucket', () => {
+    const release = backupReleaseArgs({
+      tenant: 'alpha',
+      chart: '/chart',
+      type: 'both',
+      bucket: 'b',
+      existingClaimName: 'claim',
+      volumeClaimTemplate: { storageClassName: 'local-path', size: '20Gi' },
+      schedule: 'none',
+    });
+    expect(release.values).toEqual({
+      schedule: 'none',
+      type: 'both',
+      bucket: 'b',
+      existingClaimName: 'claim',
+      volumeClaimTemplate: { storageClassName: 'local-path', size: '20Gi' },
+    });
+    expect(
+      backupReleaseArgs({ tenant: 'alpha', chart: '/chart', type: 'pvc', schedule: '0 3 * * 0' })
+        .values,
+    ).toEqual({ type: 'pvc', schedule: '0 3 * * 0' });
+  });
+
+  test('requires an explicit schedule: a cron or none, never a default (#250)', () => {
+    // @ts-expect-error schedule is a required option since #250
+    const missing: BackupDestinationInstall = { tenant: 'alpha', chart: '/chart', bucket: 'b' };
+    expect(missing.schedule).toBeUndefined();
+    const typed: BackupDestinationInstall = { tenant: 'alpha', chart: '/chart', schedule: 'none' };
+    expect(backupReleaseArgs(typed).values).toEqual({ schedule: 'none' });
+    expect(backupReleaseArgs({ ...typed, schedule: ' */15 1-5 * * 1,3 ' }).values).toEqual({
+      schedule: ' */15 1-5 * * 1,3 ',
+    });
+    for (const schedule of ['', '  ', 'nightly', '0 2 * *', '0 2 * * * *', 'manual']) {
+      expect(() => backupReleaseArgs({ ...typed, schedule })).toThrow(
+        'schedule must be a five-field UTC cron (such as "0 2 * * *") or "none"',
+      );
+    }
+    for (const schedule of ['60 * * * *', '*/0 * * * *', '5- * * * *', '- - - - -', '0 24 * * *']) {
+      expect(() => backupReleaseArgs({ ...typed, schedule })).toThrow('five-field UTC cron');
+    }
+    // A JS caller can omit it despite the type.
     expect(() =>
-      backupReleaseArgs({ tenant: 'a'.repeat(41), chart: '/chart', bucket: 'b' }),
+      backupReleaseArgs({
+        tenant: 'alpha',
+        chart: '/chart',
+      } as unknown as BackupDestinationInstall),
+    ).toThrow('schedule is required');
+    // An Output is passed through; the chart validates it when it renders.
+    const output = pulumi.output('0 2 * * *');
+    expect(backupReleaseArgs({ ...typed, schedule: output }).values).toEqual({ schedule: output });
+  });
+
+  test('passes workload-volume sources and the storage root through', () => {
+    const sources = [
+      { workloadName: 'identity', schedule: '30 3 * * *', retention: { keepLast: 7 } },
+    ];
+    expect(
+      backupReleaseArgs({
+        tenant: 'alpha',
+        chart: '/chart',
+        type: 'pvc',
+        existingClaimName: 'c',
+        storageRoot: '/var/lib/k0s',
+        schedule: 'none',
+        sources,
+      }).values,
+    ).toEqual({
+      type: 'pvc',
+      existingClaimName: 'c',
+      storageRoot: '/var/lib/k0s',
+      schedule: 'none',
+      sources,
+    });
+  });
+
+  test('requires an explicit schedule or "none" on every workload-volume source (#250)', () => {
+    const base = { tenant: 'alpha', chart: '/chart', type: 'pvc' as const, schedule: 'none' };
+    const sourcesOf = (install: BackupDestinationInstall) =>
+      (backupReleaseArgs(install).values as Record<string, unknown>).sources;
+    const none = [{ workloadName: 'identity', schedule: 'none' }];
+    expect(sourcesOf({ ...base, sources: none })).toEqual(none);
+    for (const schedule of [undefined, '', '  ']) {
+      expect(() =>
+        backupReleaseArgs({
+          ...base,
+          sources: [{ workloadName: 'identity', schedule }] as unknown as typeof none,
+        }),
+      ).toThrow('source identity: schedule is required');
+    }
+    for (const schedule of ['nightly', 'nonesuch', 'none 0 2 * * *', '99 * * * *']) {
+      expect(() =>
+        backupReleaseArgs({ ...base, sources: [{ workloadName: 'x', schedule }] }),
+      ).toThrow('source x: schedule must be a five-field UTC cron');
+    }
+    // An Output (a whole list or one schedule) is passed through; the chart validates it.
+    const output = pulumi.output(none);
+    expect(sourcesOf({ ...base, sources: output })).toBe(output);
+    const lazy = [{ workloadName: 'x', schedule: pulumi.output('0 1 * * *') }];
+    expect(sourcesOf({ ...base, sources: lazy as unknown as typeof none })).toBe(lazy);
+    expect(() =>
+      backupReleaseArgs({ ...base, sources: [null, 'x'] as unknown as typeof none }),
+    ).not.toThrow();
+    expect(() =>
+      backupReleaseArgs({ ...base, sources: [{ schedule: 7 }] as unknown as typeof none }),
+    ).toThrow('source ?: schedule is required');
+  });
+
+  test('rejects a namespace that is not a tenant name', () => {
+    expect(() =>
+      backupReleaseArgs({ tenant: 'Wasm', chart: '/chart', bucket: 'b', schedule: 'none' }),
+    ).toThrow(/wasmCloud tenant name/);
+    expect(() =>
+      backupReleaseArgs({ tenant: 'a'.repeat(41), chart: '/chart', bucket: 'b', schedule: 'none' }),
     ).toThrow(/wasmCloud tenant name/);
   });
 
@@ -86,7 +198,12 @@ describe('backup helm release', () => {
         installBackupDestination({
           provider,
           dependsOn: [],
-          install: { tenant: 'alpha', chart: '/chart', bucket: 'tenant-alpha-backups' },
+          install: {
+            tenant: 'alpha',
+            chart: '/chart',
+            bucket: 'tenant-alpha-backups',
+            schedule: '0 2 * * *',
+          },
         }) instanceof k8s.helm.v3.Release;
     });
     expect(constructed).toBe(true);
