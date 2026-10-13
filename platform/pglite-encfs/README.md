@@ -27,7 +27,7 @@ Or use `make compose PGLITE=path/to/di-framework-pglite.wasm OUT=pglite-enc.wasm
 
 - **Interfaces stay the same.** `pglite-enc.wasm` exports the same `di-framework:pglite/*` interfaces as pglite. It imports only WASI interfaces that pglite already imports.
 - **The guest is unaffected.** The guest's own WASI imports still go straight to the host; only pglite sees the encrypted view.
-- **Detecting an encrypted provider.** The composed component carries a `di-framework:pglite-encfs` custom section (`format=1 codec=aes-256-xts`). A deploy step can use it to tell that a provider is encrypted.
+- **Detecting an encrypted provider.** The composed component carries a `di-framework:pglite-encfs` custom section (`format=1 codec=aes-256-xts write-codec=3`). A deploy step can use it to tell that a provider is encrypted, and `write-codec=3` that it creates codec-3 files, which older builds cannot read (see [Codecs and migration](#codecs-and-migration)).
 - **Exact names.** `wac plug` matches import names exactly, so encfs is built for pglite's exact WASI version (`@0.2.9`; random is `@0.2.3`). `make smoke` fails if a pglite build drifts from it. When pglite moves to a new WASI version, update `wit/world.wit` from `wasm-tools component wit` of the new pglite and republish.
 
 ## Keys
@@ -94,7 +94,7 @@ Notes:
 |---|---|
 | 0..8 | magic `DIPGENC1` |
 | 8 | format version (1) |
-| 9 | codec (2 = AES-256-XTS) |
+| 9 | codec: 2 = AES-256-XTS with ciphertext stealing (v1), 3 = AES-256-XTS with a length-independent tail (#206) |
 | 16..32 | random file id |
 | 32..48 | KCV of the wrapping key |
 | 48..72 | XChaCha20 nonce |
@@ -112,8 +112,10 @@ Header lifecycle:
 
 Data units:
 - AES-256-XTS over 4 KiB units with tweak = unit index. The scheme is length-preserving: logical size = physical size − 4096.
-- A final partial unit of 16 bytes or more uses ciphertext stealing.
-- A final unit shorter than 16 bytes is XORed with an AES block keyed by the tweak key. This only happens in tiny files such as `PG_VERSION`, and two versions of such a tail with the same length leak their XOR.
+- Complete 16-byte blocks are plain XTS under both codecs. A unit's final partial block (`len % 16` bytes, only in the last unit of a file) depends on the codec:
+  - **Codec 3** (new files): no ciphertext stealing. The partial bytes are XORed with `AES-256(key2, unit as LE u64 ‖ block index as LE u32 ‖ "TAIL")`, where key2 is the XTS tweak key. The keystream does not depend on the unit's length; the `"TAIL"` constant keeps its inputs apart from XTS tweak inputs (byte 15 zero) and codec-2 masks (byte 15 = `0x81..0x8F`).
+  - **Codec 2** (files created by v1): a final partial unit of 16 bytes or more uses ciphertext stealing, and a unit shorter than 16 bytes is XORed with `AES-256(key2, tweak ^ (0x80 | len) << 120)`.
+- **Partial-block leak.** The partial block is a deterministic XOR under both codecs (for codec 2, only in units shorter than 16 bytes), so two versions of the same tail block leak the XOR of their plaintexts. Codec 3 extends this from sub-16-byte files to the partial tail block of any file, at most 15 bytes per file, and never in relation or WAL files, which are whole 8 KiB pages. Under XTS, two versions of a complete block already reveal whether the block changed.
 - Logical sizes are capped at 1 TiB, and one write or `set-size` may zero-fill at most 1 GiB past the end of file (`file-too-large` otherwise).
 
 ### Crash consistency
@@ -126,8 +128,17 @@ Data units:
     - a rewrite of the WAL page that already holds an fsynced commit
     - a `pg_control` rewrite
   - An AEAD codec failed the last two cases in the spike: a lost commit, and `PANIC` on `pg_control`. A crash-safe AEAD design is the follow-up #200.
-- **Unaligned ends: up to 31 bytes.** Ciphertext stealing and the sub-block mask make the encryption of a unit's last full block and partial block depend on the unit's length. Changing the length of a unit that ends mid-block (a shrink to, or an append at, an offset that is not a multiple of 16) re-encrypts those durable bytes. A crash between that rewrite and the size change can garble up to 31 bytes just before the durable end of file. Lengths that are multiples of 16 lose nothing. The bound is pinned by `unaligned_resizes_bound_crash_damage`; a length-independent tail encoding is tracked in #206.
+- **Unaligned ends.** A shrink rewrites the new tail and then truncates; an append rewrites the old tail with the new bytes. A crash between that write and the size change leaves the old size with the rewritten bytes.
+  - **Codec 3: at most 15 bytes, usually none.** Complete blocks never change their ciphertext with the length, and the bytes already in a partial block are a prefix of the same keystream. A shrink or append inside one block, or to or from a multiple of 16, loses nothing. An append that completes a partial block, or a shrink that splits a complete one, re-encrypts that block's durable partial bytes (at most 15) just before the durable end of file. Pinned by `unaligned_resizes_bound_crash_damage` (#206).
+  - **Codec 2: up to 31 bytes.** Ciphertext stealing and the sub-block mask make a unit's last full block and partial block depend on its length, so changing the length of a unit that ends mid-block can garble up to 31 bytes just before the durable end of file. Lengths that are multiples of 16 lose nothing. Pinned by `codec_2_files_keep_their_31_byte_bound`.
 - **New files.** The header is synced before the first data write, so a crash leaves either a fresh file (re-sealed on the next write) or a valid header. `make smoke` zeroes and shortens the files of a freshly created table after a crash, and WAL redo rebuilds it.
+
+### Codecs and migration
+
+- **One codec per file, for its lifetime.** The codec byte is written with the header and is part of the wrap's AAD, so it cannot change without the key. Writes to a codec-2 file keep encoding it with codec 2, and rotation keeps the codec. Nothing is re-encrypted in place.
+- **New files get codec 3.** That includes the files PostgreSQL rewrites through a temporary file and `rename` (most small files), so an existing directory moves to codec 3 file by file as it is written. Long-lived codec-2 files (relation segments, `pg_control`) stay codec 2; they are written in whole blocks, where both codecs behave the same.
+- **No downgrade.** A build without codec 3 refuses a codec-3 file with `io` (`unsupported header (format 1, codec 3)`). Once this build has written to a directory, roll back only to builds whose custom section has `write-codec=3`.
+- A copy into a fresh directory (the planned offline tool, #199) produces an all-codec-3 tree.
 
 ## Threat model
 
@@ -175,13 +186,14 @@ make smoke    # needs wasmtime 48 and ../pglite-component/dist (make -C ../pglit
               # or PGLITE_ENCFS_PGLITE_WASM=/path/to/di-framework-pglite.wasm
 ```
 
-**Dependencies.** Every crate is pinned with `=`. Apart from `xts-mode`, the crypto crates (`aes`, `chacha20poly1305`, `hkdf`, `sha2`, `zeroize`) are RustCrypto. `xts-mode` is a small single-maintainer crate: before bumping it, re-run `make unit`. The known answers in `src/testdata/xts-kat.txt` (the full IEEE 1619 vector 10 and ciphertext-stealing lengths 16–4096, generated by an independent IEEE 1619 reference on OpenSSL AES-256-ECB) must still pass, and any new length class should be cross-checked against that reference first.
+**Dependencies.** Every crate is pinned with `=`. Apart from `xts-mode`, the crypto crates (`aes`, `chacha20poly1305`, `hkdf`, `sha2`, `zeroize`) are RustCrypto. `xts-mode` is a small single-maintainer crate: before bumping it, re-run `make unit`. The known answers in `src/testdata/xts-kat.txt` must still pass: the full IEEE 1619 vector 10, codec-2 ciphertext-stealing lengths 16–4096 (an independent IEEE 1619 reference on OpenSSL AES-256-ECB), and codec-3 lengths 1–4096 (an independent reference on Node's AES-256-ECB with hand-written tweak doubling and tail keystream). Cross-check any new length class against such a reference first. `src/testdata/codec2/` holds files written by the v1 build, which must keep reading back exactly.
 
 **Toolchain.** Rust is pinned in `rust-toolchain.toml` (1.97.1, the same as pglite-component). The crate builds for `wasm32-unknown-unknown` and is wrapped with `wasm-tools component new`, so std adds no WASI imports of its own. Crates are pinned with `=`.
 
 **Unit tests** (`src/*.rs`) cover:
-- the XTS codec (all 512 bytes of IEEE 1619 vector 10, independent ciphertext-stealing known answers, torn-sector behaviour, tiny tails)
-- the crash bound for unaligned resizes and appends, and the size caps
+- the XTS codecs (all 512 bytes of IEEE 1619 vector 10, independent codec-2 and codec-3 known answers, torn-sector behaviour, tiny tails, length independence of codec-3 ciphertext, keystream domain separation)
+- codec-2 fixtures from the v1 build: still read, and stay codec 2 when written
+- the crash bounds for unaligned resizes and appends (codec 3: none inside a block, at most 15 bytes when completing or splitting one; codec 2: at most 31), and the size caps
 - fresh-file classification after a crash during creation, and refusal of plaintext of any size
 - the header layout and authentication
 - wrong-key detection
@@ -190,7 +202,7 @@ make smoke    # needs wasmtime 48 and ../pglite-component/dist (make -C ../pglit
 - key parsing
 - the root-marker decision table, including a partial marker after a crash, and marker path normalization
 
-**`make smoke`** plugs encfs into the pglite wasm and the pglite smoke consumer (`../pglite-component/tests/smoke-consumer`) and runs everything under wasmtime with no network:
+**`make smoke`** plugs encfs into the pglite wasm and the pglite smoke consumer (`../pglite-component/tests/smoke-consumer`) and runs everything under wasmtime with no network (the only download is the pinned v1 build for the codec-2 case; set `PGLITE_ENCFS_V1_WASM` to a local copy to skip it):
 - **Interface fit.** encfs's exports are exactly pglite's WASI imports, and the composed provider keeps pglite's imports and exports.
 - **The pglite suite, encrypted.** initdb and the full smoke suite, restart, abrupt-exit restart, and 200 marker rows plus a checkpoint.
 - **Ciphertext on disk.**
@@ -200,6 +212,7 @@ make smoke    # needs wasmtime 48 and ../pglite-component/dist (make -C ../pglit
 - **Crashes during setup.** The first start succeeds over an empty marker. After a table is created and committed and the process dies, its new files are zeroed or shortened (size durable, header not); the next start re-seals them and WAL redo restores the row.
 - **Torn writes.** The three power-loss cases above.
 - **Rotation.** Every header is re-wrapped, an interrupted rotation resumes, and the old key is refused afterwards.
+- **Codecs.** A fresh directory holds only codec-3 files. A directory initialized by the published v1 build (all codec 2) is read, restarted after an abrupt exit, and written to by this build (commits and a new table); afterwards it holds codec-2 and codec-3 files side by side.
 
 Keys are generated per run, passed by inherited environment rather than on a command line, and every log is checked for them.
 

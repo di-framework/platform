@@ -13,8 +13,14 @@
  *   5. Power-loss torn writes (the spike's cases) keep fsynced commits.
  *   6. Rotation re-wraps every header, resumes after a crash before the
  *      marker flips, and then refuses the old key.
+ *   7. Codecs (#206): a fresh directory holds only codec-3 files. A directory
+ *      initialized by the published v1 build (codec 2) keeps working: this
+ *      build reads it, writes to it, and creates codec-3 files next to the
+ *      codec-2 ones.
  *
  * pglite: $PGLITE_ENCFS_PGLITE_WASM, else ../pglite-component/dist (make build there).
+ * v1 encfs: $PGLITE_ENCFS_V1_WASM, else fetched anonymously from ghcr.io by its
+ * pinned digest (the only network access; wasmtime itself runs without one).
  * Keys are generated per run, passed to wasmtime by inherited environment
  * (never on a command line) and never printed; every log is checked for them.
  */
@@ -37,6 +43,16 @@ const FILE_MAGIC = 'DIPGENC1';
 const MARKER_FILE = '.di-encfs';
 const MARKER_MAGIC = 'DIPGKEY1';
 const CUSTOM_SECTION = 'di-framework:pglite-encfs';
+/** Header byte 9; see src/header.rs. */
+const CODEC_AT = 9;
+const CODEC_STEALING = 2;
+const CODEC_TAIL = 3;
+/**
+ * The v1 build (codec 2 only), as published by #201/#211: the Wasm layer of
+ * ghcr.io/di-framework/pglite-encfs@sha256:46863e8bc92be13104f4be1b489f5500ba008f51f4662f382a211f7a78a5d414.
+ */
+const V1_REPOSITORY = 'di-framework/pglite-encfs';
+const V1_WASM_SHA256 = '041784d169d3bc1f80136af6399fc7a54d8635600c8ff02275c00a68cca274cf';
 /** Inserted by the consumer's marker-write mode. */
 const ROW_MARKER = 'PGLITE-SMOKE-PLAINTEXT-MARKER';
 /** Plaintext that the smoke suite, initdb and postgresql.conf put on disk. */
@@ -168,6 +184,52 @@ async function assertEncrypted(dataDir: string, kcv: Buffer, secrets: Buffer[]):
   return headers;
 }
 
+/** Number of encrypted files per header codec id. */
+async function codecCounts(dataDir: string): Promise<Map<number, number>> {
+  const counts = new Map<number, number>();
+  for (const file of await regularFiles(dataDir)) {
+    if (file === join(dataDir, MARKER_FILE)) continue;
+    const bytes = await readFile(file);
+    if (bytes.length < HEADER_LEN) continue;
+    const codec = bytes[CODEC_AT] ?? -1;
+    if (codec !== CODEC_STEALING && codec !== CODEC_TAIL)
+      throw new Error(`${relative(dataDir, file)} has codec ${codec}`);
+    counts.set(codec, (counts.get(codec) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function describeCodecs(counts: Map<number, number>): string {
+  return [...counts.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([codec, n]) => `${n} codec-${codec}`)
+    .join(', ');
+}
+
+/** The v1 encfs component, checked against its pinned digest. */
+async function v1Component(ctx: Context, smokeDir: string): Promise<string> {
+  let bytes: Uint8Array;
+  const local = ctx.env.PGLITE_ENCFS_V1_WASM;
+  if (local) {
+    bytes = new Uint8Array(await readFile(local));
+  } else {
+    const auth = await fetch(`https://ghcr.io/token?scope=repository:${V1_REPOSITORY}:pull`);
+    if (!auth.ok) throw new Error(`ghcr.io token: HTTP ${auth.status}`);
+    const { token } = (await auth.json()) as { token: string };
+    const blob = await fetch(`https://ghcr.io/v2/${V1_REPOSITORY}/blobs/sha256:${V1_WASM_SHA256}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!blob.ok) throw new Error(`v1 encfs blob: HTTP ${blob.status}`);
+    bytes = new Uint8Array(await blob.arrayBuffer());
+  }
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  if (digest !== V1_WASM_SHA256)
+    throw new Error(`v1 encfs is sha256:${digest}, expected sha256:${V1_WASM_SHA256}`);
+  const out = join(smokeDir, 'pglite-encfs-v1.wasm');
+  await writeFile(out, bytes);
+  return out;
+}
+
 /** The control: the same workload without encfs leaves every probe on disk. */
 async function assertPlaintextProbes(dataDir: string): Promise<void> {
   const contents = await Promise.all((await regularFiles(dataDir)).map((f) => readFile(f)));
@@ -257,7 +319,17 @@ async function compose(ctx: Context, smokeDir: string, pglite: string, encfs: st
       throw new Error(`${out} imports ${imports.join(', ')}`);
     }
   }
-  return composed;
+  return { ...composed, consumer };
+}
+
+/** Plug another encfs build into pglite and the consumer, as `compose` does. */
+async function composeWith(smokeDir: string, pglite: string, encfs: string, consumer: string) {
+  const provider = join(smokeDir, 'pglite-enc-v1.wasm');
+  const out = join(smokeDir, 'encrypted-v1.wasm');
+  await $`wac plug --plug ${encfs} ${pglite} -o ${provider}`;
+  await $`wac plug --plug ${provider} ${consumer} -o ${out}`;
+  await $`wasm-tools validate --features all ${out}`;
+  return out;
 }
 
 export async function smoke(ctx: Context): Promise<void> {
@@ -327,6 +399,10 @@ export async function smoke(ctx: Context): Promise<void> {
     const headers = await assertEncrypted(data, keyCheckValue(keyA), raw);
     if (headers < 100) throw new Error(`only ${headers} encrypted files; expected a whole cluster`);
     log(`${headers} files encrypted under key A; no plaintext probe or key material on disk`);
+    const fresh = await codecCounts(data);
+    if (fresh.get(CODEC_TAIL) !== headers)
+      throw new Error(`a fresh directory is not all codec 3: ${describeCodecs(fresh)}`);
+    log(`fresh directory: ${describeCodecs(fresh)}`);
 
     // Refusals leave the tree byte-identical.
     await h.refused(enc, data, B, 'encrypted with a different key');
@@ -446,10 +522,47 @@ export async function smoke(ctx: Context): Promise<void> {
       throw new Error('resumed rotation re-wrapped headers twice');
     await assertEncrypted(data, keyCheckValue(keyB), raw);
     await h.run(enc, data, 'read', B, 'restart ok');
+
+    // A codec-2 directory created by the published v1 build (#206 migration).
+    const v1 = await composeWith(
+      smokeDir,
+      pglite,
+      await v1Component(ctx, smokeDir),
+      composed.consumer,
+    );
+    const legacy = join(work, 'legacy');
+    await mkdir(legacy);
+    await h.run(v1, legacy, 'write', A, 'smoke ok');
+    await h.run(v1, legacy, 'marker-write', A, 'marker-write ok');
+    const legacyHeaders = await assertEncrypted(legacy, keyCheckValue(keyA), raw);
+    const before = await codecCounts(legacy);
+    if (before.get(CODEC_STEALING) !== legacyHeaders)
+      throw new Error(`v1 did not write codec 2 only: ${describeCodecs(before)}`);
+    log(`v1 directory: ${describeCodecs(before)}`);
+    // This build reads it, survives an abrupt exit, and keeps writing to it.
+    await h.run(enc, legacy, 'read', A, 'restart ok');
+    await h.run(enc, legacy, 'marker-read', A, 'marker-read ok');
+    await h.run(enc, legacy, 'abrupt', A, 'abrupt ok');
+    await h.run(enc, legacy, 'commit-a', A, 'commit-a ok');
+    await h.run(enc, legacy, 'commit-b', A, 'commit-b ok');
+    const ab = checkAb(await h.run(enc, legacy, 'check-ab', A, /^check-ab /));
+    if (ab.a !== 1 || ab.b !== 1)
+      throw new Error(`v1 directory lost commits: ${JSON.stringify(ab)}`);
+    await h.run(enc, legacy, 'create-commit', A, 'create-commit ok');
+    if (!/^check-fresh N=1$/m.test(await h.run(enc, legacy, 'check-fresh', A, /^check-fresh /)))
+      throw new Error('v1 directory: committed row lost');
+    await h.run(enc, legacy, 'marker-read', A, 'marker-read ok');
+    await assertEncrypted(legacy, keyCheckValue(keyA), raw);
+    const after = await codecCounts(legacy);
+    if (!after.get(CODEC_STEALING) || !after.get(CODEC_TAIL))
+      throw new Error(`expected codec-2 and codec-3 files side by side: ${describeCodecs(after)}`);
+    log(`v1 directory after this build wrote to it: ${describeCodecs(after)}`);
   } finally {
     await rm(work, { recursive: true, force: true });
   }
-  log('encrypted PGlite passed: smoke, restart, ciphertext, refusals, torn writes, rotation');
+  log(
+    'encrypted PGlite passed: smoke, restart, ciphertext, refusals, torn writes, rotation, v1 directory',
+  );
 }
 
 if (import.meta.main) await run('smoke', smoke);

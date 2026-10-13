@@ -8,13 +8,20 @@
 //! |----------|--------------------------------------------|
 //! | 0..8     | magic `DIPGENC1`                           |
 //! | 8        | format version (1)                         |
-//! | 9        | codec (2 = AES-256-XTS)                    |
+//! | 9        | codec (2 or 3, see below)                  |
 //! | 10..16   | reserved, zero                             |
 //! | 16..32   | file id (random)                           |
 //! | 32..48   | key-check value of the wrapping key        |
 //! | 48..72   | wrap nonce (XChaCha20)                     |
 //! | 72..136  | wrapped 64-byte DEK                        |
 //! | 136..152 | wrap tag (Poly1305); AAD = bytes 0..32     |
+//!
+//! Codec ids ([`Codec`]): 2 is AES-256-XTS with ciphertext stealing (v1),
+//! 3 is AES-256-XTS with a length-independent tail keystream (#206). New files
+//! get [`Codec::NEW_FILES`]. A file keeps the codec it was created with for its
+//! whole lifetime: the header is never rewritten except for its wrap, and the
+//! codec byte is part of the AAD, so it cannot be changed without the key.
+//! Codec 1 was the AEAD prototype (#200) and is not accepted.
 //!
 //! The DEK is random per file rather than derived from the path, so renames
 //! keep working and a copied file gets a fresh key. The header is written once
@@ -25,6 +32,7 @@ use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{Tag, XNonce};
 use zeroize::Zeroizing;
 
+use crate::codec::Codec;
 use crate::keys::{Kek, KCV_LEN};
 
 /// Physical offset of the first data unit.
@@ -33,9 +41,6 @@ pub const HEADER_LEN: u64 = 4096;
 pub const HEADER_USED: usize = 152;
 pub const MAGIC: &[u8; 8] = b"DIPGENC1";
 pub const FORMAT_VERSION: u8 = 1;
-/// AES-256-XTS over 4 KiB units. Codec 1 was the AEAD prototype (#200) and is
-/// not accepted.
-pub const CODEC_XTS: u8 = 2;
 /// Two AES-256 keys for XTS.
 pub const DEK_LEN: usize = 64;
 pub const NONCE_LEN: usize = 24;
@@ -101,6 +106,7 @@ impl Header {
     /// Create a header for a new file, wrapping `dek` under `kek`.
     pub fn seal(
         kek: &Kek,
+        codec: Codec,
         file_id: &FileId,
         dek: &[u8; DEK_LEN],
         nonce: &[u8; NONCE_LEN],
@@ -108,7 +114,7 @@ impl Header {
         let mut bytes = [0u8; HEADER_USED];
         bytes[..MAGIC.len()].copy_from_slice(MAGIC);
         bytes[VERSION_AT] = FORMAT_VERSION;
-        bytes[CODEC_AT] = CODEC_XTS;
+        bytes[CODEC_AT] = codec.id();
         bytes[FILE_ID].copy_from_slice(file_id);
         let mut header = Header { bytes };
         header.wrap(kek, dek, nonce);
@@ -125,7 +131,7 @@ impl Header {
             return Err(HeaderError::NotEncrypted);
         }
         let (version, codec) = (bytes[VERSION_AT], bytes[CODEC_AT]);
-        if version != FORMAT_VERSION || codec != CODEC_XTS {
+        if version != FORMAT_VERSION || Codec::from_id(codec).is_none() {
             return Err(HeaderError::Unsupported { version, codec });
         }
         Ok(Header { bytes })
@@ -133,6 +139,11 @@ impl Header {
 
     pub fn as_bytes(&self) -> &[u8; HEADER_USED] {
         &self.bytes
+    }
+
+    /// The codec of the file's data units (checked by [`Header::parse`]).
+    pub fn codec(&self) -> Codec {
+        Codec::from_id(self.bytes[CODEC_AT]).expect("parse and seal only accept known codecs")
     }
 
     pub fn file_id(&self) -> FileId {
@@ -200,7 +211,13 @@ mod tests {
     }
 
     fn sealed() -> Header {
-        Header::seal(&kek(1), &[0xAB; 16], &dek(), &[3; NONCE_LEN])
+        Header::seal(
+            &kek(1),
+            Codec::NEW_FILES,
+            &[0xAB; 16],
+            &dek(),
+            &[3; NONCE_LEN],
+        )
     }
 
     #[test]
@@ -208,7 +225,8 @@ mod tests {
         let header = sealed();
         let b = header.as_bytes();
         assert_eq!(&b[..8], b"DIPGENC1");
-        assert_eq!((b[8], b[9]), (1, 2));
+        assert_eq!((b[8], b[9]), (1, 3));
+        assert_eq!(header.codec(), Codec::XtsTail);
         assert_eq!(&b[10..16], &[0; 6]);
         assert_eq!(&b[16..32], &[0xAB; 16]);
         assert_eq!(&b[32..48], kek(1).kcv());
@@ -245,24 +263,47 @@ mod tests {
             Header::parse(&bytes[..HEADER_USED - 1]).unwrap_err(),
             HeaderError::NotEncrypted
         );
-        let mut aead = bytes;
-        aead[9] = 1;
-        assert_eq!(
-            Header::parse(&aead).unwrap_err(),
-            HeaderError::Unsupported {
-                version: 1,
-                codec: 1
-            }
-        );
+        for codec in [0, 1, 4, 0xFF] {
+            // 1 is the AEAD prototype; 4 and up are not defined yet.
+            let mut other = bytes;
+            other[9] = codec;
+            assert_eq!(
+                Header::parse(&other).unwrap_err(),
+                HeaderError::Unsupported { version: 1, codec }
+            );
+        }
         let mut v2 = bytes;
         v2[8] = 2;
         assert_eq!(
             Header::parse(&v2).unwrap_err(),
             HeaderError::Unsupported {
                 version: 2,
-                codec: 2
+                codec: 3
             }
         );
+    }
+
+    #[test]
+    fn both_xts_codecs_parse_and_keep_their_id() {
+        for codec in [Codec::XtsStealing, Codec::XtsTail] {
+            let header = Header::seal(&kek(1), codec, &[0xAB; 16], &dek(), &[3; NONCE_LEN]);
+            assert_eq!(header.as_bytes()[9], codec.id());
+            let parsed = Header::parse(header.as_bytes()).unwrap();
+            assert_eq!(parsed.codec(), codec);
+            // Rotation keeps the codec.
+            let rotated = parsed.rewrap(&kek(1), &kek(2), &[4; NONCE_LEN]).unwrap();
+            assert_eq!(rotated.codec(), codec);
+        }
+    }
+
+    #[test]
+    fn the_codec_byte_is_authenticated() {
+        // Swapping codec 3 for 2 (or back) would decode the tail differently;
+        // the codec is in the AAD, so the wrap no longer opens.
+        let mut bytes = *sealed().as_bytes();
+        bytes[9] = Codec::XtsStealing.id();
+        let header = Header::parse(&bytes).unwrap();
+        assert_eq!(header.open(&kek(1)).unwrap_err(), HeaderError::Tampered);
     }
 
     #[test]
