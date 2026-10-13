@@ -577,6 +577,7 @@ pub(crate) mod tests {
         // the block that holds the durable end.
         let data = resize_data();
         let mut bounded = 0;
+        let mut lossy = 0;
         for &old in &RESIZE_LENGTHS {
             for &new in &RESIZE_LENGTHS {
                 if new == old {
@@ -593,6 +594,7 @@ pub(crate) mod tests {
                     assert!(damaged.is_empty(), "{case}: lost {damaged:?}");
                 } else {
                     bounded += 1;
+                    lossy += usize::from(!damaged.is_empty());
                     let floor = durable / 16 * 16;
                     assert!(damaged.len() <= 15, "{case}: lost {damaged:?}");
                     assert!(
@@ -606,6 +608,7 @@ pub(crate) mod tests {
             bounded > 0,
             "the completing and splitting cases are covered"
         );
+        assert!(lossy > 0, "the bound is not vacuous: some case loses bytes");
     }
 
     #[test]
@@ -645,9 +648,7 @@ pub(crate) mod tests {
             crash_resize(Codec::XtsStealing, &data, 4096, 4001),
             (3984..=4000).collect::<Vec<_>>()
         );
-        assert!(crash_resize(Codec::XtsTail, &data, 4096, 4001)
-            .iter()
-            .all(|&i| i == 4000));
+        assert_eq!(crash_resize(Codec::XtsTail, &data, 4096, 4001), vec![4000]);
         // Appending 1 byte to a 4000-byte file: codec 2 garbles 3984..3999,
         // codec 3 loses nothing.
         assert_eq!(
@@ -664,7 +665,7 @@ pub(crate) mod tests {
     #[test]
     fn codec_3_round_trips_at_block_and_unit_edges() {
         for len in [0usize, 1, 15, 16, 17, 31, 4095, 4096, 4097] {
-            let (c, m) = (cipher(), with_header());
+            let (c, m) = (cipher_with(Codec::XtsTail), with_header());
             let file = EncryptedFile {
                 cipher: &c,
                 storage: &m,
@@ -682,7 +683,7 @@ pub(crate) mod tests {
             // Growing the file by small appends never changes the ciphertext
             // already on disk, except for the durable bytes of a partial block
             // that the append completes.
-            let (c2, m2) = (cipher(), with_header());
+            let (c2, m2) = (cipher_with(Codec::XtsTail), with_header());
             let grown = EncryptedFile {
                 cipher: &c2,
                 storage: &m2,

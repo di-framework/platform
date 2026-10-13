@@ -61,11 +61,16 @@ type R<T> = Result<T, ErrorCode>;
 
 /// Lets a deploy check that a composed provider really contains this layer;
 /// the section survives `wac plug`, which nests the component unchanged.
-/// `write-codec=3`: this build creates codec-3 files (#206), which builds
-/// without it cannot read.
+/// `write-codec=N`: the codec this build creates new files with. 3 (#206) can
+/// only be read by builds that know codec 3. Advisory: nothing parses the value
+/// yet.
 #[used]
 #[link_section = "di-framework:pglite-encfs"]
-static BUILD_MARKER: [u8; 40] = *b"format=1 codec=aes-256-xts write-codec=3";
+static BUILD_MARKER: [u8; 40] = if cfg!(feature = "write-codec-3") {
+    *b"format=1 codec=aes-256-xts write-codec=3"
+} else {
+    *b"format=1 codec=aes-256-xts write-codec=2"
+};
 
 /// Write buffers that stream writers may hand over at once.
 const STREAM_WRITE_BUDGET: u64 = 1 << 20;

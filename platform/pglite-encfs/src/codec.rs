@@ -60,8 +60,13 @@ pub enum Codec {
 }
 
 impl Codec {
-    /// The codec new files are created with.
-    pub const NEW_FILES: Codec = Codec::XtsTail;
+    /// The codec new files are created with: codec 2 unless the build has the
+    /// `write-codec-3` feature (every build reads both).
+    pub const NEW_FILES: Codec = if cfg!(feature = "write-codec-3") {
+        Codec::XtsTail
+    } else {
+        Codec::XtsStealing
+    };
 
     /// The header's codec byte.
     pub fn id(self) -> u8 {
@@ -215,8 +220,13 @@ mod tests {
     }
 
     #[test]
-    fn codec_ids_round_trip_and_new_files_use_codec_3() {
-        assert_eq!(Codec::NEW_FILES, Codec::XtsTail);
+    fn codec_ids_round_trip_and_new_files_follow_the_feature() {
+        let expected = if cfg!(feature = "write-codec-3") {
+            Codec::XtsTail
+        } else {
+            Codec::XtsStealing
+        };
+        assert_eq!(Codec::NEW_FILES, expected);
         assert_eq!(Codec::XtsStealing.id(), 2);
         assert_eq!(Codec::XtsTail.id(), 3);
         for codec in CODECS {
@@ -225,7 +235,7 @@ mod tests {
         for id in [0, 1, 4, 0xFF] {
             assert_eq!(Codec::from_id(id), None, "codec {id}");
         }
-        assert_eq!(cipher(1).codec(), Codec::XtsTail);
+        assert_eq!(cipher(1).codec(), expected);
     }
 
     #[test]
@@ -246,7 +256,7 @@ mod tests {
     #[test]
     fn codec_3_round_trips_at_the_block_and_unit_edges() {
         // Lengths 0 and 4097 span no unit or two units; `file` covers them.
-        let c = cipher(2);
+        let c = cipher_with(Codec::XtsTail, 2);
         for unit in [0, 1, 78_187_493_520] {
             for len in [1, 15, 16, 17, 31, 4095, 4096] {
                 let plain = pattern(len, 9);
@@ -263,7 +273,7 @@ mod tests {
         // The fix for #206: every prefix of a unit encrypts to a prefix of the
         // unit's ciphertext, except that a partial block turns into an XTS
         // block once it is complete.
-        let c = cipher(3);
+        let c = cipher_with(Codec::XtsTail, 3);
         let plain = pattern(4096, 7);
         let whole = encrypted(&c, 6, &plain);
         let edges = (1..=4096).filter(|len| *len <= 100 || *len >= 3990 || len % 61 == 0);
@@ -304,7 +314,7 @@ mod tests {
             assert_eq!(&input[8..12], &(block as u32).to_le_bytes());
         }
         // Different blocks and units get different keystreams.
-        let c = cipher(4);
+        let c = cipher_with(Codec::XtsTail, 4);
         let ks = |unit, len| encrypted(&c, unit, &vec![0; len]);
         assert_ne!(ks(0, 1), ks(1, 1));
         assert_ne!(ks(0, 17)[16..], ks(0, 1)[..]);

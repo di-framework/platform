@@ -225,8 +225,8 @@ mod tests {
         let header = sealed();
         let b = header.as_bytes();
         assert_eq!(&b[..8], b"DIPGENC1");
-        assert_eq!((b[8], b[9]), (1, 3));
-        assert_eq!(header.codec(), Codec::XtsTail);
+        assert_eq!((b[8], b[9]), (1, Codec::NEW_FILES.id()));
+        assert_eq!(header.codec(), Codec::NEW_FILES);
         assert_eq!(&b[10..16], &[0; 6]);
         assert_eq!(&b[16..32], &[0xAB; 16]);
         assert_eq!(&b[32..48], kek(1).kcv());
@@ -278,7 +278,7 @@ mod tests {
             Header::parse(&v2).unwrap_err(),
             HeaderError::Unsupported {
                 version: 2,
-                codec: 3
+                codec: Codec::NEW_FILES.id()
             }
         );
     }
@@ -301,7 +301,11 @@ mod tests {
         // Swapping codec 3 for 2 (or back) would decode the tail differently;
         // the codec is in the AAD, so the wrap no longer opens.
         let mut bytes = *sealed().as_bytes();
-        bytes[9] = Codec::XtsStealing.id();
+        bytes[9] = if Codec::NEW_FILES == Codec::XtsTail {
+            Codec::XtsStealing.id()
+        } else {
+            Codec::XtsTail.id()
+        };
         let header = Header::parse(&bytes).unwrap();
         assert_eq!(header.open(&kek(1)).unwrap_err(), HeaderError::Tampered);
     }
