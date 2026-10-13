@@ -214,6 +214,12 @@ export function createPlatform(args: PlatformArgs) {
 
   const tenantNamespaces = seedTenantNamespaces(declared.tenants, scope, provider);
 
+  const initialDeps: pulumi.Resource[] = [
+    namespaceResource,
+    ...(registryService ? [registryService] : []),
+    ...tenantNamespaces,
+  ];
+
   const wasmcloud = new k8s.helm.v3.Release(
     'wasmcloud',
     {
@@ -256,17 +262,13 @@ export function createPlatform(args: PlatformArgs) {
     },
     {
       provider,
-      dependsOn: [
-        namespaceResource,
-        ...(registryService ? [registryService] : []),
-        ...tenantNamespaces,
-      ],
+      dependsOn: initialDeps,
     },
   );
 
   const runtimeShutdown = args.beforeTenancy?.(wasmcloud) ?? wasmcloud;
 
-  // The default host group's backend. The published port belongs to the gateway below.
+  // Gateway and network resources
   const httpBackend = new k8s.core.v1.Service(
     'http-entrypoint',
     {
@@ -320,6 +322,10 @@ export function createPlatform(args: PlatformArgs) {
     { provider, dependsOn: [gateway, httpBackend] },
   );
 
+  // Install tenancy: creates the controller, CRDs, and Tenant CustomResources (#227).
+  // When tenants are removed from the config, the Tenant CustomResources are deleted.
+  // The Helm release should be updated only after tenants are fully deleted and drained
+  // (hosts removed), so the operator can still watch their namespaces during cleanup.
   const tenancy = installTenancy({
     installation: scope,
     namespace: namespaceName,
