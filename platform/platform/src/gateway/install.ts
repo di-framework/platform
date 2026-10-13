@@ -10,6 +10,7 @@ import {
   type TenantAuthRoutes,
 } from '../tenancy/resources';
 import type { GatewayConfig } from './gateway';
+import { parseRoute, reservedRouteHosts } from './gateway';
 
 export { GATEWAY_NAME, GATEWAY_POD_LABELS };
 export const GATEWAY_PORT = 8080;
@@ -27,6 +28,69 @@ export function validateRouteUrlPattern(pattern: string | undefined): string | u
       `routeUrlPattern must look like http://{host}.{tenant}.localhost:<port>; received ${pattern}`,
     );
   return pattern;
+}
+
+/** What `validateRouteAliases` checks aliases against. */
+export interface RouteAliasRules {
+  /** Configured console, controller and registry route hosts; both alias sides must avoid them. */
+  tenantAuthRoutes?: TenantAuthRoutes;
+  /** Declared tenant names; when given, every alias target must name one of them. */
+  tenants?: readonly string[];
+}
+
+const ALIAS_SHAPE = 'an object mapping "<route-host>.<tenant>" to "<route-host>.<tenant>"';
+
+/**
+ * Validate admin route aliases (#217) and return them normalized: sources and targets lower-cased
+ * and sources sorted, so the deployed `GATEWAY_CONFIG` and its config hash depend on neither the
+ * spelling nor the order of the configured keys. Unset is `{}`. Throws when the value is not
+ * such an object, a side is not `<route-host>.<tenant>` with DNS-1123 labels, a side uses a
+ * reserved route host (`console`, `controller`, `registry` and the configured tenant-auth hosts),
+ * a target names an undeclared tenant, two sources differ only in case, or a target is another
+ * alias's source (a chain; every cycle is also a chain). A self-alias is a no-op and allowed.
+ */
+export function validateRouteAliases(
+  aliases: unknown,
+  rules: RouteAliasRules = {},
+): Record<string, string> {
+  if (aliases === undefined || aliases === null) return {};
+  if (typeof aliases !== 'object' || Array.isArray(aliases))
+    throw new Error(`routeAliases must be ${ALIAS_SHAPE}`);
+  const reserved = reservedRouteHosts(rules.tenantAuthRoutes);
+  const normalized = new Map<string, string>();
+  for (const [rawSource, rawTarget] of Object.entries(aliases)) {
+    if (typeof rawTarget !== 'string')
+      throw new Error(`routeAliases["${rawSource}"] must be a "<route-host>.<tenant>" string`);
+    const source = rawSource.toLowerCase();
+    const target = rawTarget.toLowerCase();
+    aliasSide('source', source, reserved);
+    const route = aliasSide('target', target, reserved);
+    if (rules.tenants && !rules.tenants.includes(route.tenant))
+      throw new Error(`Route alias target "${target}" names undeclared tenant ${route.tenant}`);
+    if (normalized.has(source))
+      throw new Error(`Duplicate route alias source "${source}" (sources are case-insensitive)`);
+    normalized.set(source, target);
+  }
+  for (const [source, target] of normalized)
+    if (target !== source && normalized.has(target))
+      throw new Error(`Chained route aliases are not allowed: ${source} -> ${target} -> ...`);
+  return Object.fromEntries([...normalized].sort(([a], [b]) => (a < b ? -1 : 1)));
+}
+
+/** One side of an alias, parsed; throws unless it is a valid, unreserved route. */
+function aliasSide(
+  side: 'source' | 'target',
+  value: string,
+  reserved: Set<string>,
+): { host: string; tenant: string } {
+  const route = parseRoute(value);
+  if (!route)
+    throw new Error(
+      `Invalid route alias ${side} "${value}": expected <route-host>.<tenant> with DNS-1123 labels`,
+    );
+  if (reserved.has(route.host))
+    throw new Error(`Route alias ${side} "${value}" uses the reserved route host ${route.host}`);
+  return route;
 }
 
 /** Route pattern for a loopback HTTP endpoint (the gateway's published port); otherwise none. */
@@ -52,24 +116,46 @@ export function gatewayScriptHash(scripts: Record<string, string>): string {
   return createHash('sha256').update(JSON.stringify(scripts)).digest('hex');
 }
 
+/**
+ * Hash of the routing config (tenant-auth routes and route aliases) for the pod template's
+ * `di-framework.dev/config-hash` annotation, so changing either rolls the gateway. Pass aliases
+ * already normalized by `validateRouteAliases`, so reordering keys does not change the hash.
+ */
+export function gatewayConfigHash(
+  tenantAuthRoutes?: TenantAuthRoutes,
+  routeAliases?: Record<string, string>,
+): string {
+  const configData = {
+    tenantAuthRoutes: tenantAuthRoutes ?? {},
+    routeAliases: routeAliases ?? {},
+  };
+  return createHash('sha256').update(JSON.stringify(configData)).digest('hex');
+}
+
 /** Gateway Deployment spec. It needs no Kubernetes API access, so it mounts no token. */
 export function gatewayDeploymentSpec(
   namespace: string,
   scriptHash: string,
   tenantAuthRoutes: TenantAuthRoutes = {},
+  routeAliases?: Record<string, string>,
 ) {
   const config: GatewayConfig = {
     port: GATEWAY_PORT,
     defaultUpstream: `wasmcloud-http.${namespace}.svc.cluster.local`,
     ...(Object.keys(tenantAuthRoutes).length ? { tenantAuthRoutes } : {}),
+    ...(routeAliases && Object.keys(routeAliases).length ? { routeAliases } : {}),
   };
+  const configHash = gatewayConfigHash(tenantAuthRoutes, routeAliases);
   return {
     replicas: 1,
     selector: { matchLabels: GATEWAY_POD_LABELS },
     template: {
       metadata: {
         labels: GATEWAY_POD_LABELS,
-        annotations: { 'di-framework.dev/script-hash': scriptHash },
+        annotations: {
+          'di-framework.dev/script-hash': scriptHash,
+          'di-framework.dev/config-hash': configHash,
+        },
       },
       spec: {
         automountServiceAccountToken: false,

@@ -7,6 +7,7 @@ import {
   gatewayScriptHash,
   gatewayServiceSpec,
   loadGatewayScript,
+  validateRouteAliases,
   validateRouteUrlPattern,
 } from './gateway/install';
 import {
@@ -62,6 +63,12 @@ export interface PlatformArgs {
    * `insecureRegistries`.
    */
   insecureRegistries?: string[];
+  /**
+   * Admin gateway route aliases (#217): public `<route-host>.<tenant>` to target
+   * `<route-host>.<tenant>`, for plain HTTP tenant routes only. Validated and normalized before
+   * deploy; an invalid map fails `createPlatform`. Defaults to top-level config `routeAliases`.
+   */
+  routeAliases?: Record<string, string>;
   values?: Record<string, unknown>;
   /** `http://{host}.{tenant}.localhost:<port>` for the published gateway port, if any. */
   routeUrlPattern?: string;
@@ -90,6 +97,16 @@ export interface PlatformArgs {
 export const DEFAULT_HOST_IMAGE =
   'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad';
 
+/**
+ * Config `routeAliases`, a top-level object. A `gateway` key (nested `gateway.routeAliases`, or the
+ * literal dotted key) is refused rather than silently ignored.
+ */
+function configRouteAliases(config: pulumi.Config): unknown {
+  if (config.get('gateway') !== undefined || config.get('gateway.routeAliases') !== undefined)
+    throw new Error('Set route aliases with the top-level config key routeAliases, not gateway');
+  return config.getObject<unknown>('routeAliases');
+}
+
 /** Shared platform resources; the caller owns cluster creation and Pulumi state. */
 export function createPlatform(args: PlatformArgs) {
   const provider = args.provider;
@@ -112,6 +129,14 @@ export function createPlatform(args: PlatformArgs) {
   });
   const tenantHostImage = config.get('tenantHostImage') ?? DEFAULT_HOST_IMAGE;
   assertHostImageSupportsAllowlist(tenantHostImage, insecureRegistries);
+  const tenantAuth = config.getObject<TenantAuthConfig>('tenantAuth');
+  // Gateway routes for each tenant's console and controller hosts (#58).
+  const { routes: tenantAuthRouteHosts } = tenantAuthRoutes(tenantAuth, routeUrlPattern);
+  // Gateway route aliases (#217): validated and normalized once, before any resource.
+  const routeAliases = validateRouteAliases(args.routeAliases ?? configRouteAliases(config), {
+    tenantAuthRoutes: tenantAuthRouteHosts,
+    tenants: declared.tenants.map((tenant) => tenant.name),
+  });
   const namespaceResource = new k8s.core.v1.Namespace(
     'wasmcloud',
     {
@@ -256,9 +281,6 @@ export function createPlatform(args: PlatformArgs) {
     { provider, dependsOn: [runtimeShutdown] },
   );
 
-  const tenantAuth = config.getObject<TenantAuthConfig>('tenantAuth');
-  // Gateway routes for each tenant's console and controller hosts (#58).
-  const { routes: tenantAuthRouteHosts } = tenantAuthRoutes(tenantAuth, routeUrlPattern);
   const gatewayScript = loadGatewayScript();
   const gatewayScripts = new k8s.core.v1.ConfigMap(
     'http-gateway',
@@ -281,6 +303,7 @@ export function createPlatform(args: PlatformArgs) {
         namespaceName,
         gatewayScriptHash(gatewayScript),
         tenantAuthRouteHosts,
+        routeAliases,
       ),
     },
     { provider, dependsOn: [gatewayScripts, gatewayPolicy, httpBackend] },

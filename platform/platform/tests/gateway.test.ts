@@ -26,7 +26,9 @@ import {
   endToEndHeaders,
   type GatewayOptions,
   main,
+  parseRoute,
   registryUpstream,
+  resolveAlias,
   routeRequest,
   serverName,
   tenantUpstream,
@@ -122,6 +124,64 @@ describe('routeRequest', () => {
     ])
       expect(routeRequest(host).kind).toBe('invalid');
     expect(routeRequest(undefined)).toEqual({ kind: 'invalid', reason: 'missing Host header' });
+  });
+});
+
+describe('route aliases (#217)', () => {
+  it.each([
+    ['site.alpha', { host: 'site', tenant: 'alpha' }],
+    ['api.v1.beta', { host: 'api.v1', tenant: 'beta' }],
+    ['SITE.ALPHA', { host: 'site', tenant: 'alpha' }],
+    ['no-tenant', undefined],
+    ['.alpha', undefined],
+    ['site..alpha', undefined],
+    ['site.invalid_tenant', undefined],
+    ['site.1invalid', undefined],
+    [`site.${'a'.repeat(41)}`, undefined],
+    [`${'a'.repeat(64)}.alpha`, undefined],
+    // Strict DNS-1123, unlike Host routing, which tolerates `_` (S6).
+    ['my_site.alpha', undefined],
+    ['-site.alpha', undefined],
+    [42, undefined],
+    [null, undefined],
+  ] as [unknown, ReturnType<typeof parseRoute>][])('parseRoute(%p)', (id, expected) => {
+    expect(parseRoute(id)).toEqual(expected);
+  });
+
+  const route = { host: 'identity', tenant: 'identity' };
+  const moved = { host: 'identity', tenant: 'identity-pg' };
+  it.each([
+    ['no aliases', undefined, route],
+    ['no matching alias', { 'other.beta': 'site.gamma' }, route],
+    ['a matching alias', { 'identity.identity': 'identity.identity-pg' }, moved],
+    ['an upper-case target', { 'identity.identity': 'Identity.IDENTITY-pg' }, moved],
+    [
+      'an inherited key only',
+      Object.create({ 'identity.identity': 'identity.identity-pg' }),
+      route,
+    ],
+    // Fail closed: an unusable alias never falls back to the original tenant (S3).
+    ['a map that is a string', 'identity.identity-pg', undefined],
+    ['a map that is an array', ['identity.identity-pg'], undefined],
+    ['a numeric target', { 'identity.identity': 1 }, undefined],
+    ['a nested target', { 'identity.identity': { identity: 'identity-pg' } }, undefined],
+    ['an invalid target', { 'identity.identity': 'identity.1pg' }, undefined],
+    ['a fixed reserved target', { 'identity.identity': 'registry.identity-pg' }, undefined],
+    ['a configured reserved target', { 'identity.identity': 'auth.identity-pg' }, undefined],
+  ] as [string, unknown, ReturnType<typeof resolveAlias>][])(
+    'resolveAlias with %s',
+    (_, aliases, expected) => {
+      expect(resolveAlias(route, aliases, { console: 'auth' })).toEqual(expected);
+    },
+  );
+
+  it('leaves Host routing itself unchanged', () => {
+    expect(routeRequest('identity.identity.localhost:28180')).toEqual({ kind: 'tenant', ...route });
+    expect(routeRequest('my_site.alpha.localhost')).toEqual({
+      kind: 'tenant',
+      host: 'my_site',
+      tenant: 'alpha',
+    });
   });
 });
 
@@ -519,6 +579,65 @@ describe('gateway proxy', () => {
     });
     expect(await ended).toContain('welcome;');
   });
+
+  describe('with route aliases (#217)', () => {
+    let aliased: Server | undefined;
+    const aliasGateway = async (routeAliases: unknown) => {
+      aliased = createGateway({
+        defaultUpstream: { hostname: '127.0.0.1', port: upstreamPort },
+        tenantUpstream: (tenant) => {
+          tenants.push(tenant);
+          return { hostname: '127.0.0.1', port: upstreamPort };
+        },
+        routeAliases: routeAliases as Record<string, string>,
+      });
+      return listen(aliased);
+    };
+    const aliases = { 'identity.identity': 'identity.identity-pg', 'api.api': 'api.api-v2' };
+
+    afterEach(async () => {
+      aliased?.closeAllConnections();
+      await new Promise((resolve) => aliased?.close(resolve));
+    });
+
+    it.each([
+      ['identity.identity.localhost', 'hello identity', ['identity-pg']],
+      ['api.api.localhost:28180', 'hello api', ['api-v2']],
+      ['Identity.Identity.LOCALHOST', 'hello identity', ['identity-pg']],
+      ['site.alpha.localhost', 'hello site', ['alpha']],
+      ['example.com', 'hello example.com', []],
+    ])('routes Host %s', async (host, body, expected) => {
+      const res = await send(await aliasGateway(aliases), { headers: { host } });
+      expect([res.status, res.body]).toEqual([201, body]);
+      expect(tenants).toEqual(expected);
+      // The target tenant sees the original Host as X-Forwarded-Host, so `iss` stays put.
+      expect(seen[0]?.headers['x-forwarded-host']).toBe(host);
+    });
+
+    it('restores the original route once the alias is removed', async () => {
+      const host = 'identity.identity.localhost';
+      await send(await aliasGateway(aliases), { headers: { host } });
+      aliased?.close();
+      await send(await aliasGateway({ 'api.api': 'api.api-v2' }), { headers: { host } });
+      expect(tenants).toEqual(['identity-pg', 'identity']);
+    });
+
+    it.each([
+      ['a numeric target', { 'identity.identity': 1 }],
+      ['a reserved target', { 'identity.identity': 'controller.identity-pg' }],
+      ['a malformed map', 'identity.identity-pg'],
+    ])('fails closed with 502 on %s, for requests and upgrades', async (_, broken) => {
+      const target = await aliasGateway(broken);
+      const res = await send(target, { headers: { host: 'identity.identity.localhost' } });
+      expect([res.status, res.body]).toEqual([502, 'Bad Gateway: route alias is unusable\n']);
+      const upgrade = await raw(
+        target,
+        'GET / HTTP/1.1\r\nHost: identity.identity.localhost\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n',
+      );
+      expect(upgrade).toStartWith('HTTP/1.1 502 Bad Gateway');
+      expect(tenants).toEqual([]);
+    });
+  });
 });
 
 describe('gateway process', () => {
@@ -575,6 +694,12 @@ describe('tenant-auth routes (#58:routes)', () => {
       defaultUpstream: { hostname: '127.0.0.1', port: upstreamPort },
       tenantUpstream: () => ({ hostname: '127.0.0.1', port: upstreamPort }),
       tenantAuthRoutes: { console: 'console', controller: 'controller' },
+      // Invalid at install, but the gateway must stay safe if they ever reach it (#217).
+      routeAliases: {
+        'controller.alpha': 'controller.beta',
+        'tls.alpha': 'controller.alpha',
+        'portal.alpha': 'console.alpha',
+      },
       consoleUpstream: (tenant) => {
         expect(tenant).toBe('alpha');
         return { hostname: '127.0.0.1', port: upstreamPort };
@@ -644,6 +769,17 @@ describe('tenant-auth routes (#58:routes)', () => {
 
   it('passes TLS for the controller host through to the controller certificate', async () => {
     expect(await tlsThrough('controller.alpha.localhost')).toBe('controller says hi');
+  });
+
+  it('never applies route aliases to TLS passthrough or to reserved hosts (#217)', async () => {
+    // The controller's own SNI still reaches tenant alpha's controller, not beta's.
+    expect(await tlsThrough('controller.alpha.localhost')).toBe('controller says hi');
+    // An aliased source never becomes a passthrough route.
+    expect(await tlsThrough('tls.alpha.localhost')).toBe('closed');
+    // Over HTTP a reserved alias target fails closed instead of reaching the controller or console.
+    for (const host of ['tls.alpha.localhost', 'portal.alpha.localhost'])
+      expect((await send(port, { headers: { host } })).status).toBe(502);
+    expect(seen).toEqual([]);
   });
 
   it('closes TLS for any other server name, or none', async () => {
@@ -1002,6 +1138,8 @@ describe('tenant registry route (#83:reconcile)', () => {
     const options: GatewayOptions = {
       defaultUpstream: { hostname: '127.0.0.1', port: 1 },
       tenantAuthRoutes: { registry: 'registry' },
+      // Passthrough ignores aliases, so the registry SNI below still reaches tenant alpha (#217).
+      routeAliases: { 'registry.alpha': 'registry.beta' },
       registryUpstream: (tenant) => {
         expect(tenant).toBe('alpha');
         return { hostname: '127.0.0.1', port: frontPort };
