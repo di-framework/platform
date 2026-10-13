@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { backupVolume, restoreVolume } from './volume.ts';
+import { backupVolume, probePlacement, restoreVolume } from './volume.ts';
 
 export const TERMINATION_LIMIT = 4096;
 
@@ -14,6 +14,7 @@ export const BACKUP_KINDS = [
   'restore-nats',
   'workload-volume',
   'restore-workload-volume',
+  'probe-placement',
 ] as const;
 
 export type BackupKind = (typeof BACKUP_KINDS)[number];
@@ -31,6 +32,8 @@ export interface Termination {
   encfsKcv?: string;
   imageDigest?: string;
   replacedPath?: string;
+  /** A restore that stopped part-way: the staging directory it left, relative to the root. */
+  restoringPath?: string;
 }
 
 export interface AgentRequest {
@@ -60,6 +63,8 @@ export interface AgentRequest {
   force?: boolean;
   /** The KCV the restored marker must carry, when the operator names one. */
   expectedKcv?: string;
+  /** probe-placement: directories that must exist on this node, `:`-separated. */
+  probePaths?: string;
 }
 
 export interface TreeEntry {
@@ -69,7 +74,15 @@ export interface TreeEntry {
   size: number;
   mode: number;
   mtimeMs: number;
+  /** Userspace cannot set ctime: with ino it tells a rewritten file from an untouched one. */
+  ctimeMs: number;
+  ino: number;
+  uid: number;
+  gid: number;
 }
+
+/** One end of {@link AgentIo.pipe}: a command's stdout/stdin, or a file. */
+export type PipeEnd = { argv: string[]; env?: Record<string, string> } | { file: string };
 
 export interface ExecResult {
   code: number;
@@ -95,6 +108,19 @@ export interface AgentIo {
   /** Entry names directly in `path`. */
   list(path: string): Promise<string[]>;
   rename(from: string, to: string): Promise<void>;
+  /** Set the owner of one entry, never following a link. */
+  chown(path: string, uid: number, gid: number): Promise<void>;
+  isDirectory(path: string): Promise<boolean>;
+  /**
+   * Stream `from` into `to` (or nowhere), showing every chunk to `inspect` on the way. Nothing
+   * is buffered whole: a volume can be far larger than the Job's memory. A non-zero code, or
+   * `inspect` throwing, fails the pipe.
+   */
+  pipe(
+    from: PipeEnd,
+    to: PipeEnd | undefined,
+    inspect: (chunk: Uint8Array) => void,
+  ): Promise<{ code: number; stderr: string }>;
 }
 
 export function encodeTermination(value: Termination): string {
@@ -158,6 +184,7 @@ export function parseRequest(env: Record<string, string | undefined>): AgentRequ
     targetRoot: env.BACKUP_TARGET_ROOT,
     force: env.BACKUP_FORCE === 'true',
     expectedKcv: env.BACKUP_EXPECTED_KCV || undefined,
+    probePaths: env.BACKUP_PROBE_PATHS,
   };
 }
 
@@ -627,6 +654,8 @@ async function gcPvc(io: AgentIo, request: AgentRequest): Promise<number> {
   return finish(io, request.terminationLog, { ok: true, tool: 'rm', format: 'delete' });
 }
 
+const RCLONE_NOT_FOUND = 4;
+
 async function gc(io: AgentIo, request: AgentRequest): Promise<number> {
   if (request.destinationType === 'pvc') {
     return gcPvc(io, request);
@@ -641,7 +670,8 @@ async function gc(io: AgentIo, request: AgentRequest): Promise<number> {
     const result = await io.exec(['rclone', 'deletefile', `:s3:${request.bucket}/${key}`], {
       env: rcloneEnv(request),
     });
-    if (result.code !== 0)
+    // Exit 4 is rclone's "file not found": already deleted, or never written by a failed copy.
+    if (result.code !== 0 && result.code !== RCLONE_NOT_FOUND)
       return finish(io, request.terminationLog, { ok: false, error: 'GcFailed' });
   }
   return finish(io, request.terminationLog, { ok: true, tool: 'rclone', format: 'delete' });
@@ -682,5 +712,7 @@ export async function runAgent(request: AgentRequest, io: AgentIo): Promise<numb
       return backupVolume(io, request);
     case 'restore-workload-volume':
       return restoreVolume(io, request);
+    case 'probe-placement':
+      return probePlacement(io, request);
   }
 }

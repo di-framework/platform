@@ -15,7 +15,13 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { nodeIo } from '../src/io.ts';
-import { type AgentIo, type AgentRequest, type ExecResult, runAgent } from '../src/run.ts';
+import {
+  type AgentIo,
+  type AgentRequest,
+  type ExecResult,
+  type PipeEnd,
+  runAgent,
+} from '../src/run.ts';
 import {
   imageDigestOf,
   kcvOf,
@@ -95,27 +101,50 @@ function request(overrides: Partial<AgentRequest> = {}): AgentRequest {
 type Hook = (argv: string[]) => ExecResult | undefined;
 
 /**
- * Real files and real tar. `rclone` is a directory (`bucket`), `chown` succeeds without root,
- * and a hook can replace any command. COPYFILE_DISABLE keeps macOS tar from adding `._` files.
+ * Real files and real tar. `rclone` is a directory (`bucket`), ownership changes are recorded
+ * (the tests do not run as root), and a hook can replace any command, piped ones included.
+ * COPYFILE_DISABLE keeps macOS tar from adding `._` files.
  */
-function io(hook: Hook = () => undefined): AgentIo & { calls: string[][] } {
+function io(
+  hook: Hook = () => undefined,
+): AgentIo & { calls: string[][]; owners: [string, number, number][] } {
   const base = nodeIo();
   const calls: string[][] = [];
+  const owners: [string, number, number][] = [];
   const object = (remote: string) => join(bucket, remote.replace(/^:s3:[^/]+\//, ''));
   const run = (argv: string[]) => base.exec(argv, { env: { COPYFILE_DISABLE: '1' } });
+  /** `rclone cat` and `rclone rcat` read and write the bucket directory. */
+  const local = async (end: PipeEnd): Promise<PipeEnd> => {
+    if ('file' in end) return end;
+    const [tool, verb] = end.argv;
+    const target = object(end.argv.at(-1) ?? '');
+    if (tool === 'rclone' && verb === 'rcat') {
+      await mkdir(target.slice(0, target.lastIndexOf('/')), { recursive: true });
+      return { file: target };
+    }
+    if (tool === 'rclone' && verb === 'cat') return { file: target };
+    return { argv: end.argv, env: { ...end.env, COPYFILE_DISABLE: '1' } };
+  };
   return {
     ...base,
     calls,
+    owners,
+    async chown(path, uid, gid) {
+      owners.push([path, uid, gid]);
+    },
+    async pipe(from, to, inspect) {
+      for (const end of [from, to]) {
+        if (!end || 'file' in end) continue;
+        calls.push(end.argv);
+        const hooked = hook(end.argv);
+        if (hooked) return { code: hooked.code, stderr: hooked.stderr };
+      }
+      return base.pipe(await local(from), to && (await local(to)), inspect);
+    },
     async exec(argv) {
       calls.push(argv);
       const hooked = hook(argv);
       if (hooked) return hooked;
-      if (argv[0] === 'chown') return { code: 0, stdout: '', stderr: '' };
-      if (argv[0] === 'bash' && argv[3] === 'volume-backup') {
-        const target = object(argv[5] ?? '');
-        await mkdir(target.slice(0, target.lastIndexOf('/')), { recursive: true });
-        return run(['tar', '--numeric-owner', '-C', argv[4] ?? '', '-cf', target, '.']);
-      }
       if (argv[0] === 'bash' && argv[3] === 'volume-restore') {
         return run([
           'tar',
@@ -251,10 +280,24 @@ describe('workload volume backup', () => {
     expect(
       await runAgent(request({ destinationType: 's3', bucket: 'b', pvcMountPath: undefined }), s3),
     ).toBe(0);
-    const pipe = s3.calls.find((argv) => argv[0] === 'bash');
-    expect(pipe?.[2]).toContain('set -o pipefail; tar --numeric-owner');
-    expect(pipe?.[2]).toContain('rclone rcat');
-    expect(pipe?.[5]).toBe(`:s3:b/${PREFIX}/data.tar`);
+    // One read of the volume: tar streams through the hashing reader into rclone.
+    expect(s3.calls.find((argv) => argv[0] === 'tar')).toEqual([
+      'tar',
+      '--numeric-owner',
+      '-C',
+      source,
+      '-cf',
+      '-',
+      '.',
+    ]);
+    expect(s3.calls.find((argv) => argv[1] === 'rcat')).toEqual([
+      'rclone',
+      'rcat',
+      '--s3-chunk-size',
+      '5Mi',
+      `:s3:b/${PREFIX}/data.tar`,
+    ]);
+    expect(s3.calls.some((argv) => argv[0] === 'bash')).toBe(false);
     const uploads = s3.calls.filter((argv) => argv[1] === 'copyto').map((argv) => argv[3]);
     expect(uploads).toEqual([`:s3:b/${PREFIX}/SHA256SUMS`, `:s3:b/${PREFIX}/manifest.json`]);
     expect((await manifestAt(bucket)).fileCount).toBe(4);
@@ -324,7 +367,7 @@ describe('workload volume backup', () => {
     await rm(join(source, 'pglite', 'late'));
 
     const s3Fails = io((argv) =>
-      argv[0] === 'bash' ? { code: 1, stdout: '', stderr: 'rclone' } : undefined,
+      argv[1] === 'rcat' ? { code: 1, stdout: '', stderr: 'rclone' } : undefined,
     );
     expect(await runAgent(request({ destinationType: 's3', bucket: 'b' }), s3Fails)).toBe(1);
     expect(s3Fails.calls.some((argv) => argv[1] === 'deletefile')).toBe(true);
@@ -359,12 +402,21 @@ describe('workload volume restore', () => {
     expect(await tree(join(workloads, 'identity'))).toEqual(original);
     expect(await termination()).toMatchObject({ ok: true, fileCount: 4, encfsKcv: KCV });
     expect((await termination()).replacedPath).toBeUndefined();
-    expect(restored.calls).toContainEqual([
-      'chown',
-      '-R',
-      '65532:65532',
-      join(workloads, 'identity'),
+    // The key directory goes to the host uid; every entry gets the owner the manifest recorded.
+    const manifest = await manifestAt(claim);
+    const target = join(workloads, 'identity');
+    expect(restored.owners).toEqual([
+      [target, 65532, 65532],
+      ...[...manifest.directories, ...manifest.files].map((entry): [string, number, number] => [
+        join(target, entry.path),
+        entry.uid as number,
+        entry.gid as number,
+      ]),
     ]);
+    expect(manifest.files.every((file) => file.uid === process.getuid?.())).toBe(true);
+    expect(manifest.foreignOwners).toBe(
+      process.getuid?.() === 65532 ? 0 : manifest.files.length + manifest.directories.length,
+    );
     expect(await readdir(workloads)).toEqual(['identity']);
 
     await rm(join(workloads, 'identity'), { recursive: true });
@@ -438,12 +490,18 @@ describe('workload volume restore', () => {
     );
     await write({ ...manifest, files });
     expect(await attempt()).toBe('HashMismatch');
+    // Caught before a byte is extracted: sizes, extra members, and missing ones.
     await write({ ...manifest, files: manifest.files.map((file) => ({ ...file, size: 1 })) });
-    expect(await attempt()).toBe('HashMismatch');
+    expect(await attempt()).toBe('ArchiveRejected');
     await write({ ...manifest, files: manifest.files.slice(1) });
-    expect(await attempt()).toBe('ContentMismatch');
+    expect(await attempt()).toBe('ArchiveRejected');
     await write({ ...manifest, directories: manifest.directories.slice(1) });
-    expect(await attempt()).toBe('ContentMismatch');
+    expect(await attempt()).toBe('ArchiveRejected');
+    await write({
+      ...manifest,
+      files: [...manifest.files, { ...manifest.files[0], path: 'extra' }],
+    });
+    expect(await attempt()).toBe('ArchiveRejected');
     await write(manifest, 'tampered\n');
     expect(await attempt()).toBe('ManifestInvalid');
     await write({ ...manifest, kind: 'Other' });
@@ -479,15 +537,58 @@ describe('workload volume restore', () => {
     expect((await termination()).error).toBe('DownloadFailed');
     expect(await readdir(workloads)).toEqual(['identity']);
     await reset();
-    expect(await runAgent(restore(), fails('chown'))).toBe(1);
-    expect((await termination()).error).toBe('OwnershipFailed');
+    const owners = io();
+    owners.chown = async () => {
+      throw new Error('EPERM');
+    };
+    expect(await runAgent(restore(), owners)).toBe(1);
+    expect(await termination()).toEqual({ ok: false, error: 'OwnershipFailed' });
     await reset();
+    // A move that fails part-way reports where the old data and the staging directory are.
+    const target = join(workloads, 'identity');
+    await mkdir(target);
+    await writeFile(join(target, '.di-encfs'), marker(KCV));
+    await writeFile(join(target, 'old'), 'old');
     const moves = io();
-    moves.rename = async () => {
+    let renames = 0;
+    moves.rename = async (from, to) => {
+      renames += 1;
+      if (renames === 3) throw new Error('EXDEV');
+      await nodeIo().rename(from, to);
+    };
+    expect(await runAgent(restore({ force: true }), moves)).toBe(1);
+    expect(await termination()).toEqual({
+      ok: false,
+      error: 'RestoreFailed',
+      replacedPath: 'identity.replaced-20261014T093000Z',
+      restoringPath: 'identity.restoring-20261014T093000Z',
+    });
+    expect(existsSync(join(workloads, 'identity.restoring-20261014T093000Z'))).toBe(true);
+    const ownersAfterForce = io();
+    ownersAfterForce.chown = async () => {
+      throw new Error('EPERM');
+    };
+    await rm(join(workloads, 'identity.restoring-20261014T093000Z'), { recursive: true });
+    await writeFile(join(target, 'newer'), 'newer');
+    expect(
+      await runAgent(restore({ force: true, stamp: '2026-10-15T00:00:00Z' }), ownersAfterForce),
+    ).toBe(1);
+    expect(await termination()).toEqual({
+      ok: false,
+      error: 'OwnershipFailed',
+      replacedPath: 'identity.replaced-20261015T000000Z',
+    });
+    await reset();
+    const noMoves = io();
+    noMoves.rename = async () => {
       throw new Error('EXDEV');
     };
-    expect(await runAgent(restore(), moves)).toBe(1);
-    expect((await termination()).error).toBe('RestoreFailed');
+    expect(await runAgent(restore(), noMoves)).toBe(1);
+    expect(await termination()).toEqual({
+      ok: false,
+      error: 'RestoreFailed',
+      restoringPath: 'identity.restoring-20261014T093000Z',
+    });
     await reset();
     const withLink = after(
       (argv) => argv[0] === 'tar' && argv[1] === '-x',
@@ -502,6 +603,52 @@ describe('workload volume restore', () => {
     };
     expect(await runAgent(restore(), unreadable)).toBe(1);
     expect((await termination()).error).toBe('ContentMismatch');
+    await reset();
+    // Only a missing target is empty: any other read error refuses before anything is touched.
+    const denied = io();
+    denied.list = async () => {
+      throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+    };
+    expect(await runAgent(restore({ force: true }), denied)).toBe(1);
+    expect((await termination()).error).toBe('TargetUnreadable');
+    expect(denied.calls).toEqual([]);
+  });
+
+  test('lists the archive before extracting and refuses links or unknown members', async () => {
+    await backupToClaim();
+    const manifest = await manifestAt(claim);
+    const archive = join(claim, PREFIX, 'data.tar');
+    // The same tree plus a symlink, archived by real tar.
+    const forged = join(root, 'forged');
+    await mkdir(forged);
+    await nodeIo().exec(['cp', '-R', `${source}/.`, forged]);
+    await symlink('/etc', join(forged, 'pglite', 'escape'));
+    const made = await nodeIo().exec(
+      ['tar', '--numeric-owner', '-C', forged, '-cf', archive, '.'],
+      {
+        env: { COPYFILE_DISABLE: '1' },
+      },
+    );
+    expect(made.code).toBe(0);
+    const extracted = io();
+    expect(await runAgent(restore(), extracted)).toBe(1);
+    expect((await termination()).error).toBe('ArchiveRejected');
+    // Nothing was extracted: no tar -x ran, no staging directory exists.
+    expect(extracted.calls.some((argv) => argv[0] === 'tar')).toBe(false);
+    expect(await readdir(workloads)).toEqual(['identity']);
+    // A file that is not an archive at all.
+    await writeFile(archive, Buffer.alloc(1024, 1));
+    expect(await runAgent(restore(), io())).toBe(1);
+    expect((await termination()).error).toBe('ArchiveRejected');
+    // Cut short: no end-of-archive block.
+    await writeFile(archive, Buffer.alloc(0));
+    expect(await runAgent(restore(), io())).toBe(1);
+    expect((await termination()).error).toBe('ArchiveRejected');
+    // Unreadable.
+    await rm(archive);
+    expect(await runAgent(restore(), io())).toBe(1);
+    expect((await termination()).error).toBe('DownloadFailed');
+    expect(manifest.fileCount).toBe(4);
   });
 
   test('restores from S3 and refuses missing configuration', async () => {

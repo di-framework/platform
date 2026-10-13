@@ -70,6 +70,13 @@ function harness(
       return [];
     },
     async rename() {},
+    async chown() {},
+    async isDirectory(path) {
+      return files.has(`${path}/.dir`);
+    },
+    async pipe() {
+      return { code: 0, stderr: '' };
+    },
   };
   return { io, files, calls };
 }
@@ -397,6 +404,10 @@ describe('backup-agent kinds', () => {
     const failed = harness(() => ({ code: 1, stdout: '', stderr: 'denied' }));
     expect(await runAgent(request({ kind: 'gc', gcKeys: 'a' }), failed.io)).toBe(1);
     expect(wrote(failed.files, '/work/termination')).toContain('GcFailed');
+    // rclone exit 4 (file not found): already gone, or never written by a failed copy.
+    const gone = harness(() => ({ code: 4, stdout: '', stderr: 'object not found' }));
+    expect(await runAgent(request({ kind: 'gc', gcKeys: 'a\nb' }), gone.io)).toBe(0);
+    expect(gone.calls).toHaveLength(2);
     const bucket = harness(() => ok());
     expect(await runAgent(request({ kind: 'gc', bucket: '' }), bucket.io)).toBe(1);
     expect(wrote(files, '/work/termination')).toContain('"format":"delete"');
