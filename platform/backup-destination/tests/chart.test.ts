@@ -43,6 +43,12 @@ async function helm(): Promise<string> {
   return binary;
 }
 
+const destinations = (out: string) =>
+  out
+    .split('\n---\n')
+    .filter((doc) => /^kind: BackupDestination$/m.test(doc))
+    .join('\n---\n');
+
 async function template(
   namespace: string,
   values: Record<string, string>,
@@ -101,9 +107,46 @@ describe('backup-destination chart', () => {
     expect(missing.stderr).toContain('bucket is required');
   }, 30000);
 
-  test('the CRD rejects prefixes that leave the destination', async () => {
-    const crd = await Bun.file(`${import.meta.dir}/../chart/crds/backups.yaml`).text();
-    expect(crd).toContain("self.split('/').exists(p, p == '..' || p == '.')");
+  test('every string field with a CEL rule declares maxLength (the API server cost budget)', async () => {
+    const text = await Bun.file(`${import.meta.dir}/../chart/crds/backups.yaml`).text();
+    const offenders: string[] = [];
+    const walk = (node: unknown, path: string) => {
+      if (!node || typeof node !== 'object') return;
+      const schema = node as Record<string, unknown>;
+      if (
+        schema.type === 'string' &&
+        Array.isArray(schema['x-kubernetes-validations']) &&
+        typeof schema.maxLength !== 'number'
+      )
+        offenders.push(path);
+      for (const [key, value] of Object.entries(schema)) walk(value, `${path}.${key}`);
+    };
+    for (const doc of text.split(/^---$/m)) walk(Bun.YAML.parse(doc), 'crd');
+    expect(offenders).toEqual([]);
+  });
+
+  test('prefix rejects only . and .. segments, so a leading slash stays valid', async () => {
+    const text = await Bun.file(`${import.meta.dir}/../chart/crds/backups.yaml`).text();
+    expect(text).toContain("!self.split('/').exists(p, p == '..' || p == '.')");
+    expect(text).not.toContain("!self.startsWith('/')");
+  });
+
+  test('schedule: S3 keeps its written default; PVC writes none unless set', async () => {
+    const s3 = await template('di-tenant-alpha', { bucket: 'b', existingSecret: 's' });
+    expect(destinations(s3.stdout)).toContain('schedule: "0 2 * * *"');
+    const pvc = await template('di-tenant-alpha', {
+      type: 'pvc',
+      'volumeClaimTemplate.size': '1Gi',
+    });
+    expect(destinations(pvc.stdout)).not.toContain('schedule:');
+    const both = await template('di-tenant-alpha', {
+      type: 'both',
+      bucket: 'b',
+      existingSecret: 's',
+      'volumeClaimTemplate.size': '1Gi',
+      schedule: '5 1 * * *',
+    });
+    expect(destinations(both.stdout).match(/schedule: "5 1 \* \* \*"/g)?.length).toBe(2);
   });
 
   test('renders a PVC destination, both destinations, and refuses an incomplete one', async () => {

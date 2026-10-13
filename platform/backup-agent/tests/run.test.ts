@@ -12,6 +12,7 @@ import {
   runAgent,
   safeKey,
   sha256Prefixed,
+  sweepPvc,
 } from '../src/run.ts';
 
 function request(overrides: Partial<AgentRequest> = {}): AgentRequest {
@@ -431,10 +432,11 @@ describe('backup-agent kinds', () => {
           : `rmdir ${stamp.slice(0, stamp.lastIndexOf(tail) + tail.length)}`,
       ),
     );
-    expect(gc.calls.some((call) => call.argv[0] === 'find')).toBe(true);
-    expect(gc.calls.some((call) => call.argv[0] === 'sh' && call.argv[4] === '/mnt/backup')).toBe(
-      true,
-    );
+    expect(
+      gc.calls.some(
+        (call) => call.argv[0] === 'sh' && call.argv[4] === '/mnt/backup/di-framework/alpha',
+      ),
+    ).toBe(true);
     expect(JSON.parse(wrote(gc.files, '/work/termination')).tool).toBe('rm');
   });
 
@@ -596,4 +598,64 @@ test('the process entrypoint writes a termination record via stub tools', async 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+describe('sweepPvc on a real tree', () => {
+  test('removes only stale leftovers inside <mount>/<prefix> at stamp depth', async () => {
+    const { mkdir, symlink, utimes, stat } = await import('node:fs/promises');
+    const mount = await mkdtemp(join(tmpdir(), 'sweep-'));
+    const old = new Date(Date.now() - 3 * 86400_000);
+    const put = async (path: string, aged: boolean) => {
+      const full = join(mount, path);
+      await mkdir(join(full, '..'), { recursive: true });
+      await writeFile(full, 'x');
+      if (aged) await utimes(full, old, old);
+    };
+    const exists = (path: string) =>
+      stat(join(mount, path)).then(
+        () => true,
+        () => false,
+      );
+    const stamp = 'bk/svc/uid';
+    await put(`${stamp}/old/data.dump`, true); // orphan: removed
+    await put(`${stamp}/old/data.dump.partial`, true); // stale partial: removed
+    await put(`${stamp}/new/data.dump.partial`, false); // fresh partial: kept
+    await put(`${stamp}/done/data.dump`, true); // complete: kept
+    await put(`${stamp}/done/manifest.json`, true);
+    await put(`${stamp}/fresh/data.dump`, false); // young orphan: kept
+    await put('bk/README', true); // wrong depth: kept
+    await put('bk/svc/uid/stray.partial', true); // depth 3: kept
+    await put('other/app/state/db.sqlite', true); // outside prefix: kept
+    await put('other/app/state/x.partial', true); // outside prefix: kept
+    await put('lost+found/a/b/c/#1234', true); // outside prefix: kept
+    await put('bk/lost+found/a/b/#9', true); // lost+found under prefix: kept
+    await put('elsewhere/a/b/c/data.dump', true); // reachable only through a symlink: kept
+    await symlink(join(mount, 'elsewhere'), join(mount, 'bk/link'));
+
+    const io = {
+      async exec(argv: string[]) {
+        const proc = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe' });
+        return { code: await proc.exited, stdout: '', stderr: '' };
+      },
+    } as AgentIo;
+    await sweepPvc(io, mount, ['bk']);
+
+    expect(await exists(`${stamp}/old/data.dump`)).toBe(false);
+    expect(await exists(`${stamp}/old/data.dump.partial`)).toBe(false);
+    for (const kept of [
+      `${stamp}/new/data.dump.partial`,
+      `${stamp}/done/data.dump`,
+      `${stamp}/done/manifest.json`,
+      `${stamp}/fresh/data.dump`,
+      'bk/README',
+      'bk/svc/uid/stray.partial',
+      'other/app/state/db.sqlite',
+      'other/app/state/x.partial',
+      'lost+found/a/b/c/#1234',
+      'bk/lost+found/a/b/#9',
+      'elsewhere/a/b/c/data.dump',
+    ])
+      expect(await exists(kept)).toBe(true);
+    await rm(mount, { recursive: true, force: true });
+  });
 });

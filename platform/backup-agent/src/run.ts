@@ -495,23 +495,38 @@ const STALE_MINUTES = '1440';
  * Pods killed mid-copy leave `*.partial` files and data files without a manifest. Neither has
  * an objectKey on a Backup, so retention cannot name them. Best effort: a failed sweep never
  * fails the gc.
+ *
+ * The sweep stays inside the destination's own tree: `<mount>/<prefix>`, files exactly at
+ * `<service>/<uid>/<stamp>/<file>` depth. It never follows symlinks and skips `lost+found`.
  */
-async function sweepPvc(io: AgentIo, mount: string): Promise<void> {
-  await io.exec([
-    'find',
-    mount,
-    '-type',
-    'f',
-    '-name',
-    '*.partial',
-    '-mmin',
-    `+${STALE_MINUTES}`,
-    '-delete',
-  ]);
-  const orphans =
-    'find "$1" -type f ! -name manifest.json ! -name "*.partial" -mmin +"$2" | ' +
-    'while IFS= read -r f; do [ -e "$(dirname "$f")/manifest.json" ] || rm -f "$f"; done';
-  await io.exec(['sh', '-c', orphans, 'sweep', mount, STALE_MINUTES]);
+const SWEEP_SCRIPT = `
+root="$1"; minutes="$2"
+[ -d "$root" ] && [ ! -L "$root" ] || exit 0
+find "$root" -mindepth 4 -maxdepth 4 -type f ! -path "$root/lost+found/*" -mmin +"$minutes" |
+while IFS= read -r f; do
+  case "$f" in
+    *.partial) rm -f "$f" ;;
+    */manifest.json) ;;
+    *) [ -e "$(dirname "$f")/manifest.json" ] || rm -f "$f" ;;
+  esac
+done
+`;
+
+export async function sweepPvc(
+  io: AgentIo,
+  mount: string,
+  prefixes: Iterable<string>,
+): Promise<void> {
+  for (const prefix of prefixes) {
+    const root = prefix ? `${mount}/${prefix}` : mount;
+    await io.exec(['sh', '-c', SWEEP_SCRIPT, 'sweep', root, STALE_MINUTES]);
+  }
+}
+
+/** A key is `<prefix>/<service>/<uid>/<stamp>/<file>`; the prefix is what remains after those 4. */
+function keyPrefix(key: string): string | undefined {
+  const parts = key.split('/');
+  return parts.length >= 4 ? parts.slice(0, -4).join('/') : undefined;
 }
 
 async function gcPvc(io: AgentIo, request: AgentRequest): Promise<number> {
@@ -525,7 +540,12 @@ async function gcPvc(io: AgentIo, request: AgentRequest): Promise<number> {
   if (!keys.every(safeKey)) {
     return finish(io, request.terminationLog, { ok: false, error: 'PvcPathInvalid' });
   }
-  await sweepPvc(io, request.pvcMountPath);
+  const prefixes = new Set<string>();
+  for (const key of keys) {
+    const prefix = keyPrefix(key);
+    if (prefix !== undefined) prefixes.add(prefix);
+  }
+  await sweepPvc(io, request.pvcMountPath, prefixes);
   const directories = new Set<string>();
   for (const key of keys) {
     try {

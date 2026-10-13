@@ -10,7 +10,7 @@ bucket: ""
 prefix: ""
 region: us-east-1
 endpoint: ""
-# UTC cron for BackingService dumps. Empty leaves the operator default, 0 2 * * *.
+# UTC cron for BackingService dumps.
 schedule: ""
 retentionSuccessful: 14
 existingSecret: ""

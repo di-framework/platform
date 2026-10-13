@@ -27,9 +27,6 @@
   {{- if .Values.prefix }}
   prefix: {{ .Values.prefix | quote }}
   {{- end }}
-  {{- if .Values.schedule }}
-  schedule: {{ .Values.schedule | quote }}
-  {{- end }}
   {{- if .Values.retentionSuccessful }}
   retention:
     successful: {{ .Values.retentionSuccessful }}
@@ -54,6 +51,7 @@ spec:
   {{- end }}
   credentialsSecretRef:
     name: {{ $secret | quote }}
+  schedule: {{ .Values.schedule | default "0 2 * * *" | quote }}
   {{- include "backup.common" . }}
 {{- end }}
 {{- if $pvc }}
@@ -75,6 +73,9 @@ spec:
     storageClassName: {{ .Values.volumeClaimTemplate.storageClassName | quote }}
     {{- end }}
     size: {{ .Values.volumeClaimTemplate.size | quote }}
+  {{- end }}
+  {{- if .Values.schedule }}
+  schedule: {{ .Values.schedule | quote }}
   {{- end }}
   {{- include "backup.common" . }}
 {{- end }}

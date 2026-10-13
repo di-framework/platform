@@ -39,15 +39,18 @@ spec:
                 bucket: { type: string, minLength: 1 }
                 prefix:
                   type: string
+                  # CEL cost is estimated from maxLength; without it the API server rejects the CRD.
+                  maxLength: 1024
                   x-kubernetes-validations:
-                    - rule: "!self.startsWith('/') && !self.split('/').exists(p, p == '..' || p == '.')"
-                      message: prefix must be relative and must not contain . or .. segments
+                    - rule: "!self.split('/').exists(p, p == '..' || p == '.')"
+                      message: prefix must not contain . or .. segments
                     - rule: '!oldSelf.hasValue() || oldSelf.value() == '''' || self == oldSelf.value()'
                       message: prefix is immutable once set
                       optionalOldSelf: true
                 region: { type: string }
                 endpoint:
                   type: string
+                  maxLength: 2048
                   x-kubernetes-validations:
                     - rule: 'self == '''' || self.startsWith(''https://'') || ((self.startsWith(''http://'') && (self.contains(''.svc.cluster.local'') || self.contains(''localhost''))))'
                       message: HTTP is only allowed for cluster-local endpoints

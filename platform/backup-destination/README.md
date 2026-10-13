@@ -26,7 +26,7 @@ Set `existingClaimName` to a claim that already exists in `di-runtime-<name>` (a
 
 **A PVC on the same node or VM as the data does not protect against losing that node.** With a node-local storage class such as `local-path`, the backups live on the same disk as the BackingService data. Use it for fast local restores, and add an S3 destination (`type: both`) for an off-host copy.
 
-A missing claim is detected early: the operator lists claims in `di-runtime-<name>` and sets the PVC destination to `ClaimMissing` without starting a Job, so a misspelled `existingClaimName` cannot hold up S3 backups. `prefix` must be relative and must not contain `.` or `..` segments; the CRD rejects it. Retention deletes single files and removes the emptied stamp, UID, and service directories. It also removes `*.partial` files and manifest-less data files older than a day, which a killed Job leaves behind.
+A missing claim is detected early: the operator lists claims in `di-runtime-<name>` and sets the PVC destination to `ClaimMissing` without starting a Job, so a misspelled `existingClaimName` cannot hold up S3 backups. `prefix` must not contain `.` or `..` segments (the CRD rejects it) and is at most 1024 characters. A leading `/` is still accepted and ignored. Retention deletes single files and removes the emptied stamp, UID, and service directories. It also removes `*.partial` files and manifest-less data files older than a day, which a killed Job leaves behind. That sweep stays inside `<mount>/<prefix>` at `<service>/<uid>/<stamp>/` depth, never follows symlinks, and skips `lost+found`. It runs only when retention has something to delete, so a claim that fills with leftovers before then is reclaimed on the next retention pass.
 
 ## Upgrading
 
