@@ -5,6 +5,7 @@ import {
   type BackupDestinationInstall,
   backupReleaseArgs,
   installBackupDestination,
+  SCHEDULE_MAX_LENGTH,
 } from '../src/install.ts';
 
 describe('backup helm release', () => {
@@ -86,8 +87,9 @@ describe('backup helm release', () => {
     expect(missing.schedule).toBeUndefined();
     const typed: BackupDestinationInstall = { tenant: 'alpha', chart: '/chart', schedule: 'none' };
     expect(backupReleaseArgs(typed).values).toEqual({ schedule: 'none' });
+    // Written trimmed, as the chart writes it (#254 S1).
     expect(backupReleaseArgs({ ...typed, schedule: ' */15 1-5 * * 1,3 ' }).values).toEqual({
-      schedule: ' */15 1-5 * * 1,3 ',
+      schedule: '*/15 1-5 * * 1,3',
     });
     for (const schedule of ['', '  ', 'nightly', '0 2 * *', '0 2 * * * *', 'manual']) {
       expect(() => backupReleaseArgs({ ...typed, schedule })).toThrow(
@@ -155,13 +157,56 @@ describe('backup helm release', () => {
     const output = pulumi.output(none);
     expect(sourcesOf({ ...base, sources: output })).toBe(output);
     const lazy = [{ workloadName: 'x', schedule: pulumi.output('0 1 * * *') }];
-    expect(sourcesOf({ ...base, sources: lazy as unknown as typeof none })).toBe(lazy);
+    const passed = sourcesOf({ ...base, sources: lazy as unknown as typeof none });
+    expect((passed as unknown[])[0]).toBe(lazy[0]);
     expect(() =>
       backupReleaseArgs({ ...base, sources: [null, 'x'] as unknown as typeof none }),
     ).not.toThrow();
     expect(() =>
       backupReleaseArgs({ ...base, sources: [{ schedule: 7 }] as unknown as typeof none }),
     ).toThrow('source ?: schedule is required');
+  });
+
+  test('writes schedules trimmed and within the CRD maxLength, like the chart (#254)', () => {
+    const base = { tenant: 'alpha', chart: '/chart', type: 'pvc' as const, schedule: ' none ' };
+    const values = (install: BackupDestinationInstall) =>
+      backupReleaseArgs(install).values as Record<string, unknown>;
+    const retention = { keepLast: 3 };
+    const padded = values({
+      ...base,
+      sources: [
+        { workloadName: 'identity', schedule: '  30 3 * * *\t', retention },
+        { workloadName: 'reports', schedule: ' none' },
+      ],
+    });
+    expect(padded).toEqual({
+      type: 'pvc',
+      schedule: 'none',
+      sources: [
+        { workloadName: 'identity', schedule: '30 3 * * *', retention },
+        { workloadName: 'reports', schedule: 'none' },
+      ],
+    });
+    // Fields one space apart, as the CRD pattern requires; the operator's parser alone is looser.
+    for (const schedule of ['0  2 * * *', '0\t2 * * *']) {
+      expect(() => values({ ...base, schedule })).toThrow('schedule must be a five-field UTC cron');
+      expect(() => values({ ...base, sources: [{ workloadName: 'x', schedule }] })).toThrow(
+        'source x: schedule must be a five-field UTC cron',
+      );
+    }
+    expect(SCHEDULE_MAX_LENGTH).toBe(128);
+    const longest = `10${',0'.repeat(59)} * * * *`;
+    const tooLong = `0${',0'.repeat(60)} * * * *`;
+    expect(values({ ...base, schedule: ` ${longest} ` }).schedule).toBe(longest);
+    expect(
+      values({ ...base, sources: [{ workloadName: 'x', schedule: `${longest} ` }] }).sources,
+    ).toEqual([{ workloadName: 'x', schedule: longest }]);
+    expect(() => values({ ...base, schedule: tooLong })).toThrow(
+      'schedule must be at most 128 characters',
+    );
+    expect(() => values({ ...base, sources: [{ workloadName: 'x', schedule: tooLong }] })).toThrow(
+      'source x: schedule must be at most 128 characters',
+    );
   });
 
   test('rejects a namespace that is not a tenant name', () => {
