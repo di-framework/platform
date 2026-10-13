@@ -225,6 +225,7 @@ export class Cluster {
             storage: '1Gi',
             createdAt: world.now,
             resourceVersion: this.nextVersion(),
+            objectUid: `uid-backup-${this.version}`,
             ...(source ? { source } : {}),
           },
         ],
@@ -293,6 +294,7 @@ export class Cluster {
             targetServiceName: spec.targetServiceName ?? '',
             name: meta.name,
             resourceVersion: this.nextVersion(),
+            objectUid: `uid-restore-${this.version}`,
           },
         ],
       };
@@ -306,8 +308,14 @@ export class Cluster {
       };
     } else if (action.type === 'create-job') {
       const meta = action.body.metadata as { name: string; labels: Record<string, string> };
-      if (world.jobs.some((job) => job.name === meta.name)) return;
       const label = (key: string) => meta.labels[`platform.di-framework.dev/${key}`];
+      const existing = world.jobs.find((job) => job.name === meta.name);
+      // A 409 is ours only when the existing Job carries the same owner uid (applyActions).
+      if (existing) {
+        const owner = label('backup-uid');
+        if (owner && existing.ownerUid !== owner) throw new ApplyError(409, action);
+        return;
+      }
       const kind = label('backup-kind') as JobView['backupKind'];
       const probe = kind === 'volume-probe' && this.autoProbe;
       this.world = {
@@ -323,6 +331,7 @@ export class Cluster {
             destinationName: label('destination'),
             started: this.jobsStart || probe,
             activePods: this.jobsStart && !probe ? 1 : 0,
+            ...(label('backup-uid') ? { ownerUid: label('backup-uid') } : {}),
             ...(probe ? { message: JSON.stringify({ ok: true }) } : {}),
           },
         ],

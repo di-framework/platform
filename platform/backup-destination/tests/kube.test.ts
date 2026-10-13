@@ -88,12 +88,28 @@ const routes = new Map<string, unknown>([
     '/apis/apps/v1/namespaces/di-runtime-alpha/deployments/hostgroup-tenant-alpha',
     { metadata: { labels: { 'platform.di-framework.dev/owner-uid': TENANT_UID } } },
   ],
+  // W6: a ledger in the tenant namespace (an earlier build's, or one a tenant user forged) is
+  // never read; only the runtime namespace's counts.
   [
     `/api/v1/namespaces/di-tenant-alpha/configmaps/${LEDGER}`,
     {
+      metadata: { resourceVersion: '7' },
+      data: {
+        'di-tenant-registry': JSON.stringify({ replicas: 7, heldBy: 'Backup/ghost', since: NOW }),
+      },
+    },
+  ],
+  [
+    `/api/v1/namespaces/di-runtime-alpha/configmaps/${LEDGER}`,
+    {
       metadata: { resourceVersion: '41' },
       data: {
-        identity: JSON.stringify({ replicas: 2, heldBy: 'Backup/v1', since: NOW }),
+        identity: JSON.stringify({
+          replicas: 2,
+          heldBy: 'Backup/v1',
+          since: NOW,
+          destination: 'pvc',
+        }),
         old: JSON.stringify({ replicas: 1, heldBy: 'Backup/x' }),
         junk: 'not json',
         partial: JSON.stringify({ replicas: 'two', heldBy: 'Backup/v1' }),
@@ -206,7 +222,10 @@ const routes = new Map<string, unknown>([
         {
           metadata: {
             name: 'probe',
-            labels: { 'platform.di-framework.dev/backup-kind': 'volume-probe' },
+            labels: {
+              'platform.di-framework.dev/backup-kind': 'volume-probe',
+              'platform.di-framework.dev/backup-uid': 'uid-restore-1',
+            },
           },
           status: {},
         },
@@ -265,7 +284,7 @@ describe('loading workload volume state', () => {
     expect(loaded.ledger).toEqual({
       resourceVersion: '41',
       entries: {
-        identity: { replicas: 2, heldBy: 'Backup/v1', since: NOW },
+        identity: { replicas: 2, heldBy: 'Backup/v1', since: NOW, destination: 'pvc' },
         old: { replicas: 1, heldBy: 'Backup/x', since: '' },
       },
     });
@@ -316,8 +335,43 @@ describe('loading workload volume state', () => {
         backupKind: 'volume-probe',
         started: true,
         activePods: 1,
+        ownerUid: 'uid-restore-1',
       }),
     ]);
+    expect(loaded.jobs[0]?.ownerUid).toBeUndefined();
+  });
+
+  test('W6: reads the ledger from the runtime namespace only; a tenant-namespace one is ignored', async () => {
+    const paths: string[] = [];
+    const spy = (base: KubeClient): KubeClient => ({
+      ...base,
+      async get(path) {
+        paths.push(path);
+        return base.get(path);
+      },
+    });
+    const loaded = await loadWorld(spy(client()), 'di-tenant-alpha', 'i', NOW);
+    expect(paths).toContain(`/api/v1/namespaces/di-runtime-alpha/configmaps/${LEDGER}`);
+    expect(
+      paths.some((path) => path.startsWith('/api/v1/namespaces/di-tenant-alpha/configmaps')),
+    ).toBe(false);
+    // The forged registry entry (fixture, tenant namespace) is not in the ledger.
+    expect(loaded.ledger?.entries['di-tenant-registry']).toBeUndefined();
+    // Only the old-location ledger exists (an upgrade, or a tenant's forgery): nothing is held.
+    const oldOnly = await loadWorld(
+      client({
+        async get(path) {
+          if (path === `/api/v1/namespaces/di-runtime-alpha/configmaps/${LEDGER}`) {
+            throw new KubeError(404, 'not found');
+          }
+          return client().get(path);
+        },
+      }),
+      'di-tenant-alpha',
+      'i',
+      NOW,
+    );
+    expect(oldOnly.ledger).toEqual({ entries: {} });
   });
 
   test('any failed read leaves the volume state unknown, never empty; a 404 is absent', async () => {
@@ -477,6 +531,47 @@ describe('applying actions', () => {
     ).rejects.toThrow('failed 409');
   });
 
+  test('W7: a 409 on a volume Job is ours only when the existing Job carries our owner uid', async () => {
+    const label = 'platform.di-framework.dev/backup-uid';
+    const job = (uid?: string) => ({
+      type: 'create-job' as const,
+      body: {
+        metadata: {
+          namespace: 'di-runtime-alpha',
+          name: 'di-vrestore-r-0a1b2c3d',
+          labels: uid ? { [label]: uid } : {},
+        },
+      },
+    });
+    const existing = (labels: Record<string, string>) =>
+      recorder((method) => {
+        if (method === 'POST') throw new KubeError(409, 'exists');
+        return { metadata: { labels } };
+      });
+    const same = existing({ [label]: 'uid-new' });
+    await applyActions(same.api, volumeWorld(), [job('uid-new')]);
+    expect(same.calls.map((call) => call.slice(0, 2))).toEqual([
+      ['POST', '/apis/batch/v1/namespaces/di-runtime-alpha/jobs'],
+      ['GET', '/apis/batch/v1/namespaces/di-runtime-alpha/jobs/di-vrestore-r-0a1b2c3d'],
+    ]);
+    // Another object's Job (an earlier request of the same name), or one with no owner label.
+    for (const labels of [{ [label]: 'uid-old' }, {}] as Record<string, string>[]) {
+      const other = existing(labels);
+      await expect(
+        applyActions(other.api, volumeWorld(), [
+          job('uid-new'),
+          { type: 'scale-workload', name: 'identity', replicas: 0 },
+        ]),
+      ).rejects.toThrow('already exists for another object');
+      // Nothing after the refused create runs.
+      expect(other.calls.some((call) => call[1].includes('/scale'))).toBe(false);
+    }
+    // A Job without an owner uid (a service dump) keeps 409-as-success, with no lookup.
+    const dump = existing({});
+    await applyActions(dump.api, volumeWorld(), [job()]);
+    expect(dump.calls).toHaveLength(1);
+  });
+
   test('scales through the scale subresource and deletes a Job in the background', async () => {
     const { calls, api } = recorder(() => ({}));
     await applyActions(api, volumeWorld(), [
@@ -506,13 +601,13 @@ describe('applying actions', () => {
     expect(calls).toEqual([
       [
         'POST',
-        '/api/v1/namespaces/di-tenant-alpha/configmaps',
+        '/api/v1/namespaces/di-runtime-alpha/configmaps',
         {
           apiVersion: 'v1',
           kind: 'ConfigMap',
           metadata: {
             name: LEDGER,
-            namespace: 'di-tenant-alpha',
+            namespace: 'di-runtime-alpha',
             labels: { 'platform.di-framework.dev/component': 'backup-operator' },
           },
           data: { identity: JSON.stringify(entry) },
@@ -520,7 +615,7 @@ describe('applying actions', () => {
       ],
       [
         'PATCH',
-        `/api/v1/namespaces/di-tenant-alpha/configmaps/${LEDGER}`,
+        `/api/v1/namespaces/di-runtime-alpha/configmaps/${LEDGER}`,
         { metadata: { resourceVersion: '41' }, data: { identity: null } },
       ],
     ]);
@@ -681,6 +776,18 @@ describe('leader election and single flight', () => {
     const long = opJobName('di-vrestore', `restore-volume-${'a'.repeat(60)}`);
     expect(long.length).toBe(63);
     expect(long).toMatch(/^di-vrestore-restore-volume-a+-[0-9a-f]{8}$/);
+    // W7: the owner's uid makes the name per object, within 63 characters.
+    const first = opJobName('di-vrestore', 'restore-identity', 'uid-1');
+    const second = opJobName('di-vrestore', 'restore-identity', 'uid-2');
+    expect(first).toMatch(/^di-vrestore-restore-identity-[0-9a-f]{8}$/);
+    expect(second).not.toBe(first);
+    expect(opJobName('di-vrestore', 'restore-identity', 'uid-1')).toBe(first);
+    const longOwned = opJobName('di-vrestore', `restore-volume-${'a'.repeat(60)}`, 'uid-1');
+    expect(longOwned.length).toBe(63);
+    expect(longOwned).toMatch(/^di-vrestore-restore-volume-a+-[0-9a-f]{8}-[0-9a-f]{8}$/);
+    expect(longOwned).not.toBe(
+      opJobName('di-vrestore', `restore-volume-${'a'.repeat(60)}`, 'uid-2'),
+    );
     expect(statusOf(new KubeError(404, 'x'))).toBe(404);
     expect(statusOf(new Error('x'))).toBeUndefined();
     expect(statusOf(undefined)).toBeUndefined();

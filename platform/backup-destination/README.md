@@ -77,7 +77,7 @@ The chart renders each entry into `BackupDestination.spec.sources`. Leave `stora
 Each step is written to the Backup's `status.volume` before the next action, so an operator restart carries on where it stopped.
 
 1. **Placing.** The operator finds the one node that holds the volume. Every tenant host pod mounts every storage directory of the tenant, so the hosts that mount this path (ready, starting or terminating) are the only places its instances can have written. If they span more than one node, the backup fails with `VolumeAmbiguous` and nothing is stopped. It then runs a short probe Job on that node, which mounts the hostPath and the destination claim (no credentials, non-root, no capabilities). Only when the probe succeeds does anything stop. A probe that fails, or does not finish within `startTimeoutSeconds`, ends the backup (`PlacementFailed`, `PlacementTimeout`) with no downtime. A misplaced claim, a full quota, or an image that cannot be pulled therefore costs nothing.
-2. **ScalingDown.** It records `spec.replicas` of every WorkloadDeployment that shares the volume (members sharing `di-framework.dev/workload`). The record goes in `status.volume.members` and in the held-replicas ledger, the ConfigMap `di-backup-held-replicas`. Then it scales them to 0 through the `scale` subresource. It waits until none of them has a `Workload` left, for up to `scaleDownTimeoutSeconds`. If the volume moved to another node meanwhile, the backup fails with `VolumeMoved`.
+2. **ScalingDown.** It records `spec.replicas` of every WorkloadDeployment that shares the volume (members sharing `di-framework.dev/workload`). The record goes in `status.volume.members` and in the held-replicas ledger, the ConfigMap `di-backup-held-replicas` in `di-runtime-<name>`. Then it scales them to 0 through the `scale` subresource. It waits until none of them has a `Workload` left, for up to `scaleDownTimeoutSeconds`. If the volume moved to another node meanwhile, the backup fails with `VolumeMoved`.
 3. **Copying.** It runs the copy Job on that node, pinned with node affinity, mounting the directory read-only.
    - The Job runs as root with only `DAC_READ_SEARCH`, a read-only root filesystem and the `RuntimeDefault` seccomp profile.
    - A Job that does not start within `startTimeoutSeconds` is stopped, and the replicas come back at once (`CopyNotStarted`).
@@ -95,7 +95,15 @@ The workload is down from the scale-down to the scale-up. `Backup.status.volume.
 - **Unknown is not empty.** If the workload lists, the tenant host Deployment or the ledger cannot be read, the volume state is unknown for that tick. No volume step runs and nothing terminal is written, and the next tick retries. A member is skipped only on a 404 from the scale write itself.
 - **Deleting a running Backup or BackupRestore** is safe. It carries the finalizer `platform.di-framework.dev/restore-replicas` from the moment it starts, and the operator treats deletion as "finish now": stop the Job, give the replicas back, then drop the finalizer.
 - **The ledger outlives the request.** If a running request vanishes anyway (finalizer stripped by hand), a sweeper gives every entry it held back from the ledger. A new copy never starts while a member is still held, so it never records 0 as the replicas to give back.
+- **The ledger is out of tenant reach.** It lives in the runtime namespace `di-runtime-<name>`, where tenant roles only read pods, services and events. (Tenant developers can edit ConfigMaps in `di-tenant-<name>`, so a ledger there could steer the operator's `scale` writes.) A ledger an earlier build left in the tenant namespace is ignored; delete it at will. The sweeper still checks every entry and drops, without scaling, any entry the operator could not have written:
+  - the workload is not a source of the entry's (existing) BackupDestination, nor a member sharing a source's volume;
+  - it is platform-reserved: `di-tenant-registry`, or labelled `platform.di-framework.dev/component=tenant-auth`;
+  - the replicas are not a whole number from 0 to 100, the holder is not `Backup/<name>` or `BackupRestore/<name>`, or the timestamp does not parse.
+
+  A workload that a running request holds by its own status is left to that request, whatever its entry says.
+- **Only sources stop.** A Backup or BackupRestore whose workload is not a source of its destination ends `NotASource`, and one that would stop a platform-reserved workload (by name, or by sharing its volume) ends `WorkloadReserved`, both before anything stops.
 - **One reconciler.** The operator Deployment uses `Recreate`, ticks never overlap, and only the holder of the Lease `di-backup-operator` reconciles. Every status and ledger write carries a `resourceVersion` precondition, so a stale reconciler cannot overwrite a newer result. Job and scheduled-Backup names are derived from the request (or the fire time), so a repeated create is a harmless 409.
+- **Jobs belong to one object.** Probe, copy and restore Job names include a short hash of the request's `metadata.uid`, and the Jobs carry it in the label `platform.di-framework.dev/backup-uid`. A request deleted and re-applied under the same name (a GitOps sync, a retry with `force: true`) therefore runs new Jobs instead of taking over the result of the old ones, which are kept for 7 days. A 409 on a create counts as success only when the existing Job carries the same uid. A Job of another object under the recorded name is never adopted or stopped: the request ends `JobConflict` and its replicas come back.
 
 ### Restore
 
@@ -120,10 +128,10 @@ Both sit in `<storageRoot>/di-tenants/<tenant uid>/workloads/` on the node and h
 The operator's Role in `di-tenant-<name>` adds:
 - `get`/`list` on `workloaddeployments`, `workloadreplicasets` and `workloads`;
 - `get`/`patch` on `workloaddeployments/scale` only. The WorkloadDeployment itself is never written. Platform admission re-validates every update to it, and the spec stays out of reach;
-- `get`/`patch` on the ConfigMap `di-backup-held-replicas` and the Lease `di-backup-operator`, by name, plus `create` for each (`create` cannot be limited by name);
+- `get`/`patch` on the Lease `di-backup-operator`, by name, plus `create` (`create` cannot be limited by name). It has no ConfigMap access here;
 - `get` on the one S3 credentials Secret the chart's destination names. It no longer lists Secrets. A destination created by hand that names another Secret reports `CredentialsInvalid`.
 
-In `di-runtime-<name>` it adds `get` on the one Deployment `hostgroup-tenant-<name>`, whose owner-uid label names the tenant directory. There is no ClusterRole.
+In `di-runtime-<name>` it adds `get` on the one Deployment `hostgroup-tenant-<name>`, whose owner-uid label names the tenant directory, and `get`/`patch` on the ConfigMap `di-backup-held-replicas` by name plus `create`. There is no ClusterRole.
 
 Run `sh ../backup-agent/scripts/capabilities.sh` to check the Job security contexts in a container: each capability set is run as granted, and once with one capability fewer.
 

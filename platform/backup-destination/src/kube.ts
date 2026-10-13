@@ -10,6 +10,7 @@ import {
   type JobView,
   LEDGER,
   type Ledger,
+  OWNER_OBJECT_LABEL,
   OWNER_UID_LABEL,
   PVC_CLAIM,
   pickS3Owner,
@@ -202,17 +203,28 @@ function volumeOf(status: Record<string, unknown> | undefined): VolumeProgress |
 /** Fields every Backup and BackupRestore view carries for concurrency and deletion. */
 function objectMeta(item: Item) {
   return {
+    ...(item.metadata?.uid ? { objectUid: item.metadata.uid } : {}),
     ...(item.metadata?.resourceVersion ? { resourceVersion: item.metadata.resourceVersion } : {}),
     ...(item.metadata?.finalizers?.length ? { finalizers: item.metadata.finalizers } : {}),
     ...(item.metadata?.deletionTimestamp ? { deleting: true } : {}),
   };
 }
 
+/**
+ * One ledger entry as written. Shape only: a value that is not an object with a numeric
+ * `replicas` and a string `heldBy` is skipped. Bounds, names and the destination are checked by
+ * the sweeper (`heldEntryProblem`), which refuses anything the operator would not have written.
+ */
 function entryOf(value: string): HeldEntry | undefined {
   try {
     const parsed = JSON.parse(value) as Partial<HeldEntry>;
     if (typeof parsed?.replicas !== 'number' || typeof parsed.heldBy !== 'string') return undefined;
-    return { replicas: parsed.replicas, heldBy: parsed.heldBy, since: String(parsed.since ?? '') };
+    return {
+      replicas: parsed.replicas,
+      heldBy: parsed.heldBy,
+      since: String(parsed.since ?? ''),
+      ...(typeof parsed.destination === 'string' ? { destination: parsed.destination } : {}),
+    };
   } catch {
     return undefined;
   }
@@ -296,7 +308,9 @@ async function volumeState(
           `/apis/apps/v1/namespaces/${runtimeNamespace}/deployments/hostgroup-tenant-${tenant}`,
         ),
       ),
-      absentOn404(client.get(`/api/v1/namespaces/${tenantNamespace}/configmaps/${LEDGER}`)),
+      // The runtime namespace, where tenant users cannot write ConfigMaps (W6). A ledger an
+      // earlier build left in the tenant namespace is never read.
+      absentOn404(client.get(`/api/v1/namespaces/${runtimeNamespace}/configmaps/${LEDGER}`)),
     ]);
     return { deployments, replicaSets, instances, hostgroup, ledger: ledgerOf(ledger) };
   } catch (error) {
@@ -502,6 +516,7 @@ export async function loadWorld(
           failedReason: failedReason(item),
           started: pods?.started ?? false,
           activePods: pods?.active ?? 0,
+          ...(labels[OWNER_OBJECT_LABEL] ? { ownerUid: labels[OWNER_OBJECT_LABEL] } : {}),
         },
       ];
     }),
@@ -673,12 +688,7 @@ export async function applyActions(
     } else if (action.type === 'delete-backup') {
       await except(404, client.remove(`${crd}/backups/${action.name}`));
     } else if (action.type === 'create-job') {
-      const meta = (action.body.metadata ?? {}) as { namespace?: string };
-      // Volume Job names come from the operation: a 409 means the Job already runs.
-      await except(
-        409,
-        client.post(`/apis/batch/v1/namespaces/${meta.namespace}/jobs`, action.body),
-      );
+      await createJob(client, action.body);
     } else if (action.type === 'scale-workload') {
       // A 404 is the only proof a member is gone; anything else fails the tick and is retried.
       await except(
@@ -699,6 +709,35 @@ export async function applyActions(
   }
 }
 
+/**
+ * Create a Job. Its name comes from the request, so a 409 is normally this request's own Job
+ * from an earlier tick. A volume Job carries its owner's uid: the existing Job counts as ours
+ * only when it carries the same one, and anything else fails the tick instead of adopting a Job
+ * (and its result) that another object created.
+ */
+async function createJob(client: KubeClient, body: Record<string, unknown>): Promise<void> {
+  const meta = (body.metadata ?? {}) as {
+    namespace?: string;
+    name?: string;
+    labels?: Record<string, string>;
+  };
+  const path = `/apis/batch/v1/namespaces/${meta.namespace}/jobs`;
+  try {
+    await client.post(path, body);
+  } catch (error) {
+    if (statusOf(error) !== 409) throw error;
+    const owner = meta.labels?.[OWNER_OBJECT_LABEL];
+    if (!owner) return;
+    const existing = (await client.get(`${path}/${meta.name}`)) as Item;
+    const found = existing.metadata?.labels?.[OWNER_OBJECT_LABEL];
+    if (found !== owner) {
+      throw new Error(
+        `Job ${meta.name} already exists for another object (backup-uid ${found ?? 'unset'}, expected ${owner}); not reusing it`,
+      );
+    }
+  }
+}
+
 /** Set or remove held-replicas entries; the first write creates the ConfigMap. */
 async function writeLedger(
   client: KubeClient,
@@ -706,7 +745,7 @@ async function writeLedger(
   action: Extract<Action, { type: 'ledger' }>,
   versions: Versions,
 ): Promise<void> {
-  const path = `/api/v1/namespaces/${world.tenantNamespace}/configmaps`;
+  const path = `/api/v1/namespaces/${world.runtimeNamespace}/configmaps`;
   const data = Object.fromEntries(
     Object.entries(action.set).map(([name, entry]) => [name, entry ? JSON.stringify(entry) : null]),
   );
@@ -722,7 +761,7 @@ async function writeLedger(
       kind: 'ConfigMap',
       metadata: {
         name: LEDGER,
-        namespace: world.tenantNamespace,
+        namespace: world.runtimeNamespace,
         labels: { [`${GROUP}/component`]: 'backup-operator' },
       },
       data: created,

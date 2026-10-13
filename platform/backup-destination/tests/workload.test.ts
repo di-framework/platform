@@ -8,6 +8,7 @@ import {
   type Action,
   type BackupView,
   FINALIZER,
+  opJobName,
   type RestoreView,
   storageKeyOf,
   volumePath,
@@ -129,6 +130,7 @@ describe('cold copy of a workload volume', () => {
         replicas: 2,
         heldBy: `Backup/${cluster.backup()?.name}`,
         since: cluster.world.now,
+        destination: 'pvc',
       },
     });
     expect(start[2]).toEqual({ type: 'scale-workload', name: 'identity', replicas: 0 });
@@ -140,7 +142,17 @@ describe('cold copy of a workload volume', () => {
     const copy = cluster.tick();
     const body = job(copy);
     const text = JSON.stringify(body);
-    expect((body.metadata as { name: string }).name).toBe(`di-vcopy-${cluster.backup()?.name}`);
+    // Named per object (W7): the Backup's metadata.uid is part of the name and a label.
+    const owner = cluster.backup();
+    expect((body.metadata as { name: string }).name).toBe(
+      opJobName('di-vcopy', owner?.name ?? '', owner?.objectUid),
+    );
+    expect((body.metadata as { name: string }).name).toMatch(
+      /^di-vcopy-di-volume-identity-\d+-[0-9a-f]{8}$/,
+    );
+    expect((body.metadata as { labels: Record<string, string> }).labels).toMatchObject({
+      'platform.di-framework.dev/backup-uid': owner?.objectUid,
+    });
     expect(text).toContain(
       '"matchFields":[{"key":"metadata.name","operator":"In","values":["node-a"]}]',
     );
@@ -757,7 +769,9 @@ describe('W1: deleting a running operation, and the double-scale-down trap', () 
       workloads: [workload({ replicas: 0, instances: 0 })],
       ledger: {
         resourceVersion: '7',
-        entries: { identity: { replicas: 2, heldBy: 'Backup/gone', since: NOW } },
+        entries: {
+          identity: { replicas: 2, heldBy: 'Backup/gone', since: NOW, destination: 'pvc' },
+        },
       },
     });
     const backup: BackupView = {
@@ -790,15 +804,23 @@ describe('W1: deleting a running operation, and the double-scale-down trap', () 
       phase: 'Succeeded',
       source: { kind: 'workload-volume', workloadName: 'identity' },
     };
+    const destination = pvcDestination({
+      sources: [
+        { kind: 'workload-volume', workloadName: 'identity' },
+        { kind: 'workload-volume', workloadName: 'vanished' },
+      ],
+    });
     const cluster = new Cluster(
       volumeWorld({
+        destination,
+        destinations: [destination],
         backups: [finished],
         workloads: [workload({ replicas: 5 })],
         ledger: {
           resourceVersion: '3',
           entries: {
-            identity: { replicas: 2, heldBy: 'Backup/done', since: NOW },
-            vanished: { replicas: 1, heldBy: 'BackupRestore/old', since: NOW },
+            identity: { replicas: 2, heldBy: 'Backup/done', since: NOW, destination: 'pvc' },
+            vanished: { replicas: 1, heldBy: 'BackupRestore/old', since: NOW, destination: 'pvc' },
           },
         },
       }),

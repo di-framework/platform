@@ -175,12 +175,15 @@ export interface HeldEntry {
   /** `Backup/<name>` or `BackupRestore/<name>`. */
   heldBy: string;
   since: string;
+  /** The BackupDestination whose source the workload is; the sweeper checks it against its spec. */
+  destination?: string;
 }
 
 /**
- * The held-replicas ledger, a ConfigMap in the tenant namespace. It outlives the Backup or
- * BackupRestore that wrote it: a sweeper gives the replicas back for any entry whose operation
- * is gone or finished, and a new operation never records 0 for a held workload.
+ * The held-replicas ledger, a ConfigMap in the tenant's runtime namespace, where tenant users
+ * cannot write ConfigMaps. It outlives the Backup or BackupRestore that wrote it: a sweeper gives
+ * the replicas back for any valid entry whose operation is gone or finished, and a new operation
+ * never records 0 for a held workload.
  */
 export interface Ledger {
   /** Absent while the ConfigMap does not exist. */
@@ -246,6 +249,8 @@ export interface BackupView {
   className: string;
   storage: string;
   createdAt: string;
+  /** metadata.uid (spec `uid` is the source's). It names the volume Jobs of this object. */
+  objectUid?: string;
   resourceVersion?: string;
   finalizers?: string[];
   deleting?: boolean;
@@ -266,6 +271,8 @@ export interface RestoreView {
   phase?: 'Running' | 'Succeeded' | 'Failed';
   reason?: string;
   volume?: VolumeProgress;
+  /** metadata.uid. It names the volume Jobs of this object. */
+  objectUid?: string;
   resourceVersion?: string;
   finalizers?: string[];
   deleting?: boolean;
@@ -294,6 +301,8 @@ export interface JobView {
   started?: boolean;
   /** Pods of the Job that have not finished, terminating ones included. */
   activePods?: number;
+  /** The metadata.uid of the Backup or BackupRestore that created a volume Job. */
+  ownerUid?: string;
 }
 
 export interface World {
@@ -393,8 +402,20 @@ export const JOB_GRACE_SECONDS = 120;
 export const VOLUME_JOB_TTL_SECONDS = 7 * 24 * 3600;
 /** On a running Backup or BackupRestore: removed only once its replicas are back. */
 export const FINALIZER = `${GROUP}/restore-replicas`;
-/** The held-replicas ledger ConfigMap in the tenant namespace. */
+/**
+ * The held-replicas ledger ConfigMap in the runtime namespace (`di-runtime-<tenant>`). Tenant
+ * roles only read pods, services and events there, so a tenant user cannot forge an entry. A
+ * ledger left in the tenant namespace by an earlier build is never read.
+ */
 export const LEDGER = 'di-backup-held-replicas';
+/** The most replicas a ledger entry may give back; anything above is refused as forged. */
+export const MAX_HELD_REPLICAS = 100;
+/** The platform-owned tenant registry WorkloadDeployment (platform tenancy `REGISTRY_WORKLOAD`). */
+export const REGISTRY_WORKLOAD = 'di-tenant-registry';
+/** Label value of platform-owned tenant-auth WorkloadDeployments (platform `TENANT_AUTH_COMPONENT`). */
+export const TENANT_AUTH_COMPONENT = 'tenant-auth';
+/** Label carrying the metadata.uid of the Backup or BackupRestore that owns a volume Job. */
+export const OWNER_OBJECT_LABEL = `${GROUP}/backup-uid`;
 /** The Lease the operator replicas elect a leader with. */
 export const LEASE = 'di-backup-operator';
 
@@ -473,11 +494,14 @@ export function jobName(prefix: string, service: string, unix: number): string {
 }
 
 /** A Job name derived from the operation's name only, at most 63 characters. */
-export function opJobName(prefix: string, name: string): string {
-  const base = `${prefix}-${name}`;
+export function opJobName(prefix: string, name: string, uid?: string): string {
+  // The owner's uid makes the name per object: a request re-created under the same name never
+  // finds the Jobs (kept for VOLUME_JOB_TTL_SECONDS) of the one it replaced.
+  const owner = uid ? `-${createHash('sha256').update(uid).digest('hex').slice(0, 8)}` : '';
+  const base = `${prefix}-${name}${owner}`;
   if (base.length <= 63) return base;
   const hash = createHash('sha256').update(name).digest('hex').slice(0, 8);
-  return `${prefix}-${name.slice(0, 63 - prefix.length - hash.length - 2)}-${hash}`;
+  return `${prefix}-${name.slice(0, 63 - prefix.length - hash.length - owner.length - 2)}-${hash}${owner}`;
 }
 
 /** The HTTP status of a failed API call, when the client reports one. */

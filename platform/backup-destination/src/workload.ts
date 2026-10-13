@@ -5,17 +5,22 @@ import {
   type DestinationView,
   FINALIZER,
   GROUP,
+  type HeldEntry,
   JOB_GRACE_SECONDS,
   type JobResources,
   type JobView,
   jobName,
+  MAX_HELD_REPLICAS,
+  OWNER_OBJECT_LABEL,
   opJobName,
+  REGISTRY_WORKLOAD,
   type RestoreView,
   type Retention,
   SCALE_DOWN_TIMEOUT_SECONDS,
   type SourceStatus,
   START_TIMEOUT_SECONDS,
   storageKeyOf,
+  TENANT_AUTH_COMPONENT,
   VERSION,
   VOLUME_JOB_TTL_SECONDS,
   type VolumeOutcome,
@@ -59,6 +64,58 @@ interface Resolved {
 
 type Problem = { reason: string; message: string };
 
+/**
+ * A WorkloadDeployment the platform owns (#83): the tenant registry, or anything labelled as a
+ * tenant-auth component. The operator never stops or scales one, whatever a request or the
+ * ledger says. Mirrors the `reserved-workloads` admission rule.
+ */
+export function reservedWorkload(name: string, workload?: Pick<WorkloadView, 'labels'>): boolean {
+  return (
+    name === REGISTRY_WORKLOAD || workload?.labels[`${GROUP}/component`] === TENANT_AUTH_COMPONENT
+  );
+}
+
+/**
+ * Whether `name` is a source of `dest`, or shares the volume of one (a member stopped with it).
+ * The destination's spec is platform-managed; nothing else decides what the operator may scale.
+ */
+export function sourceOf(world: World, dest: DestinationView | undefined, name: string): boolean {
+  const sources = dest?.spec.sources ?? [];
+  const workloads = world.workloads ?? [];
+  const current = workloads.find((item) => item.name === name);
+  if (reservedWorkload(name, current)) return false;
+  if (sources.some((source) => source.workloadName === name)) return true;
+  const key = current && storageKeyOf(current);
+  if (!key) return false;
+  return sources.some((source) => {
+    const named = workloads.find((item) => item.name === source.workloadName);
+    return !!named && !reservedWorkload(named.name, named) && storageKeyOf(named) === key;
+  });
+}
+
+const DNS_LABEL = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
+const HELD_BY = /^(Backup|BackupRestore)\/[a-z0-9]([-.a-z0-9]{0,251}[a-z0-9])?$/;
+
+/**
+ * Why the sweeper refuses a ledger entry, or undefined when it is one the operator could have
+ * written: a workload name, whole replicas within bounds, a `Backup/` or `BackupRestore/` holder,
+ * a timestamp, and an existing destination that has the workload as a source. A refused entry is
+ * dropped and never scaled.
+ */
+export function heldEntryProblem(world: World, name: string, entry: HeldEntry): string | undefined {
+  if (!DNS_LABEL.test(name)) return 'name';
+  if (!Number.isInteger(entry.replicas) || entry.replicas < 0) return 'replicas';
+  if (entry.replicas > MAX_HELD_REPLICAS) return 'replicas';
+  if (!HELD_BY.test(entry.heldBy)) return 'heldBy';
+  if (Number.isNaN(Date.parse(entry.since))) return 'since';
+  const destinations = world.destinations ?? (world.destination ? [world.destination] : []);
+  const dest = destinations.find((item) => item.name === entry.destination);
+  if (!dest) return 'destination';
+  const current = (world.workloads ?? []).find((item) => item.name === name);
+  if (reservedWorkload(name, current)) return 'reserved';
+  return sourceOf(world, dest, name) ? undefined : 'not-a-source';
+}
+
 /** The volume path's tail under any storageRoot. */
 function volumeTail(tenantUid: string, key: string): string {
   return volumePath('', tenantUid, key);
@@ -75,6 +132,18 @@ export function resolveVolume(world: World, workloadName: string): Resolved | Pr
   const workload = workloads.find((item) => item.name === workloadName);
   if (!workload) {
     return { reason: 'WorkloadNotFound', message: `WorkloadDeployment ${workloadName} not found` };
+  }
+  const reserved = workloads.find(
+    (item) =>
+      reservedWorkload(item.name, item) &&
+      (item.name === workloadName ||
+        (storageKeyOf(item) !== undefined && storageKeyOf(item) === storageKeyOf(workload))),
+  );
+  if (reserved) {
+    return {
+      reason: 'WorkloadReserved',
+      message: `WorkloadDeployment ${reserved.name} is managed by the platform`,
+    };
   }
   if (workload.deleting) {
     return {
@@ -173,6 +242,8 @@ interface Operation {
   /** `Backup/<name>` or `BackupRestore/<name>`: the ledger's `heldBy`. */
   ref: string;
   name: string;
+  /** metadata.uid of the Backup or BackupRestore; its volume Jobs carry it. */
+  objectUid?: string;
   workloadName: string;
   resource: 'backups' | 'backuprestores';
   kind: 'volume-copy' | 'volume-restore';
@@ -210,6 +281,28 @@ function parsed(job: JobView): JobResult {
   } catch {
     return {};
   }
+}
+
+/**
+ * The Job named in status, when it is this object's. A volume Job carries its owner's uid; one
+ * that carries another uid was made for an earlier object of the same name and is never adopted.
+ * Jobs from before the uid label carry none and count as the operation's own.
+ */
+function ownJob(
+  jobs: JobView[],
+  name: string | undefined,
+  op: Pick<Operation, 'objectUid'>,
+): { job?: JobView; foreign?: JobView } {
+  const job = jobs.find((item) => item.name === name);
+  if (job?.ownerUid && op.objectUid && job.ownerUid !== op.objectUid) return { foreign: job };
+  return { job };
+}
+
+function conflict(job: JobView): VolumeOutcome {
+  return failed(
+    'JobConflict',
+    `Job ${job.name} belongs to another object of this name; delete it and re-create the request`,
+  );
 }
 
 function failure(job: JobView, fallback: string): string {
@@ -342,7 +435,7 @@ function toScalingUp(
 
 function placing(world: World, op: Operation, jobs: JobView[], blocked?: string): Action[] {
   const volume = op.volume;
-  const probe = jobs.find((item) => item.name === volume.probeJob);
+  const { job: probe, foreign } = ownJob(jobs, volume.probeJob, op);
   // Nothing is held yet: stopping here costs no downtime.
   const stop = (outcome: VolumeOutcome): Action[] => [
     ...(probe?.phase === 'Running' ? [{ type: 'delete-job', name: probe.name } as Action] : []),
@@ -350,6 +443,7 @@ function placing(world: World, op: Operation, jobs: JobView[], blocked?: string)
   ];
   if (op.deleting) return stop(failed('Cancelled', 'the request was deleted'));
   if (blocked) return stop(failed(blocked, `stopped before the scale-down: ${blocked}`));
+  if (foreign) return stop(conflict(foreign));
   const late = seconds(volume.placingStartedAt, world.now) > op.startTimeout;
   if (!probe || probe.phase === 'Running') {
     if (late) {
@@ -403,7 +497,12 @@ function hold(world: World, op: Operation, members: { name: string; replicas: nu
     set: Object.fromEntries(
       members.map((member) => [
         member.name,
-        { replicas: member.replicas, heldBy: op.ref, since: world.now },
+        {
+          replicas: member.replicas,
+          heldBy: op.ref,
+          since: world.now,
+          ...(world.destination ? { destination: world.destination.name } : {}),
+        },
       ]),
     ),
     resourceVersion: world.ledger?.resourceVersion,
@@ -484,7 +583,9 @@ function scalingDown(world: World, op: Operation, jobs: JobView[], blocked?: str
 
 function copying(world: World, op: Operation, jobs: JobView[]): Action[] {
   const volume = op.volume;
-  const job = jobs.find((item) => item.name === volume.copyJob);
+  const { job, foreign } = ownJob(jobs, volume.copyJob, op);
+  // Another object's Job is never stopped or read; the replicas come back at once.
+  if (foreign) return toScalingUp(world, op, jobs, conflict(foreign));
   if (op.deleting) {
     return toScalingUp(world, op, jobs, failed('Cancelled', 'the request was deleted'), job);
   }
@@ -600,6 +701,8 @@ export function volumeJobBody(input: {
   /** For a probe: the operation it places. */
   probing?: 'volume-copy' | 'volume-restore';
   ownerName: string;
+  /** metadata.uid of the owning Backup or BackupRestore. */
+  ownerUid?: string;
   workloadName: string;
   volume: VolumeProgress;
   deadline: number;
@@ -616,6 +719,7 @@ export function volumeJobBody(input: {
     [`${GROUP}/backup-kind`]: input.kind,
     [`${GROUP}/workload`]: input.workloadName,
     [`${GROUP}/backup-name`]: input.ownerName,
+    ...(input.ownerUid ? { [OWNER_OBJECT_LABEL]: input.ownerUid } : {}),
     ...(world.destination ? { [`${GROUP}/destination`]: world.destination.name } : {}),
   };
   const mount = restore ? '/workloads' : '/source';
@@ -748,6 +852,7 @@ function backupOperation(world: World, backup: BackupView): Operation {
   return {
     ref: `Backup/${backup.name}`,
     name: backup.name,
+    objectUid: backup.objectUid,
     workloadName,
     resource: 'backups',
     kind: 'volume-copy',
@@ -783,9 +888,10 @@ function backupOperation(world: World, backup: BackupView): Operation {
     job: () =>
       volumeJobBody({
         world,
-        name: volume.copyJob ?? opJobName('di-vcopy', backup.name),
+        name: volume.copyJob ?? opJobName('di-vcopy', backup.name, backup.objectUid),
         kind: 'volume-copy',
         ownerName: backup.name,
+        ownerUid: backup.objectUid,
         workloadName,
         volume,
         deadline: limits.copyTimeout,
@@ -798,10 +904,11 @@ function backupOperation(world: World, backup: BackupView): Operation {
     probe: () =>
       volumeJobBody({
         world,
-        name: volume.probeJob ?? opJobName('di-vprobe', backup.name),
+        name: volume.probeJob ?? opJobName('di-vprobe', backup.name, backup.objectUid),
         kind: 'volume-probe',
         probing: 'volume-copy',
         ownerName: backup.name,
+        ownerUid: backup.objectUid,
         workloadName,
         volume,
         deadline: limits.startTimeout,
@@ -819,6 +926,7 @@ function restoreOperation(world: World, restore: RestoreView): Operation {
   return {
     ref: `BackupRestore/${restore.name}`,
     name: restore.name,
+    objectUid: restore.objectUid,
     workloadName,
     resource: 'backuprestores',
     kind: 'volume-restore',
@@ -856,9 +964,10 @@ function restoreOperation(world: World, restore: RestoreView): Operation {
     job: () =>
       volumeJobBody({
         world,
-        name: volume.copyJob ?? opJobName('di-vrestore', restore.name),
+        name: volume.copyJob ?? opJobName('di-vrestore', restore.name, restore.objectUid),
         kind: 'volume-restore',
         ownerName: restore.name,
+        ownerUid: restore.objectUid,
         workloadName,
         volume,
         deadline: limits.copyTimeout,
@@ -874,10 +983,11 @@ function restoreOperation(world: World, restore: RestoreView): Operation {
     probe: () =>
       volumeJobBody({
         world,
-        name: volume.probeJob ?? opJobName('di-vprobe', restore.name),
+        name: volume.probeJob ?? opJobName('di-vprobe', restore.name, restore.objectUid),
         kind: 'volume-probe',
         probing: 'volume-restore',
         ownerName: restore.name,
+        ownerUid: restore.objectUid,
         workloadName,
         volume,
         deadline: limits.startTimeout,
@@ -926,26 +1036,37 @@ export function advanceVolumes(world: World, blocked?: string): Action[] {
  * deleted past its finalizer, or it finished without clearing the entry. A workload somebody
  * already raised keeps its replicas; one missing from the list is scaled anyway, and only a 404
  * on that write skips it.
+ *
+ * Defense in depth (W6): the ledger is out of tenant reach, but an entry is still only acted on
+ * when it is one the operator could have written ({@link heldEntryProblem}): a source of an
+ * existing destination, never a platform-reserved workload, with bounded replicas. Anything else
+ * is dropped unscaled. A workload a running operation holds by its own status (members, which
+ * tenants cannot write) is left to that operation, whatever its entry claims.
  */
 export function releaseOrphans(world: World): Action[] {
   if (!volumeStateKnown(world)) return [];
-  const running = new Set([
+  const runningOps = [
     ...world.backups
       .filter((item) => item.source && item.phase === 'Running')
-      .map((item) => `Backup/${item.name}`),
+      .map((item) => ({ ref: `Backup/${item.name}`, volume: item.volume })),
     ...world.restores
       .filter((item) => item.targetWorkloadName && item.phase === 'Running')
-      .map((item) => `BackupRestore/${item.name}`),
-  ]);
+      .map((item) => ({ ref: `BackupRestore/${item.name}`, volume: item.volume })),
+  ];
+  const running = new Set(runningOps.map((item) => item.ref));
+  const holding = new Set(
+    runningOps.flatMap((item) => (item.volume?.members ?? []).map((member) => member.name)),
+  );
   const actions: Action[] = [];
   const release: Record<string, null> = {};
   for (const [name, entry] of Object.entries(world.ledger?.entries ?? {})) {
-    if (running.has(entry.heldBy)) continue;
+    if (running.has(entry.heldBy) || holding.has(name)) continue;
+    release[name] = null;
+    if (heldEntryProblem(world, name, entry)) continue;
     const current = (world.workloads ?? []).find((item) => item.name === name);
     if (!current || current.replicas === 0) {
       actions.push({ type: 'scale-workload', name, replicas: entry.replicas });
     }
-    release[name] = null;
   }
   if (Object.keys(release).length > 0) {
     actions.push({ type: 'ledger', set: release, resourceVersion: world.ledger?.resourceVersion });
@@ -955,14 +1076,28 @@ export function releaseOrphans(world: World): Action[] {
 
 function begin(
   world: World,
-  view: { name: string; finalizers?: string[]; resourceVersion?: string },
+  view: { name: string; objectUid?: string; finalizers?: string[]; resourceVersion?: string },
   build: (volume: VolumeProgress) => Operation,
   extra: (resolved: Resolved) => Partial<VolumeProgress>,
   check?: () => Problem | undefined,
 ): Action[] {
   const shell = build({});
-  const resolved = resolveVolume(world, shell.workloadName);
-  const problem = 'reason' in resolved ? resolved : check?.();
+  const name = shell.workloadName;
+  const target = (world.workloads ?? []).find((item) => item.name === name);
+  // Only what the destination's spec names is ever stopped: never a platform workload.
+  const scope: Problem | undefined = reservedWorkload(name, target)
+    ? {
+        reason: 'WorkloadReserved',
+        message: `WorkloadDeployment ${name} is managed by the platform`,
+      }
+    : sourceOf(world, world.destination, name)
+      ? undefined
+      : {
+          reason: 'NotASource',
+          message: `WorkloadDeployment ${name} is not a source of BackupDestination ${world.destination?.name ?? ''}`,
+        };
+  const resolved = resolveVolume(world, name);
+  const problem = scope ?? ('reason' in resolved ? resolved : check?.());
   if (problem) {
     return [shell.status({ phase: 'Failed', reason: problem.reason, message: problem.message })];
   }
@@ -978,8 +1113,9 @@ function begin(
     hostPath: found.hostPath,
     storageKey: found.key,
     image: found.image,
-    probeJob: opJobName('di-vprobe', view.name),
-    copyJob: opJobName(prefix, view.name),
+    // Per object, not per name: a re-created request never meets the old one's Jobs.
+    probeJob: opJobName('di-vprobe', view.name, view.objectUid),
+    copyJob: opJobName(prefix, view.name, view.objectUid),
     ...extra(found),
   };
   const op = build(volume);

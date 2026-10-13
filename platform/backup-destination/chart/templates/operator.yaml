@@ -24,15 +24,8 @@ rules:
     resourceNames: [{{ $secret | quote }}]
     verbs: ["get"]
   {{- end }}
-  # The held-replicas ledger (#232): the replicas a workload-volume copy holds at 0, kept
-  # outside the Backup so a deleted Backup cannot strand them. create cannot be name-scoped.
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    resourceNames: ["di-backup-held-replicas"]
-    verbs: ["get", "patch"]
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["create"]
+  # No ConfigMaps here: tenant users can edit ConfigMaps in this namespace, so the held-replicas
+  # ledger lives in the runtime namespace (see runtime.yaml).
   # One reconciler at a time across operator pods.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]

@@ -253,14 +253,17 @@ describe('backup-destination chart', () => {
       .find((doc) => doc.includes('kind: Role\n') && doc.includes('namespace: di-tenant-alpha'));
     expect(pvcTenant).toBeDefined();
     expect(pvcTenant).not.toContain('resources: ["secrets"]');
-    // The ledger and the Lease, each limited to its one object where the verb allows it.
-    expect(tenant).toContain(
+    // The ledger and the Lease, each limited to its one object where the verb allows it. The
+    // ledger is in the runtime namespace (W6): tenant users can edit ConfigMaps in their own.
+    expect(runtime).toContain(
       'resources: ["configmaps"]\n    resourceNames: ["di-backup-held-replicas"]\n    verbs: ["get", "patch"]',
     );
+    expect(runtime).toContain('resources: ["configmaps"]\n    verbs: ["create"]');
+    expect(tenant).not.toContain('configmaps');
     expect(tenant).toContain(
       'resources: ["leases"]\n    resourceNames: ["di-backup-operator"]\n    verbs: ["get", "patch"]',
     );
-    expect(tenant).not.toMatch(/resources: \["configmaps"\]\n\s*verbs: \[[^\]]*"list"/);
+    expect(runtime).not.toMatch(/resources: \["configmaps"\]\n\s*verbs: \[[^\]]*"list"/);
     // Never two operator pods at once.
     expect(rendered.stdout).toContain('strategy:\n    type: Recreate');
     expect(rendered.stdout).toContain(
