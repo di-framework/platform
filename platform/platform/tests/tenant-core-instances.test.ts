@@ -103,3 +103,64 @@ describe('Tenant spec.runtime.coreInstances', () => {
     });
   });
 });
+
+describe('Tenant spec.deletionPolicy', () => {
+  it('defaults to Retain in the CRD schema', () => {
+    const tenantCrd = crds.find(
+      (c) => (c.spec as { names: { kind: string } }).names.kind === 'Tenant',
+    ) as unknown as {
+      spec: {
+        versions: {
+          schema: {
+            openAPIV3Schema: {
+              properties: {
+                spec: { properties: Record<string, unknown> };
+              };
+            };
+          };
+        }[];
+      };
+    };
+    const spec = tenantCrd.spec.versions[0]?.schema.openAPIV3Schema.properties.spec.properties;
+    expect(spec?.deletionPolicy).toEqual({
+      type: 'string',
+      enum: ['Retain', 'Delete'],
+      default: 'Retain',
+    });
+  });
+
+  it('validates the Pulumi tenants config values', () => {
+    for (const value of ['Retain' as const, 'Delete' as const, undefined])
+      expect(() => assertTenantDeclaration({ name: 'a', deletionPolicy: value })).not.toThrow();
+    expect(() => assertTenantDeclaration({ name: 'a' })).not.toThrow();
+    for (const value of ['retain', 'delete', 'KeepData', ''] as const)
+      expect(() =>
+        assertTenantDeclaration({ name: 'a', deletionPolicy: value as unknown as 'Retain' }),
+      ).toThrow("Tenant a deletionPolicy must be 'Retain' or 'Delete'");
+  });
+
+  it('maps a Pulumi tenants entry with deletionPolicy to the Tenant CR spec', () => {
+    expect(tenantObject({ name: 'alpha', deletionPolicy: 'Delete' }, 'inst')).toEqual({
+      apiVersion: VERSION,
+      kind: 'Tenant',
+      metadata: {
+        name: 'alpha',
+        labels: { [INSTALLATION]: 'inst' },
+        annotations: { 'pulumi.com/waitFor': 'condition=Ready' },
+      },
+      spec: { deletionPolicy: 'Delete' },
+    });
+  });
+
+  it('applies deletionPolicy in the Tenant object', () => {
+    const t = tenant({ deletionPolicy: 'Delete' });
+    expect(t.spec.deletionPolicy).toBe('Delete');
+  });
+
+  it('handles both Retain and Delete deletion policies', () => {
+    const retain = tenant({ deletionPolicy: 'Retain' });
+    const del = tenant({ deletionPolicy: 'Delete' });
+    expect(retain.spec.deletionPolicy).toBe('Retain');
+    expect(del.spec.deletionPolicy).toBe('Delete');
+  });
+});

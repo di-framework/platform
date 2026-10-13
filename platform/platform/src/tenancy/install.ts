@@ -29,6 +29,11 @@ export function assertTenantDeclaration(tenant: TenantDeclaration): void {
     throw new Error(
       `Tenant ${tenant.name} runtime.coreInstances must be an integer from ${CORE_INSTANCES.minimum} to ${CORE_INSTANCES.maximum}`,
     );
+  const policy = tenant.deletionPolicy;
+  if (policy !== undefined && !['Retain', 'Delete'].includes(policy))
+    throw new Error(
+      `Tenant ${tenant.name} deletionPolicy must be 'Retain' or 'Delete', not '${policy}'`,
+    );
 }
 /** The Tenant CR for one `tenants` config entry: everything but `name` is the spec. */
 export function tenantObject({ name, ...spec }: TenantDeclaration, installation: string): Resource {

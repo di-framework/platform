@@ -119,6 +119,26 @@ The order matters. If step 3 runs before the controller owns the value (step 2),
 `kubectl-set` leaves `WASH_CORE_INSTANCES` unowned, and the next apply sets `"100"`,
 rolling the host back from 300.
 
+### Tenant removal and namespace retention
+
+`spec.deletionPolicy` (`Retain` or `Delete`, default `Retain`) controls what happens when a
+tenant is removed from the platform config (or when its Tenant object is deleted). For data
+safety, `Retain` is the default: when a Tenant is deleted, the controller scales its workload
+to zero but keeps `di-tenant-<name>` and `di-runtime-<name>` namespaces and all their data
+on disk for recovery. Set `deletionPolicy: Delete` to have the controller delete the
+namespaces and data when the Tenant is deleted.
+
+To remove a tenant from the platform and clean up its namespaces in one step, set
+`deletionPolicy: Delete` in the same `pulumi up` that removes the tenant from the config,
+or in a preceding `pulumi up`. If you remove the tenant without setting the policy first,
+the namespaces and data will be retained. To then delete them, you must patch the Tenant
+object (not the declaration) with `deletionPolicy: Delete` and let the controller finish
+the deletion.
+
+Example: to remove a tenant called `alpha` and keep its data, remove it from your `tenants`
+list and run `pulumi up`. The `di-tenant-alpha` and `di-runtime-alpha` namespaces will
+remain. To clean them up later, set `deletionPolicy: Delete` before the next removal.
+
 #### Upgrading to a version that adds a Tenant spec field
 
 `pulumi up` cannot add a Tenant spec field to the CRD and set it on an existing Tenant in
