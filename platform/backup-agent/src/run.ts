@@ -38,6 +38,8 @@ export interface AgentRequest {
   region: string;
   pgUser: string;
   pgDatabase: string;
+  destinationType?: 's3' | 'pvc';
+  pvcMountPath?: string;
 }
 
 export interface ExecResult {
@@ -108,6 +110,8 @@ export function parseRequest(env: Record<string, string | undefined>): AgentRequ
     region: env.BACKUP_REGION ?? 'us-east-1',
     pgUser: env.PGUSER ?? 'app',
     pgDatabase: env.PGDATABASE ?? 'app',
+    destinationType: (env.BACKUP_DESTINATION_TYPE ?? 's3') as 's3' | 'pvc',
+    pvcMountPath: env.BACKUP_PVC_MOUNT_PATH,
   };
 }
 
@@ -134,6 +138,27 @@ async function copyToS3(
   return io.exec(['rclone', 'copyto', file, remote(request, name)], { env: rcloneEnv(request) });
 }
 
+async function copyToPvc(
+  io: AgentIo,
+  request: AgentRequest,
+  file: string,
+  name: string,
+): Promise<ExecResult> {
+  if (!request.pvcMountPath) {
+    return { code: 1, stdout: '', stderr: 'PVC mount path not set' };
+  }
+  const destDir = `${request.pvcMountPath}/${request.prefix}`;
+  const destFile = `${destDir}/${name}`;
+  try {
+    await io.mkdir(destDir);
+    const data = await io.readFile(file);
+    await io.writeFile(destFile, data);
+    return { code: 0, stdout: '', stderr: '' };
+  } catch (err) {
+    return { code: 1, stdout: '', stderr: String(err) };
+  }
+}
+
 function manifest(tool: string, format: string, digest: string): string {
   return JSON.stringify({
     apiVersion: 'platform.di-framework.dev/v1alpha1',
@@ -156,10 +181,11 @@ async function uploadDump(
   const digest = sha256Prefixed(bytes);
   const meta = `${request.workdir}/manifest.json`;
   await io.writeFile(meta, manifest(tool, format, digest));
-  const data = await copyToS3(io, request, file, name);
+  const copy = request.destinationType === 'pvc' ? copyToPvc : copyToS3;
+  const data = await copy(io, request, file, name);
   if (data.code !== 0)
     return finish(io, request.terminationLog, { ok: false, error: 'UploadFailed' });
-  const side = await copyToS3(io, request, meta, 'manifest.json');
+  const side = await copy(io, request, meta, 'manifest.json');
   if (side.code !== 0)
     return finish(io, request.terminationLog, { ok: false, error: 'UploadFailed' });
   return finish(io, request.terminationLog, {
@@ -336,12 +362,34 @@ async function probe(io: AgentIo, request: AgentRequest): Promise<number> {
   });
 }
 
+async function downloadFromPvc(
+  io: AgentIo,
+  request: AgentRequest,
+  name: string,
+  file: string,
+): Promise<number | undefined> {
+  if (!request.pvcMountPath) {
+    return finish(io, request.terminationLog, { ok: false, error: 'PvcMountPathNotSet' });
+  }
+  try {
+    const srcFile = `${request.pvcMountPath}/${request.prefix}/${name}`;
+    const data = await io.readFile(srcFile);
+    await io.writeFile(file, data);
+    return undefined;
+  } catch (_err) {
+    return finish(io, request.terminationLog, { ok: false, error: 'DownloadFailed' });
+  }
+}
+
 async function download(
   io: AgentIo,
   request: AgentRequest,
   name: string,
   file: string,
 ): Promise<number | undefined> {
+  if (request.destinationType === 'pvc') {
+    return downloadFromPvc(io, request, name, file);
+  }
   const result = await io.exec(['rclone', 'copyto', remote(request, name), file], {
     env: rcloneEnv(request),
   });
@@ -412,7 +460,29 @@ async function restoreNats(io: AgentIo, request: AgentRequest): Promise<number> 
   return finish(io, request.terminationLog, { ok: true, tool: 'nats', format: 'account-backup' });
 }
 
+async function gcPvc(io: AgentIo, request: AgentRequest): Promise<number> {
+  if (!request.pvcMountPath) {
+    return finish(io, request.terminationLog, { ok: false, error: 'PvcMountPathNotSet' });
+  }
+  const keys = request.gcKeys
+    .split('\n')
+    .map((key) => key.trim())
+    .filter(Boolean);
+  for (const key of keys) {
+    const file = `${request.pvcMountPath}/${key}`;
+    try {
+      await io.remove(file);
+    } catch (_err) {
+      return finish(io, request.terminationLog, { ok: false, error: 'GcFailed' });
+    }
+  }
+  return finish(io, request.terminationLog, { ok: true, tool: 'rm', format: 'delete' });
+}
+
 async function gc(io: AgentIo, request: AgentRequest): Promise<number> {
+  if (request.destinationType === 'pvc') {
+    return gcPvc(io, request);
+  }
   if (!request.bucket)
     return finish(io, request.terminationLog, { ok: false, error: 'MissingBucket' });
   const keys = request.gcKeys

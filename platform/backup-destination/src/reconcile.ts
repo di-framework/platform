@@ -125,15 +125,21 @@ export function jobBody(input: {
   const service = input.service;
   const kind = input.agentKind;
   const storage = input.storage ?? service?.storage ?? '1Gi';
+  const dest = input.world.destination;
+  const destType = dest?.spec.type ?? 's3';
   const env: { name: string; value?: string; valueFrom?: unknown }[] = [
     { name: 'BACKUP_KIND', value: kind },
-    { name: 'BACKUP_BUCKET', value: input.world.destination?.spec.bucket ?? '' },
+    { name: 'BACKUP_BUCKET', value: dest?.spec.bucket ?? '' },
     { name: 'BACKUP_OBJECT_PREFIX', value: input.objectPrefix },
-    { name: 'BACKUP_REGION', value: input.world.destination?.spec.region || 'us-east-1' },
+    { name: 'BACKUP_REGION', value: dest?.spec.region || 'us-east-1' },
     { name: 'BACKUP_WORKDIR', value: '/tmp' },
+    { name: 'BACKUP_DESTINATION_TYPE', value: destType },
   ];
-  if (input.world.destination?.spec.endpoint) {
-    env.push({ name: 'BACKUP_ENDPOINT', value: input.world.destination.spec.endpoint });
+  if (destType === 'pvc') {
+    env.push({ name: 'BACKUP_PVC_MOUNT_PATH', value: '/backup-pvc' });
+  }
+  if (dest?.spec.endpoint) {
+    env.push({ name: 'BACKUP_ENDPOINT', value: dest.spec.endpoint });
   }
   if (service) {
     env.push(
@@ -197,10 +203,25 @@ export function jobBody(input: {
               },
               terminationMessagePath: '/dev/termination-log',
               terminationMessagePolicy: 'File',
-              volumeMounts: [{ name: 'scratch', mountPath: '/tmp' }],
+              volumeMounts: [
+                { name: 'scratch', mountPath: '/tmp' },
+                ...(destType === 'pvc' ? [{ name: 'backup-pvc', mountPath: '/backup-pvc' }] : []),
+              ],
             },
           ],
-          volumes: [{ name: 'scratch', emptyDir: { sizeLimit: scratch(storage, kind) } }],
+          volumes: [
+            { name: 'scratch', emptyDir: { sizeLimit: scratch(storage, kind) } },
+            ...(destType === 'pvc'
+              ? [
+                  {
+                    name: 'backup-pvc',
+                    persistentVolumeClaim: {
+                      claimName: dest?.spec.existingClaimName || 'di-backup-pvc',
+                    },
+                  },
+                ]
+              : []),
+          ],
         },
       },
     },
@@ -387,13 +408,27 @@ export function reconcile(world: World): Action[] {
     );
     return actions;
   }
-  const secretName = dest.spec.credentialsSecretRef?.name ?? '';
-  const keys = new Set(world.credentialKeys);
-  if (!secretName || !keys.has('AWS_ACCESS_KEY_ID') || !keys.has('AWS_SECRET_ACCESS_KEY')) {
-    actions.push(condition(status, 'CredentialsInvalid', 'S3 credentials are missing', false));
-    return actions;
+  if (dest.spec.type === 's3') {
+    const secretName = dest.spec.credentialsSecretRef?.name ?? '';
+    const keys = new Set(world.credentialKeys);
+    if (!secretName || !keys.has('AWS_ACCESS_KEY_ID') || !keys.has('AWS_SECRET_ACCESS_KEY')) {
+      actions.push(condition(status, 'CredentialsInvalid', 'S3 credentials are missing', false));
+      return actions;
+    }
+    if (!world.runtimeSecretPresent) actions.push({ type: 'copy-credentials', secretName });
+  } else if (dest.spec.type === 'pvc') {
+    if (!dest.spec.existingClaimName && !dest.spec.volumeClaimTemplate?.size) {
+      actions.push(
+        condition(
+          status,
+          'ConfigInvalid',
+          'PVC destination must have existingClaimName or volumeClaimTemplate.size',
+          false,
+        ),
+      );
+      return actions;
+    }
   }
-  if (!world.runtimeSecretPresent) actions.push({ type: 'copy-credentials', secretName });
   const wanted = dest.spec.extraEgress ?? [];
   if (JSON.stringify(world.networkEgress) !== JSON.stringify(wanted)) {
     actions.push({ type: 'sync-egress', extraEgress: wanted });

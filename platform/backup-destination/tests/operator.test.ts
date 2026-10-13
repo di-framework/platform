@@ -31,6 +31,7 @@ function world(overrides: Partial<World> = {}): World {
       generation: 2,
       annotations: {},
       spec: {
+        type: 's3',
         bucket: 'tenant-alpha-backups',
         credentialsSecretRef: { name: 'di-backup-s3' },
         schedule: '0 2 * * *',
@@ -1094,5 +1095,74 @@ describe('kubernetes client', () => {
     await applyActions(client, world({ destination: undefined }), [
       { type: 'destination-status', status: {} },
     ]);
+  });
+
+  test('rejects PVC destination without existingClaimName or volumeClaimTemplate.size', () => {
+    const actions = reconcile(
+      world({
+        destination: {
+          name: 'default',
+          generation: 2,
+          annotations: {},
+          spec: {
+            type: 'pvc',
+          },
+          status: {},
+        },
+      }),
+    );
+    expect(JSON.stringify(actions)).toContain('ConfigInvalid');
+    expect(JSON.stringify(actions)).toContain('existingClaimName or volumeClaimTemplate.size');
+  });
+
+  test('accepts PVC destination with existingClaimName', () => {
+    const actions = reconcile(
+      world({
+        services: [orders],
+        destination: {
+          name: 'default',
+          generation: 2,
+          annotations: { 'platform.di-framework.dev/backup-now': '2026-09-28T15:00:00.000Z' },
+          spec: {
+            type: 'pvc',
+            existingClaimName: 'my-backup-pvc',
+            schedule: '0 2 * * *',
+          },
+          status: {},
+        },
+      }),
+    );
+    expect(actions.some((action) => action.type === 'create-backup')).toBe(true);
+    const job = actions.find((action) => action.type === 'create-job');
+    expect(job && job.type === 'create-job' && JSON.stringify(job.body)).toContain(
+      'BACKUP_DESTINATION_TYPE',
+    );
+    expect(job && job.type === 'create-job' && JSON.stringify(job.body)).toContain('pvc');
+    expect(job && job.type === 'create-job' && JSON.stringify(job.body)).toContain('my-backup-pvc');
+    expect(job && job.type === 'create-job' && JSON.stringify(job.body)).toContain(
+      'BACKUP_PVC_MOUNT_PATH',
+    );
+  });
+
+  test('accepts PVC destination with volumeClaimTemplate', () => {
+    const actions = reconcile(
+      world({
+        services: [orders],
+        destination: {
+          name: 'default',
+          generation: 2,
+          annotations: { 'platform.di-framework.dev/backup-now': '2026-09-28T15:00:00.000Z' },
+          spec: {
+            type: 'pvc',
+            volumeClaimTemplate: { size: '100Gi' },
+            schedule: '0 2 * * *',
+          },
+          status: {},
+        },
+      }),
+    );
+    expect(actions.some((action) => action.type === 'create-backup')).toBe(true);
+    const job = actions.find((action) => action.type === 'create-job');
+    expect(job && job.type === 'create-job' && JSON.stringify(job.body)).toContain('di-backup-pvc');
   });
 });

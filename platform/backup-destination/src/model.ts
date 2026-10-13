@@ -13,11 +13,17 @@ export interface Egress {
 }
 
 export interface DestinationSpec {
-  bucket: string;
+  type: 's3' | 'pvc';
+  bucket?: string;
   prefix?: string;
   region?: string;
   endpoint?: string;
   credentialsSecretRef?: { name?: string };
+  existingClaimName?: string;
+  volumeClaimTemplate?: {
+    storageClassName?: string;
+    size?: string;
+  };
   schedule?: string;
   retention?: { successful?: number };
   extraEgress?: Egress[];

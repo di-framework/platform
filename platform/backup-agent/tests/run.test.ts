@@ -100,6 +100,16 @@ describe('termination and request parsing', () => {
       pgUser: 'app',
       pgDatabase: 'app',
     });
+    const pvc = parseRequest({
+      BACKUP_KIND: 'postgres',
+      BACKUP_DESTINATION_TYPE: 'pvc',
+      BACKUP_PVC_MOUNT_PATH: '/mnt/backup',
+    });
+    expect(pvc).toMatchObject({
+      kind: 'postgres',
+      destinationType: 'pvc',
+      pvcMountPath: '/mnt/backup',
+    });
   });
 
   test('rclone env enables path-style only when an endpoint is set', () => {
@@ -360,6 +370,176 @@ describe('backup-agent kinds', () => {
     const bucket = harness(() => ok());
     expect(await runAgent(request({ kind: 'gc', bucket: '' }), bucket.io)).toBe(1);
     expect(wrote(files, '/work/termination')).toContain('"format":"delete"');
+  });
+
+  test('PVC destination dumps, downloads, and gcs', async () => {
+    const postgres = harness((argv) => {
+      if (argv[0] === 'pg_dump') {
+        postgres.files.set(argv[argv.indexOf('-f') + 1] ?? '', Buffer.from('dump data'));
+      }
+      return ok();
+    });
+    const dump = await runAgent(
+      request({
+        kind: 'postgres',
+        destinationType: 'pvc',
+        pvcMountPath: '/mnt/backup',
+      }),
+      postgres.io,
+    );
+    expect(dump).toBe(0);
+    const record = JSON.parse(wrote(postgres.files, '/work/termination')) as { ok: boolean };
+    expect(record.ok).toBe(true);
+
+    const restore = harness(() => ok());
+    restore.files.set(
+      '/mnt/backup/di-framework/alpha/orders/uid/20260927T020012Z/data.dump',
+      Buffer.from('dump data'),
+    );
+    const code = await runAgent(
+      request({
+        kind: 'restore-postgres',
+        destinationType: 'pvc',
+        pvcMountPath: '/mnt/backup',
+      }),
+      restore.io,
+    );
+    expect(code).toBe(0);
+
+    const gc = harness(() => ok());
+    gc.files.set('/mnt/backup/key1', Buffer.from(''));
+    const gcCode = await runAgent(
+      request({
+        kind: 'gc',
+        gcKeys: 'key1',
+        destinationType: 'pvc',
+        pvcMountPath: '/mnt/backup',
+      }),
+      gc.io,
+    );
+    expect(gcCode).toBe(0);
+    const gcRecord = JSON.parse(wrote(gc.files, '/work/termination')) as { tool: string };
+    expect(gcRecord.tool).toBe('rm');
+  });
+
+  test('PVC download without mount path fails', async () => {
+    const missing = harness(() => ok());
+    const code = await runAgent(
+      request({
+        kind: 'restore-postgres',
+        destinationType: 'pvc',
+        pvcMountPath: undefined,
+      }),
+      missing.io,
+    );
+    expect(code).toBe(1);
+    expect(wrote(missing.files, '/work/termination')).toContain('PvcMountPathNotSet');
+  });
+
+  test('PVC gc without mount path fails', async () => {
+    const missing = harness(() => ok());
+    const code = await runAgent(
+      request({
+        kind: 'gc',
+        gcKeys: 'key1',
+        destinationType: 'pvc',
+        pvcMountPath: undefined,
+      }),
+      missing.io,
+    );
+    expect(code).toBe(1);
+    expect(wrote(missing.files, '/work/termination')).toContain('PvcMountPathNotSet');
+  });
+
+  test('PVC download from missing file fails', async () => {
+    const missing = harness(() => ok());
+    const code = await runAgent(
+      request({
+        kind: 'restore-postgres',
+        destinationType: 'pvc',
+        pvcMountPath: '/mnt/backup',
+        prefix: 'missing',
+      }),
+      missing.io,
+    );
+    expect(code).toBe(1);
+    expect(wrote(missing.files, '/work/termination')).toContain('DownloadFailed');
+  });
+
+  test('PVC gc with remove error fails', async () => {
+    const files = new Map<string, Uint8Array>();
+    const failing: AgentIo = {
+      async exec() {
+        return ok();
+      },
+      async readFile() {
+        throw new Error('should not be called');
+      },
+      async writeFile(path, data) {
+        // Allow writing the termination log
+        files.set(path, typeof data === 'string' ? Buffer.from(data) : Buffer.from(data));
+      },
+      async remove() {
+        throw new Error('remove failed');
+      },
+      async mkdir() {
+        throw new Error('should not be called');
+      },
+    };
+    const code = await runAgent(
+      request({
+        kind: 'gc',
+        gcKeys: 'key1',
+        destinationType: 'pvc',
+        pvcMountPath: '/mnt/backup',
+      }),
+      failing,
+    );
+    expect(code).toBe(1);
+    expect(wrote(files, '/work/termination')).toContain('GcFailed');
+  });
+
+  test('PVC dump with writeFile error in PVC fails', async () => {
+    const files = new Map<string, Uint8Array>();
+    let writeCount = 0;
+    const failing: AgentIo = {
+      async exec(argv) {
+        if (argv[0] === 'pg_dump') {
+          // Create the dump file
+          files.set('/work/data.dump', Buffer.from('dump data'));
+          return ok();
+        }
+        return ok();
+      },
+      async readFile(path) {
+        const value = files.get(path);
+        if (!value) throw new Error(`missing ${path}`);
+        return value;
+      },
+      async writeFile(path) {
+        writeCount += 1;
+        if (writeCount > 1 && path.includes('/mnt/backup')) {
+          // Fail on PVC writes
+          throw new Error('pvc write failed');
+        }
+        files.set(path, Buffer.from(''));
+      },
+      async remove() {
+        throw new Error('remove failed');
+      },
+      async mkdir(path) {
+        files.set(`${path}/.dir`, Buffer.from(''));
+      },
+    };
+    const code = await runAgent(
+      request({
+        kind: 'postgres',
+        destinationType: 'pvc',
+        pvcMountPath: '/mnt/backup',
+      }),
+      failing,
+    );
+    expect(code).toBe(1);
   });
 });
 

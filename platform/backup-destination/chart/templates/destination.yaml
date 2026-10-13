@@ -1,12 +1,22 @@
+{{- $type := .Values.type -}}
 {{- $secret := .Values.existingSecret -}}
+{{- $createSecret := false -}}
+{{- if eq $type "s3" -}}
 {{- if and (not $secret) .Values.accessKeyId .Values.secretAccessKey -}}
 {{- $secret = "di-backup-s3" -}}
+{{- $createSecret = true -}}
 {{- end -}}
 {{- if not .Values.bucket -}}
-{{- fail "bucket is required" -}}
+{{- fail "bucket is required for S3 destination type" -}}
 {{- end -}}
 {{- if not $secret -}}
-{{- fail "existingSecret is required (demo accessKeyId and secretAccessKey are not for shared tenants)" -}}
+{{- fail "existingSecret is required for S3 (demo accessKeyId and secretAccessKey are not for shared tenants)" -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $type "pvc" -}}
+{{- if and (not .Values.existingClaimName) (not .Values.volumeClaimTemplate.size) -}}
+{{- fail "either existingClaimName or volumeClaimTemplate.size is required for PVC destination type" -}}
+{{- end -}}
 {{- end -}}
 apiVersion: platform.di-framework.dev/v1alpha1
 kind: BackupDestination
@@ -14,6 +24,8 @@ metadata:
   name: default
   namespace: {{ .Release.Namespace }}
 spec:
+  type: {{ $type | quote }}
+  {{- if eq $type "s3" }}
   bucket: {{ .Values.bucket | quote }}
   {{- if .Values.prefix }}
   prefix: {{ .Values.prefix | quote }}
@@ -24,14 +36,49 @@ spec:
   {{- end }}
   credentialsSecretRef:
     name: {{ $secret | quote }}
+  {{- else if eq $type "pvc" }}
+  {{- if .Values.existingClaimName }}
+  existingClaimName: {{ .Values.existingClaimName | quote }}
+  {{- end }}
+  {{- if .Values.volumeClaimTemplate.size }}
+  volumeClaimTemplate:
+    {{- if .Values.volumeClaimTemplate.storageClassName }}
+    storageClassName: {{ .Values.volumeClaimTemplate.storageClassName | quote }}
+    {{- end }}
+    size: {{ .Values.volumeClaimTemplate.size | quote }}
+  {{- end }}
+  {{- end }}
+  {{- if .Values.schedule }}
   schedule: {{ .Values.schedule | quote }}
+  {{- end }}
+  {{- if .Values.retentionSuccessful }}
   retention:
     successful: {{ .Values.retentionSuccessful }}
+  {{- end }}
   {{- if .Values.extraEgress }}
   extraEgress:
     {{- toYaml .Values.extraEgress | nindent 4 }}
   {{- end }}
-{{- if and (not .Values.existingSecret) .Values.accessKeyId .Values.secretAccessKey }}
+{{- if and (eq $type "pvc") .Values.volumeClaimTemplate.size (not .Values.existingClaimName) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: di-backup-pvc
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.volumeClaimTemplate.storageClassName }}
+  storageClassName: {{ .Values.volumeClaimTemplate.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.volumeClaimTemplate.size | quote }}
+{{- end }}
+{{- if $createSecret }}
 ---
 apiVersion: v1
 kind: Secret

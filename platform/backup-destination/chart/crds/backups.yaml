@@ -23,8 +23,11 @@ spec:
           properties:
             spec:
               type: object
-              required: [bucket, credentialsSecretRef]
+              required: [type]
               properties:
+                type:
+                  type: string
+                  enum: ['s3', 'pvc']
                 bucket: { type: string, minLength: 1 }
                 prefix:
                   type: string
@@ -40,9 +43,14 @@ spec:
                       message: HTTP is only allowed for cluster-local endpoints
                 credentialsSecretRef:
                   type: object
-                  required: [name]
                   properties:
                     name: { type: string, minLength: 1 }
+                existingClaimName: { type: string, minLength: 1 }
+                volumeClaimTemplate:
+                  type: object
+                  properties:
+                    storageClassName: { type: string }
+                    size: { type: string }
                 schedule: { type: string }
                 retention:
                   type: object
