@@ -42,14 +42,14 @@
   "dependencies": {
     "@kubernetes/client-node": "2.0.0",
     "@pulumi/command": "1.2.1",
-    "@pulumi/kubernetes": "4.34.0",
-    "@pulumi/pulumi": "3.261.0",
+    "@pulumi/kubernetes": "4.34.2",
+    "@pulumi/pulumi": "3.268.0",
     "js-yaml": "4.3.2"
   },
   "devDependencies": {
     "@marcbachmann/cel-js": "^8.0.0",
     "@types/js-yaml": "4.0.9",
-    "@types/node": "26.1.2"
+    "@types/node": "26.6.5"
   },
   "typesVersions": {
     "*": {
