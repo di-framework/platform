@@ -12,6 +12,10 @@
  * controller's registry front (8790), which terminates it with the same certificate and forwards
  * to the tenant hosts; plain HTTP to that host is refused, so registry credentials never cross
  * plain HTTP outside the cluster.
+ *
+ * Admin route aliases (#217) send a plain HTTP tenant route to another tenant's route host. They
+ * never apply to the console, controller or registry hosts, or to TLS passthrough, and an unusable
+ * alias fails closed with 502 rather than reaching the original tenant.
  */
 import {
   Agent,
@@ -56,7 +60,11 @@ export interface GatewayOptions {
   controllerUpstream?: (tenant: string) => Upstream;
   /** Where a registry TLS connection is sent; only overridden by tests. */
   registryUpstream?: (tenant: string) => Upstream;
-  /** Maps public route (host.tenant) to target route (host.tenant); must be validated at install. */
+  /**
+   * Admin route aliases (#217): `<route-host>.<tenant>` to `<route-host>.<tenant>`, lower-case,
+   * validated at install. Applied to plain HTTP tenant routes only, never to the console,
+   * controller or registry hosts or to TLS passthrough.
+   */
   routeAliases?: Record<string, string>;
   /** Edge only: time a new connection has to send enough bytes to be classified (default 10 s). */
   classifyTimeoutMs?: number;
@@ -83,59 +91,63 @@ function invalid(reason: string): Route {
   return { kind: 'invalid', reason };
 }
 
+/** Strict DNS-1123 label: alias route hosts may not use the `_` that Host routing tolerates. */
+const DNS_LABEL = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+
 /**
- * Parse a route identifier like "host.tenant" from a request or configuration string.
- * Returns { host, tenant } if valid, undefined otherwise.
- * The host can be a dot-separated label sequence (e.g., "api.v2"), but there must be exactly
- * one tenant label at the end.
+ * Route hosts an alias may never use on either side: the fixed tenant-auth labels, plus whatever
+ * labels `tenantAuthRoutes` configures. Those hosts are served by the console, controller or
+ * registry, never by tenant workloads.
  */
-export function parseRoute(routeId: string): { host: string; tenant: string } | undefined {
-  const lower = routeId.toLowerCase();
-  const labels = lower.split('.');
-  if (labels.length < 2) return undefined;
+export const RESERVED_ROUTE_HOSTS = ['console', 'controller', 'registry'] as const;
 
-  const tenant = labels[labels.length - 1] as string;
-  const hostLabels = labels.slice(0, -1);
+export function reservedRouteHosts(routes?: {
+  console?: string;
+  controller?: string;
+  registry?: string;
+}): Set<string> {
+  const configured = Object.values(routes ?? {}).filter((v) => typeof v === 'string');
+  return new Set<string>([...RESERVED_ROUTE_HOSTS, ...configured]);
+}
 
-  // Validate tenant: must be a valid tenant name
-  if (tenant.length === 0 || tenant.length > 40 || !TENANT_NAME.test(tenant)) {
+/**
+ * Parse an alias side, `<route-host>.<tenant>` (case-insensitive), into its route host and tenant.
+ * The tenant is the last label; the route host is every label before it, each a DNS-1123 label.
+ * Anything else, including a non-string, is `undefined`.
+ */
+export function parseRoute(routeId: unknown): { host: string; tenant: string } | undefined {
+  if (typeof routeId !== 'string') return undefined;
+  const labels = routeId.toLowerCase().split('.');
+  const tenant = labels.pop() as string;
+  const host = labels.join('.');
+  if (labels.length === 0 || tenant.length > 40 || !TENANT_NAME.test(tenant)) return undefined;
+  if (host.length > 253 || !labels.every((l) => l.length <= 63 && DNS_LABEL.test(l)))
     return undefined;
-  }
-
-  // Validate host: each label must be valid, host combined must be valid
-  const host = hostLabels.join('.');
-  if (
-    host.length === 0 ||
-    host.length > 253 ||
-    !hostLabels.every((label) => label.length > 0 && label.length <= 63 && LABEL.test(label))
-  ) {
-    return undefined;
-  }
-
   return { host, tenant };
 }
 
 /**
- * Resolve an alias if one matches. Given a route { host, tenant }, return the target route
- * if an alias matches, or the original route if not.
+ * The route a tenant route is aliased to: `route` itself when no alias names it, the alias target
+ * when one does, or `undefined` when the alias that names it is unusable (the alias map or the
+ * target is malformed, or the target is a reserved route host). Callers fail closed on
+ * `undefined`, so a broken alias never falls back to the original tenant. Never throws.
  */
 export function resolveAlias(
   route: { host: string; tenant: string },
-  aliases?: Record<string, string>,
-): { host: string; tenant: string } {
-  if (!aliases) return route;
+  aliases: unknown,
+  tenantAuthRoutes?: { console?: string; controller?: string; registry?: string },
+): { host: string; tenant: string } | undefined {
+  if (aliases === undefined || aliases === null) return route;
+  if (typeof aliases !== 'object' || Array.isArray(aliases)) return undefined;
   const key = `${route.host}.${route.tenant}`.toLowerCase();
-  const target = aliases[key];
-  if (!target) return route;
-  const parsed = parseRoute(target);
-  return parsed ?? route;
+  if (!Object.hasOwn(aliases, key)) return route;
+  const target = parseRoute((aliases as Record<string, unknown>)[key]);
+  if (!target || reservedRouteHosts(tenantAuthRoutes).has(target.host)) return undefined;
+  return target;
 }
 
 /** Pure routing decision from the request Host header. */
-export function routeRequest(
-  hostHeader: string | undefined,
-  aliases?: Record<string, string>,
-): Route {
+export function routeRequest(hostHeader: string | undefined): Route {
   if (!hostHeader) return invalid('missing Host header');
   const value = hostHeader.toLowerCase();
   if (value.startsWith('['))
@@ -151,9 +163,7 @@ export function routeRequest(
   if (labels.length < 3 || labels[labels.length - 1] !== 'localhost') return { kind: 'default' };
   const tenant = labels[labels.length - 2] as string;
   if (tenant.length > 40 || !TENANT_NAME.test(tenant)) return { kind: 'default' };
-  const route = { host: labels.slice(0, -2).join('.'), tenant };
-  const resolved = resolveAlias(route, aliases);
-  return { kind: 'tenant', ...resolved };
+  return { kind: 'tenant', tenant, host: labels.slice(0, -2).join('.') };
 }
 
 export function tenantUpstream(tenant: string): Upstream {
@@ -245,7 +255,8 @@ function passThrough(socket: Socket, hello: Buffer, options: GatewayOptions): vo
     console.error(
       `${socket.remoteAddress}: closing a TLS connection whose ClientHello has no readable server name (malformed, or split across records)`,
     );
-  const route = routeRequest(name, options.routeAliases);
+  // Route aliases are for plain HTTP tenant routes only; TLS passthrough never consults them.
+  const route = routeRequest(name);
   const routes = options.tenantAuthRoutes;
   const upstreamFor =
     route.kind !== 'tenant'
@@ -365,30 +376,41 @@ function pairs(raw: string[]): [string, string][] {
 
 class UpstreamTimeout extends Error {}
 
+type Rejection = { error: string; status: 400 | 502 };
+
+const STATUS_TEXT = { 400: 'Bad Request', 502: 'Bad Gateway' } as const;
+
 /** Resolve the route for a request, or explain why it is rejected. */
 function target(
   req: IncomingMessage,
   options: GatewayOptions,
-): { route: Exclude<Route, { kind: 'invalid' }>; upstream: Upstream } | { error: string } {
+): { route: Exclude<Route, { kind: 'invalid' }>; upstream: Upstream } | Rejection {
   // Absolute-form targets carry their own authority; only origin-form is routed by Host.
-  if (!req.url?.startsWith('/')) return { error: 'malformed request target' };
-  const route = routeRequest(req.headers.host, options.routeAliases);
-  if (route.kind === 'invalid') return { error: route.reason };
-  if (route.kind === 'tenant' && options.tenantAuthRoutes?.controller === route.host)
-    return { error: 'the controller host is served over TLS only' };
-  if (route.kind === 'tenant' && options.tenantAuthRoutes?.registry === route.host)
-    return { error: 'the registry host is served over TLS only' };
-  if (route.kind === 'tenant' && options.tenantAuthRoutes?.console === route.host)
+  if (!req.url?.startsWith('/')) return { error: 'malformed request target', status: 400 };
+  const route = routeRequest(req.headers.host);
+  if (route.kind === 'invalid') return { error: route.reason, status: 400 };
+  if (route.kind !== 'tenant') return { route, upstream: options.defaultUpstream };
+  const routes = options.tenantAuthRoutes;
+  if (routes?.controller === route.host)
+    return { error: 'the controller host is served over TLS only', status: 400 };
+  if (routes?.registry === route.host)
+    return { error: 'the registry host is served over TLS only', status: 400 };
+  if (routes?.console === route.host)
     // The console builds its links from its public URL, so it keeps the original Host.
     return {
       route: { kind: 'console', tenant: route.tenant },
       upstream: (options.consoleUpstream ?? consoleUpstream)(route.tenant),
     };
-  const upstream =
-    route.kind === 'tenant'
-      ? (options.tenantUpstream ?? tenantUpstream)(route.tenant)
-      : options.defaultUpstream;
-  return { route, upstream };
+  const aliased = resolveAlias(route, options.routeAliases, routes);
+  if (!aliased) {
+    // Fail closed: a broken alias must never send traffic back to the original tenant.
+    console.error(`${route.host}.${route.tenant}: route alias is unusable`);
+    return { error: 'route alias is unusable', status: 502 };
+  }
+  return {
+    route: { kind: 'tenant', ...aliased },
+    upstream: (options.tenantUpstream ?? tenantUpstream)(aliased.tenant),
+  };
 }
 
 export function createGateway(options: GatewayOptions): Server {
@@ -398,7 +420,7 @@ export function createGateway(options: GatewayOptions): Server {
     const resolved = target(req, options);
     if ('error' in resolved) {
       req.resume();
-      respond(res, 400, `Bad Request: ${resolved.error}\n`);
+      respond(res, resolved.status, `${STATUS_TEXT[resolved.status]}: ${resolved.error}\n`);
       return;
     }
     const proxy = request({
@@ -434,7 +456,8 @@ export function createGateway(options: GatewayOptions): Server {
     socket.on('error', () => socket.destroy());
     const resolved = target(req, options);
     if ('error' in resolved) {
-      socket.end(rawHead(400, 'Bad Request', [['connection', 'close']]));
+      const { status } = resolved;
+      socket.end(rawHead(status, STATUS_TEXT[status], [['connection', 'close']]));
       return;
     }
     const proxy = request({

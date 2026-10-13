@@ -172,7 +172,8 @@ allowlisted registry and pull everything else over TLS. Check three things befor
 `kubeconfig` is required (a local file path); `context`, `namespace`, `release`,
 `chart`, `chartVersion`, `httpNodePort`, `timeoutSeconds`, `insecureRegistry`, `insecureRegistries`,
 `storageRoot`, `networkPolicyEngine`, `kubernetesEndpoint`, `httpEndpoint`, `routeUrlPattern`,
-`egressAllowedDestinations`, and administrator `values` are optional. `tenants`, `users`,
+`egressAllowedDestinations`, `routeAliases` (see [Gateway route aliases](#gateway-route-aliases)),
+and administrator `values` are optional. `tenants`, `users`,
 `tenantHostImage`, and `tenantHostImagePullPolicy` use the same declarations as the
 local entrypoint. NodePort zero makes the HTTP gateway ClusterIP. Registry installation is off
 for existing clusters. `insecureRegistry` gives the platform host group
@@ -516,6 +517,67 @@ ClusterIP backend.
   9191. The gateway's own policy limits its egress to cluster DNS and host group port 9191
   in this installation's namespaces. The pod runs as non-root with a read-only root, drops
   all capabilities and mounts no ServiceAccount token.
+
+#### Gateway route aliases
+
+An administrator can point a public `<route-host>.<tenant>` pair at another tenant's route host
+(#217). Set it with the top-level config key `routeAliases`, an object from source to target:
+
+```yaml
+# Pulumi.<stack>.yaml
+config:
+  di-framework-kube:routeAliases:
+    identity.identity: identity.identity-pg
+```
+
+or `pulumi config set --path 'routeAliases["identity.identity"]' identity.identity-pg`.
+`createPlatform` also takes `routeAliases` in `PlatformArgs`, which wins over config. Only the
+top-level key is read: a `gateway` key (nested `gateway.routeAliases`, or the literal dotted key)
+fails the deploy instead of being ignored. Tenants cannot see or change aliases.
+
+`Host: identity.identity.localhost:28280` then reaches
+`di-http.di-runtime-identity-pg.svc.cluster.local` with `Host: identity`, and
+`X-Forwarded-Host` still carries the original `identity.identity.localhost:28280`, so a workload
+that derives URLs (an OAuth `iss`, redirects) from it keeps the public name. The target tenant
+must serve the same route-host workload (`identity` here); the gateway rewrites only the tenant.
+
+Validation runs in `pulumi up`, before any resource changes, and an invalid map fails the deploy:
+
+- the value is an object whose values are strings; anything else (a nested object, an array,
+  non-JSON) is refused;
+- both sides are `<route-host>.<tenant>`: the tenant is the last label and a valid tenant name,
+  the route host is one or more strict DNS-1123 labels (`a-z`, `0-9`, `-`, no `_`, at most 63
+  characters each). Host routing itself still accepts `_`, so such a host cannot be aliased;
+- neither side's route host is `console`, `controller`, `registry`, or a route host configured
+  through `tenantAuth`;
+- the target tenant is declared in `tenants`. Tenants the platform does not declare are not known
+  at install, so they cannot be targets;
+- no chains or cycles: a target cannot be another alias's source. A self-alias is a no-op;
+- sources are case-insensitive, so two sources differing only in case are refused.
+
+The deployed map is lower-cased with sorted keys, so reordering or re-casing keys changes nothing.
+Aliases apply to plain HTTP tenant routes only. The console, controller and registry routes and
+TLS passthrough (routed by SNI) never consult them. If the gateway is ever handed an unusable alias
+(a malformed map or target, or a reserved target), it fails closed with `502` for that host and
+never falls back to the original tenant.
+
+**Cutover and rollback.** For the identity cutover, declare `identity-pg` in `tenants`, deploy the
+identity workload there, then add `identity.identity: identity.identity-pg` and run `pulumi up`. To
+roll back, remove the alias and run `pulumi up` again; the original route returns. Each change
+updates the gateway's `GATEWAY_CONFIG` and its `di-framework.dev/config-hash` annotation, so the
+`di-platform-gateway` pod rolls. The switch takes effect when that rollout completes
+(`kubectl rollout status deploy/di-platform-gateway -n <namespace>`): the old pod keeps routing
+until the new one is Ready, then on SIGTERM it stops accepting connections, closes idle keep-alive
+connections and lets in-flight requests finish. Switching is near-immediate, not instant, and no
+pooled upstream connection outlives the old pod. Upgrading to the release that adds the
+annotation rolls the gateway once.
+
+**`di-framework-kube up` does not pass this key yet.** Its `platform.json` allowlist rejects
+`routeAliases` (`unsupported platform config key`), and every `up` rebuilds the stack config from
+that allowlist, so an alias set by hand with `pulumi config set` is wiped by the next `up`, which
+silently rolls a cutover back. Until di-framework/kube#9 ships, set aliases with `pulumi up` on the
+stack directly and do not run `di-framework-kube up` in between. Once it ships, put the same
+object in `platform.json` as `"routeAliases": { "identity.identity": "identity.identity-pg" }`.
 
 `routeUrlPattern` (`http://{host}.{tenant}.localhost:<httpPort>`) is exported by the local
 entrypoint and returned by `createPlatform`. The existing-cluster entrypoint takes it from

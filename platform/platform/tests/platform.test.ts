@@ -522,3 +522,131 @@ test('local entrypoint rejects a container CLI with shell metacharacters', () =>
     'containerCli must be a plain command name or path',
   );
 }, 60_000);
+
+/**
+ * Runs `createPlatform` with `config` (unprefixed keys; non-strings are JSON-encoded) and extra
+ * `args` source, and returns the gateway Deployment's GATEWAY_CONFIG and config hash, or the error.
+ */
+function gatewayInstall(
+  config: Record<string, unknown>,
+  args = '',
+): {
+  gatewayConfig?: { routeAliases?: Record<string, string> };
+  configHash?: string;
+  error?: string;
+} {
+  const prefixed = Object.fromEntries(
+    Object.entries({ tenants: [{ name: 'identity' }, { name: 'identity-pg' }], ...config }).map(
+      ([key, value]) => [
+        `project:${key}`,
+        typeof value === 'string' ? value : JSON.stringify(value),
+      ],
+    ),
+  );
+  const output = execFileSync(
+    'node',
+    [
+      '-e',
+      `
+    const pulumi = require('@pulumi/pulumi');
+    const k8s = require('@pulumi/kubernetes');
+    const resources = [];
+    pulumi.runtime.setAllConfig(${JSON.stringify(prefixed)});
+    pulumi.runtime.setMocks({
+      newResource: a => { resources.push(a); return {id:a.name, state:{...a.inputs, metadata:{...a.inputs.metadata, name:a.inputs.metadata?.name ?? a.name}}}; },
+      call: a => a.inputs,
+    }, 'project', 'test', false);
+    let error;
+    pulumi.runtime.runInPulumiStack(async () => {
+      let platform;
+      try {
+        platform = require('./dist').createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', ${args} });
+      } catch (e) { error = e.message; return; }
+      await platform.namespace.promise();
+      await Promise.all(platform.tenants.map(t => t.promise()));
+    }).then(() => {
+      if (error) return console.log(JSON.stringify({ error }));
+      const gateway = resources.find(r => r.name === 'http-gateway' && r.type === 'kubernetes:apps/v1:Deployment').inputs.spec.template;
+      console.log(JSON.stringify({ gatewayConfig: JSON.parse(gateway.spec.containers[0].env[0].value), configHash: gateway.metadata.annotations['di-framework.dev/config-hash'] }));
+    }).catch(e => {console.error(e);process.exitCode=1;});
+  `,
+    ],
+    { cwd: root, encoding: 'utf8' },
+  );
+  return JSON.parse(output.trim().split('\n').at(-1) as string);
+}
+
+test('install validates config routeAliases and deploys them normalized to the gateway (#217)', () => {
+  const deployed = gatewayInstall({
+    routeAliases: {
+      'Identity.identity': 'IDENTITY.identity-pg',
+      'api.identity': 'api.identity-pg',
+    },
+  });
+  expect(deployed.error).toBeUndefined();
+  expect(Object.entries(deployed.gatewayConfig?.routeAliases ?? {})).toEqual([
+    ['api.identity', 'api.identity-pg'],
+    ['identity.identity', 'identity.identity-pg'],
+  ]);
+  // Same aliases in another order and spelling: same GATEWAY_CONFIG and hash, so no rollout.
+  const reordered = gatewayInstall({
+    routeAliases: {
+      'api.identity': 'api.identity-pg',
+      'identity.identity': 'identity.identity-pg',
+    },
+  });
+  expect(reordered).toEqual(deployed);
+  // Removing the alias drops it from GATEWAY_CONFIG and changes the hash, rolling the gateway.
+  const removed = gatewayInstall({});
+  expect(removed.gatewayConfig).not.toHaveProperty('routeAliases');
+  expect(removed.configHash).not.toBe(deployed.configHash);
+  // PlatformArgs.routeAliases wins over config.
+  const fromArgs = gatewayInstall(
+    { routeAliases: { 'api.identity': 'api.identity-pg' } },
+    `routeAliases: { 'identity.identity': 'identity.identity-pg' }`,
+  );
+  expect(fromArgs.gatewayConfig?.routeAliases).toEqual({
+    'identity.identity': 'identity.identity-pg',
+  });
+}, 120_000);
+
+test.each([
+  [
+    'a chain',
+    { routeAliases: { 'a.identity': 'a.identity-pg', 'a.identity-pg': 'b.identity' } },
+    'Chained route aliases',
+  ],
+  [
+    'a reserved target',
+    { routeAliases: { 'a.identity': 'controller.identity-pg' } },
+    'reserved route host controller',
+  ],
+  [
+    'an undeclared tenant',
+    { routeAliases: { 'a.identity': 'a.other' } },
+    'undeclared tenant other',
+  ],
+  [
+    'a nested map',
+    { routeAliases: { identity: { identity: 'identity.identity-pg' } } },
+    'routeAliases["identity"] must be a',
+  ],
+  ['an array', { routeAliases: ['identity.identity-pg'] }, 'routeAliases must be an object'],
+  ['non-JSON', { routeAliases: 'identity.identity' }, 'is not a valid JSON object'],
+  [
+    'nested gateway.routeAliases',
+    { gateway: { routeAliases: {} } },
+    'top-level config key routeAliases',
+  ],
+  [
+    'a dotted gateway.routeAliases key',
+    { 'gateway.routeAliases': {} },
+    'top-level config key routeAliases',
+  ],
+])(
+  'install refuses %s in route aliases (#217)',
+  (_, config, message) => {
+    expect(gatewayInstall(config).error).toContain(message);
+  },
+  60_000,
+);

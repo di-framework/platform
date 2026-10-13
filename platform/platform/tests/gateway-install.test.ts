@@ -11,6 +11,7 @@ import {
   gatewayServiceSpec,
   loadGatewayScript,
   routeUrlPatternFor,
+  validateRouteAliases,
   validateRouteUrlPattern,
 } from '../src/gateway/install';
 import { INSTALLATION, NAMESPACE_ROLE, TENANT } from '../src/tenancy/resources';
@@ -169,5 +170,64 @@ describe('tenant-auth gateway routes (#58:routes)', () => {
     expect(egress).toHaveLength(3);
     expect(egress[2]?.to[0]?.podSelector).toEqual({ matchLabels: { app: 'tenant-controller' } });
     expect(egress[2]?.ports).toEqual([{ protocol: 'TCP', port: 8790 }]);
+  });
+});
+
+describe('route alias validation (#217)', () => {
+  const rules = { tenantAuthRoutes: { console: 'auth' }, tenants: ['alpha', 'beta'] };
+
+  it('normalizes case and sorts sources', () => {
+    const normalized = validateRouteAliases(
+      { 'Web.Alpha': 'WEB.beta', 'api.ALPHA': 'api.Beta', 'same.alpha': 'same.alpha' },
+      rules,
+    );
+    expect(Object.entries(normalized)).toEqual([
+      ['api.alpha', 'api.beta'],
+      ['same.alpha', 'same.alpha'], // a self-alias is a no-op
+      ['web.alpha', 'web.beta'],
+    ]);
+    for (const unset of [undefined, null, {}]) expect(validateRouteAliases(unset)).toEqual({});
+  });
+
+  it.each([
+    ['a string', 'site.alpha', 'routeAliases must be an object'],
+    ['an array', ['site.alpha'], 'routeAliases must be an object'],
+    ['a nested map', { site: { alpha: 'site.beta' } }, 'routeAliases["site"] must be a'],
+    ['a numeric target', { 'site.alpha': 1 }, 'routeAliases["site.alpha"] must be a'],
+    ['a source without a tenant', { site: 'site.beta' }, 'Invalid route alias source "site"'],
+    ['a non-DNS-1123 source', { 'my_site.alpha': 'site.beta' }, 'alias source "my_site.alpha"'],
+    ['an invalid target tenant', { 'site.alpha': 'site.1beta' }, 'Invalid route alias target'],
+    ['a fixed reserved source', { 'registry.alpha': 'site.beta' }, 'reserved route host registry'],
+    ['a configured reserved source', { 'auth.alpha': 'site.beta' }, 'source "auth.alpha" uses'],
+    ['a fixed reserved target', { 'site.alpha': 'controller.beta' }, 'reserved route host'],
+    ['a configured reserved target', { 'site.alpha': 'auth.beta' }, 'target "auth.beta" uses'],
+    ['an undeclared target tenant', { 'site.alpha': 'site.gamma' }, 'undeclared tenant gamma'],
+    ['sources differing in case', { 'site.alpha': 'a.beta', 'SITE.alpha': 'b.beta' }, 'Duplicate'],
+    ['a chain', { 'a.alpha': 'b.beta', 'b.beta': 'c.alpha' }, 'Chained route aliases'],
+    ['a cycle', { 'a.alpha': 'b.beta', 'b.beta': 'a.alpha' }, 'Chained route aliases'],
+  ])('rejects %s', (_, aliases, message) => {
+    expect(() => validateRouteAliases(aliases, rules)).toThrow(message);
+  });
+
+  it('rolls the gateway when aliases change, but not when keys are reordered', () => {
+    const spec = (aliases: Record<string, string>, routes = {}) =>
+      gatewayDeploymentSpec('wasmcloud', 'abc', routes, validateRouteAliases(aliases));
+    const hash = (s: ReturnType<typeof spec>) =>
+      s.template.metadata.annotations['di-framework.dev/config-hash'];
+    const env = (s: ReturnType<typeof spec>) => s.template.spec.containers[0]?.env[0]?.value ?? '';
+    const both = spec({ 'site.alpha': 'site.beta', 'web.alpha': 'web.beta' });
+    const reordered = spec({ 'WEB.alpha': 'web.beta', 'site.alpha': 'site.beta' });
+    expect(hash(both)).toMatch(/^[0-9a-f]{64}$/);
+    expect([hash(reordered), env(reordered)]).toEqual([hash(both), env(both)]);
+    expect(JSON.parse(env(both)).routeAliases).toEqual({
+      'site.alpha': 'site.beta',
+      'web.alpha': 'web.beta',
+    });
+    // Removing an alias, or every alias, changes both the hash and GATEWAY_CONFIG.
+    const one = spec({ 'site.alpha': 'site.beta' });
+    const none = spec({});
+    expect(new Set([hash(both), hash(one), hash(none)]).size).toBe(3);
+    expect(JSON.parse(env(none))).not.toHaveProperty('routeAliases');
+    expect(hash(spec({}, { console: 'console' }))).not.toBe(hash(none));
   });
 });

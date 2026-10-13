@@ -10,7 +10,7 @@ import {
   type TenantAuthRoutes,
 } from '../tenancy/resources';
 import type { GatewayConfig } from './gateway';
-import { parseRoute } from './gateway';
+import { parseRoute, reservedRouteHosts } from './gateway';
 
 export { GATEWAY_NAME, GATEWAY_POD_LABELS };
 export const GATEWAY_PORT = 8080;
@@ -30,83 +30,64 @@ export function validateRouteUrlPattern(pattern: string | undefined): string | u
   return pattern;
 }
 
+/** What `validateRouteAliases` checks aliases against. */
+export interface RouteAliasRules {
+  /** Configured console, controller and registry route hosts; both alias sides must avoid them. */
+  tenantAuthRoutes?: TenantAuthRoutes;
+  /** Declared tenant names; when given, every alias target must name one of them. */
+  tenants?: readonly string[];
+}
+
+const ALIAS_SHAPE = 'an object mapping "<route-host>.<tenant>" to "<route-host>.<tenant>"';
+
 /**
- * Validate route aliases. Ensures:
- * - both source and target are valid route identifiers (host.tenant)
- * - source is not a reserved label (console, controller, registry)
- * - no chains (A -> B -> C) or cycles (A -> B -> A)
+ * Validate admin route aliases (#217) and return them normalized: sources and targets lower-cased
+ * and sources sorted, so the deployed `GATEWAY_CONFIG` and its config hash depend on neither the
+ * spelling nor the order of the configured keys. Unset is `{}`. Throws when the value is not
+ * such an object, a side is not `<route-host>.<tenant>` with DNS-1123 labels, a side uses a
+ * reserved route host (`console`, `controller`, `registry` and the configured tenant-auth hosts),
+ * a target names an undeclared tenant, two sources differ only in case, or a target is another
+ * alias's source (a chain; every cycle is also a chain). A self-alias is a no-op and allowed.
  */
 export function validateRouteAliases(
-  aliases: Record<string, string> | undefined,
-  tenantAuthRoutes?: { console?: string; controller?: string; registry?: string },
-): void {
-  if (!aliases || Object.keys(aliases).length === 0) return;
-
-  const reserved = new Set(
-    [tenantAuthRoutes?.console, tenantAuthRoutes?.controller, tenantAuthRoutes?.registry].filter(
-      (x) => x !== undefined,
-    ),
-  );
-
-  // Normalize alias keys to lowercase for consistent matching
-  const normalizedAliases: Record<string, string> = {};
-  for (const [source, target] of Object.entries(aliases)) {
-    const sourceKey = source.toLowerCase();
-    normalizedAliases[sourceKey] = target.toLowerCase();
+  aliases: unknown,
+  rules: RouteAliasRules = {},
+): Record<string, string> {
+  if (aliases === undefined || aliases === null) return {};
+  if (typeof aliases !== 'object' || Array.isArray(aliases))
+    throw new Error(`routeAliases must be ${ALIAS_SHAPE}`);
+  const reserved = reservedRouteHosts(rules.tenantAuthRoutes);
+  const tenants = rules.tenants && new Set(rules.tenants);
+  const normalized = new Map<string, string>();
+  for (const [rawSource, rawTarget] of Object.entries(aliases)) {
+    if (typeof rawTarget !== 'string')
+      throw new Error(`routeAliases["${rawSource}"] must be a "<route-host>.<tenant>" string`);
+    const source = rawSource.toLowerCase();
+    const target = rawTarget.toLowerCase();
+    for (const [side, value] of [
+      ['source', source],
+      ['target', target],
+    ] as const) {
+      const route = parseRoute(value);
+      if (!route)
+        throw new Error(
+          `Invalid route alias ${side} "${value}": expected <route-host>.<tenant> with DNS-1123 labels`,
+        );
+      if (reserved.has(route.host))
+        throw new Error(
+          `Route alias ${side} "${value}" uses the reserved route host ${route.host}`,
+        );
+      if (side === 'target' && tenants && !tenants.has(route.tenant))
+        throw new Error(`Route alias target "${value}" names undeclared tenant ${route.tenant}`);
+    }
+    if (normalized.has(source))
+      throw new Error(`Duplicate route alias source "${source}" (sources are case-insensitive)`);
+    normalized.set(source, target);
   }
-
-  // Parse and validate all keys and values
-  for (const [source, target] of Object.entries(normalizedAliases)) {
-    const sourceParsed = parseRoute(source);
-    if (!sourceParsed) {
-      throw new Error(`Invalid route alias source: ${source}`);
-    }
-    const targetParsed = parseRoute(target);
-    if (!targetParsed) {
-      throw new Error(`Invalid route alias target: ${target}`);
-    }
-
-    // Check that source is not a reserved label
-    if (reserved.has(sourceParsed.host)) {
-      throw new Error(`Route alias source cannot be a reserved label: ${source}`);
-    }
-  }
-
-  // Check for cycles and chains using a graph traversal
-  const visited = new Set<string>();
-  const visiting = new Set<string>();
-
-  function detectCycle(key: string, path: string[]): void {
-    if (visiting.has(key)) {
-      // We've found a cycle
-      throw new Error(`Cycle detected in route aliases: ${key}`);
-    }
-    if (visited.has(key)) return;
-
-    visiting.add(key);
-    const target = normalizedAliases[key];
-    if (target && target !== key) {
-      if (normalizedAliases[target]) {
-        // The target is also an alias source - check for cycle or chain
-        detectCycle(target, [...path, key]);
-      }
-    }
-    visited.add(key);
-    visiting.delete(key);
-  }
-
-  for (const source of Object.keys(normalizedAliases)) {
-    if (!visited.has(source)) {
-      detectCycle(source, []);
-    }
-  }
-
-  // Check for chains: an alias whose target is another alias source (but not self-aliases)
-  for (const [source, target] of Object.entries(normalizedAliases)) {
-    if (source !== target && normalizedAliases[target]) {
-      throw new Error(`Chained route aliases detected: ${source} -> ${target} -> ...`);
-    }
-  }
+  for (const [source, target] of normalized)
+    if (target !== source && normalized.has(target))
+      throw new Error(`Chained route aliases are not allowed: ${source} -> ${target} -> ...`);
+  return Object.fromEntries([...normalized].sort(([a], [b]) => (a < b ? -1 : 1)));
 }
 
 /** Route pattern for a loopback HTTP endpoint (the gateway's published port); otherwise none. */
@@ -133,8 +114,9 @@ export function gatewayScriptHash(scripts: Record<string, string>): string {
 }
 
 /**
- * Create a hash of the gateway config (routes and aliases) that changes when the config changes.
- * This is used in pod annotations to trigger a rollout when the gateway config changes.
+ * Hash of the routing config (tenant-auth routes and route aliases) for the pod template's
+ * `di-framework.dev/config-hash` annotation, so changing either rolls the gateway. Pass aliases
+ * already normalized by `validateRouteAliases`, so reordering keys does not change the hash.
  */
 export function gatewayConfigHash(
   tenantAuthRoutes?: TenantAuthRoutes,
