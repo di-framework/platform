@@ -1665,3 +1665,155 @@ describe('console and derivation', () => {
     expect(reconcileAll(cluster.world).some((a) => a.type === 'backup-status')).toBe(false);
   });
 });
+
+describe('#254: a dropped ledger entry is never silent', () => {
+  const signals = (actions: Action[]) =>
+    actions.filter((action) => action.type === 'log' || action.type === 'event');
+
+  /** A backup holding `identity` at 0, then force-deleted past its finalizer. */
+  function stranded(): { cluster: Cluster; holder: string } {
+    const cluster = requested();
+    stopped(cluster);
+    const holder = `Backup/${must(cluster.backup()).name}`;
+    expect(cluster.replicas()).toBe(0);
+    expect(cluster.held().identity).toMatchObject({ heldBy: holder, destination: 'pvc' });
+    cluster.world = { ...cluster.world, backups: [] };
+    return { cluster, holder };
+  }
+
+  /** The workload removed from the destination's sources; its status stays as it was. */
+  function unlisted(cluster: Cluster): void {
+    const current = must(cluster.world.destination);
+    const dest = { ...current, spec: { ...current.spec, sources: [] } };
+    cluster.world = { ...cluster.world, destination: dest, destinations: [dest] };
+  }
+
+  test('a held workload whose destination is deleted gets its replicas back, with a Normal Event', () => {
+    const { cluster, holder } = stranded();
+    cluster.world = { ...cluster.world, destination: undefined, destinations: [] };
+    const sweep = cluster.tick();
+    expect(scaled(sweep)).toEqual([{ type: 'scale-workload', name: 'identity', replicas: 2 }]);
+    expect(cluster.replicas()).toBe(2);
+    expect(cluster.held()).toEqual({});
+    const message = `WorkloadDeployment identity got its 2 replicas back from ${holder}; its BackupDestination pvc is gone.`;
+    // After the scale and the ledger write, so it reports what really happened.
+    expect(cluster.types(sweep)).toEqual(['scale-workload', 'ledger', 'log', 'event']);
+    expect(signals(sweep)).toEqual([
+      { type: 'log', message },
+      { type: 'event', eventType: 'Normal', reason: 'HeldReplicasReleased', message },
+    ]);
+  });
+
+  test('a held workload removed from sources stays at 0, with a Warning Event and a log line', () => {
+    const { cluster, holder } = stranded();
+    unlisted(cluster);
+    const sweep = cluster.tick();
+    expect(scaled(sweep)).toEqual([]);
+    expect(cluster.replicas()).toBe(0);
+    expect(cluster.held()).toEqual({});
+    const message = `held-replicas entry for WorkloadDeployment identity (2 replicas, held by ${holder}) dropped without scaling: the workload is not a source of BackupDestination pvc. It keeps its current replicas (0); scale it by hand if it should run.`;
+    expect(signals(sweep)).toEqual([
+      { type: 'log', message },
+      { type: 'event', eventType: 'Warning', reason: 'HeldReplicasDropped', message },
+    ]);
+    // Reported once: the entry is gone, so the next tick says nothing more.
+    expect(signals(cluster.tick())).toEqual([]);
+  });
+
+  test('a ledger write that fails reports nothing, and the next tick reports it once', () => {
+    const { cluster } = stranded();
+    unlisted(cluster);
+    cluster.fail((action) => action.type === 'ledger', 409);
+    cluster.tick();
+    expect(cluster.log.filter((action) => action.type === 'event')).toEqual([]);
+    expect(cluster.held().identity).toBeDefined();
+    const retry = cluster.tick();
+    expect(retry.filter((action) => action.type === 'event')).toHaveLength(1);
+  });
+
+  test('an entry the sweeper drops for a workload somebody raised still says why', () => {
+    const world = volumeWorld({
+      workloads: [workload({ name: 'stranger', uid: 'uid-s', annotations: {} })],
+      ledger: {
+        resourceVersion: '3',
+        entries: {
+          stranger: { replicas: 4, heldBy: 'Backup/gone', since: NOW, destination: 'pvc' },
+        },
+      },
+    });
+    const actions = releaseOrphans(world);
+    expect(scaled(actions)).toEqual([]);
+    expect(signals(actions)[0]).toEqual({
+      type: 'log',
+      message:
+        'held-replicas entry for WorkloadDeployment stranger (4 replicas, held by Backup/gone) dropped without scaling: the workload is not a source of BackupDestination pvc. It keeps its current replicas (2); scale it by hand if it should run.',
+    });
+  });
+
+  test('a destination-gone entry for a raised workload is dropped quietly', () => {
+    const world = volumeWorld({
+      destination: undefined,
+      destinations: [],
+      ledger: {
+        resourceVersion: '3',
+        entries: {
+          identity: { replicas: 4, heldBy: 'Backup/gone', since: NOW, destination: 'old' },
+        },
+      },
+    });
+    expect(releaseOrphans(world)).toEqual([
+      { type: 'ledger', set: { identity: null }, resourceVersion: '3' },
+    ]);
+  });
+
+  test('every refusal reads as a sentence, and a forged entry cannot flood the message', () => {
+    const base = { replicas: 2, heldBy: 'Backup/gone', since: NOW, destination: 'pvc' };
+    const world = volumeWorld({
+      workloads: [
+        workload({ replicas: 0, instances: 0 }),
+        workload({ name: 'di-tenant-registry', uid: 'uid-r', replicas: 0, annotations: {} }),
+      ],
+    });
+    const reasons: [string, typeof base, string][] = [
+      ['Bad_Name', base, 'the name is not a WorkloadDeployment name'],
+      ['identity', { ...base, replicas: 101 }, 'replicas is not a whole number from 0 to 100'],
+      [
+        'identity',
+        { ...base, heldBy: 'Pod/x' },
+        'the holder is not Backup/<name> or BackupRestore/<name>',
+      ],
+      ['identity', { ...base, since: 'soon' }, 'the timestamp does not parse'],
+      ['di-tenant-registry', base, 'the workload is managed by the platform'],
+      ['identity', { ...base, destination: '' }, 'the entry names no BackupDestination'],
+      [
+        'missing',
+        { ...base, destination: 'old' },
+        'BackupDestination old is gone and the workload is not listed with a platform storage volume',
+      ],
+    ];
+    for (const [name, entry, reason] of reasons) {
+      const actions = releaseOrphans({ ...world, ledger: { entries: { [name]: entry } } });
+      const event = actions.find((action) => action.type === 'event');
+      expect(event).toMatchObject({ eventType: 'Warning', reason: 'HeldReplicasDropped' });
+      expect(event?.type === 'event' && event.message).toContain(
+        `dropped without scaling: ${reason}.`,
+      );
+    }
+    const missing = releaseOrphans({
+      ...world,
+      ledger: { entries: { missing: { ...base, destination: 'old' } } },
+    });
+    expect(missing.find((action) => action.type === 'log')).toMatchObject({
+      message: expect.stringContaining('It keeps its current replicas; scale it by hand'),
+    });
+    const flood = releaseOrphans({
+      ...world,
+      ledger: { entries: { ['x'.repeat(5000)]: base } },
+    });
+    for (const action of signals(flood)) {
+      const text = action.type === 'log' || action.type === 'event' ? action.message : '';
+      expect(text.length).toBe(1024);
+      expect(text.endsWith('...')).toBe(true);
+    }
+  });
+});

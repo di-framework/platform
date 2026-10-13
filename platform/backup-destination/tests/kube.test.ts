@@ -628,6 +628,76 @@ describe('applying actions', () => {
     ]);
     expect(calls[0]?.[2]).toEqual({ metadata: { resourceVersion: '9' }, data: { identity: null } });
   });
+
+  test('posts ledger Events in the runtime namespace, and a failed one never stops the tick (#254)', async () => {
+    let refuse = false;
+    const { calls, api } = recorder((method, path) => {
+      if (refuse && method === 'POST' && path.endsWith('/events')) {
+        throw new KubeError(403, 'events is forbidden');
+      }
+      return {};
+    });
+    const event = {
+      type: 'event' as const,
+      eventType: 'Warning' as const,
+      reason: 'HeldReplicasDropped',
+      message: 'held-replicas entry for WorkloadDeployment identity dropped',
+    };
+    await applyActions(api, volumeWorld(), [event]);
+    expect(calls).toEqual([
+      [
+        'POST',
+        '/api/v1/namespaces/di-runtime-alpha/events',
+        {
+          apiVersion: 'v1',
+          kind: 'Event',
+          metadata: { generateName: `${LEDGER}.`, namespace: 'di-runtime-alpha' },
+          involvedObject: {
+            apiVersion: 'v1',
+            kind: 'ConfigMap',
+            name: LEDGER,
+            namespace: 'di-runtime-alpha',
+          },
+          type: 'Warning',
+          reason: 'HeldReplicasDropped',
+          message: 'held-replicas entry for WorkloadDeployment identity dropped',
+          source: { component: 'di-backup-operator' },
+          reportingComponent: 'di-backup-operator',
+          firstTimestamp: NOW,
+          lastTimestamp: NOW,
+          count: 1,
+        },
+      ],
+    ]);
+    calls.length = 0;
+    refuse = true;
+    const errors: unknown[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(...args);
+    };
+    try {
+      await applyActions(api, volumeWorld(), [
+        event,
+        { type: 'scale-workload', name: 'identity', replicas: 2 },
+      ]);
+      api.post = async () => {
+        throw 'not an Error';
+      };
+      await applyActions(api, volumeWorld(), [event]);
+    } finally {
+      console.error = original;
+    }
+    expect(errors).toEqual([
+      'event HeldReplicasDropped not recorded: events is forbidden',
+      'event HeldReplicasDropped not recorded: post failed',
+    ]);
+    // The action after it still ran.
+    expect(calls.map(([method, path]) => `${method} ${path}`)).toEqual([
+      'POST /api/v1/namespaces/di-runtime-alpha/events',
+      `PATCH ${RUNTIME}/workloaddeployments/identity/scale`,
+    ]);
+  });
 });
 
 describe('leader election and single flight', () => {
