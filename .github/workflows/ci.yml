@@ -40,7 +40,7 @@ jobs:
       - name: Typecheck backup prototype Pulumi program
         working-directory: platform/backup-destination/prototype
         run: |
-          bun install --frozen-lockfile
+          bun install --frozen-lockfile --ignore-scripts
           ./node_modules/.bin/tsc --noEmit -p .
 
       - name: Lint

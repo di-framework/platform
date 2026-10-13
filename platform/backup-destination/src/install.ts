@@ -1,7 +1,7 @@
 import * as k8s from '@pulumi/kubernetes';
 import type * as pulumi from '@pulumi/pulumi';
-// Extensionless: the prototype Pulumi program compiles this file with ts-node, which
-// emits CommonJS and rejects '.ts' specifiers (TS5097).
+// Extensionless: the prototype Pulumi program compiles this file with ts-node, which emits JS
+// and so cannot enable allowImportingTsExtensions ('.ts' specifiers fail with TS5097).
 import { validCron } from './schedule';
 
 const TENANT = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
