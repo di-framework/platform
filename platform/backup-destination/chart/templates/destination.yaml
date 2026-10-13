@@ -1,37 +1,105 @@
+{{- $type := .Values.type -}}
+{{- if not (has $type (list "s3" "pvc" "both")) -}}
+{{- fail "type must be s3, pvc, or both" -}}
+{{- end -}}
+{{- $s3 := or (eq $type "s3") (eq $type "both") -}}
+{{- $pvc := or (eq $type "pvc") (eq $type "both") -}}
 {{- $secret := .Values.existingSecret -}}
+{{- $createSecret := false -}}
+{{- if $s3 -}}
 {{- if and (not $secret) .Values.accessKeyId .Values.secretAccessKey -}}
 {{- $secret = "di-backup-s3" -}}
+{{- $createSecret = true -}}
 {{- end -}}
 {{- if not .Values.bucket -}}
-{{- fail "bucket is required" -}}
+{{- fail "bucket is required for S3 destination type" -}}
 {{- end -}}
 {{- if not $secret -}}
-{{- fail "existingSecret is required (demo accessKeyId and secretAccessKey are not for shared tenants)" -}}
+{{- fail "existingSecret is required for S3 (demo accessKeyId and secretAccessKey are not for shared tenants)" -}}
 {{- end -}}
+{{- end -}}
+{{- if $pvc -}}
+{{- if and (not .Values.existingClaimName) (not .Values.volumeClaimTemplate.size) -}}
+{{- fail "either existingClaimName or volumeClaimTemplate.size is required for PVC destination type" -}}
+{{- end -}}
+{{- end -}}
+{{- define "backup.common" -}}
+  {{- if .Values.prefix }}
+  prefix: {{ .Values.prefix | quote }}
+  {{- end }}
+  {{- if .Values.retentionSuccessful }}
+  retention:
+    successful: {{ .Values.retentionSuccessful }}
+  {{- end }}
+  {{- if .Values.extraEgress }}
+  extraEgress:
+    {{- toYaml .Values.extraEgress | nindent 4 }}
+  {{- end }}
+{{- end -}}
+{{- if $s3 }}
 apiVersion: platform.di-framework.dev/v1alpha1
 kind: BackupDestination
 metadata:
   name: default
   namespace: {{ .Release.Namespace }}
 spec:
+  type: s3
   bucket: {{ .Values.bucket | quote }}
-  {{- if .Values.prefix }}
-  prefix: {{ .Values.prefix | quote }}
-  {{- end }}
   region: {{ .Values.region | quote }}
   {{- if .Values.endpoint }}
   endpoint: {{ .Values.endpoint | quote }}
   {{- end }}
   credentialsSecretRef:
     name: {{ $secret | quote }}
-  schedule: {{ .Values.schedule | quote }}
-  retention:
-    successful: {{ .Values.retentionSuccessful }}
-  {{- if .Values.extraEgress }}
-  extraEgress:
-    {{- toYaml .Values.extraEgress | nindent 4 }}
+  schedule: {{ .Values.schedule | default "0 2 * * *" | quote }}
+  {{- include "backup.common" . }}
+{{- end }}
+{{- if $pvc }}
+---
+apiVersion: platform.di-framework.dev/v1alpha1
+kind: BackupDestination
+metadata:
+  {{- /* Always pvc: default is S3 and its type is immutable, so a release can switch kinds. */}}
+  name: pvc
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: pvc
+  {{- if .Values.existingClaimName }}
+  existingClaimName: {{ .Values.existingClaimName | quote }}
   {{- end }}
-{{- if and (not .Values.existingSecret) .Values.accessKeyId .Values.secretAccessKey }}
+  {{- if .Values.volumeClaimTemplate.size }}
+  volumeClaimTemplate:
+    {{- if .Values.volumeClaimTemplate.storageClassName }}
+    storageClassName: {{ .Values.volumeClaimTemplate.storageClassName | quote }}
+    {{- end }}
+    size: {{ .Values.volumeClaimTemplate.size | quote }}
+  {{- end }}
+  {{- if .Values.schedule }}
+  schedule: {{ .Values.schedule | quote }}
+  {{- end }}
+  {{- include "backup.common" . }}
+{{- end }}
+{{- if and $pvc .Values.volumeClaimTemplate.size (not .Values.existingClaimName) }}
+---
+# Agent Jobs run in the runtime namespace, so the claim lives there. It is kept on uninstall.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: di-backup-pvc
+  namespace: {{ include "backup.runtime" . | trim }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.volumeClaimTemplate.storageClassName }}
+  storageClassName: {{ .Values.volumeClaimTemplate.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.volumeClaimTemplate.size | quote }}
+{{- end }}
+{{- if $createSecret }}
 ---
 apiVersion: v1
 kind: Secret

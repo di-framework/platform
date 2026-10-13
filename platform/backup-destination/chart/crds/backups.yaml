@@ -23,26 +23,51 @@ spec:
           properties:
             spec:
               type: object
-              required: [bucket, credentialsSecretRef]
+              x-kubernetes-validations:
+                - rule: "self.type != 's3' || (has(self.bucket) && has(self.credentialsSecretRef) && has(self.credentialsSecretRef.name))"
+                  message: an s3 destination needs bucket and credentialsSecretRef.name
+                - rule: "self.type != 'pvc' || has(self.existingClaimName) || (has(self.volumeClaimTemplate) && has(self.volumeClaimTemplate.size))"
+                  message: a pvc destination needs existingClaimName or volumeClaimTemplate.size
+                - rule: "self.type == oldSelf.type"
+                  message: type is immutable; create another BackupDestination instead
               properties:
+                type:
+                  type: string
+                  enum: ['s3', 'pvc']
+                  # Destinations created before #233 have no type; they are S3.
+                  default: s3
                 bucket: { type: string, minLength: 1 }
                 prefix:
                   type: string
+                  # CEL cost is estimated from maxLength; without it the API server rejects the CRD.
+                  maxLength: 1024
                   x-kubernetes-validations:
+                    - rule: "!self.split('/').exists(p, p == '..' || p == '.')"
+                      message: prefix must not contain . or .. segments
+                    - rule: "self == '' || self.split('/').exists(p, p != '')"
+                      message: prefix must contain a non-empty segment
                     - rule: '!oldSelf.hasValue() || oldSelf.value() == '''' || self == oldSelf.value()'
                       message: prefix is immutable once set
                       optionalOldSelf: true
                 region: { type: string }
                 endpoint:
                   type: string
+                  maxLength: 2048
                   x-kubernetes-validations:
                     - rule: 'self == '''' || self.startsWith(''https://'') || ((self.startsWith(''http://'') && (self.contains(''.svc.cluster.local'') || self.contains(''localhost''))))'
                       message: HTTP is only allowed for cluster-local endpoints
                 credentialsSecretRef:
                   type: object
-                  required: [name]
                   properties:
                     name: { type: string, minLength: 1 }
+                # A claim in the runtime namespace (di-runtime-<tenant>), where agent Jobs run.
+                existingClaimName: { type: string, minLength: 1 }
+                # Read by the chart, which creates claim di-backup-pvc. The operator creates no claims.
+                volumeClaimTemplate:
+                  type: object
+                  properties:
+                    storageClassName: { type: string }
+                    size: { type: string, minLength: 1 }
                 schedule: { type: string }
                 retention:
                   type: object

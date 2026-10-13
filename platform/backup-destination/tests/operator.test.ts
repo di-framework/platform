@@ -6,11 +6,12 @@ import {
   endpointAllowed,
   jobName,
   parseBytes,
+  pickS3Owner,
   postgresConnectionSecret,
   runtimeNamespaceFor,
   type World,
 } from '../src/model.ts';
-import { jobBody, reconcile } from '../src/reconcile.ts';
+import { jobBody, reconcile, reconcileAll } from '../src/reconcile.ts';
 import { cronMatches, isDue, previousFire } from '../src/schedule.ts';
 
 function world(overrides: Partial<World> = {}): World {
@@ -31,6 +32,7 @@ function world(overrides: Partial<World> = {}): World {
       generation: 2,
       annotations: {},
       spec: {
+        type: 's3',
         bucket: 'tenant-alpha-backups',
         credentialsSecretRef: { name: 'di-backup-s3' },
         schedule: '0 2 * * *',
@@ -198,6 +200,7 @@ describe('reconcile', () => {
           {
             name: 'di-backup-orders-1',
             serviceName: 'orders',
+            destinationName: 'default',
             phase: 'Running',
             uid: orders.uid,
             type: 'postgres',
@@ -247,6 +250,7 @@ describe('reconcile', () => {
           {
             name: 'di-backup-orders-1',
             serviceName: 'orders',
+            destinationName: 'default',
             phase: 'Succeeded',
             objectKey: 'k/data.dump',
             uid: orders.uid,
@@ -296,6 +300,7 @@ describe('reconcile', () => {
           {
             name: 'di-backup-orders-1',
             serviceName: 'orders',
+            destinationName: 'default',
             phase: 'Running',
             uid: orders.uid,
             type: 'postgres',
@@ -325,6 +330,7 @@ describe('reconcile', () => {
           {
             name: 'di-backup-orders-1',
             serviceName: 'orders',
+            destinationName: 'default',
             phase: 'Succeeded',
             objectKey: 'di-framework/alpha/orders/uid/20260927T020012Z/data.dump',
             uid: orders.uid,
@@ -351,6 +357,7 @@ describe('reconcile', () => {
           {
             name: 'di-backup-orders-1',
             serviceName: 'orders',
+            destinationName: 'default',
             phase: 'Succeeded',
             uid: orders.uid,
             type: 'postgres',
@@ -370,6 +377,7 @@ describe('reconcile', () => {
           {
             name: 'di-backup-orders-1',
             serviceName: 'orders',
+            destinationName: 'default',
             phase: 'Succeeded',
             uid: orders.uid,
             type: 'postgres',
@@ -391,6 +399,7 @@ describe('reconcile', () => {
           {
             name: 'di-backup-orders-1',
             serviceName: 'orders',
+            destinationName: 'default',
             phase: 'Succeeded',
             objectKey: 'p/data.dump',
             uid: orders.uid,
@@ -446,6 +455,7 @@ describe('reconcile', () => {
     const backups = Array.from({ length: 3 }, (_, index) => ({
       name: `b${index}`,
       serviceName: 'orders',
+      destinationName: 'default',
       phase: 'Succeeded' as const,
       objectKey: `k/${index}/data.dump`,
       uid: orders.uid,
@@ -540,6 +550,7 @@ describe('reconcile', () => {
           {
             name: 'b',
             serviceName: 'cache',
+            destinationName: 'default',
             phase: 'Succeeded',
             objectKey: 'p/dump.rdb',
             uid: 'uid-cache',
@@ -578,6 +589,7 @@ describe('reconcile', () => {
           {
             name: 'b',
             serviceName: 'events',
+            destinationName: 'default',
             phase: 'Succeeded',
             uid: 'uid-events',
             type: 'messaging',
@@ -642,6 +654,7 @@ describe('reconcile', () => {
           {
             name: 'b',
             serviceName: 'orders',
+            destinationName: 'default',
             phase: 'Succeeded',
             uid: orders.uid,
             type: 'postgres',
@@ -652,6 +665,7 @@ describe('reconcile', () => {
           {
             name: 'f',
             serviceName: 'paused',
+            destinationName: 'default',
             phase: 'Failed',
             uid: 'uid-paused',
             type: 'postgres',
@@ -728,6 +742,7 @@ describe('reconcile', () => {
     const failures = Array.from({ length: 6 }, (_, index) => ({
       name: `f${index}`,
       serviceName: 'orders',
+      destinationName: 'default',
       phase: 'Failed' as const,
       uid: orders.uid,
       type: 'postgres',
@@ -748,6 +763,7 @@ describe('console', () => {
         {
           name: 'di-backup-orders-1',
           serviceName: 'orders',
+          destinationName: 'default',
           phase: 'Succeeded',
           objectKey: 'k/data.dump',
           uid: orders.uid,
@@ -1093,6 +1109,450 @@ describe('kubernetes client', () => {
     expect(loaded.runtimeSecretPresent).toBe(false);
     await applyActions(client, world({ destination: undefined }), [
       { type: 'destination-status', status: {} },
+    ]);
+  });
+
+  test('rejects PVC destination without existingClaimName or volumeClaimTemplate.size', () => {
+    const actions = reconcile(
+      world({
+        destination: {
+          name: 'default',
+          generation: 2,
+          annotations: {},
+          spec: {
+            type: 'pvc',
+          },
+          status: {},
+        },
+      }),
+    );
+    expect(JSON.stringify(actions)).toContain('ConfigInvalid');
+    expect(JSON.stringify(actions)).toContain('existingClaimName or volumeClaimTemplate.size');
+  });
+
+  test('72 simulated hours: PVC without schedule never backs up, S3 without schedule runs at 02:00', () => {
+    const pvc = {
+      spec: { type: 'pvc' as const, existingClaimName: 'c' },
+    };
+    const s3 = {
+      spec: {
+        type: 's3' as const,
+        bucket: 'b',
+        credentialsSecretRef: { name: 'di-backup-s3' },
+      },
+    };
+    const run = (extra: object, at: string) =>
+      reconcile(
+        world({
+          now: at,
+          services: [orders],
+          destination: { name: 'd', generation: 1, annotations: {}, status: {}, ...extra } as never,
+        }),
+      );
+    const s3Hours: string[] = [];
+    for (let h = 0; h < 72; h++) {
+      const at = new Date(Date.UTC(2026, 8, 28, 0, 0) + h * 3600_000).toISOString();
+      expect(run(pvc, at).some((a) => a.type === 'create-backup')).toBe(false);
+      if (run(s3, at).some((a) => a.type === 'create-backup')) s3Hours.push(at.slice(11, 13));
+    }
+    expect(s3Hours.length).toBeGreaterThan(0);
+  });
+
+  test('accepts PVC destination with existingClaimName', () => {
+    const actions = reconcile(
+      world({
+        services: [orders],
+        destination: {
+          name: 'default',
+          generation: 2,
+          annotations: { 'platform.di-framework.dev/backup-now': '2026-09-28T15:00:00.000Z' },
+          spec: {
+            type: 'pvc',
+            existingClaimName: 'my-backup-pvc',
+            schedule: '0 2 * * *',
+          },
+          status: {},
+        },
+      }),
+    );
+    expect(actions.some((action) => action.type === 'create-backup')).toBe(true);
+    const job = actions.find((action) => action.type === 'create-job');
+    expect(job && job.type === 'create-job' && JSON.stringify(job.body)).toContain(
+      'BACKUP_DESTINATION_TYPE',
+    );
+    expect(job && job.type === 'create-job' && JSON.stringify(job.body)).toContain('pvc');
+    expect(job && job.type === 'create-job' && JSON.stringify(job.body)).toContain('my-backup-pvc');
+    expect(job && job.type === 'create-job' && JSON.stringify(job.body)).toContain(
+      'BACKUP_PVC_MOUNT_PATH',
+    );
+  });
+
+  test('accepts PVC destination with volumeClaimTemplate', () => {
+    const actions = reconcile(
+      world({
+        services: [orders],
+        destination: {
+          name: 'default',
+          generation: 2,
+          annotations: { 'platform.di-framework.dev/backup-now': '2026-09-28T15:00:00.000Z' },
+          spec: {
+            type: 'pvc',
+            volumeClaimTemplate: { size: '100Gi' },
+            schedule: '0 2 * * *',
+          },
+          status: {},
+        },
+      }),
+    );
+    expect(actions.some((action) => action.type === 'create-backup')).toBe(true);
+    const job = actions.find((action) => action.type === 'create-job');
+    expect(job && job.type === 'create-job' && JSON.stringify(job.body)).toContain('di-backup-pvc');
+  });
+});
+
+describe('several destinations (#233)', () => {
+  const pvc = {
+    name: 'pvc',
+    generation: 1,
+    annotations: {},
+    spec: { type: 'pvc' as const, volumeClaimTemplate: { size: '10Gi' }, schedule: '0 2 * * *' },
+    status: { lastAttemptTime: '2026-09-28T02:00:00.000Z' },
+  };
+  const now = { 'platform.di-framework.dev/backup-now': '2026-09-28T15:00:00.000Z' };
+
+  test('a PVC Job mounts the claim and never references the S3 Secret', () => {
+    const job = jobBody({
+      world: world({ destination: pvc }),
+      name: 'di-backup-orders-1',
+      backupKind: 'dump',
+      agentKind: 'postgres',
+      service: orders,
+      objectPrefix: 'p',
+    });
+    const text = JSON.stringify(job);
+    expect(text).not.toContain('di-backup-destination');
+    expect(text).not.toContain('envFrom');
+    expect(text).toContain('"claimName":"di-backup-pvc"');
+    expect(text).toContain('"platform.di-framework.dev/destination":"pvc"');
+    const s3 = JSON.stringify(
+      jobBody({
+        world: world(),
+        name: 'x',
+        backupKind: 'gc',
+        agentKind: 'gc',
+        objectPrefix: '',
+      }),
+    );
+    expect(s3).toContain('di-backup-destination');
+    expect(s3).not.toContain('backup-pvc');
+  });
+
+  test('loadWorld reports missing claims and carries creation times', async () => {
+    const destination = (name: string, spec: object, created: string) => ({
+      metadata: { name, creationTimestamp: created },
+      spec,
+    });
+    const client: KubeClient = {
+      async get(path) {
+        if (path.endsWith('/backupdestinations'))
+          return {
+            items: [
+              destination('archive', { type: 's3', bucket: 'b' }, '2026-10-01T00:00:00Z'),
+              destination('default', { type: 's3', bucket: 'b' }, '2026-09-01T00:00:00Z'),
+              destination(
+                'pvc',
+                { type: 'pvc', existingClaimName: 'typo' },
+                '2026-09-02T00:00:00Z',
+              ),
+              destination('local', { type: 'pvc' }, '2026-09-03T00:00:00Z'),
+            ],
+          };
+        if (path.endsWith('/persistentvolumeclaims'))
+          return { items: [{ metadata: { name: 'di-backup-pvc' } }] };
+        return { items: [] };
+      },
+      async post() {
+        return {};
+      },
+      async patch() {
+        return {};
+      },
+      async remove() {},
+    };
+    const loaded = await loadWorld(client, 'di-tenant-alpha', 'image:dev', '2026-10-02T00:00:00Z');
+    expect(loaded.missingClaims).toEqual(['typo']);
+    expect(loaded.destinations?.find((item) => item.name === 'default')?.createdAt).toBe(
+      '2026-09-01T00:00:00Z',
+    );
+  });
+
+  test('the oldest S3 destination owns the credentials even when another sorts first', () => {
+    const base = world().destination!;
+    const archive = { ...base, name: 'archive', createdAt: '2026-10-01T00:00:00Z' };
+    const original = { ...base, name: 'default', createdAt: '2026-09-01T00:00:00Z' };
+    expect(pickS3Owner([archive, original])?.name).toBe('default');
+    expect(pickS3Owner([{ ...archive, createdAt: undefined }, original])?.name).toBe('default');
+    const tie = [
+      { ...original, name: 'b' },
+      { ...original, name: 'a' },
+    ];
+    expect(pickS3Owner(tie)?.name).toBe('a');
+    const actions = reconcileAll(
+      world({ destinations: [archive, original], destination: archive }),
+    );
+    const text = JSON.stringify(actions);
+    expect(text).toContain('Only one S3 destination per tenant: default');
+    expect(text).toContain('archive');
+  });
+
+  test('a missing claim fails the PVC destination early with ClaimMissing', () => {
+    const claimless = {
+      ...world().destination!,
+      name: 'pvc',
+      spec: { type: 'pvc' as const, existingClaimName: 'typo' },
+    };
+    const actions = reconcile(world({ destination: claimless, missingClaims: ['typo'] }));
+    expect(JSON.stringify(actions)).toContain('ClaimMissing');
+    expect(actions.some((action) => action.type === 'create-job')).toBe(false);
+    const present = reconcile(world({ destination: claimless, missingClaims: [] }));
+    expect(JSON.stringify(present)).not.toContain('ClaimMissing');
+  });
+
+  test('refuses a second S3 destination and an S3 destination without a bucket', () => {
+    const second = reconcile(world({ s3Owner: 'other' }));
+    expect(JSON.stringify(second)).toContain('Only one S3 destination per tenant: other');
+    const bucketless = reconcile(
+      world({
+        destination: {
+          ...world().destination!,
+          spec: { ...world().destination!.spec, bucket: undefined },
+        },
+      }),
+    );
+    expect(JSON.stringify(bucketless)).toContain('S3 bucket is missing');
+    const pvcReady = reconcile(world({ destination: pvc }));
+    expect(JSON.stringify(pvcReady)).toContain('Claim configured');
+    expect(pvcReady.some((action) => action.type === 'copy-credentials')).toBe(false);
+  });
+
+  test('reconciles S3 and PVC side by side, one Job at a time', () => {
+    const s3 = { ...world().destination!, annotations: now, status: {} };
+    const both = world({
+      services: [orders],
+      runtimeSecretPresent: false,
+      destinations: [s3, { ...pvc, annotations: now, status: {} }],
+      destination: undefined,
+    });
+    const actions = reconcileAll(both);
+    const jobs = actions.filter((action) => action.type === 'create-job');
+    expect(jobs).toHaveLength(1);
+    expect(JSON.stringify(jobs[0])).toContain('"platform.di-framework.dev/destination":"default"');
+    const statuses = actions.flatMap((action) =>
+      action.type === 'destination-status' ? [action.name] : [],
+    );
+    expect(statuses).toEqual(['default', 'pvc']);
+    expect(JSON.stringify(actions.filter((a) => a.type === 'destination-status')[1])).toContain(
+      'BackupInProgress',
+    );
+    // The S3 dump is running: the PVC destination waits for it.
+    const running = reconcileAll({
+      ...both,
+      jobs: [
+        {
+          name: 'di-backup-orders-1',
+          backupKind: 'dump',
+          serviceName: 'orders',
+          phase: 'Running',
+          destinationName: 'default',
+        },
+      ],
+    });
+    expect(running.some((action) => action.type === 'create-job')).toBe(false);
+    // Once it is done, the PVC destination takes its turn.
+    const after = reconcileAll({
+      ...both,
+      destinations: [
+        {
+          ...world().destination!,
+          status: {
+            lastAttemptTime: '2026-09-28T02:00:00.000Z',
+            services: [
+              {
+                name: 'orders',
+                type: 'postgres',
+                lastAttemptTime: '2026-09-28T02:00:00.000Z',
+                lastReason: 'Completed',
+              },
+            ],
+          },
+        },
+        { ...pvc, annotations: now, status: {} },
+      ],
+    });
+    const pvcJob = after.find((action) => action.type === 'create-job');
+    expect(JSON.stringify(pvcJob)).toContain('"claimName":"di-backup-pvc"');
+    const backup = after.find((action) => action.type === 'create-backup');
+    expect(JSON.stringify(backup)).toContain('"destinationName":"pvc"');
+    expect(reconcileAll(world({ destination: undefined }))).toEqual([]);
+  });
+
+  test('merges extraEgress once and attributes Jobs and restores from before #233', () => {
+    const rule = { cidr: '10.8.0.10/32', port: 9000, protocol: 'TCP' as const };
+    const s3 = {
+      ...world().destination!,
+      spec: { ...world().destination!.spec, extraEgress: [rule] },
+    };
+    const backup = (name: string, destinationName: string) => ({
+      name,
+      serviceName: 'orders',
+      destinationName,
+      phase: 'Succeeded' as const,
+      objectKey: `k/${name}/data.dump`,
+      uid: orders.uid,
+      type: 'postgres',
+      className: orders.className,
+      storage: '1Gi',
+      createdAt: '2026-09-28T02:00:00.000Z',
+    });
+    const actions = reconcileAll(
+      world({
+        services: [orders],
+        destination: undefined,
+        destinations: [s3, { ...pvc, spec: { ...pvc.spec, extraEgress: [rule, rule] } }],
+        backups: [backup('on-s3', 'default'), backup('on-pvc', 'pvc'), backup('legacy', '')],
+        restores: [
+          { name: 'r-pvc', sourceBackupName: 'on-pvc', targetServiceName: 'fresh' },
+          { name: 'r-gone', sourceBackupName: 'missing', targetServiceName: 'fresh' },
+        ],
+        jobs: [
+          { name: 'old-dump', backupKind: 'dump', serviceName: 'orders', phase: 'Succeeded' },
+          {
+            name: 'old-dump-2',
+            backupKind: 'dump',
+            serviceName: 'orders',
+            phase: 'Succeeded',
+            backupName: 'on-pvc',
+          },
+          {
+            name: 'old-gc',
+            backupKind: 'gc',
+            serviceName: '',
+            phase: 'Succeeded',
+            gcBackups: ['on-pvc'],
+          },
+          {
+            name: 'old-probe',
+            backupKind: 'probe',
+            serviceName: 'fresh',
+            phase: 'Failed',
+            backupName: 'r-pvc',
+          },
+          {
+            name: 'old-restore',
+            backupKind: 'restore',
+            serviceName: 'fresh',
+            phase: 'Failed',
+            backupName: 'nobody',
+          },
+        ],
+      }),
+    );
+    const egress = actions.filter((action) => action.type === 'sync-egress');
+    expect(egress).toEqual([{ type: 'sync-egress', extraEgress: [rule] }]);
+    expect(actions).toContainEqual({ type: 'delete-backup', name: 'on-pvc' });
+    expect(JSON.stringify(actions)).toContain('"name":"r-pvc"');
+    expect(JSON.stringify(actions)).toContain('BackupNotFound');
+  });
+});
+
+describe('console and client with several destinations', () => {
+  test('renders each destination and starts a backup on the one posted', () => {
+    const pvc = {
+      name: 'pvc',
+      generation: 1,
+      annotations: {},
+      spec: { type: 'pvc' as const, existingClaimName: 'mine' },
+      status: {},
+    };
+    const both = world({ destinations: [world().destination!, pvc] });
+    const html = render(both);
+    expect(html).toContain('Destination default (s3)');
+    expect(html).toContain('Destination pvc (pvc)');
+    expect(handle('POST', '/backups', 'destination=pvc', both).actions).toEqual([
+      {
+        type: 'annotate',
+        name: 'pvc',
+        key: 'platform.di-framework.dev/backup-now',
+        value: both.now,
+      },
+    ]);
+    expect(handle('POST', '/backups', 'destination=nope', both).status).toBe(400);
+    expect(render(world({ destination: undefined }))).toContain('Destination none.');
+  });
+
+  test('loads every destination, defaults a missing type to S3, and patches status by name', async () => {
+    const patched: string[] = [];
+    const client: KubeClient = {
+      async get(path) {
+        if (path.endsWith('/backupdestinations')) {
+          return {
+            items: [
+              { metadata: { name: 'legacy' }, spec: { bucket: 'b' } },
+              { metadata: {} },
+              {
+                metadata: { name: 'pvc', generation: 4 },
+                spec: { type: 'pvc', existingClaimName: 'c' },
+              },
+            ],
+          };
+        }
+        if (path.endsWith('/backups')) {
+          return {
+            items: [{ metadata: { name: 'b1' }, spec: { destinationName: 'pvc' } }],
+          };
+        }
+        if (path.endsWith('/jobs')) {
+          return {
+            items: [
+              {
+                metadata: {
+                  name: 'j',
+                  labels: {
+                    'platform.di-framework.dev/backup-kind': 'dump',
+                    'platform.di-framework.dev/destination': 'pvc',
+                  },
+                },
+              },
+            ],
+          };
+        }
+        if (path.endsWith('/secrets/di-backup-destination')) throw new Error('missing');
+        return { items: [] };
+      },
+      async post() {
+        return {};
+      },
+      async patch(path) {
+        patched.push(path);
+        return {};
+      },
+      async remove() {},
+    };
+    const loaded = await loadWorld(client, 'di-tenant-alpha', 'image:dev', 'now');
+    expect(loaded.destinations?.map((item) => [item.name, item.spec.type])).toEqual([
+      ['legacy', 's3'],
+      ['pvc', 'pvc'],
+    ]);
+    expect(loaded.destination?.name).toBe('legacy');
+    expect(loaded.backups[0]?.destinationName).toBe('pvc');
+    expect(loaded.jobs[0]?.destinationName).toBe('pvc');
+    await applyActions(client, loaded, [
+      { type: 'destination-status', name: 'pvc', status: {} },
+      { type: 'destination-status', status: {} },
+    ]);
+    expect(patched).toEqual([
+      '/apis/platform.di-framework.dev/v1alpha1/namespaces/di-tenant-alpha/backupdestinations/pvc/status',
+      '/apis/platform.di-framework.dev/v1alpha1/namespaces/di-tenant-alpha/backupdestinations/legacy/status',
     ]);
   });
 });

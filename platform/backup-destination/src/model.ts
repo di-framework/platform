@@ -5,6 +5,12 @@ export const VERSION = `${GROUP}/v1alpha1`;
 export const DUMP_CAP_BYTES = 4 * 1024 ** 3;
 export const BACKUP_NOW = `${GROUP}/backup-now`;
 export const SCHEDULE = '0 2 * * *';
+/** Claim the chart creates from `volumeClaimTemplate`, in the runtime namespace. */
+export const PVC_CLAIM = 'di-backup-pvc';
+/** Where agent Jobs mount a PVC destination. */
+export const PVC_MOUNT = '/backup-pvc';
+/** Runtime-namespace Secret the S3 credentials are copied into. There is one per tenant. */
+export const RUNTIME_SECRET = 'di-backup-destination';
 
 export interface Egress {
   cidr: string;
@@ -13,11 +19,17 @@ export interface Egress {
 }
 
 export interface DestinationSpec {
-  bucket: string;
+  type: 's3' | 'pvc';
+  bucket?: string;
   prefix?: string;
   region?: string;
   endpoint?: string;
   credentialsSecretRef?: { name?: string };
+  existingClaimName?: string;
+  volumeClaimTemplate?: {
+    storageClassName?: string;
+    size?: string;
+  };
   schedule?: string;
   retention?: { successful?: number };
   extraEgress?: Egress[];
@@ -49,6 +61,8 @@ export interface DestinationView {
   spec: DestinationSpec;
   status: DestinationStatus;
   annotations: Record<string, string>;
+  /** metadata.creationTimestamp; decides which S3 destination owns the runtime credentials. */
+  createdAt?: string;
 }
 
 export interface ServiceView {
@@ -67,6 +81,8 @@ export interface ServiceView {
 export interface BackupView {
   name: string;
   serviceName: string;
+  /** The BackupDestination that holds this backup's objects. */
+  destinationName: string;
   phase?: 'Running' | 'Succeeded' | 'Failed';
   objectKey?: string;
   digest?: string;
@@ -95,6 +111,8 @@ export interface JobView {
   message?: string;
   backupName?: string;
   gcBackups?: string[];
+  /** The BackupDestination the Job reads or writes; absent on Jobs from before #233. */
+  destinationName?: string;
 }
 
 export interface World {
@@ -102,7 +120,18 @@ export interface World {
   tenantNamespace: string;
   runtimeNamespace: string;
   agentImage: string;
+  /** The destination {@link reconcile} works on. `loadWorld` sets it to the first one listed. */
   destination?: DestinationView;
+  /** Every BackupDestination in the tenant namespace, in API (name) order. */
+  destinations?: DestinationView[];
+  /** Another destination's Job is running or was started this tick: start nothing new. */
+  busy?: boolean;
+  /** Union of every destination's extraEgress; the agent NetworkPolicy is shared. */
+  wantedEgress?: Egress[];
+  /** Name of the S3 destination whose credentials the runtime Secret holds, if any. */
+  s3Owner?: string;
+  /** Claims that do not exist in the runtime namespace. Absent when the lookup was not possible. */
+  missingClaims?: string[];
   services: ServiceView[];
   backups: BackupView[];
   restores: RestoreView[];
@@ -113,7 +142,7 @@ export interface World {
 }
 
 export type Action =
-  | { type: 'destination-status'; status: DestinationStatus }
+  | { type: 'destination-status'; name?: string; status: DestinationStatus }
   | { type: 'clear-annotation'; name: string; key: string }
   | { type: 'annotate'; name: string; key: string; value: string }
   | { type: 'copy-credentials'; secretName: string }
@@ -124,6 +153,11 @@ export type Action =
   | { type: 'create-job'; body: Record<string, unknown> }
   | { type: 'restore-status'; name: string; status: Record<string, unknown> }
   | { type: 'create-restore'; body: Record<string, unknown> };
+
+/** Destinations created before #233 carry no `type`; they are S3. */
+export function destinationType(spec: Pick<DestinationSpec, 'type'> | undefined): 's3' | 'pvc' {
+  return spec?.type === 'pvc' ? 'pvc' : 's3';
+}
 
 export function runtimeNamespaceFor(tenantNamespace: string): string {
   if (!tenantNamespace.startsWith('di-tenant-') || tenantNamespace.length < 'di-tenant-x'.length) {
@@ -184,4 +218,18 @@ export function servicePort(type: ServiceView['type']): string {
   if (type === 'postgres') return '5432';
   if (type === 'keyvalue') return '6379';
   return '4222';
+}
+
+/**
+ * The S3 destination that owns the runtime credentials: the oldest by creationTimestamp, name as
+ * the tie-break. Never name order, so adding `archive` beside a working `default` cannot take over.
+ */
+export function pickS3Owner(destinations: DestinationView[]): DestinationView | undefined {
+  return destinations
+    .filter((item) => destinationType(item.spec) === 's3')
+    .sort(
+      (a, b) =>
+        (a.createdAt || '9999').localeCompare(b.createdAt || '9999') ||
+        a.name.localeCompare(b.name),
+    )[0];
 }

@@ -2,10 +2,14 @@ import {
   type Action,
   type BackupView,
   type DestinationView,
+  destinationType,
   type Egress,
   GROUP,
   type JobView,
+  PVC_CLAIM,
+  pickS3Owner,
   type RestoreView,
+  RUNTIME_SECRET,
   runtimeNamespaceFor,
   type ServiceView,
   VERSION,
@@ -85,22 +89,42 @@ export async function loadWorld(
         .catch(() => undefined),
     ],
   );
-  const destinationItem = items(destinations)[0];
-  const destination: DestinationView | undefined = destinationItem?.metadata?.name
-    ? {
-        name: destinationItem.metadata.name,
-        generation: destinationItem.metadata.generation ?? 1,
-        spec: (destinationItem.spec ?? {}) as unknown as DestinationView['spec'],
-        status: (destinationItem.status ?? {}) as DestinationView['status'],
-        annotations: destinationItem.metadata.annotations ?? {},
-      }
-    : undefined;
-  const secretName = destination?.spec.credentialsSecretRef?.name;
+  const views = items(destinations).flatMap((item): DestinationView[] => {
+    if (!item.metadata?.name) return [];
+    const spec = (item.spec ?? {}) as unknown as DestinationView['spec'];
+    return [
+      {
+        name: item.metadata.name,
+        generation: item.metadata.generation ?? 1,
+        spec: { ...spec, type: destinationType(spec) },
+        status: (item.status ?? {}) as DestinationView['status'],
+        annotations: item.metadata.annotations ?? {},
+        createdAt: item.metadata.creationTimestamp,
+      },
+    ];
+  });
+  // The runtime Secret holds one set of S3 keys: those of the oldest S3 destination.
+  const s3 = pickS3Owner(views);
+  const secretName = s3?.spec.credentialsSecretRef?.name;
   const credential = items(secret).find((item) => item.metadata?.name === secretName);
   const runtimeSecrets = await client
-    .get(`/api/v1/namespaces/${runtimeNamespace}/secrets/di-backup-destination`)
+    .get(`/api/v1/namespaces/${runtimeNamespace}/secrets/${RUNTIME_SECRET}`)
     .then(() => true)
     .catch(() => false);
+  const claims = await client
+    .get(`/api/v1/namespaces/${runtimeNamespace}/persistentvolumeclaims`)
+    .then((list) => new Set(items(list).map((item) => item.metadata?.name)))
+    .catch(() => undefined);
+  const missingClaims = claims
+    ? [
+        ...new Set(
+          views
+            .filter((view) => view.spec.type === 'pvc')
+            .map((view) => view.spec.existingClaimName || PVC_CLAIM)
+            .filter((name) => !claims.has(name)),
+        ),
+      ]
+    : undefined;
   const messages = new Map<string, string>();
   for (const pod of items(pods)) {
     const statuses = (pod.status?.containerStatuses ?? []) as {
@@ -118,7 +142,9 @@ export async function loadWorld(
     tenantNamespace,
     runtimeNamespace,
     agentImage,
-    destination,
+    destination: views[0],
+    destinations: views,
+    missingClaims,
     services: items(services).flatMap((item) => {
       const type = item.spec?.type;
       if (type !== 'postgres' && type !== 'keyvalue' && type !== 'messaging') return [];
@@ -153,6 +179,7 @@ export async function loadWorld(
         {
           name: item.metadata.name,
           serviceName: String(spec.serviceName ?? ''),
+          destinationName: String(spec.destinationName ?? ''),
           phase: phaseOf(item.status),
           objectKey: typeof item.status?.objectKey === 'string' ? item.status.objectKey : undefined,
           digest: typeof item.status?.digest === 'string' ? item.status.digest : undefined,
@@ -192,6 +219,7 @@ export async function loadWorld(
           message: messages.get(item.metadata.name),
           backupName: labels[`${GROUP}/backup-name`],
           gcBackups: item.metadata.annotations?.[`${GROUP}/gc-backups`]?.split(',').filter(Boolean),
+          destinationName: labels[`${GROUP}/destination`],
         },
       ];
     }),
@@ -242,9 +270,11 @@ export async function applyActions(
   actions: Action[],
 ): Promise<void> {
   for (const action of actions) {
-    if (action.type === 'destination-status' && world.destination) {
+    if (action.type === 'destination-status') {
+      const name = action.name ?? world.destination?.name;
+      if (!name) continue;
       await client.patch(
-        `/apis/${VERSION}/namespaces/${world.tenantNamespace}/backupdestinations/${world.destination.name}/status`,
+        `/apis/${VERSION}/namespaces/${world.tenantNamespace}/backupdestinations/${name}/status`,
         { status: action.status },
       );
     } else if (action.type === 'annotate' || action.type === 'clear-annotation') {
@@ -266,13 +296,13 @@ export async function applyActions(
         .post(`/api/v1/namespaces/${world.runtimeNamespace}/secrets`, {
           apiVersion: 'v1',
           kind: 'Secret',
-          metadata: { name: 'di-backup-destination', namespace: world.runtimeNamespace },
+          metadata: { name: RUNTIME_SECRET, namespace: world.runtimeNamespace },
           type: 'Opaque',
           data,
         })
         .catch(async () => {
           await client.patch(
-            `/api/v1/namespaces/${world.runtimeNamespace}/secrets/di-backup-destination`,
+            `/api/v1/namespaces/${world.runtimeNamespace}/secrets/${RUNTIME_SECRET}`,
             { data },
           );
         });

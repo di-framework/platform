@@ -43,6 +43,12 @@ async function helm(): Promise<string> {
   return binary;
 }
 
+const destinations = (out: string) =>
+  out
+    .split('\n---\n')
+    .filter((doc) => /^kind: BackupDestination$/m.test(doc))
+    .join('\n---\n');
+
 async function template(
   namespace: string,
   values: Record<string, string>,
@@ -99,5 +105,102 @@ describe('backup-destination chart', () => {
     const missing = await template('di-tenant-alpha', {});
     expect(missing.code).not.toBe(0);
     expect(missing.stderr).toContain('bucket is required');
+  }, 30000);
+
+  test('every string field with a CEL rule declares maxLength (the API server cost budget)', async () => {
+    const text = await Bun.file(`${import.meta.dir}/../chart/crds/backups.yaml`).text();
+    const offenders: string[] = [];
+    const walk = (node: unknown, path: string) => {
+      if (!node || typeof node !== 'object') return;
+      const schema = node as Record<string, unknown>;
+      if (
+        schema.type === 'string' &&
+        Array.isArray(schema['x-kubernetes-validations']) &&
+        typeof schema.maxLength !== 'number'
+      )
+        offenders.push(path);
+      for (const [key, value] of Object.entries(schema)) walk(value, `${path}.${key}`);
+    };
+    for (const doc of text.split(/^---$/m)) walk(Bun.YAML.parse(doc), 'crd');
+    expect(offenders).toEqual([]);
+  });
+
+  test('prefix rejects only . and .. segments, so a leading slash stays valid', async () => {
+    const text = await Bun.file(`${import.meta.dir}/../chart/crds/backups.yaml`).text();
+    expect(text).toContain("!self.split('/').exists(p, p == '..' || p == '.')");
+    expect(text).not.toContain("!self.startsWith('/')");
+  });
+
+  test('schedule: S3 keeps its written default; PVC writes none unless set', async () => {
+    const s3 = await template('di-tenant-alpha', { bucket: 'b', existingSecret: 's' });
+    expect(destinations(s3.stdout)).toContain('schedule: "0 2 * * *"');
+    const pvc = await template('di-tenant-alpha', {
+      type: 'pvc',
+      'volumeClaimTemplate.size': '1Gi',
+    });
+    expect(destinations(pvc.stdout)).not.toContain('schedule:');
+    const both = await template('di-tenant-alpha', {
+      type: 'both',
+      bucket: 'b',
+      existingSecret: 's',
+      'volumeClaimTemplate.size': '1Gi',
+      schedule: '5 1 * * *',
+    });
+    expect(destinations(both.stdout).match(/schedule: "5 1 \* \* \*"/g)?.length).toBe(2);
+  });
+
+  test('renders a PVC destination, both destinations, and refuses an incomplete one', async () => {
+    const created = await template('di-tenant-alpha', {
+      type: 'pvc',
+      'volumeClaimTemplate.size': '20Gi',
+      'volumeClaimTemplate.storageClassName': 'local-path',
+    });
+    expect(created.code).toBe(0);
+    const claim = created.stdout
+      .split('\n---\n')
+      .find((doc) => doc.includes('kind: PersistentVolumeClaim'));
+    expect(claim).toContain('name: di-backup-pvc');
+    expect(claim).toContain('namespace: di-runtime-alpha');
+    expect(claim).toContain('helm.sh/resource-policy: keep');
+    expect(claim).toContain('storageClassName: "local-path"');
+    expect(claim).toContain('storage: "20Gi"');
+    const [only, ...others] = created.stdout
+      .split('\n---\n')
+      .filter((doc) => doc.includes('v1alpha1\nkind: BackupDestination\n'));
+    expect(others).toEqual([]);
+    expect(only).toContain('type: pvc');
+    expect(only).toContain('name: pvc');
+    expect(only).not.toContain('name: default');
+    expect(only).not.toContain('bucket:');
+    expect(only).not.toContain('credentialsSecretRef');
+    expect(created.stdout).not.toContain('kind: Secret');
+
+    const existing = await template('di-tenant-alpha', { type: 'pvc', existingClaimName: 'mine' });
+    expect(existing.code).toBe(0);
+    expect(existing.stdout).toContain('existingClaimName: "mine"');
+    expect(existing.stdout).not.toContain('kind: PersistentVolumeClaim');
+
+    const both = await template('di-tenant-alpha', {
+      type: 'both',
+      bucket: 'tenant-alpha-backups',
+      existingSecret: 'di-backup-s3',
+      'volumeClaimTemplate.size': '5Gi',
+    });
+    expect(both.code).toBe(0);
+    const destinations = both.stdout
+      .split('\n---\n')
+      .filter((doc) => doc.includes('v1alpha1\nkind: BackupDestination\n'));
+    expect(destinations).toHaveLength(2);
+    expect(destinations[0]).toContain('name: default');
+    expect(destinations[0]).toContain('type: s3');
+    expect(destinations[1]).toContain('name: pvc');
+    expect(destinations[1]).toContain('type: pvc');
+
+    const incomplete = await template('di-tenant-alpha', { type: 'pvc' });
+    expect(incomplete.code).not.toBe(0);
+    expect(incomplete.stderr).toContain('existingClaimName or volumeClaimTemplate.size');
+    const unknown = await template('di-tenant-alpha', { type: 'nfs' });
+    expect(unknown.code).not.toBe(0);
+    expect(unknown.stderr).toContain('type must be s3, pvc, or both');
   }, 30000);
 });

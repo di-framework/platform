@@ -10,7 +10,9 @@ import {
   parseRequest,
   rcloneEnv,
   runAgent,
+  safeKey,
   sha256Prefixed,
+  sweepPvc,
 } from '../src/run.ts';
 
 function request(overrides: Partial<AgentRequest> = {}): AgentRequest {
@@ -52,6 +54,9 @@ function harness(
     async remove(path) {
       files.delete(path);
     },
+    async unlink(path) {
+      files.delete(path);
+    },
     async mkdir(path) {
       files.set(`${path}/.dir`, Buffer.from(''));
     },
@@ -61,6 +66,21 @@ function harness(
 
 function ok(): ExecResult {
   return { code: 0, stdout: '', stderr: '' };
+}
+
+/** `cp`, `mv`, and `rmdir` against the in-memory files of {@link harness}. */
+function fsTools(files: Map<string, Uint8Array>) {
+  return (argv: string[]): ExecResult => {
+    const [tool, ...args] = argv;
+    if (tool === 'cp' || tool === 'mv') {
+      const [from, to] = args.filter((arg) => !arg.startsWith('-'));
+      const value = files.get(from ?? '');
+      if (!value || !to) return { code: 1, stdout: '', stderr: 'No such file' };
+      files.set(to, value);
+      if (tool === 'mv') files.delete(from ?? '');
+    }
+    return ok();
+  };
 }
 
 function wrote(files: Map<string, Uint8Array>, path: string): string {
@@ -99,6 +119,16 @@ describe('termination and request parsing', () => {
       region: 'us-east-1',
       pgUser: 'app',
       pgDatabase: 'app',
+    });
+    const pvc = parseRequest({
+      BACKUP_KIND: 'postgres',
+      BACKUP_DESTINATION_TYPE: 'pvc',
+      BACKUP_PVC_MOUNT_PATH: '/mnt/backup',
+    });
+    expect(pvc).toMatchObject({
+      kind: 'postgres',
+      destinationType: 'pvc',
+      pvcMountPath: '/mnt/backup',
     });
   });
 
@@ -361,6 +391,171 @@ describe('backup-agent kinds', () => {
     expect(await runAgent(request({ kind: 'gc', bucket: '' }), bucket.io)).toBe(1);
     expect(wrote(files, '/work/termination')).toContain('"format":"delete"');
   });
+
+  test('PVC destination dumps through a .partial name, restores, and gcs', async () => {
+    const pvc = { destinationType: 'pvc' as const, pvcMountPath: '/mnt/backup', bucket: '' };
+    const stamp = '/mnt/backup/di-framework/alpha/orders/uid/20260927T020012Z';
+    const postgres = harness((argv) => {
+      if (argv[0] === 'pg_dump') {
+        postgres.files.set(argv[argv.indexOf('-f') + 1] ?? '', Buffer.from('dump data'));
+      }
+      return fsTools(postgres.files)(argv);
+    });
+    expect(await runAgent(request({ kind: 'postgres', ...pvc }), postgres.io)).toBe(0);
+    const record = JSON.parse(wrote(postgres.files, '/work/termination')) as {
+      ok: boolean;
+      objectKey: string;
+    };
+    expect(record.ok).toBe(true);
+    expect(record.objectKey).toBe('di-framework/alpha/orders/uid/20260927T020012Z/data.dump');
+    expect(wrote(postgres.files, `${stamp}/data.dump`)).toBe('dump data');
+    expect(wrote(postgres.files, `${stamp}/manifest.json`)).toContain('BackupManifest');
+    expect([...postgres.files.keys()].some((key) => key.endsWith('.partial'))).toBe(false);
+    expect(postgres.calls.some((call) => call.argv[0] === 'rclone')).toBe(false);
+
+    const restore = harness((argv) => fsTools(restore.files)(argv));
+    restore.files.set(`${stamp}/data.dump`, Buffer.from('dump data'));
+    expect(await runAgent(request({ kind: 'restore-postgres', ...pvc }), restore.io)).toBe(0);
+    expect(wrote(restore.files, '/work/data.dump')).toBe('dump data');
+
+    const gc = harness((argv) => fsTools(gc.files)(argv));
+    gc.files.set(`${stamp}/data.dump`, Buffer.from('x'));
+    const keys = `${stamp.slice('/mnt/backup/'.length)}/data.dump\ntop-level`;
+    expect(await runAgent(request({ kind: 'gc', gcKeys: keys, ...pvc }), gc.io)).toBe(0);
+    expect(gc.files.has(`${stamp}/data.dump`)).toBe(false);
+    const rmdirs = gc.calls.map((call) => call.argv.join(' ')).filter((c) => c.startsWith('rmdir'));
+    // Stamp first, then each emptied parent up to (not including) the claim root.
+    expect(rmdirs).toEqual(
+      [`rmdir ${stamp}`, '/uid', '/orders', '/alpha', '/di-framework'].map((tail, i) =>
+        i === 0
+          ? `rmdir ${stamp}`
+          : `rmdir ${stamp.slice(0, stamp.lastIndexOf(tail) + tail.length)}`,
+      ),
+    );
+    expect(
+      gc.calls.some(
+        (call) => call.argv[0] === 'sh' && call.argv[4] === '/mnt/backup/di-framework/alpha',
+      ),
+    ).toBe(true);
+    expect(JSON.parse(wrote(gc.files, '/work/termination')).tool).toBe('rm');
+  });
+
+  test('a failed PVC copy removes the .partial and the orphan data file', async () => {
+    const pvc = { destinationType: 'pvc' as const, pvcMountPath: '/mnt/backup', bucket: '' };
+    const stamp = '/mnt/backup/di-framework/alpha/orders/uid/20260927T020012Z';
+    const run = async (fail: (argv: string[]) => boolean) => {
+      const h = harness((argv) => {
+        if (argv[0] === 'pg_dump')
+          h.files.set(argv[argv.indexOf('-f') + 1] ?? '', Buffer.from('d'));
+        if (fail(argv)) {
+          // cp wrote part of the file before failing
+          if (argv[0] === 'cp') h.files.set(argv[2] ?? '', Buffer.from('half'));
+          return { code: 1, stdout: '', stderr: 'No space left on device' };
+        }
+        return fsTools(h.files)(argv);
+      });
+      const code = await runAgent(request({ kind: 'postgres', ...pvc }), h.io);
+      return { h, code };
+    };
+    const cp = await run((argv) => argv[0] === 'cp' && argv[1] === '/work/data.dump');
+    expect(cp.code).toBe(1);
+    expect([...cp.h.files.keys()].filter((k) => k.startsWith(stamp))).toEqual([`${stamp}/.dir`]);
+    const sync = await run((argv) => argv[0] === 'sync' && argv[1]?.endsWith('.partial') === true);
+    expect(sync.code).toBe(1);
+    expect([...sync.h.files.keys()].some((k) => k.endsWith('.partial'))).toBe(false);
+    const mv = await run((argv) => argv[0] === 'mv');
+    expect(mv.code).toBe(1);
+    expect([...mv.h.files.keys()].some((k) => k.endsWith('.partial'))).toBe(false);
+    const manifestFails = await run(
+      (argv) => argv[0] === 'cp' && argv[1] === '/work/manifest.json',
+    );
+    expect(manifestFails.code).toBe(1);
+    expect(manifestFails.h.files.has(`${stamp}/data.dump`)).toBe(false);
+    expect(wrote(manifestFails.h.files, '/work/termination')).toContain('UploadFailed');
+  });
+
+  test('PVC gc unlinks files only and fails when unlink fails', async () => {
+    const pvc = { destinationType: 'pvc' as const, pvcMountPath: '/mnt/backup', bucket: '' };
+    const h = harness(() => ok());
+    h.io.unlink = async () => {
+      throw new Error('EISDIR');
+    };
+    expect(await runAgent(request({ kind: 'gc', gcKeys: 'a/b/c', ...pvc }), h.io)).toBe(1);
+    expect(wrote(h.files, '/work/termination')).toContain('GcFailed');
+  });
+
+  test('PVC paths fail closed', async () => {
+    const pvc = { destinationType: 'pvc' as const, pvcMountPath: '/mnt/backup', bucket: '' };
+    const unmounted = harness(() => ok());
+    expect(await runAgent(request({ ...pvc, pvcMountPath: undefined }), unmounted.io)).toBe(1);
+    expect(wrote(unmounted.files, '/work/termination')).toContain('MissingClaim');
+
+    const escaping = harness((argv) => {
+      if (argv[0] === 'pg_dump') escaping.files.set('/work/data.dump', Buffer.from('d'));
+      return ok();
+    });
+    expect(await runAgent(request({ ...pvc, prefix: '../outside' }), escaping.io)).toBe(1);
+    expect(wrote(escaping.files, '/work/termination')).toContain('UploadFailed');
+
+    for (const failing of ['cp', 'mv', 'mkdir']) {
+      const broken = harness((argv) => {
+        if (argv[0] === 'pg_dump') broken.files.set('/work/data.dump', Buffer.from('d'));
+        if (argv[0] === failing) return { code: 1, stdout: '', stderr: failing };
+        return ok();
+      });
+      if (failing === 'mkdir') {
+        broken.io.mkdir = async () => {
+          throw new Error('read-only claim');
+        };
+      }
+      expect(await runAgent(request(pvc), broken.io)).toBe(1);
+      expect(wrote(broken.files, '/work/termination')).toContain('UploadFailed');
+    }
+    const secondCopy = harness((argv) => {
+      if (argv[0] === 'pg_dump') secondCopy.files.set('/work/data.dump', Buffer.from('d'));
+      const copies = secondCopy.calls.filter((call) => call.argv[0] === 'cp').length;
+      return argv[0] === 'cp' && copies === 2 ? { code: 1, stdout: '', stderr: '' } : ok();
+    });
+    expect(await runAgent(request(pvc), secondCopy.io)).toBe(1);
+
+    const missing = harness((argv) => fsTools(missing.files)(argv));
+    expect(await runAgent(request({ kind: 'restore-redis', ...pvc }), missing.io)).toBe(1);
+    expect(wrote(missing.files, '/work/termination')).toContain('DownloadFailed');
+    const outside = harness(() => ok());
+    expect(
+      await runAgent(request({ kind: 'restore-nats', ...pvc, prefix: '/etc' }), outside.io),
+    ).toBe(1);
+    expect(wrote(outside.files, '/work/termination')).toContain('PvcPathInvalid');
+    const noMount = harness(() => ok());
+    expect(
+      await runAgent(
+        request({ kind: 'restore-postgres', ...pvc, pvcMountPath: undefined }),
+        noMount.io,
+      ),
+    ).toBe(1);
+
+    for (const keys of ['../escape', '/abs', 'a/./b']) {
+      const gc = harness(() => ok());
+      expect(await runAgent(request({ kind: 'gc', gcKeys: keys, ...pvc }), gc.io)).toBe(1);
+      expect(wrote(gc.files, '/work/termination')).toContain('PvcPathInvalid');
+    }
+    const gcUnmounted = harness(() => ok());
+    expect(
+      await runAgent(
+        request({ kind: 'gc', gcKeys: 'k', ...pvc, pvcMountPath: undefined }),
+        gcUnmounted.io,
+      ),
+    ).toBe(1);
+    expect(wrote(gcUnmounted.files, '/work/termination')).toContain('PvcMountPathNotSet');
+    const gcBroken = harness(() => ok());
+    gcBroken.io.unlink = async () => {
+      throw new Error('remove failed');
+    };
+    expect(await runAgent(request({ kind: 'gc', gcKeys: 'k', ...pvc }), gcBroken.io)).toBe(1);
+    expect(wrote(gcBroken.files, '/work/termination')).toContain('GcFailed');
+    expect(safeKey('')).toBe(false);
+    expect(safeKey('a/b')).toBe(true);
+  });
 });
 
 test('the process entrypoint writes a termination record via stub tools', async () => {
@@ -403,4 +598,100 @@ test('the process entrypoint writes a termination record via stub tools', async 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+describe('sweepPvc on a real tree', () => {
+  test('removes only stale leftovers inside <mount>/<prefix> at stamp depth', async () => {
+    const { mkdir, symlink, utimes, stat } = await import('node:fs/promises');
+    const mount = await mkdtemp(join(tmpdir(), 'sweep-'));
+    const old = new Date(Date.now() - 3 * 86400_000);
+    const put = async (path: string, aged: boolean) => {
+      const full = join(mount, path);
+      await mkdir(join(full, '..'), { recursive: true });
+      await writeFile(full, 'x');
+      if (aged) await utimes(full, old, old);
+    };
+    const exists = (path: string) =>
+      stat(join(mount, path)).then(
+        () => true,
+        () => false,
+      );
+    const stamp = 'bk/svc/uid';
+    await put(`${stamp}/old/data.dump`, true); // orphan: removed
+    await put(`${stamp}/old/data.dump.partial`, true); // stale partial: removed
+    await put(`${stamp}/new/data.dump.partial`, false); // fresh partial: kept
+    await put(`${stamp}/done/data.dump`, true); // complete: kept
+    await put(`${stamp}/done/manifest.json`, true);
+    await put(`${stamp}/fresh/data.dump`, false); // young orphan: kept
+    await put('bk/README', true); // wrong depth: kept
+    await put('bk/svc/uid/stray.partial', true); // depth 3: kept
+    await put('other/app/state/db.sqlite', true); // outside prefix: kept
+    await put('other/app/state/x.partial', true); // outside prefix: kept
+    await put('lost+found/a/b/c/#1234', true); // outside prefix: kept
+    await put('bk/lost+found/a/b/#9', true); // lost+found under prefix: kept
+    await put('elsewhere/a/b/c/data.dump', true); // reachable only through a symlink: kept
+    await symlink(join(mount, 'elsewhere'), join(mount, 'bk/link'));
+
+    const io = {
+      async exec(argv: string[]) {
+        const proc = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe' });
+        return { code: await proc.exited, stdout: '', stderr: '' };
+      },
+    } as AgentIo;
+    await sweepPvc(io, mount, ['bk']);
+
+    expect(await exists(`${stamp}/old/data.dump`)).toBe(false);
+    expect(await exists(`${stamp}/old/data.dump.partial`)).toBe(false);
+    for (const kept of [
+      `${stamp}/new/data.dump.partial`,
+      `${stamp}/done/data.dump`,
+      `${stamp}/done/manifest.json`,
+      `${stamp}/fresh/data.dump`,
+      'bk/README',
+      'bk/svc/uid/stray.partial',
+      'other/app/state/db.sqlite',
+      'other/app/state/x.partial',
+      'lost+found/a/b/c/#1234',
+      'bk/lost+found/a/b/#9',
+      'elsewhere/a/b/c/data.dump',
+    ])
+      expect(await exists(kept)).toBe(true);
+    await rm(mount, { recursive: true, force: true });
+  });
+
+  test('refuses the claim root and symlinked prefixes', async () => {
+    const { mkdir, symlink, utimes, stat } = await import('node:fs/promises');
+    const mount = await mkdtemp(join(tmpdir(), 'sweep-'));
+    const outside = await mkdtemp(join(tmpdir(), 'outside-'));
+    const old = new Date(Date.now() - 3 * 86400_000);
+    const put = async (base: string, path: string) => {
+      const full = join(base, path);
+      await mkdir(join(full, '..'), { recursive: true });
+      await writeFile(full, 'x');
+      await utimes(full, old, old);
+    };
+    await put(mount, 'a/b/c/d/data.dump'); // would match from the claim root
+    await put(outside, 'a/b/c/data.dump');
+    await put(outside, 'x/a/b/c/data.dump');
+    await symlink(outside, join(mount, 'bk'));
+    await mkdir(join(mount, 'mid'), { recursive: true });
+    await symlink(outside, join(mount, 'mid/link'));
+    const io = {
+      async exec(argv: string[]) {
+        const proc = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe' });
+        return { code: await proc.exited, stdout: '', stderr: '' };
+      },
+    } as AgentIo;
+    await sweepPvc(io, mount, ['/', '', 'bk/', 'mid/link', 'mid/link/x']);
+    const exists = (p: string) =>
+      stat(p).then(
+        () => true,
+        () => false,
+      );
+    expect(await exists(join(mount, 'a/b/c/d/data.dump'))).toBe(true);
+    expect(await exists(join(outside, 'a/b/c/data.dump'))).toBe(true);
+    expect(await exists(join(outside, 'x/a/b/c/data.dump'))).toBe(true);
+    await rm(mount, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  });
 });

@@ -52,6 +52,26 @@ describe('backup helm release', () => {
     });
   });
 
+  test('passes a PVC destination through without a bucket', () => {
+    const release = backupReleaseArgs({
+      tenant: 'alpha',
+      chart: '/chart',
+      type: 'both',
+      bucket: 'b',
+      existingClaimName: 'claim',
+      volumeClaimTemplate: { storageClassName: 'local-path', size: '20Gi' },
+    });
+    expect(release.values).toEqual({
+      type: 'both',
+      bucket: 'b',
+      existingClaimName: 'claim',
+      volumeClaimTemplate: { storageClassName: 'local-path', size: '20Gi' },
+    });
+    expect(backupReleaseArgs({ tenant: 'alpha', chart: '/chart', type: 'pvc' }).values).toEqual({
+      type: 'pvc',
+    });
+  });
+
   test('rejects a namespace that is not a tenant name', () => {
     expect(() => backupReleaseArgs({ tenant: 'Wasm', chart: '/chart', bucket: 'b' })).toThrow(
       /wasmCloud tenant name/,
