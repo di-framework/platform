@@ -119,26 +119,6 @@ The order matters. If step 3 runs before the controller owns the value (step 2),
 `kubectl-set` leaves `WASH_CORE_INSTANCES` unowned, and the next apply sets `"100"`,
 rolling the host back from 300.
 
-### Tenant removal and namespace retention
-
-`spec.deletionPolicy` (`Retain` or `Delete`, default `Retain`) controls what happens when a
-tenant is removed from the platform config (or when its Tenant object is deleted). For data
-safety, `Retain` is the default: when a Tenant is deleted, the controller scales its workload
-to zero but keeps `di-tenant-<name>` and `di-runtime-<name>` namespaces and all their data
-on disk for recovery. Set `deletionPolicy: Delete` to have the controller delete the
-namespaces and data when the Tenant is deleted.
-
-To remove a tenant from the platform and clean up its namespaces in one step, set
-`deletionPolicy: Delete` in the same `pulumi up` that removes the tenant from the config,
-or in a preceding `pulumi up`. If you remove the tenant without setting the policy first,
-the namespaces and data will be retained. To then delete them, you must patch the Tenant
-object (not the declaration) with `deletionPolicy: Delete` and let the controller finish
-the deletion.
-
-Example: to remove a tenant called `alpha` and keep its data, remove it from your `tenants`
-list and run `pulumi up`. The `di-tenant-alpha` and `di-runtime-alpha` namespaces will
-remain. To clean them up later, set `deletionPolicy: Delete` before the next removal.
-
 #### Upgrading to a version that adds a Tenant spec field
 
 `pulumi up` cannot add a Tenant spec field to the CRD and set it on an existing Tenant in
@@ -186,6 +166,49 @@ allowlisted registry and pull everything else over TLS. Check three things befor
   to use the default.
 - **Tenant hosts roll once.** The default host image, the host args and, on insecure installs,
   the mounted controller CA all change, so each tenant host group restarts on the upgrade.
+
+### Tenant removal and namespace retention
+
+Each `tenants` entry takes `deletionPolicy` (`Retain` or `Delete`, default `Retain`). The
+controller reads the policy from the Tenant object on the cluster when that object is deleted,
+not from your config at that moment.
+
+- `Retain`: the controller scales the workload to zero and keeps the `di-tenant-<name>` and
+  `di-runtime-<name>` namespaces.
+- `Delete`: the controller deletes both namespaces, and with them their PVCs (subject to the
+  StorageClass reclaim policy). It does not remove the on-disk tenant data directories: backend
+  data lives in tenant-UID hostPath directories under the storage root, which namespace deletion
+  does not erase.
+
+Kept namespaces stay labelled with the old Tenant UID. A new Tenant with the same name is not
+adopted over them and does not pick the old data back up, so re-adding a name after a Retain
+removal means deleting the kept namespaces first (below).
+
+When `up` or a preview removes a tenant whose live policy is `Retain` (or unset), it prints a
+warning naming the kept `di-tenant-<name>` and `di-runtime-<name>` namespaces and how to remove
+them. The check reads the cluster with the program's kubeconfig.
+
+Removing a tenant and its namespaces takes two `up` runs, because once the entry is gone
+nothing carries the new policy to the Tenant object:
+
+1. Set `deletionPolicy: Delete` on the entry and run `up`. Wait for the Tenant to report `Ready`.
+2. Remove the entry from `tenants` and run `up` again.
+
+```sh
+pulumi config set --path 'tenants[0].deletionPolicy' Delete
+```
+
+With `di-framework-kube up --platform-config`, the same setting is JSON:
+`{"tenants":[{"name":"alpha","deletionPolicy":"Delete"}]}` (the allowlist checks only top-level
+keys, so it passes).
+
+A tenant already removed under `Retain` has no Tenant object left to patch. Remove its
+namespaces by hand after checking the installation and owner labels:
+
+```sh
+kubectl get ns di-tenant-alpha di-runtime-alpha --show-labels
+kubectl delete namespace di-tenant-alpha di-runtime-alpha
+```
 
 ## Existing-cluster configuration
 

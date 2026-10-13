@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { backingServiceCrds } from './backing-services';
+import { backingServiceCrds, DELETION_POLICIES } from './backing-services';
 import { PRIVATE_IPV4_RANGES } from './egress';
 import { hostStorage } from './workload-storage';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json | undefined };
@@ -494,7 +494,7 @@ const crds = [
       type: 'object',
       properties: {
         suspended: { type: 'boolean', default: false },
-        deletionPolicy: { type: 'string', enum: ['Retain', 'Delete'], default: 'Retain' },
+        deletionPolicy: { type: 'string', enum: [...DELETION_POLICIES], default: 'Retain' },
         runtime: {
           type: 'object',
           default: {},
@@ -1910,6 +1910,7 @@ export {
   classVisibleToTenant,
   compatibleProvider,
   DEFAULT_CLASS_NAMES,
+  DELETION_POLICIES,
   defaultClassName,
   defaultClassSeed,
   PROVIDERS,

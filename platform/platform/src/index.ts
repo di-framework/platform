@@ -23,6 +23,7 @@ import {
   resolveBackingServiceClasses,
   seedTenantNamespaces,
 } from './tenancy';
+import { tenantListerFromKubeconfig, warnRemovedTenants } from './tenancy/removal';
 import {
   names,
   type TenantAuthConfig,
@@ -309,6 +310,20 @@ export function createPlatform(args: PlatformArgs) {
     routeUrlPattern,
     tenantAuth,
   });
+  // Warn before Pulumi deletes a Tenant that has no entry and whose live policy is Retain (#228).
+  // Skipped without `kubeconfig`: the program has no way to read the cluster then.
+  const removalNotice =
+    args.kubeconfig === undefined
+      ? undefined
+      : pulumi.output([args.kubeconfig, args.kubeContext] as const).apply(([kubeconfig, context]) =>
+          warnRemovedTenants({
+            installation: scope,
+            declared: declared.tenants.map((t) => t.name),
+            list: (installation) => tenantListerFromKubeconfig(kubeconfig, context)(installation),
+            warn: (message) => pulumi.log.warn(message),
+            debug: (message) => pulumi.log.debug(message),
+          }),
+        );
   const tenants = tenancy.tenants.map((t) =>
     t.metadata.name.apply((name) => ({ name, ...names(name) })),
   );
@@ -388,5 +403,7 @@ export function createPlatform(args: PlatformArgs) {
     // Tenant custom resources wait for Ready. Callers that install into
     // di-tenant-* depend on these and do not create the namespaces.
     tenantResources: tenancy.tenants,
+    /** Resolves to the removal warnings printed for Retain tenants; undefined without `kubeconfig`. */
+    removalNotice,
   };
 }

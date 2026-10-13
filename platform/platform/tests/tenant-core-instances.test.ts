@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'bun:test';
+import * as pulumi from '@pulumi/pulumi';
+import { declarations } from '../src/tenancy';
+import type { DeletionPolicy } from '../src/tenancy/backing-services';
 import { assertTenantDeclaration, tenantObject } from '../src/tenancy/install';
+import { type LiveTenant, removalWarnings, warnRemovedTenants } from '../src/tenancy/removal';
 import {
   CORE_INSTANCES,
   type ControllerConfig,
@@ -152,15 +156,79 @@ describe('Tenant spec.deletionPolicy', () => {
     });
   });
 
-  it('applies deletionPolicy in the Tenant object', () => {
-    const t = tenant({ deletionPolicy: 'Delete' });
-    expect(t.spec.deletionPolicy).toBe('Delete');
+  it('rejects a bad deletionPolicy from Pulumi config through declarations()', () => {
+    const config = (tenants: unknown) =>
+      ({
+        getObject: (key: string) => (key === 'tenants' ? tenants : undefined),
+      }) as unknown as pulumi.Config;
+    expect(declarations(config([{ name: 'a', deletionPolicy: 'Delete' }])).tenants).toHaveLength(1);
+    expect(() => declarations(config([{ name: 'a', deletionPolicy: 'Keep' }]))).toThrow(
+      "Tenant a deletionPolicy must be 'Retain' or 'Delete'",
+    );
   });
+});
 
-  it('handles both Retain and Delete deletion policies', () => {
-    const retain = tenant({ deletionPolicy: 'Retain' });
-    const del = tenant({ deletionPolicy: 'Delete' });
-    expect(retain.spec.deletionPolicy).toBe('Retain');
-    expect(del.spec.deletionPolicy).toBe('Delete');
+describe('Retain removal warning (#228)', () => {
+  const live = (name: string, deletionPolicy?: DeletionPolicy): LiveTenant => ({
+    metadata: { name },
+    spec: deletionPolicy ? { deletionPolicy } : {},
+  });
+  it('names both kept namespaces and how to remove them for Retain', () => {
+    const [message] = removalWarnings([live('alpha', 'Retain')], []);
+    expect(message).toContain('di-tenant-alpha');
+    expect(message).toContain('di-runtime-alpha');
+    expect(message).toContain('kubectl delete namespace di-tenant-alpha di-runtime-alpha');
+  });
+  it('prints nothing for Delete and for tenants that are still declared', () => {
+    expect(removalWarnings([live('alpha', 'Delete'), live('beta', 'Retain')], ['beta'])).toEqual(
+      [],
+    );
+  });
+  it('treats a missing policy as Retain', () => {
+    expect(removalWarnings([{ metadata: { name: 'alpha' } }], [])).toHaveLength(1);
+    expect(removalWarnings([live('alpha')], [])).toHaveLength(1);
+  });
+  it('takes the live policy, not the declaration', async () => {
+    const warned: string[] = [];
+    await warnRemovedTenants({
+      installation: 'inst',
+      declared: [],
+      list: async (installation) => {
+        expect(installation).toBe('inst');
+        return [live('alpha', 'Retain'), live('beta', 'Delete')];
+      },
+      warn: (m) => warned.push(m),
+    });
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toContain('di-tenant-alpha');
+  });
+  it('warns during preview too, and never fails when the cluster cannot be read', async () => {
+    const prior = pulumi.runtime.isDryRun;
+    const debugged: string[] = [];
+    try {
+      (pulumi.runtime as { isDryRun: () => boolean }).isDryRun = () => true;
+      expect(
+        await warnRemovedTenants({
+          installation: 'inst',
+          declared: [],
+          list: async () => [live('alpha')],
+          warn: () => {},
+        }),
+      ).toHaveLength(1);
+    } finally {
+      (pulumi.runtime as { isDryRun: () => boolean }).isDryRun = prior;
+    }
+    expect(
+      await warnRemovedTenants({
+        installation: 'inst',
+        declared: [],
+        list: async () => {
+          throw new Error('no CRD');
+        },
+        warn: () => {},
+        debug: (m) => debugged.push(m),
+      }),
+    ).toEqual([]);
+    expect(debugged[0]).toContain('no CRD');
   });
 });
