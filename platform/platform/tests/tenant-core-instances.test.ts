@@ -3,7 +3,12 @@ import * as pulumi from '@pulumi/pulumi';
 import { declarations } from '../src/tenancy';
 import type { DeletionPolicy } from '../src/tenancy/backing-services';
 import { assertTenantDeclaration, tenantObject } from '../src/tenancy/install';
-import { type LiveTenant, removalWarnings, warnRemovedTenants } from '../src/tenancy/removal';
+import {
+  type LiveTenant,
+  removalWarnings,
+  tenantListerFromKubeconfig,
+  warnRemovedTenants,
+} from '../src/tenancy/removal';
 import {
   CORE_INSTANCES,
   type ControllerConfig,
@@ -230,5 +235,41 @@ describe('Retain removal warning (#228)', () => {
       }),
     ).toEqual([]);
     expect(debugged[0]).toContain('no CRD');
+  });
+  it("lists the installation's Tenants from the provider kubeconfig", async () => {
+    const requests: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        requests.push(new URL(request.url).pathname + new URL(request.url).search);
+        return Response.json({ items: [live('alpha', 'Retain')] });
+      },
+    });
+    try {
+      const kubeconfig = JSON.stringify({
+        apiVersion: 'v1',
+        kind: 'Config',
+        clusters: [
+          {
+            name: 'c',
+            cluster: {
+              server: `http://127.0.0.1:${server.port}`,
+              'insecure-skip-tls-verify': true,
+            },
+          },
+        ],
+        users: [{ name: 'u', user: { token: 't' } }],
+        contexts: [{ name: 'x', context: { cluster: 'c', user: 'u' } }],
+        'current-context': 'x',
+      });
+      const tenants = await tenantListerFromKubeconfig(kubeconfig, 'x')('inst');
+      expect(tenants.map((t) => t.metadata.name)).toEqual(['alpha']);
+      expect(requests[0]).toContain('/apis/platform.di-framework.dev/v1alpha1/tenants');
+      expect(decodeURIComponent(requests[0] ?? '')).toContain(
+        'platform.di-framework.dev/installation=inst',
+      );
+    } finally {
+      server.stop(true);
+    }
   });
 });
