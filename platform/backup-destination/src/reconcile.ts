@@ -27,6 +27,15 @@ import {
   type World,
 } from './model.ts';
 import { isDue } from './schedule.ts';
+import {
+  activeVolumeOps,
+  advanceVolumes,
+  backupKeys,
+  expiredSources,
+  scheduleSources,
+  sourceRows,
+  startNext,
+} from './workload.ts';
 
 interface Result {
   ok?: boolean;
@@ -118,6 +127,42 @@ function deadline(storage: string): number {
   return Math.min(7200, 900 + 900 * gib);
 }
 
+/** Env, mounts and volumes every agent Job needs to reach the world's destination. */
+export function destinationParts(world: World): {
+  env: { name: string; value: string }[];
+  envFrom: Record<string, unknown>;
+  mounts: Record<string, unknown>[];
+  volumes: Record<string, unknown>[];
+} {
+  const dest = world.destination;
+  const destType = destinationType(dest?.spec);
+  const env = [
+    { name: 'BACKUP_BUCKET', value: dest?.spec.bucket ?? '' },
+    { name: 'BACKUP_REGION', value: dest?.spec.region || 'us-east-1' },
+    { name: 'BACKUP_DESTINATION_TYPE', value: destType },
+    ...(destType === 'pvc' ? [{ name: 'BACKUP_PVC_MOUNT_PATH', value: PVC_MOUNT }] : []),
+    ...(dest?.spec.endpoint ? [{ name: 'BACKUP_ENDPOINT', value: dest.spec.endpoint }] : []),
+  ];
+  return {
+    env,
+    // Only S3 has credentials. A PVC destination never creates the runtime Secret.
+    envFrom:
+      destType === 's3'
+        ? { envFrom: [{ secretRef: { name: RUNTIME_SECRET, optional: false } }] }
+        : {},
+    mounts: destType === 'pvc' ? [{ name: 'backup-pvc', mountPath: PVC_MOUNT }] : [],
+    volumes:
+      destType === 'pvc'
+        ? [
+            {
+              name: 'backup-pvc',
+              persistentVolumeClaim: { claimName: dest?.spec.existingClaimName || PVC_CLAIM },
+            },
+          ]
+        : [],
+  };
+}
+
 export function jobBody(input: {
   world: World;
   name: string;
@@ -134,21 +179,13 @@ export function jobBody(input: {
   const kind = input.agentKind;
   const storage = input.storage ?? service?.storage ?? '1Gi';
   const dest = input.world.destination;
-  const destType = destinationType(dest?.spec);
+  const parts = destinationParts(input.world);
   const env: { name: string; value?: string; valueFrom?: unknown }[] = [
     { name: 'BACKUP_KIND', value: kind },
-    { name: 'BACKUP_BUCKET', value: dest?.spec.bucket ?? '' },
     { name: 'BACKUP_OBJECT_PREFIX', value: input.objectPrefix },
-    { name: 'BACKUP_REGION', value: dest?.spec.region || 'us-east-1' },
     { name: 'BACKUP_WORKDIR', value: '/tmp' },
-    { name: 'BACKUP_DESTINATION_TYPE', value: destType },
+    ...parts.env,
   ];
-  if (destType === 'pvc') {
-    env.push({ name: 'BACKUP_PVC_MOUNT_PATH', value: PVC_MOUNT });
-  }
-  if (dest?.spec.endpoint) {
-    env.push({ name: 'BACKUP_ENDPOINT', value: dest.spec.endpoint });
-  }
   if (service) {
     env.push(
       {
@@ -201,34 +238,19 @@ export function jobBody(input: {
               name: 'backup-agent',
               image: input.world.agentImage,
               env,
-              // Only S3 has credentials. A PVC destination never creates the runtime Secret.
-              ...(destType === 's3'
-                ? { envFrom: [{ secretRef: { name: RUNTIME_SECRET, optional: false } }] }
-                : {}),
+              ...parts.envFrom,
               resources: {
                 requests: { cpu: '50m', memory: '64Mi', 'ephemeral-storage': storage },
                 limits: { cpu: '100m', memory: '128Mi' },
               },
               terminationMessagePath: '/dev/termination-log',
               terminationMessagePolicy: 'File',
-              volumeMounts: [
-                { name: 'scratch', mountPath: '/tmp' },
-                ...(destType === 'pvc' ? [{ name: 'backup-pvc', mountPath: PVC_MOUNT }] : []),
-              ],
+              volumeMounts: [{ name: 'scratch', mountPath: '/tmp' }, ...parts.mounts],
             },
           ],
           volumes: [
             { name: 'scratch', emptyDir: { sizeLimit: scratch(storage, kind) } },
-            ...(destType === 'pvc'
-              ? [
-                  {
-                    name: 'backup-pvc',
-                    persistentVolumeClaim: {
-                      claimName: dest?.spec.existingClaimName || PVC_CLAIM,
-                    },
-                  },
-                ]
-              : []),
+            ...parts.volumes,
           ],
         },
       },
@@ -312,8 +334,11 @@ function observe(world: World, actions: Action[]): void {
   }
 }
 
+/** The BackingService restore in progress; workload restores run in workload.ts. */
 function activeRestore(world: World): RestoreView | undefined {
-  return world.restores.find((item) => item.phase !== 'Succeeded' && item.phase !== 'Failed');
+  return world.restores.find(
+    (item) => !item.targetWorkloadName && item.phase !== 'Succeeded' && item.phase !== 'Failed',
+  );
 }
 
 function restoreActions(world: World, restore: RestoreView, actions: Action[]): void {
@@ -382,11 +407,13 @@ function restoreActions(world: World, restore: RestoreView, actions: Action[]): 
   });
 }
 
+/** BackingService dumps past `retention.successful`. Workload volumes have their own rules. */
 function excess(world: World, keep: number): BackupView[] {
   const doomed: BackupView[] = [];
-  const names = [...new Set(world.backups.map((item) => item.serviceName))];
+  const dumps = world.backups.filter((item) => !item.source);
+  const names = [...new Set(dumps.map((item) => item.serviceName))];
   for (const name of names) {
-    const rows = world.backups
+    const rows = dumps
       .filter((item) => item.serviceName === name)
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     const successes = rows.filter((item) => item.phase === 'Succeeded' && item.objectKey);
@@ -406,85 +433,39 @@ export function reconcile(world: World): Action[] {
     observedGeneration: dest.generation,
     services: [...(dest.status.services ?? [])],
   };
-  if (dest.spec.suspend) {
-    actions.push(
-      condition(dest.name, status, 'TenantSuspended', 'Tenant backups are suspended', false),
-    );
+  const problem = destinationProblem(world, dest);
+  // A started workload copy always runs to the step that gives the replicas back.
+  const advanced = advanceVolumes(world, problem?.reason);
+  actions.push(...advanced);
+  if (dest.spec.sources?.length || dest.status.sources?.length) {
+    status = { ...status, sources: sourceRows(world, dest) };
+  }
+  if (problem) {
+    actions.push(condition(dest.name, status, problem.reason, problem.message, false));
     return actions;
   }
-  if (!endpointAllowed(dest.spec.endpoint)) {
-    actions.push(
-      condition(
-        dest.name,
-        status,
-        'EndpointRejected',
-        'Endpoint must be HTTPS or cluster-local HTTP',
-        false,
-      ),
-    );
-    return actions;
-  }
-  if (destinationType(dest.spec) === 's3') {
-    if (world.s3Owner && world.s3Owner !== dest.name) {
-      actions.push(
-        condition(
-          dest.name,
-          status,
-          'ConfigInvalid',
-          `Only one S3 destination per tenant: ${world.s3Owner} holds the runtime credentials`,
-          false,
-        ),
-      );
-      return actions;
-    }
-    if (!dest.spec.bucket) {
-      actions.push(condition(dest.name, status, 'ConfigInvalid', 'S3 bucket is missing', false));
-      return actions;
-    }
-    const secretName = dest.spec.credentialsSecretRef?.name ?? '';
-    const keys = new Set(world.credentialKeys);
-    if (!secretName || !keys.has('AWS_ACCESS_KEY_ID') || !keys.has('AWS_SECRET_ACCESS_KEY')) {
-      actions.push(
-        condition(dest.name, status, 'CredentialsInvalid', 'S3 credentials are missing', false),
-      );
-      return actions;
-    }
-    if (!world.runtimeSecretPresent) actions.push({ type: 'copy-credentials', secretName });
-  } else {
-    const claim = dest.spec.existingClaimName || PVC_CLAIM;
-    if (world.missingClaims?.includes(claim)) {
-      // Without this the Job sits Pending until its deadline, and Jobs run one at a time, so
-      // S3 backups would wait behind it.
-      actions.push(
-        condition(
-          dest.name,
-          status,
-          'ClaimMissing',
-          `PersistentVolumeClaim ${claim} does not exist in ${world.runtimeNamespace}`,
-          false,
-        ),
-      );
-      return actions;
-    }
-    if (!dest.spec.existingClaimName && !dest.spec.volumeClaimTemplate?.size) {
-      actions.push(
-        condition(
-          dest.name,
-          status,
-          'ConfigInvalid',
-          'PVC destination must have existingClaimName or volumeClaimTemplate.size',
-          false,
-        ),
-      );
-      return actions;
-    }
+  if (destinationType(dest.spec) === 's3' && !world.runtimeSecretPresent) {
+    actions.push({
+      type: 'copy-credentials',
+      secretName: dest.spec.credentialsSecretRef?.name ?? '',
+    });
   }
   const wanted = world.wantedEgress ?? dest.spec.extraEgress ?? [];
   if (JSON.stringify(world.networkEgress) !== JSON.stringify(wanted)) {
     actions.push({ type: 'sync-egress', extraEgress: wanted });
   }
   observe(world, actions);
-  if (world.busy || world.jobs.some((job) => job.phase === 'Running')) {
+  if (status.sources) {
+    const scheduled = scheduleSources(world, dest, status.sources);
+    actions.push(...scheduled.actions);
+    status = { ...status, sources: scheduled.rows };
+  }
+  if (
+    world.busy ||
+    world.jobs.some((job) => job.phase === 'Running') ||
+    activeVolumeOps(world) > 0 ||
+    advanced.some((action) => action.type === 'create-job')
+  ) {
     actions.push(condition(dest.name, status, 'BackupInProgress', 'A backup job is running', true));
     return actions;
   }
@@ -502,7 +483,13 @@ export function reconcile(world: World): Action[] {
       .filter((job) => job.backupKind === 'gc' && job.phase !== 'Failed')
       .flatMap((job) => job.gcBackups ?? []),
   );
-  const stale = excess(world, keep).filter((item) => !covered.has(item.name));
+  // A backup an unfinished restore reads from is never expired under it.
+  for (const item of world.restores) {
+    if (item.phase !== 'Succeeded' && item.phase !== 'Failed') covered.add(item.sourceBackupName);
+  }
+  const stale = [...excess(world, keep), ...expiredSources(world, dest)].filter(
+    (item) => !covered.has(item.name),
+  );
   if (stale.length > 0) {
     const unix = Math.floor(new Date(world.now).getTime() / 1000);
     actions.push({
@@ -513,13 +500,7 @@ export function reconcile(world: World): Action[] {
         backupKind: 'gc',
         agentKind: 'gc',
         objectPrefix: '',
-        gcKeys: stale
-          .flatMap((item) =>
-            item.objectKey
-              ? [item.objectKey, item.objectKey.replace(/\/[^/]+$/, '/manifest.json')]
-              : [],
-          )
-          .join('\n'),
+        gcKeys: stale.flatMap(backupKeys).join('\n'),
         gcBackups: stale.map((item) => item.name),
         storage: '256Mi',
       }),
@@ -626,13 +607,17 @@ export function reconcile(world: World): Action[] {
       lastReason: 'Running',
     });
   }
+  // One thing at a time: a requested workload copy waits while a dump starts this tick.
+  const volume = run && next ? [] : startNext(world);
+  actions.push(...volume);
   const completed = (status.services ?? []).filter(
     (row) => row.lastReason === 'Completed' && row.lastSuccessTime,
   );
   if (run && pending.length === 0 && completed.length > 0 && !status.lastSuccessTime) {
     status = { ...status, lastSuccessTime: world.now };
   }
-  const reason = pending.length > 0 ? 'BackupInProgress' : 'DestinationReady';
+  const copying = volume.some((action) => action.type === 'scale-workload');
+  const reason = pending.length > 0 || copying ? 'BackupInProgress' : 'DestinationReady';
   actions.push(
     condition(
       dest.name,
@@ -642,12 +627,17 @@ export function reconcile(world: World): Action[] {
         ? destinationType(dest.spec) === 's3'
           ? 'Credentials copied'
           : 'Claim configured'
-        : `Backing up ${next?.name ?? 'services'}`,
+        : copying
+          ? 'Stopping a workload for a cold copy'
+          : `Backing up ${next?.name ?? 'services'}`,
       true,
     ),
   );
   return actions;
 }
+
+/** Owner of Backups, restores, and Jobs whose BackupDestination no longer exists. */
+const ORPHAN = '\u0000orphan';
 
 function unionEgress(destinations: DestinationView[]): Egress[] {
   const seen = new Set<string>();
@@ -683,25 +673,43 @@ export function reconcileAll(world: World): Action[] {
   const owner = (name: string): string | undefined => {
     const backup = world.backups.find((item) => item.name === name);
     if (!backup) return undefined;
-    return known.has(backup.destinationName) ? backup.destinationName : first;
+    if (known.has(backup.destinationName)) return backup.destinationName;
+    // A workload copy belongs to the destination it names. Without it, it is an orphan.
+    return backup.source ? ORPHAN : first;
   };
+  const restoreOwner = (item: RestoreView): string | undefined => {
+    const found = owner(item.sourceBackupName);
+    if (found) return found;
+    return item.targetWorkloadName && item.phase === 'Running' ? ORPHAN : first;
+  };
+  const jobDestination = (job: JobView): string | undefined => {
+    const named = jobOwner(job, world, owner);
+    if (named === undefined) return first;
+    return known.has(named) || named === ORPHAN ? named : ORPHAN;
+  };
+  const scoped = (name: string | undefined) => ({
+    backups: world.backups.filter((item) => owner(item.name) === name),
+    restores: world.restores.filter((item) => restoreOwner(item) === name),
+    jobs: world.jobs.filter((job) => jobDestination(job) === name),
+  });
   const s3Owner = pickS3Owner(destinations)?.name;
   const wantedEgress = unionEgress(destinations);
   const actions: Action[] = [];
+  // Copies whose destination was deleted mid-way still give their replicas back.
+  const orphans = scoped(ORPHAN);
+  actions.push(
+    ...advanceVolumes({ ...world, destination: undefined, ...orphans }, 'DestinationGone'),
+  );
   let started = false;
   for (const dest of destinations) {
-    const backups = world.backups.filter((item) => owner(item.name) === dest.name);
-    const restores = world.restores.filter(
-      (item) => (owner(item.sourceBackupName) ?? first) === dest.name,
-    );
-    const jobs = world.jobs.filter((job) => (jobOwner(job, world, owner) ?? first) === dest.name);
-    const elsewhere = world.jobs.some((job) => job.phase === 'Running' && !jobs.includes(job));
+    const mine = scoped(dest.name);
+    const elsewhere =
+      world.jobs.some((job) => job.phase === 'Running' && !mine.jobs.includes(job)) ||
+      activeVolumeOps(world) > activeVolumeOps(mine);
     const next = reconcile({
       ...world,
       destination: dest,
-      backups,
-      restores,
-      jobs,
+      ...mine,
       busy: started || elsewhere,
       wantedEgress,
       s3Owner,
@@ -709,9 +717,55 @@ export function reconcileAll(world: World): Action[] {
     for (const action of next) {
       if (action.type === 'sync-egress' && actions.some((item) => item.type === 'sync-egress'))
         continue;
-      if (action.type === 'create-job') started = true;
+      if (action.type === 'create-job' || action.type === 'scale-workload') started = true;
       actions.push(action);
     }
   }
   return actions;
+}
+
+/** Why this destination cannot take new work, or undefined when it can. */
+function destinationProblem(
+  world: World,
+  dest: DestinationView,
+): { reason: string; message: string } | undefined {
+  if (dest.spec.suspend)
+    return { reason: 'TenantSuspended', message: 'Tenant backups are suspended' };
+  if (!endpointAllowed(dest.spec.endpoint)) {
+    return { reason: 'EndpointRejected', message: 'Endpoint must be HTTPS or cluster-local HTTP' };
+  }
+  if (destinationType(dest.spec) === 'pvc') {
+    const claim = dest.spec.existingClaimName || PVC_CLAIM;
+    if (world.missingClaims?.includes(claim)) {
+      // Without this the Job sits Pending until its deadline, and Jobs run one at a time, so
+      // S3 backups would wait behind it.
+      return {
+        reason: 'ClaimMissing',
+        message: `PersistentVolumeClaim ${claim} does not exist in ${world.runtimeNamespace}`,
+      };
+    }
+    if (!dest.spec.existingClaimName && !dest.spec.volumeClaimTemplate?.size) {
+      return {
+        reason: 'ConfigInvalid',
+        message: 'PVC destination must have existingClaimName or volumeClaimTemplate.size',
+      };
+    }
+    return undefined;
+  }
+  if (world.s3Owner && world.s3Owner !== dest.name) {
+    return {
+      reason: 'ConfigInvalid',
+      message: `Only one S3 destination per tenant: ${world.s3Owner} holds the runtime credentials`,
+    };
+  }
+  if (!dest.spec.bucket) return { reason: 'ConfigInvalid', message: 'S3 bucket is missing' };
+  const keys = new Set(world.credentialKeys);
+  if (
+    !dest.spec.credentialsSecretRef?.name ||
+    !keys.has('AWS_ACCESS_KEY_ID') ||
+    !keys.has('AWS_SECRET_ACCESS_KEY')
+  ) {
+    return { reason: 'CredentialsInvalid', message: 'S3 credentials are missing' };
+  }
+  return undefined;
 }

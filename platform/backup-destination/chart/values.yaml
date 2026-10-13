@@ -23,6 +23,23 @@ existingClaimName: ""
 volumeClaimTemplate:
   storageClassName: ""
   size: ""
+# The platform's storageRoot: workload volumes live in
+# <storageRoot>/di-tenants/<tenant uid>/workloads/<key> on the node. Kubesolo uses /var/lib/kubesolo.
+storageRoot: /var/lib/kubesolo
+# Workload volumes to copy cold (#232). Each entry:
+#   workloadName: identity          # a WorkloadDeployment with platform storage (required)
+#   schedule: "30 3 * * *"          # UTC cron; leave it out for on-demand backups only
+#   retention:                      # leave it out to keep every backup
+#     keepLast: 7
+#     daily: 7
+#     weekly: 4
+#     monthly: 6
+#     failed: 5
+#   scaleDownTimeoutSeconds: 300    # optional
+#   copyTimeoutSeconds: 3600        # optional
+#   destination: pvc                # s3 or pvc; required when type is both
+# There is no default schedule and no default retention.
+sources: []
 extraEgress: []
 apiEgress:
   - cidr: 10.43.0.0/16

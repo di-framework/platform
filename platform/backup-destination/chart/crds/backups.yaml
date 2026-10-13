@@ -83,9 +83,56 @@ spec:
                       port: { type: integer, minimum: 1, maximum: 65535 }
                       protocol: { type: string }
                 suspend: { type: boolean }
+                # Workload volumes copied cold (#232). Nothing here runs without a schedule,
+                # and nothing is deleted without a retention rule.
+                sources:
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [workloadName]
+                  items:
+                    type: object
+                    required: [kind, workloadName]
+                    properties:
+                      kind: { type: string, enum: ['workload-volume'] }
+                      # A WorkloadDeployment in this namespace with platform storage.
+                      workloadName:
+                        type: string
+                        maxLength: 63
+                        pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+                      # UTC cron. No default: without it the source is backed up on demand only.
+                      schedule:
+                        type: string
+                        pattern: '^\S+ \S+ \S+ \S+ \S+$'
+                      # No default: without a rule every backup is kept.
+                      retention:
+                        type: object
+                        properties:
+                          keepLast: { type: integer, minimum: 1 }
+                          daily: { type: integer, minimum: 1 }
+                          weekly: { type: integer, minimum: 1 }
+                          monthly: { type: integer, minimum: 1 }
+                          failed: { type: integer, minimum: 1 }
+                      # How long to wait for the workload's instances to stop before giving up.
+                      scaleDownTimeoutSeconds: { type: integer, minimum: 10, maximum: 3600 }
+                      # The copy Job's activeDeadlineSeconds.
+                      copyTimeoutSeconds: { type: integer, minimum: 60, maximum: 86400 }
+                      suspend: { type: boolean }
             status:
               type: object
               properties:
+                sources:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      kind: { type: string }
+                      workloadName: { type: string }
+                      lastScheduledTime: { type: string }
+                      lastBackupName: { type: string }
+                      lastReason: { type: string }
+                      lastSuccessTime: { type: string }
+                      lastScaleDownSeconds: { type: integer }
+                      lastScaleDownTime: { type: string }
                 conditions:
                   type: array
                   items: { type: object, x-kubernetes-preserve-unknown-fields: true }
@@ -116,6 +163,13 @@ spec:
       storage: true
       subresources:
         status: {}
+      additionalPrinterColumns:
+        - { name: Destination, type: string, jsonPath: .spec.destinationName }
+        - { name: Source, type: string, jsonPath: .spec.serviceName }
+        - { name: Phase, type: string, jsonPath: .status.phase }
+        - { name: Reason, type: string, jsonPath: .status.reason }
+        - { name: Scale-to-0 (s), type: integer, jsonPath: .status.volume.scaleDownSeconds }
+        - { name: Age, type: date, jsonPath: .metadata.creationTimestamp }
       schema:
         openAPIV3Schema:
           type: object
@@ -133,9 +187,21 @@ spec:
                 parameters: { type: object, x-kubernetes-preserve-unknown-fields: true }
                 tool: { type: string }
                 format: { type: string }
+                # Set for a workload-volume backup (#232). serviceName then holds the workload
+                # name, uid the WorkloadDeployment uid, and type is workload-volume.
+                source:
+                  type: object
+                  required: [kind, workloadName]
+                  properties:
+                    kind: { type: string, enum: ['workload-volume'] }
+                    workloadName: { type: string, minLength: 1 }
               x-kubernetes-validations:
                 - rule: 'self.serviceName == oldSelf.serviceName && self.uid == oldSelf.uid && self.type == oldSelf.type && self.className == oldSelf.className'
                   message: backup identity is immutable
+                - rule: 'has(self.source) == has(oldSelf.source) && (!has(self.source) || self.source == oldSelf.source)'
+                  message: backup source is immutable
+                - rule: "!has(self.source) || (self.type == 'workload-volume' && self.serviceName == self.source.workloadName)"
+                  message: a workload-volume backup has type workload-volume and names its workload in serviceName
             status:
               type: object
               properties:
@@ -145,6 +211,31 @@ spec:
                 objectKey: { type: string }
                 reason: { type: string }
                 message: { type: string }
+                volume:
+                  type: object
+                  description: Progress of a workload-volume copy or restore (#232).
+                  properties:
+                    stage: { type: string, enum: ['ScalingDown', 'Copying', 'Done'] }
+                    members:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          name: { type: string }
+                          replicas: { type: integer }
+                    scaleDownStartedAt: { type: string }
+                    stoppedAt: { type: string }
+                    restoredAt: { type: string }
+                    scaleDownSeconds: { type: integer }
+                    node: { type: string }
+                    hostPath: { type: string }
+                    storageKey: { type: string }
+                    image: { type: string }
+                    objectPrefix: { type: string }
+                    fileCount: { type: integer }
+                    encfsKcv: { type: string }
+                    imageDigest: { type: string }
+                    replacedPath: { type: string }
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
@@ -171,15 +262,60 @@ spec:
           properties:
             spec:
               type: object
-              required: [sourceBackupName, targetServiceName]
+              required: [sourceBackupName]
+              x-kubernetes-validations:
+                - rule: 'has(self.targetServiceName) != has(self.targetWorkloadName)'
+                  message: set exactly one of targetServiceName and targetWorkloadName
+                - rule: '!has(self.force) || has(self.targetWorkloadName)'
+                  message: force applies to a workload-volume restore
+                - rule: 'self == oldSelf'
+                  message: a restore request is immutable
               properties:
                 sourceBackupName: { type: string, minLength: 1 }
                 targetServiceName:
                   type: string
                   pattern: '^[a-z][a-z0-9]*(-[a-z0-9]+)*$'
+                # A WorkloadDeployment with platform storage. It is scaled to 0 for the restore
+                # and given its replicas back afterwards.
+                targetWorkloadName:
+                  type: string
+                  maxLength: 63
+                  pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+                # Replace a non-empty volume. The old entries move to <dir>.replaced-<stamp>.
+                force: { type: boolean }
+                # The encfs KCV (32 hex) the restored data must carry. Required to restore over
+                # data that carries a different KCV.
+                expectedKcv:
+                  type: string
+                  pattern: '^[0-9a-f]{32}$'
             status:
               type: object
               properties:
                 phase: { type: string }
                 reason: { type: string }
                 message: { type: string }
+                volume:
+                  type: object
+                  description: Progress of a workload-volume copy or restore (#232).
+                  properties:
+                    stage: { type: string, enum: ['ScalingDown', 'Copying', 'Done'] }
+                    members:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          name: { type: string }
+                          replicas: { type: integer }
+                    scaleDownStartedAt: { type: string }
+                    stoppedAt: { type: string }
+                    restoredAt: { type: string }
+                    scaleDownSeconds: { type: integer }
+                    node: { type: string }
+                    hostPath: { type: string }
+                    storageKey: { type: string }
+                    image: { type: string }
+                    objectPrefix: { type: string }
+                    fileCount: { type: integer }
+                    encfsKcv: { type: string }
+                    imageDigest: { type: string }
+                    replacedPath: { type: string }

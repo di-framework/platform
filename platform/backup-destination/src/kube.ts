@@ -5,16 +5,23 @@ import {
   destinationType,
   type Egress,
   GROUP,
+  type HostView,
   type JobView,
+  OWNER_UID_LABEL,
   PVC_CLAIM,
   pickS3Owner,
   type RestoreView,
   RUNTIME_SECRET,
   runtimeNamespaceFor,
   type ServiceView,
+  STORAGE_VOLUME,
   VERSION,
+  type VolumeProgress,
+  type WorkloadView,
   type World,
 } from './model.ts';
+
+const RUNTIME = '/apis/runtime.wasmcloud.dev/v1alpha1';
 
 export interface KubeClient {
   get(path: string): Promise<unknown>;
@@ -23,11 +30,19 @@ export interface KubeClient {
   remove(path: string): Promise<void>;
 }
 
+interface Owner {
+  kind?: string;
+  name?: string;
+  uid?: string;
+  controller?: boolean;
+}
+
 interface Item {
   metadata?: {
     name?: string;
     namespace?: string;
     uid?: string;
+    ownerReferences?: Owner[];
     generation?: number;
     creationTimestamp?: string;
     annotations?: Record<string, string>;
@@ -65,30 +80,141 @@ function jobPhase(item: Item): JobView['phase'] {
   return 'Running';
 }
 
+function failedReason(item: Item): string | undefined {
+  const conditions = Array.isArray(item.status?.conditions)
+    ? (item.status.conditions as { type?: string; status?: string; reason?: string }[])
+    : [];
+  return conditions.find((condition) => condition.type === 'Failed' && condition.status === 'True')
+    ?.reason;
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+interface ComponentLike {
+  image?: string;
+  localResources?: { volumeMounts?: { name?: string }[] };
+}
+
+/** The image of the component that mounts the storage volume, else the first one. */
+function dataImage(item: Item): string | undefined {
+  const template = record(record(item.spec?.template)?.spec);
+  const components = (
+    Array.isArray(template?.components) ? template.components : []
+  ) as ComponentLike[];
+  const service = record(template?.service) as ComponentLike | undefined;
+  const all = [...components, ...(service ? [service] : [])];
+  const mounts = (component: ComponentLike) =>
+    (component.localResources?.volumeMounts ?? []).some((mount) => mount.name === STORAGE_VOLUME);
+  return (all.find(mounts) ?? all[0])?.image;
+}
+
+/** WorkloadDeployment -> WorkloadReplicaSet -> Workload, by controller owner references. */
+function workloadViews(
+  deployments: unknown,
+  replicaSets: unknown,
+  instances: unknown,
+): WorkloadView[] {
+  const controller = (item: Item, kind: string) =>
+    item.metadata?.ownerReferences?.find(
+      (owner) => owner.controller !== false && owner.kind === kind,
+    );
+  const sets = items(replicaSets);
+  const running = items(instances);
+  return items(deployments).flatMap((item): WorkloadView[] => {
+    const name = item.metadata?.name;
+    const uid = item.metadata?.uid;
+    if (!name || !uid) return [];
+    const owned = new Set(
+      sets
+        .filter((set) => controller(set, 'WorkloadDeployment')?.uid === uid)
+        .map((set) => set.metadata?.name),
+    );
+    const count = running.filter((workload) =>
+      owned.has(controller(workload, 'WorkloadReplicaSet')?.name),
+    ).length;
+    const reported = Number(item.status?.currentReplicas ?? 0) || 0;
+    const replicas = item.spec?.replicas;
+    return [
+      {
+        name,
+        uid,
+        replicas: typeof replicas === 'number' ? replicas : 1,
+        instances: Math.max(count, reported),
+        labels: item.metadata?.labels ?? {},
+        annotations: item.metadata?.annotations ?? {},
+        image: dataImage(item),
+        deleting: !!item.metadata?.deletionTimestamp,
+      },
+    ];
+  });
+}
+
+/** Tenant host pods: where each runs and which hostPath directories it mounts. */
+function hostViews(pods: unknown, hostgroup: string): HostView[] {
+  return items(pods).flatMap((pod): HostView[] => {
+    if (pod.metadata?.labels?.['wasmcloud.com/hostgroup'] !== hostgroup) return [];
+    const spec = pod.spec as
+      | { nodeName?: string; volumes?: { hostPath?: { path?: string } }[] }
+      | undefined;
+    const conditions = (pod.status?.conditions ?? []) as { type?: string; status?: string }[];
+    return [
+      {
+        name: pod.metadata?.name ?? '',
+        node: spec?.nodeName,
+        ready:
+          pod.status?.phase === 'Running' &&
+          !pod.metadata?.deletionTimestamp &&
+          conditions.some((condition) => condition.type === 'Ready' && condition.status === 'True'),
+        hostPaths: (spec?.volumes ?? []).flatMap((volume) =>
+          volume.hostPath?.path ? [volume.hostPath.path] : [],
+        ),
+      },
+    ];
+  });
+}
+
+function volumeOf(status: Record<string, unknown> | undefined): VolumeProgress | undefined {
+  return record(status?.volume) as VolumeProgress | undefined;
+}
+
 export async function loadWorld(
   client: KubeClient,
   tenantNamespace: string,
   agentImage: string,
   now: string,
+  storageRoot?: string,
 ): Promise<World> {
   const runtimeNamespace = runtimeNamespaceFor(tenantNamespace);
+  const tenant = tenantNamespace.slice('di-tenant-'.length);
   const base = `/apis/${VERSION}/namespaces/${tenantNamespace}`;
-  const [destinations, services, backups, restores, jobs, pods, secret, policy] = await Promise.all(
-    [
-      client.get(`${base}/backupdestinations`),
-      client.get(`${base}/backingservices`),
-      client.get(`${base}/backups`),
-      client.get(`${base}/backuprestores`),
-      client.get(`/apis/batch/v1/namespaces/${runtimeNamespace}/jobs`),
-      client.get(`/api/v1/namespaces/${runtimeNamespace}/pods`),
-      client.get(`/api/v1/namespaces/${tenantNamespace}/secrets`).catch(() => ({ items: [] })),
-      client
-        .get(
-          `/apis/networking.k8s.io/v1/namespaces/${runtimeNamespace}/networkpolicies/di-backup-agent-network`,
-        )
-        .catch(() => undefined),
-    ],
-  );
+  const runtime = `${RUNTIME}/namespaces/${tenantNamespace}`;
+  const none = () => ({ items: [] });
+  // Workload volumes (#232). A chart without the RBAC for these still backs up services.
+  const [deployments, replicaSets, instances, hostgroup] = await Promise.all([
+    client.get(`${runtime}/workloaddeployments`).catch(none),
+    client.get(`${runtime}/workloadreplicasets`).catch(none),
+    client.get(`${runtime}/workloads`).catch(none),
+    client
+      .get(`/apis/apps/v1/namespaces/${runtimeNamespace}/deployments/hostgroup-tenant-${tenant}`)
+      .catch(() => undefined),
+  ]);
+  const [destinations, services, backups, restores, jobs, pods, policy] = await Promise.all([
+    client.get(`${base}/backupdestinations`),
+    client.get(`${base}/backingservices`),
+    client.get(`${base}/backups`),
+    client.get(`${base}/backuprestores`),
+    client.get(`/apis/batch/v1/namespaces/${runtimeNamespace}/jobs`),
+    client.get(`/api/v1/namespaces/${runtimeNamespace}/pods`),
+    client
+      .get(
+        `/apis/networking.k8s.io/v1/namespaces/${runtimeNamespace}/networkpolicies/di-backup-agent-network`,
+      )
+      .catch(() => undefined),
+  ]);
   const views = items(destinations).flatMap((item): DestinationView[] => {
     if (!item.metadata?.name) return [];
     const spec = (item.spec ?? {}) as unknown as DestinationView['spec'];
@@ -106,7 +232,12 @@ export async function loadWorld(
   // The runtime Secret holds one set of S3 keys: those of the oldest S3 destination.
   const s3 = pickS3Owner(views);
   const secretName = s3?.spec.credentialsSecretRef?.name;
-  const credential = items(secret).find((item) => item.metadata?.name === secretName);
+  // Only the named credentials Secret is read; no other Secret in the tenant namespace is.
+  const credential = secretName
+    ? ((await client
+        .get(`/api/v1/namespaces/${tenantNamespace}/secrets/${secretName}`)
+        .catch(() => undefined)) as Item | undefined)
+    : undefined;
   const runtimeSecrets = await client
     .get(`/api/v1/namespaces/${runtimeNamespace}/secrets/${RUNTIME_SECRET}`)
     .then(() => true)
@@ -190,6 +321,16 @@ export async function loadWorld(
           className: String(spec.className ?? ''),
           storage: String((spec.parameters as { storage?: string } | undefined)?.storage ?? '1Gi'),
           createdAt: item.metadata.creationTimestamp ?? '',
+          ...(record(spec.source)?.kind === 'workload-volume'
+            ? {
+                source: {
+                  kind: 'workload-volume' as const,
+                  workloadName: String(record(spec.source)?.workloadName ?? ''),
+                },
+              }
+            : {}),
+          ...(volumeOf(item.status) ? { volume: volumeOf(item.status) } : {}),
+          ...(typeof item.status?.message === 'string' ? { message: item.status.message } : {}),
         },
       ];
     }),
@@ -200,8 +341,16 @@ export async function loadWorld(
           name: item.metadata.name,
           sourceBackupName: String(item.spec?.sourceBackupName ?? ''),
           targetServiceName: String(item.spec?.targetServiceName ?? ''),
+          ...(typeof item.spec?.targetWorkloadName === 'string'
+            ? { targetWorkloadName: item.spec.targetWorkloadName }
+            : {}),
+          ...(item.spec?.force === true ? { force: true } : {}),
+          ...(typeof item.spec?.expectedKcv === 'string'
+            ? { expectedKcv: item.spec.expectedKcv }
+            : {}),
           phase: phaseOf(item.status),
           reason: typeof item.status?.reason === 'string' ? item.status.reason : undefined,
+          ...(volumeOf(item.status) ? { volume: volumeOf(item.status) } : {}),
         },
       ];
     }),
@@ -209,7 +358,15 @@ export async function loadWorld(
       if (!item.metadata?.name) return [];
       const labels = item.metadata.labels ?? {};
       const kind = labels[`${GROUP}/backup-kind`];
-      if (kind !== 'dump' && kind !== 'restore' && kind !== 'probe' && kind !== 'gc') return [];
+      if (
+        kind !== 'dump' &&
+        kind !== 'restore' &&
+        kind !== 'probe' &&
+        kind !== 'gc' &&
+        kind !== 'volume-copy' &&
+        kind !== 'volume-restore'
+      )
+        return [];
       return [
         {
           name: item.metadata.name,
@@ -220,12 +377,17 @@ export async function loadWorld(
           backupName: labels[`${GROUP}/backup-name`],
           gcBackups: item.metadata.annotations?.[`${GROUP}/gc-backups`]?.split(',').filter(Boolean),
           destinationName: labels[`${GROUP}/destination`],
+          failedReason: failedReason(item),
         },
       ];
     }),
     runtimeSecretPresent: runtimeSecrets,
     credentialKeys: Object.keys(credential?.data ?? {}),
     networkEgress: egressOf(policy),
+    workloads: workloadViews(deployments, replicaSets, instances),
+    hosts: hostViews(pods, `tenant-${tenant}`),
+    tenantUid: (hostgroup as Item | undefined)?.metadata?.labels?.[OWNER_UID_LABEL],
+    storageRoot,
   };
 }
 
@@ -336,6 +498,15 @@ export async function applyActions(
     } else if (action.type === 'create-job') {
       const meta = (action.body.metadata ?? {}) as { namespace?: string };
       await client.post(`/apis/batch/v1/namespaces/${meta.namespace}/jobs`, action.body);
+    } else if (action.type === 'scale-workload') {
+      await client.patch(
+        `${RUNTIME}/namespaces/${world.tenantNamespace}/workloaddeployments/${action.name}/scale`,
+        { spec: { replicas: action.replicas } },
+      );
+    } else if (action.type === 'delete-job') {
+      await client.remove(
+        `/apis/batch/v1/namespaces/${world.runtimeNamespace}/jobs/${action.name}?propagationPolicy=Background`,
+      );
     }
   }
 }

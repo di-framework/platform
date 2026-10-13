@@ -9,6 +9,7 @@ const clusterCa = existsSync(serviceAccountCa) ? readFileSync(serviceAccountCa, 
 
 const tenantNamespace = process.env.TENANT_NAMESPACE ?? '';
 const agentImage = process.env.AGENT_IMAGE ?? 'di-framework/backup-agent:dev';
+const storageRoot = process.env.STORAGE_ROOT || undefined;
 runtimeNamespaceFor(tenantNamespace);
 
 function clusterClient(): KubeClient {
@@ -51,7 +52,13 @@ function clusterClient(): KubeClient {
 const client = clusterClient();
 
 async function tick(): Promise<void> {
-  const world = await loadWorld(client, tenantNamespace, agentImage, new Date().toISOString());
+  const world = await loadWorld(
+    client,
+    tenantNamespace,
+    agentImage,
+    new Date().toISOString(),
+    storageRoot,
+  );
   await applyActions(client, world, reconcileAll(world));
 }
 
@@ -59,7 +66,13 @@ Bun.serve({
   hostname: '0.0.0.0',
   port: 8080,
   async fetch(request) {
-    const world = await loadWorld(client, tenantNamespace, agentImage, new Date().toISOString());
+    const world = await loadWorld(
+      client,
+      tenantNamespace,
+      agentImage,
+      new Date().toISOString(),
+      storageRoot,
+    );
     const body = request.method === 'POST' ? await request.text() : '';
     const url = new URL(request.url);
     const result = handle(request.method, url.pathname, body, world);

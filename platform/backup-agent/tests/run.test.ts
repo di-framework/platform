@@ -60,6 +60,16 @@ function harness(
     async mkdir(path) {
       files.set(`${path}/.dir`, Buffer.from(''));
     },
+    async scan() {
+      return [];
+    },
+    async hash() {
+      return '';
+    },
+    async list() {
+      return [];
+    },
+    async rename() {},
   };
   return { io, files, calls };
 }
