@@ -168,6 +168,7 @@ pulumi(['config', 'set', 'kubeconfig', kubeconfig]);
 pulumi(['config', 'set', 'networkPolicyEngine', 'kube-router']);
 pulumi(['config', 'set', 'storageRoot', '/var/lib/kubesolo']);
 pulumi(['config', 'set', '--path', 'tenants[0].name', 'alpha']);
+pulumi(['config', 'set', 'schedule', '0 2 * * *']);
 pulumi(['install']);
 console.log('Handing the wasmCloud Helm release to Pulumi...');
 const removed = Bun.spawnSync(

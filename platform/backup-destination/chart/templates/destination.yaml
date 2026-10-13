@@ -1,37 +1,155 @@
+{{- $type := .Values.type -}}
+{{- if not (has $type (list "s3" "pvc" "both")) -}}
+{{- fail "type must be s3, pvc, or both" -}}
+{{- end -}}
+{{- /* No default schedule (#250): a cron, or "none" for on-demand backups only. */ -}}
+{{- $schedule := required "schedule is required: set a five-field UTC cron such as \"0 2 * * *\", or \"none\" for on-demand backups only (there is no default since #250)" (.Values.schedule | default "" | toString | trim) -}}
+{{- /* One space between fields, like the CRD pattern; each field is range-checked (the operator also rejects start > end). */ -}}
+{{- $parts := list -}}
+{{- range list "[0-5]?[0-9]" "([01]?[0-9]|2[0-3])" "(0?[1-9]|[12][0-9]|3[01])" "(0?[1-9]|1[0-2])" "[0-7]" -}}
+{{- $element := printf "(\\*|(%s)(-(%s))?)(/[1-9][0-9]*)?" . . -}}
+{{- $parts = append $parts (printf "%s(,%s)*" $element $element) -}}
+{{- end -}}
+{{- if and (ne $schedule "none") (not (regexMatch (printf "^%s$" (join " " $parts)) $schedule)) -}}
+{{- fail (printf "schedule %q must be a five-field UTC cron (minute hour day month weekday) or \"none\"" $schedule) -}}
+{{- end -}}
+{{- $s3 := or (eq $type "s3") (eq $type "both") -}}
+{{- $pvc := or (eq $type "pvc") (eq $type "both") -}}
 {{- $secret := .Values.existingSecret -}}
+{{- $createSecret := false -}}
+{{- if $s3 -}}
 {{- if and (not $secret) .Values.accessKeyId .Values.secretAccessKey -}}
 {{- $secret = "di-backup-s3" -}}
+{{- $createSecret = true -}}
 {{- end -}}
 {{- if not .Values.bucket -}}
-{{- fail "bucket is required" -}}
+{{- fail "bucket is required for S3 destination type" -}}
 {{- end -}}
 {{- if not $secret -}}
-{{- fail "existingSecret is required (demo accessKeyId and secretAccessKey are not for shared tenants)" -}}
+{{- fail "existingSecret is required for S3 (demo accessKeyId and secretAccessKey are not for shared tenants)" -}}
 {{- end -}}
+{{- end -}}
+{{- if $pvc -}}
+{{- if and (not .Values.existingClaimName) (not .Values.volumeClaimTemplate.size) -}}
+{{- fail "either existingClaimName or volumeClaimTemplate.size is required for PVC destination type" -}}
+{{- end -}}
+{{- end -}}
+{{- range .Values.sources -}}
+{{- if not .workloadName -}}
+{{- fail "every source needs a workloadName" -}}
+{{- end -}}
+{{- /* No default source schedule either (#250): a cron, or "none" for on-demand only. */ -}}
+{{- $sourceSchedule := .schedule | default "" | toString | trim -}}
+{{- if not $sourceSchedule -}}
+{{- fail (printf "source %s: schedule is required: set a five-field UTC cron, or \"none\" for on-demand backups only (there is no default since #250)" .workloadName) -}}
+{{- end -}}
+{{- if and (ne $sourceSchedule "none") (not (regexMatch (printf "^%s$" (join " " $parts)) $sourceSchedule)) -}}
+{{- fail (printf "source %s: schedule %q must be a five-field UTC cron (minute hour day month weekday) or \"none\"" .workloadName $sourceSchedule) -}}
+{{- end -}}
+{{- if and (eq $type "both") (not .destination) -}}
+{{- fail (printf "source %s needs destination s3 or pvc when type is both" .workloadName) -}}
+{{- end -}}
+{{- if and .destination (not (has .destination (list "s3" "pvc"))) -}}
+{{- fail (printf "source %s: destination must be s3 or pvc" .workloadName) -}}
+{{- end -}}
+{{- if and .destination (ne $type "both") (ne .destination $type) -}}
+{{- fail (printf "source %s: destination %s is not rendered with type %s" .workloadName .destination $type) -}}
+{{- end -}}
+{{- end -}}
+{{- define "backup.sources" -}}
+{{- $kind := .kind -}}
+{{- $picked := list -}}
+{{- range .root.Values.sources -}}
+{{- if or (not .destination) (eq .destination $kind) -}}
+{{- $picked = append $picked (omit . "destination" | merge (dict "kind" "workload-volume")) -}}
+{{- end -}}
+{{- end -}}
+{{- if $picked }}
+  sources:
+    {{- toYaml $picked | nindent 4 }}
+{{- end -}}
+{{- end -}}
+{{- define "backup.common" -}}
+  {{- if .Values.prefix }}
+  prefix: {{ .Values.prefix | quote }}
+  {{- end }}
+  {{- if .Values.retentionSuccessful }}
+  retention:
+    successful: {{ .Values.retentionSuccessful }}
+  {{- end }}
+  {{- if .Values.extraEgress }}
+  extraEgress:
+    {{- toYaml .Values.extraEgress | nindent 4 }}
+  {{- end }}
+{{- end -}}
+{{- if $s3 }}
 apiVersion: platform.di-framework.dev/v1alpha1
 kind: BackupDestination
 metadata:
   name: default
   namespace: {{ .Release.Namespace }}
 spec:
+  type: s3
   bucket: {{ .Values.bucket | quote }}
-  {{- if .Values.prefix }}
-  prefix: {{ .Values.prefix | quote }}
-  {{- end }}
   region: {{ .Values.region | quote }}
   {{- if .Values.endpoint }}
   endpoint: {{ .Values.endpoint | quote }}
   {{- end }}
   credentialsSecretRef:
     name: {{ $secret | quote }}
-  schedule: {{ .Values.schedule | quote }}
-  retention:
-    successful: {{ .Values.retentionSuccessful }}
-  {{- if .Values.extraEgress }}
-  extraEgress:
-    {{- toYaml .Values.extraEgress | nindent 4 }}
+  {{- if ne $schedule "none" }}
+  schedule: {{ $schedule | quote }}
   {{- end }}
-{{- if and (not .Values.existingSecret) .Values.accessKeyId .Values.secretAccessKey }}
+  {{- include "backup.common" . }}
+  {{- include "backup.sources" (dict "root" . "kind" "s3") }}
+{{- end }}
+{{- if $pvc }}
+---
+apiVersion: platform.di-framework.dev/v1alpha1
+kind: BackupDestination
+metadata:
+  {{- /* Always pvc: default is S3 and its type is immutable, so a release can switch kinds. */}}
+  name: pvc
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: pvc
+  {{- if .Values.existingClaimName }}
+  existingClaimName: {{ .Values.existingClaimName | quote }}
+  {{- end }}
+  {{- if .Values.volumeClaimTemplate.size }}
+  volumeClaimTemplate:
+    {{- if .Values.volumeClaimTemplate.storageClassName }}
+    storageClassName: {{ .Values.volumeClaimTemplate.storageClassName | quote }}
+    {{- end }}
+    size: {{ .Values.volumeClaimTemplate.size | quote }}
+  {{- end }}
+  {{- if ne $schedule "none" }}
+  schedule: {{ $schedule | quote }}
+  {{- end }}
+  {{- include "backup.common" . }}
+  {{- include "backup.sources" (dict "root" . "kind" "pvc") }}
+{{- end }}
+{{- if and $pvc .Values.volumeClaimTemplate.size (not .Values.existingClaimName) }}
+---
+# Agent Jobs run in the runtime namespace, so the claim lives there. It is kept on uninstall.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: di-backup-pvc
+  namespace: {{ include "backup.runtime" . | trim }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.volumeClaimTemplate.storageClassName }}
+  storageClassName: {{ .Values.volumeClaimTemplate.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.volumeClaimTemplate.size | quote }}
+{{- end }}
+{{- if $createSecret }}
 ---
 apiVersion: v1
 kind: Secret
