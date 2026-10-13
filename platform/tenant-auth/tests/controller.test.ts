@@ -50,27 +50,21 @@ describe('v1 auth routes', () => {
     credentialId: 'sub-1',
   };
   const forgotten: string[] = [];
-  const provider = { issuer: 'https://issuer.test' } as never;
-  const mockIdentityResolver = {
-    resolve: async (authorization: string | null) => {
-      if (authorization !== 'Bearer ok') throw new AuthError(401, 'a bearer token is required');
-      return principal;
-    },
-    forget: (user: string) => {
-      forgotten.push(user);
-    },
-    setProvider: () => {}, // No-op for tests
-  } as never;
   const controller = new Controller(
     { ...configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme' }), cliClientId: 'tenant-cli' },
     {} as never,
-    provider,
-    mockIdentityResolver,
+    { issuer: 'https://issuer.test' } as never,
+    {
+      resolve: async (authorization: string | null) => {
+        if (authorization !== 'Bearer ok') throw new AuthError(401, 'a bearer token is required');
+        return principal;
+      },
+      forget: (user: string) => {
+        forgotten.push(user);
+      },
+    } as never,
     {} as never,
   );
-  // Manually set discovery state for tests to work
-  (controller as any).discoveryState = { status: 'complete', provider };
-
   const call = (method: string, path: string, authorization?: string) =>
     controller.handle(
       new Request(`https://controller.test${path}`, {
@@ -102,89 +96,5 @@ describe('v1 auth routes', () => {
     expect(logout.status).toBe(204);
     expect(forgotten).toEqual(['alice']);
     expect((await call('GET', '/v1/other', 'Bearer ok')).status).toBe(404);
-  });
-});
-
-describe('discovery and 503 handling', () => {
-  const forgotten: string[] = [];
-  const provider = { issuer: 'https://issuer.test' } as never;
-  const mockIdentityResolver = {
-    resolve: async (_authorization: string | null) => {
-      throw new AuthError(503, 'issuer discovery is not yet complete');
-    },
-    forget: (_user: string) => {},
-    setProvider: () => {}, // No-op for tests
-  } as never;
-  const controller = new Controller(
-    { ...configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme' }), cliClientId: 'tenant-cli' },
-    {} as never,
-    null,
-    mockIdentityResolver,
-    {} as never,
-  );
-
-  const call = (method: string, path: string, authorization?: string) =>
-    controller.handle(
-      new Request(`https://controller.test${path}`, {
-        method,
-        headers: authorization ? { authorization } : {},
-      }),
-    );
-
-  const whoamiCall = (authorization?: string) => {
-    return controller.handleWhoami(
-      new Request(`https://controller.test/v1/auth/whoami`, {
-        method: 'GET',
-        headers: authorization ? { authorization } : {},
-      }),
-    );
-  };
-
-  test('info returns 503 while discovery is pending', async () => {
-    const response = await call('GET', '/v1/auth/info');
-    expect(response.status).toBe(503);
-    expect(response.headers.get('retry-after')).toBeTruthy();
-    const body = await response.json();
-    expect(body.title).toBe('Service Unavailable');
-  });
-
-  test('health endpoint reports discovery status', async () => {
-    const response = await call('GET', '/-/healthz');
-    expect(response.status).toBe(200);
-    const body = await response.json();
-    expect(body.ok).toBe(true);
-    expect(body.tenant).toBe('acme');
-    expect(body.discoveryReady).toBe(false);
-  });
-
-  test('whoami with bearer token returns 503 while discovery pending', async () => {
-    const response = await whoamiCall('Bearer test-token');
-    expect(response.status).toBe(503);
-    expect(response.headers.get('retry-after')).toBeTruthy();
-  });
-
-  test('whoami with host pull token works without discovery', async () => {
-    // Create controller with host pull token support
-    const tokenController = new Controller(
-      {
-        ...configFromEnv({
-          TENANT_CONTROLLER_TENANT: 'acme',
-          TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE: '/dev/null', // Empty file - matches nothing
-        }),
-        cliClientId: 'tenant-cli',
-      },
-      {} as never,
-      null,
-      mockIdentityResolver,
-      {} as never,
-    );
-    const response = await tokenController.handleWhoami(
-      new Request(`https://controller.test/v1/auth/whoami`, {
-        method: 'GET',
-        headers: { authorization: 'Bearer ' }, // Invalid token for host pull
-      }),
-    );
-    // Since host pull token doesn't match, it should fall through to identity.resolve and get 503
-    expect(response.status).toBe(503);
   });
 });

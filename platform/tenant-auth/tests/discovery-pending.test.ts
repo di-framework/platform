@@ -1,244 +1,156 @@
-import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { dump } from 'js-yaml';
 import { Controller, configFromEnv } from '../src/controller.ts';
-import { AuthError } from '../src/identity.ts';
-import { KubeClient } from '../src/kube.ts';
 import { type FakeServer, json, serve } from './support/servers.ts';
 
-describe('discovery pending', () => {
+/** Polls until `condition` holds; fails the test (by throwing) after `timeoutMs`. */
+async function eventually(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error('condition not met in time');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+/**
+ * platform#225: the listeners bind before the issuer answers. Drives the real `Controller.start`
+ * against an issuer that is down first and comes up later, over real HTTP listeners.
+ */
+describe('Controller.start with the issuer unreachable at first', () => {
+  const HOST_PULL = 'host-pull-secret';
+  let issuerUp = false;
+  let issuer: FakeServer;
   let api: FakeServer;
-  let tmpDir: string;
+  let dir: string;
+  let controller: Controller;
+  let main: ReturnType<typeof Bun.serve>;
+  let whoami: ReturnType<typeof Bun.serve>;
+  let startedIn: number;
+  let startedWithoutProvider: boolean;
 
-  beforeAll(() => {
-    // Create a fake API server
-    api = serve(() => json({ ok: true }));
+  const mainCall = (path: string) => fetch(`http://127.0.0.1:${main.port}${path}`);
+  const whoamiCall = (authorization: string) =>
+    fetch(`http://127.0.0.1:${whoami.port}/v1/auth/whoami`, { headers: { authorization } });
 
-    // Create temp directory for kubeconfig files
-    tmpDir = mkdtempSync(join(tmpdir(), 'discovery-test-'));
+  beforeAll(async () => {
+    issuer = serve((request) => {
+      if (!issuerUp) return json({ error: 'starting' }, 503);
+      if (request.pathname === '/.well-known/openid-configuration')
+        return json({
+          issuer: issuer.url,
+          authorization_endpoint: `${issuer.url}/a`,
+          token_endpoint: `${issuer.url}/t`,
+          jwks_uri: `${issuer.url}/j`,
+          userinfo_endpoint: `${issuer.url}/userinfo`,
+        });
+      return json({}, 401); // userinfo: the token is not valid
+    });
+    api = serve(() => json({}));
+    dir = mkdtempSync(join(tmpdir(), 'discovery-pending-'));
     writeFileSync(
-      join(tmpDir, 'kubeconfig'),
+      join(dir, 'kubeconfig'),
       dump({
-        'current-context': 'test',
-        contexts: [{ name: 'test', context: { cluster: 'test', user: 'admin' } }],
-        clusters: [{ name: 'test', cluster: { server: api.url } }],
-        users: [{ name: 'admin', user: { token: 'admin' } }],
+        'current-context': 'x',
+        contexts: [{ name: 'x', context: { cluster: 'c', user: 'u' } }],
+        clusters: [{ name: 'c', cluster: { server: api.url } }],
+        users: [{ name: 'u', user: { token: 't' } }],
       }),
     );
+    writeFileSync(join(dir, 'host-pull'), HOST_PULL);
+
+    const began = performance.now();
+    controller = await Controller.start({
+      ...configFromEnv({
+        TENANT_CONTROLLER_TENANT: 'acme',
+        TENANT_CONTROLLER_KUBECONFIG: join(dir, 'kubeconfig'),
+        TENANT_CONTROLLER_ISSUER: issuer.url,
+        TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE: join(dir, 'host-pull'),
+      }),
+      discoveryBackoff: { initialMs: 10, maxMs: 40 },
+    });
+    startedIn = performance.now() - began;
+    startedWithoutProvider = controller.provider === null;
+    main = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch: (request, server) => controller.handle(request, server),
+    });
+    whoami = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch: (request) => controller.handleWhoami(request),
+    });
   });
 
   afterAll(() => {
+    controller.stop();
+    main.stop(true);
+    whoami.stop(true);
+    issuer.stop();
     api.stop();
-    rmSync(tmpDir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
   });
 
-  test('handlers check discovery state and return appropriate responses', async () => {
-    const kube = new KubeClient({ server: api.url, token: 'admin' }, 'wasmcloud');
-    const provider = { issuer: 'https://issuer.test' } as never;
+  test('start returns without waiting for the issuer, and the listeners bind', () => {
+    expect(startedWithoutProvider).toBe(true);
+    // A start that awaited discovery would never return while the issuer is down.
+    expect(startedIn).toBeLessThan(1_000);
+    expect(main.port).toBeGreaterThan(0);
+    expect(whoami.port).toBeGreaterThan(0);
+  });
 
-    // Create a controller with discovery pending
-    const controller = new Controller(
-      configFromEnv({
-        TENANT_CONTROLLER_TENANT: 'acme',
-      }),
-      kube,
-      null, // provider is null, discovery pending
-      {
-        resolve: async (_authorization: string | null) => {
-          throw new AuthError(503, 'issuer discovery is not yet complete');
-        },
-        forget: () => {},
-        setProvider: () => {},
-      } as never,
-      { kube, namespace: 'di-runtime-acme', tenant: 'acme' },
-    );
-
-    // Health check works and reports discovery is not ready
-    const health = await controller.handle(
-      new Request('http://localhost/-/healthz', { method: 'GET' }),
-    );
+  test('issuer-dependent routes answer 503 with Retry-After while discovery is pending', async () => {
+    const health = await mainCall('/-/healthz');
     expect(health.status).toBe(200);
-    const healthBody = (await health.json()) as any;
-    expect(healthBody.ok).toBe(true);
-    expect(healthBody.discoveryReady).toBe(false);
+    expect(await health.json()).toMatchObject({ ok: true, discoveryReady: false });
 
-    // Registry front returns 401 (needs credentials, not discovery)
-    const registry = await controller.handleRegistry(
-      new Request('http://localhost/v2/', { method: 'GET' }),
-    );
-    expect(registry.status).toBe(401);
-
-    // Registry pull returns 401 (needs credentials, not discovery)
-    const pull = await controller.handleRegistryPull(
-      new Request('http://localhost/v2/test/manifests/latest', { method: 'GET' }),
-    );
-    expect(pull.status).toBe(401);
-
-    // /v1/auth/info returns 503 (needs discovery)
-    const info = await controller.handle(
-      new Request('http://localhost/v1/auth/info', { method: 'GET' }),
-    );
+    const info = await mainCall('/v1/auth/info');
     expect(info.status).toBe(503);
-    expect(info.headers.get('retry-after')).toBeTruthy();
+    expect(Number(info.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
 
-    // whoami with bearer returns 503 (needs discovery)
-    const whoami = await controller.handleWhoami(
-      new Request('http://localhost/v1/auth/whoami', {
-        method: 'GET',
-        headers: { authorization: 'Bearer test-token' },
-      }),
-    );
-    expect(whoami.status).toBe(503);
-    expect(whoami.headers.get('retry-after')).toBeTruthy();
-
-    // After discovery completes (simulated), endpoints work
-    (controller as any).discoveryState = { status: 'complete', provider };
-    controller.provider = provider;
-    (controller as any).identity.setProvider(provider);
-
-    // Health now shows discovery ready
-    const health2 = await controller.handle(
-      new Request('http://localhost/-/healthz', { method: 'GET' }),
-    );
-    const health2Body = (await health2.json()) as any;
-    expect(health2Body.discoveryReady).toBe(true);
-
-    // Info endpoint works
-    const info2 = await controller.handle(
-      new Request('http://localhost/v1/auth/info', { method: 'GET' }),
-    );
-    expect(info2.status).toBe(200);
-    const info2Body = (await info2.json()) as any;
-    expect(info2Body.issuer).toBe('https://issuer.test');
+    const identityToken = await whoamiCall('Bearer an-identity-access-token');
+    expect(identityToken.status).toBe(503);
+    expect(Number(identityToken.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
+    expect(identityToken.headers.get('content-type')).toContain('problem+json');
   });
 
-  test('whoami with host pull token works without discovery', async () => {
-    const kube = new KubeClient({ server: api.url, token: 'admin' }, 'wasmcloud');
-
-    // Create a file with a host pull token
-    const tokenFile = join(tmpDir, 'host-pull-token');
-    writeFileSync(tokenFile, 'test-host-pull-token-secret');
-
-    // Create controller with discovery pending but host pull token configured
-    const controller = new Controller(
-      configFromEnv({
-        TENANT_CONTROLLER_TENANT: 'acme',
-        TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE: tokenFile,
-      }),
-      kube,
-      null, // provider is null
-      {
-        resolve: async (_authorization: string | null) => {
-          throw new AuthError(503, 'issuer discovery is not yet complete');
-        },
-        forget: () => {},
-        setProvider: () => {},
-      } as never,
-      { kube, namespace: 'di-runtime-acme', tenant: 'acme' },
-    );
-
-    // whoami with matching host pull token works
-    const whoami = await controller.handleWhoami(
-      new Request('http://localhost/v1/auth/whoami', {
-        method: 'GET',
-        headers: { authorization: 'Bearer test-host-pull-token-secret' },
-      }),
-    );
-    expect(whoami.status).toBe(200);
-    const whoamiBody = (await whoami.json()) as any;
-    expect(whoamiBody.user).toBe('system:tenant-host');
-    expect(whoamiBody.via).toBe('host-pull');
-
-    // whoami with wrong token returns 503 (falls through to identity resolver)
-    const whoami2 = await controller.handleWhoami(
-      new Request('http://localhost/v1/auth/whoami', {
-        method: 'GET',
-        headers: { authorization: 'Bearer wrong-token' },
-      }),
-    );
-    expect(whoami2.status).toBe(503);
+  test('the issuer-independent host pull token is accepted while pending', async () => {
+    const response = await whoamiCall(`Bearer ${HOST_PULL}`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ via: 'host-pull', account: 'acme' });
   });
 
-  test('discovery failure is handled and logged', async () => {
-    const kube = new KubeClient({ server: api.url, token: 'admin' }, 'wasmcloud');
+  test('the same controller recovers when the issuer comes up, without a restart', async () => {
+    issuerUp = true;
+    await controller.discovered;
+    await eventually(() => controller.provider !== null);
 
-    const controller = new Controller(
-      configFromEnv({
-        TENANT_CONTROLLER_TENANT: 'acme',
-        TENANT_CONTROLLER_ISSUER: 'https://issuer.test',
-      }),
-      kube,
-      null,
-      {
-        resolve: async (_authorization: string | null) => {
-          throw new AuthError(503, 'issuer discovery is not yet complete');
-        },
-        forget: () => {},
-        setProvider: () => {},
-      } as never,
-      { kube, namespace: 'di-runtime-acme', tenant: 'acme' },
-    );
+    const info = await mainCall('/v1/auth/info');
+    expect(info.status).toBe(200);
+    expect(await info.json()).toMatchObject({ account: 'acme', issuer: issuer.url });
 
-    // Simulate discovery failure
-    const testError = new Error('Test discovery failure');
-    (controller as any).discoveryState = { status: 'failed', error: testError };
-
-    // Verify failed state is properly stored
-    const state = (controller as any).discoveryState;
-    expect(state.status).toBe('failed');
-    expect(state.error).toBe(testError);
-
-    // Handlers should still work, returning 503 for discovery-dependent operations
-    const info = await controller.handle(
-      new Request('http://localhost/v1/auth/info', { method: 'GET' }),
-    );
-    expect(info.status).toBe(503);
+    // The identity token now reaches the issuer (which rejects it) rather than getting a 503.
+    expect((await whoamiCall('Bearer an-identity-access-token')).status).toBe(401);
+    expect(
+      ((await (await mainCall('/-/healthz')).json()) as { discoveryReady: boolean }).discoveryReady,
+    ).toBe(true);
   });
 
-  test('discovery retry is scheduled when discovery fails', async () => {
-    const kube = new KubeClient({ server: api.url, token: 'admin' }, 'wasmcloud');
-
-    const controller = new Controller(
-      configFromEnv({
+  test('stop() ends discovery for a controller whose issuer never answers', async () => {
+    const down = await Controller.start({
+      ...configFromEnv({
         TENANT_CONTROLLER_TENANT: 'acme',
-        TENANT_CONTROLLER_ISSUER: 'https://issuer.test',
+        TENANT_CONTROLLER_KUBECONFIG: join(dir, 'kubeconfig'),
+        TENANT_CONTROLLER_ISSUER: 'http://127.0.0.1:1',
       }),
-      kube,
-      null,
-      {
-        resolve: async (_authorization: string | null) => {
-          throw new AuthError(503, 'issuer discovery is not yet complete');
-        },
-        forget: () => {},
-        setProvider: () => {},
-      } as never,
-      { kube, namespace: 'di-runtime-acme', tenant: 'acme' },
-    );
-
-    // Track setTimeout calls
-    let timeoutScheduled = false;
-    const originalSetTimeout = global.setTimeout;
-    global.setTimeout = ((fn: (...args: unknown[]) => void, delay?: number) => {
-      if (delay === 30_000) {
-        timeoutScheduled = true;
-      }
-      return originalSetTimeout(fn, 0) as unknown;
-    }) as typeof setTimeout;
-
-    // Set discovery state to failed to trigger scheduleDiscoveryRetry
-    (controller as any).discoveryState = { status: 'failed', error: new Error('test') };
-
-    // Call scheduleDiscoveryRetry directly (it would be called by runDiscoveryAttempt on failure)
-    (controller as any).scheduleDiscoveryRetry();
-
-    // Restore setTimeout
-    global.setTimeout = originalSetTimeout;
-
-    // The retry scheduling code has been exercised
-    // In practice, the test verifies the code path exists by checking the state
-    const failedState = (controller as any).discoveryState;
-    expect(failedState.status).toBe('failed');
+      discoveryBackoff: { initialMs: 10, maxMs: 40 },
+    });
+    expect(down.provider).toBeNull();
+    down.stop();
+    await down.discovered;
+    expect(down.provider).toBeNull();
   });
 });

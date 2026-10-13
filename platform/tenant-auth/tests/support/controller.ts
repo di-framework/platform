@@ -51,8 +51,6 @@ export function servedController(options: {
     mockIdentityResolver,
     { kube, namespace: 'di-runtime-acme', tenant: 'acme' },
   );
-  // Manually set discovery state to complete for tests
-  (controller as any).discoveryState = { status: 'complete', provider };
 
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: (r) => controller.handle(r) });
   const served = { api, base: `http://127.0.0.1:${server.port}` } as ServedController;

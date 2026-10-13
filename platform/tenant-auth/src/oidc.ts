@@ -62,12 +62,17 @@ export async function pkce(
  * answer 5xx or refuse connections for a while, so startup retries with backoff instead of
  * crashing the pod.
  */
-export async function discover(issuer: string, attempts = 20): Promise<ProviderMetadata> {
+export async function discover(
+  issuer: string,
+  attempts = 20,
+  abort?: AbortSignal,
+): Promise<ProviderMetadata> {
   const url = `${issuer.replace(/\/$/, '')}/.well-known/openid-configuration`;
   let response: Response | undefined;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+      const timeout = AbortSignal.timeout(30_000);
+      response = await fetch(url, { signal: abort ? AbortSignal.any([abort, timeout]) : timeout });
       if (response.ok) break;
     } catch {
       response = undefined;
