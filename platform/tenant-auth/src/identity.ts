@@ -41,13 +41,21 @@ export class IdentityResolver {
     { claims: IdentityClaims | undefined; until: number }
   >();
   private readonly membershipCache = new Map<string, { role: Principal['role']; until: number }>();
+  private provider: ProviderMetadata | null;
 
   constructor(
     private readonly kube: KubeClient,
-    private readonly provider: ProviderMetadata,
+    provider: ProviderMetadata | null,
     readonly tenant: string,
     private readonly keys: KeyStore,
-  ) {}
+  ) {
+    this.provider = provider;
+  }
+
+  /** Set the provider after discovery completes. */
+  setProvider(provider: ProviderMetadata): void {
+    this.provider = provider;
+  }
 
   /** The platform's view: the tenant is live and the User CR holds an active membership. */
   async membership(user: string): Promise<Principal['role']> {
@@ -66,6 +74,7 @@ export class IdentityResolver {
   }
 
   private async claimsFor(accessToken: string): Promise<IdentityClaims | undefined> {
+    if (!this.provider) throw new AuthError(503, 'issuer discovery is not yet complete');
     const id = Buffer.from(await sha256(accessToken)).toString('hex');
     const cached = this.claimsCache.get(id);
     if (cached && cached.until > Date.now()) return cached.claims;

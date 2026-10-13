@@ -35,6 +35,8 @@ export interface ControllerConfig {
   context?: string;
   platformNamespace: string;
   issuer: string;
+  /** Wait between issuer discovery attempts; doubles from `initialMs` up to `maxMs`. */
+  discoveryBackoff?: { initialMs: number; maxMs: number };
   host: string;
   port: number;
   tlsCert?: string;
@@ -372,37 +374,137 @@ export function parseSideContentLength(value: string | null): string | undefined
   return Number.isSafeInteger(Number(value)) ? String(Number(value)) : undefined;
 }
 
+/** Pending until the issuer answers; `retryAfterSeconds` is the wait until the next attempt. */
+type DiscoveryState =
+  | { status: 'pending'; retryAfterSeconds: number }
+  | { status: 'complete'; provider: ProviderMetadata };
+
+const DISCOVERY_BACKOFF_DEFAULT = { initialMs: 1_000, maxMs: 30_000 };
+
 export class Controller {
   private readonly serviceAccountTokens = new Map<string, { token: string; expiresAt: number }>();
   /** Where proxy sessions forward to; only overridden by tests. */
   proxyUpstream: (tenant: string) => string = tenantUpstream;
+  private discoveryState: DiscoveryState;
+  private readonly discoveryAbort = new AbortController();
+  private discoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  private wakeDiscoverySleep: (() => void) | undefined;
+  private markDiscovered: () => void = () => {};
+  /** Resolves once the issuer has been discovered (or the controller was stopped). */
+  readonly discovered: Promise<void> = new Promise((resolve) => {
+    this.markDiscovered = resolve;
+  });
 
   constructor(
     readonly config: ControllerConfig,
     readonly kube: KubeClient,
-    readonly provider: ProviderMetadata,
+    provider: ProviderMetadata | null,
     readonly identity: IdentityResolver,
     readonly keys: KeyStore,
-  ) {}
+  ) {
+    this.discoveryState = provider
+      ? { status: 'complete', provider }
+      : { status: 'pending', retryAfterSeconds: 1 };
+    if (provider) this.markDiscovered();
+  }
 
+  /** Provider metadata; null until discovery completes. */
+  get provider(): ProviderMetadata | null {
+    return this.discoveryState.status === 'complete' ? this.discoveryState.provider : null;
+  }
+
+  /**
+   * Builds the controller and starts issuer discovery in the background. It resolves at once, so
+   * the listeners can bind while the issuer is still coming up (platform#225).
+   */
   static async start(config: ControllerConfig): Promise<Controller> {
     const credentials = config.kubeconfig
       ? loadKubeconfig(config.kubeconfig, config.context)
       : inClusterCredentials();
     const kube = new KubeClient(credentials, config.platformNamespace);
-    const provider = await discover(config.issuer);
     const keys: KeyStore = {
       kube,
       namespace: `di-runtime-${config.tenant}`,
       tenant: config.tenant,
     };
-    return new Controller(
+    const controller = new Controller(
       config,
       kube,
-      provider,
-      new IdentityResolver(kube, provider, config.tenant, keys),
+      null,
+      new IdentityResolver(kube, null, config.tenant, keys),
       keys,
     );
+    void controller.discoverInBackground();
+    return controller;
+  }
+
+  /** Stops background discovery: aborts an in-flight attempt and clears the retry timer. */
+  stop(): void {
+    this.discoveryAbort.abort();
+    clearTimeout(this.discoveryTimer);
+    this.wakeDiscoverySleep?.();
+    this.markDiscovered();
+  }
+
+  /**
+   * Attempts discovery until it succeeds or the controller stops. The wait between attempts
+   * doubles from `initialMs` up to `maxMs`; it never gives up, since the issuer may come up at
+   * any time and the controller has to recover without a restart.
+   */
+  private async discoverInBackground(): Promise<void> {
+    const { initialMs, maxMs } = this.config.discoveryBackoff ?? DISCOVERY_BACKOFF_DEFAULT;
+    const signal = this.discoveryAbort.signal;
+    for (let attempt = 0; !signal.aborted; attempt++) {
+      try {
+        const provider = await discover(this.config.issuer, 1, signal);
+        this.discoveryState = { status: 'complete', provider };
+        this.identity.setProvider(provider);
+        this.audit('discovery.succeeded', { issuer: this.config.issuer });
+        this.markDiscovered();
+        return;
+      } catch (error) {
+        if (signal.aborted) return;
+        const delayMs = Math.min(maxMs, initialMs * 2 ** attempt);
+        this.discoveryState = {
+          status: 'pending',
+          retryAfterSeconds: Math.max(1, Math.ceil(delayMs / 1000)),
+        };
+        this.audit('discovery.failed', {
+          error: (error as Error).message,
+          issuer: this.config.issuer,
+          retryInMs: delayMs,
+        });
+        await this.sleepUnlessStopped(delayMs);
+      }
+    }
+  }
+
+  private sleepUnlessStopped(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      this.wakeDiscoverySleep = resolve;
+      this.discoveryTimer = setTimeout(resolve, ms);
+    });
+  }
+
+  private isDiscoveryReady(): boolean {
+    return this.discoveryState.status === 'complete';
+  }
+
+  private getProvider(): ProviderMetadata {
+    if (this.discoveryState.status === 'complete') return this.discoveryState.provider;
+    throw new Error('issuer discovery is not yet complete');
+  }
+
+  private serviceUnavailableUntilDiscovery(): Response {
+    const retryAfter =
+      this.discoveryState.status === 'pending' ? this.discoveryState.retryAfterSeconds : 1;
+    const response = problem(
+      503,
+      'Service Unavailable',
+      'issuer discovery is pending; retry shortly',
+    );
+    response.headers.set('retry-after', String(retryAfter));
+    return response;
   }
 
   audit(event: string, fields: Record<string, unknown> = {}): void {
@@ -447,12 +549,19 @@ export class Controller {
     server?: { requestIP(request: Request): { address: string } | null },
   ): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === '/-/healthz') return json({ ok: true, tenant: this.config.tenant });
+    if (url.pathname === '/-/healthz') {
+      return json({
+        ok: true,
+        tenant: this.config.tenant,
+        discoveryReady: this.isDiscoveryReady(),
+      });
+    }
     // The one public operation of the `/v1` contract: what a CLI needs before it has a credential.
     if (request.method === 'GET' && url.pathname === '/v1/auth/info') {
+      if (!this.isDiscoveryReady()) return this.serviceUnavailableUntilDiscovery();
       return json({
         account: this.config.tenant,
-        issuer: this.provider.issuer,
+        issuer: this.getProvider().issuer,
         clientId: this.config.cliClientId,
       });
     }
@@ -467,6 +576,10 @@ export class Controller {
           status: error.status,
           reason: error.message,
         });
+        // 503 from discovery pending should pass through
+        if (error.status === 503) {
+          return this.serviceUnavailableUntilDiscovery();
+        }
         return status(
           error.status,
           error.status === 401 ? 'Unauthorized' : 'Forbidden',
@@ -548,6 +661,7 @@ export class Controller {
           status: error.status,
           reason: error.message,
         });
+        if (error.status === 503) return this.serviceUnavailableUntilDiscovery();
         return problem(
           error.status,
           error.status === 401 ? 'Unauthorized' : 'Forbidden',
