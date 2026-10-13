@@ -10,6 +10,7 @@ import {
   type TenantAuthRoutes,
 } from '../tenancy/resources';
 import type { GatewayConfig } from './gateway';
+import { parseRoute } from './gateway';
 
 export { GATEWAY_NAME, GATEWAY_POD_LABELS };
 export const GATEWAY_PORT = 8080;
@@ -27,6 +28,85 @@ export function validateRouteUrlPattern(pattern: string | undefined): string | u
       `routeUrlPattern must look like http://{host}.{tenant}.localhost:<port>; received ${pattern}`,
     );
   return pattern;
+}
+
+/**
+ * Validate route aliases. Ensures:
+ * - both source and target are valid route identifiers (host.tenant)
+ * - source is not a reserved label (console, controller, registry)
+ * - no chains (A -> B -> C) or cycles (A -> B -> A)
+ */
+export function validateRouteAliases(
+  aliases: Record<string, string> | undefined,
+  tenantAuthRoutes?: { console?: string; controller?: string; registry?: string },
+): void {
+  if (!aliases || Object.keys(aliases).length === 0) return;
+
+  const reserved = new Set(
+    [tenantAuthRoutes?.console, tenantAuthRoutes?.controller, tenantAuthRoutes?.registry].filter(
+      (x) => x !== undefined,
+    ),
+  );
+
+  // Normalize alias keys to lowercase for consistent matching
+  const normalizedAliases: Record<string, string> = {};
+  for (const [source, target] of Object.entries(aliases)) {
+    const sourceKey = source.toLowerCase();
+    normalizedAliases[sourceKey] = target.toLowerCase();
+  }
+
+  // Parse and validate all keys and values
+  for (const [source, target] of Object.entries(normalizedAliases)) {
+    const sourceParsed = parseRoute(source);
+    if (!sourceParsed) {
+      throw new Error(`Invalid route alias source: ${source}`);
+    }
+    const targetParsed = parseRoute(target);
+    if (!targetParsed) {
+      throw new Error(`Invalid route alias target: ${target}`);
+    }
+
+    // Check that source is not a reserved label
+    if (reserved.has(sourceParsed.host)) {
+      throw new Error(`Route alias source cannot be a reserved label: ${source}`);
+    }
+  }
+
+  // Check for cycles and chains using a graph traversal
+  const visited = new Set<string>();
+  const visiting = new Set<string>();
+
+  function detectCycle(key: string, path: string[]): void {
+    if (visiting.has(key)) {
+      // We've found a cycle
+      throw new Error(`Cycle detected in route aliases: ${key}`);
+    }
+    if (visited.has(key)) return;
+
+    visiting.add(key);
+    const target = normalizedAliases[key];
+    if (target && target !== key) {
+      if (normalizedAliases[target]) {
+        // The target is also an alias source - check for cycle or chain
+        detectCycle(target, [...path, key]);
+      }
+    }
+    visited.add(key);
+    visiting.delete(key);
+  }
+
+  for (const source of Object.keys(normalizedAliases)) {
+    if (!visited.has(source)) {
+      detectCycle(source, []);
+    }
+  }
+
+  // Check for chains: an alias whose target is another alias source (but not self-aliases)
+  for (const [source, target] of Object.entries(normalizedAliases)) {
+    if (source !== target && normalizedAliases[target]) {
+      throw new Error(`Chained route aliases detected: ${source} -> ${target} -> ...`);
+    }
+  }
 }
 
 /** Route pattern for a loopback HTTP endpoint (the gateway's published port); otherwise none. */
@@ -52,24 +132,45 @@ export function gatewayScriptHash(scripts: Record<string, string>): string {
   return createHash('sha256').update(JSON.stringify(scripts)).digest('hex');
 }
 
+/**
+ * Create a hash of the gateway config (routes and aliases) that changes when the config changes.
+ * This is used in pod annotations to trigger a rollout when the gateway config changes.
+ */
+export function gatewayConfigHash(
+  tenantAuthRoutes?: TenantAuthRoutes,
+  routeAliases?: Record<string, string>,
+): string {
+  const configData = {
+    tenantAuthRoutes: tenantAuthRoutes ?? {},
+    routeAliases: routeAliases ?? {},
+  };
+  return createHash('sha256').update(JSON.stringify(configData)).digest('hex');
+}
+
 /** Gateway Deployment spec. It needs no Kubernetes API access, so it mounts no token. */
 export function gatewayDeploymentSpec(
   namespace: string,
   scriptHash: string,
   tenantAuthRoutes: TenantAuthRoutes = {},
+  routeAliases?: Record<string, string>,
 ) {
   const config: GatewayConfig = {
     port: GATEWAY_PORT,
     defaultUpstream: `wasmcloud-http.${namespace}.svc.cluster.local`,
     ...(Object.keys(tenantAuthRoutes).length ? { tenantAuthRoutes } : {}),
+    ...(routeAliases && Object.keys(routeAliases).length ? { routeAliases } : {}),
   };
+  const configHash = gatewayConfigHash(tenantAuthRoutes, routeAliases);
   return {
     replicas: 1,
     selector: { matchLabels: GATEWAY_POD_LABELS },
     template: {
       metadata: {
         labels: GATEWAY_POD_LABELS,
-        annotations: { 'di-framework.dev/script-hash': scriptHash },
+        annotations: {
+          'di-framework.dev/script-hash': scriptHash,
+          'di-framework.dev/config-hash': configHash,
+        },
       },
       spec: {
         automountServiceAccountToken: false,

@@ -26,12 +26,15 @@ import {
   endToEndHeaders,
   type GatewayOptions,
   main,
+  parseRoute,
   registryUpstream,
+  resolveAlias,
   routeRequest,
   serverName,
   tenantUpstream,
   upstreamHeaders,
 } from '../src/gateway/gateway';
+import { validateRouteAliases } from '../src/gateway/install';
 import { validName } from '../src/tenancy/resources';
 import { selfSignedCertificate } from '../src/tenancy/tls';
 
@@ -122,6 +125,161 @@ describe('routeRequest', () => {
     ])
       expect(routeRequest(host).kind).toBe('invalid');
     expect(routeRequest(undefined)).toEqual({ kind: 'invalid', reason: 'missing Host header' });
+  });
+});
+
+describe('route aliases (#217)', () => {
+  describe('parseRoute', () => {
+    it('parses valid route identifiers', () => {
+      expect(parseRoute('site.alpha')).toEqual({ host: 'site', tenant: 'alpha' });
+      expect(parseRoute('api.v1.beta')).toEqual({ host: 'api.v1', tenant: 'beta' });
+      expect(parseRoute('SITE.ALPHA')).toEqual({ host: 'site', tenant: 'alpha' });
+    });
+
+    it('rejects invalid route identifiers', () => {
+      expect(parseRoute('no-tenant')).toBeUndefined();
+      expect(parseRoute('.alpha')).toBeUndefined();
+      expect(parseRoute('site..alpha')).toBeUndefined();
+      expect(parseRoute('site.invalid_tenant')).toBeUndefined();
+      expect(parseRoute('site.1invalid')).toBeUndefined();
+      expect(parseRoute(`site.${'a'.repeat(41)}`)).toBeUndefined();
+      expect(parseRoute(`${'a'.repeat(64)}.alpha`)).toBeUndefined();
+    });
+  });
+
+  describe('resolveAlias', () => {
+    it('returns the original route when no alias matches', () => {
+      const route = { host: 'site', tenant: 'alpha' };
+      expect(resolveAlias(route, { 'other.beta': 'site.gamma' })).toEqual(route);
+    });
+
+    it('returns the original route when aliases is undefined', () => {
+      const route = { host: 'site', tenant: 'alpha' };
+      expect(resolveAlias(route)).toEqual(route);
+    });
+
+    it('resolves an alias when it matches', () => {
+      const aliases = { 'identity.identity': 'identity.identity-pg' };
+      expect(resolveAlias({ host: 'identity', tenant: 'identity' }, aliases)).toEqual({
+        host: 'identity',
+        tenant: 'identity-pg',
+      });
+    });
+
+    it('is case-insensitive for the alias key', () => {
+      const aliases = { 'site.alpha': 'site.beta' };
+      expect(resolveAlias({ host: 'SITE', tenant: 'ALPHA' }, aliases)).toEqual({
+        host: 'site',
+        tenant: 'beta',
+      });
+    });
+
+    it('ignores the port in matching', () => {
+      // The port is not part of the route parsing, just the host and tenant
+      const aliases = { 'site.alpha': 'site.beta' };
+      expect(resolveAlias({ host: 'site', tenant: 'alpha' }, aliases)).toEqual({
+        host: 'site',
+        tenant: 'beta',
+      });
+    });
+
+    it('returns the original route when the target is invalid', () => {
+      const route = { host: 'site', tenant: 'alpha' };
+      // "1invalid" is not a valid tenant name (cannot start with digit)
+      const aliases = { 'site.alpha': 'invalid.1invalid' };
+      expect(resolveAlias(route, aliases)).toEqual(route);
+    });
+  });
+
+  describe('routeRequest with aliases', () => {
+    it('resolves aliases in tenant routes', () => {
+      const aliases = { 'identity.identity': 'identity.identity-pg' };
+      expect(routeRequest('identity.identity.localhost', aliases)).toEqual({
+        kind: 'tenant',
+        host: 'identity',
+        tenant: 'identity-pg',
+      });
+      expect(routeRequest('identity.identity.localhost:28180', aliases)).toEqual({
+        kind: 'tenant',
+        host: 'identity',
+        tenant: 'identity-pg',
+      });
+    });
+
+    it('is case-insensitive', () => {
+      const aliases = { 'identity.identity': 'identity.identity-pg' };
+      expect(routeRequest('Identity.Identity.LOCALHOST', aliases)).toEqual({
+        kind: 'tenant',
+        host: 'identity',
+        tenant: 'identity-pg',
+      });
+    });
+
+    it('does not resolve non-tenant routes', () => {
+      const aliases = { 'identity.identity': 'identity.identity-pg' };
+      expect(routeRequest('example.com', aliases)).toEqual({ kind: 'default' });
+      expect(routeRequest('127.0.0.1:28180', aliases)).toEqual({ kind: 'default' });
+    });
+
+    it('returns the original tenant when no alias matches', () => {
+      const aliases = { 'other.other': 'other.other-pg' };
+      expect(routeRequest('site.alpha.localhost', aliases)).toEqual({
+        kind: 'tenant',
+        host: 'site',
+        tenant: 'alpha',
+      });
+    });
+  });
+
+  describe('validateRouteAliases', () => {
+    it('accepts valid aliases', () => {
+      const aliases = {
+        'identity.identity': 'identity.identity-pg',
+        'api.api': 'api.api-prod',
+      };
+      expect(() => validateRouteAliases(aliases)).not.toThrow();
+    });
+
+    it('accepts undefined or empty aliases', () => {
+      expect(() => validateRouteAliases(undefined)).not.toThrow();
+      expect(() => validateRouteAliases({})).not.toThrow();
+    });
+
+    it('rejects invalid source route', () => {
+      // "1invalid" is not a valid tenant name (must start with lowercase letter)
+      const aliases = { 'invalid.1invalid': 'valid.valid' };
+      expect(() => validateRouteAliases(aliases)).toThrow('Invalid route alias source');
+    });
+
+    it('rejects invalid target route', () => {
+      // "1invalid" is not a valid tenant name
+      const aliases = { 'valid.valid': 'invalid.1invalid' };
+      expect(() => validateRouteAliases(aliases)).toThrow('Invalid route alias target');
+    });
+
+    it('rejects reserved labels as alias source', () => {
+      const aliases = { 'controller.alpha': 'api.alpha' };
+      const tenantAuthRoutes = { controller: 'controller' };
+      expect(() => validateRouteAliases(aliases, tenantAuthRoutes)).toThrow(
+        'cannot be a reserved label',
+      );
+    });
+
+    it('rejects chained aliases', () => {
+      const aliases = { 'a.a': 'b.b', 'b.b': 'c.c' };
+      expect(() => validateRouteAliases(aliases)).toThrow('Chained route aliases detected');
+    });
+
+    it('rejects cycles', () => {
+      const aliases = { 'a.a': 'b.b', 'b.b': 'a.a' };
+      expect(() => validateRouteAliases(aliases)).toThrow('Cycle detected');
+    });
+
+    it('allows self-alias (no-op)', () => {
+      const aliases = { 'a.a': 'a.a' };
+      // Self-reference is a no-op, so it's allowed
+      expect(() => validateRouteAliases(aliases)).not.toThrow();
+    });
   });
 });
 
@@ -518,6 +676,94 @@ describe('gateway proxy', () => {
       socket.on('close', () => resolve(data));
     });
     expect(await ended).toContain('welcome;');
+  });
+
+  describe('gateway with route aliases (#217)', () => {
+    const aliasSeen: Seen[] = [];
+    let aliasUpstream: Server;
+    let aliasGateway: Server;
+    let aliasPort: number;
+    let aliasUpstreamPort: number;
+    const aliasTenants: string[] = [];
+
+    beforeEach(async () => {
+      aliasSeen.length = 0;
+      aliasTenants.length = 0;
+      aliasUpstream = createServer((req, res) => {
+        let body = '';
+        req.on('data', (chunk) => {
+          body += chunk;
+        });
+        req.on('end', () => {
+          aliasSeen.push({ url: req.url, method: req.method, headers: req.headers, body });
+          res.writeHead(200);
+          res.end(`tenant: ${req.headers.host}`);
+        });
+      });
+      aliasUpstreamPort = await listen(aliasUpstream);
+      aliasGateway = createGateway({
+        defaultUpstream: { hostname: '127.0.0.1', port: aliasUpstreamPort },
+        tenantUpstream: (tenant) => {
+          aliasTenants.push(tenant);
+          return { hostname: '127.0.0.1', port: aliasUpstreamPort };
+        },
+        routeAliases: {
+          'identity.identity': 'identity.identity-pg',
+          'api.api': 'api.api-v2',
+        },
+      });
+      aliasPort = await listen(aliasGateway);
+    });
+
+    afterEach(async () => {
+      aliasGateway.closeAllConnections();
+      await new Promise((resolve) => aliasGateway.close(resolve));
+      aliasUpstream.closeAllConnections();
+      await new Promise((resolve) => aliasUpstream.close(resolve));
+    });
+
+    it('routes aliased sources to target tenants', async () => {
+      const res = await send(aliasPort, {
+        headers: { host: 'identity.identity.localhost' },
+      });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe('tenant: identity');
+      expect(aliasTenants).toEqual(['identity-pg']);
+      expect(aliasSeen[0]?.headers.host).toBe('identity');
+    });
+
+    it('respects port in the request', async () => {
+      const res = await send(aliasPort, {
+        headers: { host: 'api.api.localhost:28180' },
+      });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe('tenant: api');
+      expect(aliasTenants).toEqual(['api-v2']);
+    });
+
+    it('is case-insensitive for the alias', async () => {
+      const res = await send(aliasPort, {
+        headers: { host: 'Identity.Identity.LOCALHOST' },
+      });
+      expect(res.status).toBe(200);
+      expect(aliasTenants).toEqual(['identity-pg']);
+    });
+
+    it('does not alias routes that do not match', async () => {
+      const res = await send(aliasPort, {
+        headers: { host: 'site.alpha.localhost' },
+      });
+      expect(res.status).toBe(200);
+      expect(aliasTenants).toEqual(['alpha']);
+    });
+
+    it('does not alias non-tenant routes', async () => {
+      const res = await send(aliasPort, {
+        headers: { host: 'example.com' },
+      });
+      expect(res.status).toBe(200);
+      expect(aliasTenants).toEqual([]);
+    });
   });
 });
 

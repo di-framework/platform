@@ -56,6 +56,8 @@ export interface GatewayOptions {
   controllerUpstream?: (tenant: string) => Upstream;
   /** Where a registry TLS connection is sent; only overridden by tests. */
   registryUpstream?: (tenant: string) => Upstream;
+  /** Maps public route (host.tenant) to target route (host.tenant); must be validated at install. */
+  routeAliases?: Record<string, string>;
   /** Edge only: time a new connection has to send enough bytes to be classified (default 10 s). */
   classifyTimeoutMs?: number;
   /** Edge only: idle time allowed on a controller passthrough pipe (default 5 min). */
@@ -81,8 +83,59 @@ function invalid(reason: string): Route {
   return { kind: 'invalid', reason };
 }
 
+/**
+ * Parse a route identifier like "host.tenant" from a request or configuration string.
+ * Returns { host, tenant } if valid, undefined otherwise.
+ * The host can be a dot-separated label sequence (e.g., "api.v2"), but there must be exactly
+ * one tenant label at the end.
+ */
+export function parseRoute(routeId: string): { host: string; tenant: string } | undefined {
+  const lower = routeId.toLowerCase();
+  const labels = lower.split('.');
+  if (labels.length < 2) return undefined;
+
+  const tenant = labels[labels.length - 1] as string;
+  const hostLabels = labels.slice(0, -1);
+
+  // Validate tenant: must be a valid tenant name
+  if (tenant.length === 0 || tenant.length > 40 || !TENANT_NAME.test(tenant)) {
+    return undefined;
+  }
+
+  // Validate host: each label must be valid, host combined must be valid
+  const host = hostLabels.join('.');
+  if (
+    host.length === 0 ||
+    host.length > 253 ||
+    !hostLabels.every((label) => label.length > 0 && label.length <= 63 && LABEL.test(label))
+  ) {
+    return undefined;
+  }
+
+  return { host, tenant };
+}
+
+/**
+ * Resolve an alias if one matches. Given a route { host, tenant }, return the target route
+ * if an alias matches, or the original route if not.
+ */
+export function resolveAlias(
+  route: { host: string; tenant: string },
+  aliases?: Record<string, string>,
+): { host: string; tenant: string } {
+  if (!aliases) return route;
+  const key = `${route.host}.${route.tenant}`.toLowerCase();
+  const target = aliases[key];
+  if (!target) return route;
+  const parsed = parseRoute(target);
+  return parsed ?? route;
+}
+
 /** Pure routing decision from the request Host header. */
-export function routeRequest(hostHeader: string | undefined): Route {
+export function routeRequest(
+  hostHeader: string | undefined,
+  aliases?: Record<string, string>,
+): Route {
   if (!hostHeader) return invalid('missing Host header');
   const value = hostHeader.toLowerCase();
   if (value.startsWith('['))
@@ -98,7 +151,9 @@ export function routeRequest(hostHeader: string | undefined): Route {
   if (labels.length < 3 || labels[labels.length - 1] !== 'localhost') return { kind: 'default' };
   const tenant = labels[labels.length - 2] as string;
   if (tenant.length > 40 || !TENANT_NAME.test(tenant)) return { kind: 'default' };
-  return { kind: 'tenant', tenant, host: labels.slice(0, -2).join('.') };
+  const route = { host: labels.slice(0, -2).join('.'), tenant };
+  const resolved = resolveAlias(route, aliases);
+  return { kind: 'tenant', ...resolved };
 }
 
 export function tenantUpstream(tenant: string): Upstream {
@@ -190,7 +245,7 @@ function passThrough(socket: Socket, hello: Buffer, options: GatewayOptions): vo
     console.error(
       `${socket.remoteAddress}: closing a TLS connection whose ClientHello has no readable server name (malformed, or split across records)`,
     );
-  const route = routeRequest(name);
+  const route = routeRequest(name, options.routeAliases);
   const routes = options.tenantAuthRoutes;
   const upstreamFor =
     route.kind !== 'tenant'
@@ -317,7 +372,7 @@ function target(
 ): { route: Exclude<Route, { kind: 'invalid' }>; upstream: Upstream } | { error: string } {
   // Absolute-form targets carry their own authority; only origin-form is routed by Host.
   if (!req.url?.startsWith('/')) return { error: 'malformed request target' };
-  const route = routeRequest(req.headers.host);
+  const route = routeRequest(req.headers.host, options.routeAliases);
   if (route.kind === 'invalid') return { error: route.reason };
   if (route.kind === 'tenant' && options.tenantAuthRoutes?.controller === route.host)
     return { error: 'the controller host is served over TLS only' };
@@ -445,6 +500,7 @@ export interface GatewayConfig {
   defaultUpstream: string;
   upstreamTimeoutMs?: number;
   tenantAuthRoutes?: { console?: string; controller?: string; registry?: string };
+  routeAliases?: Record<string, string>;
 }
 
 export function main(
@@ -457,6 +513,7 @@ export function main(
     defaultUpstream: { hostname: cfg.defaultUpstream, port: 80 },
     upstreamTimeoutMs: cfg.upstreamTimeoutMs,
     tenantAuthRoutes: cfg.tenantAuthRoutes,
+    routeAliases: cfg.routeAliases,
   };
   const server = createGateway(options);
   // TLS passthrough needs the raw connection, so a routed controller or registry puts the edge

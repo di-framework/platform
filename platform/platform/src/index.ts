@@ -259,6 +259,8 @@ export function createPlatform(args: PlatformArgs) {
   const tenantAuth = config.getObject<TenantAuthConfig>('tenantAuth');
   // Gateway routes for each tenant's console and controller hosts (#58).
   const { routes: tenantAuthRouteHosts } = tenantAuthRoutes(tenantAuth, routeUrlPattern);
+  // Gateway route aliases (#217): maps public routes to target tenants.
+  const routeAliases = config.getObject<Record<string, string>>('gateway.routeAliases');
   const gatewayScript = loadGatewayScript();
   const gatewayScripts = new k8s.core.v1.ConfigMap(
     'http-gateway',
@@ -281,6 +283,7 @@ export function createPlatform(args: PlatformArgs) {
         namespaceName,
         gatewayScriptHash(gatewayScript),
         tenantAuthRouteHosts,
+        routeAliases,
       ),
     },
     { provider, dependsOn: [gatewayScripts, gatewayPolicy, httpBackend] },
