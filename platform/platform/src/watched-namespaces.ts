@@ -78,7 +78,9 @@ export async function operatorHostNamespaces(args: HostNamespacesArgs): Promise<
     return declaredNamespaces;
   }
   const declared = new Set(args.declared);
-  const draining = [...new Set(await args.listTenants())].filter((t) => !declared.has(t)).sort();
+  const draining = [...new Set(await args.listTenants())]
+    .filter((t) => !declared.has(t))
+    .sort((a, b) => a.localeCompare(b));
   for (const tenant of draining)
     args.log.info(
       `Tenant ${tenant} is no longer declared but still exists, so ${runtime(tenant)} stays in the wasmCloud operator's hostNamespaces while the Tenant is deleted; it stops being watched on the next up, after the Tenant is gone (#227).`,

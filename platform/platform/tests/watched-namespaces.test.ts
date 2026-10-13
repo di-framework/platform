@@ -25,11 +25,17 @@ function args(
 test('a removed tenant whose Tenant still exists keeps its runtime namespace watched (#227)', async () => {
   const { info, warn, log } = recorder();
   const namespaces = await operatorHostNamespaces(
-    args({ listTenants: async () => ['beta', 'alpha', 'beta'] }, log),
+    args({ listTenants: async () => ['zeta', 'beta', 'alpha', 'beta'] }, log),
   );
-  expect(namespaces).toEqual(['wasmcloud', 'di-runtime-alpha', 'di-runtime-beta']);
+  // Declared first, then the removed ones once each, sorted, so the Helm values are stable.
+  expect(namespaces).toEqual([
+    'wasmcloud',
+    'di-runtime-alpha',
+    'di-runtime-beta',
+    'di-runtime-zeta',
+  ]);
   expect(warn).toEqual([]);
-  expect(info).toHaveLength(1);
+  expect(info).toHaveLength(2);
   expect(info[0]).toContain('Tenant beta is no longer declared but still exists');
   expect(info[0]).toContain('di-runtime-beta');
   expect(info[0]).toContain('next up, after the Tenant is gone');
