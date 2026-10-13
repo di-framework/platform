@@ -28,11 +28,14 @@ test('the committed document is what the manifests generate', () => {
 
 test('the committed client types are what openapi-typescript generates', () => {
   const out = join(tmpdir(), `tenant-schema-${process.pid}.d.ts`);
-  const result = Bun.spawnSync(['bun', 'x', 'openapi-typescript', openApiSpecFile, '-o', out], {
-    cwd: join(import.meta.dir, '..'),
-    stdout: 'ignore',
-    stderr: 'pipe',
-  });
+  const result = Bun.spawnSync(
+    ['bun', 'scripts/openapi-typescript.ts', openApiSpecFile, '-o', out],
+    {
+      cwd: join(import.meta.dir, '..'),
+      stdout: 'ignore',
+      stderr: 'pipe',
+    },
+  );
   expect(result.exitCode).toBe(0);
   expect(readFileSync(out, 'utf8')).toBe(
     readFileSync(join(import.meta.dir, '../src/client/schema.d.ts'), 'utf8'),

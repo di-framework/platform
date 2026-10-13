@@ -103,6 +103,33 @@ describe('loadKubeconfig', () => {
   });
   afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
+  test('resolves YAML merge keys (<<: *anchor)', () => {
+    writeFileSync(
+      join(dir, 'merge.yaml'),
+      [
+        'current-context: m',
+        'contexts:',
+        '  - name: m',
+        '    context: { cluster: c, user: u }',
+        'clusters:',
+        '  - name: c',
+        '    cluster: &base { server: "https://k8s:6443" }',
+        '  - name: c2',
+        '    cluster:',
+        '      <<: *base',
+        'users:',
+        '  - name: u',
+        '    user:',
+        '      <<: { token: tok }',
+        '',
+      ].join('\n'),
+    );
+    expect(loadKubeconfig(join(dir, 'merge.yaml'))).toMatchObject({
+      server: 'https://k8s:6443',
+      token: 'tok',
+    });
+  });
+
   test('decodes inline data for the current context', () => {
     expect(loadKubeconfig(join(dir, 'inline.yaml'))).toEqual({
       server: 'https://k8s:6443',
