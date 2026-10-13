@@ -98,13 +98,14 @@ export const DEFAULT_HOST_IMAGE =
   'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad';
 
 /**
- * Config `routeAliases`, a top-level object. A `gateway` key (nested `gateway.routeAliases`, or the
- * literal dotted key) is refused rather than silently ignored.
+ * Route aliases from `args`, or else from config `routeAliases`, a top-level object. A `gateway`
+ * config key (nested `gateway.routeAliases`, or the literal dotted key) is refused rather than
+ * silently ignored, whichever way the aliases arrive.
  */
-function configRouteAliases(config: pulumi.Config): unknown {
+function routeAliasesInput(args: PlatformArgs, config: pulumi.Config): unknown {
   if (config.get('gateway') !== undefined || config.get('gateway.routeAliases') !== undefined)
     throw new Error('Set route aliases with the top-level config key routeAliases, not gateway');
-  return config.getObject<unknown>('routeAliases');
+  return args.routeAliases ?? config.getObject<unknown>('routeAliases');
 }
 
 /** Shared platform resources; the caller owns cluster creation and Pulumi state. */
@@ -133,7 +134,7 @@ export function createPlatform(args: PlatformArgs) {
   // Gateway routes for each tenant's console and controller hosts (#58).
   const { routes: tenantAuthRouteHosts } = tenantAuthRoutes(tenantAuth, routeUrlPattern);
   // Gateway route aliases (#217): validated and normalized once, before any resource.
-  const routeAliases = validateRouteAliases(args.routeAliases ?? configRouteAliases(config), {
+  const routeAliases = validateRouteAliases(routeAliasesInput(args, config), {
     tenantAuthRoutes: tenantAuthRouteHosts,
     tenants: declared.tenants.map((tenant) => tenant.name),
   });

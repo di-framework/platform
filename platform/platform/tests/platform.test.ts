@@ -610,6 +610,14 @@ test('install validates config routeAliases and deploys them normalized to the g
   });
 }, 120_000);
 
+test('install refuses a gateway config key even when PlatformArgs.routeAliases is passed (#217)', () => {
+  const result = gatewayInstall(
+    { gateway: { routeAliases: { 'api.identity': 'api.identity-pg' } } },
+    `routeAliases: { 'identity.identity': 'identity.identity-pg' }`,
+  );
+  expect(result.error).toContain('top-level config key routeAliases');
+}, 60_000);
+
 test.each([
   [
     'a chain',
