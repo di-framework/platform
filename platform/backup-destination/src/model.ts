@@ -4,7 +4,11 @@ export const GROUP = 'platform.di-framework.dev';
 export const VERSION = `${GROUP}/v1alpha1`;
 export const DUMP_CAP_BYTES = 4 * 1024 ** 3;
 export const BACKUP_NOW = `${GROUP}/backup-now`;
-export const SCHEDULE = '0 2 * * *';
+/**
+ * The chart's explicit opt-out from scheduled backups (#250). There is no default schedule: a
+ * destination without one, or with this keyword, takes only on-demand backups.
+ */
+export const NO_SCHEDULE = 'none';
 /** Claim the chart creates from `volumeClaimTemplate`, in the runtime namespace. */
 export const PVC_CLAIM = 'di-backup-pvc';
 /** Where agent Jobs mount a PVC destination. */
@@ -385,7 +389,8 @@ export type Action =
     }
   | { type: 'create-restore'; body: Record<string, unknown> }
   | { type: 'scale-workload'; name: string; replicas: number }
-  | { type: 'delete-job'; name: string };
+  | { type: 'delete-job'; name: string }
+  | { type: 'log'; message: string };
 
 /** Destinations created before #233 carry no `type`; they are S3. */
 export function destinationType(spec: Pick<DestinationSpec, 'type'> | undefined): 's3' | 'pvc' {

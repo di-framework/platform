@@ -2,6 +2,7 @@ import * as k8s from '@pulumi/kubernetes';
 import type * as pulumi from '@pulumi/pulumi';
 
 const TENANT = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
+const CRON = /^[0-9*,/-]+(\s+[0-9*,/-]+){4}$/;
 
 export interface BackupDestinationInstall {
   tenant: string;
@@ -17,7 +18,11 @@ export interface BackupDestinationInstall {
   endpoint?: pulumi.Input<string>;
   region?: pulumi.Input<string>;
   prefix?: pulumi.Input<string>;
-  schedule?: pulumi.Input<string>;
+  /**
+   * Required, no default (#250): a five-field UTC cron such as `0 2 * * *`, or `'none'` for
+   * on-demand backups only. The chart refuses to render without it.
+   */
+  schedule: pulumi.Input<string>;
   retentionSuccessful?: pulumi.Input<number>;
   existingSecret?: pulumi.Input<string>;
   accessKeyId?: pulumi.Input<string>;
@@ -70,6 +75,14 @@ export function backupReleaseArgs(install: BackupDestinationInstall): k8s.helm.v
       'tenant must be a wasmCloud tenant name (1–40 lowercase letters, digits, hyphens; starting with a letter)',
     );
   }
+  // An Output is checked by the chart when it renders.
+  if (
+    typeof install.schedule === 'string' &&
+    install.schedule.trim() !== 'none' &&
+    !CRON.test(install.schedule.trim())
+  ) {
+    throw new Error('schedule must be a five-field UTC cron (such as "0 2 * * *") or "none"');
+  }
   const values: Record<string, pulumi.Input<unknown>> = {};
   if (install.type !== undefined) values.type = install.type;
   if (install.bucket !== undefined) values.bucket = install.bucket;
@@ -79,7 +92,7 @@ export function backupReleaseArgs(install: BackupDestinationInstall): k8s.helm.v
   if (install.endpoint !== undefined) values.endpoint = install.endpoint;
   if (install.region !== undefined) values.region = install.region;
   if (install.prefix !== undefined) values.prefix = install.prefix;
-  if (install.schedule !== undefined) values.schedule = install.schedule;
+  values.schedule = install.schedule;
   if (install.retentionSuccessful !== undefined)
     values.retentionSuccessful = install.retentionSuccessful;
   if (install.existingSecret !== undefined) values.existingSecret = install.existingSecret;

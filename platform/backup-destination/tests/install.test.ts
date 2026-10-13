@@ -1,7 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import * as k8s from '@pulumi/kubernetes';
 import * as pulumi from '@pulumi/pulumi';
-import { backupReleaseArgs, installBackupDestination } from '../src/install.ts';
+import {
+  type BackupDestinationInstall,
+  backupReleaseArgs,
+  installBackupDestination,
+} from '../src/install.ts';
 
 describe('backup helm release', () => {
   test('targets the wasmCloud tenant namespace and does not create it', () => {
@@ -9,13 +13,14 @@ describe('backup helm release', () => {
       tenant: 'alpha',
       chart: '/charts/backup-destination',
       bucket: 'tenant-alpha-backups',
+      schedule: '0 2 * * *',
     });
     expect(release).toEqual({
       name: 'backups',
       namespace: 'di-tenant-alpha',
       createNamespace: false,
       chart: '/charts/backup-destination',
-      values: { bucket: 'tenant-alpha-backups' },
+      values: { bucket: 'tenant-alpha-backups', schedule: '0 2 * * *' },
     });
   });
 
@@ -60,16 +65,38 @@ describe('backup helm release', () => {
       bucket: 'b',
       existingClaimName: 'claim',
       volumeClaimTemplate: { storageClassName: 'local-path', size: '20Gi' },
+      schedule: 'none',
     });
     expect(release.values).toEqual({
+      schedule: 'none',
       type: 'both',
       bucket: 'b',
       existingClaimName: 'claim',
       volumeClaimTemplate: { storageClassName: 'local-path', size: '20Gi' },
     });
-    expect(backupReleaseArgs({ tenant: 'alpha', chart: '/chart', type: 'pvc' }).values).toEqual({
-      type: 'pvc',
+    expect(
+      backupReleaseArgs({ tenant: 'alpha', chart: '/chart', type: 'pvc', schedule: '0 3 * * 0' })
+        .values,
+    ).toEqual({ type: 'pvc', schedule: '0 3 * * 0' });
+  });
+
+  test('requires an explicit schedule: a cron or none, never a default (#250)', () => {
+    // @ts-expect-error schedule is a required option since #250
+    const missing: BackupDestinationInstall = { tenant: 'alpha', chart: '/chart', bucket: 'b' };
+    expect(missing.schedule).toBeUndefined();
+    const typed: BackupDestinationInstall = { tenant: 'alpha', chart: '/chart', schedule: 'none' };
+    expect(backupReleaseArgs(typed).values).toEqual({ schedule: 'none' });
+    expect(backupReleaseArgs({ ...typed, schedule: ' */15 1-5 * * 1,3 ' }).values).toEqual({
+      schedule: ' */15 1-5 * * 1,3 ',
     });
+    for (const schedule of ['', '  ', 'nightly', '0 2 * *', '0 2 * * * *', 'manual']) {
+      expect(() => backupReleaseArgs({ ...typed, schedule })).toThrow(
+        'schedule must be a five-field UTC cron (such as "0 2 * * *") or "none"',
+      );
+    }
+    // An Output is passed through; the chart validates it when it renders.
+    const output = pulumi.output('0 2 * * *');
+    expect(backupReleaseArgs({ ...typed, schedule: output }).values).toEqual({ schedule: output });
   });
 
   test('passes workload-volume sources and the storage root through', () => {
@@ -89,11 +116,11 @@ describe('backup helm release', () => {
   });
 
   test('rejects a namespace that is not a tenant name', () => {
-    expect(() => backupReleaseArgs({ tenant: 'Wasm', chart: '/chart', bucket: 'b' })).toThrow(
-      /wasmCloud tenant name/,
-    );
     expect(() =>
-      backupReleaseArgs({ tenant: 'a'.repeat(41), chart: '/chart', bucket: 'b' }),
+      backupReleaseArgs({ tenant: 'Wasm', chart: '/chart', bucket: 'b', schedule: 'none' }),
+    ).toThrow(/wasmCloud tenant name/);
+    expect(() =>
+      backupReleaseArgs({ tenant: 'a'.repeat(41), chart: '/chart', bucket: 'b', schedule: 'none' }),
     ).toThrow(/wasmCloud tenant name/);
   });
 
@@ -122,7 +149,12 @@ describe('backup helm release', () => {
         installBackupDestination({
           provider,
           dependsOn: [],
-          install: { tenant: 'alpha', chart: '/chart', bucket: 'tenant-alpha-backups' },
+          install: {
+            tenant: 'alpha',
+            chart: '/chart',
+            bucket: 'tenant-alpha-backups',
+            schedule: '0 2 * * *',
+          },
         }) instanceof k8s.helm.v3.Release;
     });
     expect(constructed).toBe(true);

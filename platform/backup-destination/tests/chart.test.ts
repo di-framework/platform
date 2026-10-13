@@ -49,9 +49,10 @@ const destinations = (out: string) =>
     .filter((doc) => /^kind: BackupDestination$/m.test(doc))
     .join('\n---\n');
 
+/** Renders with `schedule: 0 2 * * *` (required since #250) unless a test overrides it; null omits a value. */
 async function template(
   namespace: string,
-  values: Record<string, string>,
+  values: Record<string, string | null>,
   typed: Record<string, string> = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const args = [
@@ -63,7 +64,9 @@ async function template(
     namespace,
     '--include-crds',
   ];
-  for (const [key, value] of Object.entries(values)) args.push('--set-string', `${key}=${value}`);
+  for (const [key, value] of Object.entries({ schedule: '0 2 * * *', ...values })) {
+    if (value !== null) args.push('--set-string', `${key}=${value}`);
+  }
   for (const [key, value] of Object.entries(typed)) args.push('--set', `${key}=${value}`);
   const child = Bun.spawn(args, { stdout: 'pipe', stderr: 'pipe' });
   const code = await child.exited;
@@ -133,22 +136,57 @@ describe('backup-destination chart', () => {
     expect(text).not.toContain("!self.startsWith('/')");
   });
 
-  test('schedule: S3 keeps its written default; PVC writes none unless set', async () => {
+  test('schedule is required for s3, pvc, and both, with no default (#250)', async () => {
+    const kinds: Record<string, Record<string, string>> = {
+      s3: { bucket: 'b', existingSecret: 's' },
+      pvc: { type: 'pvc', 'volumeClaimTemplate.size': '1Gi' },
+      both: { type: 'both', bucket: 'b', existingSecret: 's', 'volumeClaimTemplate.size': '1Gi' },
+    };
+    for (const values of Object.values(kinds)) {
+      for (const schedule of [null, '', '  ']) {
+        const missing = await template('di-tenant-alpha', { ...values, schedule });
+        expect(missing.code).not.toBe(0);
+        expect(missing.stderr).toContain('schedule is required');
+        expect(missing.stderr).toContain('"none" for on-demand backups only');
+      }
+      const bad = await template('di-tenant-alpha', { ...values, schedule: 'nightly' });
+      expect(bad.code).not.toBe(0);
+      expect(bad.stderr).toContain('schedule "nightly" must be a five-field UTC cron');
+      const short = await template('di-tenant-alpha', { ...values, schedule: '0 2 * *' });
+      expect(short.code).not.toBe(0);
+      const none = await template('di-tenant-alpha', { ...values, schedule: 'none' });
+      expect(none.code).toBe(0);
+      expect(destinations(none.stdout)).toContain('kind: BackupDestination');
+      expect(destinations(none.stdout)).not.toContain('schedule:');
+    }
+    const values = await Bun.file(`${import.meta.dir}/../chart/values.yaml`).text();
+    expect(values).toMatch(/^schedule: ""$/m);
+  });
+
+  test('an explicit cron is written to every rendered destination', async () => {
     const s3 = await template('di-tenant-alpha', { bucket: 'b', existingSecret: 's' });
-    expect(destinations(s3.stdout)).toContain('schedule: "0 2 * * *"');
+    expect(destinations(s3.stdout).match(/schedule: "0 2 \* \* \*"/g)?.length).toBe(1);
     const pvc = await template('di-tenant-alpha', {
       type: 'pvc',
       'volumeClaimTemplate.size': '1Gi',
+      schedule: '30 3 * * 0',
     });
-    expect(destinations(pvc.stdout)).not.toContain('schedule:');
+    expect(destinations(pvc.stdout)).toContain('schedule: "30 3 * * 0"');
     const both = await template('di-tenant-alpha', {
       type: 'both',
       bucket: 'b',
       existingSecret: 's',
       'volumeClaimTemplate.size': '1Gi',
-      schedule: '5 1 * * *',
+      schedule: '*/15 1-5 * * 1-3',
     });
-    expect(destinations(both.stdout).match(/schedule: "5 1 \* \* \*"/g)?.length).toBe(2);
+    expect(both.code).toBe(0);
+    expect(destinations(both.stdout).match(/schedule: "\*\/15 1-5 \* \* 1-3"/g)?.length).toBe(2);
+  });
+
+  test('the CRD describes schedule without a default', async () => {
+    const text = await Bun.file(`${import.meta.dir}/../chart/crds/backups.yaml`).text();
+    expect(text).toContain('There is no default');
+    expect(text).toContain('NoSchedule');
   });
 
   test('renders a PVC destination, both destinations, and refuses an incomplete one', async () => {

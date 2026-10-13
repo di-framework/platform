@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { handle, render } from '../src/console.ts';
 import { applyActions, type KubeClient, loadWorld } from '../src/kube.ts';
 import {
+  type Action,
   DUMP_CAP_BYTES,
   endpointAllowed,
   jobName,
@@ -1130,32 +1131,37 @@ describe('kubernetes client', () => {
     expect(JSON.stringify(actions)).toContain('existingClaimName or volumeClaimTemplate.size');
   });
 
-  test('72 simulated hours: PVC without schedule never backs up, S3 without schedule runs at 02:00', () => {
-    const pvc = {
-      spec: { type: 'pvc' as const, existingClaimName: 'c' },
-    };
-    const s3 = {
-      spec: {
-        type: 's3' as const,
-        bucket: 'b',
-        credentialsSecretRef: { name: 'di-backup-s3' },
+  test('applies a log action by writing it to stdout, without touching the API', async () => {
+    const calls: string[] = [];
+    const client: KubeClient = {
+      async get(path) {
+        calls.push(path);
+        return {};
+      },
+      async post(path) {
+        calls.push(path);
+        return {};
+      },
+      async patch(path) {
+        calls.push(path);
+        return {};
+      },
+      async remove(path) {
+        calls.push(path);
       },
     };
-    const run = (extra: object, at: string) =>
-      reconcile(
-        world({
-          now: at,
-          services: [orders],
-          destination: { name: 'd', generation: 1, annotations: {}, status: {}, ...extra } as never,
-        }),
-      );
-    const s3Hours: string[] = [];
-    for (let h = 0; h < 72; h++) {
-      const at = new Date(Date.UTC(2026, 8, 28, 0, 0) + h * 3600_000).toISOString();
-      expect(run(pvc, at).some((a) => a.type === 'create-backup')).toBe(false);
-      if (run(s3, at).some((a) => a.type === 'create-backup')) s3Hours.push(at.slice(11, 13));
+    const logged: unknown[] = [];
+    const original = console.log;
+    console.log = (...args: unknown[]) => {
+      logged.push(...args);
+    };
+    try {
+      await applyActions(client, world(), [{ type: 'log', message: 'BackupDestination d: hi' }]);
+    } finally {
+      console.log = original;
     }
-    expect(s3Hours.length).toBeGreaterThan(0);
+    expect(logged).toEqual(['BackupDestination d: hi']);
+    expect(calls).toEqual([]);
   });
 
   test('accepts PVC destination with existingClaimName', () => {
@@ -1554,5 +1560,188 @@ describe('console and client with several destinations', () => {
       '/apis/platform.di-framework.dev/v1alpha1/namespaces/di-tenant-alpha/backupdestinations/pvc/status',
       '/apis/platform.di-framework.dev/v1alpha1/namespaces/di-tenant-alpha/backupdestinations/legacy/status',
     ]);
+  });
+});
+
+describe('explicit schedules, no fallback (#250)', () => {
+  const s3Spec = {
+    type: 's3' as const,
+    bucket: 'b',
+    credentialsSecretRef: { name: 'di-backup-s3' },
+  };
+  const pvcSpec = { type: 'pvc' as const, existingClaimName: 'c' };
+  const start = Date.UTC(2026, 8, 28, 0, 0);
+  // The last run finished at the start of the simulation, so only the cron can start another.
+  const settled = {
+    lastAttemptTime: new Date(start).toISOString(),
+    services: [
+      {
+        name: 'orders',
+        type: 'postgres',
+        lastAttemptTime: new Date(start).toISOString(),
+        lastReason: 'Completed',
+      },
+    ],
+  };
+  const statusOf = (actions: Action[]) =>
+    actions.flatMap((a) => (a.type === 'destination-status' ? [a.status] : []));
+  const scheduledOf = (actions: Action[]) =>
+    statusOf(actions).map((status) => status.conditions?.find((c) => c.type === 'Scheduled'));
+
+  /**
+   * Ticks every `stepMinutes` for 72 hours, feeding each status write back like the API
+   * server would, and returns every action of every tick.
+   */
+  function simulate(spec: object, stepMinutes: number, status: object = {}): Action[][] {
+    let current = status as never;
+    const ticks: Action[][] = [];
+    for (let minute = 0; minute <= 72 * 60; minute += stepMinutes) {
+      const actions = reconcile(
+        world({
+          now: new Date(start + minute * 60_000).toISOString(),
+          services: [orders],
+          destination: {
+            name: 'd',
+            generation: 1,
+            annotations: {},
+            status: current,
+            spec,
+          } as never,
+        }),
+      );
+      const next = statusOf(actions).at(-1);
+      if (next) current = next as never;
+      ticks.push(actions);
+    }
+    return ticks;
+  }
+
+  for (const [label, spec] of [
+    ['an S3 destination without a schedule field (pre-#250 object)', s3Spec],
+    ['a PVC destination without a schedule field', pvcSpec],
+    ['an S3 destination with an empty schedule', { ...s3Spec, schedule: '' }],
+    ['an S3 destination with schedule none', { ...s3Spec, schedule: 'none' }],
+    ['a PVC destination with schedule none', { ...pvcSpec, schedule: ' none ' }],
+  ] as const) {
+    test(`72 simulated hours: ${label} never backs up and reports NoSchedule`, () => {
+      const ticks = simulate(spec, 15);
+      expect(ticks.flat().some((a) => a.type === 'create-backup' || a.type === 'create-job')).toBe(
+        false,
+      );
+      for (const actions of ticks) {
+        expect(scheduledOf(actions)).toEqual([
+          {
+            type: 'Scheduled',
+            status: 'False',
+            reason: 'NoSchedule',
+            message: 'No schedule is set: only on-demand backups run',
+          },
+        ]);
+        // Ready is still reported next to it.
+        expect(statusOf(actions)[0]?.conditions?.[0]?.type).toBe('Ready');
+      }
+      const logs = ticks.flat().filter((a) => a.type === 'log');
+      expect(logs).toEqual([
+        {
+          type: 'log',
+          message: 'BackupDestination d: No schedule is set: only on-demand backups run',
+        },
+      ]);
+    });
+  }
+
+  test('an explicit cron fires exactly at its times over 72 simulated hours', () => {
+    const ticks = simulate({ ...s3Spec, schedule: '30 */6 * * *' }, 15, {
+      ...settled,
+    });
+    const fired = ticks
+      .filter((actions) => actions.some((a) => a.type === 'create-backup'))
+      .map((actions) => statusOf(actions).at(-1)?.lastAttemptTime);
+    const expected = [0, 1, 2].flatMap((day) =>
+      [0, 6, 12, 18].map((hour) => new Date(Date.UTC(2026, 8, 28 + day, hour, 30)).toISOString()),
+    );
+    expect(fired).toEqual(expected);
+    expect(scheduledOf(ticks[0] ?? [])).toEqual([
+      {
+        type: 'Scheduled',
+        status: 'True',
+        reason: 'Scheduled',
+        message: 'Scheduled backups run on "30 */6 * * *" (UTC)',
+      },
+    ]);
+    expect(ticks.flat().filter((a) => a.type === 'log')).toHaveLength(1);
+  });
+
+  test('a nightly PVC cron fires once a day at 02:00', () => {
+    const ticks = simulate({ ...pvcSpec, schedule: '0 2 * * *' }, 60, {
+      ...settled,
+    });
+    const fired = ticks
+      .filter((actions) => actions.some((a) => a.type === 'create-backup'))
+      .map((actions) => statusOf(actions).at(-1)?.lastAttemptTime?.slice(0, 13));
+    expect(fired).toEqual(['2026-09-28T02', '2026-09-29T02', '2026-09-30T02']);
+  });
+
+  test('a destination without a schedule still runs a backup-now request', () => {
+    for (const spec of [s3Spec, pvcSpec, { ...s3Spec, schedule: 'none' }]) {
+      const actions = reconcile(
+        world({
+          services: [orders],
+          destination: {
+            name: 'd',
+            generation: 1,
+            annotations: { 'platform.di-framework.dev/backup-now': '2026-09-28T14:59:00.000Z' },
+            spec,
+            status: {},
+          },
+        }),
+      );
+      expect(actions.some((a) => a.type === 'create-backup')).toBe(true);
+      expect(actions).toContainEqual({
+        type: 'clear-annotation',
+        name: 'd',
+        key: 'platform.di-framework.dev/backup-now',
+      });
+      expect(scheduledOf(actions)[0]?.reason).toBe('NoSchedule');
+    }
+  });
+
+  test('logs again only when the Scheduled condition changes', () => {
+    const noSchedule = {
+      type: 'Scheduled',
+      status: 'False',
+      reason: 'NoSchedule',
+      message: 'No schedule is set: only on-demand backups run',
+    };
+    const run = (spec: object, conditions: object[]) =>
+      reconcile(
+        world({
+          destination: {
+            name: 'd',
+            generation: 1,
+            annotations: {},
+            spec: spec as never,
+            status: { conditions: conditions as never },
+          },
+        }),
+      ).filter((a) => a.type === 'log');
+    expect(run(s3Spec, [noSchedule])).toEqual([]);
+    expect(run({ ...s3Spec, schedule: '0 2 * * *' }, [noSchedule])).toEqual([
+      { type: 'log', message: 'BackupDestination d: Scheduled backups run on "0 2 * * *" (UTC)' },
+    ]);
+    // A suspended destination keeps the condition too.
+    const suspended = reconcile(
+      world({
+        destination: {
+          name: 'd',
+          generation: 1,
+          annotations: {},
+          spec: { ...s3Spec, suspend: true },
+          status: { conditions: [noSchedule] },
+        },
+      }),
+    );
+    expect(scheduledOf(suspended)).toEqual([noSchedule]);
+    expect(suspended.some((a) => a.type === 'log')).toBe(false);
   });
 });

@@ -111,6 +111,9 @@ const backups = tenants.map((tenant, index) => {
       bucket,
       endpoint,
       region: 'us-east-1',
+      // Required since #250 (no default). The first tick after install is due, so the demo
+      // backup still runs at once.
+      schedule: config.require('schedule'),
       accessKeyId,
       secretAccessKey,
       // kube-router evaluates egress after kube-proxy DNAT, so the Service CIDR

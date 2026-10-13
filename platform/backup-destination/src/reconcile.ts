@@ -12,6 +12,7 @@ import {
   GROUP,
   type JobView,
   jobName,
+  NO_SCHEDULE,
   PVC_CLAIM,
   PVC_MOUNT,
   parseBytes,
@@ -19,7 +20,6 @@ import {
   postgresConnectionSecret,
   type RestoreView,
   RUNTIME_SECRET,
-  SCHEDULE,
   type ServiceStatus,
   type ServiceView,
   servicePort,
@@ -425,9 +425,56 @@ function excess(world: World, keep: number): BackupView[] {
   return doomed;
 }
 
+type Condition = NonNullable<DestinationStatus['conditions']>[number];
+
+/** The destination's schedule, or undefined when it takes only on-demand backups (#250). */
+function scheduleOf(dest: DestinationView): string | undefined {
+  const schedule = dest.spec.schedule?.trim();
+  return schedule && schedule !== NO_SCHEDULE ? schedule : undefined;
+}
+
+function scheduledCondition(dest: DestinationView): Condition {
+  const schedule = scheduleOf(dest);
+  return schedule
+    ? {
+        type: 'Scheduled',
+        status: 'True',
+        reason: 'Scheduled',
+        message: `Scheduled backups run on "${schedule}" (UTC)`,
+      }
+    : {
+        type: 'Scheduled',
+        status: 'False',
+        reason: 'NoSchedule',
+        message: 'No schedule is set: only on-demand backups run',
+      };
+}
+
+/**
+ * Reconcile one destination. Every status write carries a `Scheduled` condition next to
+ * `Ready`, and a change of it is logged once (the persisted condition is the memory).
+ */
 export function reconcile(world: World): Action[] {
   const dest = world.destination;
   if (!dest) return [];
+  const scheduled = scheduledCondition(dest);
+  const actions = reconcileDestination(world, dest).map((action): Action => {
+    if (action.type !== 'destination-status') return action;
+    const conditions = (action.status.conditions ?? []).filter((item) => item.type !== 'Scheduled');
+    return { ...action, status: { ...action.status, conditions: [...conditions, scheduled] } };
+  });
+  const previous = dest.status.conditions?.find((item) => item.type === 'Scheduled');
+  if (
+    previous?.status !== scheduled.status ||
+    previous.reason !== scheduled.reason ||
+    previous.message !== scheduled.message
+  ) {
+    actions.push({ type: 'log', message: `BackupDestination ${dest.name}: ${scheduled.message}` });
+  }
+  return actions;
+}
+
+function reconcileDestination(world: World, dest: DestinationView): Action[] {
   const actions: Action[] = [];
   let status: DestinationStatus = {
     ...dest.status,
@@ -511,9 +558,8 @@ export function reconcile(world: World): Action[] {
     );
     return actions;
   }
-  // Only S3 destinations fall back to the default schedule (main's behavior for existing
-  // objects). A PVC destination without a schedule only takes on-demand backups.
-  const schedule = dest.spec.schedule || (destinationType(dest.spec) === 's3' ? SCHEDULE : '');
+  // No default schedule (#250): without one, only on-demand backups run.
+  const schedule = scheduleOf(dest);
   const forced = dest.annotations[BACKUP_NOW];
   const due =
     (!!schedule && isDue(schedule, status.lastAttemptTime, new Date(world.now))) ||

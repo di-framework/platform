@@ -2,6 +2,11 @@
 {{- if not (has $type (list "s3" "pvc" "both")) -}}
 {{- fail "type must be s3, pvc, or both" -}}
 {{- end -}}
+{{- /* No default schedule (#250): a cron, or "none" for on-demand backups only. */ -}}
+{{- $schedule := required "schedule is required: set a five-field UTC cron such as \"0 2 * * *\", or \"none\" for on-demand backups only (there is no default since #250)" (.Values.schedule | default "" | toString | trim) -}}
+{{- if and (ne $schedule "none") (not (regexMatch "^[0-9*,/-]+([ \t]+[0-9*,/-]+){4}$" $schedule)) -}}
+{{- fail (printf "schedule %q must be a five-field UTC cron (minute hour day month weekday) or \"none\"" $schedule) -}}
+{{- end -}}
 {{- $s3 := or (eq $type "s3") (eq $type "both") -}}
 {{- $pvc := or (eq $type "pvc") (eq $type "both") -}}
 {{- $secret := .Values.existingSecret -}}
@@ -78,7 +83,9 @@ spec:
   {{- end }}
   credentialsSecretRef:
     name: {{ $secret | quote }}
-  schedule: {{ .Values.schedule | default "0 2 * * *" | quote }}
+  {{- if ne $schedule "none" }}
+  schedule: {{ $schedule | quote }}
+  {{- end }}
   {{- include "backup.common" . }}
   {{- include "backup.sources" (dict "root" . "kind" "s3") }}
 {{- end }}
@@ -102,8 +109,8 @@ spec:
     {{- end }}
     size: {{ .Values.volumeClaimTemplate.size | quote }}
   {{- end }}
-  {{- if .Values.schedule }}
-  schedule: {{ .Values.schedule | quote }}
+  {{- if ne $schedule "none" }}
+  schedule: {{ $schedule | quote }}
   {{- end }}
   {{- include "backup.common" . }}
   {{- include "backup.sources" (dict "root" . "kind" "pvc") }}
