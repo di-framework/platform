@@ -1,6 +1,6 @@
 {
   "name": "@di-framework/platform",
-  "version": "6.0.13",
+  "version": "6.0.14",
   "description": "Shared Pulumi infrastructure for DI Framework wasmCloud platforms.",
   "type": "commonjs",
   "main": "./dist/index.js",
@@ -44,11 +44,10 @@
     "@pulumi/command": "1.2.1",
     "@pulumi/kubernetes": "4.34.2",
     "@pulumi/pulumi": "3.268.0",
-    "js-yaml": "4.3.2"
+    "js-yaml": "5.4.3"
   },
   "devDependencies": {
     "@marcbachmann/cel-js": "^8.0.0",
-    "@types/js-yaml": "4.0.9",
     "@types/node": "26.6.5"
   },
   "typesVersions": {

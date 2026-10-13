@@ -1,25 +1,93 @@
 import * as k8s from '@pulumi/kubernetes';
 import type * as pulumi from '@pulumi/pulumi';
+import { validCron } from './schedule.ts';
 
 const TENANT = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
 
 export interface BackupDestinationInstall {
   tenant: string;
   chart: string;
-  bucket: pulumi.Input<string>;
+  /** `s3` (the default), `pvc`, or `both`. */
+  type?: 's3' | 'pvc' | 'both';
+  /** Required for `s3` and `both`. */
+  bucket?: pulumi.Input<string>;
+  /** PVC destination: a claim that already exists in `di-runtime-<tenant>`. */
+  existingClaimName?: pulumi.Input<string>;
+  /** PVC destination: the chart creates claim `di-backup-pvc` with this size and class. */
+  volumeClaimTemplate?: pulumi.Input<{ storageClassName?: string; size: string }>;
   endpoint?: pulumi.Input<string>;
   region?: pulumi.Input<string>;
   prefix?: pulumi.Input<string>;
-  schedule?: pulumi.Input<string>;
+  /**
+   * Required, no default (#250): a five-field UTC cron such as `0 2 * * *`, or `'none'` for
+   * on-demand backups only. The chart refuses to render without it.
+   */
+  schedule: pulumi.Input<string>;
   retentionSuccessful?: pulumi.Input<number>;
   existingSecret?: pulumi.Input<string>;
   accessKeyId?: pulumi.Input<string>;
   secretAccessKey?: pulumi.Input<string>;
   extraEgress?: pulumi.Input<pulumi.Input<{ cidr: string; port: number; protocol?: string }>[]>;
+  /**
+   * The platform's storageRoot. Leave it unset and the operator takes it from the path the
+   * tenant host pods mount, so it cannot disagree with the platform. When set, that path must
+   * match it; pass the same value the platform installation uses.
+   */
+  storageRoot?: pulumi.Input<string>;
+  /**
+   * Workload volumes to copy cold (#232). `schedule` is required with no default (#250): a
+   * five-field UTC cron, or `'none'` for on-demand backups only. No retention means every backup
+   * is kept. `destination` picks `s3` or `pvc` when `type` is `both`.
+   */
+  sources?: pulumi.Input<
+    {
+      workloadName: string;
+      schedule: string;
+      retention?: {
+        keepLast?: number;
+        daily?: number;
+        weekly?: number;
+        monthly?: number;
+        failed?: number;
+      };
+      scaleDownTimeoutSeconds?: number;
+      copyTimeoutSeconds?: number;
+      /** Placement probe and copy Job start deadline (default 120). */
+      startTimeoutSeconds?: number;
+      /** Copy Job resources; the default is requests 50m/64Mi, limits 100m/128Mi. */
+      resources?: {
+        requests?: { cpu?: string; memory?: string };
+        limits?: { cpu?: string; memory?: string };
+      };
+      suspend?: boolean;
+      destination?: 's3' | 'pvc';
+    }[]
+  >;
   agentImage?: pulumi.Input<string>;
   imageRepository?: pulumi.Input<string>;
   imageTag?: pulumi.Input<string>;
   imagePullPolicy?: pulumi.Input<string>;
+}
+
+/**
+ * A plain source must name a cron or "none". A source or schedule that is an Output (an object)
+ * is checked by the chart when it renders.
+ */
+function checkSourceSchedule(source: unknown): void {
+  if (!source || typeof source !== 'object') return;
+  const { workloadName, schedule } = source as { workloadName?: unknown; schedule?: unknown };
+  if (typeof schedule === 'object' && schedule !== null) return;
+  const name = typeof workloadName === 'string' ? workloadName : '?';
+  if (typeof schedule !== 'string' || schedule.trim() === '') {
+    throw new Error(
+      `source ${name}: schedule is required: a five-field UTC cron (such as "30 3 * * *") or "none"`,
+    );
+  }
+  if (schedule.trim() !== 'none' && !validCron(schedule)) {
+    throw new Error(
+      `source ${name}: schedule must be a five-field UTC cron (such as "30 3 * * *") or "none"`,
+    );
+  }
 }
 
 /** Helm release arguments for one tenant. The namespace is the one wasmCloud created. */
@@ -29,17 +97,39 @@ export function backupReleaseArgs(install: BackupDestinationInstall): k8s.helm.v
       'tenant must be a wasmCloud tenant name (1–40 lowercase letters, digits, hyphens; starting with a letter)',
     );
   }
-  const values: Record<string, pulumi.Input<unknown>> = { bucket: install.bucket };
+  // A missing schedule throws here too (a JS caller can omit it); an Output is checked by the
+  // chart when it renders.
+  if (install.schedule === undefined || install.schedule === null) {
+    throw new Error('schedule is required: a five-field UTC cron (such as "0 2 * * *") or "none"');
+  }
+  if (
+    typeof install.schedule === 'string' &&
+    install.schedule.trim() !== 'none' &&
+    !validCron(install.schedule)
+  ) {
+    throw new Error('schedule must be a five-field UTC cron (such as "0 2 * * *") or "none"');
+  }
+  if (Array.isArray(install.sources)) {
+    for (const source of install.sources as unknown[]) checkSourceSchedule(source);
+  }
+  const values: Record<string, pulumi.Input<unknown>> = {};
+  if (install.type !== undefined) values.type = install.type;
+  if (install.bucket !== undefined) values.bucket = install.bucket;
+  if (install.existingClaimName !== undefined) values.existingClaimName = install.existingClaimName;
+  if (install.volumeClaimTemplate !== undefined)
+    values.volumeClaimTemplate = install.volumeClaimTemplate;
   if (install.endpoint !== undefined) values.endpoint = install.endpoint;
   if (install.region !== undefined) values.region = install.region;
   if (install.prefix !== undefined) values.prefix = install.prefix;
-  if (install.schedule !== undefined) values.schedule = install.schedule;
+  values.schedule = install.schedule;
   if (install.retentionSuccessful !== undefined)
     values.retentionSuccessful = install.retentionSuccessful;
   if (install.existingSecret !== undefined) values.existingSecret = install.existingSecret;
   if (install.accessKeyId !== undefined) values.accessKeyId = install.accessKeyId;
   if (install.secretAccessKey !== undefined) values.secretAccessKey = install.secretAccessKey;
   if (install.extraEgress !== undefined) values.extraEgress = install.extraEgress;
+  if (install.storageRoot !== undefined) values.storageRoot = install.storageRoot;
+  if (install.sources !== undefined) values.sources = install.sources;
   if (install.agentImage !== undefined) values.agentImage = install.agentImage;
   const image: Record<string, pulumi.Input<string>> = {};
   if (install.imageRepository !== undefined) image.repository = install.imageRepository;

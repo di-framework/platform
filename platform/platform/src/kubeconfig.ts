@@ -1,5 +1,9 @@
-import { load } from 'js-yaml';
+import { CORE_SCHEMA, load, mergeTag } from 'js-yaml';
+
 import { names } from './tenancy/resources';
+
+/** js-yaml 5 dropped merge keys (`<<: *anchor`) from its default schema; kubeconfigs use them. */
+const KUBECONFIG_SCHEMA = CORE_SCHEMA.withTags(mergeTag);
 
 export interface TenantKubeconfigArgs {
   /** Kubernetes API server URL reachable by the user, e.g. `https://127.0.0.1:26443`. */
@@ -51,7 +55,7 @@ export function tenantKubeconfig(args: TenantKubeconfigArgs): string {
 export function kubeconfigServer(text: string, context?: string): string | undefined {
   let config: unknown;
   try {
-    config = load(text);
+    config = load(text, { schema: KUBECONFIG_SCHEMA });
   } catch {
     return undefined;
   }

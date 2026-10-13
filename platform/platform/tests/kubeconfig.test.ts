@@ -89,4 +89,22 @@ current-context: first
     expect(kubeconfigServer('just text')).toBeUndefined();
     expect(kubeconfigServer('contexts: {}\ncurrent-context: x')).toBeUndefined();
   });
+
+  it('resolves YAML merge keys (<<: *anchor)', () => {
+    const text = [
+      'current-context: a',
+      'contexts:',
+      '  - name: a',
+      '    context: &ctx',
+      '      cluster: c1',
+      '  - name: b',
+      '    context:',
+      '      <<: *ctx',
+      'clusters:',
+      '  - name: c1',
+      '    cluster: { server: "https://merged:6443" }',
+      '',
+    ].join('\n');
+    expect(kubeconfigServer(text, 'b')).toBe('https://merged:6443');
+  });
 });

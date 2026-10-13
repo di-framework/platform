@@ -1,6 +1,6 @@
 {
   "name": "di-framework-platform",
-  "version": "6.0.13",
+  "version": "6.0.14",
   "private": true,
   "type": "module",
   "license": "(MIT OR Apache-2.0)",
@@ -22,9 +22,10 @@
   "devDependencies": {
     "@biomejs/biome": "^2.5.15",
     "@types/bun": "latest",
-    "typescript": "^5.9.3"
+    "@typescript/typescript6": "^6.0.2",
+    "typescript": "^7.0.2"
   },
   "peerDependencies": {
-    "typescript": "^5.9.3"
+    "typescript": "^7.0.2"
   }
 }

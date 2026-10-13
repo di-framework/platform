@@ -1,6 +1,6 @@
 {
   "name": "@di-framework/bindings",
-  "version": "6.0.13",
+  "version": "6.0.14",
   "description": "Native platform WIT service bindings for DI Framework applications.",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -45,7 +45,7 @@
     "./catalog.json": "./catalog.json"
   },
   "peerDependencies": {
-    "@di-framework/core": "^5",
+    "@di-framework/core": "^6",
     "@di-framework/repo": "^6.1.0",
     "typescript": "^5"
   },
@@ -62,7 +62,7 @@
     "LICENSE-APACHE"
   ],
   "devDependencies": {
-    "@di-framework/core": "^5",
+    "@di-framework/core": "^6",
     "@di-framework/repo": "^6.1.0",
     "@types/bun": "latest"
   }

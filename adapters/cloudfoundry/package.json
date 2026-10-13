@@ -1,6 +1,6 @@
 {
   "name": "@di-framework/cloudfoundry",
-  "version": "6.0.13",
+  "version": "6.0.14",
   "description": "Cloud Foundry connector for VCAP_SERVICES discovery, application metadata, and automated DI binding.",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -41,7 +41,7 @@
     }
   },
   "peerDependencies": {
-    "@di-framework/core": "^5",
+    "@di-framework/core": "^6",
     "typescript": "^5"
   },
   "files": [
@@ -51,7 +51,7 @@
     "LICENSE-APACHE"
   ],
   "devDependencies": {
-    "@di-framework/core": "^5",
+    "@di-framework/core": "^6",
     "@types/bun": "latest"
   }
 }

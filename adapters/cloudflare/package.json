@@ -1,6 +1,6 @@
 {
   "name": "@di-framework/cloudflare",
-  "version": "6.0.13",
+  "version": "6.0.14",
   "description": "Cloudflare Workers connector for binding discovery, wrangler config, and automated DI injection.",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -42,7 +42,7 @@
     }
   },
   "peerDependencies": {
-    "@di-framework/core": "^5",
+    "@di-framework/core": "^6",
     "typescript": "^5"
   },
   "files": [
@@ -52,7 +52,7 @@
     "LICENSE-APACHE"
   ],
   "devDependencies": {
-    "@di-framework/core": "^5",
+    "@di-framework/core": "^6",
     "@types/bun": "latest"
   }
 }

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { backupVolume, probePlacement, restoreVolume } from './volume.ts';
 
 export const TERMINATION_LIMIT = 4096;
 
@@ -11,6 +12,9 @@ export const BACKUP_KINDS = [
   'restore-postgres',
   'restore-redis',
   'restore-nats',
+  'workload-volume',
+  'restore-workload-volume',
+  'probe-placement',
 ] as const;
 
 export type BackupKind = (typeof BACKUP_KINDS)[number];
@@ -23,6 +27,13 @@ export interface Termination {
   tool?: string;
   format?: string;
   error?: string;
+  /** Workload volumes (#232). */
+  fileCount?: number;
+  encfsKcv?: string;
+  imageDigest?: string;
+  replacedPath?: string;
+  /** A restore that stopped part-way: the staging directory it left, relative to the root. */
+  restoringPath?: string;
 }
 
 export interface AgentRequest {
@@ -38,7 +49,40 @@ export interface AgentRequest {
   region: string;
   pgUser: string;
   pgDatabase: string;
+  destinationType?: 's3' | 'pvc';
+  pvcMountPath?: string;
+  /** workload-volume: the read-only hostPath mount of the volume. */
+  sourceDir?: string;
+  workloadName?: string;
+  storageKey?: string;
+  sourceImage?: string;
+  /** UTC stamp the operator chose; it names the backup and any `.replaced-` directory. */
+  stamp?: string;
+  /** restore-workload-volume: the read-write mount of `<root>/di-tenants/<uid>/workloads`. */
+  targetRoot?: string;
+  force?: boolean;
+  /** The KCV the restored marker must carry, when the operator names one. */
+  expectedKcv?: string;
+  /** probe-placement: directories that must exist on this node, `:`-separated. */
+  probePaths?: string;
 }
+
+export interface TreeEntry {
+  /** Relative to the scanned root, `/`-separated. */
+  path: string;
+  type: 'file' | 'directory' | 'symlink' | 'other';
+  size: number;
+  mode: number;
+  mtimeMs: number;
+  /** Userspace cannot set ctime: with ino it tells a rewritten file from an untouched one. */
+  ctimeMs: number;
+  ino: number;
+  uid: number;
+  gid: number;
+}
+
+/** One end of {@link AgentIo.pipe}: a command's stdout/stdin, or a file. */
+export type PipeEnd = { argv: string[]; env?: Record<string, string> } | { file: string };
 
 export interface ExecResult {
   code: number;
@@ -54,7 +98,29 @@ export interface AgentIo {
   readFile(path: string): Promise<Uint8Array>;
   writeFile(path: string, data: string | Uint8Array): Promise<void>;
   remove(path: string): Promise<void>;
+  /** Delete one file (never a directory). A missing file is not an error. */
+  unlink(path: string): Promise<void>;
   mkdir(path: string): Promise<void>;
+  /** Every entry under `root`, depth first, links not followed. */
+  scan(root: string): Promise<TreeEntry[]>;
+  /** Hex sha256 of a file, streamed. */
+  hash(path: string): Promise<string>;
+  /** Entry names directly in `path`. */
+  list(path: string): Promise<string[]>;
+  rename(from: string, to: string): Promise<void>;
+  /** Set the owner of one entry, never following a link. */
+  chown(path: string, uid: number, gid: number): Promise<void>;
+  isDirectory(path: string): Promise<boolean>;
+  /**
+   * Stream `from` into `to` (or nowhere), showing every chunk to `inspect` on the way. Nothing
+   * is buffered whole: a volume can be far larger than the Job's memory. A non-zero code, or
+   * `inspect` throwing, fails the pipe.
+   */
+  pipe(
+    from: PipeEnd,
+    to: PipeEnd | undefined,
+    inspect: (chunk: Uint8Array) => void,
+  ): Promise<{ code: number; stderr: string }>;
 }
 
 export function encodeTermination(value: Termination): string {
@@ -108,19 +174,30 @@ export function parseRequest(env: Record<string, string | undefined>): AgentRequ
     region: env.BACKUP_REGION ?? 'us-east-1',
     pgUser: env.PGUSER ?? 'app',
     pgDatabase: env.PGDATABASE ?? 'app',
+    destinationType: env.BACKUP_DESTINATION_TYPE === 'pvc' ? 'pvc' : 's3',
+    pvcMountPath: env.BACKUP_PVC_MOUNT_PATH,
+    sourceDir: env.BACKUP_SOURCE_DIR,
+    workloadName: env.BACKUP_WORKLOAD_NAME,
+    storageKey: env.BACKUP_STORAGE_KEY,
+    sourceImage: env.BACKUP_SOURCE_IMAGE,
+    stamp: env.BACKUP_STAMP,
+    targetRoot: env.BACKUP_TARGET_ROOT,
+    force: env.BACKUP_FORCE === 'true',
+    expectedKcv: env.BACKUP_EXPECTED_KCV || undefined,
+    probePaths: env.BACKUP_PROBE_PATHS,
   };
 }
 
-function remote(request: AgentRequest, name: string): string {
+export function remote(request: AgentRequest, name: string): string {
   const key = request.prefix ? `${request.prefix}/${name}` : name;
   return `:s3:${request.bucket}/${key}`;
 }
 
-function objectKey(request: AgentRequest, name: string): string {
+export function objectKey(request: AgentRequest, name: string): string {
   return request.prefix ? `${request.prefix}/${name}` : name;
 }
 
-async function finish(io: AgentIo, log: string, value: Termination): Promise<number> {
+export async function finish(io: AgentIo, log: string, value: Termination): Promise<number> {
   await io.writeFile(log, encodeTermination(value));
   return value.ok ? 0 : 1;
 }
@@ -132,6 +209,53 @@ async function copyToS3(
   name: string,
 ): Promise<ExecResult> {
   return io.exec(['rclone', 'copyto', file, remote(request, name)], { env: rcloneEnv(request) });
+}
+
+/** Object keys come from Backup status. Refuse anything that could leave the claim. */
+export function safeKey(key: string): boolean {
+  return (
+    !!key && !key.startsWith('/') && !key.split('/').some((part) => part === '..' || part === '.')
+  );
+}
+
+export function pvcPath(request: AgentRequest, name: string): string | undefined {
+  const key = objectKey(request, name);
+  if (!request.pvcMountPath || !safeKey(key)) return undefined;
+  return `${request.pvcMountPath}/${key}`;
+}
+
+/**
+ * Copy with `cp`, not through memory: a dump can be several GiB and the Job has 128Mi. The file
+ * lands under a `.partial` name and is renamed into place, so a reader never sees half of it.
+ */
+async function copyToPvc(
+  io: AgentIo,
+  request: AgentRequest,
+  file: string,
+  name: string,
+): Promise<ExecResult> {
+  const target = pvcPath(request, name);
+  if (!target) return { code: 1, stdout: '', stderr: 'PvcPathInvalid' };
+  try {
+    await io.mkdir(target.slice(0, target.lastIndexOf('/')));
+  } catch (err) {
+    return { code: 1, stdout: '', stderr: String(err) };
+  }
+  const partial = `${target}.partial`;
+  const discard = async (result: ExecResult): Promise<ExecResult> => {
+    await io.unlink(partial).catch(() => undefined);
+    return result;
+  };
+  const copied = await io.exec(['cp', file, partial]);
+  if (copied.code !== 0) return discard(copied);
+  // Flush the copy to disk before the rename, so a node crash cannot leave a renamed empty file.
+  const flushed = await io.exec(['sync', partial]);
+  if (flushed.code !== 0) return discard(flushed);
+  const moved = await io.exec(['mv', '-f', partial, target]);
+  if (moved.code !== 0) return discard(moved);
+  // Make the rename itself durable. Best effort: some `sync` builds only flush everything.
+  await io.exec(['sync', target.slice(0, target.lastIndexOf('/'))]);
+  return moved;
 }
 
 function manifest(tool: string, format: string, digest: string): string {
@@ -156,12 +280,16 @@ async function uploadDump(
   const digest = sha256Prefixed(bytes);
   const meta = `${request.workdir}/manifest.json`;
   await io.writeFile(meta, manifest(tool, format, digest));
-  const data = await copyToS3(io, request, file, name);
+  const data = await put(io, request, file, name);
   if (data.code !== 0)
     return finish(io, request.terminationLog, { ok: false, error: 'UploadFailed' });
-  const side = await copyToS3(io, request, meta, 'manifest.json');
-  if (side.code !== 0)
+  const side = await put(io, request, meta, 'manifest.json');
+  if (side.code !== 0) {
+    // No manifest means no objectKey on the Backup, so retention would never reclaim the data.
+    const orphan = request.destinationType === 'pvc' ? pvcPath(request, name) : undefined;
+    if (orphan) await io.unlink(orphan).catch(() => undefined);
     return finish(io, request.terminationLog, { ok: false, error: 'UploadFailed' });
+  }
   return finish(io, request.terminationLog, {
     ok: true,
     digest,
@@ -174,6 +302,7 @@ async function uploadDump(
 
 function requireTarget(request: AgentRequest): string | undefined {
   if (!request.host || !request.port) return 'MissingTarget';
+  if (request.destinationType === 'pvc') return request.pvcMountPath ? undefined : 'MissingClaim';
   if (!request.bucket) return 'MissingBucket';
   return undefined;
 }
@@ -336,15 +465,42 @@ async function probe(io: AgentIo, request: AgentRequest): Promise<number> {
   });
 }
 
+/** Store a local file as `<prefix>/<name>` on the destination. */
+export function put(
+  io: AgentIo,
+  request: AgentRequest,
+  file: string,
+  name: string,
+): Promise<ExecResult> {
+  return request.destinationType === 'pvc'
+    ? copyToPvc(io, request, file, name)
+    : copyToS3(io, request, file, name);
+}
+
+/** Fetch `<prefix>/<name>` from the destination into a local file. */
+export async function get(
+  io: AgentIo,
+  request: AgentRequest,
+  name: string,
+  file: string,
+): Promise<ExecResult> {
+  if (request.destinationType !== 'pvc') {
+    return io.exec(['rclone', 'copyto', remote(request, name), file], { env: rcloneEnv(request) });
+  }
+  const source = pvcPath(request, name);
+  if (!source) return { code: 1, stdout: '', stderr: 'PvcPathInvalid' };
+  return io.exec(['cp', source, file]);
+}
+
 async function download(
   io: AgentIo,
   request: AgentRequest,
   name: string,
   file: string,
 ): Promise<number | undefined> {
-  const result = await io.exec(['rclone', 'copyto', remote(request, name), file], {
-    env: rcloneEnv(request),
-  });
+  const result = await get(io, request, name, file);
+  if (result.stderr === 'PvcPathInvalid')
+    return finish(io, request.terminationLog, { ok: false, error: 'PvcPathInvalid' });
   if (result.code !== 0)
     return finish(io, request.terminationLog, { ok: false, error: 'DownloadFailed' });
   return undefined;
@@ -412,7 +568,98 @@ async function restoreNats(io: AgentIo, request: AgentRequest): Promise<number> 
   return finish(io, request.terminationLog, { ok: true, tool: 'nats', format: 'account-backup' });
 }
 
+/** Leftovers older than this are from a dead Job, not a running one. */
+const STALE_MINUTES = '1440';
+
+/**
+ * Pods killed mid-copy leave `*.partial` files and data files without a manifest. Neither has
+ * an objectKey on a Backup, so retention cannot name them. Best effort: a failed sweep never
+ * fails the gc.
+ *
+ * The sweep stays inside the destination's own tree: `<mount>/<prefix>`, files exactly at
+ * `<service>/<uid>/<stamp>/<file>` depth. It never follows symlinks and skips `lost+found`.
+ */
+const SWEEP_SCRIPT = `
+root="$1"; minutes="$2"; mount="$3"
+[ -d "$root" ] && [ ! -L "$root" ] || exit 0
+# Refuse the claim root itself, and any root that resolves outside the mount (symlinked segment).
+real=$(cd "$root" 2>/dev/null && pwd -P) || exit 0
+base=$(cd "$mount" 2>/dev/null && pwd -P) || exit 0
+[ "$real" != "$base" ] || exit 0
+case "$real" in "$base"/*) ;; *) exit 0 ;; esac
+root="$real"
+find "$root" -mindepth 4 -maxdepth 4 -type f ! -path "$root/lost+found/*" -mmin +"$minutes" |
+while IFS= read -r f; do
+  case "$f" in
+    *.partial) rm -f "$f" ;;
+    */manifest.json) ;;
+    *) [ -e "$(dirname "$f")/manifest.json" ] || rm -f "$f" ;;
+  esac
+done
+`;
+
+export async function sweepPvc(
+  io: AgentIo,
+  mount: string,
+  prefixes: Iterable<string>,
+): Promise<void> {
+  for (const prefix of prefixes) {
+    const clean = prefix.split('/').filter(Boolean).join('/');
+    if (!clean) continue; // never sweep the claim root
+    await io.exec(['sh', '-c', SWEEP_SCRIPT, 'sweep', `${mount}/${clean}`, STALE_MINUTES, mount]);
+  }
+}
+
+/** A key is `<prefix>/<service>/<uid>/<stamp>/<file>`; the prefix is what remains after those 4. */
+function keyPrefix(key: string): string | undefined {
+  const parts = key.split('/');
+  return parts.length >= 4 ? parts.slice(0, -4).filter(Boolean).join('/') : undefined;
+}
+
+async function gcPvc(io: AgentIo, request: AgentRequest): Promise<number> {
+  if (!request.pvcMountPath) {
+    return finish(io, request.terminationLog, { ok: false, error: 'PvcMountPathNotSet' });
+  }
+  const keys = request.gcKeys
+    .split('\n')
+    .map((key) => key.trim())
+    .filter(Boolean);
+  if (!keys.every(safeKey)) {
+    return finish(io, request.terminationLog, { ok: false, error: 'PvcPathInvalid' });
+  }
+  const prefixes = new Set<string>();
+  for (const key of keys) {
+    const prefix = keyPrefix(key);
+    if (prefix !== undefined) prefixes.add(prefix);
+  }
+  await sweepPvc(io, request.pvcMountPath, prefixes);
+  const directories = new Set<string>();
+  for (const key of keys) {
+    try {
+      await io.unlink(`${request.pvcMountPath}/${key}`);
+    } catch (_err) {
+      return finish(io, request.terminationLog, { ok: false, error: 'GcFailed' });
+    }
+    // Every ancestor below the claim root, deepest first: `<source>/<uid>/<stamp>` and up.
+    const parts = key.split('/').slice(0, -1);
+    for (let depth = parts.length; depth > 0; depth--) {
+      directories.add(parts.slice(0, depth).join('/'));
+    }
+  }
+  // rmdir refuses a non-empty directory, so only emptied ones go.
+  const deepestFirst = [...directories].sort((a, b) => b.split('/').length - a.split('/').length);
+  for (const directory of deepestFirst) {
+    await io.exec(['rmdir', `${request.pvcMountPath}/${directory}`]);
+  }
+  return finish(io, request.terminationLog, { ok: true, tool: 'rm', format: 'delete' });
+}
+
+const RCLONE_NOT_FOUND = 4;
+
 async function gc(io: AgentIo, request: AgentRequest): Promise<number> {
+  if (request.destinationType === 'pvc') {
+    return gcPvc(io, request);
+  }
   if (!request.bucket)
     return finish(io, request.terminationLog, { ok: false, error: 'MissingBucket' });
   const keys = request.gcKeys
@@ -423,14 +670,24 @@ async function gc(io: AgentIo, request: AgentRequest): Promise<number> {
     const result = await io.exec(['rclone', 'deletefile', `:s3:${request.bucket}/${key}`], {
       env: rcloneEnv(request),
     });
-    if (result.code !== 0)
+    // Exit 4 is rclone's "file not found": already deleted, or never written by a failed copy.
+    if (result.code !== 0 && result.code !== RCLONE_NOT_FOUND)
       return finish(io, request.terminationLog, { ok: false, error: 'GcFailed' });
   }
   return finish(io, request.terminationLog, { ok: true, tool: 'rclone', format: 'delete' });
 }
 
+const SERVICE_KINDS: readonly BackupKind[] = [
+  'postgres',
+  'redis',
+  'nats',
+  'restore-postgres',
+  'restore-redis',
+  'restore-nats',
+];
+
 export async function runAgent(request: AgentRequest, io: AgentIo): Promise<number> {
-  if (request.kind !== 'gc' && request.kind !== 'probe-empty') {
+  if (SERVICE_KINDS.includes(request.kind)) {
     const missing = requireTarget(request);
     if (missing) return finish(io, request.terminationLog, { ok: false, error: missing });
   }
@@ -451,5 +708,11 @@ export async function runAgent(request: AgentRequest, io: AgentIo): Promise<numb
       return restoreRedis(io, request);
     case 'restore-nats':
       return restoreNats(io, request);
+    case 'workload-volume':
+      return backupVolume(io, request);
+    case 'restore-workload-volume':
+      return restoreVolume(io, request);
+    case 'probe-placement':
+      return probePlacement(io, request);
   }
 }

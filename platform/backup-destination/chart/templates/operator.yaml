@@ -16,9 +16,32 @@ rules:
   - apiGroups: ["platform.di-framework.dev"]
     resources: ["backupdestinations/status", "backuprestores/status", "backups/status"]
     verbs: ["get", "patch", "update"]
+  {{- $secret := include "backup.s3Secret" . | trim }}
+  {{- if $secret }}
+  # Only the S3 credentials Secret this release's destination names; never a list.
   - apiGroups: [""]
     resources: ["secrets"]
+    resourceNames: [{{ $secret | quote }}]
+    verbs: ["get"]
+  {{- end }}
+  # No ConfigMaps here: tenant users can edit ConfigMaps in this namespace, so the held-replicas
+  # ledger lives in the runtime namespace (see runtime.yaml).
+  # One reconciler at a time across operator pods.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["di-backup-operator"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+  # Workload volumes (#232): find a workload's instances and hold its replicas at 0 while its
+  # volume is copied. Only the scale subresource is writable; the spec is not.
+  - apiGroups: ["runtime.wasmcloud.dev"]
+    resources: ["workloaddeployments", "workloadreplicasets", "workloads"]
     verbs: ["get", "list"]
+  - apiGroups: ["runtime.wasmcloud.dev"]
+    resources: ["workloaddeployments/scale"]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -41,6 +64,9 @@ metadata:
   namespace: {{ .Release.Namespace }}
 spec:
   replicas: 1
+  # Never two operator pods at once; the Lease covers anything that still overlaps.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: di-backup-operator
@@ -63,8 +89,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: AGENT_IMAGE
               value: {{ .Values.agentImage | quote }}
+            # Empty: taken from the path the tenant host pods mount.
+            - name: STORAGE_ROOT
+              value: {{ .Values.storageRoot | default "" | quote }}
           readinessProbe:
             httpGet:
               path: /
