@@ -12,4 +12,18 @@ The operator pod serves an HTML console on `di-backup-console:8080` and creates 
 
 `existingSecret` selects a Secret you create. `accessKeyId` and `secretAccessKey` render Secret `di-backup-s3` and are only for a private demo; those values stay in Helm release history.
 
+## Backup Destinations
+
+Backups can be stored in S3 or to a PersistentVolumeClaim (PVC).
+
+### S3 Destinations (recommended)
+
+S3 is the recommended destination. It provides durability, geographic distribution, and protection against node loss. Configure with `existingSecret` or the demo credentials above.
+
+### PVC Destinations
+
+PVCs can be used as local backup destinations via `existingClaimName` (reference an existing PVC) or `volumeClaimTemplate` (create a new PVC with a storageClass and size). The backup agent mounts the PVC and writes data with the same directory layout as S3.
+
+**Node loss risk:** PVCs are bound to specific nodes. If a node is lost, backups stored on that node's PVC become inaccessible unless the storage is replicated or durable across zones. For production workloads that require durable backups, use S3 instead.
+
 The packages stay private. Image tags `di-framework/backup-destination:dev` and `di-framework/backup-agent:dev` are imported into Kubesolo (`imagePullPolicy: Never`), not published to GHCR.
