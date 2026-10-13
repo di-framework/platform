@@ -57,29 +57,16 @@ export function validateRouteAliases(
   if (typeof aliases !== 'object' || Array.isArray(aliases))
     throw new Error(`routeAliases must be ${ALIAS_SHAPE}`);
   const reserved = reservedRouteHosts(rules.tenantAuthRoutes);
-  const tenants = rules.tenants && new Set(rules.tenants);
   const normalized = new Map<string, string>();
   for (const [rawSource, rawTarget] of Object.entries(aliases)) {
     if (typeof rawTarget !== 'string')
       throw new Error(`routeAliases["${rawSource}"] must be a "<route-host>.<tenant>" string`);
     const source = rawSource.toLowerCase();
     const target = rawTarget.toLowerCase();
-    for (const [side, value] of [
-      ['source', source],
-      ['target', target],
-    ] as const) {
-      const route = parseRoute(value);
-      if (!route)
-        throw new Error(
-          `Invalid route alias ${side} "${value}": expected <route-host>.<tenant> with DNS-1123 labels`,
-        );
-      if (reserved.has(route.host))
-        throw new Error(
-          `Route alias ${side} "${value}" uses the reserved route host ${route.host}`,
-        );
-      if (side === 'target' && tenants && !tenants.has(route.tenant))
-        throw new Error(`Route alias target "${value}" names undeclared tenant ${route.tenant}`);
-    }
+    aliasSide('source', source, reserved);
+    const route = aliasSide('target', target, reserved);
+    if (rules.tenants && !rules.tenants.includes(route.tenant))
+      throw new Error(`Route alias target "${target}" names undeclared tenant ${route.tenant}`);
     if (normalized.has(source))
       throw new Error(`Duplicate route alias source "${source}" (sources are case-insensitive)`);
     normalized.set(source, target);
@@ -88,6 +75,22 @@ export function validateRouteAliases(
     if (target !== source && normalized.has(target))
       throw new Error(`Chained route aliases are not allowed: ${source} -> ${target} -> ...`);
   return Object.fromEntries([...normalized].sort(([a], [b]) => (a < b ? -1 : 1)));
+}
+
+/** One side of an alias, parsed; throws unless it is a valid, unreserved route. */
+function aliasSide(
+  side: 'source' | 'target',
+  value: string,
+  reserved: Set<string>,
+): { host: string; tenant: string } {
+  const route = parseRoute(value);
+  if (!route)
+    throw new Error(
+      `Invalid route alias ${side} "${value}": expected <route-host>.<tenant> with DNS-1123 labels`,
+    );
+  if (reserved.has(route.host))
+    throw new Error(`Route alias ${side} "${value}" uses the reserved route host ${route.host}`);
+  return route;
 }
 
 /** Route pattern for a loopback HTTP endpoint (the gateway's published port); otherwise none. */
