@@ -53,6 +53,9 @@ function harness(
     async remove(path) {
       files.delete(path);
     },
+    async unlink(path) {
+      files.delete(path);
+    },
     async mkdir(path) {
       files.set(`${path}/.dir`, Buffer.from(''));
     },
@@ -419,8 +422,64 @@ describe('backup-agent kinds', () => {
     const keys = `${stamp.slice('/mnt/backup/'.length)}/data.dump\ntop-level`;
     expect(await runAgent(request({ kind: 'gc', gcKeys: keys, ...pvc }), gc.io)).toBe(0);
     expect(gc.files.has(`${stamp}/data.dump`)).toBe(false);
-    expect(gc.calls.map((call) => call.argv.join(' '))).toEqual([`rmdir ${stamp}`]);
+    const rmdirs = gc.calls.map((call) => call.argv.join(' ')).filter((c) => c.startsWith('rmdir'));
+    // Stamp first, then each emptied parent up to (not including) the claim root.
+    expect(rmdirs).toEqual(
+      [`rmdir ${stamp}`, '/uid', '/orders', '/alpha', '/di-framework'].map((tail, i) =>
+        i === 0
+          ? `rmdir ${stamp}`
+          : `rmdir ${stamp.slice(0, stamp.lastIndexOf(tail) + tail.length)}`,
+      ),
+    );
+    expect(gc.calls.some((call) => call.argv[0] === 'find')).toBe(true);
+    expect(gc.calls.some((call) => call.argv[0] === 'sh' && call.argv[4] === '/mnt/backup')).toBe(
+      true,
+    );
     expect(JSON.parse(wrote(gc.files, '/work/termination')).tool).toBe('rm');
+  });
+
+  test('a failed PVC copy removes the .partial and the orphan data file', async () => {
+    const pvc = { destinationType: 'pvc' as const, pvcMountPath: '/mnt/backup', bucket: '' };
+    const stamp = '/mnt/backup/di-framework/alpha/orders/uid/20260927T020012Z';
+    const run = async (fail: (argv: string[]) => boolean) => {
+      const h = harness((argv) => {
+        if (argv[0] === 'pg_dump')
+          h.files.set(argv[argv.indexOf('-f') + 1] ?? '', Buffer.from('d'));
+        if (fail(argv)) {
+          // cp wrote part of the file before failing
+          if (argv[0] === 'cp') h.files.set(argv[2] ?? '', Buffer.from('half'));
+          return { code: 1, stdout: '', stderr: 'No space left on device' };
+        }
+        return fsTools(h.files)(argv);
+      });
+      const code = await runAgent(request({ kind: 'postgres', ...pvc }), h.io);
+      return { h, code };
+    };
+    const cp = await run((argv) => argv[0] === 'cp' && argv[1] === '/work/data.dump');
+    expect(cp.code).toBe(1);
+    expect([...cp.h.files.keys()].filter((k) => k.startsWith(stamp))).toEqual([`${stamp}/.dir`]);
+    const sync = await run((argv) => argv[0] === 'sync' && argv[1]?.endsWith('.partial') === true);
+    expect(sync.code).toBe(1);
+    expect([...sync.h.files.keys()].some((k) => k.endsWith('.partial'))).toBe(false);
+    const mv = await run((argv) => argv[0] === 'mv');
+    expect(mv.code).toBe(1);
+    expect([...mv.h.files.keys()].some((k) => k.endsWith('.partial'))).toBe(false);
+    const manifestFails = await run(
+      (argv) => argv[0] === 'cp' && argv[1] === '/work/manifest.json',
+    );
+    expect(manifestFails.code).toBe(1);
+    expect(manifestFails.h.files.has(`${stamp}/data.dump`)).toBe(false);
+    expect(wrote(manifestFails.h.files, '/work/termination')).toContain('UploadFailed');
+  });
+
+  test('PVC gc unlinks files only and fails when unlink fails', async () => {
+    const pvc = { destinationType: 'pvc' as const, pvcMountPath: '/mnt/backup', bucket: '' };
+    const h = harness(() => ok());
+    h.io.unlink = async () => {
+      throw new Error('EISDIR');
+    };
+    expect(await runAgent(request({ kind: 'gc', gcKeys: 'a/b/c', ...pvc }), h.io)).toBe(1);
+    expect(wrote(h.files, '/work/termination')).toContain('GcFailed');
   });
 
   test('PVC paths fail closed', async () => {
@@ -487,7 +546,7 @@ describe('backup-agent kinds', () => {
     ).toBe(1);
     expect(wrote(gcUnmounted.files, '/work/termination')).toContain('PvcMountPathNotSet');
     const gcBroken = harness(() => ok());
-    gcBroken.io.remove = async () => {
+    gcBroken.io.unlink = async () => {
       throw new Error('remove failed');
     };
     expect(await runAgent(request({ kind: 'gc', gcKeys: 'k', ...pvc }), gcBroken.io)).toBe(1);

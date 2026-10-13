@@ -61,6 +61,8 @@ export interface DestinationView {
   spec: DestinationSpec;
   status: DestinationStatus;
   annotations: Record<string, string>;
+  /** metadata.creationTimestamp; decides which S3 destination owns the runtime credentials. */
+  createdAt?: string;
 }
 
 export interface ServiceView {
@@ -128,6 +130,8 @@ export interface World {
   wantedEgress?: Egress[];
   /** Name of the S3 destination whose credentials the runtime Secret holds, if any. */
   s3Owner?: string;
+  /** Claims that do not exist in the runtime namespace. Absent when the lookup was not possible. */
+  missingClaims?: string[];
   services: ServiceView[];
   backups: BackupView[];
   restores: RestoreView[];
@@ -214,4 +218,18 @@ export function servicePort(type: ServiceView['type']): string {
   if (type === 'postgres') return '5432';
   if (type === 'keyvalue') return '6379';
   return '4222';
+}
+
+/**
+ * The S3 destination that owns the runtime credentials: the oldest by creationTimestamp, name as
+ * the tie-break. Never name order, so adding `archive` beside a working `default` cannot take over.
+ */
+export function pickS3Owner(destinations: DestinationView[]): DestinationView | undefined {
+  return destinations
+    .filter((item) => destinationType(item.spec) === 's3')
+    .sort(
+      (a, b) =>
+        (a.createdAt || '9999').localeCompare(b.createdAt || '9999') ||
+        a.name.localeCompare(b.name),
+    )[0];
 }

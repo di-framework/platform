@@ -61,8 +61,8 @@ spec:
 apiVersion: platform.di-framework.dev/v1alpha1
 kind: BackupDestination
 metadata:
-  {{- /* With type both, the S3 destination keeps the name default. */}}
-  name: {{ ternary "pvc" "default" $s3 }}
+  {{- /* Always pvc: default is S3 and its type is immutable, so a release can switch kinds. */}}
+  name: pvc
   namespace: {{ .Release.Namespace }}
 spec:
   type: pvc

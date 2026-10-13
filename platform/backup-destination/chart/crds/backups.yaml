@@ -40,6 +40,8 @@ spec:
                 prefix:
                   type: string
                   x-kubernetes-validations:
+                    - rule: "!self.startsWith('/') && !self.split('/').exists(p, p == '..' || p == '.')"
+                      message: prefix must be relative and must not contain . or .. segments
                     - rule: '!oldSelf.hasValue() || oldSelf.value() == '''' || self == oldSelf.value()'
                       message: prefix is immutable once set
                       optionalOldSelf: true

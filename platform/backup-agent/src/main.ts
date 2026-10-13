@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import { type AgentIo, type AgentRequest, parseRequest, runAgent } from './run.ts';
 
 function nodeIo(): AgentIo {
@@ -33,6 +33,11 @@ function nodeIo(): AgentIo {
     },
     async remove(path) {
       await rm(path, { recursive: true, force: true });
+    },
+    async unlink(path) {
+      await unlink(path).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== 'ENOENT') throw err;
+      });
     },
     async mkdir(path) {
       await mkdir(path, { recursive: true });

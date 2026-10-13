@@ -101,6 +101,11 @@ describe('backup-destination chart', () => {
     expect(missing.stderr).toContain('bucket is required');
   }, 30000);
 
+  test('the CRD rejects prefixes that leave the destination', async () => {
+    const crd = await Bun.file(`${import.meta.dir}/../chart/crds/backups.yaml`).text();
+    expect(crd).toContain("self.split('/').exists(p, p == '..' || p == '.')");
+  });
+
   test('renders a PVC destination, both destinations, and refuses an incomplete one', async () => {
     const created = await template('di-tenant-alpha', {
       type: 'pvc',
@@ -121,6 +126,8 @@ describe('backup-destination chart', () => {
       .filter((doc) => doc.includes('v1alpha1\nkind: BackupDestination\n'));
     expect(others).toEqual([]);
     expect(only).toContain('type: pvc');
+    expect(only).toContain('name: pvc');
+    expect(only).not.toContain('name: default');
     expect(only).not.toContain('bucket:');
     expect(only).not.toContain('credentialsSecretRef');
     expect(created.stdout).not.toContain('kind: Secret');

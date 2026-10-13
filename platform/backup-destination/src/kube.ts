@@ -6,6 +6,8 @@ import {
   type Egress,
   GROUP,
   type JobView,
+  PVC_CLAIM,
+  pickS3Owner,
   type RestoreView,
   RUNTIME_SECRET,
   runtimeNamespaceFor,
@@ -97,17 +99,32 @@ export async function loadWorld(
         spec: { ...spec, type: destinationType(spec) },
         status: (item.status ?? {}) as DestinationView['status'],
         annotations: item.metadata.annotations ?? {},
+        createdAt: item.metadata.creationTimestamp,
       },
     ];
   });
-  // The runtime Secret holds one set of S3 keys: those of the first S3 destination.
-  const s3 = views.find((view) => view.spec.type === 's3');
+  // The runtime Secret holds one set of S3 keys: those of the oldest S3 destination.
+  const s3 = pickS3Owner(views);
   const secretName = s3?.spec.credentialsSecretRef?.name;
   const credential = items(secret).find((item) => item.metadata?.name === secretName);
   const runtimeSecrets = await client
     .get(`/api/v1/namespaces/${runtimeNamespace}/secrets/${RUNTIME_SECRET}`)
     .then(() => true)
     .catch(() => false);
+  const claims = await client
+    .get(`/api/v1/namespaces/${runtimeNamespace}/persistentvolumeclaims`)
+    .then((list) => new Set(items(list).map((item) => item.metadata?.name)))
+    .catch(() => undefined);
+  const missingClaims = claims
+    ? [
+        ...new Set(
+          views
+            .filter((view) => view.spec.type === 'pvc')
+            .map((view) => view.spec.existingClaimName || PVC_CLAIM)
+            .filter((name) => !claims.has(name)),
+        ),
+      ]
+    : undefined;
   const messages = new Map<string, string>();
   for (const pod of items(pods)) {
     const statuses = (pod.status?.containerStatuses ?? []) as {
@@ -127,6 +144,7 @@ export async function loadWorld(
     agentImage,
     destination: views[0],
     destinations: views,
+    missingClaims,
     services: items(services).flatMap((item) => {
       const type = item.spec?.type;
       if (type !== 'postgres' && type !== 'keyvalue' && type !== 'messaging') return [];

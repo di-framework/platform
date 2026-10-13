@@ -6,6 +6,7 @@ import {
   endpointAllowed,
   jobName,
   parseBytes,
+  pickS3Owner,
   postgresConnectionSecret,
   runtimeNamespaceFor,
   type World,
@@ -1216,6 +1217,77 @@ describe('several destinations (#233)', () => {
     );
     expect(s3).toContain('di-backup-destination');
     expect(s3).not.toContain('backup-pvc');
+  });
+
+  test('loadWorld reports missing claims and carries creation times', async () => {
+    const destination = (name: string, spec: object, created: string) => ({
+      metadata: { name, creationTimestamp: created },
+      spec,
+    });
+    const client: KubeClient = {
+      async get(path) {
+        if (path.endsWith('/backupdestinations'))
+          return {
+            items: [
+              destination('archive', { type: 's3', bucket: 'b' }, '2026-10-01T00:00:00Z'),
+              destination('default', { type: 's3', bucket: 'b' }, '2026-09-01T00:00:00Z'),
+              destination(
+                'pvc',
+                { type: 'pvc', existingClaimName: 'typo' },
+                '2026-09-02T00:00:00Z',
+              ),
+              destination('local', { type: 'pvc' }, '2026-09-03T00:00:00Z'),
+            ],
+          };
+        if (path.endsWith('/persistentvolumeclaims'))
+          return { items: [{ metadata: { name: 'di-backup-pvc' } }] };
+        return { items: [] };
+      },
+      async post() {
+        return {};
+      },
+      async patch() {
+        return {};
+      },
+      async remove() {},
+    };
+    const loaded = await loadWorld(client, 'di-tenant-alpha', 'image:dev', '2026-10-02T00:00:00Z');
+    expect(loaded.missingClaims).toEqual(['typo']);
+    expect(loaded.destinations?.find((item) => item.name === 'default')?.createdAt).toBe(
+      '2026-09-01T00:00:00Z',
+    );
+  });
+
+  test('the oldest S3 destination owns the credentials even when another sorts first', () => {
+    const base = world().destination!;
+    const archive = { ...base, name: 'archive', createdAt: '2026-10-01T00:00:00Z' };
+    const original = { ...base, name: 'default', createdAt: '2026-09-01T00:00:00Z' };
+    expect(pickS3Owner([archive, original])?.name).toBe('default');
+    expect(pickS3Owner([{ ...archive, createdAt: undefined }, original])?.name).toBe('default');
+    const tie = [
+      { ...original, name: 'b' },
+      { ...original, name: 'a' },
+    ];
+    expect(pickS3Owner(tie)?.name).toBe('a');
+    const actions = reconcileAll(
+      world({ destinations: [archive, original], destination: archive }),
+    );
+    const text = JSON.stringify(actions);
+    expect(text).toContain('Only one S3 destination per tenant: default');
+    expect(text).toContain('archive');
+  });
+
+  test('a missing claim fails the PVC destination early with ClaimMissing', () => {
+    const claimless = {
+      ...world().destination!,
+      name: 'pvc',
+      spec: { type: 'pvc' as const, existingClaimName: 'typo' },
+    };
+    const actions = reconcile(world({ destination: claimless, missingClaims: ['typo'] }));
+    expect(JSON.stringify(actions)).toContain('ClaimMissing');
+    expect(actions.some((action) => action.type === 'create-job')).toBe(false);
+    const present = reconcile(world({ destination: claimless, missingClaims: [] }));
+    expect(JSON.stringify(present)).not.toContain('ClaimMissing');
   });
 
   test('refuses a second S3 destination and an S3 destination without a bucket', () => {

@@ -15,6 +15,7 @@ import {
   PVC_CLAIM,
   PVC_MOUNT,
   parseBytes,
+  pickS3Owner,
   postgresConnectionSecret,
   type RestoreView,
   RUNTIME_SECRET,
@@ -450,6 +451,21 @@ export function reconcile(world: World): Action[] {
     }
     if (!world.runtimeSecretPresent) actions.push({ type: 'copy-credentials', secretName });
   } else {
+    const claim = dest.spec.existingClaimName || PVC_CLAIM;
+    if (world.missingClaims?.includes(claim)) {
+      // Without this the Job sits Pending until its deadline, and Jobs run one at a time, so
+      // S3 backups would wait behind it.
+      actions.push(
+        condition(
+          dest.name,
+          status,
+          'ClaimMissing',
+          `PersistentVolumeClaim ${claim} does not exist in ${world.runtimeNamespace}`,
+          false,
+        ),
+      );
+      return actions;
+    }
     if (!dest.spec.existingClaimName && !dest.spec.volumeClaimTemplate?.size) {
       actions.push(
         condition(
@@ -667,7 +683,7 @@ export function reconcileAll(world: World): Action[] {
     if (!backup) return undefined;
     return known.has(backup.destinationName) ? backup.destinationName : first;
   };
-  const s3Owner = destinations.find((item) => destinationType(item.spec) === 's3')?.name;
+  const s3Owner = pickS3Owner(destinations)?.name;
   const wantedEgress = unionEgress(destinations);
   const actions: Action[] = [];
   let started = false;

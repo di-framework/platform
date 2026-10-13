@@ -26,4 +26,18 @@ Set `existingClaimName` to a claim that already exists in `di-runtime-<name>` (a
 
 **A PVC on the same node or VM as the data does not protect against losing that node.** With a node-local storage class such as `local-path`, the backups live on the same disk as the BackingService data. Use it for fast local restores, and add an S3 destination (`type: both`) for an off-host copy.
 
+A missing claim is detected early: the operator lists claims in `di-runtime-<name>` and sets the PVC destination to `ClaimMissing` without starting a Job, so a misspelled `existingClaimName` cannot hold up S3 backups. `prefix` must be relative and must not contain `.` or `..` segments; the CRD rejects it. Retention deletes single files and removes the emptied stamp, UID, and service directories. It also removes `*.partial` files and manifest-less data files older than a day, which a killed Job leaves behind.
+
+## Upgrading
+
+Helm and Pulumi install `chart/crds/` on first install only and never upgrade it, and the CRD is cluster scoped and shared by every tenant release. Before upgrading an existing cluster to this chart, apply the CRD yourself:
+
+```sh
+kubectl apply --server-side -f platform/backup-destination/chart/crds/backups.yaml
+```
+
+Without it the old schema rejects `type` and `existingClaimName` and still requires `bucket`; S3-only releases keep working. Existing destinations read back as `type: s3`.
+
+A `BackupDestination`'s `type` is immutable. The S3 destination is always named `default` and the PVC destination always `pvc`, so a release can move from `type: s3` to `type: both` (adds `pvc`) without touching `default`. Moving from `s3` to `pvc` only: go through `both` first. If you then drop S3 (`type: pvc`), Helm deletes `default`; its existing Backups keep their `destinationName` and fall back to the first remaining destination, which does not hold their data, so keep `both` while those backups matter. A tenant can have only one S3 destination; if more exist, the oldest by creation time holds the runtime credentials and the others report `ConfigInvalid`. The operator needs `list` on `persistentvolumeclaims` in `di-runtime-<name>` (in the chart's runtime Role) for the claim check.
+
 The packages stay private. Image tags `di-framework/backup-destination:dev` and `di-framework/backup-agent:dev` are imported into Kubesolo (`imagePullPolicy: Never`), not published to GHCR.
