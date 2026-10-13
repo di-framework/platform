@@ -605,6 +605,9 @@ describe('gateway proxy', () => {
       ['api.api.localhost:28180', 'hello api', ['api-v2']],
       ['Identity.Identity.LOCALHOST', 'hello identity', ['identity-pg']],
       ['site.alpha.localhost', 'hello site', ['alpha']],
+      // Only the exact `<host>.<tenant>` pair is aliased; the cutover depends on it.
+      ['api.identity.localhost', 'hello api', ['identity']],
+      ['x.identity.identity.localhost', 'hello x.identity', ['identity']],
       ['example.com', 'hello example.com', []],
     ])('routes Host %s', async (host, body, expected) => {
       const res = await send(await aliasGateway(aliases), { headers: { host } });
@@ -645,11 +648,29 @@ describe('gateway process', () => {
     expect(() => main({})).toThrow('Missing GATEWAY_CONFIG');
   });
 
+  it.each([
+    ['a string', 'identity.identity-pg'],
+    ['an array', ['identity.identity-pg']],
+    ['null', null],
+    ['a number', 1],
+  ])('refuses to start with routeAliases as %s (#217)', (_, routeAliases) => {
+    const env = {
+      GATEWAY_CONFIG: JSON.stringify({ port: 0, defaultUpstream: '127.0.0.1', routeAliases }),
+    };
+    expect(() => main(env)).toThrow(
+      'GATEWAY_CONFIG routeAliases must be an object of "<route-host>.<tenant>" strings',
+    );
+  });
+
   it('listens on the configured port and stops on SIGTERM', async () => {
     const signals = new EventEmitter();
     const server = main(
       {
-        GATEWAY_CONFIG: JSON.stringify({ port: 0, defaultUpstream: '127.0.0.1' }),
+        GATEWAY_CONFIG: JSON.stringify({
+          port: 0,
+          defaultUpstream: '127.0.0.1',
+          routeAliases: { 'identity.identity': 'identity.identity-pg' },
+        }),
       },
       signals,
     );

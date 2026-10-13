@@ -558,8 +558,9 @@ Validation runs in `pulumi up`, before any resource changes, and an invalid map 
 The deployed map is lower-cased with sorted keys, so reordering or re-casing keys changes nothing.
 Aliases apply to plain HTTP tenant routes only. The console, controller and registry routes and
 TLS passthrough (routed by SNI) never consult them. If the gateway is ever handed an unusable alias
-(a malformed map or target, or a reserved target), it fails closed with `502` for that host and
-never falls back to the original tenant.
+(a malformed target or a reserved target), it fails closed with `502` for that host and never falls
+back to the original tenant. If its `routeAliases` is not an object (a string, an array, `null`),
+the gateway refuses to start and logs why, rather than failing every tenant route.
 
 **Cutover and rollback.** For the identity cutover, declare `identity-pg` in `tenants`, deploy the
 identity workload there, then add `identity.identity: identity.identity-pg` and run `pulumi up`. To

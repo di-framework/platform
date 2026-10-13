@@ -15,7 +15,8 @@
  *
  * Admin route aliases (#217) send a plain HTTP tenant route to another tenant's route host. They
  * never apply to the console, controller or registry hosts, or to TLS passthrough, and an unusable
- * alias fails closed with 502 rather than reaching the original tenant.
+ * alias fails closed with 502 rather than reaching the original tenant. A `routeAliases` value that
+ * is not an object stops the gateway at startup.
  */
 import {
   Agent,
@@ -532,6 +533,15 @@ export function main(
 ): Server {
   const cfg = JSON.parse(env.GATEWAY_CONFIG ?? '{}') as Partial<GatewayConfig>;
   if (!cfg.defaultUpstream) throw new Error('Missing GATEWAY_CONFIG');
+  // A malformed map would 502 every tenant route, so refuse to start rather than serve (#217).
+  const aliases: unknown = cfg.routeAliases;
+  if (
+    aliases !== undefined &&
+    (aliases === null || typeof aliases !== 'object' || Array.isArray(aliases))
+  )
+    throw new Error(
+      'GATEWAY_CONFIG routeAliases must be an object of "<route-host>.<tenant>" strings',
+    );
   const options: GatewayOptions = {
     defaultUpstream: { hostname: cfg.defaultUpstream, port: 80 },
     upstreamTimeoutMs: cfg.upstreamTimeoutMs,
