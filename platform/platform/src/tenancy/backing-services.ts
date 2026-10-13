@@ -10,7 +10,9 @@ export type Json = null | boolean | number | string | Json[] | { [key: string]: 
 export type BackingCapability = 'keyvalue' | 'messaging' | 'blobstore' | 'postgres' | 'egress';
 export type BackingProvider = 'redis' | 'nats' | 'postgres' | 'platform';
 export type ClassVisibility = 'AllTenants' | 'SelectedTenants';
-export type DeletionPolicy = 'Retain' | 'Delete';
+/** The one list of deletion policies; the CRD enums and Pulumi config validation use it. */
+export const DELETION_POLICIES = ['Retain', 'Delete'] as const;
+export type DeletionPolicy = (typeof DELETION_POLICIES)[number];
 export interface Metadata {
   name: string;
   namespace?: string;
@@ -333,7 +335,7 @@ const serviceSpec = {
     type: { type: 'string', enum: [...CAPABILITIES] },
     className: { ...nameSchema },
     parameters: sizingObject,
-    deletionPolicy: { type: 'string', enum: ['Retain', 'Delete'], default: 'Retain' },
+    deletionPolicy: { type: 'string', enum: [...DELETION_POLICIES], default: 'Retain' },
     destinations: egressEntries(EGRESS_DESTINATION_PATTERN, 32),
   },
 };

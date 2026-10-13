@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'bun:test';
+import * as pulumi from '@pulumi/pulumi';
+import type { DeletionPolicy } from '../src/tenancy/backing-services';
 import { assertTenantDeclaration, tenantObject } from '../src/tenancy/install';
+import {
+  type LiveTenant,
+  removalWarnings,
+  tenantListerFromKubeconfig,
+  warnRemovedTenants,
+} from '../src/tenancy/removal';
 import {
   CORE_INSTANCES,
   type ControllerConfig,
@@ -101,5 +109,155 @@ describe('Tenant spec.runtime.coreInstances', () => {
       },
       spec: { runtime: { coreInstances: 300 } },
     });
+  });
+});
+
+describe('Tenant spec.deletionPolicy', () => {
+  it('defaults to Retain in the CRD schema', () => {
+    const tenantCrd = crds.find(
+      (c) => (c.spec as { names: { kind: string } }).names.kind === 'Tenant',
+    ) as unknown as {
+      spec: {
+        versions: {
+          schema: {
+            openAPIV3Schema: {
+              properties: {
+                spec: { properties: Record<string, unknown> };
+              };
+            };
+          };
+        }[];
+      };
+    };
+    const spec = tenantCrd.spec.versions[0]?.schema.openAPIV3Schema.properties.spec.properties;
+    expect(spec?.deletionPolicy).toEqual({
+      type: 'string',
+      enum: ['Retain', 'Delete'],
+      default: 'Retain',
+    });
+  });
+
+  it('validates the Pulumi tenants config values', () => {
+    for (const value of ['Retain' as const, 'Delete' as const, undefined])
+      expect(() => assertTenantDeclaration({ name: 'a', deletionPolicy: value })).not.toThrow();
+    expect(() => assertTenantDeclaration({ name: 'a' })).not.toThrow();
+    for (const value of ['retain', 'delete', 'KeepData', ''] as const)
+      expect(() =>
+        assertTenantDeclaration({ name: 'a', deletionPolicy: value as unknown as 'Retain' }),
+      ).toThrow("Tenant a deletionPolicy must be 'Retain' or 'Delete'");
+  });
+
+  it('maps a Pulumi tenants entry with deletionPolicy to the Tenant CR spec', () => {
+    expect(tenantObject({ name: 'alpha', deletionPolicy: 'Delete' }, 'inst')).toEqual({
+      apiVersion: VERSION,
+      kind: 'Tenant',
+      metadata: {
+        name: 'alpha',
+        labels: { [INSTALLATION]: 'inst' },
+        annotations: { 'pulumi.com/waitFor': 'condition=Ready' },
+      },
+      spec: { deletionPolicy: 'Delete' },
+    });
+  });
+});
+
+describe('Retain removal warning (#228)', () => {
+  const live = (name: string, deletionPolicy?: DeletionPolicy): LiveTenant => ({
+    metadata: { name },
+    spec: deletionPolicy ? { deletionPolicy } : {},
+  });
+  it('names both kept namespaces and how to remove them for Retain', () => {
+    const [message] = removalWarnings([live('alpha', 'Retain')], []);
+    expect(message).toContain('di-tenant-alpha');
+    expect(message).toContain('di-runtime-alpha');
+    expect(message).toContain('kubectl delete namespace di-tenant-alpha di-runtime-alpha');
+  });
+  it('prints nothing for Delete and for tenants that are still declared', () => {
+    expect(removalWarnings([live('alpha', 'Delete'), live('beta', 'Retain')], ['beta'])).toEqual(
+      [],
+    );
+  });
+  it('treats a missing policy as Retain', () => {
+    expect(removalWarnings([{ metadata: { name: 'alpha' } }], [])).toHaveLength(1);
+    expect(removalWarnings([live('alpha')], [])).toHaveLength(1);
+  });
+  it('takes the live policy, not the declaration', async () => {
+    const warned: string[] = [];
+    await warnRemovedTenants({
+      installation: 'inst',
+      declared: [],
+      list: async (installation) => {
+        expect(installation).toBe('inst');
+        return [live('alpha', 'Retain'), live('beta', 'Delete')];
+      },
+      warn: (m) => warned.push(m),
+    });
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toContain('di-tenant-alpha');
+  });
+  it('warns during preview too, and never fails when the cluster cannot be read', async () => {
+    const prior = pulumi.runtime.isDryRun;
+    const debugged: string[] = [];
+    try {
+      (pulumi.runtime as { isDryRun: () => boolean }).isDryRun = () => true;
+      expect(
+        await warnRemovedTenants({
+          installation: 'inst',
+          declared: [],
+          list: async () => [live('alpha')],
+          warn: () => {},
+        }),
+      ).toHaveLength(1);
+    } finally {
+      (pulumi.runtime as { isDryRun: () => boolean }).isDryRun = prior;
+    }
+    expect(
+      await warnRemovedTenants({
+        installation: 'inst',
+        declared: [],
+        list: async () => {
+          throw new Error('no CRD');
+        },
+        warn: () => {},
+        debug: (m) => debugged.push(m),
+      }),
+    ).toEqual([]);
+    expect(debugged[0]).toContain('no CRD');
+  });
+  it("lists the installation's Tenants from the provider kubeconfig", async () => {
+    const requests: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        requests.push(new URL(request.url).pathname + new URL(request.url).search);
+        return Response.json({ items: [live('alpha', 'Retain')] });
+      },
+    });
+    try {
+      const kubeconfig = JSON.stringify({
+        apiVersion: 'v1',
+        kind: 'Config',
+        clusters: [
+          {
+            name: 'c',
+            cluster: {
+              server: `http://127.0.0.1:${server.port}`,
+              'insecure-skip-tls-verify': true,
+            },
+          },
+        ],
+        users: [{ name: 'u', user: { token: 't' } }],
+        contexts: [{ name: 'x', context: { cluster: 'c', user: 'u' } }],
+        'current-context': 'x',
+      });
+      const tenants = await tenantListerFromKubeconfig(kubeconfig, 'x')('inst');
+      expect(tenants.map((t) => t.metadata.name)).toEqual(['alpha']);
+      expect(requests[0]).toContain('/apis/platform.di-framework.dev/v1alpha1/tenants');
+      expect(decodeURIComponent(requests[0] ?? '')).toContain(
+        'platform.di-framework.dev/installation=inst',
+      );
+    } finally {
+      server.stop(true);
+    }
   });
 });

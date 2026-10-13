@@ -167,6 +167,49 @@ allowlisted registry and pull everything else over TLS. Check three things befor
 - **Tenant hosts roll once.** The default host image, the host args and, on insecure installs,
   the mounted controller CA all change, so each tenant host group restarts on the upgrade.
 
+### Tenant removal and namespace retention
+
+Each `tenants` entry takes `deletionPolicy` (`Retain` or `Delete`, default `Retain`). The
+controller reads the policy from the Tenant object on the cluster when that object is deleted,
+not from your config at that moment.
+
+- `Retain`: the controller scales the workload to zero and keeps the `di-tenant-<name>` and
+  `di-runtime-<name>` namespaces.
+- `Delete`: the controller deletes both namespaces, and with them their PVCs (subject to the
+  StorageClass reclaim policy). It does not remove the on-disk tenant data directories: backend
+  data lives in tenant-UID hostPath directories under the storage root, which namespace deletion
+  does not erase.
+
+Kept namespaces stay labelled with the old Tenant UID. A new Tenant with the same name is not
+adopted over them and does not pick the old data back up, so re-adding a name after a Retain
+removal means deleting the kept namespaces first (below).
+
+When `up` or a preview removes a tenant whose live policy is `Retain` (or unset), it prints a
+warning naming the kept `di-tenant-<name>` and `di-runtime-<name>` namespaces and how to remove
+them. The check reads the cluster with the program's kubeconfig.
+
+Removing a tenant and its namespaces takes two `up` runs, because once the entry is gone
+nothing carries the new policy to the Tenant object:
+
+1. Set `deletionPolicy: Delete` on the entry and run `up`. Wait for the Tenant to report `Ready`.
+2. Remove the entry from `tenants` and run `up` again.
+
+```sh
+pulumi config set --path 'tenants[0].deletionPolicy' Delete
+```
+
+With `di-framework-kube up --platform-config`, the same setting is JSON:
+`{"tenants":[{"name":"alpha","deletionPolicy":"Delete"}]}` (the allowlist checks only top-level
+keys, so it passes).
+
+A tenant already removed under `Retain` has no Tenant object left to patch. Remove its
+namespaces by hand after checking the installation and owner labels:
+
+```sh
+kubectl get ns di-tenant-alpha di-runtime-alpha --show-labels
+kubectl delete namespace di-tenant-alpha di-runtime-alpha
+```
+
 ## Existing-cluster configuration
 
 `kubeconfig` is required (a local file path); `context`, `namespace`, `release`,
