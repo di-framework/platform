@@ -9,11 +9,20 @@ export interface HostNamespacesArgs {
   installation: string;
   /** Tenant names in the stack config. */
   declared: string[];
-  /** `pulumi.runtime.isDryRun()`: a preview never reads the cluster. */
+  /**
+   * `pulumi.runtime.isDryRun()`. A preview uses the Tenant list on a best-effort basis: if it
+   * cannot be read, the preview shows the declared tenants only, with a warning.
+   */
   dryRun: boolean;
-  /** `tenancy/removal`'s lister on the admin kubeconfig; absent without one. */
-  listTenants?: TenantLister;
+  /** This run's shared Tenant list (`sharedTenantList`) on the admin kubeconfig; absent without one. */
+  tenants?: TenantSnapshot;
   log: { info(message: string): void; warn(message: string): void };
+}
+
+/** The installation's Tenants, listed at most once however often it is called. */
+export type TenantSnapshot = () => Promise<LiveTenant[]>;
+
+export interface TenantListRetry {
   /** Injected for tests; waits between attempts of a transient list failure. */
   sleep?: (ms: number) => Promise<void>;
   /** Injected for tests; the clock the retry budget is measured with. */
@@ -120,6 +129,24 @@ async function listWithRetry(
 }
 
 /**
+ * One Tenant list per run (#245): the first call lists the installation's Tenants, retrying
+ * transient failures, and every call returns that same promise. The watched-namespaces
+ * computation and the #228 Retain check share it, so they decide from one snapshot with one
+ * request. A failure is shared too; each caller handles it as before.
+ */
+export function sharedTenantList(
+  list: TenantLister,
+  installation: string,
+  retry: TenantListRetry = {},
+): TenantSnapshot {
+  let listed: Promise<LiveTenant[]> | undefined;
+  return () => {
+    listed ??= listWithRetry(list, installation, retry.sleep ?? realSleep, retry.now ?? Date.now);
+    return listed;
+  };
+}
+
+/**
  * The wasmCloud operator's `hostNamespaces` (#227): the platform namespace plus the runtime
  * namespace of every tenant that is declared or whose Tenant object still exists in the cluster.
  *
@@ -129,19 +156,14 @@ async function listWithRetry(
  * only until that drain is done, under both deletion policies (`Delete` removes the namespaces
  * first; `Retain` scales the hosts to zero and keeps the namespaces), so the next `up` stops
  * watching the namespace. A retained namespace is never watched on its own account. Transient
- * list failures are retried briefly (#245); other failures, except a missing Tenant CRD, fail
- * the update.
+ * list failures are retried briefly (#245); on `up`, other failures, except a missing Tenant
+ * CRD, fail the update. A preview reads the same list, so its diff matches the `up` (#245); when
+ * the list cannot be read there, it shows the declared tenants only, with a warning.
  */
 export async function operatorHostNamespaces(args: HostNamespacesArgs): Promise<string[]> {
   const runtime = (tenant: string) => names(tenant).runtimeNamespace;
   const declaredNamespaces = [args.platformNamespace, ...args.declared.map(runtime)];
-  if (args.dryRun) {
-    args.log.info(
-      "Preview lists the wasmCloud operator's hostNamespaces for the declared tenants only. On up, a removed tenant's runtime namespace stays watched while its Tenant is deleted, and stops being watched on the next up, after the Tenant is gone (#227).",
-    );
-    return declaredNamespaces;
-  }
-  if (!args.listTenants) {
+  if (!args.tenants) {
     args.log.warn(
       "Without the admin kubeconfig, the wasmCloud operator's hostNamespaces list the declared tenants only, so removing a tenant can strand its host pods' finalizers (#227). Pass kubeconfig to createPlatform.",
     );
@@ -149,22 +171,23 @@ export async function operatorHostNamespaces(args: HostNamespacesArgs): Promise<
   }
   let live: string[];
   try {
-    live = (
-      await listWithRetry(
-        args.listTenants,
-        args.installation,
-        args.sleep ?? realSleep,
-        args.now ?? Date.now,
-      )
-    ).map((t) => t.metadata.name);
+    live = (await args.tenants()).map((t) => t.metadata.name);
   } catch (error) {
-    // No Tenant CRD yet (a first install): no Tenants. Anything else fails the update rather
-    // than shrinking the list; the message never carries a response body or the kubeconfig.
-    if ((error as { code?: unknown } | null)?.code !== 404)
+    // No Tenant CRD yet (a first install): no Tenants. The messages below never carry a
+    // response body or the kubeconfig.
+    if ((error as { code?: unknown } | null)?.code === 404) live = [];
+    else if (args.dryRun) {
+      // Best effort: the up lists again and fails if the list still cannot be read.
+      args.log.warn(
+        `Preview cannot list the Tenants of installation ${args.installation}, so it shows the wasmCloud operator's hostNamespaces for the declared tenants only; up lists them again and keeps a removed tenant's runtime namespace watched until its Tenant is deleted (#227): ${describeListError(error)}`,
+      );
+      return declaredNamespaces;
+    }
+    // On up, anything else fails the update rather than shrinking the list.
+    else
       throw new Error(
         `Cannot list the Tenants of installation ${args.installation}, which keep a removed tenant's runtime namespace watched by the wasmCloud operator until the Tenant is deleted (#227): ${describeListError(error)}`,
       );
-    live = [];
   }
   const declared = new Set(args.declared);
   const draining = [...new Set(live)]

@@ -583,31 +583,49 @@ test('removing a tenant keeps its runtime namespace watched until its Tenant is 
   const removing = operatorNamespaces({ declared: ['alpha'], cluster: ['alpha', 'beta'] });
   expect(removing.failure).toBeUndefined();
   expect(removing.hostNamespaces).toEqual(['wasmcloud', 'di-runtime-alpha', 'di-runtime-beta']);
-  // Read through tenancy/removal's lister (the #228 Retain check may list Tenants as well).
-  expect(removing.hits).toContain(
-    '/apis/platform.di-framework.dev/v1alpha1/tenants?labelSelector=platform.di-framework.dev%2Finstallation%3Ddi-test',
-  );
+  // Listed once through tenancy/removal's lister and shared with the #228 Retain check, which
+  // warns from the same snapshot (#245).
+  expect(removing.hits).toEqual([TENANT_LIST_PATH]);
   expect(removing.log).toContain('Tenant beta is no longer declared but still exists');
+  expect(removing.log).toContain('Tenant beta is being removed with deletionPolicy Retain');
   // The next up, after the Tenant is gone: the namespace stops being watched.
   const removed = operatorNamespaces({ declared: ['alpha'], cluster: ['alpha'] });
   expect(removed.hostNamespaces).toEqual(['wasmcloud', 'di-runtime-alpha']);
   expect(removed.log).not.toContain('no longer declared');
 }, 60_000);
 
-test('preview computes watched namespaces from config, not from the cluster', () => {
+test('preview reads the shared Tenant list once, so its diff matches the up (#245)', () => {
   const preview = operatorNamespaces({
     declared: ['alpha'],
     cluster: ['alpha', 'beta'],
     dryRun: true,
   });
   expect(preview.failure).toBeUndefined();
-  // The cluster still lists beta, yet preview watches the declared tenants only: the list is not
-  // read for hostNamespaces (the unit test proves the lister is never called in preview). The
-  // #228 Retain check is separate and may still read the cluster in preview.
+  // beta still exists, so preview keeps watching di-runtime-beta exactly as the up will.
+  expect(preview.hostNamespaces).toEqual(['wasmcloud', 'di-runtime-alpha', 'di-runtime-beta']);
+  expect(preview.hits).toEqual([TENANT_LIST_PATH]);
+  expect(preview.log).toContain('Tenant beta is no longer declared but still exists');
+  expect(preview.log).toContain('Tenant beta is being removed with deletionPolicy Retain');
+  // Nothing is logged about watched namespaces when no tenant is being removed.
+  const unchanged = operatorNamespaces({ declared: ['alpha'], cluster: ['alpha'], dryRun: true });
+  expect(unchanged.hostNamespaces).toEqual(['wasmcloud', 'di-runtime-alpha']);
+  expect(unchanged.hits).toEqual([TENANT_LIST_PATH]);
+  expect(unchanged.log).not.toContain('(#227)');
+}, 60_000);
+
+test('a preview that cannot list Tenants shows the declared tenants with a warning (#245)', () => {
+  const preview = operatorNamespaces({
+    declared: ['alpha'],
+    cluster: ['beta'],
+    dryRun: true,
+    status: 403,
+  });
+  expect(preview.failure).toBeUndefined();
   expect(preview.hostNamespaces).toEqual(['wasmcloud', 'di-runtime-alpha']);
-  expect(preview.log).toContain(
-    'stops being watched on the next up, after the Tenant is gone (#227)',
-  );
+  expect(preview.hits).toEqual([TENANT_LIST_PATH]);
+  expect(preview.log).toContain('Preview cannot list the Tenants of installation di-test');
+  expect(preview.log).toContain('(#227): HTTP 403');
+  expect(preview.log).not.toContain('secret detail');
 }, 60_000);
 
 test('an unreadable Tenant list fails the update with a clear message, not a shrunk list', () => {
@@ -617,6 +635,10 @@ test('an unreadable Tenant list fails the update with a clear message, not a shr
   );
   expect(failed.failure).not.toContain('secret detail');
 }, 60_000);
+
+/** The one request that lists the installation's Tenants. */
+const TENANT_LIST_PATH =
+  '/apis/platform.di-framework.dev/v1alpha1/tenants?labelSelector=platform.di-framework.dev%2Finstallation%3Ddi-test';
 
 test('local entrypoint retains existing logical names and guarded Docker cleanup', () => {
   const local = readFileSync(join(root, 'src/local.ts'), 'utf8');
