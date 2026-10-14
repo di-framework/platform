@@ -353,6 +353,21 @@ grants, is held only in the platform namespace through the `<installation>-contr
 Role and RoleBinding. `tests/controller-rbac.test.ts` checks this against the
 rendered objects.
 
+Holding those rules gives the controller these grants directly, in every namespace:
+
+- `pods/log` `get`: the `di-runtime-viewer` and `di-runtime-developer` Roles grant
+  it to members (it also serves the logs projection).
+- `pods/portforward` `create`: `di-runtime-developer` grants it.
+- `events` `get`, `list`, `watch`: every tenant viewer and developer Role grants it.
+- `get`, `list`, `watch` on runtime `workloads`, `workloadreplicasets` and `artifacts`:
+  `di-developer` and `di-viewer` grant it.
+- `update` on `workloaddeployments`: `di-developer` grants it (the controller itself
+  writes only with server-side apply).
+- `create` and `delete` on `backingservices` and `servicebindings`: `di-developer`
+  grants them.
+
+Before #115 each of these was already reachable through `escalate`.
+
 Schemas and helpers live in `src/tenancy/backing-services.ts` and are included in the
 platform `crds` export from `src/tenancy/resources.ts`. Class seeding and controller
 script packaging live in `src/tenancy/install.ts`. Per-tick Redis/NATS provisioning
@@ -531,9 +546,10 @@ namespace, `di-logs-<app>`, labeled `di-framework.dev/projection=logs` and
 `di-framework.dev/application=<app>`, with the newest 200 lines in `data.lines` and
 the newest host failure per WorkloadDeployment in `data.failures`.
 
-- Source: the `hostgroup-<tenant>` pod logs, read through a per-tenant
-  `di-platform-log-reader` Role (`pods/log get` in the runtime namespace only). The
-  host keeps `automountServiceAccountToken: false`.
+- Source: the `hostgroup-<tenant>` pod logs. The controller's ClusterRole holds
+  `pods/log get` cluster-wide (#115), because the runtime viewer and developer Roles
+  it writes grant it; the per-tenant `di-platform-log-reader` Role and binding are
+  kept but are now redundant. The host keeps `automountServiceAccountToken: false`.
 - Guest lines come only from the wash `wasi:logging` TracingLogger. Each ends with
   `workload.name` and `workload.namespace`; the namespace must be the tenant's, and
   the name maps to a `di-framework`-managed WorkloadDeployment. Its
@@ -927,6 +943,11 @@ tenantAuth:
     while it does not exist). Roll the ClusterRole before the new controller (`pulumi up`
     applies both; a hand-rolled upgrade must apply the ClusterRole first), or the registry
     reports `403` on `TenantAuthReady` until it does.
+  - RBAC without `escalate` (#115): apply the `<installation>-controller` Role and
+    RoleBinding in the platform namespace first, then the ClusterRole (`pulumi up` orders
+    them). A ClusterRole without `escalate` applied before the Role lets the update of
+    each `di-tenant-controller-<tenant>` Role fail with `403` on `TenantAuthReady` until
+    the next poll after the Role exists. Tenant Roles and bindings are unchanged.
   - Host pull (`#83:host-pull`): the tenant's hosts pull workload components from the tenant
     registry with a namespace-scoped host credential.
     - Reference: users push to `publicUrl`; workloads reference the same repository as

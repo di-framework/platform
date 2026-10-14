@@ -178,26 +178,6 @@ export function installTenancy(args: {
     kind: 'ServiceAccount',
     metadata: { name: 'di-platform-controller', namespace },
   });
-  const role = create({
-    apiVersion: 'rbac.authorization.k8s.io/v1',
-    kind: 'ClusterRole',
-    metadata: { name: `${installation}-controller` },
-    rules: controllerClusterRoleRules(),
-  });
-  const binding = create(
-    {
-      apiVersion: 'rbac.authorization.k8s.io/v1',
-      kind: 'ClusterRoleBinding',
-      metadata: { name: `${installation}-controller` },
-      roleRef: {
-        apiGroup: 'rbac.authorization.k8s.io',
-        kind: 'ClusterRole',
-        name: `${installation}-controller`,
-      },
-      subjects: [{ kind: 'ServiceAccount', name: 'di-platform-controller', namespace }],
-    },
-    [role, serviceAccount],
-  );
   // TokenRequest in this namespace only (#115), for the per-tenant TokenRequest Roles it writes.
   const namespaceRole = create({
     apiVersion: 'rbac.authorization.k8s.io/v1',
@@ -218,6 +198,31 @@ export function installTenancy(args: {
       subjects: [{ kind: 'ServiceAccount', name: 'di-platform-controller', namespace }],
     },
     [namespaceRole, serviceAccount],
+  );
+  // The ClusterRole drops `escalate` (#115), so it waits for the namespaced TokenRequest grant:
+  // the running controller keeps writing the per-tenant TokenRequest Roles across `pulumi up`.
+  const role = create(
+    {
+      apiVersion: 'rbac.authorization.k8s.io/v1',
+      kind: 'ClusterRole',
+      metadata: { name: `${installation}-controller` },
+      rules: controllerClusterRoleRules(),
+    },
+    [namespaceBinding],
+  );
+  const binding = create(
+    {
+      apiVersion: 'rbac.authorization.k8s.io/v1',
+      kind: 'ClusterRoleBinding',
+      metadata: { name: `${installation}-controller` },
+      roleRef: {
+        apiGroup: 'rbac.authorization.k8s.io',
+        kind: 'ClusterRole',
+        name: `${installation}-controller`,
+      },
+      subjects: [{ kind: 'ServiceAccount', name: 'di-platform-controller', namespace }],
+    },
+    [role, serviceAccount],
   );
   const scripts = create({
     apiVersion: 'v1',

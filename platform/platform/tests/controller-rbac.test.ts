@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import * as path from 'node:path';
 import {
+  CONTROLLER_SCRIPT_MODULES,
   type ControllerClusterRoleRule,
   controllerClusterRoleRules,
   controllerNamespaceRoleRules,
@@ -240,5 +243,64 @@ describe('platform controller RBAC (#115)', () => {
     expect(rulesOf(viewer).every((rule) => covers(held('di-tenant-alpha', cluster), rule))).toBe(
       false,
     );
+  });
+});
+
+/** The renderers checked above; a Role or binding built anywhere else would go unchecked. */
+const RBAC_RENDERERS = ['tenantResources', 'userResources', 'tenantAuthResources'];
+const RBAC_KIND = /'(Cluster)?Role(Binding)?'/;
+/** Builds an RBAC object (not a list, prune or kind comparison of existing ones). */
+const RBAC_CONSTRUCTION = [
+  /kind:\s*'(Cluster)?Role(Binding)?'/,
+  /apiVersion:\s*'rbac\.authorization\.k8s\.io\//,
+  /\b(make|resource)\(\s*('rbac\.authorization\.k8s\.io\/v1'|rbac\b)/,
+];
+const source = (module: string) =>
+  readFileSync(path.join(import.meta.dir, '../src/tenancy', `${module}.ts`), 'utf8').split('\n');
+/** The top-level function each line belongs to, by the last `function name(` above it. */
+function enclosingFunctions(lines: string[]): (string | undefined)[] {
+  let current: string | undefined;
+  return lines.map((line) => {
+    const start = /^(?:export\s+)?(?:async\s+)?function\s+(\w+)/.exec(line);
+    if (start) current = start[1];
+    else if (/^(?:export\s+)?(?:const|let|class|interface|type)\s/.test(line)) current = undefined;
+    return current;
+  });
+}
+
+describe('controller RBAC sources (#115)', () => {
+  it('builds Roles and bindings only in the renderers the checks above cover', () => {
+    const found: string[] = [];
+    for (const module of CONTROLLER_SCRIPT_MODULES) {
+      const lines = source(module);
+      const owners = enclosingFunctions(lines);
+      lines.forEach((line, i) => {
+        const builds = RBAC_CONSTRUCTION.some((pattern) => pattern.test(line));
+        // In resources.ts every RBAC kind literal is part of building an object.
+        if (builds || (module === 'resources' && RBAC_KIND.test(line)))
+          found.push(`${module}:${owners[i] ?? '<top level>'}`);
+      });
+    }
+    expect(found.length).toBeGreaterThan(0);
+    expect([...new Set(found)].sort()).toEqual(
+      RBAC_RENDERERS.map((name) => `resources:${name}`).sort(),
+    );
+  });
+
+  it('flags an RBAC object built outside those renderers', () => {
+    const lines = [
+      'function backingServiceResources() {',
+      "  return [{ apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'Role' }];",
+      '}',
+    ];
+    expect(enclosingFunctions(lines)[1]).toBe('backingServiceResources');
+    expect(RBAC_CONSTRUCTION.some((pattern) => pattern.test(lines[1] as string))).toBe(true);
+    // Reads of existing objects are not constructions.
+    for (const line of [
+      "  ['rbac.authorization.k8s.io/v1', 'RoleBinding'],",
+      "await this.list<Resource>('rbac.authorization.k8s.io/v1', 'RoleBinding', {",
+      "value.kind === 'RoleBinding' &&",
+    ])
+      expect(RBAC_CONSTRUCTION.some((pattern) => pattern.test(line))).toBe(false);
   });
 });
