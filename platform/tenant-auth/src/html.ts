@@ -79,7 +79,7 @@ export function overview(who: Who, deployments: Deployment[], services: Service[
   const rows = deployments
     .map(
       (d) =>
-        `<tr><td><a href="/logs/${e(d.name)}">${e(d.name)}</a></td><td>${e(d.ready ?? '')}</td><td class="muted">${e(d.message ?? '')}</td><td>${e(d.age ?? '')}</td></tr>`,
+        `<tr><td><a href="/logs/${encodeURIComponent(d.name)}">${e(d.name)}</a></td><td>${e(d.ready ?? '')}</td><td class="muted">${e(d.message ?? '')}</td><td>${e(d.age ?? '')}</td></tr>`,
     )
     .join('');
   const svc = services
@@ -133,9 +133,15 @@ export function members(
   );
 }
 
-const when = (iso: string) => iso.replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+const when = (iso: string) => e(iso.replace('T', ' ').replace(/\.\d+Z$/, 'Z'));
 
-export function keys(who: Who, list: ApiKey[], issued?: IssuedApiKey, error?: string): string {
+export function keys(
+  who: Who,
+  list: ApiKey[],
+  issued?: IssuedApiKey,
+  error?: string,
+  controllerUrl = '<controller-url>',
+): string {
   const now = Date.now();
   const rows = list
     .map((key) => {
@@ -147,7 +153,7 @@ export function keys(who: Who, list: ApiKey[], issued?: IssuedApiKey, error?: st
   const banner = issued
     ? `<div class="banner"><strong>Copy this key now. It is not shown again.</strong>
       <pre>${e(issued.secret)}</pre>
-      <p class="muted">Use it with <code>login --account ${e(who.account)} --api-key &lt;key&gt;</code>. It acts as you, only in this account.</p></div>`
+      <p class="muted">Use it with <code>di-tenant login --controller ${e(controllerUrl)} --account ${e(who.account)} --api-key &lt;key&gt;</code>. It acts as you, only in this account.</p></div>`
     : '';
   return page(
     `${who.account} · API keys`,
