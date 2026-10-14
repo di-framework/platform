@@ -245,6 +245,112 @@ does not set it yet.
   pulumi config set --path tenantAuth.registry.publicUrl https://127.0.0.1:8790
   ```
 
+#### Upgrading to a registry in its own NATS account (#159)
+
+Until this version the tenant registry's blobs and manifests lived in the object store
+`OBJ_oci-registry` on the shared, unauthenticated `di-nats`, in the same account as the hosts'
+data client. A tenant workload could reach them with raw `$JS.API.*` / `$O.*` requests or a mirror
+of the stream, bypassing the registry's push authorization. Subject permissions cannot close that
+(a mirror or source copies the stream), and the registry runs on the same host pods as the
+workloads, so a NetworkPolicy cannot either. The registry now has its own NATS account.
+
+**What changes on `pulumi up`**
+
+- Every tenant's `di-nats` gets accounts. Clients without credentials log in as the `no_auth_user`
+  of `TENANT`, so host plugins and tenant keyvalue, messaging and blobstore keep working unchanged.
+  JetStream data of the server's default (`$G`) account is not available once accounts exist, so
+  a new init step of `di-nats` renames `<storageRoot>/di-tenants/<tenant uid>/di-nats/jetstream/$G`
+  to `.../jetstream/TENANT` before the server starts. It runs once: it never overwrites an existing
+  `TENANT` directory (and logs that it left `$G` in place if both exist). `di-nats` restarts once.
+- With `tenantAuth.registry`, on a host image with wash patch 0003 (below), each tenant also gets:
+  - Secret `di-nats-registry` in `di-runtime-<tenant>` (`kubernetes.io/basic-auth`, user
+    `registry`, a random password the platform controller generates). `di-nats` reads the password
+    from the environment (`DI_NATS_REGISTRY_PASSWORD`); the ConfigMap never holds it.
+  - The `REGISTRY` account on `di-nats`, and a read-only mount of the Secret in the tenant host pods
+    at `/var/run/secrets/di-framework/registry-nats` (`username`, `password`). Tenant hosts roll
+    once. Guest volumes cannot reach it: admission admits workload `hostPath` volumes only under
+    `/var/lib/di-framework/workloads/<key>`, for the controller too.
+  - Once the store has moved (below), the registry's blobstore entry gains
+    `user_file: /var/run/secrets/di-framework/registry-nats/username` and
+    `password_file: /var/run/secrets/di-framework/registry-nats/password`. Admission admits these two
+    keys only from the platform controller, only on the registry's entry, only together, and only
+    with exactly these values; `di-bs-*` and `di-binding-*` ConfigMaps and Secrets can never carry
+    them.
+
+**The one-time move of the registry store**
+
+The existing `OBJ_oci-registry` is in `TENANT` after the rename, so the registry would see an empty
+store if it switched to `REGISTRY` at once. The controller therefore switches it only after a
+one-shot Job has moved the store:
+
+1. While `di-nats` and the tenant hosts roll out with the new account and mount, the registry keeps
+   running anonymously against its store in `TENANT`.
+2. Once both are rolled out, the controller stops the registry (`di-tenant-registry` replicas 0,
+   so nothing writes to the store being moved) and runs Job `di-nats-registry-migrate` in
+   `di-runtime-<tenant>` (`natsio/nats-box:0.20.0`, pinned by digest). `TenantAuthReady` is `False`
+   with reason `RegistryMigrating`. The Job refuses to run unless the anonymous login is in `TENANT`
+   and the registry login in `REGISTRY`, copies every live object whose name, size and SHA-256 are
+   not already in the destination, lists both stores again and fails unless every object matches
+   by size and digest, then deletes the source store and writes the marker key
+   `registry-object-store=complete` in KV bucket `di-platform-migrations` of `REGISTRY`.
+3. When the Job succeeded, the controller writes ConfigMap `di-nats-registry-migration`
+   (`state: complete`), restarts the registry with the credential files and stops rendering the Job
+   (Kubernetes removes it a day after it finished).
+
+Running workloads are not affected while the registry is stopped, but pushes and host pulls from
+the tenant registry fail until it is back (a restarted host cannot pull tenant images meanwhile).
+The time is about one copy of the store over the pod network. The copy needs free JetStream file
+storage of at least the store's size under `runtimeNats.maxFileStore`; if the Job fails with
+`insufficient resources`, raise the cap. The Job retries 10 times; if it gives up, `TenantAuthReady`
+says `RegistryMigrationFailed` and the registry stays stopped. Read its logs
+(`kubectl -n di-runtime-<tenant> logs job/di-nats-registry-migrate`), fix the cause and delete the
+Job; the controller recreates it. Every step is safe to repeat: a rerun copies only what is
+missing, and a run after the move exits at the marker. A tenant without a registry store only
+writes the marker. Its pod needs `250m` CPU and `128Mi` memory of the runtime quota.
+
+**How to verify**
+
+```sh
+kubectl -n di-runtime-<tenant> get configmap di-nats-registry-migration -o jsonpath='{.data.state}'  # complete
+kubectl -n di-runtime-<tenant> logs job/di-nats-registry-migrate   # "verified N objects ... by size and SHA-256"
+kubectl -n di-tenant-<tenant> get workloaddeployment di-tenant-registry \
+  -o jsonpath='{.spec.template.spec.hostInterfaces[?(@.package=="blobstore")].config}'  # has user_file/password_file
+# Anonymous clients (what a tenant workload gets) no longer see the store:
+kubectl -n di-runtime-<tenant> port-forward deploy/di-nats 4222 &
+nats --server nats://127.0.0.1:4222 stream ls --names   # no OBJ_oci-registry
+nats --server nats://127.0.0.1:4222 account info        # Account: TENANT
+```
+
+Then push and pull an image through the registry as usual.
+
+**Password rotation.** Delete Secret `di-nats-registry`; the controller generates a new password.
+The pod templates of `di-nats` and the tenant hosts carry a digest of the password
+(`platform.di-framework.dev/registry-nats-auth-sha256`), so `di-nats` restarts with the new password
+and the hosts roll. The host reads the credential files only when it opens a connection: a pooled
+blobstore connection that stays open keeps the password it read and, after the server restarted,
+fails to reconnect until a new connection is opened, which happens once the pooled one idled for 5
+minutes or the host restarted. The host roll is that restart, so the registry recovers when its host
+has rolled. Until then registry requests fail.
+
+**Ordering with the tenant host image.** The credential keys need wash patch 0003
+(`platform/tenant-host`), which the published images built before it ignore: their entry would
+connect anonymously, land in `TENANT` and see an empty store. The controller recognises the
+published images without 0003 (including the default
+`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0…` until it is repinned) and keeps the
+registry anonymous in `TENANT` on them: no `REGISTRY` account, Secret, mount or Job, and it logs a
+warning once, as does `pulumi up` when `tenantAuth.registry` is set. It cannot recognise images of
+your own; one without 0003 set as `tenantHostImage` breaks the registry after the move. So:
+
+1. Upgrade to a platform version whose host image includes patch 0003 (the default once it is
+   repinned, or `tenantHostImage` set to a published digest from `platform/tenant-host/README.md`
+   that lists `0003-nats-blobstore-credentials.patch`).
+2. Run `pulumi up`; the move above happens for each tenant on its own.
+
+Do not switch back to a host image without 0003 after the move: the registry would not reach its
+store. Downgrading the platform package below this version also needs the rename undone (stop
+`di-nats`, move `jetstream/TENANT` back to `jetstream/$G`); the registry's store stays in
+`jetstream/REGISTRY` and is not visible to an older version.
+
 ### Tenant removal and namespace retention
 
 Each `tenants` entry takes `deletionPolicy` (`Retain` or `Delete`, default `Retain`). The
@@ -567,7 +673,22 @@ jetstream {
   max_file_store: <bytes>
   max_memory_store: <bytes>
 }
+accounts {
+  TENANT {
+    jetstream: enabled
+    users: [ { user: "tenant" } ]
+  }
+  REGISTRY {                       # only with tenantAuth.registry, on a host image with wash patch 0003
+    jetstream: enabled
+    users: [ { user: "registry", password: $DI_NATS_REGISTRY_PASSWORD } ]
+  }
+}
+no_auth_user: "tenant"
 ```
+
+Clients without credentials (the hosts' data client, so every workload's default messaging,
+keyvalue and blobstore) land in `TENANT`; the tenant registry logs in to `REGISTRY` (#159). Both
+accounts share the caps below.
 
 | `runtimeNats` key | Default | Rule |
 | --- | --- | --- |
@@ -1010,9 +1131,11 @@ tenantAuth:
   `tenant-auth` component label and are removed with the rest of the pair.
 - Registry (`tenantAuth.registry`, #83): each tenant gets the `platform/oci-registry` component
   as WorkloadDeployment `di-tenant-registry` in `di-tenant-<tenant>`, on the tenant's own hosts.
-  Its storage is the unnamed `wasmcloud:blobstore` with no references, which is the host data
-  store on the tenant's `di-nats` (JetStream on the tenant's host path, capped by
-  [`runtimeNats.maxFileStore`](#runtime-nats-storage-caps)). Its `wasmcloud:secrets`
+  Its storage is the unnamed `wasmcloud:blobstore` with the NATS backend on the tenant's `di-nats`
+  (JetStream on the tenant's host path, capped by
+  [`runtimeNats.maxFileStore`](#runtime-nats-storage-caps)), in its own NATS account `REGISTRY`
+  that tenant workloads cannot reach (#159, see
+  [Upgrading to a registry in its own NATS account](#upgrading-to-a-registry-in-its-own-nats-account-159)). Its `wasmcloud:secrets`
   bind-time config names the tenant and the controller's whoami-only listener,
   `https://tenant-controller.di-runtime-<tenant>.svc:8789` (#113). The listener serves the
   controller certificate, which always names `tenant-controller.di-runtime-<tenant>.svc`, and the

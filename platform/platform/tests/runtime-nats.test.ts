@@ -212,6 +212,14 @@ describe('di-nats JetStream storage caps (#160)', () => {
         `  max_file_store: ${GiB}`,
         `  max_memory_store: ${MiB}`,
         '}',
+        // Clients without credentials land in the TENANT account (#159).
+        'accounts {',
+        '  TENANT {',
+        '    jetstream: enabled',
+        '    users: [ { user: "tenant" } ]',
+        '  }',
+        '}',
+        'no_auth_user: "tenant"',
         '',
       ].join('\n'),
     );

@@ -24,6 +24,7 @@ import {
   resolveBackingServiceClasses,
   seedTenantNamespaces,
 } from './tenancy';
+import { hostImageSupportsNatsCredentials } from './tenancy/registry-nats';
 import { tenantListerFromKubeconfig, warnRemovedTenants } from './tenancy/removal';
 import {
   assertRuntimeNatsConfig,
@@ -151,6 +152,12 @@ export function createPlatform(args: PlatformArgs) {
   assertHostImageSupportsAllowlist(tenantHostImage, insecureRegistries);
   const configuredTenantAuth = config.getObject<TenantAuthConfig>('tenantAuth');
   assertTenantAuthConfig(configuredTenantAuth);
+  // The registry keeps working on such a host, in the shared TENANT account (#159).
+  if (configuredTenantAuth?.registry && !hostImageSupportsNatsCredentials(tenantHostImage))
+    pulumi.log.warn(
+      `tenantHostImage ${tenantHostImage} predates wash patch 0003 (NATS blobstore credentials): tenant registries ` +
+        'stay in the shared TENANT NATS account, reachable by tenant workloads, until the host image carries it',
+    );
   // Unset tenant-auth public URLs default to gateway routes (#128); explicit URLs are kept.
   const tenantAuth = withDerivedPublicUrls(configuredTenantAuth, routeUrlPattern);
   const notDerived = unsetPublicUrls(tenantAuth);

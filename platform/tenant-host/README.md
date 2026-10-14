@@ -108,8 +108,11 @@ hostInterfaces:
   pinned wash does not enable; turning it on would change `Cargo.lock`, and `--locked` builds would
   need the patch to carry that. User and password is what NATS accounts in a server config use.
 - Who may set the keys is decided by admission, not by the host: whoever can write an entry's
-  config can name any file the host can read. Platform admission already admits inline blobstore
-  config only from the platform controller, for the tenant registry; #159 adds these keys there.
+  config can name any file the host can read. Platform admission (#159) admits them only from the
+  platform controller, only on the tenant registry's inline entry, only together, and only with
+  exactly `/var/run/secrets/di-framework/registry-nats/username` and `.../password`, the read-only
+  mount of the registry's credentials Secret; `di-bs-*` / `di-binding-*` config never carries them.
+  See the platform README, "Upgrading to a registry in its own NATS account".
 - Scope: only the `backend: nats` provider of the multiplexed blobstore plugins (`wasi:blobstore`
   and `wasmcloud:blobstore`). The host's own NATS blobstore plugin, which uses the `wash host` data
   NATS connection, and the NATS keyvalue and messaging backends are unchanged.

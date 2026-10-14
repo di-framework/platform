@@ -1,6 +1,24 @@
 import { createHash } from 'node:crypto';
 import { backingServiceCrds, DELETION_POLICIES } from './backing-services';
 import { PRIVATE_IPV4_RANGES } from './egress';
+import {
+  JETSTREAM_ACCOUNT_INIT_SCRIPT,
+  NATS_BOX_IMAGE,
+  natsAccountsConfig,
+  REGISTRY_NATS_AUTH_ANNOTATION,
+  REGISTRY_NATS_MIGRATION,
+  REGISTRY_NATS_MIGRATION_COMPONENT,
+  REGISTRY_NATS_MIGRATION_JOB,
+  REGISTRY_NATS_MIGRATION_SCRIPT,
+  REGISTRY_NATS_MOUNT,
+  REGISTRY_NATS_PASSWORD_ENV,
+  REGISTRY_NATS_PASSWORD_FILE,
+  REGISTRY_NATS_SECRET,
+  REGISTRY_NATS_USER_FILE,
+  REGISTRY_NATS_VOLUME,
+  registryNatsAuthDigest,
+  registryNatsSecretData,
+} from './registry-nats';
 import { hostStorage } from './workload-storage';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json | undefined };
 export interface Metadata {
@@ -243,6 +261,32 @@ export interface TenantAuthInputs {
    * Secret or newly generated; absent, no pull Secret is rendered.
    */
   hostPullToken?: string;
+  /**
+   * The registry's NATS account (#159): `migrating` while the Job moves its object store (the
+   * registry is stopped meanwhile, so no write lands in the store being moved), `credentials`
+   * once the store is in its account. Absent, the registry stays anonymous in `TENANT`.
+   */
+  registryNats?: RegistryNatsMode;
+}
+/** How the registry's blobstore entry reaches `di-nats` (#159); see {@link TenantAuthInputs}. */
+export type RegistryNatsMode = 'migrating' | 'credentials';
+/**
+ * The registry's NATS account on `di-nats` (#159), decided by the platform controller. Present
+ * while `tenantAuth.registry` is set and the host image carries wash patch 0003: the `REGISTRY`
+ * account, its credentials Secret and the hosts' read-only mount of it are rendered.
+ */
+export interface RegistryNats {
+  /** The registry user's password: the one in `di-nats-registry` while well formed, or new. */
+  password: string;
+  /** The registry's object store is in its account (the `di-nats-registry-migration` marker). */
+  migrated: boolean;
+  /**
+   * The migration Job may run: `di-nats` and the hosts are rolled out with this password, and
+   * the store has not moved yet.
+   */
+  migrate: boolean;
+  /** The migration Job gave up (its `Failed` condition); delete it to retry. */
+  failed?: boolean;
 }
 /**
  * How the tenant hosts pull from their registry (#83 `:host-pull`), rendered once the registry
@@ -297,6 +341,8 @@ export const BACKING_SERVICE_MEMORY_LIMIT = `${BACKING_SERVICE_MEMORY_LIMIT_MIB}
 export const RUNTIME_NATS_MAX_MEMORY_STORE = `${BACKING_SERVICE_MEMORY_LIMIT_MIB / 2}Mi`;
 /** The ConfigMap in `di-runtime-<tenant>` holding the `di-nats` server config. */
 export const RUNTIME_NATS_CONFIG = 'di-nats-config';
+/** The `di-nats` image; its shell also runs the JetStream account init step (#159). */
+export const RUNTIME_NATS_IMAGE = 'nats:2.12.8-alpine';
 /** Pod template annotation carrying the server config digest, so a cap change restarts NATS. */
 export const RUNTIME_NATS_CONFIG_ANNOTATION = 'platform.di-framework.dev/nats-config-sha256';
 const BINARY_QUANTITY = /^([1-9][0-9]*)(Ki|Mi|Gi|Ti)?$/;
@@ -361,9 +407,14 @@ export function assertRuntimeNatsConfig(value: RuntimeNatsConfig | undefined): v
 /**
  * The `di-nats` server config: JetStream on the tenant's host path (`/data`, the same store
  * directory as the earlier `-js -sd /data` flags), bounded by `limits`. nats-server has no flag
- * for either cap, so they are set in this file.
+ * for either cap, so they are set in this file. Clients without credentials land in the `TENANT`
+ * account; with `registry` the registry's own `REGISTRY` account is added (#159, see
+ * `registry-nats.ts`).
  */
-export function runtimeNatsServerConfig(limits: RuntimeNatsLimits): string {
+export function runtimeNatsServerConfig(
+  limits: RuntimeNatsLimits,
+  { registry = false }: { registry?: boolean } = {},
+): string {
   return [
     'port: 4222',
     'jetstream {',
@@ -371,6 +422,7 @@ export function runtimeNatsServerConfig(limits: RuntimeNatsLimits): string {
     `  max_file_store: ${limits.maxFileStore}`,
     `  max_memory_store: ${limits.maxMemoryStore}`,
     '}',
+    ...natsAccountsConfig(registry),
     '',
   ].join('\n');
 }
@@ -896,6 +948,8 @@ function tenantResources(
   tenantAuthNetwork = false,
   /** How the hosts pull from the tenant registry (#83 `:host-pull`); absent, they do not. */
   hostPull?: HostPull,
+  /** The registry's NATS account (#159); absent, `di-nats` has the `TENANT` account only. */
+  registryNats?: RegistryNats,
 ): Resource[] {
   const n = names(tenant.metadata.name);
   const storage = hostStorage(tenant, cfg, storageKeys);
@@ -1076,6 +1130,26 @@ function tenantResources(
               { protocol: 'TCP', port: 4222 },
             ],
           },
+          // The registry object store migration Job reaches `di-nats` only (#159).
+          ...(registryNats
+            ? [
+                {
+                  from: [
+                    {
+                      namespaceSelector: {
+                        matchLabels: { 'kubernetes.io/metadata.name': n.runtimeNamespace },
+                      },
+                      podSelector: {
+                        matchLabels: {
+                          [`${GROUP}/component`]: REGISTRY_NATS_MIGRATION_COMPONENT,
+                        },
+                      },
+                    },
+                  ],
+                  ports: [{ protocol: 'TCP', port: 4222 }],
+                },
+              ]
+            : []),
         ],
         egress: [
           {
@@ -1098,7 +1172,19 @@ function tenantResources(
   );
   // The `di-nats` JetStream store lives on an unquotaed host path, so its server config caps
   // file and memory storage (#160). The ConfigMap is applied before the Deployment that mounts it.
-  const natsConfig = runtimeNatsServerConfig(runtimeNatsLimits(cfg.runtimeNats));
+  // The registry's account (#159) reads its password from the credentials Secret, which is
+  // applied before the Deployment too.
+  const natsConfig = runtimeNatsServerConfig(runtimeNatsLimits(cfg.runtimeNats), {
+    registry: !!registryNats,
+  });
+  const registryAuth = registryNats ? registryNatsAuthDigest(registryNats.password) : undefined;
+  if (registryNats)
+    result.push(
+      make('v1', 'Secret', REGISTRY_NATS_SECRET, n.runtimeNamespace, {
+        type: 'kubernetes.io/basic-auth',
+        data: registryNatsSecretData(registryNats.password),
+      }),
+    );
   result.push(
     make('v1', 'ConfigMap', RUNTIME_NATS_CONFIG, n.runtimeNamespace, {
       data: { 'nats.conf': natsConfig },
@@ -1107,15 +1193,38 @@ function tenantResources(
   const natsConfigVolume = {
     annotations: {
       [RUNTIME_NATS_CONFIG_ANNOTATION]: createHash('sha256').update(natsConfig).digest('hex'),
+      ...(registryAuth ? { [REGISTRY_NATS_AUTH_ANNOTATION]: registryAuth } : {}),
     },
     mounts: [{ name: 'config', mountPath: '/etc/nats', readOnly: true }],
     volumes: [{ name: 'config', configMap: { name: RUNTIME_NATS_CONFIG } }],
+    env: registryNats
+      ? [
+          {
+            name: REGISTRY_NATS_PASSWORD_ENV,
+            valueFrom: { secretKeyRef: { name: REGISTRY_NATS_SECRET, key: 'password' } },
+          },
+        ]
+      : [],
+    // Clients without credentials land in the TENANT account, whose JetStream directory takes
+    // over the global account's before the server starts (#159).
+    initContainers: [
+      {
+        name: 'jetstream-accounts',
+        image: RUNTIME_NATS_IMAGE,
+        command: ['sh', '-c', JETSTREAM_ACCOUNT_INIT_SCRIPT],
+        resources: {
+          requests: { cpu: '10m', memory: '16Mi' },
+          limits: { cpu: '100m', memory: '32Mi' },
+        },
+        volumeMounts: [{ name: 'data', mountPath: '/data' }],
+      },
+    ],
   };
   for (const [name, image, port, args, extra] of [
     // Runtime-internal data-plane NATS for hostgroup `--data-nats-url`.
     // Lifecycle is Tenant-owned; never created as an application BackingService.
     // Application messaging NATS instances are `di-bs-<name>` via reconcileBackingService.
-    ['di-nats', 'nats:2.12.8-alpine', 4222, ['-c', '/etc/nats/nats.conf'], natsConfigVolume],
+    ['di-nats', RUNTIME_NATS_IMAGE, 4222, ['-c', '/etc/nats/nats.conf'], natsConfigVolume],
     // Transitional warehouse Redis + di-tenant-stock (#456 migrates to BackingService).
     // Independent Redis instances are provisioned separately as `di-bs-<name>`.
     [
@@ -1139,11 +1248,13 @@ function tenantResources(
             },
             spec: {
               automountServiceAccountToken: false,
+              ...(extra ? { initContainers: extra.initContainers } : {}),
               containers: [
                 {
                   name,
                   image,
                   args,
+                  ...(extra?.env.length ? { env: extra.env } : {}),
                   ports: [{ containerPort: port }],
                   resources: {
                     requests: { cpu: '10m', memory: '32Mi' },
@@ -1207,8 +1318,17 @@ function tenantResources(
           template: {
             metadata: {
               labels: { 'wasmcloud.com/hostgroup': n.hostgroup, 'wasmcloud.com/name': 'hostgroup' },
-              ...(hostPull?.caDigest
-                ? { annotations: { [REGISTRY_CA_ANNOTATION]: hostPull.caDigest } }
+              ...(hostPull?.caDigest || registryAuth
+                ? {
+                    annotations: {
+                      ...(hostPull?.caDigest
+                        ? { [REGISTRY_CA_ANNOTATION]: hostPull.caDigest }
+                        : {}),
+                      // A rotated registry password rolls the hosts (#159): the registry's pooled
+                      // blobstore connection would reconnect with the password it read at first.
+                      ...(registryAuth ? { [REGISTRY_NATS_AUTH_ANNOTATION]: registryAuth } : {}),
+                    },
+                  }
                 : {}),
             },
             spec: {
@@ -1291,6 +1411,17 @@ function tenantResources(
                     ...(hostPull?.caDigest
                       ? [{ name: 'registry-ca', mountPath: '/registry-ca', readOnly: true }]
                       : []),
+                    // The registry's NATS credentials (#159), read by its blobstore entry only.
+                    // Never a guest preopen: workload storage lives under its own root.
+                    ...(registryNats
+                      ? [
+                          {
+                            name: REGISTRY_NATS_VOLUME,
+                            mountPath: REGISTRY_NATS_MOUNT,
+                            readOnly: true,
+                          },
+                        ]
+                      : []),
                     ...storage.volumeMounts,
                   ],
                 },
@@ -1323,6 +1454,21 @@ function tenantResources(
                       },
                     ]
                   : []),
+                ...(registryNats
+                  ? [
+                      {
+                        name: REGISTRY_NATS_VOLUME,
+                        secret: {
+                          secretName: REGISTRY_NATS_SECRET,
+                          defaultMode: 0o440,
+                          items: [
+                            { key: 'username', path: 'username' },
+                            { key: 'password', path: 'password' },
+                          ],
+                        },
+                      },
+                    ]
+                  : []),
                 ...storage.volumes,
               ],
             },
@@ -1339,7 +1485,78 @@ function tenantResources(
       }),
     );
   }
+  if (registryNats?.migrated)
+    result.push(
+      make('v1', 'ConfigMap', REGISTRY_NATS_MIGRATION, n.runtimeNamespace, {
+        data: { state: 'complete' },
+      }),
+    );
+  else if (registryNats?.migrate && !suspended)
+    result.push(registryNatsMigrationJob(make, n.runtimeNamespace));
   return result;
+}
+/**
+ * The one-shot Job that moves the registry's object store from the `TENANT` account into
+ * `REGISTRY` (#159; the script is `REGISTRY_NATS_MIGRATION_SCRIPT`). It logs in anonymously for
+ * the source and as the registry user for the destination. Kept a day after it finishes, by which
+ * time the controller has recorded the result in `di-nats-registry-migration`.
+ */
+function registryNatsMigrationJob(
+  make: (
+    apiVersion: string,
+    kind: string,
+    name: string,
+    namespace: string,
+    body: Record<string, unknown>,
+  ) => Resource,
+  namespace: string,
+): Resource {
+  const credential = (key: string) => ({
+    valueFrom: { secretKeyRef: { name: REGISTRY_NATS_SECRET, key } },
+  });
+  return make('batch/v1', 'Job', REGISTRY_NATS_MIGRATION_JOB, namespace, {
+    spec: {
+      backoffLimit: 10,
+      ttlSecondsAfterFinished: 86400,
+      template: {
+        metadata: { labels: { [`${GROUP}/component`]: REGISTRY_NATS_MIGRATION_COMPONENT } },
+        spec: {
+          restartPolicy: 'Never',
+          automountServiceAccountToken: false,
+          securityContext: {
+            runAsNonRoot: true,
+            runAsUser: 65532,
+            runAsGroup: 65532,
+            seccompProfile: { type: 'RuntimeDefault' },
+          },
+          containers: [
+            {
+              name: 'migrate',
+              image: NATS_BOX_IMAGE,
+              command: ['sh', '-c', REGISTRY_NATS_MIGRATION_SCRIPT],
+              env: [
+                { name: 'NATS_URL', value: `nats://di-nats.${namespace}.svc.cluster.local:4222` },
+                { name: 'HOME', value: '/tmp' },
+                { name: 'REGISTRY_USER', ...credential('username') },
+                { name: 'REGISTRY_PASSWORD', ...credential('password') },
+              ],
+              resources: {
+                requests: { cpu: '10m', memory: '32Mi' },
+                limits: { cpu: '250m', memory: '128Mi' },
+              },
+              securityContext: {
+                allowPrivilegeEscalation: false,
+                readOnlyRootFilesystem: true,
+                capabilities: { drop: ['ALL'] },
+              },
+              volumeMounts: [{ name: 'tmp', mountPath: '/tmp' }],
+            },
+          ],
+          volumes: [{ name: 'tmp', emptyDir: {} }],
+        },
+      },
+    },
+  });
 }
 /** Whether the controller has reconciled the tenant's current spec. */
 function tenantReady(tenant: Tenant): boolean {
@@ -2019,7 +2236,7 @@ function tenantAuthResources(
           ],
         },
       }),
-      registryWorkload(tenant, cfg, registry, registryHost),
+      registryWorkload(tenant, cfg, registry, registryHost, inputs.registryNats),
     );
   return result;
 }
@@ -2031,16 +2248,23 @@ function tenantAuthResources(
  * platform controller only, so a tenant cannot repoint it. The whoami URL is https to the
  * controller Service (#113): {@link registryWhoamiHost} is one of the controller certificate's
  * names, and the hosts trust the tenant CA through `--http-client-ca-path`.
+ *
+ * `nats` (#159): with `credentials` the blobstore entry logs in to the registry's own NATS
+ * account from the files of the hosts' read-only Secret mount; while `migrating` the registry is
+ * stopped, so nothing writes to the store the Job moves; absent, it connects anonymously and lands
+ * in the `TENANT` account.
  */
 function registryWorkload(
   tenant: Tenant,
   cfg: ControllerConfig,
   registry: TenantRegistryConfig,
   host: string,
+  nats?: RegistryNatsMode,
 ): Resource {
   const name = tenant.metadata.name;
   const n = names(name);
-  const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
+  const suspended =
+    tenant.spec.suspended || !!tenant.metadata.deletionTimestamp || nats === 'migrating';
   const whoami = `${registryWhoamiHost(name)}:${WHOAMI_PORT}`;
   const value = resource(
     tenant,
@@ -2081,6 +2305,12 @@ function registryWorkload(
                 config: {
                   backend: 'nats',
                   url: `nats://di-nats.${n.runtimeNamespace}.svc.cluster.local:4222`,
+                  ...(nats === 'credentials'
+                    ? {
+                        user_file: REGISTRY_NATS_USER_FILE,
+                        password_file: REGISTRY_NATS_PASSWORD_FILE,
+                      }
+                    : {}),
                 },
               },
               {

@@ -976,3 +976,51 @@ test.each([
   },
   60_000,
 );
+
+test('install warns that tenant registries stay in the shared NATS account on a pre-0003 host (#159)', () => {
+  const run = (config: Record<string, unknown>) => {
+    const prefixed = Object.fromEntries(
+      Object.entries({ tenants: [{ name: 'alpha' }], ...config }).map(([key, value]) => [
+        `project:${key}`,
+        typeof value === 'string' ? value : JSON.stringify(value),
+      ]),
+    );
+    const child = spawnSync(
+      'node',
+      [
+        '-e',
+        `
+    const pulumi = require('@pulumi/pulumi');
+    const k8s = require('@pulumi/kubernetes');
+    pulumi.runtime.setAllConfig(${JSON.stringify(prefixed)});
+    pulumi.runtime.setMocks({
+      newResource: a => ({id:a.name, state:{...a.inputs, metadata:{...a.inputs.metadata, name:a.inputs.metadata?.name ?? a.name}}}),
+      call: a => a.inputs,
+    }, 'project', 'test', false);
+    pulumi.runtime.runInPulumiStack(async () => {
+      const platform = require('./dist').createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test' });
+      await platform.namespace.promise();
+    }).catch(e => {console.error(e);process.exitCode=1;});
+  `,
+      ],
+      { cwd: root, encoding: 'utf8' },
+    );
+    expect(child.status).toBe(0);
+    return `${child.stdout}${child.stderr}`;
+  };
+  const tenantAuth = {
+    image: `ghcr.io/x/y@sha256:${'a'.repeat(64)}`,
+    issuer: 'https://issuer.example',
+    oauthClient: { id: 'access', secretName: 'tenant-auth-oauth' },
+    registry: { component: `ghcr.io/x/registry@sha256:${'b'.repeat(64)}` },
+  };
+  const warning = 'predates wash patch 0003 (NATS blobstore credentials)';
+  // The default host image predates 0003 until it is repinned.
+  expect(run({ tenantAuth })).toContain(warning);
+  // A host image with 0003, or no registry, logs nothing about it.
+  expect(
+    run({ tenantAuth, tenantHostImage: `ghcr.io/di-framework/wash@sha256:${'c'.repeat(64)}` }),
+  ).not.toContain(warning);
+  const { registry: _registry, ...withoutRegistry } = tenantAuth;
+  expect(run({ tenantAuth: withoutRegistry })).not.toContain(warning);
+}, 180_000);

@@ -432,6 +432,7 @@ describe('tenant RBAC, quotas, admission policies, and network isolation', () =>
     expect(names).toEqual([
       'test-backend-config',
       'test-backingservices',
+      'test-managed-config-keys',
       'test-reserved-workloads',
       'test-servicebindings',
       'test-services',
