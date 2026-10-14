@@ -509,7 +509,7 @@ export interface components {
             level?: "debug" | "info" | "warn" | "error";
             message: string;
         };
-        /** @description A secret lists its name only; a var also carries its value. */
+        /** @description A var lists its name, value, and update time. Secrets list as `SecretEntry`. */
         ConfigEntry: {
             name: string;
             value?: string;

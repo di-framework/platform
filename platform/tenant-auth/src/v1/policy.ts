@@ -27,7 +27,8 @@ export const POLICY: Record<OperationName, readonly Role[]> = {
   deployments: EVERYONE,
   deploymentStats: EVERYONE,
   rollback: DEVELOPERS,
-  // Developer-only: viewer RBAC has no Secret access, and allowing it would leak values via the raw proxy.
+  // Developer-only, matching viewer RBAC, which cannot read Secrets. Listing returns names only;
+  // values would reach viewers through the raw proxy only if their RBAC were widened to read Secrets.
   secrets: DEVELOPERS,
   setSecret: DEVELOPERS,
   updateSecret: DEVELOPERS,
