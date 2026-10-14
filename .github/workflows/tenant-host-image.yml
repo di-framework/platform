@@ -9,8 +9,10 @@
 # later job consumes) and checked again by the Dockerfile, which fails a build whose WASH_PATCHES is
 # not exactly the set listed for its IMAGE_VERSION:
 #   wasi-tls            ghcr.io/di-framework/wash:2.8.0-wasi-tls            + 0002-insecure-registry-allowlist.patch
+#                                                                            + 0003-nats-blobstore-credentials.patch
 #   wasi-tls-exclusive  ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive  + 0001-exclusive-instance.patch
 #                                                                            + 0002-insecure-registry-allowlist.patch
+#                                                                            + 0003-nats-blobstore-credentials.patch
 # The image labels name the variant and the patches applied. wasi-tls (the table's first row) is the
 # canonical tag, the one the platform default hostImage (DEFAULT_HOST_IMAGE) is pinned to; the
 # exclusive variant is only used by setting tenantHostImage to its digest. The pin job below never

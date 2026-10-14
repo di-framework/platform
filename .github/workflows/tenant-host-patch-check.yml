@@ -1,11 +1,12 @@
 # Prove every tenant host image variant's patch set applies to the pinned wasmCloud source, and that
 # the patched wash and wash-runtime build, lint, format-check and pass the tests that cover the
-# patches (#136, #175).
+# patches (#136, #175, #330).
 #
 # tenant-host-image.yml only runs on main (on push and dispatch), so without this job a patch that
 # did not apply, or did not compile, would only show up at publish time, after merge. One job per row of platform/tenant-host/variants (the
 # same table the Dockerfile and the publish workflow read), each with that variant's patches applied
-# in order, so the canonical set (0002 alone) and the exclusive stack (0001 + 0002) are both checked.
+# in order, so the canonical set (0002 + 0003) and the exclusive stack (0001 + 0002 + 0003) are both
+# checked.
 # Each job checks wasmCloud out at the commit pinned by WASMCLOUD_COMMIT in the Dockerfile, runs
 # `git apply --check` then `git apply` per patch, then:
 #   - `cargo fmt --all -- --check`;
@@ -14,7 +15,8 @@
 #   - checks and lints `-p wash --features wasi-tls,host-component-plugins`, a feature the image does
 #     not enable but the patches must not break;
 #   - runs the patch tests by name and fails if any named test did not run. The allowlist tests
-#     (0002) run for every variant; the pool and dispatch tests (0001) run where 0001 is applied.
+#     (0002) and the NATS blobstore credential tests (0003) run for every variant; the pool and
+#     dispatch tests (0001) run where 0001 is applied.
 # It does not run the whole suites: they need prebuilt wasm fixtures and Docker services this job
 # does not set up.
 #
@@ -208,7 +210,9 @@ jobs:
       # 0002: protocol selection (unit and against a loopback listener), washlet propagation, and
       # `wash host` flag/env parsing. 0001 (when applied): the exclusive gates, queueing, trap,
       # timeout and drain tests (instance_pool, instance_driver) and the opt-in surviving the wire
-      # conversion (wire_). Each name below must have run and passed.
+      # conversion (wire_). 0003 (when applied): NATS blobstore credential parsing, pool keys,
+      # credential file reading, and the CONNECT a fake NATS server receives (nats_blobstore_).
+      # Each name below must have run and passed.
       - name: Test the patches
         working-directory: wasmcloud
         env:
@@ -235,6 +239,23 @@ jobs:
           if [[ " ${PATCHES} " == *" 0001-exclusive-instance.patch "* ]]; then
             runtime_filters+=(instance_pool instance_driver wire_)
             required+=(engine::instance_pool::exclusive_tests::)
+          fi
+          if [[ " ${PATCHES} " == *" 0003-nats-blobstore-credentials.patch "* ]]; then
+            runtime_filters+=(nats_blobstore_)
+            required+=(
+              plugin::wasi_blobstore::multiplexed::nats::tests::nats_blobstore_auth_without_credential_keys_is_anonymous
+              plugin::wasi_blobstore::multiplexed::nats::tests::nats_blobstore_auth_with_both_files_is_user_password_files
+              plugin::wasi_blobstore::multiplexed::nats::tests::nats_blobstore_auth_rejects_one_key_without_the_other
+              plugin::wasi_blobstore::multiplexed::nats::tests::nats_blobstore_auth_rejects_empty_and_relative_paths
+              plugin::wasi_blobstore::multiplexed::nats::tests::nats_blobstore_pool_key_without_credentials_is_the_url
+              plugin::wasi_blobstore::multiplexed::nats::tests::nats_blobstore_pool_key_separates_credentials
+              plugin::wasi_blobstore::multiplexed::nats::tests::nats_blobstore_pool_key_invalid_credentials_is_not_pooled
+              plugin::wasi_blobstore::multiplexed::nats::tests::nats_blobstore_read_credential_drops_one_line_ending
+              plugin::wasi_blobstore::multiplexed::nats::tests::nats_blobstore_read_credential_errors_name_the_path_not_the_contents
+              plugin::wasi_blobstore::multiplexed::nats::tests::nats_blobstore_connect_sends_user_and_password_from_files
+              plugin::wasi_blobstore::multiplexed::nats::tests::nats_blobstore_connect_without_credentials_sends_none
+              plugin::wasi_blobstore::multiplexed::nats::tests::nats_blobstore_connect_fails_before_dialing_on_unreadable_credentials
+            )
           fi
           log="${RUNNER_TEMP}/patch-tests.log"
           cargo test -p wash-runtime --locked --features wasi-tls --lib -- "${runtime_filters[@]}" 2>&1 | tee "${log}"

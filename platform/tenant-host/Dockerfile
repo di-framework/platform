@@ -7,12 +7,14 @@
 #
 # Variants. `variants` in this directory is the one tag -> patch set table; the build fails unless
 # WASH_PATCHES is exactly the set it lists for IMAGE_VERSION, so a mislabelled image cannot be built:
-#   2.8.0-wasi-tls            0002-insecure-registry-allowlist.patch (#149, #175; the canonical default)
-#   2.8.0-wasi-tls-exclusive  0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch (#136)
+#   2.8.0-wasi-tls            0002-insecure-registry-allowlist.patch 0003-nats-blobstore-credentials.patch
+#                             (#149, #175, #330; the canonical default)
+#   2.8.0-wasi-tls-exclusive  0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch
+#                             0003-nats-blobstore-credentials.patch (#136)
 # The defaults below are the canonical row, so a plain `podman build` builds the canonical image.
 ARG WASMCLOUD_TAG=v2.8.0
 ARG WASMCLOUD_COMMIT=5c4ec4a3d008b3f401d9e763515f434deebc9936
-ARG WASH_PATCHES="0002-insecure-registry-allowlist.patch"
+ARG WASH_PATCHES="0002-insecure-registry-allowlist.patch 0003-nats-blobstore-credentials.patch"
 ARG IMAGE_VERSION=2.8.0-wasi-tls
 
 # rust-toolchain.toml at the tag pins 1.96.0. Pinned by digest alone (rust:1.96.0-bookworm): a tag

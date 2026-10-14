@@ -6,5 +6,5 @@
 #   - .github/workflows/tenant-host-image.yml: the publish job's resolver passes the listed set;
 #   - .github/workflows/tenant-host-patch-check.yml: one CI job per line.
 # The first line is the canonical tag (the platform default host image). Patch names hold no spaces.
-2.8.0-wasi-tls            0002-insecure-registry-allowlist.patch
-2.8.0-wasi-tls-exclusive  0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch
+2.8.0-wasi-tls            0002-insecure-registry-allowlist.patch 0003-nats-blobstore-credentials.patch
+2.8.0-wasi-tls-exclusive  0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch 0003-nats-blobstore-credentials.patch
