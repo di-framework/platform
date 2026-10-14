@@ -4,12 +4,12 @@
  * triggers and paths, the skip-if-published gate, least-privilege permissions, and the pin job.
  */
 import { describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { ARTIFACTS } from '../scripts/pin-artifact';
 import { matchesPathFilter, pushPaths } from '../scripts/source-check';
-import { spawnEnv, stubCommand } from './helpers/spawn-env';
+import { git, sandboxClone, spawnEnv, stubCommand } from './helpers/spawn-env';
 
 const repo = resolve(import.meta.dir, '..');
 const env = spawnEnv;
@@ -1115,5 +1115,374 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
       WASM_SHA256: '${{ needs.build.outputs.pglite_wasm_sha256 }}',
     });
     expect(steps('publish')[verify]?.run).toContain('package/dist/di-framework-pglite.wasm');
+  });
+});
+
+describe('Auto Tag tags a release when its PR merges instead of waiting for it (#214)', () => {
+  const autoTag = parse('.github/workflows/auto-tag.yml');
+  const tagSteps = autoTag.jobs.tag?.steps ?? [];
+  const allRuns = Object.values(autoTag.jobs)
+    .flatMap((job) => job.steps ?? [])
+    .map((s) => s.run ?? '')
+    .join('\n');
+
+  test('opens the release PR on lockfile pushes and dispatches, tags on a merged PR', () => {
+    expect(autoTag.on.push).toEqual({
+      branches: ['main'],
+      paths: ['bun.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'],
+    });
+    expect(autoTag.on.pull_request).toEqual({
+      types: ['closed'],
+      branches: ['main'],
+      paths: ['package.json'],
+    });
+    expect(autoTag.on.workflow_dispatch).toMatchObject({
+      inputs: {
+        bump: { type: 'choice', default: 'patch' },
+        tag_only: { type: 'boolean', default: false },
+      },
+    });
+  });
+
+  test('two jobs: tag, then release-pr; nothing waits for the PR to merge', () => {
+    expect(Object.keys(autoTag.jobs).sort()).toEqual(['release-pr', 'tag']);
+    expect(autoTag.jobs.tag?.needs).toBeUndefined();
+    expect(autoTag.jobs['release-pr']?.needs).toBe('tag');
+    expect(allRuns).not.toMatch(/\bsleep\b|gh pr view "\$PR"|mergedAt/);
+    // A workflow-level group would let PR-close runs cancel a pending release run, and one
+    // group for every tag job would let a merge run replace a pending push run.
+    expect(autoTag.concurrency).toBeUndefined();
+    expect(autoTag.jobs.tag).toMatchObject({
+      concurrency: { group: 'auto-tag-tag-${{ github.event_name }}', 'cancel-in-progress': false },
+    });
+    expect(autoTag.jobs['release-pr']).toMatchObject({
+      concurrency: { group: 'auto-tag', 'cancel-in-progress': false },
+    });
+  });
+
+  test('tag runs only for merged same-repository release/v* PRs; release-pr never on a PR', () => {
+    const tagIf = autoTag.jobs.tag?.if ?? '';
+    expect(tagIf).toContain("github.event_name != 'pull_request' ||");
+    expect(tagIf).toContain('github.event.pull_request.merged == true');
+    expect(tagIf).toContain("startsWith(github.event.pull_request.head.ref, 'release/v')");
+    expect(tagIf).toContain('github.event.pull_request.head.repo.full_name == github.repository');
+    const prIf = autoTag.jobs['release-pr']?.if ?? '';
+    expect(prIf).toContain("!cancelled() && needs.tag.result == 'success'");
+    expect(prIf).toContain("(github.event_name == 'workflow_dispatch' && inputs.tag_only != true)");
+    expect(prIf).toContain("github.event_name == 'push'");
+    expect(prIf).toContain("!startsWith(github.event.head_commit.message, 'chore(release):')");
+    expect(prIf).not.toContain('pull_request');
+  });
+
+  test('least privilege: no workflow-level scopes, each job only what it uses', () => {
+    expect(autoTag.permissions).toEqual({});
+    expect(autoTag.jobs.tag?.permissions).toEqual({
+      contents: 'write',
+      actions: 'write',
+      'pull-requests': 'read',
+    });
+    expect(autoTag.jobs['release-pr']?.permissions).toEqual({
+      contents: 'write',
+      'pull-requests': 'write',
+    });
+    const prRuns = (autoTag.jobs['release-pr']?.steps ?? []).map((s) => s.run ?? '').join('\n');
+    expect(prRuns).not.toMatch(/gh workflow run|git tag /);
+  });
+
+  test('tag pushes the tag, then dispatches release.yml on it (GITHUB_TOKEN pushes fire nothing)', () => {
+    const tagRun = tagSteps.map((s) => s.run ?? '').join('\n');
+    const push = tagRun.indexOf('git push origin "refs/tags/v$VERSION"');
+    const dispatch = tagRun.indexOf('gh workflow run release.yml --ref "v$VERSION"');
+    expect(push).toBeGreaterThan(-1);
+    expect(dispatch).toBeGreaterThan(push);
+    for (const s of tagSteps.filter((s) => s.run)) {
+      expect(s.env?.GH_TOKEN).toBe('${{ github.token }}');
+    }
+    expect(parse('.github/workflows/release.yml').on.push).toEqual({ tags: ['v*'] } as never);
+  });
+
+  test('the README says what publishes a release and how to recover', () => {
+    const readme = read('README.md');
+    expect(readme).toContain(
+      'Approving the Auto Tag run, or merging the release PR, is what publishes a release.',
+    );
+    expect(readme).toContain('`tag_only: true`');
+  });
+
+  describe('the tag job scripts', () => {
+    const REPO = 'di-framework/platform';
+    const find = tagSteps.find((s) => (s.run ?? '').includes('version_at'));
+    const tag = tagSteps.find((s) => (s.run ?? '').includes('gh workflow run'));
+
+    /**
+     * origin/main: a 1.0.0 commit, then `chore(release): v1.0.1 (#5)`, then `extra`.
+     * The stub `gh` answers `api repos/<repo>/commits/<sha>/pulls` from `pulls-<sha>.json`,
+     * `run list` from `runs.json`, and logs `workflow run`; a successful dispatch records a run,
+     * and a `fail-dispatch` file makes the next dispatch fail.
+     */
+    function sandbox(extra?: string) {
+      const box = sandboxClone('auto-tag-');
+      const write = (version: string) =>
+        writeFileSync(join(box.work, 'package.json'), `${JSON.stringify({ version })}\n`);
+      write('1.0.0');
+      git(box.work, 'add', '.');
+      git(box.work, 'commit', '-qm', 'init');
+      const init = git(box.work, 'rev-parse', 'HEAD');
+      write('1.0.1');
+      git(box.work, 'commit', '-qam', 'chore(release): v1.0.1 (#5)');
+      const release = git(box.work, 'rev-parse', 'HEAD');
+      if (extra) {
+        writeFileSync(join(box.work, 'other'), extra);
+        git(box.work, 'add', '.');
+        git(box.work, 'commit', '-qm', extra);
+      }
+      git(box.work, 'push', '-q', 'origin', 'HEAD:main');
+      const bin = join(box.base, 'bin');
+      const b = box.base;
+      stubCommand(
+        bin,
+        'gh',
+        [
+          'case "$1 $2" in',
+          `  "api "*) sha="\${2#*/commits/}"; sha="\${sha%/pulls}"; cat "${b}/pulls-$sha.json" 2>/dev/null || echo '[]' ;;`,
+          `  "run list") cat "${b}/runs.json" 2>/dev/null || echo '[]' ;;`,
+          `  "workflow run") echo "$*" >> "${b}/gh.log"`,
+          `    if [ -f "${b}/fail-dispatch" ]; then rm "${b}/fail-dispatch"; exit 1; fi`,
+          `    echo '[{"databaseId":1}]' > "${b}/runs.json" ;;`,
+          '  *) echo "unexpected gh $*" >&2; exit 2 ;;',
+          'esac',
+        ].join('\n'),
+      );
+      const result = { ...box, init, release, bin };
+      pulls(result, release, [releasePr('release/v1.0.1')]);
+      return result;
+    }
+    type Box = ReturnType<typeof sandbox>;
+
+    function releasePr(ref: string, repo = REPO, merged = true) {
+      return {
+        number: 5,
+        merged_at: merged ? '2026-10-14T00:00:00Z' : null,
+        head: { ref, repo: { full_name: repo } },
+      };
+    }
+    function pulls(box: { base: string }, sha: string, list: unknown[]) {
+      writeFileSync(join(box.base, `pulls-${sha}.json`), JSON.stringify(list));
+    }
+
+    function step(box: Box, script: string, vars: Record<string, string>) {
+      const output = join(box.base, 'out');
+      writeFileSync(output, '');
+      const result = Bun.spawnSync(['bash', '-c', script], {
+        cwd: box.work,
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: {
+          ...env,
+          PATH: `${box.bin}:${process.env.PATH}`,
+          GITHUB_OUTPUT: output,
+          GITHUB_STEP_SUMMARY: join(box.base, 'summary'),
+          GITHUB_REPOSITORY: REPO,
+          ...vars,
+        },
+      });
+      const out: Record<string, string> = Object.fromEntries(
+        readFileSync(output, 'utf8')
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]),
+      );
+      return { exitCode: result.exitCode, out, stdout: result.stdout.toString() };
+    }
+
+    /** Both steps, as the job runs them; `between` runs after the find step. */
+    function run(box: Box, vars: Record<string, string>, between?: () => void) {
+      const first = step(box, find?.run ?? '', vars);
+      if (first.exitCode !== 0 || !['tag', 'dispatch'].includes(first.out.action ?? '')) {
+        return first;
+      }
+      between?.();
+      const second = step(box, tag?.run ?? '', {
+        ACTION: first.out.action ?? '',
+        VERSION: first.out.version ?? '',
+        COMMIT: first.out.commit ?? '',
+      });
+      return { ...second, out: first.out, stdout: first.stdout + second.stdout };
+    }
+
+    const dispatches = (box: Box) => {
+      const file = join(box.base, 'gh.log');
+      return existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : [];
+    };
+    /** The commit a remote tag points at (peeled when annotated). */
+    const remoteTag = (box: Box, name: string) =>
+      git(box.work, 'ls-remote', '--tags', 'origin', `refs/tags/${name}`, `refs/tags/${name}^{}`)
+        .split('\n')
+        .at(-1)
+        ?.split('\t')[0];
+    const noTags = (box: Box) => expect(git(box.work, 'ls-remote', '--tags', 'origin')).toBe('');
+    const DISPATCH = 'workflow run release.yml --ref v1.0.1';
+
+    test('a push run tags the release commit of the version on main and dispatches Release once', () => {
+      const box = sandbox('fix: later work');
+      const first = run(box, { EVENT: 'push' });
+      expect(first.exitCode).toBe(0);
+      expect(first.out.action).toBe('tag');
+      expect(remoteTag(box, 'v1.0.1')).toBe(box.release);
+      expect(dispatches(box)).toEqual([DISPATCH]);
+
+      // Idempotent: the tag exists and Release ran, so a second run does nothing.
+      const again = run(box, { EVENT: 'workflow_dispatch' });
+      expect(again.exitCode).toBe(0);
+      expect(again.out.action).toBe('none');
+      expect(dispatches(box)).toEqual([DISPATCH]);
+    });
+
+    test('a merged release PR tags its merge commit', () => {
+      const box = sandbox();
+      const result = run(box, {
+        EVENT: 'pull_request',
+        HEAD_REF: 'release/v1.0.1',
+        MERGE_SHA: box.release,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(remoteTag(box, 'v1.0.1')).toBe(box.release);
+      expect(dispatches(box)).toEqual([DISPATCH]);
+    });
+
+    test('a failed dispatch after the tag push is retried by the next run, once', () => {
+      const box = sandbox();
+      writeFileSync(join(box.base, 'fail-dispatch'), '');
+      const failed = run(box, {
+        EVENT: 'pull_request',
+        HEAD_REF: 'release/v1.0.1',
+        MERGE_SHA: box.release,
+      });
+      expect(failed.exitCode).not.toBe(0);
+      expect(remoteTag(box, 'v1.0.1')).toBe(box.release);
+      expect(dispatches(box)).toEqual([DISPATCH]);
+
+      // A re-run of the same event finds the tag at the merge commit and no Release run.
+      const retry = run(box, {
+        EVENT: 'pull_request',
+        HEAD_REF: 'release/v1.0.1',
+        MERGE_SHA: box.release,
+      });
+      expect(retry.exitCode).toBe(0);
+      expect(retry.out.action).toBe('dispatch');
+      expect(dispatches(box)).toEqual([DISPATCH, DISPATCH]);
+
+      // Release has run now; a tag_only dispatch does nothing.
+      const after = run(box, { EVENT: 'workflow_dispatch' });
+      expect(after.out.action).toBe('none');
+      expect(dispatches(box)).toEqual([DISPATCH, DISPATCH]);
+    });
+
+    test('losing the tag-push race exits cleanly without a second dispatch', () => {
+      const box = sandbox();
+      const result = run(box, { EVENT: 'push' }, () => {
+        git(box.work, 'push', '-q', 'origin', `${box.release}:refs/tags/v1.0.1`);
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('Tag v1.0.1 was pushed by another run; nothing to do.');
+      expect(dispatches(box)).toEqual([]);
+    });
+
+    test('a tag at another commit is left alone and nothing is dispatched', () => {
+      const box = sandbox();
+      git(box.work, 'push', '-q', 'origin', `${box.init}:refs/tags/v1.0.1`);
+      for (const vars of [
+        { EVENT: 'push' } as Record<string, string>,
+        { EVENT: 'pull_request', HEAD_REF: 'release/v1.0.1', MERGE_SHA: box.release },
+      ]) {
+        const result = run(box, vars);
+        expect(result.exitCode).toBe(0);
+        expect(result.out.action).toBe('none');
+        expect(result.stdout).toContain(`::warning::tag v1.0.1 already exists at ${box.init}`);
+      }
+      expect(remoteTag(box, 'v1.0.1')).toBe(box.init);
+      expect(dispatches(box)).toEqual([]);
+    });
+
+    test('a merge commit whose version does not match the branch fails without tagging', () => {
+      const box = sandbox();
+      const result = run(box, {
+        EVENT: 'pull_request',
+        HEAD_REF: 'release/v1.0.2',
+        MERGE_SHA: box.release,
+      });
+      expect(result.exitCode).not.toBe(0);
+      noTags(box);
+      expect(dispatches(box)).toEqual([]);
+    });
+
+    test('a version that no release commit set is left untagged', () => {
+      const box = sandbox();
+      writeFileSync(join(box.work, 'package.json'), `${JSON.stringify({ version: '1.0.2' })}\n`);
+      git(box.work, 'commit', '-qam', 'chore: hand-edited version');
+      git(box.work, 'push', '-q', 'origin', 'HEAD:main');
+      const result = run(box, { EVENT: 'push' });
+      expect(result.exitCode).toBe(0);
+      expect(result.out.action).toBe('none');
+      noTags(box);
+      expect(dispatches(box)).toEqual([]);
+    });
+
+    describe('the catch-up path tags only the merge of a same-repository release/vX PR', () => {
+      const cases: [string, unknown[]][] = [
+        ['no PR', []],
+        ['a PR from a fork', [releasePr('release/v1.0.1', 'someone/platform')]],
+        ['a PR from another branch', [releasePr('feature/v1.0.1')]],
+        ['a PR for another version', [releasePr('release/v1.0.10')]],
+        ['an unmerged PR', [releasePr('release/v1.0.1', REPO, false)]],
+      ];
+      for (const [name, list] of cases) {
+        test(`not ${name}`, () => {
+          const box = sandbox();
+          pulls(box, box.release, list);
+          const result = run(box, { EVENT: 'push' });
+          expect(result.exitCode).toBe(0);
+          expect(result.out.action).toBe('none');
+          expect(result.stdout).toContain(
+            `::warning::${box.release} is not the merge of a release/v1.0.1 PR from ${REPO}`,
+          );
+          noTags(box);
+          expect(dispatches(box)).toEqual([]);
+        });
+      }
+
+      test('not a commit whose package.json does not set the version in its title', () => {
+        const box = sandbox();
+        writeFileSync(join(box.work, 'other'), 'x');
+        git(box.work, 'add', '.');
+        git(box.work, 'commit', '-qm', 'chore(release): v1.0.2 (#7)');
+        const titled = git(box.work, 'rev-parse', 'HEAD');
+        pulls(box, titled, [releasePr('release/v1.0.2')]);
+        writeFileSync(join(box.work, 'package.json'), `${JSON.stringify({ version: '1.0.2' })}\n`);
+        git(box.work, 'commit', '-qam', 'chore: hand-edited version');
+        git(box.work, 'push', '-q', 'origin', 'HEAD:main');
+        const result = run(box, { EVENT: 'push' });
+        expect(result.exitCode).toBe(0);
+        expect(result.out.action).toBe('none');
+        expect(result.stdout).toContain(
+          `::warning::${titled} is titled v1.0.2, but its package.json version is '1.0.1'`,
+        );
+        noTags(box);
+        expect(dispatches(box)).toEqual([]);
+      });
+    });
+
+    test('the release commit is matched by exact version: v1.0.1 never matches v1.0.10', () => {
+      const box = sandbox();
+      writeFileSync(join(box.work, 'package.json'), `${JSON.stringify({ version: '1.0.10' })}\n`);
+      git(box.work, 'commit', '-qam', 'chore(release): v1.0.10 (#9)');
+      const v10 = git(box.work, 'rev-parse', 'HEAD');
+      pulls(box, v10, [releasePr('release/v1.0.10')]);
+      git(box.work, 'push', '-q', 'origin', 'HEAD:main');
+      const result = run(box, { EVENT: 'push' });
+      expect(result.exitCode).toBe(0);
+      expect(remoteTag(box, 'v1.0.10')).toBe(v10);
+      expect(git(box.work, 'ls-remote', '--tags', 'origin', 'refs/tags/v1.0.1')).toBe('');
+    });
   });
 });
