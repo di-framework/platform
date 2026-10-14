@@ -327,16 +327,120 @@ describe('registry login', () => {
     expect(readStore(env)).toEqual({});
   });
 
-  test('logout still forgets the account when the registry cleanup fails', async () => {
+  test('logout never runs a tool logout; it prints the command and still forgets the account', async () => {
     writeStore({ acme: { ...credential, registry: { host: 'r.test', tool: 'podman' } } }, env);
-    execCode = 125;
     const logout = fakeFetch({ 'POST /v1/auth/logout': () => new Response(null, { status: 204 }) });
     expect(await run(['logout'], io(logout.fetch))).toBe(0);
-    expect(err).toContain('warning: podman logout r.test failed (exit 125)');
-    writeStore({ acme: { ...credential, registry: { host: 'r.test', tool: 'podman' } } }, env);
-    expect(await run(['logout'], { ...io(logout.fetch), exec: undefined })).toBe(0);
-    expect(err).toContain('warning: the r.test login was kept: cannot run podman from here');
+    expect(execs).toHaveLength(0);
+    expect(err).toContain(
+      'The r.test login made with podman was kept; to remove it, run: podman logout -- r.test',
+    );
     expect(readStore(env)).toEqual({});
+  });
+
+  test('an explicit registry logout runs the tool logout and reports its failure', async () => {
+    writeStore({ acme: { ...credential, registry: { host: 'r.test', tool: 'podman' } } }, env);
+    execCode = 125;
+    expect(await run(['registry', 'logout'], io())).toBe(0);
+    expect(execs.at(-1)?.command).toEqual(['podman', 'logout', '--', 'r.test']);
+    expect(err.at(-1)).toBe('warning: podman logout r.test failed (exit 125)');
+    expect(
+      await run(['registry', 'logout', '--host', 'r.test', '--with', 'oras'], {
+        ...io(),
+        exec: undefined,
+      }),
+    ).toBe(1);
+    expect(err.at(-1)).toBe('cannot run oras from here');
+  });
+
+  test('logout still forgets the account when the registry cleanup fails', async () => {
+    const path = join(scratch, 'broken.json');
+    writeFileSync(path, 'not json');
+    writeStore(
+      { acme: { ...credential, registry: { host: 'r.test', config: path, fingerprint: 'x' } } },
+      env,
+    );
+    const logout = fakeFetch({ 'POST /v1/auth/logout': () => new Response(null, { status: 204 }) });
+    expect(await run(['logout'], io(logout.fetch))).toBe(0);
+    expect(err[0]).toStartWith('warning: the r.test login was kept:');
+    expect(readStore(env)).toEqual({});
+  });
+
+  test('two accounts sharing a registry host: logging one out keeps the other account entry', async () => {
+    const shared = { ...registryInfo, url: 'https://127.0.0.1:5443' };
+    const keyA = 'dik_account_a';
+    const keyB = 'dik_account_b';
+    writeStore(
+      {
+        a: { ...credential, account: 'a', apiKey: keyA },
+        b: { ...credential, account: 'b', apiKey: keyB },
+      },
+      env,
+    );
+    const { fetch } = fakeFetch({
+      'GET /v1/deploy/registry': () => Response.json(shared),
+      'GET /v2/': () => Response.json({}),
+      'POST /v1/auth/logout': () => new Response(null, { status: 204 }),
+    });
+    expect(await run(['registry', 'login', '--account', 'a'], io(fetch))).toBe(0);
+    expect(await run(['registry', 'login', '--account', 'b'], io(fetch))).toBe(0);
+    const entryB = { auth: btoa(`token:${keyB}`) };
+    expect(JSON.parse(readFileSync(configFile(), 'utf8')).auths['127.0.0.1:5443']).toEqual(entryB);
+
+    expect(await run(['logout', '--account', 'a'], io(fetch))).toBe(0);
+    expect(JSON.parse(readFileSync(configFile(), 'utf8')).auths['127.0.0.1:5443']).toEqual(entryB);
+    expect(err.join('\n')).toContain('the 127.0.0.1:5443 entry in');
+    expect(err.join('\n')).toContain('changed since registry login');
+
+    // b wrote the entry, so b's logout removes it.
+    expect(await run(['registry', 'logout', '--account', 'b'], io(fetch))).toBe(0);
+    expect(JSON.parse(readFileSync(configFile(), 'utf8')).auths).toEqual({});
+    expect(printed()).not.toContain(keyA);
+    expect(printed()).not.toContain(keyB);
+  });
+
+  test('a manual docker login after registry login survives logout and registry logout', async () => {
+    const { fetch } = fakes();
+    expect(await run(['registry', 'login'], io(fetch))).toBe(0);
+    // The user's own `docker login` to the same host replaces the entry.
+    const config = JSON.parse(readFileSync(configFile(), 'utf8'));
+    config.auths['registry.acme.test:8443'] = { auth: btoa('me:personal') };
+    writeFileSync(configFile(), JSON.stringify(config));
+
+    expect(await run(['registry', 'logout'], io())).toBe(0);
+    expect(err.at(-1)).toContain('changed since registry login');
+    expect(JSON.parse(readFileSync(configFile(), 'utf8')).auths['registry.acme.test:8443']).toEqual(
+      {
+        auth: btoa('me:personal'),
+      },
+    );
+
+    expect(await run(['registry', 'login'], io(fetch))).toBe(0);
+    writeFileSync(configFile(), JSON.stringify(config));
+    const logout = fakeFetch({ 'POST /v1/auth/logout': () => new Response(null, { status: 204 }) });
+    expect(await run(['logout'], io(logout.fetch))).toBe(0);
+    expect(JSON.parse(readFileSync(configFile(), 'utf8')).auths['registry.acme.test:8443']).toEqual(
+      {
+        auth: btoa('me:personal'),
+      },
+    );
+
+    // Only an explicit --host removes it, whatever it holds.
+    expect(await run(['registry', 'logout', '--host', 'registry.acme.test:8443'], io())).toBe(0);
+    expect(JSON.parse(readFileSync(configFile(), 'utf8')).auths).toEqual({});
+  });
+
+  test('a recorded entry without a fingerprint is never removed blindly', async () => {
+    mkdirSync(env.DOCKER_CONFIG as string);
+    writeFileSync(configFile(), JSON.stringify({ auths: { 'r.test': { auth: 'eA==' } } }));
+    writeStore(
+      { acme: { ...credential, registry: { host: 'r.test', config: configFile() } } },
+      env,
+    );
+    expect(await run(['registry', 'logout'], io())).toBe(0);
+    expect(JSON.parse(readFileSync(configFile(), 'utf8')).auths).toEqual({
+      'r.test': { auth: 'eA==' },
+    });
   });
 
   test('an identity token is refreshed before it is stored, so it gets its full lifetime', async () => {

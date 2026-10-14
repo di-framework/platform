@@ -94,10 +94,12 @@ di-tenant registry login --with podman   # or docker / oras: the password goes t
 di-tenant registry logout                # undoes the last registry login, no controller call
 ```
 
-Before any credential is sent, the URL the controller returned must pass the controller's own
-rule: a bare `https:` origin (no userinfo, path, query, or fragment), or `http:` only for
-loopback and `*.svc` / `*.svc.cluster.local` hosts, and the host must be a plain hostname, IPv4,
-or bracketed IPv6 address. The `/v2/` check does not follow redirects.
+Before any credential is sent, the URL the controller returned is checked at least as strictly
+as the controller's own rule: a bare `https:` origin (no userinfo, path, query, or fragment), or
+`http:` only for loopback and `*.svc` / `*.svc.cluster.local` hosts. On top of that, the host must
+be a DNS name of letter, digit, and hyphen labels (no `_`, no trailing dot), an IPv4 address, or a
+bracketed IPv6 address, so a few names the controller accepts are refused here. The `/v2/` check
+does not follow redirects.
 
 Without `--with`, `registry login` stores `token:<credential>` for the host under `auths` in the
 Docker config (`--config <file>`, else `$DOCKER_CONFIG/config.json`, else
@@ -108,12 +110,21 @@ that file; podman reads it through `--authfile` or `REGISTRY_AUTH_FILE`. If the 
 `login --username=token --password-stdin [--plain-http | --tls-verify=false] -- <host>` (the
 plain-HTTP switch for oras or podman on an `http:` origin only).
 
-`registry login` records the host and where it stored the login with the account. `registry
-logout` removes that entry from the same Docker config, or runs `<tool> logout -- <host>` for a
-`--with` login; it needs no controller call, so it works after a login has expired.
-`registry logout --host <host> [--config <file> | --with <tool>]` removes a login that was not
-recorded. `logout` also removes the recorded registry login, since it holds the same token or
-key. A login stored through a Docker credential helper (`credsStore`) is the helper's to remove.
+`registry login` records the host and where it stored the login with the account, plus the
+sha256 of the Docker config entry it wrote. Docker keys entries by host alone and tenants often
+share one (`127.0.0.1:<port>`), so a logout removes the entry only while it still matches that
+fingerprint; if another account's `registry login` or your own `docker login` replaced it, the
+entry is kept with a warning.
+
+- `registry logout` removes the recorded login without a controller call, so it works after a
+  login has expired. For a `--with` login it runs `<tool> logout -- <host>`, which removes
+  whatever that tool holds for the host.
+- `registry logout --host <host> [--config <file> | --with <tool>]` removes the entry for that
+  host whatever it holds.
+- `logout` removes the recorded Docker config entry (same fingerprint rule), since it holds the
+  same token or key. It never runs `<tool> logout` for a `--with` login, because that cannot be
+  checked; it prints the command to run instead.
+- A login stored through a Docker credential helper (`credsStore`) is the helper's to remove.
 
 By hand, log in against the host of `url`, not the full URL, then push to
 `<host>/<repositoryPrefix>/<name>:<tag>`:

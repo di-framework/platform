@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   closeSync,
   existsSync,
@@ -29,7 +29,7 @@ export interface RegistryOrigin {
 
 /** One DNS label: letters, digits, and inner hyphens, so a host never starts with `-`. */
 const LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
-const HOSTNAME = new RegExp(`^${LABEL}(?:\\.${LABEL})*$`);
+const HOSTNAME = new RegExp(String.raw`^${LABEL}(?:\.${LABEL})*$`);
 const IPV6 = /^\[[0-9a-f:.]+\]$/;
 
 /** Loopback and in-cluster hosts: the only ones a credential may reach over plain HTTP. */
@@ -40,12 +40,13 @@ function isClusterLocal(hostname: string): boolean {
 }
 
 /**
- * Checks the registry URL the controller returned before any credential is sent to it, with the
- * controller's own rule (`TENANT_CONTROLLER_REGISTRY_URL`): a bare `https:` origin, or `http:` for
- * loopback and `*.svc` / `*.svc.cluster.local` only. The host must be a plain DNS name, IPv4, or
- * bracketed IPv6 address, so it can never be read as a command-line flag; the URL parser already
- * refuses a port that is not a number up to 65535. Errors never echo the value, which could carry
- * userinfo.
+ * Checks the registry URL the controller returned before any credential is sent to it. It is at
+ * least as strict as the controller's rule for `TENANT_CONTROLLER_REGISTRY_URL` (a bare `https:`
+ * origin, or `http:` for loopback and `*.svc` / `*.svc.cluster.local` only), plus a hostname
+ * syntax check: the host must be a DNS name of letter/digit/hyphen labels (no `_`, no trailing
+ * dot), IPv4, or a bracketed IPv6 address, so it can never be read as a command-line flag. The URL
+ * parser already refuses a port that is not a number up to 65535. Errors never echo the value,
+ * which could carry userinfo.
  */
 export function registryOrigin(value: string): RegistryOrigin {
   const refuse = (why: string): never => {
@@ -145,33 +146,55 @@ function writeConfig(path: string, config: DockerConfig): void {
 }
 
 /**
+ * The sha256 of an `auths` entry as JSON: recorded with the account at `registry login`, so a
+ * logout only removes the entry while it is still the one this CLI wrote. Docker keys entries by
+ * host alone, and tenants often share one (`127.0.0.1:<port>`), so another account's login or a
+ * manual `docker login` may have replaced it since.
+ */
+export function entryFingerprint(entry: unknown): string {
+  return createHash('sha256').update(JSON.stringify(entry)).digest('hex');
+}
+
+/**
  * Stores `username:password` for `host` under `auths`, keeping every other entry and key.
- * Returns a warning when a credential helper would shadow the entry.
+ * Returns the entry's fingerprint, and a warning when a credential helper would shadow it.
  */
 export function storeRegistryAuth(
   path: string,
   host: string,
   username: string,
   password: string,
-): string | undefined {
+): { fingerprint: string; warning?: string } {
   const config = readConfig(path);
-  config.auths = {
-    ...config.auths,
-    [host]: { auth: Buffer.from(`${username}:${password}`).toString('base64') },
-  };
+  const entry = { auth: Buffer.from(`${username}:${password}`).toString('base64') };
+  config.auths = { ...config.auths, [host]: entry };
   writeConfig(path, config);
+  const fingerprint = entryFingerprint(entry);
   const helper = config.credHelpers?.[host] ?? config.credsStore;
-  if (!helper) return undefined;
-  return `warning: ${path} names the credential helper "${helper}", which docker consults instead of this entry; use --with docker to log in through it`;
+  if (!helper) return { fingerprint };
+  return {
+    fingerprint,
+    warning: `warning: ${path} names the credential helper "${helper}", which docker consults instead of this entry; use --with docker to log in through it`,
+  };
 }
 
-/** Drops the `auths` entry for `host`; true when there was one. */
-export function removeRegistryAuth(path: string, host: string): boolean {
+/**
+ * Drops the `auths` entry for `host`. With a `fingerprint`, only while the entry still matches it
+ * (`changed` otherwise, and the entry stays); without one, whatever it holds (`registry logout
+ * --host`).
+ */
+export function removeRegistryAuth(
+  path: string,
+  host: string,
+  fingerprint?: string,
+): 'removed' | 'absent' | 'changed' {
   const config = readConfig(path);
-  if (!config.auths?.[host]) return false;
+  const entry = config.auths?.[host];
+  if (!config.auths || !entry) return 'absent';
+  if (fingerprint !== undefined && entryFingerprint(entry) !== fingerprint) return 'changed';
   delete config.auths[host];
   writeConfig(path, config);
-  return true;
+  return 'removed';
 }
 
 export const LOGIN_TOOLS = ['docker', 'podman', 'oras'] as const;

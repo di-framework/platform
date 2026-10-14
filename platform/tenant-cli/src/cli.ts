@@ -408,9 +408,9 @@ async function registryLogin(flags: Record<string, string>, io: Io): Promise<num
       trusting(io.fetch, caPem(credential.controller)),
     );
     const path = dockerConfigPath(flags.config, io.env);
-    const warning = storeRegistryAuth(path, registry.host, username, password);
+    const { fingerprint, warning } = storeRegistryAuth(path, registry.host, username, password);
     if (warning) io.stderr(warning);
-    record = { host: registry.host, config: path };
+    record = { host: registry.host, config: path, fingerprint };
     stored = `stored in ${path}`;
   }
   const store = readStore(io.env);
@@ -429,13 +429,26 @@ async function registryLogin(flags: Record<string, string>, io: Io): Promise<num
   return 0;
 }
 
-/** Removes a registry login from the Docker config, or through the tool that made it. */
+/**
+ * Removes a registry login from the Docker config, or through the tool that made it. A recorded
+ * Docker config entry is removed only while it matches the fingerprint taken at `registry login`;
+ * a login with no fingerprint (`registry logout --host`) is removed whatever it holds. `automatic`
+ * (from `logout`) never runs `<tool> logout`, which cannot be checked and would remove whatever
+ * that tool holds for the host; it prints the command instead.
+ */
 async function forgetRegistryLogin(
   login: NonNullable<Credential['registry']>,
   io: Io,
+  automatic = false,
 ): Promise<void> {
   if (login.tool) {
     const tool = loginTool(login.tool);
+    if (automatic) {
+      io.stderr(
+        `The ${login.host} login made with ${tool} was kept; to remove it, run: ${logoutCommand(tool, login.host).join(' ')}`,
+      );
+      return;
+    }
     if (!io.exec) throw new CliError(`cannot run ${tool} from here`);
     const code = await io.exec(logoutCommand(tool, login.host), '');
     io.stderr(
@@ -446,12 +459,13 @@ async function forgetRegistryLogin(
     return;
   }
   const path = login.config ?? dockerConfigPath(undefined, io.env);
-  const removed = removeRegistryAuth(path, login.host);
-  io.stderr(
-    removed
-      ? `Removed the ${login.host} login from ${path}.`
-      : `No ${login.host} login in ${path}.`,
-  );
+  const result = removeRegistryAuth(path, login.host, login.fingerprint);
+  const messages = {
+    removed: `Removed the ${login.host} login from ${path}.`,
+    absent: `No ${login.host} login in ${path}.`,
+    changed: `warning: the ${login.host} entry in ${path} changed since registry login (another login replaced it); kept it. Remove it with: registry logout --host ${login.host}`,
+  };
+  io.stderr(messages[result]);
 }
 
 /**
@@ -469,9 +483,11 @@ async function registryLogout(flags: Record<string, string>, io: Io): Promise<nu
     const host = registryOrigin(`https://${flags.host}`).host;
     login = { host, config: flags.config, tool: flags.with };
   } else if (recorded) {
+    // A recorded entry without a fingerprint is never removed blindly: '' matches nothing.
     login = {
       host: recorded.host,
       config: flags.config ?? recorded.config,
+      fingerprint: recorded.tool ? undefined : (recorded.fingerprint ?? ''),
       tool: flags.with ?? recorded.tool,
     };
   }
@@ -585,7 +601,7 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
       }
       // The registry login holds the same token or key; remove it too, without blocking logout.
       if (credential.registry) {
-        await forgetRegistryLogin(credential.registry, io).catch((error: Error) =>
+        await forgetRegistryLogin(credential.registry, io, true).catch((error: Error) =>
           io.stderr(`warning: the ${credential.registry?.host} login was kept: ${error.message}`),
         );
       }
