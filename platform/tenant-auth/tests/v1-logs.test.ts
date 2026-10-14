@@ -419,7 +419,7 @@ describe('GET /v1/services/:service/logs', () => {
       });
       await until('prod fresh');
       for (const message of [...PROD, 'prod fresh'])
-        expect(text.split(`"message":"${message}"`).length).toBe(2);
+        expect(text.split(`"message":"${message}"`)).toHaveLength(2);
       expect(text).not.toContain('shared copy');
       abort.abort();
       await watch.closed;

@@ -546,9 +546,10 @@ export function unpublished(
   const id = (entry: RingLine) => `${entry.deployment}\n${entry.line}`;
   const stamp = (entry: RingLine) => entry.line.split(' ')[0] as string;
   const published = new Set(ring.map((entry) => (entry.deployment ? id(entry) : entry.line)));
+  const [first] = ring;
   let oldest = '';
-  if (ring.length >= max)
-    oldest = ring.map(stamp).reduce((min, value) => (value < min ? value : min));
+  if (first && ring.length >= max)
+    oldest = ring.reduce((min, entry) => (stamp(entry) < min ? stamp(entry) : min), stamp(first));
   return incoming.filter(
     (entry) => !published.has(id(entry)) && !published.has(entry.line) && stamp(entry) >= oldest,
   );
