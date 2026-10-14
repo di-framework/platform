@@ -100,9 +100,10 @@ const noContent = () => new Response(null, { status: 204 });
 
 // ---- references from deployed workloads (platform#100) ---------------------------------------
 
-const WORKLOAD_API = 'runtime.wasmcloud.dev/v1alpha1';
+/** The API group/version of WorkloadDeployments; shared with the deploy lane so both agree. */
+export const WORKLOAD_API = 'runtime.wasmcloud.dev/v1alpha1';
 
-type Sources = { name?: unknown }[] | undefined;
+type Sources = { name?: unknown }[];
 interface Guest {
   localResources?: { environment?: { configFrom?: Sources; secretFrom?: Sources } };
 }
@@ -138,7 +139,7 @@ async function referencing(
       return components.some(injects) || injects(template?.service);
     })
     .map(({ metadata }) => metadata.name)
-    .sort();
+    .sort((a, b) => a.localeCompare(b));
 }
 
 const referencedBy = (deployments: string[], env: string) =>
@@ -258,7 +259,7 @@ const unsetSecret: V1Handler = async (_command, call, context) => {
   if (deployments.length > 0)
     return conflict(
       `secret ${name} is ${referencedBy(deployments, env)}; ` +
-        'destroy them (or redeploy without it) before unsetting it',
+        'destroy them or redeploy them without it in `secrets` before unsetting it',
     );
   await remove(
     context.asUser(),

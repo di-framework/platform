@@ -343,8 +343,12 @@ every guest's `localResources.environment` (`components[*]` and `service`):
 
 A name that does not exist is still a 404 first, and set and update are never affected. The
 check reads the live objects, so a workload applied out of band counts too; a failed read is a
-502 that leaves the secret or vars unchanged, and a deploy racing a secret unset is caught by the
-deploy's own existence check (422). Whether an emptied vars ConfigMap is deleted is a separate
+502 (a denied one a 403) that leaves the secret or vars unchanged. The check is best-effort, not
+transactional: Kubernetes has no transaction across the Secret and the WorkloadDeployments. A
+deploy that already read the secret before the unset listed workloads, and applies its
+WorkloadDeployment after that list but before the delete, still lands and then fails with
+`Config=False`. A deploy that reads after the delete is refused by its own existence check (422).
+Whether an emptied vars ConfigMap is deleted is a separate
 decision (platform#98); today it is kept with no keys.
 
 **HTTP host and labels (platform#101, #103).** A service's HTTP host is `<service>-<env>`
