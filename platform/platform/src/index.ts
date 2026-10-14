@@ -120,7 +120,7 @@ export interface PlatformArgs {
  * (scripts/pin-artifact.ts, #346) moves it together with the published-images table.
  */
 export const DEFAULT_HOST_IMAGE =
-  'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:805a47c0050a90e8dcf22de8e844da91da38b2d8f2da26170ace7c624af76584';
+  'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:76c78e4a5888b48eb9abd89f02c5f58c5aa5bcd0a7d2fefe72b323a17ea43d77';
 
 /**
  * Route aliases from `args`, or else from config `routeAliases`, a top-level object. A `gateway`
