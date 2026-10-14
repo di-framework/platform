@@ -635,11 +635,31 @@ identity workload there, then add `identity.identity: identity.identity-pg` and 
 roll back, remove the alias and run `pulumi up` again; the original route returns. Each change
 updates the gateway's `GATEWAY_CONFIG` and its `di-framework.dev/config-hash` annotation, so the
 `di-platform-gateway` pod rolls. The switch takes effect when that rollout completes
-(`kubectl rollout status deploy/di-platform-gateway -n <namespace>`): the old pod keeps routing
-until the new one is Ready, then on SIGTERM it stops accepting connections, closes idle keep-alive
-connections and lets in-flight requests finish. Switching is near-immediate, not instant, and no
-pooled upstream connection outlives the old pod. Upgrading to the release that adds the
-annotation rolls the gateway once.
+(`kubectl rollout status deploy/di-platform-gateway -n <namespace>`). The roll is meant to drop
+no requests (#223):
+
+- The rollout surges (`maxSurge: 1`, `maxUnavailable: 0`, `minReadySeconds: 5`), so the old pod
+  keeps routing until the new one has been Ready for 5 s.
+- The old pod's `preStop` hook then sleeps 10 s while it still serves, so the Service endpoint
+  removal reaches every node's proxy before its listener closes. During those seconds both pods
+  may answer, so for about 10–15 s after the rollout completes some requests still use the old
+  routing.
+- On SIGTERM the gateway stops accepting connections and closes idle keep-alive connections. It
+  answers requests already in flight with `Connection: close` and lets them finish. That includes
+  a request whose headers are only partly received and, with tenant-auth routes set, a connection
+  still being classified. It keeps upgraded (WebSocket) tunnels and TLS passthrough pipes open.
+  It waits up to 20 s, then closes whatever is left and exits. The 35 s termination grace period
+  covers the sleep and the drain.
+
+Switching is near-immediate, not instant. A WebSocket or passthrough connection opened before the
+switch keeps its old route until it closes or the 20 s drain bound ends it. No pooled upstream
+connection outlives the old pod. A client that reuses a keep-alive connection just as the old pod
+closes it as idle can still see that connection reset; HTTP clients normally retry such a request
+on a new connection. A connection opened before SIGTERM that has not sent its request yet is kept
+and answered with `Connection: close`, or closed at the 20 s bound.
+
+Upgrading to the release that adds the annotation rolls the gateway once, and so does upgrading
+to the release that adds this drain.
 
 **`di-framework-kube up` does not pass this key yet.** Its `platform.json` allowlist rejects
 `routeAliases` (`unsupported platform config key`), and every `up` rebuilds the stack config from
