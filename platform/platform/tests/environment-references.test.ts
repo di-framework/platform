@@ -1,10 +1,16 @@
 import { describe, expect, it } from 'bun:test';
+import { RUNTIME_SECRET } from '../../backup-destination/src/model';
+import { secretName as apiKeySecretName } from '../../tenant-auth/src/keys';
+import { secretObjectName } from '../../tenant-auth/src/v1/config';
 import {
   admissionResources,
+  DEPLOY_ENVS,
   ENV_LABEL,
   WORKLOAD_SECRET_SUFFIXES,
   workloadEnvironmentReferencesAllowed,
 } from '../src/tenancy/admission';
+import type { BackingService } from '../src/tenancy/backing-services';
+import { postgresNames } from '../src/tenancy/postgres';
 import {
   type ControllerConfig,
   INSTALLATION,
@@ -327,6 +333,7 @@ describe('platform-owned Secret names avoid the workload Secret suffixes (#325)'
   it('renders no Secret ending in a workload Secret suffix', () => {
     const rendered = [
       ...tenantResources(tenant, cfg),
+      // Positional flags after the registry data are the optional tenant features (stage, TLS, pull).
       ...tenantResources(tenant, cfg, { data: { 'ca.crt': 'test' } }, [], true, true, true, {}),
       ...(['migrating', 'rollout', 'migrated'] as const).flatMap((stage) =>
         tenantResources(tenant, cfg, undefined, [], true, true, true, {}, registryNats(stage)),
@@ -340,9 +347,38 @@ describe('platform-owned Secret names avoid the workload Secret suffixes (#325)'
       }),
     ];
     const names = new Set(rendered.filter((r) => r.kind === 'Secret').map((r) => r.metadata.name));
-    // The scan has to see the Secrets it is about: the registry NATS one (#159) and tenant-auth's.
-    expect(names.has('di-nats-registry')).toBe(true);
-    expect(names.has('tenant-console-oauth')).toBe(true);
+    // Producers outside tenantResources/tenantAuthResources create Secrets in tenant namespaces
+    // at runtime; their names come from the real helpers.
+    const postgres = (name: string): BackingService => ({
+      apiVersion: VERSION,
+      kind: 'BackingService',
+      metadata: { name, uid: `${name}-uid` } as BackingService['metadata'],
+      spec: { type: 'postgres' } as BackingService['spec'],
+    });
+    for (const name of ['db', 'x'.repeat(63)]) {
+      const pg = postgresNames(postgres(name));
+      names.add(pg.credentials);
+      names.add(pg.connection);
+    }
+    names.add(RUNTIME_SECRET);
+    names.add(apiKeySecretName('0123456789abcdef'));
+    for (const env of DEPLOY_ENVS)
+      for (const name of ['db', 'secrets', 'a-control']) names.add(secretObjectName(name, env));
+    // The scan has to see the Secrets it is about, so a fixture cannot silently drop them.
+    for (const expected of [
+      'di-nats-registry',
+      'di-scheduler-tls',
+      'tenant-controller-tls',
+      'tenant-controller-ca-key',
+      'di-tenant-registry-pull',
+      'tenant-console-oauth',
+      'di-backup-destination',
+    ])
+      expect(names.has(expected)).toBe(true);
+    expect([...names].some((n) => /^di-pg-.+-auth$/.test(n))).toBe(true);
+    expect([...names].some((n) => /^di-pg-.+-conn$/.test(n))).toBe(true);
+    expect([...names].some((n) => n.startsWith('di-apikey-'))).toBe(true);
+    expect(names.has('db.prod')).toBe(true);
     const offending = [...names].filter(
       (name) =>
         !managedPrefixes.some((prefix) => name.startsWith(prefix)) &&
@@ -389,6 +425,11 @@ describe('CEL parity with workloadEnvironmentReferencesAllowed (#88)', () => {
     'di-bs-x',
     'greeter-prod-control',
     'identity-control',
+    'identity-secret',
+    'identity-secrets',
+    'identity-secrets-x',
+    'greeter-prod-secrets',
+    'greeter-prod-secret',
     'di-bs-x-control',
     'other-control',
     'a-control',

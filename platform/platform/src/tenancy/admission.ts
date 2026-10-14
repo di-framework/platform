@@ -365,7 +365,12 @@ export const DEPLOY_ENVS = ['prod', 'staging'] as const;
 const TENANT_SECRET_NAME = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
 /**
  * Suffixes of the Secrets a WorkloadDeployment may reference by its own name (#203):
- * `<workload>-control` is CLI-owned, `<workload>-secrets` is app-owned.
+ * `<workload>-control` is CLI-owned, `<workload>-secrets` is app-owned. No platform Secret in a
+ * tenant namespace may end in one of these (`di-binding-`/`di-bs-` are exempt by prefix).
+ * tests/environment-references.test.ts scans tenantResources/tenantAuthResources output plus
+ * names from the real helpers of the other producers: postgresNames, backup-destination
+ * RUNTIME_SECRET, tenant-auth di-apikey-<id> and `<name>.<env>`. A new Secret producer must be
+ * added to that scan.
  *
  * Invariant: the rule that admits these names is only safe while no platform-owned Secret in a
  * tenant namespace ends in one of these suffixes (`di-binding-*` and `di-bs-*` Secrets are exempt
