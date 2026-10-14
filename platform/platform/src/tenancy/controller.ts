@@ -6,6 +6,8 @@ import { claimsRegistryHost } from './admission';
 import {
   backingServiceResourceName,
   backingServiceResources,
+  type DeploymentFailure,
+  deploymentFailure,
   endpointFor,
   RUNTIME_DATA_NATS,
   type RuntimeProvider,
@@ -1125,8 +1127,8 @@ export class Controller {
       return;
     }
     const desired = backingServiceResources(service, tenant, cls, this.cfg, sizing);
-    const ready = await this.applyBackingServiceResources(desired);
-    await this.updateBackingServiceStatus(service, tenant, cls, ready);
+    const rollout = await this.applyBackingServiceResources(desired);
+    await this.updateBackingServiceStatus(service, tenant, cls, rollout);
   }
 
   /** Egress runs nothing: the service is Ready once its class approves every destination. */
@@ -1395,8 +1397,11 @@ export class Controller {
     return { cls, sizing: sized.sizing };
   }
 
-  private async applyBackingServiceResources(desired: Resource[]): Promise<boolean> {
+  private async applyBackingServiceResources(
+    desired: Resource[],
+  ): Promise<{ ready: boolean; failure?: DeploymentFailure }> {
     let ready = true;
+    let failure: DeploymentFailure | undefined;
     for (const value of desired) {
       const applied = await this.ensure(value);
       if (value.kind !== 'Deployment') continue;
@@ -1406,29 +1411,32 @@ export class Controller {
       const status = applied.status as
         | { observedGeneration?: number; readyReplicas?: number; replicas?: number }
         | undefined;
-      ready &&=
+      const deploymentReady =
         status?.observedGeneration === applied.metadata.generation &&
         (status?.readyReplicas ?? 0) === spec.replicas &&
         (spec.replicas !== 0 || (status?.replicas ?? 0) === 0);
+      ready &&= deploymentReady;
+      if (!deploymentReady && spec.replicas !== 0) failure ??= deploymentFailure(applied);
     }
-    return ready;
+    return ready ? { ready } : { ready, ...(failure ? { failure } : {}) };
   }
 
   private async updateBackingServiceStatus(
     service: BackingService,
     tenant: Tenant,
     cls: BackingServiceClass,
-    ready: boolean,
+    { ready, failure }: { ready: boolean; failure?: DeploymentFailure },
   ): Promise<void> {
+    const suspended = tenant.spec.suspended;
     await this.status(
       service,
-      ready && !tenant.spec.suspended,
-      tenant.spec.suspended ? 'Suspended' : ready ? 'Ready' : 'Provisioning',
-      tenant.spec.suspended
+      ready && !suspended,
+      suspended ? 'Suspended' : ready ? 'Ready' : (failure?.reason ?? 'Provisioning'),
+      suspended
         ? 'Tenant suspended; backing service scaled down'
         : ready
           ? 'Backing service deployment is ready'
-          : 'Waiting for backing service deployment',
+          : (failure?.message ?? 'Waiting for backing service deployment'),
       {
         runtimeNamespace: names(tenant.metadata.name).runtimeNamespace,
         classRef: {

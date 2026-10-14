@@ -365,6 +365,55 @@ function tenantNameFromNamespace(namespace: string | undefined): string | undefi
   return namespace.slice('di-tenant-'.length);
 }
 
+/** Why a backing-service Deployment cannot become ready, read from its status conditions. */
+interface DeploymentFailure {
+  reason: string;
+  message: string;
+}
+
+/**
+ * Report a Deployment failure that will not resolve by waiting, e.g. a ResourceQuota
+ * or admission rejection (`ReplicaFailure`/`FailedCreate`) or an exceeded progress
+ * deadline. Returns `undefined` while the rollout is merely in progress.
+ */
+function deploymentFailure(deployment: Resource): DeploymentFailure | undefined {
+  const status = deployment.status as
+    | {
+        observedGeneration?: number;
+        conditions?: { type?: string; status?: string; reason?: string; message?: string }[];
+      }
+    | undefined;
+  const generation = deployment.metadata.generation;
+  if (
+    generation !== undefined &&
+    status?.observedGeneration !== undefined &&
+    status.observedGeneration !== generation
+  )
+    return undefined;
+  const conditions = status?.conditions ?? [];
+  const name = deployment.metadata.name;
+  const replicaFailure = conditions.find((c) => c.type === 'ReplicaFailure' && c.status === 'True');
+  if (replicaFailure)
+    return {
+      reason: replicaFailure.reason || 'ReplicaFailure',
+      message: `Backing service deployment ${name} cannot create pods: ${
+        replicaFailure.message || 'replica creation failed'
+      }`,
+    };
+  const progressing = conditions.find(
+    (c) =>
+      c.type === 'Progressing' && c.status === 'False' && c.reason === 'ProgressDeadlineExceeded',
+  );
+  if (progressing)
+    return {
+      reason: 'ProgressDeadlineExceeded',
+      message: `Backing service deployment ${name} did not become ready: ${
+        progressing.message || 'progress deadline exceeded'
+      }`,
+    };
+  return undefined;
+}
+
 export {
   backendDeploymentResources,
   backingLabels,
@@ -372,6 +421,8 @@ export {
   backingServiceResourceName,
   backingServiceResources,
   CAPABILITY,
+  type DeploymentFailure,
+  deploymentFailure,
   endpointFor,
   mergeSizing,
   PROVIDER_RUNTIME,

@@ -3,6 +3,7 @@ import {
   backingServiceHostPath,
   backingServiceResourceName,
   backingServiceResources,
+  deploymentFailure,
   mergeSizing,
   PROVIDER_RUNTIME,
   parseCpu,
@@ -371,6 +372,153 @@ describe('backing service reconciliation', () => {
     expect(api.objects.has('/api/v1/namespaces/di-runtime-alpha/secrets/di-bs-stock-conn')).toBe(
       true,
     );
+  });
+
+  it('surfaces a quota rejection of the deployment instead of Provisioning, then recovers', async () => {
+    const { api, controller, t, classes } = prepare();
+    const stock = backingService('stock', 'keyvalue');
+    api.seed(stock);
+    const quota =
+      'pods "di-bs-stock-5dffdb6d9-abcde" is forbidden: exceeded quota: di-runtime-quota, ' +
+      'requested: limits.cpu=250m, used: limits.cpu=2, limited: limits.cpu=2';
+    const original = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      const result = await original<T>(method, path, body);
+      if (method === 'PATCH' && path.includes('/deployments/di-bs-stock')) {
+        (result as Resource).status = {
+          observedGeneration: 1,
+          replicas: 0,
+          readyReplicas: 0,
+          conditions: [
+            { type: 'Progressing', status: 'True', reason: 'NewReplicaSetCreated' },
+            { type: 'ReplicaFailure', status: 'True', reason: 'FailedCreate', message: quota },
+          ],
+        };
+      }
+      return result;
+    };
+    await controller.reconcileBackingService(stock, t, classes);
+    expect(stock.status?.conditions?.[0]).toMatchObject({
+      type: 'Ready',
+      status: 'False',
+      reason: 'FailedCreate',
+      message: `Backing service deployment di-bs-stock cannot create pods: ${quota}`,
+    });
+    expect(stock.status?.endpoint).toMatchObject({ port: 6379 });
+
+    // Quota freed: the deployment rolls out and the condition flips to Ready.
+    api.call = original;
+    await controller.reconcileBackingService(stock, t, classes);
+    expect(stock.status?.conditions?.[0]).toMatchObject({
+      type: 'Ready',
+      status: 'True',
+      reason: 'Ready',
+      message: 'Backing service deployment is ready',
+    });
+  });
+
+  it('surfaces an exceeded progress deadline with the runtime message', async () => {
+    const { api, controller, t, classes } = prepare();
+    const bus = backingService('bus', 'messaging');
+    api.seed(bus);
+    const original = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      const result = await original<T>(method, path, body);
+      if (method === 'PATCH' && path.includes('/deployments/di-bs-bus')) {
+        (result as Resource).status = {
+          observedGeneration: 1,
+          replicas: 1,
+          readyReplicas: 0,
+          conditions: [
+            {
+              type: 'Progressing',
+              status: 'False',
+              reason: 'ProgressDeadlineExceeded',
+              message: 'ReplicaSet "di-bs-bus-7c9" has timed out progressing.',
+            },
+          ],
+        };
+      }
+      return result;
+    };
+    await controller.reconcileBackingService(bus, t, classes);
+    expect(bus.status?.conditions?.[0]).toMatchObject({
+      status: 'False',
+      reason: 'ProgressDeadlineExceeded',
+      message:
+        'Backing service deployment di-bs-bus did not become ready: ReplicaSet "di-bs-bus-7c9" has timed out progressing.',
+    });
+  });
+
+  it('keeps Suspended when a scaled-down deployment still reports an old failure', async () => {
+    const { api, controller, t, classes } = prepare();
+    const stock = backingService('stock', 'keyvalue');
+    api.seed(stock);
+    t.spec.suspended = true;
+    const original = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      const result = await original<T>(method, path, body);
+      if (method === 'PATCH' && path.includes('/deployments/di-bs-stock')) {
+        (result as Resource).status = {
+          observedGeneration: 1,
+          replicas: 1,
+          conditions: [{ type: 'ReplicaFailure', status: 'True', reason: 'FailedCreate' }],
+        };
+      }
+      return result;
+    };
+    await controller.reconcileBackingService(stock, t, classes);
+    expect(stock.status?.conditions?.[0]).toMatchObject({ status: 'False', reason: 'Suspended' });
+  });
+
+  it('reads deployment failures only from current, non-transient conditions', () => {
+    const deployment = (status: Record<string, unknown>, generation = 1): Resource => ({
+      apiVersion: 'apps/v1',
+      kind: 'Deployment',
+      metadata: { name: 'di-bs-stock', generation },
+      spec: { replicas: 1 },
+      status,
+    });
+    expect(deploymentFailure(deployment({}))).toBeUndefined();
+    expect(
+      deploymentFailure(
+        deployment({
+          observedGeneration: 1,
+          conditions: [{ type: 'Progressing', status: 'True', reason: 'ReplicaSetUpdated' }],
+        }),
+      ),
+    ).toBeUndefined();
+    // A failure recorded for an older generation is stale until the controller observes the new spec.
+    expect(
+      deploymentFailure(
+        deployment(
+          {
+            observedGeneration: 1,
+            conditions: [{ type: 'ReplicaFailure', status: 'True', reason: 'FailedCreate' }],
+          },
+          2,
+        ),
+      ),
+    ).toBeUndefined();
+    expect(
+      deploymentFailure(deployment({ conditions: [{ type: 'ReplicaFailure', status: 'True' }] })),
+    ).toEqual({
+      reason: 'ReplicaFailure',
+      message: 'Backing service deployment di-bs-stock cannot create pods: replica creation failed',
+    });
+    expect(
+      deploymentFailure(
+        deployment({
+          conditions: [
+            { type: 'Progressing', status: 'False', reason: 'ProgressDeadlineExceeded' },
+          ],
+        }),
+      ),
+    ).toEqual({
+      reason: 'ProgressDeadlineExceeded',
+      message:
+        'Backing service deployment di-bs-stock did not become ready: progress deadline exceeded',
+    });
   });
 
   it('reconciles BackingServices during tick alongside tenants', async () => {
