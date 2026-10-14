@@ -26,8 +26,10 @@ import {
 } from './tenancy';
 import { tenantListerFromKubeconfig, warnRemovedTenants } from './tenancy/removal';
 import {
+  assertRuntimeNatsConfig,
   assertTenantAuthConfig,
   names,
+  type RuntimeNatsConfig,
   type TenantAuthConfig,
   tenantAuthRoutes,
   userTokenSecretName,
@@ -54,6 +56,13 @@ export interface PlatformArgs {
   registry?: boolean;
   registryNodePort?: number;
   storageRoot?: string;
+  /**
+   * JetStream storage caps of each tenant's runtime data-plane NATS (`di-nats`, #160): binary
+   * quantities `maxFileStore` (default `10Gi`) and `maxMemoryStore` (default `32Mi`, at most
+   * `64Mi`, half the 128Mi container limit). Validated before deploy. Defaults to config
+   * `runtimeNats`.
+   */
+  runtimeNats?: RuntimeNatsConfig;
   /**
    * Plain-HTTP registries. The platform host group runs `--allow-insecure-registries`; tenant
    * hosts get `--insecure-registry` for the platform registry (with `registry`) and for each of
@@ -135,6 +144,8 @@ export function createPlatform(args: PlatformArgs) {
   assertHostImageSupportsAllowlist(tenantHostImage, insecureRegistries);
   const tenantAuth = config.getObject<TenantAuthConfig>('tenantAuth');
   assertTenantAuthConfig(tenantAuth);
+  const runtimeNats = args.runtimeNats ?? config.getObject<RuntimeNatsConfig>('runtimeNats');
+  assertRuntimeNatsConfig(runtimeNats);
   const backingServiceClasses = resolveBackingServiceClasses(config);
   if (args.apiServer !== undefined && args.kubeconfig === undefined)
     throw new Error('createPlatform: apiServer requires kubeconfig (the one provider uses)');
@@ -364,6 +375,7 @@ export function createPlatform(args: PlatformArgs) {
     backingServiceClasses,
     routeUrlPattern,
     tenantAuth,
+    runtimeNats,
   });
   // Warn before Pulumi deletes a Tenant that has no entry and whose live policy is Retain (#228).
   // Skipped without `kubeconfig`: the program has no way to read the cluster then.
