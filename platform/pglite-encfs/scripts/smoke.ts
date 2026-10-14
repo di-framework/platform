@@ -9,9 +9,13 @@
  *      KCV, and no plaintext row, catalog or config string (present in a
  *      plaintext control directory) or key material appears.
  *   4. Wrong, missing and invalid keys and a legacy plaintext directory are
- *      refused cleanly, leaving the tree byte-identical.
+ *      refused cleanly, leaving the tree byte-identical. The root probe
+ *      (tests/root-probe) checks that the root reopened as `.`, `pglite/..` or
+ *      through a symlink keeps the marker hidden and out of reach (#207).
  *   5. Power-loss torn writes (the spike's cases) keep fsynced commits.
- *   6. Rotation re-wraps every header, resumes after a crash before the
+ *   6. Rotation re-wraps every header, including encfs files fsck moved into
+ *      lost+found (fragments there are left and reported), names a stub that
+ *      stops it by its path from the root, resumes after a crash before the
  *      marker flips, and then refuses the old key.
  *   7. Codecs (#206). Two variants are built: the default (publishes; writes
  *      codec 2, so a rollback to it stays possible) and `write-codec-3`.
@@ -37,7 +41,7 @@ import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { $ } from 'bun';
 import { build } from './build.ts';
-import { type Context, logger, run, WASM_FILE } from './lib/env.ts';
+import { type Context, logger, RUST_TARGET, run, WASM_FILE } from './lib/env.ts';
 import { tearFirstRewrite, tearLastWrite } from './lib/tear.ts';
 import { compositionProblems, worldItems } from './lib/wit.ts';
 
@@ -154,11 +158,28 @@ class Harness {
     return output;
   }
 
+  /** Run the root probe (tests/root-probe) plugged onto encfs; it must report ok. */
+  async probe(composed: string, dataDir: string, keys: Keys): Promise<void> {
+    const { output, code, name } = await this.exec(
+      composed,
+      dataDir,
+      'root-probe',
+      keys,
+      'probe()',
+    );
+    if (code !== 0 || !output.includes('root-probe ok')) {
+      console.error(output.split('\n').slice(-60).join('\n'));
+      throw new Error(`${name}: exit ${code}, expected root-probe ok`);
+    }
+    log('root-probe: every descriptor naming the root keeps the marker guard');
+  }
+
   private async exec(
     composed: string,
     dataDir: string | null,
     mode: string,
     keys: Keys,
+    invoke?: string,
   ): Promise<{ output: string; code: number; name: string; signal: string | null }> {
     const args = ['wasmtime', 'run'];
     if (dataDir) args.push('--dir', `${dataDir}::/data`);
@@ -174,6 +195,7 @@ class Harness {
       env.DI_PGLITE_KEY_PREVIOUS = keys.previous;
       args.push('--env', 'DI_PGLITE_KEY_PREVIOUS');
     }
+    if (invoke) args.push('--invoke', invoke);
     args.push(composed);
     const proc = Bun.spawn(args, { env, stdout: 'pipe', stderr: 'pipe', timeout: RUN_TIMEOUT_MS });
     const [stdout, stderr, code] = await Promise.all([
@@ -422,6 +444,25 @@ async function composeWith(smokeDir: string, pglite: string, encfs: string, cons
   return out;
 }
 
+/**
+ * Build tests/root-probe and plug `encfs` into it. The probe drives encfs's
+ * wasi:filesystem export directly, which pglite cannot be made to do (#207).
+ */
+async function composeProbe(ctx: Context, smokeDir: string, encfs: string): Promise<string> {
+  const probeDir = join(ctx.pkgDir, 'tests', 'root-probe');
+  const targetDir = join(ctx.pkgDir, 'target', 'root-probe');
+  await $`cargo build --locked --release --target ${RUST_TARGET}`
+    .cwd(probeDir)
+    .env({ ...ctx.env, CARGO_TARGET_DIR: targetDir });
+  const core = join(targetDir, RUST_TARGET, 'release', 'pglite_encfs_root_probe.wasm');
+  const probe = join(smokeDir, 'root-probe.wasm');
+  const out = join(smokeDir, 'root-probe-enc.wasm');
+  await $`wasm-tools component new ${core} -o ${probe}`;
+  await $`wac plug --plug ${encfs} ${probe} -o ${out}`;
+  await $`wasm-tools validate --features all ${out}`;
+  return out;
+}
+
 export async function smoke(ctx: Context): Promise<void> {
   for (const tool of ['wasmtime', 'wac', 'wasm-tools']) {
     if (!Bun.which(tool, { PATH: ctx.env.PATH })) throw new Error(`${tool} not found on PATH`);
@@ -445,6 +486,7 @@ export async function smoke(ctx: Context): Promise<void> {
   const encfs3 = await build(ctx, { writeCodec3: true, outDir: join(smokeDir, 'codec3') });
   const composedDefault = await compose(ctx, smokeDir, pglite, encfs, 'default', 2);
   const composed = await compose(ctx, smokeDir, pglite, encfs3, 'codec3', 3);
+  const rootProbe = await composeProbe(ctx, smokeDir, encfs3);
 
   // Standard base64 for A, unpadded base64url for B: both alphabets are accepted.
   const rawA = randomBytes(32);
@@ -544,6 +586,14 @@ export async function smoke(ctx: Context): Promise<void> {
     await writeFile(autoConf, savedConf);
     await h.run(enc, data, 'marker-read', A, 'marker-read ok');
 
+    // The root reopened as `.`, `pglite/..` or through a symlink keeps the
+    // marker hidden and out of reach (#207); the probe leaves the tree as it was.
+    const beforeProbe = await treeHash(data);
+    await h.probe(rootProbe, data, A);
+    if ((await treeHash(data)) !== beforeProbe) throw new Error('the root probe changed the tree');
+    if ((await readdir(data)).includes('root-probe-loop'))
+      throw new Error('the root probe left its symlink behind');
+
     // A crash while creating a file (#201 review W1): the new relation files'
     // size is durable but their header is not (zeroed, or cut short). They hold
     // no data, so they are re-sealed and WAL redo rebuilds the table.
@@ -601,13 +651,32 @@ export async function smoke(ctx: Context): Promise<void> {
     await rm(s1, { recursive: true, force: true });
     await rm(s2, { recursive: true, force: true });
 
+    // A stub stops a rotation, and the log names it by its path from the root:
+    // relation file names repeat across databases (#207). On a copy, so the
+    // partial sweep does not touch the directory rotated below.
+    const stubbed = await snapshot(data, join(work, 'stubbed'));
+    await writeFile(join(stubbed, 'pglite', 'data', 'base', '1', '99999'), 'stub');
+    await h.fails(
+      enc,
+      stubbed,
+      'marker-read',
+      { current: keyB, previous: keyA },
+      'pglite/data/base/1/99999: no encryption header; refusing',
+      /^marker-read ok$/,
+    );
+    await rm(stubbed, { recursive: true, force: true });
+
     // Rotation A -> B: one start with both keys re-wraps every header, then flips the marker.
-    // fsck fragments in the root's lost+found are not encfs files; the sweep
-    // leaves them alone instead of aborting (#207).
-    const fragment = join(data, 'lost+found', '#131073');
+    // The root's lost+found is swept best-effort (#207): an encfs file fsck
+    // reconnected there is re-wrapped, a fragment is left as it was and
+    // reported, and neither aborts the rotation.
+    const lostAndFound = join(data, 'lost+found');
+    const fragment = join(lostAndFound, '#131073');
     const fragmentBytes = Buffer.from('fsck fragment, not an encfs file\n');
-    await mkdir(join(data, 'lost+found'), { recursive: true });
+    const recovered = join(lostAndFound, '#131074');
+    await mkdir(lostAndFound, { recursive: true });
     await writeFile(fragment, fragmentBytes);
+    await cp(join(data, 'pglite', 'data', 'PG_VERSION'), recovered);
     const rotated = await h.run(
       enc,
       data,
@@ -619,8 +688,18 @@ export async function smoke(ctx: Context): Promise<void> {
     if (count < headers)
       throw new Error(`rotation re-wrapped ${count} of at least ${headers} files`);
     if (!(await readFile(fragment)).equals(fragmentBytes))
-      throw new Error('rotation changed a file in lost+found');
-    await rm(join(data, 'lost+found'), { recursive: true, force: true });
+      throw new Error('rotation changed a fragment in lost+found');
+    if (!(await readFile(recovered)).subarray(32, 48).equals(keyCheckValue(keyB)))
+      throw new Error('rotation left a recovered encfs file in lost+found under the old key');
+    if (!rotated.includes('lost+found/#131073: left as it was during key rotation'))
+      throw new Error('rotation did not report the fragment it left in lost+found');
+    if (
+      !rotated.includes(
+        'left 1 entries in lost+found as they were; DI_PGLITE_KEY_PREVIOUS can be removed',
+      )
+    )
+      throw new Error('rotation summary does not count the lost+found entries it left');
+    await rm(lostAndFound, { recursive: true, force: true });
     const afterRotation = await assertEncrypted(data, keyCheckValue(keyB), raw);
     log(`rotation re-wrapped ${count} file keys; ${afterRotation} headers now under key B`);
     await h.run(enc, data, 'marker-read', B, 'marker-read ok');

@@ -16,20 +16,20 @@ pub const MARKER_TMP_NAME: &str = ".di-encfs.tmp";
 pub const MARKER_MAGIC: &[u8; 8] = b"DIPGKEY1";
 pub const MARKER_LEN: usize = MARKER_MAGIC.len() + KCV_LEN;
 
-/// Entries that do not make a root "non-empty": ext4 volume roots (PVCs)
-/// always carry `lost+found`, and the marker files are ours.
+/// The directory ext4 volume roots (PVCs) always carry. fsck reconnects
+/// orphaned inodes there, so on an encrypted volume it can hold sealed files
+/// as well as fragments; see [`crate::rotation`].
+pub const LOST_AND_FOUND: &str = "lost+found";
+
+/// Entries that do not make a root "non-empty": `lost+found`, and the marker
+/// files, which are ours.
 pub fn is_volume_metadata(name: &str) -> bool {
-    name == "lost+found" || is_marker_name(name)
+    name == LOST_AND_FOUND || is_marker_name(name)
 }
 
-fn is_marker_name(name: &str) -> bool {
+/// The marker or its temporary file.
+pub fn is_marker_name(name: &str) -> bool {
     name == MARKER_NAME || name == MARKER_TMP_NAME
-}
-
-/// Whether the rotation sweep leaves a root entry alone: the marker files, and
-/// `lost+found`, which holds fsck fragments rather than encrypted files (#207).
-pub fn is_skipped_by_rotation(name: &str, at_root: bool) -> bool {
-    at_root && is_volume_metadata(name)
 }
 
 /// The components of `path`, relative to a preopen root, with `.`, `..` and
@@ -313,19 +313,6 @@ mod tests {
             "lost+found",
         ] {
             assert!(!is_root_path(path), "{path}");
-        }
-    }
-
-    #[test]
-    fn rotation_skips_markers_and_lost_and_found_only_at_the_root() {
-        // #207: fsck fragments in lost+found are not encfs files and must not
-        // abort a rotation.
-        for name in ["lost+found", MARKER_NAME, MARKER_TMP_NAME] {
-            assert!(is_skipped_by_rotation(name, true), "{name}");
-            assert!(!is_skipped_by_rotation(name, false), "{name}");
-        }
-        for name in ["pglite", "PG_VERSION", "lost+found2"] {
-            assert!(!is_skipped_by_rotation(name, true), "{name}");
         }
     }
 

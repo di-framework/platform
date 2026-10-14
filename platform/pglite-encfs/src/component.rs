@@ -56,6 +56,7 @@ use crate::header::{
 };
 use crate::keys::{is_key_variable, Kek, KeyRing};
 use crate::marker::{self, Lock, RootDecision, MARKER_LEN, MARKER_NAME, MARKER_TMP_NAME};
+use crate::rotation;
 
 type R<T> = Result<T, ErrorCode>;
 
@@ -430,12 +431,10 @@ fn open_root(dir: &hfs::Descriptor) -> Result<(), ErrorCode> {
                 current_key(&state)?,
                 state.keys.previous().ok_or(ErrorCode::Access)?,
             );
-            let count = rewrap_tree(dir, previous, current, true)?;
+            let sweep = rewrap_tree(dir, previous, current)?;
             dir.sync().map_err(host)?;
             write_marker(dir, current)?;
-            log(&format!(
-                "key rotation complete: re-wrapped {count} file keys; DI_PGLITE_KEY_PREVIOUS can be removed"
-            ));
+            log(&sweep.completion_message());
             Ok(())
         }
         RootDecision::Locked(lock) => {
@@ -496,65 +495,102 @@ fn write_marker(dir: &hfs::Descriptor, kek: &Kek) -> R<()> {
     dir.sync().map_err(host)
 }
 
-/// Re-wrap every file header under `from` to `to`; returns how many changed.
-/// Headers already under `to` are skipped, so an interrupted sweep resumes.
-/// The markers and the root's `lost+found` (fsck fragments, never encfs
-/// files) are not visited.
-fn rewrap_tree(dir: &hfs::Descriptor, from: &Kek, to: &Kek, root: bool) -> R<usize> {
-    let mut count = 0;
-    let entries = dir.read_directory().map_err(host)?;
-    while let Some(entry) = entries.read_directory_entry().map_err(host)? {
-        if marker::is_skipped_by_rotation(&entry.name, root) {
-            continue;
-        }
-        match entry.type_ {
-            hfs::DescriptorType::Directory => {
-                let sub = dir
-                    .open_at(
-                        hfs::PathFlags::empty(),
-                        &entry.name,
-                        hfs::OpenFlags::DIRECTORY,
-                        hfs::DescriptorFlags::READ,
-                    )
-                    .map_err(host)?;
-                count += rewrap_tree(&sub, from, to, false)?;
-            }
-            hfs::DescriptorType::RegularFile => {
-                let file = dir
-                    .open_at(
-                        hfs::PathFlags::empty(),
-                        &entry.name,
-                        hfs::OpenFlags::empty(),
-                        hfs::DescriptorFlags::READ | hfs::DescriptorFlags::WRITE,
-                    )
-                    .map_err(host)?;
-                let physical = file.stat().map_err(host)?.size;
-                if physical == 0 {
-                    continue;
-                }
-                let start = read_header(&file).map_err(host)?;
-                // A file left fresh by a crash has no key to re-wrap.
-                let header =
-                    match classify(&start, physical).map_err(|e| header_error(&entry.name, e))? {
-                        HeaderState::Fresh => continue,
-                        HeaderState::Sealed(header) => header,
-                    };
-                if to.matches(header.kcv()) {
-                    continue;
-                }
-                let rewrapped = header
-                    .rewrap(from, to, &random())
-                    .map_err(|e| header_error(&entry.name, e))?;
-                HostStorage(&file)
-                    .write_at(0, rewrapped.as_bytes())
-                    .map_err(host)?;
-                file.sync().map_err(host)?;
-                count += 1;
-            }
-            _ => {}
+/// Lines logged for entries a rotation left in `lost+found`, before a summary.
+const SKIPPED_LOG_LIMIT: usize = 50;
+
+/// Run the rotation sweep (see [`crate::rotation`]) over a preopen root.
+fn rewrap_tree(dir: &hfs::Descriptor, from: &Kek, to: &Kek) -> R<rotation::Sweep> {
+    let sweep = rotation::rewrap_tree(&HostDir::Borrowed(dir), from, to, &mut || random())
+        .map_err(|error| match error {
+            rotation::SweepError::Host(error) => host(error),
+            rotation::SweepError::Header { path, error } => header_error(&path, error),
+        })?;
+    for skipped in sweep.skipped.iter().take(SKIPPED_LOG_LIMIT) {
+        log(&format!(
+            "{}: left as it was during key rotation: {}",
+            skipped.path,
+            skipped.reason.describe()
+        ));
+    }
+    if sweep.skipped.len() > SKIPPED_LOG_LIMIT {
+        log(&format!(
+            "... and {} more entries in {} left as they were",
+            sweep.skipped.len() - SKIPPED_LOG_LIMIT,
+            marker::LOST_AND_FOUND
+        ));
+    }
+    Ok(sweep)
+}
+
+/// A host directory for the rotation sweep: the preopen itself, or one it opened.
+enum HostDir<'a> {
+    Borrowed(&'a hfs::Descriptor),
+    Owned(hfs::Descriptor),
+}
+
+impl HostDir<'_> {
+    fn get(&self) -> &hfs::Descriptor {
+        match self {
+            HostDir::Borrowed(dir) => dir,
+            HostDir::Owned(dir) => dir,
         }
     }
-    Ok(count)
+}
+
+impl rotation::Dir for HostDir<'_> {
+    type Error = hfs::ErrorCode;
+    type File = hfs::Descriptor;
+
+    fn entries(&self) -> Result<Vec<(String, rotation::EntryType)>, hfs::ErrorCode> {
+        let stream = self.get().read_directory()?;
+        let mut entries = Vec::new();
+        while let Some(entry) = stream.read_directory_entry()? {
+            let kind = match entry.type_ {
+                hfs::DescriptorType::Directory => rotation::EntryType::Directory,
+                hfs::DescriptorType::RegularFile => rotation::EntryType::RegularFile,
+                _ => rotation::EntryType::Other,
+            };
+            entries.push((entry.name, kind));
+        }
+        Ok(entries)
+    }
+
+    fn open_dir(&self, name: &str) -> Result<Self, hfs::ErrorCode> {
+        self.get()
+            .open_at(
+                hfs::PathFlags::empty(),
+                name,
+                hfs::OpenFlags::DIRECTORY,
+                hfs::DescriptorFlags::READ,
+            )
+            .map(HostDir::Owned)
+    }
+
+    fn open_file(&self, name: &str) -> Result<hfs::Descriptor, hfs::ErrorCode> {
+        self.get().open_at(
+            hfs::PathFlags::empty(),
+            name,
+            hfs::OpenFlags::empty(),
+            hfs::DescriptorFlags::READ | hfs::DescriptorFlags::WRITE,
+        )
+    }
+}
+
+impl rotation::File for hfs::Descriptor {
+    type Error = hfs::ErrorCode;
+
+    fn physical_size(&self) -> Result<u64, hfs::ErrorCode> {
+        Ok(self.stat()?.size)
+    }
+
+    fn read_start(&self) -> Result<Vec<u8>, hfs::ErrorCode> {
+        read_header(self)
+    }
+
+    fn write_header(&self, header: &Header) -> Result<(), hfs::ErrorCode> {
+        HostStorage(self).write_at(0, header.as_bytes())?;
+        self.sync()
+    }
 }
 
 // ------------------------------------------------------------------ resources
