@@ -158,8 +158,12 @@ describe('W6: the held-replicas ledger is out of tenant reach and checked anyway
       ['stranger', entry(), 'not-a-source'],
       ['auth', entry(), 'reserved'],
       ['di-tenant-registry', entry(), 'reserved'],
-      ['identity', entry({ destination: 'elsewhere' }), 'destination'],
       ['identity', entry({ destination: undefined }), 'destination'],
+      ['identity', entry({ destination: 'Not/A.Name' }), 'destination'],
+      // Gone, and the workload is not one the operator could have stopped (#254).
+      ['stranger', entry({ destination: 'elsewhere' }), 'destination'],
+      ['ghost', entry({ destination: 'elsewhere' }), 'destination'],
+      ['auth', entry({ destination: 'elsewhere' }), 'reserved'],
       ['identity', entry({ replicas: MAX_HELD_REPLICAS + 1 }), 'replicas'],
       ['identity', entry({ replicas: -1 }), 'replicas'],
       ['identity', entry({ replicas: 1.5 }), 'replicas'],
@@ -174,9 +178,11 @@ describe('W6: the held-replicas ledger is out of tenant reach and checked anyway
         ...world,
         ledger: { resourceVersion: '5', entries: { [name]: held } },
       });
-      // Dropped from the ledger, never scaled.
+      // Dropped from the ledger, never scaled, and said so after the drop lands (#254).
       expect(scaled(actions)).toEqual([]);
-      expect(actions).toEqual([{ type: 'ledger', set: { [name]: null }, resourceVersion: '5' }]);
+      expect(actions.map((action) => action.type)).toEqual(['ledger', 'log', 'event']);
+      expect(actions[0]).toEqual({ type: 'ledger', set: { [name]: null }, resourceVersion: '5' });
+      expect(actions[2]).toMatchObject({ eventType: 'Warning', reason: 'HeldReplicasDropped' });
     }
     // The one the operator would write: a source of an existing destination, within bounds.
     expect(heldEntryProblem(world, 'identity', entry())).toBeUndefined();

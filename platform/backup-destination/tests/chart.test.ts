@@ -218,6 +218,59 @@ describe('backup-destination chart', () => {
     expect(destinations(both.stdout).match(/schedule: "\*\/15 1-5 \* \* 1-3"/g)?.length).toBe(2);
   });
 
+  test('schedules are written trimmed and held to the CRD maxLength (#254 S1, S2)', async () => {
+    const base = { bucket: 'b', existingSecret: 's', 'sources[0].workloadName': 'identity' };
+    const padded = await template('di-tenant-alpha', {
+      ...base,
+      schedule: '  0 2 * * *  ',
+      'sources[0].schedule': ' 30 3 * * * ',
+    });
+    expect(padded.stderr).toBe('');
+    expect(padded.code).toBe(0);
+    const written = destinations(padded.stdout);
+    expect(written).toContain('schedule: "0 2 * * *"\n');
+    expect(written).toContain('- kind: workload-volume\n      schedule: 30 3 * * *\n');
+    const paddedNone = await template('di-tenant-alpha', {
+      ...base,
+      'sources[0].schedule': ' none ',
+    });
+    expect(destinations(paddedNone.stdout)).toContain('      schedule: none\n');
+    // Every value the chart writes matches the CRD pattern, so `kubectl apply` cannot refuse it.
+    const crd = await Bun.file(`${import.meta.dir}/../chart/crds/backups.yaml`).text();
+    const pattern = new RegExp(/pattern: '(\^\(none\|[^']+)'/.exec(crd)?.[1] ?? '$^');
+    for (const value of written.matchAll(/schedule: "?([^"\n]+)"?\n/g)) {
+      expect(pattern.test(value[1] ?? '')).toBe(true);
+    }
+    // 128 characters is the CRD limit, for the destination and every source.
+    const longest = `10${',0'.repeat(59)} * * * *`;
+    const tooLong = `0${',0'.repeat(60)} * * * *`;
+    expect([longest.length, tooLong.length]).toEqual([128, 129]);
+    const fits = await template('di-tenant-alpha', {
+      ...base,
+      schedule: longest,
+      'sources[0].schedule': ` ${longest} `,
+    });
+    expect(fits.stderr).toBe('');
+    expect(fits.code).toBe(0);
+    const destinationLong = await template('di-tenant-alpha', {
+      ...base,
+      schedule: tooLong,
+      'sources[0].schedule': 'none',
+    });
+    expect(destinationLong.code).not.toBe(0);
+    expect(destinationLong.stderr).toContain(
+      'schedule must be at most 128 characters (it has 129)',
+    );
+    const sourceLong = await template('di-tenant-alpha', {
+      ...base,
+      'sources[0].schedule': tooLong,
+    });
+    expect(sourceLong.code).not.toBe(0);
+    expect(sourceLong.stderr).toContain(
+      'source identity: schedule must be at most 128 characters (it has 129)',
+    );
+  }, 30000);
+
   test('the CRD describes schedule without a default', async () => {
     const text = await Bun.file(`${import.meta.dir}/../chart/crds/backups.yaml`).text();
     expect(text).toContain('There is no default');
@@ -333,6 +386,10 @@ describe('backup-destination chart', () => {
     );
     expect(runtime).toContain('resources: ["configmaps"]\n    verbs: ["create"]');
     expect(tenant).not.toContain('configmaps');
+    // Ledger Events (#254) are created where the ledger is, and nowhere else.
+    expect(runtime).toContain('resources: ["events"]\n    verbs: ["create"]');
+    expect(tenant).not.toContain('events');
+    expect(rendered.stdout.match(/resources: \["events"\]/g)?.length).toBe(1);
     expect(tenant).toContain(
       'resources: ["leases"]\n    resourceNames: ["di-backup-operator"]\n    verbs: ["get", "patch"]',
     );

@@ -35,6 +35,14 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      # The prototype Pulumi program is outside the root tsconfig; Pulumi's runtime type-checks it
+      # with ts-node and its own TypeScript 5 install, so check it the same way (#251).
+      - name: Typecheck backup prototype Pulumi program
+        working-directory: platform/backup-destination/prototype
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          ./node_modules/.bin/tsc --noEmit -p .
+
       - name: Lint
         run: bun run lint
 
