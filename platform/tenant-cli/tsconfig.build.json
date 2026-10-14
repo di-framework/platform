@@ -9,5 +9,5 @@
     "allowImportingTsExtensions": false,
     "rewriteRelativeImportExtensions": true
   },
-  "include": ["src/main.ts", "src/client/index.ts"]
+  "include": ["src/main.ts", "src/client/index.ts", "src/testing/index.ts"]
 }
