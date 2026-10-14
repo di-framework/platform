@@ -1284,6 +1284,78 @@ describe('reconcileTenant with tenant-auth', () => {
     expect(api.objects.get(caKeyPath)).toBeUndefined();
   });
 
+  /** A controller on a fake clock, `days` after 2026-10-14, and the bundle it publishes. */
+  const clocked = () => {
+    const { api, t } = prepare();
+    const t0 = new Date('2026-10-14T00:00:00Z').getTime();
+    let clock = new Date(t0);
+    const controller = new Controller(api, cfg, undefined, () => clock);
+    const pass = async (days: number) => {
+      clock = new Date(t0 + days * 86_400_000);
+      await controller.reconcileTenant(t, []);
+      return field(must(api, caMapPath).data as Record<string, string>, 'ca.crt');
+    };
+    return { api, pass };
+  };
+
+  it('keeps a CA whose key was lost for at most the overlap, also via tenant-controller-tls', async () => {
+    const { api, pass } = clocked();
+    const a = await pass(0);
+    // The key goes missing 100 days in; A would be valid for years more.
+    const keys = must(api, caKeyPath);
+    keys.data = { 'ca.crt': field(keys.data as Record<string, string>, 'ca.crt') };
+    const replaced = await pass(100);
+    const c = decode(must(api, caKeyPath).data as Record<string, string>, 'ca.crt');
+    expect(c).not.toBe(a);
+    // The leaf A signed keeps verifying while the controller rolls.
+    expect(replaced).toBe(a + c);
+    expect(await pass(100 + CA_OVERLAP_DAYS - 1)).toBe(a + c);
+    expect(await pass(100 + CA_OVERLAP_DAYS + 1)).toBe(c);
+    // Deleting the platform Secret falls back to `ca.crt` in tenant-controller-tls, which is C by
+    // now: A never comes back, and C (keyless there) is again kept for the overlap only.
+    api.objects.delete(caKeyPath);
+    const again = await pass(200);
+    expect(again).not.toContain(a);
+    expect(again.startsWith(c)).toBe(true);
+    expect(await pass(200 + CA_OVERLAP_DAYS + 1)).not.toContain(c);
+  });
+
+  it('revokes a compromised CA at once when both of its Secrets are deleted', async () => {
+    const { api, pass } = clocked();
+    const a = await pass(0);
+    const oldLeaf = decode(must(api, tlsPath).data as Record<string, string>, 'tls.crt');
+    api.objects.delete(caKeyPath);
+    api.objects.delete(tlsPath);
+    const revoked = await pass(100);
+    // No overlap: only the new CA is trusted, and the old leaf no longer verifies anywhere.
+    expect(revoked).not.toContain(a);
+    expect(revoked.match(/BEGIN CERTIFICATE/g)).toHaveLength(1);
+    const keys = must(api, caKeyPath).data as Record<string, string>;
+    expect(Object.keys(keys).sort()).toEqual(['ca.crt', 'ca.key']);
+    expect(decode(keys, 'ca.crt')).toBe(revoked);
+    const tls = must(api, tlsPath).data as Record<string, string>;
+    expect(issuedBy(revoked, decode(tls, 'tls.crt'), decode(tls, 'tls.key'))).toBe(true);
+    expect(verifies(oldLeaf, revoked, new Date('2027-01-22T00:00:00Z'))).toBe(false);
+  });
+
+  it('revokes on a repeated delete when a pass ran between the two deletes (README check)', async () => {
+    const { api, pass } = clocked();
+    const a = await pass(0);
+    api.objects.delete(caKeyPath);
+    // A pass in between treats it as a lost key and keeps A for the overlap ...
+    expect(await pass(1)).toContain(a);
+    api.objects.delete(tlsPath);
+    const between = await pass(1);
+    expect(between.match(/BEGIN CERTIFICATE/g)).toHaveLength(2);
+    expect(between).toContain(a);
+    // ... so the documented check sees two certificates, and deleting both again revokes A.
+    api.objects.delete(caKeyPath);
+    api.objects.delete(tlsPath);
+    const revoked = await pass(1);
+    expect(revoked.match(/BEGIN CERTIFICATE/g)).toHaveLength(1);
+    expect(revoked).not.toContain(a);
+  });
+
   it('rotates the CA near expiry so every party verifies throughout (#170 S4, S8)', async () => {
     const { api, t } = prepare();
     const DAY = 86_400_000;
@@ -1317,7 +1389,7 @@ describe('reconcileTenant with tenant-auth', () => {
     const caCount = (bundle: string) => bundle.match(/BEGIN CERTIFICATE/g)?.length;
     /**
      * A rollout is never atomic: until it finishes, an old or new controller pod (leaf) meets an
-     * old or new host or kubeconfig (bundle). Every pairing must verify, by OpenSSL at that time.
+     * old or new host or kubeconfig (bundle). Every pairing must pass the X.509 path check then.
      */
     const overlaps = (from: State, to: State) => {
       for (const leaf of [from.leaf, to.leaf])

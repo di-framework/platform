@@ -402,7 +402,9 @@ to be done before `pulumi up`:
   a working `tenant-controller-ca-key` whose CA (the `ca.crt` in `tenant-controller-tls`) differs
   from the one in `tenant-controller-ca-<tenant>`, so an older package replaced the CA in between.
   Every host, console and kubeconfig trusts that CA now, so it becomes the current CA unchanged:
-  the bundle, the leaf and the host templates stay as they are and nothing rolls. The stale CA in
+  the bundle, the leaf and the host templates stay as they are, so the hosts and the controller do
+  not roll. The console rolls once, as on the first upgrade, because the older package's console
+  template has no `platform.di-framework.dev/ca-bundle-sha256`. The stale CA in
   `tenant-controller-ca-<tenant>` is dropped, not published again, since nothing trusts it any
   more; the next rotation starts from the adopted CA with the usual overlap.
 - **A `tenant-controller-ca-<tenant>` this installation did not write** (no
@@ -1176,17 +1178,43 @@ tenantAuth:
   A kubeconfig or `--ca-file` holding only the old CA stops verifying at the switch: fetch the
   bundle again (or `login` again) during the 30 days after it is published. The CA is replaced at
   once, with no publish step, only when it cannot sign: its key is missing or does not match it,
-  or it has expired. A published successor that is still usable then takes its place, and the old
-  CA stays in the bundle as `previous.crt` until it expires, so the leaf it signed keeps
-  verifying while the controller rolls. A new CA's key is always stored before the bundle or a
-  leaf names that CA. The controller reads only CA Secrets this installation wrote for the
+  or it has expired. A published successor that is still usable then takes its place. The old
+  CA stays in the bundle as `previous.crt` so the leaf it signed keeps verifying while the
+  controller rolls: until it expires when its successor had been published for it (at most 90
+  days), otherwise only for the 30 days after the replacement CA was created, so a CA whose key
+  went missing (and may have leaked) is not trusted for the rest of its life. Both limits come from
+  the certificates' own dates. A new CA's key is always stored before the bundle or a leaf names
+  that CA. The controller reads only CA Secrets this installation wrote for the
   Tenant (see the upgrade section above). When
   `tenant-controller-ca-<tenant>` is missing the controller falls back to the earlier layout
   (`ca.crt` in `tenant-controller-tls`, `ca.key` in the runtime namespace's
   `tenant-controller-ca-key` if this installation wrote it) and moves it, see
   [Upgrading to tenant controller CAs in the platform namespace](#upgrading-to-tenant-controller-cas-in-the-platform-namespace-170).
   A Secret from before the CA existed (one `CA:TRUE` certificate, no `ca.crt`) is replaced once.
-  The CA has no X.509 name constraints yet (#170).
+  The CA has no X.509 name constraints yet (#365).
+
+  **Revoking a compromised CA.** If a tenant CA key may have leaked, delete both Secrets that hold
+  a copy of the CA certificate, in one go:
+
+  ```sh
+  kubectl -n <platform-namespace> delete secret tenant-controller-ca-<tenant>
+  kubectl -n di-runtime-<tenant> delete secret tenant-controller-tls
+  ```
+
+  With no CA certificate left to carry over, the next pass creates a new CA with no overlap: the
+  bundle in `tenant-controller-ca` holds only the new CA, and the old one is trusted nowhere the
+  platform controls. The hosts, controller and console roll, and every kubeconfig and `--ca-file`
+  needs the new bundle (`login` again). Afterwards, check that the bundle holds exactly one
+  certificate:
+
+  ```sh
+  kubectl -n di-runtime-<tenant> get configmap tenant-controller-ca -o jsonpath='{.data.ca\.crt}' | grep -c 'BEGIN CERTIFICATE'
+  ```
+
+  If it shows `2`, a reconcile pass ran between the two deletes and kept the old CA as
+  `previous.crt`; delete both Secrets again. Deleting only `tenant-controller-ca-<tenant>` is a
+  lost-key replacement, not a revocation: the CA in `tenant-controller-tls` stays trusted for 30
+  days.
 - Routes: when the platform gateway is published (`routeUrlPattern`), a public URL whose host is
   `<label>.{tenant}.localhost` on the gateway port is routed through it, so a new Tenant gets a
   reachable console and controller with no script. `createPlatform` derives every public URL

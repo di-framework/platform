@@ -115,6 +115,32 @@ describe('rotateCas (#170)', () => {
     });
   });
 
+  it('keeps a CA replaced for a lost key for at most the overlap', () => {
+    const a = caCertificate(NAME, CA_DAYS, t0);
+    // The key is lost 100 days in, years before A would expire.
+    const replaced = rotateCas({ current: { cert: a.cert } }, NAME, at(100));
+    expect(replaced.previous).toBe(a.cert);
+    expect(bundle(replaced)).toBe(a.cert + replaced.current.cert);
+    const kept = rotateCas(stored(replaced), NAME, at(100 + CA_OVERLAP_DAYS - 1));
+    expect(kept).toEqual(replaced);
+    const dropped = rotateCas(stored(replaced), NAME, at(100 + CA_OVERLAP_DAYS + 1));
+    expect(dropped).toEqual({ current: replaced.current });
+    expect(bundle(dropped)).not.toContain(a.cert);
+    // Stored again later, it is not taken back.
+    expect(rotateCas(stored(replaced), NAME, at(1000))).toEqual({ current: replaced.current });
+  });
+
+  it('keeps a predecessor until it expires when its successor was published for it', () => {
+    const a = caCertificate(NAME, CA_DAYS, t0);
+    const b = caCertificate(NAME, CA_DAYS, at(CA_DAYS - CA_RENEW_DAYS + 1));
+    // A lost its key during the overlap: the published B takes over, and A stays until it expires
+    // (less than CA_RENEW_DAYS), past the overlap that bounds an unplanned replacement.
+    const promoted = rotateCas({ current: { cert: a.cert }, next: b }, NAME, at(CA_DAYS - 80));
+    expect(promoted).toEqual({ current: b, previous: a.cert });
+    expect(rotateCas(stored(promoted), NAME, at(CA_DAYS - 1))).toEqual(promoted);
+    expect(rotateCas(stored(promoted), NAME, at(CA_DAYS + 1))).toEqual({ current: b });
+  });
+
   it('drops a stored successor whose key does not match, and publishes a new one', () => {
     const a = caCertificate(NAME, CA_DAYS, t0);
     const b = caCertificate(NAME, CA_DAYS, at(CA_DAYS - CA_RENEW_DAYS));
@@ -141,7 +167,7 @@ describe('rotateCas (#170)', () => {
     expect(rotateCas({ current: a, previous: a.cert }, NAME, at(5)).previous).toBeUndefined();
   });
 
-  it('keeps every leaf of a rotation verifiable against each adjacent bundle (OpenSSL)', () => {
+  it('keeps every leaf of a rotation verifiable against each adjacent bundle (X.509 path check)', () => {
     const steps: { at: Date; cas: ControllerCas; leaf: string }[] = [];
     let cas: ControllerCas = { current: caCertificate(NAME, CA_DAYS, t0) };
     let leaf = '';
