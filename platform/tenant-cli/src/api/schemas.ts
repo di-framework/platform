@@ -262,7 +262,7 @@ export const schemas = {
 
   ConfigEntry: {
     type: 'object',
-    description: 'A secret lists its name only; a var also carries its value.',
+    description: 'A var lists its name, value, and update time. Secrets list as `SecretEntry`.',
     properties: {
       name: string,
       value: string,

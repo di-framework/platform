@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'bun:test';
-import { evaluate } from '@marcbachmann/cel-js';
 import {
   admissionResources,
   claimsRegistryHost,
@@ -21,6 +20,7 @@ import {
   VERSION,
 } from '../src/tenancy/resources';
 import { caCertificate, leafCertificate } from '../src/tenancy/tls';
+import { evaluate } from './support/cel';
 
 const controllerUser = 'system:serviceaccount:wasmcloud:di-platform-controller';
 const tenantUser = 'system:serviceaccount:wasmcloud:di-user-dev';

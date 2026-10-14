@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
@@ -13,7 +13,7 @@ import {
   staleNotice,
   tokenConfig,
 } from '../scripts/source-check';
-import { git, sandboxClone, spawnEnv } from './helpers/spawn-env';
+import { git, sandboxClone, sandboxCopy, spawnEnv, stubCommand } from './helpers/spawn-env';
 
 const repo = resolve(import.meta.dir, '..');
 const env = spawnEnv;
@@ -206,28 +206,28 @@ test('the CLI hashes the committed inputs of a real workflow; --force never asks
  * newer commit changes: inside the filter (`src/`) or outside it.
  */
 function behindMain(newer: 'src/a' | 'docs/b') {
-  const { base, origin, work } = sandboxClone('source-check-');
-  writeFileSync(join(work, 'w.yml'), "on:\n  push:\n    paths:\n      - 'src/**'\n");
-  mkdirSync(join(work, 'src'));
-  mkdirSync(join(work, 'docs'));
-  writeFileSync(join(work, 'src/a'), 'one\n');
-  writeFileSync(join(work, 'docs/b'), 'one\n');
-  git(work, 'add', '.');
-  git(work, 'commit', '-q', '-m', 'one');
-  const old = git(work, 'rev-parse', 'HEAD');
-  writeFileSync(join(work, newer), 'two\n');
-  git(work, 'commit', '-q', '-am', 'two');
-  git(work, 'push', '-q', origin, 'HEAD:main');
-  git(work, 'checkout', '-q', '--detach', old);
+  // Built once per `newer` and copied for each test, which still gets a sandbox of its own.
+  const { base, work } = sandboxCopy('source-check-', newer, ({ origin, work }) => {
+    writeFileSync(join(work, 'w.yml'), "on:\n  push:\n    paths:\n      - 'src/**'\n");
+    mkdirSync(join(work, 'src'));
+    mkdirSync(join(work, 'docs'));
+    writeFileSync(join(work, 'src/a'), 'one\n');
+    writeFileSync(join(work, 'docs/b'), 'one\n');
+    git(work, 'add', '.');
+    git(work, 'commit', '-q', '-m', 'one');
+    const old = git(work, 'rev-parse', 'HEAD');
+    writeFileSync(join(work, newer), 'two\n');
+    git(work, 'commit', '-q', '-am', 'two');
+    git(work, 'push', '-q', origin, 'HEAD:main');
+    git(work, 'checkout', '-q', '--detach', old);
+  });
   return { base, work };
 }
 
 /** A PATH with bun and a stub `oras` whose answer is fixed by `script`. */
 function stubOras(base: string, script: string): string {
   const bin = join(base, 'bin');
-  mkdirSync(bin, { recursive: true });
-  writeFileSync(join(bin, 'oras'), `#!/bin/sh\n${script}\n`);
-  chmodSync(join(bin, 'oras'), 0o755);
+  stubCommand(bin, 'oras', script);
   return `${bin}:${process.env.PATH}`;
 }
 

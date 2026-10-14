@@ -225,7 +225,8 @@ renaming or removing one is a breaking change.
 | `TENANT_CONSOLE_CONTROLLER_PUBLIC_URL` | `TENANT_CONSOLE_CONTROLLER_URL` | Controller URL the console shows to users and CLIs |
 | `KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT_HTTPS` | set by Kubernetes, `443` | In-cluster API server when no kubeconfig is given |
 | `TENANT_CONTROLLER_HOST`, `TENANT_CONTROLLER_PORT` | `127.0.0.1`, `8788` | Controller listen address |
-| `TENANT_CONTROLLER_WHOAMI_PORT` | none | Plain-HTTP listener serving only `GET /v1/auth/whoami` (problem+json errors), for the tenant registry's callback (platform#83) |
+| `TENANT_CONTROLLER_WHOAMI_PORT` | none | Listener serving only `GET /v1/auth/whoami` (problem+json errors), for the tenant registry's callback (platform#83). With `TENANT_CONTROLLER_TLS_CERT` and `_TLS_KEY` it serves TLS with that certificate (platform#113) and also plain HTTP on the same port, chosen by the connection's first byte, so a registry still configured with `http://` keeps working during an upgrade; without them, plain HTTP only |
+| `TENANT_CONTROLLER_WHOAMI_TLS_ONLY` | `false` | `true` refuses plain HTTP on the whoami listener once every registry calls it over `https://`. No effect without a certificate |
 | `TENANT_CONTROLLER_REGISTRY_FRONT_PORT` | none | TLS listener (the controller certificate) that forwards every request, credentials included, to the tenant hosts as the registry (platform#83) |
 | `TENANT_CONTROLLER_REGISTRY_HOST` | `registry` | `Host` the registry front sends: the registry workload's `wasi:http` host; `/v1/deploy` refuses a `<service>-<env>` equal to it |
 | `TENANT_CONTROLLER_REGISTRY_PULL_PORT` | none | The tenant hosts' pull-only listener (platform#83 `:host-pull`): the registry front for `GET`/`HEAD` only (`405` otherwise). NetworkPolicy admits only the tenant host pods |
@@ -308,7 +309,8 @@ console's Secret reassignment errors):
 | the target is platform-managed (`di-binding-*`, `di-bs-*`) | `tenant users cannot update platform-managed di-binding-*/di-bs-* Secrets` | 403 |
 | the update drops a key the Secret already has | `tenant users may update a Secret only if it keeps every existing data key` | 409 |
 
-Same-key replaces (the `/v1` secret set and update, the CLI `<workload>-control` Secret) and
+Same-key replaces (the `/v1` secret set and update, the CLI `<workload>-control` Secret, the app's
+`<workload>-secrets` Secret) and
 updates that add keys stay allowed. Match by substring: a managed name may also trip the older
 `backend-config` message first.
 
@@ -361,9 +363,15 @@ create. On a WorkloadDeployment in `di-tenant-<t>`, every
 - `secretFrom[].name` matching `^[a-z]([-a-z0-9]{0,61}[a-z0-9])?\.<env>$` (the `<name>` rule
   above, then `.<env>`), where the part before the dot is not a managed name
   (`isManagedSecretName`: `di-binding-*`, `di-bs-*`);
-- a WorkloadDeployment may also reference `secretFrom: <its own metadata.name>-control` (the
-  control Secret cli-plugin-platform renders for HTTP workloads under
-  `localResources.environment`), regardless of the env label, unless that name is managed;
+- a WorkloadDeployment may also reference exactly two Secrets named after itself, regardless of
+  the env label, unless that name is managed (platform#203):
+  - `<its own metadata.name>-control`: the control Secret cli-plugin-platform renders for HTTP
+    workloads under `localResources.environment`. It holds only the CLI's control credentials
+    (`DI_CONTROL_TOKEN`, `DI_CONTROL_IDENTITY`), and the CLI owns and rotates it on every deploy.
+  - `<its own metadata.name>-secrets`: the app's runtime secrets (for example signing keys or
+    `DI_PGLITE_KEY`). The app's own tooling writes it; the CLI never touches it.
+
+  No other `<metadata.name>-*` name is allowed, and neither Secret of another workload is;
 - no `imagePullSecret` (component or service) may be a managed name (`di-binding-*`, `di-bs-*`).
 
 `<env>` is the value of the WorkloadDeployment's `platform.di-framework.dev/env` label: the
@@ -459,8 +467,10 @@ logging out both stop access.
   the quota to include platform components.
 * The sidecar container can start after the app, which costs one restart; an init ordering or
   a startup probe would avoid it.
-* `/-/members` lists all `User` CRs and filters; a projected per-tenant member list would avoid
-  exposing other tenants' memberships to the controller.
+* `/-/members` reads the member names the platform publishes in ConfigMap
+  `tenant-controller-members` and then each `User` by name; the controller may read only those
+  (platform#321). It shows active members only. On a platform without that ConfigMap it lists
+  every `User` instead.
 * No WebSocket or SPDY upgrade through the proxy, so `kubectl port-forward` and `exec` do not
   work; logs with `--follow` stream fine.
 * Login ↔ `User` name matching is by convention; a `spec.identity` field would make it explicit.

@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'bun:test';
-import { evaluate } from '@marcbachmann/cel-js';
 import {
   admissionResources,
   EXCLUSIVE_INSTANCE_KEY,
@@ -13,6 +12,7 @@ import {
   storagePatch,
   type WorkloadDeployment,
 } from '../src/tenancy/workload-storage';
+import { evaluate } from './support/cel';
 
 const exclusive = (value: unknown) => ({ config: { [EXCLUSIVE_INSTANCE_KEY]: value } });
 

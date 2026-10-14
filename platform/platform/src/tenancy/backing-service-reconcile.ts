@@ -63,16 +63,33 @@ function backingServiceResourceName(serviceName: string): string {
   return `di-bs-${serviceName}`;
 }
 
-function backingServiceHostPath(tenantUid: string, serviceName: string): string {
-  return `/var/lib/k0s/di-tenants/${tenantUid}/bs-${serviceName}`;
+/** Node directory holding tenant data when `cfg.storageRoot` is unset. */
+const DEFAULT_STORAGE_ROOT = '/var/lib/k0s';
+
+/** `<storageRoot>/di-tenants/<tenant uid>/bs-<name>`: where a new BackingService keeps its data. */
+function backingServiceHostPath(
+  cfg: Pick<ControllerConfig, 'storageRoot'>,
+  tenantUid: string,
+  serviceName: string,
+): string {
+  return `${cfg.storageRoot ?? DEFAULT_STORAGE_ROOT}/di-tenants/${tenantUid}/bs-${serviceName}`;
 }
 
-function runtimeDataNatsHostPath(tenantUid: string): string {
-  return `/var/lib/k0s/di-tenants/${tenantUid}/${RUNTIME_DATA_NATS}`;
-}
-
-function transitionalRedisHostPath(tenantUid: string): string {
-  return `/var/lib/k0s/di-tenants/${tenantUid}/${TRANSITIONAL_REDIS}`;
+/**
+ * The hostPath the live `di-bs-<name>` Deployment already mounts as its `data` volume, when that
+ * Deployment belongs to `service`. Keeping it means a BackingService created under an earlier
+ * storage root still reaches its data; a Deployment owned by another UID never donates a path.
+ */
+function liveBackingServiceHostPath(
+  live: Resource | undefined,
+  service: BackingService,
+): string | undefined {
+  if (!live || live.metadata.labels?.[OWNER] !== service.metadata.uid) return undefined;
+  const spec = live.spec as
+    | { template?: { spec?: { volumes?: { name?: string; hostPath?: { path?: string } }[] } } }
+    | undefined;
+  const data = spec?.template?.spec?.volumes?.find((v) => v.name === 'data');
+  return data?.hostPath?.path || undefined;
 }
 
 /** Parse Kubernetes CPU quantities to millicores. */
@@ -290,7 +307,9 @@ function backendDeploymentResources(opts: {
 /**
  * Desired runtime infra for one BackingService instance.
  * Names are always `di-bs-<service-name>` so they never collide with reserved
- * `di-nats` (runtime data plane) or transitional `di-redis`.
+ * `di-nats` (runtime data plane) or transitional `di-redis`. `live` is the current
+ * `di-bs-<service-name>` Deployment, if any: its data hostPath is kept so existing data
+ * stays reachable; otherwise the path derives from `cfg.storageRoot`.
  */
 function backingServiceResources(
   service: BackingService,
@@ -298,6 +317,7 @@ function backingServiceResources(
   cls: BackingServiceClass,
   cfg: ControllerConfig,
   sizing: SizingParameters,
+  live?: Resource,
 ): Resource[] {
   if (cls.spec.provider === 'postgres')
     throw new Error('PostgreSQL requires the dedicated credentials and PVC reconciliation helpers');
@@ -315,7 +335,9 @@ function backingServiceResources(
     runtimeNamespace: n.runtimeNamespace,
     name: resourceName,
     provider,
-    hostPath: backingServiceHostPath(tenant.metadata.uid ?? 'unknown', service.metadata.name),
+    hostPath:
+      liveBackingServiceHostPath(live, service) ??
+      backingServiceHostPath(cfg, tenant.metadata.uid ?? 'unknown', service.metadata.name),
     replicas,
     sizing,
   });
@@ -436,9 +458,11 @@ export {
   backingServiceResourceName,
   backingServiceResources,
   CAPABILITY,
+  DEFAULT_STORAGE_ROOT,
   type DeploymentFailure,
   deploymentFailure,
   endpointFor,
+  liveBackingServiceHostPath,
   MAX_FAILURE_MESSAGE,
   mergeSizing,
   PROVIDER_RUNTIME,
@@ -450,11 +474,9 @@ export {
   type RuntimeProvider,
   resolveBackingSizing,
   resolveClass,
-  runtimeDataNatsHostPath,
   SERVICE,
   TRANSITIONAL_REDIS,
   tenantNameFromNamespace,
-  transitionalRedisHostPath,
   validateSizingAgainstClass,
   validateSizingAgainstTenantBudget,
 };

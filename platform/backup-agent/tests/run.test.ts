@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -194,11 +194,26 @@ describe('backup-agent kinds', () => {
   });
 
   test('postgres retries a refused connection before reporting dump failure', async () => {
-    const refused = harness(() => ({ code: 1, stdout: '', stderr: 'connection refused' }));
-    expect(await runAgent(request(), refused.io)).toBe(1);
-    expect(wrote(refused.files, '/work/termination')).toContain('DumpFailed');
-    expect(refused.calls.filter((call) => call.argv[0] === 'pg_dump')).toHaveLength(8);
-  }, 20000);
+    // The agent waits 1 s between attempts; record the waits instead of sleeping through them.
+    const waits: (number | undefined)[] = [];
+    const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((
+      handler: () => void,
+      delay?: number,
+    ) => {
+      waits.push(delay);
+      queueMicrotask(handler);
+      return 0;
+    }) as unknown as typeof setTimeout);
+    try {
+      const refused = harness(() => ({ code: 1, stdout: '', stderr: 'connection refused' }));
+      expect(await runAgent(request(), refused.io)).toBe(1);
+      expect(wrote(refused.files, '/work/termination')).toContain('DumpFailed');
+      expect(refused.calls.filter((call) => call.argv[0] === 'pg_dump')).toHaveLength(8);
+    } finally {
+      timer.mockRestore();
+    }
+    expect(waits).toEqual(new Array(7).fill(1000));
+  });
 
   test('postgres reports a dump failure and a missing target', async () => {
     const failed = harness(() => ({ code: 1, stdout: '', stderr: 'no' }));
@@ -579,6 +594,8 @@ describe('backup-agent kinds', () => {
   });
 });
 
+// A fresh Bun process transpiles src/main.ts and forks two shell stubs. That is process start-up,
+// not waiting, and it slows down with the rest of the machine, so it gets more than the default.
 test('the process entrypoint writes a termination record via stub tools', async () => {
   const root = await mkdtemp(join(tmpdir(), 'backup-agent-'));
   try {
@@ -619,7 +636,7 @@ test('the process entrypoint writes a termination record via stub tools', async 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-});
+}, 30_000);
 
 describe('sweepPvc on a real tree', () => {
   test('removes only stale leftovers inside <mount>/<prefix> at stamp depth', async () => {

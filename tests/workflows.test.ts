@@ -4,12 +4,12 @@
  * triggers and paths, the skip-if-published gate, least-privilege permissions, and the pin job.
  */
 import { describe, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { ARTIFACTS } from '../scripts/pin-artifact';
 import { matchesPathFilter, pushPaths } from '../scripts/source-check';
-import { spawnEnv } from './helpers/spawn-env';
+import { spawnEnv, stubCommand } from './helpers/spawn-env';
 
 const repo = resolve(import.meta.dir, '..');
 const env = spawnEnv;
@@ -662,12 +662,11 @@ describe('the check-source resolver reads platform/tenant-host/variants', () => 
     mkdirSync(join(dir, 'platform/tenant-host'), { recursive: true });
     writeFileSync(join(dir, 'platform/tenant-host/variants'), table);
     const bin = join(dir, 'bin');
-    mkdirSync(bin);
-    writeFileSync(
-      join(bin, 'bun'),
-      `#!/bin/sh\necho "hash=${'a'.repeat(64)}"\n${answer}\necho "args=$*" >> "${dir}/bun.log"\n`,
+    stubCommand(
+      bin,
+      'bun',
+      `echo "hash=${'a'.repeat(64)}"\n${answer}\necho "args=$*" >> "${dir}/bun.log"`,
     );
-    chmodSync(join(bin, 'bun'), 0o755);
     const output = join(dir, 'out');
     writeFileSync(output, '');
     const result = Bun.spawnSync(['bash', '-c', script], {
@@ -825,20 +824,17 @@ describe('scripts/wash-pins.sh (the wash pin set)', () => {
   function run(published: string[]) {
     const base = mkdtempSync(join(tmpdir(), 'wash-pins-'));
     const bin = join(base, 'bin');
-    mkdirSync(bin);
-    writeFileSync(
-      join(bin, 'oras'),
+    stubCommand(
+      bin,
+      'oras',
       [
-        '#!/bin/sh',
         'ref="$4"',
         'for tag in $PUBLISHED; do',
         '  case "$ref" in *":$tag") echo "{\\"digest\\":\\"sha256:$(printf %064d 0 | tr 0 "${tag#src-}" | cut -c1-64)\\"}"; exit 0 ;; esac',
         'done',
         'echo "Error: $ref: not found" >&2; exit 1',
-        '',
       ].join('\n'),
     );
-    chmodSync(join(bin, 'oras'), 0o755);
     const output = join(base, 'out');
     writeFileSync(output, '');
     const result = Bun.spawnSync(['bash', 'scripts/wash-pins.sh'], {

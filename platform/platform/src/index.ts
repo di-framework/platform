@@ -32,12 +32,18 @@ import {
   type RuntimeNatsConfig,
   type TenantAuthConfig,
   tenantAuthRoutes,
+  unsetPublicUrls,
   userTokenSecretName,
+  withDerivedPublicUrls,
 } from './tenancy/resources';
 import { secretReaderFromKubeconfig } from './token-secret-reader';
 import { waitForTokenSecret } from './token-wait';
 import { platformValues } from './values';
-import { operatorHostNamespaces } from './watched-namespaces';
+import {
+  operatorHostNamespaces,
+  sharedTenantList,
+  type TenantSnapshot,
+} from './watched-namespaces';
 
 export { platformRegistryPullHost, tenantInsecureRegistries } from './insecure-registries';
 export { kubeconfigServer, type TenantKubeconfigArgs, tenantKubeconfig } from './kubeconfig';
@@ -95,9 +101,10 @@ export interface PlatformArgs {
    * is Ready, the program polls the Kubernetes API with this kubeconfig (and `kubeContext`) until
    * the user's token Secret has `data.token`. The ambient `$KUBECONFIG` is never read. If the
    * kubeconfig uses an `exec` credential plugin, that plugin runs for these reads as it does for
-   * `provider`. On every update (never in preview) it also lists the installation's Tenants, so a
-   * removed tenant's runtime namespace stays watched by the wasmCloud operator until its Tenant is
-   * deleted (#227); without it, only declared tenants are watched.
+   * `provider`. Once per update or preview it also lists the installation's Tenants, so a removed
+   * tenant's runtime namespace stays watched by the wasmCloud operator until its Tenant is deleted
+   * (#227) and a Retain removal is announced (#228); without it, only declared tenants are
+   * watched.
    */
   kubeconfig?: pulumi.Input<string>;
   /** Context of `kubeconfig` that `provider` uses; defaults to the kubeconfig's current context. */
@@ -142,8 +149,16 @@ export function createPlatform(args: PlatformArgs) {
   });
   const tenantHostImage = config.get('tenantHostImage') ?? DEFAULT_HOST_IMAGE;
   assertHostImageSupportsAllowlist(tenantHostImage, insecureRegistries);
-  const tenantAuth = config.getObject<TenantAuthConfig>('tenantAuth');
-  assertTenantAuthConfig(tenantAuth);
+  const configuredTenantAuth = config.getObject<TenantAuthConfig>('tenantAuth');
+  assertTenantAuthConfig(configuredTenantAuth);
+  // Unset tenant-auth public URLs default to gateway routes (#128); explicit URLs are kept.
+  const tenantAuth = withDerivedPublicUrls(configuredTenantAuth, routeUrlPattern);
+  const notDerived = unsetPublicUrls(tenantAuth);
+  if (routeUrlPattern !== undefined && notDerived.length)
+    pulumi.log.warn(
+      `tenantAuth.${notDerived.join(', tenantAuth.')} not derived from routeUrlPattern ${routeUrlPattern} ` +
+        '(only http://{host}.{tenant}.localhost[:<port>] is routed to tenant-auth); the 127.0.0.1 defaults apply',
+    );
   const runtimeNats = args.runtimeNats ?? config.getObject<RuntimeNatsConfig>('runtimeNats');
   assertRuntimeNatsConfig(runtimeNats);
   const backingServiceClasses = resolveBackingServiceClasses(config);
@@ -234,30 +249,41 @@ export function createPlatform(args: PlatformArgs) {
 
   const tenantNamespaces = seedTenantNamespaces(declared.tenants, scope, provider);
 
-  // A removed tenant's runtime namespace stays watched while Pulumi deletes its Tenant, which it
-  // does after this Helm update (#227). Preview never reads the cluster.
+  // The installation's Tenants, listed once per run with the admin kubeconfig and shared by the
+  // watched namespaces (#227) and the Retain removal check (#228), in preview too, so both decide
+  // from one snapshot (#245). Without `kubeconfig` nothing is listed.
   const adminKubeconfig = args.kubeconfig;
-  const resolveHostNamespaces = (kubeconfig?: string, context?: string) =>
+  const kubeconfigAccess =
+    adminKubeconfig === undefined ? undefined : pulumi.all([adminKubeconfig, args.kubeContext]);
+  let liveTenants: TenantSnapshot | undefined;
+  const tenantSnapshot = (kubeconfig: string, context: string | undefined): TenantSnapshot => {
+    liveTenants ??= sharedTenantList(
+      // async, so an unusable kubeconfig rejects into each caller's error handling.
+      async (installation) => tenantListerFromKubeconfig(kubeconfig, context)(installation),
+      scope,
+    );
+    return liveTenants;
+  };
+
+  // A removed tenant's runtime namespace stays watched while Pulumi deletes its Tenant, which it
+  // does after this Helm update (#227).
+  const resolveHostNamespaces = (tenants?: TenantSnapshot) =>
     operatorHostNamespaces({
       platformNamespace: namespaceName,
       installation: scope,
       declared: declared.tenants.map((t) => t.name),
       dryRun: pulumi.runtime.isDryRun(),
-      // async, so an unusable kubeconfig rejects into the caller's error handling.
-      listTenants:
-        kubeconfig === undefined
-          ? undefined
-          : async (installation) => tenantListerFromKubeconfig(kubeconfig, context)(installation),
+      tenants,
       log: { info: (m) => pulumi.log.info(m), warn: (m) => pulumi.log.warn(m) },
     });
   const watchedNamespaces: pulumi.Input<string[]> =
-    pulumi.runtime.isDryRun() || adminKubeconfig === undefined
+    kubeconfigAccess === undefined
       ? resolveHostNamespaces()
       : // The namespace list is not secret, though the kubeconfig it was read with is.
         pulumi.unsecret(
-          pulumi
-            .all([adminKubeconfig, args.kubeContext])
-            .apply(([kubeconfig, context]) => resolveHostNamespaces(kubeconfig, context)),
+          kubeconfigAccess.apply(([kubeconfig, context]) =>
+            resolveHostNamespaces(tenantSnapshot(kubeconfig, context)),
+          ),
         );
 
   const wasmcloud = new k8s.helm.v3.Release(
@@ -378,19 +404,18 @@ export function createPlatform(args: PlatformArgs) {
     runtimeNats,
   });
   // Warn before Pulumi deletes a Tenant that has no entry and whose live policy is Retain (#228).
-  // Skipped without `kubeconfig`: the program has no way to read the cluster then.
-  const removalNotice =
-    args.kubeconfig === undefined
-      ? undefined
-      : pulumi.output([args.kubeconfig, args.kubeContext] as const).apply(([kubeconfig, context]) =>
-          warnRemovedTenants({
-            installation: scope,
-            declared: declared.tenants.map((t) => t.name),
-            list: (installation) => tenantListerFromKubeconfig(kubeconfig, context)(installation),
-            warn: (message) => pulumi.log.warn(message),
-            debug: (message) => pulumi.log.debug(message),
-          }),
-        );
+  // Skipped without `kubeconfig`: the program has no way to read the cluster then. Reads the
+  // same Tenant list as the watched namespaces (#245).
+  const removalNotice = kubeconfigAccess?.apply(([kubeconfig, context]) =>
+    warnRemovedTenants({
+      installation: scope,
+      declared: declared.tenants.map((t) => t.name),
+      // The shared list is already for this installation.
+      list: tenantSnapshot(kubeconfig, context),
+      warn: (message) => pulumi.log.warn(message),
+      debug: (message) => pulumi.log.debug(message),
+    }),
+  );
   const tenants = tenancy.tenants.map((t) =>
     t.metadata.name.apply((name) => ({ name, ...names(name) })),
   );

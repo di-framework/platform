@@ -142,7 +142,7 @@ A `503` is never cached, so the next request asks the controller again.
 
 | Key                     | Source                                 | Example                                              |
 | ----------------------- | -------------------------------------- | ---------------------------------------------------- |
-| `tenant-controller-url` | `wasmcloud:secrets` (bind-time config) | `https://tenant-controller.di-runtime-acme.svc:8788` |
+| `tenant-controller-url` | `wasmcloud:secrets` (bind-time config) | `https://tenant-controller.di-runtime-acme.svc:8789` |
 | `tenant`                | `wasmcloud:secrets` (bind-time config) | `acme`                                               |
 
 `https://` is accepted for any host. Plain `http://` is accepted only for
@@ -150,13 +150,17 @@ cluster-local hosts (`*.svc`, `*.svc.cluster.local`) and loopback (for
 `wash dev`); any other `http://` URL denies every request, so a typo cannot
 send tokens off-cluster in cleartext.
 
+A bracketed IPv6 authority counts as cluster-local only when it is loopback
+and is followed by nothing or by `:<digits>`; `http://[::1]evil.example` and
+the like are rejected.
+
 Both values are read through the same `wasmcloud:secrets` `store` + `reveal`
 imports upstream already used for its credentials, so the component's import
 surface grows only by `wasi:http/client` and the monotonic clock; no
 `wasi:config` host plugin is required. An optional path prefix is kept
 (`https://host/prefix` calls `/prefix/v1/auth/whoami`).
 
-### Plain HTTP to the controller
+### TLS to the controller
 
 The tenant controller serves HTTPS with a private CA. A component's outgoing
 `wasi:http` request is made by the host (wash 2.x, wasmtime-wasi-http over
@@ -171,26 +175,23 @@ wash 2.8 can do that without a per-tenant image: `wash host
 roots on top of the default webpki roots for every component's outgoing
 `wasi:http` request, P2 and P3 alike, and is read once when the host starts.
 The platform passes it the tenant CA from ConfigMap `tenant-controller-ca`
-(the same file as `--oci-ca-path`), so tenant hosts with a registry already
-trust the controller certificate (platform#113).
+(the same file as `--oci-ca-path`), so tenant hosts with a registry trust the
+controller certificate (platform#113).
 
-The component accepts either. `:reconcile` (platform#83) uses plain HTTP to a
-separate controller listener, `http://tenant-controller.di-runtime-<tenant>.svc:8789`,
-which serves only `GET /v1/auth/whoami`; a NetworkPolicy admits only the
-tenant's host pods to it (see the `tenantAuth` section of
-`platform/platform/README.md`). The credential crosses the pod network in
-**cleartext** there: a namespace is not a network boundary. The hop from the
-controller's TLS registry front to the host is plain HTTP too, so the Basic
-credential is cleartext on the pod network before the registry sees it. Both
-hops stay cleartext unless the cluster encrypts pod traffic (CNI WireGuard or
-mesh mTLS); off-cluster, users reach the registry only over TLS. Now that the
-tenant hosts trust the controller CA, an `https://` URL needs no component
-change; what keeps the callback on `8789` for now is that only that listener
-accepts the host pull token, and it serves plain HTTP (platform#113).
+On the platform the callback goes to a separate controller listener,
+`https://tenant-controller.di-runtime-<tenant>.svc:8789`, which serves only
+`GET /v1/auth/whoami` with the controller certificate (whose names always
+include `tenant-controller.di-runtime-<tenant>.svc`); a NetworkPolicy admits
+only the tenant's host pods to it (see the `tenantAuth` section of
+`platform/platform/README.md`). It is the only listener that accepts the host
+pull token. The listener also answers plain HTTP on the same port, so a
+registry still configured with `http://…:8789` keeps working while an upgrade
+rolls out (platform#113).
 
-A bracketed IPv6 authority counts as cluster-local only when it is loopback
-and is followed by nothing or by `:<digits>`; `http://[::1]evil.example` and
-the like are rejected.
+The hop from the controller's TLS registry front to the host is still plain
+HTTP, so the user's Basic credential is cleartext on the pod network before
+the registry sees it, unless the cluster encrypts pod traffic (CNI WireGuard
+or mesh mTLS); off-cluster, users reach the registry only over TLS.
 
 ### Storage limit
 

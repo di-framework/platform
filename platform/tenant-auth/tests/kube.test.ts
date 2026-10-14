@@ -177,6 +177,10 @@ describe('KubeClient', () => {
         return json({ metadata: { name: 'alice' }, spec: { memberships: [] } });
       if (request.path === `${users}/missing`)
         return json({ kind: 'Status', message: 'users "missing" not found' }, 404);
+      if (request.path === `${users}/outsider`)
+        return json({ kind: 'Status', message: 'users "outsider" is forbidden' }, 403);
+      if (request.path === '/api/v1/namespaces/ns/configmaps/members')
+        return json({ metadata: { name: 'members' }, data: { members: '[]' } });
       if (request.path === `${users}/broken`)
         return new Response('upstream exploded', { status: 500 });
       if (request.path === users) return json({ items: [] });
@@ -212,6 +216,8 @@ describe('KubeClient', () => {
   test('turns 404 into undefined and keeps other failures as KubeError', async () => {
     const client = new KubeClient({ server: api.url, cert: 'c', key: 'k' }, 'wasmcloud');
     expect(await client.getUser('missing')).toBeUndefined();
+    // Only the tenant's members are readable (#321): anyone else is no member at all.
+    expect(await client.getUser('outsider')).toBeUndefined();
     const error = await client.getUser('broken').catch((e: unknown) => e);
     expect(error).toBeInstanceOf(KubeError);
     expect((error as KubeError).status).toBe(500);
@@ -237,6 +243,7 @@ describe('KubeClient', () => {
       '/api/v1/namespaces/ns/secrets?labelSelector=a%3Db%2Cc%3Dd',
     );
     expect(await client.getSecret('ns', 'x')).toBeDefined();
+    expect((await client.getConfigMap('ns', 'members'))?.data).toEqual({ members: '[]' });
     const created = await client.createSecret('ns', {
       metadata: { name: 'k' },
       stringData: { v: '1' },

@@ -358,7 +358,7 @@ function passThrough(
   // Fail closed, logged once per connection; never log the hello or the name it carries.
   if (name === undefined)
     console.error(
-      `${socket.remoteAddress}: closing a TLS connection whose ClientHello has no readable server name (malformed, or split across records)`,
+      `${socket.remoteAddress}: closing a TLS connection whose ClientHello has no readable server name (no SNI extension, malformed, or split across records)`,
     );
   // Route aliases are for plain HTTP tenant routes only; TLS passthrough never consults them.
   const route = routeRequest(name);

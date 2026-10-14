@@ -118,9 +118,17 @@ export interface TenantAuthConfig {
   issuerUpstreamPodPort?: number;
   /** The issuer's IPv4 when pods cannot resolve its hostname. */
   issuerIp?: string;
-  /** Browser-visible console URL; `{tenant}` is replaced. Default `http://127.0.0.1:8787`. */
+  /**
+   * Browser-visible console URL; `{tenant}` is replaced. Unset, `createPlatform` derives
+   * `http://console.{tenant}.localhost:<port>` from an `http://{host}.{tenant}.localhost`
+   * `routeUrlPattern` ({@link withDerivedPublicUrls}); otherwise `http://127.0.0.1:8787`.
+   */
   consolePublicUrl?: string;
-  /** Controller URL shown to users and CLIs; `{tenant}` is replaced. Default `https://127.0.0.1:8788`. */
+  /**
+   * Controller URL shown to users and CLIs; `{tenant}` is replaced. Unset, `createPlatform`
+   * derives `https://controller.{tenant}.localhost:<port>` from an
+   * `http://{host}.{tenant}.localhost` `routeUrlPattern`; otherwise `https://127.0.0.1:8788`.
+   */
   controllerPublicUrl?: string;
   /** Each tenant's own OCI registry (#83); absent, no registry is deployed. */
   registry?: TenantRegistryConfig;
@@ -128,7 +136,7 @@ export interface TenantAuthConfig {
 /**
  * The per-tenant registry: the `platform/oci-registry` component, run as a WorkloadDeployment on
  * the tenant's own hosts and backed by their data-plane blobstore. Its whoami callback goes to
- * the controller's plain-HTTP whoami listener; users reach it through the controller's TLS
+ * the controller's whoami listener over TLS (#113); users reach it through the controller's TLS
  * registry front.
  */
 export interface TenantRegistryConfig {
@@ -137,7 +145,9 @@ export interface TenantRegistryConfig {
   /**
    * Registry origin users log in to; `{tenant}` is replaced. `https://<label>.{tenant}.localhost:<port>`
    * on the gateway port is routed through the gateway (TLS passthrough to the registry front).
-   * Default `https://127.0.0.1:8790`, a port-forward to the registry front.
+   * Unset, `createPlatform` derives `https://registry.{tenant}.localhost:<port>` from an
+   * `http://{host}.{tenant}.localhost` `routeUrlPattern`; otherwise `https://127.0.0.1:8790`, a
+   * port-forward to the registry front.
    */
   publicUrl?: string;
   /**
@@ -158,7 +168,11 @@ export interface TenantRegistryLimits {
   /** How long an upload may deliver no byte before it is cut off, in ms (default 60000). */
   uploadIdleTimeoutMs?: number;
 }
-/** The controller's plain-HTTP listener serving only `GET /v1/auth/whoami` (#83). */
+/**
+ * The controller's listener serving only `GET /v1/auth/whoami` (#83): TLS with the controller
+ * certificate (#113), and plain HTTP on the same port for a registry whose config still names
+ * `http://` during an upgrade.
+ */
 export const WHOAMI_PORT = 8789;
 /** The controller's TLS front for the tenant registry (#83). */
 export const REGISTRY_FRONT_PORT = 8790;
@@ -187,6 +201,13 @@ const REGISTRY_PULL_USER = 'tenant-host';
  */
 export function registryPullHost(tenant: string): string {
   return `${REGISTRY_PULL_SERVICE}.${names(tenant).runtimeNamespace}.svc`;
+}
+/**
+ * The name the tenant registry calls the controller's whoami listener by (#113): the controller
+ * Service in the runtime namespace, which {@link tenantControllerCertNames} always covers.
+ */
+export function registryWhoamiHost(tenant: string): string {
+  return `tenant-controller.${names(tenant).runtimeNamespace}.svc`;
 }
 /** The host pull Secret's data (base64): the token and the Docker config naming {@link registryPullHost}. */
 export function registryPullSecretData(tenant: string, token: string): Record<string, string> {
@@ -444,6 +465,50 @@ export function tenantAuthRoutes(
     else if (!problems.includes(shared)) problems.push(shared);
   }
   return { routes, urls, problems };
+}
+/** A `routeUrlPattern` the tenant-auth public URLs can be derived from; group 1 is `:<port>`. */
+const DERIVABLE_ROUTE_PATTERN = /^http:\/\/\{host\}\.\{tenant\}\.localhost(:\d+)?$/i;
+/** The tenant-auth public URLs `auth` leaves unset, by config path. */
+export function unsetPublicUrls(auth: TenantAuthConfig | undefined): string[] {
+  if (auth === undefined) return [];
+  return [
+    ...(auth.consolePublicUrl === undefined ? ['consolePublicUrl'] : []),
+    ...(auth.controllerPublicUrl === undefined ? ['controllerPublicUrl'] : []),
+    ...(auth.registry && auth.registry.publicUrl === undefined ? ['registry.publicUrl'] : []),
+  ];
+}
+/**
+ * `auth` with each unset public URL (`consolePublicUrl`, `controllerPublicUrl` and, with a
+ * registry, `registry.publicUrl`) derived from the published gateway's `routeUrlPattern`, so a
+ * fresh Tenant is routed without extra config: `http://console.{tenant}.localhost:<port>`,
+ * `https://controller.{tenant}.localhost:<port>` and `https://registry.{tenant}.localhost:<port>`
+ * on the gateway port (`:80` when the pattern names none). Explicit URLs are kept as given. Only
+ * an `http://{host}.{tenant}.localhost[:<port>]` pattern is derived from, since only those hosts
+ * are routed to the pair; with any other pattern, no `tenantAuth`, no `routeUrlPattern`, or every
+ * URL set, `auth` is returned unchanged and the `127.0.0.1` defaults apply, as before.
+ */
+export function withDerivedPublicUrls(
+  auth: TenantAuthConfig | undefined,
+  routeUrlPattern: string | undefined,
+): TenantAuthConfig | undefined {
+  const match = DERIVABLE_ROUTE_PATTERN.exec(routeUrlPattern ?? '');
+  if (auth === undefined || !match || unsetPublicUrls(auth).length === 0) return auth;
+  // The gateway port, explicit for the TLS hosts (https alone would mean 443) and omitted for the
+  // console when it is http's own 80, so its URL stays canonical.
+  const port = match[1] ?? ':80';
+  const url = (scheme: 'http' | 'https', label: string) =>
+    `${scheme}://${label}.{tenant}.localhost${scheme === 'http' && port === ':80' ? '' : port}`;
+  return {
+    ...auth,
+    consolePublicUrl: auth.consolePublicUrl ?? url('http', 'console'),
+    controllerPublicUrl: auth.controllerPublicUrl ?? url('https', 'controller'),
+    ...(auth.registry && {
+      registry: {
+        ...auth.registry,
+        publicUrl: auth.registry.publicUrl ?? url('https', 'registry'),
+      },
+    }),
+  };
 }
 /**
  * The registry workload's `wasi:http` host: the route label of a gateway-shaped
@@ -898,27 +963,6 @@ function tenantResources(
     make('v1', 'ServiceAccount', 'di-runtime', n.runtimeNamespace, {
       automountServiceAccountToken: false,
     }),
-    // The controller reads hostgroup logs to publish the console logs projection (#10).
-    // Scoped to this tenant's runtime namespace; the host itself keeps no API token.
-    make('rbac.authorization.k8s.io/v1', 'Role', 'di-platform-log-reader', n.runtimeNamespace, {
-      rules: [{ apiGroups: [''], resources: ['pods/log'], verbs: ['get'] }],
-    }),
-    make(
-      'rbac.authorization.k8s.io/v1',
-      'RoleBinding',
-      'di-platform-log-reader',
-      n.runtimeNamespace,
-      {
-        roleRef: {
-          apiGroup: 'rbac.authorization.k8s.io',
-          kind: 'Role',
-          name: 'di-platform-log-reader',
-        },
-        subjects: [
-          { kind: 'ServiceAccount', name: 'di-platform-controller', namespace: cfg.namespace },
-        ],
-      },
-    ),
     make('v1', 'ConfigMap', 'di-tenant-stock', n.namespace, {
       data: {
         backend: 'redis',
@@ -1202,7 +1246,7 @@ function tenantResources(
                     ...(cfg.insecureRegistries ?? []).flatMap((r) => ['--insecure-registry', r]),
                     // The tenant registry's pull Service serves the controller certificate. The
                     // same CA is trusted for the components' outgoing wasi:http (on top of the
-                    // webpki roots), so the registry can reach the controller over https (#113).
+                    // webpki roots), so the registry calls the controller's whoami over https (#113).
                     ...(hostPull?.caDigest
                       ? [
                           '--oci-ca-path=/registry-ca/ca.crt',
@@ -1392,7 +1436,8 @@ function tenantControllerCertNames(
   const ns = names(tenant).runtimeNamespace;
   const dns = [
     'tenant-controller',
-    `tenant-controller.${ns}.svc`,
+    // The tenant registry's whoami callback (#113).
+    registryWhoamiHost(tenant),
     `tenant-controller.${ns}.svc.cluster.local`,
     'localhost',
   ];
@@ -1416,6 +1461,11 @@ function tenantControllerCertNames(
 }
 /** The Secret holding the controller CA's private key; no pod mounts it. */
 const TENANT_CONTROLLER_CA_KEY_SECRET = 'tenant-controller-ca-key';
+/**
+ * The tenant's active members, published for the tenant controller's `/-/members` (#321). It
+ * reads each one's User by name, so its RBAC names the members instead of listing every User.
+ */
+export const TENANT_MEMBERS_CONFIG = 'tenant-controller-members';
 /** Digest of the serving certificate; in both pod templates so a renewal rolls the pair. */
 function tlsCertDigest(cert: string): string {
   return createHash('sha256').update(cert).digest('hex');
@@ -1662,6 +1712,7 @@ function tenantAuthResources(
     },
   );
   const base64 = (text: string) => Buffer.from(text).toString('base64');
+  const members = [...inputs.members].sort((a, b) => a.localeCompare(b));
   const result: Resource[] = [
     make('v1', 'ServiceAccount', 'tenant-controller', namespace, {
       automountServiceAccountToken: false,
@@ -1669,11 +1720,14 @@ function tenantAuthResources(
     make('v1', 'ServiceAccount', 'tenant-console', namespace, {
       automountServiceAccountToken: false,
     }),
-    // The tenancy CRs it checks on every request.
+    // The tenancy CRs it checks on every request: its own Tenant and its members' Users only
+    // (#321). With no members there is no users rule: empty resourceNames would mean every name.
     make(rbac, 'ClusterRole', `di-tenant-controller-${name}`, undefined, {
       rules: [
         { apiGroups: [GROUP], resources: ['tenants'], verbs: ['get'], resourceNames: [name] },
-        { apiGroups: [GROUP], resources: ['users'], verbs: ['get', 'list'] },
+        ...(inputs.members.length
+          ? [{ apiGroups: [GROUP], resources: ['users'], verbs: ['get'], resourceNames: members }]
+          : []),
       ],
     }),
     // TokenRequest only for the tenant's members, recomputed from the User CRs on every
@@ -1690,10 +1744,18 @@ function tenantAuthResources(
           ]
         : [],
     }),
-    // API-key Secrets in its own namespace.
+    // API-key Secrets in its own namespace, and the member list it reads for `/-/members`.
+    // Secret names are generated, so `resourceNames` cannot narrow these; the
+    // `tenant-controller-secrets` admission policy limits its writes to API-key Secrets (#321).
     make(rbac, 'Role', 'tenant-controller-keys', namespace, {
       rules: [
         { apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list', 'create', 'delete'] },
+        {
+          apiGroups: [''],
+          resources: ['configmaps'],
+          verbs: ['get'],
+          resourceNames: [TENANT_MEMBERS_CONFIG],
+        },
       ],
     }),
     // Tenant developers can only write Secrets (#112), so `/v1` reads them as the controller;
@@ -1815,6 +1877,9 @@ function tenantAuthResources(
       }),
     );
   result.push(
+    make('v1', 'ConfigMap', TENANT_MEMBERS_CONFIG, namespace, {
+      data: { members: JSON.stringify(members) },
+    }),
     make('v1', 'ConfigMap', 'tenant-controller-ca', namespace, {
       data: { 'ca.crt': inputs.tls.caCert },
     }),
@@ -1963,8 +2028,9 @@ function tenantAuthResources(
  * the unnamed blobstore, configured with the NATS backend pointing to the tenant's `di-nats`
  * for persistent blob and manifest storage. The component reads the whoami URL and the tenant
  * through `wasmcloud:secrets` bind-time config; admission admits that interface from the
- * platform controller only, so a tenant cannot repoint it. The plain-HTTP whoami URL is
- * in-cluster (`*.svc`), as the component requires.
+ * platform controller only, so a tenant cannot repoint it. The whoami URL is https to the
+ * controller Service (#113): {@link registryWhoamiHost} is one of the controller certificate's
+ * names, and the hosts trust the tenant CA through `--http-client-ca-path`.
  */
 function registryWorkload(
   tenant: Tenant,
@@ -1975,7 +2041,7 @@ function registryWorkload(
   const name = tenant.metadata.name;
   const n = names(name);
   const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
-  const whoami = `tenant-controller.${n.runtimeNamespace}.svc:${WHOAMI_PORT}`;
+  const whoami = `${registryWhoamiHost(name)}:${WHOAMI_PORT}`;
   const value = resource(
     tenant,
     cfg.installation,
@@ -1994,7 +2060,8 @@ function registryWorkload(
               {
                 name: 'oci-registry',
                 image: registry.component,
-                // Hosts run with --socket-egress=enforce; the whoami call is the only egress.
+                // Hosts run with --socket-egress=enforce; the whoami call (https, the same
+                // host and port) is the only egress.
                 localResources: { allowedHosts: [whoami] },
               },
             ],
@@ -2020,7 +2087,7 @@ function registryWorkload(
                 namespace: 'wasmcloud',
                 package: 'secrets',
                 interfaces: ['store', 'reveal'],
-                config: { 'tenant-controller-url': `http://${whoami}`, tenant: name },
+                config: { 'tenant-controller-url': `https://${whoami}`, tenant: name },
               },
             ],
           },

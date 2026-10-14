@@ -18,6 +18,7 @@ import {
   type Resource,
   registryHttpHost,
   registryPullHost,
+  registryWhoamiHost,
   TENANT,
   TENANT_AUTH_LIMITS,
   type Tenant,
@@ -30,7 +31,9 @@ import {
   tenantResources,
   tlsCertDigest,
   type User,
+  unsetPublicUrls,
   VERSION,
+  withDerivedPublicUrls,
 } from '../src/tenancy/resources';
 import {
   caCertificate,
@@ -172,7 +175,10 @@ describe('tenant-auth configuration', () => {
     expect(cluster[0]?.verbs).toEqual(['get', 'list', 'create', 'patch', 'delete']);
     // Never cluster-admin by proxy: no rule lets it bind or escalate cluster-scoped roles.
     for (const verb of ['bind', 'escalate']) expect(cluster[0]?.verbs).not.toContain(verb);
-    expect(rules.find((r) => r.resources.includes('rolebindings'))?.verbs).toContain('escalate');
+    // Nor namespaced ones (#115): no escalate, and bind only on named Roles.
+    expect(rules.flatMap((r) => r.verbs)).not.toContain('escalate');
+    for (const rule of rules.filter((r) => r.verbs.includes('bind')))
+      expect(rule.resourceNames?.length).toBeGreaterThan(0);
     expect(rules.find((r) => r.apiGroups.includes('discovery.k8s.io'))?.resources).toEqual([
       'endpointslices',
     ]);
@@ -247,6 +253,7 @@ describe('tenantAuthResources', () => {
       'RoleBinding/di-tenant-alpha/tenant-controller-secret-reader',
       'NetworkPolicy/di-runtime-alpha/tenant-auth-egress',
       'NetworkPolicy/di-runtime-alpha/tenant-auth-network',
+      'ConfigMap/di-runtime-alpha/tenant-controller-members',
       'ConfigMap/di-runtime-alpha/tenant-controller-ca',
       'Secret/di-runtime-alpha/tenant-controller-tls',
       'Secret/di-runtime-alpha/tenant-controller-ca-key',
@@ -1473,6 +1480,108 @@ describe('tenant-auth gateway routes (#58:routes)', () => {
     ]);
   });
 
+  it('derives unset public URLs from routeUrlPattern so they are routed (#128)', () => {
+    const { consolePublicUrl: _c, ...bare } = auth;
+    const registry = { component: `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}` };
+    const derived = withDerivedPublicUrls({ ...bare, registry }, pattern);
+    expect(derived).toEqual({
+      ...bare,
+      consolePublicUrl: 'http://console.{tenant}.localhost:28180',
+      controllerPublicUrl: 'https://controller.{tenant}.localhost:28180',
+      registry: { ...registry, publicUrl: 'https://registry.{tenant}.localhost:28180' },
+    });
+    expect(tenantAuthRoutes(derived, pattern)).toEqual({
+      routes: { console: 'console', controller: 'controller', registry: 'registry' },
+      urls: {
+        console: 'http://console.{tenant}.localhost:28180',
+        controller: 'https://controller.{tenant}.localhost:28180',
+        registry: 'https://registry.{tenant}.localhost:28180',
+      },
+      problems: [],
+    });
+    // Without a registry none is invented; without a port the TLS hosts name the gateway's 80.
+    const portless = withDerivedPublicUrls(bare, 'http://{host}.{tenant}.localhost');
+    expect(portless).toEqual({
+      ...bare,
+      consolePublicUrl: 'http://console.{tenant}.localhost',
+      controllerPublicUrl: 'https://controller.{tenant}.localhost:80',
+    });
+    expect(tenantAuthRoutes(portless, 'http://{host}.{tenant}.localhost').problems).toEqual([]);
+    // No gateway or no tenantAuth: nothing derived, the 127.0.0.1 defaults still apply.
+    expect(withDerivedPublicUrls(bare, undefined)).toBe(bare);
+    expect(withDerivedPublicUrls(undefined, pattern)).toBeUndefined();
+  });
+
+  it('keeps explicit public URLs over the derived defaults (#128)', () => {
+    const explicit: TenantAuthConfig = {
+      ...auth,
+      consolePublicUrl: 'http://ui.{tenant}.localhost:28180',
+      controllerPublicUrl: 'https://127.0.0.1:8788',
+      registry: {
+        component: `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}`,
+        publicUrl: 'https://oci.{tenant}.localhost:28180',
+      },
+    };
+    expect(withDerivedPublicUrls(explicit, pattern)).toBe(explicit);
+    // Only the unset one is derived.
+    const { controllerPublicUrl: _k, ...partial } = explicit;
+    expect(withDerivedPublicUrls(partial, pattern)).toEqual({
+      ...explicit,
+      controllerPublicUrl: 'https://controller.{tenant}.localhost:28180',
+    });
+  });
+
+  it('keeps the 127.0.0.1 defaults for a routeUrlPattern the gateway does not route (#128)', () => {
+    const { consolePublicUrl: _c, ...bare } = auth;
+    for (const unrouted of [
+      'https://{host}.{tenant}.localhost:28180',
+      'http://{host}.{tenant}.example.com:28180',
+    ]) {
+      expect(withDerivedPublicUrls(bare, unrouted)).toBe(bare);
+      expect(tenantAuthRoutes(bare, unrouted)).toEqual({ routes: {}, urls: {}, problems: [] });
+    }
+    expect(unsetPublicUrls(bare)).toEqual(['consolePublicUrl', 'controllerPublicUrl']);
+  });
+
+  it('derives the gateway port from an explicit :80 pattern (#128)', () => {
+    const { consolePublicUrl: _c, ...bare } = auth;
+    const pattern80 = 'http://{host}.{tenant}.localhost:80';
+    const derived = withDerivedPublicUrls(bare, pattern80);
+    expect(derived).toEqual({
+      ...bare,
+      consolePublicUrl: 'http://console.{tenant}.localhost',
+      controllerPublicUrl: 'https://controller.{tenant}.localhost:80',
+    });
+    expect(tenantAuthRoutes(derived, pattern80)).toMatchObject({
+      routes: { console: 'console', controller: 'controller' },
+      problems: [],
+    });
+  });
+
+  it('renders the derived URLs into the console and controller settings (#128)', () => {
+    const { consolePublicUrl: _c, ...bare } = auth;
+    const registry = { component: `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}` };
+    const derivedCfg: ControllerConfig = {
+      ...cfg,
+      routeUrlPattern: pattern,
+      tenantAuth: withDerivedPublicUrls({ ...bare, registry }, pattern),
+    };
+    const resources = tenantAuthResources(tenant(), derivedCfg, {
+      ...inputs,
+      registryServing: true,
+    });
+    expect(env(find(resources, 'Deployment', 'tenant-console') as Deployment)).toMatchObject({
+      TENANT_CONSOLE_PUBLIC_URL: 'http://console.alpha.localhost:28180',
+      TENANT_CONSOLE_CONTROLLER_PUBLIC_URL: 'https://controller.alpha.localhost:28180',
+    });
+    expect(env(find(resources, 'Deployment', 'tenant-controller') as Deployment)).toMatchObject({
+      TENANT_CONTROLLER_REGISTRY_URL: 'https://registry.alpha.localhost:28180',
+    });
+    expect(tenantControllerCertNames('alpha', derivedCfg.tenantAuth).dns).toEqual(
+      expect.arrayContaining(['controller.alpha.localhost', 'registry.alpha.localhost']),
+    );
+  });
+
   it('admits the gateway to the routed ports only and publishes the URLs', () => {
     const resources = tenantAuthResources(tenant(), routedCfg, inputs);
     for (const [app, port] of [
@@ -1761,7 +1870,7 @@ describe('tenant registry (#83:reconcile)', () => {
         package: 'secrets',
         interfaces: ['store', 'reveal'],
         config: {
-          'tenant-controller-url': 'http://tenant-controller.di-runtime-alpha.svc:8789',
+          'tenant-controller-url': 'https://tenant-controller.di-runtime-alpha.svc:8789',
           tenant: 'alpha',
         },
       },
@@ -1882,6 +1991,39 @@ describe('tenant registry (#83:reconcile)', () => {
         registry: { component: COMPONENT_REF, publicUrl: 'https://10.1.2.3:8790' },
       }).ips,
     ).toContain('10.1.2.3');
+  });
+
+  it('names the host the registry calls for whoami exactly in the controller certificate (#113)', () => {
+    const resources = tenantAuthResources(tenant(), registryCfg, {
+      ...inputs,
+      registryServing: true,
+    });
+    const workload = find(resources, 'WorkloadDeployment', REGISTRY_WORKLOAD) as Workload;
+    const { components, hostInterfaces } = workload.spec.template.spec as {
+      components: { localResources?: unknown }[];
+      hostInterfaces: { package: string; config?: Record<string, string> }[];
+    };
+    const secrets = hostInterfaces.find((i) => i.package === 'secrets');
+    const url = new URL(String(secrets?.config?.['tenant-controller-url']));
+    expect(url.protocol).toBe('https:');
+    expect(url.hostname).toBe('tenant-controller.di-runtime-alpha.svc');
+    expect(url.hostname).toBe(registryWhoamiHost('alpha'));
+    expect(url.port).toBe('8789');
+    // The egress allowlist names the same host and port.
+    expect(components[0]?.localResources).toEqual({
+      allowedHosts: [url.host],
+    });
+    // The certificate the controller is issued carries that exact name: not only a wildcard or
+    // the `.cluster.local` form, which the registry's TLS check would not match.
+    const names = tenantControllerCertNames('alpha', withRegistry);
+    const ca = caCertificate('tenant-controller CA (di-runtime-alpha)', 30);
+    const leaf = leafCertificate(url.hostname, names.dns, names.ips, 30, ca.cert, ca.key);
+    expect(certificateNames(leaf.cert)?.dns.filter((name) => name === url.hostname)).toEqual([
+      url.hostname,
+    ]);
+    expect(new X509Certificate(leaf.cert).checkHost(url.hostname)).toBe(url.hostname);
+    for (const name of ['beta', 'gamma'])
+      expect(tenantControllerCertNames(name).dns).toContain(registryWhoamiHost(name));
   });
 
   it('deploys the registry after raising the workload quota and reports it on TenantAuthReady', async () => {
