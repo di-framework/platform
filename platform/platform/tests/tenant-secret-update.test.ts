@@ -21,6 +21,7 @@ interface Case {
   name?: string;
   oldKeys?: string[];
   newKeys?: string[];
+  dryRun?: boolean;
 }
 
 const data = (keys?: string[]) =>
@@ -31,7 +32,11 @@ const celDenial = (c: Case) => {
   const metadata = { name: c.name ?? 'db.prod' };
   const oldObject = { metadata, ...data(c.oldKeys) };
   const object = { metadata, ...data(c.newKeys) };
-  const request = { operation: 'UPDATE', userInfo: { username: c.username } };
+  const request: Record<string, unknown> = {
+    operation: 'UPDATE',
+    userInfo: { username: c.username },
+  };
+  if (c.dryRun !== undefined) request.dryRun = c.dryRun;
   return spec.validations.find(
     (rule) => evaluate(rule.expression, { request, object, oldObject }) !== true,
   )?.message;
@@ -85,5 +90,33 @@ describe('tenant-secret-update admission (#112)', () => {
       ).toBeUndefined();
       expect(both({ username, oldKeys: ['a', 'b'], newKeys: [] })).toBeUndefined();
     }
+  });
+
+  it('denies dry-run UPDATEs exactly like real ones (no dryRun exemption, #204)', () => {
+    // cli-extensions#70 probes this policy with dry-run UPDATEs; see the admission.ts doc comment.
+    const dropKey = [
+      { oldKeys: ['a', 'b'], newKeys: ['a'] },
+      { oldKeys: ['a'], newKeys: ['b'] },
+    ];
+    for (const keys of dropKey) {
+      const real = both({ username: developer, ...keys });
+      expect(real).toBe(SECRET_UPDATE_KEYS_MESSAGE);
+      expect(both({ username: developer, dryRun: true, ...keys })).toBe(real);
+    }
+  });
+
+  it('allows dry-run UPDATEs that keep all keys', () => {
+    expect(
+      both({ username: developer, dryRun: true, oldKeys: ['a'], newKeys: ['a'] }),
+    ).toBeUndefined();
+    expect(
+      both({ username: developer, dryRun: true, oldKeys: ['a', 'b'], newKeys: ['a', 'b'] }),
+    ).toBeUndefined();
+  });
+
+  it('mentions dryRun nowhere in the rendered policy or binding (no exemption)', () => {
+    // Covers validations, matchConditions, variables and the binding, not only validations.
+    expect(JSON.stringify({ spec, binding: policy.binding })).not.toContain('dryRun');
+    expect((spec as unknown as Record<string, unknown>).matchConditions).toBeUndefined();
   });
 });
