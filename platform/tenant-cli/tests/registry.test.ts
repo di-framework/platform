@@ -1,10 +1,38 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  spyOn,
+  test,
+} from 'bun:test';
+import * as fs from 'node:fs';
+import {
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type Io, run } from '../src/cli.ts';
 import { type Credential, readStore, writeStore } from '../src/credentials.ts';
-import { dockerConfigPath, loginCommand } from '../src/registry.ts';
+import {
+  dockerConfigPath,
+  loginCommand,
+  logoutCommand,
+  registryOrigin,
+  registryUsername,
+} from '../src/registry.ts';
 import { caPem, readCaFile, trusting } from '../src/trust.ts';
 import { fakeFetch, type Recorded } from './support/fake-fetch.ts';
 
@@ -205,10 +233,10 @@ describe('registry login', () => {
         command: [
           'podman',
           'login',
-          'registry.acme.test:8443',
-          '--username',
-          'token',
+          '--username=token',
           '--password-stdin',
+          '--',
+          'registry.acme.test:8443',
         ],
         stdin: `${SECRET}\n`,
       },
@@ -225,11 +253,11 @@ describe('registry login', () => {
     expect(execs[0]?.command).toEqual([
       'oras',
       'login',
-      '127.0.0.1:5000',
-      '--username',
-      'token',
+      '--username=token',
       '--password-stdin',
       '--plain-http',
+      '--',
+      '127.0.0.1:5000',
     ]);
     expect(err[0]).toBe('oras login 127.0.0.1:5000 failed (exit 1)');
   });
@@ -270,8 +298,304 @@ describe('registry login', () => {
     expect(JSON.parse(readFileSync(configFile(), 'utf8')).auths).toEqual({
       'ghcr.io': { auth: 'b3RoZXI=' },
     });
-    expect(await run(['registry', 'logout'], io(fetch))).toBe(0);
+    expect((readStore(env).acme as Credential).registry).toBeUndefined();
+    expect(await run(['registry', 'logout'], io(fetch))).toBe(1);
+    expect(err.at(-1)).toBe('no registry login is recorded; pass --host <host>');
+    expect(await run(['registry', 'logout', '--host', 'registry.acme.test:8443'], io())).toBe(0);
     expect(err.at(-1)).toContain('No registry.acme.test:8443 login');
+  });
+
+  test('registry logout and logout need no controller; a --with login is undone by its tool', async () => {
+    const { fetch } = fakes();
+    expect(await run(['registry', 'login', '--with', 'docker'], io(fetch))).toBe(0);
+    expect((readStore(env).acme as Credential).registry).toEqual({
+      host: 'registry.acme.test:8443',
+      tool: 'docker',
+    });
+    expect(await run(['registry', 'logout'], io())).toBe(0);
+    expect(execs.at(-1)).toEqual({
+      command: ['docker', 'logout', '--', 'registry.acme.test:8443'],
+      stdin: '',
+    });
+    expect(err.at(-1)).toBe('Logged out of registry.acme.test:8443 with docker.');
+
+    // `logout` removes the Docker config entry it holds the key for.
+    expect(await run(['registry', 'login'], io(fetch))).toBe(0);
+    const logout = fakeFetch({ 'POST /v1/auth/logout': () => new Response(null, { status: 204 }) });
+    expect(await run(['logout'], io(logout.fetch))).toBe(0);
+    expect(JSON.parse(readFileSync(configFile(), 'utf8')).auths).toEqual({});
+    expect(readStore(env)).toEqual({});
+  });
+
+  test('logout still forgets the account when the registry cleanup fails', async () => {
+    writeStore({ acme: { ...credential, registry: { host: 'r.test', tool: 'podman' } } }, env);
+    execCode = 125;
+    const logout = fakeFetch({ 'POST /v1/auth/logout': () => new Response(null, { status: 204 }) });
+    expect(await run(['logout'], io(logout.fetch))).toBe(0);
+    expect(err).toContain('warning: podman logout r.test failed (exit 125)');
+    writeStore({ acme: { ...credential, registry: { host: 'r.test', tool: 'podman' } } }, env);
+    expect(await run(['logout'], { ...io(logout.fetch), exec: undefined })).toBe(0);
+    expect(err).toContain('warning: the r.test login was kept: cannot run podman from here');
+    expect(readStore(env)).toEqual({});
+  });
+
+  test('an identity token is refreshed before it is stored, so it gets its full lifetime', async () => {
+    const soon = new Date(Date.now() + 10 * 60_000).toISOString();
+    writeStore(
+      {
+        acme: {
+          ...credential,
+          via: 'identity',
+          apiKey: undefined,
+          accessToken: 'old-token',
+          refreshToken: 'refresh-1',
+          expiresAt: soon,
+          issuer: 'https://issuer.test',
+          clientId: 'cli',
+        },
+      },
+      env,
+    );
+    const { fetch, calls } = fakeFetch({
+      'GET /.well-known/openid-configuration': () =>
+        Response.json({
+          issuer: 'https://issuer.test',
+          authorization_endpoint: 'https://issuer.test/oauth2/authorize',
+          token_endpoint: 'https://issuer.test/oauth2/token',
+        }),
+      'POST /oauth2/token': () =>
+        Response.json({ access_token: SECRET, refresh_token: 'refresh-2', expires_in: 3600 }),
+      'GET /v1/deploy/registry': () => Response.json(registryInfo),
+      'GET /v2/': (r: Recorded) =>
+        r.headers.authorization === `Basic ${btoa(`token:${SECRET}`)}`
+          ? Response.json({})
+          : new Response(null, { status: 401 }),
+    });
+    expect(await run(['registry', 'login'], io(fetch))).toBe(0);
+    expect(calls.some((c) => c.url === 'https://issuer.test/oauth2/token')).toBe(true);
+    const stored = readStore(env).acme as Credential;
+    expect(stored.accessToken).toBe(SECRET);
+    expect(stored.refreshToken).toBe('refresh-2');
+    expect(
+      JSON.parse(readFileSync(configFile(), 'utf8')).auths['registry.acme.test:8443'].auth,
+    ).toBe(btoa(`token:${SECRET}`));
+    expect(printed()).not.toContain(SECRET);
+  });
+});
+
+describe('registry URL validation', () => {
+  const refused = async (url: string, why: string) => {
+    const { fetch, calls } = fakes({ ...registryInfo, url });
+    for (const argv of [
+      ['registry', 'login'],
+      ['registry', 'login', '--with', 'oras'],
+    ]) {
+      err.length = 0;
+      expect(await run(argv, io(fetch))).toBe(1);
+      expect(err[0]).toBe(`the controller returned an unusable registry URL: ${why}`);
+    }
+    expect(calls.every((c) => c.url.endsWith('/v1/deploy/registry'))).toBe(true);
+    expect(execs).toHaveLength(0);
+    expect(existsSync(configFile())).toBe(false);
+    expect(printed()).not.toContain(url.includes('@') ? 'secret' : SECRET);
+  };
+
+  test('plain http to a public host is refused', () =>
+    refused(
+      'http://registry.acme.test',
+      'plain http is only allowed for loopback and in-cluster hosts',
+    ));
+  test('a host that starts with - is refused', () =>
+    refused('https://--tls-verify=false/', 'the host is not a valid hostname'));
+  test('a host with characters outside a hostname is refused', () =>
+    refused('https://reg_istry.test', 'the host is not a valid hostname'));
+  test('a port that is not a number up to 65535 is refused', async () => {
+    await refused('https://registry.test:99999', 'not a URL');
+    await refused('https://registry.test:-1', 'not a URL');
+  });
+  test('userinfo, path, query, fragment and other schemes are refused', async () => {
+    await refused('https://user:secret@registry.test', 'userinfo is not allowed');
+    await refused('https://registry.test/v2', 'path, query, and fragment are not allowed');
+    await refused('https://registry.test/?x=1', 'path, query, and fragment are not allowed');
+    await refused('https://registry.test/#x', 'path, query, and fragment are not allowed');
+    await refused('ftp://registry.test', 'the scheme must be https');
+  });
+  test('registry info validates too', async () => {
+    const { fetch } = fakes({ ...registryInfo, url: 'http://registry.acme.test' });
+    expect(await run(['registry'], io(fetch))).toBe(1);
+  });
+
+  test('accepted origins: https, and http only for loopback and in-cluster hosts', () => {
+    expect(registryOrigin('https://Registry.Acme.test:8443')).toEqual({
+      origin: 'https://registry.acme.test:8443',
+      host: 'registry.acme.test:8443',
+      plainHttp: false,
+    });
+    for (const url of [
+      'http://localhost:5000',
+      'http://127.0.0.1:5000',
+      'http://[::1]:5000',
+      'http://tenant-registry.di-runtime-acme.svc',
+      'http://tenant-registry.di-runtime-acme.svc.cluster.local',
+    ]) {
+      expect(registryOrigin(url).plainHttp).toBe(true);
+    }
+    expect(registryOrigin('https://[fd00::1]:5000').host).toBe('[fd00::1]:5000');
+    expect(() => registryOrigin('http://evil.svc.example.com')).toThrow('plain http');
+  });
+
+  test('an unusable username is refused before it reaches a file or a tool', async () => {
+    expect(registryUsername('token')).toBe('token');
+    for (const name of ['--password=x', 'a:b', '', 'x y']) {
+      expect(() => registryUsername(name)).toThrow('unusable registry username');
+    }
+    const { fetch } = fakes({ ...registryInfo, username: '-u' });
+    expect(await run(['registry', 'login', '--with', 'docker'], io(fetch))).toBe(1);
+    expect(execs).toHaveLength(0);
+  });
+
+  test('registry logout --host is validated too', async () => {
+    expect(await run(['registry', 'logout', '--host', '-x'], io())).toBe(1);
+    expect(err[0]).toBe(
+      'the controller returned an unusable registry URL: the host is not a valid hostname',
+    );
+  });
+
+  test('the /v2/ check refuses a redirect instead of following it', async () => {
+    const elsewhere = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json({}) });
+    const registry = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch: () => Response.redirect(`http://127.0.0.1:${elsewhere.port}/v2/`, 302),
+    });
+    try {
+      const controller = fakeFetch({
+        'GET /v1/deploy/registry': () =>
+          Response.json({ ...registryInfo, url: `http://127.0.0.1:${registry.port}` }),
+      });
+      const routed = (async (input: string | URL | Request, init?: RequestInit) =>
+        String(input).includes('/v2/')
+          ? fetch(input, init)
+          : controller.fetch(input, init)) as typeof fetch;
+      expect(await run(['registry', 'login'], io(routed))).toBe(1);
+      expect(err[0]).toStartWith(`cannot reach the registry at http://127.0.0.1:${registry.port}:`);
+      expect(existsSync(configFile())).toBe(false);
+    } finally {
+      registry.stop(true);
+      elsewhere.stop(true);
+    }
+  });
+});
+
+describe('docker config writes', () => {
+  test('an existing 0644 config never holds the token; it is replaced by a 0600 file', async () => {
+    mkdirSync(env.DOCKER_CONFIG as string, { recursive: true });
+    writeFileSync(configFile(), JSON.stringify({ auths: { 'ghcr.io': { auth: 'b3RoZXI=' } } }), {
+      mode: 0o644,
+    });
+    // A second name for the original file shows what was ever written into it.
+    const original = join(scratch, 'original.json');
+    linkSync(configFile(), original);
+    const { fetch } = fakes();
+    expect(await run(['registry', 'login'], io(fetch))).toBe(0);
+    expect(readFileSync(original, 'utf8')).not.toContain(btoa(`token:${SECRET}`));
+    expect(statSync(original).mode & 0o777).toBe(0o644);
+    expect(statSync(configFile()).mode & 0o777).toBe(0o600);
+    const config = JSON.parse(readFileSync(configFile(), 'utf8'));
+    expect(Object.keys(config.auths)).toEqual(['ghcr.io', 'registry.acme.test:8443']);
+    expect(readdirSync(env.DOCKER_CONFIG as string)).toEqual(['config.json']);
+  });
+
+  test('a symlinked config keeps its link; the real file is replaced', async () => {
+    const dotfiles = join(scratch, 'dotfiles');
+    mkdirSync(dotfiles);
+    mkdirSync(env.DOCKER_CONFIG as string);
+    writeFileSync(join(dotfiles, 'docker.json'), JSON.stringify({ auths: {} }));
+    symlinkSync(join(dotfiles, 'docker.json'), configFile());
+    const { fetch } = fakes();
+    expect(await run(['registry', 'login'], io(fetch))).toBe(0);
+    expect(lstatSync(configFile()).isSymbolicLink()).toBe(true);
+    const real = JSON.parse(readFileSync(join(dotfiles, 'docker.json'), 'utf8'));
+    expect(real.auths['registry.acme.test:8443'].auth).toBe(btoa(`token:${SECRET}`));
+    expect(statSync(join(dotfiles, 'docker.json')).mode & 0o777).toBe(0o600);
+  });
+
+  test('a dangling symlink is written through to its target', async () => {
+    mkdirSync(env.DOCKER_CONFIG as string);
+    symlinkSync('../dotfiles/new.json', configFile());
+    const { fetch } = fakes();
+    expect(await run(['registry', 'login'], io(fetch))).toBe(0);
+    expect(lstatSync(configFile()).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(scratch, 'dotfiles', 'new.json'))).toBe(true);
+  });
+
+  test('a failed write leaves the previous config and no temporary file', async () => {
+    mkdirSync(env.DOCKER_CONFIG as string);
+    writeFileSync(configFile(), '{"auths":{}}');
+    const { fetch } = fakes();
+    const rename = spyOn(fs, 'renameSync').mockImplementation(() => {
+      throw new Error('ENOSPC: no space left on device');
+    });
+    try {
+      await expect(run(['registry', 'login'], io(fetch))).rejects.toThrow('ENOSPC');
+    } finally {
+      rename.mockRestore();
+    }
+    expect(readdirSync(env.DOCKER_CONFIG as string)).toEqual(['config.json']);
+    expect(readFileSync(configFile(), 'utf8')).toBe('{"auths":{}}');
+  });
+});
+
+describe('stored CA', () => {
+  const pem = '-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n';
+  const controllerFakes = () =>
+    fakeFetch({
+      'GET /v1/auth/info': () =>
+        Response.json({ account: 'acme', issuer: 'https://issuer.test', clientId: 'cli' }),
+      'GET /v1/auth/whoami': () =>
+        Response.json({ account: 'acme', user: 'alice', role: 'developer', via: 'api-key' }),
+    });
+  const login = (...extra: string[]) =>
+    run(
+      ['login', '--controller', 'https://controller.test', '--api-key', SECRET, ...extra],
+      io(controllerFakes().fetch),
+    );
+
+  test('login keeps a stored CA for the same controller and --no-ca drops it', async () => {
+    const data = Buffer.from(pem).toString('base64');
+    writeStore(
+      {
+        acme: {
+          ...credential,
+          controller: { url: credential.controller.url, certificateAuthorityData: data },
+        },
+      },
+      env,
+    );
+    expect(await login()).toBe(0);
+    expect((readStore(env).acme as Credential).controller.certificateAuthorityData).toBe(data);
+    expect(await login('--no-ca')).toBe(0);
+    expect((readStore(env).acme as Credential).controller).toEqual({
+      url: 'https://controller.test',
+    });
+  });
+
+  test('--ca-file and --no-ca are exclusive', async () => {
+    writeFileSync(join(scratch, 'ca.pem'), pem);
+    expect(await login('--ca-file', join(scratch, 'ca.pem'), '--no-ca')).toBe(1);
+    expect(err[0]).toBe('--ca-file and --no-ca are exclusive');
+  });
+
+  test('only chain-trust failures get the --ca-file hint', async () => {
+    const failing = (code: string) =>
+      (async () => {
+        throw Object.assign(new TypeError(`tls failure ${code}`), { code });
+      }) as unknown as typeof fetch;
+    expect(await run(['whoami'], io(failing('SELF_SIGNED_CERT_IN_CHAIN')))).toBe(1);
+    expect(err.at(-1)).toContain('login --ca-file <ca.crt>');
+    await expect(run(['whoami'], io(failing('CERT_HAS_EXPIRED')))).rejects.toThrow(
+      'tls failure CERT_HAS_EXPIRED',
+    );
   });
 });
 
@@ -282,16 +606,18 @@ describe('helpers', () => {
     expect(dockerConfigPath(undefined, { HOME: '/h' })).toBe('/h/.docker/config.json');
   });
 
-  test('loginCommand: docker over http adds nothing (its daemon decides)', () => {
-    expect(loginCommand('docker', 'h:1', 'token', true)).toEqual([
+  test('loginCommand: options first, then -- and the host; docker over http adds nothing', () => {
+    const local = registryOrigin('http://127.0.0.1:1');
+    expect(loginCommand('docker', local, 'token')).toEqual([
       'docker',
       'login',
-      'h:1',
-      '--username',
-      'token',
+      '--username=token',
       '--password-stdin',
+      '--',
+      '127.0.0.1:1',
     ]);
-    expect(loginCommand('podman', 'h:1', 'token', true).at(-1)).toBe('--tls-verify=false');
+    expect(loginCommand('podman', local, 'token')).toContain('--tls-verify=false');
+    expect(logoutCommand('oras', 'h:1')).toEqual(['oras', 'logout', '--', 'h:1']);
   });
 
   test('readCaFile keeps only PEM certificates and refuses anything else', () => {
