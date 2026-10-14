@@ -20,7 +20,7 @@ import {
 } from './kube.ts';
 import { discover, type ProviderMetadata } from './oidc.ts';
 import { controllerSecretReader } from './v1/context.ts';
-import { serveV1 } from './v1/index.ts';
+import { serveV1, TITLES } from './v1/index.ts';
 import {
   PASSTHROUGH,
   servePassthrough,
@@ -427,6 +427,50 @@ const json = (body: unknown, code = 200) =>
     headers: { 'Content-Type': 'application/json' },
   });
 
+/**
+ * The `/v1` contract's paths, whose every error is an RFC 9457 problem+json (the contract's
+ * `Problem`). Everything else the main listener serves keeps the Kubernetes Status shape.
+ */
+const isV1 = (pathname: string) => pathname.startsWith('/v1/');
+
+/** The `/v1` bearer challenge (RFC 6750). */
+const BEARER_CHALLENGE = 'Bearer realm="di-framework-tenant"';
+
+/**
+ * A non-empty bearer token was sent. Only then does a 401 say `invalid_token`: a request with no
+ * credential, another scheme, or an empty `Bearer` gets the bare challenge (RFC 6750 §3.1).
+ */
+const BEARER_PRESENTED = /^Bearer\s+\S/i;
+
+/**
+ * An {@link AuthError} as a `/v1` problem: 401 carries the bearer challenge. The detail is the
+ * error's fixed message, which never quotes the credential (platform#97).
+ */
+function v1Refusal(error: AuthError, authorization: string | null): Response {
+  const response = problem(error.status, TITLES[error.status] ?? 'Client Error', error.message);
+  if (error.status === 401)
+    response.headers.set(
+      'www-authenticate',
+      BEARER_PRESENTED.test(authorization ?? '')
+        ? `${BEARER_CHALLENGE}, error="invalid_token"`
+        : BEARER_CHALLENGE,
+    );
+  return response;
+}
+
+/** An {@link AuthError} in the caller's shape: a problem under `/v1/`, a Kubernetes Status elsewhere. */
+function refusal(request: Request, url: URL, error: AuthError): Response {
+  if (isV1(url.pathname)) return v1Refusal(error, request.headers.get('authorization'));
+  return status(error.status, error.status === 401 ? 'Unauthorized' : 'Forbidden', error.message);
+}
+
+/** A 502 with a fixed message (platform#84), in the caller's shape like {@link refusal}. */
+function unavailable(url: URL, message: string): Response {
+  return isV1(url.pathname)
+    ? problem(502, 'Bad Gateway', message)
+    : status(502, 'ServiceUnavailable', message);
+}
+
 /** A `docker-content-length` value usable as `Content-Length`: plain digits, safe integer (a duplicated header joins with a comma and fails). */
 export function parseSideContentLength(value: string | null): string | undefined {
   if (value === null || !/^\d+$/.test(value)) return undefined;
@@ -639,14 +683,10 @@ export class Controller {
         if (error.status === 503) {
           return this.serviceUnavailableUntilDiscovery();
         }
-        return status(
-          error.status,
-          error.status === 401 ? 'Unauthorized' : 'Forbidden',
-          error.message,
-        );
+        return refusal(request, url, error);
       }
       this.audit('request.failed', { path: url.pathname, reason: String(error) });
-      return status(502, 'ServiceUnavailable', 'the identity provider or cluster is unavailable');
+      return unavailable(url, 'the identity provider or cluster is unavailable');
     }
     // A proxy session URL (not a contract operation): forwarded to the session's service.
     const clientAddress = server?.requestIP(request)?.address;
@@ -675,17 +715,12 @@ export class Controller {
         return await this.own(request, url, principal);
       return await this.proxy(request, url, principal);
     } catch (error) {
-      if (error instanceof AuthError)
-        return status(
-          error.status,
-          error.status === 401 ? 'Unauthorized' : 'Forbidden',
-          error.message,
-        );
+      if (error instanceof AuthError) return refusal(request, url, error);
       // The reason can name ServiceAccounts, namespaces, RBAC text, or the API server URL: it
       // stays in the audit, and the caller gets a fixed message (platform#84).
       const reason = error instanceof KubeError ? error.message : String(error);
       this.audit('request.failed', { user: principal.user, path: url.pathname, reason });
-      return status(502, 'ServiceUnavailable', 'the cluster request failed');
+      return unavailable(url, 'the cluster request failed');
     }
   }
 
@@ -723,11 +758,7 @@ export class Controller {
           reason: error.message,
         });
         if (error.status === 503) return this.serviceUnavailableUntilDiscovery();
-        return problem(
-          error.status,
-          error.status === 401 ? 'Unauthorized' : 'Forbidden',
-          error.message,
-        );
+        return v1Refusal(error, authorization);
       }
       this.audit('request.failed', {
         path: url.pathname,
