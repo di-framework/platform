@@ -321,6 +321,27 @@ var named like an existing secret's environment variable, or a secret whose envi
 is an existing var. The deploy lane (platform#55) must still reject a bundle that meets such a
 pair (for example one created out of band) with 422; it never picks a precedence.
 
+**Unset refuses what a deployed workload injects (platform#100).** Deleting a Secret a running
+workload injects stops its replicas from being placed (`Config=False … Secret "<name>.<env>" not
+found`), and removing a var silently drops it from the workload's environment. So before an
+unset, the endpoints list the tenant's WorkloadDeployments as the caller and look at every
+guest's `localResources.environment` (`components[*]` and `service`):
+
+- `DELETE /v1/secrets/<name>?env=<env>` answers 409 when any of them lists `<name>.<env>` in
+  `secretFrom`;
+- `DELETE /v1/vars/<NAME>?env=<env>` answers 409 when any of them lists `di-vars-<env>` in
+  `configFrom`. Workloads inject the whole vars ConfigMap, not single keys, so every var of that
+  env counts as referenced while such a workload exists.
+
+The 409 is a problem+json whose `detail` names the referencing WorkloadDeployments, sorted
+(`secret verify-token is referenced by deployed workloads in staging: greeter-staging; …`), and
+nothing is deleted. A name that does not exist is still a 404 first. Unset succeeds once nothing
+references it: destroy the workload, or for a secret redeploy without it in `secrets`. Set and
+update are never blocked. The check reads the live objects, so a workload applied out of band
+counts too; a deploy racing the unset is caught by the deploy's own existence check (422).
+Whether an emptied vars ConfigMap is deleted is a separate decision (platform#98); today it is
+kept with no keys.
+
 **HTTP host and labels (platform#101, #103).** A service's HTTP host is `<service>-<env>`
 (for example `greeter-staging`, `greeter-prod`), the WorkloadDeployment's own name, in every env.
 The deploy lane sets `config.host: <service>-<env>` on the `wasi:http` host interface (keeping

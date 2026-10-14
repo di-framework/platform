@@ -10,7 +10,7 @@ const schemas = {
 };
 
 /** `secrets` and `vars` share one shape; secrets are write-only on read. */
-function entries(noun: 'secret' | 'var', readDescription: string) {
+function entries(noun: 'secret' | 'var', readDescription: string, unsetDescription: string) {
   const plural = `${noun}s`;
   const title = noun === 'secret' ? 'Secret' : 'Var';
   return [
@@ -60,6 +60,7 @@ function entries(noun: 'secret' | 'var', readDescription: string) {
         path: `/${plural}/:name`,
         successStatus: 204,
         summary: `Unset a ${noun}`,
+        description: unsetDescription,
         parameters: [env],
       },
       'Empty',
@@ -72,14 +73,22 @@ export const secrets = manifest(
   'secrets',
   '/v1',
   schemas,
-  entries('secret', 'Names and update times only; secret values are never returned.'),
+  entries(
+    'secret',
+    'Names and update times only; secret values are never returned.',
+    'Deletes the secret; 404 when it does not exist, 409 naming the deployed workloads while any of them injects it.',
+  ),
 );
 
 export const vars = manifest(
   'vars',
   '/v1',
   schemas,
-  entries('var', 'Names, values, and update times of the environment variables.'),
+  entries(
+    'var',
+    'Names, values, and update times of the environment variables.',
+    "Removes the var; 404 when it does not exist, 409 naming the deployed workloads while any of them injects the environment's vars.",
+  ),
 );
 
 export default secrets;

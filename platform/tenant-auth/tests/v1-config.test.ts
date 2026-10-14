@@ -32,6 +32,10 @@ let corruptAnnotation = false;
 let raceAfterGet: { key: string; run: () => void } | undefined;
 /** When set, Secret reads with the controller's own token answer this status. */
 let refuseController: number | undefined;
+/** The tenant's WorkloadDeployments, as the API server lists them (platform#100). */
+let workloads: unknown[] = [];
+const WORKLOADS =
+  '/apis/runtime.wasmcloud.dev/v1alpha1/namespaces/di-tenant-acme/workloaddeployments';
 
 /** Answers 409 when `expected` is set and differs from the stored version, like the API server. */
 const stale = (key: string, expected: string | undefined) =>
@@ -49,6 +53,8 @@ const api = serve((request) => {
       },
     });
   }
+  if (request.pathname === WORKLOADS && request.method === 'GET')
+    return failGet ? json({ message: 'boom' }, 500) : json({ items: workloads });
   const match = /^\/api\/v1\/namespaces\/di-tenant-acme\/(secrets|configmaps)(?:\/([^/]+))?$/.exec(
     request.pathname,
   );
@@ -205,7 +211,31 @@ beforeEach(() => {
   corruptAnnotation = false;
   raceAfterGet = undefined;
   refuseController = undefined;
+  workloads = [];
 });
+
+/** A WorkloadDeployment whose guests inject `sources`, shaped like the deploy lane renders it. */
+const workload = (
+  name: string,
+  sources: { configFrom?: string[]; secretFrom?: string[] },
+  at: 'components' | 'service' = 'components',
+) => {
+  const environment = Object.fromEntries(
+    Object.entries(sources).map(([field, names]) => [field, names.map((n) => ({ name: n }))]),
+  );
+  const guest = { name: 'app', localResources: { environment } };
+  return {
+    metadata: { name, labels: { 'platform.di-framework.dev/env': name.split('-').pop() } },
+    spec: {
+      template: {
+        spec:
+          at === 'service'
+            ? { components: [{ name: 'c' }], service: guest }
+            : { components: [guest] },
+      },
+    },
+  };
+};
 
 /** Simulates another writer bumping the stored object's resource version. */
 const bump = (key: string) => () => {
@@ -343,7 +373,8 @@ describe('secrets', () => {
     const calls = kubeCalls();
     expect(calls.length).toBeGreaterThan(0);
     for (const request of calls) {
-      expect(request.pathname.startsWith(NS)).toBe(true);
+      // Unset also lists, as the caller, the WorkloadDeployments that could inject it (#100).
+      expect(request.pathname.startsWith(NS) || request.pathname === WORKLOADS).toBe(true);
       // Secret reads run as the controller; every write runs as the caller, never as a PATCH.
       const secret = request.pathname.startsWith(`${NS}/secrets`);
       expect(request.headers.get('authorization')).toBe(
@@ -456,6 +487,45 @@ describe('secrets', () => {
     expect((await body(response)).detail).toBe('secret db changed concurrently; retry');
   });
 
+  test('unset of a secret a deployed workload injects is a 409 naming it; nothing is deleted', async () => {
+    await call('PUT', '/v1/secrets/verify-token?env=staging', 's');
+    await call('PUT', '/v1/secrets/verify-token?env=prod', 'p');
+    workloads = [
+      workload('greeter-staging', { secretFrom: ['verify-token.staging'] }),
+      workload(
+        'api-staging',
+        { configFrom: ['di-vars-staging'], secretFrom: ['verify-token.staging'] },
+        'service',
+      ),
+      workload('other-staging', { secretFrom: ['other.staging'] }),
+      { metadata: { name: 'bare-staging' } },
+      { metadata: { name: 'odd-staging' }, spec: { template: { spec: { components: 'x' } } } },
+    ];
+    const response = await call('DELETE', '/v1/secrets/verify-token?env=staging');
+    expect(response.status).toBe(409);
+    expect(response.headers.get('content-type')).toBe('application/problem+json');
+    expect((await body(response)).detail).toBe(
+      'secret verify-token is referenced by deployed workloads in staging: api-staging, greeter-staging; destroy them (or redeploy without it) before unsetting it',
+    );
+    expect(store.has('secrets/verify-token.staging')).toBe(true);
+    expect(kubeCalls().some((r) => r.method === 'DELETE')).toBe(false);
+    // The same name in an environment no workload references still unsets.
+    expect((await call('DELETE', '/v1/secrets/verify-token?env=prod')).status).toBe(204);
+    expect(store.has('secrets/verify-token.prod')).toBe(false);
+    // Once nothing injects it, the staging secret unsets too.
+    workloads = [workload('other-staging', { secretFrom: ['other.staging'] })];
+    expect((await call('DELETE', '/v1/secrets/verify-token?env=staging')).status).toBe(204);
+    expect(store.has('secrets/verify-token.staging')).toBe(false);
+  });
+
+  test('a failure listing workloads keeps the secret and is a generic 502', async () => {
+    await call('PUT', '/v1/secrets/db?env=prod', 'one');
+    failGet = true;
+    expect((await call('DELETE', '/v1/secrets/db?env=prod')).status).toBe(502);
+    failGet = false;
+    expect(store.has('secrets/db.prod')).toBe(true);
+  });
+
   test('unset deletes only the version it read', async () => {
     await call('PUT', '/v1/secrets/db?env=prod', 'one');
     raceAfterGet = { key: 'secrets/db.prod', run: bump('secrets/db.prod') };
@@ -545,7 +615,8 @@ describe('vars', () => {
       expect(request.headers.get('authorization')).toBe(
         request.pathname.startsWith(`${NS}/secrets`) ? 'Bearer admin' : 'Bearer sa-alice',
       );
-      expect(request.pathname.startsWith(NS)).toBe(true);
+      // Unset also lists the WorkloadDeployments that could reference the vars (platform#100).
+      expect(request.pathname.startsWith(NS) || request.pathname === WORKLOADS).toBe(true);
       if (request.method !== 'GET')
         expect(request.pathname.startsWith(`${NS}/configmaps`)).toBe(true);
     }
@@ -659,6 +730,32 @@ describe('vars', () => {
     // Names a secret cannot produce, and other environments, are unaffected.
     expect((await call('PUT', '/v1/vars/db_password?env=prod', 'x')).status).toBe(204);
     expect((await call('PUT', '/v1/vars/DB_PASSWORD?env=staging', 'x')).status).toBe(204);
+  });
+
+  test('unset of a var while a deployed workload injects the env vars is a 409; nothing changes', async () => {
+    await call('PUT', '/v1/vars/LEVEL?env=staging', 'debug');
+    await call('PUT', '/v1/vars/LEVEL?env=prod', 'info');
+    workloads = [
+      workload('greeter-staging', { configFrom: ['di-vars-staging'] }),
+      workload('api-prod', { configFrom: ['di-vars-prod'] }),
+      workload('worker-staging', { secretFrom: ['di-vars-staging'] }),
+    ];
+    const before = store.get('configmaps/di-vars-staging');
+    const response = await call('DELETE', '/v1/vars/LEVEL?env=staging');
+    expect(response.status).toBe(409);
+    expect(response.headers.get('content-type')).toBe('application/problem+json');
+    expect((await body(response)).detail).toBe(
+      'var LEVEL is referenced by deployed workloads in staging: greeter-staging; destroy them (or redeploy without it) before unsetting it',
+    );
+    expect(store.get('configmaps/di-vars-staging')).toEqual(before);
+    // A missing var is still a 404, not a reference conflict.
+    expect((await call('DELETE', '/v1/vars/NOPE?env=staging')).status).toBe(404);
+    // Set and update are not affected by references.
+    expect((await call('PATCH', '/v1/vars/LEVEL?env=staging', 'info')).status).toBe(204);
+    // An environment whose vars no workload injects still unsets.
+    workloads = [workload('greeter-staging', { configFrom: ['di-vars-staging'] })];
+    expect((await call('DELETE', '/v1/vars/LEVEL?env=prod')).status).toBe(204);
+    expect(store.get('configmaps/di-vars-prod')?.data).toEqual({});
   });
 
   test('an unlabelled di-vars ConfigMap is refused, never adopted', async () => {

@@ -52,6 +52,7 @@ export class VarsV1HttpController {
 
   @Endpoint({
     summary: 'Unset a var',
+    description: 'Removes the var; 404 when it does not exist, 409 naming the deployed workloads while any of them injects the environment\'s vars.',
     parameters: [{"name":"env","in":"query","required":true,"schema":{"type":"string","enum":["prod","staging"]}}],
     responses: {
       '204': {

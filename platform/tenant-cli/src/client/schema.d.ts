@@ -215,7 +215,10 @@ export interface paths {
          */
         put: operations["setSecret"];
         post?: never;
-        /** Unset a secret */
+        /**
+         * Unset a secret
+         * @description Deletes the secret; 404 when it does not exist, 409 naming the deployed workloads while any of them injects it.
+         */
         delete: operations["unsetSecret"];
         options?: never;
         head?: never;
@@ -300,7 +303,10 @@ export interface paths {
          */
         put: operations["setVar"];
         post?: never;
-        /** Unset a var */
+        /**
+         * Unset a var
+         * @description Removes the var; 404 when it does not exist, 409 naming the deployed workloads while any of them injects the environment's vars.
+         */
         delete: operations["unsetVar"];
         options?: never;
         head?: never;
