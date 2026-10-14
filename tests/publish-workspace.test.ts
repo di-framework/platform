@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -7,9 +7,16 @@ import {
   LICENSE_FILES,
   missingLicenses,
   missingPackedEntries,
+  PACK_MANIFEST,
+  type PackedPackage,
   packPaths,
+  packWorkspaces,
+  parseArgs,
   parsePackedPaths,
+  publishPacked,
   publishWorkspaces,
+  sha256File,
+  verifyPackDir,
   workspacePackageDirs,
 } from '../scripts/publish-workspace.ts';
 
@@ -174,5 +181,140 @@ describe('publish workspace packs', () => {
   test.skipIf(!pgliteBuilt)('pglite-component pack includes THIRD-PARTY-NOTICES.txt', () => {
     const packed = packPaths(join(rootDir, 'platform/pglite-component'));
     expect(packed).toContain('dist/THIRD-PARTY-NOTICES.txt');
+  });
+});
+
+/** A workspace with one public package whose build writes dist/build.txt, and one private one. */
+function packFixture(): { root: string; packDir: string } {
+  const root = mkdtempSync(join(tmpdir(), 'publish-pack-'));
+  writeFileSync(
+    join(root, 'package.json'),
+    JSON.stringify({ private: true, workspaces: ['packages/*'] }),
+  );
+  for (const license of LICENSE_FILES) writeFileSync(join(root, license), `${license}\n`);
+  const pkgDir = join(root, 'packages', 'ok');
+  mkdirSync(join(pkgDir, 'dist'), { recursive: true });
+  for (const license of LICENSE_FILES) writeFileSync(join(pkgDir, license), `${license}\n`);
+  writeFileSync(
+    join(pkgDir, 'package.json'),
+    JSON.stringify({
+      name: '@publish-pack/ok',
+      version: '1.2.3',
+      files: ['dist', ...LICENSE_FILES],
+      scripts: { build: 'echo rebuilt > dist/build.txt' },
+    }),
+  );
+  writeFileSync(join(pkgDir, 'dist', 'build.txt'), 'tested\n');
+  mkdirSync(join(root, 'packages', 'internal'), { recursive: true });
+  writeFileSync(
+    join(root, 'packages', 'internal', 'package.json'),
+    JSON.stringify({ name: 'internal', version: '0.0.0', private: true }),
+  );
+  return { root, packDir: join(root, 'out') };
+}
+
+function packedFile(tarball: string, path: string): string {
+  const result = Bun.spawnSync(['tar', '-xzOf', tarball, `package/${path}`], { stdout: 'pipe' });
+  expect(result.exitCode).toBe(0);
+  return result.stdout.toString();
+}
+
+describe('release packs (#168)', () => {
+  test('packs each public package once and records the tarball sha256', () => {
+    const { root, packDir } = packFixture();
+    const manifest = packWorkspaces(root, packDir);
+    expect(manifest.map((entry) => [entry.name, entry.version, entry.directory])).toEqual([
+      ['@publish-pack/ok', '1.2.3', 'packages/ok'],
+    ]);
+    const [entry] = manifest as [PackedPackage];
+    expect(entry.filename).toBe('publish-pack-ok-1.2.3.tgz');
+    expect(entry.sha256).toBe(sha256File(join(packDir, entry.filename)));
+    expect(JSON.parse(readFileSync(join(packDir, PACK_MANIFEST), 'utf8'))).toEqual(manifest);
+    expect(packedFile(join(packDir, entry.filename), 'dist/build.txt')).toBe('rebuilt\n');
+    expect(verifyPackDir(packDir)).toEqual(manifest);
+  });
+
+  test('a --prebuilt package is packed from the bytes already on disk, not rebuilt', () => {
+    const { root, packDir } = packFixture();
+    const [entry] = packWorkspaces(root, packDir, new Set(['@publish-pack/ok'])) as [PackedPackage];
+    expect(packedFile(join(packDir, entry.filename), 'dist/build.txt')).toBe('tested\n');
+    expect(readFileSync(join(root, 'packages/ok/dist/build.txt'), 'utf8')).toBe('tested\n');
+  });
+
+  test('refuses an unknown --prebuilt name, a non-empty pack directory, and an incomplete pack', () => {
+    const { root, packDir } = packFixture();
+    expect(() => packWorkspaces(root, packDir, new Set(['internal']))).toThrow(
+      '--prebuilt internal',
+    );
+    mkdirSync(packDir, { recursive: true });
+    writeFileSync(join(packDir, 'stale.tgz'), 'x');
+    expect(() => packWorkspaces(root, packDir)).toThrow('not empty');
+
+    const other = packFixture();
+    const manifestPath = join(other.root, 'packages/ok/package.json');
+    const pkg = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    writeFileSync(manifestPath, JSON.stringify({ ...pkg, files: [...pkg.files, 'wit'] }));
+    expect(() => packWorkspaces(other.root, other.packDir)).toThrow('missing wit');
+  });
+
+  test('verifyPackDir refuses a changed, missing, or unlisted tarball', () => {
+    const { root, packDir } = packFixture();
+    const [entry] = packWorkspaces(root, packDir) as [PackedPackage];
+    const tarball = join(packDir, entry.filename);
+    const bytes = readFileSync(tarball);
+
+    writeFileSync(join(packDir, 'extra.tgz'), 'x');
+    expect(() => verifyPackDir(packDir)).toThrow('unlisted files');
+    rmSync(join(packDir, 'extra.tgz'));
+
+    writeFileSync(tarball, Buffer.concat([bytes, Buffer.from([0])]));
+    expect(() => verifyPackDir(packDir)).toThrow('differs from the packed');
+    rmSync(tarball);
+    expect(() => verifyPackDir(packDir)).toThrow();
+  });
+
+  test('publishPacked publishes exactly the verified tarballs and skips published versions', () => {
+    const { root, packDir } = packFixture();
+    const [entry] = packWorkspaces(root, packDir) as [PackedPackage];
+    const sent: string[] = [];
+    const publish = (tarball: string) => {
+      expect(sha256File(tarball)).toBe(entry.sha256);
+      sent.push(tarball);
+    };
+    expect(publishPacked(packDir, { isPublished: () => false, publish })).toEqual([
+      '@publish-pack/ok',
+    ]);
+    expect(sent).toEqual([join(packDir, entry.filename)]);
+    expect(publishPacked(packDir, { isPublished: () => true, publish })).toEqual([]);
+    expect(sent).toHaveLength(1);
+
+    writeFileSync(join(packDir, entry.filename), 'tampered');
+    expect(() => publishPacked(packDir, { isPublished: () => false, publish })).toThrow(
+      'Refusing to publish',
+    );
+    expect(sent).toHaveLength(1);
+  });
+
+  test('parseArgs keeps the old modes and accepts exactly one mode', () => {
+    expect(parseArgs([])).toEqual({ mode: 'publish' });
+    expect(parseArgs(['--dry-run'])).toEqual({ mode: 'dry-run' });
+    expect(parseArgs(['--pack', 'out', '--prebuilt', 'a', '--prebuilt', 'b'])).toEqual({
+      mode: 'pack',
+      packDir: 'out',
+      prebuilt: new Set(['a', 'b']),
+    });
+    expect(parseArgs(['--publish-packed', 'out'])).toEqual({
+      mode: 'publish-packed',
+      packDir: 'out',
+    });
+    expect(parseArgs(['--verify-packed', 'out'])).toEqual({
+      mode: 'verify-packed',
+      packDir: 'out',
+    });
+    expect(() => parseArgs(['--dry-run', '--verify-packed', 'out'])).toThrow('only one');
+    expect(() => parseArgs(['--pack'])).toThrow('needs a value');
+    expect(() => parseArgs(['--pack', 'a', '--publish-packed', 'b'])).toThrow('only one');
+    expect(() => parseArgs(['--prebuilt', 'a'])).toThrow('only applies to --pack');
+    expect(() => parseArgs(['--publish'])).toThrow('unknown argument');
   });
 });
