@@ -109,8 +109,11 @@ const routes = new Map<string, unknown>([
           heldBy: 'Backup/v1',
           since: NOW,
           destination: 'pvc',
+          storageKey: 'identity',
+          workloadUid: 'uid-identity',
         }),
-        old: JSON.stringify({ replicas: 1, heldBy: 'Backup/x' }),
+        // Bindings that are not strings are not carried (#263): the sweeper then refuses it.
+        old: JSON.stringify({ replicas: 1, heldBy: 'Backup/x', storageKey: 7, workloadUid: {} }),
         junk: 'not json',
         partial: JSON.stringify({ replicas: 'two', heldBy: 'Backup/v1' }),
       },
@@ -284,7 +287,14 @@ describe('loading workload volume state', () => {
     expect(loaded.ledger).toEqual({
       resourceVersion: '41',
       entries: {
-        identity: { replicas: 2, heldBy: 'Backup/v1', since: NOW, destination: 'pvc' },
+        identity: {
+          replicas: 2,
+          heldBy: 'Backup/v1',
+          since: NOW,
+          destination: 'pvc',
+          storageKey: 'identity',
+          workloadUid: 'uid-identity',
+        },
         old: { replicas: 1, heldBy: 'Backup/x', since: '' },
       },
     });

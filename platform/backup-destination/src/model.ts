@@ -181,6 +181,13 @@ export interface HeldEntry {
   since: string;
   /** The BackupDestination whose source the workload is; the sweeper checks it against its spec. */
   destination?: string;
+  /**
+   * The platform storage key of the volume the workload was stopped for (#263). Once the
+   * destination is gone, the entry is given back only to a workload that still has this key.
+   */
+  storageKey?: string;
+  /** metadata.uid of the WorkloadDeployment when it was held: a re-created one is never raised. */
+  workloadUid?: string;
 }
 
 /**

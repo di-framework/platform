@@ -224,6 +224,8 @@ function entryOf(value: string): HeldEntry | undefined {
       heldBy: parsed.heldBy,
       since: String(parsed.since ?? ''),
       ...(typeof parsed.destination === 'string' ? { destination: parsed.destination } : {}),
+      ...(typeof parsed.storageKey === 'string' ? { storageKey: parsed.storageKey } : {}),
+      ...(typeof parsed.workloadUid === 'string' ? { workloadUid: parsed.workloadUid } : {}),
     };
   } catch {
     return undefined;

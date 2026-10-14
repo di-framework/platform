@@ -133,6 +133,9 @@ describe('cold copy of a workload volume', () => {
         heldBy: `Backup/${cluster.backup()?.name}`,
         since: cluster.world.now,
         destination: 'pvc',
+        // Bound to the workload and its volume (#263).
+        storageKey: 'identity',
+        workloadUid: 'uid-identity',
       },
     });
     expect(start[2]).toEqual({ type: 'scale-workload', name: 'identity', replicas: 0 });
@@ -1750,19 +1753,29 @@ describe('#254: a dropped ledger entry is never silent', () => {
     });
   });
 
-  test('a destination-gone entry for a raised workload is dropped quietly', () => {
+  test('a destination-gone entry for a raised workload is removed unscaled, and says so', () => {
     const world = volumeWorld({
       destination: undefined,
       destinations: [],
       ledger: {
         resourceVersion: '3',
         entries: {
-          identity: { replicas: 4, heldBy: 'Backup/gone', since: NOW, destination: 'old' },
+          identity: {
+            replicas: 4,
+            heldBy: 'Backup/gone',
+            since: NOW,
+            destination: 'old',
+            storageKey: 'identity',
+          },
         },
       },
     });
+    const message =
+      'WorkloadDeployment identity already runs 2 replicas (4 were recorded by Backup/gone), so it was left as is and its entry was removed; its BackupDestination old is gone.';
     expect(releaseOrphans(world)).toEqual([
       { type: 'ledger', set: { identity: null }, resourceVersion: '3' },
+      { type: 'log', message },
+      { type: 'event', eventType: 'Normal', reason: 'HeldReplicasReleased', message },
     ]);
   });
 
@@ -1803,9 +1816,14 @@ describe('#254: a dropped ledger entry is never silent', () => {
       ...world,
       ledger: { entries: { missing: { ...base, destination: 'old' } } },
     });
-    expect(missing.find((action) => action.type === 'log')).toMatchObject({
-      message: expect.stringContaining('It keeps its current replicas; scale it by hand'),
+    // #263 S4: nothing is listed, so there is nothing to scale by hand.
+    const missingLog = missing.find((action) => action.type === 'log');
+    expect(missingLog).toMatchObject({
+      message: expect.stringContaining(
+        'No WorkloadDeployment of that name is listed, so there is nothing to scale.',
+      ),
     });
+    expect(JSON.stringify(missingLog)).not.toContain('scale it by hand');
     const flood = releaseOrphans({
       ...world,
       ledger: { entries: { ['x'.repeat(5000)]: base } },
@@ -1815,5 +1833,165 @@ describe('#254: a dropped ledger entry is never silent', () => {
       expect(text.length).toBe(1024);
       expect(text.endsWith('...')).toBe(true);
     }
+  });
+});
+
+describe('#263: an orphaned held-replicas entry is bound to its workload, and reported truly', () => {
+  const signals = (actions: Action[]) =>
+    actions.filter((action) => action.type === 'log' || action.type === 'event');
+
+  /** A backup holding `identity` at 0, force-deleted past its finalizer, then its destination. */
+  function orphaned(): { cluster: Cluster; holder: string } {
+    const cluster = requested();
+    stopped(cluster);
+    const holder = `Backup/${must(cluster.backup()).name}`;
+    expect(cluster.held().identity).toEqual({
+      replicas: 2,
+      heldBy: holder,
+      since: expect.any(String),
+      destination: 'pvc',
+      storageKey: 'identity',
+      workloadUid: 'uid-identity',
+    });
+    cluster.world = { ...cluster.world, backups: [], destination: undefined, destinations: [] };
+    return { cluster, holder };
+  }
+
+  const gone = (entry: Record<string, unknown>, workloads = [workload({ replicas: 0 })]) =>
+    volumeWorld({
+      destination: undefined,
+      destinations: [],
+      workloads,
+      ledger: {
+        resourceVersion: '7',
+        entries: {
+          identity: {
+            replicas: 3,
+            heldBy: 'Backup/gone',
+            since: NOW,
+            destination: 'old',
+            ...entry,
+          },
+        },
+      },
+    });
+
+  test('S1: an orphaned entry is given back only with the storage key and uid it was held with', () => {
+    const released = releaseOrphans(gone({ storageKey: 'identity', workloadUid: 'uid-identity' }));
+    expect(scaled(released)).toEqual([{ type: 'scale-workload', name: 'identity', replicas: 3 }]);
+    // The uid is optional: an entry of a member that was not listed when held carries none.
+    const keyOnly = releaseOrphans(gone({ storageKey: 'identity' }));
+    expect(scaled(keyOnly)).toEqual([{ type: 'scale-workload', name: 'identity', replicas: 3 }]);
+
+    const refused: [Record<string, unknown>, string][] = [
+      [{}, 'the entry records no storage key to match the workload against'],
+      [
+        { storageKey: 'reports' },
+        'the storage key the entry recorded (reports) is not the workload',
+      ],
+      [
+        { storageKey: 'identity', workloadUid: 'uid-before' },
+        'the WorkloadDeployment was re-created after it was held (its uid differs)',
+      ],
+    ];
+    for (const [entry, reason] of refused) {
+      const actions = releaseOrphans(gone(entry));
+      // Never scaled: the entry is removed and the workload keeps its replicas.
+      expect(scaled(actions)).toEqual([]);
+      expect(actions[0]).toEqual({ type: 'ledger', set: { identity: null }, resourceVersion: '7' });
+      const event = actions.find((action) => action.type === 'event');
+      expect(event).toMatchObject({ eventType: 'Warning', reason: 'HeldReplicasDropped' });
+      expect(event?.type === 'event' && event.message).toContain(
+        `dropped without scaling: BackupDestination old is gone and ${reason}`,
+      );
+      expect(event?.type === 'event' && event.message).toContain(
+        'It keeps its current replicas (0); scale it by hand if it should run.',
+      );
+    }
+  });
+
+  test('S1: an entry naming a volume the workload no longer has never scales it', () => {
+    // Relabelled onto another key, so the entry's key no longer names this workload's volume.
+    const moved = workload({ replicas: 0, labels: { 'di-framework.dev/workload': 'other' } });
+    const actions = releaseOrphans(gone({ storageKey: 'identity' }, [moved]));
+    expect(scaled(actions)).toEqual([]);
+    expect(signals(actions)[1]).toMatchObject({ eventType: 'Warning' });
+  });
+
+  test('S1: an entry whose destination exists is still checked against its spec only', () => {
+    // An entry written before #263 (no key) for a listed source is still given back.
+    const world = volumeWorld({
+      workloads: [workload({ replicas: 0 })],
+      ledger: {
+        entries: {
+          identity: { replicas: 2, heldBy: 'Backup/gone', since: NOW, destination: 'pvc' },
+        },
+      },
+    });
+    expect(scaled(releaseOrphans(world))).toEqual([
+      { type: 'scale-workload', name: 'identity', replicas: 2 },
+    ]);
+  });
+
+  test('S2: a scale that landed before a failed ledger write is still reported, once', () => {
+    const { cluster, holder } = orphaned();
+    cluster.fail((action) => action.type === 'ledger', 409);
+    const first = cluster.tick();
+    // The scale landed; the ledger write did not, so nothing was reported yet.
+    expect(scaled(first)).toEqual([{ type: 'scale-workload', name: 'identity', replicas: 2 }]);
+    expect(cluster.replicas()).toBe(2);
+    expect(cluster.held().identity).toBeDefined();
+    expect(cluster.log.filter((action) => action.type === 'event')).toEqual([]);
+
+    const retry = cluster.tick();
+    expect(scaled(retry)).toEqual([]);
+    expect(cluster.held()).toEqual({});
+    const message = `WorkloadDeployment identity already has the 2 replicas ${holder} recorded, so its entry was removed without scaling; its BackupDestination pvc is gone.`;
+    expect(cluster.types(retry)).toEqual(['ledger', 'log', 'event']);
+    expect(signals(retry)).toEqual([
+      { type: 'log', message },
+      { type: 'event', eventType: 'Normal', reason: 'HeldReplicasReleased', message },
+    ]);
+    expect(signals(cluster.tick())).toEqual([]);
+  });
+
+  test('S2: an entry that recorded 0 replicas is removed without a scale and says 0 truly', () => {
+    const actions = releaseOrphans(gone({ replicas: 0, storageKey: 'identity' }));
+    const message =
+      'WorkloadDeployment identity was held by Backup/gone with 0 replicas recorded, so it was not scaled and has 0; its BackupDestination old is gone.';
+    expect(actions).toEqual([
+      { type: 'ledger', set: { identity: null }, resourceVersion: '7' },
+      { type: 'log', message },
+      { type: 'event', eventType: 'Normal', reason: 'HeldReplicasReleased', message },
+    ]);
+    const raised = releaseOrphans(gone({ replicas: 0, storageKey: 'identity' }, [workload()]));
+    expect(signals(raised)[0]).toEqual({
+      type: 'log',
+      message:
+        'WorkloadDeployment identity was held by Backup/gone with 0 replicas recorded, so it was not scaled and has 2; its BackupDestination old is gone.',
+    });
+  });
+
+  test('S2: an entry recorded at 0 whose destination exists is removed without a scale', () => {
+    const world = volumeWorld({
+      workloads: [workload({ replicas: 0 })],
+      ledger: {
+        entries: {
+          identity: { replicas: 0, heldBy: 'Backup/gone', since: NOW, destination: 'pvc' },
+        },
+      },
+    });
+    expect(releaseOrphans(world)).toEqual([
+      { type: 'ledger', set: { identity: null }, resourceVersion: undefined },
+    ]);
+  });
+
+  test('S4: a refused entry of an unlisted workload does not ask for a scale by hand', () => {
+    const actions = releaseOrphans(gone({ storageKey: 'identity' }, []));
+    expect(scaled(actions)).toEqual([]);
+    const event = actions.find((action) => action.type === 'event');
+    expect(event?.type === 'event' && event.message).toBe(
+      'held-replicas entry for WorkloadDeployment identity (3 replicas, held by Backup/gone) dropped without scaling: BackupDestination old is gone and the workload is not listed with a platform storage volume. No WorkloadDeployment of that name is listed, so there is nothing to scale.',
+    );
   });
 });
