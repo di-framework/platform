@@ -449,6 +449,20 @@ describe('run', () => {
     expectWarnedAndForgotten();
   });
 
+  test('logout warns and never sends the refresh token when discovery names another issuer', async () => {
+    writeStore(identityCredential(), env);
+    const { fetch: issuerFetch, calls } = fakeFetch({
+      'GET /.well-known/openid-configuration': () =>
+        json({ ...issuer, issuer: 'https://evil.test' }),
+      'POST /oauth2/revoke': noContent,
+    });
+    expect(await run(['logout'], io(issuerFetch))).toBe(0);
+    expectWarnedAndForgotten();
+    expect(calls.map((call) => `${call.method} ${new URL(call.url).pathname}`)).toEqual([
+      'GET /.well-known/openid-configuration',
+    ]);
+  });
+
   test('whoami prints a line or JSON', async () => {
     const who = { user: 'alice', account: 'acme', role: 'developer', via: 'api-key' };
     const { fetch } = fakeFetch({ 'GET /v1/auth/whoami': () => json(who) });

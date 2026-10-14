@@ -348,6 +348,7 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
             credential.clientId ?? '',
             credential.refreshToken,
             io.fetch,
+            credential.issuer,
           );
         } catch (error) {
           io.stderr(
