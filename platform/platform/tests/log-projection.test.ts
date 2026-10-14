@@ -12,9 +12,13 @@ import {
   applicationKey,
   attributeEntries,
   attributeLogs,
+  configMapLogKey,
   formatHostLine,
   formatProjectedLine,
   type HostFailure,
+  legacyRing,
+  logKey,
+  logKeyId,
   logsConfigMap,
   logsConfigMapName,
   logsOptedOut,
@@ -26,6 +30,7 @@ import {
   parseServiceLoopLine,
   parseWorkloadSpanLine,
   projectedDeployments,
+  projectedEnvs,
   projectedFailures,
   projectedLines,
   projectedRing,
@@ -743,10 +748,12 @@ describe('ring buffer and ConfigMap shape', () => {
     const guest = (n: number): RingLine => ({
       line: `${ts(n)} INFO tick ${n}`,
       deployment: n % 2 ? 'mesh-site' : 'mesh-collector',
+      env: '',
     });
     const host = (n: number): RingLine => ({
       line: `${ts(n)} ERROR host: failed to start workload ${n}`,
       deployment: 'mesh-site',
+      env: '',
     });
     // Out-of-order incoming lines and a trim that keeps an old host line over newer guests.
     const ring = appendRing([guest(0), host(1)], [guest(5), guest(3), guest(4), guest(2)], 3, 1);
@@ -756,6 +763,7 @@ describe('ring buffer and ConfigMap shape', () => {
     expect(configMap.data).toEqual({
       lines: ring.map((entry) => entry.line).join('\n'),
       deployments: JSON.stringify(['mesh-site', 'mesh-collector', 'mesh-site']),
+      envs: JSON.stringify(['', '', '']),
     });
     expect(projectedRing(configMap)).toEqual(ring);
     const flood = appendRing(
@@ -802,7 +810,11 @@ describe('ring buffer and ConfigMap shape', () => {
           deployment: 'mesh-site',
         },
       ]).data,
-    ).toEqual({ lines: 'a\nb\nc', deployments: JSON.stringify(['', '', 'mesh-site']) });
+    ).toEqual({
+      lines: 'a\nb\nc',
+      deployments: JSON.stringify(['', '', 'mesh-site']),
+      envs: JSON.stringify(['', '', '']),
+    });
   });
 
   it('names ConfigMaps di-logs-<app>, hashing names that do not fit', () => {
@@ -862,6 +874,10 @@ class LogApi implements Api {
   configMaps = new Map<string, Resource>();
   logs = new Map<string, string>();
   logQueries: string[] = [];
+  /** ConfigMap writes, `<name>?<query>`. */
+  writes: string[] = [];
+  /** `<METHOD> <ConfigMap name>` calls the API refuses, as at the namespace quota. */
+  refused = new Set<string>();
   pods = [
     { metadata: { name: 'host-0', uid: 'pod-0' }, status: { phase: 'Running' } },
     { metadata: { name: 'host-1', uid: 'pod-1' }, status: { phase: 'Pending' } },
@@ -901,7 +917,10 @@ class LogApi implements Api {
       if (!value) throw new ApiError(404, 'Not found');
       return structuredClone(value) as T;
     }
+    if (this.refused.has(`${method} ${name}`))
+      throw new ApiError(403, `exceeded quota: count/configmaps (${name})`);
     if (method === 'PATCH') {
+      this.writes.push(`${name}${url.search}`);
       this.configMaps.set(name, structuredClone(body) as Resource);
       return structuredClone(body) as T;
     }
@@ -1070,6 +1089,7 @@ describe('Controller.projectLogs', () => {
     expect(api.configMaps.get('di-logs-mesh')?.data).toEqual({
       lines: `${at(2)} ERROR host: failed to start workload reason="timed out"`,
       deployments: JSON.stringify(['mesh-site']),
+      envs: JSON.stringify(['']),
     });
   });
 
@@ -1095,15 +1115,17 @@ describe('Controller.projectLogs', () => {
     const controller = new Controller(api, cfg);
     await controller.projectLogs(tenant());
     expect(projectedRing(api.configMaps.get('di-logs-mesh'))).toEqual([
-      { line: `${at(1)} INFO site up`, deployment: 'mesh-site' },
+      { line: `${at(1)} INFO site up`, deployment: 'mesh-site', env: '' },
       {
         line: `${at(2)} ERROR host: failed to start workload reason="first"`,
         deployment: 'mesh-site',
+        env: '',
       },
-      { line: `${at(3)} INFO collector up`, deployment: 'mesh-collector' },
+      { line: `${at(3)} INFO collector up`, deployment: 'mesh-collector', env: '' },
       {
         line: `${at(4)} ERROR host: failed to start workload reason="second"`,
         deployment: 'mesh-site',
+        env: '',
       },
     ]);
     // data.failures still keeps only the newest failure per deployment.
@@ -1119,8 +1141,8 @@ describe('Controller.projectLogs', () => {
     api.logs.set('host-0', hostLine('later', { name: 'mesh-site-a-1', at: at(6) }));
     await new Controller(api, cfg).projectLogs(tenant());
     expect(projectedRing(api.configMaps.get('di-logs-mesh'))).toEqual([
-      { line: `${at(5)} INFO earlier`, deployment: '' },
-      { line: `${at(6)} INFO later`, deployment: 'mesh-site' },
+      { line: `${at(5)} INFO earlier`, deployment: '', env: '' },
+      { line: `${at(6)} INFO later`, deployment: 'mesh-site', env: '' },
     ]);
   });
 
@@ -1283,5 +1305,320 @@ describe('log projection security', () => {
     expect(policy).toContain(`'${PROJECTION_LABEL}' in object.metadata.labels`);
     expect(policy).toContain(`'${PROJECTION_LABEL}' in oldObject.metadata.labels`);
     expect(policy).toContain('published by the platform controller');
+  });
+});
+
+describe('projection keys per deployment and env (#106)', () => {
+  /** The labels `/v1/deploy` renders on service `web`'s WorkloadDeployment in `env`. */
+  const v1 = (env: string, service = 'web'): WorkloadIdentity => ({
+    name: `${service}-${env}`,
+    labels: {
+      'app.kubernetes.io/managed-by': 'di-framework',
+      'app.kubernetes.io/name': `${service}-${env}`,
+      'di-framework.dev/application': service,
+      'di-framework.dev/service': service,
+      'platform.di-framework.dev/env': env,
+    },
+  });
+  /** A CLI workload whose application label equals the /v1 service name. */
+  const cli: WorkloadIdentity = { name: 'web', labels: { 'di-framework.dev/application': 'web' } };
+
+  it('keys a /v1 deployment by service and env, anything else by application', () => {
+    expect(logKey(v1('prod'))).toEqual({ application: 'web', env: 'prod' });
+    expect(logKey(v1('staging'))).toEqual({ application: 'web', env: 'staging' });
+    expect(logKey(cli)).toEqual({ application: 'web', env: '' });
+    // An env label alone does not make a /v1 key: the name must be `<service>-<env>`.
+    expect(logKey({ ...v1('prod'), name: 'other' })).toEqual({ application: 'web', env: '' });
+    expect(logKey(v1('dev'))).toEqual({ application: 'web', env: '' });
+    expect(logKey({ name: 'bare' })).toEqual({ application: 'bare', env: '' });
+    expect(logKeyId(logKey(v1('prod')))).toBe('web/prod');
+    expect(logKeyId(logKey(cli))).toBe('web');
+  });
+
+  it('names /v1 projections with a dot, which no other projection name has', () => {
+    expect(logsConfigMapName('web', 'prod')).toBe('di-logs-web.prod');
+    expect(logsConfigMapName('web', 'staging')).toBe('di-logs-web.staging');
+    const long = logsConfigMapName('a'.repeat(60), 'staging');
+    expect(long.length).toBeLessThanOrEqual(63);
+    expect(long).toMatch(/^di-logs-a+-[0-9a-f]+\.staging$/);
+    for (const app of ['web.prod', 'web-prod', 'My.App', 'a'.repeat(80)])
+      expect(logsConfigMapName(app)).not.toContain('.');
+  });
+
+  it('labels a /v1 projection with its env and records the env of every line', () => {
+    const configMap = logsConfigMap(
+      'alpha',
+      NS,
+      'test',
+      'web',
+      [{ line: '2026-10-01T10:00:00Z INFO up', deployment: 'web-prod', env: 'prod' }],
+      {},
+      'prod',
+    );
+    expect(configMap.metadata.name).toBe('di-logs-web.prod');
+    expect(configMap.metadata.labels).toMatchObject({
+      'di-framework.dev/application': 'web',
+      'platform.di-framework.dev/env': 'prod',
+    });
+    expect(configMap.data).toMatchObject({
+      deployments: JSON.stringify(['web-prod']),
+      envs: JSON.stringify(['prod']),
+    });
+    expect(configMapLogKey(configMap)).toEqual({ application: 'web', env: 'prod' });
+    expect(projectedEnvs(configMap)).toEqual(['prod']);
+    // A line without a recorded env takes the ConfigMap's env label.
+    const { envs: _envs, ...data } = configMap.data as Record<string, string>;
+    expect(projectedRing({ ...configMap, data })).toEqual([
+      { line: '2026-10-01T10:00:00Z INFO up', deployment: 'web-prod', env: 'prod' },
+    ]);
+  });
+
+  it('reads data.envs only when it is aligned with data.lines', () => {
+    const cm = (data: Record<string, string>): Resource => ({
+      apiVersion: 'v1',
+      kind: 'ConfigMap',
+      metadata: { name: 'x' },
+      data,
+    });
+    expect(projectedEnvs(undefined)).toBeUndefined();
+    expect(projectedEnvs(cm({ lines: 'a\nb' }))).toBeUndefined();
+    expect(projectedEnvs(cm({ lines: 'a\nb', envs: '{' }))).toBeUndefined();
+    expect(projectedEnvs(cm({ lines: 'a\nb', envs: '{"a":1}' }))).toBeUndefined();
+    expect(projectedEnvs(cm({ lines: 'a\nb', envs: '["prod",1]' }))).toBeUndefined();
+    expect(projectedEnvs(cm({ lines: 'a\nb', envs: '["prod"]' }))).toBeUndefined();
+    expect(projectedEnvs(cm({ lines: 'a\nb', envs: '["prod",""]' }))).toEqual(['prod', '']);
+    // Without a recorded env or an env label, the env of a line is not known.
+    expect(projectedRing(cm({ lines: 'a' }))).toEqual([{ line: 'a', deployment: '' }]);
+  });
+
+  it('takes over the lines and failure of one deployment from a shared ConfigMap', () => {
+    const failure: HostFailure = {
+      workload: 'web-prod-a-1',
+      time: '2026-10-01T10:00:02Z',
+      level: 'ERROR',
+      message: 'boom',
+    };
+    const legacy = logsConfigMap(
+      'alpha',
+      NS,
+      'test',
+      'web',
+      [
+        { line: '2026-10-01T10:00:00Z INFO before deployments', deployment: '' },
+        { line: '2026-10-01T10:00:01Z INFO prod up', deployment: 'web-prod' },
+        { line: '2026-10-01T10:00:02Z ERROR host: boom', deployment: 'web-prod' },
+        { line: '2026-10-01T10:00:03Z INFO staging up', deployment: 'web-staging' },
+      ],
+      { 'web-prod': failure },
+    );
+    expect(legacyRing(legacy, 'web-prod', 'prod')).toEqual({
+      lines: [
+        { line: '2026-10-01T10:00:01Z INFO prod up', deployment: 'web-prod', env: 'prod' },
+        { line: '2026-10-01T10:00:02Z ERROR host: boom', deployment: 'web-prod', env: 'prod' },
+      ],
+      failures: { 'web-prod': failure },
+    });
+    expect(legacyRing(legacy, 'web-staging', 'staging')).toEqual({
+      lines: [
+        {
+          line: '2026-10-01T10:00:03Z INFO staging up',
+          deployment: 'web-staging',
+          env: 'staging',
+        },
+      ],
+      failures: {},
+    });
+    expect(legacyRing(undefined, 'web-prod', 'prod')).toEqual({ lines: [], failures: {} });
+  });
+
+  it('attributes staging, prod, and a same-named CLI workload to three projections', () => {
+    const text = [
+      hostLine('prod up', { name: 'web-prod', at: '2026-10-01T10:00:01Z' }),
+      hostLine('staging up', { name: 'web-staging', at: '2026-10-01T10:00:02Z' }),
+      hostLine('cli up', { name: 'web', at: '2026-10-01T10:00:03Z' }),
+    ].join('\n');
+    const entries = attributeEntries(text, NS, [v1('prod'), v1('staging'), cli]);
+    expect([...entries.keys()]).toEqual(['web/prod', 'web/staging', 'web']);
+    expect(entries.get('web/prod')).toEqual([
+      {
+        time: '2026-10-01T10:00:01Z',
+        line: '2026-10-01T10:00:01Z INFO prod up',
+        deployment: 'web-prod',
+        env: 'prod',
+      },
+    ]);
+    expect(entries.get('web')?.[0]?.env).toBe('');
+  });
+
+  it('publishes one ConfigMap per deployment env, apart from the CLI workload', async () => {
+    const api = new LogApi();
+    api.workloads = [v1('prod'), v1('staging'), cli].map((metadata) => ({ metadata }));
+    api.logs.set(
+      'host-0',
+      [
+        hostLine('prod up', { name: 'web-prod', at: '2026-10-01T10:00:01.000000Z' }),
+        hostLine('staging up', { name: 'web-staging', at: '2026-10-01T10:00:02.000000Z' }),
+        hostLine('cli up', { name: 'web', at: '2026-10-01T10:00:03.000000Z' }),
+      ].join('\n'),
+    );
+    await new Controller(api, cfg).projectLogs(tenant());
+    expect([...api.configMaps.keys()].sort()).toEqual([
+      'di-logs-web',
+      'di-logs-web.prod',
+      'di-logs-web.staging',
+    ]);
+    expect(projectedRing(api.configMaps.get('di-logs-web.prod'))).toEqual([
+      { line: '2026-10-01T10:00:01.000000Z INFO prod up', deployment: 'web-prod', env: 'prod' },
+    ]);
+    expect(projectedRing(api.configMaps.get('di-logs-web.staging'))).toEqual([
+      {
+        line: '2026-10-01T10:00:02.000000Z INFO staging up',
+        deployment: 'web-staging',
+        env: 'staging',
+      },
+    ]);
+    expect(projectedRing(api.configMaps.get('di-logs-web'))).toEqual([
+      { line: '2026-10-01T10:00:03.000000Z INFO cli up', deployment: 'web', env: '' },
+    ]);
+    expect(api.configMaps.get('di-logs-web.prod')?.metadata.labels).toMatchObject({
+      'di-framework.dev/application': 'web',
+      'platform.di-framework.dev/env': 'prod',
+    });
+    expect(
+      api.configMaps.get('di-logs-web')?.metadata.labels?.['platform.di-framework.dev/env'],
+    ).toBeUndefined();
+  });
+
+  it('migrates a ConfigMap staging and prod shared into per-env ones, then deletes it', async () => {
+    const api = new LogApi();
+    api.workloads = [v1('prod'), v1('staging')].map((metadata) => ({ metadata }));
+    const failure: HostFailure = {
+      workload: 'web-prod-a-1',
+      time: '2026-10-01T10:00:02.000000Z',
+      level: 'ERROR',
+      message: 'boom',
+    };
+    api.configMaps.set(
+      'di-logs-web',
+      logsConfigMap(
+        'alpha',
+        NS,
+        'test',
+        'web',
+        [
+          { line: '2026-10-01T10:00:00.000000Z INFO unattributed', deployment: '' },
+          { line: '2026-10-01T10:00:01.000000Z INFO prod up', deployment: 'web-prod' },
+          { line: '2026-10-01T10:00:02.000000Z ERROR host: boom', deployment: 'web-prod' },
+          { line: '2026-10-01T10:00:03.000000Z INFO staging up', deployment: 'web-staging' },
+        ],
+        { 'web-prod': failure },
+      ),
+    );
+    // The host log still holds a published prod line and one new one.
+    api.logs.set(
+      'host-0',
+      [
+        hostLine('prod up', { name: 'web-prod', at: '2026-10-01T10:00:01.000000Z' }),
+        hostLine('prod later', { name: 'web-prod', at: '2026-10-01T10:00:04.000000Z' }),
+      ].join('\n'),
+    );
+    await new Controller(api, cfg).projectLogs(tenant());
+    expect([...api.configMaps.keys()].sort()).toEqual(['di-logs-web.prod', 'di-logs-web.staging']);
+    // Published lines are not repeated: the taken-over ring sets the floor.
+    expect(linesOf(api, 'di-logs-web.prod').split('\n')).toEqual([
+      '2026-10-01T10:00:01.000000Z INFO prod up',
+      '2026-10-01T10:00:02.000000Z ERROR host: boom',
+      '2026-10-01T10:00:04.000000Z INFO prod later',
+    ]);
+    expect(JSON.parse(projectedFailuresText(api.configMaps.get('di-logs-web.prod')))).toEqual({
+      'web-prod': failure,
+    });
+    // Staging had no new lines this tick; its lines were still taken over before the delete.
+    expect(projectedRing(api.configMaps.get('di-logs-web.staging'))).toEqual([
+      {
+        line: '2026-10-01T10:00:03.000000Z INFO staging up',
+        deployment: 'web-staging',
+        env: 'staging',
+      },
+    ]);
+  });
+
+  it('keeps a shared ConfigMap a live CLI application still owns, after the takeover', async () => {
+    const api = new LogApi();
+    api.workloads = [v1('prod'), cli].map((metadata) => ({ metadata }));
+    api.configMaps.set(
+      'di-logs-web',
+      logsConfigMap('alpha', NS, 'test', 'web', [
+        { line: '2026-10-01T10:00:01.000000Z INFO prod up', deployment: 'web-prod' },
+        { line: '2026-10-01T10:00:02.000000Z INFO cli up', deployment: 'web' },
+      ]),
+    );
+    api.logs.set('host-0', '');
+    const controller = new Controller(api, cfg);
+    await controller.projectLogs(tenant());
+    expect([...api.configMaps.keys()].sort()).toEqual(['di-logs-web', 'di-logs-web.prod']);
+    expect(linesOf(api, 'di-logs-web.prod')).toBe('2026-10-01T10:00:01.000000Z INFO prod up');
+    // The kept ConfigMap is rewritten in the same pass, after the takeover, by server-side
+    // apply: the prod line now lives in di-logs-web.prod only.
+    expect(api.writes).toEqual([
+      'di-logs-web.prod?fieldManager=di-platform-controller',
+      'di-logs-web?fieldManager=di-platform-controller',
+    ]);
+    expect(projectedRing(api.configMaps.get('di-logs-web'))).toEqual([
+      { line: '2026-10-01T10:00:02.000000Z INFO cli up', deployment: 'web', env: '' },
+    ]);
+    // The next tick finds the per-env ConfigMap and has nothing to take over or prune.
+    await controller.projectLogs(tenant());
+    expect(api.writes).toHaveLength(2);
+    expect(linesOf(api, 'di-logs-web.prod')).toBe('2026-10-01T10:00:01.000000Z INFO prod up');
+  });
+
+  it('keeps going when one ConfigMap write fails, and holds back an untaken shared one', async () => {
+    const api = new LogApi();
+    api.workloads = [v1('prod'), v1('staging'), cli].map((metadata) => ({ metadata }));
+    const shared = logsConfigMap('alpha', NS, 'test', 'web', [
+      { line: '2026-10-01T10:00:01.000000Z INFO prod up', deployment: 'web-prod' },
+      { line: '2026-10-01T10:00:02.000000Z INFO staging up', deployment: 'web-staging' },
+      { line: '2026-10-01T10:00:03.000000Z INFO cli up', deployment: 'web' },
+    ]);
+    api.configMaps.set('di-logs-web', shared);
+    api.configMaps.set('di-logs-gone', logsConfigMap('alpha', NS, 'test', 'gone', ['x']));
+    api.refused.add('PATCH di-logs-web.prod');
+    api.refused.add('DELETE di-logs-gone');
+    api.logs.set('host-0', '');
+    const errors = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await new Controller(api, cfg).projectLogs(tenant());
+      // Staging was still taken over; the shared ConfigMap keeps prod's line for the next try.
+      expect(linesOf(api, 'di-logs-web.staging')).toBe(
+        '2026-10-01T10:00:02.000000Z INFO staging up',
+      );
+      expect(api.configMaps.get('di-logs-web')).toEqual(shared);
+      expect(api.configMaps.has('di-logs-gone')).toBe(true);
+      expect(errors.mock.calls.map(([line]) => line)).toEqual([
+        'Tenant/alpha logs ConfigMap di-logs-web.prod: exceeded quota: count/configmaps (di-logs-web.prod)',
+        'Tenant/alpha logs ConfigMap di-logs-gone: exceeded quota: count/configmaps (di-logs-gone)',
+      ]);
+      // Once there is room, the next poll finishes the move.
+      api.refused.clear();
+      await new Controller(api, cfg).projectLogs(tenant());
+      expect(linesOf(api, 'di-logs-web.prod')).toBe('2026-10-01T10:00:01.000000Z INFO prod up');
+      expect(linesOf(api, 'di-logs-web')).toBe('2026-10-01T10:00:03.000000Z INFO cli up');
+      expect(api.configMaps.has('di-logs-gone')).toBe(false);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it('deletes a shared ConfigMap with nothing to take over', async () => {
+    const api = new LogApi();
+    api.workloads = [{ metadata: v1('prod') }];
+    api.configMaps.set(
+      'di-logs-web',
+      logsConfigMap('alpha', NS, 'test', 'web', ['2026-10-01T10:00:00.000000Z INFO old']),
+    );
+    api.logs.set('host-0', '');
+    await new Controller(api, cfg).projectLogs(tenant());
+    expect(api.configMaps.size).toBe(0);
   });
 });

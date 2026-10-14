@@ -518,10 +518,32 @@ grant lookups and HTTP only, since no address can be listed for them. IPv6 is no
 
 ### Console log projection
 
-The controller publishes one ConfigMap per console application in each tenant
-namespace, `di-logs-<app>`, labeled `di-framework.dev/projection=logs` and
-`di-framework.dev/application=<app>`, with the newest 200 lines in `data.lines` and
-the newest host failure per WorkloadDeployment in `data.failures`.
+The controller publishes one ConfigMap per projection key in each tenant namespace,
+labeled `di-framework.dev/projection=logs` and `di-framework.dev/application=<app>`,
+with the newest 200 lines in `data.lines`, the WorkloadDeployment and /v1 environment
+of each line in `data.deployments` and `data.envs` (JSON arrays aligned with the
+lines; the env is `""` outside /v1), and the newest host failure per
+WorkloadDeployment in `data.failures`.
+
+- A WorkloadDeployment `/v1/deploy` rendered (named `<service>-<env>`, labeled
+  `di-framework.dev/application=<service>` and `platform.di-framework.dev/env=<env>`,
+  env `prod` or `staging`) is keyed by service and env: `di-logs-<service>.<env>`,
+  which also carries the env label. Staging and prod never share a ConfigMap.
+- Any other workload (for example one the CLI deployed) is keyed by its console
+  application: `di-logs-<app>`, without an env label. That name never contains a dot,
+  so a CLI workload whose application equals a /v1 service name gets its own
+  ConfigMap and never mixes into the service's logs.
+- Migration: before this keying, staging and prod of a /v1 service shared
+  `di-logs-<service>`. On its next poll the controller starts each
+  `di-logs-<service>.<env>` from the lines and failure that ConfigMap recorded for
+  `<service>-<env>`, then deletes the shared one. When a live CLI application still
+  owns that key, the shared ConfigMap is kept and rewritten in the same pass without
+  the lines of /v1 deployments, so no line is served twice. Lines published before
+  deployments were recorded cannot be attributed to an env and are not carried over.
+- Each ConfigMap write or delete is attempted on its own: one refused (for example at
+  the `count/configmaps` quota) is logged and retried on the next poll without
+  holding back the other projections, and a shared ConfigMap is not pruned or deleted
+  until its lines have been taken over.
 
 - Source: the `hostgroup-<tenant>` pod logs, read through a per-tenant
   `di-platform-log-reader` Role (`pods/log get` in the runtime namespace only). The

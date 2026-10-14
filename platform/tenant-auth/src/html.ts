@@ -66,6 +66,10 @@ export function message(title: string, text: string, error = false): string {
 
 export interface Deployment {
   name: string;
+  /** Service or console application the deployment's logs are grouped under. */
+  application?: string;
+  /** /v1 environment; '' for a workload outside /v1. */
+  env?: string;
   ready?: string;
   message?: string;
   age?: string;
@@ -75,11 +79,18 @@ export interface Service {
   class?: string;
   ready?: string;
 }
+/** Groups deployments by application, then env, then name, as their logs are keyed (#106). */
+const byGroup = (a: Deployment, b: Deployment) =>
+  (a.application ?? a.name).localeCompare(b.application ?? b.name) ||
+  (a.env ?? '').localeCompare(b.env ?? '') ||
+  a.name.localeCompare(b.name);
+
 export function overview(who: Who, deployments: Deployment[], services: Service[]): string {
-  const rows = deployments
+  const rows = [...deployments]
+    .sort(byGroup)
     .map(
       (d) =>
-        `<tr><td><a href="/logs/${encodeURIComponent(d.name)}">${e(d.name)}</a></td><td>${e(d.ready ?? '')}</td><td class="muted">${e(d.message ?? '')}</td><td>${e(d.age ?? '')}</td></tr>`,
+        `<tr><td>${e(d.application ?? d.name)}</td><td>${e(d.env ?? '')}</td><td><a href="/logs/${encodeURIComponent(d.name)}">${e(d.name)}</a></td><td>${e(d.ready ?? '')}</td><td class="muted">${e(d.message ?? '')}</td><td>${e(d.age ?? '')}</td></tr>`,
     )
     .join('');
   const svc = services
@@ -94,20 +105,26 @@ export function overview(who: Who, deployments: Deployment[], services: Service[
       who,
       '/',
       `<h2>Deployments</h2>
-      ${rows ? `<table><thead><tr><th>Name</th><th>Ready</th><th>Status</th><th>Created</th></tr></thead><tbody>${rows}</tbody></table>` : '<p class="muted">No deployments. Run <code>di-framework platform deploy</code>.</p>'}
+      ${rows ? `<table><thead><tr><th>Application</th><th>Env</th><th>Deployment</th><th>Ready</th><th>Status</th><th>Created</th></tr></thead><tbody>${rows}</tbody></table>` : '<p class="muted">No deployments. Run <code>di-framework platform deploy</code>.</p>'}
       <h2>Backing services</h2>
       ${svc ? `<table><thead><tr><th>Name</th><th>Class</th><th>Ready</th></tr></thead><tbody>${svc}</tbody></table>` : '<p class="muted">No backing services.</p>'}`,
     ),
   );
 }
 
-export function logs(who: Who, app: string, entries: string[]): string {
+export function logs(
+  who: Who,
+  deployment: string,
+  entries: string[],
+  key?: { application: string; env: string },
+): string {
+  const scope = key ? [key.application, key.env].filter(Boolean).join(' · ') : '';
   return page(
-    `${who.account} · ${app} logs`,
+    `${who.account} · ${deployment} logs`,
     chrome(
       who,
       '/',
-      `<h2>Logs · ${e(app)}</h2>${entries.length ? `<pre>${e(entries.join('\n'))}</pre>` : '<p class="muted">No projected logs yet.</p>'}`,
+      `<h2>Logs · ${e(deployment)}</h2>${scope ? `<p class="muted">${e(scope)}</p>` : ''}${entries.length ? `<pre>${e(entries.join('\n'))}</pre>` : '<p class="muted">No projected logs yet.</p>'}`,
     ),
   );
 }

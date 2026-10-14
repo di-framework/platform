@@ -30,7 +30,8 @@ references that is no longer in the contract fails `tsc`. That is the whole drif
 
 Streaming operations (`logs`) are SSE: each `log` event's `data` is one `LogEvent` as JSON, and
 `end` closes the stream. The spec names this in the operation description; the framing itself is
-`src/client/sse.ts`.
+`src/client/sse.ts`. `logs` requires `env` (`prod` or `staging`), as the contract says: the
+controller answers 400 without it and streams only that environment's lines (platform#106).
 
 ## Using the client
 
