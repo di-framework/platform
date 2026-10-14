@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'bun:test';
-import { allowed, Controller, configFromEnv, tenantNamespaces } from '../src/controller.ts';
+import {
+  allowed,
+  Controller,
+  canonicalPath,
+  configFromEnv,
+  tenantNamespaces,
+} from '../src/controller.ts';
 import { AuthError } from '../src/identity.ts';
 
 describe('controller path policy', () => {
@@ -38,6 +44,71 @@ describe('controller path policy', () => {
     ['GET', '/-/keys'],
   ])('refuses %s %s', (method, path) => {
     expect(allowed(method, path, t)).toBe(false);
+  });
+
+  describe('decides on the canonical path (#116)', () => {
+    test.each([
+      ['/api/v1/namespaces/di-tenant-acme/secrets', '/api/v1/namespaces/di-tenant-acme/secrets'],
+      ['/api/v1/namespaces/di-tenant-acme/%73ecrets', '/api/v1/namespaces/di-tenant-acme/secrets'],
+      [
+        '/api/v1/namespaces/di-tenant-acme/%73%45crets',
+        '/api/v1/namespaces/di-tenant-acme/sEcrets',
+      ],
+      ['/api/v1/namespaces/%64i-tenant-acme/pods', '/api/v1/namespaces/di-tenant-acme/pods'],
+      [
+        '/api/v1/namespaces/di-tenant-acme/pods/web%2D1',
+        '/api/v1/namespaces/di-tenant-acme/pods/web-1',
+      ],
+      ['/api/v1/namespaces/x/pods/web:8080/proxy', '/api/v1/namespaces/x/pods/web:8080/proxy'],
+      ['/api/v1/namespaces/x/pods/web%3A8080/proxy', '/api/v1/namespaces/x/pods/web:8080/proxy'],
+      ['/api/v1/namespaces/x/configmaps/a%20b', '/api/v1/namespaces/x/configmaps/a%20b'],
+      ['/apis/', '/apis/'],
+      ['/', '/'],
+    ])('canonicalises %s', (raw, canonical) => {
+      expect(canonicalPath(raw)).toBe(canonical);
+      // Idempotent: the forwarded path canonicalises to itself.
+      expect(canonicalPath(canonical)).toBe(canonical);
+    });
+    test.each([
+      'api/v1/namespaces/di-tenant-acme/pods',
+      '//api/v1/namespaces/di-tenant-acme/pods',
+      '/api/v1/namespaces/di-tenant-acme//secrets',
+      '/api/v1/namespaces/di-tenant-acme/secrets%2Fname',
+      '/api/v1/namespaces/di-tenant-acme/secrets%2fname',
+      '/api/v1/namespaces/di-tenant-acme%2F..%2Fwasmcloud/secrets',
+      '/api/v1/namespaces/di-tenant-acme/%2e%2e/%2E%2e/wasmcloud/secrets',
+      '/api/v1/namespaces/di-tenant-acme/../wasmcloud/secrets',
+      '/api/v1/namespaces/di-tenant-acme/./secrets',
+      '/api/v1/namespaces/di-tenant-acme/%2e/secrets',
+      '/api/v1/namespaces/di-tenant-acme/%2573ecrets',
+      '/api/v1/namespaces/di-tenant-acme/secrets%252Fname',
+      '/api/v1/namespaces/di-tenant-acme/secrets%5Cname',
+      '/api/v1/namespaces/di-tenant-acme/secrets%00',
+      '/api/v1/namespaces/di-tenant-acme/%zz',
+      '/api/v1/namespaces/di-tenant-acme/%',
+      '/api/v1/namespaces/di-tenant-acme/%C3',
+    ])('refuses the ambiguous path %s', (raw) => {
+      expect(canonicalPath(raw)).toBeUndefined();
+      expect(allowed('GET', raw, t)).toBe(false);
+    });
+    test.each([
+      ['GET', '/api/v1/namespaces/di-tenant-acme/%73ecrets'],
+      ['GET', '/api/v1/namespaces/%64i-tenant-acme/%73ecrets/db'],
+      ['GET', '/%61pi/v1/namespaces/di-runtime-acme/pods'],
+      ['GET', '/%61pis'],
+      ['POST', '/apis/authentication.k8s.io/v1/%73elfsubjectreviews'],
+    ])('allows the encoded spelling %s %s', (method, path) => {
+      expect(allowed(method, path, t)).toBe(true);
+    });
+    test.each([
+      ['GET', '/api/v1/namespaces/%77asmcloud/secrets'],
+      ['GET', '/api/v1/namespaces/di-tenant-acme%2Dother/secrets'],
+      ['GET', '/api/v1/%73ecrets'],
+      ['GET', '/api/v1/namespaces/di-tenant-%41CME/secrets'],
+      ['POST', '/apis/authorization.k8s.io/v1/%73ubjectaccessreviews'],
+    ])('refuses the encoded spelling %s %s', (method, path) => {
+      expect(allowed(method, path, t)).toBe(false);
+    });
   });
 });
 

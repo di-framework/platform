@@ -296,6 +296,13 @@ ValidatingAdmissionPolicy therefore refuses, for `di-user-*` ServiceAccounts, ev
 that could answer without removing it: `dryRun`, `propagationPolicy` `Orphan` or `Foreground`
 (or `orphanDependents`), and a Secret that already has finalizers or a `deletionTimestamp`. The
 controller's kubectl proxy replaces the body of a successful Secret `DELETE` with a bare `Status`.
+The proxy makes its path policy and this redaction on one canonical path, which is also the path
+it forwards: each segment is percent-decoded once (`%73ecrets` is `secrets`), and a path with an
+empty segment (`//secrets`), a malformed escape, or a segment decoding to `.`, `..`, or text with
+`/` (`secrets%2Fname`), `\`, `%` (double encoding) or a control character is refused with 403.
+The redaction is defense in depth only: tenant users also receive a token kubeconfig for their
+ServiceAccount and can reach the API server without the proxy, so the admission policies above
+are what keep Secret values from being returned.
 
 Developers replace Secrets they cannot read, so the `tenant-secret-update` policy guards every
 Secret `UPDATE` by a `di-user-*` ServiceAccount (`stringData` is already folded into `data` when
