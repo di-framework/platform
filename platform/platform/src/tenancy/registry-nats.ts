@@ -115,6 +115,10 @@ export const NATS_CREDENTIALS_HOST_IMAGE_DIGESTS: readonly string[] = [
   'sha256:805a47c0050a90e8dcf22de8e844da91da38b2d8f2da26170ace7c624af76584',
   // ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive (publish run 38628447091)
   'sha256:933d26ec01dade4af7e0d10b877c9afad5371256147cf6db4aff42ecd0c28ec2',
+  // ghcr.io/di-framework/wash:2.8.0-wasi-tls
+  'sha256:76c78e4a5888b48eb9abd89f02c5f58c5aa5bcd0a7d2fefe72b323a17ea43d77',
+  // ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive
+  'sha256:ef510b78221d5b5c7edef7203d8837b8cae35a31535376b2b034e689f909d2ab',
 ];
 /** Whether `hostImage` is pinned to one of {@link NATS_CREDENTIALS_HOST_IMAGE_DIGESTS}. */
 export function hostImageSupportsNatsCredentials(hostImage: string): boolean {
