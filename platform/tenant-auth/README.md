@@ -308,7 +308,8 @@ console's Secret reassignment errors):
 | the target is platform-managed (`di-binding-*`, `di-bs-*`) | `tenant users cannot update platform-managed di-binding-*/di-bs-* Secrets` | 403 |
 | the update drops a key the Secret already has | `tenant users may update a Secret only if it keeps every existing data key` | 409 |
 
-Same-key replaces (the `/v1` secret set and update, the CLI `<workload>-control` Secret) and
+Same-key replaces (the `/v1` secret set and update, the CLI `<workload>-control` Secret, the app's
+`<workload>-secrets` Secret) and
 updates that add keys stay allowed. Match by substring: a managed name may also trip the older
 `backend-config` message first.
 
@@ -361,9 +362,15 @@ create. On a WorkloadDeployment in `di-tenant-<t>`, every
 - `secretFrom[].name` matching `^[a-z]([-a-z0-9]{0,61}[a-z0-9])?\.<env>$` (the `<name>` rule
   above, then `.<env>`), where the part before the dot is not a managed name
   (`isManagedSecretName`: `di-binding-*`, `di-bs-*`);
-- a WorkloadDeployment may also reference `secretFrom: <its own metadata.name>-control` (the
-  control Secret cli-plugin-platform renders for HTTP workloads under
-  `localResources.environment`), regardless of the env label, unless that name is managed;
+- a WorkloadDeployment may also reference exactly two Secrets named after itself, regardless of
+  the env label, unless that name is managed (platform#203):
+  - `<its own metadata.name>-control`: the control Secret cli-plugin-platform renders for HTTP
+    workloads under `localResources.environment`. It holds only the CLI's control credentials
+    (`DI_CONTROL_TOKEN`, `DI_CONTROL_IDENTITY`), and the CLI owns and rotates it on every deploy.
+  - `<its own metadata.name>-secrets`: the app's runtime secrets (for example signing keys or
+    `DI_PGLITE_KEY`). The app's own tooling writes it; the CLI never touches it.
+
+  No other `<metadata.name>-*` name is allowed, and neither Secret of another workload is;
 - no `imagePullSecret` (component or service) may be a managed name (`di-binding-*`, `di-bs-*`).
 
 `<env>` is the value of the WorkloadDeployment's `platform.di-framework.dev/env` label: the

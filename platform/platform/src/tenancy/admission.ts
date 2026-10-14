@@ -322,6 +322,11 @@ export const ENV_LABEL = 'platform.di-framework.dev/env';
 /** Environments a WorkloadDeployment may reference tenant vars and secrets for (#88). */
 export const DEPLOY_ENVS = ['prod', 'staging'] as const;
 const TENANT_SECRET_NAME = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
+/**
+ * Suffixes of the Secrets a WorkloadDeployment may reference by its own name (#203):
+ * `<workload>-control` is CLI-owned, `<workload>-secrets` is app-owned.
+ */
+export const WORKLOAD_SECRET_SUFFIXES = ['-control', '-secrets'] as const;
 
 interface EnvironmentReferencesLike {
   environment?: {
@@ -336,8 +341,11 @@ interface EnvironmentReferencesLike {
  * Mirrors the environment reference rule in the CEL policy (#88; tenant-auth README "Secrets and
  * vars storage contract"). A tenant WorkloadDeployment labelled with env `<env>` may reference
  * only `di-vars-<env>` and `<name>.<env>` Secrets whose `<name>` is not managed; without a valid
- * env label it may reference neither. The `<workload>-control` Secret cli-plugin-platform renders
- * for HTTP workloads stays allowed. Secret labels are checked by the deploy lane (#87), not here.
+ * env label it may reference neither. Regardless of the env label, a workload may also reference
+ * exactly two Secrets named after itself: `<workload>-control`, which cli-plugin-platform renders
+ * and rotates on every deploy, and `<workload>-secrets`, which the app's own tooling writes and the
+ * CLI never touches (#203). No other `<workload>-*` name is allowed. Secret labels are checked by
+ * the deploy lane (#87), not here.
  */
 export function workloadEnvironmentReferencesAllowed(input: {
   username: string;
@@ -355,10 +363,10 @@ export function workloadEnvironmentReferencesAllowed(input: {
   if ((input.imagePullSecrets ?? []).some(isManagedSecretName)) return false;
   const label = input.labels?.[ENV_LABEL];
   const env = (DEPLOY_ENVS as readonly string[]).includes(label ?? '') ? label : undefined;
-  const controlSecret = `${input.workloadName}-control`;
+  const ownSecrets = WORKLOAD_SECRET_SUFFIXES.map((suffix) => `${input.workloadName}${suffix}`);
   const secretAllowed = (name: string) => {
     if (isManagedSecretName(name)) return false;
-    if (name === controlSecret) return true;
+    if (ownSecrets.includes(name)) return true;
     if (env === undefined || !name.endsWith(`.${env}`)) return false;
     return TENANT_SECRET_NAME.test(name.slice(0, -(env.length + 1)));
   };
@@ -647,7 +655,7 @@ function workloadPolicy(namespace: string): AdmissionPolicy {
             variables.env != '' && c.name == 'di-vars-' + variables.env)) &&
           (!has(l.environment.secretFrom) || l.environment.secretFrom.all(s,
             !s.name.startsWith('${BINDING_CONFIG_PREFIX}') && !s.name.startsWith('${BS_CONFIG_PREFIX}') &&
-            (s.name == object.metadata.name + '-control' ||
+            (${WORKLOAD_SECRET_SUFFIXES.map((suffix) => `s.name == object.metadata.name + '${suffix}'`).join(' || ')} ||
               (variables.env != '' && s.name.endsWith('.' + variables.env) &&
                 s.name.matches('^[a-z]([-a-z0-9]{0,61}[a-z0-9])?[.](${DEPLOY_ENVS.join('|')})$')))))))`,
         message:
