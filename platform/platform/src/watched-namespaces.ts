@@ -16,12 +16,39 @@ export interface HostNamespacesArgs {
   log: { info(message: string): void; warn(message: string): void };
   /** Injected for tests; waits between attempts of a transient list failure. */
   sleep?: (ms: number) => Promise<void>;
+  /** Injected for tests; the clock the retry budget is measured with. */
+  now?: () => number;
 }
 
 /** Waits before the 2nd, 3rd and 4th attempt to list the Tenants (#245): 3.5 s in all. */
 export const TENANT_LIST_RETRY_DELAYS_MS = [500, 1000, 2000] as const;
+/**
+ * No retry starts once this much time has passed since the first attempt, so slow failures
+ * (an undici connect timeout is 10 s) cannot stretch `up` by four full attempts.
+ */
+export const TENANT_LIST_RETRY_BUDGET_MS = 15_000;
 
-const TRANSIENT_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'EPIPE']);
+/**
+ * Transport failures a retry can clear, as Node (`cause.code` under undici's `fetch failed`)
+ * and Bun report them. Header and body timeouts (`UND_ERR_HEADERS_TIMEOUT`,
+ * `UND_ERR_BODY_TIMEOUT`) are left out: each already waited minutes.
+ */
+const TRANSIENT_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'EPIPE',
+  // undici: the socket closed or failed mid-request, the connect timed out, the client closed.
+  'UND_ERR_SOCKET',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_CLOSED',
+  // Bun's fetch.
+  'ConnectionRefused',
+  'ConnectionReset',
+  'ConnectionClosed',
+  'FailedToOpenSocket',
+]);
 
 /** HTTP 429 or 5xx, or a connection error that a retry can clear. */
 export function isTransientListError(error: unknown): boolean {
@@ -65,19 +92,27 @@ export function describeListError(error: unknown): string {
     : `${described} (no HTTP status or error code; check the kubeconfig's server URL, TLS settings and credentials)`;
 }
 
-const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+/** The default wait between attempts. */
+export const realSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Lists the Tenants, retrying transient failures a few times with a short backoff (#245). */
+/**
+ * Lists the Tenants, retrying transient failures a few times with a short backoff (#245), never
+ * starting a retry past `TENANT_LIST_RETRY_BUDGET_MS`.
+ */
 async function listWithRetry(
   list: TenantLister,
   installation: string,
   sleep: (ms: number) => Promise<void>,
+  now: () => number,
 ): Promise<LiveTenant[]> {
+  const started = now();
   for (const delay of TENANT_LIST_RETRY_DELAYS_MS) {
     try {
       return await list(installation);
     } catch (error) {
       if (!isTransientListError(error)) throw error;
+      if (now() - started + delay > TENANT_LIST_RETRY_BUDGET_MS) throw error;
       await sleep(delay);
     }
   }
@@ -114,9 +149,14 @@ export async function operatorHostNamespaces(args: HostNamespacesArgs): Promise<
   }
   let live: string[];
   try {
-    live = (await listWithRetry(args.listTenants, args.installation, args.sleep ?? realSleep)).map(
-      (t) => t.metadata.name,
-    );
+    live = (
+      await listWithRetry(
+        args.listTenants,
+        args.installation,
+        args.sleep ?? realSleep,
+        args.now ?? Date.now,
+      )
+    ).map((t) => t.metadata.name);
   } catch (error) {
     // No Tenant CRD yet (a first install): no Tenants. Anything else fails the update rather
     // than shrinking the list; the message never carries a response body or the kubeconfig.

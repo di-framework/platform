@@ -185,7 +185,14 @@ not from your config at that moment.
 - `Retain`: the controller scales the workload to zero and keeps the `di-tenant-<name>` and
   `di-runtime-<name>` namespaces. It removes the Tenant's finalizer only after the tenant's host
   pods are gone, terminating ones included, so the runtime operator can still clear their
-  finalizers (#245).
+  finalizers (#245). Finished pods (`Succeeded` or `Failed`, such as evicted ones) do not count.
+  While it waits, the Tenant's `Ready` condition is `False` with reason `WaitingForHostPods` and
+  names the pods. If a pod stays there (for example on an unreachable node), check it with
+  `kubectl get pods -n di-runtime-<name> -o wide`, then bring the node back or remove it from
+  the cluster, or as a last resort run
+  `kubectl delete pod -n di-runtime-<name> <pod> --grace-period=0 --force`. A pod that still
+  lists `runtime.wasmcloud.dev/pod-host-finalizer` after that is waiting for the runtime
+  operator; make sure it is running, since it clears the finalizer while the Tenant exists.
 - `Delete`: the controller deletes both namespaces, and with them their PVCs (subject to the
   StorageClass reclaim policy). It does not remove the on-disk tenant data directories: backend
   data lives in tenant-UID hostPath directories under the storage root, which namespace deletion
@@ -407,8 +414,10 @@ model, not a claim of developer-proof network isolation.
   being watched on the next `up`, after the Tenant is gone. Under either `deletionPolicy` the
   Tenant is removed once its host pods are gone (`Retain` keeps only the namespaces and data),
   so a retained namespace is not watched. Previews never read the cluster and show the
-  declared tenants only. The Tenant list is retried up to three times (0.5 s, 1 s, 2 s apart)
-  on HTTP 429/5xx and connection errors; a failure that remains fails `up` with `Cannot list
+  declared tenants only. The Tenant list is retried up to three times (0.5 s, 1 s, 2 s apart,
+  and no retry starts more than 15 s after the first attempt) on HTTP 429/5xx and connection
+  errors, including undici's `UND_ERR_SOCKET`/`UND_ERR_CONNECT_TIMEOUT` and Bun's
+  `ConnectionRefused`-style codes; a failure that remains fails `up` with `Cannot list
   the Tenants of installation <name> ... (#227): <HTTP status or error code>`. An error without
   either, such as an unusable kubeconfig, names its class and what to check in the kubeconfig
   (#245).

@@ -5,6 +5,8 @@ import {
   type HostNamespacesArgs,
   isTransientListError,
   operatorHostNamespaces,
+  realSleep,
+  TENANT_LIST_RETRY_BUDGET_MS,
   TENANT_LIST_RETRY_DELAYS_MS,
 } from '../src/watched-namespaces';
 
@@ -264,18 +266,81 @@ test('a kubeconfig error says what to check, quoting only known client-node mess
   );
 });
 
-test('without an injected sleep, a retry really waits before the next attempt', async () => {
+test('the default wait really sleeps', async () => {
+  const started = performance.now();
+  await realSleep(5);
+  expect(performance.now() - started).toBeGreaterThanOrEqual(4);
+});
+
+/** A `fetch failed` TypeError as undici raises it under Node: the code is on `cause`. */
+function undiciError(code: string): TypeError {
+  return new TypeError('fetch failed', { cause: Object.assign(new Error('other side'), { code }) });
+}
+
+/** A fetch error as Bun raises it: the code is on the error itself. */
+function bunError(code: string): Error {
+  return Object.assign(new Error('Unable to connect'), { code });
+}
+
+test.each([
+  ['undici socket', undiciError('UND_ERR_SOCKET')],
+  ['undici connect timeout', undiciError('UND_ERR_CONNECT_TIMEOUT')],
+  ['undici closed', undiciError('UND_ERR_CLOSED')],
+  ['undici ECONNRESET', undiciError('ECONNRESET')],
+  ['Bun ConnectionRefused', bunError('ConnectionRefused')],
+  ['Bun ConnectionReset', bunError('ConnectionReset')],
+  ['Bun ConnectionClosed', bunError('ConnectionClosed')],
+  ['Bun FailedToOpenSocket', bunError('FailedToOpenSocket')],
+])('a %s error is retried (#245)', async (_, error) => {
+  expect(isTransientListError(error)).toBe(true);
   const { log } = recorder();
   let calls = 0;
   const listTenants = async (): Promise<LiveTenant[]> => {
-    if (calls++ === 0) throw new ApiError(502);
-    return [];
+    if (calls++ === 0) throw error;
+    return [{ metadata: { name: 'beta' } }];
   };
-  const started = Date.now();
-  expect(await operatorHostNamespaces(args({ listTenants, sleep: undefined }, log))).toEqual([
+  expect(await operatorHostNamespaces(args({ listTenants }, log))).toEqual([
     'wasmcloud',
     'di-runtime-alpha',
+    'di-runtime-beta',
   ]);
   expect(calls).toBe(2);
-  expect(Date.now() - started).toBeGreaterThanOrEqual(TENANT_LIST_RETRY_DELAYS_MS[0] - 50);
+});
+
+test('header and body timeouts are not retried: each already waited minutes', () => {
+  expect(isTransientListError(undiciError('UND_ERR_HEADERS_TIMEOUT'))).toBe(false);
+  expect(isTransientListError(undiciError('UND_ERR_BODY_TIMEOUT'))).toBe(false);
+});
+
+test('a persistent undici error fails with its code after the last attempt', async () => {
+  const { log } = recorder();
+  const listTenants = async (): Promise<LiveTenant[]> => {
+    throw undiciError('UND_ERR_SOCKET');
+  };
+  await expect(operatorHostNamespaces(args({ listTenants }, log))).rejects.toThrow(
+    '(#227): UND_ERR_SOCKET',
+  );
+});
+
+test('no retry starts past the retry budget, so slow failures stay bounded (#245)', async () => {
+  const { log } = recorder();
+  let clock = 0;
+  const slept: number[] = [];
+  let calls = 0;
+  const listTenants = async (): Promise<LiveTenant[]> => {
+    calls++;
+    clock += 10_000; // each attempt fails only after an undici connect timeout
+    throw undiciError('UND_ERR_CONNECT_TIMEOUT');
+  };
+  const sleep = async (ms: number) => {
+    slept.push(ms);
+    clock += ms;
+  };
+  await expect(
+    operatorHostNamespaces(args({ listTenants, sleep, now: () => clock }, log)),
+  ).rejects.toThrow('(#227): UND_ERR_CONNECT_TIMEOUT');
+  // 10 s + 0.5 s wait fits the budget; a second retry would start past it.
+  expect(calls).toBe(2);
+  expect(slept).toEqual([TENANT_LIST_RETRY_DELAYS_MS[0]]);
+  expect(clock).toBeLessThanOrEqual(TENANT_LIST_RETRY_BUDGET_MS + 10_000);
 });
