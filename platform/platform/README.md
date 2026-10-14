@@ -936,6 +936,21 @@ tenantAuth:
       apply to `kubectl port-forward`: `di-runtime-developer` grants `pods/portforward`, so a
       developer can reach `8789` and `8791` directly. That yields nothing without a credential:
       the registry still authorizes every request through whoami, and no file is served.
+    - Startup (#197): after a host starts or restarts, its workloads pull while `di-tenant-registry`
+      on the same host is still starting. The pull listener waits for the registry instead of
+      failing the pull (which wash would only retry about a minute later): a refused connection or
+      the host's empty `404` for a `Host` no workload serves yet is retried with a 250 ms to 2 s
+      backoff, for at most `TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS` (default 30 s). Any answer
+      from the registry itself, a `404 BLOB_UNKNOWN` included, is returned at once, and the public
+      front never waits. The wait delays only that one pull, so nothing blocks the host that serves
+      the registry. A waiting pull gives its pool slot back between attempts, so pulls waiting out
+      a host restart do not turn the others away; one that finds no free slot before its wait is
+      over is answered `503`. Each attempt gets the full upstream header timeout, so the wait is
+      not cut short by it.
+    - Framing (#197): the front and the pull listener run on `node:http`, which writes the
+      registry's `Content-Length` on a blob `GET` as is; `Bun.serve` re-framed every streamed body
+      as chunked, and oras then stalled behind the unread body over `kubectl port-forward`. A `HEAD`
+      gets its `Content-Length` from the registry's `docker-content-length`.
     - Credential: Secret `di-tenant-registry-pull` in `di-runtime-<tenant>` holds a random
       32-byte token (`token`) and a Docker config for `tenant-registry.di-runtime-<tenant>.svc`
       (`config.json`, Basic `tenant-host:<token>`). The platform controller generates it and keeps

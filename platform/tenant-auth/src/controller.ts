@@ -19,6 +19,7 @@ import {
   type UserTokens,
 } from './kube.ts';
 import { discover, type ProviderMetadata } from './oidc.ts';
+import { serveRegistryListener } from './registry-listener.ts';
 import { controllerSecretReader } from './v1/context.ts';
 import { serveV1, TITLES } from './v1/index.ts';
 import {
@@ -100,6 +101,14 @@ export interface ControllerConfig {
   /** Whether the pull listener uses TLS (default); false when hosts pull over plain HTTP. */
   registryPullTls: boolean;
   /**
+   * How long a host pull waits for the registry workload to come up
+   * (`TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS`, default 30 s; #197). After a host starts,
+   * its workloads pull while `di-tenant-registry` on the same host is still starting; the pull
+   * listener retries until the registry answers instead of failing the pull, which wash would
+   * only retry about a minute later.
+   */
+  registryPullWaitMs: number;
+  /**
    * In-cluster registry host workloads reference (`TENANT_CONTROLLER_REGISTRY_PULL_HOST`);
    * `/v1/deploy` points users at it when a workload names the public origin instead.
    */
@@ -111,7 +120,7 @@ export interface ControllerConfig {
   hostPullTokenFile?: string;
 }
 
-/** Idle timeout of the registry front's client sockets; any data flow resets it (Bun's max is 255). */
+/** Idle timeout of the registry front's client sockets; any data flow resets it. */
 export const REGISTRY_IDLE_TIMEOUT_SECONDS = 120;
 
 /**
@@ -120,6 +129,101 @@ export const REGISTRY_IDLE_TIMEOUT_SECONDS = 120;
  */
 export const REGISTRY_PULL_MAX_BODY_BYTES = 1024;
 const DEFAULT_REGISTRY_MAX_BODY_BYTES = 512 * 1024 * 1024;
+/** Backoff between host pull attempts while the registry is starting (#197). */
+const REGISTRY_PULL_RETRY_INITIAL_MS = 250;
+const REGISTRY_PULL_RETRY_MAX_MS = 2_000;
+
+/**
+ * Whether a host's answer comes from the host rather than the registry workload: wash answers a
+ * `Host` no workload serves yet with an empty 404 (and its own gateway errors with an empty 502 or
+ * 503), while the registry's errors always carry an OCI JSON body with its `content-type`.
+ */
+export function registryNotServing(response: Response): boolean {
+  return [404, 502, 503].includes(response.status) && !response.headers.has('content-type');
+}
+
+/** A slot of a registry request pool; both calls are idempotent. */
+interface PoolSlot {
+  /** Takes the slot; false when the pool is full. */
+  acquire(): boolean;
+  release(): void;
+}
+
+function poolSlot(pool: { inFlight: number }, max: number): PoolSlot {
+  let held = false;
+  return {
+    acquire() {
+      if (held) return true;
+      if (pool.inFlight >= max) return false;
+      pool.inFlight++;
+      held = true;
+      return true;
+    },
+    release() {
+      if (!held) return;
+      held = false;
+      pool.inFlight--;
+    },
+  };
+}
+
+function registryBusy(): Response {
+  return problem(503, 'Service Unavailable', 'the tenant registry is busy; retry shortly');
+}
+
+/** One host pull attempt: the answer, or the connection failure (an abort is rethrown). */
+async function attemptPull(
+  send: () => Promise<Response>,
+  signal: AbortSignal,
+): Promise<{ response?: Response; failure?: unknown }> {
+  try {
+    return { response: await send() };
+  } catch (error) {
+    if (signal.aborted) throw error;
+    return { failure: error };
+  }
+}
+
+/** The last attempt's answer, or its failure once the wait is over. */
+function settle(outcome: { response?: Response; failure?: unknown }): Response {
+  if (outcome.response) return outcome.response;
+  throw outcome.failure;
+}
+
+/**
+ * Pauses `delay`, doubling it each time, until a slot is free again; returns the next delay, or
+ * undefined when none frees up before `deadline`.
+ */
+async function pauseForSlot(
+  delay: number,
+  deadline: number,
+  signal: AbortSignal,
+  slot: PoolSlot,
+): Promise<number | undefined> {
+  let next = delay;
+  for (;;) {
+    await pause(next, signal);
+    next = Math.min(next * 2, REGISTRY_PULL_RETRY_MAX_MS);
+    if (slot.acquire()) return next;
+    if (Date.now() + next > deadline) return undefined;
+  }
+}
+
+/** Resolves after `ms`, or rejects with the signal's reason once it aborts. */
+function pause(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 function positiveInteger(value: string | undefined, name: string, fallback: number): number {
   if (!value) return fallback;
@@ -331,6 +435,11 @@ export function configFromEnv(env = process.env): ControllerConfig {
       'TENANT_CONTROLLER_REGISTRY_PULL_PORT',
     ),
     registryPullTls: env.TENANT_CONTROLLER_REGISTRY_PULL_TLS !== 'false',
+    registryPullWaitMs: positiveInteger(
+      env.TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS,
+      'TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS',
+      30_000,
+    ),
     registryPullHost: env.TENANT_CONTROLLER_REGISTRY_PULL_HOST || undefined,
     hostPullTokenFile: env.TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE || undefined,
   };
@@ -894,15 +1003,9 @@ export class Controller {
       await request.body?.cancel().catch(() => {});
       return registryChallenge();
     }
-    if (pool.inFlight >= this.config.registryMaxConcurrent)
-      return problem(503, 'Service Unavailable', 'the tenant registry is busy; retry shortly');
-    pool.inFlight++;
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      pool.inFlight--;
-    };
+    const slot = poolSlot(pool, this.config.registryMaxConcurrent);
+    if (!slot.acquire()) return registryBusy();
+    const release = slot.release;
     const headers = upstreamRequestHeaders(
       request,
       url,
@@ -929,21 +1032,37 @@ export class Controller {
             done: armHeaderTimer,
           })
         : null;
-    if (!body) armHeaderTimer();
+    if (!body && withBody) armHeaderTimer();
+    const signal = AbortSignal.any([request.signal, timeout.signal, stall.signal]);
+    const send = () =>
+      fetch(`${this.proxyUpstream(this.config.tenant)}${url.pathname}${url.search}`, {
+        method: request.method,
+        headers,
+        body,
+        duplex: 'half',
+        redirect: 'manual',
+        decompress: false,
+        signal,
+      } as RequestInit);
     let upstream: Response;
     try {
-      upstream = await fetch(
-        `${this.proxyUpstream(this.config.tenant)}${url.pathname}${url.search}`,
-        {
-          method: request.method,
-          headers,
-          body,
-          duplex: 'half',
-          redirect: 'manual',
-          decompress: false,
-          signal: AbortSignal.any([request.signal, timeout.signal, stall.signal]),
-        } as RequestInit,
-      );
+      // A host pull carries no body, so it can be resent while the registry is starting (#197).
+      // Each attempt gets the full header timeout, so the wait is bounded only by
+      // `registryPullWaitMs` and never ends in a 504 while the host keeps answering.
+      const attempt = async () => {
+        armHeaderTimer();
+        try {
+          return await send();
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      const answer = withBody
+        ? await send()
+        : await this.untilRegistryAnswers(attempt, signal, url, slot);
+      // No slot came free for a waiting pull before its wait was over (it holds none).
+      if (!answer) return registryBusy();
+      upstream = answer;
     } catch (error) {
       release();
       const timedOut = timeout.signal.aborted;
@@ -968,9 +1087,10 @@ export class Controller {
         out.append(name, value);
       }
     });
-    // Bun.serve writes an implicit `Content-Length: 0` on a HEAD response with an empty body, which
-    // misreports the entity size. The registry therefore sends the size as `docker-content-length`
-    // on HEAD; restore it here. Accept only a single plain-digit safe integer, otherwise drop it.
+    // The registry's host rejects a declared `Content-Length` on an empty HEAD body, so the registry
+    // sends the size as `docker-content-length` on HEAD; restore it here. Accept only a single
+    // plain-digit safe integer, otherwise drop it. A GET keeps the registry's own `Content-Length`,
+    // which the registry listener writes as is (#197).
     if (request.method === 'HEAD') {
       const length = parseSideContentLength(dockerContentLength);
       if (length !== undefined) out.set('content-length', length);
@@ -979,6 +1099,46 @@ export class Controller {
       status: upstream.status,
       headers: out,
     });
+  }
+
+  /**
+   * Sends a host pull until the registry workload answers it (#197), for at most
+   * `registryPullWaitMs`. After a host (re)start its workloads pull while `di-tenant-registry` on
+   * the same host is still starting: the host then refuses the connection, or answers the empty
+   * 404 wash gives a `Host` no workload serves yet. Both are retried with a short backoff; any
+   * answer from the registry itself (its errors are OCI JSON) is final. The wait is bounded and
+   * only delays this one pull, so a host that serves the registry is never held back by it.
+   *
+   * The pool slot is given back between attempts, so pulls waiting out a host restart do not
+   * turn away the other pulls; an attempt takes a slot again first, and a pull that finds none
+   * free before the wait is over gets undefined (answered as busy).
+   */
+  private async untilRegistryAnswers(
+    send: () => Promise<Response>,
+    signal: AbortSignal,
+    url: URL,
+    slot: PoolSlot,
+  ): Promise<Response | undefined> {
+    const deadline = Date.now() + this.config.registryPullWaitMs;
+    let delay = REGISTRY_PULL_RETRY_INITIAL_MS;
+    for (let tries = 0; ; tries++) {
+      const outcome = await attemptPull(send, signal);
+      if (outcome.response && !registryNotServing(outcome.response)) return outcome.response;
+      if (Date.now() + delay > deadline) return settle(outcome);
+      await outcome.response?.body?.cancel().catch(() => {});
+      if (tries === 0)
+        this.audit('registry.waiting', {
+          path: url.pathname,
+          listener: 'registry-pull',
+          reason: outcome.response
+            ? `the host answered ${outcome.response.status} before the registry was serving`
+            : String(outcome.failure),
+        });
+      slot.release();
+      const next = await pauseForSlot(delay, deadline, signal, slot);
+      if (next === undefined) return undefined;
+      delay = next;
+    }
   }
 
   /** Registry front requests in flight (see {@link handleRegistry}). */
@@ -1130,24 +1290,26 @@ if (import.meta.main) {
       idleTimeout: 120,
       fetch: (request) => controller.handleWhoami(request),
     });
+  // The registry listeners run on `node:http`, not `Bun.serve`, so a streamed blob keeps the
+  // registry's `Content-Length` (#197; see `registry-listener.ts`).
   if (config.registryFrontPort)
-    Bun.serve({
+    await serveRegistryListener({
       hostname: config.host,
       port: config.registryFrontPort,
       tls,
       // Bounded (W2 of the platform#83 review): data flow resets the idle timeout, and bodies
       // beyond the cap are refused here too when they are chunked.
-      idleTimeout: REGISTRY_IDLE_TIMEOUT_SECONDS,
+      idleTimeoutSeconds: REGISTRY_IDLE_TIMEOUT_SECONDS,
       maxRequestBodySize: config.registryMaxBodyBytes,
       fetch: (request, server) => controller.handleRegistry(request, server),
     });
   // The tenant hosts' pulls (platform#83 `:host-pull`): TLS unless they pull over plain HTTP.
   if (config.registryPullPort)
-    Bun.serve({
+    await serveRegistryListener({
       hostname: config.host,
       port: config.registryPullPort,
       tls: config.registryPullTls ? tls : undefined,
-      idleTimeout: REGISTRY_IDLE_TIMEOUT_SECONDS,
+      idleTimeoutSeconds: REGISTRY_IDLE_TIMEOUT_SECONDS,
       maxRequestBodySize: REGISTRY_PULL_MAX_BODY_BYTES,
       fetch: (request, server) => controller.handleRegistryPull(request, server),
     });
