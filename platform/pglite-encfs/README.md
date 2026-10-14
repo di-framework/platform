@@ -39,7 +39,7 @@ Or use `make compose PGLITE=path/to/di-framework-pglite.wasm OUT=pglite-enc.wasm
 
 Generate a key with `openssl rand -base64 32`, or with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`.
 
-- **How the key is read.** The key reaches the component through `wasi:cli/environment`. On the platform that means the workload's `<workload>-control` Secret via `localResources.environment.secretFrom`. encfs reads it once, derives its keys, and wipes the decoded bytes and the environment strings.
+- **How the key is read.** The key reaches the component through `wasi:cli/environment`. On the platform that means the workload's app-owned `<workload>-secrets` Secret via `localResources.environment.secretFrom`; `<workload>-control` holds only the CLI's control credentials. encfs reads it once, derives its keys, and wipes the decoded bytes and the environment strings.
 - **What the engine sees.** encfs's own `wasi:cli/environment` export filters out both variables, so the PostgreSQL engine never sees them. The guest's environment comes from the host directly, so the guest can see them, just as it sees its other secrets.
 - **What is stored.** Neither the key nor anything that decrypts data is written to the volume. Headers and the root marker hold a 16-byte key-check value (KCV), a one-way HKDF output that identifies the key.
 
