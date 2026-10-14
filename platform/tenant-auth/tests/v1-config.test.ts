@@ -27,6 +27,7 @@ let version = 0;
 let failPut: number | undefined;
 /** When set, every GET of a named object answers 500. */
 let failGet = false;
+let failWorkloads: number | undefined;
 let corruptAnnotation = false;
 /** When set, runs once after the next GET of this key is answered: a concurrent writer. */
 let raceAfterGet: { key: string; run: () => void } | undefined;
@@ -54,7 +55,7 @@ const api = serve((request) => {
     });
   }
   if (request.pathname === WORKLOADS && request.method === 'GET')
-    return failGet ? json({ message: 'boom' }, 500) : json({ items: workloads });
+    return failWorkloads ? json({ message: 'boom' }, failWorkloads) : json({ items: workloads });
   const match = /^\/api\/v1\/namespaces\/di-tenant-acme\/(secrets|configmaps)(?:\/([^/]+))?$/.exec(
     request.pathname,
   );
@@ -208,6 +209,7 @@ beforeEach(() => {
   api.requests.length = 0;
   failPut = undefined;
   failGet = false;
+  failWorkloads = undefined;
   corruptAnnotation = false;
   raceAfterGet = undefined;
   refuseController = undefined;
@@ -505,7 +507,7 @@ describe('secrets', () => {
     expect(response.status).toBe(409);
     expect(response.headers.get('content-type')).toBe('application/problem+json');
     expect((await body(response)).detail).toBe(
-      'secret verify-token is referenced by deployed workloads in staging: api-staging, greeter-staging; destroy them (or redeploy without it) before unsetting it',
+      'secret verify-token is referenced by deployed workloads in staging: api-staging, greeter-staging; destroy them or redeploy them without it in `secrets` before unsetting it',
     );
     expect(store.has('secrets/verify-token.staging')).toBe(true);
     expect(kubeCalls().some((r) => r.method === 'DELETE')).toBe(false);
@@ -518,13 +520,20 @@ describe('secrets', () => {
     expect(store.has('secrets/verify-token.staging')).toBe(false);
   });
 
-  test('a failure listing workloads keeps the secret and is a generic 502', async () => {
-    await call('PUT', '/v1/secrets/db?env=prod', 'one');
-    failGet = true;
-    expect((await call('DELETE', '/v1/secrets/db?env=prod')).status).toBe(502);
-    failGet = false;
-    expect(store.has('secrets/db.prod')).toBe(true);
-  });
+  for (const [status, label] of [
+    [500, 'a failure listing workloads keeps the secret and is a generic 502'],
+    [403, 'a denied workload list passes the 403 through and keeps the secret'],
+  ] as const)
+    test(label, async () => {
+      await call('PUT', '/v1/secrets/db?env=prod', 'one');
+      failWorkloads = status;
+      const response = await call('DELETE', '/v1/secrets/db?env=prod');
+      expect(response.status).toBe(status === 500 ? 502 : 403);
+      // The secret's own GET succeeded; the failure came from the workload list.
+      expect(kubeCalls().some((r) => r.pathname === WORKLOADS && r.method === 'GET')).toBe(true);
+      expect(kubeCalls().some((r) => r.method === 'DELETE')).toBe(false);
+      expect(store.has('secrets/db.prod')).toBe(true);
+    });
 
   test('unset deletes only the version it read', async () => {
     await call('PUT', '/v1/secrets/db?env=prod', 'one');
@@ -745,7 +754,7 @@ describe('vars', () => {
     expect(response.status).toBe(409);
     expect(response.headers.get('content-type')).toBe('application/problem+json');
     expect((await body(response)).detail).toBe(
-      'var LEVEL is referenced by deployed workloads in staging: greeter-staging; destroy them (or redeploy without it) before unsetting it',
+      'var LEVEL is referenced by deployed workloads in staging: greeter-staging; destroy them before unsetting it; set the var instead to change its value',
     );
     expect(store.get('configmaps/di-vars-staging')).toEqual(before);
     // A missing var is still a 404, not a reference conflict.

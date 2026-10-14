@@ -100,9 +100,10 @@ const noContent = () => new Response(null, { status: 204 });
 
 // ---- references from deployed workloads (platform#100) ---------------------------------------
 
-const WORKLOAD_API = 'runtime.wasmcloud.dev/v1alpha1';
+/** The API group/version of WorkloadDeployments; shared with the deploy lane so both agree. */
+export const WORKLOAD_API = 'runtime.wasmcloud.dev/v1alpha1';
 
-type Sources = { name?: unknown }[] | undefined;
+type Sources = { name?: unknown }[];
 interface Guest {
   localResources?: { environment?: { configFrom?: Sources; secretFrom?: Sources } };
 }
@@ -138,7 +139,7 @@ async function referencing(
       return components.some(injects) || injects(template?.service);
     })
     .map(({ metadata }) => metadata.name)
-    .sort();
+    .sort((a, b) => a.localeCompare(b));
 }
 
 /**
@@ -151,12 +152,12 @@ async function refuseReferenced(
   source: string,
   what: string,
   env: string,
+  remedy: string,
 ): Promise<Response | undefined> {
   const deployments = await referencing(context, field, source);
   if (deployments.length === 0) return undefined;
   return conflict(
-    `${what} is referenced by deployed workloads in ${env}: ${deployments.join(', ')}; ` +
-      'destroy them (or redeploy without it) before unsetting it',
+    `${what} is referenced by deployed workloads in ${env}: ${deployments.join(', ')}; ${remedy}`,
   );
 }
 
@@ -275,6 +276,7 @@ const unsetSecret: V1Handler = async (_command, call, context) => {
     secretObjectName(name, env),
     `secret ${name}`,
     env,
+    'destroy them or redeploy them without it in `secrets` before unsetting it',
   );
   if (referenced) return referenced;
   await remove(
@@ -387,7 +389,14 @@ async function secretSharing(context: V1Context, name: string, env: string) {
  * env is referenced while a workload there injects that env's vars (platform#100).
  */
 const varReferenced = (context: V1Context, name: string, env: string) =>
-  refuseReferenced(context, 'configFrom', varsConfigMapName(env), `var ${name}`, env);
+  refuseReferenced(
+    context,
+    'configFrom',
+    varsConfigMapName(env),
+    `var ${name}`,
+    env,
+    'destroy them before unsetting it; set the var instead to change its value',
+  );
 
 const missingVar = (name: string, call: HttpCall) =>
   problem(404, 'Not Found', `var ${name} does not exist in ${envOf(call)}`);

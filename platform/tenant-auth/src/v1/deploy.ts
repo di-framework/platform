@@ -17,6 +17,7 @@ import {
   secretEnvName,
   secretObjectName,
   varsConfigMapName,
+  WORKLOAD_API,
 } from './config.ts';
 import type { V1Context, V1Module } from './context.ts';
 
@@ -49,7 +50,6 @@ type Json = Record<string, unknown>;
 
 /** The field manager every deploy applies with, so re-deploys by any member own the same fields. */
 export const FIELD_MANAGER = 'di-tenant-deploy';
-const WORKLOAD_API = 'runtime.wasmcloud.dev/v1alpha1';
 const BINDING_API = 'platform.di-framework.dev/v1alpha1';
 const SERVICE_LABEL = 'di-framework.dev/service';
 /** Labels cli-plugin-platform renders and the platform's log projection selects on (#103). */

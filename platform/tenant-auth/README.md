@@ -336,9 +336,15 @@ guest's `localResources.environment` (`components[*]` and `service`):
 The 409 is a problem+json whose `detail` names the referencing WorkloadDeployments, sorted
 (`secret verify-token is referenced by deployed workloads in staging: greeter-staging; …`), and
 nothing is deleted. A name that does not exist is still a 404 first. Unset succeeds once nothing
-references it: destroy the workload, or for a secret redeploy without it in `secrets`. Set and
+references it: destroy the workload, or for a secret redeploy without it in `secrets`. A var
+cannot be dropped by redeploying, since every deploy injects the whole vars ConfigMap; set the
+var to change its value instead. Set and
 update are never blocked. The check reads the live objects, so a workload applied out of band
-counts too; a deploy racing the unset is caught by the deploy's own existence check (422).
+counts too. The check is best-effort, not transactional: Kubernetes has no transaction across the
+Secret/ConfigMap and the WorkloadDeployments. A deploy that already read the secret or vars
+ConfigMap before the unset listed workloads, and applies its WorkloadDeployment after that list
+but before the delete, still lands and then fails with `Config=False`. A deploy that reads after
+the delete is refused by its own existence check (422).
 Whether an emptied vars ConfigMap is deleted is a separate decision (platform#98); today it is
 kept with no keys.
 
