@@ -58,6 +58,19 @@ import {
   postgresServingResources,
 } from './postgres';
 import {
+  hostImageSupportsNatsCredentials,
+  NATS_REGISTRY_ACCOUNT,
+  NATS_TENANT_ACCOUNT,
+  newRegistryNatsPassword,
+  REGISTRY_NATS_AUTH_ANNOTATION,
+  REGISTRY_NATS_MIGRATION,
+  REGISTRY_NATS_MIGRATION_JOB,
+  REGISTRY_NATS_PASSWORD,
+  REGISTRY_NATS_SECRET,
+  REGISTRY_NATS_VOLUME,
+  registryNatsAuthDigest,
+} from './registry-nats';
+import {
   assertTenantAuthConfig,
   type BackingService,
   type BackingServiceClass,
@@ -75,6 +88,8 @@ import {
   REGISTRY_PULL_SECRET,
   REGISTRY_PULL_SERVICE,
   REGISTRY_WORKLOAD,
+  type RegistryNats,
+  type RegistryNatsMode,
   type Resource,
   ROUTES_CONFIG_NAME,
   registryHttpHost,
@@ -148,7 +163,77 @@ const plurals: Record<string, string> = {
   BackingService: 'backingservices',
   ServiceBinding: 'servicebindings',
   WorkloadDeployment: 'workloaddeployments',
+  WorkloadReplicaSet: 'workloadreplicasets',
+  Workload: 'workloads',
+  Job: 'jobs',
 };
+type RolloutDeployment = Resource & {
+  spec?: {
+    replicas?: number;
+    template?: {
+      metadata?: { annotations?: Record<string, string> };
+      spec?: { volumes?: { name: string }[] };
+    };
+  };
+  status?: {
+    observedGeneration?: number;
+    replicas?: number;
+    updatedReplicas?: number;
+    readyReplicas?: number;
+  };
+};
+type MigrationJob = Resource & {
+  status?: {
+    succeeded?: number;
+    conditions?: { type: string; status: string; reason?: string; message?: string }[];
+  };
+};
+type WorkloadObject = Resource & {
+  metadata: Resource['metadata'] & {
+    ownerReferences?: { kind: string; name: string; uid: string; controller?: boolean }[];
+  };
+  spec?: { replicas?: number };
+  status?: Record<string, unknown> & { observedGeneration?: number };
+};
+/** The controlling owner of `value` of `kind`, as the wasmCloud operator sets it. */
+function controllerOf(value: WorkloadObject, kind: string) {
+  return value.metadata.ownerReferences?.find(
+    (owner) => owner.controller !== false && owner.kind === kind,
+  );
+}
+/** The largest replica count a wasmCloud status reports (absent fields count as zero). */
+function runningCount(status: Record<string, unknown>): number {
+  return Math.max(
+    0,
+    ...['replicas', 'currentReplicas', 'readyReplicas', 'availableReplicas'].map(
+      (key) => Number(status[key] ?? 0) || 0,
+    ),
+  );
+}
+/**
+ * Whether `deployment` runs with the registry NATS password whose digest is `digest` (#159): its
+ * template carries the digest (and, with `mounted`, the credentials volume), and every replica is
+ * updated and ready with no old pod left.
+ */
+function rolledOutWith(
+  deployment: RolloutDeployment | undefined,
+  digest: string,
+  mounted: boolean,
+): boolean {
+  const want = deployment?.spec?.replicas ?? 0;
+  const template = deployment?.spec?.template;
+  const status = deployment?.status;
+  return (
+    !!deployment &&
+    want > 0 &&
+    template?.metadata?.annotations?.[REGISTRY_NATS_AUTH_ANNOTATION] === digest &&
+    (!mounted || !!template.spec?.volumes?.some((v) => v.name === REGISTRY_NATS_VOLUME)) &&
+    status?.observedGeneration === deployment.metadata.generation &&
+    status?.updatedReplicas === want &&
+    status?.readyReplicas === want &&
+    status?.replicas === want
+  );
+}
 export function collection(apiVersion: string, kind: string, namespace?: string): string {
   const plural = plurals[kind];
   if (!plural) throw new Error(`Unsupported resource kind: ${kind}`);
@@ -620,6 +705,124 @@ export class Controller {
       )?.spec?.template?.metadata?.annotations?.[REGISTRY_CA_ANNOTATION];
     return known ? { caDigest: known } : {};
   }
+  /** Set once the host image warning (#159) has been logged. */
+  private registryNatsWarned = false;
+  /**
+   * The registry's NATS account wiring (#159), read from the cluster each pass so the tenant step
+   * and the tenant-auth step agree; see {@link RegistryNatsStage}.
+   *
+   * - Undefined while `tenantAuth.registry` is unset, and while the host image is not a known build
+   *   with wash patch 0003 and the move has not started: the registry stays anonymous in `TENANT`
+   *   (logged once) rather than switching to credentials its host would ignore.
+   * - Once the move started (a migration Job exists, or the marker says it is done), the registry
+   *   is never anonymous again, whatever the host image: it stays stopped until it can use its
+   *   credentials, so it never recreates `OBJ_oci-registry` in `TENANT`.
+   * - The Job is created only after `di-nats` and the hosts rolled out with this password and a
+   *   previous pass stopped the registry and saw it stopped.
+   *
+   * The password is the one in `di-nats-registry` while well formed, otherwise a new one.
+   */
+  private async registryNats(tenant: Tenant): Promise<RegistryNats | undefined> {
+    if (!this.cfg.tenantAuth?.registry) return undefined;
+    const n = names(tenant.metadata.name);
+    const at = (apiVersion: string, kind: string, name: string) =>
+      `${collection(apiVersion, kind, n.runtimeNamespace)}/${name}`;
+    const [marker, found] = await Promise.all([
+      this.get<{ data?: Record<string, string> }>(at('v1', 'ConfigMap', REGISTRY_NATS_MIGRATION)),
+      this.get<MigrationJob>(at('batch/v1', 'Job', REGISTRY_NATS_MIGRATION_JOB)),
+    ]);
+    const job =
+      found?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+      found.metadata.labels[OWNER] === tenant.metadata.uid
+        ? found
+        : undefined;
+    const migrated = marker?.data?.state === 'complete' || (job?.status?.succeeded ?? 0) > 0;
+    const credentials = hostImageSupportsNatsCredentials(this.cfg.hostImage);
+    if (!credentials && !this.registryNatsWarned) {
+      this.registryNatsWarned = true;
+      console.warn(
+        `tenantHostImage ${this.cfg.hostImage} is not a known build with wash patch 0003 (NATS blobstore credentials): ` +
+          `tenant registries that have not moved stay in the ${NATS_TENANT_ACCOUNT} NATS account, and registries that ` +
+          `already moved (or are moving) to ${NATS_REGISTRY_ACCOUNT} stay stopped until it is (#159)`,
+      );
+    }
+    if (!credentials && !migrated && !job) return undefined;
+    const secret = await this.get<{ data?: Record<string, string> }>(
+      at('v1', 'Secret', REGISTRY_NATS_SECRET),
+    );
+    const stored = Buffer.from(secret?.data?.password ?? '', 'base64').toString();
+    const password = REGISTRY_NATS_PASSWORD.test(stored) ? stored : newRegistryNatsPassword();
+    if (migrated) return { password, stage: 'migrated', credentials };
+    if (job) {
+      // A Job that exists keeps the registry stopped until it ends, even if a rotation or an
+      // image change rolls di-nats or the hosts meanwhile.
+      const failure = job.status?.conditions?.find(
+        (c) => c.type === 'Failed' && c.status === 'True',
+      );
+      return {
+        password,
+        stage: 'migrating',
+        credentials,
+        ...(failure ? { failed: failure.reason ?? failure.message ?? 'Failed' } : {}),
+      };
+    }
+    if (tenant.spec.suspended || tenant.metadata.deletionTimestamp)
+      return { password, stage: 'rollout', credentials };
+    const digest = registryNatsAuthDigest(password);
+    const [nats, hosts] = await Promise.all([
+      this.get<RolloutDeployment>(at('apps/v1', 'Deployment', 'di-nats')),
+      this.get<RolloutDeployment>(at('apps/v1', 'Deployment', `hostgroup-${n.hostgroup}`)),
+    ]);
+    if (!rolledOutWith(nats, digest, false) || !rolledOutWith(hosts, digest, true))
+      return { password, stage: 'rollout', credentials };
+    return {
+      password,
+      stage: (await this.registryStopped(tenant)) ? 'migrating' : 'stopping',
+      credentials,
+    };
+  }
+  /**
+   * Whether the tenant registry is observed stopped (#159): its WorkloadDeployment asks for no
+   * replica, its status (when reported) is current and counts none, every WorkloadReplicaSet it
+   * controls is at zero, and no Workload of those sets is left. A registry that does not exist
+   * is stopped.
+   */
+  private async registryStopped(tenant: Tenant): Promise<boolean> {
+    const namespace = names(tenant.metadata.name).namespace;
+    const group = 'runtime.wasmcloud.dev/v1alpha1';
+    const deployment = await this.get<WorkloadObject>(
+      `${collection(group, 'WorkloadDeployment', namespace)}/${REGISTRY_WORKLOAD}`,
+    );
+    if (!deployment) return true;
+    const status = deployment.status ?? {};
+    if (
+      (deployment.spec?.replicas ?? 1) !== 0 ||
+      (status.observedGeneration !== undefined &&
+        status.observedGeneration !== deployment.metadata.generation) ||
+      runningCount(status) > 0
+    )
+      return false;
+    const [sets, workloads] = await Promise.all([
+      this.list<WorkloadObject>(group, 'WorkloadReplicaSet', {}, namespace),
+      this.list<WorkloadObject>(group, 'Workload', {}, namespace),
+    ]);
+    const owned = sets.filter(
+      (set) => controllerOf(set, 'WorkloadDeployment')?.uid === deployment.metadata.uid,
+    );
+    if (owned.some((set) => (set.spec?.replicas ?? 0) > 0 || runningCount(set.status ?? {}) > 0))
+      return false;
+    return !workloads.some((workload) => {
+      const owner = controllerOf(workload, 'WorkloadReplicaSet');
+      return owned.some(
+        (set) => set.metadata.uid === owner?.uid || set.metadata.name === owner?.name,
+      );
+    });
+  }
+  /** How the registry workload reaches `di-nats` for {@link registryNats} (#159). */
+  private static registryNatsMode(state: RegistryNats | undefined): RegistryNatsMode | undefined {
+    if (!state || state.stage === 'rollout') return undefined;
+    return state.stage === 'migrated' && state.credentials ? 'credentials' : 'stopped';
+  }
   async reconcileTenant(tenant: Tenant, users?: User[]): Promise<void> {
     if (!validName(tenant.metadata.name)) throw new Error('Invalid tenant name');
     if (!tenant.metadata.deletionTimestamp) await this.finalizer(tenant, true);
@@ -726,6 +929,7 @@ export class Controller {
       hostPull = this.hostPulls.get(tenant.metadata.name);
     }
     const hostsKnown = !hostPullFailure || this.hostPulls.has(tenant.metadata.name);
+    const registryNats = await this.registryNats(tenant);
     // The quota keeps the tenant-auth addition only while its Deployments exist; the
     // tenant-auth step below is the one that raises it (#121).
     const desired = tenantResources(
@@ -737,6 +941,7 @@ export class Controller {
       registryDeployed,
       await this.tenantAuthNetworkApplied(tenant),
       hostPull,
+      registryNats,
     ).filter(
       (value) =>
         hostsKnown ||
@@ -823,6 +1028,7 @@ export class Controller {
       }
       this.tenantAuthClean = false;
       const registry = await this.registryState(tenant);
+      const registryNats = await this.registryNats(tenant);
       // Objects read while computing the inputs, reused by the adoption check below.
       const fetched = new Map<string, Resource | undefined>();
       const desired = tenantAuthResources(tenant, this.cfg, {
@@ -833,6 +1039,7 @@ export class Controller {
           fetched,
         )),
         registryServing: registry.serving,
+        registryNats: Controller.registryNatsMode(registryNats),
       });
       // Gateway policies for hosts that are no longer routed, pruned before anything is applied
       // so de-routing holds even when a later apply fails.
@@ -858,6 +1065,8 @@ export class Controller {
         for (const [kind, stale] of [
           ['Secret', REGISTRY_PULL_SECRET],
           ['Service', REGISTRY_PULL_SERVICE],
+          // The registry's NATS credentials (#159); its store and marker are kept.
+          ['Secret', REGISTRY_NATS_SECRET],
         ] as const) {
           const value = await this.get<Resource>(`${collection('v1', kind, namespace)}/${stale}`);
           if (
@@ -879,7 +1088,16 @@ export class Controller {
       }
       // Raise the quota right before the pair so its pods fit when they are created (#121), and
       // the tenant quota right before the registry so it takes no workload slot of the tenant's.
-      await this.ensure(runtimeQuota(tenant, this.cfg, true));
+      await this.ensure(
+        runtimeQuota(
+          tenant,
+          this.cfg,
+          true,
+          registryNats?.stage === 'migrating' &&
+            !tenant.spec.suspended &&
+            !tenant.metadata.deletionTimestamp,
+        ),
+      );
       if (this.cfg.tenantAuth.registry) await this.ensure(tenantQuota(tenant, this.cfg, true));
       let ready = true;
       const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
@@ -909,6 +1127,8 @@ export class Controller {
           `WorkloadDeployment ${registry.conflict} claims the tenant registry host ` +
             `${registryHttpHost(this.cfg.tenantAuth)}; the registry is not served until it is removed`,
         );
+      const nats = registryNatsCondition(registryNats, namespace);
+      if (nats) return condition(false, nats.reason, nats.message);
       const what = this.cfg.tenantAuth.registry
         ? 'tenant controller, console and registry'
         : 'tenant controller and console';
@@ -2162,6 +2382,43 @@ export function withHostPullFailure(auth: Condition, failure: unknown): Conditio
   if (auth.status === 'False' && auth.reason !== 'Provisioning')
     return { ...auth, message: `${auth.message}; ${detail}` };
   return { ...auth, status: 'False', reason: 'HostPullError', message: detail };
+}
+/**
+ * The TenantAuthReady reason while the registry is stopped for the move of its store (#159), or
+ * undefined when it runs.
+ */
+export function registryNatsCondition(
+  state: RegistryNats | undefined,
+  namespace: string,
+): { reason: string; message: string } | undefined {
+  const job = `Job ${REGISTRY_NATS_MIGRATION_JOB} in ${namespace}`;
+  switch (state?.stage) {
+    case 'stopping':
+      return {
+        reason: 'RegistryMigrating',
+        message: `Stopping the registry before ${job} moves its store into its NATS account`,
+      };
+    case 'migrating':
+      return state.failed
+        ? {
+            reason: 'RegistryMigrationFailed',
+            message: `${job} could not move the registry store into its NATS account (${state.failed}); the registry stays stopped. Read its logs, then delete the Job to retry`,
+          }
+        : {
+            reason: 'RegistryMigrating',
+            message: `${job} is moving the registry store into its NATS account; the registry is stopped until it finishes`,
+          };
+    case 'migrated':
+      return state.credentials
+        ? undefined
+        : {
+            reason: 'RegistryHostImageUnsupported',
+            message:
+              'The registry store is in its NATS account, but the tenant host image is not a known build with wash patch 0003, so the registry stays stopped until tenantHostImage is one',
+          };
+    default:
+      return undefined;
+  }
 }
 export async function main(
   api: Api = new KubernetesApi(),

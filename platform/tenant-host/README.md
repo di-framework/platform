@@ -108,8 +108,11 @@ hostInterfaces:
   pinned wash does not enable; turning it on would change `Cargo.lock`, and `--locked` builds would
   need the patch to carry that. User and password is what NATS accounts in a server config use.
 - Who may set the keys is decided by admission, not by the host: whoever can write an entry's
-  config can name any file the host can read. Platform admission already admits inline blobstore
-  config only from the platform controller, for the tenant registry; #159 adds these keys there.
+  config can name any file the host can read. Platform admission (#159) admits them only from the
+  platform controller, only on the tenant registry's inline entry, only together, and only with
+  exactly `/var/run/secrets/di-framework/registry-nats/username` and `.../password`, the read-only
+  mount of the registry's credentials Secret; `di-bs-*` / `di-binding-*` config never carries them.
+  See the platform README, "Upgrading to a registry in its own NATS account".
 - Scope: only the `backend: nats` provider of the multiplexed blobstore plugins (`wasi:blobstore`
   and `wasmcloud:blobstore`). The host's own NATS blobstore plugin, which uses the `wash host` data
   NATS connection, and the NATS keyvalue and messaging backends are unchanged.
@@ -402,9 +405,11 @@ Latest published images (multi-arch index digests; the bot PR keeps this table c
 The pin PR never changes the platform default (`DEFAULT_HOST_IMAGE`); a maintainer moves it by hand.
 
 The tags are mutable. The platform default `hostImage` is pinned to the canonical index built with
-0002 (and without the unnamed-import lease, #13):
+0002 and 0003 (and without the unnamed-import lease, #13). The platform lets a tenant registry use
+its NATS credentials only on host images it knows carry 0003 (`NATS_CREDENTIALS_HOST_IMAGE_DIGESTS`
+in `platform/platform/src/tenancy/registry-nats.ts`); add a new 0003 build there when you pin it:
 
-`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad`
+`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab`
 
 `tenantHostImage` overrides it. The workflow summary prints the digest of each later publish.
 Tenant hosts never run `--allow-insecure-registries`; with `insecureRegistry` they get
@@ -440,7 +445,7 @@ The registry Service is ClusterIP, so a node-pullable reference needs a NodePort
 Set the platform config used by the stack (`tenantHostImage` / `tenantHostImagePullPolicy`):
 
 ```sh
-pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad
+pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab
 pulumi config set tenantHostImagePullPolicy IfNotPresent
 ```
 
@@ -448,7 +453,7 @@ or, with `di-framework-kube`, in the `--platform-config` JSON:
 
 ```json
 {
-  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad",
+  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab",
   "tenantHostImagePullPolicy": "IfNotPresent"
 }
 ```
