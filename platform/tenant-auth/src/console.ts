@@ -5,6 +5,14 @@
  * user's own token, so it holds no cluster credential of its own.
  */
 import { readFileSync } from 'node:fs';
+// The console reads the ConfigMaps the platform's log projection writes, so it shares that
+// module's keying and format instead of copying them (as v1/logs.ts does).
+import {
+  logKey,
+  logsConfigMapName,
+  projectedRing,
+  type WorkloadIdentity,
+} from '../../platform/src/tenancy/log-projection.ts';
 import {
   keys as keysPage,
   landing,
@@ -485,7 +493,7 @@ export class Console {
 
   private async overview(session: Session): Promise<Response> {
     interface Item {
-      metadata: { name: string; creationTimestamp?: string };
+      metadata: { name: string; creationTimestamp?: string; labels?: Record<string, string> };
       spec?: { class?: string };
       status?: { conditions?: { type: string; status: string; message?: string }[] };
     }
@@ -505,6 +513,7 @@ export class Console {
         session,
         deployments.items.map((d) => ({
           name: d.metadata.name,
+          ...logKey(d.metadata),
           ready: ready(d)?.status,
           message: ready(d)?.message,
           age: d.metadata.creationTimestamp,
@@ -518,21 +527,44 @@ export class Console {
     );
   }
 
-  private async logs(session: Session, app: string): Promise<Response> {
-    let entries: string[] = [];
+  /** The object at `path`, or undefined when the controller answers 404. */
+  private async find<T>(path: string, accessToken: string): Promise<T | undefined> {
     try {
-      const configMap = await this.controller<{ data?: Record<string, string> }>(
-        `/api/v1/namespaces/${this.tenantNamespace}/configmaps/di-logs-${app}`,
-        session.accessToken,
-      );
-      entries = Object.values(configMap.data ?? {})
-        .flatMap((chunk) => chunk.split('\n'))
-        .filter(Boolean)
-        .slice(-500);
+      return await this.controller<T>(path, accessToken);
     } catch (error) {
-      if (!(error instanceof HttpError && error.status === 404)) throw error;
+      if (error instanceof HttpError && error.status === 404) return undefined;
+      throw error;
     }
-    return html(logsPage(session, app, entries));
+  }
+
+  /**
+   * One WorkloadDeployment's projected lines (#106). The projection is found by the
+   * deployment's key (per service and env for a /v1 deployment, else its console
+   * application), and only the lines recorded for this deployment are shown, plus lines
+   * published before deployments were recorded. Until the platform controller has moved a
+   * /v1 service's lines out of the ConfigMap its envs shared, they are read from there.
+   */
+  private async logs(session: Session, name: string): Promise<Response> {
+    const deployment = await this.find<{ metadata: WorkloadIdentity }>(
+      `${WASMCLOUD_API}/namespaces/${this.tenantNamespace}/workloaddeployments/${name}`,
+      session.accessToken,
+    );
+    const key = deployment ? logKey(deployment.metadata) : undefined;
+    let entries: string[] = [];
+    if (key) {
+      const configMaps = `/api/v1/namespaces/${this.tenantNamespace}/configmaps`;
+      const read = (configMap: string) =>
+        this.find<{ metadata: { name: string }; data?: Record<string, string> }>(
+          `${configMaps}/${configMap}`,
+          session.accessToken,
+        );
+      const own = await read(logsConfigMapName(key.application, key.env));
+      const shared = own || !key.env ? undefined : await read(logsConfigMapName(key.application));
+      entries = projectedRing((own ?? shared) as never)
+        .filter((entry) => entry.deployment === name || (own && !entry.deployment))
+        .map((entry) => entry.line);
+    }
+    return html(logsPage(session, name, entries, key));
   }
 
   private async members(session: Session): Promise<Response> {

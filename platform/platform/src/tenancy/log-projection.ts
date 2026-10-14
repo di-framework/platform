@@ -14,7 +14,13 @@ import { INSTALLATION, type Resource, TENANT } from './resources';
  * per WorkloadDeployment is also published as `data.failures` for console status.
  *
  * `data.lines` is the ring the console shows. `data.deployments` names the WorkloadDeployment
- * of each ring line, in the same order, so a reader can filter one deployment's lines.
+ * of each ring line, in the same order, so a reader can filter one deployment's lines, and
+ * `data.envs` the /v1 environment of each line ('' for a workload outside /v1).
+ *
+ * Projections are keyed by logKey (#106): a /v1 deployment (`<service>-<env>`) gets its own
+ * ConfigMap per environment, `di-logs-<service>.<env>`, labelled with the service and the
+ * environment. Any other workload keeps the console application key and `di-logs-<key>`,
+ * which never contains a dot, so the two kinds of projection cannot share a ConfigMap.
  *
  * The host's service supervisor loop runs in an uninstrumented task (wash-runtime
  * `engine/workload.rs`), so its WARN/ERROR lines carry no span. Those are attributed by
@@ -30,6 +36,10 @@ const MANAGED_BY = 'app.kubernetes.io/managed-by';
 const MANAGED_BY_VALUE = 'di-framework';
 /** Selects the WorkloadDeployments the projection (and storage reconcile) consider. */
 const MANAGED_SELECTOR = `${MANAGED_BY}=${MANAGED_BY_VALUE}`;
+/** /v1 environment of a WorkloadDeployment `/v1/deploy` rendered (tenant-auth v1/config.ts). */
+const ENV = 'platform.di-framework.dev/env';
+/** The environments `/v1/deploy` accepts. */
+const ENVS: readonly string[] = ['prod', 'staging'];
 /** Multi-member workload grouping set by the CLI on WorkloadDeployments. */
 const WORKLOAD = 'di-framework.dev/workload';
 /** WorkloadDeployment annotation; `"false"` opts out of guest (`wasi:logging`) lines. */
@@ -267,12 +277,14 @@ export interface HostFailure {
 }
 
 /**
- * One ring line and the WorkloadDeployment it is attributed to. `deployment` is '' for a
- * line published before the projection recorded deployments.
+ * One ring line, the WorkloadDeployment it is attributed to, and that deployment's /v1
+ * environment. `deployment` is '' for a line published before the projection recorded
+ * deployments; `env` is '' for a workload outside /v1, and absent when not known.
  */
 export interface RingLine {
   line: string;
   deployment: string;
+  env?: string;
 }
 
 /**
@@ -283,6 +295,8 @@ export interface ProjectedEntry {
   time: string;
   line?: string;
   deployment: string;
+  /** /v1 environment of `deployment` ('' outside /v1). */
+  env?: string;
   failure?: HostFailure;
   start?: string;
 }
@@ -295,6 +309,41 @@ export function logsOptedOut(workload: WorkloadIdentity): boolean {
 /** Console application key for a WorkloadDeployment, matching the console's grouping. */
 export function applicationKey(workload: WorkloadIdentity): string {
   return workload.labels?.[WORKLOAD] ?? workload.labels?.[APPLICATION] ?? workload.name;
+}
+
+/** What a projection is keyed by: the application, and the /v1 environment ('' outside /v1). */
+export interface LogKey {
+  application: string;
+  env: string;
+}
+
+/**
+ * The projection key of a WorkloadDeployment (#106). A deployment `/v1/deploy` rendered
+ * (named `<service>-<env>`, labelled with the service as application and with its env) is
+ * keyed by service and env, so staging and prod never share a projection. Any other
+ * workload is keyed by its console application key with no env.
+ */
+export function logKey(workload: WorkloadIdentity): LogKey {
+  const application = workload.labels?.[APPLICATION];
+  const env = workload.labels?.[ENV];
+  if (application && env && ENVS.includes(env) && workload.name === `${application}-${env}`)
+    return { application, env };
+  return { application: applicationKey(workload), env: '' };
+}
+
+/**
+ * A LogKey as one map key. `/` cannot occur in a label value or an object name, so a /v1
+ * key never equals the key of another workload.
+ */
+export function logKeyId(key: LogKey): string {
+  return key.env ? `${key.application}/${key.env}` : key.application;
+}
+
+/** The LogKey a projection ConfigMap is labelled with. */
+export function configMapLogKey(configMap: Resource | undefined): LogKey {
+  // Readers pass API responses as they come; tolerate one without metadata.
+  const labels = configMap?.metadata?.labels;
+  return { application: labels?.[APPLICATION] ?? '', env: labels?.[ENV] ?? '' };
 }
 
 /**
@@ -318,7 +367,7 @@ export function resolveWorkload(
 }
 
 /**
- * Attribute host log text to console applications. Guest lines come from the TracingLogger
+ * Attribute host log text to projections, keyed by logKeyId. Guest lines come from the TracingLogger
  * fields, host failures from the `workload_start` span fields. Lines from another
  * namespace, unknown workloads, and guest lines of an opted-out deployment are dropped.
  * Host failures are kept even then: they are platform diagnostics the console needs for
@@ -340,8 +389,9 @@ export function attributeEntries(
 ): Map<string, ProjectedEntry[]> {
   const result = new Map<string, ProjectedEntry[]>();
   const add = (workload: WorkloadIdentity, entry: ProjectedEntry) => {
-    const key = applicationKey(workload);
-    result.set(key, [...(result.get(key) ?? []), entry]);
+    const logkey = logKey(workload);
+    const key = logKeyId(logkey);
+    result.set(key, [...(result.get(key) ?? []), { ...entry, env: logkey.env }]);
   };
   const failure = (workload: WorkloadIdentity, line: GuestLogLine) =>
     add(workload, {
@@ -420,7 +470,7 @@ export function attributeEntries(
   return result;
 }
 
-/** Projected lines per console application (see attributeEntries). */
+/** Projected lines per projection key (logKeyId; see attributeEntries). */
 export function attributeLogs(
   text: string,
   namespace: string,
@@ -497,13 +547,63 @@ export function projectedDeployments(configMap: Resource | undefined): string[] 
   return parsed;
 }
 
-/** The published ring: each line with its deployment ('' when not recorded). */
+/**
+ * `data.envs`: the /v1 environment of each `data.lines` line, in order ('' outside /v1).
+ * Undefined when absent, malformed, or not aligned with the lines, e.g. a ConfigMap written
+ * before the projection recorded environments.
+ */
+export function projectedEnvs(configMap: Resource | undefined): string[] | undefined {
+  const data = configMap?.data as Record<string, unknown> | undefined;
+  if (typeof data?.envs !== 'string') return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data.envs);
+  } catch {
+    return undefined;
+  }
+  if (
+    !Array.isArray(parsed) ||
+    !parsed.every((env) => typeof env === 'string') ||
+    parsed.length !== projectedLines(configMap).length
+  )
+    return undefined;
+  return parsed;
+}
+
+/**
+ * The published ring: each line with its deployment ('' when not recorded) and env. A line
+ * without a recorded env takes the env label of a per-env ConfigMap, and is otherwise left
+ * without one (not known).
+ */
 export function projectedRing(configMap: Resource | undefined): RingLine[] {
   const deployments = projectedDeployments(configMap);
-  return projectedLines(configMap).map((line, index) => ({
-    line,
-    deployment: deployments?.[index] ?? '',
-  }));
+  const envs = projectedEnvs(configMap);
+  const env = configMapLogKey(configMap).env;
+  return projectedLines(configMap).map((line, index) => {
+    const known = envs?.[index] ?? (env || undefined);
+    return {
+      line,
+      deployment: deployments?.[index] ?? '',
+      ...(known === undefined ? {} : { env: known }),
+    };
+  });
+}
+
+/**
+ * Migration (#106): the lines and failures a new per-env projection of `deployment` takes
+ * over from an older ConfigMap every env of the service shared (`di-logs-<service>`, no env
+ * label). Lines without a recorded deployment cannot be told apart and are left behind.
+ */
+export function legacyRing(
+  legacy: Resource | undefined,
+  deployment: string,
+  env: string,
+): { lines: RingLine[]; failures: Record<string, HostFailure> } {
+  const lines = projectedRing(legacy)
+    .filter((entry) => entry.deployment === deployment)
+    .map((entry) => ({ ...entry, env }));
+  const failure = projectedFailures(legacy)[deployment];
+  return { lines, failures: failure ? { [deployment]: failure } : {} };
 }
 
 /** Existing `data.failures` from a ConfigMap; malformed entries are ignored. */
@@ -578,18 +678,24 @@ export function mergeFailures(
   return merged;
 }
 
-/** ConfigMap name for an application; long or odd keys are hashed down to a DNS name. */
-export function logsConfigMapName(application: string): string {
+/**
+ * ConfigMap name for a projection: `di-logs-<application>`, or `di-logs-<service>.<env>` for
+ * a /v1 key. Long or odd applications are hashed down to a DNS label, so only a /v1 name
+ * contains a dot.
+ */
+export function logsConfigMapName(application: string, env = ''): string {
+  const suffix = env ? `.${env}` : '';
   const name = `${LOGS_PREFIX}${application}`;
-  if (name.length <= 63 && /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(name)) return name;
+  if (name.length + suffix.length <= 63 && /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(name))
+    return `${name}${suffix}`;
   let hash = 0;
   for (const char of application) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
   const safe = application
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, '-')
     .replace(/^-+|-+$/g, '')
-    .slice(0, 40);
-  return `${LOGS_PREFIX}${safe || 'app'}-${hash.toString(16)}`;
+    .slice(0, 40 - suffix.length);
+  return `${LOGS_PREFIX}${safe || 'app'}-${hash.toString(16)}${suffix}`;
 }
 
 /** Label values must be ≤63 characters of the label alphabet; skip anything else. */
@@ -604,26 +710,31 @@ export function logsConfigMap(
   application: string,
   lines: (string | RingLine)[],
   failures: Record<string, HostFailure> = {},
+  env = '',
 ): Resource {
-  const ring = lines.map((entry) =>
+  const ring: RingLine[] = lines.map((entry) =>
     typeof entry === 'string' ? { line: entry, deployment: '' } : entry,
   );
   const data: Record<string, string> = { lines: ring.map((entry) => entry.line).join('\n') };
   // Written only when a line is attributed, so a ring of unattributed lines stays as before.
-  if (ring.some((entry) => entry.deployment))
+  // The envs go with the deployments, so a reader can tell '' (outside /v1) from not known.
+  if (ring.some((entry) => entry.deployment)) {
     data.deployments = JSON.stringify(ring.map((entry) => entry.deployment));
+    data.envs = JSON.stringify(ring.map((entry) => entry.env ?? env));
+  }
   if (Object.keys(failures).length > 0) data.failures = JSON.stringify(failures);
   return {
     apiVersion: 'v1',
     kind: 'ConfigMap',
     metadata: {
-      name: logsConfigMapName(application),
+      name: logsConfigMapName(application, env),
       namespace,
       labels: {
         [INSTALLATION]: installation,
         [TENANT]: tenantName,
         [PROJECTION]: 'logs',
         [APPLICATION]: application,
+        ...(env ? { [ENV]: env } : {}),
       },
     },
     data,
@@ -632,6 +743,8 @@ export function logsConfigMap(
 
 export {
   APPLICATION,
+  ENV,
+  ENVS,
   HOST_LINE,
   LOGS_ANNOTATION,
   LOGS_PREFIX,

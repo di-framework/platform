@@ -123,6 +123,27 @@ function fakeController(): Controller {
     expiresAt: '2026-10-08T00:00:00.000Z',
   };
   const ns = 'di-tenant-acme';
+  const workloads = `/apis/runtime.wasmcloud.dev/v1alpha1/namespaces/${ns}/workloaddeployments`;
+  /** The labels /v1/deploy renders on service web's WorkloadDeployment in `env`. */
+  const v1 = (env: string) => ({
+    metadata: {
+      name: `web-${env}`,
+      labels: {
+        'app.kubernetes.io/managed-by': 'di-framework',
+        'app.kubernetes.io/name': `web-${env}`,
+        'di-framework.dev/application': 'web',
+        'di-framework.dev/service': 'web',
+        'platform.di-framework.dev/env': env,
+      },
+    },
+  });
+  const ring = (lines: [string, string][], labels: Record<string, string> = {}) => ({
+    metadata: { labels: { 'di-framework.dev/application': 'web', ...labels } },
+    data: {
+      lines: lines.map(([line]) => line).join('\n'),
+      deployments: JSON.stringify(lines.map(([, deployment]) => deployment)),
+    },
+  });
   const server = serve((request) => {
     if (broken.has(request.pathname)) return new Response('not json', { status: 200 });
     const failure = failing.get(request.pathname);
@@ -130,7 +151,7 @@ function fakeController(): Controller {
     switch (`${request.method} ${request.pathname}`) {
       case 'GET /-/whoami':
         return json({ account: 'acme', user: 'alice', role: 'admin', via: 'oidc' });
-      case `GET /apis/runtime.wasmcloud.dev/v1alpha1/namespaces/${ns}/workloaddeployments`:
+      case `GET ${workloads}`:
         return json({
           items: [
             {
@@ -138,12 +159,49 @@ function fakeController(): Controller {
               status: { conditions: [{ type: 'Ready', status: 'True', message: 'running' }] },
             },
             { metadata: { name: 'pending' } },
+            v1('staging'),
+            { metadata: { name: 'web', labels: { 'di-framework.dev/application': 'web' } } },
+            v1('prod'),
           ],
         });
+      case `GET ${workloads}/hello`:
+      case `GET ${workloads}/empty`:
+      case `GET ${workloads}/forbidden`:
+        return json({ metadata: { name: request.pathname.split('/').at(-1) } });
+      case `GET ${workloads}/web-prod`:
+        return json(v1('prod'));
+      case `GET ${workloads}/web-staging`:
+        return json(v1('staging'));
+      case `GET ${workloads}/web`:
+        return json({
+          metadata: { name: 'web', labels: { 'di-framework.dev/application': 'web' } },
+        });
+      // Per-env projection of web-prod, and the CLI workload `web`'s own projection.
+      case `GET /api/v1/namespaces/${ns}/configmaps/di-logs-web.prod`:
+        return json(
+          ring([['2026-10-01T00:00:01Z INFO prod up', 'web-prod']], {
+            'platform.di-framework.dev/env': 'prod',
+          }),
+        );
+      // Shared by staging and prod before #106; web-staging has no per-env one yet.
+      case `GET /api/v1/namespaces/${ns}/configmaps/di-logs-web`:
+        return json(
+          ring([
+            ['2026-10-01T00:00:00Z INFO staging up', 'web-staging'],
+            ['2026-10-01T00:00:00Z INFO old prod line', 'web-prod'],
+            ['2026-10-01T00:00:02Z INFO cli up', 'web'],
+            ['2026-10-01T00:00:03Z INFO unattributed', ''],
+          ]),
+        );
       case `GET /apis/platform.di-framework.dev/v1alpha1/namespaces/${ns}/backingservices`:
         return json({ items: [{ metadata: { name: 'db' }, spec: { class: 'sqlite' } }] });
       case `GET /api/v1/namespaces/${ns}/configmaps/di-logs-hello`:
-        return json({ data: { a: 'line one\nline two\n', b: 'line three' } });
+        return json({
+          data: {
+            lines: 'line one\nline two\nline three',
+            failures: JSON.stringify({ hello: { message: 'not a line' } }),
+          },
+        });
       case `GET /api/v1/namespaces/${ns}/configmaps/di-logs-empty`:
         return json({});
       case `GET /api/v1/namespaces/${ns}/configmaps/di-logs-forbidden`:
@@ -380,7 +438,9 @@ describe('Console', () => {
 
     expect(await (await get(app, '/members', { cookie })).text()).toContain('active');
     expect(await (await get(app, '/keys', { cookie })).text()).toContain('0123456789abcdef');
-    expect(await (await get(app, '/logs/hello', { cookie })).text()).toContain('line three');
+    const hello = await (await get(app, '/logs/hello', { cookie })).text();
+    expect(hello).toContain('line three');
+    expect(hello).not.toContain('not a line');
     expect(await (await get(app, '/logs/empty', { cookie })).text()).toContain('No projected');
     expect(await (await get(app, '/logs/missing', { cookie })).text()).toContain('No projected');
     const forbidden = await get(app, '/logs/forbidden', { cookie });
@@ -388,6 +448,35 @@ describe('Console', () => {
     expect(await forbidden.text()).toContain('logs are not yours');
     const missing = await get(app, '/nowhere', { cookie });
     expect(missing.status).toBe(404);
+  });
+
+  test('groups deployments by application and env, with logs per deployment (#106)', async () => {
+    const cookie = await session(app);
+    const page = await (await get(app, '/', { cookie })).text();
+    const rows = [
+      ...page.matchAll(/<tr><td>([^<]*)<\/td><td>([^<]*)<\/td><td><a href="\/logs\/([^"]+)"/g),
+    ].map((m) => m.slice(1).join(' '));
+    expect(rows).toEqual([
+      'hello  hello',
+      'pending  pending',
+      'web  web',
+      'web prod web-prod',
+      'web staging web-staging',
+    ]);
+    const prod = await (await get(app, '/logs/web-prod', { cookie })).text();
+    expect(prod).toContain('web · prod');
+    expect(prod).toContain('prod up');
+    expect(prod).not.toContain('staging up');
+    // Not moved out of the shared ConfigMap yet: only web-staging's lines are shown.
+    const staging = await (await get(app, '/logs/web-staging', { cookie })).text();
+    expect(staging).toContain('staging up');
+    for (const other of ['old prod line', 'cli up', 'unattributed'])
+      expect(staging).not.toContain(other);
+    // The CLI workload `web` reads its own projection, never a /v1 env's.
+    const cli = await (await get(app, '/logs/web', { cookie })).text();
+    expect(cli).toContain('cli up');
+    expect(cli).toContain('unattributed');
+    expect(cli).not.toContain('staging up');
   });
 
   test('creates and revokes API keys from same-origin forms', async () => {

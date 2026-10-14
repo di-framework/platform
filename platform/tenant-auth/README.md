@@ -151,8 +151,12 @@ The `.localhost` issuer makes Bun use loopback, so the sidecar forwards the port
 gateway, which routes by `Host`. A new image digest rolls both pods.
 
 `GET /v1/services/:service/logs` streams a service's projected log lines as server-sent events.
-Logs are scoped to the tenant namespace, not to an environment: `env` is accepted and ignored,
-because the log projection carries no environment label.
+`env` selects the environment: the platform projects each /v1 deployment into its own
+`di-logs-<service>.<env>` ConfigMap and records each line's deployment and env
+(`data.deployments`, `data.envs`). Lines of a workload outside /v1 whose application label equals
+the service name are never served. During the move from the ConfigMap staging and prod shared
+before (`di-logs-<service>`), its lines are still read, each in the env of its recorded deployment;
+lines published before deployments were recorded are served in every env.
 
 Verified on `authproto` on 2026-10-09 with the guest from identity-server `main` (Argon2 in the
 composed `pqc-subtle` component) and the tenant CLI pilot in `platform/tenant-cli`:
@@ -395,7 +399,8 @@ repairs itself after a crash between apply and mark and after out-of-order concu
 Reads only report the repair (viewers stay read-only); the next deploy writes it.
 
 The namespace quota allows `count/configmaps: 100`, shared with `di-vars-<env>`, the `di-logs-*`
-projections and `kube-root-ca.crt`, so history is bounded (constants in `src/v1/deploy.ts`):
+projections (one per service and env, see below) and `kube-root-ca.crt`, so history is bounded
+(constants in `src/v1/deploy.ts`):
 
 * `HISTORY_PER_SERVICE_ENV = 10` revisions per service and env.
 * `HISTORY_TENANT_BUDGET = 40` revisions in the tenant, evicting the oldest across services
@@ -425,7 +430,7 @@ credential. `/-/` and the Kubernetes proxy keep the Kubernetes `Status` body.
 
 Console: `GET /login` (+ `cli_callback`, `cli_state`), `GET /oidc/callback`, `GET /logout`,
 `GET /cli/info`, `POST /cli/exchange`, `POST /cli/refresh`, `POST /cli/logout` (unused by any client in this repo now that the prototype CLI is removed); pages `/`,
-`/logs/:app`, `/members`, `/keys`, `POST /keys`, `POST /keys/:id/revoke`.
+`/logs/:deployment` (lines of one WorkloadDeployment; the overview groups deployments by application and env), `/members`, `/keys`, `POST /keys`, `POST /keys/:id/revoke`.
 
 ## Verified against `di-framework-kube` (instance `authproto`, tenant `acme`)
 
