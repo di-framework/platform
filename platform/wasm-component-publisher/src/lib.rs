@@ -1,4 +1,4 @@
-//! Validate and publish Wasm components with `wash`, shared by every component
+//! Validate and publish Wasm components with `oras` and `wash`, shared by every component
 //! publisher in this workspace. Invoked explicitly by a publisher executable,
 //! never during compilation.
 use serde_json::Value;
@@ -281,15 +281,6 @@ impl Drop for DockerConfigDir {
     }
 }
 
-/// Guard to remove a temporary file on all paths (success, error, or panic).
-struct TempFileGuard(std::path::PathBuf);
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
 /// Run `wash` with a deadline; kill it if it overruns.
 fn run_wash(args: &[String], envs: &[(&str, &Path)], timeout: Duration) -> Result<Output> {
     run_tool("wash", args, envs, timeout)
@@ -362,17 +353,6 @@ fn run_tool(
             None => std::thread::sleep(Duration::from_millis(100)),
         }
     }
-}
-
-/// `oras tag <repo>@<digest> <tag>...`: point `tags` at an existing manifest.
-fn tag_args(insecure: bool, repo_ref: &str, digest: &str, tags: &[String]) -> Vec<String> {
-    let mut args = vec!["tag".to_owned()];
-    if insecure {
-        args.push("--plain-http".to_owned());
-    }
-    args.push(format!("{repo_ref}@{digest}"));
-    args.extend(tags.iter().cloned());
-    args
 }
 
 /// The manifest digest a tag currently resolves to (`oras resolve`).
@@ -521,18 +501,24 @@ pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<(
     let read_checked = |name: &str| checked_bytes(&dist, name, &sums);
     let wasm = read_checked(spec.wasm_file)?;
     let wit = String::from_utf8(read_checked(spec.wit_file)?)?;
-    // BUILD-INFO.txt is checksum-verified here; its timestamp now lives in
-    // the config `wash` generates, so only its presence matters here.
+    // BUILD-INFO.txt is checksum-verified but not published: its build time
+    // must not reach the OCI artifact, whose digest depends only on the
+    // component (see `created_time`).
     let _ = read_checked(spec.build_info_file)?;
     let (imports, exports) = world_items(&wit)?;
     check_imports(&imports, spec.import_prefixes)?;
     if !exports.iter().any(|item| item == spec.required_export) {
         return Err(format!("built WIT lacks {}", spec.required_export).into());
     }
+    let created = created_time(source_date_epoch()?.as_deref())?;
+    let artifact = WasmArtifact::new(&wasm, &imports, &exports, &created);
     let wasm_digest = digest(&wasm);
     let log = spec.log_prefix;
     if !push_enabled {
-        eprintln!("[{log}] Validated {wasm_digest}; PUSH=true to publish");
+        eprintln!(
+            "[{log}] Validated {wasm_digest} (manifest {}); PUSH=true to publish",
+            artifact.manifest_digest()
+        );
         return Ok(());
     }
     let short_hash: String = format!("{:x}", Sha256::digest(&wasm))
@@ -563,7 +549,7 @@ pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<(
         )?),
         None => None,
     };
-    let wash_envs: Vec<(&str, &Path)> = match &docker_config {
+    let tool_envs: Vec<(&str, &Path)> = match &docker_config {
         Some(config) => vec![("DOCKER_CONFIG", &config.path)],
         None => vec![],
     };
@@ -578,25 +564,20 @@ pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<(
     let wasm_path = dist.join(spec.wasm_file);
     let repo_ref = format!("{registry}/{repository}");
     let destination = format!("{repo_ref}:{tag}");
-    // One push, one manifest digest. Extra tags are pointed at that same
-    // manifest (a second `wash oci push` would create a new manifest because
-    // wash stamps a creation time into the config).
+    // One manifest, built here from the component alone, so every tag and
+    // every publish of the same bytes share one manifest digest. It goes out
+    // under the commit tag only; the movable tags follow once it is verified.
     let manifest_digest = push_and_verify(
-        &destination,
-        &repo_ref,
-        &wasm_path,
-        &wasm,
-        insecure,
-        &wash_envs,
+        &repo_ref, &tag, &wasm_path, &wasm, &artifact, insecure, &tool_envs,
     )?;
     eprintln!("[{log}] Pushed tag: {destination} -> {manifest_digest}");
     let extra_tags = &tags[1..];
     if !extra_tags.is_empty() {
         let args = tag_args(insecure, &repo_ref, &manifest_digest, extra_tags);
-        let output = run_tool("oras", &args, &wash_envs, Duration::from_secs(120))?;
+        let output = run_tool("oras", &args, &tool_envs, Duration::from_secs(120))?;
         check_tool_output(&output, "oras tag")?;
         for extra in extra_tags {
-            let resolved = resolve_tag(&repo_ref, extra, insecure, &wash_envs)?;
+            let resolved = resolve_tag(&repo_ref, extra, insecure, &tool_envs)?;
             if resolved != manifest_digest {
                 return Err(format!(
                     "tag {extra} resolves to {resolved}, expected {manifest_digest}"
@@ -627,43 +608,252 @@ pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<(
     Ok(())
 }
 
-/// Push `wasm_path` to `destination`, then pull it back by the manifest digest
-/// that `wash` returned (not by the movable tag) and compare the bytes.
+/// Manifest media type of the published artifact (OCI image manifest v1).
+const MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+/// Config media type of the CNCF Wasm OCI artifact layout (`wash`, `wkg`).
+const CONFIG_MEDIA_TYPE: &str = "application/vnd.wasm.config.v0+json";
+/// Media type of the single component layer.
+const WASM_LAYER_MEDIA_TYPE: &str = "application/wasm";
+/// Latest second RFC 3339 can express: 9999-12-31T23:59:59Z.
+const MAX_RFC3339_SECONDS: u64 = 253_402_300_799;
+
+/// `SOURCE_DATE_EPOCH` from the environment; unset or empty means none.
+fn source_date_epoch() -> Result<Option<String>> {
+    match env::var("SOURCE_DATE_EPOCH") {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value.trim().to_owned())),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("SOURCE_DATE_EPOCH must be a decimal number of seconds".into())
+        }
+    }
+}
+
+/// The `created` time written into the config and the manifest annotation:
+/// `SOURCE_DATE_EPOCH` when set (the reproducible-builds.org convention),
+/// else the Unix epoch. Never the wall clock, so the manifest digest is a
+/// function of the published bytes. The publish workflows clear
+/// `SOURCE_DATE_EPOCH` on the publisher step, so the same component gets the
+/// same digest whichever commit publishes it.
+fn created_time(source_date_epoch: Option<&str>) -> Result<String> {
+    let Some(value) = source_date_epoch else {
+        return Ok(rfc3339_utc(0));
+    };
+    let seconds = value
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| value.parse::<u64>().ok())
+        .flatten()
+        .filter(|seconds| *seconds <= MAX_RFC3339_SECONDS)
+        .ok_or_else(|| {
+            format!(
+                "SOURCE_DATE_EPOCH must be a decimal number of seconds up to \
+                 {MAX_RFC3339_SECONDS}, got {value:?}"
+            )
+        })?;
+    Ok(rfc3339_utc(seconds))
+}
+
+/// `seconds` after the Unix epoch as RFC 3339 UTC (`1970-01-01T00:00:00Z`).
+/// Days to a civil date: Howard Hinnant's `civil_from_days`.
+fn rfc3339_utc(seconds: u64) -> String {
+    let (days, time) = (seconds / 86_400, seconds % 86_400);
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let day_of_era = z % 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        time / 3600,
+        time / 60 % 60,
+        time % 60
+    )
+}
+
+/// A JSON string literal.
+fn json_string(value: &str) -> String {
+    Value::from(value).to_string()
+}
+
+/// A JSON array of string literals, in the given order.
+fn json_strings(values: &[String]) -> String {
+    let items: Vec<String> = values.iter().map(|value| json_string(value)).collect();
+    format!("[{}]", items.join(","))
+}
+
+/// The config and manifest of a Wasm OCI artifact, in the layout `wash oci
+/// push` and `wkg` produce: one `application/wasm` layer and an
+/// `application/vnd.wasm.config.v0+json` config. The JSON is written with a
+/// fixed field order and no whitespace, independent of `serde_json` features,
+/// so equal inputs always give equal bytes and equal digests.
+struct WasmArtifact {
+    config: Vec<u8>,
+    manifest: Vec<u8>,
+}
+
+/// The `application/vnd.wasm.config.v0+json` config, byte for byte as
+/// `wash oci push` 2.5.2 writes it (see the `tests/fixtures/wash-2.5.2`
+/// parity test).
+fn wasm_config(
+    created: &str,
+    wasm_digest: &str,
+    imports: &[String],
+    exports: &[String],
+) -> Vec<u8> {
+    format!(
+        "{{\"created\":{},\"author\":null,\"architecture\":\"wasm\",\
+         \"os\":\"wasip2\",\"layerDigests\":[{}],\
+         \"component\":{{\"exports\":{},\"imports\":{},\"target\":null}}}}",
+        json_string(created),
+        json_string(wasm_digest),
+        json_strings(exports),
+        json_strings(imports),
+    )
+    .into_bytes()
+}
+
+impl WasmArtifact {
+    fn new(wasm: &[u8], imports: &[String], exports: &[String], created: &str) -> Self {
+        let config = wasm_config(created, &digest(wasm), imports, exports);
+        let wasm_digest = json_string(&digest(wasm));
+        let created = json_string(created);
+        let manifest = format!(
+            "{{\"schemaVersion\":2,\"mediaType\":{},\
+             \"config\":{{\"mediaType\":{},\"digest\":{},\"size\":{}}},\
+             \"layers\":[{{\"mediaType\":{},\"digest\":{wasm_digest},\"size\":{}}}],\
+             \"annotations\":{{\"org.opencontainers.image.created\":{created}}}}}",
+            json_string(MANIFEST_MEDIA_TYPE),
+            json_string(CONFIG_MEDIA_TYPE),
+            json_string(&digest(&config)),
+            config.len(),
+            json_string(WASM_LAYER_MEDIA_TYPE),
+            wasm.len(),
+        )
+        .into_bytes();
+        Self { config, manifest }
+    }
+
+    fn config_digest(&self) -> String {
+        digest(&self.config)
+    }
+
+    fn manifest_digest(&self) -> String {
+        digest(&self.manifest)
+    }
+}
+
+/// Private (0700) scratch directory, removed with its contents on drop.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn new(prefix: &str) -> Result<Self> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().mode(0o700).create(&path)?;
+        }
+        #[cfg(not(unix))]
+        fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `oras blob push <repo>@<digest> <file>`: upload one blob, checked against
+/// its digest.
+fn blob_push_args(insecure: bool, repo_ref: &str, digest: &str, file: &Path) -> Vec<String> {
+    let mut args = vec!["blob".to_owned(), "push".to_owned()];
+    if insecure {
+        args.push("--plain-http".to_owned());
+    }
+    args.push(format!("{repo_ref}@{digest}"));
+    args.push(file.to_string_lossy().into_owned());
+    args
+}
+
+/// `oras manifest push <repo>:<tag> <file>`: the manifest, under one tag.
+fn manifest_push_args(insecure: bool, repo_ref: &str, tag: &str, file: &Path) -> Vec<String> {
+    let mut args = vec!["manifest".to_owned(), "push".to_owned()];
+    if insecure {
+        args.push("--plain-http".to_owned());
+    }
+    args.push("--media-type".to_owned());
+    args.push(MANIFEST_MEDIA_TYPE.to_owned());
+    args.push(format!("{repo_ref}:{tag}"));
+    args.push(file.to_string_lossy().into_owned());
+    args
+}
+
+/// `oras tag <repo>@<digest> <tag>...`: point `tags` at an existing manifest.
+fn tag_args(insecure: bool, repo_ref: &str, digest: &str, tags: &[String]) -> Vec<String> {
+    let mut args = vec!["tag".to_owned()];
+    if insecure {
+        args.push("--plain-http".to_owned());
+    }
+    args.push(format!("{repo_ref}@{digest}"));
+    args.extend(tags.iter().cloned());
+    args
+}
+
+/// Push the component layer and the config, then the manifest under `tag`
+/// only, with `oras`. Check that `tag` resolves to the manifest digest
+/// computed here, then pull the component back with `wash` by that digest
+/// (not by a movable tag) and compare the bytes. Blobs go first, so the
+/// registry refuses a manifest whose layer or config is missing.
 fn push_and_verify(
-    destination: &str,
     repo_ref: &str,
+    tag: &str,
     wasm_path: &Path,
     wasm: &[u8],
+    artifact: &WasmArtifact,
     insecure: bool,
-    wash_envs: &[(&str, &Path)],
+    envs: &[(&str, &Path)],
 ) -> Result<String> {
-    let mut push: Vec<String> = vec![
-        "oci".to_owned(),
-        "push".to_owned(),
-        "--output".to_owned(),
-        "json".to_owned(),
-        "--non-interactive".to_owned(),
-    ];
-    if insecure {
-        push.push("--insecure".to_owned());
+    let manifest_digest = artifact.manifest_digest();
+    // Config, manifest and the pulled copy stay outside dist/, so failed or
+    // unverified files never pollute the build output.
+    let scratch = ScratchDir::new("wasm-publish")?;
+    let config_path = scratch.0.join("config.json");
+    let manifest_path = scratch.0.join("manifest.json");
+    fs::write(&config_path, &artifact.config)?;
+    fs::write(&manifest_path, &artifact.manifest)?;
+    for (blob_digest, path) in [
+        (digest(wasm), wasm_path),
+        (artifact.config_digest(), config_path.as_path()),
+    ] {
+        let args = blob_push_args(insecure, repo_ref, &blob_digest, path);
+        let output = run_tool("oras", &args, envs, Duration::from_secs(300))?;
+        check_tool_output(&output, "oras blob push")?;
     }
-    push.push(destination.to_owned());
-    push.push(wasm_path.to_string_lossy().into_owned());
-    let output = run_wash(&push, wash_envs, Duration::from_secs(300))?;
-    check_output(&output, "oci push")?;
-    let manifest_digest = push_digest(&output.stdout, &secret_values())?;
+    let args = manifest_push_args(insecure, repo_ref, tag, &manifest_path);
+    let output = run_tool("oras", &args, envs, Duration::from_secs(120))?;
+    check_tool_output(&output, "oras manifest push")?;
+    let resolved = resolve_tag(repo_ref, tag, insecure, envs)?;
+    if resolved != manifest_digest {
+        return Err(format!("tag {tag} resolves to {resolved}, expected {manifest_digest}").into());
+    }
 
-    // Download to a temporary path outside dist/ so failed or unverified
-    // artifacts never pollute the build output; the guard cleans up on all paths.
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pulled = env::temp_dir().join(format!("wash-pulled-{}-{nanos}.wasm", std::process::id()));
-    if pulled.exists() {
-        let _ = fs::remove_file(&pulled);
-    }
-    let _pulled_guard = TempFileGuard(pulled.clone());
+    let pulled = scratch.0.join("pulled.wasm");
     let mut pull: Vec<String> = vec![
         "oci".to_owned(),
         "pull".to_owned(),
@@ -674,32 +864,12 @@ fn push_and_verify(
     }
     pull.push(format!("{repo_ref}@{manifest_digest}"));
     pull.push(pulled.to_string_lossy().into_owned());
-    let output = run_wash(&pull, wash_envs, Duration::from_secs(300))?;
+    let output = run_wash(&pull, envs, Duration::from_secs(300))?;
     check_output(&output, "oci pull")?;
     if fs::read(&pulled)? != wasm {
         return Err("pulled Wasm differs from the local build".into());
     }
     Ok(manifest_digest)
-}
-
-/// `wash oci push --output json` prints `{"success":true,"data":{"digest":"sha256:…"}}`.
-/// Errors carry wash's stdout, masked, since wash can exit 0 with
-/// `{"success":false,...}`.
-fn push_digest(stdout: &[u8], secrets: &[String]) -> Result<String> {
-    let shown = || tool_text(stdout, secrets, 1000);
-    let parsed: Value = serde_json::from_slice(stdout)
-        .map_err(|_| format!("cannot parse wash push output: {}", shown()))?;
-    if parsed.get("success").and_then(Value::as_bool) != Some(true) {
-        return Err(format!("wash push reported failure: {}", shown()).into());
-    }
-    match parsed
-        .get("data")
-        .and_then(|data| data.get("digest"))
-        .and_then(Value::as_str)
-    {
-        Some(digest) if is_digest(digest) => Ok(digest.to_owned()),
-        _ => Err(format!("wash push returned no digest: {}", shown()).into()),
-    }
 }
 
 /// Reject any world import outside `allowed` prefixes (when a policy is set).
@@ -894,17 +1064,7 @@ mod tests {
                 "b".repeat(1985)
             )
         );
-        // The same holds for the 1000-byte cut on push results and the
-        // 200-byte cut on `oras resolve` output.
-        let push = format!("{}{secret}{}", "a".repeat(10), "b".repeat(985));
-        let error = push_digest(push.as_bytes(), &secrets)
-            .unwrap_err()
-            .to_string();
-        assert_no_fragment(&error, secret);
-        assert!(
-            error.ends_with(&format!("aaaaa[REDACTED]{}", "b".repeat(985))),
-            "{error}"
-        );
+        // The same holds for the 200-byte cut on `oras resolve` output.
         let resolved = format!("{}{secret}{}", "a".repeat(10), "b".repeat(185));
         let error = resolved_digest(resolved.as_bytes(), &secrets)
             .unwrap_err()
@@ -914,65 +1074,6 @@ mod tests {
             error.ends_with(&format!("aaaaa[REDACTED]{}", "b".repeat(185))),
             "{error}"
         );
-    }
-
-    #[test]
-    fn rejects_unsuccessful_or_malformed_push_results() {
-        let secrets = vec![
-            "s3cr3t-token".to_owned(),
-            base64_encode(b"bot:s3cr3t-token"),
-        ];
-        let auth = base64_encode(b"bot:s3cr3t-token");
-        for (value, reason) in [
-            (
-                r#"{"success":false,"data":{"digest":"sha256:abc"}}"#.to_owned(),
-                "wash push reported failure",
-            ),
-            (
-                r#"{"success":true,"data":{"digest":"sha256:abc"}}"#.to_owned(),
-                "wash push returned no digest",
-            ),
-            (
-                r#"{"success":true}"#.to_owned(),
-                "wash push returned no digest",
-            ),
-            ("not json".to_owned(), "cannot parse wash push output"),
-            // wash exits 0 but reports failure, echoing a credential.
-            (
-                r#"{"success":false,"message":"denied for s3cr3t-token"}"#.to_owned(),
-                "wash push reported failure",
-            ),
-            (
-                format!(r#"{{"success":true,"data":{{"auth":"{auth}"}}}}"#),
-                "wash push returned no digest",
-            ),
-            (
-                "unauthorized: token s3cr3t-token".to_owned(),
-                "cannot parse wash push output",
-            ),
-        ] {
-            let error = push_digest(value.as_bytes(), &secrets)
-                .unwrap_err()
-                .to_string();
-            assert!(error.starts_with(reason), "{error}");
-            assert!(!error.contains("s3cr3t"), "{error}");
-            assert!(!error.contains(&auth), "{error}");
-        }
-        let error = push_digest(
-            br#"{"success":false,"message":"denied for s3cr3t-token"}"#,
-            &secrets,
-        )
-        .unwrap_err()
-        .to_string();
-        assert_eq!(
-            error,
-            r#"wash push reported failure: {"success":false,"message":"denied for [REDACTED]"}"#
-        );
-        let digest = format!("sha256:{}", "a".repeat(64));
-        let output =
-            serde_json::to_vec(&serde_json::json!({"success":true,"data":{"digest":digest}}))
-                .unwrap();
-        assert_eq!(push_digest(&output, &secrets).unwrap(), digest);
     }
 
     #[test]
@@ -1040,19 +1141,6 @@ mod tests {
     }
 
     #[test]
-    fn tag_args_point_extra_tags_at_the_pushed_digest() {
-        let tags = ["0.2.0".to_owned(), "stable".to_owned()];
-        assert_eq!(
-            tag_args(false, "ghcr.io/o/r", "sha256:abc", &tags),
-            ["tag", "ghcr.io/o/r@sha256:abc", "0.2.0", "stable"]
-        );
-        assert_eq!(
-            tag_args(true, "localhost:5000/r", "sha256:abc", &tags[..1])[..2],
-            ["tag", "--plain-http"]
-        );
-    }
-
-    #[test]
     fn rejects_imports_outside_the_allowed_prefixes() {
         let wasi = ["wasi:io/streams@0.2.6".to_owned()];
         let plug = [
@@ -1106,14 +1194,181 @@ mod tests {
     }
 
     #[test]
-    fn temp_file_guard_removes_on_drop() {
-        let temp_path =
-            env::temp_dir().join(format!("test-temp-file-guard-{}", std::process::id()));
-        fs::write(&temp_path, b"temp").unwrap();
-        assert!(temp_path.is_file());
-        {
-            let _guard = TempFileGuard(temp_path.clone());
+    fn scratch_dir_is_private_and_removed_on_drop() {
+        let path = {
+            let scratch = ScratchDir::new("test-scratch").unwrap();
+            fs::write(scratch.0.join("file"), b"temp").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(&scratch.0).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o700);
+            }
+            scratch.0.clone()
+        };
+        assert!(!path.exists());
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    #[test]
+    fn created_time_is_source_date_epoch_or_the_unix_epoch() {
+        assert_eq!(created_time(None).unwrap(), "1970-01-01T00:00:00Z");
+        for (epoch, expected) in [
+            ("0", "1970-01-01T00:00:00Z"),
+            ("951782400", "2000-02-29T00:00:00Z"),
+            ("1700000000", "2023-11-14T22:13:20Z"),
+            ("1709251199", "2024-02-29T23:59:59Z"),
+            ("4102444800", "2100-01-01T00:00:00Z"),
+            ("253402300799", "9999-12-31T23:59:59Z"),
+        ] {
+            assert_eq!(created_time(Some(epoch)).unwrap(), expected, "{epoch}");
         }
-        assert!(!temp_path.exists());
+        for bad in [
+            "-1",
+            "+5",
+            "1.5",
+            "1e9",
+            "now",
+            "253402300800",
+            "99999999999999999999",
+        ] {
+            let error = created_time(Some(bad)).unwrap_err().to_string();
+            assert!(
+                error.starts_with("SOURCE_DATE_EPOCH must be"),
+                "{bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_bytes_and_digest_depend_only_on_the_inputs() {
+        let imports = strings(&["wasi:io/error@0.2.9", "wasi:io/streams@0.2.9"]);
+        let exports = strings(&["a:b/c@0.2.0"]);
+        let created = created_time(None).unwrap();
+        let first = WasmArtifact::new(b"wasm-bytes", &imports, &exports, &created);
+        let second = WasmArtifact::new(b"wasm-bytes", &imports, &exports, &created);
+        assert_eq!(first.config, second.config);
+        assert_eq!(first.manifest, second.manifest);
+        assert_eq!(first.manifest_digest(), second.manifest_digest());
+
+        let wasm_digest = digest(b"wasm-bytes");
+        assert_eq!(
+            String::from_utf8(first.config.clone()).unwrap(),
+            format!(
+                "{{\"created\":\"1970-01-01T00:00:00Z\",\"author\":null,\"architecture\":\"wasm\",\
+                 \"os\":\"wasip2\",\"layerDigests\":[\"{wasm_digest}\"],\"component\":{{\
+                 \"exports\":[\"a:b/c@0.2.0\"],\
+                 \"imports\":[\"wasi:io/error@0.2.9\",\"wasi:io/streams@0.2.9\"],\
+                 \"target\":null}}}}"
+            )
+        );
+        assert_eq!(
+            String::from_utf8(first.manifest.clone()).unwrap(),
+            format!(
+                "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
+                 \"config\":{{\"mediaType\":\"application/vnd.wasm.config.v0+json\",\
+                 \"digest\":\"{}\",\"size\":{}}},\
+                 \"layers\":[{{\"mediaType\":\"application/wasm\",\"digest\":\"{wasm_digest}\",\
+                 \"size\":10}}],\
+                 \"annotations\":{{\"org.opencontainers.image.created\":\"1970-01-01T00:00:00Z\"}}}}",
+                first.config_digest(),
+                first.config.len()
+            )
+        );
+        // Both documents are valid JSON with the OCI fields the registry checks.
+        let manifest: Value = serde_json::from_slice(&first.manifest).unwrap();
+        assert_eq!(manifest["config"]["digest"], first.config_digest());
+        assert_eq!(manifest["config"]["size"], first.config.len());
+        assert_eq!(manifest["layers"][0]["digest"], wasm_digest);
+        let config: Value = serde_json::from_slice(&first.config).unwrap();
+        assert_eq!(config["layerDigests"][0], wasm_digest);
+
+        // Different component bytes, a different world or a different
+        // SOURCE_DATE_EPOCH each give a different manifest digest.
+        let other_wasm = WasmArtifact::new(b"wasm-bytez", &imports, &exports, &created);
+        assert_ne!(other_wasm.manifest_digest(), first.manifest_digest());
+        assert_ne!(other_wasm.config_digest(), first.config_digest());
+        let other_world = WasmArtifact::new(b"wasm-bytes", &imports[..1], &exports, &created);
+        assert_ne!(other_world.manifest_digest(), first.manifest_digest());
+        let dated = created_time(Some("1700000000")).unwrap();
+        let other_time = WasmArtifact::new(b"wasm-bytes", &imports, &exports, &dated);
+        assert_ne!(other_time.manifest_digest(), first.manifest_digest());
+    }
+
+    /// `sqlite-config.blob` is the config `wash oci push` 2.5.2 wrote for the
+    /// sqlite component (`platform/sqlite-component/dist`), fetched raw from
+    /// a local `registry:2` with `oras manifest fetch-config`; `sqlite.wit` is
+    /// that component's WIT. Given wash's `created` time, the config written
+    /// here is byte-identical. Re-capture both files when bumping `wash` or
+    /// the host's `oci-wasm` and update `wasm_config` if this test fails.
+    #[test]
+    fn config_matches_wash_2_5_2_apart_from_created() {
+        let wash = include_bytes!("../tests/fixtures/wash-2.5.2/sqlite-config.blob");
+        let wit = include_str!("../tests/fixtures/wash-2.5.2/sqlite.wit");
+        let parsed: Value = serde_json::from_slice(wash).unwrap();
+        let created = parsed["created"].as_str().unwrap();
+        let layer = parsed["layerDigests"][0].as_str().unwrap();
+        let (imports, exports) = world_items(wit).unwrap();
+        assert_eq!(imports.len(), 18);
+        assert_eq!(exports.len(), 2);
+        let ours = wasm_config(created, layer, &imports, &exports);
+        assert_eq!(
+            String::from_utf8(ours).unwrap(),
+            std::str::from_utf8(wash).unwrap()
+        );
+    }
+
+    #[test]
+    fn json_strings_are_escaped() {
+        let artifact = WasmArtifact::new(b"w", &strings(&["a\"b\\c"]), &[], "t");
+        let config: Value = serde_json::from_slice(&artifact.config).unwrap();
+        assert_eq!(config["component"]["imports"][0], "a\"b\\c");
+        assert_eq!(config["component"]["exports"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn oras_args_push_blobs_by_digest_the_manifest_under_one_tag_then_tag_it() {
+        let tags = strings(&["0.2.0", "stable"]);
+        let file = Path::new("/tmp/m.json");
+        assert_eq!(
+            tag_args(false, "ghcr.io/o/r", "sha256:abc", &tags),
+            ["tag", "ghcr.io/o/r@sha256:abc", "0.2.0", "stable"]
+        );
+        assert_eq!(
+            tag_args(true, "localhost:5000/r", "sha256:abc", &tags[..1])[..2],
+            ["tag", "--plain-http"]
+        );
+        assert_eq!(
+            blob_push_args(false, "ghcr.io/o/r", "sha256:abc", file),
+            ["blob", "push", "ghcr.io/o/r@sha256:abc", "/tmp/m.json"]
+        );
+        assert_eq!(
+            blob_push_args(true, "localhost:5000/r", "sha256:abc", file)[..3],
+            ["blob", "push", "--plain-http"]
+        );
+        assert_eq!(
+            manifest_push_args(false, "ghcr.io/o/r", "commit1", file),
+            [
+                "manifest",
+                "push",
+                "--media-type",
+                "application/vnd.oci.image.manifest.v1+json",
+                "ghcr.io/o/r:commit1",
+                "/tmp/m.json"
+            ]
+        );
+        assert_eq!(
+            manifest_push_args(true, "localhost:5000/r", "commit1", file)[2..],
+            [
+                "--plain-http",
+                "--media-type",
+                "application/vnd.oci.image.manifest.v1+json",
+                "localhost:5000/r:commit1",
+                "/tmp/m.json"
+            ]
+        );
     }
 }

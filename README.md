@@ -145,7 +145,7 @@ di-framework platform cluster destroy local --yes
 
 Default loopback ports are Kubernetes `26443`, registry `25000`, and HTTP `28180`. Each must be a distinct integer from 1024 through 65535. Declare tenants and users in `Pulumi.<stack>.yaml`. Ports, outputs, and tenancy are in the [generated project README](platform/platform/assets/platform/README.md).
 
-`@di-framework/platform/existing` installs the same Kubernetes resources on a caller-owned cluster. `kubeconfig` is a required local file path. `di-framework-kube` uses this entrypoint. Call `createPlatform({ provider, installation })` when another program already owns the cluster and the Pulumi stack.
+`@di-framework/platform/existing` installs the same Kubernetes resources on a caller-owned cluster. `kubeconfig` is a required local file path. `di-framework-kube` uses this entrypoint. Call `createPlatform({ provider, installation })` when another program already owns the cluster and the Pulumi stack. Both entrypoints call `validatePlatformConfig` before their first resource, so invalid platform configuration fails before a cluster is created; a program that creates its own cluster should do the same.
 
 The CLI and kube share one project, backend, and stack for a given installation. Configuration keys, CRDs, admission, and backing-service contracts are in the [platform README](platform/platform/README.md).
 

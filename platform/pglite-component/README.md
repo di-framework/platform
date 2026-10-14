@@ -105,7 +105,7 @@ The pglite component is published to GitHub Container Registry (GHCR) as an OCI 
 The workflow has four jobs:
 - `check-source` (`packages: read`) hashes the committed input files (`scripts/source-check.ts`). On a push it skips the build when `ghcr.io/di-framework/pglite-component:src-<hash>` already exists, so commits that do not change the component publish nothing.
 - `build` (no write token) runs the same targets as `ci.yml`: `make tools-rust`, `make unit smoke` (which runs `make build`, composing the provider with the engine via `wac plug`), then the publisher crates' clippy and tests.
-- `publish` (`packages: write`) downloads the tested `dist/` and runs `pglite-component-publisher`. It never rebuilds or modifies `dist/`. It checks `SHA256SUMS`, requires the export `di-framework:pglite/database@0.2.0` and rejects any import that is not `wasi:*`, then pushes `ghcr.io/di-framework/pglite-component:<commit sha>` once, pulls it back by the manifest digest to compare bytes, then points the version tag (`0.2.0`, the WIT package version) at that same manifest with `oras tag` and asserts both tags resolve to one digest. The `build` job passes the tested wasm sha256 to `publish`, which verifies it before pushing. It also tags the manifest `src-<hash>`.
+- `publish` (`packages: write`) downloads the tested `dist/` and runs `pglite-component-publisher`. It never rebuilds or modifies `dist/`. It checks `SHA256SUMS`, requires the export `di-framework:pglite/database@0.2.0` and rejects any import that is not `wasi:*`, then pushes the layer, config and manifest with `oras` under `ghcr.io/di-framework/pglite-component:<commit sha>` only, pulls it back with `wash` by the manifest digest to compare bytes, and only then points the version tag (`0.2.0`, the WIT package version) at that same manifest with `oras tag` and asserts both tags resolve to one digest. A failed check leaves the version tag where it was. The manifest and config carry a fixed `created` time (the publish step clears `SOURCE_DATE_EPOCH`, so `1970-01-01T00:00:00Z`), so publishing an unchanged `di-framework-pglite.wasm` gives the same digest and the pin job has nothing to pin. The `build` job passes the tested wasm sha256 to `publish`, which verifies it before pushing. It also tags the manifest `src-<hash>`.
 - `pin` (`contents: write`, `pull-requests: write`) opens or updates the PR `bot/pin-pglite-component`, "chore: pin pglite-component to <digest>", which rewrites the digests in this README with `scripts/pin-artifact.ts`. GitHub does not run workflows on a PR that `GITHUB_TOKEN` opened, so a maintainer has to start its checks (close and reopen it) before merging. It also runs when a push's source is already published (a revert to an older source, or a pin PR closed unmerged), so `main`'s pin follows the current source; it opens no PR when `main` already has the digest. On that path the `realign` job (`packages: write`) points the moving version tag back at that source's digest with `scripts/retag.sh`, which leaves a tag that is already there alone. Every tag move is behind the same source guard, so a stale run never retags.
 
 Tags are movable. `0.2.0` always points to the latest `main` publish for WIT package 0.2.0, and re-running a commit also moves its SHA tag. Only the `@sha256:...` digest is immutable, so consumers pin by digest.
@@ -295,6 +295,28 @@ engine routes to the host's WASI `random` interface. `gen_random_uuid()` is
 built into PostgreSQL and works without the extension. Other contrib modules
 are not included. The WIT interface does not change.
 
+Public-key PGP (`pgp_pub_encrypt`/`pgp_pub_decrypt`) works with ElGamal and RSA
+keys; pgcrypto cannot generate keys, so import them with `dearmor()`. For
+ElGamal, the ephemeral `k` comes from OpenSSL's DRBG (`BN_rand`), not from
+`pg_strong_random`. On WASI, OpenSSL seeds that DRBG from `getentropy`, which
+is the same WASI `random_get` import. It fails closed: if the host cannot
+supply entropy, the DRBG does not start and `pgp_pub_encrypt` raises an error
+instead of using a weak `k`.
+
+Blowfish (`bf`), CAST5 (`cast5`) and single DES (`des`) are unavailable in
+this build, because the OpenSSL legacy provider is not built or loaded.
+pgcrypto refuses them with `Cipher cannot be initialized`: in `encrypt()` and
+`decrypt()`, in the PGP functions, and when decrypting PGP messages that use
+them. `3des` (DES-EDE3) is in OpenSSL's default provider and still works, for
+legacy data only. Use `aes` (`aes128`, `aes192`, `aes256` for PGP). Password hashing with
+`crypt()` and `gen_salt('bf')`, `'md5'`, `'xdes'` or `'des'` is unaffected,
+because pgcrypto implements those itself.
+
+The engine has no `dlopen`. Its emulation keeps a fixed table of 64 loaded
+libraries per engine instance. pgcrypto resolves before that table and never
+uses a slot. A `LOAD` of a new library after the table is full fails with
+`dlopen table is full` and leaves the session usable.
+
 ## Persistence and ownership
 
 For an `open("/data/orders", ...)` call:
@@ -344,7 +366,8 @@ annotations provide storage; they do not enforce database ownership.
 - `src/pgwire.rs`: PostgreSQL message encoding and typed rows, over memory.
 - `src/engine.rs`: persistent filesystem setup and exclusive engine access.
 - `engine/bridge.wat`: private canonical ABI bridge to the core engine.
-- `engine/build-pgcrypto.sh`: builds OpenSSL libcrypto and pgcrypto in the engine container and generates pgcrypto's static `dlsym` table; `scripts/patch-engine-source.ts` links both into the engine.
+- `engine/build-pgcrypto.sh`: builds OpenSSL libcrypto and pgcrypto in the engine container and generates pgcrypto's static `dlsym` table; `scripts/patch-engine-source.ts` links both into the engine. The libcrypto build is cached under a key of the OpenSSL source tarball's sha256, the Configure options and `SOURCE_DATE_EPOCH`, so an OpenSSL version bump always rebuilds it.
+- `scripts/patch-engine-source.ts`: also replaces the upstream `dlopen` emulation's unbounded table (`dltab`) with the bounded one described under [Extensions](#extensions), and keeps pgcrypto's hook ahead of it.
 - `scripts/prepare-engine.ts`: pinned engine preparation and componentization (all build scripts are Bun TypeScript; see `scripts/`).
 - `wit/deps/pglite-engine/engine.wit`: internal interface, composed away at build.
 

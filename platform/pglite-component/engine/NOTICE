@@ -20,7 +20,10 @@ ABI bridge, uses WASI randomness instead of a /dev/urandom preopen, and keeps
 bootstrap files within the database's persistent filesystem mount. A growable,
 bounded memory buffer replaces socket-file spillover for query replies. Backend
 startup restores application session defaults after bootstrap and enables
-durable writes.
+durable writes. The emulated dlopen keeps loaded libraries in a bounded table
+instead of writing past the end of an unsized array. pgcrypto's PGP CFB mode
+(contrib/pgcrypto/pgp-cfb.c) is patched to refuse ciphers that are unavailable
+in this build.
 
 The engine's core module, support files, adapter, and the provider are
 composed into one deployable artifact. Engine code executes in the Wasm
