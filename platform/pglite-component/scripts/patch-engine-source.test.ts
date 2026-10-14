@@ -288,6 +288,8 @@ describe('patchPgpCfb', () => {
     // The probe runs right after px_cipher_init and before the context exists.
     expect(out).toContain(`${PGP_CFB_INIT_ANCHOR}${PGP_CFB_PROBE}\n\tctx = palloc0`);
     expect(out).toContain(PGP_CFB_BLOCK_NEW);
+    // A failed block clears the rest of the caller's buffer before returning.
+    expect(PGP_CFB_BLOCK_NEW).toContain('\t\t\tpx_memset(dst, 0, len);\n\t\t\treturn res;');
     expect(out).not.toContain(PGP_CFB_BLOCK_OLD);
     expect(patchPgpCfb(out)).toBe(out);
   });

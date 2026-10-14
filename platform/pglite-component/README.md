@@ -303,15 +303,12 @@ is the same WASI `random_get` import. It fails closed: if the host cannot
 supply entropy, the DRBG does not start and `pgp_pub_encrypt` raises an error
 instead of using a weak `k`.
 
-The OpenSSL legacy provider is not built or loaded, so the legacy ciphers
-`bf` (Blowfish), `cast5` and single `des` are not available. `encrypt()` and
-`decrypt()` with them fail with `Cipher cannot be initialized`. So do PGP
-functions given `cipher-algo` or `s2k-cipher-algo` `bf` or `cast5`, and
-decrypting PGP messages that use those ciphers. Unpatched pgcrypto ignores
-that failure in its PGP CFB mode and writes the plaintext; the engine's
-pgcrypto is patched to raise the error before it writes any output. `3des`
-(DES-EDE3) is in OpenSSL's default provider and still works, for legacy data
-only. Use `aes` (`aes128`, `aes192`, `aes256` for PGP). Password hashing with
+Blowfish (`bf`), CAST5 (`cast5`) and single DES (`des`) are unavailable in
+this build, because the OpenSSL legacy provider is not built or loaded.
+pgcrypto refuses them with `Cipher cannot be initialized`: in `encrypt()` and
+`decrypt()`, in the PGP functions, and when decrypting PGP messages that use
+them. `3des` (DES-EDE3) is in OpenSSL's default provider and still works, for
+legacy data only. Use `aes` (`aes128`, `aes192`, `aes256` for PGP). Password hashing with
 `crypt()` and `gen_salt('bf')`, `'md5'`, `'xdes'` or `'des'` is unaffected,
 because pgcrypto implements those itself.
 

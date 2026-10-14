@@ -1,5 +1,6 @@
 //! OpenPGP test keys and messages from PostgreSQL's pgcrypto regression suite
-//! (contrib/pgcrypto/sql/pgp-pubkey-decrypt.sql, PostgreSQL License). They are
+//! (contrib/pgcrypto/sql/pgp-pubkey-decrypt.sql and pgp-decrypt.sql,
+//! PostgreSQL License). They are
 //! public test vectors, not secrets: the smoke test only needs real ElGamal
 //! and RSA keys, and pgcrypto cannot generate keys itself.
 
@@ -174,4 +175,13 @@ HfcZXHSpSjx4haGGTsMvEJ85qFjZpr0eTGOdY5cFhNJAAVP8MZfji7OhPRAoOOIK
 eRGOCkao12pvPyFTFnPd5vqmyBbdNpK4Q0hS82ljugMJvM0p3vJZVzW402Kz6iBL
 GQ==
 =XHkF
+-----END PGP MESSAGE-----";
+
+/// Symmetric message `dat1.blowfish.sha1.mdc.s2k3.z0` (password `foobar`).
+pub const BLOWFISH_MESSAGE: &str = r"-----BEGIN PGP MESSAGE-----
+Comment: dat1.blowfish.sha1.mdc.s2k3.z0
+
+jA0EBAMCfFNwxnvodX9g0jwB4n4s26/g5VmKzVab1bX1SmwY7gvgvlWdF3jKisvS
+yA6Ce1QTMK3KdL2MPfamsTUSAML8huCJMwYQFfE=
+=JcP+
 -----END PGP MESSAGE-----";

@@ -622,16 +622,15 @@ fn pgcrypto_legacy_ciphers(db: &Connection) {
             "{cipher}: {result:?}"
         );
     }
-    // PGP (which has no single DES) must fail too, for the data and for a
-    // separate session key, and never write the plaintext through an
-    // all-zero keystream.
+    // PGP (which has no single DES) refuses them too, for the data and for a
+    // separate session key.
     for cipher in ["bf", "cast5"] {
         for options in [
             format!("cipher-algo={cipher}"),
             format!("cipher-algo=aes128, sess-key=1, s2k-cipher-algo={cipher}"),
         ] {
             let pgp = db.first(
-                "SELECT pgp_sym_encrypt('PGLITE-LEGACY-CIPHER-PLAINTEXT', 'k', $1::text)",
+                "SELECT pgp_sym_encrypt('data', 'k', $1::text)",
                 &[Value::Text(options.clone())],
             );
             assert!(
@@ -639,6 +638,32 @@ fn pgcrypto_legacy_ciphers(db: &Connection) {
                 "pgp {options}: {pgp:?}"
             );
         }
+    }
+    // Public-key encryption refuses them as the data cipher.
+    for cipher in ["bf", "cast5"] {
+        let pgp = db.first(
+            "SELECT pgp_pub_encrypt('data', dearmor($1::text), $2::text)",
+            &[
+                Value::Text(pgp_keys::RSA2048_PUBLIC.to_string()),
+                Value::Text(format!("cipher-algo={cipher}")),
+            ],
+        );
+        assert!(
+            matches!(&pgp, Err(Error::ExecutionFailed(e)) if e.message.contains("Cipher cannot be initialized")),
+            "pgp_pub_encrypt {cipher}: {pgp:?}"
+        );
+    }
+    // A Blowfish PGP message from PostgreSQL's regression suite cannot be
+    // decrypted, as text or as bytea.
+    for function in ["pgp_sym_decrypt", "pgp_sym_decrypt_bytea"] {
+        let result = db.first(
+            &format!("SELECT {function}(dearmor($1::text), 'foobar')"),
+            &[Value::Text(pgp_keys::BLOWFISH_MESSAGE.to_string())],
+        );
+        assert!(
+            matches!(&result, Err(Error::ExecutionFailed(e)) if e.message.contains("Cipher cannot be initialized")),
+            "{function}: {result:?}"
+        );
     }
     for cipher in ["aes", "3des"] {
         assert_eq!(

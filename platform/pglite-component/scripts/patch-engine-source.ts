@@ -244,13 +244,11 @@ export function patchDlfcn(text: string): string {
 }
 
 /**
- * pgcrypto's PGP CFB mode ignores the result of px_cipher_encrypt, and the
- * OpenSSL glue only sets the cipher up on its first encrypt call. A cipher
- * that cannot run here (bf and cast5 need the OpenSSL legacy provider,
- * which is not built) then leaves the zeroed keystream in place and
- * pgp_sym_encrypt(..., 'cipher-algo=bf') emits the plaintext. Probe one block
- * when the CFB context is created, so those ciphers fail before any output,
- * and stop processing if a later block fails.
+ * Blowfish and CAST5 are unavailable in this build (they need the OpenSSL
+ * legacy provider, which is not built). pgcrypto's PGP CFB mode is patched to
+ * refuse them with `Cipher cannot be initialized`: it encrypts one probe block
+ * when the CFB context is created, and it reports any later block failure,
+ * clearing the rest of the output buffer.
  */
 export const PGP_CFB_INIT_ANCHOR = [
   '\tres = px_cipher_init(ciph, key, key_len, NULL);',
@@ -283,14 +281,17 @@ export const PGP_CFB_PROBE = [
 export const PGP_CFB_BLOCK_OLD =
   '\t\tpx_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);\n';
 export const PGP_CFB_BLOCK_NEW = [
-  '\t\t/* di-framework: never mix in a keystream block that failed. */',
+  '\t\t/* di-framework: report a failed block and leave no partial output. */',
   '\t\tres = px_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);',
   '\t\tif (res < 0)',
+  '\t\t{',
+  '\t\t\tpx_memset(dst, 0, len);',
   '\t\t\treturn res;',
+  '\t\t}',
   '',
 ].join('\n');
 
-/** Make pgcrypto's PGP CFB mode fail instead of emitting plaintext (see above). */
+/** Make pgcrypto's PGP CFB mode refuse ciphers that cannot run (see above). */
 export function patchPgpCfb(text: string): string {
   const name = 'pgp-cfb.c';
   const out = insertOnce(text, PGP_CFB_INIT_ANCHOR, PGP_CFB_PROBE, 'after', name);
@@ -301,7 +302,7 @@ export function patchPgpCfb(text: string): string {
  * Wire pgcrypto into the WASI build: build it after the core (build-ext.sh),
  * link it statically (pglite-wasm/build.sh) and resolve its symbols through
  * the emulated dlopen/dlsym (sdk_port-wasi-dlfcn.c), and make its PGP CFB mode
- * fail closed (contrib/pgcrypto/pgp-cfb.c). The build script and the
+ * report cipher failures (contrib/pgcrypto/pgp-cfb.c). The build script and the
  * checksum-verified OpenSSL source are copied into df-extensions/.
  */
 export async function patchPgcrypto(
