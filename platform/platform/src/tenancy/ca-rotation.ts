@@ -52,7 +52,11 @@ const ageDays = (cert: string, now: Date) =>
   (now.getTime() - new Date(new X509Certificate(cert).validFrom).getTime()) / DAY_MS;
 /** DNS names as one string, whatever their order or case; '' for none (an unconstrained CA). */
 const nameKey = (names: string[] | undefined) =>
-  names ? JSON.stringify([...new Set(names.map((n) => n.toLowerCase()))].sort()) : '';
+  names
+    ? JSON.stringify(
+        [...new Set(names.map((n) => n.toLowerCase()))].sort((a, b) => a.localeCompare(b)),
+      )
+    : '';
 /** The permitted DNS names of `ca` as one string ({@link nameKey}). */
 const permittedKey = (ca: string) => nameKey(caPermittedDns(ca));
 /**
