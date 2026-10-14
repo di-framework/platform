@@ -24,6 +24,7 @@ import {
   resolveBackingServiceClasses,
   seedTenantNamespaces,
 } from './tenancy';
+import { hostImageSupportsNatsCredentials } from './tenancy/registry-nats';
 import { tenantListerFromKubeconfig, warnRemovedTenants } from './tenancy/removal';
 import {
   assertRuntimeNatsConfig,
@@ -112,11 +113,13 @@ export interface PlatformArgs {
 }
 
 /**
- * Published wash 2.8.0 with wasi-tls and patch 0002 (`--insecure-registry`, #149). The tag moves on
- * the next publish; this digest is the multi-arch index from the tenant-host workflow.
+ * Published wash 2.8.0 with wasi-tls, patch 0002 (`--insecure-registry`, #149) and patch 0003 (NATS
+ * blobstore credentials, #330), which tenant registries need for their own NATS account (#159). The
+ * tag moves on the next publish; this digest is the multi-arch index from the tenant-host workflow
+ * (pinned in #336) and is listed in `NATS_CREDENTIALS_HOST_IMAGE_DIGESTS`.
  */
 export const DEFAULT_HOST_IMAGE =
-  'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad';
+  'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab';
 
 /**
  * Route aliases from `args`, or else from config `routeAliases`, a top-level object. A `gateway`
@@ -151,6 +154,12 @@ export function createPlatform(args: PlatformArgs) {
   assertHostImageSupportsAllowlist(tenantHostImage, insecureRegistries);
   const configuredTenantAuth = config.getObject<TenantAuthConfig>('tenantAuth');
   assertTenantAuthConfig(configuredTenantAuth);
+  // The registry keeps working on such a host, in the shared TENANT account (#159).
+  if (configuredTenantAuth?.registry && !hostImageSupportsNatsCredentials(tenantHostImage))
+    pulumi.log.warn(
+      `tenantHostImage ${tenantHostImage} is not a known build with wash patch 0003 (NATS blobstore credentials): ` +
+        'tenant registries stay in the shared TENANT NATS account, reachable by tenant workloads, until it is one',
+    );
   // Unset tenant-auth public URLs default to gateway routes (#128); explicit URLs are kept.
   const tenantAuth = withDerivedPublicUrls(configuredTenantAuth, routeUrlPattern);
   const notDerived = unsetPublicUrls(tenantAuth);
