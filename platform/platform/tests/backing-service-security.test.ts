@@ -435,6 +435,7 @@ describe('tenant RBAC, quotas, admission policies, and network isolation', () =>
       'test-reserved-workloads',
       'test-servicebindings',
       'test-services',
+      'test-tenant-controller-secrets',
       'test-tenant-secret-delete',
       'test-tenant-secret-update',
       'test-workloads',

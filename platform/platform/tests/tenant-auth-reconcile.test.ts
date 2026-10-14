@@ -253,6 +253,7 @@ describe('tenantAuthResources', () => {
       'RoleBinding/di-tenant-alpha/tenant-controller-secret-reader',
       'NetworkPolicy/di-runtime-alpha/tenant-auth-egress',
       'NetworkPolicy/di-runtime-alpha/tenant-auth-network',
+      'ConfigMap/di-runtime-alpha/tenant-controller-members',
       'ConfigMap/di-runtime-alpha/tenant-controller-ca',
       'Secret/di-runtime-alpha/tenant-controller-tls',
       'Secret/di-runtime-alpha/tenant-controller-ca-key',

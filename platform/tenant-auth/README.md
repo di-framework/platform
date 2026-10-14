@@ -467,8 +467,10 @@ logging out both stop access.
   the quota to include platform components.
 * The sidecar container can start after the app, which costs one restart; an init ordering or
   a startup probe would avoid it.
-* `/-/members` lists all `User` CRs and filters; a projected per-tenant member list would avoid
-  exposing other tenants' memberships to the controller.
+* `/-/members` reads the member names the platform publishes in ConfigMap
+  `tenant-controller-members` and then each `User` by name; the controller may read only those
+  (platform#321). It shows active members only. On a platform without that ConfigMap it lists
+  every `User` instead.
 * No WebSocket or SPDY upgrade through the proxy, so `kubectl port-forward` and `exec` do not
   work; logs with `--follow` stream fine.
 * Login ↔ `User` name matching is by convention; a `spec.identity` field would make it explicit.

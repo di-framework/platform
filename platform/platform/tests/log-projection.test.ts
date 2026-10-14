@@ -7,6 +7,7 @@ import {
   PROJECTION_LABEL,
 } from '../src/tenancy/admission';
 import { type Api, ApiError, Controller, collection } from '../src/tenancy/controller';
+import { controllerClusterRoleRules } from '../src/tenancy/install';
 import {
   appendRing,
   applicationKey,
@@ -1267,19 +1268,23 @@ describe('Controller.projectLogs', () => {
 });
 
 describe('log projection security', () => {
-  it('grants the controller pods/log in the tenant runtime namespace only', () => {
+  it('reads host logs through its own ClusterRole and grants itself nothing per tenant', () => {
+    // #321: the controller holds `pods/log get` cluster-wide (the runtime Roles grant it), so the
+    // per-tenant `di-platform-log-reader` Role and binding are no longer rendered.
+    expect(controllerClusterRoleRules()).toContainEqual({
+      apiGroups: [''],
+      resources: ['pods/log'],
+      verbs: ['get'],
+    });
     const resources = tenantResources(tenant(), cfg);
-    const role = resources.find(
-      (r) => r.kind === 'Role' && r.metadata.name === 'di-platform-log-reader',
-    );
-    expect(role?.metadata.namespace).toBe('di-runtime-alpha');
-    expect(role?.rules).toEqual([{ apiGroups: [''], resources: ['pods/log'], verbs: ['get'] }]);
-    const binding = resources.find(
-      (r) => r.kind === 'RoleBinding' && r.metadata.name === 'di-platform-log-reader',
-    );
-    expect(binding?.subjects).toEqual([
-      { kind: 'ServiceAccount', name: 'di-platform-controller', namespace: 'wasmcloud' },
-    ]);
+    expect(resources.some((r) => r.metadata.name === 'di-platform-log-reader')).toBe(false);
+    expect(
+      resources.some((r) =>
+        ((r.subjects as { name: string }[] | undefined) ?? []).some(
+          (s) => s.name === 'di-platform-controller',
+        ),
+      ),
+    ).toBe(false);
     const runtime = resources.find(
       (r) => r.kind === 'ServiceAccount' && r.metadata.name === 'di-runtime',
     );

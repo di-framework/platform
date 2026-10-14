@@ -12,10 +12,13 @@ import { AuthError, IdentityResolver, type Principal } from './identity.ts';
 import { createApiKey, type KeyStore, listApiKeys, revokeApiKey } from './keys.ts';
 import {
   asUser,
+  type ConfigMapResource,
   inClusterCredentials,
   KubeClient,
   KubeError,
   loadKubeconfig,
+  MEMBERS_CONFIG,
+  type UserResource,
   type UserTokens,
 } from './kube.ts';
 import { discover, type ProviderMetadata } from './oidc.ts';
@@ -1220,8 +1223,7 @@ export class Controller {
       return new Response(null, { status: 204 });
     }
     if (route === 'GET /-/members') {
-      const { items } = await this.kube.listUsers();
-      const members = items
+      const members = (await this.memberUsers())
         .flatMap((u) =>
           u.spec.memberships
             .filter((m) => m.tenant === this.config.tenant)
@@ -1249,6 +1251,27 @@ export class Controller {
         audit: (event, fields) => this.audit(event, fields),
       });
     return status(404, 'NotFound', `${url.pathname} is not a controller endpoint`);
+  }
+
+  /**
+   * The Users behind `/-/members`. The platform lists the tenant's active members in
+   * {@link MEMBERS_CONFIG} and lets the controller read only those Users (#321), so each is read by
+   * name. A platform that predates it has no such ConfigMap (or no grant on it, a 403) and still
+   * lets the controller list every User, which is the fallback.
+   */
+  private async memberUsers(): Promise<UserResource[]> {
+    let published: ConfigMapResource | undefined;
+    try {
+      published = await this.kube.getConfigMap(this.keys.namespace, MEMBERS_CONFIG);
+    } catch (error) {
+      if (!(error instanceof KubeError && error.status === 403)) throw error;
+    }
+    if (!published) return (await this.kube.listUsers()).items;
+    const names: unknown = JSON.parse(published.data?.members ?? '[]');
+    if (!Array.isArray(names) || !names.every((name) => typeof name === 'string'))
+      throw new Error(`${MEMBERS_CONFIG} does not list member names`);
+    const users = await Promise.all(names.map((name) => this.kube.getUser(name)));
+    return users.filter((user): user is UserResource => user !== undefined);
   }
 
   // The Kubernetes API proxy.

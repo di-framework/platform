@@ -963,28 +963,6 @@ function tenantResources(
     make('v1', 'ServiceAccount', 'di-runtime', n.runtimeNamespace, {
       automountServiceAccountToken: false,
     }),
-    // The controller reads hostgroup logs to publish the console logs projection (#10); the
-    // host itself keeps no API token. Redundant since #115: the controller's ClusterRole holds
-    // `pods/log get` cluster-wide, because the runtime viewer and developer Roles grant it.
-    make('rbac.authorization.k8s.io/v1', 'Role', 'di-platform-log-reader', n.runtimeNamespace, {
-      rules: [{ apiGroups: [''], resources: ['pods/log'], verbs: ['get'] }],
-    }),
-    make(
-      'rbac.authorization.k8s.io/v1',
-      'RoleBinding',
-      'di-platform-log-reader',
-      n.runtimeNamespace,
-      {
-        roleRef: {
-          apiGroup: 'rbac.authorization.k8s.io',
-          kind: 'Role',
-          name: 'di-platform-log-reader',
-        },
-        subjects: [
-          { kind: 'ServiceAccount', name: 'di-platform-controller', namespace: cfg.namespace },
-        ],
-      },
-    ),
     make('v1', 'ConfigMap', 'di-tenant-stock', n.namespace, {
       data: {
         backend: 'redis',
@@ -1483,6 +1461,11 @@ function tenantControllerCertNames(
 }
 /** The Secret holding the controller CA's private key; no pod mounts it. */
 const TENANT_CONTROLLER_CA_KEY_SECRET = 'tenant-controller-ca-key';
+/**
+ * The tenant's active members, published for the tenant controller's `/-/members` (#321). It
+ * reads each one's User by name, so its RBAC names the members instead of listing every User.
+ */
+export const TENANT_MEMBERS_CONFIG = 'tenant-controller-members';
 /** Digest of the serving certificate; in both pod templates so a renewal rolls the pair. */
 function tlsCertDigest(cert: string): string {
   return createHash('sha256').update(cert).digest('hex');
@@ -1729,6 +1712,7 @@ function tenantAuthResources(
     },
   );
   const base64 = (text: string) => Buffer.from(text).toString('base64');
+  const members = [...inputs.members].sort((a, b) => a.localeCompare(b));
   const result: Resource[] = [
     make('v1', 'ServiceAccount', 'tenant-controller', namespace, {
       automountServiceAccountToken: false,
@@ -1736,11 +1720,14 @@ function tenantAuthResources(
     make('v1', 'ServiceAccount', 'tenant-console', namespace, {
       automountServiceAccountToken: false,
     }),
-    // The tenancy CRs it checks on every request.
+    // The tenancy CRs it checks on every request: its own Tenant and its members' Users only
+    // (#321). With no members there is no users rule: empty resourceNames would mean every name.
     make(rbac, 'ClusterRole', `di-tenant-controller-${name}`, undefined, {
       rules: [
         { apiGroups: [GROUP], resources: ['tenants'], verbs: ['get'], resourceNames: [name] },
-        { apiGroups: [GROUP], resources: ['users'], verbs: ['get', 'list'] },
+        ...(inputs.members.length
+          ? [{ apiGroups: [GROUP], resources: ['users'], verbs: ['get'], resourceNames: members }]
+          : []),
       ],
     }),
     // TokenRequest only for the tenant's members, recomputed from the User CRs on every
@@ -1757,10 +1744,18 @@ function tenantAuthResources(
           ]
         : [],
     }),
-    // API-key Secrets in its own namespace.
+    // API-key Secrets in its own namespace, and the member list it reads for `/-/members`.
+    // Secret names are generated, so `resourceNames` cannot narrow these; the
+    // `tenant-controller-secrets` admission policy limits its writes to API-key Secrets (#321).
     make(rbac, 'Role', 'tenant-controller-keys', namespace, {
       rules: [
         { apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list', 'create', 'delete'] },
+        {
+          apiGroups: [''],
+          resources: ['configmaps'],
+          verbs: ['get'],
+          resourceNames: [TENANT_MEMBERS_CONFIG],
+        },
       ],
     }),
     // Tenant developers can only write Secrets (#112), so `/v1` reads them as the controller;
@@ -1882,6 +1877,9 @@ function tenantAuthResources(
       }),
     );
   result.push(
+    make('v1', 'ConfigMap', TENANT_MEMBERS_CONFIG, namespace, {
+      data: { members: JSON.stringify(members) },
+    }),
     make('v1', 'ConfigMap', 'tenant-controller-ca', namespace, {
       data: { 'ca.crt': inputs.tls.caCert },
     }),

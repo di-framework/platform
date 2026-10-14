@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
+import { admissionResources } from '../src/tenancy/admission';
+import { type Api, ApiError, Controller, collection } from '../src/tenancy/controller';
 import {
   CONTROLLER_SCRIPT_MODULES,
   type ControllerClusterRoleRule,
@@ -10,6 +12,7 @@ import {
 import {
   type ControllerConfig,
   INSTALLATION,
+  REGISTRY_PULL_SECRET,
   type Resource,
   type Tenant,
   type TenantAuthInputs,
@@ -374,5 +377,352 @@ describe('controller RBAC sources (#115)', () => {
       '}',
     ];
     expect([...rbacOwners('m', lines)].sort()).toEqual(['m:Controller.reconcile', 'm:RBAC_V1']);
+  });
+});
+
+describe('tenant controller RBAC (#321)', () => {
+  const clusterRole = (objects: Resource[], t: string) =>
+    objects.find(
+      (o) => o.kind === 'ClusterRole' && o.metadata.name === `di-tenant-controller-${t}`,
+    );
+
+  it("reads only its own members' Users, by name, and never lists them", () => {
+    const role = clusterRole(rendered(['alpha']), 'alpha') as Resource;
+    expect(rulesOf(role)).toEqual([
+      {
+        apiGroups: ['platform.di-framework.dev'],
+        resources: ['tenants'],
+        verbs: ['get'],
+        resourceNames: ['alpha'],
+      },
+      {
+        apiGroups: ['platform.di-framework.dev'],
+        resources: ['users'],
+        verbs: ['get'],
+        resourceNames: ['alice', 'bob'],
+      },
+    ]);
+    for (const rule of rulesOf(role)) expect(rule.resourceNames?.length).toBeGreaterThan(0);
+  });
+
+  it('grants no users rule at all to a tenant without members', () => {
+    const t = tenant('gamma');
+    const objects = tenantAuthResources(t, cfg, { ...inputs, members: [] });
+    const role = clusterRole(objects, 'gamma') as Resource;
+    expect(rulesOf(role).flatMap((r) => r.resources)).toEqual(['tenants']);
+    const members = objects.find((o) => o.metadata.name === 'tenant-controller-members');
+    expect(members?.data).toEqual({ members: '[]' });
+  });
+
+  it('publishes the member list it may read in its own namespace only', () => {
+    const objects = tenantAuthResources(tenant('alpha'), cfg, {
+      ...inputs,
+      members: ['bob', 'alice'],
+    });
+    const members = objects.find((o) => o.metadata.name === 'tenant-controller-members');
+    expect(members).toMatchObject({
+      kind: 'ConfigMap',
+      metadata: { namespace: 'di-runtime-alpha' },
+    });
+    const published = (members as Resource).data as { members: string };
+    expect(JSON.parse(published.members)).toEqual(['alice', 'bob']);
+    const keys = objects.find(
+      (o) => o.kind === 'Role' && o.metadata.name === 'tenant-controller-keys',
+    );
+    expect(rulesOf(keys as Resource)).toContainEqual({
+      apiGroups: [''],
+      resources: ['configmaps'],
+      verbs: ['get'],
+      resourceNames: ['tenant-controller-members'],
+    });
+    // Its write access to Secrets is narrowed by admission, not RBAC (#115 S2).
+    expect(
+      admissionResources('test', cfg.namespace).some(
+        (r) => r.metadata.name === 'test-tenant-controller-secrets',
+      ),
+    ).toBe(true);
+  });
+
+  it('no longer renders the redundant log reader or binds anything to itself', () => {
+    expect(objects().some((o) => o.metadata.name === 'di-platform-log-reader')).toBe(false);
+    expect(bindNames()).not.toContain('di-platform-log-reader');
+    for (const binding of objects().filter((o) => o.kind.endsWith('Binding')))
+      expect(
+        ((binding.subjects as { name: string }[] | undefined) ?? []).map((s) => s.name),
+      ).not.toContain('di-platform-controller');
+  });
+  const objects = () => rendered(['alpha', 'beta']);
+});
+
+// Runtime coverage: drive the real Controller against an in-memory API server and check every
+// Role and binding it actually sends, and every request it makes, against its install-time RBAC.
+// This catches what the static render above can miss: a code path that builds or changes RBAC
+// only for some tenant states (registry host pull, suspended, no members).
+
+/** A request as the RBAC authorizer sees it. */
+interface Attributes {
+  group: string;
+  resource: string;
+  verb: string;
+  namespace?: string;
+  name?: string;
+}
+/** The RBAC attributes of one API call, as the API server would derive them. */
+function attributes(method: string, url: URL, exists: boolean): Attributes {
+  const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+  const [group, rest] =
+    parts[0] === 'api' ? ['', parts.slice(2)] : [parts[1] ?? '', parts.slice(3)];
+  let namespace: string | undefined;
+  let tail = rest;
+  if (rest[0] === 'namespaces' && rest.length > 2) {
+    namespace = rest[1];
+    tail = rest.slice(2);
+  }
+  const [plural, name, sub] = tail as [string, string | undefined, string | undefined];
+  const resource = sub ? `${plural}/${sub}` : plural;
+  const verb =
+    method === 'GET'
+      ? name
+        ? 'get'
+        : 'list'
+      : method === 'PATCH'
+        ? exists
+          ? 'patch'
+          : 'create'
+        : method === 'PUT'
+          ? 'update'
+          : method === 'DELETE'
+            ? 'delete'
+            : 'create';
+  return { group, resource, verb, namespace, name };
+}
+
+/** In-memory API server that records every RBAC object written and every request's attributes. */
+class RecordingApi implements Api {
+  objects = new Map<string, Resource>();
+  /** Every Role, ClusterRole and binding body the controller sent, in order. */
+  written: Resource[] = [];
+  requests: Attributes[] = [];
+  seed(value: Resource | Tenant | User): void {
+    this.objects.set(
+      `${collection(value.apiVersion, value.kind, value.metadata.namespace)}/${value.metadata.name}`,
+      structuredClone(value) as Resource,
+    );
+  }
+  async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const url = new URL(path, 'https://kubernetes');
+    const target = decodeURIComponent(url.pathname).replace(/\/status$/, '');
+    const existing = this.objects.get(target);
+    this.requests.push(attributes(method, url, existing !== undefined));
+    if (method === 'GET' && url.searchParams.has('labelSelector')) {
+      const labels = (url.searchParams.get('labelSelector') ?? '')
+        .split(',')
+        .filter(Boolean)
+        .map((v) => v.split('='));
+      const at = decodeURIComponent(url.pathname);
+      return {
+        items: [...this.objects.values()]
+          .filter(
+            (v) =>
+              [
+                collection(v.apiVersion, v.kind),
+                collection(v.apiVersion, v.kind, v.metadata.namespace),
+              ].includes(at) && labels.every(([k = '', x]) => v.metadata.labels?.[k] === x),
+          )
+          .map((item) => structuredClone(item)),
+      } as T;
+    }
+    if (method === 'GET') {
+      if (!existing) throw new ApiError(404, 'Not found');
+      return structuredClone(existing) as T;
+    }
+    if (method === 'DELETE') {
+      this.objects.delete(target);
+      return {} as T;
+    }
+    const data = structuredClone(body) as Resource;
+    if (data.apiVersion?.startsWith(`${RBAC_GROUP}/`)) this.written.push(structuredClone(data));
+    const value = {
+      ...existing,
+      ...data,
+      metadata: { ...existing?.metadata, ...data.metadata },
+    } as Resource;
+    value.metadata.uid ??= `${value.metadata.name}-uid`;
+    value.metadata.generation ??= 1;
+    if (value.kind === 'Deployment')
+      value.status = {
+        observedGeneration: 1,
+        readyReplicas: (value.spec as { replicas: number }).replicas,
+      };
+    // Kubernetes fills ServiceAccount token Secrets.
+    if (value.kind === 'Secret' && value.type === 'kubernetes.io/service-account-token')
+      value.data = { token: 'dG9rZW4=' };
+    this.objects.set(target, value);
+    return structuredClone(value) as T;
+  }
+}
+
+describe('platform controller RBAC at runtime (#321)', () => {
+  const registryCfg: ControllerConfig = {
+    ...cfg,
+    routeUrlPattern: 'http://{host}.{tenant}.localhost:28180',
+    tenantAuth: {
+      ...(cfg.tenantAuth as NonNullable<ControllerConfig['tenantAuth']>),
+      registry: {
+        component: `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}`,
+        publicUrl: 'https://registry.{tenant}.localhost:28180',
+      },
+    },
+  };
+  /** alpha: two members and a registry the hosts pull from; beta: suspended; gamma: no members. */
+  async function run() {
+    const api = new RecordingApi();
+    const beta = tenant('beta');
+    beta.spec.suspended = true;
+    const tenants = [tenant('alpha'), beta, tenant('gamma')];
+    const carol = user('carol', 'viewer', ['alpha']);
+    carol.spec.suspended = true;
+    const users = [
+      user('alice', 'developer', ['alpha', 'beta']),
+      user('bob', 'viewer', ['alpha', 'beta']),
+      carol,
+    ];
+    for (const value of [...tenants, ...users]) api.seed(value);
+    // Ready hosts, so the tenants turn Ready and their members are bound.
+    for (const t of tenants)
+      api.seed({
+        apiVersion: 'runtime.wasmcloud.dev/v1alpha1',
+        kind: 'Host',
+        metadata: {
+          name: `${t.metadata.name}-host`,
+          namespace: cfg.namespace,
+          labels: { hostgroup: `tenant-${t.metadata.name}` },
+        },
+        environment: `di-tenant-${t.metadata.name}`,
+        status: { conditions: ready },
+      });
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: { name: 'wasmcloud-runtime-tls', namespace: cfg.namespace },
+      data: { 'ca.crt': 'dGVzdA==' },
+    });
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: { name: 'tenant-auth-oauth', namespace: cfg.namespace },
+      data: { clientSecret: 'c2hhcmVk' },
+    });
+    api.seed({
+      apiVersion: 'discovery.k8s.io/v1',
+      kind: 'EndpointSlice',
+      metadata: {
+        name: 'kubernetes',
+        namespace: 'default',
+        labels: { 'kubernetes.io/service-name': 'kubernetes' },
+      },
+      endpoints: [{ addresses: ['10.0.0.1'] }],
+      ports: [{ port: 6443 }],
+    });
+    const controller = new Controller(api, registryCfg);
+    // Twice: the first pass deploys the registry, the second wires the hosts to pull from it.
+    for (let pass = 0; pass < 2; pass++) {
+      for (const t of tenants) await controller.reconcileTenant(t, users);
+      for (const u of users) await controller.reconcileUser(u, tenants);
+    }
+    return { api, written: api.written };
+  }
+  const held = (namespace: string | undefined) =>
+    namespace === cfg.namespace
+      ? [...controllerClusterRoleRules(), ...controllerNamespaceRoleRules()]
+      : controllerClusterRoleRules();
+  const ref = (o: Resource) => `${o.kind} ${o.metadata.namespace ?? ''}/${o.metadata.name}`;
+
+  it('exercises host pull, suspended and member-less tenants', async () => {
+    const { api, written } = await run();
+    const names = new Set(written.map(ref));
+    // alpha: the registry is deployed and its hosts pull with the platform-written credential.
+    expect(
+      api.objects.get(`${collection('v1', 'Secret', 'di-runtime-alpha')}/${REGISTRY_PULL_SECRET}`),
+    ).toBeDefined();
+    const hosts = api.objects.get(
+      `${collection('apps/v1', 'Deployment', 'di-runtime-alpha')}/hostgroup-tenant-alpha`,
+    );
+    expect(JSON.stringify(hosts?.spec)).toContain(REGISTRY_PULL_SECRET);
+    // beta (suspended) keeps its Roles but gets no tenant-controller or member bindings.
+    expect(names.has('ClusterRole /di-tenant-controller-beta')).toBe(true);
+    expect(names.has('ClusterRoleBinding /di-tenant-controller-beta')).toBe(false);
+    expect(
+      written.some((o) => o.kind === 'RoleBinding' && o.metadata.namespace === 'di-tenant-beta'),
+    ).toBe(false);
+    // gamma has no members: no users rule and an empty TokenRequest Role.
+    const gamma = written.findLast((o) => ref(o) === 'ClusterRole /di-tenant-controller-gamma');
+    expect(rulesOf(gamma as Resource).flatMap((r) => r.resources)).toEqual(['tenants']);
+    const tokens = written.findLast(
+      (o) => ref(o) === `Role ${cfg.namespace}/di-tenant-controller-gamma`,
+    );
+    expect(rulesOf(tokens as Resource)).toEqual([]);
+    // Members are bound in alpha; the suspended user nowhere.
+    expect(names.has('RoleBinding di-tenant-alpha/di-user-alice')).toBe(true);
+    expect(names.has('RoleBinding di-runtime-alpha/di-user-bob')).toBe(true);
+    expect([...names].some((n) => n.includes('di-user-carol'))).toBe(false);
+  });
+
+  it('holds every rule of every Role and ClusterRole it writes', async () => {
+    const { written } = await run();
+    const roles = written.filter((o) => o.kind === 'Role' || o.kind === 'ClusterRole');
+    expect(roles.length).toBeGreaterThan(0);
+    for (const role of roles) {
+      const namespace = role.kind === 'Role' ? role.metadata.namespace : undefined;
+      for (const rule of rulesOf(role))
+        expect(covers(held(namespace), rule), `${ref(role)}: ${JSON.stringify(rule)}`).toBe(true);
+    }
+  });
+
+  it('may create every binding it writes', async () => {
+    const { api, written } = await run();
+    const bindings = written.filter(
+      (o) => o.kind === 'RoleBinding' || o.kind === 'ClusterRoleBinding',
+    );
+    expect(bindings.some((b) => b.kind === 'ClusterRoleBinding')).toBe(true);
+    for (const binding of bindings) {
+      const role = roleRefOf(binding);
+      const namespace = binding.kind === 'RoleBinding' ? binding.metadata.namespace : undefined;
+      const target = api.objects.get(
+        `${collection(`${RBAC_GROUP}/v1`, role.kind, role.kind === 'Role' ? namespace : undefined)}/${role.name}`,
+      );
+      expect(target, `${ref(binding)} -> ${role.kind} ${role.name}`).toBeDefined();
+      const bindable = allows(
+        held(namespace),
+        RBAC_GROUP,
+        role.kind === 'Role' ? 'roles' : 'clusterroles',
+        'bind',
+        role.name,
+      );
+      const holdsAll = rulesOf(target as Resource).every((rule) => covers(held(namespace), rule));
+      expect(bindable || holdsAll, `${ref(binding)} -> ${role.name}`).toBe(true);
+    }
+  });
+
+  it('is authorized for every request it makes', async () => {
+    const { api } = await run();
+    expect(api.requests.length).toBeGreaterThan(0);
+    for (const r of api.requests)
+      expect(
+        allows(held(r.namespace), r.group, r.resource, r.verb, r.name),
+        `${r.verb} ${r.group}/${r.resource} ${r.namespace ?? ''}/${r.name ?? ''}`,
+      ).toBe(true);
+  });
+
+  it('detects a written rule the controller does not hold', async () => {
+    const { written } = await run();
+    // Without its cluster-wide users read it could not write the per-tenant users grant.
+    const cluster = controllerClusterRoleRules().map((r) =>
+      r.resources.includes('users')
+        ? { ...r, resources: r.resources.filter((x) => x !== 'users') }
+        : r,
+    );
+    const alpha = written.findLast((o) => ref(o) === 'ClusterRole /di-tenant-controller-alpha');
+    expect(rulesOf(alpha as Resource).every((rule) => covers(cluster, rule))).toBe(false);
   });
 });

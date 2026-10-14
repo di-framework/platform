@@ -428,8 +428,10 @@ every rule of every Role it writes, and grants `bind` only on the fixed-name Rol
 it binds (`CONTROLLER_BOUND_ROLES` in `src/tenancy/install.ts`). TokenRequest
 (`serviceaccounts/token` `create`), which each `di-tenant-controller-<tenant>` Role
 grants, is held only in the platform namespace through the `<installation>-controller`
-Role and RoleBinding. `tests/controller-rbac.test.ts` checks this against the
-rendered objects.
+Role and RoleBinding. It binds no Role to itself (#321). `tests/controller-rbac.test.ts`
+checks this against the rendered objects, and against every Role, binding and request the
+controller sends while it reconciles tenants with a registry, suspended tenants and tenants
+without members. `tests/tenancy-install.test.ts` checks the install wiring.
 
 Holding those rules gives the controller these grants directly, in every namespace:
 
@@ -679,8 +681,8 @@ WorkloadDeployment in `data.failures`.
 
 - Source: the `hostgroup-<tenant>` pod logs. The controller's ClusterRole holds
   `pods/log get` cluster-wide (#115), because the runtime viewer and developer Roles
-  it writes grant it; the per-tenant `di-platform-log-reader` Role and binding are
-  kept but are now redundant. The host keeps `automountServiceAccountToken: false`.
+  it writes grant it. The per-tenant `di-platform-log-reader` Role and binding are no
+  longer written (#321). The host keeps `automountServiceAccountToken: false`.
 - Guest lines come only from the wash `wasi:logging` TracingLogger. Each ends with
   `workload.name` and `workload.namespace`; the namespace must be the tenant's, and
   the name maps to a `di-framework`-managed WorkloadDeployment. Its
@@ -932,7 +934,11 @@ tenantAuth:
 - RBAC: `di-tenant-controller-<tenant>` lets the controller ServiceAccount create tokens only
   for `di-user-<member>` of the tenant's active (not suspended, not deleted) members. The list
   is recomputed from the User CRs on every reconcile; with no members the Role has no rule.
-  A suspended tenant keeps the roles and loses the bindings. `tenant-controller-secret-reader` in
+  The ClusterRole `di-tenant-controller-<tenant>` grants `get` on the tenant's own `Tenant` and on
+  the same members' `User`s by name, and no `list` (#321). With no members it has no `users` rule.
+  The members are also published, as a JSON array under `members`, in ConfigMap
+  `tenant-controller-members` in the runtime namespace, which the tenant controller reads for
+  `/-/members`. A suspended tenant keeps the roles and loses the bindings. `tenant-controller-secret-reader` in
   `di-tenant-<tenant>` lets it `get`/`list` Secrets there, because tenant developers can only
   write them (#112); writes still go through as the calling user.
 - Network: `tenant-auth-egress` adds egress to the API server endpoints (EndpointSlice
@@ -954,8 +960,12 @@ tenantAuth:
   Secret `tenant-controller-ca-key` in the same runtime namespace. No pod mounts it and no tenant
   member role can read it, but the tenant controller's ServiceAccount can: its
   `tenant-controller-keys` Role (for API-key Secrets) grants `get`, `list`, `create` and `delete`
-  on every Secret in that namespace. With `delete` it can also remove `tenant-controller-ca-key` or
-  `tenant-controller-tls`, which makes the platform controller issue a new CA and roll the hosts.
+  on every Secret in that namespace, because API-key Secrets have generated names. The
+  `<installation>-tenant-controller-secrets` admission policy (#321) limits its writes: it may
+  create and delete only `di-apikey-<16 hex>` Secrets labelled
+  `platform.di-framework.dev/api-key: "true"` with its own tenant, and update none. It can no
+  longer delete `tenant-controller-ca-key`, `tenant-controller-tls`, `tenant-console-oauth` or
+  the registry pull Secret. Its reads are not narrowed.
   The leaf is replaced 30 days before it expires, when its names change, or when it no longer
   verifies against the stored CA. The leaf's `notAfter` never passes the CA's. The CA is
   replaced only when one of these holds:
@@ -1098,6 +1108,18 @@ tenantAuth:
     each `di-tenant-controller-<tenant>` Role, and of the RoleBinding of the same name
     (written without `bind`), fail with `403` on `TenantAuthReady` until the next poll
     after the Role exists. Tenant Roles and bindings are unchanged.
+  - Tenant controller RBAC (#321): `di-tenant-controller-<tenant>` no longer lets the tenant
+    controller list `User`s, so `/-/members` needs a tenant-auth image that reads
+    `tenant-controller-members`. Upgrade the `tenantAuth.image` pin together with the platform:
+    an older image answers `/-/members` with an error until it is replaced (login and API
+    keys keep working). A newer image on an older platform falls back to listing `User`s.
+    Suspended members are no longer shown in `/-/members`, because the tenant controller can
+    no longer read their `User`.
+  - Log reader (#321): the controller no longer writes the per-tenant `di-platform-log-reader`
+    Role and RoleBinding in `di-runtime-<tenant>`, and no longer has `bind` on that name.
+    Existing ones stay until the tenant is deleted; they grant only `pods/log` `get` to the
+    controller, which already holds it cluster-wide. To remove them by hand:
+    `kubectl delete role,rolebinding -A -l platform.di-framework.dev/installation=<installation> --field-selector metadata.name=di-platform-log-reader`.
   - Host pull (`#83:host-pull`): the tenant's hosts pull workload components from the tenant
     registry with a namespace-scoped host credential.
     - Reference: users push to `publicUrl`; workloads reference the same repository as
@@ -1200,8 +1222,8 @@ The reconcile does not adopt objects that the removed manual deploy script creat
 the component and tenant labels but not the installation label; `TenantAuthReady` reports
 `Refusing to adopt`). Delete them first: in `di-runtime-<tenant>` the Deployments, Services,
 ServiceAccounts, Role and RoleBinding `tenant-controller-keys`, NetworkPolicy, Secrets
-`tenant-controller-tls`, `tenant-controller-ca-key` and `tenant-console-oauth`, and ConfigMaps `tenant-controller-ca` and
-`tenant-auth-bundle`; in `di-tenant-<tenant>` the Role and RoleBinding
+`tenant-controller-tls`, `tenant-controller-ca-key` and `tenant-console-oauth`, and ConfigMaps `tenant-controller-ca`,
+`tenant-controller-members` and `tenant-auth-bundle`; in `di-tenant-<tenant>` the Role and RoleBinding
 `tenant-controller-secret-reader`; in the platform namespace the Role and RoleBinding
 `di-tenant-controller-<tenant>`; and the cluster-scoped ClusterRole and ClusterRoleBinding
 `di-tenant-controller-<tenant>`.
