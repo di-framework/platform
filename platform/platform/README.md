@@ -912,7 +912,7 @@ tenantAuth:
   consolePublicUrl: http://console.{tenant}.localhost:28180  # optional; default derived from routeUrlPattern, else http://127.0.0.1:8787
   controllerPublicUrl: https://controller.{tenant}.localhost:28180  # optional; default derived from routeUrlPattern, else https://127.0.0.1:8788
   registry:                                                  # optional: each tenant's own OCI registry (#83)
-    component: ghcr.io/di-framework/oci-registry@sha256:29ec834c5f515e99146437c831e9f8bf25c98f32079afd9e715335d9f00ba270  # required, pinned by digest
+    component: ghcr.io/di-framework/oci-registry@sha256:ce5de5184f0fab3d93b51ff7d83239e83a2f9df1a3a5104d5dd9b015d5534eb0  # required, pinned by digest
     publicUrl: https://registry.{tenant}.localhost:28180     # optional; default derived from routeUrlPattern, else https://127.0.0.1:8790
     limits:                                                  # optional; each field optional, defaults shown
       maxBodyBytes: 536870912                                # TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES
