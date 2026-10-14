@@ -348,8 +348,12 @@ const TENANT_AUTH_KINDS = [
 ] as const;
 
 export class Controller {
-  /** Newest TracingLogger timestamp already projected, per host pod uid. */
-  private readonly logCursors = new Map<string, string>();
+  /**
+   * Newest TracingLogger timestamp already projected, per tenant and host pod uid. Entries of
+   * pods that are gone are dropped by projectLogs, and those of tenants no longer projected by
+   * tick (#131), so neither grows without bound.
+   */
+  private readonly logCursors = new Map<string, Map<string, string>>();
   /** Last successful egress name resolution, kept so a failed lookup does not revoke. */
   private readonly egressAddresses = new Map<string, string[]>();
   constructor(
@@ -631,7 +635,10 @@ export class Controller {
     const token = Buffer.from(existing?.data?.token ?? '', 'base64').toString();
     return HOST_PULL_TOKEN.test(token) ? token : randomBytes(32).toString('base64url');
   }
-  /** The host wiring last rendered per tenant (W1/S6 of the #83 `:host-pull` review). */
+  /**
+   * The host wiring last rendered per tenant (W1/S6 of the #83 `:host-pull` review). Entries of
+   * tenants that are gone are dropped by tick (#131).
+   */
   private readonly hostPulls = new Map<string, HostPull | undefined>();
   /**
    * How the tenant hosts pull from the registry (#83 `:host-pull`), decided from desired state
@@ -902,16 +909,7 @@ export class Controller {
     // Tenant-auth is independent of the tenant's own objects: a failed apply above (such as a
     // hostgroup 409) must not keep it from reconciling or from reporting TenantAuthReady (#121).
     let auth = await this.reconcileTenantAuth(tenant, users);
-    if (hostPullFailure && auth) {
-      const message =
-        hostPullFailure instanceof Error ? hostPullFailure.message : String(hostPullFailure);
-      auth = {
-        ...auth,
-        status: 'False',
-        reason: 'HostPullError',
-        message: `Tenant host registry wiring could not be read: ${message}`,
-      };
-    }
+    if (hostPullFailure && auth) auth = withHostPullFailure(auth, hostPullFailure);
     if (failure) {
       const message = failure instanceof Error ? failure.message : 'Reconciliation failed';
       console.error(`Tenant/${tenant.metadata.name}: ${message}`);
@@ -2078,10 +2076,16 @@ export class Controller {
     // Failures are merged newest-wins by deployment, so they skip the line floor: a
     // restarted controller re-reading old lines cannot duplicate them, and never loses one.
     const failures = new Map<string, ProjectedEntry[]>();
+    // Cursors of host pods that no longer exist are dropped (#131); a pod that is listed but not
+    // running keeps its cursor.
+    const cursors = this.logCursors.get(tenant.metadata.name) ?? new Map<string, string>();
+    this.logCursors.set(tenant.metadata.name, cursors);
+    const listed = new Set(pods.items.map((pod) => pod.metadata.uid ?? pod.metadata.name));
+    for (const key of cursors.keys()) if (!listed.has(key)) cursors.delete(key);
     for (const pod of pods.items) {
       if (pod.status?.phase !== 'Running') continue;
       const cursorKey = pod.metadata.uid ?? pod.metadata.name;
-      const cursor = this.logCursors.get(cursorKey);
+      const cursor = cursors.get(cursorKey);
       // Re-read a short window before the cursor so a service failure logged just after a
       // tick still sees its `Starting workload` line. The floor below drops repeated lines
       // and failures merge idempotently.
@@ -2110,7 +2114,7 @@ export class Controller {
         ]);
         failures.set(id, [...(failures.get(id) ?? []), ...entries]);
       }
-      if (newest) this.logCursors.set(cursorKey, newest);
+      if (newest) cursors.set(cursorKey, newest);
     }
     /** Shared ConfigMaps (by key id) a per-env projection could not take over from yet. */
     const held = new Set<string>();
@@ -2161,6 +2165,24 @@ export class Controller {
     }
   }
 
+  /**
+   * Drop the in-memory state of tenants that are gone (#131): the host wiring of every tenant no
+   * longer listed, and the log cursors of every tenant whose logs are no longer projected
+   * (removed, suspended or being deleted; their host pods are stopped). A tenant that comes back
+   * starts as after a controller restart.
+   */
+  private forgetTenants(tenants: readonly Tenant[]): void {
+    const listed = new Set(tenants.map((tenant) => tenant.metadata.name));
+    const projected = new Set(
+      tenants
+        .filter((tenant) => !tenant.spec.suspended && !tenant.metadata.deletionTimestamp)
+        .map((tenant) => tenant.metadata.name),
+    );
+    for (const name of this.hostPulls.keys()) if (!listed.has(name)) this.hostPulls.delete(name);
+    for (const name of this.logCursors.keys())
+      if (!projected.has(name)) this.logCursors.delete(name);
+  }
+
   async tick(): Promise<void> {
     const tenants = await this.list<Tenant>(VERSION, 'Tenant', {
       [INSTALLATION]: this.cfg.installation,
@@ -2174,6 +2196,7 @@ export class Controller {
     const services = await this.list<BackingService>(VERSION, 'BackingService', {});
     const bindings = await this.list<ServiceBinding>(VERSION, 'ServiceBinding', {});
     const tenantByName = new Map(tenants.map((t) => [t.metadata.name, t]));
+    this.forgetTenants(tenants);
     for (const value of [...tenants, ...users]) {
       try {
         if (value.kind === 'Tenant') await this.reconcileTenant(value as Tenant, users);
@@ -2272,6 +2295,20 @@ export class Controller {
       }
     }
   }
+}
+/**
+ * TenantAuthReady with a failed host wiring lookup (S6 of the #83 `:host-pull` review). An
+ * earlier failure reason of the tenant-auth step (such as `RouteError` or
+ * `RegistryHostConflict`) is kept and the lookup failure is appended to its message (#131);
+ * otherwise the condition turns False with `HostPullError`.
+ */
+export function withHostPullFailure(auth: Condition, failure: unknown): Condition {
+  const detail = `Tenant host registry wiring could not be read: ${
+    failure instanceof Error ? failure.message : String(failure)
+  }`;
+  if (auth.status === 'False' && auth.reason !== 'Provisioning')
+    return { ...auth, message: `${auth.message}; ${detail}` };
+  return { ...auth, status: 'False', reason: 'HostPullError', message: detail };
 }
 export async function main(
   api: Api = new KubernetesApi(),

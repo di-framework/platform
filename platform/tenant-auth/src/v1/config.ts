@@ -98,6 +98,53 @@ const conflict = (detail: string) => problem(409, 'Conflict', detail);
 
 const noContent = () => new Response(null, { status: 204 });
 
+// ---- references from deployed workloads (platform#100) ---------------------------------------
+
+/** The API group/version of WorkloadDeployments; shared with the deploy lane so both agree. */
+export const WORKLOAD_API = 'runtime.wasmcloud.dev/v1alpha1';
+
+type Sources = { name?: unknown }[];
+interface Guest {
+  localResources?: { environment?: { configFrom?: Sources; secretFrom?: Sources } };
+}
+interface Workload {
+  metadata: { name: string };
+  spec?: { template?: { spec?: { components?: Guest[]; service?: Guest } } };
+}
+
+/**
+ * The WorkloadDeployments of the tenant whose guests inject `source` (a Secret or ConfigMap name)
+ * through `field`, sorted. Read from the live objects as the caller, so a workload applied out of
+ * band counts too; the source name already carries the env.
+ */
+async function referencing(
+  context: V1Context,
+  field: 'configFrom' | 'secretFrom',
+  source: string,
+): Promise<string[]> {
+  const list = await context
+    .asUser()
+    .call<{ items?: Workload[] }>(
+      'GET',
+      `/apis/${WORKLOAD_API}/namespaces/di-tenant-${context.tenant}/workloaddeployments`,
+    );
+  const injects = (guest: Guest | undefined) => {
+    const sources = guest?.localResources?.environment?.[field];
+    return Array.isArray(sources) && sources.some((entry) => entry?.name === source);
+  };
+  return (list.items ?? [])
+    .filter(({ spec }) => {
+      const template = spec?.template?.spec;
+      const components = Array.isArray(template?.components) ? template.components : [];
+      return components.some(injects) || injects(template?.service);
+    })
+    .map(({ metadata }) => metadata.name)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+const referencedBy = (deployments: string[], env: string) =>
+  `referenced by deployed workloads in ${env}: ${deployments.join(', ')}`;
+
 // ---- secrets ---------------------------------------------------------------------------------
 
 /** Refuses names that are not DNS labels or that the platform manages; undefined when fine. */
@@ -207,6 +254,13 @@ const unsetSecret: V1Handler = async (_command, call, context) => {
   if (refused) return refused;
   const existing = await existingSecret(context, name, env, true);
   if (existing instanceof Response) return existing;
+  // Deleting a Secret a workload injects stops its replicas from being placed (platform#100).
+  const deployments = await referencing(context, 'secretFrom', secretObjectName(name, env));
+  if (deployments.length > 0)
+    return conflict(
+      `secret ${name} is ${referencedBy(deployments, env)}; ` +
+        'destroy them or redeploy them without it in `secrets` before unsetting it',
+    );
   await remove(
     context.asUser(),
     secretPath(context, name, env),
@@ -247,6 +301,8 @@ function refuseVarName(name: string): Response | undefined {
 }
 
 type VarChange = (data: Record<string, string>, name: string) => Response | undefined;
+type VarCheck = (context: V1Context, name: string, env: string) => Promise<Response | undefined>;
+type VarAnswer = (context: V1Context, name: string, env: string) => Promise<Response>;
 
 /** Read-modify-write of the environment's vars ConfigMap. */
 async function changeVars(
@@ -255,13 +311,13 @@ async function changeVars(
   event: string,
   change: VarChange,
   createIfMissing: boolean,
-  precheck?: (context: V1Context, name: string, env: string) => Promise<Response | undefined>,
+  checks: { before?: VarCheck; answer?: VarAnswer } = {},
 ): Promise<Response> {
   const name = nameOf(call);
   const env = envOf(call);
   const refused = refuseVarName(name);
   if (refused) return refused;
-  const blocked = await precheck?.(context, name, env);
+  const blocked = await checks.before?.(context, name, env);
   if (blocked) return blocked;
   const kube = context.asUser();
   const path = varsPath(context, env);
@@ -274,6 +330,8 @@ async function changeVars(
   const data: Record<string, string> = Object.assign(Object.create(null), existing?.data);
   const failed = change(data, name);
   if (failed) return failed;
+  // Prepared before the write, so a failed read leaves the vars unchanged.
+  const answer = await checks.answer?.(context, name, env);
   const times = timestamps(existing);
   if (Object.hasOwn(data, name)) times[name] = now();
   else delete times[name];
@@ -297,7 +355,7 @@ async function changeVars(
     `the ${env} vars`,
   );
   context.audit(event, { user: context.principal.user, name, env });
-  return noContent();
+  return answer ?? noContent();
 }
 
 /** A 409 when a tenant secret in `env` is already injected under the var's name. */
@@ -309,6 +367,26 @@ async function secretSharing(context: V1Context, name: string, env: string) {
   return conflict(
     `secret ${secret} is injected as ${name} in ${env}; a secret and a var cannot share it`,
   );
+}
+
+/**
+ * The answer to a var unset (platform#100). Deployments inject the whole vars ConfigMap
+ * (`configFrom`), not single keys, so any var of an env is referenced while a workload there
+ * injects that env's vars. The map stays, so the workloads keep running: the unset succeeds with a
+ * `referenced` warning naming them instead of being refused like a secret.
+ */
+async function varUnset(context: V1Context, name: string, env: string): Promise<Response> {
+  const deployments = await referencing(context, 'configFrom', varsConfigMapName(env));
+  const warnings = deployments.length
+    ? [
+        {
+          code: 'referenced',
+          detail: `var ${name} was ${referencedBy(deployments, env)}; check they do not need it`,
+          deployments,
+        },
+      ]
+    : [];
+  return Response.json({ warnings });
 }
 
 const missingVar = (name: string, call: HttpCall) =>
@@ -343,7 +421,7 @@ export const config: V1Module = {
       true,
       // Only set can introduce a new name; update and unset act on an existing var, which
       // already passed this check when it was set, so they need no secret-sharing check.
-      secretSharing,
+      { before: secretSharing },
     ),
   updateVar: (command, call, context) =>
     changeVars(
@@ -368,5 +446,6 @@ export const config: V1Module = {
         return undefined;
       },
       false,
+      { answer: varUnset },
     ),
 };

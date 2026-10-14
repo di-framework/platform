@@ -1265,6 +1265,70 @@ describe('Controller.projectLogs', () => {
       errors.mockRestore();
     }
   });
+
+  it('drops the cursor of a host pod that is gone, and keeps the others (#131)', async () => {
+    const api = new LogApi();
+    api.pods = [
+      { metadata: { name: 'host-0', uid: 'pod-0' }, status: { phase: 'Running' } },
+      { metadata: { name: 'host-1', uid: 'pod-1' }, status: { phase: 'Running' } },
+    ];
+    api.logs.set('host-0', hostLine('zero up', { at: '2026-10-01T10:00:01.000000Z' }));
+    api.logs.set('host-1', hostLine('one up', { at: '2026-10-01T10:00:02.000000Z' }));
+    const controller = new Controller(api, cfg);
+    const cursors = () =>
+      (controller as unknown as { logCursors: Map<string, Map<string, string>> }).logCursors;
+    await controller.projectLogs(tenant());
+    expect([...(cursors().get('alpha')?.keys() ?? [])]).toEqual(['pod-0', 'pod-1']);
+    // host-1 is gone; host-0 is listed but not running and keeps its cursor.
+    api.pods = [{ metadata: { name: 'host-0', uid: 'pod-0' }, status: { phase: 'Pending' } }];
+    await controller.projectLogs(tenant());
+    expect([...(cursors().get('alpha')?.entries() ?? [])]).toEqual([
+      ['pod-0', '2026-10-01T10:00:01.000000Z'],
+    ]);
+    api.pods = [{ metadata: { name: 'host-0', uid: 'pod-0' }, status: { phase: 'Running' } }];
+    api.logQueries = [];
+    await controller.projectLogs(tenant());
+    expect(api.logQueries).toEqual([`?sinceTime=${encodeURIComponent('2026-10-01T09:58:01Z')}`]);
+  });
+
+  it('forgets the host wiring and log cursors of tenants that are gone (#131)', async () => {
+    const controller = new Controller(new LogApi(), cfg);
+    const state = controller as unknown as {
+      logCursors: Map<string, Map<string, string>>;
+      hostPulls: Map<string, { caDigest?: string } | undefined>;
+    };
+    for (const name of ['alpha', 'beta', 'gone']) {
+      state.logCursors.set(name, new Map([['pod', '2026-10-01T10:00:00.000000Z']]));
+      state.hostPulls.set(name, { caDigest: `${name}-digest` });
+    }
+    const suspended = {
+      ...tenant(),
+      metadata: { ...tenant().metadata, name: 'beta' },
+      spec: { suspended: true },
+    };
+    const spies = [
+      spyOn(controller, 'reconcileTenant').mockResolvedValue(),
+      spyOn(controller, 'projectLogs').mockResolvedValue(),
+      spyOn(controller, 'reconcileWorkloadStorage').mockResolvedValue(),
+      spyOn(controller, 'reconcileTenantEgress').mockResolvedValue(),
+      spyOn(
+        controller as unknown as { list: (...args: unknown[]) => Promise<unknown[]> },
+        'list',
+      ).mockImplementation(async (_v: unknown, kind: unknown) =>
+        kind === 'Tenant' ? [tenant(), suspended] : [],
+      ),
+    ];
+    try {
+      await controller.tick();
+      // The live tenant keeps both; the suspended one keeps its wiring but projects no logs.
+      expect([...state.hostPulls.keys()]).toEqual(['alpha', 'beta']);
+      expect(state.hostPulls.get('alpha')).toEqual({ caDigest: 'alpha-digest' });
+      expect([...state.logCursors.keys()]).toEqual(['alpha']);
+      expect([...(state.logCursors.get('alpha')?.keys() ?? [])]).toEqual(['pod']);
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  });
 });
 
 describe('log projection security', () => {
