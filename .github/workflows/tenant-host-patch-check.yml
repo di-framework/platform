@@ -16,13 +16,18 @@
 #     not enable but the patches must not break;
 #   - runs the patch tests by name and fails if any named test did not run. The allowlist tests
 #     (0002) and the NATS blobstore credential tests (0003) run for every variant; the pool and
-#     dispatch tests (0001) run where 0001 is applied.
-# It does not run the whole suites: they need prebuilt wasm fixtures and Docker services this job
-# does not set up.
+#     dispatch tests (0001) run where 0001 is applied;
+#   - where 0001 is applied, builds the wasm test fixtures (`cargo xtask build-fixtures`) and runs
+#     0001's exclusive-instance topology tests (tests/integration_exclusive_topology.rs) by name:
+#     the load-time refusal of a linked exclusive component, queueing, a new revision waiting on
+#     the old one's host path, and a trap in the HTTP handler leaving the queued calls a fresh
+#     instance (#144).
+# It does not run the whole suites: some need Docker services this job does not set up.
 #
 # Bounded: one job per variant, 90 minutes each, superseded runs are cancelled. Cached per variant:
-# cargo registry and the target directory are keyed on the pinned commit, the variant and the patch
-# contents; debug info is off to keep the cache small. A push to main with the same paths refreshes
+# cargo registry, the target directory, the fixtures' target directory and the pinned
+# wasm-component-ld are keyed on the pinned commit, the variant and the patch contents; debug info
+# is off to keep the cache small. A push to main with the same paths refreshes
 # the cache that pull requests restore.
 name: Tenant-host patch check
 
@@ -157,6 +162,8 @@ jobs:
           # rust-toolchain.toml at the pinned commit pins 1.96.0.
           toolchain: '1.96.0'
           components: clippy, rustfmt
+          # The wasm test fixtures (exclusive variant) build for these.
+          targets: wasm32-wasip1, wasm32-wasip2
 
       - name: Install protobuf compiler
         run: |
@@ -172,6 +179,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             wasmcloud/target
+            wasmcloud/crates/wash-runtime/tests/fixtures/target
+            ~/.cache/wasm-component-ld
           key: tenant-host-wash-${{ runner.os }}-${{ steps.pin.outputs.commit }}-${{ matrix.tag }}-${{ hashFiles('platform/tenant-host/*.patch') }}
           restore-keys: |
             tenant-host-wash-${{ runner.os }}-${{ steps.pin.outputs.commit }}-${{ matrix.tag }}-
@@ -210,7 +219,8 @@ jobs:
       # 0002: protocol selection (unit and against a loopback listener), washlet propagation, and
       # `wash host` flag/env parsing. 0001 (when applied): the exclusive gates, queueing, trap,
       # timeout and drain tests (instance_pool, instance_driver) and the opt-in surviving the wire
-      # conversion (wire_). 0003 (when applied): NATS blobstore credential parsing, pool keys,
+      # conversion (wire_), including the retirement a call that ends faulted takes on the HTTP trap
+      # path. 0003 (when applied): NATS blobstore credential parsing, pool keys,
       # credential file reading, and the CONNECT a fake NATS server receives (nats_blobstore_).
       # Each name below must have run and passed.
       - name: Test the patches
@@ -238,7 +248,10 @@ jobs:
           )
           if [[ " ${PATCHES} " == *" 0001-exclusive-instance.patch "* ]]; then
             runtime_filters+=(instance_pool instance_driver wire_)
-            required+=(engine::instance_pool::exclusive_tests::)
+            required+=(
+              engine::instance_pool::exclusive_tests::
+              engine::instance_pool::exclusive_tests::a_call_finished_faulted_retires_its_instance_before_the_next_is_admitted
+            )
           fi
           if [[ " ${PATCHES} " == *" 0003-nats-blobstore-credentials.patch "* ]]; then
             runtime_filters+=(nats_blobstore_)
@@ -263,6 +276,51 @@ jobs:
           for name in "${required[@]}"; do
             if ! grep -qE "^test ${name}[^ ]* \.\.\. ok$" "${log}"; then
               echo "::error::required test ${name} did not run and pass"
+              exit 1
+            fi
+          done
+
+      # 0001's topology tests `include_bytes!` prebuilt wasm components. The toolchain's bundled
+      # wasm-component-ld is too old to link the fixtures that use `(implements ..)` imports
+      # (keyvalue-implements fails), so the fixtures link with the version wasmCloud's own CI pins
+      # (.github/actions/setup-rust at the pinned commit).
+      - name: Build the wasm test fixtures
+        if: contains(format(' {0} ', matrix.patches), ' 0001-exclusive-instance.patch ')
+        working-directory: wasmcloud
+        env:
+          WASM_COMPONENT_LD_VERSION: '0.5.24'
+        run: |
+          set -euo pipefail
+          # Versioned, so a bump never reuses fixtures linked by the old linker from the cache.
+          root="${HOME}/.cache/wasm-component-ld/${WASM_COMPONENT_LD_VERSION}"
+          cargo install --locked --root "${root}" "wasm-component-ld@${WASM_COMPONENT_LD_VERSION}"
+          export CARGO_TARGET_WASM32_WASIP2_LINKER="${root}/bin/wasm-component-ld"
+          "${CARGO_TARGET_WASM32_WASIP2_LINKER}" --version
+          cargo xtask build-fixtures
+
+      # 0001: an exclusive component linked into another is refused at load time, one nobody links
+      # loads, a lone exclusive component queues real requests, a new revision waits for the old
+      # one on the same host path, and a trap in the HTTP handler fails only its own call while the
+      # calls queued behind it are served by a fresh instance. The test target is linted like the
+      # lib (it needs the fixtures to compile), then each name below must have run and passed.
+      - name: Test the exclusive-instance topology
+        if: contains(format(' {0} ', matrix.patches), ' 0001-exclusive-instance.patch ')
+        working-directory: wasmcloud
+        run: |
+          set -euo pipefail
+          required=(
+            an_exclusive_component_that_is_linked_into_another_is_refused
+            an_exclusive_component_nobody_links_is_not_refused_for_its_links
+            a_single_exclusive_component_loads_and_queues
+            a_new_revision_waits_for_the_old_one_on_the_same_host_path
+            an_http_trap_leaves_the_queued_calls_a_fresh_instance
+          )
+          log="${RUNNER_TEMP}/topology-tests.log"
+          cargo clippy -p wash-runtime --locked --features wasi-tls --test integration_exclusive_topology -- -D warnings
+          cargo test -p wash-runtime --locked --features wasi-tls --test integration_exclusive_topology 2>&1 | tee "${log}"
+          for name in "${required[@]}"; do
+            if ! grep -qE "^test ${name} \.\.\. ok$" "${log}"; then
+              echo "::error::required topology test ${name} did not run and pass"
               exit 1
             fi
           done

@@ -22,7 +22,7 @@ index 0388738..d9fcf1d 100644
      }
  
 diff --git a/crates/wash-runtime/src/engine/instance_driver.rs b/crates/wash-runtime/src/engine/instance_driver.rs
-index f7f8d3d..3897332 100644
+index f7f8d3d..8eeeb0b 100644
 --- a/crates/wash-runtime/src/engine/instance_driver.rs
 +++ b/crates/wash-runtime/src/engine/instance_driver.rs
 @@ -49,7 +49,7 @@ use wasmtime::error::Context as _;
@@ -34,7 +34,7 @@ index f7f8d3d..3897332 100644
  use crate::host::http::ServiceHttpJob;
  use crate::host::trigger_service::HttpTask;
  
-@@ -111,11 +111,40 @@ impl DriverState {
+@@ -111,11 +111,52 @@ impl DriverState {
  /// in a way that leaves guest state indeterminate.
  pub(crate) struct PoolSlot {
      state: Arc<DriverState>,
@@ -72,10 +72,22 @@ index f7f8d3d..3897332 100644
 +        self.settled = true;
 +    }
 +
++    /// The task ran to the end, and `faulted` says whether the call left the
++    /// guest's state indeterminate on the way (a handler that reported a trap
++    /// to the task). A faulted call retires the instance first, while this
++    /// slot (and the call permit it carries) is still held, so the call
++    /// admitted next is never handed this instance.
++    pub(crate) fn finish(&mut self, faulted: bool) {
++        if faulted {
++            self.retire_instance();
++        }
++        self.settle();
++    }
++
      /// Stop this instance admitting: it drains what it took, ends its run loop,
      /// and its store's teardown ends any guest work still running on it.
      ///
-@@ -144,7 +173,7 @@ struct LinkedTask {
+@@ -144,7 +185,7 @@ struct LinkedTask {
  }
  
  impl AccessorTask<SharedCtx> for LinkedTask {
@@ -84,7 +96,7 @@ index f7f8d3d..3897332 100644
          let LinkedJob {
              func_idx,
              params,
-@@ -172,6 +201,7 @@ impl AccessorTask<SharedCtx> for LinkedTask {
+@@ -172,6 +213,7 @@ impl AccessorTask<SharedCtx> for LinkedTask {
              Ok(func) => func,
              Err(e) => {
                  let _ = reply.send(Err(e));
@@ -92,7 +104,7 @@ index f7f8d3d..3897332 100644
                  return Ok(());
              }
          };
-@@ -225,6 +255,7 @@ impl AccessorTask<SharedCtx> for LinkedTask {
+@@ -225,6 +267,7 @@ impl AccessorTask<SharedCtx> for LinkedTask {
          // The caller may have gone; its call still ran to completion, because
          // a guest subtask cannot be cancelled from the host.
          let _ = reply.send(outcome);
@@ -100,7 +112,7 @@ index f7f8d3d..3897332 100644
          Ok(())
      }
  }
-@@ -232,16 +263,28 @@ impl AccessorTask<SharedCtx> for LinkedTask {
+@@ -232,16 +275,28 @@ impl AccessorTask<SharedCtx> for LinkedTask {
  /// Releases an instance's in-flight slot when the call it admitted ends,
  /// however it ends. Held by the task, so a cancelled or trapped call frees its
  /// slot just as a completed one does.
@@ -133,7 +145,7 @@ index f7f8d3d..3897332 100644
          }
      }
  }
-@@ -329,19 +372,13 @@ impl InstanceDriver {
+@@ -329,19 +384,13 @@ impl InstanceDriver {
                                      req,
                                      resp_tx,
                                      abandoned,
@@ -155,7 +167,7 @@ index f7f8d3d..3897332 100644
                              }),
                          };
                          if let Err(e) = spawned {
-@@ -368,6 +405,13 @@ impl InstanceDriver {
+@@ -368,6 +417,23 @@ impl InstanceDriver {
          }
      }
  
@@ -166,10 +178,20 @@ index f7f8d3d..3897332 100644
 +        self.state.retire();
 +    }
 +
++    /// Admit a call to this instance and hand back its slot, carrying
++    /// `permit`, as the run loop hands one to each call's task. For tests that
++    /// end a call from outside the guest.
++    #[cfg(test)]
++    pub(crate) fn admit_slot(&self, permit: Option<CallPermit>) -> Option<PoolSlot> {
++        let mut guard = self.try_admit()?;
++        guard.call = permit;
++        Some(PoolSlot::new(Arc::clone(&self.state), guard))
++    }
++
      /// Calls in flight on this instance right now.
      pub(crate) fn in_flight(&self) -> usize {
          self.state.in_flight.load(Ordering::SeqCst)
-@@ -403,7 +447,7 @@ impl InstanceDriver {
+@@ -403,7 +469,7 @@ impl InstanceDriver {
          if !claimed {
              return None;
          }
@@ -178,7 +200,7 @@ index f7f8d3d..3897332 100644
  
          // Count the call against this instance's budget. Admission past the
          // limit is refused, not just noted: racing callers can all get here
-@@ -465,21 +509,33 @@ impl InstanceDriver {
+@@ -465,21 +531,33 @@ impl InstanceDriver {
      /// Hand a call to this instance. Returns the job again if the instance
      /// could not take it, so the caller can try elsewhere. Boxed because the
      /// refusal carries the whole request back.
@@ -887,10 +909,10 @@ index 9be47f2..b158262 100644
      use std::sync::Arc;
 diff --git a/crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs b/crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs
 new file mode 100644
-index 0000000..0a27831
+index 0000000..f1e98b6
 --- /dev/null
 +++ b/crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs
-@@ -0,0 +1,1201 @@
+@@ -0,0 +1,1242 @@
 +//! Exclusive components never have two stores alive at once.
 +//!
 +//! These drive real concurrency through the production dispatch path
@@ -1286,6 +1308,47 @@ index 0000000..0a27831
 +        "the replacement waited for the faulted store"
 +    );
 +    assert_eq!(rig.created(), 2, "one instance before the trap, one after");
++}
++
++/// A call whose HTTP handler reported a trap to its task ends with
++/// `PoolSlot::finish(true)`: the instance is retired while the call still
++/// holds the call permit, so the call queued behind it is served by a
++/// replacement and is never admitted to the faulted instance. An ordinary end,
++/// `finish(false)`, leaves the instance serving the next call.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn a_call_finished_faulted_retires_its_instance_before_the_next_is_admitted() {
++    for (faulted, instances) in [(true, 2), (false, 1)] {
++        let rig = Rig::exclusive(None);
++        rig.call("ok", PATIENT).await.expect("warm up");
++
++        // A call on the warm instance, holding the call permit as a dispatched
++        // call's slot does.
++        let permit = rig.pool.admit_call().await.expect("admitted");
++        let mut slot = {
++            let drivers = rig.pool.lock_drivers();
++            let driver = drivers.first().expect("one warm instance");
++            driver.admit_slot(permit).expect("the instance is idle")
++        };
++        let behind = {
++            let rig = Arc::clone(&rig);
++            tokio::spawn(async move { rig.call("ok", PATIENT).await })
++        };
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        assert!(
++            !behind.is_finished(),
++            "the next call waits for the permit the slot holds"
++        );
++
++        slot.finish(faulted);
++        drop(slot);
++        assert_eq!(behind.await.unwrap().expect("served"), 7);
++        assert_eq!(
++            rig.created(),
++            instances,
++            "faulted={faulted}: a faulted call's instance is replaced, an ordinary one is reused"
++        );
++        assert_eq!(rig.peak(), 1);
++    }
 +}
 +
 +/// A caller that gives up on a slow call does not free the instance: the
@@ -2658,7 +2721,7 @@ index 93ebb90..9810e41 100644
          let cold = crate::engine::instance_pool::ComponentInstance { store, instance };
          let call = DispatchedCall::new("HTTP (cold store)", crate::timeouts::http_response());
 diff --git a/crates/wash-runtime/src/host/trigger_service/http.rs b/crates/wash-runtime/src/host/trigger_service/http.rs
-index 9e70b47..4ff3d07 100644
+index 9e70b47..f35f2dd 100644
 --- a/crates/wash-runtime/src/host/trigger_service/http.rs
 +++ b/crates/wash-runtime/src/host/trigger_service/http.rs
 @@ -79,7 +79,7 @@ impl AccessorTask<SharedCtx> for HttpTask {
@@ -2670,18 +2733,22 @@ index 9e70b47..4ff3d07 100644
          } = self;
  
          // The epoch deadline measures this call's own execution, so re-arm it
-@@ -103,6 +103,10 @@ impl AccessorTask<SharedCtx> for HttpTask {
+@@ -103,6 +103,14 @@ impl AccessorTask<SharedCtx> for HttpTask {
          let (frame_tx, frame_rx) =
              tokio::sync::mpsc::channel::<Result<hyper::body::Frame<bytes::Bytes>, P2ErrorCode>>(4);
          let mut resp_tx = Some(resp_tx);
-+        // Set when the handler traps, which leaves a pooled instance's guest
-+        // state indeterminate.
++        // Set when `handle` reports a trap to this task, which leaves a pooled
++        // instance's guest state indeterminate. At the pinned wasmtime a guest
++        // trap instead ends the instance's whole event loop: this task is
++        // dropped mid-call, its unsettled `PoolSlot` retires the instance, and
++        // the pool reaps the dead driver. This covers a trap that reaches a
++        // task that survives it.
 +        let trapped = std::sync::atomic::AtomicBool::new(false);
 +        let trapped_ref = &trapped;
  
          let handler_fut = async move {
              let response = match service.handle(accessor, wasi_req).await {
-@@ -119,6 +123,7 @@ impl AccessorTask<SharedCtx> for HttpTask {
+@@ -119,6 +127,7 @@ impl AccessorTask<SharedCtx> for HttpTask {
                      return Ok(());
                  }
                  Err(e) => {
@@ -2689,18 +2756,14 @@ index 9e70b47..4ff3d07 100644
                      if let Some(tx) = resp_tx.take() {
                          let _ =
                              tx.send(Err(anyhow::anyhow!(e).context("service HTTP handler trap")));
-@@ -219,6 +224,15 @@ impl AccessorTask<SharedCtx> for HttpTask {
+@@ -219,6 +228,11 @@ impl AccessorTask<SharedCtx> for HttpTask {
                  None => tracing::error!("service HTTP response timed out"),
              },
          }
 +        if let Some(slot) = pool_slot.as_mut() {
-+            if trapped.load(std::sync::atomic::Ordering::SeqCst) {
-+                // The same remedy as a timeout: the trap poisoned the store, so
-+                // stop admitting before the slot frees and a queued call is
-+                // handed this instance.
-+                slot.retire_instance();
-+            }
-+            slot.settle();
++            // The same remedy as a timeout: a reported trap retires the
++            // instance before the slot frees and a queued call is handed it.
++            slot.finish(trapped.load(std::sync::atomic::Ordering::SeqCst));
 +        }
          Ok(())
      }
@@ -2768,10 +2831,10 @@ index eb825f8..e2f0754 100644
          // Strings flowing in from the proto wire are parsed into typed
 diff --git a/crates/wash-runtime/tests/integration_exclusive_topology.rs b/crates/wash-runtime/tests/integration_exclusive_topology.rs
 new file mode 100644
-index 0000000..8e24270
+index 0000000..3e8677f
 --- /dev/null
 +++ b/crates/wash-runtime/tests/integration_exclusive_topology.rs
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,350 @@
 +//! Which workloads may contain an exclusive component.
 +//!
 +//! An exclusive component (`di-framework.dev/exclusive-instance: "true"` in its
@@ -2782,7 +2845,6 @@ index 0000000..8e24270
 +//! is refused at load time instead; the supported shape is to compose the
 +//! pieces with `wac plug` and mark the composed component exclusive.
 +
-+use std::collections::HashMap;
 +use std::time::Duration;
 +
 +use anyhow::{Context, Result};
@@ -2794,8 +2856,9 @@ index 0000000..8e24270
 +
 +mod common;
 +use common::{
-+    component_workload_request, http_counter_host_interfaces, http_only_host_interfaces,
-+    json_u64_field, start_host_with_dev_router, start_host_with_dynamic_router,
++    component_workload_request, default_counter_resources, http_counter_host_interfaces,
++    http_only_host_interfaces, json_u64_field, start_host_with_dev_router,
++    start_host_with_dynamic_router,
 +};
 +
 +const HTTP_COUNTER_WASM: &[u8] = include_bytes!("wasm/http_counter.wasm");
@@ -2805,20 +2868,13 @@ index 0000000..8e24270
 +const CALLEE_WASM: &[u8] = include_bytes!("wasm/inter_component_call_callee.wasm");
 +
 +fn resources(exclusive: bool) -> LocalResources {
-+    LocalResources {
-+        memory_limit_mb: 256,
-+        cpu_limit: 1,
-+        config: if exclusive {
-+            HashMap::from([(EXCLUSIVE_INSTANCE_KEY.to_string(), "true".to_string())])
-+        } else {
-+            HashMap::new()
-+        },
-+        environment: HashMap::new(),
-+        volume_mounts: vec![],
-+        allowed_hosts: vec!["example.com".parse().unwrap()].into(),
-+        allowed_ip_name_lookups: Default::default(),
-+        allowed_host_loopback_ports: Default::default(),
++    let mut resources = default_counter_resources();
++    if exclusive {
++        resources
++            .config
++            .insert(EXCLUSIVE_INSTANCE_KEY.to_string(), "true".to_string());
 +    }
++    resources
 +}
 +
 +fn component(name: &str, wasm: &'static [u8], exclusive: bool) -> Component {
@@ -3047,5 +3103,85 @@ index 0000000..8e24270
 +    .await?;
 +    let count = timeout(Duration::from_secs(60), first).await???;
 +    assert_eq!(count, 1, "served by the new revision's own instance");
++    Ok(())
++}
++
++/// A trap in an exclusive component's HTTP handler fails that call only. The
++/// calls queued behind it on the call permit are served by a fresh instance,
++/// never handed the faulted one. A replacement instance starts its `served`
++/// count over, so the calls behind the trap count 1, 2, 3.
++///
++/// This is what a caller sees, not which mechanism retires the instance. At
++/// the pinned wasmtime a guest trap ends the instance's whole event loop, so
++/// the pool reaps the dead driver whatever else happens; the `PoolSlot::finish`
++/// retirement that a trap reported to a surviving task takes is unit-tested in
++/// `instance_pool::exclusive_tests`. This test holds across a wasmtime bump
++/// that changes which of the two a trap takes.
++#[tokio::test]
++async fn an_http_trap_leaves_the_queued_calls_a_fresh_instance() -> Result<()> {
++    let (addr, host) = start_host_with_dev_router("127.0.0.1:0").await?;
++
++    let mut request = component_workload_request(
++        "sleeper",
++        "exclusive-trap",
++        HTTP_SLEEPER_WASM,
++        resources(true),
++        http_only_host_interfaces("trap"),
++    );
++    // Keep the instance warm between calls, so only the trap can retire it.
++    request.workload.components[0].max_invocations = 0;
++    let status = host.workload_start(request).await?.workload_status;
++    anyhow::ensure!(
++        status.workload_state == wash_runtime::types::WorkloadState::Running,
++        "{status:?}"
++    );
++
++    let client = reqwest::Client::new();
++    let trapper = {
++        let client = client.clone();
++        tokio::spawn(async move {
++            timeout(
++                Duration::from_secs(60),
++                client
++                    .get(format!("http://{addr}/trap"))
++                    .header("HOST", "trap")
++                    .send(),
++            )
++            .await?
++            .map_err(anyhow::Error::from)
++        })
++    };
++    // The trapping call is the first on its instance, so it pays the sleeper's
++    // 100ms per-instance setup (`SETUP_NANOS`) before it traps. This head start
++    // must stay well under that, so the trap has taken the call permit and the
++    // calls below queue behind it.
++    tokio::time::sleep(Duration::from_millis(60)).await;
++    let mut behind = Vec::new();
++    for _ in 0..3 {
++        let client = client.clone();
++        behind.push(tokio::spawn(async move {
++            timeout(Duration::from_secs(60), served(&client, addr, "trap")).await?
++        }));
++    }
++
++    let trapped = trapper.await??;
++    assert!(
++        trapped.status().is_server_error(),
++        "the trapping call fails: {}",
++        trapped.status()
++    );
++    let mut counts = Vec::new();
++    for call in behind {
++        counts.push(
++            call.await?
++                .context("a call queued behind the trap is served")?,
++        );
++    }
++    counts.sort_unstable();
++    assert_eq!(
++        counts,
++        vec![1, 2, 3],
++        "the calls behind the trap are served by one fresh instance"
++    );
 +    Ok(())
 +}

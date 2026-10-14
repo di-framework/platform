@@ -271,9 +271,15 @@ way `workload_stop` does. They cover these cases:
   so the next revision proceeds;
 - a store requested through `new_store` for a stopped workload is refused;
 - a symlink to the old revision's directory shares its gate (the key is the canonical path).
-`tests/integration_exclusive_topology.rs` (needs the prebuilt test fixtures) covers the layout rule
-and a lone exclusive component loading and queueing real requests (it does not measure
-serialization; the live-store tests do). See [Tests](#tests) for the commands.
+`tests/integration_exclusive_topology.rs` (needs the prebuilt test fixtures) covers the layout rule,
+a lone exclusive component loading and queueing real requests (it does not measure
+serialization; the live-store tests do), a new revision waiting for the old one on the same host
+path, and what a caller sees of an HTTP trap: the trap fails only its own call, and the calls queued
+behind it are served by a fresh instance, never the faulted one. At the pinned wasmtime a guest
+trap ends the instance's event loop, so the pool reaps the instance whatever else happens. The HTTP
+handler's `trapped` flag covers a trap reported to a task that survives it; its retirement
+(`PoolSlot::finish`) is unit-tested in `exclusive_tests.rs`. The patch-check workflow builds the
+fixtures and runs each of these tests by name. See [Tests](#tests) for the commands.
 
 ## Tests
 
@@ -296,6 +302,12 @@ git apply "$P/0001-exclusive-instance.patch" && git apply "$P/0002-insecure-regi
 git apply "$P/0003-nats-blobstore-credentials.patch"
 cargo test -p wash-runtime --features wasi-tls --lib -- insecure_registr client_protocol test_image_pull_secret_to_oci_config nats_blobstore_ instance_pool instance_driver wire_
 cargo test -p wash --features wasi-tls,host-component-plugins --lib -- insecure_registry
+
+# exclusive only: the topology tests need the wasm fixtures. The toolchain's bundled
+# wasm-component-ld (0.5.22 in 1.96.0) cannot link keyvalue-implements, so link with 0.5.24.
+cargo install --locked --root /tmp/wasm-component-ld/0.5.24 wasm-component-ld@0.5.24
+CARGO_TARGET_WASM32_WASIP2_LINKER=/tmp/wasm-component-ld/0.5.24/bin/wasm-component-ld cargo xtask build-fixtures
+cargo test -p wash-runtime --features wasi-tls --test integration_exclusive_topology
 ```
 
 0002's tests cover protocol selection (an allowlisted `host:port` is pulled over HTTP and anything
