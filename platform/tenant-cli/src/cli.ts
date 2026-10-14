@@ -333,6 +333,8 @@ async function checkRegistry(
       headers: { authorization: `Basic ${btoa(`${username}:${password}`)}` },
     });
   } catch (error) {
+    // An untrusted certificate keeps its code, so `run` can point at --ca-file.
+    if (tlsTrustCode(error)) throw error;
     throw new CliError(`cannot reach the registry at ${url}: ${(error as Error).message}`);
   }
   await response.body?.cancel();
@@ -421,6 +423,11 @@ async function registry(
 /** TLS errors that mean the certificate chain is not trusted, not that the peer is unreachable. */
 const TLS_TRUST_CODES = /^(UNABLE_TO_|SELF_SIGNED_|DEPTH_ZERO_SELF_SIGNED|CERT_)/;
 
+function tlsTrustCode(error: unknown): string | undefined {
+  const code = (error as { code?: unknown } | undefined)?.code;
+  return typeof code === 'string' && TLS_TRUST_CODES.test(code) ? code : undefined;
+}
+
 export async function run(argv: string[], io: Io): Promise<number> {
   try {
     return await dispatch(parseArgs(argv), io);
@@ -433,8 +440,8 @@ export async function run(argv: string[], io: Io): Promise<number> {
       io.stderr(`identity: ${error.message}`);
       return 1;
     }
-    const code = (error as { code?: unknown }).code;
-    if (typeof code === 'string' && TLS_TRUST_CODES.test(code)) {
+    const code = tlsTrustCode(error);
+    if (code) {
       io.stderr(
         `tls: ${(error as Error).message} (${code}). Trust the tenant's controller CA (ConfigMap tenant-controller-ca): login --ca-file <ca.crt>, or NODE_EXTRA_CA_CERTS=<ca.crt>.`,
       );

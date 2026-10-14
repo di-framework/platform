@@ -234,6 +234,32 @@ describe('registry login', () => {
     expect(err[0]).toBe('oras login 127.0.0.1:5000 failed (exit 1)');
   });
 
+  test('an unreachable or failing registry writes nothing', async () => {
+    const { fetch: controllerOnly } = fakes();
+    const unreachable = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith('/v2/')) throw new TypeError('connection refused');
+      return controllerOnly(input, init);
+    }) as typeof fetch;
+    expect(await run(['registry', 'login'], io(unreachable))).toBe(1);
+    expect(err.at(-1)).toBe(
+      'cannot reach the registry at https://registry.acme.test:8443: connection refused',
+    );
+    const failing = fakeFetch({
+      'GET /v1/deploy/registry': () => Response.json(registryInfo),
+      'GET /v2/': () => new Response(null, { status: 502 }),
+    });
+    expect(await run(['registry', 'login'], io(failing.fetch))).toBe(1);
+    expect(err.at(-1)).toBe('the registry at https://registry.acme.test:8443 answered 502');
+    expect(existsSync(configFile())).toBe(false);
+  });
+
+  test('--with needs a way to run the tool', async () => {
+    const { fetch } = fakes();
+    const noExec = { ...io(fetch), exec: undefined };
+    expect(await run(['registry', 'login', '--with', 'docker'], noExec)).toBe(1);
+    expect(err.at(-1)).toBe('cannot run docker from here');
+  });
+
   test('logout removes only the tenant entry', async () => {
     const { fetch } = fakes();
     expect(await run(['registry', 'login'], io(fetch))).toBe(0);
@@ -405,6 +431,22 @@ describe.skipIf(!hasOpenssl)('controller CA trust over TLS', () => {
     expect(await run(['registry', 'login'], io())).toBe(0);
     const config = JSON.parse(readFileSync(configFile(), 'utf8'));
     expect(config.auths[`127.0.0.1:${server.port}`].auth).toBe(btoa(`token:${SECRET}`));
+
+    // The registry check without the CA fails with the trust hint, not as unreachable.
+    const store = readStore(env);
+    const acme = store.acme as Credential;
+    writeStore({ acme: { ...acme, controller: { url: controller } } }, env);
+    const unverified = fakeFetch({
+      'GET /v1/deploy/registry': () =>
+        Response.json({ ...registryInfo, url: `https://127.0.0.1:${server.port}` }),
+    });
+    const viaFake = (async (input: string | URL | Request, init?: RequestInit) =>
+      String(input).endsWith('/v2/')
+        ? fetch(input, init)
+        : unverified.fetch(input, init)) as typeof fetch;
+    expect(await run(['registry', 'login'], io(viaFake))).toBe(1);
+    expect(err.at(-1)).toContain('tls: ');
+    writeStore(store, env);
 
     // A later login to the same controller keeps the stored CA.
     expect(await run(['login', '--controller', controller, '--api-key', SECRET], io())).toBe(0);
