@@ -84,7 +84,8 @@ class MemoryApi implements Api {
         items: [...this.objects.values()]
           .filter(
             (v) =>
-              collection(v.apiVersion, v.kind) === url.pathname &&
+              (collection(v.apiVersion, v.kind) === url.pathname ||
+                collection(v.apiVersion, v.kind, v.metadata.namespace) === url.pathname) &&
               labels.every(([k, x]) => v.metadata.labels?.[k!] === x),
           )
           .map(({ apiVersion: _version, kind: _kind, ...item }) => item),
@@ -118,6 +119,30 @@ class MemoryApi implements Api {
     }
     throw new Error(`Unexpected ${method}`);
   }
+}
+/** A host pod of `tenant` in its runtime namespace, as the hostgroup Deployment labels it. */
+function hostPod(
+  name: string,
+  tenant: string,
+  options: { terminating?: boolean; phase?: string } = {},
+): Resource {
+  const n = names(tenant);
+  return {
+    apiVersion: 'v1',
+    kind: 'Pod',
+    metadata: {
+      name,
+      namespace: n.runtimeNamespace,
+      ...(options.terminating
+        ? {
+            deletionTimestamp: '2026-01-01T00:00:00Z',
+            finalizers: ['runtime.wasmcloud.dev/pod-host-finalizer'],
+          }
+        : {}),
+      labels: { 'wasmcloud.com/hostgroup': n.hostgroup, 'wasmcloud.com/name': 'hostgroup' },
+    },
+    ...(options.phase ? { status: { phase: options.phase } } : {}),
+  };
 }
 function prepare(): { api: MemoryApi; controller: Controller; t: Tenant; u: User } {
   const api = new MemoryApi();
@@ -474,6 +499,94 @@ describe('tenant and user resource reconciliation', () => {
     ).toBe(true);
     expect([...api.objects.values()].filter((r) => r.kind === 'RoleBinding')).toHaveLength(0);
     expect(t.metadata.finalizers).not.toContain(FINALIZER);
+  });
+  it('keeps the Retain finalizer until the host pods are gone, terminating ones included (#245)', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t);
+    const n = names('alpha');
+    // The Deployments already report zero replicas; a terminating host pod is still there.
+    api.seed(hostPod('hostgroup-terminating', 'alpha', { terminating: true, phase: 'Running' }));
+    // Another tenant's host pod never holds this tenant back.
+    const other = names('beta');
+    api.seed(hostPod('hostgroup-beta', 'beta', { terminating: true }));
+    t.metadata.deletionTimestamp = new Date().toISOString();
+    api.seed(t);
+    await controller.reconcileTenant(t);
+    expect(t.metadata.finalizers).toContain(FINALIZER);
+    // The Tenant says what it waits for.
+    expect(t.status?.conditions?.[0]).toMatchObject({
+      status: 'False',
+      reason: 'WaitingForHostPods',
+      message: `Retain: waiting for host pods in ${n.runtimeNamespace} to be gone before removing the Tenant: hostgroup-terminating`,
+    });
+    expect(api.operations).toContainEqual({
+      method: 'GET',
+      path: `${collection('v1', 'Pod', n.runtimeNamespace)}?labelSelector=${encodeURIComponent(
+        `wasmcloud.com/hostgroup=${n.hostgroup},wasmcloud.com/name=hostgroup`,
+      )}`,
+    });
+    // Nothing is deleted while waiting: the pod, namespaces and the other tenant's pod stay.
+    expect(
+      api.objects.has(`/api/v1/namespaces/${n.runtimeNamespace}/pods/hostgroup-terminating`),
+    ).toBe(true);
+    expect(
+      api.objects.has(`/api/v1/namespaces/${other.runtimeNamespace}/pods/hostgroup-beta`),
+    ).toBe(true);
+    expect(api.objects.has(`/api/v1/namespaces/${n.runtimeNamespace}`)).toBe(true);
+    // A retry while the pod remains is a no-op; once the operator lets it go, the finalizer goes.
+    await controller.reconcileTenant(t);
+    expect(t.metadata.finalizers).toContain(FINALIZER);
+    api.objects.delete(`/api/v1/namespaces/${n.runtimeNamespace}/pods/hostgroup-terminating`);
+    await controller.reconcileTenant(t);
+    expect(t.metadata.finalizers).not.toContain(FINALIZER);
+    expect(api.objects.has(`/api/v1/namespaces/${n.runtimeNamespace}`)).toBe(true);
+    expect(
+      api.objects.has(`/api/v1/namespaces/${other.runtimeNamespace}/pods/hostgroup-beta`),
+    ).toBe(true);
+  });
+  it('under Retain, finished host pods do not hold the Tenant; running, pending and unknown ones do (#245)', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t);
+    const n = names('alpha');
+    const pod = (name: string) => `/api/v1/namespaces/${n.runtimeNamespace}/pods/${name}`;
+    for (const name of ['running', 'pending', 'unknown', 'no-status', 'r5', 'r6']) {
+      const phase =
+        { running: 'Running', pending: 'Pending', unknown: 'Unknown' }[name] ?? 'Running';
+      api.seed(hostPod(name, 'alpha', name === 'no-status' ? {} : { phase }));
+    }
+    // An evicted pod stays Failed until someone deletes it, and under Retain nobody does.
+    api.seed(hostPod('evicted', 'alpha', { phase: 'Failed' }));
+    api.seed(hostPod('completed', 'alpha', { phase: 'Succeeded' }));
+    t.metadata.deletionTimestamp = new Date().toISOString();
+    api.seed(t);
+    await controller.reconcileTenant(t);
+    expect(t.metadata.finalizers).toContain(FINALIZER);
+    const waiting = t.status?.conditions?.[0];
+    expect(waiting?.reason).toBe('WaitingForHostPods');
+    // At most five names, then a count; finished pods are never named.
+    expect(waiting?.message).toEndWith(': no-status, pending, r5, r6, running, and 1 more');
+    expect(waiting?.message).not.toContain('evicted');
+    for (const name of ['running', 'pending', 'unknown', 'no-status', 'r5', 'r6']) {
+      api.objects.delete(pod(name));
+    }
+    await controller.reconcileTenant(t);
+    expect(t.metadata.finalizers).not.toContain(FINALIZER);
+    // Only finished pods were left; the controller still deletes nothing under Retain.
+    expect(api.objects.has(pod('evicted'))).toBe(true);
+    expect(api.objects.has(pod('completed'))).toBe(true);
+    expect(
+      api.operations.filter((o) => o.method === 'DELETE' && o.path.includes('/pods/')),
+    ).toEqual([]);
+  });
+  it('a terminating host pod holds the Retain Tenant even in a finished phase (#245)', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t);
+    api.seed(hostPod('evicted-terminating', 'alpha', { terminating: true, phase: 'Failed' }));
+    t.metadata.deletionTimestamp = new Date().toISOString();
+    api.seed(t);
+    await controller.reconcileTenant(t);
+    expect(t.metadata.finalizers).toContain(FINALIZER);
+    expect(t.status?.conditions?.[0]?.message).toEndWith(': evicted-terminating');
   });
   it('waits for both namespaces to disappear before completing Delete', async () => {
     const { api, controller, t } = prepare();
