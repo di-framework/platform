@@ -2195,10 +2195,11 @@ export class Controller {
       // and failures merge idempotently. While a write keeps failing, its key's cursor stays
       // put. While any write or delete of this tenant is failing, every pod read is bounded like
       // the first one, and the ring by appendRing.
+      const bound = writeFailures.size > 0 ? '&tailLines=1000' : '';
       const query = oldest
         ? `sinceTime=${encodeURIComponent(
             new Date(Date.parse(oldest) - LOG_LOOKBACK_MS).toISOString().replace(/\.\d+Z$/, 'Z'),
-          )}${writeFailures.size > 0 ? '&tailLines=1000' : ''}`
+          )}${bound}`
         : 'tailLines=1000';
       const text = await this.api.call<string>(
         'GET',

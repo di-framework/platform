@@ -347,20 +347,18 @@ describe('GET /v1/services/:service/logs', () => {
       expect(await logsOf('env=prod&deployment=web')).toEqual([]);
     });
 
-    test('reads a ConfigMap staging and prod shared before, by recorded deployment', async () => {
-      const shared = logsConfigMap('acme', 'di-tenant-acme', 'platform', 'web', ring, failures);
-      const { envs: _envs, ...data } = shared.data as Record<string, string>;
-      listed = { metadata: { resourceVersion: '7' }, items: [{ ...shared, data }] };
-      expect(await logsOf('env=prod')).toEqual(PROD);
-      expect(await logsOf('env=staging&deployment=web-staging')).toEqual(STAGING);
-    });
-
     /** The ConfigMap staging and prod shared before #106, as written before data.envs. */
     const legacy = () => {
       const shared = logsConfigMap('acme', 'di-tenant-acme', 'platform', 'web', ring, failures);
       const { envs: _envs, ...data } = shared.data as Record<string, string>;
       return { ...shared, data };
     };
+
+    test('reads a ConfigMap staging and prod shared before, by recorded deployment', async () => {
+      listed = { metadata: { resourceVersion: '7' }, items: [legacy()] };
+      expect(await logsOf('env=prod')).toEqual(PROD);
+      expect(await logsOf('env=staging&deployment=web-staging')).toEqual(STAGING);
+    });
 
     test('serves each line once while the shared ConfigMap is migrated (#316)', async () => {
       // Staging was copied out; prod's copy was refused, so the shared ConfigMap stays.
@@ -794,27 +792,22 @@ test('logEvents falls back to data.failures for lines without a recorded deploym
   expect(deploymentsOf(JSON.stringify(['web-v1']))).toEqual(['web', 'web-v2', 'web']);
 });
 
-test('a line the projection moves to a per-env ConfigMap is served once (#106)', async () => {
-  // A /v1 service web and a CLI workload web, with the ConfigMap they shared before #106.
+/**
+ * A tenant namespace for the platform's log projection: its ConfigMaps (starting with the one
+ * a /v1 service's envs shared before #106, written before data.envs existed), `workloads` as its
+ * WorkloadDeployments, and no host pods. A PATCH of a ConfigMap named in `refused` fails, as at
+ * the ConfigMap quota.
+ */
+function projectionTenant(
+  shared: RingLine[],
+  workloads: { name: string; labels: Record<string, string> }[],
+  refused = new Set<string>(),
+) {
   const namespace = 'di-tenant-alpha';
   const configMaps = new Map<string, Resource>();
-  const shared = logsConfigMap('alpha', namespace, 'test', 'web', [
-    { line: '2026-10-01T10:00:01.000000Z INFO prod up', deployment: 'web-prod' },
-    { line: '2026-10-01T10:00:02.000000Z INFO cli up', deployment: 'web' },
-  ]);
-  // Written before data.envs existed.
-  const { envs: _envs, ...data } = shared.data as Record<string, string>;
-  configMaps.set('di-logs-web', { ...shared, data });
-  const workloads = [
-    {
-      name: 'web-prod',
-      labels: {
-        'di-framework.dev/application': 'web',
-        'platform.di-framework.dev/env': 'prod',
-      },
-    },
-    { name: 'web', labels: { 'di-framework.dev/application': 'web' } },
-  ];
+  const legacy = logsConfigMap('alpha', namespace, 'test', 'web', shared);
+  const { envs: _envs, ...data } = legacy.data as Record<string, string>;
+  configMaps.set('di-logs-web', { ...legacy, data });
   const cms = collection('v1', 'ConfigMap', namespace);
   const api = {
     async call<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -824,61 +817,7 @@ test('a line the projection moves to a per-env ConfigMap is served once (#106)',
         return { items: workloads.map((metadata) => ({ metadata })) } as T;
       if (url.pathname === cms) return { items: [...configMaps.values()] } as T;
       const name = decodeURIComponent(url.pathname.slice(cms.length + 1));
-      if (method === 'PATCH') configMaps.set(name, structuredClone(body) as Resource);
-      else if (method === 'DELETE') configMaps.delete(name);
-      else if (!configMaps.has(name)) throw new ApiError(404, 'Not found');
-      return structuredClone(configMaps.get(name)) as T;
-    },
-  };
-  const served = () =>
-    [...configMaps.values()]
-      .flatMap((cm) => logEvents(cm as never))
-      .filter((e) => e.env === undefined || e.env === 'prod')
-      .map((e) => e.message);
-  expect(served()).toEqual(['prod up']);
-  await new PlatformController(api, {
-    installation: 'test',
-    namespace: 'wasmcloud',
-    hostImage: 'wash:test',
-    schedulerNatsUrl: 'nats://nats:4222',
-  }).projectLogs({
-    apiVersion: 'platform.di-framework.dev/v1alpha1',
-    kind: 'Tenant',
-    metadata: { name: 'alpha', uid: 'alpha-uid', labels: {} },
-    spec: {},
-  } as Tenant);
-  // Both ConfigMaps match the endpoint's selector; the prod line is in one of them only.
-  expect([...configMaps.keys()].sort()).toEqual(['di-logs-web', 'di-logs-web.prod']);
-  expect(served()).toEqual(['prod up']);
-});
-
-test('a partial migration serves every line once, before and after the retry (#316)', async () => {
-  const namespace = 'di-tenant-alpha';
-  const configMaps = new Map<string, Resource>();
-  const shared = logsConfigMap('alpha', namespace, 'test', 'web', [
-    { line: '2026-10-01T10:00:01.000000Z INFO prod up', deployment: 'web-prod' },
-    { line: '2026-10-01T10:00:02.000000Z INFO staging up', deployment: 'web-staging' },
-    { line: '2026-10-01T10:00:03.000000Z INFO prod again', deployment: 'web-prod' },
-  ]);
-  // Written before data.envs existed.
-  const { envs: _envs, ...data } = shared.data as Record<string, string>;
-  configMaps.set('di-logs-web', { ...shared, data });
-  const v1 = (env: string) => ({
-    name: `web-${env}`,
-    labels: { 'di-framework.dev/application': 'web', 'platform.di-framework.dev/env': env },
-  });
-  const cms = collection('v1', 'ConfigMap', namespace);
-  /** The per-env prod ConfigMap is refused (e.g. at the ConfigMap quota) while this is set. */
-  let refuseProd = true;
-  const api = {
-    async call<T>(method: string, path: string, body?: unknown): Promise<T> {
-      const url = new URL(path, 'https://kubernetes');
-      if (url.pathname.endsWith('/pods')) return { items: [] } as T;
-      if (url.pathname.endsWith('/workloaddeployments'))
-        return { items: [v1('prod'), v1('staging')].map((metadata) => ({ metadata })) } as T;
-      if (url.pathname === cms) return { items: [...configMaps.values()] } as T;
-      const name = decodeURIComponent(url.pathname.slice(cms.length + 1));
-      if (method === 'PATCH' && name === 'di-logs-web.prod' && refuseProd)
+      if (method === 'PATCH' && refused.has(name))
         throw new ApiError(403, 'exceeded quota: count/configmaps');
       if (method === 'PATCH') configMaps.set(name, structuredClone(body) as Resource);
       else if (method === 'DELETE') configMaps.delete(name);
@@ -898,6 +837,48 @@ test('a partial migration serves every line once, before and after the retry (#3
       metadata: { name: 'alpha', uid: 'alpha-uid', labels: {} },
       spec: {},
     } as Tenant);
+  return { configMaps, project };
+}
+
+/** The WorkloadDeployment `/v1/deploy` renders for service web in `env`. */
+const webIn = (env: string) => ({
+  name: `web-${env}`,
+  labels: { 'di-framework.dev/application': 'web', 'platform.di-framework.dev/env': env },
+});
+
+test('a line the projection moves to a per-env ConfigMap is served once (#106)', async () => {
+  // A /v1 service web and a CLI workload web, with the ConfigMap they shared before #106.
+  const { configMaps, project } = projectionTenant(
+    [
+      { line: '2026-10-01T10:00:01.000000Z INFO prod up', deployment: 'web-prod' },
+      { line: '2026-10-01T10:00:02.000000Z INFO cli up', deployment: 'web' },
+    ],
+    [webIn('prod'), { name: 'web', labels: { 'di-framework.dev/application': 'web' } }],
+  );
+  const served = () =>
+    [...configMaps.values()]
+      .flatMap((cm) => logEvents(cm as never))
+      .filter((e) => e.env === undefined || e.env === 'prod')
+      .map((e) => e.message);
+  expect(served()).toEqual(['prod up']);
+  await project();
+  // Both ConfigMaps match the endpoint's selector; the prod line is in one of them only.
+  expect([...configMaps.keys()].sort()).toEqual(['di-logs-web', 'di-logs-web.prod']);
+  expect(served()).toEqual(['prod up']);
+});
+
+test('a partial migration serves every line once, before and after the retry (#316)', async () => {
+  // The per-env prod ConfigMap is refused (e.g. at the ConfigMap quota) at first.
+  const refused = new Set(['di-logs-web.prod']);
+  const { configMaps, project } = projectionTenant(
+    [
+      { line: '2026-10-01T10:00:01.000000Z INFO prod up', deployment: 'web-prod' },
+      { line: '2026-10-01T10:00:02.000000Z INFO staging up', deployment: 'web-staging' },
+      { line: '2026-10-01T10:00:03.000000Z INFO prod again', deployment: 'web-prod' },
+    ],
+    [webIn('prod'), webIn('staging')],
+    refused,
+  );
   const served = (env: string) =>
     listEvents({ items: [...configMaps.values()] as never })
       .filter((e) => e.env === undefined || e.env === env)
@@ -912,7 +893,7 @@ test('a partial migration serves every line once, before and after the retry (#3
   expect([...configMaps.keys()].sort()).toEqual(['di-logs-web', 'di-logs-web.staging']);
   expect(served('staging')).toEqual(['staging up']);
   expect(served('prod')).toEqual(['prod up', 'prod again']);
-  refuseProd = false;
+  refused.clear();
   await project();
   expect([...configMaps.keys()].sort()).toEqual(['di-logs-web.prod', 'di-logs-web.staging']);
   expect(served('staging')).toEqual(['staging up']);

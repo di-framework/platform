@@ -531,12 +531,12 @@ export function newestStamp(ring: readonly (string | RingLine)[]): string {
 
 /**
  * The incoming lines the ring does not hold yet (#316). A write the API applied but reported
- * as failed (e.g. a timeout) is retried with the same lines; those are dropped here, so a
- * retry never publishes a line twice. A line is identified by its text, which starts with
- * its sub-second timestamp, and its deployment; a ring line without a recorded deployment
- * (published before deployments were recorded) matches its text alone. Once the ring is full, a line older than its
- * oldest line is dropped too: the applied write may have evicted it already, and appending it
- * again would push newer lines out.
+ * as failed (e.g. a timeout) is retried with the same lines; those are dropped here, so a retry
+ * never publishes a line twice. A line is identified by its text, which starts with its
+ * sub-second timestamp, and its deployment; a ring line without a recorded deployment
+ * (published before deployments were recorded) matches its text alone. Once the ring is full,
+ * a line older than its oldest line is dropped too: the applied write may have evicted it
+ * already, and appending it again would push newer lines out.
  */
 export function unpublished(
   ring: readonly RingLine[],
@@ -546,13 +546,9 @@ export function unpublished(
   const id = (entry: RingLine) => `${entry.deployment}\n${entry.line}`;
   const stamp = (entry: RingLine) => entry.line.split(' ')[0] as string;
   const published = new Set(ring.map((entry) => (entry.deployment ? id(entry) : entry.line)));
-  const oldest =
-    ring.length >= max
-      ? ring.reduce(
-          (min, entry) => (stamp(entry) < min ? stamp(entry) : min),
-          stamp(ring[0] as RingLine),
-        )
-      : '';
+  let oldest = '';
+  if (ring.length >= max)
+    oldest = ring.map(stamp).reduce((min, value) => (value < min ? value : min));
   return incoming.filter(
     (entry) => !published.has(id(entry)) && !published.has(entry.line) && stamp(entry) >= oldest,
   );
@@ -578,7 +574,7 @@ export function logWriteCondition(
 ): Condition | undefined {
   const persistent = [...(failures ?? [])]
     .filter(([, failure]) => failure.count >= LOG_WRITE_FAILURES_REPORTED)
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    .sort(([a], [b]) => a.localeCompare(b));
   const [first] = persistent;
   if (!first) return undefined;
   const [name, failure] = first;

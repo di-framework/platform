@@ -1713,6 +1713,36 @@ describe('projection cursor and write failures (#316)', () => {
         logWriteFailures: Map<string, Map<string, { count: number; message: string }>>;
       }
     ).logWriteFailures.get('alpha');
+  /** Runs `body` with console.error silenced, and returns how often it was called. */
+  const quietly = async (body: () => Promise<void>): Promise<number> => {
+    const errors = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await body();
+      return errors.mock.calls.length;
+    } finally {
+      errors.mockRestore();
+    }
+  };
+  /** The API stores the first ConfigMap PATCH, then its response is lost (e.g. a timeout). */
+  const loseFirstPatch = (api: LogApi) => {
+    const call = api.call.bind(api);
+    let lose = true;
+    return spyOn(api, 'call').mockImplementation(async (method, path, body) => {
+      const result = await call(method, path, body);
+      if (method === 'PATCH' && lose) {
+        lose = false;
+        throw new Error('timed out');
+      }
+      return result as never;
+    });
+  };
+  /** Both host pods running. */
+  const twoPods = (api: LogApi) => {
+    api.pods = [
+      { metadata: { name: 'host-0', uid: 'pod-0' }, status: { phase: 'Running' } },
+      { metadata: { name: 'host-1', uid: 'pod-1' }, status: { phase: 'Running' } },
+    ];
+  };
 
   it('retries the lines of a failed write on the next poll, once', async () => {
     const api = new LogApi();
@@ -1727,15 +1757,12 @@ describe('projection cursor and write failures (#316)', () => {
       'host-0',
       [mesh('one', 1), mesh('two', 2), hostLine('hi', { name: 'greeter', at: at(3) })].join('\n'),
     );
-    const errors = spyOn(console, 'error').mockImplementation(() => {});
-    try {
+    const logged = await quietly(async () => {
       await controller.projectLogs(tenant());
       await controller.projectLogs(tenant());
-      // Logged once while the failure does not change.
-      expect(errors).toHaveBeenCalledTimes(1);
-    } finally {
-      errors.mockRestore();
-    }
+    });
+    // Logged once while the failure does not change.
+    expect(logged).toBe(1);
     expect(linesOf(api, 'di-logs-mesh')).toBe(published('one', 1));
     expect(linesOf(api, 'di-logs-greeter')).toBe(published('hi', 3));
     // The read starts from the held cursor, bounded while a write keeps failing.
@@ -1773,12 +1800,7 @@ describe('projection cursor and write failures (#316)', () => {
     const controller = new Controller(api, cfg);
     api.refused.add('PATCH di-logs-mesh');
     api.logs.set('host-0', mesh('one', 1));
-    const errors = spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      await controller.projectLogs(tenant());
-    } finally {
-      errors.mockRestore();
-    }
+    await quietly(() => controller.projectLogs(tenant()));
     expect(api.configMaps.has('di-logs-mesh')).toBe(false);
     api.refused.clear();
     api.logs.set('host-0', [mesh('one', 1), mesh('two', 2)].join('\n'));
@@ -1796,25 +1818,16 @@ describe('projection cursor and write failures (#316)', () => {
     const controller = new Controller(api, cfg);
     api.logs.set('host-0', mesh('one', 1));
     // The API stores the ConfigMap, then the response is lost.
-    const call = api.call.bind(api);
-    let lose = true;
-    const lost = spyOn(api, 'call').mockImplementation(async (method, path, body) => {
-      const result = await call(method, path, body);
-      if (method === 'PATCH' && lose) {
-        lose = false;
-        throw new Error('timed out');
-      }
-      return result as never;
-    });
-    const errors = spyOn(console, 'error').mockImplementation(() => {});
+    const lost = loseFirstPatch(api);
     try {
-      await controller.projectLogs(tenant());
-      expect(linesOf(api, 'di-logs-mesh')).toBe(published('one', 1));
-      api.logs.set('host-0', [mesh('one', 1), mesh('two', 2)].join('\n'));
-      await controller.projectLogs(tenant());
+      await quietly(async () => {
+        await controller.projectLogs(tenant());
+        expect(linesOf(api, 'di-logs-mesh')).toBe(published('one', 1));
+        api.logs.set('host-0', [mesh('one', 1), mesh('two', 2)].join('\n'));
+        await controller.projectLogs(tenant());
+      });
     } finally {
       lost.mockRestore();
-      errors.mockRestore();
     }
     expect(linesOf(api, 'di-logs-mesh').split('\n')).toEqual([
       published('one', 1),
@@ -1832,12 +1845,7 @@ describe('projection cursor and write failures (#316)', () => {
       }),
     );
     api.logs.set('host-0', flood.join('\n'));
-    const errors = spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      await controller.projectLogs(tenant());
-    } finally {
-      errors.mockRestore();
-    }
+    await quietly(() => controller.projectLogs(tenant()));
     api.refused.clear();
     await controller.projectLogs(tenant());
     const lines = linesOf(api, 'di-logs-mesh').split('\n');
@@ -1858,30 +1866,21 @@ describe('projection cursor and write failures (#316)', () => {
     );
     api.logs.set('host-0', batch.join('\n'));
     // The API stores the full batch (the ring keeps lines 50-249), then the response is lost.
-    const call = api.call.bind(api);
-    let lose = true;
-    const lost = spyOn(api, 'call').mockImplementation(async (method, path, body) => {
-      const result = await call(method, path, body);
-      if (method === 'PATCH' && lose) {
-        lose = false;
-        throw new Error('timed out');
-      }
-      return result as never;
-    });
-    const errors = spyOn(console, 'error').mockImplementation(() => {});
+    const lost = loseFirstPatch(api);
     try {
-      await controller.projectLogs(tenant());
-      const applied = linesOf(api, 'di-logs-mesh');
-      expect(applied.split('\n')[0]).toEndWith('line 50');
-      // The retry reads the same batch; nothing changes, and lines 0-49 do not come back.
-      await controller.projectLogs(tenant());
-      expect(linesOf(api, 'di-logs-mesh')).toBe(applied);
-      // A newer line still pushes out the oldest one.
-      api.logs.set('host-0', [...batch, hostLine('newest', { at: tick(2, 0) })].join('\n'));
-      await controller.projectLogs(tenant());
+      await quietly(async () => {
+        await controller.projectLogs(tenant());
+        const applied = linesOf(api, 'di-logs-mesh');
+        expect(applied.split('\n')[0]).toEndWith('line 50');
+        // The retry reads the same batch; nothing changes, and lines 0-49 do not come back.
+        await controller.projectLogs(tenant());
+        expect(linesOf(api, 'di-logs-mesh')).toBe(applied);
+        // A newer line still pushes out the oldest one.
+        api.logs.set('host-0', [...batch, hostLine('newest', { at: tick(2, 0) })].join('\n'));
+        await controller.projectLogs(tenant());
+      });
     } finally {
       lost.mockRestore();
-      errors.mockRestore();
     }
     const lines = linesOf(api, 'di-logs-mesh').split('\n');
     expect(lines).toEqual([
@@ -1892,10 +1891,7 @@ describe('projection cursor and write failures (#316)', () => {
 
   it('resumes after the newest stored line when pods logged out of order (#335)', async () => {
     const api = new LogApi();
-    api.pods = [
-      { metadata: { name: 'host-0', uid: 'pod-0' }, status: { phase: 'Running' } },
-      { metadata: { name: 'host-1', uid: 'pod-1' }, status: { phase: 'Running' } },
-    ];
+    twoPods(api);
     const controller = new Controller(api, cfg);
     // Both pods publish (so each has a cursor), host-1 adds an older line, then host-0 fills the
     // ring at :06.
@@ -1939,10 +1935,7 @@ describe('projection cursor and write failures (#316)', () => {
 
   it('keeps distinct lines that share the floor timestamp, from two pods and one', async () => {
     const api = new LogApi();
-    api.pods = [
-      { metadata: { name: 'host-0', uid: 'pod-0' }, status: { phase: 'Running' } },
-      { metadata: { name: 'host-1', uid: 'pod-1' }, status: { phase: 'Running' } },
-    ];
+    twoPods(api);
     api.logs.set('host-0', mesh('zero', 5));
     api.logs.set('host-1', '');
     await new Controller(api, cfg).projectLogs(tenant());
@@ -1969,15 +1962,12 @@ describe('projection cursor and write failures (#316)', () => {
     const controller = new Controller(api, cfg);
     api.refused.add('PATCH di-logs-mesh');
     api.logs.set('host-0', mesh('one', 1));
-    const errors = spyOn(console, 'error').mockImplementation(() => {});
-    try {
+    await quietly(async () => {
       await controller.projectLogs(tenant());
       await controller.projectLogs(tenant());
       expect(logWriteCondition(failuresOf(controller), 1)).toBeUndefined();
       await controller.projectLogs(tenant());
-    } finally {
-      errors.mockRestore();
-    }
+    });
     expect(logWriteCondition(failuresOf(controller), 1)).toMatchObject({
       type: 'LogsProjected',
       status: 'False',
