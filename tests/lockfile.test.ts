@@ -251,7 +251,7 @@ describe('the workflows keep bun.lock in step with the release bump', () => {
   type Workflow = { jobs: Record<string, { steps: Step[] }> };
   const parse = (file: string) =>
     Bun.YAML.parse(readFileSync(join(repo, '.github/workflows', file), 'utf8')) as Workflow;
-  const steps = parse('auto-tag.yml').jobs.tag?.steps ?? [];
+  const steps = parse('auto-tag.yml').jobs['release-pr']?.steps ?? [];
   const ciSteps = Object.values(parse('ci.yml').jobs).flatMap((job) => job.steps);
   const isSetupBun = (s: Step) => s.uses?.startsWith('oven-sh/setup-bun@') ?? false;
 

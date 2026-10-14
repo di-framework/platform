@@ -1,5 +1,20 @@
 name: Auto Tag
 
+# Two jobs, so no run waits for the release PR to merge (#214):
+#   tag         tags the merge commit of a release PR and dispatches release.yml. It runs when a
+#               release/v* PR is merged, and before release-pr in every other run, so a release
+#               whose merge fired no event is tagged by the next run. Idempotent: when the tag for
+#               the version on main already exists, it does nothing.
+#   release-pr  bumps the version, updates bun.lock, opens the release PR and enables
+#               auto-merge, then exits.
+#
+# A tag pushed with GITHUB_TOKEN does not fire release.yml's `push: tags` trigger, so the tag
+# job dispatches release.yml with `gh workflow run --ref v<version>` (workflow_dispatch is the
+# exception to the GITHUB_TOKEN rule). release.yml then runs on the tag ref.
+#
+# A merge done by auto-merge that GITHUB_TOKEN enabled fires no `push` event on main, and its
+# `pull_request` run can wait for approval like the PR's own checks. Either way the release is
+# tagged by the tag job of the next run: the next lockfile push to main, or a dispatch.
 
 on:
   push:
@@ -9,6 +24,11 @@ on:
       - "package-lock.json"
       - "yarn.lock"
       - "pnpm-lock.yaml"
+  pull_request:
+    types: [closed]
+    branches: [main]
+    paths:
+      - "package.json"
   workflow_dispatch:
     inputs:
       bump:
@@ -17,22 +37,136 @@ on:
         options: [patch, minor, major]
         default: patch
 
-concurrency:
-  group: auto-tag
-  cancel-in-progress: false
-
-permissions:
-  contents: write
-  actions: write
-  pull-requests: write
+permissions: {}
 
 jobs:
   tag:
-    name: Bump version and tag
+    name: Tag the merged release
     runs-on: ubuntu-latest
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      !startsWith(github.event.head_commit.message, 'chore(release):')
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'release/v') &&
+      github.event.pull_request.head.repo.full_name == github.repository)
+    concurrency:
+      group: auto-tag-tag
+      cancel-in-progress: false
+    permissions:
+      contents: write # push the tag
+      actions: write # dispatch release.yml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Find the release commit
+        id: release
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin main
+
+          version_at() {
+            git show "$1:package.json" | node -e 'let s="";process.stdin.on("data",(d)=>{s+=d}).on("end",()=>console.log(JSON.parse(s).version||""))'
+          }
+
+          if [ "$EVENT" = "pull_request" ]; then
+            VERSION="${HEAD_REF#release/v}"
+            COMMIT="$MERGE_SHA"
+            if ! git merge-base --is-ancestor "$COMMIT" origin/main; then
+              echo "::error::merge commit $COMMIT of $HEAD_REF is not on main"
+              exit 1
+            fi
+            AT=$(version_at "$COMMIT")
+            if [ "$AT" != "$VERSION" ]; then
+              echo "::error::$HEAD_REF merged as $COMMIT, but its package.json version is '$AT'"
+              exit 1
+            fi
+          else
+            VERSION=$(version_at origin/main)
+            if [ -z "$VERSION" ]; then
+              echo "::error::could not read version from package.json on main"
+              exit 1
+            fi
+            # The newest first-parent commit on main whose subject is this version's release
+            # commit. Squash merges append " (#N)".
+            LOG=$(git log origin/main --first-parent --format='%H%x09%s')
+            COMMIT=$(printf '%s\n' "$LOG" | awk -F '\t' -v want="chore(release): v$VERSION" \
+              '!found && ($2 == want || index($2, want " ") == 1) { print $1; found = 1 }')
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            TAGGED=$(git rev-parse "v$VERSION^{commit}")
+            if [ -n "$COMMIT" ] && [ "$TAGGED" != "$COMMIT" ]; then
+              echo "::warning::tag v$VERSION already exists at $TAGGED, not at release commit $COMMIT"
+            fi
+            echo "Tag v$VERSION already exists; nothing to do."
+            echo "tag=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$COMMIT" ]; then
+            echo "::notice::v$VERSION on main did not come from a release PR; nothing to tag."
+            echo "tag=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "tag=true" >> "$GITHUB_OUTPUT"
+          echo "Release v$VERSION is $COMMIT"
+
+      - name: Tag the release commit and dispatch Release
+        if: steps.release.outputs.tag == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "v$VERSION" -m "Release v$VERSION" "$COMMIT"
+          if ! git push origin "refs/tags/v$VERSION"; then
+            # Another run pushed it first, and that run dispatches Release.
+            if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+              echo "Tag v$VERSION was pushed by another run; nothing to do."
+              exit 0
+            fi
+            echo "::error::could not push tag v$VERSION"
+            exit 1
+          fi
+          echo "Tagged $COMMIT as v$VERSION"
+
+          # GITHUB_TOKEN tag pushes do not fire `on: push: tags`; workflow_dispatch does.
+          gh workflow run release.yml --ref "v$VERSION"
+
+          echo "### Released \`v$VERSION\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tagged \`$COMMIT\` and dispatched the Release workflow." >> "$GITHUB_STEP_SUMMARY"
+
+  release-pr:
+    name: Bump version and open the release PR
+    runs-on: ubuntu-latest
+    needs: tag
+    # After tag, so a release merged without an event is tagged before the next bump.
+    if: >-
+      !cancelled() && needs.tag.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+      !startsWith(github.event.head_commit.message, 'chore(release):')))
+    concurrency:
+      group: auto-tag
+      cancel-in-progress: false
+    permissions:
+      contents: write # push the release branch
+      pull-requests: write # open the PR and enable auto-merge
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -147,7 +281,7 @@ jobs:
                 "(\`mx build --sync-versions\`, packed-manifest audit, and" \
                 "\`npm publish --dry-run\`) before merge." \
                 "" \
-                "After merge, Auto Tag will create tag \`v$NEXT\` and dispatch the Release workflow.")" \
+                "On merge, Auto Tag's tag job tags the merge commit \`v$NEXT\` and dispatches the Release workflow.")" \
               --base main \
               --head "$BRANCH"
             PR=$(gh pr view "$BRANCH" --json number --jq .number)
@@ -164,55 +298,4 @@ jobs:
 
           echo "### Release PR" >> "$GITHUB_STEP_SUMMARY"
           echo "Opened/updated PR #$PR for \`v$NEXT\`." >> "$GITHUB_STEP_SUMMARY"
-          echo "Waiting for required checks, then auto-merge." >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Wait for PR merge
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ steps.pr.outputs.number }}
-          NEXT: ${{ steps.version.outputs.next }}
-        run: |
-          set -euo pipefail
-          # Up to ~30 minutes for Test + CodeQL
-          for i in $(seq 1 90); do
-            STATE=$(gh pr view "$PR" --json state,mergedAt --jq '{state,mergedAt}')
-            MERGED=$(echo "$STATE" | jq -r '.mergedAt // empty')
-            OPEN=$(echo "$STATE" | jq -r '.state')
-            if [ -n "$MERGED" ]; then
-              echo "PR #$PR merged at $MERGED"
-              exit 0
-            fi
-            if [ "$OPEN" = "CLOSED" ]; then
-              echo "::error::PR #$PR was closed without merging"
-              exit 1
-            fi
-            echo "Waiting for merge ($i/90)..."
-            sleep 20
-          done
-          echo "::error::Timed out waiting for PR #$PR to merge"
-          exit 1
-
-      - name: Tag merge commit and dispatch Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NEXT: ${{ steps.version.outputs.next }}
-          CURRENT: ${{ steps.version.outputs.current }}
-        run: |
-          set -euo pipefail
-          git fetch origin main
-          git checkout main
-          git reset --hard origin/main
-
-          if git rev-parse -q --verify "refs/tags/v$NEXT" >/dev/null; then
-            echo "Tag v$NEXT already exists"
-          else
-            git tag -a "v$NEXT" -m "Release v$NEXT"
-            git push origin "v$NEXT"
-            echo "Tagged v$NEXT"
-          fi
-
-          # GITHUB_TOKEN tag pushes do not fire `on: push: tags`
-          gh workflow run release.yml --ref "v${NEXT}"
-
-          echo "### Released \`v$NEXT\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Bumped from \`$CURRENT\`. Release workflow dispatched." >> "$GITHUB_STEP_SUMMARY"
+          echo "Auto-merges after the required checks pass; the tag job tags the merge." >> "$GITHUB_STEP_SUMMARY"
