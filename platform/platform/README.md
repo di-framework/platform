@@ -881,7 +881,10 @@ tenantAuth:
       backoff, for at most `TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS` (default 30 s). Any answer
       from the registry itself, a `404 BLOB_UNKNOWN` included, is returned at once, and the public
       front never waits. The wait delays only that one pull, so nothing blocks the host that serves
-      the registry.
+      the registry. A waiting pull gives its pool slot back between attempts, so pulls waiting out
+      a host restart do not turn the others away; one that finds no free slot before its wait is
+      over is answered `503`. Each attempt gets the full upstream header timeout, so the wait is
+      not cut short by it.
     - Framing (#197): the front and the pull listener run on `node:http`, which writes the
       registry's `Content-Length` on a blob `GET` as is; `Bun.serve` re-framed every streamed body
       as chunked, and oras then stalled behind the unread body over `kubectl port-forward`. A `HEAD`

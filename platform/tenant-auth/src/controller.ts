@@ -142,6 +142,73 @@ export function registryNotServing(response: Response): boolean {
   return [404, 502, 503].includes(response.status) && !response.headers.has('content-type');
 }
 
+/** A slot of a registry request pool; both calls are idempotent. */
+interface PoolSlot {
+  /** Takes the slot; false when the pool is full. */
+  acquire(): boolean;
+  release(): void;
+}
+
+function poolSlot(pool: { inFlight: number }, max: number): PoolSlot {
+  let held = false;
+  return {
+    acquire() {
+      if (held) return true;
+      if (pool.inFlight >= max) return false;
+      pool.inFlight++;
+      held = true;
+      return true;
+    },
+    release() {
+      if (!held) return;
+      held = false;
+      pool.inFlight--;
+    },
+  };
+}
+
+function registryBusy(): Response {
+  return problem(503, 'Service Unavailable', 'the tenant registry is busy; retry shortly');
+}
+
+/** One host pull attempt: the answer, or the connection failure (an abort is rethrown). */
+async function attemptPull(
+  send: () => Promise<Response>,
+  signal: AbortSignal,
+): Promise<{ response?: Response; failure?: unknown }> {
+  try {
+    return { response: await send() };
+  } catch (error) {
+    if (signal.aborted) throw error;
+    return { failure: error };
+  }
+}
+
+/** The last attempt's answer, or its failure once the wait is over. */
+function settle(outcome: { response?: Response; failure?: unknown }): Response {
+  if (outcome.response) return outcome.response;
+  throw outcome.failure;
+}
+
+/**
+ * Pauses `delay`, doubling it each time, until a slot is free again; returns the next delay, or
+ * undefined when none frees up before `deadline`.
+ */
+async function pauseForSlot(
+  delay: number,
+  deadline: number,
+  signal: AbortSignal,
+  slot: PoolSlot,
+): Promise<number | undefined> {
+  let next = delay;
+  for (;;) {
+    await pause(next, signal);
+    next = Math.min(next * 2, REGISTRY_PULL_RETRY_MAX_MS);
+    if (slot.acquire()) return next;
+    if (Date.now() + next > deadline) return undefined;
+  }
+}
+
 /** Resolves after `ms`, or rejects with the signal's reason once it aborts. */
 function pause(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -936,15 +1003,9 @@ export class Controller {
       await request.body?.cancel().catch(() => {});
       return registryChallenge();
     }
-    if (pool.inFlight >= this.config.registryMaxConcurrent)
-      return problem(503, 'Service Unavailable', 'the tenant registry is busy; retry shortly');
-    pool.inFlight++;
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      pool.inFlight--;
-    };
+    const slot = poolSlot(pool, this.config.registryMaxConcurrent);
+    if (!slot.acquire()) return registryBusy();
+    const release = slot.release;
     const headers = upstreamRequestHeaders(
       request,
       url,
@@ -971,7 +1032,7 @@ export class Controller {
             done: armHeaderTimer,
           })
         : null;
-    if (!body) armHeaderTimer();
+    if (!body && withBody) armHeaderTimer();
     const signal = AbortSignal.any([request.signal, timeout.signal, stall.signal]);
     const send = () =>
       fetch(`${this.proxyUpstream(this.config.tenant)}${url.pathname}${url.search}`, {
@@ -986,7 +1047,22 @@ export class Controller {
     let upstream: Response;
     try {
       // A host pull carries no body, so it can be resent while the registry is starting (#197).
-      upstream = withBody ? await send() : await this.untilRegistryAnswers(send, signal, url);
+      // Each attempt gets the full header timeout, so the wait is bounded only by
+      // `registryPullWaitMs` and never ends in a 504 while the host keeps answering.
+      const attempt = async () => {
+        armHeaderTimer();
+        try {
+          return await send();
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      const answer = withBody
+        ? await send()
+        : await this.untilRegistryAnswers(attempt, signal, url, slot);
+      // No slot came free for a waiting pull before its wait was over (it holds none).
+      if (!answer) return registryBusy();
+      upstream = answer;
     } catch (error) {
       release();
       const timedOut = timeout.signal.aborted;
@@ -1032,42 +1108,36 @@ export class Controller {
    * 404 wash gives a `Host` no workload serves yet. Both are retried with a short backoff; any
    * answer from the registry itself (its errors are OCI JSON) is final. The wait is bounded and
    * only delays this one pull, so a host that serves the registry is never held back by it.
+   *
+   * The pool slot is given back between attempts, so pulls waiting out a host restart do not
+   * turn away the other pulls; an attempt takes a slot again first, and a pull that finds none
+   * free before the wait is over gets undefined (answered as busy).
    */
   private async untilRegistryAnswers(
     send: () => Promise<Response>,
     signal: AbortSignal,
     url: URL,
-  ): Promise<Response> {
+    slot: PoolSlot,
+  ): Promise<Response | undefined> {
     const deadline = Date.now() + this.config.registryPullWaitMs;
     let delay = REGISTRY_PULL_RETRY_INITIAL_MS;
-    let waiting = false;
-    for (;;) {
-      let response: Response | undefined;
-      let failure: unknown;
-      try {
-        response = await send();
-      } catch (error) {
-        if (signal.aborted) throw error;
-        failure = error;
-      }
-      if (response && !registryNotServing(response)) return response;
-      if (Date.now() + delay > deadline) {
-        if (response) return response;
-        throw failure;
-      }
-      await response?.body?.cancel().catch(() => {});
-      if (!waiting) {
-        waiting = true;
+    for (let tries = 0; ; tries++) {
+      const outcome = await attemptPull(send, signal);
+      if (outcome.response && !registryNotServing(outcome.response)) return outcome.response;
+      if (Date.now() + delay > deadline) return settle(outcome);
+      await outcome.response?.body?.cancel().catch(() => {});
+      if (tries === 0)
         this.audit('registry.waiting', {
           path: url.pathname,
           listener: 'registry-pull',
-          reason: response
-            ? `the host answered ${response.status} before the registry was serving`
-            : String(failure),
+          reason: outcome.response
+            ? `the host answered ${outcome.response.status} before the registry was serving`
+            : String(outcome.failure),
         });
-      }
-      await pause(delay, signal);
-      delay = Math.min(delay * 2, REGISTRY_PULL_RETRY_MAX_MS);
+      slot.release();
+      const next = await pauseForSlot(delay, deadline, signal, slot);
+      if (next === undefined) return undefined;
+      delay = next;
     }
   }
 

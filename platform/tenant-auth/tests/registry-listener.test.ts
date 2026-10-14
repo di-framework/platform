@@ -16,7 +16,11 @@ import {
   REGISTRY_IDLE_TIMEOUT_SECONDS,
   REGISTRY_PULL_MAX_BODY_BYTES,
 } from '../src/controller.ts';
-import { type RegistryListener, serveRegistryListener } from '../src/registry-listener.ts';
+import {
+  type RegistryListener,
+  requestUrl,
+  serveRegistryListener,
+} from '../src/registry-listener.ts';
 
 /**
  * The registry front and the hosts' pull listener as they run (#197): `Controller` handlers behind
@@ -28,12 +32,14 @@ describe('registry listener keeps the registry Content-Length (#197)', () => {
   const DIGEST = `sha256:${createHash('sha256').update(BLOB).digest('hex')}`;
   const BLOB_PATH = `/v2/acme/app/blobs/${DIGEST}`;
   /** Last request the upstream saw, and whether it was aborted before its response finished. */
-  const seen: { headers?: IncomingHttpHeaders; aborted?: boolean } = {};
+  const seen: { headers?: IncomingHttpHeaders; url?: string; aborted?: boolean } = {};
+  const seenUrl = () => seen.url;
   const upstream: Server = createServer(async (req, res) => {
     // One connection per request: Bun's `node:http` server, reused by `fetch`'s pool after a
     // streamed response, now and then never ends the next chunked request body.
     res.shouldKeepAlive = false;
     seen.headers = req.headers;
+    seen.url = req.url;
     seen.aborted = false;
     res.on('close', () => {
       if (!res.writableFinished) seen.aborted = true;
@@ -172,7 +178,7 @@ describe('registry listener keeps the registry Content-Length (#197)', () => {
     expect(response.headers['content-length']).toBe(String(BLOB.length));
     expect(response.headers['transfer-encoding']).toBeUndefined();
     expect(response.headers['docker-content-digest']).toBe(DIGEST);
-    expect(response.body.length).toBe(BLOB.length);
+    expect(response.body).toHaveLength(BLOB.length);
     expect(`sha256:${createHash('sha256').update(response.body).digest('hex')}`).toBe(DIGEST);
   });
 
@@ -182,17 +188,17 @@ describe('registry listener keeps the registry Content-Length (#197)', () => {
     expect(response.headers['content-length']).toBe(String(BLOB.length));
     expect(response.headers['docker-content-length']).toBeUndefined();
     expect(response.headers['transfer-encoding']).toBeUndefined();
-    expect(response.body.length).toBe(0);
+    expect(response.body).toHaveLength(0);
   });
 
   test('the hosts pull listener keeps Content-Length on GET and HEAD too', async () => {
     const get = await send('pull', 'GET', BLOB_PATH);
     expect(get.headers['content-length']).toBe(String(BLOB.length));
     expect(get.headers['transfer-encoding']).toBeUndefined();
-    expect(get.body.length).toBe(BLOB.length);
+    expect(get.body).toHaveLength(BLOB.length);
     const head = await send('pull', 'HEAD', BLOB_PATH);
     expect(head.headers['content-length']).toBe(String(BLOB.length));
-    expect(head.body.length).toBe(0);
+    expect(head.body).toHaveLength(0);
   });
 
   test('passes the client address and the request through to the handler', async () => {
@@ -200,6 +206,130 @@ describe('registry listener keeps the registry Content-Length (#197)', () => {
     expect(seen.headers?.['x-forwarded-for']).toBe('127.0.0.1');
     expect(seen.headers?.host).toBe('registry');
     expect(seen.headers?.authorization).toBe('Basic eDpvaw==');
+  });
+
+  /** A raw request head on the pull listener; resolves with the status line and the response. */
+  const rawHead = (head: string) =>
+    new Promise<string>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      const socket = connect(pull.port, '127.0.0.1', () => socket.write(head));
+      socket.on('data', (chunk: Buffer) => chunks.push(chunk));
+      socket.on('end', () => resolve(Buffer.concat(chunks).toString('latin1')));
+      socket.on('error', reject);
+    });
+  const status = (raw: string) => Number(raw.split(' ')[1]);
+
+  test('the client Host header never changes the path the registry sees (C1/W1)', async () => {
+    for (const host of ['evil#', 'evil/v2/other/..', 'a b', 'registry.example:99999']) {
+      delete seen.url;
+      const raw = await rawHead(
+        `HEAD ${BLOB_PATH} HTTP/1.1\r\nhost: ${host}\r\nauthorization: Basic eDpvaw==\r\nconnection: close\r\n\r\n`,
+      );
+      expect(status(raw)).toBe(200);
+      expect(raw.toLowerCase()).toContain(`content-length: ${BLOB.length}`);
+      expect(seenUrl()).toBe(BLOB_PATH);
+    }
+  });
+
+  test('an absolute-form target is accepted only for the host it names', async () => {
+    delete seen.url;
+    const same = await rawHead(
+      `HEAD http://tenant-registry.svc${BLOB_PATH} HTTP/1.1\r\nhost: tenant-registry.svc\r\nauthorization: Basic eDpvaw==\r\nconnection: close\r\n\r\n`,
+    );
+    expect(status(same)).toBe(200);
+    expect(seenUrl()).toBe(BLOB_PATH);
+    delete seen.url;
+    for (const target of [
+      `http://other.example${BLOB_PATH}`,
+      `http://user:pw@tenant-registry.svc${BLOB_PATH}`,
+      `ftp://tenant-registry.svc${BLOB_PATH}`,
+      'tenant-registry.svc:80',
+      '*',
+      `${BLOB_PATH}#fragment`,
+    ]) {
+      const raw = await rawHead(
+        `GET ${target} HTTP/1.1\r\nhost: tenant-registry.svc\r\nauthorization: Basic eDpvaw==\r\nconnection: close\r\n\r\n`,
+      );
+      expect({ target, status: status(raw) }).toEqual({ target, status: 400 });
+    }
+    expect(seenUrl()).toBeUndefined();
+  });
+
+  test('an unexpected failure before the answer starts is answered 500, not dropped', async () => {
+    const listener = await serveRegistryListener({
+      hostname: '127.0.0.1',
+      port: 0,
+      idleTimeoutSeconds: 5,
+      maxRequestBodySize: 1024,
+      // Not a Response: writing it fails before any header is sent.
+      fetch: () => undefined as never,
+    });
+    try {
+      const response = await fetch(`http://127.0.0.1:${listener.port}/v2/`);
+      expect(response.status).toBe(500);
+    } finally {
+      await listener.stop();
+    }
+  });
+
+  test('response headers node refuses cancel the body (the handler frees its slot)', async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const listener = await serveRegistryListener({
+      hostname: '127.0.0.1',
+      port: 0,
+      idleTimeoutSeconds: 5,
+      maxRequestBodySize: 1024,
+      fetch: () =>
+        new Response(new ReadableStream({ cancel: () => cancelled.resolve() }), {
+          headers: { 'x-bad': 'a\u0001b' },
+        }),
+    });
+    try {
+      await expect(fetch(`http://127.0.0.1:${listener.port}/v2/`)).rejects.toBeDefined();
+      await cancelled.promise;
+    } finally {
+      await listener.stop();
+    }
+  });
+
+  test('a response body that fails partway ends the connection', async () => {
+    const listener = await serveRegistryListener({
+      hostname: '127.0.0.1',
+      port: 0,
+      idleTimeoutSeconds: 5,
+      maxRequestBodySize: 1024,
+      fetch: () =>
+        new Response(
+          new ReadableStream({
+            async pull(c) {
+              c.enqueue(new TextEncoder().encode('partial'));
+              await Bun.sleep(10);
+              c.error(new Error('upstream reset'));
+            },
+          }),
+          { headers: { 'content-length': '64' } },
+        ),
+    });
+    try {
+      const response = await fetch(`http://127.0.0.1:${listener.port}/v2/`);
+      await expect(response.text()).rejects.toBeDefined();
+    } finally {
+      await listener.stop();
+    }
+  });
+
+  test('requestUrl resolves against the listener origin', () => {
+    const at = (url: string, host?: string, hostname = '127.0.0.1', tls = false) =>
+      requestUrl(
+        { url, headers: host === undefined ? {} : { host } },
+        { hostname, tls: tls ? { cert: '', key: '' } : undefined },
+      )?.href;
+    expect(at('/v2/x?n=1', 'evil#')).toBe('http://127.0.0.1/v2/x?n=1');
+    expect(at('//other/v2/x', 'h')).toBe('http://127.0.0.1//other/v2/x');
+    expect(at('/v2/x', undefined, '::1', true)).toBe('https://[::1]/v2/x');
+    expect(at('http://H:8080/v2/x', 'h:8080')).toBe('http://127.0.0.1/v2/x');
+    expect(at('http://h/v2/x')).toBeUndefined();
+    expect(at('/v2/x', 'h', 'bad host')).toBeUndefined();
   });
 
   test('streams an upload under the cap, chunked or declared', async () => {

@@ -21,12 +21,17 @@ describe('host pulls wait for the registry', () => {
   /** Requests per path, and how many more times each path answers "no workload for this Host". */
   const hits = new Map<string, number>();
   const notYet = new Map<string, number>();
+  let hold = Promise.withResolvers<void>();
   const upstream = Bun.serve({
     hostname: '127.0.0.1',
     port: 0,
-    fetch(request) {
+    async fetch(request) {
       const { pathname } = new URL(request.url);
       hits.set(pathname, (hits.get(pathname) ?? 0) + 1);
+      if (pathname.endsWith('/hold')) {
+        await hold.promise;
+        return new Response('held', { headers: { 'content-type': 'text/plain' } });
+      }
       const left = notYet.get(pathname) ?? 0;
       // wash's answer for a `Host` no workload serves yet: an empty 404, no content-type.
       if (pathname.endsWith('/never') || left > 0) {
@@ -57,6 +62,7 @@ describe('host pulls wait for the registry', () => {
     });
   });
   afterAll(() => {
+    hold.resolve();
     log.mockRestore();
     upstream.stop(true);
   });
@@ -126,6 +132,60 @@ describe('host pulls wait for the registry', () => {
     expect(next.status).toBe(200);
   });
 
+  test('a waiting pull gives its slot back, so other pulls are not turned away (S1)', async () => {
+    const controller = make({ TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT: '1' });
+    controller.proxyUpstream = () => origin;
+    const path = '/v2/acme/slot/blobs/sha256:starting';
+    notYet.set(path, 2);
+    const waiting = controller.handleRegistryPull(pullRequest(path));
+    await Bun.sleep(100);
+    // The only slot is not held while the first pull waits.
+    const other = await controller.handleRegistryPull(pullRequest('/v2/acme/app/blobs/sha256:ok'));
+    expect(other.status).toBe(200);
+    await other.text();
+    const response = await waiting;
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('blob');
+  });
+
+  test('a waiting pull that finds no free slot before its wait is over is answered busy', async () => {
+    const controller = make({
+      TENANT_CONTROLLER_REGISTRY_MAX_CONCURRENT: '1',
+      TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS: '600',
+    });
+    controller.proxyUpstream = () => origin;
+    hold = Promise.withResolvers<void>();
+    const waiting = controller.handleRegistryPull(pullRequest('/v2/acme/busy/never'));
+    await Bun.sleep(100);
+    const holder = controller.handleRegistryPull(pullRequest('/v2/acme/app/hold'));
+    const response = await waiting;
+    expect(response.status).toBe(503);
+    expect(response.headers.get('content-type')).toBe('application/problem+json');
+    hold.resolve();
+    expect(await (await holder).text()).toBe('held');
+  });
+
+  test('each attempt gets the full header timeout, so a long wait does not end in 504 (S2)', async () => {
+    const controller = make({
+      TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS: '300',
+      TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS: '900',
+    });
+    controller.proxyUpstream = () => origin;
+    const started = Date.now();
+    const response = await controller.handleRegistryPull(pullRequest('/v2/acme/long/never'));
+    expect(response.status).toBe(404);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(300);
+  });
+
+  test('a registry that hangs past the header timeout still answers 504', async () => {
+    const controller = make({ TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS: '150' });
+    controller.proxyUpstream = () => origin;
+    hold = Promise.withResolvers<void>();
+    const response = await controller.handleRegistryPull(pullRequest('/v2/acme/slow/hold'));
+    expect(response.status).toBe(504);
+    hold.resolve();
+  });
+
   test('a refused connection is retried until the host listens', async () => {
     const controller = make();
     const late = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('x') });
@@ -158,7 +218,7 @@ describe('host pulls wait for the registry', () => {
     expect(response.status).toBe(502);
   });
 
-  test('a host that goes away stops the wait', async () => {
+  test('a pull whose client goes away stops waiting', async () => {
     const controller = make();
     controller.proxyUpstream = () => origin;
     const path = '/v2/acme/gone/never';

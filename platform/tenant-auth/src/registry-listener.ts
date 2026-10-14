@@ -61,7 +61,10 @@ export async function serveRegistryListener(
     },
   };
   const handle = (req: IncomingMessage, res: ServerResponse) => {
-    serveOne(req, res, options, client, addresses).catch(() => res.destroy());
+    // Anything unexpected still gets an answer when none has started; otherwise the connection ends.
+    serveOne(req, res, options, client, addresses).catch(() =>
+      res.headersSent ? res.destroy() : res.writeHead(500, { connection: 'close' }).end(),
+    );
   };
   const server: Server = options.tls
     ? createHttpsServer({ cert: options.tls.cert, key: options.tls.key }, handle)
@@ -96,9 +99,15 @@ async function serveOne(
 ): Promise<void> {
   const method = req.method ?? 'GET';
   const declared = req.headers['content-length'];
-  if (declared !== undefined && !(Number(declared) <= options.maxRequestBodySize)) {
+  const size = Number(declared);
+  if (declared !== undefined && (Number.isNaN(size) || size > options.maxRequestBodySize)) {
     req.resume();
     return send(req, res, tooLarge(options.maxRequestBodySize), true);
+  }
+  const url = requestUrl(req, options);
+  if (!url) {
+    req.resume();
+    return send(req, res, badRequest(), true);
   }
   // Ends the handler's request when the client goes away before the response is complete.
   const gone = new AbortController();
@@ -111,9 +120,7 @@ async function serveOne(
   const headers = new Headers();
   for (let i = 0; i + 1 < req.rawHeaders.length; i += 2)
     headers.append(req.rawHeaders[i] as string, req.rawHeaders[i + 1] as string);
-  const scheme = options.tls ? 'https' : 'http';
-  const authority = req.headers.host ?? `${options.hostname}:${options.port}`;
-  const request = new Request(`${scheme}://${authority}${req.url ?? '/'}`, {
+  const request = new Request(url, {
     method,
     headers,
     body: upload?.stream ?? null,
@@ -133,6 +140,43 @@ async function serveOne(
   }
   // A body the handler left unread is dropped, and the connection closed after the response.
   return send(req, res, response, upload?.state.dropped ?? false);
+}
+
+/**
+ * The URL the handler sees: the request target resolved against this listener's own origin, never
+ * against the client's `Host` header (which stays in the headers), so `Host` cannot rewrite the
+ * path. An absolute-form target is accepted only for the host the request names in `Host`; any
+ * other target, or one that does not parse, is undefined (answered 400).
+ */
+export function requestUrl(
+  req: Pick<IncomingMessage, 'url' | 'headers'>,
+  options: Pick<RegistryListenerOptions, 'hostname' | 'tls'>,
+): URL | undefined {
+  const scheme = options.tls ? 'https' : 'http';
+  const host = options.hostname.includes(':') ? `[${options.hostname}]` : options.hostname;
+  const origin = `${scheme}://${host}`;
+  let target = req.url ?? '';
+  // A request target has no fragment; one with `#` would reach the handler cut short.
+  if (target.includes('#')) return undefined;
+  if (!target.startsWith('/')) {
+    const absolute = URL.parse(target);
+    const named = req.headers.host?.toLowerCase();
+    if (
+      !absolute ||
+      !['http:', 'https:'].includes(absolute.protocol) ||
+      absolute.username !== '' ||
+      absolute.password !== '' ||
+      absolute.host.toLowerCase() !== named
+    )
+      return undefined;
+    target = `${absolute.pathname}${absolute.search}`;
+  }
+  const url = URL.parse(`${origin}${target}`);
+  return url && url.origin === URL.parse(origin)?.origin ? url : undefined;
+}
+
+function badRequest(): Response {
+  return problem(400, 'Bad Request', 'the request target is not valid');
 }
 
 function tooLarge(max: number): Response {
@@ -199,16 +243,26 @@ async function send(
     headers[name] = value;
   });
   if (close) headers.connection = 'close';
-  res.writeHead(response.status, headers);
+  try {
+    res.writeHead(response.status, headers);
+  } catch {
+    // A header value `Headers` allows but node refuses: cancelling the body lets the handler
+    // release what it holds for it (the registry pool slot) before the connection goes.
+    await response.body?.cancel().catch(() => {});
+    res.destroy();
+    return;
+  }
   if (!response.body || req.method === 'HEAD' || NO_BODY.has(response.status)) {
     await response.body?.cancel().catch(() => {});
     res.end();
     return;
   }
   const reader = response.body.getReader();
-  const closed = new Promise<void>((resolve) => res.once('close', resolve));
-  closed.then(() => {
-    if (!res.writableFinished) reader.cancel().catch(() => {});
+  const closed = new Promise<void>((resolve) => {
+    res.once('close', () => {
+      if (!res.writableFinished) reader.cancel().catch(() => {});
+      resolve();
+    });
   });
   try {
     for (;;) {
