@@ -577,15 +577,20 @@ describe('pglite-encfs test-only files (#349)', () => {
       expect(matchesPathFilter(trigger, file), file).toBe(true);
       expect(matchesPathFilter(hashed, file), file).toBe(!testOnly(file));
     }
-    for (const file of [
-      'platform/pglite-encfs/tests/root-probe/src/lib.rs',
-      'platform/pglite-encfs/src/testdata/xts-kat.txt',
-      'platform/pglite-encfs/scripts/smoke.ts',
-      'platform/pglite-encfs/scripts/lib/tear.test.ts',
-    ]) {
-      expect(files, file).toContain(file);
-      expect(matchesPathFilter(hashed, file), file).toBe(false);
-    }
+  });
+
+  test.each([
+    ['tests/root-probe/src/lib.rs', false],
+    ['src/testdata/xts-kat.txt', false],
+    ['scripts/smoke.ts', false],
+    ['scripts/lib/tear.test.ts', false],
+    ['src/component.rs', true],
+    ['wit/world.wit', true],
+    ['Cargo.toml', true],
+  ] as const)('platform/pglite-encfs/%s is hashed: %p', (path, isHashed) => {
+    const file = `platform/pglite-encfs/${path}`;
+    expect(files).toContain(file);
+    expect(matchesPathFilter(hashed, file)).toBe(isHashed);
   });
 
   test('the build never imports a file the hash leaves out', () => {

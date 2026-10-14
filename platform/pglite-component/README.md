@@ -250,7 +250,8 @@ an infinity):
 - After `SET TimeZone`, with `DateStyle` still ISO, PostgreSQL prints a local offset
   (`2024-01-15 05:30:00.5-05`). The provider converts it back to UTC (`2024-01-15T10:30:00.5Z`).
 - After `SET DateStyle` to `SQL`, `Postgres` or `German`, the output cannot be converted reliably
-  (`15/01/2024 05:30:00.5 EST`), so it is returned as `text`, exactly as printed.
+  (`15/01/2024 05:30:00.5 EST`), so it is returned as `text`, exactly as printed. `infinity` and
+  `-infinity` print the same under every DateStyle, so they stay `timestamp`.
 
 Closing and reopening the connection pins `DateStyle=ISO` and `TimeZone=UTC` again.
 
