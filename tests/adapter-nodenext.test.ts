@@ -128,5 +128,8 @@ export const bad: PlatformArgs = 42;
     const keys = importWithNode(project, '@di-framework/platform');
     expect(keys).toContain('createPlatform');
     expect(keys).toContain('kubeconfigServer');
-  });
+    // With skipLibCheck off, each compiler checks about 1,100 declaration files from Pulumi,
+    // Kubernetes and Node. The JavaScript-based TypeScript 6 compiler takes about 2.5 s for that
+    // locally and longer on CI runners, which runs past bun's 5 s default.
+  }, 60_000);
 });

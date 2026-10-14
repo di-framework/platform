@@ -36,7 +36,7 @@
     "node": ">=22.19"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && bun ../../scripts/fix-esm-imports.ts dist",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && bun ../../scripts/fix-esm-imports.ts dist",
     "test": "bun test"
   },
   "dependencies": {
