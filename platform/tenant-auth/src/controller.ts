@@ -18,6 +18,8 @@ import {
   KubeError,
   loadKubeconfig,
   MEMBERS_CONFIG,
+  type PublishedMember,
+  publishedMembers,
   type UserResource,
   type UserTokens,
 } from './kube.ts';
@@ -1338,17 +1340,9 @@ export class Controller {
       return new Response(null, { status: 204 });
     }
     if (route === 'GET /-/members') {
-      const members = (await this.memberUsers())
-        .flatMap((u) =>
-          u.spec.memberships
-            .filter((m) => m.tenant === this.config.tenant)
-            .map((m) => ({
-              user: u.metadata.name,
-              role: m.role,
-              suspended: u.spec.suspended === true,
-            })),
-        )
-        .sort((a, b) => a.user.localeCompare(b.user));
+      const members = (await this.members())
+        .map(({ name, role, suspended }) => ({ user: name, role, suspended }))
+        .sort((a, b) => a.user.localeCompare(b.user) || a.role.localeCompare(b.role));
       return json({ members });
     }
     // The `/v1` contract goes through the generated routes, which validate the request and hand
@@ -1369,18 +1363,39 @@ export class Controller {
   }
 
   /**
-   * The Users behind `/-/members`. The platform lists the tenant's active members in
-   * {@link MEMBERS_CONFIG} and lets the controller read only those Users (#321), so each is read by
-   * name. A platform that predates it has no such ConfigMap (or no grant on it, a 403) and still
-   * lets the controller list every User, which is the fallback.
+   * The memberships behind `/-/members` (#321). The platform publishes each one with its role and
+   * suspension in {@link MEMBERS_CONFIG} `entries`, so no User is read. Older platforms are still
+   * served from Users (see {@link memberUsers}).
    */
-  private async memberUsers(): Promise<UserResource[]> {
+  private async members(): Promise<PublishedMember[]> {
     let published: ConfigMapResource | undefined;
     try {
       published = await this.kube.getConfigMap(this.keys.namespace, MEMBERS_CONFIG);
     } catch (error) {
       if (!(error instanceof KubeError && error.status === 403)) throw error;
     }
+    const entries = published && publishedMembers(published);
+    if (entries) return entries;
+    return (await this.memberUsers(published)).flatMap((u) =>
+      u.spec.memberships
+        .filter((m) => m.tenant === this.config.tenant)
+        .map((m) => ({
+          name: u.metadata.name,
+          role: m.role,
+          suspended: u.spec.suspended === true,
+        })),
+    );
+  }
+
+  /**
+   * The Users behind `/-/members` on a platform that does not publish `entries` yet. With only the
+   * active members' names in `published` (the format before `entries`), each User is read by name:
+   * the platform grants reads on exactly those. Those names were active when published, and one
+   * suspended since answers 403 and is left out, so suspended members are not listed (as before).
+   * A platform without the ConfigMap (or no grant on it, a 403) still lets the controller list
+   * every User, which is the last fallback.
+   */
+  private async memberUsers(published: ConfigMapResource | undefined): Promise<UserResource[]> {
     if (!published) return (await this.kube.listUsers()).items;
     const names: unknown = JSON.parse(published.data?.members ?? '[]');
     if (!Array.isArray(names) || !names.every((name) => typeof name === 'string'))

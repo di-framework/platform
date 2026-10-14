@@ -237,10 +237,22 @@ export function registryPullSecretData(tenant: string, token: string): Record<st
   };
   return { token: base64(token), 'config.json': base64(JSON.stringify(config)) };
 }
+/**
+ * One membership in the tenant, as {@link TENANT_MEMBERS_CONFIG} publishes it (#321). A suspended
+ * member is listed with `suspended: true` and gets no access.
+ */
+export interface TenantMember {
+  name: string;
+  role: 'developer' | 'viewer';
+  suspended: boolean;
+}
 /** Facts the controller gathers from the cluster for {@link tenantAuthResources}. */
 export interface TenantAuthInputs {
-  /** Names of the tenant's active members; each may mint tokens for `di-user-<name>`. */
-  members: string[];
+  /**
+   * The tenant's memberships, suspended ones included. Only the active members' names reach the
+   * RBAC: each may mint tokens for `di-user-<name>`.
+   */
+  members: TenantMember[];
   /** API server endpoint addresses and port (the `kubernetes` EndpointSlice). */
   apiServer: { addresses: string[]; port: number };
   /**
@@ -1737,10 +1749,21 @@ function controllerTrustBundle(tls: TenantAuthInputs['tls']): string {
   return [tls.caPrevious, tls.caCert, tls.caNext?.cert].filter(Boolean).join('');
 }
 /**
- * The tenant's active members, published for the tenant controller's `/-/members` (#321). It
- * reads each one's User by name, so its RBAC names the members instead of listing every User.
+ * The tenant's members, published for the tenant controller's `/-/members` (#321), so it reads no
+ * User for that listing:
+ * - `entries`: every membership with its role and whether the user is suspended
+ *   ({@link TenantMember}), sorted by name and role;
+ * - `members`: the active members' names only, which tenant-auth images that predate `entries`
+ *   read (each one's User by name: the controller may `get` only those Users).
  */
 export const TENANT_MEMBERS_CONFIG = 'tenant-controller-members';
+/** The ConfigMap data of {@link TENANT_MEMBERS_CONFIG}. */
+function membersConfigData(members: TenantMember[], active: string[]): Record<string, string> {
+  const entries = members
+    .map(({ name, role, suspended }) => ({ name, role, suspended }))
+    .sort((a, b) => a.name.localeCompare(b.name) || a.role.localeCompare(b.role));
+  return { members: JSON.stringify(active), entries: JSON.stringify(entries) };
+}
 /** Digest of the serving certificate; in both pod templates so a renewal rolls the pair. */
 function tlsCertDigest(cert: string): string {
   return createHash('sha256').update(cert).digest('hex');
@@ -1992,7 +2015,10 @@ function tenantAuthResources(
     },
   );
   const base64 = (text: string) => Buffer.from(text).toString('base64');
-  const members = [...inputs.members].sort((a, b) => a.localeCompare(b));
+  // Active members only: a suspended member keeps its entry in the published list, not its access.
+  const members = [...new Set(inputs.members.filter((m) => !m.suspended).map((m) => m.name))].sort(
+    (a, b) => a.localeCompare(b),
+  );
   const result: Resource[] = [
     make('v1', 'ServiceAccount', 'tenant-controller', namespace, {
       automountServiceAccountToken: false,
@@ -2005,7 +2031,7 @@ function tenantAuthResources(
     make(rbac, 'ClusterRole', `di-tenant-controller-${name}`, undefined, {
       rules: [
         { apiGroups: [GROUP], resources: ['tenants'], verbs: ['get'], resourceNames: [name] },
-        ...(inputs.members.length
+        ...(members.length
           ? [{ apiGroups: [GROUP], resources: ['users'], verbs: ['get'], resourceNames: members }]
           : []),
       ],
@@ -2013,13 +2039,13 @@ function tenantAuthResources(
     // TokenRequest only for the tenant's members, recomputed from the User CRs on every
     // reconcile. With no members there is no rule: empty resourceNames would mean every name.
     make(rbac, 'Role', `di-tenant-controller-${name}`, cfg.namespace, {
-      rules: inputs.members.length
+      rules: members.length
         ? [
             {
               apiGroups: [''],
               resources: ['serviceaccounts/token'],
               verbs: ['create'],
-              resourceNames: inputs.members.map((m) => `di-user-${m}`),
+              resourceNames: members.map((m) => `di-user-${m}`),
             },
           ]
         : [],
@@ -2176,7 +2202,7 @@ function tenantAuthResources(
       },
     }),
     make('v1', 'ConfigMap', TENANT_MEMBERS_CONFIG, namespace, {
-      data: { members: JSON.stringify(members) },
+      data: membersConfigData(inputs.members, members),
     }),
     // Every CA of a rotation, so hosts and clients that reload it accept the leaf on either side.
     make('v1', 'ConfigMap', 'tenant-controller-ca', namespace, {

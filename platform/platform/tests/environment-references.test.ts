@@ -339,7 +339,7 @@ describe('platform-owned Secret names avoid the workload Secret suffixes (#325)'
         tenantResources(tenant, cfg, undefined, [], true, true, true, {}, registryNats(stage)),
       ),
       ...tenantAuthResources(tenant, cfg, {
-        members: ['alice'],
+        members: [{ name: 'alice', role: 'developer', suspended: false }],
         apiServer: { addresses: ['10.0.0.1'], port: 6443 },
         tls: { ...leaf, caCert: ca.cert, caKey: ca.key },
         clientSecret: 'c2VjcmV0',

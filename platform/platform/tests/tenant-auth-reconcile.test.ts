@@ -112,7 +112,10 @@ function tlsFixture(dnsName = 'tenant-controller', days = 30): TenantAuthInputs[
 }
 const tls = tlsFixture();
 const inputs: TenantAuthInputs = {
-  members: ['alice', 'bob'],
+  members: [
+    { name: 'alice', role: 'developer', suspended: false },
+    { name: 'bob', role: 'viewer', suspended: false },
+  ],
   apiServer: { addresses: ['10.0.0.1'], port: 6443 },
   tls,
   clientSecret: 'c2VjcmV0',
@@ -382,9 +385,12 @@ describe('tenantAuthResources', () => {
   });
 
   it('limits TokenRequest to the members and never renders empty resourceNames', () => {
-    const role = (members: string[]) =>
+    const role = (names: string[]) =>
       find(
-        tenantAuthResources(tenant(), cfg, { ...inputs, members }),
+        tenantAuthResources(tenant(), cfg, {
+          ...inputs,
+          members: names.map((name) => ({ name, role: 'viewer', suspended: false })),
+        }),
         'Role',
         'di-tenant-controller-alpha',
       )?.rules;
@@ -899,6 +905,14 @@ describe('reconcileTenant with tenant-auth', () => {
       user('bob', ['beta']),
     ]);
     expect(tokenNames(api)).toEqual([]);
+    // The suspended member is still listed for `/-/members`, flagged, but not as active (#321).
+    const members = api.objects.get(
+      path('ConfigMap', 'di-runtime-alpha', 'tenant-controller-members'),
+    );
+    expect(members?.data).toEqual({
+      members: '[]',
+      entries: JSON.stringify([{ name: 'alice', role: 'developer', suspended: true }]),
+    });
   });
 
   it('lists Users itself when tick does not hand them over, and tick passes them through', async () => {

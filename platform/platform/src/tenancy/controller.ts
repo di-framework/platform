@@ -376,6 +376,16 @@ const TENANT_AUTH_KINDS = [
   // The tenant registry (#83) carries the same component label.
   ['runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment'],
 ] as const;
+/**
+ * The `di-platform-log-reader` Role and RoleBinding that platforms before #321 wrote in each
+ * runtime namespace for the logs projection. The controller holds `pods/log get` cluster-wide, so
+ * it now deletes them ({@link Controller.pruneLogReader}).
+ */
+const LOG_READER = 'di-platform-log-reader';
+const LOG_READER_KINDS = [
+  ['rbac.authorization.k8s.io/v1', 'RoleBinding'],
+  ['rbac.authorization.k8s.io/v1', 'Role'],
+] as const;
 
 export class Controller {
   /**
@@ -561,7 +571,7 @@ export class Controller {
         await this.remove(binding);
   }
   /**
-   * What {@link tenantAuthResources} needs from the cluster: the tenant's active members (from
+   * What {@link tenantAuthResources} needs from the cluster: the tenant's members (from
    * the User CRs, so a membership change re-renders the TokenRequest `resourceNames` on the next
    * reconcile), the API server endpoints, the controller certificate (kept until 30 days before
    * it expires) and the shared OAuth client secret from the platform namespace.
@@ -573,15 +583,14 @@ export class Controller {
   ): Promise<TenantAuthInputs> {
     const auth = this.cfg.tenantAuth!;
     const name = tenant.metadata.name;
+    // Suspended members too, flagged, so `/-/members` lists them without reading Users (#321).
     const members = users
-      .filter(
-        (u) =>
-          !u.spec.suspended &&
-          !u.metadata.deletionTimestamp &&
-          u.spec.memberships.some((m) => m.tenant === name),
-      )
-      .map((u) => u.metadata.name)
-      .sort((a, b) => a.localeCompare(b));
+      .filter((u) => !u.metadata.deletionTimestamp)
+      .flatMap((u) =>
+        u.spec.memberships
+          .filter((m) => m.tenant === name)
+          .map((m) => ({ name: u.metadata.name, role: m.role, suspended: !!u.spec.suspended })),
+      );
     const slices = (
       await this.list<
         Resource & { endpoints?: { addresses: string[] }[]; ports?: { port: number }[] }
@@ -1012,6 +1021,8 @@ export class Controller {
             (spec.replicas !== 0 || (status?.replicas ?? 0) === 0);
         }
       }
+      // After the apply, so a failed cleanup is reported and retried without holding it back.
+      await this.pruneLogReader(tenant);
       if (ready && !tenant.spec.suspended && !tenant.metadata.deletionTimestamp) {
         const hosts = await this.list<Resource>('runtime.wasmcloud.dev/v1alpha1', 'Host', {
           hostgroup: n.hostgroup,
@@ -1355,6 +1366,31 @@ export class Controller {
         await this.remove(value);
       }
     this.tenantAuthClean = !found;
+  }
+  /** Tenant uids whose leftover log reader is known to be gone (see {@link pruneLogReader}). */
+  private readonly logReaderPruned = new Set<string>();
+  /**
+   * One-time upgrade cleanup (#321): delete the tenant's leftover {@link LOG_READER} binding, then
+   * its Role. Only objects labelled with this installation and the Tenant's uid are deleted; a
+   * foreign object of that name is left alone. Idempotent: once the check has run without error
+   * it is skipped for the tenant until the controller restarts.
+   */
+  private async pruneLogReader(tenant: Tenant): Promise<void> {
+    // Without a uid nothing can be proven to be this Tenant's, so nothing is deleted.
+    const uid = tenant.metadata.uid;
+    if (!uid || this.logReaderPruned.has(uid)) return;
+    const namespace = names(tenant.metadata.name).runtimeNamespace;
+    for (const [apiVersion, kind] of LOG_READER_KINDS) {
+      const value = await this.get<Resource>(
+        `${collection(apiVersion, kind, namespace)}/${LOG_READER}`,
+      );
+      if (
+        value?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+        value.metadata.labels[OWNER] === uid
+      )
+        await this.remove(value);
+    }
+    this.logReaderPruned.add(uid);
   }
   /** No gateway is published any more: drop the route template so the console stops linking. */
   private async removeRoutes(tenant: Tenant): Promise<void> {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
+import { MEMBERS_CONFIG, publishedMembers } from '../../tenant-auth/src/kube';
 import { admissionResources } from '../src/tenancy/admission';
 import { type Api, ApiError, Controller, collection } from '../src/tenancy/controller';
 import {
@@ -12,8 +13,10 @@ import {
 import {
   type ControllerConfig,
   INSTALLATION,
+  OWNER,
   REGISTRY_PULL_SECRET,
   type Resource,
+  TENANT_MEMBERS_CONFIG,
   type Tenant,
   type TenantAuthInputs,
   tenantAuthResources,
@@ -29,6 +32,7 @@ import { caCertificate, leafCertificate } from '../src/tenancy/tls';
 // or rule that the controller could not create on a real API server fails here.
 
 const RBAC_GROUP = 'rbac.authorization.k8s.io';
+const LOG_READER = 'di-platform-log-reader';
 type Rule = ControllerClusterRoleRule;
 type RoleRef = { apiGroup: string; kind: 'Role' | 'ClusterRole'; name: string };
 
@@ -73,8 +77,10 @@ function user(name: string, role: 'developer' | 'viewer', tenants: string[]): Us
 }
 const ca = caCertificate('tenant-controller CA', 3650);
 const leaf = leafCertificate('tenant-controller', ['tenant-controller'], [], 30, ca.cert, ca.key);
+const member = (name: string, suspended = false) =>
+  ({ name, role: 'developer', suspended }) as const;
 const inputs: TenantAuthInputs = {
-  members: ['alice', 'bob'],
+  members: [member('alice'), member('bob'), member('carol', true)],
   apiServer: { addresses: ['10.0.0.1'], port: 6443 },
   tls: { ...leaf, caCert: ca.cert, caKey: ca.key },
   clientSecret: 'c2VjcmV0',
@@ -266,6 +272,8 @@ const RBAC_OWNERS = [
   'controller:Controller.ensure',
   'controller:Controller.revoke',
   'controller:Controller.reconcileUser',
+  // The kinds of the leftover log reader that pruneLogReader deletes when this installation owns it.
+  'controller:LOG_READER_KINDS',
 ];
 /** The RBAC API group, a quoted RBAC kind, or an RBAC kind used as an object key. */
 const RBAC_MENTION = [
@@ -386,7 +394,7 @@ describe('tenant controller RBAC (#321)', () => {
       (o) => o.kind === 'ClusterRole' && o.metadata.name === `di-tenant-controller-${t}`,
     );
 
-  it("reads only its own members' Users, by name, and never lists them", () => {
+  it("reads only its own active members' Users, by name, and never lists them", () => {
     const role = clusterRole(rendered(['alpha']), 'alpha') as Resource;
     expect(rulesOf(role)).toEqual([
       {
@@ -411,21 +419,51 @@ describe('tenant controller RBAC (#321)', () => {
     const role = clusterRole(objects, 'gamma') as Resource;
     expect(rulesOf(role).flatMap((r) => r.resources)).toEqual(['tenants']);
     const members = objects.find((o) => o.metadata.name === 'tenant-controller-members');
-    expect(members?.data).toEqual({ members: '[]' });
+    expect(members?.data).toEqual({ members: '[]', entries: '[]' });
+  });
+
+  it('grants nothing to a tenant whose only members are suspended, but still lists them', () => {
+    const objects = tenantAuthResources(tenant('gamma'), cfg, {
+      ...inputs,
+      members: [member('carol', true)],
+    });
+    expect(rulesOf(clusterRole(objects, 'gamma') as Resource).flatMap((r) => r.resources)).toEqual([
+      'tenants',
+    ]);
+    const tokens = objects.find(
+      (o) => o.kind === 'Role' && o.metadata.name === 'di-tenant-controller-gamma',
+    );
+    expect(rulesOf(tokens as Resource)).toEqual([]);
+    const members = objects.find((o) => o.metadata.name === 'tenant-controller-members');
+    expect(JSON.parse(((members as Resource).data as { entries: string }).entries)).toEqual([
+      { name: 'carol', role: 'developer', suspended: true },
+    ]);
   });
 
   it('publishes the member list it may read in its own namespace only', () => {
     const objects = tenantAuthResources(tenant('alpha'), cfg, {
       ...inputs,
-      members: ['bob', 'alice'],
+      members: [
+        member('carol', true),
+        { name: 'bob', role: 'viewer', suspended: false },
+        member('bob'),
+        member('alice'),
+      ],
     });
     const members = objects.find((o) => o.metadata.name === 'tenant-controller-members');
     expect(members).toMatchObject({
       kind: 'ConfigMap',
       metadata: { namespace: 'di-runtime-alpha' },
     });
-    const published = (members as Resource).data as { members: string };
+    const published = (members as Resource).data as { members: string; entries: string };
+    // Active names for older tenant-auth images; every membership, flagged, for `/-/members`.
     expect(JSON.parse(published.members)).toEqual(['alice', 'bob']);
+    expect(JSON.parse(published.entries)).toEqual([
+      { name: 'alice', role: 'developer', suspended: false },
+      { name: 'bob', role: 'developer', suspended: false },
+      { name: 'bob', role: 'viewer', suspended: false },
+      { name: 'carol', role: 'developer', suspended: true },
+    ]);
     const keys = objects.find(
       (o) => o.kind === 'Role' && o.metadata.name === 'tenant-controller-keys',
     );
@@ -441,6 +479,21 @@ describe('tenant controller RBAC (#321)', () => {
         (r) => r.metadata.name === 'test-tenant-controller-secrets',
       ),
     ).toBe(true);
+  });
+
+  it('publishes the member list under the name and format tenant-auth reads', () => {
+    expect(TENANT_MEMBERS_CONFIG).toBe(MEMBERS_CONFIG);
+    const objects = tenantAuthResources(tenant('alpha'), cfg, inputs);
+    const published = objects.find(
+      (o) => o.kind === 'ConfigMap' && o.metadata.name === MEMBERS_CONFIG,
+    ) as Resource & { data: Record<string, string> };
+    expect(publishedMembers(published)).toEqual([...inputs.members]);
+    const keys = objects.find(
+      (o) => o.kind === 'Role' && o.metadata.name === 'tenant-controller-keys',
+    ) as Resource;
+    expect(rulesOf(keys).find((r) => r.resources.includes('configmaps'))?.resourceNames).toEqual([
+      MEMBERS_CONFIG,
+    ]);
   });
 
   it('no longer renders the redundant log reader or binds anything to itself', () => {
@@ -467,8 +520,11 @@ interface Attributes {
   namespace?: string;
   name?: string;
 }
-/** The RBAC attributes of one API call, as the API server would derive them. */
-function attributes(method: string, url: URL, exists: boolean): Attributes {
+/**
+ * The RBAC attributes of one API call, as the API server would derive them. A server-side apply
+ * (PATCH) that creates the object is authorized as both `patch` and `create`.
+ */
+function attributes(method: string, url: URL, exists: boolean): Attributes[] {
   const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
   const [group, rest] =
     parts[0] === 'api' ? ['', parts.slice(2)] : [parts[1] ?? '', parts.slice(3)];
@@ -480,21 +536,19 @@ function attributes(method: string, url: URL, exists: boolean): Attributes {
   }
   const [plural, name, sub] = tail as [string, string | undefined, string | undefined];
   const resource = sub ? `${plural}/${sub}` : plural;
-  const verb =
+  const verbs =
     method === 'GET'
-      ? name
-        ? 'get'
-        : 'list'
+      ? [name ? 'get' : 'list']
       : method === 'PATCH'
         ? exists
-          ? 'patch'
-          : 'create'
+          ? ['patch']
+          : ['patch', 'create']
         : method === 'PUT'
-          ? 'update'
+          ? ['update']
           : method === 'DELETE'
-            ? 'delete'
-            : 'create';
-  return { group, resource, verb, namespace, name };
+            ? ['delete']
+            : ['create'];
+  return verbs.map((verb) => ({ group, resource, verb, namespace, name }));
 }
 
 /** In-memory API server that records every RBAC object written and every request's attributes. */
@@ -513,7 +567,7 @@ class RecordingApi implements Api {
     const url = new URL(path, 'https://kubernetes');
     const target = decodeURIComponent(url.pathname).replace(/\/status$/, '');
     const existing = this.objects.get(target);
-    this.requests.push(attributes(method, url, existing !== undefined));
+    this.requests.push(...attributes(method, url, existing !== undefined));
     if (method === 'GET' && url.searchParams.has('labelSelector')) {
       const labels = (url.searchParams.get('labelSelector') ?? '')
         .split(',')
@@ -624,6 +678,19 @@ describe('platform controller RBAC at runtime (#321)', () => {
       endpoints: [{ addresses: ['10.0.0.1'] }],
       ports: [{ port: 6443 }],
     });
+    // Log readers that platforms before #321 wrote: alpha's are this installation's; gamma's are
+    // another installation's Role and an unlabelled binding, which must be left alone.
+    for (const [namespace, kind, labels] of [
+      ['di-runtime-alpha', 'Role', { [INSTALLATION]: 'test', [OWNER]: 'alpha-uid' }],
+      ['di-runtime-alpha', 'RoleBinding', { [INSTALLATION]: 'test', [OWNER]: 'alpha-uid' }],
+      ['di-runtime-gamma', 'Role', { [INSTALLATION]: 'other', [OWNER]: 'gamma-uid' }],
+      ['di-runtime-gamma', 'RoleBinding', undefined],
+    ] as const)
+      api.seed({
+        apiVersion: `${RBAC_GROUP}/v1`,
+        kind,
+        metadata: { name: LOG_READER, namespace, uid: `${namespace}-${kind}`, labels },
+      });
     const controller = new Controller(api, registryCfg);
     // Twice: the first pass deploys the registry, the second wires the hosts to pull from it.
     for (let pass = 0; pass < 2; pass++) {
@@ -632,11 +699,21 @@ describe('platform controller RBAC at runtime (#321)', () => {
     }
     return { api, written: api.written };
   }
-  const held = (namespace: string | undefined) =>
-    namespace === cfg.namespace
-      ? [...controllerClusterRoleRules(), ...controllerNamespaceRoleRules()]
-      : controllerClusterRoleRules();
+  const held = (namespace: string | undefined, cluster: Rule[] = controllerClusterRoleRules()) =>
+    namespace === cfg.namespace ? [...cluster, ...controllerNamespaceRoleRules()] : cluster;
   const ref = (o: Resource) => `${o.kind} ${o.metadata.namespace ?? ''}/${o.metadata.name}`;
+  /** The requests that `cluster` (with the namespace Role) does not authorize. */
+  const unauthorized = (requests: Attributes[], cluster?: Rule[]) =>
+    requests
+      .filter((r) => !allows(held(r.namespace, cluster), r.group, r.resource, r.verb, r.name))
+      .map((r) => `${r.verb} ${r.group}/${r.resource} ${r.namespace ?? ''}/${r.name ?? ''}`);
+  /** `controllerClusterRoleRules()` without `verb` on the rule that grants `resource`. */
+  const without = (group: string, resource: string, verb: string) =>
+    controllerClusterRoleRules().map((r) =>
+      r.apiGroups.includes(group) && r.resources.includes(resource) && !r.resourceNames
+        ? { ...r, verbs: r.verbs.filter((v) => v !== verb) }
+        : r,
+    );
 
   it('exercises host pull, suspended and member-less tenants', async () => {
     const { api, written } = await run();
@@ -707,11 +784,39 @@ describe('platform controller RBAC at runtime (#321)', () => {
   it('is authorized for every request it makes', async () => {
     const { api } = await run();
     expect(api.requests.length).toBeGreaterThan(0);
-    for (const r of api.requests)
-      expect(
-        allows(held(r.namespace), r.group, r.resource, r.verb, r.name),
-        `${r.verb} ${r.group}/${r.resource} ${r.namespace ?? ''}/${r.name ?? ''}`,
-      ).toBe(true);
+    expect(unauthorized(api.requests)).toEqual([]);
+  });
+
+  it('flags a request its install-time RBAC does not authorize', async () => {
+    const { api } = await run();
+    // Without `delete` on Roles it could not prune the leftover log reader.
+    expect(unauthorized(api.requests, without(RBAC_GROUP, 'roles', 'delete'))).toContain(
+      `delete ${RBAC_GROUP}/roles di-runtime-alpha/${LOG_READER}`,
+    );
+    // A server-side apply that creates an object needs `patch` as well as `create`.
+    const creates = api.requests.filter((r) => r.resource === 'configmaps' && r.verb === 'create');
+    expect(creates.length).toBeGreaterThan(0);
+    const flagged = unauthorized(api.requests, without('', 'configmaps', 'patch'));
+    for (const r of creates)
+      expect(flagged).toContain(`patch /configmaps ${r.namespace ?? ''}/${r.name ?? ''}`);
+  });
+
+  it('prunes only the leftover log reader this installation wrote, once per tenant', async () => {
+    const { api } = await run();
+    const at = (namespace: string, kind: string) =>
+      api.objects.get(`${collection(`${RBAC_GROUP}/v1`, kind, namespace)}/${LOG_READER}`);
+    expect(at('di-runtime-alpha', 'Role')).toBeUndefined();
+    expect(at('di-runtime-alpha', 'RoleBinding')).toBeUndefined();
+    expect(at('di-runtime-gamma', 'Role')).toBeDefined();
+    expect(at('di-runtime-gamma', 'RoleBinding')).toBeDefined();
+    const reads = api.requests.filter((r) => r.name === LOG_READER && r.verb === 'get');
+    // Two passes over three tenants, but each Role and binding is checked only on the first.
+    expect(reads).toHaveLength(6);
+    expect(
+      api.requests
+        .filter((r) => r.name === LOG_READER && r.verb === 'delete')
+        .map((r) => `${r.resource} ${r.namespace}`),
+    ).toEqual(['rolebindings di-runtime-alpha', 'roles di-runtime-alpha']);
   });
 
   it('detects a written rule the controller does not hold', async () => {

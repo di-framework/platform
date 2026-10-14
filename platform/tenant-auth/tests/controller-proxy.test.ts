@@ -45,21 +45,32 @@ function fakeApiServer() {
     minted: 0,
     mintFails: false,
     users: [] as { metadata: { name: string }; spec?: unknown }[],
-    /** The published member list (#321); undefined answers 403, as an older platform does. */
+    /**
+     * The published member list (#321): `members` (active names) and `entries` (every
+     * membership). With neither, the ConfigMap answers 403, as an older platform does.
+     */
     members: undefined as string | undefined,
+    entries: undefined as string | undefined,
     /** Users the controller may read by name; the rest answer 403. */
     readable: [] as string[],
+    /** User reads (by name or listed) the controller made. */
+    userReads: 0,
   };
   const server = serve((request) => {
     if (
       request.pathname === '/api/v1/namespaces/di-runtime-acme/configmaps/tenant-controller-members'
     )
-      return state.members === undefined
+      return state.members === undefined && state.entries === undefined
         ? json({ message: 'forbidden' }, 403)
         : json({
             metadata: { name: 'tenant-controller-members' },
-            data: { members: state.members },
+            data: {
+              ...(state.members === undefined ? {} : { members: state.members }),
+              ...(state.entries === undefined ? {} : { entries: state.entries }),
+            },
           });
+    if (request.pathname.startsWith('/apis/platform.di-framework.dev/v1alpha1/users'))
+      state.userReads++;
     const byName = /^\/apis\/platform\.di-framework\.dev\/v1alpha1\/users\/([^/]+)$/.exec(
       request.pathname,
     );
@@ -489,6 +500,47 @@ describe('Controller', () => {
       expect((await call('GET', '/-/members')).status).toBeGreaterThanOrEqual(500);
     } finally {
       api.state.members = undefined;
+      api.state.readable = [];
+    }
+  });
+
+  test('lists published entries, suspended members included, without reading Users (#321)', async () => {
+    // Users the controller could list or read: none of them may be consulted.
+    api.state.users = [
+      { metadata: { name: 'eve' }, spec: { memberships: [{ tenant: 'acme', role: 'viewer' }] } },
+    ];
+    api.state.readable = ['eve'];
+    api.state.members = JSON.stringify(['alice']);
+    api.state.entries = JSON.stringify([
+      { name: 'carol', role: 'viewer', suspended: true },
+      { name: 'alice', role: 'viewer', suspended: false },
+      { name: 'alice', role: 'developer', suspended: false },
+    ]);
+    const reads = api.state.userReads;
+    try {
+      expect(await (await call('GET', '/-/members')).json()).toEqual({
+        members: [
+          { user: 'alice', role: 'developer', suspended: false },
+          { user: 'alice', role: 'viewer', suspended: false },
+          { user: 'carol', role: 'viewer', suspended: true },
+        ],
+      });
+      expect(api.state.userReads).toBe(reads);
+      // Fails closed on an entry without a suspended flag, or with an unknown role.
+      for (const bad of [
+        [{ name: 'alice', role: 'developer' }],
+        [{ name: 'alice', role: 'admin', suspended: false }],
+        [{ role: 'developer', suspended: false }],
+        ['alice'],
+        { alice: true },
+      ]) {
+        api.state.entries = JSON.stringify(bad);
+        expect((await call('GET', '/-/members')).status).toBeGreaterThanOrEqual(500);
+      }
+      expect(api.state.userReads).toBe(reads);
+    } finally {
+      api.state.members = undefined;
+      api.state.entries = undefined;
       api.state.readable = [];
     }
   });

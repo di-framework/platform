@@ -43,10 +43,41 @@ export interface ConfigMapResource {
   data?: Record<string, string>;
 }
 /**
- * The ConfigMap in the runtime namespace where the platform lists the tenant's active members
- * (#321), as a JSON array of user names under `members`.
+ * The ConfigMap in the runtime namespace where the platform lists the tenant's members (#321):
+ * `entries` holds every membership as a {@link PublishedMember}; `members` the active members'
+ * names only. Platforms before `entries` publish only `members`.
  */
 export const MEMBERS_CONFIG = 'tenant-controller-members';
+/** One membership in {@link MEMBERS_CONFIG} `entries`, as the platform writes it. */
+export interface PublishedMember {
+  name: string;
+  role: Membership['role'];
+  suspended: boolean;
+}
+const isPublishedMember = (value: unknown): value is PublishedMember => {
+  const entry = value as Partial<PublishedMember> | null;
+  return (
+    typeof entry === 'object' &&
+    entry !== null &&
+    typeof entry.name === 'string' &&
+    (entry.role === 'developer' || entry.role === 'viewer') &&
+    typeof entry.suspended === 'boolean'
+  );
+};
+/**
+ * The `entries` of {@link MEMBERS_CONFIG}, or undefined when the ConfigMap predates them (only
+ * `members`). Fails closed: the platform writes `name`, `role` and `suspended` on every entry, so
+ * an entry missing one (or of the wrong type) rejects the whole list rather than show a suspended
+ * member as active.
+ */
+export function publishedMembers(config: ConfigMapResource): PublishedMember[] | undefined {
+  const raw = config.data?.entries;
+  if (raw === undefined) return undefined;
+  const entries: unknown = JSON.parse(raw);
+  if (!Array.isArray(entries) || !entries.every(isPublishedMember))
+    throw new Error(`${MEMBERS_CONFIG} entries must each have a name, a role and suspended`);
+  return entries;
+}
 export interface MintedToken {
   token: string;
   expirationTimestamp: string;

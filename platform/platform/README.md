@@ -883,7 +883,8 @@ WorkloadDeployment in `data.failures`.
 - Source: the `hostgroup-<tenant>` pod logs. The controller's ClusterRole holds
   `pods/log get` cluster-wide (#115), because the runtime viewer and developer Roles
   it writes grant it. The per-tenant `di-platform-log-reader` Role and binding are no
-  longer written (#321). The host keeps `automountServiceAccountToken: false`.
+  longer written, and leftover ones are deleted (#321). The host keeps
+  `automountServiceAccountToken: false`.
 - Guest lines come only from the wash `wasi:logging` TracingLogger. Each ends with
   `workload.name` and `workload.namespace`; the namespace must be the tenant's, and
   the name maps to a `di-framework`-managed WorkloadDeployment. Its
@@ -1140,9 +1141,11 @@ tenantAuth:
   is recomputed from the User CRs on every reconcile; with no members the Role has no rule.
   The ClusterRole `di-tenant-controller-<tenant>` grants `get` on the tenant's own `Tenant` and on
   the same members' `User`s by name, and no `list` (#321). With no members it has no `users` rule.
-  The members are also published, as a JSON array under `members`, in ConfigMap
-  `tenant-controller-members` in the runtime namespace, which the tenant controller reads for
-  `/-/members`. A suspended tenant keeps the roles and loses the bindings. `tenant-controller-secret-reader` in
+  The members are also published in ConfigMap `tenant-controller-members` in the runtime
+  namespace, which the tenant controller reads for `/-/members` without reading any `User`:
+  `entries` is a JSON array of `{name, role, suspended}`, one per membership, suspended members
+  included; `members` is a JSON array of the active members' names, for tenant-auth images that
+  predate `entries`. A suspended tenant keeps the roles and loses the bindings. `tenant-controller-secret-reader` in
   `di-tenant-<tenant>` lets it `get`/`list` Secrets there, because tenant developers can only
   write them (#112); writes still go through as the calling user.
 - Network: `tenant-auth-egress` adds egress to the API server endpoints (EndpointSlice
@@ -1171,7 +1174,9 @@ tenantAuth:
   only request tokens for its members. The
   `<installation>-tenant-controller-secrets` admission policy (#321) limits its writes: it may
   create and delete only `di-apikey-<16 hex>` Secrets labelled
-  `platform.di-framework.dev/api-key: "true"` with its own tenant, and update none. It can no
+  `platform.di-framework.dev/api-key: "true"` with its own tenant, and update none. The caller's
+  ServiceAccount namespace must be the request's, so one tenant's controller cannot write in
+  another tenant's namespace even if its RBAC allowed it. It can no
   longer delete `tenant-controller-tls`, `tenant-console-oauth` or the registry pull Secret. Its
   reads in the runtime namespace are not narrowed. Deleting the tenant (or unsetting `tenantAuth`)
   deletes `tenant-controller-ca-<tenant>` with the other tenant-auth objects.
@@ -1373,13 +1378,19 @@ tenantAuth:
     `tenant-controller-members`. Upgrade the `tenantAuth.image` pin together with the platform:
     an older image answers `/-/members` with an error until it is replaced (login and API
     keys keep working). A newer image on an older platform falls back to listing `User`s.
-    Suspended members are no longer shown in `/-/members`, because the tenant controller can
-    no longer read their `User`.
+  - Suspended members (#321): `tenant-controller-members` gains `entries` (name, role and
+    suspended per membership), and `/-/members` lists suspended members again, flagged, without
+    reading any `User`. `members` keeps the active names, so a tenant-auth image that predates
+    `entries` keeps working (active members only). A ConfigMap without `entries`, as an older
+    platform writes it, is read the old way: its names were active when published, so each is
+    read as a `User` by name and one suspended since (`403`) is left out. An `entries` item
+    without a boolean `suspended`, a known role or a name makes `/-/members` fail (`5xx`) rather
+    than show a suspended member as active.
   - Log reader (#321): the controller no longer writes the per-tenant `di-platform-log-reader`
-    Role and RoleBinding in `di-runtime-<tenant>`, and no longer has `bind` on that name.
-    Existing ones stay until the tenant is deleted; they grant only `pods/log` `get` to the
-    controller, which already holds it cluster-wide. To remove them by hand:
-    `kubectl delete role,rolebinding -A -l platform.di-framework.dev/installation=<installation> --field-selector metadata.name=di-platform-log-reader`.
+    Role and RoleBinding in `di-runtime-<tenant>`, and no longer has `bind` on that name. On
+    the first reconcile of each tenant after the controller starts, it deletes the leftover
+    RoleBinding and Role there, but only when they carry this installation's label and the
+    Tenant's owner uid; a foreign object of that name is left alone.
   - Host pull (`#83:host-pull`): the tenant's hosts pull workload components from the tenant
     registry with a namespace-scoped host credential.
     - Reference: users push to `publicUrl`; workloads reference the same repository as

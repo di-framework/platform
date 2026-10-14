@@ -1029,8 +1029,11 @@ export function tenantSecretUpdateDenial(input: {
 
 /** Denial for a tenant controller's write to a Secret that is not one of its API keys (#321). */
 export const TENANT_CONTROLLER_SECRET_MESSAGE =
-  'the tenant controller may only create and delete its API-key Secrets (di-apikey-<id>, labelled with its tenant)';
+  'the tenant controller may only create and delete its API-key Secrets in its own namespace (di-apikey-<id>, labelled with its tenant)';
 const TENANT_CONTROLLER_USER = /^system:serviceaccount:[^:]+:tenant-controller$/;
+/** The tenant controller's username when it runs in `namespace`. */
+const tenantControllerIn = (namespace: string) =>
+  `system:serviceaccount:${namespace}:tenant-controller`;
 const API_KEY_SECRET = /^di-apikey-[0-9a-f]{16}$/;
 
 /**
@@ -1038,7 +1041,8 @@ const API_KEY_SECRET = /^di-apikey-[0-9a-f]{16}$/;
  * Secrets have generated names that `resourceNames` cannot list (#115 S2). This limits its
  * writes there to what `tenant-auth/src/keys.ts` does: create and delete `di-apikey-<16 hex>`
  * Secrets labelled as API keys of the namespace's tenant. It can no longer replace or delete the
- * OAuth client, TLS or registry pull Secrets beside them.
+ * OAuth client, TLS or registry pull Secrets beside them. The caller must also run in the
+ * request's namespace, so one tenant's controller cannot write in another's even if RBAC let it.
  */
 function tenantControllerSecretsPolicy(): AdmissionPolicy {
   // `object` on CREATE, `oldObject` on DELETE (the other one is null).
@@ -1058,8 +1062,9 @@ function tenantControllerSecretsPolicy(): AdmissionPolicy {
     validations: [
       {
         expression: `!request.userInfo.username.matches('${TENANT_CONTROLLER_USER.source}') ||
-          (request.operation == 'CREATE' && ${apiKey('object')}) ||
-          (request.operation == 'DELETE' && ${apiKey('oldObject')})`,
+          (request.userInfo.username == 'system:serviceaccount:' + request.namespace + ':tenant-controller' && (
+            (request.operation == 'CREATE' && ${apiKey('object')}) ||
+            (request.operation == 'DELETE' && ${apiKey('oldObject')})))`,
         message: TENANT_CONTROLLER_SECRET_MESSAGE,
       },
     ],
@@ -1077,6 +1082,7 @@ export function tenantControllerSecretAllowed(input: {
   if (!TENANT_CONTROLLER_USER.test(input.username)) return true;
   const labels = input.labels ?? {};
   return (
+    input.username === tenantControllerIn(input.namespace) &&
     input.operation !== 'UPDATE' &&
     API_KEY_SECRET.test(input.name) &&
     labels[`${GROUP}/api-key`] === 'true' &&
