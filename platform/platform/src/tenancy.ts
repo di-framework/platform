@@ -5,6 +5,7 @@ import {
   assertTenantDeclaration,
   type BackingServiceClassDeclaration,
   controllerClusterRoleRules,
+  controllerNamespaceRoleRules,
   controllerScriptHash,
   defaultBackingServiceClasses,
   loadControllerScripts,
@@ -30,9 +31,11 @@ import {
 export {
   type BackingClassConfig,
   type BackingServiceClassDeclaration,
+  CONTROLLER_BOUND_ROLES,
   CONTROLLER_SCRIPT_MODULES,
   type ControllerClusterRoleRule,
   controllerClusterRoleRules,
+  controllerNamespaceRoleRules,
   controllerScriptHash,
   defaultBackingServiceClasses,
   loadControllerScripts,
@@ -175,12 +178,38 @@ export function installTenancy(args: {
     kind: 'ServiceAccount',
     metadata: { name: 'di-platform-controller', namespace },
   });
-  const role = create({
+  // TokenRequest in this namespace only (#115), for the per-tenant TokenRequest Roles it writes.
+  const namespaceRole = create({
     apiVersion: 'rbac.authorization.k8s.io/v1',
-    kind: 'ClusterRole',
-    metadata: { name: `${installation}-controller` },
-    rules: controllerClusterRoleRules(),
+    kind: 'Role',
+    metadata: { name: `${installation}-controller`, namespace },
+    rules: controllerNamespaceRoleRules(),
   });
+  const namespaceBinding = create(
+    {
+      apiVersion: 'rbac.authorization.k8s.io/v1',
+      kind: 'RoleBinding',
+      metadata: { name: `${installation}-controller`, namespace },
+      roleRef: {
+        apiGroup: 'rbac.authorization.k8s.io',
+        kind: 'Role',
+        name: `${installation}-controller`,
+      },
+      subjects: [{ kind: 'ServiceAccount', name: 'di-platform-controller', namespace }],
+    },
+    [namespaceRole, serviceAccount],
+  );
+  // The ClusterRole drops `escalate` (#115), so it waits for the namespaced TokenRequest grant:
+  // the running controller keeps writing the per-tenant TokenRequest Roles across `pulumi up`.
+  const role = create(
+    {
+      apiVersion: 'rbac.authorization.k8s.io/v1',
+      kind: 'ClusterRole',
+      metadata: { name: `${installation}-controller` },
+      rules: controllerClusterRoleRules(),
+    },
+    [namespaceBinding],
+  );
   const binding = create(
     {
       apiVersion: 'rbac.authorization.k8s.io/v1',
@@ -311,7 +340,15 @@ export function installTenancy(args: {
         },
       },
     },
-    [...definitions, ...policies, ...backingServiceClasses, binding, scripts, network],
+    [
+      ...definitions,
+      ...policies,
+      ...backingServiceClasses,
+      binding,
+      namespaceBinding,
+      scripts,
+      network,
+    ],
   );
   const tenants = args.tenants.map((tenant) =>
     createCustom(tenantObject(tenant, installation), [controller, ...args.dependsOn]),

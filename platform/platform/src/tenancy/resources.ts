@@ -898,8 +898,9 @@ function tenantResources(
     make('v1', 'ServiceAccount', 'di-runtime', n.runtimeNamespace, {
       automountServiceAccountToken: false,
     }),
-    // The controller reads hostgroup logs to publish the console logs projection (#10).
-    // Scoped to this tenant's runtime namespace; the host itself keeps no API token.
+    // The controller reads hostgroup logs to publish the console logs projection (#10); the
+    // host itself keeps no API token. Redundant since #115: the controller's ClusterRole holds
+    // `pods/log get` cluster-wide, because the runtime viewer and developer Roles grant it.
     make('rbac.authorization.k8s.io/v1', 'Role', 'di-platform-log-reader', n.runtimeNamespace, {
       rules: [{ apiGroups: [''], resources: ['pods/log'], verbs: ['get'] }],
     }),
