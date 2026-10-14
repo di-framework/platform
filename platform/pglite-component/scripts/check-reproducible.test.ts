@@ -145,8 +145,15 @@ describe('createWorkDir', () => {
 
   test('refuses the repository checkout and anything inside it', async () => {
     await expect(createWorkDir(repo, repo)).rejects.toThrow('inside the repository checkout');
+    await mkdir(join(repo, 'platform', 'x'), { recursive: true });
     await expect(createWorkDir(join(repo, 'platform', 'x'), repo)).rejects.toThrow(
       'inside the repository checkout',
     );
+  });
+
+  test('refuses a parent that does not exist instead of creating it', async () => {
+    const missing = join(parent, 'missing');
+    await expect(createWorkDir(missing, repo)).rejects.toThrow('must be an existing directory');
+    expect(await readdir(parent)).not.toContain('missing');
   });
 });

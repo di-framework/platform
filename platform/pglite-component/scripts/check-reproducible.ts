@@ -20,7 +20,7 @@ const USAGE = [
   '  check-reproducible.ts [--work-dir DIR] [--sdk-cache DIR] [--keep]',
   '',
   '  --work-dir DIR   parent of the new df-pglite-repro.* directory the two package',
-  '                   copies are built in (default: the system temp dir). It must be',
+  '                   copies are built in (default: the system temp dir). It must exist and be',
   '                   outside the repository checkout; only the new directory is ever',
   '                   deleted',
   '  --sdk-cache DIR  seed each copy with these SDK tarballs instead of downloading them',
@@ -81,13 +81,14 @@ export function isInside(path: string, root: string): boolean {
 export const WORK_DIR_PREFIX = 'df-pglite-repro.';
 
 /**
- * Create a fresh, empty work directory under `parent` (default: the system
- * temp dir). Refuses a parent inside `repoRoot`: `bun test` would pick up the
+ * Create a fresh, empty work directory under the existing directory `parent`
+ * (default: the system temp dir). Refuses a parent inside `repoRoot`: `bun test` would pick up the
  * copied test files, and a build tree there is easy to mistake for source.
  */
 export async function createWorkDir(parent: string | undefined, repoRoot: string): Promise<string> {
   const base = resolve(parent ?? tmpdir());
-  await mkdir(base, { recursive: true });
+  if (!(await isDirectory(base)))
+    throw new Error(`--work-dir must be an existing directory: ${base}`);
   const real = await realpath(base);
   const root = await realpath(repoRoot);
   if (isInside(real, root)) {
@@ -167,7 +168,8 @@ interface BuildResult {
 async function cleanBuild(ctx: Context, copy: string, sdkCache: string): Promise<BuildResult> {
   await copyPackage(ctx.pkgDir, copy);
   const seeded = await seedFiles(sdkCache, join(copy, SDK_CACHE));
-  log(`clean engine build in ${copy}${seeded ? ` (${seeded} SDK tarballs seeded)` : ''}`);
+  const note = seeded ? ` (${seeded} SDK tarballs seeded)` : '';
+  log(`clean engine build in ${copy}${note}`);
 
   const proc = Bun.spawn([process.execPath, join('scripts', 'prepare-engine.ts')], {
     cwd: copy,

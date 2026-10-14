@@ -77,7 +77,7 @@ OpenSSL's build info today, so this guards against it being linked in later.
 and fails unless `pglite.wasi`, `engine.core.wasm`, `engine.wasm` and every
 embedded support file have the same sha256. The builds go in a new
 `df-pglite-repro.*` directory under the system temp dir, or under
-`REPRO_ARGS="--work-dir DIR"`, which must be outside the repository checkout.
+`REPRO_ARGS="--work-dir DIR"`, an existing directory outside the repository checkout.
 Only that new directory is deleted, and it is kept if a build fails or the
 digests differ. `--sdk-cache DIR` reuses SDK tarballs you have already
 downloaded, and `--keep` keeps both builds. The
