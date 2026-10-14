@@ -1235,11 +1235,12 @@ export class Controller {
    * `registryPullWaitMs`. After a host (re)start its workloads pull while `di-tenant-registry` on
    * the same host is still starting: the host then refuses the connection, or answers the empty
    * 404 wash gives a `Host` no workload serves yet. Both are retried with a short backoff, as is
-   * the registry's own `503 UNAVAILABLE` (it cannot reach this controller's whoami yet; told
-   * by its OCI code on a GET and by its JSON `content-type` on a HEAD, see
+   * the registry's own `503 UNAVAILABLE` (it cannot reach this controller's whoami yet; told by
+   * its OCI code on a GET and by its JSON `content-type` on a HEAD, see
    * {@link registryUnavailable}); any other answer from the registry itself (its errors are OCI
-   * JSON) is final. Reading a `503` body for its code is bounded by `registryUpstreamTimeoutMs`. The wait is bounded and only delays this one pull, so a host that serves the
-   * registry is never held back by it.
+   * JSON) is final. Reading a `503` body for its code is bounded by `registryUpstreamTimeoutMs`.
+   * The wait is bounded and only delays this one pull, so a host that serves the registry is never
+   * held back by it.
    *
    * The pool slot is given back between attempts, so pulls waiting out a host restart do not
    * turn away the other pulls; an attempt takes a slot again first, and a pull that finds none
@@ -1256,24 +1257,11 @@ export class Controller {
     let delay = REGISTRY_PULL_RETRY_INITIAL_MS;
     for (let tries = 0; ; tries++) {
       const outcome = await attemptPull(send, signal);
-      const { response } = outcome;
-      let reason = response
-        ? `the host answered ${response.status} before the registry was serving`
-        : String(outcome.failure);
-      if (response && !registryNotServing(response)) {
-        // Only a 503 can be the registry's UNAVAILABLE, so only a 503 starts a body-read timer.
-        if (response.status !== 503) return response;
-        const bodyRead = AbortSignal.any([
-          signal,
-          AbortSignal.timeout(this.config.registryUpstreamTimeoutMs),
-        ]);
-        const unavailable = await registryUnavailable(response, { head, signal: bodyRead });
-        signal.throwIfAborted();
-        if (!unavailable) return response;
-        reason = 'the registry answered 503 UNAVAILABLE';
-      }
+      const reason = await this.pullRetryReason(outcome, signal, head);
+      // Without a reason to retry, the attempt has the registry's final answer.
+      if (reason === undefined) return outcome.response;
       if (Date.now() + delay > deadline) return settle(outcome);
-      await response?.body?.cancel().catch(() => {});
+      await outcome.response?.body?.cancel().catch(() => {});
       if (tries === 0)
         this.audit('registry.waiting', { path: url.pathname, listener: 'registry-pull', reason });
       slot.release();
@@ -1281,6 +1269,30 @@ export class Controller {
       if (next === undefined) return undefined;
       delay = next;
     }
+  }
+
+  /**
+   * Why a host pull attempt is retried (#197), or undefined when its answer is final: a failed
+   * attempt, the host's own answer while the registry is not serving, or the registry's
+   * `503 UNAVAILABLE`. Only a `503` can be that, so only a `503` starts a body-read timer.
+   */
+  private async pullRetryReason(
+    outcome: { response?: Response; failure?: unknown },
+    signal: AbortSignal,
+    head: boolean,
+  ): Promise<string | undefined> {
+    const { response } = outcome;
+    if (!response) return String(outcome.failure);
+    if (registryNotServing(response))
+      return `the host answered ${response.status} before the registry was serving`;
+    if (response.status !== 503) return undefined;
+    const bodyRead = AbortSignal.any([
+      signal,
+      AbortSignal.timeout(this.config.registryUpstreamTimeoutMs),
+    ]);
+    const unavailable = await registryUnavailable(response, { head, signal: bodyRead });
+    signal.throwIfAborted();
+    return unavailable ? 'the registry answered 503 UNAVAILABLE' : undefined;
   }
 
   /** Registry front requests in flight (see {@link handleRegistry}). */

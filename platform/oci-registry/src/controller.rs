@@ -227,6 +227,8 @@ impl LogLimit {
     }
 }
 
+// Per component instance, like the whoami cache: if the host instantiates per
+// request, the limit never applies and every failure is logged.
 thread_local! {
     static LOG_LIMIT: RefCell<LogLimit> = RefCell::new(LogLimit::default());
 }

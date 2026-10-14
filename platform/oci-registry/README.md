@@ -132,13 +132,15 @@ It **fails closed**: only a 2xx `Principal` for this tenant with a `viewer` /
 
 A failed whoami call logs its `wasi:http` error code to stderr: the code only,
 never its payload, the URL or the credential, and a given code at most once a
-minute (the next line says how many were left out). Configuration-type codes
-(the host's outgoing-HTTP policy, TLS against the controller, such as a
-rejected certificate, a server alert like `unknown_ca` or TLS spoken to a
-plain-HTTP port, and requests the host will never send) cannot clear on retry,
-so they get the challenge rather than a `503`. A controller `429` also gets the
-challenge: whoami is not rate-limited, so the registry does not treat it as
-temporary.
+minute (the next line says how many were left out). Like the whoami cache, that
+limit lives in the component instance, so it only applies if one instance
+serves more than one request; if wash instantiates per request (unverified, see
+above), every failure is logged. Configuration-type codes (the host's
+outgoing-HTTP policy, TLS against the controller, such as a rejected
+certificate, a server alert like `unknown_ca` or TLS spoken to a plain-HTTP
+port, and requests the host will never send) cannot clear on retry, so they get
+the challenge rather than a `503`. A controller `429` also gets the challenge:
+whoami is not rate-limited, so the registry does not treat it as temporary.
 
 The `503` covers a controller restart or an identity issuer outage (the
 controller answers its own `503` while OIDC discovery is pending), so

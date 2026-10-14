@@ -168,21 +168,6 @@ describe('host pulls wait for the registry', () => {
     expect((await answer.json()).errors[0].code).toBe('UNAVAILABLE');
   });
 
-  test('a pull answered 503 UNAVAILABLE by the registry waits until it serves', async () => {
-    const controller = make();
-    controller.proxyUpstream = () => origin;
-    const path = '/v2/acme/app/blobs/sha256:whoami-down';
-    unavailable.set(path, 2);
-    events.length = 0;
-    const response = await controller.handleRegistryPull(pullRequest(path));
-    expect(response.status).toBe(200);
-    expect(await response.text()).toBe('blob');
-    expect(hits.get(path)).toBe(3);
-    const waiting = events.filter((e) => e.event === 'registry.waiting');
-    expect(waiting).toHaveLength(1);
-    expect(waiting[0]?.reason).toBe('the registry answered 503 UNAVAILABLE');
-  });
-
   test('a body that stops arriving is not UNAVAILABLE once the read times out', async () => {
     const stalled = new Response(stalledBody(), {
       status: 503,
@@ -193,19 +178,23 @@ describe('host pulls wait for the registry', () => {
     expect(Date.now() - started).toBeLessThan(1_000);
   });
 
-  test('a HEAD pull answered 503 UNAVAILABLE by the registry waits until it serves', async () => {
-    const controller = make();
-    controller.proxyUpstream = () => origin;
-    const path = '/v2/acme/app/blobs/sha256:whoami-down-head';
-    unavailable.set(path, 2);
-    events.length = 0;
-    const response = await controller.handleRegistryPull(pullRequest(path, { method: 'HEAD' }));
-    expect(response.status).toBe(200);
-    expect(hits.get(path)).toBe(3);
-    const waiting = events.filter((e) => e.event === 'registry.waiting');
-    expect(waiting).toHaveLength(1);
-    expect(waiting[0]?.reason).toBe('the registry answered 503 UNAVAILABLE');
-  });
+  test.each(['GET', 'HEAD'])(
+    'a %s pull answered 503 UNAVAILABLE by the registry waits until it serves',
+    async (method) => {
+      const controller = make();
+      controller.proxyUpstream = () => origin;
+      const path = `/v2/acme/app/blobs/sha256:whoami-down-${method}`;
+      unavailable.set(path, 2);
+      events.length = 0;
+      const response = await controller.handleRegistryPull(pullRequest(path, { method }));
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe(method === 'HEAD' ? '' : 'blob');
+      expect(hits.get(path)).toBe(3);
+      const waiting = events.filter((e) => e.event === 'registry.waiting');
+      expect(waiting).toHaveLength(1);
+      expect(waiting[0]?.reason).toBe('the registry answered 503 UNAVAILABLE');
+    },
+  );
 
   test('a registry 503 whose body stalls is returned once the read times out', async () => {
     const controller = make({ TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS: '200' });
