@@ -345,6 +345,14 @@ Redis/NATS reconciliation and binding projection use this install path. The
 upcoming release adds dedicated PostgreSQL instances, persistent storage, and
 workload-managed associations; see [Dedicated PostgreSQL](#dedicated-postgresql-upcoming-release).
 
+The controller writes tenant RBAC without `escalate` (#115): its ClusterRole holds
+every rule of every Role it writes, and grants `bind` only on the fixed-name Roles
+it binds (`CONTROLLER_BOUND_ROLES` in `src/tenancy/install.ts`). TokenRequest
+(`serviceaccounts/token` `create`), which each `di-tenant-controller-<tenant>` Role
+grants, is held only in the platform namespace through the `<installation>-controller`
+Role and RoleBinding. `tests/controller-rbac.test.ts` checks this against the
+rendered objects.
+
 Schemas and helpers live in `src/tenancy/backing-services.ts` and are included in the
 platform `crds` export from `src/tenancy/resources.ts`. Class seeding and controller
 script packaging live in `src/tenancy/install.ts`. Per-tick Redis/NATS provisioning
