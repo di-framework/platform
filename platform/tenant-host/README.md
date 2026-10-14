@@ -408,8 +408,8 @@ Latest published images (multi-arch index digests; the bot PR keeps this table c
 
 | Variant | Image |
 | --- | --- |
-| `wasi-tls` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:805a47c0050a90e8dcf22de8e844da91da38b2d8f2da26170ace7c624af76584` |
-| `wasi-tls-exclusive` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:933d26ec01dade4af7e0d10b877c9afad5371256147cf6db4aff42ecd0c28ec2` |
+| `wasi-tls` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:76c78e4a5888b48eb9abd89f02c5f58c5aa5bcd0a7d2fefe72b323a17ea43d77` |
+| `wasi-tls-exclusive` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:ef510b78221d5b5c7edef7203d8837b8cae35a31535376b2b034e689f909d2ab` |
 
 The same pin PR (`scripts/pin-artifact.ts`, #346) also updates the platform code that names host
 builds, from the [`variants`](variants) table: the canonical variant (its first row) moves the
@@ -428,7 +428,7 @@ The tags are mutable. The platform default `hostImage` is pinned to the canonica
 0002 and 0003 (and without the unnamed-import lease, #13). The platform lets a tenant registry use
 its NATS credentials only on host images it knows carry 0003 (`NATS_CREDENTIALS_HOST_IMAGE_DIGESTS`):
 
-`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:805a47c0050a90e8dcf22de8e844da91da38b2d8f2da26170ace7c624af76584`
+`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:76c78e4a5888b48eb9abd89f02c5f58c5aa5bcd0a7d2fefe72b323a17ea43d77`
 
 `tenantHostImage` overrides it. The workflow summary prints the digest of each later publish.
 Tenant hosts never run `--allow-insecure-registries`; with `insecureRegistry` they get
@@ -464,7 +464,7 @@ The registry Service is ClusterIP, so a node-pullable reference needs a NodePort
 Set the platform config used by the stack (`tenantHostImage` / `tenantHostImagePullPolicy`):
 
 ```sh
-pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:805a47c0050a90e8dcf22de8e844da91da38b2d8f2da26170ace7c624af76584
+pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:76c78e4a5888b48eb9abd89f02c5f58c5aa5bcd0a7d2fefe72b323a17ea43d77
 pulumi config set tenantHostImagePullPolicy IfNotPresent
 ```
 
@@ -472,7 +472,7 @@ or, with `di-framework-kube`, in the `--platform-config` JSON:
 
 ```json
 {
-  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:805a47c0050a90e8dcf22de8e844da91da38b2d8f2da26170ace7c624af76584",
+  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:76c78e4a5888b48eb9abd89f02c5f58c5aa5bcd0a7d2fefe72b323a17ea43d77",
   "tenantHostImagePullPolicy": "IfNotPresent"
 }
 ```
