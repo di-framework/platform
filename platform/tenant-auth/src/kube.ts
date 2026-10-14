@@ -38,6 +38,15 @@ export interface SecretResource {
   stringData?: Record<string, string>;
   type?: string;
 }
+export interface ConfigMapResource {
+  metadata: { name: string; namespace?: string };
+  data?: Record<string, string>;
+}
+/**
+ * The ConfigMap in the runtime namespace where the platform lists the tenant's active members
+ * (#321), as a JSON array of user names under `members`.
+ */
+export const MEMBERS_CONFIG = 'tenant-controller-members';
 export interface MintedToken {
   token: string;
   expirationTimestamp: string;
@@ -205,8 +214,17 @@ export class KubeClient {
     }
   }
 
-  getUser(name: string): Promise<UserResource | undefined> {
-    return this.optional(`${usersPath}/${encodeURIComponent(name)}`);
+  /**
+   * A User by name. The tenant controller may read only its tenant's active members (#321), so
+   * the API server's 403 for anyone else means the same as a 404: no active member of that name.
+   */
+  async getUser(name: string): Promise<UserResource | undefined> {
+    try {
+      return await this.optional<UserResource>(`${usersPath}/${encodeURIComponent(name)}`);
+    } catch (error) {
+      if (error instanceof KubeError && error.status === 403) return undefined;
+      throw error;
+    }
   }
   listUsers(): Promise<{ items: UserResource[] }> {
     return this.call('GET', usersPath);
@@ -236,6 +254,9 @@ export class KubeClient {
     return result.status;
   }
 
+  getConfigMap(namespace: string, name: string): Promise<ConfigMapResource | undefined> {
+    return this.optional(`/api/v1/namespaces/${namespace}/configmaps/${encodeURIComponent(name)}`);
+  }
   listSecrets(namespace: string, labelSelector: string): Promise<{ items: SecretResource[] }> {
     return this.call(
       'GET',

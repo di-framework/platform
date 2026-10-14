@@ -41,8 +41,33 @@ const WATCH = ['{"type":"ADDED","object":{"n":1}}\n', '{"type":"MODIFIED","objec
 function fakeApiServer() {
   const validTokens = new Set<string>();
   const secrets = new Map<string, SecretResource>();
-  const state = { minted: 0, mintFails: false, users: [] as unknown[] };
+  const state = {
+    minted: 0,
+    mintFails: false,
+    users: [] as { metadata: { name: string }; spec?: unknown }[],
+    /** The published member list (#321); undefined answers 403, as an older platform does. */
+    members: undefined as string | undefined,
+    /** Users the controller may read by name; the rest answer 403. */
+    readable: [] as string[],
+  };
   const server = serve((request) => {
+    if (
+      request.pathname === '/api/v1/namespaces/di-runtime-acme/configmaps/tenant-controller-members'
+    )
+      return state.members === undefined
+        ? json({ message: 'forbidden' }, 403)
+        : json({
+            metadata: { name: 'tenant-controller-members' },
+            data: { members: state.members },
+          });
+    const byName = /^\/apis\/platform\.di-framework\.dev\/v1alpha1\/users\/([^/]+)$/.exec(
+      request.pathname,
+    );
+    if (byName?.[1]) {
+      if (!state.readable.includes(byName[1])) return json({ message: 'forbidden' }, 403);
+      const found = state.users.find((u) => u.metadata.name === byName[1]);
+      return found ? json(found) : json({ message: 'not found' }, 404);
+    }
     if (request.pathname === '/api/v1/namespaces/wasmcloud/serviceaccounts/di-user-alice/token') {
       if (state.mintFails)
         return json({ message: 'serviceaccounts "di-user-alice" not found' }, 404);
@@ -436,6 +461,36 @@ describe('Controller', () => {
       ],
     });
     expect((await call('GET', '/-/healthz', 'Bearer nope')).status).toBe(200);
+  });
+
+  test('reads the published members by name instead of listing every User (#321)', async () => {
+    api.state.users = [
+      {
+        metadata: { name: 'alice' },
+        spec: { memberships: [{ tenant: 'acme', role: 'developer' }] },
+      },
+      { metadata: { name: 'bob' }, spec: { memberships: [{ tenant: 'acme', role: 'viewer' }] } },
+      // Not a member: listing every User would reach it, reading by name does not.
+      { metadata: { name: 'eve' }, spec: { memberships: [{ tenant: 'acme', role: 'viewer' }] } },
+    ];
+    // carol was removed (404), dave's grant was already dropped (403): both are skipped.
+    api.state.members = JSON.stringify(['alice', 'bob', 'carol', 'dave']);
+    api.state.readable = ['alice', 'bob', 'carol'];
+    try {
+      expect(await (await call('GET', '/-/members')).json()).toEqual({
+        members: [
+          { user: 'alice', role: 'developer', suspended: false },
+          { user: 'bob', role: 'viewer', suspended: false },
+        ],
+      });
+      api.state.members = JSON.stringify([]);
+      expect(await (await call('GET', '/-/members')).json()).toEqual({ members: [] });
+      api.state.members = JSON.stringify({ alice: true });
+      expect((await call('GET', '/-/members')).status).toBeGreaterThanOrEqual(500);
+    } finally {
+      api.state.members = undefined;
+      api.state.readable = [];
+    }
   });
 });
 
