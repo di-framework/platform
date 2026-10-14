@@ -63,6 +63,61 @@ pub fn is_root_path(path: &str) -> bool {
     normalize(path).is_empty()
 }
 
+/// The directory part of `path` when its last component is a marker name:
+/// `a/link/.di-encfs` gives `a/link`, `.di-encfs` gives `""` (the descriptor
+/// itself). Trailing slashes are ignored. The directory part is returned as
+/// written, so the host resolves its `..` and symlinks exactly as it would
+/// for the operation itself (#349).
+pub fn marker_parent(path: &str) -> Option<&str> {
+    let path = path.trim_end_matches('/');
+    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+    is_marker_name(name).then_some(parent)
+}
+
+/// Whether any component of `path` is a marker name. Used for symlink
+/// targets: the directory such a link would resolve in is only known when
+/// it is followed, so a link that names a marker is never created (#349).
+pub fn names_marker(path: &str) -> bool {
+    path.split('/').any(is_marker_name)
+}
+
+/// What a guarded directory descriptor can tell about the directories its
+/// paths lead to.
+pub trait Namespace {
+    /// What the host identifies a directory by (device and inode).
+    type Id: PartialEq;
+
+    /// The identity of what `path` resolves to from this descriptor, with
+    /// every symlink followed; `""` is the descriptor itself. `None` when the
+    /// lookup fails.
+    fn identity(&self, path: &str) -> Option<Self::Id>;
+}
+
+/// Whether `path`, relative to `dir`, may name a marker file of the preopen
+/// whose root has identity `root` (`None` when unknown).
+///
+/// The directory that would hold the marker name is resolved by the host,
+/// so `.`, `..` and symlinks anywhere in the path, including chains of them,
+/// are followed exactly as the operation would follow them. If it is the
+/// root, or cannot be identified, the path is refused (#207, #349).
+pub fn may_reach_marker<N: Namespace>(
+    dir: &N,
+    root: Option<&N::Id>,
+    dir_is_root: bool,
+    path: &str,
+) -> bool {
+    if dir_is_root && is_marker_path(path) {
+        return true;
+    }
+    let Some(parent) = marker_parent(path) else {
+        return false;
+    };
+    match (root, dir.identity(parent)) {
+        (Some(root), Some(id)) => id == *root,
+        _ => true,
+    }
+}
+
 pub fn encode(kcv: &Kcv) -> [u8; MARKER_LEN] {
     let mut bytes = [0u8; MARKER_LEN];
     bytes[..MARKER_MAGIC.len()].copy_from_slice(MARKER_MAGIC);
@@ -314,6 +369,142 @@ mod tests {
         ] {
             assert!(!is_root_path(path), "{path}");
         }
+    }
+
+    /// Directory identities as the host would report them after following
+    /// every symlink: `a/up` links to the root, `a/c1 -> c2 -> ..` is a chain
+    /// to the root, `a/ok` links to `b`, an ordinary directory.
+    struct Tree(&'static [(&'static str, u32)]);
+
+    impl Namespace for Tree {
+        type Id = u32;
+
+        fn identity(&self, path: &str) -> Option<u32> {
+            self.0.iter().find(|(p, _)| *p == path).map(|(_, id)| *id)
+        }
+    }
+
+    const ROOT: u32 = 1;
+    const FROM_ROOT: Tree = Tree(&[
+        ("", ROOT),
+        ("a", 2),
+        ("a/up", ROOT),
+        ("a/up/", ROOT),
+        ("a/up/.", ROOT),
+        ("a/c1", ROOT),
+        ("a/c2", ROOT),
+        ("a/c1/a/c1", ROOT),
+        ("a/ok", 3),
+        ("b", 3),
+        ("pglite/..", ROOT),
+    ]);
+    /// The same tree seen from a descriptor opened on `a`.
+    const FROM_A: Tree = Tree(&[("", 2), ("up", ROOT), ("c1", ROOT), ("ok", 3)]);
+    /// A descriptor opened on `a/up`: the root under another path.
+    const FROM_UP: Tree = Tree(&[("", ROOT), ("ok", 2)]);
+
+    #[test]
+    fn marker_parents_are_split_off_as_written() {
+        assert_eq!(marker_parent(".di-encfs"), Some(""));
+        assert_eq!(marker_parent(".di-encfs.tmp"), Some(""));
+        assert_eq!(marker_parent("a/up/.di-encfs"), Some("a/up"));
+        assert_eq!(marker_parent("a/up/.di-encfs//"), Some("a/up"));
+        assert_eq!(marker_parent("a/up//.di-encfs"), Some("a/up/"));
+        assert_eq!(marker_parent("a/../.di-encfs"), Some("a/.."));
+        assert_eq!(marker_parent("a/.di-encfs/x"), None);
+        assert_eq!(marker_parent("a/up/.di-encfs2"), None);
+        assert_eq!(marker_parent("a/up"), None);
+        assert_eq!(marker_parent(""), None);
+        assert!(names_marker("../.di-encfs") && names_marker("x/.di-encfs.tmp/y"));
+        assert!(!names_marker("..") && !names_marker("data/.di-encfs2"));
+    }
+
+    #[test]
+    fn a_symlink_anywhere_in_the_path_cannot_reach_the_marker() {
+        // #349: a symlink to the root partway through the path, and a chain.
+        for path in [
+            ".di-encfs",
+            "a/up/.di-encfs",
+            "a/up/.di-encfs.tmp",
+            "a/up/.di-encfs/",
+            "a/up//.di-encfs",
+            "a/up/./.di-encfs",
+            "a/c1/.di-encfs",
+            "a/c2/.di-encfs",
+            "a/c1/a/c1/.di-encfs",
+            "pglite/../.di-encfs",
+        ] {
+            assert!(
+                may_reach_marker(&FROM_ROOT, Some(&ROOT), true, path),
+                "{path}"
+            );
+        }
+        // From a descriptor that is not the root, through a link to it.
+        for path in ["up/.di-encfs", "c1/.di-encfs", "up/.di-encfs.tmp"] {
+            assert!(
+                may_reach_marker(&FROM_A, Some(&ROOT), false, path),
+                "{path}"
+            );
+        }
+        // A descriptor that names the root under another path.
+        assert!(may_reach_marker(&FROM_UP, Some(&ROOT), false, ".di-encfs"));
+        assert!(!may_reach_marker(
+            &FROM_UP,
+            Some(&ROOT),
+            false,
+            "ok/.di-encfs"
+        ));
+    }
+
+    #[test]
+    fn ordinary_paths_and_symlinks_keep_working() {
+        for path in [
+            "a/ok/.di-encfs",
+            "b/.di-encfs",
+            "a/up",
+            "a/up/pglite",
+            "a/ok/file",
+            "a/c1/data",
+            ".di-encfs2",
+        ] {
+            assert!(
+                !may_reach_marker(&FROM_ROOT, Some(&ROOT), true, path),
+                "{path}"
+            );
+        }
+        assert!(!may_reach_marker(
+            &FROM_A,
+            Some(&ROOT),
+            false,
+            "ok/.di-encfs"
+        ));
+        assert!(!may_reach_marker(&FROM_A, Some(&ROOT), false, ".di-encfs"));
+    }
+
+    #[test]
+    fn an_unknown_directory_or_root_is_refused() {
+        // A failed lookup (missing directory, a link out of the preopen) and
+        // an unknown root identity both fail closed, for marker names only.
+        assert!(may_reach_marker(
+            &FROM_ROOT,
+            Some(&ROOT),
+            true,
+            "gone/.di-encfs"
+        ));
+        assert!(may_reach_marker(
+            &FROM_ROOT,
+            Some(&ROOT),
+            true,
+            "../.di-encfs"
+        ));
+        assert!(may_reach_marker(&FROM_A, None, false, "ok/.di-encfs"));
+        assert!(!may_reach_marker(&FROM_A, None, false, "ok/file"));
+        assert!(!may_reach_marker(
+            &FROM_ROOT,
+            Some(&ROOT),
+            true,
+            "gone/file"
+        ));
     }
 
     #[test]

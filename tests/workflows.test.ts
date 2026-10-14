@@ -168,6 +168,12 @@ const SPECS: Spec[] = [
     image: 'ghcr.io/di-framework/pglite-encfs',
     paths: [
       'platform/pglite-encfs/**',
+      '!platform/pglite-encfs/tests/**',
+      '!platform/pglite-encfs/src/testdata/**',
+      '!platform/pglite-encfs/scripts/smoke.ts',
+      '!platform/pglite-encfs/scripts/unit.ts',
+      '!platform/pglite-encfs/scripts/lib/tear.ts',
+      '!platform/pglite-encfs/scripts/**/*.test.ts',
       'platform/wasm-component-publisher/**',
       'Cargo.toml',
       'Cargo.lock',
@@ -515,6 +521,43 @@ test('publish paths reuse the paths the image checks already maintain', () => {
   expect(pushPaths(read('.github/workflows/tenant-host-image.yml'))[0]).toBe(
     'platform/tenant-host/**',
   );
+});
+
+test('pglite-encfs publishes for its build inputs but not for test-only changes', () => {
+  const paths = pushPaths(read('.github/workflows/pglite-encfs-publish.yml'));
+  const listed = Bun.spawnSync(['git', 'ls-files', 'platform/pglite-encfs'], {
+    cwd: resolve(import.meta.dir, '..'),
+  });
+  const files = listed.stdout.toString().split('\n').filter(Boolean);
+  const testOnly = (file: string) =>
+    /^platform\/pglite-encfs\/(tests\/|src\/testdata\/|scripts\/(smoke|unit)\.ts$|scripts\/lib\/tear\.ts$|scripts\/.*\.test\.ts$)/.test(
+      file,
+    ) || file.endsWith('.md');
+  expect(files.filter(testOnly).length).toBeGreaterThan(0);
+  for (const file of files) expect(matchesPathFilter(paths, file), file).toBe(!testOnly(file));
+  for (const file of [
+    'platform/pglite-encfs/src/component.rs',
+    'platform/pglite-encfs/src/marker.rs',
+    'platform/pglite-encfs/wit/world.wit',
+    'platform/pglite-encfs/scripts/build.ts',
+    'platform/pglite-encfs/scripts/lib/env.ts',
+    'platform/pglite-encfs/scripts/lib/wit.ts',
+    'platform/pglite-encfs/Makefile',
+    'platform/pglite-encfs/Cargo.toml',
+    'platform/pglite-encfs/build-support/main.rs',
+  ]) {
+    expect(files, file).toContain(file);
+    expect(matchesPathFilter(paths, file), file).toBe(true);
+  }
+  for (const file of [
+    'platform/pglite-encfs/tests/root-probe/src/lib.rs',
+    'platform/pglite-encfs/src/testdata/xts-kat.txt',
+    'platform/pglite-encfs/scripts/smoke.ts',
+    'platform/pglite-encfs/scripts/lib/tear.test.ts',
+  ]) {
+    expect(files, file).toContain(file);
+    expect(matchesPathFilter(paths, file), file).toBe(false);
+  }
 });
 
 test('merging a pin PR never republishes its own artifact, and any other publish it starts ends there', () => {

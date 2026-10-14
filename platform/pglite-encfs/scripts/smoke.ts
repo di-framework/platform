@@ -11,7 +11,9 @@
  *   4. Wrong, missing and invalid keys and a legacy plaintext directory are
  *      refused cleanly, leaving the tree byte-identical. The root probe
  *      (tests/root-probe) checks that the root reopened as `.`, `pglite/..` or
- *      through a symlink keeps the marker hidden and out of reach (#207).
+ *      through a symlink keeps the marker hidden and out of reach (#207), also
+ *      through a symlink partway through a path or a chain of them (#349),
+ *      while ordinary symlinks keep working.
  *   5. Power-loss torn writes (the spike's cases) keep fsynced commits.
  *   6. Rotation re-wraps every header, including encfs files fsck moved into
  *      lost+found (fragments there are left and reported), names a stub that
@@ -171,7 +173,7 @@ class Harness {
       console.error(output.split('\n').slice(-60).join('\n'));
       throw new Error(`${name}: exit ${code}, expected root-probe ok`);
     }
-    log('root-probe: every descriptor naming the root keeps the marker guard');
+    log('root-probe: every descriptor and every path reaching the root keeps the marker guard');
   }
 
   private async exec(
@@ -586,13 +588,16 @@ export async function smoke(ctx: Context): Promise<void> {
     await writeFile(autoConf, savedConf);
     await h.run(enc, data, 'marker-read', A, 'marker-read ok');
 
-    // The root reopened as `.`, `pglite/..` or through a symlink keeps the
-    // marker hidden and out of reach (#207); the probe leaves the tree as it was.
+    // The root reopened as `.`, `pglite/..` or through a symlink, also one
+    // partway through a path or a chain of them, keeps the marker hidden and
+    // out of reach (#207, #349); the probe leaves the tree as it was.
     const beforeProbe = await treeHash(data);
     await h.probe(rootProbe, data, A);
     if ((await treeHash(data)) !== beforeProbe) throw new Error('the root probe changed the tree');
-    if ((await readdir(data)).includes('root-probe-loop'))
-      throw new Error('the root probe left its symlink behind');
+    for (const dir of [data, join(data, 'pglite')]) {
+      const left = (await readdir(dir)).filter((name) => name.startsWith('root-probe-'));
+      if (left.length > 0) throw new Error(`the root probe left ${left.join(', ')} in ${dir}`);
+    }
 
     // A crash while creating a file (#201 review W1): the new relation files'
     // size is durable but their header is not (zeroed, or cut short). They hold

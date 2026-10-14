@@ -1,7 +1,8 @@
 //! The WASI glue: re-exports the interfaces pglite imports and serves every
 //! regular file under a preopen through [`crate::file`].
 //!
-//! - Directories, names, symlinks and metadata pass through unchanged.
+//! - Directories, names, symlinks and metadata pass through unchanged, except
+//!   that the root's markers are out of reach (see [`marker::may_reach_marker`]).
 //! - Host streams (stdio) and host pollables pass through. File streams are
 //!   served from decrypted memory, with always-ready pollables.
 //! - `wasi:cli/environment` is re-exported only to hide the key variables from
@@ -624,7 +625,10 @@ pub enum Descriptor {
     Passthrough {
         host: hfs::Descriptor,
         flags: xfs::DescriptorFlags,
+        /// This descriptor names the preopen root: its listing hides the markers.
         root: bool,
+        /// The preopen root's identity, `None` if the host could not tell.
+        root_id: Option<DirId>,
     },
     /// A preopen that failed its key check: data and namespace operations fail.
     Locked {
@@ -851,10 +855,12 @@ impl xpre::Guest for Component {
                             .get_flags()
                             .map(guest_flags)
                             .unwrap_or(xfs::DescriptorFlags::READ);
+                        let root_id = dir.metadata_hash().ok().map(dir_id);
                         Descriptor::Passthrough {
                             host: dir,
                             flags,
                             root: true,
+                            root_id,
                         }
                     }
                     Err(error) => Descriptor::Locked { host: dir, error },
@@ -876,12 +882,19 @@ impl Descriptor {
     }
 
     /// Fail data and namespace operations on a locked preopen, and keep the
-    /// marker out of reach at the root.
+    /// markers out of reach from every directory descriptor, however the path
+    /// gets to the root (see [`marker::may_reach_marker`]).
     fn guard(&self, path: Option<&str>) -> R<()> {
         match self {
             Descriptor::Locked { error, .. } => Err(*error),
-            Descriptor::Passthrough { root: true, .. }
-                if path.is_some_and(marker::is_marker_path) =>
+            Descriptor::Passthrough {
+                host,
+                root,
+                root_id,
+                ..
+            } if path.is_some_and(|path| {
+                marker::may_reach_marker(&HostNamespace(host), root_id.as_ref(), *root, path)
+            }) =>
             {
                 Err(ErrorCode::Access)
             }
@@ -897,15 +910,48 @@ impl Descriptor {
     fn is_root(&self) -> bool {
         matches!(self, Descriptor::Passthrough { root: true, .. })
     }
+
+    fn root_id(&self) -> Option<DirId> {
+        match self {
+            Descriptor::Passthrough { root_id, .. } => *root_id,
+            _ => None,
+        }
+    }
 }
 
-/// Whether two host descriptors may name the same directory. Paths alone miss
-/// a symlink back to the root, so compare what the host identifies them by. A
-/// failed lookup answers yes: treating a directory as the root only hides and
-/// guards the marker names in it.
-fn may_be_same_directory(a: &hfs::Descriptor, b: &hfs::Descriptor) -> bool {
-    match (a.metadata_hash(), b.metadata_hash()) {
-        (Ok(a), Ok(b)) => a.lower == b.lower && a.upper == b.upper,
+/// What the host identifies a file or directory by: its `metadata-hash`, which
+/// wasmtime derives from the device and inode.
+type DirId = (u64, u64);
+
+fn dir_id(hash: hfs::MetadataHashValue) -> DirId {
+    (hash.lower, hash.upper)
+}
+
+/// Path lookups for the marker guard, resolved by the host itself, so `..`
+/// and symlinks are followed exactly as the guarded operation follows them.
+struct HostNamespace<'a>(&'a hfs::Descriptor);
+
+impl marker::Namespace for HostNamespace<'_> {
+    type Id = DirId;
+
+    fn identity(&self, path: &str) -> Option<DirId> {
+        let hash = if path.is_empty() {
+            self.0.metadata_hash()
+        } else {
+            self.0
+                .metadata_hash_at(hfs::PathFlags::SYMLINK_FOLLOW, path)
+        };
+        hash.ok().map(dir_id)
+    }
+}
+
+/// Whether `dir` may be the preopen root. Paths alone miss a symlink back to
+/// it, so compare what the host identifies them by. A failed or unknown
+/// lookup answers yes: treating a directory as the root only hides and guards
+/// the marker names in it.
+fn may_be_root(dir: &hfs::Descriptor, root_id: Option<DirId>) -> bool {
+    match (dir.metadata_hash(), root_id) {
+        (Ok(hash), Some(root)) => dir_id(hash) == root,
         _ => true,
     }
 }
@@ -1085,15 +1131,17 @@ impl xfs::GuestDescriptor for Descriptor {
             .map_err(host)?;
         let stat = fd.stat().map_err(host)?;
         if stat.type_ != hfs::DescriptorType::RegularFile {
-            // The root reopened (`.`, `pglite/..`, a symlink to it) keeps the
-            // marker guard and listing filter (#207).
-            let root = self.is_root()
-                && stat.type_ == hfs::DescriptorType::Directory
-                && (marker::is_root_path(&path) || may_be_same_directory(&fd, self.host()));
+            // The root reopened (`.`, `pglite/..`, a symlink to it anywhere in
+            // the path, from any descriptor) keeps the listing filter (#207,
+            // #349).
+            let root_id = self.root_id();
+            let root = stat.type_ == hfs::DescriptorType::Directory
+                && ((self.is_root() && marker::is_root_path(&path)) || may_be_root(&fd, root_id));
             return Ok(xfs::Descriptor::new(Descriptor::Passthrough {
                 host: fd,
                 flags,
                 root,
+                root_id,
             }));
         }
         let file = File {
@@ -1162,6 +1210,11 @@ impl xfs::GuestDescriptor for Descriptor {
 
     fn symlink_at(&self, old_path: String, new_path: String) -> R<()> {
         self.guard(Some(&new_path))?;
+        // A link's target is resolved only when it is followed, from wherever
+        // the link then is, so a target naming a marker is never created (#349).
+        if marker::names_marker(&old_path) {
+            return Err(ErrorCode::Access);
+        }
         self.host().symlink_at(&old_path, &new_path).map_err(host)
     }
 

@@ -9,6 +9,9 @@
 # dispatch always builds. publish tags the manifest src-<hash>, and pin opens the bot PR
 # "chore: pin pglite-encfs to <digest>" (scripts/pin-artifact.ts). Only pin holds
 # contents: write and pull-requests: write; only publish holds packages: write.
+#
+# Files that only test the component (the root probe crate, unit test fixtures, the smoke and
+# unit scripts) are not inputs: they cannot change dist/, and ci.yml runs them on every PR (#349).
 name: Publish pglite-encfs component
 
 on:
@@ -17,6 +20,12 @@ on:
     branches: [main]
     paths:
       - 'platform/pglite-encfs/**'
+      - '!platform/pglite-encfs/tests/**'
+      - '!platform/pglite-encfs/src/testdata/**'
+      - '!platform/pglite-encfs/scripts/smoke.ts'
+      - '!platform/pglite-encfs/scripts/unit.ts'
+      - '!platform/pglite-encfs/scripts/lib/tear.ts'
+      - '!platform/pglite-encfs/scripts/**/*.test.ts'
       - 'platform/wasm-component-publisher/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
