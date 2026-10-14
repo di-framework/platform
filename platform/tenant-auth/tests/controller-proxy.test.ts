@@ -2,11 +2,32 @@ import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from 'b
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import {
+  brotliCompressSync,
+  brotliDecompressSync,
+  deflateSync,
+  gunzipSync,
+  gzipSync,
+  zstdCompressSync,
+} from 'node:zlib';
 import { dump } from 'js-yaml';
 import { Controller, configFromEnv } from '../src/controller.ts';
 import { AuthError, type Principal } from '../src/identity.ts';
 import { KubeClient, type SecretResource } from '../src/kube.ts';
 import { type FakeServer, json, serve } from './support/servers.ts';
+
+/** An API object large enough that its encoded and plain sizes differ. */
+const PLAIN = JSON.stringify({ kind: 'ConfigMap', data: { text: 'compressible '.repeat(200) } });
+const ENCODE: Record<string, (body: string) => Uint8Array<ArrayBuffer>> = {
+  gzip: (body) => new Uint8Array(gzipSync(body)),
+  'x-gzip': (body) => new Uint8Array(gzipSync(body)),
+  br: (body) => new Uint8Array(brotliCompressSync(body)),
+  deflate: (body) => new Uint8Array(deflateSync(body)),
+  zstd: (body) => new Uint8Array(zstdCompressSync(body)),
+  // A coding list `fetch` does not decode: the bytes and the header must both pass untouched.
+  'gzip, br': (body) => new Uint8Array(brotliCompressSync(gzipSync(body))),
+};
+const WATCH = ['{"type":"ADDED","object":{"n":1}}\n', '{"type":"MODIFIED","object":{"n":2}}\n'];
 
 /** A slice of the Kubernetes API: TokenRequest, a namespaced resource, users, and Secrets. */
 function fakeApiServer() {
@@ -53,6 +74,31 @@ function fakeApiServer() {
     }
     const token = request.headers.get('authorization')?.slice(7) ?? '';
     if (!validTokens.has(token)) return json({ message: 'Unauthorized' }, 401);
+    if (request.pathname === '/api/v1/namespaces/di-tenant-acme/configmaps/encoded') {
+      const coding = new URLSearchParams(request.path.split('?')[1]).get('coding') ?? '';
+      return new Response(ENCODE[coding.toLowerCase()]?.(PLAIN) ?? PLAIN, {
+        headers: {
+          'content-type': 'application/json',
+          ...(coding ? { 'content-encoding': coding } : {}),
+        },
+      });
+    }
+    if (
+      request.pathname === '/api/v1/namespaces/di-tenant-acme/pods' &&
+      request.path.includes('watch')
+    )
+      return new Response(
+        new ReadableStream({
+          async start(controller) {
+            for (const line of WATCH) {
+              controller.enqueue(new TextEncoder().encode(line));
+              await Bun.sleep(20);
+            }
+            controller.close();
+          },
+        }),
+        { headers: { 'content-type': 'application/json' } },
+      );
     return json({
       echo: { method: request.method, path: request.path, body: request.body, token },
     });
@@ -153,6 +199,63 @@ describe('Controller', () => {
     });
     expect(api.state.minted).toBe(1);
     expect(logged).toEqual(['token.minted', 'request.proxied', 'request.proxied']);
+  });
+
+  describe('relays response codings a client can read (#71)', () => {
+    // The controller behind a real listener, read by a real client: what a kubectl would see.
+    const front = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch: (request) => controller.handle(request),
+    });
+    afterAll(() => front.stop(true));
+    const get = (path: string, init: RequestInit = {}) =>
+      fetch(`http://127.0.0.1:${front.port}${path}`, {
+        ...init,
+        headers: { authorization: 'Bearer ok', ...(init.headers as Record<string, string>) },
+      } as RequestInit);
+    const encoded = (coding: string) =>
+      `/api/v1/namespaces/di-tenant-acme/configmaps/encoded?coding=${encodeURIComponent(coding)}`;
+
+    test.each(['gzip', 'x-gzip', 'br', 'deflate', 'zstd', 'GZIP', 'identity', ''])(
+      'drops the already-decoded %p coding and its stale length',
+      async (coding) => {
+        // Undecoded bytes: the body on the wire is exactly the plain object, with no coding to undo.
+        const raw = await get(encoded(coding), {
+          headers: { 'accept-encoding': 'gzip, br' },
+          decompress: false,
+        } as RequestInit);
+        expect(raw.status).toBe(200);
+        expect(raw.headers.get('content-encoding')).toBeNull();
+        expect(Buffer.from(await raw.arrayBuffer()).toString()).toBe(PLAIN);
+        const length = raw.headers.get('content-length');
+        if (length !== null) expect(Number(length)).toBe(Buffer.byteLength(PLAIN));
+        // An ordinary client (decoding on) reads the object.
+        const read = await get(encoded(coding));
+        expect(await read.json()).toEqual(JSON.parse(PLAIN));
+        expect(api.server.requests.at(-1)?.headers.get('accept-encoding')).not.toBe('gzip, br');
+      },
+    );
+
+    test('relays a coding fetch left encoded, bytes and header untouched', async () => {
+      const raw = await get(encoded('gzip, br'), { decompress: false } as RequestInit);
+      expect(raw.headers.get('content-encoding')).toBe('gzip, br');
+      const bytes = new Uint8Array(await raw.arrayBuffer());
+      expect(bytes).toEqual(new Uint8Array(brotliCompressSync(gzipSync(PLAIN))));
+      expect(gunzipSync(brotliDecompressSync(bytes)).toString()).toBe(PLAIN);
+    });
+
+    test('streams an uncoded watch chunk by chunk', async () => {
+      const response = await get('/api/v1/namespaces/di-tenant-acme/pods?watch=1');
+      expect(response.headers.get('content-encoding')).toBeNull();
+      const reader = (response.body as ReadableStream<Uint8Array>).getReader();
+      const first = await reader.read();
+      expect(new TextDecoder().decode(first.value)).toBe(WATCH[0] as string);
+      let rest = '';
+      for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read())
+        rest += new TextDecoder().decode(chunk.value);
+      expect(rest).toBe(WATCH[1] as string);
+    });
   });
 
   test('never returns the object a Secret DELETE answers with (#112)', async () => {

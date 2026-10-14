@@ -288,8 +288,13 @@ export interface UserKube {
   call<T>(method: string, path: string, body?: unknown): Promise<T>;
 }
 
-/** Caller headers never forwarded to the API server: credentials, identity and hop-by-hop. */
+/**
+ * Caller headers never forwarded to the API server: credentials, identity and hop-by-hop.
+ * `accept-encoding` is left to `fetch`, which then asks only for codings it decodes, so every
+ * caller (the Kubernetes proxy included) reads a plain body (#71).
+ */
 const STRIPPED = new Set([
+  'accept-encoding',
   'authorization',
   'proxy-authorization',
   'cookie',
