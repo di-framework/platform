@@ -116,7 +116,8 @@ export interface PlatformArgs {
  * Published wash 2.8.0 with wasi-tls, patch 0002 (`--insecure-registry`, #149) and patch 0003 (NATS
  * blobstore credentials, #330), which tenant registries need for their own NATS account (#159). The
  * tag moves on the next publish; this digest is the multi-arch index from the tenant-host workflow
- * (pinned in #336) and is listed in `NATS_CREDENTIALS_HOST_IMAGE_DIGESTS`.
+ * and is listed in `NATS_CREDENTIALS_HOST_IMAGE_DIGESTS`. The canonical variant's pin PR
+ * (scripts/pin-artifact.ts, #346) moves it together with the published-images table.
  */
 export const DEFAULT_HOST_IMAGE =
   'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab';

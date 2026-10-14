@@ -124,10 +124,15 @@ test('published implementation provisions tenancy and isolation for an existing 
   expect(cfg).not.toHaveProperty('insecureRegistry');
   // A TLS install: no plain-HTTP registry anywhere.
   expect(cfg.insecureRegistries).toEqual([]);
-  // wash 2.8.0-wasi-tls with patches 0002 (`--insecure-registry`, #149) and 0003 (#159).
-  expect(cfg.hostImage).toBe(
-    'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab',
+  // wash 2.8.0-wasi-tls with patches 0002 (`--insecure-registry`, #149) and 0003 (#159): the
+  // default, which the tenant host pin PR moves (#346).
+  const defaultHostImage = /export const DEFAULT_HOST_IMAGE =\s*'([^']+)'/.exec(
+    readFileSync(join(root, 'src/index.ts'), 'utf8'),
+  )?.[1];
+  expect(defaultHostImage).toMatch(
+    /^ghcr\.io\/di-framework\/wash:2\.8\.0-wasi-tls@sha256:[0-9a-f]{64}$/,
   );
+  expect(cfg.hostImage).toBe(defaultHostImage);
   const scripts = resources.find((r) => r.name === 'configmap-di-platform-controller')?.inputs.data;
   expect(scripts['controller.js']).toContain('class Controller');
   expect(scripts['resources.js']).toContain('tenantResources');

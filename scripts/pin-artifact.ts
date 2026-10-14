@@ -8,9 +8,15 @@
  * A target that no longer matches anything is an error, so the docs cannot drift away
  * from the bot silently.
  *
- * The platform default host image (`DEFAULT_HOST_IMAGE` in platform/platform/src/index.ts)
- * is deliberately not a target: changing the default host is a reviewed decision, not a
- * side effect of a publish. Host variants only update the "Published images" table.
+ * Tenant host variants (`wash-<variant>`, rows of platform/tenant-host/variants) also update
+ * the platform code that names host builds (#346), as read from that table:
+ *   - every variant whose patch set includes 0003 appends its digest to
+ *     `NATS_CREDENTIALS_HOST_IMAGE_DIGESTS` (platform/platform/src/tenancy/registry-nats.ts).
+ *     Older entries stay: existing installs may still run those builds.
+ *   - the canonical variant (the table's first row) moves `DEFAULT_HOST_IMAGE`
+ *     (platform/platform/src/index.ts) and every verbatim mention of the old default in
+ *     {@link DEFAULT_HOST_DOCS}.
+ * Rerunning with the same digests changes nothing.
  *
  * Usage (from the repository root):
  *   bun scripts/pin-artifact.ts <artifact> <sha256:digest> [<artifact> <sha256:digest> ...]
@@ -29,6 +35,17 @@ export interface PinTarget {
 }
 
 const HOST_README = 'platform/tenant-host/README.md';
+/** The tenant host image tag -> patch set table; its first row is the canonical tag. */
+export const HOST_VARIANTS = 'platform/tenant-host/variants';
+export const HOST_IMAGE = 'ghcr.io/di-framework/wash';
+/** Holds `DEFAULT_HOST_IMAGE`, the platform default `tenantHostImage`. */
+export const DEFAULT_HOST_SOURCE = 'platform/platform/src/index.ts';
+/** Docs that quote `DEFAULT_HOST_IMAGE` verbatim; each mention follows the default. */
+export const DEFAULT_HOST_DOCS = [HOST_README, 'platform/platform/assets/platform/README.md'];
+/** Holds `NATS_CREDENTIALS_HOST_IMAGE_DIGESTS`, the host builds known to carry patch 0003. */
+export const NATS_CREDENTIALS_SOURCE = 'platform/platform/src/tenancy/registry-nats.ts';
+export const NATS_CREDENTIALS_PATCH = '0003-nats-blobstore-credentials.patch';
+const NATS_CREDENTIALS_LIST = 'export const NATS_CREDENTIALS_HOST_IMAGE_DIGESTS';
 
 export const ARTIFACTS: Record<string, PinTarget[]> = {
   'tenant-auth': [
@@ -87,21 +104,123 @@ export function pinText(
   return { text: lines.join('\n'), matches };
 }
 
+export interface HostVariant {
+  /** The `wash-<name>` artifact suffix: the tag without its wash version, e.g. `wasi-tls`. */
+  name: string;
+  /** Image tag (IMAGE_VERSION), e.g. `2.8.0-wasi-tls`. */
+  tag: string;
+  /** WASH_PATCHES, in order. */
+  patches: string[];
+  /** The first row: the tag `DEFAULT_HOST_IMAGE` is pinned to. */
+  canonical: boolean;
+}
+
+/** Rows of {@link HOST_VARIANTS}, read the way the publish workflow's resolver reads them. */
+export function parseHostVariants(text: string): HostVariant[] {
+  return text
+    .split('\n')
+    .map((line) => line.trim().split(/\s+/))
+    .filter(([tag]) => tag !== undefined && tag !== '' && !tag.startsWith('#'))
+    .map(([tag = '', ...patches], i) => ({
+      name: tag.slice(tag.indexOf('-') + 1),
+      tag,
+      patches,
+      canonical: i === 0,
+    }));
+}
+
+/** The variant a `wash-<name>` artifact pins, or undefined for any other artifact. */
+export function hostVariant(root: string, artifact: string): HostVariant | undefined {
+  if (!artifact.startsWith('wash-')) return undefined;
+  const name = artifact.slice('wash-'.length);
+  const variant = parseHostVariants(readFileSync(join(root, HOST_VARIANTS), 'utf8')).find(
+    (v) => v.name === name,
+  );
+  if (!variant) throw new Error(`${HOST_VARIANTS}: no row for ${artifact}`);
+  return variant;
+}
+
+/** Point `DEFAULT_HOST_IMAGE` in `text` at `image`; returns the image it named before. */
+export function setDefaultHostImage(
+  text: string,
+  image: string,
+): { text: string; previous: string } {
+  const pattern = /(export const DEFAULT_HOST_IMAGE =\s*')([^'\n]+)(')/;
+  const previous = pattern.exec(text)?.[2];
+  if (previous === undefined) throw new Error(`${DEFAULT_HOST_SOURCE}: no DEFAULT_HOST_IMAGE`);
+  return {
+    text: text.replace(pattern, (_, open, _old, close) => `${open}${image}${close}`),
+    previous,
+  };
+}
+
+/**
+ * Append `digest` to `NATS_CREDENTIALS_HOST_IMAGE_DIGESTS` in `text`, after a `// <label>`
+ * comment. A digest already listed is left alone, and no entry is ever removed.
+ */
+export function allowNatsCredentials(text: string, digest: string, label: string): string {
+  if (!DIGEST.test(digest)) throw new Error(`not a sha256 digest: ${digest}`);
+  const start = text.indexOf(NATS_CREDENTIALS_LIST);
+  const open = start < 0 ? -1 : text.indexOf('[', start);
+  const close = open < 0 ? -1 : text.indexOf('\n];', open);
+  if (close < 0) throw new Error(`${NATS_CREDENTIALS_SOURCE}: no ${NATS_CREDENTIALS_LIST} list`);
+  if (text.slice(open, close).includes(`'${digest}'`)) return text;
+  return `${text.slice(0, close)}\n  // ${label}\n  '${digest}',${text.slice(close)}`;
+}
+
+/** Every file `artifact` may rewrite (relative to the repository root). */
+export function artifactFiles(artifact: string): string[] {
+  const files = (ARTIFACTS[artifact] ?? []).map((t) => t.file);
+  if (artifact.startsWith('wash-')) {
+    files.push(NATS_CREDENTIALS_SOURCE, DEFAULT_HOST_SOURCE, ...DEFAULT_HOST_DOCS);
+  }
+  return [...new Set(files)];
+}
+
 /** Apply every target of `artifact` under `root`; returns the files whose content changed. */
 export function pinArtifact(root: string, artifact: string, digest: string): string[] {
   const targets = ARTIFACTS[artifact];
   if (!targets) {
     throw new Error(`unknown artifact ${artifact}; expected one of ${Object.keys(ARTIFACTS)}`);
   }
+  const variant = hostVariant(root, artifact);
   const changed: string[] = [];
-  for (const target of targets) {
-    const path = join(root, target.file);
+  const edit = (file: string, rewrite: (before: string) => string) => {
+    const path = join(root, file);
     const before = readFileSync(path, 'utf8');
-    const { text, matches } = pinText(before, target, digest);
-    if (matches === 0) throw new Error(`${target.file}: no ${target.ref}@sha256 pin found`);
+    const text = rewrite(before);
     if (text !== before) {
       writeFileSync(path, text);
-      if (!changed.includes(target.file)) changed.push(target.file);
+      if (!changed.includes(file)) changed.push(file);
+    }
+  };
+  for (const target of targets) {
+    edit(target.file, (before) => {
+      const { text, matches } = pinText(before, target, digest);
+      if (matches === 0) throw new Error(`${target.file}: no ${target.ref}@sha256 pin found`);
+      return text;
+    });
+  }
+  if (!variant) return changed;
+  const image = `${HOST_IMAGE}:${variant.tag}@${digest}`;
+  if (variant.patches.includes(NATS_CREDENTIALS_PATCH)) {
+    edit(NATS_CREDENTIALS_SOURCE, (before) =>
+      allowNatsCredentials(before, digest, `${HOST_IMAGE}:${variant.tag}`),
+    );
+  }
+  if (variant.canonical) {
+    let previous = '';
+    edit(DEFAULT_HOST_SOURCE, (before) => {
+      const result = setDefaultHostImage(before, image);
+      previous = result.previous;
+      return result.text;
+    });
+    for (const file of DEFAULT_HOST_DOCS) {
+      edit(file, (before) => {
+        const text = previous === image ? before : before.replaceAll(previous, image);
+        if (!text.includes(image)) throw new Error(`${file}: does not name the default host image`);
+        return text;
+      });
     }
   }
   return changed;

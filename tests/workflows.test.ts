@@ -7,7 +7,7 @@ import { describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { ARTIFACTS } from '../scripts/pin-artifact';
+import { ARTIFACTS, artifactFiles } from '../scripts/pin-artifact';
 import { matchesPathFilter, pushPaths } from '../scripts/source-check';
 import { git, sandboxClone, spawnEnv, stubCommand } from './helpers/spawn-env';
 
@@ -517,12 +517,26 @@ test('publish paths reuse the paths the image checks already maintain', () => {
   );
 });
 
-test('no pin target is an input of any publish workflow, so merging a pin PR publishes nothing', () => {
-  const files = new Set(Object.values(ARTIFACTS).flatMap((targets) => targets.map((t) => t.file)));
-  for (const spec of SPECS) {
-    for (const file of files) expect(matchesPathFilter(spec.paths, file), file).toBe(false);
+test('merging a pin PR never republishes its own artifact, and any other publish it starts ends there', () => {
+  // The tenant host pin also appends to the patch-0003 allowlist (#346), which lives in
+  // platform/platform/src/tenancy/, an input of the tenant-auth image. That is the one publish a
+  // pin PR may start; tenant-auth's own pin touches no input, so the chain stops after one hop.
+  const triggers: string[] = [];
+  for (const pinSpec of SPECS) {
+    for (const file of new Set(pinSpec.artifacts.flatMap(artifactFiles))) {
+      expect(matchesPathFilter(pinSpec.paths, file), `${pinSpec.file}: ${file}`).toBe(false);
+      for (const spec of SPECS) {
+        if (matchesPathFilter(spec.paths, file))
+          triggers.push(`${pinSpec.pinName} -> ${spec.pinName}: ${file}`);
+      }
+    }
   }
-  expect(files.has('platform/platform/src/index.ts')).toBe(false);
+  expect(triggers).toEqual(['wash -> tenant-auth: platform/platform/src/tenancy/registry-nats.ts']);
+  for (const name of Object.keys(ARTIFACTS).filter((n) => !n.startsWith('wash-'))) {
+    for (const file of artifactFiles(name)) {
+      for (const spec of SPECS) expect(matchesPathFilter(spec.paths, file), file).toBe(false);
+    }
+  }
 });
 
 describe('composite actions', () => {
