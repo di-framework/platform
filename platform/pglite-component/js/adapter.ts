@@ -222,7 +222,8 @@ const RFC3339_UTC = /^(\d{4,}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?Z$/;
 /**
  * Formats a `timestamp` variant the way the `wasmcloud:postgres` codec does:
  * `YYYY-MM-DDTHH:MM:SS.mmmZ`. Microseconds are truncated to milliseconds.
- * `infinity`, `-infinity`, and BC dates are returned unchanged.
+ * `infinity` and `-infinity` are returned unchanged. (The provider returns BC dates and other
+ * values it cannot express in RFC 3339 as `text`, so they never reach this function.)
  */
 export function pgliteTimestampIso(value: string): string {
   const match = RFC3339_UTC.exec(value);

@@ -375,6 +375,40 @@ fn main() {
     assert!(matches!(col(&inf, "a"), Value::Timestamp(t) if t == "infinity"));
     assert!(matches!(col(&inf, "b"), Value::Timestamp(t) if t == "-infinity"));
 
+    // A caller's own `SET TimeZone` (DateStyle still ISO) prints a local offset;
+    // the provider converts it back to RFC 3339 in UTC.
+    let instant = "SELECT '2024-01-15T10:30:00.5Z'::timestamptz AS t";
+    db.exec("SET TimeZone = 'America/New_York'")
+        .expect("SET TimeZone");
+    let local = db.first(instant, &[]).unwrap().unwrap();
+    assert!(
+        matches!(col(&local, "t"), Value::Timestamp(t) if t == "2024-01-15T10:30:00.5Z"),
+        "SET TimeZone: {:?}",
+        col(&local, "t")
+    );
+    // A non-ISO `SET DateStyle` cannot be normalized, so the value is Text, as printed.
+    db.exec("SET DateStyle = 'SQL, DMY'")
+        .expect("SET DateStyle");
+    let sql_style = db.first(instant, &[]).unwrap().unwrap();
+    assert!(
+        matches!(col(&sql_style, "t"), Value::Text(t) if t == "15/01/2024 05:30:00.5 EST"),
+        "SET DateStyle: {:?}",
+        col(&sql_style, "t")
+    );
+    db.exec("SET TimeZone = 'UTC'")
+        .expect("SET TimeZone back to UTC");
+    let sql_utc = db.first(instant, &[]).unwrap().unwrap();
+    assert!(
+        matches!(col(&sql_utc, "t"), Value::Text(t) if t == "15/01/2024 10:30:00.5 UTC"),
+        "SET DateStyle with UTC: {:?}",
+        col(&sql_utc, "t")
+    );
+    // Reopening pins DateStyle=ISO and TimeZone=UTC again.
+    db.close().expect("close after SET");
+    let db: Connection = open("", None).expect("reopen after SET");
+    let pinned = db.first(instant, &[]).unwrap().unwrap();
+    assert!(matches!(col(&pinned, "t"), Value::Timestamp(t) if t == "2024-01-15T10:30:00.5Z"));
+
     // jsonb operators with a Json parameter: sent as OID 0, so Postgres infers jsonb.
     let contained = db
         .first(
@@ -492,7 +526,10 @@ fn pgcrypto(db: &Connection) {
         one("SELECT pgp_sym_decrypt(pgp_sym_encrypt('x', 'k'), 'k') AS v"),
         "x"
     );
-    assert_eq!(one("SELECT encode(digest('a', 'sha256'), 'hex') AS v"), SHA256_A);
+    assert_eq!(
+        one("SELECT encode(digest('a', 'sha256'), 'hex') AS v"),
+        SHA256_A
+    );
     assert_eq!(
         one("SELECT encode(hmac('a', 'k', 'sha1'), 'hex') AS v"),
         "40e7d441cadb17b07f050341aa23a6820ed81c8b"
@@ -512,7 +549,10 @@ fn pgcrypto(db: &Connection) {
     assert_eq!(text(col(&check, "ok")), "true");
     assert_eq!(text(col(&check, "bad")), "false");
     // Fresh randomness per call: salts and PGP session keys never repeat.
-    assert_ne!(one("SELECT gen_salt('bf') AS v"), one("SELECT gen_salt('bf') AS v"));
+    assert_ne!(
+        one("SELECT gen_salt('bf') AS v"),
+        one("SELECT gen_salt('bf') AS v")
+    );
     assert_eq!(
         one("SELECT (pgp_sym_encrypt('x', 'k') <> pgp_sym_encrypt('x', 'k'))::text AS v"),
         "true"
@@ -520,7 +560,10 @@ fn pgcrypto(db: &Connection) {
     assert_eq!(one("SELECT length(gen_random_bytes(32))::text AS v"), "32");
     // A wrong key is an ordinary, recoverable SQL error.
     assert!(matches!(
-        db.first("SELECT pgp_sym_decrypt(pgp_sym_encrypt('x', 'k'), 'wrong')", &[]),
+        db.first(
+            "SELECT pgp_sym_decrypt(pgp_sym_encrypt('x', 'k'), 'wrong')",
+            &[]
+        ),
         Err(Error::ExecutionFailed(_))
     ));
     assert_eq!(one("SELECT 'still usable'::text AS v"), "still usable");
@@ -587,7 +630,7 @@ fn pgcrypto_public_key(db: &Connection) {
             first_text(
                 db,
                 "SELECT (substring(pgp_pub_encrypt('x', dearmor($1::text)) FROM 20 FOR 64) <> substring(pgp_pub_encrypt('x', dearmor($1::text)) FROM 20 FOR 64))::text AS v",
-                &[public.clone()],
+                std::slice::from_ref(&public),
             ),
             "true",
             "{name} fresh randomness"
@@ -604,7 +647,10 @@ fn pgcrypto_public_key(db: &Connection) {
         ),
         Err(Error::ExecutionFailed(_))
     ));
-    assert_eq!(first_text(db, "SELECT 'still usable'::text AS v", &[]), "still usable");
+    assert_eq!(
+        first_text(db, "SELECT 'still usable'::text AS v", &[]),
+        "still usable"
+    );
     println!("pgcrypto public key ok");
 }
 
@@ -722,7 +768,10 @@ fn dlopen_table(db: &Connection) {
     )
     .expect("create df_dlopen_fill");
     let row = db
-        .first("SELECT loaded::int8, first_file, err FROM pg_temp.df_dlopen_fill()", &[])
+        .first(
+            "SELECT loaded::int8, first_file, err FROM pg_temp.df_dlopen_fill()",
+            &[],
+        )
         .expect("df_dlopen_fill")
         .expect("df_dlopen_fill row");
     let loaded = int(col(&row, "loaded"));
@@ -732,7 +781,8 @@ fn dlopen_table(db: &Connection) {
     assert!((1..64).contains(&loaded), "loaded {loaded}");
     assert!(err.contains("dlopen table is full"), "{err}");
     // An already-loaded library is found without a new slot.
-    db.exec(&format!("LOAD '{first_file}'")).expect("reload a loaded library");
+    db.exec(&format!("LOAD '{first_file}'"))
+        .expect("reload a loaded library");
     // A new one still fails cleanly.
     let pg_version = first_text(
         db,
@@ -744,7 +794,8 @@ fn dlopen_table(db: &Connection) {
         matches!(&full, Err(Error::ExecutionFailed(e)) if e.message.contains("dlopen table is full")),
         "{full:?}"
     );
-    db.exec("DO $$ BEGIN PERFORM 1; END $$").expect("plpgsql after a full table");
+    db.exec("DO $$ BEGIN PERFORM 1; END $$")
+        .expect("plpgsql after a full table");
     assert_eq!(
         first_text(db, "SELECT encode(digest('a', 'sha256'), 'hex') AS v", &[]),
         SHA256_A

@@ -6,9 +6,9 @@
 import { describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { ARTIFACTS, artifactFiles } from '../scripts/pin-artifact';
-import { matchesPathFilter, pushPaths } from '../scripts/source-check';
+import { hashExclusions, hashPaths, matchesPathFilter, pushPaths } from '../scripts/source-check';
 import { git, sandboxClone, spawnEnv, stubCommand } from './helpers/spawn-env';
 
 const repo = resolve(import.meta.dir, '..');
@@ -48,6 +48,15 @@ function read(path: string): string {
 function parse(path: string): Workflow {
   return Bun.YAML.parse(read(path)) as Workflow;
 }
+let tracked: string[] | undefined;
+/** The files git tracks, relative to the repository root. */
+function trackedFiles(): string[] {
+  tracked ??= Bun.spawnSync(['git', 'ls-files'], { cwd: repo })
+    .stdout.toString()
+    .split('\n')
+    .filter(Boolean);
+  return tracked;
+}
 
 const CHECKED =
   "${{ !cancelled() && needs.check-source.result == 'success' && needs.check-source.outputs.skip != 'true' }}";
@@ -56,6 +65,8 @@ interface Spec {
   file: string;
   image: string;
   paths: string[];
+  /** env.SOURCE_HASH_EXCLUDE: trigger files the source hash leaves out. */
+  hashExclude?: string[];
   /** The job that check-source gates. */
   first: string;
   firstIf: string;
@@ -74,6 +85,61 @@ interface Spec {
   /** The job that moves mutable tags, and its steps that the source guard gates. */
   guarded: { job: string; steps: string[] };
 }
+
+/** The pin job runs after `job` published, or when check-source found the source published. */
+function pinIfAfter(job: string): string {
+  return `\${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' && ((needs.${job}.result == 'success' && needs.${job}.outputs.digest != '') || (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}`;
+}
+
+/**
+ * A single-component workflow, `<name>-publish.yml`: a read-only build, then publish (or realign
+ * the version tag when the source is already published), then pin.
+ */
+function componentSpec(name: string, inputs: string[], hashExclude?: string[]): Spec {
+  const file = `.github/workflows/${name}-publish.yml`;
+  return {
+    file,
+    image: `ghcr.io/di-framework/${name}`,
+    paths: [
+      ...inputs,
+      'platform/wasm-component-publisher/**',
+      'Cargo.toml',
+      'Cargo.lock',
+      '.cargo/**',
+      file,
+      '!**/*.md',
+    ],
+    hashExclude,
+    first: 'build',
+    firstIf: CHECKED,
+    publish: ['publish', 'realign'],
+    readOnly: ['build'],
+    realign: { job: 'realign', tags: 'wit', wit: `platform/${name}/wit/world.wit` },
+    pinAfter: 'publish',
+    pinIf: pinIfAfter('publish'),
+    pinName: name,
+    guarded: {
+      job: 'publish',
+      steps: [
+        'Push and verify component',
+        'Record component digest',
+        'Tag with source hash',
+        'Upload publish report',
+      ],
+    },
+    artifacts: [name],
+  };
+}
+
+/** Files that only test pglite-encfs: they trigger its publish run but are not hashed (#349). */
+const ENCFS_TEST_ONLY = [
+  'platform/pglite-encfs/tests/**',
+  'platform/pglite-encfs/src/testdata/**',
+  'platform/pglite-encfs/scripts/smoke.ts',
+  'platform/pglite-encfs/scripts/unit.ts',
+  'platform/pglite-encfs/scripts/lib/tear.ts',
+  'platform/pglite-encfs/scripts/**/*.test.ts',
+];
 
 const SPECS: Spec[] = [
   {
@@ -118,85 +184,24 @@ const SPECS: Spec[] = [
     publish: ['publish-platform', 'publish-index'],
     readOnly: [],
     pinAfter: 'publish-index',
-    pinIf:
-      "${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' && ((needs.publish-index.result == 'success' && needs.publish-index.outputs.digest != '') || (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
+    pinIf: pinIfAfter('publish-index'),
     pinName: 'tenant-auth',
     guarded: { job: 'publish-index', steps: ['Assemble and verify image index'] },
     artifacts: ['tenant-auth'],
   },
-  {
-    file: '.github/workflows/pglite-component-publish.yml',
-    image: 'ghcr.io/di-framework/pglite-component',
-    paths: [
-      'platform/pglite-component/src/**',
-      'platform/pglite-component/wit/**',
-      'platform/pglite-component/engine/**',
-      'platform/pglite-component/build-support/**',
-      'platform/pglite-component/scripts/**',
-      'platform/pglite-component/Makefile',
-      'platform/pglite-component/build.rs',
-      'platform/pglite-component/Cargo.toml',
-      'platform/pglite-component/Cargo.lock',
-      'platform/pglite-component/rust-toolchain.toml',
-      'platform/wasm-component-publisher/**',
-      'Cargo.toml',
-      'Cargo.lock',
-      '.cargo/**',
-      '.github/workflows/pglite-component-publish.yml',
-      '!**/*.md',
-    ],
-    first: 'build',
-    firstIf: CHECKED,
-    publish: ['publish', 'realign'],
-    readOnly: ['build'],
-    realign: { job: 'realign', tags: 'wit', wit: 'platform/pglite-component/wit/world.wit' },
-    pinAfter: 'publish',
-    pinIf:
-      "${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' && ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') || (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
-    pinName: 'pglite-component',
-    guarded: {
-      job: 'publish',
-      steps: [
-        'Push and verify component',
-        'Record component digest',
-        'Tag with source hash',
-        'Upload publish report',
-      ],
-    },
-    artifacts: ['pglite-component'],
-  },
-  {
-    file: '.github/workflows/pglite-encfs-publish.yml',
-    image: 'ghcr.io/di-framework/pglite-encfs',
-    paths: [
-      'platform/pglite-encfs/**',
-      'platform/wasm-component-publisher/**',
-      'Cargo.toml',
-      'Cargo.lock',
-      '.cargo/**',
-      '.github/workflows/pglite-encfs-publish.yml',
-      '!**/*.md',
-    ],
-    first: 'build',
-    firstIf: CHECKED,
-    publish: ['publish', 'realign'],
-    readOnly: ['build'],
-    realign: { job: 'realign', tags: 'wit', wit: 'platform/pglite-encfs/wit/world.wit' },
-    pinAfter: 'publish',
-    pinIf:
-      "${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' && ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') || (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
-    pinName: 'pglite-encfs',
-    guarded: {
-      job: 'publish',
-      steps: [
-        'Push and verify component',
-        'Record component digest',
-        'Tag with source hash',
-        'Upload publish report',
-      ],
-    },
-    artifacts: ['pglite-encfs'],
-  },
+  componentSpec('pglite-component', [
+    'platform/pglite-component/src/**',
+    'platform/pglite-component/wit/**',
+    'platform/pglite-component/engine/**',
+    'platform/pglite-component/build-support/**',
+    'platform/pglite-component/scripts/**',
+    'platform/pglite-component/Makefile',
+    'platform/pglite-component/build.rs',
+    'platform/pglite-component/Cargo.toml',
+    'platform/pglite-component/Cargo.lock',
+    'platform/pglite-component/rust-toolchain.toml',
+  ]),
+  componentSpec('pglite-encfs', ['platform/pglite-encfs/**'], ENCFS_TEST_ONLY),
   {
     file: '.github/workflows/oci-registry-component.yml',
     image: 'ghcr.io/di-framework/oci-registry',
@@ -218,8 +223,7 @@ const SPECS: Spec[] = [
     publish: ['publish'],
     readOnly: [],
     pinAfter: 'publish',
-    pinIf:
-      "${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' && ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') || (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
+    pinIf: pinIfAfter('publish'),
     pinName: 'oci-registry',
     guarded: {
       job: 'publish',
@@ -254,6 +258,22 @@ describe.each(SPECS)('$file', (spec) => {
     // The workflow file itself is an input; Markdown never is, so pin PRs cannot loop.
     expect(matchesPathFilter(spec.paths, spec.file)).toBe(true);
     expect(matchesPathFilter(spec.paths, 'platform/tenant-host/README.md')).toBe(false);
+  });
+
+  test('hashes a subset of the files that trigger it (#349)', () => {
+    expect(hashExclusions(text)).toEqual(spec.hashExclude ?? []);
+    const hashed = hashPaths(text);
+    const triggering = trackedFiles().filter((file) => matchesPathFilter(spec.paths, file));
+    expect(triggering.length).toBeGreaterThan(0);
+    for (const file of trackedFiles()) {
+      if (matchesPathFilter(hashed, file)) expect(triggering, file).toContain(file);
+    }
+    // Every excluded glob names files that would otherwise trigger the run.
+    for (const glob of spec.hashExclude ?? []) {
+      const excluded = triggering.filter((file) => new Bun.Glob(glob).match(file));
+      expect(excluded.length, glob).toBeGreaterThan(0);
+      for (const file of excluded) expect(matchesPathFilter(hashed, file), file).toBe(false);
+    }
   });
 
   test('check-source runs on main, reads packages only, and hashes this workflow’s filter', () => {
@@ -540,6 +560,51 @@ test('publish paths reuse the paths the image checks already maintain', () => {
   expect(pushPaths(read('.github/workflows/tenant-host-image.yml'))[0]).toBe(
     'platform/tenant-host/**',
   );
+});
+
+describe('pglite-encfs test-only files (#349)', () => {
+  const text = read('.github/workflows/pglite-encfs-publish.yml');
+  const trigger = pushPaths(text);
+  const hashed = hashPaths(text);
+  const files = trackedFiles().filter(
+    (file) => file.startsWith('platform/pglite-encfs/') && !file.endsWith('.md'),
+  );
+  const testOnly = (file: string) => ENCFS_TEST_ONLY.some((glob) => new Bun.Glob(glob).match(file));
+
+  test('start the publish run but do not change the source hash', () => {
+    expect(files.filter(testOnly).length).toBeGreaterThan(0);
+    for (const file of files) {
+      expect(matchesPathFilter(trigger, file), file).toBe(true);
+      expect(matchesPathFilter(hashed, file), file).toBe(!testOnly(file));
+    }
+    for (const file of [
+      'platform/pglite-encfs/tests/root-probe/src/lib.rs',
+      'platform/pglite-encfs/src/testdata/xts-kat.txt',
+      'platform/pglite-encfs/scripts/smoke.ts',
+      'platform/pglite-encfs/scripts/lib/tear.test.ts',
+    ]) {
+      expect(files, file).toContain(file);
+      expect(matchesPathFilter(hashed, file), file).toBe(false);
+    }
+  });
+
+  test('the build never imports a file the hash leaves out', () => {
+    const seen = new Set<string>();
+    const visit = (file: string) => {
+      if (seen.has(file)) return;
+      seen.add(file);
+      const source = read(file);
+      for (const match of source.matchAll(/(?:from|import)\s*\(?\s*['"](\.{1,2}\/[^'"]+)['"]/g)) {
+        visit(join(dirname(file), match[1] as string));
+      }
+    };
+    visit('platform/pglite-encfs/scripts/build.ts');
+    expect([...seen]).toContain('platform/pglite-encfs/scripts/lib/wit.ts');
+    for (const file of seen) {
+      expect(files, file).toContain(file);
+      expect(matchesPathFilter(hashed, file), file).toBe(true);
+    }
+  });
 });
 
 test('merging a pin PR never republishes its own artifact, and any other publish it starts ends there', () => {

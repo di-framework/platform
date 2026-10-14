@@ -369,7 +369,8 @@ describe('platform-owned Secret names avoid the workload Secret suffixes (#325)'
       'di-nats-registry',
       'di-scheduler-tls',
       'tenant-controller-tls',
-      'tenant-controller-ca-key',
+      // In the platform namespace since #170, so no workload can name it; checked all the same.
+      'tenant-controller-ca-alpha',
       'di-tenant-registry-pull',
       'tenant-console-oauth',
       'di-backup-destination',

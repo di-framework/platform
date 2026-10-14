@@ -244,10 +244,20 @@ export interface TenantAuthInputs {
   /** API server endpoint addresses and port (the `kubernetes` EndpointSlice). */
   apiServer: { addresses: string[]; port: number };
   /**
-   * The controller's serving leaf certificate and key, the CA certificate that issued it (the trust
-   * anchor clients pin) and the CA key (PEM). The CA key is kept in a Secret nothing mounts.
+   * The controller's serving leaf certificate and key, the CA certificate that issued it and the
+   * CA key (PEM). During a CA rotation (#170) `caNext` is the successor that does not sign yet and
+   * `caPrevious` the CA that `caCert` replaced; clients trust all of them (see
+   * `controllerTrustBundle`).
+   * The CA keys are kept in a platform-namespace Secret nothing mounts.
    */
-  tls: { cert: string; key: string; caCert: string; caKey: string };
+  tls: {
+    cert: string;
+    key: string;
+    caCert: string;
+    caKey: string;
+    caNext?: { cert: string; key: string };
+    caPrevious?: string;
+  };
   /** The shared OAuth client secret, base64 as read from the platform Secret; absent until it exists. */
   clientSecret?: string;
   /**
@@ -1702,8 +1712,30 @@ function tenantControllerCertNames(
     dns.push(registryPullHost(tenant), `${registryPullHost(tenant)}.cluster.local`);
   return { dns: [...new Set(dns)], ips: [...new Set(ips)] };
 }
-/** The Secret holding the controller CA's private key; no pod mounts it. */
+/**
+ * The Secret in the tenant's runtime namespace that held the controller CA key before #170. The
+ * tenant controller's ServiceAccount can read every Secret there, so the controller moves the key
+ * to {@link tenantControllerCaSecret} and deletes this one.
+ */
 const TENANT_CONTROLLER_CA_KEY_SECRET = 'tenant-controller-ca-key';
+/**
+ * The Secret in the platform namespace that holds the tenant's controller CAs with their keys
+ * (#170): `ca.crt` and `ca.key` sign the serving leaf; during a rotation `next.crt`/`next.key` and
+ * `previous.crt` hold the other CAs in the trust bundle. No pod mounts it and no tenant
+ * ServiceAccount or member can read it, and it survives deleting `tenant-controller-tls`.
+ */
+function tenantControllerCaSecret(tenant: string): string {
+  return `tenant-controller-ca-${tenant}`;
+}
+/** Digest of the trust bundle on the console's pod template (#170). */
+export const CA_BUNDLE_ANNOTATION = `${GROUP}/ca-bundle-sha256`;
+/**
+ * The PEM bundle clients trust (ConfigMap `tenant-controller-ca`): the CAs of `tls`, oldest first,
+ * so switching which CA signs the leaf keeps the same bytes and does not roll the hosts.
+ */
+function controllerTrustBundle(tls: TenantAuthInputs['tls']): string {
+  return [tls.caPrevious, tls.caCert, tls.caNext?.cert].filter(Boolean).join('');
+}
 /**
  * The tenant's active members, published for the tenant controller's `/-/members` (#321). It
  * reads each one's User by name, so its RBAC names the members instead of listing every User.
@@ -1792,9 +1824,14 @@ function tenantAuthResources(
             labels: { app, [COMPONENT]: 'tenant-auth', [TENANT]: name },
             // The image reference rolls the pods; the digest is repeated here for operators. Both
             // binaries read the certificate (or CA) once at start, so its digest rolls the pair.
+            // The console also reads the trust bundle once and copies it into the kubeconfigs it
+            // issues, so a bundle change during a CA rotation (#170) rolls it too.
             annotations: {
               [`${GROUP}/image-digest`]: auth.image.split('@')[1],
               [`${GROUP}/tls-cert-sha256`]: tlsCertDigest(inputs.tls.cert),
+              ...(app === 'tenant-console'
+                ? { [CA_BUNDLE_ANNOTATION]: tlsCertDigest(controllerTrustBundle(inputs.tls)) }
+                : {}),
             },
           },
           spec: {
@@ -2120,11 +2157,30 @@ function tenantAuthResources(
       }),
     );
   result.push(
+    // Applied first, so a CA is never published (bundle, leaf) before its key is stored (#170).
+    // Not mounted by any pod: lets a leaf renewal keep the CA (and so the hosts and kubeconfigs),
+    // and keeps the CA when `tenant-controller-tls` is deleted. In the platform namespace, out of
+    // the tenant controller's reach.
+    make('v1', 'Secret', tenantControllerCaSecret(name), cfg.namespace, {
+      type: 'Opaque',
+      data: {
+        'ca.crt': base64(inputs.tls.caCert),
+        'ca.key': base64(inputs.tls.caKey),
+        ...(inputs.tls.caNext
+          ? {
+              'next.crt': base64(inputs.tls.caNext.cert),
+              'next.key': base64(inputs.tls.caNext.key),
+            }
+          : {}),
+        ...(inputs.tls.caPrevious ? { 'previous.crt': base64(inputs.tls.caPrevious) } : {}),
+      },
+    }),
     make('v1', 'ConfigMap', TENANT_MEMBERS_CONFIG, namespace, {
       data: { members: JSON.stringify(members) },
     }),
+    // Every CA of a rotation, so hosts and clients that reload it accept the leaf on either side.
     make('v1', 'ConfigMap', 'tenant-controller-ca', namespace, {
-      data: { 'ca.crt': inputs.tls.caCert },
+      data: { 'ca.crt': controllerTrustBundle(inputs.tls) },
     }),
     make('v1', 'Secret', 'tenant-controller-tls', namespace, {
       type: 'kubernetes.io/tls',
@@ -2133,11 +2189,6 @@ function tenantAuthResources(
         'tls.key': base64(inputs.tls.key),
         'ca.crt': base64(inputs.tls.caCert),
       },
-    }),
-    // Not mounted by any pod: lets a leaf renewal keep the CA (and so the hosts and kubeconfigs).
-    make('v1', 'Secret', TENANT_CONTROLLER_CA_KEY_SECRET, namespace, {
-      type: 'Opaque',
-      data: { 'ca.key': base64(inputs.tls.caKey) },
     }),
   );
   const hostPullToken = registry ? inputs.hostPullToken : undefined;
@@ -2397,6 +2448,7 @@ export {
 } from './backing-services';
 export {
   COMPONENT,
+  controllerTrustBundle,
   crds,
   FINALIZER,
   GATEWAY_NAME,
@@ -2413,6 +2465,7 @@ export {
   TENANT,
   TENANT_CONTROLLER_CA_KEY_SECRET,
   tenantAuthResources,
+  tenantControllerCaSecret,
   tenantControllerCertNames,
   tenantQuota,
   tenantResources,

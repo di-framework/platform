@@ -59,6 +59,7 @@ export const CONTROLLER_SCRIPT_MODULES = [
   'backing-services',
   'workload-storage',
   'tls',
+  'ca-rotation',
   'registry-nats',
   'resources',
   'backing-service-reconcile',

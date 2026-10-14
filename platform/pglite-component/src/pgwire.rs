@@ -572,27 +572,182 @@ fn decode_cell(oid: u32, cell: Option<String>) -> Result<Value, Error> {
             .map_err(|_| Error::ValueConversionFailed(format!("invalid float {text:?}"))),
         OID_BYTEA => decode_bytea(&text),
         OID_JSON | OID_JSONB => Ok(Value::Json(text)),
-        OID_TIMESTAMP_TZ => Ok(Value::Timestamp(normalize_timestamptz(text))),
+        OID_TIMESTAMP_TZ => Ok(decode_timestamptz(text)),
         _ => Ok(Value::Text(text)),
     }
 }
 
-/// Rewrite a `timestamptz` rendered under `DateStyle=ISO`, `TimeZone=UTC`
-/// (`2024-01-15 10:30:00.5+00`) as RFC 3339 (`2024-01-15T10:30:00.5Z`).
-/// `infinity`, `-infinity` and anything else not of that shape (for example
-/// BC dates) pass through unchanged.
-fn normalize_timestamptz(text: String) -> String {
-    match text.strip_suffix("+00") {
-        Some(body) if body.len() > 11 && body.as_bytes().get(10) == Some(&b' ') => {
-            let mut out = String::with_capacity(body.len() + 1);
-            out.push_str(&body[..10]);
-            out.push('T');
-            out.push_str(&body[11..]);
-            out.push('Z');
-            out
-        }
-        _ => text,
+/// Decode a `timestamptz` cell.
+///
+/// `connect` pins `DateStyle=ISO` and `TimeZone=UTC`, but a caller can change
+/// either with `SET` for the rest of the session, so the cell is parsed rather
+/// than trusted. Any ISO rendering (`2024-01-15 10:30:00.5+00`, or
+/// `2024-01-15 05:30:00.5-05` after `SET TimeZone`) is converted to RFC 3339
+/// in UTC (`2024-01-15T10:30:00.5Z`). `infinity` and `-infinity` stay
+/// `Value::Timestamp`. Anything else (a non-ISO `DateStyle`, BC dates, years
+/// after 9999) cannot be normalized and is returned as `Value::Text`, exactly
+/// as PostgreSQL printed it. So a `Value::Timestamp` is always RFC 3339 in UTC
+/// or one of the two infinities.
+fn decode_timestamptz(text: String) -> Value {
+    if text == "infinity" || text == "-infinity" {
+        return Value::Timestamp(text);
     }
+    match iso_timestamptz_to_utc(&text) {
+        Some(utc) => Value::Timestamp(utc),
+        None => Value::Text(text),
+    }
+}
+
+/// Parse `YYYY-MM-DD HH:MM:SS[.ffffff]±HH[:MM[:SS]]` (PostgreSQL's ISO output
+/// for `timestamptz`) and render it as `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`.
+/// Returns `None` for any other shape or when the UTC year is outside 1..=9999.
+fn iso_timestamptz_to_utc(text: &str) -> Option<String> {
+    let mut cur = Cursor(text.as_bytes());
+    let year = cur.digits(4)?;
+    cur.byte(b'-')?;
+    let month = cur.digits(2)?;
+    cur.byte(b'-')?;
+    let day = cur.digits(2)?;
+    cur.byte(b' ')?;
+    let hour = cur.digits(2)?;
+    cur.byte(b':')?;
+    let minute = cur.digits(2)?;
+    cur.byte(b':')?;
+    let second = cur.digits(2)?;
+    let fraction = cur.fraction()?;
+    let sign = match cur.take()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let offset_hours = cur.digits(2)?;
+    let offset_minutes = cur.optional_field()?;
+    let offset_seconds = cur.optional_field()?;
+    if !cur.0.is_empty()
+        || !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+        || offset_minutes > 59
+        || offset_seconds > 59
+    {
+        return None;
+    }
+    let offset = sign * (offset_hours * 3600 + offset_minutes * 60 + offset_seconds);
+    let local = days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second;
+    let utc = local - offset;
+    let (year, month, day) = civil_from_days(utc.div_euclid(86_400));
+    if !(1..=9999).contains(&year) {
+        return None;
+    }
+    let secs = utc.rem_euclid(86_400);
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}{fraction}Z",
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60
+    ))
+}
+
+/// A forward-only reader over the bytes of a timestamp literal.
+struct Cursor<'a>(&'a [u8]);
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self) -> Option<u8> {
+        let (&first, rest) = self.0.split_first()?;
+        self.0 = rest;
+        Some(first)
+    }
+
+    fn byte(&mut self, expected: u8) -> Option<()> {
+        match self.0.split_first() {
+            Some((&first, rest)) if first == expected => {
+                self.0 = rest;
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    /// Exactly `count` ASCII digits, as a number.
+    fn digits(&mut self, count: usize) -> Option<i64> {
+        let (head, rest) = self.0.split_at_checked(count)?;
+        let mut value = 0;
+        for &b in head {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            value = value * 10 + i64::from(b - b'0');
+        }
+        self.0 = rest;
+        Some(value)
+    }
+
+    /// `:NN`, or 0 when the next byte is not `:` (offset minutes and seconds).
+    fn optional_field(&mut self) -> Option<i64> {
+        if self.byte(b':').is_some() {
+            self.digits(2)
+        } else {
+            Some(0)
+        }
+    }
+
+    /// An optional `.` and 1 to 6 digits, returned with the dot (or empty).
+    fn fraction(&mut self) -> Option<&'a str> {
+        let start = self.0;
+        if self.byte(b'.').is_none() {
+            return Some("");
+        }
+        let len = self.0.iter().take_while(|b| b.is_ascii_digit()).count();
+        if !(1..=6).contains(&len) {
+            return None;
+        }
+        self.0 = self.0.get(len..)?;
+        std::str::from_utf8(start.get(..=len)?).ok()
+    }
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// Days since 1970-01-01 in the proleptic Gregorian calendar
+/// (Howard Hinnant's `days_from_civil`).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Inverse of [`days_from_civil`]: `(year, month, day)`.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let days = days + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    (year_of_era + era * 400 + i64::from(month <= 2), month, day)
 }
 
 fn decode_bytea(text: &str) -> Result<Value, Error> {
@@ -710,6 +865,15 @@ pub fn to_rows(out: SimpleOut) -> Result<Vec<Row>, Error> {
         rows.push(decode_row(raw, &out.columns, i)?);
     }
     Ok(rows)
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Keep the engine alive, but never leak an open transaction or session
+        // settings into the next WIT resource. No Terminate message: it would
+        // shut down the sole embedded backend.
+        let _ = self.close();
+    }
 }
 
 #[cfg(test)]
@@ -831,28 +995,89 @@ mod tests {
             decode_cell(OID_TIMESTAMP_TZ, Some("2024-01-01 12:00:00.25+00".to_string())),
             Ok(Value::Timestamp(t)) if t == "2024-01-01T12:00:00.25Z"
         ));
-        for lit in ["infinity", "-infinity", "0044-03-15 00:00:00+00 BC"] {
+        for lit in ["infinity", "-infinity"] {
             assert!(matches!(
                 decode_cell(OID_TIMESTAMP_TZ, Some(lit.to_string())),
                 Ok(Value::Timestamp(t)) if t == lit
             ));
         }
         assert!(matches!(
+            decode_cell(OID_TIMESTAMP_TZ, Some("0044-03-15 00:00:00+00 BC".to_string())),
+            Ok(Value::Text(t)) if t == "0044-03-15 00:00:00+00 BC"
+        ));
+        assert!(matches!(
             decode_cell(1114, Some("2024-01-01 12:00:00".to_string())),
             Ok(Value::Text(_))
         ));
-        assert!(matches!(
-            decode_cell(OID_BOOL, Some("maybe".to_string())),
-            Err(_)
-        ));
+        assert!(decode_cell(OID_BOOL, Some("maybe".to_string())).is_err());
     }
-}
 
-impl Drop for Session {
-    fn drop(&mut self) {
-        // Keep the engine alive, but never leak an open transaction or session
-        // settings into the next WIT resource. No Terminate message: it would
-        // shut down the sole embedded backend.
-        let _ = self.close();
+    fn timestamptz(text: &str) -> Value {
+        decode_cell(OID_TIMESTAMP_TZ, Some(text.to_string())).expect("timestamptz decodes")
+    }
+
+    fn assert_timestamp(input: &str, expected: &str) {
+        match timestamptz(input) {
+            Value::Timestamp(t) => assert_eq!(t, expected, "{input}"),
+            other => panic!("{input}: expected Timestamp({expected}), got {other:?}"),
+        }
+    }
+
+    fn assert_text(input: &str) {
+        match timestamptz(input) {
+            Value::Text(t) => assert_eq!(t, input),
+            other => panic!("{input}: expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timestamptz_after_set_timezone_is_converted_to_utc() {
+        // `SET TimeZone` with DateStyle ISO prints the session offset.
+        assert_timestamp("2024-01-15 05:30:00.5-05", "2024-01-15T10:30:00.5Z");
+        assert_timestamp(
+            "2024-01-15 16:00:00.123456+05:30",
+            "2024-01-15T10:30:00.123456Z",
+        );
+        // LMT offsets carry seconds (Europe/Amsterdam before 1937).
+        assert_timestamp("1900-01-01 00:19:32+00:19:32", "1900-01-01T00:00:00Z");
+        // Offsets that cross day, month, year and leap-day boundaries.
+        assert_timestamp("2024-01-01 01:00:00+02", "2023-12-31T23:00:00Z");
+        assert_timestamp("2023-12-31 20:00:00-05", "2024-01-01T01:00:00Z");
+        assert_timestamp("2024-02-28 22:00:00-03", "2024-02-29T01:00:00Z");
+        assert_timestamp("2024-03-01 01:00:00+02", "2024-02-29T23:00:00Z");
+        assert_timestamp("2023-03-01 01:00:00+02", "2023-02-28T23:00:00Z");
+        assert_timestamp("2000-02-29 12:00:00+00", "2000-02-29T12:00:00Z");
+        assert_timestamp("9999-12-31 18:00:00-05", "9999-12-31T23:00:00Z");
+        assert_timestamp("0001-01-01 00:00:00+00", "0001-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn timestamptz_that_cannot_be_normalized_is_text() {
+        for input in [
+            // `SET DateStyle` to SQL, Postgres and German.
+            "15/01/2024 05:30:00.5 EST",
+            "01/15/2024 10:30:00.5 UTC",
+            "Mon Jan 15 10:30:00.5 2024 UTC",
+            "15.01.2024 10:30:00.5 UTC",
+            // BC dates and years RFC 3339 cannot hold, before or after the offset.
+            "0044-03-15 00:00:00+00 BC",
+            "10000-01-01 00:00:00+00",
+            "0001-01-01 00:00:00+01",
+            "9999-12-31 23:00:00-02",
+            // Not a valid ISO timestamptz.
+            "2024-01-15 10:30:00",
+            "2024-01-15T10:30:00+00",
+            "2024-13-01 00:00:00+00",
+            "2023-02-29 00:00:00+00",
+            "2024-01-15 24:00:00+00",
+            "2024-01-15 10:30:00.+00",
+            "2024-01-15 10:30:00.1234567+00",
+            "2024-01-15 10:30:00+0",
+            "2024-01-15 10:30:00+00:60",
+            "2024-01-15 10:30:00+00:00:00 ",
+            "",
+        ] {
+            assert_text(input);
+        }
     }
 }
