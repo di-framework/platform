@@ -681,7 +681,8 @@ means no gateway URL is known.
 ### Tenant controller and console
 
 With config `tenantAuth` set, the tenant reconcile deploys each tenant's controller and console
-(`platform/tenant-auth`, #58) and `deploy-local.ts` is no longer needed for them:
+(`platform/tenant-auth`, #58). This is the supported deploy path; the earlier manual deploy
+script is removed:
 
 ```yaml
 tenantAuth:
@@ -940,7 +941,8 @@ tenantAuth:
   unsetting `tenantAuth` removes every object labelled `platform.di-framework.dev/component:
   tenant-auth` (the registry WorkloadDeployment included) and the quota addition.
 
-The reconcile does not adopt objects that `deploy-local.ts` created (`TenantAuthReady` reports
+The reconcile does not adopt objects that the removed manual deploy script created (they carry
+the component and tenant labels but not the installation label; `TenantAuthReady` reports
 `Refusing to adopt`). Delete them first: in `di-runtime-<tenant>` the Deployments, Services,
 ServiceAccounts, Role and RoleBinding `tenant-controller-keys`, NetworkPolicy, Secrets
 `tenant-controller-tls`, `tenant-controller-ca-key` and `tenant-console-oauth`, and ConfigMaps `tenant-controller-ca` and
