@@ -40,8 +40,10 @@ controller answers 400 without it and streams only that environment's lines (pla
 (`dist`, with `.d.ts`), so consumers need no `.ts` import support. The package also installs the
 `di-tenant` command, which requires Bun (its shebang is `bun`).
 
-The `./src/api/*` export is workspace-internal: `../tenant-auth` uses it inside this repository, and it
-is not usable from the npm package (`src` is not published).
+The `./src/api/*` export is the controller-side contract (handlers, routes, schemas, validators and
+the generated routes). It ships as TypeScript source under `src/api`, so importing it needs a runtime
+that loads `.ts` (Bun) with `experimentalDecorators` enabled in the consumer's `tsconfig.json`; `../tenant-auth` uses it inside this repository. Test fixtures are published
+as `./testing`, not from `tests/`.
 
 ```ts
 import { createClient } from '@di-framework/tenant-cli/client';

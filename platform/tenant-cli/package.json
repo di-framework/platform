@@ -13,6 +13,7 @@
   "homepage": "https://github.com/di-framework/platform",
   "files": [
     "dist",
+    "src/api",
     "api/v1/openapi.yaml",
     "README.md",
     "LICENSE-MIT",
@@ -32,7 +33,6 @@
       "default": "./dist/testing/index.js"
     },
     "./src/api/*": "./src/api/*",
-    "./tests/support/*": "./tests/support/*",
     "./package.json": "./package.json"
   },
   "bin": {
