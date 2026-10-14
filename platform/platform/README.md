@@ -636,16 +636,23 @@ no requests (#223):
   may answer, so for about 10–15 s after the rollout completes some requests still use the old
   routing.
 - On SIGTERM the gateway stops accepting connections and closes idle keep-alive connections. It
-  answers requests already in flight with `Connection: close` and lets them finish, and keeps
-  upgraded (WebSocket) tunnels and TLS passthrough pipes open. It waits up to 20 s, then closes
-  whatever is left and exits. The 35 s termination grace period covers the sleep and the drain.
+  answers requests already in flight with `Connection: close` and lets them finish. That includes
+  a request whose headers are only partly received and, with tenant-auth routes set, a connection
+  still being classified. It keeps upgraded (WebSocket) tunnels and TLS passthrough pipes open.
+  It waits up to 20 s, then closes whatever is left and exits. The 35 s termination grace period
+  covers the sleep and the drain.
 
 Switching is near-immediate, not instant. A WebSocket or passthrough connection opened before the
 switch keeps its old route until it closes or the 20 s drain bound ends it. No pooled upstream
-connection outlives the old pod. A client that reuses a keep-alive connection just as the old pod
-closes it as idle can still see that connection reset. HTTP clients normally retry such a request
-on a new connection. Upgrading to the release that adds the annotation rolls the gateway once, and
-so does upgrading to the release that adds this drain.
+connection outlives the old pod. A client can still see a connection reset in two cases, and HTTP
+clients normally retry the request on a new connection:
+
+- it reuses a keep-alive connection just as the old pod closes it as idle;
+- without tenant-auth routes, it opened a connection to the old pod but sent no byte before
+  SIGTERM (Node's HTTP server closes such a connection as idle).
+
+Upgrading to the release that adds the annotation rolls the gateway once, and so does upgrading
+to the release that adds this drain.
 
 **`di-framework-kube up` does not pass this key yet.** Its `platform.json` allowlist rejects
 `routeAliases` (`unsupported platform config key`), and every `up` rebuilds the stack config from

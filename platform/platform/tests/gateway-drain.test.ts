@@ -4,7 +4,16 @@ import { EventEmitter } from 'node:events';
 import { createServer, type Server } from 'node:http';
 import { connect, createServer as createNetServer, type Socket } from 'node:net';
 import { join } from 'node:path';
-import { main } from '../src/gateway/gateway';
+import { createServer as createTlsServer, connect as tlsConnect } from 'node:tls';
+import {
+  createEdge,
+  createGateway,
+  defaultUpstreamOf,
+  drain,
+  type GatewayOptions,
+  main,
+} from '../src/gateway/gateway';
+import { selfSignedCertificate } from '../src/tenancy/tls';
 
 /**
  * SIGTERM drain (#223) against real listeners: an upstream whose `/slow` answer waits for the
@@ -53,6 +62,29 @@ class Client {
   /** Send a GET and resolve with the next complete response (header names lower-cased). */
   get(path: string): Promise<Response> {
     this.socket.write(`GET ${path} HTTP/1.1\r\nHost: localhost\r\n\r\n`);
+    return this.next();
+  }
+
+  /** Data received so far that no response has consumed (an upgraded tunnel's bytes). */
+  received(): string {
+    return this.data;
+  }
+
+  /** Resolve once `text` has been received. */
+  receive(text: string): Promise<void> {
+    return new Promise((resolve) => {
+      const check = () => {
+        if (!this.data.includes(text)) return;
+        this.waiting = undefined;
+        resolve();
+      };
+      this.waiting = check;
+      check();
+    });
+  }
+
+  /** Resolve with the next complete response. */
+  next(): Promise<Response> {
     return new Promise((resolve) => {
       const parse = () => {
         const end = this.data.indexOf('\r\n\r\n');
@@ -200,6 +232,8 @@ describe('gateway SIGTERM drain (#223)', () => {
     const busy = await client(gateway.port);
     const slow = busy.get('/slow');
     await within(held, 2_000, 'the upstream to receive /slow');
+    // A partly sent request is covered under Node below: Bun's HTTP server sockets do not
+    // count `bytesRead`.
 
     gateway.signals.emit('SIGTERM');
 
@@ -322,12 +356,19 @@ describe('gateway process drain under Node (#223)', () => {
     });
     const exited = new Promise<number | null>((resolve) => child.once('exit', resolve));
     let busy: Client | undefined;
+    let partial: Client | undefined;
     try {
       await within(listening(port), 5_000, `the gateway process to listen\n${output}`);
       busy = new Client(port);
       await within(busy.connected(), 2_000, 'the client to connect');
       const slow = busy.get('/slow');
       await within(held, 2_000, 'the upstream to receive /slow');
+      // A keep-alive connection whose next request's headers are only partly sent (#223 S1).
+      partial = new Client(port);
+      await within(partial.connected(), 2_000, 'the partial client to connect');
+      expect((await within(partial.get('/fast'), 2_000, 'the first response')).body).toBe('ok');
+      partial.socket.write('GET /fast HTTP/1.1\r\nHo');
+      await Bun.sleep(50);
 
       child.kill('SIGTERM');
       await within(
@@ -339,6 +380,11 @@ describe('gateway process drain under Node (#223)', () => {
       );
       expect(child.exitCode).toBeNull();
 
+      partial.socket.write('st: localhost\r\n\r\n');
+      const answered = await within(partial.next(), 2_000, 'the partly sent request');
+      expect(answered.body).toBe('ok');
+      expect(answered.headers.connection).toBe('close');
+
       release();
       const res = await within(slow, 2_000, 'the in-flight response');
       expect(res.body).toBe('ok');
@@ -348,6 +394,7 @@ describe('gateway process drain under Node (#223)', () => {
     } finally {
       release();
       busy?.socket.destroy();
+      partial?.socket.destroy();
       if (child.exitCode === null) child.kill('SIGKILL');
       await new Promise((resolve) => upstream.close(resolve));
     }
@@ -365,3 +412,292 @@ async function freePort(): Promise<number> {
 async function listening(port: number): Promise<void> {
   while (await refused(port)) await Bun.sleep(20);
 }
+
+/** Upstreams for the edge drain: tenant HTTP (`/slow` held until released, WebSocket echo) and
+ * a TLS controller that echoes. */
+async function edgeUpstreams() {
+  let release: () => void = () => {};
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let seen: () => void = () => {};
+  const held = new Promise<void>((resolve) => {
+    seen = resolve;
+  });
+  const sockets = new Set<Socket>();
+  const http = createServer((req, res) => {
+    if (req.url === '/slow') seen();
+    void (req.url === '/slow' ? released : Promise.resolve()).then(() => {
+      res.writeHead(200, { 'content-length': 2 });
+      res.end('ok');
+    });
+  });
+  http.on('upgrade', (_req, socket) => {
+    socket.write(
+      'HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n',
+    );
+    socket.on('data', (chunk) => socket.write(`echo:${chunk}`));
+    socket.on('end', () => socket.end());
+  });
+  const pem = selfSignedCertificate('tenant-controller', ['controller.alpha.localhost'], [], 1);
+  const controller = createTlsServer({ cert: pem.cert, key: pem.key }, (socket) => {
+    socket.on('data', (chunk) => socket.write(`tls:${chunk}`));
+    socket.on('end', () => socket.end());
+  });
+  for (const server of [http, controller])
+    server.on('connection', (socket: Socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+    });
+  await new Promise<void>((resolve) => http.listen(0, '127.0.0.1', resolve));
+  await new Promise<void>((resolve) => controller.listen(0, '127.0.0.1', resolve));
+  return {
+    httpPort: (http.address() as { port: number }).port,
+    controllerPort: (controller.address() as { port: number }).port,
+    held,
+    release,
+    async close() {
+      release();
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => http.close(resolve));
+      await new Promise((resolve) => controller.close(resolve));
+    },
+  };
+}
+
+/** A gateway listening through the edge (controller routed), started in-process or under Node. */
+interface EdgeGateway {
+  port: number;
+  terminate(): void;
+  /** The drain's result, once it has finished. */
+  drained: Promise<string>;
+  /** Whether the HTTP server has closed, which releases the upstream keep-alive pool. */
+  serverClosed(): boolean;
+}
+
+const DRAIN_BOUND_MS = 1_000;
+
+/**
+ * Edge-mode drain (#223 W1). Before SIGTERM: an idle keep-alive connection, a connection still
+ * being classified (no byte sent), a keep-alive connection whose next request is partly sent,
+ * an in-flight request, a WebSocket tunnel and a TLS passthrough pipe. After it: the idle one is
+ * closed, new connections are refused, the others are answered with `Connection: close`, the
+ * tunnel and the pipe keep echoing until the bound, and only then is the HTTP server (and its
+ * upstream pool) closed.
+ */
+async function edgeDrainScenario(
+  gateway: EdgeGateway,
+  upstreams: Awaited<ReturnType<typeof edgeUpstreams>>,
+  opened: Client[],
+): Promise<void> {
+  const open = async () => {
+    const c = new Client(gateway.port);
+    opened.push(c);
+    await within(c.connected(), 2_000, 'a client to connect');
+    return c;
+  };
+  const idle = await open();
+  expect((await within(idle.get('/'), 2_000, 'the idle client response')).body).toBe('ok');
+  const classifying = await open();
+  const partial = await open();
+  await within(partial.get('/'), 2_000, 'the partial client response');
+  partial.socket.write('GET / HTTP/1.1\r\nHo');
+  const busy = await open();
+  const slow = busy.get('/slow');
+  await within(upstreams.held, 2_000, 'the upstream to receive /slow');
+  const tunnel = await open();
+  tunnel.socket.write(
+    'GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n',
+  );
+  await within(tunnel.receive('101 Switching Protocols'), 2_000, 'the tunnel to upgrade');
+  const tls = tlsConnect({
+    port: gateway.port,
+    host: '127.0.0.1',
+    servername: 'controller.alpha.localhost',
+    rejectUnauthorized: false,
+  });
+  tls.setEncoding('utf8');
+  tls.on('error', () => {});
+  let tlsData = '';
+  tls.on('data', (chunk: string) => {
+    tlsData += chunk;
+  });
+  const tlsClosed = new Promise<void>((resolve) => tls.once('close', () => resolve()));
+  const tlsEcho = (text: string) =>
+    within(
+      (async () => {
+        while (!tlsData.includes(`tls:${text}`)) await Bun.sleep(5);
+      })(),
+      2_000,
+      `the passthrough pipe to echo ${text}`,
+    );
+  await within(
+    new Promise<void>((resolve) => tls.once('secureConnect', () => resolve())),
+    2_000,
+    'the passthrough handshake',
+  );
+  tls.write('before');
+  await tlsEcho('before');
+  await Bun.sleep(50);
+
+  const started = performance.now();
+  gateway.terminate();
+
+  await within(idle.closed, 2_000, 'the idle keep-alive connection to close');
+  expect(await within(refused(gateway.port), 2_000, 'a new connection attempt')).toBe(true);
+
+  const first = await within(classifying.get('/'), 2_000, 'the classifying connection');
+  expect(first.body).toBe('ok');
+  expect(first.headers.connection).toBe('close');
+
+  partial.socket.write('st: localhost\r\n\r\n');
+  const answered = await within(partial.next(), 2_000, 'the partly sent request');
+  expect(answered.body).toBe('ok');
+  expect(answered.headers.connection).toBe('close');
+
+  upstreams.release();
+  const res = await within(slow, 2_000, 'the in-flight response');
+  expect(res.body).toBe('ok');
+  expect(res.headers.connection).toBe('close');
+
+  tunnel.socket.write('after');
+  await within(tunnel.receive('echo:after'), 2_000, 'the tunnel to echo after SIGTERM');
+  tls.write('after');
+  await tlsEcho('after');
+  // The pool serves the drain: the HTTP server closes only once the drain has finished.
+  expect(gateway.serverClosed()).toBe(false);
+
+  // The tunnel and the pipe hold the drain open until its bound.
+  expect(await within(gateway.drained, 5_000, 'the drain to finish')).toBe('timeout');
+  expect(performance.now() - started).toBeGreaterThanOrEqual(DRAIN_BOUND_MS - 50);
+  await within(tunnel.closed, 2_000, 'the tunnel to close at the bound');
+  await within(tlsClosed, 2_000, 'the passthrough pipe to close at the bound');
+  await within(
+    (async () => {
+      while (!gateway.serverClosed()) await Bun.sleep(5);
+    })(),
+    2_000,
+    'the HTTP server to close after the drain',
+  );
+}
+
+describe('gateway SIGTERM drain behind the edge (#223)', () => {
+  let upstreams: Awaited<ReturnType<typeof edgeUpstreams>>;
+  const opened: Client[] = [];
+  let log: ReturnType<typeof spyOn>;
+
+  beforeEach(async () => {
+    log = spyOn(console, 'error').mockImplementation(() => {});
+    upstreams = await edgeUpstreams();
+  });
+
+  afterEach(async () => {
+    log.mockRestore();
+    for (const c of opened.splice(0)) c.socket.destroy();
+    await upstreams.close();
+  });
+
+  const options = (): GatewayOptions => ({
+    defaultUpstream: { hostname: '127.0.0.1', port: upstreams.httpPort },
+    tenantAuthRoutes: { controller: 'controller' },
+    controllerUpstream: () => ({ hostname: '127.0.0.1', port: upstreams.controllerPort }),
+  });
+
+  it('drains in-process (Bun)', async () => {
+    const server = createGateway(options());
+    const edge = createEdge(server, options());
+    // Bun never emits 'close' for an HTTP server that did not listen, so watch the call; the
+    // Node test below watches the event.
+    const close = spyOn(server, 'close');
+    await new Promise<void>((resolve) => edge.listen(0, '127.0.0.1', resolve));
+    let finish: (result: string) => void = () => {};
+    const drained = new Promise<string>((resolve) => {
+      finish = resolve;
+    });
+    await edgeDrainScenario(
+      {
+        port: (edge.address() as { port: number }).port,
+        terminate: () => void drain(server, edge, DRAIN_BOUND_MS).then(finish),
+        drained,
+        serverClosed: () => close.mock.calls.length > 0,
+      },
+      upstreams,
+      opened,
+    );
+  });
+
+  it('drains under Node from the built script', async () => {
+    const port = await freePort();
+    const script = `
+      const { createGateway, createEdge, drain } = require(${JSON.stringify(join(import.meta.dir, '../dist/gateway/gateway.js'))});
+      const options = ${JSON.stringify(options())};
+      options.controllerUpstream = () => ({ hostname: '127.0.0.1', port: ${upstreams.controllerPort} });
+      const server = createGateway(options);
+      const edge = createEdge(server, options);
+      server.on('close', () => console.log('server closed'));
+      process.once('SIGTERM', () => {
+        drain(server, edge, ${DRAIN_BOUND_MS}).then((result) => {
+          console.log('drain: ' + result);
+          setTimeout(() => process.exit(0), 50);
+        });
+      });
+      edge.listen(${port}, '127.0.0.1');
+    `;
+    const child = spawn('node', ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    child.stdout.on('data', (chunk) => {
+      output += chunk;
+    });
+    child.stderr.on('data', (chunk) => {
+      output += chunk;
+    });
+    const exited = new Promise<number | null>((resolve) => child.once('exit', resolve));
+    try {
+      await within(listening(port), 5_000, `the gateway process to listen\n${output}`);
+      const drained = within(
+        (async () => {
+          for (;;) {
+            const match = /drain: (\w+)/.exec(output);
+            if (match) return match[1] as string;
+            await Bun.sleep(5);
+          }
+        })(),
+        5_000,
+        `the Node drain to finish\n${output}`,
+      );
+      // Not awaited until the scenario reads it, after SIGTERM.
+      drained.catch(() => {});
+      await edgeDrainScenario(
+        {
+          port,
+          terminate: () => child.kill('SIGTERM'),
+          drained,
+          serverClosed: () => output.includes('server closed'),
+        },
+        upstreams,
+        opened,
+      );
+      expect(await within(exited, 2_000, `the process to exit\n${output}`)).toBe(0);
+    } finally {
+      if (child.exitCode === null) child.kill('SIGKILL');
+    }
+  });
+});
+
+describe('gateway defaultUpstream (#223)', () => {
+  it('takes a bare host as port 80, or host:port', () => {
+    expect(defaultUpstreamOf('wasmcloud-http.wasmcloud.svc.cluster.local')).toEqual({
+      hostname: 'wasmcloud-http.wasmcloud.svc.cluster.local',
+      port: 80,
+    });
+    expect(defaultUpstreamOf('127.0.0.1:1')).toEqual({ hostname: '127.0.0.1', port: 1 });
+    expect(defaultUpstreamOf('127.0.0.1:65535')).toEqual({ hostname: '127.0.0.1', port: 65_535 });
+  });
+
+  it.each(['0', '65536', '99999', '000000'])('refuses to start with port %s', (port) => {
+    const env = { GATEWAY_CONFIG: JSON.stringify({ port: 0, defaultUpstream: `h:${port}` }) };
+    expect(() => main(env)).toThrow(
+      `GATEWAY_CONFIG defaultUpstream port must be between 1 and 65535; received ${port}`,
+    );
+  });
+});

@@ -19,7 +19,8 @@
  * is not an object stops the gateway at startup.
  *
  * On SIGTERM the gateway drains (#223): it stops accepting connections, closes idle keep-alive
- * connections, answers requests already in flight with `Connection: close`, and waits for them,
+ * connections, answers requests already in flight (including one whose headers are only partly
+ * received, or a new connection's first request) with `Connection: close`, and waits for them,
  * upgraded (WebSocket) tunnels and TLS passthrough pipes to finish, up to `drainTimeoutMs`. Then it
  * closes whatever is left and exits. The pod's `preStop` delay runs first, so the Service stops
  * sending it new connections before the listener closes.
@@ -82,16 +83,25 @@ export interface GatewayOptions {
 /** Default bound on a SIGTERM drain; the Deployment's termination grace period covers it. */
 export const DRAIN_TIMEOUT_MS = 20_000;
 
+/** Bytes read from a connection so far (0 for a stream that does not count them). */
+function bytesRead(socket: Duplex): number {
+  return (socket as Partial<Socket>).bytesRead ?? 0;
+}
+
 /**
  * A gateway's open client connections, so SIGTERM can drain them (#223). A connection is busy
  * while it carries an HTTP request, an upgraded tunnel, a TLS passthrough pipe or bytes the edge
- * is still classifying, and idle otherwise (a keep-alive connection between requests).
+ * is still classifying, and from being accepted until its first request. It is idle between
+ * requests on a keep-alive connection, until it reads again: a request whose headers are only
+ * partly received has advanced `bytesRead`, so it is not closed as idle but answered.
  */
 class Connections {
   draining = false;
   private readonly open = new Set<Duplex>();
   private readonly busy = new Map<Duplex, number>();
   private readonly pinned = new Set<Duplex>();
+  /** `bytesRead` when each idle connection last became idle. */
+  private readonly idleAt = new Map<Duplex, number>();
   private readonly emptied: (() => void)[] = [];
 
   add(socket: Duplex): void {
@@ -101,6 +111,7 @@ class Connections {
       this.open.delete(socket);
       this.busy.delete(socket);
       this.pinned.delete(socket);
+      this.idleAt.delete(socket);
       if (!this.open.size) for (const resolve of this.emptied.splice(0)) resolve();
     });
   }
@@ -114,13 +125,17 @@ class Connections {
   begin(socket: Duplex): void {
     this.add(socket);
     this.busy.set(socket, (this.busy.get(socket) ?? 0) + 1);
+    this.idleAt.delete(socket);
   }
 
   /** One unit of work on `socket` is done; while draining, an idle connection is closed. */
   end(socket: Duplex, closeIfIdle = true): void {
     const left = (this.busy.get(socket) ?? 1) - 1;
     if (left > 0) this.busy.set(socket, left);
-    else this.busy.delete(socket);
+    else {
+      this.busy.delete(socket);
+      this.idleAt.set(socket, bytesRead(socket));
+    }
     if (closeIfIdle && this.draining) this.closeIfIdle(socket);
   }
 
@@ -137,8 +152,11 @@ class Connections {
   }
 
   private closeIfIdle(socket: Duplex): void {
+    if (this.busy.has(socket) || this.pinned.has(socket)) return;
+    // Bytes since it went idle are the start of a request: let it complete and be answered.
+    if (bytesRead(socket) !== this.idleAt.get(socket)) return;
     // `end` flushes a response already written before it sends FIN.
-    if (!this.busy.has(socket) && !this.pinned.has(socket)) socket.end();
+    socket.end();
   }
 }
 
@@ -411,7 +429,7 @@ export function createEdge(server: Server, options: GatewayOptions): NetServer {
         connections.end(socket, false);
         return;
       }
-      // Its first request is already buffered, so a drain must not close it as idle.
+      // The HTTP server holds it busy from its 'connection' event until its first request.
       connections.end(socket, false);
       socket.unshift(buffer);
       server.emit('connection', socket);
@@ -522,9 +540,15 @@ export function createGateway(options: GatewayOptions): Server {
   const agent = new Agent({ keepAlive: true, maxSockets: 256 });
   // Assigned right after the server exists; no handler runs before that.
   let connections: Connections;
+  // Accepted connections whose first request has not started: busy, so a drain answers it.
+  const awaitingFirst = new WeakSet<Duplex>();
+  const started = (socket: Duplex) => {
+    if (awaitingFirst.delete(socket)) connections.end(socket, false);
+  };
   const server = createServer((req, res) => {
     const socket = req.socket;
     connections.begin(socket);
+    started(socket);
     res.once('close', () => connections.end(socket));
     const resolved = target(req, options);
     if ('error' in resolved) {
@@ -571,10 +595,14 @@ export function createGateway(options: GatewayOptions): Server {
     req.pipe(proxy);
   });
   connections = connectionsOf(server);
-  server.on('connection', (socket: Socket) => connections.add(socket));
+  server.on('connection', (socket: Socket) => {
+    connections.begin(socket);
+    awaitingFirst.add(socket);
+  });
   server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     // An upgrade owns its connection until a peer closes it; a drain waits for it, up to its bound.
     connections.pin(socket);
+    started(socket);
     socket.on('error', () => socket.destroy());
     const resolved = target(req, options);
     if ('error' in resolved) {
@@ -663,6 +691,9 @@ export async function drain(
   timeoutMs: number = DRAIN_TIMEOUT_MS,
 ): Promise<'drained' | 'timeout'> {
   const connections = connectionsOf(server);
+  // Without the edge, Node's `http.Server#close` also destroys the connections it deems idle:
+  // between requests, or accepted with no byte of a request yet. One whose request has begun is
+  // kept, as here. Behind the edge, a connection still being classified is kept and answered.
   listener.close();
   let timer: NodeJS.Timeout | undefined;
   const result = await Promise.race([
@@ -678,11 +709,16 @@ export async function drain(
   return result;
 }
 
-function defaultUpstreamOf(value: string): Upstream {
-  const match = /^([^:]+):([0-9]{1,5})$/.exec(value);
-  return match
-    ? { hostname: match[1] as string, port: Number(match[2]) }
-    : { hostname: value, port: 80 };
+/** `<hostname>` (port 80) or `<hostname>:<port>`; throws on a port outside 1-65535. */
+export function defaultUpstreamOf(value: string): Upstream {
+  const match = /^([^:]+):([0-9]+)$/.exec(value);
+  if (!match) return { hostname: value, port: 80 };
+  const port = Number(match[2]);
+  if (port < 1 || port > 65_535)
+    throw new Error(
+      `GATEWAY_CONFIG defaultUpstream port must be between 1 and 65535; received ${match[2]}`,
+    );
+  return { hostname: match[1] as string, port };
 }
 
 export function main(
