@@ -246,61 +246,133 @@ describe('platform controller RBAC (#115)', () => {
   });
 });
 
-/** The renderers checked above; a Role or binding built anywhere else would go unchecked. */
-const RBAC_RENDERERS = ['tenantResources', 'userResources', 'tenantAuthResources'];
-const RBAC_KIND = /'(Cluster)?Role(Binding)?'/;
-/** Builds an RBAC object (not a list, prune or kind comparison of existing ones). */
-const RBAC_CONSTRUCTION = [
-  /kind:\s*'(Cluster)?Role(Binding)?'/,
-  /apiVersion:\s*'rbac\.authorization\.k8s\.io\//,
-  /\b(make|resource)\(\s*('rbac\.authorization\.k8s\.io\/v1'|rbac\b)/,
+/**
+ * Every owner (top-level declaration, or `Class.member`) in the controller modules that mentions
+ * RBAC. Default-deny: a new line naming the RBAC API group or a Role kind anywhere else fails the
+ * scan until it is either moved into a renderer checked above or reviewed and listed here.
+ */
+const RBAC_OWNERS = [
+  // The renderers whose objects the checks above evaluate.
+  'resources:tenantResources',
+  'resources:userResources',
+  'resources:tenantAuthResources',
+  // Read-only uses in controller.ts: URL plurals, the tenant-auth prune kinds, the roleRef
+  // comparison before a re-bind, the binding revoke, and the user binding list and count.
+  'controller:plurals',
+  'controller:TENANT_AUTH_KINDS',
+  'controller:Controller.ensure',
+  'controller:Controller.revoke',
+  'controller:Controller.reconcileUser',
 ];
+/** The RBAC API group, a quoted RBAC kind, or an RBAC kind used as an object key. */
+const RBAC_MENTION = [
+  /rbac\.authorization\.k8s\.io/,
+  /['"`](Cluster)?Role(Binding)?['"`]/,
+  /\b(Cluster)?Role(Binding)?\s*:/,
+];
+const KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'return', 'catch', 'await', 'new']);
 const source = (module: string) =>
   readFileSync(path.join(import.meta.dir, '../src/tenancy', `${module}.ts`), 'utf8').split('\n');
-/** The top-level function each line belongs to, by the last `function name(` above it. */
-function enclosingFunctions(lines: string[]): (string | undefined)[] {
-  let current: string | undefined;
+/**
+ * The owner of each line: the last top-level declaration above it, refined to `Class.member` for
+ * a class member declared at two-space indentation.
+ */
+function owners(lines: string[]): (string | undefined)[] {
+  let top: string | undefined;
+  let member: string | undefined;
+  let inClass = false;
   return lines.map((line) => {
-    const start = /^(?:export\s+)?(?:async\s+)?function\s+(\w+)/.exec(line);
-    if (start) current = start[1];
-    else if (/^(?:export\s+)?(?:const|let|class|interface|type)\s/.test(line)) current = undefined;
-    return current;
+    const cls = /^(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+(\w+)/.exec(line);
+    const decl =
+      /^(?:export\s+)?(?:async\s+)?function\*?\s+(\w+)/.exec(line) ??
+      /^(?:export\s+)?(?:const|let|var|type|interface|enum)\s+(\w+)/.exec(line);
+    if (cls) [top, member, inClass] = [cls[1], undefined, true];
+    else if (decl) [top, member, inClass] = [decl[1], undefined, false];
+    else if (inClass) {
+      const m =
+        /^ {2}(?:(?:private|protected|public|static|readonly|async|override|get|set)\s+)*(\w+)\s*[(<:=]/.exec(
+          line,
+        );
+      if (m?.[1] && !KEYWORDS.has(m[1])) member = m[1];
+    }
+    return top && member ? `${top}.${member}` : top;
   });
+}
+/** Owners of the non-comment lines in `lines` that mention RBAC, as `<module>:<owner>`. */
+function rbacOwners(module: string, lines: string[]): Set<string> {
+  const owner = owners(lines);
+  const found = new Set<string>();
+  lines.forEach((line, i) => {
+    if (/^\s*(\/\/|\*|\/\*)/.test(line)) return;
+    if (RBAC_MENTION.some((pattern) => pattern.test(line)))
+      found.add(`${module}:${owner[i] ?? '<top level>'}`);
+  });
+  return found;
 }
 
 describe('controller RBAC sources (#115)', () => {
-  it('builds Roles and bindings only in the renderers the checks above cover', () => {
-    const found: string[] = [];
-    for (const module of CONTROLLER_SCRIPT_MODULES) {
-      const lines = source(module);
-      const owners = enclosingFunctions(lines);
-      lines.forEach((line, i) => {
-        const builds = RBAC_CONSTRUCTION.some((pattern) => pattern.test(line));
-        // In resources.ts every RBAC kind literal is part of building an object.
-        if (builds || (module === 'resources' && RBAC_KIND.test(line)))
-          found.push(`${module}:${owners[i] ?? '<top level>'}`);
-      });
-    }
-    expect(found.length).toBeGreaterThan(0);
-    expect([...new Set(found)].sort()).toEqual(
-      RBAC_RENDERERS.map((name) => `resources:${name}`).sort(),
-    );
+  it('mentions RBAC only in the renderers checked above and the reviewed read-only uses', () => {
+    const found = new Set<string>();
+    for (const module of CONTROLLER_SCRIPT_MODULES)
+      for (const owner of rbacOwners(module, source(module))) found.add(owner);
+    // Exact: a new owner fails, and so does an entry that no longer mentions RBAC.
+    expect([...found].sort()).toEqual([...RBAC_OWNERS].sort());
   });
 
-  it('flags an RBAC object built outside those renderers', () => {
+  it('flags a one-line resource() Role built outside the renderers', () => {
     const lines = [
-      'function backingServiceResources() {',
-      "  return [{ apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'Role' }];",
+      'export class Controller {',
+      '  private async reconcileEgress(tenant: Tenant): Promise<void> {',
+      "    await this.ensure(resource(tenant, this.cfg.installation, 'rbac.authorization.k8s.io/v1', 'Role', 'x', ns, { rules }));",
+      '  }',
       '}',
     ];
-    expect(enclosingFunctions(lines)[1]).toBe('backingServiceResources');
-    expect(RBAC_CONSTRUCTION.some((pattern) => pattern.test(lines[1] as string))).toBe(true);
-    // Reads of existing objects are not constructions.
-    for (const line of [
-      "  ['rbac.authorization.k8s.io/v1', 'RoleBinding'],",
-      "await this.list<Resource>('rbac.authorization.k8s.io/v1', 'RoleBinding', {",
-      "value.kind === 'RoleBinding' &&",
-    ])
-      expect(RBAC_CONSTRUCTION.some((pattern) => pattern.test(line))).toBe(false);
+    expect([...rbacOwners('controller', lines)]).toEqual(['controller:Controller.reconcileEgress']);
+  });
+
+  it('flags a multi-line resource() Role built outside the renderers', () => {
+    const lines = [
+      'export class Controller {',
+      '  private async reconcileEgress(tenant: Tenant): Promise<void> {',
+      '    const role = resource(',
+      '      tenant,',
+      '      this.cfg.installation,',
+      "      'rbac.authorization.k8s.io/v1',",
+      '      kind,',
+      "      'x',",
+      '      ns,',
+      '      { rules },',
+      '    );',
+      '  }',
+      '}',
+    ];
+    expect([...rbacOwners('controller', lines)]).toEqual(['controller:Controller.reconcileEgress']);
+  });
+
+  it('flags make() with an RBAC apiVersion constant', () => {
+    const lines = [
+      'function backingServiceResources(service: BackingService): Resource[] {',
+      "  return [make(RBAC_V1, 'Role', 'x', ns, {})];",
+      '}',
+    ];
+    expect([...rbacOwners('backing-services', lines)]).toEqual([
+      'backing-services:backingServiceResources',
+    ]);
+  });
+
+  it('attributes class members and skips comments', () => {
+    const lines = [
+      "const RBAC_V1 = 'rbac.authorization.k8s.io/v1';",
+      'export class Controller {',
+      '  private readonly cache = new Map();',
+      '  async reconcile(): Promise<void> {',
+      "    // A Role named 'Role' in a comment is not code.",
+      '    if (ready) {',
+      "      return this.list('rbac.authorization.k8s.io/v1', kind);",
+      '    }',
+      '  }',
+      '}',
+    ];
+    expect([...rbacOwners('m', lines)].sort()).toEqual(['m:Controller.reconcile', 'm:RBAC_V1']);
   });
 });

@@ -946,8 +946,9 @@ tenantAuth:
   - RBAC without `escalate` (#115): apply the `<installation>-controller` Role and
     RoleBinding in the platform namespace first, then the ClusterRole (`pulumi up` orders
     them). A ClusterRole without `escalate` applied before the Role lets the update of
-    each `di-tenant-controller-<tenant>` Role fail with `403` on `TenantAuthReady` until
-    the next poll after the Role exists. Tenant Roles and bindings are unchanged.
+    each `di-tenant-controller-<tenant>` Role, and of the RoleBinding of the same name
+    (written without `bind`), fail with `403` on `TenantAuthReady` until the next poll
+    after the Role exists. Tenant Roles and bindings are unchanged.
   - Host pull (`#83:host-pull`): the tenant's hosts pull workload components from the tenant
     registry with a namespace-scoped host credential.
     - Reference: users push to `publicUrl`; workloads reference the same repository as
