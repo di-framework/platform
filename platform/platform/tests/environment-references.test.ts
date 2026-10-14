@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'bun:test';
-import { evaluate } from '@marcbachmann/cel-js';
 import {
   admissionResources,
   ENV_LABEL,
   workloadEnvironmentReferencesAllowed,
 } from '../src/tenancy/admission';
 import type { Resource } from '../src/tenancy/resources';
+import { evaluate } from './support/cel';
 
 const tenantUser = 'system:serviceaccount:wasmcloud:di-user-dev';
 const controllerUser = 'system:serviceaccount:wasmcloud:di-platform-controller';

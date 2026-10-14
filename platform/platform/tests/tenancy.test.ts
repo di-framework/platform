@@ -255,6 +255,24 @@ describe('tenant and user resource reconciliation', () => {
     t.metadata.generation = 1;
     expect(userResources(u, [t], cfg)).toHaveLength(4);
   });
+  it('keeps an already granted membership while its tenant is merely Not Ready', () => {
+    const u = user();
+    const granted = new Set(['alpha']);
+    const t = tenant();
+    t.metadata.generation = 2;
+    expect(userResources(u, [t], cfg, granted)).toHaveLength(4);
+    t.status = { conditions: [{ ...ready[0]!, status: 'False', reason: 'ReconcileError' }] };
+    expect(userResources(u, [t], cfg, granted)).toHaveLength(4);
+    // A tenant that never granted access is still waited for.
+    expect(userResources(u, [t], cfg, new Set(['beta']))).toHaveLength(1);
+    // Missing, suspended and deleting tenants revoke access even when it was granted.
+    expect(userResources(u, [], cfg, granted)).toHaveLength(1);
+    t.spec.suspended = true;
+    expect(userResources(u, [t], cfg, granted)).toHaveLength(1);
+    t.spec.suspended = false;
+    t.metadata.deletionTimestamp = '2026-01-01T00:00:00Z';
+    expect(userResources(u, [t], cfg, granted)).toHaveLength(1);
+  });
   it('declares a ServiceAccount token Secret for each ready membership', () => {
     const u = user();
     u.spec.memberships.push({ tenant: 'beta', role: 'viewer' });
@@ -369,6 +387,67 @@ describe('tenant and user resource reconciliation', () => {
     u.spec.memberships = [{ tenant: 'beta', role: 'viewer' }];
     await controller.reconcileUser(u, [t, beta]);
     expect(secrets().map((r) => r.metadata.name)).toEqual(['di-user-alice-beta-token']);
+  });
+  it('keeps memberships and token Secrets while a granted tenant is Not Ready (#119)', async () => {
+    const { api, controller, t, u } = prepare();
+    const tokenPath = '/api/v1/namespaces/wasmcloud/secrets/di-user-alice-alpha-token';
+    const owned = () =>
+      [...api.objects.values()]
+        .filter((r) => r.metadata.labels?.[OWNER] === u.metadata.uid)
+        .map((r) => `${r.kind}/${r.metadata.namespace}/${r.metadata.name}`)
+        .sort();
+    await controller.reconcileUser(u, [t]);
+    const token = api.objects.get(tokenPath);
+    if (token) token.data = { token: 'dG9rZW4=', 'ca.crt': 'Y2E=' };
+    await controller.reconcileUser(u, [t]);
+    expect(u.status?.conditions?.[0]).toMatchObject({ status: 'True', reason: 'Reconciled' });
+    const granted = owned();
+    expect(granted).toHaveLength(4);
+    // An upgrade bumps the generation; the tenant is Not Ready until the controller catches up.
+    t.metadata.generation = 2;
+    api.operations = [];
+    await controller.reconcileUser(u, [t]);
+    expect(api.operations.filter((o) => o.method === 'DELETE')).toEqual([]);
+    expect(owned()).toEqual(granted);
+    expect(api.objects.get(tokenPath)?.data).toEqual({ token: 'dG9rZW4=', 'ca.crt': 'Y2E=' });
+    expect(u.status?.conditions?.[0]).toMatchObject({ status: 'True', reason: 'Reconciled' });
+    // A failing tenant keeps them too, and a role change still converges on the kept binding.
+    t.status = { conditions: [{ ...ready[0]!, status: 'False', reason: 'ReconcileError' }] };
+    u.spec.memberships[0]!.role = 'viewer';
+    api.seed(u);
+    await controller.reconcileUser(u, [t]);
+    expect(owned()).toEqual(granted);
+    expect(
+      api.objects.get(
+        '/apis/rbac.authorization.k8s.io/v1/namespaces/di-tenant-alpha/rolebindings/di-user-alice',
+      )?.roleRef,
+    ).toMatchObject({ name: 'di-viewer' });
+    // Ready again: the same state, nothing recreated.
+    t.status = { conditions: [{ ...ready[0]!, observedGeneration: 2 }] };
+    api.operations = [];
+    await controller.reconcileUser(u, [t]);
+    expect(api.operations.filter((o) => o.method === 'DELETE')).toEqual([]);
+    expect(owned()).toEqual(granted);
+    expect(u.status?.conditions?.[0]).toMatchObject({ status: 'True', reason: 'Reconciled' });
+    // Suspending the tenant still revokes access.
+    t.spec.suspended = true;
+    await controller.reconcileUser(u, [t]);
+    expect(owned()).toEqual([`ServiceAccount/wasmcloud/di-user-alice`]);
+    expect(u.status?.conditions?.[0]?.reason).toBe('TenantNotReady');
+  });
+  it('waits for a Not Ready tenant before granting a new membership', async () => {
+    const { api, controller, t, u } = prepare();
+    t.metadata.generation = 2;
+    await controller.reconcileUser(u, [t]);
+    expect([...api.objects.values()].filter((r) => r.kind === 'RoleBinding')).toHaveLength(0);
+    expect(api.objects.has('/api/v1/namespaces/wasmcloud/secrets/di-user-alice-alpha-token')).toBe(
+      false,
+    );
+    expect(u.status?.conditions?.[0]).toMatchObject({ status: 'False', reason: 'TenantNotReady' });
+    t.status = { conditions: [{ ...ready[0]!, observedGeneration: 2 }] };
+    await controller.reconcileUser(u, [t]);
+    expect([...api.objects.values()].filter((r) => r.kind === 'RoleBinding')).toHaveLength(2);
+    expect(u.status?.conditions?.[0]).toMatchObject({ status: 'False', reason: 'TokenPending' });
   });
   it('removes memberships even when the referenced tenant no longer exists', async () => {
     const { api, controller, t, u } = prepare();

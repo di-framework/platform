@@ -12,9 +12,12 @@
 //! | `developer` | allowed              | allowed                                          |
 //!
 //! Positive answers are cached briefly (bounded size and TTL) under the
-//! SHA-256 of the credential, never the raw token. Anything other than a 2xx
-//! with a known role (controller unreachable, misconfigured, `401`, `403`,
-//! `5xx`, an unparseable body) denies the request: the registry fails closed.
+//! SHA-256 of the credential, never the raw token. The registry fails closed:
+//! only a 2xx with a known role authorizes. A controller that is temporarily
+//! unavailable (a `5xx`, a timeout, a refused or failed connection) gets
+//! `503 UNAVAILABLE` with `Retry-After`, so clients retry instead of blaming
+//! their credentials. Anything else (misconfiguration, a `401` or `403`, an
+//! unparseable body, a principal of another tenant) gets the `401` challenge.
 //! Every request needs credentials — including the `GET /v2/` probe, which is
 //! where an OCI client discovers it must authenticate.
 
@@ -29,7 +32,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest, Sha256};
 
-use crate::http::{error_response, header_str, respond};
+use crate::http::{error_body, error_response, header_str, respond};
 use crate::{Fields, Method, Response};
 
 const REALM: &str = "di-framework-tenant-registry";
@@ -38,8 +41,13 @@ pub(crate) const CACHE_TTL_NANOS: u64 = 30 * 1_000_000_000;
 /// Upper bound on cached credentials.
 pub(crate) const CACHE_CAPACITY: usize = 256;
 /// Upper bound on one whoami callback, enforced in the guest on top of the
-/// `wasi:http` request options (which a host may ignore). Expiry denies.
+/// `wasi:http` request options (which a host may ignore). Expiry answers `503`.
 pub(crate) const WHOAMI_DEADLINE_NANOS: u64 = 12 * 1_000_000_000;
+/// `Retry-After` (seconds) sent with a `503` when the controller gave none.
+pub(crate) const RETRY_AFTER_DEFAULT_SECS: u32 = 5;
+/// Bounds on the `Retry-After` (seconds) passed through from the controller.
+pub(crate) const RETRY_AFTER_MIN_SECS: u32 = 1;
+pub(crate) const RETRY_AFTER_MAX_SECS: u32 = 60;
 
 /// The tenant role the controller reports for a credential.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,13 +93,20 @@ pub(crate) fn required_access(method: &str) -> Access {
     }
 }
 
-/// The controller's verdict on a credential. Every failure mode collapses to
-/// `Denied`: the registry never distinguishes "controller down" from "bad token"
-/// toward the client, it just refuses.
+/// The controller's verdict on a credential. Neither `Denied` nor
+/// `Unavailable` ever authorizes, and only `Role` is cached.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Whoami {
     Role(Role),
+    /// The controller rejected the credential (`401`, `403`), vouched for a
+    /// principal this registry does not serve, or is not configured.
     Denied,
+    /// The controller could not answer right now: a `5xx`, a timeout or a
+    /// failed connection. `retry_after` is the controller's own `Retry-After`
+    /// in seconds, when it sent one.
+    Unavailable {
+        retry_after: Option<u32>,
+    },
 }
 
 /// The tenant controller's `GET /v1/auth/whoami`, called with the credential
@@ -162,6 +177,20 @@ pub(crate) enum Decision {
     Challenge,
     /// A known principal whose role does not permit the operation: `403`.
     Forbidden,
+    /// The controller is temporarily unavailable: `503` with `Retry-After`
+    /// (seconds, already clamped).
+    Unavailable {
+        retry_after: u32,
+    },
+}
+
+/// The `Retry-After` to send: the controller's value clamped to
+/// [`RETRY_AFTER_MIN_SECS`]..=[`RETRY_AFTER_MAX_SECS`], or
+/// [`RETRY_AFTER_DEFAULT_SECS`] when it sent none.
+pub(crate) fn retry_after_secs(from_controller: Option<u32>) -> u32 {
+    from_controller.map_or(RETRY_AFTER_DEFAULT_SECS, |secs| {
+        secs.clamp(RETRY_AFTER_MIN_SECS, RETRY_AFTER_MAX_SECS)
+    })
 }
 
 /// Run `work` until it finishes or `deadline` fires, whichever is first.
@@ -185,8 +214,8 @@ pub(crate) async fn race<W: Future, D: Future<Output = ()>>(
 }
 
 /// Decide a request from its `Authorization` header and the access it needs.
-/// The controller call is abandoned (and the request denied) when `deadline`
-/// completes first; a cache hit never waits on it.
+/// The controller call is abandoned when `deadline` completes first, which
+/// counts as the controller being unavailable; a cache hit never waits on it.
 pub(crate) async fn authorize<C: Controller, D: Future<Output = ()>>(
     cache: &RefCell<Cache>,
     controller: &C,
@@ -207,7 +236,17 @@ pub(crate) async fn authorize<C: Controller, D: Future<Output = ()>>(
                 cache.borrow_mut().put(key, role, now);
                 role
             }
-            Some(Whoami::Denied) | None => return Decision::Challenge,
+            Some(Whoami::Denied) => return Decision::Challenge,
+            Some(Whoami::Unavailable { retry_after }) => {
+                return Decision::Unavailable {
+                    retry_after: retry_after_secs(retry_after),
+                };
+            }
+            None => {
+                return Decision::Unavailable {
+                    retry_after: retry_after_secs(None),
+                };
+            }
         },
     };
     if role.allows(access) {
@@ -240,7 +279,8 @@ thread_local! {
 }
 
 /// Returns `Some(response)` — `401` with a `WWW-Authenticate: Basic` challenge,
-/// or `403` — when the request may not proceed, and `None` when it may.
+/// `403`, or `503` with `Retry-After` — when the request may not proceed, and
+/// `None` when it may.
 pub(crate) async fn require_access(headers: &Fields, method: &Method) -> Option<Response> {
     let access = required_access(method_name(method));
     let authorization = header_str(headers, "authorization");
@@ -266,6 +306,7 @@ pub(crate) async fn require_access(headers: &Fields, method: &Method) -> Option<
             "DENIED",
             "your tenant role does not allow this operation",
         )),
+        Decision::Unavailable { retry_after } => Some(unavailable(retry_after)),
     }
 }
 
@@ -297,6 +338,24 @@ fn challenge() -> Response {
     )
 }
 
+/// `503` while the tenant controller cannot vouch for credentials. No
+/// `WWW-Authenticate`: the credential was not rejected.
+fn unavailable(retry_after: u32) -> Response {
+    let retry_after = retry_after.to_string();
+    respond(
+        503,
+        &[
+            ("retry-after", retry_after.as_str()),
+            ("content-type", "application/json"),
+            ("docker-distribution-api-version", "registry/2.0"),
+        ],
+        error_body(
+            "UNAVAILABLE",
+            "the tenant controller is temporarily unavailable; retry shortly",
+        ),
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -317,11 +376,11 @@ mod tests {
         }
     }
 
-    /// A fake tenant controller: a fixed token → role table, an "unreachable"
-    /// switch, and a call counter.
+    /// A fake tenant controller: a fixed token → role table, an "unavailable"
+    /// switch (with the `Retry-After` it reports), and a call counter.
     struct FakeController {
         tokens: Vec<(&'static str, Role)>,
-        reachable: bool,
+        unavailable: Option<Option<u32>>,
         calls: Cell<usize>,
         seen: RefCell<Vec<String>>,
     }
@@ -330,7 +389,7 @@ mod tests {
         fn new(tokens: Vec<(&'static str, Role)>) -> Self {
             Self {
                 tokens,
-                reachable: true,
+                unavailable: None,
                 calls: Cell::new(0),
                 seen: RefCell::new(Vec::new()),
             }
@@ -341,8 +400,8 @@ mod tests {
         async fn whoami(&self, bearer: &str) -> Whoami {
             self.calls.set(self.calls.get() + 1);
             self.seen.borrow_mut().push(bearer.to_string());
-            if !self.reachable {
-                return Whoami::Denied;
+            if let Some(retry_after) = self.unavailable {
+                return Whoami::Unavailable { retry_after };
             }
             self.tokens
                 .iter()
@@ -465,14 +524,70 @@ mod tests {
     }
 
     #[test]
-    fn fails_closed_when_the_controller_is_unreachable() {
+    fn an_unavailable_controller_answers_503_and_never_authorizes() {
         let c = cache();
         let mut f = fake();
-        f.reachable = false;
-        for method in ["GET", "PUT"] {
+        f.unavailable = Some(None);
+        for method in ["GET", "HEAD", "PUT", "DELETE"] {
             assert_eq!(
                 decide(&c, &f, Some(&basic("u", "dik_developer")), method),
-                Decision::Challenge
+                Decision::Unavailable {
+                    retry_after: RETRY_AFTER_DEFAULT_SECS
+                },
+                "{method}"
+            );
+        }
+        assert_eq!(c.borrow().len(), 0);
+    }
+
+    #[test]
+    fn the_controllers_retry_after_is_passed_through_clamped() {
+        for (from_controller, sent) in [
+            (Some(30), 30),
+            (Some(1), 1),
+            (Some(0), RETRY_AFTER_MIN_SECS),
+            (Some(3600), RETRY_AFTER_MAX_SECS),
+            (Some(u32::MAX), RETRY_AFTER_MAX_SECS),
+            (None, RETRY_AFTER_DEFAULT_SECS),
+        ] {
+            let c = cache();
+            let mut f = fake();
+            f.unavailable = Some(from_controller);
+            assert_eq!(
+                decide(&c, &f, Some(&basic("u", "viewer-token")), "GET"),
+                Decision::Unavailable { retry_after: sent },
+                "{from_controller:?}"
+            );
+            assert_eq!(c.borrow().len(), 0, "{from_controller:?}");
+        }
+    }
+
+    #[test]
+    fn unavailable_is_not_cached_so_the_next_request_asks_again() {
+        let c = cache();
+        let mut f = fake();
+        let auth = basic("u", "dik_developer");
+        f.unavailable = Some(Some(10));
+        assert_eq!(
+            decide(&c, &f, Some(&auth), "PUT"),
+            Decision::Unavailable { retry_after: 10 }
+        );
+        f.unavailable = None;
+        assert_eq!(decide(&c, &f, Some(&auth), "PUT"), Decision::Allow);
+        assert_eq!(f.calls.get(), 2);
+        assert_eq!(c.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_rejected_credential_still_gets_the_challenge() {
+        // The controller's 401 / 403 arrive here as `Denied` (see
+        // `controller::verdict`).
+        let (c, f) = (cache(), fake());
+        for method in ["GET", "PUT"] {
+            assert_eq!(
+                decide(&c, &f, Some(&basic("u", "revoked")), method),
+                Decision::Challenge,
+                "{method}"
             );
         }
         assert_eq!(c.borrow().len(), 0);
@@ -542,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hanging_controller_times_out_and_fails_closed() {
+    fn a_hanging_controller_times_out_with_503() {
         let c = cache();
         let auth = basic("u", "dik_developer");
         for access in [Access::Read, Access::Write] {
@@ -554,7 +669,12 @@ mod tests {
                 0,
                 std::future::ready(()),
             ));
-            assert_eq!(decision, Decision::Challenge);
+            assert_eq!(
+                decision,
+                Decision::Unavailable {
+                    retry_after: RETRY_AFTER_DEFAULT_SECS
+                }
+            );
         }
         assert_eq!(c.borrow().len(), 0);
     }

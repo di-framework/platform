@@ -81,15 +81,20 @@ pub(crate) fn stream_response(
     response
 }
 
-pub(crate) fn error_response(status: u16, code: &str, message: &str) -> Response {
-    let body = serde_json::json!({
+/// An OCI error body: `{"errors":[{"code":..,"message":..}]}`.
+pub(crate) fn error_body(code: &str, message: &str) -> Vec<u8> {
+    serde_json::json!({
         "errors": [{ "code": code, "message": message }]
     })
-    .to_string();
+    .to_string()
+    .into_bytes()
+}
+
+pub(crate) fn error_response(status: u16, code: &str, message: &str) -> Response {
     respond(
         status,
         &[("content-type", "application/json")],
-        body.into_bytes(),
+        error_body(code, message),
     )
 }
 

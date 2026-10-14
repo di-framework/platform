@@ -95,8 +95,8 @@ async fn dispatch(request: Request) -> Result<Response, String> {
     // Authorize before anything else — including the `/v2/` version probe,
     // which is where an OCI client discovers the registry requires credentials.
     // di-framework: the tenant controller decides (see `auth`).
-    if let Some(challenge) = auth::require_access(&headers, &method).await {
-        return Ok(challenge);
+    if let Some(refusal) = auth::require_access(&headers, &method).await {
+        return Ok(refusal);
     }
 
     let content_type = header_str(&headers, "content-type");

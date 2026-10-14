@@ -6,6 +6,8 @@ import { claimsRegistryHost } from './admission';
 import {
   backingServiceResourceName,
   backingServiceResources,
+  type DeploymentFailure,
+  deploymentFailure,
   endpointFor,
   RUNTIME_DATA_NATS,
   type RuntimeProvider,
@@ -28,8 +30,12 @@ import {
 } from './egress';
 import {
   appendRing,
-  applicationKey,
   attributeEntries,
+  configMapLogKey,
+  type LogKey,
+  legacyRing,
+  logKey,
+  logKeyId,
   logsConfigMap,
   MANAGED_SELECTOR,
   mergeFailures,
@@ -37,6 +43,8 @@ import {
   type ProjectedEntry,
   projectedFailures,
   projectedLines,
+  projectedRing,
+  type RingLine,
   validLabelValue,
   type WorkloadIdentity,
 } from './log-projection';
@@ -1031,11 +1039,14 @@ export class Controller {
   async reconcileUser(user: User, tenants: Tenant[]): Promise<void> {
     if (!validName(user.metadata.name)) throw new Error('Invalid user name');
     if (!user.metadata.deletionTimestamp) await this.finalizer(user, true);
-    const desired = userResources(user, tenants, this.cfg);
     const bindings = await this.list<Resource>('rbac.authorization.k8s.io/v1', 'RoleBinding', {
       [INSTALLATION]: this.cfg.installation,
       [OWNER]: user.metadata.uid!,
     });
+    // Memberships already bound survive while their tenant is merely Not Ready, so the token
+    // Secrets Pulumi reads stay in place until the tenant converges.
+    const granted = new Set(bindings.flatMap((binding) => binding.metadata.labels?.[TENANT] ?? []));
+    const desired = userResources(user, tenants, this.cfg, granted);
     for (const binding of bindings)
       if (!desired.some((r) => location(r) === location(binding))) await this.remove(binding);
     // Token Secrets go before the ServiceAccount so no orphaned credential outlives it.
@@ -1122,8 +1133,8 @@ export class Controller {
       return;
     }
     const desired = backingServiceResources(service, tenant, cls, this.cfg, sizing);
-    const ready = await this.applyBackingServiceResources(desired);
-    await this.updateBackingServiceStatus(service, tenant, cls, ready);
+    const rollout = await this.applyBackingServiceResources(desired);
+    await this.updateBackingServiceStatus(service, tenant, cls, rollout);
   }
 
   /** Egress runs nothing: the service is Ready once its class approves every destination. */
@@ -1224,7 +1235,15 @@ export class Controller {
         [INSTALLATION]: this.cfg.installation,
         [OWNER]: service.metadata.uid!,
       });
-      const state = postgresReadiness(pvc, deployments, pods);
+      let state = postgresReadiness(pvc, deployments, pods);
+      if (!tenant.spec.suspended && state.reason === 'Initializing') {
+        // Quota/admission rejections leave no pods, so only the Deployment explains the wait.
+        const failure = deployments
+          .filter((d) => (d.spec as { replicas?: number }).replicas !== 0)
+          .map((d) => deploymentFailure(d))
+          .find((f) => f !== undefined);
+        if (failure) state = { ready: false, ...failure };
+      }
       await this.status(
         service,
         !tenant.spec.suspended && state.ready,
@@ -1392,8 +1411,11 @@ export class Controller {
     return { cls, sizing: sized.sizing };
   }
 
-  private async applyBackingServiceResources(desired: Resource[]): Promise<boolean> {
+  private async applyBackingServiceResources(
+    desired: Resource[],
+  ): Promise<{ ready: boolean; failure?: DeploymentFailure }> {
     let ready = true;
+    let failure: DeploymentFailure | undefined;
     for (const value of desired) {
       const applied = await this.ensure(value);
       if (value.kind !== 'Deployment') continue;
@@ -1403,29 +1425,32 @@ export class Controller {
       const status = applied.status as
         | { observedGeneration?: number; readyReplicas?: number; replicas?: number }
         | undefined;
-      ready &&=
+      const deploymentReady =
         status?.observedGeneration === applied.metadata.generation &&
         (status?.readyReplicas ?? 0) === spec.replicas &&
         (spec.replicas !== 0 || (status?.replicas ?? 0) === 0);
+      ready &&= deploymentReady;
+      if (!deploymentReady && spec.replicas !== 0) failure ??= deploymentFailure(applied);
     }
-    return ready;
+    return ready ? { ready } : { ready, ...(failure ? { failure } : {}) };
   }
 
   private async updateBackingServiceStatus(
     service: BackingService,
     tenant: Tenant,
     cls: BackingServiceClass,
-    ready: boolean,
+    { ready, failure }: { ready: boolean; failure?: DeploymentFailure },
   ): Promise<void> {
+    const suspended = tenant.spec.suspended;
     await this.status(
       service,
-      ready && !tenant.spec.suspended,
-      tenant.spec.suspended ? 'Suspended' : ready ? 'Ready' : 'Provisioning',
-      tenant.spec.suspended
+      ready && !suspended,
+      suspended ? 'Suspended' : ready ? 'Ready' : (failure?.reason ?? 'Provisioning'),
+      suspended
         ? 'Tenant suspended; backing service scaled down'
         : ready
           ? 'Backing service deployment is ready'
-          : 'Waiting for backing service deployment',
+          : (failure?.message ?? 'Waiting for backing service deployment'),
       {
         runtimeNamespace: names(tenant.metadata.name).runtimeNamespace,
         classRef: {
@@ -1756,11 +1781,24 @@ export class Controller {
   }
 
   /**
-   * Publish one logs ConfigMap per console application (#10). Only `wasi:logging` lines the
-   * host attributed to a workload in this tenant, and host WARN/ERROR lines from its
-   * `workload_start` span, are kept. The newest host failure per WorkloadDeployment goes to
-   * `data.failures`. Nothing is written for an application with no attributed lines, so
-   * absence stays the console's unpublished state.
+   * Publish one logs ConfigMap per projection key (#10, #106): per console application, and
+   * per service and env for a /v1 deployment (logKey). Only `wasi:logging` lines the host
+   * attributed to a workload in this tenant, and host WARN/ERROR lines from its
+   * `workload_start` span, are kept. Each line's WorkloadDeployment goes to
+   * `data.deployments`, its env to `data.envs`, and the newest host failure per
+   * WorkloadDeployment to `data.failures`. Nothing is written for a key with no attributed
+   * lines, so absence stays the console's unpublished state.
+   *
+   * A ConfigMap whose key no live WorkloadDeployment has is removed. That includes the
+   * `di-logs-<service>` ConfigMap staging and prod of a /v1 service shared before #106: each
+   * per-env projection first takes over that ConfigMap's lines and failures of its own
+   * deployment (legacyRing), then the shared one is deleted. When a live workload outside
+   * /v1 still owns that key, the ConfigMap is kept and rewritten in the same pass without the
+   * lines of /v1 deployments, so no line is served from two projections.
+   *
+   * Each write and delete is attempted on its own: one that fails (e.g. at the ConfigMap
+   * quota) is logged and retried on the next poll without holding back the other keys. A
+   * shared ConfigMap whose lines could not be taken over is neither pruned nor deleted.
    */
   async projectLogs(tenant: Tenant): Promise<void> {
     const n = names(tenant.metadata.name);
@@ -1795,10 +1833,54 @@ export class Controller {
         )}`,
       )
     ).items.map((item) => ({ ...item, apiVersion: 'v1', kind: 'ConfigMap' }));
-    const existingByApp = new Map(
-      existing.map((item) => [item.metadata.labels?.['di-framework.dev/application'] ?? '', item]),
+    const existingByKey = new Map(existing.map((item) => [logKeyId(configMapLogKey(item)), item]));
+    const keys = new Map<string, LogKey>();
+    const members = new Map<string, string[]>();
+    for (const deployment of deployments) {
+      const key = logKey(deployment);
+      const id = logKeyId(key);
+      keys.set(id, key);
+      members.set(id, [...(members.get(id) ?? []), deployment.name]);
+    }
+    // The published ring of each live key. A /v1 key without its own ConfigMap yet starts from
+    // its deployment's lines in the ConfigMap every env of the service shared before #106.
+    const current = new Map<string, Resource>();
+    const seeded = new Set<string>();
+    for (const [id, key] of keys) {
+      const own = existingByKey.get(id);
+      const legacy = key.env ? existingByKey.get(key.application) : undefined;
+      if (own || !legacy) {
+        if (own) current.set(id, own);
+        continue;
+      }
+      const seed = legacyRing(legacy, `${key.application}-${key.env}`, key.env);
+      if (seed.lines.length === 0 && Object.keys(seed.failures).length === 0) continue;
+      seeded.add(id);
+      current.set(
+        id,
+        logsConfigMap(
+          tenant.metadata.name,
+          n.namespace,
+          this.cfg.installation,
+          key.application,
+          seed.lines,
+          seed.failures,
+          key.env,
+        ),
+      );
+    }
+    // /v1 deployments; their lines never belong in a projection outside /v1 (see pruning).
+    const v1Deployments = new Set(
+      deployments.filter((deployment) => logKey(deployment).env).map((d) => d.name),
     );
-    const incoming = new Map<string, string[]>();
+    const pruned = new Set<string>();
+    for (const [id, key] of keys)
+      if (
+        !key.env &&
+        projectedRing(current.get(id)).some((entry) => v1Deployments.has(entry.deployment))
+      )
+        pruned.add(id);
+    const incoming = new Map<string, RingLine[]>();
     // Failures are merged newest-wins by deployment, so they skip the line floor: a
     // restarted controller re-reading old lines cannot duplicate them, and never loses one.
     const failures = new Map<string, ProjectedEntry[]>();
@@ -1819,40 +1901,69 @@ export class Controller {
         `${collection('v1', 'Pod', n.runtimeNamespace)}/${encodeURIComponent(pod.metadata.name)}/log?${query}`,
       );
       let newest = cursor ?? '';
-      for (const [app, entries] of attributeEntries(text ?? '', n.namespace, deployments)) {
+      for (const [id, entries] of attributeEntries(text ?? '', n.namespace, deployments)) {
         // A restarted controller resumes after the newest line it already published.
-        const floor = cursor ?? projectedLines(existingByApp.get(app)).at(-1)?.split(' ')[0] ?? '';
+        const floor = cursor ?? projectedLines(current.get(id)).at(-1)?.split(' ')[0] ?? '';
         const fresh = entries.filter((entry) => entry.time > floor);
         for (const entry of fresh) if (entry.time > newest) newest = entry.time;
-        incoming.set(app, [
-          ...(incoming.get(app) ?? []),
-          ...fresh.flatMap((entry) => (entry.line ? [entry.line] : [])),
+        incoming.set(id, [
+          ...(incoming.get(id) ?? []),
+          ...fresh.flatMap((entry) =>
+            entry.line
+              ? [{ line: entry.line, deployment: entry.deployment, env: entry.env ?? '' }]
+              : [],
+          ),
         ]);
-        failures.set(app, [...(failures.get(app) ?? []), ...entries]);
+        failures.set(id, [...(failures.get(id) ?? []), ...entries]);
       }
       if (newest) this.logCursors.set(cursorKey, newest);
     }
-    const live = new Set(deployments.map(applicationKey));
-    for (const [app, lines] of incoming) {
-      if (!live.has(app) || !validLabelValue(app)) continue;
-      const current = existingByApp.get(app);
-      const previous = projectedFailures(current);
-      const members = deployments.filter((d) => applicationKey(d) === app).map((d) => d.name);
-      const merged = mergeFailures(previous, failures.get(app) ?? [], members);
-      if (lines.length === 0 && JSON.stringify(merged) === JSON.stringify(previous)) continue;
-      await this.ensure(
-        logsConfigMap(
-          tenant.metadata.name,
-          n.namespace,
-          this.cfg.installation,
-          app,
-          appendRing(projectedLines(current), lines),
-          merged,
-        ),
+    /** Shared ConfigMaps (by key id) a per-env projection could not take over from yet. */
+    const held = new Set<string>();
+    const attempt = async (name: string, write: () => Promise<unknown>) => {
+      try {
+        await write();
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'write failed';
+        console.error(`Tenant/${tenant.metadata.name} logs ConfigMap ${name}: ${message}`);
+        return false;
+      }
+    };
+    // Takeovers first, so a shared ConfigMap is pruned or deleted only once they are written.
+    for (const id of new Set([...seeded, ...pruned, ...incoming.keys()])) {
+      const key = keys.get(id) as LogKey;
+      if (!validLabelValue(key.application)) continue;
+      const lines = incoming.get(id) ?? [];
+      const published = current.get(id);
+      const previous = projectedFailures(published);
+      const merged = mergeFailures(previous, failures.get(id) ?? [], members.get(id) ?? []);
+      const prune = pruned.has(id) && !held.has(id);
+      if (
+        !seeded.has(id) &&
+        !prune &&
+        lines.length === 0 &&
+        JSON.stringify(merged) === JSON.stringify(previous)
+      )
+        continue;
+      const ring = projectedRing(published).filter(
+        (entry) => !prune || !v1Deployments.has(entry.deployment),
       );
+      const configMap = logsConfigMap(
+        tenant.metadata.name,
+        n.namespace,
+        this.cfg.installation,
+        key.application,
+        appendRing(ring, lines),
+        merged,
+        key.env,
+      );
+      const written = await attempt(configMap.metadata.name, () => this.ensure(configMap));
+      if (!written && seeded.has(id)) held.add(key.application);
     }
-    for (const [app, configMap] of existingByApp) {
-      if (!live.has(app)) await this.remove(configMap);
+    for (const [id, configMap] of existingByKey) {
+      if (!keys.has(id) && !held.has(id))
+        await attempt(configMap.metadata.name, () => this.remove(configMap));
     }
   }
 

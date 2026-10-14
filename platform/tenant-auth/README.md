@@ -27,8 +27,9 @@ one **console** run per tenant, in the tenant's namespace. Users hold only ident
 or tenant API keys; Kubernetes tokens never leave the controller.
 
 The package provides a tenant controller and console that run **inside the cluster**, in the
-tenant's runtime namespace. Both are deployed by `scripts/deploy-local.ts` (which stands in for the
-platform controller's tenant reconcile). The tenant CLI is `di-tenant` in `@di-framework/tenant-cli`.
+tenant's runtime namespace. The platform controller's tenant reconcile deploys both when platform
+config `tenantAuth` is set; see "Tenant controller and console" in `platform/platform/README.md`.
+The tenant CLI is `di-tenant` in `@di-framework/tenant-cli`.
 
 ## Model
 
@@ -77,13 +78,13 @@ The controller and console ship as one container image, `ghcr.io/di-framework/te
 
 A container image was chosen over an OCI bundle on a stock Bun image because Kubernetes pulls and
 verifies it natively by digest, with no init step or volume plugin, and one digest pins both the code
-and the runtime. It will replace the ConfigMap bundle when `:reconcile` lands. `:reconcile` must:
+and the runtime. The tenant reconcile's Deployments therefore:
 
-* drop the `/app` ConfigMap mount (the code is in the image);
-* keep the `/tmp` emptyDir (the root filesystem is read-only);
+* mount no code (it is in the image);
+* keep a `/tmp` emptyDir (the root filesystem is read-only);
 * set `TENANT_CONTROLLER_HOST=0.0.0.0` and `TENANT_CONSOLE_HOST=0.0.0.0`;
 * mount the TLS certificate and key (`TENANT_CONTROLLER_TLS_CERT`, `TENANT_CONTROLLER_TLS_KEY`);
-* use the image digest in place of the `bundle-digest` annotation.
+* roll when the image digest changes.
 
 The `Publish tenant-auth image` workflow publishes it by itself on each push to `main` that changes
 one of its input paths, unless `ghcr.io/di-framework/tenant-auth:src-<hash>` (a hash of those
@@ -100,34 +101,23 @@ image: ghcr.io/di-framework/tenant-auth@sha256:ffb30ae36925c42c7e84049b3f7ce8d7a
 
 Publishing needs the organization to allow Actions to write packages (issue #13).
 
-## Deploy into a local cluster
+## Deploy
+
+The platform controller's tenant reconcile deploys the controller and console for every Tenant
+once platform config `tenantAuth` names the image (by digest), the issuer and the console's OAuth
+client Secret. It owns the ServiceAccounts, RBAC, NetworkPolicy, controller certificates,
+Deployments, Services and gateway routes, and reports problems on the Tenant's `TenantAuthReady`
+condition. The fields, the objects it creates, and the migration from objects created by hand are
+in "Tenant controller and console" in `platform/platform/README.md`. To reach the pair without
+gateway routes:
 
 ```sh
-bun scripts/deploy-local.ts --tenant acme \
-  --kubeconfig "$(di-framework-kube kubeconfig --name <instance>)" \
-  --issuer http://localhost:4180 --issuer-ip <this machine's LAN IP> \
-  --client-secret <the console's OAuth client secret>
 kubectl -n di-runtime-acme port-forward svc/tenant-controller 8788:8788 &
 kubectl -n di-runtime-acme port-forward svc/tenant-console 8787:8787 &
 ```
 
-The script bundles both entrypoints with `Bun.build`, ships them in a ConfigMap (as
-`di-platform-controller` does), generates the controller's TLS in `dist/tls`, and applies it with
-the rest. The TLS is a private CA (`ca.crt`, `ca.key`) and a `CA:FALSE` leaf it signed (`tls.crt`,
-`tls.key`), the layout the platform controller uses. The controller serves the leaf, and the
-console pins `ca.crt` from ConfigMap `tenant-controller-ca`. The files are kept across runs while
-they still verify. An older `dist/tls` that holds a single `CA:TRUE` certificate is replaced: wash
-host pulls reject that certificate (`CaUsedAsEndEntity`). The script applies:
-
-* ServiceAccounts `tenant-controller` and `tenant-console` in `di-runtime-<t>`.
-* RBAC for the controller only: `get` its own `Tenant`, `get`/`list` `User` CRs, `create`
-  `serviceaccounts/token` in the platform namespace restricted by `resourceNames` to the tenant's
-  members, Secrets in its own namespace for API keys, and `get`/`list` on Secrets in
-  `di-tenant-<t>` (#112) so `/v1` can check tenant Secret names, labels and resourceVersions that
-  developers are not allowed to read. It never returns or logs Secret data.
-* A NetworkPolicy adding egress to the API server and the issuer; the tenant policy otherwise
-  allows only tenant namespaces, DNS, and public `:443`.
-* Deployments (strategy `Recreate`, 200m CPU limits) and ClusterIP Services.
+The earlier manual deploy script (#58) is removed; use the reconcile, or run the pieces outside
+the cluster as described below.
 
 Why `di-runtime-<t>` and not `di-tenant-<t>`: developers can edit any Secret or ConfigMap in the
 tenant namespace that the admission policy does not reserve by name, so there they could replace
@@ -136,33 +126,37 @@ only have pods and logs. Moving to `di-tenant-<t>` needs the `backend-config` ad
 to reserve the `tenant-auth-*` and `tenant-controller-*` names.
 
 Local identity-server: a developer's browser can only be relied on to reach `localhost`, and Bun
-resolves every `*.localhost` name to loopback regardless of `/etc/hosts`, so with
-`--issuer http://localhost:4180 --issuer-ip <ip>` each pod gets a `socat` sidecar that forwards
-`127.0.0.1:4180` to the machine. With a resolvable issuer hostname the same flag becomes a
-`hostAliases` entry instead; with a real DNS name neither is needed.
+resolves every `*.localhost` name to loopback regardless of `/etc/hosts`. With a loopback issuer,
+`tenantAuth.issuerUpstream` (or `issuerIp`) gives each pod a `socat` sidecar that forwards the
+issuer port to where identity-server really listens. With a resolvable issuer hostname,
+`issuerIp` becomes a `hostAliases` entry instead; with a real DNS name neither is needed.
 
 ### identity-server as a platform guest
 
 With the identity-server Wasm guest deployed to tenant `identity` (`di-framework platform deploy
 identity`, Postgres BackingService `directory`, runtime secrets loaded into
 `identity_runtime_secret`, gateway route `identity.identity.localhost`), the console and
-controller point at it with:
+controller point at it with platform config:
 
-```sh
-bun scripts/deploy-local.ts --tenant acme ... \
-  --issuer http://identity.identity.localhost:28280 \
-  --issuer-upstream di-platform-gateway.wasmcloud.svc.cluster.local:80 \
-  --client-id access --client-secret <AUTH_ACCESS_CLIENT_SECRET row>
+```yaml
+tenantAuth:
+  image: ghcr.io/di-framework/tenant-auth@sha256:<digest>
+  issuer: http://identity.identity.localhost:28280
+  issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80
+  issuerUpstreamPodPort: 8080
+  oauthClient: { id: access, secretName: tenant-auth-oauth } # key `clientSecret`: the AUTH_ACCESS_CLIENT_SECRET row
 ```
 
 The `.localhost` issuer makes Bun use loopback, so the sidecar forwards the port to the platform
-gateway, which routes by `Host`. A redeploy with new code rolls both pods: the pod template
-carries a digest of the bundle, because a ConfigMap update alone leaves the running processes on
-the old code.
+gateway, which routes by `Host`. A new image digest rolls both pods.
 
 `GET /v1/services/:service/logs` streams a service's projected log lines as server-sent events.
-Logs are scoped to the tenant namespace, not to an environment: `env` is accepted and ignored,
-because the log projection carries no environment label.
+`env` selects the environment: the platform projects each /v1 deployment into its own
+`di-logs-<service>.<env>` ConfigMap and records each line's deployment and env
+(`data.deployments`, `data.envs`). Lines of a workload outside /v1 whose application label equals
+the service name are never served. During the move from the ConfigMap staging and prod shared
+before (`di-logs-<service>`), its lines are still read, each in the env of its recorded deployment;
+lines published before deployments were recorded are served in every env.
 
 Verified on `authproto` on 2026-10-09 with the guest from identity-server `main` (Argon2 in the
 composed `pqc-subtle` component) and the tenant CLI pilot in `platform/tenant-cli`:
@@ -296,6 +290,13 @@ ValidatingAdmissionPolicy therefore refuses, for `di-user-*` ServiceAccounts, ev
 that could answer without removing it: `dryRun`, `propagationPolicy` `Orphan` or `Foreground`
 (or `orphanDependents`), and a Secret that already has finalizers or a `deletionTimestamp`. The
 controller's kubectl proxy replaces the body of a successful Secret `DELETE` with a bare `Status`.
+The proxy makes its path policy and this redaction on one canonical path, which is also the path
+it forwards: each segment is percent-decoded once (`%73ecrets` is `secrets`), and a path with an
+empty segment (`//secrets`), a malformed escape, or a segment decoding to `.`, `..`, or text with
+`/` (`secrets%2Fname`), `\`, `%` (double encoding) or a control character is refused with 403.
+The redaction is defense in depth only: tenant users also receive a token kubeconfig for their
+ServiceAccount and can reach the API server without the proxy, so the admission policies above
+are what keep Secret values from being returned.
 
 Developers replace Secrets they cannot read, so the `tenant-secret-update` policy guards every
 Secret `UPDATE` by a `di-user-*` ServiceAccount (`stringData` is already folded into `data` when
@@ -307,7 +308,8 @@ console's Secret reassignment errors):
 | the target is platform-managed (`di-binding-*`, `di-bs-*`) | `tenant users cannot update platform-managed di-binding-*/di-bs-* Secrets` | 403 |
 | the update drops a key the Secret already has | `tenant users may update a Secret only if it keeps every existing data key` | 409 |
 
-Same-key replaces (the `/v1` secret set and update, the CLI `<workload>-control` Secret) and
+Same-key replaces (the `/v1` secret set and update, the CLI `<workload>-control` Secret, the app's
+`<workload>-secrets` Secret) and
 updates that add keys stay allowed. Match by substring: a managed name may also trip the older
 `backend-config` message first.
 
@@ -321,26 +323,29 @@ var named like an existing secret's environment variable, or a secret whose envi
 is an existing var. The deploy lane (platform#55) must still reject a bundle that meets such a
 pair (for example one created out of band) with 422; it never picks a precedence.
 
-**Unset refuses what a deployed workload injects (platform#100).** Deleting a Secret a running
-workload injects stops its replicas from being placed (`Config=False … Secret "<name>.<env>" not
-found`), and removing a var silently drops it from the workload's environment. So before an
-unset, the endpoints list the tenant's WorkloadDeployments as the caller and look at every
-guest's `localResources.environment` (`components[*]` and `service`):
+**Unset and deployed workloads (platform#100).** Deleting a Secret a running workload injects
+stops its replicas from being placed (`Config=False … Secret "<name>.<env>" not found`); removing
+a var only drops that key from the workload's environment, since the vars ConfigMap stays. So
+before an unset, the endpoints list the tenant's WorkloadDeployments as the caller and look at
+every guest's `localResources.environment` (`components[*]` and `service`):
 
-- `DELETE /v1/secrets/<name>?env=<env>` answers 409 when any of them lists `<name>.<env>` in
-  `secretFrom`;
-- `DELETE /v1/vars/<NAME>?env=<env>` answers 409 when any of them lists `di-vars-<env>` in
-  `configFrom`. Workloads inject the whole vars ConfigMap, not single keys, so every var of that
-  env counts as referenced while such a workload exists.
+- `DELETE /v1/secrets/<name>?env=<env>` is **refused** with 409 when any of them lists
+  `<name>.<env>` in `secretFrom`. The problem+json `detail` names them, sorted (`secret
+  verify-token is referenced by deployed workloads in staging: greeter-staging; …`), and nothing
+  is deleted. It succeeds (204) once nothing references it: destroy the workload, or redeploy it
+  without the secret in `secrets`.
+- `DELETE /v1/vars/<NAME>?env=<env>` **succeeds with a warning**. It answers 200 with a `VarUnset`
+  body, `{ "warnings": [...] }`: when any workload lists `di-vars-<env>` in `configFrom`, one
+  `{ "code": "referenced", "detail": "...", "deployments": [...] }` entry names them, sorted;
+  otherwise `warnings` is empty. Workloads inject the whole ConfigMap, not single keys, so every
+  var of that env counts as referenced while such a workload exists. `di-tenant vars unset`
+  prints each warning to stderr as `warning: <detail>`.
 
-The 409 is a problem+json whose `detail` names the referencing WorkloadDeployments, sorted
-(`secret verify-token is referenced by deployed workloads in staging: greeter-staging; …`), and
-nothing is deleted. A name that does not exist is still a 404 first. Unset succeeds once nothing
-references it: destroy the workload, or for a secret redeploy without it in `secrets`. Set and
-update are never blocked. The check reads the live objects, so a workload applied out of band
-counts too; a deploy racing the unset is caught by the deploy's own existence check (422).
-Whether an emptied vars ConfigMap is deleted is a separate decision (platform#98); today it is
-kept with no keys.
+A name that does not exist is still a 404 first, and set and update are never affected. The
+check reads the live objects, so a workload applied out of band counts too; a failed read is a
+502 that leaves the secret or vars unchanged, and a deploy racing a secret unset is caught by the
+deploy's own existence check (422). Whether an emptied vars ConfigMap is deleted is a separate
+decision (platform#98); today it is kept with no keys.
 
 **HTTP host and labels (platform#101, #103).** A service's HTTP host is `<service>-<env>`
 (for example `greeter-staging`, `greeter-prod`), the WorkloadDeployment's own name, in every env.
@@ -381,9 +386,15 @@ create. On a WorkloadDeployment in `di-tenant-<t>`, every
 - `secretFrom[].name` matching `^[a-z]([-a-z0-9]{0,61}[a-z0-9])?\.<env>$` (the `<name>` rule
   above, then `.<env>`), where the part before the dot is not a managed name
   (`isManagedSecretName`: `di-binding-*`, `di-bs-*`);
-- a WorkloadDeployment may also reference `secretFrom: <its own metadata.name>-control` (the
-  control Secret cli-plugin-platform renders for HTTP workloads under
-  `localResources.environment`), regardless of the env label, unless that name is managed;
+- a WorkloadDeployment may also reference exactly two Secrets named after itself, regardless of
+  the env label, unless that name is managed (platform#203):
+  - `<its own metadata.name>-control`: the control Secret cli-plugin-platform renders for HTTP
+    workloads under `localResources.environment`. It holds only the CLI's control credentials
+    (`DI_CONTROL_TOKEN`, `DI_CONTROL_IDENTITY`), and the CLI owns and rotates it on every deploy.
+  - `<its own metadata.name>-secrets`: the app's runtime secrets (for example signing keys or
+    `DI_PGLITE_KEY`). The app's own tooling writes it; the CLI never touches it.
+
+  No other `<metadata.name>-*` name is allowed, and neither Secret of another workload is;
 - no `imagePullSecret` (component or service) may be a managed name (`di-binding-*`, `di-bs-*`).
 
 `<env>` is the value of the WorkloadDeployment's `platform.di-framework.dev/env` label: the
@@ -416,32 +427,48 @@ revision of a service/env is the one its live WorkloadDeployment names, whatever
 ConfigMap marks say: list, stats and the default rollback target use it. A `pending` revision
 the workload names reads as `live`, and any other `live` revision as `replaced`, so history
 repairs itself after a crash between apply and mark and after out-of-order concurrent applies.
-Reads only report the repair (viewers stay read-only); the next deploy writes it.
+Reads only report the repair (viewers stay read-only); the next deploy writes it. A revision
+repaired to `replaced` went live, but no deploy observed how its rollout ended: unless a status
+was recorded, it lists as `rolling`, and the repair writes that status.
 
 The namespace quota allows `count/configmaps: 100`, shared with `di-vars-<env>`, the `di-logs-*`
-projections and `kube-root-ca.crt`, so history is bounded (constants in `src/v1/deploy.ts`):
+projections (one per /v1 service and env; see "Console log projection" in the platform README)
+and `kube-root-ca.crt`, so history is bounded (constants in `src/v1/deploy.ts`):
 
 * `HISTORY_PER_SERVICE_ENV = 10` revisions per service and env.
 * `HISTORY_TENANT_BUDGET = 40` revisions in the tenant, evicting the oldest across services
   first. A revision a WorkloadDeployment runs is never evicted; the last revision of a
   destroyed or renamed service is.
 
-If the revisions running workloads alone fill the budget (only possible when a tenant's
-`spec.resources.workloads` quota is above 40), the deploy answers 507 before anything is
-applied. Pruning happens before the revision is created. If the quota still refuses it (403
+If the revisions running workloads alone fill the budget (40 or more running workloads, only
+possible when a tenant's `spec.resources.workloads` quota is at least 40), a deploy of a service
+that runs no revision answers 507 before anything is applied. A deploy or rollback of a service
+that runs one still goes ahead: the revision it replaces becomes evictable, and the next deploy
+prunes it. Each such deploy holds one revision over the budget meanwhile, so K concurrent
+redeploys can briefly reach 40 + K revisions; the `count/configmaps: 100` quota still bounds
+them. Pruning happens before the revision is created. If the quota still refuses it (403
 `exceeded quota`), the deploy answers 507 before anything is applied. Revisions edited by hand
 out of this shape (non-integer label, name not matching the labels, bad `component`
 annotation, unknown state) are skipped and logged as `deploy.revision-skipped`. A rollback
-target whose `data.bundle` does not match `data.digest`, or is not a complete bundle, is a 422.
+target whose `data.bundle` does not match `data.digest`, or is not a complete bundle, is a 422;
+one a concurrent deploy pruned after the history was read is a 404.
 
 ## HTTP surface
 
 Controller: `GET /-/healthz` (open); `GET /-/whoami`, `GET|POST /-/keys`, `DELETE /-/keys/:id`,
 `GET /-/members` (bearer); everything else is proxied to the API server under the path policy.
 
+Errors under `/v1/` are RFC 9457 `application/problem+json`, including the authentication refusals
+raised before dispatch (platform#97): a missing or rejected credential is `401` with
+`WWW-Authenticate: Bearer realm="di-framework-tenant"` (plus `error="invalid_token"` only when a
+non-empty bearer token was sent; another scheme or an empty `Bearer` gets the bare challenge, as
+RFC 6750 §3.1 asks), and a suspended account or a caller without a membership is `403`. An
+identity or cluster outage is a `502` with a fixed detail. The detail never quotes the
+credential. `/-/` and the Kubernetes proxy keep the Kubernetes `Status` body.
+
 Console: `GET /login` (+ `cli_callback`, `cli_state`), `GET /oidc/callback`, `GET /logout`,
 `GET /cli/info`, `POST /cli/exchange`, `POST /cli/refresh`, `POST /cli/logout` (unused by any client in this repo now that the prototype CLI is removed); pages `/`,
-`/logs/:app`, `/members`, `/keys`, `POST /keys`, `POST /keys/:id/revoke`.
+`/logs/:deployment` (lines of one WorkloadDeployment; the overview groups deployments by application and env), `/members`, `/keys`, `POST /keys`, `POST /keys/:id/revoke`.
 
 ## Verified against `di-framework-kube` (instance `authproto`, tenant `acme`)
 

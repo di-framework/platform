@@ -17,6 +17,13 @@
  * never apply to the console, controller or registry hosts, or to TLS passthrough, and an unusable
  * alias fails closed with 502 rather than reaching the original tenant. A `routeAliases` value that
  * is not an object stops the gateway at startup.
+ *
+ * On SIGTERM the gateway drains (#223): it stops accepting connections, closes idle keep-alive
+ * connections, answers requests already in flight (including one whose headers are only partly
+ * received, or a new connection's first request) with `Connection: close`, and waits for them,
+ * upgraded (WebSocket) tunnels and TLS passthrough pipes to finish, up to `drainTimeoutMs`. Then it
+ * closes whatever is left and exits. The pod's `preStop` delay runs first, so the Service stops
+ * sending it new connections before the listener closes.
  */
 import {
   Agent,
@@ -71,6 +78,97 @@ export interface GatewayOptions {
   classifyTimeoutMs?: number;
   /** Edge only: idle time allowed on a controller passthrough pipe (default 5 min). */
   passthroughIdleMs?: number;
+}
+
+/** Default bound on a SIGTERM drain; the Deployment's termination grace period covers it. */
+export const DRAIN_TIMEOUT_MS = 20_000;
+
+/** Bytes read from a connection so far (0 for a stream that does not count them). */
+function bytesRead(socket: Duplex): number {
+  return (socket as Partial<Socket>).bytesRead ?? 0;
+}
+
+/**
+ * A gateway's open client connections, so SIGTERM can drain them (#223). A connection is busy
+ * while it carries an HTTP request, an upgraded tunnel, a TLS passthrough pipe or bytes the edge
+ * is still classifying, and from being accepted until its first request. It is idle between
+ * requests on a keep-alive connection, until it reads again: a request whose headers are only
+ * partly received has advanced `bytesRead`, so it is not closed as idle but answered.
+ */
+class Connections {
+  draining = false;
+  private readonly open = new Set<Duplex>();
+  private readonly busy = new Map<Duplex, number>();
+  private readonly pinned = new Set<Duplex>();
+  /** `bytesRead` when each idle connection last became idle. */
+  private readonly idleAt = new Map<Duplex, number>();
+  private readonly emptied: (() => void)[] = [];
+
+  add(socket: Duplex): void {
+    if (this.open.has(socket)) return;
+    this.open.add(socket);
+    socket.once('close', () => {
+      this.open.delete(socket);
+      this.busy.delete(socket);
+      this.pinned.delete(socket);
+      this.idleAt.delete(socket);
+      if (!this.open.size) for (const resolve of this.emptied.splice(0)) resolve();
+    });
+  }
+
+  /** Busy for good: an upgraded tunnel or a passthrough pipe, closed only by its peers. */
+  pin(socket: Duplex): void {
+    this.add(socket);
+    this.pinned.add(socket);
+  }
+
+  begin(socket: Duplex): void {
+    this.add(socket);
+    this.busy.set(socket, (this.busy.get(socket) ?? 0) + 1);
+    this.idleAt.delete(socket);
+  }
+
+  /** One unit of work on `socket` is done; while draining, an idle connection is closed. */
+  end(socket: Duplex, closeIfIdle = true): void {
+    const left = (this.busy.get(socket) ?? 1) - 1;
+    if (left > 0) this.busy.set(socket, left);
+    else {
+      this.busy.delete(socket);
+      this.idleAt.set(socket, bytesRead(socket));
+    }
+    if (closeIfIdle && this.draining) this.closeIfIdle(socket);
+  }
+
+  /** Close idle connections now and resolve once every connection has closed. */
+  drain(): Promise<void> {
+    this.draining = true;
+    for (const socket of this.open) this.closeIfIdle(socket);
+    if (!this.open.size) return Promise.resolve();
+    return new Promise((resolve) => this.emptied.push(resolve));
+  }
+
+  destroyAll(): void {
+    for (const socket of this.open) socket.destroy();
+  }
+
+  private closeIfIdle(socket: Duplex): void {
+    if (this.busy.has(socket) || this.pinned.has(socket)) return;
+    // Bytes since it went idle are the start of a request: let it complete and be answered.
+    if (bytesRead(socket) !== this.idleAt.get(socket)) return;
+    // `end` flushes a response already written before it sends FIN.
+    socket.end();
+  }
+}
+
+const tracked = new WeakMap<Server, Connections>();
+
+function connectionsOf(server: Server): Connections {
+  let connections = tracked.get(server);
+  if (!connections) {
+    connections = new Connections();
+    tracked.set(server, connections);
+  }
+  return connections;
 }
 
 /** Same rule as tenant names in the platform CRDs (`validName`). */
@@ -249,12 +347,18 @@ function recordLength(buffer: Buffer): number {
  * Pipe a TLS connection for `<controller>.<tenant>.localhost` to that tenant's controller, or for
  * `<registry>.<tenant>.localhost` to the controller's registry front.
  */
-function passThrough(socket: Socket, hello: Buffer, options: GatewayOptions): void {
+function passThrough(
+  socket: Socket,
+  hello: Buffer,
+  options: GatewayOptions,
+  connections: Connections,
+): void {
+  connections.pin(socket);
   const name = serverName(hello);
   // Fail closed, logged once per connection; never log the hello or the name it carries.
   if (name === undefined)
     console.error(
-      `${socket.remoteAddress}: closing a TLS connection whose ClientHello has no readable server name (malformed, or split across records)`,
+      `${socket.remoteAddress}: closing a TLS connection whose ClientHello has no readable server name (no SNI extension, malformed, or split across records)`,
     );
   // Route aliases are for plain HTTP tenant routes only; TLS passthrough never consults them.
   const route = routeRequest(name);
@@ -301,7 +405,10 @@ function passThrough(socket: Socket, hello: Buffer, options: GatewayOptions): vo
  * passthrough idle timeout, take over.
  */
 export function createEdge(server: Server, options: GatewayOptions): NetServer {
+  const connections = connectionsOf(server);
   return createNetServer((socket) => {
+    // Classifying counts as busy, so a drain waits for (at most) the deadline below.
+    connections.begin(socket);
     const deadline = setTimeout(() => socket.destroy(), options.classifyTimeoutMs ?? 10_000);
     socket.on('error', () => socket.destroy());
     socket.once('close', () => clearTimeout(deadline));
@@ -318,9 +425,12 @@ export function createEdge(server: Server, options: GatewayOptions): NetServer {
       socket.pause();
       clearTimeout(deadline);
       if (needed) {
-        passThrough(socket, buffer, options);
+        passThrough(socket, buffer, options, connections);
+        connections.end(socket, false);
         return;
       }
+      // The HTTP server holds it busy from its 'connection' event until its first request.
+      connections.end(socket, false);
       socket.unshift(buffer);
       server.emit('connection', socket);
       socket.resume();
@@ -357,10 +467,21 @@ export function upstreamHeaders(
   return headers;
 }
 
-function respond(res: ServerResponse, status: number, message: string): void {
+/** While draining, every response closes its connection, so no client reuses it. */
+function closing(connections: Connections): OutgoingHttpHeaders {
+  return connections.draining ? { connection: 'close' } : {};
+}
+
+function respond(
+  res: ServerResponse,
+  status: number,
+  message: string,
+  extra: OutgoingHttpHeaders = {},
+): void {
   res.writeHead(status, {
     'content-type': 'text/plain; charset=utf-8',
     'content-length': Buffer.byteLength(message),
+    ...extra,
   });
   res.end(message);
 }
@@ -417,11 +538,27 @@ function target(
 export function createGateway(options: GatewayOptions): Server {
   const timeout = options.upstreamTimeoutMs ?? 60_000;
   const agent = new Agent({ keepAlive: true, maxSockets: 256 });
+  // Assigned right after the server exists; no handler runs before that.
+  let connections: Connections;
+  // Accepted connections whose first request has not started: busy, so a drain answers it.
+  const awaitingFirst = new WeakSet<Duplex>();
+  const started = (socket: Duplex) => {
+    if (awaitingFirst.delete(socket)) connections.end(socket, false);
+  };
   const server = createServer((req, res) => {
+    const socket = req.socket;
+    connections.begin(socket);
+    started(socket);
+    res.once('close', () => connections.end(socket));
     const resolved = target(req, options);
     if ('error' in resolved) {
       req.resume();
-      respond(res, resolved.status, `${STATUS_TEXT[resolved.status]}: ${resolved.error}\n`);
+      respond(
+        res,
+        resolved.status,
+        `${STATUS_TEXT[resolved.status]}: ${resolved.error}\n`,
+        closing(connections),
+      );
       return;
     }
     const proxy = request({
@@ -434,7 +571,10 @@ export function createGateway(options: GatewayOptions): Server {
     });
     proxy.setTimeout(timeout, () => proxy.destroy(new UpstreamTimeout()));
     proxy.on('response', (upstream) => {
-      res.writeHead(upstream.statusCode as number, endToEndHeaders(upstream.headers));
+      res.writeHead(upstream.statusCode as number, {
+        ...endToEndHeaders(upstream.headers),
+        ...closing(connections),
+      });
       upstream.pipe(res);
       // A truncated upstream body must not look complete to the client.
       upstream.on('error', () => res.destroy());
@@ -445,15 +585,24 @@ export function createGateway(options: GatewayOptions): Server {
     proxy.on('error', (error) => {
       console.error(`${resolved.upstream.hostname}: ${error.message || error.name}`);
       if (res.headersSent) res.destroy();
-      else if (error instanceof UpstreamTimeout) respond(res, 504, 'Gateway Timeout\n');
-      else respond(res, 502, 'Bad Gateway\n');
+      else if (error instanceof UpstreamTimeout)
+        respond(res, 504, 'Gateway Timeout\n', closing(connections));
+      else respond(res, 502, 'Bad Gateway\n', closing(connections));
     });
     res.on('close', () => {
       if (!res.writableFinished) proxy.destroy();
     });
     req.pipe(proxy);
   });
+  connections = connectionsOf(server);
+  server.on('connection', (socket: Socket) => {
+    connections.begin(socket);
+    awaitingFirst.add(socket);
+  });
   server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+    // An upgrade owns its connection until a peer closes it; a drain waits for it, up to its bound.
+    connections.pin(socket);
+    started(socket);
     socket.on('error', () => socket.destroy());
     const resolved = target(req, options);
     if ('error' in resolved) {
@@ -521,15 +670,62 @@ export function createGateway(options: GatewayOptions): Server {
 
 export interface GatewayConfig {
   port?: number;
+  /** The default host group's HTTP Service, `<hostname>` (port 80) or `<hostname>:<port>`. */
   defaultUpstream: string;
   upstreamTimeoutMs?: number;
   tenantAuthRoutes?: { console?: string; controller?: string; registry?: string };
   routeAliases?: Record<string, string>;
+  /** Bound on the SIGTERM drain (default `DRAIN_TIMEOUT_MS`). */
+  drainTimeoutMs?: number;
+}
+
+/**
+ * Drain a gateway (#223): stop accepting on `listener`, close idle keep-alive connections, and
+ * wait for in-flight requests, upgraded tunnels and passthrough pipes to finish. After
+ * `timeoutMs`, destroy whatever is still open. Resolves `drained` or `timeout`; either way every
+ * connection has been closed and so has the HTTP server.
+ */
+export async function drain(
+  server: Server,
+  listener: Server | NetServer,
+  timeoutMs: number = DRAIN_TIMEOUT_MS,
+): Promise<'drained' | 'timeout'> {
+  const connections = connectionsOf(server);
+  // Without the edge, Node's `http.Server#close` also destroys keep-alive connections between
+  // requests, as the drain does. A connection accepted but not yet sending, or partway through a
+  // request, is kept: it is answered with `Connection: close`, or closed at the bound. Behind the
+  // edge, a connection still being classified is kept and answered the same way.
+  listener.close();
+  let timer: NodeJS.Timeout | undefined;
+  const result = await Promise.race([
+    connections.drain().then(() => 'drained' as const),
+    new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), timeoutMs);
+    }),
+  ]);
+  clearTimeout(timer);
+  if (result === 'timeout') connections.destroyAll();
+  // Behind the edge the HTTP server never listened; closing it now releases the upstream agent.
+  if (listener !== server) server.close();
+  return result;
+}
+
+/** `<hostname>` (port 80) or `<hostname>:<port>`; throws on a port outside 1-65535. */
+export function defaultUpstreamOf(value: string): Upstream {
+  const match = /^([^:]+):([0-9]+)$/.exec(value);
+  if (!match) return { hostname: value, port: 80 };
+  const port = Number(match[2]);
+  if (port < 1 || port > 65_535)
+    throw new Error(
+      `GATEWAY_CONFIG defaultUpstream port must be between 1 and 65535; received ${match[2]}`,
+    );
+  return { hostname: match[1] as string, port };
 }
 
 export function main(
   env: NodeJS.ProcessEnv = process.env,
   signals: NodeJS.EventEmitter = process,
+  exit: (code: number) => void = () => {},
 ): Server {
   const cfg = JSON.parse(env.GATEWAY_CONFIG ?? '{}') as Partial<GatewayConfig>;
   if (!cfg.defaultUpstream) throw new Error('Missing GATEWAY_CONFIG');
@@ -543,7 +739,7 @@ export function main(
       'GATEWAY_CONFIG routeAliases must be an object of "<route-host>.<tenant>" strings',
     );
   const options: GatewayOptions = {
-    defaultUpstream: { hostname: cfg.defaultUpstream, port: 80 },
+    defaultUpstream: defaultUpstreamOf(cfg.defaultUpstream),
     upstreamTimeoutMs: cfg.upstreamTimeoutMs,
     tenantAuthRoutes: cfg.tenantAuthRoutes,
     routeAliases: cfg.routeAliases,
@@ -557,10 +753,14 @@ export function main(
       : server;
   listener.listen(cfg.port ?? 8080);
   signals.once('SIGTERM', () => {
-    listener.close();
-    if (listener !== server) server.close();
+    const timeoutMs = cfg.drainTimeoutMs ?? DRAIN_TIMEOUT_MS;
+    console.log(`SIGTERM: draining connections for up to ${timeoutMs} ms`);
+    void drain(server, listener, timeoutMs).then((result) => {
+      console.log(`SIGTERM: ${result === 'drained' ? 'drained' : 'drain timed out'}, exiting`);
+      exit(0);
+    });
   });
   return server;
 }
 
-if (require.main === module) main();
+if (require.main === module) main(process.env, process, (code) => process.exit(code));

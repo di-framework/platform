@@ -86,7 +86,7 @@ including the `GET /v2/` probe, the registry:
    `Authorization: Bearer <password>`. The call has a 2 s connect, 5 s
    first-byte and 5 s between-bytes timeout (`wasi:http` request options), and
    the guest also abandons it after 12 s by the monotonic clock in case the
-   host ignores those options. A timeout denies (`401`).
+   host ignores those options. A timeout answers `503` (see below).
 3. Requires a 2xx body shaped like the contract's `Principal` (`user`,
    `account`, `role`, `via`) whose `account` equals the bind-time `tenant`
    key. A principal from another tenant's controller is denied.
@@ -120,10 +120,23 @@ Worst cases before a revoked credential stops working at the registry:
 
 `POST /v1/auth/logout` on the controller does not clear the registry's cache.
 
-It **fails closed**: if `tenant-controller-url` or `tenant` is missing or
-malformed, the controller is unreachable or too slow, or it answers anything
-other than a 2xx `Principal` for this tenant with a `viewer` / `developer`
-role, the request gets the `401` challenge.
+It **fails closed**: only a 2xx `Principal` for this tenant with a `viewer` /
+`developer` role authorizes a request. The refusal tells the client why:
+
+| Controller outcome                                                          | Registry answer                                   |
+| --------------------------------------------------------------------------- | ------------------------------------------------- |
+| `5xx`, connection refused or failed, DNS or TLS failure, any timeout        | `503 UNAVAILABLE` with `Retry-After`              |
+| `401`, `403`, any other non-2xx, an unusable body, another tenant's account | `401 UNAUTHORIZED` with `WWW-Authenticate: Basic` |
+| `tenant-controller-url` or `tenant` missing or malformed                    | `401 UNAUTHORIZED` with `WWW-Authenticate: Basic` |
+
+The `503` covers a controller restart or an identity issuer outage (the
+controller answers its own `503` while OIDC discovery is pending), so
+`docker login` / `docker push` reports a temporary failure instead of bad
+credentials. It has no `WWW-Authenticate` header and an OCI error body,
+`{"errors":[{"code":"UNAVAILABLE","message":"..."}]}`. `Retry-After` is the
+controller's own delta-seconds value clamped to 1–60 s, or 5 s when the
+controller sent none (or an HTTP-date), timed out or could not be reached.
+A `503` is never cached, so the next request asks the controller again.
 
 ### Configuration
 
@@ -151,8 +164,15 @@ hyper + rustls), which verifies the server against the **host's** trust roots;
 `wasi:http/types` has no per-request field for a custom CA, and the wasi-tls
 work tracked for the tenant host (#81) concerns TLS the guest terminates or
 originates itself over `wasi:sockets`, not the host's HTTP client. So
-`https://` only works when the tenant's private CA is installed in every
-tenant host's trust store, which couples the host image to each tenant's CA.
+`https://` only works when the host trusts the tenant's private CA.
+
+wash 2.8 can do that without a per-tenant image: `wash host
+--http-client-ca-path <pem>` (`WASH_HTTP_CLIENT_CA_PATHS`) layers extra PEM
+roots on top of the default webpki roots for every component's outgoing
+`wasi:http` request, P2 and P3 alike, and is read once when the host starts.
+The platform passes it the tenant CA from ConfigMap `tenant-controller-ca`
+(the same file as `--oci-ca-path`), so tenant hosts with a registry already
+trust the controller certificate (platform#113).
 
 The component accepts either. `:reconcile` (platform#83) uses plain HTTP to a
 separate controller listener, `http://tenant-controller.di-runtime-<tenant>.svc:8789`,
@@ -163,18 +183,38 @@ tenant's host pods to it (see the `tenantAuth` section of
 controller's TLS registry front to the host is plain HTTP too, so the Basic
 credential is cleartext on the pod network before the registry sees it. Both
 hops stay cleartext unless the cluster encrypts pod traffic (CNI WireGuard or
-mesh mTLS); off-cluster, users reach the registry only over TLS. Once the
-tenant host is confirmed to accept an extra trust root, an `https://` URL
-works with no code change.
+mesh mTLS); off-cluster, users reach the registry only over TLS. Now that the
+tenant hosts trust the controller CA, an `https://` URL needs no component
+change; what keeps the callback on `8789` for now is that only that listener
+accepts the host pull token, and it serves plain HTTP (platform#113).
 
 A bracketed IPv6 authority counts as cluster-local only when it is loopback
 and is followed by nothing or by `:<digits>`; `http://[::1]evil.example` and
 the like are rejected.
 
+### Storage limit
+
+On the platform the registry's blobstore is the tenant's `di-nats` JetStream
+store, on the node's host path. Its size is capped by the platform config
+`runtimeNats.maxFileStore` (default `10Gi`, platform#160), shared with every
+other JetStream stream and object store of that tenant. Pulls keep working at
+the cap.
+
+- When writes fill the store up to the cap, the push that would cross it fails
+  with `insufficient resources`. Deleting images frees space, and pushes work
+  again.
+- When the store already holds more than the cap (the cap was lowered below
+  usage, or an upgrade introduced it), every write is refused, **deletes
+  included**: a blobstore delete is a write of a delete marker. The registry
+  cannot free space itself. An operator raises `maxFileStore` (which restarts
+  `di-nats`) or removes data with `nats stream purge` / `nats stream rm`.
+
+See "Runtime NATS storage caps" in `platform/platform/README.md`.
+
 ### Build and test
 
 ```shell
-make test     # cargo test: role -> ops, cache TTL/bound/hash keys, fail-closed (fake controller)
+make test     # cargo test: role -> ops, cache TTL/bound/hash keys, fail-closed, 503 vs 401 (fake controller)
 make lint     # cargo fmt --check + clippy -D warnings
 make build    # dist/di-framework-oci-registry.wasm (+ .wit, BUILD-INFO.txt, SHA256SUMS)
 bun test platform/oci-registry   # artifact + provenance checks

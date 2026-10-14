@@ -187,7 +187,7 @@ test('an insecure install keeps the platform flag and allowlists only its regist
     const pulumi = require('@pulumi/pulumi');
     const k8s = require('@pulumi/kubernetes');
     const resources = [];
-    pulumi.runtime.setAllConfig({'project:tenants': JSON.stringify([{name:'alpha'}]), 'project:insecureRegistries': JSON.stringify(['examples-registry.wasmcloud.svc.cluster.local:5000'])});
+    pulumi.runtime.setAllConfig({'project:tenants': JSON.stringify([{name:'alpha'}]), 'project:insecureRegistries': JSON.stringify(['examples-registry.wasmcloud.svc.cluster.local:5000']), 'project:runtimeNats': JSON.stringify({maxFileStore:'20Gi'})});
     pulumi.runtime.setMocks({
       newResource: args => { resources.push(args); return {id:args.name, state:{...args.inputs, metadata:{...args.inputs.metadata, name:args.inputs.metadata?.name ?? args.name}}}; },
       call: args => args.inputs,
@@ -223,6 +223,8 @@ test('an insecure install keeps the platform flag and allowlists only its regist
     'di-framework-registry.wasmcloud.svc.cluster.local:5000',
     'examples-registry.wasmcloud.svc.cluster.local:5000',
   ]);
+  // Config `runtimeNats` reaches the controller, which renders it into each tenant's di-nats (#160).
+  expect(cfg.runtimeNats).toEqual({ maxFileStore: '20Gi' });
 }, 60_000);
 
 test('an insecure install refuses a tenantHostImage that predates patch 0002', () => {
@@ -246,6 +248,110 @@ test('an insecure install refuses a tenantHostImage that predates patch 0002', (
     { cwd: root, encoding: 'utf8' },
   );
   expect(output).toContain(`tenantHostImage ${old} predates wash patch 0002`);
+}, 60_000);
+
+// Runs createPlatform with kube-router network policy and `config`, waits for every registration
+// to reach the mocks, and returns the thrown message (if any) and the Kubernetes resources.
+function createWithNetworkPolicy(
+  config: Record<string, unknown>,
+  args: Record<string, unknown> = {},
+): { error?: string; resources: { type: string; name: string }[] } {
+  const project = Object.fromEntries(
+    Object.entries(config).map(([key, value]) => [
+      `project:${key}`,
+      typeof value === 'string' ? value : JSON.stringify(value),
+    ]),
+  );
+  const output = execFileSync(
+    'node',
+    [
+      '-e',
+      `
+    const pulumi = require('@pulumi/pulumi');
+    const k8s = require('@pulumi/kubernetes');
+    const resources = [];
+    pulumi.runtime.setAllConfig(${JSON.stringify(project)});
+    pulumi.runtime.setMocks({
+      newResource: a => { resources.push({ type: a.type, name: a.name }); return {id:a.name, state:a.inputs}; },
+      call: a => a.inputs,
+    }, 'project', 'test', false);
+    pulumi.runtime.runInPulumiStack(async () => {
+      let error;
+      try {
+        require('./dist').createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', networkPolicyEngine:'kube-router', ...${JSON.stringify(args)} });
+      } catch (e) { error = e.message; }
+      // The sentinel round-trips through the mocks. A successful call also polls until its
+      // kube-router DaemonSet is registered, so nothing is asserted against a fixed timer.
+      const sentinel = new k8s.core.v1.Namespace('sentinel', {}, { provider: new k8s.Provider('sentinel-provider', {}) });
+      await new Promise(r => sentinel.urn.apply(r));
+      if (!error) for (let i = 0; i < 200 && !resources.some(r => r.type === 'kubernetes:apps/v1:DaemonSet'); i++) await new Promise(r => setTimeout(r, 50));
+      return error;
+    }).then(error => {
+      console.log(JSON.stringify({ error, resources: resources.filter(r => !r.type.startsWith('pulumi:') && r.name !== 'sentinel' && r.name !== 'sentinel-provider') }));
+    }).catch(e => {console.error(e);process.exitCode=1;});
+  `,
+    ],
+    { cwd: root, encoding: 'utf8' },
+  );
+  return JSON.parse(output);
+}
+
+test('an invalid tenant host allowlist fails before any resource, network policy included', () => {
+  const old =
+    'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669';
+  const cases: [Record<string, unknown>, Record<string, unknown>, string][] = [
+    [
+      { egressAllowedDestinations: JSON.stringify('bad') },
+      {},
+      'egressAllowedDestinations must be a list',
+    ],
+    [
+      { tenantAuth: { image: 'ghcr.io/x/y:latest', issuer: 'https://issuer.example' } },
+      {},
+      'tenantAuth.image must be pinned by digest',
+    ],
+    [
+      { runtimeNats: { maxMemoryStore: '1Gi' } },
+      {},
+      'runtimeNats.maxMemoryStore must be at most 64Mi, half the di-nats memory limit (128Mi)',
+    ],
+    [{}, { apiServer: 'https://k8s.example:6443' }, 'apiServer requires kubeconfig'],
+    [
+      { insecureRegistries: ['http://registry.example:5000'] },
+      { registry: true, insecureRegistry: true },
+      'insecureRegistries entries must be a registry host[:port]',
+    ],
+    [
+      { insecureRegistries: JSON.stringify('registry.example:5000') },
+      { registry: true, insecureRegistry: true },
+      'insecureRegistries must be a list of host[:port]',
+    ],
+    [
+      { insecureRegistries: ['registry.example:5000'] },
+      {},
+      'insecureRegistries requires insecureRegistry: true',
+    ],
+    [
+      { tenantHostImage: old },
+      { registry: true, insecureRegistry: true },
+      `tenantHostImage ${old} predates wash patch 0002`,
+    ],
+  ];
+  for (const [config, args, message] of cases) {
+    const { error, resources } = createWithNetworkPolicy(config, args);
+    expect(error).toContain(message);
+    expect(resources).toEqual([]);
+  }
+}, 120_000);
+
+test('a valid tenant host allowlist still installs the kube-router network policy', () => {
+  const { error, resources } = createWithNetworkPolicy(
+    { insecureRegistries: ['examples-registry.wasmcloud.svc.cluster.local:5000'] },
+    { registry: true, insecureRegistry: true },
+  );
+  expect(error).toBeUndefined();
+  expect(resources.some((r) => r.type === 'kubernetes:apps/v1:DaemonSet')).toBe(true);
+  expect(resources.some((r) => r.type === 'kubernetes:helm.sh/v3:Release')).toBe(true);
 }, 60_000);
 
 test('existing entrypoint derives the route pattern from a loopback HTTP endpoint', () => {
@@ -673,7 +779,8 @@ test('local entrypoint rejects a container CLI with shell metacharacters', () =>
 
 /**
  * Runs `createPlatform` with `config` (unprefixed keys; non-strings are JSON-encoded) and extra
- * `args` source, and returns the gateway Deployment's GATEWAY_CONFIG and config hash, or the error.
+ * `args` source, and returns the gateway Deployment's GATEWAY_CONFIG and config hash and the
+ * platform controller's PLATFORM_CONFIG, or the error.
  */
 function gatewayInstall(
   config: Record<string, unknown>,
@@ -681,6 +788,7 @@ function gatewayInstall(
 ): {
   gatewayConfig?: { routeAliases?: Record<string, string> };
   configHash?: string;
+  platformConfig?: { tenantAuth?: Record<string, unknown> };
   error?: string;
 } {
   const prefixed = Object.fromEntries(
@@ -715,7 +823,9 @@ function gatewayInstall(
     }).then(() => {
       if (error) return console.log(JSON.stringify({ error }));
       const gateway = resources.find(r => r.name === 'http-gateway' && r.type === 'kubernetes:apps/v1:Deployment').inputs.spec.template;
-      console.log(JSON.stringify({ gatewayConfig: JSON.parse(gateway.spec.containers[0].env[0].value), configHash: gateway.metadata.annotations['di-framework.dev/config-hash'] }));
+      const controller = resources.find(r => r.type === 'kubernetes:apps/v1:Deployment' && r.inputs.metadata?.name === 'di-platform-controller').inputs.spec.template;
+      const platformConfig = JSON.parse(controller.spec.containers[0].env.find(e => e.name === 'PLATFORM_CONFIG').value);
+      console.log(JSON.stringify({ gatewayConfig: JSON.parse(gateway.spec.containers[0].env[0].value), configHash: gateway.metadata.annotations['di-framework.dev/config-hash'], platformConfig }));
     }).catch(e => {console.error(e);process.exitCode=1;});
   `,
     ],
@@ -757,6 +867,44 @@ test('install validates config routeAliases and deploys them normalized to the g
     'identity.identity': 'identity.identity-pg',
   });
 }, 120_000);
+
+test('install routes tenant-auth hosts derived from routeUrlPattern through the gateway (#128)', () => {
+  const tenantAuth = {
+    image: `ghcr.io/x/y@sha256:${'a'.repeat(64)}`,
+    issuer: 'https://issuer.example',
+    oauthClient: { id: 'access', secretName: 'tenant-auth-oauth' },
+  };
+  const pattern = `routeUrlPattern: 'http://{host}.{tenant}.localhost:28180'`;
+  const derived = gatewayInstall({ tenantAuth }, pattern);
+  expect(derived.error).toBeUndefined();
+  expect(derived.gatewayConfig).toMatchObject({
+    tenantAuthRoutes: { console: 'console', controller: 'controller' },
+  });
+  // The platform controller renders the console and controller from the same derived URLs.
+  expect(derived.platformConfig?.tenantAuth).toMatchObject({
+    consolePublicUrl: 'http://console.{tenant}.localhost:28180',
+    controllerPublicUrl: 'https://controller.{tenant}.localhost:28180',
+  });
+  // An explicit URL wins: a loopback console stays unrouted.
+  const explicit = gatewayInstall(
+    { tenantAuth: { ...tenantAuth, consolePublicUrl: 'http://127.0.0.1:8787' } },
+    pattern,
+  );
+  expect(explicit.gatewayConfig).toMatchObject({
+    tenantAuthRoutes: { controller: 'controller' },
+  });
+  expect(explicit.gatewayConfig).not.toHaveProperty('tenantAuthRoutes.console');
+  expect(explicit.platformConfig?.tenantAuth?.consolePublicUrl).toBe('http://127.0.0.1:8787');
+  // A pattern the gateway does not route to tenant-auth keeps the 127.0.0.1 defaults, as before.
+  const unrouted = gatewayInstall(
+    { tenantAuth },
+    `routeUrlPattern: 'https://{host}.{tenant}.localhost:28180'`,
+  );
+  expect(unrouted.error).toBeUndefined();
+  expect(unrouted.gatewayConfig).not.toHaveProperty('tenantAuthRoutes');
+  expect(unrouted.platformConfig?.tenantAuth).not.toHaveProperty('consolePublicUrl');
+  expect(unrouted.platformConfig?.tenantAuth).not.toHaveProperty('controllerPublicUrl');
+}, 180_000);
 
 test('install refuses a gateway config key even when PlatformArgs.routeAliases is passed (#217)', () => {
   const result = gatewayInstall(

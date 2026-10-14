@@ -592,7 +592,7 @@ describe('vars', () => {
     ]);
     for (const item of items) expect(Number.isNaN(Date.parse(item.updatedAt))).toBe(false);
 
-    expect((await call('DELETE', '/v1/vars/LEVEL?env=prod')).status).toBe(204);
+    expect((await call('DELETE', '/v1/vars/LEVEL?env=prod')).status).toBe(200);
     expect(store.get('configmaps/di-vars-prod')?.data).toEqual({ A_FIRST: 'x' });
     expect(
       Object.keys(
@@ -675,7 +675,7 @@ describe('vars', () => {
       A: '1',
       constructor: 'c',
     });
-    expect((await call('DELETE', '/v1/vars/constructor?env=prod')).status).toBe(204);
+    expect((await call('DELETE', '/v1/vars/constructor?env=prod')).status).toBe(200);
   });
 
   test('refuses a name that is not an environment variable name', async () => {
@@ -732,30 +732,45 @@ describe('vars', () => {
     expect((await call('PUT', '/v1/vars/DB_PASSWORD?env=staging', 'x')).status).toBe(204);
   });
 
-  test('unset of a var while a deployed workload injects the env vars is a 409; nothing changes', async () => {
+  test('unset of a var a deployed workload injects succeeds with a warning naming it', async () => {
     await call('PUT', '/v1/vars/LEVEL?env=staging', 'debug');
+    await call('PUT', '/v1/vars/KEEP?env=staging', 'x');
     await call('PUT', '/v1/vars/LEVEL?env=prod', 'info');
     workloads = [
       workload('greeter-staging', { configFrom: ['di-vars-staging'] }),
+      workload('api-staging', { configFrom: ['di-vars-staging'] }, 'service'),
       workload('api-prod', { configFrom: ['di-vars-prod'] }),
       workload('worker-staging', { secretFrom: ['di-vars-staging'] }),
     ];
-    const before = store.get('configmaps/di-vars-staging');
     const response = await call('DELETE', '/v1/vars/LEVEL?env=staging');
-    expect(response.status).toBe(409);
-    expect(response.headers.get('content-type')).toBe('application/problem+json');
-    expect((await body(response)).detail).toBe(
-      'var LEVEL is referenced by deployed workloads in staging: greeter-staging; destroy them (or redeploy without it) before unsetting it',
-    );
-    expect(store.get('configmaps/di-vars-staging')).toEqual(before);
-    // A missing var is still a 404, not a reference conflict.
+    expect(response.status).toBe(200);
+    expect(await body(response)).toEqual({
+      warnings: [
+        {
+          code: 'referenced',
+          detail:
+            'var LEVEL was referenced by deployed workloads in staging: api-staging, greeter-staging; check they do not need it',
+          deployments: ['api-staging', 'greeter-staging'],
+        },
+      ],
+    });
+    expect(store.get('configmaps/di-vars-staging')?.data).toEqual({ KEEP: 'x' });
+    // A missing var is still a 404.
     expect((await call('DELETE', '/v1/vars/NOPE?env=staging')).status).toBe(404);
-    // Set and update are not affected by references.
-    expect((await call('PATCH', '/v1/vars/LEVEL?env=staging', 'info')).status).toBe(204);
-    // An environment whose vars no workload injects still unsets.
+    // An environment whose vars no workload injects answers no warnings.
     workloads = [workload('greeter-staging', { configFrom: ['di-vars-staging'] })];
-    expect((await call('DELETE', '/v1/vars/LEVEL?env=prod')).status).toBe(204);
+    const quiet = await call('DELETE', '/v1/vars/LEVEL?env=prod');
+    expect(quiet.status).toBe(200);
+    expect(await body(quiet)).toEqual({ warnings: [] });
     expect(store.get('configmaps/di-vars-prod')?.data).toEqual({});
+  });
+
+  test('a failure listing workloads leaves the vars unchanged', async () => {
+    await call('PUT', '/v1/vars/LEVEL?env=prod', 'info');
+    failGet = true;
+    const before = store.get('configmaps/di-vars-prod');
+    expect((await call('DELETE', '/v1/vars/LEVEL?env=prod')).status).toBe(502);
+    expect(store.get('configmaps/di-vars-prod')).toEqual(before);
   });
 
   test('an unlabelled di-vars ConfigMap is refused, never adopted', async () => {

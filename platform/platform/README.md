@@ -167,6 +167,49 @@ allowlisted registry and pull everything else over TLS. Check three things befor
 - **Tenant hosts roll once.** The default host image, the host args and, on insecure installs,
   the mounted controller CA all change, so each tenant host group restarts on the upgrade.
 
+#### Upgrading to tenant hosts that trust the controller CA for `wasi:http` (#113)
+
+- **Tenant hosts with a registry roll once.** When `tenantAuth.registry` is set, each tenant
+  host group that already mounts the controller CA (`platform.di-framework.dev/registry-ca-sha256`
+  on its pod template) gains `--http-client-ca-path=/registry-ca/ca.crt` in its args, so it
+  restarts once on the upgrade. Host groups without a registry keep the same template and do not
+  roll. A single-host tenant such as `identity` (`maxSurge: 0, maxUnavailable: 1`) is unavailable
+  while its one host restarts, so plan the upgrade for a quiet window.
+
+#### Upgrading to tenant-auth URLs derived from `routeUrlPattern` (#128)
+
+- **Who is affected.** Installs with config `tenantAuth` set, at least one of
+  `tenantAuth.consolePublicUrl`, `tenantAuth.controllerPublicUrl` or (with a registry)
+  `tenantAuth.registry.publicUrl` unset, and a routable `routeUrlPattern`
+  (`http://{host}.{tenant}.localhost[:<port>]`). That is every local install, whose entrypoint
+  always sets the pattern, and every existing-cluster install whose pattern is set or derived
+  from a loopback `http://` `httpEndpoint`. Installs without `tenantAuth`, with all of these
+  URLs set, or with any other pattern keep their URLs. On the first `pulumi up` with this
+  version, the unset URLs change for every Tenant, existing ones included (`<port>` is the
+  gateway port, `28180` on a default local install):
+  - Console: `http://127.0.0.1:8787` becomes `http://console.<tenant>.localhost:<port>`, so its
+    OAuth callback becomes `http://console.<tenant>.localhost:<port>/oidc/callback`.
+  - Controller: users and CLIs are shown `https://controller.<tenant>.localhost:<port>` instead
+    of `https://127.0.0.1:8788`. The controller certificate is reissued with that name; it still
+    covers `127.0.0.1`, so existing port-forward kubeconfigs keep working.
+  - Registry: users log in to `https://registry.<tenant>.localhost:<port>` instead of
+    `https://127.0.0.1:8790`.
+  - Workload hosts: the gateway routes `console.<tenant>.localhost`,
+    `controller.<tenant>.localhost` and `registry.<tenant>.localhost` to the tenant's console,
+    controller and registry front, so a tenant workload served on one of those route hosts is
+    no longer reachable there. Move it to another host first.
+- **To adopt the new URLs**, register `http://console.<tenant>.localhost:<port>/oidc/callback`
+  for every tenant as a redirect URI on the shared OAuth client (`tenantAuth.oauthClient.id`)
+  before `pulumi up`. Until it is registered, console login fails for that tenant.
+- **To keep the previous `127.0.0.1` URLs**, set them explicitly before upgrading (skip the
+  registry line without `tenantAuth.registry`):
+
+  ```bash
+  pulumi config set --path tenantAuth.consolePublicUrl http://127.0.0.1:8787
+  pulumi config set --path tenantAuth.controllerPublicUrl https://127.0.0.1:8788
+  pulumi config set --path tenantAuth.registry.publicUrl https://127.0.0.1:8790
+  ```
+
 ### Tenant removal and namespace retention
 
 Each `tenants` entry takes `deletionPolicy` (`Retain` or `Delete`, default `Retain`). The
@@ -216,6 +259,7 @@ kubectl delete namespace di-tenant-alpha di-runtime-alpha
 `chart`, `chartVersion`, `httpNodePort`, `timeoutSeconds`, `insecureRegistry`, `insecureRegistries`,
 `storageRoot`, `networkPolicyEngine`, `kubernetesEndpoint`, `httpEndpoint`, `routeUrlPattern`,
 `egressAllowedDestinations`, `routeAliases` (see [Gateway route aliases](#gateway-route-aliases)),
+`runtimeNats` (see [Runtime NATS storage caps](#runtime-nats-storage-caps)),
 and administrator `values` are optional. `tenants`, `users`,
 `tenantHostImage`, and `tenantHostImagePullPolicy` use the same declarations as the
 local entrypoint. NodePort zero makes the HTTP gateway ClusterIP. Registry installation is off
@@ -247,8 +291,14 @@ ServiceAccount token Secret `di-user-<user>-<tenant>-token` (type
 `kubernetes.io/service-account-token`) in the platform namespace, owned and labelled
 like the user's other resources. A User reports `Ready` only after Kubernetes has
 populated every one of its token Secrets. Removing a membership, suspending or
-deleting the user, or suspending the tenant deletes the matching Secret and so
-invalidates the token.
+deleting the user, or suspending, deleting or removing the tenant deletes the matching
+Secret and so invalidates the token.
+
+A membership is first granted once its Tenant is `Ready` for its current generation. After
+that, a Tenant that is merely not Ready (reconciling a new generation, or failing to
+reconcile) keeps the membership's RoleBindings and token Secret, and the User stays
+`Ready`, so `pulumi up` still reads the token during an upgrade. A role change still applies
+to the kept bindings.
 
 After each User is Ready, `createPlatform` reads its token Secrets and builds one
 kubeconfig per membership: the API server and cluster CA (`ca.crt` from the token
@@ -329,6 +379,29 @@ Redis/NATS reconciliation and binding projection use this install path. The
 upcoming release adds dedicated PostgreSQL instances, persistent storage, and
 workload-managed associations; see [Dedicated PostgreSQL](#dedicated-postgresql-upcoming-release).
 
+The controller writes tenant RBAC without `escalate` (#115): its ClusterRole holds
+every rule of every Role it writes, and grants `bind` only on the fixed-name Roles
+it binds (`CONTROLLER_BOUND_ROLES` in `src/tenancy/install.ts`). TokenRequest
+(`serviceaccounts/token` `create`), which each `di-tenant-controller-<tenant>` Role
+grants, is held only in the platform namespace through the `<installation>-controller`
+Role and RoleBinding. `tests/controller-rbac.test.ts` checks this against the
+rendered objects.
+
+Holding those rules gives the controller these grants directly, in every namespace:
+
+- `pods/log` `get`: the `di-runtime-viewer` and `di-runtime-developer` Roles grant
+  it to members (it also serves the logs projection).
+- `pods/portforward` `create`: `di-runtime-developer` grants it.
+- `events` `get`, `list`, `watch`: every tenant viewer and developer Role grants it.
+- `get`, `list`, `watch` on runtime `workloads`, `workloadreplicasets` and `artifacts`:
+  `di-developer` and `di-viewer` grant it.
+- `update` on `workloaddeployments`: `di-developer` grants it (the controller itself
+  writes only with server-side apply).
+- `create` and `delete` on `backingservices` and `servicebindings`: `di-developer`
+  grants them.
+
+Before #115 each of these was already reachable through `escalate`.
+
 Schemas and helpers live in `src/tenancy/backing-services.ts` and are included in the
 platform `crds` export from `src/tenancy/resources.ts`. Class seeding and controller
 script packaging live in `src/tenancy/install.ts`. Per-tick Redis/NATS provisioning
@@ -402,6 +475,65 @@ model, not a claim of developer-proof network isolation.
   Tenant-reconciled infrastructure — not an application `BackingService`. Application
   messaging instances are named `di-bs-<service-name>` and owned by BackingService UIDs.
 
+### Runtime NATS storage caps
+
+Each tenant's `di-nats` keeps its JetStream store on the node at
+`<storageRoot>/di-tenants/<tenant uid>/di-nats`, a host path no ResourceQuota covers. The tenant
+registry's images (#83) and the hosts' default blobstore live there, so the server caps it (#160).
+The controller renders ConfigMap `di-nats-config` in `di-runtime-<tenant>` and runs `di-nats` with
+`-c /etc/nats/nats.conf`:
+
+```text
+port: 4222
+jetstream {
+  store_dir: "/data"
+  max_file_store: <bytes>
+  max_memory_store: <bytes>
+}
+```
+
+| `runtimeNats` key | Default | Rule |
+| --- | --- | --- |
+| `maxFileStore` | `10Gi` | At least `1Mi` |
+| `maxMemoryStore` | `32Mi` | At least `1Mi`, at most `64Mi` (half the container's `128Mi` memory limit) |
+
+The memory cap stops at half the container limit because nats-server needs the other half for
+itself (connections, buffers, file-store caches). With that headroom a full memory store is
+refused by JetStream with `insufficient resources` instead of getting the pod OOM-killed.
+
+Values are binary quantities: a positive integer number of bytes, optionally suffixed `Ki`,
+`Mi`, `Gi` or `Ti` (decimal units such as `10GB` are refused). The caps apply to every tenant
+of the installation:
+
+```sh
+pulumi config set --path runtimeNats.maxFileStore 20Gi
+```
+
+An invalid value fails `createPlatform` before any resource. The pod template carries the
+config's SHA-256 (`platform.di-framework.dev/nats-config-sha256`), so changing a cap restarts
+`di-nats` (the Deployment is `Recreate`; the hosts reconnect).
+
+Upgrading keeps the same store directory, so existing streams and object stores are recovered
+as before. The cap never deletes data. Every stream is recovered, including one whose own
+`max_bytes` is larger than the cap; nats-server logs no error for either.
+
+If a tenant's store already holds more than the cap (an upgrade, or a cap lowered below usage):
+
+- Reads keep working: stream reads, KV gets, object-store and blobstore gets, registry pulls.
+- Every write is refused with `10023 insufficient resources`, **deletes included**. An
+  object-store, KV or blobstore delete is a publish of a delete marker, so it is refused like any
+  other write. The registry cannot free space by deleting images, and workloads cannot free
+  space through `wasmcloud:blobstore` either.
+- Recovery is an operator step: raise `maxFileStore` above current usage (the config change
+  restarts `di-nats`), or remove data with admin stream operations, `nats stream purge <stream>`
+  or `nats stream rm <stream>`, which JetStream still accepts over the cap. Writes resume once
+  usage is below the cap.
+
+When usage reaches the cap through normal writes instead, it stays below the cap: the write
+that would cross it is refused, and deletes still work, so the registry frees space by deleting
+images. Before lowering a cap, check usage on the node with
+`du -sh <storageRoot>/di-tenants/<tenant uid>/di-nats/jetstream`.
+
 ### Egress
 
 Tenant guests reach the network only through an approved egress grant. Tenant hosts run
@@ -443,14 +575,37 @@ grant lookups and HTTP only, since no address can be listed for them. IPv6 is no
 
 ### Console log projection
 
-The controller publishes one ConfigMap per console application in each tenant
-namespace, `di-logs-<app>`, labeled `di-framework.dev/projection=logs` and
-`di-framework.dev/application=<app>`, with the newest 200 lines in `data.lines` and
-the newest host failure per WorkloadDeployment in `data.failures`.
+The controller publishes one ConfigMap per projection key in each tenant namespace,
+labeled `di-framework.dev/projection=logs` and `di-framework.dev/application=<app>`,
+with the newest 200 lines in `data.lines`, the WorkloadDeployment and /v1 environment
+of each line in `data.deployments` and `data.envs` (JSON arrays aligned with the
+lines; the env is `""` outside /v1), and the newest host failure per
+WorkloadDeployment in `data.failures`.
 
-- Source: the `hostgroup-<tenant>` pod logs, read through a per-tenant
-  `di-platform-log-reader` Role (`pods/log get` in the runtime namespace only). The
-  host keeps `automountServiceAccountToken: false`.
+- A WorkloadDeployment `/v1/deploy` rendered (named `<service>-<env>`, labeled
+  `di-framework.dev/application=<service>` and `platform.di-framework.dev/env=<env>`,
+  env `prod` or `staging`) is keyed by service and env: `di-logs-<service>.<env>`,
+  which also carries the env label. Staging and prod never share a ConfigMap.
+- Any other workload (for example one the CLI deployed) is keyed by its console
+  application: `di-logs-<app>`, without an env label. That name never contains a dot,
+  so a CLI workload whose application equals a /v1 service name gets its own
+  ConfigMap and never mixes into the service's logs.
+- Migration: before this keying, staging and prod of a /v1 service shared
+  `di-logs-<service>`. On its next poll the controller starts each
+  `di-logs-<service>.<env>` from the lines and failure that ConfigMap recorded for
+  `<service>-<env>`, then deletes the shared one. When a live CLI application still
+  owns that key, the shared ConfigMap is kept and rewritten in the same pass without
+  the lines of /v1 deployments, so no line is served twice. Lines published before
+  deployments were recorded cannot be attributed to an env and are not carried over.
+- Each ConfigMap write or delete is attempted on its own: one refused (for example at
+  the `count/configmaps` quota) is logged and retried on the next poll without
+  holding back the other projections, and a shared ConfigMap is not pruned or deleted
+  until its lines have been taken over.
+
+- Source: the `hostgroup-<tenant>` pod logs. The controller's ClusterRole holds
+  `pods/log get` cluster-wide (#115), because the runtime viewer and developer Roles
+  it writes grant it; the per-tenant `di-platform-log-reader` Role and binding are
+  kept but are now redundant. The host keeps `automountServiceAccountToken: false`.
 - Guest lines come only from the wash `wasi:logging` TracingLogger. Each ends with
   `workload.name` and `workload.namespace`; the namespace must be the tenant's, and
   the name maps to a `di-framework`-managed WorkloadDeployment. Its
@@ -620,11 +775,31 @@ identity workload there, then add `identity.identity: identity.identity-pg` and 
 roll back, remove the alias and run `pulumi up` again; the original route returns. Each change
 updates the gateway's `GATEWAY_CONFIG` and its `di-framework.dev/config-hash` annotation, so the
 `di-platform-gateway` pod rolls. The switch takes effect when that rollout completes
-(`kubectl rollout status deploy/di-platform-gateway -n <namespace>`): the old pod keeps routing
-until the new one is Ready, then on SIGTERM it stops accepting connections, closes idle keep-alive
-connections and lets in-flight requests finish. Switching is near-immediate, not instant, and no
-pooled upstream connection outlives the old pod. Upgrading to the release that adds the
-annotation rolls the gateway once.
+(`kubectl rollout status deploy/di-platform-gateway -n <namespace>`). The roll is meant to drop
+no requests (#223):
+
+- The rollout surges (`maxSurge: 1`, `maxUnavailable: 0`, `minReadySeconds: 5`), so the old pod
+  keeps routing until the new one has been Ready for 5 s.
+- The old pod's `preStop` hook then sleeps 10 s while it still serves, so the Service endpoint
+  removal reaches every node's proxy before its listener closes. During those seconds both pods
+  may answer, so for about 10–15 s after the rollout completes some requests still use the old
+  routing.
+- On SIGTERM the gateway stops accepting connections and closes idle keep-alive connections. It
+  answers requests already in flight with `Connection: close` and lets them finish. That includes
+  a request whose headers are only partly received and, with tenant-auth routes set, a connection
+  still being classified. It keeps upgraded (WebSocket) tunnels and TLS passthrough pipes open.
+  It waits up to 20 s, then closes whatever is left and exits. The 35 s termination grace period
+  covers the sleep and the drain.
+
+Switching is near-immediate, not instant. A WebSocket or passthrough connection opened before the
+switch keeps its old route until it closes or the 20 s drain bound ends it. No pooled upstream
+connection outlives the old pod. A client that reuses a keep-alive connection just as the old pod
+closes it as idle can still see that connection reset; HTTP clients normally retry such a request
+on a new connection. A connection opened before SIGTERM that has not sent its request yet is kept
+and answered with `Connection: close`, or closed at the 20 s bound.
+
+Upgrading to the release that adds the annotation rolls the gateway once, and so does upgrading
+to the release that adds this drain.
 
 **`di-framework-kube up` does not pass this key yet.** Its `platform.json` allowlist rejects
 `routeAliases` (`unsupported platform config key`), and every `up` rebuilds the stack config from
@@ -646,7 +821,8 @@ means no gateway URL is known.
 ### Tenant controller and console
 
 With config `tenantAuth` set, the tenant reconcile deploys each tenant's controller and console
-(`platform/tenant-auth`, #58) and `deploy-local.ts` is no longer needed for them:
+(`platform/tenant-auth`, #58). This is the supported deploy path; the earlier manual deploy
+script is removed:
 
 ```yaml
 tenantAuth:
@@ -656,11 +832,11 @@ tenantAuth:
   issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80  # optional, for a loopback issuer
   issuerUpstreamPodPort: 8080                                # optional, the pod port behind it
   issuerIp: 192.0.2.7                                        # optional, when pods cannot resolve the issuer
-  consolePublicUrl: http://console.{tenant}.localhost:28180  # optional; default http://127.0.0.1:8787
-  controllerPublicUrl: https://127.0.0.1:8788                # optional
+  consolePublicUrl: http://console.{tenant}.localhost:28180  # optional; default derived from routeUrlPattern, else http://127.0.0.1:8787
+  controllerPublicUrl: https://controller.{tenant}.localhost:28180  # optional; default derived from routeUrlPattern, else https://127.0.0.1:8788
   registry:                                                  # optional: each tenant's own OCI registry (#83)
     component: ghcr.io/di-framework/oci-registry@sha256:29ec834c5f515e99146437c831e9f8bf25c98f32079afd9e715335d9f00ba270  # required, pinned by digest
-    publicUrl: https://registry.{tenant}.localhost:28180     # optional; default https://127.0.0.1:8790
+    publicUrl: https://registry.{tenant}.localhost:28180     # optional; default derived from routeUrlPattern, else https://127.0.0.1:8790
     limits:                                                  # optional; each field optional, defaults shown
       maxBodyBytes: 536870912                                # TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES
       upstreamTimeoutMs: 60000                               # TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS
@@ -718,9 +894,21 @@ tenantAuth:
   A Secret from before the CA existed (one `CA:TRUE` certificate, no `ca.crt`) is replaced once.
 - Routes: when the platform gateway is published (`routeUrlPattern`), a public URL whose host is
   `<label>.{tenant}.localhost` on the gateway port is routed through it, so a new Tenant gets a
-  reachable console and controller with no script. Set, for example,
-  `consolePublicUrl: http://console.{tenant}.localhost:28180` and
-  `controllerPublicUrl: https://controller.{tenant}.localhost:28180`. The console route is
+  reachable console and controller with no script. `createPlatform` derives every public URL
+  left unset from `routeUrlPattern` (#128), before any resource is created: with
+  `routeUrlPattern: http://{host}.{tenant}.localhost:28180` the defaults are
+  `consolePublicUrl: http://console.{tenant}.localhost:28180`,
+  `controllerPublicUrl: https://controller.{tenant}.localhost:28180` and, with a registry,
+  `registry.publicUrl: https://registry.{tenant}.localhost:28180` (a pattern without a port
+  gives the console no port and the TLS hosts `:80`, the gateway's own). An explicit URL always
+  wins, including a `127.0.0.1` one that keeps that host on a port-forward. Only an
+  `http://{host}.{tenant}.localhost[:<port>]` pattern is derived from, since only those hosts
+  are routed to the pair; with any other pattern (`https://`, another domain) the unset URLs
+  keep the `127.0.0.1` defaults, as before, and `createPlatform` logs a warning naming them.
+  The console's public URL is the one its OAuth redirects use, so the shared OAuth client must
+  accept the derived console callback; see
+  [Upgrading to tenant-auth URLs derived from `routeUrlPattern`](#upgrading-to-tenant-auth-urls-derived-from-routeurlpattern-128).
+  The console route is
   plain HTTP to `tenant-console:8787` with the original `Host`. The controller route is TLS
   passthrough: the gateway reads only the SNI name and pipes the connection to
   `tenant-controller:8788`, so the controller's own certificate (covering the public host) and
@@ -729,16 +917,17 @@ tenantAuth:
   `controllerUrl`. Policies `tenant-console-gateway` and `tenant-controller-gateway` admit only
   the gateway pods, each to its own port, and the gateway's egress gains only those two ports
   in this installation's tenant namespaces. A routed label takes that host away from tenant
-  workloads (`console.<tenant>.localhost` no longer reaches `di-http`). The default
-  `127.0.0.1` URLs, unset URLs, other hosts, and any URL while no gateway is published stay
-  unrouted, as before. A gateway-shaped URL the gateway cannot route (wrong scheme, port, or a
+  workloads (`console.<tenant>.localhost` no longer reaches `di-http`). Explicit `127.0.0.1`
+  URLs, other hosts, and any URL while no gateway is published (the `127.0.0.1` defaults then
+  apply) stay unrouted. A gateway-shaped URL the gateway cannot route (wrong scheme, port, or a
   host shared by both) is reported on `TenantAuthReady` with reason `RouteError`; `Ready` is
   unaffected. The routes are config, not per-Tenant objects: the gateway policies carry the
   `tenant-auth` component label and are removed with the rest of the pair.
 - Registry (`tenantAuth.registry`, #83): each tenant gets the `platform/oci-registry` component
   as WorkloadDeployment `di-tenant-registry` in `di-tenant-<tenant>`, on the tenant's own hosts.
   Its storage is the unnamed `wasmcloud:blobstore` with no references, which is the host data
-  store on the tenant's `di-nats` (JetStream on the tenant's host path). Its `wasmcloud:secrets`
+  store on the tenant's `di-nats` (JetStream on the tenant's host path, capped by
+  [`runtimeNats.maxFileStore`](#runtime-nats-storage-caps)). Its `wasmcloud:secrets`
   bind-time config names the tenant and the controller's whoami-only listener,
   `http://tenant-controller.di-runtime-<tenant>.svc:8789`: plain HTTP, in-cluster, which the
   component accepts for `*.svc` only. The listener serves nothing but `GET /v1/auth/whoami`
@@ -772,7 +961,7 @@ tenantAuth:
     controller, and answers plain HTTP for it with `400`. The gateway knows the registry's
     HTTP host whenever a registry is configured, so that `400` holds even when users reach the
     registry by port-forward (`kubectl port-forward svc/tenant-controller 8790`, the default
-    `https://127.0.0.1:8790`). Credentials therefore never cross plain HTTP off-cluster; the
+    `https://127.0.0.1:8790` when no gateway is published). Credentials therefore never cross plain HTTP off-cluster; the
     front-to-host and registry-to-controller hops are plain HTTP on the pod network, as the
     gateway-to-host hop already is. The alternative, terminating TLS at the gateway, would put
     every tenant's private key in the platform namespace; TLS passthrough keeps keys per tenant.
@@ -822,6 +1011,12 @@ tenantAuth:
     while it does not exist). Roll the ClusterRole before the new controller (`pulumi up`
     applies both; a hand-rolled upgrade must apply the ClusterRole first), or the registry
     reports `403` on `TenantAuthReady` until it does.
+  - RBAC without `escalate` (#115): apply the `<installation>-controller` Role and
+    RoleBinding in the platform namespace first, then the ClusterRole (`pulumi up` orders
+    them). A ClusterRole without `escalate` applied before the Role lets the update of
+    each `di-tenant-controller-<tenant>` Role, and of the RoleBinding of the same name
+    (written without `bind`), fail with `403` on `TenantAuthReady` until the next poll
+    after the Role exists. Tenant Roles and bindings are unchanged.
   - Host pull (`#83:host-pull`): the tenant's hosts pull workload components from the tenant
     registry with a namespace-scoped host credential.
     - Reference: users push to `publicUrl`; workloads reference the same repository as
@@ -839,6 +1034,21 @@ tenantAuth:
       apply to `kubectl port-forward`: `di-runtime-developer` grants `pods/portforward`, so a
       developer can reach `8789` and `8791` directly. That yields nothing without a credential:
       the registry still authorizes every request through whoami, and no file is served.
+    - Startup (#197): after a host starts or restarts, its workloads pull while `di-tenant-registry`
+      on the same host is still starting. The pull listener waits for the registry instead of
+      failing the pull (which wash would only retry about a minute later): a refused connection or
+      the host's empty `404` for a `Host` no workload serves yet is retried with a 250 ms to 2 s
+      backoff, for at most `TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS` (default 30 s). Any answer
+      from the registry itself, a `404 BLOB_UNKNOWN` included, is returned at once, and the public
+      front never waits. The wait delays only that one pull, so nothing blocks the host that serves
+      the registry. A waiting pull gives its pool slot back between attempts, so pulls waiting out
+      a host restart do not turn the others away; one that finds no free slot before its wait is
+      over is answered `503`. Each attempt gets the full upstream header timeout, so the wait is
+      not cut short by it.
+    - Framing (#197): the front and the pull listener run on `node:http`, which writes the
+      registry's `Content-Length` on a blob `GET` as is; `Bun.serve` re-framed every streamed body
+      as chunked, and oras then stalled behind the unread body over `kubectl port-forward`. A `HEAD`
+      gets its `Content-Length` from the registry's `docker-content-length`.
     - Credential: Secret `di-tenant-registry-pull` in `di-runtime-<tenant>` holds a random
       32-byte token (`token`) and a Docker config for `tenant-registry.di-runtime-<tenant>.svc`
       (`config.json`, Basic `tenant-host:<token>`). The platform controller generates it and keeps
@@ -859,7 +1069,13 @@ tenantAuth:
       `tenant-registry.di-runtime-<tenant>.svc[.cluster.local]`) on Service port 443, and the hosts
       trust the tenant CA that signed it through `--oci-ca-path=/registry-ca/ca.crt` from ConfigMap
       `tenant-controller-ca`. A CA:TRUE end-entity certificate is rejected by wash (rustls), hence the split.
-      wash loads that file once at start, so the host template carries
+      The same file is passed as `--http-client-ca-path`, so the components' outgoing `wasi:http`
+      trusts the tenant CA on top of the default webpki roots (#113): the registry can call the
+      controller over `https://`. Other HTTPS egress still trusts the webpki roots and now also
+      accepts a certificate issued by the tenant CA for any name, the same scope
+      `--oci-ca-path` already gives OCI pulls. The CA has no name constraints; #170 tracks the
+      CA follow-ups.
+      wash loads both once at start, so the host template carries
       `platform.di-framework.dev/registry-ca-sha256` and a CA replacement (not a leaf renewal) rolls the hosts on
       the next poll. The listener is TLS with `insecureRegistry` too (#149): only the platform host
       group runs `--allow-insecure-registries`. Tenant hosts instead get one
@@ -899,7 +1115,8 @@ tenantAuth:
   unsetting `tenantAuth` removes every object labelled `platform.di-framework.dev/component:
   tenant-auth` (the registry WorkloadDeployment included) and the quota addition.
 
-The reconcile does not adopt objects that `deploy-local.ts` created (`TenantAuthReady` reports
+The reconcile does not adopt objects that the removed manual deploy script created (they carry
+the component and tenant labels but not the installation label; `TenantAuthReady` reports
 `Refusing to adopt`). Delete them first: in `di-runtime-<tenant>` the Deployments, Services,
 ServiceAccounts, Role and RoleBinding `tenant-controller-keys`, NetworkPolicy, Secrets
 `tenant-controller-tls`, `tenant-controller-ca-key` and `tenant-console-oauth`, and ConfigMaps `tenant-controller-ca` and
@@ -1119,12 +1336,12 @@ di-framework platform service create postgres --name audit --target alpha --wait
 Declare the bindings in `src/bindings.ts` (or the project's configured bindings file):
 
 ```typescript
-import { Postgres, WasmCloudBinding } from '@di-framework/bindings';
+import { Postgres, PlatformBinding } from '@di-framework/bindings';
 
-@WasmCloudBinding('orders-db', { serviceName: 'orders' })
+@PlatformBinding('orders-db', { serviceName: 'orders' })
 export class OrdersDatabase extends Postgres {}
 
-@WasmCloudBinding('audit-db', { serviceName: 'audit' })
+@PlatformBinding('audit-db', { serviceName: 'audit' })
 export class AuditDatabase extends Postgres {}
 ```
 

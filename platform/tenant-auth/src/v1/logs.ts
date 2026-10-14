@@ -4,7 +4,11 @@ import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
 // platform's log projection writes, so it shares that module's format instead of copying it.
 import {
   APPLICATION,
+  ENV,
+  ENVS,
   PROJECTION,
+  projectedDeployments,
+  projectedEnvs,
   projectedFailures,
   projectedLines,
   validLabelValue,
@@ -18,6 +22,14 @@ export interface LogEvent {
   deployment: string;
   level?: 'debug' | 'info' | 'warn' | 'error';
   message: string;
+}
+
+/**
+ * A LogEvent and the /v1 environment of its line: '' for a workload outside /v1, absent when
+ * the ConfigMap does not tell (lines published before deployments were recorded).
+ */
+export interface ProjectedLogEvent extends LogEvent {
+  env?: string;
 }
 
 interface LogsConfigMap {
@@ -75,44 +87,79 @@ function sinceBound(since: string | undefined, now = Date.now()): string | undef
 }
 
 /**
- * The LogEvents of one logs ConfigMap, oldest first. A line is attributed to the
- * WorkloadDeployment of the host failure it reports (`data.failures`); every other line to the
- * application, since the projection keeps one ring per application.
+ * The /v1 environment of a line whose ConfigMap recorded no `data.envs` (#106): the env label
+ * of a per-env ConfigMap; in a ConfigMap staging and prod shared before, the env of the
+ * recorded deployment `<service>-<env>` ('' for any other deployment); otherwise not known.
  */
-export function logEvents(configMap: LogsConfigMap): LogEvent[] {
+function legacyEnv(
+  label: string | undefined,
+  application: string,
+  deployment: string | undefined,
+): string | undefined {
+  if (label) return label;
+  if (!deployment) return undefined;
+  return ENVS.find((env) => deployment === `${application}-${env}`) ?? '';
+}
+
+/**
+ * The LogEvents of one logs ConfigMap, oldest first. A line is attributed to the
+ * WorkloadDeployment the projection recorded for it (`data.deployments`). A line without one,
+ * written before the projection recorded deployments, falls back to the deployment whose
+ * newest host failure it reports (`data.failures`), and otherwise to the application. Its env
+ * is the one recorded in `data.envs`, else derived as legacyEnv describes.
+ */
+export function logEvents(configMap: LogsConfigMap): ProjectedLogEvent[] {
   const application = configMap.metadata.labels?.[APPLICATION] ?? '';
+  const label = configMap.metadata.labels?.[ENV];
+  const deployments = projectedDeployments(configMap as never);
+  const envs = projectedEnvs(configMap as never);
   const failures = Object.entries(projectedFailures(configMap as never));
-  const events: LogEvent[] = [];
-  for (const line of projectedLines(configMap as never)) {
+  const failed = (timestamp: string, message: string) =>
+    failures.find(([, f]) => f.time === timestamp && message === `host: ${f.message}`)?.[0];
+  const events: ProjectedLogEvent[] = [];
+  for (const [index, line] of projectedLines(configMap as never).entries()) {
     const match = LINE.exec(line);
     if (!match) continue;
     const [, timestamp, level, message] = match as unknown as [string, string, string, string];
-    const failure = failures.find(
-      ([, f]) => f.time === timestamp && message === `host: ${f.message}`,
-    );
+    const env = envs?.[index] ?? legacyEnv(label, application, deployments?.[index]);
     events.push({
       timestamp,
-      deployment: failure ? failure[0] : application,
+      deployment: deployments?.[index] || failed(timestamp, message) || application,
       level: LEVELS[level],
       message,
+      ...(env === undefined ? {} : { env }),
     });
   }
   return events;
 }
 
+/** The event as the contract's LogEvent, without the env it was selected by. */
+const contractEvent = ({ env: _env, ...event }: ProjectedLogEvent): LogEvent => event;
+
 const sse = (event: string, data?: unknown) =>
   `event: ${event}\ndata: ${data === undefined ? '' : JSON.stringify(data)}\n\n`;
 
 interface Options {
+  /** prod or staging. */
+  env: string;
   deployment?: string;
   since?: string;
   tail: number;
 }
 
-/** Applies the deployment and since filters, then keeps the newest `tail` events. */
-function select(events: LogEvent[], options: Options): LogEvent[] {
+/**
+ * Lines of a /v1 deployment in the requested env. A line of a workload outside /v1 (env '')
+ * is never served; a line whose env is not known (published before deployments were
+ * recorded) is served in every env, as before.
+ */
+const inEnv = (event: ProjectedLogEvent, env: string) =>
+  event.env === undefined || event.env === env;
+
+/** Applies the env, deployment and since filters, then keeps the newest `tail` events. */
+function select(events: ProjectedLogEvent[], options: Options): ProjectedLogEvent[] {
   const kept = events.filter(
     (event) =>
+      inEnv(event, options.env) &&
       (!options.deployment || event.deployment === options.deployment) &&
       (!options.since || Date.parse(event.timestamp) >= Date.parse(options.since)),
   );
@@ -128,7 +175,7 @@ class Cursor {
   private newest = '';
   private atNewest = new Set<string>();
 
-  fresh(events: LogEvent[]): LogEvent[] {
+  fresh(events: ProjectedLogEvent[]): ProjectedLogEvent[] {
     return events.filter((event) => {
       const key = JSON.stringify(event);
       if (event.timestamp < this.newest) return false;
@@ -137,7 +184,7 @@ class Cursor {
     });
   }
 
-  sent(event: LogEvent): void {
+  sent(event: ProjectedLogEvent): void {
     if (event.timestamp > this.newest) {
       this.newest = event.timestamp;
       this.atNewest = new Set();
@@ -172,7 +219,7 @@ async function* watchEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<Wa
 /** Watch event types that show the watch is alive and advancing. */
 const PROGRESS = new Set(['ADDED', 'MODIFIED', 'DELETED', 'BOOKMARK']);
 
-const byTime = (a: LogEvent, b: LogEvent) =>
+const byTime = (a: ProjectedLogEvent, b: ProjectedLogEvent) =>
   a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0;
 
 const listEvents = (list: ConfigMapList) => (list.items ?? []).flatMap(logEvents).sort(byTime);
@@ -232,8 +279,8 @@ function stream(
         const cursor = new Cursor();
         const live = { ...options, tail: Number.MAX_SAFE_INTEGER };
         /** Sends the selected events, then marks every event seen, sent or filtered out. */
-        const deliver = (events: LogEvent[], selected: LogEvent[]) => {
-          for (const event of selected) send(sse('log', event));
+        const deliver = (events: ProjectedLogEvent[], selected: ProjectedLogEvent[]) => {
+          for (const event of selected) send(sse('log', contractEvent(event)));
           for (const event of events) cursor.sent(event);
         };
         const backlog = listEvents(first);
@@ -323,9 +370,11 @@ function stream(
 
 /**
  * `GET /v1/services/:service/logs` (platform#54): the `logs` projection as server-sent events.
- * `env` is accepted and ignored: the log ConfigMaps carry no environment label. The `deployment`
- * filter only sees lines attributed through `data.failures`, which keeps the newest host failure
- * per deployment, so older failure lines of a deployment are attributed to the application.
+ * The service's projections are selected by application; `env` keeps the lines of that
+ * environment (#106), read from `data.envs`, the per-env ConfigMap's env label, or, in a
+ * ConfigMap staging and prod shared before, the recorded deployment. Lines of a workload
+ * outside /v1 that shares the service's application name are never served. The `deployment`
+ * filter matches the WorkloadDeployment each line is attributed to (see logEvents).
  */
 async function serveLogs(_command: unknown, call: HttpCall, context: V1Context): Promise<Response> {
   const service = call.request.params?.service ?? '';
@@ -337,6 +386,9 @@ async function serveLogs(_command: unknown, call: HttpCall, context: V1Context):
   const since = sinceBound(value('since'));
   if (since === null)
     return problem(400, 'Bad Request', 'since must be a duration such as 10m or an RFC 3339 time');
+  const env = value('env');
+  if (env === undefined || !ENVS.includes(env))
+    return problem(400, 'Bad Request', `env must be one of ${ENVS.join(', ')}`);
   const tailText = value('tail');
   const tail = tailText === undefined ? DEFAULT_TAIL : Number(tailText);
   if (!Number.isInteger(tail) || tail < 0)
@@ -352,7 +404,7 @@ async function serveLogs(_command: unknown, call: HttpCall, context: V1Context):
   );
   if (!first.items?.length)
     return problem(404, 'Not Found', `service ${service} has no published logs`);
-  const options: Options = { deployment: value('deployment'), since, tail };
+  const options: Options = { env, deployment: value('deployment'), since, tail };
   return new Response(
     stream(kube, collection, selector, first, options, value('follow') === 'true'),
     {

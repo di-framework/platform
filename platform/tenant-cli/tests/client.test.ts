@@ -33,7 +33,7 @@ test('every operation hits its contract path with the bearer and the right body'
     'GET /v1/vars': () => Response.json({ env: 'prod', items: [] }),
     'PUT /v1/vars/LEVEL': noContent,
     'PATCH /v1/vars/LEVEL': noContent,
-    'DELETE /v1/vars/LEVEL': noContent,
+    'DELETE /v1/vars/LEVEL': () => Response.json({ warnings: [] }),
   });
   const client = createClient({ baseUrl: 'https://controller.test/', token: 't0k', fetch });
 
@@ -56,7 +56,7 @@ test('every operation hits its contract path with the bearer and the right body'
   expect((await client.vars('staging')).items).toEqual([]);
   await client.setVar('prod', 'LEVEL', 'debug');
   await client.updateVar('prod', 'LEVEL', 'info');
-  await client.unsetVar('prod', 'LEVEL');
+  expect(await client.unsetVar('prod', 'LEVEL')).toEqual({ warnings: [] });
 
   expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
     'GET https://controller.test/v1/auth/info',

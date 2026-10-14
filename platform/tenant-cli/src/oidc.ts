@@ -56,6 +56,10 @@ export async function discover(issuer: string, doFetch: Fetch = fetch): Promise<
   for (const field of ['issuer', 'authorization_endpoint', 'token_endpoint'] as const) {
     if (!metadata[field]) throw new OidcError(`discovery at ${issuer} lacks ${field}`);
   }
+  // OIDC Discovery 1.0 section 4.3 / RFC 8414 section 3.3: the document must name the issuer asked for.
+  if (String(metadata.issuer).replace(/\/+$/, '') !== issuer.replace(/\/+$/, '')) {
+    throw new OidcError(`discovery at ${issuer} names a different issuer`);
+  }
   // The CLI only ever talks to the issuer it was pointed at: a document that names endpoints
   // elsewhere would send the authorization code or refresh token to another host.
   const origin = new URL(issuer).origin;
@@ -158,21 +162,27 @@ export function refreshTokens(
   );
 }
 
-/** RFC 7009; revoking the refresh token ends the whole authorization. Failures are ignored. */
+/** RFC 7009; revoking the refresh token ends the whole authorization. Throws if revocation fails. */
 export async function revokeToken(
   metadata: ProviderMetadata,
   clientId: string,
   token: string,
   doFetch: Fetch = fetch,
+  expectedIssuer: string = metadata.issuer,
 ): Promise<void> {
-  const endpoint = metadata.revocation_endpoint ?? `${metadata.issuer}/oauth2/revoke`;
-  try {
-    await doFetch(endpoint, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ token, client_id: clientId }),
-    });
-  } catch {
-    // The credential is forgotten locally either way; the token expires on its own.
+  const issuer = new URL(expectedIssuer);
+  const endpoint = new URL(metadata.revocation_endpoint ?? `${metadata.issuer}/oauth2/revoke`);
+  // Never send the token to a host other than the issuer, even if the discovery document says so.
+  if (endpoint.origin !== issuer.origin) {
+    throw new OidcError('revocation endpoint is not on the issuer origin');
+  }
+  const init = {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ token, client_id: clientId }),
+  };
+  const response = await doFetch(endpoint.href, init); // NOSONAR: CLI sends its own token to the configured issuer, origin verified above
+  if (!response.ok) {
+    throw new OidcError(`revocation endpoint returned ${response.status}`);
   }
 }

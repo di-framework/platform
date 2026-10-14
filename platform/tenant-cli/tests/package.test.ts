@@ -12,7 +12,7 @@ const run = (cmd: string[], cwd: string) => {
 const scratch = mkdtempSync(join(tmpdir(), 'tenant-client-'));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
-test('a consumer outside the workspace imports ./client from the packed tarball and calls authInfo', () => {
+test('a consumer outside the workspace imports ./client and ./testing from the packed tarball', () => {
   run(['bun', 'run', 'build'], join(import.meta.dir, '..'));
   run(
     ['bun', 'pm', 'pack', '--ignore-scripts', '--destination', scratch],
@@ -48,6 +48,22 @@ console.log(JSON.stringify({ info, error: typeof ControllerError, events: typeof
     events: 'function',
   });
 
+  // The ./testing fixture resolves from the tarball and needs nothing beyond the package itself.
+  writeFileSync(
+    join(project, 'fixture.ts'),
+    `import { deployBundle } from '@di-framework/tenant-cli/testing';
+const a = deployBundle({ env: 'staging' });
+a.secrets.push('mutated');
+const b = deployBundle();
+console.log(JSON.stringify({ env: a.env, host: a.workload.spec.template.spec.hostInterfaces[0].config, secrets: b.secrets }));
+`,
+  );
+  expect(JSON.parse(run(['bun', 'fixture.ts'], project))).toEqual({
+    env: 'staging',
+    host: { host: 'web-staging' },
+    secrets: ['api-token'],
+  });
+
   // A strict consumer that cannot import .ts files must still compile against the packed types.
   writeFileSync(
     join(project, 'tsconfig.json'),
@@ -71,13 +87,16 @@ console.log(JSON.stringify({ info, error: typeof ControllerError, events: typeof
     `import { createClient, events, type AuthInfo } from '@di-framework/tenant-cli/client';
 export const info = (baseUrl: string): Promise<AuthInfo> => createClient({ baseUrl }).authInfo();
 export const framing = events;
+import { deployBundle } from '@di-framework/tenant-cli/testing';
+import type { DeployBundle } from '@di-framework/tenant-cli/client';
+export const bundle: DeployBundle = deployBundle({ service: 'api' });
 `,
   );
   const tsc = join(import.meta.dir, '../../../node_modules/typescript/bin/tsc');
   run(['node', tsc, '-p', 'tsconfig.json'], project);
 });
 
-test('a NodeNext consumer with skipLibCheck gets real types, not any', () => {
+test('a NodeNext consumer with skipLibCheck gets real types for ./client and ./testing, not any', () => {
   const project = join(scratch, 'consumer');
   writeFileSync(
     join(project, 'tsconfig.nodenext.json'),
@@ -102,6 +121,10 @@ test('a NodeNext consumer with skipLibCheck gets real types, not any', () => {
     `import type { AuthInfo } from '@di-framework/tenant-cli/client';
 // @ts-expect-error a number is not an AuthInfo
 export const bad: AuthInfo = 42;
+import { deployBundle } from '@di-framework/tenant-cli/testing';
+// @ts-expect-error deployBundle takes a Partial<DeployBundle>, so an unknown key is rejected
+export const badBundle = deployBundle({ notAField: true });
+export const env: string = deployBundle().env;
 `,
   );
   const tsc = join(import.meta.dir, '../../../node_modules/typescript/bin/tsc');

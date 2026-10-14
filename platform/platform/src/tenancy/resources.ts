@@ -77,6 +77,22 @@ export interface ControllerConfig {
   routeUrlPattern?: string;
   /** The per-tenant controller and console (#58); absent, the reconcile deploys neither. */
   tenantAuth?: TenantAuthConfig;
+  /** JetStream storage caps of each tenant's `di-nats` (#160); absent, the defaults apply. */
+  runtimeNats?: RuntimeNatsConfig;
+}
+/**
+ * JetStream storage caps of each tenant's runtime data-plane NATS (`di-nats`), rendered as
+ * `max_file_store` and `max_memory_store` in its server config. Each is a binary quantity: a
+ * positive integer count of bytes, optionally suffixed `Ki`, `Mi`, `Gi` or `Ti`.
+ */
+export interface RuntimeNatsConfig {
+  /** JetStream file storage on the tenant's host path (default `10Gi`). */
+  maxFileStore?: string;
+  /**
+   * JetStream memory storage (default `32Mi`); at most `64Mi`, half the 128Mi container limit,
+   * leaving the rest as headroom for nats-server itself.
+   */
+  maxMemoryStore?: string;
 }
 /**
  * Platform-level settings for each tenant's controller and console. The runtime env contract is
@@ -102,9 +118,17 @@ export interface TenantAuthConfig {
   issuerUpstreamPodPort?: number;
   /** The issuer's IPv4 when pods cannot resolve its hostname. */
   issuerIp?: string;
-  /** Browser-visible console URL; `{tenant}` is replaced. Default `http://127.0.0.1:8787`. */
+  /**
+   * Browser-visible console URL; `{tenant}` is replaced. Unset, `createPlatform` derives
+   * `http://console.{tenant}.localhost:<port>` from an `http://{host}.{tenant}.localhost`
+   * `routeUrlPattern` ({@link withDerivedPublicUrls}); otherwise `http://127.0.0.1:8787`.
+   */
   consolePublicUrl?: string;
-  /** Controller URL shown to users and CLIs; `{tenant}` is replaced. Default `https://127.0.0.1:8788`. */
+  /**
+   * Controller URL shown to users and CLIs; `{tenant}` is replaced. Unset, `createPlatform`
+   * derives `https://controller.{tenant}.localhost:<port>` from an
+   * `http://{host}.{tenant}.localhost` `routeUrlPattern`; otherwise `https://127.0.0.1:8788`.
+   */
   controllerPublicUrl?: string;
   /** Each tenant's own OCI registry (#83); absent, no registry is deployed. */
   registry?: TenantRegistryConfig;
@@ -121,7 +145,9 @@ export interface TenantRegistryConfig {
   /**
    * Registry origin users log in to; `{tenant}` is replaced. `https://<label>.{tenant}.localhost:<port>`
    * on the gateway port is routed through the gateway (TLS passthrough to the registry front).
-   * Default `https://127.0.0.1:8790`, a port-forward to the registry front.
+   * Unset, `createPlatform` derives `https://registry.{tenant}.localhost:<port>` from an
+   * `http://{host}.{tenant}.localhost` `routeUrlPattern`; otherwise `https://127.0.0.1:8790`, a
+   * port-forward to the registry front.
    */
   publicUrl?: string;
   /**
@@ -211,7 +237,8 @@ export interface TenantAuthInputs {
  * How the tenant hosts pull from their registry (#83 `:host-pull`), rendered once the registry
  * is deployed, whether or not its pull Secret exists yet: wash reads the Docker config from that
  * Secret, and over TLS trusts the tenant CA (`caDigest`, the digest of `tenant-controller-ca`, which rolls the hosts
- * when the certificate is renewed, since wash loads `--oci-ca-path` once at start).
+ * when the certificate is renewed, since wash loads `--oci-ca-path` and `--http-client-ca-path`
+ * once at start). The CA is trusted for both OCI pulls and the components' outgoing `wasi:http`.
  */
 export interface HostPull {
   caDigest?: string;
@@ -244,6 +271,97 @@ export function assertTenantAuthConfig(value: TenantAuthConfig | undefined): voi
     if (!Number.isSafeInteger(limit) || (limit as number) < 1)
       throw new Error(`tenantAuth.registry.limits.${key} must be a positive integer`);
   }
+}
+/** `di-nats` JetStream caps when the platform config sets none (#160). */
+export const RUNTIME_NATS_DEFAULTS = { maxFileStore: '10Gi', maxMemoryStore: '32Mi' } as const;
+/** Memory limit of the `di-nats` and `di-redis` containers, in MiB. */
+const BACKING_SERVICE_MEMORY_LIMIT_MIB = 128;
+/** The `di-nats` / `di-redis` container memory limit, as rendered on the pod. */
+export const BACKING_SERVICE_MEMORY_LIMIT = `${BACKING_SERVICE_MEMORY_LIMIT_MIB}Mi`;
+/**
+ * The largest `di-nats` JetStream memory store: half the container memory limit. The other half
+ * is headroom for nats-server itself (connections, buffers, file-store caches), so a full memory
+ * store is refused by JetStream (`insufficient resources`) instead of getting the pod OOM-killed.
+ */
+export const RUNTIME_NATS_MAX_MEMORY_STORE = `${BACKING_SERVICE_MEMORY_LIMIT_MIB / 2}Mi`;
+/** The ConfigMap in `di-runtime-<tenant>` holding the `di-nats` server config. */
+export const RUNTIME_NATS_CONFIG = 'di-nats-config';
+/** Pod template annotation carrying the server config digest, so a cap change restarts NATS. */
+export const RUNTIME_NATS_CONFIG_ANNOTATION = 'platform.di-framework.dev/nats-config-sha256';
+const BINARY_QUANTITY = /^([1-9][0-9]*)(Ki|Mi|Gi|Ti)?$/;
+const MIB = 2 ** 20;
+const BINARY_UNITS: Record<string, number> = {
+  '': 1,
+  Ki: 2 ** 10,
+  Mi: MIB,
+  Gi: 2 ** 30,
+  Ti: 2 ** 40,
+};
+function binaryBytes(value: unknown): number | undefined {
+  if (typeof value !== 'string') return undefined;
+  const match = BINARY_QUANTITY.exec(value);
+  if (!match) return undefined;
+  const bytes = Number(match[1]) * (BINARY_UNITS[match[2] ?? ''] ?? 1);
+  return Number.isSafeInteger(bytes) ? bytes : undefined;
+}
+/** Resolved `di-nats` JetStream caps, in bytes. */
+export interface RuntimeNatsLimits {
+  maxFileStore: number;
+  maxMemoryStore: number;
+}
+/**
+ * Validate a `runtimeNats` config and resolve its caps in bytes, defaults filled in. Throws on an
+ * unknown key, a value that is not a positive binary quantity, a cap below 1Mi, or a memory
+ * store above {@link RUNTIME_NATS_MAX_MEMORY_STORE}.
+ */
+export function runtimeNatsLimits(value: RuntimeNatsConfig | undefined): RuntimeNatsLimits {
+  const config: unknown = value === undefined ? {} : value;
+  if (typeof config !== 'object' || config === null || Array.isArray(config))
+    throw new Error('runtimeNats must be an object');
+  const known = Object.keys(RUNTIME_NATS_DEFAULTS);
+  for (const key of Object.keys(config))
+    if (!Object.hasOwn(RUNTIME_NATS_DEFAULTS, key))
+      throw new Error(`runtimeNats.${key} is not a known setting (${known.join(', ')})`);
+  const set = config as RuntimeNatsConfig;
+  const resolve = (key: keyof RuntimeNatsConfig): number => {
+    const raw = set[key] ?? RUNTIME_NATS_DEFAULTS[key];
+    const bytes = binaryBytes(raw);
+    if (bytes === undefined)
+      throw new Error(
+        `runtimeNats.${key} must be a positive binary quantity such as ${RUNTIME_NATS_DEFAULTS[key]} (got ${JSON.stringify(raw)})`,
+      );
+    if (bytes < MIB) throw new Error(`runtimeNats.${key} must be at least 1Mi`);
+    return bytes;
+  };
+  const limits = {
+    maxFileStore: resolve('maxFileStore'),
+    maxMemoryStore: resolve('maxMemoryStore'),
+  };
+  if (limits.maxMemoryStore > (BACKING_SERVICE_MEMORY_LIMIT_MIB / 2) * MIB)
+    throw new Error(
+      `runtimeNats.maxMemoryStore must be at most ${RUNTIME_NATS_MAX_MEMORY_STORE}, half the di-nats memory limit (${BACKING_SERVICE_MEMORY_LIMIT}); the rest is nats-server's own headroom`,
+    );
+  return limits;
+}
+/** Reject a `runtimeNats` config the reconcile could not render. */
+export function assertRuntimeNatsConfig(value: RuntimeNatsConfig | undefined): void {
+  runtimeNatsLimits(value);
+}
+/**
+ * The `di-nats` server config: JetStream on the tenant's host path (`/data`, the same store
+ * directory as the earlier `-js -sd /data` flags), bounded by `limits`. nats-server has no flag
+ * for either cap, so they are set in this file.
+ */
+export function runtimeNatsServerConfig(limits: RuntimeNatsLimits): string {
+  return [
+    'port: 4222',
+    'jetstream {',
+    '  store_dir: "/data"',
+    `  max_file_store: ${limits.maxFileStore}`,
+    `  max_memory_store: ${limits.maxMemoryStore}`,
+    '}',
+    '',
+  ].join('\n');
 }
 /**
  * Each registry front limit and the controller env suffix it renders as
@@ -336,6 +454,50 @@ export function tenantAuthRoutes(
     else if (!problems.includes(shared)) problems.push(shared);
   }
   return { routes, urls, problems };
+}
+/** A `routeUrlPattern` the tenant-auth public URLs can be derived from; group 1 is `:<port>`. */
+const DERIVABLE_ROUTE_PATTERN = /^http:\/\/\{host\}\.\{tenant\}\.localhost(:\d+)?$/i;
+/** The tenant-auth public URLs `auth` leaves unset, by config path. */
+export function unsetPublicUrls(auth: TenantAuthConfig | undefined): string[] {
+  if (auth === undefined) return [];
+  return [
+    ...(auth.consolePublicUrl === undefined ? ['consolePublicUrl'] : []),
+    ...(auth.controllerPublicUrl === undefined ? ['controllerPublicUrl'] : []),
+    ...(auth.registry && auth.registry.publicUrl === undefined ? ['registry.publicUrl'] : []),
+  ];
+}
+/**
+ * `auth` with each unset public URL (`consolePublicUrl`, `controllerPublicUrl` and, with a
+ * registry, `registry.publicUrl`) derived from the published gateway's `routeUrlPattern`, so a
+ * fresh Tenant is routed without extra config: `http://console.{tenant}.localhost:<port>`,
+ * `https://controller.{tenant}.localhost:<port>` and `https://registry.{tenant}.localhost:<port>`
+ * on the gateway port (`:80` when the pattern names none). Explicit URLs are kept as given. Only
+ * an `http://{host}.{tenant}.localhost[:<port>]` pattern is derived from, since only those hosts
+ * are routed to the pair; with any other pattern, no `tenantAuth`, no `routeUrlPattern`, or every
+ * URL set, `auth` is returned unchanged and the `127.0.0.1` defaults apply, as before.
+ */
+export function withDerivedPublicUrls(
+  auth: TenantAuthConfig | undefined,
+  routeUrlPattern: string | undefined,
+): TenantAuthConfig | undefined {
+  const match = DERIVABLE_ROUTE_PATTERN.exec(routeUrlPattern ?? '');
+  if (auth === undefined || !match || unsetPublicUrls(auth).length === 0) return auth;
+  // The gateway port, explicit for the TLS hosts (https alone would mean 443) and omitted for the
+  // console when it is http's own 80, so its URL stays canonical.
+  const port = match[1] ?? ':80';
+  const url = (scheme: 'http' | 'https', label: string) =>
+    `${scheme}://${label}.{tenant}.localhost${scheme === 'http' && port === ':80' ? '' : port}`;
+  return {
+    ...auth,
+    consolePublicUrl: auth.consolePublicUrl ?? url('http', 'console'),
+    controllerPublicUrl: auth.controllerPublicUrl ?? url('https', 'controller'),
+    ...(auth.registry && {
+      registry: {
+        ...auth.registry,
+        publicUrl: auth.registry.publicUrl ?? url('https', 'registry'),
+      },
+    }),
+  };
 }
 /**
  * The registry workload's `wasi:http` host: the route label of a gateway-shaped
@@ -790,8 +952,9 @@ function tenantResources(
     make('v1', 'ServiceAccount', 'di-runtime', n.runtimeNamespace, {
       automountServiceAccountToken: false,
     }),
-    // The controller reads hostgroup logs to publish the console logs projection (#10).
-    // Scoped to this tenant's runtime namespace; the host itself keeps no API token.
+    // The controller reads hostgroup logs to publish the console logs projection (#10); the
+    // host itself keeps no API token. Redundant since #115: the controller's ClusterRole holds
+    // `pods/log get` cluster-wide, because the runtime viewer and developer Roles grant it.
     make('rbac.authorization.k8s.io/v1', 'Role', 'di-platform-log-reader', n.runtimeNamespace, {
       rules: [{ apiGroups: [''], resources: ['pods/log'], verbs: ['get'] }],
     }),
@@ -944,11 +1107,26 @@ function tenantResources(
       },
     }),
   );
-  for (const [name, image, port, args] of [
+  // The `di-nats` JetStream store lives on an unquotaed host path, so its server config caps
+  // file and memory storage (#160). The ConfigMap is applied before the Deployment that mounts it.
+  const natsConfig = runtimeNatsServerConfig(runtimeNatsLimits(cfg.runtimeNats));
+  result.push(
+    make('v1', 'ConfigMap', RUNTIME_NATS_CONFIG, n.runtimeNamespace, {
+      data: { 'nats.conf': natsConfig },
+    }),
+  );
+  const natsConfigVolume = {
+    annotations: {
+      [RUNTIME_NATS_CONFIG_ANNOTATION]: createHash('sha256').update(natsConfig).digest('hex'),
+    },
+    mounts: [{ name: 'config', mountPath: '/etc/nats', readOnly: true }],
+    volumes: [{ name: 'config', configMap: { name: RUNTIME_NATS_CONFIG } }],
+  };
+  for (const [name, image, port, args, extra] of [
     // Runtime-internal data-plane NATS for hostgroup `--data-nats-url`.
     // Lifecycle is Tenant-owned; never created as an application BackingService.
     // Application messaging NATS instances are `di-bs-<name>` via reconcileBackingService.
-    ['di-nats', 'nats:2.12.8-alpine', 4222, ['-js', '-sd', '/data']],
+    ['di-nats', 'nats:2.12.8-alpine', 4222, ['-c', '/etc/nats/nats.conf'], natsConfigVolume],
     // Transitional warehouse Redis + di-tenant-stock (#456 migrates to BackingService).
     // Independent Redis instances are provisioned separately as `di-bs-<name>`.
     [
@@ -956,6 +1134,7 @@ function tenantResources(
       'redis:7.4.5-alpine',
       6379,
       ['redis-server', '--appendonly', 'yes', '--dir', '/data'],
+      undefined,
     ],
   ] as const) {
     result.push(
@@ -967,6 +1146,7 @@ function tenantResources(
           template: {
             metadata: {
               labels: { app: name, [`${GROUP}/component`]: 'backing-service' },
+              ...(extra ? { annotations: extra.annotations } : {}),
             },
             spec: {
               automountServiceAccountToken: false,
@@ -978,10 +1158,13 @@ function tenantResources(
                   ports: [{ containerPort: port }],
                   resources: {
                     requests: { cpu: '10m', memory: '32Mi' },
-                    limits: { cpu: '250m', memory: '128Mi' },
+                    limits: { cpu: '250m', memory: BACKING_SERVICE_MEMORY_LIMIT },
                   },
                   readinessProbe: { tcpSocket: { port } },
-                  volumeMounts: [{ name: 'data', mountPath: '/data' }],
+                  volumeMounts: [
+                    { name: 'data', mountPath: '/data' },
+                    ...(extra ? extra.mounts : []),
+                  ],
                 },
               ],
               volumes: [
@@ -992,6 +1175,7 @@ function tenantResources(
                     type: 'DirectoryOrCreate',
                   },
                 },
+                ...(extra ? extra.volumes : []),
               ],
             },
           },
@@ -1071,8 +1255,15 @@ function tenantResources(
                     '--socket-egress=enforce',
                     // Plain HTTP only for these exact registries; never --allow-insecure-registries (#149).
                     ...(cfg.insecureRegistries ?? []).flatMap((r) => ['--insecure-registry', r]),
-                    // The tenant registry's pull Service serves the controller certificate.
-                    ...(hostPull?.caDigest ? ['--oci-ca-path=/registry-ca/ca.crt'] : []),
+                    // The tenant registry's pull Service serves the controller certificate. The
+                    // same CA is trusted for the components' outgoing wasi:http (on top of the
+                    // webpki roots), so the registry can reach the controller over https (#113).
+                    ...(hostPull?.caDigest
+                      ? [
+                          '--oci-ca-path=/registry-ca/ca.crt',
+                          '--http-client-ca-path=/registry-ca/ca.crt',
+                        ]
+                      : []),
                   ],
                   env: [
                     { name: 'HOME', value: '/tmp' },
@@ -1161,7 +1352,27 @@ function tenantResources(
   }
   return result;
 }
-function userResources(user: User, tenants: Tenant[], cfg: ControllerConfig): Resource[] {
+/** Whether the controller has reconciled the tenant's current spec. */
+function tenantReady(tenant: Tenant): boolean {
+  return !!tenant.status?.conditions?.some(
+    (c) =>
+      c.type === 'Ready' &&
+      c.status === 'True' &&
+      c.observedGeneration === tenant.metadata.generation,
+  );
+}
+/**
+ * Access a user should hold. A membership is granted once its tenant is Ready. While the tenant
+ * is merely Not Ready (for example reconciling a new generation), a membership in `granted`
+ * (already bound) is kept, so its token Secret survives. Missing, suspended and deleting tenants
+ * always lose access.
+ */
+function userResources(
+  user: User,
+  tenants: Tenant[],
+  cfg: ControllerConfig,
+  granted: ReadonlySet<string> = new Set(),
+): Resource[] {
   if (user.spec.suspended || user.metadata.deletionTimestamp) return [];
   const make = (
     apiVersion: string,
@@ -1180,12 +1391,7 @@ function userResources(user: User, tenants: Tenant[], cfg: ControllerConfig): Re
       !tenant ||
       tenant.spec.suspended ||
       tenant.metadata.deletionTimestamp ||
-      !tenant.status?.conditions?.some(
-        (c) =>
-          c.type === 'Ready' &&
-          c.status === 'True' &&
-          c.observedGeneration === tenant.metadata.generation,
-      )
+      !(tenantReady(tenant) || granted.has(membership.tenant))
     )
       continue;
     const n = names(membership.tenant);

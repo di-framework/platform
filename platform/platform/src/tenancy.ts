@@ -5,6 +5,7 @@ import {
   assertTenantDeclaration,
   type BackingServiceClassDeclaration,
   controllerClusterRoleRules,
+  controllerNamespaceRoleRules,
   controllerScriptHash,
   defaultBackingServiceClasses,
   loadControllerScripts,
@@ -12,11 +13,13 @@ import {
   tenantObject,
 } from './tenancy/install';
 import {
+  assertRuntimeNatsConfig,
   assertTenantAuthConfig,
   crds,
   INSTALLATION,
   names,
   type Resource,
+  type RuntimeNatsConfig,
   registryHttpHost,
   TENANT,
   type TenantAuthConfig,
@@ -28,9 +31,11 @@ import {
 export {
   type BackingClassConfig,
   type BackingServiceClassDeclaration,
+  CONTROLLER_BOUND_ROLES,
   CONTROLLER_SCRIPT_MODULES,
   type ControllerClusterRoleRule,
   controllerClusterRoleRules,
+  controllerNamespaceRoleRules,
   controllerScriptHash,
   defaultBackingServiceClasses,
   loadControllerScripts,
@@ -111,6 +116,8 @@ export function installTenancy(args: {
   routeUrlPattern?: string;
   /** Each tenant's controller and console (#58); omitted, the controller deploys neither. */
   tenantAuth?: TenantAuthConfig;
+  /** JetStream storage caps of each tenant's `di-nats` (#160); omitted, the defaults apply. */
+  runtimeNats?: RuntimeNatsConfig;
   /** When omitted, seeds platform defaults (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`, `egress-public` approving nothing). */
   backingServiceClasses?: BackingServiceClassDeclaration[];
 }): {
@@ -120,6 +127,7 @@ export function installTenancy(args: {
 } {
   const { installation, namespace, provider } = args;
   assertTenantAuthConfig(args.tenantAuth);
+  assertRuntimeNatsConfig(args.runtimeNats);
   function createCustom(
     value: Resource,
     dependsOn: pulumi.Resource[] = args.dependsOn,
@@ -170,12 +178,38 @@ export function installTenancy(args: {
     kind: 'ServiceAccount',
     metadata: { name: 'di-platform-controller', namespace },
   });
-  const role = create({
+  // TokenRequest in this namespace only (#115), for the per-tenant TokenRequest Roles it writes.
+  const namespaceRole = create({
     apiVersion: 'rbac.authorization.k8s.io/v1',
-    kind: 'ClusterRole',
-    metadata: { name: `${installation}-controller` },
-    rules: controllerClusterRoleRules(),
+    kind: 'Role',
+    metadata: { name: `${installation}-controller`, namespace },
+    rules: controllerNamespaceRoleRules(),
   });
+  const namespaceBinding = create(
+    {
+      apiVersion: 'rbac.authorization.k8s.io/v1',
+      kind: 'RoleBinding',
+      metadata: { name: `${installation}-controller`, namespace },
+      roleRef: {
+        apiGroup: 'rbac.authorization.k8s.io',
+        kind: 'Role',
+        name: `${installation}-controller`,
+      },
+      subjects: [{ kind: 'ServiceAccount', name: 'di-platform-controller', namespace }],
+    },
+    [namespaceRole, serviceAccount],
+  );
+  // The ClusterRole drops `escalate` (#115), so it waits for the namespaced TokenRequest grant:
+  // the running controller keeps writing the per-tenant TokenRequest Roles across `pulumi up`.
+  const role = create(
+    {
+      apiVersion: 'rbac.authorization.k8s.io/v1',
+      kind: 'ClusterRole',
+      metadata: { name: `${installation}-controller` },
+      rules: controllerClusterRoleRules(),
+    },
+    [namespaceBinding],
+  );
   const binding = create(
     {
       apiVersion: 'rbac.authorization.k8s.io/v1',
@@ -285,6 +319,7 @@ export function installTenancy(args: {
                       storageRoot: args.storageRoot,
                       routeUrlPattern: args.routeUrlPattern,
                       tenantAuth: args.tenantAuth,
+                      runtimeNats: args.runtimeNats,
                     }),
                   },
                 ],
@@ -305,7 +340,15 @@ export function installTenancy(args: {
         },
       },
     },
-    [...definitions, ...policies, ...backingServiceClasses, binding, scripts, network],
+    [
+      ...definitions,
+      ...policies,
+      ...backingServiceClasses,
+      binding,
+      namespaceBinding,
+      scripts,
+      network,
+    ],
   );
   const tenants = args.tenants.map((tenant) =>
     createCustom(tenantObject(tenant, installation), [controller, ...args.dependsOn]),

@@ -1,5 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { AuthError, IdentityResolver } from '../src/identity.ts';
+import {
+  AuthError,
+  CLAIMS_TTL_MS,
+  IdentityResolver,
+  type IdentityResolverOptions,
+  REJECTED_TTL_MS,
+} from '../src/identity.ts';
 import { createApiKey, type KeyStore } from '../src/keys.ts';
 import type { KubeClient, SecretResource, TenantResource, UserResource } from '../src/kube.ts';
 import { ORGANIZATION_ROLES_CLAIM, type ProviderMetadata } from '../src/oidc.ts';
@@ -78,11 +84,21 @@ describe('IdentityResolver', () => {
       carol: { metadata: { name: 'carol' }, spec: { suspended: true, memberships: [] } },
     } as Record<string, UserResource>,
   });
-  const resolverFor = (s = state()) => {
+  const resolverFor = (s = state(), options: IdentityResolverOptions = {}) => {
     const { kube, calls } = fakeKube(s);
     const keys: KeyStore = { kube, namespace: 'di-runtime-acme', tenant: 'acme' };
-    return { resolver: new IdentityResolver(kube, metadata, 'acme', keys), keys, calls, state: s };
+    const resolver = new IdentityResolver(kube, metadata, 'acme', keys, options);
+    return { resolver, keys, calls, state: s };
   };
+  /** A controllable clock starting at a fixed epoch-millisecond instant. */
+  const fakeClock = () => {
+    const time = { now: 1_800_000_000_000 };
+    return { time, now: () => time.now };
+  };
+  const userinfoCalls = (token: string) =>
+    issuer.requests.filter(
+      (r) => r.pathname === '/userinfo' && r.headers.get('authorization') === `Bearer ${token}`,
+    ).length;
   const member = (user: string, slug = 'acme') => ({
     sub: `sub-${user}`,
     preferred_username: user,
@@ -178,5 +194,96 @@ describe('IdentityResolver', () => {
     expect(denied.message).toContain('unknown or revoked');
     const bobKey = await createApiKey(keys, 'bob', 'ci', 3600);
     expect((await failure(resolver.resolve(`Bearer ${bobKey.secret}`))).status).toBe(403);
+  });
+
+  describe('claims cache', () => {
+    test('re-resolves claims once the cache TTL passes', async () => {
+      const { time, now } = fakeClock();
+      tokens['ttl-alice'] = member('alice');
+      const { resolver } = resolverFor(state(), { now });
+      await resolver.resolve('Bearer ttl-alice');
+      time.now += CLAIMS_TTL_MS - 1;
+      await resolver.resolve('Bearer ttl-alice');
+      expect(userinfoCalls('ttl-alice')).toBe(1);
+      time.now += 1;
+      await resolver.resolve('Bearer ttl-alice');
+      expect(userinfoCalls('ttl-alice')).toBe(2);
+    });
+
+    test('never serves cached claims at or after the token expiry', async () => {
+      const { time, now } = fakeClock();
+      const exp = Math.floor(time.now / 1000) + 10;
+      tokens['exp-alice'] = { ...member('alice'), exp };
+      const { resolver } = resolverFor(state(), { now });
+      await resolver.resolve('Bearer exp-alice');
+      time.now = exp * 1000 - 1;
+      await resolver.resolve('Bearer exp-alice');
+      expect(userinfoCalls('exp-alice')).toBe(1);
+      time.now = exp * 1000;
+      // The provider still answers with the old exp; the resolver refuses rather than serve it.
+      expect((await failure(resolver.resolve('Bearer exp-alice'))).status).toBe(401);
+      expect(userinfoCalls('exp-alice')).toBe(2);
+      // Once the provider reports a later expiry the token resolves again.
+      tokens['exp-alice'] = { ...member('alice'), exp: exp + 3600 };
+      expect((await resolver.resolve('Bearer exp-alice')).user).toBe('alice');
+      expect(userinfoCalls('exp-alice')).toBe(3);
+    });
+
+    test('bounds accepted claims with least-recently-used eviction', async () => {
+      const { now } = fakeClock();
+      for (const name of ['lru-a', 'lru-b', 'lru-c']) tokens[name] = member('alice');
+      const { resolver } = resolverFor(state(), { now, claimsCacheSize: 2 });
+      await resolver.resolve('Bearer lru-a');
+      await resolver.resolve('Bearer lru-b');
+      await resolver.resolve('Bearer lru-a');
+      await resolver.resolve('Bearer lru-c');
+      await resolver.resolve('Bearer lru-a');
+      expect(userinfoCalls('lru-a')).toBe(1);
+      await resolver.resolve('Bearer lru-b');
+      expect(userinfoCalls('lru-b')).toBe(2);
+    });
+
+    test('remembers refused tokens briefly', async () => {
+      const { time, now } = fakeClock();
+      const { resolver } = resolverFor(state(), { now });
+      expect((await failure(resolver.resolve('Bearer neg-1'))).status).toBe(401);
+      expect((await failure(resolver.resolve('Bearer neg-1'))).status).toBe(401);
+      expect(userinfoCalls('neg-1')).toBe(1);
+      time.now += REJECTED_TTL_MS;
+      await failure(resolver.resolve('Bearer neg-1'));
+      expect(userinfoCalls('neg-1')).toBe(2);
+      // A token that later becomes valid is accepted once the refusal lapses.
+      tokens['neg-1'] = member('alice');
+      time.now += REJECTED_TTL_MS;
+      expect((await resolver.resolve('Bearer neg-1')).user).toBe('alice');
+    });
+
+    test('a flood of junk tokens cannot evict the claims of a signed-in user', async () => {
+      const { now } = fakeClock();
+      tokens['flood-alice'] = member('alice');
+      const { resolver } = resolverFor(state(), { now, claimsCacheSize: 4, rejectedCacheSize: 4 });
+      await resolver.resolve('Bearer flood-alice');
+      for (let i = 0; i < 50; i++) await failure(resolver.resolve(`Bearer junk-${i}`));
+      await resolver.resolve('Bearer flood-alice');
+      expect(userinfoCalls('flood-alice')).toBe(1);
+    });
+
+    test('memory stays bounded under many distinct tokens', async () => {
+      const { now } = fakeClock();
+      const { resolver } = resolverFor(state(), { now, claimsCacheSize: 8, rejectedCacheSize: 8 });
+      const internals = resolver as unknown as {
+        claimsCache: { size: number };
+        rejectedCache: { size: number };
+      };
+      for (let i = 0; i < 40; i++) {
+        tokens[`many-${i}`] = member('alice');
+        await resolver.resolve(`Bearer many-${i}`);
+        await failure(resolver.resolve(`Bearer many-junk-${i}`));
+        expect(internals.claimsCache.size).toBeLessThanOrEqual(8);
+        expect(internals.rejectedCache.size).toBeLessThanOrEqual(8);
+      }
+      expect(internals.claimsCache.size).toBe(8);
+      expect(internals.rejectedCache.size).toBe(8);
+    });
   });
 });

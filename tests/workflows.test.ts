@@ -4,12 +4,12 @@
  * triggers and paths, the skip-if-published gate, least-privilege permissions, and the pin job.
  */
 import { describe, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { ARTIFACTS } from '../scripts/pin-artifact';
 import { matchesPathFilter, pushPaths } from '../scripts/source-check';
-import { spawnEnv } from './helpers/spawn-env';
+import { spawnEnv, stubCommand } from './helpers/spawn-env';
 
 const repo = resolve(import.meta.dir, '..');
 const env = spawnEnv;
@@ -662,12 +662,11 @@ describe('the check-source resolver reads platform/tenant-host/variants', () => 
     mkdirSync(join(dir, 'platform/tenant-host'), { recursive: true });
     writeFileSync(join(dir, 'platform/tenant-host/variants'), table);
     const bin = join(dir, 'bin');
-    mkdirSync(bin);
-    writeFileSync(
-      join(bin, 'bun'),
-      `#!/bin/sh\necho "hash=${'a'.repeat(64)}"\n${answer}\necho "args=$*" >> "${dir}/bun.log"\n`,
+    stubCommand(
+      bin,
+      'bun',
+      `echo "hash=${'a'.repeat(64)}"\n${answer}\necho "args=$*" >> "${dir}/bun.log"`,
     );
-    chmodSync(join(bin, 'bun'), 0o755);
     const output = join(dir, 'out');
     writeFileSync(output, '');
     const result = Bun.spawnSync(['bash', '-c', script], {
@@ -825,20 +824,17 @@ describe('scripts/wash-pins.sh (the wash pin set)', () => {
   function run(published: string[]) {
     const base = mkdtempSync(join(tmpdir(), 'wash-pins-'));
     const bin = join(base, 'bin');
-    mkdirSync(bin);
-    writeFileSync(
-      join(bin, 'oras'),
+    stubCommand(
+      bin,
+      'oras',
       [
-        '#!/bin/sh',
         'ref="$4"',
         'for tag in $PUBLISHED; do',
         '  case "$ref" in *":$tag") echo "{\\"digest\\":\\"sha256:$(printf %064d 0 | tr 0 "${tag#src-}" | cut -c1-64)\\"}"; exit 0 ;; esac',
         'done',
         'echo "Error: $ref: not found" >&2; exit 1',
-        '',
       ].join('\n'),
     );
-    chmodSync(join(bin, 'oras'), 0o755);
     const output = join(base, 'out');
     writeFileSync(output, '');
     const result = Bun.spawnSync(['bash', 'scripts/wash-pins.sh'], {
@@ -971,5 +967,75 @@ describe('digest artifacts: no download pattern reaches another artifact', () =>
     expect(names.filter((n) => glob.match(n)).sort()).toEqual(
       authArches.map((arch) => `tenant-auth-${arch}`).sort(),
     );
+  });
+});
+
+describe('release.yml publishes the tested npm tarballs byte for byte (#168)', () => {
+  const release = parse('.github/workflows/release.yml');
+  const steps = (job: string) => release.jobs[job]?.steps ?? [];
+  const runs = (job: string) =>
+    steps(job)
+      .map((s) => s.run ?? '')
+      .join('\n');
+  const uses = (job: string) => steps(job).map((s) => s.uses ?? '');
+
+  test('keeps its triggers: v* tag pushes and the dispatch Auto Tag sends', () => {
+    expect(release.on.push).toEqual({ tags: ['v*'] } as never);
+    expect('workflow_dispatch' in release.on).toBe(true);
+  });
+
+  test('build, publish and github-release run in that order', () => {
+    expect(Object.keys(release.jobs).sort()).toEqual(['build', 'github-release', 'publish']);
+    expect(release.jobs.publish?.needs).toBe('build');
+    expect(release.jobs['github-release']?.needs).toBe('publish');
+    expect(release.jobs['github-release']?.if).toBe("github.ref_type == 'tag'");
+  });
+
+  test('only publish holds an OIDC token, only github-release can write contents', () => {
+    expect(release.permissions).toEqual({ contents: 'read' });
+    expect(release.jobs.build?.permissions).toEqual({ contents: 'read' });
+    expect(release.jobs.publish?.permissions).toEqual({ contents: 'read', 'id-token': 'write' });
+    expect(release.jobs['github-release']?.permissions).toEqual({ contents: 'write' });
+  });
+
+  test('build smoke-tests, records the wasm sha256, packs without rebuilding pglite, uploads', () => {
+    const build = runs('build');
+    const smoke = build.indexOf('make -C platform/pglite-component unit smoke');
+    const record = build.indexOf(
+      'sha256sum platform/pglite-component/dist/di-framework-pglite.wasm',
+    );
+    const pack = build.indexOf('--pack "$RUNNER_TEMP/npm-packages"');
+    expect(smoke).toBeGreaterThan(-1);
+    expect(record).toBeGreaterThan(smoke);
+    expect(pack).toBeGreaterThan(record);
+    expect(build).toContain('--prebuilt @di-framework/pglite-component');
+    expect(
+      build.indexOf('tar -xzOf "$dir/$tarball" package/dist/di-framework-pglite.wasm'),
+    ).toBeGreaterThan(pack);
+    expect(build).toContain('--verify-packed "$dir"');
+    expect(build).not.toMatch(/npm publish|--publish-packed/);
+    expect(uses('build').filter((u) => u.startsWith('actions/upload-artifact@'))).toHaveLength(1);
+    const outputs = release.jobs.build?.outputs ?? {};
+    expect(outputs.pglite_wasm_sha256).toBe('${{ steps.smoke.outputs.wasm_sha256 }}');
+    expect(outputs.manifest_sha256).toBe('${{ steps.pack.outputs.manifest_sha256 }}');
+  });
+
+  test('publish builds nothing and checks both digests before publishing the tarballs', () => {
+    const publish = runs('publish');
+    expect(publish).not.toMatch(
+      /\bmake\b|cargo|docker|bun install|bun run build|--pack |--dry-run/,
+    );
+    expect(uses('publish').filter((u) => u.startsWith('actions/download-artifact@'))).toHaveLength(
+      1,
+    );
+    const verify = steps('publish').findIndex((s) => s.env?.MANIFEST_SHA256 !== undefined);
+    const last = steps('publish').findIndex((s) => (s.run ?? '').includes('--publish-packed'));
+    expect(verify).toBeGreaterThan(-1);
+    expect(last).toBeGreaterThan(verify);
+    expect(steps('publish')[verify]?.env).toMatchObject({
+      MANIFEST_SHA256: '${{ needs.build.outputs.manifest_sha256 }}',
+      WASM_SHA256: '${{ needs.build.outputs.pglite_wasm_sha256 }}',
+    });
+    expect(steps('publish')[verify]?.run).toContain('package/dist/di-framework-pglite.wasm');
   });
 });

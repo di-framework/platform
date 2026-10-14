@@ -141,24 +141,8 @@ async function referencing(
     .sort();
 }
 
-/**
- * A 409 naming the deployments that inject `source`, so an unset never silently breaks a running
- * workload (platform#100); undefined when nothing references it.
- */
-async function refuseReferenced(
-  context: V1Context,
-  field: 'configFrom' | 'secretFrom',
-  source: string,
-  what: string,
-  env: string,
-): Promise<Response | undefined> {
-  const deployments = await referencing(context, field, source);
-  if (deployments.length === 0) return undefined;
-  return conflict(
-    `${what} is referenced by deployed workloads in ${env}: ${deployments.join(', ')}; ` +
-      'destroy them (or redeploy without it) before unsetting it',
-  );
-}
+const referencedBy = (deployments: string[], env: string) =>
+  `referenced by deployed workloads in ${env}: ${deployments.join(', ')}`;
 
 // ---- secrets ---------------------------------------------------------------------------------
 
@@ -269,14 +253,13 @@ const unsetSecret: V1Handler = async (_command, call, context) => {
   if (refused) return refused;
   const existing = await existingSecret(context, name, env, true);
   if (existing instanceof Response) return existing;
-  const referenced = await refuseReferenced(
-    context,
-    'secretFrom',
-    secretObjectName(name, env),
-    `secret ${name}`,
-    env,
-  );
-  if (referenced) return referenced;
+  // Deleting a Secret a workload injects stops its replicas from being placed (platform#100).
+  const deployments = await referencing(context, 'secretFrom', secretObjectName(name, env));
+  if (deployments.length > 0)
+    return conflict(
+      `secret ${name} is ${referencedBy(deployments, env)}; ` +
+        'destroy them (or redeploy without it) before unsetting it',
+    );
   await remove(
     context.asUser(),
     secretPath(context, name, env),
@@ -318,6 +301,7 @@ function refuseVarName(name: string): Response | undefined {
 
 type VarChange = (data: Record<string, string>, name: string) => Response | undefined;
 type VarCheck = (context: V1Context, name: string, env: string) => Promise<Response | undefined>;
+type VarAnswer = (context: V1Context, name: string, env: string) => Promise<Response>;
 
 /** Read-modify-write of the environment's vars ConfigMap. */
 async function changeVars(
@@ -326,7 +310,7 @@ async function changeVars(
   event: string,
   change: VarChange,
   createIfMissing: boolean,
-  checks: { before?: VarCheck; after?: VarCheck } = {},
+  checks: { before?: VarCheck; answer?: VarAnswer } = {},
 ): Promise<Response> {
   const name = nameOf(call);
   const env = envOf(call);
@@ -343,8 +327,10 @@ async function changeVars(
     return conflict(`${varsConfigMapName(env)} is not a tenant vars ConfigMap`);
   // Prototype-free, so a name like `toString` is only ever an own key.
   const data: Record<string, string> = Object.assign(Object.create(null), existing?.data);
-  const failed = change(data, name) ?? (await checks.after?.(context, name, env));
+  const failed = change(data, name);
   if (failed) return failed;
+  // Prepared before the write, so a failed read leaves the vars unchanged.
+  const answer = await checks.answer?.(context, name, env);
   const times = timestamps(existing);
   if (Object.hasOwn(data, name)) times[name] = now();
   else delete times[name];
@@ -368,7 +354,7 @@ async function changeVars(
     `the ${env} vars`,
   );
   context.audit(event, { user: context.principal.user, name, env });
-  return noContent();
+  return answer ?? noContent();
 }
 
 /** A 409 when a tenant secret in `env` is already injected under the var's name. */
@@ -383,11 +369,24 @@ async function secretSharing(context: V1Context, name: string, env: string) {
 }
 
 /**
- * Deployments inject the whole vars ConfigMap (`configFrom`), not single keys, so any var of an
- * env is referenced while a workload there injects that env's vars (platform#100).
+ * The answer to a var unset (platform#100). Deployments inject the whole vars ConfigMap
+ * (`configFrom`), not single keys, so any var of an env is referenced while a workload there
+ * injects that env's vars. The map stays, so the workloads keep running: the unset succeeds with a
+ * `referenced` warning naming them instead of being refused like a secret.
  */
-const varReferenced = (context: V1Context, name: string, env: string) =>
-  refuseReferenced(context, 'configFrom', varsConfigMapName(env), `var ${name}`, env);
+async function varUnset(context: V1Context, name: string, env: string): Promise<Response> {
+  const deployments = await referencing(context, 'configFrom', varsConfigMapName(env));
+  const warnings = deployments.length
+    ? [
+        {
+          code: 'referenced',
+          detail: `var ${name} was ${referencedBy(deployments, env)}; check they do not need it`,
+          deployments,
+        },
+      ]
+    : [];
+  return Response.json({ warnings });
+}
 
 const missingVar = (name: string, call: HttpCall) =>
   problem(404, 'Not Found', `var ${name} does not exist in ${envOf(call)}`);
@@ -446,7 +445,6 @@ export const config: V1Module = {
         return undefined;
       },
       false,
-      // After the change, so unsetting a missing var stays a 404.
-      { after: varReferenced },
+      { answer: varUnset },
     ),
 };

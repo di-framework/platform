@@ -41,6 +41,8 @@ export const EGRESS_POLICY_PATTERN = `^${NAME}:${PORT}$`;
 export const EGRESS_DESTINATION_PATTERN = `^${NAME}(:${PORT})?$`;
 /** Longest DNS name plus `:65535`. */
 export const EGRESS_ENTRY_MAX_LENGTH = 259;
+/** Most destinations one egress BackingService may request. */
+export const EGRESS_MAX_DESTINATIONS = 32;
 
 interface Entry {
   name: string;

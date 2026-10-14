@@ -26,10 +26,15 @@ import {
 } from './tenancy';
 import { tenantListerFromKubeconfig, warnRemovedTenants } from './tenancy/removal';
 import {
+  assertRuntimeNatsConfig,
+  assertTenantAuthConfig,
   names,
+  type RuntimeNatsConfig,
   type TenantAuthConfig,
   tenantAuthRoutes,
+  unsetPublicUrls,
   userTokenSecretName,
+  withDerivedPublicUrls,
 } from './tenancy/resources';
 import { secretReaderFromKubeconfig } from './token-secret-reader';
 import { waitForTokenSecret } from './token-wait';
@@ -53,6 +58,13 @@ export interface PlatformArgs {
   registry?: boolean;
   registryNodePort?: number;
   storageRoot?: string;
+  /**
+   * JetStream storage caps of each tenant's runtime data-plane NATS (`di-nats`, #160): binary
+   * quantities `maxFileStore` (default `10Gi`) and `maxMemoryStore` (default `32Mi`, at most
+   * `64Mi`, half the 128Mi container limit). Validated before deploy. Defaults to config
+   * `runtimeNats`.
+   */
+  runtimeNats?: RuntimeNatsConfig;
   /**
    * Plain-HTTP registries. The platform host group runs `--allow-insecure-registries`; tenant
    * hosts get `--insecure-registry` for the platform registry (with `registry`) and for each of
@@ -118,8 +130,6 @@ export function createPlatform(args: PlatformArgs) {
   const scope = args.installation;
   const config = args.config ?? new pulumi.Config();
   const declared = declarations(config);
-  const networkPolicy =
-    args.networkPolicyEngine === 'kube-router' ? installNetworkPolicy(provider) : undefined;
   const namespaceName = args.namespace ?? 'wasmcloud';
   const REGISTRY_IMAGE = 'docker.io/library/registry:3.1.1';
   const WASMCLOUD_OPERATOR_VERSION = '2.8.0';
@@ -134,7 +144,21 @@ export function createPlatform(args: PlatformArgs) {
   });
   const tenantHostImage = config.get('tenantHostImage') ?? DEFAULT_HOST_IMAGE;
   assertHostImageSupportsAllowlist(tenantHostImage, insecureRegistries);
-  const tenantAuth = config.getObject<TenantAuthConfig>('tenantAuth');
+  const configuredTenantAuth = config.getObject<TenantAuthConfig>('tenantAuth');
+  assertTenantAuthConfig(configuredTenantAuth);
+  // Unset tenant-auth public URLs default to gateway routes (#128); explicit URLs are kept.
+  const tenantAuth = withDerivedPublicUrls(configuredTenantAuth, routeUrlPattern);
+  const notDerived = unsetPublicUrls(tenantAuth);
+  if (routeUrlPattern !== undefined && notDerived.length)
+    pulumi.log.warn(
+      `tenantAuth.${notDerived.join(', tenantAuth.')} not derived from routeUrlPattern ${routeUrlPattern} ` +
+        '(only http://{host}.{tenant}.localhost[:<port>] is routed to tenant-auth); the 127.0.0.1 defaults apply',
+    );
+  const runtimeNats = args.runtimeNats ?? config.getObject<RuntimeNatsConfig>('runtimeNats');
+  assertRuntimeNatsConfig(runtimeNats);
+  const backingServiceClasses = resolveBackingServiceClasses(config);
+  if (args.apiServer !== undefined && args.kubeconfig === undefined)
+    throw new Error('createPlatform: apiServer requires kubeconfig (the one provider uses)');
   // Gateway routes for each tenant's console and controller hosts (#58).
   const { routes: tenantAuthRouteHosts } = tenantAuthRoutes(tenantAuth, routeUrlPattern);
   // Gateway route aliases (#217): validated and normalized once, before any resource.
@@ -142,6 +166,9 @@ export function createPlatform(args: PlatformArgs) {
     tenantAuthRoutes: tenantAuthRouteHosts,
     tenants: declared.tenants.map((tenant) => tenant.name),
   });
+  // Every validation above runs before the first resource, so invalid input leaves nothing applied.
+  const networkPolicy =
+    args.networkPolicyEngine === 'kube-router' ? installNetworkPolicy(provider) : undefined;
   const namespaceResource = new k8s.core.v1.Namespace(
     'wasmcloud',
     {
@@ -355,9 +382,10 @@ export function createPlatform(args: PlatformArgs) {
     storageRoot: args.storageRoot,
     hostImage: tenantHostImage,
     hostImagePullPolicy: config.get('tenantHostImagePullPolicy') ?? 'IfNotPresent',
-    backingServiceClasses: resolveBackingServiceClasses(config),
+    backingServiceClasses,
     routeUrlPattern,
     tenantAuth,
+    runtimeNats,
   });
   // Warn before Pulumi deletes a Tenant that has no entry and whose live policy is Retain (#228).
   // Skipped without `kubeconfig`: the program has no way to read the cluster then.
@@ -389,8 +417,6 @@ export function createPlatform(args: PlatformArgs) {
   // exists, so an unknown ID defers the read to the update. During update, poll until the Secret
   // exists with data.token, as the controller may not have created it yet.
   const apiServer = args.apiServer;
-  if (apiServer !== undefined && adminKubeconfig === undefined)
-    throw new Error('createPlatform: apiServer requires kubeconfig (the one provider uses)');
   // In preview the ID is unknown, so nothing is read. On update the wait runs inside an apply on
   // the User, which resolves only after the User is applied and Ready, so the budget starts then.
   const tokenSecretId = (

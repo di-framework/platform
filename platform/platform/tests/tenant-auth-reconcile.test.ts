@@ -30,7 +30,9 @@ import {
   tenantResources,
   tlsCertDigest,
   type User,
+  unsetPublicUrls,
   VERSION,
+  withDerivedPublicUrls,
 } from '../src/tenancy/resources';
 import {
   caCertificate,
@@ -172,7 +174,10 @@ describe('tenant-auth configuration', () => {
     expect(cluster[0]?.verbs).toEqual(['get', 'list', 'create', 'patch', 'delete']);
     // Never cluster-admin by proxy: no rule lets it bind or escalate cluster-scoped roles.
     for (const verb of ['bind', 'escalate']) expect(cluster[0]?.verbs).not.toContain(verb);
-    expect(rules.find((r) => r.resources.includes('rolebindings'))?.verbs).toContain('escalate');
+    // Nor namespaced ones (#115): no escalate, and bind only on named Roles.
+    expect(rules.flatMap((r) => r.verbs)).not.toContain('escalate');
+    for (const rule of rules.filter((r) => r.verbs.includes('bind')))
+      expect(rule.resourceNames?.length).toBeGreaterThan(0);
     expect(rules.find((r) => r.apiGroups.includes('discovery.k8s.io'))?.resources).toEqual([
       'endpointslices',
     ]);
@@ -1038,7 +1043,7 @@ describe('reconcileTenant with tenant-auth', () => {
     ).toBeUndefined();
   });
 
-  it('refuses to adopt resources left by deploy-local.ts', async () => {
+  it('refuses to adopt resources left by a manual deploy', async () => {
     const { api, controller, t } = prepare();
     api.seed({
       apiVersion: 'v1',
@@ -1074,7 +1079,7 @@ describe('reconcileTenant with tenant-auth', () => {
     ).toBe(true);
   });
 
-  it('refuses to adopt a tenant-controller-tls Secret left by deploy-local.ts through the cached read', async () => {
+  it('refuses to adopt a tenant-controller-tls Secret left by a manual deploy through the cached read', async () => {
     const { api, controller, t } = prepare();
     const ns = 'di-runtime-alpha';
     const ca = caCertificate(`tenant-controller CA (${ns})`, 3650);
@@ -1091,7 +1096,7 @@ describe('reconcileTenant with tenant-auth', () => {
       'tls.key': encode(leaf.key),
       'ca.crt': encode(ca.cert),
     };
-    // The labels and keys deploy-local.ts writes; no installation label.
+    // The labels and keys the removed manual deploy script wrote; no installation label.
     api.seed({
       apiVersion: 'v1',
       kind: 'Secret',
@@ -1471,6 +1476,108 @@ describe('tenant-auth gateway routes (#58:routes)', () => {
     expect(problems({ controllerPublicUrl: 'https://console.{tenant}.localhost:28180' })).toEqual([
       'tenantAuth.controllerPublicUrl must not share the console host',
     ]);
+  });
+
+  it('derives unset public URLs from routeUrlPattern so they are routed (#128)', () => {
+    const { consolePublicUrl: _c, ...bare } = auth;
+    const registry = { component: `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}` };
+    const derived = withDerivedPublicUrls({ ...bare, registry }, pattern);
+    expect(derived).toEqual({
+      ...bare,
+      consolePublicUrl: 'http://console.{tenant}.localhost:28180',
+      controllerPublicUrl: 'https://controller.{tenant}.localhost:28180',
+      registry: { ...registry, publicUrl: 'https://registry.{tenant}.localhost:28180' },
+    });
+    expect(tenantAuthRoutes(derived, pattern)).toEqual({
+      routes: { console: 'console', controller: 'controller', registry: 'registry' },
+      urls: {
+        console: 'http://console.{tenant}.localhost:28180',
+        controller: 'https://controller.{tenant}.localhost:28180',
+        registry: 'https://registry.{tenant}.localhost:28180',
+      },
+      problems: [],
+    });
+    // Without a registry none is invented; without a port the TLS hosts name the gateway's 80.
+    const portless = withDerivedPublicUrls(bare, 'http://{host}.{tenant}.localhost');
+    expect(portless).toEqual({
+      ...bare,
+      consolePublicUrl: 'http://console.{tenant}.localhost',
+      controllerPublicUrl: 'https://controller.{tenant}.localhost:80',
+    });
+    expect(tenantAuthRoutes(portless, 'http://{host}.{tenant}.localhost').problems).toEqual([]);
+    // No gateway or no tenantAuth: nothing derived, the 127.0.0.1 defaults still apply.
+    expect(withDerivedPublicUrls(bare, undefined)).toBe(bare);
+    expect(withDerivedPublicUrls(undefined, pattern)).toBeUndefined();
+  });
+
+  it('keeps explicit public URLs over the derived defaults (#128)', () => {
+    const explicit: TenantAuthConfig = {
+      ...auth,
+      consolePublicUrl: 'http://ui.{tenant}.localhost:28180',
+      controllerPublicUrl: 'https://127.0.0.1:8788',
+      registry: {
+        component: `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}`,
+        publicUrl: 'https://oci.{tenant}.localhost:28180',
+      },
+    };
+    expect(withDerivedPublicUrls(explicit, pattern)).toBe(explicit);
+    // Only the unset one is derived.
+    const { controllerPublicUrl: _k, ...partial } = explicit;
+    expect(withDerivedPublicUrls(partial, pattern)).toEqual({
+      ...explicit,
+      controllerPublicUrl: 'https://controller.{tenant}.localhost:28180',
+    });
+  });
+
+  it('keeps the 127.0.0.1 defaults for a routeUrlPattern the gateway does not route (#128)', () => {
+    const { consolePublicUrl: _c, ...bare } = auth;
+    for (const unrouted of [
+      'https://{host}.{tenant}.localhost:28180',
+      'http://{host}.{tenant}.example.com:28180',
+    ]) {
+      expect(withDerivedPublicUrls(bare, unrouted)).toBe(bare);
+      expect(tenantAuthRoutes(bare, unrouted)).toEqual({ routes: {}, urls: {}, problems: [] });
+    }
+    expect(unsetPublicUrls(bare)).toEqual(['consolePublicUrl', 'controllerPublicUrl']);
+  });
+
+  it('derives the gateway port from an explicit :80 pattern (#128)', () => {
+    const { consolePublicUrl: _c, ...bare } = auth;
+    const pattern80 = 'http://{host}.{tenant}.localhost:80';
+    const derived = withDerivedPublicUrls(bare, pattern80);
+    expect(derived).toEqual({
+      ...bare,
+      consolePublicUrl: 'http://console.{tenant}.localhost',
+      controllerPublicUrl: 'https://controller.{tenant}.localhost:80',
+    });
+    expect(tenantAuthRoutes(derived, pattern80)).toMatchObject({
+      routes: { console: 'console', controller: 'controller' },
+      problems: [],
+    });
+  });
+
+  it('renders the derived URLs into the console and controller settings (#128)', () => {
+    const { consolePublicUrl: _c, ...bare } = auth;
+    const registry = { component: `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}` };
+    const derivedCfg: ControllerConfig = {
+      ...cfg,
+      routeUrlPattern: pattern,
+      tenantAuth: withDerivedPublicUrls({ ...bare, registry }, pattern),
+    };
+    const resources = tenantAuthResources(tenant(), derivedCfg, {
+      ...inputs,
+      registryServing: true,
+    });
+    expect(env(find(resources, 'Deployment', 'tenant-console') as Deployment)).toMatchObject({
+      TENANT_CONSOLE_PUBLIC_URL: 'http://console.alpha.localhost:28180',
+      TENANT_CONSOLE_CONTROLLER_PUBLIC_URL: 'https://controller.alpha.localhost:28180',
+    });
+    expect(env(find(resources, 'Deployment', 'tenant-controller') as Deployment)).toMatchObject({
+      TENANT_CONTROLLER_REGISTRY_URL: 'https://registry.alpha.localhost:28180',
+    });
+    expect(tenantControllerCertNames('alpha', derivedCfg.tenantAuth).dns).toEqual(
+      expect.arrayContaining(['controller.alpha.localhost', 'registry.alpha.localhost']),
+    );
   });
 
   it('admits the gateway to the routed ports only and publishes the URLs', () => {
@@ -2452,9 +2559,8 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     const none = host(tenantResources(tenant(), tlsCfg, schedulerSecret));
     expect(env(none)).not.toHaveProperty('DOCKER_CONFIG');
     expect(none.spec.template.metadata.annotations).toBeUndefined();
-    expect(none.spec.template.spec.containers[0]!.args).not.toContain(
-      '--oci-ca-path=/registry-ca/ca.crt',
-    );
+    const noneArgs = none.spec.template.spec.containers[0]!.args as string[];
+    expect(noneArgs.filter((arg) => arg.includes('ca-path'))).toEqual([]);
     expect(JSON.stringify(none.spec.template.spec.volumes)).not.toContain('registry-');
 
     const withCa = host(
@@ -2463,7 +2569,15 @@ describe('tenant registry host pull (#83:host-pull)', () => {
       }),
     );
     const container = withCa.spec.template.spec.containers[0]!;
-    expect(container.args).toContain('--oci-ca-path=/registry-ca/ca.crt');
+    // The tenant CA is trusted for OCI pulls and for the components' outgoing wasi:http (#113),
+    // both from the one mounted file whose digest rolls the hosts.
+    expect((container.args as string[]).filter((arg) => arg.includes('ca-path'))).toEqual([
+      '--oci-ca-path=/registry-ca/ca.crt',
+      '--http-client-ca-path=/registry-ca/ca.crt',
+    ]);
+    // Layered on the default webpki roots, not replacing them. Every component's HTTPS egress
+    // also accepts any name the tenant CA signs, as --oci-ca-path does for pulls (CA follow-ups: #170).
+    expect((container.args as string[]).some((arg) => arg.includes('trust-roots'))).toBe(false);
     expect(container.args).not.toContain('--allow-insecure-registries');
     expect(env(withCa).DOCKER_CONFIG).toBe('/registry-auth');
     expect(withCa.spec.template.metadata.annotations).toEqual({
@@ -2682,6 +2796,7 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     expect(env(host(api)).DOCKER_CONFIG).toBe('/registry-auth');
     const args = host(api).spec.template.spec.containers[0]!.args as string[];
     expect(args).toContain('--oci-ca-path=/registry-ca/ca.crt');
+    expect(args).toContain('--http-client-ca-path=/registry-ca/ca.crt');
     expect(args).not.toContain('--allow-insecure-registries');
     expect(args.join(' ')).toContain(`--insecure-registry ${PLATFORM_REGISTRY}`);
     expect(api.objects.get(pullServicePath)).toMatchObject({

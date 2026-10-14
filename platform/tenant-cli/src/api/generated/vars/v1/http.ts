@@ -4,11 +4,12 @@ import { useContainer } from '@di-framework/core/container';
 import { Component } from '@di-framework/core/decorators';
 import { Controller, Endpoint, json, TypedRouter } from '@di-framework/http';
 import { TenantControllerHandlers } from '../../../handlers';
-import { ConfigList, ConfigValue } from '../../../contracts/api.schemas';
+import { ConfigList, ConfigValue, VarUnset } from '../../../contracts/api.schemas';
 import {
   validateConfigList,
   validateConfigValue,
   validateEmpty,
+  validateVarUnset,
 } from './contracts';
 
 const routes = TypedRouter();
@@ -52,11 +53,16 @@ export class VarsV1HttpController {
 
   @Endpoint({
     summary: 'Unset a var',
-    description: 'Removes the var; 404 when it does not exist, 409 naming the deployed workloads while any of them injects the environment\'s vars.',
+    description: 'Removes the var; 404 when it does not exist. It succeeds while deployed workloads inject the environment\'s vars, with a `referenced` warning naming them.',
     parameters: [{"name":"env","in":"query","required":true,"schema":{"type":"string","enum":["prod","staging"]}}],
     responses: {
-      '204': {
+      '200': {
         description: 'Unset a var',
+      content: {
+        'application/json': {
+          schema: VarUnset.jsonSchema,
+        },
+      },
       },
     },
   })
@@ -71,7 +77,7 @@ export class VarsV1HttpController {
     });
 
     if (output instanceof Response) return output;
-    return json(validateEmpty(output), { status: 204 });
+    return json(validateVarUnset(output));
   });
 
   @Endpoint({

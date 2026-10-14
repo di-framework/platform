@@ -10,7 +10,13 @@ import {
 } from 'bun:test';
 import { events } from '@di-framework/tenant-cli/client';
 // The platform's log projection, which writes what this endpoint reads (platform#103).
-import { applicationKey, logsConfigMap } from '../../platform/src/tenancy/log-projection.ts';
+import {
+  ApiError,
+  collection,
+  Controller as PlatformController,
+} from '../../platform/src/tenancy/controller.ts';
+import { logKey, logsConfigMap, type RingLine } from '../../platform/src/tenancy/log-projection.ts';
+import type { Resource, Tenant } from '../../platform/src/tenancy/resources.ts';
 import { Controller, configFromEnv } from '../src/controller.ts';
 import type { Principal } from '../src/identity.ts';
 import { KubeClient } from '../src/kube.ts';
@@ -201,20 +207,27 @@ describe('GET /v1/services/:service/logs', () => {
 
   test('finds the projection written for a workload /v1/deploy rendered', async () => {
     // The labels /v1/deploy renders on service web's WorkloadDeployment (deploy.test.ts).
-    const key = applicationKey({
+    const key = logKey({
       name: 'web-prod',
       labels: {
         'app.kubernetes.io/managed-by': 'di-framework',
-        'app.kubernetes.io/name': 'web',
+        'app.kubernetes.io/name': 'web-prod',
         'di-framework.dev/application': 'web',
         'di-framework.dev/service': 'web',
         'platform.di-framework.dev/env': 'prod',
       },
     });
-    const projected = logsConfigMap('acme', 'di-tenant-acme', 'platform', key, [
-      '2020-01-01T10:00:00Z INFO hello',
-    ]);
-    expect(projected.metadata.name).toBe('di-logs-web');
+    expect(key).toEqual({ application: 'web', env: 'prod' });
+    const projected = logsConfigMap(
+      'acme',
+      'di-tenant-acme',
+      'platform',
+      key.application,
+      [{ line: '2020-01-01T10:00:00Z INFO hello', deployment: 'web-prod', env: key.env }],
+      {},
+      key.env,
+    );
+    expect(projected.metadata.name).toBe('di-logs-web.prod');
     listed = { metadata: { resourceVersion: '7' }, items: [projected] };
     const response = await fetch(`${base}/web/logs?env=prod`);
     expect(response.status).toBe(200);
@@ -246,6 +259,106 @@ describe('GET /v1/services/:service/logs', () => {
     expect(
       messages(await read(await fetch(`${base}/web/logs?env=prod&deployment=web-v2`))),
     ).toEqual(['host: boom']);
+  });
+
+  describe('per deployment and env (#106)', () => {
+    // Two host failures and guest lines of web-prod, interleaved with web-staging lines;
+    // data.failures keeps only the newest failure per deployment.
+    const failure = (time: string, message: string, workload = 'web-prod-abc-1') => ({
+      workload,
+      time,
+      level: 'ERROR' as const,
+      message,
+    });
+    const ring: RingLine[] = [
+      { line: '2020-01-01T10:00:00Z INFO prod up', deployment: 'web-prod', env: 'prod' },
+      {
+        line: '2020-01-01T10:01:00Z ERROR host: first crash',
+        deployment: 'web-prod',
+        env: 'prod',
+      },
+      { line: '2020-01-01T10:02:00Z INFO staging up', deployment: 'web-staging', env: 'staging' },
+      { line: '2020-01-01T10:03:00Z WARN prod retrying', deployment: 'web-prod', env: 'prod' },
+      {
+        line: '2020-01-01T10:04:00Z ERROR host: second crash',
+        deployment: 'web-prod',
+        env: 'prod',
+      },
+      {
+        line: '2020-01-01T10:05:00Z ERROR host: staging crash',
+        deployment: 'web-staging',
+        env: 'staging',
+      },
+    ];
+    const failures = {
+      'web-prod': failure('2020-01-01T10:04:00Z', 'second crash'),
+      'web-staging': failure('2020-01-01T10:05:00Z', 'staging crash', 'web-staging-def-1'),
+    };
+    const perEnv = (env: string) =>
+      logsConfigMap(
+        'acme',
+        'di-tenant-acme',
+        'platform',
+        'web',
+        ring.filter((entry) => entry.env === env),
+        { [`web-${env}`]: failures[`web-${env}` as keyof typeof failures] },
+        env,
+      );
+    /** A CLI workload whose application label is also `web` (its own projection). */
+    const cli = logsConfigMap('acme', 'di-tenant-acme', 'platform', 'web', [
+      { line: '2020-01-01T10:00:30Z INFO cli up', deployment: 'web', env: '' },
+    ]);
+    const PROD = ['prod up', 'host: first crash', 'prod retrying', 'host: second crash'];
+    const STAGING = ['staging up', 'host: staging crash'];
+    const logsOf = async (query: string) =>
+      messages(await read(await fetch(`${base}/web/logs?${query}`)));
+
+    test('env keeps that environment, and the deployment filter sees all of it', async () => {
+      listed = { metadata: { resourceVersion: '7' }, items: [perEnv('prod'), perEnv('staging')] };
+      expect(await logsOf('env=prod')).toEqual(PROD);
+      expect(await logsOf('env=staging')).toEqual(STAGING);
+      expect(await logsOf('env=prod&deployment=web-prod')).toEqual(PROD);
+      expect(await logsOf('env=staging&deployment=web-staging')).toEqual(STAGING);
+      expect(await logsOf('env=prod&deployment=web-staging')).toEqual([]);
+      // Each event carries its deployment and, as the contract's LogEvent, no env field.
+      const all = (await read(await fetch(`${base}/web/logs?env=staging`)))
+        .filter((e) => e.event === 'log')
+        .map((e) => JSON.parse(e.data));
+      expect(all).toEqual([
+        {
+          timestamp: '2020-01-01T10:02:00Z',
+          deployment: 'web-staging',
+          level: 'info',
+          message: 'staging up',
+        },
+        {
+          timestamp: '2020-01-01T10:05:00Z',
+          deployment: 'web-staging',
+          level: 'error',
+          message: 'host: staging crash',
+        },
+      ]);
+    });
+
+    test('never serves a CLI workload that shares the service name', async () => {
+      listed = { metadata: { resourceVersion: '7' }, items: [perEnv('prod'), cli] };
+      expect(await logsOf('env=prod')).toEqual(PROD);
+      expect(await logsOf('env=staging')).toEqual([]);
+      expect(await logsOf('env=prod&deployment=web')).toEqual([]);
+    });
+
+    test('reads a ConfigMap staging and prod shared before, by recorded deployment', async () => {
+      const shared = logsConfigMap('acme', 'di-tenant-acme', 'platform', 'web', ring, failures);
+      const { envs: _envs, ...data } = shared.data as Record<string, string>;
+      listed = { metadata: { resourceVersion: '7' }, items: [{ ...shared, data }] };
+      expect(await logsOf('env=prod')).toEqual(PROD);
+      expect(await logsOf('env=staging&deployment=web-staging')).toEqual(STAGING);
+    });
+
+    test.each(['web/logs?env=dev', 'web/logs'])('rejects %s', async (path) => {
+      const response = await fetch(`${base}/${path}`);
+      expect(response.status).toBe(400);
+    });
   });
 
   test.each([
@@ -561,4 +674,108 @@ describe('GET /v1/services/:service/logs', () => {
 
 test('logEvents tolerates a ConfigMap without labels or data', () => {
   expect(logEvents({ metadata: {} })).toEqual([]);
+});
+
+test('logEvents takes the env of a line from data.envs, the env label, or the deployment', () => {
+  const line = '2020-01-01T10:00:00Z INFO up';
+  const envOf = (labels: Record<string, string>, data: Record<string, string>) =>
+    logEvents({
+      metadata: { labels: { 'di-framework.dev/application': 'web', ...labels } },
+      data: { lines: line, ...data },
+    })[0]?.env;
+  const env = { 'platform.di-framework.dev/env': 'staging' };
+  expect(envOf({}, { deployments: '["web-prod"]', envs: '["prod"]' })).toBe('prod');
+  expect(envOf(env, { deployments: '["web-staging"]' })).toBe('staging');
+  // A ConfigMap staging and prod shared: the recorded deployment tells.
+  expect(envOf({}, { deployments: '["web-staging"]' })).toBe('staging');
+  expect(envOf({}, { deployments: '["web-worker"]' })).toBe('');
+  // No recorded deployment: not known.
+  expect(envOf({}, {})).toBeUndefined();
+});
+
+test('logEvents falls back to data.failures for lines without a recorded deployment', () => {
+  const failures = {
+    'web-v2': {
+      workload: 'web-v2-abc',
+      time: '2020-01-01T10:02:00Z',
+      level: 'ERROR',
+      message: 'boom',
+    },
+  };
+  const lines = [
+    '2020-01-01T10:00:00Z INFO old',
+    '2020-01-01T10:02:00Z ERROR host: boom',
+    '2020-01-01T10:03:00Z INFO new',
+  ];
+  const deploymentsOf = (deployments?: string) =>
+    logEvents({
+      metadata: configMap('web', lines).metadata,
+      data: {
+        ...configMap('web', lines, failures).data,
+        ...(deployments === undefined ? {} : { deployments }),
+      },
+    }).map((event) => event.deployment);
+  // Lines published before deployments were recorded ('').
+  expect(deploymentsOf(JSON.stringify(['', '', 'web-v1']))).toEqual(['web', 'web-v2', 'web-v1']);
+  // A ConfigMap without, or with misaligned, deployments falls back for every line.
+  expect(deploymentsOf()).toEqual(['web', 'web-v2', 'web']);
+  expect(deploymentsOf(JSON.stringify(['web-v1']))).toEqual(['web', 'web-v2', 'web']);
+});
+
+test('a line the projection moves to a per-env ConfigMap is served once (#106)', async () => {
+  // A /v1 service web and a CLI workload web, with the ConfigMap they shared before #106.
+  const namespace = 'di-tenant-alpha';
+  const configMaps = new Map<string, Resource>();
+  const shared = logsConfigMap('alpha', namespace, 'test', 'web', [
+    { line: '2026-10-01T10:00:01.000000Z INFO prod up', deployment: 'web-prod' },
+    { line: '2026-10-01T10:00:02.000000Z INFO cli up', deployment: 'web' },
+  ]);
+  // Written before data.envs existed.
+  const { envs: _envs, ...data } = shared.data as Record<string, string>;
+  configMaps.set('di-logs-web', { ...shared, data });
+  const workloads = [
+    {
+      name: 'web-prod',
+      labels: {
+        'di-framework.dev/application': 'web',
+        'platform.di-framework.dev/env': 'prod',
+      },
+    },
+    { name: 'web', labels: { 'di-framework.dev/application': 'web' } },
+  ];
+  const cms = collection('v1', 'ConfigMap', namespace);
+  const api = {
+    async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+      const url = new URL(path, 'https://kubernetes');
+      if (url.pathname.endsWith('/pods')) return { items: [] } as T;
+      if (url.pathname.endsWith('/workloaddeployments'))
+        return { items: workloads.map((metadata) => ({ metadata })) } as T;
+      if (url.pathname === cms) return { items: [...configMaps.values()] } as T;
+      const name = decodeURIComponent(url.pathname.slice(cms.length + 1));
+      if (method === 'PATCH') configMaps.set(name, structuredClone(body) as Resource);
+      else if (method === 'DELETE') configMaps.delete(name);
+      else if (!configMaps.has(name)) throw new ApiError(404, 'Not found');
+      return structuredClone(configMaps.get(name)) as T;
+    },
+  };
+  const served = () =>
+    [...configMaps.values()]
+      .flatMap((cm) => logEvents(cm as never))
+      .filter((e) => e.env === undefined || e.env === 'prod')
+      .map((e) => e.message);
+  expect(served()).toEqual(['prod up']);
+  await new PlatformController(api, {
+    installation: 'test',
+    namespace: 'wasmcloud',
+    hostImage: 'wash:test',
+    schedulerNatsUrl: 'nats://nats:4222',
+  }).projectLogs({
+    apiVersion: 'platform.di-framework.dev/v1alpha1',
+    kind: 'Tenant',
+    metadata: { name: 'alpha', uid: 'alpha-uid', labels: {} },
+    spec: {},
+  } as Tenant);
+  // Both ConfigMaps match the endpoint's selector; the prod line is in one of them only.
+  expect([...configMaps.keys()].sort()).toEqual(['di-logs-web', 'di-logs-web.prod']);
+  expect(served()).toEqual(['prod up']);
 });
