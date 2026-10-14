@@ -11,7 +11,9 @@
 use crate::auth::{Controller, Role, Whoami};
 use crate::bindings;
 use crate::bindings::wasi::http::client::send;
-use crate::bindings::wasi::http::types::{Fields, Request, RequestOptions, Response, Scheme};
+use crate::bindings::wasi::http::types::{
+    ErrorCode, Fields, Request, RequestOptions, Response, Scheme,
+};
 use crate::bindings::wasmcloud::secrets::reveal::reveal;
 use crate::bindings::wasmcloud::secrets::store::{self, SecretValue};
 
@@ -54,13 +56,63 @@ impl Controller for TenantController {
         let Some(target) = Target::parse(&base) else {
             return Whoami::Denied;
         };
-        match call(&target, bearer).await {
-            Some((status, body)) if (200..300).contains(&status) => {
-                role_from_body(&body, tenant.trim())
-            }
-            _ => Whoami::Denied,
-        }
+        verdict(call(&target, bearer).await, tenant.trim())
     }
+}
+
+/// How one whoami call went.
+#[derive(Debug)]
+pub(crate) enum Outcome {
+    /// The request could not be built, e.g. the credential is not a valid
+    /// header value. Nothing was sent; the credential is at fault.
+    Unsendable,
+    /// `wasi:http` `send` failed: a refused or reset connection, a DNS or TLS
+    /// failure, or one of the [`TIMEOUTS`].
+    Failed(ErrorCode),
+    /// The controller answered.
+    Answered {
+        status: u16,
+        retry_after: Option<String>,
+        body: Vec<u8>,
+    },
+}
+
+/// Map a whoami call to a verdict. A 2xx is checked by [`role_from_body`]; a
+/// `5xx` or a failed call means the controller is unavailable right now;
+/// anything else (`401`, `403`, other statuses, an unsendable request) denies.
+pub(crate) fn verdict(outcome: Outcome, tenant: &str) -> Whoami {
+    match outcome {
+        Outcome::Unsendable => Whoami::Denied,
+        Outcome::Failed(error) => transport_failure(&error),
+        Outcome::Answered { status, body, .. } if (200..300).contains(&status) => {
+            role_from_body(&body, tenant)
+        }
+        Outcome::Answered {
+            status,
+            retry_after,
+            ..
+        } if (500..600).contains(&status) => Whoami::Unavailable {
+            retry_after: retry_after.as_deref().and_then(parse_retry_after),
+        },
+        Outcome::Answered { .. } => Whoami::Denied,
+    }
+}
+
+/// Every `send` error is treated as the controller being unavailable: none of
+/// them says anything about the credential, which was never checked.
+fn transport_failure(_error: &ErrorCode) -> Whoami {
+    Whoami::Unavailable { retry_after: None }
+}
+
+/// `Retry-After` as delta-seconds (RFC 9110). An HTTP-date or anything else
+/// is ignored (the registry then uses its default); a value beyond `u32`
+/// saturates and is clamped later.
+pub(crate) fn parse_retry_after(value: &str) -> Option<u32> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(value.parse().unwrap_or(u32::MAX))
 }
 
 /// Where `whoami` lives: scheme, authority and the full path.
@@ -171,7 +223,29 @@ fn request_options(timeouts: Timeouts) -> RequestOptions {
     options
 }
 
-async fn call(target: &Target, bearer: &str) -> Option<(u16, Vec<u8>)> {
+async fn call(target: &Target, bearer: &str) -> Outcome {
+    let Some(request) = build_request(target, bearer) else {
+        return Outcome::Unsendable;
+    };
+    let response = match send(request).await {
+        Ok(response) => response,
+        Err(error) => return Outcome::Failed(error),
+    };
+    let status = response.get_status_code();
+    let retry_after = response
+        .get_headers()
+        .get("retry-after")
+        .into_iter()
+        .next()
+        .and_then(|value| String::from_utf8(value).ok());
+    Outcome::Answered {
+        status,
+        retry_after,
+        body: read_body(response).await,
+    }
+}
+
+fn build_request(target: &Target, bearer: &str) -> Option<Request> {
     let headers = Fields::new();
     headers
         .append("authorization", format!("Bearer {bearer}").as_bytes())
@@ -190,9 +264,7 @@ async fn call(target: &Target, bearer: &str) -> Option<(u16, Vec<u8>)> {
         .ok()?;
     request.set_authority(Some(&target.authority)).ok()?;
     request.set_path_with_query(Some(&target.path)).ok()?;
-    let response = send(request).await.ok()?;
-    let status = response.get_status_code();
-    Some((status, read_body(response).await))
+    Some(request)
 }
 
 async fn read_body(response: Response) -> Vec<u8> {
@@ -288,6 +360,122 @@ mod tests {
             "http://[::1",
         ] {
             assert_eq!(Target::parse(bad), None, "{bad}");
+        }
+    }
+
+    fn answered(status: u16, retry_after: Option<&str>, body: &[u8]) -> Outcome {
+        Outcome::Answered {
+            status,
+            retry_after: retry_after.map(str::to_string),
+            body: body.to_vec(),
+        }
+    }
+
+    const PRINCIPAL: &[u8] =
+        br#"{"user":"a","account":"acme","role":"developer","via":"identity"}"#;
+
+    #[test]
+    fn a_2xx_principal_is_a_role() {
+        assert_eq!(
+            verdict(answered(200, None, PRINCIPAL), "acme"),
+            Whoami::Role(Role::Developer)
+        );
+    }
+
+    #[test]
+    fn a_controller_503_is_unavailable_with_or_without_retry_after() {
+        assert_eq!(
+            verdict(answered(503, Some("30"), b""), "acme"),
+            Whoami::Unavailable {
+                retry_after: Some(30)
+            }
+        );
+        assert_eq!(
+            verdict(answered(503, None, b""), "acme"),
+            Whoami::Unavailable { retry_after: None }
+        );
+        // An HTTP-date is not passed through; the registry uses its default.
+        assert_eq!(
+            verdict(
+                answered(503, Some("Wed, 21 Oct 2026 07:28:00 GMT"), b""),
+                "acme"
+            ),
+            Whoami::Unavailable { retry_after: None }
+        );
+    }
+
+    #[test]
+    fn every_5xx_is_unavailable_even_with_a_principal_body() {
+        for status in [500, 502, 504, 599] {
+            assert_eq!(
+                verdict(answered(status, Some("7"), PRINCIPAL), "acme"),
+                Whoami::Unavailable {
+                    retry_after: Some(7)
+                },
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_timeout_or_refused_connection_is_unavailable() {
+        for error in [
+            ErrorCode::ConnectionRefused,
+            ErrorCode::ConnectionTimeout,
+            ErrorCode::ConnectionReadTimeout,
+            ErrorCode::ConnectionTerminated,
+            ErrorCode::DnsTimeout,
+            ErrorCode::DestinationUnavailable,
+        ] {
+            let label = format!("{error:?}");
+            assert_eq!(
+                verdict(Outcome::Failed(error), "acme"),
+                Whoami::Unavailable { retry_after: None },
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_controller_401_or_403_denies() {
+        for status in [401, 403] {
+            for retry_after in [None, Some("30")] {
+                assert_eq!(
+                    verdict(answered(status, retry_after, PRINCIPAL), "acme"),
+                    Whoami::Denied,
+                    "{status} {retry_after:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn other_statuses_and_unsendable_requests_deny() {
+        for status in [100, 301, 400, 404, 429, 600] {
+            assert_eq!(
+                verdict(answered(status, Some("5"), PRINCIPAL), "acme"),
+                Whoami::Denied,
+                "{status}"
+            );
+        }
+        assert_eq!(verdict(Outcome::Unsendable, "acme"), Whoami::Denied);
+    }
+
+    #[test]
+    fn retry_after_is_delta_seconds_only() {
+        assert_eq!(parse_retry_after("0"), Some(0));
+        assert_eq!(parse_retry_after(" 120 "), Some(120));
+        assert_eq!(parse_retry_after("99999999999999999999"), Some(u32::MAX));
+        for bad in [
+            "",
+            " ",
+            "-1",
+            "1.5",
+            "+5",
+            "5s",
+            "Wed, 21 Oct 2026 07:28:00 GMT",
+        ] {
+            assert_eq!(parse_retry_after(bad), None, "{bad:?}");
         }
     }
 
