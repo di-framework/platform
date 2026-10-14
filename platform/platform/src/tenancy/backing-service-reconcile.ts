@@ -371,10 +371,21 @@ interface DeploymentFailure {
   message: string;
 }
 
+/** Longest runtime message copied into a tenant-visible condition (webhook denials are free text). */
+const MAX_FAILURE_MESSAGE = 1024;
+
+function boundedMessage(message: string): string {
+  return message.length > MAX_FAILURE_MESSAGE
+    ? `${message.slice(0, MAX_FAILURE_MESSAGE - 1)}…`
+    : message;
+}
+
 /**
  * Report a Deployment failure that will not resolve by waiting, e.g. a ResourceQuota
  * or admission rejection (`ReplicaFailure`/`FailedCreate`) or an exceeded progress
  * deadline. Returns `undefined` while the rollout is merely in progress.
+ * The conditions are level-triggered: Kubernetes clears `ReplicaFailure` on the next
+ * successful sync, so a brief flip back to Provisioning is expected and harmless.
  */
 function deploymentFailure(deployment: Resource): DeploymentFailure | undefined {
   const status = deployment.status as
@@ -396,9 +407,11 @@ function deploymentFailure(deployment: Resource): DeploymentFailure | undefined 
   if (replicaFailure)
     return {
       reason: replicaFailure.reason || 'ReplicaFailure',
-      message: `Backing service deployment ${name} cannot create pods: ${
-        replicaFailure.message || 'replica creation failed'
-      }`,
+      message: boundedMessage(
+        `Backing service deployment ${name} cannot create pods: ${
+          replicaFailure.message || 'replica creation failed'
+        }`,
+      ),
     };
   const progressing = conditions.find(
     (c) =>
@@ -407,9 +420,11 @@ function deploymentFailure(deployment: Resource): DeploymentFailure | undefined 
   if (progressing)
     return {
       reason: 'ProgressDeadlineExceeded',
-      message: `Backing service deployment ${name} did not become ready: ${
-        progressing.message || 'progress deadline exceeded'
-      }`,
+      message: boundedMessage(
+        `Backing service deployment ${name} did not become ready: ${
+          progressing.message || 'progress deadline exceeded'
+        }`,
+      ),
     };
   return undefined;
 }
@@ -424,6 +439,7 @@ export {
   type DeploymentFailure,
   deploymentFailure,
   endpointFor,
+  MAX_FAILURE_MESSAGE,
   mergeSizing,
   PROVIDER_RUNTIME,
   parseCpu,

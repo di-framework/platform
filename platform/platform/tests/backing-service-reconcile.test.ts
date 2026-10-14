@@ -4,6 +4,7 @@ import {
   backingServiceResourceName,
   backingServiceResources,
   deploymentFailure,
+  MAX_FAILURE_MESSAGE,
   mergeSizing,
   PROVIDER_RUNTIME,
   parseCpu,
@@ -469,6 +470,45 @@ describe('backing service reconciliation', () => {
     };
     await controller.reconcileBackingService(stock, t, classes);
     expect(stock.status?.conditions?.[0]).toMatchObject({ status: 'False', reason: 'Suspended' });
+  });
+
+  it('caps copied runtime messages at about 1 KiB', () => {
+    const denial = `admission webhook "policy.example" denied the request: ${'x'.repeat(5000)}`;
+    const failure = deploymentFailure({
+      apiVersion: 'apps/v1',
+      kind: 'Deployment',
+      metadata: { name: 'di-bs-stock', generation: 1 },
+      spec: { replicas: 1 },
+      status: {
+        observedGeneration: 1,
+        conditions: [
+          { type: 'ReplicaFailure', status: 'True', reason: 'FailedCreate', message: denial },
+        ],
+      },
+    });
+    expect(MAX_FAILURE_MESSAGE).toBe(1024);
+    expect(failure?.message).toHaveLength(MAX_FAILURE_MESSAGE);
+    expect(failure?.message.endsWith('…')).toBe(true);
+    expect(failure?.message).toStartWith(
+      'Backing service deployment di-bs-stock cannot create pods: admission webhook',
+    );
+    const deadline = deploymentFailure({
+      apiVersion: 'apps/v1',
+      kind: 'Deployment',
+      metadata: { name: 'di-bs-stock' },
+      spec: { replicas: 1 },
+      status: {
+        conditions: [
+          {
+            type: 'Progressing',
+            status: 'False',
+            reason: 'ProgressDeadlineExceeded',
+            message: 'y'.repeat(2000),
+          },
+        ],
+      },
+    });
+    expect(deadline?.message).toHaveLength(MAX_FAILURE_MESSAGE);
   });
 
   it('reads deployment failures only from current, non-transient conditions', () => {

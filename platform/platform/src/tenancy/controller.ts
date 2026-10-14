@@ -1229,7 +1229,15 @@ export class Controller {
         [INSTALLATION]: this.cfg.installation,
         [OWNER]: service.metadata.uid!,
       });
-      const state = postgresReadiness(pvc, deployments, pods);
+      let state = postgresReadiness(pvc, deployments, pods);
+      if (!tenant.spec.suspended && state.reason === 'Initializing') {
+        // Quota/admission rejections leave no pods, so only the Deployment explains the wait.
+        const failure = deployments
+          .filter((d) => (d.spec as { replicas?: number }).replicas !== 0)
+          .map((d) => deploymentFailure(d))
+          .find((f) => f !== undefined);
+        if (failure) state = { ready: false, ...failure };
+      }
       await this.status(
         service,
         !tenant.spec.suspended && state.ready,
