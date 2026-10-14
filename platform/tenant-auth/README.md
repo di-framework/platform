@@ -392,7 +392,9 @@ revision of a service/env is the one its live WorkloadDeployment names, whatever
 ConfigMap marks say: list, stats and the default rollback target use it. A `pending` revision
 the workload names reads as `live`, and any other `live` revision as `replaced`, so history
 repairs itself after a crash between apply and mark and after out-of-order concurrent applies.
-Reads only report the repair (viewers stay read-only); the next deploy writes it.
+Reads only report the repair (viewers stay read-only); the next deploy writes it. A revision
+repaired to `replaced` went live, but no deploy observed how its rollout ended: unless a status
+was recorded, it lists as `rolling`, and the repair writes that status.
 
 The namespace quota allows `count/configmaps: 100`, shared with `di-vars-<env>`, the `di-logs-*`
 projections and `kube-root-ca.crt`, so history is bounded (constants in `src/v1/deploy.ts`):
@@ -402,13 +404,18 @@ projections and `kube-root-ca.crt`, so history is bounded (constants in `src/v1/
   first. A revision a WorkloadDeployment runs is never evicted; the last revision of a
   destroyed or renamed service is.
 
-If the revisions running workloads alone fill the budget (only possible when a tenant's
-`spec.resources.workloads` quota is above 40), the deploy answers 507 before anything is
-applied. Pruning happens before the revision is created. If the quota still refuses it (403
+If the revisions running workloads alone fill the budget (40 or more running workloads, only
+possible when a tenant's `spec.resources.workloads` quota is at least 40), a deploy of a service
+that runs no revision answers 507 before anything is applied. A deploy or rollback of a service
+that runs one still goes ahead: the revision it replaces becomes evictable, and the next deploy
+prunes it. Each such deploy holds one revision over the budget meanwhile, so K concurrent
+redeploys can briefly reach 40 + K revisions; the `count/configmaps: 100` quota still bounds
+them. Pruning happens before the revision is created. If the quota still refuses it (403
 `exceeded quota`), the deploy answers 507 before anything is applied. Revisions edited by hand
 out of this shape (non-integer label, name not matching the labels, bad `component`
 annotation, unknown state) are skipped and logged as `deploy.revision-skipped`. A rollback
-target whose `data.bundle` does not match `data.digest`, or is not a complete bundle, is a 422.
+target whose `data.bundle` does not match `data.digest`, or is not a complete bundle, is a 422;
+one a concurrent deploy pruned after the history was read is a 404.
 
 ## HTTP surface
 
