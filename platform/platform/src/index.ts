@@ -32,7 +32,9 @@ import {
   type RuntimeNatsConfig,
   type TenantAuthConfig,
   tenantAuthRoutes,
+  unsetPublicUrls,
   userTokenSecretName,
+  withDerivedPublicUrls,
 } from './tenancy/resources';
 import { secretReaderFromKubeconfig } from './token-secret-reader';
 import { waitForTokenSecret } from './token-wait';
@@ -142,8 +144,16 @@ export function createPlatform(args: PlatformArgs) {
   });
   const tenantHostImage = config.get('tenantHostImage') ?? DEFAULT_HOST_IMAGE;
   assertHostImageSupportsAllowlist(tenantHostImage, insecureRegistries);
-  const tenantAuth = config.getObject<TenantAuthConfig>('tenantAuth');
-  assertTenantAuthConfig(tenantAuth);
+  const configuredTenantAuth = config.getObject<TenantAuthConfig>('tenantAuth');
+  assertTenantAuthConfig(configuredTenantAuth);
+  // Unset tenant-auth public URLs default to gateway routes (#128); explicit URLs are kept.
+  const tenantAuth = withDerivedPublicUrls(configuredTenantAuth, routeUrlPattern);
+  const notDerived = unsetPublicUrls(tenantAuth);
+  if (routeUrlPattern !== undefined && notDerived.length)
+    pulumi.log.warn(
+      `tenantAuth.${notDerived.join(', tenantAuth.')} not derived from routeUrlPattern ${routeUrlPattern} ` +
+        '(only http://{host}.{tenant}.localhost[:<port>] is routed to tenant-auth); the 127.0.0.1 defaults apply',
+    );
   const runtimeNats = args.runtimeNats ?? config.getObject<RuntimeNatsConfig>('runtimeNats');
   assertRuntimeNatsConfig(runtimeNats);
   const backingServiceClasses = resolveBackingServiceClasses(config);

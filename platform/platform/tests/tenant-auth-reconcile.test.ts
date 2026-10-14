@@ -30,7 +30,9 @@ import {
   tenantResources,
   tlsCertDigest,
   type User,
+  unsetPublicUrls,
   VERSION,
+  withDerivedPublicUrls,
 } from '../src/tenancy/resources';
 import {
   caCertificate,
@@ -1474,6 +1476,108 @@ describe('tenant-auth gateway routes (#58:routes)', () => {
     expect(problems({ controllerPublicUrl: 'https://console.{tenant}.localhost:28180' })).toEqual([
       'tenantAuth.controllerPublicUrl must not share the console host',
     ]);
+  });
+
+  it('derives unset public URLs from routeUrlPattern so they are routed (#128)', () => {
+    const { consolePublicUrl: _c, ...bare } = auth;
+    const registry = { component: `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}` };
+    const derived = withDerivedPublicUrls({ ...bare, registry }, pattern);
+    expect(derived).toEqual({
+      ...bare,
+      consolePublicUrl: 'http://console.{tenant}.localhost:28180',
+      controllerPublicUrl: 'https://controller.{tenant}.localhost:28180',
+      registry: { ...registry, publicUrl: 'https://registry.{tenant}.localhost:28180' },
+    });
+    expect(tenantAuthRoutes(derived, pattern)).toEqual({
+      routes: { console: 'console', controller: 'controller', registry: 'registry' },
+      urls: {
+        console: 'http://console.{tenant}.localhost:28180',
+        controller: 'https://controller.{tenant}.localhost:28180',
+        registry: 'https://registry.{tenant}.localhost:28180',
+      },
+      problems: [],
+    });
+    // Without a registry none is invented; without a port the TLS hosts name the gateway's 80.
+    const portless = withDerivedPublicUrls(bare, 'http://{host}.{tenant}.localhost');
+    expect(portless).toEqual({
+      ...bare,
+      consolePublicUrl: 'http://console.{tenant}.localhost',
+      controllerPublicUrl: 'https://controller.{tenant}.localhost:80',
+    });
+    expect(tenantAuthRoutes(portless, 'http://{host}.{tenant}.localhost').problems).toEqual([]);
+    // No gateway or no tenantAuth: nothing derived, the 127.0.0.1 defaults still apply.
+    expect(withDerivedPublicUrls(bare, undefined)).toBe(bare);
+    expect(withDerivedPublicUrls(undefined, pattern)).toBeUndefined();
+  });
+
+  it('keeps explicit public URLs over the derived defaults (#128)', () => {
+    const explicit: TenantAuthConfig = {
+      ...auth,
+      consolePublicUrl: 'http://ui.{tenant}.localhost:28180',
+      controllerPublicUrl: 'https://127.0.0.1:8788',
+      registry: {
+        component: `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}`,
+        publicUrl: 'https://oci.{tenant}.localhost:28180',
+      },
+    };
+    expect(withDerivedPublicUrls(explicit, pattern)).toBe(explicit);
+    // Only the unset one is derived.
+    const { controllerPublicUrl: _k, ...partial } = explicit;
+    expect(withDerivedPublicUrls(partial, pattern)).toEqual({
+      ...explicit,
+      controllerPublicUrl: 'https://controller.{tenant}.localhost:28180',
+    });
+  });
+
+  it('keeps the 127.0.0.1 defaults for a routeUrlPattern the gateway does not route (#128)', () => {
+    const { consolePublicUrl: _c, ...bare } = auth;
+    for (const unrouted of [
+      'https://{host}.{tenant}.localhost:28180',
+      'http://{host}.{tenant}.example.com:28180',
+    ]) {
+      expect(withDerivedPublicUrls(bare, unrouted)).toBe(bare);
+      expect(tenantAuthRoutes(bare, unrouted)).toEqual({ routes: {}, urls: {}, problems: [] });
+    }
+    expect(unsetPublicUrls(bare)).toEqual(['consolePublicUrl', 'controllerPublicUrl']);
+  });
+
+  it('derives the gateway port from an explicit :80 pattern (#128)', () => {
+    const { consolePublicUrl: _c, ...bare } = auth;
+    const pattern80 = 'http://{host}.{tenant}.localhost:80';
+    const derived = withDerivedPublicUrls(bare, pattern80);
+    expect(derived).toEqual({
+      ...bare,
+      consolePublicUrl: 'http://console.{tenant}.localhost',
+      controllerPublicUrl: 'https://controller.{tenant}.localhost:80',
+    });
+    expect(tenantAuthRoutes(derived, pattern80)).toMatchObject({
+      routes: { console: 'console', controller: 'controller' },
+      problems: [],
+    });
+  });
+
+  it('renders the derived URLs into the console and controller settings (#128)', () => {
+    const { consolePublicUrl: _c, ...bare } = auth;
+    const registry = { component: `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}` };
+    const derivedCfg: ControllerConfig = {
+      ...cfg,
+      routeUrlPattern: pattern,
+      tenantAuth: withDerivedPublicUrls({ ...bare, registry }, pattern),
+    };
+    const resources = tenantAuthResources(tenant(), derivedCfg, {
+      ...inputs,
+      registryServing: true,
+    });
+    expect(env(find(resources, 'Deployment', 'tenant-console') as Deployment)).toMatchObject({
+      TENANT_CONSOLE_PUBLIC_URL: 'http://console.alpha.localhost:28180',
+      TENANT_CONSOLE_CONTROLLER_PUBLIC_URL: 'https://controller.alpha.localhost:28180',
+    });
+    expect(env(find(resources, 'Deployment', 'tenant-controller') as Deployment)).toMatchObject({
+      TENANT_CONTROLLER_REGISTRY_URL: 'https://registry.alpha.localhost:28180',
+    });
+    expect(tenantControllerCertNames('alpha', derivedCfg.tenantAuth).dns).toEqual(
+      expect.arrayContaining(['controller.alpha.localhost', 'registry.alpha.localhost']),
+    );
   });
 
   it('admits the gateway to the routed ports only and publishes the URLs', () => {

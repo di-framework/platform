@@ -176,6 +176,40 @@ allowlisted registry and pull everything else over TLS. Check three things befor
   roll. A single-host tenant such as `identity` (`maxSurge: 0, maxUnavailable: 1`) is unavailable
   while its one host restarts, so plan the upgrade for a quiet window.
 
+#### Upgrading to tenant-auth URLs derived from `routeUrlPattern` (#128)
+
+- **Who is affected.** Installs with config `tenantAuth` set, at least one of
+  `tenantAuth.consolePublicUrl`, `tenantAuth.controllerPublicUrl` or (with a registry)
+  `tenantAuth.registry.publicUrl` unset, and a routable `routeUrlPattern`
+  (`http://{host}.{tenant}.localhost[:<port>]`). That is every local install, whose entrypoint
+  always sets the pattern, and every existing-cluster install whose pattern is set or derived
+  from a loopback `http://` `httpEndpoint`. Installs without `tenantAuth`, with all of these
+  URLs set, or with any other pattern keep their URLs. On the first `pulumi up` with this
+  version, the unset URLs change for every Tenant, existing ones included (`<port>` is the
+  gateway port, `28180` on a default local install):
+  - Console: `http://127.0.0.1:8787` becomes `http://console.<tenant>.localhost:<port>`, so its
+    OAuth callback becomes `http://console.<tenant>.localhost:<port>/oidc/callback`.
+  - Controller: users and CLIs are shown `https://controller.<tenant>.localhost:<port>` instead
+    of `https://127.0.0.1:8788`. The controller certificate is reissued with that name; it still
+    covers `127.0.0.1`, so existing port-forward kubeconfigs keep working.
+  - Registry: users log in to `https://registry.<tenant>.localhost:<port>` instead of
+    `https://127.0.0.1:8790`.
+  - Workload hosts: the gateway routes `console.<tenant>.localhost`,
+    `controller.<tenant>.localhost` and `registry.<tenant>.localhost` to the tenant's console,
+    controller and registry front, so a tenant workload served on one of those route hosts is
+    no longer reachable there. Move it to another host first.
+- **To adopt the new URLs**, register `http://console.<tenant>.localhost:<port>/oidc/callback`
+  for every tenant as a redirect URI on the shared OAuth client (`tenantAuth.oauthClient.id`)
+  before `pulumi up`. Until it is registered, console login fails for that tenant.
+- **To keep the previous `127.0.0.1` URLs**, set them explicitly before upgrading (skip the
+  registry line without `tenantAuth.registry`):
+
+  ```bash
+  pulumi config set --path tenantAuth.consolePublicUrl http://127.0.0.1:8787
+  pulumi config set --path tenantAuth.controllerPublicUrl https://127.0.0.1:8788
+  pulumi config set --path tenantAuth.registry.publicUrl https://127.0.0.1:8790
+  ```
+
 ### Tenant removal and namespace retention
 
 Each `tenants` entry takes `deletionPolicy` (`Retain` or `Delete`, default `Retain`). The
@@ -798,11 +832,11 @@ tenantAuth:
   issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80  # optional, for a loopback issuer
   issuerUpstreamPodPort: 8080                                # optional, the pod port behind it
   issuerIp: 192.0.2.7                                        # optional, when pods cannot resolve the issuer
-  consolePublicUrl: http://console.{tenant}.localhost:28180  # optional; default http://127.0.0.1:8787
-  controllerPublicUrl: https://127.0.0.1:8788                # optional
+  consolePublicUrl: http://console.{tenant}.localhost:28180  # optional; default derived from routeUrlPattern, else http://127.0.0.1:8787
+  controllerPublicUrl: https://controller.{tenant}.localhost:28180  # optional; default derived from routeUrlPattern, else https://127.0.0.1:8788
   registry:                                                  # optional: each tenant's own OCI registry (#83)
     component: ghcr.io/di-framework/oci-registry@sha256:29ec834c5f515e99146437c831e9f8bf25c98f32079afd9e715335d9f00ba270  # required, pinned by digest
-    publicUrl: https://registry.{tenant}.localhost:28180     # optional; default https://127.0.0.1:8790
+    publicUrl: https://registry.{tenant}.localhost:28180     # optional; default derived from routeUrlPattern, else https://127.0.0.1:8790
     limits:                                                  # optional; each field optional, defaults shown
       maxBodyBytes: 536870912                                # TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES
       upstreamTimeoutMs: 60000                               # TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS
@@ -860,9 +894,21 @@ tenantAuth:
   A Secret from before the CA existed (one `CA:TRUE` certificate, no `ca.crt`) is replaced once.
 - Routes: when the platform gateway is published (`routeUrlPattern`), a public URL whose host is
   `<label>.{tenant}.localhost` on the gateway port is routed through it, so a new Tenant gets a
-  reachable console and controller with no script. Set, for example,
-  `consolePublicUrl: http://console.{tenant}.localhost:28180` and
-  `controllerPublicUrl: https://controller.{tenant}.localhost:28180`. The console route is
+  reachable console and controller with no script. `createPlatform` derives every public URL
+  left unset from `routeUrlPattern` (#128), before any resource is created: with
+  `routeUrlPattern: http://{host}.{tenant}.localhost:28180` the defaults are
+  `consolePublicUrl: http://console.{tenant}.localhost:28180`,
+  `controllerPublicUrl: https://controller.{tenant}.localhost:28180` and, with a registry,
+  `registry.publicUrl: https://registry.{tenant}.localhost:28180` (a pattern without a port
+  gives the console no port and the TLS hosts `:80`, the gateway's own). An explicit URL always
+  wins, including a `127.0.0.1` one that keeps that host on a port-forward. Only an
+  `http://{host}.{tenant}.localhost[:<port>]` pattern is derived from, since only those hosts
+  are routed to the pair; with any other pattern (`https://`, another domain) the unset URLs
+  keep the `127.0.0.1` defaults, as before, and `createPlatform` logs a warning naming them.
+  The console's public URL is the one its OAuth redirects use, so the shared OAuth client must
+  accept the derived console callback; see
+  [Upgrading to tenant-auth URLs derived from `routeUrlPattern`](#upgrading-to-tenant-auth-urls-derived-from-routeurlpattern-128).
+  The console route is
   plain HTTP to `tenant-console:8787` with the original `Host`. The controller route is TLS
   passthrough: the gateway reads only the SNI name and pipes the connection to
   `tenant-controller:8788`, so the controller's own certificate (covering the public host) and
@@ -871,9 +917,9 @@ tenantAuth:
   `controllerUrl`. Policies `tenant-console-gateway` and `tenant-controller-gateway` admit only
   the gateway pods, each to its own port, and the gateway's egress gains only those two ports
   in this installation's tenant namespaces. A routed label takes that host away from tenant
-  workloads (`console.<tenant>.localhost` no longer reaches `di-http`). The default
-  `127.0.0.1` URLs, unset URLs, other hosts, and any URL while no gateway is published stay
-  unrouted, as before. A gateway-shaped URL the gateway cannot route (wrong scheme, port, or a
+  workloads (`console.<tenant>.localhost` no longer reaches `di-http`). Explicit `127.0.0.1`
+  URLs, other hosts, and any URL while no gateway is published (the `127.0.0.1` defaults then
+  apply) stay unrouted. A gateway-shaped URL the gateway cannot route (wrong scheme, port, or a
   host shared by both) is reported on `TenantAuthReady` with reason `RouteError`; `Ready` is
   unaffected. The routes are config, not per-Tenant objects: the gateway policies carry the
   `tenant-auth` component label and are removed with the rest of the pair.
@@ -915,7 +961,7 @@ tenantAuth:
     controller, and answers plain HTTP for it with `400`. The gateway knows the registry's
     HTTP host whenever a registry is configured, so that `400` holds even when users reach the
     registry by port-forward (`kubectl port-forward svc/tenant-controller 8790`, the default
-    `https://127.0.0.1:8790`). Credentials therefore never cross plain HTTP off-cluster; the
+    `https://127.0.0.1:8790` when no gateway is published). Credentials therefore never cross plain HTTP off-cluster; the
     front-to-host and registry-to-controller hops are plain HTTP on the pod network, as the
     gateway-to-host hop already is. The alternative, terminating TLS at the gateway, would put
     every tenant's private key in the platform namespace; TLS passthrough keeps keys per tenant.

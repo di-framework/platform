@@ -779,7 +779,8 @@ test('local entrypoint rejects a container CLI with shell metacharacters', () =>
 
 /**
  * Runs `createPlatform` with `config` (unprefixed keys; non-strings are JSON-encoded) and extra
- * `args` source, and returns the gateway Deployment's GATEWAY_CONFIG and config hash, or the error.
+ * `args` source, and returns the gateway Deployment's GATEWAY_CONFIG and config hash and the
+ * platform controller's PLATFORM_CONFIG, or the error.
  */
 function gatewayInstall(
   config: Record<string, unknown>,
@@ -787,6 +788,7 @@ function gatewayInstall(
 ): {
   gatewayConfig?: { routeAliases?: Record<string, string> };
   configHash?: string;
+  platformConfig?: { tenantAuth?: Record<string, unknown> };
   error?: string;
 } {
   const prefixed = Object.fromEntries(
@@ -821,7 +823,9 @@ function gatewayInstall(
     }).then(() => {
       if (error) return console.log(JSON.stringify({ error }));
       const gateway = resources.find(r => r.name === 'http-gateway' && r.type === 'kubernetes:apps/v1:Deployment').inputs.spec.template;
-      console.log(JSON.stringify({ gatewayConfig: JSON.parse(gateway.spec.containers[0].env[0].value), configHash: gateway.metadata.annotations['di-framework.dev/config-hash'] }));
+      const controller = resources.find(r => r.type === 'kubernetes:apps/v1:Deployment' && r.inputs.metadata?.name === 'di-platform-controller').inputs.spec.template;
+      const platformConfig = JSON.parse(controller.spec.containers[0].env.find(e => e.name === 'PLATFORM_CONFIG').value);
+      console.log(JSON.stringify({ gatewayConfig: JSON.parse(gateway.spec.containers[0].env[0].value), configHash: gateway.metadata.annotations['di-framework.dev/config-hash'], platformConfig }));
     }).catch(e => {console.error(e);process.exitCode=1;});
   `,
     ],
@@ -863,6 +867,44 @@ test('install validates config routeAliases and deploys them normalized to the g
     'identity.identity': 'identity.identity-pg',
   });
 }, 120_000);
+
+test('install routes tenant-auth hosts derived from routeUrlPattern through the gateway (#128)', () => {
+  const tenantAuth = {
+    image: `ghcr.io/x/y@sha256:${'a'.repeat(64)}`,
+    issuer: 'https://issuer.example',
+    oauthClient: { id: 'access', secretName: 'tenant-auth-oauth' },
+  };
+  const pattern = `routeUrlPattern: 'http://{host}.{tenant}.localhost:28180'`;
+  const derived = gatewayInstall({ tenantAuth }, pattern);
+  expect(derived.error).toBeUndefined();
+  expect(derived.gatewayConfig).toMatchObject({
+    tenantAuthRoutes: { console: 'console', controller: 'controller' },
+  });
+  // The platform controller renders the console and controller from the same derived URLs.
+  expect(derived.platformConfig?.tenantAuth).toMatchObject({
+    consolePublicUrl: 'http://console.{tenant}.localhost:28180',
+    controllerPublicUrl: 'https://controller.{tenant}.localhost:28180',
+  });
+  // An explicit URL wins: a loopback console stays unrouted.
+  const explicit = gatewayInstall(
+    { tenantAuth: { ...tenantAuth, consolePublicUrl: 'http://127.0.0.1:8787' } },
+    pattern,
+  );
+  expect(explicit.gatewayConfig).toMatchObject({
+    tenantAuthRoutes: { controller: 'controller' },
+  });
+  expect(explicit.gatewayConfig).not.toHaveProperty('tenantAuthRoutes.console');
+  expect(explicit.platformConfig?.tenantAuth?.consolePublicUrl).toBe('http://127.0.0.1:8787');
+  // A pattern the gateway does not route to tenant-auth keeps the 127.0.0.1 defaults, as before.
+  const unrouted = gatewayInstall(
+    { tenantAuth },
+    `routeUrlPattern: 'https://{host}.{tenant}.localhost:28180'`,
+  );
+  expect(unrouted.error).toBeUndefined();
+  expect(unrouted.gatewayConfig).not.toHaveProperty('tenantAuthRoutes');
+  expect(unrouted.platformConfig?.tenantAuth).not.toHaveProperty('consolePublicUrl');
+  expect(unrouted.platformConfig?.tenantAuth).not.toHaveProperty('controllerPublicUrl');
+}, 180_000);
 
 test('install refuses a gateway config key even when PlatformArgs.routeAliases is passed (#217)', () => {
   const result = gatewayInstall(
