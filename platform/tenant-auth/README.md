@@ -95,7 +95,7 @@ checks (close and reopen it) before merging. **Pin consumers by digest**, never 
 published:
 
 ```yaml
-image: ghcr.io/di-framework/tenant-auth@sha256:2cd409ec6a67639fdf09c565b497c2524228e10de7b2cde0bf6d83857b4a1e6c
+image: ghcr.io/di-framework/tenant-auth@sha256:ffb30ae36925c42c7e84049b3f7ce8d7a0481ef9bbbbc0c4d6f1d3c4fa0ea8c8
 ```
 
 Publishing needs the organization to allow Actions to write packages (issue #13).
