@@ -43,6 +43,18 @@ make smoke
 
 `make tools` installs the pinned wasm-tools, wac, and wasi-sdk. `make smoke` needs `wasmtime` on `PATH`.
 
+## Release
+
+Approving the Auto Tag run, or merging the release PR, is what publishes a release.
+
+1. A lockfile change on `main` (or a dispatch of **Auto Tag**) opens a `release/vX.Y.Z` PR with the version bump and enables auto-merge. The run then ends; it does not wait for the PR.
+2. Approve the PR's checks when GitHub holds them for approval. Once they pass, the PR merges.
+3. The merge starts Auto Tag's `tag` job. Approve that run when GitHub holds it for approval. It tags the merge commit `vX.Y.Z` and dispatches `release.yml`, which publishes to npm and creates the GitHub Release.
+
+If the merge's Auto Tag run is never approved, the next Auto Tag run tags and publishes the release first, even when an unrelated lockfile push started it. The `tag` job only tags a commit that is the merge of a `release/vX.Y.Z` PR from this repository and that sets version `X.Y.Z`.
+
+Recovery: dispatch **Auto Tag** with `tag_only: true`. It tags the version on `main` if it is untagged, and dispatches `release.yml` if no Release run exists for that tag. It does not open a new release PR. A Release run that exists but failed is not retried this way; re-run it from the Actions tab.
+
 ## Usage
 
 ### Declare application bindings

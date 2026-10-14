@@ -32,7 +32,7 @@ pub(crate) async fn handle_blob(
                 head,
                 "application/octet-stream".to_string(),
                 digest.to_string(),
-                size as usize,
+                size,
             );
             if head {
                 return Ok(respond_owned(200, headers, Vec::new()));

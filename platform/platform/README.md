@@ -903,7 +903,7 @@ script is removed:
 
 ```yaml
 tenantAuth:
-  image: ghcr.io/di-framework/tenant-auth@sha256:ffb30ae36925c42c7e84049b3f7ce8d7a0481ef9bbbbc0c4d6f1d3c4fa0ea8c8   # required, pinned by digest
+  image: ghcr.io/di-framework/tenant-auth@sha256:c88a07a550dba1b53da12d000da7b102f07e3c20c91aac84249b845812a1fc4c   # required, pinned by digest
   issuer: http://identity.acme.localhost:28180               # identity-server, as pods and browsers name it
   oauthClient: { id: access, secretName: tenant-auth-oauth } # Secret in the platform namespace; key `clientSecret`
   issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80  # optional, for a loopback issuer
@@ -912,7 +912,7 @@ tenantAuth:
   consolePublicUrl: http://console.{tenant}.localhost:28180  # optional; default derived from routeUrlPattern, else http://127.0.0.1:8787
   controllerPublicUrl: https://controller.{tenant}.localhost:28180  # optional; default derived from routeUrlPattern, else https://127.0.0.1:8788
   registry:                                                  # optional: each tenant's own OCI registry (#83)
-    component: ghcr.io/di-framework/oci-registry@sha256:29ec834c5f515e99146437c831e9f8bf25c98f32079afd9e715335d9f00ba270  # required, pinned by digest
+    component: ghcr.io/di-framework/oci-registry@sha256:ce5de5184f0fab3d93b51ff7d83239e83a2f9df1a3a5104d5dd9b015d5534eb0  # required, pinned by digest
     publicUrl: https://registry.{tenant}.localhost:28180     # optional; default derived from routeUrlPattern, else https://127.0.0.1:8790
     limits:                                                  # optional; each field optional, defaults shown
       maxBodyBytes: 536870912                                # TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES
