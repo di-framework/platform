@@ -1132,8 +1132,14 @@ export class Controller {
       await this.reconcilePostgres(service, tenant, cls, sizing);
       return;
     }
-    const desired = backingServiceResources(service, tenant, cls, this.cfg, sizing);
-    const rollout = await this.applyBackingServiceResources(desired);
+    // The live Deployment keeps its data hostPath, so a storage-root change never orphans data.
+    const deploymentPath = `${collection('apps/v1', 'Deployment', runtimeNamespace)}/${backingServiceResourceName(service.metadata.name)}`;
+    const live = await this.get<Resource>(deploymentPath);
+    const desired = backingServiceResources(service, tenant, cls, this.cfg, sizing, live);
+    const rollout = await this.applyBackingServiceResources(
+      desired,
+      new Map([[deploymentPath, live]]),
+    );
     await this.updateBackingServiceStatus(service, tenant, cls, rollout);
   }
 
@@ -1413,11 +1419,12 @@ export class Controller {
 
   private async applyBackingServiceResources(
     desired: Resource[],
+    fetched?: ReadonlyMap<string, Resource | undefined>,
   ): Promise<{ ready: boolean; failure?: DeploymentFailure }> {
     let ready = true;
     let failure: DeploymentFailure | undefined;
     for (const value of desired) {
-      const applied = await this.ensure(value);
+      const applied = await this.ensure(value, false, false, fetched);
       if (value.kind !== 'Deployment') continue;
       if (applied.metadata.name === RUNTIME_DATA_NATS)
         throw new Error(`Refusing to manage runtime data plane ${RUNTIME_DATA_NATS}`);

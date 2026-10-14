@@ -3,7 +3,9 @@ import {
   backingServiceHostPath,
   backingServiceResourceName,
   backingServiceResources,
+  DEFAULT_STORAGE_ROOT,
   deploymentFailure,
+  liveBackingServiceHostPath,
   MAX_FAILURE_MESSAGE,
   mergeSizing,
   PROVIDER_RUNTIME,
@@ -12,10 +14,8 @@ import {
   RUNTIME_DATA_NATS,
   resolveBackingSizing,
   resolveClass,
-  runtimeDataNatsHostPath,
   SERVICE,
   TRANSITIONAL_REDIS,
-  transitionalRedisHostPath,
   validateSizingAgainstClass,
   validateSizingAgainstTenantBudget,
 } from '../src/tenancy/backing-service-reconcile';
@@ -175,12 +175,11 @@ describe('backing service provisioner helpers', () => {
     expect(backingServiceResourceName('stock')).toBe('di-bs-stock');
     expect(RUNTIME_DATA_NATS).toBe('di-nats');
     expect(TRANSITIONAL_REDIS).toBe('di-redis');
-    expect(backingServiceHostPath('alpha-uid', 'stock')).toBe(
-      '/var/lib/k0s/di-tenants/alpha-uid/bs-stock',
+    expect(backingServiceHostPath(cfg, 'alpha-uid', 'stock')).toBe(
+      `${DEFAULT_STORAGE_ROOT}/di-tenants/alpha-uid/bs-stock`,
     );
-    expect(runtimeDataNatsHostPath('alpha-uid')).toBe('/var/lib/k0s/di-tenants/alpha-uid/di-nats');
-    expect(transitionalRedisHostPath('alpha-uid')).toBe(
-      '/var/lib/k0s/di-tenants/alpha-uid/di-redis',
+    expect(backingServiceHostPath({ storageRoot: '/var/lib/kubesolo' }, 'alpha-uid', 'stock')).toBe(
+      '/var/lib/kubesolo/di-tenants/alpha-uid/bs-stock',
     );
     expect(PROVIDER_RUNTIME.redis.image).toBe('redis:7.4.5-alpine');
     expect(PROVIDER_RUNTIME.nats.image).toBe('nats:2.12.8-alpine');
@@ -774,5 +773,90 @@ describe('backing service reconciliation', () => {
     await controller.reconcileBackingService(stock, t, [wrong]);
     expect(stock.status?.conditions?.[0]?.reason).toBe('Failed');
     expect(stock.status?.conditions?.[0]?.message).toContain('does not match');
+  });
+});
+
+describe('backing service storage root (#226)', () => {
+  const deploymentPath = '/apis/apps/v1/namespaces/di-runtime-alpha/deployments/di-bs-stock';
+
+  function dataHostPath(api: MemoryApi): string | undefined {
+    const deployment = api.objects.get(deploymentPath);
+    expect(deployment).toBeDefined();
+    return liveBackingServiceHostPath(deployment, backingService('stock', 'keyvalue'));
+  }
+
+  async function reconcileWith(
+    api: MemoryApi,
+    config: ControllerConfig,
+    t: Tenant,
+    classes: BackingServiceClass[],
+  ): Promise<void> {
+    const stock = backingService('stock', 'keyvalue');
+    api.seed(stock);
+    await new Controller(api, config).reconcileBackingService(stock, t, classes);
+  }
+
+  it('puts a new BackingService under the configured storage root', async () => {
+    const { api, t, classes } = prepare();
+    await reconcileWith(api, { ...cfg, storageRoot: '/var/lib/kubesolo' }, t, classes);
+    expect(dataHostPath(api)).toBe('/var/lib/kubesolo/di-tenants/alpha-uid/bs-stock');
+  });
+
+  it('defaults to /var/lib/k0s when storageRoot is unset', async () => {
+    const { api, t, classes } = prepare();
+    await reconcileWith(api, cfg, t, classes);
+    expect(dataHostPath(api)).toBe('/var/lib/k0s/di-tenants/alpha-uid/bs-stock');
+  });
+
+  it('keeps the legacy hostPath of an existing Deployment so its data stays reachable', async () => {
+    const { api, t, classes } = prepare();
+    await reconcileWith(api, cfg, t, classes);
+    expect(dataHostPath(api)).toBe('/var/lib/k0s/di-tenants/alpha-uid/bs-stock');
+    await reconcileWith(api, { ...cfg, storageRoot: '/var/lib/kubesolo' }, t, classes);
+    expect(dataHostPath(api)).toBe('/var/lib/k0s/di-tenants/alpha-uid/bs-stock');
+  });
+
+  it('leaves an existing Deployment already on the storage-root path unchanged', async () => {
+    const { api, t, classes } = prepare();
+    const config = { ...cfg, storageRoot: '/var/lib/kubesolo' };
+    await reconcileWith(api, config, t, classes);
+    const before = structuredClone(api.objects.get(deploymentPath)?.spec);
+    await reconcileWith(api, config, t, classes);
+    expect(dataHostPath(api)).toBe('/var/lib/kubesolo/di-tenants/alpha-uid/bs-stock');
+    expect(api.objects.get(deploymentPath)?.spec).toEqual(before);
+  });
+
+  it('reads the live Deployment once per reconcile', async () => {
+    const { api, t, classes } = prepare();
+    await reconcileWith(api, cfg, t, classes);
+    api.operations.length = 0;
+    await reconcileWith(api, cfg, t, classes);
+    const reads = api.operations.filter((op) => op.method === 'GET' && op.path === deploymentPath);
+    expect(reads).toHaveLength(1);
+  });
+
+  it('never takes the hostPath of a Deployment owned by another BackingService', () => {
+    const t = tenant();
+    const cls = seedClass('keyvalue');
+    const service = backingService('stock', 'keyvalue');
+    const [foreign] = backingServiceResources(
+      backingService('stock', 'keyvalue', { uid: 'previous-uid' }),
+      t,
+      cls,
+      cfg,
+      mergeSizing(undefined, undefined),
+    );
+    expect(liveBackingServiceHostPath(foreign, service)).toBeUndefined();
+    const resources = backingServiceResources(
+      service,
+      t,
+      cls,
+      { ...cfg, storageRoot: '/var/lib/kubesolo' },
+      mergeSizing(undefined, undefined),
+      foreign,
+    );
+    expect(liveBackingServiceHostPath(resources[0], service)).toBe(
+      '/var/lib/kubesolo/di-tenants/alpha-uid/bs-stock',
+    );
   });
 });
