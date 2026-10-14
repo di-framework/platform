@@ -102,13 +102,31 @@ function legacyEnv(
 }
 
 /**
+ * The /v1 deployment (`<service>-<env>`) whose lines a per-env logs ConfigMap holds (#106), or
+ * undefined for any other projection.
+ */
+function perEnvDeployment(configMap: LogsConfigMap): string | undefined {
+  const env = configMap.metadata.labels?.[ENV];
+  const application = configMap.metadata.labels?.[APPLICATION];
+  return env && application && ENVS.includes(env) ? `${application}-${env}` : undefined;
+}
+
+/**
  * The LogEvents of one logs ConfigMap, oldest first. A line is attributed to the
  * WorkloadDeployment the projection recorded for it (`data.deployments`). A line without one,
  * written before the projection recorded deployments, falls back to the deployment whose
  * newest host failure it reports (`data.failures`), and otherwise to the application. Its env
  * is the one recorded in `data.envs`, else derived as legacyEnv describes.
+ *
+ * `moved` names /v1 deployments that have their own per-env ConfigMap. In a ConfigMap without
+ * an env label (one staging and prod shared before #106), lines recorded for those are
+ * skipped: the projection copied them into the per-env ConfigMap before it publishes anything
+ * there, so serving them here too would repeat them while the migration is incomplete (#316).
  */
-export function logEvents(configMap: LogsConfigMap): ProjectedLogEvent[] {
+export function logEvents(
+  configMap: LogsConfigMap,
+  moved: ReadonlySet<string> = new Set(),
+): ProjectedLogEvent[] {
   const application = configMap.metadata.labels?.[APPLICATION] ?? '';
   const label = configMap.metadata.labels?.[ENV];
   const deployments = projectedDeployments(configMap as never);
@@ -118,6 +136,7 @@ export function logEvents(configMap: LogsConfigMap): ProjectedLogEvent[] {
     failures.find(([, f]) => f.time === timestamp && message === `host: ${f.message}`)?.[0];
   const events: ProjectedLogEvent[] = [];
   for (const [index, line] of projectedLines(configMap as never).entries()) {
+    if (!label && moved.has(deployments?.[index] ?? '')) continue;
     const match = LINE.exec(line);
     if (!match) continue;
     const [, timestamp, level, message] = match as unknown as [string, string, string, string];
@@ -222,7 +241,16 @@ const PROGRESS = new Set(['ADDED', 'MODIFIED', 'DELETED', 'BOOKMARK']);
 const byTime = (a: ProjectedLogEvent, b: ProjectedLogEvent) =>
   a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0;
 
-const listEvents = (list: ConfigMapList) => (list.items ?? []).flatMap(logEvents).sort(byTime);
+/** The /v1 deployments with their own per-env ConfigMap among `configMaps` (see logEvents). */
+const movedDeployments = (configMaps: readonly LogsConfigMap[]) =>
+  new Set(configMaps.flatMap((configMap) => perEnvDeployment(configMap) ?? []));
+
+/** The LogEvents of a list of the service's logs ConfigMaps, each line once, oldest first. */
+export function listEvents(list: ConfigMapList): ProjectedLogEvent[] {
+  const items = list.items ?? [];
+  const moved = movedDeployments(items);
+  return items.flatMap((configMap) => logEvents(configMap, moved)).sort(byTime);
+}
 
 /** Resolves after `ms`, or as soon as the signal aborts. */
 const sleep = (ms: number, signal: AbortSignal) =>
@@ -283,6 +311,8 @@ function stream(
           for (const event of selected) send(sse('log', contractEvent(event)));
           for (const event of events) cursor.sent(event);
         };
+        /** /v1 deployments with a per-env ConfigMap, kept current from the watch (logEvents). */
+        let moved = movedDeployments(first.items ?? []);
         const backlog = listEvents(first);
         deliver(backlog, select(backlog, options));
         if (!follow) {
@@ -303,6 +333,7 @@ function stream(
             'GET',
             `${collection}?labelSelector=${encodeURIComponent(selector)}`,
           );
+          moved = movedDeployments(list.items ?? []);
           const fresh = cursor.fresh(listEvents(list));
           deliver(fresh, select(fresh, live));
           resourceVersion = list.metadata?.resourceVersion ?? '';
@@ -336,10 +367,13 @@ function stream(
                 if (PROGRESS.has(event.type)) delivered = true;
                 if (event.object?.metadata?.resourceVersion)
                   resourceVersion = event.object.metadata.resourceVersion;
+                const object = event.object as LogsConfigMap | undefined;
+                const deployment = object?.metadata ? perEnvDeployment(object) : undefined;
                 if (event.type === 'ADDED' || event.type === 'MODIFIED') {
-                  const fresh = cursor.fresh(logEvents(event.object as LogsConfigMap));
+                  if (deployment) moved.add(deployment);
+                  const fresh = cursor.fresh(logEvents(object as LogsConfigMap, moved));
                   deliver(fresh, select(fresh, live));
-                }
+                } else if (event.type === 'DELETED' && deployment) moved.delete(deployment);
               }
             }
             if (ended || abort.signal.aborted) break;
@@ -373,8 +407,10 @@ function stream(
  * The service's projections are selected by application; `env` keeps the lines of that
  * environment (#106), read from `data.envs`, the per-env ConfigMap's env label, or, in a
  * ConfigMap staging and prod shared before, the recorded deployment. Lines of a workload
- * outside /v1 that shares the service's application name are never served. The `deployment`
- * filter matches the WorkloadDeployment each line is attributed to (see logEvents).
+ * outside /v1 that shares the service's application name are never served. While the shared
+ * ConfigMap is being migrated, its lines of a deployment that already has a per-env ConfigMap
+ * are skipped, so no line is served twice (#316). The `deployment` filter matches the
+ * WorkloadDeployment each line is attributed to (see logEvents).
  */
 async function serveLogs(_command: unknown, call: HttpCall, context: V1Context): Promise<Response> {
   const service = call.request.params?.service ?? '';
