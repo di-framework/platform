@@ -9,6 +9,7 @@ import {
 } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { connect } from 'node:net';
+import { connect as tlsConnect } from 'node:tls';
 import { selfSignedCertificate } from '../../platform/src/tenancy/tls.ts';
 import {
   Controller,
@@ -31,6 +32,7 @@ describe('registry listener keeps the registry Content-Length (#197)', () => {
   const BLOB = new Uint8Array(300_000).map((_, i) => (i * 31) % 251);
   const DIGEST = `sha256:${createHash('sha256').update(BLOB).digest('hex')}`;
   const BLOB_PATH = `/v2/acme/app/blobs/${DIGEST}`;
+  const SIDE_PATH = '/v2/acme/app/blobs/sha256:side';
   /** Last request the upstream saw, and whether it was aborted before its response finished. */
   const seen: { headers?: IncomingHttpHeaders; url?: string; aborted?: boolean } = {};
   const seenUrl = () => seen.url;
@@ -50,6 +52,16 @@ describe('registry listener keeps the registry Content-Length (#197)', () => {
         'content-type': 'application/octet-stream',
         'docker-content-digest': DIGEST,
         'docker-content-length': String(BLOB.length),
+      });
+      return res.end();
+    }
+    if (req.url?.startsWith(SIDE_PATH) && req.method === 'HEAD') {
+      // A registry HEAD whose side header carries the `v` query values as sent (#169).
+      const values = new URL(req.url, 'http://upstream').searchParams.getAll('v');
+      res.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'docker-content-digest': 'sha256:side',
+        'docker-content-length': values.length === 1 ? (values[0] as string) : values,
       });
       return res.end();
     }
@@ -470,4 +482,165 @@ describe('registry listener keeps the registry Content-Length (#197)', () => {
     for (let i = 0; i < 50 && upstreamAborted() !== true; i++) await Bun.sleep(10);
     expect(upstreamAborted()).toBe(true);
   });
+
+  interface Pipelined {
+    method: string;
+    path: string;
+    body?: string;
+  }
+  /**
+   * Writes every request in one go on one connection (HTTP/1.1 pipelining; the last asks to
+   * close) and splits the bytes that come back into one response per request, by their framing.
+   */
+  const pipelined = (listener: 'front' | 'pull', requests: Pipelined[]) =>
+    new Promise<Parsed[]>((resolve, reject) => {
+      const wire = requests
+        .map(({ method, path, body }, i) => {
+          const close = i === requests.length - 1 ? 'connection: close\r\n' : '';
+          const length = body === undefined ? '' : `content-length: ${Buffer.byteLength(body)}\r\n`;
+          return `${method} ${path} HTTP/1.1\r\nhost: x\r\nauthorization: Basic eDpvaw==\r\n${length}${close}\r\n${body ?? ''}`;
+        })
+        .join('');
+      const chunks: Buffer[] = [];
+      const socket =
+        listener === 'front'
+          ? tlsConnect({ host: '127.0.0.1', port: front.port, rejectUnauthorized: false }, () =>
+              socket.write(wire),
+            )
+          : connect(pull.port, '127.0.0.1', () => socket.write(wire));
+      socket.on('data', (chunk: Buffer) => chunks.push(chunk));
+      socket.on('error', reject);
+      socket.on('close', () => {
+        try {
+          resolve(
+            parseResponses(
+              Buffer.concat(chunks),
+              requests.map((r) => r.method),
+            ),
+          );
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+
+  test('pipelined requests on the registry front are each answered in order (#169)', async () => {
+    const responses = await pipelined('front', [
+      { method: 'PATCH', path: '/v2/acme/app/blobs/uploads/1', body: 'hello' },
+      { method: 'GET', path: BLOB_PATH },
+      { method: 'GET', path: BLOB_PATH },
+      { method: 'HEAD', path: BLOB_PATH },
+      { method: 'GET', path: BLOB_PATH },
+    ]);
+    expect(responses.map((r) => r.status)).toEqual([202, 200, 200, 200, 200]);
+    expect(JSON.parse(responses[0]?.body.toString() ?? '')).toEqual({ received: 5 });
+    for (const response of [responses[1], responses[2], responses[4]]) {
+      const body = response?.body ?? Buffer.alloc(0);
+      expect(body).toHaveLength(BLOB.length);
+      expect(`sha256:${createHash('sha256').update(body).digest('hex')}`).toBe(DIGEST);
+    }
+    expect(responses[3]?.headers['content-length']).toEqual([String(BLOB.length)]);
+    expect(responses[3]?.body).toHaveLength(0);
+  });
+
+  test('pipelined requests on the hosts pull listener are each answered in order (#169)', async () => {
+    const responses = await pipelined('pull', [
+      { method: 'GET', path: BLOB_PATH },
+      { method: 'HEAD', path: BLOB_PATH },
+      { method: 'GET', path: BLOB_PATH },
+    ]);
+    expect(responses.map((r) => r.status)).toEqual([200, 200, 200]);
+    expect(responses[0]?.body).toHaveLength(BLOB.length);
+    expect(responses[1]?.headers['content-length']).toEqual([String(BLOB.length)]);
+    expect(responses[2]?.body).toHaveLength(BLOB.length);
+  });
+
+  test('an invalid docker-content-length on HEAD is dropped end to end, framing intact (#169)', async () => {
+    for (const values of [
+      ['abc'],
+      ['-5'],
+      ['1e3'],
+      ['1.5'],
+      ['9007199254740993'],
+      ['99999999999999999999'],
+      ['5, 5'],
+      ['5', '5'],
+    ]) {
+      const query = values.map((v) => `v=${encodeURIComponent(v)}`).join('&');
+      for (const listener of ['front', 'pull'] as const) {
+        // The HEAD with the bad side value, then a good one on the same connection: the second
+        // is parsed where the first ended only if the first carried no stray length.
+        const [bad, good] = await pipelined(listener, [
+          { method: 'HEAD', path: `${SIDE_PATH}?${query}` },
+          { method: 'HEAD', path: BLOB_PATH },
+        ]);
+        expect({ values, listener, status: bad?.status }).toEqual({
+          values,
+          listener,
+          status: 200,
+        });
+        expect(bad?.headers['content-length']).toBeUndefined();
+        expect(bad?.headers['docker-content-length']).toBeUndefined();
+        expect(bad?.headers['docker-content-digest']).toEqual(['sha256:side']);
+        expect(bad?.body).toHaveLength(0);
+        expect(good?.status).toBe(200);
+        expect(good?.headers['content-length']).toEqual([String(BLOB.length)]);
+      }
+    }
+  });
 });
+
+/**
+ * Splits raw HTTP/1.1 responses, one per request method in order: a `HEAD` answer has no body,
+ * any other is framed by `Content-Length`, by chunked encoding, or runs to the end.
+ */
+function parseResponses(raw: Buffer, methods: string[]): Parsed[] {
+  const out: Parsed[] = [];
+  let at = 0;
+  for (const method of methods) {
+    const end = raw.indexOf('\r\n\r\n', at);
+    if (end < 0) throw new Error(`response ${out.length + 1} of ${methods.length} is missing`);
+    const [statusLine = '', ...lines] = raw.subarray(at, end).toString('latin1').split('\r\n');
+    const headers: Record<string, string[]> = {};
+    for (const line of lines) {
+      const colon = line.indexOf(':');
+      const name = line.slice(0, colon).trim().toLowerCase();
+      headers[name] = [...(headers[name] ?? []), line.slice(colon + 1).trim()];
+    }
+    const status = Number(statusLine.split(' ')[1]);
+    at = end + 4;
+    let body: Buffer = Buffer.alloc(0);
+    if (method !== 'HEAD' && ![204, 304].includes(status)) {
+      const length = headers['content-length']?.[0];
+      if (length !== undefined) {
+        body = raw.subarray(at, at + Number(length));
+        at += Number(length);
+      } else if (headers['transfer-encoding']?.[0] === 'chunked') {
+        const parts: Buffer[] = [];
+        for (;;) {
+          const lineEnd = raw.indexOf('\r\n', at);
+          const size = Number.parseInt(raw.subarray(at, lineEnd).toString('latin1'), 16);
+          at = lineEnd + 2;
+          if (size === 0) {
+            at += 2;
+            break;
+          }
+          parts.push(raw.subarray(at, at + size));
+          at += size + 2;
+        }
+        body = Buffer.concat(parts);
+      } else {
+        body = raw.subarray(at);
+        at = raw.length;
+      }
+    }
+    out.push({ status, headers, body });
+  }
+  return out;
+}
+
+interface Parsed {
+  status: number;
+  headers: Record<string, string[]>;
+  body: Buffer;
+}
