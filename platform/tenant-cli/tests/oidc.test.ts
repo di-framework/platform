@@ -43,6 +43,11 @@ test('discovery needs the three endpoints and an ok answer', async () => {
   await expect(discover('https://issuer.test', elsewhere)).rejects.toThrow(
     'token_endpoint is not under the issuer',
   );
+  const { fetch: spoofed } = fakeFetch({
+    'GET /.well-known/openid-configuration': () =>
+      Response.json({ ...metadata, issuer: 'https://evil.test' }),
+  });
+  await expect(discover('https://issuer.test', spoofed)).rejects.toThrow('different issuer');
   const { fetch: down } = fakeFetch({});
   await expect(discover('https://issuer.test', down)).rejects.toMatchObject({
     name: 'OidcError',
@@ -120,9 +125,10 @@ test('code and refresh grants send the public client id only, and surface OAuth 
   });
 });
 
-test('revocation posts the token with the client id and swallows failures', async () => {
+test('revocation posts the token with the client id and surfaces failures', async () => {
   const { fetch, calls } = fakeFetch({
     'POST /oauth2/revoke': () => new Response(null, { status: 200 }),
+    'POST /revoke2': () => new Response(null, { status: 200 }),
   });
   await revokeToken(metadata, 'tenant-cli', 'rt', fetch);
   expect(calls[0]).toMatchObject({
@@ -136,8 +142,28 @@ test('revocation posts the token with the client id and swallows failures', asyn
     fetch,
   );
   expect(calls[1]?.url).toBe('https://issuer.test/revoke2');
+  await expect(
+    revokeToken({ ...metadata, revocation_endpoint: 'https://evil.test/revoke' }, 'c', 't', fetch),
+  ).rejects.toThrow('issuer origin');
   const down = (async () => {
     throw new TypeError('offline');
   }) as unknown as typeof globalThis.fetch;
-  await expect(revokeToken(metadata, 'c', 't', down)).resolves.toBeUndefined();
+  await expect(revokeToken(metadata, 'c', 't', down)).rejects.toThrow('offline');
+  const refused = (async () =>
+    new Response(null, { status: 503 })) as unknown as typeof globalThis.fetch;
+  await expect(revokeToken(metadata, 'c', 't', refused)).rejects.toThrow('503');
+});
+
+test('revocation never sends the token to an origin other than the expected issuer', async () => {
+  const { fetch, calls } = fakeFetch({});
+  await expect(
+    revokeToken(
+      { ...metadata, issuer: 'https://evil.test' },
+      'c',
+      'SECRET',
+      fetch,
+      'https://issuer.test',
+    ),
+  ).rejects.toThrow('issuer origin');
+  expect(calls).toEqual([]);
 });

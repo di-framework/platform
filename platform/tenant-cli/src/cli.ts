@@ -342,12 +342,19 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
         // An expired or already revoked token; nothing to tell the controller.
       }
       if (credential.via === 'identity' && credential.refreshToken && credential.issuer) {
-        await revokeToken(
-          await discover(credential.issuer, io.fetch),
-          credential.clientId ?? '',
-          credential.refreshToken,
-          io.fetch,
-        );
+        try {
+          await revokeToken(
+            await discover(credential.issuer, io.fetch),
+            credential.clientId ?? '',
+            credential.refreshToken,
+            io.fetch,
+            credential.issuer,
+          );
+        } catch (error) {
+          io.stderr(
+            `warning: failed to revoke token at ${credential.issuer}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
       }
       delete store[account];
       writeStore(store, io.env);
