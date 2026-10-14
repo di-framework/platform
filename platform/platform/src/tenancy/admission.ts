@@ -923,6 +923,64 @@ export function tenantSecretUpdateDenial(input: {
   return undefined;
 }
 
+/** Denial for a tenant controller's write to a Secret that is not one of its API keys (#321). */
+export const TENANT_CONTROLLER_SECRET_MESSAGE =
+  'the tenant controller may only create and delete its API-key Secrets (di-apikey-<id>, labelled with its tenant)';
+const TENANT_CONTROLLER_USER = /^system:serviceaccount:[^:]+:tenant-controller$/;
+const API_KEY_SECRET = /^di-apikey-[0-9a-f]{16}$/;
+
+/**
+ * The tenant controller's RBAC covers every Secret in its runtime namespace, because API-key
+ * Secrets have generated names that `resourceNames` cannot list (#115 S2). This limits its
+ * writes there to what `tenant-auth/src/keys.ts` does: create and delete `di-apikey-<16 hex>`
+ * Secrets labelled as API keys of the namespace's tenant. It can no longer replace or delete the
+ * OAuth client, TLS or registry pull Secrets beside them.
+ */
+function tenantControllerSecretsPolicy(): AdmissionPolicy {
+  // `object` on CREATE, `oldObject` on DELETE (the other one is null).
+  const apiKey = (secret: string) => `(
+    ${secret}.metadata.name.matches('${API_KEY_SECRET.source}') &&
+    has(${secret}.metadata.labels) &&
+    '${GROUP}/api-key' in ${secret}.metadata.labels &&
+    ${secret}.metadata.labels['${GROUP}/api-key'] == 'true' &&
+    '${TENANT}' in ${secret}.metadata.labels &&
+    request.namespace == 'di-runtime-' + ${secret}.metadata.labels['${TENANT}'])`;
+  return {
+    name: 'tenant-controller-secrets',
+    apiGroups: [''],
+    apiVersions: ['v1'],
+    operations: ['CREATE', 'UPDATE', 'DELETE'],
+    resources: ['secrets'],
+    validations: [
+      {
+        expression: `!request.userInfo.username.matches('${TENANT_CONTROLLER_USER.source}') ||
+          (request.operation == 'CREATE' && ${apiKey('object')}) ||
+          (request.operation == 'DELETE' && ${apiKey('oldObject')})`,
+        message: TENANT_CONTROLLER_SECRET_MESSAGE,
+      },
+    ],
+  };
+}
+
+/** Mirrors the `tenant-controller-secrets` CEL rule (#321). */
+export function tenantControllerSecretAllowed(input: {
+  username: string;
+  operation: 'CREATE' | 'UPDATE' | 'DELETE';
+  namespace: string;
+  name: string;
+  labels?: Record<string, string>;
+}): boolean {
+  if (!TENANT_CONTROLLER_USER.test(input.username)) return true;
+  const labels = input.labels ?? {};
+  return (
+    input.operation !== 'UPDATE' &&
+    API_KEY_SECRET.test(input.name) &&
+    labels[`${GROUP}/api-key`] === 'true' &&
+    labels[TENANT] !== undefined &&
+    input.namespace === `di-runtime-${labels[TENANT]}`
+  );
+}
+
 function ownershipLabelsExpression(installation: string): string {
   return `!has(object.metadata.labels) || (
     (!('${OWNER}' in object.metadata.labels)) &&
@@ -947,6 +1005,7 @@ export function admissionResources(
     backendConfigPolicy(namespace),
     tenantSecretDeletePolicy(namespace),
     tenantSecretUpdatePolicy(namespace),
+    tenantControllerSecretsPolicy(),
     {
       name: 'services',
       apiGroups: [''],

@@ -139,53 +139,32 @@ export function installTenancy(args: {
       { provider, dependsOn, retainOnDelete: opts.retainOnDelete },
     );
   }
-  function create(
-    value: Resource,
-    dependsOn: pulumi.Resource[] = args.dependsOn,
-    opts: { retainOnDelete?: boolean } = {},
-  ): pulumi.CustomResource {
-    const name = `${value.kind.toLowerCase()}-${value.metadata.name}`;
-    if (value.apiVersion === 'v1') {
-      if (value.kind === 'ServiceAccount')
-        return new k8s.core.v1.ServiceAccount(
-          name,
-          { metadata: value.metadata },
-          { provider, dependsOn },
-        );
-      if (value.kind === 'ConfigMap')
-        return new k8s.core.v1.ConfigMap(
-          name,
-          { metadata: value.metadata, data: value.data as Record<string, string> },
-          { provider, dependsOn },
-        );
-      throw new Error(`Unsupported core resource ${value.kind}`);
-    }
-    return createCustom(value, dependsOn, opts);
-  }
   // CRDs use retainOnDelete so Pulumi destroy/upgrade does not cascade-delete tenant
   // BackingService / ServiceBinding instances if the cluster outlives the stack.
   // Full volume/data retention for BackingService is owned by #453.
-  const definitions = crds.map((value) => create(value, args.dependsOn, { retainOnDelete: true }));
+  const definitions = crds.map((value) =>
+    createCustom(value, args.dependsOn, { retainOnDelete: true }),
+  );
   const policies = admissionResources(
     installation,
     namespace,
     registryHttpHost(args.tenantAuth),
-  ).map((value) => create(value));
+  ).map((value) => createCustom(value));
   const script = loadControllerScripts();
   const scriptHash = controllerScriptHash(script);
-  const serviceAccount = create({
-    apiVersion: 'v1',
-    kind: 'ServiceAccount',
-    metadata: { name: 'di-platform-controller', namespace },
-  });
+  const serviceAccount = new k8s.core.v1.ServiceAccount(
+    'serviceaccount-di-platform-controller',
+    { metadata: { name: 'di-platform-controller', namespace } },
+    { provider, dependsOn: args.dependsOn },
+  );
   // TokenRequest in this namespace only (#115), for the per-tenant TokenRequest Roles it writes.
-  const namespaceRole = create({
+  const namespaceRole = createCustom({
     apiVersion: 'rbac.authorization.k8s.io/v1',
     kind: 'Role',
     metadata: { name: `${installation}-controller`, namespace },
     rules: controllerNamespaceRoleRules(),
   });
-  const namespaceBinding = create(
+  const namespaceBinding = createCustom(
     {
       apiVersion: 'rbac.authorization.k8s.io/v1',
       kind: 'RoleBinding',
@@ -201,7 +180,7 @@ export function installTenancy(args: {
   );
   // The ClusterRole drops `escalate` (#115), so it waits for the namespaced TokenRequest grant:
   // the running controller keeps writing the per-tenant TokenRequest Roles across `pulumi up`.
-  const role = create(
+  const role = createCustom(
     {
       apiVersion: 'rbac.authorization.k8s.io/v1',
       kind: 'ClusterRole',
@@ -210,7 +189,7 @@ export function installTenancy(args: {
     },
     [namespaceBinding],
   );
-  const binding = create(
+  const binding = createCustom(
     {
       apiVersion: 'rbac.authorization.k8s.io/v1',
       kind: 'ClusterRoleBinding',
@@ -224,13 +203,12 @@ export function installTenancy(args: {
     },
     [role, serviceAccount],
   );
-  const scripts = create({
-    apiVersion: 'v1',
-    kind: 'ConfigMap',
-    metadata: { name: 'di-platform-controller', namespace },
-    data: script,
-  });
-  const network = create({
+  const scripts = new k8s.core.v1.ConfigMap(
+    'configmap-di-platform-controller',
+    { metadata: { name: 'di-platform-controller', namespace }, data: script },
+    { provider, dependsOn: args.dependsOn },
+  );
+  const network = createCustom({
     apiVersion: 'networking.k8s.io/v1',
     kind: 'NetworkPolicy',
     metadata: { name: 'di-tenant-scheduler', namespace },
@@ -280,7 +258,7 @@ export function installTenancy(args: {
       definitions,
     ),
   );
-  const controller = create(
+  const controller = createCustom(
     {
       apiVersion: 'apps/v1',
       kind: 'Deployment',

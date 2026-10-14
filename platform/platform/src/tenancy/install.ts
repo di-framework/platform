@@ -79,8 +79,8 @@ export type ControllerClusterRoleRule = {
 };
 
 /**
- * The fixed-name Roles the controller binds (#115): the tenant roles members are bound to, the
- * log reader it binds to itself, and the tenant controller's Secret roles. The per-tenant
+ * The fixed-name Roles the controller binds (#115): the tenant roles members are bound to and the
+ * tenant controller's Secret roles. It binds no Role to itself (#321). The per-tenant
  * `di-tenant-controller-<tenant>` Role and ClusterRole are not listed (`resourceNames` has no
  * wildcard); the controller holds every rule in them, which is all a binding needs without `bind`.
  */
@@ -89,7 +89,6 @@ export const CONTROLLER_BOUND_ROLES = [
   'di-viewer',
   'di-runtime-developer',
   'di-runtime-viewer',
-  'di-platform-log-reader',
   'tenant-controller-keys',
   'tenant-controller-secret-reader',
 ] as const;
@@ -196,6 +195,7 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
     { apiGroups: [''], resources: ['pods'], verbs: ['get', 'list', 'watch'] },
     // Held so it can write the tenant viewer and developer Roles without `escalate` (#115).
     { apiGroups: [''], resources: ['events'], verbs: ['get', 'list', 'watch'] },
+    // Also how it reads hostgroup logs for the console logs projection (#10).
     { apiGroups: [''], resources: ['pods/log'], verbs: ['get'] },
     { apiGroups: [''], resources: ['pods/portforward'], verbs: ['create'] },
     // The API server endpoints each tenant controller's egress policy allows (#58).
