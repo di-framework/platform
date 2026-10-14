@@ -108,9 +108,12 @@ async function fakeIssuer(): Promise<Issuer> {
 interface Controller extends FakeServer {
   /** Paths that answer with a non-JSON 500, to exercise unexpected failures. */
   broken: Set<string>;
+  /** Paths that answer with a controller error status and message. */
+  failing: Map<string, { status: number; message: string }>;
 }
 function fakeController(): Controller {
   const broken = new Set<string>();
+  const failing = new Map<string, { status: number; message: string }>();
   const key = {
     id: '0123456789abcdef',
     name: 'ci',
@@ -122,6 +125,8 @@ function fakeController(): Controller {
   const ns = 'di-tenant-acme';
   const server = serve((request) => {
     if (broken.has(request.pathname)) return new Response('not json', { status: 200 });
+    const failure = failing.get(request.pathname);
+    if (failure) return json({ message: failure.message }, failure.status);
     switch (`${request.method} ${request.pathname}`) {
       case 'GET /-/whoami':
         return json({ account: 'acme', user: 'alice', role: 'admin', via: 'oidc' });
@@ -157,7 +162,7 @@ function fakeController(): Controller {
         return json({ message: 'no such thing' }, 404);
     }
   });
-  return Object.assign(server, { broken });
+  return Object.assign(server, { broken, failing });
 }
 
 let issuer: Issuer;
@@ -182,6 +187,7 @@ afterEach(() => {
   issuer.gate = undefined;
   issuer.refreshes.length = 0;
   controller.broken.clear();
+  controller.failing.clear();
 });
 
 const config = (overrides: Partial<ConsoleConfig> = {}): ConsoleConfig => ({
@@ -356,7 +362,9 @@ describe('Console', () => {
     issuer.omitIdToken = true;
     const response = await signIn(app);
     expect(response.status).toBe(502);
-    expect(await response.text()).toContain('returned no ID token');
+    const page = await response.text();
+    expect(page).toContain('Something went wrong');
+    expect(page).not.toContain('returned no ID token');
   });
 
   test('signs a browser in and renders pages as the user', async () => {
@@ -406,7 +414,9 @@ describe('Console', () => {
     expect(unknown.headers.get('location')).toBe('/keys');
     const failed = await post(app, '/keys/fedcba9876543210/revoke', '', origin);
     expect(failed.status).toBe(500);
-    expect(await failed.text()).toContain('controller returned 500');
+    const failedPage = await failed.text();
+    expect(failedPage).toContain('Something went wrong');
+    expect(failedPage).not.toContain('controller returned 500');
   });
 
   test('hands the CLI its tokens through a one-time code', async () => {
@@ -584,6 +594,26 @@ describe('unexpected failures', () => {
     const logged = JSON.parse(String(log.mock.calls.at(-1)?.[0]));
     expect(logged).toMatchObject({ event: 'request.failed', route: 'GET /members' });
     expect(logged.reason).toContain('SyntaxError');
+  });
+
+  test('a controller 502 shows a generic page, not its message (#84)', async () => {
+    const cookie = await session(app);
+    controller.failing.set('/-/members', {
+      status: 502,
+      message:
+        'GET /api/v1/namespaces/wasmcloud/serviceaccounts failed: TypeError: https://10.0.0.1:6443',
+    });
+    log.mockClear();
+    const response = await get(app, '/members', { cookie });
+    expect(response.status).toBe(502);
+    const page = await response.text();
+    expect(page).toContain('Something went wrong');
+    expect(page).not.toContain('Access denied');
+    expect(page).not.toContain('10.0.0.1');
+    expect(page).not.toContain('serviceaccounts');
+    const logged = JSON.parse(String(log.mock.calls.at(-1)?.[0]));
+    expect(logged).toMatchObject({ event: 'request.failed', route: 'GET /members', status: 502 });
+    expect(logged.reason).toContain('10.0.0.1');
   });
 
   test('the API answers a generic 500', async () => {
