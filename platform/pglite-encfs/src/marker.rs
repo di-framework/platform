@@ -16,20 +16,28 @@ pub const MARKER_TMP_NAME: &str = ".di-encfs.tmp";
 pub const MARKER_MAGIC: &[u8; 8] = b"DIPGKEY1";
 pub const MARKER_LEN: usize = MARKER_MAGIC.len() + KCV_LEN;
 
-/// Entries that do not make a root "non-empty": ext4 volume roots (PVCs)
-/// always carry `lost+found`, and the marker files are ours.
+/// The directory ext4 volume roots (PVCs) always carry. fsck reconnects
+/// orphaned inodes there, so on an encrypted volume it can hold sealed files
+/// as well as fragments; see [`crate::rotation`].
+pub const LOST_AND_FOUND: &str = "lost+found";
+
+/// Entries that do not make a root "non-empty": `lost+found`, and the marker
+/// files, which are ours.
 pub fn is_volume_metadata(name: &str) -> bool {
-    name == "lost+found" || is_marker_name(name)
+    name == LOST_AND_FOUND || is_marker_name(name)
 }
 
-fn is_marker_name(name: &str) -> bool {
+/// The marker or its temporary file.
+pub fn is_marker_name(name: &str) -> bool {
     name == MARKER_NAME || name == MARKER_TMP_NAME
 }
 
-/// Whether `path`, relative to a preopen root, names a marker file once `.`,
-/// `..` and repeated slashes are resolved. pglite must never reach them.
-pub fn is_marker_path(path: &str) -> bool {
-    let mut parts: Vec<&str> = Vec::new();
+/// The components of `path`, relative to a preopen root, with `.`, `..` and
+/// repeated slashes resolved. `..` never climbs above the root: the host
+/// refuses such paths, and treating them as the root keeps the checks below
+/// on the safe side.
+fn normalize(path: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
     for part in path.split('/') {
         match part {
             "" | "." => {}
@@ -39,7 +47,20 @@ pub fn is_marker_path(path: &str) -> bool {
             name => parts.push(name),
         }
     }
-    matches!(parts.as_slice(), [name] if is_marker_name(name))
+    parts
+}
+
+/// Whether `path`, relative to a preopen root, names a marker file once `.`,
+/// `..` and repeated slashes are resolved. pglite must never reach them.
+pub fn is_marker_path(path: &str) -> bool {
+    matches!(normalize(path).as_slice(), [name] if is_marker_name(name))
+}
+
+/// Whether `path`, relative to a preopen root, names the root itself once
+/// normalized (`.`, `pglite/..`, ...). A descriptor opened that way must keep
+/// the root's marker guard and listing filter (#207).
+pub fn is_root_path(path: &str) -> bool {
+    normalize(path).is_empty()
 }
 
 pub fn encode(kcv: &Kcv) -> [u8; MARKER_LEN] {
@@ -265,6 +286,33 @@ mod tests {
             "a/../b/.di-encfs",
         ] {
             assert!(!is_marker_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn root_paths_are_recognized_after_normalization() {
+        // #207: `open-at(".")` on the root must yield a guarded root descriptor.
+        for path in [
+            "",
+            ".",
+            "./",
+            "/",
+            "//",
+            "..",
+            "pglite/..",
+            "pglite/data/../..",
+            "./pglite/../.",
+        ] {
+            assert!(is_root_path(path), "{path}");
+        }
+        for path in [
+            "pglite",
+            "pglite/data/..",
+            "./pglite",
+            ".di-encfs",
+            "lost+found",
+        ] {
+            assert!(!is_root_path(path), "{path}");
         }
     }
 
