@@ -784,12 +784,17 @@ async function reserve(
   );
 }
 
-/** Read-modify-writes a revision's annotations, re-reading after a 409; a deleted one is skipped. */
+/**
+ * Read-modify-writes a revision's annotations, re-reading after a 409; a deleted one is skipped.
+ * `defaults` are set only where the re-read object lacks them, so a value a concurrent deploy
+ * recorded since the history was read wins over one guessed from that read.
+ */
 async function annotate(
   user: UserKube,
   tenant: string,
   name: string,
   change: Record<string, string>,
+  defaults: Record<string, string> = {},
 ): Promise<void> {
   const path = `${configmapsPath(tenant)}/${name}`;
   for (let attempt = 0; attempt < UPDATE_ATTEMPTS; attempt++) {
@@ -799,7 +804,10 @@ async function annotate(
     try {
       await user.call('PUT', path, {
         ...object,
-        metadata: { ...metadata, annotations: { ...metadata.annotations, ...change } },
+        metadata: {
+          ...metadata,
+          annotations: { ...defaults, ...metadata.annotations, ...change },
+        },
       });
       return;
     } catch (error) {
@@ -924,10 +932,13 @@ async function rollout(
       });
     for (const mark of view.marks)
       if (mark.revision !== previous && !evict.includes(mark.revision))
-        await annotate(user, tenant, nameOf(mark.revision), {
-          [STATE]: mark.state,
-          ...(mark.status ? { [STATUS]: mark.status } : {}),
-        });
+        await annotate(
+          user,
+          tenant,
+          nameOf(mark.revision),
+          { [STATE]: mark.state },
+          mark.status ? { [STATUS]: mark.status } : {},
+        );
   } catch (error) {
     console.log(
       JSON.stringify({

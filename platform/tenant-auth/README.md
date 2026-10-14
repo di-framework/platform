@@ -407,8 +407,10 @@ projections and `kube-root-ca.crt`, so history is bounded (constants in `src/v1/
 If the revisions running workloads alone fill the budget (40 or more running workloads, only
 possible when a tenant's `spec.resources.workloads` quota is at least 40), a deploy of a service
 that runs no revision answers 507 before anything is applied. A deploy or rollback of a service
-that runs one still goes ahead: the revision it replaces becomes evictable, so the tenant holds
-at most one revision over the budget until the next deploy prunes it. Pruning happens before the revision is created. If the quota still refuses it (403
+that runs one still goes ahead: the revision it replaces becomes evictable, and the next deploy
+prunes it. Each such deploy holds one revision over the budget meanwhile, so K concurrent
+redeploys can briefly reach 40 + K revisions; the `count/configmaps: 100` quota still bounds
+them. Pruning happens before the revision is created. If the quota still refuses it (403
 `exceeded quota`), the deploy answers 507 before anything is applied. Revisions edited by hand
 out of this shape (non-integer label, name not matching the labels, bad `component`
 annotation, unknown state) are skipped and logged as `deploy.revision-skipped`. A rollback

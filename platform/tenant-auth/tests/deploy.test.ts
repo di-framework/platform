@@ -62,6 +62,8 @@ describe('/v1/deploy', () => {
   const raced = new Set<string>();
   /** Paths a concurrent deploy deletes just before this one reads them: the GET gets a 404. */
   const pruned = new Set<string>();
+  /** Runs once before the next GET of a path, as a concurrent writer would act. */
+  const beforeRead = new Map<string, () => void>();
   /** Answers the WorkloadDeployment list with this status, as a refused or failing read would. */
   let workloadListFailure: number | undefined;
   const api = serve((request: Recorded) => {
@@ -107,6 +109,9 @@ describe('/v1/deploy', () => {
     }
     if (request.method === 'GET') {
       if (pruned.delete(request.pathname)) stored.delete(request.pathname);
+      const hook = beforeRead.get(request.pathname);
+      beforeRead.delete(request.pathname);
+      hook?.();
       const object = stored.get(request.pathname);
       return object ? json(object) : json({ message: 'not found' }, 404);
     }
@@ -182,6 +187,7 @@ describe('/v1/deploy', () => {
     putConflicts = 0;
     raced.clear();
     pruned.clear();
+    beforeRead.clear();
     workloadListFailure = undefined;
     caller = alice;
     for (const env of ['prod', 'staging']) seedSecret('api-token', env);
@@ -1245,6 +1251,24 @@ describe('/v1/deploy', () => {
       const rollback = await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
       expect(((await rollback.json()) as Json).id).toBe('web-prod.4');
       expect(appliedReplicas()).toBe(2);
+    });
+
+    test('a repair keeps a status a concurrent deploy recorded after the history read', async () => {
+      await deployed(withReplicas(1));
+      putConflicts = UPDATE_ATTEMPTS;
+      await deployed(withReplicas(2));
+      expect(stateOf('web-prod.1')).toBe('live');
+      // Between this deploy's history read and its repair, another deploy records `ready`.
+      const key = `${REVISIONS}web-prod.1`;
+      beforeRead.set(key, () => {
+        const object = stored.get(key) as { metadata: { annotations: Json } };
+        object.metadata.annotations['platform.di-framework.dev/status'] = 'ready';
+      });
+      await deployed(withReplicas(3));
+      expect(beforeRead.size).toBe(0);
+      expect(stateOf('web-prod.1')).toBe('replaced');
+      expect(statusOf('web-prod.1')).toBe('ready');
+      expect((await listed()).at(-1)).toEqual(['web-prod.1', 'ready']);
     });
 
     test('out-of-order concurrent applies: the revision the workload runs is the live one', async () => {
