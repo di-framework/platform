@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'bun:test';
-import { evaluate } from '@marcbachmann/cel-js';
 import {
   SECRET_UPDATE_KEYS_MESSAGE,
   SECRET_UPDATE_MANAGED_MESSAGE,
   tenantSecretUpdateDenial,
 } from '../src/tenancy/admission';
+import { evaluate } from './support/cel';
 import {
   controller,
   developer,
