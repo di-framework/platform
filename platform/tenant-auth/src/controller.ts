@@ -433,26 +433,34 @@ const json = (body: unknown, code = 200) =>
  */
 const isV1 = (pathname: string) => pathname.startsWith('/v1/');
 
-/** The `/v1` bearer challenge (RFC 6750); a presented credential that failed is `invalid_token`. */
+/** The `/v1` bearer challenge (RFC 6750). */
 const BEARER_CHALLENGE = 'Bearer realm="di-framework-tenant"';
+
+/**
+ * A non-empty bearer token was sent. Only then does a 401 say `invalid_token`: a request with no
+ * credential, another scheme, or an empty `Bearer` gets the bare challenge (RFC 6750 §3.1).
+ */
+const BEARER_PRESENTED = /^Bearer\s+\S/i;
 
 /**
  * An {@link AuthError} as a `/v1` problem: 401 carries the bearer challenge. The detail is the
  * error's fixed message, which never quotes the credential (platform#97).
  */
-function v1Refusal(error: AuthError, presented: boolean): Response {
+function v1Refusal(error: AuthError, authorization: string | null): Response {
   const response = problem(error.status, TITLES[error.status] ?? 'Client Error', error.message);
   if (error.status === 401)
     response.headers.set(
       'www-authenticate',
-      presented ? `${BEARER_CHALLENGE}, error="invalid_token"` : BEARER_CHALLENGE,
+      BEARER_PRESENTED.test(authorization ?? '')
+        ? `${BEARER_CHALLENGE}, error="invalid_token"`
+        : BEARER_CHALLENGE,
     );
   return response;
 }
 
 /** An {@link AuthError} in the caller's shape: a problem under `/v1/`, a Kubernetes Status elsewhere. */
 function refusal(request: Request, url: URL, error: AuthError): Response {
-  if (isV1(url.pathname)) return v1Refusal(error, request.headers.has('authorization'));
+  if (isV1(url.pathname)) return v1Refusal(error, request.headers.get('authorization'));
   return status(error.status, error.status === 401 ? 'Unauthorized' : 'Forbidden', error.message);
 }
 
@@ -750,7 +758,7 @@ export class Controller {
           reason: error.message,
         });
         if (error.status === 503) return this.serviceUnavailableUntilDiscovery();
-        return v1Refusal(error, authorization !== null);
+        return v1Refusal(error, authorization);
       }
       this.audit('request.failed', {
         path: url.pathname,

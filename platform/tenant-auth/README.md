@@ -427,8 +427,9 @@ Controller: `GET /-/healthz` (open); `GET /-/whoami`, `GET|POST /-/keys`, `DELET
 
 Errors under `/v1/` are RFC 9457 `application/problem+json`, including the authentication refusals
 raised before dispatch (platform#97): a missing or rejected credential is `401` with
-`WWW-Authenticate: Bearer realm="di-framework-tenant"` (plus `error="invalid_token"` when a
-credential was sent), and a suspended account or a caller without a membership is `403`. An
+`WWW-Authenticate: Bearer realm="di-framework-tenant"` (plus `error="invalid_token"` only when a
+non-empty bearer token was sent; another scheme or an empty `Bearer` gets the bare challenge, as
+RFC 6750 §3.1 asks), and a suspended account or a caller without a membership is `403`. An
 identity or cluster outage is a `502` with a fixed detail. The detail never quotes the
 credential. `/-/` and the Kubernetes proxy keep the Kubernetes `Status` body.
 
