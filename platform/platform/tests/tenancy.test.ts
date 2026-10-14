@@ -347,35 +347,54 @@ describe('tenant and user resource reconciliation', () => {
     expect(t.status?.conditions?.[0]?.status).toBe('True');
   });
   it('reports a logs ConfigMap write that keeps failing on the Tenant, then clears it (#316)', async () => {
-    const { controller, t } = prepare();
+    const { api, controller, t } = prepare();
     const failures = (
       controller as unknown as {
         logWriteFailures: Map<string, Map<string, { count: number; message: string }>>;
       }
     ).logWriteFailures;
     const logs = () => t.status?.conditions?.find((c) => c.type === 'LogsProjected');
+    const statusWrites = () =>
+      api.operations.filter((o) => o.method === 'PATCH' && o.path.endsWith('/tenants/alpha/status'))
+        .length;
+    const fail = (count: number, message = 'quota') =>
+      failures.set('alpha', new Map([['di-logs-web.prod', { count, message }]]));
     // One failed poll is not reported yet.
-    failures.set('alpha', new Map([['di-logs-web.prod', { count: 1, message: 'quota' }]]));
+    fail(1);
     await controller.reconcileTenant(t);
     expect(logs()).toBeUndefined();
-    failures.set('alpha', new Map([['di-logs-web.prod', { count: 3, message: 'quota' }]]));
+    fail(3);
     await controller.reconcileTenant(t);
     // Ready is untouched: projection is best effort.
     expect(t.status?.conditions?.[0]).toMatchObject({ type: 'Ready', status: 'True' });
     expect(logs()).toMatchObject({
       status: 'False',
       reason: 'WriteFailed',
-      message: 'logs ConfigMap di-logs-web.prod failed on 3 polls in a row: quota',
+      message: 'logs ConfigMap di-logs-web.prod could not be written: quota',
     });
+    // While the same failure lasts, the Tenant status is not written again.
+    const written = statusWrites();
     const since = logs()?.lastTransitionTime;
-    failures.set('alpha', new Map([['di-logs-web.prod', { count: 4, message: 'quota' }]]));
+    for (const count of [4, 5, 6]) {
+      fail(count);
+      await controller.reconcileTenant(t);
+    }
+    expect(statusWrites()).toBe(written);
+    expect(logs()?.lastTransitionTime).toBe(since);
+    // A different error is reported, once.
+    fail(7, 'forbidden');
     await controller.reconcileTenant(t);
+    fail(8, 'forbidden');
+    await controller.reconcileTenant(t);
+    expect(statusWrites()).toBe(written + 1);
+    expect(logs()?.message).toBe('logs ConfigMap di-logs-web.prod could not be written: forbidden');
     expect(logs()?.lastTransitionTime).toBe(since);
     failures.delete('alpha');
     await controller.reconcileTenant(t);
     expect(logs()).toBeUndefined();
     expect(t.status?.conditions?.[0]).toMatchObject({ type: 'Ready', status: 'True' });
   });
+
   it('refuses to adopt a foreign namespace', async () => {
     const { api, controller, t } = prepare();
     api.seed({ apiVersion: 'v1', kind: 'Namespace', metadata: { name: names('alpha').namespace } });

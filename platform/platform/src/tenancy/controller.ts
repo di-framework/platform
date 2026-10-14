@@ -2192,8 +2192,9 @@ export class Controller {
       );
       // Re-read a short window before the cursor so a service failure logged just after a
       // tick still sees its `Starting workload` line. The floor below drops repeated lines
-      // and failures merge idempotently. While a write keeps failing, the cursor stays put; the
-      // read is then bounded like the first one, and the ring by appendRing.
+      // and failures merge idempotently. While a write keeps failing, its key's cursor stays
+      // put. While any write or delete of this tenant is failing, every pod read is bounded like
+      // the first one, and the ring by appendRing.
       const query = oldest
         ? `sinceTime=${encodeURIComponent(
             new Date(Date.parse(oldest) - LOG_LOOKBACK_MS).toISOString().replace(/\.\d+Z$/, 'Z'),
@@ -2213,7 +2214,9 @@ export class Controller {
           floor = newestStamp(projectedRing(current.get(id)));
           podCursors.set(id, floor);
         }
-        const fresh = entries.filter((entry) => entry.time > (floor as string));
+        // A line stamped exactly at the floor is read again: another pod (or a later write of
+        // this one) can log a distinct line with the same stamp. unpublished drops the repeats.
+        const fresh = entries.filter((entry) => entry.time >= (floor as string));
         for (const entry of entries) if (entry.time > newest) newest = entry.time;
         incoming.set(id, [
           ...(incoming.get(id) ?? []),

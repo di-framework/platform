@@ -834,13 +834,18 @@ WorkloadDeployment in `data.failures`.
   ConfigMap is not pruned or deleted until its lines have been taken over.
 - The read cursor is kept per host pod and projection key, and moves only once that
   key's ConfigMap is written. The lines of a refused write are read again and
-  published on the next successful poll; lines the ConfigMap already holds (for
-  example from a write that applied but reported an error) are not appended again.
-  While a write keeps failing, each read is bounded to the last 1000 lines and the
-  ring to its usual 200. A write or delete refused on 3 polls in a row is reported on
-  the Tenant as condition `LogsProjected` `False` with reason `WriteFailed`, naming
-  the ConfigMap and the error; the condition is removed once it succeeds. `Ready` is
-  not affected.
+  published on the next successful poll. Lines the ConfigMap already holds (for
+  example from a write that applied but reported an error) are not appended again,
+  and once the ring is full, neither are lines older than its oldest line, so the
+  ring keeps the newest 200.
+- While any logs ConfigMap write or delete of a tenant is failing (including the
+  delete of an unrelated stale ConfigMap), every host pod read for that tenant is
+  bounded to its last 1000 lines. The ring keeps its usual 200.
+- A write or delete refused on 3 polls in a row is reported on the Tenant as
+  condition `LogsProjected` `False` with reason `WriteFailed`, naming the ConfigMap
+  and the error. The message stays the same while the failure lasts, so the Tenant
+  status is not rewritten on every poll. The condition is removed once the write
+  succeeds. `Ready` is not affected.
 
 - Source: the `hostgroup-<tenant>` pod logs. The controller's ClusterRole holds
   `pods/log get` cluster-wide (#115), because the runtime viewer and developer Roles
@@ -894,10 +899,12 @@ WorkloadDeployment in `data.failures`.
   is dropped. Entries of deployments that left the
   application are dropped on the next write, so the key stays bounded by its member
   count.
-- A restarted controller resumes after the newest published line, so lines are not
-  repeated. That is the newest timestamp anywhere in the ring, not its last line: lines
-  of several host pods are appended per poll and need not be in order across polls. Failures are merged newest-wins by deployment from everything it re-reads,
-  so none are lost, including ones older than that line.
+- A restarted controller resumes from the newest published line, so lines are not
+  repeated. That is the newest timestamp anywhere in the ring, not its last line:
+  lines of several host pods are appended per poll and need not be in order across
+  polls. A distinct line with exactly that timestamp (for example from another pod)
+  is still published. Failures are merged newest-wins by deployment from everything
+  it re-reads, so none are lost, including ones older than that line.
 - `di-framework.dev/logs: "false"` on a WorkloadDeployment (written by the CLI for
   `"logs": false`) stops its `wasi:logging` lines from being published. Its host
   failure lines and `data.failures` entry are still published: they are platform

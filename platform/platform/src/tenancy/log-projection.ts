@@ -533,12 +533,29 @@ export function newestStamp(ring: readonly (string | RingLine)[]): string {
  * The incoming lines the ring does not hold yet (#316). A write the API applied but reported
  * as failed (e.g. a timeout) is retried with the same lines; those are dropped here, so a
  * retry never publishes a line twice. A line is identified by its text, which starts with
- * its sub-second timestamp, and its deployment.
+ * its sub-second timestamp, and its deployment; a ring line without a recorded deployment
+ * (published before deployments were recorded) matches its text alone. Once the ring is full, a line older than its
+ * oldest line is dropped too: the applied write may have evicted it already, and appending it
+ * again would push newer lines out.
  */
-export function unpublished(ring: readonly RingLine[], incoming: readonly RingLine[]): RingLine[] {
+export function unpublished(
+  ring: readonly RingLine[],
+  incoming: readonly RingLine[],
+  max = MAX_LINES,
+): RingLine[] {
   const id = (entry: RingLine) => `${entry.deployment}\n${entry.line}`;
-  const published = new Set(ring.map(id));
-  return incoming.filter((entry) => !published.has(id(entry)));
+  const stamp = (entry: RingLine) => entry.line.split(' ')[0] as string;
+  const published = new Set(ring.map((entry) => (entry.deployment ? id(entry) : entry.line)));
+  const oldest =
+    ring.length >= max
+      ? ring.reduce(
+          (min, entry) => (stamp(entry) < min ? stamp(entry) : min),
+          stamp(ring[0] as RingLine),
+        )
+      : '';
+  return incoming.filter(
+    (entry) => !published.has(id(entry)) && !published.has(entry.line) && stamp(entry) >= oldest,
+  );
 }
 
 /** A projection ConfigMap write or delete that failed, and on how many polls in a row. */
@@ -570,7 +587,9 @@ export function logWriteCondition(
     type: 'LogsProjected',
     status: 'False',
     reason: 'WriteFailed',
-    message: `logs ConfigMap ${name} failed on ${failure.count} polls in a row${more}: ${failure.message}`,
+    // No poll count: the message stays the same while the failure lasts, so the Tenant status
+    // is not rewritten on every poll.
+    message: `logs ConfigMap ${name} could not be written${more}: ${failure.message}`,
     observedGeneration: generation,
     lastTransitionTime: new Date().toISOString(),
   };
