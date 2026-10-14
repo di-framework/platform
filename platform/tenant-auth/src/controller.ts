@@ -135,6 +135,13 @@ export interface ControllerConfig {
 export const WHOAMI_MAX_BODY_BYTES = 1024;
 
 /**
+ * Most connections the whoami listener holds at once. Only the tenant hosts' registry calls it;
+ * while plain HTTP is accepted too, each connection holds three sockets (see
+ * `RegistryListenerOptions.maxConnections`).
+ */
+export const WHOAMI_MAX_CONNECTIONS = 256;
+
+/**
  * The whoami listener (platform#83) on `port`: with `tls`, TLS with the controller certificate
  * (platform#113), which the tenant hosts trust through `--http-client-ca-path`, and plain HTTP on
  * the same port unless `whoamiTlsOnly`, for a registry whose config still names `http://` while
@@ -154,6 +161,7 @@ export function serveWhoamiListener(
     // Token refreshes through the identity guest can take longer than Bun's 10 s default.
     idleTimeoutSeconds: 120,
     maxRequestBodySize: WHOAMI_MAX_BODY_BYTES,
+    maxConnections: WHOAMI_MAX_CONNECTIONS,
     fetch: (request) => controller.handleWhoami(request),
   });
 }

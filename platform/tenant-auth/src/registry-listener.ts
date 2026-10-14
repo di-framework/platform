@@ -14,7 +14,9 @@
  * and a request signal that aborts when the client goes away.
  *
  * The whoami listener uses it too (platform#113): over TLS, and for callers still configured with
- * an `http://` URL during an upgrade, over plain HTTP on the same port (`acceptPlainHttp`).
+ * an `http://` URL during an upgrade, over plain HTTP on the same port (`acceptPlainHttp`). The
+ * relay that serves both passes the client's own address on to the handler, so the option is safe
+ * on any listener that reads it.
  */
 import {
   createServer as createHttpServer,
@@ -41,10 +43,16 @@ export interface RegistryListenerOptions {
   /**
    * With `tls`, also answer plain-HTTP clients on the same port: a connection whose first byte
    * opens a TLS handshake is served over TLS, any other over plain HTTP. Each protocol is served
-   * by its own listener on loopback, so the handler sees `127.0.0.1` as the client address.
-   * Without `tls` it changes nothing.
+   * by its own listener on loopback; the handler still sees the client's own address, not the
+   * loopback hop's. Without `tls` it changes nothing.
    */
   acceptPlainHttp?: boolean;
+  /**
+   * Most client connections held open at once; further ones are closed as they arrive. Unset: no
+   * limit. With `acceptPlainHttp`, each one holds three sockets (client, relay hop, and the inner
+   * listener's end of it), so this bounds three times as many descriptors.
+   */
+  maxConnections?: number;
   /** A socket with no data flow for this long is closed. */
   idleTimeoutSeconds: number;
   /** Largest request body accepted, declared or chunked; larger ones are answered 413. */
@@ -73,36 +81,60 @@ const TLS_HANDSHAKE = 0x16;
 
 /**
  * TLS and plain HTTP on one port (`acceptPlainHttp`): each connection is relayed, by its first
- * byte, to a loopback listener for its protocol. The relay ends both sides together, and the
- * idle timeout applies to the client socket as well as to the inner listeners.
+ * byte, to a loopback listener for its protocol. The idle timeout applies to the client socket as
+ * well as to the inner listeners.
+ *
+ * A client may half-close once its request is sent (`allowHalfOpen`): its end is passed on to the
+ * inner listener and the response still comes back. The relay hop's local port names the client
+ * it carries, so the inner listeners hand the handler the client's address rather than loopback.
  */
 async function serveTlsAndPlain(
   options: RegistryListenerOptions,
   tls: { cert: string; key: string },
 ): Promise<RegistryListener> {
-  const inner = { ...options, hostname: '127.0.0.1', port: 0, acceptPlainHttp: false };
+  // The client address behind each relay hop, by the hop's local port.
+  const clients = new Map<number, string>();
+  const addressOf = (socket: Socket) =>
+    socket.remotePort === undefined ? undefined : clients.get(socket.remotePort);
+  const inner = {
+    ...options,
+    hostname: '127.0.0.1',
+    port: 0,
+    acceptPlainHttp: false,
+    maxConnections: undefined,
+  };
   // Loopback on a free port each: these do not fail where the public port could.
-  const secure = await serveSingle({ ...inner, tls });
-  const plain = await serveSingle({ ...inner, tls: undefined });
+  const secure = await serveSingle({ ...inner, tls }, addressOf);
+  const plain = await serveSingle({ ...inner, tls: undefined }, addressOf);
   const stopInner = () => Promise.all([secure.stop(), plain.stop()]).then(() => {});
   const sockets = new Set<Socket>();
-  const server = createNetServer((client) => {
+  const server = createNetServer({ allowHalfOpen: true }, (client) => {
     sockets.add(client);
     client.once('close', () => sockets.delete(client));
     client.on('error', () => client.destroy());
     client.setTimeout(options.idleTimeoutSeconds * 1000, () => client.destroy());
+    // A client that ends before sending anything has nothing to relay.
+    const ended = () => client.destroy();
+    client.once('end', ended);
     client.once('data', (first: Buffer) => {
+      client.off('end', ended);
       client.pause();
       const target = first[0] === TLS_HANDSHAKE ? secure.port : plain.port;
       const upstream = connect(target, '127.0.0.1');
       sockets.add(upstream);
+      let hop: number | undefined;
       upstream.once('close', () => {
         sockets.delete(upstream);
-        client.destroy();
+        if (hop !== undefined) clients.delete(hop);
+        // After a complete response the pipe has ended the client, which then closes once that
+        // is flushed; otherwise the inner side failed and nothing more will come.
+        if (!client.writableEnded) client.destroy();
       });
       upstream.on('error', () => upstream.destroy());
       client.once('close', () => upstream.destroy());
       upstream.once('connect', () => {
+        hop = upstream.localPort;
+        if (hop !== undefined && client.remoteAddress) clients.set(hop, client.remoteAddress);
         upstream.write(first);
         client.pipe(upstream);
         upstream.pipe(client);
@@ -110,6 +142,7 @@ async function serveTlsAndPlain(
       });
     });
   });
+  if (options.maxConnections !== undefined) server.maxConnections = options.maxConnections;
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(options.port, options.hostname, () => {
@@ -133,7 +166,14 @@ async function serveTlsAndPlain(
   };
 }
 
-async function serveSingle(options: RegistryListenerOptions): Promise<RegistryListener> {
+/**
+ * One `node:http(s)` server. `addressOf`, set for the relay's inner listeners, names the client
+ * behind a connection; without it the connection's own peer address is the client's.
+ */
+async function serveSingle(
+  options: RegistryListenerOptions,
+  addressOf?: (socket: Socket) => string | undefined,
+): Promise<RegistryListener> {
   const addresses = new WeakMap<Request, string>();
   const client: ClientAddress = {
     requestIP: (request) => {
@@ -143,7 +183,8 @@ async function serveSingle(options: RegistryListenerOptions): Promise<RegistryLi
   };
   const handle = (req: IncomingMessage, res: ServerResponse) => {
     // Anything unexpected still gets an answer when none has started; otherwise the connection ends.
-    serveOne(req, res, options, client, addresses).catch(() =>
+    const address = addressOf ? addressOf(req.socket) : req.socket.remoteAddress;
+    serveOne(req, res, options, client, addresses, address).catch(() =>
       res.headersSent ? res.destroy() : res.writeHead(500, { connection: 'close' }).end(),
     );
   };
@@ -153,6 +194,7 @@ async function serveSingle(options: RegistryListenerOptions): Promise<RegistryLi
   // Uploads may take long; only idleness ends them (the handler has its own stall timeout).
   server.requestTimeout = 0;
   server.setTimeout(options.idleTimeoutSeconds * 1000, (socket) => socket.destroy());
+  if (options.maxConnections !== undefined) server.maxConnections = options.maxConnections;
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(options.port, options.hostname, () => {
@@ -177,6 +219,7 @@ async function serveOne(
   options: RegistryListenerOptions,
   client: ClientAddress,
   addresses: WeakMap<Request, string>,
+  address: string | undefined,
 ): Promise<void> {
   const method = req.method ?? 'GET';
   const declared = req.headers['content-length'];
@@ -208,7 +251,7 @@ async function serveOne(
     signal: gone.signal,
     duplex: 'half',
   } as RequestInit);
-  if (req.socket.remoteAddress) addresses.set(request, req.socket.remoteAddress);
+  if (address) addresses.set(request, address);
   let response: Response;
   try {
     response = await options.fetch(request, client);
