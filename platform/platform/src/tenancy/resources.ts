@@ -1161,7 +1161,27 @@ function tenantResources(
   }
   return result;
 }
-function userResources(user: User, tenants: Tenant[], cfg: ControllerConfig): Resource[] {
+/** Whether the controller has reconciled the tenant's current spec. */
+function tenantReady(tenant: Tenant): boolean {
+  return !!tenant.status?.conditions?.some(
+    (c) =>
+      c.type === 'Ready' &&
+      c.status === 'True' &&
+      c.observedGeneration === tenant.metadata.generation,
+  );
+}
+/**
+ * Access a user should hold. A membership is granted once its tenant is Ready. While the tenant
+ * is merely Not Ready (for example reconciling a new generation), a membership in `granted`
+ * (already bound) is kept, so its token Secret survives. Missing, suspended and deleting tenants
+ * always lose access.
+ */
+function userResources(
+  user: User,
+  tenants: Tenant[],
+  cfg: ControllerConfig,
+  granted: ReadonlySet<string> = new Set(),
+): Resource[] {
   if (user.spec.suspended || user.metadata.deletionTimestamp) return [];
   const make = (
     apiVersion: string,
@@ -1180,12 +1200,7 @@ function userResources(user: User, tenants: Tenant[], cfg: ControllerConfig): Re
       !tenant ||
       tenant.spec.suspended ||
       tenant.metadata.deletionTimestamp ||
-      !tenant.status?.conditions?.some(
-        (c) =>
-          c.type === 'Ready' &&
-          c.status === 'True' &&
-          c.observedGeneration === tenant.metadata.generation,
-      )
+      !(tenantReady(tenant) || granted.has(membership.tenant))
     )
       continue;
     const n = names(membership.tenant);

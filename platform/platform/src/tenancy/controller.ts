@@ -1031,11 +1031,14 @@ export class Controller {
   async reconcileUser(user: User, tenants: Tenant[]): Promise<void> {
     if (!validName(user.metadata.name)) throw new Error('Invalid user name');
     if (!user.metadata.deletionTimestamp) await this.finalizer(user, true);
-    const desired = userResources(user, tenants, this.cfg);
     const bindings = await this.list<Resource>('rbac.authorization.k8s.io/v1', 'RoleBinding', {
       [INSTALLATION]: this.cfg.installation,
       [OWNER]: user.metadata.uid!,
     });
+    // Memberships already bound survive while their tenant is merely Not Ready, so the token
+    // Secrets Pulumi reads stay in place until the tenant converges.
+    const granted = new Set(bindings.flatMap((binding) => binding.metadata.labels?.[TENANT] ?? []));
+    const desired = userResources(user, tenants, this.cfg, granted);
     for (const binding of bindings)
       if (!desired.some((r) => location(r) === location(binding))) await this.remove(binding);
     // Token Secrets go before the ServiceAccount so no orphaned credential outlives it.
