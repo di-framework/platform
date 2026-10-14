@@ -933,6 +933,45 @@ describe('reconcileTenant with tenant-auth', () => {
     if (!value) throw new Error(`${p} is missing`);
     return value;
   };
+  /** A runtime-namespace `tenant-controller-ca-key` as packages before #170 wrote it. */
+  const seedLegacyCaKey = (api: MemoryApi, labels: Resource['metadata']['labels'], key: string) =>
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: {
+        name: 'tenant-controller-ca-key',
+        namespace: 'di-runtime-alpha',
+        uid: 'legacy-uid',
+        labels,
+      },
+      type: 'Opaque',
+      data: { 'ca.key': key },
+    } as Resource);
+  /** Runs `run` with `console.error` silenced. */
+  const quietly = async (run: () => Promise<unknown>) => {
+    const log = console.error;
+    console.error = () => {};
+    try {
+      await run();
+    } finally {
+      console.error = log;
+    }
+  };
+  /**
+   * A reconciled tenant turned back into the layout before #170: the CA key alone in the runtime
+   * namespace and `ca.crt` in the TLS Secret.
+   */
+  const legacyLayout = async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t, []);
+    const tls = must(api, tlsPath);
+    const before = structuredClone(tls.data);
+    const bundle = api.objects.get(caMapPath)?.data;
+    const keys = api.objects.get(caKeyPath)?.data as Record<string, string>;
+    api.objects.delete(caKeyPath);
+    seedLegacyCaKey(api, { ...tls.metadata.labels }, field(keys, 'ca.key'));
+    return { api, controller, t, before, bundle, keys };
+  };
   /** `data[key]`, failing the test when it is missing. */
   const field = (data: Record<string, string>, key: string): string => {
     const value = data[key];
@@ -1088,26 +1127,7 @@ describe('reconcileTenant with tenant-auth', () => {
   });
 
   it('moves the CA key out of the runtime namespace without replacing the CA (#170 S3)', async () => {
-    const { api, controller, t } = prepare();
-    await controller.reconcileTenant(t, []);
-    const tls = must(api, tlsPath);
-    const before = structuredClone(tls.data);
-    const bundle = api.objects.get(caMapPath)?.data;
-    const keys = api.objects.get(caKeyPath)?.data as Record<string, string>;
-    // The layout before #170: the key alone in the runtime namespace, ca.crt in the TLS Secret.
-    api.objects.delete(caKeyPath);
-    api.seed({
-      apiVersion: 'v1',
-      kind: 'Secret',
-      metadata: {
-        name: 'tenant-controller-ca-key',
-        namespace: 'di-runtime-alpha',
-        uid: 'legacy-uid',
-        labels: { ...tls.metadata.labels },
-      },
-      type: 'Opaque',
-      data: { 'ca.key': field(keys, 'ca.key') },
-    } as Resource);
+    const { api, controller, t, before, bundle, keys } = await legacyLayout();
     await controller.reconcileTenant(t, []);
     expect(api.objects.get(caKeyPath)?.data).toEqual(keys);
     expect(api.objects.get(tlsPath)?.data).toEqual(before);
@@ -1125,16 +1145,7 @@ describe('reconcileTenant with tenant-auth', () => {
     const caPem = decode(api.objects.get(tlsPath)?.data as Record<string, string>, 'ca.crt');
     const keys = api.objects.get(caKeyPath)?.data as Record<string, string>;
     api.objects.delete(caKeyPath);
-    api.seed({
-      apiVersion: 'v1',
-      kind: 'Secret',
-      metadata: {
-        name: 'tenant-controller-ca-key',
-        namespace: 'di-runtime-alpha',
-        labels: { [COMPONENT]: 'tenant-auth', [TENANT]: 'alpha' },
-      },
-      data: { 'ca.key': field(keys, 'ca.key') },
-    } as Resource);
+    seedLegacyCaKey(api, { [COMPONENT]: 'tenant-auth', [TENANT]: 'alpha' }, field(keys, 'ca.key'));
     await controller.reconcileTenant(t, []);
     const replaced = api.objects.get(caKeyPath)?.data as Record<string, string>;
     expect(decode(replaced, 'ca.crt')).not.toBe(caPem);
@@ -1194,13 +1205,7 @@ describe('reconcileTenant with tenant-auth', () => {
     const secret = must(api, caKeyPath);
     secret.metadata.labels = { ...secret.metadata.labels, [OWNER]: 'earlier-uid' };
     secret.data = { 'ca.crt': encode(stranger.cert), 'ca.key': encode(stranger.key) };
-    const log = console.error;
-    console.error = () => {};
-    try {
-      await controller.reconcileTenant(t, []);
-    } finally {
-      console.error = log;
-    }
+    await quietly(() => controller.reconcileTenant(t, []));
     expect(t.status?.conditions?.find((c) => c.type === 'TenantAuthReady')?.reason).toBe(
       'ControllerCaNotOwned',
     );
@@ -1232,18 +1237,7 @@ describe('reconcileTenant with tenant-auth', () => {
       'ca.crt': encode(older.cert),
     };
     must(api, caMapPath).data = { 'ca.crt': older.cert };
-    api.seed({
-      apiVersion: 'v1',
-      kind: 'Secret',
-      metadata: {
-        name: 'tenant-controller-ca-key',
-        namespace: ns,
-        uid: 'legacy-uid',
-        labels: { ...tls.metadata.labels },
-      },
-      type: 'Opaque',
-      data: { 'ca.key': encode(older.key) },
-    } as Resource);
+    seedLegacyCaKey(api, { ...tls.metadata.labels }, encode(older.key));
     const before = structuredClone(tls.data);
     // Upgrading again keeps what every host, console and kubeconfig trusts now: no roll at all.
     await controller.reconcileTenant(t, []);
@@ -1261,34 +1255,11 @@ describe('reconcileTenant with tenant-auth', () => {
   });
 
   it('keeps the legacy CA key until the platform Secret holding it is applied', async () => {
-    const { api, controller, t } = prepare();
-    await controller.reconcileTenant(t, []);
-    const tls = must(api, tlsPath);
-    const bundle = api.objects.get(caMapPath)?.data;
-    const keys = api.objects.get(caKeyPath)?.data as Record<string, string>;
-    api.objects.delete(caKeyPath);
-    api.seed({
-      apiVersion: 'v1',
-      kind: 'Secret',
-      metadata: {
-        name: 'tenant-controller-ca-key',
-        namespace: 'di-runtime-alpha',
-        uid: 'legacy-uid',
-        labels: { ...tls.metadata.labels },
-      },
-      type: 'Opaque',
-      data: { 'ca.key': field(keys, 'ca.key') },
-    } as Resource);
+    const { api, controller, t, bundle, keys } = await legacyLayout();
     api.fail = (method, p) =>
       method === 'PATCH' && p === caKeyPath ? new ApiError(500, 'boom') : undefined;
-    const log = console.error;
-    console.error = () => {};
-    try {
-      await controller.reconcileTenant(t, []);
-    } finally {
-      console.error = log;
-      api.fail = undefined;
-    }
+    await quietly(() => controller.reconcileTenant(t, []));
+    api.fail = undefined;
     expect(api.objects.get(legacyCaKeyPath)?.data).toEqual({ 'ca.key': field(keys, 'ca.key') });
     expect(api.objects.get(caMapPath)?.data).toEqual(bundle);
     await controller.reconcileTenant(t, []);
