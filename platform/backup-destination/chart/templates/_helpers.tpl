@@ -17,3 +17,14 @@ di-backup-s3
 {{- define "backup.runtime" -}}
 {{- printf "di-runtime-%s" (include "backup.tenant" . | trim) -}}
 {{- end -}}
+{{- /* The first range in a cron that runs backwards (such as 5-1), or empty (#263 S5): the operator never fires one, and installBackupDestination refuses it too. */ -}}
+{{- define "backup.backwardRange" -}}
+{{- $found := "" -}}
+{{- range regexFindAll "[0-9]+-[0-9]+" . -1 -}}
+{{- $ends := splitList "-" . -}}
+{{- if and (not $found) (gt (atoi (index $ends 0)) (atoi (index $ends 1))) -}}
+{{- $found = . -}}
+{{- end -}}
+{{- end -}}
+{{- $found -}}
+{{- end -}}

@@ -176,6 +176,41 @@ allowlisted registry and pull everything else over TLS. Check three things befor
   roll. A single-host tenant such as `identity` (`maxSurge: 0, maxUnavailable: 1`) is unavailable
   while its one host restarts, so plan the upgrade for a quiet window.
 
+#### Upgrading to TLS on the controller's whoami listener (#113)
+
+The tenant registry now calls `https://tenant-controller.di-runtime-<tenant>.svc:8789` instead of
+`http://…:8789`. Two independently versioned parts change: the tenant controller image
+(`tenantAuth.image`), which now serves TLS on `8789`, and the platform package, which renders the
+registry's `https://` URL. Neither has to wait for the other:
+
+- **New controller image, registry config still `http://`.** The whoami listener serves TLS and
+  plain HTTP on the same port, chosen by the connection's first byte, so the old config keeps
+  working. The host pull token is accepted on that listener over either protocol, and still
+  nowhere else.
+- **New platform, controller image still serving plain HTTP only.** The registry's whoami calls
+  fail (a TLS handshake against a plain listener), so the registry answers every request that
+  needs authorization, host pulls included, with `503` until the controller runs an image from
+  this release.
+
+So upgrade in this order:
+
+1. Set `tenantAuth.image` to the tenant-auth digest from this release and run `pulumi up` with
+   the platform package you already have. The controller Deployment rolls; nothing else changes.
+2. Upgrade the platform package and run `pulumi up` again. The `di-tenant-registry`
+   WorkloadDeployment's `tenant-controller-url` becomes `https://…:8789`; the controller,
+   NetworkPolicies and hosts do not change for it.
+
+In one `pulumi up` that changes both, the registry can call a controller pod that the rollout has
+not replaced yet: registry requests get `503` until the new pod is ready, then recover on their
+own. Tenant hosts that predate #113's `--http-client-ca-path` roll in the same
+update (see
+[Upgrading to tenant hosts that trust the controller CA for `wasi:http`](#upgrading-to-tenant-hosts-that-trust-the-controller-ca-for-wasihttp-113));
+until a host has restarted with it, the registry on that host cannot verify the controller and
+answers `503` the same way. NetworkPolicy and the registry's egress allowlist name the same host
+and port as before, so they do not change. To refuse plain HTTP on `8789` once every registry
+uses `https://`, run the controller with `TENANT_CONTROLLER_WHOAMI_TLS_ONLY=true`; the platform
+does not set it yet.
+
 #### Upgrading to tenant-auth URLs derived from `routeUrlPattern` (#128)
 
 - **Who is affected.** Installs with config `tenantAuth` set, at least one of
@@ -217,7 +252,16 @@ controller reads the policy from the Tenant object on the cluster when that obje
 not from your config at that moment.
 
 - `Retain`: the controller scales the workload to zero and keeps the `di-tenant-<name>` and
-  `di-runtime-<name>` namespaces.
+  `di-runtime-<name>` namespaces. It removes the Tenant's finalizer only after the tenant's host
+  pods are gone, terminating ones included, so the runtime operator can still clear their
+  finalizers (#245). Finished pods (`Succeeded` or `Failed`, such as evicted ones) do not count.
+  While it waits, the Tenant's `Ready` condition is `False` with reason `WaitingForHostPods` and
+  names the pods. If a pod stays there (for example on an unreachable node), check it with
+  `kubectl get pods -n di-runtime-<name> -o wide`, then bring the node back or remove it from
+  the cluster, or as a last resort run
+  `kubectl delete pod -n di-runtime-<name> <pod> --grace-period=0 --force`. A pod that still
+  lists `runtime.wasmcloud.dev/pod-host-finalizer` after that is waiting for the runtime
+  operator; make sure it is running, since it clears the finalizer while the Tenant exists.
 - `Delete`: the controller deletes both namespaces, and with them their PVCs (subject to the
   StorageClass reclaim policy). It does not remove the on-disk tenant data directories: backend
   data lives in tenant-UID hostPath directories under the storage root, which namespace deletion
@@ -460,10 +504,15 @@ model, not a claim of developer-proof network isolation.
   `pulumi up` the operator's `hostNamespaces` list the declared tenants plus every Tenant of
   the installation that still exists, read with the admin `kubeconfig`. The namespace stops
   being watched on the next `up`, after the Tenant is gone. Under either `deletionPolicy` the
-  Tenant is removed once its hosts are stopped (`Retain` keeps only the namespaces and data),
+  Tenant is removed once its host pods are gone (`Retain` keeps only the namespaces and data),
   so a retained namespace is not watched. Previews never read the cluster and show the
-  declared tenants only. A failed Tenant list fails `up` with `Cannot list the Tenants of
-  installation <name> ... (#227): <HTTP status or error code>`.
+  declared tenants only. The Tenant list is retried up to three times (0.5 s, 1 s, 2 s apart,
+  and no retry starts more than 15 s after the first attempt) on HTTP 429/5xx and connection
+  errors, including undici's `UND_ERR_SOCKET`/`UND_ERR_CONNECT_TIMEOUT` and Bun's
+  `ConnectionRefused`-style codes; a failure that remains fails `up` with `Cannot list
+  the Tenants of installation <name> ... (#227): <HTTP status or error code>`. An error without
+  either, such as an unusable kubeconfig, names its class and what to check in the kubeconfig
+  (#245).
 - Scheduler/control-plane NATS remains distinct from application messaging
   `BackingService` instances.
 - **Blobstore** services (`blobstore-nats`) run the same JetStream NATS image as messaging.
@@ -474,6 +523,27 @@ model, not a claim of developer-proof network isolation.
 - Per-tenant **runtime data-plane NATS** (`di-nats`, hostgroup `--data-nats-url`) is
   Tenant-reconciled infrastructure — not an application `BackingService`. Application
   messaging instances are named `di-bs-<service-name>` and owned by BackingService UIDs.
+
+### BackingService storage
+
+A Redis or NATS `BackingService` keeps its data on the node in a hostPath directory mounted at
+`/data` in `di-bs-<service-name>`. A new BackingService uses
+`<storageRoot>/di-tenants/<tenant uid>/bs-<service-name>`, where `storageRoot` defaults to
+`/var/lib/k0s` when unset.
+
+On every reconcile the controller reads the live `di-bs-<service-name>` Deployment. When that
+Deployment belongs to the same BackingService UID and already mounts a hostPath for its `data`
+volume, the controller keeps that exact path, so existing data stays reachable. The
+storage-root path is used only when there is no live Deployment yet (or it has no `data`
+hostPath).
+
+- A BackingService created before this behaviour, or under a different `storageRoot`, keeps its
+  original path (for example `/var/lib/k0s/...` on a node whose storage root is now
+  `/var/lib/kubesolo`) until it is deleted and recreated. Recreating it starts empty under the
+  current storage root; copy the data across first if it must be kept.
+- Storage-root discovery reads every `<root>/di-tenants/<uid>` hostPath in the cluster and
+  refuses when it finds more than one root. A leftover verification BackingService with a stray
+  path causes that ambiguity; delete it (`deletionPolicy: Delete`) to clear it.
 
 ### Runtime NATS storage caps
 
@@ -929,10 +999,16 @@ tenantAuth:
   store on the tenant's `di-nats` (JetStream on the tenant's host path, capped by
   [`runtimeNats.maxFileStore`](#runtime-nats-storage-caps)). Its `wasmcloud:secrets`
   bind-time config names the tenant and the controller's whoami-only listener,
-  `http://tenant-controller.di-runtime-<tenant>.svc:8789`: plain HTTP, in-cluster, which the
-  component accepts for `*.svc` only. The listener serves nothing but `GET /v1/auth/whoami`
-  (same answer as `8788`, problem+json errors), so the registry needs no trust in the
-  controller's private CA. Admission admits `wasmcloud:secrets` from the platform controller
+  `https://tenant-controller.di-runtime-<tenant>.svc:8789` (#113). The listener serves the
+  controller certificate, which always names `tenant-controller.di-runtime-<tenant>.svc`, and the
+  tenant hosts trust the tenant CA for the components' outgoing `wasi:http`
+  (`--http-client-ca-path`), so the registry verifies it like any other TLS server and the user's
+  credential no longer crosses the pod network in cleartext on this hop. The listener serves
+  nothing but `GET /v1/auth/whoami` (same answer as `8788`, problem+json errors). It also answers
+  plain HTTP on the same port, for a registry whose config still names `http://` while an upgrade
+  rolls out (see
+  [Upgrading to TLS on the controller's whoami listener](#upgrading-to-tls-on-the-controllers-whoami-listener-113)).
+  The hop from the registry front (`8790`) to the tenant host is still plain HTTP. Admission admits `wasmcloud:secrets` from the platform controller
   only, so a tenant cannot repoint the callback; the component's only egress is that URL
   (`allowedHosts`), and the egress reconcile leaves it alone.
   - Reservation: the front sends every registry user's Basic credentials to whatever serves the
@@ -1070,8 +1146,8 @@ tenantAuth:
       trust the tenant CA that signed it through `--oci-ca-path=/registry-ca/ca.crt` from ConfigMap
       `tenant-controller-ca`. A CA:TRUE end-entity certificate is rejected by wash (rustls), hence the split.
       The same file is passed as `--http-client-ca-path`, so the components' outgoing `wasi:http`
-      trusts the tenant CA on top of the default webpki roots (#113): the registry can call the
-      controller over `https://`. Other HTTPS egress still trusts the webpki roots and now also
+      trusts the tenant CA on top of the default webpki roots (#113): the registry calls the
+      controller's whoami listener over `https://`. Other HTTPS egress still trusts the webpki roots and now also
       accepts a certificate issued by the tenant CA for any name, the same scope
       `--oci-ca-path` already gives OCI pulls. The CA has no name constraints; #170 tracks the
       CA follow-ups.

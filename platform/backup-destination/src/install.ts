@@ -74,15 +74,33 @@ export interface BackupDestinationInstall {
 
 /** The CRD's `maxLength` on `schedule`, for the destination and every source (#254 S2). */
 export const SCHEDULE_MAX_LENGTH = 128;
-/** Five fields separated by one space, as the CRD pattern and the chart require. */
-const FIVE_FIELDS = /^\S+( \S+){4}$/;
+/**
+ * The chart's cron pattern (#263 S5): five fields one space apart; numbers of at most two digits
+ * within each field's range, `*`, ranges, steps from 1 with no leading zero, and lists. Keep it
+ * in step with `chart/templates/destination.yaml`.
+ */
+const FIELDS = [
+  '[0-5]?[0-9]',
+  '([01]?[0-9]|2[0-3])',
+  '(0?[1-9]|[12][0-9]|3[01])',
+  '(0?[1-9]|1[0-2])',
+  '[0-7]',
+];
+const CHART_CRON = new RegExp(
+  `^${FIELDS.map((value) => {
+    const element = String.raw`(\*|(${value})(-(${value}))?)(/[1-9][0-9]*)?`;
+    return `${element}(,${element})*`;
+  }).join(' ')}$`,
+);
 
 /**
  * Whether a trimmed schedule has a shape the CRD accepts: "none", or a cron the operator can
- * fire with one space between fields. The chart applies the same rules when it renders.
+ * fire that the chart also renders. The operator's parser rejects backward ranges such as `5-1`,
+ * as the chart does; the chart's pattern rejects three-digit numbers (`005`) and zero-led steps
+ * (`/01`), as this does.
  */
 function acceptedSchedule(schedule: string): boolean {
-  return schedule === 'none' || (FIVE_FIELDS.test(schedule) && validCron(schedule));
+  return schedule === 'none' || (CHART_CRON.test(schedule) && validCron(schedule));
 }
 
 const TOO_LONG = `schedule must be at most ${SCHEDULE_MAX_LENGTH} characters`;

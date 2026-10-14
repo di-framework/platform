@@ -225,7 +225,8 @@ renaming or removing one is a breaking change.
 | `TENANT_CONSOLE_CONTROLLER_PUBLIC_URL` | `TENANT_CONSOLE_CONTROLLER_URL` | Controller URL the console shows to users and CLIs |
 | `KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT_HTTPS` | set by Kubernetes, `443` | In-cluster API server when no kubeconfig is given |
 | `TENANT_CONTROLLER_HOST`, `TENANT_CONTROLLER_PORT` | `127.0.0.1`, `8788` | Controller listen address |
-| `TENANT_CONTROLLER_WHOAMI_PORT` | none | Plain-HTTP listener serving only `GET /v1/auth/whoami` (problem+json errors), for the tenant registry's callback (platform#83) |
+| `TENANT_CONTROLLER_WHOAMI_PORT` | none | Listener serving only `GET /v1/auth/whoami` (problem+json errors), for the tenant registry's callback (platform#83). With `TENANT_CONTROLLER_TLS_CERT` and `_TLS_KEY` it serves TLS with that certificate (platform#113) and also plain HTTP on the same port, chosen by the connection's first byte, so a registry still configured with `http://` keeps working during an upgrade; without them, plain HTTP only |
+| `TENANT_CONTROLLER_WHOAMI_TLS_ONLY` | `false` | `true` refuses plain HTTP on the whoami listener once every registry calls it over `https://`. No effect without a certificate |
 | `TENANT_CONTROLLER_REGISTRY_FRONT_PORT` | none | TLS listener (the controller certificate) that forwards every request, credentials included, to the tenant hosts as the registry (platform#83) |
 | `TENANT_CONTROLLER_REGISTRY_HOST` | `registry` | `Host` the registry front sends: the registry workload's `wasi:http` host; `/v1/deploy` refuses a `<service>-<env>` equal to it |
 | `TENANT_CONTROLLER_REGISTRY_PULL_PORT` | none | The tenant hosts' pull-only listener (platform#83 `:host-pull`): the registry front for `GET`/`HEAD` only (`405` otherwise). NetworkPolicy admits only the tenant host pods |

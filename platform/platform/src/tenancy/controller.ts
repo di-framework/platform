@@ -326,6 +326,25 @@ export class Controller {
     // Core Kubernetes list items may omit TypeMeta even though individual GETs include it.
     return result.items.map((item) => ({ ...item, apiVersion, kind }));
   }
+  /**
+   * The tenant's host pods that removal waits for (#245): terminating ones (the operator still has
+   * to clear their pod-host finalizer) and ones not yet finished. A finished pod (`Succeeded` or
+   * `Failed`, e.g. evicted) that nobody deletes holds nothing back: scaling to zero does not
+   * remove it, and under Retain nothing else would.
+   */
+  private async liveHostPods(n: ReturnType<typeof names>): Promise<Resource[]> {
+    const pods = await this.list<Resource>(
+      'v1',
+      'Pod',
+      { 'wasmcloud.com/hostgroup': n.hostgroup, 'wasmcloud.com/name': 'hostgroup' },
+      n.runtimeNamespace,
+    );
+    return pods.filter((pod) => {
+      if (pod.metadata.deletionTimestamp) return true;
+      const phase = (pod.status as { phase?: string } | undefined)?.phase;
+      return phase !== 'Succeeded' && phase !== 'Failed';
+    });
+  }
   private async remove(value: Resource): Promise<void> {
     try {
       await this.api.call('DELETE', location(value), {
@@ -644,7 +663,28 @@ export class Controller {
           status?.observedGeneration === updated.metadata.generation &&
           (status?.replicas ?? 0) === 0;
       }
-      if (stopped) await this.finalizer(tenant, false);
+      // `status.replicas` leaves out terminating pods, so also wait for the live host pods to
+      // be gone (#245). The wasmCloud operator clears their pod-host finalizer only while it
+      // watches the runtime namespace, and the next `up` stops watching it once this Tenant is
+      // gone. The list is read-only and scoped to this tenant's runtime namespace and hostgroup.
+      if (!stopped) return;
+      const pods = await this.liveHostPods(n);
+      if (pods.length > 0) {
+        // Sorted, so the message (and the status write) only changes when the pods do.
+        const shown = pods
+          .map((pod) => pod.metadata.name)
+          .sort((a, b) => a.localeCompare(b))
+          .slice(0, 5);
+        if (pods.length > shown.length) shown.push(`and ${pods.length - shown.length} more`);
+        await this.status(
+          tenant,
+          false,
+          'WaitingForHostPods',
+          `Retain: waiting for host pods in ${n.runtimeNamespace} to be gone before removing the Tenant: ${shown.join(', ')}`,
+        );
+        return;
+      }
+      await this.finalizer(tenant, false);
       return;
     }
     for (const name of [n.namespace, n.runtimeNamespace]) {
@@ -1132,8 +1172,14 @@ export class Controller {
       await this.reconcilePostgres(service, tenant, cls, sizing);
       return;
     }
-    const desired = backingServiceResources(service, tenant, cls, this.cfg, sizing);
-    const rollout = await this.applyBackingServiceResources(desired);
+    // The live Deployment keeps its data hostPath, so a storage-root change never orphans data.
+    const deploymentPath = `${collection('apps/v1', 'Deployment', runtimeNamespace)}/${backingServiceResourceName(service.metadata.name)}`;
+    const live = await this.get<Resource>(deploymentPath);
+    const desired = backingServiceResources(service, tenant, cls, this.cfg, sizing, live);
+    const rollout = await this.applyBackingServiceResources(
+      desired,
+      new Map([[deploymentPath, live]]),
+    );
     await this.updateBackingServiceStatus(service, tenant, cls, rollout);
   }
 
@@ -1413,11 +1459,12 @@ export class Controller {
 
   private async applyBackingServiceResources(
     desired: Resource[],
+    fetched?: ReadonlyMap<string, Resource | undefined>,
   ): Promise<{ ready: boolean; failure?: DeploymentFailure }> {
     let ready = true;
     let failure: DeploymentFailure | undefined;
     for (const value of desired) {
-      const applied = await this.ensure(value);
+      const applied = await this.ensure(value, false, false, fetched);
       if (value.kind !== 'Deployment') continue;
       if (applied.metadata.name === RUNTIME_DATA_NATS)
         throw new Error(`Refusing to manage runtime data plane ${RUNTIME_DATA_NATS}`);
