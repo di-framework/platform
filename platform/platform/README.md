@@ -903,7 +903,7 @@ script is removed:
 
 ```yaml
 tenantAuth:
-  image: ghcr.io/di-framework/tenant-auth@sha256:ffb30ae36925c42c7e84049b3f7ce8d7a0481ef9bbbbc0c4d6f1d3c4fa0ea8c8   # required, pinned by digest
+  image: ghcr.io/di-framework/tenant-auth@sha256:c88a07a550dba1b53da12d000da7b102f07e3c20c91aac84249b845812a1fc4c   # required, pinned by digest
   issuer: http://identity.acme.localhost:28180               # identity-server, as pods and browsers name it
   oauthClient: { id: access, secretName: tenant-auth-oauth } # Secret in the platform namespace; key `clientSecret`
   issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80  # optional, for a loopback issuer
