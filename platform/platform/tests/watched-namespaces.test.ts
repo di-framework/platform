@@ -1,13 +1,15 @@
 import { expect, test } from 'bun:test';
-import type { LiveTenant } from '../src/tenancy/removal';
+import { type LiveTenant, type TenantLister, warnRemovedTenants } from '../src/tenancy/removal';
 import {
   describeListError,
   type HostNamespacesArgs,
   isTransientListError,
   operatorHostNamespaces,
   realSleep,
+  sharedTenantList,
   TENANT_LIST_RETRY_BUDGET_MS,
   TENANT_LIST_RETRY_DELAYS_MS,
+  type TenantListRetry,
 } from '../src/watched-namespaces';
 
 /** A `tenancy/removal` lister stub that records the installation it is asked for. */
@@ -37,8 +39,14 @@ function recorder() {
   };
 }
 
+/** Arguments with `listTenants` behind this run's shared list, as `createPlatform` passes it. */
 function args(
-  extra: Partial<HostNamespacesArgs>,
+  {
+    listTenants,
+    sleep = async () => {},
+    now,
+    ...extra
+  }: Partial<HostNamespacesArgs> & TenantListRetry & { listTenants?: TenantLister },
   log: HostNamespacesArgs['log'],
 ): HostNamespacesArgs {
   return {
@@ -47,7 +55,7 @@ function args(
     declared: ['alpha'],
     dryRun: false,
     log,
-    sleep: async () => {},
+    tenants: listTenants && sharedTenantList(listTenants, 'di-test', { sleep, now }),
     ...extra,
   };
 }
@@ -86,18 +94,172 @@ test('once the removed Tenant is gone, its runtime namespace is no longer watche
   expect(info).toEqual([]);
 });
 
-test('preview never lists Tenants and says when a removed namespace stops being watched', async () => {
+test('preview reads the Tenant list too, so its diff matches the up (#245)', async () => {
   const { info, warn, log } = recorder();
-  const cluster = live('beta');
+  const cluster = live('alpha', 'beta');
   const namespaces = await operatorHostNamespaces(
     args({ dryRun: true, listTenants: cluster.list }, log),
   );
-  expect(cluster.asked).toEqual([]);
-  expect(namespaces).toEqual(['wasmcloud', 'di-runtime-alpha']);
+  expect(cluster.asked).toEqual(['di-test']);
+  expect(namespaces).toEqual(['wasmcloud', 'di-runtime-alpha', 'di-runtime-beta']);
   expect(warn).toEqual([]);
   expect(info).toHaveLength(1);
-  expect(info[0]).toContain('stays watched while its Tenant is deleted');
-  expect(info[0]).toContain('stops being watched on the next up, after the Tenant is gone');
+  expect(info[0]).toContain('Tenant beta is no longer declared but still exists');
+});
+
+test('preview logs nothing when no tenant is being removed (#245)', async () => {
+  const { info, warn, log } = recorder();
+  expect(
+    await operatorHostNamespaces(args({ dryRun: true, listTenants: live('alpha').list }, log)),
+  ).toEqual(['wasmcloud', 'di-runtime-alpha']);
+  expect(info).toEqual([]);
+  expect(warn).toEqual([]);
+});
+
+test('preview falls back to the declared tenants with a warning when the list fails (#245)', async () => {
+  const { info, warn, log } = recorder();
+  let calls = 0;
+  const listTenants = async (): Promise<LiveTenant[]> => {
+    calls++;
+    throw new ApiError(403);
+  };
+  expect(await operatorHostNamespaces(args({ dryRun: true, listTenants }, log))).toEqual([
+    'wasmcloud',
+    'di-runtime-alpha',
+  ]);
+  expect(calls).toBe(1);
+  expect(info).toEqual([]);
+  expect(warn).toHaveLength(1);
+  expect(warn[0]).toContain(
+    'Preview cannot list the Tenants of installation di-test, so it shows the wasmCloud operator',
+  );
+  expect(warn[0]).toEndWith('(#227): HTTP 403');
+  expect(warn[0]).not.toContain('secret detail');
+  // Transient failures are retried in preview as on up; a missing CRD means no Tenants.
+  const retried = recorder();
+  const failures: unknown[] = [new ApiError(503)];
+  const flaky = async (): Promise<LiveTenant[]> => {
+    const failure = failures.shift();
+    if (failure) throw failure;
+    return [{ metadata: { name: 'beta' } }];
+  };
+  expect(
+    await operatorHostNamespaces(args({ dryRun: true, listTenants: flaky }, retried.log)),
+  ).toEqual(['wasmcloud', 'di-runtime-alpha', 'di-runtime-beta']);
+  const missingCrd = recorder();
+  expect(
+    await operatorHostNamespaces(
+      args(
+        {
+          dryRun: true,
+          listTenants: async () => {
+            throw new ApiError(404);
+          },
+        },
+        missingCrd.log,
+      ),
+    ),
+  ).toEqual(['wasmcloud', 'di-runtime-alpha']);
+  expect(missingCrd.warn).toEqual([]);
+});
+
+test('preview without the admin kubeconfig watches the declared tenants only, with a warning', async () => {
+  const { warn, log } = recorder();
+  expect(await operatorHostNamespaces(args({ dryRun: true }, log))).toEqual([
+    'wasmcloud',
+    'di-runtime-alpha',
+  ]);
+  expect(warn).toHaveLength(1);
+  expect(warn[0]).toContain('Pass kubeconfig to createPlatform');
+});
+
+test('the Tenant list is read once per run and shared by both callers (#245)', async () => {
+  let calls = 0;
+  const asked: string[] = [];
+  const listTenants = async (installation: string): Promise<LiveTenant[]> => {
+    calls++;
+    asked.push(installation);
+    return [
+      { metadata: { name: 'alpha' } },
+      { metadata: { name: 'beta' }, spec: { deletionPolicy: 'Retain' } },
+    ];
+  };
+  const tenants = sharedTenantList(listTenants, 'di-test', { sleep: async () => {} });
+  expect(calls).toBe(0); // listed lazily, on first use
+  const { info, log } = recorder();
+  const warnings: string[] = [];
+  const [namespaces, notices] = await Promise.all([
+    operatorHostNamespaces(args({ tenants }, log)),
+    warnRemovedTenants({
+      installation: 'di-test',
+      declared: ['alpha'],
+      list: tenants,
+      warn: (m) => warnings.push(m),
+    }),
+  ]);
+  expect(calls).toBe(1);
+  expect(asked).toEqual(['di-test']);
+  expect(namespaces).toEqual(['wasmcloud', 'di-runtime-alpha', 'di-runtime-beta']);
+  expect(info[0]).toContain('Tenant beta is no longer declared');
+  expect(notices).toHaveLength(1);
+  expect(notices[0]).toContain('Tenant beta is being removed with deletionPolicy Retain');
+  expect(warnings).toEqual(notices);
+  // The same snapshot, not a second request, however often it is read.
+  expect(await tenants()).toBe(await tenants());
+  expect(calls).toBe(1);
+});
+
+test('a shared list failure keeps how each caller handles it: up fails, the Retain check skips (#245)', async () => {
+  let calls = 0;
+  const tenants = sharedTenantList(
+    async () => {
+      calls++;
+      throw new ApiError(403);
+    },
+    'di-test',
+    { sleep: async () => {} },
+  );
+  const { log } = recorder();
+  const debug: string[] = [];
+  const notices = await warnRemovedTenants({
+    installation: 'di-test',
+    declared: ['alpha'],
+    list: tenants,
+    warn: () => {},
+    debug: (m) => debug.push(m),
+  });
+  expect(notices).toEqual([]);
+  expect(debug).toHaveLength(1);
+  await expect(operatorHostNamespaces(args({ tenants }, log))).rejects.toThrow(
+    "Cannot list the Tenants of installation di-test, which keep a removed tenant's runtime namespace watched by the wasmCloud operator until the Tenant is deleted (#227): HTTP 403",
+  );
+  expect(calls).toBe(1);
+});
+
+test('a transient failure is retried once for both callers, not per caller (#245)', async () => {
+  let calls = 0;
+  const slept: number[] = [];
+  const tenants = sharedTenantList(
+    async () => {
+      calls++;
+      throw Object.assign(new Error('reset'), { code: 'ECONNRESET' });
+    },
+    'di-test',
+    {
+      sleep: async (ms) => {
+        slept.push(ms);
+      },
+    },
+  );
+  const { log } = recorder();
+  const [hostNamespaces, notices] = await Promise.allSettled([
+    operatorHostNamespaces(args({ tenants }, log)),
+    warnRemovedTenants({ installation: 'di-test', declared: [], list: tenants, warn: () => {} }),
+  ]);
+  expect(hostNamespaces.status).toBe('rejected');
+  expect(notices).toEqual({ status: 'fulfilled', value: [] });
+  expect(calls).toBe(TENANT_LIST_RETRY_DELAYS_MS.length + 1);
+  expect(slept).toEqual([...TENANT_LIST_RETRY_DELAYS_MS]);
 });
 
 test('without the admin kubeconfig only declared tenants are watched, with a warning', async () => {
