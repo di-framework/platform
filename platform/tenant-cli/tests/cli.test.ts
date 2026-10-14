@@ -366,6 +366,34 @@ describe('run', () => {
     expect(readStore(env)).toEqual({});
   });
 
+  test('logout forgets the credential even when issuer discovery fails', async () => {
+    writeStore(
+      {
+        acme: {
+          ...credential,
+          via: 'identity',
+          apiKey: undefined,
+          accessToken: 'expired',
+          refreshToken: 'rt',
+          expiresAt: '2000-01-01T00:00:00Z',
+          issuer: 'https://issuer.test',
+          clientId: 'tenant-cli',
+        },
+      },
+      env,
+    );
+    const { fetch: issuerFetch } = fakeFetch({
+      'GET /.well-known/openid-configuration': () =>
+        new Response('issuer unreachable', { status: 503 }),
+    });
+    expect(await run(['logout'], io(issuerFetch))).toBe(0);
+    // Credential is forgotten despite discovery failure.
+    expect(readStore(env)).toEqual({});
+    // Warning is printed about revocation failure.
+    expect(err.at(-1)).toBe(`Logged out of acme.`);
+    expect(err.some((line) => line.includes('warning: failed to revoke token'))).toBe(true);
+  });
+
   test('whoami prints a line or JSON', async () => {
     const who = { user: 'alice', account: 'acme', role: 'developer', via: 'api-key' };
     const { fetch } = fakeFetch({ 'GET /v1/auth/whoami': () => json(who) });
