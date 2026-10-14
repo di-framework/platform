@@ -2,14 +2,19 @@ import { ConfigList, ConfigValue, Empty, SecretList } from './api.schemas.ts';
 import { env, manifest, operation } from './manifest.ts';
 
 const schema = { module: './api.schemas.ts' };
-const schemas = {
+const shared = {
   Empty: { schema: Empty, ...schema },
-  ConfigList: { schema: ConfigList, ...schema },
   ConfigValue: { schema: ConfigValue, ...schema },
-  SecretList: { schema: SecretList, ...schema },
 };
+/** Each manifest declares only its own list schema, so neither generated module validates the other's. */
+const secretSchemas = { ...shared, SecretList: { schema: SecretList, ...schema } };
+const varSchemas = { ...shared, ConfigList: { schema: ConfigList, ...schema } };
 
-/** `secrets` and `vars` share one shape; secrets are write-only on read. */
+/**
+ * `secrets` and `vars` take the same operations and write the same `ConfigValue`, but list
+ * different entries: a `SecretList` carries names and update times only, a `ConfigList` also
+ * carries each var's value.
+ */
 function entries(noun: 'secret' | 'var', readDescription: string) {
   const plural = `${noun}s`;
   const title = noun === 'secret' ? 'Secret' : 'Var';
@@ -71,14 +76,14 @@ function entries(noun: 'secret' | 'var', readDescription: string) {
 export const secrets = manifest(
   'secrets',
   '/v1',
-  schemas,
+  secretSchemas,
   entries('secret', 'Names and update times only; secret values are never returned.'),
 );
 
 export const vars = manifest(
   'vars',
   '/v1',
-  schemas,
+  varSchemas,
   entries('var', 'Names, values, and update times of the environment variables.'),
 );
 
