@@ -26,6 +26,22 @@ export async function sourceStamp(pkgDir: string, selfPath: string): Promise<str
 }
 
 /**
+ * SOURCE_DATE_EPOCH for the engine build: the commit time of the pinned
+ * wasipg recipe (`git show -s --format=%ct`). Tools that stamp a build time,
+ * such as OpenSSL's crypto/buildinf.h and clang's __DATE__/__TIME__, then
+ * emit the same bytes on every rebuild of the same inputs (#267).
+ */
+export function sourceDateEpoch(commitTime: string): string {
+  const epoch = commitTime.trim();
+  if (!/^\d+$/.test(epoch)) {
+    throw new Error(
+      `pinned engine source has no usable commit time: ${JSON.stringify(commitTime)}`,
+    );
+  }
+  return epoch;
+}
+
+/**
  * Patch the upstream wasipg build recipe in place: fill the x86_64 SDK pins
  * and reroute its container file transfer through the di-framework source patch.
  */
@@ -52,6 +68,8 @@ export function patchUpstreamBuild(
     '  -e WASI=true -e CI=true -e SJLJ=true -e DEBUG=false \\',
     '  -e PG_VERSION=17.5 -e PG_BRANCH=REL_17_5_WASM -e SDKROOT=/tmp/sdk \\',
     '  -e GETZIC=false -e ZIC=/usr/sbin/zic -w /workspace \\',
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: injected shell for the upstream build recipe, not a TS template.
+    '  -e "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:?}" \\',
     '  "$IMG" bash -c \'./wasm-build.sh; /pack.sh\'',
     'docker cp "$SRC/." "$CONTAINER:/workspace"',
     'docker cp pack.sh "$CONTAINER:/pack.sh"',
@@ -114,6 +132,9 @@ export async function buildEngineSource(ctx: Context): Promise<void> {
   const sourceRef = requiredPin(ctx.tools.pins, 'PGLITE_SOURCE_REF');
   await $`git -C ${sourceDir} fetch --depth 1 origin ${sourceRef}`;
   await $`git -C ${sourceDir} checkout FETCH_HEAD -- build NOTICE LICENSE`;
+  const epoch = sourceDateEpoch(
+    await $`git -C ${sourceDir} show -s --format=%ct FETCH_HEAD`.text(),
+  );
 
   const versionsEnvPath = join(sourceDir, 'build', 'versions.env');
   const buildShPath = join(sourceDir, 'build', 'build.sh');
@@ -145,11 +166,14 @@ export async function buildEngineSource(ctx: Context): Promise<void> {
   // daemons and omitting its Go-specific pristine-database packaging step.
   // Do not reuse shared upstream FAST volumes: clean source builds avoid stale
   // objects compiled with a different compiler or recovery configuration.
+  // SOURCE_DATE_EPOCH goes into the build container (see patchUpstreamBuild)
+  // so the engine is byte-reproducible; `make reproducible` checks it.
   await $`bash ${buildShPath}`.env({
     ...env,
     DF_PGLITE_SOURCE_PATCH: patchScript,
     DF_PGLITE_OPENSSL_TARBALL: openssl,
     FAST: 'false',
+    SOURCE_DATE_EPOCH: epoch,
   });
 
   await Bun.write(tarball, Bun.file(join(sourceDir, 'build', 'out', 'pglite-wasi.tar.xz')));

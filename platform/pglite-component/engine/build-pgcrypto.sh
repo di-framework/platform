@@ -27,6 +27,13 @@ OUT=$BUILD_PATH/contrib/pgcrypto
 OSSL_PREFIX=$PG_BUILD/df-openssl
 WASI_UPSTREAM=$SDKROOT/wasisdk/upstream
 
+# Reproducibility (#267): OpenSSL's util/mkbuildinf.pl stamps "built on: <date>"
+# into crypto/buildinf.h, which ends up in libcrypto.a and the engine wasm. It
+# uses SOURCE_DATE_EPOCH when set, so require the value that
+# scripts/build-engine.ts derives from the pinned engine source.
+: "${SOURCE_DATE_EPOCH:?SOURCE_DATE_EPOCH must be set (scripts/build-engine.ts passes it)}"
+export SOURCE_DATE_EPOCH
+
 # --- OpenSSL libcrypto (static, wasm32-wasip1) ------------------------------
 # Only what pgcrypto needs: no TLS sockets, threads, DSO/providers modules,
 # engines, console UI, stdio or config autoloading. Its seed source on __wasi__
@@ -56,6 +63,14 @@ if [ ! -f "$OSSL_PREFIX/lib/libcrypto.a" ]; then
   # one after the other in the same way.
   make build_generated >/dev/null
   make -j"$(nproc)" libcrypto.a >/dev/null
+  # Fail if a future OpenSSL stops honoring SOURCE_DATE_EPOCH: the build date
+  # must be the pinned one, not the wall clock.
+  want="built on: $(perl -e 'print scalar gmtime($ARGV[0])' "$SOURCE_DATE_EPOCH") UTC"
+  grep -qF "\"$want\"" crypto/buildinf.h || {
+    echo "openssl: crypto/buildinf.h does not carry '$want'" >&2
+    grep -F 'built on' crypto/buildinf.h >&2 || true
+    exit 1
+  }
   mkdir -p "$OSSL_PREFIX/lib"
   cp libcrypto.a "$OSSL_PREFIX/lib/"
   rm -rf "$OSSL_PREFIX/include"

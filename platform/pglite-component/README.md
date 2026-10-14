@@ -65,6 +65,32 @@ It fails if the final artifact imports sockets or leaves the engine unresolved.
 Ship `dist/di-framework-pglite.wasm` together with `THIRD-PARTY-NOTICES.txt`.
 Build provenance and checksums are in `dist/BUILD-INFO.txt` and `SHA256SUMS`.
 
+On one host architecture and one builder image, two clean engine builds are
+byte-identical. `scripts/build-engine.ts` sets `SOURCE_DATE_EPOCH` to the commit
+time of the pinned engine recipe (`PGLITE_SOURCE_REF`) and passes it into the
+build container. OpenSSL then writes that date into `crypto/buildinf.h`
+instead of the wall clock, so `libcrypto.a` is deterministic, and clang's
+`__DATE__`/`__TIME__` are fixed. `engine/build-pgcrypto.sh` fails if
+`buildinf.h` does not carry the pinned date. The engine does not link
+OpenSSL's build info today, so this guards against it being linked in later.
+`make reproducible` builds the engine twice from clean copies of the package
+and fails unless `pglite.wasi`, `engine.core.wasm`, `engine.wasm` and every
+embedded support file have the same sha256. The builds go in a new
+`df-pglite-repro.*` directory under the system temp dir, or under
+`REPRO_ARGS="--work-dir DIR"`, an existing directory outside the repository checkout.
+Only that new directory is deleted, and it is kept if a build fails or the
+digests differ. `--sdk-cache DIR` reuses SDK tarballs you have already
+downloaded, and `--keep` keeps both builds. The
+[reproducibility workflow](../../.github/workflows/pglite-engine-reproducible.yml)
+runs the check on x86_64 when an engine input changes.
+
+The results are not portable across these limits:
+- An aarch64 host and an x86_64 host produce different engines and support
+  files, so an Apple Silicon build does not reproduce the released x86_64
+  engine.
+- The builder image's `FROM debian:12` tag and its `apt-get` packages are not
+  pinned, so builds made months apart can differ.
+
 `make smoke` composes a real WIT consumer, runs it without network access, and
 checks typed parameters/results, SQL errors and recovery, transactions,
 rollback on close/drop, exclusive connection ownership, durability settings,
