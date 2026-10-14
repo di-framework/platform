@@ -187,8 +187,9 @@ jobs:
         with:
           wash-version: v2.5.2
 
-      # oras points the version tag at the manifest wash pushed, so every tag
-      # shares one digest. Pinned by version and checksum.
+      # The publisher pushes the component, its config and one manifest for
+      # every tag with oras; wash pulls it back by digest. Pinned by version
+      # and checksum.
       - name: Install oras
         run: |
           set -euo pipefail
@@ -220,9 +221,10 @@ jobs:
           fi
 
       # The publisher re-verifies SHA256SUMS, the exported database interface
-      # and that every import is wasi:*, then pushes the commit and version
-      # tag, pulls it back by digest, and points the
-      # version tag at that same manifest.
+      # and that every import is wasi:*, then pushes one manifest under the
+      # commit and version tag and pulls it back by digest. The manifest holds
+      # no wall-clock time (SOURCE_DATE_EPOCH stays unset), so an unchanged
+      # component keeps its digest and the pin job finds nothing to pin.
       # Right before the tags move: a re-run of an older push whose inputs main has since
       # changed stops here (check-source is not re-run by "Re-run failed jobs").
       - name: Stop if main has newer inputs

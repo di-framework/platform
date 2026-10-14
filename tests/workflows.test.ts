@@ -455,24 +455,20 @@ test('every job that runs oras sets it up first (C1)', () => {
     step.uses === './.github/actions/setup-oras' ||
     step.uses === './.github/actions/setup-source-check' ||
     /oras_\$\{version\}_linux_amd64\.tar\.gz/.test(step.run ?? '');
+  // check-source runs oras inside scripts/source-check.ts, and the Wasm component publishers
+  // (wasm-component-publisher) push the layer, config and manifest with oras.
+  const runsOras = (step: { run?: string }) =>
+    /(^|[\s|(])oras\s/m.test(step.run ?? '') ||
+    /scripts\/(source-check\.ts|wash-pins\.sh)/.test(step.run ?? '') ||
+    /target\/debug\/[\w-]+-publisher\b/.test(step.run ?? '');
   let checked = 0;
   for (const spec of SPECS) {
     for (const [name, job] of Object.entries(parse(spec.file).jobs)) {
       const steps = (job.steps ?? []) as { uses?: string; run?: string; name?: string }[];
-      // check-source runs oras inside scripts/source-check.ts.
-      const usesOras = steps.some(
-        (s) =>
-          /(^|[\s|(])oras\s/m.test(s.run ?? '') ||
-          /scripts\/(source-check\.ts|wash-pins\.sh)/.test(s.run ?? ''),
-      );
+      const usesOras = steps.some(runsOras);
       if (!usesOras) continue;
       checked++;
-      const first = steps.findIndex(
-        (s) =>
-          !installs(s) &&
-          (/(^|[\s|(])oras\s/m.test(s.run ?? '') ||
-            /scripts\/(source-check\.ts|wash-pins\.sh)/.test(s.run ?? '')),
-      );
+      const first = steps.findIndex((s) => !installs(s) && runsOras(s));
       const setup = steps.findIndex(installs);
       expect(setup, `${spec.file} ${name}`).toBeGreaterThanOrEqual(0);
       expect(setup, `${spec.file} ${name}`).toBeLessThan(first);
