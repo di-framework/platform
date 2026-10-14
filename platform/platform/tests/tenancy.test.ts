@@ -84,7 +84,8 @@ class MemoryApi implements Api {
         items: [...this.objects.values()]
           .filter(
             (v) =>
-              collection(v.apiVersion, v.kind) === url.pathname &&
+              (collection(v.apiVersion, v.kind) === url.pathname ||
+                collection(v.apiVersion, v.kind, v.metadata.namespace) === url.pathname) &&
               labels.every(([k, x]) => v.metadata.labels?.[k!] === x),
           )
           .map(({ apiVersion: _version, kind: _kind, ...item }) => item),
@@ -474,6 +475,55 @@ describe('tenant and user resource reconciliation', () => {
     ).toBe(true);
     expect([...api.objects.values()].filter((r) => r.kind === 'RoleBinding')).toHaveLength(0);
     expect(t.metadata.finalizers).not.toContain(FINALIZER);
+  });
+  it('keeps the Retain finalizer until the host pods are gone, terminating ones included (#245)', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t);
+    const n = names('alpha');
+    const hostPod = (name: string, namespace: string, hostgroup: string): Resource => ({
+      apiVersion: 'v1',
+      kind: 'Pod',
+      metadata: {
+        name,
+        namespace,
+        deletionTimestamp: '2026-01-01T00:00:00Z',
+        finalizers: ['runtime.wasmcloud.dev/pod-host-finalizer'],
+        labels: { 'wasmcloud.com/hostgroup': hostgroup, 'wasmcloud.com/name': 'hostgroup' },
+      },
+    });
+    // The Deployments already report zero replicas; a terminating host pod is still there.
+    api.seed(hostPod('hostgroup-terminating', n.runtimeNamespace, n.hostgroup));
+    // Another tenant's host pod never holds this tenant back.
+    const other = names('beta');
+    api.seed(hostPod('hostgroup-beta', other.runtimeNamespace, other.hostgroup));
+    t.metadata.deletionTimestamp = new Date().toISOString();
+    api.seed(t);
+    await controller.reconcileTenant(t);
+    expect(t.metadata.finalizers).toContain(FINALIZER);
+    expect(api.operations).toContainEqual({
+      method: 'GET',
+      path: `${collection('v1', 'Pod', n.runtimeNamespace)}?labelSelector=${encodeURIComponent(
+        `wasmcloud.com/hostgroup=${n.hostgroup},wasmcloud.com/name=hostgroup`,
+      )}`,
+    });
+    // Nothing is deleted while waiting: the pod, namespaces and the other tenant's pod stay.
+    expect(
+      api.objects.has(`/api/v1/namespaces/${n.runtimeNamespace}/pods/hostgroup-terminating`),
+    ).toBe(true);
+    expect(
+      api.objects.has(`/api/v1/namespaces/${other.runtimeNamespace}/pods/hostgroup-beta`),
+    ).toBe(true);
+    expect(api.objects.has(`/api/v1/namespaces/${n.runtimeNamespace}`)).toBe(true);
+    // A retry while the pod remains is a no-op; once the operator lets it go, the finalizer goes.
+    await controller.reconcileTenant(t);
+    expect(t.metadata.finalizers).toContain(FINALIZER);
+    api.objects.delete(`/api/v1/namespaces/${n.runtimeNamespace}/pods/hostgroup-terminating`);
+    await controller.reconcileTenant(t);
+    expect(t.metadata.finalizers).not.toContain(FINALIZER);
+    expect(api.objects.has(`/api/v1/namespaces/${n.runtimeNamespace}`)).toBe(true);
+    expect(
+      api.objects.has(`/api/v1/namespaces/${other.runtimeNamespace}/pods/hostgroup-beta`),
+    ).toBe(true);
   });
   it('waits for both namespaces to disappear before completing Delete', async () => {
     const { api, controller, t } = prepare();

@@ -1,6 +1,12 @@
 import { expect, test } from 'bun:test';
 import type { LiveTenant } from '../src/tenancy/removal';
-import { type HostNamespacesArgs, operatorHostNamespaces } from '../src/watched-namespaces';
+import {
+  describeListError,
+  type HostNamespacesArgs,
+  isTransientListError,
+  operatorHostNamespaces,
+  TENANT_LIST_RETRY_DELAYS_MS,
+} from '../src/watched-namespaces';
 
 /** A `tenancy/removal` lister stub that records the installation it is asked for. */
 function live(...tenants: string[]) {
@@ -39,6 +45,7 @@ function args(
     declared: ['alpha'],
     dryRun: false,
     log,
+    sleep: async () => {},
     ...extra,
   };
 }
@@ -133,4 +140,142 @@ test('API errors fail the update with a clear message, never the response body',
   ).rejects.toThrow('(#227): ECONNREFUSED');
   await expect(failing(new Error('token: hunter2'))).rejects.toThrow('(#227): Error');
   await expect(failing(new Error('token: hunter2'))).rejects.not.toThrow('hunter2');
+});
+
+test('transient list failures are retried with a short backoff before failing (#245)', async () => {
+  const { log } = recorder();
+  const slept: number[] = [];
+  const sleep = async (ms: number) => {
+    slept.push(ms);
+  };
+  const failures: unknown[] = [
+    new ApiError(503),
+    Object.assign(new Error('reset'), { code: 'ECONNRESET' }),
+    new ApiError(429),
+  ];
+  let calls = 0;
+  const listTenants = async (): Promise<LiveTenant[]> => {
+    calls++;
+    const failure = failures.shift();
+    if (failure) throw failure;
+    return [{ metadata: { name: 'alpha' } }, { metadata: { name: 'beta' } }];
+  };
+  expect(await operatorHostNamespaces(args({ listTenants, sleep }, log))).toEqual([
+    'wasmcloud',
+    'di-runtime-alpha',
+    'di-runtime-beta',
+  ]);
+  expect(calls).toBe(4);
+  expect(slept).toEqual([...TENANT_LIST_RETRY_DELAYS_MS]);
+});
+
+test('a transient failure that persists still fails the update after the last attempt', async () => {
+  const { log } = recorder();
+  let calls = 0;
+  const listTenants = async (): Promise<LiveTenant[]> => {
+    calls++;
+    throw Object.assign(new Error('connect'), { cause: { code: 'ETIMEDOUT' } });
+  };
+  await expect(operatorHostNamespaces(args({ listTenants }, log))).rejects.toThrow(
+    '(#227): ETIMEDOUT',
+  );
+  expect(calls).toBe(TENANT_LIST_RETRY_DELAYS_MS.length + 1);
+});
+
+test('permanent failures and a missing CRD are not retried', async () => {
+  const { log } = recorder();
+  for (const [error, outcome] of [
+    [new ApiError(403), 'reject'],
+    [new ApiError(404), 'empty'],
+    [new Error('bad kubeconfig'), 'reject'],
+  ] as const) {
+    let calls = 0;
+    const listTenants = async (): Promise<LiveTenant[]> => {
+      calls++;
+      throw error;
+    };
+    const result = operatorHostNamespaces(args({ listTenants }, log));
+    if (outcome === 'empty') expect(await result).toEqual(['wasmcloud', 'di-runtime-alpha']);
+    else await expect(result).rejects.toThrow('(#227)');
+    expect(calls).toBe(1);
+  }
+});
+
+test('transient errors are HTTP 429, 5xx and connection codes only', () => {
+  expect(isTransientListError(new ApiError(500))).toBe(true);
+  expect(isTransientListError(new ApiError(429))).toBe(true);
+  expect(isTransientListError(new ApiError(401))).toBe(false);
+  expect(isTransientListError(Object.assign(new Error(), { code: 'EAI_AGAIN' }))).toBe(true);
+  expect(isTransientListError(Object.assign(new Error(), { code: 'ENOTFOUND' }))).toBe(false);
+  expect(isTransientListError(Object.assign(new Error(), { cause: { code: 'EPIPE' } }))).toBe(true);
+  expect(isTransientListError(new Error('plain'))).toBe(false);
+  expect(isTransientListError('ECONNRESET')).toBe(false);
+  expect(isTransientListError(null)).toBe(false);
+});
+
+test('a kubeconfig error says what to check, quoting only known client-node messages (#245)', async () => {
+  const { log } = recorder();
+  const failing = (error: unknown) =>
+    operatorHostNamespaces(
+      args(
+        {
+          listTenants: async () => {
+            throw error;
+          },
+        },
+        log,
+      ),
+    );
+  await expect(
+    failing(new Error('HTTP protocol is not allowed when skipTLSVerify is not set or false')),
+  ).rejects.toThrow(
+    '(#227): Error: HTTP protocol is not allowed when skipTLSVerify is not set or false (check the kubeconfig)',
+  );
+  expect(describeListError(new Error('No active cluster!'))).toBe(
+    'Error: No active cluster! (check the kubeconfig)',
+  );
+  expect(describeListError(new Error('Unsupported proxy type'))).toBe(
+    'Error: Unsupported proxy type (check the kubeconfig)',
+  );
+  expect(describeListError(new Error('users[0].name is missing'))).toBe(
+    'Error: users[0].name is missing (check the kubeconfig)',
+  );
+  expect(describeListError(new Error('clusters[2].cluster.server is missing'))).toContain(
+    'clusters[2].cluster.server is missing',
+  );
+  // Any other message may quote the kubeconfig: only the class and a fixed hint are shown.
+  const unknown = describeListError(new Error('token: hunter2'));
+  expect(unknown).toBe(
+    "Error (no HTTP status or error code; check the kubeconfig's server URL, TLS settings and credentials)",
+  );
+  expect(describeListError(new Error('Duplicate user: hunter2'))).not.toContain('hunter2');
+  const yaml = Object.assign(new Error('bad indentation: password: hunter2'), {
+    name: 'YAMLException',
+  });
+  expect(describeListError(yaml)).toStartWith('YAMLException (no HTTP status');
+  expect(describeListError(yaml)).not.toContain('hunter2');
+  // A status or code is enough on its own.
+  expect(describeListError(new ApiError(403))).toBe('HTTP 403');
+  expect(describeListError(Object.assign(new Error('x'), { cause: { code: 'EPIPE' } }))).toBe(
+    'EPIPE',
+  );
+  expect(describeListError(null)).toBe(
+    "unknown error (no HTTP status or error code; check the kubeconfig's server URL, TLS settings and credentials)",
+  );
+});
+
+test('without an injected sleep, a retry really waits before the next attempt', async () => {
+  const { log } = recorder();
+  let calls = 0;
+  const listTenants = async (): Promise<LiveTenant[]> => {
+    if (calls++ === 0) throw new ApiError(502);
+    return [];
+  };
+  const started = Date.now();
+  expect(await operatorHostNamespaces(args({ listTenants, sleep: undefined }, log))).toEqual([
+    'wasmcloud',
+    'di-runtime-alpha',
+  ]);
+  expect(calls).toBe(2);
+  expect(Date.now() - started).toBeGreaterThanOrEqual(TENANT_LIST_RETRY_DELAYS_MS[0] - 50);
 });

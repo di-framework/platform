@@ -1,4 +1,4 @@
-import type { TenantLister } from './tenancy/removal';
+import type { LiveTenant, TenantLister } from './tenancy/removal';
 import { names } from './tenancy/resources';
 import { describeReadError } from './token-wait';
 
@@ -14,6 +14,74 @@ export interface HostNamespacesArgs {
   /** `tenancy/removal`'s lister on the admin kubeconfig; absent without one. */
   listTenants?: TenantLister;
   log: { info(message: string): void; warn(message: string): void };
+  /** Injected for tests; waits between attempts of a transient list failure. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** Waits before the 2nd, 3rd and 4th attempt to list the Tenants (#245): 3.5 s in all. */
+export const TENANT_LIST_RETRY_DELAYS_MS = [500, 1000, 2000] as const;
+
+const TRANSIENT_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'EPIPE']);
+
+/** HTTP 429 or 5xx, or a connection error that a retry can clear. */
+export function isTransientListError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const { code, cause } = error as { code?: unknown; cause?: unknown };
+  if (typeof code === 'number') return code === 429 || code >= 500;
+  const causeCode = (cause as { code?: unknown } | null | undefined)?.code;
+  const name = typeof code === 'string' ? code : causeCode;
+  return typeof name === 'string' && TRANSIENT_CODES.has(name);
+}
+
+/**
+ * @kubernetes/client-node raises kubeconfig problems as plain `Error`s. These messages are fixed
+ * text (or name only a list index), so they are safe to repeat; any other message may quote the
+ * kubeconfig and is never shown.
+ */
+const SAFE_KUBECONFIG_MESSAGES = [
+  /^HTTP protocol is not allowed when skipTLSVerify is not set or false$/,
+  /^No active cluster!$/,
+  /^Unsupported proxy type$/,
+  /^(clusters|users|contexts)\[\d+\]\.[a-z.]+ is missing$/,
+];
+
+/**
+ * `describeReadError` (HTTP status, error code or class), plus what to check when the error has
+ * no status or code (#245): the kubeconfig could not be used, which client-node reports as a
+ * plain `Error`. A known client-node message is quoted; nothing else the error says is.
+ */
+export function describeListError(error: unknown): string {
+  const described = describeReadError(error);
+  const { code, cause } = (typeof error === 'object' && error !== null ? error : {}) as {
+    code?: unknown;
+    cause?: unknown;
+  };
+  if (code !== undefined || (cause as { code?: unknown } | null | undefined)?.code !== undefined)
+    return described;
+  const message = error instanceof Error ? error.message : '';
+  const known = SAFE_KUBECONFIG_MESSAGES.some((pattern) => pattern.test(message));
+  return known
+    ? `${described}: ${message} (check the kubeconfig)`
+    : `${described} (no HTTP status or error code; check the kubeconfig's server URL, TLS settings and credentials)`;
+}
+
+const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Lists the Tenants, retrying transient failures a few times with a short backoff (#245). */
+async function listWithRetry(
+  list: TenantLister,
+  installation: string,
+  sleep: (ms: number) => Promise<void>,
+): Promise<LiveTenant[]> {
+  for (const delay of TENANT_LIST_RETRY_DELAYS_MS) {
+    try {
+      return await list(installation);
+    } catch (error) {
+      if (!isTransientListError(error)) throw error;
+      await sleep(delay);
+    }
+  }
+  return list(installation);
 }
 
 /**
@@ -25,7 +93,9 @@ export interface HostNamespacesArgs {
  * host pods' finalizers there while the controller drains the tenant. The Tenant object exists
  * only until that drain is done, under both deletion policies (`Delete` removes the namespaces
  * first; `Retain` scales the hosts to zero and keeps the namespaces), so the next `up` stops
- * watching the namespace. A retained namespace is never watched on its own account.
+ * watching the namespace. A retained namespace is never watched on its own account. Transient
+ * list failures are retried briefly (#245); other failures, except a missing Tenant CRD, fail
+ * the update.
  */
 export async function operatorHostNamespaces(args: HostNamespacesArgs): Promise<string[]> {
   const runtime = (tenant: string) => names(tenant).runtimeNamespace;
@@ -44,13 +114,15 @@ export async function operatorHostNamespaces(args: HostNamespacesArgs): Promise<
   }
   let live: string[];
   try {
-    live = (await args.listTenants(args.installation)).map((t) => t.metadata.name);
+    live = (await listWithRetry(args.listTenants, args.installation, args.sleep ?? realSleep)).map(
+      (t) => t.metadata.name,
+    );
   } catch (error) {
     // No Tenant CRD yet (a first install): no Tenants. Anything else fails the update rather
     // than shrinking the list; the message never carries a response body or the kubeconfig.
     if ((error as { code?: unknown } | null)?.code !== 404)
       throw new Error(
-        `Cannot list the Tenants of installation ${args.installation}, which keep a removed tenant's runtime namespace watched by the wasmCloud operator until the Tenant is deleted (#227): ${describeReadError(error)}`,
+        `Cannot list the Tenants of installation ${args.installation}, which keep a removed tenant's runtime namespace watched by the wasmCloud operator until the Tenant is deleted (#227): ${describeListError(error)}`,
       );
     live = [];
   }
