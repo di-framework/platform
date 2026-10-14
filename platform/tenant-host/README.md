@@ -209,8 +209,15 @@ components admitting calls. A call of the old revision that was queued, or arriv
 an error instead of opening the component again, so the new revision waits only for calls already
 in flight. This holds for every path that opens the component: the pooled calls, linked calls and
 the stores built through `new_store` (p2 HTTP and the messaging plugins), which check the stopped
-flag before and after waiting for the store lease. A registry entry goes away once no pool, permit or
-store refers to its gates.
+flag before and after waiting for the store lease (a store with no exclusive component waits for no
+lease and skips the second check). A registry entry goes away once no pool, permit or store refers
+to its gates.
+
+When a component attaches a gate that is already live, the host logs it at info level:
+`exclusive component's gate is already live`, with the component, its namespace and `keyed_by`
+(`volume mounts`, or `namespace and name (no volume mount)`). This is expected once per rollout,
+because the new revision resolves while the old one is still stopping; that log line is where the
+new revision starts waiting behind the old one.
 
 Limits of the guarantee:
 
@@ -226,8 +233,9 @@ Limits of the guarantee:
 - Two exclusive components with the same mounts (or the same name and namespace and no mounts) can
   never both be serving: the one that starts second waits for the first to stop and fails once the
   wait times out. With no mount the key is only the namespace and the name, so an unrelated
-  workload that reuses them is held back the same way; the host logs a warning naming the
-  component and namespace when a component with no mount attaches a gate that is already live.
+  workload that reuses them is held back the same way. The host does not tell this apart from a
+  rollout: both log the same info line, with `keyed_by` set to `namespace and name (no volume
+  mount)`, so give an exclusive component a volume mount (or a unique name) to rule it out.
 
 Consequences. Calls to an exclusive component are serialised, so its throughput is one call at a
 time. Waiting calls hold their request open for up to the wait timeout.
@@ -272,7 +280,8 @@ way `workload_stop` does. They cover these cases:
 - a caller queued on the shared call permit when the workload is stopped is refused once admitted
   and builds nothing, and an instance being built during the stop is dropped instead of installed,
   so the next revision proceeds;
-- a store requested through `new_store` for a stopped workload is refused;
+- a store requested through `new_store` for a stopped workload is refused, and so is one that was
+  already waiting on the store lease when the workload stopped (the check after the wait);
 - a symlink to the old revision's directory shares its gate (the key is the canonical path).
 `tests/integration_exclusive_topology.rs` (needs the prebuilt test fixtures) covers the layout rule,
 a lone exclusive component loading and queueing real requests (it does not measure

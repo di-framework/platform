@@ -909,10 +909,10 @@ index 9be47f2..b158262 100644
      use std::sync::Arc;
 diff --git a/crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs b/crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs
 new file mode 100644
-index 0000000..f1e98b6
+index 0000000..fa57600
 --- /dev/null
 +++ b/crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs
-@@ -0,0 +1,1242 @@
+@@ -0,0 +1,1275 @@
 +//! Exclusive components never have two stores alive at once.
 +//!
 +//! These drive real concurrency through the production dispatch path
@@ -1962,6 +1962,39 @@ index 0000000..f1e98b6
 +    assert!(err.to_string().contains("stopping"), "{err}");
 +}
 +
++/// A store already waiting on the store lease when the workload is stopped
++/// passes the check before the wait, so only the check after it refuses the
++/// store instead of letting it take the lease from the next revision.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn a_store_queued_on_the_lease_at_stop_is_refused() {
++    let dir = tempfile::tempdir().expect("temp dir");
++    let engine = one_engine();
++    let old = exclusive_workload(&engine, "tenant", "pglite-rev1", Some(dir.path())).await;
++    let id = old
++        .components()
++        .read()
++        .await
++        .keys()
++        .next()
++        .expect("one component")
++        .to_string();
++
++    let first = old.new_store(&id).await.expect("first store");
++    let queued = {
++        let (old, id) = (old.clone(), id.clone());
++        tokio::spawn(async move { old.new_store(&id).await.map(drop) })
++    };
++    tokio::time::sleep(Duration::from_millis(200)).await;
++    assert!(!queued.is_finished(), "queued on the store lease");
++    old.unbind_all_plugins().await.expect("old stops");
++    drop(first);
++    let err = queued
++        .await
++        .expect("queued task joins")
++        .expect_err("a store queued at stop is refused");
++    assert!(err.to_string().contains("stopping"), "{err}");
++}
++
 +/// A symlink to the old revision's directory is the same host path: the key is
 +/// the canonical path, so the gate is shared.
 +#[cfg(unix)]
@@ -2345,7 +2378,7 @@ index b894375..d22535a 100644
      }
  }
 diff --git a/crates/wash-runtime/src/engine/workload.rs b/crates/wash-runtime/src/engine/workload.rs
-index b8f06ab..1e488f4 100644
+index b8f06ab..0112470 100644
 --- a/crates/wash-runtime/src/engine/workload.rs
 +++ b/crates/wash-runtime/src/engine/workload.rs
 @@ -621,19 +621,30 @@ struct ServiceStoreRecipe {
@@ -2380,7 +2413,7 @@ index b8f06ab..1e488f4 100644
          )
          .await
      }
-@@ -945,6 +956,54 @@ impl ResolvedWorkload {
+@@ -945,6 +956,59 @@ impl ResolvedWorkload {
          &self.host_interfaces
      }
  
@@ -2413,18 +2446,23 @@ index b8f06ab..1e488f4 100644
 +                &component.name,
 +            );
 +            debug!(component = component.name(), ?key, "exclusive gate");
-+            let named = matches!(key, instance_pool::GateKey::Named { .. });
++            let keyed_by = match key {
++                instance_pool::GateKey::Named { .. } => "namespace and name (no volume mount)",
++                instance_pool::GateKey::Volumes(_) => "volume mounts",
++            };
 +            let (gate, fresh) = gates.gate_for(key);
-+            if named && !fresh {
-+                // Without a volume mount the key is only namespace + name, so
-+                // this may be an unrelated workload that happens to share them.
-+                warn!(
++            if !fresh {
++                // An ordinary rollout lands here: the new revision resolves
++                // while the old one is still stopping. Without a volume mount
++                // the key is only namespace + name, so it may also be an
++                // unrelated workload that shares them.
++                info!(
 +                    component = component.name(),
 +                    namespace = &*component.metadata.workload_namespace,
-+                    "exclusive component has no volume mount and attached a gate that is already \
-+                     live under its namespace and name: it shares one instance with every other \
-+                     workload using that name, and calls wait for each other (or time out) until \
-+                     the other workload stops"
++                    keyed_by,
++                    "exclusive component's gate is already live: an earlier revision that is \
++                     still stopping, or another workload with the same key; its calls wait until \
++                     that one stops"
 +                );
 +            }
 +            component.instances.attach_gate(gate)?;
@@ -2435,7 +2473,7 @@ index b8f06ab..1e488f4 100644
      async fn resolve_component_volume_mounts(
          &self,
          component_ids: &[Arc<str>],
-@@ -1148,6 +1207,54 @@ impl ResolvedWorkload {
+@@ -1148,6 +1212,54 @@ impl ResolvedWorkload {
              res?;
          }
  
@@ -2490,7 +2528,7 @@ index b8f06ab..1e488f4 100644
          Ok(())
      }
  
-@@ -1481,12 +1588,29 @@ impl ResolvedWorkload {
+@@ -1481,12 +1593,29 @@ impl ResolvedWorkload {
          &self,
          component_id: &str,
      ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
@@ -2521,22 +2559,27 @@ index b8f06ab..1e488f4 100644
              let active_template = self.component_ctx_template(metadata);
              let mut linked_templates = Vec::with_capacity(metadata.linked_components.len());
              let mut linked_instances = Vec::with_capacity(metadata.linked_components.len());
-@@ -1502,8 +1626,14 @@ impl ResolvedWorkload {
+@@ -1502,8 +1631,19 @@ impl ResolvedWorkload {
                  active_template,
                  linked_templates,
                  linked_instances,
 +                gates,
              )
          };
++        // Only exclusive components have store gates, so a store with none
++        // waits for nothing and needs no second look at the component map.
++        let exclusive = !gates.is_empty();
 +        // Waited for with the component map unlocked: the store being waited
 +        // for may need the lock to finish.
 +        let leases = instance_pool::lease_stores(gates, deadline).await?;
 +        // The workload may have been stopped while this waited in line.
-+        instance_pool::ensure_exclusive_running(&*self.components.read().await, &held)?;
++        if exclusive {
++            instance_pool::ensure_exclusive_running(&*self.components.read().await, &held)?;
++        }
          new_store_from_templates(
              &engine,
              self.http_handler.clone(),
-@@ -1511,6 +1641,7 @@ impl ResolvedWorkload {
+@@ -1511,6 +1651,7 @@ impl ResolvedWorkload {
              &linked_templates,
              &linked_instances,
              false,
@@ -2544,7 +2587,7 @@ index b8f06ab..1e488f4 100644
          )
          .await
      }
-@@ -1554,15 +1685,7 @@ impl ResolvedWorkload {
+@@ -1554,15 +1695,7 @@ impl ResolvedWorkload {
          is_service: bool,
      ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
          let recipe = self.service_store_recipe(metadata).await?;
@@ -2561,7 +2604,7 @@ index b8f06ab..1e488f4 100644
      }
  
      /// Capture everything needed to (re)build this service's store, so the
-@@ -1577,9 +1700,10 @@ impl ResolvedWorkload {
+@@ -1577,9 +1710,10 @@ impl ResolvedWorkload {
              .iter()
              .cloned()
              .collect::<Vec<_>>();
@@ -2574,7 +2617,7 @@ index b8f06ab..1e488f4 100644
                  .iter()
                  .map(|linked_component_id| {
                      components
-@@ -1589,7 +1713,8 @@ impl ResolvedWorkload {
+@@ -1589,7 +1723,8 @@ impl ResolvedWorkload {
                              format!("linked component '{linked_component_id}' not found")
                          })
                  })
@@ -2584,7 +2627,7 @@ index b8f06ab..1e488f4 100644
          };
          let active_template = self.component_ctx_template(metadata);
          let linked_templates = linked_metadata
-@@ -1610,6 +1735,7 @@ impl ResolvedWorkload {
+@@ -1610,6 +1745,7 @@ impl ResolvedWorkload {
              active_template,
              linked_templates,
              linked_instances,
@@ -2592,7 +2635,7 @@ index b8f06ab..1e488f4 100644
          })
      }
  
-@@ -1937,6 +2063,10 @@ pub struct UnresolvedWorkload {
+@@ -1937,6 +2073,10 @@ pub struct UnresolvedWorkload {
      /// TLS provider override for `wasi:tls` client connections in this workload.
      #[cfg(feature = "wasi-tls")]
      tls_provider: Option<SharedTlsProvider>,
@@ -2603,7 +2646,7 @@ index b8f06ab..1e488f4 100644
  }
  
  impl UnresolvedWorkload {
-@@ -1979,9 +2109,19 @@ impl UnresolvedWorkload {
+@@ -1979,9 +2119,19 @@ impl UnresolvedWorkload {
              host_interfaces,
              #[cfg(feature = "wasi-tls")]
              tls_provider: None,
@@ -2623,7 +2666,7 @@ index b8f06ab..1e488f4 100644
      /// Iterates the workload's components in manifest order.
      fn components_in_manifest_order(&self) -> impl Iterator<Item = &WorkloadComponent> {
          self.component_order
-@@ -2535,6 +2675,20 @@ impl UnresolvedWorkload {
+@@ -2535,6 +2685,20 @@ impl UnresolvedWorkload {
              bail!(e);
          }
  
