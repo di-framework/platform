@@ -10,8 +10,18 @@ const checksums: Record<string, string> = {
   'linux-amd64': 'f8180838c23d7c7d797b208861fecb591d9ce1690d8704ed1e4cb8e2add966c1',
 };
 
-/** helm on the PATH, else a checksum-verified download into `.tools` (as `chart.test.ts`). */
-export async function helm(): Promise<string> {
+let resolved: Promise<string> | undefined;
+
+/**
+ * helm on the PATH, else a checksum-verified download into the package's `.tools`. Resolved
+ * once per process, so concurrent renders never race on the download.
+ */
+export function helm(): Promise<string> {
+  resolved ??= locate();
+  return resolved;
+}
+
+async function locate(): Promise<string> {
   const found = Bun.which('helm');
   if (found) return found;
   const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';

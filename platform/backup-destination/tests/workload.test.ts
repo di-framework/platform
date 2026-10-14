@@ -1701,9 +1701,14 @@ describe('#254: a dropped ledger entry is never silent', () => {
     const message = `WorkloadDeployment identity got its 2 replicas back from ${holder}; its BackupDestination pvc is gone.`;
     // After the scale and the ledger write, so it reports what really happened.
     expect(cluster.types(sweep)).toEqual(['scale-workload', 'ledger', 'log', 'event']);
+    // If the scale meets a 404 instead, the signal says the workload was deleted (#263).
+    const ifGone = {
+      workload: 'identity',
+      message: `WorkloadDeployment identity was deleted before its 2 replicas from ${holder} could be given back, so its entry was removed; its BackupDestination pvc is gone.`,
+    };
     expect(signals(sweep)).toEqual([
-      { type: 'log', message },
-      { type: 'event', eventType: 'Normal', reason: 'HeldReplicasReleased', message },
+      { type: 'log', message, ifGone },
+      { type: 'event', eventType: 'Normal', reason: 'HeldReplicasReleased', message, ifGone },
     ]);
   });
 
@@ -1884,7 +1889,6 @@ describe('#263: an orphaned held-replicas entry is bound to its workload, and re
     expect(scaled(keyOnly)).toEqual([{ type: 'scale-workload', name: 'identity', replicas: 3 }]);
 
     const refused: [Record<string, unknown>, string][] = [
-      [{}, 'the entry records no storage key to match the workload against'],
       [
         { storageKey: 'reports' },
         'the storage key the entry recorded (reports) is not the workload',
@@ -1908,6 +1912,60 @@ describe('#263: an orphaned held-replicas entry is bound to its workload, and re
         'It keeps its current replicas (0); scale it by hand if it should run.',
       );
     }
+  });
+
+  test('W1: an entry from before the binding (no key, no uid) is given back once, and says so', () => {
+    const { cluster, holder } = orphaned();
+    // The entry an earlier operator wrote: no storage key and no uid.
+    const { storageKey: _key, workloadUid: _uid, ...legacy } = must(cluster.held().identity);
+    cluster.world = {
+      ...cluster.world,
+      ledger: { ...cluster.world.ledger, entries: { identity: legacy } },
+    };
+    const sweep = cluster.tick();
+    expect(scaled(sweep)).toEqual([{ type: 'scale-workload', name: 'identity', replicas: 2 }]);
+    expect(cluster.replicas()).toBe(2);
+    expect(cluster.held()).toEqual({});
+    const message = `WorkloadDeployment identity got its 2 replicas back from ${holder}; its BackupDestination pvc is gone (the entry was written before held entries recorded a storage key).`;
+    expect(signals(sweep)).toEqual([
+      { type: 'log', message, ifGone: expect.any(Object) },
+      {
+        type: 'event',
+        eventType: 'Normal',
+        reason: 'HeldReplicasReleased',
+        message,
+        ifGone: expect.any(Object),
+      },
+    ]);
+    // Released once: nothing is held, so the next tick neither scales nor reports.
+    const next = cluster.tick();
+    expect(scaled(next)).toEqual([]);
+    expect(signals(next)).toEqual([]);
+    // A legacy entry with a recorded uid still has to match it.
+    const recreated = releaseOrphans(gone({ workloadUid: 'uid-before' }));
+    expect(scaled(recreated)).toEqual([]);
+  });
+
+  test('S3: a release whose scale finds the workload deleted says so', () => {
+    const actions = releaseOrphans(gone({ storageKey: 'identity' }));
+    const ifGone = {
+      workload: 'identity',
+      message:
+        'WorkloadDeployment identity was deleted before its 3 replicas from Backup/gone could be given back, so its entry was removed; its BackupDestination old is gone.',
+    };
+    expect(signals(actions)).toEqual([
+      { type: 'log', message: expect.stringContaining('got its 3 replicas back'), ifGone },
+      {
+        type: 'event',
+        eventType: 'Normal',
+        reason: 'HeldReplicasReleased',
+        message: expect.stringContaining('got its 3 replicas back'),
+        ifGone,
+      },
+    ]);
+    // Without a scale there is no 404 to meet: no alternative message.
+    const raised = releaseOrphans(gone({ storageKey: 'identity' }, [workload()]));
+    expect(signals(raised).some((action) => 'ifGone' in action)).toBe(false);
   });
 
   test('S1: an entry naming a volume the workload no longer has never scales it', () => {

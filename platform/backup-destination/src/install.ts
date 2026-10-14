@@ -88,7 +88,7 @@ const FIELDS = [
 ];
 const CHART_CRON = new RegExp(
   `^${FIELDS.map((value) => {
-    const element = `(\\*|(${value})(-(${value}))?)(/[1-9][0-9]*)?`;
+    const element = String.raw`(\*|(${value})(-(${value}))?)(/[1-9][0-9]*)?`;
     return `${element}(,${element})*`;
   }).join(' ')}$`,
 );

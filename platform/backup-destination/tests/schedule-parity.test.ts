@@ -84,33 +84,28 @@ describe('#263 S5: the installer and the chart accept the same crons', () => {
   ];
 
   test('every form is accepted or refused by both, for the destination and for a source', async () => {
-    for (const where of ['destination', 'source'] as const) {
-      for (const schedule of accepted) {
-        expect([schedule, where, installerAccepts(schedule, where)]).toEqual([
-          schedule,
-          where,
-          true,
-        ]);
-        expect([schedule, where, await chartAccepts(schedule, where)]).toEqual([
-          schedule,
-          where,
-          true,
-        ]);
-        // Whatever both accept, the operator can fire.
-        expect(validCron(schedule)).toBe(true);
-      }
-      for (const schedule of refused) {
-        expect([schedule, where, installerAccepts(schedule, where)]).toEqual([
-          schedule,
-          where,
-          false,
-        ]);
-        expect([schedule, where, await chartAccepts(schedule, where)]).toEqual([
-          schedule,
-          where,
-          false,
-        ]);
-      }
-    }
+    const cases = (['destination', 'source'] as const).flatMap((where) => [
+      ...accepted.map((schedule) => ({ schedule, where, expected: true })),
+      ...refused.map((schedule) => ({ schedule, where, expected: false })),
+    ]);
+    // The renders are independent: run them together, as chart.test.ts does.
+    const verdicts = await Promise.all(
+      cases.map(async ({ schedule, where }) => ({
+        schedule,
+        where,
+        installer: installerAccepts(schedule, where),
+        chart: await chartAccepts(schedule, where),
+      })),
+    );
+    expect(verdicts).toEqual(
+      cases.map(({ schedule, where, expected }) => ({
+        schedule,
+        where,
+        installer: expected,
+        chart: expected,
+      })),
+    );
+    // Whatever both accept, the operator can fire.
+    for (const schedule of accepted) expect(validCron(schedule)).toBe(true);
   }, 60_000);
 });
