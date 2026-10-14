@@ -167,6 +167,15 @@ allowlisted registry and pull everything else over TLS. Check three things befor
 - **Tenant hosts roll once.** The default host image, the host args and, on insecure installs,
   the mounted controller CA all change, so each tenant host group restarts on the upgrade.
 
+#### Upgrading to tenant hosts that trust the controller CA for `wasi:http` (#113)
+
+- **Tenant hosts with a registry roll once.** When `tenantAuth.registry` is set, each tenant
+  host group that already mounts the controller CA (`platform.di-framework.dev/registry-ca-sha256`
+  on its pod template) gains `--http-client-ca-path=/registry-ca/ca.crt` in its args, so it
+  restarts once on the upgrade. Host groups without a registry keep the same template and do not
+  roll. A single-host tenant such as `identity` (`maxSurge: 0, maxUnavailable: 1`) is unavailable
+  while its one host restarts, so plan the upgrade for a quiet window.
+
 ### Tenant removal and namespace retention
 
 Each `tenants` entry takes `deletionPolicy` (`Retain` or `Delete`, default `Retain`). The
@@ -867,7 +876,10 @@ tenantAuth:
       `tenant-controller-ca`. A CA:TRUE end-entity certificate is rejected by wash (rustls), hence the split.
       The same file is passed as `--http-client-ca-path`, so the components' outgoing `wasi:http`
       trusts the tenant CA on top of the default webpki roots (#113): the registry can call the
-      controller over `https://`. Other HTTPS egress is verified as before.
+      controller over `https://`. Other HTTPS egress still trusts the webpki roots and now also
+      accepts a certificate issued by the tenant CA for any name, the same scope
+      `--oci-ca-path` already gives OCI pulls. The CA has no name constraints; #170 tracks the
+      CA follow-ups.
       wash loads both once at start, so the host template carries
       `platform.di-framework.dev/registry-ca-sha256` and a CA replacement (not a leaf renewal) rolls the hosts on
       the next poll. The listener is TLS with `insecureRegistry` too (#149): only the platform host

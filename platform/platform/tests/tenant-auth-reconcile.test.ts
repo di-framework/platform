@@ -2468,7 +2468,8 @@ describe('tenant registry host pull (#83:host-pull)', () => {
       '--oci-ca-path=/registry-ca/ca.crt',
       '--http-client-ca-path=/registry-ca/ca.crt',
     ]);
-    // Layered on the default webpki roots: the hosts' other HTTPS egress is unchanged.
+    // Layered on the default webpki roots, not replacing them. Every component's HTTPS egress
+    // also accepts any name the tenant CA signs, as --oci-ca-path does for pulls (CA follow-ups: #170).
     expect((container.args as string[]).some((arg) => arg.includes('trust-roots'))).toBe(false);
     expect(container.args).not.toContain('--allow-insecure-registries');
     expect(env(withCa).DOCKER_CONFIG).toBe('/registry-auth');
