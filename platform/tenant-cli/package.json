@@ -41,7 +41,7 @@
   "scripts": {
     "cli": "bun src/main.ts",
     "generate:api": "di-framework generate && bun scripts/generate-openapi.ts",
-    "generate:client": "bun scripts/openapi-typescript.ts api/v1/openapi.yaml -o src/client/schema.d.ts",
+    "generate:client": "bun --no-install scripts/openapi-typescript.ts api/v1/openapi.yaml -o src/client/schema.d.ts",
     "generate": "bun run generate:api && bun run generate:client",
     "build": "rm -rf dist && bun x tsc -p tsconfig.build.json && cp src/client/schema.d.ts dist/client/schema.d.ts && bun ../../scripts/fix-esm-imports.ts dist",
     "test": "bun test"
