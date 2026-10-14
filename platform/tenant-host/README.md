@@ -290,8 +290,13 @@ path, and what a caller sees of an HTTP trap: the trap fails only its own call, 
 behind it are served by a fresh instance, never the faulted one. At the pinned wasmtime a guest
 trap ends the instance's event loop, so the pool reaps the instance whatever else happens. The HTTP
 handler's `trapped` flag covers a trap reported to a task that survives it; its retirement
-(`PoolSlot::finish`) is unit-tested in `exclusive_tests.rs`. The patch-check workflow builds the
-fixtures and runs each of these tests by name. See [Tests](#tests) for the commands.
+(`PoolSlot::finish`) is unit-tested in `exclusive_tests.rs`. The timed-out test there retires the
+instance from outside, because its guest never yields. The topology file also covers a real
+timeout: an `http-sleeper` `/wedge` call yields on an hour's sleep until the HTTP exchange timeout in
+`HttpTask` ends it, and that timeout retires the instance, so the calls queued behind it are served
+by a fresh instance. The test reruns itself in a child process with
+`WASH_HTTP_RESPONSE_TIMEOUT_SECS=1`, so the other tests keep the default. The patch-check workflow
+builds the fixtures and runs each of these tests by name. See [Tests](#tests) for the commands.
 
 ## Tests
 
