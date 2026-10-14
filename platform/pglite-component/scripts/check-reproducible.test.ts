@@ -1,13 +1,17 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, realpath, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import {
+  byCodeUnit,
   combineDigests,
+  createWorkDir,
   type Digests,
   differingEntries,
   digestTree,
+  isInside,
   parseReproArgs,
+  WORK_DIR_PREFIX,
 } from './check-reproducible.ts';
 import { UsageError } from './lib/cli.ts';
 
@@ -86,5 +90,63 @@ describe('digests', () => {
     ]);
     expect(differingEntries(a, b)).toEqual(['changed', 'only-a', 'only-b']);
     expect(differingEntries(a, a)).toEqual([]);
+  });
+});
+
+describe('byCodeUnit', () => {
+  test('orders by UTF-16 code unit, not locale', () => {
+    expect(['b', 'B', 'a', 'A', '_', 'é'].sort(byCodeUnit)).toEqual(['A', 'B', '_', 'a', 'b', 'é']);
+    expect(byCodeUnit('x', 'x')).toBe(0);
+  });
+});
+
+describe('isInside', () => {
+  test('matches the root and paths below it only', () => {
+    expect(isInside('/repo', '/repo')).toBe(true);
+    expect(isInside('/repo/a/b', '/repo')).toBe(true);
+    expect(isInside('/repo-other', '/repo')).toBe(false);
+    expect(isInside('/', '/repo')).toBe(false);
+    expect(isInside('/tmp/x', '/repo')).toBe(false);
+  });
+});
+
+describe('createWorkDir', () => {
+  let parent: string;
+  let repo: string;
+
+  beforeAll(async () => {
+    parent = await realpath(await mkdtemp(join(tmpdir(), 'df-pglite-repro-parent.')));
+    repo = await realpath(await mkdtemp(join(tmpdir(), 'df-pglite-repro-repo.')));
+    await Bun.write(join(parent, 'keep.txt'), 'user data');
+  });
+
+  afterAll(async () => {
+    await rm(parent, { recursive: true, force: true });
+    await rm(repo, { recursive: true, force: true });
+  });
+
+  test('creates a new empty directory under the given parent', async () => {
+    const dir = await createWorkDir(parent, repo);
+    expect(dirname(dir)).toBe(parent);
+    expect(basename(dir).startsWith(WORK_DIR_PREFIX)).toBe(true);
+    expect(await readdir(dir)).toEqual([]);
+    expect(await Bun.file(join(parent, 'keep.txt')).text()).toBe('user data');
+    expect(await createWorkDir(parent, repo)).not.toBe(dir);
+  });
+
+  test('defaults to the system temp dir', async () => {
+    const dir = await createWorkDir(undefined, repo);
+    try {
+      expect(dirname(dir)).toBe(await realpath(tmpdir()));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('refuses the repository checkout and anything inside it', async () => {
+    await expect(createWorkDir(repo, repo)).rejects.toThrow('inside the repository checkout');
+    await expect(createWorkDir(join(repo, 'platform', 'x'), repo)).rejects.toThrow(
+      'inside the repository checkout',
+    );
   });
 });

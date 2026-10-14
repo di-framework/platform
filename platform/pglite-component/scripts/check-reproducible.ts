@@ -4,9 +4,9 @@
  * SHA-256 digests for every engine artifact the component embeds.
  */
 import { constants } from 'node:fs';
-import { copyFile, lstat, mkdir, mkdtemp, readdir, readlink, rm } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, mkdtemp, readdir, readlink, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { $ } from 'bun';
 import { type Args, type Context, logger, parseFlags, run } from './lib/cli.ts';
 import { sha256File } from './lib/fetch.ts';
@@ -19,9 +19,10 @@ const USAGE = [
   '',
   '  check-reproducible.ts [--work-dir DIR] [--sdk-cache DIR] [--keep]',
   '',
-  '  --work-dir DIR   where the two package copies are built (default: a new directory',
-  '                   under the system temp dir; keep it outside the repository, or',
-  '                   `bun test` picks up the copied test files)',
+  '  --work-dir DIR   parent of the new df-pglite-repro.* directory the two package',
+  '                   copies are built in (default: the system temp dir). It must be',
+  '                   outside the repository checkout; only the new directory is ever',
+  '                   deleted',
   '  --sdk-cache DIR  seed each copy with these SDK tarballs instead of downloading them',
   '                   (default: target/engine/source/build/cache when it exists; the',
   '                   recipe still verifies every tarball against its pinned sha256)',
@@ -64,6 +65,37 @@ export const RUNTIME_TREE = 'target/engine/runtime';
 /** SDK tarball cache of the upstream recipe inside an engine checkout. */
 export const SDK_CACHE = 'target/engine/source/build/cache';
 
+/** Code-unit order, independent of the host locale, so digests match across hosts. */
+export function byCodeUnit(a: string, b: string): number {
+  if (a < b) return -1;
+  return a > b ? 1 : 0;
+}
+
+/** True when `path` is `root` or lies below it (both absolute and resolved). */
+export function isInside(path: string, root: string): boolean {
+  const rel = relative(root, path);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !rel.startsWith(sep));
+}
+
+/** Prefix of the directory {@link createWorkDir} makes; nothing else is ever deleted. */
+export const WORK_DIR_PREFIX = 'df-pglite-repro.';
+
+/**
+ * Create a fresh, empty work directory under `parent` (default: the system
+ * temp dir). Refuses a parent inside `repoRoot`: `bun test` would pick up the
+ * copied test files, and a build tree there is easy to mistake for source.
+ */
+export async function createWorkDir(parent: string | undefined, repoRoot: string): Promise<string> {
+  const base = resolve(parent ?? tmpdir());
+  await mkdir(base, { recursive: true });
+  const real = await realpath(base);
+  const root = await realpath(repoRoot);
+  if (isInside(real, root)) {
+    throw new Error(`refusing --work-dir inside the repository checkout ${root}: ${real}`);
+  }
+  return mkdtemp(join(real, WORK_DIR_PREFIX));
+}
+
 /** Path -> digest for every regular file (sha256) and symlink (its target). */
 export type Digests = Map<string, string>;
 
@@ -71,7 +103,7 @@ export async function digestTree(root: string): Promise<Digests> {
   const out: Digests = new Map();
   const walk = async (dir: string, rel: string): Promise<void> => {
     const entries = await readdir(dir, { withFileTypes: true });
-    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    entries.sort((a, b) => byCodeUnit(a.name, b.name));
     for (const entry of entries) {
       const abs = join(dir, entry.name);
       const name = rel ? `${rel}/${entry.name}` : entry.name;
@@ -87,14 +119,15 @@ export async function digestTree(root: string): Promise<Digests> {
 /** One digest for a whole tree, stable across hosts: sorted `path\0digest\n` lines. */
 export function combineDigests(digests: Digests): string {
   const hasher = new Bun.CryptoHasher('sha256');
-  for (const name of [...digests.keys()].sort()) hasher.update(`${name}\0${digests.get(name)}\n`);
+  for (const name of [...digests.keys()].sort(byCodeUnit))
+    hasher.update(`${name}\0${digests.get(name)}\n`);
   return hasher.digest('hex');
 }
 
 /** Names whose digests differ, or that exist in only one build. */
 export function differingEntries(a: Digests, b: Digests): string[] {
   const names = new Set([...a.keys(), ...b.keys()]);
-  return [...names].filter((name) => a.get(name) !== b.get(name)).sort();
+  return [...names].filter((name) => a.get(name) !== b.get(name)).sort(byCodeUnit);
 }
 
 /** Copy the package's git-tracked files (working-tree contents) into `dest`. */
@@ -130,8 +163,8 @@ interface BuildResult {
   runtime: Digests;
 }
 
+/** Build in `copy`, a directory that must not exist yet (it is inside a fresh work dir). */
 async function cleanBuild(ctx: Context, copy: string, sdkCache: string): Promise<BuildResult> {
-  await rm(copy, { recursive: true, force: true });
   await copyPackage(ctx.pkgDir, copy);
   const seeded = await seedFiles(sdkCache, join(copy, SDK_CACHE));
   log(`clean engine build in ${copy}${seeded ? ` (${seeded} SDK tarballs seeded)` : ''}`);
@@ -158,16 +191,23 @@ async function cleanBuild(ctx: Context, copy: string, sdkCache: string): Promise
 }
 
 export async function checkReproducible(ctx: Context, options: ReproOptions): Promise<void> {
-  const workDir = options.workDir
-    ? resolve(ctx.pkgDir, options.workDir)
-    : await mkdtemp(join(tmpdir(), 'df-pglite-repro.'));
+  const repoRoot = (await $`git -C ${ctx.pkgDir} rev-parse --show-toplevel`.text()).trim();
+  const workDir = await createWorkDir(options.workDir, repoRoot);
+  log(`work dir: ${workDir}`);
   const sdkCache = resolve(ctx.pkgDir, options.sdkCache ?? SDK_CACHE);
   const firstDir = join(workDir, 'a');
-  const first = await cleanBuild(ctx, firstDir, sdkCache);
-  // Without a seed cache, hand the first build's verified SDK tarballs (over
-  // 1 GB) to the second instead of downloading them again.
-  const secondSeed = (await isDirectory(sdkCache)) ? sdkCache : join(firstDir, SDK_CACHE);
-  const second = await cleanBuild(ctx, join(workDir, 'b'), secondSeed);
+  let first: BuildResult;
+  let second: BuildResult;
+  try {
+    first = await cleanBuild(ctx, firstDir, sdkCache);
+    // Without a seed cache, hand the first build's verified SDK tarballs (over
+    // 1 GB) to the second instead of downloading them again.
+    const secondSeed = (await isDirectory(sdkCache)) ? sdkCache : join(firstDir, SDK_CACHE);
+    second = await cleanBuild(ctx, join(workDir, 'b'), secondSeed);
+  } catch (error) {
+    log(`build failed; work dir kept for inspection: ${workDir}`);
+    throw error;
+  }
 
   let identical = true;
   for (const [name, a] of first.artifacts) {

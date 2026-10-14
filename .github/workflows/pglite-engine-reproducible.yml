@@ -15,6 +15,9 @@ on:
       - 'platform/pglite-component/scripts/patch-engine-source.ts'
       - 'platform/pglite-component/scripts/prepare-engine.ts'
       - 'platform/pglite-component/scripts/check-reproducible.ts'
+      - 'platform/pglite-component/scripts/install-tools.ts'
+      - 'platform/pglite-component/scripts/lib/**'
+      - 'platform/pglite-component/Makefile'
       - 'platform/pglite-component/scripts/tool-versions.env'
       - 'platform/pglite-component/wit/deps/pglite-engine/**'
       - '.github/workflows/pglite-engine-reproducible.yml'
@@ -26,6 +29,9 @@ on:
       - 'platform/pglite-component/scripts/patch-engine-source.ts'
       - 'platform/pglite-component/scripts/prepare-engine.ts'
       - 'platform/pglite-component/scripts/check-reproducible.ts'
+      - 'platform/pglite-component/scripts/install-tools.ts'
+      - 'platform/pglite-component/scripts/lib/**'
+      - 'platform/pglite-component/Makefile'
       - 'platform/pglite-component/scripts/tool-versions.env'
       - 'platform/pglite-component/wit/deps/pglite-engine/**'
       - '.github/workflows/pglite-engine-reproducible.yml'
@@ -41,7 +47,7 @@ jobs:
   reproducible:
     name: Two clean engine builds match
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
