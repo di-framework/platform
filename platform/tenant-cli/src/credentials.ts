@@ -21,6 +21,12 @@ export interface Credential {
   issuer?: string;
   clientId?: string;
   controller: { url: string; certificateAuthorityData?: string };
+  /**
+   * The last `registry login`: the host, and either the Docker config it was stored in (with the
+   * sha256 of the entry written, so only that entry is ever removed) or the tool that stored it,
+   * so `registry logout` and `logout` can remove it without the controller.
+   */
+  registry?: { host: string; config?: string; fingerprint?: string; tool?: string };
   console?: string;
 }
 

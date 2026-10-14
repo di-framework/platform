@@ -28,6 +28,7 @@ export type Principal = components['schemas']['Principal'];
 export type DeployBundle = Body<'deploy'>;
 export type DeployPlan = Json<'previewDeploy', 200>;
 export type Deployment = Json<'deploy', 202>;
+export type RegistryInfo = Json<'registry', 200>;
 export type DeploymentList = Json<'deployments', 200>;
 export type DeploymentStats = Json<'deploymentStats', 200>;
 export type RollbackRequest = Body<'rollback'>;
@@ -51,6 +52,7 @@ const PATHS = {
   logout: '/v1/auth/logout',
   previewDeploy: '/v1/deploy/preview',
   deploy: '/v1/deploy',
+  registry: '/v1/deploy/registry',
   createService: '/v1/services',
   logs: '/v1/services/{service}/logs',
   proxy: '/v1/services/{service}/proxy',
@@ -142,6 +144,8 @@ export function createClient(options: ClientOptions) {
       json<DeployPlan>({ method: 'POST', path: PATHS.previewDeploy, body: bundle }),
     deploy: (bundle: DeployBundle) =>
       json<Deployment>({ method: 'POST', path: PATHS.deploy, body: bundle }),
+    /** The tenant's OCI registry and how to log in to it; the credential is the caller's own. */
+    registry: () => json<RegistryInfo>({ method: 'GET', path: PATHS.registry }),
 
     createService: (request: CreateServiceRequest) =>
       json<Service>({ method: 'POST', path: PATHS.createService, body: request }),

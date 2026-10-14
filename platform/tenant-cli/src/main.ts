@@ -17,12 +17,26 @@ function openBrowser(url: string): void {
   }
 }
 
+/** Runs a login tool with the password on stdin and the terminal for its output. */
+async function exec(command: string[], stdin: string): Promise<number> {
+  try {
+    const child = Bun.spawn(command, { stdin: 'pipe', stdout: 'inherit', stderr: 'inherit' });
+    child.stdin.write(stdin);
+    await child.stdin.end();
+    return await child.exited;
+  } catch (error) {
+    console.error(`cannot run ${command[0]}: ${(error as Error).message}`);
+    return 127;
+  }
+}
+
 process.exit(
   await run(process.argv.slice(2), {
     stdout: (line) => console.log(line),
     stderr: (line) => console.error(line),
     stdin: () => readFileSync(0, 'utf8'),
     open: openBrowser,
+    exec,
     env: process.env,
     cwd: process.cwd(),
   }),

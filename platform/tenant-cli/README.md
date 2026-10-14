@@ -83,7 +83,50 @@ the Tenant's TenantAuthReady condition`. The origin must be `https://`; plain `h
 accepted only for loopback (`localhost`, `127.0.0.0/8`, `[::1]`) and in-cluster hosts (`*.svc`,
 `*.svc.cluster.local`).
 
-Log in against the host of `url`, not the full URL, then push to
+`di-tenant registry` prints the URL, the login host, and the push prefix. `di-tenant registry
+login` logs in with the credential you are already logged in with (an identity token is
+refreshed first, so the stored copy gets its full lifetime); it never prints the token or key:
+
+```text
+di-tenant registry                       # url, login host, push prefix
+di-tenant registry login                 # checks GET <url>/v2/, then writes the Docker config
+di-tenant registry login --with podman   # or docker / oras: the password goes to its stdin
+di-tenant registry logout                # undoes the last registry login, no controller call
+```
+
+Before any credential is sent, the URL the controller returned is checked at least as strictly
+as the controller's own rule: a bare `https:` origin (no userinfo, path, query, or fragment), or
+`http:` only for loopback and `*.svc` / `*.svc.cluster.local` hosts. On top of that, the host must
+be a DNS name of letter, digit, and hyphen labels (no `_`, no trailing dot), an IPv4 address, or a
+bracketed IPv6 address, so a few names the controller accepts are refused here. The `/v2/` check
+does not follow redirects.
+
+Without `--with`, `registry login` stores `token:<credential>` for the host under `auths` in the
+Docker config (`--config <file>`, else `$DOCKER_CONFIG/config.json`, else
+`~/.docker/config.json`), keeping every other entry, with mode `0600`. docker, oras, and helm read
+that file; podman reads it through `--authfile` or `REGISTRY_AUTH_FILE`. If the file names a
+`credsStore` or `credHelpers` entry for the host, docker consults the helper instead, so use
+`--with docker`. With `--with`, the tool runs
+`login --username=token --password-stdin [--plain-http | --tls-verify=false] -- <host>` (the
+plain-HTTP switch for oras or podman on an `http:` origin only).
+
+`registry login` records the host and where it stored the login with the account, plus the
+sha256 of the Docker config entry it wrote. Docker keys entries by host alone and tenants often
+share one (`127.0.0.1:<port>`), so a logout removes the entry only while it still matches that
+fingerprint; if another account's `registry login` or your own `docker login` replaced it, the
+entry is kept with a warning.
+
+- `registry logout` removes the recorded login without a controller call, so it works after a
+  login has expired. For a `--with` login it runs `<tool> logout -- <host>`, which removes
+  whatever that tool holds for the host.
+- `registry logout --host <host> [--config <file> | --with <tool>]` removes the entry for that
+  host whatever it holds.
+- `logout` removes the recorded Docker config entry (same fingerprint rule), since it holds the
+  same token or key. It never runs `<tool> logout` for a `--with` login, because that cannot be
+  checked; it prints the command to run instead.
+- A login stored through a Docker credential helper (`credsStore`) is the helper's to remove.
+
+By hand, log in against the host of `url`, not the full URL, then push to
 `<host>/<repositoryPrefix>/<name>:<tag>`:
 
 ```text
@@ -95,8 +138,10 @@ oras push <host>/<repositoryPrefix>/<name>:<tag> ...
 An `http:` origin means plain HTTP (loopback or in-cluster only): pass `oras --plain-http` or
 `wash --insecure`. The platform serves the registry over HTTPS through the gateway, since the Basic
 password is an identity credential. Its certificate is the tenant controller's, so trust the
-tenant's CA (ConfigMap `tenant-controller-ca`) as you do for the controller, for example
-`oras login --ca-file` or `/etc/docker/certs.d/<host>/ca.crt`.
+tenant's CA (ConfigMap `tenant-controller-ca`) as you do for the controller. `di-tenant` itself
+uses the CA stored with the login (see [Controller CA](#controller-ca)) for the `/v2/` check;
+the push tools need their own trust, for example `oras --ca-file`,
+`/etc/docker/certs.d/<host>/ca.crt`, or `~/.config/containers/certs.d/<host>/ca.crt` for podman.
 
 Identity access tokens expire, so a stored `docker login` stops working; a `dik_` API key suits CI.
 
@@ -120,7 +165,7 @@ names the public origin, and the problem `detail` gives the in-cluster reference
 ## Commands
 
 ```text
-login --controller <url> [--account <tenant>] [--api-key <key>]
+login --controller <url> [--account <tenant>] [--api-key <key>] [--ca-file <pem> | --no-ca] [--no-browser]
 logout | whoami
 deploy preview|apply --env <prod|staging> --bundle <file>
 logs --service <name> --env <env> [--deployment <id>] [--follow] [--since <dur>] [--tail <n>]
@@ -128,6 +173,8 @@ services create <keyvalue|messaging|blobstore|postgres|egress> --name <name> --e
 deployments list|stats --env <env> [--service <name>]
 deployments rollback --service <name> --env <env> [--to <id>]
 secrets|vars list|set|update|unset <name> --env <env> [--from-file <path|->]
+registry [info] | registry login [--config <file> | --with <docker|podman|oras>]
+registry logout [--host <host>] [--config <file> | --with <docker|podman|oras>]
 proxy --service <name> --env <env> [--port <n>]
 init [name] [--dir <path>] [--name <name>] [--force]
 ```
@@ -148,6 +195,19 @@ stored under `$DI_FRAMEWORK_HOME/credentials.json` with the issuer and client id
 minute of expiry is refreshed before the next command, and `logout` revokes the refresh token at
 the issuer and tells the controller. `--api-key` skips the browser; `--no-browser` prints the URL
 instead of opening it.
+
+## Controller CA
+
+The tenant controller serves TLS with a certificate from the tenant's own CA (ConfigMap
+`tenant-controller-ca`, key `ca.crt`). `login --ca-file <ca.crt>` trusts it, on top of the public
+roots, for every call to that controller and for the registry check. The CA is stored with the
+credential as `controller.certificateAuthorityData` (base64 PEM, the field the console writes),
+so later commands need no flag, and a later `login` to the same controller URL keeps it. After the
+CA rotates, log in again with the new `--ca-file`, or with `--no-ca` to drop the stored CA and
+rely on the system roots or `NODE_EXTRA_CA_CERTS`. Identity issuer calls do not use it.
+`NODE_EXTRA_CA_CERTS=<ca.crt>` still works process-wide. A certificate chain that is not trusted
+fails with a `tls:` error that names both options; an expired or revoked certificate does not
+get that hint.
 
 ## What the pilot does not do yet
 
