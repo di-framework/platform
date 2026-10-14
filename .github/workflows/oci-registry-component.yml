@@ -1,4 +1,4 @@
-# Publish the canonical Wasm OCI artifact through the Rust publisher and wash.
+# Publish the canonical Wasm OCI artifact through the Rust publisher, oras and wash.
 #
 # Triggers (#172): a push to main that touches one of the paths below, and workflow_dispatch.
 # check-source hashes the committed files in on.push.paths (scripts/source-check.ts); on a push
@@ -111,6 +111,11 @@ jobs:
         with:
           wash-version: v2.5.2
 
+      # The publisher pushes the component, its config and manifest with oras (no wall-clock
+      # time, so an unchanged component keeps its digest); wash pulls it back by digest.
+      - name: Set up ORAS
+        uses: ./.github/actions/setup-oras
+
       - name: Test component and publisher
         run: |
           set -euo pipefail
@@ -133,6 +138,9 @@ jobs:
         if: steps.guard.outputs.stale != 'true'
         env:
           PUSH: 'true'
+          # Cleared so no exported value reaches the publisher: a per-commit created time
+          # would give an unchanged component a new digest on every publish.
+          SOURCE_DATE_EPOCH: ''
           DI_OCI_REGISTRY: ghcr.io
           DI_OCI_CLUSTER_REGISTRY: ghcr.io
           DI_OCI_REPOSITORY: di-framework/oci-registry
@@ -159,9 +167,6 @@ jobs:
             echo
             echo 'The component was pulled by digest and verified against the local build.'
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Set up ORAS
-        uses: ./.github/actions/setup-oras
 
       - name: Tag with source hash
         if: steps.guard.outputs.stale != 'true'

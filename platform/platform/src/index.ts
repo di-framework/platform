@@ -120,35 +120,57 @@ export interface PlatformArgs {
  * (scripts/pin-artifact.ts, #346) moves it together with the published-images table.
  */
 export const DEFAULT_HOST_IMAGE =
-  'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:805a47c0050a90e8dcf22de8e844da91da38b2d8f2da26170ace7c624af76584';
+  'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:76c78e4a5888b48eb9abd89f02c5f58c5aa5bcd0a7d2fefe72b323a17ea43d77';
 
 /**
  * Route aliases from `args`, or else from config `routeAliases`, a top-level object. A `gateway`
  * config key (nested `gateway.routeAliases`, or the literal dotted key) is refused rather than
  * silently ignored, whichever way the aliases arrive.
  */
-function routeAliasesInput(args: PlatformArgs, config: pulumi.Config): unknown {
+function routeAliasesInput(args: PlatformConfigArgs, config: pulumi.Config): unknown {
   if (config.get('gateway') !== undefined || config.get('gateway.routeAliases') !== undefined)
     throw new Error('Set route aliases with the top-level config key routeAliases, not gateway');
   return args.routeAliases ?? config.getObject<unknown>('routeAliases');
 }
 
-/** Shared platform resources; the caller owns cluster creation and Pulumi state. */
-export function createPlatform(args: PlatformArgs) {
-  const provider = args.provider;
-  const scope = args.installation;
+/**
+ * The `createPlatform` arguments that `validatePlatformConfig` checks. No provider is needed, so an
+ * entrypoint can validate before it creates the cluster the provider points at.
+ */
+export type PlatformConfigArgs = Omit<PlatformArgs, 'provider' | 'beforeTenancy'>;
+
+/** Validated, normalized configuration that `createPlatform` installs. */
+export interface ValidatedPlatformConfig {
+  config: pulumi.Config;
+  declared: ReturnType<typeof declarations>;
+  namespace: string;
+  routeUrlPattern: string | undefined;
+  insecureRegistries: string[];
+  tenantHostImage: string;
+  tenantAuth: ReturnType<typeof withDerivedPublicUrls>;
+  tenantAuthRouteHosts: ReturnType<typeof tenantAuthRoutes>['routes'];
+  runtimeNats: RuntimeNatsConfig | undefined;
+  backingServiceClasses: ReturnType<typeof resolveBackingServiceClasses>;
+  routeAliases: ReturnType<typeof validateRouteAliases>;
+  /** Warnings about accepted input; `createPlatform` logs them. */
+  warnings: string[];
+}
+
+/**
+ * Validates platform input without registering any resource or logging, and throws on invalid
+ * input. `createPlatform` runs it first; entrypoints that create a cluster run it before the first
+ * cluster resource, so invalid input fails before anything is created (#294).
+ */
+export function validatePlatformConfig(args: PlatformConfigArgs): ValidatedPlatformConfig {
   const config = args.config ?? new pulumi.Config();
   const declared = declarations(config);
-  const namespaceName = args.namespace ?? 'wasmcloud';
-  const REGISTRY_IMAGE = 'docker.io/library/registry:3.1.1';
-  const WASMCLOUD_OPERATOR_VERSION = '2.8.0';
-  const REGISTRY_NODE_PORT = args.registryNodePort ?? 30500;
-  const HTTP_NODE_PORT = args.httpNodePort ?? 30180;
+  const namespace = args.namespace ?? 'wasmcloud';
+  const warnings: string[] = [];
   const routeUrlPattern = validateRouteUrlPattern(args.routeUrlPattern);
   const insecureRegistries = tenantInsecureRegistries({
     insecureRegistry: args.insecureRegistry,
     registry: args.registry,
-    namespace: namespaceName,
+    namespace,
     extra: args.insecureRegistries ?? config.getObject<string[]>('insecureRegistries'),
   });
   const tenantHostImage = config.get('tenantHostImage') ?? DEFAULT_HOST_IMAGE;
@@ -157,7 +179,7 @@ export function createPlatform(args: PlatformArgs) {
   assertTenantAuthConfig(configuredTenantAuth);
   // The registry keeps working on such a host, in the shared TENANT account (#159).
   if (configuredTenantAuth?.registry && !hostImageSupportsNatsCredentials(tenantHostImage))
-    pulumi.log.warn(
+    warnings.push(
       `tenantHostImage ${tenantHostImage} is not a known build with wash patch 0003 (NATS blobstore credentials): ` +
         'tenant registries stay in the shared TENANT NATS account, reachable by tenant workloads, until it is one',
     );
@@ -165,7 +187,7 @@ export function createPlatform(args: PlatformArgs) {
   const tenantAuth = withDerivedPublicUrls(configuredTenantAuth, routeUrlPattern);
   const notDerived = unsetPublicUrls(tenantAuth);
   if (routeUrlPattern !== undefined && notDerived.length)
-    pulumi.log.warn(
+    warnings.push(
       `tenantAuth.${notDerived.join(', tenantAuth.')} not derived from routeUrlPattern ${routeUrlPattern} ` +
         '(only http://{host}.{tenant}.localhost[:<port>] is routed to tenant-auth); the 127.0.0.1 defaults apply',
     );
@@ -181,7 +203,46 @@ export function createPlatform(args: PlatformArgs) {
     tenantAuthRoutes: tenantAuthRouteHosts,
     tenants: declared.tenants.map((tenant) => tenant.name),
   });
-  // Every validation above runs before the first resource, so invalid input leaves nothing applied.
+  return {
+    config,
+    declared,
+    namespace,
+    routeUrlPattern,
+    insecureRegistries,
+    tenantHostImage,
+    tenantAuth,
+    tenantAuthRouteHosts,
+    runtimeNats,
+    backingServiceClasses,
+    routeAliases,
+    warnings,
+  };
+}
+
+/** Shared platform resources; the caller owns cluster creation and Pulumi state. */
+export function createPlatform(args: PlatformArgs) {
+  // Every validation runs before the first resource, so invalid input leaves nothing applied.
+  const {
+    config,
+    declared,
+    namespace: namespaceName,
+    routeUrlPattern,
+    insecureRegistries,
+    tenantHostImage,
+    tenantAuth,
+    tenantAuthRouteHosts,
+    runtimeNats,
+    backingServiceClasses,
+    routeAliases,
+    warnings,
+  } = validatePlatformConfig(args);
+  for (const warning of warnings) pulumi.log.warn(warning);
+  const provider = args.provider;
+  const scope = args.installation;
+  const REGISTRY_IMAGE = 'docker.io/library/registry:3.1.1';
+  const WASMCLOUD_OPERATOR_VERSION = '2.8.0';
+  const REGISTRY_NODE_PORT = args.registryNodePort ?? 30500;
+  const HTTP_NODE_PORT = args.httpNodePort ?? 30180;
   const networkPolicy =
     args.networkPolicyEngine === 'kube-router' ? installNetworkPolicy(provider) : undefined;
   const namespaceResource = new k8s.core.v1.Namespace(

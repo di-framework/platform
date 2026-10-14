@@ -13,6 +13,14 @@ deployment tooling.
   platform on a caller-owned cluster. `di-framework-kube` uses this entrypoint.
 - `createPlatform(args)` installs the shared Kubernetes resources with a supplied
   Kubernetes provider. It does not create a cluster or select a Pulumi backend.
+- `validatePlatformConfig(args)` runs the same checks `createPlatform` runs first, with no
+  provider, and throws on invalid input (tenant and user declarations, `routeUrlPattern`,
+  `routeAliases`, `tenantAuth`, `runtimeNats`, insecure registries, the tenant host image,
+  backing-service classes). It registers no resource and logs nothing; it returns the
+  normalized configuration and any warnings, which `createPlatform` logs. Both entrypoints call
+  it before their first resource, so invalid input fails before the local cluster (or the
+  existing cluster's provider) is created. A program that creates its own cluster before
+  `createPlatform` should call it first too.
 
 Generated projects pin the installed package version. Upgrades are explicit.
 The CLI and kube must use the same project/backend/stack when operating the same
@@ -1046,7 +1054,7 @@ script is removed:
 
 ```yaml
 tenantAuth:
-  image: ghcr.io/di-framework/tenant-auth@sha256:269b941d3f51d6c43125a41ac4570d985d99698b6e5f388f354031a866746a5b   # required, pinned by digest
+  image: ghcr.io/di-framework/tenant-auth@sha256:c2315aa6e9d8a120d8fbd1e414678a4c89388e82015b1a717503bb3deec02e88   # required, pinned by digest
   issuer: http://identity.acme.localhost:28180               # identity-server, as pods and browsers name it
   oauthClient: { id: access, secretName: tenant-auth-oauth } # Secret in the platform namespace; key `clientSecret`
   issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80  # optional, for a loopback issuer
@@ -1286,13 +1294,16 @@ tenantAuth:
       on the same host is still starting. The pull listener waits for the registry instead of
       failing the pull (which wash would only retry about a minute later): a refused connection or
       the host's empty `404` for a `Host` no workload serves yet is retried with a 250 ms to 2 s
-      backoff, for at most `TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS` (default 30 s). Any answer
-      from the registry itself, a `404 BLOB_UNKNOWN` included, is returned at once, and the public
-      front never waits. The wait delays only that one pull, so nothing blocks the host that serves
-      the registry. A waiting pull gives its pool slot back between attempts, so pulls waiting out
-      a host restart do not turn the others away; one that finds no free slot before its wait is
-      over is answered `503`. Each attempt gets the full upstream header timeout, so the wait is
-      not cut short by it.
+      backoff, for at most `TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS` (default 30 s). The
+      registry's own `503 UNAVAILABLE` (it cannot reach the controller's whoami yet) is waited
+      out the same way and returned as is once the wait is over: on a GET by its OCI error code,
+      and on a HEAD, which has no body, by its JSON `content-type` (the registry's only `503`).
+      Any other answer from the registry itself, a `404 BLOB_UNKNOWN` or a `429` included, is
+      returned at once, and the public front never waits. The wait delays only that one pull, so
+      nothing blocks the host that serves the registry. A waiting pull gives its pool slot back
+      between attempts, so pulls waiting out a host restart do not turn the others away; one that
+      finds no free slot before its wait is over is answered `503`. Each attempt gets the full
+      upstream header timeout, so the wait is not cut short by it.
     - Framing (#197): the front and the pull listener run on `node:http`, which writes the
       registry's `Content-Length` on a blob `GET` as is; `Bun.serve` re-framed every streamed body
       as chunked, and oras then stalled behind the unread body over `kubectl port-forward`. A `HEAD`

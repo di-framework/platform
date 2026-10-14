@@ -9,10 +9,22 @@ Use `-- --check` to validate an existing build without rebuilding or publishing.
 The component retains its independent Cargo workspace and pinned toolchain.
 
 `PUSH=true cargo run --locked -p oci-registry-publisher` (or `make publish-local`
-here) also publishes through `wash oci push`, pulls by the returned manifest
-digest, verifies the bytes, and writes `dist/publish-report.json`. This preserves
-the reference branch's Wasm OCI format; `oci-builder` builds container images,
-so this component flow still needs `wash` on PATH.
+here) also publishes: it writes the Wasm OCI config and manifest itself, pushes
+the layer and config, then the manifest under `DI_OCI_TAG` only, with `oras`,
+pulls the component back with `wash` by the manifest digest and verifies the
+bytes. Only then does it point any extra (version) tag at that manifest with
+`oras tag`, and it writes `dist/publish-report.json`. This keeps the Wasm OCI
+format `wash oci push` produces (the config is byte-identical to wash 2.5.2's
+apart from `created`; see `platform/wasm-component-publisher/tests/fixtures`);
+`oci-builder` builds container images, so this component flow needs `oras` and
+`wash` on PATH.
+
+The config and manifest carry no wall-clock time: their `created` time is
+`SOURCE_DATE_EPOCH` when set, else `1970-01-01T00:00:00Z`, and their JSON has a
+fixed field order. Publishing the same `dist/` again, from any commit, gives the
+same manifest digest; a different component gives a different one. The publish
+workflows clear `SOURCE_DATE_EPOCH` on the publisher step, so the digest depends
+only on the component.
 
 Defaults are `DI_OCI_REGISTRY=127.0.0.1:25001`,
 `DI_OCI_REPOSITORY=di-framework/oci-registry`, and a content-derived tag.
@@ -27,7 +39,7 @@ environment. Tool output in errors has those secrets masked.
 
 Cargo's `build.rs` only tracks compile-time inputs. Publication requires an
 explicit executable run with `PUSH=true`. The publish workflow
-installs Rust, Go/native build dependencies, Wasm tools, and wash before running
+installs Rust, Go/native build dependencies, Wasm tools, wash, and oras before running
 the publisher. Pull requests build and validate without publishing.
 
 Per-tenant OCI registry component for the di-framework platform (#83
@@ -123,11 +135,24 @@ Worst cases before a revoked credential stops working at the registry:
 It **fails closed**: only a 2xx `Principal` for this tenant with a `viewer` /
 `developer` role authorizes a request. The refusal tells the client why:
 
-| Controller outcome                                                          | Registry answer                                   |
-| --------------------------------------------------------------------------- | ------------------------------------------------- |
-| `5xx`, connection refused or failed, DNS or TLS failure, any timeout        | `503 UNAVAILABLE` with `Retry-After`              |
-| `401`, `403`, any other non-2xx, an unusable body, another tenant's account | `401 UNAUTHORIZED` with `WWW-Authenticate: Basic` |
-| `tenant-controller-url` or `tenant` missing or malformed                    | `401 UNAUTHORIZED` with `WWW-Authenticate: Basic` |
+| Controller outcome                                                                                    | Registry answer                                   |
+| ----------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `5xx`, connection refused or reset, DNS failure, any timeout                                          | `503 UNAVAILABLE` with `Retry-After`              |
+| `401`, `403`, `429`, any other non-2xx, an unusable body, another tenant's account                    | `401 UNAUTHORIZED` with `WWW-Authenticate: Basic` |
+| A configuration-type `send` error, e.g. `configuration-error`, `HTTP-request-denied`, any TLS failure | `401 UNAUTHORIZED` with `WWW-Authenticate: Basic` |
+| `tenant-controller-url` or `tenant` missing or malformed                                              | `401 UNAUTHORIZED` with `WWW-Authenticate: Basic` |
+
+A failed whoami call logs its `wasi:http` error code to stderr: the code only,
+never its payload, the URL or the credential, and a given code at most once a
+minute (the next line says how many were left out). Like the whoami cache, that
+limit lives in the component instance, so it only applies if one instance
+serves more than one request; if wash instantiates per request (unverified, see
+above), every failure is logged. Configuration-type codes (the host's
+outgoing-HTTP policy, TLS against the controller, such as a rejected
+certificate, a server alert like `unknown_ca` or TLS spoken to a plain-HTTP
+port, and requests the host will never send) cannot clear on retry, so they get
+the challenge rather than a `503`. A controller `429` also gets the challenge:
+whoami is not rate-limited, so the registry does not treat it as temporary.
 
 The `503` covers a controller restart or an identity issuer outage (the
 controller answers its own `503` while OIDC discovery is pending), so
@@ -237,7 +262,7 @@ pushed manifest. It runs `make -C platform/oci-registry test build` and
 pushes `dist/di-framework-oci-registry.wasm` to
 `ghcr.io/di-framework/oci-registry` in the Wasm OCI layout that `wkg` and
 `wash oci push` produce: one `application/wasm` layer and an
-`application/vnd.wasm.config.v0+json` config carrying `created`,
+`application/vnd.wasm.config.v0+json` config carrying `created` (fixed, see above),
 `architecture: "wasm"`, `os: "wasip2"`, `layerDigests` and the `component`
 field (the world's `imports` and `exports`, read from the WIT `make build`
 recovers from the component), which the CNCF Wasm OCI layout requires for

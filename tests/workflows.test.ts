@@ -19,6 +19,7 @@ interface Job {
   if?: string;
   needs?: string | string[];
   permissions?: Permissions;
+  env?: Record<string, string>;
   outputs?: Record<string, string>;
   strategy?: { matrix?: Record<string, unknown> };
   steps?: {
@@ -36,6 +37,7 @@ interface Workflow {
     workflow_dispatch?: unknown;
   };
   permissions: Permissions;
+  env?: Record<string, string>;
   concurrency: { group: string; 'cancel-in-progress': boolean };
   jobs: Record<string, Job>;
 }
@@ -461,30 +463,53 @@ test('every job that runs oras sets it up first (C1)', () => {
     step.uses === './.github/actions/setup-oras' ||
     step.uses === './.github/actions/setup-source-check' ||
     /oras_\$\{version\}_linux_amd64\.tar\.gz/.test(step.run ?? '');
+  // check-source runs oras inside scripts/source-check.ts, and the Wasm component publishers
+  // (wasm-component-publisher) push the layer, config and manifest with oras.
+  const runsOras = (step: { run?: string }) =>
+    /(^|[\s|(])oras\s/m.test(step.run ?? '') ||
+    /scripts\/(source-check\.ts|wash-pins\.sh)/.test(step.run ?? '') ||
+    /target\/debug\/[\w-]+-publisher\b/.test(step.run ?? '');
   let checked = 0;
   for (const spec of SPECS) {
     for (const [name, job] of Object.entries(parse(spec.file).jobs)) {
       const steps = (job.steps ?? []) as { uses?: string; run?: string; name?: string }[];
-      // check-source runs oras inside scripts/source-check.ts.
-      const usesOras = steps.some(
-        (s) =>
-          /(^|[\s|(])oras\s/m.test(s.run ?? '') ||
-          /scripts\/(source-check\.ts|wash-pins\.sh)/.test(s.run ?? ''),
-      );
+      const usesOras = steps.some(runsOras);
       if (!usesOras) continue;
       checked++;
-      const first = steps.findIndex(
-        (s) =>
-          !installs(s) &&
-          (/(^|[\s|(])oras\s/m.test(s.run ?? '') ||
-            /scripts\/(source-check\.ts|wash-pins\.sh)/.test(s.run ?? '')),
-      );
+      const first = steps.findIndex((s) => !installs(s) && runsOras(s));
       const setup = steps.findIndex(installs);
       expect(setup, `${spec.file} ${name}`).toBeGreaterThanOrEqual(0);
       expect(setup, `${spec.file} ${name}`).toBeLessThan(first);
     }
   }
   expect(checked).toBeGreaterThanOrEqual(7);
+});
+
+test('no Wasm component publisher sees a SOURCE_DATE_EPOCH (#345)', () => {
+  // wasm-component-publisher writes SOURCE_DATE_EPOCH into the manifest's created time. A
+  // per-commit value (build-engine.ts uses one for the engine build) would give an unchanged
+  // component a new digest on every publish, so the publisher step clears it, and neither the
+  // workflow nor the job sets it.
+  const files = [
+    '.github/workflows/oci-registry-component.yml',
+    '.github/workflows/pglite-component-publish.yml',
+    '.github/workflows/pglite-encfs-publish.yml',
+  ];
+  for (const file of files) {
+    const workflow = parse(file);
+    expect(workflow.env?.SOURCE_DATE_EPOCH, file).toBeUndefined();
+    let publishers = 0;
+    for (const [name, job] of Object.entries(workflow.jobs)) {
+      expect(job.env?.SOURCE_DATE_EPOCH, `${file} ${name}`).toBeUndefined();
+      for (const step of job.steps ?? []) {
+        if (!/target\/debug\/[\w-]+-publisher\b/.test(step.run ?? '')) continue;
+        publishers++;
+        expect(step.env?.PUSH, `${file} ${name}`).toBe('true');
+        expect(step.env?.SOURCE_DATE_EPOCH, `${file} ${name}`).toBe('');
+      }
+    }
+    expect(publishers, file).toBe(1);
+  }
 });
 
 test('the publish workflows use distinct concurrency groups', () => {
