@@ -186,7 +186,7 @@ For shared tenant keyvalue storage, reference the controller-managed ConfigMap
 services use ConfigMaps named `di-bs-*` and binding-projected Secrets/ConfigMaps
 named `di-binding-*` (#450/#451). The warehouse's HTTP, Redis, and NATS sync flow
 has been verified on wash 2.8.0. The platform default host image is
-`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad`,
+`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab`,
 which links `wasi:tls`. Native keyvalue needs no custom image. The warehouse uses this same ConfigMap reference
 in its external-cluster setup. Messaging uses the tenant's dedicated NATS backend.
 Tenant admission restricts native interfaces, forbids host volumes and guest

@@ -510,6 +510,70 @@ describe('backing service reconciliation', () => {
     expect(deadline?.message).toHaveLength(MAX_FAILURE_MESSAGE);
   });
 
+  it('does not split a surrogate pair when the cap lands inside an emoji', () => {
+    const failureFor = (message: string) =>
+      deploymentFailure({
+        apiVersion: 'apps/v1',
+        kind: 'Deployment',
+        metadata: { name: 'di-bs-stock', generation: 1 },
+        spec: { replicas: 1 },
+        status: {
+          observedGeneration: 1,
+          conditions: [{ type: 'ReplicaFailure', status: 'True', reason: 'FailedCreate', message }],
+        },
+      });
+    const prefixLength = 'Backing service deployment di-bs-stock cannot create pods: '.length;
+    // The emoji's high surrogate would be the last kept code unit before the marker.
+    const padding = 'x'.repeat(MAX_FAILURE_MESSAGE - 2 - prefixLength);
+    const message = failureFor(`${padding}\u{1F600}${'z'.repeat(50)}`)?.message ?? '';
+    expect(message.isWellFormed()).toBe(true);
+    expect(message.length).toBeLessThanOrEqual(MAX_FAILURE_MESSAGE);
+    expect(message).toHaveLength(MAX_FAILURE_MESSAGE - 1);
+    expect(message.endsWith(`${padding.slice(-5)}…`)).toBe(true);
+    // An emoji that ends exactly at the boundary is kept whole.
+    const whole =
+      failureFor(`${'x'.repeat(MAX_FAILURE_MESSAGE - 3 - prefixLength)}\u{1F600}${'z'.repeat(50)}`)
+        ?.message ?? '';
+    expect(whole.isWellFormed()).toBe(true);
+    expect(whole).toHaveLength(MAX_FAILURE_MESSAGE);
+    expect(whole.endsWith('\u{1F600}…')).toBe(true);
+  });
+
+  it('produces an identical status on repeated reconciles with a capped emoji message', async () => {
+    const { api, controller, t, classes } = prepare();
+    const stock = backingService('stock', 'keyvalue');
+    api.seed(stock);
+    const prefix = 'Backing service deployment di-bs-stock cannot create pods: ';
+    const denial = `${'x'.repeat(MAX_FAILURE_MESSAGE - 2 - prefix.length)}\u{1F600}tail`;
+    const original = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      // Kubernetes stores U+FFFD for any unpaired surrogate in a patched status.
+      const sent = path.endsWith('/status')
+        ? (JSON.parse(JSON.stringify(body).replaceAll('\\ud83d', '\\ufffd')) as unknown)
+        : body;
+      const result = await original<T>(method, path, sent);
+      if (method === 'PATCH' && path.includes('/deployments/di-bs-stock')) {
+        (result as Resource).status = {
+          observedGeneration: 1,
+          conditions: [
+            { type: 'ReplicaFailure', status: 'True', reason: 'FailedCreate', message: denial },
+          ],
+        };
+      }
+      return result;
+    };
+    await controller.reconcileBackingService(stock, t, classes);
+    // The next reconcile sees the status as stored by the API server.
+    const stored = api.objects.get(key(stock)) as unknown as BackingService;
+    const first = structuredClone(stored.status);
+    const statusPatches = () =>
+      api.operations.filter((o) => o.method === 'PATCH' && o.path.endsWith('/status')).length;
+    const before = statusPatches();
+    await controller.reconcileBackingService(stored, t, classes);
+    expect(stored.status).toEqual(first);
+    expect(statusPatches()).toBe(before);
+  });
+
   it('reads deployment failures only from current, non-transient conditions', () => {
     const deployment = (status: Record<string, unknown>, generation = 1): Resource => ({
       apiVersion: 'apps/v1',

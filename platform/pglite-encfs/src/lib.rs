@@ -10,6 +10,7 @@
 //! - [`codec`]: AES-256-XTS over 4 KiB units.
 //! - [`file`]: logical reads, writes and resizes over the physical file.
 //! - [`marker`]: the key marker that locks a preopen before anything is touched.
+//! - [`rotation`]: the sweep that re-wraps every header during a key rotation.
 //!
 //! The WASI glue (`component`) is only built for Wasm; everything else is
 //! plain Rust with host unit tests. See README.md for the threat model, key
@@ -20,6 +21,7 @@ pub mod file;
 pub mod header;
 pub mod keys;
 pub mod marker;
+pub mod rotation;
 
 #[cfg(target_arch = "wasm32")]
 mod component;

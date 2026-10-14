@@ -108,8 +108,11 @@ hostInterfaces:
   pinned wash does not enable; turning it on would change `Cargo.lock`, and `--locked` builds would
   need the patch to carry that. User and password is what NATS accounts in a server config use.
 - Who may set the keys is decided by admission, not by the host: whoever can write an entry's
-  config can name any file the host can read. Platform admission already admits inline blobstore
-  config only from the platform controller, for the tenant registry; #159 adds these keys there.
+  config can name any file the host can read. Platform admission (#159) admits them only from the
+  platform controller, only on the tenant registry's inline entry, only together, and only with
+  exactly `/var/run/secrets/di-framework/registry-nats/username` and `.../password`, the read-only
+  mount of the registry's credentials Secret; `di-bs-*` / `di-binding-*` config never carries them.
+  See the platform README, "Upgrading to a registry in its own NATS account".
 - Scope: only the `backend: nats` provider of the multiplexed blobstore plugins (`wasi:blobstore`
   and `wasmcloud:blobstore`). The host's own NATS blobstore plugin, which uses the `wash host` data
   NATS connection, and the NATS keyvalue and messaging backends are unchanged.
@@ -271,9 +274,15 @@ way `workload_stop` does. They cover these cases:
   so the next revision proceeds;
 - a store requested through `new_store` for a stopped workload is refused;
 - a symlink to the old revision's directory shares its gate (the key is the canonical path).
-`tests/integration_exclusive_topology.rs` (needs the prebuilt test fixtures) covers the layout rule
-and a lone exclusive component loading and queueing real requests (it does not measure
-serialization; the live-store tests do). See [Tests](#tests) for the commands.
+`tests/integration_exclusive_topology.rs` (needs the prebuilt test fixtures) covers the layout rule,
+a lone exclusive component loading and queueing real requests (it does not measure
+serialization; the live-store tests do), a new revision waiting for the old one on the same host
+path, and what a caller sees of an HTTP trap: the trap fails only its own call, and the calls queued
+behind it are served by a fresh instance, never the faulted one. At the pinned wasmtime a guest
+trap ends the instance's event loop, so the pool reaps the instance whatever else happens. The HTTP
+handler's `trapped` flag covers a trap reported to a task that survives it; its retirement
+(`PoolSlot::finish`) is unit-tested in `exclusive_tests.rs`. The patch-check workflow builds the
+fixtures and runs each of these tests by name. See [Tests](#tests) for the commands.
 
 ## Tests
 
@@ -296,6 +305,12 @@ git apply "$P/0001-exclusive-instance.patch" && git apply "$P/0002-insecure-regi
 git apply "$P/0003-nats-blobstore-credentials.patch"
 cargo test -p wash-runtime --features wasi-tls --lib -- insecure_registr client_protocol test_image_pull_secret_to_oci_config nats_blobstore_ instance_pool instance_driver wire_
 cargo test -p wash --features wasi-tls,host-component-plugins --lib -- insecure_registry
+
+# exclusive only: the topology tests need the wasm fixtures. The toolchain's bundled
+# wasm-component-ld (0.5.22 in 1.96.0) cannot link keyvalue-implements, so link with 0.5.24.
+cargo install --locked --root /tmp/wasm-component-ld/0.5.24 wasm-component-ld@0.5.24
+CARGO_TARGET_WASM32_WASIP2_LINKER=/tmp/wasm-component-ld/0.5.24/bin/wasm-component-ld cargo xtask build-fixtures
+cargo test -p wash-runtime --features wasi-tls --test integration_exclusive_topology
 ```
 
 0002's tests cover protocol selection (an allowlisted `host:port` is pulled over HTTP and anything
@@ -384,15 +399,17 @@ Latest published images (multi-arch index digests; the bot PR keeps this table c
 
 | Variant | Image |
 | --- | --- |
-| `wasi-tls` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab` |
-| `wasi-tls-exclusive` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:da38d84b52a6327e02febe7172a466f628b1d923944ebf50171f1df630ec37a9` |
+| `wasi-tls` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:805a47c0050a90e8dcf22de8e844da91da38b2d8f2da26170ace7c624af76584` |
+| `wasi-tls-exclusive` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:933d26ec01dade4af7e0d10b877c9afad5371256147cf6db4aff42ecd0c28ec2` |
 
 The pin PR never changes the platform default (`DEFAULT_HOST_IMAGE`); a maintainer moves it by hand.
 
 The tags are mutable. The platform default `hostImage` is pinned to the canonical index built with
-0002 (and without the unnamed-import lease, #13):
+0002 and 0003 (and without the unnamed-import lease, #13). The platform lets a tenant registry use
+its NATS credentials only on host images it knows carry 0003 (`NATS_CREDENTIALS_HOST_IMAGE_DIGESTS`
+in `platform/platform/src/tenancy/registry-nats.ts`); add a new 0003 build there when you pin it:
 
-`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad`
+`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab`
 
 `tenantHostImage` overrides it. The workflow summary prints the digest of each later publish.
 Tenant hosts never run `--allow-insecure-registries`; with `insecureRegistry` they get
@@ -428,7 +445,7 @@ The registry Service is ClusterIP, so a node-pullable reference needs a NodePort
 Set the platform config used by the stack (`tenantHostImage` / `tenantHostImagePullPolicy`):
 
 ```sh
-pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad
+pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab
 pulumi config set tenantHostImagePullPolicy IfNotPresent
 ```
 
@@ -436,7 +453,7 @@ or, with `di-framework-kube`, in the `--platform-config` JSON:
 
 ```json
 {
-  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad",
+  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab",
   "tenantHostImagePullPolicy": "IfNotPresent"
 }
 ```
