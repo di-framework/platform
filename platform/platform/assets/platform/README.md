@@ -220,7 +220,9 @@ override the default wasi-tls host image when a stack needs a different runtime.
 This project is a local install, so its tenant hosts always get
 `--insecure-registry` for the platform registry: an override image must be built
 with wash patch 0002 (see `platform/tenant-host/README.md` in the platform
-repository). Older images reject that argument and the tenant hosts crash-loop.
+repository). `createPlatform` refuses the one published pre-0002 digest up front;
+other older builds (for example locally built images) reject that argument and
+the tenant hosts crash-loop.
 
 ## Shared implementation
 

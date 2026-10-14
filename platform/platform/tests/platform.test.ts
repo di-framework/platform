@@ -278,10 +278,13 @@ function createWithNetworkPolicy(
       try {
         require('./dist').createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', networkPolicyEngine:'kube-router', ...${JSON.stringify(args)} });
       } catch (e) { error = e.message; }
-      await new Promise(r => setTimeout(r, 200));
+      // The sentinel round-trips through the mocks. A successful call also polls until its
+      // kube-router DaemonSet is registered, so nothing is asserted against a fixed timer.
+      await new k8s.core.v1.Namespace('sentinel', {}, { provider: new k8s.Provider('sentinel-provider', {}) }).id;
+      if (!error) for (let i = 0; i < 200 && !resources.some(r => r.type === 'kubernetes:apps/v1:DaemonSet'); i++) await new Promise(r => setTimeout(r, 50));
       return error;
     }).then(error => {
-      console.log(JSON.stringify({ error, resources: resources.filter(r => !r.type.startsWith('pulumi:')) }));
+      console.log(JSON.stringify({ error, resources: resources.filter(r => !r.type.startsWith('pulumi:') && r.name !== 'sentinel' && r.name !== 'sentinel-provider') }));
     }).catch(e => {console.error(e);process.exitCode=1;});
   `,
     ],
@@ -294,6 +297,17 @@ test('an invalid tenant host allowlist fails before any resource, network policy
   const old =
     'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669';
   const cases: [Record<string, unknown>, Record<string, unknown>, string][] = [
+    [
+      { egressAllowedDestinations: JSON.stringify('bad') },
+      {},
+      'egressAllowedDestinations must be a list',
+    ],
+    [
+      { tenantAuth: { image: 'ghcr.io/x/y:latest', issuer: 'https://issuer.example' } },
+      {},
+      'tenantAuth.image must be pinned by digest',
+    ],
+    [{}, { apiServer: 'https://k8s.example:6443' }, 'apiServer requires kubeconfig'],
     [
       { insecureRegistries: ['http://registry.example:5000'] },
       { registry: true, insecureRegistry: true },
