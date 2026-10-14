@@ -13,6 +13,14 @@ deployment tooling.
   platform on a caller-owned cluster. `di-framework-kube` uses this entrypoint.
 - `createPlatform(args)` installs the shared Kubernetes resources with a supplied
   Kubernetes provider. It does not create a cluster or select a Pulumi backend.
+- `validatePlatformConfig(args)` runs the same checks `createPlatform` runs first, with no
+  provider, and throws on invalid input (tenant and user declarations, `routeUrlPattern`,
+  `routeAliases`, `tenantAuth`, `runtimeNats`, insecure registries, the tenant host image,
+  backing-service classes). It registers no resource and logs nothing; it returns the
+  normalized configuration and any warnings, which `createPlatform` logs. Both entrypoints call
+  it before their first resource, so invalid input fails before the local cluster (or the
+  existing cluster's provider) is created. A program that creates its own cluster before
+  `createPlatform` should call it first too.
 
 Generated projects pin the installed package version. Upgrades are explicit.
 The CLI and kube must use the same project/backend/stack when operating the same

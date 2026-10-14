@@ -1,0 +1,337 @@
+package root:component;
+
+world root {
+  import wasi:io/poll@0.2.9;
+  import wasi:clocks/monotonic-clock@0.2.9;
+  import wasi:clocks/wall-clock@0.2.9;
+  import wasi:random/random@0.2.9;
+  import wasi:io/error@0.2.9;
+  import wasi:io/streams@0.2.9;
+  import wasi:cli/stdout@0.2.9;
+  import wasi:cli/stderr@0.2.9;
+  import wasi:cli/stdin@0.2.9;
+  import wasi:cli/environment@0.2.9;
+  import wasi:cli/exit@0.2.9;
+  import wasi:cli/terminal-input@0.2.9;
+  import wasi:cli/terminal-output@0.2.9;
+  import wasi:cli/terminal-stdin@0.2.9;
+  import wasi:cli/terminal-stdout@0.2.9;
+  import wasi:cli/terminal-stderr@0.2.9;
+  import wasi:filesystem/types@0.2.9;
+  import wasi:filesystem/preopens@0.2.9;
+
+  export di-framework:sqlite/types@0.1.0;
+  export di-framework:sqlite/database@0.1.0;
+}
+package wasi:io@0.2.9 {
+  interface poll {
+    resource pollable {
+      block: func();
+    }
+
+    poll: func(in: list<borrow<pollable>>) -> list<u32>;
+  }
+  interface error {
+    resource error;
+  }
+  interface streams {
+    use error.{error};
+    use poll.{pollable};
+
+    resource input-stream;
+
+    resource output-stream {
+      check-write: func() -> result<u64, stream-error>;
+      write: func(contents: list<u8>) -> result<_, stream-error>;
+      blocking-flush: func() -> result<_, stream-error>;
+      subscribe: func() -> pollable;
+    }
+
+    variant stream-error {
+      last-operation-failed(error),
+      closed,
+    }
+  }
+}
+
+
+package wasi:clocks@0.2.9 {
+  interface monotonic-clock {
+    use wasi:io/poll@0.2.9.{pollable};
+
+    type instant = u64;
+
+    type duration = u64;
+
+    now: func() -> instant;
+
+    subscribe-instant: func(when: instant) -> pollable;
+
+    subscribe-duration: func(when: duration) -> pollable;
+  }
+  interface wall-clock {
+    record datetime {
+      seconds: u64,
+      nanoseconds: u32,
+    }
+
+    now: func() -> datetime;
+  }
+}
+
+
+package wasi:random@0.2.9 {
+  interface random {
+    get-random-bytes: func(len: u64) -> list<u8>;
+  }
+}
+
+
+package wasi:cli@0.2.9 {
+  interface stdout {
+    use wasi:io/streams@0.2.9.{output-stream};
+
+    get-stdout: func() -> output-stream;
+  }
+  interface stderr {
+    use wasi:io/streams@0.2.9.{output-stream};
+
+    get-stderr: func() -> output-stream;
+  }
+  interface stdin {
+    use wasi:io/streams@0.2.9.{input-stream};
+
+    get-stdin: func() -> input-stream;
+  }
+  interface environment {
+    get-environment: func() -> list<tuple<string, string>>;
+  }
+  interface exit {
+    exit: func(status: result);
+  }
+  interface terminal-input {
+    resource terminal-input;
+  }
+  interface terminal-output {
+    resource terminal-output;
+  }
+  interface terminal-stdin {
+    use terminal-input.{terminal-input};
+
+    get-terminal-stdin: func() -> option<terminal-input>;
+  }
+  interface terminal-stdout {
+    use terminal-output.{terminal-output};
+
+    get-terminal-stdout: func() -> option<terminal-output>;
+  }
+  interface terminal-stderr {
+    use terminal-output.{terminal-output};
+
+    get-terminal-stderr: func() -> option<terminal-output>;
+  }
+}
+
+
+package wasi:filesystem@0.2.9 {
+  interface types {
+    use wasi:io/streams@0.2.9.{input-stream, output-stream};
+    use wasi:clocks/wall-clock@0.2.9.{datetime};
+
+    resource descriptor {
+      read-via-stream: func(offset: filesize) -> result<input-stream, error-code>;
+      write-via-stream: func(offset: filesize) -> result<output-stream, error-code>;
+      append-via-stream: func() -> result<output-stream, error-code>;
+      get-flags: func() -> result<descriptor-flags, error-code>;
+      set-size: func(size: filesize) -> result<_, error-code>;
+      read: func(length: filesize, offset: filesize) -> result<tuple<list<u8>, bool>, error-code>;
+      write: func(buffer: list<u8>, offset: filesize) -> result<filesize, error-code>;
+      sync: func() -> result<_, error-code>;
+      create-directory-at: func(path: string) -> result<_, error-code>;
+      stat: func() -> result<descriptor-stat, error-code>;
+      stat-at: func(path-flags: path-flags, path: string) -> result<descriptor-stat, error-code>;
+      open-at: func(path-flags: path-flags, path: string, open-flags: open-flags, %flags: descriptor-flags) -> result<descriptor, error-code>;
+      unlink-file-at: func(path: string) -> result<_, error-code>;
+      metadata-hash: func() -> result<metadata-hash-value, error-code>;
+      metadata-hash-at: func(path-flags: path-flags, path: string) -> result<metadata-hash-value, error-code>;
+    }
+
+    type filesize = u64;
+
+    enum error-code {
+      access,
+      would-block,
+      already,
+      bad-descriptor,
+      busy,
+      deadlock,
+      quota,
+      exist,
+      file-too-large,
+      illegal-byte-sequence,
+      in-progress,
+      interrupted,
+      invalid,
+      io,
+      is-directory,
+      loop,
+      too-many-links,
+      message-size,
+      name-too-long,
+      no-device,
+      no-entry,
+      no-lock,
+      insufficient-memory,
+      insufficient-space,
+      not-directory,
+      not-empty,
+      not-recoverable,
+      unsupported,
+      no-tty,
+      no-such-device,
+      overflow,
+      not-permitted,
+      pipe,
+      read-only,
+      invalid-seek,
+      text-file-busy,
+      cross-device,
+    }
+
+    flags descriptor-flags {
+      read,
+      write,
+      file-integrity-sync,
+      data-integrity-sync,
+      requested-write-sync,
+      mutate-directory,
+    }
+
+    enum descriptor-type {
+      unknown,
+      block-device,
+      character-device,
+      directory,
+      fifo,
+      symbolic-link,
+      regular-file,
+      socket,
+    }
+
+    type link-count = u64;
+
+    record descriptor-stat {
+      %type: descriptor-type,
+      link-count: link-count,
+      size: filesize,
+      data-access-timestamp: option<datetime>,
+      data-modification-timestamp: option<datetime>,
+      status-change-timestamp: option<datetime>,
+    }
+
+    flags path-flags {
+      symlink-follow,
+    }
+
+    flags open-flags {
+      create,
+      directory,
+      exclusive,
+      truncate,
+    }
+
+    record metadata-hash-value {
+      lower: u64,
+      upper: u64,
+    }
+  }
+  interface preopens {
+    use types.{descriptor};
+
+    get-directories: func() -> list<tuple<descriptor, string>>;
+  }
+}
+
+
+package di-framework:sqlite@0.1.0 {
+  interface types {
+    record sqlite-error {
+      code: s32,
+      extended-code: s32,
+      message: string,
+    }
+
+    variant error {
+      open-failed(string),
+      closed,
+      invalid-sql(string),
+      invalid-params(string),
+      execution-failed(sqlite-error),
+      value-conversion-failed(string),
+      busy,
+      invalid-transaction-state(string),
+      other(string),
+    }
+
+    variant value {
+      null,
+      integer(s64),
+      real(f64),
+      text(string),
+      blob(list<u8>),
+    }
+
+    type row = list<tuple<string, value>>;
+
+    enum sync-mode {
+      off,
+      normal,
+      full,
+    }
+
+    enum journal-mode {
+      delete,
+      persist,
+      memory,
+    }
+
+    enum transaction-behavior {
+      deferred,
+      immediate,
+      exclusive,
+    }
+
+    record open-options {
+      create: option<bool>,
+      read-only: option<bool>,
+      synchronous: option<sync-mode>,
+      journal-mode: option<journal-mode>,
+      busy-timeout-ms: option<u32>,
+      foreign-keys: option<bool>,
+    }
+  }
+  interface database {
+    use types.{error, value, row, open-options, transaction-behavior};
+
+    resource connection {
+      exec: func(sql: string) -> result<_, error>;
+      run: func(sql: string, params: list<value>) -> result<u64, error>;
+      query: func(sql: string, params: list<value>) -> result<list<row>, error>;
+      first: func(sql: string, params: list<value>) -> result<option<row>, error>;
+      begin: func(behavior: option<transaction-behavior>) -> result<_, error>;
+      commit: func() -> result<_, error>;
+      rollback: func() -> result<_, error>;
+      savepoint: func(name: string) -> result<_, error>;
+      release-savepoint: func(name: string) -> result<_, error>;
+      rollback-to-savepoint: func(name: string) -> result<_, error>;
+      in-transaction: func() -> bool;
+      changes: func() -> u64;
+      last-insert-rowid: func() -> s64;
+      close: func() -> result<_, error>;
+    }
+
+    open: func(path: string, options: option<open-options>) -> result<connection, error>;
+
+    sqlite-version: func() -> string;
+  }
+}

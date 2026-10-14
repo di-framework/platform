@@ -4,24 +4,18 @@ import { readFileSync } from 'node:fs';
 import * as k8s from '@pulumi/kubernetes';
 import * as pulumi from '@pulumi/pulumi';
 import { routeUrlPatternFor } from './gateway/install';
-import { createPlatform } from './index';
+import { createPlatform, type PlatformConfigArgs, validatePlatformConfig } from './index';
 import { kubeconfigServer } from './kubeconfig';
 
 const config = new pulumi.Config();
 export const kubeconfig = config.require('kubeconfig');
 const adminKubeconfig = readFileSync(kubeconfig, 'utf8');
-const provider = new k8s.Provider('cluster', {
-  kubeconfig: pulumi.secret(adminKubeconfig),
-  context: config.get('context'),
-  enableServerSideApply: true,
-});
 const installation = `di-framework-${createHash('sha256').update(`${pulumi.getProject()}/${pulumi.getStack()}`).digest('hex').slice(0, 20)}`;
 const networkPolicyEngine = config.get('networkPolicyEngine') ?? 'existing';
 if (networkPolicyEngine !== 'existing' && networkPolicyEngine !== 'kube-router')
   throw new Error('networkPolicyEngine must be existing or kube-router');
-const platform = createPlatform({
+const platformConfig = {
   networkPolicyEngine,
-  provider,
   installation,
   config,
   namespace: config.get('namespace'),
@@ -39,7 +33,15 @@ const platform = createPlatform({
   apiServer:
     config.get('kubernetesEndpoint') ?? kubeconfigServer(adminKubeconfig, config.get('context')),
   routeUrlPattern: config.get('routeUrlPattern') ?? routeUrlPatternFor(config.get('httpEndpoint')),
+} satisfies PlatformConfigArgs;
+// Refuse invalid platform input before registering the cluster provider (#294).
+validatePlatformConfig(platformConfig);
+const provider = new k8s.Provider('cluster', {
+  kubeconfig: pulumi.secret(adminKubeconfig),
+  context: config.get('context'),
+  enableServerSideApply: true,
 });
+const platform = createPlatform({ ...platformConfig, provider });
 export const schemaVersion = 2;
 export const namespace = platform.namespace;
 export const tenants = platform.tenants;

@@ -96,6 +96,11 @@ Send the configured project name as the HTTP `Host` header, for example:
 curl -H 'Host: greeter' http://127.0.0.1:28180/
 ```
 
+`pulumi up` checks the platform configuration (tenants, users, route aliases,
+tenant auth, runtime NATS, insecure registries, the tenant host image) before it
+creates anything, so invalid configuration fails without creating the k0s
+container, network, or volumes.
+
 Platform destroy removes only container-engine and Kubernetes resources bearing this
 project/stack scope, along with the generated kubeconfig. It refuses to adopt
 or replace an already-existing container, network, or volume with the same name. Teardown
