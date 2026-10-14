@@ -84,6 +84,27 @@ describe('services create and the service proxy', () => {
           'cache-control': 'no-store',
         },
       });
+    if (request.pathname === '/reporting')
+      return new Response('reporting', {
+        headers: {
+          NEL: '{"report_to":"svc","max_age":31536000,"include_subdomains":true}',
+          'Report-To':
+            '{"group":"svc","max_age":31536000,"endpoints":[{"url":"https://collector.test/r"}]}',
+          'Reporting-Endpoints': 'svc="https://collector.test/r"',
+          'ALT-SVC': 'h3=":443"; ma=86400',
+          'x-service': 'yes',
+        },
+      });
+    if (request.pathname === '/burst')
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            for (let part = 0; part < 4; part++)
+              controller.enqueue(new Uint8Array(256 * 1024).fill(97 + part));
+            controller.close();
+          },
+        }),
+      );
     if (request.pathname === '/stall')
       return new Response(
         new ReadableStream({
@@ -603,6 +624,19 @@ describe('services create and the service proxy', () => {
     expect(response.headers.get('content-security-policy')).toBe('sandbox');
   });
 
+  test('a service cannot register reporting endpoints or alternative services (#91)', async () => {
+    const { url } = await openSession();
+    const response = await fetch(`${url}/reporting`, { headers: { authorization: 'Bearer ok' } });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('reporting');
+    for (const name of ['nel', 'NEL', 'report-to', 'Report-To', 'reporting-endpoints', 'alt-svc'])
+      expect(response.headers.get(name)).toBeNull();
+    const names = [...response.headers.keys()];
+    for (const name of ['nel', 'report-to', 'reporting-endpoints', 'alt-svc'])
+      expect(names).not.toContain(name);
+    expect(response.headers.get('x-service')).toBe('yes');
+  });
+
   test('a stall after the headers is audited and ends the body (#91 S10)', async () => {
     const sessions = new ProxySessions();
     const session = sessions.issue({
@@ -668,9 +702,20 @@ describe('services create and the service proxy', () => {
       );
       return { response, audited };
     };
-    const slow = await run('/page');
-    await Bun.sleep(120);
-    expect(await slow.response.text()).toBe('echo GET /page ');
+    // Several chunks, each read well past the idle timeout: only a silent service is a stall.
+    const slow = await run('/burst');
+    const body = (slow.response.body as ReadableStream<Uint8Array>).getReader();
+    let received = 0;
+    let reads = 0;
+    for (;;) {
+      await Bun.sleep(100);
+      const chunk = await body.read();
+      if (chunk.done) break;
+      received += chunk.value.byteLength;
+      reads++;
+    }
+    expect(received).toBe(4 * 256 * 1024);
+    expect(reads).toBeGreaterThan(1);
     expect(slow.audited).toEqual(['proxy.forwarded']);
     const cancelled = await run('/stall');
     const reader = (cancelled.response.body as ReadableStream<Uint8Array>).getReader();
