@@ -63,7 +63,7 @@ describe('overview', () => {
       [{ name: 'web<1>', ready: '1/1', message: 'ok', age: '5m' }, { name: 'bare' }],
       [{ name: 'db', class: 'postgres', ready: 'True' }, { name: 'cache' }],
     );
-    expect(html).toContain('<a href="/logs/web&lt;1&gt;">web&lt;1&gt;</a>');
+    expect(html).toContain('<a href="/logs/web%3C1%3E">web&lt;1&gt;</a>');
     expect(html).toContain('<td>1/1</td>');
     expect(html).toContain('<td>postgres</td>');
     expect(html).toContain('<td>cache</td><td></td><td></td>');
@@ -126,13 +126,60 @@ describe('keys', () => {
     const html = keys(who, [key()], issued);
     expect(html).toContain('Copy this key now. It is not shown again.');
     expect(html).toContain('<pre>sec&lt;ret&gt;</pre>');
-    // The hint currently omits --controller (see tenant-cli usage); pinned as-is, not fixed here.
-    expect(html).toContain('login --account acme --api-key &lt;key&gt;');
+    expect(keys(who, [key()], issued, undefined, 'https://ctl.test/a?x=<1>')).toContain(
+      'di-tenant login --controller https://ctl.test/a?x=&lt;1&gt; --account acme --api-key &lt;key&gt;',
+    );
   });
 
   test('renders an escaped error', () => {
     expect(keys(who, [], undefined, '<boom>')).toContain(
       '<p class="banner error">&lt;boom&gt;</p>',
     );
+  });
+});
+
+describe('escaping of user-controlled values', () => {
+  const X = '<script>x</script>';
+  const I = '<img src=x>';
+  const hostile: Who = { account: `A${X}`, user: `U${I}`, role: `R${X}` };
+  const eX = '&lt;script&gt;x&lt;/script&gt;';
+  const eI = '&lt;img src=x&gt;';
+  const cases: [string, string, string][] = [
+    ['key.name', keys(hostile, [key({ name: `N${X}` })]), `N${eX}`],
+    [
+      'key.id (cell and revoke action)',
+      keys(hostile, [key({ id: `i${I}` })]),
+      `/keys/i${eI}/revoke`,
+    ],
+    ['key timestamps', keys(hostile, [key({ createdAt: `c${X}`, expiresAt: `x${I}` })]), `c${eX}`],
+    ['who.account', keys(hostile, []), `<h1>A${eX}</h1>`],
+    ['who.user', keys(hostile, []), `U${eI}`],
+    ['who.role', keys(hostile, []), `(R${eX})`],
+    ['banner account', keys(hostile, [], { ...key(), secret: 's' }), `--account A${eX}`],
+    [
+      'banner controller',
+      keys(hostile, [], { ...key(), secret: 's' }, undefined, `C${I}`),
+      `--controller C${eI}`,
+    ],
+    [
+      'members user',
+      members(hostile, [{ user: `m${I}`, role: `r${X}`, suspended: false }]),
+      `m${eI}`,
+    ],
+    ['members role', members(hostile, [{ user: 'm', role: `r${X}`, suspended: false }]), `r${eX}`],
+    ['service name', overview(hostile, [], [{ name: `S${X}` }]), `S${eX}`],
+    ['deployment name', overview(hostile, [{ name: `D${I}` }], []), `D${eI}`],
+    ['logs app', logs(hostile, `L${X}`, []), `L${eX}`],
+    ['landing h1', landing(`H${X}`), `<h1>H${eX}</h1>`],
+    ['message h1', message(`T${I}`, 'ok'), `<h1>T${eI}</h1>`],
+  ];
+  test.each(cases)('%s', (_name, out, escaped) => {
+    expect(out).toContain(escaped);
+    expect(out).not.toContain('<script>x');
+    expect(out).not.toContain('<img src=x');
+  });
+
+  test('deployment names are percent-encoded in the logs href', () => {
+    expect(overview(who, [{ name: 'a/b?c' }], [])).toContain('href="/logs/a%2Fb%3Fc"');
   });
 });

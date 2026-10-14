@@ -540,7 +540,10 @@ export class Console {
 
   private async keys(session: Session, issued?: IssuedApiKey, error?: string): Promise<Response> {
     const { keys } = await this.controller<{ keys: ApiKey[] }>('/-/keys', session.accessToken);
-    return html(keysPage(session, keys, issued, error), error ? 400 : 200);
+    return html(
+      keysPage(session, keys, issued, error, this.config.controllerPublicUrl),
+      error ? 400 : 200,
+    );
   }
 
   private async createKey(request: Request, session: Session): Promise<Response> {
