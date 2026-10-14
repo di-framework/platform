@@ -451,7 +451,9 @@ jobs:
   # wash:src-<hash> tag, so the PR is a snapshot of the registry, not of this run. A variant not
   # yet published for this source keeps its current row; recover a failed variant by dispatching
   # the workflow for it. scripts/pin-artifact.ts also moves DEFAULT_HOST_IMAGE to the canonical
-# variant's digest and appends each 0003 variant's digest to NATS_CREDENTIALS_HOST_IMAGE_DIGESTS.
+  # variant's digest and appends each 0003 variant's digest to NATS_CREDENTIALS_HOST_IMAGE_DIGESTS.
+  # That allowlist lives under platform/platform/src/tenancy/**, an input of tenant-auth-image.yml,
+  # so merging a pin PR that extends it also publishes tenant-auth and opens bot/pin-tenant-auth.
   pin:
     name: Open pin PR
     # Also on a push that published nothing (every variant already published for this source, e.g.
