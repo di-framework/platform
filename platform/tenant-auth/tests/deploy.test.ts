@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
-import { deployBundle } from '@di-framework/tenant-cli/tests/support/deploy-bundle.ts';
+import { deployBundle } from '@di-framework/tenant-cli/testing';
 import type { Socket } from 'bun';
 // Pinned to the platform's log projection, which keys logs by these labels (platform#103).
 import {

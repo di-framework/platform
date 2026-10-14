@@ -50,6 +50,20 @@ const info = await createClient({ baseUrl: 'https://controller.example' }).authI
 
 `api/v1/openapi.yaml` ships alongside as the contract. `bun run build` produces `dist`.
 
+### Test fixtures
+
+`@di-framework/tenant-cli/testing` exports `deployBundle(overrides?)`: a complete, valid
+`DeployBundle` as the CLI renders it, fresh on every call. The tenant controller's deploy tests and
+other consumers of the deploy contract import it so both sides agree on the shape. Pin it to the
+same version as `./client`. It is a separate entry so test code stays out of `./client`, and it has
+no runtime dependencies.
+
+```ts
+import { deployBundle } from '@di-framework/tenant-cli/testing';
+
+const bundle = deployBundle({ env: 'staging' });
+```
+
 ## Registry
 
 Each tenant gets its own OCI registry component in its namespace (platform#83, decision in
