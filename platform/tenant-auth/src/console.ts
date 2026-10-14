@@ -546,7 +546,7 @@ export class Console {
    */
   private async logs(session: Session, name: string): Promise<Response> {
     const deployment = await this.find<{ metadata: WorkloadIdentity }>(
-      `${WASMCLOUD_API}/namespaces/${this.tenantNamespace}/workloaddeployments/${name}`,
+      `${WASMCLOUD_API}/namespaces/${this.tenantNamespace}/workloaddeployments/${encodeURIComponent(name)}`,
       session.accessToken,
     );
     const key = deployment ? logKey(deployment.metadata) : undefined;

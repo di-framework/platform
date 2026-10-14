@@ -874,6 +874,10 @@ class LogApi implements Api {
   configMaps = new Map<string, Resource>();
   logs = new Map<string, string>();
   logQueries: string[] = [];
+  /** ConfigMap writes, `<name>?<query>`. */
+  writes: string[] = [];
+  /** `<METHOD> <ConfigMap name>` calls the API refuses, as at the namespace quota. */
+  refused = new Set<string>();
   pods = [
     { metadata: { name: 'host-0', uid: 'pod-0' }, status: { phase: 'Running' } },
     { metadata: { name: 'host-1', uid: 'pod-1' }, status: { phase: 'Pending' } },
@@ -913,7 +917,10 @@ class LogApi implements Api {
       if (!value) throw new ApiError(404, 'Not found');
       return structuredClone(value) as T;
     }
+    if (this.refused.has(`${method} ${name}`))
+      throw new ApiError(403, `exceeded quota: count/configmaps (${name})`);
     if (method === 'PATCH') {
+      this.writes.push(`${name}${url.search}`);
       this.configMaps.set(name, structuredClone(body) as Resource);
       return structuredClone(body) as T;
     }
@@ -1551,9 +1558,56 @@ describe('projection keys per deployment and env (#106)', () => {
     await controller.projectLogs(tenant());
     expect([...api.configMaps.keys()].sort()).toEqual(['di-logs-web', 'di-logs-web.prod']);
     expect(linesOf(api, 'di-logs-web.prod')).toBe('2026-10-01T10:00:01.000000Z INFO prod up');
-    // The next tick finds the per-env ConfigMap and takes nothing over again.
+    // The kept ConfigMap is rewritten in the same pass, after the takeover, by server-side
+    // apply: the prod line now lives in di-logs-web.prod only.
+    expect(api.writes).toEqual([
+      'di-logs-web.prod?fieldManager=di-platform-controller',
+      'di-logs-web?fieldManager=di-platform-controller',
+    ]);
+    expect(projectedRing(api.configMaps.get('di-logs-web'))).toEqual([
+      { line: '2026-10-01T10:00:02.000000Z INFO cli up', deployment: 'web', env: '' },
+    ]);
+    // The next tick finds the per-env ConfigMap and has nothing to take over or prune.
     await controller.projectLogs(tenant());
+    expect(api.writes).toHaveLength(2);
     expect(linesOf(api, 'di-logs-web.prod')).toBe('2026-10-01T10:00:01.000000Z INFO prod up');
+  });
+
+  it('keeps going when one ConfigMap write fails, and holds back an untaken shared one', async () => {
+    const api = new LogApi();
+    api.workloads = [v1('prod'), v1('staging'), cli].map((metadata) => ({ metadata }));
+    const shared = logsConfigMap('alpha', NS, 'test', 'web', [
+      { line: '2026-10-01T10:00:01.000000Z INFO prod up', deployment: 'web-prod' },
+      { line: '2026-10-01T10:00:02.000000Z INFO staging up', deployment: 'web-staging' },
+      { line: '2026-10-01T10:00:03.000000Z INFO cli up', deployment: 'web' },
+    ]);
+    api.configMaps.set('di-logs-web', shared);
+    api.configMaps.set('di-logs-gone', logsConfigMap('alpha', NS, 'test', 'gone', ['x']));
+    api.refused.add('PATCH di-logs-web.prod');
+    api.refused.add('DELETE di-logs-gone');
+    api.logs.set('host-0', '');
+    const errors = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await new Controller(api, cfg).projectLogs(tenant());
+      // Staging was still taken over; the shared ConfigMap keeps prod's line for the next try.
+      expect(linesOf(api, 'di-logs-web.staging')).toBe(
+        '2026-10-01T10:00:02.000000Z INFO staging up',
+      );
+      expect(api.configMaps.get('di-logs-web')).toEqual(shared);
+      expect(api.configMaps.has('di-logs-gone')).toBe(true);
+      expect(errors.mock.calls.map(([line]) => line)).toEqual([
+        'Tenant/alpha logs ConfigMap di-logs-web.prod: exceeded quota: count/configmaps (di-logs-web.prod)',
+        'Tenant/alpha logs ConfigMap di-logs-gone: exceeded quota: count/configmaps (di-logs-gone)',
+      ]);
+      // Once there is room, the next poll finishes the move.
+      api.refused.clear();
+      await new Controller(api, cfg).projectLogs(tenant());
+      expect(linesOf(api, 'di-logs-web.prod')).toBe('2026-10-01T10:00:01.000000Z INFO prod up');
+      expect(linesOf(api, 'di-logs-web')).toBe('2026-10-01T10:00:03.000000Z INFO cli up');
+      expect(api.configMaps.has('di-logs-gone')).toBe(false);
+    } finally {
+      errors.mockRestore();
+    }
   });
 
   it('deletes a shared ConfigMap with nothing to take over', async () => {

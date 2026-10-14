@@ -399,8 +399,8 @@ repairs itself after a crash between apply and mark and after out-of-order concu
 Reads only report the repair (viewers stay read-only); the next deploy writes it.
 
 The namespace quota allows `count/configmaps: 100`, shared with `di-vars-<env>`, the `di-logs-*`
-projections (one per service and env, see below) and `kube-root-ca.crt`, so history is bounded
-(constants in `src/v1/deploy.ts`):
+projections (one per /v1 service and env; see "Console log projection" in the platform README)
+and `kube-root-ca.crt`, so history is bounded (constants in `src/v1/deploy.ts`):
 
 * `HISTORY_PER_SERVICE_ENV = 10` revisions per service and env.
 * `HISTORY_TENANT_BUDGET = 40` revisions in the tenant, evicting the oldest across services

@@ -10,7 +10,13 @@ import {
 } from 'bun:test';
 import { events } from '@di-framework/tenant-cli/client';
 // The platform's log projection, which writes what this endpoint reads (platform#103).
+import {
+  ApiError,
+  collection,
+  Controller as PlatformController,
+} from '../../platform/src/tenancy/controller.ts';
 import { logKey, logsConfigMap, type RingLine } from '../../platform/src/tenancy/log-projection.ts';
+import type { Resource, Tenant } from '../../platform/src/tenancy/resources.ts';
 import { Controller, configFromEnv } from '../src/controller.ts';
 import type { Principal } from '../src/identity.ts';
 import { KubeClient } from '../src/kube.ts';
@@ -714,4 +720,62 @@ test('logEvents falls back to data.failures for lines without a recorded deploym
   // A ConfigMap without, or with misaligned, deployments falls back for every line.
   expect(deploymentsOf()).toEqual(['web', 'web-v2', 'web']);
   expect(deploymentsOf(JSON.stringify(['web-v1']))).toEqual(['web', 'web-v2', 'web']);
+});
+
+test('a line the projection moves to a per-env ConfigMap is served once (#106)', async () => {
+  // A /v1 service web and a CLI workload web, with the ConfigMap they shared before #106.
+  const namespace = 'di-tenant-alpha';
+  const configMaps = new Map<string, Resource>();
+  const shared = logsConfigMap('alpha', namespace, 'test', 'web', [
+    { line: '2026-10-01T10:00:01.000000Z INFO prod up', deployment: 'web-prod' },
+    { line: '2026-10-01T10:00:02.000000Z INFO cli up', deployment: 'web' },
+  ]);
+  // Written before data.envs existed.
+  const { envs: _envs, ...data } = shared.data as Record<string, string>;
+  configMaps.set('di-logs-web', { ...shared, data });
+  const workloads = [
+    {
+      name: 'web-prod',
+      labels: {
+        'di-framework.dev/application': 'web',
+        'platform.di-framework.dev/env': 'prod',
+      },
+    },
+    { name: 'web', labels: { 'di-framework.dev/application': 'web' } },
+  ];
+  const cms = collection('v1', 'ConfigMap', namespace);
+  const api = {
+    async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+      const url = new URL(path, 'https://kubernetes');
+      if (url.pathname.endsWith('/pods')) return { items: [] } as T;
+      if (url.pathname.endsWith('/workloaddeployments'))
+        return { items: workloads.map((metadata) => ({ metadata })) } as T;
+      if (url.pathname === cms) return { items: [...configMaps.values()] } as T;
+      const name = decodeURIComponent(url.pathname.slice(cms.length + 1));
+      if (method === 'PATCH') configMaps.set(name, structuredClone(body) as Resource);
+      else if (method === 'DELETE') configMaps.delete(name);
+      else if (!configMaps.has(name)) throw new ApiError(404, 'Not found');
+      return structuredClone(configMaps.get(name)) as T;
+    },
+  };
+  const served = () =>
+    [...configMaps.values()]
+      .flatMap((cm) => logEvents(cm as never))
+      .filter((e) => e.env === undefined || e.env === 'prod')
+      .map((e) => e.message);
+  expect(served()).toEqual(['prod up']);
+  await new PlatformController(api, {
+    installation: 'test',
+    namespace: 'wasmcloud',
+    hostImage: 'wash:test',
+    schedulerNatsUrl: 'nats://nats:4222',
+  }).projectLogs({
+    apiVersion: 'platform.di-framework.dev/v1alpha1',
+    kind: 'Tenant',
+    metadata: { name: 'alpha', uid: 'alpha-uid', labels: {} },
+    spec: {},
+  } as Tenant);
+  // Both ConfigMaps match the endpoint's selector; the prod line is in one of them only.
+  expect([...configMaps.keys()].sort()).toEqual(['di-logs-web', 'di-logs-web.prod']);
+  expect(served()).toEqual(['prod up']);
 });

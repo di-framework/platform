@@ -536,9 +536,14 @@ WorkloadDeployment in `data.failures`.
 - Migration: before this keying, staging and prod of a /v1 service shared
   `di-logs-<service>`. On its next poll the controller starts each
   `di-logs-<service>.<env>` from the lines and failure that ConfigMap recorded for
-  `<service>-<env>`, then deletes the shared one (unless a live CLI application still
-  owns that key). Lines published before deployments were recorded cannot be
-  attributed to an env and are not carried over.
+  `<service>-<env>`, then deletes the shared one. When a live CLI application still
+  owns that key, the shared ConfigMap is kept and rewritten in the same pass without
+  the lines of /v1 deployments, so no line is served twice. Lines published before
+  deployments were recorded cannot be attributed to an env and are not carried over.
+- Each ConfigMap write or delete is attempted on its own: one refused (for example at
+  the `count/configmaps` quota) is logged and retried on the next poll without
+  holding back the other projections, and a shared ConfigMap is not pruned or deleted
+  until its lines have been taken over.
 
 - Source: the `hostgroup-<tenant>` pod logs, read through a per-tenant
   `di-platform-log-reader` Role (`pods/log get` in the runtime namespace only). The

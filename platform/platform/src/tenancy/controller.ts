@@ -1792,7 +1792,13 @@ export class Controller {
    * A ConfigMap whose key no live WorkloadDeployment has is removed. That includes the
    * `di-logs-<service>` ConfigMap staging and prod of a /v1 service shared before #106: each
    * per-env projection first takes over that ConfigMap's lines and failures of its own
-   * deployment (legacyRing), then the shared one is deleted.
+   * deployment (legacyRing), then the shared one is deleted. When a live workload outside
+   * /v1 still owns that key, the ConfigMap is kept and rewritten in the same pass without the
+   * lines of /v1 deployments, so no line is served from two projections.
+   *
+   * Each write and delete is attempted on its own: one that fails (e.g. at the ConfigMap
+   * quota) is logged and retried on the next poll without holding back the other keys. A
+   * shared ConfigMap whose lines could not be taken over is neither pruned nor deleted.
    */
   async projectLogs(tenant: Tenant): Promise<void> {
     const n = names(tenant.metadata.name);
@@ -1863,6 +1869,17 @@ export class Controller {
         ),
       );
     }
+    // /v1 deployments; their lines never belong in a projection outside /v1 (see pruning).
+    const v1Deployments = new Set(
+      deployments.filter((deployment) => logKey(deployment).env).map((d) => d.name),
+    );
+    const pruned = new Set<string>();
+    for (const [id, key] of keys)
+      if (
+        !key.env &&
+        projectedRing(current.get(id)).some((entry) => v1Deployments.has(entry.deployment))
+      )
+        pruned.add(id);
     const incoming = new Map<string, RingLine[]>();
     // Failures are merged newest-wins by deployment, so they skip the line floor: a
     // restarted controller re-reading old lines cannot duplicate them, and never loses one.
@@ -1901,33 +1918,52 @@ export class Controller {
       }
       if (newest) this.logCursors.set(cursorKey, newest);
     }
-    for (const id of new Set([...seeded, ...incoming.keys()])) {
-      const key = keys.get(id);
-      if (!key || !validLabelValue(key.application)) continue;
+    /** Shared ConfigMaps (by key id) a per-env projection could not take over from yet. */
+    const held = new Set<string>();
+    const attempt = async (name: string, write: () => Promise<unknown>) => {
+      try {
+        await write();
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'write failed';
+        console.error(`Tenant/${tenant.metadata.name} logs ConfigMap ${name}: ${message}`);
+        return false;
+      }
+    };
+    // Takeovers first, so a shared ConfigMap is pruned or deleted only once they are written.
+    for (const id of new Set([...seeded, ...pruned, ...incoming.keys()])) {
+      const key = keys.get(id) as LogKey;
+      if (!validLabelValue(key.application)) continue;
       const lines = incoming.get(id) ?? [];
       const published = current.get(id);
       const previous = projectedFailures(published);
       const merged = mergeFailures(previous, failures.get(id) ?? [], members.get(id) ?? []);
+      const prune = pruned.has(id) && !held.has(id);
       if (
         !seeded.has(id) &&
+        !prune &&
         lines.length === 0 &&
         JSON.stringify(merged) === JSON.stringify(previous)
       )
         continue;
-      await this.ensure(
-        logsConfigMap(
-          tenant.metadata.name,
-          n.namespace,
-          this.cfg.installation,
-          key.application,
-          appendRing(projectedRing(published), lines),
-          merged,
-          key.env,
-        ),
+      const ring = projectedRing(published).filter(
+        (entry) => !prune || !v1Deployments.has(entry.deployment),
       );
+      const configMap = logsConfigMap(
+        tenant.metadata.name,
+        n.namespace,
+        this.cfg.installation,
+        key.application,
+        appendRing(ring, lines),
+        merged,
+        key.env,
+      );
+      const written = await attempt(configMap.metadata.name, () => this.ensure(configMap));
+      if (!written && seeded.has(id)) held.add(key.application);
     }
     for (const [id, configMap] of existingByKey) {
-      if (!keys.has(id)) await this.remove(configMap);
+      if (!keys.has(id) && !held.has(id))
+        await attempt(configMap.metadata.name, () => this.remove(configMap));
     }
   }
 
