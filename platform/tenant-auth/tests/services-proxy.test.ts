@@ -703,12 +703,14 @@ describe('services create and the service proxy', () => {
       return { response, audited };
     };
     // Several chunks, each read well past the idle timeout: only a silent service is a stall.
+    // How many chunks the 1 MiB arrives in is up to the runtime, so only the first few reads
+    // wait; a pause per chunk made the test as long as the chunk count, which load drives up.
     const slow = await run('/burst');
     const body = (slow.response.body as ReadableStream<Uint8Array>).getReader();
     let received = 0;
     let reads = 0;
     for (;;) {
-      await Bun.sleep(100);
+      if (reads < 3) await Bun.sleep(100);
       const chunk = await body.read();
       if (chunk.done) break;
       received += chunk.value.byteLength;

@@ -239,6 +239,22 @@ describe('header handling', () => {
 
 type Seen = { url?: string; method?: string; headers: IncomingHttpHeaders; body: string };
 
+/** Resolves once `port` accepts a connection: a server started by `main` reports no event. */
+async function accepting(port: number): Promise<void> {
+  for (;;) {
+    const accepted = await new Promise<boolean>((resolve) => {
+      const socket = connect(port, '127.0.0.1');
+      socket.once('connect', () => {
+        socket.destroy();
+        resolve(true);
+      });
+      socket.once('error', () => resolve(false));
+    });
+    if (accepted) return;
+    await Bun.sleep(5);
+  }
+}
+
 async function listen(server: Server): Promise<number> {
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   return (server.address() as { port: number }).port;
@@ -455,13 +471,13 @@ describe('gateway proxy', () => {
   });
 
   it('cancels the upstream request when the client goes away', async () => {
-    const closed = new Promise<void>((resolve) => {
-      upstream.once('request', (req: IncomingMessage) => req.socket.once('close', resolve));
-    });
+    const arrived = new Promise<IncomingMessage>((resolve) => upstream.once('request', resolve));
     const socket = connect(port, '127.0.0.1', () =>
       socket.write('GET /slow HTTP/1.1\r\nHost: site.alpha.localhost\r\n\r\n'),
     );
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Leave only once the request reached the upstream, so there is one to cancel.
+    const req = await arrived;
+    const closed = new Promise((resolve) => req.socket.once('close', resolve));
     socket.destroy();
     await closed;
   });
@@ -861,6 +877,10 @@ describe('tenant-auth routes (#58:routes)', () => {
     const target = await listen(free as Server);
     await new Promise((resolve) => free.close(resolve));
     const signals = new EventEmitter();
+    let exited: () => void = () => {};
+    const drained = new Promise<void>((resolve) => {
+      exited = resolve;
+    });
     const server = main(
       {
         GATEWAY_CONFIG: JSON.stringify({
@@ -870,12 +890,13 @@ describe('tenant-auth routes (#58:routes)', () => {
         }),
       },
       signals,
+      () => exited(),
     );
     expect(server.listening).toBe(false); // the edge listens in front of it
-    await Bun.sleep(20);
+    await accepting(target);
     expect(await tlsThrough('other.alpha.localhost', target)).toBe('closed');
     signals.emit('SIGTERM');
-    await Bun.sleep(20);
+    await drained;
     const refused = await new Promise<boolean>((resolve) => {
       const socket = connect(target, '127.0.0.1');
       socket.on('connect', () => {
@@ -1077,41 +1098,77 @@ describe('edge timeouts and HTTP handoff (#58:routes)', () => {
     expect(await openFor([0x16, 3, 1, 0x40, 0x01])).toBeLessThan(80);
   });
 
-  /** Write each chunk after a pause and collect everything the gateway answers. */
-  const converse = (chunks: string[], pause = 0) =>
-    new Promise<string>((resolve) => {
-      let data = '';
-      const socket = connect(port, '127.0.0.1', async () => {
-        for (const chunk of chunks) {
-          socket.write(chunk);
-          await Bun.sleep(pause);
-        }
-        await Bun.sleep(100);
-        socket.destroy();
-        resolve(data);
-      });
-      socket.setEncoding('utf8');
-      socket.on('data', (chunk) => {
-        data += chunk;
-      });
+  /**
+   * A raw client. `until` resolves once the gateway has answered `text`, and rejects if the
+   * connection closes first, so each step waits for the reply instead of a fixed pause.
+   */
+  const client = async () => {
+    const socket = connect(port, '127.0.0.1');
+    await new Promise((resolve, reject) => {
+      socket.once('connect', resolve);
+      socket.once('error', reject);
     });
+    let data = '';
+    let closed = false;
+    const waiters = new Set<() => void>();
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk) => {
+      data += chunk;
+      for (const check of waiters) check();
+    });
+    socket.on('error', () => {});
+    socket.on('close', () => {
+      closed = true;
+      for (const check of waiters) check();
+    });
+    const until = (text: string) =>
+      new Promise<void>((resolve, reject) => {
+        const check = () => {
+          if (data.includes(text)) resolve();
+          else if (closed) reject(new Error(`closed before ${JSON.stringify(text)}: ${data}`));
+          else return;
+          waiters.delete(check);
+        };
+        waiters.add(check);
+        check();
+      });
+    return { socket, until, data: () => data };
+  };
+
+  // Each pause outlasts the 100 ms classification timeout: that the connection survives it is
+  // what these two tests check, so the wait is the point, not a guess at how long a reply takes.
+  const pastClassification = () => Bun.sleep(150);
 
   it('keeps a classified HTTP connection alive past the classification timeout', async () => {
     const get = (path: string) => `GET ${path} HTTP/1.1\r\nHost: site.alpha.localhost\r\n\r\n`;
-    const data = await converse([get('/a'), get('/b'), get('/c')], 150);
-    expect(data.match(/ok \/[abc]/g)).toEqual(['ok /a', 'ok /b', 'ok /c']);
+    const { socket, until, data } = await client();
+    try {
+      for (const path of ['/a', '/b', '/c']) {
+        socket.write(get(path));
+        await until(`ok ${path}`);
+        await pastClassification();
+      }
+      expect(data().match(/ok \/[abc]/g)).toEqual(['ok /a', 'ok /b', 'ok /c']);
+    } finally {
+      socket.destroy();
+    }
   });
 
   it('relays a WebSocket upgrade through the edge in both directions', async () => {
-    const data = await converse(
-      [
+    const { socket, until, data } = await client();
+    try {
+      socket.write(
         'GET /ws HTTP/1.1\r\nHost: site.alpha.localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n',
-        'ping',
-      ],
-      150,
-    );
-    expect(data).toContain('101 Switching Protocols');
-    expect(data).toContain('echo:ping');
+      );
+      await until('101 Switching Protocols');
+      await pastClassification();
+      socket.write('ping');
+      await until('echo:ping');
+      expect(data()).toContain('101 Switching Protocols');
+      expect(data()).toContain('echo:ping');
+    } finally {
+      socket.destroy();
+    }
   });
 
   it('closes an idle controller passthrough after the idle timeout', async () => {
@@ -1213,6 +1270,10 @@ describe('tenant registry route (#83:reconcile)', () => {
     const target = await listen(free as Server);
     await new Promise((resolve) => free.close(resolve));
     const signals = new EventEmitter();
+    let exited: () => void = () => {};
+    const drained = new Promise<void>((resolve) => {
+      exited = resolve;
+    });
     const server = main(
       {
         GATEWAY_CONFIG: JSON.stringify({
@@ -1222,9 +1283,11 @@ describe('tenant registry route (#83:reconcile)', () => {
         }),
       },
       signals,
+      () => exited(),
     );
     expect(server.listening).toBe(false); // the edge listens in front of it
+    await accepting(target);
     signals.emit('SIGTERM');
-    await Bun.sleep(20);
+    await drained;
   });
 });
