@@ -12,6 +12,9 @@
  * It keeps what the registry listeners relied on from `Bun.serve`: an idle timeout that any data
  * flow resets, a request body cap that also applies to chunked bodies (413), the client address,
  * and a request signal that aborts when the client goes away.
+ *
+ * The whoami listener uses it too (platform#113): over TLS, and for callers still configured with
+ * an `http://` URL during an upgrade, over plain HTTP on the same port (`acceptPlainHttp`).
  */
 import {
   createServer as createHttpServer,
@@ -21,6 +24,7 @@ import {
   type ServerResponse,
 } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
+import { connect, createServer as createNetServer, type Socket } from 'node:net';
 import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
 
 /** The `server` argument the registry handlers take, as `Bun.serve` passes it. */
@@ -34,6 +38,13 @@ export interface RegistryListenerOptions {
   port: number;
   /** PEM certificate and key; plain HTTP without them. */
   tls?: { cert: string; key: string };
+  /**
+   * With `tls`, also answer plain-HTTP clients on the same port: a connection whose first byte
+   * opens a TLS handshake is served over TLS, any other over plain HTTP. Each protocol is served
+   * by its own listener on loopback, so the handler sees `127.0.0.1` as the client address.
+   * Without `tls` it changes nothing.
+   */
+  acceptPlainHttp?: boolean;
   /** A socket with no data flow for this long is closed. */
   idleTimeoutSeconds: number;
   /** Largest request body accepted, declared or chunked; larger ones are answered 413. */
@@ -53,6 +64,76 @@ const NO_BODY = new Set([204, 205, 304]);
 export async function serveRegistryListener(
   options: RegistryListenerOptions,
 ): Promise<RegistryListener> {
+  if (options.tls && options.acceptPlainHttp) return serveTlsAndPlain(options, options.tls);
+  return serveSingle(options);
+}
+
+/** The first byte of a TLS connection: a handshake record (content type 22). */
+const TLS_HANDSHAKE = 0x16;
+
+/**
+ * TLS and plain HTTP on one port (`acceptPlainHttp`): each connection is relayed, by its first
+ * byte, to a loopback listener for its protocol. The relay ends both sides together, and the
+ * idle timeout applies to the client socket as well as to the inner listeners.
+ */
+async function serveTlsAndPlain(
+  options: RegistryListenerOptions,
+  tls: { cert: string; key: string },
+): Promise<RegistryListener> {
+  const inner = { ...options, hostname: '127.0.0.1', port: 0, acceptPlainHttp: false };
+  // Loopback on a free port each: these do not fail where the public port could.
+  const secure = await serveSingle({ ...inner, tls });
+  const plain = await serveSingle({ ...inner, tls: undefined });
+  const stopInner = () => Promise.all([secure.stop(), plain.stop()]).then(() => {});
+  const sockets = new Set<Socket>();
+  const server = createNetServer((client) => {
+    sockets.add(client);
+    client.once('close', () => sockets.delete(client));
+    client.on('error', () => client.destroy());
+    client.setTimeout(options.idleTimeoutSeconds * 1000, () => client.destroy());
+    client.once('data', (first: Buffer) => {
+      client.pause();
+      const target = first[0] === TLS_HANDSHAKE ? secure.port : plain.port;
+      const upstream = connect(target, '127.0.0.1');
+      sockets.add(upstream);
+      upstream.once('close', () => {
+        sockets.delete(upstream);
+        client.destroy();
+      });
+      upstream.on('error', () => upstream.destroy());
+      client.once('close', () => upstream.destroy());
+      upstream.once('connect', () => {
+        upstream.write(first);
+        client.pipe(upstream);
+        upstream.pipe(client);
+        client.resume();
+      });
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(options.port, options.hostname, () => {
+      server.off('error', reject);
+      resolve();
+    });
+  }).catch(async (error) => {
+    await stopInner();
+    throw error;
+  });
+  const address = server.address();
+  return {
+    port: typeof address === 'object' && address ? address.port : options.port,
+    stop: async () => {
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+        for (const socket of sockets) socket.destroy();
+      });
+      await stopInner();
+    },
+  };
+}
+
+async function serveSingle(options: RegistryListenerOptions): Promise<RegistryListener> {
   const addresses = new WeakMap<Request, string>();
   const client: ClientAddress = {
     requestIP: (request) => {

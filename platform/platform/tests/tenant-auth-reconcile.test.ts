@@ -18,6 +18,7 @@ import {
   type Resource,
   registryHttpHost,
   registryPullHost,
+  registryWhoamiHost,
   TENANT,
   TENANT_AUTH_LIMITS,
   type Tenant,
@@ -1868,7 +1869,7 @@ describe('tenant registry (#83:reconcile)', () => {
         package: 'secrets',
         interfaces: ['store', 'reveal'],
         config: {
-          'tenant-controller-url': 'http://tenant-controller.di-runtime-alpha.svc:8789',
+          'tenant-controller-url': 'https://tenant-controller.di-runtime-alpha.svc:8789',
           tenant: 'alpha',
         },
       },
@@ -1989,6 +1990,39 @@ describe('tenant registry (#83:reconcile)', () => {
         registry: { component: COMPONENT_REF, publicUrl: 'https://10.1.2.3:8790' },
       }).ips,
     ).toContain('10.1.2.3');
+  });
+
+  it('names the host the registry calls for whoami exactly in the controller certificate (#113)', () => {
+    const resources = tenantAuthResources(tenant(), registryCfg, {
+      ...inputs,
+      registryServing: true,
+    });
+    const workload = find(resources, 'WorkloadDeployment', REGISTRY_WORKLOAD) as Workload;
+    const { components, hostInterfaces } = workload.spec.template.spec as {
+      components: { localResources?: unknown }[];
+      hostInterfaces: { package: string; config?: Record<string, string> }[];
+    };
+    const secrets = hostInterfaces.find((i) => i.package === 'secrets');
+    const url = new URL(String(secrets?.config?.['tenant-controller-url']));
+    expect(url.protocol).toBe('https:');
+    expect(url.hostname).toBe('tenant-controller.di-runtime-alpha.svc');
+    expect(url.hostname).toBe(registryWhoamiHost('alpha'));
+    expect(url.port).toBe('8789');
+    // The egress allowlist names the same host and port.
+    expect(components[0]?.localResources).toEqual({
+      allowedHosts: [url.host],
+    });
+    // The certificate the controller is issued carries that exact name: not only a wildcard or
+    // the `.cluster.local` form, which the registry's TLS check would not match.
+    const names = tenantControllerCertNames('alpha', withRegistry);
+    const ca = caCertificate('tenant-controller CA (di-runtime-alpha)', 30);
+    const leaf = leafCertificate(url.hostname, names.dns, names.ips, 30, ca.cert, ca.key);
+    expect(certificateNames(leaf.cert)?.dns.filter((name) => name === url.hostname)).toEqual([
+      url.hostname,
+    ]);
+    expect(new X509Certificate(leaf.cert).checkHost(url.hostname)).toBe(url.hostname);
+    for (const name of ['beta', 'gamma'])
+      expect(tenantControllerCertNames(name).dns).toContain(registryWhoamiHost(name));
   });
 
   it('deploys the registry after raising the workload quota and reports it on TenantAuthReady', async () => {

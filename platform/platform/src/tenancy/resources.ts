@@ -136,7 +136,7 @@ export interface TenantAuthConfig {
 /**
  * The per-tenant registry: the `platform/oci-registry` component, run as a WorkloadDeployment on
  * the tenant's own hosts and backed by their data-plane blobstore. Its whoami callback goes to
- * the controller's plain-HTTP whoami listener; users reach it through the controller's TLS
+ * the controller's whoami listener over TLS (#113); users reach it through the controller's TLS
  * registry front.
  */
 export interface TenantRegistryConfig {
@@ -168,7 +168,11 @@ export interface TenantRegistryLimits {
   /** How long an upload may deliver no byte before it is cut off, in ms (default 60000). */
   uploadIdleTimeoutMs?: number;
 }
-/** The controller's plain-HTTP listener serving only `GET /v1/auth/whoami` (#83). */
+/**
+ * The controller's listener serving only `GET /v1/auth/whoami` (#83): TLS with the controller
+ * certificate (#113), and plain HTTP on the same port for a registry whose config still names
+ * `http://` during an upgrade.
+ */
 export const WHOAMI_PORT = 8789;
 /** The controller's TLS front for the tenant registry (#83). */
 export const REGISTRY_FRONT_PORT = 8790;
@@ -197,6 +201,13 @@ const REGISTRY_PULL_USER = 'tenant-host';
  */
 export function registryPullHost(tenant: string): string {
   return `${REGISTRY_PULL_SERVICE}.${names(tenant).runtimeNamespace}.svc`;
+}
+/**
+ * The name the tenant registry calls the controller's whoami listener by (#113): the controller
+ * Service in the runtime namespace, which {@link tenantControllerCertNames} always covers.
+ */
+export function registryWhoamiHost(tenant: string): string {
+  return `tenant-controller.${names(tenant).runtimeNamespace}.svc`;
 }
 /** The host pull Secret's data (base64): the token and the Docker config naming {@link registryPullHost}. */
 export function registryPullSecretData(tenant: string, token: string): Record<string, string> {
@@ -1257,7 +1268,7 @@ function tenantResources(
                     ...(cfg.insecureRegistries ?? []).flatMap((r) => ['--insecure-registry', r]),
                     // The tenant registry's pull Service serves the controller certificate. The
                     // same CA is trusted for the components' outgoing wasi:http (on top of the
-                    // webpki roots), so the registry can reach the controller over https (#113).
+                    // webpki roots), so the registry calls the controller's whoami over https (#113).
                     ...(hostPull?.caDigest
                       ? [
                           '--oci-ca-path=/registry-ca/ca.crt',
@@ -1447,7 +1458,8 @@ function tenantControllerCertNames(
   const ns = names(tenant).runtimeNamespace;
   const dns = [
     'tenant-controller',
-    `tenant-controller.${ns}.svc`,
+    // The tenant registry's whoami callback (#113).
+    registryWhoamiHost(tenant),
     `tenant-controller.${ns}.svc.cluster.local`,
     'localhost',
   ];
@@ -2018,8 +2030,9 @@ function tenantAuthResources(
  * the unnamed blobstore, configured with the NATS backend pointing to the tenant's `di-nats`
  * for persistent blob and manifest storage. The component reads the whoami URL and the tenant
  * through `wasmcloud:secrets` bind-time config; admission admits that interface from the
- * platform controller only, so a tenant cannot repoint it. The plain-HTTP whoami URL is
- * in-cluster (`*.svc`), as the component requires.
+ * platform controller only, so a tenant cannot repoint it. The whoami URL is https to the
+ * controller Service (#113): {@link registryWhoamiHost} is one of the controller certificate's
+ * names, and the hosts trust the tenant CA through `--http-client-ca-path`.
  */
 function registryWorkload(
   tenant: Tenant,
@@ -2030,7 +2043,7 @@ function registryWorkload(
   const name = tenant.metadata.name;
   const n = names(name);
   const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
-  const whoami = `tenant-controller.${n.runtimeNamespace}.svc:${WHOAMI_PORT}`;
+  const whoami = `${registryWhoamiHost(name)}:${WHOAMI_PORT}`;
   const value = resource(
     tenant,
     cfg.installation,
@@ -2049,7 +2062,8 @@ function registryWorkload(
               {
                 name: 'oci-registry',
                 image: registry.component,
-                // Hosts run with --socket-egress=enforce; the whoami call is the only egress.
+                // Hosts run with --socket-egress=enforce; the whoami call (https, the same
+                // host and port) is the only egress.
                 localResources: { allowedHosts: [whoami] },
               },
             ],
@@ -2075,7 +2089,7 @@ function registryWorkload(
                 namespace: 'wasmcloud',
                 package: 'secrets',
                 interfaces: ['store', 'reveal'],
-                config: { 'tenant-controller-url': `http://${whoami}`, tenant: name },
+                config: { 'tenant-controller-url': `https://${whoami}`, tenant: name },
               },
             ],
           },
