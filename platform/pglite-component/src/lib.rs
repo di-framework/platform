@@ -103,11 +103,10 @@ impl GuestConnection for DbConn {
         let mut guard = locked(self)?;
 
         let sess = live(&mut guard)?;
-        let out = sess.simple(&sql).map_err(|e| {
+        let out = sess.simple(&sql).inspect_err(|e| {
             // Redacted: server messages/SQL may hold PII; stderr gets only
             // the variant + SQLSTATE.
-            eprintln!("pglite exec failed: {}", describe_redacted(&e));
-            e
+            eprintln!("pglite exec failed: {}", describe_redacted(e));
         })?;
         guard.last_affected = out
             .tags
@@ -120,9 +119,8 @@ impl GuestConnection for DbConn {
     fn run(&self, sql: String, params: Vec<Value>) -> Result<u64, Error> {
         let mut guard = locked(self)?;
         let sess = live(&mut guard)?;
-        let out = sess.extended(&sql, &params).map_err(|e| {
-            eprintln!("pglite run failed: {}", describe_redacted(&e));
-            e
+        let out = sess.extended(&sql, &params).inspect_err(|e| {
+            eprintln!("pglite run failed: {}", describe_redacted(e));
         })?;
         let affected = out
             .tags
@@ -136,9 +134,8 @@ impl GuestConnection for DbConn {
     fn query(&self, sql: String, params: Vec<Value>) -> Result<Vec<Row>, Error> {
         let mut guard = locked(self)?;
         let sess = live(&mut guard)?;
-        let out = sess.extended(&sql, &params).map_err(|e| {
-            eprintln!("pglite query failed: {}", describe_redacted(&e));
-            e
+        let out = sess.extended(&sql, &params).inspect_err(|e| {
+            eprintln!("pglite query failed: {}", describe_redacted(e));
         })?;
         to_rows(out)
     }
