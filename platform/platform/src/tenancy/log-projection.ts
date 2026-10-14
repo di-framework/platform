@@ -1,4 +1,4 @@
-import { INSTALLATION, type Resource, TENANT } from './resources';
+import { type Condition, INSTALLATION, type Resource, TENANT } from './resources';
 
 /**
  * Tenant console log projection (#10).
@@ -516,6 +516,66 @@ export function appendRing<T extends string | RingLine>(
   return merged.filter((_, i) => keep.has(i));
 }
 
+/**
+ * Timestamp of the newest line of a published ring ('' when empty). The ring holds lines of
+ * several host pods and several passes, so its last line need not be its newest (#316).
+ */
+export function newestStamp(ring: readonly (string | RingLine)[]): string {
+  let newest = '';
+  for (const entry of ring) {
+    const stamp = (typeof entry === 'string' ? entry : entry.line).split(' ')[0] as string;
+    if (stamp > newest) newest = stamp;
+  }
+  return newest;
+}
+
+/**
+ * The incoming lines the ring does not hold yet (#316). A write the API applied but reported
+ * as failed (e.g. a timeout) is retried with the same lines; those are dropped here, so a
+ * retry never publishes a line twice. A line is identified by its text, which starts with
+ * its sub-second timestamp, and its deployment.
+ */
+export function unpublished(ring: readonly RingLine[], incoming: readonly RingLine[]): RingLine[] {
+  const id = (entry: RingLine) => `${entry.deployment}\n${entry.line}`;
+  const published = new Set(ring.map(id));
+  return incoming.filter((entry) => !published.has(id(entry)));
+}
+
+/** A projection ConfigMap write or delete that failed, and on how many polls in a row. */
+export interface LogWriteFailure {
+  count: number;
+  message: string;
+}
+
+/** Polls in a row a ConfigMap write must fail before the Tenant reports it (#316). */
+const LOG_WRITE_FAILURES_REPORTED = 3;
+
+/**
+ * The `LogsProjected` Tenant condition (#316): False while a projection ConfigMap has failed
+ * to be written (or deleted) on LOG_WRITE_FAILURES_REPORTED polls in a row, keyed by its name.
+ * Undefined otherwise, so a tenant whose logs project normally carries no extra condition.
+ */
+export function logWriteCondition(
+  failures: ReadonlyMap<string, LogWriteFailure> | undefined,
+  generation: number,
+): Condition | undefined {
+  const persistent = [...(failures ?? [])]
+    .filter(([, failure]) => failure.count >= LOG_WRITE_FAILURES_REPORTED)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const [first] = persistent;
+  if (!first) return undefined;
+  const [name, failure] = first;
+  const more = persistent.length > 1 ? ` (and ${persistent.length - 1} more)` : '';
+  return {
+    type: 'LogsProjected',
+    status: 'False',
+    reason: 'WriteFailed',
+    message: `logs ConfigMap ${name} failed on ${failure.count} polls in a row${more}: ${failure.message}`,
+    observedGeneration: generation,
+    lastTransitionTime: new Date().toISOString(),
+  };
+}
+
 /** Existing projected lines from a ConfigMap, newest last. */
 export function projectedLines(configMap: Resource | undefined): string[] {
   const data = configMap?.data as Record<string, unknown> | undefined;
@@ -746,6 +806,7 @@ export {
   ENV,
   ENVS,
   HOST_LINE,
+  LOG_WRITE_FAILURES_REPORTED,
   LOGS_ANNOTATION,
   LOGS_PREFIX,
   MANAGED_BY,

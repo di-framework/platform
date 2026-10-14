@@ -33,18 +33,21 @@ import {
   attributeEntries,
   configMapLogKey,
   type LogKey,
+  type LogWriteFailure,
   legacyRing,
   logKey,
   logKeyId,
   logsConfigMap,
+  logWriteCondition,
   MANAGED_SELECTOR,
   mergeFailures,
+  newestStamp,
   PROJECTION,
   type ProjectedEntry,
   projectedFailures,
-  projectedLines,
   projectedRing,
   type RingLine,
+  unpublished,
   validLabelValue,
   type WorkloadIdentity,
 } from './log-projection';
@@ -379,11 +382,12 @@ const TENANT_AUTH_KINDS = [
 
 export class Controller {
   /**
-   * Newest TracingLogger timestamp already projected, per tenant and host pod uid. Entries of
-   * pods that are gone are dropped by projectLogs, and those of tenants no longer projected by
-   * tick (#131), so neither grows without bound.
+   * Newest TracingLogger timestamp already projected, per tenant, host pod uid, and projection
+   * key (logKeyId). A key's cursor moves only once its ConfigMap is written (#316). Entries of
+   * pods and keys that are gone are dropped by projectLogs, and those of tenants no longer
+   * projected by tick (#131), so neither grows without bound.
    */
-  private readonly logCursors = new Map<string, Map<string, string>>();
+  private readonly logCursors = new Map<string, Map<string, Map<string, string>>>();
   /** Last successful egress name resolution, kept so a failed lookup does not revoke. */
   private readonly egressAddresses = new Map<string, string[]>();
   constructor(
@@ -984,10 +988,16 @@ export class Controller {
     // hostgroup 409) must not keep it from reconciling or from reporting TenantAuthReady (#121).
     let auth = await this.reconcileTenantAuth(tenant, users);
     if (hostPullFailure && auth) auth = withHostPullFailure(auth, hostPullFailure);
+    // A projection ConfigMap that keeps failing to be written (#316); absent otherwise.
+    const logs = logWriteCondition(
+      this.logWriteFailures.get(tenant.metadata.name),
+      tenant.metadata.generation ?? 1,
+    );
+    const others = [...(auth ? [auth] : []), ...(logs ? [logs] : [])];
     if (failure) {
       const message = failure instanceof Error ? failure.message : 'Reconciliation failed';
       console.error(`Tenant/${tenant.metadata.name}: ${message}`);
-      await this.status(tenant, false, 'ReconcileError', message, {}, auth ? [auth] : []);
+      await this.status(tenant, false, 'ReconcileError', message, {}, others);
       return;
     }
     await this.status(
@@ -1000,7 +1010,7 @@ export class Controller {
           ? 'Tenant resources are ready'
           : 'Waiting for runtime and backend deployments',
       { ...n, httpService: `di-http.${n.runtimeNamespace}.svc.cluster.local` },
-      auth ? [auth] : [],
+      others,
     );
   }
   /**
@@ -2046,6 +2056,13 @@ export class Controller {
   }
 
   /**
+   * Projection ConfigMap writes (and deletes) that failed on the last poll, per tenant and
+   * ConfigMap name, with how many polls in a row they failed. reconcileTenant reports one that
+   * persists as the `LogsProjected` condition (#316). Pruned like logCursors.
+   */
+  private readonly logWriteFailures = new Map<string, Map<string, LogWriteFailure>>();
+
+  /**
    * Publish one logs ConfigMap per projection key (#10, #106): per console application, and
    * per service and env for a /v1 deployment (logKey). Only `wasi:logging` lines the host
    * attributed to a workload in this tenant, and host WARN/ERROR lines from its
@@ -2150,33 +2167,54 @@ export class Controller {
     // restarted controller re-reading old lines cannot duplicate them, and never loses one.
     const failures = new Map<string, ProjectedEntry[]>();
     // Cursors of host pods that no longer exist are dropped (#131); a pod that is listed but not
-    // running keeps its cursor.
-    const cursors = this.logCursors.get(tenant.metadata.name) ?? new Map<string, string>();
+    // running keeps its cursors. So are those of keys no live WorkloadDeployment has.
+    const cursors =
+      this.logCursors.get(tenant.metadata.name) ?? new Map<string, Map<string, string>>();
     this.logCursors.set(tenant.metadata.name, cursors);
     const listed = new Set(pods.items.map((pod) => pod.metadata.uid ?? pod.metadata.name));
-    for (const key of cursors.keys()) if (!listed.has(key)) cursors.delete(key);
+    for (const pod of cursors.keys()) if (!listed.has(pod)) cursors.delete(pod);
+    for (const podCursors of cursors.values())
+      for (const id of podCursors.keys()) if (!keys.has(id)) podCursors.delete(id);
+    const writeFailures =
+      this.logWriteFailures.get(tenant.metadata.name) ?? new Map<string, LogWriteFailure>();
+    this.logWriteFailures.set(tenant.metadata.name, writeFailures);
+    /** Where each key's cursor of each pod moves once that key's ConfigMap is written (#316). */
+    const advance = new Map<string, Map<string, string>>();
     for (const pod of pods.items) {
       if (pod.status?.phase !== 'Running') continue;
       const cursorKey = pod.metadata.uid ?? pod.metadata.name;
-      const cursor = cursors.get(cursorKey);
+      const podCursors = cursors.get(cursorKey) ?? new Map<string, string>();
+      cursors.set(cursorKey, podCursors);
+      // Read from the oldest key cursor, so a key whose write failed reads its lines again.
+      const oldest = [...podCursors.values()].reduce<string | undefined>(
+        (min, value) => (min === undefined || value < min ? value : min),
+        undefined,
+      );
       // Re-read a short window before the cursor so a service failure logged just after a
       // tick still sees its `Starting workload` line. The floor below drops repeated lines
-      // and failures merge idempotently.
-      const query = cursor
+      // and failures merge idempotently. While a write keeps failing, the cursor stays put; the
+      // read is then bounded like the first one, and the ring by appendRing.
+      const query = oldest
         ? `sinceTime=${encodeURIComponent(
-            new Date(Date.parse(cursor) - LOG_LOOKBACK_MS).toISOString().replace(/\.\d+Z$/, 'Z'),
-          )}`
+            new Date(Date.parse(oldest) - LOG_LOOKBACK_MS).toISOString().replace(/\.\d+Z$/, 'Z'),
+          )}${writeFailures.size > 0 ? '&tailLines=1000' : ''}`
         : 'tailLines=1000';
       const text = await this.api.call<string>(
         'GET',
         `${collection('v1', 'Pod', n.runtimeNamespace)}/${encodeURIComponent(pod.metadata.name)}/log?${query}`,
       );
-      let newest = cursor ?? '';
+      let newest = '';
       for (const [id, entries] of attributeEntries(text ?? '', n.namespace, deployments)) {
-        // A restarted controller resumes after the newest line it already published.
-        const floor = cursor ?? projectedLines(current.get(id)).at(-1)?.split(' ')[0] ?? '';
-        const fresh = entries.filter((entry) => entry.time > floor);
-        for (const entry of fresh) if (entry.time > newest) newest = entry.time;
+        // A pod first seen for this key (e.g. after a controller restart) resumes after the
+        // newest line already published for the key. The cursor is pinned there at once, so a
+        // failed write retries from it rather than from lines published since by another pod.
+        let floor = podCursors.get(id);
+        if (floor === undefined) {
+          floor = newestStamp(projectedRing(current.get(id)));
+          podCursors.set(id, floor);
+        }
+        const fresh = entries.filter((entry) => entry.time > (floor as string));
+        for (const entry of entries) if (entry.time > newest) newest = entry.time;
         incoming.set(id, [
           ...(incoming.get(id) ?? []),
           ...fresh.flatMap((entry) =>
@@ -2187,26 +2225,42 @@ export class Controller {
         ]);
         failures.set(id, [...(failures.get(id) ?? []), ...entries]);
       }
-      if (newest) cursors.set(cursorKey, newest);
+      // Every key of this pod has seen the pod's log up to its newest attributed line, so each
+      // may move there, once its own ConfigMap holds what it read.
+      if (newest)
+        for (const id of podCursors.keys())
+          advance.set(id, (advance.get(id) ?? new Map<string, string>()).set(cursorKey, newest));
     }
     /** Shared ConfigMaps (by key id) a per-env projection could not take over from yet. */
     const held = new Set<string>();
+    /** ConfigMaps written or deleted this pass; a failure of any other one is not current. */
+    const attempted = new Set<string>();
     const attempt = async (name: string, write: () => Promise<unknown>) => {
+      attempted.add(name);
       try {
         await write();
+        writeFailures.delete(name);
         return true;
       } catch (error) {
         const message = error instanceof Error ? error.message : 'write failed';
-        console.error(`Tenant/${tenant.metadata.name} logs ConfigMap ${name}: ${message}`);
+        const previous = writeFailures.get(name);
+        writeFailures.set(name, { count: (previous?.count ?? 0) + 1, message });
+        // Logged when it starts or changes; one that persists is on the Tenant (LogsProjected).
+        if (previous?.message !== message)
+          console.error(`Tenant/${tenant.metadata.name} logs ConfigMap ${name}: ${message}`);
         return false;
       }
     };
+    /** Keys whose ConfigMap could not be written; their cursors stay put for the next poll. */
+    const unwritten = new Set<string>();
     // Takeovers first, so a shared ConfigMap is pruned or deleted only once they are written.
     for (const id of new Set([...seeded, ...pruned, ...incoming.keys()])) {
       const key = keys.get(id) as LogKey;
       if (!validLabelValue(key.application)) continue;
-      const lines = incoming.get(id) ?? [];
       const published = current.get(id);
+      const ring = projectedRing(published);
+      // Lines of a write that applied although it reported a failure are not appended twice.
+      const lines = unpublished(ring, incoming.get(id) ?? []);
       const previous = projectedFailures(published);
       const merged = mergeFailures(previous, failures.get(id) ?? [], members.get(id) ?? []);
       const prune = pruned.has(id) && !held.has(id);
@@ -2217,25 +2271,33 @@ export class Controller {
         JSON.stringify(merged) === JSON.stringify(previous)
       )
         continue;
-      const ring = projectedRing(published).filter(
-        (entry) => !prune || !v1Deployments.has(entry.deployment),
-      );
       const configMap = logsConfigMap(
         tenant.metadata.name,
         n.namespace,
         this.cfg.installation,
         key.application,
-        appendRing(ring, lines),
+        appendRing(
+          ring.filter((entry) => !prune || !v1Deployments.has(entry.deployment)),
+          lines,
+        ),
         merged,
         key.env,
       );
       const written = await attempt(configMap.metadata.name, () => this.ensure(configMap));
-      if (!written && seeded.has(id)) held.add(key.application);
+      if (written) continue;
+      unwritten.add(id);
+      if (seeded.has(id)) held.add(key.application);
     }
+    for (const [id, moves] of advance)
+      if (!unwritten.has(id))
+        for (const [pod, newest] of moves)
+          if (newest > (cursors.get(pod)?.get(id) ?? '')) cursors.get(pod)?.set(id, newest);
     for (const [id, configMap] of existingByKey) {
       if (!keys.has(id) && !held.has(id))
         await attempt(configMap.metadata.name, () => this.remove(configMap));
     }
+    for (const name of writeFailures.keys()) if (!attempted.has(name)) writeFailures.delete(name);
+    if (writeFailures.size === 0) this.logWriteFailures.delete(tenant.metadata.name);
   }
 
   /**
@@ -2254,6 +2316,8 @@ export class Controller {
     for (const name of this.hostPulls.keys()) if (!listed.has(name)) this.hostPulls.delete(name);
     for (const name of this.logCursors.keys())
       if (!projected.has(name)) this.logCursors.delete(name);
+    for (const name of this.logWriteFailures.keys())
+      if (!projected.has(name)) this.logWriteFailures.delete(name);
   }
 
   async tick(): Promise<void> {

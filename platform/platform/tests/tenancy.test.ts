@@ -346,6 +346,36 @@ describe('tenant and user resource reconciliation', () => {
     expect(role('di-tenant-alpha')).toBeUndefined();
     expect(t.status?.conditions?.[0]?.status).toBe('True');
   });
+  it('reports a logs ConfigMap write that keeps failing on the Tenant, then clears it (#316)', async () => {
+    const { controller, t } = prepare();
+    const failures = (
+      controller as unknown as {
+        logWriteFailures: Map<string, Map<string, { count: number; message: string }>>;
+      }
+    ).logWriteFailures;
+    const logs = () => t.status?.conditions?.find((c) => c.type === 'LogsProjected');
+    // One failed poll is not reported yet.
+    failures.set('alpha', new Map([['di-logs-web.prod', { count: 1, message: 'quota' }]]));
+    await controller.reconcileTenant(t);
+    expect(logs()).toBeUndefined();
+    failures.set('alpha', new Map([['di-logs-web.prod', { count: 3, message: 'quota' }]]));
+    await controller.reconcileTenant(t);
+    // Ready is untouched: projection is best effort.
+    expect(t.status?.conditions?.[0]).toMatchObject({ type: 'Ready', status: 'True' });
+    expect(logs()).toMatchObject({
+      status: 'False',
+      reason: 'WriteFailed',
+      message: 'logs ConfigMap di-logs-web.prod failed on 3 polls in a row: quota',
+    });
+    const since = logs()?.lastTransitionTime;
+    failures.set('alpha', new Map([['di-logs-web.prod', { count: 4, message: 'quota' }]]));
+    await controller.reconcileTenant(t);
+    expect(logs()?.lastTransitionTime).toBe(since);
+    failures.delete('alpha');
+    await controller.reconcileTenant(t);
+    expect(logs()).toBeUndefined();
+    expect(t.status?.conditions?.[0]).toMatchObject({ type: 'Ready', status: 'True' });
+  });
   it('refuses to adopt a foreign namespace', async () => {
     const { api, controller, t } = prepare();
     api.seed({ apiVersion: 'v1', kind: 'Namespace', metadata: { name: names('alpha').namespace } });

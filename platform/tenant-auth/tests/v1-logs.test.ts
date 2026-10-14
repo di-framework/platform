@@ -20,7 +20,7 @@ import type { Resource, Tenant } from '../../platform/src/tenancy/resources.ts';
 import { Controller, configFromEnv } from '../src/controller.ts';
 import type { Principal } from '../src/identity.ts';
 import { KubeClient } from '../src/kube.ts';
-import { logEvents, timing } from '../src/v1/logs.ts';
+import { listEvents, logEvents, timing } from '../src/v1/logs.ts';
 import { type FakeServer, json, type Recorded, serve } from './support/servers.ts';
 
 const configMap = (application: string, lines: string[], failures?: unknown, rv = '1') => ({
@@ -353,6 +353,78 @@ describe('GET /v1/services/:service/logs', () => {
       listed = { metadata: { resourceVersion: '7' }, items: [{ ...shared, data }] };
       expect(await logsOf('env=prod')).toEqual(PROD);
       expect(await logsOf('env=staging&deployment=web-staging')).toEqual(STAGING);
+    });
+
+    /** The ConfigMap staging and prod shared before #106, as written before data.envs. */
+    const legacy = () => {
+      const shared = logsConfigMap('acme', 'di-tenant-acme', 'platform', 'web', ring, failures);
+      const { envs: _envs, ...data } = shared.data as Record<string, string>;
+      return { ...shared, data };
+    };
+
+    test('serves each line once while the shared ConfigMap is migrated (#316)', async () => {
+      // Staging was copied out; prod's copy was refused, so the shared ConfigMap stays.
+      listed = { metadata: { resourceVersion: '7' }, items: [legacy(), perEnv('staging')] };
+      expect(await logsOf('env=staging')).toEqual(STAGING);
+      expect(await logsOf('env=staging&deployment=web-staging')).toEqual(STAGING);
+      // Prod has no per-env ConfigMap yet and is still served from the shared one.
+      expect(await logsOf('env=prod')).toEqual(PROD);
+      // Both copied: every line comes from its per-env ConfigMap, once.
+      listed = {
+        metadata: { resourceVersion: '8' },
+        items: [legacy(), perEnv('prod'), perEnv('staging')],
+      };
+      expect(await logsOf('env=prod')).toEqual(PROD);
+      expect(await logsOf('env=staging')).toEqual(STAGING);
+    });
+
+    test('follow skips shared lines of a deployment once its per-env ConfigMap appears', async () => {
+      listed = { metadata: { resourceVersion: '7' }, items: [legacy(), perEnv('staging')] };
+      const opened = new Promise<void>((resolve) => {
+        onWatch = resolve;
+      });
+      const abort = new AbortController();
+      const response = await fetch(`${base}/web/logs?env=prod&follow=true&tail=100`, {
+        signal: abort.signal,
+      });
+      const reader = response.body?.getReader() as ReadableStreamDefaultReader<Uint8Array>;
+      const decoder = new TextDecoder();
+      let text = '';
+      const until = async (needle: string) => {
+        while (!text.includes(needle)) text += decoder.decode((await reader.read()).value);
+      };
+      await until('second crash');
+      await opened;
+      const watch = watches[0] as Watch;
+      // The prod copy is written: its lines were sent already and are not repeated.
+      watch.push({ type: 'ADDED', object: perEnv('prod') });
+      // A shared ConfigMap rewritten later still holds a prod line; it is not served.
+      const late = logsConfigMap('acme', 'di-tenant-acme', 'platform', 'web', [
+        ...ring,
+        { line: '2020-01-01T10:06:00Z INFO shared copy', deployment: 'web-prod', env: 'prod' },
+      ]);
+      watch.push({ type: 'MODIFIED', object: late });
+      watch.push({
+        type: 'MODIFIED',
+        object: logsConfigMap(
+          'acme',
+          'di-tenant-acme',
+          'platform',
+          'web',
+          [
+            ...ring.filter((entry) => entry.env === 'prod'),
+            { line: '2020-01-01T10:07:00Z INFO prod fresh', deployment: 'web-prod', env: 'prod' },
+          ],
+          {},
+          'prod',
+        ),
+      });
+      await until('prod fresh');
+      for (const message of [...PROD, 'prod fresh'])
+        expect(text.split(`"message":"${message}"`).length).toBe(2);
+      expect(text).not.toContain('shared copy');
+      abort.abort();
+      await watch.closed;
     });
 
     test.each(['web/logs?env=dev', 'web/logs'])('rejects %s', async (path) => {
@@ -778,4 +850,71 @@ test('a line the projection moves to a per-env ConfigMap is served once (#106)',
   // Both ConfigMaps match the endpoint's selector; the prod line is in one of them only.
   expect([...configMaps.keys()].sort()).toEqual(['di-logs-web', 'di-logs-web.prod']);
   expect(served()).toEqual(['prod up']);
+});
+
+test('a partial migration serves every line once, before and after the retry (#316)', async () => {
+  const namespace = 'di-tenant-alpha';
+  const configMaps = new Map<string, Resource>();
+  const shared = logsConfigMap('alpha', namespace, 'test', 'web', [
+    { line: '2026-10-01T10:00:01.000000Z INFO prod up', deployment: 'web-prod' },
+    { line: '2026-10-01T10:00:02.000000Z INFO staging up', deployment: 'web-staging' },
+    { line: '2026-10-01T10:00:03.000000Z INFO prod again', deployment: 'web-prod' },
+  ]);
+  // Written before data.envs existed.
+  const { envs: _envs, ...data } = shared.data as Record<string, string>;
+  configMaps.set('di-logs-web', { ...shared, data });
+  const v1 = (env: string) => ({
+    name: `web-${env}`,
+    labels: { 'di-framework.dev/application': 'web', 'platform.di-framework.dev/env': env },
+  });
+  const cms = collection('v1', 'ConfigMap', namespace);
+  /** The per-env prod ConfigMap is refused (e.g. at the ConfigMap quota) while this is set. */
+  let refuseProd = true;
+  const api = {
+    async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+      const url = new URL(path, 'https://kubernetes');
+      if (url.pathname.endsWith('/pods')) return { items: [] } as T;
+      if (url.pathname.endsWith('/workloaddeployments'))
+        return { items: [v1('prod'), v1('staging')].map((metadata) => ({ metadata })) } as T;
+      if (url.pathname === cms) return { items: [...configMaps.values()] } as T;
+      const name = decodeURIComponent(url.pathname.slice(cms.length + 1));
+      if (method === 'PATCH' && name === 'di-logs-web.prod' && refuseProd)
+        throw new ApiError(403, 'exceeded quota: count/configmaps');
+      if (method === 'PATCH') configMaps.set(name, structuredClone(body) as Resource);
+      else if (method === 'DELETE') configMaps.delete(name);
+      else if (!configMaps.has(name)) throw new ApiError(404, 'Not found');
+      return structuredClone(configMaps.get(name)) as T;
+    },
+  };
+  const project = () =>
+    new PlatformController(api, {
+      installation: 'test',
+      namespace: 'wasmcloud',
+      hostImage: 'wash:test',
+      schedulerNatsUrl: 'nats://nats:4222',
+    }).projectLogs({
+      apiVersion: 'platform.di-framework.dev/v1alpha1',
+      kind: 'Tenant',
+      metadata: { name: 'alpha', uid: 'alpha-uid', labels: {} },
+      spec: {},
+    } as Tenant);
+  const served = (env: string) =>
+    listEvents({ items: [...configMaps.values()] as never })
+      .filter((e) => e.env === undefined || e.env === env)
+      .map((e) => e.message);
+  const errors = spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    await project();
+  } finally {
+    errors.mockRestore();
+  }
+  // Staging was copied, prod refused: the shared ConfigMap stays, and holds both.
+  expect([...configMaps.keys()].sort()).toEqual(['di-logs-web', 'di-logs-web.staging']);
+  expect(served('staging')).toEqual(['staging up']);
+  expect(served('prod')).toEqual(['prod up', 'prod again']);
+  refuseProd = false;
+  await project();
+  expect([...configMaps.keys()].sort()).toEqual(['di-logs-web.prod', 'di-logs-web.staging']);
+  expect(served('staging')).toEqual(['staging up']);
+  expect(served('prod')).toEqual(['prod up', 'prod again']);
 });
