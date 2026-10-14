@@ -22,6 +22,8 @@ interface Job {
   outputs?: Record<string, string>;
   strategy?: { matrix?: Record<string, unknown> };
   steps?: {
+    name?: string;
+    if?: string;
     uses?: string;
     run?: string;
     env?: Record<string, string>;
@@ -678,6 +680,40 @@ test('every tenant host variant carries the NATS blobstore credentials patch, an
   const required = [...check.matchAll(new RegExp(`^\\s+${prefix}(\\w+)$`, 'gm'))].map((m) => m[1]);
   expect(added.length).toBeGreaterThan(0);
   expect(required.sort()).toEqual(added.sort());
+});
+
+test('CI runs every exclusive-instance topology test the 0001 patch adds, by name (#144)', () => {
+  const text = read('platform/tenant-host/0001-exclusive-instance.patch');
+  const file = 'crates/wash-runtime/tests/integration_exclusive_topology.rs';
+  const section = text.split(/^diff --git /m).find((s) => s.startsWith(`a/${file} b/${file}`));
+  expect(section).toBeDefined();
+  const added = [
+    ...(section ?? '').matchAll(/^\+#\[tokio::test[^\n]*\n\+(?:async )?fn (\w+)\(/gm),
+  ].map((m) => m[1] ?? '');
+  expect(added).toContain('an_http_trap_retires_the_exclusive_instance_before_the_next_call');
+
+  const workflow = parse('.github/workflows/tenant-host-patch-check.yml');
+  const steps = workflow.jobs.patch?.steps ?? [];
+  const fixtures = steps.find((s) => s.name === 'Build the wasm test fixtures');
+  const topology = steps.find((s) => s.name === 'Test the exclusive-instance topology');
+  const onlyWith0001 =
+    "contains(format(' {0} ', matrix.patches), ' 0001-exclusive-instance.patch ')";
+  expect(fixtures?.if).toBe(onlyWith0001);
+  expect(topology?.if).toBe(onlyWith0001);
+  expect(fixtures?.run).toContain('cargo xtask build-fixtures');
+  expect(fixtures?.run).toContain('CARGO_TARGET_WASM32_WASIP2_LINKER');
+  // The fixtures are built before the tests that `include_bytes!` them.
+  const index = (name: string) => steps.findIndex((s) => s.name === name);
+  expect(index('Build the wasm test fixtures')).toBeLessThan(
+    index('Test the exclusive-instance topology'),
+  );
+  const run = topology?.run ?? '';
+  expect(run).toContain('--test integration_exclusive_topology');
+  expect(run).toContain('::error::required topology test ${name} did not run and pass');
+  const block = run.match(/required=\(\n([\s\S]*?)\n\s*\)/)?.[1] ?? '';
+  const required = block.split('\n').map((line) => line.trim());
+  expect(added.length).toBeGreaterThan(0);
+  expect([...required].sort()).toEqual([...added].sort());
 });
 
 describe('the check-source resolver reads platform/tenant-host/variants', () => {

@@ -2768,10 +2768,10 @@ index eb825f8..e2f0754 100644
          // Strings flowing in from the proto wire are parsed into typed
 diff --git a/crates/wash-runtime/tests/integration_exclusive_topology.rs b/crates/wash-runtime/tests/integration_exclusive_topology.rs
 new file mode 100644
-index 0000000..8e24270
+index 0000000..48007f9
 --- /dev/null
 +++ b/crates/wash-runtime/tests/integration_exclusive_topology.rs
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,347 @@
 +//! Which workloads may contain an exclusive component.
 +//!
 +//! An exclusive component (`di-framework.dev/exclusive-instance: "true"` in its
@@ -2782,7 +2782,6 @@ index 0000000..8e24270
 +//! is refused at load time instead; the supported shape is to compose the
 +//! pieces with `wac plug` and mark the composed component exclusive.
 +
-+use std::collections::HashMap;
 +use std::time::Duration;
 +
 +use anyhow::{Context, Result};
@@ -2794,8 +2793,9 @@ index 0000000..8e24270
 +
 +mod common;
 +use common::{
-+    component_workload_request, http_counter_host_interfaces, http_only_host_interfaces,
-+    json_u64_field, start_host_with_dev_router, start_host_with_dynamic_router,
++    component_workload_request, default_counter_resources, http_counter_host_interfaces,
++    http_only_host_interfaces, json_u64_field, start_host_with_dev_router,
++    start_host_with_dynamic_router,
 +};
 +
 +const HTTP_COUNTER_WASM: &[u8] = include_bytes!("wasm/http_counter.wasm");
@@ -2805,20 +2805,13 @@ index 0000000..8e24270
 +const CALLEE_WASM: &[u8] = include_bytes!("wasm/inter_component_call_callee.wasm");
 +
 +fn resources(exclusive: bool) -> LocalResources {
-+    LocalResources {
-+        memory_limit_mb: 256,
-+        cpu_limit: 1,
-+        config: if exclusive {
-+            HashMap::from([(EXCLUSIVE_INSTANCE_KEY.to_string(), "true".to_string())])
-+        } else {
-+            HashMap::new()
-+        },
-+        environment: HashMap::new(),
-+        volume_mounts: vec![],
-+        allowed_hosts: vec!["example.com".parse().unwrap()].into(),
-+        allowed_ip_name_lookups: Default::default(),
-+        allowed_host_loopback_ports: Default::default(),
++    let mut resources = default_counter_resources();
++    if exclusive {
++        resources
++            .config
++            .insert(EXCLUSIVE_INSTANCE_KEY.to_string(), "true".to_string());
 +    }
++    resources
 +}
 +
 +fn component(name: &str, wasm: &'static [u8], exclusive: bool) -> Component {
@@ -3047,5 +3040,82 @@ index 0000000..8e24270
 +    .await?;
 +    let count = timeout(Duration::from_secs(60), first).await???;
 +    assert_eq!(count, 1, "served by the new revision's own instance");
++    Ok(())
++}
++
++/// A trap in an exclusive component's HTTP handler fails that call only. The
++/// calls queued behind it on the call permit are served by a fresh instance,
++/// never handed the faulted one. The trapping call is the first on its
++/// instance, so it pays the sleeper's per-instance setup before it traps, and
++/// the other calls are queued by then. A replacement instance starts its
++/// `served` count over, so the calls behind the trap count 1, 2, 3.
++///
++/// At the pinned wasmtime a guest trap ends the instance's whole event loop,
++/// so the HTTP task is dropped mid-call and its unsettled pool slot retires the
++/// instance; the handler's `trapped` flag covers a trap reported to the task
++/// instead. Either way this is the outcome the caller sees, so it holds across
++/// a wasmtime bump that changes which of the two a trap takes.
++#[tokio::test]
++async fn an_http_trap_retires_the_exclusive_instance_before_the_next_call() -> Result<()> {
++    let (addr, host) = start_host_with_dev_router("127.0.0.1:0").await?;
++
++    let mut request = component_workload_request(
++        "sleeper",
++        "exclusive-trap",
++        HTTP_SLEEPER_WASM,
++        resources(true),
++        http_only_host_interfaces("trap"),
++    );
++    // Keep the instance warm between calls, so only the trap can retire it.
++    request.workload.components[0].max_invocations = 0;
++    let status = host.workload_start(request).await?.workload_status;
++    anyhow::ensure!(
++        status.workload_state == wash_runtime::types::WorkloadState::Running,
++        "{status:?}"
++    );
++
++    let client = reqwest::Client::new();
++    let trapper = {
++        let client = client.clone();
++        tokio::spawn(async move {
++            timeout(
++                Duration::from_secs(60),
++                client
++                    .get(format!("http://{addr}/trap"))
++                    .header("HOST", "trap")
++                    .send(),
++            )
++            .await?
++            .map_err(anyhow::Error::from)
++        })
++    };
++    tokio::time::sleep(Duration::from_millis(30)).await;
++    let mut behind = Vec::new();
++    for _ in 0..3 {
++        let client = client.clone();
++        behind.push(tokio::spawn(async move {
++            timeout(Duration::from_secs(60), served(&client, addr, "trap")).await?
++        }));
++    }
++
++    let trapped = trapper.await??;
++    assert!(
++        trapped.status().is_server_error(),
++        "the trapping call fails: {}",
++        trapped.status()
++    );
++    let mut counts = Vec::new();
++    for call in behind {
++        counts.push(
++            call.await?
++                .context("a call queued behind the trap is served")?,
++        );
++    }
++    counts.sort_unstable();
++    assert_eq!(
++        counts,
++        vec![1, 2, 3],
++        "the calls behind the trap are served by one fresh instance"
++    );
 +    Ok(())
 +}
