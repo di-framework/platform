@@ -366,6 +366,11 @@ const TENANT_SECRET_NAME = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
 /**
  * Suffixes of the Secrets a WorkloadDeployment may reference by its own name (#203):
  * `<workload>-control` is CLI-owned, `<workload>-secrets` is app-owned.
+ *
+ * Invariant: the rule that admits these names is only safe while no platform-owned Secret in a
+ * tenant namespace ends in one of these suffixes (`di-binding-*` and `di-bs-*` Secrets are exempt
+ * because the rule denies them by prefix). Otherwise a workload named after the Secret's stem
+ * could reference it. The tests render every tenant Secret and check this.
  */
 export const WORKLOAD_SECRET_SUFFIXES = ['-control', '-secrets'] as const;
 
@@ -404,10 +409,12 @@ export function workloadEnvironmentReferencesAllowed(input: {
   if ((input.imagePullSecrets ?? []).some(isManagedSecretName)) return false;
   const label = input.labels?.[ENV_LABEL];
   const env = (DEPLOY_ENVS as readonly string[]).includes(label ?? '') ? label : undefined;
-  const ownSecrets = WORKLOAD_SECRET_SUFFIXES.map((suffix) => `${input.workloadName}${suffix}`);
+  const ownSecrets = new Set(
+    WORKLOAD_SECRET_SUFFIXES.map((suffix) => `${input.workloadName}${suffix}`),
+  );
   const secretAllowed = (name: string) => {
     if (isManagedSecretName(name)) return false;
-    if (ownSecrets.includes(name)) return true;
+    if (ownSecrets.has(name)) return true;
     if (env === undefined || !name.endsWith(`.${env}`)) return false;
     return TENANT_SECRET_NAME.test(name.slice(0, -(env.length + 1)));
   };
@@ -711,7 +718,7 @@ function workloadPolicy(namespace: string): AdmissionPolicy {
               (variables.env != '' && s.name.endsWith('.' + variables.env) &&
                 s.name.matches('^[a-z]([-a-z0-9]{0,61}[a-z0-9])?[.](${DEPLOY_ENVS.join('|')})$')))))))`,
         message:
-          'Tenant guests may reference only di-vars-<env> and <name>.<env> Secrets matching their platform.di-framework.dev/env label (never di-binding-*/di-bs-*)',
+          'Tenant guests may reference only di-vars-<env> and <name>.<env> Secrets matching their platform.di-framework.dev/env label (never di-binding-*/di-bs-*); a workload may also reference its own <workload>-control and <workload>-secrets Secrets',
       },
       {
         expression: `variables.controller || variables.pullSecrets.all(n,
