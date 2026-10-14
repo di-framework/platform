@@ -1,7 +1,12 @@
 version: 2
 updates:
   - package-ecosystem: "bun"
-    directory: "/"
+    # The backup-destination prototype pins @pulumi/* to match platform/platform
+    # (guarded by platform/backup-destination/tests/prototype.test.ts); one entry
+    # keeps grouped bumps for both directories in the same pull request.
+    directories:
+      - "/"
+      - "/platform/backup-destination/prototype"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -24,6 +29,12 @@ updates:
           - "*"
         update-types:
           - "major"
+    ignore:
+      # The prototype stays on typescript ~5.9 because Pulumi's ts-node needs
+      # TypeScript < 7. Dependabot ignores cannot be scoped per directory.
+      - dependency-name: "typescript"
+        update-types:
+          - "version-update:semver-major"
     commit-message:
       prefix: "deps"
       include: "scope"
