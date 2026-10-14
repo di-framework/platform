@@ -137,6 +137,9 @@ test('revocation posts the token with the client id and surfaces failures', asyn
     fetch,
   );
   expect(calls[1]?.url).toBe('https://issuer.test/revoke2');
+  await expect(
+    revokeToken({ ...metadata, revocation_endpoint: 'https://evil.test/revoke' }, 'c', 't', fetch),
+  ).rejects.toThrow('issuer origin');
   const down = (async () => {
     throw new TypeError('offline');
   }) as unknown as typeof globalThis.fetch;

@@ -165,8 +165,13 @@ export async function revokeToken(
   token: string,
   doFetch: Fetch = fetch,
 ): Promise<void> {
-  const endpoint = metadata.revocation_endpoint ?? `${metadata.issuer}/oauth2/revoke`;
-  const response = await doFetch(endpoint, {
+  const issuer = new URL(metadata.issuer);
+  const endpoint = new URL(metadata.revocation_endpoint ?? `${metadata.issuer}/oauth2/revoke`);
+  // Never send the token to a host other than the issuer, even if the discovery document says so.
+  if (endpoint.origin !== issuer.origin) {
+    throw new OidcError('revocation endpoint is not on the issuer origin');
+  }
+  const response = await doFetch(endpoint.href, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ token, client_id: clientId }),
