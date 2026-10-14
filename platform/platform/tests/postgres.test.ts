@@ -212,6 +212,62 @@ describe('dedicated PostgreSQL', () => {
       ).reason,
     ).toBe('InitializationFailed');
   });
+  test('surfaces a quota rejection of the PostgreSQL deployment, then recovers', async () => {
+    const t = setup();
+    const n = postgresNames(t.s);
+    const quota =
+      'pods "di-pg-orders-6f7c-abcde" is forbidden: exceeded quota: di-runtime-quota, ' +
+      'requested: limits.cpu=500m, used: limits.cpu=2, limited: limits.cpu=2';
+    const original = t.api.call.bind(t.api);
+    t.api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      const result = await original<T>(method, path, body);
+      if (method === 'PATCH' && path.includes('/deployments/')) {
+        (result as Resource).status = {
+          observedGeneration: 1,
+          replicas: 0,
+          readyReplicas: 0,
+          conditions: [
+            { type: 'ReplicaFailure', status: 'True', reason: 'FailedCreate', message: quota },
+          ],
+        };
+      }
+      return result;
+    };
+    await t.reconcile();
+    expect(condition(t.s)).toMatchObject({
+      status: 'False',
+      reason: 'FailedCreate',
+      message: `Backing service deployment ${n.instance} cannot create pods: ${quota}`,
+    });
+
+    // A suspended tenant still reports Suspended even if the old failure lingers.
+    await t.reconcile({ ...tenant, spec: { ...tenant.spec, suspended: true } });
+    expect(condition(t.s)?.reason).toBe('Suspended');
+
+    t.api.call = original;
+    await t.reconcile();
+    expect(condition(t.s)).toMatchObject({
+      status: 'True',
+      reason: 'Ready',
+      message: 'PostgreSQL application database authenticated and ready',
+    });
+  });
+  test('keeps storage and pod failures ahead of deployment failures', async () => {
+    const t = setup();
+    t.api.pending = true;
+    const original = t.api.call.bind(t.api);
+    t.api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      const result = await original<T>(method, path, body);
+      if (method === 'PATCH' && path.includes('/deployments/'))
+        (result as Resource).status = {
+          observedGeneration: 1,
+          conditions: [{ type: 'ReplicaFailure', status: 'True', reason: 'FailedCreate' }],
+        };
+      return result;
+    };
+    await t.reconcile();
+    expect(condition(t.s)?.reason).toBe('StoragePending');
+  });
   test('preserves the selected storage class, rejects shrinking and checks expansion support', async () => {
     const t = setup();
     const custom = { ...cls, spec: { ...cls.spec, storageClassName: 'fast' } };
