@@ -340,6 +340,9 @@ fn challenge() -> Response {
 
 /// `503` while the tenant controller cannot vouch for credentials. No
 /// `WWW-Authenticate`: the credential was not rejected.
+// This is the registry's only `503`, and it is always JSON. tenant-auth's
+// host-pull wait relies on that: a HEAD answer has no body to read the
+// `UNAVAILABLE` code from, so it waits on any `503` with a JSON content type.
 fn unavailable(retry_after: u32) -> Response {
     let retry_after = retry_after.to_string();
     respond(

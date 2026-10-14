@@ -26,6 +26,13 @@ describe('host pulls wait for the registry', () => {
   /** Requests per path, and how many more times each path answers "no workload for this Host". */
   const hits = new Map<string, number>();
   const notYet = new Map<string, number>();
+  /** A body that sends its first bytes and then never ends. */
+  const stalledBody = () =>
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"errors":'));
+      },
+    });
   /** How many more times each path answers the registry's own `503 UNAVAILABLE`. */
   const unavailable = new Map<string, number>();
   let hold = Promise.withResolvers<void>();
@@ -54,6 +61,12 @@ describe('host pulls wait for the registry', () => {
           { status: 503, headers: { 'retry-after': '5' } },
         );
       }
+      // A 503 JSON head whose body stops arriving.
+      if (pathname.endsWith('/stalled-503'))
+        return new Response(stalledBody(), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        });
       if (pathname.endsWith('/denied-503'))
         return Response.json({ errors: [{ code: 'DENIED', message: 'no' }] }, { status: 503 });
       if (pathname.endsWith('/toomanyrequests'))
@@ -142,6 +155,13 @@ describe('host pulls wait for the registry', () => {
         Response.json({ errors: [{ code: 'UNAVAILABLE' }], padding }, { status: 503 }),
       ),
     ).toBe(false);
+    // A HEAD answer has no body: any JSON 503 is the registry's UNAVAILABLE.
+    const head = (status: number, headers: Record<string, string>) =>
+      registryUnavailable(new Response(null, { status, headers }), { head: true });
+    expect(await head(503, { 'content-type': 'application/json' })).toBe(true);
+    expect(await head(503, {})).toBe(false);
+    expect(await head(503, { 'content-type': 'text/plain' })).toBe(false);
+    expect(await head(404, { 'content-type': 'application/json' })).toBe(false);
     // The response stays whole for the client.
     const answer = oci('UNAVAILABLE');
     expect(await registryUnavailable(answer)).toBe(true);
@@ -161,6 +181,56 @@ describe('host pulls wait for the registry', () => {
     const waiting = events.filter((e) => e.event === 'registry.waiting');
     expect(waiting).toHaveLength(1);
     expect(waiting[0]?.reason).toBe('the registry answered 503 UNAVAILABLE');
+  });
+
+  test('a body that stops arriving is not UNAVAILABLE once the read times out', async () => {
+    const stalled = new Response(stalledBody(), {
+      status: 503,
+      headers: { 'content-type': 'application/json' },
+    });
+    const started = Date.now();
+    expect(await registryUnavailable(stalled, { signal: AbortSignal.timeout(50) })).toBe(false);
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  test('a HEAD pull answered 503 UNAVAILABLE by the registry waits until it serves', async () => {
+    const controller = make();
+    controller.proxyUpstream = () => origin;
+    const path = '/v2/acme/app/blobs/sha256:whoami-down-head';
+    unavailable.set(path, 2);
+    events.length = 0;
+    const response = await controller.handleRegistryPull(pullRequest(path, { method: 'HEAD' }));
+    expect(response.status).toBe(200);
+    expect(hits.get(path)).toBe(3);
+    const waiting = events.filter((e) => e.event === 'registry.waiting');
+    expect(waiting).toHaveLength(1);
+    expect(waiting[0]?.reason).toBe('the registry answered 503 UNAVAILABLE');
+  });
+
+  test('a registry 503 whose body stalls is returned once the read times out', async () => {
+    const controller = make({ TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS: '200' });
+    controller.proxyUpstream = () => origin;
+    const path = '/v2/acme/app/stalled-503';
+    const started = Date.now();
+    const response = await controller.handleRegistryPull(pullRequest(path));
+    expect(response.status).toBe(503);
+    expect(Date.now() - started).toBeLessThan(1_500);
+    expect(hits.get(path)).toBe(1);
+    await response.body?.cancel();
+  });
+
+  test('a client that goes away while a 503 body is read gets the failure path', async () => {
+    const controller = make();
+    controller.proxyUpstream = () => origin;
+    const path = '/v2/acme/gone/stalled-503';
+    const client = new AbortController();
+    const pending = controller.handleRegistryPull(pullRequest(path, { signal: client.signal }));
+    await Bun.sleep(100);
+    client.abort();
+    const started = Date.now();
+    expect((await pending).status).toBe(502);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(hits.get(path)).toBe(1);
   });
 
   test('a registry 503 UNAVAILABLE past the wait is returned as is', async () => {

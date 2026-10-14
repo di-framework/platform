@@ -1287,14 +1287,15 @@ tenantAuth:
       failing the pull (which wash would only retry about a minute later): a refused connection or
       the host's empty `404` for a `Host` no workload serves yet is retried with a 250 ms to 2 s
       backoff, for at most `TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS` (default 30 s). The
-      registry's own `503` with OCI error code `UNAVAILABLE` (it cannot reach the controller's
-      whoami yet) is waited out the same way, and returned as is once the wait is over. Any other
-      answer from the registry itself, a `404 BLOB_UNKNOWN` or a `429` included, is returned at
-      once, and the public front never waits. The wait delays only that one pull, so nothing blocks the host that serves
-      the registry. A waiting pull gives its pool slot back between attempts, so pulls waiting out
-      a host restart do not turn the others away; one that finds no free slot before its wait is
-      over is answered `503`. Each attempt gets the full upstream header timeout, so the wait is
-      not cut short by it.
+      registry's own `503 UNAVAILABLE` (it cannot reach the controller's whoami yet) is waited
+      out the same way and returned as is once the wait is over: on a GET by its OCI error code,
+      and on a HEAD, which has no body, by its JSON `content-type` (the registry's only `503`).
+      Any other answer from the registry itself, a `404 BLOB_UNKNOWN` or a `429` included, is
+      returned at once, and the public front never waits. The wait delays only that one pull, so
+      nothing blocks the host that serves the registry. A waiting pull gives its pool slot back
+      between attempts, so pulls waiting out a host restart do not turn the others away; one that
+      finds no free slot before its wait is over is answered `503`. Each attempt gets the full
+      upstream header timeout, so the wait is not cut short by it.
     - Framing (#197): the front and the pull listener run on `node:http`, which writes the
       registry's `Content-Length` on a blob `GET` as is; `Bun.serve` re-framed every streamed body
       as chunked, and oras then stalled behind the unread body over `kubectl port-forward`. A `HEAD`
