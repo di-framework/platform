@@ -2,10 +2,13 @@
 /**
  * Skip-if-published check for the GHCR publish workflows (#172).
  *
- * The source hash covers exactly the files the workflow's own `on.push.paths`
- * filter matches (with GitHub's ordering and `!` exclusions), so the files that
- * trigger a publish and the files that decide whether one is needed are the same
- * set. It hashes `git ls-tree -r HEAD` lines (mode, blob id and path of each
+ * The source hash covers the files the workflow's own `on.push.paths` filter
+ * matches (with GitHub's ordering and `!` exclusions), minus the globs listed in
+ * the workflow's top-level `env.SOURCE_HASH_EXCLUDE` (one per line). Those are
+ * files that only test the artifact: a change to them still starts the run, so a
+ * fix to a failed gate publishes by itself, but it leaves the hash alone, so the
+ * run stops at this check when the source is already published (#349). The
+ * hashed files are therefore always a subset of the triggering ones. It hashes `git ls-tree -r HEAD` lines (mode, blob id and path of each
  * committed file), not the working tree, so it is deterministic for a commit. An optional
  * salt separates artifacts built from the same inputs (the tenant host variants).
  *
@@ -29,6 +32,33 @@ export function pushPaths(workflowYaml: string): string[] {
     throw new Error('workflow has no on.push.paths list');
   }
   return paths as string[];
+}
+
+/**
+ * The workflow's `env.SOURCE_HASH_EXCLUDE`: globs, one per line, that trigger a run but are
+ * not hashed. Empty when the workflow sets none.
+ */
+export function hashExclusions(workflowYaml: string): string[] {
+  const workflow = Bun.YAML.parse(workflowYaml) as { env?: Record<string, unknown> };
+  const value = workflow.env?.SOURCE_HASH_EXCLUDE;
+  if (value === undefined) return [];
+  if (typeof value !== 'string') throw new Error('env.SOURCE_HASH_EXCLUDE must be a string');
+  const globs = value
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (const glob of globs) {
+    if (glob.startsWith('!')) throw new Error(`SOURCE_HASH_EXCLUDE lists globs, not ${glob}`);
+  }
+  return globs;
+}
+
+/**
+ * The filter the source hash uses: `on.push.paths`, then each `SOURCE_HASH_EXCLUDE` glob as a
+ * final `!` pattern, so it can only remove files from the triggering set.
+ */
+export function hashPaths(workflowYaml: string): string[] {
+  return [...pushPaths(workflowYaml), ...hashExclusions(workflowYaml).map((glob) => `!${glob}`)];
 }
 
 /**
@@ -229,7 +259,7 @@ export function check(args: Args, filter: string[]): Result {
 
 if (import.meta.main) {
   const args = parseArgs(Bun.argv.slice(2));
-  const filter = pushPaths(readFileSync(args.workflow, 'utf8'));
+  const filter = hashPaths(readFileSync(args.workflow, 'utf8'));
   const result = check(args, filter);
   const outputs = [
     `hash=${result.hash}`,

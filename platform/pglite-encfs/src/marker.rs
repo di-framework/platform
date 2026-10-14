@@ -27,9 +27,17 @@ pub fn is_volume_metadata(name: &str) -> bool {
     name == LOST_AND_FOUND || is_marker_name(name)
 }
 
-/// The marker or its temporary file.
+/// The marker or its temporary file, exactly as encfs writes them.
 pub fn is_marker_name(name: &str) -> bool {
     name == MARKER_NAME || name == MARKER_TMP_NAME
+}
+
+/// A name pglite may not use: the marker or its temporary file in any ASCII
+/// case. On a case-insensitive volume (APFS by default) `.DI-ENCFS` names the
+/// marker; pglite never needs such a name, so refusing it everywhere costs
+/// nothing on a case-sensitive one.
+pub fn is_reserved_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(MARKER_NAME) || name.eq_ignore_ascii_case(MARKER_TMP_NAME)
 }
 
 /// The components of `path`, relative to a preopen root, with `.`, `..` and
@@ -53,7 +61,7 @@ fn normalize(path: &str) -> Vec<&str> {
 /// Whether `path`, relative to a preopen root, names a marker file once `.`,
 /// `..` and repeated slashes are resolved. pglite must never reach them.
 pub fn is_marker_path(path: &str) -> bool {
-    matches!(normalize(path).as_slice(), [name] if is_marker_name(name))
+    matches!(normalize(path).as_slice(), [name] if is_reserved_name(name))
 }
 
 /// Whether `path`, relative to a preopen root, names the root itself once
@@ -63,7 +71,8 @@ pub fn is_root_path(path: &str) -> bool {
     normalize(path).is_empty()
 }
 
-/// The directory part of `path` when its last component is a marker name:
+/// The directory part of `path` when its last component is a reserved name
+/// (see [`is_reserved_name`]):
 /// `a/link/.di-encfs` gives `a/link`, `.di-encfs` gives `""` (the descriptor
 /// itself). Trailing slashes are ignored. The directory part is returned as
 /// written, so the host resolves its `..` and symlinks exactly as it would
@@ -71,14 +80,14 @@ pub fn is_root_path(path: &str) -> bool {
 pub fn marker_parent(path: &str) -> Option<&str> {
     let path = path.trim_end_matches('/');
     let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
-    is_marker_name(name).then_some(parent)
+    is_reserved_name(name).then_some(parent)
 }
 
 /// Whether any component of `path` is a marker name. Used for symlink
 /// targets: the directory such a link would resolve in is only known when
 /// it is followed, so a link that names a marker is never created (#349).
 pub fn names_marker(path: &str) -> bool {
-    path.split('/').any(is_marker_name)
+    path.split('/').any(is_reserved_name)
 }
 
 /// What a guarded directory descriptor can tell about the directories its
@@ -417,6 +426,45 @@ mod tests {
         assert_eq!(marker_parent(""), None);
         assert!(names_marker("../.di-encfs") && names_marker("x/.di-encfs.tmp/y"));
         assert!(!names_marker("..") && !names_marker("data/.di-encfs2"));
+    }
+
+    #[test]
+    fn marker_names_are_reserved_in_any_case() {
+        for name in [
+            ".di-encfs",
+            ".DI-ENCFS",
+            ".Di-EncFs",
+            ".di-encfs.TMP",
+            ".DI-ENCFS.TMP",
+        ] {
+            assert!(is_reserved_name(name), "{name}");
+        }
+        for name in [".di-encfs2", "di-encfs", ".di-encfs.tmp2", ".dı-encfs"] {
+            assert!(!is_reserved_name(name), "{name}");
+        }
+        // Only the exact names are the marker files encfs writes and skips.
+        assert!(is_marker_name(".di-encfs") && !is_marker_name(".DI-ENCFS"));
+        assert!(is_marker_path(".DI-ENCFS") && is_marker_path("pglite/../.Di-Encfs.Tmp"));
+        assert_eq!(marker_parent("a/up/.DI-ENCFS"), Some("a/up"));
+        assert!(names_marker("../.DI-ENCFS"));
+        assert!(may_reach_marker(
+            &FROM_ROOT,
+            Some(&ROOT),
+            true,
+            "a/up/.DI-ENCFS"
+        ));
+        assert!(may_reach_marker(
+            &FROM_A,
+            Some(&ROOT),
+            false,
+            "c1/.di-ENCFS.tmp"
+        ));
+        assert!(!may_reach_marker(
+            &FROM_ROOT,
+            Some(&ROOT),
+            true,
+            "a/ok/.DI-ENCFS"
+        ));
     }
 
     #[test]

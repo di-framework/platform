@@ -972,10 +972,7 @@ impl xfs::GuestDirectoryEntryStream for DirectoryEntryStream {
     fn read_directory_entry(&self) -> R<Option<xfs::DirectoryEntry>> {
         loop {
             match self.host.read_directory_entry().map_err(host)? {
-                Some(entry)
-                    if self.hide_marker
-                        && (entry.name == MARKER_NAME || entry.name == MARKER_TMP_NAME) =>
-                {
+                Some(entry) if self.hide_marker && marker::is_reserved_name(&entry.name) => {
                     continue
                 }
                 entry => {

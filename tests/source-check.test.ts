@@ -6,6 +6,8 @@ import {
   classifyFetch,
   descriptorDigest,
   filterTree,
+  hashExclusions,
+  hashPaths,
   matchesPathFilter,
   parseArgs,
   pushPaths,
@@ -36,6 +38,42 @@ describe('pushPaths', () => {
   test('rejects a workflow without a paths filter', () => {
     expect(() => pushPaths('on:\n  workflow_dispatch:\n')).toThrow('no on.push.paths');
     expect(() => pushPaths('on:\n  push:\n    paths: []\n')).toThrow('no on.push.paths');
+  });
+});
+
+describe('hashPaths', () => {
+  const yaml = [
+    'on:',
+    '  push:',
+    '    paths:',
+    "      - 'a/**'",
+    "      - '!**/*.md'",
+    'env:',
+    '  SOURCE_HASH_EXCLUDE: |',
+    '    a/tests/**',
+    '',
+    '    a/smoke.ts',
+    '',
+  ].join('\n');
+
+  test('appends env.SOURCE_HASH_EXCLUDE as final exclusions', () => {
+    expect(hashExclusions(yaml)).toEqual(['a/tests/**', 'a/smoke.ts']);
+    expect(hashPaths(yaml)).toEqual(['a/**', '!**/*.md', '!a/tests/**', '!a/smoke.ts']);
+    expect(matchesPathFilter(pushPaths(yaml), 'a/tests/x.rs')).toBe(true);
+    expect(matchesPathFilter(hashPaths(yaml), 'a/tests/x.rs')).toBe(false);
+    expect(matchesPathFilter(hashPaths(yaml), 'a/src/x.rs')).toBe(true);
+  });
+
+  test('without exclusions the hash filter is the trigger filter', () => {
+    const plain = "on:\n  push:\n    paths:\n      - 'a/**'\n";
+    expect(hashExclusions(plain)).toEqual([]);
+    expect(hashPaths(plain)).toEqual(['a/**']);
+  });
+
+  test('rejects a negated or non-string exclusion', () => {
+    const base = "on:\n  push:\n    paths:\n      - 'a/**'\nenv:\n  SOURCE_HASH_EXCLUDE: ";
+    expect(() => hashExclusions(`${base}'!a/x'\n`)).toThrow('lists globs');
+    expect(() => hashExclusions(`${base}[a]\n`)).toThrow('must be a string');
   });
 });
 

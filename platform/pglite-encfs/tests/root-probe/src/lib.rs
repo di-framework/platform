@@ -22,6 +22,8 @@ use bindings::wasi::filesystem::types::{
 
 const MARKER: &str = ".di-encfs";
 const MARKER_TMP: &str = ".di-encfs.tmp";
+/// The marker in another case: the same file on a case-insensitive volume.
+const MARKER_UPPER: &str = ".DI-ENCFS";
 const LOOP: &str = "root-probe-loop";
 /// Below `pglite`: `up -> ..` (the root), `c1 -> c2 -> ..` (a chain to it)
 /// and `ok -> data` (an ordinary link).
@@ -29,6 +31,10 @@ const UP: &str = "root-probe-up";
 const CHAIN: &str = "root-probe-c1";
 const CHAIN_NEXT: &str = "root-probe-c2";
 const OK: &str = "root-probe-ok";
+/// At the root: `root-probe-pg -> pglite/data`, so `root-probe-pg/..` is
+/// `pglite` when `..` is resolved after the link, and the root itself if it
+/// were resolved by name.
+const PG: &str = "root-probe-pg";
 
 struct Probe;
 
@@ -66,15 +72,15 @@ fn run() -> Result<(), String> {
     // #349: symlinks partway through the path. Every link is removed again,
     // whatever the checks found.
     let links = [
-        ("..", UP),
-        (CHAIN_NEXT, CHAIN),
-        ("..", CHAIN_NEXT),
-        ("data", OK),
+        ("..", format!("pglite/{UP}")),
+        (CHAIN_NEXT, format!("pglite/{CHAIN}")),
+        ("..", format!("pglite/{CHAIN_NEXT}")),
+        ("data", format!("pglite/{OK}")),
+        ("pglite/data", PG.to_string()),
     ];
     let mut made = Vec::new();
     let mut result = Ok(());
-    for (target, name) in links {
-        let link = format!("pglite/{name}");
+    for (target, link) in links {
         match root.symlink_at(target, &link) {
             Ok(()) => made.push(link),
             Err(e) => {
@@ -114,6 +120,9 @@ fn mid_path(root: &Descriptor) -> Result<(), String> {
         format!("{up}/."),
         format!("{chain}/pglite/{UP}"),
         format!("pglite/data/../{UP}"),
+        // `..` directly after a link is resolved where the link leads.
+        format!("pglite/{OK}/../{UP}"),
+        format!("{PG}/../{UP}"),
     ] {
         check_unreachable(root, &prefix)?;
         // The directory itself is the root under another name.
@@ -151,6 +160,7 @@ fn mid_path(root: &Descriptor) -> Result<(), String> {
         (root, format!("{ok}/PG_VERSION")),
         (&pglite, format!("{OK}/PG_VERSION")),
         (root, format!("pglite/{CHAIN}/pglite/{OK}/PG_VERSION")),
+        (root, format!("{PG}/../data/PG_VERSION")),
     ] {
         let file = dir
             .open_at(
@@ -188,7 +198,7 @@ fn mid_path(root: &Descriptor) -> Result<(), String> {
 /// Every operation on `<prefix>/.di-encfs` (and the temporary name) from
 /// `dir` must fail with `access` and leave the marker as it was.
 fn check_unreachable(dir: &Descriptor, prefix: &str) -> Result<(), String> {
-    for name in [MARKER, MARKER_TMP] {
+    for name in [MARKER, MARKER_TMP, MARKER_UPPER] {
         let path = format!("{prefix}/{name}");
         let refused = |what: &str, result: Result<(), ErrorCode>| match result {
             Err(ErrorCode::Access) => Ok(()),
@@ -257,7 +267,10 @@ fn check_root(label: &str, dir: &Descriptor) -> Result<(), String> {
     if !names.iter().any(|n| n == "pglite") {
         return Err(format!("{label}: not the data directory root: {names:?}"));
     }
-    if names.iter().any(|n| n == MARKER || n == MARKER_TMP) {
+    if names
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(MARKER) || n.eq_ignore_ascii_case(MARKER_TMP))
+    {
         return Err(format!("{label}: the listing shows the marker"));
     }
     let refused = |what: &str, result: Result<(), ErrorCode>| match result {
@@ -267,6 +280,10 @@ fn check_root(label: &str, dir: &Descriptor) -> Result<(), String> {
         )),
     };
     refused("stat", dir.stat_at(PathFlags::empty(), MARKER).map(|_| ()))?;
+    refused(
+        "stat (other case)",
+        dir.stat_at(PathFlags::empty(), MARKER_UPPER).map(|_| ()),
+    )?;
     refused(
         "open",
         dir.open_at(

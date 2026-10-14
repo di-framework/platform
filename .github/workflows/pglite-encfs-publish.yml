@@ -10,8 +10,10 @@
 # "chore: pin pglite-encfs to <digest>" (scripts/pin-artifact.ts). Only pin holds
 # contents: write and pull-requests: write; only publish holds packages: write.
 #
-# Files that only test the component (the root probe crate, unit test fixtures, the smoke and
-# unit scripts) are not inputs: they cannot change dist/, and ci.yml runs them on every PR (#349).
+# Files that only test the component (env.SOURCE_HASH_EXCLUDE) still trigger the workflow but are
+# left out of the source hash (#349). A test-only change then stops at check-source, because
+# src-<hash> already exists; a test fix after a failed gate finds its source unpublished and builds
+# and publishes it, with no manual dispatch.
 name: Publish pglite-encfs component
 
 on:
@@ -20,12 +22,6 @@ on:
     branches: [main]
     paths:
       - 'platform/pglite-encfs/**'
-      - '!platform/pglite-encfs/tests/**'
-      - '!platform/pglite-encfs/src/testdata/**'
-      - '!platform/pglite-encfs/scripts/smoke.ts'
-      - '!platform/pglite-encfs/scripts/unit.ts'
-      - '!platform/pglite-encfs/scripts/lib/tear.ts'
-      - '!platform/pglite-encfs/scripts/**/*.test.ts'
       - 'platform/wasm-component-publisher/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -35,6 +31,16 @@ on:
 
 permissions:
   contents: read
+
+# Read by scripts/source-check.ts: trigger the run, but are not hashed.
+env:
+  SOURCE_HASH_EXCLUDE: |
+    platform/pglite-encfs/tests/**
+    platform/pglite-encfs/src/testdata/**
+    platform/pglite-encfs/scripts/smoke.ts
+    platform/pglite-encfs/scripts/unit.ts
+    platform/pglite-encfs/scripts/lib/tear.ts
+    platform/pglite-encfs/scripts/**/*.test.ts
 
 concurrency:
   group: publish-pglite-encfs
