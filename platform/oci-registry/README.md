@@ -10,17 +10,21 @@ The component retains its independent Cargo workspace and pinned toolchain.
 
 `PUSH=true cargo run --locked -p oci-registry-publisher` (or `make publish-local`
 here) also publishes: it writes the Wasm OCI config and manifest itself, pushes
-the layer, config and manifest with `oras`, pulls the component back with `wash`
-by the manifest digest, verifies the bytes, and writes `dist/publish-report.json`.
-This keeps the Wasm OCI format `wash oci push` produces; `oci-builder` builds
-container images, so this component flow needs `oras` and `wash` on PATH.
+the layer and config, then the manifest under `DI_OCI_TAG` only, with `oras`,
+pulls the component back with `wash` by the manifest digest and verifies the
+bytes. Only then does it point any extra (version) tag at that manifest with
+`oras tag`, and it writes `dist/publish-report.json`. This keeps the Wasm OCI
+format `wash oci push` produces (the config is byte-identical to wash 2.5.2's
+apart from `created`; see `platform/wasm-component-publisher/tests/fixtures`);
+`oci-builder` builds container images, so this component flow needs `oras` and
+`wash` on PATH.
 
 The config and manifest carry no wall-clock time: their `created` time is
 `SOURCE_DATE_EPOCH` when set, else `1970-01-01T00:00:00Z`, and their JSON has a
 fixed field order. Publishing the same `dist/` again, from any commit, gives the
 same manifest digest; a different component gives a different one. The publish
-workflows leave `SOURCE_DATE_EPOCH` unset, so the digest depends only on the
-component.
+workflows clear `SOURCE_DATE_EPOCH` on the publisher step, so the digest depends
+only on the component.
 
 Defaults are `DI_OCI_REGISTRY=127.0.0.1:25001`,
 `DI_OCI_REPOSITORY=di-framework/oci-registry`, and a content-derived tag.

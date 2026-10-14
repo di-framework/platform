@@ -565,12 +565,27 @@ pub fn run(package: &Path, spec: &ComponentSpec, push_enabled: bool) -> Result<(
     let repo_ref = format!("{registry}/{repository}");
     let destination = format!("{repo_ref}:{tag}");
     // One manifest, built here from the component alone, so every tag and
-    // every publish of the same bytes share one manifest digest.
+    // every publish of the same bytes share one manifest digest. It goes out
+    // under the commit tag only; the movable tags follow once it is verified.
     let manifest_digest = push_and_verify(
-        &repo_ref, &tags, &wasm_path, &wasm, &artifact, insecure, &tool_envs,
+        &repo_ref, &tag, &wasm_path, &wasm, &artifact, insecure, &tool_envs,
     )?;
-    for tag in &tags {
-        eprintln!("[{log}] Pushed tag: {repo_ref}:{tag} -> {manifest_digest}");
+    eprintln!("[{log}] Pushed tag: {destination} -> {manifest_digest}");
+    let extra_tags = &tags[1..];
+    if !extra_tags.is_empty() {
+        let args = tag_args(insecure, &repo_ref, &manifest_digest, extra_tags);
+        let output = run_tool("oras", &args, &tool_envs, Duration::from_secs(120))?;
+        check_tool_output(&output, "oras tag")?;
+        for extra in extra_tags {
+            let resolved = resolve_tag(&repo_ref, extra, insecure, &tool_envs)?;
+            if resolved != manifest_digest {
+                return Err(format!(
+                    "tag {extra} resolves to {resolved}, expected {manifest_digest}"
+                )
+                .into());
+            }
+            eprintln!("[{log}] Tagged {repo_ref}:{extra} -> {manifest_digest}");
+        }
     }
     let local = format!("{repo_ref}@{manifest_digest}");
     let cluster = format!("{cluster_registry}/{repository}@{manifest_digest}");
@@ -617,9 +632,9 @@ fn source_date_epoch() -> Result<Option<String>> {
 /// The `created` time written into the config and the manifest annotation:
 /// `SOURCE_DATE_EPOCH` when set (the reproducible-builds.org convention),
 /// else the Unix epoch. Never the wall clock, so the manifest digest is a
-/// function of the published bytes. The publish workflows leave
-/// `SOURCE_DATE_EPOCH` unset, so the same component gets the same digest
-/// whichever commit publishes it.
+/// function of the published bytes. The publish workflows clear
+/// `SOURCE_DATE_EPOCH` on the publisher step, so the same component gets the
+/// same digest whichever commit publishes it.
 fn created_time(source_date_epoch: Option<&str>) -> Result<String> {
     let Some(value) = source_date_epoch else {
         return Ok(rfc3339_utc(0));
@@ -686,18 +701,32 @@ struct WasmArtifact {
     manifest: Vec<u8>,
 }
 
+/// The `application/vnd.wasm.config.v0+json` config, byte for byte as
+/// `wash oci push` 2.5.2 writes it (see the `tests/fixtures/wash-2.5.2`
+/// parity test).
+fn wasm_config(
+    created: &str,
+    wasm_digest: &str,
+    imports: &[String],
+    exports: &[String],
+) -> Vec<u8> {
+    format!(
+        "{{\"created\":{},\"author\":null,\"architecture\":\"wasm\",\
+         \"os\":\"wasip2\",\"layerDigests\":[{}],\
+         \"component\":{{\"exports\":{},\"imports\":{},\"target\":null}}}}",
+        json_string(created),
+        json_string(wasm_digest),
+        json_strings(exports),
+        json_strings(imports),
+    )
+    .into_bytes()
+}
+
 impl WasmArtifact {
     fn new(wasm: &[u8], imports: &[String], exports: &[String], created: &str) -> Self {
+        let config = wasm_config(created, &digest(wasm), imports, exports);
         let wasm_digest = json_string(&digest(wasm));
         let created = json_string(created);
-        let config = format!(
-            "{{\"created\":{created},\"author\":null,\"architecture\":\"wasm\",\
-             \"os\":\"wasip2\",\"layerDigests\":[{wasm_digest}],\
-             \"component\":{{\"exports\":{},\"imports\":{},\"target\":null}}}}",
-            json_strings(exports),
-            json_strings(imports),
-        )
-        .into_bytes();
         let manifest = format!(
             "{{\"schemaVersion\":2,\"mediaType\":{},\
              \"config\":{{\"mediaType\":{},\"digest\":{},\"size\":{}}},\
@@ -762,26 +791,38 @@ fn blob_push_args(insecure: bool, repo_ref: &str, digest: &str, file: &Path) -> 
     args
 }
 
-/// `oras manifest push <repo>:<tag>[,<tag>...] <file>`: one manifest, every tag.
-fn manifest_push_args(insecure: bool, repo_ref: &str, tags: &[String], file: &Path) -> Vec<String> {
+/// `oras manifest push <repo>:<tag> <file>`: the manifest, under one tag.
+fn manifest_push_args(insecure: bool, repo_ref: &str, tag: &str, file: &Path) -> Vec<String> {
     let mut args = vec!["manifest".to_owned(), "push".to_owned()];
     if insecure {
         args.push("--plain-http".to_owned());
     }
     args.push("--media-type".to_owned());
     args.push(MANIFEST_MEDIA_TYPE.to_owned());
-    args.push(format!("{repo_ref}:{}", tags.join(",")));
+    args.push(format!("{repo_ref}:{tag}"));
     args.push(file.to_string_lossy().into_owned());
     args
 }
 
-/// Push the component layer, the config and the manifest with `oras`, check
-/// that every tag resolves to the manifest digest computed here, then pull
-/// the component back with `wash` by that digest (not by a movable tag) and
-/// compare the bytes.
+/// `oras tag <repo>@<digest> <tag>...`: point `tags` at an existing manifest.
+fn tag_args(insecure: bool, repo_ref: &str, digest: &str, tags: &[String]) -> Vec<String> {
+    let mut args = vec!["tag".to_owned()];
+    if insecure {
+        args.push("--plain-http".to_owned());
+    }
+    args.push(format!("{repo_ref}@{digest}"));
+    args.extend(tags.iter().cloned());
+    args
+}
+
+/// Push the component layer and the config, then the manifest under `tag`
+/// only, with `oras`. Check that `tag` resolves to the manifest digest
+/// computed here, then pull the component back with `wash` by that digest
+/// (not by a movable tag) and compare the bytes. Blobs go first, so the
+/// registry refuses a manifest whose layer or config is missing.
 fn push_and_verify(
     repo_ref: &str,
-    tags: &[String],
+    tag: &str,
     wasm_path: &Path,
     wasm: &[u8],
     artifact: &WasmArtifact,
@@ -804,16 +845,12 @@ fn push_and_verify(
         let output = run_tool("oras", &args, envs, Duration::from_secs(300))?;
         check_tool_output(&output, "oras blob push")?;
     }
-    let args = manifest_push_args(insecure, repo_ref, tags, &manifest_path);
+    let args = manifest_push_args(insecure, repo_ref, tag, &manifest_path);
     let output = run_tool("oras", &args, envs, Duration::from_secs(120))?;
     check_tool_output(&output, "oras manifest push")?;
-    for tag in tags {
-        let resolved = resolve_tag(repo_ref, tag, insecure, envs)?;
-        if resolved != manifest_digest {
-            return Err(
-                format!("tag {tag} resolves to {resolved}, expected {manifest_digest}").into(),
-            );
-        }
+    let resolved = resolve_tag(repo_ref, tag, insecure, envs)?;
+    if resolved != manifest_digest {
+        return Err(format!("tag {tag} resolves to {resolved}, expected {manifest_digest}").into());
     }
 
     let pulled = scratch.0.join("pulled.wasm");
@@ -1261,6 +1298,29 @@ mod tests {
         assert_ne!(other_time.manifest_digest(), first.manifest_digest());
     }
 
+    /// `sqlite-config.blob` is the config `wash oci push` 2.5.2 wrote for the
+    /// sqlite component (`platform/sqlite-component/dist`), fetched raw from
+    /// a local `registry:2` with `oras manifest fetch-config`; `sqlite.wit` is
+    /// that component's WIT. Given wash's `created` time, the config written
+    /// here is byte-identical. Re-capture both files when bumping `wash` or
+    /// the host's `oci-wasm` and update `wasm_config` if this test fails.
+    #[test]
+    fn config_matches_wash_2_5_2_apart_from_created() {
+        let wash = include_bytes!("../tests/fixtures/wash-2.5.2/sqlite-config.blob");
+        let wit = include_str!("../tests/fixtures/wash-2.5.2/sqlite.wit");
+        let parsed: Value = serde_json::from_slice(wash).unwrap();
+        let created = parsed["created"].as_str().unwrap();
+        let layer = parsed["layerDigests"][0].as_str().unwrap();
+        let (imports, exports) = world_items(wit).unwrap();
+        assert_eq!(imports.len(), 18);
+        assert_eq!(exports.len(), 2);
+        let ours = wasm_config(created, layer, &imports, &exports);
+        assert_eq!(
+            String::from_utf8(ours).unwrap(),
+            std::str::from_utf8(wash).unwrap()
+        );
+    }
+
     #[test]
     fn json_strings_are_escaped() {
         let artifact = WasmArtifact::new(b"w", &strings(&["a\"b\\c"]), &[], "t");
@@ -1270,9 +1330,17 @@ mod tests {
     }
 
     #[test]
-    fn oras_args_push_blobs_by_digest_and_one_manifest_for_every_tag() {
-        let tags = strings(&["commit1", "0.2.0"]);
+    fn oras_args_push_blobs_by_digest_the_manifest_under_one_tag_then_tag_it() {
+        let tags = strings(&["0.2.0", "stable"]);
         let file = Path::new("/tmp/m.json");
+        assert_eq!(
+            tag_args(false, "ghcr.io/o/r", "sha256:abc", &tags),
+            ["tag", "ghcr.io/o/r@sha256:abc", "0.2.0", "stable"]
+        );
+        assert_eq!(
+            tag_args(true, "localhost:5000/r", "sha256:abc", &tags[..1])[..2],
+            ["tag", "--plain-http"]
+        );
         assert_eq!(
             blob_push_args(false, "ghcr.io/o/r", "sha256:abc", file),
             ["blob", "push", "ghcr.io/o/r@sha256:abc", "/tmp/m.json"]
@@ -1282,18 +1350,18 @@ mod tests {
             ["blob", "push", "--plain-http"]
         );
         assert_eq!(
-            manifest_push_args(false, "ghcr.io/o/r", &tags, file),
+            manifest_push_args(false, "ghcr.io/o/r", "commit1", file),
             [
                 "manifest",
                 "push",
                 "--media-type",
                 "application/vnd.oci.image.manifest.v1+json",
-                "ghcr.io/o/r:commit1,0.2.0",
+                "ghcr.io/o/r:commit1",
                 "/tmp/m.json"
             ]
         );
         assert_eq!(
-            manifest_push_args(true, "localhost:5000/r", &tags[..1], file)[2..],
+            manifest_push_args(true, "localhost:5000/r", "commit1", file)[2..],
             [
                 "--plain-http",
                 "--media-type",

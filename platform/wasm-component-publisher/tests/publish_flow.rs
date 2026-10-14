@@ -1,7 +1,8 @@
 //! End-to-end publish flow against fake `wash` and `oras` executables: the
-//! publisher uploads the layer and config blobs, pushes one manifest for
-//! every tag, and that manifest (and so its digest) depends only on the
-//! component, not on when or under which tag it is published. Single test
+//! publisher uploads the layer and config blobs, pushes the manifest under
+//! the commit tag, verifies it with a `wash` pull by digest, and only then
+//! points the version tag at it. That manifest (and so its digest) depends
+//! only on the component, not on when or under which tag it is published. Single test
 //! function: it edits the process environment, so scenarios run sequentially.
 #![cfg(unix)]
 
@@ -83,13 +84,17 @@ fn publishes_one_deterministic_manifest_for_every_tag() {
 
     let log: PathBuf = root.join("calls.log");
     // wash only pulls; a push through wash would stamp the wall clock.
+    // FAKE_PULL=fail makes the pull fail, FAKE_PULL=corrupt returns other bytes.
     script(
         &bin,
         "wash",
         &format!(
             "echo \"wash $*\" >> '{log}'\n\
              case \"$2\" in\n\
-               pull) for last; do :; done; cp '{wasm}' \"$last\" ;;\n\
+               pull)\n\
+                 if [ \"$FAKE_PULL\" = fail ]; then echo 'manifest unknown'; exit 1; fi\n\
+                 for last; do :; done; cp '{wasm}' \"$last\"\n\
+                 if [ \"$FAKE_PULL\" = corrupt ]; then echo x >> \"$last\"; fi ;;\n\
                *) exit 3 ;;\n\
              esac",
             log = log.display(),
@@ -155,28 +160,27 @@ fn publishes_one_deterministic_manifest_for_every_tag() {
     run(&package, &spec(), true).expect("publish");
     let calls = fs::read_to_string(&log).unwrap();
     assert!(!calls.contains("wash oci push"), "{calls}");
-    assert_eq!(
-        calls
-            .matches("oras blob push --plain-http localhost:5000/o/r@sha256:")
-            .count(),
-        2,
-        "{calls}"
-    );
-    assert!(
-        calls.contains(&format!(
-            "{MANIFEST_PUSH} localhost:5000/o/r:commit1,0.2.0 "
-        )),
-        "{calls}"
-    );
-    assert!(calls.contains("oras resolve --plain-http localhost:5000/o/r:commit1"));
-    assert!(calls.contains("oras resolve --plain-http localhost:5000/o/r:0.2.0"));
     let (digest, manifest) = published(&root, &dist);
-    assert!(
-        calls.contains(&format!(
-            "wash oci pull --non-interactive --insecure localhost:5000/o/r@{digest} "
-        )),
-        "{calls}"
-    );
+    // Order: both blobs, then the manifest under the commit tag only, then
+    // the wash pull by digest, and only then the movable version tag.
+    let blob = "oras blob push --plain-http localhost:5000/o/r@sha256:";
+    let steps: Vec<&str> = calls.lines().collect();
+    let expected = [
+        blob,
+        blob,
+        &format!("{MANIFEST_PUSH} localhost:5000/o/r:commit1 "),
+        "oras resolve --plain-http localhost:5000/o/r:commit1",
+        &format!("wash oci pull --non-interactive --insecure localhost:5000/o/r@{digest} "),
+        &format!("oras tag --plain-http localhost:5000/o/r@{digest} 0.2.0"),
+        "oras resolve --plain-http localhost:5000/o/r:0.2.0",
+    ];
+    assert_eq!(steps.len(), expected.len(), "{calls}");
+    for (step, prefix) in steps.iter().zip(expected) {
+        assert!(
+            step.starts_with(prefix),
+            "{step:?} should start with {prefix:?}\n{calls}"
+        );
+    }
     let report: serde_json::Value =
         serde_json::from_slice(&fs::read(dist.join("report.json")).unwrap()).unwrap();
     assert_eq!(report["tags"].as_array().unwrap().len(), 2);
@@ -208,6 +212,10 @@ fn publishes_one_deterministic_manifest_for_every_tag() {
     unsafe { env::set_var("SOURCE_DATE_EPOCH", "yesterday") };
     let error = run(&package, &spec(), true).unwrap_err().to_string();
     assert!(error.starts_with("SOURCE_DATE_EPOCH must be"), "{error}");
+    // The publish workflows clear it (`SOURCE_DATE_EPOCH: ''`): empty is unset.
+    unsafe { env::set_var("SOURCE_DATE_EPOCH", "") };
+    run(&package, &spec(), true).expect("publish with a cleared epoch");
+    assert_eq!(published(&root, &dist), (digest.clone(), manifest.clone()));
     unsafe { env::remove_var("SOURCE_DATE_EPOCH") };
 
     // A different component gets a different digest.
@@ -216,6 +224,26 @@ fn publishes_one_deterministic_manifest_for_every_tag() {
     let (other, _) = published(&root, &dist);
     assert_ne!(other, digest);
     assert_ne!(other, dated);
+
+    // A pull that fails, or returns other bytes, stops the publish before
+    // the version tag moves.
+    for (mode, reason) in [
+        (
+            "fail",
+            "wash oci pull failed (exit status: 1): stdout: manifest unknown",
+        ),
+        ("corrupt", "pulled Wasm differs from the local build"),
+    ] {
+        unsafe { env::set_var("FAKE_PULL", mode) };
+        fs::write(&log, "").unwrap();
+        let error = run(&package, &spec(), true).unwrap_err().to_string();
+        assert_eq!(error, reason);
+        let calls = fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("wash oci pull"), "{calls}");
+        assert!(!calls.contains("oras tag"), "{calls}");
+        assert!(!calls.contains(":0.2.0"), "{calls}");
+    }
+    unsafe { env::remove_var("FAKE_PULL") };
 
     // A tag that resolves to another manifest must fail the publish.
     unsafe { env::set_var("FAKE_RESOLVE", "sha256:bbbb") };
@@ -230,7 +258,8 @@ fn publishes_one_deterministic_manifest_for_every_tag() {
     let error = run(&package, &spec(), true).unwrap_err().to_string();
     assert!(error.contains("resolves to"), "{error}");
 
-    // Single-tag components (oci-registry) push the manifest under one tag.
+    // Single-tag components (oci-registry) push the manifest under the
+    // commit tag and add no other tag.
     unsafe {
         env::remove_var("FAKE_RESOLVE");
         env::set_var("DI_OCI_TAG", "commit1");
@@ -247,6 +276,7 @@ fn publishes_one_deterministic_manifest_for_every_tag() {
         "{calls}"
     );
     assert_eq!(calls.matches("oras resolve").count(), 1, "{calls}");
+    assert!(!calls.contains("oras tag"), "{calls}");
 
     // A failed push reports what oras printed. oras never inherits the token
     // env; it sees the credential only as the base64 auth in DOCKER_CONFIG,

@@ -187,9 +187,10 @@ jobs:
         with:
           wash-version: v2.5.2
 
-      # The publisher pushes the component, its config and one manifest for
-      # every tag with oras; wash pulls it back by digest. Pinned by version
-      # and checksum.
+      # The publisher pushes the component, its config and the manifest under
+      # the commit tag with oras, pulls it back with wash by digest, then
+      # points the version tag at it with oras tag. Pinned by version and
+      # checksum.
       - name: Install oras
         run: |
           set -euo pipefail
@@ -221,9 +222,10 @@ jobs:
           fi
 
       # The publisher re-verifies SHA256SUMS, the exported database interface
-      # and that every import is wasi:*, then pushes one manifest under the
-      # commit and version tag and pulls it back by digest. The manifest holds
-      # no wall-clock time (SOURCE_DATE_EPOCH stays unset), so an unchanged
+      # and that every import is wasi:*, then pushes the manifest under the
+      # commit tag, pulls it back by digest to compare bytes, and only then
+      # points the version tag at that same manifest. The manifest holds no
+      # wall-clock time (SOURCE_DATE_EPOCH is cleared below), so an unchanged
       # component keeps its digest and the pin job finds nothing to pin.
       # Right before the tags move: a re-run of an older push whose inputs main has since
       # changed stops here (check-source is not re-run by "Re-run failed jobs").
@@ -238,6 +240,9 @@ jobs:
         if: steps.guard.outputs.stale != 'true'
         env:
           PUSH: 'true'
+          # Cleared so no exported value reaches the publisher: a per-commit created time
+          # would give an unchanged component a new digest on every publish.
+          SOURCE_DATE_EPOCH: ''
           DI_OCI_REGISTRY: ghcr.io
           DI_OCI_CLUSTER_REGISTRY: ghcr.io
           DI_OCI_REPOSITORY: di-framework/pglite-component

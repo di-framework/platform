@@ -138,6 +138,9 @@ jobs:
         if: steps.guard.outputs.stale != 'true'
         env:
           PUSH: 'true'
+          # Cleared so no exported value reaches the publisher: a per-commit created time
+          # would give an unchanged component a new digest on every publish.
+          SOURCE_DATE_EPOCH: ''
           DI_OCI_REGISTRY: ghcr.io
           DI_OCI_CLUSTER_REGISTRY: ghcr.io
           DI_OCI_REPOSITORY: di-framework/oci-registry
