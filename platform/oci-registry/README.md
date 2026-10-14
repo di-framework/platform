@@ -86,7 +86,7 @@ including the `GET /v2/` probe, the registry:
    `Authorization: Bearer <password>`. The call has a 2 s connect, 5 s
    first-byte and 5 s between-bytes timeout (`wasi:http` request options), and
    the guest also abandons it after 12 s by the monotonic clock in case the
-   host ignores those options. A timeout denies (`401`).
+   host ignores those options. A timeout answers `503` (see below).
 3. Requires a 2xx body shaped like the contract's `Principal` (`user`,
    `account`, `role`, `via`) whose `account` equals the bind-time `tenant`
    key. A principal from another tenant's controller is denied.
@@ -120,10 +120,23 @@ Worst cases before a revoked credential stops working at the registry:
 
 `POST /v1/auth/logout` on the controller does not clear the registry's cache.
 
-It **fails closed**: if `tenant-controller-url` or `tenant` is missing or
-malformed, the controller is unreachable or too slow, or it answers anything
-other than a 2xx `Principal` for this tenant with a `viewer` / `developer`
-role, the request gets the `401` challenge.
+It **fails closed**: only a 2xx `Principal` for this tenant with a `viewer` /
+`developer` role authorizes a request. The refusal tells the client why:
+
+| Controller outcome                                                          | Registry answer                                   |
+| --------------------------------------------------------------------------- | ------------------------------------------------- |
+| `5xx`, connection refused or failed, DNS or TLS failure, any timeout        | `503 UNAVAILABLE` with `Retry-After`              |
+| `401`, `403`, any other non-2xx, an unusable body, another tenant's account | `401 UNAUTHORIZED` with `WWW-Authenticate: Basic` |
+| `tenant-controller-url` or `tenant` missing or malformed                    | `401 UNAUTHORIZED` with `WWW-Authenticate: Basic` |
+
+The `503` covers a controller restart or an identity issuer outage (the
+controller answers its own `503` while OIDC discovery is pending), so
+`docker login` / `docker push` reports a temporary failure instead of bad
+credentials. It has no `WWW-Authenticate` header and an OCI error body,
+`{"errors":[{"code":"UNAVAILABLE","message":"..."}]}`. `Retry-After` is the
+controller's own delta-seconds value clamped to 1–60 s, or 5 s when the
+controller sent none (or an HTTP-date), timed out or could not be reached.
+A `503` is never cached, so the next request asks the controller again.
 
 ### Configuration
 
@@ -201,7 +214,7 @@ See "Runtime NATS storage caps" in `platform/platform/README.md`.
 ### Build and test
 
 ```shell
-make test     # cargo test: role -> ops, cache TTL/bound/hash keys, fail-closed (fake controller)
+make test     # cargo test: role -> ops, cache TTL/bound/hash keys, fail-closed, 503 vs 401 (fake controller)
 make lint     # cargo fmt --check + clippy -D warnings
 make build    # dist/di-framework-oci-registry.wasm (+ .wit, BUILD-INFO.txt, SHA256SUMS)
 bun test platform/oci-registry   # artifact + provenance checks
