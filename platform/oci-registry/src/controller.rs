@@ -94,14 +94,85 @@ pub(crate) fn verdict(outcome: Outcome, tenant: &str) -> Whoami {
         } if (500..600).contains(&status) => Whoami::Unavailable {
             retry_after: retry_after.as_deref().and_then(parse_retry_after),
         },
+        // A `429` deliberately gets the `401` challenge, not a retryable `503`:
+        // the controller does not rate-limit whoami, so a `429` here is not a
+        // condition the registry knows will clear. If whoami is ever
+        // rate-limited, revisit this (and its test) so clients back off
+        // instead of re-prompting for credentials.
+        Outcome::Answered { status: 429, .. } => Whoami::Denied,
         Outcome::Answered { .. } => Whoami::Denied,
     }
 }
 
-/// Every `send` error is treated as the controller being unavailable: none of
-/// them says anything about the credential, which was never checked.
-fn transport_failure(_error: &ErrorCode) -> Whoami {
-    Whoami::Unavailable { retry_after: None }
+/// How a `send` error is answered. Neither says anything about the
+/// credential, which was never checked. A transient failure (the controller
+/// restarting, a refused or reset connection, DNS, a timeout) is `503` so
+/// clients retry; a configuration-type failure (the host's outgoing-HTTP
+/// policy, a bad certificate, a request the host will never send) cannot clear
+/// on retry, so it gets the `401` challenge like a missing configuration does.
+/// The error code is logged, never its payload, the URL or the credential.
+fn transport_failure(error: &ErrorCode) -> Whoami {
+    let (code, transient) = classify(error);
+    let answer = if transient { 503 } else { 401 };
+    eprintln!("oci-registry: tenant controller whoami failed: {code}; answering {answer}");
+    if transient {
+        Whoami::Unavailable { retry_after: None }
+    } else {
+        Whoami::Denied
+    }
+}
+
+/// The WIT name of a `wasi:http` error code (without its payload), and whether
+/// the failure may clear on retry. Exhaustive, so a new code is a deliberate
+/// choice.
+fn classify(error: &ErrorCode) -> (&'static str, bool) {
+    match error {
+        // The controller or the network between is down, restarting or slow.
+        ErrorCode::DnsTimeout => ("DNS-timeout", true),
+        ErrorCode::DnsError(_) => ("DNS-error", true),
+        ErrorCode::DestinationNotFound => ("destination-not-found", true),
+        ErrorCode::DestinationUnavailable => ("destination-unavailable", true),
+        ErrorCode::DestinationIpUnroutable => ("destination-IP-unroutable", true),
+        ErrorCode::ConnectionRefused => ("connection-refused", true),
+        ErrorCode::ConnectionTerminated => ("connection-terminated", true),
+        ErrorCode::ConnectionTimeout => ("connection-timeout", true),
+        ErrorCode::ConnectionReadTimeout => ("connection-read-timeout", true),
+        ErrorCode::ConnectionWriteTimeout => ("connection-write-timeout", true),
+        ErrorCode::ConnectionLimitReached => ("connection-limit-reached", true),
+        ErrorCode::TlsProtocolError => ("TLS-protocol-error", true),
+        ErrorCode::TlsAlertReceived(_) => ("TLS-alert-received", true),
+        ErrorCode::HttpResponseIncomplete => ("HTTP-response-incomplete", true),
+        ErrorCode::HttpResponseHeaderSectionSize(_) => ("HTTP-response-header-section-size", true),
+        ErrorCode::HttpResponseHeaderSize(_) => ("HTTP-response-header-size", true),
+        ErrorCode::HttpResponseBodySize(_) => ("HTTP-response-body-size", true),
+        ErrorCode::HttpResponseTrailerSectionSize(_) => {
+            ("HTTP-response-trailer-section-size", true)
+        }
+        ErrorCode::HttpResponseTrailerSize(_) => ("HTTP-response-trailer-size", true),
+        ErrorCode::HttpResponseTransferCoding(_) => ("HTTP-response-transfer-coding", true),
+        ErrorCode::HttpResponseContentCoding(_) => ("HTTP-response-content-coding", true),
+        ErrorCode::HttpResponseTimeout => ("HTTP-response-timeout", true),
+        ErrorCode::HttpProtocolError => ("HTTP-protocol-error", true),
+        // A catch-all the host gives no detail for; assume it may clear.
+        ErrorCode::InternalError(_) => ("internal-error", true),
+        // Configuration: the host's policy, the controller's certificate, or
+        // a request the host will refuse every time.
+        ErrorCode::ConfigurationError => ("configuration-error", false),
+        ErrorCode::HttpRequestDenied => ("HTTP-request-denied", false),
+        ErrorCode::TlsCertificateError => ("TLS-certificate-error", false),
+        ErrorCode::DestinationIpProhibited => ("destination-IP-prohibited", false),
+        ErrorCode::LoopDetected => ("loop-detected", false),
+        ErrorCode::HttpUpgradeFailed => ("HTTP-upgrade-failed", false),
+        ErrorCode::HttpRequestLengthRequired => ("HTTP-request-length-required", false),
+        ErrorCode::HttpRequestBodySize(_) => ("HTTP-request-body-size", false),
+        ErrorCode::HttpRequestMethodInvalid => ("HTTP-request-method-invalid", false),
+        ErrorCode::HttpRequestUriInvalid => ("HTTP-request-URI-invalid", false),
+        ErrorCode::HttpRequestUriTooLong => ("HTTP-request-URI-too-long", false),
+        ErrorCode::HttpRequestHeaderSectionSize(_) => ("HTTP-request-header-section-size", false),
+        ErrorCode::HttpRequestHeaderSize(_) => ("HTTP-request-header-size", false),
+        ErrorCode::HttpRequestTrailerSectionSize(_) => ("HTTP-request-trailer-section-size", false),
+        ErrorCode::HttpRequestTrailerSize(_) => ("HTTP-request-trailer-size", false),
+    }
 }
 
 /// `Retry-After` as delta-seconds (RFC 9110). An HTTP-date or anything else
@@ -294,6 +365,7 @@ async fn config_string(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bindings::wasi::http::types::DnsErrorPayload;
 
     #[test]
     fn parses_controller_base_urls() {
@@ -437,6 +509,87 @@ mod tests {
     }
 
     #[test]
+    fn configuration_type_transport_errors_get_the_challenge() {
+        for error in [
+            ErrorCode::ConfigurationError,
+            ErrorCode::HttpRequestDenied,
+            ErrorCode::TlsCertificateError,
+            ErrorCode::DestinationIpProhibited,
+            ErrorCode::LoopDetected,
+            ErrorCode::HttpRequestUriInvalid,
+            ErrorCode::HttpRequestHeaderSize(None),
+        ] {
+            let label = format!("{error:?}");
+            assert_eq!(
+                verdict(Outcome::Failed(error), "acme"),
+                Whoami::Denied,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_transport_errors_stay_unavailable() {
+        for error in [
+            ErrorCode::DnsError(DnsErrorPayload {
+                rcode: Some("SERVFAIL".to_string()),
+                info_code: None,
+            }),
+            ErrorCode::TlsProtocolError,
+            ErrorCode::HttpResponseIncomplete,
+            ErrorCode::HttpResponseTimeout,
+            ErrorCode::ConnectionWriteTimeout,
+            ErrorCode::InternalError(Some("token=secret".to_string())),
+        ] {
+            let label = format!("{error:?}");
+            assert_eq!(
+                verdict(Outcome::Failed(error), "acme"),
+                Whoami::Unavailable { retry_after: None },
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_logged_code_is_the_wit_name_without_its_payload() {
+        assert_eq!(
+            classify(&ErrorCode::ConfigurationError),
+            ("configuration-error", false)
+        );
+        assert_eq!(
+            classify(&ErrorCode::HttpRequestDenied),
+            ("HTTP-request-denied", false)
+        );
+        assert_eq!(
+            classify(&ErrorCode::TlsCertificateError),
+            ("TLS-certificate-error", false)
+        );
+        assert_eq!(
+            classify(&ErrorCode::ConnectionRefused),
+            ("connection-refused", true)
+        );
+        // A payload never reaches the log line.
+        assert_eq!(
+            classify(&ErrorCode::InternalError(Some(
+                "Bearer dik_secret".to_string()
+            ))),
+            ("internal-error", true)
+        );
+    }
+
+    #[test]
+    fn a_controller_429_gets_the_challenge_not_a_retry() {
+        // Pinned: whoami is not rate-limited, so a 429 denies (see `verdict`).
+        for retry_after in [None, Some("30")] {
+            assert_eq!(
+                verdict(answered(429, retry_after, PRINCIPAL), "acme"),
+                Whoami::Denied,
+                "{retry_after:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_controller_401_or_403_denies() {
         for status in [401, 403] {
             for retry_after in [None, Some("30")] {
@@ -451,7 +604,7 @@ mod tests {
 
     #[test]
     fn other_statuses_and_unsendable_requests_deny() {
-        for status in [100, 301, 400, 404, 429, 600] {
+        for status in [100, 301, 400, 404, 600] {
             assert_eq!(
                 verdict(answered(status, Some("5"), PRINCIPAL), "acme"),
                 Whoami::Denied,

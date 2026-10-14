@@ -1286,9 +1286,11 @@ tenantAuth:
       on the same host is still starting. The pull listener waits for the registry instead of
       failing the pull (which wash would only retry about a minute later): a refused connection or
       the host's empty `404` for a `Host` no workload serves yet is retried with a 250 ms to 2 s
-      backoff, for at most `TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS` (default 30 s). Any answer
-      from the registry itself, a `404 BLOB_UNKNOWN` included, is returned at once, and the public
-      front never waits. The wait delays only that one pull, so nothing blocks the host that serves
+      backoff, for at most `TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS` (default 30 s). The
+      registry's own `503` with OCI error code `UNAVAILABLE` (it cannot reach the controller's
+      whoami yet) is waited out the same way, and returned as is once the wait is over. Any other
+      answer from the registry itself, a `404 BLOB_UNKNOWN` or a `429` included, is returned at
+      once, and the public front never waits. The wait delays only that one pull, so nothing blocks the host that serves
       the registry. A waiting pull gives its pool slot back between attempts, so pulls waiting out
       a host restart do not turn the others away; one that finds no free slot before its wait is
       over is answered `503`. Each attempt gets the full upstream header timeout, so the wait is

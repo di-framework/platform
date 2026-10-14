@@ -194,6 +194,76 @@ export function registryNotServing(response: Response): boolean {
   return [404, 502, 503].includes(response.status) && !response.headers.has('content-type');
 }
 
+/** Largest registry error body read for its OCI code; the registry's own is about 120 bytes. */
+const REGISTRY_ERROR_BODY_MAX_BYTES = 16 * 1024;
+
+/**
+ * Whether a registry answer is its own `503` with OCI error code `UNAVAILABLE`: the registry sends
+ * it while the tenant controller's whoami cannot be reached (a controller restart, an identity
+ * issuer outage), so a host pull may wait it out like a registry that is still starting. Only a
+ * JSON body of at most {@link REGISTRY_ERROR_BODY_MAX_BYTES} is read, from a clone, so the response
+ * stays whole; a body that is cut off, unreadable or not JSON is not `UNAVAILABLE`.
+ */
+export async function registryUnavailable(
+  response: Response,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (response.status !== 503 || !response.body) return false;
+  const type = response.headers.get('content-type') ?? '';
+  if (!/^application\/(?:[\w.+-]+\+)?json(?:\s*;|$)/i.test(type.trim())) return false;
+  const text = await readCapped(response.clone(), REGISTRY_ERROR_BODY_MAX_BYTES, signal);
+  if (text === undefined) return false;
+  try {
+    const body = JSON.parse(text) as { errors?: unknown };
+    return (
+      Array.isArray(body.errors) &&
+      body.errors.some(
+        (error) =>
+          typeof error === 'object' &&
+          error !== null &&
+          (error as { code?: unknown }).code === 'UNAVAILABLE',
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** A response body as text, or undefined when it exceeds `max`, fails, or `signal` aborts. */
+async function readCapped(
+  response: Response,
+  max: number,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  const reader = response.body?.getReader();
+  if (!reader) return '';
+  const stop = () => {
+    reader.cancel().catch(() => {});
+  };
+  signal?.addEventListener('abort', stop, { once: true });
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      if (signal?.aborted) return undefined;
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > max) {
+        stop();
+        return undefined;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return undefined;
+  } finally {
+    signal?.removeEventListener('abort', stop);
+  }
+  if (signal?.aborted) return undefined;
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
 /** A slot of a registry request pool; both calls are idempotent. */
 interface PoolSlot {
   /** Takes the slot; false when the pool is full. */
@@ -1158,9 +1228,11 @@ export class Controller {
    * Sends a host pull until the registry workload answers it (#197), for at most
    * `registryPullWaitMs`. After a host (re)start its workloads pull while `di-tenant-registry` on
    * the same host is still starting: the host then refuses the connection, or answers the empty
-   * 404 wash gives a `Host` no workload serves yet. Both are retried with a short backoff; any
-   * answer from the registry itself (its errors are OCI JSON) is final. The wait is bounded and
-   * only delays this one pull, so a host that serves the registry is never held back by it.
+   * 404 wash gives a `Host` no workload serves yet. Both are retried with a short backoff, as is
+   * the registry's own `503 UNAVAILABLE` (it cannot reach this controller's whoami yet, see
+   * {@link registryUnavailable}); any other answer from the registry itself (its errors are OCI
+   * JSON) is final. The wait is bounded and only delays this one pull, so a host that serves the
+   * registry is never held back by it.
    *
    * The pool slot is given back between attempts, so pulls waiting out a host restart do not
    * turn away the other pulls; an attempt takes a slot again first, and a pull that finds none
@@ -1176,17 +1248,24 @@ export class Controller {
     let delay = REGISTRY_PULL_RETRY_INITIAL_MS;
     for (let tries = 0; ; tries++) {
       const outcome = await attemptPull(send, signal);
-      if (outcome.response && !registryNotServing(outcome.response)) return outcome.response;
+      const { response } = outcome;
+      let reason = response
+        ? `the host answered ${response.status} before the registry was serving`
+        : String(outcome.failure);
+      if (response && !registryNotServing(response)) {
+        const bodyRead = AbortSignal.any([
+          signal,
+          AbortSignal.timeout(this.config.registryUpstreamTimeoutMs),
+        ]);
+        const unavailable = await registryUnavailable(response, bodyRead);
+        signal.throwIfAborted();
+        if (!unavailable) return response;
+        reason = 'the registry answered 503 UNAVAILABLE';
+      }
       if (Date.now() + delay > deadline) return settle(outcome);
-      await outcome.response?.body?.cancel().catch(() => {});
+      await response?.body?.cancel().catch(() => {});
       if (tries === 0)
-        this.audit('registry.waiting', {
-          path: url.pathname,
-          listener: 'registry-pull',
-          reason: outcome.response
-            ? `the host answered ${outcome.response.status} before the registry was serving`
-            : String(outcome.failure),
-        });
+        this.audit('registry.waiting', { path: url.pathname, listener: 'registry-pull', reason });
       slot.release();
       const next = await pauseForSlot(delay, deadline, signal, slot);
       if (next === undefined) return undefined;
