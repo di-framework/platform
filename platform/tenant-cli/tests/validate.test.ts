@@ -130,15 +130,23 @@ test('a secret list refuses an entry that carries a value; a var list accepts it
   expect(() => ConfigList.parse({ env: 'prod', items: [{ ...entry, value: 'x' }] })).not.toThrow();
 });
 
-test('the secrets and vars contracts each declare only their own list schema', async () => {
+test('the secrets and vars contracts each declare only their own schemas', async () => {
   expect(Object.keys(secrets.schemas).sort()).toEqual(['ConfigValue', 'Empty', 'SecretList']);
-  expect(Object.keys(vars.schemas).sort()).toEqual(['ConfigList', 'ConfigValue', 'Empty']);
+  // Only a var unset answers warnings (platform#100); a referenced secret unset is a 409.
+  expect(Object.keys(vars.schemas).sort()).toEqual([
+    'ConfigList',
+    'ConfigValue',
+    'Empty',
+    'VarUnset',
+  ]);
   const secretsModule = await import('../src/api/generated/secrets/v1/contracts.ts');
   const varsModule = await import('../src/api/generated/vars/v1/contracts.ts');
   expect('validateSecretList' in secretsModule).toBe(true);
   expect('validateConfigList' in secretsModule).toBe(false);
   expect('validateConfigList' in varsModule).toBe(true);
   expect('validateSecretList' in varsModule).toBe(false);
+  expect('validateVarUnset' in varsModule).toBe(true);
+  expect('validateVarUnset' in secretsModule).toBe(false);
 });
 
 test('query parameters are coerced to their declared type', () => {

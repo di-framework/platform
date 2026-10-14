@@ -324,6 +324,34 @@ var named like an existing secret's environment variable, or a secret whose envi
 is an existing var. The deploy lane (platform#55) must still reject a bundle that meets such a
 pair (for example one created out of band) with 422; it never picks a precedence.
 
+**Unset and deployed workloads (platform#100).** Deleting a Secret a running workload injects
+stops its replicas from being placed (`Config=False … Secret "<name>.<env>" not found`); removing
+a var only drops that key from the workload's environment, since the vars ConfigMap stays. So
+before an unset, the endpoints list the tenant's WorkloadDeployments as the caller and look at
+every guest's `localResources.environment` (`components[*]` and `service`):
+
+- `DELETE /v1/secrets/<name>?env=<env>` is **refused** with 409 when any of them lists
+  `<name>.<env>` in `secretFrom`. The problem+json `detail` names them, sorted (`secret
+  verify-token is referenced by deployed workloads in staging: greeter-staging; …`), and nothing
+  is deleted. It succeeds (204) once nothing references it: destroy the workload, or redeploy it
+  without the secret in `secrets`.
+- `DELETE /v1/vars/<NAME>?env=<env>` **succeeds with a warning**. It answers 200 with a `VarUnset`
+  body, `{ "warnings": [...] }`: when any workload lists `di-vars-<env>` in `configFrom`, one
+  `{ "code": "referenced", "detail": "...", "deployments": [...] }` entry names them, sorted;
+  otherwise `warnings` is empty. Workloads inject the whole ConfigMap, not single keys, so every
+  var of that env counts as referenced while such a workload exists. `di-tenant vars unset`
+  prints each warning to stderr as `warning: <detail>`.
+
+A name that does not exist is still a 404 first, and set and update are never affected. The
+check reads the live objects, so a workload applied out of band counts too; a failed read is a
+502 (a denied one a 403) that leaves the secret or vars unchanged. The check is best-effort, not
+transactional: Kubernetes has no transaction across the Secret and the WorkloadDeployments. A
+deploy that already read the secret before the unset listed workloads, and applies its
+WorkloadDeployment after that list but before the delete, still lands and then fails with
+`Config=False`. A deploy that reads after the delete is refused by its own existence check (422).
+Whether an emptied vars ConfigMap is deleted is a separate
+decision (platform#98); today it is kept with no keys.
+
 **HTTP host and labels (platform#101, #103).** A service's HTTP host is `<service>-<env>`
 (for example `greeter-staging`, `greeter-prod`), the WorkloadDeployment's own name, in every env.
 The deploy lane sets `config.host: <service>-<env>` on the `wasi:http` host interface (keeping
