@@ -1,4 +1,8 @@
 import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
+import {
+  EGRESS_ENTRY_MAX_LENGTH as DESTINATION_MAX_LENGTH,
+  EGRESS_MAX_DESTINATIONS as MAX_DESTINATIONS,
+} from '../../../platform/src/tenancy/egress.ts';
 import type { V1Module } from './context.ts';
 import { proxySessions, SERVICE_NAME } from './proxy.ts';
 
@@ -16,9 +20,6 @@ const GROUP_VERSION = 'platform.di-framework.dev/v1alpha1';
 /** Records the `/v1` environment the service was created for. */
 export const ENV_ANNOTATION = 'platform.di-framework.dev/env';
 const QUANTITY = /^[0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|Ti)?$/;
-/** The BackingService CRD limits on `destinations`: entry length and count. */
-const DESTINATION_MAX_LENGTH = 259;
-const MAX_DESTINATIONS = 32;
 /** `host`, `*.suffix`, optionally with `:port` (no leading zeros); the BackingService egress schema. */
 const DESTINATION =
   /^(?:\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::([1-9][0-9]{0,4}))?$/;

@@ -1,6 +1,7 @@
 import {
   EGRESS_DESTINATION_PATTERN,
   EGRESS_ENTRY_MAX_LENGTH,
+  EGRESS_MAX_DESTINATIONS,
   EGRESS_POLICY_PATTERN,
   validEgressDestination,
   validEgressPolicyEntry,
@@ -336,7 +337,7 @@ const serviceSpec = {
     className: { ...nameSchema },
     parameters: sizingObject,
     deletionPolicy: { type: 'string', enum: [...DELETION_POLICIES], default: 'Retain' },
-    destinations: egressEntries(EGRESS_DESTINATION_PATTERN, 32),
+    destinations: egressEntries(EGRESS_DESTINATION_PATTERN, EGRESS_MAX_DESTINATIONS),
   },
 };
 
