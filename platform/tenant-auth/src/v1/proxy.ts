@@ -47,7 +47,15 @@ export class ProxySessions {
   constructor(
     private readonly maxPerUser = MAX_SESSIONS_PER_USER,
     private readonly maxTotal = MAX_SESSIONS,
-  ) {}
+  ) {
+    // A cap below one could never be met: issuing would evict forever or refuse everything.
+    for (const [name, cap] of [
+      ['maxPerUser', maxPerUser],
+      ['maxTotal', maxTotal],
+    ] as const)
+      if (!Number.isInteger(cap) || cap < 1)
+        throw new RangeError(`${name} must be a positive integer, got ${cap}`);
+  }
 
   get size(): number {
     return this.sessions.size;
@@ -136,14 +144,22 @@ const STRIPPED_REQUEST = new Set([
   'x-di-control-token',
 ]);
 const STRIPPED_REQUEST_PREFIX = 'impersonate-';
-/** A service may not set cookies on the controller's origin. */
+/**
+ * Service headers never relayed: a service may not set cookies or origin-wide policy (CORS,
+ * HSTS, site-data clearing, refresh redirects) on the controller's origin, and the hop-by-hop
+ * framing is the controller's own. `access-control-*` is dropped by prefix.
+ */
 const STRIPPED_RESPONSE = new Set([
   'set-cookie',
+  'clear-site-data',
+  'strict-transport-security',
+  'refresh',
   'connection',
   'keep-alive',
   'content-length',
   'transfer-encoding',
 ]);
+const STRIPPED_RESPONSE_PREFIX = 'access-control-';
 
 /**
  * The headers sent to the service. Like the tenant gateway, the forwarding headers are always
@@ -177,7 +193,8 @@ export function upstreamRequestHeaders(
 function responseHeaders(upstream: Response, prefix: string): Headers {
   const out = new Headers();
   upstream.headers.forEach((value, name) => {
-    if (!STRIPPED_RESPONSE.has(name)) out.append(name, value);
+    if (!STRIPPED_RESPONSE.has(name) && !name.startsWith(STRIPPED_RESPONSE_PREFIX))
+      out.append(name, value);
   });
   // A relative redirect stays under the session URL rather than escaping to the controller root.
   const location = out.get('location');
@@ -284,6 +301,7 @@ export async function servePassthrough(
       ? problem(504, 'Gateway Timeout', 'the service did not answer in time')
       : problem(502, 'Bad Gateway', 'the service could not be reached');
   }
+  disarm();
   options.audit('proxy.forwarded', {
     user: principal.user,
     service,
@@ -293,18 +311,36 @@ export async function servePassthrough(
     status: upstream.status,
   });
   const out = responseHeaders(upstream, `/v1/services/${service}/proxy/${id}`);
-  arm();
-  const stream = upstream.body
-    ? upstream.body.pipeThrough(
-        new TransformStream<Uint8Array, Uint8Array>({
-          transform(chunk, controller) {
-            arm();
-            controller.enqueue(chunk);
-          },
-          flush: disarm,
-        }),
-      )
-    : null;
-  if (!stream) disarm();
+  if (!upstream.body) return new Response(null, { status: upstream.status, headers: out });
+  // The idle timer runs only while waiting on the service, so a slow reader is not a stall. A
+  // stall or failure after the headers can no longer change the status, so it is audited here.
+  const reader = upstream.body.getReader();
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      arm();
+      let chunk: Awaited<ReturnType<typeof reader.read>>;
+      try {
+        chunk = await reader.read();
+      } catch (error) {
+        disarm();
+        options.audit('request.failed', {
+          user: principal.user,
+          service,
+          path: url.pathname,
+          status: upstream.status,
+          reason: idle.signal.aborted ? 'the service stalled after its headers' : String(error),
+        });
+        controller.error(error);
+        return;
+      }
+      disarm();
+      if (chunk.done) controller.close();
+      else controller.enqueue(chunk.value);
+    },
+    cancel(reason) {
+      disarm();
+      return reader.cancel(reason);
+    },
+  });
   return new Response(stream, { status: upstream.status, headers: out });
 }

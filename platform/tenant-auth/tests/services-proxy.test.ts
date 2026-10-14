@@ -5,6 +5,10 @@ import {
   backingServiceCrds,
   DEFAULT_CLASS_NAMES,
 } from '../../platform/src/tenancy/backing-services.ts';
+import {
+  EGRESS_ENTRY_MAX_LENGTH,
+  EGRESS_MAX_DESTINATIONS,
+} from '../../platform/src/tenancy/egress.ts';
 import { Controller, configFromEnv } from '../src/controller.ts';
 import { AuthError, type Principal } from '../src/identity.ts';
 import { KubeClient } from '../src/kube.ts';
@@ -66,6 +70,28 @@ describe('services create and the service proxy', () => {
     if (request.pathname === '/away')
       return new Response(null, { status: 302, headers: { location: 'https://elsewhere.test/x' } });
     if (request.pathname === '/empty') return new Response(null, { status: 204 });
+    if (request.pathname === '/policy')
+      return new Response('policy', {
+        headers: {
+          'access-control-allow-origin': '*',
+          'access-control-allow-credentials': 'true',
+          'Access-Control-Expose-Headers': 'x-service',
+          'clear-site-data': '"*"',
+          'strict-transport-security': 'max-age=63072000; includeSubDomains; preload',
+          refresh: '0; url=https://elsewhere.test/',
+          'set-cookie': 'sid=1',
+          'x-service': 'yes',
+          'cache-control': 'no-store',
+        },
+      });
+    if (request.pathname === '/stall')
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('partial'));
+          },
+        }),
+      );
     if (request.pathname === '/drip')
       return new Response(
         new ReadableStream({
@@ -557,6 +583,103 @@ describe('services create and the service proxy', () => {
     expect(empty.status).toBe(204);
   });
 
+  test('a service cannot set origin-wide policy on the controller (#91 S9)', async () => {
+    const { url } = await openSession();
+    const response = await fetch(`${url}/policy`, { headers: { authorization: 'Bearer ok' } });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('policy');
+    for (const name of [
+      'access-control-allow-origin',
+      'access-control-allow-credentials',
+      'access-control-expose-headers',
+      'clear-site-data',
+      'strict-transport-security',
+      'refresh',
+      'set-cookie',
+    ])
+      expect(response.headers.get(name)).toBeNull();
+    expect(response.headers.get('x-service')).toBe('yes');
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(response.headers.get('content-security-policy')).toBe('sandbox');
+  });
+
+  test('a stall after the headers is audited and ends the body (#91 S10)', async () => {
+    const sessions = new ProxySessions();
+    const session = sessions.issue({
+      tenant: 'acme',
+      user: 'alice',
+      service: 'web',
+      env: 'prod',
+    }) as ProxySession;
+    const request = new Request(`http://controller/v1/services/web/proxy/${session.id}/stall`);
+    const target = new URL(request.url);
+    const audited: [string, Record<string, unknown> | undefined][] = [];
+    const response = await servePassthrough(
+      request,
+      target,
+      PASSTHROUGH.exec(target.pathname) as RegExpExecArray,
+      {
+        tenant: 'acme',
+        principal: alice,
+        upstream: upstream.url,
+        audit: (event, fields) => audited.push([event, fields]),
+        sessions,
+        timeoutMs: 80,
+      },
+    );
+    expect(response.status).toBe(200);
+    const reader = (response.body as ReadableStream<Uint8Array>).getReader();
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe('partial');
+    await expect(reader.read()).rejects.toBeDefined();
+    expect(audited.map(([event]) => event)).toEqual(['proxy.forwarded', 'request.failed']);
+    expect(audited[1]?.[1]).toMatchObject({
+      user: 'alice',
+      service: 'web',
+      path: `/v1/services/web/proxy/${session.id}/stall`,
+      status: 200,
+      reason: 'the service stalled after its headers',
+    });
+  });
+
+  test('a slow reader is not a stall, and a cancelled body is not audited (#91 S10)', async () => {
+    const sessions = new ProxySessions();
+    const session = sessions.issue({
+      tenant: 'acme',
+      user: 'alice',
+      service: 'web',
+      env: 'prod',
+    }) as ProxySession;
+    const run = async (path: string) => {
+      const request = new Request(`http://controller/v1/services/web/proxy/${session.id}${path}`);
+      const target = new URL(request.url);
+      const audited: string[] = [];
+      const response = await servePassthrough(
+        request,
+        target,
+        PASSTHROUGH.exec(target.pathname) as RegExpExecArray,
+        {
+          tenant: 'acme',
+          principal: alice,
+          upstream: upstream.url,
+          audit: (event) => audited.push(event),
+          sessions,
+          timeoutMs: 40,
+        },
+      );
+      return { response, audited };
+    };
+    const slow = await run('/page');
+    await Bun.sleep(120);
+    expect(await slow.response.text()).toBe('echo GET /page ');
+    expect(slow.audited).toEqual(['proxy.forwarded']);
+    const cancelled = await run('/stall');
+    const reader = (cancelled.response.body as ReadableStream<Uint8Array>).getReader();
+    await reader.read();
+    await reader.cancel();
+    await Bun.sleep(120);
+    expect(cancelled.audited).toEqual(['proxy.forwarded']);
+  });
+
   test.each(['/a/../../../x', '/%2e%2e/%2e%2e/x', '//evil.test/x', '/@evil.test/x'])(
     'the path %s cannot leave the upstream',
     async (target) => {
@@ -620,7 +743,15 @@ describe('services create and the service proxy', () => {
 
   test.each([
     [{ destinations: ['a.example.com'], parameters: { cpu: '1' } }, 'takes no sizing parameters'],
-    [{ destinations: Array.from({ length: 33 }, (_, i) => `h${i}.example.com`) }, 'at most 32'],
+    [
+      {
+        destinations: Array.from(
+          { length: EGRESS_MAX_DESTINATIONS + 1 },
+          (_, i) => `h${i}.example.com`,
+        ),
+      },
+      `at most ${EGRESS_MAX_DESTINATIONS}`,
+    ],
     [{ destinations: ['a.example.com', 'a.example.com'] }, 'must not repeat'],
     [{ destinations: ['a.example.com:080'] }, 'host, *.suffix'],
     [
@@ -657,6 +788,25 @@ describe('services create and the service proxy', () => {
       expect(sessions.get(third.id)).toBeDefined();
       expect(sessions.issue(bind('carol'))).toBeDefined();
       expect(sessions.size).toBe(3);
+    });
+
+    test.each([
+      [0, 10],
+      [10, 0],
+      [-1, 10],
+      [1.5, 10],
+      [Number.NaN, 10],
+    ])('a cap below one is refused: ProxySessions(%p, %p) (#91 S13)', (perUser, total) => {
+      expect(() => new ProxySessions(perUser, total)).toThrow(RangeError);
+    });
+
+    test('the smallest caps still issue (#91 S13)', () => {
+      const sessions = new ProxySessions(1, 1);
+      const first = sessions.issue(bind('alice')) as { id: string };
+      const second = sessions.issue(bind('alice')) as { id: string };
+      expect(sessions.get(first.id)).toBeUndefined();
+      expect(sessions.get(second.id)).toBeDefined();
+      expect(sessions.issue(bind('carol'))).toBeUndefined();
     });
 
     test('issuing is refused at the total cap, and expired sessions free room', () => {
@@ -706,6 +856,13 @@ describe('services create and the service proxy', () => {
 
     test('DEFAULT_CLASSES matches the platform default class names', () => {
       expect(DEFAULT_CLASSES).toEqual(DEFAULT_CLASS_NAMES);
+    });
+
+    test('the egress destination limits are the CRD limits (#91 S11)', () => {
+      // The BackingService `destinations` schema, as the platform renders it.
+      expect(JSON.stringify(backingServiceCrds)).toContain(
+        `"destinations":{"type":"array","maxItems":${EGRESS_MAX_DESTINATIONS},"x-kubernetes-list-type":"set","items":{"type":"string","maxLength":${EGRESS_ENTRY_MAX_LENGTH},`,
+      );
     });
 
     test('SERVICE_NAME is the CRD name pattern', () => {
