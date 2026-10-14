@@ -643,9 +643,41 @@ test('the tenant host resolves variants in one place, from platform/tenant-host/
     .split('\n')) {
     expect(matchesPathFilter(filter, file), file).toBe(!file.endsWith('.md'));
   }
-  for (const file of ['variants', '0002-insecure-registry-allowlist.patch']) {
+  for (const file of [
+    'variants',
+    '0002-insecure-registry-allowlist.patch',
+    '0003-nats-blobstore-credentials.patch',
+  ]) {
     expect(matchesPathFilter(filter, `platform/tenant-host/${file}`), file).toBe(true);
   }
+});
+
+test('every tenant host variant carries the NATS blobstore credentials patch, and CI tests it (#330)', () => {
+  const patch = '0003-nats-blobstore-credentials.patch';
+  const rows = read('platform/tenant-host/variants')
+    .split('\n')
+    .filter((line) => line.trim() && !line.startsWith('#'))
+    .map((line) => line.trim().split(/\s+/));
+  expect(rows.length).toBeGreaterThan(0);
+  // Last in each row: it is a `git diff` against the pinned commit and touches no file 0001/0002 do.
+  for (const [tag, ...patches] of rows) expect(patches.at(-1), tag).toBe(patch);
+  const dockerfile = read('platform/tenant-host/Dockerfile');
+  expect(dockerfile).toContain(`ARG WASH_PATCHES="${rows[0]?.slice(1).join(' ')}"`);
+  const text = read(`platform/tenant-host/${patch}`);
+  const files = [...text.matchAll(/^diff --git a\/(\S+) b\//gm)].map((m) => m[1]);
+  expect(files).toEqual(['crates/wash-runtime/src/plugin/wasi_blobstore/multiplexed/nats.rs']);
+  for (const other of ['0001-exclusive-instance.patch', '0002-insecure-registry-allowlist.patch']) {
+    const touched = read(`platform/tenant-host/${other}`);
+    for (const file of files) expect(touched, other).not.toContain(`a/${file} `);
+  }
+  // Every test the patch adds is a required test of the patch-check job, and nothing else is.
+  const check = read('.github/workflows/tenant-host-patch-check.yml');
+  expect(check).toContain(`*" ${patch} "*`);
+  const prefix = 'plugin::wasi_blobstore::multiplexed::nats::tests::';
+  const added = [...text.matchAll(/^\+\s+(?:async )?fn (nats_blobstore_\w+)\(/gm)].map((m) => m[1]);
+  const required = [...check.matchAll(new RegExp(`^\\s+${prefix}(\\w+)$`, 'gm'))].map((m) => m[1]);
+  expect(added.length).toBeGreaterThan(0);
+  expect(required.sort()).toEqual(added.sort());
 });
 
 describe('the check-source resolver reads platform/tenant-host/variants', () => {
