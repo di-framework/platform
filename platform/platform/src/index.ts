@@ -118,8 +118,6 @@ export function createPlatform(args: PlatformArgs) {
   const scope = args.installation;
   const config = args.config ?? new pulumi.Config();
   const declared = declarations(config);
-  const networkPolicy =
-    args.networkPolicyEngine === 'kube-router' ? installNetworkPolicy(provider) : undefined;
   const namespaceName = args.namespace ?? 'wasmcloud';
   const REGISTRY_IMAGE = 'docker.io/library/registry:3.1.1';
   const WASMCLOUD_OPERATOR_VERSION = '2.8.0';
@@ -142,6 +140,9 @@ export function createPlatform(args: PlatformArgs) {
     tenantAuthRoutes: tenantAuthRouteHosts,
     tenants: declared.tenants.map((tenant) => tenant.name),
   });
+  // Every validation above runs before the first resource, so invalid input leaves nothing applied.
+  const networkPolicy =
+    args.networkPolicyEngine === 'kube-router' ? installNetworkPolicy(provider) : undefined;
   const namespaceResource = new k8s.core.v1.Namespace(
     'wasmcloud',
     {

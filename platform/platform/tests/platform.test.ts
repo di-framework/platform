@@ -248,6 +248,90 @@ test('an insecure install refuses a tenantHostImage that predates patch 0002', (
   expect(output).toContain(`tenantHostImage ${old} predates wash patch 0002`);
 }, 60_000);
 
+// Runs createPlatform with kube-router network policy and `config`, waits for every registration
+// to reach the mocks, and returns the thrown message (if any) and the Kubernetes resources.
+function createWithNetworkPolicy(
+  config: Record<string, unknown>,
+  args: Record<string, unknown> = {},
+): { error?: string; resources: { type: string; name: string }[] } {
+  const project = Object.fromEntries(
+    Object.entries(config).map(([key, value]) => [
+      `project:${key}`,
+      typeof value === 'string' ? value : JSON.stringify(value),
+    ]),
+  );
+  const output = execFileSync(
+    'node',
+    [
+      '-e',
+      `
+    const pulumi = require('@pulumi/pulumi');
+    const k8s = require('@pulumi/kubernetes');
+    const resources = [];
+    pulumi.runtime.setAllConfig(${JSON.stringify(project)});
+    pulumi.runtime.setMocks({
+      newResource: a => { resources.push({ type: a.type, name: a.name }); return {id:a.name, state:a.inputs}; },
+      call: a => a.inputs,
+    }, 'project', 'test', false);
+    pulumi.runtime.runInPulumiStack(async () => {
+      let error;
+      try {
+        require('./dist').createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', networkPolicyEngine:'kube-router', ...${JSON.stringify(args)} });
+      } catch (e) { error = e.message; }
+      await new Promise(r => setTimeout(r, 200));
+      return error;
+    }).then(error => {
+      console.log(JSON.stringify({ error, resources: resources.filter(r => !r.type.startsWith('pulumi:')) }));
+    }).catch(e => {console.error(e);process.exitCode=1;});
+  `,
+    ],
+    { cwd: root, encoding: 'utf8' },
+  );
+  return JSON.parse(output);
+}
+
+test('an invalid tenant host allowlist fails before any resource, network policy included', () => {
+  const old =
+    'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669';
+  const cases: [Record<string, unknown>, Record<string, unknown>, string][] = [
+    [
+      { insecureRegistries: ['http://registry.example:5000'] },
+      { registry: true, insecureRegistry: true },
+      'insecureRegistries entries must be a registry host[:port]',
+    ],
+    [
+      { insecureRegistries: JSON.stringify('registry.example:5000') },
+      { registry: true, insecureRegistry: true },
+      'insecureRegistries must be a list of host[:port]',
+    ],
+    [
+      { insecureRegistries: ['registry.example:5000'] },
+      {},
+      'insecureRegistries requires insecureRegistry: true',
+    ],
+    [
+      { tenantHostImage: old },
+      { registry: true, insecureRegistry: true },
+      `tenantHostImage ${old} predates wash patch 0002`,
+    ],
+  ];
+  for (const [config, args, message] of cases) {
+    const { error, resources } = createWithNetworkPolicy(config, args);
+    expect(error).toContain(message);
+    expect(resources).toEqual([]);
+  }
+}, 120_000);
+
+test('a valid tenant host allowlist still installs the kube-router network policy', () => {
+  const { error, resources } = createWithNetworkPolicy(
+    { insecureRegistries: ['examples-registry.wasmcloud.svc.cluster.local:5000'] },
+    { registry: true, insecureRegistry: true },
+  );
+  expect(error).toBeUndefined();
+  expect(resources.some((r) => r.type === 'kubernetes:apps/v1:DaemonSet')).toBe(true);
+  expect(resources.some((r) => r.type === 'kubernetes:helm.sh/v3:Release')).toBe(true);
+}, 60_000);
+
 test('existing entrypoint derives the route pattern from a loopback HTTP endpoint', () => {
   const kubeconfigFile = join(mkdtempSync(join(tmpdir(), 'existing-')), 'config');
   writeFileSync(kubeconfigFile, TENANT_API_KUBECONFIG);
