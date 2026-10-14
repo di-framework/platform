@@ -66,7 +66,7 @@ export default manifest(
         successStatus: 201,
         summary: 'Open an HTTP session to a service',
         description:
-          'Issues a short-lived HTTP session to the service, bound to the caller. The session URL takes the same bearer.',
+          "Issues a short-lived HTTP session to the service, bound to the caller. The session URL takes the same bearer. A new session replaces the caller's oldest once they hold the per-user limit; 429 when the controller already holds its maximum of live sessions, so retry later.",
       },
       'ProxyRequest',
       'ProxySession',

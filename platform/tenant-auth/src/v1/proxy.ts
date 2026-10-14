@@ -146,14 +146,20 @@ const STRIPPED_REQUEST = new Set([
 const STRIPPED_REQUEST_PREFIX = 'impersonate-';
 /**
  * Service headers never relayed: a service may not set cookies or origin-wide policy (CORS,
- * HSTS, site-data clearing, refresh redirects) on the controller's origin, and the hop-by-hop
- * framing is the controller's own. `access-control-*` is dropped by prefix.
+ * HSTS, site-data clearing, refresh redirects, alternative services) on the controller's origin,
+ * nor register reporting endpoints (`nel`, `report-to`, `reporting-endpoints`) that would make
+ * the browser send it the URLs of later controller requests. The hop-by-hop framing is the
+ * controller's own. `access-control-*` is dropped by prefix. Header names arrive lower-cased.
  */
 const STRIPPED_RESPONSE = new Set([
   'set-cookie',
   'clear-site-data',
   'strict-transport-security',
   'refresh',
+  'nel',
+  'report-to',
+  'reporting-endpoints',
+  'alt-svc',
   'connection',
   'keep-alive',
   'content-length',
