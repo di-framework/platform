@@ -14,6 +14,12 @@ export interface KeyPair {
   key: string;
 }
 
+/** The DNS names and IPv4 addresses in a certificate's subjectAltName. */
+export interface CertNames {
+  dns: string[];
+  ips: string[];
+}
+
 const der = (tag: number, ...parts: Buffer[]): Buffer => {
   const body = Buffer.concat(parts);
   const length =
@@ -74,6 +80,22 @@ const keyUsage = (...bits: number[]) => {
   const unused = 31 - Math.clz32(byte & -byte); // trailing zero bits, as DER requires
   return extension('2.5.29.15', der(0x03, Buffer.from([unused, byte])), true);
 };
+const NAME_CONSTRAINTS = '2.5.29.30';
+/**
+ * A critical (RFC 5280 §4.2.1.10) nameConstraints extension whose permitted subtrees are exactly
+ * the DNS names `permittedDns`. A DNS subtree also admits names below it (`a.localhost` under
+ * `localhost`). IP addresses are left unconstrained: BoringSSL (Bun's TLS client) rejects every
+ * chain in which an IP address SAN meets an IP address constraint, and the controller's leaf names
+ * `127.0.0.1`.
+ */
+const nameConstraints = (permittedDns: string[]) => {
+  if (permittedDns.length === 0) throw new Error('name constraints need a permitted DNS name');
+  return extension(
+    NAME_CONSTRAINTS,
+    seq(der(0xa0, ...permittedDns.map((dns) => seq(der(0x82, Buffer.from(dns)))))),
+    true,
+  );
+};
 const subjectAltName = (dnsNames: string[], ipAddresses: string[]) =>
   extension(
     '2.5.29.17',
@@ -86,11 +108,15 @@ const pem = (label: string, body: Buffer): string =>
   `-----BEGIN ${label}-----\n${(body.toString('base64').match(/.{1,64}/g) ?? []).join('\n')}\n-----END ${label}-----\n`;
 const pkcs8 = (key: KeyObject) => key.export({ type: 'pkcs8', format: 'pem' }) as string;
 
+/** The length of the tag and length octets of the DER element at the start of `buf`. */
+const headerLength = (buf: Buffer) => {
+  const first = buf[1] as number;
+  return first & 0x80 ? 2 + (first & 0x7f) : 2;
+};
 /** The DER children of the constructed element at the start of `buf`. */
 function children(buf: Buffer): Buffer[] {
-  const first = buf[1] as number;
   const out: Buffer[] = [];
-  for (let at = first & 0x80 ? 2 + (first & 0x7f) : 2; at < buf.length; ) {
+  for (let at = headerLength(buf); at < buf.length; ) {
     const lead = buf[at + 1] as number;
     const width = lead & 0x80 ? lead & 0x7f : 0;
     const length = width ? buf.readUIntBE(at + 2, width) : lead;
@@ -99,6 +125,9 @@ function children(buf: Buffer): Buffer[] {
   }
   return out;
 }
+
+/** The contents of the DER element at the start of `buf`, without its tag and length. */
+const contents = (buf: Buffer): Buffer => buf.subarray(headerLength(buf));
 
 /** The subject Name of a PEM certificate as DER, so a leaf can carry it verbatim as its issuer. */
 function subjectDer(cert: string): Buffer {
@@ -171,13 +200,67 @@ function selfIssued(
 /**
  * A P-256 certificate authority: a self-signed certificate that may only sign end-entity
  * certificates (`CA:TRUE, pathlen:0`, keyUsage `keyCertSign, cRLSign`, an SKI) and carries no SANs.
+ * With `permittedDns`, a critical nameConstraints extension limits the DNS names any certificate
+ * it signs may carry to those and the names below them (#365).
  */
-export function caCertificate(commonName: string, days: number, now: Date = new Date()): KeyPair {
+export function caCertificate(
+  commonName: string,
+  days: number,
+  now: Date = new Date(),
+  permittedDns?: string[],
+): KeyPair {
   return selfIssued(commonName, days, now, (publicKey) => [
     extension('2.5.29.19', seq(BOOLEAN_TRUE, der(0x02, Buffer.from([0]))), true),
     keyUsage(5, 6),
     subjectKeyId(publicKey),
+    ...(permittedDns ? [nameConstraints(permittedDns)] : []),
   ]);
+}
+
+/**
+ * The permitted DNS subtrees of `ca`'s name constraints (#365); undefined when it has no name
+ * constraints or does not parse. Only what {@link caCertificate} writes is read: other name forms
+ * and excluded subtrees are ignored.
+ */
+export function caPermittedDns(ca: string): string[] | undefined {
+  try {
+    const tbs = children(new X509Certificate(ca).raw)[0] as Buffer;
+    const extensions = children(tbs).find((field) => field[0] === 0xa3) as Buffer;
+    const wanted = oid(NAME_CONSTRAINTS);
+    const found = children(children(extensions)[0] as Buffer).find((ext) =>
+      (children(ext)[0] as Buffer).equals(wanted),
+    );
+    if (!found) return undefined;
+    const permitted = children(contents(children(found).at(-1) as Buffer)).filter(
+      (part) => part[0] === 0xa0,
+    );
+    return permitted
+      .flatMap((subtrees) => children(subtrees).map((subtree) => children(subtree)[0] as Buffer))
+      .filter((base) => base[0] === 0x82)
+      .map((base) => contents(base).toString('latin1'));
+  } catch {
+    return undefined;
+  }
+}
+
+/** True when the DNS name `dns` is `subtree` or below it (RFC 5280 §4.2.1.10), ignoring case. */
+export const inDnsSubtree = (dns: string, subtree: string): boolean => {
+  const [name, base] = [dns.toLowerCase(), subtree.toLowerCase()];
+  return name === base || name.endsWith(`.${base}`);
+};
+
+/**
+ * The part of `names` a certificate signed by `ca` may carry under its name constraints (#365):
+ * the DNS names within its permitted subtrees, and every IP address (they are not constrained).
+ * All of `names` when `ca` has no name constraints.
+ */
+export function namesPermittedBy(ca: string, names: CertNames): CertNames {
+  const permitted = caPermittedDns(ca);
+  if (!permitted) return names;
+  return {
+    dns: names.dns.filter((dns) => permitted.some((base) => inDnsSubtree(dns, base))),
+    ips: names.ips,
+  };
 }
 
 /**
@@ -288,7 +371,7 @@ export function certificateValid(
 }
 
 /** The DNS names and IP addresses in `cert`'s subjectAltName; undefined when unreadable. */
-export function certificateNames(cert: string): { dns: string[]; ips: string[] } | undefined {
+export function certificateNames(cert: string): CertNames | undefined {
   try {
     const entries = (new X509Certificate(cert).subjectAltName ?? '').split(', ');
     const pick = (prefix: string) =>

@@ -125,7 +125,14 @@ import {
   serviceBindingResources,
   sharedBindingConflict,
 } from './service-binding-reconcile';
-import { certificateNames, certificateValid, holdsCaKey, issuedBy, leafCertificate } from './tls';
+import {
+  certificateNames,
+  certificateValid,
+  holdsCaKey,
+  issuedBy,
+  leafCertificate,
+  namesPermittedBy,
+} from './tls';
 import {
   STORAGE_FIELD_MANAGER,
   storageKeys,
@@ -607,7 +614,8 @@ export class Controller {
    * `tenant-controller-tls` reissues only the leaf. {@link rotateCas} decides which CAs to keep and
    * overlaps them during a rotation. The leaf is reused while it verifies against the current CA,
    * has {@link LEAF_RENEW_DAYS} left and names what it should, so a leaf renewal keeps the CA and
-   * does not roll the hosts or invalidate kubeconfigs.
+   * does not roll the hosts or invalidate kubeconfigs. The CAs permit only the leaf's names (#365),
+   * so a change of names is a rotation too.
    *
    * Until the platform-namespace Secret exists, the CA is taken from where it was kept before:
    * `ca.crt` in `tenant-controller-tls` and `ca.key` in the runtime namespace's
@@ -673,14 +681,21 @@ export class Controller {
         ? fromCaSecret
         : { current: legacy };
     const now = this.now();
-    const cas = rotateCas(stored, `tenant-controller CA (${runtimeNamespace})`, now);
+    const wanted = tenantControllerCertNames(name, auth);
+    const cas = rotateCas(
+      stored,
+      { commonName: `tenant-controller CA (${runtimeNamespace})`, dnsNames: wanted.dns },
+      now,
+    );
     const ca = {
       caCert: cas.current.cert,
       caKey: cas.current.key,
       ...(cas.next ? { caNext: cas.next } : {}),
       ...(cas.previous ? { caPrevious: cas.previous } : {}),
     };
-    const certNames = tenantControllerCertNames(name, auth);
+    // While a successor for changed names is published, the leaf names only what the signing CA
+    // permits (#365); the rest are added at the switch.
+    const certNames = namesPermittedBy(ca.caCert, wanted);
     if (
       certificateValid(cert, LEAF_RENEW_DAYS, now) &&
       JSON.stringify(certificateNames(cert)) === JSON.stringify(certNames) &&
