@@ -452,6 +452,11 @@ export const MAX_STORED_BUNDLE_BYTES = 900 * 1024;
 type Status = 'pending' | 'rolling' | 'ready' | 'failed' | 'rolled-back';
 type State = 'pending' | 'live' | 'replaced' | 'failed';
 const STATES: readonly string[] = ['pending', 'live', 'replaced', 'failed'];
+/**
+ * What a revision that went live reports when no deploy recorded its status at replacement, as
+ * after a crash between apply and mark: it was rolled out, but how the rollout ended is unknown.
+ */
+const UNOBSERVED: Status = 'rolling';
 interface Live {
   status: Status;
   readyAt?: string;
@@ -583,6 +588,8 @@ async function revisions(
 interface Mark {
   revision: Revision;
   state: State;
+  /** The status a repair from `live` to `replaced` records, when none was recorded. */
+  status?: Status;
 }
 
 /** The revisions, the tenant's workloads by name, and each service/env's running revision. */
@@ -618,7 +625,8 @@ async function history(
     if (named) running.set(groupOf(revision), revision);
     const state = named ? 'live' : revision.state === 'live' ? 'replaced' : revision.state;
     if (state === revision.state) continue;
-    marks.push({ revision, state });
+    const unrecorded = state === 'replaced' && !revision.object.metadata.annotations?.[STATUS];
+    marks.push({ revision, state, ...(unrecorded ? { status: UNOBSERVED } : {}) });
     revision.state = state;
   }
   return { items, workloads, running, marks };
@@ -668,13 +676,16 @@ function deployment(revision: Revision, { status, readyAt }: Live) {
   };
 }
 
-/** What a revision that is not running reports: its recorded status, or that it never went live. */
+/**
+ * What a revision that is not running reports: its recorded status, `UNOBSERVED` when it went live
+ * but none was recorded, or that it never went live.
+ */
 function recorded(revision: Revision): Live {
   if (revision.state === 'pending' || revision.state === 'failed')
     return { status: revision.state };
   const annotations = revision.object.metadata.annotations ?? {};
   return {
-    status: (annotations[STATUS] as Status | undefined) ?? 'pending',
+    status: (annotations[STATUS] as Status | undefined) ?? UNOBSERVED,
     ...(annotations[READY_AT] ? { readyAt: annotations[READY_AT] } : {}),
   };
 }
@@ -694,7 +705,9 @@ async function remove(user: UserKube, path: string): Promise<void> {
 /**
  * The revisions to delete to make room for one more of `group`: at most `HISTORY_PER_SERVICE_ENV`
  * per service/env and `HISTORY_TENANT_BUDGET` in the tenant, oldest first, never a revision a
- * workload runs. A 507 when the revisions workloads run already fill the tenant budget.
+ * workload runs. A 507 when the revisions workloads run already fill the tenant budget, unless
+ * `group` runs one of them: its deploy replaces that revision, which the next deploy may evict, so
+ * the tenant holds at most one revision over the budget meanwhile.
  */
 function evictions({ items, running }: History, group: string): Revision[] | Response {
   const kept = new Set(running.values());
@@ -716,7 +729,7 @@ function evictions({ items, running }: History, group: string): Revision[] | Res
     evict.add(revision);
     total--;
   }
-  if (total > HISTORY_TENANT_BUDGET)
+  if (total > HISTORY_TENANT_BUDGET + (running.has(group) ? 1 : 0))
     return problem(
       507,
       'Insufficient Storage',
@@ -798,8 +811,9 @@ async function annotate(
 }
 
 /**
- * The stored bundle of a rollback target: a 422 when it does not match `data.digest` or is not a
- * complete bundle for the revision's service and env.
+ * The stored bundle of a rollback target: a 404 when a concurrent deploy pruned it since the
+ * history was read, a 422 when it does not match `data.digest` or is not a complete bundle for
+ * the revision's service and env.
  */
 async function load(
   user: UserKube,
@@ -809,10 +823,16 @@ async function load(
   const object = (await current(user, `${configmapsPath(tenant)}/${nameOf(revision)}`)) as
     | RevisionObject
     | undefined;
-  const text = object?.data?.bundle ?? '';
+  if (!object)
+    return problem(
+      404,
+      'Not Found',
+      `deployment ${revision.id} is not in the history of ${revision.service} in ${revision.env}`,
+    );
+  const text = object.data?.bundle ?? '';
   const unprocessable = (reason: string) =>
     problem(422, 'Unprocessable Entity', `deployment ${revision.id} ${reason}`);
-  if (object?.data?.digest !== sha256(text))
+  if (object.data?.digest !== sha256(text))
     return unprocessable('does not match its stored digest');
   let bundle: unknown;
   try {
@@ -904,7 +924,10 @@ async function rollout(
       });
     for (const mark of view.marks)
       if (mark.revision !== previous && !evict.includes(mark.revision))
-        await annotate(user, tenant, nameOf(mark.revision), { [STATE]: mark.state });
+        await annotate(user, tenant, nameOf(mark.revision), {
+          [STATE]: mark.state,
+          ...(mark.status ? { [STATUS]: mark.status } : {}),
+        });
   } catch (error) {
     console.log(
       JSON.stringify({
