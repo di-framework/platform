@@ -64,13 +64,23 @@ const trustedCa = (cert: string | undefined, now: Date): cert is string =>
  *    nothing still needs it.
  *
  * A current CA that is missing, expired or whose key is missing or wrong is replaced at once
- * (by the successor when there is a usable one): nothing can sign with it.
+ * (by the successor when there is a usable one): nothing can sign with it. While its certificate
+ * is still a valid CA it stays in the bundle as `previous`, so the leaf it signed keeps verifying
+ * until the controller rolls.
  */
 export function rotateCas(stored: StoredCas, commonName: string, now: Date): ControllerCas {
   const fresh = () => caCertificate(commonName, CA_DAYS, now);
   const current = usable(stored.current, now);
   let next = usable(stored.next, now);
-  if (!current) return { current: next ?? fresh() };
+  if (!current) {
+    // Its leaf may still be served until the controller rolls, so a CA that is still valid stays
+    // trusted (it never signs again).
+    const replacement = next ?? fresh();
+    const old = stored.current?.cert;
+    return trustedCa(old, now) && old !== replacement.cert
+      ? { current: replacement, previous: old }
+      : { current: replacement };
+  }
   let cas: ControllerCas = {
     current,
     ...(trustedCa(stored.previous, now) && stored.previous !== current.cert

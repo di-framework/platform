@@ -389,8 +389,20 @@ to be done before `pulumi up`:
   the digest of the trust bundle it copies into the kubeconfigs it issues.
 - **Downgrading** to a platform package without this change finds no `tenant-controller-ca-key`
   and replaces the CA: the tenant hosts roll and kubeconfigs issued before need a new `login`.
-  Delete `tenant-controller-ca-<tenant>` in the platform namespace afterwards; the older package
-  does not know it.
+  The older package leaves `tenant-controller-ca-<tenant>` alone; it does not know it.
+- **Upgrading again after a downgrade** keeps the CA the older package issued. The controller sees
+  a working `tenant-controller-ca-key` whose CA (the `ca.crt` in `tenant-controller-tls`) differs
+  from the one in `tenant-controller-ca-<tenant>`, so an older package replaced the CA in between.
+  Every host, console and kubeconfig trusts that CA now, so it becomes the current CA unchanged:
+  the bundle, the leaf and the host templates stay as they are and nothing rolls. The stale CA in
+  `tenant-controller-ca-<tenant>` is dropped, not published again, since nothing trusts it any
+  more; the next rotation starts from the adopted CA with the usual overlap.
+- **A `tenant-controller-ca-<tenant>` this installation did not write** (no
+  `platform.di-framework.dev/installation` label of this installation, or an owner label of
+  another Tenant, for example one left from an earlier Tenant of the same name) is never read or
+  published. `TenantAuthReady` turns `False` with reason `ControllerCaNotOwned`, the controller
+  logs it once, and nothing of the pair changes until the Secret is deleted; the controller then
+  writes its own.
 
 ### Tenant removal and namespace retention
 
@@ -1155,8 +1167,12 @@ tenantAuth:
 
   A kubeconfig or `--ca-file` holding only the old CA stops verifying at the switch: fetch the
   bundle again (or `login` again) during the 30 days after it is published. The CA is replaced at
-  once, with no overlap, only when it cannot sign: its key is missing or does not match it, or it
-  has expired. A published successor that is still usable then takes its place. When
+  once, with no publish step, only when it cannot sign: its key is missing or does not match it,
+  or it has expired. A published successor that is still usable then takes its place, and the old
+  CA stays in the bundle as `previous.crt` until it expires, so the leaf it signed keeps
+  verifying while the controller rolls. A new CA's key is always stored before the bundle or a
+  leaf names that CA. The controller reads only CA Secrets this installation wrote for the
+  Tenant (see the upgrade section above). When
   `tenant-controller-ca-<tenant>` is missing the controller falls back to the earlier layout
   (`ca.crt` in `tenant-controller-tls`, `ca.key` in the runtime namespace's
   `tenant-controller-ca-key` if this installation wrote it) and moves it, see

@@ -9,7 +9,12 @@ import {
   rotateCas,
 } from '../src/tenancy/ca-rotation';
 import { controllerTrustBundle } from '../src/tenancy/resources';
-import { caCertificate, holdsCaKey, leafCertificate } from '../src/tenancy/tls';
+import {
+  caCertificate,
+  holdsCaKey,
+  leafCertificate,
+  selfSignedCertificate,
+} from '../src/tenancy/tls';
 import { verifiesAt } from './support/tls';
 
 const DAY = 86_400_000;
@@ -44,28 +49,33 @@ describe('rotateCas (#170)', () => {
   it('replaces a current CA at once when its key is missing or wrong, or it expired', () => {
     const a = caCertificate(NAME, CA_DAYS, t0);
     const other = caCertificate('other', CA_DAYS, t0);
-    for (const current of [
-      { cert: a.cert },
-      { cert: a.cert, key: other.key },
-      { cert: 'garbage', key: a.key },
-    ]) {
+    // A CA that lost its key stays trusted as `previous` while valid: its leaf is still served
+    // until the controller rolls.
+    for (const current of [{ cert: a.cert }, { cert: a.cert, key: other.key }]) {
       const cas = rotateCas({ current }, NAME, t0);
       expect(cas.current.cert).not.toBe(a.cert);
-      expect(cas.previous).toBeUndefined();
+      expect(holdsCaKey(cas.current.cert, cas.current.key)).toBe(true);
+      expect(cas.previous).toBe(a.cert);
+      expect(cas.next).toBeUndefined();
     }
+    const garbage = rotateCas({ current: { cert: 'garbage', key: a.key } }, NAME, t0);
+    expect(garbage.previous).toBeUndefined();
+    // An expired CA is not kept.
     const expired = rotateCas({ current: a }, NAME, at(CA_DAYS + 1));
     expect(expired.current.cert).not.toBe(a.cert);
     expect(expired.previous).toBeUndefined();
-    // A leaf certificate is never taken for a CA.
+    // A leaf certificate is never taken for a CA, current or previous.
     const leaf = leafCertificate('leaf', ['a'], [], 30, a.cert, a.key, t0);
-    expect(rotateCas({ current: leaf }, NAME, t0).current.cert).not.toBe(leaf.cert);
+    const fromLeaf = rotateCas({ current: leaf }, NAME, t0);
+    expect(fromLeaf.current.cert).not.toBe(leaf.cert);
+    expect(fromLeaf.previous).toBeUndefined();
   });
 
   it('promotes a published successor when the current CA becomes unusable', () => {
     const a = caCertificate(NAME, CA_DAYS, t0);
     const b = caCertificate(NAME, CA_DAYS, at(CA_DAYS - CA_RENEW_DAYS));
     const cas = rotateCas({ current: { cert: a.cert }, next: b }, NAME, at(CA_DAYS - 80));
-    expect(cas).toEqual({ current: b });
+    expect(cas).toEqual({ current: b, previous: a.cert });
   });
 
   it('publishes, switches and retires on schedule, keeping the bundle bytes at the switch', () => {
@@ -201,5 +211,25 @@ describe('rotateCas (#170)', () => {
     expect(await handshake(a, a.cert + b.cert)).toBe('ok');
     expect(await handshake(b, a.cert + b.cert)).toBe('ok');
     expect(await handshake(a, b.cert)).toBe('rejected');
+  });
+
+  it('checks every link of the path in the X.509 helper the rotation tests rely on', () => {
+    const a = caCertificate(NAME, 100, t0);
+    const leaf = leafCertificate('localhost', ['localhost'], [], 30, a.cert, a.key, t0).cert;
+    expect(verifiesAt(leaf, a.cert, at(1))).toBe(true);
+    // Each of these must fail, or the matrices above could pass on a broken setup.
+    expect(verifiesAt(leaf, a.cert, at(-1))).toBe(false);
+    expect(verifiesAt(leaf, a.cert, at(31))).toBe(false);
+    const sameName = caCertificate(NAME, 100, t0);
+    expect(verifiesAt(leaf, sameName.cert, at(1))).toBe(false);
+    const elsewhere = leafCertificate('other', ['other.example'], [], 30, a.cert, a.key, t0).cert;
+    expect(verifiesAt(elsewhere, a.cert, at(1))).toBe(false);
+    const selfSigned = selfSignedCertificate('localhost', ['localhost'], [], 30, t0).cert;
+    expect(verifiesAt(selfSigned, selfSigned, at(1))).toBe(false);
+    expect(verifiesAt(leaf, leaf, at(1))).toBe(false);
+    expect(() => verifiesAt(leaf, '', at(1))).toThrow();
+    expect(() =>
+      verifiesAt(leaf, '-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n', at(1)),
+    ).toThrow();
   });
 });

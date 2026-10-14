@@ -264,10 +264,11 @@ describe('tenantAuthResources', () => {
       'RoleBinding/di-tenant-alpha/tenant-controller-secret-reader',
       'NetworkPolicy/di-runtime-alpha/tenant-auth-egress',
       'NetworkPolicy/di-runtime-alpha/tenant-auth-network',
+      // The CA key is stored before the bundle and the leaf publish the CA (#170).
+      'Secret/wasmcloud/tenant-controller-ca-alpha',
       'ConfigMap/di-runtime-alpha/tenant-controller-members',
       'ConfigMap/di-runtime-alpha/tenant-controller-ca',
       'Secret/di-runtime-alpha/tenant-controller-tls',
-      'Secret/wasmcloud/tenant-controller-ca-alpha',
       'Secret/di-runtime-alpha/tenant-console-oauth',
       'Deployment/di-runtime-alpha/tenant-controller',
       'Deployment/di-runtime-alpha/tenant-console',
@@ -926,6 +927,18 @@ describe('reconcileTenant with tenant-auth', () => {
   const decode = (data: Record<string, string> | undefined, key: string) =>
     Buffer.from(data?.[key] ?? '', 'base64').toString();
   const encode = (value: string) => Buffer.from(value).toString('base64');
+  /** The object at `p`, failing the test when it is missing. */
+  const must = (api: MemoryApi, p: string): Resource => {
+    const value = api.objects.get(p);
+    if (!value) throw new Error(`${p} is missing`);
+    return value;
+  };
+  /** `data[key]`, failing the test when it is missing. */
+  const field = (data: Record<string, string>, key: string): string => {
+    const value = data[key];
+    if (value === undefined) throw new Error(`${key} is missing`);
+    return value;
+  };
 
   it('issues a CA and a leaf, keeps both while valid, and publishes only the CA', async () => {
     const { api, controller, t } = prepare();
@@ -1019,8 +1032,8 @@ describe('reconcileTenant with tenant-auth', () => {
     await controller.reconcileTenant(t, []);
     const second = api.objects.get(tlsPath)?.data as Record<string, string>;
     expect(second['ca.crt']).not.toBe(first['ca.crt']);
-    api.objects.get(caKeyPath)!.data = {
-      ...(api.objects.get(caKeyPath)!.data as Record<string, string>),
+    must(api, caKeyPath).data = {
+      ...(must(api, caKeyPath).data as Record<string, string>),
       'ca.key': encode(caCertificate('o', 30).key),
     };
     await controller.reconcileTenant(t, []);
@@ -1077,7 +1090,7 @@ describe('reconcileTenant with tenant-auth', () => {
   it('moves the CA key out of the runtime namespace without replacing the CA (#170 S3)', async () => {
     const { api, controller, t } = prepare();
     await controller.reconcileTenant(t, []);
-    const tls = api.objects.get(tlsPath)!;
+    const tls = must(api, tlsPath);
     const before = structuredClone(tls.data);
     const bundle = api.objects.get(caMapPath)?.data;
     const keys = api.objects.get(caKeyPath)?.data as Record<string, string>;
@@ -1093,7 +1106,7 @@ describe('reconcileTenant with tenant-auth', () => {
         labels: { ...tls.metadata.labels },
       },
       type: 'Opaque',
-      data: { 'ca.key': keys['ca.key']! },
+      data: { 'ca.key': field(keys, 'ca.key') },
     } as Resource);
     await controller.reconcileTenant(t, []);
     expect(api.objects.get(caKeyPath)?.data).toEqual(keys);
@@ -1103,7 +1116,7 @@ describe('reconcileTenant with tenant-auth', () => {
     // The tenant controller's Role covers only its runtime namespace; the key is not there.
     for (const value of api.objects.values())
       if (value.metadata.namespace === 'di-runtime-alpha')
-        expect(JSON.stringify(value)).not.toContain(keys['ca.key']!);
+        expect(JSON.stringify(value)).not.toContain(field(keys, 'ca.key'));
   });
 
   it('neither adopts nor deletes a runtime-namespace CA key it did not write', async () => {
@@ -1120,12 +1133,175 @@ describe('reconcileTenant with tenant-auth', () => {
         namespace: 'di-runtime-alpha',
         labels: { [COMPONENT]: 'tenant-auth', [TENANT]: 'alpha' },
       },
-      data: { 'ca.key': keys['ca.key']! },
+      data: { 'ca.key': field(keys, 'ca.key') },
     } as Resource);
     await controller.reconcileTenant(t, []);
     const replaced = api.objects.get(caKeyPath)?.data as Record<string, string>;
     expect(decode(replaced, 'ca.crt')).not.toBe(caPem);
-    expect(api.objects.get(legacyCaKeyPath)?.data).toEqual({ 'ca.key': keys['ca.key']! });
+    expect(api.objects.get(legacyCaKeyPath)?.data).toEqual({ 'ca.key': field(keys, 'ca.key') });
+  });
+
+  it('refuses a CA Secret it did not write before publishing anything from it, and logs it once', async () => {
+    const { api, controller, t } = prepare();
+    const stranger = caCertificate('someone else', 3650);
+    const seeded = {
+      'ca.crt': encode(stranger.cert),
+      'ca.key': encode(stranger.key),
+    };
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: { name: 'tenant-controller-ca-alpha', namespace: 'wasmcloud' },
+      type: 'Opaque',
+      data: seeded,
+    } as Resource);
+    const logged: string[] = [];
+    const log = console.error;
+    console.error = (message: string) => logged.push(message);
+    try {
+      for (let pass = 0; pass < 3; pass++) await controller.reconcileTenant(t, []);
+    } finally {
+      console.error = log;
+    }
+    const conditions = Object.fromEntries((t.status?.conditions ?? []).map((c) => [c.type, c]));
+    expect(conditions.Ready?.status).toBe('True');
+    expect(conditions.TenantAuthReady).toMatchObject({
+      status: 'False',
+      reason: 'ControllerCaNotOwned',
+    });
+    expect(conditions.TenantAuthReady?.message).toContain(
+      'Refusing to adopt Secret wasmcloud/tenant-controller-ca-alpha',
+    );
+    expect(logged.filter((m) => m.includes('tenant-controller-ca-alpha'))).toHaveLength(1);
+    // Nothing was rendered from it: no bundle, no leaf, and the Secret is left as it was.
+    expect(api.objects.get(caMapPath)).toBeUndefined();
+    expect(api.objects.get(tlsPath)).toBeUndefined();
+    expect(api.objects.get(caKeyPath)?.data).toEqual(seeded);
+    // Once it is deleted, the controller writes its own.
+    api.objects.delete(caKeyPath);
+    await controller.reconcileTenant(t, []);
+    const keys = must(api, caKeyPath);
+    expect(keys.metadata.labels).toMatchObject({ [INSTALLATION]: 'test', [OWNER]: 'alpha-uid' });
+    expect(decode(keys.data as Record<string, string>, 'ca.crt')).not.toBe(stranger.cert);
+  });
+
+  it('refuses a CA Secret left by an earlier Tenant of the same name, keeping the bundle', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t, []);
+    const bundle = api.objects.get(caMapPath)?.data;
+    const tls = api.objects.get(tlsPath)?.data;
+    const stranger = caCertificate('earlier tenant', 3650);
+    const secret = must(api, caKeyPath);
+    secret.metadata.labels = { ...secret.metadata.labels, [OWNER]: 'earlier-uid' };
+    secret.data = { 'ca.crt': encode(stranger.cert), 'ca.key': encode(stranger.key) };
+    const log = console.error;
+    console.error = () => {};
+    try {
+      await controller.reconcileTenant(t, []);
+    } finally {
+      console.error = log;
+    }
+    expect(t.status?.conditions?.find((c) => c.type === 'TenantAuthReady')?.reason).toBe(
+      'ControllerCaNotOwned',
+    );
+    expect(api.objects.get(caMapPath)?.data).toEqual(bundle);
+    expect(api.objects.get(tlsPath)?.data).toEqual(tls);
+  });
+
+  it('adopts the CA an older package issued after a downgrade instead of the stale one (#170)', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t, []);
+    const stale = decode(api.objects.get(caKeyPath)?.data as Record<string, string>, 'ca.crt');
+    const tls = must(api, tlsPath);
+    // What a package from before #170 does once downgraded: it finds no runtime-namespace key,
+    // replaces the CA and keeps its key in tenant-controller-ca-key. The platform Secret stays.
+    const ns = 'di-runtime-alpha';
+    const older = caCertificate(`tenant-controller CA (${ns})`, 3650);
+    const names = tenantControllerCertNames('alpha', auth);
+    const leaf = leafCertificate(
+      `tenant-controller.${ns}.svc`,
+      names.dns,
+      names.ips,
+      365,
+      older.cert,
+      older.key,
+    );
+    tls.data = {
+      'tls.crt': encode(leaf.cert),
+      'tls.key': encode(leaf.key),
+      'ca.crt': encode(older.cert),
+    };
+    must(api, caMapPath).data = { 'ca.crt': older.cert };
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: {
+        name: 'tenant-controller-ca-key',
+        namespace: ns,
+        uid: 'legacy-uid',
+        labels: { ...tls.metadata.labels },
+      },
+      type: 'Opaque',
+      data: { 'ca.key': encode(older.key) },
+    } as Resource);
+    const before = structuredClone(tls.data);
+    // Upgrading again keeps what every host, console and kubeconfig trusts now: no roll at all.
+    await controller.reconcileTenant(t, []);
+    expect(api.objects.get(tlsPath)?.data).toEqual(before);
+    expect(api.objects.get(caMapPath)?.data).toEqual({ 'ca.crt': older.cert });
+    const keys = api.objects.get(caKeyPath)?.data as Record<string, string>;
+    expect(Object.keys(keys).sort()).toEqual(['ca.crt', 'ca.key']);
+    expect(decode(keys, 'ca.crt')).toBe(older.cert);
+    expect(decode(keys, 'ca.crt')).not.toBe(stale);
+    expect(holdsCaKey(older.cert, decode(keys, 'ca.key'))).toBe(true);
+    expect(api.objects.get(legacyCaKeyPath)).toBeUndefined();
+    await controller.reconcileTenant(t, []);
+    expect(api.objects.get(tlsPath)?.data).toEqual(before);
+    expect(api.objects.get(caKeyPath)?.data).toEqual(keys);
+  });
+
+  it('keeps the legacy CA key until the platform Secret holding it is applied', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t, []);
+    const tls = must(api, tlsPath);
+    const bundle = api.objects.get(caMapPath)?.data;
+    const keys = api.objects.get(caKeyPath)?.data as Record<string, string>;
+    api.objects.delete(caKeyPath);
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: {
+        name: 'tenant-controller-ca-key',
+        namespace: 'di-runtime-alpha',
+        uid: 'legacy-uid',
+        labels: { ...tls.metadata.labels },
+      },
+      type: 'Opaque',
+      data: { 'ca.key': field(keys, 'ca.key') },
+    } as Resource);
+    api.fail = (method, p) =>
+      method === 'PATCH' && p === caKeyPath ? new ApiError(500, 'boom') : undefined;
+    const log = console.error;
+    console.error = () => {};
+    try {
+      await controller.reconcileTenant(t, []);
+    } finally {
+      console.error = log;
+      api.fail = undefined;
+    }
+    expect(api.objects.get(legacyCaKeyPath)?.data).toEqual({ 'ca.key': field(keys, 'ca.key') });
+    expect(api.objects.get(caMapPath)?.data).toEqual(bundle);
+    await controller.reconcileTenant(t, []);
+    expect(api.objects.get(caKeyPath)?.data).toEqual(keys);
+    expect(api.objects.get(legacyCaKeyPath)).toBeUndefined();
+  });
+
+  it('removes the platform-namespace CA Secret when tenantAuth is unset', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t, []);
+    expect(api.objects.get(caKeyPath)).toBeDefined();
+    await new Controller(api, { ...cfg, tenantAuth: undefined }).reconcileTenant(t, []);
+    expect(api.objects.get(caKeyPath)).toBeUndefined();
   });
 
   it('removes the platform-namespace CA Secret with the tenant', async () => {
@@ -2928,6 +3104,36 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     await controller.reconcileTenant(t, []);
     expect(token(api)).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(JSON.stringify(host(api).spec.template)).toBe(template);
+  });
+
+  it('rolls the hosts when a CA is published and retired, not when it switches (#170)', async () => {
+    const { api, t } = prepare();
+    const DAY = 86_400_000;
+    const t0 = new Date('2026-10-14T00:00:00Z').getTime();
+    let clock = new Date(t0);
+    const controller = new Controller(api, tlsCfg, undefined, () => clock);
+    const digestAt = async (days: number) => {
+      clock = new Date(t0 + days * DAY);
+      // The tenant step renders the hosts from the bundle the previous pass applied.
+      await controller.reconcileTenant(t, []);
+      await controller.reconcileTenant(t, []);
+      const bundle = String(
+        (api.objects.get(caPath)?.data as Record<string, string> | undefined)?.['ca.crt'],
+      );
+      const digest =
+        host(api).spec.template.metadata.annotations[
+          'platform.di-framework.dev/registry-ca-sha256'
+        ];
+      expect(digest).toBe(tlsCertDigest(bundle));
+      return digest;
+    };
+    const created = await digestAt(0);
+    expect(await digestAt(CA_DAYS - CA_RENEW_DAYS - 10)).toBe(created);
+    const published = await digestAt(CA_DAYS - CA_RENEW_DAYS + 1);
+    expect(published).not.toBe(created);
+    expect(await digestAt(CA_DAYS - CA_RENEW_DAYS + CA_OVERLAP_DAYS + 2)).toBe(published);
+    const retired = await digestAt(CA_DAYS + 1);
+    expect(retired).not.toBe(published);
   });
 
   it('keeps the hosts wired while the pull Secret cannot be recreated', async () => {

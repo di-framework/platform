@@ -246,7 +246,8 @@ export interface TenantAuthInputs {
   /**
    * The controller's serving leaf certificate and key, the CA certificate that issued it and the
    * CA key (PEM). During a CA rotation (#170) `caNext` is the successor that does not sign yet and
-   * `caPrevious` the CA that `caCert` replaced; clients trust all of them (see `trustBundle`).
+   * `caPrevious` the CA that `caCert` replaced; clients trust all of them (see
+   * `controllerTrustBundle`).
    * The CA keys are kept in a platform-namespace Secret nothing mounts.
    */
   tls: {
@@ -2156,21 +2157,7 @@ function tenantAuthResources(
       }),
     );
   result.push(
-    make('v1', 'ConfigMap', TENANT_MEMBERS_CONFIG, namespace, {
-      data: { members: JSON.stringify(members) },
-    }),
-    // Every CA of a rotation, so hosts and clients that reload it accept the leaf on either side.
-    make('v1', 'ConfigMap', 'tenant-controller-ca', namespace, {
-      data: { 'ca.crt': controllerTrustBundle(inputs.tls) },
-    }),
-    make('v1', 'Secret', 'tenant-controller-tls', namespace, {
-      type: 'kubernetes.io/tls',
-      data: {
-        'tls.crt': base64(inputs.tls.cert),
-        'tls.key': base64(inputs.tls.key),
-        'ca.crt': base64(inputs.tls.caCert),
-      },
-    }),
+    // Applied first, so a CA is never published (bundle, leaf) before its key is stored (#170).
     // Not mounted by any pod: lets a leaf renewal keep the CA (and so the hosts and kubeconfigs),
     // and keeps the CA when `tenant-controller-tls` is deleted. In the platform namespace, out of
     // the tenant controller's reach.
@@ -2186,6 +2173,21 @@ function tenantAuthResources(
             }
           : {}),
         ...(inputs.tls.caPrevious ? { 'previous.crt': base64(inputs.tls.caPrevious) } : {}),
+      },
+    }),
+    make('v1', 'ConfigMap', TENANT_MEMBERS_CONFIG, namespace, {
+      data: { members: JSON.stringify(members) },
+    }),
+    // Every CA of a rotation, so hosts and clients that reload it accept the leaf on either side.
+    make('v1', 'ConfigMap', 'tenant-controller-ca', namespace, {
+      data: { 'ca.crt': controllerTrustBundle(inputs.tls) },
+    }),
+    make('v1', 'Secret', 'tenant-controller-tls', namespace, {
+      type: 'kubernetes.io/tls',
+      data: {
+        'tls.crt': base64(inputs.tls.cert),
+        'tls.key': base64(inputs.tls.key),
+        'ca.crt': base64(inputs.tls.caCert),
       },
     }),
   );
