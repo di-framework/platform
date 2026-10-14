@@ -57,7 +57,7 @@ export async function discover(issuer: string, doFetch: Fetch = fetch): Promise<
     if (!metadata[field]) throw new OidcError(`discovery at ${issuer} lacks ${field}`);
   }
   // OIDC Discovery 1.0 section 4.3 / RFC 8414 section 3.3: the document must name the issuer asked for.
-  if (metadata.issuer?.replace(/\/+$/, '') !== issuer.replace(/\/+$/, '')) {
+  if (String(metadata.issuer).replace(/\/+$/, '') !== issuer.replace(/\/+$/, '')) {
     throw new OidcError(`discovery at ${issuer} names a different issuer`);
   }
   // The CLI only ever talks to the issuer it was pointed at: a document that names endpoints
@@ -181,7 +181,7 @@ export async function revokeToken(
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ token, client_id: clientId }),
   };
-  const response = await doFetch(endpoint.href, init);
+  const response = await doFetch(endpoint.href, init); // NOSONAR: CLI sends its own token to the configured issuer, origin verified above
   if (!response.ok) {
     throw new OidcError(`revocation endpoint returned ${response.status}`);
   }
