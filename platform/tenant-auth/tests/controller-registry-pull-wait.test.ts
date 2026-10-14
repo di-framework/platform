@@ -90,6 +90,18 @@ describe('host pulls wait for the registry', () => {
       ...init,
       headers: { authorization: 'Basic eDpvaw==' },
     });
+  /** Starts a pull, lets its client go away after 100 ms, and expects a prompt 502. */
+  const expectAbortedPullFails = async (path: string) => {
+    const controller = make();
+    controller.proxyUpstream = () => origin;
+    const client = new AbortController();
+    const pending = controller.handleRegistryPull(pullRequest(path, { signal: client.signal }));
+    await Bun.sleep(100);
+    client.abort();
+    const started = Date.now();
+    expect((await pending).status).toBe(502);
+    expect(Date.now() - started).toBeLessThan(500);
+  };
   const events: Record<string, unknown>[] = [];
   let log: ReturnType<typeof spyOn>;
   beforeAll(() => {
@@ -209,16 +221,8 @@ describe('host pulls wait for the registry', () => {
   });
 
   test('a client that goes away while a 503 body is read gets the failure path', async () => {
-    const controller = make();
-    controller.proxyUpstream = () => origin;
     const path = '/v2/acme/gone/stalled-503';
-    const client = new AbortController();
-    const pending = controller.handleRegistryPull(pullRequest(path, { signal: client.signal }));
-    await Bun.sleep(100);
-    client.abort();
-    const started = Date.now();
-    expect((await pending).status).toBe(502);
-    expect(Date.now() - started).toBeLessThan(500);
+    await expectAbortedPullFails(path);
     expect(hits.get(path)).toBe(1);
   });
 
@@ -382,16 +386,8 @@ describe('host pulls wait for the registry', () => {
   });
 
   test('a pull whose client goes away stops waiting', async () => {
-    const controller = make();
-    controller.proxyUpstream = () => origin;
     const path = '/v2/acme/gone/never';
-    const client = new AbortController();
-    const pending = controller.handleRegistryPull(pullRequest(path, { signal: client.signal }));
-    await Bun.sleep(100);
-    client.abort();
-    const started = Date.now();
-    expect((await pending).status).toBe(502);
-    expect(Date.now() - started).toBeLessThan(500);
+    await expectAbortedPullFails(path);
     const count = hits.get(path) ?? 0;
     await Bun.sleep(600);
     expect(hits.get(path)).toBe(count);
