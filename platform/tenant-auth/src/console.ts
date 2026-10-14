@@ -306,23 +306,27 @@ export class Console {
       if (logs?.[1]) return await this.logs(session, logs[1]);
       return html(message('Not found', `${url.pathname} is not a page here.`, true), 404);
     } catch (error) {
-      if (error instanceof HttpError) {
+      // A 5xx (the controller or identity provider failing) can carry upstream text: like any
+      // unexpected error, its detail stays in the log and the user sees a generic page.
+      if (error instanceof HttpError && error.status < 500) {
         this.audit('request.denied', { route, status: error.status, reason: error.message });
         return api
           ? json({ error: error.message }, error.status)
           : html(message('Access denied', error.message, true), error.status);
       }
       // The detail stays in the server log; the page must not echo internal error text.
-      this.audit('request.failed', { route, reason: String(error) });
+      const failed = error instanceof HttpError ? error.status : 500;
+      const reason = error instanceof HttpError ? error.message : String(error);
+      this.audit('request.failed', { route, status: failed, reason });
       return api
-        ? json({ error: 'internal error' }, 500)
+        ? json({ error: 'internal error' }, failed)
         : html(
             message(
               'Something went wrong',
               'The console could not complete the request. Try again later.',
               true,
             ),
-            500,
+            failed,
           );
     }
   }

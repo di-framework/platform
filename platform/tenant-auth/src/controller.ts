@@ -681,9 +681,11 @@ export class Controller {
           error.status === 401 ? 'Unauthorized' : 'Forbidden',
           error.message,
         );
+      // The reason can name ServiceAccounts, namespaces, RBAC text, or the API server URL: it
+      // stays in the audit, and the caller gets a fixed message (platform#84).
       const reason = error instanceof KubeError ? error.message : String(error);
       this.audit('request.failed', { user: principal.user, path: url.pathname, reason });
-      return status(502, 'ServiceUnavailable', reason);
+      return status(502, 'ServiceUnavailable', 'the cluster request failed');
     }
   }
 

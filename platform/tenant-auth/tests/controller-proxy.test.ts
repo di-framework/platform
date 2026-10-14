@@ -385,7 +385,19 @@ describe('Controller', () => {
     const unmintable = await call('GET', '/api/v1/namespaces/di-tenant-acme/pods');
     api.state.mintFails = false;
     expect(unmintable.status).toBe(502);
-    expect(((await unmintable.json()) as { message: string }).message).toContain('not found');
+    // The mint failure names the ServiceAccount and platform namespace: it stays in the audit.
+    const body = await unmintable.text();
+    expect(JSON.parse(body)).toMatchObject({
+      reason: 'ServiceUnavailable',
+      message: 'the cluster request failed',
+    });
+    expect(body).not.toContain('di-user-alice');
+    expect(body).not.toContain('not found');
+    const audit = (log.mock.calls as unknown[][])
+      .map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
+      .findLast((entry) => entry.event === 'request.failed');
+    expect(audit).toMatchObject({ user: 'alice', path: '/api/v1/namespaces/di-tenant-acme/pods' });
+    expect(String(audit?.reason)).toContain('di-user-alice');
   });
 
   test('manages API keys and lists members', async () => {
@@ -484,5 +496,60 @@ describe('Controller.start', () => {
     } finally {
       if (saved !== undefined) process.env.KUBERNETES_SERVICE_HOST = saved;
     }
+  });
+});
+
+describe('Controller upstream failures (#84)', () => {
+  const alice: Principal = {
+    user: 'alice',
+    account: 'acme',
+    role: 'developer',
+    via: 'identity',
+    credentialId: 's',
+  };
+  // Nothing listens here: every API server call is a network error.
+  const unreachable = serve(() => json({}));
+  const server = unreachable.url;
+  unreachable.stop();
+  const kube = new KubeClient({ server, token: 'admin' }, 'wasmcloud');
+  const controller = new Controller(
+    configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme' }),
+    kube,
+    { issuer: 'https://issuer.test' } as never,
+    { resolve: async () => alice, forget: () => {} } as never,
+    { kube, namespace: 'di-runtime-acme', tenant: 'acme' },
+  );
+  let log: ReturnType<typeof spyOn<typeof console, 'log'>>;
+  beforeAll(() => {
+    log = spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterAll(() => log.mockRestore());
+
+  test('a network error answers a generic 502 and logs the detail', async () => {
+    const response = await controller.handle(
+      new Request('https://controller.test/api/v1/namespaces/di-tenant-acme/pods', {
+        headers: { authorization: 'Bearer ok' },
+      }),
+    );
+    expect(response.status).toBe(502);
+    const body = await response.text();
+    expect(JSON.parse(body)).toEqual({
+      kind: 'Status',
+      apiVersion: 'v1',
+      metadata: {},
+      status: 'Failure',
+      reason: 'ServiceUnavailable',
+      message: 'the cluster request failed',
+      code: 502,
+    });
+    // Neither the API server address, the ServiceAccount, nor the raw error reaches the caller.
+    expect(body).not.toContain(new URL(server).host);
+    expect(body).not.toContain('di-user-alice');
+    expect(body).not.toContain('Error');
+    const audit = log.mock.calls
+      .map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
+      .find((entry) => entry.event === 'request.failed');
+    expect(audit).toMatchObject({ user: 'alice', path: '/api/v1/namespaces/di-tenant-acme/pods' });
+    expect(String(audit?.reason)).toContain('could not mint a token for alice');
   });
 });
