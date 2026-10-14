@@ -394,6 +394,61 @@ describe('run', () => {
     expect(err.some((line) => line.includes('warning: failed to revoke token'))).toBe(true);
   });
 
+  const identityCredential = () => ({
+    acme: {
+      ...credential,
+      via: 'identity' as const,
+      apiKey: undefined,
+      accessToken: 'expired',
+      refreshToken: 'rt',
+      expiresAt: '2000-01-01T00:00:00Z',
+      issuer: 'https://issuer.test',
+      clientId: 'tenant-cli',
+    },
+  });
+
+  const expectWarnedAndForgotten = () => {
+    expect(readStore(env)).toEqual({});
+    expect(err.at(-1)).toBe('Logged out of acme.');
+    expect(err.some((line) => line.startsWith('warning: failed to revoke token'))).toBe(true);
+    for (const line of err) {
+      expect(line).not.toContain('rt');
+      expect(line).not.toContain('expired');
+    }
+  };
+
+  test('logout warns and forgets the credential when revocation returns non-2xx', async () => {
+    writeStore(identityCredential(), env);
+    const { fetch: issuerFetch } = fakeFetch({
+      'GET /.well-known/openid-configuration': () => json(issuer),
+      'POST /oauth2/revoke': () => new Response('down', { status: 503 }),
+    });
+    expect(await run(['logout'], io(issuerFetch))).toBe(0);
+    expectWarnedAndForgotten();
+  });
+
+  test('logout warns and forgets the credential when the revoke request throws', async () => {
+    writeStore(identityCredential(), env);
+    const { fetch: base } = fakeFetch({
+      'GET /.well-known/openid-configuration': () => json(issuer),
+    });
+    const flaky = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith('/oauth2/revoke')) throw new TypeError('offline');
+      return base(input, init);
+    }) as unknown as typeof globalThis.fetch;
+    expect(await run(['logout'], io(flaky))).toBe(0);
+    expectWarnedAndForgotten();
+  });
+
+  test('logout warns and forgets the credential when discovery fetch rejects', async () => {
+    writeStore(identityCredential(), env);
+    const down = (async () => {
+      throw new TypeError('unreachable');
+    }) as unknown as typeof globalThis.fetch;
+    expect(await run(['logout'], io(down))).toBe(0);
+    expectWarnedAndForgotten();
+  });
+
   test('whoami prints a line or JSON', async () => {
     const who = { user: 'alice', account: 'acme', role: 'developer', via: 'api-key' };
     const { fetch } = fakeFetch({ 'GET /v1/auth/whoami': () => json(who) });

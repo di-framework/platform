@@ -158,7 +158,7 @@ export function refreshTokens(
   );
 }
 
-/** RFC 7009; revoking the refresh token ends the whole authorization. Failures are ignored. */
+/** RFC 7009; revoking the refresh token ends the whole authorization. Throws if revocation fails. */
 export async function revokeToken(
   metadata: ProviderMetadata,
   clientId: string,
@@ -166,13 +166,12 @@ export async function revokeToken(
   doFetch: Fetch = fetch,
 ): Promise<void> {
   const endpoint = metadata.revocation_endpoint ?? `${metadata.issuer}/oauth2/revoke`;
-  try {
-    await doFetch(endpoint, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ token, client_id: clientId }),
-    });
-  } catch {
-    // The credential is forgotten locally either way; the token expires on its own.
+  const response = await doFetch(endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ token, client_id: clientId }),
+  });
+  if (!response.ok) {
+    throw new OidcError(`revocation endpoint returned ${response.status}`);
   }
 }
