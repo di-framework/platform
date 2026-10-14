@@ -171,11 +171,13 @@ export async function revokeToken(
   if (endpoint.origin !== issuer.origin) {
     throw new OidcError('revocation endpoint is not on the issuer origin');
   }
-  const response = await doFetch(endpoint.href, {
+  const init = {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ token, client_id: clientId }),
-  });
+  };
+  // The origin was verified against the issuer above.
+  const response = await doFetch(endpoint.href, init); // NOSONAR
   if (!response.ok) {
     throw new OidcError(`revocation endpoint returned ${response.status}`);
   }
