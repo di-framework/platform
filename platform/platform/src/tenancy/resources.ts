@@ -8,7 +8,9 @@ import {
   REGISTRY_NATS_AUTH_ANNOTATION,
   REGISTRY_NATS_MIGRATION,
   REGISTRY_NATS_MIGRATION_COMPONENT,
+  REGISTRY_NATS_MIGRATION_DEADLINE_SECONDS,
   REGISTRY_NATS_MIGRATION_JOB,
+  REGISTRY_NATS_MIGRATION_LIMITS,
   REGISTRY_NATS_MIGRATION_SCRIPT,
   REGISTRY_NATS_MOUNT,
   REGISTRY_NATS_PASSWORD_ENV,
@@ -262,31 +264,38 @@ export interface TenantAuthInputs {
    */
   hostPullToken?: string;
   /**
-   * The registry's NATS account (#159): `migrating` while the Job moves its object store (the
-   * registry is stopped meanwhile, so no write lands in the store being moved), `credentials`
+   * The registry's NATS account (#159): `stopped` from the moment the controller stops the
+   * registry for the move of its object store until it can use its credentials, `credentials`
    * once the store is in its account. Absent, the registry stays anonymous in `TENANT`.
    */
   registryNats?: RegistryNatsMode;
 }
 /** How the registry's blobstore entry reaches `di-nats` (#159); see {@link TenantAuthInputs}. */
-export type RegistryNatsMode = 'migrating' | 'credentials';
+export type RegistryNatsMode = 'stopped' | 'credentials';
+/**
+ * Where the move of the registry's object store into its NATS account stands (#159):
+ * - `rollout`: `di-nats` and the hosts roll out with the account and the mount; the registry
+ *   still runs anonymously in `TENANT`.
+ * - `stopping`: both rolled out; the registry is stopped, and no Job exists until a later pass
+ *   has observed it stopped (no replica and no Workload left).
+ * - `migrating`: the migration Job exists or is created; the registry stays stopped.
+ * - `migrated`: the store is in `REGISTRY` (the Job succeeded or the marker says so).
+ */
+export type RegistryNatsStage = 'rollout' | 'stopping' | 'migrating' | 'migrated';
 /**
  * The registry's NATS account on `di-nats` (#159), decided by the platform controller. Present
- * while `tenantAuth.registry` is set and the host image carries wash patch 0003: the `REGISTRY`
- * account, its credentials Secret and the hosts' read-only mount of it are rendered.
+ * while `tenantAuth.registry` is set and either the host image is a known build with wash patch
+ * 0003 or the move already started: the `REGISTRY` account, its credentials Secret and the hosts'
+ * read-only mount of it are rendered.
  */
 export interface RegistryNats {
   /** The registry user's password: the one in `di-nats-registry` while well formed, or new. */
   password: string;
-  /** The registry's object store is in its account (the `di-nats-registry-migration` marker). */
-  migrated: boolean;
-  /**
-   * The migration Job may run: `di-nats` and the hosts are rolled out with this password, and
-   * the store has not moved yet.
-   */
-  migrate: boolean;
-  /** The migration Job gave up (its `Failed` condition); delete it to retry. */
-  failed?: boolean;
+  stage: RegistryNatsStage;
+  /** The host image is a known build with patch 0003, so the registry may use the credentials. */
+  credentials: boolean;
+  /** Why the migration Job failed (its `Failed` condition); delete the Job to retry. */
+  failed?: string;
 }
 /**
  * How the tenant hosts pull from their registry (#83 `:host-pull`), rendered once the registry
@@ -824,8 +833,20 @@ const editVerbs = [...readVerbs, 'create', 'update', 'patch', 'delete'];
  * The controller raises it only in the tenant-auth step, right before it applies those
  * Deployments, and keeps it raised only while they exist (#121).
  */
-function runtimeQuota(tenant: Tenant, cfg: ControllerConfig, withTenantAuth: boolean): Resource {
+function runtimeQuota(
+  tenant: Tenant,
+  cfg: ControllerConfig,
+  withTenantAuth: boolean,
+  /** The registry NATS migration Job's limits are added while it runs (#159). */
+  withMigration = false,
+): Resource {
   const resources = tenant.spec.resources ?? {};
+  const cpu = withTenantAuth
+    ? addQuantity(resources.cpu ?? '2', TENANT_AUTH_LIMITS.cpu, 'm')
+    : (resources.cpu ?? '2');
+  const memory = withTenantAuth
+    ? addQuantity(resources.memory ?? '4Gi', TENANT_AUTH_LIMITS.memory, 'Mi')
+    : (resources.memory ?? '4Gi');
   return resource(
     tenant,
     cfg.installation,
@@ -836,12 +857,12 @@ function runtimeQuota(tenant: Tenant, cfg: ControllerConfig, withTenantAuth: boo
     {
       spec: {
         hard: {
-          'limits.cpu': withTenantAuth
-            ? addQuantity(resources.cpu ?? '2', TENANT_AUTH_LIMITS.cpu, 'm')
-            : (resources.cpu ?? '2'),
-          'limits.memory': withTenantAuth
-            ? addQuantity(resources.memory ?? '4Gi', TENANT_AUTH_LIMITS.memory, 'Mi')
-            : (resources.memory ?? '4Gi'),
+          'limits.cpu': withMigration
+            ? addQuantity(cpu, REGISTRY_NATS_MIGRATION_LIMITS.cpu, 'm')
+            : cpu,
+          'limits.memory': withMigration
+            ? addQuantity(memory, REGISTRY_NATS_MIGRATION_LIMITS.memory, 'Mi')
+            : memory,
           pods: '20',
           // Aggregate compute/storage budget for runtime + controller-managed di-bs-* backends.
           // Per-service sizing still comes from BackingServiceClass parametersSchema (#450).
@@ -962,6 +983,9 @@ function tenantResources(
   ) => resource(tenant, cfg.installation, apiVersion, kind, name, namespace, body);
   const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
   const replicas = suspended ? 0 : (tenant.spec.runtime?.replicas ?? 1);
+  // The migration Job (#159) is rendered, and its pod fits the runtime quota, only while the move
+  // is under way.
+  const migrationJob = registryNats?.stage === 'migrating' && !suspended;
   const workloadRead = {
     apiGroups: ['runtime.wasmcloud.dev'],
     resources: ['workloaddeployments', 'workloads', 'workloadreplicasets', 'artifacts'],
@@ -969,7 +993,7 @@ function tenantResources(
   };
   const result = [
     tenantQuota(tenant, cfg, registryQuota),
-    runtimeQuota(tenant, cfg, tenantAuthQuota),
+    runtimeQuota(tenant, cfg, tenantAuthQuota, migrationJob),
     make('rbac.authorization.k8s.io/v1', 'Role', 'di-developer', n.namespace, {
       rules: [
         workloadRead,
@@ -1485,14 +1509,13 @@ function tenantResources(
       }),
     );
   }
-  if (registryNats?.migrated)
+  if (registryNats?.stage === 'migrated')
     result.push(
       make('v1', 'ConfigMap', REGISTRY_NATS_MIGRATION, n.runtimeNamespace, {
         data: { state: 'complete' },
       }),
     );
-  else if (registryNats?.migrate && !suspended)
-    result.push(registryNatsMigrationJob(make, n.runtimeNamespace));
+  else if (migrationJob) result.push(registryNatsMigrationJob(make, n.runtimeNamespace));
   return result;
 }
 /**
@@ -1517,6 +1540,9 @@ function registryNatsMigrationJob(
   return make('batch/v1', 'Job', REGISTRY_NATS_MIGRATION_JOB, namespace, {
     spec: {
       backoffLimit: 10,
+      // A Job that cannot start (quota, scheduling) or hangs ends Failed (DeadlineExceeded), so
+      // the stopped registry is reported as RegistryMigrationFailed instead of waiting forever.
+      activeDeadlineSeconds: REGISTRY_NATS_MIGRATION_DEADLINE_SECONDS,
       ttlSecondsAfterFinished: 86400,
       template: {
         metadata: { labels: { [`${GROUP}/component`]: REGISTRY_NATS_MIGRATION_COMPONENT } },
@@ -1542,7 +1568,7 @@ function registryNatsMigrationJob(
               ],
               resources: {
                 requests: { cpu: '10m', memory: '32Mi' },
-                limits: { cpu: '250m', memory: '128Mi' },
+                limits: REGISTRY_NATS_MIGRATION_LIMITS,
               },
               securityContext: {
                 allowPrivilegeEscalation: false,
@@ -2250,9 +2276,9 @@ function tenantAuthResources(
  * names, and the hosts trust the tenant CA through `--http-client-ca-path`.
  *
  * `nats` (#159): with `credentials` the blobstore entry logs in to the registry's own NATS
- * account from the files of the hosts' read-only Secret mount; while `migrating` the registry is
- * stopped, so nothing writes to the store the Job moves; absent, it connects anonymously and lands
- * in the `TENANT` account.
+ * account from the files of the hosts' read-only Secret mount; while `stopped` it does not run,
+ * so nothing writes to the store the Job moves and nothing recreates it in `TENANT`; absent, it
+ * connects anonymously and lands in the `TENANT` account.
  */
 function registryWorkload(
   tenant: Tenant,
@@ -2264,7 +2290,7 @@ function registryWorkload(
   const name = tenant.metadata.name;
   const n = names(name);
   const suspended =
-    tenant.spec.suspended || !!tenant.metadata.deletionTimestamp || nats === 'migrating';
+    tenant.spec.suspended || !!tenant.metadata.deletionTimestamp || nats === 'stopped';
   const whoami = `${registryWhoamiHost(name)}:${WHOAMI_PORT}`;
   const value = resource(
     tenant,

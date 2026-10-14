@@ -1,4 +1,6 @@
 import { describe, expect, it, spyOn } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   admissionResources,
   type HostInterfaceLike,
@@ -8,18 +10,26 @@ import {
   WORKLOAD_HOST_PATH_MESSAGE,
   workloadHostPathsAllowed,
 } from '../src/tenancy/admission';
-import { type Api, ApiError, Controller, collection } from '../src/tenancy/controller';
+import {
+  type Api,
+  ApiError,
+  Controller,
+  collection,
+  registryNatsCondition,
+} from '../src/tenancy/controller';
 import { controllerClusterRoleRules } from '../src/tenancy/install';
 import {
   hostImageSupportsNatsCredentials,
   JETSTREAM_ACCOUNT_INIT_SCRIPT,
   NATS_BOX_IMAGE,
+  NATS_CREDENTIALS_HOST_IMAGE_DIGESTS,
   newRegistryNatsPassword,
-  PRE_NATS_CREDENTIALS_HOST_IMAGE_DIGESTS,
   REGISTRY_NATS_AUTH_ANNOTATION,
   REGISTRY_NATS_MIGRATION,
   REGISTRY_NATS_MIGRATION_COMPONENT,
+  REGISTRY_NATS_MIGRATION_DEADLINE_SECONDS,
   REGISTRY_NATS_MIGRATION_JOB,
+  REGISTRY_NATS_MIGRATION_LIMITS,
   REGISTRY_NATS_MIGRATION_SCRIPT,
   REGISTRY_NATS_MOUNT,
   REGISTRY_NATS_PASSWORD,
@@ -69,10 +79,13 @@ const auth: TenantAuthConfig = {
     publicUrl: 'https://registry.{tenant}.localhost:28180',
   },
 };
+/** The pinned canonical tenant host build with wash patch 0003 (#336). */
+const HOST_0003 =
+  'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab';
 const cfg: ControllerConfig = {
   installation: 'test',
   namespace: 'wasmcloud',
-  hostImage: 'wash:test',
+  hostImage: HOST_0003,
   schedulerNatsUrl: 'nats://nats:4222',
   routeUrlPattern: 'http://{host}.{tenant}.localhost:28180',
   tenantAuth: auth,
@@ -228,7 +241,7 @@ describe('registry NATS account rendering (#159)', () => {
   it('renames the global account store to TENANT before di-nats starts, always', () => {
     for (const resources of [
       render(),
-      render({ password: PASSWORD, migrated: true, migrate: false }),
+      render({ password: PASSWORD, stage: 'migrated', credentials: true }),
     ]) {
       const init = template(find(resources, 'Deployment', 'di-nats')).spec.initContainers;
       expect(init).toEqual([
@@ -242,11 +255,13 @@ describe('registry NATS account rendering (#159)', () => {
     }
     // Never overwrites a TENANT store that is already there.
     expect(JETSTREAM_ACCOUNT_INIT_SCRIPT).toContain('if [ -e "$store/TENANT" ]');
+    // Both present: the step fails rather than starting on one of them.
+    expect(JETSTREAM_ACCOUNT_INIT_SCRIPT).toMatch(/both[^\n]*\n\s*exit 1/);
     expect(JETSTREAM_ACCOUNT_INIT_SCRIPT).toContain('mv "$store/\\$G" "$store/TENANT"');
   });
 
   it('feeds the password to nats-server from the Secret and to the hosts as a read-only mount', () => {
-    const resources = render({ password: PASSWORD, migrated: false, migrate: false });
+    const resources = render({ password: PASSWORD, stage: 'rollout', credentials: true });
     const secret = find(resources, 'Secret', REGISTRY_NATS_SECRET);
     expect(secret.metadata.namespace).toBe('di-runtime-alpha');
     expect(secret.type).toBe('kubernetes.io/basic-auth');
@@ -316,7 +331,7 @@ describe('registry NATS account rendering (#159)', () => {
           };
         }
       ).spec.ingress;
-    const rule = policy(render({ password: PASSWORD, migrated: false, migrate: true })).find(
+    const rule = policy(render({ password: PASSWORD, stage: 'migrating', credentials: true })).find(
       (r) =>
         r.from[0]?.podSelector.matchLabels[`${GROUP}/component`] ===
         REGISTRY_NATS_MIGRATION_COMPONENT,
@@ -326,23 +341,33 @@ describe('registry NATS account rendering (#159)', () => {
   });
 
   it('renders the Job only while the store may move, and the marker once it has', () => {
-    const waiting = render({ password: PASSWORD, migrated: false, migrate: false });
+    const waiting = render({ password: PASSWORD, stage: 'rollout', credentials: true });
     expect(has(waiting, 'Job', REGISTRY_NATS_MIGRATION_JOB)).toBe(false);
     expect(has(waiting, 'ConfigMap', REGISTRY_NATS_MIGRATION)).toBe(false);
+    // Stopping the registry renders no Job: that waits for a pass that saw it stopped.
+    const stopping = render({ password: PASSWORD, stage: 'stopping', credentials: true });
+    expect(has(stopping, 'Job', REGISTRY_NATS_MIGRATION_JOB)).toBe(false);
     const suspended = render(
-      { password: PASSWORD, migrated: false, migrate: true },
+      { password: PASSWORD, stage: 'migrating', credentials: true },
       { suspended: true },
     );
     expect(has(suspended, 'Job', REGISTRY_NATS_MIGRATION_JOB)).toBe(false);
-    const done = render({ password: PASSWORD, migrated: true, migrate: false });
+    const done = render({ password: PASSWORD, stage: 'migrated', credentials: true });
     expect(has(done, 'Job', REGISTRY_NATS_MIGRATION_JOB)).toBe(false);
     expect(find(done, 'ConfigMap', REGISTRY_NATS_MIGRATION).data).toEqual({ state: 'complete' });
 
-    const resources = render({ password: PASSWORD, migrated: false, migrate: true });
+    const resources = render({ password: PASSWORD, stage: 'migrating', credentials: true });
     const job = find(resources, 'Job', REGISTRY_NATS_MIGRATION_JOB) as Resource & {
-      spec: { backoffLimit: number; ttlSecondsAfterFinished: number; template: PodTemplate };
+      spec: {
+        backoffLimit: number;
+        activeDeadlineSeconds: number;
+        ttlSecondsAfterFinished: number;
+        template: PodTemplate;
+      };
     };
     expect(job.apiVersion).toBe('batch/v1');
+    // A Job the quota or scheduler never admits, or that hangs, ends Failed.
+    expect(job.spec.activeDeadlineSeconds).toBe(REGISTRY_NATS_MIGRATION_DEADLINE_SECONDS);
     expect(job.metadata.namespace).toBe('di-runtime-alpha');
     expect(job.spec.backoffLimit).toBeGreaterThan(0);
     expect(job.spec.ttlSecondsAfterFinished).toBe(86400);
@@ -370,6 +395,33 @@ describe('registry NATS account rendering (#159)', () => {
       },
     ]);
     expect(JSON.stringify(job)).not.toContain(PASSWORD);
+    expect((container as unknown as { resources: { limits: unknown } }).resources.limits).toEqual(
+      REGISTRY_NATS_MIGRATION_LIMITS,
+    );
+  });
+
+  it('raises the runtime quota by the Job limits only while the Job is rendered', () => {
+    const hard = (resources: Resource[]) =>
+      (
+        find(resources, 'ResourceQuota', 'di-runtime-quota').spec as {
+          hard: Record<string, string>;
+        }
+      ).hard;
+    expect(hard(render())).toMatchObject({ 'limits.cpu': '2', 'limits.memory': '4Gi' });
+    for (const stage of ['rollout', 'stopping', 'migrated'] as const)
+      expect(hard(render({ password: PASSWORD, stage, credentials: true }))).toMatchObject({
+        'limits.cpu': '2',
+        'limits.memory': '4Gi',
+      });
+    expect(
+      hard(render({ password: PASSWORD, stage: 'migrating', credentials: true })),
+    ).toMatchObject({ 'limits.cpu': '2250m', 'limits.memory': '4224Mi' });
+    // Suspended: no Job, no raise.
+    expect(
+      hard(
+        render({ password: PASSWORD, stage: 'migrating', credentials: true }, { suspended: true }),
+      ),
+    ).toMatchObject({ 'limits.cpu': '2' });
   });
 
   it('switches the registry entry to the mounted credentials only once the store moved', () => {
@@ -378,8 +430,8 @@ describe('registry NATS account rendering (#159)', () => {
       url: 'nats://di-nats.di-runtime-alpha.svc.cluster.local:4222',
     });
     expect((registryWorkload() as Workload).spec.replicas).toBe(1);
-    // While the Job copies, the registry is stopped and still anonymous.
-    const migrating = registryWorkload('migrating') as Workload;
+    // While the move is under way, the registry is stopped and still anonymous.
+    const migrating = registryWorkload('stopped') as Workload;
     expect(migrating.spec.replicas).toBe(0);
     expect(blobstoreOf(migrating).config).toEqual(blobstoreOf(registryWorkload()).config);
     const switched = registryWorkload('credentials') as Workload;
@@ -414,22 +466,38 @@ describe('registry NATS account rendering (#159)', () => {
       expect(REGISTRY_NATS_PASSWORD.test(bad)).toBe(false);
   });
 
-  it('knows the published host images without wash patch 0003', () => {
-    for (const digest of PRE_NATS_CREDENTIALS_HOST_IMAGE_DIGESTS)
-      expect(
-        hostImageSupportsNatsCredentials(`ghcr.io/di-framework/wash:2.8.0-wasi-tls@${digest}`),
-      ).toBe(false);
-    // The current default predates 0003 until the pin lands; the registry stays anonymous on it.
-    // (`DEFAULT_HOST_IMAGE` in src/index.ts, asserted in platform.test.ts.)
-    expect(
-      hostImageSupportsNatsCredentials(
-        'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad',
-      ),
-    ).toBe(false);
-    expect(
-      hostImageSupportsNatsCredentials(`ghcr.io/di-framework/wash@sha256:${'c'.repeat(64)}`),
-    ).toBe(true);
-    expect(hostImageSupportsNatsCredentials('wash:test')).toBe(true);
+  it('trusts only the pinned host builds known to carry wash patch 0003 (fail closed)', () => {
+    expect(NATS_CREDENTIALS_HOST_IMAGE_DIGESTS).toEqual([
+      'sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab',
+      'sha256:da38d84b52a6327e02febe7172a466f628b1d923944ebf50171f1df630ec37a9',
+    ]);
+    for (const image of [
+      HOST_0003,
+      'ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:da38d84b52a6327e02febe7172a466f628b1d923944ebf50171f1df630ec37a9',
+    ])
+      expect(hostImageSupportsNatsCredentials(image)).toBe(true);
+    for (const image of [
+      // Earlier published builds, before 0003.
+      'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad',
+      'ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:0ee414e9db4b0d4fc923eb477f1b1afd20f707b8ab3e552957575ff4f8e6a528',
+      'ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:4214f5318638fe29c0aecf484c4cdeb04ab4859c93f8c728727348381631bdf3',
+      // Unknown digests, tags alone, and look-alikes.
+      `ghcr.io/di-framework/wash@sha256:${'c'.repeat(64)}`,
+      'ghcr.io/di-framework/wash:2.8.0-wasi-tls',
+      'wash:test',
+      'sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab',
+      `${HOST_0003}x`,
+      `${HOST_0003.replace('@', ':')}`,
+    ])
+      expect(hostImageSupportsNatsCredentials(image)).toBe(false);
+  });
+
+  it('pins the platform default host image to a 0003 build', () => {
+    // Read from the source so the test does not load src/index.ts (Pulumi) into coverage.
+    const index = readFileSync(join(import.meta.dir, '../src/index.ts'), 'utf8');
+    const image = /export const DEFAULT_HOST_IMAGE =\s*'([^']+)'/.exec(index)?.[1];
+    expect(image).toBe(HOST_0003);
+    expect(hostImageSupportsNatsCredentials(must(image, 'DEFAULT_HOST_IMAGE'))).toBe(true);
   });
 
   it('keeps the migration script from printing or passing the password on a command line', () => {
@@ -963,8 +1031,69 @@ const succeed = (api: FakeApi) => {
   job.status = { succeeded: 1, conditions: [{ type: 'Complete', status: 'True' }] };
 };
 
+const WORKLOADS = 'runtime.wasmcloud.dev/v1alpha1';
+const jobOf = (api: FakeApi) => api.get('batch/v1', 'Job', REGISTRY_NATS_MIGRATION_JOB);
+const quota = (api: FakeApi) =>
+  (
+    must(api.get('v1', 'ResourceQuota', 'di-runtime-quota'), 'quota').spec as {
+      hard: Record<string, string>;
+    }
+  ).hard;
+/** A running registry instance as the wasmCloud operator records it: set and workload. */
+const seedRegistryInstance = (api: FakeApi) => {
+  const deployment = registry(api);
+  api.seed({
+    apiVersion: WORKLOADS,
+    kind: 'WorkloadReplicaSet',
+    metadata: {
+      name: 'di-tenant-registry-abc',
+      namespace: 'di-tenant-alpha',
+      uid: 'set-uid',
+      ownerReferences: [
+        {
+          kind: 'WorkloadDeployment',
+          name: REGISTRY_WORKLOAD,
+          uid: must(deployment.metadata.uid, 'uid'),
+          controller: true,
+        },
+      ],
+    },
+    spec: { replicas: 1 },
+    status: { replicas: 1 },
+  } as Resource);
+  api.seed({
+    apiVersion: WORKLOADS,
+    kind: 'Workload',
+    metadata: {
+      name: 'di-tenant-registry-abc-xyz',
+      namespace: 'di-tenant-alpha',
+      ownerReferences: [
+        {
+          kind: 'WorkloadReplicaSet',
+          name: 'di-tenant-registry-abc',
+          uid: 'set-uid',
+          controller: true,
+        },
+      ],
+    },
+  } as Resource);
+};
+const setPath = `${collection(WORKLOADS, 'WorkloadReplicaSet', 'di-tenant-alpha')}/di-tenant-registry-abc`;
+const workloadPath = `${collection(WORKLOADS, 'Workload', 'di-tenant-alpha')}/di-tenant-registry-abc-xyz`;
+const jobPath = `${collection('batch/v1', 'Job', 'di-runtime-alpha')}/${REGISTRY_NATS_MIGRATION_JOB}`;
+const OLD_HOST =
+  'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad';
+const quietly = async <T>(run: () => Promise<T>): Promise<T> => {
+  const warn = spyOn(console, 'warn').mockImplementation(() => {});
+  try {
+    return await run();
+  } finally {
+    warn.mockRestore();
+  }
+};
+
 describe('controller: registry NATS account and migration (#159)', () => {
-  it('rolls out the account, then stops the registry and runs the Job, then switches it', async () => {
+  it('stops the registry, and creates the Job only on a later pass that saw it stopped', async () => {
     const { api, t, controller } = cluster();
     // Until di-nats and the hosts rolled out with the password, the registry stays anonymous.
     api.held.add('hostgroup-tenant-alpha');
@@ -972,35 +1101,78 @@ describe('controller: registry NATS account and migration (#159)', () => {
     await controller.reconcileTenant(t, []);
     const first = password(api);
     expect(first).toMatch(REGISTRY_NATS_PASSWORD);
-    expect(api.get('batch/v1', 'Job', REGISTRY_NATS_MIGRATION_JOB)).toBeUndefined();
+    expect(jobOf(api)).toBeUndefined();
     expect(registry(api).spec.replicas).toBe(1);
     expect(Object.keys(blobstoreOf(registry(api)).config ?? {})).toEqual(['backend', 'url']);
-    const natsConfig = natsConfigOf(api);
-    expect(natsConfig).toContain('REGISTRY {');
+    expect(natsConfigOf(api)).toContain('REGISTRY {');
+    seedRegistryInstance(api);
 
-    // Rolled out: the Job runs and the registry is stopped meanwhile.
+    // Rolled out: this pass stops the registry and creates no Job.
     api.held.clear();
     await controller.reconcileTenant(t, []);
-    await controller.reconcileTenant(t, []);
-    expect(api.get('batch/v1', 'Job', REGISTRY_NATS_MIGRATION_JOB)).toBeDefined();
     expect(registry(api).spec.replicas).toBe(0);
+    expect(jobOf(api)).toBeUndefined();
     expect(tenantAuthCondition(api)).toMatchObject({
       status: 'False',
       reason: 'RegistryMigrating',
+      message: expect.stringContaining('Stopping the registry'),
+    });
+    // Asked to stop, but a replica set still runs one: no Job.
+    await controller.reconcileTenant(t, []);
+    expect(jobOf(api)).toBeUndefined();
+    // The set is at zero, but its Workload is still there: no Job.
+    const set = must(api.objects.get(setPath), 'set');
+    set.spec = { replicas: 0 };
+    set.status = { replicas: 0 };
+    await controller.reconcileTenant(t, []);
+    expect(jobOf(api)).toBeUndefined();
+    expect(quota(api)['limits.cpu']).toBe('2500m');
+    // A status that lags the spec is not "stopped" either.
+    api.objects.delete(workloadPath);
+    const deployment = must(
+      api.objects.get(
+        `${collection(WORKLOADS, 'WorkloadDeployment', 'di-tenant-alpha')}/${REGISTRY_WORKLOAD}`,
+      ),
+      'registry',
+    );
+    deployment.status = { observedGeneration: 0, currentReplicas: 0 };
+    await controller.reconcileTenant(t, []);
+    expect(jobOf(api)).toBeUndefined();
+    registry(api).status = { observedGeneration: 1, currentReplicas: 0 };
+
+    // Observed stopped: the Job is created, with room for it in the runtime quota.
+    await controller.reconcileTenant(t, []);
+    expect(jobOf(api)).toBeDefined();
+    expect(registry(api).spec.replicas).toBe(0);
+    expect(quota(api)).toMatchObject({ 'limits.cpu': '2750m', 'limits.memory': '4672Mi' });
+    expect(tenantAuthCondition(api)).toMatchObject({
+      reason: 'RegistryMigrating',
+      message: expect.stringContaining('is moving the registry store'),
     });
 
-    // Once the Job exists, a host roll (a rotation, say) does not restart the registry under it.
+    // While the Job exists the registry stays stopped: through a host roll (a rotation, say)...
     api.held.add('hostgroup-tenant-alpha');
     await controller.reconcileTenant(t, []);
     expect(registry(api).spec.replicas).toBe(0);
+    expect(jobOf(api)).toBeDefined();
     api.held.clear();
+    // ...and through a switch to a host image without 0003, which never makes it anonymous again.
+    await quietly(() =>
+      new Controller(api, { ...cfg, hostImage: OLD_HOST }).reconcileTenant(t, []),
+    );
+    expect(registry(api).spec.replicas).toBe(0);
+    expect(jobOf(api)).toBeDefined();
+    expect(natsConfigOf(api)).toContain('REGISTRY {');
 
-    // A Job that gave up is reported; the registry stays stopped.
-    must(api.get('batch/v1', 'Job', REGISTRY_NATS_MIGRATION_JOB), 'Job').status = {
-      conditions: [{ type: 'Failed', status: 'True' }],
+    // A Job that ran out of time (quota, scheduling, a hang) is reported; the registry stays stopped.
+    must(jobOf(api), 'Job').status = {
+      conditions: [{ type: 'Failed', status: 'True', reason: 'DeadlineExceeded' }],
     };
     await controller.reconcileTenant(t, []);
-    expect(tenantAuthCondition(api)).toMatchObject({ reason: 'RegistryMigrationFailed' });
+    expect(tenantAuthCondition(api)).toMatchObject({
+      reason: 'RegistryMigrationFailed',
+      message: expect.stringContaining('(DeadlineExceeded)'),
+    });
     expect(registry(api).spec.replicas).toBe(0);
 
     // Succeeded: the marker is written and the registry runs with the mounted credentials.
@@ -1014,24 +1186,28 @@ describe('controller: registry NATS account and migration (#159)', () => {
       user_file: REGISTRY_NATS_USER_FILE,
       password_file: REGISTRY_NATS_PASSWORD_FILE,
     });
-    expect(tenantAuthCondition(api)?.reason).not.toMatch(/^RegistryMigrat/);
+    expect(tenantAuthCondition(api)?.reason).not.toMatch(/^Registry/);
+    expect(quota(api)['limits.cpu']).toBe('2500m');
     expect(password(api)).toBe(first);
 
-    // The marker holds even after the Job is cleaned up; the Job is not recreated.
-    api.objects.delete(
-      `${collection('batch/v1', 'Job', 'di-runtime-alpha')}/${REGISTRY_NATS_MIGRATION_JOB}`,
-    );
+    // The marker holds after the Job is cleaned up; the Job is not recreated.
+    api.objects.delete(jobPath);
     await controller.reconcileTenant(t, []);
-    expect(api.get('batch/v1', 'Job', REGISTRY_NATS_MIGRATION_JOB)).toBeUndefined();
+    expect(jobOf(api)).toBeUndefined();
     expect(registry(api).spec.replicas).toBe(1);
 
-    // The Job verbs it used are granted to the platform controller.
-    const granted = controllerClusterRoleRules()
-      .filter((r) => r.resources.includes('jobs'))
-      .flatMap((r) => r.verbs);
-    const used = [...api.verbs].filter((v) => v.endsWith(' jobs')).map((v) => v.slice(0, -5));
-    expect(used.sort()).toEqual(['create', 'get', 'patch']);
-    for (const verb of used) expect(granted).toContain(verb);
+    // Every verb it used on Jobs and the wasmCloud workload objects is granted to the controller.
+    const rules = controllerClusterRoleRules();
+    for (const resource of ['jobs', 'workloadreplicasets', 'workloads']) {
+      const granted = rules.filter((r) => r.resources.includes(resource)).flatMap((r) => r.verbs);
+      for (const used of [...api.verbs].filter((v) => v.endsWith(` ${resource}`)))
+        expect(granted).toContain(used.slice(0, -resource.length - 1));
+    }
+    expect([...api.verbs].filter((v) => v.endsWith(' jobs')).sort()).toEqual([
+      'create jobs',
+      'get jobs',
+      'patch jobs',
+    ]);
 
     // The password is in the credentials Secret only.
     for (const [key, value] of api.objects) {
@@ -1063,41 +1239,74 @@ describe('controller: registry NATS account and migration (#159)', () => {
     expect(password(api)).toMatch(REGISTRY_NATS_PASSWORD);
   });
 
-  it('keeps the registry anonymous in TENANT on a host image without patch 0003, and says so once', async () => {
-    const old = `ghcr.io/di-framework/wash:2.8.0-wasi-tls@${PRE_NATS_CREDENTIALS_HOST_IMAGE_DIGESTS[1]}`;
-    const { api, t, controller } = cluster({ ...cfg, hostImage: old });
-    const warn = spyOn(console, 'warn').mockImplementation(() => {});
-    try {
-      await controller.reconcileTenant(t, []);
-      await controller.reconcileTenant(t, []);
-      expect(warn).toHaveBeenCalledTimes(1);
-      expect(String(warn.mock.calls[0]?.[0])).toContain('predates wash patch 0003');
-    } finally {
-      warn.mockRestore();
+  it('keeps the registry anonymous in TENANT on a host image not known to carry 0003, and says so once', async () => {
+    for (const hostImage of [OLD_HOST, 'ghcr.io/di-framework/wash:2.8.0-wasi-tls']) {
+      const { api, t, controller } = cluster({ ...cfg, hostImage });
+      const warn = spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await controller.reconcileTenant(t, []);
+        await controller.reconcileTenant(t, []);
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(String(warn.mock.calls[0]?.[0])).toContain('not a known build with wash patch 0003');
+      } finally {
+        warn.mockRestore();
+      }
+      expect(api.get('v1', 'Secret', REGISTRY_NATS_SECRET)).toBeUndefined();
+      expect(jobOf(api)).toBeUndefined();
+      const natsConfig = natsConfigOf(api);
+      expect(natsConfig).toContain('no_auth_user: "tenant"');
+      expect(natsConfig).not.toContain('REGISTRY');
+      expect(registry(api).spec.replicas).toBe(1);
+      expect(Object.keys(blobstoreOf(registry(api)).config ?? {})).toEqual(['backend', 'url']);
+      expect(tenantAuthCondition(api)?.reason).not.toMatch(/^Registry/);
     }
-    expect(api.get('v1', 'Secret', REGISTRY_NATS_SECRET)).toBeUndefined();
-    expect(api.get('batch/v1', 'Job', REGISTRY_NATS_MIGRATION_JOB)).toBeUndefined();
-    const natsConfig = natsConfigOf(api);
-    expect(natsConfig).toContain('no_auth_user: "tenant"');
-    expect(natsConfig).not.toContain('REGISTRY');
-    expect(registry(api).spec.replicas).toBe(1);
+  });
+
+  it('keeps a moved registry stopped, never anonymous, on a host image without 0003', async () => {
+    const { api, t, controller } = cluster({ ...cfg, hostImage: OLD_HOST });
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'ConfigMap',
+      metadata: { name: REGISTRY_NATS_MIGRATION, namespace: 'di-runtime-alpha' },
+      data: { state: 'complete' },
+    });
+    await quietly(async () => {
+      await controller.reconcileTenant(t, []);
+      await controller.reconcileTenant(t, []);
+    });
+    expect(registry(api).spec.replicas).toBe(0);
     expect(Object.keys(blobstoreOf(registry(api)).config ?? {})).toEqual(['backend', 'url']);
+    expect(natsConfigOf(api)).toContain('REGISTRY {');
+    expect(jobOf(api)).toBeUndefined();
+    expect(tenantAuthCondition(api)).toMatchObject({
+      status: 'False',
+      reason: 'RegistryHostImageUnsupported',
+    });
+    // Back on a 0003 build, it runs with its credentials.
+    await controller.reconcileTenant(t, []);
+    await new Controller(api, cfg).reconcileTenant(t, []);
+    expect(registry(api).spec.replicas).toBe(1);
+    expect(blobstoreOf(registry(api)).config).toMatchObject({
+      user_file: REGISTRY_NATS_USER_FILE,
+    });
   });
 
   it('removes the credentials Secret with the registry, and keeps the marker', async () => {
     const { api, t, controller } = cluster();
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'ConfigMap',
+      metadata: { name: REGISTRY_NATS_MIGRATION, namespace: 'di-runtime-alpha' },
+      data: { state: 'complete' },
+    });
     await controller.reconcileTenant(t, []);
-    await controller.reconcileTenant(t, []);
-    succeed(api);
-    await controller.reconcileTenant(t, []);
-    expect(api.get('v1', 'ConfigMap', REGISTRY_NATS_MIGRATION)).toBeDefined();
+    expect(api.get('v1', 'Secret', REGISTRY_NATS_SECRET)).toBeDefined();
     const { registry: _registry, ...withoutRegistry } = auth;
     const off = new Controller(api, { ...cfg, tenantAuth: withoutRegistry });
     await off.reconcileTenant(t, []);
     expect(api.get('v1', 'Secret', REGISTRY_NATS_SECRET)).toBeUndefined();
     expect(api.get('v1', 'ConfigMap', REGISTRY_NATS_MIGRATION)).toBeDefined();
-    const natsConfig = natsConfigOf(api);
-    expect(natsConfig).not.toContain('REGISTRY');
+    expect(natsConfigOf(api)).not.toContain('REGISTRY');
     const host = (
       api.get('apps/v1', 'Deployment', 'hostgroup-tenant-alpha') as unknown as {
         spec: { template: PodTemplate };
@@ -1110,8 +1319,31 @@ describe('controller: registry NATS account and migration (#159)', () => {
     const { api, controller } = cluster();
     const t = tenant({ suspended: true });
     api.seed(t);
-    await controller.reconcileTenant(t, []);
-    await controller.reconcileTenant(t, []);
-    expect(api.get('batch/v1', 'Job', REGISTRY_NATS_MIGRATION_JOB)).toBeUndefined();
+    for (let pass = 0; pass < 3; pass++) await controller.reconcileTenant(t, []);
+    expect(jobOf(api)).toBeUndefined();
+  });
+
+  it('reports each stage on TenantAuthReady', () => {
+    const at = 'di-runtime-alpha';
+    const state = (stage: RegistryNats['stage'], extra: Partial<RegistryNats> = {}) => ({
+      password: PASSWORD,
+      stage,
+      credentials: true,
+      ...extra,
+    });
+    expect(registryNatsCondition(undefined, at)).toBeUndefined();
+    expect(registryNatsCondition(state('rollout'), at)).toBeUndefined();
+    expect(registryNatsCondition(state('migrated'), at)).toBeUndefined();
+    expect(registryNatsCondition(state('stopping'), at)?.reason).toBe('RegistryMigrating');
+    expect(registryNatsCondition(state('migrating'), at)?.reason).toBe('RegistryMigrating');
+    expect(
+      registryNatsCondition(state('migrating', { failed: 'BackoffLimitExceeded' }), at),
+    ).toMatchObject({
+      reason: 'RegistryMigrationFailed',
+      message: expect.stringContaining('(BackoffLimitExceeded)'),
+    });
+    expect(registryNatsCondition(state('migrated', { credentials: false }), at)?.reason).toBe(
+      'RegistryHostImageUnsupported',
+    );
   });
 });

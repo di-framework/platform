@@ -2717,9 +2717,6 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     const ca = (api.objects.get(caPath)!.data as Record<string, string>)['ca.crt']!;
     expect(host(api).spec.template.metadata.annotations).toEqual({
       'platform.di-framework.dev/registry-ca-sha256': tlsCertDigest(ca),
-      // The registry's NATS password (#159), unrelated to the pull token rotated below.
-      'platform.di-framework.dev/registry-nats-auth-sha256':
-        expect.stringMatching(/^[0-9a-f]{64}$/),
     });
     const template = JSON.stringify(host(api).spec.template);
     // The token is kept across reconciles.
@@ -2788,9 +2785,7 @@ describe('tenant registry host pull (#83:host-pull)', () => {
       api.objects.delete(hostPath);
       await new Controller(api, tlsCfg).reconcileTenant(t, []);
       expect(env(host(api)).DOCKER_CONFIG).toBe('/registry-auth');
-      expect(host(api).spec.template.metadata.annotations).not.toHaveProperty(
-        'platform.di-framework.dev/registry-ca-sha256',
-      );
+      expect(host(api).spec.template.metadata.annotations).toBeUndefined();
     } finally {
       api.fail = undefined;
       console.error = log;

@@ -67,6 +67,13 @@ export const REGISTRY_NATS_MIGRATION_COMPONENT = 'nats-migration';
 /** nats-box 0.20.0 (nats CLI 0.5.0), the multi-arch index. */
 export const NATS_BOX_IMAGE =
   'docker.io/natsio/nats-box:0.20.0@sha256:d2f04223f40e016f77922a8115d34b0cd5fad2ec10b19b39316ae92d07f3d295';
+/** The migration Job's container limits, added to the runtime quota while the Job exists. */
+export const REGISTRY_NATS_MIGRATION_LIMITS = { cpu: '250m', memory: '128Mi' } as const;
+/**
+ * How long the migration Job may take, from its start, before it ends `Failed`
+ * (`DeadlineExceeded`): also bounds a pod the quota or the scheduler never admits.
+ */
+export const REGISTRY_NATS_MIGRATION_DEADLINE_SECONDS = 3600;
 /** The registry's blobstore container (`CONTAINER_NAME` in `platform/oci-registry/src/storage.rs`). */
 export const REGISTRY_BUCKET = 'oci-registry';
 
@@ -90,23 +97,23 @@ export function registryNatsSecretData(password: string): Record<string, string>
 }
 
 /**
- * Published tenant host images built before wash patch 0003 (#330). Their NATS blobstore
- * entries ignore `user_file` / `password_file` and connect anonymously, so a registry switched
- * to its account on one of them would see an empty store. The controller keeps the registry in
- * {@link NATS_TENANT_ACCOUNT} on these and logs a warning. An image not listed (any other digest
- * or tag) is taken to carry 0003.
+ * Published tenant host images known to carry wash patch 0003 (#330), by multi-arch index digest
+ * (publish run 38613407365, labels `dev.di-framework.wash.patches` list
+ * `0003-nats-blobstore-credentials.patch`). Fail closed: on any other image, a tag-only reference
+ * or an unknown digest included, the registry stays anonymous in {@link NATS_TENANT_ACCOUNT} and
+ * the controller logs a warning, since a host without 0003 ignores `user_file` / `password_file`
+ * and would show the registry an empty store. Add each later 0003 build here when it is pinned.
  */
-export const PRE_NATS_CREDENTIALS_HOST_IMAGE_DIGESTS: readonly string[] = [
-  'sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669',
-  'sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad',
-  'sha256:5f6419bd0293fd946e44f79ca0ba7e9f03dcf5459be9e1c64f1560b52cb64f78',
-  'sha256:7c0c94291c088fa0c77b96efa37005ea58cf3eee585639935c93cf1b056d1f44',
+export const NATS_CREDENTIALS_HOST_IMAGE_DIGESTS: readonly string[] = [
+  // ghcr.io/di-framework/wash:2.8.0-wasi-tls (canonical, DEFAULT_HOST_IMAGE)
+  'sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab',
+  // ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive
+  'sha256:da38d84b52a6327e02febe7172a466f628b1d923944ebf50171f1df630ec37a9',
 ];
-/** Whether `hostImage` is not one of {@link PRE_NATS_CREDENTIALS_HOST_IMAGE_DIGESTS}. */
+/** Whether `hostImage` is pinned to one of {@link NATS_CREDENTIALS_HOST_IMAGE_DIGESTS}. */
 export function hostImageSupportsNatsCredentials(hostImage: string): boolean {
-  return !PRE_NATS_CREDENTIALS_HOST_IMAGE_DIGESTS.some((digest) =>
-    hostImage.endsWith(`@${digest}`),
-  );
+  const at = hostImage.lastIndexOf('@');
+  return at > 0 && NATS_CREDENTIALS_HOST_IMAGE_DIGESTS.includes(hostImage.slice(at + 1));
 }
 
 /**
@@ -138,13 +145,15 @@ export function natsAccountsConfig(registry: boolean): string[] {
  * Init step of `di-nats`, run before the server starts: JetStream keeps one directory per account
  * under `<store_dir>/jetstream`. Clients without credentials used the global account (`$G`) until
  * accounts were configured; they now land in {@link NATS_TENANT_ACCOUNT}, so its directory takes
- * over `$G`'s once. A `TENANT` directory that already exists is never overwritten.
+ * over `$G`'s once. When both exist (a downgrade that skipped the documented rename back, say)
+ * the step fails, so `di-nats` does not start and silently serve the older of the two stores.
  */
 export const JETSTREAM_ACCOUNT_INIT_SCRIPT = `set -eu
 store=/data/jetstream
 if [ -d "$store/\\$G" ]; then
   if [ -e "$store/${NATS_TENANT_ACCOUNT}" ]; then
-    echo "di-nats: $store/${NATS_TENANT_ACCOUNT} exists; leaving $store/\\$G in place" >&2
+    echo "di-nats: both $store/\\$G and $store/${NATS_TENANT_ACCOUNT} exist; keep the one to serve and move the other away (see the platform README)" >&2
+    exit 1
   else
     mv "$store/\\$G" "$store/${NATS_TENANT_ACCOUNT}"
     echo "di-nats: moved the JetStream store of the global account to ${NATS_TENANT_ACCOUNT}"
