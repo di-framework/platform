@@ -357,6 +357,7 @@ describe('gateway process drain under Node (#223)', () => {
     const exited = new Promise<number | null>((resolve) => child.once('exit', resolve));
     let busy: Client | undefined;
     let partial: Client | undefined;
+    let silent: Client | undefined;
     try {
       await within(listening(port), 5_000, `the gateway process to listen\n${output}`);
       busy = new Client(port);
@@ -368,6 +369,9 @@ describe('gateway process drain under Node (#223)', () => {
       await within(partial.connected(), 2_000, 'the partial client to connect');
       expect((await within(partial.get('/fast'), 2_000, 'the first response')).body).toBe('ok');
       partial.socket.write('GET /fast HTTP/1.1\r\nHo');
+      // A connection opened before SIGTERM that sends its request only afterwards.
+      silent = new Client(port);
+      await within(silent.connected(), 2_000, 'the silent client to connect');
       await Bun.sleep(50);
 
       child.kill('SIGTERM');
@@ -384,6 +388,9 @@ describe('gateway process drain under Node (#223)', () => {
       const answered = await within(partial.next(), 2_000, 'the partly sent request');
       expect(answered.body).toBe('ok');
       expect(answered.headers.connection).toBe('close');
+      const late = await within(silent.get('/fast'), 2_000, 'the silent connection request');
+      expect(late.body).toBe('ok');
+      expect(late.headers.connection).toBe('close');
 
       release();
       const res = await within(slow, 2_000, 'the in-flight response');
@@ -395,6 +402,7 @@ describe('gateway process drain under Node (#223)', () => {
       release();
       busy?.socket.destroy();
       partial?.socket.destroy();
+      silent?.socket.destroy();
       if (child.exitCode === null) child.kill('SIGKILL');
       await new Promise((resolve) => upstream.close(resolve));
     }

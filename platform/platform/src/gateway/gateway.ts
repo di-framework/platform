@@ -691,9 +691,10 @@ export async function drain(
   timeoutMs: number = DRAIN_TIMEOUT_MS,
 ): Promise<'drained' | 'timeout'> {
   const connections = connectionsOf(server);
-  // Without the edge, Node's `http.Server#close` also destroys the connections it deems idle:
-  // between requests, or accepted with no byte of a request yet. One whose request has begun is
-  // kept, as here. Behind the edge, a connection still being classified is kept and answered.
+  // Without the edge, Node's `http.Server#close` also destroys keep-alive connections between
+  // requests, as the drain does. A connection accepted but not yet sending, or partway through a
+  // request, is kept: it is answered with `Connection: close`, or closed at the bound. Behind the
+  // edge, a connection still being classified is kept and answered the same way.
   listener.close();
   let timer: NodeJS.Timeout | undefined;
   const result = await Promise.race([

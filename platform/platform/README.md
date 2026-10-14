@@ -644,12 +644,10 @@ no requests (#223):
 
 Switching is near-immediate, not instant. A WebSocket or passthrough connection opened before the
 switch keeps its old route until it closes or the 20 s drain bound ends it. No pooled upstream
-connection outlives the old pod. A client can still see a connection reset in two cases, and HTTP
-clients normally retry the request on a new connection:
-
-- it reuses a keep-alive connection just as the old pod closes it as idle;
-- without tenant-auth routes, it opened a connection to the old pod but sent no byte before
-  SIGTERM (Node's HTTP server closes such a connection as idle).
+connection outlives the old pod. A client that reuses a keep-alive connection just as the old pod
+closes it as idle can still see that connection reset; HTTP clients normally retry such a request
+on a new connection. A connection opened before SIGTERM that has not sent its request yet is kept
+and answered with `Connection: close`, or closed at the 20 s bound.
 
 Upgrading to the release that adds the annotation rolls the gateway once, and so does upgrading
 to the release that adds this drain.
