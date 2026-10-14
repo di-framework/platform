@@ -146,6 +146,11 @@ export class Console {
     { tokens: Tokens; principal: Principal; createdAt: number }
   >();
   private readonly sessions = new Map<string, Session>();
+  /**
+   * One in-flight refresh per session. identity-server rotates refresh tokens and revokes the
+   * whole family when an old one is replayed, so concurrent requests must share a single refresh.
+   */
+  private readonly refreshing = new Map<string, Promise<boolean>>();
 
   constructor(
     readonly config: ConsoleConfig,
@@ -215,20 +220,43 @@ export class Console {
       if (now > session.expiresAt) this.sessions.delete(id);
   }
 
-  private async sessionFor(request: Request): Promise<Session | undefined> {
-    const session = this.sessions.get(cookies(request)[SESSION_COOKIE] ?? '');
+  /**
+   * The signed-in session for a request, refreshing its access token when it is about to expire.
+   * Returns 'dropped' when the refresh failed: the session is gone and the user must sign in again.
+   */
+  private async sessionFor(request: Request): Promise<Session | 'dropped' | undefined> {
+    const sid = cookies(request)[SESSION_COOKIE] ?? '';
+    const session = this.sessions.get(sid);
     if (!session || session.expiresAt < Date.now()) return undefined;
     if (session.accessExpiresAt - Date.now() < 30_000 && session.refreshToken) {
+      let pending = this.refreshing.get(sid);
+      if (!pending) {
+        pending = this.refresh(sid, session, session.refreshToken).finally(() =>
+          this.refreshing.delete(sid),
+        );
+        this.refreshing.set(sid, pending);
+      }
+      if (!(await pending)) return 'dropped';
+    }
+    return session;
+  }
+
+  private async refresh(sid: string, session: Session, refreshToken: string): Promise<boolean> {
+    try {
       const fresh = fromTokens(
         await refreshTokens(this.provider, {
           clientId: this.config.clientId,
           clientSecret: this.config.clientSecret,
-          refreshToken: session.refreshToken,
+          refreshToken,
         }),
       );
       Object.assign(session, fresh);
+      return true;
+    } catch (error) {
+      this.sessions.delete(sid);
+      this.audit('session.refresh_failed', { user: session.user, reason: String(error) });
+      return false;
     }
-    return session;
   }
 
   private sameOrigin(request: Request): void {
@@ -249,13 +277,23 @@ export class Console {
           issuer: this.config.issuer,
           controller: this.controllerInfo,
         });
-      if (route === 'GET /login') return this.login(url);
+      if (route === 'GET /login') return await this.login(url);
       if (route === 'GET /oidc/callback') return await this.callback(request, url);
       if (route === 'GET /logout') return this.logout(request);
       if (route === 'POST /cli/exchange') return await this.cliExchange(request);
       if (route === 'POST /cli/refresh') return await this.cliRefresh(request);
       if (route === 'POST /cli/logout') return await this.cliLogout(request);
       const session = await this.sessionFor(request);
+      if (session === 'dropped') {
+        const clear = { 'Set-Cookie': cookie(SESSION_COOKIE, '', 0) };
+        return api
+          ? json({ error: 'the session has expired; sign in again' }, 401, clear)
+          : html(
+              landing(this.config.tenant, 'Your session has expired. Sign in again.'),
+              200,
+              clear,
+            );
+      }
       if (!session)
         return api ? json({ error: 'not signed in' }, 401) : html(landing(this.config.tenant));
       if (route === 'GET /') return await this.overview(session);
@@ -274,10 +312,18 @@ export class Console {
           ? json({ error: error.message }, error.status)
           : html(message('Access denied', error.message, true), error.status);
       }
+      // The detail stays in the server log; the page must not echo internal error text.
       this.audit('request.failed', { route, reason: String(error) });
       return api
         ? json({ error: 'internal error' }, 500)
-        : html(message('Something went wrong', String(error), true), 500);
+        : html(
+            message(
+              'Something went wrong',
+              'The console could not complete the request. Try again later.',
+              true,
+            ),
+            500,
+          );
     }
   }
 
