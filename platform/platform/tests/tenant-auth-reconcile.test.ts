@@ -2452,9 +2452,8 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     const none = host(tenantResources(tenant(), tlsCfg, schedulerSecret));
     expect(env(none)).not.toHaveProperty('DOCKER_CONFIG');
     expect(none.spec.template.metadata.annotations).toBeUndefined();
-    expect(none.spec.template.spec.containers[0]!.args).not.toContain(
-      '--oci-ca-path=/registry-ca/ca.crt',
-    );
+    const noneArgs = none.spec.template.spec.containers[0]!.args as string[];
+    expect(noneArgs.filter((arg) => arg.includes('ca-path'))).toEqual([]);
     expect(JSON.stringify(none.spec.template.spec.volumes)).not.toContain('registry-');
 
     const withCa = host(
@@ -2463,7 +2462,14 @@ describe('tenant registry host pull (#83:host-pull)', () => {
       }),
     );
     const container = withCa.spec.template.spec.containers[0]!;
-    expect(container.args).toContain('--oci-ca-path=/registry-ca/ca.crt');
+    // The tenant CA is trusted for OCI pulls and for the components' outgoing wasi:http (#113),
+    // both from the one mounted file whose digest rolls the hosts.
+    expect((container.args as string[]).filter((arg) => arg.includes('ca-path'))).toEqual([
+      '--oci-ca-path=/registry-ca/ca.crt',
+      '--http-client-ca-path=/registry-ca/ca.crt',
+    ]);
+    // Layered on the default webpki roots: the hosts' other HTTPS egress is unchanged.
+    expect((container.args as string[]).some((arg) => arg.includes('trust-roots'))).toBe(false);
     expect(container.args).not.toContain('--allow-insecure-registries');
     expect(env(withCa).DOCKER_CONFIG).toBe('/registry-auth');
     expect(withCa.spec.template.metadata.annotations).toEqual({
@@ -2682,6 +2688,7 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     expect(env(host(api)).DOCKER_CONFIG).toBe('/registry-auth');
     const args = host(api).spec.template.spec.containers[0]!.args as string[];
     expect(args).toContain('--oci-ca-path=/registry-ca/ca.crt');
+    expect(args).toContain('--http-client-ca-path=/registry-ca/ca.crt');
     expect(args).not.toContain('--allow-insecure-registries');
     expect(args.join(' ')).toContain(`--insecure-registry ${PLATFORM_REGISTRY}`);
     expect(api.objects.get(pullServicePath)).toMatchObject({

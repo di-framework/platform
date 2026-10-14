@@ -211,7 +211,8 @@ export interface TenantAuthInputs {
  * How the tenant hosts pull from their registry (#83 `:host-pull`), rendered once the registry
  * is deployed, whether or not its pull Secret exists yet: wash reads the Docker config from that
  * Secret, and over TLS trusts the tenant CA (`caDigest`, the digest of `tenant-controller-ca`, which rolls the hosts
- * when the certificate is renewed, since wash loads `--oci-ca-path` once at start).
+ * when the certificate is renewed, since wash loads `--oci-ca-path` and `--http-client-ca-path`
+ * once at start). The CA is trusted for both OCI pulls and the components' outgoing `wasi:http`.
  */
 export interface HostPull {
   caDigest?: string;
@@ -1071,8 +1072,15 @@ function tenantResources(
                     '--socket-egress=enforce',
                     // Plain HTTP only for these exact registries; never --allow-insecure-registries (#149).
                     ...(cfg.insecureRegistries ?? []).flatMap((r) => ['--insecure-registry', r]),
-                    // The tenant registry's pull Service serves the controller certificate.
-                    ...(hostPull?.caDigest ? ['--oci-ca-path=/registry-ca/ca.crt'] : []),
+                    // The tenant registry's pull Service serves the controller certificate. The
+                    // same CA is trusted for the components' outgoing wasi:http (on top of the
+                    // webpki roots), so the registry can reach the controller over https (#113).
+                    ...(hostPull?.caDigest
+                      ? [
+                          '--oci-ca-path=/registry-ca/ca.crt',
+                          '--http-client-ca-path=/registry-ca/ca.crt',
+                        ]
+                      : []),
                   ],
                   env: [
                     { name: 'HOME', value: '/tmp' },

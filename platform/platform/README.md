@@ -865,7 +865,10 @@ tenantAuth:
       `tenant-registry.di-runtime-<tenant>.svc[.cluster.local]`) on Service port 443, and the hosts
       trust the tenant CA that signed it through `--oci-ca-path=/registry-ca/ca.crt` from ConfigMap
       `tenant-controller-ca`. A CA:TRUE end-entity certificate is rejected by wash (rustls), hence the split.
-      wash loads that file once at start, so the host template carries
+      The same file is passed as `--http-client-ca-path`, so the components' outgoing `wasi:http`
+      trusts the tenant CA on top of the default webpki roots (#113): the registry can call the
+      controller over `https://`. Other HTTPS egress is verified as before.
+      wash loads both once at start, so the host template carries
       `platform.di-framework.dev/registry-ca-sha256` and a CA replacement (not a leaf renewal) rolls the hosts on
       the next poll. The listener is TLS with `insecureRegistry` too (#149): only the platform host
       group runs `--allow-insecure-registries`. Tenant hosts instead get one

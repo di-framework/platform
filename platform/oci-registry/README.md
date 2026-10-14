@@ -151,8 +151,15 @@ hyper + rustls), which verifies the server against the **host's** trust roots;
 `wasi:http/types` has no per-request field for a custom CA, and the wasi-tls
 work tracked for the tenant host (#81) concerns TLS the guest terminates or
 originates itself over `wasi:sockets`, not the host's HTTP client. So
-`https://` only works when the tenant's private CA is installed in every
-tenant host's trust store, which couples the host image to each tenant's CA.
+`https://` only works when the host trusts the tenant's private CA.
+
+wash 2.8 can do that without a per-tenant image: `wash host
+--http-client-ca-path <pem>` (`WASH_HTTP_CLIENT_CA_PATHS`) layers extra PEM
+roots on top of the default webpki roots for every component's outgoing
+`wasi:http` request, P2 and P3 alike, and is read once when the host starts.
+The platform passes it the tenant CA from ConfigMap `tenant-controller-ca`
+(the same file as `--oci-ca-path`), so tenant hosts with a registry already
+trust the controller certificate (platform#113).
 
 The component accepts either. `:reconcile` (platform#83) uses plain HTTP to a
 separate controller listener, `http://tenant-controller.di-runtime-<tenant>.svc:8789`,
@@ -163,9 +170,10 @@ tenant's host pods to it (see the `tenantAuth` section of
 controller's TLS registry front to the host is plain HTTP too, so the Basic
 credential is cleartext on the pod network before the registry sees it. Both
 hops stay cleartext unless the cluster encrypts pod traffic (CNI WireGuard or
-mesh mTLS); off-cluster, users reach the registry only over TLS. Once the
-tenant host is confirmed to accept an extra trust root, an `https://` URL
-works with no code change.
+mesh mTLS); off-cluster, users reach the registry only over TLS. Now that the
+tenant hosts trust the controller CA, an `https://` URL needs no component
+change; what keeps the callback on `8789` for now is that only that listener
+accepts the host pull token, and it serves plain HTTP (platform#113).
 
 A bracketed IPv6 authority counts as cluster-local only when it is loopback
 and is followed by nothing or by `:<digits>`; `http://[::1]evil.example` and
