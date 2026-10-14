@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -29,4 +29,38 @@ export function selfSignedCert(): { key: string; cert: string; keyPath: string; 
     keyPath,
     certPath,
   };
+}
+
+/**
+ * True when OpenSSL verifies `leaf` (PEM) as a TLS server certificate for `localhost` against the
+ * PEM trust bundle `bundle`, at time `at` (strict X.509 checks).
+ */
+export function verifiesAt(leaf: string, bundle: string, at: Date): boolean {
+  const dir = mkdtempSync(join(tmpdir(), 'verify-'));
+  try {
+    writeFileSync(join(dir, 'leaf.pem'), leaf);
+    writeFileSync(join(dir, 'bundle.pem'), bundle);
+    execFileSync(
+      'openssl',
+      [
+        'verify',
+        '-x509_strict',
+        '-purpose',
+        'sslserver',
+        '-verify_hostname',
+        'localhost',
+        '-attime',
+        String(Math.floor(at.getTime() / 1000)),
+        '-CAfile',
+        join(dir, 'bundle.pem'),
+        join(dir, 'leaf.pem'),
+      ],
+      { stdio: 'ignore' },
+    );
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }

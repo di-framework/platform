@@ -15,6 +15,7 @@ import {
   resolveClass,
   tenantNameFromNamespace,
 } from './backing-service-reconcile';
+import { LEAF_RENEW_DAYS, rotateCas } from './ca-rotation';
 import {
   approveEgress,
   EGRESS_FIELD_MANAGER,
@@ -104,6 +105,7 @@ import {
   type TenantAuthInputs,
   tenantAuthResources,
   tenantAuthRoutes,
+  tenantControllerCaSecret,
   tenantControllerCertNames,
   tenantQuota,
   tenantResources,
@@ -123,14 +125,7 @@ import {
   serviceBindingResources,
   sharedBindingConflict,
 } from './service-binding-reconcile';
-import {
-  caCertificate,
-  certificateNames,
-  certificateValid,
-  holdsCaKey,
-  issuedBy,
-  leafCertificate,
-} from './tls';
+import { certificateNames, certificateValid, issuedBy, leafCertificate } from './tls';
 import {
   STORAGE_FIELD_MANAGER,
   storageKeys,
@@ -359,9 +354,6 @@ export class KubernetesApi implements Api {
 const LOG_LOOKBACK_MS = 120_000;
 /** A generated host pull token: 32 random bytes, base64url. */
 const HOST_PULL_TOKEN = /^[A-Za-z0-9_-]{43}$/;
-/** Lifetime of the controller CA, and how long before expiry it is replaced (days). */
-const CA_DAYS = 3650;
-const CA_RENEW_DAYS = 90;
 const TENANT_AUTH_KINDS = [
   ['apps/v1', 'Deployment'],
   ['v1', 'Service'],
@@ -390,6 +382,8 @@ export class Controller {
     private readonly api: Api,
     private readonly cfg: ControllerConfig,
     private readonly resolveName: (name: string) => Promise<string[]> = resolveIpv4,
+    /** The clock certificate issuance and CA rotation (#170) read. */
+    private readonly now: () => Date = () => new Date(),
   ) {}
   private async get<T>(path: string): Promise<T | undefined> {
     try {
@@ -603,11 +597,18 @@ export class Controller {
     };
   }
   /**
-   * The controller's TLS material: a long-lived CA and a leaf it signed. Both are reused while they
-   * verify against each other (the leaf by the CA's signature and key, the CA as `CA:TRUE` with its
-   * stored key), so a leaf renewal keeps the CA and does not roll the hosts or invalidate kubeconfigs.
-   * A Secret from before the CA existed has no `ca.crt` and is replaced once. The Secrets read
-   * are recorded in `fetched`, so applying them later in the pass does not read them again.
+   * The controller's TLS material: long-lived CAs (#170) and a leaf the current one signed. The CAs
+   * and their keys live in the platform namespace ({@link tenantControllerCaSecret}), so deleting
+   * `tenant-controller-tls` reissues only the leaf. {@link rotateCas} decides which CAs to keep and
+   * overlaps them during a rotation. The leaf is reused while it verifies against the current CA,
+   * has {@link LEAF_RENEW_DAYS} left and names what it should, so a leaf renewal keeps the CA and
+   * does not roll the hosts or invalidate kubeconfigs.
+   *
+   * Until the platform-namespace Secret exists, the CA is taken from where it was kept before:
+   * `ca.crt` in `tenant-controller-tls` and `ca.key` in the runtime namespace's
+   * `tenant-controller-ca-key`, which the pass deletes once the new Secret is applied. A Secret
+   * from before the CA existed has neither and is replaced once. The Secrets read are recorded in
+   * `fetched`, so applying them later in the pass does not read them again.
    */
   private async controllerTls(
     tenant: string,
@@ -616,43 +617,57 @@ export class Controller {
   ): Promise<TenantAuthInputs['tls']> {
     const runtimeNamespace = names(tenant).runtimeNamespace;
     // One GET per Secret: several keys are decoded from each.
-    const secret = async (secretName: string) => {
-      const path = `${collection('v1', 'Secret', runtimeNamespace)}/${secretName}`;
+    const secret = async (namespace: string, secretName: string) => {
+      const path = `${collection('v1', 'Secret', namespace)}/${secretName}`;
       const value = await this.get<Resource & { data?: Record<string, string> }>(path);
       fetched.set(path, value);
-      return (key: string) => Buffer.from(value?.data?.[key] ?? '', 'base64').toString();
+      return value;
     };
-    const [tlsSecret, caKeySecret] = await Promise.all([
-      secret('tenant-controller-tls'),
-      secret(TENANT_CONTROLLER_CA_KEY_SECRET),
+    const [tlsSecret, caSecret, legacySecret] = await Promise.all([
+      secret(runtimeNamespace, 'tenant-controller-tls'),
+      secret(this.cfg.namespace, tenantControllerCaSecret(tenant)),
+      secret(runtimeNamespace, TENANT_CONTROLLER_CA_KEY_SECRET),
     ]);
-    const [cert, key, caCert, caKey] = [
-      tlsSecret('tls.crt'),
-      tlsSecret('tls.key'),
-      tlsSecret('ca.crt'),
-      caKeySecret('ca.key'),
-    ];
+    const decode = (value: { data?: Record<string, string> } | undefined, key: string) =>
+      Buffer.from(value?.data?.[key] ?? '', 'base64').toString();
+    const [cert, key] = [decode(tlsSecret, 'tls.crt'), decode(tlsSecret, 'tls.key')];
+    // A key in a runtime-namespace Secret this installation did not write is never adopted.
+    const legacyKey =
+      legacySecret?.metadata.labels?.[INSTALLATION] === this.cfg.installation
+        ? decode(legacySecret, 'ca.key')
+        : '';
+    const stored = caSecret
+      ? {
+          current: { cert: decode(caSecret, 'ca.crt'), key: decode(caSecret, 'ca.key') },
+          next: { cert: decode(caSecret, 'next.crt'), key: decode(caSecret, 'next.key') },
+          previous: decode(caSecret, 'previous.crt'),
+        }
+      : { current: { cert: decode(tlsSecret, 'ca.crt'), key: legacyKey } };
+    const now = this.now();
+    const cas = rotateCas(stored, `tenant-controller CA (${runtimeNamespace})`, now);
+    const ca = {
+      caCert: cas.current.cert,
+      caKey: cas.current.key,
+      ...(cas.next ? { caNext: cas.next } : {}),
+      ...(cas.previous ? { caPrevious: cas.previous } : {}),
+    };
     const certNames = tenantControllerCertNames(tenant, auth);
-    const ca =
-      holdsCaKey(caCert, caKey) && certificateValid(caCert, CA_RENEW_DAYS)
-        ? { cert: caCert, key: caKey }
-        : caCertificate(`tenant-controller CA (${runtimeNamespace})`, CA_DAYS);
     if (
-      ca.cert === caCert &&
-      certificateValid(cert, 30) &&
+      certificateValid(cert, LEAF_RENEW_DAYS, now) &&
       JSON.stringify(certificateNames(cert)) === JSON.stringify(certNames) &&
-      issuedBy(caCert, cert, key)
+      issuedBy(ca.caCert, cert, key)
     )
-      return { cert, key, caCert, caKey };
+      return { cert, key, ...ca };
     const leaf = leafCertificate(
       `tenant-controller.${runtimeNamespace}.svc`,
       certNames.dns,
       certNames.ips,
       365,
-      ca.cert,
-      ca.key,
+      ca.caCert,
+      ca.caKey,
+      now,
     );
-    return { ...leaf, caCert: ca.cert, caKey: ca.key };
+    return { ...leaf, ...ca };
   }
   /**
    * The host pull token (#83 `:host-pull`): the one in `di-tenant-registry-pull` while it is well
@@ -1118,6 +1133,16 @@ export class Controller {
             (status?.readyReplicas ?? 0) === spec.replicas;
         }
       }
+      // The CA key moved to the platform namespace (#170), which the loop above just applied:
+      // drop the copy the tenant controller's ServiceAccount could read.
+      const legacyCaKey = fetched.get(
+        `${collection('v1', 'Secret', namespace)}/${TENANT_CONTROLLER_CA_KEY_SECRET}`,
+      );
+      if (
+        legacyCaKey?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+        legacyCaKey.metadata.labels[OWNER] === tenant.metadata.uid
+      )
+        await this.remove(legacyCaKey);
       const { problems } = tenantAuthRoutes(this.cfg.tenantAuth, this.cfg.routeUrlPattern);
       if (problems.length) return condition(false, 'RouteError', problems.join('; '));
       if (registry.conflict)

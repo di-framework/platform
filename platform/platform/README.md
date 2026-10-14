@@ -373,6 +373,25 @@ Downgrading the platform package below this version needs the rename undone (sto
 is not visible to an older version. Upgrading again with both directories present stops `di-nats`
 at its init step (see above).
 
+#### Upgrading to tenant controller CAs in the platform namespace (#170)
+
+The tenant controller CA and its key move from the tenant's runtime namespace to Secret
+`tenant-controller-ca-<tenant>` in the platform namespace, out of reach of the tenant controller's
+ServiceAccount (see [Tenant controller and console](#tenant-controller-and-console)). Nothing has
+to be done before `pulumi up`:
+
+- **The CA is kept.** On its first pass for each tenant the controller copies `ca.crt` from
+  `tenant-controller-tls` and `ca.key` from `di-runtime-<tenant>/tenant-controller-ca-key` into the
+  new Secret, then deletes `tenant-controller-ca-key`. The CA, the leaf and ConfigMap
+  `tenant-controller-ca` do not change, so the tenant hosts and the controller do not roll, and the
+  kubeconfigs and `--ca-file`s already handed out stay valid.
+- **The console rolls once.** Its pod template gains `platform.di-framework.dev/ca-bundle-sha256`,
+  the digest of the trust bundle it copies into the kubeconfigs it issues.
+- **Downgrading** to a platform package without this change finds no `tenant-controller-ca-key`
+  and replaces the CA: the tenant hosts roll and kubeconfigs issued before need a new `login`.
+  Delete `tenant-controller-ca-<tenant>` in the platform namespace afterwards; the older package
+  does not know it.
+
 ### Tenant removal and namespace retention
 
 Each `tenants` entry takes `deletionPolicy` (`Retain` or `Delete`, default `Retain`). The
@@ -1098,28 +1117,52 @@ tenantAuth:
   a projected token; the issuer-proxy sidecar (`alpine/socat`, pinned by digest) has none.
 - TLS: the platform controller generates a per-tenant P-256 CA (`CA:TRUE, pathlen:0`, valid ten
   years) and a leaf it signs (`CA:FALSE`, server auth, 365 days) for `tenant-controller` and the host
-  of `controllerPublicUrl`. The leaf, its key and `ca.crt` are in Secret `tenant-controller-tls`; the
-  console and the hosts pin only the CA, from ConfigMap `tenant-controller-ca`. The CA key is in
-  Secret `tenant-controller-ca-key` in the same runtime namespace. No pod mounts it and no tenant
-  member role can read it, but the tenant controller's ServiceAccount can: its
-  `tenant-controller-keys` Role (for API-key Secrets) grants `get`, `list`, `create` and `delete`
-  on every Secret in that namespace, because API-key Secrets have generated names. The
+  of `controllerPublicUrl`. The leaf, its key and the CA that signed it (`ca.crt`) are in Secret
+  `tenant-controller-tls`; the console and the hosts pin only the trust bundle in ConfigMap
+  `tenant-controller-ca` (key `ca.crt`): the CA, plus the other CA during a rotation (below).
+  The CAs and their keys are in Secret `tenant-controller-ca-<tenant>` in the platform namespace
+  (#170): `ca.crt` and `ca.key` sign the leaf, and during a rotation `next.crt`/`next.key` or
+  `previous.crt` hold the other CA. No pod mounts it, and neither tenant members nor the tenant
+  controller's ServiceAccount can read it: that ServiceAccount's `tenant-controller-keys` Role (for
+  API-key Secrets) grants `get`, `list`, `create` and `delete` on every Secret in the runtime
+  namespace, because API-key Secrets have generated names, and in the platform namespace it may
+  only request tokens for its members. The
   `<installation>-tenant-controller-secrets` admission policy (#321) limits its writes: it may
   create and delete only `di-apikey-<16 hex>` Secrets labelled
   `platform.di-framework.dev/api-key: "true"` with its own tenant, and update none. It can no
-  longer delete `tenant-controller-ca-key`, `tenant-controller-tls`, `tenant-console-oauth` or
-  the registry pull Secret. Its reads are not narrowed.
+  longer delete `tenant-controller-tls`, `tenant-console-oauth` or the registry pull Secret. Its
+  reads in the runtime namespace are not narrowed. Deleting the tenant (or unsetting `tenantAuth`)
+  deletes `tenant-controller-ca-<tenant>` with the other tenant-auth objects.
   The leaf is replaced 30 days before it expires, when its names change, or when it no longer
-  verifies against the stored CA. The leaf's `notAfter` never passes the CA's. The CA is
-  replaced only when one of these holds:
-  - it expires within 90 days;
-  - its key is missing or does not match it;
-  - `ca.crt` is missing from `tenant-controller-tls`, for example because that Secret was
-    deleted.
+  verifies against the CA that signs. The leaf's `notAfter` never passes the CA's. Deleting
+  `tenant-controller-tls` therefore issues only a new leaf under the same CA. A leaf renewal keeps
+  the CA, so hosts do not roll and kubeconfigs the console issued stay valid; the leaf digest in
+  both pod templates rolls the pair.
 
-  A leaf renewal therefore keeps the CA, so hosts do not roll and
-  kubeconfigs the console issued stay valid; the leaf digest in both pod templates rolls the pair.
+  **CA rotation.** A CA is replaced in three steps, so that while any rollout is under way every
+  host, console and kubeconfig, old or new, still verifies the leaf any controller pod, old or
+  new, serves:
+  1. *Publish*, 90 days before the CA expires: a successor is created and added to the bundle,
+     oldest first. The leaf does not change. The hosts roll on the bundle digest
+     (`registry-ca-sha256`) and the console on `ca-bundle-sha256`; kubeconfigs it issues from then
+     on carry both CAs.
+  2. *Switch*, once the successor is 30 days old: it signs a new leaf and the old CA becomes
+     `previous.crt`. The bundle bytes do not change, so the hosts do not roll; the controller and
+     console roll for the new leaf. If the controller was not running in between and the old CA
+     has less than 30 days left, it switches in the same pass as it publishes.
+  3. *Retire*, when the old CA expires: it leaves the bundle (no leaf it signed outlives it), and
+     the hosts and console roll once more.
+
+  A kubeconfig or `--ca-file` holding only the old CA stops verifying at the switch: fetch the
+  bundle again (or `login` again) during the 30 days after it is published. The CA is replaced at
+  once, with no overlap, only when it cannot sign: its key is missing or does not match it, or it
+  has expired. A published successor that is still usable then takes its place. When
+  `tenant-controller-ca-<tenant>` is missing the controller falls back to the earlier layout
+  (`ca.crt` in `tenant-controller-tls`, `ca.key` in the runtime namespace's
+  `tenant-controller-ca-key` if this installation wrote it) and moves it, see
+  [Upgrading to tenant controller CAs in the platform namespace](#upgrading-to-tenant-controller-cas-in-the-platform-namespace-170).
   A Secret from before the CA existed (one `CA:TRUE` certificate, no `ca.crt`) is replaced once.
+  The CA has no X.509 name constraints yet (#170).
 - Routes: when the platform gateway is published (`routeUrlPattern`), a public URL whose host is
   `<label>.{tenant}.localhost` on the gateway port is routed through it, so a new Tenant gets a
   reachable console and controller with no script. `createPlatform` derives every public URL
