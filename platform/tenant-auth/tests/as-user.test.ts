@@ -74,7 +74,7 @@ test('strips cookies, proxy credentials and impersonation headers', async () => 
     },
   });
   // `fetch` negotiates the coding itself, so the body it hands back is always decoded (#71).
-  expect(api.requests.at(-1)?.headers.get('accept-encoding')).not.toBe('compress');
+  expect(api.requests.at(-1)?.headers.get('accept-encoding') ?? '').not.toContain('compress');
   const sent = api.requests.at(-1)?.headers;
   for (const name of [
     'cookie',

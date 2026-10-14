@@ -260,9 +260,21 @@ export const HOST_PULL_USER = 'system:tenant-host';
 /**
  * The single `Content-Encoding` values `fetch` decodes before handing out the body. A proxied
  * body sent with one of these is already plain, so the header must not be relayed (#71); any
- * other value (a coding list, an unknown coding) leaves the body untouched and is relayed as is.
+ * other value (a multi-coding list, an unknown coding) leaves the body untouched and is relayed as is.
  */
-const DECODED_ENCODINGS = new Set(['identity', 'gzip', 'x-gzip', 'deflate', 'br', 'zstd']);
+const DECODED_ENCODINGS = new Set(['gzip', 'x-gzip', 'deflate', 'br', 'zstd']);
+
+/**
+ * Whether `fetch` already decoded a body sent with this `Content-Encoding`: it ignores empty and
+ * `identity` entries in a list, and decodes what is left only when that is one known coding.
+ */
+function fetchDecoded(header: string): boolean {
+  const codings = header
+    .split(',')
+    .map((coding) => coding.trim().toLowerCase())
+    .filter((coding) => coding !== '' && coding !== 'identity');
+  return codings.length === 0 || (codings.length === 1 && DECODED_ENCODINGS.has(codings[0] ?? ''));
+}
 
 /** Headers never relayed back from the registry: hop-by-hop. */
 const HOP_BY_HOP_RESPONSE = new Set(['connection', 'keep-alive', 'transfer-encoding']);
@@ -1013,8 +1025,8 @@ export class Controller {
     // `fetch` already decoded is gone from the body and must go from the headers too (#71).
     const out = new Headers(upstream.headers);
     for (const name of ['content-length', 'transfer-encoding', 'connection']) out.delete(name);
-    const encoding = out.get('content-encoding')?.trim().toLowerCase();
-    if (encoding !== undefined && DECODED_ENCODINGS.has(encoding)) out.delete('content-encoding');
+    const encoding = out.get('content-encoding');
+    if (encoding !== null && fetchDecoded(encoding)) out.delete('content-encoding');
     return new Response(upstream.body, { status: upstream.status, headers: out });
   }
 }

@@ -24,8 +24,16 @@ const ENCODE: Record<string, (body: string) => Uint8Array<ArrayBuffer>> = {
   br: (body) => new Uint8Array(brotliCompressSync(body)),
   deflate: (body) => new Uint8Array(deflateSync(body)),
   zstd: (body) => new Uint8Array(zstdCompressSync(body)),
+  'gzip, identity': (body) => new Uint8Array(gzipSync(body)),
+  'identity, gzip': (body) => new Uint8Array(gzipSync(body)),
+  'gzip, ': (body) => new Uint8Array(gzipSync(body)),
   // A coding list `fetch` does not decode: the bytes and the header must both pass untouched.
   'gzip, br': (body) => new Uint8Array(brotliCompressSync(gzipSync(body))),
+};
+/** Resolved by the watch test once it has read the first chunk, releasing the second. */
+const watchGate: { release: () => void; opened: Promise<void> } = {
+  release: () => {},
+  opened: Promise.resolve(),
 };
 const WATCH = ['{"type":"ADDED","object":{"n":1}}\n', '{"type":"MODIFIED","object":{"n":2}}\n'];
 
@@ -90,10 +98,9 @@ function fakeApiServer() {
       return new Response(
         new ReadableStream({
           async start(controller) {
-            for (const line of WATCH) {
-              controller.enqueue(new TextEncoder().encode(line));
-              await Bun.sleep(20);
-            }
+            controller.enqueue(new TextEncoder().encode(WATCH[0] as string));
+            await watchGate.opened;
+            controller.enqueue(new TextEncoder().encode(WATCH[1] as string));
             controller.close();
           },
         }),
@@ -217,25 +224,35 @@ describe('Controller', () => {
     const encoded = (coding: string) =>
       `/api/v1/namespaces/di-tenant-acme/configmaps/encoded?coding=${encodeURIComponent(coding)}`;
 
-    test.each(['gzip', 'x-gzip', 'br', 'deflate', 'zstd', 'GZIP', 'identity', ''])(
-      'drops the already-decoded %p coding and its stale length',
-      async (coding) => {
-        // Undecoded bytes: the body on the wire is exactly the plain object, with no coding to undo.
-        const raw = await get(encoded(coding), {
-          headers: { 'accept-encoding': 'gzip, br' },
-          decompress: false,
-        } as RequestInit);
-        expect(raw.status).toBe(200);
-        expect(raw.headers.get('content-encoding')).toBeNull();
-        expect(Buffer.from(await raw.arrayBuffer()).toString()).toBe(PLAIN);
-        const length = raw.headers.get('content-length');
-        if (length !== null) expect(Number(length)).toBe(Buffer.byteLength(PLAIN));
-        // An ordinary client (decoding on) reads the object.
-        const read = await get(encoded(coding));
-        expect(await read.json()).toEqual(JSON.parse(PLAIN));
-        expect(api.server.requests.at(-1)?.headers.get('accept-encoding')).not.toBe('gzip, br');
-      },
-    );
+    test.each([
+      'gzip',
+      'x-gzip',
+      'br',
+      'deflate',
+      'zstd',
+      'GZIP',
+      'identity',
+      '',
+      'gzip, identity',
+      'identity, gzip',
+      'gzip, ',
+    ])('drops the already-decoded %p coding and its stale length', async (coding) => {
+      // Undecoded bytes: the body on the wire is exactly the plain object, with no coding to undo.
+      const raw = await get(encoded(coding), {
+        headers: { 'accept-encoding': 'gzip, br' },
+        decompress: false,
+      } as RequestInit);
+      expect(raw.status).toBe(200);
+      expect(raw.headers.get('content-encoding')).toBeNull();
+      expect(Buffer.from(await raw.arrayBuffer()).toString()).toBe(PLAIN);
+      const length = raw.headers.get('content-length');
+      if (length !== null) expect(Number(length)).toBe(Buffer.byteLength(PLAIN));
+      // The caller's Accept-Encoding is not what reached the API server.
+      expect(api.server.requests.at(-1)?.headers.get('accept-encoding') ?? '').not.toBe('gzip, br');
+      // An ordinary client (decoding on) reads the object.
+      const read = await get(encoded(coding));
+      expect(await read.json()).toEqual(JSON.parse(PLAIN));
+    });
 
     test('relays a coding fetch left encoded, bytes and header untouched', async () => {
       const raw = await get(encoded('gzip, br'), { decompress: false } as RequestInit);
@@ -246,11 +263,17 @@ describe('Controller', () => {
     });
 
     test('streams an uncoded watch chunk by chunk', async () => {
+      watchGate.opened = new Promise<void>((resolve) => {
+        watchGate.release = resolve;
+      });
       const response = await get('/api/v1/namespaces/di-tenant-acme/pods?watch=1');
       expect(response.headers.get('content-encoding')).toBeNull();
       const reader = (response.body as ReadableStream<Uint8Array>).getReader();
+      // The upstream holds the second line back until the first has crossed both hops, so a
+      // relay that buffered the whole body would hang here instead of passing by luck of timing.
       const first = await reader.read();
       expect(new TextDecoder().decode(first.value)).toBe(WATCH[0] as string);
+      watchGate.release();
       let rest = '';
       for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read())
         rest += new TextDecoder().decode(chunk.value);
