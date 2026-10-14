@@ -297,6 +297,70 @@ describe('Controller', () => {
     expect(((await other.json()) as { echo: Record<string, string> }).echo.method).toBe('DELETE');
   });
 
+  test('redacts a Secret DELETE however its path is spelled (#116)', async () => {
+    for (const [raw, forwarded] of [
+      [
+        '/api/v1/namespaces/di-tenant-acme/%73ecrets/db',
+        '/api/v1/namespaces/di-tenant-acme/secrets/db',
+      ],
+      [
+        '/api/v1/namespaces/di-tenant-acme/%73%65%63%72%65%74%73/db',
+        '/api/v1/namespaces/di-tenant-acme/secrets/db',
+      ],
+      [
+        '/api/v1/namespaces/%64i-tenant-acme/secrets/d%62',
+        '/api/v1/namespaces/di-tenant-acme/secrets/db',
+      ],
+      [
+        '/api/v1/namespaces/di-tenant-acme/secrets/db%2Eprod',
+        '/api/v1/namespaces/di-tenant-acme/secrets/db.prod',
+      ],
+    ] as const) {
+      const response = await call('DELETE', raw);
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(text).not.toContain('echo');
+      expect(JSON.parse(text)).toMatchObject({ kind: 'Status', status: 'Success', code: 200 });
+      // The API server is sent the path the policy and the redaction checked.
+      expect(api.server.requests.at(-1)?.pathname).toBe(forwarded);
+    }
+  });
+
+  test('refuses ambiguous encodings before the API server sees them (#116)', async () => {
+    const before = api.server.requests.length;
+    for (const path of [
+      '/api/v1/namespaces/di-tenant-acme/secrets%2Fdb',
+      '/api/v1/namespaces/di-tenant-acme/secrets%2fdb',
+      '/api/v1/namespaces/di-tenant-acme//secrets/db',
+      '/api/v1/namespaces/di-tenant-acme%2F..%2Fwasmcloud/secrets',
+      '/api/v1/namespaces/di-tenant-acme/%2573ecrets/db',
+      '/api/v1/namespaces/di-tenant-acme/%zz',
+    ]) {
+      const response = await call('DELETE', path);
+      expect(response.status).toBe(403);
+      expect(((await response.json()) as { kind: string }).kind).toBe('Status');
+    }
+    // Dot segments, encoded or not, are resolved by the URL parser and then checked as usual.
+    expect(
+      (await call('GET', '/api/v1/namespaces/di-tenant-acme/%2e%2E/%2E%2e/wasmcloud/secrets'))
+        .status,
+    ).toBe(403);
+    expect(api.server.requests.length).toBe(before);
+    expect(logged.length).toBeGreaterThan(0);
+    expect(logged.every((event) => event === 'request.denied')).toBe(true);
+  });
+
+  test('forwards a legitimately encoded name in its canonical spelling (#116)', async () => {
+    const response = await call(
+      'GET',
+      '/api/v1/namespaces/di-tenant-acme/pods/web%2D1%3A8080/proxy?x=%2F',
+    );
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { echo: Record<string, string> }).echo.path).toBe(
+      '/api/v1/namespaces/di-tenant-acme/pods/web-1:8080/proxy?x=%2F',
+    );
+  });
+
   test('re-mints once when the cached token is rejected', async () => {
     api.validTokens.clear();
     const response = await call('GET', '/api/v1/namespaces/di-tenant-acme/pods', 'Bearer key');

@@ -338,12 +338,52 @@ export function configFromEnv(env = process.env): ControllerConfig {
 
 export const tenantNamespaces = (tenant: string) => [`di-tenant-${tenant}`, `di-runtime-${tenant}`];
 
+/** Characters `encodeURIComponent` escapes that a path segment may carry as they are. */
+const SEGMENT_SAFE = /%(3A|40|24|26|2B|2C|3B|3D)/g;
+
+/**
+ * The one spelling of an API server path that the proxy checks and forwards (#116), or
+ * `undefined` when the path is ambiguous. Each segment is percent-decoded once and re-encoded the
+ * same way, so `%73ecrets` and `secrets` are one path to the policy and to the API server.
+ * Refused, rather than guessed at: a path not starting with `/`, an empty segment other than a
+ * trailing slash (`//secrets`), a malformed escape, and any segment that decodes to `.` or `..`,
+ * or to text containing `/`, `\`, `%` (double encoding) or a control character.
+ */
+export function canonicalPath(pathname: string): string | undefined {
+  if (!pathname.startsWith('/')) return undefined;
+  const segments = pathname.slice(1).split('/');
+  const out: string[] = [];
+  for (const [index, raw] of segments.entries()) {
+    if (raw === '') {
+      if (index === segments.length - 1) {
+        out.push('');
+        continue;
+      }
+      return undefined;
+    }
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(raw);
+    } catch {
+      return undefined;
+    }
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are refused.
+    if (decoded === '.' || decoded === '..' || /[/\\%\u0000-\u001f\u007f]/.test(decoded))
+      return undefined;
+    out.push(encodeURIComponent(decoded).replace(SEGMENT_SAFE, (kept) => decodeURIComponent(kept)));
+  }
+  return `/${out.join('/')}`;
+}
+
 /**
  * Which API server paths a tenant user may reach through this controller. Namespaced paths must
  * name one of the tenant's namespaces; discovery and self-subject reviews are allowed so kubectl
- * works; everything cluster-scoped is refused regardless of the user's RBAC.
+ * works; everything cluster-scoped is refused regardless of the user's RBAC. The decision is made
+ * on `canonicalPath(pathname)`, and a path without one is refused (#116).
  */
-export function allowed(method: string, pathname: string, tenant: string): boolean {
+export function allowed(method: string, rawPathname: string, tenant: string): boolean {
+  const pathname = canonicalPath(rawPathname);
+  if (pathname === undefined) return false;
   const namespaces = tenantNamespaces(tenant);
   const namespaced =
     /^\/api\/v1\/namespaces\/([^/]+)(\/|$)/.exec(pathname) ??
@@ -364,7 +404,7 @@ export function allowed(method: string, pathname: string, tenant: string): boole
   return false;
 }
 
-/** Secret objects and collections in any namespace, as the raw proxy sees them. */
+/** Secret objects and collections in any namespace, matched on the canonical path (#116). */
 const SECRET_PATH = /^\/api\/v1\/namespaces\/[^/]+\/secrets(\/|$)/;
 
 /** A Kubernetes Status object, so kubectl prints the reason instead of a parse error. */
@@ -985,7 +1025,10 @@ export class Controller {
   // The Kubernetes API proxy.
 
   private async proxy(request: Request, url: URL, principal: Principal): Promise<Response> {
-    if (!allowed(request.method, url.pathname, this.config.tenant)) {
+    // The policy, the Secret redaction and the upstream request all use one canonical path, so
+    // an encoded spelling cannot pass the check and then mean something else upstream (#116).
+    const path = canonicalPath(url.pathname);
+    if (path === undefined || !allowed(request.method, path, this.config.tenant)) {
       this.audit('request.denied', {
         user: principal.user,
         method: request.method,
@@ -1005,19 +1048,19 @@ export class Controller {
         : await request.arrayBuffer();
     const upstream = await asUser(this.kube, this.userTokens, principal).fetch(
       request.method,
-      `${url.pathname}${url.search}`,
+      `${path}${url.search}`,
       { headers: request.headers, body },
     );
     this.audit('request.proxied', {
       user: principal.user,
       via: principal.via,
       method: request.method,
-      path: url.pathname,
+      path,
       status: upstream.status,
     });
     // A Secret DELETE answers with the deleted object, data included (#112): developers may delete
     // Secrets but never read them, so a successful one is reported as a bare Status.
-    if (request.method === 'DELETE' && SECRET_PATH.test(url.pathname) && upstream.ok) {
+    if (request.method === 'DELETE' && SECRET_PATH.test(path) && upstream.ok) {
       await upstream.body?.cancel();
       return status(upstream.status, 'Success', 'secret deleted; its contents are not returned');
     }
