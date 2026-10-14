@@ -49,10 +49,19 @@ export interface RegistryListenerOptions {
   acceptPlainHttp?: boolean;
   /**
    * Most client connections held open at once; further ones are closed as they arrive. Unset: no
-   * limit. With `acceptPlainHttp`, each one holds three sockets (client, relay hop, and the inner
-   * listener's end of it), so this bounds three times as many descriptors.
+   * limit. When relayed (`acceptPlainHttp`, `requestTimeoutSeconds`), each one holds three
+   * sockets (client, relay hop, and the inner listener's end of it), so this bounds three times as
+   * many descriptors.
    */
   maxConnections?: number;
+  /**
+   * Once a client sends data, an answer has to start within this long or the connection is
+   * closed, so a client trickling its request cannot hold a connection. Every request on a
+   * connection gets the same deadline. With it, every connection is relayed as with
+   * `acceptPlainHttp`: `node:http` under Bun does not enforce its own request timeouts. Unset:
+   * only idleness ends a request, as long uploads need.
+   */
+  requestTimeoutSeconds?: number;
   /** A socket with no data flow for this long is closed. */
   idleTimeoutSeconds: number;
   /** Largest request body accepted, declared or chunked; larger ones are answered 413. */
@@ -72,69 +81,123 @@ const NO_BODY = new Set([204, 205, 304]);
 export async function serveRegistryListener(
   options: RegistryListenerOptions,
 ): Promise<RegistryListener> {
-  if (options.tls && options.acceptPlainHttp) return serveTlsAndPlain(options, options.tls);
+  if ((options.tls && options.acceptPlainHttp) || options.requestTimeoutSeconds !== undefined)
+    return serveRelayed(options);
   return serveSingle(options);
 }
 
 /** The first byte of a TLS connection: a handshake record (content type 22). */
 const TLS_HANDSHAKE = 0x16;
 
+/** After a complete response, how long the relay waits for the client to close its side. */
+const CLOSE_GRACE_MS = 5_000;
+
 /**
- * TLS and plain HTTP on one port (`acceptPlainHttp`): each connection is relayed, by its first
- * byte, to a loopback listener for its protocol. The idle timeout applies to the client socket as
- * well as to the inner listeners.
+ * The client address behind each relay hop to one inner listener, by the hop's local port. A
+ * local port is unique only per destination, so each inner listener has its own table, and a
+ * hop's release removes only its own entry: the port may already name a newer hop.
+ */
+export class HopAddresses {
+  readonly #entries = new Map<number, { address: string }>();
+
+  /** Records `address` for the hop on local `port`; the returned function forgets it again. */
+  claim(port: number, address: string): () => void {
+    const entry = { address };
+    this.#entries.set(port, entry);
+    return () => {
+      if (this.#entries.get(port) === entry) this.#entries.delete(port);
+    };
+  }
+
+  lookup(port: number | undefined): string | undefined {
+    return port === undefined ? undefined : this.#entries.get(port)?.address;
+  }
+}
+
+/**
+ * Connections relayed, by their first byte, to a loopback listener for their protocol: TLS (with
+ * `tls`) and plain HTTP (without `tls`, or with `acceptPlainHttp`). A first byte for a protocol
+ * not served closes the connection. The relay is what bounds the client side: `maxConnections`,
+ * the idle timeout, and `requestTimeoutSeconds`.
  *
  * A client may half-close once its request is sent (`allowHalfOpen`): its end is passed on to the
- * inner listener and the response still comes back. The relay hop's local port names the client
- * it carries, so the inner listeners hand the handler the client's address rather than loopback.
+ * inner listener and the response still comes back. The inner listeners hand the handler the
+ * client's address rather than loopback, through {@link HopAddresses}.
+ *
+ * The inner listeners have no connection cap of their own: they listen on loopback only, so
+ * besides the relay (bounded by `maxConnections`) only processes in the same network namespace
+ * reach them.
  */
-async function serveTlsAndPlain(
-  options: RegistryListenerOptions,
-  tls: { cert: string; key: string },
-): Promise<RegistryListener> {
-  // The client address behind each relay hop, by the hop's local port.
-  const clients = new Map<number, string>();
-  const addressOf = (socket: Socket) =>
-    socket.remotePort === undefined ? undefined : clients.get(socket.remotePort);
+async function serveRelayed(options: RegistryListenerOptions): Promise<RegistryListener> {
   const inner = {
     ...options,
     hostname: '127.0.0.1',
     port: 0,
     acceptPlainHttp: false,
     maxConnections: undefined,
+    requestTimeoutSeconds: undefined,
   };
   // Loopback on a free port each: these do not fail where the public port could.
-  const secure = await serveSingle({ ...inner, tls }, addressOf);
-  const plain = await serveSingle({ ...inner, tls: undefined }, addressOf);
-  const stopInner = () => Promise.all([secure.stop(), plain.stop()]).then(() => {});
+  const listen = async (tls: RegistryListenerOptions['tls']) => {
+    const hops = new HopAddresses();
+    const listener = await serveSingle({ ...inner, tls }, (socket) =>
+      hops.lookup(socket.remotePort),
+    );
+    return { listener, hops };
+  };
+  const secure = options.tls ? await listen(options.tls) : undefined;
+  const plain = !options.tls || options.acceptPlainHttp ? await listen(undefined) : undefined;
+  const stopInner = () =>
+    Promise.all([secure?.listener.stop(), plain?.listener.stop()]).then(() => {});
+  const requestTimeoutMs =
+    options.requestTimeoutSeconds === undefined ? undefined : options.requestTimeoutSeconds * 1000;
   const sockets = new Set<Socket>();
   const server = createNetServer({ allowHalfOpen: true }, (client) => {
     sockets.add(client);
     client.once('close', () => sockets.delete(client));
     client.on('error', () => client.destroy());
     client.setTimeout(options.idleTimeoutSeconds * 1000, () => client.destroy());
+    // Armed when the client sends and nothing has come back since; any answer disarms it.
+    let awaiting: ReturnType<typeof setTimeout> | undefined;
+    const sent = () => {
+      if (requestTimeoutMs !== undefined && awaiting === undefined)
+        awaiting = setTimeout(() => client.destroy(), requestTimeoutMs);
+    };
+    const answered = () => {
+      clearTimeout(awaiting);
+      awaiting = undefined;
+    };
+    client.once('close', answered);
     // A client that ends before sending anything has nothing to relay.
     const ended = () => client.destroy();
     client.once('end', ended);
     client.once('data', (first: Buffer) => {
       client.off('end', ended);
+      const target = first[0] === TLS_HANDSHAKE ? secure : plain;
+      if (!target) return client.destroy();
       client.pause();
-      const target = first[0] === TLS_HANDSHAKE ? secure.port : plain.port;
-      const upstream = connect(target, '127.0.0.1');
+      sent();
+      client.on('data', sent);
+      const upstream = connect(target.listener.port, '127.0.0.1');
       sockets.add(upstream);
-      let hop: number | undefined;
+      let release = () => {};
+      upstream.on('data', answered);
       upstream.once('close', () => {
         sockets.delete(upstream);
-        if (hop !== undefined) clients.delete(hop);
-        // After a complete response the pipe has ended the client, which then closes once that
-        // is flushed; otherwise the inner side failed and nothing more will come.
-        if (!client.writableEnded) client.destroy();
+        release();
+        // After a complete response the pipe has ended the client, which closes once that is
+        // flushed and the client has ended too, within a short grace; otherwise the inner side
+        // failed and nothing more will come. (A timer of its own: under Bun a socket's timeout
+        // no longer fires once its writable side has ended.)
+        if (!client.writableEnded) return client.destroy();
+        const grace = setTimeout(() => client.destroy(), CLOSE_GRACE_MS);
+        client.once('close', () => clearTimeout(grace));
       });
       upstream.on('error', () => upstream.destroy());
       client.once('close', () => upstream.destroy());
       upstream.once('connect', () => {
-        hop = upstream.localPort;
-        if (hop !== undefined && client.remoteAddress) clients.set(hop, client.remoteAddress);
+        if (upstream.localPort !== undefined && client.remoteAddress)
+          release = target.hops.claim(upstream.localPort, client.remoteAddress);
         upstream.write(first);
         client.pipe(upstream);
         upstream.pipe(client);

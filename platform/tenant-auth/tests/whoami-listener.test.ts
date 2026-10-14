@@ -5,6 +5,7 @@ import { request as httpsRequest } from 'node:https';
 import { connect, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { connect as tlsConnect } from 'node:tls';
 import { caCertificate, leafCertificate } from '../../platform/src/tenancy/tls.ts';
 import {
   Controller,
@@ -13,7 +14,11 @@ import {
   serveWhoamiListener,
 } from '../src/controller.ts';
 import { AuthError } from '../src/identity.ts';
-import { type RegistryListener, serveRegistryListener } from '../src/registry-listener.ts';
+import {
+  HopAddresses,
+  type RegistryListener,
+  serveRegistryListener,
+} from '../src/registry-listener.ts';
 
 /** The name the tenant registry calls the whoami listener by (platform#113). */
 const CONTROLLER_NAME = 'tenant-controller.di-runtime-acme.svc';
@@ -290,5 +295,137 @@ describe('TLS and plain HTTP relay (#329)', () => {
     } finally {
       await listener.stop();
     }
+  });
+
+  test('keeps a TLS hop and a plain hop open at once, each with its own client address', async () => {
+    // Dual-stack: the plain client comes from 127.0.0.1, the TLS client from ::1.
+    const listener = await serve({ hostname: '::' });
+    const plainSocket = connect(listener.port, '127.0.0.1');
+    const tlsSocket = tlsConnect({
+      host: '::1',
+      port: listener.port,
+      ca: ca.cert,
+      servername: 'localhost',
+    });
+    const answer = (socket: Socket) =>
+      new Promise<string>((resolve, reject) => {
+        let raw = '';
+        const read = (chunk: Buffer) => {
+          raw += chunk;
+          // The JSON body, chunked: complete once the last chunk has come.
+          const body = /\{.*\}/.exec(raw);
+          if (body && raw.endsWith('\r\n0\r\n\r\n')) {
+            socket.off('data', read);
+            resolve(body[0]);
+          }
+        };
+        socket.on('data', read);
+        socket.once('error', reject);
+        socket.write('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n');
+      });
+    try {
+      await Promise.all([
+        new Promise((resolve) => plainSocket.once('connect', resolve)),
+        new Promise((resolve) => tlsSocket.once('secureConnect', resolve)),
+      ]);
+      // Both hops stay open across both requests, and twice over in alternation.
+      for (let round = 0; round < 2; round++) {
+        expect(JSON.parse(await answer(tlsSocket))).toEqual({ address: '::1' });
+        expect(JSON.parse(await answer(plainSocket)).address).toEndWith('127.0.0.1');
+      }
+    } finally {
+      plainSocket.destroy();
+      tlsSocket.destroy();
+      await listener.stop();
+    }
+  });
+
+  test('closes a client trickling its request after requestTimeoutSeconds', async () => {
+    const listener = await serve({ requestTimeoutSeconds: 1 });
+    const socket = await opened(listener.port);
+    socket.on('error', () => {});
+    socket.write('GET / HTTP/1.1\r\n');
+    // Never idle, never finished: only the request deadline ends it.
+    const trickle = setInterval(() => socket.write('X-Slow: 1\r\n'), 200);
+    try {
+      await closedWithin(socket, 5_000);
+    } finally {
+      clearInterval(trickle);
+      socket.destroy();
+      await listener.stop();
+    }
+  });
+
+  test('with requestTimeoutSeconds, a TLS-only or plain-only listener serves only its protocol', async () => {
+    const tlsOnly = await serve({ acceptPlainHttp: false, requestTimeoutSeconds: 5 });
+    const plainOnly = await serve({ tls: undefined, requestTimeoutSeconds: 5 });
+    try {
+      expect(JSON.parse(await ask(true, '127.0.0.1', tlsOnly.port))).toEqual({
+        address: '127.0.0.1',
+      });
+      await expect(ask(false, '127.0.0.1', tlsOnly.port)).rejects.toThrow();
+      expect(JSON.parse(await ask(false, '127.0.0.1', plainOnly.port))).toEqual({
+        address: '127.0.0.1',
+      });
+      await expect(ask(true, '127.0.0.1', plainOnly.port)).rejects.toThrow();
+    } finally {
+      await Promise.all([tlsOnly.stop(), plainOnly.stop()]);
+    }
+  });
+
+  test('frees the slot of a client that keeps its side open after a complete response', async () => {
+    const listener = await serve({ maxConnections: 1 });
+    const lingering = connect({ port: listener.port, host: '127.0.0.1', allowHalfOpen: true });
+    let raw = '';
+    lingering.on('data', (chunk: Buffer) => {
+      raw += chunk;
+    });
+    const ended = new Promise((resolve) => lingering.once('end', resolve));
+    lingering.write('GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');
+    try {
+      await ended;
+      expect(raw).toStartWith('HTTP/1.1 200');
+      // The response is complete but the client never closes: after a short grace, well before
+      // the 120 s idle timeout, its slot takes a new connection.
+      const started = Date.now();
+      for (;;) {
+        const answer = await ask(false, '127.0.0.1', listener.port).catch(() => undefined);
+        if (answer !== undefined) {
+          expect(JSON.parse(answer)).toEqual({ address: '127.0.0.1' });
+          break;
+        }
+        expect(Date.now() - started).toBeLessThan(8_000);
+        await Bun.sleep(250);
+      }
+    } finally {
+      lingering.destroy();
+      await listener.stop();
+    }
+  }, 10_000);
+});
+
+/** The relay's per-listener table of client addresses (#329 review W1). */
+describe('HopAddresses', () => {
+  test('the same local port to two inner listeners keeps two addresses', () => {
+    const secure = new HopAddresses();
+    const plain = new HopAddresses();
+    const releaseSecure = secure.claim(40000, '10.0.0.1');
+    plain.claim(40000, '10.0.0.2');
+    expect(secure.lookup(40000)).toBe('10.0.0.1');
+    expect(plain.lookup(40000)).toBe('10.0.0.2');
+    releaseSecure();
+    expect(secure.lookup(40000)).toBeUndefined();
+    expect(plain.lookup(40000)).toBe('10.0.0.2');
+  });
+
+  test("a reused port's new entry survives the old hop's release", () => {
+    const hops = new HopAddresses();
+    const releaseOld = hops.claim(40001, '10.0.0.1');
+    const releaseNew = hops.claim(40001, '10.0.0.2');
+    releaseOld();
+    expect(hops.lookup(40001)).toBe('10.0.0.2');
+    releaseNew();
+    expect(hops.lookup(40001)).toBeUndefined();
+    expect(hops.lookup(undefined)).toBeUndefined();
   });
 });

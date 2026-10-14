@@ -136,10 +136,15 @@ export const WHOAMI_MAX_BODY_BYTES = 1024;
 
 /**
  * Most connections the whoami listener holds at once. Only the tenant hosts' registry calls it;
- * while plain HTTP is accepted too, each connection holds three sockets (see
- * `RegistryListenerOptions.maxConnections`).
+ * each connection is relayed and holds three sockets (see `RegistryListenerOptions`).
  */
 export const WHOAMI_MAX_CONNECTIONS = 256;
+
+/**
+ * How long a whoami caller may take to send a request before the listener answers, so a caller
+ * trickling bytes cannot hold one of the {@link WHOAMI_MAX_CONNECTIONS}. Whoami takes no body.
+ */
+export const WHOAMI_REQUEST_TIMEOUT_SECONDS = 30;
 
 /**
  * The whoami listener (platform#83) on `port`: with `tls`, TLS with the controller certificate
@@ -162,6 +167,7 @@ export function serveWhoamiListener(
     idleTimeoutSeconds: 120,
     maxRequestBodySize: WHOAMI_MAX_BODY_BYTES,
     maxConnections: WHOAMI_MAX_CONNECTIONS,
+    requestTimeoutSeconds: WHOAMI_REQUEST_TIMEOUT_SECONDS,
     fetch: (request) => controller.handleWhoami(request),
   });
 }
