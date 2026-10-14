@@ -187,7 +187,7 @@ test('an insecure install keeps the platform flag and allowlists only its regist
     const pulumi = require('@pulumi/pulumi');
     const k8s = require('@pulumi/kubernetes');
     const resources = [];
-    pulumi.runtime.setAllConfig({'project:tenants': JSON.stringify([{name:'alpha'}]), 'project:insecureRegistries': JSON.stringify(['examples-registry.wasmcloud.svc.cluster.local:5000'])});
+    pulumi.runtime.setAllConfig({'project:tenants': JSON.stringify([{name:'alpha'}]), 'project:insecureRegistries': JSON.stringify(['examples-registry.wasmcloud.svc.cluster.local:5000']), 'project:runtimeNats': JSON.stringify({maxFileStore:'20Gi'})});
     pulumi.runtime.setMocks({
       newResource: args => { resources.push(args); return {id:args.name, state:{...args.inputs, metadata:{...args.inputs.metadata, name:args.inputs.metadata?.name ?? args.name}}}; },
       call: args => args.inputs,
@@ -223,6 +223,8 @@ test('an insecure install keeps the platform flag and allowlists only its regist
     'di-framework-registry.wasmcloud.svc.cluster.local:5000',
     'examples-registry.wasmcloud.svc.cluster.local:5000',
   ]);
+  // Config `runtimeNats` reaches the controller, which renders it into each tenant's di-nats (#160).
+  expect(cfg.runtimeNats).toEqual({ maxFileStore: '20Gi' });
 }, 60_000);
 
 test('an insecure install refuses a tenantHostImage that predates patch 0002', () => {
@@ -307,6 +309,11 @@ test('an invalid tenant host allowlist fails before any resource, network policy
       { tenantAuth: { image: 'ghcr.io/x/y:latest', issuer: 'https://issuer.example' } },
       {},
       'tenantAuth.image must be pinned by digest',
+    ],
+    [
+      { runtimeNats: { maxMemoryStore: '1Gi' } },
+      {},
+      'runtimeNats.maxMemoryStore must be below the di-nats memory limit (128Mi)',
     ],
     [{}, { apiServer: 'https://k8s.example:6443' }, 'apiServer requires kubeconfig'],
     [

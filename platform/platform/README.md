@@ -225,6 +225,7 @@ kubectl delete namespace di-tenant-alpha di-runtime-alpha
 `chart`, `chartVersion`, `httpNodePort`, `timeoutSeconds`, `insecureRegistry`, `insecureRegistries`,
 `storageRoot`, `networkPolicyEngine`, `kubernetesEndpoint`, `httpEndpoint`, `routeUrlPattern`,
 `egressAllowedDestinations`, `routeAliases` (see [Gateway route aliases](#gateway-route-aliases)),
+`runtimeNats` (see [Runtime NATS storage caps](#runtime-nats-storage-caps)),
 and administrator `values` are optional. `tenants`, `users`,
 `tenantHostImage`, and `tenantHostImagePullPolicy` use the same declarations as the
 local entrypoint. NodePort zero makes the HTTP gateway ClusterIP. Registry installation is off
@@ -416,6 +417,49 @@ model, not a claim of developer-proof network isolation.
 - Per-tenant **runtime data-plane NATS** (`di-nats`, hostgroup `--data-nats-url`) is
   Tenant-reconciled infrastructure — not an application `BackingService`. Application
   messaging instances are named `di-bs-<service-name>` and owned by BackingService UIDs.
+
+### Runtime NATS storage caps
+
+Each tenant's `di-nats` keeps its JetStream store on the node at
+`<storageRoot>/di-tenants/<tenant uid>/di-nats`, a host path no ResourceQuota covers. The tenant
+registry's images (#83) and the hosts' default blobstore live there, so the server caps it (#160).
+The controller renders ConfigMap `di-nats-config` in `di-runtime-<tenant>` and runs `di-nats` with
+`-c /etc/nats/nats.conf`:
+
+```text
+port: 4222
+jetstream {
+  store_dir: "/data"
+  max_file_store: <bytes>
+  max_memory_store: <bytes>
+}
+```
+
+| `runtimeNats` key | Default | Rule |
+| --- | --- | --- |
+| `maxFileStore` | `10Gi` | At least `1Mi` |
+| `maxMemoryStore` | `32Mi` | At least `1Mi`, below the container's `128Mi` memory limit |
+
+Values are binary quantities: a positive integer number of bytes, optionally suffixed `Ki`,
+`Mi`, `Gi` or `Ti` (decimal units such as `10GB` are refused). The caps apply to every tenant
+of the installation:
+
+```sh
+pulumi config set --path runtimeNats.maxFileStore 20Gi
+```
+
+An invalid value fails `createPlatform` before any resource. The pod template carries the
+config's SHA-256 (`platform.di-framework.dev/nats-config-sha256`), so changing a cap restarts
+`di-nats` (the Deployment is `Recreate`; the hosts reconnect).
+
+Upgrading keeps the same store directory, so existing streams and object stores are recovered
+as before. The cap never deletes data. If a tenant's store already holds more than the new cap,
+nats-server still recovers streams without their own `max_bytes`, and they stay readable and
+deletable, but JetStream refuses new writes (registry pushes and blobstore writes included)
+until usage falls below the cap. A stream whose own `max_bytes` no longer fits under the cap
+is not recovered; nats-server logs the error at start-up. Raise `maxFileStore` (or delete data)
+and the next restart recovers it. Before lowering a cap, check usage with
+`du -sh <storageRoot>/di-tenants/<tenant uid>/di-nats/jetstream` on the node.
 
 ### Egress
 
@@ -773,7 +817,8 @@ tenantAuth:
 - Registry (`tenantAuth.registry`, #83): each tenant gets the `platform/oci-registry` component
   as WorkloadDeployment `di-tenant-registry` in `di-tenant-<tenant>`, on the tenant's own hosts.
   Its storage is the unnamed `wasmcloud:blobstore` with no references, which is the host data
-  store on the tenant's `di-nats` (JetStream on the tenant's host path). Its `wasmcloud:secrets`
+  store on the tenant's `di-nats` (JetStream on the tenant's host path, capped by
+  [`runtimeNats.maxFileStore`](#runtime-nats-storage-caps)). Its `wasmcloud:secrets`
   bind-time config names the tenant and the controller's whoami-only listener,
   `http://tenant-controller.di-runtime-<tenant>.svc:8789`: plain HTTP, in-cluster, which the
   component accepts for `*.svc` only. The listener serves nothing but `GET /v1/auth/whoami`

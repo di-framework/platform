@@ -179,6 +179,15 @@ A bracketed IPv6 authority counts as cluster-local only when it is loopback
 and is followed by nothing or by `:<digits>`; `http://[::1]evil.example` and
 the like are rejected.
 
+### Storage limit
+
+On the platform the registry's blobstore is the tenant's `di-nats` JetStream
+store, on the node's host path. Its size is capped by the platform config
+`runtimeNats.maxFileStore` (default `10Gi`, platform#160), shared with every
+other JetStream stream and object store of that tenant. Once the cap is
+reached, pushes fail until images are deleted or the cap is raised; pulls keep
+working. See "Runtime NATS storage caps" in `platform/platform/README.md`.
+
 ### Build and test
 
 ```shell

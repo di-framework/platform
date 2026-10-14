@@ -12,11 +12,13 @@ import {
   tenantObject,
 } from './tenancy/install';
 import {
+  assertRuntimeNatsConfig,
   assertTenantAuthConfig,
   crds,
   INSTALLATION,
   names,
   type Resource,
+  type RuntimeNatsConfig,
   registryHttpHost,
   TENANT,
   type TenantAuthConfig,
@@ -111,6 +113,8 @@ export function installTenancy(args: {
   routeUrlPattern?: string;
   /** Each tenant's controller and console (#58); omitted, the controller deploys neither. */
   tenantAuth?: TenantAuthConfig;
+  /** JetStream storage caps of each tenant's `di-nats` (#160); omitted, the defaults apply. */
+  runtimeNats?: RuntimeNatsConfig;
   /** When omitted, seeds platform defaults (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`, `postgres-dedicated`, `egress-public` approving nothing). */
   backingServiceClasses?: BackingServiceClassDeclaration[];
 }): {
@@ -120,6 +124,7 @@ export function installTenancy(args: {
 } {
   const { installation, namespace, provider } = args;
   assertTenantAuthConfig(args.tenantAuth);
+  assertRuntimeNatsConfig(args.runtimeNats);
   function createCustom(
     value: Resource,
     dependsOn: pulumi.Resource[] = args.dependsOn,
@@ -285,6 +290,7 @@ export function installTenancy(args: {
                       storageRoot: args.storageRoot,
                       routeUrlPattern: args.routeUrlPattern,
                       tenantAuth: args.tenantAuth,
+                      runtimeNats: args.runtimeNats,
                     }),
                   },
                 ],

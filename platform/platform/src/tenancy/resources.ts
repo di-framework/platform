@@ -77,6 +77,19 @@ export interface ControllerConfig {
   routeUrlPattern?: string;
   /** The per-tenant controller and console (#58); absent, the reconcile deploys neither. */
   tenantAuth?: TenantAuthConfig;
+  /** JetStream storage caps of each tenant's `di-nats` (#160); absent, the defaults apply. */
+  runtimeNats?: RuntimeNatsConfig;
+}
+/**
+ * JetStream storage caps of each tenant's runtime data-plane NATS (`di-nats`), rendered as
+ * `max_file_store` and `max_memory_store` in its server config. Each is a binary quantity: a
+ * positive integer count of bytes, optionally suffixed `Ki`, `Mi`, `Gi` or `Ti`.
+ */
+export interface RuntimeNatsConfig {
+  /** JetStream file storage on the tenant's host path (default `10Gi`). */
+  maxFileStore?: string;
+  /** JetStream memory storage (default `32Mi`); must stay below the 128Mi container limit. */
+  maxMemoryStore?: string;
 }
 /**
  * Platform-level settings for each tenant's controller and console. The runtime env contract is
@@ -245,6 +258,88 @@ export function assertTenantAuthConfig(value: TenantAuthConfig | undefined): voi
     if (!Number.isSafeInteger(limit) || (limit as number) < 1)
       throw new Error(`tenantAuth.registry.limits.${key} must be a positive integer`);
   }
+}
+/** `di-nats` JetStream caps when the platform config sets none (#160). */
+export const RUNTIME_NATS_DEFAULTS = { maxFileStore: '10Gi', maxMemoryStore: '32Mi' } as const;
+/** The `di-nats` container memory limit; the memory store must fit below it. */
+const RUNTIME_NATS_MEMORY_LIMIT = '128Mi';
+/** The ConfigMap in `di-runtime-<tenant>` holding the `di-nats` server config. */
+export const RUNTIME_NATS_CONFIG = 'di-nats-config';
+/** Pod template annotation carrying the server config digest, so a cap change restarts NATS. */
+export const RUNTIME_NATS_CONFIG_ANNOTATION = 'platform.di-framework.dev/nats-config-sha256';
+const BINARY_QUANTITY = /^([1-9][0-9]*)(Ki|Mi|Gi|Ti)?$/;
+const BINARY_UNITS: Record<string, number> = {
+  '': 1,
+  Ki: 2 ** 10,
+  Mi: 2 ** 20,
+  Gi: 2 ** 30,
+  Ti: 2 ** 40,
+};
+function binaryBytes(value: unknown): number | undefined {
+  if (typeof value !== 'string') return undefined;
+  const match = BINARY_QUANTITY.exec(value);
+  if (!match) return undefined;
+  const bytes = Number(match[1]) * (BINARY_UNITS[match[2] ?? ''] ?? 1);
+  return Number.isSafeInteger(bytes) ? bytes : undefined;
+}
+/** Resolved `di-nats` JetStream caps, in bytes. */
+export interface RuntimeNatsLimits {
+  maxFileStore: number;
+  maxMemoryStore: number;
+}
+/**
+ * Validate a `runtimeNats` config and resolve its caps in bytes, defaults filled in. Throws on an
+ * unknown key, a value that is not a positive binary quantity, a cap below 1Mi, or a memory
+ * store that would not fit below the container memory limit.
+ */
+export function runtimeNatsLimits(value: RuntimeNatsConfig | undefined): RuntimeNatsLimits {
+  const config: unknown = value === undefined ? {} : value;
+  if (typeof config !== 'object' || config === null || Array.isArray(config))
+    throw new Error('runtimeNats must be an object');
+  const known = Object.keys(RUNTIME_NATS_DEFAULTS);
+  for (const key of Object.keys(config))
+    if (!Object.hasOwn(RUNTIME_NATS_DEFAULTS, key))
+      throw new Error(`runtimeNats.${key} is not a known setting (${known.join(', ')})`);
+  const set = config as RuntimeNatsConfig;
+  const resolve = (key: keyof RuntimeNatsConfig): number => {
+    const raw = set[key] ?? RUNTIME_NATS_DEFAULTS[key];
+    const bytes = binaryBytes(raw);
+    if (bytes === undefined)
+      throw new Error(
+        `runtimeNats.${key} must be a positive binary quantity such as ${RUNTIME_NATS_DEFAULTS[key]} (got ${JSON.stringify(raw)})`,
+      );
+    if (bytes < 2 ** 20) throw new Error(`runtimeNats.${key} must be at least 1Mi`);
+    return bytes;
+  };
+  const limits = {
+    maxFileStore: resolve('maxFileStore'),
+    maxMemoryStore: resolve('maxMemoryStore'),
+  };
+  if (limits.maxMemoryStore >= (binaryBytes(RUNTIME_NATS_MEMORY_LIMIT) ?? 0))
+    throw new Error(
+      `runtimeNats.maxMemoryStore must be below the di-nats memory limit (${RUNTIME_NATS_MEMORY_LIMIT})`,
+    );
+  return limits;
+}
+/** Reject a `runtimeNats` config the reconcile could not render. */
+export function assertRuntimeNatsConfig(value: RuntimeNatsConfig | undefined): void {
+  runtimeNatsLimits(value);
+}
+/**
+ * The `di-nats` server config: JetStream on the tenant's host path (`/data`, the same store
+ * directory as the earlier `-js -sd /data` flags), bounded by `limits`. nats-server has no flag
+ * for either cap, so they are set in this file.
+ */
+export function runtimeNatsServerConfig(limits: RuntimeNatsLimits): string {
+  return [
+    'port: 4222',
+    'jetstream {',
+    '  store_dir: "/data"',
+    `  max_file_store: ${limits.maxFileStore}`,
+    `  max_memory_store: ${limits.maxMemoryStore}`,
+    '}',
+    '',
+  ].join('\n');
 }
 /**
  * Each registry front limit and the controller env suffix it renders as
@@ -945,11 +1040,26 @@ function tenantResources(
       },
     }),
   );
-  for (const [name, image, port, args] of [
+  // The `di-nats` JetStream store lives on an unquotaed host path, so its server config caps
+  // file and memory storage (#160). The ConfigMap is applied before the Deployment that mounts it.
+  const natsConfig = runtimeNatsServerConfig(runtimeNatsLimits(cfg.runtimeNats));
+  result.push(
+    make('v1', 'ConfigMap', RUNTIME_NATS_CONFIG, n.runtimeNamespace, {
+      data: { 'nats.conf': natsConfig },
+    }),
+  );
+  const natsConfigVolume = {
+    annotations: {
+      [RUNTIME_NATS_CONFIG_ANNOTATION]: createHash('sha256').update(natsConfig).digest('hex'),
+    },
+    mounts: [{ name: 'config', mountPath: '/etc/nats', readOnly: true }],
+    volumes: [{ name: 'config', configMap: { name: RUNTIME_NATS_CONFIG } }],
+  };
+  for (const [name, image, port, args, extra] of [
     // Runtime-internal data-plane NATS for hostgroup `--data-nats-url`.
     // Lifecycle is Tenant-owned; never created as an application BackingService.
     // Application messaging NATS instances are `di-bs-<name>` via reconcileBackingService.
-    ['di-nats', 'nats:2.12.8-alpine', 4222, ['-js', '-sd', '/data']],
+    ['di-nats', 'nats:2.12.8-alpine', 4222, ['-c', '/etc/nats/nats.conf'], natsConfigVolume],
     // Transitional warehouse Redis + di-tenant-stock (#456 migrates to BackingService).
     // Independent Redis instances are provisioned separately as `di-bs-<name>`.
     [
@@ -957,6 +1067,7 @@ function tenantResources(
       'redis:7.4.5-alpine',
       6379,
       ['redis-server', '--appendonly', 'yes', '--dir', '/data'],
+      undefined,
     ],
   ] as const) {
     result.push(
@@ -968,6 +1079,7 @@ function tenantResources(
           template: {
             metadata: {
               labels: { app: name, [`${GROUP}/component`]: 'backing-service' },
+              ...(extra ? { annotations: extra.annotations } : {}),
             },
             spec: {
               automountServiceAccountToken: false,
@@ -982,7 +1094,10 @@ function tenantResources(
                     limits: { cpu: '250m', memory: '128Mi' },
                   },
                   readinessProbe: { tcpSocket: { port } },
-                  volumeMounts: [{ name: 'data', mountPath: '/data' }],
+                  volumeMounts: [
+                    { name: 'data', mountPath: '/data' },
+                    ...(extra ? extra.mounts : []),
+                  ],
                 },
               ],
               volumes: [
@@ -993,6 +1108,7 @@ function tenantResources(
                     type: 'DirectoryOrCreate',
                   },
                 },
+                ...(extra ? extra.volumes : []),
               ],
             },
           },
