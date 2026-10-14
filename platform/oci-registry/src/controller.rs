@@ -10,12 +10,15 @@
 
 use crate::auth::{Controller, Role, Whoami};
 use crate::bindings;
+use crate::bindings::wasi::clocks::monotonic_clock;
 use crate::bindings::wasi::http::client::send;
 use crate::bindings::wasi::http::types::{
     ErrorCode, Fields, Request, RequestOptions, Response, Scheme,
 };
 use crate::bindings::wasmcloud::secrets::reveal::reveal;
 use crate::bindings::wasmcloud::secrets::store::{self, SecretValue};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 /// Config key holding the controller's base URL.
 pub(crate) const URL_KEY: &str = "tenant-controller-url";
@@ -56,7 +59,11 @@ impl Controller for TenantController {
         let Some(target) = Target::parse(&base) else {
             return Whoami::Denied;
         };
-        verdict(call(&target, bearer).await, tenant.trim())
+        let outcome = call(&target, bearer).await;
+        if let Outcome::Failed(error) = &outcome {
+            log_failure(error, monotonic_clock::now());
+        }
+        verdict(outcome, tenant.trim())
     }
 }
 
@@ -78,8 +85,9 @@ pub(crate) enum Outcome {
 }
 
 /// Map a whoami call to a verdict. A 2xx is checked by [`role_from_body`]; a
-/// `5xx` or a failed call means the controller is unavailable right now;
-/// anything else (`401`, `403`, other statuses, an unsendable request) denies.
+/// `5xx` means the controller is unavailable right now; a failed call is
+/// answered as [`classify`] says; anything else (`401`, `403`, other statuses,
+/// an unsendable request) denies.
 pub(crate) fn verdict(outcome: Outcome, tenant: &str) -> Whoami {
     match outcome {
         Outcome::Unsendable => Whoami::Denied,
@@ -94,14 +102,157 @@ pub(crate) fn verdict(outcome: Outcome, tenant: &str) -> Whoami {
         } if (500..600).contains(&status) => Whoami::Unavailable {
             retry_after: retry_after.as_deref().and_then(parse_retry_after),
         },
+        // A `429` deliberately gets the `401` challenge, not a retryable `503`:
+        // the controller does not rate-limit whoami, so a `429` here is not a
+        // condition the registry knows will clear. If whoami is ever
+        // rate-limited, revisit this (and its test) so clients back off
+        // instead of re-prompting for credentials.
+        Outcome::Answered { status: 429, .. } => Whoami::Denied,
         Outcome::Answered { .. } => Whoami::Denied,
     }
 }
 
-/// Every `send` error is treated as the controller being unavailable: none of
-/// them says anything about the credential, which was never checked.
-fn transport_failure(_error: &ErrorCode) -> Whoami {
-    Whoami::Unavailable { retry_after: None }
+/// How a failed whoami call is answered. Neither says anything about the
+/// credential, which was never checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailureAnswer {
+    /// `503 UNAVAILABLE`: the controller or the network to it is down, slow or
+    /// restarting, so a retry may succeed.
+    Retry,
+    /// The `401` challenge, like a missing configuration: a configuration-type
+    /// failure (the host's outgoing-HTTP policy, TLS against the controller, a
+    /// request the host will never send) that a retry cannot clear.
+    Challenge,
+}
+
+fn transport_failure(error: &ErrorCode) -> Whoami {
+    match classify(error).1 {
+        FailureAnswer::Retry => Whoami::Unavailable { retry_after: None },
+        FailureAnswer::Challenge => Whoami::Denied,
+    }
+}
+
+/// The WIT name of a `wasi:http` error code (without its payload), and how
+/// the failure is answered. Exhaustive, so a new code is a deliberate choice.
+fn classify(error: &ErrorCode) -> (&'static str, FailureAnswer) {
+    use FailureAnswer::{Challenge, Retry};
+    match error {
+        // The controller or the network between is down, restarting or slow.
+        ErrorCode::DnsTimeout => ("DNS-timeout", Retry),
+        ErrorCode::DnsError(_) => ("DNS-error", Retry),
+        ErrorCode::DestinationNotFound => ("destination-not-found", Retry),
+        ErrorCode::DestinationUnavailable => ("destination-unavailable", Retry),
+        ErrorCode::DestinationIpUnroutable => ("destination-IP-unroutable", Retry),
+        ErrorCode::ConnectionRefused => ("connection-refused", Retry),
+        ErrorCode::ConnectionTerminated => ("connection-terminated", Retry),
+        ErrorCode::ConnectionTimeout => ("connection-timeout", Retry),
+        ErrorCode::ConnectionReadTimeout => ("connection-read-timeout", Retry),
+        ErrorCode::ConnectionWriteTimeout => ("connection-write-timeout", Retry),
+        ErrorCode::ConnectionLimitReached => ("connection-limit-reached", Retry),
+        // The controller's answer was broken: not the credential's fault, and
+        // a controller restart or rollout may fix it.
+        ErrorCode::HttpResponseIncomplete => ("HTTP-response-incomplete", Retry),
+        ErrorCode::HttpResponseHeaderSectionSize(_) => ("HTTP-response-header-section-size", Retry),
+        ErrorCode::HttpResponseHeaderSize(_) => ("HTTP-response-header-size", Retry),
+        ErrorCode::HttpResponseBodySize(_) => ("HTTP-response-body-size", Retry),
+        ErrorCode::HttpResponseTrailerSectionSize(_) => {
+            ("HTTP-response-trailer-section-size", Retry)
+        }
+        ErrorCode::HttpResponseTrailerSize(_) => ("HTTP-response-trailer-size", Retry),
+        ErrorCode::HttpResponseTransferCoding(_) => ("HTTP-response-transfer-coding", Retry),
+        ErrorCode::HttpResponseContentCoding(_) => ("HTTP-response-content-coding", Retry),
+        ErrorCode::HttpResponseTimeout => ("HTTP-response-timeout", Retry),
+        ErrorCode::HttpProtocolError => ("HTTP-protocol-error", Retry),
+        // A catch-all the host gives no detail for; assume it may clear.
+        ErrorCode::InternalError(_) => ("internal-error", Retry),
+        // Configuration: the host's policy, TLS against the controller (a
+        // rejected certificate, a server alert such as `unknown_ca`, or TLS
+        // spoken to a plain-HTTP port), or a request the host will refuse
+        // every time.
+        ErrorCode::ConfigurationError => ("configuration-error", Challenge),
+        ErrorCode::HttpRequestDenied => ("HTTP-request-denied", Challenge),
+        ErrorCode::TlsCertificateError => ("TLS-certificate-error", Challenge),
+        ErrorCode::TlsProtocolError => ("TLS-protocol-error", Challenge),
+        ErrorCode::TlsAlertReceived(_) => ("TLS-alert-received", Challenge),
+        ErrorCode::DestinationIpProhibited => ("destination-IP-prohibited", Challenge),
+        ErrorCode::LoopDetected => ("loop-detected", Challenge),
+        ErrorCode::HttpUpgradeFailed => ("HTTP-upgrade-failed", Challenge),
+        ErrorCode::HttpRequestLengthRequired => ("HTTP-request-length-required", Challenge),
+        ErrorCode::HttpRequestBodySize(_) => ("HTTP-request-body-size", Challenge),
+        ErrorCode::HttpRequestMethodInvalid => ("HTTP-request-method-invalid", Challenge),
+        ErrorCode::HttpRequestUriInvalid => ("HTTP-request-URI-invalid", Challenge),
+        ErrorCode::HttpRequestUriTooLong => ("HTTP-request-URI-too-long", Challenge),
+        ErrorCode::HttpRequestHeaderSectionSize(_) => {
+            ("HTTP-request-header-section-size", Challenge)
+        }
+        ErrorCode::HttpRequestHeaderSize(_) => ("HTTP-request-header-size", Challenge),
+        ErrorCode::HttpRequestTrailerSectionSize(_) => {
+            ("HTTP-request-trailer-section-size", Challenge)
+        }
+        ErrorCode::HttpRequestTrailerSize(_) => ("HTTP-request-trailer-size", Challenge),
+    }
+}
+
+/// A given failure code is logged at most once per minute, so a controller
+/// restart under pull load does not log a line per request.
+const LOG_INTERVAL_NANOS: u64 = 60_000_000_000;
+
+/// When each failure code was last logged, and how many failures with it were
+/// left out since. Bounded by the number of `wasi:http` error codes.
+#[derive(Debug, Default)]
+pub(crate) struct LogLimit {
+    codes: HashMap<&'static str, (u64, u32)>,
+}
+
+impl LogLimit {
+    /// Whether a failure with `code` at `now` (monotonic nanoseconds) is
+    /// logged: `Some(left_out)` with the count left out since its last line,
+    /// or `None` while that line is under [`LOG_INTERVAL_NANOS`] old.
+    pub(crate) fn admit(&mut self, code: &'static str, now: u64) -> Option<u32> {
+        match self.codes.get_mut(code) {
+            Some((at, left_out)) if now.saturating_sub(*at) < LOG_INTERVAL_NANOS => {
+                *left_out = left_out.saturating_add(1);
+                None
+            }
+            Some(entry) => {
+                let left_out = entry.1;
+                *entry = (now, 0);
+                Some(left_out)
+            }
+            None => {
+                self.codes.insert(code, (now, 0));
+                Some(0)
+            }
+        }
+    }
+}
+
+// Per component instance, like the whoami cache: if the host instantiates per
+// request, the limit never applies and every failure is logged.
+thread_local! {
+    static LOG_LIMIT: RefCell<LogLimit> = RefCell::new(LogLimit::default());
+}
+
+/// Log a failed whoami call to stderr: the error code only, never its
+/// payload, the URL or the credential; rate-limited by [`LogLimit`].
+fn log_failure(error: &ErrorCode, now: u64) {
+    let (code, answer) = classify(error);
+    if let Some(left_out) = LOG_LIMIT.with(|limit| limit.borrow_mut().admit(code, now)) {
+        eprintln!("{}", log_line(code, answer, left_out));
+    }
+}
+
+fn log_line(code: &str, answer: FailureAnswer, left_out: u32) -> String {
+    let status = match answer {
+        FailureAnswer::Retry => 503,
+        FailureAnswer::Challenge => 401,
+    };
+    let line = format!("oci-registry: tenant controller whoami failed: {code}; answering {status}");
+    if left_out == 0 {
+        line
+    } else {
+        format!("{line} ({left_out} more since the last line)")
+    }
 }
 
 /// `Retry-After` as delta-seconds (RFC 9110). An HTTP-date or anything else
@@ -294,6 +445,7 @@ async fn config_string(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bindings::wasi::http::types::{DnsErrorPayload, TlsAlertReceivedPayload};
 
     #[test]
     fn parses_controller_base_urls() {
@@ -437,6 +589,135 @@ mod tests {
     }
 
     #[test]
+    fn configuration_type_transport_errors_get_the_challenge() {
+        for error in [
+            ErrorCode::ConfigurationError,
+            ErrorCode::HttpRequestDenied,
+            ErrorCode::TlsCertificateError,
+            ErrorCode::TlsProtocolError,
+            ErrorCode::TlsAlertReceived(TlsAlertReceivedPayload {
+                alert_id: Some(48),
+                alert_message: Some("unknown_ca".to_string()),
+            }),
+            ErrorCode::DestinationIpProhibited,
+            ErrorCode::LoopDetected,
+            ErrorCode::HttpRequestUriInvalid,
+            ErrorCode::HttpRequestHeaderSize(None),
+        ] {
+            let label = format!("{error:?}");
+            assert_eq!(
+                verdict(Outcome::Failed(error), "acme"),
+                Whoami::Denied,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_transport_errors_stay_unavailable() {
+        for error in [
+            ErrorCode::DnsError(DnsErrorPayload {
+                rcode: Some("SERVFAIL".to_string()),
+                info_code: None,
+            }),
+            ErrorCode::HttpResponseIncomplete,
+            ErrorCode::HttpResponseTimeout,
+            ErrorCode::ConnectionWriteTimeout,
+            ErrorCode::InternalError(Some("token=secret".to_string())),
+        ] {
+            let label = format!("{error:?}");
+            assert_eq!(
+                verdict(Outcome::Failed(error), "acme"),
+                Whoami::Unavailable { retry_after: None },
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_logged_code_is_the_wit_name_without_its_payload() {
+        use FailureAnswer::{Challenge, Retry};
+        assert_eq!(
+            classify(&ErrorCode::ConfigurationError),
+            ("configuration-error", Challenge)
+        );
+        assert_eq!(
+            classify(&ErrorCode::HttpRequestDenied),
+            ("HTTP-request-denied", Challenge)
+        );
+        assert_eq!(
+            classify(&ErrorCode::TlsCertificateError),
+            ("TLS-certificate-error", Challenge)
+        );
+        assert_eq!(
+            classify(&ErrorCode::TlsProtocolError),
+            ("TLS-protocol-error", Challenge)
+        );
+        assert_eq!(
+            classify(&ErrorCode::ConnectionRefused),
+            ("connection-refused", Retry)
+        );
+        // A payload never reaches the log line.
+        let (code, answer) = classify(&ErrorCode::InternalError(Some(
+            "Bearer dik_secret".to_string(),
+        )));
+        assert_eq!((code, answer), ("internal-error", Retry));
+        let line = log_line(code, answer, 0);
+        assert_eq!(
+            line,
+            "oci-registry: tenant controller whoami failed: internal-error; answering 503"
+        );
+        assert!(!line.contains("dik_secret"));
+        assert_eq!(
+            log_line("TLS-protocol-error", Challenge, 4),
+            "oci-registry: tenant controller whoami failed: TLS-protocol-error; answering 401 \
+             (4 more since the last line)"
+        );
+    }
+
+    #[test]
+    fn a_failure_code_is_logged_at_most_once_per_interval() {
+        let mut limit = LogLimit::default();
+        let t0 = 1_000;
+        assert_eq!(limit.admit("connection-refused", t0), Some(0));
+        assert_eq!(limit.admit("connection-refused", t0 + 1), None);
+        assert_eq!(
+            limit.admit("connection-refused", t0 + LOG_INTERVAL_NANOS - 1),
+            None
+        );
+        // Another code has its own interval.
+        assert_eq!(limit.admit("DNS-timeout", t0 + 2), Some(0));
+        // Once the interval is over the code is logged again, with the count
+        // left out since its last line.
+        assert_eq!(
+            limit.admit("connection-refused", t0 + LOG_INTERVAL_NANOS),
+            Some(2)
+        );
+        assert_eq!(
+            limit.admit("connection-refused", t0 + LOG_INTERVAL_NANOS + 1),
+            None
+        );
+        assert_eq!(
+            limit.admit("connection-refused", t0 + 2 * LOG_INTERVAL_NANOS),
+            Some(1)
+        );
+        // A clock that goes backwards does not log more often.
+        assert_eq!(limit.admit("DNS-timeout", 0), None);
+    }
+
+    #[test]
+    fn a_controller_429_gets_the_challenge_not_a_retry() {
+        // Pinned: whoami is not rate-limited, so a 429 denies (see `verdict`).
+        for retry_after in [None, Some("30")] {
+            assert_eq!(
+                verdict(answered(429, retry_after, PRINCIPAL), "acme"),
+                Whoami::Denied,
+                "{retry_after:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_controller_401_or_403_denies() {
         for status in [401, 403] {
             for retry_after in [None, Some("30")] {
@@ -451,7 +732,7 @@ mod tests {
 
     #[test]
     fn other_statuses_and_unsendable_requests_deny() {
-        for status in [100, 301, 400, 404, 429, 600] {
+        for status in [100, 301, 400, 404, 600] {
             assert_eq!(
                 verdict(answered(status, Some("5"), PRINCIPAL), "acme"),
                 Whoami::Denied,
