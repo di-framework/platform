@@ -92,41 +92,31 @@ describe('tenant-secret-update admission (#112)', () => {
     }
   });
 
-  it('denies dry-run UPDATEs that drop keys (no dryRun exemption - CLI probes rely on it)', () => {
-    // tenant-secret-update has NO dryRun exemption: the CLI's dry-run probes (cli-extensions#70)
-    // rely on this policy denying dry-run requests that would drop a Secret key, to prove three
-    // things without reading: every extra key in <workload>-control is declared, the CLI keys
-    // are present, and the policy applies to this caller. If a dryRun exemption is added, the
-    // probes pass silently and undeclared keys are "kept" without guard (#204).
-    expect(both({ username: developer, dryRun: true, oldKeys: ['a', 'b'], newKeys: ['a'] })).toBe(
-      SECRET_UPDATE_KEYS_MESSAGE,
-    );
-    expect(both({ username: developer, dryRun: true, oldKeys: ['a'], newKeys: ['b'] })).toBe(
-      SECRET_UPDATE_KEYS_MESSAGE,
-    );
+  it('denies dry-run UPDATEs exactly like real ones (no dryRun exemption, #204)', () => {
+    // cli-extensions#70 probes this policy with dry-run UPDATEs; see the admission.ts doc comment.
+    const dropKey = [
+      { oldKeys: ['a', 'b'], newKeys: ['a'] },
+      { oldKeys: ['a'], newKeys: ['b'] },
+    ];
+    for (const keys of dropKey) {
+      const real = both({ username: developer, ...keys });
+      expect(real).toBe(SECRET_UPDATE_KEYS_MESSAGE);
+      expect(both({ username: developer, dryRun: true, ...keys })).toBe(real);
+    }
   });
 
   it('allows dry-run UPDATEs that keep all keys', () => {
-    // dryRun UPDATEs that keep all keys are allowed, just like real UPDATEs.
-    expect(both({ username: developer, dryRun: true, oldKeys: ['a'], newKeys: ['a'] })).toBe(
-      undefined,
-    );
     expect(
-      both({
-        username: developer,
-        dryRun: true,
-        oldKeys: ['a', 'b'],
-        newKeys: ['a', 'b'],
-      }),
-    ).toBe(undefined);
+      both({ username: developer, dryRun: true, oldKeys: ['a'], newKeys: ['a'] }),
+    ).toBeUndefined();
+    expect(
+      both({ username: developer, dryRun: true, oldKeys: ['a', 'b'], newKeys: ['a', 'b'] }),
+    ).toBeUndefined();
   });
 
-  it('has no request.dryRun clause in its validations (no exemption)', () => {
-    // Assert that the policy has no dryRun-related exclusions. The CLI's dry-run probes
-    // (tenant-auth/README and cli-extensions#70) must receive the full admission check.
-    for (const validation of spec.validations) {
-      expect(validation.expression).not.toContain('request.dryRun');
-      expect(validation.expression).not.toContain('dryRun');
-    }
+  it('mentions dryRun nowhere in the rendered policy or binding (no exemption)', () => {
+    // Covers validations, matchConditions, variables and the binding, not only validations.
+    expect(JSON.stringify({ spec, binding: policy.binding })).not.toContain('dryRun');
+    expect((spec as unknown as Record<string, unknown>).matchConditions).toBeUndefined();
   });
 });

@@ -873,7 +873,7 @@ export const SECRET_UPDATE_KEYS_MESSAGE =
  * with dry-run UPDATEs to prove three things without reading Secrets: that every extra key in
  * `<workload>-control` is declared, that CLI keys are present, and that the policy applies to the
  * caller. If a dryRun exemption is added, probes pass silently and undeclared keys are "kept"
- * without guard (#204). See tenant-secret-update.test.ts for the test that pins this.
+ * without guard (#204). tenant-secret-update.test.ts pins this.
  */
 function tenantSecretUpdatePolicy(namespace: string): AdmissionPolicy {
   const developer = `request.userInfo.username.startsWith('system:serviceaccount:${namespace}:di-user-')`;
