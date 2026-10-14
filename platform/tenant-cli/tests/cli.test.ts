@@ -688,6 +688,11 @@ describe('run', () => {
     warnings = [{ code: 'referenced', detail, deployments: ['web-prod'] }];
     expect(await run(['vars', 'unset', 'LEVEL', '--env', 'prod'], io(fetch))).toBe(0);
     expect(err.slice(-2)).toEqual([`warning: ${detail}`, 'unset var LEVEL in prod']);
+    // With --json the warnings go to stdout as the VarUnset body, not to stderr.
+    const errors = err.length;
+    expect(await run(['vars', 'unset', 'LEVEL', '--env', 'prod', '--json'], io(fetch))).toBe(0);
+    expect(JSON.parse(out.at(-1) as string)).toEqual({ warnings });
+    expect(err.slice(errors)).toEqual(['unset var LEVEL in prod']);
     expect(await run(['vars', 'set', '--env', 'prod'], io(fetch))).toBe(1);
     expect(err.at(-1)).toBe('usage: vars list|set|update|unset <name>');
   });

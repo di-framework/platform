@@ -209,9 +209,20 @@ export function createClient(options: ClientOptions) {
         query: { env },
         body: { value },
       }),
-    /** Removes the var; `warnings` names deployed workloads that injected it (platform#100). */
-    unsetVar: (env: Env, name: string) =>
-      json<VarUnset>({ method: 'DELETE', path: PATHS.var, params: { name }, query: { env } }),
+    /**
+     * Removes the var; `warnings` names deployed workloads that injected it (platform#100). A
+     * controller from before #100 answers 204 with no body, read as no warnings.
+     */
+    async unsetVar(env: Env, name: string): Promise<VarUnset> {
+      const response = await send({
+        method: 'DELETE',
+        path: PATHS.var,
+        params: { name },
+        query: { env },
+      });
+      const text = await response.text();
+      return text.trim() ? (JSON.parse(text) as VarUnset) : { warnings: [] };
+    },
   };
 }
 

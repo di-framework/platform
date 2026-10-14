@@ -88,6 +88,17 @@ test('every operation hits its contract path with the bearer and the right body'
   expect(calls[13]?.body).toBeUndefined();
 });
 
+test('unsetVar reads an empty success from a controller before #100 as no warnings', async () => {
+  for (const answer of [
+    () => new Response(null, { status: 204 }),
+    () => new Response('', { status: 200 }),
+  ]) {
+    const { fetch } = fakeFetch({ 'DELETE /v1/vars/LEVEL': answer });
+    const client = createClient({ baseUrl: 'https://controller.test', token: 't', fetch });
+    expect(await client.unsetVar('prod', 'LEVEL')).toEqual({ warnings: [] });
+  }
+});
+
 test('errors become ControllerError with the problem details when the body has them', async () => {
   const { fetch, calls } = fakeFetch({
     'GET /v1/auth/whoami': () =>

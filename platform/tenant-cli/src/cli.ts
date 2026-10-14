@@ -755,9 +755,12 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
       }
       if (sub === 'unset') {
         if (secret) await client.unsetSecret(env, name);
-        else
-          for (const warning of (await client.unsetVar(env, name)).warnings)
-            io.stderr(`warning: ${warning.detail}`);
+        else {
+          const result = await client.unsetVar(env, name);
+          // With --json the warnings go to stdout for scripts; otherwise each is a stderr line.
+          if (flags.json === 'true') io.stdout(JSON.stringify(result, null, 2));
+          else for (const warning of result.warnings) io.stderr(`warning: ${warning.detail}`);
+        }
       } else {
         const value = valueFrom(flags, io);
         if (sub === 'set')
