@@ -315,6 +315,17 @@ test('an invalid tenant host allowlist fails before any resource, network policy
       {},
       'runtimeNats.maxMemoryStore must be at most 64Mi, half the di-nats memory limit (128Mi)',
     ],
+    [
+      {
+        tenantAuth: {
+          image: `ghcr.io/x/y@sha256:${'a'.repeat(64)}`,
+          issuer: 'https://issuer.example',
+          oauthClient: { id: 'access', secretName: 'tenant-auth-oauth' },
+        },
+      },
+      { routeUrlPattern: 'https://{host}.{tenant}.localhost:28180' },
+      'cannot be derived from routeUrlPattern https://{host}.{tenant}.localhost:28180',
+    ],
     [{}, { apiServer: 'https://k8s.example:6443' }, 'apiServer requires kubeconfig'],
     [
       { insecureRegistries: ['http://registry.example:5000'] },
@@ -862,6 +873,29 @@ test('install validates config routeAliases and deploys them normalized to the g
   expect(fromArgs.gatewayConfig?.routeAliases).toEqual({
     'identity.identity': 'identity.identity-pg',
   });
+}, 120_000);
+
+test('install routes tenant-auth hosts derived from routeUrlPattern through the gateway (#128)', () => {
+  const tenantAuth = {
+    image: `ghcr.io/x/y@sha256:${'a'.repeat(64)}`,
+    issuer: 'https://issuer.example',
+    oauthClient: { id: 'access', secretName: 'tenant-auth-oauth' },
+  };
+  const pattern = `routeUrlPattern: 'http://{host}.{tenant}.localhost:28180'`;
+  const derived = gatewayInstall({ tenantAuth }, pattern);
+  expect(derived.error).toBeUndefined();
+  expect(derived.gatewayConfig).toMatchObject({
+    tenantAuthRoutes: { console: 'console', controller: 'controller' },
+  });
+  // An explicit URL wins: a loopback console stays unrouted.
+  const explicit = gatewayInstall(
+    { tenantAuth: { ...tenantAuth, consolePublicUrl: 'http://127.0.0.1:8787' } },
+    pattern,
+  );
+  expect(explicit.gatewayConfig).toMatchObject({
+    tenantAuthRoutes: { controller: 'controller' },
+  });
+  expect(explicit.gatewayConfig).not.toHaveProperty('tenantAuthRoutes.console');
 }, 120_000);
 
 test('install refuses a gateway config key even when PlatformArgs.routeAliases is passed (#217)', () => {

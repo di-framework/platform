@@ -33,6 +33,7 @@ import {
   type TenantAuthConfig,
   tenantAuthRoutes,
   userTokenSecretName,
+  withDerivedPublicUrls,
 } from './tenancy/resources';
 import { secretReaderFromKubeconfig } from './token-secret-reader';
 import { waitForTokenSecret } from './token-wait';
@@ -142,8 +143,10 @@ export function createPlatform(args: PlatformArgs) {
   });
   const tenantHostImage = config.get('tenantHostImage') ?? DEFAULT_HOST_IMAGE;
   assertHostImageSupportsAllowlist(tenantHostImage, insecureRegistries);
-  const tenantAuth = config.getObject<TenantAuthConfig>('tenantAuth');
-  assertTenantAuthConfig(tenantAuth);
+  const configuredTenantAuth = config.getObject<TenantAuthConfig>('tenantAuth');
+  assertTenantAuthConfig(configuredTenantAuth);
+  // Unset tenant-auth public URLs default to gateway routes (#128); explicit URLs are kept.
+  const tenantAuth = withDerivedPublicUrls(configuredTenantAuth, routeUrlPattern);
   const runtimeNats = args.runtimeNats ?? config.getObject<RuntimeNatsConfig>('runtimeNats');
   assertRuntimeNatsConfig(runtimeNats);
   const backingServiceClasses = resolveBackingServiceClasses(config);

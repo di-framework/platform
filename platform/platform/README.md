@@ -752,11 +752,11 @@ tenantAuth:
   issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80  # optional, for a loopback issuer
   issuerUpstreamPodPort: 8080                                # optional, the pod port behind it
   issuerIp: 192.0.2.7                                        # optional, when pods cannot resolve the issuer
-  consolePublicUrl: http://console.{tenant}.localhost:28180  # optional; default http://127.0.0.1:8787
-  controllerPublicUrl: https://127.0.0.1:8788                # optional
+  consolePublicUrl: http://console.{tenant}.localhost:28180  # optional; default derived from routeUrlPattern, else http://127.0.0.1:8787
+  controllerPublicUrl: https://127.0.0.1:8788                # optional; default derived from routeUrlPattern, else https://127.0.0.1:8788
   registry:                                                  # optional: each tenant's own OCI registry (#83)
     component: ghcr.io/di-framework/oci-registry@sha256:29ec834c5f515e99146437c831e9f8bf25c98f32079afd9e715335d9f00ba270  # required, pinned by digest
-    publicUrl: https://registry.{tenant}.localhost:28180     # optional; default https://127.0.0.1:8790
+    publicUrl: https://registry.{tenant}.localhost:28180     # optional; default derived from routeUrlPattern, else https://127.0.0.1:8790
     limits:                                                  # optional; each field optional, defaults shown
       maxBodyBytes: 536870912                                # TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES
       upstreamTimeoutMs: 60000                               # TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS
@@ -814,9 +814,19 @@ tenantAuth:
   A Secret from before the CA existed (one `CA:TRUE` certificate, no `ca.crt`) is replaced once.
 - Routes: when the platform gateway is published (`routeUrlPattern`), a public URL whose host is
   `<label>.{tenant}.localhost` on the gateway port is routed through it, so a new Tenant gets a
-  reachable console and controller with no script. Set, for example,
-  `consolePublicUrl: http://console.{tenant}.localhost:28180` and
-  `controllerPublicUrl: https://controller.{tenant}.localhost:28180`. The console route is
+  reachable console and controller with no script. `createPlatform` derives every public URL
+  left unset from `routeUrlPattern` (#128), before any resource is created: with
+  `routeUrlPattern: http://{host}.{tenant}.localhost:28180` the defaults are
+  `consolePublicUrl: http://console.{tenant}.localhost:28180`,
+  `controllerPublicUrl: https://controller.{tenant}.localhost:28180` and, with a registry,
+  `registry.publicUrl: https://registry.{tenant}.localhost:28180` (a pattern without a port
+  gives the console no port and the TLS hosts `:80`, the gateway's own). An explicit URL always
+  wins, including a `127.0.0.1` one that keeps that host on a port-forward. Only an
+  `http://{host}.{tenant}.localhost[:<port>]` pattern can be derived from; any other pattern
+  (`https://`, another domain) fails `createPlatform` with `cannot be derived from
+  routeUrlPattern` unless all of these URLs are set explicitly. The console's public URL is
+  the one its OAuth redirects use, so the shared OAuth client must accept the derived console
+  host. The console route is
   plain HTTP to `tenant-console:8787` with the original `Host`. The controller route is TLS
   passthrough: the gateway reads only the SNI name and pipes the connection to
   `tenant-controller:8788`, so the controller's own certificate (covering the public host) and
@@ -825,9 +835,9 @@ tenantAuth:
   `controllerUrl`. Policies `tenant-console-gateway` and `tenant-controller-gateway` admit only
   the gateway pods, each to its own port, and the gateway's egress gains only those two ports
   in this installation's tenant namespaces. A routed label takes that host away from tenant
-  workloads (`console.<tenant>.localhost` no longer reaches `di-http`). The default
-  `127.0.0.1` URLs, unset URLs, other hosts, and any URL while no gateway is published stay
-  unrouted, as before. A gateway-shaped URL the gateway cannot route (wrong scheme, port, or a
+  workloads (`console.<tenant>.localhost` no longer reaches `di-http`). Explicit `127.0.0.1`
+  URLs, other hosts, and any URL while no gateway is published (the `127.0.0.1` defaults then
+  apply) stay unrouted. A gateway-shaped URL the gateway cannot route (wrong scheme, port, or a
   host shared by both) is reported on `TenantAuthReady` with reason `RouteError`; `Ready` is
   unaffected. The routes are config, not per-Tenant objects: the gateway policies carry the
   `tenant-auth` component label and are removed with the rest of the pair.
@@ -869,7 +879,7 @@ tenantAuth:
     controller, and answers plain HTTP for it with `400`. The gateway knows the registry's
     HTTP host whenever a registry is configured, so that `400` holds even when users reach the
     registry by port-forward (`kubectl port-forward svc/tenant-controller 8790`, the default
-    `https://127.0.0.1:8790`). Credentials therefore never cross plain HTTP off-cluster; the
+    `https://127.0.0.1:8790` when no gateway is published). Credentials therefore never cross plain HTTP off-cluster; the
     front-to-host and registry-to-controller hops are plain HTTP on the pod network, as the
     gateway-to-host hop already is. The alternative, terminating TLS at the gateway, would put
     every tenant's private key in the platform namespace; TLS passthrough keeps keys per tenant.
