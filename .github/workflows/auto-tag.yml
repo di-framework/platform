@@ -44,6 +44,13 @@ jobs:
         with:
           node-version: "20"
 
+      # Same Bun as the Test workflow (ci.yml), so the bun.lock this job writes is
+      # the one `bun install --frozen-lockfile` there accepts.
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: latest
+
       - name: Compute next version
         id: version
         run: |
@@ -103,12 +110,18 @@ jobs:
           npm version "$NEXT" --no-git-tag-version --allow-same-version
           node scripts/sync-workspace-versions.mjs
 
-          git add package.json
+          # bun.lock records each workspace package's version. Neither step above
+          # updates it, and `bun install --frozen-lockfile` still passes with the
+          # old versions, so regenerate it here and check it before committing (#260).
+          bun install --lockfile-only --ignore-scripts
+          bun scripts/check-lockfile-versions.ts
+
+          git add package.json bun.lock
           # Workspace manifests are not all under packages/.
           git ls-files -m -- '*package.json' | while IFS= read -r f; do
             git add "$f"
           done
-          git add -u bun.lock package-lock.json yarn.lock pnpm-lock.yaml 2>/dev/null || true
+          git add -u package-lock.json yarn.lock pnpm-lock.yaml 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "::error::nothing to commit for v$NEXT (package.json already at that version?)"
             exit 1
