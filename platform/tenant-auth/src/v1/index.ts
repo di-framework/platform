@@ -50,7 +50,8 @@ for (const module of Object.values(MODULES))
     };
   }
 
-const TITLES: Record<number, string> = {
+/** Problem titles for the client errors `/v1` answers; the controller's pre-dispatch refusals use them too. */
+export const TITLES: Record<number, string> = {
   400: 'Bad Request',
   401: 'Unauthorized',
   403: 'Forbidden',

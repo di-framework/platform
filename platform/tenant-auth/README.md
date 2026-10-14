@@ -425,6 +425,13 @@ target whose `data.bundle` does not match `data.digest`, or is not a complete bu
 Controller: `GET /-/healthz` (open); `GET /-/whoami`, `GET|POST /-/keys`, `DELETE /-/keys/:id`,
 `GET /-/members` (bearer); everything else is proxied to the API server under the path policy.
 
+Errors under `/v1/` are RFC 9457 `application/problem+json`, including the authentication refusals
+raised before dispatch (platform#97): a missing or rejected credential is `401` with
+`WWW-Authenticate: Bearer realm="di-framework-tenant"` (plus `error="invalid_token"` when a
+credential was sent), and a suspended account or a caller without a membership is `403`. An
+identity or cluster outage is a `502` with a fixed detail. The detail never quotes the
+credential. `/-/` and the Kubernetes proxy keep the Kubernetes `Status` body.
+
 Console: `GET /login` (+ `cli_callback`, `cli_state`), `GET /oidc/callback`, `GET /logout`,
 `GET /cli/info`, `POST /cli/exchange`, `POST /cli/refresh`, `POST /cli/logout` (unused by any client in this repo now that the prototype CLI is removed); pages `/`,
 `/logs/:app`, `/members`, `/keys`, `POST /keys`, `POST /keys/:id/revoke`.
