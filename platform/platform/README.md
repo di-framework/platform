@@ -247,8 +247,14 @@ ServiceAccount token Secret `di-user-<user>-<tenant>-token` (type
 `kubernetes.io/service-account-token`) in the platform namespace, owned and labelled
 like the user's other resources. A User reports `Ready` only after Kubernetes has
 populated every one of its token Secrets. Removing a membership, suspending or
-deleting the user, or suspending the tenant deletes the matching Secret and so
-invalidates the token.
+deleting the user, or suspending, deleting or removing the tenant deletes the matching
+Secret and so invalidates the token.
+
+A membership is first granted once its Tenant is `Ready` for its current generation. After
+that, a Tenant that is merely not Ready (reconciling a new generation, or failing to
+reconcile) keeps the membership's RoleBindings and token Secret, and the User stays
+`Ready`, so `pulumi up` still reads the token during an upgrade. A role change still applies
+to the kept bindings.
 
 After each User is Ready, `createPlatform` reads its token Secrets and builds one
 kubeconfig per membership: the API server and cluster CA (`ca.crt` from the token
