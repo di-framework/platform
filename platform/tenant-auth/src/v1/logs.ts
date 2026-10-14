@@ -5,6 +5,7 @@ import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
 import {
   APPLICATION,
   PROJECTION,
+  projectedDeployments,
   projectedFailures,
   projectedLines,
   validLabelValue,
@@ -76,23 +77,24 @@ function sinceBound(since: string | undefined, now = Date.now()): string | undef
 
 /**
  * The LogEvents of one logs ConfigMap, oldest first. A line is attributed to the
- * WorkloadDeployment of the host failure it reports (`data.failures`); every other line to the
- * application, since the projection keeps one ring per application.
+ * WorkloadDeployment the projection recorded for it (`data.deployments`). A line without one,
+ * written before the projection recorded deployments, falls back to the deployment whose
+ * newest host failure it reports (`data.failures`), and otherwise to the application.
  */
 export function logEvents(configMap: LogsConfigMap): LogEvent[] {
   const application = configMap.metadata.labels?.[APPLICATION] ?? '';
+  const deployments = projectedDeployments(configMap as never);
   const failures = Object.entries(projectedFailures(configMap as never));
+  const failed = (timestamp: string, message: string) =>
+    failures.find(([, f]) => f.time === timestamp && message === `host: ${f.message}`)?.[0];
   const events: LogEvent[] = [];
-  for (const line of projectedLines(configMap as never)) {
+  for (const [index, line] of projectedLines(configMap as never).entries()) {
     const match = LINE.exec(line);
     if (!match) continue;
     const [, timestamp, level, message] = match as unknown as [string, string, string, string];
-    const failure = failures.find(
-      ([, f]) => f.time === timestamp && message === `host: ${f.message}`,
-    );
     events.push({
       timestamp,
-      deployment: failure ? failure[0] : application,
+      deployment: deployments?.[index] || failed(timestamp, message) || application,
       level: LEVELS[level],
       message,
     });
@@ -324,8 +326,7 @@ function stream(
 /**
  * `GET /v1/services/:service/logs` (platform#54): the `logs` projection as server-sent events.
  * `env` is accepted and ignored: the log ConfigMaps carry no environment label. The `deployment`
- * filter only sees lines attributed through `data.failures`, which keeps the newest host failure
- * per deployment, so older failure lines of a deployment are attributed to the application.
+ * filter matches the WorkloadDeployment each line is attributed to (see logEvents).
  */
 async function serveLogs(_command: unknown, call: HttpCall, context: V1Context): Promise<Response> {
   const service = call.request.params?.service ?? '';

@@ -13,6 +13,9 @@ import { INSTALLATION, type Resource, TENANT } from './resources';
  * The span fields carry `workload.name` and `workload.namespace`; the newest of these
  * per WorkloadDeployment is also published as `data.failures` for console status.
  *
+ * `data.lines` is the ring the console shows. `data.deployments` names the WorkloadDeployment
+ * of each ring line, in the same order, so a reader can filter one deployment's lines.
+ *
  * The host's service supervisor loop runs in an uninstrumented task (wash-runtime
  * `engine/workload.rs`), so its WARN/ERROR lines carry no span. Those are attributed by
  * a heuristic; see attributeEntries.
@@ -264,6 +267,15 @@ export interface HostFailure {
 }
 
 /**
+ * One ring line and the WorkloadDeployment it is attributed to. `deployment` is '' for a
+ * line published before the projection recorded deployments.
+ */
+export interface RingLine {
+  line: string;
+  deployment: string;
+}
+
+/**
  * One attributed event. `line` is what the ring shows; `failure` is set for host failure
  * lines; `start` (host workload name, no line) marks a `Starting workload` line.
  */
@@ -428,15 +440,16 @@ export function attributeLogs(
  * The newest `hostMax` host lines are kept first, guest lines fill the rest newest first,
  * and only then older host lines. `existing` is the published ring (older than
  * `incoming`, which may interleave several pods and is put in timestamp order); the
- * result keeps that order.
+ * result keeps that order. Ring lines are kept or dropped with their deployment.
  */
-export function appendRing(
-  existing: string[],
-  incoming: string[],
+export function appendRing<T extends string | RingLine>(
+  existing: T[],
+  incoming: T[],
   max = MAX_LINES,
   hostMax = MAX_HOST_LINES,
-): string[] {
-  const stamp = (line: string) => line.split(' ')[0] as string;
+): T[] {
+  const text = (entry: T) => (typeof entry === 'string' ? entry : entry.line);
+  const stamp = (entry: T) => text(entry).split(' ')[0] as string;
   const sorted = [...incoming].sort((a, b) =>
     stamp(a) < stamp(b) ? -1 : stamp(a) > stamp(b) ? 1 : 0,
   );
@@ -445,7 +458,7 @@ export function appendRing(
   const keep = new Set<number>();
   const fill = (limit: number, take: (line: string) => boolean) => {
     for (let i = merged.length - 1; i >= 0 && keep.size < limit; i--)
-      if (take(merged[i] as string)) keep.add(i);
+      if (take(text(merged[i] as T))) keep.add(i);
   };
   fill(Math.min(hostMax, max), (line) => HOST_LINE.test(line));
   fill(max, (line) => !HOST_LINE.test(line));
@@ -459,6 +472,38 @@ export function projectedLines(configMap: Resource | undefined): string[] {
   const lines = data?.lines;
   if (typeof lines !== 'string' || lines.length === 0) return [];
   return lines.split('\n');
+}
+
+/**
+ * `data.deployments`: the WorkloadDeployment of each `data.lines` line, in order. Undefined
+ * when absent, malformed, or not aligned with the lines, e.g. a ConfigMap written before
+ * the projection recorded deployments.
+ */
+export function projectedDeployments(configMap: Resource | undefined): string[] | undefined {
+  const data = configMap?.data as Record<string, unknown> | undefined;
+  if (typeof data?.deployments !== 'string') return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data.deployments);
+  } catch {
+    return undefined;
+  }
+  if (
+    !Array.isArray(parsed) ||
+    !parsed.every((name) => typeof name === 'string') ||
+    parsed.length !== projectedLines(configMap).length
+  )
+    return undefined;
+  return parsed;
+}
+
+/** The published ring: each line with its deployment ('' when not recorded). */
+export function projectedRing(configMap: Resource | undefined): RingLine[] {
+  const deployments = projectedDeployments(configMap);
+  return projectedLines(configMap).map((line, index) => ({
+    line,
+    deployment: deployments?.[index] ?? '',
+  }));
 }
 
 /** Existing `data.failures` from a ConfigMap; malformed entries are ignored. */
@@ -557,10 +602,16 @@ export function logsConfigMap(
   namespace: string,
   installation: string,
   application: string,
-  lines: string[],
+  lines: (string | RingLine)[],
   failures: Record<string, HostFailure> = {},
 ): Resource {
-  const data: Record<string, string> = { lines: lines.join('\n') };
+  const ring = lines.map((entry) =>
+    typeof entry === 'string' ? { line: entry, deployment: '' } : entry,
+  );
+  const data: Record<string, string> = { lines: ring.map((entry) => entry.line).join('\n') };
+  // Written only when a line is attributed, so a ring of unattributed lines stays as before.
+  if (ring.some((entry) => entry.deployment))
+    data.deployments = JSON.stringify(ring.map((entry) => entry.deployment));
   if (Object.keys(failures).length > 0) data.failures = JSON.stringify(failures);
   return {
     apiVersion: 'v1',

@@ -39,6 +39,8 @@ import {
   type ProjectedEntry,
   projectedFailures,
   projectedLines,
+  projectedRing,
+  type RingLine,
   validLabelValue,
   type WorkloadIdentity,
 } from './log-projection';
@@ -1777,9 +1779,10 @@ export class Controller {
   /**
    * Publish one logs ConfigMap per console application (#10). Only `wasi:logging` lines the
    * host attributed to a workload in this tenant, and host WARN/ERROR lines from its
-   * `workload_start` span, are kept. The newest host failure per WorkloadDeployment goes to
-   * `data.failures`. Nothing is written for an application with no attributed lines, so
-   * absence stays the console's unpublished state.
+   * `workload_start` span, are kept. Each line's WorkloadDeployment goes to `data.deployments`
+   * and the newest host failure per WorkloadDeployment to `data.failures`. Nothing is written
+   * for an application with no attributed lines, so absence stays the console's unpublished
+   * state.
    */
   async projectLogs(tenant: Tenant): Promise<void> {
     const n = names(tenant.metadata.name);
@@ -1817,7 +1820,7 @@ export class Controller {
     const existingByApp = new Map(
       existing.map((item) => [item.metadata.labels?.['di-framework.dev/application'] ?? '', item]),
     );
-    const incoming = new Map<string, string[]>();
+    const incoming = new Map<string, RingLine[]>();
     // Failures are merged newest-wins by deployment, so they skip the line floor: a
     // restarted controller re-reading old lines cannot duplicate them, and never loses one.
     const failures = new Map<string, ProjectedEntry[]>();
@@ -1845,7 +1848,9 @@ export class Controller {
         for (const entry of fresh) if (entry.time > newest) newest = entry.time;
         incoming.set(app, [
           ...(incoming.get(app) ?? []),
-          ...fresh.flatMap((entry) => (entry.line ? [entry.line] : [])),
+          ...fresh.flatMap((entry) =>
+            entry.line ? [{ line: entry.line, deployment: entry.deployment }] : [],
+          ),
         ]);
         failures.set(app, [...(failures.get(app) ?? []), ...entries]);
       }
@@ -1865,7 +1870,7 @@ export class Controller {
           n.namespace,
           this.cfg.installation,
           app,
-          appendRing(projectedLines(current), lines),
+          appendRing(projectedRing(current), lines),
           merged,
         ),
       );

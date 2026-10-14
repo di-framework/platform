@@ -248,6 +248,57 @@ describe('GET /v1/services/:service/logs', () => {
     ).toEqual(['host: boom']);
   });
 
+  test('the deployment filter sees every failure and line of that deployment', async () => {
+    // Two host failures and guest lines of web-prod, interleaved with web-staging lines, in
+    // the ring the projection writes; data.failures keeps only the newest failure.
+    const failure = (time: string, message: string) => ({
+      workload: 'web-prod-abc-1',
+      time,
+      level: 'ERROR' as const,
+      message,
+    });
+    const projected = logsConfigMap(
+      'acme',
+      'di-tenant-acme',
+      'platform',
+      'web',
+      [
+        { line: '2020-01-01T10:00:00Z INFO prod up', deployment: 'web-prod' },
+        { line: '2020-01-01T10:01:00Z ERROR host: first crash', deployment: 'web-prod' },
+        { line: '2020-01-01T10:02:00Z INFO staging up', deployment: 'web-staging' },
+        { line: '2020-01-01T10:03:00Z WARN prod retrying', deployment: 'web-prod' },
+        { line: '2020-01-01T10:04:00Z ERROR host: second crash', deployment: 'web-prod' },
+        { line: '2020-01-01T10:05:00Z ERROR host: staging crash', deployment: 'web-staging' },
+      ],
+      {
+        'web-prod': failure('2020-01-01T10:04:00Z', 'second crash'),
+        'web-staging': {
+          ...failure('2020-01-01T10:05:00Z', 'staging crash'),
+          workload: 'web-staging-def-1',
+        },
+      },
+    );
+    listed = { metadata: { resourceVersion: '7' }, items: [projected] };
+    expect(
+      messages(await read(await fetch(`${base}/web/logs?env=prod&deployment=web-prod`))),
+    ).toEqual(['prod up', 'host: first crash', 'prod retrying', 'host: second crash']);
+    expect(
+      messages(await read(await fetch(`${base}/web/logs?env=prod&deployment=web-staging`))),
+    ).toEqual(['staging up', 'host: staging crash']);
+    // Without a filter every line is streamed, each with its deployment.
+    const all = (await read(await fetch(`${base}/web/logs?env=prod`)))
+      .filter((e) => e.event === 'log')
+      .map((e) => JSON.parse(e.data).deployment);
+    expect(all).toEqual([
+      'web-prod',
+      'web-prod',
+      'web-staging',
+      'web-prod',
+      'web-prod',
+      'web-staging',
+    ]);
+  });
+
   test.each([
     ['since=yesterday', 'since must be'],
     ['since=5', 'since must be'],
@@ -561,4 +612,33 @@ describe('GET /v1/services/:service/logs', () => {
 
 test('logEvents tolerates a ConfigMap without labels or data', () => {
   expect(logEvents({ metadata: {} })).toEqual([]);
+});
+
+test('logEvents falls back to data.failures for lines without a recorded deployment', () => {
+  const failures = {
+    'web-v2': {
+      workload: 'web-v2-abc',
+      time: '2020-01-01T10:02:00Z',
+      level: 'ERROR',
+      message: 'boom',
+    },
+  };
+  const lines = [
+    '2020-01-01T10:00:00Z INFO old',
+    '2020-01-01T10:02:00Z ERROR host: boom',
+    '2020-01-01T10:03:00Z INFO new',
+  ];
+  const deploymentsOf = (deployments?: string) =>
+    logEvents({
+      metadata: configMap('web', lines).metadata,
+      data: {
+        ...configMap('web', lines, failures).data,
+        ...(deployments === undefined ? {} : { deployments }),
+      },
+    }).map((event) => event.deployment);
+  // Lines published before deployments were recorded ('').
+  expect(deploymentsOf(JSON.stringify(['', '', 'web-v1']))).toEqual(['web', 'web-v2', 'web-v1']);
+  // A ConfigMap without, or with misaligned, deployments falls back for every line.
+  expect(deploymentsOf()).toEqual(['web', 'web-v2', 'web']);
+  expect(deploymentsOf(JSON.stringify(['web-v1']))).toEqual(['web', 'web-v2', 'web']);
 });

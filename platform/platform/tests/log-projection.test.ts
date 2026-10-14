@@ -25,8 +25,11 @@ import {
   parseHostFailureLine,
   parseServiceLoopLine,
   parseWorkloadSpanLine,
+  projectedDeployments,
   projectedFailures,
   projectedLines,
+  projectedRing,
+  type RingLine,
   redactLogText,
   resolveWorkload,
   validLabelValue,
@@ -735,6 +738,73 @@ describe('ring buffer and ConfigMap shape', () => {
     ).toEqual(['a', 'b']);
   });
 
+  it('trims ring lines together with their deployment', () => {
+    const ts = (n: number) => `2026-10-01T23:00:00.${String(n).padStart(6, '0')}Z`;
+    const guest = (n: number): RingLine => ({
+      line: `${ts(n)} INFO tick ${n}`,
+      deployment: n % 2 ? 'mesh-site' : 'mesh-collector',
+    });
+    const host = (n: number): RingLine => ({
+      line: `${ts(n)} ERROR host: failed to start workload ${n}`,
+      deployment: 'mesh-site',
+    });
+    // Out-of-order incoming lines and a trim that keeps an old host line over newer guests.
+    const ring = appendRing([guest(0), host(1)], [guest(5), guest(3), guest(4), guest(2)], 3, 1);
+    expect(ring).toEqual([host(1), guest(4), guest(5)]);
+    // Written and read back, every line keeps its deployment.
+    const configMap = logsConfigMap('alpha', NS, 'test', 'mesh', ring);
+    expect(configMap.data).toEqual({
+      lines: ring.map((entry) => entry.line).join('\n'),
+      deployments: JSON.stringify(['mesh-site', 'mesh-collector', 'mesh-site']),
+    });
+    expect(projectedRing(configMap)).toEqual(ring);
+    const flood = appendRing(
+      [host(1)],
+      Array.from({ length: 1000 }, (_, i) => guest(i + 2)),
+    );
+    expect(flood).toHaveLength(MAX_LINES);
+    expect(flood[0]).toEqual(host(1));
+    for (const entry of flood.slice(1))
+      expect(entry.deployment).toBe(
+        Number(entry.line.split(' ').at(-1)) % 2 ? 'mesh-site' : 'mesh-collector',
+      );
+  });
+
+  it('reads data.deployments only when it is aligned with data.lines', () => {
+    const cm = (data: Record<string, string>): Resource => ({
+      apiVersion: 'v1',
+      kind: 'ConfigMap',
+      metadata: { name: 'x' },
+      data,
+    });
+    expect(projectedDeployments(undefined)).toBeUndefined();
+    expect(projectedDeployments(cm({ lines: 'a\nb' }))).toBeUndefined();
+    expect(projectedDeployments(cm({ lines: 'a\nb', deployments: '{' }))).toBeUndefined();
+    expect(projectedDeployments(cm({ lines: 'a\nb', deployments: '{"a":1}' }))).toBeUndefined();
+    expect(projectedDeployments(cm({ lines: 'a\nb', deployments: '["x",1]' }))).toBeUndefined();
+    expect(projectedDeployments(cm({ lines: 'a\nb', deployments: '["x"]' }))).toBeUndefined();
+    expect(projectedDeployments(cm({ lines: 'a\nb', deployments: '["x",""]' }))).toEqual(['x', '']);
+    // Without (aligned) deployments, the ring reads as unattributed lines.
+    expect(projectedRing(cm({ lines: 'a\nb', deployments: '["x"]' }))).toEqual([
+      { line: 'a', deployment: '' },
+      { line: 'b', deployment: '' },
+    ]);
+    // A ring of unattributed lines is written as before.
+    expect(
+      logsConfigMap('alpha', NS, 'test', 'mesh', [{ line: 'a', deployment: '' }]).data,
+    ).toEqual({ lines: 'a' });
+    expect(
+      logsConfigMap('alpha', NS, 'test', 'mesh', [
+        { line: 'a', deployment: '' },
+        'b',
+        {
+          line: 'c',
+          deployment: 'mesh-site',
+        },
+      ]).data,
+    ).toEqual({ lines: 'a\nb\nc', deployments: JSON.stringify(['', '', 'mesh-site']) });
+  });
+
   it('names ConfigMaps di-logs-<app>, hashing names that do not fit', () => {
     expect(logsConfigMapName('mesh')).toBe('di-logs-mesh');
     const long = logsConfigMapName('a'.repeat(80));
@@ -996,9 +1066,62 @@ describe('Controller.projectLogs', () => {
       [failed, startLine('mesh-site-78b9f6d4b6-5d4d5db5c6', 'w-2', 3)].join('\n'),
     );
     await controller.projectLogs(tenant());
+    // The failure line stays in the ring, still attributed to its deployment.
     expect(api.configMaps.get('di-logs-mesh')?.data).toEqual({
       lines: `${at(2)} ERROR host: failed to start workload reason="timed out"`,
+      deployments: JSON.stringify(['mesh-site']),
     });
+  });
+
+  it('records the deployment of every line, so older failures stay attributed', async () => {
+    const api = new LogApi();
+    api.logs.set(
+      'host-0',
+      [
+        hostLine('site up', { name: 'mesh-site-a-1', at: at(1) }),
+        failureLine('failed to start workload reason="first"', {
+          name: 'mesh-site-a-1',
+          level: 'ERROR',
+          at: at(2),
+        }),
+        hostLine('collector up', { name: 'mesh-collector-c-1', at: at(3) }),
+        failureLine('failed to start workload reason="second"', {
+          name: 'mesh-site-a-1',
+          level: 'ERROR',
+          at: at(4),
+        }),
+      ].join('\n'),
+    );
+    const controller = new Controller(api, cfg);
+    await controller.projectLogs(tenant());
+    expect(projectedRing(api.configMaps.get('di-logs-mesh'))).toEqual([
+      { line: `${at(1)} INFO site up`, deployment: 'mesh-site' },
+      {
+        line: `${at(2)} ERROR host: failed to start workload reason="first"`,
+        deployment: 'mesh-site',
+      },
+      { line: `${at(3)} INFO collector up`, deployment: 'mesh-collector' },
+      {
+        line: `${at(4)} ERROR host: failed to start workload reason="second"`,
+        deployment: 'mesh-site',
+      },
+    ]);
+    // data.failures still keeps only the newest failure per deployment.
+    expect(
+      Object.values(JSON.parse(projectedFailuresText(api.configMaps.get('di-logs-mesh')))),
+    ).toEqual([expect.objectContaining({ time: at(4) })]);
+
+    // A ring published before deployments were recorded keeps its old lines unattributed.
+    api.configMaps.set(
+      'di-logs-mesh',
+      logsConfigMap('alpha', NS, 'test', 'mesh', [`${at(5)} INFO earlier`]),
+    );
+    api.logs.set('host-0', hostLine('later', { name: 'mesh-site-a-1', at: at(6) }));
+    await new Controller(api, cfg).projectLogs(tenant());
+    expect(projectedRing(api.configMaps.get('di-logs-mesh'))).toEqual([
+      { line: `${at(5)} INFO earlier`, deployment: '' },
+      { line: `${at(6)} INFO later`, deployment: 'mesh-site' },
+    ]);
   });
 
   it('keeps a host line in the ring across a guest flood and a controller restart', async () => {
