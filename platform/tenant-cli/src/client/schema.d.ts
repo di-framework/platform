@@ -367,7 +367,7 @@ export interface components {
             /** @description sha256 digest of the pushed artifact. */
             digest: string;
         };
-        /** @description One `@WasmCloudBinding` of the component, rendered by the CLI. */
+        /** @description One `@PlatformBinding` of the component, rendered by the CLI. */
         Binding: {
             name: string;
             capability: string;

@@ -62,7 +62,7 @@ export const schemas = {
 
   Binding: {
     type: 'object',
-    description: 'One `@WasmCloudBinding` of the component, rendered by the CLI.',
+    description: 'One `@PlatformBinding` of the component, rendered by the CLI.',
     properties: {
       name: string,
       capability: string,
