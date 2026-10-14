@@ -46,7 +46,16 @@ if [ ! -f "$OSSL_PREFIX/lib/libcrypto.a" ]; then
     no-autoload-config no-atexit no-egd \
     -Oz -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS \
     -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_GETPID >/dev/null
-  make -j"$(nproc)" build_generated libcrypto.a >/dev/null
+  # Two separate make runs. OpenSSL writes generated headers such as
+  # opensslv.h and safestack.h through a shell redirect, and its object rules
+  # do not depend on them until `make depend` has run. One parallel run with
+  # both goals compiles crypto/*.c while those headers are still empty or
+  # half written. The build then fails at random with "OPENSSL_API_COMPAT
+  # expresses an impossible API compatibility level" or "STACK_OF(BIGNUM)"
+  # undefined (#265). OpenSSL's own build_libs target runs these two steps
+  # one after the other in the same way.
+  make build_generated >/dev/null
+  make -j"$(nproc)" libcrypto.a >/dev/null
   mkdir -p "$OSSL_PREFIX/lib"
   cp libcrypto.a "$OSSL_PREFIX/lib/"
   rm -rf "$OSSL_PREFIX/include"
