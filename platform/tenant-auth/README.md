@@ -27,8 +27,9 @@ one **console** run per tenant, in the tenant's namespace. Users hold only ident
 or tenant API keys; Kubernetes tokens never leave the controller.
 
 The package provides a tenant controller and console that run **inside the cluster**, in the
-tenant's runtime namespace. Both are deployed by `scripts/deploy-local.ts` (which stands in for the
-platform controller's tenant reconcile). The tenant CLI is `di-tenant` in `@di-framework/tenant-cli`.
+tenant's runtime namespace. The platform controller's tenant reconcile deploys both when platform
+config `tenantAuth` is set; see "Tenant controller and console" in `platform/platform/README.md`.
+The tenant CLI is `di-tenant` in `@di-framework/tenant-cli`.
 
 ## Model
 
@@ -77,13 +78,13 @@ The controller and console ship as one container image, `ghcr.io/di-framework/te
 
 A container image was chosen over an OCI bundle on a stock Bun image because Kubernetes pulls and
 verifies it natively by digest, with no init step or volume plugin, and one digest pins both the code
-and the runtime. It will replace the ConfigMap bundle when `:reconcile` lands. `:reconcile` must:
+and the runtime. The tenant reconcile's Deployments therefore:
 
-* drop the `/app` ConfigMap mount (the code is in the image);
-* keep the `/tmp` emptyDir (the root filesystem is read-only);
+* mount no code (it is in the image);
+* keep a `/tmp` emptyDir (the root filesystem is read-only);
 * set `TENANT_CONTROLLER_HOST=0.0.0.0` and `TENANT_CONSOLE_HOST=0.0.0.0`;
 * mount the TLS certificate and key (`TENANT_CONTROLLER_TLS_CERT`, `TENANT_CONTROLLER_TLS_KEY`);
-* use the image digest in place of the `bundle-digest` annotation.
+* roll when the image digest changes.
 
 The `Publish tenant-auth image` workflow publishes it by itself on each push to `main` that changes
 one of its input paths, unless `ghcr.io/di-framework/tenant-auth:src-<hash>` (a hash of those
@@ -100,34 +101,23 @@ image: ghcr.io/di-framework/tenant-auth@sha256:ffb30ae36925c42c7e84049b3f7ce8d7a
 
 Publishing needs the organization to allow Actions to write packages (issue #13).
 
-## Deploy into a local cluster
+## Deploy
+
+The platform controller's tenant reconcile deploys the controller and console for every Tenant
+once platform config `tenantAuth` names the image (by digest), the issuer and the console's OAuth
+client Secret. It owns the ServiceAccounts, RBAC, NetworkPolicy, controller certificates,
+Deployments, Services and gateway routes, and reports problems on the Tenant's `TenantAuthReady`
+condition. The fields, the objects it creates, and the migration from objects created by hand are
+in "Tenant controller and console" in `platform/platform/README.md`. To reach the pair without
+gateway routes:
 
 ```sh
-bun scripts/deploy-local.ts --tenant acme \
-  --kubeconfig "$(di-framework-kube kubeconfig --name <instance>)" \
-  --issuer http://localhost:4180 --issuer-ip <this machine's LAN IP> \
-  --client-secret <the console's OAuth client secret>
 kubectl -n di-runtime-acme port-forward svc/tenant-controller 8788:8788 &
 kubectl -n di-runtime-acme port-forward svc/tenant-console 8787:8787 &
 ```
 
-The script bundles both entrypoints with `Bun.build`, ships them in a ConfigMap (as
-`di-platform-controller` does), generates the controller's TLS in `dist/tls`, and applies it with
-the rest. The TLS is a private CA (`ca.crt`, `ca.key`) and a `CA:FALSE` leaf it signed (`tls.crt`,
-`tls.key`), the layout the platform controller uses. The controller serves the leaf, and the
-console pins `ca.crt` from ConfigMap `tenant-controller-ca`. The files are kept across runs while
-they still verify. An older `dist/tls` that holds a single `CA:TRUE` certificate is replaced: wash
-host pulls reject that certificate (`CaUsedAsEndEntity`). The script applies:
-
-* ServiceAccounts `tenant-controller` and `tenant-console` in `di-runtime-<t>`.
-* RBAC for the controller only: `get` its own `Tenant`, `get`/`list` `User` CRs, `create`
-  `serviceaccounts/token` in the platform namespace restricted by `resourceNames` to the tenant's
-  members, Secrets in its own namespace for API keys, and `get`/`list` on Secrets in
-  `di-tenant-<t>` (#112) so `/v1` can check tenant Secret names, labels and resourceVersions that
-  developers are not allowed to read. It never returns or logs Secret data.
-* A NetworkPolicy adding egress to the API server and the issuer; the tenant policy otherwise
-  allows only tenant namespaces, DNS, and public `:443`.
-* Deployments (strategy `Recreate`, 200m CPU limits) and ClusterIP Services.
+The earlier manual deploy script (#58) is removed; use the reconcile, or run the pieces outside
+the cluster as described below.
 
 Why `di-runtime-<t>` and not `di-tenant-<t>`: developers can edit any Secret or ConfigMap in the
 tenant namespace that the admission policy does not reserve by name, so there they could replace
@@ -136,29 +126,29 @@ only have pods and logs. Moving to `di-tenant-<t>` needs the `backend-config` ad
 to reserve the `tenant-auth-*` and `tenant-controller-*` names.
 
 Local identity-server: a developer's browser can only be relied on to reach `localhost`, and Bun
-resolves every `*.localhost` name to loopback regardless of `/etc/hosts`, so with
-`--issuer http://localhost:4180 --issuer-ip <ip>` each pod gets a `socat` sidecar that forwards
-`127.0.0.1:4180` to the machine. With a resolvable issuer hostname the same flag becomes a
-`hostAliases` entry instead; with a real DNS name neither is needed.
+resolves every `*.localhost` name to loopback regardless of `/etc/hosts`. With a loopback issuer,
+`tenantAuth.issuerUpstream` (or `issuerIp`) gives each pod a `socat` sidecar that forwards the
+issuer port to where identity-server really listens. With a resolvable issuer hostname,
+`issuerIp` becomes a `hostAliases` entry instead; with a real DNS name neither is needed.
 
 ### identity-server as a platform guest
 
 With the identity-server Wasm guest deployed to tenant `identity` (`di-framework platform deploy
 identity`, Postgres BackingService `directory`, runtime secrets loaded into
 `identity_runtime_secret`, gateway route `identity.identity.localhost`), the console and
-controller point at it with:
+controller point at it with platform config:
 
-```sh
-bun scripts/deploy-local.ts --tenant acme ... \
-  --issuer http://identity.identity.localhost:28280 \
-  --issuer-upstream di-platform-gateway.wasmcloud.svc.cluster.local:80 \
-  --client-id access --client-secret <AUTH_ACCESS_CLIENT_SECRET row>
+```yaml
+tenantAuth:
+  image: ghcr.io/di-framework/tenant-auth@sha256:<digest>
+  issuer: http://identity.identity.localhost:28280
+  issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80
+  issuerUpstreamPodPort: 8080
+  oauthClient: { id: access, secretName: tenant-auth-oauth } # key `clientSecret`: the AUTH_ACCESS_CLIENT_SECRET row
 ```
 
 The `.localhost` issuer makes Bun use loopback, so the sidecar forwards the port to the platform
-gateway, which routes by `Host`. A redeploy with new code rolls both pods: the pod template
-carries a digest of the bundle, because a ConfigMap update alone leaves the running processes on
-the old code.
+gateway, which routes by `Host`. A new image digest rolls both pods.
 
 `GET /v1/services/:service/logs` streams a service's projected log lines as server-sent events.
 Logs are scoped to the tenant namespace, not to an environment: `env` is accepted and ignored,

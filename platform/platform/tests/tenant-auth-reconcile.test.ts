@@ -1038,7 +1038,7 @@ describe('reconcileTenant with tenant-auth', () => {
     ).toBeUndefined();
   });
 
-  it('refuses to adopt resources left by deploy-local.ts', async () => {
+  it('refuses to adopt resources left by a manual deploy', async () => {
     const { api, controller, t } = prepare();
     api.seed({
       apiVersion: 'v1',
@@ -1074,7 +1074,7 @@ describe('reconcileTenant with tenant-auth', () => {
     ).toBe(true);
   });
 
-  it('refuses to adopt a tenant-controller-tls Secret left by deploy-local.ts through the cached read', async () => {
+  it('refuses to adopt a tenant-controller-tls Secret left by a manual deploy through the cached read', async () => {
     const { api, controller, t } = prepare();
     const ns = 'di-runtime-alpha';
     const ca = caCertificate(`tenant-controller CA (${ns})`, 3650);
@@ -1091,7 +1091,7 @@ describe('reconcileTenant with tenant-auth', () => {
       'tls.key': encode(leaf.key),
       'ca.crt': encode(ca.cert),
     };
-    // The labels and keys deploy-local.ts writes; no installation label.
+    // The labels and keys the removed manual deploy script wrote; no installation label.
     api.seed({
       apiVersion: 'v1',
       kind: 'Secret',
