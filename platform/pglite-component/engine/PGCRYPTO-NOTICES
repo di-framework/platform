@@ -11,6 +11,7 @@ distribution.
 px.c, px-hmac.c, px-crypt.c, mbuf.c, openssl.c, pgcrypto.c, pgp*.c and
 their headers:
 
+    Copyright (c) 2000 Marko Kreen
     Copyright (c) 2001 Marko Kreen
     Copyright (c) 2005 Marko Kreen
     All rights reserved.

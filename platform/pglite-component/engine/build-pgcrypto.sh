@@ -11,8 +11,11 @@
 # scripts/build-engine.ts verified and placed at $DF_EXT/openssl.tar.gz.
 #
 # Randomness: pgcrypto draws every salt, session key and padding byte from
-# pg_strong_random, which prepare-engine.ts routes to WASI random_get. OpenSSL's
-# own seed source on __wasi__ is getentropy, i.e. the same WASI import.
+# pg_strong_random, which prepare-engine.ts routes to WASI random_get. The
+# ElGamal ephemeral k (pgp-mpi-openssl.c) comes from OpenSSL's DRBG through
+# BN_rand. Its seed source on __wasi__ is getentropy, i.e. the same WASI import,
+# and it fails closed: if getentropy fails the DRBG does not instantiate,
+# BN_rand returns 0 and pgp_pub_encrypt raises an error.
 set -eo pipefail
 
 # The SDK environment scripts are not nounset-clean; source them first.
@@ -37,22 +40,38 @@ export SOURCE_DATE_EPOCH
 # --- OpenSSL libcrypto (static, wasm32-wasip1) ------------------------------
 # Only what pgcrypto needs: no TLS sockets, threads, DSO/providers modules,
 # engines, console UI, stdio or config autoloading. Its seed source on __wasi__
-# is getentropy(), i.e. WASI random_get.
-if [ ! -f "$OSSL_PREFIX/lib/libcrypto.a" ]; then
-  rm -rf "$PG_BUILD/df-openssl-src"
+# is getentropy(), i.e. WASI random_get. The legacy provider is not built or
+# loaded, so bf, cast5 and des are unavailable to encrypt()/pgp_*.
+OSSL_CONFIG=(
+  linux-generic32 --prefix="$OSSL_PREFIX" --libdir=lib
+  --with-rand-seed=getrandom
+  no-asm no-shared no-module no-dso no-threads no-thread-pool no-async
+  no-sock no-dgram no-quic no-http no-ktls no-afalgeng no-ui-console
+  no-tests no-apps no-docs no-engine no-secure-memory no-posix-io no-stdio
+  no-autoload-config no-atexit no-egd
+  -Oz -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS
+  -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_GETPID
+)
+# The libcrypto cache below is keyed to the exact OpenSSL source (the tarball
+# that scripts/build-engine.ts verified against OPENSSL_SHA256, so a version
+# bump changes it), the Configure options and SOURCE_DATE_EPOCH. A build tree
+# that outlives one engine build never links a stale libcrypto.a.
+OSSL_KEY=$(
+  {
+    sha256sum "$DF_EXT/openssl.tar.gz" | cut -d' ' -f1
+    echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
+    printf '%s\n' "${OSSL_CONFIG[@]}"
+  } | sha256sum | cut -d' ' -f1
+)
+if [ ! -f "$OSSL_PREFIX/lib/libcrypto.a" ] ||
+  [ "$(cat "$OSSL_PREFIX/df-cache-key" 2>/dev/null)" != "$OSSL_KEY" ]; then
+  rm -rf "$OSSL_PREFIX" "$PG_BUILD/df-openssl-src"
   mkdir -p "$PG_BUILD/df-openssl-src"
   tar -xzf "$DF_EXT/openssl.tar.gz" -C "$PG_BUILD/df-openssl-src" --strip-components=1
   pushd "$PG_BUILD/df-openssl-src" >/dev/null
   CC="$WASI_UPSTREAM/bin/clang --target=wasm32-wasip1" \
   AR="$WASI_UPSTREAM/bin/llvm-ar" RANLIB="$WASI_UPSTREAM/bin/llvm-ranlib" \
-  ./Configure linux-generic32 --prefix="$OSSL_PREFIX" --libdir=lib \
-    --with-rand-seed=getrandom \
-    no-asm no-shared no-module no-dso no-threads no-thread-pool no-async \
-    no-sock no-dgram no-quic no-http no-ktls no-afalgeng no-ui-console \
-    no-tests no-apps no-docs no-engine no-secure-memory no-posix-io no-stdio \
-    no-autoload-config no-atexit no-egd \
-    -Oz -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS \
-    -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_GETPID >/dev/null
+  ./Configure "${OSSL_CONFIG[@]}" >/dev/null
   # Two separate make runs. OpenSSL writes generated headers such as
   # opensslv.h and safestack.h through a shell redirect, and its object rules
   # do not depend on them until `make depend` has run. One parallel run with
@@ -77,6 +96,7 @@ if [ ! -f "$OSSL_PREFIX/lib/libcrypto.a" ]; then
   cp -R include "$OSSL_PREFIX/include"
   popd >/dev/null
   rm -rf "$PG_BUILD/df-openssl-src"
+  echo "$OSSL_KEY" > "$OSSL_PREFIX/df-cache-key"
 fi
 
 # --- pgcrypto objects -> libpgcrypto.a --------------------------------------
