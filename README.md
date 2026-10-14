@@ -30,7 +30,7 @@ bun run lint
 bun run typecheck
 ```
 
-`bun install` sets `core.hooksPath` to `.githooks`. The pre-commit hook (`scripts/pre-commit.ts`) checks the content the commit records, not the working tree: it runs `bun typecheck` and `biome check` on the staged files. When the working tree has unstaged changes, for example after `git add -p`, it runs those checks on a temporary copy of the index, so unstaged edits neither fail nor pass the commit. It does not rewrite files: if biome reports lint or format errors in staged files, the commit is refused. Run `bun run lint:fix`, stage the result, and commit again. The pre-push hook runs `bun test --coverage` and requires 100% line coverage.
+`bun install` sets `core.hooksPath` to `.githooks`. The pre-commit hook (`scripts/pre-commit.ts`) checks the content the commit records, not the working tree: it runs `bun typecheck` and `biome check` on the staged files. When the working tree has unstaged changes or untracked files, for example after `git add -p` or during `git commit <path>`, it runs those checks on a temporary copy of the index the commit records, so unstaged edits and untracked files neither fail nor pass the commit. It does not rewrite files: if biome reports lint or format errors in staged files, the commit is refused. Run `bun run lint:fix`, stage the result, and commit again. The pre-push hook runs `bun test --coverage` and requires 100% line coverage.
 
 `bun test` builds `@di-framework/platform`, `@di-framework/bindings`, `@di-framework/cloudfoundry`, and `@di-framework/cloudflare` before the test run. Build the SQLite provider from its package:
 

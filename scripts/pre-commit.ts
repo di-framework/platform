@@ -3,17 +3,19 @@
  *
  * It checks what the commit records, which is the index, not the working tree:
  *
- * - When every tracked file in the working tree matches the index (the usual commit), it runs
- *   `bun typecheck` and `biome check` on the staged files in the repository itself.
- * - When the working tree has unstaged changes (`git add -p`, `git commit <path>`, or edits left
- *   unstaged), it writes the index to a temporary directory with `git checkout-index` and runs the
- *   same checks there. Ignored directories (node_modules, dist) are symlinked into that copy so
- *   modules still resolve. The repository's working tree and index are never modified.
+ * - When the working tree matches the index (no unstaged changes and no untracked, non-ignored
+ *   files), it runs `bun typecheck` and `biome check` on the staged files in the repository itself.
+ * - Otherwise (`git add -p`, `git commit <path>`, edits left unstaged, untracked scratch files), it
+ *   writes the index to a temporary directory with `git checkout-index` and runs the same checks
+ *   there. Ignored directories (node_modules, dist) are symlinked into that copy so modules still
+ *   resolve, and `*.tsbuildinfo` is copied so the typecheck stays incremental. The repository's
+ *   working tree and index are never modified.
  *
  * File lists come from `git ... -z`, so paths with spaces, newlines, or non-ASCII characters are
  * passed to biome unchanged whatever `core.quotePath` is set to.
  */
 import {
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -92,11 +94,17 @@ export function snapshotIndex(root: string, dir: string): void {
   );
   for (const path of ignored) {
     const target = join(dir, path);
-    // Only directories: an ignored file such as tsconfig.tsbuildinfo would be written through
-    // the link.
-    if (existsSync(target) || !isDirectory(join(root, path))) continue;
-    mkdirSync(dirname(target), { recursive: true });
-    symlinkSync(join(root, path), target);
+    const source = join(root, path);
+    if (existsSync(target)) continue;
+    if (isDirectory(source)) {
+      mkdirSync(dirname(target), { recursive: true });
+      symlinkSync(source, target);
+    } else if (path.endsWith('.tsbuildinfo')) {
+      // Copied, not linked, so the snapshot's typecheck never writes the repository's build info.
+      // tsc compares file hashes, so a stale copy only costs time, never a wrong result.
+      mkdirSync(dirname(target), { recursive: true });
+      copyFileSync(source, target);
+    }
   }
 }
 
@@ -141,15 +149,32 @@ export function runChecks(cwd: string, files: string[]): number {
   return 0;
 }
 
+/**
+ * Whether the working tree holds anything the index (the commit) does not: an unstaged change to
+ * a tracked file, or an untracked, non-ignored file that the in-repo typecheck would pick up.
+ *
+ * Git exports GIT_INDEX_FILE to the hook, and every git command here inherits it. For
+ * `git commit <path>` (and `-a`) that is the temporary index the commit records, so files staged
+ * in the real index but not part of this commit count as untracked here.
+ */
+export function workingTreeDiffers(root: string): boolean {
+  if (run(['git', 'diff', '--quiet', '--no-ext-diff'], root).code !== 0) return true;
+  const untracked = git(root, 'ls-files', '--others', '--exclude-standard', '--directory', '-z');
+  return untracked !== '';
+}
+
 export function main(): number {
   const root = git(process.cwd(), 'rev-parse', '--show-toplevel').trim();
+  // T: a path that changed type (symlink -> file) is a file to check; runChecks skips
+  // non-regular files. D is left out: a deleted file has nothing to check.
   const staged = splitNul(
-    git(root, 'diff', '--cached', '--name-only', '-z', '--no-ext-diff', '--diff-filter=ACMR'),
+    git(root, 'diff', '--cached', '--name-only', '-z', '--no-ext-diff', '--diff-filter=ACMRT'),
   );
-  const unstaged = run(['git', 'diff', '--quiet', '--no-ext-diff'], root).code !== 0;
-  if (!unstaged) return runChecks(root, staged);
+  if (!workingTreeDiffers(root)) return runChecks(root, staged);
 
-  console.error('[pre-commit] The working tree has unstaged changes; checking the staged content.');
+  console.error(
+    '[pre-commit] The working tree has unstaged changes or untracked files; checking the staged content.',
+  );
   const dir = mkdtempSync(join(tmpdir(), 'di-framework-pre-commit-'));
   try {
     snapshotIndex(root, dir);

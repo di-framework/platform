@@ -59,6 +59,7 @@ function longModule(first: string, last: string): string {
 
 let base: string;
 let tmp: string;
+let noHooks: string;
 
 /** A fresh repository using this repository's hook, scripts, biome config and node_modules. */
 function fixture(): string {
@@ -107,17 +108,33 @@ function fixture(): string {
   writeFileSync(join(work, 'src/base.ts'), GOOD);
   git(work, 'config', 'core.hooksPath', '.githooks');
   git(work, 'add', '-A');
-  // The setup commit runs the hook too.
-  const first = commit(work, 'setup');
-  if (first.code !== 0) throw new Error(`fixture setup commit failed:\n${first.output}`);
+  baseline(work, 'setup');
   return work;
 }
 
-function commit(work: string, message: string): { code: number; output: string } {
-  const result = Bun.spawnSync(
-    ['git', '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', message],
-    { cwd: work, env: { ...spawnEnv, TMPDIR: tmp }, stdout: 'pipe', stderr: 'pipe' },
-  );
+/**
+ * Commit without running the hook, for setup and baseline commits. The hook is skipped by
+ * pointing core.hooksPath at an empty directory for this one command.
+ */
+function baseline(work: string, message: string): void {
+  const result = commit(work, message, { hooks: noHooks });
+  if (result.code !== 0) throw new Error(`baseline commit failed:\n${result.output}`);
+}
+
+function commit(
+  work: string,
+  message: string,
+  options: { hooks?: string; paths?: string[] } = {},
+): { code: number; output: string } {
+  const hooks = options.hooks ? ['-c', `core.hooksPath=${options.hooks}`] : [];
+  const cmd = ['git', '-c', 'user.name=t', '-c', 'user.email=t@t', ...hooks, 'commit', '-q'];
+  cmd.push('-m', message, ...(options.paths ? ['--', ...options.paths] : []));
+  const result = Bun.spawnSync(cmd, {
+    cwd: work,
+    env: { ...spawnEnv, TMPDIR: tmp },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
   return {
     code: result.exitCode ?? 1,
     output: `${result.stdout.toString()}${result.stderr.toString()}`,
@@ -140,10 +157,38 @@ function committed(work: string, path: string): string {
   return git(work, 'show', `HEAD:${path}`);
 }
 
+/** Stage a good hunk, leave a broken one unstaged, and expect the commit to pass. */
+function expectPartialStagingPasses(work: string): void {
+  writeFileSync(join(work, 'src/long.ts'), longModule(GOOD, 'export const z = 0;\n'));
+  git(work, 'add', 'src/long.ts');
+  baseline(work, 'long');
+
+  // Staged: a good change to the first line. Unstaged: a type and format error at the end.
+  const staged = longModule('export const a: number = 2;\n', 'export const z = 0;\n');
+  const working = longModule(
+    'export const a: number = 2;\n',
+    "export const   z: number = 'broken'\n",
+  );
+  writeFileSync(join(work, 'src/long.ts'), working);
+  stageContent(work, 'src/long.ts', staged);
+  expect(git(work, 'diff', '--name-only')).toBe('src/long.ts');
+
+  const result = commit(work, 'partial');
+  expect(result.output).toContain('checking the staged content');
+  expect(result.code).toBe(0);
+  expect(`${committed(work, 'src/long.ts')}\n`).toBe(staged);
+  // The hook leaves the working tree, the linked node_modules and the temp dir alone.
+  expect(readFileSync(join(work, 'src/long.ts'), 'utf8')).toBe(working);
+  expect(existsSync(join(repo, 'node_modules/.bin/biome'))).toBe(true);
+  expect(readdirSync(tmp)).toEqual([]);
+}
+
 beforeAll(() => {
   base = mkdtempSync(join(tmpdir(), 'pre-commit-test-'));
   tmp = join(base, 'tmp');
   mkdirSync(tmp);
+  noHooks = join(base, 'no-hooks');
+  mkdirSync(noHooks);
 });
 
 afterAll(() => {
@@ -157,7 +202,10 @@ describe('pre-commit hook', () => {
       const work = fixture();
       writeFileSync(join(work, 'src/ok.ts'), GOOD);
       git(work, 'add', 'src/ok.ts');
-      expect(commit(work, 'ok').code).toBe(0);
+      const ok = commit(work, 'ok');
+      expect(ok.code).toBe(0);
+      // Nothing unstaged or untracked: the checks run in the repository itself.
+      expect(ok.output).not.toContain('checking the staged content');
 
       writeFileSync(join(work, 'src/fmt.ts'), FORMAT_ERROR);
       git(work, 'add', 'src/fmt.ts');
@@ -179,28 +227,80 @@ describe('pre-commit hook', () => {
   test(
     'a partially staged file passes when only the unstaged part is broken',
     () => {
+      expectPartialStagingPasses(fixture());
+    },
+    TIMEOUT,
+  );
+
+  test(
+    'an untracked file the commit depends on fails the commit',
+    () => {
       const work = fixture();
-      writeFileSync(join(work, 'src/long.ts'), longModule(GOOD, 'export const z = 0;\n'));
-      git(work, 'add', 'src/long.ts');
-      expect(commit(work, 'long').code).toBe(0);
-
-      // Staged: a good change to the first line. Unstaged: a type and format error at the end.
-      const staged = longModule('export const a: number = 2;\n', 'export const z = 0;\n');
-      const working = longModule(
-        'export const a: number = 2;\n',
-        "export const   z: number = 'broken'\n",
+      writeFileSync(join(work, 'src/helper.ts'), 'export const h = 1;\n');
+      writeFileSync(
+        join(work, 'src/uses-helper.ts'),
+        "import { h } from './helper';\n\nexport const v: number = h;\n",
       );
-      writeFileSync(join(work, 'src/long.ts'), working);
-      stageContent(work, 'src/long.ts', staged);
-      expect(git(work, 'diff', '--name-only')).toBe('src/long.ts');
+      git(work, 'add', 'src/uses-helper.ts');
+      const result = commit(work, 'imports an untracked file');
+      expect(result.output).toContain('checking the staged content');
+      expect(result.code).not.toBe(0);
+      expect(result.output).toContain('typecheck found errors');
+    },
+    TIMEOUT,
+  );
 
-      const result = commit(work, 'partial');
+  test(
+    'an untracked broken file does not fail a clean commit',
+    () => {
+      const work = fixture();
+      writeFileSync(join(work, 'src/wip.ts'), TYPE_ERROR);
+      writeFileSync(join(work, 'src/ok.ts'), GOOD);
+      git(work, 'add', 'src/ok.ts');
+      const result = commit(work, 'clean');
       expect(result.output).toContain('checking the staged content');
       expect(result.code).toBe(0);
-      expect(`${committed(work, 'src/long.ts')}\n`).toBe(staged);
-      // The hook leaves the working tree, the linked node_modules and the temp dir alone.
-      expect(readFileSync(join(work, 'src/long.ts'), 'utf8')).toBe(working);
-      expect(existsSync(join(repo, 'node_modules/.bin/biome'))).toBe(true);
+      expect(git(work, 'status', '--porcelain', '--untracked-files=all')).toBe('?? src/wip.ts');
+    },
+    TIMEOUT,
+  );
+
+  test(
+    'git commit <path> checks only what that commit records',
+    () => {
+      const work = fixture();
+      // Another file is staged and broken, but it is not part of `git commit src/base.ts`.
+      writeFileSync(join(work, 'src/other.ts'), TYPE_ERROR);
+      git(work, 'add', 'src/other.ts');
+      writeFileSync(join(work, 'src/base.ts'), 'export const a: number = 2;\n');
+
+      const result = commit(work, 'only base', { paths: ['src/base.ts'] });
+      expect(result.code).toBe(0);
+      expect(committed(work, 'src/base.ts')).toBe('export const a: number = 2;');
+      expect(git(work, 'diff', '--cached', '--name-only')).toBe('src/other.ts');
+
+      // Committing the broken file by path still fails.
+      const broken = commit(work, 'only other', { paths: ['src/other.ts'] });
+      expect(broken.code).not.toBe(0);
+      expect(broken.output).toContain('typecheck found errors');
+    },
+    TIMEOUT,
+  );
+
+  test(
+    'works in a linked worktree',
+    () => {
+      const work = fixture();
+      const tree = join(base, 'linked-worktree');
+      git(work, 'worktree', 'add', '-q', '-b', 'side', tree);
+      symlinkSync(join(repo, 'node_modules'), join(tree, 'node_modules'));
+      expectPartialStagingPasses(tree);
+
+      writeFileSync(join(tree, 'src/fixed.ts'), GOOD);
+      stageContent(tree, 'src/fixed.ts', TYPE_ERROR);
+      const broken = commit(tree, 'staged type error');
+      expect(broken.code).not.toBe(0);
+      expect(broken.output).toContain('typecheck found errors');
       expect(readdirSync(tmp)).toEqual([]);
     },
     TIMEOUT,
@@ -212,7 +312,7 @@ describe('pre-commit hook', () => {
       const work = fixture();
       writeFileSync(join(work, 'src/long.ts'), longModule(GOOD, 'export const z = 0;\n'));
       git(work, 'add', 'src/long.ts');
-      expect(commit(work, 'long').code).toBe(0);
+      baseline(work, 'long');
 
       writeFileSync(
         join(work, 'src/long.ts'),
