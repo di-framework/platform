@@ -1038,6 +1038,8 @@ mod tests {
             "2024-01-15 16:00:00.123456+05:30",
             "2024-01-15T10:30:00.123456Z",
         );
+        // A negative half-hour offset (America/St_Johns) subtracts its minutes too.
+        assert_timestamp("2024-01-15 07:00:00-03:30", "2024-01-15T10:30:00Z");
         // LMT offsets carry seconds (Europe/Amsterdam before 1937).
         assert_timestamp("1900-01-01 00:19:32+00:19:32", "1900-01-01T00:00:00Z");
         // Offsets that cross day, month, year and leap-day boundaries.

@@ -4,11 +4,12 @@
 # publish job only validates and pushes the already-tested dist/.
 #
 # Triggers (#172): a push to main that touches one of the paths below, and workflow_dispatch.
-# check-source hashes the committed files in on.push.paths (scripts/source-check.ts); on a push
-# the build is skipped when ghcr.io/di-framework/pglite-encfs:src-<hash> already exists. A
-# dispatch always builds. publish tags the manifest src-<hash>, and pin opens the bot PR
-# "chore: pin pglite-encfs to <digest>" (scripts/pin-artifact.ts). Only pin holds
-# contents: write and pull-requests: write; only publish holds packages: write.
+# check-source hashes the committed files in on.push.paths, except the test-only files listed in
+# env.SOURCE_HASH_EXCLUDE (scripts/source-check.ts); on a push the build is skipped when
+# ghcr.io/di-framework/pglite-encfs:src-<hash> already exists. A dispatch always builds. publish
+# tags the manifest src-<hash>, and pin opens the bot PR "chore: pin pglite-encfs to <digest>"
+# (scripts/pin-artifact.ts). Only pin holds contents: write and pull-requests: write; only publish
+# holds packages: write.
 #
 # Files that only test the component (env.SOURCE_HASH_EXCLUDE) still trigger the workflow but are
 # left out of the source hash (#349). A test-only change then stops at check-source, because
@@ -120,7 +121,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Install wasmtime
-        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
         with:
           version: 'v48.0.1'
 

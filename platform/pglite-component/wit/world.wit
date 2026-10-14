@@ -64,7 +64,8 @@ interface types {
   ///   ISO output is converted back to UTC. A value that cannot be converted
   ///   (BC dates, years after 9999, or any output after `SET DateStyle` to
   ///   `SQL`, `Postgres` or `German`) is returned as `text`, as PostgreSQL
-  ///   printed it. Reopening the connection pins both settings again.
+  ///   printed it. `infinity` and `-infinity` stay `timestamp` under every
+  ///   DateStyle. Reopening the connection pins both settings again.
   /// - `timestamp` (no zone) and `date` -> `text` (`2024-01-15 10:30:00`,
   ///   `2024-01-15`).
   /// - `uuid` and `numeric` -> `text`; arrays -> `text` as PostgreSQL array
