@@ -98,17 +98,23 @@ export function registryNatsSecretData(password: string): Record<string, string>
 
 /**
  * Published tenant host images known to carry wash patch 0003 (#330), by multi-arch index digest
- * (publish run 38613407365, labels `dev.di-framework.wash.patches` list
- * `0003-nats-blobstore-credentials.patch`). Fail closed: on any other image, a tag-only reference
+ * (their `dev.di-framework.wash.patches` labels list `0003-nats-blobstore-credentials.patch`;
+ * the publish run is named per entry where known). Fail closed: on any other image, a tag-only reference
  * or an unknown digest included, the registry stays anonymous in {@link NATS_TENANT_ACCOUNT} and
  * the controller logs a warning, since a host without 0003 ignores `user_file` / `password_file`
- * and would show the registry an empty store. Add each later 0003 build here when it is pinned.
+ * and would show the registry an empty store. The tenant host pin PR (scripts/pin-artifact.ts,
+ * #346) appends each later published build whose patch set includes 0003; entries are never
+ * removed, since existing installs may still run them.
  */
 export const NATS_CREDENTIALS_HOST_IMAGE_DIGESTS: readonly string[] = [
-  // ghcr.io/di-framework/wash:2.8.0-wasi-tls (canonical, DEFAULT_HOST_IMAGE)
+  // ghcr.io/di-framework/wash:2.8.0-wasi-tls (publish run 38613407365)
   'sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab',
-  // ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive
+  // ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive (publish run 38613407365)
   'sha256:da38d84b52a6327e02febe7172a466f628b1d923944ebf50171f1df630ec37a9',
+  // ghcr.io/di-framework/wash:2.8.0-wasi-tls (publish run 38628447091)
+  'sha256:805a47c0050a90e8dcf22de8e844da91da38b2d8f2da26170ace7c624af76584',
+  // ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive (publish run 38628447091)
+  'sha256:933d26ec01dade4af7e0d10b877c9afad5371256147cf6db4aff42ecd0c28ec2',
 ];
 /** Whether `hostImage` is pinned to one of {@link NATS_CREDENTIALS_HOST_IMAGE_DIGESTS}. */
 export function hostImageSupportsNatsCredentials(hostImage: string): boolean {

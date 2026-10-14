@@ -467,13 +467,25 @@ describe('registry NATS account rendering (#159)', () => {
   });
 
   it('trusts only the pinned host builds known to carry wash patch 0003 (fail closed)', () => {
-    expect(NATS_CREDENTIALS_HOST_IMAGE_DIGESTS).toEqual([
+    // The pin PR appends later 0003 builds (#346) and never drops one, so the list starts with
+    // these, in this order, and holds each digest once.
+    expect(NATS_CREDENTIALS_HOST_IMAGE_DIGESTS.slice(0, 4)).toEqual([
       'sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab',
       'sha256:da38d84b52a6327e02febe7172a466f628b1d923944ebf50171f1df630ec37a9',
+      // Publish run 38628447091 (wasi-tls, wasi-tls-exclusive), both with 0003.
+      'sha256:805a47c0050a90e8dcf22de8e844da91da38b2d8f2da26170ace7c624af76584',
+      'sha256:933d26ec01dade4af7e0d10b877c9afad5371256147cf6db4aff42ecd0c28ec2',
     ]);
+    expect(new Set(NATS_CREDENTIALS_HOST_IMAGE_DIGESTS).size).toBe(
+      NATS_CREDENTIALS_HOST_IMAGE_DIGESTS.length,
+    );
+    for (const digest of NATS_CREDENTIALS_HOST_IMAGE_DIGESTS)
+      expect(digest).toMatch(/^sha256:[0-9a-f]{64}$/);
     for (const image of [
       HOST_0003,
       'ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:da38d84b52a6327e02febe7172a466f628b1d923944ebf50171f1df630ec37a9',
+      'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:805a47c0050a90e8dcf22de8e844da91da38b2d8f2da26170ace7c624af76584',
+      'ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:933d26ec01dade4af7e0d10b877c9afad5371256147cf6db4aff42ecd0c28ec2',
     ])
       expect(hostImageSupportsNatsCredentials(image)).toBe(true);
     for (const image of [
@@ -492,12 +504,29 @@ describe('registry NATS account rendering (#159)', () => {
       expect(hostImageSupportsNatsCredentials(image)).toBe(false);
   });
 
-  it('pins the platform default host image to a 0003 build', () => {
+  it('pins the platform default host image to the latest canonical pin, an allowlisted 0003 build', () => {
     // Read from the source so the test does not load src/index.ts (Pulumi) into coverage.
     const index = readFileSync(join(import.meta.dir, '../src/index.ts'), 'utf8');
-    const image = /export const DEFAULT_HOST_IMAGE =\s*'([^']+)'/.exec(index)?.[1];
-    expect(image).toBe(HOST_0003);
-    expect(hostImageSupportsNatsCredentials(must(image, 'DEFAULT_HOST_IMAGE'))).toBe(true);
+    const image = must(
+      /export const DEFAULT_HOST_IMAGE =\s*'([^']+)'/.exec(index)?.[1],
+      'DEFAULT_HOST_IMAGE',
+    );
+    expect(hostImageSupportsNatsCredentials(image)).toBe(true);
+    // The canonical tag is the first row of the variants table, and that row carries 0003.
+    const hostDir = join(import.meta.dir, '../../tenant-host');
+    const [canonical = []] = readFileSync(join(hostDir, 'variants'), 'utf8')
+      .split('\n')
+      .map((line) => line.trim().split(/\s+/))
+      .filter(([tag]) => tag && !tag.startsWith('#'));
+    expect(canonical).toContain('0003-nats-blobstore-credentials.patch');
+    expect(image).toMatch(
+      new RegExp(`^ghcr\\.io/di-framework/wash:${canonical[0]}@sha256:[0-9a-f]{64}$`),
+    );
+    // The default moves with the canonical row of the published-images table, in one pin PR (#346).
+    const row = readFileSync(join(hostDir, 'README.md'), 'utf8')
+      .split('\n')
+      .find((line) => line.startsWith(`| \`${canonical[0]?.replace(/^[^-]+-/, '')}\` |`));
+    expect(row).toBe(`| \`${canonical[0]?.replace(/^[^-]+-/, '')}\` | \`${image}\` |`);
   });
 
   it('keeps the migration script from printing or passing the password on a command line', () => {

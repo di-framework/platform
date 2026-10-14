@@ -402,14 +402,24 @@ Latest published images (multi-arch index digests; the bot PR keeps this table c
 | `wasi-tls` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:805a47c0050a90e8dcf22de8e844da91da38b2d8f2da26170ace7c624af76584` |
 | `wasi-tls-exclusive` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:933d26ec01dade4af7e0d10b877c9afad5371256147cf6db4aff42ecd0c28ec2` |
 
-The pin PR never changes the platform default (`DEFAULT_HOST_IMAGE`); a maintainer moves it by hand.
+The same pin PR (`scripts/pin-artifact.ts`, #346) also updates the platform code that names host
+builds, from the [`variants`](variants) table: the canonical variant (its first row) moves the
+platform default (`DEFAULT_HOST_IMAGE` in `platform/platform/src/index.ts`) and the mentions of it
+below, and every variant whose patch set includes 0003 appends its digest to
+`NATS_CREDENTIALS_HOST_IMAGE_DIGESTS` (`platform/platform/src/tenancy/registry-nats.ts`). Older
+digests stay listed, since existing installs may still run them.
+
+An install that does not set `tenantHostImage` moves its tenant hosts to the new build on the first
+deploy of a platform release that contains a merged canonical pin; to hold a build, set
+`tenantHostImage` to its digest. The allowlist is under `platform/platform/src/tenancy/`, an input of
+the tenant-auth image, so merging a host pin PR that extends it also publishes tenant-auth and opens
+a second bot PR, `bot/pin-tenant-auth`.
 
 The tags are mutable. The platform default `hostImage` is pinned to the canonical index built with
 0002 and 0003 (and without the unnamed-import lease, #13). The platform lets a tenant registry use
-its NATS credentials only on host images it knows carry 0003 (`NATS_CREDENTIALS_HOST_IMAGE_DIGESTS`
-in `platform/platform/src/tenancy/registry-nats.ts`); add a new 0003 build there when you pin it:
+its NATS credentials only on host images it knows carry 0003 (`NATS_CREDENTIALS_HOST_IMAGE_DIGESTS`):
 
-`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab`
+`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:805a47c0050a90e8dcf22de8e844da91da38b2d8f2da26170ace7c624af76584`
 
 `tenantHostImage` overrides it. The workflow summary prints the digest of each later publish.
 Tenant hosts never run `--allow-insecure-registries`; with `insecureRegistry` they get
@@ -445,7 +455,7 @@ The registry Service is ClusterIP, so a node-pullable reference needs a NodePort
 Set the platform config used by the stack (`tenantHostImage` / `tenantHostImagePullPolicy`):
 
 ```sh
-pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab
+pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:805a47c0050a90e8dcf22de8e844da91da38b2d8f2da26170ace7c624af76584
 pulumi config set tenantHostImagePullPolicy IfNotPresent
 ```
 
@@ -453,7 +463,7 @@ or, with `di-framework-kube`, in the `--platform-config` JSON:
 
 ```json
 {
-  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab",
+  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:805a47c0050a90e8dcf22de8e844da91da38b2d8f2da26170ace7c624af76584",
   "tenantHostImagePullPolicy": "IfNotPresent"
 }
 ```

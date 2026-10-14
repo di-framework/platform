@@ -15,8 +15,9 @@
 #                                                                            + 0003-nats-blobstore-credentials.patch
 # The image labels name the variant and the patches applied. wasi-tls (the table's first row) is the
 # canonical tag, the one the platform default hostImage (DEFAULT_HOST_IMAGE) is pinned to; the
-# exclusive variant is only used by setting tenantHostImage to its digest. The pin job below never
-# changes DEFAULT_HOST_IMAGE.
+# exclusive variant is only used by setting tenantHostImage to its digest. The pin job below moves
+# DEFAULT_HOST_IMAGE with the canonical variant's pin and lists every 0003 build in the platform's
+# patch-0003 allowlist (scripts/pin-artifact.ts reads the variants table, #346).
 #
 # Skip if published: check-source hashes the committed files in on.push.paths, salted with the
 # variant (scripts/source-check.ts). On a push, a variant whose wash:src-<hash> tag already
@@ -390,7 +391,7 @@ jobs:
             echo "Pin \`tenantHostImage\` to that digest. The tag \`${TAG}\` moves on the next publish of this variant."
             echo
             if [[ "${CANONICAL}" == "true" ]]; then
-              echo "This is the canonical tag. Repin \`DEFAULT_HOST_IMAGE\` to this digest in a separate, reviewed change."
+              echo "This is the canonical tag. The pin PR also moves \`DEFAULT_HOST_IMAGE\` to this digest."
             else
               echo "This variant is not the default. Use it only by setting \`tenantHostImage\` (digest-pinned); do not change \`DEFAULT_HOST_IMAGE\`."
             fi
@@ -449,7 +450,10 @@ jobs:
   # must not drop the other's pending pin. Each variant's digest is read from its
   # wash:src-<hash> tag, so the PR is a snapshot of the registry, not of this run. A variant not
   # yet published for this source keeps its current row; recover a failed variant by dispatching
-  # the workflow for it. It never changes DEFAULT_HOST_IMAGE.
+  # the workflow for it. scripts/pin-artifact.ts also moves DEFAULT_HOST_IMAGE to the canonical
+  # variant's digest and appends each 0003 variant's digest to NATS_CREDENTIALS_HOST_IMAGE_DIGESTS.
+  # That allowlist lives under platform/platform/src/tenancy/**, an input of tenant-auth-image.yml,
+  # so merging a pin PR that extends it also publishes tenant-auth and opens bot/pin-tenant-auth.
   pin:
     name: Open pin PR
     # Also on a push that published nothing (every variant already published for this source, e.g.
