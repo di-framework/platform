@@ -65,6 +65,20 @@ It fails if the final artifact imports sockets or leaves the engine unresolved.
 Ship `dist/di-framework-pglite.wasm` together with `THIRD-PARTY-NOTICES.txt`.
 Build provenance and checksums are in `dist/BUILD-INFO.txt` and `SHA256SUMS`.
 
+The engine build is byte-reproducible. `scripts/build-engine.ts` sets
+`SOURCE_DATE_EPOCH` to the commit time of the pinned engine recipe
+(`PGLITE_SOURCE_REF`) and passes it into the build container. OpenSSL then
+writes that date, not the wall clock, into `crypto/buildinf.h`, and
+`engine/build-pgcrypto.sh` fails if it does not. `make reproducible` builds the
+engine twice from clean copies of the package at different paths and fails
+unless `pglite.wasi`, `engine.core.wasm`, `engine.wasm` and every embedded
+support file have the same sha256. Pass `REPRO_ARGS="--sdk-cache DIR"` to reuse
+already downloaded SDK tarballs, and `--keep` to keep both builds. The
+[reproducibility workflow](../../.github/workflows/pglite-engine-reproducible.yml)
+runs it when an engine input changes. Both builds use the same builder image;
+its `apt-get` packages are not version-pinned, so builds months apart can
+still differ.
+
 `make smoke` composes a real WIT consumer, runs it without network access, and
 checks typed parameters/results, SQL errors and recovery, transactions,
 rollback on close/drop, exclusive connection ownership, durability settings,
