@@ -274,8 +274,11 @@ way `workload_stop` does. They cover these cases:
 `tests/integration_exclusive_topology.rs` (needs the prebuilt test fixtures) covers the layout rule,
 a lone exclusive component loading and queueing real requests (it does not measure
 serialization; the live-store tests do), a new revision waiting for the old one on the same host
-path, and the HTTP trap path: a trap in the handler fails only its own call, and the calls queued
-behind it are served by a fresh instance, never the faulted one. The patch-check workflow builds the
+path, and what a caller sees of an HTTP trap: the trap fails only its own call, and the calls queued
+behind it are served by a fresh instance, never the faulted one. At the pinned wasmtime a guest
+trap ends the instance's event loop, so the pool reaps the instance whatever else happens. The HTTP
+handler's `trapped` flag covers a trap reported to a task that survives it; its retirement
+(`PoolSlot::finish`) is unit-tested in `exclusive_tests.rs`. The patch-check workflow builds the
 fixtures and runs each of these tests by name. See [Tests](#tests) for the commands.
 
 ## Tests
@@ -302,8 +305,8 @@ cargo test -p wash --features wasi-tls,host-component-plugins --lib -- insecure_
 
 # exclusive only: the topology tests need the wasm fixtures. The toolchain's bundled
 # wasm-component-ld (0.5.22 in 1.96.0) cannot link keyvalue-implements, so link with 0.5.24.
-cargo install --locked --root /tmp/wcld wasm-component-ld@0.5.24
-CARGO_TARGET_WASM32_WASIP2_LINKER=/tmp/wcld/bin/wasm-component-ld cargo xtask build-fixtures
+cargo install --locked --root /tmp/wasm-component-ld/0.5.24 wasm-component-ld@0.5.24
+CARGO_TARGET_WASM32_WASIP2_LINKER=/tmp/wasm-component-ld/0.5.24/bin/wasm-component-ld cargo xtask build-fixtures
 cargo test -p wash-runtime --features wasi-tls --test integration_exclusive_topology
 ```
 

@@ -690,7 +690,7 @@ test('CI runs every exclusive-instance topology test the 0001 patch adds, by nam
   const added = [
     ...(section ?? '').matchAll(/^\+#\[tokio::test[^\n]*\n\+(?:async )?fn (\w+)\(/gm),
   ].map((m) => m[1] ?? '');
-  expect(added).toContain('an_http_trap_retires_the_exclusive_instance_before_the_next_call');
+  expect(added).toContain('an_http_trap_leaves_the_queued_calls_a_fresh_instance');
 
   const workflow = parse('.github/workflows/tenant-host-patch-check.yml');
   const steps = workflow.jobs.patch?.steps ?? [];
@@ -714,6 +714,16 @@ test('CI runs every exclusive-instance topology test the 0001 patch adds, by nam
   const required = block.split('\n').map((line) => line.trim());
   expect(added.length).toBeGreaterThan(0);
   expect([...required].sort()).toEqual([...added].sort());
+
+  // The flag a trap reported to an HTTP task sets is unit-tested in the pool tests, by name.
+  const unit = 'a_call_finished_faulted_retires_its_instance_before_the_next_is_admitted';
+  expect(text).toMatch(new RegExp(`^\\+async fn ${unit}\\(`, 'm'));
+  expect(read('.github/workflows/tenant-host-patch-check.yml')).toContain(
+    `engine::instance_pool::exclusive_tests::${unit}\n`,
+  );
+  expect(fixtures?.run).toContain(
+    'root="${HOME}/.cache/wasm-component-ld/${WASM_COMPONENT_LD_VERSION}"',
+  );
 });
 
 describe('the check-source resolver reads platform/tenant-host/variants', () => {

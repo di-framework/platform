@@ -219,7 +219,8 @@ jobs:
       # 0002: protocol selection (unit and against a loopback listener), washlet propagation, and
       # `wash host` flag/env parsing. 0001 (when applied): the exclusive gates, queueing, trap,
       # timeout and drain tests (instance_pool, instance_driver) and the opt-in surviving the wire
-      # conversion (wire_). 0003 (when applied): NATS blobstore credential parsing, pool keys,
+      # conversion (wire_), including the retirement a call that ends faulted takes on the HTTP trap
+      # path. 0003 (when applied): NATS blobstore credential parsing, pool keys,
       # credential file reading, and the CONNECT a fake NATS server receives (nats_blobstore_).
       # Each name below must have run and passed.
       - name: Test the patches
@@ -247,7 +248,10 @@ jobs:
           )
           if [[ " ${PATCHES} " == *" 0001-exclusive-instance.patch "* ]]; then
             runtime_filters+=(instance_pool instance_driver wire_)
-            required+=(engine::instance_pool::exclusive_tests::)
+            required+=(
+              engine::instance_pool::exclusive_tests::
+              engine::instance_pool::exclusive_tests::a_call_finished_faulted_retires_its_instance_before_the_next_is_admitted
+            )
           fi
           if [[ " ${PATCHES} " == *" 0003-nats-blobstore-credentials.patch "* ]]; then
             runtime_filters+=(nats_blobstore_)
@@ -287,7 +291,8 @@ jobs:
           WASM_COMPONENT_LD_VERSION: '0.5.24'
         run: |
           set -euo pipefail
-          root="${HOME}/.cache/wasm-component-ld"
+          # Versioned, so a bump never reuses fixtures linked by the old linker from the cache.
+          root="${HOME}/.cache/wasm-component-ld/${WASM_COMPONENT_LD_VERSION}"
           cargo install --locked --root "${root}" "wasm-component-ld@${WASM_COMPONENT_LD_VERSION}"
           export CARGO_TARGET_WASM32_WASIP2_LINKER="${root}/bin/wasm-component-ld"
           "${CARGO_TARGET_WASM32_WASIP2_LINKER}" --version
@@ -308,7 +313,7 @@ jobs:
             an_exclusive_component_nobody_links_is_not_refused_for_its_links
             a_single_exclusive_component_loads_and_queues
             a_new_revision_waits_for_the_old_one_on_the_same_host_path
-            an_http_trap_retires_the_exclusive_instance_before_the_next_call
+            an_http_trap_leaves_the_queued_calls_a_fresh_instance
           )
           log="${RUNNER_TEMP}/topology-tests.log"
           cargo clippy -p wash-runtime --locked --features wasi-tls --test integration_exclusive_topology -- -D warnings
