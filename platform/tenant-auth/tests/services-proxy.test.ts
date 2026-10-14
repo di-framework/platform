@@ -92,6 +92,10 @@ describe('services create and the service proxy', () => {
             '{"group":"svc","max_age":31536000,"endpoints":[{"url":"https://collector.test/r"}]}',
           'Reporting-Endpoints': 'svc="https://collector.test/r"',
           'ALT-SVC': 'h3=":443"; ma=86400',
+          'Content-Security-Policy-Report-Only':
+            "default-src 'none'; report-uri https://collector.test/csp",
+          'Accept-CH': 'Sec-CH-UA-Platform-Version, Sec-CH-UA-Model',
+          'CRITICAL-CH': 'Sec-CH-UA-Model',
           'x-service': 'yes',
         },
       });
@@ -634,6 +638,20 @@ describe('services create and the service proxy', () => {
     const names = [...response.headers.keys()];
     for (const name of ['nel', 'report-to', 'reporting-endpoints', 'alt-svc'])
       expect(names).not.toContain(name);
+    expect(response.headers.get('x-service')).toBe('yes');
+  });
+
+  test('a service cannot set report-only policy or client hints on the controller (#304)', async () => {
+    const { url } = await openSession();
+    const response = await fetch(`${url}/reporting`, { headers: { authorization: 'Bearer ok' } });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('reporting');
+    const stripped = ['content-security-policy-report-only', 'accept-ch', 'critical-ch'];
+    for (const name of [...stripped, ...stripped.map((n) => n.toUpperCase())])
+      expect(response.headers.get(name)).toBeNull();
+    const names = [...response.headers.keys()];
+    for (const name of stripped) expect(names).not.toContain(name);
+    expect(response.headers.get('content-security-policy')).toBe('sandbox');
     expect(response.headers.get('x-service')).toBe('yes');
   });
 

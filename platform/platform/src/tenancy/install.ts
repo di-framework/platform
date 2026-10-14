@@ -51,14 +51,15 @@ export function tenantObject({ name, ...spec }: TenantDeclaration, installation:
 }
 
 /** Controller ConfigMap modules. TypeScript emit does not bundle imports, so
- * `admission`, `egress`, `backing-services`, `backing-service-reconcile`, `service-binding-reconcile`, and
- * `log-projection` must ship beside `resources` / `controller` (which require them at runtime). */
+ * `admission`, `egress`, `backing-services`, `backing-service-reconcile`, `service-binding-reconcile`,
+ * `registry-nats`, and `log-projection` must ship beside `resources` / `controller` (which require them at runtime). */
 export const CONTROLLER_SCRIPT_MODULES = [
   'admission',
   'egress',
   'backing-services',
   'workload-storage',
   'tls',
+  'registry-nats',
   'resources',
   'backing-service-reconcile',
   'service-binding-reconcile',
@@ -236,6 +237,9 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
       resources: ['networkpolicies'],
       verbs: ['get', 'list', 'watch', 'create', 'patch', 'update', 'delete'],
     },
+    // The one-shot Job that moves each tenant registry's object store into its NATS account
+    // (#159): applied with server-side apply, read for its result.
+    { apiGroups: ['batch'], resources: ['jobs'], verbs: ['get', 'create', 'patch'] },
     // No `escalate` (#115): the controller holds every rule of every Role it writes, which the
     // API server checks on each create and update. `bind` only on the fixed-name Roles it binds.
     {

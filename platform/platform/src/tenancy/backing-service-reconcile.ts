@@ -397,9 +397,13 @@ interface DeploymentFailure {
 const MAX_FAILURE_MESSAGE = 1024;
 
 function boundedMessage(message: string): string {
-  return message.length > MAX_FAILURE_MESSAGE
-    ? `${message.slice(0, MAX_FAILURE_MESSAGE - 1)}…`
-    : message;
+  if (message.length <= MAX_FAILURE_MESSAGE) return message;
+  let end = MAX_FAILURE_MESSAGE - 1;
+  // Never cut between the halves of a surrogate pair: Kubernetes would store U+FFFD for the
+  // orphaned high surrogate and the stored status would never equal the computed one.
+  const last = message.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${message.slice(0, end)}…`;
 }
 
 /**

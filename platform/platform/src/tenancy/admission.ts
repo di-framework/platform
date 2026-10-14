@@ -1,3 +1,4 @@
+import { REGISTRY_NATS_PASSWORD_FILE, REGISTRY_NATS_USER_FILE } from './registry-nats';
 import {
   CAPABILITIES,
   DEFAULT_CLASS_NAMES,
@@ -9,6 +10,7 @@ import {
   ROUTES_CONFIG_NAME,
   TENANT,
 } from './resources';
+import { HOST_MOUNT_ROOT } from './workload-storage';
 
 /** Controller-managed ConfigMap prefix for BackingService backend config (#450). */
 export const BS_CONFIG_PREFIX = 'di-bs-';
@@ -82,6 +84,13 @@ export interface HostInterfaceLike {
   config?: Record<string, unknown>;
 }
 
+/**
+ * Blobstore entry keys wash patch 0003 reads as files and sends to NATS as the user and password
+ * (#159). Whoever names them chooses which host file is sent, so only the controller may set them,
+ * only on the registry's entry, and only to the registry credentials mount.
+ */
+export const NATS_CREDENTIAL_KEYS = ['user_file', 'password_file'] as const;
+
 function registryBlobstoreAllowed(
   hostInterface: HostInterfaceLike,
   requester?: { username: string; controllerNamespace: string; workloadNamespace?: string },
@@ -91,13 +100,24 @@ function registryBlobstoreAllowed(
     : undefined;
   const config = hostInterface.config ?? {};
   const keys = Object.keys(config);
+  // Both credential files or neither, each exactly the registry credentials mount (#159).
+  const credentials =
+    keys.length === 2 ||
+    (keys.length === 4 &&
+      config.user_file === REGISTRY_NATS_USER_FILE &&
+      config.password_file === REGISTRY_NATS_PASSWORD_FILE);
   return (
     requester?.username ===
       `system:serviceaccount:${requester?.controllerNamespace}:di-platform-controller` &&
     tenant !== undefined &&
     (hostInterface.configFrom ?? []).length === 0 &&
-    keys.length === 2 &&
-    keys.every((key) => key === 'backend' || key === 'url') &&
+    keys.every(
+      (key) =>
+        key === 'backend' ||
+        key === 'url' ||
+        (NATS_CREDENTIAL_KEYS as readonly string[]).includes(key),
+    ) &&
+    credentials &&
     config.backend === 'nats' &&
     config.url === `nats://di-nats.di-runtime-${tenant}.svc.cluster.local:4222`
   );
@@ -243,6 +263,27 @@ export function workloadVolumesAllowed(input: {
       mounts.length === 0 ||
       (kept && mounts.every((mount) => volumes.some((volume) => volume.name === mount.name))),
   );
+}
+
+/** Platform workload storage directories (#11), the only host paths a workload volume may name. */
+const WORKLOAD_HOST_PATH = `^${HOST_MOUNT_ROOT}/[a-z0-9]([-a-z0-9]*[a-z0-9])?$`;
+export const WORKLOAD_HOST_PATH_MESSAGE =
+  'Workload host volumes may only name a platform workload storage directory';
+
+/**
+ * Mirrors the workload host path rule in the CEL policy (#159), which binds the controller too: a
+ * `hostPath` volume may only name a platform storage directory under `HOST_MOUNT_ROOT`. Guests run
+ * in the tenant host pod, so a volume naming any other host pod path (the registry's NATS
+ * credentials mount, or a parent of it) would hand that path to a guest as a preopen.
+ */
+export function workloadHostPathsAllowed(volumes: VolumeLike[] | undefined): boolean {
+  const pattern = new RegExp(WORKLOAD_HOST_PATH);
+  return (volumes ?? []).every((volume) => {
+    const hostPath = volume.hostPath as { path?: unknown } | undefined;
+    return (
+      hostPath === undefined || (typeof hostPath.path === 'string' && pattern.test(hostPath.path))
+    );
+  });
 }
 
 interface LocalResourcesLike {
@@ -521,13 +562,18 @@ function hostInterfaceAdmissionExpression(): string {
       h.config.all(k, k in ['subscriptions', 'consumer_group', 'max_in_flight', 'admission_wait'])) &&
     (${defaultMessaging} || ${namedMessaging}))`;
 
-  // Controller-only (#150): the registry's nats backend against its own runtime namespace's NATS.
+  // Controller-only (#150): the registry's nats backend against its own runtime namespace's NATS,
+  // anonymous or with both credential files pinned to the registry credentials mount (#159).
   const registryNats = `(variables.controller && ${noConfigReferences} &&
     object.metadata.namespace.startsWith('di-tenant-') &&
-    size(h.config) == 2 && has(h.config.backend) && has(h.config.url) &&
+    has(h.config.backend) && has(h.config.url) &&
     h.config.backend == 'nats' &&
     h.config.url == 'nats://di-nats.di-runtime-' + object.metadata.namespace.substring(10) +
-      '.svc.cluster.local:4222')`;
+      '.svc.cluster.local:4222' &&
+    (size(h.config) == 2 ||
+      (size(h.config) == 4 && has(h.config.user_file) && has(h.config.password_file) &&
+        h.config.user_file == '${REGISTRY_NATS_USER_FILE}' &&
+        h.config.password_file == '${REGISTRY_NATS_PASSWORD_FILE}')))`;
   const blobstore = `(h['namespace'] == 'wasmcloud' && h['package'] == 'blobstore' &&
     ${unnamed} && ${noSecretReferences} &&
     (!has(h.configFrom) || size(h.configFrom) == 0 || h.configFrom.all(c, ${managedConfigName})) &&
@@ -618,6 +664,12 @@ function workloadPolicy(namespace: string): AdmissionPolicy {
         expression: `variables.controller || variables.keptVolumes ||
           !has(variables.w.volumes) || size(variables.w.volumes) == 0`,
         message: 'Tenant workloads cannot mount host volumes',
+      },
+      {
+        // Everyone, the controller included (#159): only platform storage directories.
+        expression: `!has(variables.w.volumes) || variables.w.volumes.all(v, !has(v.hostPath) ||
+          (has(v.hostPath.path) && v.hostPath.path.matches('${WORKLOAD_HOST_PATH}')))`,
+        message: WORKLOAD_HOST_PATH_MESSAGE,
       },
       {
         expression: `variables.locals.all(l,
@@ -806,6 +858,46 @@ function backendConfigPolicy(namespace: string): AdmissionPolicy {
             (request.operation != 'CREATE' && has(oldObject.metadata.labels) &&
               '${PROJECTION_LABEL}' in oldObject.metadata.labels))`,
         message: 'di-framework.dev/projection ConfigMaps are published by the platform controller',
+      },
+    ],
+  };
+}
+
+/** Denial for NATS credential file keys in a controller-managed ConfigMap or Secret (#159). */
+export const MANAGED_CONFIG_KEYS_MESSAGE =
+  'di-bs-* and di-binding-* ConfigMaps and Secrets cannot carry user_file or password_file';
+
+/**
+ * Mirrors the `managed-config-keys` CEL rule (#159). Blobstore entries of tenant workloads read
+ * their backend config from `di-bs-` / `di-binding-` ConfigMaps, so such an object must never
+ * carry the NATS credential file keys, whoever writes it: only the registry's own entry, inline
+ * and controller-written, may name them.
+ */
+export function managedConfigKeysAllowed(input: {
+  name: string;
+  data?: Record<string, unknown>;
+  binaryData?: Record<string, unknown>;
+}): boolean {
+  if (!input.name.startsWith(BS_CONFIG_PREFIX) && !input.name.startsWith(BINDING_CONFIG_PREFIX))
+    return true;
+  const keys = [...Object.keys(input.data ?? {}), ...Object.keys(input.binaryData ?? {})];
+  return !keys.some((key) => (NATS_CREDENTIAL_KEYS as readonly string[]).includes(key));
+}
+
+function managedConfigKeysPolicy(): AdmissionPolicy {
+  const keys = JSON.stringify(NATS_CREDENTIAL_KEYS).replaceAll('"', "'");
+  return {
+    name: 'managed-config-keys',
+    apiGroups: [''],
+    apiVersions: ['v1'],
+    resources: ['configmaps', 'secrets'],
+    validations: [
+      {
+        expression: `!(object.metadata.name.startsWith('${BS_CONFIG_PREFIX}') ||
+            object.metadata.name.startsWith('${BINDING_CONFIG_PREFIX}')) || (
+          (!has(object.data) || !object.data.exists(k, k in ${keys})) &&
+          (!has(object.binaryData) || !object.binaryData.exists(k, k in ${keys})))`,
+        message: MANAGED_CONFIG_KEYS_MESSAGE,
       },
     ],
   };
@@ -1003,6 +1095,7 @@ export function admissionResources(
     workloadPolicy(namespace),
     reservedWorkloadPolicy(namespace, registryHost),
     backendConfigPolicy(namespace),
+    managedConfigKeysPolicy(),
     tenantSecretDeletePolicy(namespace),
     tenantSecretUpdatePolicy(namespace),
     tenantControllerSecretsPolicy(),

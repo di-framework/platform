@@ -124,9 +124,9 @@ test('published implementation provisions tenancy and isolation for an existing 
   expect(cfg).not.toHaveProperty('insecureRegistry');
   // A TLS install: no plain-HTTP registry anywhere.
   expect(cfg.insecureRegistries).toEqual([]);
-  // wash 2.8.0-wasi-tls with patch 0002 (`--insecure-registry`, #149).
+  // wash 2.8.0-wasi-tls with patches 0002 (`--insecure-registry`, #149) and 0003 (#159).
   expect(cfg.hostImage).toBe(
-    'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad',
+    'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab',
   );
   const scripts = resources.find((r) => r.name === 'configmap-di-platform-controller')?.inputs.data;
   expect(scripts['controller.js']).toContain('class Controller');
@@ -976,3 +976,67 @@ test.each([
   },
   60_000,
 );
+
+test('install warns that tenant registries stay in the shared NATS account unless the host is a known 0003 build (#159)', () => {
+  const run = (config: Record<string, unknown>) => {
+    const prefixed = Object.fromEntries(
+      Object.entries({ tenants: [{ name: 'alpha' }], ...config }).map(([key, value]) => [
+        `project:${key}`,
+        typeof value === 'string' ? value : JSON.stringify(value),
+      ]),
+    );
+    const child = spawnSync(
+      'node',
+      [
+        '-e',
+        `
+    const pulumi = require('@pulumi/pulumi');
+    const k8s = require('@pulumi/kubernetes');
+    pulumi.runtime.setAllConfig(${JSON.stringify(prefixed)});
+    pulumi.runtime.setMocks({
+      newResource: a => ({id:a.name, state:{...a.inputs, metadata:{...a.inputs.metadata, name:a.inputs.metadata?.name ?? a.name}}}),
+      call: a => a.inputs,
+    }, 'project', 'test', false);
+    pulumi.runtime.runInPulumiStack(async () => {
+      const platform = require('./dist').createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test' });
+      await platform.namespace.promise();
+    }).catch(e => {console.error(e);process.exitCode=1;});
+  `,
+      ],
+      { cwd: root, encoding: 'utf8' },
+    );
+    expect(child.status).toBe(0);
+    return `${child.stdout}${child.stderr}`;
+  };
+  const tenantAuth = {
+    image: `ghcr.io/x/y@sha256:${'a'.repeat(64)}`,
+    issuer: 'https://issuer.example',
+    oauthClient: { id: 'access', secretName: 'tenant-auth-oauth' },
+    registry: { component: `ghcr.io/x/registry@sha256:${'b'.repeat(64)}` },
+  };
+  const warning = 'is not a known build with wash patch 0003 (NATS blobstore credentials)';
+  // The default host image carries 0003; so does the pinned exclusive build.
+  expect(run({ tenantAuth })).not.toContain(warning);
+  expect(
+    run({
+      tenantAuth,
+      tenantHostImage:
+        'ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:da38d84b52a6327e02febe7172a466f628b1d923944ebf50171f1df630ec37a9',
+    }),
+  ).not.toContain(warning);
+  // Fail closed: an earlier build, an unknown digest or a tag alone is not trusted to carry it.
+  for (const tenantHostImage of [
+    'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad',
+    `ghcr.io/di-framework/wash@sha256:${'c'.repeat(64)}`,
+    'ghcr.io/di-framework/wash:2.8.0-wasi-tls',
+  ])
+    expect(run({ tenantAuth, tenantHostImage })).toContain(warning);
+  // Without a registry nothing is logged about it.
+  const { registry: _registry, ...withoutRegistry } = tenantAuth;
+  expect(
+    run({
+      tenantAuth: withoutRegistry,
+      tenantHostImage: 'ghcr.io/di-framework/wash:2.8.0-wasi-tls',
+    }),
+  ).not.toContain(warning);
+}, 180_000);

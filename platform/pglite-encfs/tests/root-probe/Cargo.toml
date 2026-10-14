@@ -1,0 +1,25 @@
+[package]
+name = "pglite-encfs-root-probe"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Smoke probe: drives pglite-encfs's wasi:filesystem export directly to check the root guard (#207)."
+publish = false
+
+# Standalone: neither the root workspace nor ../../ (pglite-encfs) builds it;
+# scripts/smoke.ts does.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "=0.61.1", default-features = false, features = ["macros", "realloc", "bitflags"] }
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+strip = "debuginfo"
+
+[profile.dev]
+panic = "abort"

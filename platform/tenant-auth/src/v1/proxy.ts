@@ -148,8 +148,11 @@ const STRIPPED_REQUEST_PREFIX = 'impersonate-';
  * Service headers never relayed: a service may not set cookies or origin-wide policy (CORS,
  * HSTS, site-data clearing, refresh redirects, alternative services) on the controller's origin,
  * nor register reporting endpoints (`nel`, `report-to`, `reporting-endpoints`) that would make
- * the browser send it the URLs of later controller requests. The hop-by-hop framing is the
- * controller's own. `access-control-*` is dropped by prefix. Header names arrive lower-cased.
+ * the browser send it the URLs of later controller requests. A report-only policy
+ * (`content-security-policy-report-only`) would have the browser send violation reports to an
+ * address the service picks, which the `sandbox` policy otherwise blocks; client-hint requests
+ * (`accept-ch`, `critical-ch`) would change which hints the browser sends on later controller
+ * requests. The hop-by-hop framing is the controller's own. `access-control-*` is dropped by prefix. Header names arrive lower-cased.
  */
 const STRIPPED_RESPONSE = new Set([
   'set-cookie',
@@ -159,6 +162,9 @@ const STRIPPED_RESPONSE = new Set([
   'nel',
   'report-to',
   'reporting-endpoints',
+  'content-security-policy-report-only',
+  'accept-ch',
+  'critical-ch',
   'alt-svc',
   'connection',
   'keep-alive',

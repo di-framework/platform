@@ -61,6 +61,12 @@ const TAG: std::ops::Range<usize> = 136..152;
 pub enum HeaderError {
     /// No magic: a plaintext or foreign file, or a header cut short.
     NotEncrypted,
+    /// No magic in a file no longer than a header whose start is not all
+    /// zero: a small plaintext file, or a stub left by a failed header write
+    /// (`ENOSPC`, or a crash under ext4 `data=writeback` that made the size
+    /// durable but not the bytes). Either way it holds no encrypted data,
+    /// since data only ever follows a synced header (#207).
+    Stub,
     /// A format version or codec this build does not read.
     Unsupported { version: u8, codec: u8 },
     /// Wrapped under a key whose KCV is not the one offered.
@@ -87,13 +93,23 @@ pub enum HeaderState {
 /// longer than [`HEADER_LEN`] (it may hold data; the header is synced before
 /// any data is written, so a crash cannot produce that state), and any
 /// non-zero bytes that are not a header, however short (a plaintext file must
-/// never be read as an empty encrypted one).
+/// never be read as an empty encrypted one). Those short files are reported as
+/// [`HeaderError::Stub`] so the operator learns they hold no encrypted data.
+///
+/// Only the first [`HEADER_USED`] bytes are inspected: a file of at most
+/// [`HEADER_LEN`] bytes whose first [`HEADER_USED`] bytes are zero is fresh
+/// whatever the rest holds.
 pub fn classify(start: &[u8], physical: u64) -> Result<HeaderState, HeaderError> {
     let start = &start[..start.len().min(HEADER_USED)];
-    if physical <= HEADER_LEN && start.iter().all(|&b| b == 0) {
+    let no_room_for_data = physical <= HEADER_LEN;
+    if no_room_for_data && start.iter().all(|&b| b == 0) {
         return Ok(HeaderState::Fresh);
     }
-    Header::parse(start).map(HeaderState::Sealed)
+    match Header::parse(start) {
+        Ok(header) => Ok(HeaderState::Sealed(header)),
+        Err(HeaderError::NotEncrypted) if no_room_for_data => Err(HeaderError::Stub),
+        Err(error) => Err(error),
+    }
 }
 
 /// A parsed header (magic, version and codec already checked).
@@ -349,15 +365,61 @@ mod tests {
             Err(HeaderError::NotEncrypted)
         );
         // Non-zero bytes that are not a header are refused at any size: a small
-        // plaintext file must not be read as an empty encrypted one.
+        // plaintext file must not be read as an empty encrypted one. Up to a
+        // header's length they are reported as a stub (#207): no encrypted
+        // data can be in them.
+        assert_eq!(classify(&[b'x'; HEADER_USED], 200), Err(HeaderError::Stub));
         assert_eq!(
-            classify(&[b'x'; HEADER_USED], 200),
-            Err(HeaderError::NotEncrypted)
+            classify(&[b'x'; HEADER_USED], HEADER_LEN),
+            Err(HeaderError::Stub)
         );
-        assert_eq!(classify(b"17\n", 3), Err(HeaderError::NotEncrypted));
+        assert_eq!(classify(b"17\n", 3), Err(HeaderError::Stub));
         let mut half = [0u8; HEADER_USED];
         half[..8].copy_from_slice(MAGIC);
-        assert_eq!(classify(&half[..20], 20), Err(HeaderError::NotEncrypted));
+        assert_eq!(classify(&half[..20], 20), Err(HeaderError::Stub));
+    }
+
+    #[test]
+    fn stubs_are_only_files_without_room_for_data() {
+        // A partial header write (ENOSPC) or garbage behind a durable size
+        // (ext4 data=writeback crash): no larger than a header, start not zero.
+        let mut torn = [0u8; HEADER_USED];
+        torn[..8].copy_from_slice(MAGIC);
+        torn[8] = FORMAT_VERSION;
+        for physical in [1, 8, HEADER_USED as u64, HEADER_LEN] {
+            assert_eq!(
+                classify(&torn[..(physical as usize).min(12)], physical),
+                Err(HeaderError::Stub),
+                "{physical}"
+            );
+        }
+        // One byte longer may hold data: still refused, but not called a stub.
+        assert_eq!(
+            classify(&[b'x'; HEADER_USED], HEADER_LEN + 1),
+            Err(HeaderError::NotEncrypted)
+        );
+        // A complete header in a short file is sealed, and an unsupported one
+        // is reported as such, never as a stub.
+        let sealed = sealed();
+        assert_eq!(
+            classify(sealed.as_bytes(), HEADER_USED as u64),
+            Ok(HeaderState::Sealed(sealed.clone()))
+        );
+        let mut other = *sealed.as_bytes();
+        other[9] = 0xFF;
+        assert_eq!(
+            classify(&other, HEADER_LEN),
+            Err(HeaderError::Unsupported {
+                version: FORMAT_VERSION,
+                codec: 0xFF
+            })
+        );
+        // The first HEADER_USED bytes decide: zero there means fresh, whatever
+        // follows within the header (README "Header lifecycle").
+        assert_eq!(
+            classify(&[0u8; HEADER_USED], HEADER_LEN),
+            Ok(HeaderState::Fresh)
+        );
     }
 
     #[test]
