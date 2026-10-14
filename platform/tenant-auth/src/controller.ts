@@ -194,6 +194,82 @@ export function registryNotServing(response: Response): boolean {
   return [404, 502, 503].includes(response.status) && !response.headers.has('content-type');
 }
 
+/** Largest registry error body read for its OCI code; the registry's own is about 120 bytes. */
+const REGISTRY_ERROR_BODY_MAX_BYTES = 16 * 1024;
+
+/**
+ * Whether a registry answer is its own `503` with OCI error code `UNAVAILABLE`: the registry sends
+ * it while the tenant controller's whoami cannot be reached (a controller restart, an identity
+ * issuer outage), so a host pull may wait it out like a registry that is still starting.
+ *
+ * On a GET, only a JSON body of at most {@link REGISTRY_ERROR_BODY_MAX_BYTES} is read, from a
+ * clone, so the response stays whole; a body that is cut off, unreadable, not JSON, or not read
+ * before `signal` aborts is not `UNAVAILABLE`. A HEAD answer has no body to read the code from, so
+ * any `503` with a JSON `content-type` counts: that is the registry's only `503` (its `unavailable`
+ * answer in `oci-registry/src/auth.rs`), while the host's own gateway errors carry no content type.
+ */
+export async function registryUnavailable(
+  response: Response,
+  options: { head?: boolean; signal?: AbortSignal } = {},
+): Promise<boolean> {
+  if (response.status !== 503) return false;
+  const type = response.headers.get('content-type') ?? '';
+  if (!/^application\/(?:[\w.+-]+\+)?json(?:\s*;|$)/i.test(type.trim())) return false;
+  if (options.head) return true;
+  if (!response.body) return false;
+  const text = await readCapped(response.clone(), REGISTRY_ERROR_BODY_MAX_BYTES, options.signal);
+  if (text === undefined) return false;
+  try {
+    const body = JSON.parse(text) as { errors?: unknown };
+    return (
+      Array.isArray(body.errors) &&
+      body.errors.some(
+        (error) =>
+          typeof error === 'object' &&
+          error !== null &&
+          (error as { code?: unknown }).code === 'UNAVAILABLE',
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** A response body as text, or undefined when it exceeds `max`, fails, or `signal` aborts. */
+async function readCapped(
+  response: Response,
+  max: number,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  const reader = response.body?.getReader();
+  if (!reader) return '';
+  const stop = () => {
+    reader.cancel().catch(() => {});
+  };
+  signal?.addEventListener('abort', stop, { once: true });
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      if (signal?.aborted) return undefined;
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > max) {
+        stop();
+        return undefined;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return undefined;
+  } finally {
+    signal?.removeEventListener('abort', stop);
+  }
+  if (signal?.aborted) return undefined;
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
 /** A slot of a registry request pool; both calls are idempotent. */
 interface PoolSlot {
   /** Takes the slot; false when the pool is full. */
@@ -1112,7 +1188,7 @@ export class Controller {
       };
       const answer = withBody
         ? await send()
-        : await this.untilRegistryAnswers(attempt, signal, url, slot);
+        : await this.untilRegistryAnswers(attempt, signal, url, slot, request.method === 'HEAD');
       // No slot came free for a waiting pull before its wait was over (it holds none).
       if (!answer) return registryBusy();
       upstream = answer;
@@ -1158,9 +1234,13 @@ export class Controller {
    * Sends a host pull until the registry workload answers it (#197), for at most
    * `registryPullWaitMs`. After a host (re)start its workloads pull while `di-tenant-registry` on
    * the same host is still starting: the host then refuses the connection, or answers the empty
-   * 404 wash gives a `Host` no workload serves yet. Both are retried with a short backoff; any
-   * answer from the registry itself (its errors are OCI JSON) is final. The wait is bounded and
-   * only delays this one pull, so a host that serves the registry is never held back by it.
+   * 404 wash gives a `Host` no workload serves yet. Both are retried with a short backoff, as is
+   * the registry's own `503 UNAVAILABLE` (it cannot reach this controller's whoami yet; told by
+   * its OCI code on a GET and by its JSON `content-type` on a HEAD, see
+   * {@link registryUnavailable}); any other answer from the registry itself (its errors are OCI
+   * JSON) is final. Reading a `503` body for its code is bounded by `registryUpstreamTimeoutMs`.
+   * The wait is bounded and only delays this one pull, so a host that serves the registry is never
+   * held back by it.
    *
    * The pool slot is given back between attempts, so pulls waiting out a host restart do not
    * turn away the other pulls; an attempt takes a slot again first, and a pull that finds none
@@ -1171,27 +1251,48 @@ export class Controller {
     signal: AbortSignal,
     url: URL,
     slot: PoolSlot,
+    head: boolean,
   ): Promise<Response | undefined> {
     const deadline = Date.now() + this.config.registryPullWaitMs;
     let delay = REGISTRY_PULL_RETRY_INITIAL_MS;
     for (let tries = 0; ; tries++) {
       const outcome = await attemptPull(send, signal);
-      if (outcome.response && !registryNotServing(outcome.response)) return outcome.response;
+      const reason = await this.pullRetryReason(outcome, signal, head);
+      // Without a reason to retry, the attempt has the registry's final answer.
+      if (reason === undefined) return outcome.response;
       if (Date.now() + delay > deadline) return settle(outcome);
       await outcome.response?.body?.cancel().catch(() => {});
       if (tries === 0)
-        this.audit('registry.waiting', {
-          path: url.pathname,
-          listener: 'registry-pull',
-          reason: outcome.response
-            ? `the host answered ${outcome.response.status} before the registry was serving`
-            : String(outcome.failure),
-        });
+        this.audit('registry.waiting', { path: url.pathname, listener: 'registry-pull', reason });
       slot.release();
       const next = await pauseForSlot(delay, deadline, signal, slot);
       if (next === undefined) return undefined;
       delay = next;
     }
+  }
+
+  /**
+   * Why a host pull attempt is retried (#197), or undefined when its answer is final: a failed
+   * attempt, the host's own answer while the registry is not serving, or the registry's
+   * `503 UNAVAILABLE`. Only a `503` can be that, so only a `503` starts a body-read timer.
+   */
+  private async pullRetryReason(
+    outcome: { response?: Response; failure?: unknown },
+    signal: AbortSignal,
+    head: boolean,
+  ): Promise<string | undefined> {
+    const { response } = outcome;
+    if (!response) return String(outcome.failure);
+    if (registryNotServing(response))
+      return `the host answered ${response.status} before the registry was serving`;
+    if (response.status !== 503) return undefined;
+    const bodyRead = AbortSignal.any([
+      signal,
+      AbortSignal.timeout(this.config.registryUpstreamTimeoutMs),
+    ]);
+    const unavailable = await registryUnavailable(response, { head, signal: bodyRead });
+    signal.throwIfAborted();
+    return unavailable ? 'the registry answered 503 UNAVAILABLE' : undefined;
   }
 
   /** Registry front requests in flight (see {@link handleRegistry}). */
