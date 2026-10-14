@@ -280,7 +280,8 @@ function createWithNetworkPolicy(
       } catch (e) { error = e.message; }
       // The sentinel round-trips through the mocks. A successful call also polls until its
       // kube-router DaemonSet is registered, so nothing is asserted against a fixed timer.
-      await new k8s.core.v1.Namespace('sentinel', {}, { provider: new k8s.Provider('sentinel-provider', {}) }).id;
+      const sentinel = new k8s.core.v1.Namespace('sentinel', {}, { provider: new k8s.Provider('sentinel-provider', {}) });
+      await new Promise(r => sentinel.urn.apply(r));
       if (!error) for (let i = 0; i < 200 && !resources.some(r => r.type === 'kubernetes:apps/v1:DaemonSet'); i++) await new Promise(r => setTimeout(r, 50));
       return error;
     }).then(error => {
