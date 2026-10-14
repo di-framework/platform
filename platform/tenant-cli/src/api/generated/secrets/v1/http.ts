@@ -81,6 +81,7 @@ export class SecretsV1HttpController {
 
   @Endpoint({
     summary: 'Unset a secret',
+    description: 'Deletes the secret; 404 when it does not exist, 409 naming the deployed workloads while any of them injects it.',
     parameters: [{"name":"env","in":"query","required":true,"schema":{"type":"string","enum":["prod","staging"]}}],
     responses: {
       '204': {

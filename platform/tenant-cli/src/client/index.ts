@@ -38,6 +38,7 @@ export type LogEvent = Json<'logs', 200>;
 export type LogsQuery = Query<'logs'>;
 export type SecretList = Json<'secrets', 200>;
 export type ConfigList = Json<'vars', 200>;
+export type VarUnset = Json<'unsetVar', 200>;
 export type ProxyRequest = Body<'proxy'>;
 export type ProxySession = Json<'proxy', 201>;
 export type Problem = components['schemas']['Problem'];
@@ -208,8 +209,20 @@ export function createClient(options: ClientOptions) {
         query: { env },
         body: { value },
       }),
-    unsetVar: (env: Env, name: string) =>
-      empty({ method: 'DELETE', path: PATHS.var, params: { name }, query: { env } }),
+    /**
+     * Removes the var; `warnings` names deployed workloads that injected it (platform#100). A
+     * controller from before #100 answers 204 with no body, read as no warnings.
+     */
+    async unsetVar(env: Env, name: string): Promise<VarUnset> {
+      const response = await send({
+        method: 'DELETE',
+        path: PATHS.var,
+        params: { name },
+        query: { env },
+      });
+      const text = await response.text();
+      return text.trim() ? (JSON.parse(text) as VarUnset) : { warnings: [] };
+    },
   };
 }
 

@@ -308,6 +308,27 @@ export const schemas = {
     required: ['value'],
   },
 
+  VarUnset: {
+    type: 'object',
+    description:
+      "The var was removed. `warnings` lists what may notice: `referenced` names the deployed workloads that inject the environment's vars (platform#100); empty when none do.",
+    properties: {
+      warnings: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            code: { type: 'string', enum: ['referenced'] },
+            detail: string,
+            deployments: { type: 'array', items: string },
+          },
+          required: ['code', 'detail', 'deployments'],
+        },
+      },
+    },
+    required: ['warnings'],
+  },
+
   ProxyRequest: {
     type: 'object',
     properties: {

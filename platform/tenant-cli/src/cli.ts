@@ -753,9 +753,15 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
       if (!name || (sub !== 'set' && sub !== 'update' && sub !== 'unset')) {
         throw new CliError(`usage: ${command} list|set|update|unset <name>`);
       }
-      if (sub === 'unset')
-        await (secret ? client.unsetSecret(env, name) : client.unsetVar(env, name));
-      else {
+      if (sub === 'unset') {
+        if (secret) await client.unsetSecret(env, name);
+        else {
+          const result = await client.unsetVar(env, name);
+          // With --json the warnings go to stdout for scripts; otherwise each is a stderr line.
+          if (flags.json === 'true') io.stdout(JSON.stringify(result, null, 2));
+          else for (const warning of result.warnings) io.stderr(`warning: ${warning.detail}`);
+        }
+      } else {
         const value = valueFrom(flags, io);
         if (sub === 'set')
           await (secret ? client.setSecret(env, name, value) : client.setVar(env, name, value));

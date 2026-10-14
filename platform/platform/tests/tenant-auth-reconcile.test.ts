@@ -2,7 +2,14 @@ import { describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { createPrivateKey, X509Certificate } from 'node:crypto';
 import { platformRegistryPullHost } from '../src/insecure-registries';
-import { type Api, ApiError, Controller, collection, main } from '../src/tenancy/controller';
+import {
+  type Api,
+  ApiError,
+  Controller,
+  collection,
+  main,
+  withHostPullFailure,
+} from '../src/tenancy/controller';
 import { CONTROLLER_SCRIPT_MODULES, controllerClusterRoleRules } from '../src/tenancy/install';
 import {
   addQuantity,
@@ -2821,6 +2828,75 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     api.fail = undefined;
     await controller.reconcileTenant(t, []);
     expect(conditions().TenantAuthReady?.reason).not.toBe('HostPullError');
+  });
+
+  it('reports HostPullError over Reconciled and Provisioning, and keeps failure reasons (#131)', () => {
+    const base = {
+      type: 'TenantAuthReady',
+      observedGeneration: 1,
+      lastTransitionTime: '2026-10-14T00:00:00.000Z',
+    };
+    const detail = 'Tenant host registry wiring could not be read:';
+    for (const [status, reason] of [
+      ['True', 'Reconciled'],
+      ['False', 'Provisioning'],
+    ] as const)
+      expect(
+        withHostPullFailure({ ...base, status, reason, message: 'm' }, new Error('down')),
+      ).toEqual({ ...base, status: 'False', reason: 'HostPullError', message: `${detail} down` });
+    for (const reason of ['RouteError', 'RegistryHostConflict', 'ReconcileError'])
+      expect(
+        withHostPullFailure({ ...base, status: 'False', reason, message: 'earlier' }, 'down'),
+      ).toEqual({ ...base, status: 'False', reason, message: `earlier; ${detail} down` });
+  });
+
+  it('keeps an earlier TenantAuthReady failure reason when the host wiring lookup fails (#131)', async () => {
+    const { api, t } = prepare();
+    const controller = new Controller(api, tlsCfg);
+    await controller.reconcileTenant(t, []);
+    await controller.reconcileTenant(t, []);
+    const condition = () => t.status?.conditions?.find((c) => c.type === 'TenantAuthReady');
+    // A workload that claims the registry host: TenantAuthReady reports RegistryHostConflict.
+    api.seed({
+      apiVersion: 'runtime.wasmcloud.dev/v1alpha1',
+      kind: 'WorkloadDeployment',
+      metadata: { name: 'claimant', namespace: 'di-tenant-alpha', labels: {} },
+      spec: {
+        template: {
+          spec: {
+            hostInterfaces: [
+              {
+                namespace: 'wasi',
+                package: 'http',
+                interfaces: ['handler'],
+                config: { host: registryHttpHost(withRegistry) },
+              },
+            ],
+          },
+        },
+      },
+    } as unknown as Resource);
+    const log = console.error;
+    console.error = () => {};
+    try {
+      await controller.reconcileTenant(t, []);
+      expect(condition()).toMatchObject({ status: 'False', reason: 'RegistryHostConflict' });
+      const conflict = condition()?.message;
+      // Only the host wiring lookup (the first read of the CA this tick) fails.
+      let failures = 0;
+      api.fail = (method, p) =>
+        method === 'GET' && p === caPath && failures++ === 0
+          ? new ApiError(500, 'configmaps unavailable')
+          : undefined;
+      await controller.reconcileTenant(t, []);
+      expect(condition()).toMatchObject({ status: 'False', reason: 'RegistryHostConflict' });
+      expect(condition()?.message).toBe(
+        `${conflict}; Tenant host registry wiring could not be read: configmaps unavailable`,
+      );
+    } finally {
+      api.fail = undefined;
+      console.error = log;
+    }
   });
 
   it('wires the hosts with TLS for the pull listener even when insecureRegistry is true', async () => {

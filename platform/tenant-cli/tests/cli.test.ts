@@ -647,8 +647,12 @@ describe('run', () => {
       'DELETE /v1/secrets/TOKEN': record,
       'PUT /v1/vars/LEVEL': record,
       'PATCH /v1/vars/LEVEL': record,
-      'DELETE /v1/vars/LEVEL': record,
+      'DELETE /v1/vars/LEVEL': (call: Recorded) => {
+        bodies.push(call.body);
+        return json({ warnings });
+      },
     });
+    let warnings: unknown[] = [];
     const file = join(scratch, 'value.txt');
     writeFileSync(file, 's3cret\n');
     expect(await run(['secrets', 'list', '--env', 'prod'], io(fetch))).toBe(0);
@@ -679,6 +683,16 @@ describe('run', () => {
       undefined,
     ]);
     expect(err.at(-1)).toBe('unset var LEVEL in prod');
+    // A var some deployed workload injected still unsets; the CLI prints the warning (#100).
+    const detail = 'var LEVEL was referenced by deployed workloads in prod: web-prod; check';
+    warnings = [{ code: 'referenced', detail, deployments: ['web-prod'] }];
+    expect(await run(['vars', 'unset', 'LEVEL', '--env', 'prod'], io(fetch))).toBe(0);
+    expect(err.slice(-2)).toEqual([`warning: ${detail}`, 'unset var LEVEL in prod']);
+    // With --json the warnings go to stdout as the VarUnset body, not to stderr.
+    const errors = err.length;
+    expect(await run(['vars', 'unset', 'LEVEL', '--env', 'prod', '--json'], io(fetch))).toBe(0);
+    expect(JSON.parse(out.at(-1) as string)).toEqual({ warnings });
+    expect(err.slice(errors)).toEqual(['unset var LEVEL in prod']);
     expect(await run(['vars', 'set', '--env', 'prod'], io(fetch))).toBe(1);
     expect(err.at(-1)).toBe('usage: vars list|set|update|unset <name>');
   });

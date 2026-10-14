@@ -182,7 +182,9 @@ init [name] [--dir <path>] [--name <name>] [--force]
 
 Shared flags: `--env`, `--json`, `--account` (or `DI_TENANT_ACCOUNT`, or the only login on disk).
 There is no token argument. Secret and var values come from `--from-file` or stdin (`-`), so they
-stay out of shell history. `init` writes a minimal di-framework seed and creates no platform
+stay out of shell history. `secrets unset` fails with 409 while a deployed workload injects the
+secret; `vars unset` succeeds but prints `warning: …` naming the deployed workloads that inject
+the env's vars (platform#100). `init` writes a minimal di-framework seed and creates no platform
 resources.
 
 ## Login

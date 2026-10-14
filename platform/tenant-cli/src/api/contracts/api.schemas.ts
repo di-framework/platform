@@ -38,6 +38,7 @@ export const LogEvent = runtime(schemas.LogEvent);
 export const ConfigList = runtime(schemas.ConfigList);
 export const SecretList = runtime(schemas.SecretList);
 export const ConfigValue = runtime(schemas.ConfigValue);
+export const VarUnset = runtime(schemas.VarUnset);
 export const ProxyRequest = runtime(schemas.ProxyRequest);
 export const ProxySession = runtime(schemas.ProxySession);
 
@@ -57,5 +58,6 @@ export type LogEvent = unknown;
 export type ConfigList = unknown;
 export type SecretList = unknown;
 export type ConfigValue = unknown;
+export type VarUnset = unknown;
 export type ProxyRequest = unknown;
 export type ProxySession = unknown;
