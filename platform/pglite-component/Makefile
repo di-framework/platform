@@ -7,6 +7,8 @@
 #   make smoke          build tests/smoke-consumer, `wac plug` it with the provider,
 #                       run under wasmtime with persistent storage and no networking
 #   make unit           cargo test --lib (host unit tests)
+#   make reproducible   build the engine twice from clean copies and require
+#                       identical sha256 digests (REPRO_ARGS="--sdk-cache DIR --keep")
 #   make wit            print the WIT recovered from the built component
 #   make check          cargo check for the wasm target
 #   make compose APP=path/to/app.wasm OUT=path/to/composed.wasm
@@ -28,7 +30,7 @@ export DF_PGLITE_TOOLS_DIR := $(TOOLS_DIR)
 
 PLUGIN_ASSET_DIR ?= $(PKG_DIR)/dist
 
-.PHONY: tools tools-rust build debug smoke unit wit check compose publish-asset versions clean distclean
+.PHONY: tools tools-rust build debug smoke unit reproducible wit check compose publish-asset versions clean distclean
 
 tools:
 	bun scripts/install-tools.ts
@@ -47,6 +49,9 @@ smoke: build
 
 unit:
 	bun scripts/unit.ts
+
+reproducible:
+	bun scripts/check-reproducible.ts $(REPRO_ARGS)
 
 wit:
 	bun scripts/wit.ts

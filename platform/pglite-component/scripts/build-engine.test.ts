@@ -1,5 +1,16 @@
 import { describe, expect, test } from 'bun:test';
-import { patchUpstreamBuild } from './build-engine.ts';
+import { patchUpstreamBuild, sourceDateEpoch } from './build-engine.ts';
+
+describe('sourceDateEpoch', () => {
+  test('uses the pinned commit time', () => {
+    expect(sourceDateEpoch('1754000000\n')).toBe('1754000000');
+  });
+
+  test('rejects output that is not a Unix timestamp', () => {
+    expect(() => sourceDateEpoch('')).toThrow('no usable commit time');
+    expect(() => sourceDateEpoch('fatal: bad object')).toThrow('no usable commit time');
+  });
+});
 
 const upstreamVersions = [
   'SDK_SHA256_X86_64=__FILLED_BY_FIRST_BUILD__',
@@ -47,6 +58,11 @@ describe('patchUpstreamBuild', () => {
     expect(patched.buildSh).not.toContain('-v "$(pwd)/$SRC:/workspace:rw"');
     expect(patched.buildSh.endsWith('cp ../NOTICE out/NOTICE\n')).toBe(true);
     expect(patched.buildSh.split('cp ../NOTICE out/NOTICE')).toHaveLength(2);
+  });
+
+  test('passes SOURCE_DATE_EPOCH into the build container', () => {
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: expected shell text, not a TS template.
+    expect(patched.buildSh).toContain('-e "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:?}"');
   });
 
   test('fails loudly when the upstream anchor moves', () => {

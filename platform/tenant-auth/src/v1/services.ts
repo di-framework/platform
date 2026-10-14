@@ -1,7 +1,7 @@
 import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
 import {
-  EGRESS_ENTRY_MAX_LENGTH as DESTINATION_MAX_LENGTH,
   EGRESS_MAX_DESTINATIONS as MAX_DESTINATIONS,
+  validEgressDestination,
 } from '../../../platform/src/tenancy/egress.ts';
 import type { V1Module } from './context.ts';
 import { proxySessions, SERVICE_NAME } from './proxy.ts';
@@ -20,9 +20,6 @@ const GROUP_VERSION = 'platform.di-framework.dev/v1alpha1';
 /** Records the `/v1` environment the service was created for. */
 export const ENV_ANNOTATION = 'platform.di-framework.dev/env';
 const QUANTITY = /^[0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|Ti)?$/;
-/** `host`, `*.suffix`, optionally with `:port` (no leading zeros); the BackingService egress schema. */
-const DESTINATION =
-  /^(?:\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::([1-9][0-9]{0,4}))?$/;
 
 type Sizing = { storage?: string; memory?: string; cpu?: string };
 
@@ -47,12 +44,6 @@ interface BackingService {
   };
 }
 
-function destinationValid(value: string): boolean {
-  const match = DESTINATION.exec(value);
-  if (match === null || value.length > DESTINATION_MAX_LENGTH) return false;
-  return match[1] === undefined || (Number(match[1]) >= 1 && Number(match[1]) <= 65535);
-}
-
 /** The admission rules a request can break, checked before the API server sees it. */
 function invalid(command: CreateServiceCommand): string | undefined {
   if (command.name.length > 40 || !SERVICE_NAME.test(command.name))
@@ -69,7 +60,9 @@ function invalid(command: CreateServiceCommand): string | undefined {
       return `an egress service takes at most ${MAX_DESTINATIONS} destinations`;
     if (new Set(command.destinations).size !== command.destinations.length)
       return 'destinations must not repeat';
-    const bad = command.destinations.find((d) => !destinationValid(d));
+    // The platform's own check for a requested destination: `host`, `*.suffix`, either with
+    // `:port`, within the BackingService schema's length limit.
+    const bad = command.destinations.find((d) => !validEgressDestination(d));
     if (bad !== undefined) return `destination ${bad} must be host, *.suffix, or either with :port`;
   } else if (command.destinations !== undefined) {
     return 'destinations are only allowed on an egress service';
