@@ -1195,7 +1195,9 @@ tenantAuth:
       template keeps the last known CA digest while `tenant-controller-ca` is missing, so only a
       different CA rolls the hosts. The first wiring, a CA renewal, and unsetting the registry
       each roll the hosts once. A failed lookup of that wiring is reported on `TenantAuthReady`
-      (`HostPullError`) and leaves the hosts as they were. Unsetting
+      (`HostPullError`, or appended to the message of an earlier failure reason such as
+      `RegistryHostConflict` or `RouteError`, which is kept) and leaves the hosts as they were.
+      Unsetting
       `tenantAuth.registry` also deletes the pull Secret and Service.
     - Alternative not taken: anonymous pull restricted by NetworkPolicy to the tenant's host pods.
       The registry authorizes every request through whoami, so it would need an
