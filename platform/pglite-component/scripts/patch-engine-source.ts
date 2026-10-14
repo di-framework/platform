@@ -17,6 +17,7 @@ export const ALLOWED_RELATIVE_FILES = new Set([
   'pglite-wasm/build.sh',
   'wasm-build/build-ext.sh',
   'wasm-build/sdk_port-wasi/sdk_port-wasi-dlfcn.c',
+  'contrib/pgcrypto/pgp-cfb.c',
   'df-extensions/build-pgcrypto.sh',
   'df-extensions/openssl.tar.gz',
 ]);
@@ -144,12 +145,163 @@ export function insertOnce(
   return text.replace(anchor, where === 'before' ? `${addition}${anchor}` : `${anchor}${addition}`);
 }
 
+/**
+ * Replace the single occurrence of `anchor` with `replacement`.
+ * Idempotent: text that already contains `replacement` is returned unchanged.
+ */
+export function replaceOnce(
+  text: string,
+  anchor: string,
+  replacement: string,
+  file: string,
+): string {
+  if (text.includes(replacement)) return text;
+  const count = text.split(anchor).length - 1;
+  if (count !== 1) throw new Error(`${file}: expected 1 patch anchor, found ${count}`);
+  return text.replace(anchor, () => replacement);
+}
+
 export const DLOPEN_DEFINITION = 'void *\ndlopen(';
+
+/**
+ * The static-extension dlopen hook must run before the emulated dlopen table
+ * code below it, so statically linked extensions never take a table slot.
+ */
+export const DLOPEN_HOOK_NOTE = [
+  '    /* di-framework: keep this hook ahead of the dltab code below; static',
+  '     * extensions such as pgcrypto must never take a dltab slot. */',
+  '',
+].join('\n');
+
+/**
+ * wasipg's dlopen emulation declares `volatile dict_t* dltab[];`, which C
+ * completes to a one-element array, then stores each new table at
+ * `dltab[++dltab_index]` with no bound. The first dlopen already writes past
+ * the array, and loading plpgsql (or LOAD of any existing file) reaches it.
+ * Its lookup never matched either (`> 0` on entry 0). Replace the table with
+ * a bounded one and fail dlopen cleanly once it is full.
+ */
+export const DLTAB_DECL_OLD = 'volatile dict_t* dltab[];\nvolatile int dltab_index = 0;\n';
+export const DLTAB_DECL_NEW = [
+  '/* di-framework: bounded dlopen table (upstream overflowed dltab[]). */',
+  '#define DF_DLTAB_MAX 64',
+  'static dict_t dltab[DF_DLTAB_MAX];',
+  'static int dltab_index = 0;',
+  '',
+].join('\n');
+export const DLTAB_LOOKUP_OLD = [
+  '    for (int i=0; i< dltab_index; i++) {',
+  '        if ( dict_find_index(dltab[i], filename) > 0 )',
+  '            return (void *)i;',
+  '    }',
+  '',
+].join('\n');
+export const DLTAB_LOOKUP_NEW = [
+  '    for (int i = 0; i < dltab_index; i++) {',
+  '        if (dict_find_index(dltab[i], filename) >= 0)',
+  '            return (void *)(intptr_t)(i + 1);',
+  '    }',
+  '    if (dltab_index >= DF_DLTAB_MAX)',
+  '        return NULL;',
+  '',
+].join('\n');
+export const DLTAB_INSERT_OLD = [
+  '    tab = dict_new();',
+  '    dict_add(tab, filename, dltab_index++ );',
+  '    dltab[dltab_index] = tab;',
+  '',
+  '    return (void *)dltab_index;',
+  '',
+].join('\n');
+export const DLTAB_INSERT_NEW = [
+  '    tab = dict_new();',
+  '    dict_add(tab, filename, dltab_index);',
+  '    dltab[dltab_index++] = tab;',
+  '',
+  '    return (void *)(intptr_t)dltab_index;',
+  '',
+].join('\n');
+/** Upstream dlerror returned its own address as the message string. */
+export const DLERROR_OLD = '    return (char *)dlerror;\n';
+export const DLERROR_NEW = '    return (char *)"di-framework: dlopen table is full";\n';
+
+/**
+ * Patch the emulated dlopen/dlsym: the static-extension hooks first, then the
+ * bounded dltab. The dlopen hook is anchored to the function's first
+ * statement, so it always runs before the table lookup; if upstream moves the
+ * lookup above that statement the anchor no longer matches and patching fails.
+ */
+export function patchDlfcn(text: string): string {
+  const name = 'sdk_port-wasi-dlfcn.c';
+  let out = insertOnce(text, DLOPEN_DEFINITION, DLFCN_DECLS, 'before', name);
+  out = insertOnce(out, DLOPEN_ANCHOR, DLOPEN_HOOK, 'after', name);
+  out = insertOnce(out, DLOPEN_HOOK, DLOPEN_HOOK_NOTE, 'before', name);
+  out = insertOnce(out, DLSYM_ANCHOR, DLSYM_HOOK, 'after', name);
+  out = replaceOnce(out, DLTAB_DECL_OLD, DLTAB_DECL_NEW, name);
+  out = replaceOnce(out, DLTAB_LOOKUP_OLD, DLTAB_LOOKUP_NEW, name);
+  out = replaceOnce(out, DLTAB_INSERT_OLD, DLTAB_INSERT_NEW, name);
+  return replaceOnce(out, DLERROR_OLD, DLERROR_NEW, name);
+}
+
+/**
+ * pgcrypto's PGP CFB mode ignores the result of px_cipher_encrypt, and the
+ * OpenSSL glue only sets the cipher up on its first encrypt call. A cipher
+ * that cannot run here (bf and cast5 need the OpenSSL legacy provider,
+ * which is not built) then leaves the zeroed keystream in place and
+ * pgp_sym_encrypt(..., 'cipher-algo=bf') emits the plaintext. Probe one block
+ * when the CFB context is created, so those ciphers fail before any output,
+ * and stop processing if a later block fails.
+ */
+export const PGP_CFB_INIT_ANCHOR = [
+  '\tres = px_cipher_init(ciph, key, key_len, NULL);',
+  '\tif (res < 0)',
+  '\t{',
+  '\t\tpx_cipher_free(ciph);',
+  '\t\treturn res;',
+  '\t}',
+  '',
+].join('\n');
+export const PGP_CFB_PROBE = [
+  '',
+  '\t/* di-framework: fail here if the cipher cannot encrypt a block. */',
+  '\t{',
+  '\t\tuint8\t\tprobe_in[PGP_MAX_BLOCK] = {0};',
+  '\t\tuint8\t\tprobe_out[PGP_MAX_BLOCK];',
+  '\t\tunsigned\tprobe_len;',
+  '',
+  '\t\tres = px_cipher_encrypt(ciph, 0, probe_in, px_cipher_block_size(ciph),',
+  '\t\t\t\t\t\t\t\tprobe_out, &probe_len);',
+  '\t\tpx_memset(probe_out, 0, sizeof(probe_out));',
+  '\t\tif (res < 0)',
+  '\t\t{',
+  '\t\t\tpx_cipher_free(ciph);',
+  '\t\t\treturn res;',
+  '\t\t}',
+  '\t}',
+  '',
+].join('\n');
+export const PGP_CFB_BLOCK_OLD =
+  '\t\tpx_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);\n';
+export const PGP_CFB_BLOCK_NEW = [
+  '\t\t/* di-framework: never mix in a keystream block that failed. */',
+  '\t\tres = px_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);',
+  '\t\tif (res < 0)',
+  '\t\t\treturn res;',
+  '',
+].join('\n');
+
+/** Make pgcrypto's PGP CFB mode fail instead of emitting plaintext (see above). */
+export function patchPgpCfb(text: string): string {
+  const name = 'pgp-cfb.c';
+  const out = insertOnce(text, PGP_CFB_INIT_ANCHOR, PGP_CFB_PROBE, 'after', name);
+  return replaceOnce(out, PGP_CFB_BLOCK_OLD, PGP_CFB_BLOCK_NEW, name);
+}
 
 /**
  * Wire pgcrypto into the WASI build: build it after the core (build-ext.sh),
  * link it statically (pglite-wasm/build.sh) and resolve its symbols through
- * the emulated dlopen/dlsym (sdk_port-wasi-dlfcn.c). The build script and the
+ * the emulated dlopen/dlsym (sdk_port-wasi-dlfcn.c), and make its PGP CFB mode
+ * fail closed (contrib/pgcrypto/pgp-cfb.c). The build script and the
  * checksum-verified OpenSSL source are copied into df-extensions/.
  */
 export async function patchPgcrypto(
@@ -176,12 +328,10 @@ export async function patchPgcrypto(
   );
 
   const dlfcn = checkedPath(source, 'wasm-build/sdk_port-wasi/sdk_port-wasi-dlfcn.c');
-  const name = 'sdk_port-wasi-dlfcn.c';
-  let text = await Bun.file(dlfcn).text();
-  text = insertOnce(text, DLOPEN_DEFINITION, DLFCN_DECLS, 'before', name);
-  text = insertOnce(text, DLOPEN_ANCHOR, DLOPEN_HOOK, 'after', name);
-  text = insertOnce(text, DLSYM_ANCHOR, DLSYM_HOOK, 'after', name);
-  await Bun.write(dlfcn, text);
+  await Bun.write(dlfcn, patchDlfcn(await Bun.file(dlfcn).text()));
+
+  const cfb = checkedPath(source, 'contrib/pgcrypto/pgp-cfb.c');
+  await Bun.write(cfb, patchPgpCfb(await Bun.file(cfb).text()));
 
   await mkdir(join(source, 'df-extensions'), { recursive: true });
   await Bun.write(
@@ -237,14 +387,15 @@ export async function patch(ctx: Context, argv: string[]): Promise<void> {
   }
   const root = engineRoot(ctx.pkgDir);
   const source = await resolveSourceDir(args.source, root);
-  await patchEngineSource(source, ctx.pkgDir);
   // build-engine.ts downloads and verifies the pinned OpenSSL source first.
+  // Check it before writing anything so a refusal leaves the source untouched.
   const openssl = ctx.env.DF_PGLITE_OPENSSL_TARBALL;
   if (!openssl) throw new Error('DF_PGLITE_OPENSSL_TARBALL is not set (run via build-engine.ts)');
   const tarball = resolve(openssl);
   if (!tarball.startsWith(`${resolve(root)}/`)) {
     throw new Error(`refusing OpenSSL source outside ${root}: ${tarball}`);
   }
+  await patchEngineSource(source, ctx.pkgDir);
   await patchPgcrypto(source, ctx.pkgDir, tarball);
 }
 

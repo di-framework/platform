@@ -8,6 +8,8 @@ wit_bindgen::generate!({
 use di_framework::pglite::database::{open, server_version, Connection};
 use di_framework::pglite::types::{Error, OpenOptions, Value};
 
+mod pgp_keys;
+
 fn text(v: &Value) -> String {
     match v {
         Value::Text(s) => s.clone(),
@@ -463,6 +465,10 @@ fn main() {
     );
 
     pgcrypto(&db);
+    pgcrypto_public_key(&db);
+    pgcrypto_legacy_ciphers(&db);
+    // Last: it fills the emulated dlopen table for this engine instance.
+    dlopen_table(&db);
 
     db.close().unwrap();
     println!("smoke ok");
@@ -519,6 +525,206 @@ fn pgcrypto(db: &Connection) {
     ));
     assert_eq!(one("SELECT 'still usable'::text AS v"), "still usable");
     println!("pgcrypto ok");
+}
+
+/// First text column of the single row `sql` returns with `params`.
+fn first_text(db: &Connection, sql: &str, params: &[Value]) -> String {
+    let row = db
+        .first(sql, params)
+        .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+        .unwrap_or_else(|| panic!("{sql}: no row"));
+    text(&row[0].1)
+}
+
+/// Public-key PGP with ElGamal and RSA keys. pgcrypto's ElGamal encryption
+/// draws its ephemeral `k` from OpenSSL's DRBG (`BN_rand`), seeded through
+/// WASI `getentropy` -> `random_get`; RSA uses PKCS#1 v1.5 padding from
+/// `pg_strong_random`.
+fn pgcrypto_public_key(db: &Connection) {
+    let keys = [
+        (
+            "elg1024",
+            pgp_keys::ELG1024_PUBLIC,
+            pgp_keys::ELG1024_SECRET,
+            pgp_keys::ELG1024_MESSAGE,
+            "Secret msg",
+        ),
+        (
+            "rsa2048",
+            pgp_keys::RSA2048_PUBLIC,
+            pgp_keys::RSA2048_SECRET,
+            pgp_keys::RSA2048_MESSAGE,
+            "Secret message.",
+        ),
+    ];
+    for (name, public, secret, message, plaintext) in keys {
+        let public = Value::Text(public.to_string());
+        let secret = Value::Text(secret.to_string());
+        // Round trip through this engine.
+        assert_eq!(
+            first_text(
+                db,
+                "SELECT pgp_pub_decrypt(pgp_pub_encrypt('round trip', dearmor($1::text)), dearmor($2::text)) AS v",
+                &[public.clone(), secret.clone()],
+            ),
+            "round trip",
+            "{name} round trip"
+        );
+        // A message GnuPG encrypted to the same key.
+        assert_eq!(
+            first_text(
+                db,
+                "SELECT pgp_pub_decrypt(dearmor($1::text), dearmor($2::text)) AS v",
+                &[Value::Text(message.to_string()), secret.clone()],
+            ),
+            plaintext,
+            "{name} GnuPG message"
+        );
+        // Fresh randomness per call. Bytes 20..84 lie inside the first MPI of
+        // the session-key packet: g^k for ElGamal, so equal bytes would mean a
+        // repeated k; the padded session key for RSA.
+        assert_eq!(
+            first_text(
+                db,
+                "SELECT (substring(pgp_pub_encrypt('x', dearmor($1::text)) FROM 20 FOR 64) <> substring(pgp_pub_encrypt('x', dearmor($1::text)) FROM 20 FOR 64))::text AS v",
+                &[public.clone()],
+            ),
+            "true",
+            "{name} fresh randomness"
+        );
+    }
+    // The other key cannot decrypt: an ordinary, recoverable SQL error.
+    assert!(matches!(
+        db.first(
+            "SELECT pgp_pub_decrypt(dearmor($1::text), dearmor($2::text))",
+            &[
+                Value::Text(pgp_keys::ELG1024_MESSAGE.to_string()),
+                Value::Text(pgp_keys::RSA2048_SECRET.to_string()),
+            ],
+        ),
+        Err(Error::ExecutionFailed(_))
+    ));
+    assert_eq!(first_text(db, "SELECT 'still usable'::text AS v", &[]), "still usable");
+    println!("pgcrypto public key ok");
+}
+
+/// OpenSSL's legacy provider is not built, so Blowfish, CAST5 and single DES
+/// fail cleanly. 3DES (DES-EDE3) is in OpenSSL's default provider, and it and
+/// AES keep working.
+fn pgcrypto_legacy_ciphers(db: &Connection) {
+    for cipher in ["bf", "cast5", "des"] {
+        let result = db.first(
+            "SELECT encrypt('data'::bytea, '01234567'::bytea, $1::text)",
+            &[Value::Text(cipher.to_string())],
+        );
+        assert!(
+            matches!(&result, Err(Error::ExecutionFailed(e)) if e.message.contains("Cipher cannot be initialized")),
+            "{cipher}: {result:?}"
+        );
+    }
+    // PGP (which has no single DES) must fail too, for the data and for a
+    // separate session key, and never write the plaintext through an
+    // all-zero keystream.
+    for cipher in ["bf", "cast5"] {
+        for options in [
+            format!("cipher-algo={cipher}"),
+            format!("cipher-algo=aes128, sess-key=1, s2k-cipher-algo={cipher}"),
+        ] {
+            let pgp = db.first(
+                "SELECT pgp_sym_encrypt('PGLITE-LEGACY-CIPHER-PLAINTEXT', 'k', $1::text)",
+                &[Value::Text(options.clone())],
+            );
+            assert!(
+                matches!(&pgp, Err(Error::ExecutionFailed(e)) if e.message.contains("Cipher cannot be initialized")),
+                "pgp {options}: {pgp:?}"
+            );
+        }
+    }
+    for cipher in ["aes", "3des"] {
+        assert_eq!(
+            first_text(
+                db,
+                "SELECT convert_from(decrypt(encrypt('data', '0123456789abcdef01234567', $1::text), '0123456789abcdef01234567', $1::text), 'UTF8') AS v",
+                &[Value::Text(cipher.to_string())],
+            ),
+            "data",
+            "{cipher}"
+        );
+    }
+    for options in [
+        "cipher-algo=3des",
+        "cipher-algo=aes128, sess-key=1, s2k-cipher-algo=3des",
+    ] {
+        assert_eq!(
+            first_text(
+                db,
+                "SELECT pgp_sym_decrypt(pgp_sym_encrypt('x', 'k', $1::text), 'k') AS v",
+                &[Value::Text(options.to_string())],
+            ),
+            "x",
+            "{options}"
+        );
+    }
+    println!("pgcrypto legacy ciphers unavailable ok");
+}
+
+/// wasipg emulates dlopen with a fixed table of loaded libraries. Filling it
+/// must fail the next new LOAD with an error, not write past the table, and
+/// leave plpgsql, pgcrypto and already-loaded libraries working. LOAD on the
+/// emulated loader only stats the file, so template1's relation files serve
+/// as distinct "libraries".
+fn dlopen_table(db: &Connection) {
+    db.exec(
+        r#"CREATE FUNCTION pg_temp.df_dlopen_fill(OUT loaded int, OUT first_file text, OUT err text)
+        LANGUAGE plpgsql AS $$
+        DECLARE
+          dir text := current_setting('data_directory') || '/base/1';
+          f text;
+        BEGIN
+          loaded := 0;
+          FOR f IN SELECT dir || '/' || n FROM pg_ls_dir(dir) AS n WHERE n ~ '^[0-9]+$' ORDER BY n LOOP
+            BEGIN
+              EXECUTE format('LOAD %L', f);
+              loaded := loaded + 1;
+              first_file := coalesce(first_file, f);
+            EXCEPTION WHEN others THEN
+              err := SQLERRM;
+              RETURN;
+            END;
+          END LOOP;
+        END
+        $$"#,
+    )
+    .expect("create df_dlopen_fill");
+    let row = db
+        .first("SELECT loaded::int8, first_file, err FROM pg_temp.df_dlopen_fill()", &[])
+        .expect("df_dlopen_fill")
+        .expect("df_dlopen_fill row");
+    let loaded = int(col(&row, "loaded"));
+    let first_file = text(col(&row, "first_file"));
+    let err = text(col(&row, "err"));
+    // plpgsql already holds a slot; the table has 64.
+    assert!((1..64).contains(&loaded), "loaded {loaded}");
+    assert!(err.contains("dlopen table is full"), "{err}");
+    // An already-loaded library is found without a new slot.
+    db.exec(&format!("LOAD '{first_file}'")).expect("reload a loaded library");
+    // A new one still fails cleanly.
+    let pg_version = first_text(
+        db,
+        "SELECT current_setting('data_directory') || '/PG_VERSION' AS v",
+        &[],
+    );
+    let full = db.exec(&format!("LOAD '{pg_version}'"));
+    assert!(
+        matches!(&full, Err(Error::ExecutionFailed(e)) if e.message.contains("dlopen table is full")),
+        "{full:?}"
+    );
+    db.exec("DO $$ BEGIN PERFORM 1; END $$").expect("plpgsql after a full table");
+    assert_eq!(
+        first_text(db, "SELECT encode(digest('a', 'sha256'), 'hex') AS v", &[]),
+        SHA256_A
+    );
+    println!("dlopen table ok");
 }
 
 /// Rows whose text must never appear in the data directory when it is
