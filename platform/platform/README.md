@@ -524,6 +524,27 @@ model, not a claim of developer-proof network isolation.
   Tenant-reconciled infrastructure — not an application `BackingService`. Application
   messaging instances are named `di-bs-<service-name>` and owned by BackingService UIDs.
 
+### BackingService storage
+
+A Redis or NATS `BackingService` keeps its data on the node in a hostPath directory mounted at
+`/data` in `di-bs-<service-name>`. A new BackingService uses
+`<storageRoot>/di-tenants/<tenant uid>/bs-<service-name>`, where `storageRoot` defaults to
+`/var/lib/k0s` when unset.
+
+On every reconcile the controller reads the live `di-bs-<service-name>` Deployment. When that
+Deployment belongs to the same BackingService UID and already mounts a hostPath for its `data`
+volume, the controller keeps that exact path, so existing data stays reachable. The
+storage-root path is used only when there is no live Deployment yet (or it has no `data`
+hostPath).
+
+- A BackingService created before this behaviour, or under a different `storageRoot`, keeps its
+  original path (for example `/var/lib/k0s/...` on a node whose storage root is now
+  `/var/lib/kubesolo`) until it is deleted and recreated. Recreating it starts empty under the
+  current storage root; copy the data across first if it must be kept.
+- Storage-root discovery reads every `<root>/di-tenants/<uid>` hostPath in the cluster and
+  refuses when it finds more than one root. A leftover verification BackingService with a stray
+  path causes that ambiguity; delete it (`deletionPolicy: Delete`) to clear it.
+
 ### Runtime NATS storage caps
 
 Each tenant's `di-nats` keeps its JetStream store on the node at
