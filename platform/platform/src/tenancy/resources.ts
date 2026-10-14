@@ -120,14 +120,14 @@ export interface TenantAuthConfig {
   issuerIp?: string;
   /**
    * Browser-visible console URL; `{tenant}` is replaced. Unset, `createPlatform` derives
-   * `http://console.{tenant}.localhost:<port>` from `routeUrlPattern`
-   * ({@link withDerivedPublicUrls}); with no gateway published, `http://127.0.0.1:8787`.
+   * `http://console.{tenant}.localhost:<port>` from an `http://{host}.{tenant}.localhost`
+   * `routeUrlPattern` ({@link withDerivedPublicUrls}); otherwise `http://127.0.0.1:8787`.
    */
   consolePublicUrl?: string;
   /**
    * Controller URL shown to users and CLIs; `{tenant}` is replaced. Unset, `createPlatform`
-   * derives `https://controller.{tenant}.localhost:<port>` from `routeUrlPattern`; with no
-   * gateway published, `https://127.0.0.1:8788`.
+   * derives `https://controller.{tenant}.localhost:<port>` from an
+   * `http://{host}.{tenant}.localhost` `routeUrlPattern`; otherwise `https://127.0.0.1:8788`.
    */
   controllerPublicUrl?: string;
   /** Each tenant's own OCI registry (#83); absent, no registry is deployed. */
@@ -145,9 +145,9 @@ export interface TenantRegistryConfig {
   /**
    * Registry origin users log in to; `{tenant}` is replaced. `https://<label>.{tenant}.localhost:<port>`
    * on the gateway port is routed through the gateway (TLS passthrough to the registry front).
-   * Unset, `createPlatform` derives `https://registry.{tenant}.localhost:<port>` from
-   * `routeUrlPattern`; with no gateway published, `https://127.0.0.1:8790`, a port-forward to the
-   * registry front.
+   * Unset, `createPlatform` derives `https://registry.{tenant}.localhost:<port>` from an
+   * `http://{host}.{tenant}.localhost` `routeUrlPattern`; otherwise `https://127.0.0.1:8790`, a
+   * port-forward to the registry front.
    */
   publicUrl?: string;
   /**
@@ -457,33 +457,31 @@ export function tenantAuthRoutes(
 }
 /** A `routeUrlPattern` the tenant-auth public URLs can be derived from; group 1 is `:<port>`. */
 const DERIVABLE_ROUTE_PATTERN = /^http:\/\/\{host\}\.\{tenant\}\.localhost(:\d+)?$/i;
+/** The tenant-auth public URLs `auth` leaves unset, by config path. */
+export function unsetPublicUrls(auth: TenantAuthConfig | undefined): string[] {
+  if (auth === undefined) return [];
+  return [
+    ...(auth.consolePublicUrl === undefined ? ['consolePublicUrl'] : []),
+    ...(auth.controllerPublicUrl === undefined ? ['controllerPublicUrl'] : []),
+    ...(auth.registry && auth.registry.publicUrl === undefined ? ['registry.publicUrl'] : []),
+  ];
+}
 /**
  * `auth` with each unset public URL (`consolePublicUrl`, `controllerPublicUrl` and, with a
  * registry, `registry.publicUrl`) derived from the published gateway's `routeUrlPattern`, so a
  * fresh Tenant is routed without extra config: `http://console.{tenant}.localhost:<port>`,
  * `https://controller.{tenant}.localhost:<port>` and `https://registry.{tenant}.localhost:<port>`
- * on the gateway port (`:80` when the pattern names none). Explicit URLs are kept as given. With no `tenantAuth`, no
- * `routeUrlPattern`, or every URL set, `auth` is returned unchanged (the `127.0.0.1` defaults then
- * apply). Throws when a URL has to be derived but the pattern is not
- * `http://{host}.{tenant}.localhost[:<port>]`: only those hosts can be routed to the pair.
+ * on the gateway port (`:80` when the pattern names none). Explicit URLs are kept as given. Only
+ * an `http://{host}.{tenant}.localhost[:<port>]` pattern is derived from, since only those hosts
+ * are routed to the pair; with any other pattern, no `tenantAuth`, no `routeUrlPattern`, or every
+ * URL set, `auth` is returned unchanged and the `127.0.0.1` defaults apply, as before.
  */
 export function withDerivedPublicUrls(
   auth: TenantAuthConfig | undefined,
   routeUrlPattern: string | undefined,
 ): TenantAuthConfig | undefined {
-  if (auth === undefined || routeUrlPattern === undefined) return auth;
-  const missing = [
-    ...(auth.consolePublicUrl === undefined ? ['consolePublicUrl'] : []),
-    ...(auth.controllerPublicUrl === undefined ? ['controllerPublicUrl'] : []),
-    ...(auth.registry && auth.registry.publicUrl === undefined ? ['registry.publicUrl'] : []),
-  ];
-  if (missing.length === 0) return auth;
-  const match = DERIVABLE_ROUTE_PATTERN.exec(routeUrlPattern);
-  if (!match)
-    throw new Error(
-      `tenantAuth.${missing.join(', tenantAuth.')} cannot be derived from routeUrlPattern ${routeUrlPattern}: ` +
-        'it must be http://{host}.{tenant}.localhost[:<port>]; set them explicitly instead',
-    );
+  const match = DERIVABLE_ROUTE_PATTERN.exec(routeUrlPattern ?? '');
+  if (auth === undefined || !match || unsetPublicUrls(auth).length === 0) return auth;
   // The gateway port, explicit for the TLS hosts (https alone would mean 443) and omitted for the
   // console when it is http's own 80, so its URL stays canonical.
   const port = match[1] ?? ':80';

@@ -176,6 +176,40 @@ allowlisted registry and pull everything else over TLS. Check three things befor
   roll. A single-host tenant such as `identity` (`maxSurge: 0, maxUnavailable: 1`) is unavailable
   while its one host restarts, so plan the upgrade for a quiet window.
 
+#### Upgrading to tenant-auth URLs derived from `routeUrlPattern` (#128)
+
+- **Who is affected.** Installs with config `tenantAuth` set, at least one of
+  `tenantAuth.consolePublicUrl`, `tenantAuth.controllerPublicUrl` or (with a registry)
+  `tenantAuth.registry.publicUrl` unset, and a routable `routeUrlPattern`
+  (`http://{host}.{tenant}.localhost[:<port>]`). That is every local install, whose entrypoint
+  always sets the pattern, and every existing-cluster install whose pattern is set or derived
+  from a loopback `http://` `httpEndpoint`. Installs without `tenantAuth`, with all of these
+  URLs set, or with any other pattern keep their URLs. On the first `pulumi up` with this
+  version, the unset URLs change for every Tenant, existing ones included (`<port>` is the
+  gateway port, `28180` on a default local install):
+  - Console: `http://127.0.0.1:8787` becomes `http://console.<tenant>.localhost:<port>`, so its
+    OAuth callback becomes `http://console.<tenant>.localhost:<port>/oidc/callback`.
+  - Controller: users and CLIs are shown `https://controller.<tenant>.localhost:<port>` instead
+    of `https://127.0.0.1:8788`. The controller certificate is reissued with that name; it still
+    covers `127.0.0.1`, so existing port-forward kubeconfigs keep working.
+  - Registry: users log in to `https://registry.<tenant>.localhost:<port>` instead of
+    `https://127.0.0.1:8790`.
+  - Workload hosts: the gateway routes `console.<tenant>.localhost`,
+    `controller.<tenant>.localhost` and `registry.<tenant>.localhost` to the tenant's console,
+    controller and registry front, so a tenant workload served on one of those route hosts is
+    no longer reachable there. Move it to another host first.
+- **To adopt the new URLs**, register `http://console.<tenant>.localhost:<port>/oidc/callback`
+  for every tenant as a redirect URI on the shared OAuth client (`tenantAuth.oauthClient.id`)
+  before `pulumi up`. Until it is registered, console login fails for that tenant.
+- **To keep the previous `127.0.0.1` URLs**, set them explicitly before upgrading (skip the
+  registry line without `tenantAuth.registry`):
+
+  ```bash
+  pulumi config set --path tenantAuth.consolePublicUrl http://127.0.0.1:8787
+  pulumi config set --path tenantAuth.controllerPublicUrl https://127.0.0.1:8788
+  pulumi config set --path tenantAuth.registry.publicUrl https://127.0.0.1:8790
+  ```
+
 ### Tenant removal and namespace retention
 
 Each `tenants` entry takes `deletionPolicy` (`Retain` or `Delete`, default `Retain`). The
@@ -753,7 +787,7 @@ tenantAuth:
   issuerUpstreamPodPort: 8080                                # optional, the pod port behind it
   issuerIp: 192.0.2.7                                        # optional, when pods cannot resolve the issuer
   consolePublicUrl: http://console.{tenant}.localhost:28180  # optional; default derived from routeUrlPattern, else http://127.0.0.1:8787
-  controllerPublicUrl: https://127.0.0.1:8788                # optional; default derived from routeUrlPattern, else https://127.0.0.1:8788
+  controllerPublicUrl: https://controller.{tenant}.localhost:28180  # optional; default derived from routeUrlPattern, else https://127.0.0.1:8788
   registry:                                                  # optional: each tenant's own OCI registry (#83)
     component: ghcr.io/di-framework/oci-registry@sha256:29ec834c5f515e99146437c831e9f8bf25c98f32079afd9e715335d9f00ba270  # required, pinned by digest
     publicUrl: https://registry.{tenant}.localhost:28180     # optional; default derived from routeUrlPattern, else https://127.0.0.1:8790
@@ -822,11 +856,13 @@ tenantAuth:
   `registry.publicUrl: https://registry.{tenant}.localhost:28180` (a pattern without a port
   gives the console no port and the TLS hosts `:80`, the gateway's own). An explicit URL always
   wins, including a `127.0.0.1` one that keeps that host on a port-forward. Only an
-  `http://{host}.{tenant}.localhost[:<port>]` pattern can be derived from; any other pattern
-  (`https://`, another domain) fails `createPlatform` with `cannot be derived from
-  routeUrlPattern` unless all of these URLs are set explicitly. The console's public URL is
-  the one its OAuth redirects use, so the shared OAuth client must accept the derived console
-  host. The console route is
+  `http://{host}.{tenant}.localhost[:<port>]` pattern is derived from, since only those hosts
+  are routed to the pair; with any other pattern (`https://`, another domain) the unset URLs
+  keep the `127.0.0.1` defaults, as before, and `createPlatform` logs a warning naming them.
+  The console's public URL is the one its OAuth redirects use, so the shared OAuth client must
+  accept the derived console callback; see
+  [Upgrading to tenant-auth URLs derived from `routeUrlPattern`](#upgrading-to-tenant-auth-urls-derived-from-routeurlpattern-128).
+  The console route is
   plain HTTP to `tenant-console:8787` with the original `Host`. The controller route is TLS
   passthrough: the gateway reads only the SNI name and pipes the connection to
   `tenant-controller:8788`, so the controller's own certificate (covering the public host) and

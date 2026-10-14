@@ -30,6 +30,7 @@ import {
   tenantResources,
   tlsCertDigest,
   type User,
+  unsetPublicUrls,
   VERSION,
   withDerivedPublicUrls,
 } from '../src/tenancy/resources';
@@ -1525,24 +1526,54 @@ describe('tenant-auth gateway routes (#58:routes)', () => {
     });
   });
 
-  it('refuses to derive public URLs from an unsupported routeUrlPattern (#128)', () => {
+  it('keeps the 127.0.0.1 defaults for a routeUrlPattern the gateway does not route (#128)', () => {
     const { consolePublicUrl: _c, ...bare } = auth;
-    for (const unsupported of [
+    for (const unrouted of [
       'https://{host}.{tenant}.localhost:28180',
       'http://{host}.{tenant}.example.com:28180',
-      'http://{host}.{tenant}.localhost:28180/path',
-    ])
-      expect(() => withDerivedPublicUrls(bare, unsupported)).toThrow(
-        `tenantAuth.consolePublicUrl, tenantAuth.controllerPublicUrl cannot be derived from routeUrlPattern ${unsupported}`,
-      );
-    // Every URL explicit: nothing to derive, so the pattern is not consulted.
-    const explicit = {
+    ]) {
+      expect(withDerivedPublicUrls(bare, unrouted)).toBe(bare);
+      expect(tenantAuthRoutes(bare, unrouted)).toEqual({ routes: {}, urls: {}, problems: [] });
+    }
+    expect(unsetPublicUrls(bare)).toEqual(['consolePublicUrl', 'controllerPublicUrl']);
+  });
+
+  it('derives the gateway port from an explicit :80 pattern (#128)', () => {
+    const { consolePublicUrl: _c, ...bare } = auth;
+    const pattern80 = 'http://{host}.{tenant}.localhost:80';
+    const derived = withDerivedPublicUrls(bare, pattern80);
+    expect(derived).toEqual({
       ...bare,
-      consolePublicUrl: 'http://127.0.0.1:8787',
-      controllerPublicUrl: 'https://127.0.0.1:8788',
+      consolePublicUrl: 'http://console.{tenant}.localhost',
+      controllerPublicUrl: 'https://controller.{tenant}.localhost:80',
+    });
+    expect(tenantAuthRoutes(derived, pattern80)).toMatchObject({
+      routes: { console: 'console', controller: 'controller' },
+      problems: [],
+    });
+  });
+
+  it('renders the derived URLs into the console and controller settings (#128)', () => {
+    const { consolePublicUrl: _c, ...bare } = auth;
+    const registry = { component: `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}` };
+    const derivedCfg: ControllerConfig = {
+      ...cfg,
+      routeUrlPattern: pattern,
+      tenantAuth: withDerivedPublicUrls({ ...bare, registry }, pattern),
     };
-    expect(withDerivedPublicUrls(explicit, 'https://{host}.{tenant}.localhost:28180')).toBe(
-      explicit,
+    const resources = tenantAuthResources(tenant(), derivedCfg, {
+      ...inputs,
+      registryServing: true,
+    });
+    expect(env(find(resources, 'Deployment', 'tenant-console') as Deployment)).toMatchObject({
+      TENANT_CONSOLE_PUBLIC_URL: 'http://console.alpha.localhost:28180',
+      TENANT_CONSOLE_CONTROLLER_PUBLIC_URL: 'https://controller.alpha.localhost:28180',
+    });
+    expect(env(find(resources, 'Deployment', 'tenant-controller') as Deployment)).toMatchObject({
+      TENANT_CONTROLLER_REGISTRY_URL: 'https://registry.alpha.localhost:28180',
+    });
+    expect(tenantControllerCertNames('alpha', derivedCfg.tenantAuth).dns).toEqual(
+      expect.arrayContaining(['controller.alpha.localhost', 'registry.alpha.localhost']),
     );
   });
 
