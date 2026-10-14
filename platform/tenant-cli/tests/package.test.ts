@@ -1,36 +1,16 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-
-const run = (cmd: string[], cwd: string) => {
-  const result = Bun.spawnSync(cmd, { cwd, stdout: 'pipe', stderr: 'pipe' });
-  if (result.exitCode !== 0) throw new Error(`${cmd.join(' ')}: ${result.stderr.toString()}`);
-  return result.stdout.toString();
-};
+import { installPacked, run, typescriptCompilers } from '../../../tests/helpers/packed-consumer';
 
 const scratch = mkdtempSync(join(tmpdir(), 'tenant-client-'));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
+let project: string;
+
 test('a consumer outside the workspace imports ./client and ./testing from the packed tarball', () => {
-  run(['bun', 'run', 'build'], join(import.meta.dir, '..'));
-  run(
-    ['bun', 'pm', 'pack', '--ignore-scripts', '--destination', scratch],
-    join(import.meta.dir, '..'),
-  );
-  const tarball = readdirSync(scratch).find((name) => name.endsWith('.tgz'));
-  expect(tarball).toBeDefined();
-
-  const project = join(scratch, 'consumer');
-  const installed = join(project, 'node_modules', '@di-framework');
-  mkdirSync(installed, { recursive: true });
-  run(['tar', '-xzf', join(scratch, tarball as string)], installed);
-  run(['mv', join(installed, 'package'), join(installed, 'tenant-cli')], installed);
-
-  writeFileSync(
-    join(project, 'package.json'),
-    JSON.stringify({ name: 'consumer', type: 'module' }),
-  );
+  ({ project } = installPacked(join(import.meta.dir, '..'), scratch));
   writeFileSync(
     join(project, 'main.ts'),
     `import { createClient, ControllerError, events } from '@di-framework/tenant-cli/client';
@@ -92,12 +72,10 @@ import type { DeployBundle } from '@di-framework/tenant-cli/client';
 export const bundle: DeployBundle = deployBundle({ service: 'api' });
 `,
   );
-  const tsc = join(import.meta.dir, '../../../node_modules/typescript/bin/tsc');
-  run(['node', tsc, '-p', 'tsconfig.json'], project);
+  run(['node', typescriptCompilers.typescript7, '-p', 'tsconfig.json'], project);
 });
 
 test('a NodeNext consumer with skipLibCheck gets real types for ./client and ./testing, not any', () => {
-  const project = join(scratch, 'consumer');
   writeFileSync(
     join(project, 'tsconfig.nodenext.json'),
     JSON.stringify({
@@ -127,6 +105,7 @@ export const badBundle = deployBundle({ notAField: true });
 export const env: string = deployBundle().env;
 `,
   );
-  const tsc = join(import.meta.dir, '../../../node_modules/typescript/bin/tsc');
-  run(['node', tsc, '-p', 'tsconfig.nodenext.json'], project);
+  for (const tsc of Object.values(typescriptCompilers)) {
+    run(['node', tsc, '-p', 'tsconfig.nodenext.json'], project);
+  }
 });
