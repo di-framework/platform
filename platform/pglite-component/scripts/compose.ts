@@ -3,7 +3,7 @@ import { join, resolve } from 'node:path';
 import { $ } from 'bun';
 import { type Args, type Context, parseFlags, run, UsageError } from './lib/cli.ts';
 import { fileExists } from './lib/fs.ts';
-import { databaseInterface, readWitVersion } from './lib/wit-version.ts';
+import { assertComposedWit, readWitVersion } from './lib/wit-version.ts';
 
 const USAGE = [
   'compose a consumer component with the PGlite provider',
@@ -54,10 +54,7 @@ export async function composeConsumer(ctx: Context, { app, out, provider }: Comp
   await $`wac plug --plug ${provider} ${app} -o ${out}`;
   await $`wasm-tools validate --features all ${out}`;
   const wit = await $`wasm-tools component wit ${out}`.text();
-  const database = databaseInterface(await readWitVersion(ctx.pkgDir));
-  if (wit.includes(`import ${database}`)) {
-    throw new Error(`${out} still imports ${database}; plug did not apply`);
-  }
+  assertComposedWit(wit, await readWitVersion(ctx.pkgDir), out);
   console.error(`[compose] ok: ${out}`);
   console.error(wit.match(/^world root[\s\S]*?^}/m)?.[0] ?? wit);
 }

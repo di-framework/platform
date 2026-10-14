@@ -236,12 +236,23 @@ PostgreSQL type:
 | `float4`, `float8` | `real` | |
 | `bytea` | `blob` | |
 | `json`, `jsonb` | `json` | JSON text; `jsonb` is re-rendered by PostgreSQL (`{"a": 1}`) |
-| `timestamptz` | `timestamp` | RFC 3339 in UTC, e.g. `2024-01-15T10:30:00Z`, fractional seconds kept (`...:00.123Z`). `infinity` and `-infinity` are returned as those literals; BC dates are returned unmodified (`0044-03-15 00:00:00+00 BC`) |
+| `timestamptz` | `timestamp` | RFC 3339 in UTC, e.g. `2024-01-15T10:30:00Z`, fractional seconds kept (`...:00.123Z`). `infinity` and `-infinity` are returned as those literals. A value RFC 3339 cannot hold (BC dates, years after 9999) is `text`, as PostgreSQL printed it (`0044-03-15 00:00:00+00 BC`) |
 | `timestamp` (no zone) | `text` | `2024-01-15 10:30:00` (ISO, space separator, no offset). Deliberately not `timestamp`, which always denotes an instant |
 | `date` | `text` | `2024-01-15` |
 | `uuid`, `numeric` | `text` | canonical PostgreSQL text (`12.50` keeps its scale) |
 | arrays | `text` | PostgreSQL array literal, e.g. `{a,b}` |
 | everything else | `text` | |
+
+A caller can still change either setting with `SET` for the rest of the connection. `timestamptz`
+cells are parsed rather than trusted, so the `timestamp` variant always holds RFC 3339 in UTC (or
+an infinity):
+
+- After `SET TimeZone`, with `DateStyle` still ISO, PostgreSQL prints a local offset
+  (`2024-01-15 05:30:00.5-05`). The provider converts it back to UTC (`2024-01-15T10:30:00.5Z`).
+- After `SET DateStyle` to `SQL`, `Postgres` or `German`, the output cannot be converted reliably
+  (`15/01/2024 05:30:00.5 EST`), so it is returned as `text`, exactly as printed.
+
+Closing and reopening the connection pins `DateStyle=ISO` and `TimeZone=UTC` again.
 
 Parameters are typed as follows. `integer`, `real`, `boolean` and `blob` are
 sent as `int8`, `float8`, `bool` and `bytea`. `text`, `json` and `timestamp`
