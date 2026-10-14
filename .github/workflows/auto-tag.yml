@@ -44,8 +44,8 @@ jobs:
         with:
           node-version: "20"
 
-      # Same Bun as the Test workflow (ci.yml), so the bun.lock this job writes is
-      # the one `bun install --frozen-lockfile` there accepts.
+      # Runs scripts/check-lockfile-versions.ts with the same Bun as the Test
+      # workflow (ci.yml), which runs the same check on the release PR.
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
@@ -111,9 +111,10 @@ jobs:
           node scripts/sync-workspace-versions.mjs
 
           # bun.lock records each workspace package's version. Neither step above
-          # updates it, and `bun install --frozen-lockfile` still passes with the
-          # old versions, so regenerate it here and check it before committing (#260).
-          bun install --lockfile-only --ignore-scripts
+          # updates it, and `bun install --frozen-lockfile` can pass with the old
+          # versions, so set them here and check before committing (#260). --write
+          # edits only those version lines; nothing is resolved or installed.
+          bun scripts/check-lockfile-versions.ts --write
           bun scripts/check-lockfile-versions.ts
 
           git add package.json bun.lock
