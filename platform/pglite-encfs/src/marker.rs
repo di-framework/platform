@@ -26,10 +26,18 @@ fn is_marker_name(name: &str) -> bool {
     name == MARKER_NAME || name == MARKER_TMP_NAME
 }
 
-/// Whether `path`, relative to a preopen root, names a marker file once `.`,
-/// `..` and repeated slashes are resolved. pglite must never reach them.
-pub fn is_marker_path(path: &str) -> bool {
-    let mut parts: Vec<&str> = Vec::new();
+/// Whether the rotation sweep leaves a root entry alone: the marker files, and
+/// `lost+found`, which holds fsck fragments rather than encrypted files (#207).
+pub fn is_skipped_by_rotation(name: &str, at_root: bool) -> bool {
+    at_root && is_volume_metadata(name)
+}
+
+/// The components of `path`, relative to a preopen root, with `.`, `..` and
+/// repeated slashes resolved. `..` never climbs above the root: the host
+/// refuses such paths, and treating them as the root keeps the checks below
+/// on the safe side.
+fn normalize(path: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
     for part in path.split('/') {
         match part {
             "" | "." => {}
@@ -39,7 +47,20 @@ pub fn is_marker_path(path: &str) -> bool {
             name => parts.push(name),
         }
     }
-    matches!(parts.as_slice(), [name] if is_marker_name(name))
+    parts
+}
+
+/// Whether `path`, relative to a preopen root, names a marker file once `.`,
+/// `..` and repeated slashes are resolved. pglite must never reach them.
+pub fn is_marker_path(path: &str) -> bool {
+    matches!(normalize(path).as_slice(), [name] if is_marker_name(name))
+}
+
+/// Whether `path`, relative to a preopen root, names the root itself once
+/// normalized (`.`, `pglite/..`, ...). A descriptor opened that way must keep
+/// the root's marker guard and listing filter (#207).
+pub fn is_root_path(path: &str) -> bool {
+    normalize(path).is_empty()
 }
 
 pub fn encode(kcv: &Kcv) -> [u8; MARKER_LEN] {
@@ -265,6 +286,46 @@ mod tests {
             "a/../b/.di-encfs",
         ] {
             assert!(!is_marker_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn root_paths_are_recognized_after_normalization() {
+        // #207: `open-at(".")` on the root must yield a guarded root descriptor.
+        for path in [
+            "",
+            ".",
+            "./",
+            "/",
+            "//",
+            "..",
+            "pglite/..",
+            "pglite/data/../..",
+            "./pglite/../.",
+        ] {
+            assert!(is_root_path(path), "{path}");
+        }
+        for path in [
+            "pglite",
+            "pglite/data/..",
+            "./pglite",
+            ".di-encfs",
+            "lost+found",
+        ] {
+            assert!(!is_root_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn rotation_skips_markers_and_lost_and_found_only_at_the_root() {
+        // #207: fsck fragments in lost+found are not encfs files and must not
+        // abort a rotation.
+        for name in ["lost+found", MARKER_NAME, MARKER_TMP_NAME] {
+            assert!(is_skipped_by_rotation(name, true), "{name}");
+            assert!(!is_skipped_by_rotation(name, false), "{name}");
+        }
+        for name in ["pglite", "PG_VERSION", "lost+found2"] {
+            assert!(!is_skipped_by_rotation(name, true), "{name}");
         }
     }
 

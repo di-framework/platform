@@ -535,6 +535,10 @@ export async function smoke(ctx: Context): Promise<void> {
     if (!intruded.includes('postgresql.auto.conf: no encryption header; refusing')) {
       throw new Error('a plaintext file was not refused');
     }
+    // A file this short is also what a failed header write leaves (#207).
+    if (!intruded.includes('truncating it to 0 bytes is safe')) {
+      throw new Error('a short file without a header was refused without operator guidance');
+    }
     if (!(await readFile(autoConf)).equals(intruder))
       throw new Error('the plaintext file was changed');
     await writeFile(autoConf, savedConf);
@@ -598,6 +602,12 @@ export async function smoke(ctx: Context): Promise<void> {
     await rm(s2, { recursive: true, force: true });
 
     // Rotation A -> B: one start with both keys re-wraps every header, then flips the marker.
+    // fsck fragments in the root's lost+found are not encfs files; the sweep
+    // leaves them alone instead of aborting (#207).
+    const fragment = join(data, 'lost+found', '#131073');
+    const fragmentBytes = Buffer.from('fsck fragment, not an encfs file\n');
+    await mkdir(join(data, 'lost+found'), { recursive: true });
+    await writeFile(fragment, fragmentBytes);
     const rotated = await h.run(
       enc,
       data,
@@ -608,6 +618,9 @@ export async function smoke(ctx: Context): Promise<void> {
     const count = Number(/re-wrapped (\d+) file keys/.exec(rotated)?.[1] ?? -1);
     if (count < headers)
       throw new Error(`rotation re-wrapped ${count} of at least ${headers} files`);
+    if (!(await readFile(fragment)).equals(fragmentBytes))
+      throw new Error('rotation changed a file in lost+found');
+    await rm(join(data, 'lost+found'), { recursive: true, force: true });
     const afterRotation = await assertEncrypted(data, keyCheckValue(keyB), raw);
     log(`rotation re-wrapped ${count} file keys; ${afterRotation} headers now under key B`);
     await h.run(enc, data, 'marker-read', B, 'marker-read ok');

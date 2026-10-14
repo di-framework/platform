@@ -211,6 +211,16 @@ fn header_error(path: &str, error: HeaderError) -> ErrorCode {
             );
             ErrorCode::Io
         }
+        HeaderError::Stub => {
+            // The same refusal as plaintext, plus what the operator can do (#207).
+            log(&format!(
+                "{path}: no encryption header; refusing. The file is at most {HEADER_LEN} bytes, \
+                 so it holds no encrypted data: unless it is a plaintext file placed here, it is \
+                 a stub left by a failed header write (full disk, or a crash under ext4 \
+                 data=writeback), and truncating it to 0 bytes is safe"
+            ));
+            ErrorCode::Io
+        }
         HeaderError::Unsupported { version, codec } => {
             log(&format!(
                 "{path}: unsupported header (format {version}, codec {codec}); refusing"
@@ -488,14 +498,13 @@ fn write_marker(dir: &hfs::Descriptor, kek: &Kek) -> R<()> {
 
 /// Re-wrap every file header under `from` to `to`; returns how many changed.
 /// Headers already under `to` are skipped, so an interrupted sweep resumes.
+/// The markers and the root's `lost+found` (fsck fragments, never encfs
+/// files) are not visited.
 fn rewrap_tree(dir: &hfs::Descriptor, from: &Kek, to: &Kek, root: bool) -> R<usize> {
     let mut count = 0;
     let entries = dir.read_directory().map_err(host)?;
     while let Some(entry) = entries.read_directory_entry().map_err(host)? {
-        if root
-            && marker::is_volume_metadata(&entry.name)
-            && entry.type_ != hfs::DescriptorType::Directory
-        {
+        if marker::is_skipped_by_rotation(&entry.name, root) {
             continue;
         }
         match entry.type_ {
@@ -848,6 +857,21 @@ impl Descriptor {
         self.guard(None)?;
         Ok(self.host())
     }
+
+    fn is_root(&self) -> bool {
+        matches!(self, Descriptor::Passthrough { root: true, .. })
+    }
+}
+
+/// Whether two host descriptors may name the same directory. Paths alone miss
+/// a symlink back to the root, so compare what the host identifies them by. A
+/// failed lookup answers yes: treating a directory as the root only hides and
+/// guards the marker names in it.
+fn may_be_same_directory(a: &hfs::Descriptor, b: &hfs::Descriptor) -> bool {
+    match (a.metadata_hash(), b.metadata_hash()) {
+        (Ok(a), Ok(b)) => a.lower == b.lower && a.upper == b.upper,
+        _ => true,
+    }
 }
 
 impl xfs::Guest for Component {
@@ -973,7 +997,7 @@ impl xfs::GuestDescriptor for Descriptor {
     }
 
     fn read_directory(&self) -> R<xfs::DirectoryEntryStream> {
-        let hide_marker = matches!(self, Descriptor::Passthrough { root: true, .. });
+        let hide_marker = self.is_root();
         let stream = self.passthrough()?.read_directory().map_err(host)?;
         Ok(xfs::DirectoryEntryStream::new(DirectoryEntryStream {
             host: stream,
@@ -1025,10 +1049,15 @@ impl xfs::GuestDescriptor for Descriptor {
             .map_err(host)?;
         let stat = fd.stat().map_err(host)?;
         if stat.type_ != hfs::DescriptorType::RegularFile {
+            // The root reopened (`.`, `pglite/..`, a symlink to it) keeps the
+            // marker guard and listing filter (#207).
+            let root = self.is_root()
+                && stat.type_ == hfs::DescriptorType::Directory
+                && (marker::is_root_path(&path) || may_be_same_directory(&fd, self.host()));
             return Ok(xfs::Descriptor::new(Descriptor::Passthrough {
                 host: fd,
                 flags,
-                root: false,
+                root,
             }));
         }
         let file = File {
