@@ -58,8 +58,9 @@ export interface PlatformArgs {
   storageRoot?: string;
   /**
    * JetStream storage caps of each tenant's runtime data-plane NATS (`di-nats`, #160): binary
-   * quantities `maxFileStore` (default `10Gi`) and `maxMemoryStore` (default `32Mi`, below the
-   * 128Mi container limit). Validated before deploy. Defaults to config `runtimeNats`.
+   * quantities `maxFileStore` (default `10Gi`) and `maxMemoryStore` (default `32Mi`, at most
+   * `64Mi`, half the 128Mi container limit). Validated before deploy. Defaults to config
+   * `runtimeNats`.
    */
   runtimeNats?: RuntimeNatsConfig;
   /**

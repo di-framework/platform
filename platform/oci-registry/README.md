@@ -184,9 +184,19 @@ the like are rejected.
 On the platform the registry's blobstore is the tenant's `di-nats` JetStream
 store, on the node's host path. Its size is capped by the platform config
 `runtimeNats.maxFileStore` (default `10Gi`, platform#160), shared with every
-other JetStream stream and object store of that tenant. Once the cap is
-reached, pushes fail until images are deleted or the cap is raised; pulls keep
-working. See "Runtime NATS storage caps" in `platform/platform/README.md`.
+other JetStream stream and object store of that tenant. Pulls keep working at
+the cap.
+
+- When writes fill the store up to the cap, the push that would cross it fails
+  with `insufficient resources`. Deleting images frees space, and pushes work
+  again.
+- When the store already holds more than the cap (the cap was lowered below
+  usage, or an upgrade introduced it), every write is refused, **deletes
+  included**: a blobstore delete is a write of a delete marker. The registry
+  cannot free space itself. An operator raises `maxFileStore` (which restarts
+  `di-nats`) or removes data with `nats stream purge` / `nats stream rm`.
+
+See "Runtime NATS storage caps" in `platform/platform/README.md`.
 
 ### Build and test
 

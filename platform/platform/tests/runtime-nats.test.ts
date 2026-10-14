@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'bun:test';
 import {
   assertRuntimeNatsConfig,
+  BACKING_SERVICE_MEMORY_LIMIT,
   type ControllerConfig,
   INSTALLATION,
   type Resource,
   RUNTIME_NATS_CONFIG,
   RUNTIME_NATS_CONFIG_ANNOTATION,
   RUNTIME_NATS_DEFAULTS,
+  RUNTIME_NATS_MAX_MEMORY_STORE,
   type RuntimeNatsConfig,
   runtimeNatsLimits,
   runtimeNatsServerConfig,
@@ -36,6 +38,7 @@ function tenant(): Tenant {
 }
 interface Container {
   args: string[];
+  resources: { limits: { memory: string } };
   volumeMounts: { name: string; mountPath: string; readOnly?: boolean }[];
 }
 interface Deployment {
@@ -141,11 +144,29 @@ describe('di-nats JetStream storage caps (#160)', () => {
     ]);
   });
 
+  it('keeps the memory store to half the container memory limit it renders', () => {
+    const resources = tenantResources(tenant(), cfg);
+    for (const name of ['di-nats', 'di-redis']) {
+      const deployment = find(resources, 'Deployment', name) as unknown as Deployment;
+      expect(deployment.spec.template.spec.containers[0]?.resources.limits.memory).toBe(
+        BACKING_SERVICE_MEMORY_LIMIT,
+      );
+    }
+    expect(BACKING_SERVICE_MEMORY_LIMIT).toBe('128Mi');
+    expect(RUNTIME_NATS_MAX_MEMORY_STORE).toBe('64Mi');
+    // The largest accepted memory store leaves at least as much again for nats-server itself.
+    const largest = runtimeNatsLimits({ maxMemoryStore: RUNTIME_NATS_MAX_MEMORY_STORE });
+    expect(largest.maxMemoryStore * 2).toBe(128 * MiB);
+    expect(() => runtimeNatsLimits({ maxMemoryStore: `${64 * 1024 + 1}Ki` })).toThrow(
+      "the rest is nats-server's own headroom",
+    );
+  });
+
   it('accepts valid configs', () => {
     expect(() => assertRuntimeNatsConfig(undefined)).not.toThrow();
     expect(() => assertRuntimeNatsConfig({})).not.toThrow();
     expect(() =>
-      assertRuntimeNatsConfig({ maxFileStore: '1Mi', maxMemoryStore: '127Mi' }),
+      assertRuntimeNatsConfig({ maxFileStore: '1Mi', maxMemoryStore: '64Mi' }),
     ).not.toThrow();
   });
 
@@ -168,12 +189,12 @@ describe('di-nats JetStream storage caps (#160)', () => {
     [{ maxFileStore: '1023Ki' }, 'runtimeNats.maxFileStore must be at least 1Mi'],
     [{ maxMemoryStore: '' }, 'runtimeNats.maxMemoryStore must be a positive binary quantity'],
     [
-      { maxMemoryStore: '128Mi' },
-      'runtimeNats.maxMemoryStore must be below the di-nats memory limit (128Mi)',
+      { maxMemoryStore: '65537Ki' },
+      'runtimeNats.maxMemoryStore must be at most 64Mi, half the di-nats memory limit (128Mi)',
     ],
     [
       { maxMemoryStore: '1Gi' },
-      'runtimeNats.maxMemoryStore must be below the di-nats memory limit (128Mi)',
+      'runtimeNats.maxMemoryStore must be at most 64Mi, half the di-nats memory limit (128Mi)',
     ],
   ] as const)('rejects %p', (value, message) => {
     expect(() => assertRuntimeNatsConfig(value as unknown as RuntimeNatsConfig)).toThrow(message);

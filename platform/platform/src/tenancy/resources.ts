@@ -88,7 +88,10 @@ export interface ControllerConfig {
 export interface RuntimeNatsConfig {
   /** JetStream file storage on the tenant's host path (default `10Gi`). */
   maxFileStore?: string;
-  /** JetStream memory storage (default `32Mi`); must stay below the 128Mi container limit. */
+  /**
+   * JetStream memory storage (default `32Mi`); at most `64Mi`, half the 128Mi container limit,
+   * leaving the rest as headroom for nats-server itself.
+   */
   maxMemoryStore?: string;
 }
 /**
@@ -261,17 +264,26 @@ export function assertTenantAuthConfig(value: TenantAuthConfig | undefined): voi
 }
 /** `di-nats` JetStream caps when the platform config sets none (#160). */
 export const RUNTIME_NATS_DEFAULTS = { maxFileStore: '10Gi', maxMemoryStore: '32Mi' } as const;
-/** The `di-nats` container memory limit; the memory store must fit below it. */
-const RUNTIME_NATS_MEMORY_LIMIT = '128Mi';
+/** Memory limit of the `di-nats` and `di-redis` containers, in MiB. */
+const BACKING_SERVICE_MEMORY_LIMIT_MIB = 128;
+/** The `di-nats` / `di-redis` container memory limit, as rendered on the pod. */
+export const BACKING_SERVICE_MEMORY_LIMIT = `${BACKING_SERVICE_MEMORY_LIMIT_MIB}Mi`;
+/**
+ * The largest `di-nats` JetStream memory store: half the container memory limit. The other half
+ * is headroom for nats-server itself (connections, buffers, file-store caches), so a full memory
+ * store is refused by JetStream (`insufficient resources`) instead of getting the pod OOM-killed.
+ */
+export const RUNTIME_NATS_MAX_MEMORY_STORE = `${BACKING_SERVICE_MEMORY_LIMIT_MIB / 2}Mi`;
 /** The ConfigMap in `di-runtime-<tenant>` holding the `di-nats` server config. */
 export const RUNTIME_NATS_CONFIG = 'di-nats-config';
 /** Pod template annotation carrying the server config digest, so a cap change restarts NATS. */
 export const RUNTIME_NATS_CONFIG_ANNOTATION = 'platform.di-framework.dev/nats-config-sha256';
 const BINARY_QUANTITY = /^([1-9][0-9]*)(Ki|Mi|Gi|Ti)?$/;
+const MIB = 2 ** 20;
 const BINARY_UNITS: Record<string, number> = {
   '': 1,
   Ki: 2 ** 10,
-  Mi: 2 ** 20,
+  Mi: MIB,
   Gi: 2 ** 30,
   Ti: 2 ** 40,
 };
@@ -290,7 +302,7 @@ export interface RuntimeNatsLimits {
 /**
  * Validate a `runtimeNats` config and resolve its caps in bytes, defaults filled in. Throws on an
  * unknown key, a value that is not a positive binary quantity, a cap below 1Mi, or a memory
- * store that would not fit below the container memory limit.
+ * store above {@link RUNTIME_NATS_MAX_MEMORY_STORE}.
  */
 export function runtimeNatsLimits(value: RuntimeNatsConfig | undefined): RuntimeNatsLimits {
   const config: unknown = value === undefined ? {} : value;
@@ -308,16 +320,16 @@ export function runtimeNatsLimits(value: RuntimeNatsConfig | undefined): Runtime
       throw new Error(
         `runtimeNats.${key} must be a positive binary quantity such as ${RUNTIME_NATS_DEFAULTS[key]} (got ${JSON.stringify(raw)})`,
       );
-    if (bytes < 2 ** 20) throw new Error(`runtimeNats.${key} must be at least 1Mi`);
+    if (bytes < MIB) throw new Error(`runtimeNats.${key} must be at least 1Mi`);
     return bytes;
   };
   const limits = {
     maxFileStore: resolve('maxFileStore'),
     maxMemoryStore: resolve('maxMemoryStore'),
   };
-  if (limits.maxMemoryStore >= (binaryBytes(RUNTIME_NATS_MEMORY_LIMIT) ?? 0))
+  if (limits.maxMemoryStore > (BACKING_SERVICE_MEMORY_LIMIT_MIB / 2) * MIB)
     throw new Error(
-      `runtimeNats.maxMemoryStore must be below the di-nats memory limit (${RUNTIME_NATS_MEMORY_LIMIT})`,
+      `runtimeNats.maxMemoryStore must be at most ${RUNTIME_NATS_MAX_MEMORY_STORE}, half the di-nats memory limit (${BACKING_SERVICE_MEMORY_LIMIT}); the rest is nats-server's own headroom`,
     );
   return limits;
 }
@@ -1091,7 +1103,7 @@ function tenantResources(
                   ports: [{ containerPort: port }],
                   resources: {
                     requests: { cpu: '10m', memory: '32Mi' },
-                    limits: { cpu: '250m', memory: '128Mi' },
+                    limits: { cpu: '250m', memory: BACKING_SERVICE_MEMORY_LIMIT },
                   },
                   readinessProbe: { tcpSocket: { port } },
                   volumeMounts: [

@@ -438,7 +438,11 @@ jetstream {
 | `runtimeNats` key | Default | Rule |
 | --- | --- | --- |
 | `maxFileStore` | `10Gi` | At least `1Mi` |
-| `maxMemoryStore` | `32Mi` | At least `1Mi`, below the container's `128Mi` memory limit |
+| `maxMemoryStore` | `32Mi` | At least `1Mi`, at most `64Mi` (half the container's `128Mi` memory limit) |
+
+The memory cap stops at half the container limit because nats-server needs the other half for
+itself (connections, buffers, file-store caches). With that headroom a full memory store is
+refused by JetStream with `insufficient resources` instead of getting the pod OOM-killed.
 
 Values are binary quantities: a positive integer number of bytes, optionally suffixed `Ki`,
 `Mi`, `Gi` or `Ti` (decimal units such as `10GB` are refused). The caps apply to every tenant
@@ -453,13 +457,25 @@ config's SHA-256 (`platform.di-framework.dev/nats-config-sha256`), so changing a
 `di-nats` (the Deployment is `Recreate`; the hosts reconnect).
 
 Upgrading keeps the same store directory, so existing streams and object stores are recovered
-as before. The cap never deletes data. If a tenant's store already holds more than the new cap,
-nats-server still recovers streams without their own `max_bytes`, and they stay readable and
-deletable, but JetStream refuses new writes (registry pushes and blobstore writes included)
-until usage falls below the cap. A stream whose own `max_bytes` no longer fits under the cap
-is not recovered; nats-server logs the error at start-up. Raise `maxFileStore` (or delete data)
-and the next restart recovers it. Before lowering a cap, check usage with
-`du -sh <storageRoot>/di-tenants/<tenant uid>/di-nats/jetstream` on the node.
+as before. The cap never deletes data. Every stream is recovered, including one whose own
+`max_bytes` is larger than the cap; nats-server logs no error for either.
+
+If a tenant's store already holds more than the cap (an upgrade, or a cap lowered below usage):
+
+- Reads keep working: stream reads, KV gets, object-store and blobstore gets, registry pulls.
+- Every write is refused with `10023 insufficient resources`, **deletes included**. An
+  object-store, KV or blobstore delete is a publish of a delete marker, so it is refused like any
+  other write. The registry cannot free space by deleting images, and workloads cannot free
+  space through `wasmcloud:blobstore` either.
+- Recovery is an operator step: raise `maxFileStore` above current usage (the config change
+  restarts `di-nats`), or remove data with admin stream operations, `nats stream purge <stream>`
+  or `nats stream rm <stream>`, which JetStream still accepts over the cap. Writes resume once
+  usage is below the cap.
+
+When usage reaches the cap through normal writes instead, it stays below the cap: the write
+that would cross it is refused, and deletes still work, so the registry frees space by deleting
+images. Before lowering a cap, check usage on the node with
+`du -sh <storageRoot>/di-tenants/<tenant uid>/di-nats/jetstream`.
 
 ### Egress
 

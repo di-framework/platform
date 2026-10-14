@@ -313,7 +313,7 @@ test('an invalid tenant host allowlist fails before any resource, network policy
     [
       { runtimeNats: { maxMemoryStore: '1Gi' } },
       {},
-      'runtimeNats.maxMemoryStore must be below the di-nats memory limit (128Mi)',
+      'runtimeNats.maxMemoryStore must be at most 64Mi, half the di-nats memory limit (128Mi)',
     ],
     [{}, { apiServer: 'https://k8s.example:6443' }, 'apiServer requires kubeconfig'],
     [
