@@ -99,13 +99,22 @@ async function legacyRead<T>(read: () => Promise<T>, empty: T): Promise<T> {
     throw error;
   }
 }
-/** A key's Secret: the new namespace first, then the old one while keys are being moved. */
-async function findSecret(store: KeyStore, id: string): Promise<SecretResource | undefined> {
-  const secret = await store.kube.getSecret(store.namespace, secretName(id));
-  if (secret) return secret;
+/**
+ * A key's Secret, as `{ secret, original }`: `secret` from the new namespace, `original` from the
+ * old one while keys are being moved. When neither read finds it, the new namespace is read once
+ * more: the move may have copied the key and deleted its original between the two reads, and the
+ * original is deleted only once its copy exists.
+ */
+async function findSecret(
+  store: KeyStore,
+  id: string,
+): Promise<{ secret?: SecretResource; original?: SecretResource }> {
+  const read = () => store.kube.getSecret(store.namespace, secretName(id));
+  const secret = await read();
   const legacy = await legacyNamespace(store);
-  if (!legacy) return undefined;
-  return legacyRead(() => store.kube.getSecret(legacy, secretName(id)), undefined);
+  if (!legacy) return { secret };
+  const original = await legacyRead(() => store.kube.getSecret(legacy, secretName(id)), undefined);
+  return { secret: secret ?? (original ? undefined : await read()), original };
 }
 
 export function hex(bytes: Uint8Array): string {
@@ -201,11 +210,7 @@ export async function listApiKeys(store: KeyStore, user: string): Promise<ApiKey
  */
 export async function revokeApiKey(store: KeyStore, user: string, id: string): Promise<boolean> {
   if (!/^[0-9a-f]{16}$/.test(id)) return false;
-  const secret = await store.kube.getSecret(store.namespace, secretName(id));
-  const legacy = await legacyNamespace(store);
-  const original = legacy
-    ? await legacyRead(() => store.kube.getSecret(legacy, secretName(id)), undefined)
-    : undefined;
+  const { secret, original } = await findSecret(store, id);
   const found = secret ?? original;
   const key = found ? fromSecret(found) : undefined;
   if (!key || key.tenant !== store.tenant || key.user !== user) return false;
@@ -221,7 +226,8 @@ export class ApiKeyError extends Error {}
 export async function resolveApiKey(store: KeyStore, presented: string): Promise<ApiKey> {
   const parsed = parseKey(presented.trim());
   if (!parsed) throw new ApiKeyError('API key is malformed');
-  const secret = await findSecret(store, parsed.id);
+  const found = await findSecret(store, parsed.id);
+  const secret = found.secret ?? found.original;
   const key = secret ? fromSecret(secret) : undefined;
   const storedHash = secret?.data?.hash
     ? Buffer.from(secret.data.hash, 'base64').toString('utf8')

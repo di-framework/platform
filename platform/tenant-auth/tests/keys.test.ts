@@ -195,6 +195,27 @@ describe('api keys across the move to di-apikeys-<tenant> (#379)', () => {
     await works(); // the old namespace is no longer read (and would answer 403)
   });
 
+  test('finds a key the move finishes between its two reads, for resolve and revoke', async () => {
+    const { kube, store, legacyKey, copy, deleteOriginal } = setup();
+    const issued = await legacyKey();
+    // The new namespace misses; the move copies and deletes the original before the old one is read.
+    const get = kube.getSecret.bind(kube);
+    const moveDuringOldRead = () => {
+      kube.getSecret = async (namespace: string, name: string) => {
+        if (namespace === RUNTIME && kube.secrets.has(`${RUNTIME}/${name}`)) {
+          copy(issued.id);
+          deleteOriginal(issued.id);
+        }
+        return get(namespace, name);
+      };
+    };
+    moveDuringOldRead();
+    expect((await resolveApiKey(store, issued.secret)).id).toBe(issued.id);
+    expect(await revokeApiKey(store, 'alice', issued.id)).toBe(true);
+    kube.getSecret = get;
+    await expect(resolveApiKey(store, issued.secret)).rejects.toThrow('unknown or revoked');
+  });
+
   test('a 403 in the old namespace before the done signal counts as nothing there', async () => {
     const { state, store } = setup();
     state.forbidden.add(RUNTIME);
