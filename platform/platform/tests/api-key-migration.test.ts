@@ -12,6 +12,7 @@ import {
 import { crds, names, type Tenant, tenantResources, VERSION } from '../src/tenancy/resources';
 import {
   API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS,
+  imagePinnedTo,
   tenantAuthReadsApiKeyNamespace,
 } from '../src/tenant-auth-images';
 
@@ -374,6 +375,18 @@ describe('API-key move gate (#379)', () => {
     expect(apiKeyMoveBlocker(IMAGE, supported, value, [...pods])).toContain(reason);
   });
 
+  it('names every old pod, in name order', () => {
+    expect(
+      apiKeyMoveBlocker(IMAGE, true, deployment(), [
+        pod('tenant-controller-b', OLD, true),
+        ...ok,
+        pod('tenant-controller-a', OLD),
+      ]),
+    ).toBe(
+      'tenant-controller pods still run another image: tenant-controller-a, tenant-controller-b',
+    );
+  });
+
   it('opens with zero replicas (a suspended tenant) once no pod is left', () => {
     const suspended = deployment({ replicas: 0, status: { observedGeneration: 2 } });
     expect(apiKeyMoveBlocker(IMAGE, true, suspended, [])).toBeUndefined();
@@ -399,6 +412,14 @@ describe('tenant-auth images that read the API-key namespace (#379)', () => {
         true,
       );
     }
+  });
+
+  it('matches a digest-pinned reference against a list', () => {
+    const digest = `sha256:${'c'.repeat(64)}`;
+    expect(imagePinnedTo(`ghcr.io/di-framework/tenant-auth@${digest}`, [digest])).toBe(true);
+    expect(imagePinnedTo(`ghcr.io/di-framework/tenant-auth:${digest}`, [digest])).toBe(false);
+    expect(imagePinnedTo(`@${digest}`, [digest])).toBe(false);
+    expect(imagePinnedTo(`ghcr.io/di-framework/tenant-auth@${digest}`, [])).toBe(false);
   });
 
   it('accepts only digest-pinned references to a listed build', () => {

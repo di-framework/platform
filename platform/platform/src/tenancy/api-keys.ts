@@ -109,7 +109,8 @@ export function apiKeyMoveBlocker(
   )
     return `the tenant-controller Deployment has not finished rolling out ${image}`;
   const old = pods.filter((pod) => !runs(pod.spec?.containers)).map((pod) => pod.metadata.name);
-  if (old.length) return `tenant-controller pods still run another image: ${old.sort().join(', ')}`;
+  old.sort((a, b) => a.localeCompare(b));
+  if (old.length) return `tenant-controller pods still run another image: ${old.join(', ')}`;
   return undefined;
 }
 
@@ -129,7 +130,7 @@ export function apiKeyCopy(secret: ApiKeySecret, tenant: string): ApiKeySecret {
       ),
     },
     type: secret.type ?? 'Opaque',
-    data: { ...(secret.data ?? {}) },
+    data: { ...secret.data },
   };
 }
 

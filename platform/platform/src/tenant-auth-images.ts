@@ -13,8 +13,13 @@
  */
 export const API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS: readonly string[] = [];
 
+/** Whether `image` is pinned by digest to one of `digests`. */
+export function imagePinnedTo(image: string, digests: readonly string[]): boolean {
+  const at = image.lastIndexOf('@');
+  return at > 0 && digests.includes(image.slice(at + 1));
+}
+
 /** Whether `image` is pinned to one of {@link API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS}. */
 export function tenantAuthReadsApiKeyNamespace(image: string): boolean {
-  const at = image.lastIndexOf('@');
-  return at > 0 && API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS.includes(image.slice(at + 1));
+  return imagePinnedTo(image, API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS);
 }
