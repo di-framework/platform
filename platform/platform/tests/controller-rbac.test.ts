@@ -1051,6 +1051,37 @@ describe('platform controller RBAC at runtime (#321)', () => {
     );
   });
 
+  it('replaces a copy it did not write with the original, and logs it', async () => {
+    const api = new RecordingApi();
+    const { controller, tenants, users } = setup(api);
+    const alpha = tenants[0] as Tenant;
+    const [first] = LEGACY_KEYS as [string];
+    const at = `${collection('v1', 'Secret', 'di-apikeys-alpha')}/di-apikey-${first}`;
+    const original = api.objects.get(
+      `${collection('v1', 'Secret', 'di-runtime-alpha')}/di-apikey-${first}`,
+    ) as Resource & { data: Record<string, string> };
+    api.seed({
+      ...original,
+      metadata: { ...original.metadata, namespace: 'di-apikeys-alpha', uid: 'planted' },
+      data: { hash: Buffer.from('planted').toString('base64') },
+    } as Resource);
+    const warned: string[] = [];
+    const [log, warn] = [console.log, console.warn];
+    console.log = () => {};
+    console.warn = (line: string) => warned.push(line);
+    try {
+      for (let pass = 0; pass < 2; pass++) await controller.reconcileTenant(alpha, users);
+    } finally {
+      console.log = log;
+      console.warn = warn;
+    }
+    expect((api.objects.get(at) as Resource & { data: unknown }).data).toEqual(original.data);
+    expect(api.objects.get(at)?.metadata.uid).not.toBe('planted');
+    expect(warned.filter((line) => line.includes('API key'))).toEqual([
+      `Tenant/alpha: replaced di-apikeys-alpha/di-apikey-${first}, which differed from the API key in di-runtime-alpha and was not written by the platform`,
+    ]);
+  });
+
   it('leaves the keys and the read rule in place under a tenant-auth not known to read the new namespace', async () => {
     // `cfg` names no registry (so the pair turns ready here) and no allowlisted image.
     expect(cfg.tenantAuthReadsApiKeyNamespace).toBeUndefined();
