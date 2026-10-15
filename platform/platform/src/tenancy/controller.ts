@@ -1021,8 +1021,6 @@ export class Controller {
             (spec.replicas !== 0 || (status?.replicas ?? 0) === 0);
         }
       }
-      // After the apply, so a failed cleanup is reported and retried without holding it back.
-      await this.pruneLogReader(tenant);
       if (ready && !tenant.spec.suspended && !tenant.metadata.deletionTimestamp) {
         const hosts = await this.list<Resource>('runtime.wasmcloud.dev/v1alpha1', 'Host', {
           hostgroup: n.hostgroup,
@@ -1038,6 +1036,13 @@ export class Controller {
       }
     } catch (error) {
       failure = error;
+    }
+    // Apart from the apply, so neither failure holds the other back. A cleanup failure is
+    // reported unless the apply already failed, and the cleanup is retried on the next pass.
+    try {
+      await this.pruneLogReader(tenant);
+    } catch (error) {
+      failure ??= error;
     }
     // Tenant-auth is independent of the tenant's own objects: a failed apply above (such as a
     // hostgroup 409) must not keep it from reconciling or from reporting TenantAuthReady (#121).

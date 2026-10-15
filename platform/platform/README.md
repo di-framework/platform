@@ -1390,7 +1390,9 @@ tenantAuth:
     Role and RoleBinding in `di-runtime-<tenant>`, and no longer has `bind` on that name. On
     the first reconcile of each tenant after the controller starts, it deletes the leftover
     RoleBinding and Role there, but only when they carry this installation's label and the
-    Tenant's owner uid; a foreign object of that name is left alone.
+    Tenant's owner uid; a foreign object of that name is left alone. The cleanup runs even
+    when the tenant's apply fails; a failed delete is reported as `ReconcileError` and retried on
+    the next reconcile.
   - Host pull (`#83:host-pull`): the tenant's hosts pull workload components from the tenant
     registry with a namespace-scoped host credential.
     - Reference: users push to `publicUrl`; workloads reference the same repository as

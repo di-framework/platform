@@ -629,8 +629,7 @@ describe('platform controller RBAC at runtime (#321)', () => {
     },
   };
   /** alpha: two members and a registry the hosts pull from; beta: suspended; gamma: no members. */
-  async function run() {
-    const api = new RecordingApi();
+  function setup(api = new RecordingApi()) {
     const beta = tenant('beta');
     beta.spec.suspended = true;
     const tenants = [tenant('alpha'), beta, tenant('gamma')];
@@ -678,11 +677,13 @@ describe('platform controller RBAC at runtime (#321)', () => {
       endpoints: [{ addresses: ['10.0.0.1'] }],
       ports: [{ port: 6443 }],
     });
-    // Log readers that platforms before #321 wrote: alpha's are this installation's; gamma's are
-    // another installation's Role and an unlabelled binding, which must be left alone.
+    // Log readers that platforms before #321 wrote: alpha's are this installation's. The rest must
+    // be left alone: beta's Role carries this installation but another tenant's uid, gamma's
+    // Role another installation's label, and gamma's binding no labels.
     for (const [namespace, kind, labels] of [
       ['di-runtime-alpha', 'Role', { [INSTALLATION]: 'test', [OWNER]: 'alpha-uid' }],
       ['di-runtime-alpha', 'RoleBinding', { [INSTALLATION]: 'test', [OWNER]: 'alpha-uid' }],
+      ['di-runtime-beta', 'Role', { [INSTALLATION]: 'test', [OWNER]: 'alpha-uid' }],
       ['di-runtime-gamma', 'Role', { [INSTALLATION]: 'other', [OWNER]: 'gamma-uid' }],
       ['di-runtime-gamma', 'RoleBinding', undefined],
     ] as const)
@@ -691,7 +692,10 @@ describe('platform controller RBAC at runtime (#321)', () => {
         kind,
         metadata: { name: LOG_READER, namespace, uid: `${namespace}-${kind}`, labels },
       });
-    const controller = new Controller(api, registryCfg);
+    return { api, controller: new Controller(api, registryCfg), tenants, users };
+  }
+  async function run() {
+    const { api, controller, tenants, users } = setup();
     // Twice: the first pass deploys the registry, the second wires the hosts to pull from it.
     for (let pass = 0; pass < 2; pass++) {
       for (const t of tenants) await controller.reconcileTenant(t, users);
@@ -801,14 +805,18 @@ describe('platform controller RBAC at runtime (#321)', () => {
       expect(flagged).toContain(`patch /configmaps ${r.namespace ?? ''}/${r.name ?? ''}`);
   });
 
+  /** The leftover log reader of `kind` in `namespace`, if it is still there. */
+  const logReader = (api: RecordingApi, namespace: string, kind: string) =>
+    api.objects.get(`${collection(`${RBAC_GROUP}/v1`, kind, namespace)}/${LOG_READER}`);
+
   it('prunes only the leftover log reader this installation wrote, once per tenant', async () => {
     const { api } = await run();
-    const at = (namespace: string, kind: string) =>
-      api.objects.get(`${collection(`${RBAC_GROUP}/v1`, kind, namespace)}/${LOG_READER}`);
-    expect(at('di-runtime-alpha', 'Role')).toBeUndefined();
-    expect(at('di-runtime-alpha', 'RoleBinding')).toBeUndefined();
-    expect(at('di-runtime-gamma', 'Role')).toBeDefined();
-    expect(at('di-runtime-gamma', 'RoleBinding')).toBeDefined();
+    expect(logReader(api, 'di-runtime-alpha', 'Role')).toBeUndefined();
+    expect(logReader(api, 'di-runtime-alpha', 'RoleBinding')).toBeUndefined();
+    // This installation's label, but alpha's uid in beta's namespace: not beta's to delete.
+    expect(logReader(api, 'di-runtime-beta', 'Role')).toBeDefined();
+    expect(logReader(api, 'di-runtime-gamma', 'Role')).toBeDefined();
+    expect(logReader(api, 'di-runtime-gamma', 'RoleBinding')).toBeDefined();
     const reads = api.requests.filter((r) => r.name === LOG_READER && r.verb === 'get');
     // Two passes over three tenants, but each Role and binding is checked only on the first.
     expect(reads).toHaveLength(6);
@@ -817,6 +825,73 @@ describe('platform controller RBAC at runtime (#321)', () => {
         .filter((r) => r.name === LOG_READER && r.verb === 'delete')
         .map((r) => `${r.resource} ${r.namespace}`),
     ).toEqual(['rolebindings di-runtime-alpha', 'roles di-runtime-alpha']);
+  });
+
+  /** Fails the first request that `fails` matches with a 500 carrying `message`. */
+  class FailOnceApi extends RecordingApi {
+    private failed = false;
+    constructor(
+      private readonly fails: (method: string, path: string) => boolean,
+      private readonly message: string,
+    ) {
+      super();
+    }
+    override async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+      if (!this.failed && this.fails(method, path)) {
+        this.failed = true;
+        throw new ApiError(500, this.message);
+      }
+      return super.call<T>(method, path, body);
+    }
+  }
+  /** Reconciles alpha once against `api`, with the controller's error log silenced. */
+  async function reconcileAlpha(api: RecordingApi) {
+    const { controller, tenants, users } = setup(api);
+    const alpha = tenants[0] as Tenant;
+    const log = console.error;
+    console.error = () => {};
+    try {
+      await controller.reconcileTenant(alpha, users);
+    } finally {
+      console.error = log;
+    }
+    const ready = () =>
+      (
+        api.objects.get(`${collection(VERSION, 'Tenant')}/alpha`)?.status as
+          | { conditions?: { type: string; reason: string; message: string }[] }
+          | undefined
+      )?.conditions?.find((c) => c.type === 'Ready');
+    return { again: () => controller.reconcileTenant(alpha, users), ready };
+  }
+
+  it('reports a failed log-reader delete and retries it on the next pass', async () => {
+    const api = new FailOnceApi(
+      (method, path) => method === 'DELETE' && path.endsWith(`/rolebindings/${LOG_READER}`),
+      'log reader delete failed',
+    );
+    const { again, ready: readyReason } = await reconcileAlpha(api);
+    expect(readyReason()).toMatchObject({
+      reason: 'ReconcileError',
+      message: 'log reader delete failed',
+    });
+    expect(logReader(api, 'di-runtime-alpha', 'RoleBinding')).toBeDefined();
+    expect(logReader(api, 'di-runtime-alpha', 'Role')).toBeDefined();
+    // Not memoized after the failure: the next pass checks again and deletes both.
+    await again();
+    expect(logReader(api, 'di-runtime-alpha', 'RoleBinding')).toBeUndefined();
+    expect(logReader(api, 'di-runtime-alpha', 'Role')).toBeUndefined();
+    expect(readyReason()?.reason).not.toBe('ReconcileError');
+  });
+
+  it('prunes the log reader even when the apply fails, and reports the apply failure', async () => {
+    const api = new FailOnceApi(
+      (method, path) => method === 'PATCH' && path.includes('/deployments/hostgroup-tenant-alpha'),
+      'hostgroup apply failed',
+    );
+    const { ready } = await reconcileAlpha(api);
+    expect(ready()).toMatchObject({ reason: 'ReconcileError', message: 'hostgroup apply failed' });
+    expect(logReader(api, 'di-runtime-alpha', 'RoleBinding')).toBeUndefined();
+    expect(logReader(api, 'di-runtime-alpha', 'Role')).toBeUndefined();
   });
 
   it('detects a written rule the controller does not hold', async () => {
