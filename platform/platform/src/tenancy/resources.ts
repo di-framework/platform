@@ -100,6 +100,12 @@ export interface ControllerConfig {
   routeUrlPattern?: string;
   /** The per-tenant controller and console (#58); absent, the reconcile deploys neither. */
   tenantAuth?: TenantAuthConfig;
+  /**
+   * Whether `tenantAuth.image` is a published build known to read API keys from
+   * `di-apikeys-<tenant>` (`API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS`, #379). Absent or false, keys
+   * stay in the runtime namespace.
+   */
+  tenantAuthReadsApiKeyNamespace?: boolean;
   /** JetStream storage caps of each tenant's `di-nats` (#160); absent, the defaults apply. */
   runtimeNats?: RuntimeNatsConfig;
 }

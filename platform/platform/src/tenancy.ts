@@ -44,6 +44,8 @@ export {
   tenantObject,
 } from './tenancy/install';
 
+import { tenantAuthReadsApiKeyNamespace } from './tenant-auth-images';
+
 export interface UserDeclaration extends UserSpec {
   name: string;
 }
@@ -297,6 +299,9 @@ export function installTenancy(args: {
                       storageRoot: args.storageRoot,
                       routeUrlPattern: args.routeUrlPattern,
                       tenantAuth: args.tenantAuth,
+                      // API keys move out of the runtime namespace only under such an image (#379).
+                      tenantAuthReadsApiKeyNamespace:
+                        !!args.tenantAuth && tenantAuthReadsApiKeyNamespace(args.tenantAuth.image),
                       runtimeNats: args.runtimeNats,
                     }),
                   },

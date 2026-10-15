@@ -16,6 +16,10 @@
  *   - the canonical variant (the table's first row) moves `DEFAULT_HOST_IMAGE`
  *     (platform/platform/src/index.ts) and every verbatim mention of the old default in
  *     {@link DEFAULT_HOST_DOCS}.
+ *
+ * Each tenant-auth pin also appends its digest to `API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS`
+ * (platform/platform/src/tenant-auth-images.ts, #379): every build from #379 on reads API keys
+ * from `di-apikeys-<tenant>`, and the platform moves keys there only under a listed build.
  * Rerunning with the same digests changes nothing.
  *
  * Usage (from the repository root):
@@ -46,6 +50,10 @@ export const DEFAULT_HOST_DOCS = [HOST_README, 'platform/platform/assets/platfor
 export const NATS_CREDENTIALS_SOURCE = 'platform/platform/src/tenancy/registry-nats.ts';
 export const NATS_CREDENTIALS_PATCH = '0003-nats-blobstore-credentials.patch';
 const NATS_CREDENTIALS_LIST = 'export const NATS_CREDENTIALS_HOST_IMAGE_DIGESTS';
+/** Holds `API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS`, the tenant-auth builds that read `di-apikeys-*`. */
+export const API_KEY_NAMESPACE_SOURCE = 'platform/platform/src/tenant-auth-images.ts';
+const API_KEY_NAMESPACE_LIST = 'export const API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS';
+export const TENANT_AUTH_IMAGE = 'ghcr.io/di-framework/tenant-auth';
 
 export const ARTIFACTS: Record<string, PinTarget[]> = {
   'tenant-auth': [
@@ -159,13 +167,41 @@ export function setDefaultHostImage(
  * comment. A digest already listed is left alone, and no entry is ever removed.
  */
 export function allowNatsCredentials(text: string, digest: string, label: string): string {
+  return allowDigest(text, NATS_CREDENTIALS_SOURCE, NATS_CREDENTIALS_LIST, digest, label);
+}
+
+/**
+ * Append `digest` to `API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS` in `text` (#379), after a `// <label>`
+ * comment. A digest already listed is left alone, and no entry is ever removed.
+ */
+export function allowApiKeyNamespace(text: string, digest: string, label: string): string {
+  return allowDigest(text, API_KEY_NAMESPACE_SOURCE, API_KEY_NAMESPACE_LIST, digest, label);
+}
+
+/**
+ * Append `digest` to the `readonly string[]` literal that `list` declares in `text`, which is
+ * either multi-line (`[` ... `\n];`) or still empty (`[];`).
+ */
+function allowDigest(
+  text: string,
+  file: string,
+  list: string,
+  digest: string,
+  label: string,
+): string {
   if (!DIGEST.test(digest)) throw new Error(`not a sha256 digest: ${digest}`);
-  const start = text.indexOf(NATS_CREDENTIALS_LIST);
-  const open = start < 0 ? -1 : text.indexOf('[', start);
-  const close = open < 0 ? -1 : text.indexOf('\n];', open);
-  if (close < 0) throw new Error(`${NATS_CREDENTIALS_SOURCE}: no ${NATS_CREDENTIALS_LIST} list`);
+  const start = text.indexOf(list);
+  // The literal, not the `readonly string[]` annotation before it.
+  const assign = start < 0 ? -1 : text.indexOf('= [', start + list.length);
+  const open = assign < 0 ? -1 : assign + 2;
+  if (open < 0) throw new Error(`${file}: no ${list} list`);
+  const entry = `\n  // ${label}\n  '${digest}',`;
+  if (text.startsWith('[];', open))
+    return `${text.slice(0, open + 1)}${entry}\n${text.slice(open + 1)}`;
+  const close = text.indexOf('\n];', open);
+  if (close < 0) throw new Error(`${file}: no ${list} list`);
   if (text.slice(open, close).includes(`'${digest}'`)) return text;
-  return `${text.slice(0, close)}\n  // ${label}\n  '${digest}',${text.slice(close)}`;
+  return `${text.slice(0, close)}${entry}${text.slice(close)}`;
 }
 
 /** Every file `artifact` may rewrite (relative to the repository root). */
@@ -174,6 +210,7 @@ export function artifactFiles(artifact: string): string[] {
   if (artifact.startsWith('wash-')) {
     files.push(NATS_CREDENTIALS_SOURCE, DEFAULT_HOST_SOURCE, ...DEFAULT_HOST_DOCS);
   }
+  if (artifact === 'tenant-auth') files.push(API_KEY_NAMESPACE_SOURCE);
   return [...new Set(files)];
 }
 
@@ -201,6 +238,10 @@ export function pinArtifact(root: string, artifact: string, digest: string): str
       return text;
     });
   }
+  if (artifact === 'tenant-auth')
+    edit(API_KEY_NAMESPACE_SOURCE, (before) =>
+      allowApiKeyNamespace(before, digest, TENANT_AUTH_IMAGE),
+    );
   if (!variant) return changed;
   const image = `${HOST_IMAGE}:${variant.tag}@${digest}`;
   if (variant.patches.includes(NATS_CREDENTIALS_PATCH)) {
