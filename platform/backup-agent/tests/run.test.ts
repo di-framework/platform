@@ -215,6 +215,81 @@ describe('backup-agent kinds', () => {
     expect(waits).toEqual(new Array(7).fill(1000));
   });
 
+  test('probes, nats dumps and restores retry a connection the policy has not admitted yet', async () => {
+    // A new pod's first connections are refused until its network policy is programmed (#388).
+    const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void) => {
+      queueMicrotask(handler);
+      return 0;
+    }) as unknown as typeof setTimeout);
+    const archive = (files: Map<string, Uint8Array>, argv: string[]) => {
+      if (argv[0] === 'tar' && argv.includes('-cf')) {
+        files.set(argv[argv.indexOf('-cf') + 1] ?? '', Buffer.from('tar-bytes'));
+      }
+      return ok();
+    };
+    const refusedFirst = (tool: string, then: (argv: string[]) => ExecResult, times = 2) => {
+      let refused = 0;
+      return (argv: string[]) => {
+        if (argv[0] === tool && refused < times) {
+          refused += 1;
+          return {
+            code: 1,
+            stdout: '',
+            stderr:
+              tool === 'nats'
+                ? 'nats: error: setup failed: nats: no servers available for connection'
+                : 'could not connect to server: Connection refused',
+          };
+        }
+        return then(argv);
+      };
+    };
+    try {
+      for (const [port, tool, stdout] of [
+        ['5432', 'psql', '0\n'],
+        ['6379', 'redis-cli', '0'],
+        ['4222', 'nats', '[]'],
+      ] as const) {
+        const probe = harness(refusedFirst(tool, () => ({ code: 0, stdout, stderr: '' })));
+        expect(await runAgent(request({ kind: 'probe-empty', port }), probe.io)).toBe(0);
+        expect(probe.calls.filter((call) => call.argv[0] === tool)).toHaveLength(3);
+      }
+
+      const dump = harness(
+        refusedFirst('nats', (argv) =>
+          argv.includes('ls') ? { code: 0, stdout: '[]', stderr: '' } : archive(dump.files, argv),
+        ),
+      );
+      expect(await runAgent(request({ kind: 'nats', port: '4222' }), dump.io)).toBe(0);
+      expect(dump.calls.filter((call) => call.argv.includes('ls'))).toHaveLength(3);
+
+      const restore = harness(refusedFirst('pg_restore', () => ok()));
+      expect(await runAgent(request({ kind: 'restore-postgres' }), restore.io)).toBe(0);
+      expect(restore.calls.filter((call) => call.argv[0] === 'pg_restore')).toHaveLength(3);
+
+      const redis = harness(
+        refusedFirst('redis-cli', (argv) =>
+          argv[0] === 'rdb' ? { code: 0, stdout: 'RESP', stderr: '' } : ok(),
+        ),
+      );
+      expect(await runAgent(request({ kind: 'restore-redis', port: '6379' }), redis.io)).toBe(0);
+      const pipes = redis.calls.filter((call) => call.argv[0] === 'redis-cli');
+      expect(pipes).toHaveLength(3);
+      expect(pipes.every((call) => call.input === 'RESP')).toBe(true);
+
+      const nats = harness(refusedFirst('nats', () => ok()));
+      expect(await runAgent(request({ kind: 'restore-nats', port: '4222' }), nats.io)).toBe(0);
+      expect(nats.calls.filter((call) => call.argv.includes('restore'))).toHaveLength(3);
+
+      // Other failures are not retried.
+      const denied = harness(() => ({ code: 1, stdout: '', stderr: 'Authorization Violation' }));
+      expect(await runAgent(request({ kind: 'probe-empty', port: '4222' }), denied.io)).toBe(1);
+      expect(denied.calls).toHaveLength(1);
+    } finally {
+      timer.mockRestore();
+    }
+  });
+
   test('postgres reports a dump failure and a missing target', async () => {
     const failed = harness(() => ({ code: 1, stdout: '', stderr: 'no' }));
     expect(await runAgent(request(), failed.io)).toBe(1);
