@@ -377,7 +377,14 @@ describe('registry NATS account rendering (#159)', () => {
     const podBackoff = Array.from({ length: job.spec.backoffLimit }, (_, i) =>
       Math.min(10 * 2 ** i, 360),
     ).reduce((sum, delay) => sum + delay, 0);
-    const wait = REGISTRY_NATS_CONNECT_WAIT_SECONDS + REGISTRY_NATS_CONNECT_MAX_DELAY_SECONDS;
+    // Each of a pod's 13 attempts may also wait out nats.go's 2 s dial timeout when an engine
+    // drops packets instead of refusing them.
+    const attempts = 13;
+    const dialTimeout = 2;
+    const wait =
+      REGISTRY_NATS_CONNECT_WAIT_SECONDS +
+      REGISTRY_NATS_CONNECT_MAX_DELAY_SECONDS +
+      attempts * dialTimeout;
     expect((job.spec.backoffLimit + 1) * wait + podBackoff).toBeLessThan(
       REGISTRY_NATS_MIGRATION_DEADLINE_SECONDS,
     );

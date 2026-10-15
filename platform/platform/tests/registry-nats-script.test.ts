@@ -10,7 +10,7 @@ import {
 } from '../src/tenancy/registry-nats';
 
 // Runs the migration Job's script against a stubbed `nats` CLI and `sleep` (#388). nats-box runs
-// it with busybox sh; bash stands in here because it also supports `set -o pipefail`.
+// it with busybox sh, so the cases also run under `busybox sh` where the runner has busybox.
 
 const PASSWORD = 'rSENTINELpasswordSENTINELpasswordSENTINEL0000';
 const REFUSED = 'nats: error: setup failed: nats: no servers available for connection';
@@ -20,7 +20,7 @@ const REFUSED = 'nats: error: setup failed: nats: no servers available for conne
  * programmed yet, then `account info` reports the account the login lands in and the marker
  * says the migration is complete. Every call is logged without its environment.
  */
-function stub(dir: string, refusals: number, anonymousAccount = 'TENANT') {
+function stub(dir: string, refusals: number, anonymousAccount = 'TENANT', refusal = REFUSED) {
   writeFileSync(
     join(dir, 'nats'),
     `#!/bin/sh
@@ -29,7 +29,7 @@ count=$(cat "${dir}/count" 2>/dev/null || echo 0)
 count=$((count + 1))
 echo "$count" > "${dir}/count"
 if [ "$count" -le ${refusals} ]; then
-  echo "${REFUSED}" >&2
+  echo "${refusal}" >&2
   exit 1
 fi
 case "$*" in
@@ -54,11 +54,19 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function run(refusals: number, anonymousAccount?: string) {
+const DENIED = 'nats: error: setup failed: nats: Authorization Violation';
+const busybox = spawnSync('busybox', ['true']).error === undefined;
+
+function run(
+  refusals: number,
+  anonymousAccount?: string,
+  refusal?: string,
+  shell: string[] = ['bash', '-c'],
+) {
   const dir = mkdtempSync(join(tmpdir(), 'registry-migrate-'));
   dirs.push(dir);
-  stub(dir, refusals, anonymousAccount);
-  const child = spawnSync('bash', ['-c', REGISTRY_NATS_MIGRATION_SCRIPT], {
+  stub(dir, refusals, anonymousAccount, refusal);
+  const child = spawnSync(shell[0] ?? 'bash', [...shell.slice(1), REGISTRY_NATS_MIGRATION_SCRIPT], {
     encoding: 'utf8',
     env: {
       PATH: `${dir}:${process.env.PATH}`,
@@ -127,6 +135,30 @@ describe('registry migration script: first connection (#388)', () => {
       `registry migration: could not connect to di-nats as the registry user in 13 attempts over 95s: ${REFUSED}`,
     );
     expect(`${result.stdout}${result.stderr}`).not.toContain(PASSWORD);
+  });
+
+  it('fails at once on a rejected login without retrying', () => {
+    const result = run(1000, undefined, DENIED);
+    expect(result.status).toBe(1);
+    expect(result.sleeps).toEqual([]);
+    expect(result.calls).toEqual(['account info']);
+    expect(result.stderr).toContain(`registry migration: the registry login failed: ${DENIED}`);
+    expect(result.stderr).not.toContain('retrying');
+    expect(`${result.stdout}${result.stderr}`).not.toContain(PASSWORD);
+  });
+
+  it.skipIf(!busybox)('retries and then proceeds under busybox sh', () => {
+    const result = run(3, undefined, undefined, ['busybox', 'sh', '-c']);
+    expect(result.status).toBe(0);
+    expect(result.sleeps).toEqual([1, 2, 4]);
+    expect(result.stdout).toContain('already complete');
+  });
+
+  it.skipIf(!busybox)('fails at once on a rejected login under busybox sh', () => {
+    const result = run(1000, undefined, DENIED, ['busybox', 'sh', '-c']);
+    expect(result.status).toBe(1);
+    expect(result.calls).toEqual(['account info']);
+    expect(result.stderr).toContain('the registry login failed');
   });
 
   it('still refuses a misrendered server after the wait', () => {

@@ -230,12 +230,15 @@ objects() {
 }
 
 # A new pod's traffic to di-nats is refused until the network policy engine has programmed the
-# pod (about a second under kube-router), so wait for the first registry login (#388).
+# pod (about a second under kube-router), so wait for the first registry login (#388). Only a
+# failure to reach di-nats is retried; anything else (such as a rejected login) fails at once.
 waited=0
 delay=1
 attempt=1
 until dst account info >/dev/null 2>"$work/connect"; do
   reason="$(tail -n 1 "$work/connect")"
+  grep -qiE 'no servers available|connection refused|i/o timeout|timed out' "$work/connect" ||
+    fail "the registry login failed: $reason"
   [ "$waited" -lt ${REGISTRY_NATS_CONNECT_WAIT_SECONDS} ] ||
     fail "could not connect to di-nats as the registry user in $attempt attempts over \${waited}s: $reason"
   echo "registry migration: connecting to di-nats, attempt $attempt failed ($reason); retrying in \${delay}s" >&2

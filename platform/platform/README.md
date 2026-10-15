@@ -331,7 +331,8 @@ storage of at least the store's size under `runtimeNats.maxFileStore`; if the Jo
 connection to `di-nats`, because a network policy engine admits a new pod's traffic only once it
 has programmed the pod (about a second under kube-router). Its log shows each refused attempt
 (`connecting to di-nats, attempt N failed …`). A pod that cannot connect in that time fails with
-`could not connect to di-nats as the registry user`. The Job retries 10 times within one hour
+`could not connect to di-nats as the registry user`; any other failure of that first login (such
+as a rejected password) fails at once with `the registry login failed`. The Job retries 10 times within one hour
 (`activeDeadlineSeconds: 3600`, which also ends a Job whose pod the quota or the scheduler never
 admits). When it fails, `TenantAuthReady` says `RegistryMigrationFailed` with the Job's reason
 (`BackoffLimitExceeded`, `DeadlineExceeded`) and the registry stays stopped. Read its logs

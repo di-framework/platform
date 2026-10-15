@@ -263,9 +263,11 @@ describe('backup-agent kinds', () => {
       expect(await runAgent(request({ kind: 'nats', port: '4222' }), dump.io)).toBe(0);
       expect(dump.calls.filter((call) => call.argv.includes('ls'))).toHaveLength(3);
 
-      const restore = harness(refusedFirst('pg_restore', () => ok()));
+      // Restores wait with a read-only probe, then run exactly once.
+      const restore = harness(refusedFirst('psql', () => ok()));
       expect(await runAgent(request({ kind: 'restore-postgres' }), restore.io)).toBe(0);
-      expect(restore.calls.filter((call) => call.argv[0] === 'pg_restore')).toHaveLength(3);
+      expect(restore.calls.filter((call) => call.argv[0] === 'psql')).toHaveLength(3);
+      expect(restore.calls.filter((call) => call.argv[0] === 'pg_restore')).toHaveLength(1);
 
       const redis = harness(
         refusedFirst('redis-cli', (argv) =>
@@ -273,13 +275,16 @@ describe('backup-agent kinds', () => {
         ),
       );
       expect(await runAgent(request({ kind: 'restore-redis', port: '6379' }), redis.io)).toBe(0);
-      const pipes = redis.calls.filter((call) => call.argv[0] === 'redis-cli');
-      expect(pipes).toHaveLength(3);
-      expect(pipes.every((call) => call.input === 'RESP')).toBe(true);
+      const redisCalls = redis.calls.filter((call) => call.argv[0] === 'redis-cli');
+      expect(redisCalls.filter((call) => call.argv.includes('PING'))).toHaveLength(3);
+      const pipes = redisCalls.filter((call) => call.argv.includes('--pipe'));
+      expect(pipes).toHaveLength(1);
+      expect(pipes[0]?.input).toBe('RESP');
 
       const nats = harness(refusedFirst('nats', () => ok()));
       expect(await runAgent(request({ kind: 'restore-nats', port: '4222' }), nats.io)).toBe(0);
-      expect(nats.calls.filter((call) => call.argv.includes('restore'))).toHaveLength(3);
+      expect(nats.calls.filter((call) => call.argv.includes('info'))).toHaveLength(3);
+      expect(nats.calls.filter((call) => call.argv.includes('restore'))).toHaveLength(1);
 
       // Other failures are not retried.
       const denied = harness(() => ({ code: 1, stdout: '', stderr: 'Authorization Violation' }));
@@ -288,6 +293,32 @@ describe('backup-agent kinds', () => {
     } finally {
       timer.mockRestore();
     }
+  });
+
+  test('a restore that fails with connection-like output is never run again', async () => {
+    const partial = {
+      code: 1,
+      stdout: '',
+      stderr:
+        'pg_restore: error: connection to server failed: Connection refused\nCommand was: REFRESH',
+    };
+    const postgres = harness((argv) => (argv[0] === 'pg_restore' ? partial : ok()));
+    expect(await runAgent(request({ kind: 'restore-postgres' }), postgres.io)).toBe(1);
+    expect(postgres.calls.filter((call) => call.argv[0] === 'pg_restore')).toHaveLength(1);
+    const redis = harness((argv) =>
+      argv[0] === 'rdb'
+        ? { code: 0, stdout: 'RESP', stderr: '' }
+        : argv.includes('--pipe')
+          ? { code: 1, stdout: 'Could not connect to Redis', stderr: '' }
+          : ok(),
+    );
+    expect(await runAgent(request({ kind: 'restore-redis', port: '6379' }), redis.io)).toBe(1);
+    expect(redis.calls.filter((call) => call.argv.includes('--pipe'))).toHaveLength(1);
+    const nats = harness((argv) =>
+      argv.includes('restore') ? { code: 1, stdout: '', stderr: 'could not connect' } : ok(),
+    );
+    expect(await runAgent(request({ kind: 'restore-nats', port: '4222' }), nats.io)).toBe(1);
+    expect(nats.calls.filter((call) => call.argv.includes('restore'))).toHaveLength(1);
   });
 
   test('postgres reports a dump failure and a missing target', async () => {

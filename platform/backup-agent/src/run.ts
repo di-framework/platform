@@ -331,6 +331,14 @@ async function execConnected(
   return result;
 }
 
+/**
+ * Restores are not idempotent (a rerun appends again), so they never go through `execConnected`:
+ * a read-only probe waits for the connection, then the restore runs exactly once.
+ */
+async function probeConnected(io: AgentIo, argv: string[]): Promise<boolean> {
+  return (await execConnected(io, argv)).code === 0;
+}
+
 async function dumpPostgres(io: AgentIo, request: AgentRequest): Promise<number> {
   const file = `${request.workdir}/data.dump`;
   const result = await execConnected(io, [
@@ -525,7 +533,21 @@ async function restorePostgres(io: AgentIo, request: AgentRequest): Promise<numb
   const file = `${request.workdir}/data.dump`;
   const failed = await download(io, request, 'data.dump', file);
   if (failed !== undefined) return failed;
-  const result = await execConnected(io, [
+  const reachable = await probeConnected(io, [
+    'psql',
+    '-h',
+    request.host,
+    '-p',
+    request.port,
+    '-U',
+    request.pgUser,
+    '-d',
+    request.pgDatabase,
+    '-c',
+    'SELECT 1',
+  ]);
+  if (!reachable) return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  const result = await io.exec([
     'pg_restore',
     '-h',
     request.host,
@@ -554,11 +576,18 @@ async function restoreRedis(io: AgentIo, request: AgentRequest): Promise<number>
     return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
   await io.writeFile(resp, converted.stdout);
   await io.remove(rdb);
-  const loaded = await execConnected(
-    io,
-    ['redis-cli', '-h', request.host, '-p', request.port, '--pipe'],
-    { input: converted.stdout },
-  );
+  const reachable = await probeConnected(io, [
+    'redis-cli',
+    '-h',
+    request.host,
+    '-p',
+    request.port,
+    'PING',
+  ]);
+  if (!reachable) return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  const loaded = await io.exec(['redis-cli', '-h', request.host, '-p', request.port, '--pipe'], {
+    input: converted.stdout,
+  });
   if (loaded.code !== 0)
     return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
   return finish(io, request.terminationLog, { ok: true, tool: 'redis-cli', format: 'resp' });
@@ -572,10 +601,13 @@ async function restoreNats(io: AgentIo, request: AgentRequest): Promise<number> 
   if (extracted.code !== 0)
     return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
   await io.remove(archive);
-  const restored = await execConnected(io, [
+  const server = `${request.host}:${request.port}`;
+  const reachable = await probeConnected(io, ['nats', '--server', server, 'account', 'info']);
+  if (!reachable) return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  const restored = await io.exec([
     'nats',
     '--server',
-    `${request.host}:${request.port}`,
+    server,
     'account',
     'restore',
     `${request.workdir}/js-backup`,
