@@ -172,6 +172,30 @@ describe('api keys across the move to di-apikeys-<tenant> (#379)', () => {
     };
   }
 
+  // The platform moves keys only under tenant-auth builds the pin bot lists as reading
+  // di-apikeys-<tenant> (API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS), and it lists every build it pins.
+  // This holds every such build to that contract, so a revert of keys.ts fails here first.
+  test('the contract the platform allowlist relies on: create in, and read first from, apiKeysNamespace', async () => {
+    const { kube, store, legacyKey } = setup();
+    expect(store.namespace).toBe(apiKeysNamespace('acme'));
+    expect(apiKeysNamespace('acme')).toBe(KEYS);
+    const reads: string[] = [];
+    const get = kube.getSecret.bind(kube);
+    kube.getSecret = async (namespace: string, name: string) => {
+      reads.push(namespace);
+      return get(namespace, name);
+    };
+    const created = await createApiKey(store, 'alice', 'ci', 3600);
+    expect([...kube.secrets.keys()]).toEqual([`${KEYS}/di-apikey-${created.id}`]);
+    const old = await legacyKey();
+    reads.length = 0;
+    expect((await resolveApiKey(store, created.secret)).id).toBe(created.id);
+    expect(reads[0]).toBe(KEYS);
+    reads.length = 0;
+    expect((await resolveApiKey(store, old.secret)).id).toBe(old.id);
+    expect(reads.slice(0, 2)).toEqual([KEYS, RUNTIME]);
+  });
+
   test('creates new keys in the API-key namespace only', async () => {
     const { kube, store } = setup();
     const issued = await createApiKey(store, 'alice', 'ci', 3600);
