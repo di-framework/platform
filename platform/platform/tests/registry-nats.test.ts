@@ -25,6 +25,8 @@ import {
   NATS_CREDENTIALS_HOST_IMAGE_DIGESTS,
   newRegistryNatsPassword,
   REGISTRY_NATS_AUTH_ANNOTATION,
+  REGISTRY_NATS_CONNECT_MAX_DELAY_SECONDS,
+  REGISTRY_NATS_CONNECT_WAIT_SECONDS,
   REGISTRY_NATS_MIGRATION,
   REGISTRY_NATS_MIGRATION_COMPONENT,
   REGISTRY_NATS_MIGRATION_DEADLINE_SECONDS,
@@ -370,6 +372,22 @@ describe('registry NATS account rendering (#159)', () => {
     expect(job.spec.activeDeadlineSeconds).toBe(REGISTRY_NATS_MIGRATION_DEADLINE_SECONDS);
     expect(job.metadata.namespace).toBe('di-runtime-alpha');
     expect(job.spec.backoffLimit).toBeGreaterThan(0);
+    // Every pod the Job may start can spend its whole first-connection wait (#388), plus the
+    // Job controller's pod backoff (10 s doubling, capped at 6 min), well inside the deadline.
+    const podBackoff = Array.from({ length: job.spec.backoffLimit }, (_, i) =>
+      Math.min(10 * 2 ** i, 360),
+    ).reduce((sum, delay) => sum + delay, 0);
+    // Each of a pod's 13 attempts may also wait out nats.go's 2 s dial timeout when an engine
+    // drops packets instead of refusing them.
+    const attempts = 13;
+    const dialTimeout = 2;
+    const wait =
+      REGISTRY_NATS_CONNECT_WAIT_SECONDS +
+      REGISTRY_NATS_CONNECT_MAX_DELAY_SECONDS +
+      attempts * dialTimeout;
+    expect((job.spec.backoffLimit + 1) * wait + podBackoff).toBeLessThan(
+      REGISTRY_NATS_MIGRATION_DEADLINE_SECONDS,
+    );
     expect(job.spec.ttlSecondsAfterFinished).toBe(86400);
     const pod = job.spec.template;
     expect(pod.metadata.labels).toEqual({

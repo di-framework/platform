@@ -74,6 +74,16 @@ export const REGISTRY_NATS_MIGRATION_LIMITS = { cpu: '250m', memory: '128Mi' } a
  * (`DeadlineExceeded`): also bounds a pod the quota or the scheduler never admits.
  */
 export const REGISTRY_NATS_MIGRATION_DEADLINE_SECONDS = 3600;
+/**
+ * How long, in seconds of backoff between attempts, the migration script waits for its first
+ * connection to `di-nats` before it gives up (#388). A network policy engine admits a new pod's
+ * traffic only once it has programmed the pod (about a second under kube-router), so the first
+ * attempts of a fresh pod are refused. The delays double from 1 s up to
+ * {@link REGISTRY_NATS_CONNECT_MAX_DELAY_SECONDS}.
+ */
+export const REGISTRY_NATS_CONNECT_WAIT_SECONDS = 90;
+/** The longest delay between two connection attempts of the migration script. */
+export const REGISTRY_NATS_CONNECT_MAX_DELAY_SECONDS = 10;
 /** The registry's blobstore container (`CONTAINER_NAME` in `platform/oci-registry/src/storage.rs`). */
 export const REGISTRY_BUCKET = 'oci-registry';
 
@@ -180,6 +190,9 @@ fi
  * store `OBJ_oci-registry` from {@link NATS_TENANT_ACCOUNT} (anonymous) to
  * {@link NATS_REGISTRY_ACCOUNT} (`REGISTRY_USER` / `REGISTRY_PASSWORD`):
  *
+ * 0. Waits for its first login as the registry user to succeed: it retries with backoff for up
+ *    to {@link REGISTRY_NATS_CONNECT_WAIT_SECONDS} seconds, logging each failed attempt, then
+ *    fails (#388). It only reads the account, so the wait changes nothing.
  * 1. Refuses to run unless the anonymous login is in `TENANT` and the registry login in
  *    `REGISTRY`, so the source can never be the destination.
  * 2. Exits at once when the marker key `registry-object-store` in the `di-platform-migrations`
@@ -215,6 +228,27 @@ objects() {
       jq -r '.data | @base64d | fromjson | select(.deleted != true) | [.name, (.size | tostring), .digest] | @tsv'
   done < "$work/subjects" | sort
 }
+
+# A new pod's traffic to di-nats is refused until the network policy engine has programmed the
+# pod (about a second under kube-router), so wait for the first registry login (#388). Only a
+# failure to reach di-nats is retried; anything else (such as a rejected login) fails at once.
+waited=0
+delay=1
+attempt=1
+until dst account info >/dev/null 2>"$work/connect"; do
+  reason="$(tail -n 1 "$work/connect")"
+  grep -qiE 'no servers available|connection refused|i/o timeout|timed out' "$work/connect" ||
+    fail "the registry login failed: $reason"
+  [ "$waited" -lt ${REGISTRY_NATS_CONNECT_WAIT_SECONDS} ] ||
+    fail "could not connect to di-nats as the registry user in $attempt attempts over \${waited}s: $reason"
+  echo "registry migration: connecting to di-nats, attempt $attempt failed ($reason); retrying in \${delay}s" >&2
+  sleep "$delay"
+  waited=$((waited + delay))
+  attempt=$((attempt + 1))
+  delay=$((delay * 2))
+  [ "$delay" -le ${REGISTRY_NATS_CONNECT_MAX_DELAY_SECONDS} ] || delay=${REGISTRY_NATS_CONNECT_MAX_DELAY_SECONDS}
+done
+[ "$attempt" -eq 1 ] || echo "registry migration: connected to di-nats on attempt $attempt"
 
 [ "$(account src)" = ${NATS_TENANT_ACCOUNT} ] || fail "the anonymous login is not in the ${NATS_TENANT_ACCOUNT} account"
 [ "$(account dst)" = ${NATS_REGISTRY_ACCOUNT} ] || fail "the registry login is not in the ${NATS_REGISTRY_ACCOUNT} account"

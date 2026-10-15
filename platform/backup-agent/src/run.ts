@@ -307,20 +307,36 @@ function requireTarget(request: AgentRequest): string | undefined {
   return undefined;
 }
 
+// `no servers available` is how the nats CLI reports a connection it could not open (#388).
 const CONNECT_FAILURE =
-  /could not connect|connection refused|timeout expired|name or service not known|temporary failure in name resolution|i\/o timeout/i;
+  /could not connect|connection refused|timeout expired|name or service not known|temporary failure in name resolution|i\/o timeout|no servers available/i;
 const CONNECT_ATTEMPTS = 8;
 
-/** kube-router programs a new pod into the source ipset after the container starts. */
-async function execConnected(io: AgentIo, argv: string[]): Promise<ExecResult> {
+/**
+ * kube-router programs a new pod into the source ipset after the container starts, so a Job's
+ * first connection to a backing service can be refused. Only failures to connect are retried.
+ */
+async function execConnected(
+  io: AgentIo,
+  argv: string[],
+  opts?: { input?: string },
+): Promise<ExecResult> {
   let result: ExecResult = { code: 1, stdout: '', stderr: '' };
   for (let attempt = 1; attempt <= CONNECT_ATTEMPTS; attempt++) {
-    result = await io.exec(argv);
+    result = await io.exec(argv, opts);
     if (result.code === 0 || !CONNECT_FAILURE.test(`${result.stderr}\n${result.stdout}`))
       return result;
     if (attempt < CONNECT_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, 1000));
   }
   return result;
+}
+
+/**
+ * Restores are not idempotent (a rerun appends again), so they never go through `execConnected`:
+ * a read-only probe waits for the connection, then the restore runs exactly once.
+ */
+async function probeConnected(io: AgentIo, argv: string[]): Promise<boolean> {
+  return (await execConnected(io, argv)).code === 0;
 }
 
 async function dumpPostgres(io: AgentIo, request: AgentRequest): Promise<number> {
@@ -422,7 +438,7 @@ async function probe(io: AgentIo, request: AgentRequest): Promise<number> {
   }
   let result: ExecResult;
   if (request.port === '5432') {
-    result = await io.exec([
+    result = await execConnected(io, [
       'psql',
       '-h',
       request.host,
@@ -436,9 +452,16 @@ async function probe(io: AgentIo, request: AgentRequest): Promise<number> {
       "SELECT count(*) FROM pg_tables WHERE schemaname='public'",
     ]);
   } else if (request.port === '6379') {
-    result = await io.exec(['redis-cli', '-h', request.host, '-p', request.port, 'DBSIZE']);
+    result = await execConnected(io, [
+      'redis-cli',
+      '-h',
+      request.host,
+      '-p',
+      request.port,
+      'DBSIZE',
+    ]);
   } else if (request.port === '4222') {
-    result = await io.exec([
+    result = await execConnected(io, [
       'nats',
       '--server',
       `${request.host}:${request.port}`,
@@ -510,6 +533,20 @@ async function restorePostgres(io: AgentIo, request: AgentRequest): Promise<numb
   const file = `${request.workdir}/data.dump`;
   const failed = await download(io, request, 'data.dump', file);
   if (failed !== undefined) return failed;
+  const reachable = await probeConnected(io, [
+    'psql',
+    '-h',
+    request.host,
+    '-p',
+    request.port,
+    '-U',
+    request.pgUser,
+    '-d',
+    request.pgDatabase,
+    '-c',
+    'SELECT 1',
+  ]);
+  if (!reachable) return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
   const result = await io.exec([
     'pg_restore',
     '-h',
@@ -539,6 +576,15 @@ async function restoreRedis(io: AgentIo, request: AgentRequest): Promise<number>
     return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
   await io.writeFile(resp, converted.stdout);
   await io.remove(rdb);
+  const reachable = await probeConnected(io, [
+    'redis-cli',
+    '-h',
+    request.host,
+    '-p',
+    request.port,
+    'PING',
+  ]);
+  if (!reachable) return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
   const loaded = await io.exec(['redis-cli', '-h', request.host, '-p', request.port, '--pipe'], {
     input: converted.stdout,
   });
@@ -555,10 +601,13 @@ async function restoreNats(io: AgentIo, request: AgentRequest): Promise<number> 
   if (extracted.code !== 0)
     return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
   await io.remove(archive);
+  const server = `${request.host}:${request.port}`;
+  const reachable = await probeConnected(io, ['nats', '--server', server, 'account', 'info']);
+  if (!reachable) return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
   const restored = await io.exec([
     'nats',
     '--server',
-    `${request.host}:${request.port}`,
+    server,
     'account',
     'restore',
     `${request.workdir}/js-backup`,
