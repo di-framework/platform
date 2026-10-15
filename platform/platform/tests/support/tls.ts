@@ -1,8 +1,15 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { X509Certificate } from 'node:crypto';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { caPermittedDns, certificateNames } from '../../src/tenancy/tls';
+
+/**
+ * The OpenSSL binary the tests run, by absolute path rather than through `PATH`: OpenSSL 3 on the
+ * CI runners (Ubuntu), LibreSSL on macOS. Both apply X.509 name constraints.
+ */
+export const OPENSSL = '/usr/bin/openssl';
 
 /** Generates a throwaway self-signed certificate for a fake Kubernetes API server. */
 export function selfSignedCert(): { key: string; cert: string; keyPath: string; certPath: string } {
@@ -10,7 +17,7 @@ export function selfSignedCert(): { key: string; cert: string; keyPath: string; 
   const keyPath = join(dir, 'key.pem');
   const certPath = join(dir, 'cert.pem');
   execFileSync(
-    '/usr/bin/openssl',
+    OPENSSL,
     [
       'req',
       '-x509',
@@ -36,6 +43,53 @@ export function selfSignedCert(): { key: string; cert: string; keyPath: string; 
 const SERVER_AUTH = '1.3.6.1.5.5.7.3.1';
 const PEM_CERTIFICATE = /-----BEGIN CERTIFICATE-----[^-]+-----END CERTIFICATE-----/g;
 
+/**
+ * True when every DNS name `leaf` (PEM) carries lies within the permitted DNS subtrees of
+ * `anchor`'s name constraints, or `anchor` has none (#365). `node:crypto` does not apply name
+ * constraints (`X509Certificate.verify` checks only the signature, `checkIssued` only the issuer
+ * link), so the helper checks them itself, matching names on its own rather than with the
+ * production matcher; {@link opensslVerifies} checks the same paths with OpenSSL.
+ */
+export function withinNameConstraints(leaf: string, anchor: string): boolean {
+  const permitted = caPermittedDns(anchor)?.map((base) => base.toLowerCase());
+  const under = (dns: string, base: string) => dns === base || dns.endsWith(`.${base}`);
+  return (
+    !permitted ||
+    (certificateNames(leaf)?.dns ?? []).every((dns) =>
+      permitted.some((base) => under(dns.toLowerCase(), base)),
+    )
+  );
+}
+
+/**
+ * True when `openssl verify` accepts `leaf` (PEM) as a TLS server certificate, strictly
+ * (`-x509_strict`), against the PEM trust bundle `bundle` at time `at`. OpenSSL applies name
+ * constraints itself, so this is an oracle independent of this repository's X.509 code. LibreSSL
+ * has no `-verify_hostname`; {@link verifiesAt} checks the host name.
+ */
+export function opensslVerifies(leaf: string, bundle: string, at: Date): boolean {
+  const dir = mkdtempSync(join(tmpdir(), 'ca-verify-'));
+  try {
+    writeFileSync(join(dir, 'leaf.pem'), leaf);
+    writeFileSync(join(dir, 'bundle.pem'), bundle);
+    const result = spawnSync(OPENSSL, [
+      'verify',
+      '-x509_strict',
+      '-purpose',
+      'sslserver',
+      '-attime',
+      String(Math.floor(at.getTime() / 1000)),
+      '-CAfile',
+      join(dir, 'bundle.pem'),
+      join(dir, 'leaf.pem'),
+    ]);
+    if (result.error) throw result.error;
+    return result.status === 0;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 /** True when `cert` is within its validity period at `at`. */
 const validAt = (cert: X509Certificate, at: Date) =>
   new Date(cert.validFrom).getTime() <= at.getTime() &&
@@ -47,7 +101,9 @@ const validAt = (cert: X509Certificate, at: Date) =>
  *
  * - the leaf is an end entity, valid at `at`, for server authentication, and names `localhost`;
  * - some bundle certificate is a self-signed CA, valid at `at`, that issued the leaf (subject,
- *   key identifiers and key usage, per `checkIssued`) and whose key verifies the leaf's signature.
+ *   key identifiers and key usage, per `checkIssued`), whose key verifies the leaf's signature
+ *   and whose name constraints permit every DNS name of the leaf ({@link withinNameConstraints},
+ *   checked here because `node:crypto` does not).
  *
  * Any certificate in `bundle` that does not parse throws, so a broken bundle fails the test.
  */
@@ -67,7 +123,8 @@ export function verifiesAt(leaf: string, bundle: string, at: Date): boolean {
         anchor.checkIssued(anchor) &&
         anchor.verify(anchor.publicKey) &&
         certificate.checkIssued(anchor) &&
-        certificate.verify(anchor.publicKey),
+        certificate.verify(anchor.publicKey) &&
+        withinNameConstraints(leaf, anchor.toString()),
     )
   );
 }

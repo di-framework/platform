@@ -15,7 +15,7 @@ import {
   resolveClass,
   tenantNameFromNamespace,
 } from './backing-service-reconcile';
-import { LEAF_RENEW_DAYS, rotateCas } from './ca-rotation';
+import { LEAF_RENEW_DAYS, leafNames, rotateCas } from './ca-rotation';
 import {
   approveEgress,
   EGRESS_FIELD_MANAGER,
@@ -620,7 +620,8 @@ export class Controller {
    * `tenant-controller-tls` reissues only the leaf. {@link rotateCas} decides which CAs to keep and
    * overlaps them during a rotation. The leaf is reused while it verifies against the current CA,
    * has {@link LEAF_RENEW_DAYS} left and names what it should, so a leaf renewal keeps the CA and
-   * does not roll the hosts or invalidate kubeconfigs.
+   * does not roll the hosts or invalidate kubeconfigs. The CAs permit only the leaf's names (#365),
+   * so a change of names is a rotation too.
    *
    * Until the platform-namespace Secret exists, the CA is taken from where it was kept before:
    * `ca.crt` in `tenant-controller-tls` and `ca.key` in the runtime namespace's
@@ -686,18 +687,26 @@ export class Controller {
         ? fromCaSecret
         : { current: legacy };
     const now = this.now();
-    const cas = rotateCas(stored, `tenant-controller CA (${runtimeNamespace})`, now);
+    const wanted = tenantControllerCertNames(name, auth);
+    const cas = rotateCas(
+      stored,
+      { commonName: `tenant-controller CA (${runtimeNamespace})`, dnsNames: wanted.dns },
+      now,
+    );
     const ca = {
       caCert: cas.current.cert,
       caKey: cas.current.key,
       ...(cas.next ? { caNext: cas.next } : {}),
       ...(cas.previous ? { caPrevious: cas.previous } : {}),
     };
-    const certNames = tenantControllerCertNames(name, auth);
+    // While a successor is published the leaf keeps the names it serves, so no host goes dark
+    // before the switch; names the signing CA does not permit wait for the switch (#365).
+    const served = issuedBy(ca.caCert, cert, key) ? certificateNames(cert) : undefined;
+    const certNames = leafNames(cas, wanted, served);
     if (
+      served &&
       certificateValid(cert, LEAF_RENEW_DAYS, now) &&
-      JSON.stringify(certificateNames(cert)) === JSON.stringify(certNames) &&
-      issuedBy(ca.caCert, cert, key)
+      JSON.stringify(served) === JSON.stringify(certNames)
     )
       return { cert, key, ...ca };
     const leaf = leafCertificate(

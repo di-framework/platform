@@ -46,6 +46,7 @@ import {
 } from '../src/tenancy/resources';
 import {
   caCertificate,
+  caPermittedDns,
   certificateNames,
   certificateValid,
   holdsCaKey,
@@ -54,7 +55,7 @@ import {
   selfSignedCertificate,
   serialNumber,
 } from '../src/tenancy/tls';
-import { verifiesAt as verifies } from './support/tls';
+import { verifiesAt as verifies, withinNameConstraints } from './support/tls';
 
 const IMAGE = `ghcr.io/di-framework/tenant-auth@sha256:${'a'.repeat(64)}`;
 const auth: TenantAuthConfig = {
@@ -1253,12 +1254,16 @@ describe('reconcileTenant with tenant-auth', () => {
     must(api, caMapPath).data = { 'ca.crt': older.cert };
     seedLegacyCaKey(api, { ...tls.metadata.labels }, encode(older.key));
     const before = structuredClone(tls.data);
-    // Upgrading again keeps what every host, console and kubeconfig trusts now: no roll at all.
+    // Upgrading again keeps what every host, console and kubeconfig trusts now and the leaf it
+    // signed. That CA has no name constraints, so a constrained successor is published beside it
+    // (#365) and switched to after the overlap.
     await controller.reconcileTenant(t, []);
     expect(api.objects.get(tlsPath)?.data).toEqual(before);
-    expect(api.objects.get(caMapPath)?.data).toEqual({ 'ca.crt': older.cert });
     const keys = api.objects.get(caKeyPath)?.data as Record<string, string>;
-    expect(Object.keys(keys).sort()).toEqual(['ca.crt', 'ca.key']);
+    expect(Object.keys(keys).sort()).toEqual(['ca.crt', 'ca.key', 'next.crt', 'next.key']);
+    const successor = decode(keys, 'next.crt');
+    expect(caPermittedDns(successor)).toEqual(names.dns);
+    expect(api.objects.get(caMapPath)?.data).toEqual({ 'ca.crt': older.cert + successor });
     expect(decode(keys, 'ca.crt')).toBe(older.cert);
     expect(decode(keys, 'ca.crt')).not.toBe(stale);
     expect(holdsCaKey(older.cert, decode(keys, 'ca.key'))).toBe(true);
@@ -1370,12 +1375,15 @@ describe('reconcileTenant with tenant-auth', () => {
     expect(revoked).not.toContain(a);
   });
 
-  it('rotates the CA near expiry so every party verifies throughout (#170 S4, S8)', async () => {
+  /**
+   * The tenant controller run on one clock, one controller per config, and what each pass leaves
+   * behind for the CA rotation tests (#170, #365).
+   */
+  const rotationHarness = () => {
     const { api, t } = prepare();
-    const DAY = 86_400_000;
     const t0 = new Date('2026-10-14T00:00:00Z').getTime();
     let clock = new Date(t0);
-    const controller = new Controller(api, cfg, undefined, () => clock);
+    const controllers = new Map<ControllerConfig, Controller>();
     const snapshot = () => {
       const tls = api.objects.get(tlsPath)?.data as Record<string, string>;
       const consoleDeployment = api.objects.get(
@@ -1392,15 +1400,18 @@ describe('reconcileTenant with tenant-auth', () => {
       };
     };
     type State = ReturnType<typeof snapshot>;
-    const pass = async (at: number): Promise<State> => {
-      clock = new Date(at);
+    /** One reconcile pass `days` after t0 under `config`. */
+    const pass = async (days: number, config = cfg): Promise<State> => {
+      clock = new Date(t0 + days * 86_400_000);
+      const controller =
+        controllers.get(config) ?? new Controller(api, config, undefined, () => clock);
+      controllers.set(config, controller);
       await controller.reconcileTenant(t, []);
       const state = snapshot();
       // The console reloads (and copies into the kubeconfigs it issues) what the hosts trust.
       expect(state.consoleBundle).toBe(tlsCertDigest(state.bundle));
       return state;
     };
-    const caCount = (bundle: string) => bundle.match(/BEGIN CERTIFICATE/g)?.length;
     /**
      * A rollout is never atomic: until it finishes, an old or new controller pod (leaf) meets an
      * old or new host or kubeconfig (bundle). Every pairing must pass the X.509 path check then.
@@ -1410,15 +1421,20 @@ describe('reconcileTenant with tenant-auth', () => {
         for (const bundle of [from.bundle, to.bundle])
           expect(verifies(leaf, bundle, clock)).toBe(true);
     };
-    await pass(t0);
-    const a = decode(snapshot().keys, 'ca.crt');
+    return { api, pass, overlaps, at: () => clock };
+  };
+  const caCount = (bundle: string) => bundle.match(/BEGIN CERTIFICATE/g)?.length;
+
+  it('rotates the CA near expiry so every party verifies throughout (#170 S4, S8)', async () => {
+    const { pass, overlaps, at } = rotationHarness();
+    const a = decode((await pass(0)).keys, 'ca.crt');
     // A yearly leaf renewal shortly before the rotation window keeps CA A.
-    const steady = await pass(t0 + (CA_DAYS - CA_RENEW_DAYS - 10) * DAY);
+    const steady = await pass(CA_DAYS - CA_RENEW_DAYS - 10);
     expect(steady.bundle).toBe(a);
     expect(steady.keys['next.crt']).toBeUndefined();
 
     // 1. Publish: B joins the bundle (the hosts roll on its digest); the leaf stays A's.
-    const published = await pass(t0 + (CA_DAYS - CA_RENEW_DAYS + 1) * DAY);
+    const published = await pass(CA_DAYS - CA_RENEW_DAYS + 1);
     expect(published.leaf).toBe(steady.leaf);
     expect(caCount(published.bundle)).toBe(2);
     expect(published.bundle.startsWith(a)).toBe(true);
@@ -1427,11 +1443,11 @@ describe('reconcileTenant with tenant-auth', () => {
     expect(holdsCaKey(b, decode(published.keys, 'next.key'))).toBe(true);
     overlaps(steady, published);
     // Nothing changes while the overlap lasts.
-    const waiting = await pass(t0 + (CA_DAYS - CA_RENEW_DAYS + CA_OVERLAP_DAYS) * DAY);
+    const waiting = await pass(CA_DAYS - CA_RENEW_DAYS + CA_OVERLAP_DAYS);
     expect(waiting).toEqual(published);
 
     // 2. Switch: B signs a new leaf; the bundle bytes are unchanged, so the hosts do not roll.
-    const switched = await pass(t0 + (CA_DAYS - CA_RENEW_DAYS + CA_OVERLAP_DAYS + 2) * DAY);
+    const switched = await pass(CA_DAYS - CA_RENEW_DAYS + CA_OVERLAP_DAYS + 2);
     expect(switched.bundle).toBe(published.bundle);
     expect(switched.leaf).not.toBe(published.leaf);
     expect(decode(switched.keys, 'ca.crt')).toBe(b);
@@ -1442,14 +1458,14 @@ describe('reconcileTenant with tenant-auth', () => {
     overlaps(published, switched);
 
     // 3. Retire: A leaves the bundle once it has expired; no leaf it signed outlives it.
-    const kept = await pass(t0 + (CA_DAYS - 1) * DAY);
+    const kept = await pass(CA_DAYS - 1);
     expect(kept).toEqual(switched);
-    const retired = await pass(t0 + (CA_DAYS + 1) * DAY);
+    const retired = await pass(CA_DAYS + 1);
     expect(retired.leaf).toBe(switched.leaf);
     expect(retired.bundle).toBe(b);
     expect(retired.keys['previous.crt']).toBeUndefined();
     overlaps(switched, retired);
-    expect(verifies(published.leaf, retired.bundle, clock)).toBe(false);
+    expect(verifies(published.leaf, retired.bundle, at())).toBe(false);
   });
 
   it('waits for the OAuth Secret, defaults the API port, and revokes the ClusterRoleBinding on suspend', async () => {
@@ -1578,29 +1594,80 @@ describe('reconcileTenant with tenant-auth', () => {
     expect(auth()).toMatchObject({ status: 'True', reason: 'Reconciled' });
   });
 
-  it('reissues the certificate when the public controller host changes', async () => {
-    const { api, t } = prepare();
-    await new Controller(api, cfg).reconcileTenant(t, []);
-    const tlsPath = path('Secret', 'di-runtime-alpha', 'tenant-controller-tls');
-    const first = (api.objects.get(tlsPath)!.data as Record<string, string>)['tls.crt'];
-    const moved = new Controller(api, {
+  it('rotates the CA through the overlap when the public controller host changes (#365)', async () => {
+    const { api, pass, overlaps } = rotationHarness();
+    const oldAuth = { ...auth, controllerPublicUrl: 'https://old.{tenant}.example.com' };
+    const old: ControllerConfig = { ...cfg, tenantAuth: oldAuth };
+    const moved: ControllerConfig = {
       ...cfg,
       tenantAuth: { ...auth, controllerPublicUrl: 'https://controller.{tenant}.example.com' },
-    });
-    await moved.reconcileTenant(t, []);
-    const second = (api.objects.get(tlsPath)!.data as Record<string, string>)['tls.crt']!;
-    expect(second).not.toBe(first);
-    expect(new X509Certificate(Buffer.from(second, 'base64').toString()).subjectAltName).toContain(
-      'DNS:controller.alpha.example.com',
-    );
-    const deployment = api.objects.get(
-      path('Deployment', 'di-runtime-alpha', 'tenant-console'),
-    ) as Deployment;
+    };
+    const host = 'DNS:controller.alpha.example.com';
+    const oldHost = 'DNS:old.alpha.example.com';
+    const sans = (leaf: string) => new X509Certificate(leaf).subjectAltName;
+    const before = await pass(0, old);
+    const a = decode(before.keys, 'ca.crt');
+    expect(caPermittedDns(a)).toEqual(tenantControllerCertNames('alpha', oldAuth).dns);
+    expect(sans(before.leaf)).toContain(oldHost);
+    // Publish: B permits the new host and A does not, so A's leaf, for the old host, is served
+    // until the switch: kubeconfigs that name the old host keep working, none goes dark.
+    const published = await pass(100, moved);
+    expect(published.leaf).toBe(before.leaf);
+    expect(sans(published.leaf)).toContain(oldHost);
+    expect(sans(published.leaf)).not.toContain(host);
+    const b = decode(published.keys, 'next.crt');
+    expect(published.bundle).toBe(a + b);
+    expect(caPermittedDns(b)).toContain('controller.alpha.example.com');
+    overlaps(before, published);
+    expect(await pass(100 + CA_OVERLAP_DAYS - 1, moved)).toEqual(published);
+    // B signs a leaf naming the new host; the bundle bytes stay and A is kept.
+    const switched = await pass(100 + CA_OVERLAP_DAYS + 1, moved);
+    expect(switched.bundle).toBe(published.bundle);
+    expect(issuedBy(b, switched.leaf, switched.leafKey)).toBe(true);
+    // Switch: the new host is served from here on and the old one is dropped.
+    expect(sans(switched.leaf)).toContain(host);
+    expect(sans(switched.leaf)).not.toContain(oldHost);
+    expect(withinNameConstraints(switched.leaf, a)).toBe(false);
+    const consoleDeployment = must(api, path('Deployment', 'di-runtime-alpha', 'tenant-console'));
     expect(
-      deployment.spec.template.metadata.annotations['platform.di-framework.dev/tls-cert-sha256'],
-    ).toBe(tlsCertDigest(Buffer.from(second, 'base64').toString()));
-    await moved.reconcileTenant(t, []);
-    expect((api.objects.get(tlsPath)!.data as Record<string, string>)['tls.crt']).toBe(second);
+      (consoleDeployment as Deployment).spec.template.metadata.annotations[
+        'platform.di-framework.dev/tls-cert-sha256'
+      ],
+    ).toBe(tlsCertDigest(switched.leaf));
+    overlaps(published, switched);
+    // Retire: A leaves the bundle once B is twice the overlap old.
+    expect(await pass(100 + 2 * CA_OVERLAP_DAYS - 1, moved)).toEqual(switched);
+    const retired = await pass(100 + 2 * CA_OVERLAP_DAYS + 1, moved);
+    expect(retired.bundle).toBe(b);
+    expect(retired.leaf).toBe(switched.leaf);
+    overlaps(switched, retired);
+  });
+
+  it('publishes a successor instead of replacing the CA when routeUrlPattern is set (#365)', async () => {
+    const { pass, overlaps } = rotationHarness();
+    const routed: ControllerConfig = {
+      ...cfg,
+      routeUrlPattern: 'http://{host}.{tenant}.localhost:28180',
+      tenantAuth: withDerivedPublicUrls(auth, 'http://{host}.{tenant}.localhost:28180'),
+    };
+    const before = await pass(0);
+    const a = decode(before.keys, 'ca.crt');
+    const published = await pass(1, routed);
+    expect(decode(published.keys, 'ca.crt')).toBe(a);
+    expect(caPermittedDns(decode(published.keys, 'next.crt'))).toContain(
+      'controller.alpha.localhost',
+    );
+    // The derived host lies below A's permitted `localhost`, so A serves it during the overlap.
+    expect(new X509Certificate(published.leaf).subjectAltName).toContain(
+      'DNS:controller.alpha.localhost',
+    );
+    expect(issuedBy(a, published.leaf, published.leafKey)).toBe(true);
+    overlaps(before, published);
+    const switched = await pass(2 + CA_OVERLAP_DAYS, routed);
+    expect(issuedBy(decode(published.keys, 'next.crt'), switched.leaf, switched.leafKey)).toBe(
+      true,
+    );
+    overlaps(published, switched);
   });
 
   const tenantAuthObjects = (api: MemoryApi) =>
