@@ -455,17 +455,20 @@ move only while `tenantAuth.image` is a build listed in `API_KEY_NAMESPACE_TENAN
 (`src/tenant-auth-images.ts`). The tenant-auth pin PR adds each published build to that list, so
 the digest documented here is always on it.
 
-With any other image (an older digest, an unknown digest, a tag), no key moves, but key management
-breaks. RBAC and admission are narrowed whatever image runs, and a tenant-auth from before #379
-writes keys only in the runtime namespace. Until `tenantAuth.image` is a listed build:
+With any other image (an older digest, an unknown digest, a tag), no key moves. RBAC and admission
+are narrowed whatever image runs, so until `tenantAuth.image` is a listed build:
 
 - **Existing keys keep authenticating.** They stay in `di-runtime-<tenant>`, and the tenant
   controller keeps its read-only Secret rule there.
-- **Creating and revoking keys fail for every tenant.** The runtime Role has no `create` or
-  `delete`, and admission admits key writes only in `di-apikeys-<tenant>`.
-- **Listing keys fails for tenants with no old keys,** such as new tenants or tenants that never
-  made one. Their move is done at once, so their runtime Role has no Secret rule, and the old image
-  does not handle the `403`.
+- **With a tenant-auth from before #379, creating and revoking keys fail for every tenant.** That
+  image writes keys only in the runtime namespace, where the Role has no `create` or `delete` and
+  admission admits no key write; it admits them only in `di-apikeys-<tenant>`.
+- **With a tenant-auth from before #379, listing keys fails for tenants with no old keys,** such as
+  new tenants or tenants that never made one. Their move is done at once, so their runtime Role has
+  no Secret rule, and that image does not handle the `403`.
+
+A build from #379 on that is not listed yet (an unknown or tag-only reference) still creates, lists
+and revokes keys in `di-apikeys-<tenant>`; only the old keys stay where they are.
 
 `pulumi up` flags this with the warning `tenantAuth.image … is not a known tenant-auth build that
 reads di-apikeys-<tenant> (#379)`, and `TenantAuthReady` reports `ApiKeyMigrationWaiting`. The fix
