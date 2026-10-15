@@ -147,12 +147,19 @@ describe('registry migration script: first connection (#388)', () => {
     expect(`${result.stdout}${result.stderr}`).not.toContain(PASSWORD);
   });
 
-  it.skipIf(!busybox)('retries and then proceeds under busybox sh', () => {
-    const result = run(3, undefined, undefined, ['busybox', 'sh', '-c']);
-    expect(result.status).toBe(0);
-    expect(result.sleeps).toEqual([1, 2, 4]);
-    expect(result.stdout).toContain('already complete');
-  });
+  // busybox sh runs `sleep` as a built-in applet and ignores the stub, so one refusal keeps the
+  // real wait to a second.
+  it.skipIf(!busybox)(
+    'retries and then proceeds under busybox sh',
+    () => {
+      const result = run(1, undefined, undefined, ['busybox', 'sh', '-c']);
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain('attempt 1 failed');
+      expect(result.stdout).toContain('connected to di-nats on attempt 2');
+      expect(result.stdout).toContain('already complete');
+    },
+    15000,
+  );
 
   it.skipIf(!busybox)('fails at once on a rejected login under busybox sh', () => {
     const result = run(1000, undefined, DENIED, ['busybox', 'sh', '-c']);
