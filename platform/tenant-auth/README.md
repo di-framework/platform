@@ -495,10 +495,13 @@ logging out both stop access.
   the quota to include platform components.
 * The sidecar container can start after the app, which costs one restart; an init ordering or
   a startup probe would avoid it.
-* `/-/members` reads the member names the platform publishes in ConfigMap
-  `tenant-controller-members` and then each `User` by name; the controller may read only those
-  (platform#321). It shows active members only. On a platform without that ConfigMap it lists
-  every `User` instead.
+* `/-/members` reads the memberships the platform publishes in ConfigMap
+  `tenant-controller-members` under `entries` (name, role and suspended each), suspended members
+  included, and reads no `User` (platform#321). An entry without a boolean `suspended`, a known
+  role or a name fails the request instead of showing a suspended member as active. A ConfigMap
+  from an older platform has only `members` (active names): each `User` is then read by name, the
+  controller may read only those, and suspended members are not shown. On a platform without that
+  ConfigMap it lists every `User` instead.
 * No WebSocket or SPDY upgrade through the proxy, so `kubectl port-forward` and `exec` do not
   work; logs with `--follow` stream fine.
 * Login ↔ `User` name matching is by convention; a `spec.identity` field would make it explicit.

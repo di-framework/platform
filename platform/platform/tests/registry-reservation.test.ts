@@ -252,7 +252,7 @@ function renderedRegistryInterfaces(): HostInterfaceLike[] {
     caKey: ca.key,
   };
   const rendered = tenantAuthResources(tenant, cfg, {
-    members: ['alice'],
+    members: [{ name: 'alice', role: 'developer', suspended: false }],
     apiServer: { addresses: ['10.0.0.1'], port: 6443 },
     tls,
     clientSecret: 'c2VjcmV0',

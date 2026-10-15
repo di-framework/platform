@@ -128,6 +128,27 @@ describe('tenant-controller-secrets admission (#321)', () => {
     );
   });
 
+  it('denies a tenant controller writes outside its own namespace', () => {
+    const other = 'system:serviceaccount:di-runtime-other:tenant-controller';
+    const otherLabels = { ...keyLabels, 'platform.di-framework.dev/tenant': 'other' };
+    for (const operation of ['CREATE', 'DELETE'] as const) {
+      // Another tenant's controller, with this tenant's key labels, in this tenant's namespace.
+      expect(both({ username: other, operation, labels: keyLabels })).toBe(false);
+      // A ServiceAccount of the same name in another namespace.
+      expect(
+        both({
+          username: 'system:serviceaccount:di-tenant-acme:tenant-controller',
+          operation,
+          labels: keyLabels,
+        }),
+      ).toBe(false);
+      // The same controller in its own namespace is allowed.
+      expect(
+        both({ username: other, operation, namespace: 'di-runtime-other', labels: otherLabels }),
+      ).toBe(true);
+    }
+  });
+
   it('leaves the platform controller and tenant users to their own rules', () => {
     for (const username of [controller, developer, 'system:serviceaccount:x:tenant-console'])
       for (const operation of ['CREATE', 'UPDATE', 'DELETE'] as const)
