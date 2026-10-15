@@ -3,7 +3,14 @@ import { readFileSync } from 'node:fs';
 import { request } from 'node:https';
 import { setTimeout } from 'node:timers/promises';
 import { claimsRegistryHost } from './admission';
-import { type ApiKeySecret, migrateApiKeys } from './api-keys';
+import {
+  type ApiKeyMigration,
+  type ApiKeySecret,
+  apiKeyMoveBlocker,
+  migrateApiKeys,
+  type TenantControllerDeployment,
+  type TenantControllerPod,
+} from './api-keys';
 import {
   backingServiceResourceName,
   backingServiceResources,
@@ -1117,13 +1124,14 @@ export class Controller {
       // API keys still in the runtime namespace are moved before anything is rendered, so the
       // pass that finds none left also drops the tenant controller's Secret rule there (#379).
       // A failed move keeps that read rule and is reported below; the rest still reconciles.
-      let apiKeyFailure: unknown;
-      let legacyApiKeys = true;
+      let apiKeys: ApiKeyMigration;
       try {
-        legacyApiKeys = !(await this.moveApiKeys(tenant));
+        apiKeys = await this.moveApiKeys(tenant);
       } catch (error) {
-        apiKeyFailure = error;
+        const message = error instanceof Error ? error.message : String(error);
+        apiKeys = { done: false, moved: 0, failures: [message] };
       }
+      const legacyApiKeys = !apiKeys.done;
       const registry = await this.registryState(tenant);
       const registryNats = await this.registryNats(tenant);
       // Objects read while computing the inputs, reused by the adoption check below.
@@ -1239,19 +1247,25 @@ export class Controller {
         );
       const nats = registryNatsCondition(registryNats, namespace);
       if (nats) return condition(false, nats.reason, nats.message);
-      if (apiKeyFailure) {
-        const message = `API keys not moved to ${names(tenant.metadata.name).apiKeysNamespace}: ${
-          apiKeyFailure instanceof Error ? apiKeyFailure.message : String(apiKeyFailure)
-        }`;
+      const keyNamespace = names(tenant.metadata.name).apiKeysNamespace;
+      if (apiKeys.failures.length) {
+        const message = `API keys not moved to ${keyNamespace}: ${apiKeys.failures.join('; ')}`;
         console.error(`Tenant/${tenant.metadata.name} tenant-auth: ${message}`);
         return condition(false, 'ApiKeyMigrationFailed', message);
       }
       const what = this.cfg.tenantAuth.registry
         ? 'tenant controller, console and registry'
         : 'tenant controller and console';
-      return ready
-        ? condition(true, 'Reconciled', `T${what.slice(1)} are ready`)
-        : condition(false, 'Provisioning', `Waiting for the ${what}`);
+      if (!ready) return condition(false, 'Provisioning', `Waiting for the ${what}`);
+      // The pair works, but API keys made before #379 are still in the runtime namespace, and so
+      // is the tenant controller's read of its Secrets.
+      if (apiKeys.waiting)
+        return condition(
+          false,
+          'ApiKeyMigrationWaiting',
+          `API keys are not moved to ${keyNamespace} yet: ${apiKeys.waiting}`,
+        );
+      return condition(true, 'Reconciled', `T${what.slice(1)} are ready`);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Tenant-auth reconcile failed';
       const refused = error instanceof ControllerCaRefused;
@@ -1329,14 +1343,15 @@ export class Controller {
   private readonly apiKeysMoved = new Set<string>();
   /**
    * Moves the tenant's API keys from the runtime namespace to `di-apikeys-<tenant>` (#379, see
-   * {@link migrateApiKeys}); true once none is left there. Keys are moved only once the tenant
-   * controller runs this platform's tenant-auth image, which reads both layouts. Once done it is
-   * not checked again until the controller restarts: the tenant controller cannot write Secrets
-   * in the runtime namespace any more, so no key can appear there again.
+   * {@link migrateApiKeys}); `done` once none is left there. Keys are moved only once the tenant
+   * controller is known to run a tenant-auth build that reads both layouts
+   * ({@link apiKeyMoveBlocker}). Once done it is not checked again until the controller restarts:
+   * the tenant controller cannot write Secrets in the runtime namespace any more, so no key can
+   * appear there again.
    */
-  private async moveApiKeys(tenant: Tenant): Promise<boolean> {
+  private async moveApiKeys(tenant: Tenant): Promise<ApiKeyMigration> {
     const uid = tenant.metadata.uid;
-    if (uid && this.apiKeysMoved.has(uid)) return true;
+    if (uid && this.apiKeysMoved.has(uid)) return { done: true, moved: 0, failures: [] };
     const n = names(tenant.metadata.name);
     const secrets = (namespace: string) => collection('v1', 'Secret', namespace);
     const result = await migrateApiKeys(tenant.metadata.name, n.runtimeNamespace, {
@@ -1350,49 +1365,37 @@ export class Controller {
           if (!(error instanceof ApiError && error.code === 409)) throw error;
         }
       },
-      remove: (secret) =>
+      remove: (namespace, secret) =>
         this.remove({
           ...secret,
           apiVersion: 'v1',
           kind: 'Secret',
-          metadata: { ...secret.metadata, namespace: n.runtimeNamespace },
+          metadata: { ...secret.metadata, namespace },
         } as Resource),
-      rolledOut: () => this.tenantControllerRolledOut(tenant),
+      blocker: () => this.apiKeyMoveBlocker(tenant),
+      replaced: (name) =>
+        console.warn(
+          `Tenant/${tenant.metadata.name}: replaced ${n.apiKeysNamespace}/${name}, which differed from the API key in ${n.runtimeNamespace} and was not written by the platform`,
+        ),
     });
     if (result.moved > 0)
       console.log(
         `Tenant/${tenant.metadata.name}: moved ${result.moved} API keys from ${n.runtimeNamespace} to ${n.apiKeysNamespace}`,
       );
     if (result.done && uid) this.apiKeysMoved.add(uid);
-    return result.done;
+    return result;
   }
-  /**
-   * Whether the tenant controller Deployment has finished rolling out this platform's tenant-auth
-   * image: the template names it, the Deployment controller has seen the latest spec, and every
-   * pod it counts is an updated one. With zero replicas (a suspended tenant) nothing serves keys.
-   */
-  private async tenantControllerRolledOut(tenant: Tenant): Promise<boolean> {
-    const image = this.cfg.tenantAuth?.image;
-    const deployment = await this.get<
-      Resource & {
-        spec?: {
-          replicas?: number;
-          template?: { spec?: { containers?: { image?: string }[] } };
-        };
-        status?: { observedGeneration?: number; replicas?: number; updatedReplicas?: number };
-      }
-    >(
-      `${collection('apps/v1', 'Deployment', names(tenant.metadata.name).runtimeNamespace)}/tenant-controller`,
-    );
-    if (!image || !deployment) return false;
-    const replicas = deployment.spec?.replicas ?? 1;
-    const status = deployment.status ?? {};
-    return (
-      (deployment.spec?.template?.spec?.containers ?? []).some((c) => c.image === image) &&
-      status.observedGeneration === deployment.metadata.generation &&
-      (status.updatedReplicas ?? 0) === replicas &&
-      (status.replicas ?? 0) === replicas
-    );
+  /** {@link apiKeyMoveBlocker} for the tenant's live controller Deployment and pods. */
+  private async apiKeyMoveBlocker(tenant: Tenant): Promise<string | undefined> {
+    const image = this.cfg.tenantAuth?.image ?? '';
+    const namespace = names(tenant.metadata.name).runtimeNamespace;
+    const [deployment, pods] = await Promise.all([
+      this.get<TenantControllerDeployment>(
+        `${collection('apps/v1', 'Deployment', namespace)}/tenant-controller`,
+      ),
+      this.list<TenantControllerPod>('v1', 'Pod', { app: 'tenant-controller' }, namespace),
+    ]);
+    return apiKeyMoveBlocker(image, !!this.cfg.tenantAuthReadsApiKeyNamespace, deployment, pods);
   }
   /** Whether the tenant-auth Deployments of `tenant` exist, i.e. the quota may stay raised. */
   private async tenantAuthDeployed(tenant: Tenant): Promise<boolean> {

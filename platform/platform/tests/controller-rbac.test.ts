@@ -680,13 +680,15 @@ describe('platform controller RBAC at runtime (#321)', () => {
         publicUrl: 'https://registry.{tenant}.localhost:28180',
       },
     },
+    // Its tenant-auth image is a build known to read the API-key namespace (#379).
+    tenantAuthReadsApiKeyNamespace: true,
   };
   const LEGACY_KEYS = ['0123456789abcdef', 'fedcba9876543210'];
   /**
    * alpha: two members, a registry the hosts pull from and API keys in the old layout; beta:
    * suspended; gamma: no members.
    */
-  function setup(api = new RecordingApi()) {
+  function setup(api = new RecordingApi(), config = registryCfg) {
     const beta = tenant('beta');
     beta.spec.suspended = true;
     const tenants = [tenant('alpha'), beta, tenant('gamma')];
@@ -766,7 +768,7 @@ describe('platform controller RBAC at runtime (#321)', () => {
         type: 'Opaque',
         data: { hash: Buffer.from(id).toString('base64') },
       });
-    return { api, controller: new Controller(api, registryCfg), tenants, users };
+    return { api, controller: new Controller(api, config), tenants, users };
   }
   async function run() {
     const { api, controller, tenants, users } = setup();
@@ -1021,7 +1023,9 @@ describe('platform controller RBAC at runtime (#321)', () => {
       const [first, second] = LEGACY_KEYS as [string, string];
       expect(secret('di-apikeys-alpha', first)).toBeDefined();
       expect(secret('di-runtime-alpha', first)).toBeDefined();
-      expect(secret('di-runtime-alpha', second)).toBeDefined();
+      // The failure does not hold the other key back.
+      expect(secret('di-runtime-alpha', second)).toBeUndefined();
+      expect(secret('di-apikeys-alpha', second)).toBeDefined();
       expect(status()?.conditions?.find((c) => c.type === 'TenantAuthReady')).toMatchObject({
         reason: 'ApiKeyMigrationFailed',
       });
@@ -1045,6 +1049,39 @@ describe('platform controller RBAC at runtime (#321)', () => {
     expect(status()?.conditions?.find((c) => c.type === 'TenantAuthReady')?.reason).not.toBe(
       'ApiKeyMigrationFailed',
     );
+  });
+
+  it('leaves the keys and the read rule in place under a tenant-auth not known to read the new namespace', async () => {
+    // `cfg` names no registry (so the pair turns ready here) and no allowlisted image.
+    expect(cfg.tenantAuthReadsApiKeyNamespace).toBeUndefined();
+    const { api, controller, tenants, users } = setup(new RecordingApi(), cfg);
+    const alpha = tenants[0] as Tenant;
+    // Rolled out and ready, pass after pass: the gate stays closed on the image alone.
+    for (let pass = 0; pass < 3; pass++) await controller.reconcileTenant(alpha, users);
+    for (const id of LEGACY_KEYS) {
+      expect(
+        api.objects.get(`${collection('v1', 'Secret', 'di-runtime-alpha')}/di-apikey-${id}`),
+      ).toBeDefined();
+      expect(
+        api.objects.get(`${collection('v1', 'Secret', 'di-apikeys-alpha')}/di-apikey-${id}`),
+      ).toBeUndefined();
+    }
+    const status = api.objects.get(`${collection(VERSION, 'Tenant')}/alpha`)?.status as {
+      apiKeysMigrated?: boolean;
+      conditions: { type: string; reason: string; message: string }[];
+    };
+    expect(status.apiKeysMigrated).toBeUndefined();
+    expect(status.conditions.find((c) => c.type === 'TenantAuthReady')).toMatchObject({
+      reason: 'ApiKeyMigrationWaiting',
+      message: expect.stringContaining('is not a known tenant-auth build'),
+    });
+    expect(
+      rulesOf(
+        api.objects.get(
+          `${collection(`${RBAC_GROUP}/v1`, 'Role', 'di-runtime-alpha')}/tenant-controller-keys`,
+        ) as Resource,
+      ).filter((r) => r.resources.includes('secrets')),
+    ).toEqual([{ apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list'] }]);
   });
 
   /** Reconciles alpha once against `api`, with the controller's error log silenced. */

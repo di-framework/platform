@@ -446,8 +446,18 @@ rejects it. Do not change those URLs while downgraded. If they did change, eithe
 
 Tenant API keys move from `di-runtime-<tenant>` to a new namespace, `di-apikeys-<tenant>`, and the
 tenant controller loses every Secret rule in the runtime namespace, where the console's OAuth
-client, the registry pull token, the registry's NATS credentials and the TLS Secrets live. Nothing
-has to be done before `pulumi up`, and existing keys keep working throughout:
+client, the registry pull token, the registry's NATS credentials and the TLS Secrets live.
+
+**What you have to do:** set `tenantAuth.image` to the tenant-auth digest this README documents
+(the `tenantAuth` example under [Tenant controller and console](#tenant-controller-and-console)), or
+to any later published build, in the same `pulumi up` as the package upgrade or afterwards. Keys
+move only while `tenantAuth.image` is a build listed in `API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS`
+(`src/tenant-auth-images.ts`). The tenant-auth pin PR adds each published build to that list, so
+the digest documented here is always on it. With any other image (an older digest, an unknown
+digest, a tag), nothing moves and nothing breaks. The keys stay in `di-runtime-<tenant>` and keep
+working, and the tenant controller keeps its read-only Secret rule there. `pulumi up` warns
+`tenantAuth.image … is not a known tenant-auth build that reads di-apikeys-<tenant> (#379)`, and
+`TenantAuthReady` reports `ApiKeyMigrationWaiting`. Existing keys keep working throughout:
 
 - **The namespace.** The platform controller creates `di-apikeys-<tenant>` with the tenant's other
   namespaces, labelled with the installation, tenant and owner like them, so the
@@ -464,40 +474,66 @@ has to be done before `pulumi up`, and existing keys keep working throughout:
   keys of its tenant, in that tenant's `di-apikeys-<tenant>`, from
   `system:serviceaccount:di-runtime-<tenant>:tenant-controller`.
 - **The move, per tenant, in this order:**
-  1. The first pass renders the new namespace, its Role and binding and the new tenant-auth
+  1. Each pass applies the new namespace, its Role and binding, and the configured tenant-auth
      image. While keys are left in the runtime namespace, the runtime Role also keeps a read-only
      (`get`, `list`) Secret rule there, so the controller can still find them.
-  2. Once the `tenant-controller` Deployment has rolled out that image (the image this package
-     pins, every counted pod updated), the platform controller copies each `di-apikey-*` Secret
-     labelled as a key of the tenant into `di-apikeys-<tenant>` with the same name, labels and data,
-     reads the copy back and compares it, and only then deletes the original. The new image looks a
-     key up in `di-apikeys-<tenant>` first and in `di-runtime-<tenant>` second, so a key is found
-     before its copy, between copy and delete, and after.
+  2. Keys move only when all of these hold:
+     - `tenantAuth.image` is on the list above;
+     - the `tenant-controller` Deployment's template runs it;
+     - the Deployment controller has seen the latest spec;
+     - every replica it counts is updated;
+     - no `tenant-controller` pod, terminating ones included, runs anything else.
+
+     The platform controller then copies each `di-apikey-*` Secret labelled as a key of the tenant
+     into `di-apikeys-<tenant>`, with the same name, labels and data. It reads the copy back and
+     compares it, and only then deletes the original. Those images look a key up in
+     `di-apikeys-<tenant>` first and in `di-runtime-<tenant>` second, so a key is found before its
+     copy, between copy and delete, and after.
   3. The pass that finds no key left drops the read rule from the runtime Role and sets
      `status.apiKeysMigrated: true` (next to `status.apiKeysNamespace`) on the Tenant. The tenant
      controller reads that status (rechecked every 30 seconds) and stops looking in the runtime
      namespace; until it does, a `403` there counts as "no key there".
 
   Every step is idempotent. An interrupted pass (a key copied but its original not deleted) is
-  finished by the next one, which finds the copy, compares it and deletes the original. A copy is
-  never overwritten: if a Secret of that name in `di-apikeys-<tenant>` holds something else, the
-  original is kept and `TenantAuthReady` turns `False` with reason `ApiKeyMigrationFailed`, naming
-  the Secret; remove the wrong copy and the next pass moves the key. The same reason reports a
-  copy the quota refused; raise `spec.resources.apiKeys`. The read rule stays until the move is
-  done.
+  finished by the next one, which finds the copy, compares it and deletes the original.
+
+  The original is authoritative. A Secret of that name in `di-apikeys-<tenant>` that differs from
+  it was not written by the platform: key ids are random, and nothing updates a key. So the
+  controller deletes it (by uid), copies the original again, and logs
+  `replaced di-apikeys-<tenant>/<name>, which differed from the API key in di-runtime-<tenant> and
+  was not written by the platform`. Treat that log line as a sign that something else writes
+  there, such as a compromised tenant controller.
+
+  A key that still cannot be moved keeps its original, and the other keys move anyway. Examples
+  are a copy the quota refuses (raise `spec.resources.apiKeys`) or a foreign Secret that comes back
+  at once. `TenantAuthReady` turns `False` with reason `ApiKeyMigrationFailed` and lists every such
+  key. The read rule stays until no key is left.
 - **What users see.** Keys keep working and are listed once, wherever they are. Revoking a key that
   is still in the runtime namespace answers `409` ("try again in a minute") until it is moved,
   because the tenant controller may not delete there. While the old tenant-auth image still runs
   during the rollout, creating or revoking a key fails: admission no longer admits its writes in
   the runtime namespace. Retry once the pod has restarted.
+- **Revoking a key by hand while it cannot be moved** (for example a leaked key during a stalled
+  move). Find it by its id, the `<id>` in `dik_<id>_…`. Delete the original and any copy:
+
+  ```sh
+  kubectl delete secret -n di-runtime-<tenant> di-apikey-<id> --ignore-not-found
+  kubectl delete secret -n di-apikeys-<tenant> di-apikey-<id> --ignore-not-found
+  ```
+
+  Delete the original first, so the move cannot copy it again. To list a user's keys:
+  `kubectl get secrets -n di-runtime-<tenant> -l platform.di-framework.dev/user=<user>` (and the
+  same in `di-apikeys-<tenant>`).
 - **What operators see.** The new namespace (`kubectl get ns di-apikeys-<tenant>`), the keys in it
-  (`kubectl get secrets -n di-apikeys-<tenant> -l platform.di-framework.dev/api-key=true`), and the
-  Tenant's `.status.apiKeysMigrated`. The controller logs
+  (`kubectl get secrets -n di-apikeys-<tenant> -l platform.di-framework.dev/api-key=true`), the
+  Tenant's `.status.apiKeysMigrated`, and `TenantAuthReady`: `ApiKeyMigrationWaiting` names what
+  the move waits for (the image not being on the list, or the rollout), and `ApiKeyMigrationFailed`
+  names the keys that did not move. The controller logs
   `moved N API keys from di-runtime-<tenant> to di-apikeys-<tenant>` once per pass that moves any.
 - **Downgrading** to a package without this change puts back the runtime Secret rule and the old
-  admission rule, and runs a tenant-auth image that reads only the runtime namespace: keys already
-  moved stop working until you upgrade again (nothing is deleted). The older package leaves
-  `di-apikeys-<tenant>` alone.
+  admission rule, which let the tenant controller write keys only in the runtime namespace: keys
+  already moved stop working until you upgrade again (nothing is deleted). The older package
+  leaves `di-apikeys-<tenant>` alone.
 
 ### Tenant removal and namespace retention
 
