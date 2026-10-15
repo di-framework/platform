@@ -453,11 +453,24 @@ client, the registry pull token, the registry's NATS credentials and the TLS Sec
 to any later published build, in the same `pulumi up` as the package upgrade or afterwards. Keys
 move only while `tenantAuth.image` is a build listed in `API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS`
 (`src/tenant-auth-images.ts`). The tenant-auth pin PR adds each published build to that list, so
-the digest documented here is always on it. With any other image (an older digest, an unknown
-digest, a tag), nothing moves and nothing breaks. The keys stay in `di-runtime-<tenant>` and keep
-working, and the tenant controller keeps its read-only Secret rule there. `pulumi up` warns
-`tenantAuth.image … is not a known tenant-auth build that reads di-apikeys-<tenant> (#379)`, and
-`TenantAuthReady` reports `ApiKeyMigrationWaiting`. Existing keys keep working throughout:
+the digest documented here is always on it.
+
+With any other image (an older digest, an unknown digest, a tag), no key moves, but key management
+breaks. RBAC and admission are narrowed whatever image runs, and a tenant-auth from before #379
+writes keys only in the runtime namespace. Until `tenantAuth.image` is a listed build:
+
+- **Existing keys keep authenticating.** They stay in `di-runtime-<tenant>`, and the tenant
+  controller keeps its read-only Secret rule there.
+- **Creating and revoking keys fail for every tenant.** The runtime Role has no `create` or
+  `delete`, and admission admits key writes only in `di-apikeys-<tenant>`.
+- **Listing keys fails for tenants with no old keys,** such as new tenants or tenants that never
+  made one. Their move is done at once, so their runtime Role has no Secret rule, and the old image
+  does not handle the `403`.
+
+`pulumi up` flags this with the warning `tenantAuth.image … is not a known tenant-auth build that
+reads di-apikeys-<tenant> (#379)`, and `TenantAuthReady` reports `ApiKeyMigrationWaiting`. The fix
+is to set `tenantAuth.image` to the documented digest or a later published build. With a listed
+image, existing keys keep working throughout:
 
 - **The namespace.** The platform controller creates `di-apikeys-<tenant>` with the tenant's other
   namespaces, labelled with the installation, tenant and owner like them, so the
@@ -508,7 +521,23 @@ working, and the tenant controller keeps its read-only Secret rule there. `pulum
   are a copy the quota refuses (raise `spec.resources.apiKeys`) or a foreign Secret that comes back
   at once. `TenantAuthReady` turns `False` with reason `ApiKeyMigrationFailed` and lists every such
   key. The read rule stays until no key is left.
-- **What users see.** Keys keep working and are listed once, wherever they are. Revoking a key that
+
+  A move that stays stalled can be a sign of a compromised tenant controller, since only it can
+  write in `di-apikeys-<tenant>` besides the platform. Two cases point that way:
+  - a quota refusal (`ApiKeyMigrationFailed` with `exceeded quota`) on a tenant that never had that
+    many keys;
+  - a foreign copy that keeps coming back.
+
+  To check, compare `kubectl get secrets -n di-apikeys-<tenant> -l
+  platform.di-framework.dev/api-key=true` with the keys the tenant's users created. If the namespace
+  holds keys nobody made:
+  1. Suspend the tenant (`suspended: true`, which removes the tenant controller's bindings).
+  2. Restart or redeploy its `tenant-controller` from the pinned image.
+  3. Delete the unknown Secrets in `di-apikeys-<tenant>`.
+  4. Rotate the Secrets it could read in `di-runtime-<tenant>`: the console OAuth client, the
+     registry pull and NATS credentials, and the TLS Secrets.
+  5. Unsuspend the tenant.
+- **What users see** (with a listed image). Keys keep working and are listed once, wherever they are. Revoking a key that
   is still in the runtime namespace answers `409` ("try again in a minute") until it is moved,
   because the tenant controller may not delete there. While the old tenant-auth image still runs
   during the rollout, creating or revoking a key fails: admission no longer admits its writes in
