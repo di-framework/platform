@@ -118,6 +118,7 @@ const schedulerSecret = { data: { 'ca.crt': 'test' } };
 type Container = {
   name: string;
   image: string;
+  workingDir?: string;
   command?: string[];
   args?: string[];
   env?: { name: string; value?: string; valueFrom?: unknown }[];
@@ -399,6 +400,8 @@ describe('registry NATS account rendering (#159)', () => {
     const [container] = pod.spec.containers;
     expect(container?.image).toBe(NATS_BOX_IMAGE);
     expect(NATS_BOX_IMAGE).toMatch(/@sha256:[0-9a-f]{64}$/);
+    // The container runs as non-root uid 65532, so it needs a readable working directory (#391).
+    expect(container?.workingDir).toBe('/tmp');
     expect(container?.command).toEqual(['sh', '-c', REGISTRY_NATS_MIGRATION_SCRIPT]);
     expect(container?.env).toEqual([
       { name: 'NATS_URL', value: 'nats://di-nats.di-runtime-alpha.svc.cluster.local:4222' },
@@ -416,6 +419,23 @@ describe('registry NATS account rendering (#159)', () => {
     expect((container as unknown as { resources: { limits: unknown } }).resources.limits).toEqual(
       REGISTRY_NATS_MIGRATION_LIMITS,
     );
+    // The /tmp volume must be writable by uid 65532 for the nats CLI and script temp files.
+    expect(
+      (pod.spec.volumes as unknown as Array<{ name: string }>).find((v) => v.name === 'tmp'),
+    ).toBeDefined();
+    expect(
+      (
+        container?.volumeMounts as unknown as Array<{
+          name: string;
+          mountPath: string;
+        }>
+      )?.find((v) => v.name === 'tmp' && v.mountPath === '/tmp'),
+    ).toBeDefined();
+    // The filesystem is read-only except /tmp, so uid 65532 can only work in /tmp.
+    expect(
+      (container as unknown as { securityContext: { readOnlyRootFilesystem: boolean } })
+        .securityContext.readOnlyRootFilesystem,
+    ).toBe(true);
   });
 
   it('raises the runtime quota by the Job limits only while the Job is rendered', () => {

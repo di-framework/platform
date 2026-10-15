@@ -88,6 +88,77 @@ function run(
   };
 }
 
+describe('registry migration script: working directory fix (#391)', () => {
+  it('fails immediately when nats CLI exits 1 on schema validation error', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'registry-migrate-'));
+    dirs.push(dir);
+    const SCHEMA_ERROR =
+      'nats: error: server response is not a valid "io.nats.jetstream.api.v1.stream_names_response" message: could not load schema {}\\n: stat .: permission denied';
+    writeFileSync(
+      join(dir, 'nats'),
+      `#!/bin/sh
+case "$*" in
+  "account info")
+    if [ -n "$NATS_USER" ]; then echo "Account Information"; echo "Account: REGISTRY (REGISTRY)"; else echo "Account Information"; echo "Account: TENANT (TENANT)"; fi
+    ;;
+  "stream ls --names") printf '%s\\n' '${SCHEMA_ERROR}' >&2; exit 1 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+`,
+    );
+    chmodSync(join(dir, 'nats'), 0o755);
+    const child = spawnSync('bash', ['-c', REGISTRY_NATS_MIGRATION_SCRIPT], {
+      encoding: 'utf8',
+      env: {
+        PATH: `${dir}:${process.env.PATH}`,
+        HOME: dir,
+        TMPDIR: dir,
+        NATS_URL: 'nats://di-nats.di-runtime-alpha.svc.cluster.local:4222',
+        REGISTRY_USER: 'registry',
+        REGISTRY_PASSWORD: PASSWORD,
+      },
+    });
+    expect(child.status).not.toBe(0);
+    expect(`${child.stdout}${child.stderr}`).toContain('could not load schema');
+    expect(`${child.stdout}${child.stderr}`).toContain('permission denied');
+  });
+
+  it('proceeds with migration when marker bucket does not exist on first run', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'registry-migrate-'));
+    dirs.push(dir);
+    writeFileSync(
+      join(dir, 'nats'),
+      `#!/bin/sh
+case "$*" in
+  "account info")
+    if [ -n "$NATS_USER" ]; then echo "Account Information"; echo "Account: REGISTRY (REGISTRY)"; else echo "Account Information"; echo "Account: TENANT (TENANT)"; fi
+    ;;
+  "stream ls --names") echo "" ;;
+  "object add oci-registry") ;;
+  "kv add di-platform-migrations") ;;
+  "kv put di-platform-migrations registry-object-store complete") ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+`,
+    );
+    chmodSync(join(dir, 'nats'), 0o755);
+    const child = spawnSync('bash', ['-c', REGISTRY_NATS_MIGRATION_SCRIPT], {
+      encoding: 'utf8',
+      env: {
+        PATH: `${dir}:${process.env.PATH}`,
+        HOME: dir,
+        TMPDIR: dir,
+        NATS_URL: 'nats://di-nats.di-runtime-alpha.svc.cluster.local:4222',
+        REGISTRY_USER: 'registry',
+        REGISTRY_PASSWORD: PASSWORD,
+      },
+    });
+    expect(child.status).toBe(0);
+    expect(child.stdout).toContain('registry migration: no source store');
+    expect(child.stdout).toContain('registry migration: complete');
+  });
+});
+
 describe('registry migration script: first connection (#388)', () => {
   it('retries refused connections with backoff, then runs the checks and the steps', () => {
     const result = run(3);
