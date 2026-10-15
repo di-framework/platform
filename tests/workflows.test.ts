@@ -800,6 +800,7 @@ test('CI runs every exclusive-instance topology test the 0001 patch adds, by nam
     ...(section ?? '').matchAll(/^\+#\[tokio::test[^\n]*\n\+(?:async )?fn (\w+)\(/gm),
   ].map((m) => m[1] ?? '');
   expect(added).toContain('an_http_trap_leaves_the_queued_calls_a_fresh_instance');
+  expect(added).toContain('an_http_timeout_leaves_the_queued_calls_a_fresh_instance');
 
   const workflow = parse('.github/workflows/tenant-host-patch-check.yml');
   const steps = workflow.jobs.patch?.steps ?? [];

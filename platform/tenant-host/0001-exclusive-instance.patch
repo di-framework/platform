@@ -909,10 +909,10 @@ index 9be47f2..b158262 100644
      use std::sync::Arc;
 diff --git a/crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs b/crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs
 new file mode 100644
-index 0000000..fa57600
+index 0000000..8ce9a44
 --- /dev/null
 +++ b/crates/wash-runtime/src/engine/instance_pool/exclusive_tests.rs
-@@ -0,0 +1,1275 @@
+@@ -0,0 +1,1280 @@
 +//! Exclusive components never have two stores alive at once.
 +//!
 +//! These drive real concurrency through the production dispatch path
@@ -1356,6 +1356,11 @@ index 0000000..fa57600
 +/// and for the store to be dropped. The instance is retired (as a timed-out
 +/// call retires it), so its replacement is built afterwards, and only once the
 +/// old store's teardown, held open here, has finished.
++///
++/// This guest never yields, so the retirement is applied from outside. A
++/// timeout reached by a guest that yields, and the retirement the production
++/// timeout branch applies, are covered by the topology test
++/// `an_http_timeout_leaves_the_queued_calls_a_fresh_instance`.
 +#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 +async fn a_timed_out_call_still_holds_the_line_until_its_store_is_gone() {
 +    let rig = Rig::exclusive(None);
@@ -2874,10 +2879,10 @@ index eb825f8..e2f0754 100644
          // Strings flowing in from the proto wire are parsed into typed
 diff --git a/crates/wash-runtime/tests/integration_exclusive_topology.rs b/crates/wash-runtime/tests/integration_exclusive_topology.rs
 new file mode 100644
-index 0000000..3e8677f
+index 0000000..c7f3a56
 --- /dev/null
 +++ b/crates/wash-runtime/tests/integration_exclusive_topology.rs
-@@ -0,0 +1,350 @@
+@@ -0,0 +1,472 @@
 +//! Which workloads may contain an exclusive component.
 +//!
 +//! An exclusive component (`di-framework.dev/exclusive-instance: "true"` in its
@@ -3225,6 +3230,128 @@ index 0000000..3e8677f
 +        counts,
 +        vec![1, 2, 3],
 +        "the calls behind the trap are served by one fresh instance"
++    );
++    Ok(())
++}
++
++/// The exchange timeout the timeout test runs under, and the variable that
++/// sets it. The runtime reads it once per process and caches it, so that test
++/// reruns itself in a child process with it set (see
++/// [`rerun_with_short_http_response_timeout`]), and the other tests here keep
++/// the default.
++const HTTP_RESPONSE_TIMEOUT_VAR: &str = "WASH_HTTP_RESPONSE_TIMEOUT_SECS";
++const SHORT_HTTP_RESPONSE_TIMEOUT_SECS: &str = "1";
++
++/// Run the test `name` alone, in a child process of this test binary with the
++/// exchange timeout shortened, and fail unless it ran there and passed. Setting
++/// the variable in this process instead would need `unsafe`, and would race
++/// the other tests' first read of it.
++async fn rerun_with_short_http_response_timeout(name: &str) -> Result<()> {
++    let output = tokio::process::Command::new(std::env::current_exe()?)
++        .args([name, "--exact", "--nocapture", "--test-threads=1"])
++        .env(HTTP_RESPONSE_TIMEOUT_VAR, SHORT_HTTP_RESPONSE_TIMEOUT_SECS)
++        .output()
++        .await
++        .context("rerun the test binary")?;
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    anyhow::ensure!(
++        output.status.success() && stdout.contains(&format!("test {name} ... ok")),
++        "{name} with {HTTP_RESPONSE_TIMEOUT_VAR}={SHORT_HTTP_RESPONSE_TIMEOUT_SECS} did not run \
++         and pass ({}):\n{stdout}\n{stderr}",
++        output.status
++    );
++    Ok(())
++}
++
++/// A call that times out on an exclusive component retires the instance it
++/// was on. The calls queued behind it are served by a fresh instance, never
++/// by the one the timed-out work is still running on.
++///
++/// The `/wedge` call parks the guest on an hour's pollable sleep. The guest
++/// yields, so what ends the call is the host's exchange timeout in `HttpTask`
++/// (1s here), not the epoch deadline that only a guest that never yields
++/// reaches. The instance counted the wedge as its first call, so an instance
++/// kept after the timeout would serve the queued calls as 2, 3 and 4. A fresh
++/// one counts 1, 2, 3.
++#[tokio::test]
++async fn an_http_timeout_leaves_the_queued_calls_a_fresh_instance() -> Result<()> {
++    if std::env::var(HTTP_RESPONSE_TIMEOUT_VAR).as_deref() != Ok(SHORT_HTTP_RESPONSE_TIMEOUT_SECS) {
++        return rerun_with_short_http_response_timeout(
++            "an_http_timeout_leaves_the_queued_calls_a_fresh_instance",
++        )
++        .await;
++    }
++    let (addr, host) = start_host_with_dev_router("127.0.0.1:0").await?;
++
++    let mut request = component_workload_request(
++        "sleeper",
++        "exclusive-timeout",
++        HTTP_SLEEPER_WASM,
++        resources(true),
++        http_only_host_interfaces("timeout"),
++    );
++    // Keep the instance warm between calls, so only the timeout can retire it.
++    request.workload.components[0].max_invocations = 0;
++    let status = host.workload_start(request).await?.workload_status;
++    anyhow::ensure!(
++        status.workload_state == wash_runtime::types::WorkloadState::Running,
++        "{status:?}"
++    );
++
++    let client = reqwest::Client::new();
++    let started = std::time::Instant::now();
++    let wedged = {
++        let client = client.clone();
++        tokio::spawn(async move {
++            timeout(
++                Duration::from_secs(60),
++                client
++                    .get(format!("http://{addr}/wedge"))
++                    .header("HOST", "timeout")
++                    .send(),
++            )
++            .await
++        })
++    };
++    // Well under the 1s timeout, so the wedged call holds the call permit and
++    // the calls below queue behind it.
++    tokio::time::sleep(Duration::from_millis(200)).await;
++    let mut behind = Vec::new();
++    for _ in 0..3 {
++        let client = client.clone();
++        behind.push(tokio::spawn(async move {
++            let count =
++                timeout(Duration::from_secs(60), served(&client, addr, "timeout")).await??;
++            Ok::<_, anyhow::Error>((count, started.elapsed()))
++        }));
++    }
++
++    // Bounded by the timeout, not by the hour the guest asked for. The failure
++    // surfaces as a 5xx or as a closed connection, depending on where it lands.
++    if let Ok(response) = wedged.await?? {
++        assert!(
++            response.status().is_server_error(),
++            "the timed-out call fails: {}",
++            response.status()
++        );
++    }
++    let mut counts = Vec::new();
++    for call in behind {
++        let (count, at) = call
++            .await?
++            .context("a call queued behind the timeout is served")?;
++        assert!(
++            at >= Duration::from_secs(1),
++            "a queued call was served at {at:?}, before the wedged call timed out"
++        );
++        counts.push(count);
++    }
++    counts.sort_unstable();
++    assert_eq!(
++        counts,
++        vec![1, 2, 3],
++        "the calls behind the timeout are served by one fresh instance"
 +    );
 +    Ok(())
 +}

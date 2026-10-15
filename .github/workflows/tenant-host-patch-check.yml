@@ -20,8 +20,8 @@
 #   - where 0001 is applied, builds the wasm test fixtures (`cargo xtask build-fixtures`) and runs
 #     0001's exclusive-instance topology tests (tests/integration_exclusive_topology.rs) by name:
 #     the load-time refusal of a linked exclusive component, queueing, a new revision waiting on
-#     the old one's host path, and a trap in the HTTP handler leaving the queued calls a fresh
-#     instance (#144).
+#     the old one's host path, and a trap or a timeout in the HTTP handler leaving the queued calls
+#     a fresh instance (#144).
 # It does not run the whole suites: some need Docker services this job does not set up.
 #
 # Bounded: one job per variant, 90 minutes each, superseded runs are cancelled. Cached per variant:
@@ -301,8 +301,11 @@ jobs:
       # 0001: an exclusive component linked into another is refused at load time, one nobody links
       # loads, a lone exclusive component queues real requests, a new revision waits for the old
       # one on the same host path, and a trap in the HTTP handler fails only its own call while the
-      # calls queued behind it are served by a fresh instance. The test target is linted like the
-      # lib (it needs the fixtures to compile), then each name below must have run and passed.
+      # calls queued behind it are served by a fresh instance. So does a call to a guest that yields
+      # until the HTTP exchange timeout ends it: the timeout retires the instance. That test reruns
+      # itself in a child process with WASH_HTTP_RESPONSE_TIMEOUT_SECS=1. The test target is linted
+      # like the lib (it needs the fixtures to compile), then each name below must have run and
+      # passed.
       - name: Test the exclusive-instance topology
         if: contains(format(' {0} ', matrix.patches), ' 0001-exclusive-instance.patch ')
         working-directory: wasmcloud
@@ -314,6 +317,7 @@ jobs:
             a_single_exclusive_component_loads_and_queues
             a_new_revision_waits_for_the_old_one_on_the_same_host_path
             an_http_trap_leaves_the_queued_calls_a_fresh_instance
+            an_http_timeout_leaves_the_queued_calls_a_fresh_instance
           )
           log="${RUNNER_TEMP}/topology-tests.log"
           cargo clippy -p wash-runtime --locked --features wasi-tls --test integration_exclusive_topology -- -D warnings
