@@ -5,13 +5,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { caPermittedDns, certificateNames } from '../../src/tenancy/tls';
 
+/**
+ * The OpenSSL binary the tests run, by absolute path rather than through `PATH`: OpenSSL 3 on the
+ * CI runners (Ubuntu), LibreSSL on macOS. Both apply X.509 name constraints.
+ */
+export const OPENSSL = '/usr/bin/openssl';
+
 /** Generates a throwaway self-signed certificate for a fake Kubernetes API server. */
 export function selfSignedCert(): { key: string; cert: string; keyPath: string; certPath: string } {
   const dir = mkdtempSync(join(tmpdir(), 'fake-api-tls-'));
   const keyPath = join(dir, 'key.pem');
   const certPath = join(dir, 'cert.pem');
   execFileSync(
-    '/usr/bin/openssl',
+    OPENSSL,
     [
       'req',
       '-x509',
@@ -56,22 +62,21 @@ export function withinNameConstraints(leaf: string, anchor: string): boolean {
 }
 
 /**
- * True when `openssl verify` accepts `leaf` (PEM) as a TLS server certificate for `localhost`,
- * strictly (`-x509_strict`), against the PEM trust bundle `bundle` at time `at`. OpenSSL applies
- * name constraints itself, so this is an oracle independent of this repository's X.509 code.
+ * True when `openssl verify` accepts `leaf` (PEM) as a TLS server certificate, strictly
+ * (`-x509_strict`), against the PEM trust bundle `bundle` at time `at`. OpenSSL applies name
+ * constraints itself, so this is an oracle independent of this repository's X.509 code. LibreSSL
+ * has no `-verify_hostname`; {@link verifiesAt} checks the host name.
  */
 export function opensslVerifies(leaf: string, bundle: string, at: Date): boolean {
   const dir = mkdtempSync(join(tmpdir(), 'ca-verify-'));
   try {
     writeFileSync(join(dir, 'leaf.pem'), leaf);
     writeFileSync(join(dir, 'bundle.pem'), bundle);
-    const result = spawnSync('openssl', [
+    const result = spawnSync(OPENSSL, [
       'verify',
       '-x509_strict',
       '-purpose',
       'sslserver',
-      '-verify_hostname',
-      'localhost',
       '-attime',
       String(Math.floor(at.getTime() / 1000)),
       '-CAfile',

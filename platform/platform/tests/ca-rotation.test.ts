@@ -22,7 +22,7 @@ import {
   namesPermittedBy,
   selfSignedCertificate,
 } from '../src/tenancy/tls';
-import { opensslVerifies, verifiesAt, withinNameConstraints } from './support/tls';
+import { OPENSSL, opensslVerifies, verifiesAt, withinNameConstraints } from './support/tls';
 
 const DAY = 86_400_000;
 const NAME = 'tenant-controller CA (di-runtime-alpha)';
@@ -307,7 +307,7 @@ describe('tenant controller CA name constraints (#365)', () => {
     const ca = tenantCa(CA_DAYS, t0);
     expect(caPermittedDns(ca.cert)).toEqual(NAMES);
     // Read back independently of the parser above.
-    const text = Bun.spawnSync(['openssl', 'x509', '-noout', '-text'], {
+    const text = Bun.spawnSync([OPENSSL, 'x509', '-noout', '-text'], {
       stdin: Buffer.from(ca.cert),
     }).stdout.toString();
     expect(text).toMatch(/X509v3 Name Constraints: critical\s+Permitted:\s+DNS:tenant-controller/);
