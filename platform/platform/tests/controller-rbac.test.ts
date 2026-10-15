@@ -95,6 +95,8 @@ function rendered(names: string[]): Resource[] {
       ...tenantResources(t, cfg),
       ...tenantResources(t, cfg, undefined, [], true, true, true),
       ...tenantAuthResources(t, cfg, inputs),
+      // While API keys are still being moved out of the runtime namespace (#379).
+      ...tenantAuthResources(t, cfg, { ...inputs, legacyApiKeys: true }),
     ]),
     ...users.flatMap((u) => userResources(u, tenants, cfg)),
   ].filter((r) => r.apiVersion.startsWith(`${RBAC_GROUP}/`));
@@ -481,6 +483,45 @@ describe('tenant controller RBAC (#321)', () => {
     ).toBe(true);
   });
 
+  it('holds no Secret rule in its runtime namespace, only in its API-key namespace (#379)', () => {
+    const roles = (objects: Resource[], namespace: string) =>
+      objects.filter((o) => o.kind === 'Role' && o.metadata.namespace === namespace);
+    const secretRules = (objects: Resource[], namespace: string) =>
+      roles(objects, namespace)
+        .flatMap(rulesOf)
+        .filter((r) => r.resources.includes('secrets'));
+    const objects = tenantAuthResources(tenant('alpha'), cfg, inputs);
+    expect(secretRules(objects, 'di-runtime-alpha')).toEqual([]);
+    expect(rulesOf(roles(objects, 'di-runtime-alpha')[0] as Resource)).toEqual([
+      {
+        apiGroups: [''],
+        resources: ['configmaps'],
+        verbs: ['get'],
+        resourceNames: ['tenant-controller-members'],
+      },
+    ]);
+    expect(secretRules(objects, 'di-apikeys-alpha')).toEqual([
+      { apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list', 'create', 'delete'] },
+    ]);
+    // Bound to the tenant controller in both namespaces.
+    for (const namespace of ['di-runtime-alpha', 'di-apikeys-alpha'])
+      expect(
+        objects.find(
+          (o) =>
+            o.kind === 'RoleBinding' &&
+            o.metadata.namespace === namespace &&
+            o.metadata.name === 'tenant-controller-keys',
+        )?.subjects,
+      ).toEqual([
+        { kind: 'ServiceAccount', name: 'tenant-controller', namespace: 'di-runtime-alpha' },
+      ]);
+    // Until its keys are moved it may still read, and only read, them where they were.
+    const moving = tenantAuthResources(tenant('alpha'), cfg, { ...inputs, legacyApiKeys: true });
+    expect(secretRules(moving, 'di-runtime-alpha')).toEqual([
+      { apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list'] },
+    ]);
+  });
+
   it('publishes the member list under the name and format tenant-auth reads', () => {
     expect(TENANT_MEMBERS_CONFIG).toBe(MEMBERS_CONFIG);
     const objects = tenantAuthResources(tenant('alpha'), cfg, inputs);
@@ -596,6 +637,14 @@ class RecordingApi implements Api {
     }
     const data = structuredClone(body) as Resource;
     if (data.apiVersion?.startsWith(`${RBAC_GROUP}/`)) this.written.push(structuredClone(data));
+    if (method === 'POST') {
+      // A create names the collection; the object is stored under its own path.
+      const at = `${target}/${data.metadata.name}`;
+      if (this.objects.has(at)) throw new ApiError(409, 'AlreadyExists');
+      data.metadata.uid ??= `${data.metadata.name}-uid`;
+      this.objects.set(at, data);
+      return structuredClone(data) as T;
+    }
     const value = {
       ...existing,
       ...data,
@@ -603,11 +652,15 @@ class RecordingApi implements Api {
     } as Resource;
     value.metadata.uid ??= `${value.metadata.name}-uid`;
     value.metadata.generation ??= 1;
-    if (value.kind === 'Deployment')
+    if (value.kind === 'Deployment') {
+      const replicas = (value.spec as { replicas: number }).replicas;
       value.status = {
         observedGeneration: 1,
-        readyReplicas: (value.spec as { replicas: number }).replicas,
+        replicas,
+        updatedReplicas: replicas,
+        readyReplicas: replicas,
       };
+    }
     // Kubernetes fills ServiceAccount token Secrets.
     if (value.kind === 'Secret' && value.type === 'kubernetes.io/service-account-token')
       value.data = { token: 'dG9rZW4=' };
@@ -628,7 +681,11 @@ describe('platform controller RBAC at runtime (#321)', () => {
       },
     },
   };
-  /** alpha: two members and a registry the hosts pull from; beta: suspended; gamma: no members. */
+  const LEGACY_KEYS = ['0123456789abcdef', 'fedcba9876543210'];
+  /**
+   * alpha: two members, a registry the hosts pull from and API keys in the old layout; beta:
+   * suspended; gamma: no members.
+   */
   function setup(api = new RecordingApi()) {
     const beta = tenant('beta');
     beta.spec.suspended = true;
@@ -692,6 +749,23 @@ describe('platform controller RBAC at runtime (#321)', () => {
         kind,
         metadata: { name: LOG_READER, namespace, uid: `${namespace}-${kind}`, labels },
       });
+    // API keys alpha's controller stored in its runtime namespace before #379.
+    for (const id of LEGACY_KEYS)
+      api.seed({
+        apiVersion: 'v1',
+        kind: 'Secret',
+        metadata: {
+          name: `di-apikey-${id}`,
+          namespace: 'di-runtime-alpha',
+          labels: {
+            'platform.di-framework.dev/api-key': 'true',
+            'platform.di-framework.dev/tenant': 'alpha',
+            'platform.di-framework.dev/user': 'alice',
+          },
+        },
+        type: 'Opaque',
+        data: { hash: Buffer.from(id).toString('base64') },
+      });
     return { api, controller: new Controller(api, registryCfg), tenants, users };
   }
   async function run() {
@@ -747,6 +821,78 @@ describe('platform controller RBAC at runtime (#321)', () => {
     expect(names.has('RoleBinding di-tenant-alpha/di-user-alice')).toBe(true);
     expect(names.has('RoleBinding di-runtime-alpha/di-user-bob')).toBe(true);
     expect([...names].some((n) => n.includes('di-user-carol'))).toBe(false);
+  });
+
+  it('moves the API keys, then drops every Secret rule in the runtime namespace (#379)', async () => {
+    const { api, written } = await run();
+    const secret = (namespace: string, id: string) =>
+      api.objects.get(`${collection('v1', 'Secret', namespace)}/di-apikey-${id}`);
+    for (const id of LEGACY_KEYS) {
+      expect(secret('di-runtime-alpha', id)).toBeUndefined();
+      expect(secret('di-apikeys-alpha', id)?.data).toEqual({
+        hash: Buffer.from(id).toString('base64'),
+      });
+    }
+    const keysRole = (namespace: string) =>
+      written.filter((o) => ref(o) === `Role ${namespace}/tenant-controller-keys`);
+    // The first pass ran the old image's layout: keys stayed put and stayed readable there.
+    const [first, ...later] = keysRole('di-runtime-alpha');
+    expect(rulesOf(first as Resource).some((r) => r.resources.includes('secrets'))).toBe(true);
+    expect(later.length).toBeGreaterThan(0);
+    for (const role of later)
+      expect(rulesOf(role).some((r) => r.resources.includes('secrets'))).toBe(false);
+    // Every tenant ends with no Secret rule in its runtime namespace.
+    for (const t of ['alpha', 'beta', 'gamma']) {
+      const last = keysRole(`di-runtime-${t}`).at(-1) as Resource;
+      expect(rulesOf(last).flatMap((r) => r.resources)).toEqual(['configmaps']);
+      expect(rulesOf(keysRole(`di-apikeys-${t}`).at(-1) as Resource)).toEqual([
+        { apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list', 'create', 'delete'] },
+      ]);
+    }
+    const status = api.objects.get(`${collection(VERSION, 'Tenant')}/alpha`)?.status as
+      | Record<string, unknown>
+      | undefined;
+    expect(status).toMatchObject({
+      apiKeysNamespace: 'di-apikeys-alpha',
+      apiKeysMigrated: true,
+    });
+  });
+
+  it('creates the API-key namespace where the admission binding applies, with its quota', async () => {
+    const { api } = await run();
+    const namespace = api.objects.get(`${collection('v1', 'Namespace')}/di-apikeys-alpha`);
+    const labels = namespace?.metadata.labels ?? {};
+    expect(labels).toMatchObject({
+      [INSTALLATION]: 'test',
+      [OWNER]: 'alpha-uid',
+      'platform.di-framework.dev/tenant': 'alpha',
+    });
+    // The tenant-controller-secrets binding selects namespaces by exactly these labels.
+    const binding = admissionResources('test', cfg.namespace).find(
+      (r) =>
+        r.kind === 'ValidatingAdmissionPolicyBinding' &&
+        r.metadata.name === 'test-tenant-controller-secrets',
+    ) as Resource;
+    const selector = (
+      binding.spec as {
+        matchResources: {
+          namespaceSelector: {
+            matchLabels: Record<string, string>;
+            matchExpressions: { key: string; operator: string }[];
+          };
+        };
+      }
+    ).matchResources.namespaceSelector;
+    for (const [key, value] of Object.entries(selector.matchLabels))
+      expect(labels[key]).toBe(value);
+    for (const { key, operator } of selector.matchExpressions) {
+      expect(operator).toBe('Exists');
+      expect(labels[key]).toBeDefined();
+    }
+    expect(
+      api.objects.get(`${collection('v1', 'ResourceQuota', 'di-apikeys-alpha')}/di-apikeys-quota`)
+        ?.spec,
+    ).toEqual({ hard: { 'count/secrets': '1000', pods: '0' } });
   });
 
   it('holds every rule of every Role and ClusterRole it writes', async () => {
@@ -844,6 +990,63 @@ describe('platform controller RBAC at runtime (#321)', () => {
       return super.call<T>(method, path, body);
     }
   }
+  it('finishes an interrupted key move on the next pass, keeping the read rule until then', async () => {
+    const api = new FailOnceApi(
+      (method, path) =>
+        method === 'DELETE' && path.includes('/namespaces/di-runtime-alpha/secrets/di-apikey-'),
+      'key delete failed',
+    );
+    const { controller, tenants, users } = setup(api);
+    const alpha = tenants[0] as Tenant;
+    const status = () =>
+      api.objects.get(`${collection(VERSION, 'Tenant')}/alpha`)?.status as
+        | { apiKeysMigrated?: boolean; conditions?: { type: string; reason: string }[] }
+        | undefined;
+    const secret = (namespace: string, id: string) =>
+      api.objects.get(`${collection('v1', 'Secret', namespace)}/di-apikey-${id}`);
+    const runtimeSecretRules = () =>
+      rulesOf(
+        api.objects.get(
+          `${collection(`${RBAC_GROUP}/v1`, 'Role', 'di-runtime-alpha')}/tenant-controller-keys`,
+        ) as Resource,
+      ).filter((r) => r.resources.includes('secrets'));
+    const [log, error] = [console.log, console.error];
+    console.log = () => {};
+    console.error = () => {};
+    try {
+      // Pass 1 rolls out the tenant controller; pass 2 copies the first key, then fails to
+      // delete its original.
+      await controller.reconcileTenant(alpha, users);
+      await controller.reconcileTenant(alpha, users);
+      const [first, second] = LEGACY_KEYS as [string, string];
+      expect(secret('di-apikeys-alpha', first)).toBeDefined();
+      expect(secret('di-runtime-alpha', first)).toBeDefined();
+      expect(secret('di-runtime-alpha', second)).toBeDefined();
+      expect(status()?.conditions?.find((c) => c.type === 'TenantAuthReady')).toMatchObject({
+        reason: 'ApiKeyMigrationFailed',
+      });
+      expect(status()?.apiKeysMigrated).toBeUndefined();
+      // The tenant controller can still read the keys that are left where they were.
+      expect(runtimeSecretRules()).toEqual([
+        { apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list'] },
+      ]);
+      // Pass 3 finds the copy, checks it, deletes the original and moves the rest.
+      await controller.reconcileTenant(alpha, users);
+    } finally {
+      console.log = log;
+      console.error = error;
+    }
+    for (const id of LEGACY_KEYS) {
+      expect(secret('di-runtime-alpha', id)).toBeUndefined();
+      expect(secret('di-apikeys-alpha', id)).toBeDefined();
+    }
+    expect(runtimeSecretRules()).toEqual([]);
+    expect(status()?.apiKeysMigrated).toBe(true);
+    expect(status()?.conditions?.find((c) => c.type === 'TenantAuthReady')?.reason).not.toBe(
+      'ApiKeyMigrationFailed',
+    );
+  });
+
   /** Reconciles alpha once against `api`, with the controller's error log silenced. */
   async function reconcileAlpha(api: RecordingApi) {
     const { controller, tenants, users } = setup(api);

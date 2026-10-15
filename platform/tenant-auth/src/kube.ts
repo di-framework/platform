@@ -25,6 +25,8 @@ export interface UserResource {
 export interface TenantResource {
   metadata: { name: string };
   spec: { suspended?: boolean };
+  /** `apiKeysMigrated`: the platform moved every API key out of the runtime namespace (#379). */
+  status?: { apiKeysMigrated?: boolean };
 }
 export interface SecretResource {
   metadata: {

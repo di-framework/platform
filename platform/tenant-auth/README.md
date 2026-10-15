@@ -56,8 +56,10 @@ The tenant CLI is `di-tenant` in `@di-framework/tenant-cli`.
 * **CLI** (`di-tenant` in `@di-framework/tenant-cli`): `login` runs the browser flow and stores a
   JSON credential (tokens and metadata, mode 0600) under `~/.di-framework`. It talks to the tenant
   controller only. See `platform/tenant-cli/README.md` for commands and flags.
-* **API keys**: `dik_<id>_<secret>`, SHA-256 hash stored as a Secret in `di-runtime-<t>`, which
-  tenant users cannot read. A key is a bearer token in its own right and acts as its creator,
+* **API keys**: `dik_<id>_<secret>`, SHA-256 hash stored as a Secret in `di-apikeys-<t>`, a
+  namespace that holds only keys and that tenant users cannot read (#379). Keys made before
+  #379 are in `di-runtime-<t>`; the controller also reads them there until the platform reports
+  them moved (`status.apiKeysMigrated` on the Tenant). A key is a bearer token in its own right and acts as its creator,
   only in its tenant. Revocation is deletion.
 * **Revocation points**: expiry (identity access tokens are 10 min; refresh rotates), console
   logout (revokes the refresh token), key revoke, and the `User` CR: suspending it deletes the

@@ -290,11 +290,10 @@ workloads, so a NetworkPolicy cannot either. The registry now has its own NATS a
     keys only from the platform controller, only on the registry's entry, only together, and only
     with exactly these values; `di-bs-*` and `di-binding-*` ConfigMaps and Secrets can never carry
     them.
-  - Who can read the password: the platform controller, which writes it, and the tenant
-    controller (tenant-auth), whose `tenant-controller-keys` Role reads every Secret in
-    `di-runtime-<tenant>` because its API-key Secrets have generated names that `resourceNames`
-    cannot list. Both are platform components already in the registry's trust path (the tenant
-    controller authorizes every registry request); tenant users and workloads cannot read it.
+  - Who can read the password: the platform controller, which writes it. Tenant users and
+    workloads cannot read it, and since #379 neither can the tenant controller (tenant-auth): its
+    API keys moved to `di-apikeys-<tenant>`, and it keeps no Secret rule in `di-runtime-<tenant>`
+    once they are moved (see "Upgrading to API keys in their own namespace (#379)").
 
 **The one-time move of the registry store**
 
@@ -443,14 +442,71 @@ rejects it. Do not change those URLs while downgraded. If they did change, eithe
 - replace the CA at once as for a revocation (see "Revoking a compromised CA"), after which every
   host, console and kubeconfig needs the new bundle.
 
+#### Upgrading to API keys in their own namespace (#379)
+
+Tenant API keys move from `di-runtime-<tenant>` to a new namespace, `di-apikeys-<tenant>`, and the
+tenant controller loses every Secret rule in the runtime namespace, where the console's OAuth
+client, the registry pull token, the registry's NATS credentials and the TLS Secrets live. Nothing
+has to be done before `pulumi up`, and existing keys keep working throughout:
+
+- **The namespace.** The platform controller creates `di-apikeys-<tenant>` with the tenant's other
+  namespaces, labelled with the installation, tenant and owner like them, so the
+  `<installation>-tenant-controller-secrets` admission policy applies there. It holds one Secret per
+  key and nothing else; no pod runs there. ResourceQuota `di-apikeys-quota` caps the keys with
+  `count/secrets` (`spec.resources.apiKeys`, default `1000`, `1`–`10000`; set it as described in
+  "Upgrading to a version that adds a Tenant spec field") and admits no pod. A create beyond the cap
+  fails with the API server's quota error. It is removed with the tenant under `deletionPolicy:
+  Delete` and kept under `Retain`, like the other two.
+- **RBAC and admission.** Role `tenant-controller-keys` in `di-apikeys-<tenant>` grants the tenant
+  controller `get`, `list`, `create` and `delete` on Secrets there. The Role of that name in
+  `di-runtime-<tenant>` keeps only `get` on ConfigMap `tenant-controller-members`. Admission
+  admits the tenant controller's Secret writes only as `di-apikey-<16 hex>` Secrets labelled as API
+  keys of its tenant, in that tenant's `di-apikeys-<tenant>`, from
+  `system:serviceaccount:di-runtime-<tenant>:tenant-controller`.
+- **The move, per tenant, in this order:**
+  1. The first pass renders the new namespace, its Role and binding and the new tenant-auth
+     image. While keys are left in the runtime namespace, the runtime Role also keeps a read-only
+     (`get`, `list`) Secret rule there, so the controller can still find them.
+  2. Once the `tenant-controller` Deployment has rolled out that image (the image this package
+     pins, every counted pod updated), the platform controller copies each `di-apikey-*` Secret
+     labelled as a key of the tenant into `di-apikeys-<tenant>` with the same name, labels and data,
+     reads the copy back and compares it, and only then deletes the original. The new image looks a
+     key up in `di-apikeys-<tenant>` first and in `di-runtime-<tenant>` second, so a key is found
+     before its copy, between copy and delete, and after.
+  3. The pass that finds no key left drops the read rule from the runtime Role and sets
+     `status.apiKeysMigrated: true` (next to `status.apiKeysNamespace`) on the Tenant. The tenant
+     controller reads that status (rechecked every 30 seconds) and stops looking in the runtime
+     namespace; until it does, a `403` there counts as "no key there".
+
+  Every step is idempotent. An interrupted pass (a key copied but its original not deleted) is
+  finished by the next one, which finds the copy, compares it and deletes the original. A copy is
+  never overwritten: if a Secret of that name in `di-apikeys-<tenant>` holds something else, the
+  original is kept and `TenantAuthReady` turns `False` with reason `ApiKeyMigrationFailed`, naming
+  the Secret; remove the wrong copy and the next pass moves the key. The same reason reports a
+  copy the quota refused; raise `spec.resources.apiKeys`. The read rule stays until the move is
+  done.
+- **What users see.** Keys keep working and are listed once, wherever they are. Revoking a key that
+  is still in the runtime namespace answers `409` ("try again in a minute") until it is moved,
+  because the tenant controller may not delete there. While the old tenant-auth image still runs
+  during the rollout, creating or revoking a key fails: admission no longer admits its writes in
+  the runtime namespace. Retry once the pod has restarted.
+- **What operators see.** The new namespace (`kubectl get ns di-apikeys-<tenant>`), the keys in it
+  (`kubectl get secrets -n di-apikeys-<tenant> -l platform.di-framework.dev/api-key=true`), and the
+  Tenant's `.status.apiKeysMigrated`. The controller logs
+  `moved N API keys from di-runtime-<tenant> to di-apikeys-<tenant>` once per pass that moves any.
+- **Downgrading** to a package without this change puts back the runtime Secret rule and the old
+  admission rule, and runs a tenant-auth image that reads only the runtime namespace: keys already
+  moved stop working until you upgrade again (nothing is deleted). The older package leaves
+  `di-apikeys-<tenant>` alone.
+
 ### Tenant removal and namespace retention
 
 Each `tenants` entry takes `deletionPolicy` (`Retain` or `Delete`, default `Retain`). The
 controller reads the policy from the Tenant object on the cluster when that object is deleted,
 not from your config at that moment.
 
-- `Retain`: the controller scales the workload to zero and keeps the `di-tenant-<name>` and
-  `di-runtime-<name>` namespaces. It removes the Tenant's finalizer only after the tenant's host
+- `Retain`: the controller scales the workload to zero and keeps the `di-tenant-<name>`,
+  `di-runtime-<name>` and `di-apikeys-<name>` namespaces. It removes the Tenant's finalizer only after the tenant's host
   pods are gone, terminating ones included, so the runtime operator can still clear their
   finalizers (#245). Finished pods (`Succeeded` or `Failed`, such as evicted ones) do not count.
   While it waits, the Tenant's `Ready` condition is `False` with reason `WaitingForHostPods` and
@@ -460,7 +516,7 @@ not from your config at that moment.
   `kubectl delete pod -n di-runtime-<name> <pod> --grace-period=0 --force`. A pod that still
   lists `runtime.wasmcloud.dev/pod-host-finalizer` after that is waiting for the runtime
   operator; make sure it is running, since it clears the finalizer while the Tenant exists.
-- `Delete`: the controller deletes both namespaces, and with them their PVCs (subject to the
+- `Delete`: the controller deletes the three namespaces, and with them their PVCs (subject to the
   StorageClass reclaim policy). It does not remove the on-disk tenant data directories: backend
   data lives in tenant-UID hostPath directories under the storage root, which namespace deletion
   does not erase.
@@ -470,7 +526,7 @@ adopted over them and does not pick the old data back up, so re-adding a name af
 removal means deleting the kept namespaces first (below).
 
 When `up` or a preview removes a tenant whose live policy is `Retain` (or unset), it prints a
-warning naming the kept `di-tenant-<name>` and `di-runtime-<name>` namespaces and how to remove
+warning naming the kept `di-tenant-<name>`, `di-runtime-<name>` and `di-apikeys-<name>` namespaces and how to remove
 them. The check reads the cluster with the program's kubeconfig.
 
 Removing a tenant and its namespaces takes two `up` runs, because once the entry is gone
@@ -491,8 +547,8 @@ A tenant already removed under `Retain` has no Tenant object left to patch. Remo
 namespaces by hand after checking the installation and owner labels:
 
 ```sh
-kubectl get ns di-tenant-alpha di-runtime-alpha --show-labels
-kubectl delete namespace di-tenant-alpha di-runtime-alpha
+kubectl get ns di-tenant-alpha di-runtime-alpha di-apikeys-alpha --show-labels
+kubectl delete namespace di-tenant-alpha di-runtime-alpha di-apikeys-alpha
 ```
 
 ## Existing-cluster configuration
@@ -1197,17 +1253,18 @@ tenantAuth:
   The CAs and their keys are in Secret `tenant-controller-ca-<tenant>` in the platform namespace
   (#170): `ca.crt` and `ca.key` sign the leaf, and during a rotation `next.crt`/`next.key` or
   `previous.crt` hold the other CA. No pod mounts it, and neither tenant members nor the tenant
-  controller's ServiceAccount can read it: that ServiceAccount's `tenant-controller-keys` Role (for
-  API-key Secrets) grants `get`, `list`, `create` and `delete` on every Secret in the runtime
-  namespace, because API-key Secrets have generated names, and in the platform namespace it may
-  only request tokens for its members. The
+  controller's ServiceAccount can read it: that ServiceAccount's Secret rights are in
+  `di-apikeys-<tenant>` only (#379), where Role `tenant-controller-keys` grants `get`, `list`,
+  `create` and `delete` on Secrets because API-key Secrets have generated names; in the runtime
+  namespace it has no Secret rule (only `get` on ConfigMap `tenant-controller-members`), and in
+  the platform namespace it may only request tokens for its members. The
   `<installation>-tenant-controller-secrets` admission policy (#321) limits its writes: it may
   create and delete only `di-apikey-<16 hex>` Secrets labelled
-  `platform.di-framework.dev/api-key: "true"` with its own tenant, and update none. The caller's
-  ServiceAccount namespace must be the request's, so one tenant's controller cannot write in
-  another tenant's namespace even if its RBAC allowed it. It can no
-  longer delete `tenant-controller-tls`, `tenant-console-oauth` or the registry pull Secret. Its
-  reads in the runtime namespace are not narrowed. Deleting the tenant (or unsetting `tenantAuth`)
+  `platform.di-framework.dev/api-key: "true"` with its own tenant, in that tenant's
+  `di-apikeys-<tenant>`, as `system:serviceaccount:di-runtime-<tenant>:tenant-controller`, and
+  update none. So one tenant's controller cannot write in another tenant's namespace even if its
+  RBAC allowed it, and it can neither read nor write `tenant-controller-tls`,
+  `tenant-console-oauth` or the registry pull and NATS Secrets. Deleting the tenant (or unsetting `tenantAuth`)
   deletes `tenant-controller-ca-<tenant>` with the other tenant-auth objects.
   The leaf is replaced 30 days before it expires, when its names change (within what the CA
   permits, see "Name constraints" below), or when it no longer
@@ -1573,7 +1630,7 @@ tenantAuth:
 The reconcile does not adopt objects that the removed manual deploy script created (they carry
 the component and tenant labels but not the installation label; `TenantAuthReady` reports
 `Refusing to adopt`). Delete them first: in `di-runtime-<tenant>` the Deployments, Services,
-ServiceAccounts, Role and RoleBinding `tenant-controller-keys`, NetworkPolicy, Secrets
+ServiceAccounts, Role and RoleBinding `tenant-controller-keys` (also in `di-apikeys-<tenant>`), NetworkPolicy, Secrets
 `tenant-controller-tls`, `tenant-controller-ca-key` and `tenant-console-oauth`, and ConfigMaps `tenant-controller-ca`,
 `tenant-controller-members` and `tenant-auth-bundle`; in `di-tenant-<tenant>` the Role and RoleBinding
 `tenant-controller-secret-reader`; in the platform namespace the Role and RoleBinding

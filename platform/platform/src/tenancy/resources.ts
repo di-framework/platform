@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { API_KEYS_LIMITS, apiKeysNamespace, DEFAULT_API_KEYS } from './api-keys';
 import { backingServiceCrds, DELETION_POLICIES } from './backing-services';
 import { PRIVATE_IPV4_RANGES } from './egress';
 import {
@@ -58,6 +59,8 @@ export interface TenantSpec {
     backingServices?: number;
     /** Max concurrent ServiceBinding objects in the tenant namespace (default 40). */
     serviceBindings?: number;
+    /** Max API keys of the tenant: `count/secrets` in `di-apikeys-<tenant>` (default 1000, #379). */
+    apiKeys?: number;
   };
 }
 export const CORE_INSTANCES = { default: 100, minimum: 1, maximum: 10000 } as const;
@@ -291,6 +294,11 @@ export interface TenantAuthInputs {
    * once the store is in its account. Absent, the registry stays anonymous in `TENANT`.
    */
   registryNats?: RegistryNatsMode;
+  /**
+   * API-key Secrets are still in the runtime namespace (#379): the tenant controller keeps a
+   * read-only Secret rule there until they are moved. Absent, it has no Secret rule there.
+   */
+  legacyApiKeys?: boolean;
 }
 /** How the registry's blobstore entry reaches `di-nats` (#159); see {@link TenantAuthInputs}. */
 export type RegistryNatsMode = 'stopped' | 'credentials';
@@ -768,6 +776,7 @@ const crds = [
             workloads: { type: 'integer', minimum: 1, maximum: 1000, default: 20 },
             backingServices: { type: 'integer', minimum: 1, maximum: 100, default: 10 },
             serviceBindings: { type: 'integer', minimum: 1, maximum: 400, default: 40 },
+            apiKeys: { type: 'integer', ...API_KEYS_LIMITS, default: DEFAULT_API_KEYS },
           },
         },
       },
@@ -775,6 +784,10 @@ const crds = [
     {
       namespace: { type: 'string' },
       runtimeNamespace: { type: 'string' },
+      apiKeysNamespace: { type: 'string' },
+      // Set once every API key is out of the runtime namespace (#379); tenant-auth then stops
+      // reading the old layout.
+      apiKeysMigrated: { type: 'boolean' },
       hostgroup: { type: 'string' },
       httpService: { type: 'string' },
     },
@@ -816,6 +829,7 @@ function names(name: string) {
   return {
     namespace: `di-tenant-${name}`,
     runtimeNamespace: `di-runtime-${name}`,
+    apiKeysNamespace: apiKeysNamespace(name),
     hostgroup: `tenant-${name}`,
   };
 }
@@ -926,6 +940,29 @@ function tenantQuota(tenant: Tenant, cfg: ControllerConfig, withRegistry: boolea
   );
 }
 /**
+ * The quota of `di-apikeys-<tenant>` (#379): `count/secrets` is the tenant's API-key cap
+ * (`spec.resources.apiKeys`), since the namespace holds one Secret per key and nothing else. No
+ * pod runs there, so it admits none.
+ */
+function apiKeysQuota(tenant: Tenant, cfg: ControllerConfig): Resource {
+  return resource(
+    tenant,
+    cfg.installation,
+    'v1',
+    'ResourceQuota',
+    'di-apikeys-quota',
+    names(tenant.metadata.name).apiKeysNamespace,
+    {
+      spec: {
+        hard: {
+          'count/secrets': String(tenant.spec.resources?.apiKeys ?? DEFAULT_API_KEYS),
+          pods: '0',
+        },
+      },
+    },
+  );
+}
+/**
  * Egress of `di-tenant-network`: the tenant's own namespaces, cluster DNS, the platform's NATS
  * and registry, and public HTTPS. Tenant-auth pods get the same through `tenant-auth-network`.
  */
@@ -1016,6 +1053,7 @@ function tenantResources(
   const result = [
     tenantQuota(tenant, cfg, registryQuota),
     runtimeQuota(tenant, cfg, tenantAuthQuota, migrationJob),
+    apiKeysQuota(tenant, cfg),
     make('rbac.authorization.k8s.io/v1', 'Role', 'di-developer', n.namespace, {
       rules: [
         workloadRead,
@@ -2050,18 +2088,28 @@ function tenantAuthResources(
           ]
         : [],
     }),
-    // API-key Secrets in its own namespace, and the member list it reads for `/-/members`.
-    // Secret names are generated, so `resourceNames` cannot narrow these; the
-    // `tenant-controller-secrets` admission policy limits its writes to API-key Secrets (#321).
+    // In its own namespace, only the member list it reads for `/-/members`: no Secret rule
+    // (#379). While API keys are still being moved out of it, it may also read them there; that
+    // rule goes in the pass that finds none left (see `migrateApiKeys`).
     make(rbac, 'Role', 'tenant-controller-keys', namespace, {
       rules: [
-        { apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list', 'create', 'delete'] },
         {
           apiGroups: [''],
           resources: ['configmaps'],
           verbs: ['get'],
           resourceNames: [TENANT_MEMBERS_CONFIG],
         },
+        ...(inputs.legacyApiKeys
+          ? [{ apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list'] }]
+          : []),
+      ],
+    }),
+    // API-key Secrets, in `di-apikeys-<tenant>`, which holds nothing else (#379). Secret names
+    // are generated, so `resourceNames` cannot narrow these; the `tenant-controller-secrets`
+    // admission policy limits its writes to API-key Secrets of its own tenant (#321).
+    make(rbac, 'Role', 'tenant-controller-keys', n.apiKeysNamespace, {
+      rules: [
+        { apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list', 'create', 'delete'] },
       ],
     }),
     // Tenant developers can only write Secrets (#112), so `/v1` reads them as the controller;
@@ -2089,14 +2137,16 @@ function tenantAuthResources(
         },
         subjects,
       }),
-      make(rbac, 'RoleBinding', 'tenant-controller-keys', namespace, {
-        roleRef: {
-          apiGroup: 'rbac.authorization.k8s.io',
-          kind: 'Role',
-          name: 'tenant-controller-keys',
-        },
-        subjects,
-      }),
+      ...[namespace, n.apiKeysNamespace].map((ns) =>
+        make(rbac, 'RoleBinding', 'tenant-controller-keys', ns, {
+          roleRef: {
+            apiGroup: 'rbac.authorization.k8s.io',
+            kind: 'Role',
+            name: 'tenant-controller-keys',
+          },
+          subjects,
+        }),
+      ),
       make(rbac, 'RoleBinding', 'tenant-controller-secret-reader', n.namespace, {
         roleRef: {
           apiGroup: 'rbac.authorization.k8s.io',
@@ -2473,6 +2523,7 @@ export {
   validateServiceSpec,
 } from './backing-services';
 export {
+  apiKeysQuota,
   COMPONENT,
   controllerTrustBundle,
   crds,

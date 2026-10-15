@@ -637,13 +637,19 @@ describe('tenant and user resource reconciliation', () => {
     expect(t.metadata.finalizers).toContain(FINALIZER);
     expect(t.status?.conditions?.[0]?.message).toEndWith(': evicted-terminating');
   });
-  it('waits for both namespaces to disappear before completing Delete', async () => {
+  it('waits for its namespaces to disappear before completing Delete', async () => {
     const { api, controller, t } = prepare();
     await controller.reconcileTenant(t);
+    const namespaces = ['di-tenant-alpha', 'di-runtime-alpha', 'di-apikeys-alpha'];
+    const live = () =>
+      namespaces.filter((name) => api.objects.has(`${collection('v1', 'Namespace')}/${name}`));
+    expect(live()).toEqual(namespaces);
     t.spec.deletionPolicy = 'Delete';
     t.metadata.deletionTimestamp = new Date().toISOString();
     api.seed(t);
     await controller.reconcileTenant(t);
+    // The API-key namespace (#379) goes with the others.
+    expect(live()).toEqual([]);
     expect(t.metadata.finalizers).toContain(FINALIZER);
     await controller.reconcileTenant(t);
     expect(t.metadata.finalizers).not.toContain(FINALIZER);
