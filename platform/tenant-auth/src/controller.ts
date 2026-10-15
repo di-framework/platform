@@ -1344,13 +1344,11 @@ export class Controller {
     }
     const revoke = /^DELETE \/-\/keys\/([0-9a-f]{16})$/.exec(route);
     if (revoke?.[1]) {
-      let revoked: boolean;
-      try {
-        revoked = await revokeApiKey(this.keys, principal.user, revoke[1]);
-      } catch (error) {
-        if (error instanceof ApiKeyMigrationPending) throw new AuthError(409, error.message);
-        throw error;
-      }
+      const revoked = await revokeApiKey(this.keys, principal.user, revoke[1]).catch(
+        (error: unknown) => {
+          throw error instanceof ApiKeyMigrationPending ? new AuthError(409, error.message) : error;
+        },
+      );
       if (!revoked) throw new AuthError(404, 'no such key');
       this.audit('apikey.revoked', { user: principal.user, id: revoke[1] });
       return new Response(null, { status: 204 });

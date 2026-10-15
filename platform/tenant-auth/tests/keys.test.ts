@@ -19,6 +19,8 @@ import { type KubeClient, KubeError, type SecretResource } from '../src/kube.ts'
 interface FakeKubeState {
   /** Namespaces whose Secrets the controller may not read (its rule there is gone). */
   forbidden: Set<string>;
+  /** Namespaces whose Secret reads fail with a server error. */
+  failing?: Set<string>;
   /** The Tenant's `status.apiKeysMigrated`; `error` makes the read fail. */
   migrated: boolean | 'error';
   tenantReads: number;
@@ -30,6 +32,7 @@ function fakeKube(state?: FakeKubeState): KubeClient & { secrets: Map<string, Se
   const key = (namespace: string, name: string) => `${namespace}/${name}`;
   const guard = (namespace: string) => {
     if (state?.forbidden.has(namespace)) throw new KubeError(403, 'secrets is forbidden');
+    if (state?.failing?.has(namespace)) throw new KubeError(500, 'etcdserver: request timed out');
   };
   return {
     secrets,
@@ -200,6 +203,12 @@ describe('api keys across the move to di-apikeys-<tenant> (#379)', () => {
     expect((await listApiKeys(store, 'alice')).map((k) => k.id)).toEqual([issued.id]);
     await expect(resolveApiKey(store, generateKey().value)).rejects.toThrow('unknown or revoked');
     expect(await revokeApiKey(store, 'alice', issued.id)).toBe(true);
+  });
+
+  test('any other failure in the old namespace is an error, not a missing key', async () => {
+    const { state, store } = setup();
+    state.failing = new Set([RUNTIME]);
+    await expect(resolveApiKey(store, generateKey().value)).rejects.toThrow('timed out');
   });
 
   test('stops reading the old layout once the platform reports the move done', async () => {
