@@ -6,6 +6,8 @@ import {
   CA_RENEW_DAYS,
   type ControllerCas,
   LEAF_RENEW_DAYS,
+  leafNames,
+  MIN_POST_SWITCH_DAYS,
   rotateCas,
 } from '../src/tenancy/ca-rotation';
 import { controllerTrustBundle } from '../src/tenancy/resources';
@@ -14,12 +16,13 @@ import {
   caCertificate,
   caPermittedDns,
   holdsCaKey,
+  inDnsSubtree,
   type KeyPair,
   leafCertificate,
   namesPermittedBy,
   selfSignedCertificate,
 } from '../src/tenancy/tls';
-import { verifiesAt, withinNameConstraints } from './support/tls';
+import { opensslVerifies, verifiesAt, withinNameConstraints } from './support/tls';
 
 const DAY = 86_400_000;
 const NAME = 'tenant-controller CA (di-runtime-alpha)';
@@ -52,20 +55,22 @@ interface Step {
 }
 /**
  * Reconcile passes from `start` on the days given, each with the DNS names wanted then (the leaf
- * also names `127.0.0.1`). Like the controller, a pass issues a leaf when there is none, when the
- * signing CA changes, or when the names the signing CA permits of those wanted change.
+ * also names `127.0.0.1`). Like the controller, a pass issues a leaf for {@link leafNames} when
+ * there is none, when the signing CA changes, or when those names change.
  */
 const walk = (start: ControllerCas, plan: [day: number, names: string[]][]): Step[] => {
   const steps: Step[] = [];
-  let [cas, leaf, leafNames] = [start, '', ''];
+  let [cas, leaf] = [start, ''];
+  let served: CertNames | undefined;
   for (const [day, dnsNames] of plan) {
     const now = at(day);
     const next = rotateCas(stored(cas), { commonName: NAME, dnsNames }, now);
-    const names = namesPermittedBy(next.current.cert, { dns: dnsNames, ips: ['127.0.0.1'] });
-    if (!leaf || next.current.cert !== cas.current.cert || JSON.stringify(names) !== leafNames) {
-      const { cert } = next.current;
-      leaf = leafCertificate(NAME, names.dns, names.ips, 365, cert, next.current.key, now).cert;
-      leafNames = JSON.stringify(names);
+    const kept = next.current.cert === cas.current.cert ? served : undefined;
+    const names = leafNames(next, { dns: dnsNames, ips: ['127.0.0.1'] }, kept);
+    if (!kept || JSON.stringify(names) !== JSON.stringify(kept)) {
+      const { cert, key } = next.current;
+      leaf = leafCertificate('localhost', names.dns, names.ips, 365, cert, key, now).cert;
+      served = names;
     }
     cas = next;
     steps.push({ at: now, cas, leaf });
@@ -75,15 +80,17 @@ const walk = (start: ControllerCas, plan: [day: number, names: string[]][]): Ste
 /**
  * A rollout is never atomic: between two passes an old or new controller pod (leaf) meets an old
  * or new host or kubeconfig (bundle). Each leaf of two adjacent steps must verify against each of
- * their bundles at the later step.
+ * their bundles at the later step, by the test helper and by `openssl verify`.
  */
 const expectNoTrustGap = (steps: Step[]) => {
   for (const [i, to] of steps.entries()) {
     const from = steps[i - 1];
     if (!from) continue;
     for (const l of [from.leaf, to.leaf])
-      for (const b of [bundle(from.cas), bundle(to.cas)])
+      for (const b of [bundle(from.cas), bundle(to.cas)]) {
         expect(verifiesAt(l, b, to.at)).toBe(true);
+        expect(opensslVerifies(l, b, to.at)).toBe(true);
+      }
   }
 };
 /** Serves a leaf `signer` issues for `dns` and `ips`, and fetches it over TLS trusting `ca`. */
@@ -308,7 +315,32 @@ describe('tenant controller CA name constraints (#365)', () => {
     expect(text).not.toContain('IP:');
     expect(caPermittedDns(caCertificate(NAME, CA_DAYS, t0).cert)).toBeUndefined();
     expect(caPermittedDns('garbage')).toBeUndefined();
+    // Subtrees that are not leaf names are refused rather than written (RFC 5280 would read an
+    // empty one as "any name" and a leading-dot one as "only names below it").
     expect(() => caCertificate(NAME, CA_DAYS, t0, [])).toThrow();
+    expect(() => caCertificate(NAME, CA_DAYS, t0, ['localhost', ''])).toThrow();
+    expect(() => caCertificate(NAME, CA_DAYS, t0, ['.localhost'])).toThrow();
+  });
+
+  it('matches DNS subtrees as RFC 5280 does', () => {
+    expect(inDnsSubtree('LocalHost', 'localhost')).toBe(true);
+    expect(inDnsSubtree('a.b.localhost', 'localhost')).toBe(true);
+    expect(inDnsSubtree('notlocalhost', 'localhost')).toBe(false);
+    expect(inDnsSubtree('localhost', '.localhost')).toBe(false);
+    expect(inDnsSubtree('a.localhost', '.localhost')).toBe(true);
+    expect(inDnsSubtree('anything.example', '')).toBe(true);
+  });
+
+  it('permits no DNS name when the name constraints do not parse (fails closed)', () => {
+    const ca = tenantCa(CA_DAYS, t0, ['zzzz']);
+    // Give the subtree's base an 8-octet length field, which no DER reader accepts. The signature
+    // breaks too, but the certificate still parses.
+    const der = Buffer.from(new X509Certificate(ca.cert).raw).toString('hex');
+    const broken = Buffer.from(der.replace('82047a7a7a7a', '82887a7a7a7a'), 'hex');
+    expect(broken.toString('hex')).not.toBe(der);
+    const pem = `-----BEGIN CERTIFICATE-----\n${broken.toString('base64')}\n-----END CERTIFICATE-----\n`;
+    expect(caPermittedDns(pem)).toEqual([]);
+    expect(namesPermittedBy(pem, { dns: ['zzzz'], ips: [] }).dns).toEqual([]);
   });
 
   it('refuses a leaf naming a DNS name outside the constraints', () => {
@@ -322,6 +354,10 @@ describe('tenant controller CA name constraints (#365)', () => {
     // So the path check in the test helper applies them itself.
     expect(withinNameConstraints(outside.cert, ca.cert)).toBe(false);
     expect(verifiesAt(outside.cert, ca.cert, at(1))).toBe(false);
+    // OpenSSL, independently of both, agrees.
+    expect(opensslVerifies(outside.cert, ca.cert, at(1))).toBe(false);
+    const inside = leafCertificate('x', NAMES, ['127.0.0.1'], 30, ca.cert, ca.key, t0);
+    expect(opensslVerifies(inside.cert, ca.cert, at(1))).toBe(true);
     // A name below a permitted subtree and any IP address are allowed (RFC 5280 §4.2.1.10).
     const below = leafCertificate('x', ['a.localhost'], ['10.1.2.3'], 30, ca.cert, ca.key, t0);
     expect(withinNameConstraints(below.cert, ca.cert)).toBe(true);
@@ -379,7 +415,7 @@ describe('tenant controller CA name constraints (#365)', () => {
     expect(verifiesAt(steady.leaf, bundle(retired.cas), retired.at)).toBe(false);
   });
 
-  it('narrows the leaf at once when a name is removed, then rotates to a narrower CA', () => {
+  it('keeps a removed name in the leaf until the switch, then rotates to a narrower CA', () => {
     const steps = walk({ current: tenantCa(CA_DAYS, t0, MOVED) }, [
       [100, MOVED],
       [101, NAMES],
@@ -389,11 +425,37 @@ describe('tenant controller CA name constraints (#365)', () => {
     expectNoTrustGap(steps);
     const [steady, published, switched] = steps as [Step, Step, Step];
     expect(sans(steady.leaf)).toContain(HOST);
-    // The current CA still permits everything wanted, so the leaf drops the host now.
+    // The current CA still permits the removed host, so it is served until the switch.
     expect(published.cas.current.cert).toBe(steady.cas.current.cert);
-    expect(sans(published.leaf)).not.toContain(HOST);
+    expect(published.leaf).toBe(steady.leaf);
     expect(caPermittedDns(published.cas.next?.cert ?? '')).toEqual(NAMES);
     expect(switched.cas.current).toEqual(published.cas.next as KeyPair);
+    expect(sans(switched.leaf)).not.toContain(HOST);
+  });
+
+  it('serves the old public host until the switch and the new one from it on', () => {
+    const OLD = [...NAMES, 'old.example.com'];
+    const NEW = [...NAMES, 'new.example.com'];
+    const steps = walk({ current: tenantCa(CA_DAYS, t0, OLD) }, [
+      [100, OLD],
+      [101, NEW],
+      [101 + CA_OVERLAP_DAYS - 1, NEW],
+      [101 + CA_OVERLAP_DAYS + 1, NEW],
+      [101 + 2 * CA_OVERLAP_DAYS + 1, NEW],
+    ]);
+    expectNoTrustGap(steps);
+    const hosts = steps.map(({ leaf }) => [
+      sans(leaf).includes('DNS:old.example.com'),
+      sans(leaf).includes('DNS:new.example.com'),
+    ]);
+    // [old, new] per step: one public host is always served, the new one from the switch on.
+    expect(hosts).toEqual([
+      [true, false],
+      [true, false],
+      [true, false],
+      [false, true],
+      [false, true],
+    ]);
   });
 
   it('replaces a published successor for names no longer wanted', () => {
@@ -409,16 +471,59 @@ describe('tenant controller CA name constraints (#365)', () => {
     expect(rotateCas(stored(again), profile(other), at(139)).next).toEqual(again.next as KeyPair);
   });
 
-  it('publishes a renamed successor again when its switch was missed by over the overlap', () => {
+  it('switches to a renamed successor only while the old CA stays long enough after', () => {
     const a = tenantCa(CA_DAYS, t0);
     const b = tenantCa(CA_DAYS, at(100), MOVED);
-    const late = rotateCas({ current: a, next: b }, profile(MOVED), at(101 + 2 * CA_OVERLAP_DAYS));
-    expect(late.current).toEqual(a);
-    expect(late.next?.cert).not.toBe(b.cert);
-    expect(caPermittedDns(late.next?.cert ?? '')).toEqual(MOVED);
+    const moved = profile(MOVED);
+    const lastSwitch = 100 + 2 * CA_OVERLAP_DAYS - MIN_POST_SWITCH_DAYS;
     // Within the window it switches, keeping A until B is twice the overlap old.
-    const timely = rotateCas({ current: a, next: b }, profile(MOVED), at(105 + CA_OVERLAP_DAYS));
+    const timely = rotateCas({ current: a, next: b }, moved, at(lastSwitch - 0.1));
     expect(timely).toEqual({ current: b, previous: a.cert });
+    // Later (the controller was not running) B is published again instead.
+    for (const day of [
+      lastSwitch + 0.1,
+      100 + 2 * CA_OVERLAP_DAYS - 0.1,
+      101 + 2 * CA_OVERLAP_DAYS,
+    ]) {
+      const late = rotateCas({ current: a, next: b }, moved, at(day));
+      expect(late.current).toEqual(a);
+      expect(late.next?.cert).not.toBe(b.cert);
+      expect(caPermittedDns(late.next?.cert ?? '')).toEqual(MOVED);
+    }
+  });
+
+  it('leaves no trust gap when the controller returns 59.9 days into a rename overlap', () => {
+    // Down from day 30 of the overlap; back when the successor is 59.9 days old.
+    const back = 101 + 2 * CA_OVERLAP_DAYS - 0.1;
+    const steps = walk({ current: tenantCa(CA_DAYS, t0) }, [
+      [100, NAMES],
+      [101, MOVED],
+      [101 + CA_OVERLAP_DAYS - 1, MOVED],
+      [back, MOVED],
+      [back + 0.1, MOVED],
+      [back + CA_OVERLAP_DAYS + 1, MOVED],
+      [back + CA_OVERLAP_DAYS + 1.1, MOVED],
+      [back + 2 * CA_OVERLAP_DAYS + 2, MOVED],
+    ]);
+    expectNoTrustGap(steps);
+    const [steady, published, , returned, after, switched, , retired] = steps as Step[] as [
+      Step,
+      Step,
+      Step,
+      Step,
+      Step,
+      Step,
+      Step,
+      Step,
+    ];
+    const a = steady.cas.current.cert;
+    // Not switched: a fresh successor is published, A keeps signing and stays in the bundle.
+    expect(returned.cas.current.cert).toBe(a);
+    expect(returned.cas.next?.cert).not.toBe(published.cas.next?.cert);
+    expect(after.cas).toEqual(returned.cas);
+    // The fresh successor is switched to after its own overlap, and A retires after that.
+    expect(switched.cas).toEqual({ current: returned.cas.next as KeyPair, previous: a });
+    expect(retired.cas).toEqual({ current: returned.cas.next as KeyPair });
   });
 
   it('rolls a CA without name constraints to a constrained one through the overlap', () => {

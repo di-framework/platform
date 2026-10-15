@@ -15,7 +15,7 @@ import {
   resolveClass,
   tenantNameFromNamespace,
 } from './backing-service-reconcile';
-import { LEAF_RENEW_DAYS, rotateCas } from './ca-rotation';
+import { LEAF_RENEW_DAYS, leafNames, rotateCas } from './ca-rotation';
 import {
   approveEgress,
   EGRESS_FIELD_MANAGER,
@@ -125,14 +125,7 @@ import {
   serviceBindingResources,
   sharedBindingConflict,
 } from './service-binding-reconcile';
-import {
-  certificateNames,
-  certificateValid,
-  holdsCaKey,
-  issuedBy,
-  leafCertificate,
-  namesPermittedBy,
-} from './tls';
+import { certificateNames, certificateValid, holdsCaKey, issuedBy, leafCertificate } from './tls';
 import {
   STORAGE_FIELD_MANAGER,
   storageKeys,
@@ -693,13 +686,14 @@ export class Controller {
       ...(cas.next ? { caNext: cas.next } : {}),
       ...(cas.previous ? { caPrevious: cas.previous } : {}),
     };
-    // While a successor for changed names is published, the leaf names only what the signing CA
-    // permits (#365); the rest are added at the switch.
-    const certNames = namesPermittedBy(ca.caCert, wanted);
+    // While a successor is published the leaf keeps the names it serves, so no host goes dark
+    // before the switch; names the signing CA does not permit wait for the switch (#365).
+    const served = issuedBy(ca.caCert, cert, key) ? certificateNames(cert) : undefined;
+    const certNames = leafNames(cas, wanted, served);
     if (
+      served &&
       certificateValid(cert, LEAF_RENEW_DAYS, now) &&
-      JSON.stringify(certificateNames(cert)) === JSON.stringify(certNames) &&
-      issuedBy(ca.caCert, cert, key)
+      JSON.stringify(served) === JSON.stringify(certNames)
     )
       return { cert, key, ...ca };
     const leaf = leafCertificate(

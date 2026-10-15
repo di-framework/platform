@@ -414,6 +414,35 @@ to be done before `pulumi up`:
   logs it once, and nothing of the pair changes until the Secret is deleted; the controller then
   writes its own.
 
+#### Upgrading to name-constrained tenant controller CAs (#365)
+
+Every tenant controller CA now carries X.509 name constraints (see "Name constraints" under
+[Tenant controller and console](#tenant-controller-and-console)). A CA from before has none, so the
+first pass after `pulumi up` starts a rotation for every tenant with tenant-auth, whatever the CA's
+age. Nothing has to be done before the upgrade, but plan for this, counted from that first pass:
+
+- **Day 0, publish.** A constrained successor joins ConfigMap `tenant-controller-ca`. The tenant
+  hosts restart (`registry-ca-sha256`) and the console restarts (`ca-bundle-sha256`). The leaf
+  does not change. Kubeconfigs the console issues from now on carry both CAs.
+- **About day 30, switch.** The successor signs a new leaf; the controller and console restart.
+  **Every kubeconfig and `--ca-file` handed out before the upgrade stops verifying here**, since
+  it holds only the old CA: fetch the bundle again (or `login` again) within those 30 days.
+- **About day 60, retire.** The old CA leaves the bundle; the hosts and console restart again.
+
+So the hosts restart twice and the console three times over about 60 days.
+
+**Downgrading** to a package without this change while a constrained CA signs (after the switch)
+keeps that CA; the older package still signs its leaf for the names it computes. If
+`routeUrlPattern`, `controllerPublicUrl` or the registry URL change while it runs, that leaf names
+hosts outside the CA's constraints and every client that applies them (Bun, Go, rustls, OpenSSL)
+rejects it. Do not change those URLs while downgraded. If they did change, either:
+
+- change them back; the next pass of the older package reissues a leaf the CA permits; or
+- upgrade again: the controller signs a leaf for the names the CA permits right away (the new
+  hosts are served from the switch on, 30 days later) and rotates to a CA for the new names; or
+- replace the CA at once as for a revocation (see "Revoking a compromised CA"), after which every
+  host, console and kubeconfig needs the new bundle.
+
 ### Tenant removal and namespace retention
 
 Each `tenants` entry takes `deletionPolicy` (`Retain` or `Delete`, default `Retain`). The
@@ -1195,41 +1224,47 @@ tenantAuth:
 
   **Name constraints (#365).** Each CA carries a critical X.509 `nameConstraints` extension
   (RFC 5280 §4.2.1.10) whose permitted DNS subtrees are exactly the leaf's DNS names: the
-  controller's in-cluster names (`tenant-controller`, `tenant-controller.<ns>.svc[.cluster.local]`,
-  `localhost`), the host of `controllerPublicUrl` and, with `tenantAuth.registry`, the host of the
-  registry's public URL and the registry pull Service names. A DNS subtree also admits the names
-  below it, so the permitted `localhost` admits every `*.localhost` host, including those a
-  `http://{host}.{tenant}.localhost` `routeUrlPattern` derives for other tenants: X.509 cannot
-  permit `localhost` alone. A certificate the CA signs for any other DNS name fails path validation in clients
-  that apply name constraints (Go, rustls/webpki, OpenSSL, BoringSSL). IP addresses are not
-  constrained: BoringSSL, which Bun's TLS client uses, rejects every chain in which an IP address
-  SAN meets an IP address constraint, and the leaf always names `127.0.0.1`.
+  controller's in-cluster names (`tenant-controller`,
+  `tenant-controller.<ns>.svc[.cluster.local]`, `localhost`), the host of `controllerPublicUrl`
+  and, with `tenantAuth.registry`, the host of the registry's public URL and the registry pull
+  Service names. A certificate the CA signs for any other DNS name fails path validation in
+  clients that apply name constraints (Go, rustls/webpki, OpenSSL, BoringSSL), so a leaked tenant
+  CA key cannot impersonate `ghcr.io`, `kubernetes.default.svc` or another Service to the hosts'
+  outgoing HTTPS.
+
+  A DNS subtree also admits the names below it, so the permitted `localhost` admits every
+  `*.localhost` host, including those a `http://{host}.{tenant}.localhost` `routeUrlPattern`
+  derives for other tenants; X.509 cannot permit `localhost` alone. The risk is low: only parties
+  that trust this tenant's CA accept such a certificate, and they resolve `*.localhost` to
+  loopback (RFC 6761), so it only helps an attacker already on the client's own loopback.
+
+  **IP addresses are not constrained yet.** The CA can sign a certificate for any IP address, and
+  every party that trusts it accepts one, including the hosts' outgoing HTTPS to `https://<ip>`.
+  BoringSSL, which Bun's TLS client uses, rejects every chain in which an IP address SAN meets an
+  IP address constraint (even a permitted one), and the leaf always names `127.0.0.1`.
+  [#381](https://github.com/di-framework/platform/issues/381) tracks dropping that SAN when the
+  public URLs are DNS names and then excluding all IP addresses.
 
   The permitted names come from `routeUrlPattern`, `controllerPublicUrl` and the registry URL, so
-  changing them changes what the CA must permit. That is a rotation through the same three steps,
-  started at once whatever the CA's age, never an in-place replacement:
-  1. *Publish*: a successor that permits the new names joins the bundle. The current CA cannot
-     sign a name it does not permit, so the leaf carries only the wanted names it permits. A new
-     name outside them is **not served until the switch**: clients that reach the controller by
-     that host get a name mismatch for up to 30 days. A new name below a permitted subtree (a
-     derived `*.localhost` host) is served at once. A removed name leaves the leaf at once, since the current CA
-     still permits all the remaining names.
-  2. *Switch*, once the successor is 30 days old: it signs a leaf for all the new names. The old
-     CA stays in the bundle as `previous.crt` until the successor is 60 days old (30 days after a
-     timely switch), so a controller pod that has not rolled yet still verifies.
+  changing them changes what the CA must permit. That starts a rotation through the same three
+  steps at once, whatever the CA's age, never an in-place replacement:
+  1. *Publish*: a successor that permits the new names joins the bundle. The current CA keeps
+     signing, and the leaf keeps every name it already serves, so **no public host goes dark**:
+     kubeconfigs that name the old host keep working until the switch. A new name the current CA
+     permits (below one of its subtrees, such as a derived `*.localhost` host) is added at once.
+     A new name it does not permit is **not served until the switch**, up to 30 days.
+  2. *Switch*, once the successor is 30 days old: it signs a leaf for exactly the new names, so a
+     removed host stops being served. The old CA stays in the bundle as `previous.crt` until the
+     successor is 60 days old (30 days after a timely switch), so a controller pod that has not
+     rolled yet still verifies.
   3. *Retire*: the old CA leaves the bundle.
 
   Changing the names again before the switch drops the unused successor (it never signed) and
-  publishes one for the latest names, restarting the 30 days. If the controller was not running
-  when the switch was due and the successor is already 60 days old, it is published again rather
-  than switched to, since the old CA would otherwise leave the bundle in the same pass as its leaf
-  stops being served. A CA from before #365 has no name constraints and is rolled to a
-  constrained one the same way, starting with the first pass after the upgrade instead of at its
-  next expiry, because an unconstrained tenant CA is trusted by the hosts' outgoing HTTPS for any
-  name (see the tenant registry section). When a CA loses its key, its replacement does not wait
-  for the overlap; if the replacement also permits other names than the lost CA (such as a CA from
-  before #365), the lost CA stays in the bundle for at most 60 days instead of 30, since the
-  certificates do not record why the names differ.
+  publishes one for the latest names, restarting the 30 days. The switch happens only while the
+  old CA would stay in the bundle at least 15 more days; if the controller was not running and the
+  successor is older than 45 days, a fresh successor is published instead and switched to after
+  its own 30 days. To cut over to new names at once instead, replace the CA as for a revocation
+  (below): every host, console and kubeconfig then needs the new bundle at once.
 
   **Revoking a compromised CA.** If a tenant CA key may have leaked, delete both Secrets that hold
   a copy of the CA certificate, in one go:
@@ -1252,7 +1287,8 @@ tenantAuth:
   If it shows `2`, a reconcile pass ran between the two deletes and kept the old CA as
   `previous.crt`; delete both Secrets again. Deleting only `tenant-controller-ca-<tenant>` is a
   lost-key replacement, not a revocation: the CA in `tenant-controller-tls` stays trusted for 30
-  days.
+  days, or 60 when the new CA permits other names than it did (during a rename rotation, or for a
+  CA from before #365, see "Name constraints").
 - Routes: when the platform gateway is published (`routeUrlPattern`), a public URL whose host is
   `<label>.{tenant}.localhost` on the gateway port is routed through it, so a new Tenant gets a
   reachable console and controller with no script. `createPlatform` derives every public URL

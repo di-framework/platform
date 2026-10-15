@@ -1582,28 +1582,37 @@ describe('reconcileTenant with tenant-auth', () => {
 
   it('rotates the CA through the overlap when the public controller host changes (#365)', async () => {
     const { api, pass, overlaps } = rotationHarness();
+    const oldAuth = { ...auth, controllerPublicUrl: 'https://old.{tenant}.example.com' };
+    const old: ControllerConfig = { ...cfg, tenantAuth: oldAuth };
     const moved: ControllerConfig = {
       ...cfg,
       tenantAuth: { ...auth, controllerPublicUrl: 'https://controller.{tenant}.example.com' },
     };
     const host = 'DNS:controller.alpha.example.com';
-    const before = await pass(0);
+    const oldHost = 'DNS:old.alpha.example.com';
+    const sans = (leaf: string) => new X509Certificate(leaf).subjectAltName;
+    const before = await pass(0, old);
     const a = decode(before.keys, 'ca.crt');
-    expect(caPermittedDns(a)).toEqual(tenantControllerCertNames('alpha', auth).dns);
-    // Publish: B permits the new host and A does not, so A's leaf is served until the switch.
+    expect(caPermittedDns(a)).toEqual(tenantControllerCertNames('alpha', oldAuth).dns);
+    expect(sans(before.leaf)).toContain(oldHost);
+    // Publish: B permits the new host and A does not, so A's leaf, for the old host, is served
+    // until the switch: kubeconfigs that name the old host keep working, none goes dark.
     const published = await pass(100, moved);
     expect(published.leaf).toBe(before.leaf);
-    expect(new X509Certificate(published.leaf).subjectAltName).not.toContain(host);
+    expect(sans(published.leaf)).toContain(oldHost);
+    expect(sans(published.leaf)).not.toContain(host);
     const b = decode(published.keys, 'next.crt');
     expect(published.bundle).toBe(a + b);
     expect(caPermittedDns(b)).toContain('controller.alpha.example.com');
     overlaps(before, published);
     expect(await pass(100 + CA_OVERLAP_DAYS - 1, moved)).toEqual(published);
-    // Switch: B signs a leaf naming the new host; the bundle bytes stay and A is kept.
+    // B signs a leaf naming the new host; the bundle bytes stay and A is kept.
     const switched = await pass(100 + CA_OVERLAP_DAYS + 1, moved);
     expect(switched.bundle).toBe(published.bundle);
     expect(issuedBy(b, switched.leaf, switched.leafKey)).toBe(true);
-    expect(new X509Certificate(switched.leaf).subjectAltName).toContain(host);
+    // Switch: the new host is served from here on and the old one is dropped.
+    expect(sans(switched.leaf)).toContain(host);
+    expect(sans(switched.leaf)).not.toContain(oldHost);
     expect(withinNameConstraints(switched.leaf, a)).toBe(false);
     const consoleDeployment = must(api, path('Deployment', 'di-runtime-alpha', 'tenant-console'));
     expect(

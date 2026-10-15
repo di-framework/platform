@@ -90,6 +90,10 @@ const NAME_CONSTRAINTS = '2.5.29.30';
  */
 const nameConstraints = (permittedDns: string[]) => {
   if (permittedDns.length === 0) throw new Error('name constraints need a permitted DNS name');
+  // An empty subtree permits every name and a leading-dot one only subdomains (RFC 5280); neither
+  // is a leaf name, and clients disagree on the latter, so they are never written.
+  const odd = permittedDns.find((dns) => dns === '' || dns.startsWith('.'));
+  if (odd !== undefined) throw new Error(`not a permitted DNS name: '${odd}'`);
   return extension(
     NAME_CONSTRAINTS,
     seq(der(0xa0, ...permittedDns.map((dns) => seq(der(0x82, Buffer.from(dns)))))),
@@ -219,18 +223,24 @@ export function caCertificate(
 
 /**
  * The permitted DNS subtrees of `ca`'s name constraints (#365); undefined when it has no name
- * constraints or does not parse. Only what {@link caCertificate} writes is read: other name forms
- * and excluded subtrees are ignored.
+ * constraints or does not parse, and none (`[]`, so it permits no DNS name) when the extension
+ * itself does not parse. Only what {@link caCertificate} writes is read: other name forms and
+ * excluded subtrees are ignored.
  */
 export function caPermittedDns(ca: string): string[] | undefined {
+  let found: Buffer | undefined;
   try {
     const tbs = children(new X509Certificate(ca).raw)[0] as Buffer;
     const extensions = children(tbs).find((field) => field[0] === 0xa3) as Buffer;
     const wanted = oid(NAME_CONSTRAINTS);
-    const found = children(children(extensions)[0] as Buffer).find((ext) =>
+    found = children(children(extensions)[0] as Buffer).find((ext) =>
       (children(ext)[0] as Buffer).equals(wanted),
     );
-    if (!found) return undefined;
+  } catch {
+    return undefined;
+  }
+  if (!found) return undefined;
+  try {
     const permitted = children(contents(children(found).at(-1) as Buffer)).filter(
       (part) => part[0] === 0xa0,
     );
@@ -239,13 +249,20 @@ export function caPermittedDns(ca: string): string[] | undefined {
       .filter((base) => base[0] === 0x82)
       .map((base) => contents(base).toString('latin1'));
   } catch {
-    return undefined;
+    // Constrained, but not readably: fail closed.
+    return [];
   }
 }
 
-/** True when the DNS name `dns` is `subtree` or below it (RFC 5280 §4.2.1.10), ignoring case. */
+/**
+ * True when the DNS name `dns` lies in the permitted subtree `subtree` (RFC 5280 §4.2.1.10),
+ * ignoring case: `subtree` itself or a name below it; only names below it for a leading-dot
+ * subtree; every name for an empty one.
+ */
 export const inDnsSubtree = (dns: string, subtree: string): boolean => {
   const [name, base] = [dns.toLowerCase(), subtree.toLowerCase()];
+  if (base === '') return true;
+  if (base.startsWith('.')) return name.length > base.length && name.endsWith(base);
   return name === base || name.endsWith(`.${base}`);
 };
 
