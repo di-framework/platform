@@ -94,6 +94,11 @@ fn main() {
         println!("database ok");
         return;
     }
+    if mode == "missing-database" {
+        missing_database_mode();
+        println!("missing database ok");
+        return;
+    }
     let db: Connection = open("/data/pglite", None).expect("open");
     assert!(matches!(
         open("/data/pglite", None),
@@ -609,6 +614,22 @@ fn database_mode() {
         Err(error) => panic!("switching databases: unexpected {error:?}"),
         Ok(_) => panic!("switching databases must fail"),
     }
+}
+
+/// A directory without the `postgres` database (initdb's last step never
+/// ran): an explicit `postgres` open fails cleanly instead of trapping, and
+/// the same instance can still open the default (`template1`).
+fn missing_database_mode() {
+    match open("/data/pglite", Some(&database("postgres"))) {
+        Err(Error::OpenFailed(message)) => {
+            assert!(message.contains("\"postgres\" does not exist"), "{message}")
+        }
+        Err(error) => panic!("missing postgres: unexpected {error:?}"),
+        Ok(_) => panic!("opening a missing postgres database must fail"),
+    }
+    let db = open("/data/pglite", None).expect("open default after the refusal");
+    assert_eq!(current_database(&db), "template1");
+    db.close().expect("close missing-database mode");
 }
 
 const SHA256_A: &str = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb";

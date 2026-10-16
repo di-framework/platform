@@ -178,11 +178,19 @@ impl Transport {
                 None => {
                     // A partially initialized engine cannot be booted again in the same memory.
                     state.poisoned = true;
-                    let booted = boot(&root, requested)?;
+                    prepare_cluster(&root)?;
+                    // The bootstrap instance (if it ran) belongs to this root now.
                     state.root = Some(root.clone());
-                    state.databases = Some(booted);
                     state.poisoned = false;
-                    (true, booted.session)
+                    // No engine runs while choosing, so a refusal here (for
+                    // example a database that does not exist) leaves the
+                    // instance usable for another open.
+                    let chosen = choose_databases(&root.join("data"), requested)?;
+                    state.poisoned = true;
+                    start_serving(&root, chosen.session)?;
+                    state.databases = Some(chosen);
+                    state.poisoned = false;
+                    (true, chosen.session)
                 }
             };
             let password = fs::read_to_string(root.join("runtime/password")).map_err(|e| e.to_string())?;
@@ -395,7 +403,7 @@ fn ensure_durability(data: &Path) -> Result<(), String> {
 ///
 /// Crash windows (each one leaves the directory safe on the next boot):
 /// 1. During initdb, before `PG_VERSION` and `global/pg_control` both exist:
-///    `boot` refuses the directory ("nonempty but has no PG_VERSION" or
+///    `prepare_cluster` refuses the directory ("nonempty but has no PG_VERSION" or
 ///    "incomplete cluster") until the operator removes it. Unchanged by #212.
 /// 2. After initdb, before or during the post-bootstrap SQL that the
 ///    bootstrap backend runs: there is no marker, so later boots use
@@ -427,7 +435,9 @@ fn initialize_cluster(root: &Path, runtime: &Path, data: &Path) -> Result<(), St
     write_marker(data)
 }
 
-fn boot(root: &Path, requested: Option<&'static str>) -> Result<Databases, String> {
+/// Install the runtime, validate PGDATA, and create the cluster with the
+/// bootstrap instance when PGDATA is empty. Starts no serving engine.
+fn prepare_cluster(root: &Path) -> Result<(), String> {
     let runtime = root.join("runtime");
     let data = root.join("data");
     fs::create_dir_all(&runtime).map_err(|e| format!("create runtime directory: {e}"))?;
@@ -463,14 +473,53 @@ fn boot(root: &Path, requested: Option<&'static str>) -> Result<Databases, Strin
     if initializing {
         initialize_cluster(root, &runtime, &data)?;
     }
-    // Decided after initdb and before the serving backend starts, from the
-    // marker that `initialize_cluster` writes, so the first session of a new
-    // directory already runs in `postgres`.
-    let default = default_database(&data)?;
+    Ok(())
+}
+
+/// Directory of a built-in database under PGDATA. initdb (PostgreSQL 15
+/// and later) creates them with fixed OIDs: `template1` = 1 and
+/// `postgres` = 5 (`PostgresDbOid`).
+pub(crate) fn database_dir(name: &str) -> Option<&'static str> {
+    match name {
+        LEGACY_DATABASE => Some("base/1"),
+        DEDICATED_DATABASE => Some("base/5"),
+        _ => None,
+    }
+}
+
+/// Pick the session database of an initialized cluster.
+///
+/// Decided after initdb and before the serving backend starts, from the
+/// marker that `initialize_cluster` writes, so the first session of a new
+/// directory already runs in `postgres`. A database whose directory is
+/// missing is refused here: the single-user backend would otherwise stop with
+/// a FATAL error and trap the component. That happens to `postgres` when a
+/// crash interrupted initdb's last step (crash window 2).
+pub(crate) fn choose_databases(
+    data: &Path,
+    requested: Option<&'static str>,
+) -> Result<Databases, String> {
+    let default = default_database(data)?;
     let session = requested.unwrap_or(default);
-    start_engine(&SERVING_ENGINE, &runtime, &data, session)?;
-    (SERVING_ENGINE.backend)();
+    let present = database_dir(session).is_some_and(|dir| data.join(dir).is_dir());
+    if !present {
+        return Err(format!(
+            "database \"{session}\" does not exist in this data directory (its initialization may not have finished); open template1, or restore the directory from a backup"
+        ));
+    }
     Ok(Databases { default, session })
+}
+
+/// Boot the serving engine on the prepared cluster in `session`.
+fn start_serving(root: &Path, session: &str) -> Result<(), String> {
+    start_engine(
+        &SERVING_ENGINE,
+        &root.join("runtime"),
+        &root.join("data"),
+        session,
+    )?;
+    (SERVING_ENGINE.backend)();
+    Ok(())
 }
 
 /// README section that explains moving a database between major versions.
@@ -513,9 +562,9 @@ fn sync_tree(dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_data_version, data_root, default_database, marker_path, parse_marker,
-        requested_database, reuse_database, write_marker, Databases, DATABASE_MARKER,
-        DEDICATED_DATABASE, LEGACY_DATABASE, POSTGRES_MAJOR, POSTGRES_VERSION,
+        check_data_version, choose_databases, data_root, database_dir, default_database,
+        marker_path, parse_marker, requested_database, reuse_database, write_marker, Databases,
+        DATABASE_MARKER, DEDICATED_DATABASE, LEGACY_DATABASE, POSTGRES_MAJOR, POSTGRES_VERSION,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -596,6 +645,45 @@ mod tests {
         let dir = TempDir::new("bad-marker");
         fs::write(dir.0.join(DATABASE_MARKER), "template0\n").unwrap();
         assert!(default_database(&dir.0).is_err());
+    }
+
+    #[test]
+    fn a_missing_database_is_refused_before_boot() {
+        let dir = TempDir::new("choose");
+        let data = &dir.0;
+        // Crash window 2: template1 exists, postgres was never created.
+        fs::create_dir_all(data.join("base/1")).unwrap();
+        assert_eq!(
+            choose_databases(data, None),
+            Ok(Databases {
+                default: "template1",
+                session: "template1"
+            })
+        );
+        let err = choose_databases(data, Some("postgres")).unwrap_err();
+        assert!(
+            err.starts_with("database \"postgres\" does not exist"),
+            "{err}"
+        );
+        // A marked directory whose postgres directory is gone fails the same way.
+        write_marker(data).unwrap();
+        assert!(choose_databases(data, None).is_err());
+        fs::create_dir_all(data.join("base/5")).unwrap();
+        assert_eq!(
+            choose_databases(data, None),
+            Ok(Databases {
+                default: "postgres",
+                session: "postgres"
+            })
+        );
+        assert_eq!(
+            choose_databases(data, Some("template1")),
+            Ok(Databases {
+                default: "postgres",
+                session: "template1"
+            })
+        );
+        assert_eq!(database_dir("template0"), None);
     }
 
     #[test]

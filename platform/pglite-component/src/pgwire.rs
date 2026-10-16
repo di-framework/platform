@@ -203,7 +203,7 @@ fn server_error(body: &[u8]) -> Error {
 
 impl Session {
     /// Open the embedded session. `database` is `open-options.database`;
-    /// `None` selects the data directory's default (see `engine::boot`).
+    /// `None` selects the data directory's default (see `engine::choose_databases`).
     pub fn connect(path: &str, database: Option<&str>) -> Result<Self, Error> {
         let opened = Transport::open(path, database).map_err(Error::OpenFailed)?;
         let fresh = opened.transport.fresh;

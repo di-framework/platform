@@ -363,22 +363,35 @@ uses a slot. A `LOAD` of a new library after the table is full fails with
 ### Application database
 
 Application data lives in the `postgres` database on data directories this
-provider initializes, and stays in `template1` on directories created before
-(#212). With `open-options.database` unset:
+provider initializes. Directories created before this release keep it in
+`template1` (#212). With `open-options.database` unset:
 
 | Data directory | Default database |
 | --- | --- |
 | Initialized by this provider: `<root>/data/di-framework-database` contains `postgres` | `postgres` |
-| No marker: created by an earlier release (the current package version, 6.0.15, and before) | `template1`, unchanged |
+| No marker: created before this release (6.0.16 and earlier) | `template1`, unchanged |
 
 Upgrading the provider never moves data: an existing directory keeps opening
 `template1`, and it never gets the marker. Fresh directories open `postgres`
 from their first session on.
 
+**Do not roll back below this release for a directory it created.** Providers
+from before this release (6.0.16 and earlier) ignore the marker and open
+`template1`. On a directory created by this release, that database is empty:
+the application sees no data, may re-run its migrations, and writes into
+`template1`. Upgrading again brings the `postgres` data back, and everything
+written during the rollback stays stranded in `template1`. To roll back,
+either roll back to a build that reads the marker, or restore the backup of
+the root taken before the upgrade.
+
 Explicit `open-options.database` values:
 
-- `postgres` and `template1` are accepted on every directory (initdb creates
-  both). On an older directory, `postgres` exists but is empty.
+- `postgres` and `template1` are accepted. initdb creates both, so they exist
+  in every complete directory; on an older directory, `postgres` exists but is
+  empty. If initialization was interrupted during its last step, `postgres`
+  may not exist. `open` then fails with `open-failed`
+  (`database "postgres" does not exist ...`) before the engine starts, and the
+  same component instance can still open `template1`.
 - `template0` is always rejected: the single-user engine would not enforce
   `datallowconn`, so opening it would make the pristine template writable.
 - Any other name is rejected. The list is fixed because the engine picks its
@@ -389,11 +402,13 @@ A later `open` in the same component instance that resolves to a different
 database fails with `open-failed`; restart the component to switch.
 
 The marker is part of the data directory. Back it up and restore it with the
-rest of PGDATA: without it, a directory falls back to `template1`, and an
-application whose tables are in `postgres` would find them missing. To move a
-legacy directory to `postgres`, dump `template1` and restore it into
-`postgres` on a fresh directory; do not add the marker by hand to a directory
-whose data is in `template1`.
+rest of PGDATA. Without it, a directory falls back to `template1`, and an
+application whose tables are in `postgres` finds them missing; the provider
+cannot detect this. Do not add the marker by hand to a directory whose data
+is in `template1`. To move a legacy directory to `postgres`, export the data
+through the application and import it into a fresh directory, as described
+in [Upgrading across PostgreSQL major versions](#upgrading-across-postgresql-major-versions)
+(no `pg_dump` is bundled).
 
 Initialization runs in a separate, single-use engine instance bundled into
 the provider: initdb's post-bootstrap step runs in `template1` and the
@@ -401,6 +416,14 @@ single-user backend cannot change databases afterwards. That instance creates
 the cluster and the marker. The serving instance then boots on the finished
 cluster in the selected database and verifies it with `current_database()`
 before the first session is handed out.
+
+Cost: the bootstrap instance runs only when a directory is created, but the
+component model cannot drop an instance, so its linear memory and its open
+files stay held until the process exits. The first start on a new directory
+peaks at about 690 MB RSS (about 106 MB more than a single engine) and holds
+about 43 more host file handles under the root. Later starts on an existing
+directory cost the same as before (about 264 MB in the smoke consumer).
+Restart the component after creating a directory if that memory matters.
 
 ## Persistence and ownership
 

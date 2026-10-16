@@ -1,5 +1,5 @@
 /** Persistent-storage smoke test: compose a consumer and run it under wasmtime. */
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { $ } from 'bun';
@@ -19,6 +19,7 @@ const MARKERS = {
   'upgrade-write': 'upgrade write ok',
   'upgrade-read': 'upgrade read ok',
   database: 'database ok',
+  'missing-database': 'missing database ok',
 } as const;
 
 type SmokeMode = keyof typeof MARKERS;
@@ -223,6 +224,11 @@ async function markerLossSmoke(ctx: Context, composed: string, smokeDir: string)
       present: false,
     });
     await expectMarker(dataDir, null, 'marker-loss directory after reopen');
+    // Crash window 2 leaves no postgres database (base/5): an explicit
+    // postgres open must fail with open-failed, not trap the engine.
+    const data = join(dataDir, 'pglite', 'data');
+    await rename(join(data, 'base', '5'), join(dataDir, 'postgres-moved-away'));
+    await runMode(ctx, composed, smokeDir, 'missing-database', mount);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
