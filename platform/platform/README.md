@@ -340,6 +340,12 @@ delete the Job; the controller recreates it. Every step is safe to repeat: a rer
 is missing, and a run after the move exits at the marker. A tenant without a registry store only
 writes the marker.
 
+While the registry is held at `replicas: 0` for the move, the runtime can still report the
+`di-tenant-registry` WorkloadDeployment as `Ready`. Wait on the tenant's `TenantAuthReady`
+condition instead: it is `False` with `RegistryMigrating`, `RegistryMigrationFailed` or
+`RegistryHostImageUnsupported` while the registry is held, then `Provisioning` until the
+registry is back, and `True` once it serves again (#392).
+
 **How to verify**
 
 ```sh

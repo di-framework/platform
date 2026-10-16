@@ -1253,9 +1253,22 @@ describe('controller: registry NATS account and migration (#159)', () => {
       user_file: REGISTRY_NATS_USER_FILE,
       password_file: REGISTRY_NATS_PASSWORD_FILE,
     });
-    expect(tenantAuthCondition(api)?.reason).not.toMatch(/^Registry/);
+    // #392: migration is complete, but registry is not yet Ready.
+    // Callers must wait on TenantAuthReady, which stays False until the registry is back.
+    expect(tenantAuthCondition(api)).toMatchObject({
+      status: 'False',
+      reason: 'Provisioning',
+    });
     expect(quota(api)['limits.cpu']).toBe('2500m');
     expect(password(api)).toBe(first);
+
+    // Registry becomes Ready.
+    registry(api).status = { conditions: [readyCondition] };
+    await controller.reconcileTenant(t, []);
+    expect(tenantAuthCondition(api)).toMatchObject({
+      status: 'True',
+      reason: 'Reconciled',
+    });
 
     // The marker holds after the Job is cleaned up; the Job is not recreated.
     api.objects.delete(jobPath);
