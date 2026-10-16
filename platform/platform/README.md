@@ -1928,7 +1928,8 @@ separate databases, volumes, and passwords.
 Update the platform package and apply its existing Pulumi stack before using
 these APIs. Update the application CLI extension and `@di-framework/bindings`
 together. Managed named imports require `@di-framework/componentize-qjs`
-`0.4.4-di.3` or later; the CLI installs the compiler dependency.
+`0.4.4-di.5` or later, which also carries `int8` values past 2^53 exactly as
+`BigInt`; the CLI installs the compiler dependency.
 
 ### Create and bind
 

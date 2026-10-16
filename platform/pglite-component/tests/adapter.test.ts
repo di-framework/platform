@@ -37,7 +37,11 @@ describe('pglite value conversion', () => {
   test('binds JavaScript values as pglite value variants', () => {
     expect(toWasmPgValue(null)).toEqual({ tag: 'null' });
     expect(toWasmPgValue(undefined)).toEqual({ tag: 'null' });
-    expect(toWasmPgValue(42)).toEqual({ tag: 'integer', val: 42 });
+    expect(toWasmPgValue(42)).toEqual({ tag: 'integer', val: 42n });
+    expect(toWasmPgValue(Number.MAX_SAFE_INTEGER)).toEqual({
+      tag: 'integer',
+      val: 9007199254740991n,
+    });
     expect(toWasmPgValue(1.5)).toEqual({ tag: 'real', val: 1.5 });
     expect(() => toWasmPgValue(Number.MAX_SAFE_INTEGER + 2)).toThrow(/bigint or a decimal string/);
     expect(() => toWasmPgValue(-(2 ** 60))).toThrow(TypeError);
@@ -47,9 +51,14 @@ describe('pglite value conversion', () => {
       tag: 'real',
       val: Number.POSITIVE_INFINITY,
     });
-    expect(toWasmPgValue(42n)).toEqual({ tag: 'integer', val: 42 });
-    expect(toWasmPgValue(2n ** 62n)).toEqual({ tag: 'text', val: '4611686018427387904' });
-    expect(toWasmPgValue(-(2n ** 62n))).toEqual({ tag: 'text', val: '-4611686018427387904' });
+    // int8 values travel as BigInt (componentize-qjs 0.4.4-di.5 lowers s64 from BigInt, #153).
+    expect(toWasmPgValue(42n)).toEqual({ tag: 'integer', val: 42n });
+    expect(toWasmPgValue(9007199254740993n)).toEqual({ tag: 'integer', val: 9007199254740993n });
+    expect(toWasmPgValue(2n ** 63n - 1n)).toEqual({ tag: 'integer', val: 2n ** 63n - 1n });
+    expect(toWasmPgValue(-(2n ** 63n))).toEqual({ tag: 'integer', val: -(2n ** 63n) });
+    // Outside s64 the binding would wrap modulo 2^64, so the value goes as text for numeric.
+    expect(toWasmPgValue(2n ** 63n)).toEqual({ tag: 'text', val: '9223372036854775808' });
+    expect(toWasmPgValue(-(2n ** 63n) - 1n)).toEqual({ tag: 'text', val: '-9223372036854775809' });
     expect(toWasmPgValue(true)).toEqual({ tag: 'boolean', val: true });
     expect(toWasmPgValue(false)).toEqual({ tag: 'boolean', val: false });
     expect(toWasmPgValue('text')).toEqual({ tag: 'text', val: 'text' });
@@ -68,7 +77,7 @@ describe('pglite value conversion', () => {
     expect(() => toWasmPgValue(Symbol('x'))).toThrow(/Cannot bind symbol/);
     expect(() => toWasmPgValue(() => 1)).toThrow(/Cannot bind function/);
     expect(toWasmPgParams([1, 'a', null])).toEqual([
-      { tag: 'integer', val: 1 },
+      { tag: 'integer', val: 1n },
       { tag: 'text', val: 'a' },
       { tag: 'null' },
     ]);
@@ -303,7 +312,7 @@ describe('pglite SqlDatabase adapter', () => {
       ]);
       expect(params).toEqual([
         [
-          { tag: 'integer', val: 1 },
+          { tag: 'integer', val: 1n },
           { tag: 'json', val: '{"a":1}' },
         ],
         [{ tag: 'timestamp', val: '1970-01-01T00:00:00.000Z' }],

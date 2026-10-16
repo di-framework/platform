@@ -166,16 +166,21 @@ export function unwrapWasmPgliteResult<T>(value: T | WasmResult<T>): T {
 
 const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 const MIN_SAFE = BigInt(Number.MIN_SAFE_INTEGER);
+const MAX_INT8 = 2n ** 63n - 1n;
+const MIN_INT8 = -(2n ** 63n);
 
 /**
  * Converts a bound JavaScript parameter into a `value` variant.
  *
- * - `bigint` in the safe integer range becomes `integer`; a larger one is sent
- *   as `text` (OID 0), so PostgreSQL parses it for an `int8`/`numeric` column
- *   without rounding through a double.
- * - A `number` that is an integer outside the safe range throws a `TypeError`
- *   (pass a `bigint` or string for `int8`); other non-safe numbers, including
- *   NaN and Infinity, are `real` (`float8`).
+ * - `bigint` in the `int8` range becomes `integer` with a `bigint` payload, so
+ *   values past 2^53 reach PostgreSQL exact (componentize-qjs 0.4.4-di.5 and jco
+ *   lower WIT `s64` from `BigInt`). A `bigint` outside the `int8` range is sent
+ *   as `text` (OID 0), so PostgreSQL parses it for a `numeric` column instead
+ *   of the binding wrapping it modulo 2^64.
+ * - A safe integer `number` becomes `integer` too, as a `bigint`. A `number`
+ *   that is an integer outside the safe range throws a `TypeError` (pass a
+ *   `bigint` or string for `int8`); other non-safe numbers, including NaN and
+ *   Infinity, are `real` (`float8`).
  * - `Date` becomes `timestamp` (RFC 3339 UTC); plain objects and arrays become
  *   `json`. Arrays are not PostgreSQL arrays: pass a literal such as `'{a,b}'`.
  */
@@ -183,14 +188,15 @@ export function toWasmPgValue(value: unknown): WasmPgValue {
   if (value === null || value === undefined) return { tag: 'null' };
   switch (typeof value) {
     case 'bigint':
-      // componentize-qjs lowers WIT s64 from JS numbers (f64), not BigInt (#153).
-      if (value >= MIN_SAFE && value <= MAX_SAFE) {
-        return { tag: 'integer', val: Number(value) };
+      // WIT s64 is lowered from BigInt (componentize-qjs 0.4.4-di.5, jco), so
+      // int8 values keep every bit; only values outside s64 fall back to text.
+      if (value >= MIN_INT8 && value <= MAX_INT8) {
+        return { tag: 'integer', val: value };
       }
       return { tag: 'text', val: value.toString() };
     case 'number':
       if (Number.isSafeInteger(value)) {
-        return { tag: 'integer', val: value };
+        return { tag: 'integer', val: BigInt(value) };
       }
       if (Number.isInteger(value)) {
         // An integral double past 2^53 has already lost its low bits, and the

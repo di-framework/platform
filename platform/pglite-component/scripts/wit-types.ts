@@ -8,8 +8,8 @@
  * The mapping follows the component bindings the adapter targets: functions
  * and fields are camelCase, a `result<T, error>` return is `T` (the binding
  * throws the error), `option<T>` is `T | undefined` (an optional trailing
- * parameter), `s64`/`u64` are `bigint` (componentize-qjs still lowers
- * `s64` from JS numbers until #153 ships, so the adapter accepts both), `list<u8>` is `Uint8Array`, a variant
+ * parameter), `s64`/`u64` are `bigint` (componentize-qjs 0.4.4-di.5 and jco
+ * lift and lower them as `BigInt`), `list<u8>` is `Uint8Array`, a variant
  * is `{ tag: 'case'; val: T }`, and a resource is a class. Only the WIT subset
  * `world.wit` uses is supported; anything else throws so a WIT change cannot
  * be silently mistranslated.
