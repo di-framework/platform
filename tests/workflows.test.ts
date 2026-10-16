@@ -1255,8 +1255,14 @@ describe('Auto Tag tags a release when its PR merges instead of waiting for it (
   });
 
   test('tags on schedule every 30 minutes to catch auto-merged releases (#395)', () => {
-    expect((autoTag.on.schedule as { cron: string }[])?.length).toBeGreaterThan(0);
-    expect((autoTag.on.schedule as { cron: string }[])?.[0]?.cron).toBe('*/30 * * * *');
+    expect(autoTag.on.schedule).toEqual([{ cron: '*/30 * * * *' }]);
+  });
+
+  test('schedule runs only on the di-framework/platform repository', () => {
+    const tagIf = autoTag.jobs.tag?.if ?? '';
+    expect(tagIf).toContain(
+      "github.event_name == 'schedule' && github.repository == 'di-framework/platform'",
+    );
   });
 
   test('two jobs: tag, then release-pr; nothing waits for the PR to merge', () => {
@@ -1277,7 +1283,9 @@ describe('Auto Tag tags a release when its PR merges instead of waiting for it (
 
   test('tag runs only for merged same-repository release/v* PRs; release-pr never on a PR', () => {
     const tagIf = autoTag.jobs.tag?.if ?? '';
-    expect(tagIf).toContain("github.event_name != 'pull_request' ||");
+    expect(tagIf).toContain(
+      "github.event_name == 'schedule' && github.repository == 'di-framework/platform'",
+    );
     expect(tagIf).toContain('github.event.pull_request.merged == true');
     expect(tagIf).toContain("startsWith(github.event.pull_request.head.ref, 'release/v')");
     expect(tagIf).toContain('github.event.pull_request.head.repo.full_name == github.repository');
@@ -1319,9 +1327,8 @@ describe('Auto Tag tags a release when its PR merges instead of waiting for it (
 
   test('the README says what publishes a release and how to recover', () => {
     const readme = read('README.md');
-    expect(readme).toContain(
-      'Approving the Auto Tag run, or merging the release PR, is what publishes a release.',
-    );
+    expect(readme).toContain('Merging the release PR is what publishes a release.');
+    expect(readme).toContain("Auto Tag's scheduled `tag` job runs every 30 minutes");
     expect(readme).toContain('`tag_only: true`');
   });
 
@@ -1599,6 +1606,46 @@ describe('Auto Tag tags a release when its PR merges instead of waiting for it (
       expect(result.exitCode).toBe(0);
       expect(remoteTag(box, 'v1.0.10')).toBe(v10);
       expect(git(box.work, 'ls-remote', '--tags', 'origin', 'refs/tags/v1.0.1')).toBe('');
+    });
+
+    describe('scheduled tag job', () => {
+      test('a scheduled run tags an untagged release and dispatches Release once', () => {
+        const box = sandbox();
+        const result = run(box, { EVENT: 'schedule' });
+        expect(result.exitCode).toBe(0);
+        expect(result.out.action).toBe('tag');
+        expect(remoteTag(box, 'v1.0.1')).toBe(box.release);
+        expect(dispatches(box)).toEqual([DISPATCH]);
+      });
+
+      test('a second scheduled run exits with action=none when the tag exists and Release has run', () => {
+        const box = sandbox();
+        // First run tags and dispatches
+        run(box, { EVENT: 'schedule' });
+        expect(dispatches(box)).toEqual([DISPATCH]);
+
+        // Second run finds the tag and Release run, does nothing
+        const again = run(box, { EVENT: 'schedule' });
+        expect(again.exitCode).toBe(0);
+        expect(again.out.action).toBe('none');
+        expect(dispatches(box)).toEqual([DISPATCH]);
+      });
+
+      test('a scheduled run with an existing Release run (even failed) exits with action=none and does not re-dispatch', () => {
+        const box = sandbox();
+        // First, tag the release commit so it already exists
+        git(box.work, 'push', '-q', 'origin', `${box.release}:refs/tags/v1.0.1`);
+        // Set up a runs.json with a failing Release run (from a previous attempt)
+        writeFileSync(
+          join(box.base, 'runs.json'),
+          JSON.stringify([{ databaseId: 1, conclusion: 'failure' }]),
+        );
+        const result = run(box, { EVENT: 'schedule' });
+        expect(result.exitCode).toBe(0);
+        expect(result.out.action).toBe('none');
+        expect(remoteTag(box, 'v1.0.1')).toBe(box.release);
+        expect(dispatches(box)).toEqual([]);
+      });
     });
   });
 });
