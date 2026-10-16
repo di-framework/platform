@@ -55,10 +55,12 @@ const PATHS = {
   deploy: '/v1/deploy',
   registry: '/v1/deploy/registry',
   createService: '/v1/services',
+  deleteService: '/v1/services/{service}',
   logs: '/v1/services/{service}/logs',
   proxy: '/v1/services/{service}/proxy',
   deployments: '/v1/deployments',
   deploymentStats: '/v1/deployments/stats',
+  removeDeployment: '/v1/deployments/{service}',
   rollback: '/v1/deployments/rollback',
   secrets: '/v1/secrets',
   secret: '/v1/secrets/{name}',
@@ -177,6 +179,15 @@ export function createClient(options: ClientOptions) {
       json<DeploymentStats>({ method: 'GET', path: PATHS.deploymentStats, query: { env } }),
     rollback: (request: RollbackRequest) =>
       json<Deployment>({ method: 'POST', path: PATHS.rollback, body: request }),
+    removeDeployment: (env: Env, service: string) =>
+      empty({
+        method: 'DELETE',
+        path: PATHS.removeDeployment,
+        params: { service },
+        query: { env },
+      }),
+    deleteService: (env: Env, service: string) =>
+      empty({ method: 'DELETE', path: PATHS.deleteService, params: { service }, query: { env } }),
 
     secrets: (env: Env) => json<SecretList>({ method: 'GET', path: PATHS.secrets, query: { env } }),
     setSecret: (env: Env, name: string, value: string) =>

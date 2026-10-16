@@ -751,4 +751,44 @@ describe('run', () => {
     expect(await run(['init', 'orders', '--force', '--json'], io())).toBe(0);
     expect(JSON.parse(out.at(-1) as string).files).toHaveLength(3);
   });
+
+  test('deployments remove removes a deployed service from an env', async () => {
+    const { fetch, calls } = fakeFetch({
+      'DELETE /v1/deployments/web': () => new Response(null, { status: 204 }),
+    });
+    expect(
+      await run(['deployments', 'remove', '--service', 'web', '--env', 'prod'], io(fetch)),
+    ).toBe(0);
+    expect(calls.at(-1)?.url).toEndWith('/v1/deployments/web?env=prod');
+    expect(err.at(-1)).toBe('removed web from prod');
+    expect(out).toEqual([]);
+    expect(await run(['deployments', 'remove', '--env', 'prod'], io(fetch))).toBe(1);
+    expect(err.at(-1)).toContain('--service');
+  });
+
+  test('services delete deletes a backing service of an env', async () => {
+    const { fetch, calls } = fakeFetch({
+      'DELETE /v1/services/kv': () => new Response(null, { status: 204 }),
+    });
+    expect(await run(['services', 'delete', '--name', 'kv', '--env', 'prod'], io(fetch))).toBe(0);
+    expect(calls.at(-1)?.url).toEndWith('/v1/services/kv?env=prod');
+    expect(err.at(-1)).toBe('deleted service kv in prod');
+    expect(out).toEqual([]);
+    expect(await run(['services', 'delete', '--env', 'prod'], io(fetch))).toBe(1);
+    expect(err.at(-1)).toContain('--name');
+  });
+
+  test('services delete reports the 409 for a service a deployment binds', async () => {
+    const detail = 'service kv is bound by deployed services: web-prod; remove them first';
+    const { fetch } = fakeFetch({
+      'DELETE /v1/services/kv': () => json({ title: 'Conflict', status: 409, detail }, 409),
+    });
+    expect(await run(['services', 'delete', '--name', 'kv', '--env', 'prod'], io(fetch))).toBe(1);
+    expect(err.at(-1)).toContain(detail);
+  });
+
+  test('services without create or delete prints both usages', async () => {
+    expect(await run(['services', 'list', '--env', 'prod'], io())).toBe(1);
+    expect(err.at(-1)).toContain('services delete --name <name>');
+  });
 });

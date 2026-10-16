@@ -58,5 +58,19 @@ export default manifest(
       'RollbackRequest',
       'Deployment',
     ),
+    operation(
+      'removeDeployment',
+      {
+        method: 'DELETE',
+        path: '/deployments/:service',
+        successStatus: 204,
+        summary: 'Remove a deployed service',
+        description:
+          'Removes the service from the environment: its WorkloadDeployment (running or not), its ServiceBindings and its deploy history. 404 when the environment has none of them.',
+        parameters: [env],
+      },
+      'Empty',
+      'Empty',
+    ),
   ],
 );

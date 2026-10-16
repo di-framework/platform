@@ -71,5 +71,19 @@ export default manifest(
       'ProxyRequest',
       'ProxySession',
     ),
+    operation(
+      'deleteService',
+      {
+        method: 'DELETE',
+        path: '/services/:service',
+        successStatus: 204,
+        summary: 'Delete a backing service',
+        description:
+          "Deletes a backing service of the environment. 409 while any ServiceBinding (a deployed service's binding) names it, whatever its deletionPolicy; 404 when the environment has no such service. The platform then keeps (Retain) or deletes (Delete) its data and storage according to deletionPolicy.",
+        parameters: [env],
+      },
+      'Empty',
+      'Empty',
+    ),
   ],
 );

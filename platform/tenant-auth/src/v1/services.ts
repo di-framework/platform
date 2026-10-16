@@ -3,7 +3,10 @@ import {
   EGRESS_MAX_DESTINATIONS as MAX_DESTINATIONS,
   validEgressDestination,
 } from '../../../platform/src/tenancy/egress.ts';
+import { KubeError } from '../kube.ts';
+import { ENV as ENV_LABEL } from './config.ts';
 import type { V1Module } from './context.ts';
+import { SERVICE_LABEL } from './deploy.ts';
 import { proxySessions, SERVICE_NAME } from './proxy.ts';
 
 /** The backing-service types admission accepts, with the platform default class of each. */
@@ -34,7 +37,7 @@ interface CreateServiceCommand {
 }
 
 interface BackingService {
-  metadata: { name: string; creationTimestamp?: string };
+  metadata: { name: string; creationTimestamp?: string; annotations?: Record<string, string> };
   spec: {
     type: ServiceType;
     className?: string;
@@ -42,6 +45,26 @@ interface BackingService {
     deletionPolicy?: 'Retain' | 'Delete';
     destinations?: string[];
   };
+}
+
+interface ServiceBinding {
+  metadata: { name: string; labels?: Record<string, string> };
+  spec?: { serviceName?: string };
+}
+
+const servicesPath = (tenant: string) =>
+  `/apis/${GROUP_VERSION}/namespaces/di-tenant-${tenant}/backingservices`;
+const notFound = (error: unknown) => error instanceof KubeError && error.status === 404;
+
+/**
+ * The deployed service a ServiceBinding belongs to, `<service>-<env>` as the deploy lane names its
+ * WorkloadDeployment, or the binding's own name when it carries no deploy labels.
+ */
+function binderOf(binding: ServiceBinding): string {
+  const labels = binding.metadata.labels ?? {};
+  const service = labels[SERVICE_LABEL];
+  const env = labels[ENV_LABEL];
+  return service && env ? `${service}-${env}` : binding.metadata.name;
 }
 
 /** The admission rules a request can break, checked before the API server sees it. */
@@ -70,7 +93,7 @@ function invalid(command: CreateServiceCommand): string | undefined {
   return undefined;
 }
 
-/** `/v1/services` creation and the service HTTP proxy session (platform#56). */
+/** `/v1/services` creation, deletion, and the service HTTP proxy session (platform#56). */
 export const services: V1Module = {
   async createService(input, _call, context) {
     const command = input as CreateServiceCommand;
@@ -114,6 +137,62 @@ export const services: V1Module = {
       },
       { status: 201 },
     );
+  },
+
+  /**
+   * Deletes a BackingService of `env` (platform#98). Refused with 409 while any ServiceBinding
+   * names it, whatever its `deletionPolicy`: a running workload would lose the capability. Once
+   * deleted, the platform keeps (`Retain`, the default) or deletes (`Delete`) its data and
+   * storage according to that policy.
+   */
+  async deleteService(_input, call, context) {
+    const env = String(call.request.query?.env);
+    const name = call.request.params?.service ?? '';
+    if (name.length > 63 || !SERVICE_NAME.test(name))
+      return problem(422, 'Unprocessable Entity', 'service must be a DNS label');
+    const user = context.asUser();
+    const path = `${servicesPath(context.tenant)}/${name}`;
+    const missing = () => problem(404, 'Not Found', `service ${name} does not exist in ${env}`);
+    let existing: BackingService;
+    try {
+      existing = await user.call<BackingService>('GET', path);
+    } catch (error) {
+      if (notFound(error)) return missing();
+      throw error;
+    }
+    // A service created without `/v1` carries no env; it is deletable from either env.
+    const createdFor = existing.metadata.annotations?.[ENV_ANNOTATION];
+    if (createdFor !== undefined && createdFor !== env) return missing();
+    const bindings = await user.call<{ items?: ServiceBinding[] }>(
+      'GET',
+      `/apis/${GROUP_VERSION}/namespaces/di-tenant-${context.tenant}/servicebindings`,
+    );
+    const binders = [
+      ...new Set(
+        (bindings.items ?? [])
+          .filter((binding) => binding.spec?.serviceName === name)
+          .map(binderOf),
+      ),
+    ].sort();
+    if (binders.length > 0)
+      return problem(
+        409,
+        'Conflict',
+        `service ${name} is bound by deployed services: ${binders.join(', ')}; remove them first`,
+      );
+    try {
+      await user.call('DELETE', path);
+    } catch (error) {
+      if (notFound(error)) return missing();
+      throw error;
+    }
+    context.audit('service.deleted', {
+      user: context.principal.user,
+      service: name,
+      env,
+      deletionPolicy: existing.spec.deletionPolicy ?? 'Retain',
+    });
+    return new Response(null, { status: 204 });
   },
 
   async proxy(input, call, context) {

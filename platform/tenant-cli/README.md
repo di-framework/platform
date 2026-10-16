@@ -173,8 +173,10 @@ logout | whoami
 deploy preview|apply --env <prod|staging> --bundle <file>
 logs --service <name> --env <env> [--deployment <id>] [--follow] [--since <dur>] [--tail <n>]
 services create <keyvalue|messaging|blobstore|postgres|egress> --name <name> --env <env> [--class] [--storage] [--memory] [--cpu] [--deletion-policy] [--destination]
+services delete --name <name> --env <env>
 deployments list|stats --env <env> [--service <name>]
 deployments rollback --service <name> --env <env> [--to <id>]
+deployments remove --service <name> --env <env>
 secrets|vars list|set|update|unset <name> --env <env> [--from-file <path|->]
 registry [info] | registry login [--config <file> | --with <docker|podman|oras>]
 registry logout [--host <host>] [--config <file> | --with <docker|podman|oras>]
@@ -186,7 +188,10 @@ Shared flags: `--env`, `--json`, `--account` (or `DI_TENANT_ACCOUNT`, or the onl
 There is no token argument. Secret and var values come from `--from-file` or stdin (`-`), so they
 stay out of shell history. `secrets unset` fails with 409 while a deployed workload injects the
 secret; `vars unset` succeeds but prints `warning: …` naming the deployed workloads that inject
-the env's vars (platform#100). `init` writes a minimal di-framework seed and creates no platform
+the env's vars (platform#100). `deployments remove` deletes the service's workload, bindings and
+deploy history in that env; `services delete` fails with 409 while any deployment binds the
+service, whatever its `--deletion-policy`, which only decides whether the platform keeps its data
+(platform#98). `init` writes a minimal di-framework seed and creates no platform
 resources.
 
 ## Login

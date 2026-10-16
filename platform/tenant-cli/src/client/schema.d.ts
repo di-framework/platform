@@ -161,6 +161,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/deployments/{service}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove a deployed service
+         * @description Removes the service from the environment: its WorkloadDeployment (running or not), its ServiceBindings and its deploy history. 404 when the environment has none of them.
+         */
+        delete: operations["removeDeployment"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/deployments/rollback": {
         parameters: {
             query?: never;
@@ -244,6 +264,26 @@ export interface paths {
          */
         post: operations["createService"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/services/{service}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a backing service
+         * @description Deletes a backing service of the environment. 409 while any ServiceBinding (a deployed service's binding) names it, whatever its deletionPolicy; 404 when the environment has no such service. The platform then keeps (Retain) or deletes (Delete) its data and storage according to deletionPolicy.
+         */
+        delete: operations["deleteService"];
         options?: never;
         head?: never;
         patch?: never;
@@ -838,6 +878,28 @@ export interface operations {
             };
         };
     };
+    removeDeployment: {
+        parameters: {
+            query: {
+                env: "prod" | "staging";
+            };
+            header?: never;
+            path: {
+                service: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Remove a deployed service */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     rollback: {
         parameters: {
             query?: never;
@@ -1041,6 +1103,28 @@ export interface operations {
                         createdAt: string;
                     };
                 };
+            };
+        };
+    };
+    deleteService: {
+        parameters: {
+            query: {
+                env: "prod" | "staging";
+            };
+            header?: never;
+            path: {
+                service: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Delete a backing service */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

@@ -66,6 +66,8 @@ describe('/v1/deploy', () => {
   const beforeRead = new Map<string, () => void>();
   /** Answers the WorkloadDeployment list with this status, as a refused or failing read would. */
   let workloadListFailure: number | undefined;
+  /** Answers `<METHOD> <path>` with this status, as a refused or failing call would. */
+  const failing = new Map<string, number>();
   const api = serve((request: Recorded) => {
     if (request.pathname.endsWith('/token'))
       return json({
@@ -82,6 +84,8 @@ describe('/v1/deploy', () => {
       return json({ message: 'Unauthorized' }, 401);
     if (workloadListFailure && request.method === 'GET' && request.pathname === WORKLOADS)
       return json({ message: 'workloaddeployments unavailable' }, workloadListFailure);
+    const failure = failing.get(`${request.method} ${request.pathname}`);
+    if (failure) return json({ message: 'refused' }, failure);
     // RBAC per token (#112): a member's `sa-*` token may not read or patch Secrets.
     if (
       request.pathname.startsWith(`${CORE}/secrets`) &&
@@ -90,8 +94,12 @@ describe('/v1/deploy', () => {
     )
       return json({ message: 'secrets is forbidden' }, 403);
     const selector = new URL(request.path, 'http://x').searchParams.get('labelSelector');
-    if (request.method === 'GET' && selector !== null) {
-      const wanted = selector.split(',').map((term) => term.split('='));
+    // ServiceBindings are also listed without a selector (deleteService reads every one).
+    if (request.method === 'GET' && (selector !== null || request.pathname === BINDINGS)) {
+      const wanted = (selector ?? '')
+        .split(',')
+        .filter((term) => term !== '')
+        .map((term) => term.split('='));
       const items = [...stored.entries()]
         .filter(([key]) => key.startsWith(`${request.pathname}/`))
         .map(([, object]) => object)
@@ -189,6 +197,7 @@ describe('/v1/deploy', () => {
     pruned.clear();
     beforeRead.clear();
     workloadListFailure = undefined;
+    failing.clear();
     caller = alice;
     for (const env of ['prod', 'staging']) seedSecret('api-token', env);
   });
@@ -1743,6 +1752,222 @@ describe('/v1/deploy', () => {
       );
       expect(reads.length).toBeGreaterThan(0);
       expect(reads.every((r) => r.method === 'GET')).toBe(true);
+    });
+  });
+
+  describe('removal (platform#98)', () => {
+    const SERVICES =
+      '/apis/platform.di-framework.dev/v1alpha1/namespaces/di-tenant-acme/backingservices';
+    const REVISIONS = `${CORE}/configmaps/di-deploy-`;
+    const remove = (path: string) =>
+      fetch(`${base}${path}`, { method: 'DELETE', headers: { authorization: 'Bearer ok' } });
+    const deployed = async (bundle = deployBundle()) =>
+      expect((await post('/v1/deploy', bundle)).status).toBe(202);
+    const keys = (prefix: string) => [...stored.keys()].filter((key) => key.startsWith(prefix));
+    /** Stores a BackingService as `/v1/services` creates it; `env: null` leaves out the env. */
+    const seedService = (
+      name: string,
+      { env = 'prod' as string | null, deletionPolicy = undefined as string | undefined } = {},
+    ) =>
+      stored.set(`${SERVICES}/${name}`, {
+        metadata: {
+          name,
+          ...(env ? { annotations: { 'platform.di-framework.dev/env': env } } : {}),
+        },
+        spec: { type: 'keyvalue', ...(deletionPolicy ? { deletionPolicy } : {}) },
+      });
+    /** The newest audit line of `event`. */
+    const audited = (event: string) =>
+      log.mock.calls
+        .map(([line]: unknown[]) => JSON.parse(String(line)) as Json)
+        .filter((line: Json) => line.event === event)
+        .at(-1);
+
+    test('removes a running deployment: workload, bindings and every revision of that env', async () => {
+      await deployed();
+      await deployed();
+      await deployed(deployBundle({ env: 'staging' }));
+      // A revision edited out of shape is history of web in prod too.
+      stored.set(`${REVISIONS}web-prod.9`, {
+        metadata: {
+          name: 'di-deploy-web-prod.9',
+          labels: {
+            'platform.di-framework.dev/deploy-revision': '9',
+            'di-framework.dev/service': 'web',
+            'platform.di-framework.dev/env': 'prod',
+          },
+          annotations: { 'platform.di-framework.dev/component': 'not json' },
+        },
+      });
+      expect(stored.has(`${WORKLOADS}/web-prod`)).toBe(true);
+      expect(keys(`${BINDINGS}/web-prod-`)).toHaveLength(1);
+      expect(keys(`${REVISIONS}web-prod.`)).toHaveLength(3);
+
+      const response = await remove('/v1/deployments/web?env=prod');
+      expect(response.status).toBe(204);
+      expect(stored.has(`${WORKLOADS}/web-prod`)).toBe(false);
+      expect(keys(`${BINDINGS}/web-prod-`)).toEqual([]);
+      expect(keys(`${REVISIONS}web-prod.`)).toEqual([]);
+      // The workload goes first, so it stops before what it binds is removed.
+      const deletes = api.requests.filter((r) => r.method === 'DELETE').map((r) => r.pathname);
+      expect(deletes[0]).toBe(`${WORKLOADS}/web-prod`);
+      // Staging is untouched, and so is the secret and the backing service it bound.
+      expect(stored.has(`${WORKLOADS}/web-staging`)).toBe(true);
+      expect(keys(`${BINDINGS}/web-staging-`)).toHaveLength(1);
+      expect(keys(`${REVISIONS}web-staging.`)).toHaveLength(1);
+      expect(audited('deployment.removed')).toMatchObject({
+        user: 'alice',
+        service: 'web',
+        env: 'prod',
+        workload: true,
+        bindings: 1,
+        revisions: 3,
+      });
+      // Removed as the caller.
+      expect(
+        api.requests
+          .filter((r) => r.method === 'DELETE')
+          .every((r) => r.headers.get('authorization') === 'Bearer sa-di-user-alice'),
+      ).toBe(true);
+      // Nothing left: a second removal is a 404, and the history lists nothing.
+      expect((await remove('/v1/deployments/web?env=prod')).status).toBe(404);
+      const list = await fetch(`${base}/v1/deployments?env=prod`, {
+        headers: { authorization: 'Bearer ok' },
+      });
+      expect(((await list.json()) as Json).items).toEqual([]);
+    });
+
+    test('removes what a destroyed workload left behind', async () => {
+      await deployed();
+      stored.delete(`${WORKLOADS}/web-prod`);
+      expect((await remove('/v1/deployments/web?env=prod')).status).toBe(204);
+      expect(keys(`${BINDINGS}/web-prod-`)).toEqual([]);
+      expect(keys(`${REVISIONS}web-prod.`)).toEqual([]);
+    });
+
+    test('a service that is not deployed in the env is a 404', async () => {
+      await deployed(deployBundle({ env: 'staging' }));
+      const response = await remove('/v1/deployments/web?env=prod');
+      expect(response.status).toBe(404);
+      expect(((await response.json()) as Json).detail).toBe('web is not deployed in prod');
+    });
+
+    test('an invalid service or env is refused before anything is deleted', async () => {
+      expect((await remove('/v1/deployments/Web?env=prod')).status).toBe(422);
+      expect((await remove('/v1/deployments/web?env=qa')).status).toBe(400);
+      expect((await remove('/v1/deployments/web')).status).toBe(400);
+      expect(api.requests.filter((r) => r.method === 'DELETE')).toEqual([]);
+    });
+
+    test('a refused workload delete is passed through and removes nothing else', async () => {
+      await deployed();
+      failing.set(`DELETE ${WORKLOADS}/web-prod`, 403);
+      expect((await remove('/v1/deployments/web?env=prod')).status).toBe(403);
+      expect(keys(`${BINDINGS}/web-prod-`)).toHaveLength(1);
+      expect(keys(`${REVISIONS}web-prod.`)).toHaveLength(1);
+    });
+
+    test('a binding or revision a concurrent removal took counts as removed', async () => {
+      await deployed();
+      for (const key of [...keys(`${BINDINGS}/web-prod-`), ...keys(`${REVISIONS}web-prod.`)])
+        raced.add(key);
+      expect((await remove('/v1/deployments/web?env=prod')).status).toBe(204);
+    });
+
+    test('deletes an unbound backing service of the env', async () => {
+      seedService('kv');
+      expect((await remove('/v1/services/kv?env=prod')).status).toBe(204);
+      expect(stored.has(`${SERVICES}/kv`)).toBe(false);
+      expect(audited('service.deleted')).toMatchObject({
+        user: 'alice',
+        service: 'kv',
+        env: 'prod',
+        deletionPolicy: 'Retain',
+      });
+    });
+
+    for (const deletionPolicy of ['Retain', 'Delete'])
+      test(`a service a deployment binds is a 409 under deletionPolicy ${deletionPolicy}, until the deployment is removed`, async () => {
+        seedService('cache', { deletionPolicy });
+        await deployed();
+        await deployed(deployBundle({ env: 'staging' }));
+        const refused = await remove('/v1/services/cache?env=prod');
+        expect(refused.status).toBe(409);
+        expect(((await refused.json()) as Json).detail).toBe(
+          'service cache is bound by deployed services: web-prod, web-staging; remove them first',
+        );
+        expect(stored.has(`${SERVICES}/cache`)).toBe(true);
+        expect(api.requests.some((r) => r.method === 'DELETE')).toBe(false);
+
+        expect((await remove('/v1/deployments/web?env=prod')).status).toBe(204);
+        expect((await remove('/v1/services/cache?env=prod')).status).toBe(409);
+        expect((await remove('/v1/deployments/web?env=staging')).status).toBe(204);
+        expect((await remove('/v1/services/cache?env=prod')).status).toBe(204);
+        expect(stored.has(`${SERVICES}/cache`)).toBe(false);
+        expect(audited('service.deleted')).toMatchObject({ service: 'cache', deletionPolicy });
+      });
+
+    test('a binding applied out of band counts, named by itself', async () => {
+      seedService('cache');
+      stored.set(`${BINDINGS}/manual`, {
+        metadata: { name: 'manual' },
+        spec: { serviceName: 'cache', bindingName: 'cache', capability: 'keyvalue' },
+      });
+      stored.set(`${BINDINGS}/other`, { metadata: { name: 'other' }, spec: { serviceName: 'db' } });
+      stored.set(`${BINDINGS}/bare`, { metadata: { name: 'bare' } });
+      const response = await remove('/v1/services/cache?env=prod');
+      expect(response.status).toBe(409);
+      expect(((await response.json()) as Json).detail).toContain(
+        'bound by deployed services: manual;',
+      );
+    });
+
+    test('a service of another env, or none, is a 404', async () => {
+      seedService('kv', { env: 'staging' });
+      const response = await remove('/v1/services/kv?env=prod');
+      expect(response.status).toBe(404);
+      expect(((await response.json()) as Json).detail).toBe('service kv does not exist in prod');
+      expect((await remove('/v1/services/nope?env=prod')).status).toBe(404);
+      expect(stored.has(`${SERVICES}/kv`)).toBe(true);
+    });
+
+    test('a service created without an env is deletable from either env', async () => {
+      seedService('kv', { env: null });
+      expect((await remove('/v1/services/kv?env=staging')).status).toBe(204);
+    });
+
+    test('an invalid service name or env is refused before anything is read', async () => {
+      expect((await remove('/v1/services/Bad_Name?env=prod')).status).toBe(422);
+      expect((await remove('/v1/services/kv?env=qa')).status).toBe(400);
+      expect(api.requests.filter((r) => !r.pathname.endsWith('/token'))).toEqual([]);
+    });
+
+    test('cluster refusals are passed through and a concurrent delete is a 404', async () => {
+      seedService('kv');
+      failing.set(`GET ${SERVICES}/kv`, 403);
+      expect((await remove('/v1/services/kv?env=prod')).status).toBe(403);
+      failing.clear();
+      failing.set(`GET ${BINDINGS}`, 403);
+      expect((await remove('/v1/services/kv?env=prod')).status).toBe(403);
+      failing.clear();
+      failing.set(`DELETE ${SERVICES}/kv`, 500);
+      expect((await remove('/v1/services/kv?env=prod')).status).toBe(502);
+      failing.clear();
+      raced.add(`${SERVICES}/kv`);
+      expect((await remove('/v1/services/kv?env=prod')).status).toBe(404);
+    });
+
+    test('viewers may remove neither a deployment nor a service', async () => {
+      seedService('kv');
+      await deployed();
+      caller = { ...alice, user: 'vic', role: 'viewer' };
+      expect((await remove('/v1/deployments/web?env=prod')).status).toBe(403);
+      expect((await remove('/v1/services/kv?env=prod')).status).toBe(403);
+      expect(stored.has(`${WORKLOADS}/web-prod`)).toBe(true);
+      expect(stored.has(`${SERVICES}/kv`)).toBe(true);
+      expect(
+        api.requests.some((r) => r.headers.get('authorization') === 'Bearer sa-di-user-vic'),
+      ).toBe(false);
     });
   });
 
