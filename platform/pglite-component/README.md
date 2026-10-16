@@ -388,10 +388,22 @@ Explicit `open-options.database` values:
 
 - `postgres` and `template1` are accepted. initdb creates both, so they exist
   in every complete directory; on an older directory, `postgres` exists but is
-  empty. If initialization was interrupted during its last step, `postgres`
-  may not exist. `open` then fails with `open-failed`
-  (`database "postgres" does not exist ...`) before the engine starts, and the
-  same component instance can still open `template1`.
+  empty. Before the engine starts, the provider checks that the database's
+  fixed-OID directory exists (`base/1` for `template1`, `base/5` for
+  `postgres`). If it does not, `open` fails with `open-failed`
+  (`database "postgres" has no data directory at base/5 ...`) and the same
+  component instance can still open `template1`. This is a filesystem check,
+  not a catalog lookup, so it does not catch every case:
+  - If initdb crashed while creating `postgres`, after copying `base/5` but
+    before committing the database, the check passes and an explicit
+    `postgres` open still stops the engine with
+    `FATAL: database "postgres" does not exist`. Only an initdb that crashed
+    partway through leaves a directory in this state, and with or without the
+    clean error such a directory is unfinished: re-create it (remove the root)
+    or restore it from a backup, do not use it.
+  - A `postgres` database that was dropped and re-created (new OID) or moved
+    with `ALTER DATABASE ... SET TABLESPACE` has no `base/5`, so the provider
+    refuses to open it although it exists.
 - `template0` is always rejected: the single-user engine would not enforce
   `datallowconn`, so opening it would make the pristine template writable.
 - Any other name is rejected. The list is fixed because the engine picks its

@@ -622,7 +622,10 @@ fn database_mode() {
 fn missing_database_mode() {
     match open("/data/pglite", Some(&database("postgres"))) {
         Err(Error::OpenFailed(message)) => {
-            assert!(message.contains("\"postgres\" does not exist"), "{message}")
+            assert!(
+                message.contains("\"postgres\" has no data directory at base/5"),
+                "{message}"
+            )
         }
         Err(error) => panic!("missing postgres: unexpected {error:?}"),
         Ok(_) => panic!("opening a missing postgres database must fail"),

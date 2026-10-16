@@ -183,7 +183,7 @@ impl Transport {
                     state.root = Some(root.clone());
                     state.poisoned = false;
                     // No engine runs while choosing, so a refusal here (for
-                    // example a database that does not exist) leaves the
+                    // example a database with no data directory) leaves the
                     // instance usable for another open.
                     let chosen = choose_databases(&root.join("data"), requested)?;
                     state.poisoned = true;
@@ -491,10 +491,20 @@ pub(crate) fn database_dir(name: &str) -> Option<&'static str> {
 ///
 /// Decided after initdb and before the serving backend starts, from the
 /// marker that `initialize_cluster` writes, so the first session of a new
-/// directory already runs in `postgres`. A database whose directory is
-/// missing is refused here: the single-user backend would otherwise stop with
-/// a FATAL error and trap the component. That happens to `postgres` when a
-/// crash interrupted initdb's last step (crash window 2).
+/// directory already runs in `postgres`.
+///
+/// A database whose fixed-OID directory is missing is refused here, with
+/// `open-failed` instead of a FATAL error that traps the component. This is a
+/// filesystem check, not a catalog lookup, so it is incomplete in both
+/// directions:
+/// - In crash window 2, `CREATE DATABASE postgres` (FILE_COPY) copies
+///   `base/1` to `base/5` before it commits the `pg_database` row. A crash in
+///   between leaves `base/5` without a `postgres` database: the check passes
+///   and an explicit `postgres` open still traps. Only an initdb that crashed
+///   partway through produces this state; such a directory must be re-created
+///   or restored, not used.
+/// - A `postgres` database that was dropped and re-created (new OID) or moved
+///   to another tablespace has no `base/5` and is refused although it exists.
 pub(crate) fn choose_databases(
     data: &Path,
     requested: Option<&'static str>,
@@ -504,7 +514,8 @@ pub(crate) fn choose_databases(
     let present = database_dir(session).is_some_and(|dir| data.join(dir).is_dir());
     if !present {
         return Err(format!(
-            "database \"{session}\" does not exist in this data directory (its initialization may not have finished); open template1, or restore the directory from a backup"
+            "database \"{session}\" has no data directory at {} (initdb crashed before creating it, or the database was re-created with a different OID or moved to another tablespace); open template1, or re-create or restore the data directory",
+            database_dir(session).unwrap_or("base/?")
         ));
     }
     Ok(Databases { default, session })
@@ -662,7 +673,7 @@ mod tests {
         );
         let err = choose_databases(data, Some("postgres")).unwrap_err();
         assert!(
-            err.starts_with("database \"postgres\" does not exist"),
+            err.starts_with("database \"postgres\" has no data directory at base/5"),
             "{err}"
         );
         // A marked directory whose postgres directory is gone fails the same way.
