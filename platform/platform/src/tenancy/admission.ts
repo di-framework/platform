@@ -1,3 +1,4 @@
+import { REGISTRY_NATS_PASSWORD_FILE, REGISTRY_NATS_USER_FILE } from './registry-nats';
 import {
   CAPABILITIES,
   DEFAULT_CLASS_NAMES,
@@ -9,6 +10,7 @@ import {
   ROUTES_CONFIG_NAME,
   TENANT,
 } from './resources';
+import { HOST_MOUNT_ROOT } from './workload-storage';
 
 /** Controller-managed ConfigMap prefix for BackingService backend config (#450). */
 export const BS_CONFIG_PREFIX = 'di-bs-';
@@ -82,6 +84,13 @@ export interface HostInterfaceLike {
   config?: Record<string, unknown>;
 }
 
+/**
+ * Blobstore entry keys wash patch 0003 reads as files and sends to NATS as the user and password
+ * (#159). Whoever names them chooses which host file is sent, so only the controller may set them,
+ * only on the registry's entry, and only to the registry credentials mount.
+ */
+export const NATS_CREDENTIAL_KEYS = ['user_file', 'password_file'] as const;
+
 function registryBlobstoreAllowed(
   hostInterface: HostInterfaceLike,
   requester?: { username: string; controllerNamespace: string; workloadNamespace?: string },
@@ -91,13 +100,24 @@ function registryBlobstoreAllowed(
     : undefined;
   const config = hostInterface.config ?? {};
   const keys = Object.keys(config);
+  // Both credential files or neither, each exactly the registry credentials mount (#159).
+  const credentials =
+    keys.length === 2 ||
+    (keys.length === 4 &&
+      config.user_file === REGISTRY_NATS_USER_FILE &&
+      config.password_file === REGISTRY_NATS_PASSWORD_FILE);
   return (
     requester?.username ===
       `system:serviceaccount:${requester?.controllerNamespace}:di-platform-controller` &&
     tenant !== undefined &&
     (hostInterface.configFrom ?? []).length === 0 &&
-    keys.length === 2 &&
-    keys.every((key) => key === 'backend' || key === 'url') &&
+    keys.every(
+      (key) =>
+        key === 'backend' ||
+        key === 'url' ||
+        (NATS_CREDENTIAL_KEYS as readonly string[]).includes(key),
+    ) &&
+    credentials &&
     config.backend === 'nats' &&
     config.url === `nats://di-nats.di-runtime-${tenant}.svc.cluster.local:4222`
   );
@@ -245,6 +265,27 @@ export function workloadVolumesAllowed(input: {
   );
 }
 
+/** Platform workload storage directories (#11), the only host paths a workload volume may name. */
+const WORKLOAD_HOST_PATH = `^${HOST_MOUNT_ROOT}/[a-z0-9]([-a-z0-9]*[a-z0-9])?$`;
+export const WORKLOAD_HOST_PATH_MESSAGE =
+  'Workload host volumes may only name a platform workload storage directory';
+
+/**
+ * Mirrors the workload host path rule in the CEL policy (#159), which binds the controller too: a
+ * `hostPath` volume may only name a platform storage directory under `HOST_MOUNT_ROOT`. Guests run
+ * in the tenant host pod, so a volume naming any other host pod path (the registry's NATS
+ * credentials mount, or a parent of it) would hand that path to a guest as a preopen.
+ */
+export function workloadHostPathsAllowed(volumes: VolumeLike[] | undefined): boolean {
+  const pattern = new RegExp(WORKLOAD_HOST_PATH);
+  return (volumes ?? []).every((volume) => {
+    const hostPath = volume.hostPath as { path?: unknown } | undefined;
+    return (
+      hostPath === undefined || (typeof hostPath.path === 'string' && pattern.test(hostPath.path))
+    );
+  });
+}
+
 interface LocalResourcesLike {
   allowedHosts?: string[];
   allowedIpNameLookups?: string[];
@@ -322,6 +363,21 @@ export const ENV_LABEL = 'platform.di-framework.dev/env';
 /** Environments a WorkloadDeployment may reference tenant vars and secrets for (#88). */
 export const DEPLOY_ENVS = ['prod', 'staging'] as const;
 const TENANT_SECRET_NAME = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
+/**
+ * Suffixes of the Secrets a WorkloadDeployment may reference by its own name (#203):
+ * `<workload>-control` is CLI-owned, `<workload>-secrets` is app-owned. No platform Secret in a
+ * tenant namespace may end in one of these (`di-binding-`/`di-bs-` are exempt by prefix).
+ * tests/environment-references.test.ts scans tenantResources/tenantAuthResources output plus
+ * names from the real helpers of the other producers: postgresNames, backup-destination
+ * RUNTIME_SECRET, tenant-auth di-apikey-<id> and `<name>.<env>`. A new Secret producer must be
+ * added to that scan.
+ *
+ * Invariant: the rule that admits these names is only safe while no platform-owned Secret in a
+ * tenant namespace ends in one of these suffixes (`di-binding-*` and `di-bs-*` Secrets are exempt
+ * because the rule denies them by prefix). Otherwise a workload named after the Secret's stem
+ * could reference it. The tests render every tenant Secret and check this.
+ */
+export const WORKLOAD_SECRET_SUFFIXES = ['-control', '-secrets'] as const;
 
 interface EnvironmentReferencesLike {
   environment?: {
@@ -336,8 +392,11 @@ interface EnvironmentReferencesLike {
  * Mirrors the environment reference rule in the CEL policy (#88; tenant-auth README "Secrets and
  * vars storage contract"). A tenant WorkloadDeployment labelled with env `<env>` may reference
  * only `di-vars-<env>` and `<name>.<env>` Secrets whose `<name>` is not managed; without a valid
- * env label it may reference neither. The `<workload>-control` Secret cli-plugin-platform renders
- * for HTTP workloads stays allowed. Secret labels are checked by the deploy lane (#87), not here.
+ * env label it may reference neither. Regardless of the env label, a workload may also reference
+ * exactly two Secrets named after itself: `<workload>-control`, which cli-plugin-platform renders
+ * and rotates on every deploy, and `<workload>-secrets`, which the app's own tooling writes and the
+ * CLI never touches (#203). No other `<workload>-*` name is allowed. Secret labels are checked by
+ * the deploy lane (#87), not here.
  */
 export function workloadEnvironmentReferencesAllowed(input: {
   username: string;
@@ -355,10 +414,12 @@ export function workloadEnvironmentReferencesAllowed(input: {
   if ((input.imagePullSecrets ?? []).some(isManagedSecretName)) return false;
   const label = input.labels?.[ENV_LABEL];
   const env = (DEPLOY_ENVS as readonly string[]).includes(label ?? '') ? label : undefined;
-  const controlSecret = `${input.workloadName}-control`;
+  const ownSecrets = new Set(
+    WORKLOAD_SECRET_SUFFIXES.map((suffix) => `${input.workloadName}${suffix}`),
+  );
   const secretAllowed = (name: string) => {
     if (isManagedSecretName(name)) return false;
-    if (name === controlSecret) return true;
+    if (ownSecrets.has(name)) return true;
     if (env === undefined || !name.endsWith(`.${env}`)) return false;
     return TENANT_SECRET_NAME.test(name.slice(0, -(env.length + 1)));
   };
@@ -513,13 +574,18 @@ function hostInterfaceAdmissionExpression(): string {
       h.config.all(k, k in ['subscriptions', 'consumer_group', 'max_in_flight', 'admission_wait'])) &&
     (${defaultMessaging} || ${namedMessaging}))`;
 
-  // Controller-only (#150): the registry's nats backend against its own runtime namespace's NATS.
+  // Controller-only (#150): the registry's nats backend against its own runtime namespace's NATS,
+  // anonymous or with both credential files pinned to the registry credentials mount (#159).
   const registryNats = `(variables.controller && ${noConfigReferences} &&
     object.metadata.namespace.startsWith('di-tenant-') &&
-    size(h.config) == 2 && has(h.config.backend) && has(h.config.url) &&
+    has(h.config.backend) && has(h.config.url) &&
     h.config.backend == 'nats' &&
     h.config.url == 'nats://di-nats.di-runtime-' + object.metadata.namespace.substring(10) +
-      '.svc.cluster.local:4222')`;
+      '.svc.cluster.local:4222' &&
+    (size(h.config) == 2 ||
+      (size(h.config) == 4 && has(h.config.user_file) && has(h.config.password_file) &&
+        h.config.user_file == '${REGISTRY_NATS_USER_FILE}' &&
+        h.config.password_file == '${REGISTRY_NATS_PASSWORD_FILE}')))`;
   const blobstore = `(h['namespace'] == 'wasmcloud' && h['package'] == 'blobstore' &&
     ${unnamed} && ${noSecretReferences} &&
     (!has(h.configFrom) || size(h.configFrom) == 0 || h.configFrom.all(c, ${managedConfigName})) &&
@@ -612,6 +678,12 @@ function workloadPolicy(namespace: string): AdmissionPolicy {
         message: 'Tenant workloads cannot mount host volumes',
       },
       {
+        // Everyone, the controller included (#159): only platform storage directories.
+        expression: `!has(variables.w.volumes) || variables.w.volumes.all(v, !has(v.hostPath) ||
+          (has(v.hostPath.path) && v.hostPath.path.matches('${WORKLOAD_HOST_PATH}')))`,
+        message: WORKLOAD_HOST_PATH_MESSAGE,
+      },
+      {
         expression: `variables.locals.all(l,
           (!has(l.allowedHostLoopbackPorts) || size(l.allowedHostLoopbackPorts) == 0) &&
           (!has(l.volumeMounts) || size(l.volumeMounts) == 0 || variables.controller ||
@@ -647,11 +719,11 @@ function workloadPolicy(namespace: string): AdmissionPolicy {
             variables.env != '' && c.name == 'di-vars-' + variables.env)) &&
           (!has(l.environment.secretFrom) || l.environment.secretFrom.all(s,
             !s.name.startsWith('${BINDING_CONFIG_PREFIX}') && !s.name.startsWith('${BS_CONFIG_PREFIX}') &&
-            (s.name == object.metadata.name + '-control' ||
+            (${WORKLOAD_SECRET_SUFFIXES.map((suffix) => `s.name == object.metadata.name + '${suffix}'`).join(' || ')} ||
               (variables.env != '' && s.name.endsWith('.' + variables.env) &&
                 s.name.matches('^[a-z]([-a-z0-9]{0,61}[a-z0-9])?[.](${DEPLOY_ENVS.join('|')})$')))))))`,
         message:
-          'Tenant guests may reference only di-vars-<env> and <name>.<env> Secrets matching their platform.di-framework.dev/env label (never di-binding-*/di-bs-*)',
+          'Tenant guests may reference only di-vars-<env> and <name>.<env> Secrets matching their platform.di-framework.dev/env label (never di-binding-*/di-bs-*); a workload may also reference its own <workload>-control and <workload>-secrets Secrets',
       },
       {
         expression: `variables.controller || variables.pullSecrets.all(n,
@@ -803,6 +875,46 @@ function backendConfigPolicy(namespace: string): AdmissionPolicy {
   };
 }
 
+/** Denial for NATS credential file keys in a controller-managed ConfigMap or Secret (#159). */
+export const MANAGED_CONFIG_KEYS_MESSAGE =
+  'di-bs-* and di-binding-* ConfigMaps and Secrets cannot carry user_file or password_file';
+
+/**
+ * Mirrors the `managed-config-keys` CEL rule (#159). Blobstore entries of tenant workloads read
+ * their backend config from `di-bs-` / `di-binding-` ConfigMaps, so such an object must never
+ * carry the NATS credential file keys, whoever writes it: only the registry's own entry, inline
+ * and controller-written, may name them.
+ */
+export function managedConfigKeysAllowed(input: {
+  name: string;
+  data?: Record<string, unknown>;
+  binaryData?: Record<string, unknown>;
+}): boolean {
+  if (!input.name.startsWith(BS_CONFIG_PREFIX) && !input.name.startsWith(BINDING_CONFIG_PREFIX))
+    return true;
+  const keys = [...Object.keys(input.data ?? {}), ...Object.keys(input.binaryData ?? {})];
+  return !keys.some((key) => (NATS_CREDENTIAL_KEYS as readonly string[]).includes(key));
+}
+
+function managedConfigKeysPolicy(): AdmissionPolicy {
+  const keys = JSON.stringify(NATS_CREDENTIAL_KEYS).replaceAll('"', "'");
+  return {
+    name: 'managed-config-keys',
+    apiGroups: [''],
+    apiVersions: ['v1'],
+    resources: ['configmaps', 'secrets'],
+    validations: [
+      {
+        expression: `!(object.metadata.name.startsWith('${BS_CONFIG_PREFIX}') ||
+            object.metadata.name.startsWith('${BINDING_CONFIG_PREFIX}')) || (
+          (!has(object.data) || !object.data.exists(k, k in ${keys})) &&
+          (!has(object.binaryData) || !object.binaryData.exists(k, k in ${keys})))`,
+        message: MANAGED_CONFIG_KEYS_MESSAGE,
+      },
+    ],
+  };
+}
+
 /**
  * Developers may delete tenant Secrets but never read them (#112). A DELETE response carries the
  * object, data included, so refuse every DELETE that can answer without removing the Secret:
@@ -868,6 +980,12 @@ export const SECRET_UPDATE_KEYS_MESSAGE =
  * `di-user-*` service account must target an unmanaged name and keep every key of the old object
  * (stringData is already folded into data at admission). Same-key replaces (the `/v1` set and
  * update, the CLI control Secret) stay allowed.
+ *
+ * CRITICAL: This policy has NO `request.dryRun` exemption. The CLI (cli-extensions#70) probes it
+ * with dry-run UPDATEs to prove three things without reading Secrets: that every extra key in
+ * `<workload>-control` is declared, that CLI keys are present, and that the policy applies to the
+ * caller. If a dryRun exemption is added, probes pass silently and undeclared keys are "kept"
+ * without guard (#204). tenant-secret-update.test.ts pins this.
  */
 function tenantSecretUpdatePolicy(namespace: string): AdmissionPolicy {
   const developer = `request.userInfo.username.startsWith('system:serviceaccount:${namespace}:di-user-')`;
@@ -909,6 +1027,70 @@ export function tenantSecretUpdateDenial(input: {
   return undefined;
 }
 
+/** Denial for a tenant controller's write to a Secret that is not one of its API keys (#321). */
+export const TENANT_CONTROLLER_SECRET_MESSAGE =
+  'the tenant controller may only create and delete its API-key Secrets in its own namespace (di-apikey-<id>, labelled with its tenant)';
+const TENANT_CONTROLLER_USER = /^system:serviceaccount:[^:]+:tenant-controller$/;
+/** The tenant controller's username when it runs in `namespace`. */
+const tenantControllerIn = (namespace: string) =>
+  `system:serviceaccount:${namespace}:tenant-controller`;
+const API_KEY_SECRET = /^di-apikey-[0-9a-f]{16}$/;
+
+/**
+ * The tenant controller's RBAC covers every Secret in its runtime namespace, because API-key
+ * Secrets have generated names that `resourceNames` cannot list (#115 S2). This limits its
+ * writes there to what `tenant-auth/src/keys.ts` does: create and delete `di-apikey-<16 hex>`
+ * Secrets labelled as API keys of the namespace's tenant. It can no longer replace or delete the
+ * OAuth client, TLS or registry pull Secrets beside them. The caller must also run in the
+ * request's namespace, so one tenant's controller cannot write in another's even if RBAC let it.
+ */
+function tenantControllerSecretsPolicy(): AdmissionPolicy {
+  // `object` on CREATE, `oldObject` on DELETE (the other one is null).
+  const apiKey = (secret: string) => `(
+    ${secret}.metadata.name.matches('${API_KEY_SECRET.source}') &&
+    has(${secret}.metadata.labels) &&
+    '${GROUP}/api-key' in ${secret}.metadata.labels &&
+    ${secret}.metadata.labels['${GROUP}/api-key'] == 'true' &&
+    '${TENANT}' in ${secret}.metadata.labels &&
+    request.namespace == 'di-runtime-' + ${secret}.metadata.labels['${TENANT}'])`;
+  return {
+    name: 'tenant-controller-secrets',
+    apiGroups: [''],
+    apiVersions: ['v1'],
+    operations: ['CREATE', 'UPDATE', 'DELETE'],
+    resources: ['secrets'],
+    validations: [
+      {
+        expression: `!request.userInfo.username.matches('${TENANT_CONTROLLER_USER.source}') ||
+          (request.userInfo.username == 'system:serviceaccount:' + request.namespace + ':tenant-controller' && (
+            (request.operation == 'CREATE' && ${apiKey('object')}) ||
+            (request.operation == 'DELETE' && ${apiKey('oldObject')})))`,
+        message: TENANT_CONTROLLER_SECRET_MESSAGE,
+      },
+    ],
+  };
+}
+
+/** Mirrors the `tenant-controller-secrets` CEL rule (#321). */
+export function tenantControllerSecretAllowed(input: {
+  username: string;
+  operation: 'CREATE' | 'UPDATE' | 'DELETE';
+  namespace: string;
+  name: string;
+  labels?: Record<string, string>;
+}): boolean {
+  if (!TENANT_CONTROLLER_USER.test(input.username)) return true;
+  const labels = input.labels ?? {};
+  return (
+    input.username === tenantControllerIn(input.namespace) &&
+    input.operation !== 'UPDATE' &&
+    API_KEY_SECRET.test(input.name) &&
+    labels[`${GROUP}/api-key`] === 'true' &&
+    labels[TENANT] !== undefined &&
+    input.namespace === `di-runtime-${labels[TENANT]}`
+  );
+}
+
 function ownershipLabelsExpression(installation: string): string {
   return `!has(object.metadata.labels) || (
     (!('${OWNER}' in object.metadata.labels)) &&
@@ -931,8 +1113,10 @@ export function admissionResources(
     workloadPolicy(namespace),
     reservedWorkloadPolicy(namespace, registryHost),
     backendConfigPolicy(namespace),
+    managedConfigKeysPolicy(),
     tenantSecretDeletePolicy(namespace),
     tenantSecretUpdatePolicy(namespace),
+    tenantControllerSecretsPolicy(),
     {
       name: 'services',
       apiGroups: [''],

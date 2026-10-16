@@ -1,0 +1,11 @@
+package di-framework:pglite-encfs-probe;
+
+/// Plugged on top of pglite-encfs (`wac plug --plug pglite-encfs.wasm probe.wasm`)
+/// and run with `wasmtime run --invoke 'probe()'`.
+world probe {
+  import wasi:filesystem/types@0.2.9;
+  import wasi:filesystem/preopens@0.2.9;
+
+  /// "root-probe ok", or "root-probe FAIL: <what>".
+  export probe: func() -> string;
+}

@@ -4,12 +4,12 @@
  * triggers and paths, the skip-if-published gate, least-privilege permissions, and the pin job.
  */
 import { describe, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { ARTIFACTS } from '../scripts/pin-artifact';
-import { matchesPathFilter, pushPaths } from '../scripts/source-check';
-import { spawnEnv } from './helpers/spawn-env';
+import { dirname, join, resolve } from 'node:path';
+import { ARTIFACTS, artifactFiles } from '../scripts/pin-artifact';
+import { hashExclusions, hashPaths, matchesPathFilter, pushPaths } from '../scripts/source-check';
+import { git, sandboxClone, spawnEnv, stubCommand } from './helpers/spawn-env';
 
 const repo = resolve(import.meta.dir, '..');
 const env = spawnEnv;
@@ -19,9 +19,12 @@ interface Job {
   if?: string;
   needs?: string | string[];
   permissions?: Permissions;
+  env?: Record<string, string>;
   outputs?: Record<string, string>;
   strategy?: { matrix?: Record<string, unknown> };
   steps?: {
+    name?: string;
+    if?: string;
     uses?: string;
     run?: string;
     env?: Record<string, string>;
@@ -34,6 +37,7 @@ interface Workflow {
     workflow_dispatch?: unknown;
   };
   permissions: Permissions;
+  env?: Record<string, string>;
   concurrency: { group: string; 'cancel-in-progress': boolean };
   jobs: Record<string, Job>;
 }
@@ -44,6 +48,15 @@ function read(path: string): string {
 function parse(path: string): Workflow {
   return Bun.YAML.parse(read(path)) as Workflow;
 }
+let tracked: string[] | undefined;
+/** The files git tracks, relative to the repository root. */
+function trackedFiles(): string[] {
+  tracked ??= Bun.spawnSync(['git', 'ls-files'], { cwd: repo })
+    .stdout.toString()
+    .split('\n')
+    .filter(Boolean);
+  return tracked;
+}
 
 const CHECKED =
   "${{ !cancelled() && needs.check-source.result == 'success' && needs.check-source.outputs.skip != 'true' }}";
@@ -52,6 +65,8 @@ interface Spec {
   file: string;
   image: string;
   paths: string[];
+  /** env.SOURCE_HASH_EXCLUDE: trigger files the source hash leaves out. */
+  hashExclude?: string[];
   /** The job that check-source gates. */
   first: string;
   firstIf: string;
@@ -70,6 +85,61 @@ interface Spec {
   /** The job that moves mutable tags, and its steps that the source guard gates. */
   guarded: { job: string; steps: string[] };
 }
+
+/** The pin job runs after `job` published, or when check-source found the source published. */
+function pinIfAfter(job: string): string {
+  return `\${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' && ((needs.${job}.result == 'success' && needs.${job}.outputs.digest != '') || (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}`;
+}
+
+/**
+ * A single-component workflow, `<name>-publish.yml`: a read-only build, then publish (or realign
+ * the version tag when the source is already published), then pin.
+ */
+function componentSpec(name: string, inputs: string[], hashExclude?: string[]): Spec {
+  const file = `.github/workflows/${name}-publish.yml`;
+  return {
+    file,
+    image: `ghcr.io/di-framework/${name}`,
+    paths: [
+      ...inputs,
+      'platform/wasm-component-publisher/**',
+      'Cargo.toml',
+      'Cargo.lock',
+      '.cargo/**',
+      file,
+      '!**/*.md',
+    ],
+    hashExclude,
+    first: 'build',
+    firstIf: CHECKED,
+    publish: ['publish', 'realign'],
+    readOnly: ['build'],
+    realign: { job: 'realign', tags: 'wit', wit: `platform/${name}/wit/world.wit` },
+    pinAfter: 'publish',
+    pinIf: pinIfAfter('publish'),
+    pinName: name,
+    guarded: {
+      job: 'publish',
+      steps: [
+        'Push and verify component',
+        'Record component digest',
+        'Tag with source hash',
+        'Upload publish report',
+      ],
+    },
+    artifacts: [name],
+  };
+}
+
+/** Files that only test pglite-encfs: they trigger its publish run but are not hashed (#349). */
+const ENCFS_TEST_ONLY = [
+  'platform/pglite-encfs/tests/**',
+  'platform/pglite-encfs/src/testdata/**',
+  'platform/pglite-encfs/scripts/smoke.ts',
+  'platform/pglite-encfs/scripts/unit.ts',
+  'platform/pglite-encfs/scripts/lib/tear.ts',
+  'platform/pglite-encfs/scripts/**/*.test.ts',
+];
 
 const SPECS: Spec[] = [
   {
@@ -114,85 +184,24 @@ const SPECS: Spec[] = [
     publish: ['publish-platform', 'publish-index'],
     readOnly: [],
     pinAfter: 'publish-index',
-    pinIf:
-      "${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' && ((needs.publish-index.result == 'success' && needs.publish-index.outputs.digest != '') || (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
+    pinIf: pinIfAfter('publish-index'),
     pinName: 'tenant-auth',
     guarded: { job: 'publish-index', steps: ['Assemble and verify image index'] },
     artifacts: ['tenant-auth'],
   },
-  {
-    file: '.github/workflows/pglite-component-publish.yml',
-    image: 'ghcr.io/di-framework/pglite-component',
-    paths: [
-      'platform/pglite-component/src/**',
-      'platform/pglite-component/wit/**',
-      'platform/pglite-component/engine/**',
-      'platform/pglite-component/build-support/**',
-      'platform/pglite-component/scripts/**',
-      'platform/pglite-component/Makefile',
-      'platform/pglite-component/build.rs',
-      'platform/pglite-component/Cargo.toml',
-      'platform/pglite-component/Cargo.lock',
-      'platform/pglite-component/rust-toolchain.toml',
-      'platform/wasm-component-publisher/**',
-      'Cargo.toml',
-      'Cargo.lock',
-      '.cargo/**',
-      '.github/workflows/pglite-component-publish.yml',
-      '!**/*.md',
-    ],
-    first: 'build',
-    firstIf: CHECKED,
-    publish: ['publish', 'realign'],
-    readOnly: ['build'],
-    realign: { job: 'realign', tags: 'wit', wit: 'platform/pglite-component/wit/world.wit' },
-    pinAfter: 'publish',
-    pinIf:
-      "${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' && ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') || (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
-    pinName: 'pglite-component',
-    guarded: {
-      job: 'publish',
-      steps: [
-        'Push and verify component',
-        'Record component digest',
-        'Tag with source hash',
-        'Upload publish report',
-      ],
-    },
-    artifacts: ['pglite-component'],
-  },
-  {
-    file: '.github/workflows/pglite-encfs-publish.yml',
-    image: 'ghcr.io/di-framework/pglite-encfs',
-    paths: [
-      'platform/pglite-encfs/**',
-      'platform/wasm-component-publisher/**',
-      'Cargo.toml',
-      'Cargo.lock',
-      '.cargo/**',
-      '.github/workflows/pglite-encfs-publish.yml',
-      '!**/*.md',
-    ],
-    first: 'build',
-    firstIf: CHECKED,
-    publish: ['publish', 'realign'],
-    readOnly: ['build'],
-    realign: { job: 'realign', tags: 'wit', wit: 'platform/pglite-encfs/wit/world.wit' },
-    pinAfter: 'publish',
-    pinIf:
-      "${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' && ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') || (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
-    pinName: 'pglite-encfs',
-    guarded: {
-      job: 'publish',
-      steps: [
-        'Push and verify component',
-        'Record component digest',
-        'Tag with source hash',
-        'Upload publish report',
-      ],
-    },
-    artifacts: ['pglite-encfs'],
-  },
+  componentSpec('pglite-component', [
+    'platform/pglite-component/src/**',
+    'platform/pglite-component/wit/**',
+    'platform/pglite-component/engine/**',
+    'platform/pglite-component/build-support/**',
+    'platform/pglite-component/scripts/**',
+    'platform/pglite-component/Makefile',
+    'platform/pglite-component/build.rs',
+    'platform/pglite-component/Cargo.toml',
+    'platform/pglite-component/Cargo.lock',
+    'platform/pglite-component/rust-toolchain.toml',
+  ]),
+  componentSpec('pglite-encfs', ['platform/pglite-encfs/**'], ENCFS_TEST_ONLY),
   {
     file: '.github/workflows/oci-registry-component.yml',
     image: 'ghcr.io/di-framework/oci-registry',
@@ -214,8 +223,7 @@ const SPECS: Spec[] = [
     publish: ['publish'],
     readOnly: [],
     pinAfter: 'publish',
-    pinIf:
-      "${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' && ((needs.publish.result == 'success' && needs.publish.outputs.digest != '') || (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' && needs.check-source.outputs.digest != '')) }}",
+    pinIf: pinIfAfter('publish'),
     pinName: 'oci-registry',
     guarded: {
       job: 'publish',
@@ -250,6 +258,22 @@ describe.each(SPECS)('$file', (spec) => {
     // The workflow file itself is an input; Markdown never is, so pin PRs cannot loop.
     expect(matchesPathFilter(spec.paths, spec.file)).toBe(true);
     expect(matchesPathFilter(spec.paths, 'platform/tenant-host/README.md')).toBe(false);
+  });
+
+  test('hashes a subset of the files that trigger it (#349)', () => {
+    expect(hashExclusions(text)).toEqual(spec.hashExclude ?? []);
+    const hashed = hashPaths(text);
+    const triggering = trackedFiles().filter((file) => matchesPathFilter(spec.paths, file));
+    expect(triggering.length).toBeGreaterThan(0);
+    for (const file of trackedFiles()) {
+      if (matchesPathFilter(hashed, file)) expect(triggering, file).toContain(file);
+    }
+    // Every excluded glob names files that would otherwise trigger the run.
+    for (const glob of spec.hashExclude ?? []) {
+      const excluded = triggering.filter((file) => new Bun.Glob(glob).match(file));
+      expect(excluded.length, glob).toBeGreaterThan(0);
+      for (const file of excluded) expect(matchesPathFilter(hashed, file), file).toBe(false);
+    }
   });
 
   test('check-source runs on main, reads packages only, and hashes this workflow’s filter', () => {
@@ -453,30 +477,53 @@ test('every job that runs oras sets it up first (C1)', () => {
     step.uses === './.github/actions/setup-oras' ||
     step.uses === './.github/actions/setup-source-check' ||
     /oras_\$\{version\}_linux_amd64\.tar\.gz/.test(step.run ?? '');
+  // check-source runs oras inside scripts/source-check.ts, and the Wasm component publishers
+  // (wasm-component-publisher) push the layer, config and manifest with oras.
+  const runsOras = (step: { run?: string }) =>
+    /(^|[\s|(])oras\s/m.test(step.run ?? '') ||
+    /scripts\/(source-check\.ts|wash-pins\.sh)/.test(step.run ?? '') ||
+    /target\/debug\/[\w-]+-publisher\b/.test(step.run ?? '');
   let checked = 0;
   for (const spec of SPECS) {
     for (const [name, job] of Object.entries(parse(spec.file).jobs)) {
       const steps = (job.steps ?? []) as { uses?: string; run?: string; name?: string }[];
-      // check-source runs oras inside scripts/source-check.ts.
-      const usesOras = steps.some(
-        (s) =>
-          /(^|[\s|(])oras\s/m.test(s.run ?? '') ||
-          /scripts\/(source-check\.ts|wash-pins\.sh)/.test(s.run ?? ''),
-      );
+      const usesOras = steps.some(runsOras);
       if (!usesOras) continue;
       checked++;
-      const first = steps.findIndex(
-        (s) =>
-          !installs(s) &&
-          (/(^|[\s|(])oras\s/m.test(s.run ?? '') ||
-            /scripts\/(source-check\.ts|wash-pins\.sh)/.test(s.run ?? '')),
-      );
+      const first = steps.findIndex((s) => !installs(s) && runsOras(s));
       const setup = steps.findIndex(installs);
       expect(setup, `${spec.file} ${name}`).toBeGreaterThanOrEqual(0);
       expect(setup, `${spec.file} ${name}`).toBeLessThan(first);
     }
   }
   expect(checked).toBeGreaterThanOrEqual(7);
+});
+
+test('no Wasm component publisher sees a SOURCE_DATE_EPOCH (#345)', () => {
+  // wasm-component-publisher writes SOURCE_DATE_EPOCH into the manifest's created time. A
+  // per-commit value (build-engine.ts uses one for the engine build) would give an unchanged
+  // component a new digest on every publish, so the publisher step clears it, and neither the
+  // workflow nor the job sets it.
+  const files = [
+    '.github/workflows/oci-registry-component.yml',
+    '.github/workflows/pglite-component-publish.yml',
+    '.github/workflows/pglite-encfs-publish.yml',
+  ];
+  for (const file of files) {
+    const workflow = parse(file);
+    expect(workflow.env?.SOURCE_DATE_EPOCH, file).toBeUndefined();
+    let publishers = 0;
+    for (const [name, job] of Object.entries(workflow.jobs)) {
+      expect(job.env?.SOURCE_DATE_EPOCH, `${file} ${name}`).toBeUndefined();
+      for (const step of job.steps ?? []) {
+        if (!/target\/debug\/[\w-]+-publisher\b/.test(step.run ?? '')) continue;
+        publishers++;
+        expect(step.env?.PUSH, `${file} ${name}`).toBe('true');
+        expect(step.env?.SOURCE_DATE_EPOCH, `${file} ${name}`).toBe('');
+      }
+    }
+    expect(publishers, file).toBe(1);
+  }
 });
 
 test('the publish workflows use distinct concurrency groups', () => {
@@ -515,12 +562,76 @@ test('publish paths reuse the paths the image checks already maintain', () => {
   );
 });
 
-test('no pin target is an input of any publish workflow, so merging a pin PR publishes nothing', () => {
-  const files = new Set(Object.values(ARTIFACTS).flatMap((targets) => targets.map((t) => t.file)));
-  for (const spec of SPECS) {
-    for (const file of files) expect(matchesPathFilter(spec.paths, file), file).toBe(false);
+describe('pglite-encfs test-only files (#349)', () => {
+  const text = read('.github/workflows/pglite-encfs-publish.yml');
+  const trigger = pushPaths(text);
+  const hashed = hashPaths(text);
+  const files = trackedFiles().filter(
+    (file) => file.startsWith('platform/pglite-encfs/') && !file.endsWith('.md'),
+  );
+  const testOnly = (file: string) => ENCFS_TEST_ONLY.some((glob) => new Bun.Glob(glob).match(file));
+
+  test('start the publish run but do not change the source hash', () => {
+    expect(files.filter(testOnly).length).toBeGreaterThan(0);
+    for (const file of files) {
+      expect(matchesPathFilter(trigger, file), file).toBe(true);
+      expect(matchesPathFilter(hashed, file), file).toBe(!testOnly(file));
+    }
+  });
+
+  test.each([
+    ['tests/root-probe/src/lib.rs', false],
+    ['src/testdata/xts-kat.txt', false],
+    ['scripts/smoke.ts', false],
+    ['scripts/lib/tear.test.ts', false],
+    ['src/component.rs', true],
+    ['wit/world.wit', true],
+    ['Cargo.toml', true],
+  ] as const)('platform/pglite-encfs/%s is hashed: %p', (path, isHashed) => {
+    const file = `platform/pglite-encfs/${path}`;
+    expect(files).toContain(file);
+    expect(matchesPathFilter(hashed, file)).toBe(isHashed);
+  });
+
+  test('the build never imports a file the hash leaves out', () => {
+    const seen = new Set<string>();
+    const visit = (file: string) => {
+      if (seen.has(file)) return;
+      seen.add(file);
+      const source = read(file);
+      for (const match of source.matchAll(/(?:from|import)\s*\(?\s*['"](\.{1,2}\/[^'"]+)['"]/g)) {
+        visit(join(dirname(file), match[1] as string));
+      }
+    };
+    visit('platform/pglite-encfs/scripts/build.ts');
+    expect([...seen]).toContain('platform/pglite-encfs/scripts/lib/wit.ts');
+    for (const file of seen) {
+      expect(files, file).toContain(file);
+      expect(matchesPathFilter(hashed, file), file).toBe(true);
+    }
+  });
+});
+
+test('merging a pin PR never republishes its own artifact, and any other publish it starts ends there', () => {
+  // The tenant host pin also appends to the patch-0003 allowlist (#346), which lives in
+  // platform/platform/src/tenancy/, an input of the tenant-auth image. That is the one publish a
+  // pin PR may start; tenant-auth's own pin touches no input, so the chain stops after one hop.
+  const triggers: string[] = [];
+  for (const pinSpec of SPECS) {
+    for (const file of new Set(pinSpec.artifacts.flatMap(artifactFiles))) {
+      expect(matchesPathFilter(pinSpec.paths, file), `${pinSpec.file}: ${file}`).toBe(false);
+      for (const spec of SPECS) {
+        if (matchesPathFilter(spec.paths, file))
+          triggers.push(`${pinSpec.pinName} -> ${spec.pinName}: ${file}`);
+      }
+    }
   }
-  expect(files.has('platform/platform/src/index.ts')).toBe(false);
+  expect(triggers).toEqual(['wash -> tenant-auth: platform/platform/src/tenancy/registry-nats.ts']);
+  for (const name of Object.keys(ARTIFACTS).filter((n) => !n.startsWith('wash-'))) {
+    for (const file of artifactFiles(name)) {
+      for (const spec of SPECS) expect(matchesPathFilter(spec.paths, file), file).toBe(false);
+    }
+  }
 });
 
 describe('composite actions', () => {
@@ -643,9 +754,86 @@ test('the tenant host resolves variants in one place, from platform/tenant-host/
     .split('\n')) {
     expect(matchesPathFilter(filter, file), file).toBe(!file.endsWith('.md'));
   }
-  for (const file of ['variants', '0002-insecure-registry-allowlist.patch']) {
+  for (const file of [
+    'variants',
+    '0002-insecure-registry-allowlist.patch',
+    '0003-nats-blobstore-credentials.patch',
+  ]) {
     expect(matchesPathFilter(filter, `platform/tenant-host/${file}`), file).toBe(true);
   }
+});
+
+test('every tenant host variant carries the NATS blobstore credentials patch, and CI tests it (#330)', () => {
+  const patch = '0003-nats-blobstore-credentials.patch';
+  const rows = read('platform/tenant-host/variants')
+    .split('\n')
+    .filter((line) => line.trim() && !line.startsWith('#'))
+    .map((line) => line.trim().split(/\s+/));
+  expect(rows.length).toBeGreaterThan(0);
+  // Last in each row: it is a `git diff` against the pinned commit and touches no file 0001/0002 do.
+  for (const [tag, ...patches] of rows) expect(patches.at(-1), tag).toBe(patch);
+  const dockerfile = read('platform/tenant-host/Dockerfile');
+  expect(dockerfile).toContain(`ARG WASH_PATCHES="${rows[0]?.slice(1).join(' ')}"`);
+  const text = read(`platform/tenant-host/${patch}`);
+  const files = [...text.matchAll(/^diff --git a\/(\S+) b\//gm)].map((m) => m[1]);
+  expect(files).toEqual(['crates/wash-runtime/src/plugin/wasi_blobstore/multiplexed/nats.rs']);
+  for (const other of ['0001-exclusive-instance.patch', '0002-insecure-registry-allowlist.patch']) {
+    const touched = read(`platform/tenant-host/${other}`);
+    for (const file of files) expect(touched, other).not.toContain(`a/${file} `);
+  }
+  // Every test the patch adds is a required test of the patch-check job, and nothing else is.
+  const check = read('.github/workflows/tenant-host-patch-check.yml');
+  expect(check).toContain(`*" ${patch} "*`);
+  const prefix = 'plugin::wasi_blobstore::multiplexed::nats::tests::';
+  const added = [...text.matchAll(/^\+\s+(?:async )?fn (nats_blobstore_\w+)\(/gm)].map((m) => m[1]);
+  const required = [...check.matchAll(new RegExp(`^\\s+${prefix}(\\w+)$`, 'gm'))].map((m) => m[1]);
+  expect(added.length).toBeGreaterThan(0);
+  expect(required.sort()).toEqual(added.sort());
+});
+
+test('CI runs every exclusive-instance topology test the 0001 patch adds, by name (#144)', () => {
+  const text = read('platform/tenant-host/0001-exclusive-instance.patch');
+  const file = 'crates/wash-runtime/tests/integration_exclusive_topology.rs';
+  const section = text.split(/^diff --git /m).find((s) => s.startsWith(`a/${file} b/${file}`));
+  expect(section).toBeDefined();
+  const added = [
+    ...(section ?? '').matchAll(/^\+#\[tokio::test[^\n]*\n\+(?:async )?fn (\w+)\(/gm),
+  ].map((m) => m[1] ?? '');
+  expect(added).toContain('an_http_trap_leaves_the_queued_calls_a_fresh_instance');
+  expect(added).toContain('an_http_timeout_leaves_the_queued_calls_a_fresh_instance');
+
+  const workflow = parse('.github/workflows/tenant-host-patch-check.yml');
+  const steps = workflow.jobs.patch?.steps ?? [];
+  const fixtures = steps.find((s) => s.name === 'Build the wasm test fixtures');
+  const topology = steps.find((s) => s.name === 'Test the exclusive-instance topology');
+  const onlyWith0001 =
+    "contains(format(' {0} ', matrix.patches), ' 0001-exclusive-instance.patch ')";
+  expect(fixtures?.if).toBe(onlyWith0001);
+  expect(topology?.if).toBe(onlyWith0001);
+  expect(fixtures?.run).toContain('cargo xtask build-fixtures');
+  expect(fixtures?.run).toContain('CARGO_TARGET_WASM32_WASIP2_LINKER');
+  // The fixtures are built before the tests that `include_bytes!` them.
+  const index = (name: string) => steps.findIndex((s) => s.name === name);
+  expect(index('Build the wasm test fixtures')).toBeLessThan(
+    index('Test the exclusive-instance topology'),
+  );
+  const run = topology?.run ?? '';
+  expect(run).toContain('--test integration_exclusive_topology');
+  expect(run).toContain('::error::required topology test ${name} did not run and pass');
+  const block = run.match(/required=\(\n([\s\S]*?)\n\s*\)/)?.[1] ?? '';
+  const required = block.split('\n').map((line) => line.trim());
+  expect(added.length).toBeGreaterThan(0);
+  expect([...required].sort()).toEqual([...added].sort());
+
+  // The flag a trap reported to an HTTP task sets is unit-tested in the pool tests, by name.
+  const unit = 'a_call_finished_faulted_retires_its_instance_before_the_next_is_admitted';
+  expect(text).toMatch(new RegExp(`^\\+async fn ${unit}\\(`, 'm'));
+  expect(read('.github/workflows/tenant-host-patch-check.yml')).toContain(
+    `engine::instance_pool::exclusive_tests::${unit}\n`,
+  );
+  expect(fixtures?.run).toContain(
+    'root="${HOME}/.cache/wasm-component-ld/${WASM_COMPONENT_LD_VERSION}"',
+  );
 });
 
 describe('the check-source resolver reads platform/tenant-host/variants', () => {
@@ -662,12 +850,11 @@ describe('the check-source resolver reads platform/tenant-host/variants', () => 
     mkdirSync(join(dir, 'platform/tenant-host'), { recursive: true });
     writeFileSync(join(dir, 'platform/tenant-host/variants'), table);
     const bin = join(dir, 'bin');
-    mkdirSync(bin);
-    writeFileSync(
-      join(bin, 'bun'),
-      `#!/bin/sh\necho "hash=${'a'.repeat(64)}"\n${answer}\necho "args=$*" >> "${dir}/bun.log"\n`,
+    stubCommand(
+      bin,
+      'bun',
+      `echo "hash=${'a'.repeat(64)}"\n${answer}\necho "args=$*" >> "${dir}/bun.log"`,
     );
-    chmodSync(join(bin, 'bun'), 0o755);
     const output = join(dir, 'out');
     writeFileSync(output, '');
     const result = Bun.spawnSync(['bash', '-c', script], {
@@ -825,20 +1012,17 @@ describe('scripts/wash-pins.sh (the wash pin set)', () => {
   function run(published: string[]) {
     const base = mkdtempSync(join(tmpdir(), 'wash-pins-'));
     const bin = join(base, 'bin');
-    mkdirSync(bin);
-    writeFileSync(
-      join(bin, 'oras'),
+    stubCommand(
+      bin,
+      'oras',
       [
-        '#!/bin/sh',
         'ref="$4"',
         'for tag in $PUBLISHED; do',
         '  case "$ref" in *":$tag") echo "{\\"digest\\":\\"sha256:$(printf %064d 0 | tr 0 "${tag#src-}" | cut -c1-64)\\"}"; exit 0 ;; esac',
         'done',
         'echo "Error: $ref: not found" >&2; exit 1',
-        '',
       ].join('\n'),
     );
-    chmodSync(join(bin, 'oras'), 0o755);
     const output = join(base, 'out');
     writeFileSync(output, '');
     const result = Bun.spawnSync(['bash', 'scripts/wash-pins.sh'], {
@@ -971,5 +1155,444 @@ describe('digest artifacts: no download pattern reaches another artifact', () =>
     expect(names.filter((n) => glob.match(n)).sort()).toEqual(
       authArches.map((arch) => `tenant-auth-${arch}`).sort(),
     );
+  });
+});
+
+describe('release.yml publishes the tested npm tarballs byte for byte (#168)', () => {
+  const release = parse('.github/workflows/release.yml');
+  const steps = (job: string) => release.jobs[job]?.steps ?? [];
+  const runs = (job: string) =>
+    steps(job)
+      .map((s) => s.run ?? '')
+      .join('\n');
+  const uses = (job: string) => steps(job).map((s) => s.uses ?? '');
+
+  test('keeps its triggers: v* tag pushes and the dispatch Auto Tag sends', () => {
+    expect(release.on.push).toEqual({ tags: ['v*'] } as never);
+    expect('workflow_dispatch' in release.on).toBe(true);
+  });
+
+  test('build, publish and github-release run in that order', () => {
+    expect(Object.keys(release.jobs).sort()).toEqual(['build', 'github-release', 'publish']);
+    expect(release.jobs.publish?.needs).toBe('build');
+    expect(release.jobs['github-release']?.needs).toBe('publish');
+    expect(release.jobs['github-release']?.if).toBe("github.ref_type == 'tag'");
+  });
+
+  test('only publish holds an OIDC token, only github-release can write contents', () => {
+    expect(release.permissions).toEqual({ contents: 'read' });
+    expect(release.jobs.build?.permissions).toEqual({ contents: 'read' });
+    expect(release.jobs.publish?.permissions).toEqual({ contents: 'read', 'id-token': 'write' });
+    expect(release.jobs['github-release']?.permissions).toEqual({ contents: 'write' });
+  });
+
+  test('build smoke-tests, records the wasm sha256, packs without rebuilding pglite, uploads', () => {
+    const build = runs('build');
+    const smoke = build.indexOf('make -C platform/pglite-component unit smoke');
+    const record = build.indexOf(
+      'sha256sum platform/pglite-component/dist/di-framework-pglite.wasm',
+    );
+    const pack = build.indexOf('--pack "$RUNNER_TEMP/npm-packages"');
+    expect(smoke).toBeGreaterThan(-1);
+    expect(record).toBeGreaterThan(smoke);
+    expect(pack).toBeGreaterThan(record);
+    expect(build).toContain('--prebuilt @di-framework/pglite-component');
+    expect(
+      build.indexOf('tar -xzOf "$dir/$tarball" package/dist/di-framework-pglite.wasm'),
+    ).toBeGreaterThan(pack);
+    expect(build).toContain('--verify-packed "$dir"');
+    expect(build).not.toMatch(/npm publish|--publish-packed/);
+    expect(uses('build').filter((u) => u.startsWith('actions/upload-artifact@'))).toHaveLength(1);
+    const outputs = release.jobs.build?.outputs ?? {};
+    expect(outputs.pglite_wasm_sha256).toBe('${{ steps.smoke.outputs.wasm_sha256 }}');
+    expect(outputs.manifest_sha256).toBe('${{ steps.pack.outputs.manifest_sha256 }}');
+  });
+
+  test('publish builds nothing and checks both digests before publishing the tarballs', () => {
+    const publish = runs('publish');
+    expect(publish).not.toMatch(
+      /\bmake\b|cargo|docker|bun install|bun run build|--pack |--dry-run/,
+    );
+    expect(uses('publish').filter((u) => u.startsWith('actions/download-artifact@'))).toHaveLength(
+      1,
+    );
+    const verify = steps('publish').findIndex((s) => s.env?.MANIFEST_SHA256 !== undefined);
+    const last = steps('publish').findIndex((s) => (s.run ?? '').includes('--publish-packed'));
+    expect(verify).toBeGreaterThan(-1);
+    expect(last).toBeGreaterThan(verify);
+    expect(steps('publish')[verify]?.env).toMatchObject({
+      MANIFEST_SHA256: '${{ needs.build.outputs.manifest_sha256 }}',
+      WASM_SHA256: '${{ needs.build.outputs.pglite_wasm_sha256 }}',
+    });
+    expect(steps('publish')[verify]?.run).toContain('package/dist/di-framework-pglite.wasm');
+  });
+});
+
+describe('Auto Tag tags a release when its PR merges instead of waiting for it (#214)', () => {
+  const autoTag = parse('.github/workflows/auto-tag.yml');
+  const tagSteps = autoTag.jobs.tag?.steps ?? [];
+  const allRuns = Object.values(autoTag.jobs)
+    .flatMap((job) => job.steps ?? [])
+    .map((s) => s.run ?? '')
+    .join('\n');
+
+  test('opens the release PR on lockfile pushes and dispatches, tags on a merged PR', () => {
+    expect(autoTag.on.push).toEqual({
+      branches: ['main'],
+      paths: ['bun.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'],
+    });
+    expect(autoTag.on.pull_request).toEqual({
+      types: ['closed'],
+      branches: ['main'],
+      paths: ['package.json'],
+    });
+    expect(autoTag.on.workflow_dispatch).toMatchObject({
+      inputs: {
+        bump: { type: 'choice', default: 'patch' },
+        tag_only: { type: 'boolean', default: false },
+      },
+    });
+  });
+
+  test('two jobs: tag, then release-pr; nothing waits for the PR to merge', () => {
+    expect(Object.keys(autoTag.jobs).sort()).toEqual(['release-pr', 'tag']);
+    expect(autoTag.jobs.tag?.needs).toBeUndefined();
+    expect(autoTag.jobs['release-pr']?.needs).toBe('tag');
+    expect(allRuns).not.toMatch(/\bsleep\b|gh pr view "\$PR"|mergedAt/);
+    // A workflow-level group would let PR-close runs cancel a pending release run, and one
+    // group for every tag job would let a merge run replace a pending push run.
+    expect(autoTag.concurrency).toBeUndefined();
+    expect(autoTag.jobs.tag).toMatchObject({
+      concurrency: { group: 'auto-tag-tag-${{ github.event_name }}', 'cancel-in-progress': false },
+    });
+    expect(autoTag.jobs['release-pr']).toMatchObject({
+      concurrency: { group: 'auto-tag', 'cancel-in-progress': false },
+    });
+  });
+
+  test('tag runs only for merged same-repository release/v* PRs; release-pr never on a PR', () => {
+    const tagIf = autoTag.jobs.tag?.if ?? '';
+    expect(tagIf).toContain("github.event_name != 'pull_request' ||");
+    expect(tagIf).toContain('github.event.pull_request.merged == true');
+    expect(tagIf).toContain("startsWith(github.event.pull_request.head.ref, 'release/v')");
+    expect(tagIf).toContain('github.event.pull_request.head.repo.full_name == github.repository');
+    const prIf = autoTag.jobs['release-pr']?.if ?? '';
+    expect(prIf).toContain("!cancelled() && needs.tag.result == 'success'");
+    expect(prIf).toContain("(github.event_name == 'workflow_dispatch' && inputs.tag_only != true)");
+    expect(prIf).toContain("github.event_name == 'push'");
+    expect(prIf).toContain("!startsWith(github.event.head_commit.message, 'chore(release):')");
+    expect(prIf).not.toContain('pull_request');
+  });
+
+  test('least privilege: no workflow-level scopes, each job only what it uses', () => {
+    expect(autoTag.permissions).toEqual({});
+    expect(autoTag.jobs.tag?.permissions).toEqual({
+      contents: 'write',
+      actions: 'write',
+      'pull-requests': 'read',
+    });
+    expect(autoTag.jobs['release-pr']?.permissions).toEqual({
+      contents: 'write',
+      'pull-requests': 'write',
+    });
+    const prRuns = (autoTag.jobs['release-pr']?.steps ?? []).map((s) => s.run ?? '').join('\n');
+    expect(prRuns).not.toMatch(/gh workflow run|git tag /);
+  });
+
+  test('tag pushes the tag, then dispatches release.yml on it (GITHUB_TOKEN pushes fire nothing)', () => {
+    const tagRun = tagSteps.map((s) => s.run ?? '').join('\n');
+    const push = tagRun.indexOf('git push origin "refs/tags/v$VERSION"');
+    const dispatch = tagRun.indexOf('gh workflow run release.yml --ref "v$VERSION"');
+    expect(push).toBeGreaterThan(-1);
+    expect(dispatch).toBeGreaterThan(push);
+    for (const s of tagSteps.filter((s) => s.run)) {
+      expect(s.env?.GH_TOKEN).toBe('${{ github.token }}');
+    }
+    expect(parse('.github/workflows/release.yml').on.push).toEqual({ tags: ['v*'] } as never);
+  });
+
+  test('the README says what publishes a release and how to recover', () => {
+    const readme = read('README.md');
+    expect(readme).toContain(
+      'Approving the Auto Tag run, or merging the release PR, is what publishes a release.',
+    );
+    expect(readme).toContain('`tag_only: true`');
+  });
+
+  describe('the tag job scripts', () => {
+    const REPO = 'di-framework/platform';
+    const find = tagSteps.find((s) => (s.run ?? '').includes('version_at'));
+    const tag = tagSteps.find((s) => (s.run ?? '').includes('gh workflow run'));
+
+    /**
+     * origin/main: a 1.0.0 commit, then `chore(release): v1.0.1 (#5)`, then `extra`.
+     * The stub `gh` answers `api repos/<repo>/commits/<sha>/pulls` from `pulls-<sha>.json`,
+     * `run list` from `runs.json`, and logs `workflow run`; a successful dispatch records a run,
+     * and a `fail-dispatch` file makes the next dispatch fail.
+     */
+    function sandbox(extra?: string) {
+      const box = sandboxClone('auto-tag-');
+      const write = (version: string) =>
+        writeFileSync(join(box.work, 'package.json'), `${JSON.stringify({ version })}\n`);
+      write('1.0.0');
+      git(box.work, 'add', '.');
+      git(box.work, 'commit', '-qm', 'init');
+      const init = git(box.work, 'rev-parse', 'HEAD');
+      write('1.0.1');
+      git(box.work, 'commit', '-qam', 'chore(release): v1.0.1 (#5)');
+      const release = git(box.work, 'rev-parse', 'HEAD');
+      if (extra) {
+        writeFileSync(join(box.work, 'other'), extra);
+        git(box.work, 'add', '.');
+        git(box.work, 'commit', '-qm', extra);
+      }
+      git(box.work, 'push', '-q', 'origin', 'HEAD:main');
+      const bin = join(box.base, 'bin');
+      const b = box.base;
+      stubCommand(
+        bin,
+        'gh',
+        [
+          'case "$1 $2" in',
+          `  "api "*) sha="\${2#*/commits/}"; sha="\${sha%/pulls}"; cat "${b}/pulls-$sha.json" 2>/dev/null || echo '[]' ;;`,
+          `  "run list") cat "${b}/runs.json" 2>/dev/null || echo '[]' ;;`,
+          `  "workflow run") echo "$*" >> "${b}/gh.log"`,
+          `    if [ -f "${b}/fail-dispatch" ]; then rm "${b}/fail-dispatch"; exit 1; fi`,
+          `    echo '[{"databaseId":1}]' > "${b}/runs.json" ;;`,
+          '  *) echo "unexpected gh $*" >&2; exit 2 ;;',
+          'esac',
+        ].join('\n'),
+      );
+      const result = { ...box, init, release, bin };
+      pulls(result, release, [releasePr('release/v1.0.1')]);
+      return result;
+    }
+    type Box = ReturnType<typeof sandbox>;
+
+    function releasePr(ref: string, repo = REPO, merged = true) {
+      return {
+        number: 5,
+        merged_at: merged ? '2026-10-14T00:00:00Z' : null,
+        head: { ref, repo: { full_name: repo } },
+      };
+    }
+    function pulls(box: { base: string }, sha: string, list: unknown[]) {
+      writeFileSync(join(box.base, `pulls-${sha}.json`), JSON.stringify(list));
+    }
+
+    function step(box: Box, script: string, vars: Record<string, string>) {
+      const output = join(box.base, 'out');
+      writeFileSync(output, '');
+      const result = Bun.spawnSync(['bash', '-c', script], {
+        cwd: box.work,
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: {
+          ...env,
+          PATH: `${box.bin}:${process.env.PATH}`,
+          GITHUB_OUTPUT: output,
+          GITHUB_STEP_SUMMARY: join(box.base, 'summary'),
+          GITHUB_REPOSITORY: REPO,
+          ...vars,
+        },
+      });
+      const out: Record<string, string> = Object.fromEntries(
+        readFileSync(output, 'utf8')
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]),
+      );
+      return { exitCode: result.exitCode, out, stdout: result.stdout.toString() };
+    }
+
+    /** Both steps, as the job runs them; `between` runs after the find step. */
+    function run(box: Box, vars: Record<string, string>, between?: () => void) {
+      const first = step(box, find?.run ?? '', vars);
+      if (first.exitCode !== 0 || !['tag', 'dispatch'].includes(first.out.action ?? '')) {
+        return first;
+      }
+      between?.();
+      const second = step(box, tag?.run ?? '', {
+        ACTION: first.out.action ?? '',
+        VERSION: first.out.version ?? '',
+        COMMIT: first.out.commit ?? '',
+      });
+      return { ...second, out: first.out, stdout: first.stdout + second.stdout };
+    }
+
+    const dispatches = (box: Box) => {
+      const file = join(box.base, 'gh.log');
+      return existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : [];
+    };
+    /** The commit a remote tag points at (peeled when annotated). */
+    const remoteTag = (box: Box, name: string) =>
+      git(box.work, 'ls-remote', '--tags', 'origin', `refs/tags/${name}`, `refs/tags/${name}^{}`)
+        .split('\n')
+        .at(-1)
+        ?.split('\t')[0];
+    const noTags = (box: Box) => expect(git(box.work, 'ls-remote', '--tags', 'origin')).toBe('');
+    const DISPATCH = 'workflow run release.yml --ref v1.0.1';
+
+    test('a push run tags the release commit of the version on main and dispatches Release once', () => {
+      const box = sandbox('fix: later work');
+      const first = run(box, { EVENT: 'push' });
+      expect(first.exitCode).toBe(0);
+      expect(first.out.action).toBe('tag');
+      expect(remoteTag(box, 'v1.0.1')).toBe(box.release);
+      expect(dispatches(box)).toEqual([DISPATCH]);
+
+      // Idempotent: the tag exists and Release ran, so a second run does nothing.
+      const again = run(box, { EVENT: 'workflow_dispatch' });
+      expect(again.exitCode).toBe(0);
+      expect(again.out.action).toBe('none');
+      expect(dispatches(box)).toEqual([DISPATCH]);
+    });
+
+    test('a merged release PR tags its merge commit', () => {
+      const box = sandbox();
+      const result = run(box, {
+        EVENT: 'pull_request',
+        HEAD_REF: 'release/v1.0.1',
+        MERGE_SHA: box.release,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(remoteTag(box, 'v1.0.1')).toBe(box.release);
+      expect(dispatches(box)).toEqual([DISPATCH]);
+    });
+
+    test('a failed dispatch after the tag push is retried by the next run, once', () => {
+      const box = sandbox();
+      writeFileSync(join(box.base, 'fail-dispatch'), '');
+      const failed = run(box, {
+        EVENT: 'pull_request',
+        HEAD_REF: 'release/v1.0.1',
+        MERGE_SHA: box.release,
+      });
+      expect(failed.exitCode).not.toBe(0);
+      expect(remoteTag(box, 'v1.0.1')).toBe(box.release);
+      expect(dispatches(box)).toEqual([DISPATCH]);
+
+      // A re-run of the same event finds the tag at the merge commit and no Release run.
+      const retry = run(box, {
+        EVENT: 'pull_request',
+        HEAD_REF: 'release/v1.0.1',
+        MERGE_SHA: box.release,
+      });
+      expect(retry.exitCode).toBe(0);
+      expect(retry.out.action).toBe('dispatch');
+      expect(dispatches(box)).toEqual([DISPATCH, DISPATCH]);
+
+      // Release has run now; a tag_only dispatch does nothing.
+      const after = run(box, { EVENT: 'workflow_dispatch' });
+      expect(after.out.action).toBe('none');
+      expect(dispatches(box)).toEqual([DISPATCH, DISPATCH]);
+    });
+
+    test('losing the tag-push race exits cleanly without a second dispatch', () => {
+      const box = sandbox();
+      const result = run(box, { EVENT: 'push' }, () => {
+        git(box.work, 'push', '-q', 'origin', `${box.release}:refs/tags/v1.0.1`);
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('Tag v1.0.1 was pushed by another run; nothing to do.');
+      expect(dispatches(box)).toEqual([]);
+    });
+
+    test('a tag at another commit is left alone and nothing is dispatched', () => {
+      const box = sandbox();
+      git(box.work, 'push', '-q', 'origin', `${box.init}:refs/tags/v1.0.1`);
+      for (const vars of [
+        { EVENT: 'push' } as Record<string, string>,
+        { EVENT: 'pull_request', HEAD_REF: 'release/v1.0.1', MERGE_SHA: box.release },
+      ]) {
+        const result = run(box, vars);
+        expect(result.exitCode).toBe(0);
+        expect(result.out.action).toBe('none');
+        expect(result.stdout).toContain(`::warning::tag v1.0.1 already exists at ${box.init}`);
+      }
+      expect(remoteTag(box, 'v1.0.1')).toBe(box.init);
+      expect(dispatches(box)).toEqual([]);
+    });
+
+    test('a merge commit whose version does not match the branch fails without tagging', () => {
+      const box = sandbox();
+      const result = run(box, {
+        EVENT: 'pull_request',
+        HEAD_REF: 'release/v1.0.2',
+        MERGE_SHA: box.release,
+      });
+      expect(result.exitCode).not.toBe(0);
+      noTags(box);
+      expect(dispatches(box)).toEqual([]);
+    });
+
+    test('a version that no release commit set is left untagged', () => {
+      const box = sandbox();
+      writeFileSync(join(box.work, 'package.json'), `${JSON.stringify({ version: '1.0.2' })}\n`);
+      git(box.work, 'commit', '-qam', 'chore: hand-edited version');
+      git(box.work, 'push', '-q', 'origin', 'HEAD:main');
+      const result = run(box, { EVENT: 'push' });
+      expect(result.exitCode).toBe(0);
+      expect(result.out.action).toBe('none');
+      noTags(box);
+      expect(dispatches(box)).toEqual([]);
+    });
+
+    describe('the catch-up path tags only the merge of a same-repository release/vX PR', () => {
+      const cases: [string, unknown[]][] = [
+        ['no PR', []],
+        ['a PR from a fork', [releasePr('release/v1.0.1', 'someone/platform')]],
+        ['a PR from another branch', [releasePr('feature/v1.0.1')]],
+        ['a PR for another version', [releasePr('release/v1.0.10')]],
+        ['an unmerged PR', [releasePr('release/v1.0.1', REPO, false)]],
+      ];
+      for (const [name, list] of cases) {
+        test(`not ${name}`, () => {
+          const box = sandbox();
+          pulls(box, box.release, list);
+          const result = run(box, { EVENT: 'push' });
+          expect(result.exitCode).toBe(0);
+          expect(result.out.action).toBe('none');
+          expect(result.stdout).toContain(
+            `::warning::${box.release} is not the merge of a release/v1.0.1 PR from ${REPO}`,
+          );
+          noTags(box);
+          expect(dispatches(box)).toEqual([]);
+        });
+      }
+
+      test('not a commit whose package.json does not set the version in its title', () => {
+        const box = sandbox();
+        writeFileSync(join(box.work, 'other'), 'x');
+        git(box.work, 'add', '.');
+        git(box.work, 'commit', '-qm', 'chore(release): v1.0.2 (#7)');
+        const titled = git(box.work, 'rev-parse', 'HEAD');
+        pulls(box, titled, [releasePr('release/v1.0.2')]);
+        writeFileSync(join(box.work, 'package.json'), `${JSON.stringify({ version: '1.0.2' })}\n`);
+        git(box.work, 'commit', '-qam', 'chore: hand-edited version');
+        git(box.work, 'push', '-q', 'origin', 'HEAD:main');
+        const result = run(box, { EVENT: 'push' });
+        expect(result.exitCode).toBe(0);
+        expect(result.out.action).toBe('none');
+        expect(result.stdout).toContain(
+          `::warning::${titled} is titled v1.0.2, but its package.json version is '1.0.1'`,
+        );
+        noTags(box);
+        expect(dispatches(box)).toEqual([]);
+      });
+    });
+
+    test('the release commit is matched by exact version: v1.0.1 never matches v1.0.10', () => {
+      const box = sandbox();
+      writeFileSync(join(box.work, 'package.json'), `${JSON.stringify({ version: '1.0.10' })}\n`);
+      git(box.work, 'commit', '-qam', 'chore(release): v1.0.10 (#9)');
+      const v10 = git(box.work, 'rev-parse', 'HEAD');
+      pulls(box, v10, [releasePr('release/v1.0.10')]);
+      git(box.work, 'push', '-q', 'origin', 'HEAD:main');
+      const result = run(box, { EVENT: 'push' });
+      expect(result.exitCode).toBe(0);
+      expect(remoteTag(box, 'v1.0.10')).toBe(v10);
+      expect(git(box.work, 'ls-remote', '--tags', 'origin', 'refs/tags/v1.0.1')).toBe('');
+    });
   });
 });

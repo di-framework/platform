@@ -1,7 +1,8 @@
 //! The WASI glue: re-exports the interfaces pglite imports and serves every
 //! regular file under a preopen through [`crate::file`].
 //!
-//! - Directories, names, symlinks and metadata pass through unchanged.
+//! - Directories, names, symlinks and metadata pass through unchanged, except
+//!   that the root's markers are out of reach (see [`marker::may_reach_marker`]).
 //! - Host streams (stdio) and host pollables pass through. File streams are
 //!   served from decrypted memory, with always-ready pollables.
 //! - `wasi:cli/environment` is re-exported only to hide the key variables from
@@ -56,6 +57,7 @@ use crate::header::{
 };
 use crate::keys::{is_key_variable, Kek, KeyRing};
 use crate::marker::{self, Lock, RootDecision, MARKER_LEN, MARKER_NAME, MARKER_TMP_NAME};
+use crate::rotation;
 
 type R<T> = Result<T, ErrorCode>;
 
@@ -209,6 +211,16 @@ fn header_error(path: &str, error: HeaderError) -> ErrorCode {
                 "plain-file",
                 &format!("{path}: no encryption header; refusing"),
             );
+            ErrorCode::Io
+        }
+        HeaderError::Stub => {
+            // The same refusal as plaintext, plus what the operator can do (#207).
+            log(&format!(
+                "{path}: no encryption header; refusing. The file is at most {HEADER_LEN} bytes, \
+                 so it holds no encrypted data: unless it is a plaintext file placed here, it is \
+                 a stub left by a failed header write (full disk, or a crash under ext4 \
+                 data=writeback), and truncating it to 0 bytes is safe"
+            ));
             ErrorCode::Io
         }
         HeaderError::Unsupported { version, codec } => {
@@ -420,12 +432,10 @@ fn open_root(dir: &hfs::Descriptor) -> Result<(), ErrorCode> {
                 current_key(&state)?,
                 state.keys.previous().ok_or(ErrorCode::Access)?,
             );
-            let count = rewrap_tree(dir, previous, current, true)?;
+            let sweep = rewrap_tree(dir, previous, current)?;
             dir.sync().map_err(host)?;
             write_marker(dir, current)?;
-            log(&format!(
-                "key rotation complete: re-wrapped {count} file keys; DI_PGLITE_KEY_PREVIOUS can be removed"
-            ));
+            log(&sweep.completion_message());
             Ok(())
         }
         RootDecision::Locked(lock) => {
@@ -486,66 +496,102 @@ fn write_marker(dir: &hfs::Descriptor, kek: &Kek) -> R<()> {
     dir.sync().map_err(host)
 }
 
-/// Re-wrap every file header under `from` to `to`; returns how many changed.
-/// Headers already under `to` are skipped, so an interrupted sweep resumes.
-fn rewrap_tree(dir: &hfs::Descriptor, from: &Kek, to: &Kek, root: bool) -> R<usize> {
-    let mut count = 0;
-    let entries = dir.read_directory().map_err(host)?;
-    while let Some(entry) = entries.read_directory_entry().map_err(host)? {
-        if root
-            && marker::is_volume_metadata(&entry.name)
-            && entry.type_ != hfs::DescriptorType::Directory
-        {
-            continue;
-        }
-        match entry.type_ {
-            hfs::DescriptorType::Directory => {
-                let sub = dir
-                    .open_at(
-                        hfs::PathFlags::empty(),
-                        &entry.name,
-                        hfs::OpenFlags::DIRECTORY,
-                        hfs::DescriptorFlags::READ,
-                    )
-                    .map_err(host)?;
-                count += rewrap_tree(&sub, from, to, false)?;
-            }
-            hfs::DescriptorType::RegularFile => {
-                let file = dir
-                    .open_at(
-                        hfs::PathFlags::empty(),
-                        &entry.name,
-                        hfs::OpenFlags::empty(),
-                        hfs::DescriptorFlags::READ | hfs::DescriptorFlags::WRITE,
-                    )
-                    .map_err(host)?;
-                let physical = file.stat().map_err(host)?.size;
-                if physical == 0 {
-                    continue;
-                }
-                let start = read_header(&file).map_err(host)?;
-                // A file left fresh by a crash has no key to re-wrap.
-                let header =
-                    match classify(&start, physical).map_err(|e| header_error(&entry.name, e))? {
-                        HeaderState::Fresh => continue,
-                        HeaderState::Sealed(header) => header,
-                    };
-                if to.matches(header.kcv()) {
-                    continue;
-                }
-                let rewrapped = header
-                    .rewrap(from, to, &random())
-                    .map_err(|e| header_error(&entry.name, e))?;
-                HostStorage(&file)
-                    .write_at(0, rewrapped.as_bytes())
-                    .map_err(host)?;
-                file.sync().map_err(host)?;
-                count += 1;
-            }
-            _ => {}
+/// Lines logged for entries a rotation left in `lost+found`, before a summary.
+const SKIPPED_LOG_LIMIT: usize = 50;
+
+/// Run the rotation sweep (see [`crate::rotation`]) over a preopen root.
+fn rewrap_tree(dir: &hfs::Descriptor, from: &Kek, to: &Kek) -> R<rotation::Sweep> {
+    let sweep = rotation::rewrap_tree(&HostDir::Borrowed(dir), from, to, &mut || random())
+        .map_err(|error| match error {
+            rotation::SweepError::Host(error) => host(error),
+            rotation::SweepError::Header { path, error } => header_error(&path, error),
+        })?;
+    for skipped in sweep.skipped.iter().take(SKIPPED_LOG_LIMIT) {
+        log(&format!(
+            "{}: left as it was during key rotation: {}",
+            skipped.path,
+            skipped.reason.describe()
+        ));
+    }
+    if sweep.skipped.len() > SKIPPED_LOG_LIMIT {
+        log(&format!(
+            "... and {} more entries in {} left as they were",
+            sweep.skipped.len() - SKIPPED_LOG_LIMIT,
+            marker::LOST_AND_FOUND
+        ));
+    }
+    Ok(sweep)
+}
+
+/// A host directory for the rotation sweep: the preopen itself, or one it opened.
+enum HostDir<'a> {
+    Borrowed(&'a hfs::Descriptor),
+    Owned(hfs::Descriptor),
+}
+
+impl HostDir<'_> {
+    fn get(&self) -> &hfs::Descriptor {
+        match self {
+            HostDir::Borrowed(dir) => dir,
+            HostDir::Owned(dir) => dir,
         }
     }
-    Ok(count)
+}
+
+impl rotation::Dir for HostDir<'_> {
+    type Error = hfs::ErrorCode;
+    type File = hfs::Descriptor;
+
+    fn entries(&self) -> Result<Vec<(String, rotation::EntryType)>, hfs::ErrorCode> {
+        let stream = self.get().read_directory()?;
+        let mut entries = Vec::new();
+        while let Some(entry) = stream.read_directory_entry()? {
+            let kind = match entry.type_ {
+                hfs::DescriptorType::Directory => rotation::EntryType::Directory,
+                hfs::DescriptorType::RegularFile => rotation::EntryType::RegularFile,
+                _ => rotation::EntryType::Other,
+            };
+            entries.push((entry.name, kind));
+        }
+        Ok(entries)
+    }
+
+    fn open_dir(&self, name: &str) -> Result<Self, hfs::ErrorCode> {
+        self.get()
+            .open_at(
+                hfs::PathFlags::empty(),
+                name,
+                hfs::OpenFlags::DIRECTORY,
+                hfs::DescriptorFlags::READ,
+            )
+            .map(HostDir::Owned)
+    }
+
+    fn open_file(&self, name: &str) -> Result<hfs::Descriptor, hfs::ErrorCode> {
+        self.get().open_at(
+            hfs::PathFlags::empty(),
+            name,
+            hfs::OpenFlags::empty(),
+            hfs::DescriptorFlags::READ | hfs::DescriptorFlags::WRITE,
+        )
+    }
+}
+
+impl rotation::File for hfs::Descriptor {
+    type Error = hfs::ErrorCode;
+
+    fn physical_size(&self) -> Result<u64, hfs::ErrorCode> {
+        Ok(self.stat()?.size)
+    }
+
+    fn read_start(&self) -> Result<Vec<u8>, hfs::ErrorCode> {
+        read_header(self)
+    }
+
+    fn write_header(&self, header: &Header) -> Result<(), hfs::ErrorCode> {
+        HostStorage(self).write_at(0, header.as_bytes())?;
+        self.sync()
+    }
 }
 
 // ------------------------------------------------------------------ resources
@@ -579,7 +625,10 @@ pub enum Descriptor {
     Passthrough {
         host: hfs::Descriptor,
         flags: xfs::DescriptorFlags,
+        /// This descriptor names the preopen root: its listing hides the markers.
         root: bool,
+        /// The preopen root's identity, `None` if the host could not tell.
+        root_id: Option<DirId>,
     },
     /// A preopen that failed its key check: data and namespace operations fail.
     Locked {
@@ -806,10 +855,12 @@ impl xpre::Guest for Component {
                             .get_flags()
                             .map(guest_flags)
                             .unwrap_or(xfs::DescriptorFlags::READ);
+                        let root_id = dir.metadata_hash().ok().map(dir_id);
                         Descriptor::Passthrough {
                             host: dir,
                             flags,
                             root: true,
+                            root_id,
                         }
                     }
                     Err(error) => Descriptor::Locked { host: dir, error },
@@ -831,12 +882,19 @@ impl Descriptor {
     }
 
     /// Fail data and namespace operations on a locked preopen, and keep the
-    /// marker out of reach at the root.
+    /// markers out of reach from every directory descriptor, however the path
+    /// gets to the root (see [`marker::may_reach_marker`]).
     fn guard(&self, path: Option<&str>) -> R<()> {
         match self {
             Descriptor::Locked { error, .. } => Err(*error),
-            Descriptor::Passthrough { root: true, .. }
-                if path.is_some_and(marker::is_marker_path) =>
+            Descriptor::Passthrough {
+                host,
+                root,
+                root_id,
+                ..
+            } if path.is_some_and(|path| {
+                marker::may_reach_marker(&HostNamespace(host), root_id.as_ref(), *root, path)
+            }) =>
             {
                 Err(ErrorCode::Access)
             }
@@ -847,6 +905,54 @@ impl Descriptor {
     fn passthrough(&self) -> R<&hfs::Descriptor> {
         self.guard(None)?;
         Ok(self.host())
+    }
+
+    fn is_root(&self) -> bool {
+        matches!(self, Descriptor::Passthrough { root: true, .. })
+    }
+
+    fn root_id(&self) -> Option<DirId> {
+        match self {
+            Descriptor::Passthrough { root_id, .. } => *root_id,
+            _ => None,
+        }
+    }
+}
+
+/// What the host identifies a file or directory by: its `metadata-hash`, which
+/// wasmtime derives from the device and inode.
+type DirId = (u64, u64);
+
+fn dir_id(hash: hfs::MetadataHashValue) -> DirId {
+    (hash.lower, hash.upper)
+}
+
+/// Path lookups for the marker guard, resolved by the host itself, so `..`
+/// and symlinks are followed exactly as the guarded operation follows them.
+struct HostNamespace<'a>(&'a hfs::Descriptor);
+
+impl marker::Namespace for HostNamespace<'_> {
+    type Id = DirId;
+
+    fn identity(&self, path: &str) -> Option<DirId> {
+        let hash = if path.is_empty() {
+            self.0.metadata_hash()
+        } else {
+            self.0
+                .metadata_hash_at(hfs::PathFlags::SYMLINK_FOLLOW, path)
+        };
+        hash.ok().map(dir_id)
+    }
+}
+
+/// Whether `dir` may be the preopen root. Paths alone miss a symlink back to
+/// it, so compare what the host identifies them by. A failed or unknown
+/// lookup answers yes: treating a directory as the root only hides and guards
+/// the marker names in it.
+fn may_be_root(dir: &hfs::Descriptor, root_id: Option<DirId>) -> bool {
+    match (dir.metadata_hash(), root_id) {
+        (Ok(hash), Some(root)) => dir_id(hash) == root,
+        _ => true,
     }
 }
 
@@ -866,10 +972,7 @@ impl xfs::GuestDirectoryEntryStream for DirectoryEntryStream {
     fn read_directory_entry(&self) -> R<Option<xfs::DirectoryEntry>> {
         loop {
             match self.host.read_directory_entry().map_err(host)? {
-                Some(entry)
-                    if self.hide_marker
-                        && (entry.name == MARKER_NAME || entry.name == MARKER_TMP_NAME) =>
-                {
+                Some(entry) if self.hide_marker && marker::is_reserved_name(&entry.name) => {
                     continue
                 }
                 entry => {
@@ -973,7 +1076,7 @@ impl xfs::GuestDescriptor for Descriptor {
     }
 
     fn read_directory(&self) -> R<xfs::DirectoryEntryStream> {
-        let hide_marker = matches!(self, Descriptor::Passthrough { root: true, .. });
+        let hide_marker = self.is_root();
         let stream = self.passthrough()?.read_directory().map_err(host)?;
         Ok(xfs::DirectoryEntryStream::new(DirectoryEntryStream {
             host: stream,
@@ -1025,10 +1128,17 @@ impl xfs::GuestDescriptor for Descriptor {
             .map_err(host)?;
         let stat = fd.stat().map_err(host)?;
         if stat.type_ != hfs::DescriptorType::RegularFile {
+            // The root reopened (`.`, `pglite/..`, a symlink to it anywhere in
+            // the path, from any descriptor) keeps the listing filter (#207,
+            // #349).
+            let root_id = self.root_id();
+            let root = stat.type_ == hfs::DescriptorType::Directory
+                && ((self.is_root() && marker::is_root_path(&path)) || may_be_root(&fd, root_id));
             return Ok(xfs::Descriptor::new(Descriptor::Passthrough {
                 host: fd,
                 flags,
-                root: false,
+                root,
+                root_id,
             }));
         }
         let file = File {
@@ -1097,6 +1207,11 @@ impl xfs::GuestDescriptor for Descriptor {
 
     fn symlink_at(&self, old_path: String, new_path: String) -> R<()> {
         self.guard(Some(&new_path))?;
+        // A link's target is resolved only when it is followed, from wherever
+        // the link then is, so a target naming a marker is never created (#349).
+        if marker::names_marker(&old_path) {
+            return Err(ErrorCode::Access);
+        }
         self.host().symlink_at(&old_path, &new_path).map_err(host)
     }
 

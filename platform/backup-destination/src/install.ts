@@ -1,6 +1,8 @@
 import * as k8s from '@pulumi/kubernetes';
 import type * as pulumi from '@pulumi/pulumi';
-import { validCron } from './schedule.ts';
+// Extensionless: the prototype Pulumi program compiles this file with ts-node, which emits JS
+// and so cannot enable allowImportingTsExtensions ('.ts' specifiers fail with TS5097).
+import { validCron } from './schedule';
 
 const TENANT = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
 
@@ -20,7 +22,8 @@ export interface BackupDestinationInstall {
   prefix?: pulumi.Input<string>;
   /**
    * Required, no default (#250): a five-field UTC cron such as `0 2 * * *`, or `'none'` for
-   * on-demand backups only. The chart refuses to render without it.
+   * on-demand backups only. The chart refuses to render without it. It is written trimmed, and
+   * may have at most 128 characters, as the CRD allows (#254).
    */
   schedule: pulumi.Input<string>;
   retentionSuccessful?: pulumi.Input<number>;
@@ -69,25 +72,62 @@ export interface BackupDestinationInstall {
   imagePullPolicy?: pulumi.Input<string>;
 }
 
+/** The CRD's `maxLength` on `schedule`, for the destination and every source (#254 S2). */
+export const SCHEDULE_MAX_LENGTH = 128;
 /**
- * A plain source must name a cron or "none". A source or schedule that is an Output (an object)
- * is checked by the chart when it renders.
+ * The chart's cron pattern (#263 S5): five fields one space apart; numbers of at most two digits
+ * within each field's range, `*`, ranges, steps from 1 with no leading zero, and lists. Keep it
+ * in step with `chart/templates/destination.yaml`.
  */
-function checkSourceSchedule(source: unknown): void {
-  if (!source || typeof source !== 'object') return;
+const FIELDS = [
+  '[0-5]?[0-9]',
+  '([01]?[0-9]|2[0-3])',
+  '(0?[1-9]|[12][0-9]|3[01])',
+  '(0?[1-9]|1[0-2])',
+  '[0-7]',
+];
+const CHART_CRON = new RegExp(
+  `^${FIELDS.map((value) => {
+    const element = String.raw`(\*|(${value})(-(${value}))?)(/[1-9][0-9]*)?`;
+    return `${element}(,${element})*`;
+  }).join(' ')}$`,
+);
+
+/**
+ * Whether a trimmed schedule has a shape the CRD accepts: "none", or a cron the operator can
+ * fire that the chart also renders. The operator's parser rejects backward ranges such as `5-1`,
+ * as the chart does; the chart's pattern rejects three-digit numbers (`005`) and zero-led steps
+ * (`/01`), as this does.
+ */
+function acceptedSchedule(schedule: string): boolean {
+  return schedule === 'none' || (CHART_CRON.test(schedule) && validCron(schedule));
+}
+
+const TOO_LONG = `schedule must be at most ${SCHEDULE_MAX_LENGTH} characters`;
+
+/**
+ * A plain source must name a cron or "none". The trimmed value is the one passed on (#254 S1),
+ * as the chart writes it: the CRD pattern refuses surrounding spaces. A source or schedule that
+ * is an Output (an object) is passed through and checked by the chart when it renders.
+ */
+function checkedSource(source: unknown): unknown {
+  if (!source || typeof source !== 'object') return source;
   const { workloadName, schedule } = source as { workloadName?: unknown; schedule?: unknown };
-  if (typeof schedule === 'object' && schedule !== null) return;
+  if (typeof schedule === 'object' && schedule !== null) return source;
   const name = typeof workloadName === 'string' ? workloadName : '?';
-  if (typeof schedule !== 'string' || schedule.trim() === '') {
+  const trimmed = typeof schedule === 'string' ? schedule.trim() : '';
+  if (trimmed === '') {
     throw new Error(
       `source ${name}: schedule is required: a five-field UTC cron (such as "30 3 * * *") or "none"`,
     );
   }
-  if (schedule.trim() !== 'none' && !validCron(schedule)) {
+  if (trimmed.length > SCHEDULE_MAX_LENGTH) throw new Error(`source ${name}: ${TOO_LONG}`);
+  if (!acceptedSchedule(trimmed)) {
     throw new Error(
       `source ${name}: schedule must be a five-field UTC cron (such as "30 3 * * *") or "none"`,
     );
   }
+  return { ...source, schedule: trimmed };
 }
 
 /** Helm release arguments for one tenant. The namespace is the one wasmCloud created. */
@@ -102,16 +142,17 @@ export function backupReleaseArgs(install: BackupDestinationInstall): k8s.helm.v
   if (install.schedule === undefined || install.schedule === null) {
     throw new Error('schedule is required: a five-field UTC cron (such as "0 2 * * *") or "none"');
   }
-  if (
-    typeof install.schedule === 'string' &&
-    install.schedule.trim() !== 'none' &&
-    !validCron(install.schedule)
-  ) {
-    throw new Error('schedule must be a five-field UTC cron (such as "0 2 * * *") or "none"');
+  const schedule =
+    typeof install.schedule === 'string' ? install.schedule.trim() : install.schedule;
+  if (typeof schedule === 'string') {
+    if (schedule.length > SCHEDULE_MAX_LENGTH) throw new Error(TOO_LONG);
+    if (!acceptedSchedule(schedule)) {
+      throw new Error('schedule must be a five-field UTC cron (such as "0 2 * * *") or "none"');
+    }
   }
-  if (Array.isArray(install.sources)) {
-    for (const source of install.sources as unknown[]) checkSourceSchedule(source);
-  }
+  const sources = Array.isArray(install.sources)
+    ? (install.sources as unknown[]).map(checkedSource)
+    : install.sources;
   const values: Record<string, pulumi.Input<unknown>> = {};
   if (install.type !== undefined) values.type = install.type;
   if (install.bucket !== undefined) values.bucket = install.bucket;
@@ -121,7 +162,7 @@ export function backupReleaseArgs(install: BackupDestinationInstall): k8s.helm.v
   if (install.endpoint !== undefined) values.endpoint = install.endpoint;
   if (install.region !== undefined) values.region = install.region;
   if (install.prefix !== undefined) values.prefix = install.prefix;
-  values.schedule = install.schedule;
+  values.schedule = schedule;
   if (install.retentionSuccessful !== undefined)
     values.retentionSuccessful = install.retentionSuccessful;
   if (install.existingSecret !== undefined) values.existingSecret = install.existingSecret;
@@ -129,7 +170,7 @@ export function backupReleaseArgs(install: BackupDestinationInstall): k8s.helm.v
   if (install.secretAccessKey !== undefined) values.secretAccessKey = install.secretAccessKey;
   if (install.extraEgress !== undefined) values.extraEgress = install.extraEgress;
   if (install.storageRoot !== undefined) values.storageRoot = install.storageRoot;
-  if (install.sources !== undefined) values.sources = install.sources;
+  if (sources !== undefined) values.sources = sources;
   if (install.agentImage !== undefined) values.agentImage = install.agentImage;
   const image: Record<string, pulumi.Input<string>> = {};
   if (install.imageRepository !== undefined) image.repository = install.imageRepository;

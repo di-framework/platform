@@ -109,8 +109,11 @@ const routes = new Map<string, unknown>([
           heldBy: 'Backup/v1',
           since: NOW,
           destination: 'pvc',
+          storageKey: 'identity',
+          workloadUid: 'uid-identity',
         }),
-        old: JSON.stringify({ replicas: 1, heldBy: 'Backup/x' }),
+        // Bindings that are not strings are not carried (#263): the sweeper then refuses it.
+        old: JSON.stringify({ replicas: 1, heldBy: 'Backup/x', storageKey: 7, workloadUid: {} }),
         junk: 'not json',
         partial: JSON.stringify({ replicas: 'two', heldBy: 'Backup/v1' }),
       },
@@ -284,7 +287,14 @@ describe('loading workload volume state', () => {
     expect(loaded.ledger).toEqual({
       resourceVersion: '41',
       entries: {
-        identity: { replicas: 2, heldBy: 'Backup/v1', since: NOW, destination: 'pvc' },
+        identity: {
+          replicas: 2,
+          heldBy: 'Backup/v1',
+          since: NOW,
+          destination: 'pvc',
+          storageKey: 'identity',
+          workloadUid: 'uid-identity',
+        },
         old: { replicas: 1, heldBy: 'Backup/x', since: '' },
       },
     });
@@ -627,6 +637,130 @@ describe('applying actions', () => {
       { type: 'ledger', set: { identity: null }, resourceVersion: '9' },
     ]);
     expect(calls[0]?.[2]).toEqual({ metadata: { resourceVersion: '9' }, data: { identity: null } });
+  });
+
+  test('posts ledger Events in the runtime namespace, and a failed one never stops the tick (#254)', async () => {
+    let refuse = false;
+    const { calls, api } = recorder((method, path) => {
+      if (refuse && method === 'POST' && path.endsWith('/events')) {
+        throw new KubeError(403, 'events is forbidden');
+      }
+      return {};
+    });
+    const event = {
+      type: 'event' as const,
+      eventType: 'Warning' as const,
+      reason: 'HeldReplicasDropped',
+      message: 'held-replicas entry for WorkloadDeployment identity dropped',
+    };
+    await applyActions(api, volumeWorld(), [event]);
+    expect(calls).toEqual([
+      [
+        'POST',
+        '/api/v1/namespaces/di-runtime-alpha/events',
+        {
+          apiVersion: 'v1',
+          kind: 'Event',
+          metadata: { generateName: `${LEDGER}.`, namespace: 'di-runtime-alpha' },
+          involvedObject: {
+            apiVersion: 'v1',
+            kind: 'ConfigMap',
+            name: LEDGER,
+            namespace: 'di-runtime-alpha',
+          },
+          type: 'Warning',
+          reason: 'HeldReplicasDropped',
+          message: 'held-replicas entry for WorkloadDeployment identity dropped',
+          source: { component: 'di-backup-operator' },
+          reportingComponent: 'di-backup-operator',
+          firstTimestamp: NOW,
+          lastTimestamp: NOW,
+          count: 1,
+        },
+      ],
+    ]);
+    calls.length = 0;
+    refuse = true;
+    const errors: unknown[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(...args);
+    };
+    try {
+      await applyActions(api, volumeWorld(), [
+        event,
+        { type: 'scale-workload', name: 'identity', replicas: 2 },
+      ]);
+      api.post = async () => {
+        throw 'not an Error';
+      };
+      await applyActions(api, volumeWorld(), [event]);
+    } finally {
+      console.error = original;
+    }
+    expect(errors).toEqual([
+      'event HeldReplicasDropped not recorded: events is forbidden',
+      'event HeldReplicasDropped not recorded: post failed',
+    ]);
+    // The action after it still ran.
+    expect(calls.map(([method, path]) => `${method} ${path}`)).toEqual([
+      'POST /api/v1/namespaces/di-runtime-alpha/events',
+      `PATCH ${RUNTIME}/workloaddeployments/identity/scale`,
+    ]);
+  });
+
+  test('a signal says the workload was deleted when its scale met a 404 (#263)', async () => {
+    const gone = new Set(['identity']);
+    const { calls, api } = recorder((method, path) => {
+      const name = path.match(/workloaddeployments\/([^/]+)\/scale$/)?.[1];
+      if (method === 'PATCH' && name && gone.has(name)) throw new KubeError(404, 'not found');
+      return {};
+    });
+    const signalsFor = (workload: string) => {
+      const ifGone = { workload, message: `${workload} was deleted` };
+      return [
+        { type: 'log' as const, message: `${workload} is back`, ifGone },
+        {
+          type: 'event' as const,
+          eventType: 'Normal' as const,
+          reason: 'HeldReplicasReleased',
+          message: `${workload} is back`,
+          ifGone,
+        },
+      ];
+    };
+    const logs: unknown[] = [];
+    const original = console.log;
+    console.log = (...args: unknown[]) => {
+      logs.push(...args);
+    };
+    try {
+      await applyActions(api, volumeWorld(), [
+        { type: 'scale-workload', name: 'identity', replicas: 2 },
+        { type: 'scale-workload', name: 'reports', replicas: 1 },
+        ...signalsFor('identity'),
+        ...signalsFor('reports'),
+      ]);
+    } finally {
+      console.log = original;
+    }
+    expect(logs).toEqual(['identity was deleted', 'reports is back']);
+    const events = calls
+      .filter(([method, path]) => method === 'POST' && path.endsWith('/events'))
+      .map(([, , body]) => (body as { message: string }).message);
+    expect(events).toEqual(['identity was deleted', 'reports is back']);
+    // Any other failure still stops the tick before a signal is written.
+    const { calls: failed, api: broken } = recorder((method) => {
+      if (method === 'PATCH') throw new KubeError(500, 'boom');
+      return {};
+    });
+    await expect(
+      applyActions(broken, volumeWorld(), [
+        { type: 'scale-workload', name: 'identity', replicas: 2 },
+        ...signalsFor('identity'),
+      ]),
+    ).rejects.toThrow('boom');
+    expect(failed.filter(([method]) => method === 'POST')).toEqual([]);
   });
 });
 

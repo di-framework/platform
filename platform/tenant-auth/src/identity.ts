@@ -12,6 +12,7 @@ import {
   sha256,
   userinfo,
 } from './oidc.ts';
+import { TtlCache } from './ttl-cache.ts';
 
 export class AuthError extends Error {
   constructor(
@@ -32,14 +33,30 @@ export interface Principal {
 }
 
 const USER_NAME = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
-const CLAIMS_TTL_MS = 60_000;
+/** How long UserInfo claims for an accepted token are reused, capped by the token's `exp`. */
+export const CLAIMS_TTL_MS = 60_000;
+/** Accepted tokens whose claims are held at once; least recently used are evicted first. */
+export const CLAIMS_CACHE_SIZE = 1024;
+/** How long a token UserInfo refused stays refused without asking again. */
+export const REJECTED_TTL_MS = 5_000;
+/**
+ * Refused tokens remembered at once. Kept apart from accepted claims so a flood of junk tokens
+ * can only evict other junk, never the claims of signed-in users.
+ */
+export const REJECTED_CACHE_SIZE = 256;
 const MEMBERSHIP_TTL_MS = 15_000;
 
+export interface IdentityResolverOptions {
+  /** Clock in epoch milliseconds; tests inject a fake one. */
+  now?: () => number;
+  claimsCacheSize?: number;
+  rejectedCacheSize?: number;
+}
+
 export class IdentityResolver {
-  private readonly claimsCache = new Map<
-    string,
-    { claims: IdentityClaims | undefined; until: number }
-  >();
+  private readonly now: () => number;
+  private readonly claimsCache: TtlCache<IdentityClaims>;
+  private readonly rejectedCache: TtlCache<true>;
   private readonly membershipCache = new Map<string, { role: Principal['role']; until: number }>();
   private provider: ProviderMetadata | null;
 
@@ -48,8 +65,12 @@ export class IdentityResolver {
     provider: ProviderMetadata | null,
     readonly tenant: string,
     private readonly keys: KeyStore,
+    options: IdentityResolverOptions = {},
   ) {
     this.provider = provider;
+    this.now = options.now ?? Date.now;
+    this.claimsCache = new TtlCache(options.claimsCacheSize ?? CLAIMS_CACHE_SIZE, this.now);
+    this.rejectedCache = new TtlCache(options.rejectedCacheSize ?? REJECTED_CACHE_SIZE, this.now);
   }
 
   /** Set the provider after discovery completes. */
@@ -60,7 +81,7 @@ export class IdentityResolver {
   /** The platform's view: the tenant is live and the User CR holds an active membership. */
   async membership(user: string): Promise<Principal['role']> {
     const cached = this.membershipCache.get(user);
-    if (cached && cached.until > Date.now()) return cached.role;
+    if (cached && cached.until > this.now()) return cached.role;
     const tenant = await this.kube.getTenant(this.tenant);
     if (!tenant) throw new AuthError(404, `account ${this.tenant} does not exist`);
     if (tenant.spec.suspended) throw new AuthError(403, `account ${this.tenant} is suspended`);
@@ -69,7 +90,7 @@ export class IdentityResolver {
       throw new AuthError(403, `${user} has no active platform user`);
     const found = resource.spec.memberships.find((m) => m.tenant === this.tenant);
     if (!found) throw new AuthError(403, `${user} is not a member of ${this.tenant}`);
-    this.membershipCache.set(user, { role: found.role, until: Date.now() + MEMBERSHIP_TTL_MS });
+    this.membershipCache.set(user, { role: found.role, until: this.now() + MEMBERSHIP_TTL_MS });
     return found.role;
   }
 
@@ -77,9 +98,18 @@ export class IdentityResolver {
     if (!this.provider) throw new AuthError(503, 'issuer discovery is not yet complete');
     const id = Buffer.from(await sha256(accessToken)).toString('hex');
     const cached = this.claimsCache.get(id);
-    if (cached && cached.until > Date.now()) return cached.claims;
+    if (cached) return cached;
+    if (this.rejectedCache.get(id)) return undefined;
     const claims = await userinfo(this.provider, accessToken);
-    this.claimsCache.set(id, { claims, until: Date.now() + CLAIMS_TTL_MS });
+    const now = this.now();
+    if (!claims) {
+      this.rejectedCache.set(id, true, now + REJECTED_TTL_MS);
+      return undefined;
+    }
+    // Never outlive the token: claims are dropped at its `exp` when UserInfo reports one.
+    const expiresAt = typeof claims.exp === 'number' ? claims.exp * 1000 : Number.POSITIVE_INFINITY;
+    if (expiresAt <= now) return undefined;
+    this.claimsCache.set(id, claims, Math.min(now + CLAIMS_TTL_MS, expiresAt));
     return claims;
   }
 

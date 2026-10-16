@@ -173,6 +173,15 @@ export interface HostView {
   hostPaths: string[];
 }
 
+/**
+ * A signal's message for when this tick's `scale-workload` of `workload` found it gone (a 404),
+ * so the signal says what really happened (#263).
+ */
+export interface GoneMessage {
+  workload: string;
+  message: string;
+}
+
 /** One WorkloadDeployment an operation holds at 0, and the replicas to give back. */
 export interface HeldEntry {
   replicas: number;
@@ -181,6 +190,13 @@ export interface HeldEntry {
   since: string;
   /** The BackupDestination whose source the workload is; the sweeper checks it against its spec. */
   destination?: string;
+  /**
+   * The platform storage key of the volume the workload was stopped for (#263). Once the
+   * destination is gone, the entry is given back only to a workload that still has this key.
+   */
+  storageKey?: string;
+  /** metadata.uid of the WorkloadDeployment when it was held: a re-created one is never raised. */
+  workloadUid?: string;
 }
 
 /**
@@ -390,7 +406,18 @@ export type Action =
   | { type: 'create-restore'; body: Record<string, unknown> }
   | { type: 'scale-workload'; name: string; replicas: number }
   | { type: 'delete-job'; name: string }
-  | { type: 'log'; message: string };
+  | { type: 'log'; message: string; ifGone?: GoneMessage }
+  /**
+   * A Kubernetes Event in the runtime namespace, on the held-replicas ledger ConfigMap (#254).
+   * A signal, not a step: a failed write is logged and never stops the tick.
+   */
+  | {
+      type: 'event';
+      eventType: 'Normal' | 'Warning';
+      reason: string;
+      message: string;
+      ifGone?: GoneMessage;
+    };
 
 /** Destinations created before #233 carry no `type`; they are S3. */
 export function destinationType(spec: Pick<DestinationSpec, 'type'> | undefined): 's3' | 'pvc' {

@@ -6,15 +6,31 @@ on:
       - "v*"
   workflow_dispatch:
 
+# Three jobs, so the toolchains and Docker never run with publish credentials (#168):
+#   build           builds and smoke-tests everything, packs every public package into a tarball
+#                   once, and uploads the tarballs with their sha256 manifest. No OIDC token.
+#   publish         downloads those tarballs, checks them against the build job's digests, and
+#                   runs `npm publish <tarball>`. Only this job holds id-token: write.
+#   github-release  creates the GitHub Release for a tag. Only this job holds contents: write.
+# The pglite wasm npm receives is the one `make smoke` tested: it is not rebuilt after the smoke
+# test, and both jobs compare its sha256 inside the packed tarball with the tested file's.
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
-  release:
+  build:
+    name: Build, test and pack
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      manifest_sha256: ${{ steps.pack.outputs.manifest_sha256 }}
+      pglite_wasm_sha256: ${{ steps.smoke.outputs.wasm_sha256 }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install SQLite build toolchain
         run: |
@@ -32,7 +48,7 @@ jobs:
           echo "$GITHUB_WORKSPACE/platform/pglite-component/.tools/bin" >> "$GITHUB_PATH"
 
       - name: Install wasmtime
-        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
         with:
           version: 'v48.0.1'
 
@@ -46,22 +62,91 @@ jobs:
             bun run build
           fi
 
+      # The sha256 recorded here is the wasm that passed the smoke test. Nothing below
+      # rebuilds it, and the pack is checked against it.
       - name: Build and smoke-test the PGlite component
-        run: make -C platform/pglite-component unit smoke
+        id: smoke
+        run: |
+          set -euo pipefail
+          make -C platform/pglite-component unit smoke
+          sum="$(sha256sum platform/pglite-component/dist/di-framework-pglite.wasm | cut -d' ' -f1)"
+          echo "wasm_sha256=${sum}" >> "$GITHUB_OUTPUT"
+          echo "Smoke-tested di-framework-pglite.wasm sha256:${sum}"
+
+      # `npm pack` below is the packer `npm publish` used before #168.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.x"
 
       # `bun run build` does not compile @di-framework/sqlite-component or
-      # @di-framework/pglite-component. This dry-run runs each package's build
-      # (pglite: adapter + `make build`, reusing the engine built above) and refuses
-      # a pack that omits a `files` entry, such as the pglite wasm or adapter. The
-      # pack tests below read what that build leaves on disk, which is the same
-      # order as the Test workflow.
-      - name: Dry-run package publish
-        run: bun scripts/publish-workspace.ts --dry-run
+      # @di-framework/pglite-component. The pack step runs each package's build, `npm pack`s
+      # it once and refuses a tarball that omits a `files` entry, such as the pglite wasm or
+      # adapter. pglite is --prebuilt: only its adapter is compiled here, so the packed wasm is
+      # the file `make smoke` tested, not a rebuild. The pack tests below read what these
+      # builds leave on disk, which is the same order as the Test workflow.
+      - name: Build the PGlite adapter
+        run: bun run --cwd platform/pglite-component build:adapter
+
+      - name: Pack packages
+        run: |
+          bun scripts/publish-workspace.ts --pack "$RUNNER_TEMP/npm-packages" \
+            --prebuilt @di-framework/pglite-component
+
+      - name: Check the packed PGlite wasm is the smoke-tested one
+        env:
+          EXPECTED_SHA256: ${{ steps.smoke.outputs.wasm_sha256 }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/npm-packages"
+          tarball="$(jq -er '.[] | select(.name == "@di-framework/pglite-component") | .filename' "$dir/packages.json")"
+          actual="$(tar -xzOf "$dir/$tarball" package/dist/di-framework-pglite.wasm | sha256sum | cut -d' ' -f1)"
+          if [[ ! "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ || "$actual" != "$EXPECTED_SHA256" ]]; then
+            echo "::error::packed wasm ($actual) differs from the smoke-tested build ($EXPECTED_SHA256)"
+            exit 1
+          fi
+          echo "Packed di-framework-pglite.wasm matches the smoke-tested build (sha256:$actual)"
 
       - name: Test
         env:
           PGLITE_REQUIRE_DIST: '1'
         run: bun test --coverage
+
+      # Re-checks every tarball against packages.json after the tests, then hands the
+      # manifest's sha256 to the publish job.
+      - name: Record package digests
+        id: pack
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/npm-packages"
+          bun scripts/publish-workspace.ts --verify-packed "$dir"
+          sum="$(sha256sum "$dir/packages.json" | cut -d' ' -f1)"
+          echo "manifest_sha256=${sum}" >> "$GITHUB_OUTPUT"
+          echo "packages.json sha256:${sum}"
+
+      - name: Upload packed packages
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: npm-packages
+          path: ${{ runner.temp }}/npm-packages/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Runs no build: it publishes the tarballs the build job tested, byte for byte.
+  publish:
+    name: Publish packages to npm
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - uses: actions/setup-node@v7
         with:
@@ -71,14 +156,52 @@ jobs:
       - name: Ensure modern npm for OIDC trusted publishing
         run: npm install -g npm@latest
 
-      - name: Publish packages to npm
-        if: github.event_name != 'pull_request'
-        run: bun scripts/publish-workspace.ts
+      - name: Download packed packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: npm-packages
+          path: ${{ runner.temp }}/npm-packages
 
+      # packages.json must be the one the build job wrote, and the pglite tarball must still
+      # carry the smoke-tested wasm. The publish step then checks every tarball against
+      # packages.json before it publishes anything.
+      - name: Verify the downloaded packages are the tested build
+        env:
+          MANIFEST_SHA256: ${{ needs.build.outputs.manifest_sha256 }}
+          WASM_SHA256: ${{ needs.build.outputs.pglite_wasm_sha256 }}
+          ARTIFACT_DIGEST: ${{ needs.build.outputs.artifact_digest }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/npm-packages"
+          echo "Artifact npm-packages digest: ${ARTIFACT_DIGEST}"
+          actual="$(sha256sum "$dir/packages.json" | cut -d' ' -f1)"
+          if [[ ! "$MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ || "$actual" != "$MANIFEST_SHA256" ]]; then
+            echo "::error::downloaded packages.json ($actual) differs from the build job's ($MANIFEST_SHA256)"
+            exit 1
+          fi
+          tarball="$(jq -er '.[] | select(.name == "@di-framework/pglite-component") | .filename' "$dir/packages.json")"
+          wasm="$(tar -xzOf "$dir/$tarball" package/dist/di-framework-pglite.wasm | sha256sum | cut -d' ' -f1)"
+          if [[ ! "$WASM_SHA256" =~ ^[0-9a-f]{64}$ || "$wasm" != "$WASM_SHA256" ]]; then
+            echo "::error::packed wasm ($wasm) differs from the smoke-tested build ($WASM_SHA256)"
+            exit 1
+          fi
+          echo "packages.json sha256:${actual}; pglite wasm sha256:${wasm}"
+
+      - name: Publish packages to npm
+        run: bun scripts/publish-workspace.ts --publish-packed "$RUNNER_TEMP/npm-packages"
+
+  github-release:
+    name: Create GitHub Release
+    needs: publish
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
       - name: Create GitHub Release
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"

@@ -84,7 +84,8 @@ class MemoryApi implements Api {
         items: [...this.objects.values()]
           .filter(
             (v) =>
-              collection(v.apiVersion, v.kind) === url.pathname &&
+              (collection(v.apiVersion, v.kind) === url.pathname ||
+                collection(v.apiVersion, v.kind, v.metadata.namespace) === url.pathname) &&
               labels.every(([k, x]) => v.metadata.labels?.[k!] === x),
           )
           .map(({ apiVersion: _version, kind: _kind, ...item }) => item),
@@ -118,6 +119,30 @@ class MemoryApi implements Api {
     }
     throw new Error(`Unexpected ${method}`);
   }
+}
+/** A host pod of `tenant` in its runtime namespace, as the hostgroup Deployment labels it. */
+function hostPod(
+  name: string,
+  tenant: string,
+  options: { terminating?: boolean; phase?: string } = {},
+): Resource {
+  const n = names(tenant);
+  return {
+    apiVersion: 'v1',
+    kind: 'Pod',
+    metadata: {
+      name,
+      namespace: n.runtimeNamespace,
+      ...(options.terminating
+        ? {
+            deletionTimestamp: '2026-01-01T00:00:00Z',
+            finalizers: ['runtime.wasmcloud.dev/pod-host-finalizer'],
+          }
+        : {}),
+      labels: { 'wasmcloud.com/hostgroup': n.hostgroup, 'wasmcloud.com/name': 'hostgroup' },
+    },
+    ...(options.phase ? { status: { phase: options.phase } } : {}),
+  };
 }
 function prepare(): { api: MemoryApi; controller: Controller; t: Tenant; u: User } {
   const api = new MemoryApi();
@@ -255,6 +280,24 @@ describe('tenant and user resource reconciliation', () => {
     t.metadata.generation = 1;
     expect(userResources(u, [t], cfg)).toHaveLength(4);
   });
+  it('keeps an already granted membership while its tenant is merely Not Ready', () => {
+    const u = user();
+    const granted = new Set(['alpha']);
+    const t = tenant();
+    t.metadata.generation = 2;
+    expect(userResources(u, [t], cfg, granted)).toHaveLength(4);
+    t.status = { conditions: [{ ...ready[0]!, status: 'False', reason: 'ReconcileError' }] };
+    expect(userResources(u, [t], cfg, granted)).toHaveLength(4);
+    // A tenant that never granted access is still waited for.
+    expect(userResources(u, [t], cfg, new Set(['beta']))).toHaveLength(1);
+    // Missing, suspended and deleting tenants revoke access even when it was granted.
+    expect(userResources(u, [], cfg, granted)).toHaveLength(1);
+    t.spec.suspended = true;
+    expect(userResources(u, [t], cfg, granted)).toHaveLength(1);
+    t.spec.suspended = false;
+    t.metadata.deletionTimestamp = '2026-01-01T00:00:00Z';
+    expect(userResources(u, [t], cfg, granted)).toHaveLength(1);
+  });
   it('declares a ServiceAccount token Secret for each ready membership', () => {
     const u = user();
     u.spec.memberships.push({ tenant: 'beta', role: 'viewer' });
@@ -303,6 +346,55 @@ describe('tenant and user resource reconciliation', () => {
     expect(role('di-tenant-alpha')).toBeUndefined();
     expect(t.status?.conditions?.[0]?.status).toBe('True');
   });
+  it('reports a logs ConfigMap write that keeps failing on the Tenant, then clears it (#316)', async () => {
+    const { api, controller, t } = prepare();
+    const failures = (
+      controller as unknown as {
+        logWriteFailures: Map<string, Map<string, { count: number; message: string }>>;
+      }
+    ).logWriteFailures;
+    const logs = () => t.status?.conditions?.find((c) => c.type === 'LogsProjected');
+    const statusWrites = () =>
+      api.operations.filter((o) => o.method === 'PATCH' && o.path.endsWith('/tenants/alpha/status'))
+        .length;
+    const fail = (count: number, message = 'quota') =>
+      failures.set('alpha', new Map([['di-logs-web.prod', { count, message }]]));
+    // One failed poll is not reported yet.
+    fail(1);
+    await controller.reconcileTenant(t);
+    expect(logs()).toBeUndefined();
+    fail(3);
+    await controller.reconcileTenant(t);
+    // Ready is untouched: projection is best effort.
+    expect(t.status?.conditions?.[0]).toMatchObject({ type: 'Ready', status: 'True' });
+    expect(logs()).toMatchObject({
+      status: 'False',
+      reason: 'WriteFailed',
+      message: 'logs ConfigMap di-logs-web.prod could not be written: quota',
+    });
+    // While the same failure lasts, the Tenant status is not written again.
+    const written = statusWrites();
+    const since = logs()?.lastTransitionTime;
+    for (const count of [4, 5, 6]) {
+      fail(count);
+      await controller.reconcileTenant(t);
+    }
+    expect(statusWrites()).toBe(written);
+    expect(logs()?.lastTransitionTime).toBe(since);
+    // A different error is reported, once.
+    fail(7, 'forbidden');
+    await controller.reconcileTenant(t);
+    fail(8, 'forbidden');
+    await controller.reconcileTenant(t);
+    expect(statusWrites()).toBe(written + 1);
+    expect(logs()?.message).toBe('logs ConfigMap di-logs-web.prod could not be written: forbidden');
+    expect(logs()?.lastTransitionTime).toBe(since);
+    failures.delete('alpha');
+    await controller.reconcileTenant(t);
+    expect(logs()).toBeUndefined();
+    expect(t.status?.conditions?.[0]).toMatchObject({ type: 'Ready', status: 'True' });
+  });
+
   it('refuses to adopt a foreign namespace', async () => {
     const { api, controller, t } = prepare();
     api.seed({ apiVersion: 'v1', kind: 'Namespace', metadata: { name: names('alpha').namespace } });
@@ -370,6 +462,67 @@ describe('tenant and user resource reconciliation', () => {
     await controller.reconcileUser(u, [t, beta]);
     expect(secrets().map((r) => r.metadata.name)).toEqual(['di-user-alice-beta-token']);
   });
+  it('keeps memberships and token Secrets while a granted tenant is Not Ready (#119)', async () => {
+    const { api, controller, t, u } = prepare();
+    const tokenPath = '/api/v1/namespaces/wasmcloud/secrets/di-user-alice-alpha-token';
+    const owned = () =>
+      [...api.objects.values()]
+        .filter((r) => r.metadata.labels?.[OWNER] === u.metadata.uid)
+        .map((r) => `${r.kind}/${r.metadata.namespace}/${r.metadata.name}`)
+        .sort();
+    await controller.reconcileUser(u, [t]);
+    const token = api.objects.get(tokenPath);
+    if (token) token.data = { token: 'dG9rZW4=', 'ca.crt': 'Y2E=' };
+    await controller.reconcileUser(u, [t]);
+    expect(u.status?.conditions?.[0]).toMatchObject({ status: 'True', reason: 'Reconciled' });
+    const granted = owned();
+    expect(granted).toHaveLength(4);
+    // An upgrade bumps the generation; the tenant is Not Ready until the controller catches up.
+    t.metadata.generation = 2;
+    api.operations = [];
+    await controller.reconcileUser(u, [t]);
+    expect(api.operations.filter((o) => o.method === 'DELETE')).toEqual([]);
+    expect(owned()).toEqual(granted);
+    expect(api.objects.get(tokenPath)?.data).toEqual({ token: 'dG9rZW4=', 'ca.crt': 'Y2E=' });
+    expect(u.status?.conditions?.[0]).toMatchObject({ status: 'True', reason: 'Reconciled' });
+    // A failing tenant keeps them too, and a role change still converges on the kept binding.
+    t.status = { conditions: [{ ...ready[0]!, status: 'False', reason: 'ReconcileError' }] };
+    u.spec.memberships[0]!.role = 'viewer';
+    api.seed(u);
+    await controller.reconcileUser(u, [t]);
+    expect(owned()).toEqual(granted);
+    expect(
+      api.objects.get(
+        '/apis/rbac.authorization.k8s.io/v1/namespaces/di-tenant-alpha/rolebindings/di-user-alice',
+      )?.roleRef,
+    ).toMatchObject({ name: 'di-viewer' });
+    // Ready again: the same state, nothing recreated.
+    t.status = { conditions: [{ ...ready[0]!, observedGeneration: 2 }] };
+    api.operations = [];
+    await controller.reconcileUser(u, [t]);
+    expect(api.operations.filter((o) => o.method === 'DELETE')).toEqual([]);
+    expect(owned()).toEqual(granted);
+    expect(u.status?.conditions?.[0]).toMatchObject({ status: 'True', reason: 'Reconciled' });
+    // Suspending the tenant still revokes access.
+    t.spec.suspended = true;
+    await controller.reconcileUser(u, [t]);
+    expect(owned()).toEqual([`ServiceAccount/wasmcloud/di-user-alice`]);
+    expect(u.status?.conditions?.[0]?.reason).toBe('TenantNotReady');
+  });
+  it('waits for a Not Ready tenant before granting a new membership', async () => {
+    const { api, controller, t, u } = prepare();
+    t.metadata.generation = 2;
+    await controller.reconcileUser(u, [t]);
+    expect([...api.objects.values()].filter((r) => r.kind === 'RoleBinding')).toHaveLength(0);
+    expect(api.objects.has('/api/v1/namespaces/wasmcloud/secrets/di-user-alice-alpha-token')).toBe(
+      false,
+    );
+    expect(u.status?.conditions?.[0]).toMatchObject({ status: 'False', reason: 'TenantNotReady' });
+    t.status = { conditions: [{ ...ready[0]!, observedGeneration: 2 }] };
+    await controller.reconcileUser(u, [t]);
+    expect([...api.objects.values()].filter((r) => r.kind === 'RoleBinding')).toHaveLength(2);
+    expect(u.status?.conditions?.[0]).toMatchObject({ status: 'False', reason: 'TokenPending' });
+  });
   it('removes memberships even when the referenced tenant no longer exists', async () => {
     const { api, controller, t, u } = prepare();
     await controller.reconcileUser(u, [t]);
@@ -395,6 +548,94 @@ describe('tenant and user resource reconciliation', () => {
     ).toBe(true);
     expect([...api.objects.values()].filter((r) => r.kind === 'RoleBinding')).toHaveLength(0);
     expect(t.metadata.finalizers).not.toContain(FINALIZER);
+  });
+  it('keeps the Retain finalizer until the host pods are gone, terminating ones included (#245)', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t);
+    const n = names('alpha');
+    // The Deployments already report zero replicas; a terminating host pod is still there.
+    api.seed(hostPod('hostgroup-terminating', 'alpha', { terminating: true, phase: 'Running' }));
+    // Another tenant's host pod never holds this tenant back.
+    const other = names('beta');
+    api.seed(hostPod('hostgroup-beta', 'beta', { terminating: true }));
+    t.metadata.deletionTimestamp = new Date().toISOString();
+    api.seed(t);
+    await controller.reconcileTenant(t);
+    expect(t.metadata.finalizers).toContain(FINALIZER);
+    // The Tenant says what it waits for.
+    expect(t.status?.conditions?.[0]).toMatchObject({
+      status: 'False',
+      reason: 'WaitingForHostPods',
+      message: `Retain: waiting for host pods in ${n.runtimeNamespace} to be gone before removing the Tenant: hostgroup-terminating`,
+    });
+    expect(api.operations).toContainEqual({
+      method: 'GET',
+      path: `${collection('v1', 'Pod', n.runtimeNamespace)}?labelSelector=${encodeURIComponent(
+        `wasmcloud.com/hostgroup=${n.hostgroup},wasmcloud.com/name=hostgroup`,
+      )}`,
+    });
+    // Nothing is deleted while waiting: the pod, namespaces and the other tenant's pod stay.
+    expect(
+      api.objects.has(`/api/v1/namespaces/${n.runtimeNamespace}/pods/hostgroup-terminating`),
+    ).toBe(true);
+    expect(
+      api.objects.has(`/api/v1/namespaces/${other.runtimeNamespace}/pods/hostgroup-beta`),
+    ).toBe(true);
+    expect(api.objects.has(`/api/v1/namespaces/${n.runtimeNamespace}`)).toBe(true);
+    // A retry while the pod remains is a no-op; once the operator lets it go, the finalizer goes.
+    await controller.reconcileTenant(t);
+    expect(t.metadata.finalizers).toContain(FINALIZER);
+    api.objects.delete(`/api/v1/namespaces/${n.runtimeNamespace}/pods/hostgroup-terminating`);
+    await controller.reconcileTenant(t);
+    expect(t.metadata.finalizers).not.toContain(FINALIZER);
+    expect(api.objects.has(`/api/v1/namespaces/${n.runtimeNamespace}`)).toBe(true);
+    expect(
+      api.objects.has(`/api/v1/namespaces/${other.runtimeNamespace}/pods/hostgroup-beta`),
+    ).toBe(true);
+  });
+  it('under Retain, finished host pods do not hold the Tenant; running, pending and unknown ones do (#245)', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t);
+    const n = names('alpha');
+    const pod = (name: string) => `/api/v1/namespaces/${n.runtimeNamespace}/pods/${name}`;
+    for (const name of ['running', 'pending', 'unknown', 'no-status', 'r5', 'r6']) {
+      const phase =
+        { running: 'Running', pending: 'Pending', unknown: 'Unknown' }[name] ?? 'Running';
+      api.seed(hostPod(name, 'alpha', name === 'no-status' ? {} : { phase }));
+    }
+    // An evicted pod stays Failed until someone deletes it, and under Retain nobody does.
+    api.seed(hostPod('evicted', 'alpha', { phase: 'Failed' }));
+    api.seed(hostPod('completed', 'alpha', { phase: 'Succeeded' }));
+    t.metadata.deletionTimestamp = new Date().toISOString();
+    api.seed(t);
+    await controller.reconcileTenant(t);
+    expect(t.metadata.finalizers).toContain(FINALIZER);
+    const waiting = t.status?.conditions?.[0];
+    expect(waiting?.reason).toBe('WaitingForHostPods');
+    // At most five names, then a count; finished pods are never named.
+    expect(waiting?.message).toEndWith(': no-status, pending, r5, r6, running, and 1 more');
+    expect(waiting?.message).not.toContain('evicted');
+    for (const name of ['running', 'pending', 'unknown', 'no-status', 'r5', 'r6']) {
+      api.objects.delete(pod(name));
+    }
+    await controller.reconcileTenant(t);
+    expect(t.metadata.finalizers).not.toContain(FINALIZER);
+    // Only finished pods were left; the controller still deletes nothing under Retain.
+    expect(api.objects.has(pod('evicted'))).toBe(true);
+    expect(api.objects.has(pod('completed'))).toBe(true);
+    expect(
+      api.operations.filter((o) => o.method === 'DELETE' && o.path.includes('/pods/')),
+    ).toEqual([]);
+  });
+  it('a terminating host pod holds the Retain Tenant even in a finished phase (#245)', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t);
+    api.seed(hostPod('evicted-terminating', 'alpha', { terminating: true, phase: 'Failed' }));
+    t.metadata.deletionTimestamp = new Date().toISOString();
+    api.seed(t);
+    await controller.reconcileTenant(t);
+    expect(t.metadata.finalizers).toContain(FINALIZER);
+    expect(t.status?.conditions?.[0]?.message).toEndWith(': evicted-terminating');
   });
   it('waits for both namespaces to disappear before completing Delete', async () => {
     const { api, controller, t } = prepare();

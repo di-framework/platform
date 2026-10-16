@@ -13,6 +13,7 @@
   "homepage": "https://github.com/di-framework/platform",
   "files": [
     "dist",
+    "src/api",
     "api/v1/openapi.yaml",
     "README.md",
     "LICENSE-MIT",
@@ -25,8 +26,13 @@
       "import": "./dist/client/index.js",
       "default": "./dist/client/index.js"
     },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "bun": "./dist/testing/index.js",
+      "import": "./dist/testing/index.js",
+      "default": "./dist/testing/index.js"
+    },
     "./src/api/*": "./src/api/*",
-    "./tests/support/*": "./tests/support/*",
     "./package.json": "./package.json"
   },
   "bin": {
@@ -35,7 +41,7 @@
   "scripts": {
     "cli": "bun src/main.ts",
     "generate:api": "di-framework generate && bun scripts/generate-openapi.ts",
-    "generate:client": "bun scripts/openapi-typescript.ts api/v1/openapi.yaml -o src/client/schema.d.ts",
+    "generate:client": "bun --no-install scripts/openapi-typescript.ts api/v1/openapi.yaml -o src/client/schema.d.ts",
     "generate": "bun run generate:api && bun run generate:client",
     "build": "rm -rf dist && bun x tsc -p tsconfig.build.json && cp src/client/schema.d.ts dist/client/schema.d.ts && bun ../../scripts/fix-esm-imports.ts dist",
     "test": "bun test"

@@ -62,7 +62,7 @@ export const schemas = {
 
   Binding: {
     type: 'object',
-    description: 'One `@WasmCloudBinding` of the component, rendered by the CLI.',
+    description: 'One `@PlatformBinding` of the component, rendered by the CLI.',
     properties: {
       name: string,
       capability: string,
@@ -262,7 +262,7 @@ export const schemas = {
 
   ConfigEntry: {
     type: 'object',
-    description: 'A secret lists its name only; a var also carries its value.',
+    description: 'A var lists its name, value, and update time. Secrets list as `SecretEntry`.',
     properties: {
       name: string,
       value: string,
@@ -306,6 +306,27 @@ export const schemas = {
       value: string,
     },
     required: ['value'],
+  },
+
+  VarUnset: {
+    type: 'object',
+    description:
+      "The var was removed. `warnings` lists what may notice: `referenced` names the deployed workloads that inject the environment's vars (platform#100); empty when none do.",
+    properties: {
+      warnings: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            code: { type: 'string', enum: ['referenced'] },
+            detail: string,
+            deployments: { type: 'array', items: string },
+          },
+          required: ['code', 'detail', 'deployments'],
+        },
+      },
+    },
+    required: ['warnings'],
   },
 
   ProxyRequest: {

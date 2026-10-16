@@ -38,6 +38,46 @@ export interface SecretResource {
   stringData?: Record<string, string>;
   type?: string;
 }
+export interface ConfigMapResource {
+  metadata: { name: string; namespace?: string };
+  data?: Record<string, string>;
+}
+/**
+ * The ConfigMap in the runtime namespace where the platform lists the tenant's members (#321):
+ * `entries` holds every membership as a {@link PublishedMember}; `members` the active members'
+ * names only. Platforms before `entries` publish only `members`.
+ */
+export const MEMBERS_CONFIG = 'tenant-controller-members';
+/** One membership in {@link MEMBERS_CONFIG} `entries`, as the platform writes it. */
+export interface PublishedMember {
+  name: string;
+  role: Membership['role'];
+  suspended: boolean;
+}
+const isPublishedMember = (value: unknown): value is PublishedMember => {
+  const entry = value as Partial<PublishedMember> | null;
+  return (
+    typeof entry === 'object' &&
+    entry !== null &&
+    typeof entry.name === 'string' &&
+    (entry.role === 'developer' || entry.role === 'viewer') &&
+    typeof entry.suspended === 'boolean'
+  );
+};
+/**
+ * The `entries` of {@link MEMBERS_CONFIG}, or undefined when the ConfigMap predates them (only
+ * `members`). Fails closed: the platform writes `name`, `role` and `suspended` on every entry, so
+ * an entry missing one (or of the wrong type) rejects the whole list rather than show a suspended
+ * member as active.
+ */
+export function publishedMembers(config: ConfigMapResource): PublishedMember[] | undefined {
+  const raw = config.data?.entries;
+  if (raw === undefined) return undefined;
+  const entries: unknown = JSON.parse(raw);
+  if (!Array.isArray(entries) || !entries.every(isPublishedMember))
+    throw new Error(`${MEMBERS_CONFIG} entries must each have a name, a role and suspended`);
+  return entries;
+}
 export interface MintedToken {
   token: string;
   expirationTimestamp: string;
@@ -205,8 +245,17 @@ export class KubeClient {
     }
   }
 
-  getUser(name: string): Promise<UserResource | undefined> {
-    return this.optional(`${usersPath}/${encodeURIComponent(name)}`);
+  /**
+   * A User by name. The tenant controller may read only its tenant's active members (#321), so
+   * the API server's 403 for anyone else means the same as a 404: no active member of that name.
+   */
+  async getUser(name: string): Promise<UserResource | undefined> {
+    try {
+      return await this.optional<UserResource>(`${usersPath}/${encodeURIComponent(name)}`);
+    } catch (error) {
+      if (error instanceof KubeError && error.status === 403) return undefined;
+      throw error;
+    }
   }
   listUsers(): Promise<{ items: UserResource[] }> {
     return this.call('GET', usersPath);
@@ -236,6 +285,9 @@ export class KubeClient {
     return result.status;
   }
 
+  getConfigMap(namespace: string, name: string): Promise<ConfigMapResource | undefined> {
+    return this.optional(`/api/v1/namespaces/${namespace}/configmaps/${encodeURIComponent(name)}`);
+  }
   listSecrets(namespace: string, labelSelector: string): Promise<{ items: SecretResource[] }> {
     return this.call(
       'GET',
@@ -288,8 +340,13 @@ export interface UserKube {
   call<T>(method: string, path: string, body?: unknown): Promise<T>;
 }
 
-/** Caller headers never forwarded to the API server: credentials, identity and hop-by-hop. */
+/**
+ * Caller headers never forwarded to the API server: credentials, identity and hop-by-hop.
+ * `accept-encoding` is left to `fetch`, which then asks only for codings it decodes, so every
+ * caller (the Kubernetes proxy included) reads a plain body (#71).
+ */
 const STRIPPED = new Set([
+  'accept-encoding',
   'authorization',
   'proxy-authorization',
   'cookie',

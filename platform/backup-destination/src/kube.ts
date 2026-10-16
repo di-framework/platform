@@ -224,6 +224,8 @@ function entryOf(value: string): HeldEntry | undefined {
       heldBy: parsed.heldBy,
       since: String(parsed.since ?? ''),
       ...(typeof parsed.destination === 'string' ? { destination: parsed.destination } : {}),
+      ...(typeof parsed.storageKey === 'string' ? { storageKey: parsed.storageKey } : {}),
+      ...(typeof parsed.workloadUid === 'string' ? { workloadUid: parsed.workloadUid } : {}),
     };
   } catch {
     return undefined;
@@ -615,9 +617,13 @@ export async function applyActions(
 ): Promise<void> {
   const versions = new Versions();
   const crd = `/apis/${VERSION}/namespaces/${world.tenantNamespace}`;
+  // Workloads this tick's scale found gone (a 404): their signals say so (#263).
+  const gone = new Set<string>();
+  const say = (action: Extract<Action, { type: 'log' | 'event' }>) =>
+    action.ifGone && gone.has(action.ifGone.workload) ? action.ifGone.message : action.message;
   for (const action of actions) {
     if (action.type === 'log') {
-      console.log(action.message);
+      console.log(say(action));
     } else if (action.type === 'destination-status') {
       const name = action.name ?? world.destination?.name;
       if (!name) continue;
@@ -693,13 +699,15 @@ export async function applyActions(
       await createJob(client, action.body);
     } else if (action.type === 'scale-workload') {
       // A 404 is the only proof a member is gone; anything else fails the tick and is retried.
-      await except(
-        404,
-        client.patch(
+      await client
+        .patch(
           `${RUNTIME}/namespaces/${world.tenantNamespace}/workloaddeployments/${action.name}/scale`,
           { spec: { replicas: action.replicas } },
-        ),
-      );
+        )
+        .catch((error: unknown) => {
+          if (statusOf(error) !== 404) throw error;
+          gone.add(action.name);
+        });
     } else if (action.type === 'delete-job') {
       await except(
         404,
@@ -707,7 +715,41 @@ export async function applyActions(
           `/apis/batch/v1/namespaces/${world.runtimeNamespace}/jobs/${action.name}?propagationPolicy=Background`,
         ),
       );
+    } else if (action.type === 'event') {
+      await recordEvent(client, world, { ...action, message: say(action) });
     }
+  }
+}
+
+/**
+ * Post an Event on the held-replicas ledger in the runtime namespace, where tenant roles read
+ * events. A signal, not a step: a failure is logged and the tick goes on.
+ */
+async function recordEvent(
+  client: KubeClient,
+  world: World,
+  action: Extract<Action, { type: 'event' }>,
+): Promise<void> {
+  const namespace = world.runtimeNamespace;
+  try {
+    await client.post(`/api/v1/namespaces/${namespace}/events`, {
+      apiVersion: 'v1',
+      kind: 'Event',
+      metadata: { generateName: `${LEDGER}.`, namespace },
+      involvedObject: { apiVersion: 'v1', kind: 'ConfigMap', name: LEDGER, namespace },
+      type: action.eventType,
+      reason: action.reason,
+      message: action.message,
+      source: { component: 'di-backup-operator' },
+      reportingComponent: 'di-backup-operator',
+      firstTimestamp: world.now,
+      lastTimestamp: world.now,
+      count: 1,
+    });
+  } catch (error) {
+    console.error(
+      `event ${action.reason} not recorded: ${error instanceof Error ? error.message : 'post failed'}`,
+    );
   }
 }
 

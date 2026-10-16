@@ -483,7 +483,8 @@ describe('storage admission and install', () => {
     ).toEqual({
       apiGroups: ['runtime.wasmcloud.dev'],
       resources: ['workloaddeployments'],
-      verbs: ['get', 'list', 'watch', 'create', 'patch', 'delete'],
+      // update only because the di-developer Role it writes grants it (#115).
+      verbs: ['get', 'list', 'watch', 'create', 'patch', 'update', 'delete'],
     });
   });
 });

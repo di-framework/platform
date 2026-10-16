@@ -80,7 +80,7 @@ pub(crate) async fn handle_manifest(
                 .unwrap_or_else(|| DEFAULT_MANIFEST_MEDIA_TYPE.to_string());
 
             let head = matches!(method, Method::Head);
-            let headers = entity_headers(head, media_type, digest, data.len());
+            let headers = entity_headers(head, media_type, digest, data.len() as u64);
             Ok(respond_owned(
                 200,
                 headers,

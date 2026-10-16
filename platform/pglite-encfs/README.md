@@ -4,13 +4,13 @@
 
 - It sits between pglite and the host and re-exports the WASI 0.2.9 interfaces pglite imports (`wasi:filesystem`, `wasi:io`, the `wasi:cli` stdio and environment interfaces, and `wasi:clocks/monotonic-clock`).
 - Every regular file under a preopened directory is stored as AES-256-XTS ciphertext behind a 4 KiB header.
-- Directory names, symlinks and metadata pass through unchanged.
+- Directory names, symlinks and metadata pass through unchanged. The one exception is the root's marker, which pglite can never reach (see "Atomic marker" under [Fail closed](#fail-closed)).
 
 ```
 guest.wasm ──di-framework:pglite/database──▶ pglite.wasm ──wasi:filesystem, io, cli…──▶ pglite-encfs.wasm ──▶ host (wash / wasmtime)
 ```
 
-Published as `ghcr.io/di-framework/pglite-encfs@sha256:e8339a1da95895bd8387a8530ca0f1fc2084f7868b15cf4e2ff82105128ff3aa`. The publish workflow rewrites this pin after every publish. The moving tags are the commit SHA and the WIT package version (`0.1.0`); only the digest is immutable.
+Published as `ghcr.io/di-framework/pglite-encfs@sha256:3613eab40e1ee2c2457c0fb4870190d7b6b54ba11c8b6747b269f807e49ad435`. The publish workflow rewrites this pin after every publish. The moving tags are the commit SHA and the WIT package version (`0.1.0`); only the digest is immutable.
 
 Design and spike: #199. The integrity (AEAD) mode is a follow-up: #200.
 
@@ -39,7 +39,7 @@ Or use `make compose PGLITE=path/to/di-framework-pglite.wasm OUT=pglite-enc.wasm
 
 Generate a key with `openssl rand -base64 32`, or with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`.
 
-- **How the key is read.** The key reaches the component through `wasi:cli/environment`. On the platform that means the workload's `<workload>-control` Secret via `localResources.environment.secretFrom`. encfs reads it once, derives its keys, and wipes the decoded bytes and the environment strings.
+- **How the key is read.** The key reaches the component through `wasi:cli/environment`. On the platform that means the workload's app-owned `<workload>-secrets` Secret via `localResources.environment.secretFrom`; `<workload>-control` holds only the CLI's control credentials. encfs reads it once, derives its keys, and wipes the decoded bytes and the environment strings.
 - **What the engine sees.** encfs's own `wasi:cli/environment` export filters out both variables, so the PostgreSQL engine never sees them. The guest's environment comes from the host directly, so the guest can see them, just as it sees its other secrets.
 - **What is stored.** Neither the key nor anything that decrypts data is written to the volume. Headers and the root marker hold a 16-byte key-check value (KCV), a one-way HKDF output that identifies the key.
 
@@ -59,8 +59,9 @@ Before pglite can touch a preopen, encfs checks the `.di-encfs` marker at its ro
 
 - **A refusal changes nothing.** It locks the whole preopen before anything is written. pglite surfaces it as `open-failed(...)`, and encfs prints the reason to stderr (for example, `pglite-encfs: the data directory was encrypted with a different key ...`).
 - **No partial encryption.** encfs never encrypts an existing plaintext directory in place, and never accepts a mix of plaintext and encrypted files.
-- **Per-file checks.** A file wrapped under another key fails with `access`. A file without a header, or a header that does not authenticate, fails with `io`. That includes a plaintext file of any size dropped into an encrypted directory: it is neither read nor rewritten.
-- **Atomic marker.** The marker is written to `.di-encfs.tmp`, synced and renamed into place. pglite can reach neither name; paths are normalized (`.`, `..`, `//`) before the check.
+- **Per-file checks.** A file wrapped under another key fails with `access`. A file without a header, or a header that does not authenticate, fails with `io`. A plaintext file dropped into an encrypted directory is neither read nor rewritten, with one exception: a file of at most 4096 bytes whose first 152 bytes are all zero is indistinguishable from a file whose creation was cut short by a crash. It is treated as fresh: it reads as empty, and its first write replaces its contents with a new header. Every other plaintext file, of any size, is refused.
+- **Stubs without a header.** A file of at most 4096 bytes whose first 152 bytes are neither all zero nor a complete header is refused with `io`. Besides a small plaintext file, a failed header write can leave one: a partial header after `ENOSPC`, or garbage after a crash on ext4 with `data=writeback`, which can make a file's size durable before its contents. Data is only written after a synced header, so such a file holds no encrypted data. encfs logs `<path>: no encryption header; refusing. The file is at most 4096 bytes ...` for each one, with the path relative to the data directory root. Unless you placed a plaintext file there, it is safe to truncate the file to 0 bytes on the volume (`truncate -s 0 <data-dir>/<path>`). Never truncate the `.di-encfs` marker. The next write gives the file a new header. A stub in the data directory also stops a rotation until it is truncated.
+- **Atomic marker.** The marker is written to `.di-encfs.tmp`, synced and renamed into place. pglite can reach neither name, in any ASCII case (so `.DI-ENCFS` is refused too, which is the same file on a case-insensitive volume such as APFS), from any directory descriptor and through any path. Whenever a path ends in one of the two names, the host resolves the directory that would hold it, following `.`, `..` and every symlink in the path as the operation itself would, and encfs compares that directory's identity (the host's `metadata-hash`, from device and inode) with the root's. If it is the root, or cannot be identified, the operation fails with `access`. This covers open and create, stat, metadata hash, rename (either side), unlink, readlink, creating or removing a directory, and creating a symlink. A directory descriptor that names the root again (`.`, `pglite/..`, or a symlink to it anywhere in the path) hides both names, in any case, from its listing. A symlink whose target contains either name is never created. Other symlinks work as before.
 
 ### Key custody: losing the key means losing the data
 
@@ -76,11 +77,12 @@ There is no recovery path. Without `DI_PGLITE_KEY` the database cannot be read b
 A rotation replaces the key-encryption key. Each file's data key is re-wrapped; data is not re-encrypted.
 
 1. Set the new key in `DI_PGLITE_KEY` and the old one in `DI_PGLITE_KEY_PREVIOUS`, then restart the workload.
-2. At start, encfs walks the preopen and re-wraps every file header under the new key, syncing each file. It then flips the root marker. The log says `pglite-encfs: key rotation complete: re-wrapped N file keys`.
-3. After that line, remove `DI_PGLITE_KEY_PREVIOUS`. From then on the old key alone is refused.
+2. At start, encfs walks the preopen and re-wraps every file header under the new key, syncing each file. It then flips the root marker. The log says `pglite-encfs: key rotation complete: re-wrapped N file keys; ... DI_PGLITE_KEY_PREVIOUS can be removed`.
+3. After that line, remove `DI_PGLITE_KEY_PREVIOUS`. From then on the old key alone is refused. If the line instead says that entries in `lost+found` may still be wrapped under the previous key, keep a copy of that key until those entries are recovered or deleted (below).
 
 Notes:
 - **Crashes are safe.** A crash mid-sweep leaves the marker on the old key, and the next start with both keys resumes. Headers already under the new key are skipped.
+- **`lost+found` is swept best-effort.** fsck reconnects orphaned inodes into `lost+found` at the root as `#<inode>`. On an encrypted volume those can be encfs files whose directory entry was lost, next to fragments that are not encfs files at all. The sweep re-wraps every file there whose header opens under the previous key and leaves everything else as it was. Nothing there aborts a rotation. Each entry it leaves is logged (`lost+found/#123: left as it was during key rotation: ...`), up to 50 lines; beyond that, one line gives how many more were left. The completion line always counts all of them. An entry may still be under the previous key if its header is under that key but does not authenticate, or is a format this build does not read, or if the entry could not be read (for example a `lost+found` owned by root with mode `0700`). If any entry might be, the completion line does not say the previous key can be removed. It says how many such entries there are instead.
 - **Keep both variables set until step 2 has logged success.** Starting with only the old key after a partial sweep fails closed on the re-wrapped files.
 - **A rotation does not lock out a compromised old key.** The data keys do not change, so someone who holds the old key and a volume image from before the rotation can still read data written later. After a suspected key compromise, copy the data into a fresh directory under a new key instead. An offline migration tool is tracked in #199 and has not been built yet.
 
@@ -108,7 +110,7 @@ Keys:
 Header lifecycle:
 - An empty file has no header.
 - The header is written with the first byte of data and synced before any data follows it. It is never removed: truncating to zero keeps it, so a file id never changes while its inode exists.
-- A file no longer than a header whose start is all zero (a crash made its size durable before its header) holds no data. It is treated as empty and sealed with a new header on its first write, and rotation skips it. A zero header on a longer file, or non-zero bytes that are not a header, are refused.
+- A file no longer than a header (4096 bytes) whose first 152 bytes are all zero holds no data: a crash made its size durable before its header. Only those 152 bytes are checked. It is treated as empty and sealed with a new header on its first write, and rotation skips it. A zero header on a longer file is refused, and so are non-zero bytes that are not a header, at any size (see the stubs under [Fail closed](#fail-closed)).
 
 Data units:
 - AES-256-XTS over 4 KiB units with tweak = unit index. The scheme is length-preserving: logical size = physical size − 4096.
@@ -213,7 +215,10 @@ make smoke    # needs wasmtime 48 and ../pglite-component/dist (make -C ../pglit
 - rotation re-wrapping
 - size semantics against a plaintext model under random writes and resizes
 - key parsing
-- the root-marker decision table, including a partial marker after a crash, and marker path normalization
+- the root-marker decision table, including a partial marker after a crash, and marker and root path normalization
+- the marker guard over a symlinked tree: a symlink to the root partway through a path or a chain of them is refused, a link to an ordinary directory is not, an unidentifiable directory fails closed, and marker names are refused in any case
+- the rotation sweep over an in-memory tree: markers skipped, paths in errors relative to the root, recovered encfs files in `lost+found` re-wrapped, and fragments and unreadable entries there left, counted and kept out of the "can be removed" line
+- stub classification of short files without a header
 
 **`make smoke`** plugs encfs into the pglite wasm and the pglite smoke consumer (`../pglite-component/tests/smoke-consumer`) and runs everything under wasmtime with no network (the only download is the pinned v1 build for the codec-2 case; set `PGLITE_ENCFS_V1_WASM` to a local copy to skip it):
 - **Interface fit.** encfs's exports are exactly pglite's WASI imports, and the composed provider keeps pglite's imports and exports.
@@ -224,7 +229,8 @@ make smoke    # needs wasmtime 48 and ../pglite-component/dist (make -C ../pglit
 - **Refusals.** A wrong key, a missing key, an invalid key and a legacy plaintext directory are each refused, with the tree byte-identical afterwards. A plaintext file dropped into the encrypted directory is refused and left unchanged.
 - **Crashes during setup.** The first start succeeds over an empty marker. After a table is created and committed and the process dies, its new files are zeroed or shortened (size durable, header not); the next start re-seals them and WAL redo restores the row.
 - **Torn writes.** The three power-loss cases above.
-- **Rotation.** Every header is re-wrapped, an interrupted rotation resumes, and the old key is refused afterwards.
+- **Rotation.** A stub stops it, and the log names the stub by its path from the root. Every header is re-wrapped, including an encfs file copied into `lost+found`. A fragment there is left byte-identical and reported. An interrupted rotation resumes, and the old key is refused afterwards.
+- **Root guard.** A probe component (`tests/root-probe`) plugged onto encfs reopens the root as `.`, `./`, `pglite/..`, `pglite/data/../..` and through a symlink to `.`. In every case the listing hides `.di-encfs`, and stat, open, rename and unlink of it fail with `access`. It then links `pglite/root-probe-up` to `..` and `pglite/root-probe-c1` to the root through a second link, and reaches both marker names through them from the root and from `pglite`, also after `.`, `..`, `..` directly after a link (`pglite/root-probe-ok/..`, and `root-probe-pg/..` with `root-probe-pg` linked to `pglite/data`, which only reaches `pglite` when `..` is resolved where the link leads) and a second hop, and as `.DI-ENCFS`. Stat, metadata hash, open, create, rename to and from, unlink, readlink, mkdir, rmdir and symlink there all fail with `access`, and the directories reached through the links hide the marker. Symlinks whose targets name a marker are refused. An ordinary link (`pglite/root-probe-ok` to `data`) still lists and reads `PG_VERSION`, also as `root-probe-pg/../data/PG_VERSION`, and a marker name below it is just absent. The tree is unchanged afterwards and no link is left behind.
 - **Codecs.** The default build writes codec 2 only (a fresh directory and one written to after an abrupt exit), and its section says `write-codec=2`. The `write-codec-3` build writes a fresh directory with codec 3 only. A directory initialized by the published v1 build (all codec 2) is read, restarted after an abrupt exit, and written to by the codec-3 build (commits and a new table); afterwards it holds codec-2 and codec-3 files side by side.
 - **Rollback.** The published v1 build over that mixed directory, after a clean shutdown and after an abrupt exit (and after a single codec-3 start plus one abrupt commit), must fail with `unsupported header (format 1, codec 3)` and never start. Both new builds then still report every commit (`check-ab A=1 B=1`, `check-fresh N=1`), and the default build adds no codec-3 files.
 

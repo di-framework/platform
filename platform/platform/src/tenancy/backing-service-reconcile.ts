@@ -63,16 +63,33 @@ function backingServiceResourceName(serviceName: string): string {
   return `di-bs-${serviceName}`;
 }
 
-function backingServiceHostPath(tenantUid: string, serviceName: string): string {
-  return `/var/lib/k0s/di-tenants/${tenantUid}/bs-${serviceName}`;
+/** Node directory holding tenant data when `cfg.storageRoot` is unset. */
+const DEFAULT_STORAGE_ROOT = '/var/lib/k0s';
+
+/** `<storageRoot>/di-tenants/<tenant uid>/bs-<name>`: where a new BackingService keeps its data. */
+function backingServiceHostPath(
+  cfg: Pick<ControllerConfig, 'storageRoot'>,
+  tenantUid: string,
+  serviceName: string,
+): string {
+  return `${cfg.storageRoot ?? DEFAULT_STORAGE_ROOT}/di-tenants/${tenantUid}/bs-${serviceName}`;
 }
 
-function runtimeDataNatsHostPath(tenantUid: string): string {
-  return `/var/lib/k0s/di-tenants/${tenantUid}/${RUNTIME_DATA_NATS}`;
-}
-
-function transitionalRedisHostPath(tenantUid: string): string {
-  return `/var/lib/k0s/di-tenants/${tenantUid}/${TRANSITIONAL_REDIS}`;
+/**
+ * The hostPath the live `di-bs-<name>` Deployment already mounts as its `data` volume, when that
+ * Deployment belongs to `service`. Keeping it means a BackingService created under an earlier
+ * storage root still reaches its data; a Deployment owned by another UID never donates a path.
+ */
+function liveBackingServiceHostPath(
+  live: Resource | undefined,
+  service: BackingService,
+): string | undefined {
+  if (!live || live.metadata.labels?.[OWNER] !== service.metadata.uid) return undefined;
+  const spec = live.spec as
+    | { template?: { spec?: { volumes?: { name?: string; hostPath?: { path?: string } }[] } } }
+    | undefined;
+  const data = spec?.template?.spec?.volumes?.find((v) => v.name === 'data');
+  return data?.hostPath?.path || undefined;
 }
 
 /** Parse Kubernetes CPU quantities to millicores. */
@@ -290,7 +307,9 @@ function backendDeploymentResources(opts: {
 /**
  * Desired runtime infra for one BackingService instance.
  * Names are always `di-bs-<service-name>` so they never collide with reserved
- * `di-nats` (runtime data plane) or transitional `di-redis`.
+ * `di-nats` (runtime data plane) or transitional `di-redis`. `live` is the current
+ * `di-bs-<service-name>` Deployment, if any: its data hostPath is kept so existing data
+ * stays reachable; otherwise the path derives from `cfg.storageRoot`.
  */
 function backingServiceResources(
   service: BackingService,
@@ -298,6 +317,7 @@ function backingServiceResources(
   cls: BackingServiceClass,
   cfg: ControllerConfig,
   sizing: SizingParameters,
+  live?: Resource,
 ): Resource[] {
   if (cls.spec.provider === 'postgres')
     throw new Error('PostgreSQL requires the dedicated credentials and PVC reconciliation helpers');
@@ -315,7 +335,9 @@ function backingServiceResources(
     runtimeNamespace: n.runtimeNamespace,
     name: resourceName,
     provider,
-    hostPath: backingServiceHostPath(tenant.metadata.uid ?? 'unknown', service.metadata.name),
+    hostPath:
+      liveBackingServiceHostPath(live, service) ??
+      backingServiceHostPath(cfg, tenant.metadata.uid ?? 'unknown', service.metadata.name),
     replicas,
     sizing,
   });
@@ -365,6 +387,74 @@ function tenantNameFromNamespace(namespace: string | undefined): string | undefi
   return namespace.slice('di-tenant-'.length);
 }
 
+/** Why a backing-service Deployment cannot become ready, read from its status conditions. */
+interface DeploymentFailure {
+  reason: string;
+  message: string;
+}
+
+/** Longest runtime message copied into a tenant-visible condition (webhook denials are free text). */
+const MAX_FAILURE_MESSAGE = 1024;
+
+function boundedMessage(message: string): string {
+  if (message.length <= MAX_FAILURE_MESSAGE) return message;
+  let end = MAX_FAILURE_MESSAGE - 1;
+  // Never cut between the halves of a surrogate pair: Kubernetes would store U+FFFD for the
+  // orphaned high surrogate and the stored status would never equal the computed one.
+  const last = message.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${message.slice(0, end)}…`;
+}
+
+/**
+ * Report a Deployment failure that will not resolve by waiting, e.g. a ResourceQuota
+ * or admission rejection (`ReplicaFailure`/`FailedCreate`) or an exceeded progress
+ * deadline. Returns `undefined` while the rollout is merely in progress.
+ * The conditions are level-triggered: Kubernetes clears `ReplicaFailure` on the next
+ * successful sync, so a brief flip back to Provisioning is expected and harmless.
+ */
+function deploymentFailure(deployment: Resource): DeploymentFailure | undefined {
+  const status = deployment.status as
+    | {
+        observedGeneration?: number;
+        conditions?: { type?: string; status?: string; reason?: string; message?: string }[];
+      }
+    | undefined;
+  const generation = deployment.metadata.generation;
+  if (
+    generation !== undefined &&
+    status?.observedGeneration !== undefined &&
+    status.observedGeneration !== generation
+  )
+    return undefined;
+  const conditions = status?.conditions ?? [];
+  const name = deployment.metadata.name;
+  const replicaFailure = conditions.find((c) => c.type === 'ReplicaFailure' && c.status === 'True');
+  if (replicaFailure)
+    return {
+      reason: replicaFailure.reason || 'ReplicaFailure',
+      message: boundedMessage(
+        `Backing service deployment ${name} cannot create pods: ${
+          replicaFailure.message || 'replica creation failed'
+        }`,
+      ),
+    };
+  const progressing = conditions.find(
+    (c) =>
+      c.type === 'Progressing' && c.status === 'False' && c.reason === 'ProgressDeadlineExceeded',
+  );
+  if (progressing)
+    return {
+      reason: 'ProgressDeadlineExceeded',
+      message: boundedMessage(
+        `Backing service deployment ${name} did not become ready: ${
+          progressing.message || 'progress deadline exceeded'
+        }`,
+      ),
+    };
+  return undefined;
+}
+
 export {
   backendDeploymentResources,
   backingLabels,
@@ -372,7 +462,12 @@ export {
   backingServiceResourceName,
   backingServiceResources,
   CAPABILITY,
+  DEFAULT_STORAGE_ROOT,
+  type DeploymentFailure,
+  deploymentFailure,
   endpointFor,
+  liveBackingServiceHostPath,
+  MAX_FAILURE_MESSAGE,
   mergeSizing,
   PROVIDER_RUNTIME,
   parseCpu,
@@ -383,11 +478,9 @@ export {
   type RuntimeProvider,
   resolveBackingSizing,
   resolveClass,
-  runtimeDataNatsHostPath,
   SERVICE,
   TRANSITIONAL_REDIS,
   tenantNameFromNamespace,
-  transitionalRedisHostPath,
   validateSizingAgainstClass,
   validateSizingAgainstTenantBudget,
 };

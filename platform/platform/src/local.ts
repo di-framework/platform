@@ -19,7 +19,12 @@ import {
   refuseExistingVolumeThenCreate,
   shutdownRuntime,
 } from './container-cli';
-import { createPlatform, platformRegistryPullHost } from './index';
+import {
+  createPlatform,
+  type PlatformConfigArgs,
+  platformRegistryPullHost,
+  validatePlatformConfig,
+} from './index';
 import { localPathStorageResources } from './local-storage';
 import { registryMirrorFiles, registryMirrors } from './registry-mirrors';
 
@@ -48,6 +53,17 @@ const k0sDataName = `${scope}-k0s-data`;
 const k0sPodLogsName = `${scope}-k0s-pod-logs`;
 const kubeconfigFile = path.resolve(`.kubeconfig-${stack}`);
 const owned: ContainerScope = { cli, ownershipLabel, scope };
+
+const platformConfig = {
+  installation: scope,
+  config,
+  namespace: namespaceName,
+  routeUrlPattern: `http://{host}.{tenant}.localhost:${httpPort}`,
+  registry: true,
+  insecureRegistry: true,
+} satisfies PlatformConfigArgs;
+// Refuse invalid platform input before the cluster exists, not after creating it (#294).
+validatePlatformConfig(platformConfig);
 
 const runtimeNetwork = new command.local.Command('runtime-network', {
   create: refuseExistingNetworkThenCreate(owned, networkName),
@@ -125,13 +141,8 @@ const provider = new k8s.Provider(
 new k8s.yaml.ConfigGroup('local-path-storage', { objs: localPathStorageResources }, { provider });
 
 const platform = createPlatform({
+  ...platformConfig,
   provider,
-  installation: scope,
-  config,
-  namespace: namespaceName,
-  routeUrlPattern: `http://{host}.{tenant}.localhost:${httpPort}`,
-  registry: true,
-  insecureRegistry: true,
   kubeconfig: kubeconfigContents,
   apiServer: `https://127.0.0.1:${apiPort}`,
   beforeTenancy: (wasmcloud) => {

@@ -3,8 +3,11 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  GATEWAY_DRAIN_SECONDS,
   GATEWAY_NAME,
   GATEWAY_PORT,
+  GATEWAY_PRESTOP_SECONDS,
+  GATEWAY_TERMINATION_GRACE_SECONDS,
   gatewayDeploymentSpec,
   gatewayNetworkPolicySpec,
   gatewayScriptHash,
@@ -85,8 +88,35 @@ describe('gateway resources', () => {
     expect(JSON.parse(container.env[0]!.value)).toEqual({
       port: GATEWAY_PORT,
       defaultUpstream: 'wasmcloud-http.wasmcloud.svc.cluster.local',
+      drainTimeoutMs: GATEWAY_DRAIN_SECONDS * 1000,
     });
     expect(pod.volumes).toEqual([{ name: 'script', configMap: { name: GATEWAY_NAME } }]);
+  });
+
+  it('rolls without dropping capacity and drains the old pod before it stops (#223)', () => {
+    const spec = gatewayDeploymentSpec('wasmcloud', 'abc', {}, { 'a.alpha': 'a.beta' });
+    const pod = spec.template.spec;
+    const [container] = pod.containers;
+    if (!container) throw new Error('the gateway Deployment has no container');
+    // Surge a new pod; never take the old one down before the new one is Ready.
+    expect(spec.replicas).toBe(1);
+    expect(spec.strategy).toEqual({
+      type: 'RollingUpdate',
+      rollingUpdate: { maxSurge: 1, maxUnavailable: 0 },
+    });
+    expect(spec.minReadySeconds).toBeGreaterThan(0);
+    expect(container.readinessProbe).toMatchObject({ tcpSocket: { port: 'http' } });
+    // Keep serving while the endpoint removal propagates, then drain within the grace period.
+    expect(container.lifecycle).toEqual({
+      preStop: { exec: { command: ['sleep', String(GATEWAY_PRESTOP_SECONDS)] } },
+    });
+    expect(GATEWAY_PRESTOP_SECONDS).toBeGreaterThanOrEqual(5);
+    const drainMs = JSON.parse(container.env[0]?.value ?? '{}').drainTimeoutMs;
+    expect(drainMs).toBe(GATEWAY_DRAIN_SECONDS * 1000);
+    expect(pod.terminationGracePeriodSeconds).toBe(GATEWAY_TERMINATION_GRACE_SECONDS);
+    expect(pod.terminationGracePeriodSeconds * 1000).toBeGreaterThan(
+      GATEWAY_PRESTOP_SECONDS * 1000 + drainMs,
+    );
   });
 
   it('owns the published NodePort, or stays ClusterIP without one', () => {

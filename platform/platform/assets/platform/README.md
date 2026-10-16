@@ -96,6 +96,11 @@ Send the configured project name as the HTTP `Host` header, for example:
 curl -H 'Host: greeter' http://127.0.0.1:28180/
 ```
 
+`pulumi up` checks the platform configuration (tenants, users, route aliases,
+tenant auth, runtime NATS, insecure registries, the tenant host image) before it
+creates anything, so invalid configuration fails without creating the k0s
+container, network, or volumes.
+
 Platform destroy removes only container-engine and Kubernetes resources bearing this
 project/stack scope, along with the generated kubeconfig. It refuses to adopt
 or replace an already-existing container, network, or volume with the same name. Teardown
@@ -186,8 +191,10 @@ For shared tenant keyvalue storage, reference the controller-managed ConfigMap
 services use ConfigMaps named `di-bs-*` and binding-projected Secrets/ConfigMaps
 named `di-binding-*` (#450/#451). The warehouse's HTTP, Redis, and NATS sync flow
 has been verified on wash 2.8.0. The platform default host image is
-`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad`,
-which links `wasi:tls`. Native keyvalue needs no custom image. The warehouse uses this same ConfigMap reference
+`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:dd61810dc74af61c88b684fd26fcd8e030d41b8f0216a8cb1f7fdfa4242178b0`,
+which links `wasi:tls`; the tenant host pin PR moves it with each canonical host publish, so an
+install without `tenantHostImage` moves its tenant hosts on the first deploy of a release that
+contains that pin (set `tenantHostImage` to a digest to hold a build). Native keyvalue needs no custom image. The warehouse uses this same ConfigMap reference
 in its external-cluster setup. Messaging uses the tenant's dedicated NATS backend.
 Tenant admission restricts native interfaces, forbids host volumes and guest
 network capabilities, and reserves `di-tenant-stock`, `di-bs-*`, and
@@ -217,6 +224,12 @@ registries, production storage, and stronger resource accounting are separate
 work. Namespace NetworkPolicies require an enforcing CNI (the generated k0s
 cluster uses kube-router). `tenantHostImage` and `tenantHostImagePullPolicy`
 override the default wasi-tls host image when a stack needs a different runtime.
+This project is a local install, so its tenant hosts always get
+`--insecure-registry` for the platform registry: an override image must be built
+with wash patch 0002 (see `platform/tenant-host/README.md` in the platform
+repository). `createPlatform` refuses the one published pre-0002 digest up front;
+other older builds (for example locally built images) reject that argument and
+the tenant hosts crash-loop.
 
 ## Shared implementation
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import { evaluate } from '@marcbachmann/cel-js';
 import { tenantSecretDeleteAllowed } from '../src/tenancy/admission';
+import { evaluate } from './support/cel';
 import {
   controller,
   developer,

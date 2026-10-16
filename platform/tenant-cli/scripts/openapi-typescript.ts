@@ -7,7 +7,7 @@
  * module openapi-typescript resolves with `@typescript/typescript6`, the
  * official TypeScript 6 API package, so the generated file is unchanged.
  *
- *   bun scripts/openapi-typescript.ts <openapi.yaml> -o <schema.d.ts>
+ *   bun --no-install scripts/openapi-typescript.ts <openapi.yaml> -o <schema.d.ts>
  */
 import { dirname } from 'node:path';
 import { plugin } from 'bun';

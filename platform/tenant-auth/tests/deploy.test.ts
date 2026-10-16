@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
-import { deployBundle } from '@di-framework/tenant-cli/tests/support/deploy-bundle.ts';
+import { deployBundle } from '@di-framework/tenant-cli/testing';
 import type { Socket } from 'bun';
 // Pinned to the platform's log projection, which keys logs by these labels (platform#103).
 import {
@@ -60,6 +60,12 @@ describe('/v1/deploy', () => {
   let putConflicts = 0;
   /** Paths a concurrent deploy deletes just before this one does: the DELETE gets a 404. */
   const raced = new Set<string>();
+  /** Paths a concurrent deploy deletes just before this one reads them: the GET gets a 404. */
+  const pruned = new Set<string>();
+  /** Runs once before the next GET of a path, as a concurrent writer would act. */
+  const beforeRead = new Map<string, () => void>();
+  /** Answers the WorkloadDeployment list with this status, as a refused or failing read would. */
+  let workloadListFailure: number | undefined;
   const api = serve((request: Recorded) => {
     if (request.pathname.endsWith('/token'))
       return json({
@@ -74,6 +80,8 @@ describe('/v1/deploy', () => {
       (rejectToken === 'workloads' && request.pathname.startsWith(WORKLOADS))
     )
       return json({ message: 'Unauthorized' }, 401);
+    if (workloadListFailure && request.method === 'GET' && request.pathname === WORKLOADS)
+      return json({ message: 'workloaddeployments unavailable' }, workloadListFailure);
     // RBAC per token (#112): a member's `sa-*` token may not read or patch Secrets.
     if (
       request.pathname.startsWith(`${CORE}/secrets`) &&
@@ -100,6 +108,10 @@ describe('/v1/deploy', () => {
       });
     }
     if (request.method === 'GET') {
+      if (pruned.delete(request.pathname)) stored.delete(request.pathname);
+      const hook = beforeRead.get(request.pathname);
+      beforeRead.delete(request.pathname);
+      hook?.();
       const object = stored.get(request.pathname);
       return object ? json(object) : json({ message: 'not found' }, 404);
     }
@@ -174,6 +186,9 @@ describe('/v1/deploy', () => {
     postFailures.length = 0;
     putConflicts = 0;
     raced.clear();
+    pruned.clear();
+    beforeRead.clear();
+    workloadListFailure = undefined;
     caller = alice;
     for (const env of ['prod', 'staging']) seedSecret('api-token', env);
   });
@@ -1049,6 +1064,10 @@ describe('/v1/deploy', () => {
       ((revision(id)?.metadata as Json | undefined)?.annotations as Json | undefined)?.[
         'platform.di-framework.dev/revision-state'
       ];
+    const statusOf = (id: string) =>
+      ((revision(id)?.metadata as Json | undefined)?.annotations as Json | undefined)?.[
+        'platform.di-framework.dev/status'
+      ];
     const listed = async (query = 'env=prod') =>
       ((await (await get(`/v1/deployments?${query}`)).json()) as { items: Json[] }).items.map(
         (item) => [item.id, item.status],
@@ -1114,6 +1133,62 @@ describe('/v1/deploy', () => {
       expect(api.requests.some((r) => ['POST', 'DELETE'].includes(r.method))).toBe(false);
     });
 
+    test('a service that runs a revision may still redeploy and roll back when running revisions fill the budget', async () => {
+      for (let n = 1; n < HISTORY_TENANT_BUDGET; n++)
+        seedRevision(`s${n}`, 'prod', 1, { running: true });
+      seedRevision('web', 'prod', 1, {
+        running: true,
+        bundle: JSON.stringify(withReplicas(1, { bindings: [] })),
+      });
+      // The redeploy replaces web-prod.1, so the tenant holds one revision over the budget.
+      expect((await deployed(withReplicas(2))).id).toBe('web-prod.2');
+      expect(revisionKeys()).toHaveLength(HISTORY_TENANT_BUDGET + 1);
+      expect(stateOf('web-prod.1')).toBe('replaced');
+      // A new service would add a running revision: 507, and nothing is pruned for it.
+      const response = await post('/v1/deploy', deployBundle({ service: 'api', bindings: [] }));
+      expect(response.status).toBe(507);
+      expect(((await response.json()) as Json).detail).toContain(
+        `the ${HISTORY_TENANT_BUDGET} revisions running workloads fill`,
+      );
+      expect(revision('web-prod.1')).toBeDefined();
+      // A rollback of the running service re-applies web-prod.1, then evicts it to make room:
+      // the bundle lives on in web-prod.3. The next redeploy evicts web-prod.2 the same way.
+      const rollback = await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
+      expect(rollback.status).toBe(202);
+      expect(((await rollback.json()) as Json).id).toBe('web-prod.3');
+      expect(appliedReplicas()).toBe(1);
+      expect(revision('web-prod.1')).toBeUndefined();
+      expect(revisionKeys()).toHaveLength(HISTORY_TENANT_BUDGET + 1);
+      expect(await deployed(withReplicas(4))).toMatchObject({ id: 'web-prod.4' });
+      expect(revision('web-prod.2')).toBeUndefined();
+      expect(stateOf('web-prod.3')).toBe('replaced');
+      expect(revisionKeys()).toHaveLength(HISTORY_TENANT_BUDGET + 1);
+    });
+
+    // The API server's refusal passes through; a server error is the controller's 502.
+    for (const [status, answered] of [
+      [403, 403],
+      [503, 502],
+    ] as const)
+      test(`a WorkloadDeployment list that fails with ${status} fails the deploy before anything is written`, async () => {
+        await deployed(withReplicas(1));
+        for (let n = 2; n <= HISTORY_PER_SERVICE_ENV + 1; n++)
+          seedRevision('web', 'prod', n, { state: 'replaced' });
+        const before = new Map(stored);
+        api.requests.length = 0;
+        workloadListFailure = status;
+        const response = await post('/v1/deploy', withReplicas(2));
+        expect(response.status).toBe(answered);
+        // A failed read never counts as "no workloads": nothing is pruned, reserved or applied.
+        expect(
+          api.requests.filter((r) => ['DELETE', 'POST', 'PATCH', 'PUT'].includes(r.method)),
+        ).toEqual([]);
+        expect(stored).toEqual(before);
+        const rollback = await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
+        expect(rollback.status).toBe(answered);
+        expect((await get('/v1/deployments?env=prod')).status).toBe(answered);
+      });
+
     test('revisions are listed as metadata only, and only a rollback target is fetched whole', async () => {
       await deployed(withReplicas(1));
       await deployed(withReplicas(2));
@@ -1152,9 +1227,10 @@ describe('/v1/deploy', () => {
       expect(stateOf('web-prod.2')).toBe('pending');
       expect(stateOf('web-prod.1')).toBe('live');
       setReady('web-prod', 'True', '2026-10-01T00:00:00Z');
+      // web-prod.1 went live, but no deploy observed how its rollout ended.
       expect(await listed()).toEqual([
         ['web-prod.2', 'ready'],
-        ['web-prod.1', 'pending'],
+        ['web-prod.1', 'rolling'],
       ]);
       const stats = (await (await get('/v1/deployments/stats?env=prod')).json()) as Json;
       expect(stats).toMatchObject({ deployments: 2, ready: 1 });
@@ -1164,9 +1240,35 @@ describe('/v1/deploy', () => {
       expect(stateOf('web-prod.3')).toBe('live');
       expect(stateOf('web-prod.2')).toBe('replaced');
       expect(stateOf('web-prod.1')).toBe('replaced');
+      // The repair records that status; web-prod.2 gets the one the deploy observed.
+      expect(statusOf('web-prod.1')).toBe('rolling');
+      expect(statusOf('web-prod.2')).toBe('ready');
+      expect(await listed()).toEqual([
+        ['web-prod.3', 'pending'],
+        ['web-prod.2', 'ready'],
+        ['web-prod.1', 'rolling'],
+      ]);
       const rollback = await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
       expect(((await rollback.json()) as Json).id).toBe('web-prod.4');
       expect(appliedReplicas()).toBe(2);
+    });
+
+    test('a repair keeps a status a concurrent deploy recorded after the history read', async () => {
+      await deployed(withReplicas(1));
+      putConflicts = UPDATE_ATTEMPTS;
+      await deployed(withReplicas(2));
+      expect(stateOf('web-prod.1')).toBe('live');
+      // Between this deploy's history read and its repair, another deploy records `ready`.
+      const key = `${REVISIONS}web-prod.1`;
+      beforeRead.set(key, () => {
+        const object = stored.get(key) as { metadata: { annotations: Json } };
+        object.metadata.annotations['platform.di-framework.dev/status'] = 'ready';
+      });
+      await deployed(withReplicas(3));
+      expect(beforeRead.size).toBe(0);
+      expect(stateOf('web-prod.1')).toBe('replaced');
+      expect(statusOf('web-prod.1')).toBe('ready');
+      expect((await listed()).at(-1)).toEqual(['web-prod.1', 'ready']);
     });
 
     test('out-of-order concurrent applies: the revision the workload runs is the live one', async () => {
@@ -1210,6 +1312,18 @@ describe('/v1/deploy', () => {
         expect(response.status).toBe(422);
         expect(((await response.json()) as Json).detail).toContain(detail);
       }
+      expect(patches()).toHaveLength(0);
+    });
+
+    test('a rollback target a concurrent deploy pruned after the history read is a 404', async () => {
+      seedRevision('web', 'prod', 1, { state: 'replaced' });
+      seedRevision('web', 'prod', 2, { running: true });
+      pruned.add(`${REVISIONS}web-prod.1`);
+      const response = await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
+      expect(response.status).toBe(404);
+      expect(((await response.json()) as Json).detail).toBe(
+        'deployment web-prod.1 is not in the history of web in prod',
+      );
       expect(patches()).toHaveLength(0);
     });
 

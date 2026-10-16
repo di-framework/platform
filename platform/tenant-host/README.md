@@ -2,7 +2,8 @@
 
 Runtime image for tenant host groups (`tenant-<name>` Deployments in `di-runtime-<name>`). It is
 `wash` from wasmCloud tag `v2.8.0` (commit `5c4ec4a3d008b3f401d9e763515f434deebc9936`) built with the
-opt-in `wasi-tls` cargo feature and a per-registry insecure allowlist for OCI registries.
+opt-in `wasi-tls` cargo feature, a per-registry insecure allowlist for OCI registries, and
+credentials for NATS blobstore entries.
 
 The stock `ghcr.io/wasmcloud/wash:2.8.0` image is a default-features build. Its host world has no
 `wasi:tls`, so a component that imports `wasi:tls/client@0.3.0-draft` (the node:tls shim, for example
@@ -14,16 +15,19 @@ links `wasi:tls/client,types@0.3.0-draft` alongside the default interfaces.
 [`variants`](variants) is the one table that maps an image tag to the patches applied to the pinned
 source, in order. The Dockerfile fails a build whose `WASH_PATCHES` is not exactly the set listed for
 its `IMAGE_VERSION`, the publish workflow takes the set from it, and the patch-check workflow runs one
-job per row. Both variants carry 0002:
+job per row. Both variants carry 0002 and 0003:
 
 | Tag | Patches (in order) | Use |
 | --- | --- | --- |
-| `ghcr.io/di-framework/wash:2.8.0-wasi-tls` (canonical, the build default) | `0002-insecure-registry-allowlist.patch` | Every tenant host, including local Kubesolo/k0s clusters that pull from the in-cluster plain-HTTP registry. |
-| `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive` | `0001-exclusive-instance.patch` `0002-insecure-registry-allowlist.patch` | Only stacks that need exclusive instances (pglite on a persistent directory), by setting `tenantHostImage`. |
+| `ghcr.io/di-framework/wash:2.8.0-wasi-tls` (canonical, the build default) | `0002-insecure-registry-allowlist.patch` `0003-nats-blobstore-credentials.patch` | Every tenant host, including local Kubesolo/k0s clusters that pull from the in-cluster plain-HTTP registry. |
+| `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive` | `0001-exclusive-instance.patch` `0002-insecure-registry-allowlist.patch` `0003-nats-blobstore-credentials.patch` | Only stacks that need exclusive instances (pglite on a persistent directory), by setting `tenantHostImage`. |
 
 - **0002-insecure-registry-allowlist.patch** (#149, #175) adds `wash host --insecure-registry
   <host[:port]>` and the `WASH_INSECURE_REGISTRIES` environment variable: a per-registry plain-HTTP
   allowlist. See [Insecure registry allowlist](#insecure-registry-allowlist).
+- **0003-nats-blobstore-credentials.patch** (#330) lets a NATS blobstore entry authenticate with a
+  user and password read from files in the host pod (`user_file`, `password_file`). See
+  [NATS blobstore credentials](#nats-blobstore-credentials).
 - **0001-exclusive-instance.patch** (#136) adds the exclusive queueing pool policy, opted into per
   component with `localResources.config` key `di-framework.dev/exclusive-instance: "true"`. See
   [Exclusive instances](#exclusive-instances-wasi-tls-exclusive).
@@ -58,6 +62,60 @@ So pass the registry exactly as workload references spell it. The local stack's 
 `di-framework-registry.<namespace>.svc.cluster.local:5000` (`registry.pull` in
 `platform/platform/src/local.ts`), so that is the entry to pass for it; references written as
 `di-framework-registry:5000/...` need that short spelling listed too.
+
+## NATS blobstore credentials
+
+Stock wash 2.8.0 opens a NATS blobstore entry's connection (`backend: nats`, `NatsBlobProvider` in
+`crates/wash-runtime/src/plugin/wasi_blobstore/multiplexed/nats.rs`) from `url` alone. async-nats 0.49.1 does not send a user and password embedded in the url, so the
+connection is always anonymous. Isolating one entry's data with NATS accounts (#159) needs that
+entry to log in as its own user. 0003 adds two optional keys to the entry config:
+
+| Key | Value |
+| --- | --- |
+| `user_file` | Absolute path, inside the host pod, of a file holding the NATS user. |
+| `password_file` | Absolute path, inside the host pod, of a file holding the password. |
+
+```yaml
+hostInterfaces:
+  - namespace: wasmcloud
+    package: blobstore
+    interfaces: [blobstore, container, types]
+    config:
+      backend: nats
+      url: nats://di-nats.di-runtime-acme.svc.cluster.local:4222
+      user_file: /var/run/secrets/di-framework/registry-nats/username
+      password_file: /var/run/secrets/di-framework/registry-nats/password
+```
+
+- The config holds only paths. The platform mounts the Secret into the host pod (for example a
+  `kubernetes.io/basic-auth` Secret, whose `username` and `password` keys become the two files), and
+  the host reads the files when it opens the connection. The values never pass through the entry
+  config, the WorkloadDeployment or the operator.
+- Both keys or neither. One without the other, an empty value or a relative path fails the bind with
+  an error naming the key. A file that cannot be read or is empty fails it too; the error names the
+  key and the path, never the contents.
+- One trailing line ending (`\n` or `\r\n`) is dropped from each file, so a file written by `echo`
+  works; anything else, including spaces, is kept.
+- Pooling: entries share a connection only when `url` and both paths are equal. An entry with
+  credentials never shares a connection with an entry without them (or with other files), and an
+  entry with invalid credential keys is never pooled, so it fails instead of reusing another
+  entry's connection. The files are read once per connection, and async-nats reconnects with the
+  values it read then. A rotated Secret is used by the next connection, after the pooled one has
+  gone unused for the pool's idle period (5 minutes by default) or the host restarts.
+- Without the keys nothing changes: the entry connects with `async_nats::ConnectOptions::default()`,
+  which is what stock wash's `async_nats::connect(url)` uses, and is pooled by `url` as before.
+- Not supported: NATS `.creds` (JWT) and nkey files. Both need async-nats' `nkeys` feature, which the
+  pinned wash does not enable; turning it on would change `Cargo.lock`, and `--locked` builds would
+  need the patch to carry that. User and password is what NATS accounts in a server config use.
+- Who may set the keys is decided by admission, not by the host: whoever can write an entry's
+  config can name any file the host can read. Platform admission (#159) admits them only from the
+  platform controller, only on the tenant registry's inline entry, only together, and only with
+  exactly `/var/run/secrets/di-framework/registry-nats/username` and `.../password`, the read-only
+  mount of the registry's credentials Secret; `di-bs-*` / `di-binding-*` config never carries them.
+  See the platform README, "Upgrading to a registry in its own NATS account".
+- Scope: only the `backend: nats` provider of the multiplexed blobstore plugins (`wasi:blobstore`
+  and `wasmcloud:blobstore`). The host's own NATS blobstore plugin, which uses the `wash host` data
+  NATS connection, and the NATS keyvalue and messaging backends are unchanged.
 
 ## What is built
 
@@ -151,8 +209,15 @@ components admitting calls. A call of the old revision that was queued, or arriv
 an error instead of opening the component again, so the new revision waits only for calls already
 in flight. This holds for every path that opens the component: the pooled calls, linked calls and
 the stores built through `new_store` (p2 HTTP and the messaging plugins), which check the stopped
-flag before and after waiting for the store lease. A registry entry goes away once no pool, permit or
-store refers to its gates.
+flag before and after waiting for the store lease (a store with no exclusive component waits for no
+lease and skips the second check). A registry entry goes away once no pool, permit or store refers
+to its gates.
+
+When a component attaches a gate that is already live, the host logs it at info level:
+`exclusive component's gate is already live`, with the component, its namespace and `keyed_by`
+(`volume mounts`, or `namespace and name (no volume mount)`). This is expected once per rollout,
+because the new revision resolves while the old one is still stopping; that log line is where the
+new revision starts waiting behind the old one.
 
 Limits of the guarantee:
 
@@ -168,8 +233,9 @@ Limits of the guarantee:
 - Two exclusive components with the same mounts (or the same name and namespace and no mounts) can
   never both be serving: the one that starts second waits for the first to stop and fails once the
   wait times out. With no mount the key is only the namespace and the name, so an unrelated
-  workload that reuses them is held back the same way; the host logs a warning naming the
-  component and namespace when a component with no mount attaches a gate that is already live.
+  workload that reuses them is held back the same way. The host does not tell this apart from a
+  rollout: both log the same info line, with `keyed_by` set to `namespace and name (no volume
+  mount)`, so give an exclusive component a volume mount (or a unique name) to rule it out.
 
 Consequences. Calls to an exclusive component are serialised, so its throughput is one call at a
 time. Waiting calls hold their request open for up to the wait timeout.
@@ -191,8 +257,8 @@ and a pod rescheduled to another node sees a different directory.
 
 **Image.** Published under its own tag, `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive`, with
 `org.opencontainers.image.version=2.8.0-wasi-tls-exclusive` and
-`dev.di-framework.wash.patches=0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch`
-(0001 stacked with the allowlist patch every variant carries). It never moves the canonical
+`dev.di-framework.wash.patches=0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch 0003-nats-blobstore-credentials.patch`
+(0001 stacked with the allowlist and NATS blobstore credential patches every variant carries). It never moves the canonical
 `2.8.0-wasi-tls` tag, and `DEFAULT_HOST_IMAGE` stays on the canonical digest. Use it only by setting
 `tenantHostImage` (digest-pinned) on a stack that needs it until it is proven.
 
@@ -214,11 +280,23 @@ way `workload_stop` does. They cover these cases:
 - a caller queued on the shared call permit when the workload is stopped is refused once admitted
   and builds nothing, and an instance being built during the stop is dropped instead of installed,
   so the next revision proceeds;
-- a store requested through `new_store` for a stopped workload is refused;
+- a store requested through `new_store` for a stopped workload is refused, and so is one that was
+  already waiting on the store lease when the workload stopped (the check after the wait);
 - a symlink to the old revision's directory shares its gate (the key is the canonical path).
-`tests/integration_exclusive_topology.rs` (needs the prebuilt test fixtures) covers the layout rule
-and a lone exclusive component loading and queueing real requests (it does not measure
-serialization; the live-store tests do). See [Tests](#tests) for the commands.
+`tests/integration_exclusive_topology.rs` (needs the prebuilt test fixtures) covers the layout rule,
+a lone exclusive component loading and queueing real requests (it does not measure
+serialization; the live-store tests do), a new revision waiting for the old one on the same host
+path, and what a caller sees of an HTTP trap: the trap fails only its own call, and the calls queued
+behind it are served by a fresh instance, never the faulted one. At the pinned wasmtime a guest
+trap ends the instance's event loop, so the pool reaps the instance whatever else happens. The HTTP
+handler's `trapped` flag covers a trap reported to a task that survives it; its retirement
+(`PoolSlot::finish`) is unit-tested in `exclusive_tests.rs`. The timed-out test there retires the
+instance from outside, because its guest never yields. The topology file also covers a real
+timeout: an `http-sleeper` `/wedge` call yields on an hour's sleep until the HTTP exchange timeout in
+`HttpTask` ends it, and that timeout retires the instance, so the calls queued behind it are served
+by a fresh instance. The test reruns itself in a child process with
+`WASH_HTTP_RESPONSE_TIMEOUT_SECS=1`, so the other tests keep the default. The patch-check workflow
+builds the fixtures and runs each of these tests by name. See [Tests](#tests) for the commands.
 
 ## Tests
 
@@ -230,22 +308,34 @@ git clone https://github.com/wasmCloud/wasmCloud /tmp/wasmcloud && cd /tmp/wasmc
 git checkout 5c4ec4a3d008b3f401d9e763515f434deebc9936
 P=/path/to/platform/tenant-host
 
-# canonical (2.8.0-wasi-tls): 0002 alone
-git apply "$P/0002-insecure-registry-allowlist.patch"
-cargo test -p wash-runtime --features wasi-tls --lib -- insecure_registr client_protocol test_image_pull_secret_to_oci_config
+# canonical (2.8.0-wasi-tls): 0002 then 0003
+git apply "$P/0002-insecure-registry-allowlist.patch" && git apply "$P/0003-nats-blobstore-credentials.patch"
+cargo test -p wash-runtime --features wasi-tls --lib -- insecure_registr client_protocol test_image_pull_secret_to_oci_config nats_blobstore_
 cargo test -p wash --features wasi-tls,host-component-plugins --lib -- insecure_registry
 
-# exclusive (2.8.0-wasi-tls-exclusive), on a clean checkout: 0001 then 0002
+# exclusive (2.8.0-wasi-tls-exclusive), on a clean checkout: 0001, 0002, then 0003
 git checkout -- . && git clean -fd
 git apply "$P/0001-exclusive-instance.patch" && git apply "$P/0002-insecure-registry-allowlist.patch"
-cargo test -p wash-runtime --features wasi-tls --lib -- insecure_registr client_protocol test_image_pull_secret_to_oci_config instance_pool instance_driver wire_
+git apply "$P/0003-nats-blobstore-credentials.patch"
+cargo test -p wash-runtime --features wasi-tls --lib -- insecure_registr client_protocol test_image_pull_secret_to_oci_config nats_blobstore_ instance_pool instance_driver wire_
 cargo test -p wash --features wasi-tls,host-component-plugins --lib -- insecure_registry
+
+# exclusive only: the topology tests need the wasm fixtures. The toolchain's bundled
+# wasm-component-ld (0.5.22 in 1.96.0) cannot link keyvalue-implements, so link with 0.5.24.
+cargo install --locked --root /tmp/wasm-component-ld/0.5.24 wasm-component-ld@0.5.24
+CARGO_TARGET_WASM32_WASIP2_LINKER=/tmp/wasm-component-ld/0.5.24/bin/wasm-component-ld cargo xtask build-fixtures
+cargo test -p wash-runtime --features wasi-tls --test integration_exclusive_topology
 ```
 
 0002's tests cover protocol selection (an allowlisted `host:port` is pulled over HTTP and anything
 else over HTTPS, checked against a loopback listener; `--allow-insecure-registries` makes every pull
 HTTP), the allowlist reaching the washlet's pull config, and `wash host` parsing of repeated flags,
-the comma-delimited `WASH_INSECURE_REGISTRIES`, trimming, and rejected entries. CI also runs
+the comma-delimited `WASH_INSECURE_REGISTRIES`, trimming, and rejected entries. 0003's tests
+(`nats_blobstore_`) cover parsing the credential keys (neither, both, one alone, empty, relative),
+pool keys (unchanged without credentials, separated by credentials, invalid entries unpooled),
+reading the files (line ending, empty and missing files, errors without contents), and the `CONNECT`
+a fake NATS server on a loopback listener receives: the user and password from the files, or none
+without the keys. CI also runs
 `cargo fmt --all -- --check`, clippy `-D warnings` for `-p wash` and `-p wash-runtime`, and
 `cargo check -p wash --features wasi-tls,host-component-plugins`.
 
@@ -257,7 +347,7 @@ podman run --rm localhost/di-framework/wash:2.8.0-wasi-tls --version
 
 # the exclusive variant
 podman build -t localhost/di-framework/wash:2.8.0-wasi-tls-exclusive \
-  --build-arg "WASH_PATCHES=0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch" \
+  --build-arg "WASH_PATCHES=0001-exclusive-instance.patch 0002-insecure-registry-allowlist.patch 0003-nats-blobstore-credentials.patch" \
   --build-arg IMAGE_VERSION=2.8.0-wasi-tls-exclusive platform/tenant-host
 ```
 
@@ -276,8 +366,8 @@ list (the stock image lists the same interfaces without it), followed by one exp
 
 ## Publish
 
-Reference: `ghcr.io/di-framework/wash:2.8.0-wasi-tls` (with the allowlist patch, 0002), or
-`ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive` (0001 and 0002).
+Reference: `ghcr.io/di-framework/wash:2.8.0-wasi-tls` (0002 and 0003), or
+`ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive` (0001, 0002 and 0003).
 
 The **Publish tenant host image** workflow
 ([`.github/workflows/tenant-host-image.yml`](../../.github/workflows/tenant-host-image.yml))
@@ -323,15 +413,27 @@ Latest published images (multi-arch index digests; the bot PR keeps this table c
 
 | Variant | Image |
 | --- | --- |
-| `wasi-tls` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:5f6419bd0293fd946e44f79ca0ba7e9f03dcf5459be9e1c64f1560b52cb64f78` |
-| `wasi-tls-exclusive` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:7c0c94291c088fa0c77b96efa37005ea58cf3eee585639935c93cf1b056d1f44` |
+| `wasi-tls` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:dd61810dc74af61c88b684fd26fcd8e030d41b8f0216a8cb1f7fdfa4242178b0` |
+| `wasi-tls-exclusive` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:4a1b3f1897152865b2c15e2350ec207ce9cae2a5ae0f7d493be180f772f51faa` |
 
-The pin PR never changes the platform default (`DEFAULT_HOST_IMAGE`); a maintainer moves it by hand.
+The same pin PR (`scripts/pin-artifact.ts`, #346) also updates the platform code that names host
+builds, from the [`variants`](variants) table: the canonical variant (its first row) moves the
+platform default (`DEFAULT_HOST_IMAGE` in `platform/platform/src/index.ts`) and the mentions of it
+below, and every variant whose patch set includes 0003 appends its digest to
+`NATS_CREDENTIALS_HOST_IMAGE_DIGESTS` (`platform/platform/src/tenancy/registry-nats.ts`). Older
+digests stay listed, since existing installs may still run them.
+
+An install that does not set `tenantHostImage` moves its tenant hosts to the new build on the first
+deploy of a platform release that contains a merged canonical pin; to hold a build, set
+`tenantHostImage` to its digest. The allowlist is under `platform/platform/src/tenancy/`, an input of
+the tenant-auth image, so merging a host pin PR that extends it also publishes tenant-auth and opens
+a second bot PR, `bot/pin-tenant-auth`.
 
 The tags are mutable. The platform default `hostImage` is pinned to the canonical index built with
-0002 (and without the unnamed-import lease, #13):
+0002 and 0003 (and without the unnamed-import lease, #13). The platform lets a tenant registry use
+its NATS credentials only on host images it knows carry 0003 (`NATS_CREDENTIALS_HOST_IMAGE_DIGESTS`):
 
-`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad`
+`ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:dd61810dc74af61c88b684fd26fcd8e030d41b8f0216a8cb1f7fdfa4242178b0`
 
 `tenantHostImage` overrides it. The workflow summary prints the digest of each later publish.
 Tenant hosts never run `--allow-insecure-registries`; with `insecureRegistry` they get
@@ -367,7 +469,7 @@ The registry Service is ClusterIP, so a node-pullable reference needs a NodePort
 Set the platform config used by the stack (`tenantHostImage` / `tenantHostImagePullPolicy`):
 
 ```sh
-pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad
+pulumi config set tenantHostImage ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:dd61810dc74af61c88b684fd26fcd8e030d41b8f0216a8cb1f7fdfa4242178b0
 pulumi config set tenantHostImagePullPolicy IfNotPresent
 ```
 
@@ -375,7 +477,7 @@ or, with `di-framework-kube`, in the `--platform-config` JSON:
 
 ```json
 {
-  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:d88158b0b09edd9fc3e79d787762697c60f65baf134d895529e85d6c47cd80ad",
+  "tenantHostImage": "ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:dd61810dc74af61c88b684fd26fcd8e030d41b8f0216a8cb1f7fdfa4242178b0",
   "tenantHostImagePullPolicy": "IfNotPresent"
 }
 ```

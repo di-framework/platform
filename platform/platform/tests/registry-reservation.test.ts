@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'bun:test';
-import { evaluate } from '@marcbachmann/cel-js';
 import {
   admissionResources,
   claimsRegistryHost,
@@ -21,6 +20,7 @@ import {
   VERSION,
 } from '../src/tenancy/resources';
 import { caCertificate, leafCertificate } from '../src/tenancy/tls';
+import { evaluate } from './support/cel';
 
 const controllerUser = 'system:serviceaccount:wasmcloud:di-platform-controller';
 const tenantUser = 'system:serviceaccount:wasmcloud:di-user-dev';
@@ -252,7 +252,7 @@ function renderedRegistryInterfaces(): HostInterfaceLike[] {
     caKey: ca.key,
   };
   const rendered = tenantAuthResources(tenant, cfg, {
-    members: ['alice'],
+    members: [{ name: 'alice', role: 'developer', suspended: false }],
     apiServer: { addresses: ['10.0.0.1'], port: 6443 },
     tls,
     clientSecret: 'c2VjcmV0',

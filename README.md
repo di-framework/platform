@@ -30,7 +30,7 @@ bun run lint
 bun run typecheck
 ```
 
-`bun install` sets `core.hooksPath` to `.githooks`. The pre-commit hook first refuses the commit if a staged file also has unstaged changes, because biome reads files from the working tree rather than the index; stage the changes (`git add`) or discard them (`git restore`). It then runs `bun typecheck` and `biome check --staged`. It does not rewrite files: if biome reports lint or format errors in staged files, the commit is refused. Run `bun run lint:fix`, stage the result, and commit again. The pre-push hook runs `bun test --coverage` and requires 100% line coverage.
+`bun install` sets `core.hooksPath` to `.githooks`. The pre-commit hook (`scripts/pre-commit.ts`) checks the content the commit records, not the working tree: it runs `bun typecheck` and `biome check` on the staged files. When the working tree has unstaged changes or untracked files, for example after `git add -p` or during `git commit <path>`, it runs those checks on a temporary copy of the index the commit records, so unstaged edits and untracked files neither fail nor pass the commit. It does not rewrite files: if biome reports lint or format errors in staged files, the commit is refused. Run `bun run lint:fix`, stage the result, and commit again. The pre-push hook runs `bun test --coverage` and requires 100% line coverage.
 
 `bun test` builds `@di-framework/platform`, `@di-framework/bindings`, `@di-framework/cloudfoundry`, and `@di-framework/cloudflare` before the test run. Build the SQLite provider from its package:
 
@@ -42,6 +42,18 @@ make smoke
 ```
 
 `make tools` installs the pinned wasm-tools, wac, and wasi-sdk. `make smoke` needs `wasmtime` on `PATH`.
+
+## Release
+
+Approving the Auto Tag run, or merging the release PR, is what publishes a release.
+
+1. A lockfile change on `main` (or a dispatch of **Auto Tag**) opens a `release/vX.Y.Z` PR with the version bump and enables auto-merge. The run then ends; it does not wait for the PR.
+2. Approve the PR's checks when GitHub holds them for approval. Once they pass, the PR merges.
+3. The merge starts Auto Tag's `tag` job. Approve that run when GitHub holds it for approval. It tags the merge commit `vX.Y.Z` and dispatches `release.yml`, which publishes to npm and creates the GitHub Release.
+
+If the merge's Auto Tag run is never approved, the next Auto Tag run tags and publishes the release first, even when an unrelated lockfile push started it. The `tag` job only tags a commit that is the merge of a `release/vX.Y.Z` PR from this repository and that sets version `X.Y.Z`.
+
+Recovery: dispatch **Auto Tag** with `tag_only: true`. It tags the version on `main` if it is untagged, and dispatches `release.yml` if no Release run exists for that tag. It does not open a new release PR. A Release run that exists but failed is not retried this way; re-run it from the Actions tab.
 
 ## Usage
 
@@ -57,13 +69,13 @@ Put binding classes in `src/bindings.ts`. The platform CLI discovers that file, 
 
 ```ts
 import { Container } from '@di-framework/core/decorators';
-import { KeyValue, Postgres, WasmCloudBinding } from '@di-framework/bindings';
+import { KeyValue, Postgres, PlatformBinding } from '@di-framework/bindings';
 
-@WasmCloudBinding('user-database', { config: { database: 'orders' } })
+@PlatformBinding('user-database', { config: { database: 'orders' } })
 @Container()
 export class UserDatabase extends Postgres {}
 
-@WasmCloudBinding('sessions', { interfaces: ['store', 'atomics'] })
+@PlatformBinding('sessions', { interfaces: ['store', 'atomics'] })
 @Container()
 export class Sessions extends KeyValue {}
 ```
@@ -92,9 +104,9 @@ di-framework platform service create postgres --name orders --target alpha \
 ```
 
 ```ts
-import { Postgres, WasmCloudBinding } from '@di-framework/bindings';
+import { Postgres, PlatformBinding } from '@di-framework/bindings';
 
-@WasmCloudBinding('orders-db', { serviceName: 'orders' })
+@PlatformBinding('orders-db', { serviceName: 'orders' })
 export class OrdersDatabase extends Postgres {}
 ```
 
@@ -133,7 +145,7 @@ di-framework platform cluster destroy local --yes
 
 Default loopback ports are Kubernetes `26443`, registry `25000`, and HTTP `28180`. Each must be a distinct integer from 1024 through 65535. Declare tenants and users in `Pulumi.<stack>.yaml`. Ports, outputs, and tenancy are in the [generated project README](platform/platform/assets/platform/README.md).
 
-`@di-framework/platform/existing` installs the same Kubernetes resources on a caller-owned cluster. `kubeconfig` is a required local file path. `di-framework-kube` uses this entrypoint. Call `createPlatform({ provider, installation })` when another program already owns the cluster and the Pulumi stack.
+`@di-framework/platform/existing` installs the same Kubernetes resources on a caller-owned cluster. `kubeconfig` is a required local file path. `di-framework-kube` uses this entrypoint. Call `createPlatform({ provider, installation })` when another program already owns the cluster and the Pulumi stack. Both entrypoints call `validatePlatformConfig` before their first resource, so invalid platform configuration fails before a cluster is created; a program that creates its own cluster should do the same.
 
 The CLI and kube share one project, backend, and stack for a given installation. Configuration keys, CRDs, admission, and backing-service contracts are in the [platform README](platform/platform/README.md).
 

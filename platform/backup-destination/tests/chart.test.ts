@@ -1,47 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { createHash } from 'node:crypto';
-import { chmod, mkdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-
-const version = '3.18.4';
-const checksums: Record<string, string> = {
-  'darwin-arm64': '041849741550b20710d7ad0956e805ebd960b483fe978864f8e7fdd03ca84ec8',
-  'darwin-amd64': '860a7238285b44b5dc7b3c4dad6194316885d7015d77c34e23177e0e9554af8f',
-  'linux-arm64': 'c0a45e67eef0c7416a8a8c9e9d5d2d30d70e4f4d3f7bea5de28241fffa8f3b89',
-  'linux-amd64': 'f8180838c23d7c7d797b208861fecb591d9ce1690d8704ed1e4cb8e2add966c1',
-};
-
-async function helm(): Promise<string> {
-  const found = Bun.which('helm');
-  if (found) return found;
-  const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
-  const os = process.platform === 'darwin' ? 'darwin' : 'linux';
-  const key = `${os}-${arch}`;
-  const expected = checksums[key];
-  if (!expected) throw new Error(`no helm checksum for ${key}`);
-  const dir = join(import.meta.dir, '..', '.tools');
-  const binary = join(dir, 'helm');
-  try {
-    await stat(binary);
-    return binary;
-  } catch {
-    await mkdir(dir, { recursive: true });
-  }
-  const archive = `helm-v${version}-${key}.tar.gz`;
-  const response = await fetch(`https://get.helm.sh/${archive}`);
-  if (!response.ok) throw new Error(`helm download failed: ${response.status}`);
-  const bytes = Buffer.from(await response.arrayBuffer());
-  const digest = createHash('sha256').update(bytes).digest('hex');
-  if (digest !== expected) throw new Error(`helm checksum mismatch: ${digest}`);
-  const tar = join(dir, archive);
-  await Bun.write(tar, bytes);
-  const extracted = Bun.spawn(['tar', '-xzf', tar, '-C', dir], { stdout: 'pipe', stderr: 'pipe' });
-  if ((await extracted.exited) !== 0) throw new Error('helm extract failed');
-  const nested = join(dir, `${os}-${arch}`, 'helm');
-  await Bun.write(binary, await Bun.file(nested).arrayBuffer());
-  await chmod(binary, 0o755);
-  return binary;
-}
+import { helm } from './support/helm.ts';
 
 const destinations = (out: string) =>
   out
@@ -142,19 +101,31 @@ describe('backup-destination chart', () => {
       pvc: { type: 'pvc', 'volumeClaimTemplate.size': '1Gi' },
       both: { type: 'both', bucket: 'b', existingSecret: 's', 'volumeClaimTemplate.size': '1Gi' },
     };
-    for (const values of Object.values(kinds)) {
-      for (const schedule of [null, '', '  ']) {
-        const missing = await template('di-tenant-alpha', { ...values, schedule });
-        expect(missing.code).not.toBe(0);
-        expect(missing.stderr).toContain('schedule is required');
-        expect(missing.stderr).toContain('"none" for on-demand backups only');
+    // Every render is its own helm process and none depends on another: start them together.
+    const renders = await Promise.all(
+      Object.values(kinds).map(async (values) => {
+        const [missing, bad, short, none] = await Promise.all([
+          Promise.all(
+            [null, '', '  '].map((schedule) =>
+              template('di-tenant-alpha', { ...values, schedule }),
+            ),
+          ),
+          template('di-tenant-alpha', { ...values, schedule: 'nightly' }),
+          template('di-tenant-alpha', { ...values, schedule: '0 2 * *' }),
+          template('di-tenant-alpha', { ...values, schedule: 'none' }),
+        ]);
+        return { missing, bad, short, none };
+      }),
+    );
+    for (const { missing, bad, short, none } of renders) {
+      for (const result of missing) {
+        expect(result.code).not.toBe(0);
+        expect(result.stderr).toContain('schedule is required');
+        expect(result.stderr).toContain('"none" for on-demand backups only');
       }
-      const bad = await template('di-tenant-alpha', { ...values, schedule: 'nightly' });
       expect(bad.code).not.toBe(0);
       expect(bad.stderr).toContain('schedule "nightly" must be a five-field UTC cron');
-      const short = await template('di-tenant-alpha', { ...values, schedule: '0 2 * *' });
       expect(short.code).not.toBe(0);
-      const none = await template('di-tenant-alpha', { ...values, schedule: 'none' });
       expect(none.code).toBe(0);
       expect(destinations(none.stdout)).toContain('kind: BackupDestination');
       expect(destinations(none.stdout)).not.toContain('schedule:');
@@ -165,7 +136,7 @@ describe('backup-destination chart', () => {
 
   test('schedule rejects crons the operator can never fire, and accepts valid ones', async () => {
     const base = { bucket: 'b', existingSecret: 's' };
-    for (const schedule of [
+    const invalid = [
       '60 * * * *',
       '*/0 * * * *',
       '5- * * * *',
@@ -179,20 +150,26 @@ describe('backup-destination chart', () => {
       '*-5 * * * *',
       '0  2 * * *',
       '0 2 * * * *',
-    ]) {
-      const result = await template('di-tenant-alpha', { ...base, schedule });
-      expect(result.code).not.toBe(0);
-      expect(result.stderr).toContain('must be a five-field UTC cron');
-    }
-    for (const schedule of [
+    ];
+    const valid = [
       '0 2 * * *',
       '*/15 0-2 1,15 1-6 1-5',
       '30 3 * * 7',
       '0 0 29 2 *',
       '59 23 31 12 0-7/7',
       'none',
-    ]) {
-      const result = await template('di-tenant-alpha', { ...base, schedule });
+    ];
+    // Independent helm processes: render them together, then check each.
+    const render = (schedule: string) => template('di-tenant-alpha', { ...base, schedule });
+    const [refused, accepted] = await Promise.all([
+      Promise.all(invalid.map(render)),
+      Promise.all(valid.map(render)),
+    ]);
+    for (const result of refused) {
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain('must be a five-field UTC cron');
+    }
+    for (const result of accepted) {
       expect(result.stderr).toBe('');
       expect(result.code).toBe(0);
     }
@@ -217,6 +194,59 @@ describe('backup-destination chart', () => {
     expect(both.code).toBe(0);
     expect(destinations(both.stdout).match(/schedule: "\*\/15 1-5 \* \* 1-3"/g)?.length).toBe(2);
   });
+
+  test('schedules are written trimmed and held to the CRD maxLength (#254 S1, S2)', async () => {
+    const base = { bucket: 'b', existingSecret: 's', 'sources[0].workloadName': 'identity' };
+    const padded = await template('di-tenant-alpha', {
+      ...base,
+      schedule: '  0 2 * * *  ',
+      'sources[0].schedule': ' 30 3 * * * ',
+    });
+    expect(padded.stderr).toBe('');
+    expect(padded.code).toBe(0);
+    const written = destinations(padded.stdout);
+    expect(written).toContain('schedule: "0 2 * * *"\n');
+    expect(written).toContain('- kind: workload-volume\n      schedule: 30 3 * * *\n');
+    const paddedNone = await template('di-tenant-alpha', {
+      ...base,
+      'sources[0].schedule': ' none ',
+    });
+    expect(destinations(paddedNone.stdout)).toContain('      schedule: none\n');
+    // Every value the chart writes matches the CRD pattern, so `kubectl apply` cannot refuse it.
+    const crd = await Bun.file(`${import.meta.dir}/../chart/crds/backups.yaml`).text();
+    const pattern = new RegExp(/pattern: '(\^\(none\|[^']+)'/.exec(crd)?.[1] ?? '$^');
+    for (const value of written.matchAll(/schedule: "?([^"\n]+)"?\n/g)) {
+      expect(pattern.test(value[1] ?? '')).toBe(true);
+    }
+    // 128 characters is the CRD limit, for the destination and every source.
+    const longest = `10${',0'.repeat(59)} * * * *`;
+    const tooLong = `0${',0'.repeat(60)} * * * *`;
+    expect([longest.length, tooLong.length]).toEqual([128, 129]);
+    const fits = await template('di-tenant-alpha', {
+      ...base,
+      schedule: longest,
+      'sources[0].schedule': ` ${longest} `,
+    });
+    expect(fits.stderr).toBe('');
+    expect(fits.code).toBe(0);
+    const destinationLong = await template('di-tenant-alpha', {
+      ...base,
+      schedule: tooLong,
+      'sources[0].schedule': 'none',
+    });
+    expect(destinationLong.code).not.toBe(0);
+    expect(destinationLong.stderr).toContain(
+      'schedule must be at most 128 characters (it has 129)',
+    );
+    const sourceLong = await template('di-tenant-alpha', {
+      ...base,
+      'sources[0].schedule': tooLong,
+    });
+    expect(sourceLong.code).not.toBe(0);
+    expect(sourceLong.stderr).toContain(
+      'source identity: schedule must be at most 128 characters (it has 129)',
+    );
+  }, 30000);
 
   test('the CRD describes schedule without a default', async () => {
     const text = await Bun.file(`${import.meta.dir}/../chart/crds/backups.yaml`).text();
@@ -333,6 +363,10 @@ describe('backup-destination chart', () => {
     );
     expect(runtime).toContain('resources: ["configmaps"]\n    verbs: ["create"]');
     expect(tenant).not.toContain('configmaps');
+    // Ledger Events (#254) are created where the ledger is, and nowhere else.
+    expect(runtime).toContain('resources: ["events"]\n    verbs: ["create"]');
+    expect(tenant).not.toContain('events');
+    expect(rendered.stdout.match(/resources: \["events"\]/g)?.length).toBe(1);
     expect(tenant).toContain(
       'resources: ["leases"]\n    resourceNames: ["di-backup-operator"]\n    verbs: ["get", "patch"]',
     );
@@ -512,14 +546,14 @@ describe('backup-destination chart', () => {
       ],
       [{ 'sources[0].schedule': '* * * * *' }, 'every source needs a workloadName'],
     ];
-    for (const [values, message] of refusals) {
-      const refused = await template('di-tenant-alpha', {
-        bucket: 'b',
-        existingSecret: 's',
-        ...values,
-      });
-      expect(refused.code).not.toBe(0);
-      expect(refused.stderr).toContain(message);
-    }
+    const refused = await Promise.all(
+      refusals.map(([values]) =>
+        template('di-tenant-alpha', { bucket: 'b', existingSecret: 's', ...values }),
+      ),
+    );
+    refusals.forEach(([, message], i) => {
+      expect(refused[i]?.code).not.toBe(0);
+      expect(refused[i]?.stderr).toContain(message);
+    });
   }, 30000);
 });

@@ -155,6 +155,8 @@ describe('/v1 dispatch', () => {
   test('/v1 operations still require a credential', async () => {
     const response = await fetch(`${base}/v1/deployments?env=prod`);
     expect(response.status).toBe(401);
+    expect(response.headers.get('www-authenticate')).toBe('Bearer realm="di-framework-tenant"');
+    expect((await problem(response)).title).toBe('Unauthorized');
   });
 
   test('the auth routes keep their behaviour', async () => {

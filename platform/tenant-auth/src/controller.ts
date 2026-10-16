@@ -12,15 +12,21 @@ import { AuthError, IdentityResolver, type Principal } from './identity.ts';
 import { createApiKey, type KeyStore, listApiKeys, revokeApiKey } from './keys.ts';
 import {
   asUser,
+  type ConfigMapResource,
   inClusterCredentials,
   KubeClient,
   KubeError,
   loadKubeconfig,
+  MEMBERS_CONFIG,
+  type PublishedMember,
+  publishedMembers,
+  type UserResource,
   type UserTokens,
 } from './kube.ts';
 import { discover, type ProviderMetadata } from './oidc.ts';
+import { type RegistryListener, serveRegistryListener } from './registry-listener.ts';
 import { controllerSecretReader } from './v1/context.ts';
-import { serveV1 } from './v1/index.ts';
+import { serveV1, TITLES } from './v1/index.ts';
 import {
   PASSTHROUGH,
   servePassthrough,
@@ -57,10 +63,18 @@ export interface ControllerConfig {
    */
   registryConfigured: boolean;
   /**
-   * Plain-HTTP listener serving only `GET /v1/auth/whoami`, for the tenant registry component on
-   * the tenant's hosts (platform#83). NetworkPolicy admits only the host pods to it. Unset: none.
+   * Listener serving only `GET /v1/auth/whoami`, for the tenant registry component on the
+   * tenant's hosts (platform#83). NetworkPolicy admits only the host pods to it. Unset: none.
+   * With `tlsCert` and `tlsKey` it serves TLS with the same certificate as `port` (platform#113)
+   * and, unless `whoamiTlsOnly`, plain HTTP on the same port too, so a registry still configured
+   * with an `http://` URL keeps working during an upgrade. Without them: plain HTTP only.
    */
   whoamiPort?: number;
+  /**
+   * Refuse plain HTTP on the whoami listener (`TENANT_CONTROLLER_WHOAMI_TLS_ONLY=true`): only
+   * TLS connections are served. Default false. Has no effect without a certificate.
+   */
+  whoamiTlsOnly?: boolean;
   /**
    * TLS listener (same certificate as `port`) that fronts the tenant registry: every request is
    * forwarded to the tenant hosts with `Host: registryHost`. The gateway passes TLS for the
@@ -100,6 +114,14 @@ export interface ControllerConfig {
   /** Whether the pull listener uses TLS (default); false when hosts pull over plain HTTP. */
   registryPullTls: boolean;
   /**
+   * How long a host pull waits for the registry workload to come up
+   * (`TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS`, default 30 s; #197). After a host starts,
+   * its workloads pull while `di-tenant-registry` on the same host is still starting; the pull
+   * listener retries until the registry answers instead of failing the pull, which wash would
+   * only retry about a minute later.
+   */
+  registryPullWaitMs: number;
+  /**
    * In-cluster registry host workloads reference (`TENANT_CONTROLLER_REGISTRY_PULL_HOST`);
    * `/v1/deploy` points users at it when a workload names the public origin instead.
    */
@@ -111,7 +133,48 @@ export interface ControllerConfig {
   hostPullTokenFile?: string;
 }
 
-/** Idle timeout of the registry front's client sockets; any data flow resets it (Bun's max is 255). */
+/** The whoami listener serves `GET` only, so it never needs a request body. */
+export const WHOAMI_MAX_BODY_BYTES = 1024;
+
+/**
+ * Most connections the whoami listener holds at once. Only the tenant hosts' registry calls it;
+ * each connection is relayed and holds three sockets (see `RegistryListenerOptions`).
+ */
+export const WHOAMI_MAX_CONNECTIONS = 256;
+
+/**
+ * How long a whoami caller may take to send a request before the listener answers, so a caller
+ * trickling bytes cannot hold one of the {@link WHOAMI_MAX_CONNECTIONS}. Whoami takes no body.
+ */
+export const WHOAMI_REQUEST_TIMEOUT_SECONDS = 30;
+
+/**
+ * The whoami listener (platform#83) on `port`: with `tls`, TLS with the controller certificate
+ * (platform#113), which the tenant hosts trust through `--http-client-ca-path`, and plain HTTP on
+ * the same port unless `whoamiTlsOnly`, for a registry whose config still names `http://` while
+ * an upgrade rolls out. Without `tls`, plain HTTP as before.
+ */
+export function serveWhoamiListener(
+  controller: Pick<Controller, 'handleWhoami'>,
+  config: Pick<ControllerConfig, 'host' | 'whoamiTlsOnly'>,
+  port: number,
+  tls: { cert: string; key: string } | undefined,
+): Promise<RegistryListener> {
+  return serveRegistryListener({
+    hostname: config.host,
+    port,
+    tls,
+    acceptPlainHttp: !config.whoamiTlsOnly,
+    // Token refreshes through the identity guest can take longer than Bun's 10 s default.
+    idleTimeoutSeconds: 120,
+    maxRequestBodySize: WHOAMI_MAX_BODY_BYTES,
+    maxConnections: WHOAMI_MAX_CONNECTIONS,
+    requestTimeoutSeconds: WHOAMI_REQUEST_TIMEOUT_SECONDS,
+    fetch: (request) => controller.handleWhoami(request),
+  });
+}
+
+/** Idle timeout of the registry front's client sockets; any data flow resets it. */
 export const REGISTRY_IDLE_TIMEOUT_SECONDS = 120;
 
 /**
@@ -120,6 +183,177 @@ export const REGISTRY_IDLE_TIMEOUT_SECONDS = 120;
  */
 export const REGISTRY_PULL_MAX_BODY_BYTES = 1024;
 const DEFAULT_REGISTRY_MAX_BODY_BYTES = 512 * 1024 * 1024;
+/** Backoff between host pull attempts while the registry is starting (#197). */
+const REGISTRY_PULL_RETRY_INITIAL_MS = 250;
+const REGISTRY_PULL_RETRY_MAX_MS = 2_000;
+
+/**
+ * Whether a host's answer comes from the host rather than the registry workload: wash answers a
+ * `Host` no workload serves yet with an empty 404 (and its own gateway errors with an empty 502 or
+ * 503), while the registry's errors always carry an OCI JSON body with its `content-type`.
+ */
+export function registryNotServing(response: Response): boolean {
+  return [404, 502, 503].includes(response.status) && !response.headers.has('content-type');
+}
+
+/** Largest registry error body read for its OCI code; the registry's own is about 120 bytes. */
+const REGISTRY_ERROR_BODY_MAX_BYTES = 16 * 1024;
+
+/**
+ * Whether a registry answer is its own `503` with OCI error code `UNAVAILABLE`: the registry sends
+ * it while the tenant controller's whoami cannot be reached (a controller restart, an identity
+ * issuer outage), so a host pull may wait it out like a registry that is still starting.
+ *
+ * On a GET, only a JSON body of at most {@link REGISTRY_ERROR_BODY_MAX_BYTES} is read, from a
+ * clone, so the response stays whole; a body that is cut off, unreadable, not JSON, or not read
+ * before `signal` aborts is not `UNAVAILABLE`. A HEAD answer has no body to read the code from, so
+ * any `503` with a JSON `content-type` counts: that is the registry's only `503` (its `unavailable`
+ * answer in `oci-registry/src/auth.rs`), while the host's own gateway errors carry no content type.
+ */
+export async function registryUnavailable(
+  response: Response,
+  options: { head?: boolean; signal?: AbortSignal } = {},
+): Promise<boolean> {
+  if (response.status !== 503) return false;
+  const type = response.headers.get('content-type') ?? '';
+  if (!/^application\/(?:[\w.+-]+\+)?json(?:\s*;|$)/i.test(type.trim())) return false;
+  if (options.head) return true;
+  if (!response.body) return false;
+  const text = await readCapped(response.clone(), REGISTRY_ERROR_BODY_MAX_BYTES, options.signal);
+  if (text === undefined) return false;
+  try {
+    const body = JSON.parse(text) as { errors?: unknown };
+    return (
+      Array.isArray(body.errors) &&
+      body.errors.some(
+        (error) =>
+          typeof error === 'object' &&
+          error !== null &&
+          (error as { code?: unknown }).code === 'UNAVAILABLE',
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** A response body as text, or undefined when it exceeds `max`, fails, or `signal` aborts. */
+async function readCapped(
+  response: Response,
+  max: number,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  const reader = response.body?.getReader();
+  if (!reader) return '';
+  const stop = () => {
+    reader.cancel().catch(() => {});
+  };
+  signal?.addEventListener('abort', stop, { once: true });
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      if (signal?.aborted) return undefined;
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > max) {
+        stop();
+        return undefined;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return undefined;
+  } finally {
+    signal?.removeEventListener('abort', stop);
+  }
+  if (signal?.aborted) return undefined;
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
+/** A slot of a registry request pool; both calls are idempotent. */
+interface PoolSlot {
+  /** Takes the slot; false when the pool is full. */
+  acquire(): boolean;
+  release(): void;
+}
+
+function poolSlot(pool: { inFlight: number }, max: number): PoolSlot {
+  let held = false;
+  return {
+    acquire() {
+      if (held) return true;
+      if (pool.inFlight >= max) return false;
+      pool.inFlight++;
+      held = true;
+      return true;
+    },
+    release() {
+      if (!held) return;
+      held = false;
+      pool.inFlight--;
+    },
+  };
+}
+
+function registryBusy(): Response {
+  return problem(503, 'Service Unavailable', 'the tenant registry is busy; retry shortly');
+}
+
+/** One host pull attempt: the answer, or the connection failure (an abort is rethrown). */
+async function attemptPull(
+  send: () => Promise<Response>,
+  signal: AbortSignal,
+): Promise<{ response?: Response; failure?: unknown }> {
+  try {
+    return { response: await send() };
+  } catch (error) {
+    if (signal.aborted) throw error;
+    return { failure: error };
+  }
+}
+
+/** The last attempt's answer, or its failure once the wait is over. */
+function settle(outcome: { response?: Response; failure?: unknown }): Response {
+  if (outcome.response) return outcome.response;
+  throw outcome.failure;
+}
+
+/**
+ * Pauses `delay`, doubling it each time, until a slot is free again; returns the next delay, or
+ * undefined when none frees up before `deadline`.
+ */
+async function pauseForSlot(
+  delay: number,
+  deadline: number,
+  signal: AbortSignal,
+  slot: PoolSlot,
+): Promise<number | undefined> {
+  let next = delay;
+  for (;;) {
+    await pause(next, signal);
+    next = Math.min(next * 2, REGISTRY_PULL_RETRY_MAX_MS);
+    if (slot.acquire()) return next;
+    if (Date.now() + next > deadline) return undefined;
+  }
+}
+
+/** Resolves after `ms`, or rejects with the signal's reason once it aborts. */
+function pause(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 function positiveInteger(value: string | undefined, name: string, fallback: number): number {
   if (!value) return fallback;
@@ -257,6 +491,25 @@ function registryChallenge(): Response {
 /** The user the whoami listener reports for the host pull token. */
 export const HOST_PULL_USER = 'system:tenant-host';
 
+/**
+ * The single `Content-Encoding` values `fetch` decodes before handing out the body. A proxied
+ * body sent with one of these is already plain, so the header must not be relayed (#71); any
+ * other value (a multi-coding list, an unknown coding) leaves the body untouched and is relayed as is.
+ */
+const DECODED_ENCODINGS = new Set(['gzip', 'x-gzip', 'deflate', 'br', 'zstd']);
+
+/**
+ * Whether `fetch` already decoded a body sent with this `Content-Encoding`: it ignores empty and
+ * `identity` entries in a list, and decodes what is left only when that is one known coding.
+ */
+function fetchDecoded(header: string): boolean {
+  const codings = header
+    .split(',')
+    .map((coding) => coding.trim().toLowerCase())
+    .filter((coding) => coding !== '' && coding !== 'identity');
+  return codings.length === 0 || (codings.length === 1 && DECODED_ENCODINGS.has(codings[0] ?? ''));
+}
+
 /** Headers never relayed back from the registry: hop-by-hop. */
 const HOP_BY_HOP_RESPONSE = new Set(['connection', 'keep-alive', 'transfer-encoding']);
 
@@ -281,6 +534,7 @@ export function configFromEnv(env = process.env): ControllerConfig {
     cliClientId: env.TENANT_CONTROLLER_CLI_CLIENT_ID ?? 'tenant-cli',
     registryUrl: registryOrigin(env.TENANT_CONTROLLER_REGISTRY_URL, tenant),
     whoamiPort: optionalPort(env.TENANT_CONTROLLER_WHOAMI_PORT, 'TENANT_CONTROLLER_WHOAMI_PORT'),
+    whoamiTlsOnly: env.TENANT_CONTROLLER_WHOAMI_TLS_ONLY === 'true',
     registryFrontPort: optionalPort(
       env.TENANT_CONTROLLER_REGISTRY_FRONT_PORT,
       'TENANT_CONTROLLER_REGISTRY_FRONT_PORT',
@@ -312,6 +566,11 @@ export function configFromEnv(env = process.env): ControllerConfig {
       'TENANT_CONTROLLER_REGISTRY_PULL_PORT',
     ),
     registryPullTls: env.TENANT_CONTROLLER_REGISTRY_PULL_TLS !== 'false',
+    registryPullWaitMs: positiveInteger(
+      env.TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS,
+      'TENANT_CONTROLLER_REGISTRY_PULL_WAIT_MS',
+      30_000,
+    ),
     registryPullHost: env.TENANT_CONTROLLER_REGISTRY_PULL_HOST || undefined,
     hostPullTokenFile: env.TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE || undefined,
   };
@@ -319,12 +578,52 @@ export function configFromEnv(env = process.env): ControllerConfig {
 
 export const tenantNamespaces = (tenant: string) => [`di-tenant-${tenant}`, `di-runtime-${tenant}`];
 
+/** Characters `encodeURIComponent` escapes that a path segment may carry as they are. */
+const SEGMENT_SAFE = /%(3A|40|24|26|2B|2C|3B|3D)/g;
+
+/**
+ * The one spelling of an API server path that the proxy checks and forwards (#116), or
+ * `undefined` when the path is ambiguous. Each segment is percent-decoded once and re-encoded the
+ * same way, so `%73ecrets` and `secrets` are one path to the policy and to the API server.
+ * Refused, rather than guessed at: a path not starting with `/`, an empty segment other than a
+ * trailing slash (`//secrets`), a malformed escape, and any segment that decodes to `.` or `..`,
+ * or to text containing `/`, `\`, `%` (double encoding) or a control character.
+ */
+export function canonicalPath(pathname: string): string | undefined {
+  if (!pathname.startsWith('/')) return undefined;
+  const segments = pathname.slice(1).split('/');
+  const out: string[] = [];
+  for (const [index, raw] of segments.entries()) {
+    if (raw === '') {
+      if (index === segments.length - 1) {
+        out.push('');
+        continue;
+      }
+      return undefined;
+    }
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(raw);
+    } catch {
+      return undefined;
+    }
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are refused.
+    if (decoded === '.' || decoded === '..' || /[/\\%\u0000-\u001f\u007f]/.test(decoded))
+      return undefined;
+    out.push(encodeURIComponent(decoded).replace(SEGMENT_SAFE, (kept) => decodeURIComponent(kept)));
+  }
+  return `/${out.join('/')}`;
+}
+
 /**
  * Which API server paths a tenant user may reach through this controller. Namespaced paths must
  * name one of the tenant's namespaces; discovery and self-subject reviews are allowed so kubectl
- * works; everything cluster-scoped is refused regardless of the user's RBAC.
+ * works; everything cluster-scoped is refused regardless of the user's RBAC. The decision is made
+ * on `canonicalPath(pathname)`, and a path without one is refused (#116).
  */
-export function allowed(method: string, pathname: string, tenant: string): boolean {
+export function allowed(method: string, rawPathname: string, tenant: string): boolean {
+  const pathname = canonicalPath(rawPathname);
+  if (pathname === undefined) return false;
   const namespaces = tenantNamespaces(tenant);
   const namespaced =
     /^\/api\/v1\/namespaces\/([^/]+)(\/|$)/.exec(pathname) ??
@@ -345,7 +644,7 @@ export function allowed(method: string, pathname: string, tenant: string): boole
   return false;
 }
 
-/** Secret objects and collections in any namespace, as the raw proxy sees them. */
+/** Secret objects and collections in any namespace, matched on the canonical path (#116). */
 const SECRET_PATH = /^\/api\/v1\/namespaces\/[^/]+\/secrets(\/|$)/;
 
 /** A Kubernetes Status object, so kubectl prints the reason instead of a parse error. */
@@ -367,6 +666,50 @@ const json = (body: unknown, code = 200) =>
     status: code,
     headers: { 'Content-Type': 'application/json' },
   });
+
+/**
+ * The `/v1` contract's paths, whose every error is an RFC 9457 problem+json (the contract's
+ * `Problem`). Everything else the main listener serves keeps the Kubernetes Status shape.
+ */
+const isV1 = (pathname: string) => pathname.startsWith('/v1/');
+
+/** The `/v1` bearer challenge (RFC 6750). */
+const BEARER_CHALLENGE = 'Bearer realm="di-framework-tenant"';
+
+/**
+ * A non-empty bearer token was sent. Only then does a 401 say `invalid_token`: a request with no
+ * credential, another scheme, or an empty `Bearer` gets the bare challenge (RFC 6750 §3.1).
+ */
+const BEARER_PRESENTED = /^Bearer\s+\S/i;
+
+/**
+ * An {@link AuthError} as a `/v1` problem: 401 carries the bearer challenge. The detail is the
+ * error's fixed message, which never quotes the credential (platform#97).
+ */
+function v1Refusal(error: AuthError, authorization: string | null): Response {
+  const response = problem(error.status, TITLES[error.status] ?? 'Client Error', error.message);
+  if (error.status === 401)
+    response.headers.set(
+      'www-authenticate',
+      BEARER_PRESENTED.test(authorization ?? '')
+        ? `${BEARER_CHALLENGE}, error="invalid_token"`
+        : BEARER_CHALLENGE,
+    );
+  return response;
+}
+
+/** An {@link AuthError} in the caller's shape: a problem under `/v1/`, a Kubernetes Status elsewhere. */
+function refusal(request: Request, url: URL, error: AuthError): Response {
+  if (isV1(url.pathname)) return v1Refusal(error, request.headers.get('authorization'));
+  return status(error.status, error.status === 401 ? 'Unauthorized' : 'Forbidden', error.message);
+}
+
+/** A 502 with a fixed message (platform#84), in the caller's shape like {@link refusal}. */
+function unavailable(url: URL, message: string): Response {
+  return isV1(url.pathname)
+    ? problem(502, 'Bad Gateway', message)
+    : status(502, 'ServiceUnavailable', message);
+}
 
 /** A `docker-content-length` value usable as `Content-Length`: plain digits, safe integer (a duplicated header joins with a comma and fails). */
 export function parseSideContentLength(value: string | null): string | undefined {
@@ -580,14 +923,10 @@ export class Controller {
         if (error.status === 503) {
           return this.serviceUnavailableUntilDiscovery();
         }
-        return status(
-          error.status,
-          error.status === 401 ? 'Unauthorized' : 'Forbidden',
-          error.message,
-        );
+        return refusal(request, url, error);
       }
       this.audit('request.failed', { path: url.pathname, reason: String(error) });
-      return status(502, 'ServiceUnavailable', 'the identity provider or cluster is unavailable');
+      return unavailable(url, 'the identity provider or cluster is unavailable');
     }
     // A proxy session URL (not a contract operation): forwarded to the session's service.
     const clientAddress = server?.requestIP(request)?.address;
@@ -616,15 +955,12 @@ export class Controller {
         return await this.own(request, url, principal);
       return await this.proxy(request, url, principal);
     } catch (error) {
-      if (error instanceof AuthError)
-        return status(
-          error.status,
-          error.status === 401 ? 'Unauthorized' : 'Forbidden',
-          error.message,
-        );
+      if (error instanceof AuthError) return refusal(request, url, error);
+      // The reason can name ServiceAccounts, namespaces, RBAC text, or the API server URL: it
+      // stays in the audit, and the caller gets a fixed message (platform#84).
       const reason = error instanceof KubeError ? error.message : String(error);
       this.audit('request.failed', { user: principal.user, path: url.pathname, reason });
-      return status(502, 'ServiceUnavailable', reason);
+      return unavailable(url, 'the cluster request failed');
     }
   }
 
@@ -662,11 +998,7 @@ export class Controller {
           reason: error.message,
         });
         if (error.status === 503) return this.serviceUnavailableUntilDiscovery();
-        return problem(
-          error.status,
-          error.status === 401 ? 'Unauthorized' : 'Forbidden',
-          error.message,
-        );
+        return v1Refusal(error, authorization);
       }
       this.audit('request.failed', {
         path: url.pathname,
@@ -802,15 +1134,9 @@ export class Controller {
       await request.body?.cancel().catch(() => {});
       return registryChallenge();
     }
-    if (pool.inFlight >= this.config.registryMaxConcurrent)
-      return problem(503, 'Service Unavailable', 'the tenant registry is busy; retry shortly');
-    pool.inFlight++;
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      pool.inFlight--;
-    };
+    const slot = poolSlot(pool, this.config.registryMaxConcurrent);
+    if (!slot.acquire()) return registryBusy();
+    const release = slot.release;
     const headers = upstreamRequestHeaders(
       request,
       url,
@@ -837,21 +1163,37 @@ export class Controller {
             done: armHeaderTimer,
           })
         : null;
-    if (!body) armHeaderTimer();
+    if (!body && withBody) armHeaderTimer();
+    const signal = AbortSignal.any([request.signal, timeout.signal, stall.signal]);
+    const send = () =>
+      fetch(`${this.proxyUpstream(this.config.tenant)}${url.pathname}${url.search}`, {
+        method: request.method,
+        headers,
+        body,
+        duplex: 'half',
+        redirect: 'manual',
+        decompress: false,
+        signal,
+      } as RequestInit);
     let upstream: Response;
     try {
-      upstream = await fetch(
-        `${this.proxyUpstream(this.config.tenant)}${url.pathname}${url.search}`,
-        {
-          method: request.method,
-          headers,
-          body,
-          duplex: 'half',
-          redirect: 'manual',
-          decompress: false,
-          signal: AbortSignal.any([request.signal, timeout.signal, stall.signal]),
-        } as RequestInit,
-      );
+      // A host pull carries no body, so it can be resent while the registry is starting (#197).
+      // Each attempt gets the full header timeout, so the wait is bounded only by
+      // `registryPullWaitMs` and never ends in a 504 while the host keeps answering.
+      const attempt = async () => {
+        armHeaderTimer();
+        try {
+          return await send();
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      const answer = withBody
+        ? await send()
+        : await this.untilRegistryAnswers(attempt, signal, url, slot, request.method === 'HEAD');
+      // No slot came free for a waiting pull before its wait was over (it holds none).
+      if (!answer) return registryBusy();
+      upstream = answer;
     } catch (error) {
       release();
       const timedOut = timeout.signal.aborted;
@@ -876,9 +1218,10 @@ export class Controller {
         out.append(name, value);
       }
     });
-    // Bun.serve writes an implicit `Content-Length: 0` on a HEAD response with an empty body, which
-    // misreports the entity size. The registry therefore sends the size as `docker-content-length`
-    // on HEAD; restore it here. Accept only a single plain-digit safe integer, otherwise drop it.
+    // The registry's host rejects a declared `Content-Length` on an empty HEAD body, so the registry
+    // sends the size as `docker-content-length` on HEAD; restore it here. Accept only a single
+    // plain-digit safe integer, otherwise drop it. A GET keeps the registry's own `Content-Length`,
+    // which the registry listener writes as is (#197).
     if (request.method === 'HEAD') {
       const length = parseSideContentLength(dockerContentLength);
       if (length !== undefined) out.set('content-length', length);
@@ -887,6 +1230,71 @@ export class Controller {
       status: upstream.status,
       headers: out,
     });
+  }
+
+  /**
+   * Sends a host pull until the registry workload answers it (#197), for at most
+   * `registryPullWaitMs`. After a host (re)start its workloads pull while `di-tenant-registry` on
+   * the same host is still starting: the host then refuses the connection, or answers the empty
+   * 404 wash gives a `Host` no workload serves yet. Both are retried with a short backoff, as is
+   * the registry's own `503 UNAVAILABLE` (it cannot reach this controller's whoami yet; told by
+   * its OCI code on a GET and by its JSON `content-type` on a HEAD, see
+   * {@link registryUnavailable}); any other answer from the registry itself (its errors are OCI
+   * JSON) is final. Reading a `503` body for its code is bounded by `registryUpstreamTimeoutMs`.
+   * The wait is bounded and only delays this one pull, so a host that serves the registry is never
+   * held back by it.
+   *
+   * The pool slot is given back between attempts, so pulls waiting out a host restart do not
+   * turn away the other pulls; an attempt takes a slot again first, and a pull that finds none
+   * free before the wait is over gets undefined (answered as busy).
+   */
+  private async untilRegistryAnswers(
+    send: () => Promise<Response>,
+    signal: AbortSignal,
+    url: URL,
+    slot: PoolSlot,
+    head: boolean,
+  ): Promise<Response | undefined> {
+    const deadline = Date.now() + this.config.registryPullWaitMs;
+    let delay = REGISTRY_PULL_RETRY_INITIAL_MS;
+    for (let tries = 0; ; tries++) {
+      const outcome = await attemptPull(send, signal);
+      const reason = await this.pullRetryReason(outcome, signal, head);
+      // Without a reason to retry, the attempt has the registry's final answer.
+      if (reason === undefined) return outcome.response;
+      if (Date.now() + delay > deadline) return settle(outcome);
+      await outcome.response?.body?.cancel().catch(() => {});
+      if (tries === 0)
+        this.audit('registry.waiting', { path: url.pathname, listener: 'registry-pull', reason });
+      slot.release();
+      const next = await pauseForSlot(delay, deadline, signal, slot);
+      if (next === undefined) return undefined;
+      delay = next;
+    }
+  }
+
+  /**
+   * Why a host pull attempt is retried (#197), or undefined when its answer is final: a failed
+   * attempt, the host's own answer while the registry is not serving, or the registry's
+   * `503 UNAVAILABLE`. Only a `503` can be that, so only a `503` starts a body-read timer.
+   */
+  private async pullRetryReason(
+    outcome: { response?: Response; failure?: unknown },
+    signal: AbortSignal,
+    head: boolean,
+  ): Promise<string | undefined> {
+    const { response } = outcome;
+    if (!response) return String(outcome.failure);
+    if (registryNotServing(response))
+      return `the host answered ${response.status} before the registry was serving`;
+    if (response.status !== 503) return undefined;
+    const bodyRead = AbortSignal.any([
+      signal,
+      AbortSignal.timeout(this.config.registryUpstreamTimeoutMs),
+    ]);
+    const unavailable = await registryUnavailable(response, { head, signal: bodyRead });
+    signal.throwIfAborted();
+    return unavailable ? 'the registry answered 503 UNAVAILABLE' : undefined;
   }
 
   /** Registry front requests in flight (see {@link handleRegistry}). */
@@ -932,18 +1340,9 @@ export class Controller {
       return new Response(null, { status: 204 });
     }
     if (route === 'GET /-/members') {
-      const { items } = await this.kube.listUsers();
-      const members = items
-        .flatMap((u) =>
-          u.spec.memberships
-            .filter((m) => m.tenant === this.config.tenant)
-            .map((m) => ({
-              user: u.metadata.name,
-              role: m.role,
-              suspended: u.spec.suspended === true,
-            })),
-        )
-        .sort((a, b) => a.user.localeCompare(b.user));
+      const members = (await this.members())
+        .map(({ name, role, suspended }) => ({ user: name, role, suspended }))
+        .sort((a, b) => a.user.localeCompare(b.user) || a.role.localeCompare(b.role));
       return json({ members });
     }
     // The `/v1` contract goes through the generated routes, which validate the request and hand
@@ -963,10 +1362,55 @@ export class Controller {
     return status(404, 'NotFound', `${url.pathname} is not a controller endpoint`);
   }
 
+  /**
+   * The memberships behind `/-/members` (#321). The platform publishes each one with its role and
+   * suspension in {@link MEMBERS_CONFIG} `entries`, so no User is read. Older platforms are still
+   * served from Users (see {@link memberUsers}).
+   */
+  private async members(): Promise<PublishedMember[]> {
+    let published: ConfigMapResource | undefined;
+    try {
+      published = await this.kube.getConfigMap(this.keys.namespace, MEMBERS_CONFIG);
+    } catch (error) {
+      if (!(error instanceof KubeError && error.status === 403)) throw error;
+    }
+    const entries = published && publishedMembers(published);
+    if (entries) return entries;
+    return (await this.memberUsers(published)).flatMap((u) =>
+      u.spec.memberships
+        .filter((m) => m.tenant === this.config.tenant)
+        .map((m) => ({
+          name: u.metadata.name,
+          role: m.role,
+          suspended: u.spec.suspended === true,
+        })),
+    );
+  }
+
+  /**
+   * The Users behind `/-/members` on a platform that does not publish `entries` yet. With only the
+   * active members' names in `published` (the format before `entries`), each User is read by name:
+   * the platform grants reads on exactly those. Those names were active when published, and one
+   * suspended since answers 403 and is left out, so suspended members are not listed (as before).
+   * A platform without the ConfigMap (or no grant on it, a 403) still lets the controller list
+   * every User, which is the last fallback.
+   */
+  private async memberUsers(published: ConfigMapResource | undefined): Promise<UserResource[]> {
+    if (!published) return (await this.kube.listUsers()).items;
+    const names: unknown = JSON.parse(published.data?.members ?? '[]');
+    if (!Array.isArray(names) || !names.every((name) => typeof name === 'string'))
+      throw new Error(`${MEMBERS_CONFIG} does not list member names`);
+    const users = await Promise.all(names.map((name) => this.kube.getUser(name)));
+    return users.filter((user): user is UserResource => user !== undefined);
+  }
+
   // The Kubernetes API proxy.
 
   private async proxy(request: Request, url: URL, principal: Principal): Promise<Response> {
-    if (!allowed(request.method, url.pathname, this.config.tenant)) {
+    // The policy, the Secret redaction and the upstream request all use one canonical path, so
+    // an encoded spelling cannot pass the check and then mean something else upstream (#116).
+    const path = canonicalPath(url.pathname);
+    if (path === undefined || !allowed(request.method, path, this.config.tenant)) {
       this.audit('request.denied', {
         user: principal.user,
         method: request.method,
@@ -986,24 +1430,28 @@ export class Controller {
         : await request.arrayBuffer();
     const upstream = await asUser(this.kube, this.userTokens, principal).fetch(
       request.method,
-      `${url.pathname}${url.search}`,
+      `${path}${url.search}`,
       { headers: request.headers, body },
     );
     this.audit('request.proxied', {
       user: principal.user,
       via: principal.via,
       method: request.method,
-      path: url.pathname,
+      path,
       status: upstream.status,
     });
     // A Secret DELETE answers with the deleted object, data included (#112): developers may delete
     // Secrets but never read them, so a successful one is reported as a bare Status.
-    if (request.method === 'DELETE' && SECRET_PATH.test(url.pathname) && upstream.ok) {
+    if (request.method === 'DELETE' && SECRET_PATH.test(path) && upstream.ok) {
       await upstream.body?.cancel();
       return status(upstream.status, 'Success', 'secret deleted; its contents are not returned');
     }
+    // The relayed body is re-framed, so its length is the response's own to compute; a coding
+    // `fetch` already decoded is gone from the body and must go from the headers too (#71).
     const out = new Headers(upstream.headers);
     for (const name of ['content-length', 'transfer-encoding', 'connection']) out.delete(name);
+    const encoding = out.get('content-encoding');
+    if (encoding !== null && fetchDecoded(encoding)) out.delete('content-encoding');
     return new Response(upstream.body, { status: upstream.status, headers: out });
   }
 }
@@ -1023,32 +1471,27 @@ if (import.meta.main) {
     idleTimeout: 120,
     fetch: (request, server) => controller.handle(request, server),
   });
-  // The registry's whoami callback stays inside the cluster, so it is plain HTTP (platform#83).
-  if (config.whoamiPort)
-    Bun.serve({
-      hostname: config.host,
-      port: config.whoamiPort,
-      idleTimeout: 120,
-      fetch: (request) => controller.handleWhoami(request),
-    });
+  if (config.whoamiPort) await serveWhoamiListener(controller, config, config.whoamiPort, tls);
+  // The registry listeners run on `node:http`, not `Bun.serve`, so a streamed blob keeps the
+  // registry's `Content-Length` (#197; see `registry-listener.ts`).
   if (config.registryFrontPort)
-    Bun.serve({
+    await serveRegistryListener({
       hostname: config.host,
       port: config.registryFrontPort,
       tls,
       // Bounded (W2 of the platform#83 review): data flow resets the idle timeout, and bodies
       // beyond the cap are refused here too when they are chunked.
-      idleTimeout: REGISTRY_IDLE_TIMEOUT_SECONDS,
+      idleTimeoutSeconds: REGISTRY_IDLE_TIMEOUT_SECONDS,
       maxRequestBodySize: config.registryMaxBodyBytes,
       fetch: (request, server) => controller.handleRegistry(request, server),
     });
   // The tenant hosts' pulls (platform#83 `:host-pull`): TLS unless they pull over plain HTTP.
   if (config.registryPullPort)
-    Bun.serve({
+    await serveRegistryListener({
       hostname: config.host,
       port: config.registryPullPort,
       tls: config.registryPullTls ? tls : undefined,
-      idleTimeout: REGISTRY_IDLE_TIMEOUT_SECONDS,
+      idleTimeoutSeconds: REGISTRY_IDLE_TIMEOUT_SECONDS,
       maxRequestBodySize: REGISTRY_PULL_MAX_BODY_BYTES,
       fetch: (request, server) => controller.handleRegistryPull(request, server),
     });

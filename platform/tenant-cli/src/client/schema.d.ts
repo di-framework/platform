@@ -215,7 +215,10 @@ export interface paths {
          */
         put: operations["setSecret"];
         post?: never;
-        /** Unset a secret */
+        /**
+         * Unset a secret
+         * @description Deletes the secret; 404 when it does not exist, 409 naming the deployed workloads while any of them injects it.
+         */
         delete: operations["unsetSecret"];
         options?: never;
         head?: never;
@@ -277,7 +280,7 @@ export interface paths {
         put?: never;
         /**
          * Open an HTTP session to a service
-         * @description Issues a short-lived HTTP session to the service, bound to the caller. The session URL takes the same bearer.
+         * @description Issues a short-lived HTTP session to the service, bound to the caller. The session URL takes the same bearer. A new session replaces the caller's oldest once they hold the per-user limit; 429 when the controller already holds its maximum of live sessions, so retry later.
          */
         post: operations["proxy"];
         delete?: never;
@@ -300,7 +303,10 @@ export interface paths {
          */
         put: operations["setVar"];
         post?: never;
-        /** Unset a var */
+        /**
+         * Unset a var
+         * @description Removes the var; 404 when it does not exist. It succeeds while deployed workloads inject the environment's vars, with a `referenced` warning naming them.
+         */
         delete: operations["unsetVar"];
         options?: never;
         head?: never;
@@ -367,7 +373,7 @@ export interface components {
             /** @description sha256 digest of the pushed artifact. */
             digest: string;
         };
-        /** @description One `@WasmCloudBinding` of the component, rendered by the CLI. */
+        /** @description One `@PlatformBinding` of the component, rendered by the CLI. */
         Binding: {
             name: string;
             capability: string;
@@ -509,7 +515,7 @@ export interface components {
             level?: "debug" | "info" | "warn" | "error";
             message: string;
         };
-        /** @description A secret lists its name only; a var also carries its value. */
+        /** @description A var lists its name, value, and update time. Secrets list as `SecretEntry`. */
         ConfigEntry: {
             name: string;
             value?: string;
@@ -534,6 +540,15 @@ export interface components {
         };
         ConfigValue: {
             value: string;
+        };
+        /** @description The var was removed. `warnings` lists what may notice: `referenced` names the deployed workloads that inject the environment's vars (platform#100); empty when none do. */
+        VarUnset: {
+            warnings: {
+                /** @enum {string} */
+                code: "referenced";
+                detail: string;
+                deployments: string[];
+            }[];
         };
         ProxyRequest: {
             /** @enum {string} */
@@ -1148,11 +1163,20 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Unset a var */
-            204: {
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": {
+                        warnings: {
+                            /** @enum {string} */
+                            code: "referenced";
+                            detail: string;
+                            deployments: string[];
+                        }[];
+                    };
+                };
             };
         };
     };

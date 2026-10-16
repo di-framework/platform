@@ -60,7 +60,12 @@ interface types {
   /// - `json` and `jsonb` -> `json` (JSON text).
   /// - `timestamptz` -> `timestamp`, RFC 3339 in UTC (`2024-01-15T10:30:00Z`,
   ///   fractional seconds kept). `infinity` and `-infinity` are returned as
-  ///   those literals.
+  ///   those literals. This holds after a caller's own `SET TimeZone`: any
+  ///   ISO output is converted back to UTC. A value that cannot be converted
+  ///   (BC dates, years after 9999, or any output after `SET DateStyle` to
+  ///   `SQL`, `Postgres` or `German`) is returned as `text`, as PostgreSQL
+  ///   printed it. `infinity` and `-infinity` stay `timestamp` under every
+  ///   DateStyle. Reopening the connection pins both settings again.
   /// - `timestamp` (no zone) and `date` -> `text` (`2024-01-15 10:30:00`,
   ///   `2024-01-15`).
   /// - `uuid` and `numeric` -> `text`; arrays -> `text` as PostgreSQL array

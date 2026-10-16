@@ -6,7 +6,7 @@ import { type Args, type Context, logger, parseFlags, run } from './lib/cli.ts';
 import { sha256File } from './lib/fetch.ts';
 import { fileExists, isDirectory } from './lib/fs.ts';
 import { requiredPin } from './lib/versions.ts';
-import { databaseInterface, readWitVersion } from './lib/wit-version.ts';
+import { assertProviderWit, readWitVersion } from './lib/wit-version.ts';
 import { prepareEngine } from './prepare-engine.ts';
 
 const log = logger('build');
@@ -112,13 +112,7 @@ export async function buildComponent(ctx: Context, options: BuildOptions): Promi
   await Bun.write(join(dist, 'di-framework-pglite.wit'), wit);
 
   const witVersion = await readWitVersion(pkgDir);
-  const database = databaseInterface(witVersion);
-  if (!wit.includes(`export ${database}`)) {
-    throw new Error(`component does not export ${database} (see dist/di-framework-pglite.wit)`);
-  }
-  if (/(^|\s)import (wasi:sockets|di-framework:pglite-engine)/m.test(wit)) {
-    throw new Error('unexpected socket or unresolved engine import in bundled provider');
-  }
+  assertProviderWit(wit, witVersion);
 
   const notices = await Promise.all(
     THIRD_PARTY_NOTICE_FILES.map((f) => Bun.file(join(pkgDir, 'engine', f)).text()),

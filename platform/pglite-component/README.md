@@ -65,6 +65,32 @@ It fails if the final artifact imports sockets or leaves the engine unresolved.
 Ship `dist/di-framework-pglite.wasm` together with `THIRD-PARTY-NOTICES.txt`.
 Build provenance and checksums are in `dist/BUILD-INFO.txt` and `SHA256SUMS`.
 
+On one host architecture and one builder image, two clean engine builds are
+byte-identical. `scripts/build-engine.ts` sets `SOURCE_DATE_EPOCH` to the commit
+time of the pinned engine recipe (`PGLITE_SOURCE_REF`) and passes it into the
+build container. OpenSSL then writes that date into `crypto/buildinf.h`
+instead of the wall clock, so `libcrypto.a` is deterministic, and clang's
+`__DATE__`/`__TIME__` are fixed. `engine/build-pgcrypto.sh` fails if
+`buildinf.h` does not carry the pinned date. The engine does not link
+OpenSSL's build info today, so this guards against it being linked in later.
+`make reproducible` builds the engine twice from clean copies of the package
+and fails unless `pglite.wasi`, `engine.core.wasm`, `engine.wasm` and every
+embedded support file have the same sha256. The builds go in a new
+`df-pglite-repro.*` directory under the system temp dir, or under
+`REPRO_ARGS="--work-dir DIR"`, an existing directory outside the repository checkout.
+Only that new directory is deleted, and it is kept if a build fails or the
+digests differ. `--sdk-cache DIR` reuses SDK tarballs you have already
+downloaded, and `--keep` keeps both builds. The
+[reproducibility workflow](../../.github/workflows/pglite-engine-reproducible.yml)
+runs the check on x86_64 when an engine input changes.
+
+The results are not portable across these limits:
+- An aarch64 host and an x86_64 host produce different engines and support
+  files, so an Apple Silicon build does not reproduce the released x86_64
+  engine.
+- The builder image's `FROM debian:12` tag and its `apt-get` packages are not
+  pinned, so builds made months apart can differ.
+
 `make smoke` composes a real WIT consumer, runs it without network access, and
 checks typed parameters/results, SQL errors and recovery, transactions,
 rollback on close/drop, exclusive connection ownership, durability settings,
@@ -79,7 +105,7 @@ The pglite component is published to GitHub Container Registry (GHCR) as an OCI 
 The workflow has four jobs:
 - `check-source` (`packages: read`) hashes the committed input files (`scripts/source-check.ts`). On a push it skips the build when `ghcr.io/di-framework/pglite-component:src-<hash>` already exists, so commits that do not change the component publish nothing.
 - `build` (no write token) runs the same targets as `ci.yml`: `make tools-rust`, `make unit smoke` (which runs `make build`, composing the provider with the engine via `wac plug`), then the publisher crates' clippy and tests.
-- `publish` (`packages: write`) downloads the tested `dist/` and runs `pglite-component-publisher`. It never rebuilds or modifies `dist/`. It checks `SHA256SUMS`, requires the export `di-framework:pglite/database@0.2.0` and rejects any import that is not `wasi:*`, then pushes `ghcr.io/di-framework/pglite-component:<commit sha>` once, pulls it back by the manifest digest to compare bytes, then points the version tag (`0.2.0`, the WIT package version) at that same manifest with `oras tag` and asserts both tags resolve to one digest. The `build` job passes the tested wasm sha256 to `publish`, which verifies it before pushing. It also tags the manifest `src-<hash>`.
+- `publish` (`packages: write`) downloads the tested `dist/` and runs `pglite-component-publisher`. It never rebuilds or modifies `dist/`. It checks `SHA256SUMS`, requires the export `di-framework:pglite/database@0.2.0` and rejects any import that is not `wasi:*`, then pushes the layer, config and manifest with `oras` under `ghcr.io/di-framework/pglite-component:<commit sha>` only, pulls it back with `wash` by the manifest digest to compare bytes, and only then points the version tag (`0.2.0`, the WIT package version) at that same manifest with `oras tag` and asserts both tags resolve to one digest. A failed check leaves the version tag where it was. The manifest and config carry a fixed `created` time (the publish step clears `SOURCE_DATE_EPOCH`, so `1970-01-01T00:00:00Z`), so publishing an unchanged `di-framework-pglite.wasm` gives the same digest and the pin job has nothing to pin. The `build` job passes the tested wasm sha256 to `publish`, which verifies it before pushing. It also tags the manifest `src-<hash>`.
 - `pin` (`contents: write`, `pull-requests: write`) opens or updates the PR `bot/pin-pglite-component`, "chore: pin pglite-component to <digest>", which rewrites the digests in this README with `scripts/pin-artifact.ts`. GitHub does not run workflows on a PR that `GITHUB_TOKEN` opened, so a maintainer has to start its checks (close and reopen it) before merging. It also runs when a push's source is already published (a revert to an older source, or a pin PR closed unmerged), so `main`'s pin follows the current source; it opens no PR when `main` already has the digest. On that path the `realign` job (`packages: write`) points the moving version tag back at that source's digest with `scripts/retag.sh`, which leaves a tag that is already there alone. Every tag move is behind the same source guard, so a stale run never retags.
 
 Tags are movable. `0.2.0` always points to the latest `main` publish for WIT package 0.2.0, and re-running a commit also moves its SHA tag. Only the `@sha256:...` digest is immutable, so consumers pin by digest.
@@ -87,7 +113,7 @@ Tags are movable. `0.2.0` always points to the latest `main` publish for WIT pac
 ### Artifact location
 
 The digest is in **Details** > **Record component digest** > **Step summary**, and in the `pglite-publish-report` artifact (`publish-report.json`).
-Published digest: `ghcr.io/di-framework/pglite-component@sha256:4c6243bed7c30df93ef5a6c11c3070e3e777786fe4e34b3a63f4b89b8f75a523`
+Published digest: `ghcr.io/di-framework/pglite-component@sha256:42a5a38f61abb621643c8175fd4c9a8652778eb90edc458eb355625733fa4c33`
 
 **Note:** The GHCR package must be made public by an org admin after the first publish. Until then, only members with access to di-framework/platform can pull it.
 
@@ -125,7 +151,7 @@ wasmtime run --dir ./data::/data path/to/app.composed.wasm
 To use the published OCI component from GHCR instead (pin by digest for reproducibility):
 
 ```sh
-export PGLITE_REF='ghcr.io/di-framework/pglite-component@sha256:4c6243bed7c30df93ef5a6c11c3070e3e777786fe4e34b3a63f4b89b8f75a523'
+export PGLITE_REF='ghcr.io/di-framework/pglite-component@sha256:42a5a38f61abb621643c8175fd4c9a8652778eb90edc458eb355625733fa4c33'
 wash oci pull "${PGLITE_REF}" pglite.wasm
 wac plug --plug pglite.wasm path/to/app.wasm -o path/to/app.composed.wasm
 mkdir -p ./data
@@ -210,12 +236,24 @@ PostgreSQL type:
 | `float4`, `float8` | `real` | |
 | `bytea` | `blob` | |
 | `json`, `jsonb` | `json` | JSON text; `jsonb` is re-rendered by PostgreSQL (`{"a": 1}`) |
-| `timestamptz` | `timestamp` | RFC 3339 in UTC, e.g. `2024-01-15T10:30:00Z`, fractional seconds kept (`...:00.123Z`). `infinity` and `-infinity` are returned as those literals; BC dates are returned unmodified (`0044-03-15 00:00:00+00 BC`) |
+| `timestamptz` | `timestamp` | RFC 3339 in UTC, e.g. `2024-01-15T10:30:00Z`, fractional seconds kept (`...:00.123Z`). `infinity` and `-infinity` are returned as those literals. A value RFC 3339 cannot hold (BC dates, years after 9999) is `text`, as PostgreSQL printed it (`0044-03-15 00:00:00+00 BC`) |
 | `timestamp` (no zone) | `text` | `2024-01-15 10:30:00` (ISO, space separator, no offset). Deliberately not `timestamp`, which always denotes an instant |
 | `date` | `text` | `2024-01-15` |
 | `uuid`, `numeric` | `text` | canonical PostgreSQL text (`12.50` keeps its scale) |
 | arrays | `text` | PostgreSQL array literal, e.g. `{a,b}` |
 | everything else | `text` | |
+
+A caller can still change either setting with `SET` for the rest of the connection. `timestamptz`
+cells are parsed rather than trusted, so the `timestamp` variant always holds RFC 3339 in UTC (or
+an infinity):
+
+- After `SET TimeZone`, with `DateStyle` still ISO, PostgreSQL prints a local offset
+  (`2024-01-15 05:30:00.5-05`). The provider converts it back to UTC (`2024-01-15T10:30:00.5Z`).
+- After `SET DateStyle` to `SQL`, `Postgres` or `German`, the output cannot be converted reliably
+  (`15/01/2024 05:30:00.5 EST`), so it is returned as `text`, exactly as printed. `infinity` and
+  `-infinity` print the same under every DateStyle, so they stay `timestamp`.
+
+Closing and reopening the connection pins `DateStyle=ISO` and `TimeZone=UTC` again.
 
 Parameters are typed as follows. `integer`, `real`, `boolean` and `blob` are
 sent as `int8`, `float8`, `bool` and `bytea`. `text`, `json` and `timestamp`
@@ -269,6 +307,28 @@ engine routes to the host's WASI `random` interface. `gen_random_uuid()` is
 built into PostgreSQL and works without the extension. Other contrib modules
 are not included. The WIT interface does not change.
 
+Public-key PGP (`pgp_pub_encrypt`/`pgp_pub_decrypt`) works with ElGamal and RSA
+keys; pgcrypto cannot generate keys, so import them with `dearmor()`. For
+ElGamal, the ephemeral `k` comes from OpenSSL's DRBG (`BN_rand`), not from
+`pg_strong_random`. On WASI, OpenSSL seeds that DRBG from `getentropy`, which
+is the same WASI `random_get` import. It fails closed: if the host cannot
+supply entropy, the DRBG does not start and `pgp_pub_encrypt` raises an error
+instead of using a weak `k`.
+
+Blowfish (`bf`), CAST5 (`cast5`) and single DES (`des`) are unavailable in
+this build, because the OpenSSL legacy provider is not built or loaded.
+pgcrypto refuses them with `Cipher cannot be initialized`: in `encrypt()` and
+`decrypt()`, in the PGP functions, and when decrypting PGP messages that use
+them. `3des` (DES-EDE3) is in OpenSSL's default provider and still works, for
+legacy data only. Use `aes` (`aes128`, `aes192`, `aes256` for PGP). Password hashing with
+`crypt()` and `gen_salt('bf')`, `'md5'`, `'xdes'` or `'des'` is unaffected,
+because pgcrypto implements those itself.
+
+The engine has no `dlopen`. Its emulation keeps a fixed table of 64 loaded
+libraries per engine instance. pgcrypto resolves before that table and never
+uses a slot. A `LOAD` of a new library after the table is full fails with
+`dlopen table is full` and leaves the session usable.
+
 ## Persistence and ownership
 
 For an `open("/data/orders", ...)` call:
@@ -318,7 +378,8 @@ annotations provide storage; they do not enforce database ownership.
 - `src/pgwire.rs`: PostgreSQL message encoding and typed rows, over memory.
 - `src/engine.rs`: persistent filesystem setup and exclusive engine access.
 - `engine/bridge.wat`: private canonical ABI bridge to the core engine.
-- `engine/build-pgcrypto.sh`: builds OpenSSL libcrypto and pgcrypto in the engine container and generates pgcrypto's static `dlsym` table; `scripts/patch-engine-source.ts` links both into the engine.
+- `engine/build-pgcrypto.sh`: builds OpenSSL libcrypto and pgcrypto in the engine container and generates pgcrypto's static `dlsym` table; `scripts/patch-engine-source.ts` links both into the engine. The libcrypto build is cached under a key of the OpenSSL source tarball's sha256, the Configure options and `SOURCE_DATE_EPOCH`, so an OpenSSL version bump always rebuilds it.
+- `scripts/patch-engine-source.ts`: also replaces the upstream `dlopen` emulation's unbounded table (`dltab`) with the bounded one described under [Extensions](#extensions), and keeps pgcrypto's hook ahead of it.
 - `scripts/prepare-engine.ts`: pinned engine preparation and componentization (all build scripts are Bun TypeScript; see `scripts/`).
 - `wit/deps/pglite-engine/engine.wit`: internal interface, composed away at build.
 

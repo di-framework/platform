@@ -81,15 +81,20 @@ pub(crate) fn stream_response(
     response
 }
 
-pub(crate) fn error_response(status: u16, code: &str, message: &str) -> Response {
-    let body = serde_json::json!({
+/// An OCI error body: `{"errors":[{"code":..,"message":..}]}`.
+pub(crate) fn error_body(code: &str, message: &str) -> Vec<u8> {
+    serde_json::json!({
         "errors": [{ "code": code, "message": message }]
     })
-    .to_string();
+    .to_string()
+    .into_bytes()
+}
+
+pub(crate) fn error_response(status: u16, code: &str, message: &str) -> Response {
     respond(
         status,
         &[("content-type", "application/json")],
-        body.into_bytes(),
+        error_body(code, message),
     )
 }
 
@@ -102,11 +107,14 @@ pub(crate) fn method_not_allowed() -> Response {
 /// A `HEAD` response has an empty body and the runtime rejects a declared `content-length` with an
 /// empty body, so `HEAD` carries the size in the `docker-content-length` side header instead (the
 /// tenant controller restores `Content-Length` from it). `GET` carries a real `content-length`.
+///
+/// `len` is a `u64`, the blobstore's object size type: `usize` is 32 bits on `wasm32-wasip2`, so a
+/// blob of 4 GiB or more would report a wrapped length.
 pub(crate) fn entity_headers(
     head: bool,
     content_type: String,
     digest: String,
-    len: usize,
+    len: u64,
 ) -> Vec<(String, String)> {
     let length_header = if head {
         "docker-content-length"
@@ -150,5 +158,25 @@ mod entity_header_tests {
         );
         assert_eq!(get(&h, "content-length"), Some("0"));
         assert_eq!(get(&h, "docker-content-length"), None);
+    }
+
+    #[test]
+    fn lengths_past_32_bits_are_not_wrapped() {
+        // 4 GiB + 1 wraps to 1 in a 32-bit `usize`, which is what `wasm32-wasip2` has.
+        let len = u64::from(u32::MAX) + 2;
+        let head = entity_headers(
+            true,
+            "application/octet-stream".into(),
+            "sha256:ab".into(),
+            len,
+        );
+        assert_eq!(get(&head, "docker-content-length"), Some("4294967297"));
+        let full = entity_headers(
+            false,
+            "application/octet-stream".into(),
+            "sha256:ab".into(),
+            u64::MAX,
+        );
+        assert_eq!(get(&full, "content-length"), Some("18446744073709551615"));
     }
 }

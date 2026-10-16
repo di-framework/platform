@@ -1,6 +1,26 @@
 import { createHash } from 'node:crypto';
 import { backingServiceCrds, DELETION_POLICIES } from './backing-services';
 import { PRIVATE_IPV4_RANGES } from './egress';
+import {
+  JETSTREAM_ACCOUNT_INIT_SCRIPT,
+  NATS_BOX_IMAGE,
+  natsAccountsConfig,
+  REGISTRY_NATS_AUTH_ANNOTATION,
+  REGISTRY_NATS_MIGRATION,
+  REGISTRY_NATS_MIGRATION_COMPONENT,
+  REGISTRY_NATS_MIGRATION_DEADLINE_SECONDS,
+  REGISTRY_NATS_MIGRATION_JOB,
+  REGISTRY_NATS_MIGRATION_LIMITS,
+  REGISTRY_NATS_MIGRATION_SCRIPT,
+  REGISTRY_NATS_MOUNT,
+  REGISTRY_NATS_PASSWORD_ENV,
+  REGISTRY_NATS_PASSWORD_FILE,
+  REGISTRY_NATS_SECRET,
+  REGISTRY_NATS_USER_FILE,
+  REGISTRY_NATS_VOLUME,
+  registryNatsAuthDigest,
+  registryNatsSecretData,
+} from './registry-nats';
 import { hostStorage } from './workload-storage';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json | undefined };
 export interface Metadata {
@@ -77,6 +97,22 @@ export interface ControllerConfig {
   routeUrlPattern?: string;
   /** The per-tenant controller and console (#58); absent, the reconcile deploys neither. */
   tenantAuth?: TenantAuthConfig;
+  /** JetStream storage caps of each tenant's `di-nats` (#160); absent, the defaults apply. */
+  runtimeNats?: RuntimeNatsConfig;
+}
+/**
+ * JetStream storage caps of each tenant's runtime data-plane NATS (`di-nats`), rendered as
+ * `max_file_store` and `max_memory_store` in its server config. Each is a binary quantity: a
+ * positive integer count of bytes, optionally suffixed `Ki`, `Mi`, `Gi` or `Ti`.
+ */
+export interface RuntimeNatsConfig {
+  /** JetStream file storage on the tenant's host path (default `10Gi`). */
+  maxFileStore?: string;
+  /**
+   * JetStream memory storage (default `32Mi`); at most `64Mi`, half the 128Mi container limit,
+   * leaving the rest as headroom for nats-server itself.
+   */
+  maxMemoryStore?: string;
 }
 /**
  * Platform-level settings for each tenant's controller and console. The runtime env contract is
@@ -102,9 +138,17 @@ export interface TenantAuthConfig {
   issuerUpstreamPodPort?: number;
   /** The issuer's IPv4 when pods cannot resolve its hostname. */
   issuerIp?: string;
-  /** Browser-visible console URL; `{tenant}` is replaced. Default `http://127.0.0.1:8787`. */
+  /**
+   * Browser-visible console URL; `{tenant}` is replaced. Unset, `createPlatform` derives
+   * `http://console.{tenant}.localhost:<port>` from an `http://{host}.{tenant}.localhost`
+   * `routeUrlPattern` ({@link withDerivedPublicUrls}); otherwise `http://127.0.0.1:8787`.
+   */
   consolePublicUrl?: string;
-  /** Controller URL shown to users and CLIs; `{tenant}` is replaced. Default `https://127.0.0.1:8788`. */
+  /**
+   * Controller URL shown to users and CLIs; `{tenant}` is replaced. Unset, `createPlatform`
+   * derives `https://controller.{tenant}.localhost:<port>` from an
+   * `http://{host}.{tenant}.localhost` `routeUrlPattern`; otherwise `https://127.0.0.1:8788`.
+   */
   controllerPublicUrl?: string;
   /** Each tenant's own OCI registry (#83); absent, no registry is deployed. */
   registry?: TenantRegistryConfig;
@@ -112,7 +156,7 @@ export interface TenantAuthConfig {
 /**
  * The per-tenant registry: the `platform/oci-registry` component, run as a WorkloadDeployment on
  * the tenant's own hosts and backed by their data-plane blobstore. Its whoami callback goes to
- * the controller's plain-HTTP whoami listener; users reach it through the controller's TLS
+ * the controller's whoami listener over TLS (#113); users reach it through the controller's TLS
  * registry front.
  */
 export interface TenantRegistryConfig {
@@ -121,7 +165,9 @@ export interface TenantRegistryConfig {
   /**
    * Registry origin users log in to; `{tenant}` is replaced. `https://<label>.{tenant}.localhost:<port>`
    * on the gateway port is routed through the gateway (TLS passthrough to the registry front).
-   * Default `https://127.0.0.1:8790`, a port-forward to the registry front.
+   * Unset, `createPlatform` derives `https://registry.{tenant}.localhost:<port>` from an
+   * `http://{host}.{tenant}.localhost` `routeUrlPattern`; otherwise `https://127.0.0.1:8790`, a
+   * port-forward to the registry front.
    */
   publicUrl?: string;
   /**
@@ -142,7 +188,11 @@ export interface TenantRegistryLimits {
   /** How long an upload may deliver no byte before it is cut off, in ms (default 60000). */
   uploadIdleTimeoutMs?: number;
 }
-/** The controller's plain-HTTP listener serving only `GET /v1/auth/whoami` (#83). */
+/**
+ * The controller's listener serving only `GET /v1/auth/whoami` (#83): TLS with the controller
+ * certificate (#113), and plain HTTP on the same port for a registry whose config still names
+ * `http://` during an upgrade.
+ */
 export const WHOAMI_PORT = 8789;
 /** The controller's TLS front for the tenant registry (#83). */
 export const REGISTRY_FRONT_PORT = 8790;
@@ -172,6 +222,13 @@ const REGISTRY_PULL_USER = 'tenant-host';
 export function registryPullHost(tenant: string): string {
   return `${REGISTRY_PULL_SERVICE}.${names(tenant).runtimeNamespace}.svc`;
 }
+/**
+ * The name the tenant registry calls the controller's whoami listener by (#113): the controller
+ * Service in the runtime namespace, which {@link tenantControllerCertNames} always covers.
+ */
+export function registryWhoamiHost(tenant: string): string {
+  return `tenant-controller.${names(tenant).runtimeNamespace}.svc`;
+}
 /** The host pull Secret's data (base64): the token and the Docker config naming {@link registryPullHost}. */
 export function registryPullSecretData(tenant: string, token: string): Record<string, string> {
   const base64 = (text: string) => Buffer.from(text).toString('base64');
@@ -180,17 +237,39 @@ export function registryPullSecretData(tenant: string, token: string): Record<st
   };
   return { token: base64(token), 'config.json': base64(JSON.stringify(config)) };
 }
+/**
+ * One membership in the tenant, as {@link TENANT_MEMBERS_CONFIG} publishes it (#321). A suspended
+ * member is listed with `suspended: true` and gets no access.
+ */
+export interface TenantMember {
+  name: string;
+  role: 'developer' | 'viewer';
+  suspended: boolean;
+}
 /** Facts the controller gathers from the cluster for {@link tenantAuthResources}. */
 export interface TenantAuthInputs {
-  /** Names of the tenant's active members; each may mint tokens for `di-user-<name>`. */
-  members: string[];
+  /**
+   * The tenant's memberships, suspended ones included. Only the active members' names reach the
+   * RBAC: each may mint tokens for `di-user-<name>`.
+   */
+  members: TenantMember[];
   /** API server endpoint addresses and port (the `kubernetes` EndpointSlice). */
   apiServer: { addresses: string[]; port: number };
   /**
-   * The controller's serving leaf certificate and key, the CA certificate that issued it (the trust
-   * anchor clients pin) and the CA key (PEM). The CA key is kept in a Secret nothing mounts.
+   * The controller's serving leaf certificate and key, the CA certificate that issued it and the
+   * CA key (PEM). During a CA rotation (#170) `caNext` is the successor that does not sign yet and
+   * `caPrevious` the CA that `caCert` replaced; clients trust all of them (see
+   * `controllerTrustBundle`).
+   * The CA keys are kept in a platform-namespace Secret nothing mounts.
    */
-  tls: { cert: string; key: string; caCert: string; caKey: string };
+  tls: {
+    cert: string;
+    key: string;
+    caCert: string;
+    caKey: string;
+    caNext?: { cert: string; key: string };
+    caPrevious?: string;
+  };
   /** The shared OAuth client secret, base64 as read from the platform Secret; absent until it exists. */
   clientSecret?: string;
   /**
@@ -206,12 +285,46 @@ export interface TenantAuthInputs {
    * Secret or newly generated; absent, no pull Secret is rendered.
    */
   hostPullToken?: string;
+  /**
+   * The registry's NATS account (#159): `stopped` from the moment the controller stops the
+   * registry for the move of its object store until it can use its credentials, `credentials`
+   * once the store is in its account. Absent, the registry stays anonymous in `TENANT`.
+   */
+  registryNats?: RegistryNatsMode;
+}
+/** How the registry's blobstore entry reaches `di-nats` (#159); see {@link TenantAuthInputs}. */
+export type RegistryNatsMode = 'stopped' | 'credentials';
+/**
+ * Where the move of the registry's object store into its NATS account stands (#159):
+ * - `rollout`: `di-nats` and the hosts roll out with the account and the mount; the registry
+ *   still runs anonymously in `TENANT`.
+ * - `stopping`: both rolled out; the registry is stopped, and no Job exists until a later pass
+ *   has observed it stopped (no replica and no Workload left).
+ * - `migrating`: the migration Job exists or is created; the registry stays stopped.
+ * - `migrated`: the store is in `REGISTRY` (the Job succeeded or the marker says so).
+ */
+export type RegistryNatsStage = 'rollout' | 'stopping' | 'migrating' | 'migrated';
+/**
+ * The registry's NATS account on `di-nats` (#159), decided by the platform controller. Present
+ * while `tenantAuth.registry` is set and either the host image is a known build with wash patch
+ * 0003 or the move already started: the `REGISTRY` account, its credentials Secret and the hosts'
+ * read-only mount of it are rendered.
+ */
+export interface RegistryNats {
+  /** The registry user's password: the one in `di-nats-registry` while well formed, or new. */
+  password: string;
+  stage: RegistryNatsStage;
+  /** The host image is a known build with patch 0003, so the registry may use the credentials. */
+  credentials: boolean;
+  /** Why the migration Job failed (its `Failed` condition); delete the Job to retry. */
+  failed?: string;
 }
 /**
  * How the tenant hosts pull from their registry (#83 `:host-pull`), rendered once the registry
  * is deployed, whether or not its pull Secret exists yet: wash reads the Docker config from that
  * Secret, and over TLS trusts the tenant CA (`caDigest`, the digest of `tenant-controller-ca`, which rolls the hosts
- * when the certificate is renewed, since wash loads `--oci-ca-path` once at start).
+ * when the certificate is renewed, since wash loads `--oci-ca-path` and `--http-client-ca-path`
+ * once at start). The CA is trusted for both OCI pulls and the components' outgoing `wasi:http`.
  */
 export interface HostPull {
   caDigest?: string;
@@ -244,6 +357,105 @@ export function assertTenantAuthConfig(value: TenantAuthConfig | undefined): voi
     if (!Number.isSafeInteger(limit) || (limit as number) < 1)
       throw new Error(`tenantAuth.registry.limits.${key} must be a positive integer`);
   }
+}
+/** `di-nats` JetStream caps when the platform config sets none (#160). */
+export const RUNTIME_NATS_DEFAULTS = { maxFileStore: '10Gi', maxMemoryStore: '32Mi' } as const;
+/** Memory limit of the `di-nats` and `di-redis` containers, in MiB. */
+const BACKING_SERVICE_MEMORY_LIMIT_MIB = 128;
+/** The `di-nats` / `di-redis` container memory limit, as rendered on the pod. */
+export const BACKING_SERVICE_MEMORY_LIMIT = `${BACKING_SERVICE_MEMORY_LIMIT_MIB}Mi`;
+/**
+ * The largest `di-nats` JetStream memory store: half the container memory limit. The other half
+ * is headroom for nats-server itself (connections, buffers, file-store caches), so a full memory
+ * store is refused by JetStream (`insufficient resources`) instead of getting the pod OOM-killed.
+ */
+export const RUNTIME_NATS_MAX_MEMORY_STORE = `${BACKING_SERVICE_MEMORY_LIMIT_MIB / 2}Mi`;
+/** The ConfigMap in `di-runtime-<tenant>` holding the `di-nats` server config. */
+export const RUNTIME_NATS_CONFIG = 'di-nats-config';
+/** The `di-nats` image; its shell also runs the JetStream account init step (#159). */
+export const RUNTIME_NATS_IMAGE = 'nats:2.12.8-alpine';
+/** Pod template annotation carrying the server config digest, so a cap change restarts NATS. */
+export const RUNTIME_NATS_CONFIG_ANNOTATION = 'platform.di-framework.dev/nats-config-sha256';
+const BINARY_QUANTITY = /^([1-9][0-9]*)(Ki|Mi|Gi|Ti)?$/;
+const MIB = 2 ** 20;
+const BINARY_UNITS: Record<string, number> = {
+  '': 1,
+  Ki: 2 ** 10,
+  Mi: MIB,
+  Gi: 2 ** 30,
+  Ti: 2 ** 40,
+};
+function binaryBytes(value: unknown): number | undefined {
+  if (typeof value !== 'string') return undefined;
+  const match = BINARY_QUANTITY.exec(value);
+  if (!match) return undefined;
+  const bytes = Number(match[1]) * (BINARY_UNITS[match[2] ?? ''] ?? 1);
+  return Number.isSafeInteger(bytes) ? bytes : undefined;
+}
+/** Resolved `di-nats` JetStream caps, in bytes. */
+export interface RuntimeNatsLimits {
+  maxFileStore: number;
+  maxMemoryStore: number;
+}
+/**
+ * Validate a `runtimeNats` config and resolve its caps in bytes, defaults filled in. Throws on an
+ * unknown key, a value that is not a positive binary quantity, a cap below 1Mi, or a memory
+ * store above {@link RUNTIME_NATS_MAX_MEMORY_STORE}.
+ */
+export function runtimeNatsLimits(value: RuntimeNatsConfig | undefined): RuntimeNatsLimits {
+  const config: unknown = value === undefined ? {} : value;
+  if (typeof config !== 'object' || config === null || Array.isArray(config))
+    throw new Error('runtimeNats must be an object');
+  const known = Object.keys(RUNTIME_NATS_DEFAULTS);
+  for (const key of Object.keys(config))
+    if (!Object.hasOwn(RUNTIME_NATS_DEFAULTS, key))
+      throw new Error(`runtimeNats.${key} is not a known setting (${known.join(', ')})`);
+  const set = config as RuntimeNatsConfig;
+  const resolve = (key: keyof RuntimeNatsConfig): number => {
+    const raw = set[key] ?? RUNTIME_NATS_DEFAULTS[key];
+    const bytes = binaryBytes(raw);
+    if (bytes === undefined)
+      throw new Error(
+        `runtimeNats.${key} must be a positive binary quantity such as ${RUNTIME_NATS_DEFAULTS[key]} (got ${JSON.stringify(raw)})`,
+      );
+    if (bytes < MIB) throw new Error(`runtimeNats.${key} must be at least 1Mi`);
+    return bytes;
+  };
+  const limits = {
+    maxFileStore: resolve('maxFileStore'),
+    maxMemoryStore: resolve('maxMemoryStore'),
+  };
+  if (limits.maxMemoryStore > (BACKING_SERVICE_MEMORY_LIMIT_MIB / 2) * MIB)
+    throw new Error(
+      `runtimeNats.maxMemoryStore must be at most ${RUNTIME_NATS_MAX_MEMORY_STORE}, half the di-nats memory limit (${BACKING_SERVICE_MEMORY_LIMIT}); the rest is nats-server's own headroom`,
+    );
+  return limits;
+}
+/** Reject a `runtimeNats` config the reconcile could not render. */
+export function assertRuntimeNatsConfig(value: RuntimeNatsConfig | undefined): void {
+  runtimeNatsLimits(value);
+}
+/**
+ * The `di-nats` server config: JetStream on the tenant's host path (`/data`, the same store
+ * directory as the earlier `-js -sd /data` flags), bounded by `limits`. nats-server has no flag
+ * for either cap, so they are set in this file. Clients without credentials land in the `TENANT`
+ * account; with `registry` the registry's own `REGISTRY` account is added (#159, see
+ * `registry-nats.ts`).
+ */
+export function runtimeNatsServerConfig(
+  limits: RuntimeNatsLimits,
+  { registry = false }: { registry?: boolean } = {},
+): string {
+  return [
+    'port: 4222',
+    'jetstream {',
+    '  store_dir: "/data"',
+    `  max_file_store: ${limits.maxFileStore}`,
+    `  max_memory_store: ${limits.maxMemoryStore}`,
+    '}',
+    ...natsAccountsConfig(registry),
+    '',
+  ].join('\n');
 }
 /**
  * Each registry front limit and the controller env suffix it renders as
@@ -336,6 +548,50 @@ export function tenantAuthRoutes(
     else if (!problems.includes(shared)) problems.push(shared);
   }
   return { routes, urls, problems };
+}
+/** A `routeUrlPattern` the tenant-auth public URLs can be derived from; group 1 is `:<port>`. */
+const DERIVABLE_ROUTE_PATTERN = /^http:\/\/\{host\}\.\{tenant\}\.localhost(:\d+)?$/i;
+/** The tenant-auth public URLs `auth` leaves unset, by config path. */
+export function unsetPublicUrls(auth: TenantAuthConfig | undefined): string[] {
+  if (auth === undefined) return [];
+  return [
+    ...(auth.consolePublicUrl === undefined ? ['consolePublicUrl'] : []),
+    ...(auth.controllerPublicUrl === undefined ? ['controllerPublicUrl'] : []),
+    ...(auth.registry && auth.registry.publicUrl === undefined ? ['registry.publicUrl'] : []),
+  ];
+}
+/**
+ * `auth` with each unset public URL (`consolePublicUrl`, `controllerPublicUrl` and, with a
+ * registry, `registry.publicUrl`) derived from the published gateway's `routeUrlPattern`, so a
+ * fresh Tenant is routed without extra config: `http://console.{tenant}.localhost:<port>`,
+ * `https://controller.{tenant}.localhost:<port>` and `https://registry.{tenant}.localhost:<port>`
+ * on the gateway port (`:80` when the pattern names none). Explicit URLs are kept as given. Only
+ * an `http://{host}.{tenant}.localhost[:<port>]` pattern is derived from, since only those hosts
+ * are routed to the pair; with any other pattern, no `tenantAuth`, no `routeUrlPattern`, or every
+ * URL set, `auth` is returned unchanged and the `127.0.0.1` defaults apply, as before.
+ */
+export function withDerivedPublicUrls(
+  auth: TenantAuthConfig | undefined,
+  routeUrlPattern: string | undefined,
+): TenantAuthConfig | undefined {
+  const match = DERIVABLE_ROUTE_PATTERN.exec(routeUrlPattern ?? '');
+  if (auth === undefined || !match || unsetPublicUrls(auth).length === 0) return auth;
+  // The gateway port, explicit for the TLS hosts (https alone would mean 443) and omitted for the
+  // console when it is http's own 80, so its URL stays canonical.
+  const port = match[1] ?? ':80';
+  const url = (scheme: 'http' | 'https', label: string) =>
+    `${scheme}://${label}.{tenant}.localhost${scheme === 'http' && port === ':80' ? '' : port}`;
+  return {
+    ...auth,
+    consolePublicUrl: auth.consolePublicUrl ?? url('http', 'console'),
+    controllerPublicUrl: auth.controllerPublicUrl ?? url('https', 'controller'),
+    ...(auth.registry && {
+      registry: {
+        ...auth.registry,
+        publicUrl: auth.registry.publicUrl ?? url('https', 'registry'),
+      },
+    }),
+  };
 }
 /**
  * The registry workload's `wasi:http` host: the route label of a gateway-shaped
@@ -599,8 +855,20 @@ const editVerbs = [...readVerbs, 'create', 'update', 'patch', 'delete'];
  * The controller raises it only in the tenant-auth step, right before it applies those
  * Deployments, and keeps it raised only while they exist (#121).
  */
-function runtimeQuota(tenant: Tenant, cfg: ControllerConfig, withTenantAuth: boolean): Resource {
+function runtimeQuota(
+  tenant: Tenant,
+  cfg: ControllerConfig,
+  withTenantAuth: boolean,
+  /** The registry NATS migration Job's limits are added while it runs (#159). */
+  withMigration = false,
+): Resource {
   const resources = tenant.spec.resources ?? {};
+  const cpu = withTenantAuth
+    ? addQuantity(resources.cpu ?? '2', TENANT_AUTH_LIMITS.cpu, 'm')
+    : (resources.cpu ?? '2');
+  const memory = withTenantAuth
+    ? addQuantity(resources.memory ?? '4Gi', TENANT_AUTH_LIMITS.memory, 'Mi')
+    : (resources.memory ?? '4Gi');
   return resource(
     tenant,
     cfg.installation,
@@ -611,12 +879,12 @@ function runtimeQuota(tenant: Tenant, cfg: ControllerConfig, withTenantAuth: boo
     {
       spec: {
         hard: {
-          'limits.cpu': withTenantAuth
-            ? addQuantity(resources.cpu ?? '2', TENANT_AUTH_LIMITS.cpu, 'm')
-            : (resources.cpu ?? '2'),
-          'limits.memory': withTenantAuth
-            ? addQuantity(resources.memory ?? '4Gi', TENANT_AUTH_LIMITS.memory, 'Mi')
-            : (resources.memory ?? '4Gi'),
+          'limits.cpu': withMigration
+            ? addQuantity(cpu, REGISTRY_NATS_MIGRATION_LIMITS.cpu, 'm')
+            : cpu,
+          'limits.memory': withMigration
+            ? addQuantity(memory, REGISTRY_NATS_MIGRATION_LIMITS.memory, 'Mi')
+            : memory,
           pods: '20',
           // Aggregate compute/storage budget for runtime + controller-managed di-bs-* backends.
           // Per-service sizing still comes from BackingServiceClass parametersSchema (#450).
@@ -723,6 +991,8 @@ function tenantResources(
   tenantAuthNetwork = false,
   /** How the hosts pull from the tenant registry (#83 `:host-pull`); absent, they do not. */
   hostPull?: HostPull,
+  /** The registry's NATS account (#159); absent, `di-nats` has the `TENANT` account only. */
+  registryNats?: RegistryNats,
 ): Resource[] {
   const n = names(tenant.metadata.name);
   const storage = hostStorage(tenant, cfg, storageKeys);
@@ -735,6 +1005,9 @@ function tenantResources(
   ) => resource(tenant, cfg.installation, apiVersion, kind, name, namespace, body);
   const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
   const replicas = suspended ? 0 : (tenant.spec.runtime?.replicas ?? 1);
+  // The migration Job (#159) is rendered, and its pod fits the runtime quota, only while the move
+  // is under way.
+  const migrationJob = registryNats?.stage === 'migrating' && !suspended;
   const workloadRead = {
     apiGroups: ['runtime.wasmcloud.dev'],
     resources: ['workloaddeployments', 'workloads', 'workloadreplicasets', 'artifacts'],
@@ -742,7 +1015,7 @@ function tenantResources(
   };
   const result = [
     tenantQuota(tenant, cfg, registryQuota),
-    runtimeQuota(tenant, cfg, tenantAuthQuota),
+    runtimeQuota(tenant, cfg, tenantAuthQuota, migrationJob),
     make('rbac.authorization.k8s.io/v1', 'Role', 'di-developer', n.namespace, {
       rules: [
         workloadRead,
@@ -790,27 +1063,6 @@ function tenantResources(
     make('v1', 'ServiceAccount', 'di-runtime', n.runtimeNamespace, {
       automountServiceAccountToken: false,
     }),
-    // The controller reads hostgroup logs to publish the console logs projection (#10).
-    // Scoped to this tenant's runtime namespace; the host itself keeps no API token.
-    make('rbac.authorization.k8s.io/v1', 'Role', 'di-platform-log-reader', n.runtimeNamespace, {
-      rules: [{ apiGroups: [''], resources: ['pods/log'], verbs: ['get'] }],
-    }),
-    make(
-      'rbac.authorization.k8s.io/v1',
-      'RoleBinding',
-      'di-platform-log-reader',
-      n.runtimeNamespace,
-      {
-        roleRef: {
-          apiGroup: 'rbac.authorization.k8s.io',
-          kind: 'Role',
-          name: 'di-platform-log-reader',
-        },
-        subjects: [
-          { kind: 'ServiceAccount', name: 'di-platform-controller', namespace: cfg.namespace },
-        ],
-      },
-    ),
     make('v1', 'ConfigMap', 'di-tenant-stock', n.namespace, {
       data: {
         backend: 'redis',
@@ -924,6 +1176,26 @@ function tenantResources(
               { protocol: 'TCP', port: 4222 },
             ],
           },
+          // The registry object store migration Job reaches `di-nats` only (#159).
+          ...(registryNats
+            ? [
+                {
+                  from: [
+                    {
+                      namespaceSelector: {
+                        matchLabels: { 'kubernetes.io/metadata.name': n.runtimeNamespace },
+                      },
+                      podSelector: {
+                        matchLabels: {
+                          [`${GROUP}/component`]: REGISTRY_NATS_MIGRATION_COMPONENT,
+                        },
+                      },
+                    },
+                  ],
+                  ports: [{ protocol: 'TCP', port: 4222 }],
+                },
+              ]
+            : []),
         ],
         egress: [
           {
@@ -944,11 +1216,61 @@ function tenantResources(
       },
     }),
   );
-  for (const [name, image, port, args] of [
+  // The `di-nats` JetStream store lives on an unquotaed host path, so its server config caps
+  // file and memory storage (#160). The ConfigMap is applied before the Deployment that mounts it.
+  // The registry's account (#159) reads its password from the credentials Secret, which is
+  // applied before the Deployment too.
+  const natsConfig = runtimeNatsServerConfig(runtimeNatsLimits(cfg.runtimeNats), {
+    registry: !!registryNats,
+  });
+  const registryAuth = registryNats ? registryNatsAuthDigest(registryNats.password) : undefined;
+  if (registryNats)
+    result.push(
+      make('v1', 'Secret', REGISTRY_NATS_SECRET, n.runtimeNamespace, {
+        type: 'kubernetes.io/basic-auth',
+        data: registryNatsSecretData(registryNats.password),
+      }),
+    );
+  result.push(
+    make('v1', 'ConfigMap', RUNTIME_NATS_CONFIG, n.runtimeNamespace, {
+      data: { 'nats.conf': natsConfig },
+    }),
+  );
+  const natsConfigVolume = {
+    annotations: {
+      [RUNTIME_NATS_CONFIG_ANNOTATION]: createHash('sha256').update(natsConfig).digest('hex'),
+      ...(registryAuth ? { [REGISTRY_NATS_AUTH_ANNOTATION]: registryAuth } : {}),
+    },
+    mounts: [{ name: 'config', mountPath: '/etc/nats', readOnly: true }],
+    volumes: [{ name: 'config', configMap: { name: RUNTIME_NATS_CONFIG } }],
+    env: registryNats
+      ? [
+          {
+            name: REGISTRY_NATS_PASSWORD_ENV,
+            valueFrom: { secretKeyRef: { name: REGISTRY_NATS_SECRET, key: 'password' } },
+          },
+        ]
+      : [],
+    // Clients without credentials land in the TENANT account, whose JetStream directory takes
+    // over the global account's before the server starts (#159).
+    initContainers: [
+      {
+        name: 'jetstream-accounts',
+        image: RUNTIME_NATS_IMAGE,
+        command: ['sh', '-c', JETSTREAM_ACCOUNT_INIT_SCRIPT],
+        resources: {
+          requests: { cpu: '10m', memory: '16Mi' },
+          limits: { cpu: '100m', memory: '32Mi' },
+        },
+        volumeMounts: [{ name: 'data', mountPath: '/data' }],
+      },
+    ],
+  };
+  for (const [name, image, port, args, extra] of [
     // Runtime-internal data-plane NATS for hostgroup `--data-nats-url`.
     // Lifecycle is Tenant-owned; never created as an application BackingService.
     // Application messaging NATS instances are `di-bs-<name>` via reconcileBackingService.
-    ['di-nats', 'nats:2.12.8-alpine', 4222, ['-js', '-sd', '/data']],
+    ['di-nats', RUNTIME_NATS_IMAGE, 4222, ['-c', '/etc/nats/nats.conf'], natsConfigVolume],
     // Transitional warehouse Redis + di-tenant-stock (#456 migrates to BackingService).
     // Independent Redis instances are provisioned separately as `di-bs-<name>`.
     [
@@ -956,6 +1278,7 @@ function tenantResources(
       'redis:7.4.5-alpine',
       6379,
       ['redis-server', '--appendonly', 'yes', '--dir', '/data'],
+      undefined,
     ],
   ] as const) {
     result.push(
@@ -967,21 +1290,27 @@ function tenantResources(
           template: {
             metadata: {
               labels: { app: name, [`${GROUP}/component`]: 'backing-service' },
+              ...(extra ? { annotations: extra.annotations } : {}),
             },
             spec: {
               automountServiceAccountToken: false,
+              ...(extra ? { initContainers: extra.initContainers } : {}),
               containers: [
                 {
                   name,
                   image,
                   args,
+                  ...(extra?.env.length ? { env: extra.env } : {}),
                   ports: [{ containerPort: port }],
                   resources: {
                     requests: { cpu: '10m', memory: '32Mi' },
-                    limits: { cpu: '250m', memory: '128Mi' },
+                    limits: { cpu: '250m', memory: BACKING_SERVICE_MEMORY_LIMIT },
                   },
                   readinessProbe: { tcpSocket: { port } },
-                  volumeMounts: [{ name: 'data', mountPath: '/data' }],
+                  volumeMounts: [
+                    { name: 'data', mountPath: '/data' },
+                    ...(extra ? extra.mounts : []),
+                  ],
                 },
               ],
               volumes: [
@@ -992,6 +1321,7 @@ function tenantResources(
                     type: 'DirectoryOrCreate',
                   },
                 },
+                ...(extra ? extra.volumes : []),
               ],
             },
           },
@@ -1034,8 +1364,17 @@ function tenantResources(
           template: {
             metadata: {
               labels: { 'wasmcloud.com/hostgroup': n.hostgroup, 'wasmcloud.com/name': 'hostgroup' },
-              ...(hostPull?.caDigest
-                ? { annotations: { [REGISTRY_CA_ANNOTATION]: hostPull.caDigest } }
+              ...(hostPull?.caDigest || registryAuth
+                ? {
+                    annotations: {
+                      ...(hostPull?.caDigest
+                        ? { [REGISTRY_CA_ANNOTATION]: hostPull.caDigest }
+                        : {}),
+                      // A rotated registry password rolls the hosts (#159): the registry's pooled
+                      // blobstore connection would reconnect with the password it read at first.
+                      ...(registryAuth ? { [REGISTRY_NATS_AUTH_ANNOTATION]: registryAuth } : {}),
+                    },
+                  }
                 : {}),
             },
             spec: {
@@ -1071,8 +1410,15 @@ function tenantResources(
                     '--socket-egress=enforce',
                     // Plain HTTP only for these exact registries; never --allow-insecure-registries (#149).
                     ...(cfg.insecureRegistries ?? []).flatMap((r) => ['--insecure-registry', r]),
-                    // The tenant registry's pull Service serves the controller certificate.
-                    ...(hostPull?.caDigest ? ['--oci-ca-path=/registry-ca/ca.crt'] : []),
+                    // The tenant registry's pull Service serves the controller certificate. The
+                    // same CA is trusted for the components' outgoing wasi:http (on top of the
+                    // webpki roots), so the registry calls the controller's whoami over https (#113).
+                    ...(hostPull?.caDigest
+                      ? [
+                          '--oci-ca-path=/registry-ca/ca.crt',
+                          '--http-client-ca-path=/registry-ca/ca.crt',
+                        ]
+                      : []),
                   ],
                   env: [
                     { name: 'HOME', value: '/tmp' },
@@ -1111,6 +1457,17 @@ function tenantResources(
                     ...(hostPull?.caDigest
                       ? [{ name: 'registry-ca', mountPath: '/registry-ca', readOnly: true }]
                       : []),
+                    // The registry's NATS credentials (#159), read by its blobstore entry only.
+                    // Never a guest preopen: workload storage lives under its own root.
+                    ...(registryNats
+                      ? [
+                          {
+                            name: REGISTRY_NATS_VOLUME,
+                            mountPath: REGISTRY_NATS_MOUNT,
+                            readOnly: true,
+                          },
+                        ]
+                      : []),
                     ...storage.volumeMounts,
                   ],
                 },
@@ -1143,6 +1500,21 @@ function tenantResources(
                       },
                     ]
                   : []),
+                ...(registryNats
+                  ? [
+                      {
+                        name: REGISTRY_NATS_VOLUME,
+                        secret: {
+                          secretName: REGISTRY_NATS_SECRET,
+                          defaultMode: 0o440,
+                          items: [
+                            { key: 'username', path: 'username' },
+                            { key: 'password', path: 'password' },
+                          ],
+                        },
+                      },
+                    ]
+                  : []),
                 ...storage.volumes,
               ],
             },
@@ -1159,9 +1531,103 @@ function tenantResources(
       }),
     );
   }
+  if (registryNats?.stage === 'migrated')
+    result.push(
+      make('v1', 'ConfigMap', REGISTRY_NATS_MIGRATION, n.runtimeNamespace, {
+        data: { state: 'complete' },
+      }),
+    );
+  else if (migrationJob) result.push(registryNatsMigrationJob(make, n.runtimeNamespace));
   return result;
 }
-function userResources(user: User, tenants: Tenant[], cfg: ControllerConfig): Resource[] {
+/**
+ * The one-shot Job that moves the registry's object store from the `TENANT` account into
+ * `REGISTRY` (#159; the script is `REGISTRY_NATS_MIGRATION_SCRIPT`). It logs in anonymously for
+ * the source and as the registry user for the destination. Kept a day after it finishes, by which
+ * time the controller has recorded the result in `di-nats-registry-migration`.
+ */
+function registryNatsMigrationJob(
+  make: (
+    apiVersion: string,
+    kind: string,
+    name: string,
+    namespace: string,
+    body: Record<string, unknown>,
+  ) => Resource,
+  namespace: string,
+): Resource {
+  const credential = (key: string) => ({
+    valueFrom: { secretKeyRef: { name: REGISTRY_NATS_SECRET, key } },
+  });
+  return make('batch/v1', 'Job', REGISTRY_NATS_MIGRATION_JOB, namespace, {
+    spec: {
+      backoffLimit: 10,
+      // A Job that cannot start (quota, scheduling) or hangs ends Failed (DeadlineExceeded), so
+      // the stopped registry is reported as RegistryMigrationFailed instead of waiting forever.
+      activeDeadlineSeconds: REGISTRY_NATS_MIGRATION_DEADLINE_SECONDS,
+      ttlSecondsAfterFinished: 86400,
+      template: {
+        metadata: { labels: { [`${GROUP}/component`]: REGISTRY_NATS_MIGRATION_COMPONENT } },
+        spec: {
+          restartPolicy: 'Never',
+          automountServiceAccountToken: false,
+          securityContext: {
+            runAsNonRoot: true,
+            runAsUser: 65532,
+            runAsGroup: 65532,
+            seccompProfile: { type: 'RuntimeDefault' },
+          },
+          containers: [
+            {
+              name: 'migrate',
+              image: NATS_BOX_IMAGE,
+              workingDir: '/tmp',
+              command: ['sh', '-c', REGISTRY_NATS_MIGRATION_SCRIPT],
+              env: [
+                { name: 'NATS_URL', value: `nats://di-nats.${namespace}.svc.cluster.local:4222` },
+                { name: 'HOME', value: '/tmp' },
+                { name: 'REGISTRY_USER', ...credential('username') },
+                { name: 'REGISTRY_PASSWORD', ...credential('password') },
+              ],
+              resources: {
+                requests: { cpu: '10m', memory: '32Mi' },
+                limits: REGISTRY_NATS_MIGRATION_LIMITS,
+              },
+              securityContext: {
+                allowPrivilegeEscalation: false,
+                readOnlyRootFilesystem: true,
+                capabilities: { drop: ['ALL'] },
+              },
+              volumeMounts: [{ name: 'tmp', mountPath: '/tmp' }],
+            },
+          ],
+          volumes: [{ name: 'tmp', emptyDir: {} }],
+        },
+      },
+    },
+  });
+}
+/** Whether the controller has reconciled the tenant's current spec. */
+function tenantReady(tenant: Tenant): boolean {
+  return !!tenant.status?.conditions?.some(
+    (c) =>
+      c.type === 'Ready' &&
+      c.status === 'True' &&
+      c.observedGeneration === tenant.metadata.generation,
+  );
+}
+/**
+ * Access a user should hold. A membership is granted once its tenant is Ready. While the tenant
+ * is merely Not Ready (for example reconciling a new generation), a membership in `granted`
+ * (already bound) is kept, so its token Secret survives. Missing, suspended and deleting tenants
+ * always lose access.
+ */
+function userResources(
+  user: User,
+  tenants: Tenant[],
+  cfg: ControllerConfig,
+  granted: ReadonlySet<string> = new Set(),
+): Resource[] {
   if (user.spec.suspended || user.metadata.deletionTimestamp) return [];
   const make = (
     apiVersion: string,
@@ -1180,12 +1646,7 @@ function userResources(user: User, tenants: Tenant[], cfg: ControllerConfig): Re
       !tenant ||
       tenant.spec.suspended ||
       tenant.metadata.deletionTimestamp ||
-      !tenant.status?.conditions?.some(
-        (c) =>
-          c.type === 'Ready' &&
-          c.status === 'True' &&
-          c.observedGeneration === tenant.metadata.generation,
-      )
+      !(tenantReady(tenant) || granted.has(membership.tenant))
     )
       continue;
     const n = names(membership.tenant);
@@ -1241,7 +1702,8 @@ function tenantControllerCertNames(
   const ns = names(tenant).runtimeNamespace;
   const dns = [
     'tenant-controller',
-    `tenant-controller.${ns}.svc`,
+    // The tenant registry's whoami callback (#113).
+    registryWhoamiHost(tenant),
     `tenant-controller.${ns}.svc.cluster.local`,
     'localhost',
   ];
@@ -1263,8 +1725,46 @@ function tenantControllerCertNames(
     dns.push(registryPullHost(tenant), `${registryPullHost(tenant)}.cluster.local`);
   return { dns: [...new Set(dns)], ips: [...new Set(ips)] };
 }
-/** The Secret holding the controller CA's private key; no pod mounts it. */
+/**
+ * The Secret in the tenant's runtime namespace that held the controller CA key before #170. The
+ * tenant controller's ServiceAccount can read every Secret there, so the controller moves the key
+ * to {@link tenantControllerCaSecret} and deletes this one.
+ */
 const TENANT_CONTROLLER_CA_KEY_SECRET = 'tenant-controller-ca-key';
+/**
+ * The Secret in the platform namespace that holds the tenant's controller CAs with their keys
+ * (#170): `ca.crt` and `ca.key` sign the serving leaf; during a rotation `next.crt`/`next.key` and
+ * `previous.crt` hold the other CAs in the trust bundle. No pod mounts it and no tenant
+ * ServiceAccount or member can read it, and it survives deleting `tenant-controller-tls`.
+ */
+function tenantControllerCaSecret(tenant: string): string {
+  return `tenant-controller-ca-${tenant}`;
+}
+/** Digest of the trust bundle on the console's pod template (#170). */
+export const CA_BUNDLE_ANNOTATION = `${GROUP}/ca-bundle-sha256`;
+/**
+ * The PEM bundle clients trust (ConfigMap `tenant-controller-ca`): the CAs of `tls`, oldest first,
+ * so switching which CA signs the leaf keeps the same bytes and does not roll the hosts.
+ */
+function controllerTrustBundle(tls: TenantAuthInputs['tls']): string {
+  return [tls.caPrevious, tls.caCert, tls.caNext?.cert].filter(Boolean).join('');
+}
+/**
+ * The tenant's members, published for the tenant controller's `/-/members` (#321), so it reads no
+ * User for that listing:
+ * - `entries`: every membership with its role and whether the user is suspended
+ *   ({@link TenantMember}), sorted by name and role;
+ * - `members`: the active members' names only, which tenant-auth images that predate `entries`
+ *   read (each one's User by name: the controller may `get` only those Users).
+ */
+export const TENANT_MEMBERS_CONFIG = 'tenant-controller-members';
+/** The ConfigMap data of {@link TENANT_MEMBERS_CONFIG}. */
+function membersConfigData(members: TenantMember[], active: string[]): Record<string, string> {
+  const entries = members
+    .map(({ name, role, suspended }) => ({ name, role, suspended }))
+    .sort((a, b) => a.name.localeCompare(b.name) || a.role.localeCompare(b.role));
+  return { members: JSON.stringify(active), entries: JSON.stringify(entries) };
+}
 /** Digest of the serving certificate; in both pod templates so a renewal rolls the pair. */
 function tlsCertDigest(cert: string): string {
   return createHash('sha256').update(cert).digest('hex');
@@ -1348,9 +1848,14 @@ function tenantAuthResources(
             labels: { app, [COMPONENT]: 'tenant-auth', [TENANT]: name },
             // The image reference rolls the pods; the digest is repeated here for operators. Both
             // binaries read the certificate (or CA) once at start, so its digest rolls the pair.
+            // The console also reads the trust bundle once and copies it into the kubeconfigs it
+            // issues, so a bundle change during a CA rotation (#170) rolls it too.
             annotations: {
               [`${GROUP}/image-digest`]: auth.image.split('@')[1],
               [`${GROUP}/tls-cert-sha256`]: tlsCertDigest(inputs.tls.cert),
+              ...(app === 'tenant-console'
+                ? { [CA_BUNDLE_ANNOTATION]: tlsCertDigest(controllerTrustBundle(inputs.tls)) }
+                : {}),
             },
           },
           spec: {
@@ -1511,6 +2016,10 @@ function tenantAuthResources(
     },
   );
   const base64 = (text: string) => Buffer.from(text).toString('base64');
+  // Active members only: a suspended member keeps its entry in the published list, not its access.
+  const members = [...new Set(inputs.members.filter((m) => !m.suspended).map((m) => m.name))].sort(
+    (a, b) => a.localeCompare(b),
+  );
   const result: Resource[] = [
     make('v1', 'ServiceAccount', 'tenant-controller', namespace, {
       automountServiceAccountToken: false,
@@ -1518,31 +2027,42 @@ function tenantAuthResources(
     make('v1', 'ServiceAccount', 'tenant-console', namespace, {
       automountServiceAccountToken: false,
     }),
-    // The tenancy CRs it checks on every request.
+    // The tenancy CRs it checks on every request: its own Tenant and its members' Users only
+    // (#321). With no members there is no users rule: empty resourceNames would mean every name.
     make(rbac, 'ClusterRole', `di-tenant-controller-${name}`, undefined, {
       rules: [
         { apiGroups: [GROUP], resources: ['tenants'], verbs: ['get'], resourceNames: [name] },
-        { apiGroups: [GROUP], resources: ['users'], verbs: ['get', 'list'] },
+        ...(members.length
+          ? [{ apiGroups: [GROUP], resources: ['users'], verbs: ['get'], resourceNames: members }]
+          : []),
       ],
     }),
     // TokenRequest only for the tenant's members, recomputed from the User CRs on every
     // reconcile. With no members there is no rule: empty resourceNames would mean every name.
     make(rbac, 'Role', `di-tenant-controller-${name}`, cfg.namespace, {
-      rules: inputs.members.length
+      rules: members.length
         ? [
             {
               apiGroups: [''],
               resources: ['serviceaccounts/token'],
               verbs: ['create'],
-              resourceNames: inputs.members.map((m) => `di-user-${m}`),
+              resourceNames: members.map((m) => `di-user-${m}`),
             },
           ]
         : [],
     }),
-    // API-key Secrets in its own namespace.
+    // API-key Secrets in its own namespace, and the member list it reads for `/-/members`.
+    // Secret names are generated, so `resourceNames` cannot narrow these; the
+    // `tenant-controller-secrets` admission policy limits its writes to API-key Secrets (#321).
     make(rbac, 'Role', 'tenant-controller-keys', namespace, {
       rules: [
         { apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list', 'create', 'delete'] },
+        {
+          apiGroups: [''],
+          resources: ['configmaps'],
+          verbs: ['get'],
+          resourceNames: [TENANT_MEMBERS_CONFIG],
+        },
       ],
     }),
     // Tenant developers can only write Secrets (#112), so `/v1` reads them as the controller;
@@ -1664,8 +2184,30 @@ function tenantAuthResources(
       }),
     );
   result.push(
+    // Applied first, so a CA is never published (bundle, leaf) before its key is stored (#170).
+    // Not mounted by any pod: lets a leaf renewal keep the CA (and so the hosts and kubeconfigs),
+    // and keeps the CA when `tenant-controller-tls` is deleted. In the platform namespace, out of
+    // the tenant controller's reach.
+    make('v1', 'Secret', tenantControllerCaSecret(name), cfg.namespace, {
+      type: 'Opaque',
+      data: {
+        'ca.crt': base64(inputs.tls.caCert),
+        'ca.key': base64(inputs.tls.caKey),
+        ...(inputs.tls.caNext
+          ? {
+              'next.crt': base64(inputs.tls.caNext.cert),
+              'next.key': base64(inputs.tls.caNext.key),
+            }
+          : {}),
+        ...(inputs.tls.caPrevious ? { 'previous.crt': base64(inputs.tls.caPrevious) } : {}),
+      },
+    }),
+    make('v1', 'ConfigMap', TENANT_MEMBERS_CONFIG, namespace, {
+      data: membersConfigData(inputs.members, members),
+    }),
+    // Every CA of a rotation, so hosts and clients that reload it accept the leaf on either side.
     make('v1', 'ConfigMap', 'tenant-controller-ca', namespace, {
-      data: { 'ca.crt': inputs.tls.caCert },
+      data: { 'ca.crt': controllerTrustBundle(inputs.tls) },
     }),
     make('v1', 'Secret', 'tenant-controller-tls', namespace, {
       type: 'kubernetes.io/tls',
@@ -1674,11 +2216,6 @@ function tenantAuthResources(
         'tls.key': base64(inputs.tls.key),
         'ca.crt': base64(inputs.tls.caCert),
       },
-    }),
-    // Not mounted by any pod: lets a leaf renewal keep the CA (and so the hosts and kubeconfigs).
-    make('v1', 'Secret', TENANT_CONTROLLER_CA_KEY_SECRET, namespace, {
-      type: 'Opaque',
-      data: { 'ca.key': base64(inputs.tls.caKey) },
     }),
   );
   const hostPullToken = registry ? inputs.hostPullToken : undefined;
@@ -1803,7 +2340,7 @@ function tenantAuthResources(
           ],
         },
       }),
-      registryWorkload(tenant, cfg, registry, registryHost),
+      registryWorkload(tenant, cfg, registry, registryHost, inputs.registryNats),
     );
   return result;
 }
@@ -1812,19 +2349,27 @@ function tenantAuthResources(
  * the unnamed blobstore, configured with the NATS backend pointing to the tenant's `di-nats`
  * for persistent blob and manifest storage. The component reads the whoami URL and the tenant
  * through `wasmcloud:secrets` bind-time config; admission admits that interface from the
- * platform controller only, so a tenant cannot repoint it. The plain-HTTP whoami URL is
- * in-cluster (`*.svc`), as the component requires.
+ * platform controller only, so a tenant cannot repoint it. The whoami URL is https to the
+ * controller Service (#113): {@link registryWhoamiHost} is one of the controller certificate's
+ * names, and the hosts trust the tenant CA through `--http-client-ca-path`.
+ *
+ * `nats` (#159): with `credentials` the blobstore entry logs in to the registry's own NATS
+ * account from the files of the hosts' read-only Secret mount; while `stopped` it does not run,
+ * so nothing writes to the store the Job moves and nothing recreates it in `TENANT`; absent, it
+ * connects anonymously and lands in the `TENANT` account.
  */
 function registryWorkload(
   tenant: Tenant,
   cfg: ControllerConfig,
   registry: TenantRegistryConfig,
   host: string,
+  nats?: RegistryNatsMode,
 ): Resource {
   const name = tenant.metadata.name;
   const n = names(name);
-  const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
-  const whoami = `tenant-controller.${n.runtimeNamespace}.svc:${WHOAMI_PORT}`;
+  const suspended =
+    tenant.spec.suspended || !!tenant.metadata.deletionTimestamp || nats === 'stopped';
+  const whoami = `${registryWhoamiHost(name)}:${WHOAMI_PORT}`;
   const value = resource(
     tenant,
     cfg.installation,
@@ -1843,7 +2388,8 @@ function registryWorkload(
               {
                 name: 'oci-registry',
                 image: registry.component,
-                // Hosts run with --socket-egress=enforce; the whoami call is the only egress.
+                // Hosts run with --socket-egress=enforce; the whoami call (https, the same
+                // host and port) is the only egress.
                 localResources: { allowedHosts: [whoami] },
               },
             ],
@@ -1863,13 +2409,19 @@ function registryWorkload(
                 config: {
                   backend: 'nats',
                   url: `nats://di-nats.${n.runtimeNamespace}.svc.cluster.local:4222`,
+                  ...(nats === 'credentials'
+                    ? {
+                        user_file: REGISTRY_NATS_USER_FILE,
+                        password_file: REGISTRY_NATS_PASSWORD_FILE,
+                      }
+                    : {}),
                 },
               },
               {
                 namespace: 'wasmcloud',
                 package: 'secrets',
                 interfaces: ['store', 'reveal'],
-                config: { 'tenant-controller-url': `http://${whoami}`, tenant: name },
+                config: { 'tenant-controller-url': `https://${whoami}`, tenant: name },
               },
             ],
           },
@@ -1923,6 +2475,7 @@ export {
 } from './backing-services';
 export {
   COMPONENT,
+  controllerTrustBundle,
   crds,
   FINALIZER,
   GATEWAY_NAME,
@@ -1939,6 +2492,7 @@ export {
   TENANT,
   TENANT_CONTROLLER_CA_KEY_SECRET,
   tenantAuthResources,
+  tenantControllerCaSecret,
   tenantControllerCertNames,
   tenantQuota,
   tenantResources,

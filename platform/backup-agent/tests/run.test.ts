@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -194,11 +194,132 @@ describe('backup-agent kinds', () => {
   });
 
   test('postgres retries a refused connection before reporting dump failure', async () => {
-    const refused = harness(() => ({ code: 1, stdout: '', stderr: 'connection refused' }));
-    expect(await runAgent(request(), refused.io)).toBe(1);
-    expect(wrote(refused.files, '/work/termination')).toContain('DumpFailed');
-    expect(refused.calls.filter((call) => call.argv[0] === 'pg_dump')).toHaveLength(8);
-  }, 20000);
+    // The agent waits 1 s between attempts; record the waits instead of sleeping through them.
+    const waits: (number | undefined)[] = [];
+    const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((
+      handler: () => void,
+      delay?: number,
+    ) => {
+      waits.push(delay);
+      queueMicrotask(handler);
+      return 0;
+    }) as unknown as typeof setTimeout);
+    try {
+      const refused = harness(() => ({ code: 1, stdout: '', stderr: 'connection refused' }));
+      expect(await runAgent(request(), refused.io)).toBe(1);
+      expect(wrote(refused.files, '/work/termination')).toContain('DumpFailed');
+      expect(refused.calls.filter((call) => call.argv[0] === 'pg_dump')).toHaveLength(8);
+    } finally {
+      timer.mockRestore();
+    }
+    expect(waits).toEqual(new Array(7).fill(1000));
+  });
+
+  test('probes, nats dumps and restores retry a connection the policy has not admitted yet', async () => {
+    // A new pod's first connections are refused until its network policy is programmed (#388).
+    const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void) => {
+      queueMicrotask(handler);
+      return 0;
+    }) as unknown as typeof setTimeout);
+    const archive = (files: Map<string, Uint8Array>, argv: string[]) => {
+      if (argv[0] === 'tar' && argv.includes('-cf')) {
+        files.set(argv[argv.indexOf('-cf') + 1] ?? '', Buffer.from('tar-bytes'));
+      }
+      return ok();
+    };
+    const refusedFirst = (tool: string, then: (argv: string[]) => ExecResult, times = 2) => {
+      let refused = 0;
+      return (argv: string[]) => {
+        if (argv[0] === tool && refused < times) {
+          refused += 1;
+          return {
+            code: 1,
+            stdout: '',
+            stderr:
+              tool === 'nats'
+                ? 'nats: error: setup failed: nats: no servers available for connection'
+                : 'could not connect to server: Connection refused',
+          };
+        }
+        return then(argv);
+      };
+    };
+    try {
+      for (const [port, tool, stdout] of [
+        ['5432', 'psql', '0\n'],
+        ['6379', 'redis-cli', '0'],
+        ['4222', 'nats', '[]'],
+      ] as const) {
+        const probe = harness(refusedFirst(tool, () => ({ code: 0, stdout, stderr: '' })));
+        expect(await runAgent(request({ kind: 'probe-empty', port }), probe.io)).toBe(0);
+        expect(probe.calls.filter((call) => call.argv[0] === tool)).toHaveLength(3);
+      }
+
+      const dump = harness(
+        refusedFirst('nats', (argv) =>
+          argv.includes('ls') ? { code: 0, stdout: '[]', stderr: '' } : archive(dump.files, argv),
+        ),
+      );
+      expect(await runAgent(request({ kind: 'nats', port: '4222' }), dump.io)).toBe(0);
+      expect(dump.calls.filter((call) => call.argv.includes('ls'))).toHaveLength(3);
+
+      // Restores wait with a read-only probe, then run exactly once.
+      const restore = harness(refusedFirst('psql', () => ok()));
+      expect(await runAgent(request({ kind: 'restore-postgres' }), restore.io)).toBe(0);
+      expect(restore.calls.filter((call) => call.argv[0] === 'psql')).toHaveLength(3);
+      expect(restore.calls.filter((call) => call.argv[0] === 'pg_restore')).toHaveLength(1);
+
+      const redis = harness(
+        refusedFirst('redis-cli', (argv) =>
+          argv[0] === 'rdb' ? { code: 0, stdout: 'RESP', stderr: '' } : ok(),
+        ),
+      );
+      expect(await runAgent(request({ kind: 'restore-redis', port: '6379' }), redis.io)).toBe(0);
+      const redisCalls = redis.calls.filter((call) => call.argv[0] === 'redis-cli');
+      expect(redisCalls.filter((call) => call.argv.includes('PING'))).toHaveLength(3);
+      const pipes = redisCalls.filter((call) => call.argv.includes('--pipe'));
+      expect(pipes).toHaveLength(1);
+      expect(pipes[0]?.input).toBe('RESP');
+
+      const nats = harness(refusedFirst('nats', () => ok()));
+      expect(await runAgent(request({ kind: 'restore-nats', port: '4222' }), nats.io)).toBe(0);
+      expect(nats.calls.filter((call) => call.argv.includes('info'))).toHaveLength(3);
+      expect(nats.calls.filter((call) => call.argv.includes('restore'))).toHaveLength(1);
+
+      // Other failures are not retried.
+      const denied = harness(() => ({ code: 1, stdout: '', stderr: 'Authorization Violation' }));
+      expect(await runAgent(request({ kind: 'probe-empty', port: '4222' }), denied.io)).toBe(1);
+      expect(denied.calls).toHaveLength(1);
+    } finally {
+      timer.mockRestore();
+    }
+  });
+
+  test('a restore that fails with connection-like output is never run again', async () => {
+    const partial = {
+      code: 1,
+      stdout: '',
+      stderr:
+        'pg_restore: error: connection to server failed: Connection refused\nCommand was: REFRESH',
+    };
+    const postgres = harness((argv) => (argv[0] === 'pg_restore' ? partial : ok()));
+    expect(await runAgent(request({ kind: 'restore-postgres' }), postgres.io)).toBe(1);
+    expect(postgres.calls.filter((call) => call.argv[0] === 'pg_restore')).toHaveLength(1);
+    const redis = harness((argv) =>
+      argv[0] === 'rdb'
+        ? { code: 0, stdout: 'RESP', stderr: '' }
+        : argv.includes('--pipe')
+          ? { code: 1, stdout: 'Could not connect to Redis', stderr: '' }
+          : ok(),
+    );
+    expect(await runAgent(request({ kind: 'restore-redis', port: '6379' }), redis.io)).toBe(1);
+    expect(redis.calls.filter((call) => call.argv.includes('--pipe'))).toHaveLength(1);
+    const nats = harness((argv) =>
+      argv.includes('restore') ? { code: 1, stdout: '', stderr: 'could not connect' } : ok(),
+    );
+    expect(await runAgent(request({ kind: 'restore-nats', port: '4222' }), nats.io)).toBe(1);
+    expect(nats.calls.filter((call) => call.argv.includes('restore'))).toHaveLength(1);
+  });
 
   test('postgres reports a dump failure and a missing target', async () => {
     const failed = harness(() => ({ code: 1, stdout: '', stderr: 'no' }));
@@ -579,6 +700,8 @@ describe('backup-agent kinds', () => {
   });
 });
 
+// A fresh Bun process transpiles src/main.ts and forks two shell stubs. That is process start-up,
+// not waiting, and it slows down with the rest of the machine, so it gets more than the default.
 test('the process entrypoint writes a termination record via stub tools', async () => {
   const root = await mkdtemp(join(tmpdir(), 'backup-agent-'));
   try {
@@ -619,7 +742,7 @@ test('the process entrypoint writes a termination record via stub tools', async 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-});
+}, 30_000);
 
 describe('sweepPvc on a real tree', () => {
   test('removes only stale leftovers inside <mount>/<prefix> at stamp depth', async () => {

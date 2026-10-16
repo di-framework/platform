@@ -6,6 +6,8 @@ import { claimsRegistryHost } from './admission';
 import {
   backingServiceResourceName,
   backingServiceResources,
+  type DeploymentFailure,
+  deploymentFailure,
   endpointFor,
   RUNTIME_DATA_NATS,
   type RuntimeProvider,
@@ -13,6 +15,7 @@ import {
   resolveClass,
   tenantNameFromNamespace,
 } from './backing-service-reconcile';
+import { LEAF_RENEW_DAYS, leafNames, rotateCas } from './ca-rotation';
 import {
   approveEgress,
   EGRESS_FIELD_MANAGER,
@@ -28,15 +31,24 @@ import {
 } from './egress';
 import {
   appendRing,
-  applicationKey,
   attributeEntries,
+  configMapLogKey,
+  type LogKey,
+  type LogWriteFailure,
+  legacyRing,
+  logKey,
+  logKeyId,
   logsConfigMap,
+  logWriteCondition,
   MANAGED_SELECTOR,
   mergeFailures,
+  newestStamp,
   PROJECTION,
   type ProjectedEntry,
   projectedFailures,
-  projectedLines,
+  projectedRing,
+  type RingLine,
+  unpublished,
   validLabelValue,
   type WorkloadIdentity,
 } from './log-projection';
@@ -49,6 +61,19 @@ import {
   postgresReadiness,
   postgresServingResources,
 } from './postgres';
+import {
+  hostImageSupportsNatsCredentials,
+  NATS_REGISTRY_ACCOUNT,
+  NATS_TENANT_ACCOUNT,
+  newRegistryNatsPassword,
+  REGISTRY_NATS_AUTH_ANNOTATION,
+  REGISTRY_NATS_MIGRATION,
+  REGISTRY_NATS_MIGRATION_JOB,
+  REGISTRY_NATS_PASSWORD,
+  REGISTRY_NATS_SECRET,
+  REGISTRY_NATS_VOLUME,
+  registryNatsAuthDigest,
+} from './registry-nats';
 import {
   assertTenantAuthConfig,
   type BackingService,
@@ -67,6 +92,8 @@ import {
   REGISTRY_PULL_SECRET,
   REGISTRY_PULL_SERVICE,
   REGISTRY_WORKLOAD,
+  type RegistryNats,
+  type RegistryNatsMode,
   type Resource,
   ROUTES_CONFIG_NAME,
   registryHttpHost,
@@ -81,6 +108,7 @@ import {
   type TenantAuthInputs,
   tenantAuthResources,
   tenantAuthRoutes,
+  tenantControllerCaSecret,
   tenantControllerCertNames,
   tenantQuota,
   tenantResources,
@@ -100,14 +128,7 @@ import {
   serviceBindingResources,
   sharedBindingConflict,
 } from './service-binding-reconcile';
-import {
-  caCertificate,
-  certificateNames,
-  certificateValid,
-  holdsCaKey,
-  issuedBy,
-  leafCertificate,
-} from './tls';
+import { certificateNames, certificateValid, holdsCaKey, issuedBy, leafCertificate } from './tls';
 import {
   STORAGE_FIELD_MANAGER,
   storageKeys,
@@ -140,7 +161,77 @@ const plurals: Record<string, string> = {
   BackingService: 'backingservices',
   ServiceBinding: 'servicebindings',
   WorkloadDeployment: 'workloaddeployments',
+  WorkloadReplicaSet: 'workloadreplicasets',
+  Workload: 'workloads',
+  Job: 'jobs',
 };
+type RolloutDeployment = Resource & {
+  spec?: {
+    replicas?: number;
+    template?: {
+      metadata?: { annotations?: Record<string, string> };
+      spec?: { volumes?: { name: string }[] };
+    };
+  };
+  status?: {
+    observedGeneration?: number;
+    replicas?: number;
+    updatedReplicas?: number;
+    readyReplicas?: number;
+  };
+};
+type MigrationJob = Resource & {
+  status?: {
+    succeeded?: number;
+    conditions?: { type: string; status: string; reason?: string; message?: string }[];
+  };
+};
+type WorkloadObject = Resource & {
+  metadata: Resource['metadata'] & {
+    ownerReferences?: { kind: string; name: string; uid: string; controller?: boolean }[];
+  };
+  spec?: { replicas?: number };
+  status?: Record<string, unknown> & { observedGeneration?: number };
+};
+/** The controlling owner of `value` of `kind`, as the wasmCloud operator sets it. */
+function controllerOf(value: WorkloadObject, kind: string) {
+  return value.metadata.ownerReferences?.find(
+    (owner) => owner.controller !== false && owner.kind === kind,
+  );
+}
+/** The largest replica count a wasmCloud status reports (absent fields count as zero). */
+function runningCount(status: Record<string, unknown>): number {
+  return Math.max(
+    0,
+    ...['replicas', 'currentReplicas', 'readyReplicas', 'availableReplicas'].map(
+      (key) => Number(status[key] ?? 0) || 0,
+    ),
+  );
+}
+/**
+ * Whether `deployment` runs with the registry NATS password whose digest is `digest` (#159): its
+ * template carries the digest (and, with `mounted`, the credentials volume), and every replica is
+ * updated and ready with no old pod left.
+ */
+function rolledOutWith(
+  deployment: RolloutDeployment | undefined,
+  digest: string,
+  mounted: boolean,
+): boolean {
+  const want = deployment?.spec?.replicas ?? 0;
+  const template = deployment?.spec?.template;
+  const status = deployment?.status;
+  return (
+    !!deployment &&
+    want > 0 &&
+    template?.metadata?.annotations?.[REGISTRY_NATS_AUTH_ANNOTATION] === digest &&
+    (!mounted || !!template.spec?.volumes?.some((v) => v.name === REGISTRY_NATS_VOLUME)) &&
+    status?.observedGeneration === deployment.metadata.generation &&
+    status?.updatedReplicas === want &&
+    status?.readyReplicas === want &&
+    status?.replicas === want
+  );
+}
 export function collection(apiVersion: string, kind: string, namespace?: string): string {
   const plural = plurals[kind];
   if (!plural) throw new Error(`Unsupported resource kind: ${kind}`);
@@ -199,6 +290,11 @@ export class ApiError extends Error {
     super(message);
   }
 }
+/**
+ * A `tenant-controller-ca-<tenant>` Secret this installation did not write for the Tenant (#170).
+ * Reported on `TenantAuthReady` (reason `ControllerCaNotOwned`) and logged once, not every pass.
+ */
+export class ControllerCaRefused extends Error {}
 export class KubernetesApi implements Api {
   private readonly directory = '/var/run/secrets/kubernetes.io/serviceaccount';
   async call<T>(
@@ -266,9 +362,6 @@ export class KubernetesApi implements Api {
 const LOG_LOOKBACK_MS = 120_000;
 /** A generated host pull token: 32 random bytes, base64url. */
 const HOST_PULL_TOKEN = /^[A-Za-z0-9_-]{43}$/;
-/** Lifetime of the controller CA, and how long before expiry it is replaced (days). */
-const CA_DAYS = 3650;
-const CA_RENEW_DAYS = 90;
 const TENANT_AUTH_KINDS = [
   ['apps/v1', 'Deployment'],
   ['v1', 'Service'],
@@ -283,16 +376,33 @@ const TENANT_AUTH_KINDS = [
   // The tenant registry (#83) carries the same component label.
   ['runtime.wasmcloud.dev/v1alpha1', 'WorkloadDeployment'],
 ] as const;
+/**
+ * The `di-platform-log-reader` Role and RoleBinding that platforms before #321 wrote in each
+ * runtime namespace for the logs projection. The controller holds `pods/log get` cluster-wide, so
+ * it now deletes them ({@link Controller.pruneLogReader}).
+ */
+const LOG_READER = 'di-platform-log-reader';
+const LOG_READER_KINDS = [
+  ['rbac.authorization.k8s.io/v1', 'RoleBinding'],
+  ['rbac.authorization.k8s.io/v1', 'Role'],
+] as const;
 
 export class Controller {
-  /** Newest TracingLogger timestamp already projected, per host pod uid. */
-  private readonly logCursors = new Map<string, string>();
+  /**
+   * Newest TracingLogger timestamp already projected, per tenant, host pod uid, and projection
+   * key (logKeyId). A key's cursor moves only once its ConfigMap is written (#316). Entries of
+   * pods and keys that are gone are dropped by projectLogs, and those of tenants no longer
+   * projected by tick (#131), so neither grows without bound.
+   */
+  private readonly logCursors = new Map<string, Map<string, Map<string, string>>>();
   /** Last successful egress name resolution, kept so a failed lookup does not revoke. */
   private readonly egressAddresses = new Map<string, string[]>();
   constructor(
     private readonly api: Api,
     private readonly cfg: ControllerConfig,
     private readonly resolveName: (name: string) => Promise<string[]> = resolveIpv4,
+    /** The clock certificate issuance and CA rotation (#170) read. */
+    private readonly now: () => Date = () => new Date(),
   ) {}
   private async get<T>(path: string): Promise<T | undefined> {
     try {
@@ -317,6 +427,25 @@ export class Controller {
     );
     // Core Kubernetes list items may omit TypeMeta even though individual GETs include it.
     return result.items.map((item) => ({ ...item, apiVersion, kind }));
+  }
+  /**
+   * The tenant's host pods that removal waits for (#245): terminating ones (the operator still has
+   * to clear their pod-host finalizer) and ones not yet finished. A finished pod (`Succeeded` or
+   * `Failed`, e.g. evicted) that nobody deletes holds nothing back: scaling to zero does not
+   * remove it, and under Retain nothing else would.
+   */
+  private async liveHostPods(n: ReturnType<typeof names>): Promise<Resource[]> {
+    const pods = await this.list<Resource>(
+      'v1',
+      'Pod',
+      { 'wasmcloud.com/hostgroup': n.hostgroup, 'wasmcloud.com/name': 'hostgroup' },
+      n.runtimeNamespace,
+    );
+    return pods.filter((pod) => {
+      if (pod.metadata.deletionTimestamp) return true;
+      const phase = (pod.status as { phase?: string } | undefined)?.phase;
+      return phase !== 'Succeeded' && phase !== 'Failed';
+    });
   }
   private async remove(value: Resource): Promise<void> {
     try {
@@ -442,7 +571,7 @@ export class Controller {
         await this.remove(binding);
   }
   /**
-   * What {@link tenantAuthResources} needs from the cluster: the tenant's active members (from
+   * What {@link tenantAuthResources} needs from the cluster: the tenant's members (from
    * the User CRs, so a membership change re-renders the TokenRequest `resourceNames` on the next
    * reconcile), the API server endpoints, the controller certificate (kept until 30 days before
    * it expires) and the shared OAuth client secret from the platform namespace.
@@ -454,15 +583,14 @@ export class Controller {
   ): Promise<TenantAuthInputs> {
     const auth = this.cfg.tenantAuth!;
     const name = tenant.metadata.name;
+    // Suspended members too, flagged, so `/-/members` lists them without reading Users (#321).
     const members = users
-      .filter(
-        (u) =>
-          !u.spec.suspended &&
-          !u.metadata.deletionTimestamp &&
-          u.spec.memberships.some((m) => m.tenant === name),
-      )
-      .map((u) => u.metadata.name)
-      .sort((a, b) => a.localeCompare(b));
+      .filter((u) => !u.metadata.deletionTimestamp)
+      .flatMap((u) =>
+        u.spec.memberships
+          .filter((m) => m.tenant === name)
+          .map((m) => ({ name: u.metadata.name, role: m.role, suspended: !!u.spec.suspended })),
+      );
     const slices = (
       await this.list<
         Resource & { endpoints?: { addresses: string[] }[]; ports?: { port: number }[] }
@@ -474,7 +602,7 @@ export class Controller {
       ],
       port: slices[0]?.ports?.[0]?.port ?? 443,
     };
-    const tls = await this.controllerTls(name, auth, fetched);
+    const tls = await this.controllerTls(tenant, auth, fetched);
     const oauth = await this.get<{ data?: Record<string, string> }>(
       `${collection('v1', 'Secret', this.cfg.namespace)}/${auth.oauthClient.secretName}`,
     );
@@ -487,56 +615,110 @@ export class Controller {
     };
   }
   /**
-   * The controller's TLS material: a long-lived CA and a leaf it signed. Both are reused while they
-   * verify against each other (the leaf by the CA's signature and key, the CA as `CA:TRUE` with its
-   * stored key), so a leaf renewal keeps the CA and does not roll the hosts or invalidate kubeconfigs.
-   * A Secret from before the CA existed has no `ca.crt` and is replaced once. The Secrets read
-   * are recorded in `fetched`, so applying them later in the pass does not read them again.
+   * The controller's TLS material: long-lived CAs (#170) and a leaf the current one signed. The CAs
+   * and their keys live in the platform namespace ({@link tenantControllerCaSecret}), so deleting
+   * `tenant-controller-tls` reissues only the leaf. {@link rotateCas} decides which CAs to keep and
+   * overlaps them during a rotation. The leaf is reused while it verifies against the current CA,
+   * has {@link LEAF_RENEW_DAYS} left and names what it should, so a leaf renewal keeps the CA and
+   * does not roll the hosts or invalidate kubeconfigs. The CAs permit only the leaf's names (#365),
+   * so a change of names is a rotation too.
+   *
+   * Until the platform-namespace Secret exists, the CA is taken from where it was kept before:
+   * `ca.crt` in `tenant-controller-tls` and `ca.key` in the runtime namespace's
+   * `tenant-controller-ca-key`, which the pass deletes once the new Secret is applied. When both
+   * exist and the legacy pair is a different working CA, an older package replaced the CA after a
+   * downgrade; that CA is what every party trusts, so it is adopted as is. A Secret from before
+   * the CA existed has neither and is replaced once. Only Secrets this installation wrote for the
+   * Tenant are read; a foreign platform-namespace CA Secret is refused ({@link ControllerCaRefused})
+   * before anything is rendered from it. The Secrets read are recorded in `fetched`, so applying
+   * them later in the pass does not read them again.
    */
   private async controllerTls(
-    tenant: string,
+    tenant: Tenant,
     auth: TenantAuthConfig,
     fetched: Map<string, Resource | undefined>,
   ): Promise<TenantAuthInputs['tls']> {
-    const runtimeNamespace = names(tenant).runtimeNamespace;
+    const name = tenant.metadata.name;
+    const runtimeNamespace = names(name).runtimeNamespace;
     // One GET per Secret: several keys are decoded from each.
-    const secret = async (secretName: string) => {
-      const path = `${collection('v1', 'Secret', runtimeNamespace)}/${secretName}`;
+    const secret = async (namespace: string, secretName: string) => {
+      const path = `${collection('v1', 'Secret', namespace)}/${secretName}`;
       const value = await this.get<Resource & { data?: Record<string, string> }>(path);
       fetched.set(path, value);
-      return (key: string) => Buffer.from(value?.data?.[key] ?? '', 'base64').toString();
+      return value;
     };
-    const [tlsSecret, caKeySecret] = await Promise.all([
-      secret('tenant-controller-tls'),
-      secret(TENANT_CONTROLLER_CA_KEY_SECRET),
+    const caSecretName = tenantControllerCaSecret(name);
+    const [tlsSecret, caSecret, legacySecret] = await Promise.all([
+      secret(runtimeNamespace, 'tenant-controller-tls'),
+      secret(this.cfg.namespace, caSecretName),
+      secret(runtimeNamespace, TENANT_CONTROLLER_CA_KEY_SECRET),
     ]);
-    const [cert, key, caCert, caKey] = [
-      tlsSecret('tls.crt'),
-      tlsSecret('tls.key'),
-      tlsSecret('ca.crt'),
-      caKeySecret('ca.key'),
-    ];
-    const certNames = tenantControllerCertNames(tenant, auth);
-    const ca =
-      holdsCaKey(caCert, caKey) && certificateValid(caCert, CA_RENEW_DAYS)
-        ? { cert: caCert, key: caKey }
-        : caCertificate(`tenant-controller CA (${runtimeNamespace})`, CA_DAYS);
+    // Only what this installation wrote for this Tenant is ever read; a foreign
+    // `tenant-controller-tls` is then refused when it is applied, as before.
+    const owned = (value: Resource | undefined) =>
+      value?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+      value.metadata.labels[OWNER] === tenant.metadata.uid;
+    // The trust anchor itself: refused before anything is rendered from it, so its CA never
+    // reaches the bundle or the leaf.
+    if (caSecret && !owned(caSecret))
+      throw new ControllerCaRefused(
+        `Refusing to adopt Secret ${this.cfg.namespace}/${caSecretName}: it holds the tenant ` +
+          `controller CA but was not written by installation ${this.cfg.installation} for this ` +
+          'Tenant. Delete it to let the controller write its own.',
+      );
+    const decode = (value: { data?: Record<string, string> } | undefined, key: string) =>
+      owned(value as Resource | undefined)
+        ? Buffer.from(value?.data?.[key] ?? '', 'base64').toString()
+        : '';
+    const [cert, key] = [decode(tlsSecret, 'tls.crt'), decode(tlsSecret, 'tls.key')];
+    // The layout before #170, and what an older platform package writes after a downgrade.
+    const legacy = { cert: decode(tlsSecret, 'ca.crt'), key: decode(legacySecret, 'ca.key') };
+    const fromCaSecret = caSecret && {
+      current: { cert: decode(caSecret, 'ca.crt'), key: decode(caSecret, 'ca.key') },
+      next: { cert: decode(caSecret, 'next.crt'), key: decode(caSecret, 'next.key') },
+      previous: decode(caSecret, 'previous.crt'),
+    };
+    // A working legacy pair with a different CA than the platform Secret means an older package
+    // ran since the move and replaced the CA (a downgrade, then this upgrade). Everything trusts
+    // that CA now, so it is adopted unchanged; the platform Secret's CA is stale and dropped.
+    const stored =
+      fromCaSecret &&
+      !(holdsCaKey(legacy.cert, legacy.key) && legacy.cert !== fromCaSecret.current.cert)
+        ? fromCaSecret
+        : { current: legacy };
+    const now = this.now();
+    const wanted = tenantControllerCertNames(name, auth);
+    const cas = rotateCas(
+      stored,
+      { commonName: `tenant-controller CA (${runtimeNamespace})`, dnsNames: wanted.dns },
+      now,
+    );
+    const ca = {
+      caCert: cas.current.cert,
+      caKey: cas.current.key,
+      ...(cas.next ? { caNext: cas.next } : {}),
+      ...(cas.previous ? { caPrevious: cas.previous } : {}),
+    };
+    // While a successor is published the leaf keeps the names it serves, so no host goes dark
+    // before the switch; names the signing CA does not permit wait for the switch (#365).
+    const served = issuedBy(ca.caCert, cert, key) ? certificateNames(cert) : undefined;
+    const certNames = leafNames(cas, wanted, served);
     if (
-      ca.cert === caCert &&
-      certificateValid(cert, 30) &&
-      JSON.stringify(certificateNames(cert)) === JSON.stringify(certNames) &&
-      issuedBy(caCert, cert, key)
+      served &&
+      certificateValid(cert, LEAF_RENEW_DAYS, now) &&
+      JSON.stringify(served) === JSON.stringify(certNames)
     )
-      return { cert, key, caCert, caKey };
+      return { cert, key, ...ca };
     const leaf = leafCertificate(
       `tenant-controller.${runtimeNamespace}.svc`,
       certNames.dns,
       certNames.ips,
       365,
-      ca.cert,
-      ca.key,
+      ca.caCert,
+      ca.caKey,
+      now,
     );
-    return { ...leaf, caCert: ca.cert, caKey: ca.key };
+    return { ...leaf, ...ca };
   }
   /**
    * The host pull token (#83 `:host-pull`): the one in `di-tenant-registry-pull` while it is well
@@ -549,7 +731,10 @@ export class Controller {
     const token = Buffer.from(existing?.data?.token ?? '', 'base64').toString();
     return HOST_PULL_TOKEN.test(token) ? token : randomBytes(32).toString('base64url');
   }
-  /** The host wiring last rendered per tenant (W1/S6 of the #83 `:host-pull` review). */
+  /**
+   * The host wiring last rendered per tenant (W1/S6 of the #83 `:host-pull` review). Entries of
+   * tenants that are gone are dropped by tick (#131).
+   */
   private readonly hostPulls = new Map<string, HostPull | undefined>();
   /**
    * How the tenant hosts pull from the registry (#83 `:host-pull`), decided from desired state
@@ -585,6 +770,124 @@ export class Controller {
         )
       )?.spec?.template?.metadata?.annotations?.[REGISTRY_CA_ANNOTATION];
     return known ? { caDigest: known } : {};
+  }
+  /** Set once the host image warning (#159) has been logged. */
+  private registryNatsWarned = false;
+  /**
+   * The registry's NATS account wiring (#159), read from the cluster each pass so the tenant step
+   * and the tenant-auth step agree; see {@link RegistryNatsStage}.
+   *
+   * - Undefined while `tenantAuth.registry` is unset, and while the host image is not a known build
+   *   with wash patch 0003 and the move has not started: the registry stays anonymous in `TENANT`
+   *   (logged once) rather than switching to credentials its host would ignore.
+   * - Once the move started (a migration Job exists, or the marker says it is done), the registry
+   *   is never anonymous again, whatever the host image: it stays stopped until it can use its
+   *   credentials, so it never recreates `OBJ_oci-registry` in `TENANT`.
+   * - The Job is created only after `di-nats` and the hosts rolled out with this password and a
+   *   previous pass stopped the registry and saw it stopped.
+   *
+   * The password is the one in `di-nats-registry` while well formed, otherwise a new one.
+   */
+  private async registryNats(tenant: Tenant): Promise<RegistryNats | undefined> {
+    if (!this.cfg.tenantAuth?.registry) return undefined;
+    const n = names(tenant.metadata.name);
+    const at = (apiVersion: string, kind: string, name: string) =>
+      `${collection(apiVersion, kind, n.runtimeNamespace)}/${name}`;
+    const [marker, found] = await Promise.all([
+      this.get<{ data?: Record<string, string> }>(at('v1', 'ConfigMap', REGISTRY_NATS_MIGRATION)),
+      this.get<MigrationJob>(at('batch/v1', 'Job', REGISTRY_NATS_MIGRATION_JOB)),
+    ]);
+    const job =
+      found?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+      found.metadata.labels[OWNER] === tenant.metadata.uid
+        ? found
+        : undefined;
+    const migrated = marker?.data?.state === 'complete' || (job?.status?.succeeded ?? 0) > 0;
+    const credentials = hostImageSupportsNatsCredentials(this.cfg.hostImage);
+    if (!credentials && !this.registryNatsWarned) {
+      this.registryNatsWarned = true;
+      console.warn(
+        `tenantHostImage ${this.cfg.hostImage} is not a known build with wash patch 0003 (NATS blobstore credentials): ` +
+          `tenant registries that have not moved stay in the ${NATS_TENANT_ACCOUNT} NATS account, and registries that ` +
+          `already moved (or are moving) to ${NATS_REGISTRY_ACCOUNT} stay stopped until it is (#159)`,
+      );
+    }
+    if (!credentials && !migrated && !job) return undefined;
+    const secret = await this.get<{ data?: Record<string, string> }>(
+      at('v1', 'Secret', REGISTRY_NATS_SECRET),
+    );
+    const stored = Buffer.from(secret?.data?.password ?? '', 'base64').toString();
+    const password = REGISTRY_NATS_PASSWORD.test(stored) ? stored : newRegistryNatsPassword();
+    if (migrated) return { password, stage: 'migrated', credentials };
+    if (job) {
+      // A Job that exists keeps the registry stopped until it ends, even if a rotation or an
+      // image change rolls di-nats or the hosts meanwhile.
+      const failure = job.status?.conditions?.find(
+        (c) => c.type === 'Failed' && c.status === 'True',
+      );
+      return {
+        password,
+        stage: 'migrating',
+        credentials,
+        ...(failure ? { failed: failure.reason ?? failure.message ?? 'Failed' } : {}),
+      };
+    }
+    if (tenant.spec.suspended || tenant.metadata.deletionTimestamp)
+      return { password, stage: 'rollout', credentials };
+    const digest = registryNatsAuthDigest(password);
+    const [nats, hosts] = await Promise.all([
+      this.get<RolloutDeployment>(at('apps/v1', 'Deployment', 'di-nats')),
+      this.get<RolloutDeployment>(at('apps/v1', 'Deployment', `hostgroup-${n.hostgroup}`)),
+    ]);
+    if (!rolledOutWith(nats, digest, false) || !rolledOutWith(hosts, digest, true))
+      return { password, stage: 'rollout', credentials };
+    return {
+      password,
+      stage: (await this.registryStopped(tenant)) ? 'migrating' : 'stopping',
+      credentials,
+    };
+  }
+  /**
+   * Whether the tenant registry is observed stopped (#159): its WorkloadDeployment asks for no
+   * replica, its status (when reported) is current and counts none, every WorkloadReplicaSet it
+   * controls is at zero, and no Workload of those sets is left. A registry that does not exist
+   * is stopped.
+   */
+  private async registryStopped(tenant: Tenant): Promise<boolean> {
+    const namespace = names(tenant.metadata.name).namespace;
+    const group = 'runtime.wasmcloud.dev/v1alpha1';
+    const deployment = await this.get<WorkloadObject>(
+      `${collection(group, 'WorkloadDeployment', namespace)}/${REGISTRY_WORKLOAD}`,
+    );
+    if (!deployment) return true;
+    const status = deployment.status ?? {};
+    if (
+      (deployment.spec?.replicas ?? 1) !== 0 ||
+      (status.observedGeneration !== undefined &&
+        status.observedGeneration !== deployment.metadata.generation) ||
+      runningCount(status) > 0
+    )
+      return false;
+    const [sets, workloads] = await Promise.all([
+      this.list<WorkloadObject>(group, 'WorkloadReplicaSet', {}, namespace),
+      this.list<WorkloadObject>(group, 'Workload', {}, namespace),
+    ]);
+    const owned = sets.filter(
+      (set) => controllerOf(set, 'WorkloadDeployment')?.uid === deployment.metadata.uid,
+    );
+    if (owned.some((set) => (set.spec?.replicas ?? 0) > 0 || runningCount(set.status ?? {}) > 0))
+      return false;
+    return !workloads.some((workload) => {
+      const owner = controllerOf(workload, 'WorkloadReplicaSet');
+      return owned.some(
+        (set) => set.metadata.uid === owner?.uid || set.metadata.name === owner?.name,
+      );
+    });
+  }
+  /** How the registry workload reaches `di-nats` for {@link registryNats} (#159). */
+  private static registryNatsMode(state: RegistryNats | undefined): RegistryNatsMode | undefined {
+    if (!state || state.stage === 'rollout') return undefined;
+    return state.stage === 'migrated' && state.credentials ? 'credentials' : 'stopped';
   }
   async reconcileTenant(tenant: Tenant, users?: User[]): Promise<void> {
     if (!validName(tenant.metadata.name)) throw new Error('Invalid tenant name');
@@ -636,7 +939,28 @@ export class Controller {
           status?.observedGeneration === updated.metadata.generation &&
           (status?.replicas ?? 0) === 0;
       }
-      if (stopped) await this.finalizer(tenant, false);
+      // `status.replicas` leaves out terminating pods, so also wait for the live host pods to
+      // be gone (#245). The wasmCloud operator clears their pod-host finalizer only while it
+      // watches the runtime namespace, and the next `up` stops watching it once this Tenant is
+      // gone. The list is read-only and scoped to this tenant's runtime namespace and hostgroup.
+      if (!stopped) return;
+      const pods = await this.liveHostPods(n);
+      if (pods.length > 0) {
+        // Sorted, so the message (and the status write) only changes when the pods do.
+        const shown = pods
+          .map((pod) => pod.metadata.name)
+          .sort((a, b) => a.localeCompare(b))
+          .slice(0, 5);
+        if (pods.length > shown.length) shown.push(`and ${pods.length - shown.length} more`);
+        await this.status(
+          tenant,
+          false,
+          'WaitingForHostPods',
+          `Retain: waiting for host pods in ${n.runtimeNamespace} to be gone before removing the Tenant: ${shown.join(', ')}`,
+        );
+        return;
+      }
+      await this.finalizer(tenant, false);
       return;
     }
     for (const name of [n.namespace, n.runtimeNamespace]) {
@@ -671,6 +995,7 @@ export class Controller {
       hostPull = this.hostPulls.get(tenant.metadata.name);
     }
     const hostsKnown = !hostPullFailure || this.hostPulls.has(tenant.metadata.name);
+    const registryNats = await this.registryNats(tenant);
     // The quota keeps the tenant-auth addition only while its Deployments exist; the
     // tenant-auth step below is the one that raises it (#121).
     const desired = tenantResources(
@@ -682,6 +1007,7 @@ export class Controller {
       registryDeployed,
       await this.tenantAuthNetworkApplied(tenant),
       hostPull,
+      registryNats,
     ).filter(
       (value) =>
         hostsKnown ||
@@ -720,23 +1046,27 @@ export class Controller {
     } catch (error) {
       failure = error;
     }
+    // Apart from the apply, so neither failure holds the other back. A cleanup failure is
+    // reported unless the apply already failed, and the cleanup is retried on the next pass.
+    try {
+      await this.pruneLogReader(tenant);
+    } catch (error) {
+      failure ??= error;
+    }
     // Tenant-auth is independent of the tenant's own objects: a failed apply above (such as a
     // hostgroup 409) must not keep it from reconciling or from reporting TenantAuthReady (#121).
     let auth = await this.reconcileTenantAuth(tenant, users);
-    if (hostPullFailure && auth) {
-      const message =
-        hostPullFailure instanceof Error ? hostPullFailure.message : String(hostPullFailure);
-      auth = {
-        ...auth,
-        status: 'False',
-        reason: 'HostPullError',
-        message: `Tenant host registry wiring could not be read: ${message}`,
-      };
-    }
+    if (hostPullFailure && auth) auth = withHostPullFailure(auth, hostPullFailure);
+    // A projection ConfigMap that keeps failing to be written (#316); absent otherwise.
+    const logs = logWriteCondition(
+      this.logWriteFailures.get(tenant.metadata.name),
+      tenant.metadata.generation ?? 1,
+    );
+    const others = [...(auth ? [auth] : []), ...(logs ? [logs] : [])];
     if (failure) {
       const message = failure instanceof Error ? failure.message : 'Reconciliation failed';
       console.error(`Tenant/${tenant.metadata.name}: ${message}`);
-      await this.status(tenant, false, 'ReconcileError', message, {}, auth ? [auth] : []);
+      await this.status(tenant, false, 'ReconcileError', message, {}, others);
       return;
     }
     await this.status(
@@ -749,7 +1079,7 @@ export class Controller {
           ? 'Tenant resources are ready'
           : 'Waiting for runtime and backend deployments',
       { ...n, httpService: `di-http.${n.runtimeNamespace}.svc.cluster.local` },
-      auth ? [auth] : [],
+      others,
     );
   }
   /**
@@ -777,6 +1107,7 @@ export class Controller {
       }
       this.tenantAuthClean = false;
       const registry = await this.registryState(tenant);
+      const registryNats = await this.registryNats(tenant);
       // Objects read while computing the inputs, reused by the adoption check below.
       const fetched = new Map<string, Resource | undefined>();
       const desired = tenantAuthResources(tenant, this.cfg, {
@@ -787,7 +1118,10 @@ export class Controller {
           fetched,
         )),
         registryServing: registry.serving,
+        registryNats: Controller.registryNatsMode(registryNats),
       });
+      // The CA Secret was accepted this pass: a later refusal is logged again.
+      this.caRefusals.delete(tenant.metadata.name);
       // Gateway policies for hosts that are no longer routed, pruned before anything is applied
       // so de-routing holds even when a later apply fails.
       const namespace = names(tenant.metadata.name).runtimeNamespace;
@@ -812,6 +1146,8 @@ export class Controller {
         for (const [kind, stale] of [
           ['Secret', REGISTRY_PULL_SECRET],
           ['Service', REGISTRY_PULL_SERVICE],
+          // The registry's NATS credentials (#159); its store and marker are kept.
+          ['Secret', REGISTRY_NATS_SECRET],
         ] as const) {
           const value = await this.get<Resource>(`${collection('v1', kind, namespace)}/${stale}`);
           if (
@@ -833,7 +1169,16 @@ export class Controller {
       }
       // Raise the quota right before the pair so its pods fit when they are created (#121), and
       // the tenant quota right before the registry so it takes no workload slot of the tenant's.
-      await this.ensure(runtimeQuota(tenant, this.cfg, true));
+      await this.ensure(
+        runtimeQuota(
+          tenant,
+          this.cfg,
+          true,
+          registryNats?.stage === 'migrating' &&
+            !tenant.spec.suspended &&
+            !tenant.metadata.deletionTimestamp,
+        ),
+      );
       if (this.cfg.tenantAuth.registry) await this.ensure(tenantQuota(tenant, this.cfg, true));
       let ready = true;
       const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
@@ -854,6 +1199,16 @@ export class Controller {
             (status?.readyReplicas ?? 0) === spec.replicas;
         }
       }
+      // The CA key moved to the platform namespace (#170), which the loop above just applied:
+      // drop the copy the tenant controller's ServiceAccount could read.
+      const legacyCaKey = fetched.get(
+        `${collection('v1', 'Secret', namespace)}/${TENANT_CONTROLLER_CA_KEY_SECRET}`,
+      );
+      if (
+        legacyCaKey?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+        legacyCaKey.metadata.labels[OWNER] === tenant.metadata.uid
+      )
+        await this.remove(legacyCaKey);
       const { problems } = tenantAuthRoutes(this.cfg.tenantAuth, this.cfg.routeUrlPattern);
       if (problems.length) return condition(false, 'RouteError', problems.join('; '));
       if (registry.conflict)
@@ -863,6 +1218,8 @@ export class Controller {
           `WorkloadDeployment ${registry.conflict} claims the tenant registry host ` +
             `${registryHttpHost(this.cfg.tenantAuth)}; the registry is not served until it is removed`,
         );
+      const nats = registryNatsCondition(registryNats, namespace);
+      if (nats) return condition(false, nats.reason, nats.message);
       const what = this.cfg.tenantAuth.registry
         ? 'tenant controller, console and registry'
         : 'tenant controller and console';
@@ -871,7 +1228,12 @@ export class Controller {
         : condition(false, 'Provisioning', `Waiting for the ${what}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Tenant-auth reconcile failed';
-      console.error(`Tenant/${tenant.metadata.name} tenant-auth: ${message}`);
+      const refused = error instanceof ControllerCaRefused;
+      // A refused CA Secret stays refused until someone acts: logged once, reported every pass.
+      if (!refused || this.caRefusals.get(tenant.metadata.name) !== message)
+        console.error(`Tenant/${tenant.metadata.name} tenant-auth: ${message}`);
+      if (refused) this.caRefusals.set(tenant.metadata.name, message);
+      else this.caRefusals.delete(tenant.metadata.name);
       if (!this.cfg.tenantAuth) return undefined;
       try {
         // Never leave the quota raised for a pair that was not applied (#121).
@@ -882,7 +1244,7 @@ export class Controller {
       } catch {
         /* The tenant step lowers it on the next poll. */
       }
-      return condition(false, 'ReconcileError', message);
+      return condition(false, refused ? 'ControllerCaNotOwned' : 'ReconcileError', message);
     }
   }
   /**
@@ -997,6 +1359,8 @@ export class Controller {
       for (const value of await this.list<Resource>(apiVersion, kind, labels))
         await this.remove(value);
   }
+  /** The last CA Secret refusal logged per tenant (#170), so it is logged once. */
+  private readonly caRefusals = new Map<string, string>();
   /** True once a sweep found no tenant-auth objects; reset when a Tenant is deleted. */
   private tenantAuthClean = false;
   /**
@@ -1017,6 +1381,31 @@ export class Controller {
       }
     this.tenantAuthClean = !found;
   }
+  /** Tenant uids whose leftover log reader is known to be gone (see {@link pruneLogReader}). */
+  private readonly logReaderPruned = new Set<string>();
+  /**
+   * One-time upgrade cleanup (#321): delete the tenant's leftover {@link LOG_READER} binding, then
+   * its Role. Only objects labelled with this installation and the Tenant's uid are deleted; a
+   * foreign object of that name is left alone. Idempotent: once the check has run without error
+   * it is skipped for the tenant until the controller restarts.
+   */
+  private async pruneLogReader(tenant: Tenant): Promise<void> {
+    // Without a uid nothing can be proven to be this Tenant's, so nothing is deleted.
+    const uid = tenant.metadata.uid;
+    if (!uid || this.logReaderPruned.has(uid)) return;
+    const namespace = names(tenant.metadata.name).runtimeNamespace;
+    for (const [apiVersion, kind] of LOG_READER_KINDS) {
+      const value = await this.get<Resource>(
+        `${collection(apiVersion, kind, namespace)}/${LOG_READER}`,
+      );
+      if (
+        value?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+        value.metadata.labels[OWNER] === uid
+      )
+        await this.remove(value);
+    }
+    this.logReaderPruned.add(uid);
+  }
   /** No gateway is published any more: drop the route template so the console stops linking. */
   private async removeRoutes(tenant: Tenant): Promise<void> {
     const routes = await this.get<Resource>(
@@ -1031,11 +1420,14 @@ export class Controller {
   async reconcileUser(user: User, tenants: Tenant[]): Promise<void> {
     if (!validName(user.metadata.name)) throw new Error('Invalid user name');
     if (!user.metadata.deletionTimestamp) await this.finalizer(user, true);
-    const desired = userResources(user, tenants, this.cfg);
     const bindings = await this.list<Resource>('rbac.authorization.k8s.io/v1', 'RoleBinding', {
       [INSTALLATION]: this.cfg.installation,
       [OWNER]: user.metadata.uid!,
     });
+    // Memberships already bound survive while their tenant is merely Not Ready, so the token
+    // Secrets Pulumi reads stay in place until the tenant converges.
+    const granted = new Set(bindings.flatMap((binding) => binding.metadata.labels?.[TENANT] ?? []));
+    const desired = userResources(user, tenants, this.cfg, granted);
     for (const binding of bindings)
       if (!desired.some((r) => location(r) === location(binding))) await this.remove(binding);
     // Token Secrets go before the ServiceAccount so no orphaned credential outlives it.
@@ -1121,9 +1513,15 @@ export class Controller {
       await this.reconcilePostgres(service, tenant, cls, sizing);
       return;
     }
-    const desired = backingServiceResources(service, tenant, cls, this.cfg, sizing);
-    const ready = await this.applyBackingServiceResources(desired);
-    await this.updateBackingServiceStatus(service, tenant, cls, ready);
+    // The live Deployment keeps its data hostPath, so a storage-root change never orphans data.
+    const deploymentPath = `${collection('apps/v1', 'Deployment', runtimeNamespace)}/${backingServiceResourceName(service.metadata.name)}`;
+    const live = await this.get<Resource>(deploymentPath);
+    const desired = backingServiceResources(service, tenant, cls, this.cfg, sizing, live);
+    const rollout = await this.applyBackingServiceResources(
+      desired,
+      new Map([[deploymentPath, live]]),
+    );
+    await this.updateBackingServiceStatus(service, tenant, cls, rollout);
   }
 
   /** Egress runs nothing: the service is Ready once its class approves every destination. */
@@ -1224,7 +1622,15 @@ export class Controller {
         [INSTALLATION]: this.cfg.installation,
         [OWNER]: service.metadata.uid!,
       });
-      const state = postgresReadiness(pvc, deployments, pods);
+      let state = postgresReadiness(pvc, deployments, pods);
+      if (!tenant.spec.suspended && state.reason === 'Initializing') {
+        // Quota/admission rejections leave no pods, so only the Deployment explains the wait.
+        const failure = deployments
+          .filter((d) => (d.spec as { replicas?: number }).replicas !== 0)
+          .map((d) => deploymentFailure(d))
+          .find((f) => f !== undefined);
+        if (failure) state = { ready: false, ...failure };
+      }
       await this.status(
         service,
         !tenant.spec.suspended && state.ready,
@@ -1392,10 +1798,14 @@ export class Controller {
     return { cls, sizing: sized.sizing };
   }
 
-  private async applyBackingServiceResources(desired: Resource[]): Promise<boolean> {
+  private async applyBackingServiceResources(
+    desired: Resource[],
+    fetched?: ReadonlyMap<string, Resource | undefined>,
+  ): Promise<{ ready: boolean; failure?: DeploymentFailure }> {
     let ready = true;
+    let failure: DeploymentFailure | undefined;
     for (const value of desired) {
-      const applied = await this.ensure(value);
+      const applied = await this.ensure(value, false, false, fetched);
       if (value.kind !== 'Deployment') continue;
       if (applied.metadata.name === RUNTIME_DATA_NATS)
         throw new Error(`Refusing to manage runtime data plane ${RUNTIME_DATA_NATS}`);
@@ -1403,29 +1813,32 @@ export class Controller {
       const status = applied.status as
         | { observedGeneration?: number; readyReplicas?: number; replicas?: number }
         | undefined;
-      ready &&=
+      const deploymentReady =
         status?.observedGeneration === applied.metadata.generation &&
         (status?.readyReplicas ?? 0) === spec.replicas &&
         (spec.replicas !== 0 || (status?.replicas ?? 0) === 0);
+      ready &&= deploymentReady;
+      if (!deploymentReady && spec.replicas !== 0) failure ??= deploymentFailure(applied);
     }
-    return ready;
+    return ready ? { ready } : { ready, ...(failure ? { failure } : {}) };
   }
 
   private async updateBackingServiceStatus(
     service: BackingService,
     tenant: Tenant,
     cls: BackingServiceClass,
-    ready: boolean,
+    { ready, failure }: { ready: boolean; failure?: DeploymentFailure },
   ): Promise<void> {
+    const suspended = tenant.spec.suspended;
     await this.status(
       service,
-      ready && !tenant.spec.suspended,
-      tenant.spec.suspended ? 'Suspended' : ready ? 'Ready' : 'Provisioning',
-      tenant.spec.suspended
+      ready && !suspended,
+      suspended ? 'Suspended' : ready ? 'Ready' : (failure?.reason ?? 'Provisioning'),
+      suspended
         ? 'Tenant suspended; backing service scaled down'
         : ready
           ? 'Backing service deployment is ready'
-          : 'Waiting for backing service deployment',
+          : (failure?.message ?? 'Waiting for backing service deployment'),
       {
         runtimeNamespace: names(tenant.metadata.name).runtimeNamespace,
         classRef: {
@@ -1756,11 +2169,31 @@ export class Controller {
   }
 
   /**
-   * Publish one logs ConfigMap per console application (#10). Only `wasi:logging` lines the
-   * host attributed to a workload in this tenant, and host WARN/ERROR lines from its
-   * `workload_start` span, are kept. The newest host failure per WorkloadDeployment goes to
-   * `data.failures`. Nothing is written for an application with no attributed lines, so
-   * absence stays the console's unpublished state.
+   * Projection ConfigMap writes (and deletes) that failed on the last poll, per tenant and
+   * ConfigMap name, with how many polls in a row they failed. reconcileTenant reports one that
+   * persists as the `LogsProjected` condition (#316). Pruned like logCursors.
+   */
+  private readonly logWriteFailures = new Map<string, Map<string, LogWriteFailure>>();
+
+  /**
+   * Publish one logs ConfigMap per projection key (#10, #106): per console application, and
+   * per service and env for a /v1 deployment (logKey). Only `wasi:logging` lines the host
+   * attributed to a workload in this tenant, and host WARN/ERROR lines from its
+   * `workload_start` span, are kept. Each line's WorkloadDeployment goes to
+   * `data.deployments`, its env to `data.envs`, and the newest host failure per
+   * WorkloadDeployment to `data.failures`. Nothing is written for a key with no attributed
+   * lines, so absence stays the console's unpublished state.
+   *
+   * A ConfigMap whose key no live WorkloadDeployment has is removed. That includes the
+   * `di-logs-<service>` ConfigMap staging and prod of a /v1 service shared before #106: each
+   * per-env projection first takes over that ConfigMap's lines and failures of its own
+   * deployment (legacyRing), then the shared one is deleted. When a live workload outside
+   * /v1 still owns that key, the ConfigMap is kept and rewritten in the same pass without the
+   * lines of /v1 deployments, so no line is served from two projections.
+   *
+   * Each write and delete is attempted on its own: one that fails (e.g. at the ConfigMap
+   * quota) is logged and retried on the next poll without holding back the other keys. A
+   * shared ConfigMap whose lines could not be taken over is neither pruned nor deleted.
    */
   async projectLogs(tenant: Tenant): Promise<void> {
     const n = names(tenant.metadata.name);
@@ -1795,65 +2228,214 @@ export class Controller {
         )}`,
       )
     ).items.map((item) => ({ ...item, apiVersion: 'v1', kind: 'ConfigMap' }));
-    const existingByApp = new Map(
-      existing.map((item) => [item.metadata.labels?.['di-framework.dev/application'] ?? '', item]),
+    const existingByKey = new Map(existing.map((item) => [logKeyId(configMapLogKey(item)), item]));
+    const keys = new Map<string, LogKey>();
+    const members = new Map<string, string[]>();
+    for (const deployment of deployments) {
+      const key = logKey(deployment);
+      const id = logKeyId(key);
+      keys.set(id, key);
+      members.set(id, [...(members.get(id) ?? []), deployment.name]);
+    }
+    // The published ring of each live key. A /v1 key without its own ConfigMap yet starts from
+    // its deployment's lines in the ConfigMap every env of the service shared before #106.
+    const current = new Map<string, Resource>();
+    const seeded = new Set<string>();
+    for (const [id, key] of keys) {
+      const own = existingByKey.get(id);
+      const legacy = key.env ? existingByKey.get(key.application) : undefined;
+      if (own || !legacy) {
+        if (own) current.set(id, own);
+        continue;
+      }
+      const seed = legacyRing(legacy, `${key.application}-${key.env}`, key.env);
+      if (seed.lines.length === 0 && Object.keys(seed.failures).length === 0) continue;
+      seeded.add(id);
+      current.set(
+        id,
+        logsConfigMap(
+          tenant.metadata.name,
+          n.namespace,
+          this.cfg.installation,
+          key.application,
+          seed.lines,
+          seed.failures,
+          key.env,
+        ),
+      );
+    }
+    // /v1 deployments; their lines never belong in a projection outside /v1 (see pruning).
+    const v1Deployments = new Set(
+      deployments.filter((deployment) => logKey(deployment).env).map((d) => d.name),
     );
-    const incoming = new Map<string, string[]>();
+    const pruned = new Set<string>();
+    for (const [id, key] of keys)
+      if (
+        !key.env &&
+        projectedRing(current.get(id)).some((entry) => v1Deployments.has(entry.deployment))
+      )
+        pruned.add(id);
+    const incoming = new Map<string, RingLine[]>();
     // Failures are merged newest-wins by deployment, so they skip the line floor: a
     // restarted controller re-reading old lines cannot duplicate them, and never loses one.
     const failures = new Map<string, ProjectedEntry[]>();
+    // Cursors of host pods that no longer exist are dropped (#131); a pod that is listed but not
+    // running keeps its cursors. So are those of keys no live WorkloadDeployment has.
+    const cursors =
+      this.logCursors.get(tenant.metadata.name) ?? new Map<string, Map<string, string>>();
+    this.logCursors.set(tenant.metadata.name, cursors);
+    const listed = new Set(pods.items.map((pod) => pod.metadata.uid ?? pod.metadata.name));
+    for (const pod of cursors.keys()) if (!listed.has(pod)) cursors.delete(pod);
+    for (const podCursors of cursors.values())
+      for (const id of podCursors.keys()) if (!keys.has(id)) podCursors.delete(id);
+    const writeFailures =
+      this.logWriteFailures.get(tenant.metadata.name) ?? new Map<string, LogWriteFailure>();
+    this.logWriteFailures.set(tenant.metadata.name, writeFailures);
+    /** Where each key's cursor of each pod moves once that key's ConfigMap is written (#316). */
+    const advance = new Map<string, Map<string, string>>();
     for (const pod of pods.items) {
       if (pod.status?.phase !== 'Running') continue;
       const cursorKey = pod.metadata.uid ?? pod.metadata.name;
-      const cursor = this.logCursors.get(cursorKey);
+      const podCursors = cursors.get(cursorKey) ?? new Map<string, string>();
+      cursors.set(cursorKey, podCursors);
+      // Read from the oldest key cursor, so a key whose write failed reads its lines again.
+      const oldest = [...podCursors.values()].reduce<string | undefined>(
+        (min, value) => (min === undefined || value < min ? value : min),
+        undefined,
+      );
       // Re-read a short window before the cursor so a service failure logged just after a
       // tick still sees its `Starting workload` line. The floor below drops repeated lines
-      // and failures merge idempotently.
-      const query = cursor
+      // and failures merge idempotently. While a write keeps failing, its key's cursor stays
+      // put. While any write or delete of this tenant is failing, every pod read is bounded like
+      // the first one, and the ring by appendRing.
+      const bound = writeFailures.size > 0 ? '&tailLines=1000' : '';
+      const query = oldest
         ? `sinceTime=${encodeURIComponent(
-            new Date(Date.parse(cursor) - LOG_LOOKBACK_MS).toISOString().replace(/\.\d+Z$/, 'Z'),
-          )}`
+            new Date(Date.parse(oldest) - LOG_LOOKBACK_MS).toISOString().replace(/\.\d+Z$/, 'Z'),
+          )}${bound}`
         : 'tailLines=1000';
       const text = await this.api.call<string>(
         'GET',
         `${collection('v1', 'Pod', n.runtimeNamespace)}/${encodeURIComponent(pod.metadata.name)}/log?${query}`,
       );
-      let newest = cursor ?? '';
-      for (const [app, entries] of attributeEntries(text ?? '', n.namespace, deployments)) {
-        // A restarted controller resumes after the newest line it already published.
-        const floor = cursor ?? projectedLines(existingByApp.get(app)).at(-1)?.split(' ')[0] ?? '';
-        const fresh = entries.filter((entry) => entry.time > floor);
-        for (const entry of fresh) if (entry.time > newest) newest = entry.time;
-        incoming.set(app, [
-          ...(incoming.get(app) ?? []),
-          ...fresh.flatMap((entry) => (entry.line ? [entry.line] : [])),
+      let newest = '';
+      for (const [id, entries] of attributeEntries(text ?? '', n.namespace, deployments)) {
+        // A pod first seen for this key (e.g. after a controller restart) resumes after the
+        // newest line already published for the key. The cursor is pinned there at once, so a
+        // failed write retries from it rather than from lines published since by another pod.
+        let floor = podCursors.get(id);
+        if (floor === undefined) {
+          floor = newestStamp(projectedRing(current.get(id)));
+          podCursors.set(id, floor);
+        }
+        // A line stamped exactly at the floor is read again: another pod (or a later write of
+        // this one) can log a distinct line with the same stamp. unpublished drops the repeats.
+        const fresh = entries.filter((entry) => entry.time >= (floor as string));
+        for (const entry of entries) if (entry.time > newest) newest = entry.time;
+        incoming.set(id, [
+          ...(incoming.get(id) ?? []),
+          ...fresh.flatMap((entry) =>
+            entry.line
+              ? [{ line: entry.line, deployment: entry.deployment, env: entry.env ?? '' }]
+              : [],
+          ),
         ]);
-        failures.set(app, [...(failures.get(app) ?? []), ...entries]);
+        failures.set(id, [...(failures.get(id) ?? []), ...entries]);
       }
-      if (newest) this.logCursors.set(cursorKey, newest);
+      // Every key of this pod has seen the pod's log up to its newest attributed line, so each
+      // may move there, once its own ConfigMap holds what it read.
+      if (newest)
+        for (const id of podCursors.keys())
+          advance.set(id, (advance.get(id) ?? new Map<string, string>()).set(cursorKey, newest));
     }
-    const live = new Set(deployments.map(applicationKey));
-    for (const [app, lines] of incoming) {
-      if (!live.has(app) || !validLabelValue(app)) continue;
-      const current = existingByApp.get(app);
-      const previous = projectedFailures(current);
-      const members = deployments.filter((d) => applicationKey(d) === app).map((d) => d.name);
-      const merged = mergeFailures(previous, failures.get(app) ?? [], members);
-      if (lines.length === 0 && JSON.stringify(merged) === JSON.stringify(previous)) continue;
-      await this.ensure(
-        logsConfigMap(
-          tenant.metadata.name,
-          n.namespace,
-          this.cfg.installation,
-          app,
-          appendRing(projectedLines(current), lines),
-          merged,
+    /** Shared ConfigMaps (by key id) a per-env projection could not take over from yet. */
+    const held = new Set<string>();
+    /** ConfigMaps written or deleted this pass; a failure of any other one is not current. */
+    const attempted = new Set<string>();
+    const attempt = async (name: string, write: () => Promise<unknown>) => {
+      attempted.add(name);
+      try {
+        await write();
+        writeFailures.delete(name);
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'write failed';
+        const previous = writeFailures.get(name);
+        writeFailures.set(name, { count: (previous?.count ?? 0) + 1, message });
+        // Logged when it starts or changes; one that persists is on the Tenant (LogsProjected).
+        if (previous?.message !== message)
+          console.error(`Tenant/${tenant.metadata.name} logs ConfigMap ${name}: ${message}`);
+        return false;
+      }
+    };
+    /** Keys whose ConfigMap could not be written; their cursors stay put for the next poll. */
+    const unwritten = new Set<string>();
+    // Takeovers first, so a shared ConfigMap is pruned or deleted only once they are written.
+    for (const id of new Set([...seeded, ...pruned, ...incoming.keys()])) {
+      const key = keys.get(id) as LogKey;
+      if (!validLabelValue(key.application)) continue;
+      const published = current.get(id);
+      const ring = projectedRing(published);
+      // Lines of a write that applied although it reported a failure are not appended twice.
+      const lines = unpublished(ring, incoming.get(id) ?? []);
+      const previous = projectedFailures(published);
+      const merged = mergeFailures(previous, failures.get(id) ?? [], members.get(id) ?? []);
+      const prune = pruned.has(id) && !held.has(id);
+      if (
+        !seeded.has(id) &&
+        !prune &&
+        lines.length === 0 &&
+        JSON.stringify(merged) === JSON.stringify(previous)
+      )
+        continue;
+      const configMap = logsConfigMap(
+        tenant.metadata.name,
+        n.namespace,
+        this.cfg.installation,
+        key.application,
+        appendRing(
+          ring.filter((entry) => !prune || !v1Deployments.has(entry.deployment)),
+          lines,
         ),
+        merged,
+        key.env,
       );
+      const written = await attempt(configMap.metadata.name, () => this.ensure(configMap));
+      if (written) continue;
+      unwritten.add(id);
+      if (seeded.has(id)) held.add(key.application);
     }
-    for (const [app, configMap] of existingByApp) {
-      if (!live.has(app)) await this.remove(configMap);
+    for (const [id, moves] of advance)
+      if (!unwritten.has(id))
+        for (const [pod, newest] of moves)
+          if (newest > (cursors.get(pod)?.get(id) ?? '')) cursors.get(pod)?.set(id, newest);
+    for (const [id, configMap] of existingByKey) {
+      if (!keys.has(id) && !held.has(id))
+        await attempt(configMap.metadata.name, () => this.remove(configMap));
     }
+    for (const name of writeFailures.keys()) if (!attempted.has(name)) writeFailures.delete(name);
+    if (writeFailures.size === 0) this.logWriteFailures.delete(tenant.metadata.name);
+  }
+
+  /**
+   * Drop the in-memory state of tenants that are gone (#131): the host wiring and logged CA Secret
+   * refusal (#170) of every tenant no longer listed, and the log cursors of every tenant whose logs are no longer projected
+   * (removed, suspended or being deleted; their host pods are stopped). A tenant that comes back
+   * starts as after a controller restart.
+   */
+  private forgetTenants(tenants: readonly Tenant[]): void {
+    const listed = new Set(tenants.map((tenant) => tenant.metadata.name));
+    const projected = new Set(
+      tenants
+        .filter((tenant) => !tenant.spec.suspended && !tenant.metadata.deletionTimestamp)
+        .map((tenant) => tenant.metadata.name),
+    );
+    for (const name of this.hostPulls.keys()) if (!listed.has(name)) this.hostPulls.delete(name);
+    for (const name of this.caRefusals.keys()) if (!listed.has(name)) this.caRefusals.delete(name);
+    for (const name of this.logCursors.keys())
+      if (!projected.has(name)) this.logCursors.delete(name);
+    for (const name of this.logWriteFailures.keys())
+      if (!projected.has(name)) this.logWriteFailures.delete(name);
   }
 
   async tick(): Promise<void> {
@@ -1869,6 +2451,7 @@ export class Controller {
     const services = await this.list<BackingService>(VERSION, 'BackingService', {});
     const bindings = await this.list<ServiceBinding>(VERSION, 'ServiceBinding', {});
     const tenantByName = new Map(tenants.map((t) => [t.metadata.name, t]));
+    this.forgetTenants(tenants);
     for (const value of [...tenants, ...users]) {
       try {
         if (value.kind === 'Tenant') await this.reconcileTenant(value as Tenant, users);
@@ -1966,6 +2549,57 @@ export class Controller {
         console.error(`Tenant/${tenant.metadata.name} egress: ${message}`);
       }
     }
+  }
+}
+/**
+ * TenantAuthReady with a failed host wiring lookup (S6 of the #83 `:host-pull` review). An
+ * earlier failure reason of the tenant-auth step (such as `RouteError` or
+ * `RegistryHostConflict`) is kept and the lookup failure is appended to its message (#131);
+ * otherwise the condition turns False with `HostPullError`.
+ */
+export function withHostPullFailure(auth: Condition, failure: unknown): Condition {
+  const detail = `Tenant host registry wiring could not be read: ${
+    failure instanceof Error ? failure.message : String(failure)
+  }`;
+  if (auth.status === 'False' && auth.reason !== 'Provisioning')
+    return { ...auth, message: `${auth.message}; ${detail}` };
+  return { ...auth, status: 'False', reason: 'HostPullError', message: detail };
+}
+/**
+ * The TenantAuthReady reason while the registry is stopped for the move of its store (#159), or
+ * undefined when it runs.
+ */
+export function registryNatsCondition(
+  state: RegistryNats | undefined,
+  namespace: string,
+): { reason: string; message: string } | undefined {
+  const job = `Job ${REGISTRY_NATS_MIGRATION_JOB} in ${namespace}`;
+  switch (state?.stage) {
+    case 'stopping':
+      return {
+        reason: 'RegistryMigrating',
+        message: `Stopping the registry before ${job} moves its store into its NATS account`,
+      };
+    case 'migrating':
+      return state.failed
+        ? {
+            reason: 'RegistryMigrationFailed',
+            message: `${job} could not move the registry store into its NATS account (${state.failed}); the registry stays stopped. Read its logs, then delete the Job to retry`,
+          }
+        : {
+            reason: 'RegistryMigrating',
+            message: `${job} is moving the registry store into its NATS account; the registry is stopped until it finishes`,
+          };
+    case 'migrated':
+      return state.credentials
+        ? undefined
+        : {
+            reason: 'RegistryHostImageUnsupported',
+            message:
+              'The registry store is in its NATS account, but the tenant host image is not a known build with wash patch 0003, so the registry stays stopped until tenantHostImage is one',
+          };
+    default:
+      return undefined;
   }
 }
 export async function main(

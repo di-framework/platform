@@ -4,11 +4,17 @@
 # publish job only validates and pushes the already-tested dist/.
 #
 # Triggers (#172): a push to main that touches one of the paths below, and workflow_dispatch.
-# check-source hashes the committed files in on.push.paths (scripts/source-check.ts); on a push
-# the build is skipped when ghcr.io/di-framework/pglite-encfs:src-<hash> already exists. A
-# dispatch always builds. publish tags the manifest src-<hash>, and pin opens the bot PR
-# "chore: pin pglite-encfs to <digest>" (scripts/pin-artifact.ts). Only pin holds
-# contents: write and pull-requests: write; only publish holds packages: write.
+# check-source hashes the committed files in on.push.paths, except the test-only files listed in
+# env.SOURCE_HASH_EXCLUDE (scripts/source-check.ts); on a push the build is skipped when
+# ghcr.io/di-framework/pglite-encfs:src-<hash> already exists. A dispatch always builds. publish
+# tags the manifest src-<hash>, and pin opens the bot PR "chore: pin pglite-encfs to <digest>"
+# (scripts/pin-artifact.ts). Only pin holds contents: write and pull-requests: write; only publish
+# holds packages: write.
+#
+# Files that only test the component (env.SOURCE_HASH_EXCLUDE) still trigger the workflow but are
+# left out of the source hash (#349). A test-only change then stops at check-source, because
+# src-<hash> already exists; a test fix after a failed gate finds its source unpublished and builds
+# and publishes it, with no manual dispatch.
 name: Publish pglite-encfs component
 
 on:
@@ -26,6 +32,16 @@ on:
 
 permissions:
   contents: read
+
+# Read by scripts/source-check.ts: trigger the run, but are not hashed.
+env:
+  SOURCE_HASH_EXCLUDE: |
+    platform/pglite-encfs/tests/**
+    platform/pglite-encfs/src/testdata/**
+    platform/pglite-encfs/scripts/smoke.ts
+    platform/pglite-encfs/scripts/unit.ts
+    platform/pglite-encfs/scripts/lib/tear.ts
+    platform/pglite-encfs/scripts/**/*.test.ts
 
 concurrency:
   group: publish-pglite-encfs
@@ -105,7 +121,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Install wasmtime
-        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
         with:
           version: 'v48.0.1'
 
@@ -181,7 +197,8 @@ jobs:
         with:
           wash-version: v2.5.2
 
-      # oras points the version tag at the manifest wash pushed, so every tag shares one digest.
+      # The publisher pushes the component, its config and the manifest under the commit tag with
+      # oras, pulls it back with wash by digest, then points the version tag at it with oras tag.
       - name: Set up ORAS
         uses: ./.github/actions/setup-oras
 
@@ -206,8 +223,10 @@ jobs:
           fi
 
       # The publisher re-verifies SHA256SUMS, the exported wasi:filesystem/types interface and
-      # that every import is wasi:*, then pushes the commit and version tag, pulls it back by
-      # digest, and points the version tag at that same manifest.
+      # that every import is wasi:*, then pushes the manifest under the commit tag, pulls it back
+      # by digest to compare bytes, and only then points the version tag at that same manifest.
+      # The manifest holds no wall-clock time (SOURCE_DATE_EPOCH is cleared below), so an
+      # unchanged component keeps its digest.
       # Right before the tags move: a re-run of an older push whose inputs main has since
       # changed stops here (check-source is not re-run by "Re-run failed jobs").
       - name: Stop if main has newer inputs
@@ -221,6 +240,9 @@ jobs:
         if: steps.guard.outputs.stale != 'true'
         env:
           PUSH: 'true'
+          # Cleared so no exported value reaches the publisher: a per-commit created time
+          # would give an unchanged component a new digest on every publish.
+          SOURCE_DATE_EPOCH: ''
           DI_OCI_REGISTRY: ghcr.io
           DI_OCI_CLUSTER_REGISTRY: ghcr.io
           DI_OCI_REPOSITORY: di-framework/pglite-encfs

@@ -9,10 +9,22 @@ Use `-- --check` to validate an existing build without rebuilding or publishing.
 The component retains its independent Cargo workspace and pinned toolchain.
 
 `PUSH=true cargo run --locked -p oci-registry-publisher` (or `make publish-local`
-here) also publishes through `wash oci push`, pulls by the returned manifest
-digest, verifies the bytes, and writes `dist/publish-report.json`. This preserves
-the reference branch's Wasm OCI format; `oci-builder` builds container images,
-so this component flow still needs `wash` on PATH.
+here) also publishes: it writes the Wasm OCI config and manifest itself, pushes
+the layer and config, then the manifest under `DI_OCI_TAG` only, with `oras`,
+pulls the component back with `wash` by the manifest digest and verifies the
+bytes. Only then does it point any extra (version) tag at that manifest with
+`oras tag`, and it writes `dist/publish-report.json`. This keeps the Wasm OCI
+format `wash oci push` produces (the config is byte-identical to wash 2.5.2's
+apart from `created`; see `platform/wasm-component-publisher/tests/fixtures`);
+`oci-builder` builds container images, so this component flow needs `oras` and
+`wash` on PATH.
+
+The config and manifest carry no wall-clock time: their `created` time is
+`SOURCE_DATE_EPOCH` when set, else `1970-01-01T00:00:00Z`, and their JSON has a
+fixed field order. Publishing the same `dist/` again, from any commit, gives the
+same manifest digest; a different component gives a different one. The publish
+workflows clear `SOURCE_DATE_EPOCH` on the publisher step, so the digest depends
+only on the component.
 
 Defaults are `DI_OCI_REGISTRY=127.0.0.1:25001`,
 `DI_OCI_REPOSITORY=di-framework/oci-registry`, and a content-derived tag.
@@ -27,7 +39,7 @@ environment. Tool output in errors has those secrets masked.
 
 Cargo's `build.rs` only tracks compile-time inputs. Publication requires an
 explicit executable run with `PUSH=true`. The publish workflow
-installs Rust, Go/native build dependencies, Wasm tools, and wash before running
+installs Rust, Go/native build dependencies, Wasm tools, wash, and oras before running
 the publisher. Pull requests build and validate without publishing.
 
 Per-tenant OCI registry component for the di-framework platform (#83
@@ -86,7 +98,7 @@ including the `GET /v2/` probe, the registry:
    `Authorization: Bearer <password>`. The call has a 2 s connect, 5 s
    first-byte and 5 s between-bytes timeout (`wasi:http` request options), and
    the guest also abandons it after 12 s by the monotonic clock in case the
-   host ignores those options. A timeout denies (`401`).
+   host ignores those options. A timeout answers `503` (see below).
 3. Requires a 2xx body shaped like the contract's `Principal` (`user`,
    `account`, `role`, `via`) whose `account` equals the bind-time `tenant`
    key. A principal from another tenant's controller is denied.
@@ -120,16 +132,42 @@ Worst cases before a revoked credential stops working at the registry:
 
 `POST /v1/auth/logout` on the controller does not clear the registry's cache.
 
-It **fails closed**: if `tenant-controller-url` or `tenant` is missing or
-malformed, the controller is unreachable or too slow, or it answers anything
-other than a 2xx `Principal` for this tenant with a `viewer` / `developer`
-role, the request gets the `401` challenge.
+It **fails closed**: only a 2xx `Principal` for this tenant with a `viewer` /
+`developer` role authorizes a request. The refusal tells the client why:
+
+| Controller outcome                                                                                    | Registry answer                                   |
+| ----------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `5xx`, connection refused or reset, DNS failure, any timeout                                          | `503 UNAVAILABLE` with `Retry-After`              |
+| `401`, `403`, `429`, any other non-2xx, an unusable body, another tenant's account                    | `401 UNAUTHORIZED` with `WWW-Authenticate: Basic` |
+| A configuration-type `send` error, e.g. `configuration-error`, `HTTP-request-denied`, any TLS failure | `401 UNAUTHORIZED` with `WWW-Authenticate: Basic` |
+| `tenant-controller-url` or `tenant` missing or malformed                                              | `401 UNAUTHORIZED` with `WWW-Authenticate: Basic` |
+
+A failed whoami call logs its `wasi:http` error code to stderr: the code only,
+never its payload, the URL or the credential, and a given code at most once a
+minute (the next line says how many were left out). Like the whoami cache, that
+limit lives in the component instance, so it only applies if one instance
+serves more than one request; if wash instantiates per request (unverified, see
+above), every failure is logged. Configuration-type codes (the host's
+outgoing-HTTP policy, TLS against the controller, such as a rejected
+certificate, a server alert like `unknown_ca` or TLS spoken to a plain-HTTP
+port, and requests the host will never send) cannot clear on retry, so they get
+the challenge rather than a `503`. A controller `429` also gets the challenge:
+whoami is not rate-limited, so the registry does not treat it as temporary.
+
+The `503` covers a controller restart or an identity issuer outage (the
+controller answers its own `503` while OIDC discovery is pending), so
+`docker login` / `docker push` reports a temporary failure instead of bad
+credentials. It has no `WWW-Authenticate` header and an OCI error body,
+`{"errors":[{"code":"UNAVAILABLE","message":"..."}]}`. `Retry-After` is the
+controller's own delta-seconds value clamped to 1–60 s, or 5 s when the
+controller sent none (or an HTTP-date), timed out or could not be reached.
+A `503` is never cached, so the next request asks the controller again.
 
 ### Configuration
 
 | Key                     | Source                                 | Example                                              |
 | ----------------------- | -------------------------------------- | ---------------------------------------------------- |
-| `tenant-controller-url` | `wasmcloud:secrets` (bind-time config) | `https://tenant-controller.di-runtime-acme.svc:8788` |
+| `tenant-controller-url` | `wasmcloud:secrets` (bind-time config) | `https://tenant-controller.di-runtime-acme.svc:8789` |
 | `tenant`                | `wasmcloud:secrets` (bind-time config) | `acme`                                               |
 
 `https://` is accepted for any host. Plain `http://` is accepted only for
@@ -137,13 +175,17 @@ cluster-local hosts (`*.svc`, `*.svc.cluster.local`) and loopback (for
 `wash dev`); any other `http://` URL denies every request, so a typo cannot
 send tokens off-cluster in cleartext.
 
+A bracketed IPv6 authority counts as cluster-local only when it is loopback
+and is followed by nothing or by `:<digits>`; `http://[::1]evil.example` and
+the like are rejected.
+
 Both values are read through the same `wasmcloud:secrets` `store` + `reveal`
 imports upstream already used for its credentials, so the component's import
 surface grows only by `wasi:http/client` and the monotonic clock; no
 `wasi:config` host plugin is required. An optional path prefix is kept
 (`https://host/prefix` calls `/prefix/v1/auth/whoami`).
 
-### Plain HTTP to the controller
+### TLS to the controller
 
 The tenant controller serves HTTPS with a private CA. A component's outgoing
 `wasi:http` request is made by the host (wash 2.x, wasmtime-wasi-http over
@@ -151,30 +193,54 @@ hyper + rustls), which verifies the server against the **host's** trust roots;
 `wasi:http/types` has no per-request field for a custom CA, and the wasi-tls
 work tracked for the tenant host (#81) concerns TLS the guest terminates or
 originates itself over `wasi:sockets`, not the host's HTTP client. So
-`https://` only works when the tenant's private CA is installed in every
-tenant host's trust store, which couples the host image to each tenant's CA.
+`https://` only works when the host trusts the tenant's private CA.
 
-The component accepts either. `:reconcile` (platform#83) uses plain HTTP to a
-separate controller listener, `http://tenant-controller.di-runtime-<tenant>.svc:8789`,
-which serves only `GET /v1/auth/whoami`; a NetworkPolicy admits only the
-tenant's host pods to it (see the `tenantAuth` section of
-`platform/platform/README.md`). The credential crosses the pod network in
-**cleartext** there: a namespace is not a network boundary. The hop from the
-controller's TLS registry front to the host is plain HTTP too, so the Basic
-credential is cleartext on the pod network before the registry sees it. Both
-hops stay cleartext unless the cluster encrypts pod traffic (CNI WireGuard or
-mesh mTLS); off-cluster, users reach the registry only over TLS. Once the
-tenant host is confirmed to accept an extra trust root, an `https://` URL
-works with no code change.
+wash 2.8 can do that without a per-tenant image: `wash host
+--http-client-ca-path <pem>` (`WASH_HTTP_CLIENT_CA_PATHS`) layers extra PEM
+roots on top of the default webpki roots for every component's outgoing
+`wasi:http` request, P2 and P3 alike, and is read once when the host starts.
+The platform passes it the tenant CA from ConfigMap `tenant-controller-ca`
+(the same file as `--oci-ca-path`), so tenant hosts with a registry trust the
+controller certificate (platform#113).
 
-A bracketed IPv6 authority counts as cluster-local only when it is loopback
-and is followed by nothing or by `:<digits>`; `http://[::1]evil.example` and
-the like are rejected.
+On the platform the callback goes to a separate controller listener,
+`https://tenant-controller.di-runtime-<tenant>.svc:8789`, which serves only
+`GET /v1/auth/whoami` with the controller certificate (whose names always
+include `tenant-controller.di-runtime-<tenant>.svc`); a NetworkPolicy admits
+only the tenant's host pods to it (see the `tenantAuth` section of
+`platform/platform/README.md`). It is the only listener that accepts the host
+pull token. The listener also answers plain HTTP on the same port, so a
+registry still configured with `http://…:8789` keeps working while an upgrade
+rolls out (platform#113).
+
+The hop from the controller's TLS registry front to the host is still plain
+HTTP, so the user's Basic credential is cleartext on the pod network before
+the registry sees it, unless the cluster encrypts pod traffic (CNI WireGuard
+or mesh mTLS); off-cluster, users reach the registry only over TLS.
+
+### Storage limit
+
+On the platform the registry's blobstore is the tenant's `di-nats` JetStream
+store, on the node's host path. Its size is capped by the platform config
+`runtimeNats.maxFileStore` (default `10Gi`, platform#160), shared with every
+other JetStream stream and object store of that tenant. Pulls keep working at
+the cap.
+
+- When writes fill the store up to the cap, the push that would cross it fails
+  with `insufficient resources`. Deleting images frees space, and pushes work
+  again.
+- When the store already holds more than the cap (the cap was lowered below
+  usage, or an upgrade introduced it), every write is refused, **deletes
+  included**: a blobstore delete is a write of a delete marker. The registry
+  cannot free space itself. An operator raises `maxFileStore` (which restarts
+  `di-nats`) or removes data with `nats stream purge` / `nats stream rm`.
+
+See "Runtime NATS storage caps" in `platform/platform/README.md`.
 
 ### Build and test
 
 ```shell
-make test     # cargo test: role -> ops, cache TTL/bound/hash keys, fail-closed (fake controller)
+make test     # cargo test: role -> ops, cache TTL/bound/hash keys, fail-closed, 503 vs 401 (fake controller)
 make lint     # cargo fmt --check + clippy -D warnings
 make build    # dist/di-framework-oci-registry.wasm (+ .wit, BUILD-INFO.txt, SHA256SUMS)
 bun test platform/oci-registry   # artifact + provenance checks
@@ -196,7 +262,7 @@ pushed manifest. It runs `make -C platform/oci-registry test build` and
 pushes `dist/di-framework-oci-registry.wasm` to
 `ghcr.io/di-framework/oci-registry` in the Wasm OCI layout that `wkg` and
 `wash oci push` produce: one `application/wasm` layer and an
-`application/vnd.wasm.config.v0+json` config carrying `created`,
+`application/vnd.wasm.config.v0+json` config carrying `created` (fixed, see above),
 `architecture: "wasm"`, `os: "wasip2"`, `layerDigests` and the `component`
 field (the world's `imports` and `exports`, read from the WIT `make build`
 recovers from the component), which the CNCF Wasm OCI layout requires for
@@ -236,7 +302,7 @@ lacks access shows up in the publisher error as the registry's denial on
 Pin deployments by digest, never by tag. Latest published:
 
 ```
-ghcr.io/di-framework/oci-registry@sha256:77469c031147bcf635469dc8acc21bbcd88977964586775b196db69ed21c0cea
+ghcr.io/di-framework/oci-registry@sha256:a99201b51a1481df0241e4d364e6156da3f18d196d6d83162b76e9a8b812222e
 ```
 
 The SHA tag is informational; only the digest is stable. The tenancy reconcile

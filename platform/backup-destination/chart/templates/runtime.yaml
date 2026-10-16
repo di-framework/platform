@@ -34,6 +34,11 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create"]
+  # Events on that ledger (#254): an entry the sweeper drops without scaling, or gives back
+  # after its destination is gone, is reported here, where tenant roles read events.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
   # Workload volumes (#232): the tenant uid on the host Deployment names the node directory.
   - apiGroups: ["apps"]
     resources: ["deployments"]

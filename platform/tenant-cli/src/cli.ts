@@ -11,6 +11,7 @@ import {
   bearer,
   CliError,
   type Credential,
+  type CredentialStore,
   load,
   needsRefresh,
   readStore,
@@ -29,6 +30,18 @@ import {
   revokeToken,
   type TokenResponse,
 } from './oidc.ts';
+import {
+  dockerConfigPath,
+  loginCommand,
+  loginTool,
+  logoutCommand,
+  type RegistryOrigin,
+  registryOrigin,
+  registryUsername,
+  removeRegistryAuth,
+  storeRegistryAuth,
+} from './registry.ts';
+import { caPem, readCaFile, trusting } from './trust.ts';
 
 export interface Io {
   stdout(line: string): void;
@@ -40,6 +53,11 @@ export interface Io {
   env: NodeJS.ProcessEnv;
   cwd: string;
   fetch?: typeof fetch;
+  /**
+   * Runs a command with `stdin` piped in and the terminal for its output; resolves to its exit
+   * code. `registry login --with <tool>` hands the password over this way, never in argv.
+   */
+  exec?(command: string[], stdin: string): Promise<number>;
   /** How long `login` waits for the browser to come back; five minutes by default. */
   loginTimeoutMs?: number;
 }
@@ -52,7 +70,7 @@ export interface Parsed {
   positionals: string[];
 }
 
-const BOOLEAN_FLAGS = new Set(['json', 'follow', 'force', 'no-browser']);
+const BOOLEAN_FLAGS = new Set(['json', 'follow', 'force', 'no-browser', 'no-ca']);
 
 /** `--flag value`, `--flag=value`, boolean flags, and positionals; `--` ends flag parsing. */
 export function parseArgs(argv: string[]): Parsed {
@@ -86,7 +104,7 @@ export function parseArgs(argv: string[]): Parsed {
 
 export const USAGE = `di-tenant: the tenant CLI pilot. It talks to the tenant controller only.
 
-  login --controller <url> [--account <tenant>] [--api-key <key>] [--no-browser]
+  login --controller <url> [--account <tenant>] [--api-key <key>] [--ca-file <pem> | --no-ca] [--no-browser]
   logout [--account <tenant>]
   whoami [--account <tenant>]
   deploy preview|apply --env <prod|staging> --bundle <file>
@@ -97,6 +115,9 @@ export const USAGE = `di-tenant: the tenant CLI pilot. It talks to the tenant co
   secrets|vars list --env <env>
   secrets|vars set|update <name> --env <env> --from-file <path|->
   secrets|vars unset <name> --env <env>
+  registry [info]
+  registry login [--config <file>] [--with <docker|podman|oras>]
+  registry logout [--host <host>] [--config <file> | --with <docker|podman|oras>]
   proxy --service <name> --env <env> [--port <n>]
   init [name] [--dir <path>] [--name <name>] [--force]
 
@@ -144,16 +165,19 @@ function print(io: Io, flags: Record<string, string>, value: unknown, line: (v: 
 
 /**
  * Resolves the credential on disk for the account, refreshing an identity token that is about to
- * expire, and builds a client with its bearer.
+ * expire (or always, with `fresh`, when the token is about to be handed on), and builds a client
+ * with its bearer.
  */
 async function session(
   flags: Record<string, string>,
   io: Io,
+  fresh = false,
 ): Promise<{ credential: Credential; client: TenantClient }> {
   const store = readStore(io.env);
   const account = resolveAccount(flags.account, io.env, store);
   let credential = load(account, io.env);
-  if (needsRefresh(credential)) {
+  const refreshable = credential.via === 'identity' && credential.refreshToken !== undefined;
+  if (needsRefresh(credential) || (fresh && refreshable)) {
     credential = await refresh(credential, io);
     store[account] = credential;
     writeStore(store, io.env);
@@ -161,7 +185,7 @@ async function session(
   const client = createClient({
     baseUrl: credential.controller.url,
     token: bearer(credential),
-    fetch: io.fetch,
+    fetch: trusting(io.fetch, caPem(credential.controller)),
   });
   return { credential, client };
 }
@@ -264,21 +288,37 @@ async function browserLogin(
   }
 }
 
+function storedCa(store: CredentialStore, controller: string, drop: boolean): string | undefined {
+  if (drop) return undefined;
+  return Object.values(store).find((c) => c.controller.url === controller)?.controller
+    .certificateAuthorityData;
+}
+
 async function login(flags: Record<string, string>, io: Io): Promise<number> {
   const controller = requireFlag(flags, 'controller').replace(/\/$/, '');
-  const info = await createClient({ baseUrl: controller, fetch: io.fetch }).authInfo();
+  const store = readStore(io.env);
+  // `--ca-file` trusts the tenant's controller CA; a later login to the same controller keeps it,
+  // and `--no-ca` drops it (after a CA rotation, or to rely on NODE_EXTRA_CA_CERTS).
+  if (flags['ca-file'] && flags['no-ca'] === 'true')
+    throw new CliError('--ca-file and --no-ca are exclusive');
+  const certificateAuthorityData = flags['ca-file']
+    ? readCaFile(flags['ca-file'])
+    : storedCa(store, controller, flags['no-ca'] === 'true');
+  const controllerInfo = { url: controller, certificateAuthorityData };
+  const controllerFetch = trusting(io.fetch, caPem(controllerInfo));
+  const info = await createClient({ baseUrl: controller, fetch: controllerFetch }).authInfo();
   if (flags.account && info.account !== flags.account) {
     throw new CliError(`${controller} serves account ${info.account}, not ${flags.account}`);
   }
   const apiKey = flags['api-key'];
   const tokens = apiKey ? undefined : await browserLogin(info, flags, io);
   const token = apiKey ?? (tokens as TokenResponse).access_token;
-  const who = await createClient({ baseUrl: controller, token, fetch: io.fetch }).whoami();
+  const who = await createClient({ baseUrl: controller, token, fetch: controllerFetch }).whoami();
   const base = {
     account: info.account,
     user: who.user,
     role: who.role,
-    controller: { url: controller },
+    controller: certificateAuthorityData ? controllerInfo : { url: controller },
   };
   const credential: Credential = apiKey
     ? { ...base, via: 'api-key', apiKey }
@@ -289,11 +329,207 @@ async function login(flags: Record<string, string>, io: Io): Promise<number> {
         clientId: info.clientId,
         ...issued(tokens as TokenResponse),
       };
-  const store = readStore(io.env);
   store[info.account] = credential;
   writeStore(store, io.env);
   io.stderr(`Logged in to ${info.account} as ${who.user} (${who.role}) via ${credential.via}.`);
   return 0;
+}
+
+/**
+ * `GET <origin>/v2/` with the Basic credential, as `docker login` checks one before storing it.
+ * The origin passed `registryOrigin`; a redirect is an error, so a 200 from anywhere else cannot
+ * stand in for the registry's own answer.
+ */
+async function checkRegistry(
+  registry: RegistryOrigin,
+  authorization: string,
+  doFetch: typeof fetch = fetch,
+): Promise<void> {
+  const where = `the registry at ${registry.origin}`;
+  let response: Response;
+  try {
+    response = await doFetch(new URL('/v2/', registry.origin), {
+      headers: { authorization },
+      redirect: 'error',
+    });
+  } catch (error) {
+    // An untrusted certificate keeps its code, so `run` can point at --ca-file.
+    if (tlsTrustCode(error)) throw error;
+    throw new CliError(`cannot reach ${where}: ${(error as Error).message}`);
+  }
+  await response.body?.cancel();
+  if (response.status === 401 || response.status === 403) {
+    throw new CliError(`${where} refused the credential (${response.status})`);
+  }
+  if (!response.ok) throw new CliError(`${where} answered ${response.status}`);
+}
+
+/** `registry [info]`: where to log in and push; no credential is shown. */
+async function registryInfo(flags: Record<string, string>, io: Io): Promise<number> {
+  const { client } = await session(flags, io);
+  const info = await client.registry();
+  const { host } = registryOrigin(info.url);
+  const repository = info.repositoryPrefix ? `${host}/${info.repositoryPrefix}` : host;
+  const lines = [
+    `registry   ${info.url}`,
+    `login      ${host} (username ${info.username}; password: your identity token or dik_ API key)`,
+    `push to    ${repository}/<name>:<tag>`,
+  ];
+  print(io, flags, { ...info, host }, () => lines.join('\n'));
+  return 0;
+}
+
+/**
+ * `registry login`: the caller's identity access token (refreshed first, so the stored copy gets
+ * its full lifetime) or `dik_` key is the Basic password; nothing is minted, and the registry asks
+ * the controller's `/v1/auth/whoami` for the role. The password goes to a 0600 Docker config or a
+ * login tool's stdin, never to the terminal.
+ */
+async function registryLogin(flags: Record<string, string>, io: Io): Promise<number> {
+  const tool = flags.with === undefined ? undefined : loginTool(flags.with);
+  const { credential, client } = await session(flags, io, true);
+  const info = await client.registry();
+  const registry = registryOrigin(info.url);
+  const username = registryUsername(info.username);
+  const password = bearer(credential);
+  let record: NonNullable<Credential['registry']>;
+  let stored: string;
+  if (tool) {
+    if (!io.exec) throw new CliError(`cannot run ${tool} from here`);
+    const code = await io.exec(loginCommand(tool, registry, username), `${password}\n`);
+    if (code !== 0) throw new CliError(`${tool} login ${registry.host} failed (exit ${code})`);
+    record = { host: registry.host, tool };
+    stored = `with ${tool}`;
+  } else {
+    const basic = Buffer.from(`${username}:${password}`).toString('base64');
+    await checkRegistry(
+      registry,
+      `Basic ${basic}`,
+      trusting(io.fetch, caPem(credential.controller)),
+    );
+    const path = dockerConfigPath(flags.config, io.env);
+    const { fingerprint, warning } = storeRegistryAuth(path, registry.host, username, password);
+    if (warning) io.stderr(warning);
+    record = { host: registry.host, config: path, fingerprint };
+    stored = `stored in ${path}`;
+  }
+  const store = readStore(io.env);
+  store[credential.account] = { ...credential, registry: record };
+  writeStore(store, io.env);
+  const access = credential.role === 'developer' ? 'push and pull' : 'pull';
+  io.stderr(
+    `Logged in to ${registry.host} as ${credential.user} (${credential.role}: ${access}); ${stored}.`,
+  );
+  if (credential.via === 'identity') {
+    const expiry = credential.expiresAt ?? 'an unknown time';
+    io.stderr(
+      `The registry password is your identity access token, which expires at ${expiry}; run registry login again then, or log in with a dik_ API key for CI.`,
+    );
+  }
+  return 0;
+}
+
+/**
+ * Removes a registry login from the Docker config, or through the tool that made it. A recorded
+ * Docker config entry is removed only while it matches the fingerprint taken at `registry login`;
+ * a login with no fingerprint (`registry logout --host`) is removed whatever it holds. `automatic`
+ * (from `logout`) never runs `<tool> logout`, which cannot be checked and would remove whatever
+ * that tool holds for the host; it prints the command instead.
+ */
+async function forgetRegistryLogin(
+  login: NonNullable<Credential['registry']>,
+  io: Io,
+  automatic = false,
+): Promise<void> {
+  if (login.tool) {
+    const tool = loginTool(login.tool);
+    if (automatic) {
+      io.stderr(
+        `The ${login.host} login made with ${tool} was kept; to remove it, run: ${logoutCommand(tool, login.host).join(' ')}`,
+      );
+      return;
+    }
+    if (!io.exec) throw new CliError(`cannot run ${tool} from here`);
+    const code = await io.exec(logoutCommand(tool, login.host), '');
+    io.stderr(
+      code === 0
+        ? `Logged out of ${login.host} with ${tool}.`
+        : `warning: ${tool} logout ${login.host} failed (exit ${code})`,
+    );
+    return;
+  }
+  const path = login.config ?? dockerConfigPath(undefined, io.env);
+  const result = removeRegistryAuth(path, login.host, login.fingerprint);
+  const messages = {
+    removed: `Removed the ${login.host} login from ${path}.`,
+    absent: `No ${login.host} login in ${path}.`,
+    changed: `warning: the ${login.host} entry in ${path} changed since registry login (another login replaced it); kept it. Remove it with: registry logout --host ${login.host}`,
+  };
+  io.stderr(messages[result]);
+}
+
+/**
+ * `registry logout`: the login recorded by `registry login`, or `--host` (with `--config` or
+ * `--with`). Needs no controller call, so it works after the token can no longer be refreshed.
+ */
+async function registryLogout(flags: Record<string, string>, io: Io): Promise<number> {
+  const store = readStore(io.env);
+  const accounts = Object.keys(store);
+  const account =
+    accounts.length > 0 || flags.account ? resolveAccount(flags.account, io.env, store) : undefined;
+  const recorded = account ? store[account]?.registry : undefined;
+  let login: Credential['registry'];
+  if (flags.host) {
+    const host = registryOrigin(`https://${flags.host}`).host;
+    login = { host, config: flags.config, tool: flags.with };
+  } else if (recorded) {
+    // A recorded entry without a fingerprint is never removed blindly: '' matches nothing.
+    login = {
+      host: recorded.host,
+      config: flags.config ?? recorded.config,
+      fingerprint: recorded.tool ? undefined : (recorded.fingerprint ?? ''),
+      tool: flags.with ?? recorded.tool,
+    };
+  }
+  if (!login) throw new CliError('no registry login is recorded; pass --host <host>');
+  await forgetRegistryLogin(login, io);
+  if (account && recorded?.host === login.host) {
+    delete (store[account] as Credential).registry;
+    writeStore(store, io.env);
+  }
+  return 0;
+}
+
+/** `registry [info|login|logout]`: the tenant's own OCI registry from `GET /v1/deploy/registry`. */
+function registry(sub: string | undefined, flags: Record<string, string>, io: Io): Promise<number> {
+  switch (sub ?? 'info') {
+    case 'info':
+      return registryInfo(flags, io);
+    case 'login':
+      return registryLogin(flags, io);
+    case 'logout':
+      return registryLogout(flags, io);
+    default:
+      throw new CliError('usage: registry [info|login|logout]');
+  }
+}
+
+/**
+ * TLS errors that mean the certificate chain is not trusted, the case `--ca-file` fixes; expiry
+ * and revocation are not among them.
+ */
+const TLS_TRUST_CODES = new Set([
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'UNABLE_TO_GET_ISSUER_CERT',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'CERT_UNTRUSTED',
+]);
+
+function tlsTrustCode(error: unknown): string | undefined {
+  const code = (error as { code?: unknown } | undefined)?.code;
+  return typeof code === 'string' && TLS_TRUST_CODES.has(code) ? code : undefined;
 }
 
 export async function run(argv: string[], io: Io): Promise<number> {
@@ -306,6 +542,13 @@ export async function run(argv: string[], io: Io): Promise<number> {
     }
     if (error instanceof OidcError) {
       io.stderr(`identity: ${error.message}`);
+      return 1;
+    }
+    const code = tlsTrustCode(error);
+    if (code) {
+      io.stderr(
+        `tls: ${(error as Error).message} (${code}). Trust the tenant's controller CA (ConfigMap tenant-controller-ca): login --ca-file <ca.crt>, or NODE_EXTRA_CA_CERTS=<ca.crt>.`,
+      );
       return 1;
     }
     if ((error as ControllerError).name === 'ControllerError') {
@@ -336,17 +579,30 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
         await createClient({
           baseUrl: credential.controller.url,
           token: bearer(credential),
-          fetch: io.fetch,
+          fetch: trusting(io.fetch, caPem(credential.controller)),
         }).logout();
       } catch {
         // An expired or already revoked token; nothing to tell the controller.
       }
       if (credential.via === 'identity' && credential.refreshToken && credential.issuer) {
-        await revokeToken(
-          await discover(credential.issuer, io.fetch),
-          credential.clientId ?? '',
-          credential.refreshToken,
-          io.fetch,
+        try {
+          await revokeToken(
+            await discover(credential.issuer, io.fetch),
+            credential.clientId ?? '',
+            credential.refreshToken,
+            io.fetch,
+            credential.issuer,
+          );
+        } catch (error) {
+          io.stderr(
+            `warning: failed to revoke token at ${credential.issuer}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      // The registry login holds the same token or key; remove it too, without blocking logout.
+      if (credential.registry) {
+        await forgetRegistryLogin(credential.registry, io, true).catch((error: Error) =>
+          io.stderr(`warning: the ${credential.registry?.host} login was kept: ${error.message}`),
         );
       }
       delete store[account];
@@ -497,9 +753,15 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
       if (!name || (sub !== 'set' && sub !== 'update' && sub !== 'unset')) {
         throw new CliError(`usage: ${command} list|set|update|unset <name>`);
       }
-      if (sub === 'unset')
-        await (secret ? client.unsetSecret(env, name) : client.unsetVar(env, name));
-      else {
+      if (sub === 'unset') {
+        if (secret) await client.unsetSecret(env, name);
+        else {
+          const result = await client.unsetVar(env, name);
+          // With --json the warnings go to stdout for scripts; otherwise each is a stderr line.
+          if (flags.json === 'true') io.stdout(JSON.stringify(result, null, 2));
+          else for (const warning of result.warnings) io.stderr(`warning: ${warning.detail}`);
+        }
+      } else {
         const value = valueFrom(flags, io);
         if (sub === 'set')
           await (secret ? client.setSecret(env, name, value) : client.setVar(env, name, value));
@@ -511,6 +773,8 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
       io.stderr(`${sub} ${command.slice(0, -1)} ${name} in ${env}`);
       return 0;
     }
+    case 'registry':
+      return registry(sub, flags, io);
     case 'proxy': {
       const { client } = await session(flags, io);
       const sessionInfo = await client.proxy(requireFlag(flags, 'service'), {

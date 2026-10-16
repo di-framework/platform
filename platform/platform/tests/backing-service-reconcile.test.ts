@@ -3,6 +3,10 @@ import {
   backingServiceHostPath,
   backingServiceResourceName,
   backingServiceResources,
+  DEFAULT_STORAGE_ROOT,
+  deploymentFailure,
+  liveBackingServiceHostPath,
+  MAX_FAILURE_MESSAGE,
   mergeSizing,
   PROVIDER_RUNTIME,
   parseCpu,
@@ -10,10 +14,8 @@ import {
   RUNTIME_DATA_NATS,
   resolveBackingSizing,
   resolveClass,
-  runtimeDataNatsHostPath,
   SERVICE,
   TRANSITIONAL_REDIS,
-  transitionalRedisHostPath,
   validateSizingAgainstClass,
   validateSizingAgainstTenantBudget,
 } from '../src/tenancy/backing-service-reconcile';
@@ -173,12 +175,11 @@ describe('backing service provisioner helpers', () => {
     expect(backingServiceResourceName('stock')).toBe('di-bs-stock');
     expect(RUNTIME_DATA_NATS).toBe('di-nats');
     expect(TRANSITIONAL_REDIS).toBe('di-redis');
-    expect(backingServiceHostPath('alpha-uid', 'stock')).toBe(
-      '/var/lib/k0s/di-tenants/alpha-uid/bs-stock',
+    expect(backingServiceHostPath(cfg, 'alpha-uid', 'stock')).toBe(
+      `${DEFAULT_STORAGE_ROOT}/di-tenants/alpha-uid/bs-stock`,
     );
-    expect(runtimeDataNatsHostPath('alpha-uid')).toBe('/var/lib/k0s/di-tenants/alpha-uid/di-nats');
-    expect(transitionalRedisHostPath('alpha-uid')).toBe(
-      '/var/lib/k0s/di-tenants/alpha-uid/di-redis',
+    expect(backingServiceHostPath({ storageRoot: '/var/lib/kubesolo' }, 'alpha-uid', 'stock')).toBe(
+      '/var/lib/kubesolo/di-tenants/alpha-uid/bs-stock',
     );
     expect(PROVIDER_RUNTIME.redis.image).toBe('redis:7.4.5-alpine');
     expect(PROVIDER_RUNTIME.nats.image).toBe('nats:2.12.8-alpine');
@@ -371,6 +372,256 @@ describe('backing service reconciliation', () => {
     expect(api.objects.has('/api/v1/namespaces/di-runtime-alpha/secrets/di-bs-stock-conn')).toBe(
       true,
     );
+  });
+
+  it('surfaces a quota rejection of the deployment instead of Provisioning, then recovers', async () => {
+    const { api, controller, t, classes } = prepare();
+    const stock = backingService('stock', 'keyvalue');
+    api.seed(stock);
+    const quota =
+      'pods "di-bs-stock-5dffdb6d9-abcde" is forbidden: exceeded quota: di-runtime-quota, ' +
+      'requested: limits.cpu=250m, used: limits.cpu=2, limited: limits.cpu=2';
+    const original = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      const result = await original<T>(method, path, body);
+      if (method === 'PATCH' && path.includes('/deployments/di-bs-stock')) {
+        (result as Resource).status = {
+          observedGeneration: 1,
+          replicas: 0,
+          readyReplicas: 0,
+          conditions: [
+            { type: 'Progressing', status: 'True', reason: 'NewReplicaSetCreated' },
+            { type: 'ReplicaFailure', status: 'True', reason: 'FailedCreate', message: quota },
+          ],
+        };
+      }
+      return result;
+    };
+    await controller.reconcileBackingService(stock, t, classes);
+    expect(stock.status?.conditions?.[0]).toMatchObject({
+      type: 'Ready',
+      status: 'False',
+      reason: 'FailedCreate',
+      message: `Backing service deployment di-bs-stock cannot create pods: ${quota}`,
+    });
+    expect(stock.status?.endpoint).toMatchObject({ port: 6379 });
+
+    // Quota freed: the deployment rolls out and the condition flips to Ready.
+    api.call = original;
+    await controller.reconcileBackingService(stock, t, classes);
+    expect(stock.status?.conditions?.[0]).toMatchObject({
+      type: 'Ready',
+      status: 'True',
+      reason: 'Ready',
+      message: 'Backing service deployment is ready',
+    });
+  });
+
+  it('surfaces an exceeded progress deadline with the runtime message', async () => {
+    const { api, controller, t, classes } = prepare();
+    const bus = backingService('bus', 'messaging');
+    api.seed(bus);
+    const original = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      const result = await original<T>(method, path, body);
+      if (method === 'PATCH' && path.includes('/deployments/di-bs-bus')) {
+        (result as Resource).status = {
+          observedGeneration: 1,
+          replicas: 1,
+          readyReplicas: 0,
+          conditions: [
+            {
+              type: 'Progressing',
+              status: 'False',
+              reason: 'ProgressDeadlineExceeded',
+              message: 'ReplicaSet "di-bs-bus-7c9" has timed out progressing.',
+            },
+          ],
+        };
+      }
+      return result;
+    };
+    await controller.reconcileBackingService(bus, t, classes);
+    expect(bus.status?.conditions?.[0]).toMatchObject({
+      status: 'False',
+      reason: 'ProgressDeadlineExceeded',
+      message:
+        'Backing service deployment di-bs-bus did not become ready: ReplicaSet "di-bs-bus-7c9" has timed out progressing.',
+    });
+  });
+
+  it('keeps Suspended when a scaled-down deployment still reports an old failure', async () => {
+    const { api, controller, t, classes } = prepare();
+    const stock = backingService('stock', 'keyvalue');
+    api.seed(stock);
+    t.spec.suspended = true;
+    const original = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      const result = await original<T>(method, path, body);
+      if (method === 'PATCH' && path.includes('/deployments/di-bs-stock')) {
+        (result as Resource).status = {
+          observedGeneration: 1,
+          replicas: 1,
+          conditions: [{ type: 'ReplicaFailure', status: 'True', reason: 'FailedCreate' }],
+        };
+      }
+      return result;
+    };
+    await controller.reconcileBackingService(stock, t, classes);
+    expect(stock.status?.conditions?.[0]).toMatchObject({ status: 'False', reason: 'Suspended' });
+  });
+
+  it('caps copied runtime messages at about 1 KiB', () => {
+    const denial = `admission webhook "policy.example" denied the request: ${'x'.repeat(5000)}`;
+    const failure = deploymentFailure({
+      apiVersion: 'apps/v1',
+      kind: 'Deployment',
+      metadata: { name: 'di-bs-stock', generation: 1 },
+      spec: { replicas: 1 },
+      status: {
+        observedGeneration: 1,
+        conditions: [
+          { type: 'ReplicaFailure', status: 'True', reason: 'FailedCreate', message: denial },
+        ],
+      },
+    });
+    expect(MAX_FAILURE_MESSAGE).toBe(1024);
+    expect(failure?.message).toHaveLength(MAX_FAILURE_MESSAGE);
+    expect(failure?.message.endsWith('…')).toBe(true);
+    expect(failure?.message).toStartWith(
+      'Backing service deployment di-bs-stock cannot create pods: admission webhook',
+    );
+    const deadline = deploymentFailure({
+      apiVersion: 'apps/v1',
+      kind: 'Deployment',
+      metadata: { name: 'di-bs-stock' },
+      spec: { replicas: 1 },
+      status: {
+        conditions: [
+          {
+            type: 'Progressing',
+            status: 'False',
+            reason: 'ProgressDeadlineExceeded',
+            message: 'y'.repeat(2000),
+          },
+        ],
+      },
+    });
+    expect(deadline?.message).toHaveLength(MAX_FAILURE_MESSAGE);
+  });
+
+  it('does not split a surrogate pair when the cap lands inside an emoji', () => {
+    const failureFor = (message: string) =>
+      deploymentFailure({
+        apiVersion: 'apps/v1',
+        kind: 'Deployment',
+        metadata: { name: 'di-bs-stock', generation: 1 },
+        spec: { replicas: 1 },
+        status: {
+          observedGeneration: 1,
+          conditions: [{ type: 'ReplicaFailure', status: 'True', reason: 'FailedCreate', message }],
+        },
+      });
+    const prefixLength = 'Backing service deployment di-bs-stock cannot create pods: '.length;
+    // The emoji's high surrogate would be the last kept code unit before the marker.
+    const padding = 'x'.repeat(MAX_FAILURE_MESSAGE - 2 - prefixLength);
+    const message = failureFor(`${padding}\u{1F600}${'z'.repeat(50)}`)?.message ?? '';
+    expect(message.isWellFormed()).toBe(true);
+    expect(message.length).toBeLessThanOrEqual(MAX_FAILURE_MESSAGE);
+    expect(message).toHaveLength(MAX_FAILURE_MESSAGE - 1);
+    expect(message.endsWith(`${padding.slice(-5)}…`)).toBe(true);
+    // An emoji that ends exactly at the boundary is kept whole.
+    const whole =
+      failureFor(`${'x'.repeat(MAX_FAILURE_MESSAGE - 3 - prefixLength)}\u{1F600}${'z'.repeat(50)}`)
+        ?.message ?? '';
+    expect(whole.isWellFormed()).toBe(true);
+    expect(whole).toHaveLength(MAX_FAILURE_MESSAGE);
+    expect(whole.endsWith('\u{1F600}…')).toBe(true);
+  });
+
+  it('produces an identical status on repeated reconciles with a capped emoji message', async () => {
+    const { api, controller, t, classes } = prepare();
+    const stock = backingService('stock', 'keyvalue');
+    api.seed(stock);
+    const prefix = 'Backing service deployment di-bs-stock cannot create pods: ';
+    const denial = `${'x'.repeat(MAX_FAILURE_MESSAGE - 2 - prefix.length)}\u{1F600}tail`;
+    const original = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      // Kubernetes stores U+FFFD for any unpaired surrogate in a patched status.
+      const sent = path.endsWith('/status')
+        ? (JSON.parse(JSON.stringify(body).replaceAll('\\ud83d', '\\ufffd')) as unknown)
+        : body;
+      const result = await original<T>(method, path, sent);
+      if (method === 'PATCH' && path.includes('/deployments/di-bs-stock')) {
+        (result as Resource).status = {
+          observedGeneration: 1,
+          conditions: [
+            { type: 'ReplicaFailure', status: 'True', reason: 'FailedCreate', message: denial },
+          ],
+        };
+      }
+      return result;
+    };
+    await controller.reconcileBackingService(stock, t, classes);
+    // The next reconcile sees the status as stored by the API server.
+    const stored = api.objects.get(key(stock)) as unknown as BackingService;
+    const first = structuredClone(stored.status);
+    const statusPatches = () =>
+      api.operations.filter((o) => o.method === 'PATCH' && o.path.endsWith('/status')).length;
+    const before = statusPatches();
+    await controller.reconcileBackingService(stored, t, classes);
+    expect(stored.status).toEqual(first);
+    expect(statusPatches()).toBe(before);
+  });
+
+  it('reads deployment failures only from current, non-transient conditions', () => {
+    const deployment = (status: Record<string, unknown>, generation = 1): Resource => ({
+      apiVersion: 'apps/v1',
+      kind: 'Deployment',
+      metadata: { name: 'di-bs-stock', generation },
+      spec: { replicas: 1 },
+      status,
+    });
+    expect(deploymentFailure(deployment({}))).toBeUndefined();
+    expect(
+      deploymentFailure(
+        deployment({
+          observedGeneration: 1,
+          conditions: [{ type: 'Progressing', status: 'True', reason: 'ReplicaSetUpdated' }],
+        }),
+      ),
+    ).toBeUndefined();
+    // A failure recorded for an older generation is stale until the controller observes the new spec.
+    expect(
+      deploymentFailure(
+        deployment(
+          {
+            observedGeneration: 1,
+            conditions: [{ type: 'ReplicaFailure', status: 'True', reason: 'FailedCreate' }],
+          },
+          2,
+        ),
+      ),
+    ).toBeUndefined();
+    expect(
+      deploymentFailure(deployment({ conditions: [{ type: 'ReplicaFailure', status: 'True' }] })),
+    ).toEqual({
+      reason: 'ReplicaFailure',
+      message: 'Backing service deployment di-bs-stock cannot create pods: replica creation failed',
+    });
+    expect(
+      deploymentFailure(
+        deployment({
+          conditions: [
+            { type: 'Progressing', status: 'False', reason: 'ProgressDeadlineExceeded' },
+          ],
+        }),
+      ),
+    ).toEqual({
+      reason: 'ProgressDeadlineExceeded',
+      message:
+        'Backing service deployment di-bs-stock did not become ready: progress deadline exceeded',
+    });
   });
 
   it('reconciles BackingServices during tick alongside tenants', async () => {
@@ -586,5 +837,90 @@ describe('backing service reconciliation', () => {
     await controller.reconcileBackingService(stock, t, [wrong]);
     expect(stock.status?.conditions?.[0]?.reason).toBe('Failed');
     expect(stock.status?.conditions?.[0]?.message).toContain('does not match');
+  });
+});
+
+describe('backing service storage root (#226)', () => {
+  const deploymentPath = '/apis/apps/v1/namespaces/di-runtime-alpha/deployments/di-bs-stock';
+
+  function dataHostPath(api: MemoryApi): string | undefined {
+    const deployment = api.objects.get(deploymentPath);
+    expect(deployment).toBeDefined();
+    return liveBackingServiceHostPath(deployment, backingService('stock', 'keyvalue'));
+  }
+
+  async function reconcileWith(
+    api: MemoryApi,
+    config: ControllerConfig,
+    t: Tenant,
+    classes: BackingServiceClass[],
+  ): Promise<void> {
+    const stock = backingService('stock', 'keyvalue');
+    api.seed(stock);
+    await new Controller(api, config).reconcileBackingService(stock, t, classes);
+  }
+
+  it('puts a new BackingService under the configured storage root', async () => {
+    const { api, t, classes } = prepare();
+    await reconcileWith(api, { ...cfg, storageRoot: '/var/lib/kubesolo' }, t, classes);
+    expect(dataHostPath(api)).toBe('/var/lib/kubesolo/di-tenants/alpha-uid/bs-stock');
+  });
+
+  it('defaults to /var/lib/k0s when storageRoot is unset', async () => {
+    const { api, t, classes } = prepare();
+    await reconcileWith(api, cfg, t, classes);
+    expect(dataHostPath(api)).toBe('/var/lib/k0s/di-tenants/alpha-uid/bs-stock');
+  });
+
+  it('keeps the legacy hostPath of an existing Deployment so its data stays reachable', async () => {
+    const { api, t, classes } = prepare();
+    await reconcileWith(api, cfg, t, classes);
+    expect(dataHostPath(api)).toBe('/var/lib/k0s/di-tenants/alpha-uid/bs-stock');
+    await reconcileWith(api, { ...cfg, storageRoot: '/var/lib/kubesolo' }, t, classes);
+    expect(dataHostPath(api)).toBe('/var/lib/k0s/di-tenants/alpha-uid/bs-stock');
+  });
+
+  it('leaves an existing Deployment already on the storage-root path unchanged', async () => {
+    const { api, t, classes } = prepare();
+    const config = { ...cfg, storageRoot: '/var/lib/kubesolo' };
+    await reconcileWith(api, config, t, classes);
+    const before = structuredClone(api.objects.get(deploymentPath)?.spec);
+    await reconcileWith(api, config, t, classes);
+    expect(dataHostPath(api)).toBe('/var/lib/kubesolo/di-tenants/alpha-uid/bs-stock');
+    expect(api.objects.get(deploymentPath)?.spec).toEqual(before);
+  });
+
+  it('reads the live Deployment once per reconcile', async () => {
+    const { api, t, classes } = prepare();
+    await reconcileWith(api, cfg, t, classes);
+    api.operations.length = 0;
+    await reconcileWith(api, cfg, t, classes);
+    const reads = api.operations.filter((op) => op.method === 'GET' && op.path === deploymentPath);
+    expect(reads).toHaveLength(1);
+  });
+
+  it('never takes the hostPath of a Deployment owned by another BackingService', () => {
+    const t = tenant();
+    const cls = seedClass('keyvalue');
+    const service = backingService('stock', 'keyvalue');
+    const [foreign] = backingServiceResources(
+      backingService('stock', 'keyvalue', { uid: 'previous-uid' }),
+      t,
+      cls,
+      cfg,
+      mergeSizing(undefined, undefined),
+    );
+    expect(liveBackingServiceHostPath(foreign, service)).toBeUndefined();
+    const resources = backingServiceResources(
+      service,
+      t,
+      cls,
+      { ...cfg, storageRoot: '/var/lib/kubesolo' },
+      mergeSizing(undefined, undefined),
+      foreign,
+    );
+    expect(liveBackingServiceHostPath(resources[0], service)).toBe(
+      '/var/lib/kubesolo/di-tenants/alpha-uid/bs-stock',
+    );
   });
 });

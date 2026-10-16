@@ -4,13 +4,17 @@
 {{- end -}}
 {{- /* No default schedule (#250): a cron, or "none" for on-demand backups only. */ -}}
 {{- $schedule := required "schedule is required: set a five-field UTC cron such as \"0 2 * * *\", or \"none\" for on-demand backups only (there is no default since #250)" (.Values.schedule | default "" | toString | trim) -}}
-{{- /* One space between fields, like the CRD pattern; each field is range-checked (the operator also rejects start > end). */ -}}
+{{- /* One space between fields, like the CRD pattern; each field is range-checked, a range never runs backwards, and installBackupDestination applies the same rules (#263 S5). */ -}}
 {{- $parts := list -}}
 {{- range list "[0-5]?[0-9]" "([01]?[0-9]|2[0-3])" "(0?[1-9]|[12][0-9]|3[01])" "(0?[1-9]|1[0-2])" "[0-7]" -}}
 {{- $element := printf "(\\*|(%s)(-(%s))?)(/[1-9][0-9]*)?" . . -}}
 {{- $parts = append $parts (printf "%s(,%s)*" $element $element) -}}
 {{- end -}}
-{{- if and (ne $schedule "none") (not (regexMatch (printf "^%s$" (join " " $parts)) $schedule)) -}}
+{{- /* The CRD's maxLength (#254 S2); the value written is the trimmed one. */ -}}
+{{- if gt (len $schedule) 128 -}}
+{{- fail (printf "schedule must be at most 128 characters (it has %d)" (len $schedule)) -}}
+{{- end -}}
+{{- if and (ne $schedule "none") (or (not (regexMatch (printf "^%s$" (join " " $parts)) $schedule)) (include "backup.backwardRange" $schedule)) -}}
 {{- fail (printf "schedule %q must be a five-field UTC cron (minute hour day month weekday) or \"none\"" $schedule) -}}
 {{- end -}}
 {{- $s3 := or (eq $type "s3") (eq $type "both") -}}
@@ -43,7 +47,10 @@
 {{- if not $sourceSchedule -}}
 {{- fail (printf "source %s: schedule is required: set a five-field UTC cron, or \"none\" for on-demand backups only (there is no default since #250)" .workloadName) -}}
 {{- end -}}
-{{- if and (ne $sourceSchedule "none") (not (regexMatch (printf "^%s$" (join " " $parts)) $sourceSchedule)) -}}
+{{- if gt (len $sourceSchedule) 128 -}}
+{{- fail (printf "source %s: schedule must be at most 128 characters (it has %d)" .workloadName (len $sourceSchedule)) -}}
+{{- end -}}
+{{- if and (ne $sourceSchedule "none") (or (not (regexMatch (printf "^%s$" (join " " $parts)) $sourceSchedule)) (include "backup.backwardRange" $sourceSchedule)) -}}
 {{- fail (printf "source %s: schedule %q must be a five-field UTC cron (minute hour day month weekday) or \"none\"" .workloadName $sourceSchedule) -}}
 {{- end -}}
 {{- if and (eq $type "both") (not .destination) -}}
@@ -61,7 +68,9 @@
 {{- $picked := list -}}
 {{- range .root.Values.sources -}}
 {{- if or (not .destination) (eq .destination $kind) -}}
-{{- $picked = append $picked (omit . "destination" | merge (dict "kind" "workload-volume")) -}}
+{{- /* The schedule checked above is the one written: trimmed, as the CRD pattern needs (#254 S1). */ -}}
+{{- $schedule := .schedule | default "" | toString | trim -}}
+{{- $picked = append $picked (omit . "destination" | merge (dict "kind" "workload-volume" "schedule" $schedule)) -}}
 {{- end -}}
 {{- end -}}
 {{- if $picked }}

@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { ConfigList, SecretList } from '../src/api/contracts/api.schemas.ts';
 import auth from '../src/api/contracts/auth-v1.codegen.ts';
 import { secrets, vars } from '../src/api/contracts/config-v1.codegen.ts';
 import deploy from '../src/api/contracts/deploy-v1.codegen.ts';
@@ -118,6 +119,34 @@ test('references resolve to the component schemas', () => {
   expect(() => validate({ $ref: '#/components/schemas/Missing' }, {})).toThrow(
     'unknown schema reference #/components/schemas/Missing',
   );
+});
+
+test('a secret list refuses an entry that carries a value; a var list accepts it', () => {
+  const entry = { name: 'API_KEY', updatedAt: '2026-10-09T01:02:03Z' };
+  expect(() => SecretList.parse({ env: 'prod', items: [entry] })).not.toThrow();
+  expect(() => SecretList.parse({ env: 'prod', items: [{ ...entry, value: 'hunter2' }] })).toThrow(
+    new ValidationError('body.items[0].value is not allowed'),
+  );
+  expect(() => ConfigList.parse({ env: 'prod', items: [{ ...entry, value: 'x' }] })).not.toThrow();
+});
+
+test('the secrets and vars contracts each declare only their own schemas', async () => {
+  expect(Object.keys(secrets.schemas).sort()).toEqual(['ConfigValue', 'Empty', 'SecretList']);
+  // Only a var unset answers warnings (platform#100); a referenced secret unset is a 409.
+  expect(Object.keys(vars.schemas).sort()).toEqual([
+    'ConfigList',
+    'ConfigValue',
+    'Empty',
+    'VarUnset',
+  ]);
+  const secretsModule = await import('../src/api/generated/secrets/v1/contracts.ts');
+  const varsModule = await import('../src/api/generated/vars/v1/contracts.ts');
+  expect('validateSecretList' in secretsModule).toBe(true);
+  expect('validateConfigList' in secretsModule).toBe(false);
+  expect('validateConfigList' in varsModule).toBe(true);
+  expect('validateSecretList' in varsModule).toBe(false);
+  expect('validateVarUnset' in varsModule).toBe(true);
+  expect('validateVarUnset' in secretsModule).toBe(false);
 });
 
 test('query parameters are coerced to their declared type', () => {

@@ -14,20 +14,22 @@ Terraform, Crossplane, Helm, or another infrastructure layer.
 
 ```ts
 import { Component, Container } from '@di-framework/core/decorators';
-import { KeyValue, Postgres, WasmCloudBinding } from '@di-framework/bindings';
+import { KeyValue, Postgres, PlatformBinding } from '@di-framework/bindings';
 
-@WasmCloudBinding('user-database')
+@PlatformBinding('user-database')
 @Container()
 export class UserDatabase extends Postgres {}
 
-@WasmCloudBinding('sessions', { interfaces: ['store', 'atomics'] })
+@PlatformBinding('sessions', { interfaces: ['store', 'atomics'] })
 @Container()
 export class Sessions extends KeyValue {}
 
-@WasmCloudBinding('cache')
+@PlatformBinding('cache')
 @Container()
 export class Cache extends KeyValue {}
 ```
+
+`@WasmCloudBinding` remains exported as a deprecated alias of `@PlatformBinding` for back-compat; new code should use `@PlatformBinding`.
 
 Put those classes in `src/bindings.ts`. The wasmCloud CLI extension discovers the file, contributes
 each class to the shared WIT requirement graph, generates real WIT guest imports, and renders
@@ -98,7 +100,7 @@ leaves it unloaded. Import `@di-framework/bindings/postgres` from a guest that d
 Secret material is referenced, never inlined:
 
 ```ts
-@WasmCloudBinding('user-database', { secretFrom: 'orders-user-database' })
+@PlatformBinding('user-database', { secretFrom: 'orders-user-database' })
 @Container()
 export class UserDatabase extends Postgres {}
 ```
@@ -136,7 +138,7 @@ testContainer.registerValue(UserDatabase, new FakeUserDatabase());
 ## Managed PostgreSQL (upcoming release)
 
 ```ts
-@WasmCloudBinding('orders-db', { serviceName: 'orders' })
+@PlatformBinding('orders-db', { serviceName: 'orders' })
 export class OrdersDatabase extends Postgres {}
 ```
 

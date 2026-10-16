@@ -132,7 +132,23 @@ export function gatewayConfigHash(
   return createHash('sha256').update(JSON.stringify(configData)).digest('hex');
 }
 
-/** Gateway Deployment spec. It needs no Kubernetes API access, so it mounts no token. */
+/**
+ * Rollout drain timing (#223). On termination the pod first sleeps `GATEWAY_PRESTOP_SECONDS` while
+ * still serving, so the Service endpoint removal reaches every node's proxy before the listener
+ * closes. Then SIGTERM drains for at most `GATEWAY_DRAIN_SECONDS`. The grace period covers both
+ * with a margin, so the kubelet never kills a drain that is within its bound.
+ */
+export const GATEWAY_PRESTOP_SECONDS = 10;
+export const GATEWAY_DRAIN_SECONDS = 20;
+export const GATEWAY_TERMINATION_GRACE_SECONDS =
+  GATEWAY_PRESTOP_SECONDS + GATEWAY_DRAIN_SECONDS + 5;
+
+/**
+ * Gateway Deployment spec. It needs no Kubernetes API access, so it mounts no token. A rollout
+ * surges a new pod and keeps the old one until the new one has been Ready for `minReadySeconds`
+ * (`maxUnavailable: 0`), and the old pod drains as described above, so a roll (a `routeAliases`
+ * change, say) drops no requests.
+ */
 export function gatewayDeploymentSpec(
   namespace: string,
   scriptHash: string,
@@ -144,10 +160,14 @@ export function gatewayDeploymentSpec(
     defaultUpstream: `wasmcloud-http.${namespace}.svc.cluster.local`,
     ...(Object.keys(tenantAuthRoutes).length ? { tenantAuthRoutes } : {}),
     ...(routeAliases && Object.keys(routeAliases).length ? { routeAliases } : {}),
+    drainTimeoutMs: GATEWAY_DRAIN_SECONDS * 1000,
   };
   const configHash = gatewayConfigHash(tenantAuthRoutes, routeAliases);
   return {
     replicas: 1,
+    strategy: { type: 'RollingUpdate', rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } },
+    // Lets the new pod's endpoint reach every node's proxy before the old pod starts terminating.
+    minReadySeconds: 5,
     selector: { matchLabels: GATEWAY_POD_LABELS },
     template: {
       metadata: {
@@ -160,6 +180,7 @@ export function gatewayDeploymentSpec(
       spec: {
         automountServiceAccountToken: false,
         enableServiceLinks: false,
+        terminationGracePeriodSeconds: GATEWAY_TERMINATION_GRACE_SECONDS,
         securityContext: {
           runAsNonRoot: true,
           runAsUser: 1000,
@@ -173,8 +194,12 @@ export function gatewayDeploymentSpec(
             command: ['node', '/gateway/gateway.js'],
             env: [{ name: 'GATEWAY_CONFIG', value: JSON.stringify(config) }],
             ports: [{ name: 'http', containerPort: GATEWAY_PORT }],
-            readinessProbe: { tcpSocket: { port: 'http' }, periodSeconds: 5 },
+            readinessProbe: { tcpSocket: { port: 'http' }, periodSeconds: 2 },
             livenessProbe: { tcpSocket: { port: 'http' }, initialDelaySeconds: 10 },
+            // The image's busybox `sleep`: keep serving until the endpoint removal propagates.
+            lifecycle: {
+              preStop: { exec: { command: ['sleep', String(GATEWAY_PRESTOP_SECONDS)] } },
+            },
             resources: {
               requests: { cpu: '20m', memory: '32Mi' },
               limits: { cpu: '500m', memory: '128Mi' },

@@ -29,11 +29,24 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # --frozen-lockfile can pass while bun.lock still records old workspace
+      # versions (#260), so check them explicitly.
+      - name: Check bun.lock workspace versions
+        run: bun scripts/check-lockfile-versions.ts
+
       - name: Build
         run: bun run build
 
       - name: Typecheck
         run: bun run typecheck
+
+      # The prototype Pulumi program is outside the root tsconfig; Pulumi's runtime type-checks it
+      # with ts-node and its own TypeScript 5 install, so check it the same way (#251).
+      - name: Typecheck backup prototype Pulumi program
+        working-directory: platform/backup-destination/prototype
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          ./node_modules/.bin/tsc --noEmit -p .
 
       - name: Lint
         run: bun run lint
@@ -47,7 +60,7 @@ jobs:
         run: bun scripts/publish-workspace.ts --dry-run
 
       - name: Install wasmtime
-        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
         with:
           version: 'v48.0.1'
 

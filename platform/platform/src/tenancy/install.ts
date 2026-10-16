@@ -51,14 +51,16 @@ export function tenantObject({ name, ...spec }: TenantDeclaration, installation:
 }
 
 /** Controller ConfigMap modules. TypeScript emit does not bundle imports, so
- * `admission`, `egress`, `backing-services`, `backing-service-reconcile`, `service-binding-reconcile`, and
- * `log-projection` must ship beside `resources` / `controller` (which require them at runtime). */
+ * `admission`, `egress`, `backing-services`, `backing-service-reconcile`, `service-binding-reconcile`,
+ * `registry-nats`, and `log-projection` must ship beside `resources` / `controller` (which require them at runtime). */
 export const CONTROLLER_SCRIPT_MODULES = [
   'admission',
   'egress',
   'backing-services',
   'workload-storage',
   'tls',
+  'ca-rotation',
+  'registry-nats',
   'resources',
   'backing-service-reconcile',
   'service-binding-reconcile',
@@ -75,7 +77,23 @@ export type ControllerClusterRoleRule = {
   apiGroups: string[];
   resources: string[];
   verbs: string[];
+  resourceNames?: string[];
 };
+
+/**
+ * The fixed-name Roles the controller binds (#115): the tenant roles members are bound to and the
+ * tenant controller's Secret roles. It binds no Role to itself (#321). The per-tenant
+ * `di-tenant-controller-<tenant>` Role and ClusterRole are not listed (`resourceNames` has no
+ * wildcard); the controller holds every rule in them, which is all a binding needs without `bind`.
+ */
+export const CONTROLLER_BOUND_ROLES = [
+  'di-developer',
+  'di-viewer',
+  'di-runtime-developer',
+  'di-runtime-viewer',
+  'tenant-controller-keys',
+  'tenant-controller-secret-reader',
+] as const;
 
 /**
  * Platform-owned default classes (`keyvalue-redis`, `messaging-nats`, `blobstore-nats`,
@@ -156,6 +174,13 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
       ],
       verbs: ['get', 'list', 'watch', 'patch', 'update'],
     },
+    // The `di-developer` Role grants these (#115). Without `escalate` the controller may only
+    // write a Role whose rules it holds itself.
+    {
+      apiGroups: ['platform.di-framework.dev'],
+      resources: ['backingservices', 'servicebindings'],
+      verbs: ['create', 'delete'],
+    },
     {
       apiGroups: [''],
       resources: [
@@ -170,6 +195,11 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
       verbs: ['get', 'list', 'watch', 'create', 'patch', 'update', 'delete'],
     },
     { apiGroups: [''], resources: ['pods'], verbs: ['get', 'list', 'watch'] },
+    // Held so it can write the tenant viewer and developer Roles without `escalate` (#115).
+    { apiGroups: [''], resources: ['events'], verbs: ['get', 'list', 'watch'] },
+    // Also how it reads hostgroup logs for the console logs projection (#10).
+    { apiGroups: [''], resources: ['pods/log'], verbs: ['get'] },
+    { apiGroups: [''], resources: ['pods/portforward'], verbs: ['create'] },
     // The API server endpoints each tenant controller's egress policy allows (#58).
     { apiGroups: ['discovery.k8s.io'], resources: ['endpointslices'], verbs: ['get', 'list'] },
     {
@@ -184,12 +214,19 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
     },
     {
       // Read for the logs projection; patch sets the platform storage volume (#11) and approved
-      // egress (#13). create and delete serve only the tenant registry workload (#83): its
+      // egress (#13). create and delete serve the tenant registry workload (#83): its
       // server-side apply is authorized as create while it does not exist, and unsetting
-      // tenantAuth.registry deletes it. No update: every write is a server-side apply PATCH.
+      // tenantAuth.registry deletes it. The controller itself writes only with server-side apply
+      // PATCH; update is held because the `di-developer` Role grants it (#115).
       apiGroups: ['runtime.wasmcloud.dev'],
       resources: ['workloaddeployments'],
-      verbs: ['get', 'list', 'watch', 'create', 'patch', 'delete'],
+      verbs: ['get', 'list', 'watch', 'create', 'patch', 'update', 'delete'],
+    },
+    // Read access the tenant viewer and developer Roles grant (#115).
+    {
+      apiGroups: ['runtime.wasmcloud.dev'],
+      resources: ['workloads', 'workloadreplicasets', 'artifacts'],
+      verbs: ['get', 'list', 'watch'],
     },
     {
       apiGroups: ['apps'],
@@ -201,10 +238,21 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
       resources: ['networkpolicies'],
       verbs: ['get', 'list', 'watch', 'create', 'patch', 'update', 'delete'],
     },
+    // The one-shot Job that moves each tenant registry's object store into its NATS account
+    // (#159): applied with server-side apply, read for its result.
+    { apiGroups: ['batch'], resources: ['jobs'], verbs: ['get', 'create', 'patch'] },
+    // No `escalate` (#115): the controller holds every rule of every Role it writes, which the
+    // API server checks on each create and update. `bind` only on the fixed-name Roles it binds.
     {
       apiGroups: ['rbac.authorization.k8s.io'],
       resources: ['roles', 'rolebindings'],
-      verbs: ['get', 'list', 'watch', 'create', 'patch', 'update', 'delete', 'bind', 'escalate'],
+      verbs: ['get', 'list', 'watch', 'create', 'patch', 'update', 'delete'],
+    },
+    {
+      apiGroups: ['rbac.authorization.k8s.io'],
+      resources: ['roles'],
+      verbs: ['bind'],
+      resourceNames: [...CONTROLLER_BOUND_ROLES],
     },
     // Each tenant controller's `di-tenant-controller-<t>` ClusterRole and its binding (#58). The
     // controller already holds every permission they grant, so it needs no bind or escalate.
@@ -214,6 +262,15 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
       verbs: ['get', 'list', 'create', 'patch', 'delete'],
     },
   ];
+}
+
+/**
+ * Rules the controller holds only in its own namespace (#115): TokenRequest for the members'
+ * `di-user-<name>` ServiceAccounts, which each tenant's `di-tenant-controller-<tenant>` Role grants
+ * there. Holding it here, not cluster-wide, lets it write that Role without `escalate`.
+ */
+export function controllerNamespaceRoleRules(): ControllerClusterRoleRule[] {
+  return [{ apiGroups: [''], resources: ['serviceaccounts/token'], verbs: ['create'] }];
 }
 
 /** Load compiled controller scripts from the package dist (`tsc` emit under `tenancy/`). */
