@@ -11,7 +11,10 @@
  * `platform/platform/src/tenancy/`, an input of the tenant-auth image, so merging a pin PR does not
  * publish tenant-auth again.
  */
-export const API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS: readonly string[] = [];
+export const API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS: readonly string[] = [
+  // ghcr.io/di-framework/tenant-auth
+  'sha256:39eb90e585701b90dbf4e772546028c1f2c6f792e95d1c3d1695905f1646fe66',
+];
 
 /** Whether `image` is pinned by digest to one of `digests`. */
 export function imagePinnedTo(image: string, digests: readonly string[]): boolean {
