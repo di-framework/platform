@@ -1808,7 +1808,7 @@ describe('/v1/deploy', () => {
       expect(stored.has(`${WORKLOADS}/web-prod`)).toBe(false);
       expect(keys(`${BINDINGS}/web-prod-`)).toEqual([]);
       expect(keys(`${REVISIONS}web-prod.`)).toEqual([]);
-      // The workload goes first, so it stops before what it binds is removed.
+      // The workload goes first, so it is deleted before what it binds.
       const deletes = api.requests.filter((r) => r.method === 'DELETE').map((r) => r.pathname);
       expect(deletes[0]).toBe(`${WORKLOADS}/web-prod`);
       // Staging is untouched, and so is the secret and the backing service it bound.
@@ -1835,6 +1835,25 @@ describe('/v1/deploy', () => {
         headers: { authorization: 'Bearer ok' },
       });
       expect(((await list.json()) as Json).items).toEqual([]);
+    });
+
+    test('removing web leaves the web-prod and web-api services in place', async () => {
+      await deployed();
+      // Their objects share prefixes with web's: web-prod-prod-*, web-api-prod-*, di-deploy-web-*.
+      await deployed(deployBundle({ service: 'web-prod' }));
+      await deployed(deployBundle({ service: 'web-api' }));
+      const others = () =>
+        [...stored.keys()].filter((key) => /\/(di-deploy-)?web-(prod|api)-prod([-.]|$)/.test(key));
+      const before = others();
+      expect(before.filter((key) => key.startsWith(`${WORKLOADS}/`))).toEqual([
+        `${WORKLOADS}/web-prod-prod`,
+        `${WORKLOADS}/web-api-prod`,
+      ]);
+      expect(before.filter((key) => key.startsWith(`${BINDINGS}/`))).toHaveLength(2);
+      expect(before.filter((key) => key.startsWith(REVISIONS))).toHaveLength(2);
+      expect((await remove('/v1/deployments/web?env=prod')).status).toBe(204);
+      expect(stored.has(`${WORKLOADS}/web-prod`)).toBe(false);
+      expect(others()).toEqual(before);
     });
 
     test('removes what a destroyed workload left behind', async () => {

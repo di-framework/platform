@@ -464,12 +464,17 @@ one a concurrent deploy pruned after the history was read is a 404.
 Both operations are developer-only (viewers get 403) and run as the caller.
 
 * `DELETE /v1/deployments/<service>?env=<env>` removes the service from that env: first its
-  WorkloadDeployment `<service>-<env>` (running or not, so the workload stops before what it
-  binds goes), then its ServiceBindings (the deploy labels and the `<service>-<env>-` prefix),
+  WorkloadDeployment `<service>-<env>` (running or not, so the workload is deleted before what
+  it binds), then its ServiceBindings (the deploy labels and the `<service>-<env>-` prefix),
   then every revision ConfigMap `di-deploy-<service>-<env>.<n>`, including ones edited out of
   shape. It answers 204, or 404 when the env has none of them, and audits `deployment.removed`.
   The other env and the BackingServices the service bound are left alone. An object a
-  concurrent call already deleted counts as deleted.
+  concurrent call already deleted counts as deleted. The removal is not transactional: a deploy
+  of the same service and env that is in flight (it reserved its revision before the removal
+  deleted the history, and applies its workload after the removal deleted the workload) leaves
+  a running workload with no history; its revision mark fails and is logged as
+  `deploy.history-mark-failed`. Running the removal again deletes that workload and anything it
+  bound.
 * `DELETE /v1/services/<name>?env=<env>` deletes a BackingService. It is **refused** with 409
   while any ServiceBinding in the tenant names it in `spec.serviceName`, whatever its
   `deletionPolicy`; the `detail` names the binders, sorted (`<service>-<env>` for a deployed

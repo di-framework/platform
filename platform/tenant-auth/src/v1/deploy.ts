@@ -1170,8 +1170,10 @@ export const deploy: V1Module = {
   },
   /**
    * Removes `service` from `env` (platform#98): the WorkloadDeployment first, so a running
-   * workload stops before what it binds goes, then its ServiceBindings, then its deploy history.
-   * The BackingServices it bound stay; `deleteService` removes those.
+   * workload is deleted before what it binds, then its ServiceBindings, then its deploy history.
+   * The BackingServices it bound stay; `deleteService` removes those. Not transactional: a deploy
+   * in flight can apply its workload after this deleted the history, leaving a workload with no
+   * history; removing again deletes it.
    */
   removeDeployment: async (_command, call, context) => {
     const env = String(queryValue(call, 'env'));

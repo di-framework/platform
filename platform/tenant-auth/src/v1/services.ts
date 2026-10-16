@@ -173,7 +173,7 @@ export const services: V1Module = {
           .filter((binding) => binding.spec?.serviceName === name)
           .map(binderOf),
       ),
-    ].sort();
+    ].sort((a, b) => a.localeCompare(b));
     if (binders.length > 0)
       return problem(
         409,
