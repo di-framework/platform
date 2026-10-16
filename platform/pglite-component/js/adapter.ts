@@ -74,7 +74,13 @@ export interface WasmPgliteConnection {
 
 /** The `open-options` record. Every field is optional. */
 export interface WasmPgliteOpenOptions {
-  /** Session database. The provider currently accepts only `template1`. */
+  /**
+   * Session database: `postgres` or `template1`. Unset selects the data
+   * directory's default: `postgres` for a directory the provider initialized
+   * (it writes a `di-framework-database` marker in PGDATA), `template1` for
+   * one created by an earlier release. The provider rejects `template0` and
+   * any other name.
+   */
   database?: string;
   /** Reserved by the provider: only `0` (or unset) is accepted. */
   statementTimeoutMs?: number;

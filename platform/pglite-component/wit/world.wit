@@ -91,7 +91,15 @@ interface types {
   /// Options accepted by `open`. Every field is optional; `none` means the
   /// documented default.
   record open-options {
-    /// Database name for the session. Only `template1` is currently supported.
+    /// Database name for the session: `postgres` or `template1`.
+    ///
+    /// `none` selects the data directory's default. A directory this
+    /// provider initializes keeps application data in `postgres` and records
+    /// that with a `di-framework-database` marker in PGDATA. A directory
+    /// without the marker (one created by an earlier release) keeps using
+    /// `template1`, unchanged. `template0` and every other name fail `open`.
+    /// The engine stays in the database its first `open` selected until the
+    /// component restarts; a later `open` naming another one fails.
     database: option<string>,
     /// Reserved: WASI lacks the signal timer used for query cancellation.
     /// Only none or zero is supported; nonzero values fail open.
@@ -174,10 +182,11 @@ interface database {
 /// Kept symmetric with the sqlite-component: `types` is exported explicitly
 /// so the component is self-contained for `wac plug`.
 ///
-/// The private engine import is resolved during the provider build. The
+/// The private engine imports are resolved during the provider build. The
 /// shipped artifact has only WASI imports, including filesystem and randomness.
 world pglite-provider {
   import di-framework:pglite-engine/engine@0.1.0;
+  import di-framework:pglite-engine-bootstrap/bootstrap@0.1.0;
   export types;
   export database;
 }

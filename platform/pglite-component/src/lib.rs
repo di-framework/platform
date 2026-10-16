@@ -78,10 +78,9 @@ impl Guest for Provider {
                     .into(),
             ));
         }
-        let database = options
-            .as_ref()
-            .and_then(|o| o.database.as_deref())
-            .unwrap_or("template1");
+        // `None` keeps the data directory's default: `postgres` for
+        // directories this provider initialized, `template1` for older ones.
+        let database = options.as_ref().and_then(|o| o.database.as_deref());
         let sess = Session::connect(&path, database)?;
 
         Ok(Connection::new(DbConn(RefCell::new(LiveConn {

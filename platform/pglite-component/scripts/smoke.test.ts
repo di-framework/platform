@@ -1,7 +1,15 @@
 import { describe, expect, test } from 'bun:test';
-import { resolve } from 'node:path';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { loadPins } from './lib/versions.ts';
-import { PACKAGE_PROVIDER, previousRelease } from './smoke.ts';
+import {
+  DATABASE_MARKER,
+  databaseArgs,
+  PACKAGE_PROVIDER,
+  previousRelease,
+  readDatabaseMarker,
+} from './smoke.ts';
 
 describe('cross-version smoke step', () => {
   test('writes the data directory with the published 6.0.15 (PostgreSQL 17.5) provider', async () => {
@@ -17,5 +25,48 @@ describe('cross-version smoke step', () => {
 
   test('refuses to run without the pins', () => {
     expect(() => previousRelease({})).toThrow('missing pin PGLITE_UPGRADE_FROM_VERSION');
+  });
+});
+
+describe('database smoke checks (#212)', () => {
+  test('the marker name matches the provider source', async () => {
+    const engine = await Bun.file(resolve(import.meta.dir, '..', 'src', 'engine.rs')).text();
+    expect(engine).toContain(`pub(crate) const DATABASE_MARKER: &str = "${DATABASE_MARKER}";`);
+  });
+
+  test('reads the marker from PGDATA under the mounted root', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'df-pglite-marker-test.'));
+    try {
+      expect(await readDatabaseMarker(dir)).toBeNull();
+      await mkdir(join(dir, 'pglite', 'data'), { recursive: true });
+      await writeFile(join(dir, 'pglite', 'data', DATABASE_MARKER), 'postgres\n');
+      expect(await readDatabaseMarker(dir)).toBe('postgres\n');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('passes the expectation to the consumer as environment', () => {
+    expect(
+      databaseArgs({
+        requested: 'template1',
+        expected: 'template1',
+        table: 'tasks',
+        present: false,
+      }),
+    ).toEqual([
+      '--env',
+      'PGLITE_SMOKE_EXPECT_DB=template1',
+      '--env',
+      'PGLITE_SMOKE_TABLE=tasks',
+      '--env',
+      'PGLITE_SMOKE_TABLE_PRESENT=0',
+      '--env',
+      'PGLITE_SMOKE_DATABASE=template1',
+    ]);
+    // No requested database: the consumer opens with `none`.
+    expect(databaseArgs({ expected: 'postgres', table: 'tasks', present: true })).not.toContain(
+      'PGLITE_SMOKE_DATABASE=postgres',
+    );
   });
 });

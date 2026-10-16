@@ -18,6 +18,7 @@ const MARKERS = {
   abrupt: 'abrupt ok',
   'upgrade-write': 'upgrade write ok',
   'upgrade-read': 'upgrade read ok',
+  database: 'database ok',
 } as const;
 
 type SmokeMode = keyof typeof MARKERS;
@@ -60,6 +61,56 @@ async function runMode(
     throw new Error(`wasmtime ${mode}: marker ${marker} not found`);
   }
   log(marker);
+}
+
+/** Marker inside PGDATA that `src/engine.rs` (`DATABASE_MARKER`) writes on a new data directory (#212). */
+export const DATABASE_MARKER = 'di-framework-database';
+
+/** The marker's content, or null when the data directory has none. */
+export async function readDatabaseMarker(dataDir: string): Promise<string | null> {
+  const file = Bun.file(join(dataDir, 'pglite', 'data', DATABASE_MARKER));
+  return (await file.exists()) ? await file.text() : null;
+}
+
+/** Arguments for the consumer's `database` mode: open `requested`, expect `expected` and `table`. */
+export function databaseArgs(check: {
+  requested?: 'postgres' | 'template1';
+  expected: 'postgres' | 'template1';
+  table: string;
+  present: boolean;
+}): string[] {
+  const env = [
+    `PGLITE_SMOKE_EXPECT_DB=${check.expected}`,
+    `PGLITE_SMOKE_TABLE=${check.table}`,
+    `PGLITE_SMOKE_TABLE_PRESENT=${check.present ? '1' : '0'}`,
+  ];
+  if (check.requested) env.push(`PGLITE_SMOKE_DATABASE=${check.requested}`);
+  return env.flatMap((pair) => ['--env', pair]);
+}
+
+/** Run the consumer's `database` mode on `mount` with one expectation. */
+async function databaseCheck(
+  ctx: Context,
+  composed: string,
+  smokeDir: string,
+  mount: string[],
+  logName: string,
+  check: Parameters<typeof databaseArgs>[0],
+): Promise<void> {
+  await runMode(ctx, composed, smokeDir, 'database', [...mount, ...databaseArgs(check)], logName);
+  const what = check.requested ? `explicit ${check.requested}` : 'default';
+  log(
+    `${logName}: ${what} -> ${check.expected}, ${check.table} ${check.present ? 'present' : 'absent'}`,
+  );
+}
+
+async function expectMarker(dataDir: string, expected: string | null, when: string): Promise<void> {
+  const marker = await readDatabaseMarker(dataDir);
+  if (marker !== expected) {
+    throw new Error(
+      `${when}: ${DATABASE_MARKER} is ${JSON.stringify(marker)}, expected ${JSON.stringify(expected)}`,
+    );
+  }
 }
 
 /** The previous release the cross-version step writes a data directory with. */
@@ -124,13 +175,57 @@ async function upgradeSmoke(ctx: Context, consumer: string, composed: string, sm
     if (pgVersion !== release.postgres.split('.')[0]) {
       throw new Error(`previous release wrote PG_VERSION ${pgVersion}, not ${release.postgres}`);
     }
+    await expectMarker(dataDir, null, `after ${release.version}`);
+    // upgrade-read asserts that `none` still selects template1 here (#212).
     await runMode(ctx, composed, smokeDir, 'upgrade-read', mount);
+    await expectMarker(dataDir, null, 'legacy directory after upgrade-read');
+    const table = 'upgrade_check';
+    await databaseCheck(ctx, composed, smokeDir, mount, 'legacy-explicit-postgres', {
+      requested: 'postgres',
+      expected: 'postgres',
+      table,
+      present: false,
+    });
+    await databaseCheck(ctx, composed, smokeDir, mount, 'legacy-explicit-template1', {
+      requested: 'template1',
+      expected: 'template1',
+      table,
+      present: true,
+    });
+    await databaseCheck(ctx, composed, smokeDir, mount, 'legacy-default', {
+      expected: 'template1',
+      table,
+      present: true,
+    });
+    await expectMarker(dataDir, null, 'legacy directory after explicit opens');
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
   log(
     `data directory from ${release.version} (PostgreSQL ${release.postgres}) opens under this build`,
   );
+}
+
+/**
+ * A directory without the marker uses template1, even one this build
+ * initialized: the state a crash between initdb and the marker leaves.
+ */
+async function markerLossSmoke(ctx: Context, composed: string, smokeDir: string): Promise<void> {
+  const dataDir = await mkdtemp(join(tmpdir(), 'df-pglite-marker.'));
+  const mount = ['--dir', `${dataDir}::/data`];
+  try {
+    await runMode(ctx, composed, smokeDir, 'write', mount, 'marker-loss-write');
+    await expectMarker(dataDir, 'postgres\n', 'marker-loss directory after write');
+    await rm(join(dataDir, 'pglite', 'data', DATABASE_MARKER));
+    await databaseCheck(ctx, composed, smokeDir, mount, 'marker-loss-default', {
+      expected: 'template1',
+      table: 'tasks',
+      present: false,
+    });
+    await expectMarker(dataDir, null, 'marker-loss directory after reopen');
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
 }
 
 export async function smoke(ctx: Context): Promise<void> {
@@ -164,12 +259,29 @@ export async function smoke(ctx: Context): Promise<void> {
         throw new Error(`${file} missing after write`);
       }
     }
+    // write asserted that the first session of the new directory is in postgres.
+    await expectMarker(dataDir, 'postgres\n', 'new directory after write');
+    // read asserts that a restart stays in postgres.
     await runMode(ctx, composed, smokeDir, 'read', mount);
+    await databaseCheck(ctx, composed, smokeDir, mount, 'new-explicit-template1', {
+      requested: 'template1',
+      expected: 'template1',
+      table: 'tasks',
+      present: false,
+    });
+    await databaseCheck(ctx, composed, smokeDir, mount, 'new-explicit-postgres', {
+      requested: 'postgres',
+      expected: 'postgres',
+      table: 'tasks',
+      present: true,
+    });
     await runMode(ctx, composed, smokeDir, 'abrupt', mount);
     await runMode(ctx, composed, smokeDir, 'read', mount);
+    await expectMarker(dataDir, 'postgres\n', 'new directory after restarts');
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
+  await markerLossSmoke(ctx, composed, smokeDir);
   await upgradeSmoke(ctx, consumer, composed, smokeDir);
   log('persistent embedded PGlite passed without networking');
 }

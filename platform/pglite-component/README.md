@@ -130,7 +130,7 @@ The pglite component is published to GitHub Container Registry (GHCR) as an OCI 
 
 The workflow has four jobs:
 - `check-source` (`packages: read`) hashes the committed input files (`scripts/source-check.ts`). On a push it skips the build when `ghcr.io/di-framework/pglite-component:src-<hash>` already exists, so commits that do not change the component publish nothing.
-- `build` (no write token) runs the same targets as `ci.yml`: `make tools-rust`, `make unit smoke` (which runs `make build`, composing the provider with the engine via `wac plug`), then the publisher crates' clippy and tests.
+- `build` (no write token) runs the same targets as `ci.yml`: `make tools-rust`, `make unit smoke` (which runs `make build`, composing the provider with two instances of the engine via `wac compose`), then the publisher crates' clippy and tests.
 - `publish` (`packages: write`) downloads the tested `dist/` and runs `pglite-component-publisher`. It never rebuilds or modifies `dist/`. It checks `SHA256SUMS`, requires the export `di-framework:pglite/database@0.2.0` and rejects any import that is not `wasi:*`, then pushes the layer, config and manifest with `oras` under `ghcr.io/di-framework/pglite-component:<commit sha>` only, pulls it back with `wash` by the manifest digest to compare bytes, and only then points the version tag (`0.2.0`, the WIT package version) at that same manifest with `oras tag` and asserts both tags resolve to one digest. A failed check leaves the version tag where it was. The manifest and config carry a fixed `created` time (the publish step clears `SOURCE_DATE_EPOCH`, so `1970-01-01T00:00:00Z`), so publishing an unchanged `di-framework-pglite.wasm` gives the same digest and the pin job has nothing to pin. The `build` job passes the tested wasm sha256 to `publish`, which verifies it before pushing. It also tags the manifest `src-<hash>`.
 - `pin` (`contents: write`, `pull-requests: write`) opens or updates the PR `bot/pin-pglite-component`, "chore: pin pglite-component to <digest>", which rewrites the digests in this README with `scripts/pin-artifact.ts`. GitHub does not run workflows on a PR that `GITHUB_TOKEN` opened, so a maintainer has to start its checks (close and reopen it) before merging. It also runs when a push's source is already published (a revert to an older source, or a pin PR closed unmerged), so `main`'s pin follows the current source; it opens no PR when `main` already has the digest. On that path the `realign` job (`packages: write`) points the moving version tag back at that source's digest with `scripts/retag.sh`, which leaves a tag that is already there alone. Every tag move is behind the same source guard, so a stale run never retags.
 
@@ -196,8 +196,8 @@ savepoints, `rows-affected`, `close`, and `server-version`. PostgreSQL parameter
 use `$1`, `$2`, etc. Text parameters are sent with OID 0 (unknown type), allowing
 PostgreSQL to infer the type from context; comparisons against `uuid`, `timestamptz`,
 and `jsonb` columns work correctly (see Typed values). `server-version()` reports the bundled engine without
-opening a database. Only the `template1` database is currently supported;
-other `open-options.database` values are rejected. Requests must fit the engine's
+opening a database (see [Application database](#application-database) for
+`open-options.database`). Requests must fit the engine's
 input buffer; each serialized result is limited to 64 MiB and stays in memory.
 Larger results return a PostgreSQL program-limit error. Signal-based statement
 timeouts are unavailable in this WASI engine: nonzero `statement-timeout-ms`
@@ -360,11 +360,55 @@ libraries per engine instance. pgcrypto resolves before that table and never
 uses a slot. A `LOAD` of a new library after the table is full fails with
 `dlopen table is full` and leaves the session usable.
 
+### Application database
+
+Application data lives in the `postgres` database on data directories this
+provider initializes, and stays in `template1` on directories created before
+(#212). With `open-options.database` unset:
+
+| Data directory | Default database |
+| --- | --- |
+| Initialized by this provider: `<root>/data/di-framework-database` contains `postgres` | `postgres` |
+| No marker: created by an earlier release (the current package version, 6.0.15, and before) | `template1`, unchanged |
+
+Upgrading the provider never moves data: an existing directory keeps opening
+`template1`, and it never gets the marker. Fresh directories open `postgres`
+from their first session on.
+
+Explicit `open-options.database` values:
+
+- `postgres` and `template1` are accepted on every directory (initdb creates
+  both). On an older directory, `postgres` exists but is empty.
+- `template0` is always rejected: the single-user engine would not enforce
+  `datallowconn`, so opening it would make the pristine template writable.
+- Any other name is rejected. The list is fixed because the engine picks its
+  database before its backend starts, so it cannot look the name up first.
+
+The embedded backend stays connected to the database its first `open` chose.
+A later `open` in the same component instance that resolves to a different
+database fails with `open-failed`; restart the component to switch.
+
+The marker is part of the data directory. Back it up and restore it with the
+rest of PGDATA: without it, a directory falls back to `template1`, and an
+application whose tables are in `postgres` would find them missing. To move a
+legacy directory to `postgres`, dump `template1` and restore it into
+`postgres` on a fresh directory; do not add the marker by hand to a directory
+whose data is in `template1`.
+
+Initialization runs in a separate, single-use engine instance bundled into
+the provider: initdb's post-bootstrap step runs in `template1` and the
+single-user backend cannot change databases afterwards. That instance creates
+the cluster and the marker. The serving instance then boots on the finished
+cluster in the selected database and verifies it with `current_database()`
+before the first session is handed out.
+
 ## Persistence and ownership
 
 For an `open("/data/orders", ...)` call:
 
-- `/data/orders/data/` is PGDATA (catalogs, tables, WAL and configuration).
+- `/data/orders/data/` is PGDATA (catalogs, tables, WAL and configuration,
+  plus the `di-framework-database` marker on directories this provider
+  initialized; see [Application database](#application-database)).
 - `/data/orders/runtime/` contains bundled initialization/support files.
 - Bootstrap and shared-memory scratch files also stay beneath `/data/orders`.
 
@@ -440,7 +484,7 @@ for both the export and the import. PostgreSQL 18 is tracked in #401.
 - `js/wit.d.ts`: generated TypeScript view of the `database` interface.
 - `src/lib.rs`: public WIT resources and connection lifecycle.
 - `src/pgwire.rs`: PostgreSQL message encoding and typed rows, over memory.
-- `src/engine.rs`: persistent filesystem setup and exclusive engine access.
+- `src/engine.rs`: persistent filesystem setup, exclusive engine access, and the application database choice (marker, crash windows).
 - `engine/bridge.wat`: private canonical ABI bridge to the core engine.
 - `engine/build-pgcrypto.sh`: builds OpenSSL libcrypto and pgcrypto in the engine container and generates pgcrypto's static `dlsym` table; `scripts/patch-engine-source.ts` links both into the engine. The libcrypto build is cached under a key of the OpenSSL source tarball's sha256, the Configure options and `SOURCE_DATE_EPOCH`, so an OpenSSL version bump always rebuilds it.
 - `scripts/patch-engine-source.ts`: also replaces the upstream `dlopen` emulation's unbounded table (`dltab`) with the bounded one described under [Extensions](#extensions), and keeps pgcrypto's hook ahead of it.
@@ -448,5 +492,6 @@ for both the export and the import. PostgreSQL 18 is tracked in #401.
 - `scripts/build-engine.ts`: builds the engine source tree (pinned tag, checked commit, checked patches) and runs the wasipg container build; `scripts/check-engine-patch.ts` (`make check-engine-patch`) runs the same source steps without the build.
 - `scripts/prepare-engine.ts`: pinned engine preparation and componentization (all build scripts are Bun TypeScript; see `scripts/`).
 - `wit/deps/pglite-engine/engine.wit`: internal interface, composed away at build.
+- `wit/deps/pglite-engine-bootstrap/bootstrap.wit`: internal interface of the single-use initdb engine instance; `scripts/build.ts` (`providerWac`) feeds it from a second instance of the same engine component.
 
 Engine provenance and modifications are described in `engine/NOTICE`.
