@@ -490,8 +490,6 @@ logging out both stop access.
 ## Known gaps
 
 * Console sessions, login flows, and the controller's token cache are in memory.
-* The `resourceNames` list of members in the TokenRequest Role is computed at deploy time; the
-  platform controller must keep it current on membership changes.
 * The pair takes CPU from the tenant runtime quota (`di-runtime-quota`, 2 CPU limits total with
   the hosts already using 1.5), hence the small limits and `Recreate`; the reconcile should size
   the quota to include platform components.
