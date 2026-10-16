@@ -1928,7 +1928,11 @@ separate databases, volumes, and passwords.
 Update the platform package and apply its existing Pulumi stack before using
 these APIs. Update the application CLI extension and `@di-framework/bindings`
 together. Managed named imports require `@di-framework/componentize-qjs`
-`0.4.4-di.3` or later; the CLI installs the compiler dependency.
+`0.4.4-di.3` or later; the CLI installs the compiler dependency. Exact `int8`
+parameters past 2^53 through the pglite adapter need `0.4.4-di.5`
+(`@di-framework/cli-plugin-platform` 6.2.0 or later). npm's `latest` tag of
+the compiler is still `0.4.4-di.1`, so install it with the `di` tag
+(`@di-framework/componentize-qjs@di`) when you do not use the CLI.
 
 ### Create and bind
 

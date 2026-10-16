@@ -31,13 +31,29 @@ import {
 import { databaseInterface, readWitVersion } from '../scripts/lib/wit-version';
 import { startWorker, withTimeout } from './async-context';
 
+const MAX_SAFE_BIG = BigInt(Number.MAX_SAFE_INTEGER);
+
 const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe('pglite value conversion', () => {
   test('binds JavaScript values as pglite value variants', () => {
     expect(toWasmPgValue(null)).toEqual({ tag: 'null' });
     expect(toWasmPgValue(undefined)).toEqual({ tag: 'null' });
+    // Safe integers stay Numbers so every binding can lower them as s64.
     expect(toWasmPgValue(42)).toEqual({ tag: 'integer', val: 42 });
+    expect(toWasmPgValue(Number.MAX_SAFE_INTEGER)).toEqual({
+      tag: 'integer',
+      val: Number.MAX_SAFE_INTEGER,
+    });
+    expect(toWasmPgValue(Number.MIN_SAFE_INTEGER)).toEqual({
+      tag: 'integer',
+      val: Number.MIN_SAFE_INTEGER,
+    });
+    const negativeZero = toWasmPgValue(-0);
+    expect(negativeZero).toEqual({ tag: 'integer', val: 0 });
+    expect(Object.is(negativeZero.val, 0)).toBe(true);
+    expect(() => toWasmPgValue(2 ** 53)).toThrow(/outside the safe range/);
+    expect(() => toWasmPgValue(-(2 ** 53))).toThrow(/outside the safe range/);
     expect(toWasmPgValue(1.5)).toEqual({ tag: 'real', val: 1.5 });
     expect(() => toWasmPgValue(Number.MAX_SAFE_INTEGER + 2)).toThrow(/bigint or a decimal string/);
     expect(() => toWasmPgValue(-(2 ** 60))).toThrow(TypeError);
@@ -47,9 +63,21 @@ describe('pglite value conversion', () => {
       tag: 'real',
       val: Number.POSITIVE_INFINITY,
     });
+    // Band 1: a safe bigint is sent as a Number, like a safe number.
     expect(toWasmPgValue(42n)).toEqual({ tag: 'integer', val: 42 });
-    expect(toWasmPgValue(2n ** 62n)).toEqual({ tag: 'text', val: '4611686018427387904' });
-    expect(toWasmPgValue(-(2n ** 62n))).toEqual({ tag: 'text', val: '-4611686018427387904' });
+    expect(toWasmPgValue(0n)).toEqual({ tag: 'integer', val: 0 });
+    expect(toWasmPgValue(MAX_SAFE_BIG)).toEqual({ tag: 'integer', val: Number.MAX_SAFE_INTEGER });
+    expect(toWasmPgValue(-MAX_SAFE_BIG)).toEqual({ tag: 'integer', val: Number.MIN_SAFE_INTEGER });
+    // Band 2: past 2^53 within int8 a BigInt payload keeps it exact
+    // (componentize-qjs 0.4.4-di.5 lowers s64 from BigInt, #153).
+    expect(toWasmPgValue(2n ** 53n)).toEqual({ tag: 'integer', val: 2n ** 53n });
+    expect(toWasmPgValue(-(2n ** 53n))).toEqual({ tag: 'integer', val: -(2n ** 53n) });
+    expect(toWasmPgValue(9007199254740993n)).toEqual({ tag: 'integer', val: 9007199254740993n });
+    expect(toWasmPgValue(2n ** 63n - 1n)).toEqual({ tag: 'integer', val: 2n ** 63n - 1n });
+    expect(toWasmPgValue(-(2n ** 63n))).toEqual({ tag: 'integer', val: -(2n ** 63n) });
+    // Band 3: outside s64 the binding would wrap modulo 2^64, so the value goes as text for numeric.
+    expect(toWasmPgValue(2n ** 63n)).toEqual({ tag: 'text', val: '9223372036854775808' });
+    expect(toWasmPgValue(-(2n ** 63n) - 1n)).toEqual({ tag: 'text', val: '-9223372036854775809' });
     expect(toWasmPgValue(true)).toEqual({ tag: 'boolean', val: true });
     expect(toWasmPgValue(false)).toEqual({ tag: 'boolean', val: false });
     expect(toWasmPgValue('text')).toEqual({ tag: 'text', val: 'text' });
