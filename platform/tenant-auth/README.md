@@ -122,10 +122,10 @@ The earlier manual deploy script (#58) is removed; use the reconcile, or run the
 the cluster as described below.
 
 Why `di-runtime-<t>` and not `di-tenant-<t>`: developers can edit any Secret or ConfigMap in the
-tenant namespace that the admission policy does not reserve by name, so there they could replace
-the controller's code or read the console's client secret. In the runtime namespace tenant users
-only have pods and logs. Moving to `di-tenant-<t>` needs the `backend-config` admission policy
-to reserve the `tenant-auth-*` and `tenant-controller-*` names.
+tenant namespace that the admission policy does not reserve by name, so there they could read the
+console's client secret. The controller's code runs from the image, not a mount. In the runtime
+namespace tenant users only have pods and logs. Moving to `di-tenant-<t>` needs the
+`backend-config` admission policy to reserve the `tenant-auth-*` and `tenant-controller-*` names.
 
 Local identity-server: a developer's browser can only be relied on to reach `localhost`, and Bun
 resolves every `*.localhost` name to loopback regardless of `/etc/hosts`. With a loopback issuer,
@@ -490,11 +490,8 @@ logging out both stop access.
 ## Known gaps
 
 * Console sessions, login flows, and the controller's token cache are in memory.
-* The `resourceNames` list of members in the TokenRequest Role is computed at deploy time; the
-  platform controller must keep it current on membership changes.
-* The pair takes CPU from the tenant runtime quota (`di-runtime-quota`, 2 CPU limits total with
-  the hosts already using 1.5), hence the small limits and `Recreate`; the reconcile should size
-  the quota to include platform components.
+* The controller and console use `Recreate` strategy because a surge pod would not fit the
+  runtime quota after platform components.
 * The sidecar container can start after the app, which costs one restart; an init ordering or
   a startup probe would avoid it.
 * `/-/members` reads the memberships the platform publishes in ConfigMap

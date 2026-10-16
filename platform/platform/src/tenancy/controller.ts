@@ -1099,8 +1099,8 @@ export class Controller {
   }
   /**
    * The tenant's controller and console (#58), reconciled apart from the tenant itself: a
-   * failure here (an object left by `deploy-local.ts`, a missing permission) is reported on the
-   * `TenantAuthReady` condition and never turns Ready false, so members keep their access.
+   * failure (a missing permission or an object created by hand that can't be adopted) is reported
+   * on the `TenantAuthReady` condition and never turns Ready false, so members keep their access.
    * With `tenantAuth` unset, the pair and its RBAC are pruned and no condition is reported.
    */
   private async reconcileTenantAuth(
