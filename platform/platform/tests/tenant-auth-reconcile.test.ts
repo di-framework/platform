@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { createPrivateKey, X509Certificate } from 'node:crypto';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
+import {
+  configFromEnv as controllerConfigFromEnv,
+  serveWhoamiListener,
+} from '../../tenant-auth/src/controller';
 import { platformRegistryPullHost } from '../src/insecure-registries';
 import { CA_DAYS, CA_OVERLAP_DAYS, CA_RENEW_DAYS } from '../src/tenancy/ca-rotation';
 import {
@@ -2377,6 +2383,7 @@ describe('tenant registry (#83:reconcile)', () => {
     const controller = find(resources, 'Deployment', 'tenant-controller') as Deployment;
     expect(env(controller)).toMatchObject({
       TENANT_CONTROLLER_WHOAMI_PORT: '8789',
+      TENANT_CONTROLLER_WHOAMI_TLS_ONLY: 'true',
       TENANT_CONTROLLER_REGISTRY_FRONT_PORT: '8790',
       TENANT_CONTROLLER_REGISTRY_HOST: 'registry',
       TENANT_CONTROLLER_REGISTRY_URL: 'https://registry.alpha.localhost:28180',
@@ -2439,6 +2446,7 @@ describe('tenant registry (#83:reconcile)', () => {
     );
     expect(closed).toMatchObject({
       TENANT_CONTROLLER_WHOAMI_PORT: '8789',
+      TENANT_CONTROLLER_WHOAMI_TLS_ONLY: 'true',
       TENANT_CONTROLLER_REGISTRY_HOST: 'registry',
     });
     expect(closed).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_FRONT_PORT');
@@ -2447,9 +2455,10 @@ describe('tenant registry (#83:reconcile)', () => {
     // Without a registry, none of it.
     const plain = tenantAuthResources(tenant(), { ...registryCfg, tenantAuth: auth }, inputs);
     expect(find(plain, 'WorkloadDeployment', REGISTRY_WORKLOAD)).toBeUndefined();
-    expect(env(find(plain, 'Deployment', 'tenant-controller') as Deployment)).not.toHaveProperty(
-      'TENANT_CONTROLLER_REGISTRY_URL',
-    );
+    const plainEnv = env(find(plain, 'Deployment', 'tenant-controller') as Deployment);
+    expect(plainEnv).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_URL');
+    expect(plainEnv).not.toHaveProperty('TENANT_CONTROLLER_WHOAMI_PORT');
+    expect(plainEnv).not.toHaveProperty('TENANT_CONTROLLER_WHOAMI_TLS_ONLY');
     const plainNetwork = find(plain, 'NetworkPolicy', 'tenant-auth-network') as unknown as {
       spec: { ingress: unknown[] };
     };
@@ -2523,6 +2532,51 @@ describe('tenant registry (#83:reconcile)', () => {
     expect(new X509Certificate(leaf.cert).checkHost(url.hostname)).toBe(url.hostname);
     for (const name of ['beta', 'gamma'])
       expect(tenantControllerCertNames(name).dns).toContain(registryWhoamiHost(name));
+  });
+
+  it('the rendered controller serves whoami over TLS only, with no plain-HTTP relay (#329)', async () => {
+    const rendered = env(
+      find(
+        tenantAuthResources(tenant(), registryCfg, { ...inputs, registryServing: true }),
+        'Deployment',
+        'tenant-controller',
+      ) as Deployment,
+    );
+    // The controller's own reading of the rendered env: only the bind address and port differ.
+    const config = controllerConfigFromEnv({ ...rendered, TENANT_CONTROLLER_HOST: '127.0.0.1' });
+    expect(config.whoamiPort).toBe(8789);
+    expect(config.whoamiTlsOnly).toBe(true);
+    const name = registryWhoamiHost('alpha');
+    const names = tenantControllerCertNames('alpha', withRegistry);
+    const ca = caCertificate('tenant-controller CA (di-runtime-alpha)', 30);
+    const leaf = leafCertificate(name, names.dns, names.ips, 30, ca.cert, ca.key);
+    const listener = await serveWhoamiListener(
+      { handleWhoami: async () => Response.json({ user: 'u' }) },
+      config,
+      0,
+      { cert: leaf.cert, key: leaf.key },
+    );
+    const call = (secure: boolean) =>
+      new Promise<number>((resolve, reject) => {
+        const options = { host: '127.0.0.1', port: listener.port, path: '/v1/auth/whoami' };
+        const done = (res: import('node:http').IncomingMessage) => {
+          res.resume();
+          res.on('end', () => resolve(res.statusCode ?? 0));
+        };
+        // The registry's view: the tenant CA and the Service name it calls.
+        const req = secure
+          ? httpsRequest({ ...options, agent: false, ca: ca.cert, servername: name }, done)
+          : httpRequest({ ...options, agent: false }, done);
+        req.on('error', reject);
+        req.end();
+      });
+    try {
+      expect(await call(true)).toBe(200);
+      // A plain-HTTP request is not relayed to the handler: the connection fails instead.
+      await expect(call(false)).rejects.toThrow();
+    } finally {
+      await listener.stop();
+    }
   });
 
   it('deploys the registry after raising the workload quota and reports it on TenantAuthReady', async () => {
