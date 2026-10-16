@@ -1254,6 +1254,11 @@ describe('Auto Tag tags a release when its PR merges instead of waiting for it (
     });
   });
 
+  test('tags on schedule every 30 minutes to catch auto-merged releases (#395)', () => {
+    expect((autoTag.on.schedule as { cron: string }[])?.length).toBeGreaterThan(0);
+    expect((autoTag.on.schedule as { cron: string }[])?.[0]?.cron).toBe('*/30 * * * *');
+  });
+
   test('two jobs: tag, then release-pr; nothing waits for the PR to merge', () => {
     expect(Object.keys(autoTag.jobs).sort()).toEqual(['release-pr', 'tag']);
     expect(autoTag.jobs.tag?.needs).toBeUndefined();
@@ -1278,6 +1283,7 @@ describe('Auto Tag tags a release when its PR merges instead of waiting for it (
     expect(tagIf).toContain('github.event.pull_request.head.repo.full_name == github.repository');
     const prIf = autoTag.jobs['release-pr']?.if ?? '';
     expect(prIf).toContain("!cancelled() && needs.tag.result == 'success'");
+    expect(prIf).toContain("github.event_name != 'schedule'");
     expect(prIf).toContain("(github.event_name == 'workflow_dispatch' && inputs.tag_only != true)");
     expect(prIf).toContain("github.event_name == 'push'");
     expect(prIf).toContain("!startsWith(github.event.head_commit.message, 'chore(release):')");
