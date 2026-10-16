@@ -692,6 +692,129 @@ describe('gateway SIGTERM drain behind the edge (#223)', () => {
   });
 });
 
+/**
+ * routeAliases rollout scenario (#223): requests to an aliased route succeed during a gateway
+ * drain triggered by a rollout.
+ */
+describe('routeAliases during SIGTERM drain (#223)', () => {
+  let upstream: Server;
+  let upstreamPort: number;
+  let held: Promise<void>;
+  let release: () => void;
+
+  beforeEach(async () => {
+    let seen: () => void = () => {};
+    held = new Promise((resolve) => {
+      seen = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    upstream = createServer((req, res) => {
+      const answer = (body: string) => {
+        res.writeHead(200, {
+          'content-type': 'text/plain',
+          'content-length': Buffer.byteLength(body),
+        });
+        res.end(body);
+      };
+      if (req.url === '/slow') {
+        seen();
+        void released.then(() => answer('slow done'));
+        return;
+      }
+      answer('fast');
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+    upstreamPort = (upstream.address() as { port: number }).port;
+  });
+
+  afterEach(async () => {
+    release();
+    for (const socket of Array.from((upstream.connections ?? []) as unknown as Set<Socket>)) {
+      socket.destroy();
+    }
+    await new Promise((resolve) => upstream.close(resolve));
+  });
+
+  it('routes requests to aliased tenant during drain', async () => {
+    const signals = new EventEmitter();
+    let exited: (code: number) => void = () => {};
+    const exit = new Promise<number>((resolve) => {
+      exited = resolve;
+    });
+
+    const server = main(
+      {
+        GATEWAY_CONFIG: JSON.stringify({
+          port: 0,
+          defaultUpstream: `127.0.0.1:${upstreamPort}`,
+          tenantUpstream: (_tenant: string) => ({
+            hostname: '127.0.0.1',
+            port: upstreamPort,
+          }),
+          routeAliases: { 'api.alpha': 'api.beta' }, // alpha.api -> beta.api
+          drainTimeoutMs: 5_000,
+        }),
+      },
+      signals,
+      (code) => {
+        exited(code);
+      },
+    );
+
+    await within(
+      new Promise((resolve) => server.once('listening', resolve)),
+      2_000,
+      'the gateway to listen',
+    );
+    const port = (server.address() as { port: number }).port;
+
+    const clients: Client[] = [];
+    try {
+      // Request to the aliased route should reach the upstream.
+      const aliasedClient = new Client(port);
+      clients.push(aliasedClient);
+      await within(aliasedClient.connected(), 2_000, 'aliased client to connect');
+
+      // Make a request through the alias (api.alpha.localhost -> api.beta.localhost).
+      const firstRes = await within(aliasedClient.get('/'), 2_000, 'first aliased response');
+      expect(firstRes.body).toBe('fast');
+
+      // Now make a slow request on a second client.
+      const slowClient = new Client(port);
+      clients.push(slowClient);
+      await within(slowClient.connected(), 2_000, 'slow client to connect');
+      const slowPromise = slowClient.get('/slow');
+      await within(held, 2_000, 'the upstream to receive /slow');
+
+      // Trigger SIGTERM (simulating the rollout).
+      signals.emit('SIGTERM');
+
+      // New connections should be refused.
+      await within(
+        (async () => {
+          while (!(await refused(port))) await Bun.sleep(10);
+        })(),
+        2_000,
+        'the listener to close',
+      );
+
+      // The slow request should still complete successfully.
+      release();
+      const slowRes = await within(slowPromise, 2_000, 'the slow response');
+      expect(slowRes.status).toBe(200);
+      expect(slowRes.body).toBe('slow done');
+      expect(slowRes.headers.connection).toBe('close');
+
+      // The gateway should exit.
+      expect(await within(exit, 2_000, 'the gateway to exit')).toBe(0);
+    } finally {
+      for (const c of clients) c.socket.destroy();
+    }
+  });
+});
+
 describe('gateway defaultUpstream (#223)', () => {
   it('takes a bare host as port 80, or host:port', () => {
     expect(defaultUpstreamOf('wasmcloud-http.wasmcloud.svc.cluster.local')).toEqual({
