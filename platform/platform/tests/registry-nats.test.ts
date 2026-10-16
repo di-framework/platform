@@ -25,6 +25,8 @@ import {
   NATS_CREDENTIALS_HOST_IMAGE_DIGESTS,
   newRegistryNatsPassword,
   REGISTRY_NATS_AUTH_ANNOTATION,
+  REGISTRY_NATS_CONNECT_MAX_DELAY_SECONDS,
+  REGISTRY_NATS_CONNECT_WAIT_SECONDS,
   REGISTRY_NATS_MIGRATION,
   REGISTRY_NATS_MIGRATION_COMPONENT,
   REGISTRY_NATS_MIGRATION_DEADLINE_SECONDS,
@@ -116,6 +118,7 @@ const schedulerSecret = { data: { 'ca.crt': 'test' } };
 type Container = {
   name: string;
   image: string;
+  workingDir?: string;
   command?: string[];
   args?: string[];
   env?: { name: string; value?: string; valueFrom?: unknown }[];
@@ -370,6 +373,22 @@ describe('registry NATS account rendering (#159)', () => {
     expect(job.spec.activeDeadlineSeconds).toBe(REGISTRY_NATS_MIGRATION_DEADLINE_SECONDS);
     expect(job.metadata.namespace).toBe('di-runtime-alpha');
     expect(job.spec.backoffLimit).toBeGreaterThan(0);
+    // Every pod the Job may start can spend its whole first-connection wait (#388), plus the
+    // Job controller's pod backoff (10 s doubling, capped at 6 min), well inside the deadline.
+    const podBackoff = Array.from({ length: job.spec.backoffLimit }, (_, i) =>
+      Math.min(10 * 2 ** i, 360),
+    ).reduce((sum, delay) => sum + delay, 0);
+    // Each of a pod's 13 attempts may also wait out nats.go's 2 s dial timeout when an engine
+    // drops packets instead of refusing them.
+    const attempts = 13;
+    const dialTimeout = 2;
+    const wait =
+      REGISTRY_NATS_CONNECT_WAIT_SECONDS +
+      REGISTRY_NATS_CONNECT_MAX_DELAY_SECONDS +
+      attempts * dialTimeout;
+    expect((job.spec.backoffLimit + 1) * wait + podBackoff).toBeLessThan(
+      REGISTRY_NATS_MIGRATION_DEADLINE_SECONDS,
+    );
     expect(job.spec.ttlSecondsAfterFinished).toBe(86400);
     const pod = job.spec.template;
     expect(pod.metadata.labels).toEqual({
@@ -381,6 +400,8 @@ describe('registry NATS account rendering (#159)', () => {
     const [container] = pod.spec.containers;
     expect(container?.image).toBe(NATS_BOX_IMAGE);
     expect(NATS_BOX_IMAGE).toMatch(/@sha256:[0-9a-f]{64}$/);
+    // The container runs as non-root uid 65532, so it needs a readable working directory (#391).
+    expect(container?.workingDir).toBe('/tmp');
     expect(container?.command).toEqual(['sh', '-c', REGISTRY_NATS_MIGRATION_SCRIPT]);
     expect(container?.env).toEqual([
       { name: 'NATS_URL', value: 'nats://di-nats.di-runtime-alpha.svc.cluster.local:4222' },
@@ -398,6 +419,23 @@ describe('registry NATS account rendering (#159)', () => {
     expect((container as unknown as { resources: { limits: unknown } }).resources.limits).toEqual(
       REGISTRY_NATS_MIGRATION_LIMITS,
     );
+    // The /tmp volume must be writable by uid 65532 for the nats CLI and script temp files.
+    expect(
+      (pod.spec.volumes as unknown as Array<{ name: string }>).find((v) => v.name === 'tmp'),
+    ).toBeDefined();
+    expect(
+      (
+        container?.volumeMounts as unknown as Array<{
+          name: string;
+          mountPath: string;
+        }>
+      )?.find((v) => v.name === 'tmp' && v.mountPath === '/tmp'),
+    ).toBeDefined();
+    // The filesystem is read-only except /tmp, so uid 65532 can only work in /tmp.
+    expect(
+      (container as unknown as { securityContext: { readOnlyRootFilesystem: boolean } })
+        .securityContext.readOnlyRootFilesystem,
+    ).toBe(true);
   });
 
   it('raises the runtime quota by the Job limits only while the Job is rendered', () => {

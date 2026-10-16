@@ -326,7 +326,12 @@ Running workloads are not affected while the registry is stopped, but pushes and
 the tenant registry fail until it is back (a restarted host cannot pull tenant images meanwhile).
 The time is about one copy of the store over the pod network. The copy needs free JetStream file
 storage of at least the store's size under `runtimeNats.maxFileStore`; if the Job fails with
-`insufficient resources`, raise the cap. The Job retries 10 times within one hour
+`insufficient resources`, raise the cap. Each Job pod first waits up to about 90 s for its first
+connection to `di-nats`, because a network policy engine admits a new pod's traffic only once it
+has programmed the pod (about a second under kube-router). Its log shows each refused attempt
+(`connecting to di-nats, attempt N failed …`). A pod that cannot connect in that time fails with
+`could not connect to di-nats as the registry user`; any other failure of that first login (such
+as a rejected password) fails at once with `the registry login failed`. The Job retries 10 times within one hour
 (`activeDeadlineSeconds: 3600`, which also ends a Job whose pod the quota or the scheduler never
 admits). When it fails, `TenantAuthReady` says `RegistryMigrationFailed` with the Job's reason
 (`BackoffLimitExceeded`, `DeadlineExceeded`) and the registry stays stopped. Read its logs
@@ -1261,7 +1266,7 @@ script is removed:
 
 ```yaml
 tenantAuth:
-  image: ghcr.io/di-framework/tenant-auth@sha256:6c15ee1024c43f17747b8a4b177de8cecafc0a1cc27623468ce5c70ee14617c4   # required, pinned by digest
+  image: ghcr.io/di-framework/tenant-auth@sha256:035fd41d945fac8fcf614ab3fa52e49b95dcf4cc4bc4bdfb7b94226269bb11b7   # required, pinned by digest
   issuer: http://identity.acme.localhost:28180               # identity-server, as pods and browsers name it
   oauthClient: { id: access, secretName: tenant-auth-oauth } # Secret in the platform namespace; key `clientSecret`
   issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80  # optional, for a loopback issuer

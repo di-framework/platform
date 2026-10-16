@@ -1625,6 +1625,7 @@ function registryNatsMigrationJob(
             {
               name: 'migrate',
               image: NATS_BOX_IMAGE,
+              workingDir: '/tmp',
               command: ['sh', '-c', REGISTRY_NATS_MIGRATION_SCRIPT],
               env: [
                 { name: 'NATS_URL', value: `nats://di-nats.${namespace}.svc.cluster.local:4222` },
