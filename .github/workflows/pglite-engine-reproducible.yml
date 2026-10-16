@@ -3,6 +3,10 @@
 # for pglite.wasi, engine.core.wasm, engine.wasm and the embedded support filesystem
 # (`make reproducible`, scripts/check-reproducible.ts).
 #
+# The engine source patches (engine/patches/, scripts/patch-engine-source.ts) are covered by
+# engine/** and the script paths below; `make check-engine-patch` fails fast if one no longer
+# applies to the pinned PostgreSQL tag, before the two long builds start.
+#
 # Two full engine source builds are too slow for every ci.yml run, so this job only runs when an
 # engine input changes. It uses no cache: a restored engine would not be a clean build.
 name: pglite engine reproducibility
@@ -15,6 +19,7 @@ on:
       - 'platform/pglite-component/scripts/patch-engine-source.ts'
       - 'platform/pglite-component/scripts/prepare-engine.ts'
       - 'platform/pglite-component/scripts/check-reproducible.ts'
+      - 'platform/pglite-component/scripts/check-engine-patch.ts'
       - 'platform/pglite-component/scripts/install-tools.ts'
       - 'platform/pglite-component/scripts/lib/**'
       - 'platform/pglite-component/Makefile'
@@ -29,6 +34,7 @@ on:
       - 'platform/pglite-component/scripts/patch-engine-source.ts'
       - 'platform/pglite-component/scripts/prepare-engine.ts'
       - 'platform/pglite-component/scripts/check-reproducible.ts'
+      - 'platform/pglite-component/scripts/check-engine-patch.ts'
       - 'platform/pglite-component/scripts/install-tools.ts'
       - 'platform/pglite-component/scripts/lib/**'
       - 'platform/pglite-component/Makefile'
@@ -68,6 +74,9 @@ jobs:
 
       - name: Install Wasm build tools
         run: make -C platform/pglite-component tools
+
+      - name: Check that the engine source patches apply
+        run: make -C platform/pglite-component check-engine-patch
 
       - name: Build the engine twice and compare digests
         run: make -C platform/pglite-component reproducible

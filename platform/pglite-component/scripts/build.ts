@@ -2,10 +2,11 @@
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { $ } from 'bun';
+import { ENGINE_SOURCE_PATCH, postgresSource, postgresVersion } from './build-engine.ts';
 import { type Args, type Context, logger, parseFlags, run } from './lib/cli.ts';
 import { sha256File } from './lib/fetch.ts';
 import { fileExists, isDirectory } from './lib/fs.ts';
-import { requiredPin } from './lib/versions.ts';
+import { type Pins, requiredPin } from './lib/versions.ts';
 import { assertProviderWit, readWitVersion } from './lib/wit-version.ts';
 import { prepareEngine } from './prepare-engine.ts';
 
@@ -20,6 +21,19 @@ const USAGE = [
 ].join('\n');
 
 const FLAGS = { debug: { type: 'boolean' } } as const;
+
+/** BUILD-INFO.txt lines naming the engine and every input of its source tree. */
+export function engineBuildInfo(pins: Pins, patchSha256: string): string[] {
+  const source = postgresSource(pins);
+  const repo = source.repo.replace(/\.git$/, '');
+  return [
+    `engine:          PostgreSQL ${postgresVersion(source.tag)}, persistent WASI filesystem`,
+    `extensions:      plpgsql, pgcrypto (OpenSSL ${requiredPin(pins, 'OPENSSL_VERSION')} libcrypto)`,
+    `engine-source:   ${repo}/tree/${source.commit} (${source.tag})`,
+    `engine-patch:    ${ENGINE_SOURCE_PATCH} (sha256 ${patchSha256})`,
+    `engine-recipe:   https://github.com/moznion/wasipg/tree/${requiredPin(pins, 'PGLITE_SOURCE_REF')}`,
+  ];
+}
 
 /** engine/ files concatenated, in order, into dist/THIRD-PARTY-NOTICES.txt. */
 export const THIRD_PARTY_NOTICE_FILES = [
@@ -132,9 +146,7 @@ export async function buildComponent(ctx: Context, options: BuildOptions): Promi
       `wasm-tools:      ${wasmToolsVersion}`,
       `wit-bindgen:     ${requiredPin(pins, 'WIT_BINDGEN_VERSION')}`,
       `md5:             ${requiredPin(pins, 'MD5_VERSION')}`,
-      'engine:          PostgreSQL 17.5, persistent WASI filesystem',
-      `extensions:      plpgsql, pgcrypto (OpenSSL ${requiredPin(pins, 'OPENSSL_VERSION')} libcrypto)`,
-      `engine-source:   https://github.com/moznion/wasipg/tree/${requiredPin(pins, 'PGLITE_SOURCE_REF')}`,
+      ...engineBuildInfo(pins, await sha256File(join(pkgDir, ENGINE_SOURCE_PATCH))),
       `adapter-sha256:  ${requiredPin(pins, 'PGLITE_ADAPTER_SHA256')}`,
       `engine-sha256:   ${await sha256File(join(engineDir, 'engine.core.wasm'))}`,
       `size:            ${size} bytes`,

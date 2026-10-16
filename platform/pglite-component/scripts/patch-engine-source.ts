@@ -17,6 +17,8 @@ export const ALLOWED_RELATIVE_FILES = new Set([
   'pglite-wasm/build.sh',
   'wasm-build/build-ext.sh',
   'wasm-build/sdk_port-wasi/sdk_port-wasi-dlfcn.c',
+  'pglite-wasm/pgl_initdb.c',
+  'pglite-wasm/pgl_stubs.h',
   'contrib/pgcrypto/pgp-cfb.c',
   'df-extensions/build-pgcrypto.sh',
   'df-extensions/openssl.tar.gz',
@@ -245,71 +247,105 @@ export function patchDlfcn(text: string): string {
 
 /**
  * Blowfish and CAST5 are unavailable in this build (they need the OpenSSL
- * legacy provider, which is not built). pgcrypto's PGP CFB mode is patched to
- * refuse them with `Cipher cannot be initialized`: it encrypts one probe block
- * when the CFB context is created, and it reports any later block failure,
- * clearing the rest of the output buffer.
+ * legacy provider, which is not built). Upstream PostgreSQL 17.11 makes
+ * pgcrypto's PGP CFB mode raise an ERROR when a cipher cannot encrypt
+ * (b05cfc6937, CVE-2026-14663) and adds a decrypt-only `ignore-cipher-failure`
+ * recovery option (7eed42a). di-framework carried its own fix for this until
+ * #383; now the engine relies on upstream's, and refuses a base without it.
  */
-export const PGP_CFB_INIT_ANCHOR = [
-  '\tres = px_cipher_init(ciph, key, key_len, NULL);',
-  '\tif (res < 0)',
-  '\t{',
-  '\t\tpx_cipher_free(ciph);',
-  '\t\treturn res;',
-  '\t}',
+export const PGP_CFB_UPSTREAM_FIX =
+  '\t\terr = px_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);\n';
+
+/** Fail unless pgcrypto's PGP CFB mode checks px_cipher_encrypt (see above). */
+export function requirePgpCfbFix(text: string): void {
+  if (!text.includes(PGP_CFB_UPSTREAM_FIX)) {
+    throw new Error(
+      'pgp-cfb.c: the PGP CFB cipher error check (PostgreSQL 17.11, CVE-2026-14663) is missing; ' +
+        'Blowfish and CAST5 would encrypt to plaintext',
+    );
+  }
+}
+
+/**
+ * Frontend glue the PostgreSQL security fixes since 17.5 need. pgl_initdb.c
+ * compiles initdb.c into the backend translation unit, and pgl_stubs.h stands
+ * in for src/common/fe_memutils.c there.
+ *
+ * - 4fcccea (17.11, CVE-2026-6471) declares a frontend
+ *   `SplitGUCList(char *, char, char ***)` in fe_utils/string_utils.h, which
+ *   clashes with the backend's `List **` one in utils/varlena.h. initdb never
+ *   calls it, so the frontend declaration is renamed for that include only.
+ * - fe2720c (17.10, CVE-2026-6473) routes pg_malloc_array() and
+ *   pg_realloc_array() through new overflow-checked pg_malloc_mul() and
+ *   pg_realloc_mul(); the stubs gain both, with upstream's limits.
+ */
+export const INITDB_INCLUDE = '#include "bin/initdb/initdb.c"\n';
+export const INITDB_INCLUDE_NEW = [
+  '/* di-framework: initdb never calls the frontend SplitGUCList (17.11), whose',
+  ' * declaration clashes with the backend one already in scope here. */',
+  '#define SplitGUCList df_frontend_SplitGUCList',
+  '#include "bin/initdb/initdb.c"',
+  '#undef SplitGUCList',
   '',
 ].join('\n');
-export const PGP_CFB_PROBE = [
-  '',
-  '\t/* di-framework: fail here if the cipher cannot encrypt a block. */',
-  '\t{',
-  '\t\tuint8\t\tprobe_in[PGP_MAX_BLOCK] = {0};',
-  '\t\tuint8\t\tprobe_out[PGP_MAX_BLOCK];',
-  '\t\tunsigned\tprobe_len;',
-  '',
-  '\t\tres = px_cipher_encrypt(ciph, 0, probe_in, px_cipher_block_size(ciph),',
-  '\t\t\t\t\t\t\t\tprobe_out, &probe_len);',
-  '\t\tpx_memset(probe_out, 0, sizeof(probe_out));',
-  '\t\tif (res < 0)',
-  '\t\t{',
-  '\t\t\tpx_cipher_free(ciph);',
-  '\t\t\treturn res;',
-  '\t\t}',
-  '\t}',
+export const STUBS_REALLOC_ANCHOR = [
+  'void *',
+  'pg_realloc(void *ptr, size_t size) {',
+  '    return realloc(ptr, size);',
+  '}',
   '',
 ].join('\n');
-export const PGP_CFB_BLOCK_OLD =
-  '\t\tpx_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);\n';
-export const PGP_CFB_BLOCK_NEW = [
-  '\t\t/* di-framework: report a failed block and leave no partial output. */',
-  '\t\tres = px_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);',
-  '\t\tif (res < 0)',
-  '\t\t{',
-  '\t\t\tpx_memset(dst, 0, len);',
-  '\t\t\treturn res;',
-  '\t\t}',
+export const STUBS_MUL_HELPERS = [
+  '',
+  '/* di-framework: overflow-checked helpers behind pg_malloc_array() and',
+  " * pg_realloc_array() (17.10), with fe_memutils.c's limits. */",
+  'static size_t',
+  'df_mul_size(size_t s1, size_t s2) {',
+  '    size_t req;',
+  '    if (__builtin_mul_overflow(s1, s2, &req) || req > (SIZE_MAX / 2)) {',
+  '        fprintf(stderr, "invalid memory allocation request size %zu * %zu\\n", s1, s2);',
+  '        abort();',
+  '    }',
+  '    return req;',
+  '}',
+  '',
+  'void *',
+  'pg_malloc_mul(size_t s1, size_t s2) {',
+  '    return pg_malloc(df_mul_size(s1, s2));',
+  '}',
+  '',
+  'void *',
+  'pg_realloc_mul(void *ptr, size_t s1, size_t s2) {',
+  '    return pg_realloc(ptr, df_mul_size(s1, s2));',
+  '}',
   '',
 ].join('\n');
 
-/** Make pgcrypto's PGP CFB mode refuse ciphers that cannot run (see above). */
-export function patchPgpCfb(text: string): string {
-  const name = 'pgp-cfb.c';
-  const out = insertOnce(text, PGP_CFB_INIT_ANCHOR, PGP_CFB_PROBE, 'after', name);
-  return replaceOnce(out, PGP_CFB_BLOCK_OLD, PGP_CFB_BLOCK_NEW, name);
+export function patchInitdbInclude(text: string): string {
+  return replaceOnce(text, INITDB_INCLUDE, INITDB_INCLUDE_NEW, 'pgl_initdb.c');
+}
+
+export function patchFrontendStubs(text: string): string {
+  return insertOnce(text, STUBS_REALLOC_ANCHOR, STUBS_MUL_HELPERS, 'after', 'pgl_stubs.h');
+}
+
+/** Apply the frontend glue fixes (see INITDB_INCLUDE_NEW and STUBS_MUL_HELPERS). */
+export async function patchFrontendGlue(source: string): Promise<void> {
+  const initdb = checkedPath(source, 'pglite-wasm/pgl_initdb.c');
+  await Bun.write(initdb, patchInitdbInclude(await Bun.file(initdb).text()));
+  const stubs = checkedPath(source, 'pglite-wasm/pgl_stubs.h');
+  await Bun.write(stubs, patchFrontendStubs(await Bun.file(stubs).text()));
 }
 
 /**
  * Wire pgcrypto into the WASI build: build it after the core (build-ext.sh),
  * link it statically (pglite-wasm/build.sh) and resolve its symbols through
- * the emulated dlopen/dlsym (sdk_port-wasi-dlfcn.c), and make its PGP CFB mode
- * report cipher failures (contrib/pgcrypto/pgp-cfb.c). The build script and the
- * checksum-verified OpenSSL source are copied into df-extensions/.
+ * the emulated dlopen/dlsym (sdk_port-wasi-dlfcn.c), and check that its PGP CFB
+ * mode reports cipher failures (contrib/pgcrypto/pgp-cfb.c). patchPgcrypto then
+ * copies the build script and the checksum-verified OpenSSL source into
+ * df-extensions/.
  */
-export async function patchPgcrypto(
-  source: string,
-  pkgDir: string,
-  opensslTarball: string,
-): Promise<void> {
+export async function patchPgcryptoSources(source: string): Promise<void> {
   const ext = checkedPath(source, 'wasm-build/build-ext.sh');
   await Bun.write(
     ext,
@@ -331,9 +367,15 @@ export async function patchPgcrypto(
   const dlfcn = checkedPath(source, 'wasm-build/sdk_port-wasi/sdk_port-wasi-dlfcn.c');
   await Bun.write(dlfcn, patchDlfcn(await Bun.file(dlfcn).text()));
 
-  const cfb = checkedPath(source, 'contrib/pgcrypto/pgp-cfb.c');
-  await Bun.write(cfb, patchPgpCfb(await Bun.file(cfb).text()));
+  requirePgpCfbFix(await Bun.file(checkedPath(source, 'contrib/pgcrypto/pgp-cfb.c')).text());
+}
 
+export async function patchPgcrypto(
+  source: string,
+  pkgDir: string,
+  opensslTarball: string,
+): Promise<void> {
+  await patchPgcryptoSources(source);
   await mkdir(join(source, 'df-extensions'), { recursive: true });
   await Bun.write(
     checkedPath(source, 'df-extensions/build-pgcrypto.sh'),
@@ -397,6 +439,7 @@ export async function patch(ctx: Context, argv: string[]): Promise<void> {
     throw new Error(`refusing OpenSSL source outside ${root}: ${tarball}`);
   }
   await patchEngineSource(source, ctx.pkgDir);
+  await patchFrontendGlue(source);
   await patchPgcrypto(source, ctx.pkgDir, tarball);
 }
 

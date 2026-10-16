@@ -1,6 +1,6 @@
 # di-framework:pglite — embedded PostgreSQL over WIT
 
-The provider bundles the PGlite PostgreSQL 17.5 engine into a WebAssembly
+The provider bundles a PostgreSQL 17.11 engine, built for WASI, into a WebAssembly
 component. SQL calls cross WIT and WebAssembly memory. There is no TCP listener,
 network client, native sidecar, or separate database service.
 
@@ -59,6 +59,24 @@ is cached under `target/engine`. Containers are build tools only; deployment
 runs the resulting `.wasm` directly. For a remote Podman daemon, set the task's
 `DOCKER_CONTEXT=podman`.
 
+### Engine source
+
+The engine is upstream PostgreSQL `REL_17_11` with ElectricSQL's PGlite WASI
+changes replayed onto it. Electric maintains no WASI branch past 17.5 (its newer
+branches are Emscripten-only), so the 17.5 WASI changes are carried as
+[`engine/patches/postgresql-17.11-wasi.patch`](engine/patches/README.md)
+(PostgreSQL License). `scripts/build-engine.ts` fetches the tag pinned in
+`scripts/tool-versions.env` (`POSTGRES_SOURCE_TAG`), refuses it unless it
+resolves to `POSTGRES_SOURCE_COMMIT`, and applies that patch and then the
+[wasipg](https://github.com/moznion/wasipg) recipe's sjlj patches, checking each
+before applying it. `scripts/patch-engine-source.ts` adds the di-framework
+changes described in `engine/NOTICE`.
+
+`make check-engine-patch` runs all of those steps without the container build,
+in about 30 seconds. Run it first after bumping the PostgreSQL release: a patch
+that no longer applies fails with its name, the base, and git's output. Then
+follow [engine/patches/README.md](engine/patches/README.md).
+
 The build embeds the support filesystem, adapts the engine's WASI Preview 1
 imports to Preview 2, and composes the engine with the Rust database provider.
 It fails if the final artifact imports sockets or leaves the engine unresolved.
@@ -97,6 +115,14 @@ rollback on close/drop, exclusive connection ownership, durability settings,
 and persistence across separate runtime processes. It also exits a runtime
 with an open transaction and verifies that committed rows survive and the
 uncommitted row is absent after restart. No scripted database server is used.
+
+`make smoke` also checks upgrades from the previous release. It downloads the
+published `@di-framework/pglite-component` tarball pinned as
+`PGLITE_UPGRADE_FROM_*` in `scripts/tool-versions.env` (6.0.15, PostgreSQL
+17.5) and checks its sha256. Its provider writes a data directory with a table,
+pgcrypto and PGP ciphertext. The new build must then open that directory,
+report 17.11, read the rows, decrypt the old ciphertext, run pgcrypto on new
+values, and write to it.
 
 ## Publishing to GHCR
 
@@ -319,7 +345,12 @@ Blowfish (`bf`), CAST5 (`cast5`) and single DES (`des`) are unavailable in
 this build, because the OpenSSL legacy provider is not built or loaded.
 pgcrypto refuses them with `Cipher cannot be initialized`: in `encrypt()` and
 `decrypt()`, in the PGP functions, and when decrypting PGP messages that use
-them. `3des` (DES-EDE3) is in OpenSSL's default provider and still works, for
+them. For PGP this is upstream PostgreSQL's own check (17.11, CVE-2026-14663);
+pgcrypto is otherwise unmodified. Provider releases before the #355 fix wrote
+Blowfish and CAST5 PGP messages that are not actually encrypted. To recover such
+a message, decrypt it once with upstream's `ignore-cipher-failure=1` option
+(`pgp_sym_decrypt`, `pgp_pub_decrypt`; decryption only), then re-encrypt it with
+AES. Plaintext recovered that way is not authenticated by the key. `3des` (DES-EDE3) is in OpenSSL's default provider and still works, for
 legacy data only. Use `aes` (`aes128`, `aes192`, `aes256` for PGP). Password hashing with
 `crypt()` and `gen_salt('bf')`, `'md5'`, `'xdes'` or `'des'` is unaffected,
 because pgcrypto implements those itself.
@@ -339,7 +370,8 @@ For an `open("/data/orders", ...)` call:
 
 Mount the entire root on persistent storage and reuse it after restarts.
 Initialization creates the cluster once; later starts reuse it. Incomplete
-clusters or an incompatible PostgreSQL major version are rejected.
+clusters are rejected, and so is a data directory from another PostgreSQL major
+version (see [below](#upgrading-across-postgresql-major-versions)).
 `fsync`, `synchronous_commit`, and `full_page_writes` are enabled before the
 backend starts. The host filesystem must honor WASI sync operations; a local
 restart test is not a power-loss durability certification.
@@ -370,6 +402,38 @@ its components the matching WASI preopen. Use a stable workload identity on
 redeploy and configure exclusive execution for this database. These
 annotations provide storage; they do not enforce database ownership.
 
+## Upgrading across PostgreSQL major versions
+
+A data directory belongs to one PostgreSQL major version, recorded in
+`<root>/data/PG_VERSION`. Minor releases share the on-disk format: a directory
+written by the 17.5 engine (provider 6.0.15 and earlier) opens in place under
+17.11, and `make smoke` checks this.
+
+The engine opens only major version 17. For any other `PG_VERSION`, `open`
+fails with `open-failed` and a message such as:
+
+```text
+incompatible PostgreSQL data directory: PG_VERSION is 16, but this provider bundles
+PostgreSQL 17.11 and opens only major version 17 data directories; see
+platform/pglite-component/README.md#upgrading-across-postgresql-major-versions
+```
+
+The provider does not convert directories between major versions; it bundles
+neither a second engine nor `pg_upgrade`. To move a database across a major
+version:
+
+1. Stop every writer. Keep the provider version that wrote the directory,
+   pinned by its digest or npm version, and back up the whole root.
+2. With that provider, export the data through the application, for example
+   with a migration step that reads each table through the `database`
+   interface into a portable format.
+3. Deploy the new provider on a new, empty root, and recreate the schema with
+   the application's migrations.
+4. Import the exported data, check it, then retire the old root.
+
+If the root is encrypted with `pglite-encfs`, compose encfs with the same key
+for both the export and the import. PostgreSQL 18 is tracked in #401.
+
 ## Implementation
 
 - `js/adapter.ts`: the `SqlDatabase` adapter published on npm (`bun run build:adapter`).
@@ -380,6 +444,8 @@ annotations provide storage; they do not enforce database ownership.
 - `engine/bridge.wat`: private canonical ABI bridge to the core engine.
 - `engine/build-pgcrypto.sh`: builds OpenSSL libcrypto and pgcrypto in the engine container and generates pgcrypto's static `dlsym` table; `scripts/patch-engine-source.ts` links both into the engine. The libcrypto build is cached under a key of the OpenSSL source tarball's sha256, the Configure options and `SOURCE_DATE_EPOCH`, so an OpenSSL version bump always rebuilds it.
 - `scripts/patch-engine-source.ts`: also replaces the upstream `dlopen` emulation's unbounded table (`dltab`) with the bounded one described under [Extensions](#extensions), and keeps pgcrypto's hook ahead of it.
+- `engine/patches/postgresql-17.11-wasi.patch`: Electric's 17.5 WASI changes replayed onto upstream `REL_17_11`; see [engine/patches/README.md](engine/patches/README.md).
+- `scripts/build-engine.ts`: builds the engine source tree (pinned tag, checked commit, checked patches) and runs the wasipg container build; `scripts/check-engine-patch.ts` (`make check-engine-patch`) runs the same source steps without the build.
 - `scripts/prepare-engine.ts`: pinned engine preparation and componentization (all build scripts are Bun TypeScript; see `scripts/`).
 - `wit/deps/pglite-engine/engine.wit`: internal interface, composed away at build.
 

@@ -8,13 +8,12 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-/// Bundled PostgreSQL major version this component was built against.
+/// Bundled PostgreSQL version this component was built against.
 ///
-/// Must stay in sync with the engine recipe (`PG_VERSION=17.5` in
-/// `scripts/build-engine.sh` via `PGLITE_SOURCE_REF`) and with
-/// `server_version()` in `lib.rs`. The smoke consumer asserts
-/// `version.contains("17.5")`.
-pub(crate) const POSTGRES_VERSION: &str = "17.5";
+/// Must stay in sync with the engine source (`POSTGRES_SOURCE_TAG=REL_17_11`
+/// in `scripts/tool-versions.env`), which `server_version()` in `lib.rs`
+/// reports. The smoke consumer asserts `version.contains("17.11")`.
+pub(crate) const POSTGRES_VERSION: &str = "17.11";
 /// Major version recorded in `PG_VERSION` for a compatible data directory.
 const POSTGRES_MAJOR: &str = "17";
 
@@ -190,12 +189,7 @@ fn boot(root: &Path) -> Result<(), String> {
     fs::create_dir_all(&data).map_err(|e| e.to_string())?;
     if data.join("PG_VERSION").exists() {
         let version = fs::read_to_string(data.join("PG_VERSION")).map_err(|e| e.to_string())?;
-        if version.trim() != POSTGRES_MAJOR {
-            return Err(format!(
-                "incompatible PostgreSQL data version: {}",
-                version.trim()
-            ));
-        }
+        check_data_version(&version)?;
         if !data.join("global/pg_control").is_file() {
             return Err(
                 "incomplete cluster; restore or remove the failed initialization before retrying"
@@ -273,6 +267,27 @@ fn boot(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// README section that explains moving a database between major versions.
+const MAJOR_UPGRADE_DOCS: &str =
+    "platform/pglite-component/README.md#upgrading-across-postgresql-major-versions";
+
+/// Refuse a data directory written by another PostgreSQL major version.
+///
+/// `found` is the content of `PG_VERSION`. The error names the version found,
+/// the version this engine needs, and where the upgrade steps are documented.
+fn check_data_version(found: &str) -> Result<(), String> {
+    let found = found.trim();
+    if found == POSTGRES_MAJOR {
+        return Ok(());
+    }
+    let found = if found.is_empty() { "(empty)" } else { found };
+    Err(format!(
+        "incompatible PostgreSQL data directory: PG_VERSION is {found}, but this provider \
+         bundles PostgreSQL {POSTGRES_VERSION} and opens only major version {POSTGRES_MAJOR} \
+         data directories; see {MAJOR_UPGRADE_DOCS}"
+    ))
+}
+
 fn sync_tree(dir: &Path) -> Result<(), String> {
     for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -291,8 +306,25 @@ fn sync_tree(dir: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::data_root;
+    use super::{check_data_version, data_root, POSTGRES_MAJOR, POSTGRES_VERSION};
     use std::path::Path;
+
+    #[test]
+    fn data_version_must_match_the_bundled_major() {
+        assert_eq!(POSTGRES_VERSION, "17.11");
+        assert_eq!(check_data_version(POSTGRES_MAJOR), Ok(()));
+        assert_eq!(check_data_version("17\n"), Ok(()));
+
+        let err = check_data_version("16\n").unwrap_err();
+        assert_eq!(
+            err,
+            "incompatible PostgreSQL data directory: PG_VERSION is 16, but this provider \
+             bundles PostgreSQL 17.11 and opens only major version 17 data directories; \
+             see platform/pglite-component/README.md#upgrading-across-postgresql-major-versions"
+        );
+        assert!(check_data_version("18").unwrap_err().contains("PG_VERSION is 18,"));
+        assert!(check_data_version("  ").unwrap_err().contains("PG_VERSION is (empty),"));
+    }
 
     #[test]
     fn roots_are_absolute_and_do_not_traverse() {

@@ -33,10 +33,13 @@ fn col<'a>(row: &'a [(String, Value)], name: &str) -> &'a Value {
 
 fn main() {
     // --- server version: proves the handshake (startup + auth + ReadyForQuery) ---
+    // The cross-version step runs `upgrade-write` against the previous release.
+    let expected =
+        std::env::var("PGLITE_SMOKE_SERVER_VERSION").unwrap_or_else(|_| "17.11".into());
     let version = server_version().expect("server-version");
     assert!(
-        version.contains("17.5"),
-        "unexpected server version {version:?}"
+        version.contains(&expected),
+        "unexpected server version {version:?}, expected {expected:?}"
     );
     println!("server {version}");
 
@@ -81,6 +84,18 @@ fn main() {
         Err(Error::OpenFailed(_))
     ));
 
+    if mode == "upgrade-write" {
+        upgrade_write(&db);
+        db.close().expect("close upgrade-write");
+        println!("upgrade write ok");
+        return;
+    }
+    if mode == "upgrade-read" {
+        upgrade_read(&db);
+        db.close().expect("close upgrade-read");
+        println!("upgrade read ok");
+        return;
+    }
     if mode == "read" {
         let row = db
             .first("SELECT payload FROM tasks WHERE id = 1", &[])
@@ -510,6 +525,73 @@ fn main() {
 
 const SHA256_A: &str = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb";
 
+/// Secret the cross-version step encrypts on the previous release.
+const UPGRADE_SECRET: &str = "written by the previous release";
+
+/// Run by the previous release (PostgreSQL 17.5) on a fresh data directory:
+/// a table, pgcrypto, and PGP ciphertext for the new engine to read back.
+fn upgrade_write(db: &Connection) {
+    db.exec("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+        .expect("CREATE EXTENSION pgcrypto");
+    db.exec("CREATE TABLE upgrade_check (id int PRIMARY KEY, payload text, secret bytea)")
+        .expect("create upgrade_check");
+    db.run(
+        "INSERT INTO upgrade_check VALUES (1, $1, pgp_sym_encrypt($2, 'k', 'cipher-algo=aes256'))",
+        &[
+            Value::Text("kept across the upgrade".into()),
+            Value::Text(UPGRADE_SECRET.into()),
+        ],
+    )
+    .expect("insert upgrade_check");
+}
+
+/// Run by this release on the directory upgrade_write left: the engine is
+/// 17.11, the data is intact, and pgcrypto works on old and new data.
+fn upgrade_read(db: &Connection) {
+    let row = db
+        .first("SHOW server_version", &[])
+        .expect("server_version")
+        .expect("server_version row");
+    let engine = text(&row[0].1);
+    assert!(engine.starts_with("17.11"), "engine reports {engine:?}");
+
+    let row = db
+        .first(
+            "SELECT payload, pgp_sym_decrypt(secret, 'k') AS secret FROM upgrade_check WHERE id = 1",
+            &[],
+        )
+        .expect("read upgrade_check")
+        .expect("upgrade_check row");
+    assert_eq!(text(col(&row, "payload")), "kept across the upgrade");
+    assert_eq!(text(col(&row, "secret")), UPGRADE_SECRET);
+
+    // The extension created by 17.5 resolves its functions in 17.11.
+    assert_eq!(
+        first_text(db, "SELECT encode(digest('a', 'sha256'), 'hex') AS v", &[]),
+        SHA256_A
+    );
+    assert_eq!(
+        first_text(
+            db,
+            "SELECT pgp_sym_decrypt(pgp_sym_encrypt('fresh', 'k'), 'k') AS v",
+            &[]
+        ),
+        "fresh"
+    );
+    // Upstream's refusal (CVE-2026-14663) holds in the upgraded directory.
+    let refused = db.first("SELECT pgp_sym_encrypt('x', 'k', 'cipher-algo=bf')", &[]);
+    assert!(
+        matches!(&refused, Err(Error::ExecutionFailed(e)) if e.message.contains("Cipher cannot be initialized")),
+        "bf: {refused:?}"
+    );
+    // And the directory stays writable.
+    db.run(
+        "INSERT INTO upgrade_check VALUES (2, 'written by 17.11', NULL)",
+        &[],
+    )
+    .expect("insert after upgrade");
+}
+
 /// pgcrypto is statically linked into the engine with OpenSSL libcrypto;
 /// its salts, session keys and padding come from WASI random_get.
 fn pgcrypto(db: &Connection) {
@@ -655,7 +737,9 @@ fn pgcrypto_public_key(db: &Connection) {
 }
 
 /// OpenSSL's legacy provider is not built, so Blowfish, CAST5 and single DES
-/// fail cleanly. 3DES (DES-EDE3) is in OpenSSL's default provider, and it and
+/// fail cleanly. For PGP that refusal is upstream PostgreSQL's own (17.11,
+/// CVE-2026-14663): before it, PGP encryption with an unavailable cipher wrote
+/// plaintext. 3DES (DES-EDE3) is in OpenSSL's default provider, and it and
 /// AES keep working.
 fn pgcrypto_legacy_ciphers(db: &Connection) {
     for cipher in ["bf", "cast5", "des"] {
