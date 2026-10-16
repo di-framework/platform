@@ -351,8 +351,7 @@ transactional: Kubernetes has no transaction across the Secret and the WorkloadD
 deploy that already read the secret before the unset listed workloads, and applies its
 WorkloadDeployment after that list but before the delete, still lands and then fails with
 `Config=False`. A deploy that reads after the delete is refused by its own existence check (422).
-Whether an emptied vars ConfigMap is deleted is a separate
-decision (platform#98); today it is kept with no keys.
+An emptied vars ConfigMap is kept with no keys (platform#98).
 
 **HTTP host and labels (platform#101, #103).** A service's HTTP host is `<service>-<env>`
 (for example `greeter-staging`, `greeter-prod`), the WorkloadDeployment's own name, in every env.
@@ -459,6 +458,36 @@ out of this shape (non-integer label, name not matching the labels, bad `compone
 annotation, unknown state) are skipped and logged as `deploy.revision-skipped`. A rollback
 target whose `data.bundle` does not match `data.digest`, or is not a complete bundle, is a 422;
 one a concurrent deploy pruned after the history was read is a 404.
+
+## Removing deployments and services (platform#98)
+
+Both operations are developer-only (viewers get 403) and run as the caller.
+
+* `DELETE /v1/deployments/<service>?env=<env>` removes the service from that env: first its
+  WorkloadDeployment `<service>-<env>` (running or not, so the workload is deleted before what
+  it binds), then its ServiceBindings (the deploy labels and the `<service>-<env>-` prefix),
+  then every revision ConfigMap `di-deploy-<service>-<env>.<n>`, including ones edited out of
+  shape. It answers 204, or 404 when the env has none of them, and audits `deployment.removed`.
+  The other env and the BackingServices the service bound are left alone. An object a
+  concurrent call already deleted counts as deleted. The removal is not transactional: a deploy
+  of the same service and env that is in flight (it reserved its revision before the removal
+  deleted the history, and applies its workload after the removal deleted the workload) leaves
+  a running workload with no history; its revision mark fails and is logged as
+  `deploy.history-mark-failed`. Running the removal again deletes that workload and anything it
+  bound.
+* `DELETE /v1/services/<name>?env=<env>` deletes a BackingService. It is **refused** with 409
+  while any ServiceBinding in the tenant names it in `spec.serviceName`, whatever its
+  `deletionPolicy`; the `detail` names the binders, sorted (`<service>-<env>` for a deployed
+  binding, the binding's own name for one applied out of band). Remove those deployments first.
+  A service whose env annotation names the other env is a 404, as is a missing one; a service
+  created without `/v1` (no annotation) can be deleted from either env. It answers 204 and
+  audits `service.deleted` with the `deletionPolicy`. `deletionPolicy` decides only what the
+  platform does with the service's data and storage afterwards: `Retain` (the default) keeps
+  them, `Delete` removes them.
+
+Unsetting the last var still leaves an empty `di-vars-<env>` ConfigMap, unchanged by this
+issue: workloads deployed while it existed list it in `configFrom`, and deleting it would stop
+their replicas from being placed, as a deleted secret does (platform#100 above).
 
 ## HTTP surface
 

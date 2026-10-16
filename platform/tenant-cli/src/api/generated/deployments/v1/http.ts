@@ -78,6 +78,30 @@ export class DeploymentsV1HttpController {
   });
 
   @Endpoint({
+    summary: 'Remove a deployed service',
+    description: 'Removes the service from the environment: its WorkloadDeployment (running or not), its ServiceBindings and its deploy history. 404 when the environment has none of them.',
+    parameters: [{"name":"env","in":"query","required":true,"schema":{"type":"string","enum":["prod","staging"]}}],
+    responses: {
+      '204': {
+        description: 'Remove a deployed service',
+      },
+    },
+  })
+  static removeDeployment = routes.delete('/v1/deployments/:service', async (request) => {
+    const self = useContainer().resolve(DeploymentsV1HttpController);
+    const body = (request as { content?: unknown }).content;
+    const command = validateEmpty(body);
+
+    const output = await self.handlers.removeDeployment(command, {
+      transport: 'http' as const,
+      request,
+    });
+
+    if (output instanceof Response) return output;
+    return json(validateEmpty(output), { status: 204 });
+  });
+
+  @Endpoint({
     summary: 'Roll a service back',
     description: 'Starts a rollout of an earlier deployment, the previous one unless `to` names it.',
     requestBody: {

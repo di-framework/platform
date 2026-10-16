@@ -51,7 +51,7 @@ type Json = Record<string, unknown>;
 /** The field manager every deploy applies with, so re-deploys by any member own the same fields. */
 export const FIELD_MANAGER = 'di-tenant-deploy';
 const BINDING_API = 'platform.di-framework.dev/v1alpha1';
-const SERVICE_LABEL = 'di-framework.dev/service';
+export const SERVICE_LABEL = 'di-framework.dev/service';
 /** Labels cli-plugin-platform renders and the platform's log projection selects on (#103). */
 const NAME_LABEL = 'app.kubernetes.io/name';
 /** The only `wasi:http` host interface tenant hosts serve, as cli-plugin-platform renders it. */
@@ -867,22 +867,55 @@ async function load(
 async function staleBindings(
   user: UserKube,
   tenant: string,
-  bundle: DeployBundle,
+  target: { service: string; env: string },
   keep: Set<string>,
 ): Promise<string[]> {
   const selector = [
     `${MANAGED_BY}=${MANAGED_BY_VALUE}`,
-    `${SERVICE_LABEL}=${bundle.service}`,
-    `${ENV}=${bundle.env}`,
+    `${SERVICE_LABEL}=${target.service}`,
+    `${ENV}=${target.env}`,
   ].join(',');
   const list = await user.call<{ items?: KubeObject[] }>(
     'GET',
     `${bindingsPath(tenant)}?labelSelector=${encodeURIComponent(selector)}`,
   );
-  const prefix = `${bundle.service}-${bundle.env}-`;
+  const prefix = `${groupOf(target)}-`;
   return (list.items ?? [])
     .map((item) => item.metadata.name)
     .filter((name) => name.startsWith(prefix) && !keep.has(name));
+}
+
+/**
+ * Every revision ConfigMap of `service` in `env` by name, including revisions edited out of shape
+ * (which `revisions` skips), so removing a service leaves none of its history behind.
+ */
+async function revisionNames(
+  user: UserKube,
+  tenant: string,
+  target: { service: string; env: string },
+) {
+  const selector = [REVISION, `${SERVICE_LABEL}=${target.service}`, `${ENV}=${target.env}`];
+  const list = await send<{ items?: RevisionObject[] }>(
+    user,
+    'GET',
+    `${configmapsPath(tenant)}?labelSelector=${encodeURIComponent(selector.join(','))}`,
+    { Accept: METADATA_LIST },
+  );
+  const prefix = `${REVISION_PREFIX}${groupOf(target)}.`;
+  return (list.items ?? [])
+    .map((item) => item.metadata.name)
+    .filter((name) => name.startsWith(prefix));
+}
+
+/** Deletes `path`; false when it was already gone. */
+async function removed(user: UserKube, path: string): Promise<boolean> {
+  try {
+    await user.call('DELETE', path);
+    return true;
+  } catch (error) {
+    if (hasStatus(error, 404)) return false;
+    throw error;
+  }
 }
 
 /**
@@ -1134,5 +1167,36 @@ export const deploy: V1Module = {
     const bundle = await load(user, context.tenant, target);
     if (bundle instanceof Response) return bundle;
     return checked(bundle, context, (refs) => rollout(bundle, context, refs, target.id));
+  },
+  /**
+   * Removes `service` from `env` (platform#98): the WorkloadDeployment first, so a running
+   * workload is deleted before what it binds, then its ServiceBindings, then its deploy history.
+   * The BackingServices it bound stay; `deleteService` removes those. Not transactional: a deploy
+   * in flight can apply its workload after this deleted the history, leaving a workload with no
+   * history; removing again deletes it.
+   */
+  removeDeployment: async (_command, call, context) => {
+    const env = String(queryValue(call, 'env'));
+    const service = call.request.params?.service;
+    if (!validService(service)) return problem(422, 'Unprocessable Entity', INVALID_SERVICE);
+    const user = context.asUser();
+    const { tenant } = context;
+    const target = { service, env };
+    const workload = await removed(user, `${workloadsPath(tenant)}/${groupOf(target)}`);
+    const bindings = await staleBindings(user, tenant, target, new Set());
+    for (const name of bindings) await remove(user, `${bindingsPath(tenant)}/${name}`);
+    const history = await revisionNames(user, tenant, target);
+    for (const name of history) await remove(user, `${configmapsPath(tenant)}/${name}`);
+    if (!workload && bindings.length === 0 && history.length === 0)
+      return problem(404, 'Not Found', `${service} is not deployed in ${env}`);
+    context.audit('deployment.removed', {
+      user: context.principal.user,
+      service,
+      env,
+      workload,
+      bindings: bindings.length,
+      revisions: history.length,
+    });
+    return new Response(null, { status: 204 });
   },
 };

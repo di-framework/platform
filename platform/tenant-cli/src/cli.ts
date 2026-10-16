@@ -110,8 +110,10 @@ export const USAGE = `di-tenant: the tenant CLI pilot. It talks to the tenant co
   deploy preview|apply --env <prod|staging> --bundle <file>
   logs --service <name> --env <env> [--deployment <id>] [--follow] [--since <dur>] [--tail <n>]
   services create <keyvalue|messaging|blobstore|postgres|egress> --name <name> --env <env> [--class <class>] [--storage <q>] [--memory <q>] [--cpu <q>] [--deletion-policy <Retain|Delete>] [--destination <host[:port],...>]
+  services delete --name <name> --env <env>
   deployments list|stats --env <env> [--service <name>]
   deployments rollback --service <name> --env <env> [--to <id>]
+  deployments remove --service <name> --env <env>
   secrets|vars list --env <env>
   secrets|vars set|update <name> --env <env> --from-file <path|->
   secrets|vars unset <name> --env <env>
@@ -660,9 +662,17 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
       return 0;
     }
     case 'services': {
+      if (sub === 'delete') {
+        const env = requireEnv(flags);
+        const name = requireFlag(flags, 'name');
+        const { client } = await session(flags, io);
+        await client.deleteService(env, name);
+        io.stderr(`deleted service ${name} in ${env}`);
+        return 0;
+      }
       if (sub !== 'create')
         throw new CliError(
-          'usage: services create <keyvalue|messaging|blobstore|postgres|egress> --name <name>',
+          'usage: services create <keyvalue|messaging|blobstore|postgres|egress> --name <name> | services delete --name <name>',
         );
       const type = rest[0] as CreateServiceRequest['type'];
       if (!BACKING_TYPES.includes(type)) {
@@ -731,7 +741,13 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
         );
         return 0;
       }
-      throw new CliError('usage: deployments list|stats|rollback');
+      if (sub === 'remove') {
+        const service = requireFlag(flags, 'service');
+        await client.removeDeployment(env, service);
+        io.stderr(`removed ${service} from ${env}`);
+        return 0;
+      }
+      throw new CliError('usage: deployments list|stats|rollback|remove');
     }
     case 'secrets':
     case 'vars': {

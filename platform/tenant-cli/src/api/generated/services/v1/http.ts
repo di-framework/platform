@@ -58,6 +58,30 @@ export class ServicesV1HttpController {
   });
 
   @Endpoint({
+    summary: 'Delete a backing service',
+    description: 'Deletes a backing service of the environment. 409 while any ServiceBinding (a deployed service\'s binding) names it, whatever its deletionPolicy; 404 when the environment has no such service. The platform then keeps (Retain) or deletes (Delete) its data and storage according to deletionPolicy.',
+    parameters: [{"name":"env","in":"query","required":true,"schema":{"type":"string","enum":["prod","staging"]}}],
+    responses: {
+      '204': {
+        description: 'Delete a backing service',
+      },
+    },
+  })
+  static deleteService = routes.delete('/v1/services/:service', async (request) => {
+    const self = useContainer().resolve(ServicesV1HttpController);
+    const body = (request as { content?: unknown }).content;
+    const command = validateEmpty(body);
+
+    const output = await self.handlers.deleteService(command, {
+      transport: 'http' as const,
+      request,
+    });
+
+    if (output instanceof Response) return output;
+    return json(validateEmpty(output), { status: 204 });
+  });
+
+  @Endpoint({
     summary: 'Read or follow service logs',
     description: 'Server-sent events (`text/event-stream`). Each `log` event carries one LogEvent as JSON; an `end` event closes the stream. With `follow` the stream stays open until the client disconnects.',
     parameters: [{"name":"env","in":"query","required":true,"schema":{"type":"string","enum":["prod","staging"]}},{"name":"deployment","in":"query","required":false,"schema":{"type":"string"}},{"name":"follow","in":"query","required":false,"schema":{"type":"boolean","default":false}},{"name":"since","in":"query","required":false,"schema":{"type":"string","description":"Duration such as 10m or 1h, or an RFC 3339 timestamp."}},{"name":"tail","in":"query","required":false,"schema":{"type":"integer","format":"int32","default":100}}],

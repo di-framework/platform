@@ -152,3 +152,17 @@ test('logs streams log events and stops at end', async () => {
   for await (const event of client.logs('quiet', { env: 'prod' })) none.push(event);
   expect(none).toEqual([]);
 });
+
+test('removeDeployment and deleteService send DELETE with the service in the path', async () => {
+  const { fetch, calls } = fakeFetch({
+    'DELETE /v1/deployments/web': () => new Response(null, { status: 204 }),
+    'DELETE /v1/services/kv': () => new Response(null, { status: 204 }),
+  });
+  const client = createClient({ baseUrl: 'https://controller.test', token: 't', fetch });
+  expect(await client.removeDeployment('prod', 'web')).toBeUndefined();
+  expect(await client.deleteService('staging', 'kv')).toBeUndefined();
+  expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
+    'DELETE https://controller.test/v1/deployments/web?env=prod',
+    'DELETE https://controller.test/v1/services/kv?env=staging',
+  ]);
+});

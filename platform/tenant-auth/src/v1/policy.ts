@@ -22,11 +22,13 @@ export const POLICY: Record<OperationName, readonly Role[]> = {
   // Viewers pull from the tenant registry, so both roles may look it up.
   registry: EVERYONE,
   createService: DEVELOPERS,
+  deleteService: DEVELOPERS,
   logs: EVERYONE,
   proxy: DEVELOPERS,
   deployments: EVERYONE,
   deploymentStats: EVERYONE,
   rollback: DEVELOPERS,
+  removeDeployment: DEVELOPERS,
   // Developer-only, matching viewer RBAC, which cannot read Secrets. Listing returns names only;
   // values would reach viewers through the raw proxy only if their RBAC were widened to read Secrets.
   secrets: DEVELOPERS,

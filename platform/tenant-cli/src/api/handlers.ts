@@ -20,11 +20,13 @@ export const OPERATIONS = [
   'deploy',
   'registry',
   'createService',
+  'deleteService',
   'logs',
   'proxy',
   'deployments',
   'deploymentStats',
   'rollback',
+  'removeDeployment',
   'secrets',
   'setSecret',
   'updateSecret',
@@ -64,11 +66,13 @@ export class TenantControllerHandlers {
   declare deploy: Handler;
   declare registry: Handler;
   declare createService: Handler;
+  declare deleteService: Handler;
   declare logs: Handler;
   declare proxy: Handler;
   declare deployments: Handler;
   declare deploymentStats: Handler;
   declare rollback: Handler;
+  declare removeDeployment: Handler;
   declare secrets: Handler;
   declare setSecret: Handler;
   declare updateSecret: Handler;
