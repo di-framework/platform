@@ -1832,9 +1832,9 @@ const serviceAccountVolume = () => ({
   },
 });
 /**
- * The tenant's controller and console (#58), ported from `tenant-auth/scripts/deploy-local.ts`.
- * They run in the tenant's runtime namespace, next to the `di-http` Service the controller
- * proxies to; the runtime quota grows by {@link TENANT_AUTH_LIMITS} to hold them.
+ * The tenant's controller and console (#58): reconciled Kubernetes resources that run in the
+ * tenant's runtime namespace, next to the `di-http` Service the controller proxies to. The
+ * runtime quota grows by {@link TENANT_AUTH_LIMITS} to hold them.
  */
 function tenantAuthResources(
   tenant: Tenant,
