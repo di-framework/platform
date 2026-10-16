@@ -8,7 +8,7 @@ name: Auto Tag
 #               it only dispatches release.yml again if no Release run exists for the tag. A
 #               scheduled run when nothing needs tagging exits quietly (action=none). Schedules
 #               run only from the default branch; if disabled by GitHub (after 60 days of
-#               inactivity), use `tag_only: true` to recover.
+#               inactivity), re-enable the workflow first, then dispatch with `tag_only: true`.
 #   release-pr  bumps the version, updates bun.lock, opens the release PR and enables
 #               auto-merge, then exits. Never runs on schedule or on a tag_only dispatch.
 #
@@ -19,7 +19,8 @@ name: Auto Tag
 #
 # Recovery: dispatch this workflow with `tag_only: true`. It runs only the tag job: it tags the
 # version on main if needed and dispatches release.yml if no Release run exists for the tag. It
-# never opens a new release PR. If the schedule has been disabled by GitHub, this also re-enables it.
+# never opens a new release PR. If the schedule has been disabled by GitHub (after 60 days of
+# inactivity), re-enable it first via the Actions tab or `gh workflow enable auto-tag.yml`, then dispatch.
 #
 # A tag pushed with GITHUB_TOKEN does not fire release.yml's `push: tags` trigger, so the tag
 # job dispatches release.yml with `gh workflow run --ref v<version>` (workflow_dispatch is the

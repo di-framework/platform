@@ -1328,7 +1328,8 @@ describe('Auto Tag tags a release when its PR merges instead of waiting for it (
   test('the README says what publishes a release and how to recover', () => {
     const readme = read('README.md');
     expect(readme).toContain('Merging the release PR is what publishes a release.');
-    expect(readme).toContain("Auto Tag's scheduled `tag` job runs every 30 minutes");
+    expect(readme).toContain('If the PR was merged by a person, the tag job runs immediately');
+    expect(readme).toContain('the scheduled tag job catches it within about 30 minutes');
     expect(readme).toContain('`tag_only: true`');
   });
 
