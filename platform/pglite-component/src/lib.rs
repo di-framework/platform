@@ -91,9 +91,9 @@ impl Guest for Provider {
     }
 
     fn server_version() -> Result<String, Error> {
-        // Single source of truth with the engine recipe: `engine::POSTGRES_VERSION`
-        // tracks `PG_VERSION=17.5` in `scripts/build-engine.sh`. The smoke
-        // consumer asserts `version.contains("17.5")`.
+        // Single source of truth with the engine source: `engine::POSTGRES_VERSION`
+        // tracks `POSTGRES_SOURCE_TAG=REL_17_11` in `scripts/tool-versions.env`.
+        // The smoke consumer asserts `version.contains("17.11")`.
         Ok(POSTGRES_VERSION.into())
     }
 }

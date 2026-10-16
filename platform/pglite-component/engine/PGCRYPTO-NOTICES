@@ -1,6 +1,6 @@
 
 --------------------------------------------------------------------------
-pgcrypto (PostgreSQL 17.5 contrib/pgcrypto)
+pgcrypto (PostgreSQL 17.11 contrib/pgcrypto)
 --------------------------------------------------------------------------
 
 pgcrypto is part of PostgreSQL and is distributed under the PostgreSQL

@@ -17,26 +17,31 @@ import {
   EXT_PGCRYPTO_HOOK,
   engineRoot,
   INITDB_DEFAULTS_NEW,
+  INITDB_INCLUDE,
+  INITDB_INCLUDE_NEW,
   insertOnce,
   LINK_PGCRYPTO,
   LINK_PLPGSQL,
   PG_BACKEND_END,
   PG_BACKEND_START,
-  PGP_CFB_BLOCK_NEW,
-  PGP_CFB_BLOCK_OLD,
-  PGP_CFB_INIT_ANCHOR,
-  PGP_CFB_PROBE,
+  PGP_CFB_UPSTREAM_FIX,
   PQCOMM_END,
   PQCOMM_FALLBACK_START,
   parseSourceArgs,
   patch,
   patchDlfcn,
   patchEngineSource,
+  patchFrontendGlue,
+  patchFrontendStubs,
+  patchInitdbInclude,
   patchPgcrypto,
-  patchPgpCfb,
+  patchPgcryptoSources,
   replaceOnce,
+  requirePgpCfbFix,
   resolveSourceDir,
   SESSION_DEFAULTS_BLOCK,
+  STUBS_MUL_HELPERS,
+  STUBS_REALLOC_ANCHOR,
 } from './patch-engine-source.ts';
 
 const pkgDir = resolve(import.meta.dir, '..');
@@ -84,27 +89,8 @@ const UPSTREAM_DLFCN = [
   '',
 ].join('\n');
 
-/** pgcrypto's PGP CFB mode as PostgreSQL 17.5 ships it (abridged). */
+/** pgcrypto's PGP CFB mode as PostgreSQL 17.11 ships it (abridged). */
 const UPSTREAM_PGP_CFB = [
-  'int',
-  'pgp_cfb_create(PGP_CFB **ctx_p, int algo, const uint8 *key, int key_len,',
-  '\t\t\t   int resync, uint8 *iv)',
-  '{',
-  '\tres = pgp_load_cipher(algo, &ciph);',
-  '\tif (res < 0)',
-  '\t\treturn res;',
-  '',
-  '\tres = px_cipher_init(ciph, key, key_len, NULL);',
-  '\tif (res < 0)',
-  '\t{',
-  '\t\tpx_cipher_free(ciph);',
-  '\t\treturn res;',
-  '\t}',
-  '',
-  '\tctx = palloc0(sizeof(*ctx));',
-  '\treturn 0;',
-  '}',
-  '',
   'static int',
   'cfb_process(PGP_CFB *ctx, const uint8 *data, int len, uint8 *dst,',
   '\t\t\tmix_data_t mix_data)',
@@ -112,12 +98,54 @@ const UPSTREAM_PGP_CFB = [
   '\twhile (len > 0)',
   '\t{',
   '\t\tunsigned\trlen;',
+  '\t\tint\t\t\terr;',
   '',
-  '\t\tpx_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);',
-  '\t\tif (ctx->block_no < 5)',
-  '\t\t\tctx->block_no++;',
+  '\t\terr = px_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);',
+  '\t\tif (err)',
+  '\t\t\tereport(ERROR,',
+  '\t\t\t\t\t(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),',
+  '\t\t\t\t\t errmsg("encrypt error: %s", px_strerror(err))));',
   '\t}',
   '\treturn 0;',
+  '}',
+  '',
+].join('\n');
+
+/** The same loop before 17.11: the encrypt result is ignored. */
+const UNFIXED_PGP_CFB = [
+  '\twhile (len > 0)',
+  '\t{',
+  '\t\tpx_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);',
+  '\t}',
+  '',
+].join('\n');
+
+/** pglite-wasm/pgl_initdb.c around the initdb include (abridged). */
+const UPSTREAM_PGL_INITDB = [
+  '#define icu_validate_locale(loc_str) icu_validate_locale_idb(loc_str)',
+  '',
+  '',
+  '#include "bin/initdb/initdb.c"',
+  '',
+  'void use_socketfile(void) {',
+  '}',
+  '',
+].join('\n');
+
+/** pglite-wasm/pgl_stubs.h around the allocator stubs (abridged). */
+const UPSTREAM_PGL_STUBS = [
+  'void *',
+  'pg_malloc(size_t size) {',
+  '\treturn malloc(size);',
+  '}',
+  '',
+  'void *',
+  'pg_realloc(void *ptr, size_t size) {',
+  '    return realloc(ptr, size);',
+  '}',
+  '',
+  'char *',
+  'pg_strdup(const char *in) {',
   '}',
   '',
 ].join('\n');
@@ -134,6 +162,8 @@ async function writePgcryptoInputs(source: string): Promise<void> {
   await Bun.write(join(source, 'pglite-wasm/build.sh'), `             ${LINK_PLPGSQL}`);
   await Bun.write(join(source, 'wasm-build/sdk_port-wasi/sdk_port-wasi-dlfcn.c'), UPSTREAM_DLFCN);
   await Bun.write(join(source, 'contrib/pgcrypto/pgp-cfb.c'), UPSTREAM_PGP_CFB);
+  await Bun.write(join(source, 'pglite-wasm/pgl_initdb.c'), UPSTREAM_PGL_INITDB);
+  await Bun.write(join(source, 'pglite-wasm/pgl_stubs.h'), UPSTREAM_PGL_STUBS);
 }
 
 describe('checkedPath', () => {
@@ -256,7 +286,8 @@ describe('patchPgcrypto', () => {
         );
       const once = await read();
       const [ext = '', link = '', dlfcn = '', cfb = ''] = once;
-      expect(cfb).toBe(patchPgpCfb(UPSTREAM_PGP_CFB));
+      // pgcrypto's PGP CFB mode is left exactly as upstream ships it.
+      expect(cfb).toBe(UPSTREAM_PGP_CFB);
       expect(ext).toContain(`${EXT_PGCRYPTO_HOOK}    SKIP_CONTRIB=true\nelse\n`);
       expect(link).toContain(`libplpgsql.a \\\n${LINK_PGCRYPTO}`);
       expect(dlfcn).toContain('extern void *df_ext_dlsym(const char *symbol);');
@@ -282,25 +313,79 @@ describe('patchPgcrypto', () => {
   });
 });
 
-describe('patchPgpCfb', () => {
-  test('probes the cipher at create time and propagates block failures', () => {
-    const out = patchPgpCfb(UPSTREAM_PGP_CFB);
-    // The probe runs right after px_cipher_init and before the context exists.
-    expect(out).toContain(`${PGP_CFB_INIT_ANCHOR}${PGP_CFB_PROBE}\n\tctx = palloc0`);
-    expect(out).toContain(PGP_CFB_BLOCK_NEW);
-    // A failed block clears the rest of the caller's buffer before returning.
-    expect(PGP_CFB_BLOCK_NEW).toContain('\t\t\tpx_memset(dst, 0, len);\n\t\t\treturn res;');
-    expect(out).not.toContain(PGP_CFB_BLOCK_OLD);
-    expect(patchPgpCfb(out)).toBe(out);
+describe('requirePgpCfbFix', () => {
+  test('accepts the upstream PGP CFB error check', () => {
+    expect(UPSTREAM_PGP_CFB).toContain(PGP_CFB_UPSTREAM_FIX);
+    expect(() => requirePgpCfbFix(UPSTREAM_PGP_CFB)).not.toThrow();
   });
 
-  test('refuses sources whose anchors moved', () => {
-    expect(() => patchPgpCfb(UPSTREAM_PGP_CFB.replace(PGP_CFB_BLOCK_OLD, ''))).toThrow(
-      'pgp-cfb.c: expected 1 patch anchor, found 0',
+  test('refuses a base whose PGP CFB mode ignores cipher failures', () => {
+    expect(() => requirePgpCfbFix(UNFIXED_PGP_CFB)).toThrow(
+      'pgp-cfb.c: the PGP CFB cipher error check (PostgreSQL 17.11, CVE-2026-14663) is missing',
     );
-    expect(() => patchPgpCfb(UPSTREAM_PGP_CFB.replace(PGP_CFB_INIT_ANCHOR, ''))).toThrow(
-      'pgp-cfb.c: expected 1 patch anchor, found 0',
+  });
+
+  test('patchPgcryptoSources stops on an unfixed pgcrypto', async () => {
+    const source = await mkdtemp(join(tmpdir(), 'df-pglite-cfb-test.'));
+    try {
+      await writePgcryptoInputs(source);
+      await Bun.write(join(source, 'contrib/pgcrypto/pgp-cfb.c'), UNFIXED_PGP_CFB);
+      await expect(patchPgcryptoSources(source)).rejects.toThrow('CVE-2026-14663');
+    } finally {
+      await rm(source, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('frontend glue', () => {
+  test('renames the frontend SplitGUCList only around the initdb include', () => {
+    const out = patchInitdbInclude(UPSTREAM_PGL_INITDB);
+    expect(out).toContain(INITDB_INCLUDE_NEW);
+    expect(out.indexOf('#define SplitGUCList')).toBeLessThan(out.indexOf(INITDB_INCLUDE));
+    expect(out.indexOf('#undef SplitGUCList')).toBeGreaterThan(out.indexOf(INITDB_INCLUDE));
+    expect(out.split(INITDB_INCLUDE)).toHaveLength(2);
+    expect(patchInitdbInclude(out)).toBe(out);
+    expect(() => patchInitdbInclude('#include "initdb.c"\n')).toThrow(
+      'pgl_initdb.c: expected 1 patch anchor, found 0',
     );
+  });
+
+  test('adds overflow-checked pg_malloc_mul and pg_realloc_mul after pg_realloc', () => {
+    const out = patchFrontendStubs(UPSTREAM_PGL_STUBS);
+    expect(out).toContain(`${STUBS_REALLOC_ANCHOR}${STUBS_MUL_HELPERS}`);
+    expect(STUBS_MUL_HELPERS).toContain('pg_malloc_mul(size_t s1, size_t s2) {');
+    expect(STUBS_MUL_HELPERS).toContain('pg_realloc_mul(void *ptr, size_t s1, size_t s2) {');
+    // fe_memutils.c's limits: no wrap-around and nothing above SIZE_MAX / 2.
+    expect(STUBS_MUL_HELPERS).toContain(
+      '__builtin_mul_overflow(s1, s2, &req) || req > (SIZE_MAX / 2)',
+    );
+    expect(patchFrontendStubs(out)).toBe(out);
+    expect(() => patchFrontendStubs(UPSTREAM_PGL_STUBS.replace(STUBS_REALLOC_ANCHOR, ''))).toThrow(
+      'pgl_stubs.h: expected 1 patch anchor, found 0',
+    );
+  });
+
+  test('patchFrontendGlue edits both files in place, idempotently', async () => {
+    const source = await mkdtemp(join(tmpdir(), 'df-pglite-glue-test.'));
+    try {
+      await writePgcryptoInputs(source);
+      await patchFrontendGlue(source);
+      const read = () =>
+        Promise.all(
+          ['pglite-wasm/pgl_initdb.c', 'pglite-wasm/pgl_stubs.h'].map((f) =>
+            Bun.file(join(source, f)).text(),
+          ),
+        );
+      const once = await read();
+      expect(once).toEqual([
+        patchInitdbInclude(UPSTREAM_PGL_INITDB),
+        patchFrontendStubs(UPSTREAM_PGL_STUBS),
+      ]);
+      await patchFrontendGlue(source);
+      expect(await read()).toEqual(once);
+    } finally {
+      await rm(source, { recursive: true, force: true });
+    }
   });
 });
 
@@ -464,6 +549,12 @@ describe('patch', () => {
       const [pqcomm = '', main = ''] = await snapshot(source, files);
       expect(pqcomm).toContain('di-framework');
       expect(main).toContain('/* di-framework: application session defaults */');
+      expect(await Bun.file(join(source, 'pglite-wasm/pgl_initdb.c')).text()).toContain(
+        '#define SplitGUCList df_frontend_SplitGUCList',
+      );
+      expect(await Bun.file(join(source, 'pglite-wasm/pgl_stubs.h')).text()).toContain(
+        'pg_malloc_mul(size_t s1, size_t s2) {',
+      );
       expect(await Bun.file(join(source, 'df-extensions/openssl.tar.gz')).text()).toBe(
         'tarball bytes',
       );

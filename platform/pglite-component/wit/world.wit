@@ -114,7 +114,7 @@ interface database {
   /// are supported. Close/drop releases the connection for reuse at that root.
   open: func(path: string, options: option<open-options>) -> result<connection, error>;
 
-  /// The bundled engine version string, `17.5`; does not open a database.
+  /// The bundled engine version string, `17.11`; does not open a database.
   server-version: func() -> result<string, error>;
 
   /// An exclusive handle to the embedded session. Closing or dropping it

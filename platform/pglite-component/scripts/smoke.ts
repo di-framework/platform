@@ -5,7 +5,9 @@ import { join } from 'node:path';
 import { $ } from 'bun';
 import { composeConsumer } from './compose.ts';
 import { type Context, logger, run } from './lib/cli.ts';
+import { fetchVerified } from './lib/fetch.ts';
 import { fileExists } from './lib/fs.ts';
+import { type Pins, requiredPin } from './lib/versions.ts';
 
 const log = logger('smoke');
 
@@ -14,6 +16,8 @@ const MARKERS = {
   write: 'smoke ok',
   read: 'restart ok',
   abrupt: 'abrupt ok',
+  'upgrade-write': 'upgrade write ok',
+  'upgrade-read': 'upgrade read ok',
 } as const;
 
 type SmokeMode = keyof typeof MARKERS;
@@ -27,6 +31,7 @@ async function runMode(
   smokeDir: string,
   mode: SmokeMode,
   extraArgs: string[],
+  logName: string = mode,
 ): Promise<void> {
   const proc = Bun.spawn(
     ['wasmtime', 'run', ...extraArgs, '--env', `PGLITE_SMOKE_MODE=${mode}`, composed],
@@ -44,7 +49,7 @@ async function runMode(
     proc.exited,
   ]);
   const output = `${stdout}${stderr}`;
-  await Bun.write(join(smokeDir, `${mode}.log`), output);
+  await Bun.write(join(smokeDir, `${logName}.log`), output);
   if (code !== 0) {
     console.error(output.split('\n').slice(-80).join('\n'));
     const why = proc.signalCode ? `signal ${proc.signalCode}` : `exit ${code}`;
@@ -57,6 +62,77 @@ async function runMode(
   log(marker);
 }
 
+/** The previous release the cross-version step writes a data directory with. */
+export interface PreviousRelease {
+  version: string;
+  postgres: string;
+  url: string;
+  sha256: string;
+}
+
+export function previousRelease(pins: Pins): PreviousRelease {
+  return {
+    version: requiredPin(pins, 'PGLITE_UPGRADE_FROM_VERSION'),
+    postgres: requiredPin(pins, 'PGLITE_UPGRADE_FROM_POSTGRES'),
+    url: requiredPin(pins, 'PGLITE_UPGRADE_FROM_URL'),
+    sha256: requiredPin(pins, 'PGLITE_UPGRADE_FROM_SHA256'),
+  };
+}
+
+/** Path of the provider component inside the published npm tarball. */
+export const PACKAGE_PROVIDER = 'package/dist/di-framework-pglite.wasm';
+
+/** Fetch the previous release's npm tarball (checksum-verified) and extract its provider. */
+async function previousProvider(release: PreviousRelease, dir: string): Promise<string> {
+  const tarball = join(dir, `pglite-component-${release.version}.tgz`);
+  await fetchVerified(release.url, tarball, release.sha256, { log });
+  const out = join(dir, `pglite-component-${release.version}`);
+  await rm(out, { recursive: true, force: true });
+  await mkdir(out, { recursive: true });
+  await $`tar -xzf ${tarball} -C ${out} ${PACKAGE_PROVIDER}`;
+  return join(out, PACKAGE_PROVIDER);
+}
+
+/**
+ * Cross-version step (#383): the previous release (PostgreSQL 17.5) writes a
+ * data directory with a table, pgcrypto and PGP ciphertext; this build must
+ * open it, read the data, and run pgcrypto on old and new values.
+ */
+async function upgradeSmoke(ctx: Context, consumer: string, composed: string, smokeDir: string) {
+  const release = previousRelease(ctx.tools.pins);
+  const upgradeDir = join(smokeDir, 'upgrade');
+  await mkdir(upgradeDir, { recursive: true });
+  const previous = join(upgradeDir, 'previous.wasm');
+  await composeConsumer(ctx, {
+    app: consumer,
+    out: previous,
+    provider: await previousProvider(release, upgradeDir),
+  });
+
+  const dataDir = await mkdtemp(join(tmpdir(), 'df-pglite-upgrade.'));
+  const mount = ['--dir', `${dataDir}::/data`];
+  try {
+    await runMode(
+      ctx,
+      previous,
+      smokeDir,
+      'upgrade-write',
+      [...mount, '--env', `PGLITE_SMOKE_SERVER_VERSION=${release.postgres}`],
+      `upgrade-write-${release.version}`,
+    );
+    const pgVersion = (await Bun.file(join(dataDir, 'pglite', 'data', 'PG_VERSION')).text()).trim();
+    if (pgVersion !== release.postgres.split('.')[0]) {
+      throw new Error(`previous release wrote PG_VERSION ${pgVersion}, not ${release.postgres}`);
+    }
+    await runMode(ctx, composed, smokeDir, 'upgrade-read', mount);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+  log(
+    `data directory from ${release.version} (PostgreSQL ${release.postgres}) opens under this build`,
+  );
+}
+
 export async function smoke(ctx: Context): Promise<void> {
   const { pkgDir } = ctx;
   const { rustTarget } = ctx.tools;
@@ -66,8 +142,9 @@ export async function smoke(ctx: Context): Promise<void> {
   const smokeDir = join(pkgDir, 'target', 'smoke');
   await mkdir(smokeDir, { recursive: true });
   const composed = join(smokeDir, 'composed.wasm');
+  const consumer = join(pkgDir, 'target', rustTarget, 'release', 'pglite-smoke-consumer.wasm');
   await composeConsumer(ctx, {
-    app: join(pkgDir, 'target', rustTarget, 'release', 'pglite-smoke-consumer.wasm'),
+    app: consumer,
     out: composed,
     provider: join(pkgDir, 'dist', 'di-framework-pglite.wasm'),
   });
@@ -93,6 +170,7 @@ export async function smoke(ctx: Context): Promise<void> {
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
+  await upgradeSmoke(ctx, consumer, composed, smokeDir);
   log('persistent embedded PGlite passed without networking');
 }
 

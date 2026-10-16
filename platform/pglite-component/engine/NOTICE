@@ -1,14 +1,22 @@
 di-framework embedded PGlite component
 
-The provider bundles PostgreSQL 17.5 (PGlite WASI), originally maintained by
-ElectricSQL. PostgreSQL's license is reproduced in POSTGRESQL-COPYRIGHT.
-The upstream bindings license and WASI adapter license are reproduced in
-PGLITE-BINDINGS-LICENSE and WASMTIME-LICENSE. The engine statically links
-the pgcrypto extension and OpenSSL libcrypto; their notices are in
-PGCRYPTO-NOTICES and the OpenSSL license (Apache-2.0) in OPENSSL-LICENSE.
+The provider bundles PostgreSQL 17.11 built for WASI. The engine source is
+upstream PostgreSQL REL_17_11 (commit 083ac033419f690758508e08c1736089384bbee8)
+with ElectricSQL's PGlite WASI changes from postgres-pglite branch
+REL_17_5_WASM-pglite (commit 2194acf356e9b7bf7cff29c4ed4bd6b82b93895d) replayed
+onto it; that replay is engine/patches/postgresql-17.11-wasi.patch in the
+di-framework source. PostgreSQL, postgres-pglite and the replay patch are
+distributed under the PostgreSQL License, reproduced in POSTGRESQL-COPYRIGHT.
+The engine is built with the wasipg recipe and its sjlj patches (Apache-2.0;
+notice below). The upstream bindings license and WASI adapter license are
+reproduced in PGLITE-BINDINGS-LICENSE and WASMTIME-LICENSE. The engine
+statically links the pgcrypto extension and OpenSSL libcrypto; their notices
+are in PGCRYPTO-NOTICES and the OpenSSL license (Apache-2.0) in
+OPENSSL-LICENSE.
 
 Sources:
-https://github.com/electric-sql/postgres-pglite
+https://github.com/postgres/postgres/tree/REL_17_11
+https://github.com/electric-sql/postgres-pglite/tree/REL_17_5_WASM-pglite
 https://github.com/electric-sql/pglite-bindings
 https://github.com/moznion/wasipg
 https://github.com/bytecodealliance/wasmtime/tree/v29.0.1
@@ -21,9 +29,17 @@ bootstrap files within the database's persistent filesystem mount. A growable,
 bounded memory buffer replaces socket-file spillover for query replies. Backend
 startup restores application session defaults after bootstrap and enables
 durable writes. The emulated dlopen keeps loaded libraries in a bounded table
-instead of writing past the end of an unsized array. pgcrypto's PGP CFB mode
-(contrib/pgcrypto/pgp-cfb.c) is patched to refuse ciphers that are unavailable
-in this build.
+instead of writing past the end of an unsized array. Two small changes to the
+WASI glue let it compile against 17.11: initdb's frontend SplitGUCList
+declaration is renamed where initdb is compiled into the backend, and the
+frontend allocator stubs gain the overflow-checked pg_malloc_mul and
+pg_realloc_mul. pgcrypto is unmodified: PostgreSQL 17.11 itself refuses
+ciphers OpenSSL cannot run (CVE-2026-14663), which in this build includes
+Blowfish and CAST5.
+
+The wasipg notice below describes wasipg's own release artifacts, which were
+built from REL_17_5_WASM-pglite; this provider uses wasipg's build recipe and
+patches with the 17.11 source tree above.
 
 The engine's core module, support files, adapter, and the provider are
 composed into one deployable artifact. Engine code executes in the Wasm
