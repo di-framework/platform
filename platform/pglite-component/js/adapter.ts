@@ -172,15 +172,20 @@ const MIN_INT8 = -(2n ** 63n);
 /**
  * Converts a bound JavaScript parameter into a `value` variant.
  *
- * - `bigint` in the `int8` range becomes `integer` with a `bigint` payload, so
- *   values past 2^53 reach PostgreSQL exact (componentize-qjs 0.4.4-di.5 and jco
- *   lower WIT `s64` from `BigInt`). A `bigint` outside the `int8` range is sent
- *   as `text` (OID 0), so PostgreSQL parses it for a `numeric` column instead
- *   of the binding wrapping it modulo 2^64.
- * - A safe integer `number` becomes `integer` too, as a `bigint`. A `number`
- *   that is an integer outside the safe range throws a `TypeError` (pass a
- *   `bigint` or string for `int8`); other non-safe numbers, including NaN and
- *   Infinity, are `real` (`float8`).
+ * - Integers are sent in three bands:
+ *   - A safe integer (`number` or `bigint`, |v| <= 2^53-1) becomes `integer`
+ *     with a `number` payload. Every componentize-qjs release, including the
+ *     `--sync` / `--opt-size` runtimes, and jco lower WIT `s64` from it.
+ *   - A `bigint` past 2^53 that fits `int8` becomes `integer` with a `bigint`
+ *     payload, so it reaches PostgreSQL exact. That needs a binding that lowers
+ *     `s64` from `BigInt`: componentize-qjs 0.4.4-di.5 or later (default
+ *     runtime) or jco. Older componentize-qjs bindings trap on it.
+ *   - A `bigint` outside the `int8` range is sent as `text` (OID 0), so
+ *     PostgreSQL parses it for a `numeric` column instead of the binding
+ *     wrapping it modulo 2^64.
+ * - A `number` that is an integer outside the safe range throws a `TypeError`
+ *   (pass a `bigint` or string for `int8`); other non-safe numbers, including
+ *   NaN and Infinity, are `real` (`float8`).
  * - `Date` becomes `timestamp` (RFC 3339 UTC); plain objects and arrays become
  *   `json`. Arrays are not PostgreSQL arrays: pass a literal such as `'{a,b}'`.
  */
@@ -188,15 +193,20 @@ export function toWasmPgValue(value: unknown): WasmPgValue {
   if (value === null || value === undefined) return { tag: 'null' };
   switch (typeof value) {
     case 'bigint':
-      // WIT s64 is lowered from BigInt (componentize-qjs 0.4.4-di.5, jco), so
-      // int8 values keep every bit; only values outside s64 fall back to text.
+      // Safe values go as Numbers so bindings that lower s64 only from Numbers
+      // (componentize-qjs before 0.4.4-di.5, --sync, --opt-size) keep working.
+      if (value >= MIN_SAFE && value <= MAX_SAFE) {
+        return { tag: 'integer', val: Number(value) };
+      }
+      // Past 2^53 only a BigInt is exact (componentize-qjs 0.4.4-di.5+, jco).
       if (value >= MIN_INT8 && value <= MAX_INT8) {
         return { tag: 'integer', val: value };
       }
       return { tag: 'text', val: value.toString() };
     case 'number':
       if (Number.isSafeInteger(value)) {
-        return { tag: 'integer', val: BigInt(value) };
+        // `+ 0` turns -0 into 0, which is the int8 PostgreSQL stores anyway.
+        return { tag: 'integer', val: value + 0 };
       }
       if (Number.isInteger(value)) {
         // An integral double past 2^53 has already lost its low bits, and the
