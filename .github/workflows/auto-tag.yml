@@ -2,22 +2,25 @@ name: Auto Tag
 
 # Two jobs, so no run waits for the release PR to merge (#214):
 #   tag         tags the merge commit of a release PR and dispatches release.yml. It runs when a
-#               release/v* PR is merged, and before release-pr in every other run, so a release
-#               whose merge fired no event is tagged by the next run. Idempotent: when the tag
-#               already exists at the release commit it only dispatches release.yml again if no
-#               Release run exists for the tag.
+#               release/v* PR is merged, on a schedule (every 30 minutes) to tag releases merged
+#               by GITHUB_TOKEN (which fire no push or pull_request events), and before release-pr
+#               in every other run. Idempotent: when the tag already exists at the release commit
+#               it only dispatches release.yml again if no Release run exists for the tag. A
+#               scheduled run when nothing needs tagging exits quietly (action=none). Schedules
+#               run only from the default branch; if disabled by GitHub (after 60 days of
+#               inactivity), re-enable the workflow first, then dispatch with `tag_only: true`.
 #   release-pr  bumps the version, updates bun.lock, opens the release PR and enables
-#               auto-merge, then exits.
+#               auto-merge, then exits. Never runs on schedule or on a tag_only dispatch.
 #
-# What publishes a release: merging the release PR, and approving this workflow's
-# `pull_request` run for that merge when GitHub holds it for approval. Release PRs opened and
-# auto-merged with GITHUB_TOKEN always come up `action_required`, and their merge fires no
-# `push` event on main. A release whose merge run is not approved is tagged and published by the
-# tag job of the next run of this workflow, which can be an unrelated lockfile push to main.
+# What publishes a release: merging the release PR. Release PRs opened and auto-merged with
+# GITHUB_TOKEN fire no `push` or `pull_request` events, so the scheduled tag job catches them
+# within about 30 minutes. The tag job then tags the commit and dispatches release.yml (which
+# reads the tag and publishes). Use `tag_only: true` to tag and release sooner.
 #
 # Recovery: dispatch this workflow with `tag_only: true`. It runs only the tag job: it tags the
 # version on main if needed and dispatches release.yml if no Release run exists for the tag. It
-# never opens a new release PR.
+# never opens a new release PR. If the schedule has been disabled by GitHub (after 60 days of
+# inactivity), re-enable it first via the Actions tab or `gh workflow enable auto-tag.yml`, then dispatch.
 #
 # A tag pushed with GITHUB_TOKEN does not fire release.yml's `push: tags` trigger, so the tag
 # job dispatches release.yml with `gh workflow run --ref v<version>` (workflow_dispatch is the
@@ -47,6 +50,8 @@ on:
         description: "Recovery: only tag the version on main and dispatch Release if it never ran; open no release PR"
         type: boolean
         default: false
+  schedule:
+    - cron: "*/30 * * * *"
 
 permissions: {}
 
@@ -55,7 +60,9 @@ jobs:
     name: Tag the merged release
     runs-on: ubuntu-latest
     if: >-
-      github.event_name != 'pull_request' ||
+      (github.event_name == 'schedule' && github.repository == 'di-framework/platform') ||
+      (github.event_name != 'pull_request' &&
+      github.event_name != 'schedule') ||
       (github.event.pull_request.merged == true &&
       startsWith(github.event.pull_request.head.ref, 'release/v') &&
       github.event.pull_request.head.repo.full_name == github.repository)
@@ -202,6 +209,7 @@ jobs:
     # After tag, so a release merged without an event is tagged before the next bump.
     if: >-
       !cancelled() && needs.tag.result == 'success' &&
+      github.event_name != 'schedule' &&
       ((github.event_name == 'workflow_dispatch' && inputs.tag_only != true) ||
       (github.event_name == 'push' &&
       !startsWith(github.event.head_commit.message, 'chore(release):')))
@@ -325,10 +333,9 @@ jobs:
                 "(\`mx build --sync-versions\`, packed-manifest audit, and" \
                 "\`npm publish --dry-run\`) before merge." \
                 "" \
-                "Approving this PR's checks and merging it publishes \`v$NEXT\`: on merge, Auto Tag's" \
-                "tag job tags the merge commit and dispatches the Release workflow. Approve that" \
-                "Auto Tag run too when GitHub holds it for approval. If it is not approved, the next" \
-                "Auto Tag run publishes \`v$NEXT\`, even one started by an unrelated lockfile push.")" \
+                "Merging this PR publishes \`v$NEXT\`: on merge, Auto Tag's scheduled tag job" \
+                "(every 30 minutes) tags the commit and dispatches the Release workflow. To tag" \
+                "and release sooner, dispatch Auto Tag with \`tag_only: true\`.")" \
               --base main \
               --head "$BRANCH"
             PR=$(gh pr view "$BRANCH" --json number --jq .number)
