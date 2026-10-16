@@ -815,7 +815,10 @@ function gatewayInstall(
 ): {
   gatewayConfig?: { routeAliases?: Record<string, string> };
   configHash?: string;
-  platformConfig?: { tenantAuth?: Record<string, unknown> };
+  platformConfig?: {
+    tenantAuth?: Record<string, unknown>;
+    tenantAuthReadsApiKeyNamespace?: boolean;
+  };
   error?: string;
 } {
   const prefixed = Object.fromEntries(
@@ -907,6 +910,8 @@ test('install routes tenant-auth hosts derived from routeUrlPattern through the 
   expect(derived.gatewayConfig).toMatchObject({
     tenantAuthRoutes: { console: 'console', controller: 'controller' },
   });
+  // Not a listed tenant-auth build, so API keys stay where they are (#379).
+  expect(derived.platformConfig?.tenantAuthReadsApiKeyNamespace).toBe(false);
   // The platform controller renders the console and controller from the same derived URLs.
   expect(derived.platformConfig?.tenantAuth).toMatchObject({
     consolePublicUrl: 'http://console.{tenant}.localhost:28180',
@@ -1038,10 +1043,13 @@ test('install warns that tenant registries stay in the shared NATS account unles
     expect(run({ tenantAuth, tenantHostImage })).toContain(warning);
   // Without a registry nothing is logged about it.
   const { registry: _registry, ...withoutRegistry } = tenantAuth;
-  expect(
-    run({
-      tenantAuth: withoutRegistry,
-      tenantHostImage: 'ghcr.io/di-framework/wash:2.8.0-wasi-tls',
-    }),
-  ).not.toContain(warning);
+  const unregistered = run({
+    tenantAuth: withoutRegistry,
+    tenantHostImage: 'ghcr.io/di-framework/wash:2.8.0-wasi-tls',
+  });
+  expect(unregistered).not.toContain(warning);
+  // #379: a tenant-auth not listed as reading di-apikeys-<tenant> leaves the keys where they are.
+  const keys = 'is not a known tenant-auth build that reads di-apikeys-<tenant> (#379)';
+  expect(unregistered).toContain(`tenantAuth.image ${tenantAuth.image} ${keys}`);
+  expect(run({})).not.toContain(keys);
 }, 180_000);

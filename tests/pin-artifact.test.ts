@@ -3,7 +3,9 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import {
+  API_KEY_NAMESPACE_SOURCE,
   ARTIFACTS,
+  allowApiKeyNamespace,
   allowNatsCredentials,
   artifactFiles,
   DEFAULT_HOST_DOCS,
@@ -113,6 +115,28 @@ describe('pinArtifact against the repository files', () => {
       `ghcr.io/di-framework/wash:2.8.0-wasi-tls@${OTHER}`,
     );
     for (const file of DEFAULT_HOST_DOCS) expect(read(file)).not.toContain(image);
+  });
+
+  test('a tenant-auth pin lists its build as reading the API-key namespace (#379)', () => {
+    const root = copyTargets();
+    const read = () => readFileSync(join(root, API_KEY_NAMESPACE_SOURCE), 'utf8');
+    const listed = () => {
+      const source = read();
+      const start = source.indexOf('export const API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS');
+      const list = source.slice(start, source.indexOf(';', start));
+      return [...list.matchAll(/'(sha256:[0-9a-f]{64})'/g)].map((m) => m[1] as string);
+    };
+    const before = listed();
+    expect(pinArtifact(root, 'tenant-auth', DIGEST)).toContain(API_KEY_NAMESPACE_SOURCE);
+    expect(listed()).toEqual([...before, DIGEST]);
+    expect(read()).toContain(`  // ghcr.io/di-framework/tenant-auth\n  '${DIGEST}',`);
+    // Older entries stay; a rerun adds nothing.
+    pinArtifact(root, 'tenant-auth', OTHER);
+    expect(listed()).toEqual([...before, DIGEST, OTHER]);
+    expect(pinArtifact(root, 'tenant-auth', OTHER)).toEqual([]);
+    // No other artifact touches it.
+    for (const name of Object.keys(ARTIFACTS).filter((n) => n !== 'tenant-auth'))
+      expect(artifactFiles(name)).not.toContain(API_KEY_NAMESPACE_SOURCE);
   });
 
   test('a non-canonical host pin leaves the default alone', () => {
@@ -250,6 +274,32 @@ describe('host variant rewrites', () => {
     expect(allowNatsCredentials(list(''), OTHER, 'l')).toBe(list(`\n  // l\n  '${OTHER}',`));
     expect(() => allowNatsCredentials('const x = [];', DIGEST, 'l')).toThrow('no export const');
     expect(() => allowNatsCredentials(list(''), 'sha256:nope', 'l')).toThrow('not a sha256');
+  });
+
+  test('allowApiKeyNamespace fills the empty list, then appends once (#379)', () => {
+    const empty =
+      '/** doc */\nexport const API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS: readonly string[] = [];\nexport const z = 1;\n';
+    const once = allowApiKeyNamespace(empty, DIGEST, 'label');
+    expect(once).toBe(
+      `/** doc */\nexport const API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS: readonly string[] = [\n  // label\n  '${DIGEST}',\n];\nexport const z = 1;\n`,
+    );
+    expect(allowApiKeyNamespace(once, DIGEST, 'again')).toBe(once);
+    expect(allowApiKeyNamespace(once, OTHER, 'l')).toBe(
+      once.replace('\n];', `\n  // l\n  '${OTHER}',\n];`),
+    );
+    expect(() => allowApiKeyNamespace('const x = [];', DIGEST, 'l')).toThrow(
+      `${API_KEY_NAMESPACE_SOURCE}: no export const API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS list`,
+    );
+    expect(() =>
+      allowApiKeyNamespace(
+        'export const API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS: readonly string[] = [',
+        DIGEST,
+        'l',
+      ),
+    ).toThrow('no export const');
+    // The live source starts out in a shape the bot can fill.
+    const live = readFileSync(join(repo, API_KEY_NAMESPACE_SOURCE), 'utf8');
+    expect(allowApiKeyNamespace(live, DIGEST, 'l')).toContain(`'${DIGEST}'`);
   });
 
   test('a drifted default host doc fails rather than leaving a stale default', () => {

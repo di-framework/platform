@@ -137,8 +137,8 @@ are no additional platform CLI subcommands. Controller TypeScript is compiled to
 JavaScript when Pulumi builds its ConfigMap; no custom container build is needed.
 Run `bun run check` in this directory to check all generated TypeScript.
 
-Each tenant gets `di-tenant-<name>` for workloads and `di-runtime-<name>` for its
-host pool, Redis, and NATS. Host environments match the workload namespace, and
+Each tenant gets `di-tenant-<name>` for workloads, `di-runtime-<name>` for its
+host pool, Redis, and NATS, and `di-apikeys-<name>` for its API keys (no pods). Host environments match the workload namespace, and
 `allowSharedHosts` is false. Runtime certificates remain in the runtime namespace.
 Pulumi seeds these namespaces before Helm so the wasmCloud operator can watch
 host pods there; the controller then manages their resources and lifecycle.
@@ -149,7 +149,8 @@ objects. Increase `resources.cpu` and `resources.memory` when increasing
 `runtime.replicas`; these quotas cover runtime pods and aggregate
 `requests.storage` (50Gi hard) for stock and future `di-bs-*` backends, not
 individual Wasm invocations. Override concurrent service/binding counts with
-`resources.backingServices` / `resources.serviceBindings`.
+`resources.backingServices` / `resources.serviceBindings`. A tenant may hold
+1000 API keys; override with `resources.apiKeys` (1–10000).
 
 Users get a ServiceAccount in `wasmcloud` and tenant RoleBindings. Developers
 can manage WorkloadDeployments, `BackingService`, `ServiceBinding`, ConfigMaps,

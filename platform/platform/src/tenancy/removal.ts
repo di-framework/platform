@@ -14,9 +14,9 @@ export type TenantLister = (installation: string) => Promise<LiveTenant[]>;
 export function retainedNamespacesMessage(tenant: string): string {
   const n = names(tenant);
   return (
-    `Tenant ${tenant} is being removed with deletionPolicy Retain: namespaces ${n.namespace} and ` +
-    `${n.runtimeNamespace} are kept (tenant data directories are never removed). ` +
-    `To remove the namespaces, run: kubectl delete namespace ${n.namespace} ${n.runtimeNamespace}. ` +
+    `Tenant ${tenant} is being removed with deletionPolicy Retain: namespaces ${n.namespace}, ` +
+    `${n.runtimeNamespace} and ${n.apiKeysNamespace} are kept (tenant data directories are never removed). ` +
+    `To remove the namespaces, run: kubectl delete namespace ${n.namespace} ${n.runtimeNamespace} ${n.apiKeysNamespace}. ` +
     `To have the platform remove them next time, set deletionPolicy: Delete on the tenants entry, ` +
     `run up, then remove the entry and run up again.`
   );

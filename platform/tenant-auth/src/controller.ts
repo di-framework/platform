@@ -9,7 +9,15 @@ import { timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
 import { AuthError, IdentityResolver, type Principal } from './identity.ts';
-import { createApiKey, type KeyStore, listApiKeys, revokeApiKey } from './keys.ts';
+import {
+  ApiKeyMigrationPending,
+  apiKeysNamespace,
+  createApiKey,
+  type KeyStore,
+  legacyKeys,
+  listApiKeys,
+  revokeApiKey,
+} from './keys.ts';
 import {
   asUser,
   type ConfigMapResource,
@@ -767,8 +775,10 @@ export class Controller {
     const kube = new KubeClient(credentials, config.platformNamespace);
     const keys: KeyStore = {
       kube,
-      namespace: `di-runtime-${config.tenant}`,
+      namespace: apiKeysNamespace(config.tenant),
       tenant: config.tenant,
+      // Keys made before #379, until the platform has moved them.
+      legacy: legacyKeys(kube, config.tenant),
     };
     const controller = new Controller(
       config,
@@ -1334,8 +1344,12 @@ export class Controller {
     }
     const revoke = /^DELETE \/-\/keys\/([0-9a-f]{16})$/.exec(route);
     if (revoke?.[1]) {
-      if (!(await revokeApiKey(this.keys, principal.user, revoke[1])))
-        throw new AuthError(404, 'no such key');
+      const revoked = await revokeApiKey(this.keys, principal.user, revoke[1]).catch(
+        (error: unknown) => {
+          throw error instanceof ApiKeyMigrationPending ? new AuthError(409, error.message) : error;
+        },
+      );
+      if (!revoked) throw new AuthError(404, 'no such key');
       this.audit('apikey.revoked', { user: principal.user, id: revoke[1] });
       return new Response(null, { status: 204 });
     }
@@ -1370,7 +1384,8 @@ export class Controller {
   private async members(): Promise<PublishedMember[]> {
     let published: ConfigMapResource | undefined;
     try {
-      published = await this.kube.getConfigMap(this.keys.namespace, MEMBERS_CONFIG);
+      // Published in the runtime namespace, not the API-key one (#379).
+      published = await this.kube.getConfigMap(`di-runtime-${this.config.tenant}`, MEMBERS_CONFIG);
     } catch (error) {
       if (!(error instanceof KubeError && error.status === 403)) throw error;
     }

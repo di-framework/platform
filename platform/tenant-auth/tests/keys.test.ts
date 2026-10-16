@@ -1,23 +1,48 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  ApiKeyMigrationPending,
+  apiKeysNamespace,
   createApiKey,
   generateKey,
   hashSecret,
   type KeyStore,
+  type LegacyKeys,
+  legacyKeys,
   listApiKeys,
   parseKey,
   resolveApiKey,
   revokeApiKey,
 } from '../src/keys.ts';
-import type { KubeClient, SecretResource } from '../src/kube.ts';
+import { type KubeClient, KubeError, type SecretResource } from '../src/kube.ts';
 
-/** An in-memory stand-in for the Secrets the controller stores in the tenant runtime namespace. */
-function fakeKube(): KubeClient {
+/** Knobs of {@link fakeKube}, for the move to `di-apikeys-<tenant>` (#379). */
+interface FakeKubeState {
+  /** Namespaces whose Secrets the controller may not read (its rule there is gone). */
+  forbidden: Set<string>;
+  /** Namespaces whose Secret reads fail with a server error. */
+  failing?: Set<string>;
+  /** The Tenant's `status.apiKeysMigrated`; `error` makes the read fail. */
+  migrated: boolean | 'error';
+  tenantReads: number;
+}
+/** An in-memory stand-in for the Secrets the controller stores, keyed `<namespace>/<name>`. */
+function fakeKube(state?: FakeKubeState): KubeClient & { secrets: Map<string, SecretResource> } {
   const secrets = new Map<string, SecretResource>();
   const encode = (value: string) => Buffer.from(value).toString('base64');
   const key = (namespace: string, name: string) => `${namespace}/${name}`;
+  const guard = (namespace: string) => {
+    if (state?.forbidden.has(namespace)) throw new KubeError(403, 'secrets is forbidden');
+    if (state?.failing?.has(namespace)) throw new KubeError(500, 'etcdserver: request timed out');
+  };
   return {
+    secrets,
     platformNamespace: 'wasmcloud',
+    async getTenant(name: string) {
+      if (!state) return undefined;
+      state.tenantReads++;
+      if (state.migrated === 'error') throw new KubeError(500, 'unavailable');
+      return { metadata: { name }, spec: {}, status: { apiKeysMigrated: state.migrated } };
+    },
     async createSecret(namespace: string, secret: SecretResource) {
       const data = Object.fromEntries(
         Object.entries(secret.stringData ?? {}).map(([k, v]) => [k, encode(v)]),
@@ -31,12 +56,15 @@ function fakeKube(): KubeClient {
       return stored;
     },
     async getSecret(namespace: string, name: string) {
+      guard(namespace);
       return secrets.get(key(namespace, name));
     },
     async deleteSecret(namespace: string, name: string) {
+      guard(namespace);
       secrets.delete(key(namespace, name));
     },
     async listSecrets(namespace: string, selector: string) {
+      guard(namespace);
       const wanted = Object.fromEntries(
         selector.split(',').map((part) => part.split('=') as [string, string]),
       );
@@ -47,7 +75,7 @@ function fakeKube(): KubeClient {
           .filter((s) => Object.entries(wanted).every(([k, v]) => s.metadata.labels?.[k] === v)),
       };
     },
-  } as unknown as KubeClient;
+  } as unknown as KubeClient & { secrets: Map<string, SecretResource> };
 }
 const storeFor = (kube: KubeClient, tenant = 'acme'): KeyStore => ({
   kube,
@@ -101,5 +129,190 @@ describe('api keys in the cluster', () => {
     const store = storeFor(fakeKube());
     const issued = await createApiKey(store, 'alice', 'ci', -1);
     await expect(resolveApiKey(store, issued.secret)).rejects.toThrow('expired');
+  });
+});
+
+describe('api keys across the move to di-apikeys-<tenant> (#379)', () => {
+  const RUNTIME = 'di-runtime-acme';
+  const KEYS = 'di-apikeys-acme';
+  function setup() {
+    const state: FakeKubeState = { forbidden: new Set(), migrated: false, tenantReads: 0 };
+    const kube = fakeKube(state);
+    let now = 0;
+    const store: KeyStore = {
+      kube,
+      namespace: apiKeysNamespace('acme'),
+      tenant: 'acme',
+      legacy: legacyKeys(kube, 'acme', () => now),
+    };
+    /** A key created by a tenant-auth from before #379, in the runtime namespace. */
+    const legacyKey = (user = 'alice') =>
+      createApiKey({ ...store, namespace: RUNTIME }, user, 'ci', 3600);
+    /** The platform controller's steps (platform/src/tenancy/api-keys.ts). */
+    const copy = (id: string) =>
+      kube.secrets.set(
+        `${KEYS}/di-apikey-${id}`,
+        structuredClone(kube.secrets.get(`${RUNTIME}/di-apikey-${id}`) as SecretResource),
+      );
+    const deleteOriginal = (id: string) => kube.secrets.delete(`${RUNTIME}/di-apikey-${id}`);
+    const markDone = () => {
+      state.forbidden.add(RUNTIME);
+      state.migrated = true;
+      now += 60_000;
+    };
+    return {
+      state,
+      kube,
+      store,
+      legacyKey,
+      copy,
+      deleteOriginal,
+      markDone,
+      tick: (ms: number) => (now += ms),
+    };
+  }
+
+  // The platform moves keys only under tenant-auth builds the pin bot lists as reading
+  // di-apikeys-<tenant> (API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS), and it lists every build it pins.
+  // This holds every such build to that contract, so a revert of keys.ts fails here first.
+  test('the contract the platform allowlist relies on: create in, and read first from, apiKeysNamespace', async () => {
+    const { kube, store, legacyKey } = setup();
+    expect(store.namespace).toBe(apiKeysNamespace('acme'));
+    expect(apiKeysNamespace('acme')).toBe(KEYS);
+    const reads: string[] = [];
+    const get = kube.getSecret.bind(kube);
+    kube.getSecret = async (namespace: string, name: string) => {
+      reads.push(namespace);
+      return get(namespace, name);
+    };
+    const created = await createApiKey(store, 'alice', 'ci', 3600);
+    expect([...kube.secrets.keys()]).toEqual([`${KEYS}/di-apikey-${created.id}`]);
+    const old = await legacyKey();
+    reads.length = 0;
+    expect((await resolveApiKey(store, created.secret)).id).toBe(created.id);
+    expect(reads[0]).toBe(KEYS);
+    reads.length = 0;
+    expect((await resolveApiKey(store, old.secret)).id).toBe(old.id);
+    expect(reads.slice(0, 2)).toEqual([KEYS, RUNTIME]);
+  });
+
+  test('creates new keys in the API-key namespace only', async () => {
+    const { kube, store } = setup();
+    const issued = await createApiKey(store, 'alice', 'ci', 3600);
+    expect([...kube.secrets.keys()]).toEqual([`${KEYS}/di-apikey-${issued.id}`]);
+    expect((await resolveApiKey(store, issued.secret)).id).toBe(issued.id);
+  });
+
+  test('a valid key works at every step of its move, and after it', async () => {
+    const { store, legacyKey, copy, deleteOriginal, markDone } = setup();
+    const issued = await legacyKey();
+    const works = async () => {
+      expect((await resolveApiKey(store, issued.secret)).id).toBe(issued.id);
+      expect((await listApiKeys(store, 'alice')).map((k) => k.id)).toEqual([issued.id]);
+    };
+    await works(); // old layout only
+    copy(issued.id);
+    await works(); // in both: listed once
+    deleteOriginal(issued.id);
+    await works(); // new layout only
+    markDone();
+    await works(); // the old namespace is no longer read (and would answer 403)
+  });
+
+  test('finds a key the move finishes between its two reads, for resolve and revoke', async () => {
+    const { kube, store, legacyKey, copy, deleteOriginal } = setup();
+    const issued = await legacyKey();
+    // The new namespace misses; the move copies and deletes the original before the old one is read.
+    const get = kube.getSecret.bind(kube);
+    const moveDuringOldRead = () => {
+      kube.getSecret = async (namespace: string, name: string) => {
+        if (namespace === RUNTIME && kube.secrets.has(`${RUNTIME}/${name}`)) {
+          copy(issued.id);
+          deleteOriginal(issued.id);
+        }
+        return get(namespace, name);
+      };
+    };
+    moveDuringOldRead();
+    expect((await resolveApiKey(store, issued.secret)).id).toBe(issued.id);
+    expect(await revokeApiKey(store, 'alice', issued.id)).toBe(true);
+    kube.getSecret = get;
+    await expect(resolveApiKey(store, issued.secret)).rejects.toThrow('unknown or revoked');
+  });
+
+  test('a 403 in the old namespace before the done signal counts as nothing there', async () => {
+    const { state, store } = setup();
+    state.forbidden.add(RUNTIME);
+    const issued = await createApiKey(store, 'alice', 'ci', 3600);
+    expect((await resolveApiKey(store, issued.secret)).id).toBe(issued.id);
+    expect((await listApiKeys(store, 'alice')).map((k) => k.id)).toEqual([issued.id]);
+    await expect(resolveApiKey(store, generateKey().value)).rejects.toThrow('unknown or revoked');
+    expect(await revokeApiKey(store, 'alice', issued.id)).toBe(true);
+  });
+
+  test('any other failure in the old namespace is an error, not a missing key', async () => {
+    const { state, store } = setup();
+    state.failing = new Set([RUNTIME]);
+    await expect(resolveApiKey(store, generateKey().value)).rejects.toThrow('timed out');
+  });
+
+  test('stops reading the old layout once the platform reports the move done', async () => {
+    const { state, store, legacyKey, markDone } = setup();
+    const issued = await legacyKey();
+    markDone();
+    state.forbidden.delete(RUNTIME);
+    // Still there (as if left over), but no longer read: only the new layout counts.
+    await expect(resolveApiKey(store, issued.secret)).rejects.toThrow('unknown or revoked');
+    expect(await listApiKeys(store, 'alice')).toEqual([]);
+  });
+
+  test('refuses to revoke a key that is still in the old namespace', async () => {
+    const { kube, store, legacyKey, copy, deleteOriginal } = setup();
+    const issued = await legacyKey();
+    await expect(revokeApiKey(store, 'alice', issued.id)).rejects.toBeInstanceOf(
+      ApiKeyMigrationPending,
+    );
+    // Copied, original not yet deleted: deleting only the copy would let the move copy it back.
+    copy(issued.id);
+    await expect(revokeApiKey(store, 'alice', issued.id)).rejects.toBeInstanceOf(
+      ApiKeyMigrationPending,
+    );
+    expect(kube.secrets.has(`${KEYS}/di-apikey-${issued.id}`)).toBe(true);
+    // Still only its owner learns that it exists.
+    expect(await revokeApiKey(store, 'bob', issued.id)).toBe(false);
+    deleteOriginal(issued.id);
+    expect(await revokeApiKey(store, 'alice', issued.id)).toBe(true);
+    await expect(resolveApiKey(store, issued.secret)).rejects.toThrow('unknown or revoked');
+  });
+
+  test('reads the Tenant status at most every 30s until it reports done, then never again', async () => {
+    const { state, store, tick } = setup();
+    const legacy = store.legacy as LegacyKeys;
+    expect(await legacy.migrated()).toBe(false);
+    expect(await legacy.migrated()).toBe(false);
+    expect(state.tenantReads).toBe(1);
+    state.migrated = true;
+    tick(29_999);
+    expect(await legacy.migrated()).toBe(false);
+    tick(1);
+    expect(await legacy.migrated()).toBe(true);
+    state.migrated = false;
+    tick(60_000);
+    expect(await legacy.migrated()).toBe(true);
+    expect(state.tenantReads).toBe(2);
+  });
+
+  test('keeps reading both layouts when the Tenant cannot be read', async () => {
+    const { state, store, legacyKey } = setup();
+    state.migrated = 'error';
+    const issued = await legacyKey();
+    expect((await resolveApiKey(store, issued.secret)).id).toBe(issued.id);
+  });
+
+  test('a store without the old layout reads only its own namespace', async () => {
+    const { kube, legacyKey } = setup();
+    const issued = await legacyKey();
+    const store: KeyStore = { kube, namespace: KEYS, tenant: 'acme' };
+    await expect(resolveApiKey(store, issued.secret)).rejects.toThrow('unknown or revoked');
   });
 });

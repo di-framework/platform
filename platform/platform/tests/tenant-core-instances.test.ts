@@ -170,7 +170,9 @@ describe('Retain removal warning (#228)', () => {
     const [message] = removalWarnings([live('alpha', 'Retain')], []);
     expect(message).toContain('di-tenant-alpha');
     expect(message).toContain('di-runtime-alpha');
-    expect(message).toContain('kubectl delete namespace di-tenant-alpha di-runtime-alpha');
+    expect(message).toContain(
+      'kubectl delete namespace di-tenant-alpha di-runtime-alpha di-apikeys-alpha.',
+    );
   });
   it('prints nothing for Delete and for tenants that are still declared', () => {
     expect(removalWarnings([live('alpha', 'Delete'), live('beta', 'Retain')], ['beta'])).toEqual(

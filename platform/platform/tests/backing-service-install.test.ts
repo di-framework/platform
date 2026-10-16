@@ -170,6 +170,7 @@ describe('backing-service install', () => {
 
   it('loads compiled backing-services into the controller ConfigMap script map', () => {
     expect([...CONTROLLER_SCRIPT_MODULES]).toEqual([
+      'api-keys',
       'admission',
       'egress',
       'backing-services',
@@ -190,6 +191,7 @@ describe('backing-service install', () => {
     const scripts = loadControllerScripts(distTenancy);
     expect(Object.keys(scripts).sort()).toEqual([
       'admission.js',
+      'api-keys.js',
       'backing-service-reconcile.js',
       'backing-services.js',
       'ca-rotation.js',

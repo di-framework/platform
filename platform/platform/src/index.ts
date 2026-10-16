@@ -37,6 +37,7 @@ import {
   userTokenSecretName,
   withDerivedPublicUrls,
 } from './tenancy/resources';
+import { tenantAuthReadsApiKeyNamespace } from './tenant-auth-images';
 import { secretReaderFromKubeconfig } from './token-secret-reader';
 import { waitForTokenSecret } from './token-wait';
 import { platformValues } from './values';
@@ -182,6 +183,14 @@ export function validatePlatformConfig(args: PlatformConfigArgs): ValidatedPlatf
     warnings.push(
       `tenantHostImage ${tenantHostImage} is not a known build with wash patch 0003 (NATS blobstore credentials): ` +
         'tenant registries stay in the shared TENANT NATS account, reachable by tenant workloads, until it is one',
+    );
+  // Keys made before #379 stay in di-runtime-<tenant>, readable by the tenant controller, until
+  // tenant-auth runs a build that reads the API-key namespace.
+  if (configuredTenantAuth && !tenantAuthReadsApiKeyNamespace(configuredTenantAuth.image))
+    warnings.push(
+      `tenantAuth.image ${configuredTenantAuth.image} is not a known tenant-auth build that reads di-apikeys-<tenant> (#379): ` +
+        'API keys made before #379 are not moved out of di-runtime-<tenant>, and the tenant controller keeps reading ' +
+        "that namespace's Secrets, until tenantAuth.image is the tenant-auth digest this package documents",
     );
   // Unset tenant-auth public URLs default to gateway routes (#128); explicit URLs are kept.
   const tenantAuth = withDerivedPublicUrls(configuredTenantAuth, routeUrlPattern);

@@ -436,6 +436,25 @@ describe('Controller', () => {
     expect(String(audit?.reason)).toContain('di-user-alice');
   });
 
+  test('answers 409 to revoking a key the platform is still moving (#379)', async () => {
+    const created = await call('POST', '/-/keys', 'Bearer ok', '{"name":"ci","ttlSeconds":3600}');
+    const { id } = (await created.json()) as { id: string };
+    // The fake serves one namespace: here it stands for the old layout, still being read.
+    const moving = new Controller(controller.config, kube, null, controller.identity, {
+      ...keys,
+      legacy: { namespace: keys.namespace, migrated: async () => false },
+    });
+    const revoke = await moving.handle(
+      new Request(`https://controller.test/-/keys/${id}`, {
+        method: 'DELETE',
+        headers: { authorization: 'Bearer ok' },
+      }),
+    );
+    expect(revoke.status).toBe(409);
+    expect(await revoke.text()).toContain('try again');
+    expect((await call('DELETE', `/-/keys/${id}`)).status).toBe(204);
+  });
+
   test('manages API keys and lists members', async () => {
     expect(
       (await call('POST', '/-/keys', 'Bearer key', '{"name":"ci","ttlSeconds":3600}')).status,
@@ -587,7 +606,12 @@ describe('Controller.start', () => {
     await controller.discovered;
     expect(controller.kube.server).toBe('https://k8s.test');
     expect(controller.provider?.issuer).toBe(issuer.url);
-    expect(controller.keys).toMatchObject({ namespace: 'di-runtime-acme', tenant: 'acme' });
+    // Keys live in their own namespace; the runtime namespace is read until they are moved (#379).
+    expect(controller.keys).toMatchObject({
+      namespace: 'di-apikeys-acme',
+      tenant: 'acme',
+      legacy: { namespace: 'di-runtime-acme' },
+    });
     expect(controller.identity.tenant).toBe('acme');
     controller.stop();
   });
