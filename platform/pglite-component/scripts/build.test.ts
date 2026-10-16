@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { join, resolve } from 'node:path';
-import { engineBuildInfo, parseBuildArgs, THIRD_PARTY_NOTICE_FILES } from './build.ts';
+import { engineBuildInfo, parseBuildArgs, providerWac, THIRD_PARTY_NOTICE_FILES } from './build.ts';
 import { postgresVersion } from './build-engine.ts';
 import { loadPins } from './lib/versions.ts';
 
@@ -55,5 +55,52 @@ describe('third-party notices name the engine base', () => {
     expect(notice).toContain('PostgreSQL 17.11');
     expect(notice).toContain('REL_17_5_WASM-pglite');
     expect(notice).toContain('engine/patches/postgresql-17.11-wasi.patch');
+  });
+});
+
+describe('providerWac', () => {
+  const witDir = resolve(import.meta.dir, '..', 'wit');
+
+  test('feeds the bootstrap import from a second instance of the engine (#212)', () => {
+    const wac = providerWac('0.2.0');
+    const engine = 'di-framework:pglite-engine/engine@0.1.0';
+    expect(wac.match(/= new di-framework:pglite-engine-impl \{ \.\.\. \};/g)).toHaveLength(2);
+    expect(wac).toContain(`"${engine}": serving["${engine}"],`);
+    expect(wac).toContain(
+      `"di-framework:pglite-engine-bootstrap/bootstrap@0.1.0": bootstrap["${engine}"],`,
+    );
+    expect(wac).toContain('export provider["di-framework:pglite/types@0.2.0"];');
+    expect(wac).toContain('export provider["di-framework:pglite/database@0.2.0"];');
+  });
+
+  test('names exactly the engine imports the provider world declares', async () => {
+    const world = await Bun.file(join(witDir, 'world.wit')).text();
+    const imports = [...world.matchAll(/^\s*import (di-framework:pglite-engine[^;]*);/gm)].map(
+      (m) => m[1],
+    );
+    expect(imports).toEqual([
+      'di-framework:pglite-engine/engine@0.1.0',
+      'di-framework:pglite-engine-bootstrap/bootstrap@0.1.0',
+    ]);
+    const wac = providerWac('0.2.0');
+    for (const name of imports) expect(wac).toContain(`"${name}":`);
+  });
+
+  test('the bootstrap interface is a subset of the engine interface', async () => {
+    const funcs = (wit: string) =>
+      [...wit.matchAll(/^\s*([a-z-]+): func\(([^)]*)\)( -> [^;]+)?;/gm)].map(
+        (m) => `${m[1]}(${m[2]})${m[3] ?? ''}`,
+      );
+    const engine = funcs(await Bun.file(join(witDir, 'deps/pglite-engine/engine.wit')).text());
+    const bootstrap = funcs(
+      await Bun.file(join(witDir, 'deps/pglite-engine-bootstrap/bootstrap.wit')).text(),
+    );
+    expect(bootstrap).toEqual([
+      'set-env(name: string, value: string) -> s32',
+      'start(arguments: list<string>) -> s32',
+      'initdb() -> s32',
+      'backend()',
+    ]);
+    for (const func of bootstrap) expect(engine).toContain(func);
   });
 });

@@ -202,11 +202,14 @@ fn server_error(body: &[u8]) -> Error {
 }
 
 impl Session {
-    pub fn connect(path: &str, database: &str) -> Result<Self, Error> {
-        let (sock, password) = Transport::open(path, database).map_err(Error::OpenFailed)?;
-        let fresh = sock.fresh;
+    /// Open the embedded session. `database` is `open-options.database`;
+    /// `None` selects the data directory's default (see `engine::choose_databases`).
+    pub fn connect(path: &str, database: Option<&str>) -> Result<Self, Error> {
+        let opened = Transport::open(path, database).map_err(Error::OpenFailed)?;
+        let fresh = opened.transport.fresh;
+        let database = opened.database;
         let mut session = Self {
-            sock,
+            sock: opened.transport,
             buf: Vec::new(),
             ready: b'I',
             authenticated: false,
@@ -216,7 +219,23 @@ impl Session {
                 .sock
                 .write_all(&startup_message("postgres", database))
                 .map_err(Error::OpenFailed)?;
-            session.handshake("postgres", &password)?;
+            session.handshake("postgres", &opened.password)?;
+            // The engine picks the database from PGDATABASE when its backend
+            // boots; the startup packet's `database` is not honored. Check
+            // that the single-user session really landed where we expect.
+            let out = session.simple("SELECT current_database()")?;
+            let actual = out
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .cloned()
+                .flatten();
+            if actual.as_deref() != Some(database) {
+                // Leave the transport unhealthy: Drop poisons the engine.
+                return Err(Error::OpenFailed(format!(
+                    "embedded engine connected to database {actual:?}, expected {database:?}"
+                )));
+            }
         }
         session.sock.mark_healthy();
         session.authenticated = true;

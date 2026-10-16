@@ -78,11 +78,44 @@ fn main() {
         println!("refused ok");
         return;
     }
+    // Explicit database names are checked before the engine boots, so these
+    // refusals leave the instance usable (#212).
+    for name in ["template0", "orders"] {
+        assert!(
+            matches!(
+                open("/data/pglite", Some(&database(name))),
+                Err(Error::OpenFailed(_))
+            ),
+            "{name} must be refused"
+        );
+    }
+    if mode == "database" {
+        database_mode();
+        println!("database ok");
+        return;
+    }
+    if mode == "missing-database" {
+        missing_database_mode();
+        println!("missing database ok");
+        return;
+    }
     let db: Connection = open("/data/pglite", None).expect("open");
     assert!(matches!(
         open("/data/pglite", None),
         Err(Error::OpenFailed(_))
     ));
+    // Which database `none` selects: `postgres` for a directory this build
+    // initialized (the very first session included), `template1` for one
+    // written by an earlier release. The previous release reports template1.
+    let expected_db = match mode.as_str() {
+        "upgrade-write" | "upgrade-read" => "template1",
+        _ => "postgres",
+    };
+    assert_eq!(
+        current_database(&db),
+        expected_db,
+        "{mode}: default database"
+    );
 
     if mode == "upgrade-write" {
         upgrade_write(&db);
@@ -521,6 +554,85 @@ fn main() {
 
     db.close().unwrap();
     println!("smoke ok");
+}
+
+fn database(name: &str) -> OpenOptions {
+    OpenOptions {
+        database: Some(name.into()),
+        statement_timeout_ms: None,
+    }
+}
+
+fn current_database(db: &Connection) -> String {
+    let row = db
+        .first("SELECT current_database()::text AS db", &[])
+        .expect("current_database")
+        .expect("current_database row");
+    text(col(&row, "db"))
+}
+
+/// `PGLITE_SMOKE_DATABASE` (unset = `none`) is opened; the session must be
+/// in `PGLITE_SMOKE_EXPECT_DB`, and `PGLITE_SMOKE_TABLE` must exist there
+/// exactly when `PGLITE_SMOKE_TABLE_PRESENT=1`.
+fn database_mode() {
+    let env = |name: &str| std::env::var(name).ok();
+    let requested = env("PGLITE_SMOKE_DATABASE");
+    let expected = env("PGLITE_SMOKE_EXPECT_DB").expect("PGLITE_SMOKE_EXPECT_DB");
+    let table = env("PGLITE_SMOKE_TABLE").expect("PGLITE_SMOKE_TABLE");
+    let present = env("PGLITE_SMOKE_TABLE_PRESENT").as_deref() == Some("1");
+
+    let options = requested.as_deref().map(database);
+    let db = open("/data/pglite", options.as_ref()).expect("open requested database");
+    assert_eq!(current_database(&db), expected, "requested {requested:?}");
+    let row = db
+        .first(
+            "SELECT to_regclass($1) IS NOT NULL AS present",
+            &[Value::Text(format!("public.{table}"))],
+        )
+        .expect("to_regclass")
+        .expect("to_regclass row");
+    assert!(
+        matches!(col(&row, "present"), Value::Boolean(found) if *found == present),
+        "table {table} in {expected}: expected present={present}"
+    );
+    db.close().expect("close database mode");
+
+    // The backend cannot change databases: reopening the same one works,
+    // asking this instance for the other one fails clearly.
+    let again = open("/data/pglite", Some(&database(&expected))).expect("reopen same database");
+    assert_eq!(current_database(&again), expected);
+    again.close().expect("close reopen");
+    let other = if expected == "postgres" {
+        "template1"
+    } else {
+        "postgres"
+    };
+    match open("/data/pglite", Some(&database(other))) {
+        Err(Error::OpenFailed(message)) => {
+            assert!(message.contains("cannot switch"), "{message}")
+        }
+        Err(error) => panic!("switching databases: unexpected {error:?}"),
+        Ok(_) => panic!("switching databases must fail"),
+    }
+}
+
+/// A directory without the `postgres` database (initdb's last step never
+/// ran): an explicit `postgres` open fails cleanly instead of trapping, and
+/// the same instance can still open the default (`template1`).
+fn missing_database_mode() {
+    match open("/data/pglite", Some(&database("postgres"))) {
+        Err(Error::OpenFailed(message)) => {
+            assert!(
+                message.contains("\"postgres\" has no data directory at base/5"),
+                "{message}"
+            )
+        }
+        Err(error) => panic!("missing postgres: unexpected {error:?}"),
+        Ok(_) => panic!("opening a missing postgres database must fail"),
+    }
+    let db = open("/data/pglite", None).expect("open default after the refusal");
+    assert_eq!(current_database(&db), "template1");
+    db.close().expect("close missing-database mode");
 }
 
 const SHA256_A: &str = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb";

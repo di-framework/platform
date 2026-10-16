@@ -45,6 +45,31 @@ export const THIRD_PARTY_NOTICE_FILES = [
   'WASMTIME-LICENSE',
 ] as const;
 
+/**
+ * WAC source that bundles the provider with two instances of the engine
+ * component: one serves every session, the other runs initdb on an empty data
+ * directory and is not used again (#212; see wit/deps/pglite-engine-bootstrap).
+ * Both instances share the engine's code; each has its own linear memory.
+ */
+export function providerWac(witVersion: string): string {
+  const engine = 'di-framework:pglite-engine/engine@0.1.0';
+  return [
+    'package di-framework:pglite-bundle;',
+    '',
+    'let serving = new di-framework:pglite-engine-impl { ... };',
+    'let bootstrap = new di-framework:pglite-engine-impl { ... };',
+    'let provider = new di-framework:pglite-provider-impl {',
+    `  "${engine}": serving["${engine}"],`,
+    `  "di-framework:pglite-engine-bootstrap/bootstrap@0.1.0": bootstrap["${engine}"],`,
+    '  ...',
+    '};',
+    '',
+    `export provider["di-framework:pglite/types@${witVersion}"];`,
+    `export provider["di-framework:pglite/database@${witVersion}"];`,
+    '',
+  ].join('\n');
+}
+
 export interface BuildOptions {
   profile: 'release' | 'dev';
   profileDir: 'release' | 'debug';
@@ -120,12 +145,14 @@ export async function buildComponent(ctx: Context, options: BuildOptions): Promi
   await mkdir(dist, { recursive: true });
   const wasmOut = join(dist, 'di-framework-pglite.wasm');
   const engineDir = join(pkgDir, 'target', 'engine');
-  await $`wac plug --plug ${join(engineDir, 'engine.wasm')} ${wasmIn} -o ${wasmOut}`;
+  const witVersion = await readWitVersion(pkgDir);
+  const wacSource = join(pkgDir, 'target', 'provider.wac');
+  await Bun.write(wacSource, providerWac(witVersion));
+  await $`wac compose ${wacSource} --dep ${`di-framework:pglite-engine-impl=${join(engineDir, 'engine.wasm')}`} --dep ${`di-framework:pglite-provider-impl=${wasmIn}`} -o ${wasmOut}`;
   await $`wasm-tools validate --features all ${wasmOut}`;
   const wit = await $`wasm-tools component wit ${wasmOut}`.text();
   await Bun.write(join(dist, 'di-framework-pglite.wit'), wit);
 
-  const witVersion = await readWitVersion(pkgDir);
   assertProviderWit(wit, witVersion);
 
   const notices = await Promise.all(

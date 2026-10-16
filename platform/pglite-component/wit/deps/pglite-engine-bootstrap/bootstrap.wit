@@ -1,0 +1,22 @@
+package di-framework:pglite-engine-bootstrap@0.1.0;
+
+/// Private: a second, single-use instance of the bundled engine that runs
+/// initdb on an empty data directory (#212).
+///
+/// The functions match `di-framework:pglite-engine/engine@0.1.0`; the build
+/// composes this import from a second instance of the same engine component
+/// (see `scripts/build.ts`). Like the engine import, it is never a host import
+/// in the final artifact.
+///
+/// Why a second instance: the engine's first backend session after initdb
+/// runs initdb's post-bootstrap SQL, which creates the `postgres` database
+/// from a `template1` session, and a single-user backend cannot change
+/// databases afterwards. The provider therefore initializes the cluster here
+/// and serves every session, the first included, from the main engine
+/// instance booted on the existing cluster with the selected database.
+interface bootstrap {
+  set-env: func(name: string, value: string) -> s32;
+  start: func(arguments: list<string>) -> s32;
+  initdb: func() -> s32;
+  backend: func();
+}
