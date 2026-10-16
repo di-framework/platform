@@ -8,6 +8,7 @@ import {
   checkTagCommit,
   ENGINE_SOURCE_PATCH,
   ENGINE_TREE_MARKER,
+  gitEnv,
   type PostgresSource,
   PREPARED_CHECKOUT,
   patchDoesNotApply,
@@ -206,17 +207,66 @@ describe('patchDoesNotApply', () => {
   });
 });
 
+/** git for test fixtures: no GIT_* from a hook (pre-push runs this suite), no user config. */
+const fixtureGitEnv = { ...gitEnv(), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+
 /** A local "upstream" repository with one tagged commit. */
 async function upstreamRepo(dir: string): Promise<string> {
   const repo = join(dir, 'upstream');
   await mkdir(repo, { recursive: true });
-  await $`git -C ${repo} init -q`;
+  await $`git -C ${repo} init -q`.env(fixtureGitEnv);
   await Bun.write(join(repo, 'a.c'), 'int a;\n');
-  await $`git -C ${repo} add a.c`;
-  await $`git -C ${repo} -c user.name=t -c user.email=t@example.invalid commit -q -m base`;
-  await $`git -C ${repo} tag REL_17_11`;
+  await $`git -C ${repo} add a.c`.env(fixtureGitEnv);
+  await $`git -C ${repo} -c user.name=t -c user.email=t@example.invalid commit -q -m base`.env(
+    fixtureGitEnv,
+  );
+  await $`git -C ${repo} tag REL_17_11`.env(fixtureGitEnv);
   return repo;
 }
+
+describe('gitEnv', () => {
+  test('drops every GIT_* variable a hook exports and keeps the rest', () => {
+    expect(
+      gitEnv({
+        GIT_DIR: '/repo/.git',
+        GIT_INDEX_FILE: '/repo/.git/index',
+        GIT_WORK_TREE: '/repo',
+        PATH: '/bin',
+        HOME: '/home/u',
+        UNSET: undefined,
+      }),
+    ).toEqual({ PATH: '/bin', HOME: '/home/u' });
+  });
+
+  test('a hook-style GIT_DIR cannot redirect prepareEngineTree at another repository', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'df-pglite-gitenv-test.'));
+    const saved = process.env.GIT_DIR;
+    try {
+      const repo = await upstreamRepo(dir);
+      const commit = (await $`git -C ${repo} rev-parse HEAD`.env(fixtureGitEnv).text()).trim();
+      const decoy = join(dir, 'decoy.git');
+      await $`git init -q --bare ${decoy}`.env(fixtureGitEnv);
+      process.env.GIT_DIR = decoy;
+      const replay = join(dir, 'replay.patch');
+      await Bun.write(replay, diff('a.c', 'int a;', 'int b;'));
+      const recipe = join(dir, 'patches');
+      await mkdir(recipe);
+      const tree = join(dir, 'tree');
+      await prepareEngineTree(tree, { repo, tag: 'REL_17_11', commit }, replay, recipe);
+      expect(await Bun.file(join(tree, 'a.c')).text()).toBe('int b;\n');
+      // The decoy repository is untouched: no remote, no objects fetched.
+      delete process.env.GIT_DIR;
+      expect((await $`git -C ${decoy} remote`.env(fixtureGitEnv).text()).trim()).toBe('');
+      expect(
+        (await $`git -C ${decoy} config --get core.bare`.env(fixtureGitEnv).text()).trim(),
+      ).toBe('true');
+    } finally {
+      if (saved === undefined) delete process.env.GIT_DIR;
+      else process.env.GIT_DIR = saved;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 /** A unified diff that replaces `from` with `to` in file `name`. */
 const diff = (name: string, from: string, to: string): string =>
@@ -257,7 +307,7 @@ describe('prepareEngineTree', () => {
     const dir = await mkdtemp(join(tmpdir(), 'df-pglite-tree-test.'));
     try {
       const repo = await upstreamRepo(dir);
-      const commit = (await $`git -C ${repo} rev-parse HEAD`.text()).trim();
+      const commit = (await $`git -C ${repo} rev-parse HEAD`.env(fixtureGitEnv).text()).trim();
       const pinned: PostgresSource = { repo, tag: 'REL_17_11', commit };
       const replay = join(dir, 'replay.patch');
       await Bun.write(replay, diff('a.c', 'int a;', 'int b;'));

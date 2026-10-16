@@ -132,6 +132,21 @@ export function patchUpstreamBuild(
   return { versionsEnv: patchedVersions, buildSh: patchedBuild };
 }
 
+/**
+ * Environment for git commands on build-engine's own trees. Git hooks export
+ * GIT_DIR and friends, which would point `git -C <tree>` at the hook's
+ * repository instead; every GIT_* variable is dropped.
+ */
+export function gitEnv(
+  env: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(env).filter(
+      (entry): entry is [string, string] => !entry[0].startsWith('GIT_') && entry[1] !== undefined,
+    ),
+  );
+}
+
 /** The pinned upstream PostgreSQL source the engine tree starts from. */
 export interface PostgresSource {
   repo: string;
@@ -190,12 +205,13 @@ export async function applyCheckedPatch(
   source: PostgresSource,
 ): Promise<void> {
   const check = await $`git -C ${tree} apply --check --whitespace=nowarn ${patchFile}`
+    .env(gitEnv())
     .nothrow()
     .quiet();
   if (check.exitCode !== 0) {
     throw patchDoesNotApply(label, source, `${check.stdout}${check.stderr}`);
   }
-  await $`git -C ${tree} apply --whitespace=nowarn ${patchFile}`.quiet();
+  await $`git -C ${tree} apply --whitespace=nowarn ${patchFile}`.env(gitEnv()).quiet();
 }
 
 /** wasipg's own source patches, in the order its build.sh applies them. */
@@ -220,11 +236,14 @@ export async function prepareEngineTree(
 ): Promise<void> {
   await rm(tree, { recursive: true, force: true });
   await mkdir(tree, { recursive: true });
-  await $`git -C ${tree} init -q`;
-  await $`git -C ${tree} remote add origin ${source.repo}`;
-  await $`git -C ${tree} fetch -q --depth 1 origin ${`refs/tags/${source.tag}`}`;
-  checkTagCommit(source, await $`git -C ${tree} rev-parse ${'FETCH_HEAD^{commit}'}`.text());
-  await $`git -C ${tree} checkout -q FETCH_HEAD`;
+  await $`git -C ${tree} init -q`.env(gitEnv());
+  await $`git -C ${tree} remote add origin ${source.repo}`.env(gitEnv());
+  await $`git -C ${tree} fetch -q --depth 1 origin ${`refs/tags/${source.tag}`}`.env(gitEnv());
+  checkTagCommit(
+    source,
+    await $`git -C ${tree} rev-parse ${'FETCH_HEAD^{commit}'}`.env(gitEnv()).text(),
+  );
+  await $`git -C ${tree} checkout -q FETCH_HEAD`.env(gitEnv());
   await applyCheckedPatch(tree, replayPatch, ENGINE_SOURCE_PATCH, source);
   for (const patch of await recipePatches(recipePatchDir)) {
     await applyCheckedPatch(tree, patch, `wasipg build/patches/${patch.split('/').pop()}`, source);
@@ -236,12 +255,16 @@ export async function prepareEngineTree(
 export async function fetchRecipe(sourceDir: string, sourceRef: string): Promise<string> {
   if (!(await isDirectory(join(sourceDir, '.git')))) {
     await mkdir(sourceDir, { recursive: true });
-    await $`git -C ${sourceDir} init -q`;
-    await $`git -C ${sourceDir} remote add origin https://github.com/moznion/wasipg.git`;
+    await $`git -C ${sourceDir} init -q`.env(gitEnv());
+    await $`git -C ${sourceDir} remote add origin https://github.com/moznion/wasipg.git`.env(
+      gitEnv(),
+    );
   }
-  await $`git -C ${sourceDir} fetch --depth 1 origin ${sourceRef}`;
-  await $`git -C ${sourceDir} checkout FETCH_HEAD -- build NOTICE LICENSE`;
-  return sourceDateEpoch(await $`git -C ${sourceDir} show -s --format=%ct FETCH_HEAD`.text());
+  await $`git -C ${sourceDir} fetch --depth 1 origin ${sourceRef}`.env(gitEnv());
+  await $`git -C ${sourceDir} checkout FETCH_HEAD -- build NOTICE LICENSE`.env(gitEnv());
+  return sourceDateEpoch(
+    await $`git -C ${sourceDir} show -s --format=%ct FETCH_HEAD`.env(gitEnv()).text(),
+  );
 }
 
 export async function buildEngineSource(ctx: Context): Promise<void> {
