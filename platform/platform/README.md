@@ -1536,11 +1536,15 @@ tenantAuth:
     controller: while `di-tenant-registry` is not `Ready` the front relays whatever the tenant
     host answers for a request to a host it has no route for (502 only when `di-http` cannot be
     reached, 504 when its response headers time out), and `TenantAuthReady` reports
-    `Provisioning`. Tenant users cannot create a claimant (admission);
-    one written by any other requester (an operator, a CD service account) is detected on the
-    next reconcile (polled every 3 s), which closes the front, so it can receive credentials for
-    at most that poll plus the controller's `Recreate` rollout. Opening or closing the front
-    rolls the controller pod.
+    `Provisioning`. During the registry's NATS store migration (#159), `di-tenant-registry` is
+    held at replicas 0 and the wasmCloud operator may still report its WorkloadDeployment as
+    `Ready`. Callers must wait on the tenant's `TenantAuthReady` condition (which reports
+    `RegistryMigrating` or `RegistryMigrationFailed`) rather than the WorkloadDeployment,
+    since the latter does not reflect the migration state. Tenant users cannot create a
+    claimant (admission); one written by any other requester (an operator, a CD service
+    account) is detected on the next reconcile (polled every 3 s), which closes the front, so
+    it can receive credentials for at most that poll plus the controller's `Recreate` rollout.
+    Opening or closing the front rolls the controller pod.
   - Limits: the front is reachable without credentials (the component authenticates). A request
     without Basic credentials gets the registry's own challenge (`401`,
     `WWW-Authenticate: Basic realm="di-framework-tenant-registry"`) from the front, so

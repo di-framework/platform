@@ -2912,6 +2912,118 @@ describe('tenant registry (#83:reconcile)', () => {
       });
       expect(frontEnv(api)).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_FRONT_PORT');
     });
+
+    it('reports TenantAuthReady with RegistryMigrating reason while migration is stopping or migrating (#392)', async () => {
+      const { api, t } = prepare();
+      const controller = new Controller(api, registryCfg);
+      await controller.reconcileTenant(t, []);
+      // Registry is created and set to Ready.
+      expect(api.objects.get(wdPath)).toBeDefined();
+      api.objects.get(wdPath)!.status = { conditions: ready };
+      await controller.reconcileTenant(t, []);
+      expect(authCondition(t)).toMatchObject({
+        status: 'True',
+        reason: 'Reconciled',
+      });
+
+      // Simulate registry NATS migration: stopping stage (about to migrate).
+      api.seed({
+        apiVersion: 'batch/v1',
+        kind: 'Job',
+        metadata: {
+          name: 'di-nats-registry-migrate',
+          namespace: 'di-runtime-alpha',
+          labels: {
+            [INSTALLATION]: 'test',
+            [OWNER]: 'alpha-uid',
+          },
+        },
+        status: {},
+      });
+      api.objects.get(wdPath)!.status = { conditions: ready };
+      await controller.reconcileTenant(t, []);
+      // TenantAuthReady should be False with RegistryMigrating while the migration is in progress.
+      expect(authCondition(t)).toMatchObject({
+        status: 'False',
+        reason: 'RegistryMigrating',
+        message: expect.stringContaining('di-nats-registry-migrate'),
+      });
+    });
+
+    it('reports TenantAuthReady with RegistryMigrationFailed reason when migration Job fails (#392)', async () => {
+      const { api, t } = prepare();
+      const controller = new Controller(api, registryCfg);
+      await controller.reconcileTenant(t, []);
+      api.objects.get(wdPath)!.status = { conditions: ready };
+      await controller.reconcileTenant(t, []);
+
+      // Create a migration Job with a Failed condition.
+      api.seed({
+        apiVersion: 'batch/v1',
+        kind: 'Job',
+        metadata: {
+          name: 'di-nats-registry-migrate',
+          namespace: 'di-runtime-alpha',
+          labels: {
+            [INSTALLATION]: 'test',
+            [OWNER]: 'alpha-uid',
+          },
+        },
+        status: {
+          conditions: [
+            {
+              type: 'Failed',
+              status: 'True',
+              reason: 'BackoffLimitExceeded',
+              message: 'Job has reached the specified backoff limit',
+            },
+          ],
+        },
+      });
+      api.objects.get(wdPath)!.status = { conditions: ready };
+      await controller.reconcileTenant(t, []);
+      // TenantAuthReady should be False with RegistryMigrationFailed.
+      expect(authCondition(t)).toMatchObject({
+        status: 'False',
+        reason: 'RegistryMigrationFailed',
+        message: expect.stringContaining('BackoffLimitExceeded'),
+      });
+    });
+
+    it('reports pending/failing registry NATS migration on TenantAuthReady (#392)', async () => {
+      const { api, t } = prepare();
+      const controller = new Controller(api, registryCfg);
+      await controller.reconcileTenant(t, []);
+      api.objects.get(wdPath)!.status = { conditions: ready };
+      await controller.reconcileTenant(t, []);
+      expect(authCondition(t)).toMatchObject({
+        status: 'True',
+        reason: 'Reconciled',
+      });
+
+      // While a migration Job exists and hasn't succeeded, TenantAuthReady reports Migrating.
+      // Once it succeeds, the condition depends on the host image (see registryNatsCondition).
+      // This test verifies the key fact: during migration, TenantAuthReady reports the migration
+      // state, not a successful status, so callers waiting on it see the correct state.
+      api.seed({
+        apiVersion: 'batch/v1',
+        kind: 'Job',
+        metadata: {
+          name: 'di-nats-registry-migrate',
+          namespace: 'di-runtime-alpha',
+          labels: {
+            [INSTALLATION]: 'test',
+            [OWNER]: 'alpha-uid',
+          },
+        },
+        status: {},
+      });
+      api.objects.get(wdPath)!.status = { conditions: ready };
+      await controller.reconcileTenant(t, []);
+      // While migration is in progress, status is not Reconciled.
+      expect(authCondition(t)!.status).toBe('False');
+      expect(['RegistryMigrating', 'RegistryMigrationFailed']).toContain(authCondition(t)!.reason);
+    });
   });
 });
 
