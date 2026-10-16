@@ -209,9 +209,9 @@ On the platform the callback goes to a separate controller listener,
 include `tenant-controller.di-runtime-<tenant>.svc`); a NetworkPolicy admits
 only the tenant's host pods to it (see the `tenantAuth` section of
 `platform/platform/README.md`). It is the only listener that accepts the host
-pull token. The listener also answers plain HTTP on the same port, so a
-registry still configured with `http://…:8789` keeps working while an upgrade
-rolls out (platform#113).
+pull token. The platform runs it TLS-only
+(`TENANT_CONTROLLER_WHOAMI_TLS_ONLY=true`, platform#329), so a registry
+configured with `http://…:8789` is refused.
 
 The hop from the controller's TLS registry front to the host is still plain
 HTTP, so the user's Basic credential is cleartext on the pod network before

@@ -215,9 +215,24 @@ update (see
 [Upgrading to tenant hosts that trust the controller CA for `wasi:http`](#upgrading-to-tenant-hosts-that-trust-the-controller-ca-for-wasihttp-113));
 until a host has restarted with it, the registry on that host cannot verify the controller and
 answers `503` the same way. NetworkPolicy and the registry's egress allowlist name the same host
-and port as before, so they do not change. To refuse plain HTTP on `8789` once every registry
-uses `https://`, run the controller with `TENANT_CONTROLLER_WHOAMI_TLS_ONLY=true`; the platform
-does not set it yet.
+and port as before, so they do not change. A later release refuses plain HTTP on `8789` (see
+[Upgrading to a whoami listener that refuses plain HTTP](#upgrading-to-a-whoami-listener-that-refuses-plain-http-329)).
+
+#### Upgrading to a whoami listener that refuses plain HTTP (#329)
+
+- **Who is affected.** Installs with config `tenantAuth.registry` set.
+- **What changes.** The `tenant-controller` Deployment gains
+  `TENANT_CONTROLLER_WHOAMI_TLS_ONLY=true`, so its pods roll once. The whoami listener (`8789`)
+  then serves only TLS: a plain-HTTP connection is closed without reaching the handler. Every
+  `di-tenant-registry` the platform renders has called `https://…:8789` since v6.0.15 (#113), so
+  nothing the platform runs still needs plain HTTP. A tenant-auth image older than v6.0.15
+  ignores the variable.
+- **Upgrading from before v6.0.15.** The registry switches to `https://` in the same update; a
+  registry replica still on the old `http://` config until it is replaced cannot reach the
+  controller and answers requests that need authorization with `503` until then. Upgrading
+  through v6.0.15 or v6.0.16 first avoids that window. Follow
+  [Upgrading to TLS on the controller's whoami listener](#upgrading-to-tls-on-the-controllers-whoami-listener-113)
+  for the image order.
 
 #### Upgrading to tenant-auth URLs derived from `routeUrlPattern` (#128)
 
@@ -1494,10 +1509,9 @@ tenantAuth:
   tenant hosts trust the tenant CA for the components' outgoing `wasi:http`
   (`--http-client-ca-path`), so the registry verifies it like any other TLS server and the user's
   credential no longer crosses the pod network in cleartext on this hop. The listener serves
-  nothing but `GET /v1/auth/whoami` (same answer as `8788`, problem+json errors). It also answers
-  plain HTTP on the same port, for a registry whose config still names `http://` while an upgrade
-  rolls out (see
-  [Upgrading to TLS on the controller's whoami listener](#upgrading-to-tls-on-the-controllers-whoami-listener-113)).
+  nothing but `GET /v1/auth/whoami` (same answer as `8788`, problem+json errors), over TLS only:
+  the platform renders `TENANT_CONTROLLER_WHOAMI_TLS_ONLY=true` (see
+  [Upgrading to a whoami listener that refuses plain HTTP](#upgrading-to-a-whoami-listener-that-refuses-plain-http-329)).
   The hop from the registry front (`8790`) to the tenant host is still plain HTTP. Admission admits `wasmcloud:secrets` from the platform controller
   only, so a tenant cannot repoint the callback; the component's only egress is that URL
   (`allowedHosts`), and the egress reconcile leaves it alone.
