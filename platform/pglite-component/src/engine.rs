@@ -50,6 +50,12 @@ pub fn data_root(path: &str) -> Result<PathBuf, String> {
     Ok(root.components().collect())
 }
 
+/// Returns true if the data directory is marked as using the postgres database (new installations).
+/// Returns false for data directories created before the marker was introduced (using template1).
+pub fn uses_postgres_database(data_path: &Path) -> bool {
+    data_path.join(".postgres-enabled").exists()
+}
+
 impl Transport {
     pub fn open(path: &str, database: &str) -> Result<(Self, String), String> {
         if database != "template1" {
@@ -268,6 +274,13 @@ fn boot(root: &Path) -> Result<(), String> {
         fs::File::open(root)
             .and_then(|f| f.sync_all())
             .map_err(|e| format!("sync database root: {e}"))?;
+        // Write a marker to indicate this cluster uses postgres as the application database
+        // (as opposed to template1 for clusters initialized before this change).
+        fs::write(data.join(".postgres-enabled"), b"")
+            .map_err(|e| format!("write postgres marker: {e}"))?;
+        fs::File::open(&data)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| format!("sync postgres marker: {e}"))?;
     }
     engine::backend();
     Ok(())

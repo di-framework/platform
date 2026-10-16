@@ -86,7 +86,11 @@ interface types {
   /// Options accepted by `open`. Every field is optional; `none` means the
   /// documented default.
   record open-options {
-    /// Database name for the session. Only `template1` is currently supported.
+    /// Database name for the session. Default depends on cluster version:
+    /// - New clusters created with v0.2.1+ default to `postgres`.
+    /// - Existing clusters created before v0.2.1 default to `template1` and
+    ///   continue to use it unless explicitly overridden.
+    /// Callers may override the default by specifying a database name.
     database: option<string>,
     /// Reserved: WASI lacks the signal timer used for query cancellation.
     /// Only none or zero is supported; nonzero values fail open.

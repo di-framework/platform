@@ -78,11 +78,23 @@ impl Guest for Provider {
                     .into(),
             ));
         }
-        let database = options
+        let database = if let Some(explicit_db) = options
             .as_ref()
             .and_then(|o| o.database.as_deref())
-            .unwrap_or("template1");
-        let sess = Session::connect(&path, database)?;
+        {
+            // Caller explicitly specified a database
+            explicit_db.to_string()
+        } else {
+            // Select default database based on cluster version
+            let data_root = engine::data_root(&path).map_err(|e| Error::OpenFailed(e))?;
+            if engine::uses_postgres_database(&data_root) {
+                "postgres"
+            } else {
+                "template1"
+            }
+            .to_string()
+        };
+        let sess = Session::connect(&path, &database)?;
 
         Ok(Connection::new(DbConn(RefCell::new(LiveConn {
             sess: Some(sess),
