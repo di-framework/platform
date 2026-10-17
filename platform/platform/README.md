@@ -874,10 +874,72 @@ model, not a claim of developer-proof network isolation.
   A `ServiceBinding` with `capability: blobstore` projects ConfigMap `di-binding-<binding>` with
   `backend: nats` and `url` only. The workload host interface stays unnamed and selects the
   store with `configFrom`; each guest container is its own object store bucket. Without a
-  binding, the unnamed interface keeps the host default store.
+  binding, the unnamed interface is in memory on wash 2.8.0; see
+  [Blobstore persistence](#known-limitation-blobstore-persistence-154).
 - Per-tenant **runtime data-plane NATS** (`di-nats`, hostgroup `--data-nats-url`) is
   Tenant-reconciled infrastructure — not an application `BackingService`. Application
   messaging instances are named `di-bs-<service-name>` and owned by BackingService UIDs.
+
+### Known limitation: blobstore persistence (#154)
+
+On wash 2.8.0 a `wasmcloud:blobstore` import with no backend configuration is served by the
+host's multiplexed blobstore plugin with its default **in-memory** backend. Everything a
+workload writes through it is lost when the host pod restarts, and host pods restart routinely
+(the first deploy of a persistent workload, certificate reissue, host image upgrades). The
+platform does not change this default.
+
+A workload whose blobs must survive a restart configures a backend explicitly. Tenant workloads
+do it with a `blobstore-nats` service and a binding; admission refuses inline `config` on a
+tenant's blobstore entry:
+
+```yaml
+apiVersion: platform.di-framework.dev/v1alpha1
+kind: BackingService
+metadata: { name: objects, namespace: di-tenant-alpha }
+spec: { type: blobstore }
+---
+apiVersion: platform.di-framework.dev/v1alpha1
+kind: ServiceBinding
+metadata: { name: objects, namespace: di-tenant-alpha }
+spec: { serviceName: objects, bindingName: objects, capability: blobstore }
+```
+
+The binding projects ConfigMap `di-binding-objects` with `backend: nats` and
+`url: nats://di-bs-objects.di-runtime-alpha.svc.cluster.local:4222`. The WorkloadDeployment
+keeps the entry unnamed (componentize-qjs cannot encode a named blobstore import) and selects
+the store with `configFrom`:
+
+```yaml
+hostInterfaces:
+  - namespace: wasmcloud
+    package: blobstore
+    version: 0.1.0
+    interfaces: [blobstore, container, types]
+    configFrom:
+      - name: di-binding-objects
+```
+
+The tenant registry (#150) uses the same backend, set inline by the controller and admitted from
+the controller only. Its entry points at the tenant's runtime `di-nats` (JetStream on the
+tenant's host path) and, with the registry's own NATS account (#159), logs in through the
+mounted credential files:
+
+```yaml
+hostInterfaces:
+  - namespace: wasmcloud
+    package: blobstore
+    version: 0.1.0
+    interfaces: [blobstore, container, types]
+    config:
+      backend: nats
+      url: nats://di-nats.di-runtime-alpha.svc.cluster.local:4222
+      user_file: /var/run/secrets/di-framework/registry-nats/username
+      password_file: /var/run/secrets/di-framework/registry-nats/password
+```
+
+With the JetStream-backed NATS backend each guest container is an object store bucket on the
+service's storage, so it survives host restarts (see
+[BackingService storage](#backingservice-storage)).
 
 ### BackingService storage
 
@@ -904,7 +966,7 @@ hostPath).
 
 Each tenant's `di-nats` keeps its JetStream store on the node at
 `<storageRoot>/di-tenants/<tenant uid>/di-nats`, a host path no ResourceQuota covers. The tenant
-registry's images (#83) and the hosts' default blobstore live there, so the server caps it (#160).
+registry's images (#83) live there, so the server caps it (#160).
 The controller renders ConfigMap `di-nats-config` in `di-runtime-<tenant>` and runs `di-nats` with
 `-c /etc/nats/nats.conf`:
 
