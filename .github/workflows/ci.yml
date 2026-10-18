@@ -9,6 +9,24 @@ permissions:
   contents: read
 
 jobs:
+  operator:
+    name: Operator
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: platform/operator/go.mod
+          cache-dependency-path: platform/operator/go.sum
+
+      # Generated DeepCopy, CRD and ClusterRole must match the API markers; gofmt, vet and tests.
+      - name: Check
+        working-directory: platform/operator
+        run: make check
+
   build-and-test:
     name: Test
     runs-on: ubuntu-latest
