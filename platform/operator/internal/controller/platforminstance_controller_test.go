@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -115,13 +116,26 @@ func (h *harness) readyTarget() {
 	h.tg.state = targets.State{Ready: true, Kubeconfig: []byte("kubeconfig-bytes"), Server: "https://vcluster.pi-team-a-one.svc:443"}
 }
 
-func TestCreateThroughReady(t *testing.T) {
+// installedHarness runs an instance through finalizer and first install with a ready target.
+func installedHarness(t *testing.T) (*harness, ctrl.Result) {
+	t.Helper()
+	h := newHarness(t, "")
+	h.readyTarget()
+	h.reconcile()
+	return h, h.reconcile()
+}
+
+func TestFinalizerComesFirst(t *testing.T) {
 	h := newHarness(t, "")
 	h.reconcile()
 	if !containsFinalizer(h.get()) || h.tg.ensures != 0 {
 		t.Fatalf("first reconcile must only add the finalizer (ensures %d)", h.tg.ensures)
 	}
+}
 
+func TestPendingTargetIsProvisioning(t *testing.T) {
+	h := newHarness(t, "")
+	h.reconcile()
 	h.tg.state = targets.State{Reason: "ControlPlanePending", Message: "not ready"}
 	if res := h.reconcile(); res.RequeueAfter != 10*time.Second {
 		t.Fatalf("pending target requeue %v", res.RequeueAfter)
@@ -130,21 +144,30 @@ func TestCreateThroughReady(t *testing.T) {
 	if inst.Status.Phase != v1alpha1.PhaseProvisioning || conditionReason(inst, v1alpha1.ConditionTargetReady) != "ControlPlanePending" {
 		t.Fatalf("provisioning status %+v", inst.Status)
 	}
+	if len(h.in.installs) != 0 {
+		t.Fatal("installed before the target was ready")
+	}
+}
 
-	h.readyTarget()
-	if res := h.reconcile(); res.RequeueAfter != 30*time.Minute {
+func TestReadyStatus(t *testing.T) {
+	h, res := installedHarness(t)
+	if res.RequeueAfter != 30*time.Minute {
 		t.Fatalf("ready requeue %v, want the repair interval", res.RequeueAfter)
 	}
-	inst = h.get()
-	if inst.Status.Phase != v1alpha1.PhaseReady || inst.Status.InstalledVersion != "6.0.17" || inst.Status.ObservedGeneration != 1 {
-		t.Fatalf("ready status %+v", inst.Status)
+	s := h.get().Status
+	if s.Phase != v1alpha1.PhaseReady || s.InstalledVersion != "6.0.17" || s.ObservedGeneration != 1 {
+		t.Fatalf("ready status %+v", s)
 	}
-	if !meta.IsStatusConditionTrue(inst.Status.Conditions, v1alpha1.ConditionReady) || inst.Status.Endpoints.HTTP != "http://h" {
-		t.Fatalf("ready conditions/endpoints %+v", inst.Status)
+	if !meta.IsStatusConditionTrue(s.Conditions, v1alpha1.ConditionReady) || s.Endpoints.HTTP != "http://h" {
+		t.Fatalf("ready conditions/endpoints %+v", s)
 	}
-	if inst.Status.KubeconfigSecretRef == nil || inst.Status.KubeconfigSecretRef.Name != "one-kubeconfig" {
-		t.Fatalf("kubeconfig ref %+v", inst.Status.KubeconfigSecretRef)
+	if s.KubeconfigSecretRef == nil || s.KubeconfigSecretRef.Name != "one-kubeconfig" {
+		t.Fatalf("kubeconfig ref %+v", s.KubeconfigSecretRef)
 	}
+}
+
+func TestKubeconfigSecretIsOwned(t *testing.T) {
+	h, _ := installedHarness(t)
 	var secret corev1.Secret
 	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "one-kubeconfig"}, &secret); err != nil {
 		t.Fatal(err)
@@ -152,25 +175,25 @@ func TestCreateThroughReady(t *testing.T) {
 	if string(secret.Data[KubeconfigKey]) != "kubeconfig-bytes" || len(secret.OwnerReferences) != 1 {
 		t.Fatalf("kubeconfig Secret %+v", secret)
 	}
+}
 
+func TestInstallRequest(t *testing.T) {
+	h, _ := installedHarness(t)
 	req := h.in.installs[0]
 	want := map[string]any{
 		"namespace": "wasmcloud", "networkPolicyEngine": "existing", "httpNodePort": 0,
 		"storageRoot": "/var/lib/kubesolo/instances/team-a-one", "kubernetesEndpoint": "https://vcluster.pi-team-a-one.svc:443",
 	}
-	if req.ID != "team-a.one" || req.Version != "6.0.17" || len(req.Settings) != len(want) {
+	if req.ID != "team-a.one" || req.Version != "6.0.17" || !reflect.DeepEqual(req.Settings, want) {
 		t.Fatalf("install request %+v", req)
-	}
-	for k, v := range want {
-		if req.Settings[k] != v {
-			t.Fatalf("setting %s = %v, want %v", k, req.Settings[k], v)
-		}
 	}
 	if h.in.options[0].Refresh {
 		t.Fatal("first install must not refresh")
 	}
+}
 
-	// Within the repair interval nothing runs; after it, a refresh + up runs.
+func TestRepairRunsAfterTheInterval(t *testing.T) {
+	h, _ := installedHarness(t)
 	h.now = h.now.Add(10 * time.Minute)
 	if res := h.reconcile(); res.RequeueAfter != 20*time.Minute || len(h.in.installs) != 1 {
 		t.Fatalf("early reconcile requeue %v installs %d", res.RequeueAfter, len(h.in.installs))

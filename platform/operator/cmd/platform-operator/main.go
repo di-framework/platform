@@ -35,6 +35,7 @@ func run() error {
 	var (
 		stateDir        = flag.String("state-dir", "/var/lib/platform-operator", "directory (the operator's PVC) for per-instance install projects and state")
 		passphraseFile  = flag.String("passphrase-file", "/etc/platform-operator/passphrase", "file holding the passphrase that encrypts install state secrets")
+		npm             = flag.String("npm", installer.DefaultNPM, "absolute path of npm")
 		storageRootBase = flag.String("storage-root-base", "/var/lib/kubesolo/instances", "node directory under which each instance gets its own storageRoot")
 		repairInterval  = flag.Duration("repair-interval", 30*time.Minute, "how often a ready instance gets a refresh and up to repair drift")
 		targetPoll      = flag.Duration("target-poll", 10*time.Second, "how often to check a target that is still coming up")
@@ -86,6 +87,7 @@ func run() error {
 			StateDir:   *stateDir,
 			Passphrase: strings.TrimSpace(string(passphrase)),
 			Log:        os.Stderr,
+			NPM:        *npm,
 		},
 		Plan:            plan.Config{RepairInterval: *repairInterval, TargetPoll: *targetPoll},
 		StorageRootBase: *storageRootBase,

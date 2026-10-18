@@ -21,6 +21,9 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
+// DefaultNPM is npm in the operator image (node:22 alpine).
+const DefaultNPM = "/usr/local/bin/npm"
+
 const (
 	// projectName is also the platform program's config namespace ("<project>:<key>").
 	projectName = "platform-instance"
@@ -47,6 +50,8 @@ type Pulumi struct {
 	Passphrase string
 	// Log receives Pulumi and npm output.
 	Log io.Writer
+	// NPM is the absolute path of npm; empty uses DefaultNPM.
+	NPM string
 
 	// npmInstall installs the project's dependencies; nil runs `npm install`.
 	npmInstall func(ctx context.Context, dir string) error
@@ -259,7 +264,14 @@ func (p *Pulumi) writeProject(ctx context.Context, req Request, projectDir, stat
 }
 
 func (p *Pulumi) runNPM(ctx context.Context, dir string) error {
-	cmd := exec.CommandContext(ctx, "npm", "install", "--no-audit", "--no-fund")
+	npm := p.NPM
+	if npm == "" {
+		npm = DefaultNPM
+	}
+	if !filepath.IsAbs(npm) {
+		return fmt.Errorf("npm path %q is not absolute", npm)
+	}
+	cmd := exec.CommandContext(ctx, npm, "install", "--no-audit", "--no-fund")
 	cmd.Dir = dir
 	cmd.Stdout, cmd.Stderr = p.log(), p.log()
 	return cmd.Run()

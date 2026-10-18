@@ -128,75 +128,88 @@ func TestRepairRefreshesBeforeUp(t *testing.T) {
 }
 
 func TestLockRecovery(t *testing.T) {
-	t.Run("cancel clears the stale lock, then refresh and one retry", func(t *testing.T) {
-		s := &fakeStack{fail: map[string][]error{"up": {errLocked, nil}}}
-		p, _ := newTestPulumi(t, s)
-		if _, err := p.Install(context.Background(), request(), Options{}); err != nil {
-			t.Fatal(err)
-		}
-		if want := []string{"config", "up", "cancel", "refresh", "up", "outputs"}; !reflect.DeepEqual(s.calls, want) {
-			t.Fatalf("calls %v, want %v", s.calls, want)
-		}
-	})
-	t.Run("file backend without cancel: lock files are removed", func(t *testing.T) {
-		s := &fakeStack{fail: map[string][]error{"up": {errLocked, nil}}, cancelErr: errors.New("cancel not supported")}
-		p, _ := newTestPulumi(t, s)
-		locks := filepath.Join(p.StateDir, "team-a.pi-one", "state", ".pulumi", "locks", "organization", projectName, stackName)
-		if err := os.MkdirAll(locks, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		lock := filepath.Join(locks, "a1b2.json")
-		keep := filepath.Join(locks, "README")
-		for _, f := range []string{lock, keep} {
-			if err := os.WriteFile(f, []byte("{}"), 0o600); err != nil {
-				t.Fatal(err)
+	unreachable := errors.New("kubernetes API unreachable")
+	refreshFailed := errors.New("refresh failed")
+	tests := []struct {
+		name      string
+		fail      map[string][]error
+		refresh   bool
+		wantCalls []string
+		wantErr   error
+	}{
+		{
+			name:      "cancel clears the stale lock, then refresh and one retry",
+			fail:      map[string][]error{"up": {errLocked, nil}},
+			wantCalls: []string{"config", "up", "cancel", "refresh", "up", "outputs"},
+		},
+		{
+			name:      "a lock during the repair refresh is recovered too",
+			fail:      map[string][]error{"refresh": {errLocked, nil, nil}},
+			refresh:   true,
+			wantCalls: []string{"config", "refresh", "cancel", "refresh", "refresh", "up", "outputs"},
+		},
+		{
+			name:      "retries once only",
+			fail:      map[string][]error{"up": {errLocked, errLocked}},
+			wantCalls: []string{"config", "up", "cancel", "refresh", "up"},
+			wantErr:   errLocked,
+		},
+		{
+			name:      "other errors are not retried",
+			fail:      map[string][]error{"up": {unreachable}},
+			wantCalls: []string{"config", "up"},
+			wantErr:   unreachable,
+		},
+		{
+			name:      "a failed refresh after recovery stops the retry",
+			fail:      map[string][]error{"up": {errLocked}, "refresh": {refreshFailed}},
+			wantCalls: []string{"config", "up", "cancel", "refresh"},
+			wantErr:   refreshFailed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &fakeStack{fail: tt.fail}
+			p, _ := newTestPulumi(t, s)
+			_, err := p.Install(context.Background(), request(), Options{Refresh: tt.refresh})
+			if !errors.Is(err, tt.wantErr) || (tt.wantErr == nil && err != nil) {
+				t.Fatalf("err %v, want %v", err, tt.wantErr)
 			}
-		}
-		if _, err := p.Install(context.Background(), request(), Options{}); err != nil {
+			if !reflect.DeepEqual(s.calls, tt.wantCalls) {
+				t.Fatalf("calls %v, want %v", s.calls, tt.wantCalls)
+			}
+		})
+	}
+}
+
+func TestLockFilesRemovedWhenCancelFails(t *testing.T) {
+	s := &fakeStack{fail: map[string][]error{"up": {errLocked, nil}}, cancelErr: errors.New("cancel not supported")}
+	p, _ := newTestPulumi(t, s)
+	locks := filepath.Join(p.StateDir, "team-a.pi-one", "state", ".pulumi", "locks", "organization", projectName, stackName)
+	lock, keep := filepath.Join(locks, "a1b2.json"), filepath.Join(locks, "README")
+	writeFiles(t, lock, keep)
+	if _, err := p.Install(context.Background(), request(), Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(lock); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale lock still present: %v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("non-lock file removed: %v", err)
+	}
+}
+
+// writeFiles creates each file (and its directory) with "{}".
+func writeFiles(t *testing.T, files ...string) {
+	t.Helper()
+	for _, f := range files {
+		if err := os.MkdirAll(filepath.Dir(f), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := os.Stat(lock); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("stale lock still present: %v", err)
-		}
-		if _, err := os.Stat(keep); err != nil {
-			t.Fatalf("non-lock file removed: %v", err)
-		}
-	})
-	t.Run("a lock during the repair refresh is recovered too", func(t *testing.T) {
-		s := &fakeStack{fail: map[string][]error{"refresh": {errLocked, nil, nil}}}
-		p, _ := newTestPulumi(t, s)
-		if _, err := p.Install(context.Background(), request(), Options{Refresh: true}); err != nil {
+		if err := os.WriteFile(f, []byte("{}"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if want := []string{"config", "refresh", "cancel", "refresh", "refresh", "up", "outputs"}; !reflect.DeepEqual(s.calls, want) {
-			t.Fatalf("calls %v, want %v", s.calls, want)
-		}
-	})
-	t.Run("retries once only", func(t *testing.T) {
-		s := &fakeStack{fail: map[string][]error{"up": {errLocked, errLocked}}}
-		p, _ := newTestPulumi(t, s)
-		_, err := p.Install(context.Background(), request(), Options{})
-		if !errors.Is(err, errLocked) || strings.Count(strings.Join(s.calls, ","), "up") != 2 {
-			t.Fatalf("err %v, calls %v", err, s.calls)
-		}
-	})
-	t.Run("other errors are not retried", func(t *testing.T) {
-		boom := errors.New("kubernetes API unreachable")
-		s := &fakeStack{fail: map[string][]error{"up": {boom}}}
-		p, _ := newTestPulumi(t, s)
-		_, err := p.Install(context.Background(), request(), Options{})
-		if !errors.Is(err, boom) || !reflect.DeepEqual(s.calls, []string{"config", "up"}) {
-			t.Fatalf("err %v, calls %v", err, s.calls)
-		}
-	})
-	t.Run("a failed refresh after recovery stops the retry", func(t *testing.T) {
-		boom := errors.New("refresh failed")
-		s := &fakeStack{fail: map[string][]error{"up": {errLocked}, "refresh": {boom}}}
-		p, _ := newTestPulumi(t, s)
-		if _, err := p.Install(context.Background(), request(), Options{}); !errors.Is(err, boom) {
-			t.Fatalf("err %v", err)
-		}
-	})
+	}
 }
 
 func TestInvalidRequests(t *testing.T) {
