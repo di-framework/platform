@@ -20,17 +20,17 @@ import (
 	"github.com/di-framework/platform/operator/api/v1alpha1"
 	"github.com/di-framework/platform/operator/internal/installer"
 	"github.com/di-framework/platform/operator/internal/plan"
-	"github.com/di-framework/platform/operator/internal/target"
+	"github.com/di-framework/platform/operator/internal/targets"
 )
 
 type fakeTarget struct {
-	state      target.State
+	state      targets.State
 	ensures    int
 	deletes    int
 	deleteDone bool
 }
 
-func (f *fakeTarget) Ensure(context.Context, *v1alpha1.PlatformInstance) (target.State, error) {
+func (f *fakeTarget) Ensure(context.Context, *v1alpha1.PlatformInstance) (targets.State, error) {
 	f.ensures++
 	return f.state, nil
 }
@@ -112,7 +112,7 @@ func (h *harness) get() *v1alpha1.PlatformInstance {
 }
 
 func (h *harness) readyTarget() {
-	h.tg.state = target.State{Ready: true, Kubeconfig: []byte("kubeconfig-bytes"), Server: "https://vcluster.pi-team-a-one.svc:443"}
+	h.tg.state = targets.State{Ready: true, Kubeconfig: []byte("kubeconfig-bytes"), Server: "https://vcluster.pi-team-a-one.svc:443"}
 }
 
 func TestCreateThroughReady(t *testing.T) {
@@ -122,7 +122,7 @@ func TestCreateThroughReady(t *testing.T) {
 		t.Fatalf("first reconcile must only add the finalizer (ensures %d)", h.tg.ensures)
 	}
 
-	h.tg.state = target.State{Reason: "ControlPlanePending", Message: "not ready"}
+	h.tg.state = targets.State{Reason: "ControlPlanePending", Message: "not ready"}
 	if res := h.reconcile(); res.RequeueAfter != 10*time.Second {
 		t.Fatalf("pending target requeue %v", res.RequeueAfter)
 	}

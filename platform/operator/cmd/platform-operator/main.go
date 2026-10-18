@@ -21,7 +21,7 @@ import (
 	"github.com/di-framework/platform/operator/internal/controller"
 	"github.com/di-framework/platform/operator/internal/installer"
 	"github.com/di-framework/platform/operator/internal/plan"
-	"github.com/di-framework/platform/operator/internal/target/vcluster"
+	"github.com/di-framework/platform/operator/internal/targets/vcluster"
 )
 
 func main() {

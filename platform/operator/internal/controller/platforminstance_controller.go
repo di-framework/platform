@@ -22,7 +22,7 @@ import (
 	"github.com/di-framework/platform/operator/api/v1alpha1"
 	"github.com/di-framework/platform/operator/internal/installer"
 	"github.com/di-framework/platform/operator/internal/plan"
-	"github.com/di-framework/platform/operator/internal/target"
+	"github.com/di-framework/platform/operator/internal/targets"
 )
 
 // Finalizer holds a PlatformInstance until its deletion policy has been applied.
@@ -41,7 +41,7 @@ const PlatformNamespace = "wasmcloud"
 // recovery relies on both.
 type Reconciler struct {
 	client.Client
-	Target    target.Target
+	Target    targets.Target
 	Installer installer.Installer
 	Plan      plan.Config
 	// StorageRootBase is the node directory under which each instance gets its own storageRoot
@@ -126,7 +126,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 }
 
-func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstance, st target.State, d plan.Decision) (ctrl.Result, error) {
+func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstance, st targets.State, d plan.Decision) (ctrl.Result, error) {
 	if err := r.patchStatus(ctx, inst, func(s *v1alpha1.PlatformInstanceStatus) {
 		if d.Action == plan.Install {
 			s.Phase = v1alpha1.PhaseInstalling
@@ -175,7 +175,7 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, inst *v1alpha1.Platfor
 		if !done {
 			return ctrl.Result{RequeueAfter: r.Plan.TargetPoll}, nil
 		}
-		if err := r.Installer.Uninstall(ctx, r.request(inst, target.State{}), installer.UninstallOptions{}); err != nil {
+		if err := r.Installer.Uninstall(ctx, r.request(inst, targets.State{}), installer.UninstallOptions{}); err != nil {
 			return r.fail(ctx, inst, v1alpha1.ConditionInstalled, "UninstallFailed", err.Error(), err)
 		}
 		obs.UninstallDone = true
@@ -207,7 +207,7 @@ func (r *Reconciler) observe(inst *v1alpha1.PlatformInstance) plan.Observation {
 }
 
 // request builds the installer input. Settings are the platform's existing-entrypoint keys.
-func (r *Reconciler) request(inst *v1alpha1.PlatformInstance, st target.State) installer.Request {
+func (r *Reconciler) request(inst *v1alpha1.PlatformInstance, st targets.State) installer.Request {
 	engine := inst.Spec.Platform.NetworkPolicyEngine
 	if engine == "" {
 		engine = "existing"
