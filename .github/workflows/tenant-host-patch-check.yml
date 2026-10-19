@@ -157,7 +157,7 @@ jobs:
           git -C wasmcloud diff --stat
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           # rust-toolchain.toml at the pinned commit pins 1.96.0.
           toolchain: '1.96.0'
