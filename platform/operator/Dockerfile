@@ -1,6 +1,6 @@
 # platform-operator: the operator binary, Node.js and npm (the platform program is TypeScript) and the
 # Pulumi CLI the Automation API drives. Build from platform/operator.
-FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM golang:1.26@sha256:672c944cfd07599b5f1bb179869270cdc94c6254e41db4d431259693cb286b82 AS build
 ARG TARGETOS TARGETARCH
 # Pulumi CLI, matching the Automation API SDK in go.mod. Digests from pulumi-3.270.0-checksums.txt.
 ARG PULUMI_VERSION=3.270.0
@@ -24,7 +24,7 @@ RUN set -eu; \
     echo "$sum  /tmp/pulumi.tgz" | sha256sum -c -; \
     tar -xzf /tmp/pulumi.tgz -C /opt
 
-FROM node:22.18.0-alpine3.22
+FROM node:22.18.0-alpine3.22@sha256:1b2479dd35a99687d6638f5976fd235e26c5b37e8122f786fcd5fe231d63de5b
 COPY --from=build /opt/pulumi /opt/pulumi
 COPY --from=build /platform-operator /usr/local/bin/platform-operator
 ENV PATH=/opt/pulumi:$PATH \

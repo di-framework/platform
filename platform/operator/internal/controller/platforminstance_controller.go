@@ -31,6 +31,10 @@ const Finalizer = "platform.di-framework.dev/instance"
 // KubeconfigKey is the key of the instance kubeconfig in its Secret.
 const KubeconfigKey = "kubeconfig"
 
+// ManagedLabels mark the objects the operator creates. The operator's cache watches only Secrets
+// that carry them.
+var ManagedLabels = map[string]string{"app.kubernetes.io/managed-by": "platform-operator"}
+
 // PlatformNamespace is the namespace the platform is installed into, inside the target.
 const PlatformNamespace = "wasmcloud"
 
@@ -49,6 +53,9 @@ type Reconciler struct {
 	StorageRootBase string
 	// MaxConcurrent caps parallel reconciles across instances (installs are long-running).
 	MaxConcurrent int
+	// InstallTimeout bounds one install or repair, so a hung npm or Pulumi run frees its worker.
+	// Zero means no bound.
+	InstallTimeout time.Duration
 	// Now is injectable for tests; nil uses time.Now.
 	Now func() time.Time
 }
@@ -58,6 +65,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=platform.di-framework.dev,resources=platforminstances/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
@@ -122,8 +130,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	case plan.Install, plan.Repair:
 		return r.install(ctx, &inst, st, d)
 	default: // plan.Wait
-		return ctrl.Result{RequeueAfter: d.RequeueAfter}, nil
+		return ctrl.Result{RequeueAfter: d.RequeueAfter}, r.markReady(ctx, &inst)
 	}
+}
+
+// markReady puts back the Ready status when the instance is installed and its target answers
+// again after a transient failure, which leaves phase and conditions behind until the next
+// repair otherwise.
+func (r *Reconciler) markReady(ctx context.Context, inst *v1alpha1.PlatformInstance) error {
+	s := inst.Status
+	if s.Phase == v1alpha1.PhaseReady && s.KubeconfigSecretRef != nil &&
+		meta.IsStatusConditionTrue(s.Conditions, v1alpha1.ConditionTargetReady) &&
+		meta.IsStatusConditionTrue(s.Conditions, v1alpha1.ConditionReady) {
+		return nil
+	}
+	return r.patchStatus(ctx, inst, func(s *v1alpha1.PlatformInstanceStatus) {
+		s.Phase = v1alpha1.PhaseReady
+		s.KubeconfigSecretRef = &v1alpha1.SecretReference{Name: kubeconfigSecretName(inst)}
+		setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionTrue, "Ready", "target cluster answers")
+		setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionTrue, "Ready", "instance is ready")
+	})
 }
 
 func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstance, st targets.State, d plan.Decision) (ctrl.Result, error) {
@@ -137,7 +163,16 @@ func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstanc
 		return ctrl.Result{}, err
 	}
 
-	res, err := r.Installer.Install(ctx, r.request(inst, st), installer.Options{Refresh: d.Action == plan.Repair})
+	installCtx := ctx
+	if r.InstallTimeout > 0 {
+		var cancel context.CancelFunc
+		installCtx, cancel = context.WithTimeout(ctx, r.InstallTimeout)
+		defer cancel()
+	}
+	// A repair, and a retry after a failed install, refresh first: the failed run may have left
+	// resources Pulumi hasn't recorded.
+	refresh := d.Action == plan.Repair || d.Reason == plan.ReasonRetry
+	res, err := r.Installer.Install(installCtx, r.request(inst, st), installer.Options{Refresh: refresh})
 	if err != nil {
 		return r.fail(ctx, inst, v1alpha1.ConditionInstalled, "InstallFailed",
 			fmt.Sprintf("%s of %s failed: %v", d.Reason, inst.Spec.Version, err), err)
@@ -214,7 +249,8 @@ func (r *Reconciler) request(inst *v1alpha1.PlatformInstance, st targets.State) 
 	}
 	root := inst.Spec.Platform.StorageRoot
 	if root == "" {
-		root = path.Join(r.StorageRootBase, inst.Namespace+"-"+inst.Name)
+		// Kubernetes names can't contain "/", so <namespace>/<name> is unique per instance.
+		root = path.Join(r.StorageRootBase, inst.Namespace, inst.Name)
 	}
 	settings := map[string]any{
 		"namespace":           PlatformNamespace,
@@ -224,6 +260,9 @@ func (r *Reconciler) request(inst *v1alpha1.PlatformInstance, st targets.State) 
 	}
 	if st.Server != "" {
 		settings["kubernetesEndpoint"] = st.Server
+	}
+	if ep := inst.Spec.Platform.Gateway.HTTPEndpoint; ep != "" {
+		settings["httpEndpoint"] = ep
 	}
 	return installer.Request{
 		ID:         inst.Namespace + "." + inst.Name,
@@ -239,6 +278,12 @@ func kubeconfigSecretName(inst *v1alpha1.PlatformInstance) string { return inst.
 func (r *Reconciler) writeKubeconfig(ctx context.Context, inst *v1alpha1.PlatformInstance, kubeconfig []byte) error {
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: inst.Namespace, Name: kubeconfigSecretName(inst)}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
+		if secret.Labels == nil {
+			secret.Labels = map[string]string{}
+		}
+		for k, v := range ManagedLabels {
+			secret.Labels[k] = v
+		}
 		secret.Type = corev1.SecretTypeOpaque
 		secret.Data = map[string][]byte{KubeconfigKey: kubeconfig}
 		return controllerutil.SetControllerReference(inst, secret, r.Scheme())

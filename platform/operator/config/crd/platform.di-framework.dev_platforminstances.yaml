@@ -52,7 +52,9 @@ spec:
           metadata:
             type: object
           spec:
-            description: PlatformInstanceSpec is the desired platform instance.
+            description: |-
+              PlatformInstanceSpec is the desired platform instance. The target and storageRoot are fixed at
+              creation: the operator would otherwise lose track of the cluster and data it made.
             properties:
               deletionPolicy:
                 default: Delete
@@ -68,6 +70,13 @@ spec:
                   gateway:
                     description: Gateway configures the platform HTTP gateway.
                     properties:
+                      httpEndpoint:
+                        description: |-
+                          HTTPEndpoint is the gateway's public base URL, for example http://apps.example:30080. The
+                          platform derives route URLs from it, and status.endpoints.http reports it. The operator
+                          can't know how the gateway is reached from outside, so it is set here.
+                        pattern: ^https?://
+                        type: string
                       httpNodePort:
                         description: HTTPNodePort publishes the gateway on this NodePort.
                           Zero (default) keeps it ClusterIP.
@@ -112,6 +121,13 @@ spec:
             - target
             - version
             type: object
+            x-kubernetes-validations:
+            - message: target is immutable
+              rule: self.target == oldSelf.target
+            - message: platform.storageRoot is immutable
+              rule: 'has(self.platform) && has(self.platform.storageRoot) ? has(oldSelf.platform)
+                && has(oldSelf.platform.storageRoot) && oldSelf.platform.storageRoot
+                == self.platform.storageRoot : !(has(oldSelf.platform) && has(oldSelf.platform.storageRoot))'
           status:
             description: PlatformInstanceStatus is the observed state of an instance.
             properties:
@@ -219,6 +235,9 @@ spec:
                 type: string
             type: object
         type: object
+        x-kubernetes-validations:
+        - message: name must be at most 63 characters
+          rule: self.metadata.name.size() <= 63
     served: true
     storage: true
     subresources:

@@ -41,21 +41,27 @@ func (h *Helm) configuration(namespace string) (*action.Configuration, error) {
 	return cfg, nil
 }
 
-// Exists reports whether a deployed (or failed) release named name exists in namespace.
-func (h *Helm) Exists(_ context.Context, namespace, name string) (bool, error) {
+// Get returns the release named name in namespace, or nil when there is none.
+func (h *Helm) Get(_ context.Context, namespace, name string) (*Release, error) {
 	cfg, err := h.configuration(namespace)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	if _, err := action.NewGet(cfg).Run(name); errors.Is(err, driver.ErrReleaseNotFound) {
-		return false, nil
+	rel, err := action.NewGet(cfg).Run(name)
+	if errors.Is(err, driver.ErrReleaseNotFound) {
+		return nil, nil
 	} else if err != nil {
-		return false, err
+		return nil, err
 	}
-	return true, nil
+	out := &Release{}
+	if rel.Info != nil {
+		out.Status, out.Description = rel.Info.Status.String(), rel.Info.Description
+	}
+	return out, nil
 }
 
-// Install installs chart as name in namespace without waiting; Ensure polls readiness.
+// Install installs chart as name in namespace without waiting; Ensure polls readiness. The
+// namespace must exist: Ensure creates it with its owner annotation.
 func (h *Helm) Install(ctx context.Context, namespace, name string, chart []byte, values map[string]any) error {
 	cfg, err := h.configuration(namespace)
 	if err != nil {
@@ -68,7 +74,6 @@ func (h *Helm) Install(ctx context.Context, namespace, name string, chart []byte
 	install := action.NewInstall(cfg)
 	install.ReleaseName = name
 	install.Namespace = namespace
-	install.CreateNamespace = true
 	_, err = install.RunWithContext(ctx, ch, values)
 	return err
 }

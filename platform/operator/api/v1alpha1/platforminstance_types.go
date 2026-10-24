@@ -32,7 +32,8 @@ const TargetVCluster TargetType = "vcluster"
 type DeletionPolicy string
 
 const (
-	// DeletionDelete uninstalls the platform and deletes the target cluster and its data.
+	// DeletionDelete deletes the target cluster, with the platform and the cluster's own data
+	// volume. Tenant data under storageRoot stays on the node (see the README).
 	DeletionDelete DeletionPolicy = "Delete"
 	// DeletionRetain removes the PlatformInstance but keeps the target cluster, its data and
 	// the install state, so a PlatformInstance with the same name picks them up again.
@@ -43,7 +44,10 @@ const (
 // +kubebuilder:validation:Enum=existing;kube-router
 type NetworkPolicyEngine string
 
-// PlatformInstanceSpec is the desired platform instance.
+// PlatformInstanceSpec is the desired platform instance. The target and storageRoot are fixed at
+// creation: the operator would otherwise lose track of the cluster and data it made.
+// +kubebuilder:validation:XValidation:rule="self.target == oldSelf.target",message="target is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.platform) && has(self.platform.storageRoot) ? has(oldSelf.platform) && has(oldSelf.platform.storageRoot) && oldSelf.platform.storageRoot == self.platform.storageRoot : !(has(oldSelf.platform) && has(oldSelf.platform.storageRoot))",message="platform.storageRoot is immutable"
 type PlatformInstanceSpec struct {
 	// Version is the exact @di-framework/platform package version to install, for example 6.0.17.
 	// +kubebuilder:validation:Pattern=`^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$`
@@ -94,6 +98,13 @@ type GatewaySettings struct {
 	// +kubebuilder:validation:Maximum=32767
 	// +optional
 	HTTPNodePort int32 `json:"httpNodePort,omitempty"`
+
+	// HTTPEndpoint is the gateway's public base URL, for example http://apps.example:30080. The
+	// platform derives route URLs from it, and status.endpoints.http reports it. The operator
+	// can't know how the gateway is reached from outside, so it is set here.
+	// +kubebuilder:validation:Pattern=`^https?://`
+	// +optional
+	HTTPEndpoint string `json:"httpEndpoint,omitempty"`
 }
 
 // Phase is the instance's coarse lifecycle state.
@@ -175,6 +186,7 @@ type SecretReference struct {
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // PlatformInstance is one isolated copy of the di-framework platform.
+// +kubebuilder:validation:XValidation:rule="self.metadata.name.size() <= 63",message="name must be at most 63 characters"
 type PlatformInstance struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

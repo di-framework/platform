@@ -42,12 +42,14 @@ func (f *fakeTarget) Delete(context.Context, *v1alpha1.PlatformInstance) (bool, 
 
 type fakeInstaller struct {
 	err        error
+	deadline   bool
 	installs   []installer.Request
 	options    []installer.Options
 	uninstalls []installer.UninstallOptions
 }
 
-func (f *fakeInstaller) Install(_ context.Context, req installer.Request, opts installer.Options) (installer.Result, error) {
+func (f *fakeInstaller) Install(ctx context.Context, req installer.Request, opts installer.Options) (installer.Result, error) {
+	_, f.deadline = ctx.Deadline()
 	f.installs, f.options = append(f.installs, req), append(f.options, opts)
 	return installer.Result{KubernetesEndpoint: "https://k", HTTPEndpoint: "http://h"}, f.err
 }
@@ -182,7 +184,7 @@ func TestInstallRequest(t *testing.T) {
 	req := h.in.installs[0]
 	want := map[string]any{
 		"namespace": "wasmcloud", "networkPolicyEngine": "existing", "httpNodePort": 0,
-		"storageRoot": "/var/lib/kubesolo/instances/team-a-one", "kubernetesEndpoint": "https://vcluster.pi-team-a-one.svc:443",
+		"storageRoot": "/var/lib/kubesolo/instances/team-a/one", "kubernetesEndpoint": "https://vcluster.pi-team-a-one.svc:443",
 	}
 	if req.ID != "team-a.one" || req.Version != "6.0.17" || !reflect.DeepEqual(req.Settings, want) {
 		t.Fatalf("install request %+v", req)
@@ -245,6 +247,72 @@ func TestInstallFailureIsReadable(t *testing.T) {
 	h.reconcile()
 	if inst = h.get(); inst.Status.Phase != v1alpha1.PhaseReady {
 		t.Fatalf("recovered status %+v", inst.Status)
+	}
+}
+
+func TestFailedRetryAfterAnUpgradeIsARetry(t *testing.T) {
+	h, _ := installedHarness(t)
+	inst := h.get()
+	inst.Spec.Version = "6.0.18"
+	inst.Generation = 2
+	if err := h.c.Update(context.Background(), inst); err != nil {
+		t.Fatal(err)
+	}
+	h.in.err = errors.New("npm install failed")
+	_, _ = h.r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+	h.in.err = nil
+	h.reconcile()
+	if r := conditionReason(h.get(), v1alpha1.ConditionInstalled); r != plan.ReasonRetry || !h.in.options[2].Refresh {
+		t.Fatalf("retry reason %q options %+v", r, h.in.options)
+	}
+}
+
+// A target that stops answering for a while (control plane restart) must not leave the instance
+// Failed or Provisioning until the next repair once it answers again.
+func TestReadyComesBackAfterATargetBlip(t *testing.T) {
+	h, _ := installedHarness(t)
+	h.tg.state = targets.State{Reason: "ControlPlanePending", Message: "vcluster control plane not ready"}
+	h.reconcile()
+	if inst := h.get(); inst.Status.Phase != v1alpha1.PhaseProvisioning || inst.Status.KubeconfigSecretRef != nil {
+		t.Fatalf("blip status %+v", inst.Status)
+	}
+	h.readyTarget()
+	h.now = h.now.Add(time.Minute)
+	res := h.reconcile()
+	inst := h.get()
+	if inst.Status.Phase != v1alpha1.PhaseReady || inst.Status.KubeconfigSecretRef == nil ||
+		!meta.IsStatusConditionTrue(inst.Status.Conditions, v1alpha1.ConditionReady) ||
+		!meta.IsStatusConditionTrue(inst.Status.Conditions, v1alpha1.ConditionTargetReady) {
+		t.Fatalf("status after the blip %+v", inst.Status)
+	}
+	if len(h.in.installs) != 1 || res.RequeueAfter != 29*time.Minute {
+		t.Fatalf("recovery reinstalled (%d) or requeued %v", len(h.in.installs), res.RequeueAfter)
+	}
+}
+
+func TestHTTPEndpointIsPassedToTheInstall(t *testing.T) {
+	h := newHarness(t, "")
+	inst := h.get()
+	inst.Spec.Platform.Gateway.HTTPEndpoint = "http://apps.example:30080"
+	if err := h.c.Update(context.Background(), inst); err != nil {
+		t.Fatal(err)
+	}
+	h.readyTarget()
+	h.reconcile()
+	h.reconcile()
+	if got := h.in.installs[0].Settings["httpEndpoint"]; got != "http://apps.example:30080" {
+		t.Fatalf("httpEndpoint setting %v", got)
+	}
+}
+
+func TestInstallTimeoutBoundsTheInstall(t *testing.T) {
+	h := newHarness(t, "")
+	h.r.InstallTimeout = time.Minute
+	h.readyTarget()
+	h.reconcile()
+	h.reconcile()
+	if !h.in.deadline {
+		t.Fatal("install ran without a deadline")
 	}
 }
 

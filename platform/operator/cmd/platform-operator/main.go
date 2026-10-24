@@ -10,9 +10,13 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -39,6 +43,7 @@ func run() error {
 		storageRootBase = flag.String("storage-root-base", "/var/lib/kubesolo/instances", "node directory under which each instance gets its own storageRoot")
 		repairInterval  = flag.Duration("repair-interval", 30*time.Minute, "how often a ready instance gets a refresh and up to repair drift")
 		targetPoll      = flag.Duration("target-poll", 10*time.Second, "how often to check a target that is still coming up")
+		installTimeout  = flag.Duration("install-timeout", 30*time.Minute, "longest one install or repair may run before it is cancelled and retried")
 		concurrency     = flag.Int("max-concurrent-installs", 2, "instances reconciled in parallel")
 		leaderElect     = flag.Bool("leader-elect", true, "run one active operator through a Lease")
 		metricsAddr     = flag.String("metrics-bind-address", ":8080", "metrics endpoint")
@@ -70,6 +75,13 @@ func run() error {
 		HealthProbeBindAddress: *probeAddr,
 		LeaderElection:         *leaderElect,
 		LeaderElectionID:       "platform-operator.platform.di-framework.dev",
+		// The watch on owned Secrets sees only the operator's kubeconfig Secrets, and Secret and
+		// Service reads (vCluster's kubeconfig, the host DNS Service) go to the API server, so
+		// the operator never caches the cluster's other Secrets, Helm releases among them.
+		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
+			&corev1.Secret{}: {Label: labels.SelectorFromSet(controller.ManagedLabels)},
+		}},
+		Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}, &corev1.Service{}}}},
 	})
 	if err != nil {
 		return err
@@ -92,6 +104,7 @@ func run() error {
 		Plan:            plan.Config{RepairInterval: *repairInterval, TargetPoll: *targetPoll},
 		StorageRootBase: *storageRootBase,
 		MaxConcurrent:   *concurrency,
+		InstallTimeout:  *installTimeout,
 	}
 	if err := r.SetupWithManager(mgr); err != nil {
 		return err

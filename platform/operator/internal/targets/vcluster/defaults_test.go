@@ -120,7 +120,7 @@ func TestEnsureUsesTheHostDNSService(t *testing.T) {
 		t.Fatalf("Corefile does not forward to the host DNS:\n%s", corefile)
 	}
 	sans := normalize(t, helm.installed[HostNamespace(inst)])["controlPlane"].(map[string]any)["proxy"].(map[string]any)["extraSANs"]
-	if !strings.Contains(fmt.Sprint(sans), "vcluster.pi-team-a-one.svc ") {
+	if !strings.Contains(fmt.Sprint(sans), "vcluster."+HostNamespace(inst)+".svc ") {
 		t.Fatalf("proxy SANs %v lack the .svc name the kubeconfig uses", sans)
 	}
 

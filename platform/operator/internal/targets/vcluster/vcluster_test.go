@@ -19,12 +19,18 @@ import (
 
 type fakeHelm struct {
 	installed   map[string]map[string]any // namespace -> values
+	status      map[string]string         // namespace -> release status; unset is deployed
 	uninstalled []string
 }
 
-func (f *fakeHelm) Exists(_ context.Context, ns, _ string) (bool, error) {
-	_, ok := f.installed[ns]
-	return ok, nil
+func (f *fakeHelm) Get(_ context.Context, ns, _ string) (*Release, error) {
+	if _, ok := f.installed[ns]; !ok {
+		return nil, nil
+	}
+	if st, ok := f.status[ns]; ok {
+		return &Release{Status: st, Description: "boom"}, nil
+	}
+	return &Release{Status: "deployed"}, nil
 }
 func (f *fakeHelm) Install(_ context.Context, ns, name string, chart []byte, values map[string]any) error {
 	if name != ReleaseName || len(chart) == 0 {
@@ -37,6 +43,10 @@ func (f *fakeHelm) Uninstall(_ context.Context, ns, _ string) error {
 	f.uninstalled = append(f.uninstalled, ns)
 	delete(f.installed, ns)
 	return nil
+}
+
+func ownedNamespace(inst *v1alpha1.PlatformInstance) *corev1.Namespace {
+	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: HostNamespace(inst), Annotations: map[string]string{OwnerAnnotation: inst.Namespace + "/" + inst.Name}}}
 }
 
 func instance(ns, name string) *v1alpha1.PlatformInstance {
@@ -127,13 +137,57 @@ func TestEnsure(t *testing.T) {
 	if len(helm.installed) != 1 {
 		t.Fatalf("installed more than once: %v", helm.installed)
 	}
+	var namespace corev1.Namespace
+	if err := c.Get(ctx, client.ObjectKey{Name: ns}, &namespace); err != nil || namespace.Annotations[OwnerAnnotation] != "team-a/one" {
+		t.Fatalf("host namespace not annotated with its owner: %v %v", namespace.Annotations, err)
+	}
+}
+
+func TestEnsureReinstallsAFailedRelease(t *testing.T) {
+	for _, status := range []string{"failed", "pending-install"} {
+		inst := instance("team-a", "one")
+		ns := HostNamespace(inst)
+		helm := &fakeHelm{installed: map[string]map[string]any{ns: {}}, status: map[string]string{ns: status}}
+		tg := &Target{Client: newClient(t, ownedNamespace(inst)), Helm: helm, Values: func(context.Context, *v1alpha1.PlatformInstance) (map[string]any, error) {
+			return map[string]any{}, nil
+		}}
+		st, err := tg.Ensure(context.Background(), inst)
+		if err != nil || st.Reason != "Reinstalling" || !strings.Contains(st.Message, status) || len(helm.uninstalled) != 1 {
+			t.Fatalf("%s release: %+v %v (uninstalled %v)", status, st, err, helm.uninstalled)
+		}
+		delete(helm.status, ns)
+		if st, err = tg.Ensure(context.Background(), inst); err != nil || st.Reason != "Creating" {
+			t.Fatalf("%s release, second Ensure: %+v %v", status, st, err)
+		}
+	}
+}
+
+// team-a/one and team/a-one join to the same string; they must get different host namespaces,
+// and neither may touch a namespace the other owns.
+func TestInstancesNeverShareAHostNamespace(t *testing.T) {
+	a, b := instance("team-a", "one"), instance("team", "a-one")
+	if HostNamespace(a) == HostNamespace(b) {
+		t.Fatalf("both instances map to %s", HostNamespace(a))
+	}
+
+	// A namespace claimed by another instance (as a name collision would produce) is refused.
+	theirs := ownedNamespace(b)
+	theirs.Name = HostNamespace(a)
+	helm := &fakeHelm{installed: map[string]map[string]any{theirs.Name: {}}}
+	tg := &Target{Client: newClient(t, theirs), Helm: helm}
+	if _, err := tg.Ensure(context.Background(), a); err == nil || !strings.Contains(err.Error(), "team/a-one") {
+		t.Fatalf("Ensure into another instance's namespace: %v", err)
+	}
+	if done, err := tg.Delete(context.Background(), a); err == nil || done || len(helm.uninstalled) != 0 {
+		t.Fatalf("Delete of another instance's namespace: done=%v %v (uninstalled %v)", done, err, helm.uninstalled)
+	}
 }
 
 func TestDelete(t *testing.T) {
 	inst := instance("team-a", "one")
 	ns := HostNamespace(inst)
 	helm := &fakeHelm{installed: map[string]map[string]any{ns: {}}}
-	c := newClient(t, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+	c := newClient(t, ownedNamespace(inst))
 	tg := &Target{Client: c, Helm: helm}
 
 	done, err := tg.Delete(context.Background(), inst)
@@ -150,12 +204,20 @@ func TestDelete(t *testing.T) {
 }
 
 func TestHostNamespace(t *testing.T) {
-	if got := HostNamespace(instance("team-a", "one")); got != "pi-team-a-one" {
+	if got := HostNamespace(instance("team-a", "one")); !strings.HasPrefix(got, "pi-team-a-one-") || len(got) != len("pi-team-a-one-")+10 {
 		t.Fatalf("short name %q", got)
+	}
+	if got := HostNamespace(instance("team-a", "web.v2")); !strings.HasPrefix(got, "pi-team-a-web-v2-") {
+		t.Fatalf("dotted name %q", got)
 	}
 	long := HostNamespace(instance(strings.Repeat("n", 40), strings.Repeat("m", 40)))
 	other := HostNamespace(instance(strings.Repeat("n", 40), strings.Repeat("m", 39)+"x"))
 	if len(long) > 63 || long == other || !strings.HasPrefix(long, "pi-") {
 		t.Fatalf("long names %q / %q", long, other)
+	}
+	// Cutting at a dash must not leave a double dash before the hash.
+	dash := HostNamespace(instance(strings.Repeat("n", 48), "m"))
+	if strings.Contains(dash, "--") || len(dash) > 63 {
+		t.Fatalf("cut at a dash: %q", dash)
 	}
 }

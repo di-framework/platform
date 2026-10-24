@@ -63,6 +63,10 @@ type Config struct {
 	TargetPoll time.Duration
 }
 
+// ReasonRetry is the Install reason after a failed install or upgrade. The controller refreshes
+// before retrying.
+const ReasonRetry = "Retry"
+
 // Decision is the next action and, for Wait, when to look again.
 type Decision struct {
 	Action       Action
@@ -105,12 +109,12 @@ func installReason(o Observation) string {
 	switch {
 	case !o.Installed && o.InstalledVersion == "":
 		return "FirstInstall"
+	case !o.Installed:
+		return ReasonRetry
 	case o.InstalledVersion != o.DesiredVersion:
 		return "VersionChanged"
-	case o.InstalledGeneration != o.Generation:
+	default: // Next only installs when something differs; here it is the generation.
 		return "SpecChanged"
-	default:
-		return "Reinstall"
 	}
 }
 

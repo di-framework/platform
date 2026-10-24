@@ -9,6 +9,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -44,11 +45,23 @@ func Chart() ([]byte, error) {
 	return chartArchive, nil
 }
 
+// OwnerAnnotation on a host namespace names the PlatformInstance ("<namespace>/<name>") it
+// belongs to. The target never installs into or deletes a namespace another instance owns.
+const OwnerAnnotation = "platform.di-framework.dev/instance"
+
+// Release is what the target needs to know about an installed Helm release.
+type Release struct {
+	// Status is Helm's release status: deployed, failed, pending-install and so on.
+	Status string
+	// Description is Helm's note on the last operation, which carries the failure.
+	Description string
+}
+
 // Releaser is the Helm surface the target uses.
 type Releaser interface {
-	// Exists reports whether the release is installed in namespace.
-	Exists(ctx context.Context, namespace, name string) (bool, error)
-	// Install installs the chart archive as name in namespace, creating the namespace.
+	// Get returns the release, or nil when there is none.
+	Get(ctx context.Context, namespace, name string) (*Release, error)
+	// Install installs the chart archive as name in the existing namespace.
 	Install(ctx context.Context, namespace, name string, chart []byte, values map[string]any) error
 	// Uninstall removes the release; a missing release is not an error.
 	Uninstall(ctx context.Context, namespace, name string) error
@@ -70,14 +83,19 @@ type Target struct {
 var _ targets.Target = (*Target)(nil)
 
 // Ensure installs the vCluster once and reports it ready when its control plane is ready and
-// its kubeconfig Secret exists. Values are applied at creation only (see InstanceValues).
+// its kubeconfig Secret exists. Values are applied at creation only (see InstanceValues). A
+// release left failed or pending (an install that errored or was interrupted) is removed so the
+// next round installs it again.
 func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (targets.State, error) {
 	ns := HostNamespace(inst)
-	exists, err := t.Helm.Exists(ctx, ns, ReleaseName)
+	if err := t.claimNamespace(ctx, inst, ns); err != nil {
+		return targets.State{}, err
+	}
+	rel, err := t.Helm.Get(ctx, ns, ReleaseName)
 	if err != nil {
 		return targets.State{}, fmt.Errorf("look up vcluster release: %w", err)
 	}
-	if !exists {
+	if rel == nil {
 		chart, err := Chart()
 		if err != nil {
 			return targets.State{}, err
@@ -90,6 +108,12 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 			return targets.State{}, fmt.Errorf("install vcluster %s: %w", ChartVersion, err)
 		}
 		return targets.State{Reason: "Creating", Message: fmt.Sprintf("installed vcluster %s in namespace %s", ChartVersion, ns)}, nil
+	}
+	if rel.Status != "deployed" {
+		if err := t.Helm.Uninstall(ctx, ns, ReleaseName); err != nil {
+			return targets.State{}, fmt.Errorf("remove %s vcluster release: %w", rel.Status, err)
+		}
+		return targets.State{Reason: "Reinstalling", Message: fmt.Sprintf("vcluster release was %s (%s); removed it to install again", rel.Status, rel.Description)}, nil
 	}
 
 	var sts appsv1.StatefulSet
@@ -135,14 +159,46 @@ func (t *Target) values(ctx context.Context, inst *v1alpha1.PlatformInstance) (m
 	return InstanceValues(svc.Spec.ClusterIP, HostNamespace(inst))
 }
 
+// claimNamespace creates the host namespace annotated with its owner, or checks that an existing
+// one belongs to inst.
+func (t *Target) claimNamespace(ctx context.Context, inst *v1alpha1.PlatformInstance, ns string) error {
+	var namespace corev1.Namespace
+	err := t.Client.Get(ctx, types.NamespacedName{Name: ns}, &namespace)
+	if apierrors.IsNotFound(err) {
+		namespace = corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+			Name:        ns,
+			Labels:      map[string]string{"app.kubernetes.io/managed-by": "platform-operator"},
+			Annotations: map[string]string{OwnerAnnotation: owner(inst)},
+		}}
+		return client.IgnoreAlreadyExists(t.Client.Create(ctx, &namespace))
+	}
+	if err != nil {
+		return err
+	}
+	return checkOwner(inst, &namespace)
+}
+
+func owner(inst *v1alpha1.PlatformInstance) string { return inst.Namespace + "/" + inst.Name }
+
+func checkOwner(inst *v1alpha1.PlatformInstance, namespace *corev1.Namespace) error {
+	if got := namespace.Annotations[OwnerAnnotation]; got != owner(inst) {
+		return fmt.Errorf("host namespace %s is not this instance's (%s=%q)", namespace.Name, OwnerAnnotation, got)
+	}
+	return nil
+}
+
 // Delete uninstalls the release and deletes the host namespace, which removes the vCluster's
-// data volume. Done is true once the namespace is gone.
+// data volume. Done is true once the namespace is gone. A namespace another instance owns is
+// left alone and reported as an error.
 func (t *Target) Delete(ctx context.Context, inst *v1alpha1.PlatformInstance) (bool, error) {
 	ns := HostNamespace(inst)
 	var namespace corev1.Namespace
 	if err := t.Client.Get(ctx, types.NamespacedName{Name: ns}, &namespace); apierrors.IsNotFound(err) {
 		return true, nil
 	} else if err != nil {
+		return false, err
+	}
+	if err := checkOwner(inst, &namespace); err != nil {
 		return false, err
 	}
 	if namespace.DeletionTimestamp == nil {
@@ -156,15 +212,17 @@ func (t *Target) Delete(ctx context.Context, inst *v1alpha1.PlatformInstance) (b
 	return false, nil
 }
 
-// HostNamespace is the instance's host namespace: pi-<namespace>-<name>, or a hashed form when
-// that exceeds the 63-character limit.
+// HostNamespace is the instance's host namespace: pi-<namespace>-<name>, with dots made dashes
+// and cut to fit 63 characters, then a hash of <namespace>/<name>. The hash keeps instances
+// apart whose names join to the same string (team-a/one and team/a-one).
 func HostNamespace(inst *v1alpha1.PlatformInstance) string {
-	name := "pi-" + inst.Namespace + "-" + inst.Name
-	if len(name) <= 63 {
-		return name
+	sum := sha256.Sum256([]byte(owner(inst)))
+	suffix := "-" + hex.EncodeToString(sum[:])[:10]
+	name := strings.ReplaceAll("pi-"+inst.Namespace+"-"+inst.Name, ".", "-")
+	if max := 63 - len(suffix); len(name) > max {
+		name = strings.TrimRight(name[:max], "-")
 	}
-	sum := sha256.Sum256([]byte(inst.Namespace + "/" + inst.Name))
-	return name[:54] + "-" + hex.EncodeToString(sum[:])[:8]
+	return name + suffix
 }
 
 // withServer points every cluster in a kubeconfig at server. vCluster's Secret addresses
