@@ -64,14 +64,22 @@ func TestDeletionPolicy(t *testing.T) {
 		policy        v1alpha1.DeletionPolicy
 		finalizer     bool
 		uninstallDone bool
+		mutate        func(*Observation)
 		want          Action
 		reason        string
+		after         time.Duration
 	}{
-		{"unset policy defaults to Delete", "", true, false, Uninstall, "Deleting"},
-		{"Delete uninstalls first", v1alpha1.DeletionDelete, true, false, Uninstall, "Deleting"},
-		{"Delete releases once uninstalled", v1alpha1.DeletionDelete, true, true, Release, "Uninstalled"},
-		{"Retain never uninstalls", v1alpha1.DeletionRetain, true, false, Release, "Retained"},
-		{"already released", v1alpha1.DeletionDelete, false, true, Wait, "Deleted"},
+		{"unset policy defaults to Delete", "", true, false, nil, Uninstall, "Deleting", 0},
+		{"Delete uninstalls first", v1alpha1.DeletionDelete, true, false, nil, Uninstall, "Deleting", 0},
+		{"Delete cleans the default storageRoot once uninstalled", v1alpha1.DeletionDelete, true, true, nil, CleanStorage, "CleaningStorage", 10 * time.Second},
+		{"unset policy cleans storage too", "", true, true, nil, CleanStorage, "CleaningStorage", 10 * time.Second},
+		{"storage cleanup waits for the uninstall", v1alpha1.DeletionDelete, true, false, func(o *Observation) { o.StorageCleaned = true }, Uninstall, "Deleting", 0},
+		{"Delete releases once storage is cleaned", v1alpha1.DeletionDelete, true, true, func(o *Observation) { o.StorageCleaned = true }, Release, "Uninstalled", 0},
+		{"a custom storageRoot is never cleaned", v1alpha1.DeletionDelete, true, true, func(o *Observation) { o.CustomStorageRoot = true }, Release, "CustomStorageKept", 0},
+		{"the skip annotation releases without cleaning", v1alpha1.DeletionDelete, true, true, func(o *Observation) { o.SkipStorageCleanup = true }, Release, "StorageCleanupSkipped", 0},
+		{"Retain never uninstalls", v1alpha1.DeletionRetain, true, false, nil, Release, "Retained", 0},
+		{"Retain never cleans storage", v1alpha1.DeletionRetain, true, true, nil, Release, "Retained", 0},
+		{"already released", v1alpha1.DeletionDelete, false, true, nil, Wait, "Deleted", 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -79,9 +87,12 @@ func TestDeletionPolicy(t *testing.T) {
 			o.Deleting, o.Policy, o.HasFinalizer, o.UninstallDone = true, tt.policy, tt.finalizer, tt.uninstallDone
 			// Deletion wins even while the target is down or an upgrade is pending.
 			o.TargetReady, o.DesiredVersion = false, "6.0.18"
+			if tt.mutate != nil {
+				tt.mutate(&o)
+			}
 			got := Next(o, cfg)
-			if got.Action != tt.want || got.Reason != tt.reason {
-				t.Fatalf("Next() = %+v, want %s/%s", got, tt.want, tt.reason)
+			if got.Action != tt.want || got.Reason != tt.reason || got.RequeueAfter != tt.after {
+				t.Fatalf("Next() = %+v, want %s/%s after %s", got, tt.want, tt.reason, tt.after)
 			}
 		})
 	}

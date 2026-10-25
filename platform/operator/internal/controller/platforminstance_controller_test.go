@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -90,8 +91,9 @@ func newHarness(t *testing.T, policy v1alpha1.DeletionPolicy) *harness {
 	h := &harness{t: t, c: c, tg: &fakeTarget{}, in: &fakeInstaller{}, now: time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)}
 	h.r = &Reconciler{
 		Client: c, Target: h.tg, Installer: h.in, StorageRootBase: "/var/lib/kubesolo/instances",
-		Plan: plan.Config{RepairInterval: 30 * time.Minute, TargetPoll: 10 * time.Second},
-		Now:  func() time.Time { return h.now },
+		CleanupNamespace: "platform-operator",
+		Plan:             plan.Config{RepairInterval: 30 * time.Minute, TargetPoll: 10 * time.Second},
+		Now:              func() time.Time { return h.now },
 	}
 	return h
 }
@@ -341,6 +343,12 @@ func TestDeletePolicyUninstallsThenReleases(t *testing.T) {
 	if len(h.in.uninstalls) != 1 || h.in.uninstalls[0].Destroy {
 		t.Fatalf("uninstall %+v: want one, without destroy (the target took everything)", h.in.uninstalls)
 	}
+	// The default storageRoot goes last; the finalizer holds until its Job completes.
+	if !containsFinalizer(h.get()) || h.cleanupJob() == nil {
+		t.Fatal("released before the storageRoot was cleaned")
+	}
+	h.finishCleanup(batchv1.JobComplete)
+	h.reconcile()
 	var inst v1alpha1.PlatformInstance
 	if err := h.c.Get(context.Background(), key, &inst); err == nil {
 		t.Fatalf("instance still present after release: %+v", inst.Finalizers)
@@ -356,8 +364,8 @@ func TestRetainPolicyKeepsEverything(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.reconcile()
-	if len(h.in.uninstalls) != 0 || h.tg.deletes != 0 {
-		t.Fatalf("Retain touched the target: uninstalls %d deletes %d", len(h.in.uninstalls), h.tg.deletes)
+	if len(h.in.uninstalls) != 0 || h.tg.deletes != 0 || h.jobCount() != 0 {
+		t.Fatalf("Retain touched the target or storage: uninstalls %d deletes %d jobs %d", len(h.in.uninstalls), h.tg.deletes, h.jobCount())
 	}
 	var inst v1alpha1.PlatformInstance
 	if err := h.c.Get(context.Background(), key, &inst); err == nil {

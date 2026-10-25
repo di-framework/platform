@@ -23,6 +23,9 @@ const (
 	Repair Action = "Repair"
 	// Uninstall removes the platform and the target cluster (DeletionPolicy Delete).
 	Uninstall Action = "Uninstall"
+	// CleanStorage removes the instance's default storageRoot from the node once Uninstall has
+	// finished (DeletionPolicy Delete). It never runs for a custom storageRoot.
+	CleanStorage Action = "CleanStorage"
 	// Release removes the finalizer and leaves the target cluster, its data and the install state
 	// in place (DeletionPolicy Retain, or after Uninstall finished).
 	Release Action = "Release"
@@ -38,6 +41,13 @@ type Observation struct {
 
 	// UninstallDone is true once Uninstall has removed the platform and the target.
 	UninstallDone bool
+	// CustomStorageRoot is true when spec.platform.storageRoot is set. The operator didn't create
+	// that path, so it never removes it.
+	CustomStorageRoot bool
+	// SkipStorageCleanup is true when the instance is annotated to keep its storageRoot.
+	SkipStorageCleanup bool
+	// StorageCleaned is true once the default storageRoot has been removed from the node.
+	StorageCleaned bool
 
 	// TargetReady is true when the target answered with a kubeconfig this round.
 	TargetReady bool
@@ -87,10 +97,16 @@ func Next(o Observation, c Config) Decision {
 			return Decision{Action: Wait, Reason: "Deleted"}
 		case policy(o.Policy) == v1alpha1.DeletionRetain:
 			return Decision{Action: Release, Reason: "Retained"}
-		case o.UninstallDone:
-			return Decision{Action: Release, Reason: "Uninstalled"}
-		default:
+		case !o.UninstallDone:
 			return Decision{Action: Uninstall, Reason: "Deleting"}
+		case o.CustomStorageRoot:
+			return Decision{Action: Release, Reason: "CustomStorageKept"}
+		case o.SkipStorageCleanup:
+			return Decision{Action: Release, Reason: "StorageCleanupSkipped"}
+		case !o.StorageCleaned:
+			return Decision{Action: CleanStorage, RequeueAfter: c.TargetPoll, Reason: "CleaningStorage"}
+		default:
+			return Decision{Action: Release, Reason: "Uninstalled"}
 		}
 	}
 	if !o.HasFinalizer {

@@ -48,18 +48,37 @@ kubeconfig is in the Secret named by `status.kubeconfigSecretRef` (`<name>-kubec
    answers again after a blip goes straight back to `Ready`.
 5. **Delete.** `Delete` uninstalls the vCluster and deletes its host namespace (and so the vCluster's data
    volume and everything the platform installed), drops the instance's install state without a `destroy`,
-   then releases the finalizer. **Tenant data under `storageRoot` (the platform's registry and tenant
-   volumes, node `hostPath`s) stays on the node**, and a new PlatformInstance with the same namespace and name
-   gets the same default `storageRoot` and finds it. Remove `<storage-root-base>/<namespace>/<name>` by hand
-   when that data must go; an operator-run cleanup is follow-up work. `Retain` releases the finalizer and
-   leaves the vCluster, its data and the install state, so a new PlatformInstance with the same name and
-   namespace picks them up again.
+   then removes the instance's default `storageRoot` from the node (see below), then releases the finalizer.
+   A new PlatformInstance with the same namespace and name starts empty. `Retain` releases the finalizer and
+   leaves the vCluster, its data, the install state and the `storageRoot`, so a new PlatformInstance with the
+   same name and namespace picks them up again.
 
 `spec.target` and `spec.platform.storageRoot` can't change after creation, and names are at most 63
 characters.
 
 Status carries `phase` (`Provisioning`, `Installing`, `Ready`, `Failed`, `Deleting`) and the `TargetReady`,
 `Installed` and `Ready` conditions, each with a readable reason and message.
+
+### Tenant data after Delete
+
+The platform keeps tenant data (registry blobs, tenant volumes, pglite `PGDATA`) in node `hostPath`s under
+the instance's `storageRoot`, so deleting the vCluster doesn't remove it. With `deletionPolicy: Delete`, once
+the target is gone the operator runs a short-lived Job (`pi-storage-cleanup-<hash>`, in `--cleanup-namespace`)
+that mounts `--storage-root-base` from the node and runs `rm -rf` of exactly `<namespace>/<name>` under it. The
+path is checked first (no empty parts, no `..`, no `/`, an absolute base other than `/`), the command has no
+shell, and the image is busybox pinned by digest. The finalizer holds until the Job succeeds; the operator then
+deletes the Job.
+
+- **A custom `spec.platform.storageRoot` is never removed.** The operator didn't create that path and can't
+  know what else lives there. Remove it yourself when its data must go.
+- **A failed cleanup** (the Job fails, or its pod can't start within 5 minutes) sets `Installed` to `False`
+  with reason `StorageCleanupFailed` and a message naming the path, deletes the failed Job and retries with
+  backoff. The finalizer stays meanwhile.
+- **The way out**, when the node can't run the cleanup: annotate the instance with
+  `platform.di-framework.dev/skip-storage-cleanup: "true"` (or set `deletionPolicy: Retain`). The finalizer
+  is then released and the directory stays on the node.
+- **Single node only** (as all of v1alpha1). The Job isn't pinned to a node; on one node it runs where the
+  data is.
 
 ### One install per instance
 
@@ -119,10 +138,12 @@ The operator needs:
   NetworkPolicy.
 - **egress to npm, the Pulumi plugin host and the platform's images**, since each install runs `npm install`
   and fetches the Pulumi Kubernetes provider plugin.
+- **a namespace that admits a `hostPath` pod** for the storage cleanup Job: `--cleanup-namespace`, which
+  defaults to the operator's own namespace (read from its service account). Run outside a cluster, set it.
 
 The operator caches only the Secrets it labels (`app.kubernetes.io/managed-by: platform-operator`, its
-instances' kubeconfig Secrets) and reads other Secrets and Services straight from the API server, so it never
-holds the cluster's Helm release Secrets in memory.
+instances' kubeconfig Secrets) and reads other Secrets, Services and its cleanup Jobs straight from the API
+server, so it never holds the cluster's Helm release Secrets in memory.
 
 ```sh
 make generate   # DeepCopy, CRD and ClusterRole from the markers
