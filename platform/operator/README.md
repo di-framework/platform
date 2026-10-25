@@ -31,10 +31,12 @@ kubeconfig is in the Secret named by `status.kubeconfigSecretRef` (`<name>-kubec
 1. **Finalizer.** Added before anything is created, so a delete never orphans a cluster.
 2. **Target.** Creates the host namespace `pi-<namespace>-<name>-<hash>` (the hash of `<namespace>/<name>`
    keeps `team-a/one` and `team/a-one` apart; dots become dashes and long names are cut to fit), annotated
-   `platform.di-framework.dev/instance: <namespace>/<name>`. The operator refuses to install into or delete a
-   namespace whose annotation names another instance. It installs vCluster from the embedded, digest-checked
+   `platform.di-framework.dev/instance: <namespace>/<name>`. The operator refuses to install into a namespace
+   whose annotation names anyone else, and on delete leaves such a namespace alone and releases the
+   finalizer. It installs vCluster from the embedded, digest-checked
    chart (0.37.3), then waits for its control plane and kubeconfig Secret. A release left `failed` or
-   `pending-install` (an install that errored or was interrupted) is removed and installed again. The
+   `pending-install` (an install that errored or was interrupted) is removed and installed again, with
+   backoff, so an install that fails every time doesn't cycle every poll. The
    kubeconfig is rewritten to the in-cluster Service address and stored in the instance's Secret.
 3. **Install.** On first install, a version change, any spec change or a retry after a failed install (which
    refreshes first), it writes a Pulumi project for the

@@ -230,6 +230,7 @@ func (r *Reconciler) observe(inst *v1alpha1.PlatformInstance) plan.Observation {
 		DesiredVersion:   inst.Spec.Version,
 		InstalledVersion: inst.Status.InstalledVersion,
 		Installed:        installed,
+		InstallAttempted: meta.FindStatusCondition(inst.Status.Conditions, v1alpha1.ConditionInstalled) != nil,
 		Now:              r.now(),
 	}
 	if installed {

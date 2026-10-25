@@ -78,10 +78,11 @@ func run() error {
 		// The watch on owned Secrets sees only the operator's kubeconfig Secrets, and Secret and
 		// Service reads (vCluster's kubeconfig, the host DNS Service) go to the API server, so
 		// the operator never caches the cluster's other Secrets, Helm releases among them.
+		// Namespace reads go there too, so the host namespace owner check never sees a stale copy.
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
 			&corev1.Secret{}: {Label: labels.SelectorFromSet(controller.ManagedLabels)},
 		}},
-		Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}, &corev1.Service{}}}},
+		Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}, &corev1.Service{}, &corev1.Namespace{}}}},
 	})
 	if err != nil {
 		return err

@@ -242,11 +242,15 @@ func TestInstallFailureIsReadable(t *testing.T) {
 		c.Message != "FirstInstall of 6.0.17 failed: kubernetes API unreachable" {
 		t.Fatalf("failure status %+v", inst.Status)
 	}
-	// The next success replaces the failure.
+	// The retry refreshes first (the failed run may have created resources), and its success
+	// replaces the failure.
 	h.in.err = nil
 	h.reconcile()
 	if inst = h.get(); inst.Status.Phase != v1alpha1.PhaseReady {
 		t.Fatalf("recovered status %+v", inst.Status)
+	}
+	if len(h.in.options) != 2 || !h.in.options[1].Refresh || conditionReason(inst, v1alpha1.ConditionInstalled) != plan.ReasonRetry {
+		t.Fatalf("retry options %+v reason %q", h.in.options, conditionReason(inst, v1alpha1.ConditionInstalled))
 	}
 }
 

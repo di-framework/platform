@@ -38,6 +38,9 @@ func TestNext(t *testing.T) {
 		{"version bump upgrades in place", func(o *Observation) { o.DesiredVersion, o.Generation = "6.0.18", 4 }, Install, "VersionChanged", 0},
 		{"settings change reinstalls", func(o *Observation) { o.Generation = 4 }, Install, "SpecChanged", 0},
 		{"failed install is retried", func(o *Observation) { o.Installed = false }, Install, ReasonRetry, 0},
+		{"failed first install is retried", func(o *Observation) {
+			o.Installed, o.InstalledVersion, o.InstallAttempted = false, "", true
+		}, Install, ReasonRetry, 0},
 		{"ready and recently repaired waits for the next repair", func(o *Observation) {}, Wait, "Ready", 20 * time.Minute},
 		{"repair is due", func(o *Observation) { o.LastRepair = now.Add(-30 * time.Minute) }, Repair, "RepairDue", 0},
 		{"never repaired", func(o *Observation) { o.LastRepair = time.Time{} }, Repair, "RepairDue", 0},

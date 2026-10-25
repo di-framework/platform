@@ -49,6 +49,9 @@ type Observation struct {
 	DesiredVersion      string
 	InstalledVersion    string
 	Installed           bool
+	// InstallAttempted is true once an install has run, whether or not it succeeded (the
+	// Installed condition is present).
+	InstallAttempted bool
 
 	// LastRepair is when the last install or repair finished; zero if never.
 	LastRepair time.Time
@@ -63,8 +66,8 @@ type Config struct {
 	TargetPoll time.Duration
 }
 
-// ReasonRetry is the Install reason after a failed install or upgrade. The controller refreshes
-// before retrying.
+// ReasonRetry is the Install reason after a failed install, first or later. The controller
+// refreshes before retrying: the failed run (or a timeout) may have created resources.
 const ReasonRetry = "Retry"
 
 // Decision is the next action and, for Wait, when to look again.
@@ -107,7 +110,7 @@ func Next(o Observation, c Config) Decision {
 
 func installReason(o Observation) string {
 	switch {
-	case !o.Installed && o.InstalledVersion == "":
+	case !o.Installed && o.InstalledVersion == "" && !o.InstallAttempted:
 		return "FirstInstall"
 	case !o.Installed:
 		return ReasonRetry
