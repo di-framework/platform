@@ -17,6 +17,8 @@ const ROLE = join(operator, 'config', 'rbac', 'role.yaml');
 const HEADLAMP_SHA256 = 'faa471a8c5c55125b3dceed1cf73000e1ced18f07e2088e5e12e75292fb9ae62';
 const DIGEST = `sha256:${'a'.repeat(64)}`;
 const KEEP = { 'helm.sh/resource-policy': 'keep' };
+/** The passphrase Secret the offline renders mount (`helm template` cannot reach a cluster). */
+const PASSPHRASE = 'platform-operator-passphrase';
 
 type Doc = {
   apiVersion: string;
@@ -46,10 +48,23 @@ async function run(args: string[]): Promise<{ code: number; stdout: string; stde
   return { code, stdout, stderr };
 }
 
-async function template(...set: string[]): Promise<Doc[]> {
+/** `helm template` with only the given --set values: no cluster, so lookup sees nothing. */
+function offline(...set: string[]) {
   const args = ['template', 'platform-operator', chart, '--namespace', 'platform-operator'];
   for (const value of set) args.push('--set', value);
-  const out = await run(args);
+  return run(args);
+}
+
+/**
+ * Renders offline with a valid digest and an existing passphrase Secret, the two values an offline
+ * render needs; `set` comes after them, so it can override either.
+ */
+async function template(...set: string[]): Promise<Doc[]> {
+  const out = await offline(
+    `image.digest=${DIGEST}`,
+    `passphrase.existingSecret=${PASSPHRASE}`,
+    ...set,
+  );
   if (out.code !== 0) throw new Error(`helm template failed: ${out.stderr}`);
   return docs(out.stdout);
 }
@@ -89,7 +104,6 @@ describe('platform-operator chart', () => {
       'CustomResourceDefinition',
       'Deployment',
       'PersistentVolumeClaim',
-      'Secret',
       'ServiceAccount',
     ]);
     expect(JSON.stringify(rendered)).not.toContain('headlamp');
@@ -177,10 +191,8 @@ describe('platform-operator chart', () => {
     expect(names.sort()).toEqual(
       defined.filter((f) => f !== 'npm' && f !== 'cleanup-namespace').sort(),
     );
-    expect(container.env).toContainEqual({
-      name: 'POD_NAMESPACE',
-      valueFrom: { fieldRef: { fieldPath: 'metadata.namespace' } },
-    });
+    // Nothing reads POD_NAMESPACE: the operator takes its namespace from the ServiceAccount.
+    expect(container.env).toBeUndefined();
     expect(args).toContain('--state-dir=/var/lib/platform-operator');
     expect(args).toContain('--passphrase-file=/etc/platform-operator/passphrase');
     expect(args).toContain('--storage-root-base=/var/lib/kubesolo/instances');
@@ -235,33 +247,112 @@ describe('platform-operator chart', () => {
     expect(pinned.spec.template.spec.containers[0].image).toBe(
       `ghcr.io/di-framework/platform-operator@${DIGEST}`,
     );
-    const tagged = await run([
-      'template',
-      'platform-operator',
-      chart,
-      '--set',
-      'image.digest=latest',
-    ]);
-    expect(tagged.code).not.toBe(0);
-    expect(tagged.stderr).toContain('image.digest must be a sha256 digest');
+    const rejected = [
+      'latest',
+      values.image.digest,
+      'sha256:zz',
+      `sha256:${'a'.repeat(63)}`,
+      `sha256:${'a'.repeat(65)}`,
+      `sha256:${'A'.repeat(64)}`,
+      `x${DIGEST}`,
+    ];
+    for (const digest of rejected) {
+      const out = await offline(
+        `passphrase.existingSecret=${PASSPHRASE}`,
+        `image.digest=${digest}`,
+      );
+      expect(out.code).not.toBe(0);
+      expect(out.stderr).toContain('image.digest must be a sha256 digest');
+    }
+  }, 60000);
+
+  test('the default values do not install: the placeholder digest fails the render', async () => {
+    const out = await offline(`passphrase.existingSecret=${PASSPHRASE}`);
+    expect(out.code).not.toBe(0);
+    expect(out.stderr).toContain('image.digest must be a sha256 digest');
+  }, 60000);
+
+  test('replicaCount > 1 requires leader election', async () => {
+    const out = await offline(
+      `image.digest=${DIGEST}`,
+      `passphrase.existingSecret=${PASSPHRASE}`,
+      'replicaCount=2',
+      'leaderElect=false',
+    );
+    expect(out.code).not.toBe(0);
+    expect(out.stderr).toContain('replicaCount > 1 requires leaderElect');
+    expect(operatorDeployment(await template('replicaCount=2')).spec.replicas).toBe(2);
+    expect(operatorDeployment(await template('leaderElect=false')).spec.replicas).toBe(1);
+  }, 60000);
+
+  test('an offline render without passphrase.existingSecret fails instead of generating one', async () => {
+    // helm template never sees a cluster, like client-side --dry-run and Argo CD: a generated
+    // passphrase there would overwrite the live one when applied.
+    const out = await offline(`image.digest=${DIGEST}`);
+    expect(out.code).not.toBe(0);
+    expect(out.stderr).toContain('this render cannot see the cluster');
+    expect(out.stderr).toContain('passphrase.existingSecret');
+    expect(out.stdout).not.toContain('kind: Secret');
+  }, 60000);
+
+  test('ephemeral storage is requested and limited, and both emptyDirs are size-limited', async () => {
+    const pod = operatorDeployment(await template()).spec.template.spec;
+    expect(pod.containers[0].resources.requests['ephemeral-storage']).toBe('1Gi');
+    expect(pod.containers[0].resources.limits['ephemeral-storage']).toBe('6Gi');
+    const volumes = Object.fromEntries(
+      (pod.volumes as { name: string; emptyDir?: { sizeLimit: string } }[]).map((v) => [
+        v.name,
+        v.emptyDir,
+      ]),
+    );
+    expect(volumes.home).toEqual({ sizeLimit: '4Gi' });
+    expect(volumes.tmp).toEqual({ sizeLimit: '1Gi' });
+  }, 60000);
+
+  test('rbac.clusterAdmin=false drops only the cluster-admin binding', async () => {
+    const bindings = (await template('rbac.clusterAdmin=false')).filter(
+      (d) => d.kind === 'ClusterRoleBinding',
+    );
+    expect(bindings.map((b) => b.roleRef.name)).toEqual(['platform-operator']);
+  }, 60000);
+
+  test('the Headlamp plugin manager is pinned: a pluginctl version and a node image by digest', async () => {
+    const values = Bun.YAML.parse(read(join(chart, 'values.yaml'))) as {
+      headlamp: { pluginsManager: { version: string; baseImage: string } };
+    };
+    expect(values.headlamp.pluginsManager.version).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(values.headlamp.pluginsManager.baseImage).toMatch(/^node:[^@]+@sha256:[0-9a-f]{64}$/);
+    const rendered = await template(
+      'headlamp.enabled=true',
+      'headlamp.pluginsManager.enabled=true',
+      'headlamp.pluginsManager.configContent=plugins: []',
+    );
+    const headlamp = JSON.stringify(find(rendered, 'Deployment', 'platform-operator-headlamp'));
+    expect(headlamp).toContain(values.headlamp.pluginsManager.baseImage);
+    expect(headlamp).toContain(`@headlamp-k8s/pluginctl@${values.headlamp.pluginsManager.version}`);
   }, 60000);
 
   test('the CRD, the state claim and the passphrase Secret survive helm uninstall', async () => {
     const rendered = await template();
-    for (const kind of ['CustomResourceDefinition', 'PersistentVolumeClaim', 'Secret']) {
+    for (const kind of ['CustomResourceDefinition', 'PersistentVolumeClaim']) {
       expect(find(rendered, kind).metadata.annotations).toMatchObject(KEEP);
     }
     for (const doc of rendered.filter(
-      (d) => !['CustomResourceDefinition', 'PersistentVolumeClaim', 'Secret'].includes(d.kind),
+      (d) => !['CustomResourceDefinition', 'PersistentVolumeClaim'].includes(d.kind),
     )) {
       expect(doc.metadata.annotations?.['helm.sh/resource-policy']).toBeUndefined();
     }
-    const secret = find(rendered, 'Secret');
-    expect(Buffer.from(secret.data.passphrase, 'base64').toString()).toMatch(/^[A-Za-z0-9]{48}$/);
-    // The passphrase is generated only when no Secret exists (lookup), never on every upgrade.
-    expect(read(join(chart, 'templates', 'passphrase.yaml'))).toContain(
-      'lookup "v1" "Secret" .Release.Namespace $name',
-    );
+    // The generated Secret renders only against a cluster, which helm template never reaches, so
+    // its template is checked as text: kept on uninstall, reused through lookup when it exists,
+    // and generated only otherwise, after the offline-render guard.
+    const source = read(join(chart, 'templates', 'passphrase.yaml'));
+    expect(source).toContain('    helm.sh/resource-policy: keep');
+    const guard = source.indexOf('lookup "v1" "Namespace" "" "kube-system"');
+    const reuse = source.indexOf('lookup "v1" "Secret" .Release.Namespace $name');
+    const generate = source.indexOf('randAlphaNum 48');
+    expect(guard).toBeGreaterThan(-1);
+    expect(guard).toBeLessThan(reuse);
+    expect(reuse).toBeLessThan(generate);
   }, 60000);
 
   test('existing claim and passphrase Secret are used instead of created', async () => {

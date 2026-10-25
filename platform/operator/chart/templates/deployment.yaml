@@ -1,3 +1,4 @@
+{{- include "platform-operator.validate" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -53,12 +54,6 @@ spec:
             {{- range .Values.extraArgs }}
             - {{ . | quote }}
             {{- end }}
-          env:
-            # The operator's own namespace, where it runs its storageRoot cleanup Jobs by default.
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
           ports:
             - name: metrics
               containerPort: 8080
@@ -103,9 +98,11 @@ spec:
               - key: passphrase
                 path: passphrase
         - name: home
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: {{ .Values.emptyDirSizeLimit.home }}
         - name: tmp
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: {{ .Values.emptyDirSizeLimit.tmp }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
