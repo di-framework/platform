@@ -63,22 +63,39 @@ Status carries `phase` (`Provisioning`, `Installing`, `Ready`, `Failed`, `Deleti
 
 The platform keeps tenant data (registry blobs, tenant volumes, pglite `PGDATA`) in node `hostPath`s under
 the instance's `storageRoot`, so deleting the vCluster doesn't remove it. With `deletionPolicy: Delete`, once
-the target is gone the operator runs a short-lived Job (`pi-storage-cleanup-<hash>`, in `--cleanup-namespace`)
-that mounts `--storage-root-base` from the node and runs `rm -rf` of exactly `<namespace>/<name>` under it. The
-path is checked first (no empty parts, no `..`, no `/`, an absolute base other than `/`), the command has no
-shell, and the image is busybox pinned by digest. The finalizer holds until the Job succeeds; the operator then
-deletes the Job.
+the target is gone the operator runs a short-lived Job (`pi-storage-cleanup-<name hash>-<uid hash>`, in
+`--cleanup-namespace`) that mounts `--storage-root-base` from the node (hostPath type `Directory`) and runs
+`rm -rf` of exactly `<namespace>/<name>` under it. The path is checked first (no empty parts, no `..`, no `/`,
+an absolute base other than `/`; the operator also refuses to start with a bad `--storage-root-base`), the
+command has no shell, and the image is busybox pinned by digest. The pod runs as root, since tenant data is
+owned by other UIDs, but with every capability dropped except `DAC_OVERRIDE` and `FOWNER` (what `rm` needs
+for other users' directories and sticky directories), no privilege escalation, a read-only root filesystem,
+the `RuntimeDefault` seccomp profile and small resource requests and limits. The finalizer holds until the Job
+succeeds.
 
+- **Each Job belongs to one incarnation of the instance.** It carries the instance UID. A Job or pod of an
+  earlier instance with the same `<namespace>/<name>` is deleted unread before a new one starts, so a
+  recreated instance never trusts, or is cleaned by, its predecessor's Job.
+- **Nothing outlives the release.** Whatever releases the finalizer (a finished cleanup, the skip annotation,
+  `Retain`, a custom root), the operator first deletes the instance's cleanup Jobs and their pods and waits
+  until they are gone.
 - **A custom `spec.platform.storageRoot` is never removed.** The operator didn't create that path and can't
-  know what else lives there. Remove it yourself when its data must go.
-- **A failed cleanup** (the Job fails, or its pod can't start within 5 minutes) sets `Installed` to `False`
-  with reason `StorageCleanupFailed` and a message naming the path, deletes the failed Job and retries with
-  backoff. The finalizer stays meanwhile.
+  know what else lives there. Remove it yourself when its data must go. A custom root inside
+  `--storage-root-base`, or containing it, is rejected (`Installed` False, reason `InvalidStorageRoot`) and
+  never installed, since another instance's cleanup could remove its data.
+- **A failed cleanup** (the Job fails, or its pod can't start within 5 minutes, for example because
+  `--storage-root-base` doesn't exist on the node) sets `Installed` to `False` with reason
+  `StorageCleanupFailed` and a message naming the path and the attempt, and deletes the failed Job. The next
+  Job starts after an exponential backoff: 10s after the first failure, doubling per failure, at most 5
+  minutes. The failures are counted in the instance's `platform.di-framework.dev/storage-cleanup-failures`
+  annotation. The finalizer stays meanwhile.
 - **The way out**, when the node can't run the cleanup: annotate the instance with
-  `platform.di-framework.dev/skip-storage-cleanup: "true"` (or set `deletionPolicy: Retain`). The finalizer
-  is then released and the directory stays on the node.
-- **Single node only** (as all of v1alpha1). The Job isn't pinned to a node; on one node it runs where the
-  data is.
+  `platform.di-framework.dev/skip-storage-cleanup: "true"` (or set `deletionPolicy: Retain`). Any running
+  cleanup Job is stopped, the finalizer is then released and the directory stays on the node.
+- **Single node only** (as all of v1alpha1); multi-node is out of scope. The Job isn't pinned to a node. On
+  one node it runs where the data is. On more than one node it may run on a node without the data and succeed,
+  so the instance is released while its data stays on the original node: the cleanup fails open (nothing is
+  removed that shouldn't be), and a successful cleanup proves nothing there.
 
 ### One install per instance
 

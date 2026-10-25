@@ -24,6 +24,13 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - pods
+  verbs:
+  - delete
+  - list
+- apiGroups:
+  - ""
+  resources:
   - secrets
   verbs:
   - create
@@ -55,6 +62,7 @@ rules:
   - create
   - delete
   - get
+  - list
 - apiGroups:
   - coordination.k8s.io
   resources:
