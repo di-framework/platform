@@ -57,19 +57,19 @@ jobs:
       run:
         working-directory: platform/operator/headlamp-plugin
     steps:
+      # Depth 2 is enough: a pull_request run checks out the merge commit, whose first parent is
+      # the base branch it merges into.
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          fetch-depth: 2
 
       - name: Check for plugin changes
         id: changes
         working-directory: .
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           if [ "$GITHUB_EVENT_NAME" != pull_request ] ||
-            ! git diff --quiet "$BASE_SHA" HEAD -- \
+            ! git diff --quiet HEAD^1 HEAD -- \
               platform/operator/headlamp-plugin \
               platform/operator/config/crd \
               .github/workflows/ci.yml; then
@@ -85,6 +85,13 @@ jobs:
         with:
           bun-version: '1.4.3'
 
+      # The package step gzips with Node's zlib, so its sha256 depends on the Node version: pin it.
+      - name: Setup Node
+        if: steps.changes.outputs.run == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.23.2'
+
       - name: Install dependencies
         if: steps.changes.outputs.run == 'true'
         run: bun install --frozen-lockfile
@@ -97,9 +104,10 @@ jobs:
         if: steps.changes.outputs.run == 'true'
         run: bun run tsc
 
-      - name: Test
+      # 100% lines, statements, functions and branches (vitest.config.mjs).
+      - name: Test with coverage
         if: steps.changes.outputs.run == 'true'
-        run: bun run test
+        run: bun run test:coverage
 
       # Deterministic tarball for Headlamp's plugin manager; the release attaches it later.
       - name: Package
@@ -307,7 +315,8 @@ jobs:
   # The required check: green only when every job above is.
   build-and-test:
     name: Test
-    needs: [typescript, components]
+    # headlamp-plugin skips its steps, and succeeds, when a PR doesn't touch the plugin or the CRD.
+    needs: [typescript, components, headlamp-plugin]
     # always(): a failed or cancelled job must fail this check, not skip it (a skip passes).
     if: always()
     runs-on: ubuntu-latest

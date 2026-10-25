@@ -39,6 +39,39 @@ updates:
       prefix: "deps"
       include: "scope"
 
+  # The Headlamp plugin is a standalone package with its own bun.lock, so it has its own entry
+  # and groups. typescript stays at the 5.6.2 override that @kinvolk/headlamp-plugin's tooling
+  # supports.
+  - package-ecosystem: "bun"
+    directory: "/platform/operator/headlamp-plugin"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    assignees:
+      - "geoffsee"
+    labels:
+      - "dependencies"
+    groups:
+      headlamp-plugin-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      headlamp-plugin-major:
+        patterns:
+          - "*"
+        update-types:
+          - "major"
+    ignore:
+      - dependency-name: "typescript"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
