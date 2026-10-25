@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -18,6 +19,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/di-framework/platform/operator/api/v1alpha1"
 	"github.com/di-framework/platform/operator/internal/targets"
@@ -48,6 +51,10 @@ func Chart() ([]byte, error) {
 // OwnerAnnotation on a host namespace names the PlatformInstance ("<namespace>/<name>") it
 // belongs to. The target never installs into or deletes a namespace another instance owns.
 const OwnerAnnotation = "platform.di-framework.dev/instance"
+
+// ErrReinstalling reports that Ensure removed a failed or interrupted vCluster release, which the
+// next round installs again.
+var ErrReinstalling = errors.New("reinstalling vcluster")
 
 // Release is what the target needs to know about an installed Helm release.
 type Release struct {
@@ -85,7 +92,8 @@ var _ targets.Target = (*Target)(nil)
 // Ensure installs the vCluster once and reports it ready when its control plane is ready and
 // its kubeconfig Secret exists. Values are applied at creation only (see InstanceValues). A
 // release left failed or pending (an install that errored or was interrupted) is removed so the
-// next round installs it again.
+// next round installs it again. That is reported as an error, so an install that fails the same
+// way every time backs off instead of cycling every poll.
 func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (targets.State, error) {
 	ns := HostNamespace(inst)
 	if err := t.claimNamespace(ctx, inst, ns); err != nil {
@@ -113,7 +121,7 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 		if err := t.Helm.Uninstall(ctx, ns, ReleaseName); err != nil {
 			return targets.State{}, fmt.Errorf("remove %s vcluster release: %w", rel.Status, err)
 		}
-		return targets.State{Reason: "Reinstalling", Message: fmt.Sprintf("vcluster release was %s (%s); removed it to install again", rel.Status, rel.Description)}, nil
+		return targets.State{}, fmt.Errorf("%w: vcluster release was %s (%s); removed it to install again", ErrReinstalling, rel.Status, rel.Description)
 	}
 
 	var sts appsv1.StatefulSet
@@ -170,7 +178,12 @@ func (t *Target) claimNamespace(ctx context.Context, inst *v1alpha1.PlatformInst
 			Labels:      map[string]string{"app.kubernetes.io/managed-by": "platform-operator"},
 			Annotations: map[string]string{OwnerAnnotation: owner(inst)},
 		}}
-		return client.IgnoreAlreadyExists(t.Client.Create(ctx, &namespace))
+		err = t.Client.Create(ctx, &namespace)
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		// Someone created it between the read and the create; it must still be ours.
+		err = t.Client.Get(ctx, types.NamespacedName{Name: ns}, &namespace)
 	}
 	if err != nil {
 		return err
@@ -188,8 +201,9 @@ func checkOwner(inst *v1alpha1.PlatformInstance, namespace *corev1.Namespace) er
 }
 
 // Delete uninstalls the release and deletes the host namespace, which removes the vCluster's
-// data volume. Done is true once the namespace is gone. A namespace another instance owns is
-// left alone and reported as an error.
+// data volume. Done is true once the namespace is gone. A namespace that isn't this instance's
+// (created by hand at the same name) is left alone and counts as done: there is nothing of the
+// instance's to delete, and refusing would hold the finalizer forever.
 func (t *Target) Delete(ctx context.Context, inst *v1alpha1.PlatformInstance) (bool, error) {
 	ns := HostNamespace(inst)
 	var namespace corev1.Namespace
@@ -199,7 +213,8 @@ func (t *Target) Delete(ctx context.Context, inst *v1alpha1.PlatformInstance) (b
 		return false, err
 	}
 	if err := checkOwner(inst, &namespace); err != nil {
-		return false, err
+		log.FromContext(ctx).Info("leaving a host namespace this instance doesn't own", "reason", err.Error())
+		return true, nil
 	}
 	if namespace.DeletionTimestamp == nil {
 		if err := t.Helm.Uninstall(ctx, ns, ReleaseName); err != nil {

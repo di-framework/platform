@@ -2,6 +2,7 @@ package vcluster
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -13,6 +14,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/di-framework/platform/operator/api/v1alpha1"
 )
@@ -151,8 +153,9 @@ func TestEnsureReinstallsAFailedRelease(t *testing.T) {
 		tg := &Target{Client: newClient(t, ownedNamespace(inst)), Helm: helm, Values: func(context.Context, *v1alpha1.PlatformInstance) (map[string]any, error) {
 			return map[string]any{}, nil
 		}}
+		// An error, so a release that fails every time backs off instead of cycling every poll.
 		st, err := tg.Ensure(context.Background(), inst)
-		if err != nil || st.Reason != "Reinstalling" || !strings.Contains(st.Message, status) || len(helm.uninstalled) != 1 {
+		if !errors.Is(err, ErrReinstalling) || !strings.Contains(err.Error(), status) || st.Ready || len(helm.uninstalled) != 1 {
 			t.Fatalf("%s release: %+v %v (uninstalled %v)", status, st, err, helm.uninstalled)
 		}
 		delete(helm.status, ns)
@@ -178,8 +181,37 @@ func TestInstancesNeverShareAHostNamespace(t *testing.T) {
 	if _, err := tg.Ensure(context.Background(), a); err == nil || !strings.Contains(err.Error(), "team/a-one") {
 		t.Fatalf("Ensure into another instance's namespace: %v", err)
 	}
-	if done, err := tg.Delete(context.Background(), a); err == nil || done || len(helm.uninstalled) != 0 {
+	// Delete leaves it alone and is done, so the finalizer is released.
+	if done, err := tg.Delete(context.Background(), a); err != nil || !done || len(helm.uninstalled) != 0 {
 		t.Fatalf("Delete of another instance's namespace: done=%v %v (uninstalled %v)", done, err, helm.uninstalled)
+	}
+	var ns corev1.Namespace
+	if err := tg.Client.Get(context.Background(), client.ObjectKey{Name: theirs.Name}, &ns); err != nil {
+		t.Fatalf("the other namespace was deleted: %v", err)
+	}
+}
+
+// A namespace that appears between the read and the create is checked like any other.
+func TestClaimChecksANamespaceCreatedInTheRace(t *testing.T) {
+	a := instance("team-a", "one")
+	c := newClient(t)
+	racy := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*corev1.Namespace); ok {
+				other := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: obj.GetName(), Annotations: map[string]string{OwnerAnnotation: "someone/else"}}}
+				if err := cl.Create(ctx, other); err != nil {
+					return err
+				}
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	})
+	helm := &fakeHelm{installed: map[string]map[string]any{}}
+	tg := &Target{Client: racy, Helm: helm, Values: func(context.Context, *v1alpha1.PlatformInstance) (map[string]any, error) {
+		return map[string]any{}, nil
+	}}
+	if _, err := tg.Ensure(context.Background(), a); err == nil || !strings.Contains(err.Error(), "someone/else") || len(helm.installed) != 0 {
+		t.Fatalf("Ensure after the race: %v (installed %v)", err, helm.installed)
 	}
 }
 
