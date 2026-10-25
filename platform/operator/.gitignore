@@ -1,0 +1,4 @@
+bin/
+# The vCluster chart is embedded into the binary (go:embed) and checked by digest; the root
+# ignores *.tgz for npm pack output.
+!internal/targets/vcluster/chart/*.tgz
