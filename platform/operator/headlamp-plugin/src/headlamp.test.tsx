@@ -288,7 +288,6 @@ describe('detail', () => {
       namespace: 'team-b',
       name: 'full-instance',
       patch: [
-        { op: 'test', path: '/metadata/resourceVersion', value: '5' },
         { op: 'test', path: '/spec/version', value: '6.0.18-rc.1' },
         { op: 'replace', path: '/spec/version', value: '6.0.19' },
       ],

@@ -75,6 +75,7 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
         : { mode: 'create', object: buildPlatformInstance(form) },
     [form, mode, existing],
   );
+  const showLabel = submission.mode === 'edit' ? 'Show patch' : 'Show YAML';
 
   function set<K extends FormField>(field: K, value: FormState[K]) {
     setForm((f) => ({ ...f, [field]: value }));
@@ -222,7 +223,7 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
         )}
         <Box sx={{ mt: 2 }}>
           <Button size="small" onClick={() => setShowPreview((s) => !s)}>
-            {showPreview ? 'Hide YAML' : submission.mode === 'edit' ? 'Show patch' : 'Show YAML'}
+            {showPreview ? 'Hide YAML' : showLabel}
           </Button>
           {showPreview && (
             <Box component="pre" aria-label="Object preview" sx={{ fontSize: '0.8rem', p: 1 }}>

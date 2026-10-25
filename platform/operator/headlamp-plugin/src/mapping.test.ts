@@ -166,10 +166,9 @@ describe('edit', () => {
     return updated;
   }
 
-  it('patches only the changed fields, guarded by resourceVersion and their old values', () => {
+  it('patches only the changed fields, guarded by their old values', () => {
     const form = { ...formFromObject(live), version: '6.0.19', deletionPolicy: 'Delete' as const };
     expect(editPatch(live, form)).toStrictEqual([
-      { op: 'test', path: '/metadata/resourceVersion', value: '42' },
       { op: 'test', path: '/spec/version', value: '6.0.18-rc.1' },
       { op: 'test', path: '/spec/deletionPolicy', value: 'Retain' },
       { op: 'replace', path: '/spec/version', value: '6.0.19' },
@@ -224,25 +223,78 @@ describe('edit', () => {
       },
     };
     const patch = editPatch(decorated, { ...formFromObject(decorated), version: '6.0.19' });
-    expect(patch.filter((op) => op.path.startsWith('/metadata'))).toStrictEqual([
+    expect(patch.filter((op) => op.path.startsWith('/metadata'))).toStrictEqual([]);
+    expect(applyPatch(decorated, patch).metadata).toStrictEqual(decorated.metadata);
+    // With a container to create, the only /metadata op is the resourceVersion test.
+    const added = editPatch(
+      { ...decorated, spec: { ...decorated.spec, platform: undefined } },
+      { ...formFromObject(decorated), storageRoot: '' },
+    );
+    expect(added.filter((op) => op.path.startsWith('/metadata'))).toStrictEqual([
       { op: 'test', path: '/metadata/resourceVersion', value: '42' },
     ]);
-    expect(applyPatch(decorated, patch).metadata).toStrictEqual(decorated.metadata);
   });
 
-  it('fails as a whole when the object changed after the dialog opened', () => {
+  it('fails as a whole when a field it changes was changed after the dialog opened', () => {
     const patch = editPatch(live, { ...formFromObject(live), version: '6.0.19' });
-    // Any other write (spec, labels, status) bumps resourceVersion: rejected, nothing applied.
-    const bumped = { ...live, metadata: { ...live.metadata, resourceVersion: '43' } };
-    expect(() => applyPatch(bumped, patch)).toThrow(PatchError);
-    expect(() => applyPatch(bumped, patch)).toThrow(
-      /testing value \/metadata\/resourceVersion failed/,
-    );
-    // A changed field fails its own test as well.
     const changed = { ...live, spec: { ...live.spec, version: '6.0.20' } };
-    expect(() => applyPatch(changed, patch.slice(1))).toThrow(
-      /testing value \/spec\/version failed/,
+    expect(() => applyPatch(changed, patch)).toThrow(PatchError);
+    expect(() => applyPatch(changed, patch)).toThrow(
+      expect.objectContaining({ detail: 'testing value /spec/version failed: test failed' }),
     );
+    // A removed field fails the same way, so does one a concurrent change deleted.
+    const removal = editPatch(live, { ...formFromObject(live), httpEndpoint: '' });
+    const moved = structuredClone(live);
+    moved.spec.platform = { ...moved.spec.platform, gateway: { httpEndpoint: 'http://other' } };
+    expect(() => applyPatch(moved, removal)).toThrow(PatchError);
+  });
+
+  it('succeeds after an operator status write when it changes only existing fields (S6)', () => {
+    // The operator's status updates bump resourceVersion and leave the spec alone.
+    const statusWrite: PlatformInstanceObject = {
+      ...live,
+      metadata: { ...live.metadata, resourceVersion: '43' },
+      status: { ...live.status, phase: 'Provisioning', observedGeneration: 3 },
+    };
+    const form = {
+      ...formFromObject(live),
+      version: '6.0.19',
+      networkPolicyEngine: '' as const,
+      httpNodePort: '30081',
+      httpEndpoint: '',
+    };
+    const patch = editPatch(live, form);
+    expect(patch.some((op) => op.path === '/metadata/resourceVersion')).toBe(false);
+    const updated = serverApply(statusWrite, patch);
+    expect(updated.spec.version).toBe('6.0.19');
+    expect(updated.spec.platform).toStrictEqual({
+      storageRoot: live.spec.platform?.storageRoot,
+      gateway: { httpNodePort: 30081 },
+    });
+    expect(updated.status).toStrictEqual(statusWrite.status);
+  });
+
+  it('guards on resourceVersion when it creates a container or adds a missing field (S6)', () => {
+    const old = { ...minimal, metadata: { ...minimal.metadata, resourceVersion: '7' } };
+    const bumped = { ...old, metadata: { ...old.metadata, resourceVersion: '8' } };
+    // JSON Patch can't test that a member is absent: someone may have created it meanwhile.
+    for (const form of [
+      { ...formFromObject(old), httpNodePort: '30080' },
+      { ...formFromObject(old), deletionPolicy: 'Retain' as const },
+    ]) {
+      const patch = editPatch(old, form);
+      expect(patch[0]).toStrictEqual({
+        op: 'test',
+        path: '/metadata/resourceVersion',
+        value: '7',
+      });
+      expect(() => applyPatch(bumped, patch)).toThrow(
+        expect.objectContaining({
+          detail: 'testing value /metadata/resourceVersion failed: test failed',
+        }),
+      );
+      expect(() => serverApply(old, patch)).not.toThrow();
+    }
   });
 
   it('keeps an instance without storageRoot without one, as the CEL rule requires', () => {
@@ -276,20 +328,41 @@ describe('edit', () => {
       spec: { ...live.spec, platform: { gateway: { httpNodePort: 30080 } } },
     };
     const both = editPatch(gatewayOnly, { ...formFromObject(gatewayOnly), httpNodePort: '' });
-    expect(both.filter((op) => op.op === 'remove')).toStrictEqual([
+    expect(both).toStrictEqual([
+      { op: 'test', path: '/spec/platform/gateway/httpNodePort', value: 30080 },
       { op: 'remove', path: '/spec/platform/gateway/httpNodePort' },
+      { op: 'test', path: '/spec/platform/gateway', value: {} },
       { op: 'remove', path: '/spec/platform/gateway' },
+      { op: 'test', path: '/spec/platform', value: {} },
       { op: 'remove', path: '/spec/platform' },
     ]);
     expect(applyPatch(gatewayOnly, both).spec.platform).toBeUndefined();
+    // Something added to an emptied container meanwhile fails the patch instead of being removed.
+    for (const platform of [
+      { gateway: { httpNodePort: 30080, httpEndpoint: 'http://new' } },
+      { gateway: { httpNodePort: 30080 }, networkPolicyEngine: 'kube-router' as const },
+    ]) {
+      const concurrent = { ...gatewayOnly, spec: { ...gatewayOnly.spec, platform } };
+      expect(() => applyPatch(concurrent, both)).toThrow(PatchError);
+    }
   });
 
-  it('omits the resourceVersion guard only when the object has none', () => {
-    expect(editPatch(minimal, { ...formFromObject(minimal), version: '6.0.18' })[0]).toStrictEqual({
-      op: 'test',
-      path: '/spec/version',
-      value: '6.0.17',
-    });
+  it('omits the resourceVersion guard when the object has none', () => {
+    expect(
+      editPatch(minimal, { ...formFromObject(minimal), httpNodePort: '30080' })[0],
+    ).toStrictEqual({ op: 'add', path: '/spec/platform', value: {} });
+  });
+
+  it('creates the spec when the object has none', () => {
+    const bare = { ...minimal, spec: undefined } as unknown as PlatformInstanceObject;
+    const patch = editPatch(bare, { ...emptyForm('team-a'), name: 'one', version: '6.0.17' });
+    expect(patch).toStrictEqual([
+      { op: 'add', path: '/spec', value: {} },
+      { op: 'add', path: '/spec/version', value: '6.0.17' },
+      { op: 'add', path: '/spec/target', value: {} },
+      { op: 'add', path: '/spec/target/type', value: 'vcluster' },
+    ]);
+    expect(applyPatch(bare, patch).spec).toStrictEqual(minimal.spec);
   });
 
   it('does not validate the fixed name and namespace again', () => {

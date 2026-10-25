@@ -43,7 +43,7 @@ describe('edge cases', () => {
         instance={{ metadata: { name: 'x' }, status: { conditions: [bare] } } as never}
       />,
     );
-    expect(screen.getAllByText('-').length).toBe(3);
+    expect(screen.getAllByText('-')).toHaveLength(3);
   });
 
   it('a failed read offers no download', async () => {

@@ -2,9 +2,11 @@
 // - an alias so tests can vi.mock '@kinvolk/headlamp-plugin/lib/k8s/cluster': in the built plugin
 //   that import is an external served by Headlamp (pluginLib.K8s), and no file has that path;
 // - the coverage gate (`bun run test:coverage`, run in CI).
-import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import headlamp from '@kinvolk/headlamp-plugin/config/vite.config.mjs';
 import { mergeConfig } from 'vitest/config';
-import headlamp from './node_modules/@kinvolk/headlamp-plugin/config/vite.config.mjs';
+
+const require = createRequire(import.meta.url);
 
 // What `headlamp-plugin test` sets for the run.
 process.env.UNDER_TEST = 'true';
@@ -14,12 +16,7 @@ export default mergeConfig(headlamp, {
     alias: [
       {
         find: /^@kinvolk\/headlamp-plugin\/lib\/k8s\/cluster$/,
-        replacement: fileURLToPath(
-          new URL(
-            './node_modules/@kinvolk/headlamp-plugin/lib/lib/k8s/cluster.js',
-            import.meta.url,
-          ),
-        ),
+        replacement: require.resolve('@kinvolk/headlamp-plugin/lib/lib/k8s/cluster.js'),
       },
     ],
   },

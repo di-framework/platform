@@ -14,7 +14,8 @@ import {
   patchInstance,
   submitInstance,
 } from './api';
-import type { JsonPatchOp } from './mapping';
+import { editPatch, formFromObject, type JsonPatchOp } from './mapping';
+import { applyPatch, invalidError, PATCH_REJECTED, PatchError } from './testdata/applyPatch';
 import { minimal } from './testdata/fixtures';
 
 const BASE = '/apis/platform.di-framework.dev/v1alpha1/namespaces';
@@ -61,10 +62,12 @@ describe('api', () => {
     );
   });
 
-  it('turns a failed test op (422) or a 409 into the conflict message', async () => {
+  it('turns a patch the server could not apply (its generic 422) or a 409 into the conflict message', async () => {
     for (const err of [
-      httpError(422, 'testing value /metadata/resourceVersion failed: test failed'),
-      httpError(409, 'Conflict'),
+      new PatchError('testing value /spec/version failed: test failed'),
+      // Over HTTP/2 there is no status text, so Headlamp's message starts with " - ".
+      httpError(422, ` - ${PATCH_REJECTED}`),
+      httpError(409, 'Conflict - Operation cannot be fulfilled on platforminstances'),
     ]) {
       proxy.request.mockRejectedValueOnce(err);
       const rejection = patchInstance('team-a', 'one', patch);
@@ -73,20 +76,44 @@ describe('api', () => {
     }
   });
 
-  it('passes every other error through unchanged', async () => {
-    const invalid = httpError(422, 'spec.version: Invalid value');
+  it('shows a real concurrent change as the conflict message', async () => {
+    const opened = { ...minimal, metadata: { ...minimal.metadata, resourceVersion: '7' } };
+    const edit = editPatch(opened, { ...formFromObject(opened), version: '6.0.18' });
+    const current = { ...opened, spec: { ...opened.spec, version: '6.0.20' } };
+    // The server applies the patch to the current object; its failed test is the server's 422.
+    proxy.request.mockImplementationOnce(async (_path: string, init: { body: string }) =>
+      applyPatch(current, JSON.parse(init.body)),
+    );
+    await expect(patchInstance('team-a', 'one', edit)).rejects.toThrow(CONFLICT_MESSAGE);
+  });
+
+  it('passes a validation error (422 is invalid) and every other error through unchanged', async () => {
+    const invalid = invalidError(
+      'one',
+      'spec.version: Invalid value: "6.0": spec.version in body should match',
+    );
     proxy.request.mockRejectedValueOnce(invalid);
     await expect(patchInstance('team-a', 'one', patch)).rejects.toBe(invalid);
+    const cel = invalidError('one', 'spec.target: Invalid value: "object": target is immutable');
+    proxy.request.mockRejectedValueOnce(cel);
+    await expect(patchInstance('team-a', 'one', patch)).rejects.toBe(cel);
     const forbidden = httpError(403, 'Forbidden');
     proxy.request.mockRejectedValueOnce(forbidden);
     await expect(patchInstance('team-a', 'one', patch)).rejects.toBe(forbidden);
   });
 
-  it('isConflict needs a status, and a test-failure message for 422', () => {
+  it('isConflict needs a 409, or a 422 with the server message for a patch that did not apply', () => {
     expect(isConflict(undefined)).toBe(false);
+    expect(isConflict({ status: 409 })).toBe(true);
     expect(isConflict({ status: 422 })).toBe(false);
-    expect(isConflict({ status: 422, message: 'test failed' })).toBe(true);
-    expect(isConflict({ message: 'testing value' })).toBe(false);
+    expect(isConflict({ status: 422, message: `Unprocessable Entity - ${PATCH_REJECTED}` })).toBe(
+      true,
+    );
+    expect(isConflict(invalidError('one', 'spec.version: Invalid value'))).toBe(false);
+    // The json-patch text never reaches the client, so it is not what is matched.
+    expect(isConflict({ status: 422, message: 'testing value /spec/version failed' })).toBe(false);
+    expect(isConflict({ message: PATCH_REJECTED })).toBe(false);
+    expect(isConflict({ status: 400, message: PATCH_REJECTED })).toBe(false);
   });
 
   it('dispatches a submission by mode', async () => {

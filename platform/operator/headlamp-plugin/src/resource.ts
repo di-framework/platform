@@ -15,10 +15,10 @@ export type PlatformInstanceInterface = KubeObjectInterface &
  * proxy with the viewer's own credentials.
  */
 export class PlatformInstance extends KubeObject<PlatformInstanceInterface> {
-  static kind = KIND;
-  static apiVersion = API_VERSION;
-  static apiName = PLURAL;
-  static isNamespaced = true;
+  static readonly kind = KIND;
+  static readonly apiVersion = API_VERSION;
+  static readonly apiName = PLURAL;
+  static readonly isNamespaced = true;
 
   static get detailsRoute() {
     return ROUTE_DETAILS;
