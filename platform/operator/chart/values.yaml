@@ -2,13 +2,17 @@ image:
   repository: ghcr.io/di-framework/platform-operator
   # The operator image is always pulled by digest, never by tag. The operator image pin PR (#271)
   # rewrites this placeholder with the digest each publish produced. Until then, set it at install
-  # time: --set image.digest=sha256:<64 hex>.
+  # time: --set image.digest=sha256:<64 hex>. The chart refuses to render anything else, the
+  # placeholder included, and the release workflow refuses to publish a chart that still has it.
   digest: sha256:<pinned by the platform-operator image pin PR>
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
 # One operator is active at a time: extra replicas wait on the leader-election Lease. Each
-# PlatformInstance has at most one Pulumi run in flight only while leader election is on.
+# PlatformInstance has at most one Pulumi run in flight only while leader election is on, so the
+# chart refuses replicaCount > 1 with leaderElect: false. With the default ReadWriteOnce state claim
+# on a multi-node cluster, a standby replica scheduled on another node stays in ContainerCreating
+# (Multi-Attach error) instead of waiting on the Lease; use a ReadWriteMany class or one replica.
 replicaCount: 1
 leaderElect: true
 
@@ -48,9 +52,14 @@ state:
   accessModes:
     - ReadWriteOnce
 
-# The passphrase that encrypts the secrets in the Pulumi state. The chart generates one on first
-# install, reuses it on every upgrade (lookup), and keeps the Secret on `helm uninstall`. Losing it
-# makes the state unreadable. Set existingSecret (key `passphrase`) to bring your own.
+# The passphrase that encrypts the secrets in the Pulumi state. Losing or changing it makes the
+# state unreadable.
+#   - existingSecret set: the chart creates no Secret and mounts that one (key `passphrase`).
+#     Required for helm template, client-side --dry-run, Argo CD and other GitOps tools.
+#   - existingSecret empty: the chart reads the cluster (lookup). It reuses the passphrase of its
+#     Secret when it exists and generates one on first install, and keeps the Secret on
+#     `helm uninstall`. A render that cannot see the cluster fails instead of generating a new
+#     passphrase that would overwrite the live one.
 passphrase:
   existingSecret: ""
 
@@ -59,18 +68,30 @@ serviceAccount:
   name: ""
   annotations: {}
 
-# RBAC: the chart always binds two ClusterRoles to the operator's ServiceAccount.
-#   - platform-operator: config/rbac/role.yaml, what the controller itself uses.
-#   - cluster-admin: required in v1alpha1. The operator installs the vCluster chart with Helm, and
-#     that chart creates RBAC, workloads and Services in each instance's host namespace; Kubernetes
-#     only lets Helm grant permissions it already holds. Narrowing this is follow-up work.
+# RBAC: the chart binds two ClusterRoles to the operator's ServiceAccount.
+#   - platform-operator: config/rbac/role.yaml, what the controller itself uses. Its name is fixed,
+#     so (with the cluster-scoped CRD) the chart installs once per cluster.
+#   - cluster-admin, when rbac.clusterAdmin is true: required in v1alpha1. The operator installs the
+#     vCluster chart with Helm, and that chart creates RBAC, workloads and Services in each
+#     instance's host namespace; Kubernetes only lets Helm grant permissions it already holds. Set
+#     it to false only when you bind the ServiceAccount to an equivalent role yourself.
+rbac:
+  clusterAdmin: true
 
 resources:
   requests:
     cpu: 100m
     memory: 256Mi
+    ephemeral-storage: 1Gi
   limits:
     memory: 2Gi
+    ephemeral-storage: 6Gi
+
+# Size limits of the writable emptyDirs: /home/node holds npm's cache and Pulumi's plugins, /tmp
+# the rest. Together they must fit in the ephemeral-storage limit above.
+emptyDirSizeLimit:
+  home: 4Gi
+  tmp: 1Gi
 
 podAnnotations: {}
 podLabels: {}
@@ -110,6 +131,10 @@ headlamp:
   #           source: <where #273 publishes the plugin tarball>
   # (Upstream reads `pluginsManager` at the top of the Headlamp chart's values, so here it is
   # headlamp.pluginsManager, not headlamp.config.pluginsManager.)
+  # Upstream defaults to `npx @headlamp-k8s/pluginctl@latest` on `node:lts-alpine`; both are pinned
+  # here (the image by digest) so the sidecar is reproducible. It still needs npm egress.
   pluginsManager:
     enabled: false
     configContent: ""
+    version: 0.1.1
+    baseImage: node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53

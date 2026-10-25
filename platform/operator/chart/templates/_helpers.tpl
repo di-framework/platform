@@ -32,8 +32,16 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
 
 {{- /* The operator image, always by digest: <repository>@sha256:<...>. */ -}}
 {{- define "platform-operator.image" -}}
-{{- if not (hasPrefix "sha256:" .Values.image.digest) -}}
-{{- fail (printf "image.digest must be a sha256 digest (sha256:<64 hex>), not %q" .Values.image.digest) -}}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" (toString .Values.image.digest)) -}}
+{{- fail (printf "image.digest must be a sha256 digest (sha256:<64 lowercase hex>), not %q. Until the chart ships a pinned digest, set --set image.digest=sha256:<64 hex>" .Values.image.digest) -}}
 {{- end -}}
 {{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
+{{- end -}}
+
+{{- /* Every replica mounts the same state claim: only leader election keeps two operators from
+running Pulumi on the same stack at once. */ -}}
+{{- define "platform-operator.validate" -}}
+{{- if and (gt (int .Values.replicaCount) 1) (not .Values.leaderElect) -}}
+{{- fail "replicaCount > 1 requires leaderElect: true; without it the replicas run Pulumi on the same state at once and can corrupt it" -}}
+{{- end -}}
 {{- end -}}

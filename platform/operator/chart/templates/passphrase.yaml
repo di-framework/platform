@@ -1,7 +1,15 @@
 {{- if not .Values.passphrase.existingSecret }}
 {{- $name := include "platform-operator.passphraseSecret" . }}
-{{- /* Generated once. Every upgrade reuses the passphrase already in the cluster, since a new one
-would make the existing Pulumi state unreadable. */}}
+{{- /* The passphrase must never change once state exists: a new one makes the existing Pulumi
+state unreadable at the operator's next restart. An offline render (helm template, client-side
+--dry-run, Argo CD and other GitOps tools) cannot see the live Secret through lookup, so it would
+render a fresh passphrase that overwrites the live one when applied. Refuse to render offline: those
+users set passphrase.existingSecret. kube-system always exists, so an empty lookup of it means there
+is no cluster (the release namespace may not exist yet under --create-namespace). */}}
+{{- if not (lookup "v1" "Namespace" "" "kube-system") }}
+{{- fail "passphrase: this render cannot see the cluster (helm template, client-side --dry-run, Argo CD or another GitOps tool), so it cannot reuse the existing passphrase and would render a new one that makes the operator's Pulumi state unreadable. Create a Secret with a `passphrase` key and set passphrase.existingSecret to its name (see the chart README), or render against the cluster with helm install/upgrade (--dry-run=server works)." }}
+{{- end }}
+{{- /* Online: reuse the passphrase already in the cluster; generate one only on first install. */}}
 {{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
 {{- $passphrase := "" }}
 {{- if and $existing $existing.data (hasKey $existing.data "passphrase") }}

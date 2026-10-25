@@ -1220,7 +1220,7 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     expect('workflow_dispatch' in release.on).toBe(true);
   });
 
-  test('build, publish and github-release run in that order; chart runs after build', () => {
+  test('build, publish and github-release run in that order; chart runs after build, before the Release', () => {
     expect(Object.keys(release.jobs).sort()).toEqual([
       'build',
       'chart',
@@ -1228,7 +1228,8 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
       'publish',
     ]);
     expect(release.jobs.publish?.needs).toBe('build');
-    expect(release.jobs['github-release']?.needs).toBe('publish');
+    // The GitHub Release is announced only once the npm packages and the chart are both out.
+    expect(release.jobs['github-release']?.needs).toEqual(['publish', 'chart']);
     expect(release.jobs['github-release']?.if).toBe("github.ref_type == 'tag'");
     expect(release.jobs.chart?.needs).toBe('build');
     expect(release.jobs.chart?.if).toBe("github.ref_type == 'tag'");
@@ -1259,6 +1260,18 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     expect(chart).toContain('--password-stdin');
     expect(chart).toContain('helm push "$TARBALL" oci://ghcr.io/di-framework/charts');
     expect(chart.indexOf('helm package')).toBeLessThan(chart.indexOf('helm push'));
+    // A chart whose default image.digest is still the placeholder is never published.
+    expect(chart).toContain('helm template platform-operator platform/operator/chart');
+    expect(chart).toContain('refusing to publish the chart');
+    expect(chart.indexOf('refusing to publish the chart')).toBeLessThan(
+      chart.indexOf('helm package'),
+    );
+    // Idempotent: a re-run never overwrites a released chart version with different bytes.
+    const show =
+      'helm show chart oci://ghcr.io/di-framework/charts/platform-operator --version "$VERSION"';
+    expect(chart).toContain(show);
+    expect(chart.indexOf(show)).toBeLessThan(chart.indexOf('helm push'));
+    expect(chart).toContain('not pushing it again');
     expect(chart).not.toMatch(/\bmake\b|docker|bun install|helm dependency/);
   });
 

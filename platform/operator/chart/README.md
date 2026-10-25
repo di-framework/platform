@@ -8,6 +8,32 @@ helm install platform-operator oci://ghcr.io/di-framework/charts/platform-operat
   --version <release> --namespace platform-operator --create-namespace
 ```
 
+The chart installs once per cluster: the `PlatformInstance` CRD is cluster-scoped and the generated
+ClusterRole is always named `platform-operator`, whatever the release name.
+
+## The passphrase, and `helm template`, Argo CD and GitOps
+
+The passphrase Secret encrypts the secrets in the operator's Pulumi state. If it ever changes, every
+existing instance's state becomes unreadable at the operator's next restart, permanently.
+
+- **`passphrase.existingSecret` set:** the chart creates no Secret and mounts that one (key
+  `passphrase`). This is required whenever the chart is rendered without a cluster: `helm template`,
+  client-side `helm install/upgrade --dry-run`, Argo CD (which always renders with `helm template`),
+  and other GitOps tools.
+
+  ```sh
+  kubectl -n platform-operator create secret generic platform-operator-passphrase \
+    --from-literal=passphrase="$(openssl rand -base64 36)"
+  helm template platform-operator <chart> -n platform-operator \
+    --set passphrase.existingSecret=platform-operator-passphrase
+  ```
+
+- **`passphrase.existingSecret` empty (the default):** the chart reads the cluster with `lookup`. When
+  its Secret exists, the passphrase is reused unchanged; on first install one is generated. A render
+  that cannot see the cluster (an empty lookup of the `kube-system` namespace) **fails** with a message
+  pointing here, instead of generating a fresh passphrase that would overwrite the live one when
+  applied. `helm install`, `helm upgrade` and `--dry-run=server` see the cluster and work.
+
 Every `v*` release publishes the chart at the release's version (the Release workflow's `chart` job).
 The chart's own `version` and `appVersion` in `Chart.yaml` are placeholders that packaging replaces.
 
@@ -16,10 +42,11 @@ The chart's own `version` and `appVersion` in `Chart.yaml` are placeholders that
 The chart binds two ClusterRoles to the operator's ServiceAccount:
 
 - `platform-operator`, generated from `config/rbac/role.yaml`: what the controller itself uses.
-- **`cluster-admin`, required in v1alpha1.** The operator installs the vCluster chart with Helm in each
+- **`cluster-admin`, required in v1alpha1** (`rbac.clusterAdmin: true`, the default). The operator installs the vCluster chart with Helm in each
   instance's host namespace, and that chart creates RBAC, workloads and Services. Kubernetes only lets
   Helm grant permissions it already holds, so the operator needs every permission the vCluster chart
-  grants. Narrowing this is follow-up work.
+  grants. Narrowing this is follow-up work. Set `rbac.clusterAdmin=false` only when you bind the
+  operator's ServiceAccount to an equivalent role yourself.
 
 Install the chart only on a cluster where a cluster-admin operator is acceptable. Instance owners are
 trusted in v1alpha1 (see the epic).
@@ -51,6 +78,10 @@ Install again with the same release name and namespace and the chart adopts all 
 reused, never regenerated (`lookup`). To remove them, delete them by hand after deleting the instances
 you no longer want.
 
+Every `PlatformInstance` carries the `platform.di-framework.dev/instance` finalizer, which only the
+operator removes. While the operator is uninstalled, deleting an instance (or the CRD) hangs until the
+operator is installed again; delete instances before uninstalling if you mean to remove them.
+
 The CRD sits in `templates/` rather than `crds/` so `helm upgrade` upgrades it: Helm never upgrades
 CRDs in `crds/`. `make generate` in `platform/operator` writes `templates/crd.yaml` and
 `templates/clusterrole.yaml` from `config/`, and `make check` fails when they drift.
@@ -60,8 +91,8 @@ CRDs in `crds/`. `make generate` in `platform/operator` writes `templates/crd.ya
 | Value | Default | Flag |
 | --- | --- | --- |
 | `image.repository` | `ghcr.io/di-framework/platform-operator` | |
-| `image.digest` | placeholder until the image pin PR (#271) sets it | |
-| `replicaCount` | `1` | |
+| `image.digest` | placeholder until the image pin PR (#271) sets it; must match `sha256:<64 hex>` | |
+| `replicaCount` | `1`; more than 1 requires `leaderElect` | |
 | `leaderElect` | `true` | `--leader-elect` |
 | `storageRootBase` | `/var/lib/kubesolo/instances` | `--storage-root-base` |
 | `installTimeout` | `30m` | `--install-timeout` |
@@ -71,8 +102,10 @@ CRDs in `crds/`. `make generate` in `platform/operator` writes `templates/crd.ya
 | `cleanupNamespace` | empty: the release namespace | `--cleanup-namespace` (only when set) |
 | `extraArgs` | `[]` | any other flag, such as `--zap-log-level=debug` |
 | `state.size`, `state.storageClassName`, `state.existingClaim` | `10Gi`, default class, none | `--state-dir` |
-| `passphrase.existingSecret` | none (generated) | `--passphrase-file` |
-| `resources` | 100m / 256Mi requests, 2Gi memory limit | |
+| `passphrase.existingSecret` | none (generated; offline renders fail) | `--passphrase-file` |
+| `rbac.clusterAdmin` | `true` | |
+| `resources` | 100m / 256Mi / 1Gi ephemeral requests, 2Gi memory / 6Gi ephemeral limits | |
+| `emptyDirSizeLimit.home`, `emptyDirSizeLimit.tmp` | `4Gi`, `1Gi` | |
 | `headlamp.enabled` | `false` | |
 
 The image is always pulled by digest. The vCluster chart version, its values and the platform version
@@ -80,7 +113,11 @@ are not chart values: the operator embeds the digest-checked vCluster chart and 
 and each `PlatformInstance` names its own `spec.version`.
 
 The pod runs as the image's `node` user (uid 1000) with a read-only root filesystem; `/home/node` (npm's
-cache and Pulumi's plugins) and `/tmp` are emptyDirs.
+cache and Pulumi's plugins) and `/tmp` are size-limited emptyDirs.
+
+The state claim is `ReadWriteOnce`. On a multi-node cluster a standby replica on another node stays in
+`ContainerCreating` (Multi-Attach) rather than waiting on the leader-election Lease; keep one replica or
+use a `ReadWriteMany` class.
 
 ## Headlamp
 
@@ -90,4 +127,5 @@ ServiceAccount to `cluster-admin` by default (`headlamp.clusterRoleBinding`); us
 their own token unless `headlamp.config.unsafeUseServiceAccountToken` is set.
 
 The PlatformInstance plugin (#273) is installed through Headlamp's plugin manager sidecar. Until it is
-published, `headlamp.pluginsManager` is a documented stub in `values.yaml`.
+published, `headlamp.pluginsManager` is a documented stub in `values.yaml`. Its `pluginctl` version and
+its `node` base image (by digest) are pinned rather than upstream's `latest` and `lts-alpine`.

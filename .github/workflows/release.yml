@@ -240,24 +240,47 @@ jobs:
             exit 1
           fi
           helm lint platform/operator/chart
+          # The chart refuses an image.digest that is not sha256:<64 hex>, the placeholder included.
+          # Refuse to publish a chart whose defaults cannot install. existingSecret only skips the
+          # passphrase's offline-render guard.
+          if ! helm template platform-operator platform/operator/chart \
+            --set passphrase.existingSecret=release-check >/dev/null; then
+            echo "::error::platform/operator/chart/values.yaml image.digest is not pinned (sha256:<64 hex>); refusing to publish the chart"
+            exit 1
+          fi
           mkdir -p "$RUNNER_TEMP/chart"
           helm package platform/operator/chart --version "$VERSION" --app-version "$VERSION" \
             --destination "$RUNNER_TEMP/chart"
           echo "tarball=$RUNNER_TEMP/chart/platform-operator-${VERSION}.tgz" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
+      # helm 3 packaging is not reproducible and helm push overwrites a tag, so a re-run would
+      # replace a released chart with different bytes. Push only when the version is not there yet.
       - name: Push the chart to GHCR
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TARBALL: ${{ steps.package.outputs.tarball }}
+          VERSION: ${{ steps.package.outputs.version }}
         run: |
           set -euo pipefail
           echo "$GITHUB_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          helm push "$TARBALL" oci://ghcr.io/di-framework/charts
+          if helm show chart oci://ghcr.io/di-framework/charts/platform-operator --version "$VERSION" \
+            >/dev/null 2>"$RUNNER_TEMP/show-chart.err"; then
+            echo "::notice::platform-operator ${VERSION} is already in ghcr.io/di-framework/charts; not pushing it again"
+          # A missing tag is "not found"/"manifest unknown"; a package that does not exist yet (the
+          # first release) is "name unknown" or a 403 "denied". A real auth problem fails the push.
+          elif grep -qiE 'not found|manifest unknown|name unknown|denied' "$RUNNER_TEMP/show-chart.err"; then
+            helm push "$TARBALL" oci://ghcr.io/di-framework/charts
+          else
+            cat "$RUNNER_TEMP/show-chart.err" >&2
+            echo "::error::could not check whether platform-operator ${VERSION} is already published"
+            exit 1
+          fi
           helm registry logout ghcr.io
 
   github-release:
     name: Create GitHub Release
-    needs: publish
+    needs: [publish, chart]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:

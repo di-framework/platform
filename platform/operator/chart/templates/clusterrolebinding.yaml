@@ -13,6 +13,7 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "platform-operator.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- if .Values.rbac.clusterAdmin }}
 ---
 # Required in v1alpha1: the operator installs the vCluster chart with Helm, which creates RBAC,
 # workloads and Services in each instance's host namespace, and Kubernetes only lets Helm grant
@@ -31,3 +32,4 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "platform-operator.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- end }}
