@@ -46,6 +46,9 @@ const TENANT_API = `
     const server = http.createServer((req, res) => {
       tenantHits.push(req.url);
       res.setHeader('content-type', 'application/json');
+      // An unref'd server still holds its accepted keep-alive sockets: without this, every child
+      // idles about 3 s after its output before it can exit.
+      res.setHeader('connection', 'close');
       res.statusCode = Number(process.env.TENANT_API_STATUS || 200);
       if (res.statusCode !== 200) return res.end('{"kind":"Status","message":"secret detail"}');
       res.end(JSON.stringify({ items: JSON.parse(process.env.TENANTS || '[]').map(name => ({ metadata: { name } })) }));
