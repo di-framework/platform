@@ -199,8 +199,7 @@ jobs:
           bash platform/sqlite-component/scripts/install-tools.sh --rust
           echo "$GITHUB_WORKSPACE/platform/sqlite-component/.tools/bin" >> "$GITHUB_PATH"
 
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
+      # No `bun install`: the component scripts import only Bun built-ins.
 
       # The engine source build (Docker, about 6 minutes) is skipped when target/engine holds a
       # source-stamp matching its inputs; the key hashes the same files, so a hit restores a
