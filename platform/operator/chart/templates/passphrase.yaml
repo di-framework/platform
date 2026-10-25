@@ -1,0 +1,25 @@
+{{- if not .Values.passphrase.existingSecret }}
+{{- $name := include "platform-operator.passphraseSecret" . }}
+{{- /* Generated once. Every upgrade reuses the passphrase already in the cluster, since a new one
+would make the existing Pulumi state unreadable. */}}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
+{{- $passphrase := "" }}
+{{- if and $existing $existing.data (hasKey $existing.data "passphrase") }}
+{{- $passphrase = index $existing.data "passphrase" }}
+{{- else }}
+{{- $passphrase = randAlphaNum 48 | b64enc }}
+{{- end }}
+# Encrypts the secrets in the operator's Pulumi state. Kept on `helm uninstall`, like the state.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "platform-operator.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+data:
+  passphrase: {{ $passphrase }}
+{{- end }}

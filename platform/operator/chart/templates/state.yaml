@@ -1,0 +1,22 @@
+{{- if not .Values.state.existingClaim }}
+# The operator's Pulumi state. Kept on `helm uninstall`: without it Pulumi forgets what it
+# installed. A reinstall with the same release name and namespace adopts it again.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "platform-operator.stateClaim" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "platform-operator.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.state.accessModes | nindent 4 }}
+  {{- with .Values.state.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.state.size | quote }}
+{{- end }}

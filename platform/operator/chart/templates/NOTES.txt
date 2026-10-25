@@ -1,0 +1,22 @@
+The platform operator is installed in {{ .Release.Namespace }}.
+
+Create an instance:
+
+  kubectl apply -f - <<'YAML'
+  apiVersion: platform.di-framework.dev/v1alpha1
+  kind: PlatformInstance
+  metadata:
+    name: one
+    namespace: default
+  spec:
+    version: <@di-framework/platform version>
+    target:
+      type: vcluster
+  YAML
+
+  kubectl get pi -A
+
+`helm uninstall {{ .Release.Name }}` removes the operator only. The PlatformInstance CRD (and so
+every instance), the state claim {{ include "platform-operator.stateClaim" . }} and the passphrase
+Secret {{ include "platform-operator.passphraseSecret" . }} stay. Reinstall with the same release
+name and namespace to pick them up again.

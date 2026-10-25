@@ -1,0 +1,21 @@
+apiVersion: v2
+name: platform-operator
+description: >-
+  The di-framework platform operator: the PlatformInstance CRD and the operator that turns each
+  PlatformInstance into an isolated copy of the platform in a vCluster. Optionally Headlamp.
+type: application
+home: https://github.com/di-framework/platform/tree/main/platform/operator
+sources:
+  - https://github.com/di-framework/platform
+# Placeholders: the release job packages the chart with
+# `helm package --version <release> --app-version <release>`.
+version: 0.0.0
+appVersion: "0.0.0"
+dependencies:
+  # Vendored in charts/ and recorded in Chart.lock, so packaging and the tests never fetch it.
+  # To upgrade: change the version, run `helm dependency update`, and update HEADLAMP_SHA256 in
+  # tests/operator-chart.test.ts (the `digest` of the release in the upstream index.yaml).
+  - name: headlamp
+    version: 0.46.0
+    repository: https://kubernetes-sigs.github.io/headlamp/
+    condition: headlamp.enabled
