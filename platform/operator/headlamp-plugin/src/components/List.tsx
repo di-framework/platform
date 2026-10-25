@@ -1,7 +1,7 @@
 import { ResourceListView } from '@kinvolk/headlamp-plugin/lib/components/common';
 import Button from '@mui/material/Button';
 import { useState } from 'react';
-import { createInstance, updateInstance } from '../api';
+import { submitInstance } from '../api';
 import { platformInstanceColumns } from '../columns';
 import { PlatformInstance } from '../resource';
 import { PlatformInstanceFormDialog } from './PlatformInstanceForm';
@@ -27,7 +27,7 @@ export function PlatformInstanceList() {
           open
           mode="create"
           onClose={() => setCreating(false)}
-          submit={(obj, mode) => (mode === 'create' ? createInstance(obj) : updateInstance(obj))}
+          submit={submitInstance}
         />
       )}
     </>

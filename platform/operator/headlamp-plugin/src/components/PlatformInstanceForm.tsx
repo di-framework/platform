@@ -10,8 +10,10 @@ import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
 import { dump } from 'js-yaml';
 import { useMemo, useState } from 'react';
+import type { Submission } from '../api';
 import {
   buildPlatformInstance,
+  editPatch,
   emptyForm,
   type FormField,
   type FormMode,
@@ -31,14 +33,13 @@ import {
 export interface PlatformInstanceFormProps {
   open: boolean;
   mode: FormMode;
-  /** The object being edited (edit mode). */
+  /** The object being edited (edit mode); the edit is computed against it as it was at open. */
   existing?: PlatformInstanceObject;
   /** The namespace the create form starts with. */
   defaultNamespace?: string;
   onClose: () => void;
-  /** Sends the object; rejects with an Error whose message is shown. */
-  submit: (obj: PlatformInstanceObject, mode: FormMode) => Promise<unknown>;
-  onDone?: (obj: PlatformInstanceObject) => void;
+  /** Sends the new object (create) or the JSON Patch (edit); rejects with an Error to show. */
+  submit: (submission: Submission) => Promise<unknown>;
 }
 
 const API_DEFAULT = '(API default)';
@@ -48,7 +49,10 @@ const API_DEFAULT = '(API default)';
  * exactly as for a manifest; fields that can't change after creation are disabled on edit.
  */
 export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
-  const { open, mode, existing, defaultNamespace, onClose, submit, onDone } = props;
+  const { open, mode, defaultNamespace, onClose, submit } = props;
+  // Snapshot at open: later watch updates of `existing` must not move the patch's baseline, or a
+  // concurrent change would be overwritten instead of detected.
+  const [existing] = useState(() => (props.existing ? structuredClone(props.existing) : undefined));
   const [form, setForm] = useState<FormState>(() =>
     existing ? formFromObject(existing) : emptyForm(defaultNamespace ?? 'default'),
   );
@@ -59,7 +63,18 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
   const [showPreview, setShowPreview] = useState(false);
 
   const errors = useMemo(() => validateForm(form, mode), [form, mode]);
-  const object = useMemo(() => buildPlatformInstance(form, existing), [form, existing]);
+  const submission = useMemo<Submission>(
+    () =>
+      mode === 'edit' && existing
+        ? {
+            mode: 'edit',
+            namespace: existing.metadata.namespace ?? '',
+            name: existing.metadata.name,
+            patch: editPatch(existing, form),
+          }
+        : { mode: 'create', object: buildPlatformInstance(form) },
+    [form, mode, existing],
+  );
 
   function set<K extends FormField>(field: K, value: FormState[K]) {
     setForm((f) => ({ ...f, [field]: value }));
@@ -78,8 +93,7 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
     }
     setBusy(true);
     try {
-      await submit(object, mode);
-      onDone?.(object);
+      await submit(submission);
       onClose();
     } catch (err) {
       setServerError(err instanceof Error ? err.message : String(err));
@@ -208,11 +222,13 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
         )}
         <Box sx={{ mt: 2 }}>
           <Button size="small" onClick={() => setShowPreview((s) => !s)}>
-            {showPreview ? 'Hide YAML' : 'Show YAML'}
+            {showPreview ? 'Hide YAML' : submission.mode === 'edit' ? 'Show patch' : 'Show YAML'}
           </Button>
           {showPreview && (
             <Box component="pre" aria-label="Object preview" sx={{ fontSize: '0.8rem', p: 1 }}>
-              {dump(object, { noRefs: true })}
+              {dump(submission.mode === 'edit' ? submission.patch : submission.object, {
+                noRefs: true,
+              })}
             </Box>
           )}
         </Box>
