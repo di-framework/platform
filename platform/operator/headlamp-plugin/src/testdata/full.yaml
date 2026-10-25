@@ -1,0 +1,17 @@
+# Every spec field set.
+apiVersion: platform.di-framework.dev/v1alpha1
+kind: PlatformInstance
+metadata:
+  name: full-instance
+  namespace: team-b
+spec:
+  version: 6.0.18-rc.1
+  target:
+    type: vcluster
+  platform:
+    networkPolicyEngine: kube-router
+    storageRoot: /var/lib/di-framework/team-b/full-instance
+    gateway:
+      httpNodePort: 30080
+      httpEndpoint: http://apps.example:30080
+  deletionPolicy: Retain

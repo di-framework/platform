@@ -1,6 +1,8 @@
 [test]
 coverageReporter = ["text", "lcov"]
 coverageThreshold = { lines = 1.0, functions = 0 }
+# The Headlamp plugin is a standalone package with its own lockfile and vitest suite (its own CI job).
+pathIgnorePatterns = ["platform/operator/headlamp-plugin/**"]
 coveragePathIgnorePatterns = [
   "**/platform/tenant-cli/src/api/generated/**",
   "**/platform/tenant-cli/src/api/generated/**/*.d.ts",

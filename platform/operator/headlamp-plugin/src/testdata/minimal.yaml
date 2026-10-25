@@ -1,0 +1,10 @@
+# The smallest valid PlatformInstance: only the required fields. Defaults stay with the API.
+apiVersion: platform.di-framework.dev/v1alpha1
+kind: PlatformInstance
+metadata:
+  name: one
+  namespace: team-a
+spec:
+  version: 6.0.17
+  target:
+    type: vcluster
