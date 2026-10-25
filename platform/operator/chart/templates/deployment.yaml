@@ -47,9 +47,18 @@ spec:
             - --leader-elect={{ .Values.leaderElect }}
             - --metrics-bind-address=:8080
             - --health-probe-bind-address=:8081
+            {{- with .Values.cleanupNamespace }}
+            - --cleanup-namespace={{ . }}
+            {{- end }}
             {{- range .Values.extraArgs }}
             - {{ . | quote }}
             {{- end }}
+          env:
+            # The operator's own namespace, where it runs its storageRoot cleanup Jobs by default.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: metrics
               containerPort: 8080

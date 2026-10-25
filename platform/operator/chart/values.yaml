@@ -23,6 +23,12 @@ repairInterval: 30m
 targetPoll: 10s
 # Instances reconciled in parallel. Each install runs `npm install` and Pulumi in the operator pod.
 maxConcurrentInstalls: 2
+# Where the operator runs the Jobs that remove a deleted instance's default storageRoot
+# (--cleanup-namespace, from #426). Empty (the default) passes no flag and the operator uses its own
+# namespace, the release namespace. Those Jobs mount <storageRootBase> with hostPath, so Pod
+# Security admission must allow privileged pods in that namespace (see the chart README). Set this
+# only with an operator image that has the flag.
+cleanupNamespace: ""
 # Extra operator flags, such as the zap logging flags (--zap-log-level=debug).
 extraArgs: []
 
