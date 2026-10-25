@@ -5,7 +5,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -51,6 +50,9 @@ type Reconciler struct {
 	// StorageRootBase is the node directory under which each instance gets its own storageRoot
 	// when spec.platform.storageRoot is empty.
 	StorageRootBase string
+	// CleanupNamespace is where the Job that removes a deleted instance's default storageRoot
+	// runs: the operator's own namespace, since the Job mounts the node's storage root base.
+	CleanupNamespace string
 	// MaxConcurrent caps parallel reconciles across instances (installs are long-running).
 	MaxConcurrent int
 	// InstallTimeout bounds one install or repair, so a hung npm or Pulumi run frees its worker.
@@ -68,6 +70,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;create;delete
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // The vCluster chart creates RBAC, workloads and Services in each instance namespace; Helm needs
 // every permission it grants. v1alpha1 binds the operator to cluster-admin for that (see README).
@@ -189,7 +192,8 @@ func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstanc
 	})
 }
 
-// reconcileDelete applies the deletion policy, then releases the finalizer.
+// reconcileDelete applies the deletion policy, then releases the finalizer. Delete removes the
+// target, then the install state, then the default storageRoot on the node.
 func (r *Reconciler) reconcileDelete(ctx context.Context, inst *v1alpha1.PlatformInstance, obs plan.Observation) (ctrl.Result, error) {
 	d := plan.Next(obs, r.Plan)
 	switch d.Action {
@@ -215,6 +219,19 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, inst *v1alpha1.Platfor
 		}
 		obs.UninstallDone = true
 		return r.reconcileDelete(ctx, inst, obs)
+	case plan.CleanStorage:
+		// The target is gone, so nothing writes to the storageRoot any more.
+		done, err := r.cleanStorage(ctx, inst)
+		if err != nil {
+			return r.fail(ctx, inst, v1alpha1.ConditionInstalled, v1alpha1.ReasonStorageCleanupFailed,
+				fmt.Sprintf("removing storageRoot %s failed (annotate %s=true to skip): %v",
+					r.storageRoot(inst), v1alpha1.AnnotationSkipStorageCleanup, err), err)
+		}
+		if !done {
+			return ctrl.Result{RequeueAfter: d.RequeueAfter}, nil
+		}
+		obs.StorageCleaned = true
+		return r.reconcileDelete(ctx, inst, obs)
 	default:
 		return ctrl.Result{}, nil
 	}
@@ -223,15 +240,17 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, inst *v1alpha1.Platfor
 func (r *Reconciler) observe(inst *v1alpha1.PlatformInstance) plan.Observation {
 	installed := meta.IsStatusConditionTrue(inst.Status.Conditions, v1alpha1.ConditionInstalled)
 	o := plan.Observation{
-		Deleting:         !inst.DeletionTimestamp.IsZero(),
-		HasFinalizer:     controllerutil.ContainsFinalizer(inst, Finalizer),
-		Policy:           inst.Spec.DeletionPolicy,
-		Generation:       inst.Generation,
-		DesiredVersion:   inst.Spec.Version,
-		InstalledVersion: inst.Status.InstalledVersion,
-		Installed:        installed,
-		InstallAttempted: meta.FindStatusCondition(inst.Status.Conditions, v1alpha1.ConditionInstalled) != nil,
-		Now:              r.now(),
+		Deleting:           !inst.DeletionTimestamp.IsZero(),
+		HasFinalizer:       controllerutil.ContainsFinalizer(inst, Finalizer),
+		Policy:             inst.Spec.DeletionPolicy,
+		CustomStorageRoot:  inst.Spec.Platform.StorageRoot != "",
+		SkipStorageCleanup: inst.Annotations[v1alpha1.AnnotationSkipStorageCleanup] == "true",
+		Generation:         inst.Generation,
+		DesiredVersion:     inst.Spec.Version,
+		InstalledVersion:   inst.Status.InstalledVersion,
+		Installed:          installed,
+		InstallAttempted:   meta.FindStatusCondition(inst.Status.Conditions, v1alpha1.ConditionInstalled) != nil,
+		Now:                r.now(),
 	}
 	if installed {
 		o.InstalledGeneration = inst.Status.ObservedGeneration
@@ -248,15 +267,10 @@ func (r *Reconciler) request(inst *v1alpha1.PlatformInstance, st targets.State) 
 	if engine == "" {
 		engine = "existing"
 	}
-	root := inst.Spec.Platform.StorageRoot
-	if root == "" {
-		// Kubernetes names can't contain "/", so <namespace>/<name> is unique per instance.
-		root = path.Join(r.StorageRootBase, inst.Namespace, inst.Name)
-	}
 	settings := map[string]any{
 		"namespace":           PlatformNamespace,
 		"networkPolicyEngine": string(engine),
-		"storageRoot":         root,
+		"storageRoot":         r.storageRoot(inst),
 		"httpNodePort":        int(inst.Spec.Platform.Gateway.HTTPNodePort),
 	}
 	if st.Server != "" {

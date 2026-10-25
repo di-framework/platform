@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -28,6 +29,9 @@ import (
 	"github.com/di-framework/platform/operator/internal/targets/vcluster"
 )
 
+// serviceAccountNamespace holds the namespace of an in-cluster pod.
+const serviceAccountNamespace = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "platform-operator:", err)
@@ -41,6 +45,7 @@ func run() error {
 		passphraseFile  = flag.String("passphrase-file", "/etc/platform-operator/passphrase", "file holding the passphrase that encrypts install state secrets")
 		npm             = flag.String("npm", installer.DefaultNPM, "absolute path of npm")
 		storageRootBase = flag.String("storage-root-base", "/var/lib/kubesolo/instances", "node directory under which each instance gets its own storageRoot")
+		cleanupNS       = flag.String("cleanup-namespace", "", "namespace for the Jobs that remove a deleted instance's default storageRoot (default: the operator's own namespace)")
 		repairInterval  = flag.Duration("repair-interval", 30*time.Minute, "how often a ready instance gets a refresh and up to repair drift")
 		targetPoll      = flag.Duration("target-poll", 10*time.Second, "how often to check a target that is still coming up")
 		installTimeout  = flag.Duration("install-timeout", 30*time.Minute, "longest one install or repair may run before it is cancelled and retried")
@@ -62,6 +67,14 @@ func run() error {
 		return errors.New("passphrase file is empty")
 	}
 
+	if *cleanupNS == "" {
+		ns, err := os.ReadFile(serviceAccountNamespace)
+		if err != nil {
+			return fmt.Errorf("--cleanup-namespace is unset and the operator's namespace is unknown: %w", err)
+		}
+		*cleanupNS = strings.TrimSpace(string(ns))
+	}
+
 	scheme := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{clientgoscheme.AddToScheme, v1alpha1.AddToScheme} {
 		if err := add(scheme); err != nil {
@@ -78,11 +91,12 @@ func run() error {
 		// The watch on owned Secrets sees only the operator's kubeconfig Secrets, and Secret and
 		// Service reads (vCluster's kubeconfig, the host DNS Service) go to the API server, so
 		// the operator never caches the cluster's other Secrets, Helm releases among them.
-		// Namespace reads go there too, so the host namespace owner check never sees a stale copy.
+		// Namespace reads go there too, so the host namespace owner check never sees a stale copy,
+		// and so do the storage cleanup Job reads, which the operator polls instead of watching.
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
 			&corev1.Secret{}: {Label: labels.SelectorFromSet(controller.ManagedLabels)},
 		}},
-		Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}, &corev1.Service{}, &corev1.Namespace{}}}},
+		Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}, &corev1.Service{}, &corev1.Namespace{}, &batchv1.Job{}}}},
 	})
 	if err != nil {
 		return err
@@ -102,10 +116,11 @@ func run() error {
 			Log:        os.Stderr,
 			NPM:        *npm,
 		},
-		Plan:            plan.Config{RepairInterval: *repairInterval, TargetPoll: *targetPoll},
-		StorageRootBase: *storageRootBase,
-		MaxConcurrent:   *concurrency,
-		InstallTimeout:  *installTimeout,
+		Plan:             plan.Config{RepairInterval: *repairInterval, TargetPoll: *targetPoll},
+		StorageRootBase:  *storageRootBase,
+		CleanupNamespace: *cleanupNS,
+		MaxConcurrent:    *concurrency,
+		InstallTimeout:   *installTimeout,
 	}
 	if err := r.SetupWithManager(mgr); err != nil {
 		return err

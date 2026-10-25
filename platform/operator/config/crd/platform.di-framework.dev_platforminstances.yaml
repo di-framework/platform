@@ -97,7 +97,8 @@ spec:
                   storageRoot:
                     description: |-
                       StorageRoot is the node path under which the platform keeps tenant data. Empty uses the
-                      operator's per-instance default.
+                      operator's per-instance default, which deletionPolicy Delete removes. The operator didn't
+                      create a path set here, so it never removes it.
                     type: string
                 type: object
               target:

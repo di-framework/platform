@@ -33,7 +33,8 @@ type DeletionPolicy string
 
 const (
 	// DeletionDelete deletes the target cluster, with the platform and the cluster's own data
-	// volume. Tenant data under storageRoot stays on the node (see the README).
+	// volume, then removes the operator's default storageRoot from the node. A custom
+	// spec.platform.storageRoot is never removed (see the README).
 	DeletionDelete DeletionPolicy = "Delete"
 	// DeletionRetain removes the PlatformInstance but keeps the target cluster, its data and
 	// the install state, so a PlatformInstance with the same name picks them up again.
@@ -82,7 +83,8 @@ type PlatformSettings struct {
 	NetworkPolicyEngine NetworkPolicyEngine `json:"networkPolicyEngine,omitempty"`
 
 	// StorageRoot is the node path under which the platform keeps tenant data. Empty uses the
-	// operator's per-instance default.
+	// operator's per-instance default, which deletionPolicy Delete removes. The operator didn't
+	// create a path set here, so it never removes it.
 	// +optional
 	StorageRoot string `json:"storageRoot,omitempty"`
 
@@ -129,6 +131,15 @@ const (
 	// ConditionReady is True when the instance is usable at spec.version.
 	ConditionReady = "Ready"
 )
+
+// ReasonStorageCleanupFailed (on Installed) reports that removing the default storageRoot after a
+// Delete failed. The finalizer stays until a retry succeeds, the instance is annotated with
+// AnnotationSkipStorageCleanup, or its deletionPolicy is set to Retain.
+const ReasonStorageCleanupFailed = "StorageCleanupFailed"
+
+// AnnotationSkipStorageCleanup set to "true" on a PlatformInstance makes deletionPolicy Delete
+// leave the default storageRoot on the node, for example when the node can't run the cleanup.
+const AnnotationSkipStorageCleanup = "platform.di-framework.dev/skip-storage-cleanup"
 
 // PlatformInstanceStatus is the observed state of an instance.
 type PlatformInstanceStatus struct {
