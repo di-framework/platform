@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -93,6 +94,32 @@ func TestInstanceValuesMatchTheLayer3PassingValues(t *testing.T) {
 	data := haveManifests[3]["data"].(map[string]any)
 	if !bytes.Equal([]byte(data["Corefile"].(string)), []byte(haveCorefile)) {
 		t.Fatalf("manifest ConfigMap Corefile differs from overwriteConfig:\n%q\n%q", data["Corefile"], haveCorefile)
+	}
+}
+
+var digestPinned = regexp.MustCompile(`^docker\.io/coredns/coredns:[0-9.]+@sha256:[0-9a-f]{64}$`)
+
+func TestCoreDNSImageIsDigestPinned(t *testing.T) {
+	if !digestPinned.MatchString(CoreDNSImage) {
+		t.Fatalf("CoreDNSImage %q is not pinned by digest", CoreDNSImage)
+	}
+	v, err := InstanceValues("10.43.0.10", "pi-a-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, manifests := coredns(t, normalize(t, v))
+	var images []string
+	for _, obj := range manifests {
+		if obj["kind"] != "Deployment" {
+			continue
+		}
+		pod := obj["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
+		for _, c := range pod["containers"].([]any) {
+			images = append(images, c.(map[string]any)["image"].(string))
+		}
+	}
+	if len(images) != 1 || images[0] != CoreDNSImage {
+		t.Fatalf("CoreDNS Deployment images %q, want [%q]", images, CoreDNSImage)
 	}
 }
 

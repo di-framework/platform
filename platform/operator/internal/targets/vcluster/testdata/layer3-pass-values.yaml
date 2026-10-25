@@ -1,5 +1,6 @@
 # The vCluster values the proving-grounds Layer 3 run passed with inside a vCluster on KubeSolo
-# (2026-10-17, run 2: 15/15, 4/4, 2/2). InstanceValues must render exactly these.
+# (2026-10-17, run 2: 15/15, 4/4, 2/2). InstanceValues must render exactly these. Since then the
+# CoreDNS image is pinned by digest (the multi-arch index of the same 1.14.2 tag the run used).
 sync:
   toHost:
     networkPolicies:
@@ -105,7 +106,7 @@ controlPlane:
             nodeSelector: {kubernetes.io/os: linux}
             containers:
               - name: coredns
-                image: docker.io/coredns/coredns:1.14.2
+                image: docker.io/coredns/coredns:1.14.2@sha256:e7e6440cfd1e919280958f5b5a6ab2b184d385bba774c12ad2a9e1e4183f90d9
                 imagePullPolicy: IfNotPresent
                 args: [-conf, /etc/coredns/Corefile]
                 ports:
