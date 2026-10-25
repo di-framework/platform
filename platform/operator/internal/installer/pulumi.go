@@ -249,9 +249,14 @@ func (p *Pulumi) writeProject(ctx context.Context, req Request, projectDir, stat
 			return err
 		}
 	}
+	// The stamp alone isn't enough: node_modules can go missing under it (a partial restore of
+	// the state volume), and Pulumi would then fail on a missing module every round.
 	stamp := filepath.Join(projectDir, ".installed-version")
+	installed := filepath.Join(projectDir, "node_modules", "@di-framework", "platform", "package.json")
 	if b, err := os.ReadFile(stamp); err == nil && string(b) == req.Version {
-		return nil
+		if _, err := os.Stat(installed); err == nil {
+			return nil
+		}
 	}
 	install := p.npmInstall
 	if install == nil {

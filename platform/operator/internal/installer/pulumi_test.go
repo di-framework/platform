@@ -51,8 +51,15 @@ func newTestPulumi(t *testing.T, s *fakeStack) (*Pulumi, *int) {
 	t.Helper()
 	npm := 0
 	return &Pulumi{
-		StateDir:   t.TempDir(),
-		npmInstall: func(context.Context, string) error { npm++; return nil },
+		StateDir: t.TempDir(),
+		npmInstall: func(_ context.Context, dir string) error {
+			npm++
+			pkg := filepath.Join(dir, "node_modules", "@di-framework", "platform")
+			if err := os.MkdirAll(pkg, 0o700); err != nil {
+				return err
+			}
+			return os.WriteFile(filepath.Join(pkg, "package.json"), []byte("{}"), 0o600)
+		},
 		open: func(context.Context, *Pulumi, string, string, string) (stack, error) {
 			return s, nil
 		},
@@ -113,6 +120,18 @@ func TestInstallRunsUpAndReadsEndpoints(t *testing.T) {
 	}
 	if *npm != 2 {
 		t.Fatalf("npm installs %d, want 2 (6.0.17 once, 6.0.18 once)", *npm)
+	}
+
+	// node_modules lost under a matching stamp (a partial volume restore): install again.
+	projectDir, _ = p.dirs(next.ID)
+	if err := os.RemoveAll(filepath.Join(projectDir, "node_modules")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Install(context.Background(), next, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if *npm != 3 {
+		t.Fatalf("npm installs %d, want 3 after node_modules went missing", *npm)
 	}
 }
 
