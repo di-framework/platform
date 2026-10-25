@@ -13,11 +13,15 @@ it does, `kubectl apply` of the same YAML does too.
 - **Edit spec** sends a JSON Patch (RFC 6902, `application/json-patch+json`) computed from the
   form's changes against the object as it was when the dialog opened, never a full PUT. The patch
   touches only the form's spec fields that changed, so spec fields this plugin version doesn't
-  know, labels, annotations and the rest of the metadata are left as they are. It starts with
-  `test` operations on `metadata.resourceVersion` (captured at open) and on each changed field's old
-  value: if the object changed meanwhile (including a status write by the operator), the apiserver
-  rejects the whole patch and the form says the instance changed and must be reopened, instead of
-  overwriting someone else's change. **Show patch** shows the operations.
+  know, labels, annotations and the rest of the metadata are left as they are. It starts with a
+  `test` of each changed field's old value, and tests that a `platform` or `gateway` it empties is
+  still `{}` before removing it. JSON Patch can't test that a key is absent, so a patch that adds a
+  missing field or container also tests `metadata.resourceVersion` (captured at open). If one of
+  those changed meanwhile, the apiserver rejects the whole patch (a 422 "the server rejected our
+  request due to an error in our request", or a 409) and the form says the instance changed and
+  must be reopened, instead of overwriting someone else's change. A status write by the operator
+  doesn't block an edit of existing fields. A validation error (`… is invalid: …`) is shown as the
+  apiserver sent it. **Show patch** shows the operations.
 - **Detail view**: spec and status, endpoints, conditions with reasons and messages, recent Events,
   and the instance kubeconfig from `status.kubeconfigSecretRef`. The Secret is read only when you
   click Show or Download, through Headlamp's API proxy with your own credentials, so RBAC on the

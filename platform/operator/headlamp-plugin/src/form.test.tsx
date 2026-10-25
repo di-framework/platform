@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { CONFLICT_MESSAGE } from './api';
 import { PlatformInstanceFormDialog } from './components/PlatformInstanceForm';
-import { applyPatch } from './testdata/applyPatch';
+import { applyPatch, PatchError } from './testdata/applyPatch';
 import { full, minimal } from './testdata/fixtures';
 import type { PlatformInstanceObject } from './types';
 
@@ -108,7 +108,11 @@ describe('PlatformInstanceFormDialog', () => {
       />,
     );
     // A watch update while the dialog is open must not move the baseline the patch is tested on.
-    const newer = { ...live, metadata: { ...live.metadata, resourceVersion: '10' } };
+    const newer = {
+      ...live,
+      metadata: { ...live.metadata, resourceVersion: '10' },
+      spec: { ...live.spec, version: '6.0.20' },
+    } as PlatformInstanceObject;
     rerender(
       <PlatformInstanceFormDialog
         open
@@ -137,13 +141,15 @@ describe('PlatformInstanceFormDialog', () => {
       namespace: 'team-b',
       name: 'full-instance',
       patch: [
-        { op: 'test', path: '/metadata/resourceVersion', value: '9' },
         { op: 'test', path: '/spec/version', value: '6.0.18-rc.1' },
         { op: 'replace', path: '/spec/version', value: '6.0.19' },
       ],
     });
-    // Applied to the object as it is now (resourceVersion 10), the patch is a conflict.
-    expect(() => applyPatch(newer, sent.patch)).toThrow(/resourceVersion failed/);
+    // Applied to the object as it is now (another version), the patch is a conflict.
+    expect(() => applyPatch(newer, sent.patch)).toThrow(PatchError);
+    // A write that left the version alone (a status update) doesn't stop the edit.
+    const statusWrite = { ...live, metadata: { ...live.metadata, resourceVersion: '10' } };
+    expect(applyPatch(statusWrite, sent.patch).spec.version).toBe('6.0.19');
     // Applied to the object it was made for, only the version changes.
     expect(applyPatch(live, sent.patch)).toStrictEqual({
       ...live,
@@ -166,9 +172,7 @@ describe('PlatformInstanceFormDialog', () => {
     );
     type('version', '6.0.19');
     fireEvent.click(screen.getByRole('button', { name: 'Show patch' }));
-    expect(screen.getByLabelText('Object preview').textContent).toContain(
-      '/metadata/resourceVersion',
-    );
+    expect(screen.getByLabelText('Object preview').textContent).toContain('/spec/version');
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     });

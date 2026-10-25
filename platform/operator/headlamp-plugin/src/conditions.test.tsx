@@ -86,7 +86,7 @@ describe('ConditionsTable', () => {
     expect(within(target).getByText('vCluster answers')).toBeTruthy();
 
     const custom = screen.getByTestId('condition-Custom');
-    expect(within(custom).getAllByText('-').length).toBe(1);
+    expect(within(custom).getAllByText('-')).toHaveLength(1);
 
     const order = screen.getAllByTestId(/^condition-/).map((el) => el.dataset.testid);
     expect(order).toEqual([

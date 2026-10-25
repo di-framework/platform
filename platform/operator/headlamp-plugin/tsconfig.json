@@ -1,7 +1,8 @@
 {
   "extends": "./node_modules/@kinvolk/headlamp-plugin/config/plugins-tsconfig.json",
   "compilerOptions": {
-    "module": "esnext"
+    "module": "esnext",
+    "lib": ["es2022", "dom", "dom.iterable"]
   },
   "include": ["./src/**/*"]
 }

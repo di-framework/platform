@@ -159,19 +159,66 @@ function at(root: unknown, path: readonly string[]): unknown {
 }
 
 function pointer(path: readonly string[]): string {
-  return `/spec/${path.map((k) => k.replace(/~/g, '~0').replace(/\//g, '~1')).join('/')}`;
+  return `/spec/${path.map((k) => k.replaceAll('~', '~0').replaceAll('/', '~1')).join('/')}`;
+}
+
+/** The container at `path` in `root`; every container on the way exists. */
+const container = (root: Tree, path: readonly string[]) => at(root, path) as Tree;
+
+/**
+ * Removes the field at `path` from `work` and returns the ops that do the same on the server:
+ * the `remove`, then a `test` that each container the removal emptied is `{}` and its `remove`,
+ * innermost first. The `test` fails if someone added to the container meanwhile.
+ */
+function removeOps(work: Tree, path: readonly string[]): JsonPatchOp[] {
+  const ops: JsonPatchOp[] = [{ op: 'remove', path: pointer(path) }];
+  delete container(work, path.slice(0, -1))[path.at(-1) as string];
+  for (let depth = path.length - 1; depth > 0; depth--) {
+    const parent = path.slice(0, depth);
+    if (Object.keys(container(work, parent)).length > 0) {
+      break;
+    }
+    ops.push({ op: 'test', path: pointer(parent), value: {} });
+    ops.push({ op: 'remove', path: pointer(parent) });
+    delete container(work, parent.slice(0, -1))[parent[depth - 1] as string];
+  }
+  return ops;
+}
+
+/**
+ * Sets the field at `path` in `work` to `value` and returns the ops that do the same on the
+ * server: an `add` of each missing container, then a `replace` of an existing field or an `add`
+ * of a missing one.
+ */
+function setOps(work: Tree, path: readonly string[], value: unknown): JsonPatchOp[] {
+  const ops: JsonPatchOp[] = [];
+  for (let depth = 1; depth < path.length; depth++) {
+    const parent = path.slice(0, depth);
+    if (at(work, parent) === undefined) {
+      ops.push({ op: 'add', path: pointer(parent), value: {} });
+      container(work, parent.slice(0, -1))[parent[depth - 1] as string] = {};
+    }
+  }
+  const leaf = path.at(-1) as string;
+  const parent = container(work, path.slice(0, -1));
+  ops.push({ op: leaf in parent ? 'replace' : 'add', path: pointer(path), value });
+  parent[leaf] = value;
+  return ops;
 }
 
 /**
  * The edit as a JSON Patch against `original`, the object as it was when the dialog opened.
  *
- * - It starts with a `test` of `metadata.resourceVersion` and a `test` of each changed field's old
- *   value, so if anyone changed the object meanwhile the apiserver rejects the whole patch instead
- *   of overwriting their change.
- * - It then touches only the form-owned spec paths that changed: `replace` (or `add`, creating
+ * - It touches only the form-owned spec paths that changed: `replace` (or `add`, creating
  *   `platform`/`gateway` when missing) or `remove`, dropping a `platform`/`gateway` the removal
  *   left empty. Spec fields the form doesn't know, labels, annotations and the rest of the
  *   metadata are never in the patch, so the server keeps them.
+ * - Every changed field that existed is guarded by a `test` of its old value, and every emptied
+ *   container by a `test` that it is still `{}` before its `remove`, so a concurrent change to
+ *   them fails the whole patch instead of being overwritten.
+ * - JSON Patch can't test that a member is absent, so an `add` of a missing key (a container or a
+ *   field) is guarded by a `test` of `metadata.resourceVersion` instead. Only such a patch fails on
+ *   an unrelated write, such as the operator's status updates.
  */
 export function editPatch(
   original: PlatformInstanceObject,
@@ -182,12 +229,8 @@ export function editPatch(
   const work = structuredClone(before);
   const tests: JsonPatchOp[] = [];
   const changes: JsonPatchOp[] = [];
-  if (original.metadata.resourceVersion !== undefined) {
-    tests.push({
-      op: 'test',
-      path: '/metadata/resourceVersion',
-      value: original.metadata.resourceVersion,
-    });
+  if (original.spec === undefined) {
+    changes.push({ op: 'add', path: '/spec', value: {} });
   }
 
   for (const path of FORM_PATHS) {
@@ -199,46 +242,25 @@ export function editPatch(
     if (oldValue !== undefined) {
       tests.push({ op: 'test', path: pointer(path), value: oldValue });
     }
-    const leaf = path[path.length - 1] as string;
-    if (newValue === undefined) {
-      changes.push({ op: 'remove', path: pointer(path) });
-      delete (at(work, path.slice(0, -1)) as Tree)[leaf];
-      // Drop the containers the removal emptied, innermost first.
-      for (let depth = path.length - 1; depth > 0; depth--) {
-        const parent = path.slice(0, depth);
-        if (Object.keys(at(work, parent) as Tree).length > 0) {
-          break;
-        }
-        changes.push({ op: 'remove', path: pointer(parent) });
-        delete (at(work, parent.slice(0, -1)) as Tree)[parent[depth - 1] as string];
-      }
-      continue;
-    }
-    if (original.spec === undefined && changes.length === 0) {
-      changes.push({ op: 'add', path: '/spec', value: {} });
-    }
-    for (let depth = 1; depth < path.length; depth++) {
-      const parent = path.slice(0, depth);
-      if (at(work, parent) === undefined) {
-        changes.push({ op: 'add', path: pointer(parent), value: {} });
-        (at(work, parent.slice(0, -1)) as Tree)[parent[depth - 1] as string] = {};
-      }
-    }
-    changes.push({
-      op: oldValue === undefined ? 'add' : 'replace',
-      path: pointer(path),
-      value: newValue,
-    });
-    (at(work, path.slice(0, -1)) as Tree)[leaf] = newValue;
+    changes.push(
+      ...(newValue === undefined ? removeOps(work, path) : setOps(work, path, newValue)),
+    );
   }
-  return [...tests, ...changes];
+
+  const adds = changes.some((op) => op.op === 'add');
+  const resourceVersion = original.metadata.resourceVersion;
+  const guard: JsonPatchOp[] =
+    adds && resourceVersion !== undefined
+      ? [{ op: 'test', path: '/metadata/resourceVersion', value: resourceVersion }]
+      : [];
+  return [...guard, ...tests, ...changes];
 }
 
 // The apiserver's DNS-1123 subdomain (object names) and label (namespaces) rules.
 const DNS1123_SUBDOMAIN = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/;
 const DNS1123_LABEL = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
 // The CRD's patterns for spec.version and spec.platform.gateway.httpEndpoint.
-const VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$/;
+const VERSION_PATTERN = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/;
 const ENDPOINT_PATTERN = /^https?:\/\//;
 const MAX_NODE_PORT = 32767;
 
@@ -275,7 +297,7 @@ export function validateForm(form: PlatformInstanceForm, mode: FormMode): FormEr
   const nodePort = form.httpNodePort.trim();
   if (nodePort) {
     const n = Number(nodePort);
-    if (!/^[0-9]+$/.test(nodePort) || !Number.isInteger(n) || n < 0 || n > MAX_NODE_PORT) {
+    if (!/^\d+$/.test(nodePort) || !Number.isInteger(n) || n < 0 || n > MAX_NODE_PORT) {
       errors.httpNodePort = `HTTP NodePort must be a whole number from 0 to ${MAX_NODE_PORT}.`;
     }
   }

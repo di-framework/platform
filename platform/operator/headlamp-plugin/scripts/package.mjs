@@ -31,7 +31,7 @@ import { create } from 'tar';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = resolve(root, process.argv[2] ?? 'dist-package');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-const pluginName = pkg.name.replace(/@/g, '').replace(/\//g, '-');
+const pluginName = pkg.name.replaceAll('@', '').replaceAll('/', '-');
 const tarballName = `${pluginName}-${pkg.version}.tar.gz`;
 const distDir = join(root, 'dist');
 
@@ -41,6 +41,12 @@ if (!existsSync(join(distDir, 'main.js'))) {
 }
 
 const EPOCH = new Date(0);
+
+/** Compares two paths by UTF-16 code units (byte order for ASCII), not by locale. */
+function byteOrder(a, b) {
+  if (a < b) return -1;
+  return a > b ? 1 : 0;
+}
 
 /** Every file under dir, as sorted paths relative to it (byte order, not locale). */
 function walk(dir) {
@@ -53,7 +59,7 @@ function walk(dir) {
       out.push(name);
     }
   }
-  return out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return out.sort(byteOrder);
 }
 
 const staging = mkdtempSync(join(tmpdir(), 'headlamp-plugin-package-'));

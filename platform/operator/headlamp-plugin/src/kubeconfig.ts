@@ -23,7 +23,9 @@ export function decodeKubeconfig(secret: SecretLike): string {
     throw new Error(`The Secret has no "${KUBECONFIG_KEY}" key.`);
   }
   const binary = atob(encoded);
-  const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
+  // atob returns one character per byte (U+0000 to U+00FF), never a surrogate pair, so
+  // codePointAt(0) is the byte and is always defined.
+  const bytes = Uint8Array.from(binary, (ch) => ch.codePointAt(0) as number);
   return new TextDecoder().decode(bytes);
 }
 

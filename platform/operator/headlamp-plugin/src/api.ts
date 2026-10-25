@@ -20,16 +20,24 @@ export const CONFLICT_MESSAGE =
   'Close the dialog and open Edit spec again to see the current values.';
 
 /**
- * A failed `test` operation (the apiserver answers 422 "testing value ... failed") or a 409: the
- * object is no longer the one the form was opened on.
+ * The fixed message of the apiserver's 422 for a JSON Patch that doesn't apply
+ * (`k8s.io/apiserver` `pkg/endpoints/handlers/patch.go`, `NewGenericServerResponse`): a failed
+ * `test`, or a `replace`/`remove` of a path a concurrent change removed. The json-patch detail is
+ * dropped, and Headlamp prefixes the status text.
+ */
+const PATCH_REJECTED = 'the server rejected our request due to an error in our request';
+
+/**
+ * A patch the server couldn't apply (422 with {@link PATCH_REJECTED}) or a 409 Conflict: the
+ * object is no longer the one the form was opened on. A 422 from CRD schema or CEL validation
+ * (`… is invalid: …`) is not a conflict: its message says what to fix.
  */
 export function isConflict(err: unknown): boolean {
   const { status, message } = (err ?? {}) as { status?: number; message?: unknown };
-  return (
-    status === 409 ||
-    (status === 422 &&
-      /testing value|test failed/i.test(typeof message === 'string' ? message : ''))
-  );
+  if (status === 409) {
+    return true;
+  }
+  return status === 422 && typeof message === 'string' && message.includes(PATCH_REJECTED);
 }
 
 /** POST the object exactly as built: the same body `kubectl create -f` sends for the manifest. */
