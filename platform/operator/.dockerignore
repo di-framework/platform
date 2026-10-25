@@ -1,0 +1,4 @@
+# Keep the build context to the hashed image inputs (see .github/workflows/platform-operator-image.yml).
+chart/
+headlamp-plugin/
+*.md
