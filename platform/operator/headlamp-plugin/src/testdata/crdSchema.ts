@@ -87,6 +87,35 @@ export function schemaErrors(obj: unknown): ErrorObject[] {
   return validate(obj) ? [] : [...(validate.errors ?? [])];
 }
 
+/** Every `x-kubernetes-validations[].rule` anywhere in the CRD's schema. */
+export function crdCelRules(): string[] {
+  const rules: string[] = [];
+  const walk = (node: unknown) => {
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+    } else if (node && typeof node === 'object') {
+      for (const [k, v] of Object.entries(node)) {
+        if (k === 'x-kubernetes-validations') {
+          for (const { rule } of v as { rule: string }[]) {
+            rules.push(rule);
+          }
+        } else {
+          walk(v);
+        }
+      }
+    }
+  };
+  walk(loadCrd().schema);
+  return rules;
+}
+
+/** The CEL rules `celErrors` implements, verbatim as the CRD states them. */
+export const EMULATED_CEL_RULES: readonly string[] = [
+  'self.metadata.name.size() <= 63',
+  'self.target == oldSelf.target',
+  'has(self.platform) && has(self.platform.storageRoot) ? has(oldSelf.platform) && has(oldSelf.platform.storageRoot) && oldSelf.platform.storageRoot == self.platform.storageRoot : !(has(oldSelf.platform) && has(oldSelf.platform.storageRoot))',
+];
+
 interface CelSubject {
   metadata: { name: string };
   spec: { target: unknown; platform?: { storageRoot?: string } };

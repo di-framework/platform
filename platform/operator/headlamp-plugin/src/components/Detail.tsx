@@ -7,7 +7,7 @@ import Button from '@mui/material/Button';
 import Link from '@mui/material/Link';
 import { useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { fetchSecret, updateInstance } from '../api';
+import { fetchSecret, submitInstance } from '../api';
 import { asObject, PlatformInstance } from '../resource';
 import { phaseOf, phaseSeverity } from '../status';
 import { ConditionsTable } from './Conditions';
@@ -15,7 +15,7 @@ import { KubeconfigSection } from './KubeconfigSection';
 import { PlatformInstanceFormDialog } from './PlatformInstanceForm';
 import { StatusChip } from './StatusChip';
 
-function Url(props: { url?: string }) {
+export function Url(props: { url?: string }) {
   if (!props.url) {
     return <span>-</span>;
   }
@@ -29,7 +29,7 @@ function Url(props: { url?: string }) {
   return <code>{props.url}</code>;
 }
 
-function EditAction(props: { item: PlatformInstance }) {
+export function EditAction(props: { item: PlatformInstance }) {
   const [open, setOpen] = useState(false);
   return (
     <>
@@ -42,7 +42,7 @@ function EditAction(props: { item: PlatformInstance }) {
           mode="edit"
           existing={asObject(props.item)}
           onClose={() => setOpen(false)}
-          submit={(obj) => updateInstance(obj)}
+          submit={submitInstance}
         />
       )}
     </>
@@ -120,6 +120,9 @@ export function PlatformInstanceDetail() {
                 section: (
                   <SectionBox title="Kubeconfig">
                     <KubeconfigSection
+                      key={`${item.getNamespace()}/${item.getName()}/${
+                        item.jsonData.status?.kubeconfigSecretRef?.name ?? ''
+                      }`}
                       instanceName={item.getName()}
                       namespace={item.getNamespace() ?? ''}
                       secretName={item.jsonData.status?.kubeconfigSecretRef?.name}

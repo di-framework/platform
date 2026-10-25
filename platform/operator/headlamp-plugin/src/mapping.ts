@@ -119,32 +119,119 @@ export function specFromForm(form: PlatformInstanceForm): PlatformInstanceSpec {
   return spec;
 }
 
-/**
- * The object to send. On create it is exactly the manifest a user would `kubectl apply`. On edit
- * it is the existing object with its spec replaced (metadata, including resourceVersion, kept so
- * the update is a normal optimistic-concurrency PUT; status left out, the main resource ignores it).
- */
-export function buildPlatformInstance(
-  form: PlatformInstanceForm,
-  existing?: PlatformInstanceObject,
-): PlatformInstanceObject {
-  const spec = specFromForm(form);
-  if (existing) {
-    const updated: PlatformInstanceObject = {
-      ...existing,
-      apiVersion: API_VERSION,
-      kind: KIND,
-      spec,
-    };
-    delete updated.status;
-    return updated;
-  }
+/** The manifest the create form describes: exactly what a user would `kubectl apply`. */
+export function buildPlatformInstance(form: PlatformInstanceForm): PlatformInstanceObject {
   return {
     apiVersion: API_VERSION,
     kind: KIND,
     metadata: { name: form.name.trim(), namespace: form.namespace.trim() },
-    spec,
+    spec: specFromForm(form),
   };
+}
+
+/** One RFC 6902 JSON Patch operation, as the plugin sends them. */
+export type JsonPatchOp =
+  | { op: 'test' | 'add' | 'replace'; path: string; value: unknown }
+  | { op: 'remove'; path: string };
+
+/** The spec paths the form owns. Every other spec field, and all metadata, is left alone. */
+const FORM_PATHS: readonly (readonly string[])[] = [
+  ['version'],
+  ['target', 'type'],
+  ['platform', 'networkPolicyEngine'],
+  ['platform', 'storageRoot'],
+  ['platform', 'gateway', 'httpNodePort'],
+  ['platform', 'gateway', 'httpEndpoint'],
+  ['deletionPolicy'],
+];
+
+type Tree = Record<string, unknown>;
+
+function at(root: unknown, path: readonly string[]): unknown {
+  let node = root;
+  for (const key of path) {
+    if (node === null || typeof node !== 'object') {
+      return undefined;
+    }
+    node = (node as Tree)[key];
+  }
+  return node;
+}
+
+function pointer(path: readonly string[]): string {
+  return `/spec/${path.map((k) => k.replace(/~/g, '~0').replace(/\//g, '~1')).join('/')}`;
+}
+
+/**
+ * The edit as a JSON Patch against `original`, the object as it was when the dialog opened.
+ *
+ * - It starts with a `test` of `metadata.resourceVersion` and a `test` of each changed field's old
+ *   value, so if anyone changed the object meanwhile the apiserver rejects the whole patch instead
+ *   of overwriting their change.
+ * - It then touches only the form-owned spec paths that changed: `replace` (or `add`, creating
+ *   `platform`/`gateway` when missing) or `remove`, dropping a `platform`/`gateway` the removal
+ *   left empty. Spec fields the form doesn't know, labels, annotations and the rest of the
+ *   metadata are never in the patch, so the server keeps them.
+ */
+export function editPatch(
+  original: PlatformInstanceObject,
+  form: PlatformInstanceForm,
+): JsonPatchOp[] {
+  const before: Tree = (original.spec ?? {}) as unknown as Tree;
+  const after = specFromForm(form);
+  const work = structuredClone(before);
+  const tests: JsonPatchOp[] = [];
+  const changes: JsonPatchOp[] = [];
+  if (original.metadata.resourceVersion !== undefined) {
+    tests.push({
+      op: 'test',
+      path: '/metadata/resourceVersion',
+      value: original.metadata.resourceVersion,
+    });
+  }
+
+  for (const path of FORM_PATHS) {
+    const oldValue = at(before, path);
+    const newValue = at(after, path);
+    if (oldValue === newValue) {
+      continue;
+    }
+    if (oldValue !== undefined) {
+      tests.push({ op: 'test', path: pointer(path), value: oldValue });
+    }
+    const leaf = path[path.length - 1] as string;
+    if (newValue === undefined) {
+      changes.push({ op: 'remove', path: pointer(path) });
+      delete (at(work, path.slice(0, -1)) as Tree)[leaf];
+      // Drop the containers the removal emptied, innermost first.
+      for (let depth = path.length - 1; depth > 0; depth--) {
+        const parent = path.slice(0, depth);
+        if (Object.keys(at(work, parent) as Tree).length > 0) {
+          break;
+        }
+        changes.push({ op: 'remove', path: pointer(parent) });
+        delete (at(work, parent.slice(0, -1)) as Tree)[parent[depth - 1] as string];
+      }
+      continue;
+    }
+    if (original.spec === undefined && changes.length === 0) {
+      changes.push({ op: 'add', path: '/spec', value: {} });
+    }
+    for (let depth = 1; depth < path.length; depth++) {
+      const parent = path.slice(0, depth);
+      if (at(work, parent) === undefined) {
+        changes.push({ op: 'add', path: pointer(parent), value: {} });
+        (at(work, parent.slice(0, -1)) as Tree)[parent[depth - 1] as string] = {};
+      }
+    }
+    changes.push({
+      op: oldValue === undefined ? 'add' : 'replace',
+      path: pointer(path),
+      value: newValue,
+    });
+    (at(work, path.slice(0, -1)) as Tree)[leaf] = newValue;
+  }
+  return [...tests, ...changes];
 }
 
 // The apiserver's DNS-1123 subdomain (object names) and label (namespaces) rules.
@@ -206,7 +293,7 @@ export function collectionPath(namespace: string): string {
   return `/apis/${API_VERSION}/namespaces/${encodeURIComponent(namespace)}/${PLURAL}`;
 }
 
-/** The API path of one PlatformInstance (PUT target on edit). */
+/** The API path of one PlatformInstance (PATCH target on edit). */
 export function objectPath(namespace: string, name: string): string {
   return `${collectionPath(namespace)}/${encodeURIComponent(name)}`;
 }

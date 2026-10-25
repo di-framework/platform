@@ -9,15 +9,24 @@ import { describe, expect, it } from 'vitest';
 import {
   buildPlatformInstance,
   collectionPath,
+  editPatch,
   emptyForm,
   formFromObject,
   IMMUTABLE_ON_EDIT,
   isDisabled,
+  type JsonPatchOp,
   objectPath,
   type PlatformInstanceForm,
   validateForm,
 } from './mapping';
-import { celErrors, loadCrd, schemaErrors } from './testdata/crdSchema';
+import { applyPatch, PatchError } from './testdata/applyPatch';
+import {
+  celErrors,
+  crdCelRules,
+  EMULATED_CEL_RULES,
+  loadCrd,
+  schemaErrors,
+} from './testdata/crdSchema';
 import { endpointOnly, full, minimal } from './testdata/fixtures';
 import { API_VERSION, KIND, PLURAL, type PlatformInstanceObject } from './types';
 
@@ -73,7 +82,7 @@ describe.each(Object.keys(fixtures) as (keyof typeof fixtures)[])('fixture %s', 
   });
 
   it('round-trips through the edit form unchanged', () => {
-    expect(buildPlatformInstance(formFromObject(manifest))).toStrictEqual(manifest);
+    expect(editPatch(manifest, formFromObject(manifest))).toStrictEqual([]);
   });
 });
 
@@ -144,37 +153,154 @@ describe('edit', () => {
     }
   });
 
-  it('replaces the spec, keeps metadata (resourceVersion) and drops status', () => {
+  /** What the server does with the patch: apply it, then check the result like any update. */
+  function serverApply(current: PlatformInstanceObject, patch: JsonPatchOp[]) {
+    const updated = applyPatch(current, patch);
+    const body: Partial<PlatformInstanceObject> = {
+      ...updated,
+      metadata: { name: updated.metadata.name },
+    };
+    delete body.status;
+    expect(schemaErrors(body)).toEqual([]);
+    expect(celErrors(updated, current)).toEqual([]);
+    return updated;
+  }
+
+  it('patches only the changed fields, guarded by resourceVersion and their old values', () => {
     const form = { ...formFromObject(live), version: '6.0.19', deletionPolicy: 'Delete' as const };
-    const updated = buildPlatformInstance(form, live);
-    expect(updated.metadata).toStrictEqual(live.metadata);
-    expect(updated).not.toHaveProperty('status');
+    expect(editPatch(live, form)).toStrictEqual([
+      { op: 'test', path: '/metadata/resourceVersion', value: '42' },
+      { op: 'test', path: '/spec/version', value: '6.0.18-rc.1' },
+      { op: 'test', path: '/spec/deletionPolicy', value: 'Retain' },
+      { op: 'replace', path: '/spec/version', value: '6.0.19' },
+      { op: 'replace', path: '/spec/deletionPolicy', value: 'Delete' },
+    ]);
+    const updated = serverApply(live, editPatch(live, form));
     expect(updated.spec).toStrictEqual({
       ...full.spec,
       version: '6.0.19',
       deletionPolicy: 'Delete',
     });
-    expect(schemaErrors(updated)).toEqual([]);
-    expect(celErrors(updated, live)).toEqual([]);
+    expect(updated.status).toStrictEqual(live.status);
+  });
+
+  it('keeps spec fields the form does not know, at every level (W1)', () => {
+    const extended = {
+      ...live,
+      spec: {
+        ...live.spec,
+        futureTopLevel: { a: 1 },
+        platform: {
+          ...live.spec.platform,
+          futurePlatform: true,
+          gateway: { ...live.spec.platform?.gateway, futureGateway: 'x' },
+        },
+      },
+    } as PlatformInstanceObject;
+    const form = {
+      ...formFromObject(extended),
+      version: '6.0.19',
+      httpNodePort: '',
+      httpEndpoint: '',
+    };
+    const updated = applyPatch(extended, editPatch(extended, form));
+    expect(updated.spec).toStrictEqual({
+      ...extended.spec,
+      version: '6.0.19',
+      platform: { ...extended.spec.platform, gateway: { futureGateway: 'x' } },
+    });
+  });
+
+  it('keeps labels, annotations and the rest of the metadata (W3)', () => {
+    const decorated: PlatformInstanceObject = {
+      ...live,
+      metadata: {
+        ...live.metadata,
+        labels: { team: 'a' },
+        annotations: { 'example.com/note': 'keep me' },
+        finalizers: ['platform.di-framework.dev/finalizer'],
+        ownerReferences: [{ apiVersion: 'v1', kind: 'ConfigMap', name: 'owner', uid: 'o-1' }],
+        managedFields: [{ manager: 'kubectl', operation: 'Apply' }],
+      },
+    };
+    const patch = editPatch(decorated, { ...formFromObject(decorated), version: '6.0.19' });
+    expect(patch.filter((op) => op.path.startsWith('/metadata'))).toStrictEqual([
+      { op: 'test', path: '/metadata/resourceVersion', value: '42' },
+    ]);
+    expect(applyPatch(decorated, patch).metadata).toStrictEqual(decorated.metadata);
+  });
+
+  it('fails as a whole when the object changed after the dialog opened', () => {
+    const patch = editPatch(live, { ...formFromObject(live), version: '6.0.19' });
+    // Any other write (spec, labels, status) bumps resourceVersion: rejected, nothing applied.
+    const bumped = { ...live, metadata: { ...live.metadata, resourceVersion: '43' } };
+    expect(() => applyPatch(bumped, patch)).toThrow(PatchError);
+    expect(() => applyPatch(bumped, patch)).toThrow(
+      /testing value \/metadata\/resourceVersion failed/,
+    );
+    // A changed field fails its own test as well.
+    const changed = { ...live, spec: { ...live.spec, version: '6.0.20' } };
+    expect(() => applyPatch(changed, patch.slice(1))).toThrow(
+      /testing value \/spec\/version failed/,
+    );
   });
 
   it('keeps an instance without storageRoot without one, as the CEL rule requires', () => {
     const old = { ...minimal, metadata: { ...minimal.metadata, resourceVersion: '7' } };
-    const updated = buildPlatformInstance({ ...formFromObject(old), version: '6.0.18' }, old);
-    expect(updated.spec.platform).toBeUndefined();
-    expect(celErrors(updated, old)).toEqual([]);
+    const patch = editPatch(old, { ...formFromObject(old), version: '6.0.18' });
+    expect(patch.some((op) => op.path.includes('storageRoot'))).toBe(false);
+    expect(serverApply(old, patch).spec.platform).toBeUndefined();
   });
 
-  it('removing an optional field leaves it out of the PUT body', () => {
-    const updated = buildPlatformInstance({ ...formFromObject(live), httpNodePort: '' }, live);
-    expect(updated.spec.platform?.gateway).toStrictEqual({
+  it('creates platform and gateway when the first gateway field is set', () => {
+    const old = { ...minimal, metadata: { ...minimal.metadata, resourceVersion: '7' } };
+    const patch = editPatch(old, { ...formFromObject(old), httpNodePort: '30080' });
+    expect(patch).toStrictEqual([
+      { op: 'test', path: '/metadata/resourceVersion', value: '7' },
+      { op: 'add', path: '/spec/platform', value: {} },
+      { op: 'add', path: '/spec/platform/gateway', value: {} },
+      { op: 'add', path: '/spec/platform/gateway/httpNodePort', value: 30080 },
+    ]);
+    expect(serverApply(old, patch).spec.platform).toStrictEqual({
+      gateway: { httpNodePort: 30080 },
+    });
+  });
+
+  it('removing an optional field removes it, and the containers it leaves empty', () => {
+    const one = editPatch(live, { ...formFromObject(live), httpNodePort: '' });
+    expect(serverApply(live, one).spec.platform?.gateway).toStrictEqual({
       httpEndpoint: 'http://apps.example:30080',
+    });
+    const gatewayOnly: PlatformInstanceObject = {
+      ...live,
+      spec: { ...live.spec, platform: { gateway: { httpNodePort: 30080 } } },
+    };
+    const both = editPatch(gatewayOnly, { ...formFromObject(gatewayOnly), httpNodePort: '' });
+    expect(both.filter((op) => op.op === 'remove')).toStrictEqual([
+      { op: 'remove', path: '/spec/platform/gateway/httpNodePort' },
+      { op: 'remove', path: '/spec/platform/gateway' },
+      { op: 'remove', path: '/spec/platform' },
+    ]);
+    expect(applyPatch(gatewayOnly, both).spec.platform).toBeUndefined();
+  });
+
+  it('omits the resourceVersion guard only when the object has none', () => {
+    expect(editPatch(minimal, { ...formFromObject(minimal), version: '6.0.18' })[0]).toStrictEqual({
+      op: 'test',
+      path: '/spec/version',
+      value: '6.0.17',
     });
   });
 
   it('does not validate the fixed name and namespace again', () => {
     const form = { ...formFromObject(live), name: 'x'.repeat(80) };
     expect(validateForm(form, 'edit').name).toBeUndefined();
+  });
+});
+
+describe('the CEL emulation matches the CRD (S1)', () => {
+  it('implements exactly the rules the CRD declares', () => {
+    expect([...crdCelRules()].sort()).toStrictEqual([...EMULATED_CEL_RULES].sort());
   });
 });
 
