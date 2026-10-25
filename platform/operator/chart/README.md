@@ -29,7 +29,10 @@ existing instance's state becomes unreadable at the operator's next restart, per
   ```
 
 - **`passphrase.existingSecret` empty (the default):** the chart reads the cluster with `lookup`. When
-  its Secret exists, the passphrase is reused unchanged; on first install one is generated. A render
+  its Secret exists, the passphrase is reused unchanged; one is generated only on a first install,
+  when neither the Secret nor the state claim exists. If the state claim exists but the Secret is
+  gone, or the Secret has no `passphrase` key, the render fails: restore the Secret, or set
+  `passphrase.existingSecret` to one holding the original passphrase. A render
   that cannot see the cluster (an empty lookup of the `kube-system` namespace) **fails** with a message
   pointing here, instead of generating a fresh passphrase that would overwrite the live one when
   applied. `helm install`, `helm upgrade` and `--dry-run=server` see the cluster and work.

@@ -9,11 +9,18 @@ is no cluster (the release namespace may not exist yet under --create-namespace)
 {{- if not (lookup "v1" "Namespace" "" "kube-system") }}
 {{- fail "passphrase: this render cannot see the cluster (helm template, client-side --dry-run, Argo CD or another GitOps tool), so it cannot reuse the existing passphrase and would render a new one that makes the operator's Pulumi state unreadable. Create a Secret with a `passphrase` key and set passphrase.existingSecret to its name (see the chart README), or render against the cluster with helm install/upgrade (--dry-run=server works)." }}
 {{- end }}
-{{- /* Online: reuse the passphrase already in the cluster; generate one only on first install. */}}
+{{- /* Online: reuse the passphrase already in the cluster; generate one only on a first install,
+when neither the Secret nor the state claim exists. A Secret without the key, or a kept state claim
+whose Secret is gone, means state encrypted with a passphrase this render cannot see: fail rather
+than replace it. */}}
 {{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
 {{- $passphrase := "" }}
 {{- if and $existing $existing.data (hasKey $existing.data "passphrase") }}
 {{- $passphrase = index $existing.data "passphrase" }}
+{{- else if $existing }}
+{{- fail (printf "passphrase: Secret %s/%s exists but has no `passphrase` key. Restore the key, or set passphrase.existingSecret to a Secret that has it; a new passphrase would make the operator's Pulumi state unreadable." .Release.Namespace $name) }}
+{{- else if lookup "v1" "PersistentVolumeClaim" .Release.Namespace (include "platform-operator.stateClaim" .) }}
+{{- fail (printf "passphrase: the state claim %s/%s exists but the passphrase Secret %s does not, so the state is encrypted with a passphrase this chart cannot see. Restore the Secret (key `passphrase`), or set passphrase.existingSecret to a Secret that holds the original passphrase." .Release.Namespace (include "platform-operator.stateClaim" .) $name) }}
 {{- else }}
 {{- $passphrase = randAlphaNum 48 | b64enc }}
 {{- end }}

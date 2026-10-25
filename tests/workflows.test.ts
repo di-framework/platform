@@ -23,6 +23,7 @@ interface Job {
   outputs?: Record<string, string>;
   strategy?: { matrix?: Record<string, unknown> };
   steps?: {
+    id?: string;
     name?: string;
     if?: string;
     uses?: string;
@@ -1260,7 +1261,7 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     expect(chart).toContain('--password-stdin');
     expect(chart).toContain('helm push "$TARBALL" oci://ghcr.io/di-framework/charts');
     expect(chart.indexOf('helm package')).toBeLessThan(chart.indexOf('helm push'));
-    // A chart whose default image.digest is still the placeholder is never published.
+    // A chart whose defaults do not render is never published.
     expect(chart).toContain('helm template platform-operator platform/operator/chart');
     expect(chart).toContain('refusing to publish the chart');
     expect(chart.indexOf('refusing to publish the chart')).toBeLessThan(
@@ -1272,7 +1273,53 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     expect(chart).toContain(show);
     expect(chart.indexOf(show)).toBeLessThan(chart.indexOf('helm push'));
     expect(chart).toContain('not pushing it again');
+    expect(chart).toContain('::warning::GHCR denied reading platform-operator');
     expect(chart).not.toMatch(/\bmake\b|docker|bun install|helm dependency/);
+  });
+
+  test('an unpinned image.digest skips the chart with a warning; a pinned one packages and pushes (W5)', () => {
+    const chartSteps = steps('chart');
+    const pin = chartSteps.find((s) => s.id === 'pin');
+    const pinIndex = chartSteps.indexOf(pin as never);
+    for (const name of ['Package the chart', 'Push the chart to GHCR']) {
+      const step = chartSteps.find((s) => s.name === name);
+      expect(chartSteps.indexOf(step as never)).toBeGreaterThan(pinIndex);
+      expect(step?.if).toBe("steps.pin.outputs.pinned == 'true'");
+    }
+    // github-release still runs: the skip is a success, not a failure.
+    expect(release.jobs['github-release']?.needs).toContain('chart');
+    const values = read('platform/operator/chart/values.yaml');
+    const runPin = (digest: string) => {
+      const dir = mkdtempSync(join(tmpdir(), 'chart-pin-'));
+      mkdirSync(join(dir, 'platform/operator/chart'), { recursive: true });
+      writeFileSync(
+        join(dir, 'platform/operator/chart/values.yaml'),
+        values.replace(/^ {2}digest: .*$/m, `  digest: ${digest}`),
+      );
+      const output = join(dir, 'github-output');
+      writeFileSync(output, '');
+      const result = Bun.spawnSync(['bash', '-c', pin?.run ?? 'exit 1'], {
+        cwd: dir,
+        env: { ...process.env, GITHUB_OUTPUT: output },
+      });
+      return {
+        code: result.exitCode,
+        stdout: result.stdout.toString(),
+        output: readFileSync(output, 'utf8'),
+      };
+    };
+    // The checked-in placeholder (until the image pin PR): skipped, exit 0, with a warning.
+    const placeholder = (/^ {2}digest: (.*)$/m.exec(values) ?? [])[1] ?? '';
+    expect(placeholder).toStartWith('sha256:<');
+    const skipped = runPin(placeholder);
+    expect(skipped.code).toBe(0);
+    expect(skipped.output).toBe('pinned=false\n');
+    expect(skipped.stdout).toContain('::warning::chart not published');
+    const pinned = runPin(`sha256:${'0'.repeat(64)}`);
+    expect(pinned.code).toBe(0);
+    expect(pinned.output).toBe('pinned=true\n');
+    expect(pinned.stdout).not.toContain('::warning::');
+    expect(runPin(`sha256:${'0'.repeat(63)}`).output).toBe('pinned=false\n');
   });
 
   test('build smoke-tests, records the wasm sha256, packs without rebuilding pglite, uploads', () => {

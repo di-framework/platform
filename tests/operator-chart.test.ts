@@ -5,7 +5,8 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { helm } from '../platform/backup-destination/tests/support/helm.ts';
 
@@ -68,6 +69,51 @@ async function template(...set: string[]): Promise<Doc[]> {
   if (out.code !== 0) throw new Error(`helm template failed: ${out.stderr}`);
   return docs(out.stdout);
 }
+
+/** The three lookups passphrase.yaml makes, each replaced by a value in the mocked chart. */
+const LOOKUPS = {
+  namespace: 'lookup "v1" "Namespace" "" "kube-system"',
+  secret: 'lookup "v1" "Secret" .Release.Namespace $name',
+  claim:
+    'lookup "v1" "PersistentVolumeClaim" .Release.Namespace (include "platform-operator.stateClaim" .)',
+} as const;
+
+/**
+ * A copy of the chart whose passphrase lookups read `.Values.mock.<name>` instead of the cluster,
+ * so `helm template` can render the online paths (helm-unittest-style lookup mocks without the
+ * plugin). Every lookup must appear exactly once, or the mock would silently miss it.
+ */
+function mockedChart(): string {
+  const dir = join(mkdtempSync(join(tmpdir(), 'operator-chart-')), 'chart');
+  cpSync(chart, dir, { recursive: true });
+  const file = join(dir, 'templates', 'passphrase.yaml');
+  let source = read(file);
+  for (const [name, call] of Object.entries(LOOKUPS)) {
+    expect(source.split(call).length - 1).toBe(1);
+    source = source.replace(call, `.Values.mock.${name}`);
+  }
+  expect(source).not.toMatch(/lookup "/);
+  writeFileSync(file, source);
+  return dir;
+}
+
+/** Renders the mocked chart as if online: kube-system exists, plus the given Secret and claim. */
+function online(dir: string, mock: { secret?: unknown; claim?: unknown }) {
+  const mocks = { namespace: { metadata: { name: 'kube-system' } }, ...mock };
+  return run([
+    'template',
+    'platform-operator',
+    dir,
+    '--namespace',
+    'platform-operator',
+    '--set',
+    `image.digest=${DIGEST}`,
+    '--set-json',
+    `mock=${JSON.stringify(mocks)}`,
+  ]);
+}
+
+const CLAIM = { metadata: { name: 'platform-operator-state' } };
 
 function find(rendered: Doc[], kind: string, name?: string): Doc {
   const doc = rendered.find(
@@ -295,6 +341,34 @@ describe('platform-operator chart', () => {
     expect(out.stdout).not.toContain('kind: Secret');
   }, 60000);
 
+  test('online: the passphrase is reused when its Secret exists, generated only on a first install', async () => {
+    const dir = mockedChart();
+    const kept = Buffer.from('the-original-passphrase').toString('base64');
+    const reused = await online(dir, { secret: { data: { passphrase: kept } }, claim: CLAIM });
+    expect(reused.stderr).toBe('');
+    expect(find(docs(reused.stdout), 'Secret').data.passphrase).toBe(kept);
+    const fresh = await online(dir, {});
+    expect(fresh.code).toBe(0);
+    const secret = find(docs(fresh.stdout), 'Secret');
+    expect(secret.metadata.annotations).toMatchObject(KEEP);
+    expect(Buffer.from(secret.data.passphrase, 'base64').toString()).toMatch(/^[A-Za-z0-9]{48}$/);
+  }, 60000);
+
+  test('online: a kept state claim without its Secret, or a Secret without the key, fails (S8)', async () => {
+    const dir = mockedChart();
+    const orphan = await online(dir, { claim: CLAIM });
+    expect(orphan.code).not.toBe(0);
+    expect(orphan.stderr).toContain(
+      'the state claim platform-operator/platform-operator-state exists',
+    );
+    expect(orphan.stdout).not.toContain('kind: Secret');
+    for (const claim of [CLAIM, undefined]) {
+      const keyless = await online(dir, { secret: { data: { other: 'eA==' } }, claim });
+      expect(keyless.code).not.toBe(0);
+      expect(keyless.stderr).toContain('exists but has no `passphrase` key');
+    }
+  }, 60000);
+
   test('ephemeral storage is requested and limited, and both emptyDirs are size-limited', async () => {
     const pod = operatorDeployment(await template()).spec.template.spec;
     expect(pod.containers[0].resources.requests['ephemeral-storage']).toBe('1Gi');
@@ -347,12 +421,18 @@ describe('platform-operator chart', () => {
     // and generated only otherwise, after the offline-render guard.
     const source = read(join(chart, 'templates', 'passphrase.yaml'));
     expect(source).toContain('    helm.sh/resource-policy: keep');
-    const guard = source.indexOf('lookup "v1" "Namespace" "" "kube-system"');
-    const reuse = source.indexOf('lookup "v1" "Secret" .Release.Namespace $name');
-    const generate = source.indexOf('randAlphaNum 48');
-    expect(guard).toBeGreaterThan(-1);
+    const lines = source.split('\n');
+    const at = (line: string) => {
+      expect(lines.filter((l) => l === line)).toHaveLength(1);
+      return lines.indexOf(line);
+    };
+    const guard = at(`{{- if not (${LOOKUPS.namespace}) }}`);
+    const reuse = at('{{- if and $existing $existing.data (hasKey $existing.data "passphrase") }}');
+    const take = at('{{- $passphrase = index $existing.data "passphrase" }}');
+    const generate = at('{{- $passphrase = randAlphaNum 48 | b64enc }}');
     expect(guard).toBeLessThan(reuse);
-    expect(reuse).toBeLessThan(generate);
+    expect(take).toBe(reuse + 1);
+    expect(take).toBeLessThan(generate);
   }, 60000);
 
   test('existing claim and passphrase Secret are used instead of created', async () => {
