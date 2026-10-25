@@ -67,6 +67,10 @@ func run() error {
 		return errors.New("passphrase file is empty")
 	}
 
+	// Every default storageRoot sits under the base, so a bad one fails here, not at the first Delete.
+	if err := controller.CheckStorageBase(*storageRootBase); err != nil {
+		return fmt.Errorf("--storage-root-base: %w", err)
+	}
 	if *cleanupNS == "" {
 		ns, err := os.ReadFile(serviceAccountNamespace)
 		if err != nil {
@@ -96,7 +100,7 @@ func run() error {
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
 			&corev1.Secret{}: {Label: labels.SelectorFromSet(controller.ManagedLabels)},
 		}},
-		Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}, &corev1.Service{}, &corev1.Namespace{}, &batchv1.Job{}}}},
+		Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}, &corev1.Service{}, &corev1.Namespace{}, &batchv1.Job{}, &corev1.Pod{}}}},
 	})
 	if err != nil {
 		return err

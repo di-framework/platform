@@ -4,6 +4,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -70,7 +71,8 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch
-// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;create;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;create;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=list;delete
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // The vCluster chart creates RBAC, workloads and Services in each instance namespace; Helm needs
 // every permission it grants. v1alpha1 binds the operator to cluster-admin for that (see README).
@@ -102,6 +104,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	obs := r.observe(&inst)
 	if obs.Deleting {
 		return r.reconcileDelete(ctx, &inst, obs)
+	}
+	if root := inst.Spec.Platform.StorageRoot; root != "" && customRootOverlapsBase(root, r.StorageRootBase) {
+		// Deleting an instance removes <storage-root-base>/<namespace>/<name>, so a custom root
+		// that overlaps the base could lose its data to another instance's cleanup.
+		return r.fail(ctx, &inst, v1alpha1.ConditionInstalled, v1alpha1.ReasonInvalidStorageRoot,
+			fmt.Sprintf("spec.platform.storageRoot %q overlaps --storage-root-base %q, where the operator removes deleted instances' data; choose a path outside it",
+				root, r.StorageRootBase), nil)
 	}
 	if !obs.HasFinalizer {
 		// The update is a watch event, so the next step runs without a requeue.
@@ -198,6 +207,16 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, inst *v1alpha1.Platfor
 	d := plan.Next(obs, r.Plan)
 	switch d.Action {
 	case plan.Release:
+		// Every way out (Retain, skip, a custom root, a finished cleanup) first removes any
+		// cleanup Job and pod of this name, so no rm -rf outlives the instance and reaches a
+		// recreated one.
+		gone, err := r.sweepCleanup(ctx, inst, false)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !gone {
+			return ctrl.Result{RequeueAfter: r.Plan.TargetPoll}, nil
+		}
 		controllerutil.RemoveFinalizer(inst, Finalizer)
 		return ctrl.Result{}, r.Update(ctx, inst)
 	case plan.Uninstall:
@@ -221,14 +240,23 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, inst *v1alpha1.Platfor
 		return r.reconcileDelete(ctx, inst, obs)
 	case plan.CleanStorage:
 		// The target is gone, so nothing writes to the storageRoot any more.
-		done, err := r.cleanStorage(ctx, inst)
+		done, retry, err := r.cleanStorage(ctx, inst)
 		if err != nil {
-			return r.fail(ctx, inst, v1alpha1.ConditionInstalled, v1alpha1.ReasonStorageCleanupFailed,
+			res, ferr := r.fail(ctx, inst, v1alpha1.ConditionInstalled, v1alpha1.ReasonStorageCleanupFailed,
 				fmt.Sprintf("removing storageRoot %s failed (annotate %s=true to skip): %v",
 					r.storageRoot(inst), v1alpha1.AnnotationSkipStorageCleanup, err), err)
+			if errors.Is(ferr, ErrStorageCleanupFailed) {
+				// A failed Job is counted on the instance and retried after its own exponential
+				// backoff; controller-runtime's resets on every RequeueAfter.
+				return ctrl.Result{RequeueAfter: retry}, nil
+			}
+			return res, ferr
 		}
 		if !done {
-			return ctrl.Result{RequeueAfter: d.RequeueAfter}, nil
+			if retry == 0 {
+				retry = d.RequeueAfter
+			}
+			return ctrl.Result{RequeueAfter: retry}, nil
 		}
 		obs.StorageCleaned = true
 		return r.reconcileDelete(ctx, inst, obs)
@@ -245,6 +273,7 @@ func (r *Reconciler) observe(inst *v1alpha1.PlatformInstance) plan.Observation {
 		Policy:             inst.Spec.DeletionPolicy,
 		CustomStorageRoot:  inst.Spec.Platform.StorageRoot != "",
 		SkipStorageCleanup: inst.Annotations[v1alpha1.AnnotationSkipStorageCleanup] == "true",
+		StorageCleaned:     inst.Annotations[AnnotationStorageCleaned] == "true",
 		Generation:         inst.Generation,
 		DesiredVersion:     inst.Spec.Version,
 		InstalledVersion:   inst.Status.InstalledVersion,

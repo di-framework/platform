@@ -82,7 +82,7 @@ func newHarness(t *testing.T, policy v1alpha1.DeletionPolicy) *harness {
 		}
 	}
 	inst := &v1alpha1.PlatformInstance{
-		ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name, Generation: 1},
+		ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name, Generation: 1, UID: "uid-1"},
 		Spec: v1alpha1.PlatformInstanceSpec{
 			Version: "6.0.17", Target: v1alpha1.TargetSpec{Type: v1alpha1.TargetVCluster}, DeletionPolicy: policy,
 		},

@@ -137,6 +137,10 @@ const (
 // AnnotationSkipStorageCleanup, or its deletionPolicy is set to Retain.
 const ReasonStorageCleanupFailed = "StorageCleanupFailed"
 
+// ReasonInvalidStorageRoot (on Installed) reports a custom spec.platform.storageRoot that overlaps
+// the operator's --storage-root-base. The operator doesn't install it.
+const ReasonInvalidStorageRoot = "InvalidStorageRoot"
+
 // AnnotationSkipStorageCleanup set to "true" on a PlatformInstance makes deletionPolicy Delete
 // leave the default storageRoot on the node, for example when the node can't run the cleanup.
 const AnnotationSkipStorageCleanup = "platform.di-framework.dev/skip-storage-cleanup"
