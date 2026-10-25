@@ -64,13 +64,15 @@ Status carries `phase` (`Provisioning`, `Installing`, `Ready`, `Failed`, `Deleti
 The platform keeps tenant data (registry blobs, tenant volumes, pglite `PGDATA`) in node `hostPath`s under
 the instance's `storageRoot`, so deleting the vCluster doesn't remove it. With `deletionPolicy: Delete`, once
 the target is gone the operator runs a short-lived Job (`pi-storage-cleanup-<name hash>-<uid hash>`, in
-`--cleanup-namespace`) that mounts the parent of `--storage-root-base` from the node (hostPath type
-`Directory`, never created) and removes exactly `<namespace>/<name>` under the base with `rm -rf`. The path is
-checked first (no empty parts, no `..`, no `/`; an absolute, clean base whose parent isn't `/`, which the
-operator also checks at startup). A fixed `sh` script gets the paths as arguments, never interpolated, and
-the image is busybox pinned by digest. If the base is missing on the node, the Job succeeds only for an
-instance that never installed (nothing can have been written); after an install it fails, since the data may
-be elsewhere. A symlinked base is refused. The pod runs as root, since tenant data is
+`--cleanup-namespace`) that mounts only `--storage-root-base` from the node (hostPath type
+`DirectoryOrCreate`) and removes exactly `<namespace>/<name>` under it with `rm -rf`. The path is checked
+first (no empty parts, no `..`, no `/`, an absolute, clean base other than `/`, which the operator also checks
+at startup). A fixed `sh` script gets the base, `<namespace>/<name>` and `<namespace>` as quoted positional
+arguments, never interpolated. It changes into the base, refuses a symlink at the base or at `<namespace>`
+(`rm` would follow either out of the instance's directory), and runs `rm -rf --` on the relative path. A
+symlink at `<name>` is removed, not followed. The image is busybox pinned by digest. On a fresh node where the
+base doesn't exist yet, kubelet creates it empty and the cleanup succeeds trivially, since nothing was written
+on this node. The pod runs as root, since tenant data is
 owned by other UIDs, but with every capability dropped except `DAC_OVERRIDE` and `FOWNER` (what `rm` needs
 for other users' directories and sticky directories), no privilege escalation, a read-only root filesystem,
 the `RuntimeDefault` seccomp profile and small resource requests and limits. The finalizer holds until the Job
@@ -94,8 +96,8 @@ succeeds.
   `di-tenants` or `di-framework` tree contains the base. A root that only contains the base, such as the
   platform's own `/var/lib/kubesolo`, is fine: the platform writes only under `<root>/di-tenants` and
   `<root>/di-framework`. An instance that has installed is never failed by this check.
-- **A failed cleanup** (the Job fails, or its pod can't start within 5 minutes, for example because the
-  base's parent doesn't exist on the node) sets `Installed` to `False` with reason
+- **A failed cleanup** (the Job fails, for example on a symlink, or its pod can't start within 5 minutes)
+  sets `Installed` to `False` with reason
   `StorageCleanupFailed` and a message naming the path and the attempt, and deletes the failed Job. The next
   Job starts after an exponential backoff: 10s after the first failure, doubling per failure, at most 5
   minutes. The failures are counted in the instance's `platform.di-framework.dev/storage-cleanup-failures`
@@ -107,6 +109,10 @@ succeeds.
   one node it runs where the data is. On more than one node it may run on a node without the data and succeed,
   so the instance is released while its data stays on the original node: the cleanup fails open (nothing is
   removed that shouldn't be), and a successful cleanup proves nothing there.
+- **A wrong base also fails open.** The cleanup removes `<namespace>/<name>` under the `--storage-root-base`
+  the operator runs with now. If the flag changed since the instance installed, or the base is wrong for this
+  node, the Job removes an absent path (creating an empty base if needed) and reports cleaned, while the data
+  stays where it was written. Nothing is removed that shouldn't be; remove the old directory yourself.
 
 ### One install per instance
 
