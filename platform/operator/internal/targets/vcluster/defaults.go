@@ -6,8 +6,10 @@ import (
 )
 
 // CoreDNSImage is the cluster DNS image every instance runs. vCluster's own deployment of it is
-// replaced (see InstanceValues), so the operator pins it.
-const CoreDNSImage = "docker.io/coredns/coredns:1.14.2"
+// replaced (see InstanceValues), so the operator pins it: the 1.14.2 tag the Layer 3 run used,
+// by its multi-arch index digest. vCluster applies overwriteManifests as written, so the image
+// reaches the Deployment unchanged; the runtime pulls by the digest.
+const CoreDNSImage = "docker.io/coredns/coredns:1.14.2@sha256:e7e6440cfd1e919280958f5b5a6ab2b184d385bba774c12ad2a9e1e4183f90d9"
 
 // InstanceValues are the vCluster chart values a platform instance needs (#270), proven by the
 // proving-grounds Layer 3 run inside a vCluster on KubeSolo (2026-10-17):
