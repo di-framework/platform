@@ -1,5 +1,10 @@
 The platform operator is installed in {{ .Release.Namespace }}.
 
+Its storageRoot cleanup Jobs mount node paths (hostPath) in {{ .Values.cleanupNamespace | default .Release.Namespace }}, so
+Pod Security admission must allow privileged pods there:
+
+  kubectl label namespace {{ .Values.cleanupNamespace | default .Release.Namespace }} pod-security.kubernetes.io/enforce=privileged --overwrite
+
 Create an instance:
 
   kubectl apply -f - <<'YAML'

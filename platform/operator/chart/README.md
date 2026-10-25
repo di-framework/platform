@@ -24,6 +24,17 @@ The chart binds two ClusterRoles to the operator's ServiceAccount:
 Install the chart only on a cluster where a cluster-admin operator is acceptable. Instance owners are
 trusted in v1alpha1 (see the epic).
 
+## Pod Security: the release namespace must allow hostPath
+
+When an instance with `deletionPolicy: Delete` is deleted, the operator removes its default
+`storageRoot` with a Job that mounts `storageRootBase` from the node through `hostPath` (#426). The Job
+runs in the operator's own namespace (the release namespace, read from the pod) unless
+`cleanupNamespace` names another, so Pod Security admission must allow privileged pods there:
+
+```sh
+kubectl label namespace platform-operator pod-security.kubernetes.io/enforce=privileged --overwrite
+```
+
 ## What `helm uninstall` leaves
 
 `helm uninstall` removes the Deployment, the ServiceAccount and the RBAC. It keeps, through
@@ -57,6 +68,7 @@ CRDs in `crds/`. `make generate` in `platform/operator` writes `templates/crd.ya
 | `repairInterval` | `30m` | `--repair-interval` |
 | `targetPoll` | `10s` | `--target-poll` |
 | `maxConcurrentInstalls` | `2` | `--max-concurrent-installs` |
+| `cleanupNamespace` | empty: the release namespace | `--cleanup-namespace` (only when set) |
 | `extraArgs` | `[]` | any other flag, such as `--zap-log-level=debug` |
 | `state.size`, `state.storageClassName`, `state.existingClaim` | `10Gi`, default class, none | `--state-dir` |
 | `passphrase.existingSecret` | none (generated) | `--passphrase-file` |

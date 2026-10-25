@@ -172,8 +172,15 @@ describe('platform-operator chart', () => {
     const args = container.args as string[];
     const names = args.map((arg) => /^--([a-z-]+)=/.exec(arg)?.[1]);
     for (const name of names) expect(defined).toContain(name as string);
-    // npm keeps its image default; everything else is set from values.
-    expect(names.sort()).toEqual(defined.filter((f) => f !== 'npm').sort());
+    // npm keeps its image default, and cleanup-namespace (#426) defaults to the operator's own
+    // namespace unless cleanupNamespace is set; everything else is set from values.
+    expect(names.sort()).toEqual(
+      defined.filter((f) => f !== 'npm' && f !== 'cleanup-namespace').sort(),
+    );
+    expect(container.env).toContainEqual({
+      name: 'POD_NAMESPACE',
+      valueFrom: { fieldRef: { fieldPath: 'metadata.namespace' } },
+    });
     expect(args).toContain('--state-dir=/var/lib/platform-operator');
     expect(args).toContain('--passphrase-file=/etc/platform-operator/passphrase');
     expect(args).toContain('--storage-root-base=/var/lib/kubesolo/instances');
@@ -189,8 +196,14 @@ describe('platform-operator chart', () => {
     expect(mounts.state).toBe('/var/lib/platform-operator');
     expect(mounts.passphrase).toBe('/etc/platform-operator');
     const custom = operatorDeployment(
-      await template('storageRootBase=/srv/instances', 'installTimeout=1h', 'leaderElect=false'),
+      await template(
+        'storageRootBase=/srv/instances',
+        'installTimeout=1h',
+        'leaderElect=false',
+        'cleanupNamespace=pi-cleanup',
+      ),
     ).spec.template.spec.containers[0].args as string[];
+    expect(custom).toContain('--cleanup-namespace=pi-cleanup');
     expect(custom).toContain('--storage-root-base=/srv/instances');
     expect(custom).toContain('--install-timeout=1h');
     expect(custom).toContain('--leader-elect=false');
