@@ -68,9 +68,12 @@ the target is gone the operator runs a short-lived Job (`pi-storage-cleanup-<nam
 `DirectoryOrCreate`) and removes exactly `<namespace>/<name>` under it with `rm -rf`. The path is checked
 first (no empty parts, no `..`, no `/`, an absolute, clean base other than `/`, which the operator also checks
 at startup). A fixed `sh` script gets the base, `<namespace>/<name>` and `<namespace>` as quoted positional
-arguments, never interpolated. It changes into the base, refuses a symlink at the base or at `<namespace>`
-(`rm` would follow either out of the instance's directory), and runs `rm -rf --` on the relative path. A
-symlink at `<name>` is removed, not followed. The image is busybox pinned by digest. On a fresh node where the
+arguments, never interpolated. It changes into the base (and stops if it can't), refuses a symlink at
+`<namespace>` (`rm` would follow it out of the instance's directory), and runs `rm -rf --` on the relative
+path. A symlink at `<name>` is removed, not followed. A symlinked `--storage-root-base` can't be detected from
+inside the pod: kubelet resolves it on the node when it mounts the hostPath, so the cleanup acts on the link's
+target. Point `--storage-root-base` at the real directory. The script also refuses a symlinked base, but that
+is defense in depth for runs outside a pod, not a guarantee. The image is busybox pinned by digest. On a fresh node where the
 base doesn't exist yet, kubelet creates it empty and the cleanup succeeds trivially, since nothing was written
 on this node. The pod runs as root, since tenant data is
 owned by other UIDs, but with every capability dropped except `DAC_OVERRIDE` and `FOWNER` (what `rm` needs

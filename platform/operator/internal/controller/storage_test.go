@@ -351,7 +351,7 @@ func TestCleanupScript(t *testing.T) {
 		}
 	}
 	exists := func(p string) bool { _, err := os.Lstat(p); return err == nil }
-	run := func(t *testing.T, tr tree, ns, name string) error {
+	runIn := func(t *testing.T, dir string, tr tree, ns, name string) error {
 		t.Helper()
 		p, err := newStoragePath(tr.base, ns, name)
 		if err != nil {
@@ -359,10 +359,14 @@ func TestCleanupScript(t *testing.T) {
 		}
 		args := cleanupArgs(tr.base, p)
 		cmd := exec.Command("/bin/sh", args[1:]...)
-		cmd.Dir = t.TempDir() // a stray relative path lands here, not in the tree
+		cmd.Dir = dir
 		out, err := cmd.CombinedOutput()
 		t.Logf("%s", out)
 		return err
+	}
+	run := func(t *testing.T, tr tree, ns, name string) error {
+		t.Helper()
+		return runIn(t, t.TempDir(), tr, ns, name) // a stray relative path lands there, not in the tree
 	}
 	setup := func(t *testing.T) tree {
 		t.Helper()
@@ -401,6 +405,37 @@ func TestCleanupScript(t *testing.T) {
 			t.Fatal("the symlink's target was removed")
 		}
 	})
+	// The script must stop when it can't change into the base, not run rm from wherever it is.
+	t.Run("base that isn't a directory fails without removing anything", func(t *testing.T) {
+		root := t.TempDir()
+		tr := tree{base: filepath.Join(root, "base")}
+		if err := os.WriteFile(tr.base, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cwd := t.TempDir()
+		mk(t, filepath.Join(cwd, "team-a", "one"))
+		if err := runIn(t, cwd, tr, "team-a", "one"); err == nil {
+			t.Fatal("succeeded without the base")
+		}
+		if !exists(filepath.Join(cwd, "team-a", "one", "f")) {
+			t.Fatal("removed a path relative to the working directory")
+		}
+	})
+	// storageRelPath admits a namespace with a space, so the symlink check must quote it.
+	t.Run("symlink at a namespace with a space is refused", func(t *testing.T) {
+		tr := setup(t)
+		if err := os.Symlink(tr.outside, filepath.Join(tr.base, "team x")); err != nil {
+			t.Fatal(err)
+		}
+		if err := run(t, tr, "team x", "one"); err == nil {
+			t.Fatal("followed a namespace symlink")
+		}
+		if !exists(filepath.Join(tr.outside, "one", "f")) {
+			t.Fatal("the symlink's target was removed")
+		}
+	})
+	// Defense in depth only: in the pod the base is a mount point, never a symlink (kubelet
+	// resolves a symlinked hostPath on the node).
 	t.Run("symlinked base is refused", func(t *testing.T) {
 		tr := setup(t)
 		link := filepath.Join(filepath.Dir(tr.base), "link")
