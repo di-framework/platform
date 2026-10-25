@@ -3,6 +3,9 @@ package controller
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -160,7 +163,7 @@ func TestDeleteRunsACleanupJobForExactlyTheInstanceRoot(t *testing.T) {
 	spec := job.Spec.Template.Spec
 	c := spec.Containers[0]
 	want := []string{"sh", "-c", cleanupScript, "cleanup",
-		"/storage-root-parent/instances", "/storage-root-parent/instances/team-a/one", "installed"}
+		"/storage-root-base", "team-a/one", "team-a"}
 	if !reflect.DeepEqual(c.Command, want) {
 		t.Fatalf("command %q, want %q", c.Command, want)
 	}
@@ -168,8 +171,8 @@ func TestDeleteRunsACleanupJobForExactlyTheInstanceRoot(t *testing.T) {
 		t.Fatalf("image %q args %q", c.Image, c.Args)
 	}
 	hp := spec.Volumes[0].HostPath
-	if hp == nil || hp.Path != "/var/lib/kubesolo" || c.VolumeMounts[0].MountPath != "/storage-root-parent" ||
-		hp.Type == nil || *hp.Type != corev1.HostPathDirectory {
+	if hp == nil || hp.Path != "/var/lib/kubesolo/instances" || c.VolumeMounts[0].MountPath != "/storage-root-base" ||
+		hp.Type == nil || *hp.Type != corev1.HostPathDirectoryOrCreate {
 		t.Fatalf("mount %+v %+v", spec.Volumes, c.VolumeMounts)
 	}
 	if spec.RestartPolicy != corev1.RestartPolicyNever || *job.Spec.BackoffLimit != 0 ||
@@ -329,12 +332,118 @@ func TestStorageCleanedAnnotationNeedsThisUID(t *testing.T) {
 	}
 }
 
-func TestCleanupScriptArgs(t *testing.T) {
-	inst := &v1alpha1.PlatformInstance{}
-	inst.Namespace, inst.Name, inst.UID = "team-a", "one", "uid-1"
-	job := cleanupJob(types.NamespacedName{Namespace: cleanupNS, Name: "j"}, inst, storagePath{"/var/lib/kubesolo/instances", "team-a/one"}, false)
-	if got := job.Spec.Template.Spec.Containers[0].Command[6]; got != "never-installed" {
-		t.Fatalf("state %q", got)
+// TestCleanupScript runs the real cleanupScript with /bin/sh against temp trees laid out as the
+// pod sees them: the base, and things beside and outside it that must survive.
+func TestCleanupScript(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("no /bin/sh")
+	}
+	type tree struct{ base, outside string }
+	mk := func(t *testing.T, paths ...string) {
+		t.Helper()
+		for _, p := range paths {
+			if err := os.MkdirAll(p, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(p, "f"), []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	exists := func(p string) bool { _, err := os.Lstat(p); return err == nil }
+	run := func(t *testing.T, tr tree, ns, name string) error {
+		t.Helper()
+		p, err := newStoragePath(tr.base, ns, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		args := cleanupArgs(tr.base, p)
+		cmd := exec.Command("/bin/sh", args[1:]...)
+		cmd.Dir = t.TempDir() // a stray relative path lands here, not in the tree
+		out, err := cmd.CombinedOutput()
+		t.Logf("%s", out)
+		return err
+	}
+	setup := func(t *testing.T) tree {
+		t.Helper()
+		root := t.TempDir()
+		tr := tree{base: filepath.Join(root, "base"), outside: filepath.Join(root, "outside")}
+		mk(t, filepath.Join(tr.base, "team-b", "one"), filepath.Join(tr.base, "team-a", "two"), filepath.Join(tr.outside, "one"))
+		return tr
+	}
+
+	t.Run("removes exactly the instance directory", func(t *testing.T) {
+		tr := setup(t)
+		mk(t, filepath.Join(tr.base, "team-a", "one", "deep", "er"))
+		if err := run(t, tr, "team-a", "one"); err != nil {
+			t.Fatal(err)
+		}
+		if exists(filepath.Join(tr.base, "team-a", "one")) || !exists(filepath.Join(tr.base, "team-a", "two", "f")) ||
+			!exists(filepath.Join(tr.base, "team-b", "one", "f")) || !exists(filepath.Join(tr.outside, "one", "f")) {
+			t.Fatal("removed the wrong things")
+		}
+	})
+	t.Run("already gone", func(t *testing.T) {
+		tr := setup(t)
+		if err := run(t, tr, "team-c", "one"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("symlink at the namespace is refused", func(t *testing.T) {
+		tr := setup(t)
+		if err := os.Symlink(tr.outside, filepath.Join(tr.base, "team-x")); err != nil {
+			t.Fatal(err)
+		}
+		if err := run(t, tr, "team-x", "one"); err == nil {
+			t.Fatal("followed a namespace symlink")
+		}
+		if !exists(filepath.Join(tr.outside, "one", "f")) {
+			t.Fatal("the symlink's target was removed")
+		}
+	})
+	t.Run("symlinked base is refused", func(t *testing.T) {
+		tr := setup(t)
+		link := filepath.Join(filepath.Dir(tr.base), "link")
+		if err := os.Symlink(tr.base, link); err != nil {
+			t.Fatal(err)
+		}
+		tr.base = link
+		if err := run(t, tr, "team-a", "two"); err == nil {
+			t.Fatal("followed a symlinked base")
+		}
+		if !exists(filepath.Join(link, "team-a", "two", "f")) {
+			t.Fatal("data removed through a symlinked base")
+		}
+	})
+	t.Run("symlink at the name removes only the link", func(t *testing.T) {
+		tr := setup(t)
+		if err := os.Symlink(filepath.Join(tr.outside, "one"), filepath.Join(tr.base, "team-a", "one")); err != nil {
+			t.Fatal(err)
+		}
+		if err := run(t, tr, "team-a", "one"); err != nil {
+			t.Fatal(err)
+		}
+		if exists(filepath.Join(tr.base, "team-a", "one")) || !exists(filepath.Join(tr.outside, "one", "f")) {
+			t.Fatal("link kept or its target removed")
+		}
+	})
+	// The API server never admits these names, but storageRelPath does, so the script must take
+	// them as one operand each: not split on spaces, not read as rm options.
+	for _, tt := range []struct{ ns, name string }{
+		{"-rf", "one"}, {"-x y", "one"}, {"team-a", "two words"}, {"team-a", "-rf"},
+	} {
+		t.Run(tt.ns+"/"+tt.name, func(t *testing.T) {
+			tr := setup(t)
+			mk(t, filepath.Join(tr.base, tt.ns, tt.name), filepath.Join(tr.base, tt.ns, "keep"),
+				filepath.Join(tr.base, "y"), filepath.Join(tr.base, "team-a", "two"))
+			if err := run(t, tr, tt.ns, tt.name); err != nil {
+				t.Fatal(err)
+			}
+			if exists(filepath.Join(tr.base, tt.ns, tt.name)) || !exists(filepath.Join(tr.base, tt.ns, "keep", "f")) ||
+				!exists(filepath.Join(tr.base, "y", "f")) || !exists(filepath.Join(tr.base, "team-a", "two", "f")) {
+				t.Fatal("removed the wrong things")
+			}
+		})
 	}
 }
 
@@ -471,7 +580,6 @@ func TestCleanupRefusesUnsafePaths(t *testing.T) {
 		{"relative base", "var/lib/instances", "team-a", "storage root base"},
 		{"unclean base", "/var/lib/../instances", "team-a", "storage root base"},
 		{"root base", "/", "team-a", "storage root base"},
-		{"base whose parent is root", "/instances", "team-a", "storage root base"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -565,8 +673,8 @@ func TestCleanupJobOfAnEarlierIncarnationIsNotTrusted(t *testing.T) {
 	old := inst.DeepCopy()
 	old.UID = "uid-0"
 	stale := []*batchv1.Job{
-		cleanupJob(types.NamespacedName{Namespace: cleanupNS, Name: cleanupJobName(old)}, old, storagePath{"/var/lib/kubesolo/instances", "team-a/one"}, true),
-		cleanupJob(types.NamespacedName{Namespace: cleanupNS, Name: cleanupJobName(inst)}, old, storagePath{"/var/lib/kubesolo/instances", "team-a/one"}, true),
+		cleanupJob(types.NamespacedName{Namespace: cleanupNS, Name: cleanupJobName(old)}, old, storagePath{"/var/lib/kubesolo/instances", "team-a/one"}),
+		cleanupJob(types.NamespacedName{Namespace: cleanupNS, Name: cleanupJobName(inst)}, old, storagePath{"/var/lib/kubesolo/instances", "team-a/one"}),
 	}
 	for _, job := range stale {
 		if err := h.c.Create(context.Background(), job); err != nil {

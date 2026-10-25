@@ -26,8 +26,8 @@ import (
 // CleanupImage runs the storageRoot cleanup Job: busybox 1.38.0, pinned to its multi-arch index.
 const CleanupImage = "docker.io/library/busybox:1.38.0@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"
 
-// cleanupMount is where the cleanup Job mounts the parent of --storage-root-base.
-const cleanupMount = "/storage-root-parent"
+// cleanupMount is where the cleanup Job mounts --storage-root-base.
+const cleanupMount = "/storage-root-base"
 
 // cleanupDeadline bounds one cleanup Job, so a pod that can't start (an image that won't pull, a
 // missing --storage-root-base) fails the Job instead of holding the finalizer silently.
@@ -106,11 +106,10 @@ func storageRelPath(namespace, name string) (string, error) {
 	return namespace + "/" + name, nil
 }
 
-// CheckStorageBase requires an absolute, clean --storage-root-base at least two levels deep: the
-// cleanup Job mounts its parent, which must not be the node's root.
+// CheckStorageBase requires an absolute, clean --storage-root-base that isn't the node's root.
 func CheckStorageBase(base string) error {
-	if !path.IsAbs(base) || path.Clean(base) != base || path.Dir(base) == "/" || base == "/" {
-		return fmt.Errorf("%w: storage root base %q must be an absolute, clean directory whose parent isn't /", ErrUnsafeStoragePath, base)
+	if !path.IsAbs(base) || path.Clean(base) != base || base == "/" {
+		return fmt.Errorf("%w: storage root base %q must be an absolute, clean directory other than /", ErrUnsafeStoragePath, base)
 	}
 	return nil
 }
@@ -252,7 +251,7 @@ func (r *Reconciler) cleanStorage(ctx context.Context, inst *v1alpha1.PlatformIn
 				return false, wait, nil
 			}
 		}
-		if err := r.Create(ctx, cleanupJob(key, inst, p, inst.Status.InstalledVersion != "")); client.IgnoreAlreadyExists(err) != nil {
+		if err := r.Create(ctx, cleanupJob(key, inst, p)); client.IgnoreAlreadyExists(err) != nil {
 			return false, 0, fmt.Errorf("create storage cleanup Job: %w", err)
 		}
 		return false, 0, nil
@@ -303,20 +302,22 @@ func jobOutcome(job *batchv1.Job) (succeeded, failed bool, msg string) {
 	return false, false, ""
 }
 
-// cleanupScript runs in the cleanup pod with the base, the path to remove and the install state
-// as positional arguments, never interpolated into the script. The pod mounts the base's parent
-// (hostPath Directory), so a missing base reaches the script instead of failing the mount:
-//   - base present: rm -rf of exactly the validated path; an absent path is already clean.
-//   - base missing and the instance never installed: nothing can have been written, so it is
-//     clean (the first instance on a fresh node, deleted before it installed).
-//   - base missing after an install: the data may sit elsewhere (a changed flag, another node),
-//     so the Job fails instead of reporting cleaned.
-//   - base a symlink: refused, since it would resolve inside the container, not on the node.
+// cleanupScript runs in the cleanup pod as sh -c with three positional arguments, never
+// interpolated: $1 the mounted base, $2 the path to remove relative to it (<ns>/<name>) and $3
+// its <ns>. It works from inside the base, so every operand is relative and confined to it. A
+// symlink at the base or at <ns> is refused, since rm would follow it out of the instance's
+// directory. A symlink at <name> is fine: rm -rf removes the link, not its target. An absent
+// path is already clean.
 const cleanupScript = `if [ -L "$1" ]; then echo "storage root base $1 is a symlink" >&2; exit 1; fi
-if [ -d "$1" ]; then exec rm -rf -- "$2"; fi
-if [ "$3" = never-installed ]; then exit 0; fi
-echo "storage root base $1 is missing on this node, but the instance was installed" >&2
-exit 1`
+cd -- "$1" || exit 1
+if [ -L "$3" ]; then echo "namespace directory $3 is a symlink" >&2; exit 1; fi
+exec rm -rf -- "$2"`
+
+// cleanupArgs is the argv of the cleanup container for p mounted at mount.
+func cleanupArgs(mount string, p storagePath) []string {
+	ns, _, _ := strings.Cut(p.rel, "/")
+	return []string{"sh", "-c", cleanupScript, "cleanup", mount, p.rel, ns}
+}
 
 // cleanupJob builds the Job that removes p on the node.
 //
@@ -324,12 +325,7 @@ exit 1`
 // but the two unlink needs there: DAC_OVERRIDE to enter and write directories root doesn't own,
 // and FOWNER to unlink other users' files in sticky directories. Checked with podman against
 // busybox rm -rf: without both, such a tree fails with EPERM and stays.
-func cleanupJob(key types.NamespacedName, inst *v1alpha1.PlatformInstance, p storagePath, installed bool) *batchv1.Job {
-	podBase := path.Join(cleanupMount, path.Base(p.base))
-	state := "never-installed"
-	if installed {
-		state = "installed"
-	}
+func cleanupJob(key types.NamespacedName, inst *v1alpha1.PlatformInstance, p storagePath) *batchv1.Job {
 	labels := map[string]string{
 		"app.kubernetes.io/component": "storage-cleanup",
 		LabelInstanceKey:              instanceKey(inst),
@@ -363,7 +359,7 @@ func cleanupJob(key types.NamespacedName, inst *v1alpha1.PlatformInstance, p sto
 						Name:            "rm",
 						Image:           CleanupImage,
 						ImagePullPolicy: corev1.PullIfNotPresent,
-						Command:         []string{"sh", "-c", cleanupScript, "cleanup", podBase, path.Join(podBase, p.rel), state},
+						Command:         cleanupArgs(cleanupMount, p),
 						VolumeMounts:    []corev1.VolumeMount{{Name: "storage-root-base", MountPath: cleanupMount}},
 						Resources:       corev1.ResourceRequirements{Requests: requests, Limits: limits},
 						SecurityContext: &corev1.SecurityContext{
@@ -378,10 +374,11 @@ func cleanupJob(key types.NamespacedName, inst *v1alpha1.PlatformInstance, p sto
 					}},
 					Volumes: []corev1.Volume{{
 						Name: "storage-root-base",
-						// The base's parent, as Directory, never DirectoryOrCreate: kubelet creates
-						// nothing, and cleanupScript decides what a missing base means.
+						// Only the base is writable in the pod. DirectoryOrCreate: on a fresh node
+						// kubelet creates an empty base and the cleanup succeeds trivially. A wrong
+						// base also reports cleaned; that fails open (see the README).
 						VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
-							Path: path.Dir(p.base), Type: ptr.To(corev1.HostPathDirectory),
+							Path: p.base, Type: ptr.To(corev1.HostPathDirectoryOrCreate),
 						}},
 					}},
 				},
