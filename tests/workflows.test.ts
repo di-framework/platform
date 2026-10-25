@@ -236,6 +236,27 @@ const SPECS: Spec[] = [
     },
     artifacts: ['oci-registry'],
   },
+  {
+    file: '.github/workflows/platform-operator-image.yml',
+    image: 'ghcr.io/di-framework/platform-operator',
+    // The chart and the Headlamp plugin live under platform/operator/ but are not image inputs.
+    paths: [
+      'platform/operator/**',
+      '!platform/operator/chart/**',
+      '!platform/operator/headlamp-plugin/**',
+      '.github/workflows/platform-operator-image.yml',
+      '!**/*.md',
+    ],
+    first: 'build',
+    firstIf: CHECKED,
+    publish: ['build', 'merge'],
+    readOnly: [],
+    pinAfter: 'merge',
+    pinIf: pinIfAfter('merge'),
+    pinName: 'platform-operator',
+    guarded: { job: 'merge', steps: ['Create and push manifest', 'Tag with source hash'] },
+    artifacts: ['platform-operator'],
+  },
 ];
 
 function needsOf(job: Job): string[] {
@@ -560,6 +581,26 @@ test('publish paths reuse the paths the image checks already maintain', () => {
   expect(pushPaths(read('.github/workflows/tenant-host-image.yml'))[0]).toBe(
     'platform/tenant-host/**',
   );
+});
+
+test('the operator image ignores the chart and Headlamp plugin trees, which are not image inputs (#271)', () => {
+  const filter = pushPaths(read('.github/workflows/platform-operator-image.yml'));
+  for (const file of [
+    'platform/operator/Dockerfile',
+    'platform/operator/go.mod',
+    'platform/operator/cmd/platform-operator/main.go',
+    '.github/workflows/platform-operator-image.yml',
+  ]) {
+    expect(matchesPathFilter(filter, file), file).toBe(true);
+  }
+  for (const file of [
+    'platform/operator/README.md',
+    'platform/operator/chart/values.yaml',
+    'platform/operator/chart/templates/deployment.yaml',
+    'platform/operator/headlamp-plugin/src/index.tsx',
+  ]) {
+    expect(matchesPathFilter(filter, file), file).toBe(false);
+  }
 });
 
 describe('pglite-encfs test-only files (#349)', () => {

@@ -95,14 +95,27 @@ the host-side synced ConfigMap, so changing them means recreating the instance.
 
 ## Running it
 
-The image (`Dockerfile`) carries the operator, Node.js, npm and the Pulumi CLI. It needs:
+The image (`Dockerfile`) carries the operator, Node.js, npm and the Pulumi CLI, for linux/amd64 and
+linux/arm64. `.github/workflows/platform-operator-image.yml` publishes it from main and opens a PR that pins
+this reference to the new digest:
+
+```text
+ghcr.io/di-framework/platform-operator@sha256:<pending first publish>
+```
+
+Each publish is also tagged with its commit SHA and `src-<hash>` (the hash of its inputs); only the digest is
+immutable. The image doesn't yet carry the pinned `@di-framework/platform` package or the Pulumi Kubernetes
+provider plugin, so each instance's first install downloads both.
+
+The operator needs:
 
 - **cluster-admin.** The vCluster chart creates RBAC, workloads and Services in each instance namespace, and
   Helm needs every permission it grants. `config/rbac/role.yaml` lists what the controller itself uses;
   narrowing the chart's needs is follow-up work.
 - **a host policy engine.** Instances run with `networkPolicyEngine: existing`, so the host cluster must enforce
   NetworkPolicy.
-- **egress to npm and the platform's images**, since each install runs `npm install`.
+- **egress to npm, the Pulumi plugin host and the platform's images**, since each install runs `npm install`
+  and fetches the Pulumi Kubernetes provider plugin.
 
 The operator caches only the Secrets it labels (`app.kubernetes.io/managed-by: platform-operator`, its
 instances' kubeconfig Secrets) and reads other Secrets and Services straight from the API server, so it never
@@ -114,5 +127,5 @@ make test
 make build
 ```
 
-Packaging (image publish and pin, Helm chart, Headlamp plugin) and the Layer 4 proof are tracked separately in
+Packaging (Helm chart, Headlamp plugin) and the Layer 4 proof are tracked separately in
 the platform operator epic.

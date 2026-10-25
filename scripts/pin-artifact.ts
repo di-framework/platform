@@ -70,6 +70,9 @@ export const ARTIFACTS: Record<string, PinTarget[]> = {
   'pglite-encfs': [
     { file: 'platform/pglite-encfs/README.md', ref: 'ghcr.io/di-framework/pglite-encfs' },
   ],
+  'platform-operator': [
+    { file: 'platform/operator/README.md', ref: 'ghcr.io/di-framework/platform-operator' },
+  ],
   'wash-wasi-tls': [
     {
       file: HOST_README,
