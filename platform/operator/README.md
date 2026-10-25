@@ -64,10 +64,13 @@ Status carries `phase` (`Provisioning`, `Installing`, `Ready`, `Failed`, `Deleti
 The platform keeps tenant data (registry blobs, tenant volumes, pglite `PGDATA`) in node `hostPath`s under
 the instance's `storageRoot`, so deleting the vCluster doesn't remove it. With `deletionPolicy: Delete`, once
 the target is gone the operator runs a short-lived Job (`pi-storage-cleanup-<name hash>-<uid hash>`, in
-`--cleanup-namespace`) that mounts `--storage-root-base` from the node (hostPath type `Directory`) and runs
-`rm -rf` of exactly `<namespace>/<name>` under it. The path is checked first (no empty parts, no `..`, no `/`,
-an absolute base other than `/`; the operator also refuses to start with a bad `--storage-root-base`), the
-command has no shell, and the image is busybox pinned by digest. The pod runs as root, since tenant data is
+`--cleanup-namespace`) that mounts the parent of `--storage-root-base` from the node (hostPath type
+`Directory`, never created) and removes exactly `<namespace>/<name>` under the base with `rm -rf`. The path is
+checked first (no empty parts, no `..`, no `/`; an absolute, clean base whose parent isn't `/`, which the
+operator also checks at startup). A fixed `sh` script gets the paths as arguments, never interpolated, and
+the image is busybox pinned by digest. If the base is missing on the node, the Job succeeds only for an
+instance that never installed (nothing can have been written); after an install it fails, since the data may
+be elsewhere. A symlinked base is refused. The pod runs as root, since tenant data is
 owned by other UIDs, but with every capability dropped except `DAC_OVERRIDE` and `FOWNER` (what `rm` needs
 for other users' directories and sticky directories), no privilege escalation, a read-only root filesystem,
 the `RuntimeDefault` seccomp profile and small resource requests and limits. The finalizer holds until the Job
@@ -78,13 +81,21 @@ succeeds.
   recreated instance never trusts, or is cleaned by, its predecessor's Job.
 - **Nothing outlives the release.** Whatever releases the finalizer (a finished cleanup, the skip annotation,
   `Retain`, a custom root), the operator first deletes the instance's cleanup Jobs and their pods and waits
-  until they are gone.
+  until they are gone. While it waits, `Ready` is `False` with reason `WaitingForStorageCleanup`, naming the
+  Job or pod. A pod stuck `Terminating` (for example `rm` blocked in uninterruptible IO) holds the instance;
+  the last resort is `kubectl -n <cleanup-namespace> delete pod <pod> --force --grace-period=0`. The `rm` may
+  still be running on the node after that.
+- **Success is recorded per incarnation.** The `platform.di-framework.dev/storage-cleaned` annotation holds
+  the instance UID; any other value (`"true"`, a UID copied from another manifest) is ignored.
 - **A custom `spec.platform.storageRoot` is never removed.** The operator didn't create that path and can't
-  know what else lives there. Remove it yourself when its data must go. A custom root inside
-  `--storage-root-base`, or containing it, is rejected (`Installed` False, reason `InvalidStorageRoot`) and
-  never installed, since another instance's cleanup could remove its data.
-- **A failed cleanup** (the Job fails, or its pod can't start within 5 minutes, for example because
-  `--storage-root-base` doesn't exist on the node) sets `Installed` to `False` with reason
+  know what else lives there. Remove it yourself when its data must go. A custom root that a cleanup could
+  reach is rejected before its first install (`Installed` False, reason `InvalidStorageRoot`): a root inside
+  `--storage-root-base` (including inside some `<base>/<namespace>/<name>`), `/`, or a root whose
+  `di-tenants` or `di-framework` tree contains the base. A root that only contains the base, such as the
+  platform's own `/var/lib/kubesolo`, is fine: the platform writes only under `<root>/di-tenants` and
+  `<root>/di-framework`. An instance that has installed is never failed by this check.
+- **A failed cleanup** (the Job fails, or its pod can't start within 5 minutes, for example because the
+  base's parent doesn't exist on the node) sets `Installed` to `False` with reason
   `StorageCleanupFailed` and a message naming the path and the attempt, and deletes the failed Job. The next
   Job starts after an exponential backoff: 10s after the first failure, doubling per failure, at most 5
   minutes. The failures are counted in the instance's `platform.di-framework.dev/storage-cleanup-failures`

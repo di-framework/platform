@@ -26,8 +26,8 @@ import (
 // CleanupImage runs the storageRoot cleanup Job: busybox 1.38.0, pinned to its multi-arch index.
 const CleanupImage = "docker.io/library/busybox:1.38.0@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"
 
-// cleanupMount is where the cleanup Job mounts --storage-root-base.
-const cleanupMount = "/storage-root-base"
+// cleanupMount is where the cleanup Job mounts the parent of --storage-root-base.
+const cleanupMount = "/storage-root-parent"
 
 // cleanupDeadline bounds one cleanup Job, so a pod that can't start (an image that won't pull, a
 // missing --storage-root-base) fails the Job instead of holding the finalizer silently.
@@ -53,7 +53,8 @@ const (
 	LabelInstanceUID = "platform.di-framework.dev/instance-uid"
 	// AnnotationCleanupFailures counts the failed cleanup attempts of a deleting instance.
 	AnnotationCleanupFailures = "platform.di-framework.dev/storage-cleanup-failures"
-	// AnnotationStorageCleaned is set once this incarnation's cleanup Job has succeeded.
+	// AnnotationStorageCleaned holds the UID of the incarnation whose cleanup Job succeeded. Any
+	// other value ("true", another UID from a copied manifest) is ignored.
 	AnnotationStorageCleaned = "platform.di-framework.dev/storage-cleaned"
 	// AnnotationCleanupFailedAt is when the last cleanup attempt failed (RFC 3339).
 	AnnotationCleanupFailedAt = "platform.di-framework.dev/storage-cleanup-failed-at"
@@ -105,23 +106,38 @@ func storageRelPath(namespace, name string) (string, error) {
 	return namespace + "/" + name, nil
 }
 
-// CheckStorageBase requires an absolute, clean --storage-root-base that isn't the node's root.
+// CheckStorageBase requires an absolute, clean --storage-root-base at least two levels deep: the
+// cleanup Job mounts its parent, which must not be the node's root.
 func CheckStorageBase(base string) error {
-	if !path.IsAbs(base) || path.Clean(base) != base || base == "/" {
-		return fmt.Errorf("%w: storage root base %q must be an absolute, clean directory other than /", ErrUnsafeStoragePath, base)
+	if !path.IsAbs(base) || path.Clean(base) != base || path.Dir(base) == "/" || base == "/" {
+		return fmt.Errorf("%w: storage root base %q must be an absolute, clean directory whose parent isn't /", ErrUnsafeStoragePath, base)
 	}
 	return nil
 }
 
-// customRootOverlapsBase reports whether a custom storageRoot lies inside --storage-root-base or
-// contains it. Either way, removing some instance's default storageRoot could remove its data.
-func customRootOverlapsBase(root, base string) bool {
+// platformDataDirs are where the platform writes under a storageRoot (src/tenancy, src/index.ts).
+var platformDataDirs = []string{"di-tenants", "di-framework"}
+
+func within(p, dir string) bool { return p == dir || dir == "/" || strings.HasPrefix(p, dir+"/") }
+
+// customRootOverlapsCleanup reports whether a custom storageRoot's data could be removed by the
+// cleanup of some default storageRoot <base>/<ns>/<name>: the root lies inside the base, or the
+// base lies inside one of the platform's data trees under the root. A root that merely contains
+// the base (the platform's own /var/lib/kubesolo) is disjoint from what the cleanup removes.
+func customRootOverlapsCleanup(root, base string) bool {
 	root = path.Clean(root)
 	if !path.IsAbs(root) {
 		return false
 	}
-	within := func(p, dir string) bool { return p == dir || dir == "/" || strings.HasPrefix(p, dir+"/") }
-	return within(root, base) || within(base, root)
+	if root == "/" || within(root, base) {
+		return true
+	}
+	for _, d := range platformDataDirs {
+		if within(base, path.Join(root, d)) {
+			return true
+		}
+	}
+	return false
 }
 
 func shortHash(s string, n int) string {
@@ -153,32 +169,32 @@ func cleanupBackoff(failures int) time.Duration {
 }
 
 // sweepCleanup deletes every cleanup Job and pod of the instance's <namespace>/<name>, except
-// this incarnation's Job and its pods when keepCurrent is set, and reports whether none of the
-// others is left. A Job of another incarnation is never read, only deleted: its rm could still
+// this incarnation's Job and its pods when keepCurrent is set, and returns the ones still
+// left ("Job x", "pod y"). A Job of another incarnation is never read, only deleted: its rm could still
 // run against a recreated instance's data, and its result says nothing about this one.
-func (r *Reconciler) sweepCleanup(ctx context.Context, inst *v1alpha1.PlatformInstance, keepCurrent bool) (bool, error) {
+func (r *Reconciler) sweepCleanup(ctx context.Context, inst *v1alpha1.PlatformInstance, keepCurrent bool) ([]string, error) {
 	if r.CleanupNamespace == "" {
-		return true, nil // no cleanup Job can have been created
+		return nil, nil // no cleanup Job can have been created
 	}
 	sel := []client.ListOption{client.InNamespace(r.CleanupNamespace), client.MatchingLabels{LabelInstanceKey: instanceKey(inst)}}
 	current := func(o client.Object) bool {
 		return keepCurrent && o.GetLabels()[LabelInstanceUID] == string(inst.UID)
 	}
-	gone := true
+	var left []string
 
 	var jobs batchv1.JobList
 	if err := r.List(ctx, &jobs, sel...); err != nil {
-		return false, fmt.Errorf("list storage cleanup Jobs: %w", err)
+		return nil, fmt.Errorf("list storage cleanup Jobs: %w", err)
 	}
 	for i := range jobs.Items {
 		job := &jobs.Items[i]
 		if current(job) && job.Name == cleanupJobName(inst) {
 			continue
 		}
-		gone = false
+		left = append(left, "Job "+job.Name)
 		if job.DeletionTimestamp.IsZero() {
 			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
-				return false, fmt.Errorf("delete storage cleanup Job %s: %w", job.Name, err)
+				return nil, fmt.Errorf("delete storage cleanup Job %s: %w", job.Name, err)
 			}
 		}
 	}
@@ -187,21 +203,21 @@ func (r *Reconciler) sweepCleanup(ctx context.Context, inst *v1alpha1.PlatformIn
 	// only once they are gone too, so no rm can still run.
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, sel...); err != nil {
-		return false, fmt.Errorf("list storage cleanup pods: %w", err)
+		return nil, fmt.Errorf("list storage cleanup pods: %w", err)
 	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if current(pod) {
 			continue
 		}
-		gone = false
+		left = append(left, "pod "+pod.Name)
 		if pod.DeletionTimestamp.IsZero() {
 			if err := r.Delete(ctx, pod); client.IgnoreNotFound(err) != nil {
-				return false, fmt.Errorf("delete storage cleanup pod %s: %w", pod.Name, err)
+				return nil, fmt.Errorf("delete storage cleanup pod %s: %w", pod.Name, err)
 			}
 		}
 	}
-	return gone, nil
+	return left, nil
 }
 
 // cleanStorage removes the instance's default storageRoot from the node with a Job that mounts
@@ -222,7 +238,7 @@ func (r *Reconciler) cleanStorage(ctx context.Context, inst *v1alpha1.PlatformIn
 		return false, 0, errors.New("instance has no UID")
 	}
 
-	if gone, err := r.sweepCleanup(ctx, inst, true); err != nil || !gone {
+	if left, err := r.sweepCleanup(ctx, inst, true); err != nil || len(left) > 0 {
 		return false, 0, err
 	}
 
@@ -236,7 +252,7 @@ func (r *Reconciler) cleanStorage(ctx context.Context, inst *v1alpha1.PlatformIn
 				return false, wait, nil
 			}
 		}
-		if err := r.Create(ctx, cleanupJob(key, inst, p)); client.IgnoreAlreadyExists(err) != nil {
+		if err := r.Create(ctx, cleanupJob(key, inst, p, inst.Status.InstalledVersion != "")); client.IgnoreAlreadyExists(err) != nil {
 			return false, 0, fmt.Errorf("create storage cleanup Job: %w", err)
 		}
 		return false, 0, nil
@@ -256,7 +272,7 @@ func (r *Reconciler) cleanStorage(ctx context.Context, inst *v1alpha1.PlatformIn
 	}
 	if succeeded {
 		// Recorded, so the release that waits for the Job's pod never starts a second Job.
-		inst.Annotations[AnnotationStorageCleaned] = "true"
+		inst.Annotations[AnnotationStorageCleaned] = string(inst.UID)
 		return true, 0, r.Update(ctx, inst)
 	}
 	failures, _ := strconv.Atoi(inst.Annotations[AnnotationCleanupFailures])
@@ -287,14 +303,33 @@ func jobOutcome(job *batchv1.Job) (succeeded, failed bool, msg string) {
 	return false, false, ""
 }
 
-// cleanupJob builds the Job that removes p on the node. The command has no shell, so the path is
-// passed as one argument exactly as validated.
+// cleanupScript runs in the cleanup pod with the base, the path to remove and the install state
+// as positional arguments, never interpolated into the script. The pod mounts the base's parent
+// (hostPath Directory), so a missing base reaches the script instead of failing the mount:
+//   - base present: rm -rf of exactly the validated path; an absent path is already clean.
+//   - base missing and the instance never installed: nothing can have been written, so it is
+//     clean (the first instance on a fresh node, deleted before it installed).
+//   - base missing after an install: the data may sit elsewhere (a changed flag, another node),
+//     so the Job fails instead of reporting cleaned.
+//   - base a symlink: refused, since it would resolve inside the container, not on the node.
+const cleanupScript = `if [ -L "$1" ]; then echo "storage root base $1 is a symlink" >&2; exit 1; fi
+if [ -d "$1" ]; then exec rm -rf -- "$2"; fi
+if [ "$3" = never-installed ]; then exit 0; fi
+echo "storage root base $1 is missing on this node, but the instance was installed" >&2
+exit 1`
+
+// cleanupJob builds the Job that removes p on the node.
 //
 // The pod runs as root, since tenant data is owned by other UIDs, with every capability dropped
 // but the two unlink needs there: DAC_OVERRIDE to enter and write directories root doesn't own,
 // and FOWNER to unlink other users' files in sticky directories. Checked with podman against
 // busybox rm -rf: without both, such a tree fails with EPERM and stays.
-func cleanupJob(key types.NamespacedName, inst *v1alpha1.PlatformInstance, p storagePath) *batchv1.Job {
+func cleanupJob(key types.NamespacedName, inst *v1alpha1.PlatformInstance, p storagePath, installed bool) *batchv1.Job {
+	podBase := path.Join(cleanupMount, path.Base(p.base))
+	state := "never-installed"
+	if installed {
+		state = "installed"
+	}
 	labels := map[string]string{
 		"app.kubernetes.io/component": "storage-cleanup",
 		LabelInstanceKey:              instanceKey(inst),
@@ -328,7 +363,7 @@ func cleanupJob(key types.NamespacedName, inst *v1alpha1.PlatformInstance, p sto
 						Name:            "rm",
 						Image:           CleanupImage,
 						ImagePullPolicy: corev1.PullIfNotPresent,
-						Command:         []string{"rm", "-rf", "--", path.Join(cleanupMount, p.rel)},
+						Command:         []string{"sh", "-c", cleanupScript, "cleanup", podBase, path.Join(podBase, p.rel), state},
 						VolumeMounts:    []corev1.VolumeMount{{Name: "storage-root-base", MountPath: cleanupMount}},
 						Resources:       corev1.ResourceRequirements{Requests: requests, Limits: limits},
 						SecurityContext: &corev1.SecurityContext{
@@ -343,11 +378,10 @@ func cleanupJob(key types.NamespacedName, inst *v1alpha1.PlatformInstance, p sto
 					}},
 					Volumes: []corev1.Volume{{
 						Name: "storage-root-base",
-						// Directory, not DirectoryOrCreate: a missing base (a typo, the wrong node)
-						// keeps the pod from starting and fails the Job, instead of rm -rf of an
-						// absent path reporting success.
+						// The base's parent, as Directory, never DirectoryOrCreate: kubelet creates
+						// nothing, and cleanupScript decides what a missing base means.
 						VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
-							Path: p.base, Type: ptr.To(corev1.HostPathDirectory),
+							Path: path.Dir(p.base), Type: ptr.To(corev1.HostPathDirectory),
 						}},
 					}},
 				},
