@@ -547,6 +547,33 @@ test('no Wasm component publisher sees a SOURCE_DATE_EPOCH (#345)', () => {
   }
 });
 
+// Every build job that writes a registry cache (cache-to) must stop at the source guard first,
+// so a stale re-run never moves the buildcache-* tags back to an older source.
+test('a stale re-run of build leaves the buildcache tags alone, in every cache-writing workflow', () => {
+  let checked = 0;
+  for (const spec of SPECS) {
+    const steps = (parse(spec.file).jobs.build?.steps ?? []) as {
+      name?: string;
+      uses?: string;
+      if?: string;
+      with?: Record<string, unknown>;
+    }[];
+    const cacheWriter = steps.findIndex((s) => s.with?.['cache-to'] !== undefined);
+    if (cacheWriter < 0) continue;
+    checked++;
+    const guard = steps.findIndex((s) => s.uses === './.github/actions/source-guard');
+    expect(guard, spec.file).toBeGreaterThanOrEqual(0);
+    expect(cacheWriter, spec.file).toBeGreaterThan(guard);
+    for (const step of steps.slice(guard + 1)) {
+      expect(step.if, `${spec.file}: ${step.name ?? step.uses}`).toBe(
+        "steps.guard.outputs.stale != 'true'",
+      );
+    }
+  }
+  // tenant-host and platform-operator both write buildcache-* tags.
+  expect(checked).toBeGreaterThanOrEqual(2);
+});
+
 test('the publish workflows use distinct concurrency groups', () => {
   const groups = SPECS.map((spec) => parse(spec.file).concurrency.group);
   expect(new Set(groups).size).toBe(SPECS.length);
@@ -1012,26 +1039,6 @@ describe('the check-source resolver reads platform/tenant-host/variants', () => 
       .map((line) => (line.trim().split(/\s+/)[0] ?? '').replace(/^2\.8\.0-/, ''));
     expect(options.options).toEqual(tags);
     expect(options.default).toBe(tags[0] ?? '');
-  });
-
-  test('a stale re-run of build leaves the buildcache tags alone (S1)', () => {
-    const steps = (workflow.jobs.build?.steps ?? []) as {
-      name?: string;
-      uses?: string;
-      if?: string;
-    }[];
-    const guard = steps.findIndex((s) => s.uses === './.github/actions/source-guard');
-    expect(guard).toBeGreaterThanOrEqual(0);
-    for (const name of [
-      'Log in to GHCR',
-      'Build and push by digest',
-      'Export digest',
-      'Upload digest',
-    ]) {
-      const index = steps.findIndex((s) => s.name === name);
-      expect(index, name).toBeGreaterThan(guard);
-      expect(steps[index]?.if, name).toBe("steps.guard.outputs.stale != 'true'");
-    }
   });
 
   test('a dispatch of an unlisted variant fails', () => {
