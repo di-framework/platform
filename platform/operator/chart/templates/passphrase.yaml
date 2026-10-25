@@ -1,4 +1,10 @@
 {{- if not .Values.passphrase.existingSecret }}
+{{- /* A claim the user brings may already hold state encrypted with a passphrase this chart has
+never seen, and the chart can't tell an empty claim from a used one. Ask for the Secret up front
+instead of failing later with a message about an unknown passphrase. */}}
+{{- if .Values.state.existingClaim }}
+{{- fail "state.existingClaim requires passphrase.existingSecret: the chart cannot know the passphrase of state in a claim it did not create. Create a Secret with a `passphrase` key (the original passphrase, or a new one for an empty claim) and set passphrase.existingSecret to its name." }}
+{{- end }}
 {{- $name := include "platform-operator.passphraseSecret" . }}
 {{- /* The passphrase must never change once state exists: a new one makes the existing Pulumi
 state unreadable at the operator's next restart. An offline render (helm template, client-side

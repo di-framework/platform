@@ -369,6 +369,34 @@ describe('platform-operator chart', () => {
     }
   }, 60000);
 
+  test('state.existingClaim without passphrase.existingSecret fails up front (S10)', async () => {
+    const message = 'state.existingClaim requires passphrase.existingSecret';
+    // Offline, before the cannot-see-the-cluster guard.
+    const offlineOut = await offline(`image.digest=${DIGEST}`, 'state.existingClaim=my-empty-pvc');
+    expect(offlineOut.code).not.toBe(0);
+    expect(offlineOut.stderr).toContain(message);
+    expect(offlineOut.stderr).not.toContain('this render cannot see the cluster');
+    // Online, with an empty pre-provisioned claim: no misleading unknown-passphrase message.
+    const dir = mockedChart();
+    const out = await run([
+      'template',
+      'platform-operator',
+      dir,
+      '--namespace',
+      'platform-operator',
+      '--set',
+      `image.digest=${DIGEST}`,
+      '--set',
+      'state.existingClaim=my-empty-pvc',
+      '--set-json',
+      `mock=${JSON.stringify({ namespace: { metadata: { name: 'kube-system' } }, claim: { metadata: { name: 'my-empty-pvc' } } })}`,
+    ]);
+    expect(out.code).not.toBe(0);
+    expect(out.stderr).toContain(message);
+    expect(out.stderr).not.toContain('a passphrase this chart cannot see');
+    expect(out.stdout).not.toContain('kind: Secret');
+  }, 60000);
+
   test('ephemeral storage is requested and limited, and both emptyDirs are size-limited', async () => {
     const pod = operatorDeployment(await template()).spec.template.spec;
     expect(pod.containers[0].resources.requests['ephemeral-storage']).toBe('1Gi');

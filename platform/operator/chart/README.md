@@ -37,6 +37,11 @@ existing instance's state becomes unreadable at the operator's next restart, per
   pointing here, instead of generating a fresh passphrase that would overwrite the live one when
   applied. `helm install`, `helm upgrade` and `--dry-run=server` see the cluster and work.
 
+- **`state.existingClaim` requires `passphrase.existingSecret`.** The chart can't know the passphrase of
+  state in a claim it didn't create, and can't tell an empty claim from a used one, so it refuses to
+  render a claim of yours without a Secret of yours. For an empty claim, create the Secret with a new
+  passphrase as above; for a claim with state, use the original passphrase.
+
 Every `v*` release publishes the chart at the release's version (the Release workflow's `chart` job).
 The chart's own `version` and `appVersion` in `Chart.yaml` are placeholders that packaging replaces.
 
@@ -104,7 +109,8 @@ CRDs in `crds/`. `make generate` in `platform/operator` writes `templates/crd.ya
 | `maxConcurrentInstalls` | `2` | `--max-concurrent-installs` |
 | `cleanupNamespace` | empty: the release namespace | `--cleanup-namespace` (only when set) |
 | `extraArgs` | `[]` | any other flag, such as `--zap-log-level=debug` |
-| `state.size`, `state.storageClassName`, `state.existingClaim` | `10Gi`, default class, none | `--state-dir` |
+| `state.size`, `state.storageClassName` | `10Gi`, default class | `--state-dir` |
+| `state.existingClaim` | none; requires `passphrase.existingSecret` | `--state-dir` |
 | `passphrase.existingSecret` | none (generated; offline renders fail) | `--passphrase-file` |
 | `rbac.clusterAdmin` | `true` | |
 | `resources` | 100m / 256Mi / 1Gi ephemeral requests, 2Gi memory / 6Gi ephemeral limits | |

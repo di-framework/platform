@@ -31,8 +31,7 @@ maxConcurrentInstalls: 2
 # Where the operator runs the Jobs that remove a deleted instance's default storageRoot
 # (--cleanup-namespace, from #426). Empty (the default) passes no flag and the operator uses its own
 # namespace, the release namespace. Those Jobs mount <storageRootBase> with hostPath, so Pod
-# Security admission must allow privileged pods in that namespace (see the chart README). Set this
-# only with an operator image that has the flag.
+# Security admission must allow privileged pods in that namespace (see the chart README).
 cleanupNamespace: ""
 # Extra operator flags, such as the zap logging flags (--zap-log-level=debug).
 extraArgs: []
@@ -45,7 +44,9 @@ extraArgs: []
 # means Pulumi forgets what it installed, so the claim is kept on `helm uninstall`
 # (helm.sh/resource-policy: keep). Back it up.
 state:
-  # An existing claim to use instead of the chart's.
+  # An existing claim to use instead of the chart's. Requires passphrase.existingSecret: the chart
+  # can't know the passphrase of state in a claim it didn't create, so it refuses to render without
+  # one.
   existingClaim: ""
   size: 10Gi
   # Empty uses the cluster's default StorageClass.
