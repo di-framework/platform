@@ -29,8 +29,10 @@ const CleanupImage = "docker.io/library/busybox:1.38.0@sha256:fd7dc98638c8e305f4
 // cleanupMount is where the cleanup Job mounts --storage-root-base.
 const cleanupMount = "/storage-root-base"
 
-// cleanupDeadline bounds one cleanup Job, so a pod that can't start (an image that won't pull, a
-// missing --storage-root-base) fails the Job instead of holding the finalizer silently.
+// cleanupDeadline bounds one cleanup Job, so a pod that can't start or finish (an image that won't
+// pull, a node that never schedules it, an rm that hangs) fails the Job instead of holding the
+// finalizer silently. A missing --storage-root-base doesn't fail it: the hostPath type is
+// DirectoryOrCreate, so kubelet creates the base empty and the cleanup succeeds trivially.
 const cleanupDeadline int64 = 300
 
 // cleanupTTL removes a finished Job the operator didn't delete itself.
@@ -304,10 +306,16 @@ func jobOutcome(job *batchv1.Job) (succeeded, failed bool, msg string) {
 
 // cleanupScript runs in the cleanup pod as sh -c with three positional arguments, never
 // interpolated: $1 the mounted base, $2 the path to remove relative to it (<ns>/<name>) and $3
-// its <ns>. It works from inside the base, so every operand is relative and confined to it. A
-// symlink at the base or at <ns> is refused, since rm would follow it out of the instance's
-// directory. A symlink at <name> is fine: rm -rf removes the link, not its target. An absent
-// path is already clean.
+// its <ns>. It works from inside the base, so every operand is relative and confined to it, and
+// it stops if it can't change into the base. A symlink at <ns> is refused, since rm would follow
+// it out of the instance's directory. A symlink at <name> is fine: rm -rf removes the link, not
+// its target. An absent path is already clean.
+//
+// The base check is defense in depth only. In the pod, $1 is the mount point, which is never a
+// symlink: if --storage-root-base is a symlink on the node, kubelet resolves it when it mounts the
+// hostPath, and the cleanup acts on the link's target. The base is operator configuration, so
+// that is accepted; the check matters only when the script runs against an unresolved path, as
+// in the tests.
 const cleanupScript = `if [ -L "$1" ]; then echo "storage root base $1 is a symlink" >&2; exit 1; fi
 cd -- "$1" || exit 1
 if [ -L "$3" ]; then echo "namespace directory $3 is a symlink" >&2; exit 1; fi
