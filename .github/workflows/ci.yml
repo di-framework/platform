@@ -47,6 +47,78 @@ jobs:
         working-directory: platform/operator
         run: make check
 
+  # The Headlamp plugin is a standalone package (own bun.lock, vitest), outside the root
+  # workspaces, so it gets its own job. Its checks run when a PR touches the plugin, the CRD its
+  # tests validate against, or this workflow; pushes to main always run them.
+  headlamp-plugin:
+    name: Headlamp plugin
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: platform/operator/headlamp-plugin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check for plugin changes
+        id: changes
+        working-directory: .
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ] ||
+            ! git diff --quiet "$BASE_SHA" HEAD -- \
+              platform/operator/headlamp-plugin \
+              platform/operator/config/crd \
+              .github/workflows/ci.yml; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No Headlamp plugin changes; skipping its checks."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Bun
+        if: steps.changes.outputs.run == 'true'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.3'
+
+      - name: Install dependencies
+        if: steps.changes.outputs.run == 'true'
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        if: steps.changes.outputs.run == 'true'
+        run: bun run lint
+
+      - name: Typecheck
+        if: steps.changes.outputs.run == 'true'
+        run: bun run tsc
+
+      - name: Test
+        if: steps.changes.outputs.run == 'true'
+        run: bun run test
+
+      # Deterministic tarball for Headlamp's plugin manager; the release attaches it later.
+      - name: Package
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          bun run package
+          cat dist-package/*.sha256
+
+      - name: Upload plugin tarball
+        if: steps.changes.outputs.run == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: headlamp-plugin
+          path: |
+            platform/operator/headlamp-plugin/dist-package/*.tar.gz
+            platform/operator/headlamp-plugin/dist-package/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
   # TypeScript checks and `bun test`. The tests need the built pglite and OCI registry
   # components, so this job builds them too; their own Rust tests run in `components`.
   typescript:

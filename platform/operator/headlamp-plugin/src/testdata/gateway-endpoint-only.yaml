@@ -1,0 +1,14 @@
+# Only some optional fields: the endpoint without a NodePort, and the explicit default policy.
+apiVersion: platform.di-framework.dev/v1alpha1
+kind: PlatformInstance
+metadata:
+  name: endpoint-only
+  namespace: default
+spec:
+  version: 6.0.17
+  target:
+    type: vcluster
+  platform:
+    gateway:
+      httpEndpoint: https://apps.example
+  deletionPolicy: Delete
