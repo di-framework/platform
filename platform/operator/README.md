@@ -105,7 +105,10 @@ ghcr.io/di-framework/platform-operator@sha256:<pending first publish>
 
 Each publish is also tagged with its commit SHA and `src-<hash>` (the hash of its inputs); only the digest is
 immutable. The image doesn't yet carry the pinned `@di-framework/platform` package or the Pulumi Kubernetes
-provider plugin, so each instance's first install downloads both.
+provider plugin, so each instance's first install downloads both. Baking them in is tracked in #431.
+
+The first publish creates the `platform-operator` GHCR package as private. An org admin must make it public
+once (Package settings, then Change visibility), because Layer 4 (#274) pulls the image anonymously.
 
 The operator needs:
 

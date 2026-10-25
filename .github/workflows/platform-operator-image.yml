@@ -17,7 +17,7 @@
 #
 # Not baked in yet: the pinned @di-framework/platform package and the Pulumi Kubernetes provider
 # plugin. Each instance's first install runs npm install and downloads the plugin, so the operator
-# needs egress to npm and to the plugin host.
+# needs egress to npm and to the plugin host. Baking them in is tracked in #431.
 #
 # Permissions: workflow default contents: read. check-source reads packages; build and merge push
 # (packages: write). Only pin holds contents: write and pull-requests: write.
