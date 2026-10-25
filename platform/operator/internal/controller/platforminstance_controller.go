@@ -105,9 +105,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if obs.Deleting {
 		return r.reconcileDelete(ctx, &inst, obs)
 	}
-	if root := inst.Spec.Platform.StorageRoot; root != "" && customRootOverlapsBase(root, r.StorageRootBase) {
+	if root := inst.Spec.Platform.StorageRoot; root != "" && inst.Status.InstalledVersion == "" &&
+		customRootOverlapsCleanup(root, r.StorageRootBase) {
 		// Deleting an instance removes <storage-root-base>/<namespace>/<name>, so a custom root
-		// that overlaps the base could lose its data to another instance's cleanup.
+		// whose data could sit there could lose it to another instance's cleanup. Checked only
+		// before the first install: an installed instance never flips to Failed from this.
 		return r.fail(ctx, &inst, v1alpha1.ConditionInstalled, v1alpha1.ReasonInvalidStorageRoot,
 			fmt.Sprintf("spec.platform.storageRoot %q overlaps --storage-root-base %q, where the operator removes deleted instances' data; choose a path outside it",
 				root, r.StorageRootBase), nil)
@@ -210,12 +212,15 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, inst *v1alpha1.Platfor
 		// Every way out (Retain, skip, a custom root, a finished cleanup) first removes any
 		// cleanup Job and pod of this name, so no rm -rf outlives the instance and reaches a
 		// recreated one.
-		gone, err := r.sweepCleanup(ctx, inst, false)
+		left, err := r.sweepCleanup(ctx, inst, false)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if !gone {
-			return ctrl.Result{RequeueAfter: r.Plan.TargetPoll}, nil
+		if len(left) > 0 {
+			return ctrl.Result{RequeueAfter: r.Plan.TargetPoll}, r.patchStatus(ctx, inst, func(s *v1alpha1.PlatformInstanceStatus) {
+				setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionFalse, "WaitingForStorageCleanup",
+					fmt.Sprintf("waiting for storage cleanup %s to terminate before releasing (see the README to force it)", strings.Join(left, ", ")))
+			})
 		}
 		controllerutil.RemoveFinalizer(inst, Finalizer)
 		return ctrl.Result{}, r.Update(ctx, inst)
@@ -273,7 +278,7 @@ func (r *Reconciler) observe(inst *v1alpha1.PlatformInstance) plan.Observation {
 		Policy:             inst.Spec.DeletionPolicy,
 		CustomStorageRoot:  inst.Spec.Platform.StorageRoot != "",
 		SkipStorageCleanup: inst.Annotations[v1alpha1.AnnotationSkipStorageCleanup] == "true",
-		StorageCleaned:     inst.Annotations[AnnotationStorageCleaned] == "true",
+		StorageCleaned:     inst.UID != "" && inst.Annotations[AnnotationStorageCleaned] == string(inst.UID),
 		Generation:         inst.Generation,
 		DesiredVersion:     inst.Spec.Version,
 		InstalledVersion:   inst.Status.InstalledVersion,

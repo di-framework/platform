@@ -159,14 +159,16 @@ func TestDeleteRunsACleanupJobForExactlyTheInstanceRoot(t *testing.T) {
 	}
 	spec := job.Spec.Template.Spec
 	c := spec.Containers[0]
-	if want := []string{"rm", "-rf", "--", "/storage-root-base/team-a/one"}; !reflect.DeepEqual(c.Command, want) {
+	want := []string{"sh", "-c", cleanupScript, "cleanup",
+		"/storage-root-parent/instances", "/storage-root-parent/instances/team-a/one", "installed"}
+	if !reflect.DeepEqual(c.Command, want) {
 		t.Fatalf("command %q, want %q", c.Command, want)
 	}
 	if c.Image != CleanupImage || !strings.Contains(CleanupImage, "@sha256:") || len(c.Args) != 0 {
 		t.Fatalf("image %q args %q", c.Image, c.Args)
 	}
 	hp := spec.Volumes[0].HostPath
-	if hp == nil || hp.Path != "/var/lib/kubesolo/instances" || c.VolumeMounts[0].MountPath != "/storage-root-base" ||
+	if hp == nil || hp.Path != "/var/lib/kubesolo" || c.VolumeMounts[0].MountPath != "/storage-root-parent" ||
 		hp.Type == nil || *hp.Type != corev1.HostPathDirectory {
 		t.Fatalf("mount %+v %+v", spec.Volumes, c.VolumeMounts)
 	}
@@ -240,10 +242,15 @@ func TestCustomStorageRootIsNeverCleaned(t *testing.T) {
 func TestCustomStorageRootOverlappingTheBaseIsRejected(t *testing.T) {
 	for _, root := range []string{
 		"/var/lib/kubesolo/instances", "/var/lib/kubesolo/instances/team-b/two", "/var/lib/kubesolo/instances/team-a/one/x",
-		"/var/lib/kubesolo/instances/../instances/team-a", "/var/lib", "/",
+		"/var/lib/kubesolo/instances/../instances/team-a", "/",
+		// With a base inside the root's platform data trees.
+		"/srv/x",
 	} {
 		t.Run(root, func(t *testing.T) {
 			h := newHarness(t, v1alpha1.DeletionDelete)
+			if root == "/srv/x" {
+				h.r.StorageRootBase = "/srv/x/di-tenants/instances"
+			}
 			inst := h.get()
 			inst.Spec.Platform.StorageRoot = root
 			if err := h.c.Update(context.Background(), inst); err != nil {
@@ -258,10 +265,76 @@ func TestCustomStorageRootOverlappingTheBaseIsRejected(t *testing.T) {
 			}
 		})
 	}
-	for _, root := range []string{"/var/lib/kubesolo/instances-other", "/srv/team-a", "relative/dir"} {
-		if customRootOverlapsBase(root, "/var/lib/kubesolo/instances") {
-			t.Errorf("%q reported as overlapping", root)
-		}
+	// Roots the cleanup can't reach are accepted and installed, the platform's own default
+	// /var/lib/kubesolo (which contains the base) among them.
+	for _, root := range []string{"/var/lib/kubesolo", "/var/lib", "/var/lib/kubesolo/instances-other", "/srv/team-a"} {
+		t.Run("accepts "+root, func(t *testing.T) {
+			h := newHarness(t, v1alpha1.DeletionDelete)
+			inst := h.get()
+			inst.Spec.Platform.StorageRoot = root
+			if err := h.c.Update(context.Background(), inst); err != nil {
+				t.Fatal(err)
+			}
+			h.readyTarget()
+			h.reconcile()
+			h.reconcile()
+			if len(h.in.installs) != 1 || h.get().Status.Phase != v1alpha1.PhaseReady {
+				t.Fatalf("installs %d status %+v", len(h.in.installs), h.get().Status)
+			}
+		})
+	}
+	if customRootOverlapsCleanup("relative/dir", "/var/lib/kubesolo/instances") {
+		t.Error("relative root reported as overlapping")
+	}
+}
+
+// An instance installed before the check (or before --storage-root-base moved) never flips to
+// Failed because of it.
+func TestInstalledInstanceIsNotFailedByTheStorageRootCheck(t *testing.T) {
+	h := newHarness(t, v1alpha1.DeletionDelete)
+	inst := h.get()
+	inst.Spec.Platform.StorageRoot = "/data/one"
+	if err := h.c.Update(context.Background(), inst); err != nil {
+		t.Fatal(err)
+	}
+	h.readyTarget()
+	h.reconcile()
+	h.reconcile()
+	h.r.StorageRootBase = "/data"
+	h.now = h.now.Add(time.Hour)
+	h.reconcile()
+	if got := h.get(); got.Status.Phase != v1alpha1.PhaseReady || len(h.in.installs) != 2 ||
+		conditionReason(got, v1alpha1.ConditionInstalled) == v1alpha1.ReasonInvalidStorageRoot {
+		t.Fatalf("installs %d status %+v", len(h.in.installs), got.Status)
+	}
+}
+
+// storage-cleaned counts only with this incarnation's UID: "true" or a copied UID is ignored.
+func TestStorageCleanedAnnotationNeedsThisUID(t *testing.T) {
+	for _, v := range []string{"true", "uid-0"} {
+		t.Run(v, func(t *testing.T) {
+			h := deleting(t, v1alpha1.DeletionDelete, func(inst *v1alpha1.PlatformInstance) {
+				inst.Annotations = map[string]string{AnnotationStorageCleaned: v}
+			})
+			h.reconcile()
+			if h.released() || h.cleanupJob() == nil {
+				t.Fatalf("annotation %q skipped the cleanup: released %v", v, h.released())
+			}
+			h.finishCleanup(batchv1.JobComplete)
+			h.reconcile()
+			if !h.released() {
+				t.Fatal("not released after the cleanup")
+			}
+		})
+	}
+}
+
+func TestCleanupScriptArgs(t *testing.T) {
+	inst := &v1alpha1.PlatformInstance{}
+	inst.Namespace, inst.Name, inst.UID = "team-a", "one", "uid-1"
+	job := cleanupJob(types.NamespacedName{Namespace: cleanupNS, Name: "j"}, inst, storagePath{"/var/lib/kubesolo/instances", "team-a/one"}, false)
+	if got := job.Spec.Template.Spec.Containers[0].Command[6]; got != "never-installed" {
+		t.Fatalf("state %q", got)
 	}
 }
 
@@ -297,6 +370,10 @@ func escapeMidJob(t *testing.T, way func(h *harness)) {
 	}
 	if h.released() {
 		t.Fatal("released while the cleanup pod still exists")
+	}
+	if c := meta.FindStatusCondition(h.get().Status.Conditions, v1alpha1.ConditionReady); c == nil ||
+		c.Reason != "WaitingForStorageCleanup" || !strings.Contains(c.Message, "pod "+pod.Name) {
+		t.Fatalf("no condition names the pod being waited for: %+v", c)
 	}
 	h.stopPod(pod)
 	h.reconcile()
@@ -394,6 +471,7 @@ func TestCleanupRefusesUnsafePaths(t *testing.T) {
 		{"relative base", "var/lib/instances", "team-a", "storage root base"},
 		{"unclean base", "/var/lib/../instances", "team-a", "storage root base"},
 		{"root base", "/", "team-a", "storage root base"},
+		{"base whose parent is root", "/instances", "team-a", "storage root base"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -487,8 +565,8 @@ func TestCleanupJobOfAnEarlierIncarnationIsNotTrusted(t *testing.T) {
 	old := inst.DeepCopy()
 	old.UID = "uid-0"
 	stale := []*batchv1.Job{
-		cleanupJob(types.NamespacedName{Namespace: cleanupNS, Name: cleanupJobName(old)}, old, storagePath{"/var/lib/kubesolo/instances", "team-a/one"}),
-		cleanupJob(types.NamespacedName{Namespace: cleanupNS, Name: cleanupJobName(inst)}, old, storagePath{"/var/lib/kubesolo/instances", "team-a/one"}),
+		cleanupJob(types.NamespacedName{Namespace: cleanupNS, Name: cleanupJobName(old)}, old, storagePath{"/var/lib/kubesolo/instances", "team-a/one"}, true),
+		cleanupJob(types.NamespacedName{Namespace: cleanupNS, Name: cleanupJobName(inst)}, old, storagePath{"/var/lib/kubesolo/instances", "team-a/one"}, true),
 	}
 	for _, job := range stale {
 		if err := h.c.Create(context.Background(), job); err != nil {
