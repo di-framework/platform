@@ -1,0 +1,325 @@
+# Publish the platform operator image, ghcr.io/di-framework/platform-operator (#271).
+#
+# Triggers (#172): a push to main that touches platform/operator/** (except the Helm chart and the
+# Headlamp plugin, which are not image inputs and are published on their own) or this file, and
+# workflow_dispatch. check-source hashes the committed files in on.push.paths
+# (scripts/source-check.ts); on a push the build is skipped when
+# ghcr.io/di-framework/platform-operator:src-<hash> already exists. A dispatch always builds.
+#
+# amd64 and arm64 build at the same time on native runners, no QEMU: platform/operator/Dockerfile
+# compiles the Go binary on $BUILDPLATFORM for $TARGETARCH and fetches the matching Pulumi CLI.
+# Each arch pushes by digest and its own registry cache (mode=max); merge assembles the two into
+# one index tagged with the commit SHA and src-<hash>, and pin opens the bot PR
+# "chore: pin platform-operator to <digest>" (scripts/pin-artifact.ts rewrites the pinned
+# reference in platform/operator/README.md). Only commit-SHA and src-<hash> tags are pushed, so a
+# revert has no moving tag to re-point: check-source finds the published source and pin re-pins it.
+# cancel-in-progress stays false so a queued publish waits and does not abort one in progress.
+#
+# Not baked in yet: the pinned @di-framework/platform package and the Pulumi Kubernetes provider
+# plugin. Each instance's first install runs npm install and downloads the plugin, so the operator
+# needs egress to npm and to the plugin host.
+#
+# Permissions: workflow default contents: read. check-source reads packages; build and merge push
+# (packages: write). Only pin holds contents: write and pull-requests: write.
+# Auth is GITHUB_TOKEN. No registry secret is stored.
+name: Publish platform operator image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'platform/operator/**'
+      - '!platform/operator/chart/**'
+      - '!platform/operator/headlamp-plugin/**'
+      - '.github/workflows/platform-operator-image.yml'
+      - '!**/*.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-platform-operator
+  cancel-in-progress: false
+
+jobs:
+  check-source:
+    name: Check if source already published
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      source-hash: ${{ steps.check.outputs.hash }}
+      skip: ${{ steps.check.outputs.skip }}
+      stale: ${{ steps.check.outputs.stale }}
+      digest: ${{ steps.check.outputs.digest }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up source check
+        uses: ./.github/actions/setup-source-check
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if already published
+        id: check
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
+          SOURCE_CHECK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086 # FORCE is empty or one flag
+          bun scripts/source-check.ts --workflow .github/workflows/platform-operator-image.yml \
+            --image ghcr.io/di-framework/platform-operator --stale-guard ${FORCE} --github-output
+
+  build:
+    name: Build on ${{ matrix.platform }}
+    needs: check-source
+    if: ${{ !cancelled() && needs.check-source.result == 'success' && needs.check-source.outputs.skip != 'true' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Require di-framework/platform
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY}" != "di-framework/platform" ]]; then
+            echo "::error::This workflow publishes ghcr.io/di-framework/platform-operator and only runs in di-framework/platform"
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A stale re-run must not move the buildcache-* tags back to an older source.
+      - name: Stop if main has newer inputs
+        id: guard
+        uses: ./.github/actions/source-guard
+        with:
+          workflow: .github/workflows/platform-operator-image.yml
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        if: steps.guard.outputs.stale != 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        if: steps.guard.outputs.stale != 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        if: steps.guard.outputs.stale != 'true'
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: platform/operator
+          platforms: ${{ matrix.platform }}
+          provenance: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/di-framework/platform
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=di-framework platform operator (PlatformInstance controller)
+          outputs: type=image,name=ghcr.io/di-framework/platform-operator,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=ghcr.io/di-framework/platform-operator:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=ghcr.io/di-framework/platform-operator:buildcache-${{ matrix.arch }},mode=max,oci-mediatypes=true,image-manifest=true
+
+      - name: Export digest
+        if: steps.guard.outputs.stale != 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ "${DIGEST}" != sha256:* ]]; then
+            echo "::error::build did not return a digest"
+            exit 1
+          fi
+          mkdir -p "${RUNNER_TEMP}/digests"
+          : > "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        if: steps.guard.outputs.stale != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: platform-operator-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish multi-architecture index
+    needs: [check-source, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+    steps:
+      - name: Require di-framework/platform
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY}" != "di-framework/platform" ]]; then
+            echo "::error::This workflow publishes ghcr.io/di-framework/platform-operator and only runs in di-framework/platform"
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Right before the tags move: a re-run of an older push whose inputs main has since
+      # changed stops here (check-source is not re-run by "Re-run failed jobs").
+      - name: Stop if main has newer inputs
+        id: guard
+        uses: ./.github/actions/source-guard
+        with:
+          workflow: .github/workflows/platform-operator-image.yml
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # By exact name, one step per build arch.
+      - name: Download amd64 digest
+        if: steps.guard.outputs.stale != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: platform-operator-digest-amd64
+          path: ${{ runner.temp }}/digests
+
+      - name: Download arm64 digest
+        if: steps.guard.outputs.stale != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: platform-operator-digest-arm64
+          path: ${{ runner.temp }}/digests
+
+      - name: Set up Docker Buildx
+        if: steps.guard.outputs.stale != 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        if: steps.guard.outputs.stale != 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up ORAS
+        if: steps.guard.outputs.stale != 'true'
+        uses: ./.github/actions/setup-oras
+
+      - name: Create and push manifest
+        if: steps.guard.outputs.stale != 'true'
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find . -type f | sort)
+          if (( ${#files[@]} != 2 )); then
+            echo "::error::expected 2 image digests, found ${#files[@]}"
+            printf '%s\n' "${files[@]}"
+            exit 1
+          fi
+          args=()
+          for file in "${files[@]}"; do
+            hex="$(basename "${file}")"
+            if [[ ! "${hex}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::unexpected digest file ${hex}"
+              exit 1
+            fi
+            args+=("ghcr.io/di-framework/platform-operator@sha256:${hex}")
+          done
+          # --metadata-file is the index that was just pushed; never pipe `imagetools inspect`
+          # into a reader that exits early (it fails the job after the tag is published).
+          docker buildx imagetools create \
+            --metadata-file "${RUNNER_TEMP}/platform-operator-index.json" \
+            --tag "ghcr.io/di-framework/platform-operator:${GITHUB_SHA}" \
+            "${args[@]}"
+
+      - name: Tag with source hash
+        if: steps.guard.outputs.stale != 'true'
+        id: index
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_HASH: ${{ needs.check-source.outputs.source-hash }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${SOURCE_HASH}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo '::error::missing source hash'
+            exit 1
+          fi
+          digest="$(jq -er '.["containerimage.descriptor"].digest' "${RUNNER_TEMP}/platform-operator-index.json")"
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::manifest list did not return an index digest"
+            cat "${RUNNER_TEMP}/platform-operator-index.json"
+            exit 1
+          fi
+          printf '%s' "${GHCR_TOKEN}" | oras login ghcr.io --username "${GHCR_USERNAME}" --password-stdin
+          pinned="ghcr.io/di-framework/platform-operator@${digest}"
+          oras manifest fetch "${pinned}" > index.json
+          jq -e '[.manifests[] | select(.platform.os != "unknown") | .platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]' index.json
+          oras tag "${pinned}" "src-${SOURCE_HASH}"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          printf 'Published %s (also tagged src-%s)\n' "${pinned}" "${SOURCE_HASH}"
+          {
+            echo '### Platform operator image'
+            echo
+            # shellcheck disable=SC2016 # the backticks are Markdown, not expansions
+            printf '```\n%s\n```\n' "${pinned}"
+            echo
+            echo "Also tagged \`${GITHUB_SHA}\` and \`src-${SOURCE_HASH}\` (hash of the committed inputs). Both linux/amd64 and linux/arm64 are included."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  pin:
+    name: Open pin PR
+    # After a publish, or when this push's source was already published (a revert to an older
+    # source, or a pin PR closed unmerged): then check-source's digest is pinned again.
+    # pin-artifact.ts finds nothing to change when main already has it, so that is a no-op.
+    needs: [check-source, merge]
+    if: >-
+      ${{ !cancelled() && needs.check-source.result == 'success' && github.ref == 'refs/heads/main' &&
+      ((needs.merge.result == 'success' && needs.merge.outputs.digest != '') ||
+      (needs.check-source.outputs.skip == 'true' && needs.check-source.outputs.stale != 'true' &&
+      needs.check-source.outputs.digest != '')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Open pin PR
+        uses: ./.github/actions/open-pin-pr
+        with:
+          name: platform-operator
+          workflow: .github/workflows/platform-operator-image.yml
+          pins: platform-operator ${{ needs.merge.outputs.digest || needs.check-source.outputs.digest }}
+          token: ${{ secrets.GITHUB_TOKEN }}
