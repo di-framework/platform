@@ -8,6 +8,26 @@ on:
 permissions:
   contents: read
 
+# Cancel a PR's superseded runs; every push to main still runs to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Only what build-engine.ts checks before skipping the engine source build (a few MB);
+  # prepare-engine.ts rebuilds the rest in seconds.
+  ENGINE_CACHE_PATHS: |
+    platform/pglite-component/target/engine/source-stamp
+    platform/pglite-component/target/engine/pglite-source.tar.xz
+  # Cargo target directories of the Wasm components (cargo's fingerprints decide what is reused).
+  RUST_CACHE_PATHS: |
+    target
+    platform/pglite-component/target
+    !platform/pglite-component/target/engine
+    platform/pglite-encfs/target
+    platform/oci-registry/target
+    platform/sqlite-component/target
+
 jobs:
   operator:
     name: Operator
@@ -27,8 +47,10 @@ jobs:
         working-directory: platform/operator
         run: make check
 
-  build-and-test:
-    name: Test
+  # TypeScript checks and `bun test`. The tests need the built pglite and OCI registry
+  # components, so this job builds them too; their own Rust tests run in `components`.
+  typescript:
+    name: TypeScript
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -69,28 +91,30 @@ jobs:
       - name: Lint
         run: bun run lint
 
+      # Only `components` saves this cache; on a miss both jobs build the engine.
+      - name: Restore PGlite engine source build
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.ENGINE_CACHE_PATHS }}
+          key: pglite-engine-source-${{ hashFiles('platform/pglite-component/engine/**', 'platform/pglite-component/scripts/build-engine.ts', 'platform/pglite-component/scripts/patch-engine-source.ts', 'platform/pglite-component/scripts/tool-versions.env') }}
+
+      - name: Cache Rust build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.RUST_CACHE_PATHS }}
+          key: rust-${{ github.job }}-${{ hashFiles('Cargo.lock', 'platform/*/Cargo.lock', 'platform/*/rust-toolchain.toml', 'platform/pglite-component/scripts/tool-versions.env') }}
+          restore-keys: rust-${{ github.job }}-
+
       # Builds the engine before the dry-run, which runs the package's `bun run build`
       # (adapter + `make build`) and then reuses the engine and cargo caches.
       - name: Build embedded PGlite component
         run: make -C platform/pglite-component tools-rust build
 
+      - name: Build tenant OCI registry component
+        run: make -C platform/oci-registry build
+
       - name: Dry-run package publish
         run: bun scripts/publish-workspace.ts --dry-run
-
-      - name: Install wasmtime
-        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
-        with:
-          version: 'v48.0.1'
-
-      - name: Test embedded PGlite component against the real engine
-        run: make -C platform/pglite-component unit smoke
-
-      # Plugs pglite-encfs into the pglite component built above and runs the encryption matrix.
-      - name: Test pglite-encfs (encryption at rest) against the real engine
-        run: make -C platform/pglite-encfs tools unit smoke
-
-      - name: Build and test tenant OCI registry component
-        run: make -C platform/oci-registry test lint build
 
       - name: Test
         env:
@@ -156,10 +180,78 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+
+  # The components' own Rust tests and smoke runs, in parallel with `typescript`.
+  components:
+    name: Components
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.3'
+
+      - name: Install SQLite build toolchain
+        run: |
+          bash platform/sqlite-component/scripts/install-tools.sh --rust
+          echo "$GITHUB_WORKSPACE/platform/sqlite-component/.tools/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # The engine source build (Docker, about 6 minutes) is skipped when target/engine holds a
+      # source-stamp matching its inputs; the key hashes the same files, so a hit restores a
+      # matching stamp and anything stale is still rebuilt by build-engine.ts.
+      - name: Cache PGlite engine source build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.ENGINE_CACHE_PATHS }}
+          key: pglite-engine-source-${{ hashFiles('platform/pglite-component/engine/**', 'platform/pglite-component/scripts/build-engine.ts', 'platform/pglite-component/scripts/patch-engine-source.ts', 'platform/pglite-component/scripts/tool-versions.env') }}
+
+      - name: Cache Rust build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.RUST_CACHE_PATHS }}
+          key: rust-${{ github.job }}-${{ hashFiles('Cargo.lock', 'platform/*/Cargo.lock', 'platform/*/rust-toolchain.toml', 'platform/pglite-component/scripts/tool-versions.env') }}
+          restore-keys: rust-${{ github.job }}-
+
+      - name: Install wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
+        with:
+          version: 'v48.0.1'
+
+      - name: Test embedded PGlite component against the real engine
+        run: make -C platform/pglite-component tools-rust unit smoke
+
+      # Plugs pglite-encfs into the pglite component built above and runs the encryption matrix.
+      - name: Test pglite-encfs (encryption at rest) against the real engine
+        run: make -C platform/pglite-encfs tools unit smoke
+
+      - name: Build and test tenant OCI registry component
+        run: make -C platform/oci-registry test lint build
+
+  # The required check: green only when every job above is.
+  build-and-test:
+    name: Test
+    needs: [typescript, components]
+    # always(): a failed or cancelled job must fail this check, not skip it (a skip passes).
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every job to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for result in $RESULTS; do [ "$result" = success ] || exit 1; done
+
   publish-coverage-badges:
     name: Dispatch docs deploy for coverage badges
-    needs: build-and-test
-    if: ${{ !cancelled() && needs.build-and-test.result == 'success' && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    needs: typescript
+    if: ${{ !cancelled() && needs.typescript.result == 'success' && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch coverage update to di-framework/docs
