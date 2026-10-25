@@ -178,8 +178,10 @@ function removeOps(work: Tree, path: readonly string[]): JsonPatchOp[] {
     if (Object.keys(container(work, parent)).length > 0) {
       break;
     }
-    ops.push({ op: 'test', path: pointer(parent), value: {} });
-    ops.push({ op: 'remove', path: pointer(parent) });
+    ops.push(
+      { op: 'test', path: pointer(parent), value: {} },
+      { op: 'remove', path: pointer(parent) },
+    );
     delete container(work, parent.slice(0, -1))[parent[depth - 1] as string];
   }
   return ops;
