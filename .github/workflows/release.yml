@@ -6,12 +6,14 @@ on:
       - "v*"
   workflow_dispatch:
 
-# Three jobs, so the toolchains and Docker never run with publish credentials (#168):
+# Separate jobs, so the toolchains and Docker never run with publish credentials (#168):
 #   build           builds and smoke-tests everything, packs every public package into a tarball
 #                   once, and uploads the tarballs with their sha256 manifest. No OIDC token.
 #   publish         downloads those tarballs, checks them against the build job's digests, and
 #                   runs `npm publish <tarball>`. Only this job holds id-token: write.
 #   github-release  creates the GitHub Release for a tag. Only this job holds contents: write.
+#   chart           packages the operator Helm chart at the tag's version and pushes it to GHCR
+#                   (#272). Only this job holds packages: write.
 # The pglite wasm npm receives is the one `make smoke` tested: it is not rebuilt after the smoke
 # test, and both jobs compare its sha256 inside the packed tarball with the tested file's.
 permissions:
@@ -189,6 +191,69 @@ jobs:
 
       - name: Publish packages to npm
         run: bun scripts/publish-workspace.ts --publish-packed "$RUNNER_TEMP/npm-packages"
+
+  # The platform operator's Helm chart (#272), at the release's version, pushed as an OCI chart to
+  # ghcr.io/di-framework/charts/platform-operator. Only tags: a dispatch on a branch has no
+  # release version. It packages the chart as checked in (Headlamp is vendored in charts/), so it
+  # builds and fetches nothing else.
+  chart:
+    name: Publish the operator Helm chart
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The same helm as the chart tests (platform/backup-destination/tests/support/helm.ts).
+      - name: Install helm
+        env:
+          HELM_VERSION: '3.18.4'
+          HELM_SHA256: f8180838c23d7c7d797b208861fecb591d9ce1690d8704ed1e4cb8e2add966c1
+        run: |
+          set -euo pipefail
+          archive="helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/$archive" "https://get.helm.sh/$archive"
+          echo "${HELM_SHA256}  $RUNNER_TEMP/$archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/helm"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/helm" --strip-components=1 linux-amd64/helm
+          echo "$RUNNER_TEMP/helm" >> "$GITHUB_PATH"
+
+      # The release version is the tag without its `v`, and must be the version package.json
+      # carries at that tag.
+      - name: Package the chart
+        id: package
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} is not v<semver>"
+            exit 1
+          fi
+          PACKAGE_VERSION="$(jq -er .version package.json)"
+          if [ "$PACKAGE_VERSION" != "$VERSION" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${PACKAGE_VERSION}"
+            exit 1
+          fi
+          helm lint platform/operator/chart
+          mkdir -p "$RUNNER_TEMP/chart"
+          helm package platform/operator/chart --version "$VERSION" --app-version "$VERSION" \
+            --destination "$RUNNER_TEMP/chart"
+          echo "tarball=$RUNNER_TEMP/chart/platform-operator-${VERSION}.tgz" >> "$GITHUB_OUTPUT"
+
+      - name: Push the chart to GHCR
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TARBALL: ${{ steps.package.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          echo "$GITHUB_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          helm push "$TARBALL" oci://ghcr.io/di-framework/charts
+          helm registry logout ghcr.io
 
   github-release:
     name: Create GitHub Release

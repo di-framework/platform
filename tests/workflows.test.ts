@@ -1220,11 +1220,18 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     expect('workflow_dispatch' in release.on).toBe(true);
   });
 
-  test('build, publish and github-release run in that order', () => {
-    expect(Object.keys(release.jobs).sort()).toEqual(['build', 'github-release', 'publish']);
+  test('build, publish and github-release run in that order; chart runs after build', () => {
+    expect(Object.keys(release.jobs).sort()).toEqual([
+      'build',
+      'chart',
+      'github-release',
+      'publish',
+    ]);
     expect(release.jobs.publish?.needs).toBe('build');
     expect(release.jobs['github-release']?.needs).toBe('publish');
     expect(release.jobs['github-release']?.if).toBe("github.ref_type == 'tag'");
+    expect(release.jobs.chart?.needs).toBe('build');
+    expect(release.jobs.chart?.if).toBe("github.ref_type == 'tag'");
   });
 
   test('only publish holds an OIDC token, only github-release can write contents', () => {
@@ -1232,6 +1239,27 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     expect(release.jobs.build?.permissions).toEqual({ contents: 'read' });
     expect(release.jobs.publish?.permissions).toEqual({ contents: 'read', 'id-token': 'write' });
     expect(release.jobs['github-release']?.permissions).toEqual({ contents: 'write' });
+    expect(release.jobs.chart?.permissions).toEqual({ contents: 'read', packages: 'write' });
+  });
+
+  test('chart packages the operator chart at the tag version and pushes it to GHCR (#272)', () => {
+    const chart = runs('chart');
+    for (const ref of uses('chart').filter(Boolean)) expect(ref).toMatch(/@[0-9a-f]{40}$/);
+    // The helm the chart tests download, checked by the same sha256.
+    const helper = read('platform/backup-destination/tests/support/helm.ts');
+    const install = steps('chart').find((s) => s.name === 'Install helm');
+    expect(helper).toContain(`const version = '${install?.env?.HELM_VERSION}';`);
+    expect(helper).toContain(`'linux-amd64': '${install?.env?.HELM_SHA256}'`);
+    expect(install?.run).toContain('sha256sum -c -');
+    expect(chart).toContain('VERSION="${GITHUB_REF_NAME#v}"');
+    expect(chart).toContain(
+      'helm package platform/operator/chart --version "$VERSION" --app-version "$VERSION"',
+    );
+    expect(chart).toContain('helm registry login ghcr.io');
+    expect(chart).toContain('--password-stdin');
+    expect(chart).toContain('helm push "$TARBALL" oci://ghcr.io/di-framework/charts');
+    expect(chart.indexOf('helm package')).toBeLessThan(chart.indexOf('helm push'));
+    expect(chart).not.toMatch(/\bmake\b|docker|bun install|helm dependency/);
   });
 
   test('build smoke-tests, records the wasm sha256, packs without rebuilding pglite, uploads', () => {

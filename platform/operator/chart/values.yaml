@@ -1,0 +1,109 @@
+image:
+  repository: ghcr.io/di-framework/platform-operator
+  # The operator image is always pulled by digest, never by tag. The operator image pin PR (#271)
+  # rewrites this placeholder with the digest each publish produced. Until then, set it at install
+  # time: --set image.digest=sha256:<64 hex>.
+  digest: sha256:<pinned by the platform-operator image pin PR>
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# One operator is active at a time: extra replicas wait on the leader-election Lease. Each
+# PlatformInstance has at most one Pulumi run in flight only while leader election is on.
+replicaCount: 1
+leaderElect: true
+
+# The operator's flags (cmd/platform-operator/main.go). Durations use Go syntax (30m, 10s).
+# Each instance's default storageRoot is <storageRootBase>/<namespace>/<name> on the node.
+storageRootBase: /var/lib/kubesolo/instances
+# Longest one install or repair may run before it is cancelled and retried.
+installTimeout: 30m
+# How often a Ready instance gets a refresh and up, which repairs drift.
+repairInterval: 30m
+# How often a target that is still coming up is checked.
+targetPoll: 10s
+# Instances reconciled in parallel. Each install runs `npm install` and Pulumi in the operator pod.
+maxConcurrentInstalls: 2
+# Extra operator flags, such as the zap logging flags (--zap-log-level=debug).
+extraArgs: []
+
+# There are no values for the vCluster chart version, the vCluster values or a default platform
+# version: the operator embeds the digest-checked vCluster chart and its KubeSolo defaults, and each
+# PlatformInstance names its own spec.version. They change with the operator image.
+
+# The operator's Pulumi state: per instance, the install project and a file backend. Losing it
+# means Pulumi forgets what it installed, so the claim is kept on `helm uninstall`
+# (helm.sh/resource-policy: keep). Back it up.
+state:
+  # An existing claim to use instead of the chart's.
+  existingClaim: ""
+  size: 10Gi
+  # Empty uses the cluster's default StorageClass.
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOnce
+
+# The passphrase that encrypts the secrets in the Pulumi state. The chart generates one on first
+# install, reuses it on every upgrade (lookup), and keeps the Secret on `helm uninstall`. Losing it
+# makes the state unreadable. Set existingSecret (key `passphrase`) to bring your own.
+passphrase:
+  existingSecret: ""
+
+serviceAccount:
+  # Empty uses the release's full name.
+  name: ""
+  annotations: {}
+
+# RBAC: the chart always binds two ClusterRoles to the operator's ServiceAccount.
+#   - platform-operator: config/rbac/role.yaml, what the controller itself uses.
+#   - cluster-admin: required in v1alpha1. The operator installs the vCluster chart with Helm, and
+#     that chart creates RBAC, workloads and Services in each instance's host namespace; Kubernetes
+#     only lets Helm grant permissions it already holds. Narrowing this is follow-up work.
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 2Gi
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# The image runs as `node` (uid 1000) from the Dockerfile.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+# The root filesystem is read-only: the chart mounts writable emptyDirs at /tmp and at /home/node
+# (HOME: the npm cache and Pulumi's plugins).
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Headlamp (the upstream chart, vendored in charts/) as the operator's UI. Off by default.
+# Everything under `headlamp` is passed to that chart; see its values.yaml.
+headlamp:
+  enabled: false
+  # The PlatformInstance Headlamp plugin (#273) is installed as a tarball by Headlamp's plugin
+  # manager sidecar (`pluginctl install --config`). Until the plugin is published this is a stub:
+  # to try a plugin, enable it and set configContent to the plugin list, for example
+  #   pluginsManager:
+  #     enabled: true
+  #     configContent: |
+  #       plugins:
+  #         - name: platform-instances
+  #           source: <where #273 publishes the plugin tarball>
+  # (Upstream reads `pluginsManager` at the top of the Headlamp chart's values, so here it is
+  # headlamp.pluginsManager, not headlamp.config.pluginsManager.)
+  pluginsManager:
+    enabled: false
+    configContent: ""
