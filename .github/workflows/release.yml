@@ -225,8 +225,24 @@ jobs:
 
       # The release version is the tag without its `v`, and must be the version package.json
       # carries at that tag.
+      # Until the image pin PR rewrites the placeholder in values.yaml, the chart cannot install
+      # (it refuses an unpinned image.digest), so it is not published, but the release goes on:
+      # npm and the GitHub Release do not wait for the operator image pin.
+      - name: Check the operator image digest is pinned
+        id: pin
+        run: |
+          set -euo pipefail
+          DIGEST="$(sed -n 's/^  digest: *//p' platform/operator/chart/values.yaml)"
+          if [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "pinned=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::chart not published: image.digest in platform/operator/chart/values.yaml is not pinned yet (${DIGEST})"
+            echo "pinned=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Package the chart
         id: package
+        if: steps.pin.outputs.pinned == 'true'
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
@@ -240,12 +256,11 @@ jobs:
             exit 1
           fi
           helm lint platform/operator/chart
-          # The chart refuses an image.digest that is not sha256:<64 hex>, the placeholder included.
-          # Refuse to publish a chart whose defaults cannot install. existingSecret only skips the
-          # passphrase's offline-render guard.
+          # The digest is pinned; the packaged defaults must also render. existingSecret only skips
+          # the passphrase's offline-render guard.
           if ! helm template platform-operator platform/operator/chart \
             --set passphrase.existingSecret=release-check >/dev/null; then
-            echo "::error::platform/operator/chart/values.yaml image.digest is not pinned (sha256:<64 hex>); refusing to publish the chart"
+            echo "::error::platform/operator/chart does not render with its default values; refusing to publish the chart"
             exit 1
           fi
           mkdir -p "$RUNNER_TEMP/chart"
@@ -257,6 +272,7 @@ jobs:
       # helm 3 packaging is not reproducible and helm push overwrites a tag, so a re-run would
       # replace a released chart with different bytes. Push only when the version is not there yet.
       - name: Push the chart to GHCR
+        if: steps.pin.outputs.pinned == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TARBALL: ${{ steps.package.outputs.tarball }}
@@ -269,7 +285,10 @@ jobs:
             echo "::notice::platform-operator ${VERSION} is already in ghcr.io/di-framework/charts; not pushing it again"
           # A missing tag is "not found"/"manifest unknown"; a package that does not exist yet (the
           # first release) is "name unknown" or a 403 "denied". A real auth problem fails the push.
-          elif grep -qiE 'not found|manifest unknown|name unknown|denied' "$RUNNER_TEMP/show-chart.err"; then
+          elif grep -qiE 'not found|manifest unknown|name unknown' "$RUNNER_TEMP/show-chart.err"; then
+            helm push "$TARBALL" oci://ghcr.io/di-framework/charts
+          elif grep -qi 'denied' "$RUNNER_TEMP/show-chart.err"; then
+            echo "::warning::GHCR denied reading platform-operator ${VERSION}; treating this as the chart's first publish. If the push fails, the package's Manage Actions access is missing this repository."
             helm push "$TARBALL" oci://ghcr.io/di-framework/charts
           else
             cat "$RUNNER_TEMP/show-chart.err" >&2

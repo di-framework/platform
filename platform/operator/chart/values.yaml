@@ -3,7 +3,8 @@ image:
   # The operator image is always pulled by digest, never by tag. The operator image pin PR (#271)
   # rewrites this placeholder with the digest each publish produced. Until then, set it at install
   # time: --set image.digest=sha256:<64 hex>. The chart refuses to render anything else, the
-  # placeholder included, and the release workflow refuses to publish a chart that still has it.
+  # placeholder included, and the release workflow skips publishing the chart (with a warning)
+  # while it still has it.
   digest: sha256:<pinned by the platform-operator image pin PR>
   pullPolicy: IfNotPresent
 imagePullSecrets: []
@@ -57,7 +58,8 @@ state:
 #   - existingSecret set: the chart creates no Secret and mounts that one (key `passphrase`).
 #     Required for helm template, client-side --dry-run, Argo CD and other GitOps tools.
 #   - existingSecret empty: the chart reads the cluster (lookup). It reuses the passphrase of its
-#     Secret when it exists and generates one on first install, and keeps the Secret on
+#     Secret when it exists and generates one only when neither the Secret nor the state claim
+#     exists (a claim without its Secret, or a Secret without the key, fails). It keeps the Secret on
 #     `helm uninstall`. A render that cannot see the cluster fails instead of generating a new
 #     passphrase that would overwrite the live one.
 passphrase:
