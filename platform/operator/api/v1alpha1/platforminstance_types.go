@@ -116,9 +116,9 @@ type PlatformSettings struct {
 	// TenantHostImage is the platform's `tenantHostImage`. A change is applied by the next install
 	// and restarts the tenant hosts. Empty keeps the image status.applied.tenantHostImage recorded;
 	// a new instance records the operator's pinned exclusive host variant
-	// (ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive by digest, which needs spec.version
-	// 6.0.20 or later), and an instance installed before this field existed keeps the platform's
-	// own default.
+	// (ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive by digest; the spec.version package must
+	// list it as an approved host build), and an instance installed before this field existed keeps
+	// the platform's own default.
 	// +kubebuilder:validation:Pattern=`^[^\s@]+(@sha256:[0-9a-f]{64})?$`
 	// +kubebuilder:validation:MaxLength=512
 	// +optional
@@ -381,8 +381,9 @@ const (
 const ReasonTenantAuthSecret = "TenantAuthSecretUnavailable"
 
 // ReasonTenantHostImageUnsupported (on Installed) reports that an empty spec.platform.tenantHostImage
-// would use the operator's exclusive default host image with a spec.version that doesn't list it
-// as an approved build. Set the field, or a newer version.
+// would use the operator's exclusive default host image, and the installed spec.version package
+// doesn't list its digest as an approved host build (NATS_CREDENTIALS_HOST_IMAGE_DIGESTS). Set the
+// field, or a version that approves it.
 const ReasonTenantHostImageUnsupported = "TenantHostImageUnsupported"
 
 // ReasonStorageCleanupFailed (on Installed) reports that removing the default storageRoot after a

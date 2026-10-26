@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -50,13 +48,6 @@ type oauthClientConfig struct {
 // removed from the install state.
 var tenancyUnset = []string{"tenantAuth", installer.TenantAuthClientSecretKey, "tenantHostImage", "tenantHostImagePullPolicy"}
 
-// MinDefaultHostImageVersion is the first platform version whose approved host builds
-// (NATS_CREDENTIALS_HOST_IMAGE_DIGESTS) list DefaultTenantHostImage.
-const MinDefaultHostImageVersion = "6.0.20"
-
-// errTenantHostImage marks an exclusive default the spec.version doesn't approve.
-var errTenantHostImage = errors.New("default tenant host image unsupported")
-
 // tenantHostImage is the image an install of inst applies, empty for the platform's own default:
 // the spec's; else the one the last install recorded; else, for an instance installed before the
 // operator recorded it, the platform default it was installed with; else (a new instance) the
@@ -71,26 +62,6 @@ func tenantHostImage(inst *v1alpha1.PlatformInstance) (image string, fromDefault
 		return "", false
 	}
 	return DefaultTenantHostImage, true
-}
-
-// versionBefore reports whether the exact version v (x.y.z[-pre]) is below min (x.y.z). A
-// prerelease of min counts as min.
-func versionBefore(v, min string) bool {
-	parse := func(s string) [3]int {
-		var n [3]int
-		core, _, _ := strings.Cut(s, "-")
-		for i, part := range strings.SplitN(core, ".", 3) {
-			n[i], _ = strconv.Atoi(part)
-		}
-		return n
-	}
-	a, b := parse(v), parse(min)
-	for i := range a {
-		if a[i] != b[i] {
-			return a[i] < b[i]
-		}
-	}
-	return false
 }
 
 // tenancy adds the platform's tenants, users, tenantHostImage(PullPolicy) and tenantAuth config to
@@ -110,9 +81,9 @@ func (r *Reconciler) tenancy(ctx context.Context, inst *v1alpha1.PlatformInstanc
 	req.Settings["tenants"] = tenants
 	req.Settings["users"] = users
 	image, fromDefault := tenantHostImage(inst)
-	if fromDefault && versionBefore(inst.Spec.Version, MinDefaultHostImageVersion) {
-		return "", fmt.Errorf("%w: spec.platform.tenantHostImage is empty, and the operator's default %s is an approved host build only from platform %s; spec.version is %s. Set spec.platform.tenantHostImage, or a version from %s",
-			errTenantHostImage, DefaultTenantHostImage, MinDefaultHostImageVersion, inst.Spec.Version, MinDefaultHostImageVersion)
+	if fromDefault {
+		// The installer refuses it unless spec.version's package lists it as an approved host build.
+		req.ApprovedHostImage = image
 	}
 	if image != "" {
 		req.Settings["tenantHostImage"] = image

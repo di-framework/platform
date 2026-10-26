@@ -5,6 +5,10 @@
  *
  * The project is laid out the way npm installs the operator's package.json: `@di-framework/platform` with
  * `@pulumi/pulumi` and `@pulumi/kubernetes` hoisted next to it, and `@types/node`.
+ *
+ * The installer also reads the approved host builds from the installed package's
+ * `dist/tenancy/registry-nats.js` (installer/host_image.go): that module keeps the shape it parses,
+ * and lists the operator's default host image.
  */
 import { describe, expect, test } from 'bun:test';
 import {
@@ -87,4 +91,34 @@ describe('the operator Pulumi program', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 120_000);
+});
+
+describe('the approved host builds the operator reads', () => {
+  const hostImageGo = readFileSync(join(installer, 'host_image.go'), 'utf8');
+  const tenancyGo = readFileSync(
+    join(root, 'platform', 'operator', 'internal', 'controller', 'tenancy.go'),
+    'utf8',
+  );
+  /** A Go regexp from `name = regexp.MustCompile(`...`)` as a JS RegExp (`(?s)` becomes the s flag). */
+  function goRegexp(name: string): RegExp {
+    const source = hostImageGo.match(
+      new RegExp(`${name}\\s*= regexp\\.MustCompile\\(\`([^\`]+)\``),
+    )?.[1];
+    if (!source) throw new Error(`no ${name} in host_image.go`);
+    return source.startsWith('(?s)') ? new RegExp(source.slice(4), 's') : new RegExp(source, 'g');
+  }
+
+  test('lists the operator default in the shape the installer parses', () => {
+    const file = hostImageGo.match(/approvedDigestsFile = filepath\.Join\(([^)]+)\)/)?.[1] ?? '';
+    const parts = [...file.matchAll(/"([^"]+)"/g)].map((m) => m[1] as string);
+    expect(parts.slice(0, 3)).toEqual(['node_modules', '@di-framework', 'platform']);
+    const module = readFileSync(join(platformPkg, ...parts.slice(3)), 'utf8');
+    const list = goRegexp('approvedDigestsList').exec(module)?.[1] ?? '';
+    const digests = [...list.matchAll(goRegexp('approvedDigest'))].map((m) => m[1]);
+    expect(digests.length).toBeGreaterThan(0);
+    const fallback = tenancyGo.match(
+      /const DefaultTenantHostImage = "[^"@]+@(sha256:[0-9a-f]{64})"/,
+    )?.[1];
+    expect(digests).toContain(fallback);
+  });
 });

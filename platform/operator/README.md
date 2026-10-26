@@ -77,7 +77,10 @@ namespace. On every install and repair the operator reads it and sets it as the 
 names that Secret. A missing Secret or key stops the install with `Installed=False`,
 reason `TenantAuthSecretUnavailable` (and `ConfigApplied=False` with the same reason), and is retried with
 backoff. The operator doesn't watch the Secret, so creating a missing one is picked up by the next retry (the
-backoff reaches about 16 minutes), not at once.
+backoff reaches about 16 minutes), not at once. On an installed instance, a repair that finds the source
+Secret gone also sets `phase: Failed` and `Ready=False` until the Secret is back: that means the instance
+can't be reconciled to its spec, not that it is down. Nothing is removed, and the platform keeps serving
+with the last applied client secret.
 
 **Rotating the client secret.** Change the value in the source Secret. The next repair (at most one
 `--repair-interval`, 30 minutes by default) rewrites `platform-operator-tenant-auth`, and the platform
@@ -96,11 +99,14 @@ together with a `spec.version` upgrade) is a spec change that rolls the tenant h
   `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:...` (the PGlite exclusive-PGDATA workloads need
   it; the image pin PR moves it), at its first install. That image is recorded in
   `status.applied.tenantHostImage`, and later installs and repairs keep using it, so upgrading the operator
-  never moves it or restarts the hosts. To move it, set the field. The exclusive default is an approved host
-  build (the platform's `NATS_CREDENTIALS_HOST_IMAGE_DIGESTS`, which gives a tenant registry its own NATS
-  account) only from platform `6.0.20`; with an earlier `spec.version` the install stops with
-  `Installed=False` and `ConfigApplied=False`, reason `TenantHostImageUnsupported`. Set `tenantHostImage` or a
-  newer `spec.version`.
+  never moves it or restarts the hosts. To move it, set the field. Before that first install uses the
+  default, the operator checks that the installed `@di-framework/platform@<spec.version>` lists its digest
+  as an approved host build (`NATS_CREDENTIALS_HOST_IMAGE_DIGESTS` in `dist/tenancy/registry-nats.js`, which
+  gives a tenant registry its own NATS account). The default's pin PR adds the digest to that list, so it
+  is approved from the next platform release on (today's default from `6.0.20`). When the package doesn't
+  list it, nothing is applied and the install stops with `Installed=False` and `ConfigApplied=False`, reason
+  `TenantHostImageUnsupported`, naming the digest and the version. Set `tenantHostImage` or a newer
+  `spec.version`. An explicit or recorded image isn't checked.
 - An **instance installed before the operator managed the host image** (`Installed` with no
   `status.applied`) keeps the platform's own default: the operator doesn't set the key (and removes a
   hand-set one), records it as empty, and keeps doing so, so its hosts don't restart on the operator upgrade.

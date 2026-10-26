@@ -113,6 +113,11 @@ func (p *Pulumi) Install(ctx context.Context, req Request, opts Options) (Result
 	if err := p.writeProject(ctx, req, projectDir, stateDir); err != nil {
 		return Result{}, err
 	}
+	if req.ApprovedHostImage != "" {
+		if err := checkApprovedHostImage(projectDir, req.Version, req.ApprovedHostImage); err != nil {
+			return Result{}, err
+		}
+	}
 	s, err := p.openStack(ctx, req.ID, projectDir, stateDir)
 	if err != nil {
 		return Result{}, err

@@ -26,6 +26,11 @@ type Request struct {
 	// Unset are config keys removed from the install state when present and not set by Settings
 	// or SecretSettings, so a setting dropped from the spec stops applying.
 	Unset []string
+	// ApprovedHostImage, when set, is a digest-pinned tenant host image the installed
+	// @di-framework/platform@Version must list as an approved host build
+	// (NATS_CREDENTIALS_HOST_IMAGE_DIGESTS). Install checks it after installing the package and
+	// before any update, and fails with ErrHostImageNotApproved when the package doesn't list it.
+	ApprovedHostImage string
 }
 
 // TenantAuthClientSecretKey is the secret config key whose value the install's program writes to
@@ -67,6 +72,10 @@ type Installer interface {
 	Status(ctx context.Context, req Request) (State, error)
 	Uninstall(ctx context.Context, req Request, opts UninstallOptions) error
 }
+
+// ErrHostImageNotApproved marks an install refused because the installed platform package doesn't
+// list Request.ApprovedHostImage as an approved host build.
+var ErrHostImageNotApproved = errors.New("tenant host image not approved by the platform package")
 
 // ErrInvalidRequest marks a Request the installer refuses without touching any state.
 var ErrInvalidRequest = errors.New("invalid install request")

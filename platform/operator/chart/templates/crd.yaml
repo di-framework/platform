@@ -222,9 +222,9 @@ spec:
                       TenantHostImage is the platform's `tenantHostImage`. A change is applied by the next install
                       and restarts the tenant hosts. Empty keeps the image status.applied.tenantHostImage recorded;
                       a new instance records the operator's pinned exclusive host variant
-                      (ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive by digest, which needs spec.version
-                      6.0.20 or later), and an instance installed before this field existed keeps the platform's
-                      own default.
+                      (ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive by digest; the spec.version package must
+                      list it as an approved host build), and an instance installed before this field existed keeps
+                      the platform's own default.
                     maxLength: 512
                     pattern: ^[^\s@]+(@sha256:[0-9a-f]{64})?$
                     type: string

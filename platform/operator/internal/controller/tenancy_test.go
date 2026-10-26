@@ -49,7 +49,7 @@ func tenancyHarness(t *testing.T, withSecret bool) *harness {
 	h := newHarness(t, "")
 	inst := h.get()
 	inst.Spec.Platform = tenancySpec()
-	inst.Spec.Version = MinDefaultHostImageVersion
+	inst.Spec.Version = "6.0.20"
 	if err := h.c.Update(context.Background(), inst); err != nil {
 		t.Fatal(err)
 	}

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/di-framework/platform/operator/api/v1alpha1"
+	"github.com/di-framework/platform/operator/internal/installer"
 )
 
 // imageHarness is an instance at version with spec.platform.tenantHostImage set to image.
@@ -61,7 +63,7 @@ func TestChangedTenantHostImageReinstalls(t *testing.T) {
 // W1: a new instance records the operator default once and keeps it while the field is empty;
 // an explicit value then wins and is recorded, and clearing the field keeps the recorded one.
 func TestDefaultTenantHostImageIsRecorded(t *testing.T) {
-	h := imageHarness(t, MinDefaultHostImageVersion, "")
+	h := imageHarness(t, "6.0.20", "")
 	h.reconcile()
 	h.reconcile()
 	if h.lastImage() != DefaultTenantHostImage || h.get().Status.Applied.TenantHostImage != DefaultTenantHostImage {
@@ -90,33 +92,51 @@ func TestDefaultTenantHostImageIsRecorded(t *testing.T) {
 	}
 }
 
-// W1: the exclusive default with a platform that doesn't approve it is refused, visibly.
-func TestDefaultTenantHostImageNeedsAnApprovingVersion(t *testing.T) {
-	for _, version := range []string{"6.0.19", "5.9.30", "6.0.19-rc.1"} {
-		h := imageHarness(t, version, "")
-		h.reconcile()
-		if _, err := h.r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); !errors.Is(err, errTenantHostImage) {
-			t.Fatalf("%s: err %v", version, err)
-		}
-		if len(h.in.installs) != 0 {
-			t.Fatalf("%s: installed", version)
-		}
-		inst := h.get()
-		for _, typ := range []string{v1alpha1.ConditionInstalled, v1alpha1.ConditionConfigApplied} {
-			c := meta.FindStatusCondition(inst.Status.Conditions, typ)
-			if c == nil || c.Status != metav1.ConditionFalse || c.Reason != v1alpha1.ReasonTenantHostImageUnsupported ||
-				!strings.Contains(c.Message, "approved host build only from platform 6.0.20; spec.version is "+version) {
-				t.Fatalf("%s: %s %+v", version, typ, c)
-			}
+// W1: only the operator default is checked against the spec.version package's approved host
+// builds; an installer refusal stops the install visibly, on Installed and ConfigApplied.
+func TestDefaultTenantHostImageMustBeApproved(t *testing.T) {
+	h := imageHarness(t, "6.0.20", "")
+	h.reconcile()
+	h.reconcile()
+	if len(h.in.installs) != 1 || h.in.installs[0].ApprovedHostImage != DefaultTenantHostImage {
+		t.Fatalf("first install with the default: ApprovedHostImage %q", h.in.installs[0].ApprovedHostImage)
+	}
+	// The recorded and explicit images are not checked.
+	h.update(func(i *v1alpha1.PlatformInstance) { i.Spec.Platform.Tenants = []v1alpha1.Tenant{{Name: "acme"}} })
+	h.reconcile()
+	h.update(func(i *v1alpha1.PlatformInstance) { i.Spec.Platform.TenantHostImage = "localhost/wash:explicit" })
+	h.reconcile()
+	for _, req := range h.in.installs[1:] {
+		if req.ApprovedHostImage != "" {
+			t.Fatalf("checked a recorded or explicit image: %q", req.ApprovedHostImage)
 		}
 	}
-	for _, version := range []string{"6.0.20", "6.0.20-rc.1", "6.1.0", "7.0.0"} {
-		h := imageHarness(t, version, "")
-		h.reconcile()
-		h.reconcile()
-		if len(h.in.installs) != 1 || h.lastImage() != DefaultTenantHostImage {
-			t.Fatalf("%s: installs %d", version, len(h.in.installs))
+
+	h = imageHarness(t, "6.0.19", "")
+	refusal := fmt.Errorf("%w: @di-framework/platform@6.0.19 does not list sha256:abc", installer.ErrHostImageNotApproved)
+	h.in.err = refusal
+	h.reconcile()
+	if _, err := h.r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); !errors.Is(err, installer.ErrHostImageNotApproved) {
+		t.Fatalf("err %v", err)
+	}
+	inst := h.get()
+	if inst.Status.Applied != nil || inst.Status.Phase != v1alpha1.PhaseFailed {
+		t.Fatalf("refused install recorded %+v, phase %s", inst.Status.Applied, inst.Status.Phase)
+	}
+	for _, typ := range []string{v1alpha1.ConditionInstalled, v1alpha1.ConditionConfigApplied} {
+		c := meta.FindStatusCondition(inst.Status.Conditions, typ)
+		if c == nil || c.Status != metav1.ConditionFalse || c.Reason != v1alpha1.ReasonTenantHostImageUnsupported ||
+			!strings.Contains(c.Message, "@di-framework/platform@6.0.19 does not list sha256:abc") ||
+			!strings.Contains(c.Message, "set spec.platform.tenantHostImage") {
+			t.Fatalf("%s %+v", typ, c)
 		}
+	}
+	// Another install failure keeps its own reason.
+	h.in.err = errors.New("boom")
+	h.now = h.now.Add(time.Hour)
+	h.reconcile()
+	if conditionReason(h.get(), v1alpha1.ConditionInstalled) != "InstallFailed" {
+		t.Fatalf("reason %q", conditionReason(h.get(), v1alpha1.ConditionInstalled))
 	}
 }
 
@@ -149,13 +169,5 @@ func TestPreexistingInstanceKeepsThePlatformDefault(t *testing.T) {
 	h.reconcile()
 	if _, set := h.in.installs[1].Settings["tenantHostImage"]; set {
 		t.Fatal("recorded platform default replaced by the operator default")
-	}
-}
-
-func TestVersionBefore(t *testing.T) {
-	for v, want := range map[string]bool{"6.0.19": true, "6.0.20": false, "6.0.20-rc.1": false, "6.0.3": true, "6.1.0": false, "5.99.99": true, "10.0.0": false} {
-		if got := versionBefore(v, "6.0.20"); got != want {
-			t.Errorf("versionBefore(%s) = %v", v, got)
-		}
 	}
 }
