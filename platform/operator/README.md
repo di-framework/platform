@@ -194,10 +194,16 @@ What it doesn't:
   up, so the default deny doesn't close it, and pods of other instances can reach the gateway pods too, as anyone
   can through the NodePort. The NodePort path itself needs no host-namespace rule.
 - **Other in-cluster clients of the vCluster API.** Only the operator's namespace is admitted to port 8443.
-  Anything else that uses an instance kubeconfig from inside the cluster must run in that namespace, or use
-  `kubectl port-forward`, which goes through the kubelet.
-- **Traffic from the node itself** (kubelet probes, and on kube-router any source the node masquerades) is
-  governed by the policy engine, not by these policies: kube-router admits traffic from the local node.
+  Anything else in the cluster that uses an instance kubeconfig must run in that namespace or use
+  `kubectl port-forward`, which goes through the kubelet and the container runtime into the pod and so isn't
+  subject to NetworkPolicy (the proxy certificate names `127.0.0.1` and `localhost` for it). That covers the
+  instance's kubeconfig Secret and the tenant kubeconfigs the platform exports, which carry the same
+  in-cluster `https://vcluster.<host namespace>.svc:443` server. Host-level scrapers in other namespaces
+  (Prometheus or ServiceMonitors for NATS, CoreDNS `:9153` and the like) are blocked too.
+- **Traffic from the node itself.** Traffic that originates on the node (kubelet probes, a client on the
+  node) is admitted by kube-router's local-node rule. NodePort traffic from outside keeps its source address
+  (the NAT happens after the policy check) and is admitted only by a rule with no peers, such as the
+  gateway's.
 
 ## Running it
 
