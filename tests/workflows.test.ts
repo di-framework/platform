@@ -1229,8 +1229,9 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
       'publish',
     ]);
     expect(release.jobs.publish?.needs).toBe('build');
-    // The GitHub Release is announced only once the npm packages and the chart are both out.
-    expect(release.jobs['github-release']?.needs).toEqual(['publish', 'chart']);
+    // The GitHub Release is announced only once the npm packages and the chart are both out; it
+    // needs build for the Headlamp plugin's sha256 (#435).
+    expect(release.jobs['github-release']?.needs).toEqual(['build', 'publish', 'chart']);
     expect(release.jobs['github-release']?.if).toBe("github.ref_type == 'tag'");
     expect(release.jobs.chart?.needs).toBe('build');
     expect(release.jobs.chart?.if).toBe("github.ref_type == 'tag'");
@@ -1322,21 +1323,53 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     expect(runPin(`sha256:${'0'.repeat(63)}`).output).toBe('pinned=false\n');
   });
 
-  test('github-release uploads the Headlamp plugin only when it matches its Artifact Hub entry (#435)', () => {
+  test('build packs the Headlamp plugin at a tag and verifies its Artifact Hub entry (#435)', () => {
+    const build = steps('build');
+    const plugin = build.find((s) => s.id === 'plugin');
+    const node = build.find((s) => s.name === 'Setup Node for the Headlamp plugin');
+    const upload = build.find((s) => s.name === 'Upload the Headlamp plugin');
+    for (const step of [plugin, node, upload]) expect(step?.if).toBe("github.ref_type == 'tag'");
+    const ci = parse('.github/workflows/ci.yml').jobs['headlamp-plugin']?.steps ?? [];
+    const ciNode = ci.find((s) => s.uses?.startsWith('actions/setup-node@'));
+    expect(node?.uses).toBe(ciNode?.uses);
+    expect(node?.with?.['node-version']).toBe(ciNode?.with?.['node-version']);
+    expect(upload?.uses).toMatch(/^actions\/upload-artifact@[0-9a-f]{40}$/);
+    expect(upload?.with?.name).toBe('headlamp-plugin');
+    const run = plugin?.run ?? '';
+    expect(run).toContain('set -euo pipefail');
+    const order = [
+      'artifacthub/$VERSION/artifacthub-pkg.yml',
+      'bun install --cwd platform/operator/headlamp-plugin --frozen-lockfile --ignore-scripts',
+      'bun run --cwd platform/operator/headlamp-plugin package',
+      'bun scripts/artifacthub-plugin.ts verify "$VERSION" --required',
+      'echo "sha256=',
+    ].map((s) => run.indexOf(s));
+    expect(order.every((i) => i > -1)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(release.jobs.build?.outputs?.plugin_sha256).toBe('${{ steps.plugin.outputs.sha256 }}');
+    // The plugin is packed after the npm packages are uploaded, so it cannot change them.
+    expect(build.indexOf(node as never)).toBeGreaterThan(build.findIndex((s) => s.id === 'upload'));
+  });
+
+  test('github-release uploads the build job plugin byte for byte, each asset once (#435)', () => {
     const job = steps('github-release');
     for (const ref of uses('github-release').filter(Boolean)) expect(ref).toMatch(/@[0-9a-f]{40}$/);
-    const ci = parse('.github/workflows/ci.yml').jobs['headlamp-plugin']?.steps ?? [];
-    const node = (s: { uses?: string }) => s.uses?.startsWith('actions/setup-node@') ?? false;
-    expect(job.find(node)?.uses).toBe(ci.find(node)?.uses);
-    expect(job.find(node)?.with?.['node-version']).toBe(ci.find(node)?.with?.['node-version']);
     const all = runs('github-release');
     for (const s of job.filter((s) => s.run)) expect(s.run).toContain('set -euo pipefail');
+    // No rebuild: no plugin install, no pack, no Node or Bun setup.
+    expect(all).not.toMatch(/bun install|bun run|bun scripts/);
+    expect(uses('github-release').some((u) => /setup-(node|bun)/.test(u))).toBe(false);
+    const download = job.find((s) => s.uses?.startsWith('actions/download-artifact@'));
+    expect(download?.with?.name).toBe('headlamp-plugin');
+    const upload = job.find((s) => s.name === 'Upload the Headlamp plugin to the GitHub Release');
+    expect(upload?.env?.EXPECTED_SHA256).toBe('${{ needs.build.outputs.plugin_sha256 }}');
     const order = [
       'gh release create "$TAG"',
-      'bun install --frozen-lockfile && bun run package',
-      'bun scripts/artifacthub-plugin.ts verify "$VERSION" --required',
-      'gh release view "$TAG" --json assets --jq \'.assets[].name\' | grep -Fxq "$NAME"',
-      'gh release upload "$TAG" "$TARBALL" "$TARBALL.sha256"',
+      'sha256sum "$TARBALL"',
+      '"$actual" != "$EXPECTED_SHA256"',
+      'for FILE in "$TARBALL" "$TARBALL.sha256"; do',
+      'grep -Fxq "$NAME" <<< "$ASSETS"',
+      'gh release upload "$TAG" "$FILE"',
     ].map((s) => all.indexOf(s));
     expect(order.every((i) => i > -1)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
@@ -1344,13 +1377,103 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     expect(all).not.toContain('--clobber');
   });
 
-  test('the Headlamp plugin CI job checks a released version against its Artifact Hub entry (#435)', () => {
+  test('github-release uploads only the plugin assets the release lacks (#435)', () => {
+    const run =
+      steps('github-release').find(
+        (s) => s.name === 'Upload the Headlamp plugin to the GitHub Release',
+      )?.run ?? '';
+    const temp = mkdtempSync(join(tmpdir(), 'plugin-upload-'));
+    mkdirSync(join(temp, 'headlamp-plugin'));
+    const tarball = join(temp, 'headlamp-plugin', 'di-framework-platform-6.0.18.tar.gz');
+    writeFileSync(tarball, 'bytes');
+    writeFileSync(`${tarball}.sha256`, 'sum');
+    const sha = new Bun.CryptoHasher('sha256').update('bytes').digest('hex');
+    let n = 0;
+    const exec = (assets: string[], expected = sha) => {
+      n += 1;
+      const bin = join(temp, `bin-${n}`);
+      const log = join(temp, `log-${n}`);
+      const list = assets.map((a) => `'${a}'`).join(' ');
+      stubCommand(
+        bin,
+        'gh',
+        `echo "$*" >> '${log}'\nif [ "$1 $2" = "release view" ]; then printf '%s\\n' ${list}; fi`,
+      );
+      const result = Bun.spawnSync(['bash', '-c', run], {
+        env: {
+          ...spawnEnv,
+          PATH: `${bin}:${spawnEnv.PATH}`,
+          RUNNER_TEMP: temp,
+          GITHUB_REF_NAME: 'v6.0.18',
+          EXPECTED_SHA256: expected,
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const calls = existsSync(log) ? readFileSync(log, 'utf8') : '';
+      return { code: result.exitCode, calls };
+    };
+    const none = exec([]);
+    expect(none.code).toBe(0);
+    expect(none.calls).toContain(`release upload v6.0.18 ${tarball}\n`);
+    expect(none.calls).toContain(`release upload v6.0.18 ${tarball}.sha256\n`);
+    const onlyTarball = exec(['di-framework-platform-6.0.18.tar.gz']);
+    expect(onlyTarball.code).toBe(0);
+    expect(onlyTarball.calls).not.toContain(`release upload v6.0.18 ${tarball}\n`);
+    expect(onlyTarball.calls).toContain(`release upload v6.0.18 ${tarball}.sha256\n`);
+    const both = exec([
+      'di-framework-platform-6.0.18.tar.gz',
+      'di-framework-platform-6.0.18.tar.gz.sha256',
+    ]);
+    expect(both.code).toBe(0);
+    expect(both.calls).not.toContain('release upload');
+    const mismatch = exec([], '0'.repeat(64));
+    expect(mismatch.code).toBe(1);
+    expect(mismatch.calls).toBe('');
+  });
+
+  test('the Headlamp plugin CI job verifies the entry only on the PR that adds it (#435)', () => {
     const ci = parse('.github/workflows/ci.yml').jobs['headlamp-plugin']?.steps ?? [];
     const names = ci.map((s) => s.name);
     const check = ci.find((s) => s.name === 'Check the Artifact Hub entry');
     expect(names.indexOf('Check the Artifact Hub entry')).toBe(names.indexOf('Package') + 1);
-    expect(check?.run).toContain('bun scripts/artifacthub-plugin.ts verify "$(node -p');
-    expect(check?.run).not.toContain('--required');
+    const entry = 'platform/operator/headlamp-plugin/artifacthub/1.2.3/artifacthub-pkg.yml';
+    const box = sandboxClone('plugin-entry-');
+    const pkg = join(box.work, 'platform/operator/headlamp-plugin/package.json');
+    mkdirSync(dirname(pkg), { recursive: true });
+    writeFileSync(pkg, '{"version":"1.2.3"}\n');
+    git(box.work, 'add', '-A');
+    git(box.work, 'commit', '-q', '-m', 'base');
+    let n = 0;
+    const run = (event: string) => {
+      n += 1;
+      const bin = join(box.base, `bin-${n}`);
+      const log = join(box.base, `log-${n}`);
+      stubCommand(bin, 'bun', `echo "$*" >> '${log}'`);
+      const result = Bun.spawnSync(['bash', '-c', check?.run ?? 'exit 1'], {
+        cwd: box.work,
+        env: { ...spawnEnv, PATH: `${bin}:${spawnEnv.PATH}`, GITHUB_EVENT_NAME: event },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      expect(result.exitCode).toBe(0);
+      return existsSync(log) ? readFileSync(log, 'utf8') : '';
+    };
+    // A plugin PR that does not add the entry.
+    writeFileSync(pkg, '{"version":"1.2.3","x":1}\n');
+    git(box.work, 'commit', '-q', '-am', 'plugin change');
+    expect(run('pull_request')).toBe('');
+    // The release PR adds the entry: verified, required.
+    mkdirSync(join(box.work, dirname(entry)), { recursive: true });
+    writeFileSync(join(box.work, entry), 'version: 1.2.3\n');
+    git(box.work, 'add', '-A');
+    git(box.work, 'commit', '-q', '-m', 'release');
+    expect(run('pull_request')).toBe('scripts/artifacthub-plugin.ts verify 1.2.3 --required\n');
+    expect(run('push')).toBe('');
+    // A later PR that edits the plugin under the released version does not re-verify.
+    writeFileSync(pkg, '{"version":"1.2.3","x":2}\n');
+    git(box.work, 'commit', '-q', '-am', 'later change');
+    expect(run('pull_request')).toBe('');
   });
 
   test('build smoke-tests, records the wasm sha256, packs without rebuilding pglite, uploads', () => {
@@ -1369,7 +1492,8 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     ).toBeGreaterThan(pack);
     expect(build).toContain('--verify-packed "$dir"');
     expect(build).not.toMatch(/npm publish|--publish-packed/);
-    expect(uses('build').filter((u) => u.startsWith('actions/upload-artifact@'))).toHaveLength(1);
+    const uploads = steps('build').filter((s) => s.uses?.startsWith('actions/upload-artifact@'));
+    expect(uploads.map((s) => s.with?.name)).toEqual(['npm-packages', 'headlamp-plugin']);
     const outputs = release.jobs.build?.outputs ?? {};
     expect(outputs.pglite_wasm_sha256).toBe('${{ steps.smoke.outputs.wasm_sha256 }}');
     expect(outputs.manifest_sha256).toBe('${{ steps.pack.outputs.manifest_sha256 }}');

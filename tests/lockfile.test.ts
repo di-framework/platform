@@ -279,7 +279,8 @@ describe('the workflows keep bun.lock in step with the release bump', () => {
     expect(commit).toBeGreaterThan(add);
     // The root workspace is never installed. The only install is the Headlamp plugin's own frozen
     // lockfile, which the release PR packs for its Artifact Hub entry (#435).
-    const plugin = 'bun install --cwd platform/operator/headlamp-plugin --frozen-lockfile\n';
+    const plugin =
+      'bun install --cwd platform/operator/headlamp-plugin --frozen-lockfile --ignore-scripts\n';
     expect(pr).toContain(plugin);
     expect(
       steps
@@ -294,7 +295,7 @@ describe('the workflows keep bun.lock in step with the release bump', () => {
     const order = [
       'bun scripts/check-lockfile-versions.ts\n',
       'bun scripts/artifacthub-plugin.ts set-version "$NEXT"',
-      'bun install --cwd platform/operator/headlamp-plugin --frozen-lockfile',
+      'bun install --cwd platform/operator/headlamp-plugin --frozen-lockfile --ignore-scripts',
       'bun run --cwd platform/operator/headlamp-plugin package',
       'bun scripts/artifacthub-plugin.ts write "$NEXT"',
       'git add platform/operator/chart/values.yaml platform/operator/headlamp-plugin/artifacthub',
@@ -302,6 +303,19 @@ describe('the workflows keep bun.lock in step with the release bump', () => {
     ].map((s) => pr.indexOf(s));
     expect(order.every((i) => i > -1)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // The plugin is built and packed without the token; only the push/PR step holds it.
+    const bumpStep = steps.find((s) => (s.run ?? '').includes('git commit')) as Step & {
+      env?: Record<string, string>;
+    };
+    const prStep = steps.find((s) => (s.run ?? '').includes('gh pr create')) as Step & {
+      env?: Record<string, string>;
+    };
+    expect(bumpStep).not.toBe(prStep);
+    expect(Object.keys(bumpStep.env ?? {})).not.toContain('GH_TOKEN');
+    expect(JSON.stringify(bumpStep)).not.toContain('github.token');
+    expect(prStep.env?.GH_TOKEN).toContain('github.token');
+    expect(prStep.run).toContain('git push');
+    expect(prStep.run).not.toContain('bun ');
     // The plugin's package.json is added by the `*package.json` loop.
     expect(pr).toContain("git ls-files -m -- '*package.json'");
     // Packs with the same pinned Node as the plugin's CI job.

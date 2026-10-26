@@ -13,5 +13,6 @@ Do not write version entries by hand. The release PR (Auto Tag) packs the plugin
 `bun scripts/artifacthub-plugin.ts write <version>`, which records the tarball's sha256 and the
 release asset URL
 `https://github.com/di-framework/platform/releases/download/v<version>/di-framework-platform-<version>.tar.gz`.
-The release workflow packs the plugin again at the tag, checks it against that checksum and only
-then uploads the tarball. A published entry is never rewritten.
+The release workflow's build job packs the plugin again at the tag and checks it against that
+checksum; the `github-release` job then uploads those exact bytes. A published entry is never
+rewritten.

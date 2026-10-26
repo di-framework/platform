@@ -272,12 +272,12 @@ jobs:
           echo "branch=release/v$NEXT" >> "$GITHUB_OUTPUT"
           echo "Bumping $CURRENT -> $NEXT ($BUMP)"
 
-      - name: Open release PR
-        id: pr
+      # Bumps, packs the Headlamp plugin and commits without GH_TOKEN in the environment: the
+      # plugin's build tooling never sees the token (#435). Only the next step pushes and opens
+      # the PR with it.
+      - name: Bump versions and commit the release
         env:
-          GH_TOKEN: ${{ github.token }}
           NEXT: ${{ steps.version.outputs.next }}
-          CURRENT: ${{ steps.version.outputs.current }}
           BRANCH: ${{ steps.version.outputs.branch }}
         run: |
           set -euo pipefail
@@ -308,9 +308,9 @@ jobs:
           # The Headlamp plugin ships with the platform's version (#435): set it in the plugin's
           # package.json and the chart's plugin manager config, pack the plugin with its own
           # lockfile, and write its Artifact Hub entry from the tarball's sha256. The release
-          # job packs it again at the tag and uploads it only if the checksum matches.
+          # build job packs it again at the tag; the release uploads it only if the checksum matches.
           bun scripts/artifacthub-plugin.ts set-version "$NEXT"
-          bun install --cwd platform/operator/headlamp-plugin --frozen-lockfile
+          bun install --cwd platform/operator/headlamp-plugin --frozen-lockfile --ignore-scripts
           bun run --cwd platform/operator/headlamp-plugin package
           bun scripts/artifacthub-plugin.ts write "$NEXT"
           git add platform/operator/chart/values.yaml platform/operator/headlamp-plugin/artifacthub
@@ -326,6 +326,16 @@ jobs:
             exit 1
           fi
           git commit -m "chore(release): v$NEXT"
+
+      - name: Open release PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT: ${{ steps.version.outputs.next }}
+          CURRENT: ${{ steps.version.outputs.current }}
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: |
+          set -euo pipefail
 
           # Refresh remote-tracking ref so --force-with-lease can replace a stale branch
           git fetch origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" 2>/dev/null || true

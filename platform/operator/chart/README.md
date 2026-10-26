@@ -140,6 +140,8 @@ by default (`headlamp.pluginsManager.enabled`) and takes effect once `headlamp.e
 `configContent` names the plugin's Artifact Hub package
 (<https://artifacthub.io/packages/headlamp/di-framework-platform/di-framework-platform>) at the plugin
 version, which is the platform release version: each release PR rewrites that `version:` line (#435).
-pluginctl downloads the tarball attached to the GitHub release and checks its sha256, so the sidecar
+pluginctl downloads the tarball attached to the GitHub release and checks its sha256. Until the
+first release that ships the plugin (v6.0.18), the chart on `main` names plugin 0.1.0, which has no
+Artifact Hub entry, so the sidecar cannot install it from a source checkout. The sidecar
 needs egress to npm, artifacthub.io and github.com. Its `pluginctl` version and its `node` base image
 (by digest) are pinned rather than upstream's `latest` and `lts-alpine`.

@@ -117,9 +117,12 @@ How a release delivers it:
    with `version-compat: ">=0.46.0"` and `distro-compat: in-cluster,web,app`. An existing entry is
    never rewritten with a different checksum. Artifact Hub reads `artifacthub/` from `main`
    (repository `di-framework-platform`, `artifacthub/artifacthub-repo.yml`).
-3. **Release asset.** The release workflow's `github-release` job packs the plugin again at the tag,
-   fails if its sha256 differs from the entry (or the entry is missing), and only then uploads the
-   tarball and its `.sha256` to the GitHub release. A tarball already on the release is left as is.
+3. **Release asset.** On the tag, the release workflow's `build` job packs the plugin again (same
+   pinned Node, `bun install --frozen-lockfile --ignore-scripts`) and fails if its sha256 differs
+   from the entry or the entry is missing. It hands the tarball and its `.sha256` on as a workflow
+   artifact with the sha256 as a job output. `github-release` downloads them, checks the sha256
+   against that output and uploads each file to the GitHub release only if the release lacks it;
+   it rebuilds nothing, and an uploaded asset is never replaced.
 4. **Chart.** `headlamp.pluginsManager` is enabled with:
 
    ```yaml
@@ -132,5 +135,17 @@ How a release delivers it:
            version: <X>
    ```
 
-The plugin's CI job also checks that a version with an entry still packs to the recorded sha256
-(`bun scripts/artifacthub-plugin.ts verify <version>` from the repository root).
+On the pull request that adds an entry (the release PR), the plugin's CI job also checks that the
+plugin packs to the recorded sha256 (`bun scripts/artifacthub-plugin.ts verify <version> --required`
+from the repository root). Later plugin changes before the next release pack to other bytes under
+the same version, so other PRs and pushes do not re-check a released entry.
+
+Two windows to expect:
+
+- **Between the release PR merging and the release uploading the asset**, Artifact Hub may already
+  list the new version while its `archive-url` still returns 404. pluginctl fails to install it
+  until the `github-release` job has run (the Release workflow follows the tag, which Auto Tag
+  makes within about 30 minutes of the merge).
+- **Before the first release that ships the plugin (v6.0.18)**, the chart on `main` names plugin
+  version `0.1.0`, which has no Artifact Hub entry. Enabling Headlamp from a source checkout of
+  the chart installs Headlamp, but the plugin manager cannot install the plugin until that release.
