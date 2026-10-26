@@ -18,6 +18,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/di-framework/platform/operator/api/v1alpha1"
 	"github.com/di-framework/platform/operator/internal/installer"
@@ -127,6 +128,47 @@ func installedHarness(t *testing.T) (*harness, ctrl.Result) {
 	h.readyTarget()
 	h.reconcile()
 	return h, h.reconcile()
+}
+
+// Without the kubeconfig Secret, a target that isn't ready clears the reference.
+func TestKubeconfigRefIsClearedWithoutTheSecret(t *testing.T) {
+	h, _ := installedHarness(t)
+	if err := h.c.Delete(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name + "-kubeconfig"}}); err != nil {
+		t.Fatal(err)
+	}
+	h.tg.state = targets.State{Reason: "KubeconfigPending", Message: "no Secret"}
+	h.reconcile()
+	if inst := h.get(); inst.Status.KubeconfigSecretRef != nil {
+		t.Fatalf("reference kept without the Secret: %+v", inst.Status)
+	}
+}
+
+// The finalizer is added with a merge patch carrying only metadata, so the user's spec is not
+// rewritten (platform: {gateway: {}}) and its generation stays 1.
+func TestFinalizerPatchLeavesTheSpecAlone(t *testing.T) {
+	h := newHarness(t, "")
+	var patches []string
+	h.r.Client = interceptor.NewClient(h.c.(client.WithWatch), interceptor.Funcs{
+		Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+			t.Fatal("the instance was updated, not patched")
+			return nil
+		},
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			data, err := patch.Data(obj)
+			if err != nil {
+				return err
+			}
+			patches = append(patches, string(data))
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	h.reconcile()
+	if len(patches) != 1 || strings.Contains(patches[0], "spec") || !strings.Contains(patches[0], Finalizer) || !strings.Contains(patches[0], "resourceVersion") {
+		t.Fatalf("finalizer patches %q", patches)
+	}
+	if inst := h.get(); !containsFinalizer(inst) || inst.Generation != 1 {
+		t.Fatalf("finalizer %v generation %d", inst.Finalizers, inst.Generation)
+	}
 }
 
 func TestFinalizerComesFirst(t *testing.T) {
@@ -279,7 +321,8 @@ func TestReadyComesBackAfterATargetBlip(t *testing.T) {
 	h, _ := installedHarness(t)
 	h.tg.state = targets.State{Reason: "ControlPlanePending", Message: "vcluster control plane not ready"}
 	h.reconcile()
-	if inst := h.get(); inst.Status.Phase != v1alpha1.PhaseProvisioning || inst.Status.KubeconfigSecretRef != nil {
+	// The kubeconfig Secret still exists, so its reference stays (#453 review S3).
+	if inst := h.get(); inst.Status.Phase != v1alpha1.PhaseProvisioning || inst.Status.KubeconfigSecretRef == nil {
 		t.Fatalf("blip status %+v", inst.Status)
 	}
 	h.readyTarget()

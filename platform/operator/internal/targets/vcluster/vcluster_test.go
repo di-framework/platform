@@ -18,24 +18,33 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/di-framework/platform/operator/api/v1alpha1"
+	"github.com/di-framework/platform/operator/internal/targets"
 )
 
 type fakeHelm struct {
 	installed   map[string]map[string]any // namespace -> values
 	status      map[string]string         // namespace -> release status; unset is deployed
 	uninstalled []string
-	upgraded    []string
-	upgradeErr  error
+	revision    map[string]int // namespace -> latest revision; unset is 1
+	repaired    []string
+	repairErr   error
+	onRepair    func(ns string)
+	rolledBack  []string
+	rollbackErr error
 }
 
 func (f *fakeHelm) Get(_ context.Context, ns, _ string) (*Release, error) {
 	if _, ok := f.installed[ns]; !ok {
 		return nil, nil
 	}
-	if st, ok := f.status[ns]; ok {
-		return &Release{Status: st, Description: "boom"}, nil
+	rev := 1
+	if r, ok := f.revision[ns]; ok {
+		rev = r
 	}
-	return &Release{Status: "deployed"}, nil
+	if st, ok := f.status[ns]; ok {
+		return &Release{Status: st, Description: "boom", Revision: rev}, nil
+	}
+	return &Release{Status: "deployed", Revision: rev}, nil
 }
 func (f *fakeHelm) Install(_ context.Context, ns, name string, chart []byte, values map[string]any) error {
 	if name != ReleaseName || len(chart) == 0 {
@@ -44,12 +53,22 @@ func (f *fakeHelm) Install(_ context.Context, ns, name string, chart []byte, val
 	f.installed[ns] = values
 	return nil
 }
-func (f *fakeHelm) Upgrade(_ context.Context, ns, name string, chart []byte) error {
-	if name != ReleaseName || len(chart) == 0 {
-		panic("unexpected upgrade")
+func (f *fakeHelm) Repair(_ context.Context, ns, name string) error {
+	if name != ReleaseName {
+		panic("unexpected repair")
 	}
-	f.upgraded = append(f.upgraded, ns)
-	return f.upgradeErr
+	f.repaired = append(f.repaired, ns)
+	if f.repairErr == nil && f.onRepair != nil {
+		f.onRepair(ns)
+	}
+	return f.repairErr
+}
+func (f *fakeHelm) Rollback(_ context.Context, ns, name string) (int, error) {
+	if name != ReleaseName {
+		panic("unexpected rollback")
+	}
+	f.rolledBack = append(f.rolledBack, ns)
+	return f.revision[ns] - 1, f.rollbackErr
 }
 func (f *fakeHelm) Uninstall(_ context.Context, ns, _ string) error {
 	f.uninstalled = append(f.uninstalled, ns)
@@ -158,8 +177,8 @@ func TestEnsure(t *testing.T) {
 	if st.Server != want || cfg.Clusters["my-vcluster"].Server != want || dialed != "vcluster."+ns+".svc:443" {
 		t.Fatalf("server %q / %q (dialed %q), want %q", st.Server, cfg.Clusters["my-vcluster"].Server, dialed, want)
 	}
-	if len(helm.installed) != 1 || len(helm.upgraded) != 0 {
-		t.Fatalf("installed more than once or upgraded: %v %v", helm.installed, helm.upgraded)
+	if len(helm.installed) != 1 || len(helm.repaired) != 0 {
+		t.Fatalf("installed more than once or upgraded: %v %v", helm.installed, helm.repaired)
 	}
 	var namespace corev1.Namespace
 	if err := c.Get(ctx, client.ObjectKey{Name: ns}, &namespace); err != nil || namespace.Annotations[OwnerAnnotation] != "team-a/one" {
@@ -188,8 +207,8 @@ func TestEnsureReappliesTheReleaseWhenAnObjectIsMissing(t *testing.T) {
 	tg, helm, inst, sts := readyInstance(t)
 	ns := HostNamespace(inst)
 	ctx := context.Background()
-	if st, err := tg.Ensure(ctx, inst); err != nil || !st.Ready || len(helm.upgraded) != 0 {
-		t.Fatalf("intact release: %+v %v (upgraded %v)", st, err, helm.upgraded)
+	if st, err := tg.Ensure(ctx, inst); err != nil || !st.Ready || len(helm.repaired) != 0 {
+		t.Fatalf("intact release: %+v %v (upgraded %v)", st, err, helm.repaired)
 	}
 	var after appsv1.StatefulSet
 	if err := tg.Client.Get(ctx, client.ObjectKeyFromObject(sts), &after); err != nil || after.ResourceVersion != sts.ResourceVersion {
@@ -205,12 +224,12 @@ func TestEnsureReappliesTheReleaseWhenAnObjectIsMissing(t *testing.T) {
 		}
 	}
 	st, err := tg.Ensure(ctx, inst)
-	if err != nil || st.Ready || st.Reason != "Repairing" || len(helm.upgraded) != 1 || helm.upgraded[0] != ns ||
+	if err != nil || st.Ready || st.Reason != "Repairing" || len(helm.repaired) != 1 || helm.repaired[0] != ns ||
 		!strings.Contains(st.Message, "statefulset/vcluster, service/vcluster") {
-		t.Fatalf("missing objects: %+v %v (upgraded %v)", st, err, helm.upgraded)
+		t.Fatalf("missing objects: %+v %v (upgraded %v)", st, err, helm.repaired)
 	}
 
-	helm.upgradeErr = errors.New("boom")
+	helm.repairErr = errors.New("boom")
 	if _, err := tg.Ensure(ctx, inst); err == nil || !strings.Contains(err.Error(), "recreate statefulset/vcluster, service/vcluster: boom") {
 		t.Fatalf("failed upgrade: %v", err)
 	}
@@ -232,14 +251,102 @@ func TestEnsureReportsAReadErrorOnAReleaseObject(t *testing.T) {
 }
 
 // With the Secret in place but the API not answering, the reason says so and names the endpoint
-// instead of blaming the Secret (#453).
+// instead of blaming the Secret (#453), but only after UnreachableAfter consecutive failed checks;
+// a check that answers again resets the count.
 func TestEnsureReportsAnUnreachableAPI(t *testing.T) {
 	tg, _, inst, _ := readyInstance(t)
-	tg.Dial = func(context.Context, string) error { return errors.New("connection refused") }
-	st, err := tg.Ensure(context.Background(), inst)
-	want := "vcluster API https://vcluster." + HostNamespace(inst) + ".svc:443 (service " + HostNamespace(inst) + "/vcluster) is unreachable: connection refused"
-	if err != nil || st.Ready || st.Reason != "TargetUnreachable" || st.Message != want {
-		t.Fatalf("unreachable API: %+v %v", st, err)
+	down := true
+	tg.Dial = func(context.Context, string) error {
+		if down {
+			return errors.New("connection refused")
+		}
+		return nil
+	}
+	ctx := context.Background()
+	ensure := func() targets.State {
+		t.Helper()
+		st, err := tg.Ensure(ctx, inst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+	for i := 1; i < UnreachableAfter; i++ {
+		if st := ensure(); !st.Ready {
+			t.Fatalf("failed check %d already reports %+v", i, st)
+		}
+	}
+	st := ensure()
+	want := "vcluster API https://vcluster." + HostNamespace(inst) + ".svc:443 (service " + HostNamespace(inst) + "/vcluster) is unreachable (3 consecutive checks): connection refused"
+	if st.Ready || st.Reason != "TargetUnreachable" || st.Message != want {
+		t.Fatalf("unreachable API: %+v", st)
+	}
+	down = false
+	if st := ensure(); !st.Ready {
+		t.Fatalf("answering again: %+v", st)
+	}
+	down = true
+	if st := ensure(); !st.Ready {
+		t.Fatalf("one failure after a success: %+v", st)
+	}
+}
+
+// A repair that failed or was interrupted (revision > 1) is rolled back, never uninstalled; an
+// install that failed or was interrupted is still removed and installed again.
+func TestEnsureRollsBackAFailedRepair(t *testing.T) {
+	for _, status := range []string{"failed", "pending-upgrade"} {
+		tg, helm, inst, _ := readyInstance(t)
+		ns := HostNamespace(inst)
+		helm.status = map[string]string{ns: status}
+		helm.revision = map[string]int{ns: 2}
+		st, err := tg.Ensure(context.Background(), inst)
+		want := "vcluster release revision 2 was " + status + " (boom); rolled back to revision 1"
+		if err != nil || st.Ready || st.Reason != "RolledBack" || st.Message != want || len(helm.uninstalled) != 0 || len(helm.rolledBack) != 1 {
+			t.Fatalf("%s repair: %+v %v (uninstalled %v, rolled back %v)", status, st, err, helm.uninstalled, helm.rolledBack)
+		}
+		helm.rollbackErr = errors.New("no deployed revision")
+		if _, err := tg.Ensure(context.Background(), inst); err == nil || !strings.Contains(err.Error(), "roll back "+status+" vcluster release revision 2: no deployed revision") || len(helm.uninstalled) != 0 {
+			t.Fatalf("%s repair, failed rollback: %v (uninstalled %v)", status, err, helm.uninstalled)
+		}
+	}
+
+	tg, helm, inst, _ := readyInstance(t)
+	ns := HostNamespace(inst)
+	helm.status = map[string]string{ns: "pending-install"}
+	helm.revision = map[string]int{ns: 2}
+	if _, err := tg.Ensure(context.Background(), inst); !errors.Is(err, ErrReinstalling) || len(helm.uninstalled) != 1 || len(helm.rolledBack) != 0 {
+		t.Fatalf("pending-install: %v (uninstalled %v, rolled back %v)", err, helm.uninstalled, helm.rolledBack)
+	}
+}
+
+// The Layer 4 4.10 case: only service/vcluster (or the headless Service) is deleted. Repair
+// re-applies the release once, names only that object, the StatefulSet is untouched, and the
+// next round is ready without another repair.
+func TestEnsureRecreatesADeletedService(t *testing.T) {
+	for _, name := range []string{ReleaseName, ReleaseName + "-headless"} {
+		tg, helm, inst, sts := readyInstance(t)
+		ns := HostNamespace(inst)
+		ctx := context.Background()
+		helm.onRepair = func(ns string) {
+			if err := tg.Client.Create(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := tg.Client.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}}); err != nil {
+			t.Fatal(err)
+		}
+		st, err := tg.Ensure(ctx, inst)
+		want := "re-applied the vcluster release in namespace " + ns + " to recreate service/" + name
+		if err != nil || st.Reason != "Repairing" || st.Message != want || len(helm.repaired) != 1 {
+			t.Fatalf("deleted %s: %+v %v (repaired %v)", name, st, err, helm.repaired)
+		}
+		if st, err = tg.Ensure(ctx, inst); err != nil || !st.Ready || len(helm.repaired) != 1 {
+			t.Fatalf("after repairing %s: %+v %v (repaired %v)", name, st, err, helm.repaired)
+		}
+		var after appsv1.StatefulSet
+		if err := tg.Client.Get(ctx, client.ObjectKeyFromObject(sts), &after); err != nil || after.ResourceVersion != sts.ResourceVersion {
+			t.Fatalf("StatefulSet touched repairing %s: %s -> %s %v", name, sts.ResourceVersion, after.ResourceVersion, err)
+		}
 	}
 }
 

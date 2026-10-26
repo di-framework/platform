@@ -116,9 +116,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				root, r.StorageRootBase), nil)
 	}
 	if !obs.HasFinalizer {
-		// The update is a watch event, so the next step runs without a requeue.
-		controllerutil.AddFinalizer(&inst, Finalizer)
-		return ctrl.Result{}, r.Update(ctx, &inst)
+		// The patch is a watch event, so the next step runs without a requeue. A merge patch
+		// carries only the finalizer: an Update would send the whole object and write the
+		// zero-valued spec fields (platform: {gateway: {}}) the user never set.
+		return ctrl.Result{}, r.patchFinalizers(ctx, &inst, controllerutil.AddFinalizer)
 	}
 
 	st, err := r.Target.Ensure(ctx, &inst)
@@ -136,9 +137,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	log.FromContext(ctx).V(1).Info("decision", "action", d.Action, "reason", d.Reason)
 	switch d.Action {
 	case plan.EnsureTarget:
+		// The reference stays while the Secret exists: it still holds the instance's kubeconfig.
+		var secret corev1.Secret
+		err := r.Get(ctx, client.ObjectKey{Namespace: inst.Namespace, Name: kubeconfigSecretName(&inst)}, &secret)
+		if client.IgnoreNotFound(err) != nil {
+			return ctrl.Result{}, err
+		}
+		keepRef := err == nil
 		return ctrl.Result{RequeueAfter: d.RequeueAfter}, r.patchStatus(ctx, &inst, func(s *v1alpha1.PlatformInstanceStatus) {
 			s.Phase = v1alpha1.PhaseProvisioning
-			s.KubeconfigSecretRef = nil
+			if !keepRef {
+				s.KubeconfigSecretRef = nil
+			}
 			setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionFalse, st.Reason, st.Message)
 			setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionFalse, "TargetPending", "waiting for the target cluster")
 		})
@@ -223,8 +233,7 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, inst *v1alpha1.Platfor
 					fmt.Sprintf("waiting for storage cleanup %s to terminate before releasing (see the README to force it)", strings.Join(left, ", ")))
 			})
 		}
-		controllerutil.RemoveFinalizer(inst, Finalizer)
-		return ctrl.Result{}, r.Update(ctx, inst)
+		return ctrl.Result{}, r.patchFinalizers(ctx, inst, controllerutil.RemoveFinalizer)
 	case plan.Uninstall:
 		// The vCluster target is deleted wholesale (its host namespace and data volume), which
 		// removes everything the platform installed. So the target goes first and the install
@@ -354,6 +363,14 @@ func (r *Reconciler) fail(ctx context.Context, inst *v1alpha1.PlatformInstance, 
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, cause
+}
+
+// patchFinalizers adds or removes the finalizer with a merge patch that carries only the
+// finalizers (and the resourceVersion, so a concurrent change conflicts).
+func (r *Reconciler) patchFinalizers(ctx context.Context, inst *v1alpha1.PlatformInstance, change func(client.Object, string) bool) error {
+	base := inst.DeepCopy()
+	change(inst, Finalizer)
+	return r.Patch(ctx, inst, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 }
 
 func (r *Reconciler) patchStatus(ctx context.Context, inst *v1alpha1.PlatformInstance, mutate func(*v1alpha1.PlatformInstanceStatus)) error {

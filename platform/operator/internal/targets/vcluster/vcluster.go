@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -64,6 +65,8 @@ type Release struct {
 	Status string
 	// Description is Helm's note on the last operation, which carries the failure.
 	Description string
+	// Revision is the release's latest revision; 1 is the install.
+	Revision int
 }
 
 // Releaser is the Helm surface the target uses.
@@ -72,9 +75,11 @@ type Releaser interface {
 	Get(ctx context.Context, namespace, name string) (*Release, error)
 	// Install installs the chart archive as name in the existing namespace.
 	Install(ctx context.Context, namespace, name string, chart []byte, values map[string]any) error
-	// Upgrade re-applies the chart archive to the release with the values it was installed
-	// with, which recreates any of its objects that are missing and leaves the rest unchanged.
-	Upgrade(ctx context.Context, namespace, name string, chart []byte) error
+	// Repair re-applies the release with the chart and values it was installed with, which
+	// recreates any of its objects that are missing and leaves the rest unchanged.
+	Repair(ctx context.Context, namespace, name string) error
+	// Rollback rolls the release back to its last deployed revision and returns it.
+	Rollback(ctx context.Context, namespace, name string) (int, error)
 	// Uninstall removes the release; a missing release is not an error.
 	Uninstall(ctx context.Context, namespace, name string) error
 }
@@ -96,6 +101,10 @@ type Target struct {
 	// Dial checks that the vCluster API answers at address (host:port); nil opens a TCP
 	// connection with a 5 second timeout.
 	Dial func(ctx context.Context, address string) error
+
+	mu sync.Mutex
+	// failures counts consecutive failed API checks per host namespace.
+	failures map[string]int
 }
 
 // releaseObjects are the vCluster release's host-namespace objects Ensure checks on every round.
@@ -111,12 +120,16 @@ func releaseObjects(ns string) []client.Object {
 var _ targets.Target = (*Target)(nil)
 
 // Ensure puts the host-namespace NetworkPolicies in place (every round, so a deleted or edited
-// one comes back), re-applies the release when one of its host-namespace objects is missing
-// (#453), reports the vCluster API unreachable when it doesn't answer, installs the vCluster once and reports it ready when its control plane is ready and
-// its kubeconfig Secret exists. Values are applied at creation only (see InstanceValues). A
-// release left failed or pending (an install that errored or was interrupted) is removed so the
-// next round installs it again. That is reported as an error, so an install that fails the same
-// way every time backs off instead of cycling every poll.
+// one comes back), installs the vCluster once and reports it ready when its control plane is
+// ready, its kubeconfig Secret exists and its API answers. Values are applied at creation only
+// (see InstanceValues). A release left failed or pending by the install (revision 1) is removed
+// so the next round installs it again. That is reported as an error, so an install that fails
+// the same way every time backs off instead of cycling every poll. A later revision left failed
+// or pending (a repair that errored or was interrupted) is rolled back to the last deployed one
+// instead, so a working control plane is never uninstalled. When one of the release's
+// host-namespace objects is missing, the stored release is re-applied (#453). The API is reported
+// unreachable only after UnreachableAfter consecutive failed checks, so one slow dial doesn't
+// flip a ready instance.
 func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (targets.State, error) {
 	ns := HostNamespace(inst)
 	if err := t.claimNamespace(ctx, inst, ns); err != nil {
@@ -143,6 +156,15 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 		}
 		return targets.State{Reason: "Creating", Message: fmt.Sprintf("installed vcluster %s in namespace %s", ChartVersion, ns)}, nil
 	}
+	if rel.Status != "deployed" && rel.Status != "pending-install" && rel.Revision > 1 {
+		// A repair (or rollback) that failed or was interrupted: the instance had a working
+		// control plane, so go back to it instead of uninstalling.
+		rev, err := t.Helm.Rollback(ctx, ns, ReleaseName)
+		if err != nil {
+			return targets.State{}, fmt.Errorf("roll back %s vcluster release revision %d: %w", rel.Status, rel.Revision, err)
+		}
+		return targets.State{Reason: "RolledBack", Message: fmt.Sprintf("vcluster release revision %d was %s (%s); rolled back to revision %d", rel.Revision, rel.Status, rel.Description, rev)}, nil
+	}
 	if rel.Status != "deployed" {
 		if err := t.Helm.Uninstall(ctx, ns, ReleaseName); err != nil {
 			return targets.State{}, fmt.Errorf("remove %s vcluster release: %w", rel.Status, err)
@@ -163,11 +185,7 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 		}
 	}
 	if len(missing) > 0 {
-		chart, err := Chart()
-		if err != nil {
-			return targets.State{}, err
-		}
-		if err := t.Helm.Upgrade(ctx, ns, ReleaseName, chart); err != nil {
+		if err := t.Helm.Repair(ctx, ns, ReleaseName); err != nil {
 			return targets.State{}, fmt.Errorf("re-apply vcluster release to recreate %s: %w", strings.Join(missing, ", "), err)
 		}
 		return targets.State{Reason: "Repairing", Message: fmt.Sprintf("re-applied the vcluster release in namespace %s to recreate %s", ns, strings.Join(missing, ", "))}, nil
@@ -196,10 +214,36 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 	if err != nil {
 		return targets.State{}, fmt.Errorf("vcluster kubeconfig: %w", err)
 	}
+	ready := targets.State{Ready: true, Kubeconfig: kubeconfig, Server: server}
 	if err := t.dial(ctx, address); err != nil {
-		return targets.State{Reason: "TargetUnreachable", Message: fmt.Sprintf("vcluster API %s (service %s/%s) is unreachable: %v", server, ns, ReleaseName, err)}, nil
+		n := t.countFailure(ns)
+		if n < UnreachableAfter {
+			log.FromContext(ctx).Info("vcluster API check failed", "endpoint", server, "failures", n, "error", err.Error())
+			return ready, nil
+		}
+		return targets.State{Reason: "TargetUnreachable", Message: fmt.Sprintf("vcluster API %s (service %s/%s) is unreachable (%d consecutive checks): %v", server, ns, ReleaseName, n, err)}, nil
 	}
-	return targets.State{Ready: true, Kubeconfig: kubeconfig, Server: server}, nil
+	t.resetFailures(ns)
+	return ready, nil
+}
+
+// UnreachableAfter is how many consecutive failed API checks report the target unreachable.
+const UnreachableAfter = 3
+
+func (t *Target) countFailure(ns string) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.failures == nil {
+		t.failures = map[string]int{}
+	}
+	t.failures[ns]++
+	return t.failures[ns]
+}
+
+func (t *Target) resetFailures(ns string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.failures, ns)
 }
 
 func (t *Target) dial(ctx context.Context, address string) error {
