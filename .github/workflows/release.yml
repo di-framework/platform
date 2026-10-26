@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
   workflow_dispatch:
 
 # Separate jobs, so the toolchains and Docker never run with publish credentials (#168):
@@ -85,7 +85,7 @@ jobs:
       # `npm pack` below is the packer `npm publish` used before #168.
       - uses: actions/setup-node@v7
         with:
-          node-version: "24.x"
+          node-version: '24.x'
 
       # `bun run build` does not compile @di-framework/sqlite-component or
       # @di-framework/pglite-component. The pack step runs each package's build, `npm pack`s
@@ -205,8 +205,8 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: "24.x"
-          registry-url: "https://registry.npmjs.org"
+          node-version: '24.x'
+          registry-url: 'https://registry.npmjs.org'
 
       - name: Ensure modern npm for OIDC trusted publishing
         run: npm install -g npm@latest

@@ -1,21 +1,21 @@
 changelog:
   categories:
-    - title: "⚠️ Breaking Changes"
+    - title: '⚠️ Breaking Changes'
       labels:
-        - "breaking-change"
-    - title: "🚀 Features"
+        - 'breaking-change'
+    - title: '🚀 Features'
       labels:
-        - "enhancement"
-        - "feature"
-    - title: "🐛 Bug Fixes"
+        - 'enhancement'
+        - 'feature'
+    - title: '🐛 Bug Fixes'
       labels:
-        - "fix"
-        - "bug"
-    - title: "📚 Documentation"
+        - 'fix'
+        - 'bug'
+    - title: '📚 Documentation'
       labels:
-        - "documentation"
-    - title: "🧰 Maintenance & Dependencies"
+        - 'documentation'
+    - title: '🧰 Maintenance & Dependencies'
       labels:
-        - "dependencies"
-        - "test"
-        - "coverage"
+        - 'dependencies'
+        - 'test'
+        - 'coverage'

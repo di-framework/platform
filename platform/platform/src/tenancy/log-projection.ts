@@ -549,6 +549,7 @@ export function unpublished(
   const [first] = ring;
   let oldest = '';
   if (first && ring.length >= max)
+    // biome-ignore lint/complexity/useMathMinMax: stamps are ISO strings; Math.min would coerce them to NaN.
     oldest = ring.reduce((min, entry) => (stamp(entry) < min ? stamp(entry) : min), stamp(first));
   return incoming.filter(
     (entry) => !published.has(id(entry)) && !published.has(entry.line) && stamp(entry) >= oldest,
