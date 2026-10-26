@@ -41,7 +41,7 @@ apiVersion: platform.di-framework.dev/v1alpha1
 kind: PlatformInstance
 metadata: { name: one, namespace: team-a }
 spec:
-  version: 6.0.17
+  version: 6.0.20
   target: { type: vcluster }
   platform:
     tenants:
@@ -62,12 +62,12 @@ as JSON:
 
 | `spec.platform` | Platform config | Notes |
 | --- | --- | --- |
-| `tenants[]` (`name`, `suspended`, `deletionPolicy`, `runtime.{replicas,coreInstances}`, `resources.{cpu,memory,workloads,backingServices,serviceBindings,apiKeys}`) | `tenants` | Always set (`[]` when empty). At most 32; names are unique, 1-40 lowercase letters, digits and hyphens, starting with a letter. |
-| `users[]` (`name`, `suspended`, `memberships[].{tenant,role}`) | `users` | Always set (`[]` when empty). At most 256; each membership names an entry of `tenants`, once, as `developer` or `viewer`. |
+| `tenants[]` (`name`, `suspended`, `deletionPolicy`, `runtime.{replicas,coreInstances}`, `resources.{cpu,memory,workloads,backingServices,serviceBindings,apiKeys}`) | `tenants` | Always set (`[]` when empty). At most 32; names are unique, 1-40 lowercase letters, digits and hyphens, starting with a letter. The bounds are the platform Tenant CRD's: `replicas` 1-10, `coreInstances` 1-10000, `workloads` 1-1000, `backingServices` 1-100, `serviceBindings` 1-400, `apiKeys` 1-10000, and `cpu`/`memory` are quantities (`500m`, `1.5`, `512Mi`). |
+| `users[]` (`name`, `suspended`, `memberships[].{tenant,role}`) | `users` | Always set (`[]` when empty). At most 128, each with at most 16 memberships (so the membership rule stays within the apiserver's CEL cost limit); each membership names an entry of `tenants`, once, as `developer` or `viewer`. |
 | `tenantAuth.image`, `issuer`, `issuerUpstream`, `issuerUpstreamPodPort`, `issuerIp`, `consolePublicUrl`, `controllerPublicUrl`, `registry.{component,publicUrl,limits}` | `tenantAuth.<same>` | `image` and `registry.component` are pinned by digest. `issuer`, `clientId` and `clientSecretRef` go together. |
 | `tenantAuth.clientId` | `tenantAuth.oauthClient.id` | |
 | `tenantAuth.clientSecretRef.{name,key}` | `tenantAuth.oauthClient.secretName` | See below. |
-| `tenantHostImage` | `tenantHostImage` | Empty uses the pinned exclusive host variant, `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:...` (the PGlite exclusive-PGDATA workloads need it; the image pin PR moves it), not the platform's own default. Immutable after creation. |
+| `tenantHostImage` | `tenantHostImage` | Can change: the next install applies it and restarts the tenant hosts. Empty keeps the image the instance was first installed with, recorded in `status.applied.tenantHostImage` (see below). |
 | `tenantHostImagePullPolicy` | `tenantHostImagePullPolicy` | `Always`, `IfNotPresent` or `Never`; unset leaves the platform's default. |
 
 **The client secret is never inline.** `clientSecretRef` names a Secret and key in the PlatformInstance's
@@ -75,12 +75,42 @@ namespace. On every install and repair the operator reads it and sets it as the 
 `tenantAuthClientSecret`; the instance's Pulumi program writes it to the Secret `platform-operator-tenant-auth`
 (key `clientSecret`) in the platform namespace inside the instance, and `tenantAuth.oauthClient.secretName`
 names that Secret. A missing Secret or key stops the install with `Installed=False`,
-reason `TenantAuthSecretUnavailable`, and is retried with backoff. A changed Secret value is applied by the next
-repair (the operator doesn't watch the Secret).
+reason `TenantAuthSecretUnavailable` (and `ConfigApplied=False` with the same reason), and is retried with
+backoff. The operator doesn't watch the Secret, so creating a missing one is picked up by the next retry (the
+backoff reaches about 16 minutes), not at once.
 
-**Changes.** A change to `tenants`, `users` or `tenantAuth` is a spec change, so the next reconcile installs
+**Rotating the client secret.** Change the value in the source Secret. The next repair (at most one
+`--repair-interval`, 30 minutes by default) rewrites `platform-operator-tenant-auth`, and the platform
+controller copies it into `tenant-console-oauth` in each tenant's runtime namespace. The consoles read it from
+their environment at start, so each keeps the old secret until it restarts. Once `tenant-console-oauth`
+holds the new value, restart them with the instance's kubeconfig (`status.kubeconfigSecretRef`):
+
+```sh
+kubectl --kubeconfig instance.kubeconfig -n di-runtime-<tenant> rollout restart deployment/tenant-console
+```
+
+**The tenant host image.** An explicit `tenantHostImage` is applied as set, and changing it (for example
+together with a `spec.version` upgrade) is a spec change that rolls the tenant hosts. Left empty:
+
+- A **new instance** gets the operator's pinned exclusive host variant,
+  `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:...` (the PGlite exclusive-PGDATA workloads need
+  it; the image pin PR moves it), at its first install. That image is recorded in
+  `status.applied.tenantHostImage`, and later installs and repairs keep using it, so upgrading the operator
+  never moves it or restarts the hosts. To move it, set the field. The exclusive default is an approved host
+  build (the platform's `NATS_CREDENTIALS_HOST_IMAGE_DIGESTS`, which gives a tenant registry its own NATS
+  account) only from platform `6.0.20`; with an earlier `spec.version` the install stops with
+  `Installed=False` and `ConfigApplied=False`, reason `TenantHostImageUnsupported`. Set `tenantHostImage` or a
+  newer `spec.version`.
+- An **instance installed before the operator managed the host image** (`Installed` with no
+  `status.applied`) keeps the platform's own default: the operator doesn't set the key (and removes a
+  hand-set one), records it as empty, and keeps doing so, so its hosts don't restart on the operator upgrade.
+
+Clearing the field after it was set keeps the last applied image; nothing reverts to a default on its own.
+
+**Changes.** A change to `tenants`, `users`, `tenantAuth` or `tenantHostImage` is a spec change, so the next reconcile installs
 (`Installed` reason `SpecChanged`) with the new config. Settings removed from the spec (`tenantAuth`,
-`tenantHostImagePullPolicy`) are removed from the stack config too. A repair with an unchanged spec sets the
+`tenantHostImagePullPolicy`) are removed from the stack config too, as is `tenantHostImage` when the applied
+image is the platform's own default. A repair with an unchanged spec sets the
 same config, so its `up` changes nothing. `status.applied` reports what the last install applied (the
 generation, the number of tenants and users, the `tenantAuth` issuer and the tenant host image), and the
 `ConfigApplied` condition says the same in words.
@@ -302,6 +332,16 @@ The operator needs:
 The operator caches only the Secrets it labels (`app.kubernetes.io/managed-by: platform-operator`, its
 instances' kubeconfig Secrets) and reads other Secrets, Services and its cleanup Jobs straight from the API
 server, so it never holds the cluster's Helm release Secrets in memory.
+
+Two consequences of `tenantAuth.clientSecretRef`:
+
+- **Who can make the operator read a Secret.** Anyone who may create or edit a PlatformInstance in a namespace
+  can have the operator read any key of any Secret in that namespace and copy it into the instance. The
+  reference is limited to the instance's own namespace for that reason; grant PlatformInstance write access
+  only to those who may read that namespace's Secrets.
+- **The value on the command line.** The Pulumi Automation API sets secret config with
+  `pulumi config set-all --secret`, so the client secret is on that command's argv, visible in the operator
+  container's `/proc` while it runs. It never reaches the CR, its status, events or the operator log.
 
 ```sh
 make generate   # DeepCopy, CRD and ClusterRole from the markers
