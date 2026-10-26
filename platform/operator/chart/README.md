@@ -135,6 +135,13 @@ in `Chart.lock`); everything under `headlamp` is passed to it. Upstream binds He
 ServiceAccount to `cluster-admin` by default (`headlamp.clusterRoleBinding`); users still sign in with
 their own token unless `headlamp.config.unsafeUseServiceAccountToken` is set.
 
-The PlatformInstance plugin (#273) is installed through Headlamp's plugin manager sidecar. Until it is
-published, `headlamp.pluginsManager` is a documented stub in `values.yaml`. Its `pluginctl` version and
-its `node` base image (by digest) are pinned rather than upstream's `latest` and `lts-alpine`.
+The PlatformInstance plugin (#273) is installed through Headlamp's plugin manager sidecar, which is on
+by default (`headlamp.pluginsManager.enabled`) and takes effect once `headlamp.enabled=true`. Its
+`configContent` names the plugin's Artifact Hub package
+(<https://artifacthub.io/packages/headlamp/di-framework-platform/di-framework-platform>) at the plugin
+version, which is the platform release version: each release PR rewrites that `version:` line (#435).
+pluginctl downloads the tarball attached to the GitHub release and checks its sha256. Until the
+first release that ships the plugin (v6.0.18), the chart on `main` names plugin 0.1.0, which has no
+Artifact Hub entry, so the sidecar cannot install it from a source checkout. The sidecar
+needs egress to npm, artifacthub.io and github.com. Its `pluginctl` version and its `node` base image
+(by digest) are pinned rather than upstream's `latest` and `lts-alpine`.

@@ -225,10 +225,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The same Node as the Headlamp plugin's CI job (ci.yml): the release PR packs the plugin
+      # and records its sha256, and the gzip bytes come from Node's zlib (#435).
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "20"
+          node-version: '22.23.2'
 
       # Runs scripts/check-lockfile-versions.ts with the same Bun as the Test
       # workflow (ci.yml), which runs the same check on the release PR.
@@ -270,12 +272,12 @@ jobs:
           echo "branch=release/v$NEXT" >> "$GITHUB_OUTPUT"
           echo "Bumping $CURRENT -> $NEXT ($BUMP)"
 
-      - name: Open release PR
-        id: pr
+      # Bumps, packs the Headlamp plugin and commits without GH_TOKEN in the environment: the
+      # plugin's build tooling never sees the token (#435). Only the next step pushes and opens
+      # the PR with it.
+      - name: Bump versions and commit the release
         env:
-          GH_TOKEN: ${{ github.token }}
           NEXT: ${{ steps.version.outputs.next }}
-          CURRENT: ${{ steps.version.outputs.current }}
           BRANCH: ${{ steps.version.outputs.branch }}
         run: |
           set -euo pipefail
@@ -303,6 +305,21 @@ jobs:
           bun scripts/check-lockfile-versions.ts --write
           bun scripts/check-lockfile-versions.ts
 
+          # The Headlamp plugin ships with the platform's version (#435): set it in the plugin's
+          # package.json and the chart's plugin manager config, pack the plugin with its own
+          # lockfile, and write its Artifact Hub entry from the tarball's sha256. The release
+          # build job packs it again at the tag; the release uploads it only if the checksum matches.
+          # The recorded sha256 depends on Node's zlib: refuse any Node but the pinned one.
+          if [ "$(node -v)" != "v22.23.2" ]; then
+            echo "::error::the Headlamp plugin must be packed with Node v22.23.2, not $(node -v)"
+            exit 1
+          fi
+          bun scripts/artifacthub-plugin.ts set-version "$NEXT"
+          bun install --cwd platform/operator/headlamp-plugin --frozen-lockfile --ignore-scripts
+          bun run --cwd platform/operator/headlamp-plugin package
+          bun scripts/artifacthub-plugin.ts write "$NEXT"
+          git add platform/operator/chart/values.yaml platform/operator/headlamp-plugin/artifacthub
+
           git add package.json bun.lock
           # Workspace manifests are not all under packages/.
           git ls-files -m -- '*package.json' | while IFS= read -r f; do
@@ -314,6 +331,16 @@ jobs:
             exit 1
           fi
           git commit -m "chore(release): v$NEXT"
+
+      - name: Open release PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT: ${{ steps.version.outputs.next }}
+          CURRENT: ${{ steps.version.outputs.current }}
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: |
+          set -euo pipefail
 
           # Refresh remote-tracking ref so --force-with-lease can replace a stale branch
           git fetch origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" 2>/dev/null || true

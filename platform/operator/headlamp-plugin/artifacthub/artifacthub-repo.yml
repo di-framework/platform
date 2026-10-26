@@ -1,0 +1,7 @@
+# Artifact Hub repository metadata for the di-framework-platform Headlamp plugin (#435).
+# Registered as kind "Headlamp plugins" under the di-framework organization, repository
+# di-framework-platform, URL .../platform/operator/headlamp-plugin/artifacthub on branch main.
+repositoryID: 77c7ba33-a42d-4f30-bc77-6cdf5b78d51b
+owners:
+  - name: geoffsee
+    email: gseemueller@gmail.com

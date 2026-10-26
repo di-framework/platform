@@ -8,10 +8,14 @@ on:
 
 # Separate jobs, so the toolchains and Docker never run with publish credentials (#168):
 #   build           builds and smoke-tests everything, packs every public package into a tarball
-#                   once, and uploads the tarballs with their sha256 manifest. No OIDC token.
+#                   once, and uploads the tarballs with their sha256 manifest. On a tag it also
+#                   packs the Headlamp plugin and checks it against its Artifact Hub entry.
+#                   No OIDC token.
 #   publish         downloads those tarballs, checks them against the build job's digests, and
 #                   runs `npm publish <tarball>`. Only this job holds id-token: write.
-#   github-release  creates the GitHub Release for a tag. Only this job holds contents: write.
+#   github-release  creates the GitHub Release for a tag and attaches the Headlamp plugin tarball
+#                   the build job packed and checked against its Artifact Hub entry (#435), byte
+#                   for byte. Only this job holds contents: write.
 #   chart           packages the operator Helm chart at the tag's version and pushes it to GHCR
 #                   (#272). Only this job holds packages: write.
 # The pglite wasm npm receives is the one `make smoke` tested: it is not rebuilt after the smoke
@@ -29,6 +33,7 @@ jobs:
       manifest_sha256: ${{ steps.pack.outputs.manifest_sha256 }}
       pglite_wasm_sha256: ${{ steps.smoke.outputs.wasm_sha256 }}
       artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      plugin_sha256: ${{ steps.plugin.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -40,6 +45,8 @@ jobs:
           echo "$GITHUB_WORKSPACE/platform/sqlite-component/.tools/bin" >> "$GITHUB_PATH"
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.3'
 
       # @di-framework/pglite-component ships its wasm on npm. The release builds it
       # from source with the same make targets as ci.yml (engine via Docker) and runs
@@ -131,6 +138,52 @@ jobs:
         with:
           name: npm-packages
           path: ${{ runner.temp }}/npm-packages/
+          if-no-files-found: error
+          retention-days: 7
+
+      # The Headlamp plugin tarball its Artifact Hub entry points at (#435). The release PR packed it
+      # and recorded the sha256 in platform/operator/headlamp-plugin/artifacthub/<version>/; packing
+      # again at the tag must give the same bytes. github-release uploads this artifact as is.
+      # The same Node as the plugin's CI job: the tarball's gzip bytes come from Node's zlib.
+      - name: Setup Node for the Headlamp plugin
+        if: github.ref_type == 'tag'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.23.2'
+
+      - name: Pack the Headlamp plugin and check it against its Artifact Hub entry
+        id: plugin
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          ENTRY="platform/operator/headlamp-plugin/artifacthub/$VERSION/artifacthub-pkg.yml"
+          if [ ! -f "$ENTRY" ]; then
+            echo "::error::$ENTRY is missing at $GITHUB_REF_NAME: the release PR writes it; not releasing the Headlamp plugin"
+            exit 1
+          fi
+          # The recorded sha256 depends on Node's zlib: refuse any Node but the pinned one.
+          if [ "$(node -v)" != "v22.23.2" ]; then
+            echo "::error::the Headlamp plugin must be packed with Node v22.23.2, not $(node -v)"
+            exit 1
+          fi
+          bun install --cwd platform/operator/headlamp-plugin --frozen-lockfile --ignore-scripts
+          bun run --cwd platform/operator/headlamp-plugin package
+          if ! bun scripts/artifacthub-plugin.ts verify "$VERSION" --required; then
+            echo "::error::the Headlamp plugin packed at $GITHUB_REF_NAME does not match its Artifact Hub entry; not releasing it"
+            exit 1
+          fi
+          TARBALL="platform/operator/headlamp-plugin/dist-package/di-framework-platform-$VERSION.tar.gz"
+          echo "sha256=$(sha256sum "$TARBALL" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the Headlamp plugin
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: headlamp-plugin
+          path: |
+            platform/operator/headlamp-plugin/dist-package/*.tar.gz
+            platform/operator/headlamp-plugin/dist-package/*.sha256
           if-no-files-found: error
           retention-days: 7
 
@@ -299,7 +352,7 @@ jobs:
 
   github-release:
     name: Create GitHub Release
-    needs: [publish, chart]
+    needs: [build, publish, chart]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
@@ -318,3 +371,37 @@ jobs:
           else
             echo "GitHub Release $TAG already exists"
           fi
+
+      # The Headlamp plugin the build job packed and checked against its Artifact Hub entry (#435),
+      # uploaded byte for byte: nothing is rebuilt here.
+      - name: Download the Headlamp plugin
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: headlamp-plugin
+          path: ${{ runner.temp }}/headlamp-plugin
+
+      - name: Upload the Headlamp plugin to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_SHA256: ${{ needs.build.outputs.plugin_sha256 }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          TARBALL="$RUNNER_TEMP/headlamp-plugin/di-framework-platform-${TAG#v}.tar.gz"
+          actual="$(sha256sum "$TARBALL" | cut -d' ' -f1)"
+          if [[ ! "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ || "$actual" != "$EXPECTED_SHA256" ]]; then
+            echo "::error::downloaded Headlamp plugin ($actual) differs from the one the build job checked ($EXPECTED_SHA256)"
+            exit 1
+          fi
+          # Never replace released bytes: each asset is uploaded only if the release lacks it.
+          ASSETS="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          for FILE in "$TARBALL" "$TARBALL.sha256"; do
+            NAME="$(basename "$FILE")"
+            if grep -Fxq "$NAME" <<< "$ASSETS"; then
+              echo "$NAME is already on $TAG; not uploading it again"
+            else
+              gh release upload "$TAG" "$FILE"
+              echo "Uploaded $NAME to $TAG"
+            fi
+          done

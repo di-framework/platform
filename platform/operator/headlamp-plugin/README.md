@@ -89,9 +89,9 @@ reproduce the checksum.
 
 ## Delivery: Artifact Hub (#435)
 
-Loading the plugin from the Headlamp chart is tracked in
-[#435](https://github.com/di-framework/platform/issues/435): the tarball is published as a GitHub
-release asset and listed in an **Artifact Hub** repository of kind *Headlamp plugins*.
+The plugin is released with the platform and installed by the operator chart's Headlamp plugin
+manager from **Artifact Hub**:
+<https://artifacthub.io/packages/headlamp/di-framework-platform/di-framework-platform>.
 
 That is the only route the chart's plugin manager takes. `pluginsManager` runs
 `@headlamp-k8s/pluginctl install --config /config/plugin.yml`, and pluginctl 0.1.1 (the only
@@ -103,26 +103,27 @@ published version) rejects anything else:
   (`releases`/`archive`), GitLab or Bitbucket URL. pluginctl checks its sha256 and extracts it with
   `strip: 1`.
 
-The pieces #435 delivers:
+How a release delivers it:
 
-1. The tarball attached to the GitHub release:
-   `https://github.com/di-framework/platform/releases/download/v<platform-version>/di-framework-platform-<plugin-version>.tar.gz`
-2. An Artifact Hub repository with `artifacthub-repo.yml` and one `artifacthub-pkg.yml` per version:
-
-   ```yaml
-   version: <plugin-version>
-   name: di-framework-platform
-   displayName: di-framework Platform Instances
-   createdAt: "<RFC 3339 time>"
-   description: Manage di-framework PlatformInstances from Headlamp.
-   annotations:
-     headlamp/plugin/archive-url: https://github.com/di-framework/platform/releases/download/v<platform-version>/di-framework-platform-<plugin-version>.tar.gz
-     headlamp/plugin/archive-checksum: sha256:<sha256 from dist-package/*.sha256>
-     headlamp/plugin/version-compat: ">=0.46.0"
-     headlamp/plugin/distro-compat: in-cluster,web,app
-   ```
-
-3. The chart values:
+1. **Version.** The plugin's version is the platform release version. The release PR (Auto Tag)
+   runs `bun scripts/artifacthub-plugin.ts set-version <X>`, which sets `version` in this
+   `package.json` and the plugin's `version:` line in the chart's
+   `headlamp.pluginsManager.configContent`.
+2. **Artifact Hub entry.** The same PR packs the plugin (`bun run package`, with the Node version CI
+   pins) and runs `bun scripts/artifacthub-plugin.ts write <X>`, which writes
+   [`artifacthub/<X>/artifacthub-pkg.yml`](artifacthub/README.md) and a README. The entry records
+   the tarball's sha256 and the release asset
+   `https://github.com/di-framework/platform/releases/download/v<X>/di-framework-platform-<X>.tar.gz`,
+   with `version-compat: ">=0.46.0"` and `distro-compat: in-cluster,web,app`. An existing entry is
+   never rewritten with a different checksum. Artifact Hub reads `artifacthub/` from `main`
+   (repository `di-framework-platform`, `artifacthub/artifacthub-repo.yml`).
+3. **Release asset.** On the tag, the release workflow's `build` job packs the plugin again (same
+   pinned Node, `bun install --frozen-lockfile --ignore-scripts`) and fails if its sha256 differs
+   from the entry or the entry is missing. It hands the tarball and its `.sha256` on as a workflow
+   artifact with the sha256 as a job output. `github-release` downloads them, checks the sha256
+   against that output and uploads each file to the GitHub release only if the release lacks it;
+   it rebuilds nothing, and an uploaded asset is never replaced.
+4. **Chart.** `headlamp.pluginsManager` is enabled with:
 
    ```yaml
    pluginsManager:
@@ -130,6 +131,21 @@ The pieces #435 delivers:
      configContent: |
        plugins:
          - name: di-framework-platform
-           source: https://artifacthub.io/packages/headlamp/<artifacthub-repo>/di-framework-platform
-           version: <plugin-version>
+           source: https://artifacthub.io/packages/headlamp/di-framework-platform/di-framework-platform
+           version: <X>
    ```
+
+On the pull request that adds an entry (the release PR), the plugin's CI job also checks that the
+plugin packs to the recorded sha256 (`bun scripts/artifacthub-plugin.ts verify <version> --required`
+from the repository root). Later plugin changes before the next release pack to other bytes under
+the same version, so other PRs and pushes do not re-check a released entry.
+
+Two windows to expect:
+
+- **Between the release PR merging and the release uploading the asset**, Artifact Hub may already
+  list the new version while its `archive-url` still returns 404. pluginctl fails to install it
+  until the `github-release` job has run (the Release workflow follows the tag, which Auto Tag
+  makes within about 30 minutes of the merge).
+- **Before the first release that ships the plugin (v6.0.18)**, the chart on `main` names plugin
+  version `0.1.0`, which has no Artifact Hub entry. Enabling Headlamp from a source checkout of
+  the chart installs Headlamp, but the plugin manager cannot install the plugin until that release.

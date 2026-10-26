@@ -116,6 +116,28 @@ jobs:
           bun run package
           cat dist-package/*.sha256
 
+      # The release PR adds the Artifact Hub entry (#435) for the plugin's new version; that PR's
+      # pack must match it, and so must any PR that edits or deletes that entry (a deleted entry
+      # fails). Other PRs leave a released entry alone (later plugin changes pack to other bytes
+      # under the same version until the next release), and pushes skip the check.
+      - name: Check the Artifact Hub entry
+        if: steps.changes.outputs.run == 'true'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            echo "Not a pull request; the Artifact Hub entry is checked on the PR that changes it."
+            exit 0
+          fi
+          VERSION="$(node -p "require('./platform/operator/headlamp-plugin/package.json').version")"
+          ENTRY="platform/operator/headlamp-plugin/artifacthub/$VERSION/"
+          # HEAD is the merge commit; its first parent is the PR base.
+          if [ -n "$(git diff --name-only HEAD^1 HEAD -- "$ENTRY")" ]; then
+            bun scripts/artifacthub-plugin.ts verify "$VERSION" --required
+          else
+            echo "This PR does not change $ENTRY; nothing to verify."
+          fi
+
       - name: Upload plugin tarball
         if: steps.changes.outputs.run == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

@@ -123,21 +123,21 @@ securityContext:
 # Everything under `headlamp` is passed to that chart; see its values.yaml.
 headlamp:
   enabled: false
-  # The PlatformInstance Headlamp plugin (#273) is installed as a tarball by Headlamp's plugin
-  # manager sidecar (`pluginctl install --config`). Until the plugin is published this is a stub:
-  # to try a plugin, enable it and set configContent to the plugin list, for example
-  #   pluginsManager:
-  #     enabled: true
-  #     configContent: |
-  #       plugins:
-  #         - name: platform-instances
-  #           source: <where #273 publishes the plugin tarball>
+  # The PlatformInstance Headlamp plugin (#273) is installed by Headlamp's plugin manager sidecar
+  # (`pluginctl install --config`) from its Artifact Hub entry (#435), which points at the tarball
+  # attached to the platform's GitHub release. The plugin's version is the platform's release
+  # version; the release PR rewrites the `version:` line below (scripts/artifacthub-plugin.ts).
   # (Upstream reads `pluginsManager` at the top of the Headlamp chart's values, so here it is
   # headlamp.pluginsManager, not headlamp.config.pluginsManager.)
   # Upstream defaults to `npx @headlamp-k8s/pluginctl@latest` on `node:lts-alpine`; both are pinned
-  # here (the image by digest) so the sidecar is reproducible. It still needs npm egress.
+  # here (the image by digest) so the sidecar is reproducible. It still needs egress to npm,
+  # artifacthub.io and github.com.
   pluginsManager:
-    enabled: false
-    configContent: ""
+    enabled: true
+    configContent: |
+      plugins:
+        - name: di-framework-platform
+          source: https://artifacthub.io/packages/headlamp/di-framework-platform/di-framework-platform
+          version: 0.1.0
     version: 0.1.1
     baseImage: node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53

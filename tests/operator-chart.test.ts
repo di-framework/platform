@@ -160,8 +160,6 @@ describe('platform-operator chart', () => {
     const headlamp = find(rendered, 'Deployment', 'platform-operator-headlamp');
     expect(JSON.stringify(headlamp)).toContain('ghcr.io/headlamp-k8s/headlamp:v0.46.0');
     expect(operatorDeployment(rendered)).toBeDefined();
-    // The plugin manager stub stays off until the plugin (#273) is published.
-    expect(JSON.stringify(headlamp)).not.toContain('headlamp-plugin');
   }, 60000);
 
   test('the vendored Headlamp chart is the upstream release, as Chart.lock records', () => {
@@ -432,6 +430,24 @@ describe('platform-operator chart', () => {
     const headlamp = JSON.stringify(find(rendered, 'Deployment', 'platform-operator-headlamp'));
     expect(headlamp).toContain(values.headlamp.pluginsManager.baseImage);
     expect(headlamp).toContain(`@headlamp-k8s/pluginctl@${values.headlamp.pluginsManager.version}`);
+  }, 60000);
+
+  test('with Headlamp on, the plugin manager installs the plugin from Artifact Hub (#435)', async () => {
+    const rendered = await template('headlamp.enabled=true');
+    const config = find(rendered, 'ConfigMap', 'platform-operator-headlamp-plugin-config');
+    expect(Bun.YAML.parse(config.data['plugin.yml'])).toEqual({
+      plugins: [
+        {
+          name: 'di-framework-platform',
+          source:
+            'https://artifacthub.io/packages/headlamp/di-framework-platform/di-framework-platform',
+          version: JSON.parse(read(join(operator, 'headlamp-plugin', 'package.json'))).version,
+        },
+      ],
+    });
+    const headlamp = JSON.stringify(find(rendered, 'Deployment', 'platform-operator-headlamp'));
+    expect(headlamp).toContain('pluginctl@0.1.1 install --config /config/plugin.yml');
+    expect(headlamp).toContain('platform-operator-headlamp-plugin-config');
   }, 60000);
 
   test('the CRD, the state claim and the passphrase Secret survive helm uninstall', async () => {
