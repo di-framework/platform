@@ -1322,6 +1322,37 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     expect(runPin(`sha256:${'0'.repeat(63)}`).output).toBe('pinned=false\n');
   });
 
+  test('github-release uploads the Headlamp plugin only when it matches its Artifact Hub entry (#435)', () => {
+    const job = steps('github-release');
+    for (const ref of uses('github-release').filter(Boolean)) expect(ref).toMatch(/@[0-9a-f]{40}$/);
+    const ci = parse('.github/workflows/ci.yml').jobs['headlamp-plugin']?.steps ?? [];
+    const node = (s: { uses?: string }) => s.uses?.startsWith('actions/setup-node@') ?? false;
+    expect(job.find(node)?.uses).toBe(ci.find(node)?.uses);
+    expect(job.find(node)?.with?.['node-version']).toBe(ci.find(node)?.with?.['node-version']);
+    const all = runs('github-release');
+    for (const s of job.filter((s) => s.run)) expect(s.run).toContain('set -euo pipefail');
+    const order = [
+      'gh release create "$TAG"',
+      'bun install --frozen-lockfile && bun run package',
+      'bun scripts/artifacthub-plugin.ts verify "$VERSION" --required',
+      'gh release view "$TAG" --json assets --jq \'.assets[].name\' | grep -Fxq "$NAME"',
+      'gh release upload "$TAG" "$TARBALL" "$TARBALL.sha256"',
+    ].map((s) => all.indexOf(s));
+    expect(order.every((i) => i > -1)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(all).toContain('::error::');
+    expect(all).not.toContain('--clobber');
+  });
+
+  test('the Headlamp plugin CI job checks a released version against its Artifact Hub entry (#435)', () => {
+    const ci = parse('.github/workflows/ci.yml').jobs['headlamp-plugin']?.steps ?? [];
+    const names = ci.map((s) => s.name);
+    const check = ci.find((s) => s.name === 'Check the Artifact Hub entry');
+    expect(names.indexOf('Check the Artifact Hub entry')).toBe(names.indexOf('Package') + 1);
+    expect(check?.run).toContain('bun scripts/artifacthub-plugin.ts verify "$(node -p');
+    expect(check?.run).not.toContain('--required');
+  });
+
   test('build smoke-tests, records the wasm sha256, packs without rebuilding pglite, uploads', () => {
     const build = runs('build');
     const smoke = build.indexOf('make -C platform/pglite-component unit smoke');

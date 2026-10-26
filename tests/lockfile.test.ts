@@ -277,7 +277,38 @@ describe('the workflows keep bun.lock in step with the release bump', () => {
     expect(check).toBeGreaterThan(write);
     expect(add).toBeGreaterThan(check);
     expect(commit).toBeGreaterThan(add);
-    expect(steps.map((s) => s.run ?? '').join('\n')).not.toMatch(/^\s*bun (install|i|add)\b/m);
+    // The root workspace is never installed. The only install is the Headlamp plugin's own frozen
+    // lockfile, which the release PR packs for its Artifact Hub entry (#435).
+    const plugin = 'bun install --cwd platform/operator/headlamp-plugin --frozen-lockfile\n';
+    expect(pr).toContain(plugin);
+    expect(
+      steps
+        .map((s) => s.run ?? '')
+        .join('\n')
+        .replace(plugin, ''),
+    ).not.toMatch(/^\s*bun (install|i|add)\b/m);
+  });
+
+  test('Auto Tag moves the Headlamp plugin to the release version and writes its Artifact Hub entry (#435)', () => {
+    const pr = steps.map((s) => s.run ?? '').find((r) => r.includes('git commit')) ?? '';
+    const order = [
+      'bun scripts/check-lockfile-versions.ts\n',
+      'bun scripts/artifacthub-plugin.ts set-version "$NEXT"',
+      'bun install --cwd platform/operator/headlamp-plugin --frozen-lockfile',
+      'bun run --cwd platform/operator/headlamp-plugin package',
+      'bun scripts/artifacthub-plugin.ts write "$NEXT"',
+      'git add platform/operator/chart/values.yaml platform/operator/headlamp-plugin/artifacthub',
+      'git commit',
+    ].map((s) => pr.indexOf(s));
+    expect(order.every((i) => i > -1)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // The plugin's package.json is added by the `*package.json` loop.
+    expect(pr).toContain("git ls-files -m -- '*package.json'");
+    // Packs with the same pinned Node as the plugin's CI job.
+    const node = (s: Step) => s.uses?.startsWith('actions/setup-node@') ?? false;
+    const ciNode = parse('ci.yml').jobs['headlamp-plugin']?.steps.find(node);
+    expect(steps.find(node)?.uses).toBe(ciNode?.uses);
+    expect(steps.find(node)?.with?.['node-version']).toBe(ciNode?.with?.['node-version']);
   });
 
   test('the Test workflow checks bun.lock on every PR, release/v* included', () => {

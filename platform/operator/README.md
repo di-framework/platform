@@ -188,5 +188,7 @@ make test
 make build
 ```
 
-Packaging (Helm chart, Headlamp plugin) and the Layer 4 proof are tracked separately in
-the platform operator epic.
+The Helm chart is in [`chart/`](chart/README.md). The Headlamp plugin
+([`headlamp-plugin/`](headlamp-plugin/README.md)) is released with the platform: each release attaches
+its tarball to the GitHub release and lists it on Artifact Hub, and the chart's Headlamp plugin manager
+installs it from there (#435). The Layer 4 proof is tracked separately in the platform operator epic.

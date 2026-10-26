@@ -116,6 +116,15 @@ jobs:
           bun run package
           cat dist-package/*.sha256
 
+      # A released version's Artifact Hub entry (#435) must still match what this commit packs; an
+      # unreleased version has no entry yet, which passes.
+      - name: Check the Artifact Hub entry
+        if: steps.changes.outputs.run == 'true'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          bun scripts/artifacthub-plugin.ts verify "$(node -p "require('./platform/operator/headlamp-plugin/package.json').version")"
+
       - name: Upload plugin tarball
         if: steps.changes.outputs.run == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
