@@ -26,6 +26,68 @@ spec:
 `kubectl get pi -A` shows the requested and installed versions and the phase. The instance's admin
 kubeconfig is in the Secret named by `status.kubeconfigSecretRef` (`<name>-kubeconfig`, key `kubeconfig`).
 
+## Tenancy settings
+
+`spec.platform` also carries the instance's tenants, users, `tenantAuth` and tenant host image, so an instance
+comes up with a working console and `/v1` API without touching the operator's stack config:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata: { name: tenant-auth-oauth, namespace: team-a }
+stringData: { clientSecret: <the console's OAuth client secret> }
+---
+apiVersion: platform.di-framework.dev/v1alpha1
+kind: PlatformInstance
+metadata: { name: one, namespace: team-a }
+spec:
+  version: 6.0.17
+  target: { type: vcluster }
+  platform:
+    tenants:
+      - name: acme
+    users:
+      - name: dev
+        memberships: [{ tenant: acme, role: developer }]
+    tenantAuth:
+      image: ghcr.io/di-framework/tenant-auth@sha256:<digest>
+      issuer: https://id.example
+      clientId: console
+      clientSecretRef: { name: tenant-auth-oauth, key: clientSecret }
+      registry: { component: ghcr.io/di-framework/oci-registry@sha256:<digest> }
+```
+
+Each field is the platform's config key of the same name (see `platform/platform/README.md`), passed through
+as JSON:
+
+| `spec.platform` | Platform config | Notes |
+| --- | --- | --- |
+| `tenants[]` (`name`, `suspended`, `deletionPolicy`, `runtime.{replicas,coreInstances}`, `resources.{cpu,memory,workloads,backingServices,serviceBindings,apiKeys}`) | `tenants` | Always set (`[]` when empty). At most 32; names are unique, 1-40 lowercase letters, digits and hyphens, starting with a letter. |
+| `users[]` (`name`, `suspended`, `memberships[].{tenant,role}`) | `users` | Always set (`[]` when empty). At most 256; each membership names an entry of `tenants`, once, as `developer` or `viewer`. |
+| `tenantAuth.image`, `issuer`, `issuerUpstream`, `issuerUpstreamPodPort`, `issuerIp`, `consolePublicUrl`, `controllerPublicUrl`, `registry.{component,publicUrl,limits}` | `tenantAuth.<same>` | `image` and `registry.component` are pinned by digest. `issuer`, `clientId` and `clientSecretRef` go together. |
+| `tenantAuth.clientId` | `tenantAuth.oauthClient.id` | |
+| `tenantAuth.clientSecretRef.{name,key}` | `tenantAuth.oauthClient.secretName` | See below. |
+| `tenantHostImage` | `tenantHostImage` | Empty uses the pinned exclusive host variant, `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:...` (the PGlite exclusive-PGDATA workloads need it; the image pin PR moves it), not the platform's own default. Immutable after creation. |
+| `tenantHostImagePullPolicy` | `tenantHostImagePullPolicy` | `Always`, `IfNotPresent` or `Never`; unset leaves the platform's default. |
+
+**The client secret is never inline.** `clientSecretRef` names a Secret and key in the PlatformInstance's
+namespace. On every install and repair the operator reads it and sets it as the encrypted stack config key
+`tenantAuthClientSecret`; the instance's Pulumi program writes it to the Secret `platform-operator-tenant-auth`
+(key `clientSecret`) in the platform namespace inside the instance, and `tenantAuth.oauthClient.secretName`
+names that Secret. A missing Secret or key stops the install with `Installed=False`,
+reason `TenantAuthSecretUnavailable`, and is retried with backoff. A changed Secret value is applied by the next
+repair (the operator doesn't watch the Secret).
+
+**Changes.** A change to `tenants`, `users` or `tenantAuth` is a spec change, so the next reconcile installs
+(`Installed` reason `SpecChanged`) with the new config. Settings removed from the spec (`tenantAuth`,
+`tenantHostImagePullPolicy`) are removed from the stack config too. A repair with an unchanged spec sets the
+same config, so its `up` changes nothing. `status.applied` reports what the last install applied (the
+generation, the number of tenants and users, the `tenantAuth` issuer and the tenant host image), and the
+`ConfigApplied` condition says the same in words.
+
+The rest of the install stays operator-owned: the platform namespace (`wasmcloud`), the `storageRoot` layout,
+the Kubernetes endpoint and the kubeconfig.
+
 ## How it reconciles
 
 1. **Finalizer.** Added before anything is created, so a delete never orphans a cluster.
@@ -49,7 +111,7 @@ kubeconfig is in the Secret named by `status.kubeconfigSecretRef` (`<name>-kubec
 3. **Install.** On first install, a version change, any spec change or a retry after a failed install (which
    refreshes first), it writes a Pulumi project for the
    instance (`package.json` pinning `@di-framework/platform@<version>`, an `index.ts` re-exporting the
-   existing entrypoint), sets the config and runs `up`. One install or repair is cancelled after
+   existing entrypoint, plus the `tenantAuth` client secret Secret, see above), sets the config and runs `up`. One install or repair is cancelled after
    `--install-timeout` (30 minutes by default) and retried, so a hung run doesn't hold a worker.
 4. **Repair.** Every `--repair-interval` (30 minutes by default) a Ready instance gets `refresh` then `up`,
    which puts back hand-deleted or edited resources. Between repairs, an installed instance whose target

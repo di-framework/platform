@@ -47,6 +47,9 @@ export interface PinTarget {
 /** The operator chart's values; its `image.digest` is a bare digest line. */
 export const OPERATOR_CHART_VALUES = 'platform/operator/chart/values.yaml';
 
+/** Holds the operator's `DefaultTenantHostImage`, the exclusive variant (#442). */
+export const OPERATOR_TENANT_HOST_SOURCE = 'platform/operator/internal/controller/tenancy.go';
+
 const HOST_README = 'platform/tenant-host/README.md';
 /** The tenant host image tag -> patch set table; its first row is the canonical tag. */
 export const HOST_VARIANTS = 'platform/tenant-host/variants';
@@ -100,6 +103,11 @@ export const ARTIFACTS: Record<string, PinTarget[]> = {
       file: HOST_README,
       ref: 'ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive',
       linePrefix: '| `wasi-tls-exclusive` |',
+    },
+    {
+      file: OPERATOR_TENANT_HOST_SOURCE,
+      ref: 'ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive',
+      linePrefix: 'const DefaultTenantHostImage = ',
     },
   ],
 };

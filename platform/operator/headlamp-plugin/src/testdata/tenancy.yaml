@@ -1,0 +1,27 @@
+# The tenancy settings (#442): one tenant, one user and tenantAuth against a stub OIDC issuer.
+apiVersion: platform.di-framework.dev/v1alpha1
+kind: PlatformInstance
+metadata:
+  name: tenancy-instance
+  namespace: team-c
+spec:
+  version: 6.0.18
+  target:
+    type: vcluster
+  platform:
+    tenantHostImage: ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:6fea016378c3c6313427f2d6df0fed5ca369ab8f5676eb49d99844625312bb80
+    tenantHostImagePullPolicy: IfNotPresent
+    tenants:
+      - name: acme
+        deletionPolicy: Delete
+        runtime: { coreInstances: 300 }
+    users:
+      - name: dev
+        memberships: [{ tenant: acme, role: developer }]
+    tenantAuth:
+      image: ghcr.io/di-framework/tenant-auth@sha256:455af084f57e60a54b16b6f5c4f39fcafb0593612fb036e1b099b88423147a30
+      issuer: http://stub-oidc.pg-stub-oidc.svc.cluster.local
+      clientId: pgprove-console
+      clientSecretRef: { name: tenant-auth-oauth, key: clientSecret }
+      issuerUpstream: stub-oidc.pg-stub-oidc.svc.cluster.local:80
+      issuerUpstreamPodPort: 8080

@@ -685,6 +685,8 @@ test('merging a pin PR never republishes its own artifact, and any other publish
   // The tenant host pin also appends to the patch-0003 allowlist (#346), which lives in
   // platform/platform/src/tenancy/, an input of the tenant-auth image. That is the one publish a
   // pin PR may start; tenant-auth's own pin touches no input, so the chain stops after one hop.
+  // The exclusive host pin also moves the operator's DefaultTenantHostImage (#442), an input of
+  // the platform-operator image, which must ship the new default; its own pin touches no input.
   const triggers: string[] = [];
   for (const pinSpec of SPECS) {
     for (const file of new Set(pinSpec.artifacts.flatMap(artifactFiles))) {
@@ -695,7 +697,10 @@ test('merging a pin PR never republishes its own artifact, and any other publish
       }
     }
   }
-  expect(triggers).toEqual(['wash -> tenant-auth: platform/platform/src/tenancy/registry-nats.ts']);
+  expect(triggers).toEqual([
+    'wash -> tenant-auth: platform/platform/src/tenancy/registry-nats.ts',
+    'wash -> platform-operator: platform/operator/internal/controller/tenancy.go',
+  ]);
   for (const name of Object.keys(ARTIFACTS).filter((n) => !n.startsWith('wash-'))) {
     for (const file of artifactFiles(name)) {
       for (const spec of SPECS) expect(matchesPathFilter(spec.paths, file), file).toBe(false);

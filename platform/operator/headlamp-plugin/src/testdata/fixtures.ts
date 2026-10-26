@@ -5,6 +5,7 @@ import type { PlatformInstanceObject } from '../types';
 import fullYaml from './full.yaml?raw';
 import endpointOnlyYaml from './gateway-endpoint-only.yaml?raw';
 import minimalYaml from './minimal.yaml?raw';
+import tenancyYaml from './tenancy.yaml?raw';
 
 /** Only the required fields. */
 export const minimal = load(minimalYaml) as PlatformInstanceObject;
@@ -12,3 +13,5 @@ export const minimal = load(minimalYaml) as PlatformInstanceObject;
 export const full = load(fullYaml) as PlatformInstanceObject;
 /** Some optional fields: the gateway endpoint without a NodePort, and the default policy. */
 export const endpointOnly = load(endpointOnlyYaml) as PlatformInstanceObject;
+/** The tenancy settings (#442), which the form doesn't edit yet. */
+export const tenancy = load(tenancyYaml) as PlatformInstanceObject;

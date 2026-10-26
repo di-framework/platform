@@ -20,7 +20,17 @@ type Request struct {
 	// Settings are the platform's existing-entrypoint config keys (networkPolicyEngine,
 	// storageRoot, httpNodePort, namespace, ...), already defaulted by the caller.
 	Settings map[string]any
+	// SecretSettings are config keys stored encrypted in the install state (the tenantAuth OAuth
+	// client secret, under TenantAuthClientSecretKey).
+	SecretSettings map[string]string
+	// Unset are config keys removed from the install state when present and not set by Settings
+	// or SecretSettings, so a setting dropped from the spec stops applying.
+	Unset []string
 }
+
+// TenantAuthClientSecretKey is the secret config key whose value the install's program writes to
+// the target's platform namespace as the Secret tenantAuth.oauthClient.secretName names.
+const TenantAuthClientSecretKey = "tenantAuthClientSecret"
 
 // Result is what a finished install reports.
 type Result struct {

@@ -252,8 +252,10 @@ func TestInstallRequest(t *testing.T) {
 	want := map[string]any{
 		"namespace": "wasmcloud", "networkPolicyEngine": "existing", "httpNodePort": 0,
 		"storageRoot": "/var/lib/kubesolo/instances/team-a/one", "kubernetesEndpoint": "https://vcluster.pi-team-a-one.svc:443",
+		"tenants": []v1alpha1.Tenant{}, "users": []v1alpha1.User{}, "tenantHostImage": DefaultTenantHostImage,
 	}
-	if req.ID != "team-a.one" || req.Version != "6.0.17" || !reflect.DeepEqual(req.Settings, want) {
+	if req.ID != "team-a.one" || req.Version != "6.0.17" || !reflect.DeepEqual(req.Settings, want) || req.SecretSettings != nil ||
+		!reflect.DeepEqual(req.Unset, []string{"tenantAuth", "tenantAuthClientSecret", "tenantHostImagePullPolicy"}) {
 		t.Fatalf("install request %+v", req)
 	}
 	if h.in.options[0].Refresh {

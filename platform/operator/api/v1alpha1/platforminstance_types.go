@@ -49,6 +49,7 @@ type NetworkPolicyEngine string
 // creation: the operator would otherwise lose track of the cluster and data it made.
 // +kubebuilder:validation:XValidation:rule="self.target == oldSelf.target",message="target is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.platform) && has(self.platform.storageRoot) ? has(oldSelf.platform) && has(oldSelf.platform.storageRoot) && oldSelf.platform.storageRoot == self.platform.storageRoot : !(has(oldSelf.platform) && has(oldSelf.platform.storageRoot))",message="platform.storageRoot is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.platform) && has(self.platform.tenantHostImage) ? has(oldSelf.platform) && has(oldSelf.platform.tenantHostImage) && oldSelf.platform.tenantHostImage == self.platform.tenantHostImage : !(has(oldSelf.platform) && has(oldSelf.platform.tenantHostImage))",message="platform.tenantHostImage is immutable in v1alpha1: it is fixed at creation (empty uses the operator's pinned exclusive host image)"
 type PlatformInstanceSpec struct {
 	// Version is the exact @di-framework/platform package version to install, for example 6.0.17.
 	// +kubebuilder:validation:Pattern=`^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$`
@@ -75,6 +76,7 @@ type TargetSpec struct {
 }
 
 // PlatformSettings are the platform install settings an instance owner may choose.
+// +kubebuilder:validation:XValidation:rule="!has(self.users) || self.users.all(u, u.memberships.all(m, has(self.tenants) && self.tenants.exists(t, t.name == m.tenant)))",message="every users[].memberships[].tenant must name an entry of tenants"
 type PlatformSettings struct {
 	// NetworkPolicyEngine is existing (default: the target enforces NetworkPolicy) or
 	// kube-router (the platform runs its own policy controller).
@@ -91,6 +93,235 @@ type PlatformSettings struct {
 	// Gateway configures the platform HTTP gateway.
 	// +optional
 	Gateway GatewaySettings `json:"gateway,omitempty"`
+
+	// Tenants are the platform's tenants (its `tenants` config). A change on a Ready instance is
+	// applied by the install the spec change starts.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	Tenants []Tenant `json:"tenants,omitempty"`
+
+	// Users are the platform's users and their tenant memberships (its `users` config).
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=256
+	// +optional
+	Users []User `json:"users,omitempty"`
+
+	// TenantAuth enables the per-tenant console and /v1 API against an OIDC issuer (the
+	// platform's `tenantAuth` config). Unset, tenants get no console.
+	// +optional
+	TenantAuth *TenantAuth `json:"tenantAuth,omitempty"`
+
+	// TenantHostImage is the platform's `tenantHostImage`. Empty uses the operator's pinned
+	// exclusive host variant (ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive by digest), which
+	// the PGlite exclusive-PGDATA workloads need. Fixed at creation.
+	// +kubebuilder:validation:Pattern=`^[^\s@]+(@sha256:[0-9a-f]{64})?$`
+	// +kubebuilder:validation:MaxLength=512
+	// +optional
+	TenantHostImage string `json:"tenantHostImage,omitempty"`
+
+	// TenantHostImagePullPolicy is the platform's `tenantHostImagePullPolicy` (the platform
+	// defaults to IfNotPresent).
+	// +kubebuilder:validation:Enum=Always;IfNotPresent;Never
+	// +optional
+	TenantHostImagePullPolicy string `json:"tenantHostImagePullPolicy,omitempty"`
+}
+
+// Tenant is one entry of the platform's `tenants` config.
+type Tenant struct {
+	// Name is 1-40 lowercase letters, digits and hyphens, starting with a letter.
+	// +kubebuilder:validation:MaxLength=40
+	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9]*(-[a-z0-9]+)*$`
+	Name string `json:"name"`
+
+	// Suspended suspends the tenant.
+	// +optional
+	Suspended bool `json:"suspended,omitempty"`
+
+	// DeletionPolicy is what removing the tenant does to its data: Retain or Delete (the
+	// platform's default applies when unset).
+	// +kubebuilder:validation:Enum=Retain;Delete
+	// +optional
+	DeletionPolicy string `json:"deletionPolicy,omitempty"`
+
+	// Runtime sizes the tenant's hosts.
+	// +optional
+	Runtime *TenantRuntime `json:"runtime,omitempty"`
+
+	// Resources are the tenant's quotas.
+	// +optional
+	Resources *TenantResources `json:"resources,omitempty"`
+}
+
+// TenantRuntime is a tenant's `runtime`.
+type TenantRuntime struct {
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Replicas *int32 `json:"replicas,omitempty"`
+	// CoreInstances is WASH_CORE_INSTANCES for the tenant host (platform default 100).
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10000
+	// +optional
+	CoreInstances *int32 `json:"coreInstances,omitempty"`
+}
+
+// TenantResources is a tenant's `resources`.
+type TenantResources struct {
+	// +kubebuilder:validation:MaxLength=32
+	// +optional
+	CPU string `json:"cpu,omitempty"`
+	// +kubebuilder:validation:MaxLength=32
+	// +optional
+	Memory string `json:"memory,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Workloads *int32 `json:"workloads,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	BackingServices *int32 `json:"backingServices,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	ServiceBindings *int32 `json:"serviceBindings,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	APIKeys *int32 `json:"apiKeys,omitempty"`
+}
+
+// User is one entry of the platform's `users` config.
+type User struct {
+	// Name is 1-40 lowercase letters, digits and hyphens, starting with a letter.
+	// +kubebuilder:validation:MaxLength=40
+	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9]*(-[a-z0-9]+)*$`
+	Name string `json:"name"`
+
+	// Suspended blocks the user's access.
+	// +optional
+	Suspended bool `json:"suspended,omitempty"`
+
+	// Memberships are the tenants the user belongs to, one entry per tenant.
+	// +listType=map
+	// +listMapKey=tenant
+	// +kubebuilder:validation:MaxItems=32
+	Memberships []Membership `json:"memberships"`
+}
+
+// MembershipRole is a user's role in a tenant.
+// +kubebuilder:validation:Enum=developer;viewer
+type MembershipRole string
+
+// Membership puts a user in a tenant.
+type Membership struct {
+	// Tenant names an entry of spec.platform.tenants.
+	// +kubebuilder:validation:MaxLength=40
+	Tenant string         `json:"tenant"`
+	Role   MembershipRole `json:"role"`
+}
+
+// TenantAuth is the platform's `tenantAuth` config, with the OAuth client secret read from a
+// Secret instead of inline. The operator copies the secret into the target's platform namespace
+// and points tenantAuth.oauthClient.secretName at the copy.
+// +kubebuilder:validation:XValidation:rule="has(self.issuer) && has(self.clientId) && has(self.clientSecretRef)",message="tenantAuth needs issuer, clientId and clientSecretRef together"
+type TenantAuth struct {
+	// Image is the tenant-auth image, pinned by digest (<repository>@sha256:<digest>).
+	// +kubebuilder:validation:Pattern=`^[^@\s]+@sha256:[0-9a-f]{64}$`
+	// +kubebuilder:validation:MaxLength=512
+	Image string `json:"image"`
+
+	// Issuer is the OIDC issuer URL, as both pods and browsers name it.
+	// +kubebuilder:validation:Pattern=`^https?://`
+	// +kubebuilder:validation:MaxLength=2048
+	// +optional
+	Issuer string `json:"issuer,omitempty"`
+
+	// ClientID is the console's confidential OAuth client (oauthClient.id).
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	ClientID string `json:"clientId,omitempty"`
+
+	// ClientSecretRef names the Secret, in the PlatformInstance's namespace, and its key that
+	// hold the OAuth client secret.
+	// +optional
+	ClientSecretRef *SecretKeyReference `json:"clientSecretRef,omitempty"`
+
+	// IssuerUpstream is the in-cluster <service>.<namespace>[.svc...]:<port> a sidecar forwards a
+	// loopback issuer's port to.
+	// +kubebuilder:validation:MaxLength=512
+	// +optional
+	IssuerUpstream string `json:"issuerUpstream,omitempty"`
+
+	// IssuerUpstreamPodPort is the pod port behind issuerUpstream.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +optional
+	IssuerUpstreamPodPort int32 `json:"issuerUpstreamPodPort,omitempty"`
+
+	// IssuerIP is the issuer's IPv4 when pods cannot resolve its hostname.
+	// +kubebuilder:validation:MaxLength=15
+	// +optional
+	IssuerIP string `json:"issuerIp,omitempty"`
+
+	// ConsolePublicURL is the browser-visible console URL; {tenant} is replaced.
+	// +kubebuilder:validation:Pattern=`^https?://`
+	// +kubebuilder:validation:MaxLength=2048
+	// +optional
+	ConsolePublicURL string `json:"consolePublicUrl,omitempty"`
+
+	// ControllerPublicURL is the controller URL shown to users and CLIs; {tenant} is replaced.
+	// +kubebuilder:validation:Pattern=`^https?://`
+	// +kubebuilder:validation:MaxLength=2048
+	// +optional
+	ControllerPublicURL string `json:"controllerPublicUrl,omitempty"`
+
+	// Registry deploys each tenant's own OCI registry.
+	// +optional
+	Registry *TenantRegistry `json:"registry,omitempty"`
+}
+
+// SecretKeyReference names a key of a Secret in the PlatformInstance's namespace.
+type SecretKeyReference struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Key string `json:"key"`
+}
+
+// TenantRegistry is tenantAuth.registry.
+type TenantRegistry struct {
+	// Component is the oci-registry component, pinned by digest.
+	// +kubebuilder:validation:Pattern=`^[^@\s]+@sha256:[0-9a-f]{64}$`
+	// +kubebuilder:validation:MaxLength=512
+	Component string `json:"component"`
+
+	// PublicURL is the registry origin users log in to; {tenant} is replaced.
+	// +kubebuilder:validation:Pattern=`^https?://`
+	// +kubebuilder:validation:MaxLength=2048
+	// +optional
+	PublicURL string `json:"publicUrl,omitempty"`
+
+	// Limits bound the controller's registry front.
+	// +optional
+	Limits *TenantRegistryLimits `json:"limits,omitempty"`
+}
+
+// TenantRegistryLimits are tenantAuth.registry.limits; each a positive integer.
+type TenantRegistryLimits struct {
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxBodyBytes *int64 `json:"maxBodyBytes,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	UpstreamTimeoutMs *int64 `json:"upstreamTimeoutMs,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxConcurrent *int64 `json:"maxConcurrent,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	UploadIdleTimeoutMs *int64 `json:"uploadIdleTimeoutMs,omitempty"`
 }
 
 // GatewaySettings configures the platform HTTP gateway.
@@ -130,7 +361,14 @@ const (
 	ConditionInstalled = "Installed"
 	// ConditionReady is True when the instance is usable at spec.version.
 	ConditionReady = "Ready"
+	// ConditionConfigApplied is True once an install applied the spec's platform settings
+	// (tenants, users, tenantAuth, tenant host image) of the generation status.applied names.
+	ConditionConfigApplied = "ConfigApplied"
 )
+
+// ReasonTenantAuthSecret (on Installed) reports that spec.platform.tenantAuth.clientSecretRef
+// names a Secret or key that can't be read. The operator doesn't install until it can.
+const ReasonTenantAuthSecret = "TenantAuthSecretUnavailable"
 
 // ReasonStorageCleanupFailed (on Installed) reports that removing the default storageRoot after a
 // Delete failed. The finalizer stays until a retry succeeds, the instance is annotated with
@@ -168,6 +406,10 @@ type PlatformInstanceStatus struct {
 	// +optional
 	KubeconfigSecretRef *SecretReference `json:"kubeconfigSecretRef,omitempty"`
 
+	// Applied summarizes the platform settings the last successful install applied.
+	// +optional
+	Applied *AppliedConfig `json:"applied,omitempty"`
+
 	// LastRepair is when the last periodic refresh and up finished.
 	// +optional
 	LastRepair *metav1.Time `json:"lastRepair,omitempty"`
@@ -185,6 +427,22 @@ type Endpoints struct {
 	Kubernetes string `json:"kubernetes,omitempty"`
 	// +optional
 	HTTP string `json:"http,omitempty"`
+}
+
+// AppliedConfig is what the last successful install applied.
+type AppliedConfig struct {
+	// Generation is the metadata.generation whose settings were applied.
+	Generation int64 `json:"generation"`
+	// Tenants is the number of applied tenants.
+	Tenants int32 `json:"tenants"`
+	// Users is the number of applied users.
+	Users int32 `json:"users"`
+	// TenantAuthIssuer is the applied tenantAuth issuer; empty without tenantAuth.
+	// +optional
+	TenantAuthIssuer string `json:"tenantAuthIssuer,omitempty"`
+	// TenantHostImage is the applied tenant host image.
+	// +optional
+	TenantHostImage string `json:"tenantHostImage,omitempty"`
 }
 
 // SecretReference names a Secret in the PlatformInstance's namespace.

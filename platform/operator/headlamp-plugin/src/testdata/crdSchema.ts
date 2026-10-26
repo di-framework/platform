@@ -114,11 +114,45 @@ export const EMULATED_CEL_RULES: readonly string[] = [
   'self.metadata.name.size() <= 63',
   'self.target == oldSelf.target',
   'has(self.platform) && has(self.platform.storageRoot) ? has(oldSelf.platform) && has(oldSelf.platform.storageRoot) && oldSelf.platform.storageRoot == self.platform.storageRoot : !(has(oldSelf.platform) && has(oldSelf.platform.storageRoot))',
+  'has(self.platform) && has(self.platform.tenantHostImage) ? has(oldSelf.platform) && has(oldSelf.platform.tenantHostImage) && oldSelf.platform.tenantHostImage == self.platform.tenantHostImage : !(has(oldSelf.platform) && has(oldSelf.platform.tenantHostImage))',
+  '!has(self.users) || self.users.all(u, u.memberships.all(m, has(self.tenants) && self.tenants.exists(t, t.name == m.tenant)))',
+  'has(self.issuer) && has(self.clientId) && has(self.clientSecretRef)',
 ];
 
 interface CelSubject {
   metadata: { name: string };
-  spec: { target: unknown; platform?: { storageRoot?: string } };
+  spec: {
+    target: unknown;
+    platform?: {
+      storageRoot?: string;
+      tenantHostImage?: string;
+      tenants?: { name: string }[];
+      users?: { memberships: { tenant: string }[] }[];
+      tenantAuth?: { issuer?: string; clientId?: string; clientSecretRef?: unknown };
+    };
+  };
+}
+
+/** The tenancy rules (#442): memberships name tenants; tenantAuth's issuer, client and secret go together. */
+function tenancyErrors(obj: CelSubject): string[] {
+  const errors: string[] = [];
+  const p = obj.spec.platform;
+  const tenants = new Set((p?.tenants ?? []).map((t) => t.name));
+  if ((p?.users ?? []).some((u) => u.memberships.some((m) => !tenants.has(m.tenant)))) {
+    errors.push('every users[].memberships[].tenant must name an entry of tenants');
+  }
+  const auth = p?.tenantAuth;
+  if (
+    auth &&
+    !(
+      auth.issuer !== undefined &&
+      auth.clientId !== undefined &&
+      auth.clientSecretRef !== undefined
+    )
+  ) {
+    errors.push('tenantAuth needs issuer, clientId and clientSecretRef together');
+  }
+  return errors;
 }
 
 /**
@@ -127,7 +161,7 @@ interface CelSubject {
  * added later").
  */
 export function celErrors(obj: CelSubject, old?: CelSubject): string[] {
-  const errors: string[] = [];
+  const errors: string[] = tenancyErrors(obj);
   if (obj.metadata.name.length > MAX_NAME_LENGTH) {
     errors.push('name must be at most 63 characters');
   }
@@ -141,6 +175,15 @@ export function celErrors(obj: CelSubject, old?: CelSubject): string[] {
       : !has(old);
     if (!ok) {
       errors.push('platform.storageRoot is immutable');
+    }
+    const hasImage = (o: CelSubject) => o.spec.platform?.tenantHostImage !== undefined;
+    const imageOk = hasImage(obj)
+      ? hasImage(old) && old.spec.platform?.tenantHostImage === obj.spec.platform?.tenantHostImage
+      : !hasImage(old);
+    if (!imageOk) {
+      errors.push(
+        "platform.tenantHostImage is immutable in v1alpha1: it is fixed at creation (empty uses the operator's pinned exclusive host image)",
+      );
     }
   }
   return errors;

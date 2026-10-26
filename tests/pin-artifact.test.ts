@@ -13,6 +13,7 @@ import {
   HOST_VARIANTS,
   NATS_CREDENTIALS_SOURCE,
   OPERATOR_CHART_VALUES,
+  OPERATOR_TENANT_HOST_SOURCE,
   parseHostVariants,
   parsePairs,
   pinArtifact,
@@ -175,6 +176,24 @@ describe('pinArtifact against the repository files', () => {
     expect(readme).toContain(`\`${defaultHostImage(before)}\``);
   });
 
+  test("the exclusive host pin moves the operator's DefaultTenantHostImage, and nothing else does (#442)", () => {
+    const root = copyTargets();
+    const read = () => readFileSync(join(root, OPERATOR_TENANT_HOST_SOURCE), 'utf8');
+    const line = (text: string) =>
+      text.split('\n').find((l) => l.startsWith('const DefaultTenantHostImage = '));
+    expect(line(read())).toMatch(
+      /^const DefaultTenantHostImage = "ghcr\.io\/di-framework\/wash:2\.8\.0-wasi-tls-exclusive@sha256:[0-9a-f]{64}"$/,
+    );
+    pinArtifact(root, 'wash-wasi-tls', DIGEST);
+    expect(read()).not.toContain(DIGEST);
+    expect(pinArtifact(root, 'wash-wasi-tls-exclusive', DIGEST)).toContain(
+      OPERATOR_TENANT_HOST_SOURCE,
+    );
+    expect(line(read())).toBe(
+      `const DefaultTenantHostImage = "ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@${DIGEST}"`,
+    );
+  });
+
   test.each(['wash-wasi-tls', 'wash-wasi-tls-exclusive'])(
     '%s: a 0003 variant appends to the NATS credentials allowlist, keeping older entries',
     (name) => {
@@ -205,7 +224,7 @@ describe('pinArtifact against the repository files', () => {
     expect(table).not.toMatch(/exclusive.*0003/);
     writeFileSync(join(root, HOST_VARIANTS), table);
     const changed = pinArtifact(root, 'wash-wasi-tls-exclusive', DIGEST);
-    expect(changed).toEqual(['platform/tenant-host/README.md']);
+    expect(changed).toEqual(['platform/tenant-host/README.md', OPERATOR_TENANT_HOST_SOURCE]);
     expect(readFileSync(join(root, NATS_CREDENTIALS_SOURCE), 'utf8')).toBe(allow);
     writeFileSync(
       join(root, HOST_VARIANTS),
@@ -363,6 +382,7 @@ test('the CLI pins several artifacts in one edit', () => {
   expect(result.exitCode).toBe(0);
   expect(result.stdout.toString().trim().split('\n').sort()).toEqual(
     [
+      OPERATOR_TENANT_HOST_SOURCE,
       'platform/tenant-host/README.md',
       NATS_CREDENTIALS_SOURCE,
       DEFAULT_HOST_SOURCE,
@@ -522,6 +542,7 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
         DEFAULT_HOST_SOURCE,
         NATS_CREDENTIALS_SOURCE,
         'platform/tenant-host/README.md',
+        OPERATOR_TENANT_HOST_SOURCE,
       ].sort(),
     );
     const gh = readFileSync(join(box.base, 'gh.log'), 'utf8');

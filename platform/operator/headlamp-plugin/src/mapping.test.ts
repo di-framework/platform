@@ -27,7 +27,7 @@ import {
   loadCrd,
   schemaErrors,
 } from './testdata/crdSchema';
-import { endpointOnly, full, minimal } from './testdata/fixtures';
+import { endpointOnly, full, minimal, tenancy } from './testdata/fixtures';
 import { API_VERSION, KIND, PLURAL, type PlatformInstanceObject } from './types';
 
 const fixtures = { minimal, full, endpointOnly };
@@ -374,6 +374,46 @@ describe('edit', () => {
 describe('the CEL emulation matches the CRD (S1)', () => {
   it('implements exactly the rules the CRD declares', () => {
     expect([...crdCelRules()].sort()).toStrictEqual([...EMULATED_CEL_RULES].sort());
+  });
+
+  // The tenancy settings (#442) have no form fields yet; the manifest must still validate.
+  type Subject = Parameters<typeof celErrors>[0];
+  const tenancySubject = () => structuredClone(tenancy) as unknown as Subject;
+
+  it('accepts the tenancy fixture against the schema and the CEL rules', () => {
+    expect(schemaErrors(tenancy)).toEqual([]);
+    expect(celErrors(tenancySubject())).toEqual([]);
+    expect(celErrors(tenancySubject(), tenancySubject())).toEqual([]);
+  });
+
+  it('rejects a membership of no tenant, and a partial tenantAuth', () => {
+    const orphan = tenancySubject();
+    orphan.spec.platform = { ...orphan.spec.platform, tenants: undefined };
+    expect(celErrors(orphan)).toEqual([
+      'every users[].memberships[].tenant must name an entry of tenants',
+    ]);
+    const partial = tenancySubject();
+    delete partial.spec.platform?.tenantAuth?.clientSecretRef;
+    expect(celErrors(partial)).toEqual([
+      'tenantAuth needs issuer, clientId and clientSecretRef together',
+    ]);
+  });
+
+  it('keeps tenantHostImage fixed after creation', () => {
+    const changed = tenancySubject();
+    changed.spec.platform = { ...changed.spec.platform, tenantHostImage: 'localhost/wash:dev' };
+    const unset = tenancySubject();
+    delete unset.spec.platform?.tenantHostImage;
+    for (const [obj, old] of [
+      [changed, tenancySubject()],
+      [unset, tenancySubject()],
+      [tenancySubject(), unset],
+    ] as const) {
+      expect(celErrors(obj, old)).toEqual([
+        "platform.tenantHostImage is immutable in v1alpha1: it is fixed at creation (empty uses the operator's pinned exclusive host image)",
+      ]);
+    }
+    expect(celErrors(unset, unset)).toEqual([]);
   });
 });
 
