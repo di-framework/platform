@@ -10,7 +10,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -70,6 +72,9 @@ type Releaser interface {
 	Get(ctx context.Context, namespace, name string) (*Release, error)
 	// Install installs the chart archive as name in the existing namespace.
 	Install(ctx context.Context, namespace, name string, chart []byte, values map[string]any) error
+	// Upgrade re-applies the chart archive to the release with the values it was installed
+	// with, which recreates any of its objects that are missing and leaves the rest unchanged.
+	Upgrade(ctx context.Context, namespace, name string, chart []byte) error
 	// Uninstall removes the release; a missing release is not an error.
 	Uninstall(ctx context.Context, namespace, name string) error
 }
@@ -88,12 +93,26 @@ type Target struct {
 	// OperatorNamespace is the operator's own namespace, which the host-namespace
 	// NetworkPolicies admit to the vCluster API.
 	OperatorNamespace string
+	// Dial checks that the vCluster API answers at address (host:port); nil opens a TCP
+	// connection with a 5 second timeout.
+	Dial func(ctx context.Context, address string) error
+}
+
+// releaseObjects are the vCluster release's host-namespace objects Ensure checks on every round.
+// Helm creates them all before the install returns, so a missing one was deleted.
+func releaseObjects(ns string) []client.Object {
+	return []client.Object{
+		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: ReleaseName}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: ReleaseName}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: ReleaseName + "-headless"}},
+	}
 }
 
 var _ targets.Target = (*Target)(nil)
 
 // Ensure puts the host-namespace NetworkPolicies in place (every round, so a deleted or edited
-// one comes back), installs the vCluster once and reports it ready when its control plane is ready and
+// one comes back), re-applies the release when one of its host-namespace objects is missing
+// (#453), reports the vCluster API unreachable when it doesn't answer, installs the vCluster once and reports it ready when its control plane is ready and
 // its kubeconfig Secret exists. Values are applied at creation only (see InstanceValues). A
 // release left failed or pending (an install that errored or was interrupted) is removed so the
 // next round installs it again. That is reported as an error, so an install that fails the same
@@ -131,10 +150,30 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 		return targets.State{}, fmt.Errorf("%w: vcluster release was %s (%s); removed it to install again", ErrReinstalling, rel.Status, rel.Description)
 	}
 
-	var sts appsv1.StatefulSet
-	if err := t.Client.Get(ctx, types.NamespacedName{Namespace: ns, Name: ReleaseName}, &sts); apierrors.IsNotFound(err) {
-		return targets.State{Reason: "ControlPlanePending", Message: "vcluster StatefulSet not created yet"}, nil
-	} else if err != nil {
+	var missing []string
+	for _, obj := range releaseObjects(ns) {
+		if err := t.Client.Get(ctx, client.ObjectKeyFromObject(obj), obj); apierrors.IsNotFound(err) {
+			kind := "service"
+			if _, ok := obj.(*appsv1.StatefulSet); ok {
+				kind = "statefulset"
+			}
+			missing = append(missing, kind+"/"+obj.GetName())
+		} else if err != nil {
+			return targets.State{}, err
+		}
+	}
+	if len(missing) > 0 {
+		chart, err := Chart()
+		if err != nil {
+			return targets.State{}, err
+		}
+		if err := t.Helm.Upgrade(ctx, ns, ReleaseName, chart); err != nil {
+			return targets.State{}, fmt.Errorf("re-apply vcluster release to recreate %s: %w", strings.Join(missing, ", "), err)
+		}
+		return targets.State{Reason: "Repairing", Message: fmt.Sprintf("re-applied the vcluster release in namespace %s to recreate %s", ns, strings.Join(missing, ", "))}, nil
+	}
+	sts := releaseObjects(ns)[0].(*appsv1.StatefulSet)
+	if err := t.Client.Get(ctx, client.ObjectKeyFromObject(sts), sts); err != nil {
 		return targets.State{}, err
 	}
 	if sts.Status.ReadyReplicas < 1 {
@@ -151,12 +190,28 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 	if len(raw) == 0 {
 		return targets.State{Reason: "KubeconfigPending", Message: "vcluster kubeconfig Secret has no config key"}, nil
 	}
-	server := fmt.Sprintf("https://%s.%s.svc:443", ReleaseName, ns)
+	address := fmt.Sprintf("%s.%s.svc:443", ReleaseName, ns)
+	server := "https://" + address
 	kubeconfig, err := withServer(raw, server)
 	if err != nil {
 		return targets.State{}, fmt.Errorf("vcluster kubeconfig: %w", err)
 	}
+	if err := t.dial(ctx, address); err != nil {
+		return targets.State{Reason: "TargetUnreachable", Message: fmt.Sprintf("vcluster API %s (service %s/%s) is unreachable: %v", server, ns, ReleaseName, err)}, nil
+	}
 	return targets.State{Ready: true, Kubeconfig: kubeconfig, Server: server}, nil
+}
+
+func (t *Target) dial(ctx context.Context, address string) error {
+	if t.Dial != nil {
+		return t.Dial(ctx, address)
+	}
+	d := net.Dialer{Timeout: 5 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
 }
 
 func (t *Target) values(ctx context.Context, inst *v1alpha1.PlatformInstance) (map[string]any, error) {

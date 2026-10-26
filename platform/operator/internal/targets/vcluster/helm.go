@@ -78,6 +78,29 @@ func (h *Helm) Install(ctx context.Context, namespace, name string, chart []byte
 	return err
 }
 
+// releaseHistory caps the revisions an Upgrade keeps, so repeated repairs don't pile up release
+// Secrets.
+const releaseHistory = 5
+
+// Upgrade re-applies chart to the release with the values it was installed with. Helm's
+// three-way merge creates objects missing from the cluster and leaves unchanged ones alone.
+func (h *Helm) Upgrade(ctx context.Context, namespace, name string, chart []byte) error {
+	cfg, err := h.configuration(namespace)
+	if err != nil {
+		return err
+	}
+	ch, err := loader.LoadArchive(bytes.NewReader(chart))
+	if err != nil {
+		return fmt.Errorf("load chart: %w", err)
+	}
+	upgrade := action.NewUpgrade(cfg)
+	upgrade.Namespace = namespace
+	upgrade.ReuseValues = true
+	upgrade.MaxHistory = releaseHistory
+	_, err = upgrade.RunWithContext(ctx, name, ch, nil)
+	return err
+}
+
 // Uninstall removes the release; a missing release is not an error.
 func (h *Helm) Uninstall(_ context.Context, namespace, name string) error {
 	cfg, err := h.configuration(namespace)

@@ -37,7 +37,12 @@ kubeconfig is in the Secret named by `status.kubeconfigSecretRef` (`<name>-kubec
    chart (0.37.3), then waits for its control plane and kubeconfig Secret. A release left `failed` or
    `pending-install` (an install that errored or was interrupted) is removed and installed again, with
    backoff, so an install that fails every time doesn't cycle every poll. The
-   kubeconfig is rewritten to the in-cluster Service address and stored in the instance's Secret.
+   kubeconfig is rewritten to the in-cluster Service address and stored in the instance's Secret. Every
+   reconcile (a poll, a repair) checks the release's host-namespace objects (`statefulset/vcluster`,
+   `service/vcluster`, `service/vcluster-headless`): when one is missing it re-applies the release with the
+   values it was installed with (`helm upgrade` reusing them), which recreates it and leaves the rest
+   unchanged. An intact release is not re-applied. The vCluster's data PVC belongs to the StatefulSet, which
+   recreates it with its pod; the kubeconfig Secrets are rewritten every round.
 3. **Install.** On first install, a version change, any spec change or a retry after a failed install (which
    refreshes first), it writes a Pulumi project for the
    instance (`package.json` pinning `@di-framework/platform@<version>`, an `index.ts` re-exporting the
@@ -57,7 +62,10 @@ kubeconfig is in the Secret named by `status.kubeconfigSecretRef` (`<name>-kubec
 characters.
 
 Status carries `phase` (`Provisioning`, `Installing`, `Ready`, `Failed`, `Deleting`) and the `TargetReady`,
-`Installed` and `Ready` conditions, each with a readable reason and message.
+`Installed` and `Ready` conditions, each with a readable reason and message. While the target isn't ready,
+`TargetReady` is `False` with `ControlPlanePending` (the vCluster StatefulSet isn't ready), `Repairing` (a
+missing release object is being recreated), `KubeconfigPending` (vCluster's kubeconfig Secret doesn't exist
+yet) or `TargetUnreachable` (the Secret exists but the vCluster API, named in the message, doesn't answer).
 
 ### Tenant data after Delete
 

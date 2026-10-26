@@ -3,6 +3,7 @@ package vcluster
 import (
 	"context"
 	"errors"
+	"net"
 	"strings"
 	"testing"
 
@@ -23,6 +24,8 @@ type fakeHelm struct {
 	installed   map[string]map[string]any // namespace -> values
 	status      map[string]string         // namespace -> release status; unset is deployed
 	uninstalled []string
+	upgraded    []string
+	upgradeErr  error
 }
 
 func (f *fakeHelm) Get(_ context.Context, ns, _ string) (*Release, error) {
@@ -40,6 +43,13 @@ func (f *fakeHelm) Install(_ context.Context, ns, name string, chart []byte, val
 	}
 	f.installed[ns] = values
 	return nil
+}
+func (f *fakeHelm) Upgrade(_ context.Context, ns, name string, chart []byte) error {
+	if name != ReleaseName || len(chart) == 0 {
+		panic("unexpected upgrade")
+	}
+	f.upgraded = append(f.upgraded, ns)
+	return f.upgradeErr
 }
 func (f *fakeHelm) Uninstall(_ context.Context, ns, _ string) error {
 	f.uninstalled = append(f.uninstalled, ns)
@@ -87,28 +97,40 @@ func TestChartDigest(t *testing.T) {
 	}
 }
 
+// createReleaseObjects stands in for Helm, which creates the release's objects before Install
+// returns.
+func createReleaseObjects(t *testing.T, c client.Client, ns string) *appsv1.StatefulSet {
+	t.Helper()
+	for _, obj := range releaseObjects(ns) {
+		if err := c.Create(context.Background(), obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sts := &appsv1.StatefulSet{}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: ReleaseName}, sts); err != nil {
+		t.Fatal(err)
+	}
+	return sts
+}
+
+func answers(context.Context, string) error { return nil }
+
 func TestEnsure(t *testing.T) {
 	inst := instance("team-a", "one")
 	ns := HostNamespace(inst)
 	helm := &fakeHelm{installed: map[string]map[string]any{}}
 	c := newClient(t)
+	var dialed string
 	tg := &Target{Client: c, Helm: helm, OperatorNamespace: operatorNS, Values: func(_ context.Context, i *v1alpha1.PlatformInstance) (map[string]any, error) {
 		return map[string]any{"marker": i.Name}, nil
-	}}
+	}, Dial: func(_ context.Context, address string) error { dialed = address; return nil }}
 	ctx := context.Background()
 
 	st, err := tg.Ensure(ctx, inst)
 	if err != nil || st.Ready || st.Reason != "Creating" || helm.installed[ns]["marker"] != "one" {
 		t.Fatalf("first Ensure: %+v %v (installed %v)", st, err, helm.installed)
 	}
-	if st, _ = tg.Ensure(ctx, inst); st.Reason != "ControlPlanePending" {
-		t.Fatalf("no StatefulSet yet: %+v", st)
-	}
-
-	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: ReleaseName}}
-	if err := c.Create(ctx, sts); err != nil {
-		t.Fatal(err)
-	}
+	sts := createReleaseObjects(t, c, ns)
 	if st, _ = tg.Ensure(ctx, inst); st.Reason != "ControlPlanePending" {
 		t.Fatalf("StatefulSet not ready: %+v", st)
 	}
@@ -116,7 +138,7 @@ func TestEnsure(t *testing.T) {
 	if err := c.Status().Update(ctx, sts); err != nil {
 		t.Fatal(err)
 	}
-	if st, _ = tg.Ensure(ctx, inst); st.Reason != "KubeconfigPending" {
+	if st, _ = tg.Ensure(ctx, inst); st.Reason != "KubeconfigPending" || st.Message != "vcluster kubeconfig Secret not created yet" {
 		t.Fatalf("no Secret yet: %+v", st)
 	}
 
@@ -133,15 +155,107 @@ func TestEnsure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Server != want || cfg.Clusters["my-vcluster"].Server != want {
-		t.Fatalf("server %q / %q, want %q", st.Server, cfg.Clusters["my-vcluster"].Server, want)
+	if st.Server != want || cfg.Clusters["my-vcluster"].Server != want || dialed != "vcluster."+ns+".svc:443" {
+		t.Fatalf("server %q / %q (dialed %q), want %q", st.Server, cfg.Clusters["my-vcluster"].Server, dialed, want)
 	}
-	if len(helm.installed) != 1 {
-		t.Fatalf("installed more than once: %v", helm.installed)
+	if len(helm.installed) != 1 || len(helm.upgraded) != 0 {
+		t.Fatalf("installed more than once or upgraded: %v %v", helm.installed, helm.upgraded)
 	}
 	var namespace corev1.Namespace
 	if err := c.Get(ctx, client.ObjectKey{Name: ns}, &namespace); err != nil || namespace.Annotations[OwnerAnnotation] != "team-a/one" {
 		t.Fatalf("host namespace not annotated with its owner: %v %v", namespace.Annotations, err)
+	}
+}
+
+// readyInstance is an installed instance whose release objects and kubeconfig Secret exist.
+func readyInstance(t *testing.T) (*Target, *fakeHelm, *v1alpha1.PlatformInstance, *appsv1.StatefulSet) {
+	t.Helper()
+	inst := instance("team-a", "one")
+	ns := HostNamespace(inst)
+	helm := &fakeHelm{installed: map[string]map[string]any{ns: {}}}
+	c := newClient(t, ownedNamespace(inst), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "vc-" + ReleaseName}, Data: map[string][]byte{"config": []byte(vclusterKubeconfig)}})
+	sts := createReleaseObjects(t, c, ns)
+	sts.Status.ReadyReplicas = 1
+	if err := c.Status().Update(context.Background(), sts); err != nil {
+		t.Fatal(err)
+	}
+	return &Target{Client: c, Helm: helm, OperatorNamespace: operatorNS, Dial: answers}, helm, inst, sts
+}
+
+// A hand-deleted release object (Layer 4 deleted service/vcluster) is recreated by re-applying
+// the release; an intact release is not touched (#453).
+func TestEnsureReappliesTheReleaseWhenAnObjectIsMissing(t *testing.T) {
+	tg, helm, inst, sts := readyInstance(t)
+	ns := HostNamespace(inst)
+	ctx := context.Background()
+	if st, err := tg.Ensure(ctx, inst); err != nil || !st.Ready || len(helm.upgraded) != 0 {
+		t.Fatalf("intact release: %+v %v (upgraded %v)", st, err, helm.upgraded)
+	}
+	var after appsv1.StatefulSet
+	if err := tg.Client.Get(ctx, client.ObjectKeyFromObject(sts), &after); err != nil || after.ResourceVersion != sts.ResourceVersion {
+		t.Fatalf("StatefulSet touched: %s -> %s %v", sts.ResourceVersion, after.ResourceVersion, err)
+	}
+
+	for _, obj := range []client.Object{
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: ReleaseName}},
+		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: ReleaseName}},
+	} {
+		if err := tg.Client.Delete(ctx, obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := tg.Ensure(ctx, inst)
+	if err != nil || st.Ready || st.Reason != "Repairing" || len(helm.upgraded) != 1 || helm.upgraded[0] != ns ||
+		!strings.Contains(st.Message, "statefulset/vcluster, service/vcluster") {
+		t.Fatalf("missing objects: %+v %v (upgraded %v)", st, err, helm.upgraded)
+	}
+
+	helm.upgradeErr = errors.New("boom")
+	if _, err := tg.Ensure(ctx, inst); err == nil || !strings.Contains(err.Error(), "recreate statefulset/vcluster, service/vcluster: boom") {
+		t.Fatalf("failed upgrade: %v", err)
+	}
+}
+
+func TestEnsureReportsAReadErrorOnAReleaseObject(t *testing.T) {
+	tg, _, inst, _ := readyInstance(t)
+	tg.Client = interceptor.NewClient(tg.Client.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Service); ok {
+				return errors.New("read failed")
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	})
+	if _, err := tg.Ensure(context.Background(), inst); err == nil || err.Error() != "read failed" {
+		t.Fatalf("read error: %v", err)
+	}
+}
+
+// With the Secret in place but the API not answering, the reason says so and names the endpoint
+// instead of blaming the Secret (#453).
+func TestEnsureReportsAnUnreachableAPI(t *testing.T) {
+	tg, _, inst, _ := readyInstance(t)
+	tg.Dial = func(context.Context, string) error { return errors.New("connection refused") }
+	st, err := tg.Ensure(context.Background(), inst)
+	want := "vcluster API https://vcluster." + HostNamespace(inst) + ".svc:443 (service " + HostNamespace(inst) + "/vcluster) is unreachable: connection refused"
+	if err != nil || st.Ready || st.Reason != "TargetUnreachable" || st.Message != want {
+		t.Fatalf("unreachable API: %+v %v", st, err)
+	}
+}
+
+func TestDefaultDial(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	tg := &Target{}
+	if err := tg.dial(context.Background(), addr); err != nil {
+		t.Fatalf("dial a listener: %v", err)
+	}
+	l.Close()
+	if err := tg.dial(context.Background(), addr); err == nil {
+		t.Fatal("dial a closed port succeeded")
 	}
 }
 
