@@ -1,0 +1,19 @@
+version: 6.0.19
+name: di-framework-platform
+displayName: di-framework Platform Instances
+createdAt: "2026-10-26T17:22:11Z"
+description: Manage di-framework PlatformInstances from Headlamp.
+homeURL: https://github.com/di-framework/platform/blob/v6.0.19/platform/operator/headlamp-plugin/README.md
+license: MIT OR Apache-2.0
+keywords:
+  - headlamp
+  - kubernetes
+  - di-framework
+links:
+  - name: source
+    url: https://github.com/di-framework/platform/tree/v6.0.19/platform/operator/headlamp-plugin
+annotations:
+  headlamp/plugin/archive-url: https://github.com/di-framework/platform/releases/download/v6.0.19/di-framework-platform-6.0.19.tar.gz
+  headlamp/plugin/archive-checksum: sha256:0c2ea34810e5f40568d4d0f1436c9972b7cbb99417a809ab93c91fe3e20d9427
+  headlamp/plugin/version-compat: ">=0.46.0"
+  headlamp/plugin/distro-compat: in-cluster,web,app
