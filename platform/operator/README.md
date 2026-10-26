@@ -156,7 +156,7 @@ linux/arm64. `.github/workflows/platform-operator-image.yml` publishes it from m
 this reference to the new digest:
 
 ```text
-ghcr.io/di-framework/platform-operator@sha256:<pending first publish>
+ghcr.io/di-framework/platform-operator@sha256:8118d0397c414038dbcb7327dc9ca7ba569b6e62843c6df4127bc6fbd1ba80e5
 ```
 
 Each publish is also tagged with its commit SHA and `src-<hash>` (the hash of its inputs); only the digest is
