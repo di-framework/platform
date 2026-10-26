@@ -32,7 +32,7 @@ const REPO_URL = 'https://github.com/di-framework/platform';
 
 /** The plugin entry's `version:` line in configContent, anchored on its name and source lines. */
 const CHART_VERSION_LINE = new RegExp(
-  `^(\\s+- name: ${PLUGIN_NAME}\\n\\s+source: ${SOURCE.replaceAll('.', '\\.')}\\n\\s+version: )\\S+$`,
+  String.raw`^(\s+- name: ${PLUGIN_NAME}\n\s+source: ${SOURCE.replaceAll('.', String.raw`\.`)}\n\s+version: )\S+$`,
   'm',
 );
 
@@ -108,7 +108,7 @@ The platform operator's Helm chart installs it through Headlamp's plugin manager
 
 /** The archive checksum recorded in an artifacthub-pkg.yml, or undefined. */
 export function recordedSha256(yaml: string): string | undefined {
-  return /^\s*headlamp\/plugin\/archive-checksum: sha256:([0-9a-f]{64})\s*$/m.exec(yaml)?.[1];
+  return /^ *headlamp\/plugin\/archive-checksum: sha256:([0-9a-f]{64})$/m.exec(yaml)?.[1];
 }
 
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
@@ -129,7 +129,11 @@ export function writeEntry(root: string, version: string, createdAt: string): bo
         `${entryDir(version)} already records sha256:${recorded}, the tarball is sha256:${sha256}; a published version is not rewritten`,
       );
     }
-    return false;
+    // Same checksum: restore a missing README, change nothing else.
+    const readmePath = join(dir, 'README.md');
+    if (existsSync(readmePath)) return false;
+    writeFileSync(readmePath, readme(version));
+    return true;
   }
   mkdirSync(dir, { recursive: true });
   writeFileSync(pkgPath, pkgYaml(version, sha256, createdAt));

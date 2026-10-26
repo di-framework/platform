@@ -10,6 +10,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -201,6 +202,22 @@ describe('write', () => {
     expect(main(['write', '6.0.18', '--created-at', '2027-01-01T00:00:00Z'], root)).toBe(0);
     expect(read(join(root, entryDir('6.0.18'), 'artifacthub-pkg.yml'))).toBe(before);
     expect(logs).toEqual([`${entryDir('6.0.18')} is already up to date`]);
+  });
+
+  test('restores a missing README when the entry has the same checksum', () => {
+    const root = scratch();
+    pack(root, '6.0.18');
+    writeEntry(root, '6.0.18', AT);
+    const dir = join(root, entryDir('6.0.18'));
+    const pkgBefore = read(join(dir, 'artifacthub-pkg.yml'));
+    rmSync(join(dir, 'README.md'));
+    expect(writeEntry(root, '6.0.18', '2027-01-01T00:00:00Z')).toBe(true);
+    expect(read(join(dir, 'README.md'))).toContain('# di-framework Platform Instances 6.0.18');
+    expect(read(join(dir, 'artifacthub-pkg.yml'))).toBe(pkgBefore);
+    rmSync(join(dir, 'README.md'));
+    pack(root, '6.0.18', 'other bytes');
+    expect(() => writeEntry(root, '6.0.18', AT)).toThrow('a published version is not rewritten');
+    expect(existsSync(join(dir, 'README.md'))).toBe(false);
   });
 
   test('refuses to rewrite a published version with a different checksum', () => {
