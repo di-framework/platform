@@ -40,11 +40,11 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@kubernetes/client-node": "2.0.0",
+    "@kubernetes/client-node": "2.0.1",
     "@pulumi/command": "1.2.1",
     "@pulumi/kubernetes": "4.34.2",
-    "@pulumi/pulumi": "3.268.0",
-    "js-yaml": "5.4.3"
+    "@pulumi/pulumi": "3.272.0",
+    "js-yaml": "5.5.0"
   },
   "devDependencies": {
     "@marcbachmann/cel-js": "^8.0.0",
