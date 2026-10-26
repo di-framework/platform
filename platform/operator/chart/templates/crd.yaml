@@ -219,9 +219,12 @@ spec:
                       rule: has(self.issuer) && has(self.clientId) && has(self.clientSecretRef)
                   tenantHostImage:
                     description: |-
-                      TenantHostImage is the platform's `tenantHostImage`. Empty uses the operator's pinned
-                      exclusive host variant (ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive by digest), which
-                      the PGlite exclusive-PGDATA workloads need. Fixed at creation.
+                      TenantHostImage is the platform's `tenantHostImage`. A change is applied by the next install
+                      and restarts the tenant hosts. Empty keeps the image status.applied.tenantHostImage recorded;
+                      a new instance records the operator's pinned exclusive host variant
+                      (ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive by digest, which needs spec.version
+                      6.0.20 or later), and an instance installed before this field existed keeps the platform's
+                      own default.
                     maxLength: 512
                     pattern: ^[^\s@]+(@sha256:[0-9a-f]{64})?$
                     type: string
@@ -400,11 +403,6 @@ spec:
               rule: 'has(self.platform) && has(self.platform.storageRoot) ? has(oldSelf.platform)
                 && has(oldSelf.platform.storageRoot) && oldSelf.platform.storageRoot
                 == self.platform.storageRoot : !(has(oldSelf.platform) && has(oldSelf.platform.storageRoot))'
-            - message: 'platform.tenantHostImage is immutable in v1alpha1: it is fixed
-                at creation (empty uses the operator''s pinned exclusive host image)'
-              rule: 'has(self.platform) && has(self.platform.tenantHostImage) ? has(oldSelf.platform)
-                && has(oldSelf.platform.tenantHostImage) && oldSelf.platform.tenantHostImage
-                == self.platform.tenantHostImage : !(has(oldSelf.platform) && has(oldSelf.platform.tenantHostImage))'
           status:
             description: PlatformInstanceStatus is the observed state of an instance.
             properties:
@@ -422,7 +420,9 @@ spec:
                       empty without tenantAuth.
                     type: string
                   tenantHostImage:
-                    description: TenantHostImage is the applied tenant host image.
+                    description: |-
+                      TenantHostImage is the applied tenant host image; empty means the platform's own default.
+                      With spec.platform.tenantHostImage empty, later installs keep using it.
                     type: string
                   tenants:
                     description: Tenants is the number of applied tenants.

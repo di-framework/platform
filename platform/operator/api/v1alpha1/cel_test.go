@@ -112,14 +112,10 @@ func TestTenancyRules(t *testing.T) {
 			obj: strings.Replace(tenancy, "      issuer: http://stub-oidc.pg-stub-oidc.svc.cluster.local\n", "", 1), want: "tenantAuth needs issuer, clientId and clientSecretRef together",
 		},
 		"host image changed": {
-			obj: strings.Replace(tenancy, "localhost/wash:dev", "localhost/wash:other", 1), old: tenancy, want: "platform.tenantHostImage is immutable in v1alpha1",
+			obj: strings.Replace(tenancy, "localhost/wash:dev", "localhost/wash:other", 1), old: tenancy,
 		},
-		"host image added": {
-			obj: tenancy, old: strings.Replace(tenancy, "    tenantHostImage: localhost/wash:dev\n", "", 1), want: "platform.tenantHostImage is immutable in v1alpha1",
-		},
-		"host image removed": {
-			obj: strings.Replace(tenancy, "    tenantHostImage: localhost/wash:dev\n", "", 1), old: tenancy, want: "platform.tenantHostImage is immutable in v1alpha1",
-		},
+		"host image added":          {obj: tenancy, old: strings.Replace(tenancy, "    tenantHostImage: localhost/wash:dev\n", "", 1)},
+		"host image removed":        {obj: strings.Replace(tenancy, "    tenantHostImage: localhost/wash:dev\n", "", 1), old: tenancy},
 		"no host image either side": {obj: base, old: base},
 	} {
 		t.Run(name, func(t *testing.T) {

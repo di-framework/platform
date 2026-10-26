@@ -49,7 +49,6 @@ type NetworkPolicyEngine string
 // creation: the operator would otherwise lose track of the cluster and data it made.
 // +kubebuilder:validation:XValidation:rule="self.target == oldSelf.target",message="target is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.platform) && has(self.platform.storageRoot) ? has(oldSelf.platform) && has(oldSelf.platform.storageRoot) && oldSelf.platform.storageRoot == self.platform.storageRoot : !(has(oldSelf.platform) && has(oldSelf.platform.storageRoot))",message="platform.storageRoot is immutable"
-// +kubebuilder:validation:XValidation:rule="has(self.platform) && has(self.platform.tenantHostImage) ? has(oldSelf.platform) && has(oldSelf.platform.tenantHostImage) && oldSelf.platform.tenantHostImage == self.platform.tenantHostImage : !(has(oldSelf.platform) && has(oldSelf.platform.tenantHostImage))",message="platform.tenantHostImage is immutable in v1alpha1: it is fixed at creation (empty uses the operator's pinned exclusive host image)"
 type PlatformInstanceSpec struct {
 	// Version is the exact @di-framework/platform package version to install, for example 6.0.17.
 	// +kubebuilder:validation:Pattern=`^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$`
@@ -114,9 +113,12 @@ type PlatformSettings struct {
 	// +optional
 	TenantAuth *TenantAuth `json:"tenantAuth,omitempty"`
 
-	// TenantHostImage is the platform's `tenantHostImage`. Empty uses the operator's pinned
-	// exclusive host variant (ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive by digest), which
-	// the PGlite exclusive-PGDATA workloads need. Fixed at creation.
+	// TenantHostImage is the platform's `tenantHostImage`. A change is applied by the next install
+	// and restarts the tenant hosts. Empty keeps the image status.applied.tenantHostImage recorded;
+	// a new instance records the operator's pinned exclusive host variant
+	// (ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive by digest, which needs spec.version
+	// 6.0.20 or later), and an instance installed before this field existed keeps the platform's
+	// own default.
 	// +kubebuilder:validation:Pattern=`^[^\s@]+(@sha256:[0-9a-f]{64})?$`
 	// +kubebuilder:validation:MaxLength=512
 	// +optional
@@ -378,6 +380,11 @@ const (
 // names a Secret or key that can't be read. The operator doesn't install until it can.
 const ReasonTenantAuthSecret = "TenantAuthSecretUnavailable"
 
+// ReasonTenantHostImageUnsupported (on Installed) reports that an empty spec.platform.tenantHostImage
+// would use the operator's exclusive default host image with a spec.version that doesn't list it
+// as an approved build. Set the field, or a newer version.
+const ReasonTenantHostImageUnsupported = "TenantHostImageUnsupported"
+
 // ReasonStorageCleanupFailed (on Installed) reports that removing the default storageRoot after a
 // Delete failed. The finalizer stays until a retry succeeds, the instance is annotated with
 // AnnotationSkipStorageCleanup, or its deletionPolicy is set to Retain.
@@ -448,7 +455,8 @@ type AppliedConfig struct {
 	// TenantAuthIssuer is the applied tenantAuth issuer; empty without tenantAuth.
 	// +optional
 	TenantAuthIssuer string `json:"tenantAuthIssuer,omitempty"`
-	// TenantHostImage is the applied tenant host image.
+	// TenantHostImage is the applied tenant host image; empty means the platform's own default.
+	// With spec.platform.tenantHostImage empty, later installs keep using it.
 	// +optional
 	TenantHostImage string `json:"tenantHostImage,omitempty"`
 }

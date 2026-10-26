@@ -399,21 +399,22 @@ describe('the CEL emulation matches the CRD (S1)', () => {
     ]);
   });
 
-  it('keeps tenantHostImage fixed after creation', () => {
-    const changed = tenancySubject();
-    changed.spec.platform = { ...changed.spec.platform, tenantHostImage: 'localhost/wash:dev' };
-    const unset = tenancySubject();
-    delete unset.spec.platform?.tenantHostImage;
-    for (const [obj, old] of [
-      [changed, tenancySubject()],
-      [unset, tenancySubject()],
-      [tenancySubject(), unset],
-    ] as const) {
-      expect(celErrors(obj, old)).toEqual([
-        "platform.tenantHostImage is immutable in v1alpha1: it is fixed at creation (empty uses the operator's pinned exclusive host image)",
-      ]);
-    }
-    expect(celErrors(unset, unset)).toEqual([]);
+  it('lets tenantHostImage change after creation', () => {
+    expect(EMULATED_CEL_RULES.some((rule) => rule.includes('tenantHostImage'))).toBe(false);
+    const changed = structuredClone(tenancy);
+    // The form has no tenancy fields, so PlatformSettings doesn't declare tenantHostImage.
+    Object.assign(changed.spec.platform ?? {}, { tenantHostImage: 'localhost/wash:dev' });
+    expect(schemaErrors(changed)).toEqual([]);
+    expect(celErrors(changed as unknown as Subject, tenancySubject())).toEqual([]);
+  });
+
+  it('leaves tenants, users and tenantAuth untouched when the form edits an instance', () => {
+    const live = structuredClone(tenancy);
+    const form = { ...formFromObject(live), version: '6.0.21' };
+    const patch = editPatch(live, form);
+    expect(patch.map((op) => op.path)).toStrictEqual(['/spec/version', '/spec/version']);
+    const updated = applyPatch(live, patch);
+    expect(updated.spec).toStrictEqual({ ...tenancy.spec, version: '6.0.21' });
   });
 });
 

@@ -21,6 +21,7 @@ import (
 )
 
 const (
+	testHostImage = "localhost/wash:test"
 	testAuthImage = "ghcr.io/di-framework/tenant-auth@sha256:455af084f57e60a54b16b6f5c4f39fcafb0593612fb036e1b099b88423147a30"
 	testRegistry  = "ghcr.io/di-framework/oci-registry@sha256:" + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 )
@@ -48,6 +49,7 @@ func tenancyHarness(t *testing.T, withSecret bool) *harness {
 	h := newHarness(t, "")
 	inst := h.get()
 	inst.Spec.Platform = tenancySpec()
+	inst.Spec.Version = MinDefaultHostImageVersion
 	if err := h.c.Update(context.Background(), inst); err != nil {
 		t.Fatal(err)
 	}
@@ -170,6 +172,10 @@ func TestTenantAuthSecretUnavailable(t *testing.T) {
 			}
 			if inst.Status.Phase != v1alpha1.PhaseFailed {
 				t.Fatalf("phase %s", inst.Status.Phase)
+			}
+			if c := meta.FindStatusCondition(inst.Status.Conditions, v1alpha1.ConditionConfigApplied); c == nil ||
+				c.Status != metav1.ConditionFalse || c.Reason != v1alpha1.ReasonTenantAuthSecret {
+				t.Fatalf("ConfigApplied %+v", c)
 			}
 		})
 	}

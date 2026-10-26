@@ -114,7 +114,6 @@ export const EMULATED_CEL_RULES: readonly string[] = [
   'self.metadata.name.size() <= 63',
   'self.target == oldSelf.target',
   'has(self.platform) && has(self.platform.storageRoot) ? has(oldSelf.platform) && has(oldSelf.platform.storageRoot) && oldSelf.platform.storageRoot == self.platform.storageRoot : !(has(oldSelf.platform) && has(oldSelf.platform.storageRoot))',
-  'has(self.platform) && has(self.platform.tenantHostImage) ? has(oldSelf.platform) && has(oldSelf.platform.tenantHostImage) && oldSelf.platform.tenantHostImage == self.platform.tenantHostImage : !(has(oldSelf.platform) && has(oldSelf.platform.tenantHostImage))',
   '!has(self.users) || self.users.all(u, u.memberships.all(m, has(self.tenants) && self.tenants.exists(t, t.name == m.tenant)))',
   'has(self.issuer) && has(self.clientId) && has(self.clientSecretRef)',
 ];
@@ -125,7 +124,6 @@ interface CelSubject {
     target: unknown;
     platform?: {
       storageRoot?: string;
-      tenantHostImage?: string;
       tenants?: { name: string }[];
       users?: { memberships: { tenant: string }[] }[];
       tenantAuth?: { issuer?: string; clientId?: string; clientSecretRef?: unknown };
@@ -175,15 +173,6 @@ export function celErrors(obj: CelSubject, old?: CelSubject): string[] {
       : !has(old);
     if (!ok) {
       errors.push('platform.storageRoot is immutable');
-    }
-    const hasImage = (o: CelSubject) => o.spec.platform?.tenantHostImage !== undefined;
-    const imageOk = hasImage(obj)
-      ? hasImage(old) && old.spec.platform?.tenantHostImage === obj.spec.platform?.tenantHostImage
-      : !hasImage(old);
-    if (!imageOk) {
-      errors.push(
-        "platform.tenantHostImage is immutable in v1alpha1: it is fixed at creation (empty uses the operator's pinned exclusive host image)",
-      );
     }
   }
   return errors;
