@@ -10,7 +10,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
+	"sync"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -56,12 +59,18 @@ const OwnerAnnotation = "platform.di-framework.dev/instance"
 // next round installs again.
 var ErrReinstalling = errors.New("reinstalling vcluster")
 
+// ErrRolledBack reports that Ensure rolled back a failed or interrupted repair. It comes with a
+// RolledBack State, so a repair that fails every time backs off instead of cycling every poll.
+var ErrRolledBack = errors.New("rolled back vcluster release")
+
 // Release is what the target needs to know about an installed Helm release.
 type Release struct {
 	// Status is Helm's release status: deployed, failed, pending-install and so on.
 	Status string
 	// Description is Helm's note on the last operation, which carries the failure.
 	Description string
+	// Revision is the release's latest revision; 1 is the install.
+	Revision int
 }
 
 // Releaser is the Helm surface the target uses.
@@ -70,6 +79,11 @@ type Releaser interface {
 	Get(ctx context.Context, namespace, name string) (*Release, error)
 	// Install installs the chart archive as name in the existing namespace.
 	Install(ctx context.Context, namespace, name string, chart []byte, values map[string]any) error
+	// Repair re-applies the release with the chart and values it was installed with, which
+	// recreates any of its objects that are missing and leaves the rest unchanged.
+	Repair(ctx context.Context, namespace, name string) error
+	// Rollback rolls the release back to its last deployed revision and returns it.
+	Rollback(ctx context.Context, namespace, name string) (int, error)
 	// Uninstall removes the release; a missing release is not an error.
 	Uninstall(ctx context.Context, namespace, name string) error
 }
@@ -85,18 +99,55 @@ type Target struct {
 	// Values renders the chart values for an instance; nil uses InstanceValues with the host
 	// DNS Service's ClusterIP.
 	Values func(ctx context.Context, inst *v1alpha1.PlatformInstance) (map[string]any, error)
+	// OperatorNamespace is the operator's own namespace, which the host-namespace
+	// NetworkPolicies admit to the vCluster API.
+	OperatorNamespace string
+	// Dial checks that the vCluster API answers at address (host:port); nil opens a TCP
+	// connection with a 5 second timeout.
+	Dial func(ctx context.Context, address string) error
+
+	mu sync.Mutex
+	// failures counts consecutive failed API checks per host namespace.
+	failures map[string]int
+}
+
+// releaseObjects are the vCluster release's host-namespace objects Ensure checks on every round.
+// Helm creates them all before the install returns, so a missing one was deleted.
+func releaseObjects(ns string) []client.Object {
+	return []client.Object{
+		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: ReleaseName}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: ReleaseName}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: ReleaseName + "-headless"}},
+	}
 }
 
 var _ targets.Target = (*Target)(nil)
 
-// Ensure installs the vCluster once and reports it ready when its control plane is ready and
-// its kubeconfig Secret exists. Values are applied at creation only (see InstanceValues). A
-// release left failed or pending (an install that errored or was interrupted) is removed so the
-// next round installs it again. That is reported as an error, so an install that fails the same
-// way every time backs off instead of cycling every poll.
+// Ensure puts the host-namespace NetworkPolicies in place (every round, so a deleted or edited
+// one comes back), installs the vCluster once and reports it ready when its control plane is
+// ready, its kubeconfig Secret exists and its API answers. Values are applied at creation only
+// (see InstanceValues). A release left failed or pending by the install (revision 1) is removed
+// so the next round installs it again. That is reported as an error, so an install that fails
+// the same way every time backs off instead of cycling every poll. A later revision left failed
+// or pending (a repair that errored or was interrupted) is rolled back to the last deployed one
+// instead, so a working control plane is never uninstalled. When one of the release's
+// host-namespace objects is missing, the stored release is re-applied (#453). The API is reported
+// unreachable only after UnreachableAfter consecutive failed checks, so one slow dial doesn't
+// flip a ready instance.
 func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (targets.State, error) {
 	ns := HostNamespace(inst)
+	// The unreachable count is of consecutive checks: a round that stops before the check
+	// (repairing, control plane or Secret pending, an error) starts it over.
+	checked := false
+	defer func() {
+		if !checked {
+			t.resetFailures(ns)
+		}
+	}()
 	if err := t.claimNamespace(ctx, inst, ns); err != nil {
+		return targets.State{}, err
+	}
+	if err := t.applyNetworkPolicies(ctx, ns); err != nil {
 		return targets.State{}, err
 	}
 	rel, err := t.Helm.Get(ctx, ns, ReleaseName)
@@ -117,6 +168,16 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 		}
 		return targets.State{Reason: "Creating", Message: fmt.Sprintf("installed vcluster %s in namespace %s", ChartVersion, ns)}, nil
 	}
+	if rel.Status != "deployed" && rel.Status != "pending-install" && rel.Revision > 1 {
+		// A repair (or rollback) that failed or was interrupted: the instance had a working
+		// control plane, so go back to it instead of uninstalling.
+		rev, err := t.Helm.Rollback(ctx, ns, ReleaseName)
+		if err != nil {
+			return targets.State{}, fmt.Errorf("roll back %s vcluster release revision %d: %w", rel.Status, rel.Revision, err)
+		}
+		msg := fmt.Sprintf("vcluster release revision %d was %s (%s); rolled back to revision %d", rel.Revision, rel.Status, rel.Description, rev)
+		return targets.State{Reason: "RolledBack", Message: msg}, fmt.Errorf("%w: %s", ErrRolledBack, msg)
+	}
 	if rel.Status != "deployed" {
 		if err := t.Helm.Uninstall(ctx, ns, ReleaseName); err != nil {
 			return targets.State{}, fmt.Errorf("remove %s vcluster release: %w", rel.Status, err)
@@ -124,10 +185,26 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 		return targets.State{}, fmt.Errorf("%w: vcluster release was %s (%s); removed it to install again", ErrReinstalling, rel.Status, rel.Description)
 	}
 
-	var sts appsv1.StatefulSet
-	if err := t.Client.Get(ctx, types.NamespacedName{Namespace: ns, Name: ReleaseName}, &sts); apierrors.IsNotFound(err) {
-		return targets.State{Reason: "ControlPlanePending", Message: "vcluster StatefulSet not created yet"}, nil
-	} else if err != nil {
+	var missing []string
+	for _, obj := range releaseObjects(ns) {
+		if err := t.Client.Get(ctx, client.ObjectKeyFromObject(obj), obj); apierrors.IsNotFound(err) {
+			kind := "service"
+			if _, ok := obj.(*appsv1.StatefulSet); ok {
+				kind = "statefulset"
+			}
+			missing = append(missing, kind+"/"+obj.GetName())
+		} else if err != nil {
+			return targets.State{}, err
+		}
+	}
+	if len(missing) > 0 {
+		if err := t.Helm.Repair(ctx, ns, ReleaseName); err != nil {
+			return targets.State{}, fmt.Errorf("re-apply vcluster release to recreate %s: %w", strings.Join(missing, ", "), err)
+		}
+		return targets.State{Reason: "Repairing", Message: fmt.Sprintf("re-applied the vcluster release in namespace %s to recreate %s", ns, strings.Join(missing, ", "))}, nil
+	}
+	sts := releaseObjects(ns)[0].(*appsv1.StatefulSet)
+	if err := t.Client.Get(ctx, client.ObjectKeyFromObject(sts), sts); err != nil {
 		return targets.State{}, err
 	}
 	if sts.Status.ReadyReplicas < 1 {
@@ -144,12 +221,55 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 	if len(raw) == 0 {
 		return targets.State{Reason: "KubeconfigPending", Message: "vcluster kubeconfig Secret has no config key"}, nil
 	}
-	server := fmt.Sprintf("https://%s.%s.svc:443", ReleaseName, ns)
+	address := fmt.Sprintf("%s.%s.svc:443", ReleaseName, ns)
+	server := "https://" + address
 	kubeconfig, err := withServer(raw, server)
 	if err != nil {
 		return targets.State{}, fmt.Errorf("vcluster kubeconfig: %w", err)
 	}
-	return targets.State{Ready: true, Kubeconfig: kubeconfig, Server: server}, nil
+	ready := targets.State{Ready: true, Kubeconfig: kubeconfig, Server: server}
+	checked = true
+	if err := t.dial(ctx, address); err != nil {
+		n := t.countFailure(ns)
+		if n < UnreachableAfter {
+			log.FromContext(ctx).Info("vcluster API check failed", "endpoint", server, "failures", n, "error", err.Error())
+			return ready, nil
+		}
+		return targets.State{Reason: "TargetUnreachable", Message: fmt.Sprintf("vcluster API %s (service %s/%s) is unreachable (%d consecutive checks): %v", server, ns, ReleaseName, n, err)}, nil
+	}
+	t.resetFailures(ns)
+	return ready, nil
+}
+
+// UnreachableAfter is how many consecutive failed API checks report the target unreachable.
+const UnreachableAfter = 3
+
+func (t *Target) countFailure(ns string) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.failures == nil {
+		t.failures = map[string]int{}
+	}
+	t.failures[ns]++
+	return t.failures[ns]
+}
+
+func (t *Target) resetFailures(ns string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.failures, ns)
+}
+
+func (t *Target) dial(ctx context.Context, address string) error {
+	if t.Dial != nil {
+		return t.Dial(ctx, address)
+	}
+	d := net.Dialer{Timeout: 5 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
 }
 
 func (t *Target) values(ctx context.Context, inst *v1alpha1.PlatformInstance) (map[string]any, error) {
@@ -206,6 +326,7 @@ func checkOwner(inst *v1alpha1.PlatformInstance, namespace *corev1.Namespace) er
 // instance's to delete, and refusing would hold the finalizer forever.
 func (t *Target) Delete(ctx context.Context, inst *v1alpha1.PlatformInstance) (bool, error) {
 	ns := HostNamespace(inst)
+	t.resetFailures(ns)
 	var namespace corev1.Namespace
 	if err := t.Client.Get(ctx, types.NamespacedName{Name: ns}, &namespace); apierrors.IsNotFound(err) {
 		return true, nil

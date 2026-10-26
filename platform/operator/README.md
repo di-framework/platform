@@ -34,10 +34,18 @@ kubeconfig is in the Secret named by `status.kubeconfigSecretRef` (`<name>-kubec
    `platform.di-framework.dev/instance: <namespace>/<name>`. The operator refuses to install into a namespace
    whose annotation names anyone else, and on delete leaves such a namespace alone and releases the
    finalizer. It installs vCluster from the embedded, digest-checked
-   chart (0.37.3), then waits for its control plane and kubeconfig Secret. A release left `failed` or
-   `pending-install` (an install that errored or was interrupted) is removed and installed again, with
-   backoff, so an install that fails every time doesn't cycle every poll. The
-   kubeconfig is rewritten to the in-cluster Service address and stored in the instance's Secret.
+   chart (0.37.3), then waits for its control plane, its kubeconfig Secret and its API. A release left
+   `pending-install`, or `failed` at revision 1 (an install that errored or was interrupted), is removed and
+   installed again, with backoff, so an install that fails every time doesn't cycle every poll. A later
+   revision left `failed` or `pending-*` (a repair that errored or was interrupted) is never uninstalled: it
+   is rolled back to the last deployed revision (`TargetReady=False/RolledBack`), and the next round repairs
+   again. The kubeconfig is rewritten to the in-cluster Service address and stored in the instance's Secret.
+   Every reconcile (a poll, a repair) checks the release's host-namespace objects (`statefulset/vcluster`,
+   `service/vcluster`, `service/vcluster-headless`): when one is missing it re-applies the stored release
+   exactly, with the chart and values it was installed with (not the operator's embedded chart, so a repair
+   after the operator moves to a newer vCluster chart is not an upgrade), which recreates it and leaves the
+   rest unchanged. An intact release is not re-applied. The vCluster's data PVC belongs to the StatefulSet,
+   which recreates it with its pod; the kubeconfig Secrets are rewritten every round.
 3. **Install.** On first install, a version change, any spec change or a retry after a failed install (which
    refreshes first), it writes a Pulumi project for the
    instance (`package.json` pinning `@di-framework/platform@<version>`, an `index.ts` re-exporting the
@@ -57,7 +65,12 @@ kubeconfig is in the Secret named by `status.kubeconfigSecretRef` (`<name>-kubec
 characters.
 
 Status carries `phase` (`Provisioning`, `Installing`, `Ready`, `Failed`, `Deleting`) and the `TargetReady`,
-`Installed` and `Ready` conditions, each with a readable reason and message.
+`Installed` and `Ready` conditions, each with a readable reason and message. While the target isn't ready,
+`TargetReady` is `False` with `ControlPlanePending` (the vCluster StatefulSet isn't ready), `Repairing` (a
+missing release object is being recreated), `RolledBack` (a failed or interrupted repair was rolled back),
+`KubeconfigPending` (vCluster's kubeconfig Secret doesn't exist yet) or `TargetUnreachable` (the Secret
+exists but the vCluster API, named in the message, failed 3 consecutive checks; a single failed check
+changes nothing). While the instance's kubeconfig Secret exists, `kubeconfigSecretRef` keeps pointing at it.
 
 ### Tenant data after Delete
 
@@ -149,6 +162,49 @@ test keeps the two identical):
 The values are applied **at creation only**. A later chart upgrade doesn't carry a changed CoreDNS config to
 the host-side synced ConfigMap, so changing them means recreating the instance.
 
+## Host-namespace isolation
+
+vCluster syncs the platform's NetworkPolicies to the host, but those cover the tenant namespaces, not the
+instance's `wasmcloud` namespace, its CoreDNS or the vCluster control plane. So the operator owns three
+NetworkPolicies in every instance host namespace (`pi-<namespace>-<name>-<hash>`), labelled
+`app.kubernetes.io/managed-by: platform-operator` (#452):
+
+- `platform-operator-deny-ingress`: every pod in the namespace is selected for ingress, so nothing gets in that
+  no policy allows;
+- `platform-operator-allow-same-namespace`: pods of the same host namespace get in, which covers the instance's
+  own synced pods, its CoreDNS, and its vCluster control plane reaching synced pods and serving the kubelet port
+  (10250) of its `vcluster-node-*` Services;
+- `platform-operator-allow-operator`: the operator's own namespace gets
+  in to the vCluster API (`app=vcluster` pods, port 8443 behind `svc/vcluster:443`), for the target check and
+  the installs.
+
+The target applies them on every reconcile, before the vCluster is installed, so a deleted or edited policy is
+back by the next round (and so by the next repair); an unchanged one is not written.
+
+What this isolates: pods of another instance, and pods in any other host namespace, can't reach this
+instance's `wasmcloud` services (NATS, host group, runtime-operator, `wasmcloud-http`), its CoreDNS, its vCluster
+API or its kubelet port. The platform's own synced policies keep isolating its tenant namespaces as before.
+
+What it doesn't:
+
+- **Egress** is not restricted here; it stays as the platform's synced policies set it (DNS to the host's
+  `kube-system/kube-dns` on 53 among it).
+- **The HTTP gateway.** The platform's synced `di-platform-gateway` policy admits its HTTP port from any
+  source, with no peers, so that `gateway.httpNodePort` traffic from outside the cluster arrives. Policies add
+  up, so the default deny doesn't close it, and pods of other instances can reach the gateway pods too, as anyone
+  can through the NodePort. The NodePort path itself needs no host-namespace rule.
+- **Other in-cluster clients of the vCluster API.** Only the operator's namespace is admitted to port 8443.
+  Anything else in the cluster that uses an instance kubeconfig must run in that namespace or use
+  `kubectl port-forward`, which goes through the kubelet and the container runtime into the pod and so isn't
+  subject to NetworkPolicy (the proxy certificate names `127.0.0.1` and `localhost` for it). That covers the
+  instance's kubeconfig Secret and the tenant kubeconfigs the platform exports, which carry the same
+  in-cluster `https://vcluster.<host namespace>.svc:443` server. Host-level scrapers in other namespaces
+  (Prometheus or ServiceMonitors for NATS, CoreDNS `:9153` and the like) are blocked too.
+- **Traffic from the node itself.** Traffic that originates on the node (kubelet probes, a client on the
+  node) is admitted by kube-router's local-node rule. NodePort traffic from outside keeps its source address
+  (the NAT happens after the policy check) and is admitted only by a rule with no peers, such as the
+  gateway's.
+
 ## Running it
 
 The image (`Dockerfile`) carries the operator, Node.js, npm and the Pulumi CLI, for linux/amd64 and
@@ -175,6 +231,9 @@ The operator needs:
   NetworkPolicy.
 - **egress to npm, the Pulumi plugin host and the platform's images**, since each install runs `npm install`
   and fetches the Pulumi Kubernetes provider plugin.
+- **its own namespace**, which every instance host namespace admits to the vCluster API (see
+  [Host-namespace isolation](#host-namespace-isolation)): read from its service account, or
+  `--cleanup-namespace` when run outside a cluster.
 - **a namespace that admits a `hostPath` pod** for the storage cleanup Job: `--cleanup-namespace`, which
   defaults to the operator's own namespace (read from its service account). Run outside a cluster, set it.
 

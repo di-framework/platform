@@ -77,6 +77,14 @@ rules:
   - update
   - watch
 - apiGroups:
+  - networking.k8s.io
+  resources:
+  - networkpolicies
+  verbs:
+  - create
+  - get
+  - update
+- apiGroups:
   - platform.di-framework.dev
   resources:
   - platforminstances

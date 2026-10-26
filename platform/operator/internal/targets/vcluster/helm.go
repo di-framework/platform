@@ -9,6 +9,7 @@ import (
 
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart/loader"
+	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/storage/driver"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/client-go/discovery"
@@ -23,11 +24,16 @@ import (
 type Helm struct {
 	Config *rest.Config
 	Log    *slog.Logger
+	// configure replaces the cluster-backed action configuration in tests.
+	configure func(namespace string) (*action.Configuration, error)
 }
 
 var _ Releaser = (*Helm)(nil)
 
 func (h *Helm) configuration(namespace string) (*action.Configuration, error) {
+	if h.configure != nil {
+		return h.configure(namespace)
+	}
 	cfg := new(action.Configuration)
 	getter := &restGetter{config: h.Config, namespace: namespace}
 	logf := func(format string, args ...any) {
@@ -57,6 +63,7 @@ func (h *Helm) Get(_ context.Context, namespace, name string) (*Release, error) 
 	if rel.Info != nil {
 		out.Status, out.Description = rel.Info.Status.String(), rel.Info.Description
 	}
+	out.Revision = rel.Version
 	return out, nil
 }
 
@@ -76,6 +83,67 @@ func (h *Helm) Install(ctx context.Context, namespace, name string, chart []byte
 	install.Namespace = namespace
 	_, err = install.RunWithContext(ctx, ch, values)
 	return err
+}
+
+// releaseHistory caps the revisions a repair or rollback keeps, so repeated repairs don't pile
+// up release Secrets.
+const releaseHistory = 5
+
+// Repair re-applies the release exactly as stored: its own chart and values, not the operator's
+// embedded chart, so a repair after a chart bump is never an upgrade. Helm's three-way merge
+// creates objects missing from the cluster and leaves unchanged ones alone.
+func (h *Helm) Repair(ctx context.Context, namespace, name string) error {
+	cfg, err := h.configuration(namespace)
+	if err != nil {
+		return err
+	}
+	cur, err := action.NewGet(cfg).Run(name)
+	if err != nil {
+		return err
+	}
+	upgrade := action.NewUpgrade(cfg)
+	upgrade.Namespace = namespace
+	upgrade.MaxHistory = releaseHistory
+	_, err = upgrade.RunWithContext(ctx, name, cur.Chart, cur.Config)
+	return err
+}
+
+// Rollback rolls the release back to its latest revision whose status is deployed (a failed
+// upgrade leaves the one before it deployed), falling back to the latest superseded one, and
+// returns that revision.
+func (h *Helm) Rollback(_ context.Context, namespace, name string) (int, error) {
+	cfg, err := h.configuration(namespace)
+	if err != nil {
+		return 0, err
+	}
+	history, err := action.NewHistory(cfg).Run(name)
+	if err != nil {
+		return 0, err
+	}
+	latest, deployed, superseded := 0, 0, 0
+	for _, r := range history {
+		latest = max(latest, r.Version)
+		if r.Info == nil {
+			continue
+		}
+		switch r.Info.Status {
+		case release.StatusDeployed:
+			deployed = max(deployed, r.Version)
+		case release.StatusSuperseded:
+			superseded = max(superseded, r.Version)
+		}
+	}
+	target := deployed
+	if target == 0 || target == latest {
+		target = superseded
+	}
+	if target == 0 {
+		return 0, fmt.Errorf("release %s has no deployed revision before %d", name, latest)
+	}
+	rollback := action.NewRollback(cfg)
+	rollback.Version = target
+	rollback.MaxHistory = releaseHistory
+	return target, rollback.Run(name)
 }
 
 // Uninstall removes the release; a missing release is not an error.
