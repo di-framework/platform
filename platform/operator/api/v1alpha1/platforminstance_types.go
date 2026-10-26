@@ -105,7 +105,7 @@ type PlatformSettings struct {
 	// Users are the platform's users and their tenant memberships (its `users` config).
 	// +listType=map
 	// +listMapKey=name
-	// +kubebuilder:validation:MaxItems=256
+	// +kubebuilder:validation:MaxItems=128
 	// +optional
 	Users []User `json:"users,omitempty"`
 
@@ -157,7 +157,8 @@ type Tenant struct {
 
 // TenantRuntime is a tenant's `runtime`.
 type TenantRuntime struct {
-	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10
 	// +optional
 	Replicas *int32 `json:"replicas,omitempty"`
 	// CoreInstances is WASH_CORE_INSTANCES for the tenant host (platform default 100).
@@ -169,22 +170,29 @@ type TenantRuntime struct {
 
 // TenantResources is a tenant's `resources`.
 type TenantResources struct {
+	// The bounds are the platform Tenant CRD's.
 	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|Ti)?$`
 	// +optional
 	CPU string `json:"cpu,omitempty"`
 	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|Ti)?$`
 	// +optional
 	Memory string `json:"memory,omitempty"`
-	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1000
 	// +optional
 	Workloads *int32 `json:"workloads,omitempty"`
-	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
 	// +optional
 	BackingServices *int32 `json:"backingServices,omitempty"`
-	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=400
 	// +optional
 	ServiceBindings *int32 `json:"serviceBindings,omitempty"`
-	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10000
 	// +optional
 	APIKeys *int32 `json:"apiKeys,omitempty"`
 }
@@ -203,7 +211,7 @@ type User struct {
 	// Memberships are the tenants the user belongs to, one entry per tenant.
 	// +listType=map
 	// +listMapKey=tenant
-	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:MaxItems=16
 	Memberships []Membership `json:"memberships"`
 }
 

@@ -2,6 +2,7 @@ package v1alpha1_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/validation"
 	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
+	apiservervalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	celconfig "k8s.io/apiserver/pkg/apis/cel"
 	"sigs.k8s.io/yaml"
@@ -129,5 +131,75 @@ func TestTenancyRules(t *testing.T) {
 				t.Fatalf("errors %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// schemaErrors runs the CRD's OpenAPI schema (types, bounds, patterns) as the apiserver does.
+func schemaErrors(t *testing.T, obj string) string {
+	t.Helper()
+	v, _, err := apiservervalidation.NewSchemaValidator(loadCRD(t).Spec.Validation.OpenAPIV3Schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errs := apiservervalidation.ValidateCustomResource(field.NewPath("root"), object(t, obj), v)
+	if len(errs) == 0 {
+		return ""
+	}
+	return errs.ToAggregate().Error()
+}
+
+// W3: the tenant bounds are the platform Tenant CRD's, so bad values fail admission.
+func TestTenantBounds(t *testing.T) {
+	withTenant := func(fields string) string {
+		return strings.Replace(tenancy, "tenants: [{name: acme}]", "tenants: [{name: acme, "+fields+"}]", 1)
+	}
+	ok := "runtime: {replicas: 10, coreInstances: 10000}, resources: {cpu: '1.5', memory: 512Mi, workloads: 1000, backingServices: 100, serviceBindings: 400, apiKeys: 10000}"
+	if got := schemaErrors(t, withTenant(ok)); got != "" {
+		t.Fatalf("upper bounds rejected: %s", got)
+	}
+	for _, bad := range []string{
+		"runtime: {replicas: 0}", "runtime: {replicas: 11}", "runtime: {coreInstances: 0}", "runtime: {coreInstances: 10001}",
+		"resources: {cpu: two}", "resources: {memory: 4GB}", "resources: {cpu: '-1'}",
+		"resources: {workloads: 0}", "resources: {workloads: 1001}",
+		"resources: {backingServices: 0}", "resources: {backingServices: 101}",
+		"resources: {serviceBindings: 0}", "resources: {serviceBindings: 401}",
+		"resources: {apiKeys: 0}", "resources: {apiKeys: 10001}",
+	} {
+		if schemaErrors(t, withTenant(bad)) == "" {
+			t.Errorf("%s: accepted", bad)
+		}
+	}
+}
+
+// W2: the largest object the limits allow (32 tenants, 128 users with 16 memberships each, every
+// name 40 characters) passes the membership rule within the apiserver's runtime cost limits.
+func TestLargestAllowedSpecFitsTheCELBudget(t *testing.T) {
+	name := func(prefix string, i int) string {
+		n := fmt.Sprintf("%s%d", prefix, i)
+		return n + strings.Repeat("x", 40-len(n))
+	}
+	var b strings.Builder
+	b.WriteString(base + "  platform:\n    tenants:\n")
+	for i := range 32 {
+		fmt.Fprintf(&b, "      - name: %s\n", name("t", i))
+	}
+	b.WriteString("    users:\n")
+	for u := range 128 {
+		fmt.Fprintf(&b, "      - name: %s\n        memberships:\n", name("u", u))
+		for m := range 16 {
+			fmt.Fprintf(&b, "          - {tenant: %s, role: viewer}\n", name("t", 31-m))
+		}
+	}
+	big := b.String()
+	if got := schemaErrors(t, big); got != "" {
+		t.Fatalf("schema: %s", got)
+	}
+	if got := celErrors(t, big, big); got != "" {
+		t.Fatalf("CEL: %s", got)
+	}
+	// One more user is refused by the schema.
+	more := strings.Replace(big, "    users:\n", "    users:\n      - {name: extra, memberships: []}\n", 1)
+	if !strings.Contains(schemaErrors(t, more), "must have at most 128 items") {
+		t.Fatalf("129 users accepted: %s", schemaErrors(t, more))
 	}
 }

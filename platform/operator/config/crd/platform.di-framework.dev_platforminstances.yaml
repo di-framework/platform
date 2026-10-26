@@ -259,25 +259,32 @@ spec:
                           properties:
                             apiKeys:
                               format: int32
-                              minimum: 0
+                              maximum: 10000
+                              minimum: 1
                               type: integer
                             backingServices:
                               format: int32
-                              minimum: 0
+                              maximum: 100
+                              minimum: 1
                               type: integer
                             cpu:
+                              description: The bounds are the platform Tenant CRD's.
                               maxLength: 32
+                              pattern: ^[0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|Ti)?$
                               type: string
                             memory:
                               maxLength: 32
+                              pattern: ^[0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|Ti)?$
                               type: string
                             serviceBindings:
                               format: int32
-                              minimum: 0
+                              maximum: 400
+                              minimum: 1
                               type: integer
                             workloads:
                               format: int32
-                              minimum: 0
+                              maximum: 1000
+                              minimum: 1
                               type: integer
                           type: object
                         runtime:
@@ -292,7 +299,8 @@ spec:
                               type: integer
                             replicas:
                               format: int32
-                              minimum: 0
+                              maximum: 10
+                              minimum: 1
                               type: integer
                           type: object
                         suspended:
@@ -333,7 +341,7 @@ spec:
                             - role
                             - tenant
                             type: object
-                          maxItems: 32
+                          maxItems: 16
                           type: array
                           x-kubernetes-list-map-keys:
                           - tenant
@@ -351,7 +359,7 @@ spec:
                       - memberships
                       - name
                       type: object
-                    maxItems: 256
+                    maxItems: 128
                     type: array
                     x-kubernetes-list-map-keys:
                     - name
