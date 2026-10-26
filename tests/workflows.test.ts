@@ -1347,6 +1347,24 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     expect(order.every((i) => i > -1)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     expect(release.jobs.build?.outputs?.plugin_sha256).toBe('${{ steps.plugin.outputs.sha256 }}');
+    // The pinned Node is the last one set up before the pack, and the pack refuses any other.
+    const packIndex = build.indexOf(plugin as never);
+    const lastNode = build
+      .slice(0, packIndex)
+      .filter((s) => s.uses?.startsWith('actions/setup-node@'))
+      .at(-1);
+    expect(lastNode).toBe(node);
+    const guard = `if [ "$(node -v)" != "v${ciNode?.with?.['node-version']}" ]; then`;
+    expect(run).toContain(guard);
+    expect(run.indexOf(guard)).toBeLessThan(order[1] ?? -1);
+    const autoTag = parse('.github/workflows/auto-tag.yml').jobs['release-pr']?.steps ?? [];
+    const bump = autoTag.find((s) => s.run?.includes('artifacthub-plugin.ts write'))?.run ?? '';
+    expect(bump).toContain(guard);
+    expect(bump.indexOf(guard)).toBeLessThan(bump.indexOf('bun run --cwd'));
+    // The same Bun as Auto Tag and the plugin's CI job (S6).
+    const bun = (s: { uses?: string }) => s.uses?.startsWith('oven-sh/setup-bun@') ?? false;
+    expect(build.find(bun)?.with?.['bun-version']).toBe(ci.find(bun)?.with?.['bun-version']);
+    expect(build.find(bun)?.with?.['bun-version']).toBe(autoTag.find(bun)?.with?.['bun-version']);
     // The plugin is packed after the npm packages are uploaded, so it cannot change them.
     expect(build.indexOf(node as never)).toBeGreaterThan(build.findIndex((s) => s.id === 'upload'));
   });
@@ -1432,7 +1450,7 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     expect(mismatch.calls).toBe('');
   });
 
-  test('the Headlamp plugin CI job verifies the entry only on the PR that adds it (#435)', () => {
+  test('the Headlamp plugin CI job verifies the entry only on a PR that adds, edits or deletes it (#435)', () => {
     const ci = parse('.github/workflows/ci.yml').jobs['headlamp-plugin']?.steps ?? [];
     const names = ci.map((s) => s.name);
     const check = ci.find((s) => s.name === 'Check the Artifact Hub entry');
@@ -1474,6 +1492,18 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     writeFileSync(pkg, '{"version":"1.2.3","x":2}\n');
     git(box.work, 'commit', '-q', '-am', 'later change');
     expect(run('pull_request')).toBe('');
+    // A PR that edits the released entry, or deletes it, is verified (a deleted entry fails).
+    writeFileSync(join(box.work, entry), 'version: 1.2.3\n# edited\n');
+    git(box.work, 'commit', '-q', '-am', 'edit entry');
+    expect(run('pull_request')).toBe('scripts/artifacthub-plugin.ts verify 1.2.3 --required\n');
+    git(box.work, 'rm', '-q', entry);
+    git(box.work, 'commit', '-q', '-m', 'delete entry');
+    expect(run('pull_request')).toBe('scripts/artifacthub-plugin.ts verify 1.2.3 --required\n');
+    const deleted = Bun.spawnSync(
+      ['bun', join(repo, 'scripts/artifacthub-plugin.ts'), 'verify', '1.2.3', '--required'],
+      { cwd: box.work, env: spawnEnv, stdout: 'pipe', stderr: 'pipe' },
+    );
+    expect(deleted.exitCode).toBe(1);
   });
 
   test('build smoke-tests, records the wasm sha256, packs without rebuilding pglite, uploads', () => {

@@ -309,6 +309,11 @@ jobs:
           # package.json and the chart's plugin manager config, pack the plugin with its own
           # lockfile, and write its Artifact Hub entry from the tarball's sha256. The release
           # build job packs it again at the tag; the release uploads it only if the checksum matches.
+          # The recorded sha256 depends on Node's zlib: refuse any Node but the pinned one.
+          if [ "$(node -v)" != "v22.23.2" ]; then
+            echo "::error::the Headlamp plugin must be packed with Node v22.23.2, not $(node -v)"
+            exit 1
+          fi
           bun scripts/artifacthub-plugin.ts set-version "$NEXT"
           bun install --cwd platform/operator/headlamp-plugin --frozen-lockfile --ignore-scripts
           bun run --cwd platform/operator/headlamp-plugin package

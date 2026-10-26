@@ -45,6 +45,8 @@ jobs:
           echo "$GITHUB_WORKSPACE/platform/sqlite-component/.tools/bin" >> "$GITHUB_PATH"
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.3'
 
       # @di-framework/pglite-component ships its wasm on npm. The release builds it
       # from source with the same make targets as ci.yml (engine via Docker) and runs
@@ -158,6 +160,11 @@ jobs:
           ENTRY="platform/operator/headlamp-plugin/artifacthub/$VERSION/artifacthub-pkg.yml"
           if [ ! -f "$ENTRY" ]; then
             echo "::error::$ENTRY is missing at $GITHUB_REF_NAME: the release PR writes it; not releasing the Headlamp plugin"
+            exit 1
+          fi
+          # The recorded sha256 depends on Node's zlib: refuse any Node but the pinned one.
+          if [ "$(node -v)" != "v22.23.2" ]; then
+            echo "::error::the Headlamp plugin must be packed with Node v22.23.2, not $(node -v)"
             exit 1
           fi
           bun install --cwd platform/operator/headlamp-plugin --frozen-lockfile --ignore-scripts
