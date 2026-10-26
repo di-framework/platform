@@ -72,16 +72,28 @@ func TestHelmRepairReappliesTheStoredRelease(t *testing.T) {
 
 func TestHelmRollbackGoesToTheLastDeployedRevision(t *testing.T) {
 	h, cfg := memoryHelm(t)
+	// A failed upgrade leaves the revision before it deployed; the one before the latest is
+	// superseded here, so "the previous revision" would be the wrong target (review S7).
 	seed(t, cfg, 1, release.StatusSuperseded)
-	seed(t, cfg, 2, release.StatusSuperseded)
-	seed(t, cfg, 3, release.StatusFailed)
+	seed(t, cfg, 2, release.StatusDeployed)
+	seed(t, cfg, 3, release.StatusSuperseded)
+	seed(t, cfg, 4, release.StatusFailed)
 	rev, err := h.Rollback(context.Background(), "pi-x", ReleaseName)
 	if err != nil || rev != 2 {
 		t.Fatalf("rollback: %d %v", rev, err)
 	}
 	last, err := cfg.Releases.Last(ReleaseName)
-	if err != nil || last.Version != 4 || last.Info.Status != release.StatusDeployed || last.Chart.Metadata.Version != "0.0.1-installed" {
+	if err != nil || last.Version != 5 || last.Info.Status != release.StatusDeployed || last.Chart.Metadata.Version != "0.0.1-installed" {
 		t.Fatalf("after rollback: %+v %v", last, err)
+	}
+
+	// Without a deployed revision, the latest superseded one.
+	h, cfg = memoryHelm(t)
+	seed(t, cfg, 1, release.StatusSuperseded)
+	seed(t, cfg, 2, release.StatusSuperseded)
+	seed(t, cfg, 3, release.StatusFailed)
+	if rev, err := h.Rollback(context.Background(), "pi-x", ReleaseName); err != nil || rev != 2 {
+		t.Fatalf("rollback to superseded: %d %v", rev, err)
 	}
 
 	h, cfg = memoryHelm(t)

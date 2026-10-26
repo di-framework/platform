@@ -59,6 +59,10 @@ const OwnerAnnotation = "platform.di-framework.dev/instance"
 // next round installs again.
 var ErrReinstalling = errors.New("reinstalling vcluster")
 
+// ErrRolledBack reports that Ensure rolled back a failed or interrupted repair. It comes with a
+// RolledBack State, so a repair that fails every time backs off instead of cycling every poll.
+var ErrRolledBack = errors.New("rolled back vcluster release")
+
 // Release is what the target needs to know about an installed Helm release.
 type Release struct {
 	// Status is Helm's release status: deployed, failed, pending-install and so on.
@@ -132,6 +136,14 @@ var _ targets.Target = (*Target)(nil)
 // flip a ready instance.
 func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (targets.State, error) {
 	ns := HostNamespace(inst)
+	// The unreachable count is of consecutive checks: a round that stops before the check
+	// (repairing, control plane or Secret pending, an error) starts it over.
+	checked := false
+	defer func() {
+		if !checked {
+			t.resetFailures(ns)
+		}
+	}()
 	if err := t.claimNamespace(ctx, inst, ns); err != nil {
 		return targets.State{}, err
 	}
@@ -163,7 +175,8 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 		if err != nil {
 			return targets.State{}, fmt.Errorf("roll back %s vcluster release revision %d: %w", rel.Status, rel.Revision, err)
 		}
-		return targets.State{Reason: "RolledBack", Message: fmt.Sprintf("vcluster release revision %d was %s (%s); rolled back to revision %d", rel.Revision, rel.Status, rel.Description, rev)}, nil
+		msg := fmt.Sprintf("vcluster release revision %d was %s (%s); rolled back to revision %d", rel.Revision, rel.Status, rel.Description, rev)
+		return targets.State{Reason: "RolledBack", Message: msg}, fmt.Errorf("%w: %s", ErrRolledBack, msg)
 	}
 	if rel.Status != "deployed" {
 		if err := t.Helm.Uninstall(ctx, ns, ReleaseName); err != nil {
@@ -215,6 +228,7 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 		return targets.State{}, fmt.Errorf("vcluster kubeconfig: %w", err)
 	}
 	ready := targets.State{Ready: true, Kubeconfig: kubeconfig, Server: server}
+	checked = true
 	if err := t.dial(ctx, address); err != nil {
 		n := t.countFailure(ns)
 		if n < UnreachableAfter {
@@ -312,6 +326,7 @@ func checkOwner(inst *v1alpha1.PlatformInstance, namespace *corev1.Namespace) er
 // instance's to delete, and refusing would hold the finalizer forever.
 func (t *Target) Delete(ctx context.Context, inst *v1alpha1.PlatformInstance) (bool, error) {
 	ns := HostNamespace(inst)
+	t.resetFailures(ns)
 	var namespace corev1.Namespace
 	if err := t.Client.Get(ctx, types.NamespacedName{Name: ns}, &namespace); apierrors.IsNotFound(err) {
 		return true, nil

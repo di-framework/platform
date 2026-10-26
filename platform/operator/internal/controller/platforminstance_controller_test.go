@@ -31,11 +31,12 @@ type fakeTarget struct {
 	ensures    int
 	deletes    int
 	deleteDone bool
+	err        error
 }
 
 func (f *fakeTarget) Ensure(context.Context, *v1alpha1.PlatformInstance) (targets.State, error) {
 	f.ensures++
-	return f.state, nil
+	return f.state, f.err
 }
 func (f *fakeTarget) Delete(context.Context, *v1alpha1.PlatformInstance) (bool, error) {
 	f.deletes++
@@ -168,6 +169,28 @@ func TestFinalizerPatchLeavesTheSpecAlone(t *testing.T) {
 	}
 	if inst := h.get(); !containsFinalizer(inst) || inst.Generation != 1 {
 		t.Fatalf("finalizer %v generation %d", inst.Finalizers, inst.Generation)
+	}
+}
+
+// A target error that comes with a State (a rolled-back repair) keeps that reason in the
+// condition and is returned, so controller-runtime backs off (review S8).
+func TestTargetErrorKeepsTheTargetsReason(t *testing.T) {
+	h, _ := installedHarness(t)
+	h.tg.state = targets.State{Reason: "RolledBack", Message: "rolled back to revision 1"}
+	h.tg.err = errors.New("rolled back vcluster release")
+	if _, err := h.r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err == nil {
+		t.Fatal("no error to back off on")
+	}
+	inst := h.get()
+	if c := meta.FindStatusCondition(inst.Status.Conditions, v1alpha1.ConditionTargetReady); c == nil || c.Reason != "RolledBack" || c.Message != "rolled back to revision 1" {
+		t.Fatalf("TargetReady %+v", c)
+	}
+
+	h.tg.state = targets.State{}
+	h.tg.err = errors.New("boom")
+	h.r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+	if got := conditionReason(h.get(), v1alpha1.ConditionTargetReady); got != "TargetError" {
+		t.Fatalf("plain error reason %q", got)
 	}
 }
 

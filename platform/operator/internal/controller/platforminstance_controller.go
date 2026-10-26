@@ -124,7 +124,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	st, err := r.Target.Ensure(ctx, &inst)
 	if err != nil {
-		return r.fail(ctx, &inst, v1alpha1.ConditionTargetReady, "TargetError", err.Error(), err)
+		// A target that reports what it did with its error (a rolled-back repair) keeps that
+		// reason in the condition; the error makes controller-runtime back off.
+		reason, msg := "TargetError", err.Error()
+		if st.Reason != "" {
+			reason, msg = st.Reason, st.Message
+		}
+		return r.fail(ctx, &inst, v1alpha1.ConditionTargetReady, reason, msg, err)
 	}
 	obs.TargetReady = st.Ready
 	if st.Ready {

@@ -108,7 +108,8 @@ func (h *Helm) Repair(ctx context.Context, namespace, name string) error {
 	return err
 }
 
-// Rollback rolls the release back to its last deployed revision, before the latest one, and
+// Rollback rolls the release back to its latest revision whose status is deployed (a failed
+// upgrade leaves the one before it deployed), falling back to the latest superseded one, and
 // returns that revision.
 func (h *Helm) Rollback(_ context.Context, namespace, name string) (int, error) {
 	cfg, err := h.configuration(namespace)
@@ -119,15 +120,22 @@ func (h *Helm) Rollback(_ context.Context, namespace, name string) (int, error) 
 	if err != nil {
 		return 0, err
 	}
-	latest, target := 0, 0
+	latest, deployed, superseded := 0, 0, 0
 	for _, r := range history {
 		latest = max(latest, r.Version)
-	}
-	for _, r := range history {
-		if r.Version < latest && r.Version > target && r.Info != nil &&
-			(r.Info.Status == release.StatusDeployed || r.Info.Status == release.StatusSuperseded) {
-			target = r.Version
+		if r.Info == nil {
+			continue
 		}
+		switch r.Info.Status {
+		case release.StatusDeployed:
+			deployed = max(deployed, r.Version)
+		case release.StatusSuperseded:
+			superseded = max(superseded, r.Version)
+		}
+	}
+	target := deployed
+	if target == 0 || target == latest {
+		target = superseded
 	}
 	if target == 0 {
 		return 0, fmt.Errorf("release %s has no deployed revision before %d", name, latest)

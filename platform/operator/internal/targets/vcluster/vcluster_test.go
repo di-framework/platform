@@ -301,7 +301,8 @@ func TestEnsureRollsBackAFailedRepair(t *testing.T) {
 		helm.revision = map[string]int{ns: 2}
 		st, err := tg.Ensure(context.Background(), inst)
 		want := "vcluster release revision 2 was " + status + " (boom); rolled back to revision 1"
-		if err != nil || st.Ready || st.Reason != "RolledBack" || st.Message != want || len(helm.uninstalled) != 0 || len(helm.rolledBack) != 1 {
+		// An error as well, so a repair that fails every time backs off (review S8).
+		if !errors.Is(err, ErrRolledBack) || !strings.Contains(err.Error(), want) || st.Ready || st.Reason != "RolledBack" || st.Message != want || len(helm.uninstalled) != 0 || len(helm.rolledBack) != 1 {
 			t.Fatalf("%s repair: %+v %v (uninstalled %v, rolled back %v)", status, st, err, helm.uninstalled, helm.rolledBack)
 		}
 		helm.rollbackErr = errors.New("no deployed revision")
@@ -347,6 +348,37 @@ func TestEnsureRecreatesADeletedService(t *testing.T) {
 		if err := tg.Client.Get(ctx, client.ObjectKeyFromObject(sts), &after); err != nil || after.ResourceVersion != sts.ResourceVersion {
 			t.Fatalf("StatefulSet touched repairing %s: %s -> %s %v", name, sts.ResourceVersion, after.ResourceVersion, err)
 		}
+	}
+}
+
+// Failed checks count only when consecutive: a round that stops before the check, and Delete,
+// start the count over (review S9).
+func TestUnreachableCountStartsOverWhenTheCheckIsSkipped(t *testing.T) {
+	tg, _, inst, sts := readyInstance(t)
+	ns := HostNamespace(inst)
+	tg.Dial = func(context.Context, string) error { return errors.New("connection refused") }
+	ctx := context.Background()
+	for i := 1; i < UnreachableAfter; i++ {
+		if st, err := tg.Ensure(ctx, inst); err != nil || !st.Ready {
+			t.Fatalf("failed check %d: %+v %v", i, st, err)
+		}
+	}
+	sts.Status.ReadyReplicas = 0
+	if err := tg.Client.Status().Update(ctx, sts); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := tg.Ensure(ctx, inst); st.Reason != "ControlPlanePending" || tg.failures[ns] != 0 {
+		t.Fatalf("skipped check: %+v (failures %d)", st, tg.failures[ns])
+	}
+	sts.Status.ReadyReplicas = 1
+	if err := tg.Client.Status().Update(ctx, sts); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := tg.Ensure(ctx, inst); !st.Ready || tg.failures[ns] != 1 {
+		t.Fatalf("first failure after the skip: %+v (failures %d)", st, tg.failures[ns])
+	}
+	if _, err := tg.Delete(ctx, inst); err != nil || tg.failures[ns] != 0 {
+		t.Fatalf("Delete kept the count: %v (failures %d)", err, tg.failures[ns])
 	}
 }
 
