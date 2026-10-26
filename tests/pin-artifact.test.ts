@@ -12,6 +12,7 @@ import {
   DEFAULT_HOST_SOURCE,
   HOST_VARIANTS,
   NATS_CREDENTIALS_SOURCE,
+  OPERATOR_CHART_VALUES,
   parseHostVariants,
   parsePairs,
   pinArtifact,
@@ -74,6 +75,31 @@ describe('pinText', () => {
     expect(two.matches).toBe(1);
     expect(two.text.split('\n')[0]).toContain('a'.repeat(64));
     expect(two.text.split('\n')[1]).toContain(`wasi-tls-exclusive@${OTHER}`);
+  });
+
+  test('a bare target rewrites only the chart image.digest line (placeholder, digest, no-op)', () => {
+    const chartTarget = ARTIFACTS['platform-operator']?.find((t) => t.bare);
+    if (!chartTarget) throw new Error('no bare platform-operator target');
+    expect(chartTarget.file).toBe(OPERATOR_CHART_VALUES);
+    const values = readFileSync(join(repo, OPERATOR_CHART_VALUES), 'utf8').replace(
+      /^ {2}digest: .*$/m,
+      '  digest: sha256:<pinned by the platform-operator image pin PR>',
+    );
+    const lines = values.split('\n');
+    const at = lines.indexOf('  digest: sha256:<pinned by the platform-operator image pin PR>');
+    expect(lines.some((l, i) => i !== at && /sha256:[0-9a-f]{64}/.test(l))).toBe(true);
+    const expected = (digest: string) =>
+      lines.map((l, i) => (i === at ? `  digest: ${digest}` : l)).join('\n');
+    const placeholder = pinText(values, chartTarget, DIGEST);
+    expect(placeholder.matches).toBe(1);
+    expect(placeholder.text).toBe(expected(DIGEST));
+    const moved = pinText(placeholder.text, chartTarget, OTHER);
+    expect(moved.matches).toBe(1);
+    expect(moved.text).toBe(expected(OTHER));
+    const same = pinText(moved.text, chartTarget, OTHER);
+    expect(same.matches).toBe(1);
+    expect(same.text).toBe(moved.text);
+    expect(pinText('digest: sha256:<x>\n', chartTarget, DIGEST).matches).toBe(0);
   });
 
   test('rejects anything but a sha256 digest', () => {

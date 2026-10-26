@@ -1309,10 +1309,8 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
         output: readFileSync(output, 'utf8'),
       };
     };
-    // The checked-in placeholder (until the image pin PR): skipped, exit 0, with a warning.
-    const placeholder = (/^ {2}digest: (.*)$/m.exec(values) ?? [])[1] ?? '';
-    expect(placeholder).toStartWith('sha256:<');
-    const skipped = runPin(placeholder);
+    // A placeholder (the chart's value before its first pin): skipped, exit 0, with a warning.
+    const skipped = runPin('sha256:<pinned by the platform-operator image pin PR>');
     expect(skipped.code).toBe(0);
     expect(skipped.output).toBe('pinned=false\n');
     expect(skipped.stdout).toContain('::warning::chart not published');

@@ -9,6 +9,7 @@ import { cpSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { helm } from '../platform/backup-destination/tests/support/helm.ts';
+import { ARTIFACTS } from '../scripts/pin-artifact';
 
 const operator = resolve(import.meta.dir, '..', 'platform', 'operator');
 const chart = join(operator, 'chart');
@@ -280,20 +281,24 @@ describe('platform-operator chart', () => {
     expect(container.securityContext.allowPrivilegeEscalation).toBe(false);
   }, 60000);
 
-  test('the image is pulled by digest; the default is a placeholder pin-artifact can rewrite', async () => {
+  test('the image is pulled by digest; the default is a pinned digest pin-artifact maintains', async () => {
     const values = Bun.YAML.parse(read(join(chart, 'values.yaml'))) as {
       image: { repository: string; digest: string };
     };
     expect(values.image.repository).toBe('ghcr.io/di-framework/platform-operator');
-    // pin-artifact.ts's placeholder form: sha256:<...>.
-    expect(values.image.digest).toMatch(/^sha256:<[^>\n]*>$/);
+    // A placeholder must never reach a release: the chart job skips an unpinned digest.
+    expect(values.image.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    // The image pin PR rewrites values.yaml along with the README, so the pin cannot go stale.
+    expect(ARTIFACTS['platform-operator']?.map((t) => t.file)).toContain(
+      'platform/operator/chart/values.yaml',
+    );
     const pinned = operatorDeployment(await template(`image.digest=${DIGEST}`));
     expect(pinned.spec.template.spec.containers[0].image).toBe(
       `ghcr.io/di-framework/platform-operator@${DIGEST}`,
     );
     const rejected = [
       'latest',
-      values.image.digest,
+      'sha256:<pinned by the platform-operator image pin PR>',
       'sha256:zz',
       `sha256:${'a'.repeat(63)}`,
       `sha256:${'a'.repeat(65)}`,
@@ -310,10 +315,9 @@ describe('platform-operator chart', () => {
     }
   }, 60000);
 
-  test('the default values do not install: the placeholder digest fails the render', async () => {
+  test('the default values render: the checked-in digest is pinned', async () => {
     const out = await offline(`passphrase.existingSecret=${PASSPHRASE}`);
-    expect(out.code).not.toBe(0);
-    expect(out.stderr).toContain('image.digest must be a sha256 digest');
+    expect(out.code).toBe(0);
   }, 60000);
 
   test('replicaCount > 1 requires leader election', async () => {

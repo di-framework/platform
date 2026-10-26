@@ -1,11 +1,10 @@
 image:
   repository: ghcr.io/di-framework/platform-operator
-  # The operator image is always pulled by digest, never by tag. The operator image pin PR (#271)
-  # rewrites this placeholder with the digest each publish produced. Until then, set it at install
-  # time: --set image.digest=sha256:<64 hex>. The chart refuses to render anything else, the
-  # placeholder included, and the release workflow skips publishing the chart (with a warning)
-  # while it still has it.
-  digest: sha256:<pinned by the platform-operator image pin PR>
+  # The operator image is always pulled by digest, never by tag. The operator image pin PR (#271,
+  # scripts/pin-artifact.ts) rewrites this line with the digest each publish produced. Override it
+  # at install time with --set image.digest=sha256:<64 hex>. The chart refuses to render anything
+  # else, and the release workflow skips publishing the chart (with a warning) unless it is pinned.
+  digest: sha256:8118d0397c414038dbcb7327dc9ca7ba569b6e62843c6df4127bc6fbd1ba80e5
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 

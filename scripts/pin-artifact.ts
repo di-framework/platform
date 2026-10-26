@@ -4,7 +4,8 @@
  *
  * The publish workflows' pin job runs this after a successful publish and opens a
  * "chore: pin <artifact> to <digest>" PR with the result. Each target is a reference
- * `<ref>@sha256:<64 hex>` or a placeholder `<ref>@sha256:<...>`; only those are touched.
+ * `<ref>@sha256:<64 hex>` or a placeholder `<ref>@sha256:<...>` (or, for a `bare` target such as the
+ * operator chart's `image.digest`, a lone `sha256:` digest on its `linePrefix` line); only those are touched.
  * A target that no longer matches anything is an error, so the docs cannot drift away
  * from the bot silently.
  *
@@ -36,7 +37,15 @@ export interface PinTarget {
   ref: string;
   /** Only lines starting with this are rewritten. */
   linePrefix?: string;
+  /**
+   * The digest stands alone (`digest: sha256:...`), not after `<ref>@`; `ref` only names the
+   * target in errors. Requires `linePrefix`, which anchors it to one line.
+   */
+  bare?: boolean;
 }
+
+/** The operator chart's values; its `image.digest` is a bare digest line. */
+export const OPERATOR_CHART_VALUES = 'platform/operator/chart/values.yaml';
 
 const HOST_README = 'platform/tenant-host/README.md';
 /** The tenant host image tag -> patch set table; its first row is the canonical tag. */
@@ -72,6 +81,12 @@ export const ARTIFACTS: Record<string, PinTarget[]> = {
   ],
   'platform-operator': [
     { file: 'platform/operator/README.md', ref: 'ghcr.io/di-framework/platform-operator' },
+    {
+      file: OPERATOR_CHART_VALUES,
+      ref: 'ghcr.io/di-framework/platform-operator',
+      linePrefix: '  digest: ',
+      bare: true,
+    },
   ],
   'wash-wasi-tls': [
     {
@@ -103,13 +118,15 @@ export function pinText(
 ): { text: string; matches: number } {
   if (!DIGEST.test(digest)) throw new Error(`not a sha256 digest: ${digest}`);
   // The ref is followed directly by `@`, so `wash:2.8.0-wasi-tls` never matches `...-exclusive`.
-  const pattern = new RegExp(`${escapeRegExp(target.ref)}@sha256:(?:[0-9a-f]{64}|<[^>\\n]*>)`, 'g');
+  const prefix = target.bare ? '' : `${escapeRegExp(target.ref)}@`;
+  const pattern = new RegExp(`${prefix}sha256:(?:[0-9a-f]{64}|<[^>\\n]*>)`, 'g');
+  const pinned = target.bare ? digest : `${target.ref}@${digest}`;
   let matches = 0;
   const lines = text.split('\n').map((line) => {
     if (target.linePrefix !== undefined && !line.startsWith(target.linePrefix)) return line;
     return line.replace(pattern, () => {
       matches++;
-      return `${target.ref}@${digest}`;
+      return pinned;
     });
   });
   return { text: lines.join('\n'), matches };

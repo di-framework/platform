@@ -99,7 +99,7 @@ CRDs in `crds/`. `make generate` in `platform/operator` writes `templates/crd.ya
 | Value | Default | Flag |
 | --- | --- | --- |
 | `image.repository` | `ghcr.io/di-framework/platform-operator` | |
-| `image.digest` | placeholder until the image pin PR (#271) sets it; must match `sha256:<64 hex>` | |
+| `image.digest` | the latest published operator image, kept current by the image pin PR (#271); must match `sha256:<64 hex>` | |
 | `replicaCount` | `1`; more than 1 requires `leaderElect` | |
 | `leaderElect` | `true` | `--leader-elect` |
 | `storageRootBase` | `/var/lib/kubesolo/instances` | `--storage-root-base` |
