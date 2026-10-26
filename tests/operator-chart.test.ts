@@ -436,6 +436,15 @@ describe('platform-operator chart', () => {
     expect(headlamp).toContain(`@headlamp-k8s/pluginctl@${values.headlamp.pluginsManager.version}`);
   }, 60000);
 
+  test('with Headlamp on, Headlamp watches for the plugin the sidecar writes later (#451)', async () => {
+    const rendered = await template('headlamp.enabled=true');
+    const deployment = find(rendered, 'Deployment', 'platform-operator-headlamp');
+    const container = deployment.spec.template.spec.containers.find(
+      (c: { name: string }) => c.name === 'headlamp',
+    );
+    expect(container.args).toContain('-watch-plugins-changes');
+  }, 60000);
+
   test('with Headlamp on, the plugin manager installs the plugin from Artifact Hub (#435)', async () => {
     const rendered = await template('headlamp.enabled=true');
     const config = find(rendered, 'ConfigMap', 'platform-operator-headlamp-plugin-config');

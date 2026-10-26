@@ -122,6 +122,10 @@ securityContext:
 # Everything under `headlamp` is passed to that chart; see its values.yaml.
 headlamp:
   enabled: false
+  config:
+    # The pluginctl sidecar below writes the plugin after Headlamp has started, so without
+    # `-watch-plugins-changes` Headlamp never serves it (#451, found by Layer 4). Keep this on.
+    watchPlugins: true
   # The PlatformInstance Headlamp plugin (#273) is installed by Headlamp's plugin manager sidecar
   # (`pluginctl install --config`) from its Artifact Hub entry (#435), which points at the tarball
   # attached to the platform's GitHub release. The plugin's version is the platform's release

@@ -145,3 +145,7 @@ first release that ships the plugin (v6.0.18), the chart on `main` names plugin 
 Artifact Hub entry, so the sidecar cannot install it from a source checkout. The sidecar
 needs egress to npm, artifacthub.io and github.com. Its `pluginctl` version and its `node` base image
 (by digest) are pinned rather than upstream's `latest` and `lts-alpine`.
+
+`headlamp.config.watchPlugins` is `true` here (upstream defaults to `false`), which starts Headlamp
+with `-watch-plugins-changes`. It must stay on: the sidecar writes the plugin after Headlamp has
+started, and without the watch Headlamp never picks it up, so the plugin is never served (#451).
