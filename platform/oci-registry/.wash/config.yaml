@@ -13,7 +13,7 @@ dev:
     - namespace: wasmcloud
       package: blobstore
       interfaces: [blobstore]
-      version: "0.1.0"
+      version: '0.1.0'
       config:
         backend: filesystem
         root: tmp/blobstore

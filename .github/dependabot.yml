@@ -1,93 +1,93 @@
 version: 2
 updates:
-  - package-ecosystem: "bun"
+  - package-ecosystem: 'bun'
     # The backup-destination prototype pins @pulumi/* to match platform/platform
     # (guarded by platform/backup-destination/tests/prototype.test.ts); one entry
     # keeps grouped bumps for both directories in the same pull request.
     directories:
-      - "/"
-      - "/platform/backup-destination/prototype"
+      - '/'
+      - '/platform/backup-destination/prototype'
     schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "09:00"
-      timezone: "UTC"
+      interval: 'weekly'
+      day: 'monday'
+      time: '09:00'
+      timezone: 'UTC'
     open-pull-requests-limit: 10
     assignees:
-      - "geoffsee"
+      - 'geoffsee'
     labels:
-      - "dependencies"
+      - 'dependencies'
     groups:
       bun-minor-and-patch:
         patterns:
-          - "*"
+          - '*'
         update-types:
-          - "minor"
-          - "patch"
+          - 'minor'
+          - 'patch'
       bun-major:
         patterns:
-          - "*"
+          - '*'
         update-types:
-          - "major"
+          - 'major'
     ignore:
       # The prototype stays on typescript ~5.9 because Pulumi's ts-node needs
       # TypeScript < 7. Dependabot ignores cannot be scoped per directory.
-      - dependency-name: "typescript"
+      - dependency-name: 'typescript'
         update-types:
-          - "version-update:semver-major"
+          - 'version-update:semver-major'
     commit-message:
-      prefix: "deps"
-      include: "scope"
+      prefix: 'deps'
+      include: 'scope'
 
   # The Headlamp plugin is a standalone package with its own bun.lock, so it has its own entry
   # and groups. typescript stays at the 5.6.2 override that @kinvolk/headlamp-plugin's tooling
   # supports.
-  - package-ecosystem: "bun"
-    directory: "/platform/operator/headlamp-plugin"
+  - package-ecosystem: 'bun'
+    directory: '/platform/operator/headlamp-plugin'
     schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "09:00"
-      timezone: "UTC"
+      interval: 'weekly'
+      day: 'monday'
+      time: '09:00'
+      timezone: 'UTC'
     open-pull-requests-limit: 5
     assignees:
-      - "geoffsee"
+      - 'geoffsee'
     labels:
-      - "dependencies"
+      - 'dependencies'
     groups:
       headlamp-plugin-minor-and-patch:
         patterns:
-          - "*"
+          - '*'
         update-types:
-          - "minor"
-          - "patch"
+          - 'minor'
+          - 'patch'
       headlamp-plugin-major:
         patterns:
-          - "*"
+          - '*'
         update-types:
-          - "major"
+          - 'major'
     ignore:
-      - dependency-name: "typescript"
+      - dependency-name: 'typescript'
     commit-message:
-      prefix: "deps"
-      include: "scope"
+      prefix: 'deps'
+      include: 'scope'
 
-  - package-ecosystem: "github-actions"
-    directory: "/"
+  - package-ecosystem: 'github-actions'
+    directory: '/'
     schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "09:00"
-      timezone: "UTC"
+      interval: 'weekly'
+      day: 'monday'
+      time: '09:00'
+      timezone: 'UTC'
     open-pull-requests-limit: 5
     assignees:
-      - "geoffsee"
+      - 'geoffsee'
     labels:
-      - "dependencies"
+      - 'dependencies'
     groups:
       github-actions:
         patterns:
-          - "*"
+          - '*'
     commit-message:
-      prefix: "ci"
-      include: "scope"
+      prefix: 'ci'
+      include: 'scope'

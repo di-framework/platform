@@ -282,7 +282,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-
   # The components' own Rust tests and smoke runs, in parallel with `typescript`.
   components:
     name: Components

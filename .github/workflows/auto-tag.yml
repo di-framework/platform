@@ -30,28 +30,28 @@ on:
   push:
     branches: [main]
     paths:
-      - "bun.lock"
-      - "package-lock.json"
-      - "yarn.lock"
-      - "pnpm-lock.yaml"
+      - 'bun.lock'
+      - 'package-lock.json'
+      - 'yarn.lock'
+      - 'pnpm-lock.yaml'
   pull_request:
     types: [closed]
     branches: [main]
     paths:
-      - "package.json"
+      - 'package.json'
   workflow_dispatch:
     inputs:
       bump:
-        description: "Which component to bump"
+        description: 'Which component to bump'
         type: choice
         options: [patch, minor, major]
         default: patch
       tag_only:
-        description: "Recovery: only tag the version on main and dispatch Release if it never ran; open no release PR"
+        description: 'Recovery: only tag the version on main and dispatch Release if it never ran; open no release PR'
         type: boolean
         default: false
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: '*/30 * * * *'
 
 permissions: {}
 
