@@ -149,6 +149,43 @@ test keeps the two identical):
 The values are applied **at creation only**. A later chart upgrade doesn't carry a changed CoreDNS config to
 the host-side synced ConfigMap, so changing them means recreating the instance.
 
+## Host-namespace isolation
+
+vCluster syncs the platform's NetworkPolicies to the host, but those cover the tenant namespaces, not the
+instance's `wasmcloud` namespace, its CoreDNS or the vCluster control plane. So the operator owns three
+NetworkPolicies in every instance host namespace (`pi-<namespace>-<name>-<hash>`), labelled
+`app.kubernetes.io/managed-by: platform-operator` (#452):
+
+- `platform-operator-deny-ingress`: every pod in the namespace is selected for ingress, so nothing gets in that
+  no policy allows;
+- `platform-operator-allow-same-namespace`: pods of the same host namespace get in, which covers the instance's
+  own synced pods, its CoreDNS, and its vCluster control plane reaching synced pods and serving the kubelet port
+  (10250) of its `vcluster-node-*` Services;
+- `platform-operator-allow-operator`: the operator's own namespace gets
+  in to the vCluster API (`app=vcluster` pods, port 8443 behind `svc/vcluster:443`), for the target check and
+  the installs.
+
+The target applies them on every reconcile, before the vCluster is installed, so a deleted or edited policy is
+back by the next round (and so by the next repair); an unchanged one is not written.
+
+What this isolates: pods of another instance, and pods in any other host namespace, can't reach this
+instance's `wasmcloud` services (NATS, host group, runtime-operator, `wasmcloud-http`), its CoreDNS, its vCluster
+API or its kubelet port. The platform's own synced policies keep isolating its tenant namespaces as before.
+
+What it doesn't:
+
+- **Egress** is not restricted here; it stays as the platform's synced policies set it (DNS to the host's
+  `kube-system/kube-dns` on 53 among it).
+- **The HTTP gateway.** The platform's synced `di-platform-gateway` policy admits its HTTP port from any
+  source, with no peers, so that `gateway.httpNodePort` traffic from outside the cluster arrives. Policies add
+  up, so the default deny doesn't close it, and pods of other instances can reach the gateway pods too, as anyone
+  can through the NodePort. The NodePort path itself needs no host-namespace rule.
+- **Other in-cluster clients of the vCluster API.** Only the operator's namespace is admitted to port 8443.
+  Anything else that uses an instance kubeconfig from inside the cluster must run in that namespace, or use
+  `kubectl port-forward`, which goes through the kubelet.
+- **Traffic from the node itself** (kubelet probes, and on kube-router any source the node masquerades) is
+  governed by the policy engine, not by these policies: kube-router admits traffic from the local node.
+
 ## Running it
 
 The image (`Dockerfile`) carries the operator, Node.js, npm and the Pulumi CLI, for linux/amd64 and
@@ -175,6 +212,9 @@ The operator needs:
   NetworkPolicy.
 - **egress to npm, the Pulumi plugin host and the platform's images**, since each install runs `npm install`
   and fetches the Pulumi Kubernetes provider plugin.
+- **its own namespace**, which every instance host namespace admits to the vCluster API (see
+  [Host-namespace isolation](#host-namespace-isolation)): read from its service account, or
+  `--cleanup-namespace` when run outside a cluster.
 - **a namespace that admits a `hostPath` pod** for the storage cleanup Job: `--cleanup-namespace`, which
   defaults to the operator's own namespace (read from its service account). Run outside a cluster, set it.
 

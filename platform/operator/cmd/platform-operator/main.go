@@ -12,6 +12,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -71,12 +72,20 @@ func run() error {
 	if err := controller.CheckStorageBase(*storageRootBase); err != nil {
 		return fmt.Errorf("--storage-root-base: %w", err)
 	}
+	// The operator's own namespace, which every instance host namespace admits to the vCluster
+	// API. Outside a cluster there is no service account, so it falls back to --cleanup-namespace.
+	operatorNS := ""
+	if ns, err := os.ReadFile(serviceAccountNamespace); err == nil {
+		operatorNS = strings.TrimSpace(string(ns))
+	}
 	if *cleanupNS == "" {
-		ns, err := os.ReadFile(serviceAccountNamespace)
-		if err != nil {
-			return fmt.Errorf("--cleanup-namespace is unset and the operator's namespace is unknown: %w", err)
+		if operatorNS == "" {
+			return errors.New("--cleanup-namespace is unset and the operator's namespace is unknown")
 		}
-		*cleanupNS = strings.TrimSpace(string(ns))
+		*cleanupNS = operatorNS
+	}
+	if operatorNS == "" {
+		operatorNS = *cleanupNS
 	}
 
 	scheme := runtime.NewScheme()
@@ -96,11 +105,12 @@ func run() error {
 		// Service reads (vCluster's kubeconfig, the host DNS Service) go to the API server, so
 		// the operator never caches the cluster's other Secrets, Helm releases among them.
 		// Namespace reads go there too, so the host namespace owner check never sees a stale copy,
-		// and so do the storage cleanup Job reads, which the operator polls instead of watching.
+		// and so do the storage cleanup Job reads, which the operator polls instead of watching,
+		// and the host-namespace NetworkPolicy reads, so the cache never holds every policy.
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
 			&corev1.Secret{}: {Label: labels.SelectorFromSet(controller.ManagedLabels)},
 		}},
-		Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}, &corev1.Service{}, &corev1.Namespace{}, &batchv1.Job{}, &corev1.Pod{}}}},
+		Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}, &corev1.Service{}, &corev1.Namespace{}, &batchv1.Job{}, &corev1.Pod{}, &networkingv1.NetworkPolicy{}}}},
 	})
 	if err != nil {
 		return err
@@ -111,8 +121,9 @@ func run() error {
 	r := &controller.Reconciler{
 		Client: mgr.GetClient(),
 		Target: &vcluster.Target{
-			Client: mgr.GetClient(),
-			Helm:   &vcluster.Helm{Config: cfg, Log: slog.Default()},
+			Client:            mgr.GetClient(),
+			Helm:              &vcluster.Helm{Config: cfg, Log: slog.Default()},
+			OperatorNamespace: operatorNS,
 		},
 		Installer: &installer.Pulumi{
 			StateDir:   *stateDir,

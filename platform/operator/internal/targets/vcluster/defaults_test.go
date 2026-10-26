@@ -139,7 +139,7 @@ func TestEnsureUsesTheHostDNSService(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "kube-dns"},
 		Spec:       corev1.ServiceSpec{ClusterIP: "10.43.0.99"},
 	})
-	if _, err := (&Target{Client: c, Helm: helm}).Ensure(context.Background(), inst); err != nil {
+	if _, err := (&Target{Client: c, Helm: helm, OperatorNamespace: operatorNS}).Ensure(context.Background(), inst); err != nil {
 		t.Fatal(err)
 	}
 	corefile, _ := coredns(t, normalize(t, helm.installed[HostNamespace(inst)]))
@@ -153,7 +153,7 @@ func TestEnsureUsesTheHostDNSService(t *testing.T) {
 
 	// Without the host DNS Service nothing is installed.
 	other := instance("team-b", "two")
-	if _, err := (&Target{Client: newClient(t), Helm: helm}).Ensure(context.Background(), other); err == nil {
+	if _, err := (&Target{Client: newClient(t), Helm: helm, OperatorNamespace: operatorNS}).Ensure(context.Background(), other); err == nil {
 		t.Fatal("Ensure must fail without the host DNS Service")
 	}
 	if _, ok := helm.installed[HostNamespace(other)]; ok {

@@ -85,11 +85,15 @@ type Target struct {
 	// Values renders the chart values for an instance; nil uses InstanceValues with the host
 	// DNS Service's ClusterIP.
 	Values func(ctx context.Context, inst *v1alpha1.PlatformInstance) (map[string]any, error)
+	// OperatorNamespace is the operator's own namespace, which the host-namespace
+	// NetworkPolicies admit to the vCluster API.
+	OperatorNamespace string
 }
 
 var _ targets.Target = (*Target)(nil)
 
-// Ensure installs the vCluster once and reports it ready when its control plane is ready and
+// Ensure puts the host-namespace NetworkPolicies in place (every round, so a deleted or edited
+// one comes back), installs the vCluster once and reports it ready when its control plane is ready and
 // its kubeconfig Secret exists. Values are applied at creation only (see InstanceValues). A
 // release left failed or pending (an install that errored or was interrupted) is removed so the
 // next round installs it again. That is reported as an error, so an install that fails the same
@@ -97,6 +101,9 @@ var _ targets.Target = (*Target)(nil)
 func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (targets.State, error) {
 	ns := HostNamespace(inst)
 	if err := t.claimNamespace(ctx, inst, ns); err != nil {
+		return targets.State{}, err
+	}
+	if err := t.applyNetworkPolicies(ctx, ns); err != nil {
 		return targets.State{}, err
 	}
 	rel, err := t.Helm.Get(ctx, ns, ReleaseName)
