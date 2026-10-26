@@ -182,7 +182,7 @@ class Harness {
     mode: string,
     keys: Keys,
     invoke?: string,
-  ): Promise<{ output: string; code: number; name: string; signal: string | null }> {
+  ): Promise<{ output: string; code: number; name: string; signal: string | number | null }> {
     const args = ['wasmtime', 'run'];
     if (dataDir) args.push('--dir', `${dataDir}::/data`);
     args.push('--env', `PGLITE_SMOKE_MODE=${mode}`);

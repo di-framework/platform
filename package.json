@@ -20,7 +20,7 @@
     "typecheck": "bun x tsc --noEmit"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.6.2",
+    "@biomejs/biome": "^2.5.15",
     "@types/bun": "latest",
     "@typescript/typescript6": "^6.0.2",
     "typescript": "^7.0.2"
