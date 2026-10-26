@@ -120,17 +120,23 @@ describe('versions and names', () => {
   });
 });
 
+// The repository's own plugin version: the release PR moves it, so the bump tests target a
+// version that is never the current one.
+const CURRENT: string = JSON.parse(read(join(repo, PLUGIN_DIR, 'package.json'))).version;
+const NEXT = '9.9.9';
+
 describe('setChartVersion', () => {
   const values = read(join(repo, CHART_VALUES));
 
   test('rewrites only the plugin entry version line', () => {
-    const out = setChartVersion(values, '6.0.18');
+    expect(CURRENT).not.toBe(NEXT);
+    const out = setChartVersion(values, NEXT);
     const before = values.split('\n');
     const after = out.split('\n');
     const changed = before.flatMap((line, i) => (line === after[i] ? [] : [[line, after[i]]]));
-    expect(changed).toEqual([['          version: 0.1.0', '          version: 6.0.18']]);
+    expect(changed).toEqual([[`          version: ${CURRENT}`, `          version: ${NEXT}`]]);
     expect(out).toContain('    version: 0.1.1\n');
-    expect(setChartVersion(out, '6.0.18')).toBe(out);
+    expect(setChartVersion(out, NEXT)).toBe(out);
   });
 
   test('fails when the plugin entry is gone', () => {
@@ -143,14 +149,16 @@ describe('setChartVersion', () => {
 describe('set-version', () => {
   test('moves the plugin package.json and the chart line, nothing else', () => {
     const root = scratch();
-    expect(main(['set-version', '6.0.18'], root)).toBe(0);
+    expect(main(['set-version', NEXT], root)).toBe(0);
     const pkg = JSON.parse(read(join(root, PLUGIN_DIR, 'package.json')));
     const original = JSON.parse(read(join(repo, PLUGIN_DIR, 'package.json')));
-    expect(pkg).toEqual({ ...original, version: '6.0.18' });
+    expect(pkg).toEqual({ ...original, version: NEXT });
+    expect(pkg.version).not.toBe(original.version);
     expect(read(join(root, CHART_VALUES))).toBe(
-      setChartVersion(read(join(repo, CHART_VALUES)), '6.0.18'),
+      setChartVersion(read(join(repo, CHART_VALUES)), NEXT),
     );
-    expect(logs).toEqual(['Set the Headlamp plugin version to 6.0.18']);
+    expect(read(join(root, CHART_VALUES))).toContain(`version: ${NEXT}\n`);
+    expect(logs).toEqual([`Set the Headlamp plugin version to ${NEXT}`]);
   });
 });
 
