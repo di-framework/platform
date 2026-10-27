@@ -284,7 +284,7 @@ describe('tenant and user resource reconciliation', () => {
         await controller.tick();
         await controller.tick();
         expect(reconcile).toHaveBeenCalledTimes(2);
-        expect(reconcile.mock.calls[0]![0].metadata.name).toBe(t.metadata.name);
+        expect(reconcile.mock.calls[0]?.[0].metadata.name).toBe(t.metadata.name);
         expect(services).toHaveBeenCalledTimes(2);
         const user = api.objects.get(key(u)) as unknown as User;
         expect(user.status?.conditions?.[0]?.reason).not.toBe('TenantNotReady');
@@ -320,6 +320,28 @@ describe('tenant and user resource reconciliation', () => {
       try {
         await controller.tick();
         expect(reconcile).not.toHaveBeenCalled();
+        const user = api.objects.get(key(u)) as unknown as User;
+        expect(user.status?.conditions?.[0]?.reason).toBe('TenantNotReady');
+      } finally {
+        reconcile.mockRestore();
+        warn.mockRestore();
+      }
+    });
+
+    it('ignores a Tenant found by GET that belongs to another installation', async () => {
+      const { api, controller, t, u } = prepare();
+      staleList(api, async () => ({
+        ...t,
+        metadata: { ...t.metadata, labels: { ...t.metadata.labels, [INSTALLATION]: 'other' } },
+      }));
+      const reconcile = spyOn(controller, 'reconcileTenant').mockResolvedValue();
+      const warn = spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await controller.tick();
+        expect(reconcile).not.toHaveBeenCalled();
+        expect(warn.mock.calls.some(([m]) => String(m).startsWith('Tenant list stale'))).toBe(
+          false,
+        );
         const user = api.objects.get(key(u)) as unknown as User;
         expect(user.status?.conditions?.[0]?.reason).toBe('TenantNotReady');
       } finally {

@@ -2543,7 +2543,8 @@ export class Controller {
   /**
    * The API server can keep answering a LIST from a stale watch cache while a GET by name finds
    * the object (#474). Tenants that Users or tenant namespaces reference but the LIST missed are
-   * read by name and appended to `tenants`, so they reconcile this tick.
+   * read by name and appended to `tenants`, so they reconcile this tick. A Tenant that nothing
+   * references stays invisible while the list is stale.
    */
   private async recoverUnlistedTenants(
     tenants: Tenant[],
@@ -2571,7 +2572,9 @@ export class Controller {
       if (listed.has(name)) continue;
       let tenant: Tenant | undefined;
       try {
-        tenant = await this.get<Tenant>(`${collection(VERSION, 'Tenant')}/${name}`);
+        tenant = await this.get<Tenant>(
+          `${collection(VERSION, 'Tenant')}/${encodeURIComponent(name)}`,
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`Tenant/${name}: GET after a LIST miss failed: ${message}`);
