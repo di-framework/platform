@@ -29,7 +29,7 @@ it does, `kubectl apply` of the same YAML does too.
     On Edit, existing tenant names are read-only: the platform has no rename, so a changed name
     would remove the old tenant (its namespaces deleted or kept per its `deletionPolicy`) and
     create a new one. Remove the tenant and add another to do that explicitly; new rows are
-    editable.
+    editable. A tenant removed and added back under the same name keeps its other settings.
   - **Users**: name and memberships (up to 128 users, 16 memberships each), each membership a
     tenant chosen from the Tenants rows and a role (`developer` or `viewer`). `suspended` is kept.
   - **Tenant auth**: issuer, client ID, the client secret as a reference to a Secret name and key

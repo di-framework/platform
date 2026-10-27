@@ -355,6 +355,25 @@ function at(root: unknown, path: readonly string[]): unknown {
   return node;
 }
 
+/**
+ * A tenant row added on Edit with the name of a tenant the object had when opened (removed and
+ * added back) keeps that tenant's other settings (deletionPolicy, resources, runtime, suspended).
+ */
+function withOpenedTenantSettings(
+  original: PlatformInstanceObject,
+  form: PlatformInstanceForm,
+): PlatformInstanceForm {
+  const opened = new Map(
+    (original.spec?.platform?.tenants ?? []).map(({ name, ...rest }) => [name, rest]),
+  );
+  return {
+    ...form,
+    tenants: form.tenants.map((t) =>
+      t.existing ? t : { ...t, rest: { ...opened.get(t.name.trim()), ...t.rest } },
+    ),
+  };
+}
+
 function emptyListAsAbsent(value: unknown): unknown {
   return Array.isArray(value) && value.length === 0 ? undefined : value;
 }
@@ -447,7 +466,7 @@ export function editPatch(
   form: PlatformInstanceForm,
 ): JsonPatchOp[] {
   const before: Tree = (original.spec ?? {}) as unknown as Tree;
-  const after = specFromForm(form);
+  const after = specFromForm(withOpenedTenantSettings(original, form));
   const work = structuredClone(before);
   const tests: JsonPatchOp[] = [];
   const changes: JsonPatchOp[] = [];

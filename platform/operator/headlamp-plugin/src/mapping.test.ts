@@ -713,6 +713,22 @@ describe('tenancy edits (#273, #442)', () => {
     ]);
   });
 
+  it('keeps the settings of a tenant removed and added back under the same name (S7)', () => {
+    const old = live(tenancyFull);
+    const form = formFromObject(old);
+    form.tenants = [...form.tenants.filter((t) => t.name !== 'acme'), { name: ' acme ', rest: {} }];
+    const updated = serverApply(old, editPatch(old, form));
+    expect(updated.spec.platform?.tenants).toStrictEqual([
+      tenancyFull.spec.platform?.tenants?.[1],
+      tenancyFull.spec.platform?.tenants?.[0],
+    ]);
+    // A new name gets no settings.
+    form.tenants = [...form.tenants, { name: 'initech', rest: {} }];
+    expect(applyPatch(old, editPatch(old, form)).spec.platform?.tenants?.[2]).toStrictEqual({
+      name: 'initech',
+    });
+  });
+
   it('keeps tenantAuth fields the form does not know', () => {
     const old = live(tenancyFull);
     Object.assign(old.spec.platform?.tenantAuth ?? {}, { futureField: 'x' });

@@ -289,7 +289,8 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
                     rows.map((t, k) => (k === i ? { ...t, name: e.target.value } : t)),
                   )
                 }
-                disabled={busy || tenant.existing}
+                disabled={busy}
+                InputProps={{ readOnly: tenant.existing }}
                 error={Boolean(error)}
                 helperText={
                   error ??

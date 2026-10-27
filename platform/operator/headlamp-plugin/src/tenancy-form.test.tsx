@@ -300,7 +300,11 @@ describe('the tenancy sections of the form', () => {
       />,
     );
     // The platform has no rename: a new name would remove the tenant and create another.
-    expect(input('tenants-0-name').disabled).toBe(true);
+    // Read-only, not disabled: keyboard users can focus it and reach the help text.
+    expect(input('tenants-0-name').readOnly).toBe(true);
+    expect(input('tenants-0-name').disabled).toBe(false);
+    input('tenants-0-name').focus();
+    expect(document.activeElement).toBe(input('tenants-0-name'));
     expect(screen.getAllByText(/Can't be renamed/)).toHaveLength(2);
     click('Add tenant');
     expect(input('tenants-2-name').disabled).toBe(false);
