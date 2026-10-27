@@ -389,6 +389,9 @@ export const RUNTIME_NATS_CONFIG = 'di-nats-config';
 /** The `di-nats` image; its shell also runs the JetStream account init step (#159). */
 export const RUNTIME_NATS_IMAGE = 'nats:2.12.8-alpine';
 
+/** Pod template annotation carrying the server config digest, so a cap change restarts NATS. */
+export const RUNTIME_NATS_CONFIG_ANNOTATION = 'platform.di-framework.dev/nats-config-sha256';
+
 /** `host:port` of a `nats://` URL; NATS's default port when the URL names none. */
 export function natsHostPort(url: string): string {
   const u = new URL(url);
@@ -403,6 +406,7 @@ export function waitForNatsContainer(targets: string[]) {
   const script = [
     'deadline=$(( $(date +%s) + 600 ))',
     `for t in ${targets.join(' ')}; do`,
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion
     '  h=${t%:*}; p=${t##*:}',
     '  until nc -z -w 2 "$h" "$p" 2>/dev/null; do',
     '    if ! nslookup "$h" >/dev/null 2>&1; then reason="DNS lookup failed"; else reason="TCP connect failed"; fi',
@@ -427,8 +431,7 @@ export function waitForNatsContainer(targets: string[]) {
     },
   };
 }
-/** Pod template annotation carrying the server config digest, so a cap change restarts NATS. */
-export const RUNTIME_NATS_CONFIG_ANNOTATION = 'platform.di-framework.dev/nats-config-sha256';
+
 const BINARY_QUANTITY = /^([1-9][0-9]*)(Ki|Mi|Gi|Ti)?$/;
 const MIB = 2 ** 20;
 const BINARY_UNITS: Record<string, number> = {
