@@ -31,6 +31,7 @@ import (
 	"github.com/di-framework/platform/operator/api/v1alpha1"
 	"github.com/di-framework/platform/operator/internal/controller"
 	"github.com/di-framework/platform/operator/internal/installer"
+	"github.com/di-framework/platform/operator/internal/logging"
 	"github.com/di-framework/platform/operator/internal/plan"
 	"github.com/di-framework/platform/operator/internal/targets/vcluster"
 )
@@ -64,6 +65,9 @@ func run() error {
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	// log/slog (the operator user line, the Helm wrapper) writes through the same zap logger, so
+	// its lines land in the pod log (#473).
+	logging.BridgeSlog(ctrl.Log)
 
 	passphrase, err := os.ReadFile(*passphraseFile)
 	if err != nil {
