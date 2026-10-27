@@ -3,9 +3,11 @@ package vcluster
 import (
 	"context"
 	"io"
+	"log/slog"
 	"strings"
 	"testing"
 
+	"github.com/go-logr/logr/funcr"
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chartutil"
@@ -13,6 +15,8 @@ import (
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/storage"
 	"helm.sh/helm/v3/pkg/storage/driver"
+
+	"github.com/di-framework/platform/operator/internal/logging"
 )
 
 // memoryHelm is a Helm whose releases live in memory and whose cluster writes go nowhere.
@@ -104,5 +108,36 @@ func TestHelmRollbackGoesToTheLastDeployedRevision(t *testing.T) {
 	}
 	if _, err := h.Rollback(context.Background(), "pi-x", "missing"); err == nil {
 		t.Fatal("rollback of a missing release succeeded")
+	}
+}
+
+// Helm's action lines go through the Helm wrapper's slog logger at Info, so with slog bridged
+// into the operator's logr logger they reach the pod log at its default verbosity (#473).
+func TestHelmLogReachesTheBridgedLogger(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var lines []string
+	logging.BridgeSlog(funcr.New(func(_, args string) { lines = append(lines, args) }, funcr.Options{}))
+
+	h, cfg := memoryHelm(t)
+	h.Log = slog.Default()
+	cfg.Log = h.logf("pi-x")
+	h.logf("pi-x")("performing update for %s", ReleaseName)
+	seed(t, cfg, 1, release.StatusDeployed)
+	if err := h.Repair(context.Background(), "pi-x", ReleaseName); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{
+		`"msg"="performing update for vcluster" "namespace"="pi-x"`,
+		`"msg"="preparing upgrade for vcluster" "namespace"="pi-x"`,
+	} {
+		found := false
+		for _, l := range lines {
+			found = found || strings.Contains(l, want)
+		}
+		if !found {
+			t.Errorf("no line contains %q in %q", want, lines)
+		}
 	}
 }

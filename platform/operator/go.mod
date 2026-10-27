@@ -3,6 +3,7 @@ module github.com/di-framework/platform/operator
 go 1.26.6
 
 require (
+	github.com/go-logr/logr v1.4.4
 	github.com/google/cel-go v0.29.2
 	github.com/pulumi/pulumi/sdk/v3 v3.270.0
 	helm.sh/helm/v3 v3.22.1
@@ -73,7 +74,6 @@ require (
 	github.com/go-git/go-git/v6 v6.0.0-beta.1 // indirect
 	github.com/go-gorp/gorp/v3 v3.1.0 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
-	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-logr/zapr v1.3.0 // indirect
 	github.com/go-openapi/jsonpointer v1.0.0 // indirect
@@ -96,7 +96,6 @@ require (
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/glog v1.2.5 // indirect
 	github.com/google/btree v1.1.3 // indirect
-	github.com/google/cel-go v0.29.2 // indirect
 	github.com/google/gnostic-models v0.7.1 // indirect
 	github.com/google/go-tpm v0.9.8 // indirect
 	github.com/google/uuid v1.6.0 // indirect

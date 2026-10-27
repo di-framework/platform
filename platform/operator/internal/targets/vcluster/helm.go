@@ -36,15 +36,21 @@ func (h *Helm) configuration(namespace string) (*action.Configuration, error) {
 	}
 	cfg := new(action.Configuration)
 	getter := &restGetter{config: h.Config, namespace: namespace}
-	logf := func(format string, args ...any) {
-		if h.Log != nil {
-			h.Log.Debug(fmt.Sprintf(format, args...), "namespace", namespace)
-		}
-	}
-	if err := cfg.Init(getter, namespace, "secret", logf); err != nil {
+	if err := cfg.Init(getter, namespace, "secret", h.logf(namespace)); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// logf is the printf-style log func Helm's actions write to. Its lines are the only trace of
+// what the operator ran inside an instance, so they log at Info: slog's Debug becomes logr V(4),
+// which the operator's zap logger drops by default (#473).
+func (h *Helm) logf(namespace string) func(format string, args ...any) {
+	return func(format string, args ...any) {
+		if h.Log != nil {
+			h.Log.Info(fmt.Sprintf(format, args...), "namespace", namespace)
+		}
+	}
 }
 
 // Get returns the release named name in namespace, or nil when there is none.
