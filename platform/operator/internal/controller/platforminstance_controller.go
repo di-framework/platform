@@ -46,6 +46,9 @@ const PlatformNamespace = "wasmcloud"
 // recovery relies on both.
 type Reconciler struct {
 	client.Client
+	// APIReader reads the instance past the cache before a resync reinstall (#472); nil skips
+	// that check.
+	APIReader APIReader
 	Target    targets.Target
 	Installer installer.Installer
 	// Recorder emits Events on PlatformInstances; nil emits none.
@@ -64,6 +67,11 @@ type Reconciler struct {
 	InstallTimeout time.Duration
 	// Now is injectable for tests; nil uses time.Now.
 	Now func() time.Time
+}
+
+// APIReader reads objects from the API server; client.Reader satisfies it.
+type APIReader interface {
+	Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error
 }
 
 // +kubebuilder:rbac:groups=platform.di-framework.dev,resources=platforminstances,verbs=get;list;watch;update;patch
@@ -147,10 +155,24 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 	}
 
+	if st.Ready && st.Resynced {
+		live, err := r.resyncDone(ctx, &inst, st.ServiceUID)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if live != nil {
+			// The cache still had the resync marker the reinstall cleared (#472): the resync is
+			// done, so this round follows the live instance without reinstalling again.
+			inst, st.Resynced = *live, false
+			obs = r.observe(&inst)
+			obs.TargetReady = st.Ready
+		}
+	}
 	d := plan.Next(obs, r.Plan)
-	if st.Ready && st.Resynced && d.Action == plan.Wait {
+	if st.Ready && st.Resynced && (d.Action == plan.Wait || d.Action == plan.Repair) {
 		// The target was resynced after its synced objects were lost (#466): run the install
 		// now instead of at the next repair, so the platform's Secrets and ConfigMaps come back.
+		// The reason is Resync whatever the plan said, a due repair included (#472).
 		d = plan.Decision{Action: plan.Repair, Reason: ReasonResync}
 	}
 	log.FromContext(ctx).V(1).Info("decision", "action", d.Action, "reason", d.Reason)
@@ -181,6 +203,24 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	default: // plan.Wait
 		return ctrl.Result{RequeueAfter: d.RequeueAfter}, r.markReady(ctx, &inst, st)
 	}
+}
+
+// resyncDone re-reads the instance past the cache and returns it when its resync marker for uid
+// is gone, which a finished reinstall clears; nil means the resync is still pending or there is
+// no APIReader. A cache that lags the reinstall's status patch would otherwise run the reinstall
+// a second time (#472).
+func (r *Reconciler) resyncDone(ctx context.Context, inst *v1alpha1.PlatformInstance, uid string) (*v1alpha1.PlatformInstance, error) {
+	if r.APIReader == nil {
+		return nil, nil
+	}
+	var live v1alpha1.PlatformInstance
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(inst), &live); err != nil {
+		return nil, err
+	}
+	if live.Status.Target.ResyncServiceUID == uid {
+		return nil, nil
+	}
+	return &live, nil
 }
 
 // markReady puts back the Ready status when the instance is installed and its target answers

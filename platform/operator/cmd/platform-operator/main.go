@@ -143,7 +143,8 @@ func run() error {
 		return err
 	}
 	r := &controller.Reconciler{
-		Client: mgr.GetClient(),
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
 		Target: &vcluster.Target{
 			Client:            mgr.GetClient(),
 			Helm:              &vcluster.Helm{Config: cfg, Log: slog.Default()},
