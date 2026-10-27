@@ -131,7 +131,7 @@ describe('gateway resources', () => {
   });
 
   it('limits gateway egress to DNS and host group HTTP of this installation', () => {
-    const policy = gatewayNetworkPolicySpec('wasmcloud', 'di-test');
+    const policy = gatewayNetworkPolicySpec('wasmcloud', 'di-test', {}, true);
     expect(policy.podSelector).toEqual({ matchLabels: { app: GATEWAY_NAME } });
     expect(policy.ingress).toEqual([{ ports: [{ protocol: 'TCP', port: GATEWAY_PORT }] }]);
     const hosts = policy.egress[1]!;
@@ -147,6 +147,25 @@ describe('gateway resources', () => {
           matchExpressions: [{ key: TENANT, operator: 'Exists' }],
         },
         podSelector: { matchLabels: { 'wasmcloud.com/name': 'hostgroup' } },
+      },
+    ]);
+  });
+});
+
+describe('gateway ingress (#457, #462)', () => {
+  it('admits only the platform and tenant namespaces when not published', () => {
+    expect(gatewayNetworkPolicySpec('wasmcloud', 'di-test').ingress).toEqual([
+      {
+        from: [
+          { namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'wasmcloud' } } },
+          {
+            namespaceSelector: {
+              matchLabels: { [INSTALLATION]: 'di-test' },
+              matchExpressions: [{ key: TENANT, operator: 'Exists' }],
+            },
+          },
+        ],
+        ports: [{ protocol: 'TCP', port: GATEWAY_PORT }],
       },
     ]);
   });

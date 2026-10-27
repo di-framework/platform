@@ -654,7 +654,11 @@ kubectl delete namespace di-tenant-alpha di-runtime-alpha di-apikeys-alpha
 `runtimeNats` (see [Runtime NATS storage caps](#runtime-nats-storage-caps)),
 and administrator `values` are optional. `tenants`, `users`,
 `tenantHostImage`, and `tenantHostImagePullPolicy` use the same declarations as the
-local entrypoint. NodePort zero makes the HTTP gateway ClusterIP. Registry installation is off
+local entrypoint. NodePort zero (the default here) makes the HTTP gateway ClusterIP, and its
+NetworkPolicy then admits only the platform and tenant namespaces (#457): an ingress controller
+or any other proxy in another namespace that fronts the gateway can no longer reach it, so set
+`httpNodePort` to publish it. Values overrides that add host groups get a warning: the platform
+renders an ingress policy for the `default` host group only. Registry installation is off
 for existing clusters. `insecureRegistry` gives the platform host group
 `--allow-insecure-registries`; tenant hosts get `--insecure-registry` only for each
 `insecureRegistries` entry (a list of `host[:port]`, spelled exactly as workload references spell
@@ -827,6 +831,23 @@ accept ingress only from the tenant hostgroup. `allowSharedHosts` remains
 still grants `pods/portforward` so developers can reach runtime pods (including
 backends) from their kubeconfig — consistent with the within-tenant Secret access
 model, not a claim of developer-proof network isolation.
+
+Platform namespace ingress (#462): the wasmCloud chart's own NetworkPolicies admit their
+ports from any source, so the platform turns them off (`networkPolicy.enabled: false`, enforced
+over values overrides) and renders its own. Every ingress rule names its peers by namespace
+label, never a bare rule or `namespaceSelector: {}`:
+
+| Policy | Pods, ports | Admits |
+| --- | --- | --- |
+| `di-platform-nats`, `di-tenant-scheduler` | NATS, 4222 | the platform namespace's host group and runtime-operator pods; this installation's tenant host groups |
+| `di-platform-hostgroup-default` | default host group, 9191 (`wasmcloud-http` 80 targets it) | platform namespace pods (the gateway) |
+| `di-platform-runtime-operator` | runtime-operator, 8082 and 8443 | platform namespace pods |
+| `di-platform-gateway` | gateway, 8080 (Service port 80) | any source when published (`httpNodePort` set); otherwise the platform namespace and this installation's tenant namespaces (#457) |
+
+On a host shared by vCluster instances, vCluster's policy sync rewrites each namespace
+selector into the instance's own `vcluster.loft.sh/ns-label-vcluster-x-<hash>` pod labels, so
+these peers match only the same instance's pods; a rule without `from` would admit every
+instance's. Only a published gateway is reachable from other instances.
 
 ### Installation ownership and lifecycle
 

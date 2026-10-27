@@ -18,6 +18,7 @@ import {
 } from './insecure-registries';
 import { tenantKubeconfig } from './kubeconfig';
 import { installNetworkPolicy } from './network-policy';
+import { extraHostGroupsWarning, platformIngressPolicies } from './platform-ingress';
 import {
   declarations,
   installTenancy,
@@ -200,6 +201,8 @@ export function validatePlatformConfig(args: PlatformConfigArgs): ValidatedPlatf
       `tenantAuth.${notDerived.join(', tenantAuth.')} not derived from routeUrlPattern ${routeUrlPattern} ` +
         '(only http://{host}.{tenant}.localhost[:<port>] is routed to tenant-auth); the 127.0.0.1 defaults apply',
     );
+  const extraHostGroups = extraHostGroupsWarning(args.values);
+  if (extraHostGroups) warnings.push(extraHostGroups);
   const runtimeNats = args.runtimeNats ?? config.getObject<RuntimeNatsConfig>('runtimeNats');
   assertRuntimeNatsConfig(runtimeNats);
   const backingServiceClasses = resolveBackingServiceClasses(config);
@@ -414,6 +417,14 @@ export function createPlatform(args: PlatformArgs) {
 
   const runtimeShutdown = args.beforeTenancy?.(wasmcloud) ?? wasmcloud;
 
+  // After the release, whose upgrade removes the chart's open policies (#462).
+  for (const { name, spec } of platformIngressPolicies(namespaceName, scope))
+    new k8s.networking.v1.NetworkPolicy(
+      name,
+      { metadata: { name, namespace: namespaceName }, spec },
+      { provider, dependsOn: [wasmcloud] },
+    );
+
   // The default host group's backend. The published port belongs to the gateway below.
   const httpBackend = new k8s.core.v1.Service(
     'http-entrypoint',
@@ -441,7 +452,12 @@ export function createPlatform(args: PlatformArgs) {
     'http-gateway',
     {
       metadata: { name: GATEWAY_NAME, namespace: namespaceName },
-      spec: gatewayNetworkPolicySpec(namespaceName, scope, tenantAuthRouteHosts),
+      spec: gatewayNetworkPolicySpec(
+        namespaceName,
+        scope,
+        tenantAuthRouteHosts,
+        HTTP_NODE_PORT !== 0,
+      ),
     },
     { provider, dependsOn: [namespaceResource] },
   );

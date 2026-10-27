@@ -11,6 +11,8 @@ export function platformValues(
   result.operator = operator;
   operator.allowSharedHosts = false;
   operator.hostNamespaces = (defaults.operator as Record<string, unknown>).hostNamespaces;
+  // The chart's policies admit their ports from any source; the platform renders its own (#462).
+  result.networkPolicy = { enabled: false };
   return result;
 }
 function merge(
