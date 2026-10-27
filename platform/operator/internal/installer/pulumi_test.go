@@ -2,6 +2,7 @@ package installer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/auto"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 )
 
 var errLocked = errors.New("the stack is currently locked by 1 lock(s)")
@@ -23,6 +25,8 @@ type fakeStack struct {
 	removed   []string
 	outputs   auto.OutputMap
 	cancelErr error
+	state     apitype.UntypedDeployment
+	replaced  []string
 }
 
 func (f *fakeStack) next(op string) error {
@@ -46,6 +50,13 @@ func (f *fakeStack) RemoveAllConfig(_ context.Context, keys []string) error {
 }
 func (f *fakeStack) Up(context.Context) error      { return f.next("up") }
 func (f *fakeStack) Refresh(context.Context) error { return f.next("refresh") }
+func (f *fakeStack) UpReplacing(_ context.Context, urns []string) error {
+	f.replaced = urns
+	return f.next("up-replace")
+}
+func (f *fakeStack) Export(context.Context) (apitype.UntypedDeployment, error) {
+	return f.state, f.next("export")
+}
 func (f *fakeStack) Cancel(context.Context) error {
 	f.calls = append(f.calls, "cancel")
 	return f.cancelErr
@@ -152,6 +163,43 @@ func TestRepairRefreshesBeforeUp(t *testing.T) {
 	}
 	if want := []string{"config", "refresh", "up", "outputs"}; !reflect.DeepEqual(s.calls, want) {
 		t.Fatalf("calls %v, want %v", s.calls, want)
+	}
+}
+
+const releaseState = `{"resources":[
+ {"urn":"urn:pulumi:instance::platform-instance::pulumi:pulumi:Stack::platform-instance-instance","type":"pulumi:pulumi:Stack"},
+ {"urn":"urn:pulumi:instance::platform-instance::kubernetes:helm.sh/v3:Release::wasmcloud","type":"kubernetes:helm.sh/v3:Release"},
+ {"urn":"urn:pulumi:instance::platform-instance::kubernetes:helm.sh/v3:Release::other","type":"kubernetes:helm.sh/v3:Release"},
+ {"urn":"urn:pulumi:instance::platform-instance::kubernetes:core/v1:Secret::wasmcloud","type":"kubernetes:core/v1:Secret"}]}`
+
+// A resync (#466) replaces the platform Release, found in the state, after the refresh.
+func TestResyncReplacesThePlatformRelease(t *testing.T) {
+	s := &fakeStack{fail: map[string][]error{}, state: apitype.UntypedDeployment{Deployment: json.RawMessage(releaseState)}}
+	p, _ := newTestPulumi(t, s)
+	if _, err := p.Install(context.Background(), request(), Options{Refresh: true, ReplaceRelease: true}); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"config", "refresh", "export", "up-replace", "outputs"}; !reflect.DeepEqual(s.calls, want) {
+		t.Fatalf("calls %v, want %v", s.calls, want)
+	}
+	if want := []string{"urn:pulumi:instance::platform-instance::kubernetes:helm.sh/v3:Release::wasmcloud"}; !reflect.DeepEqual(s.replaced, want) {
+		t.Fatalf("replaced %v, want %v", s.replaced, want)
+	}
+}
+
+func TestResyncReplaceErrors(t *testing.T) {
+	s := &fakeStack{fail: map[string][]error{"export": {errors.New("no state")}}}
+	p, _ := newTestPulumi(t, s)
+	if _, err := p.Install(context.Background(), request(), Options{ReplaceRelease: true}); err == nil || err.Error() != "export state: no state" {
+		t.Fatalf("export error: %v", err)
+	}
+	s = &fakeStack{fail: map[string][]error{}, state: apitype.UntypedDeployment{Deployment: json.RawMessage("[")}}
+	p, _ = newTestPulumi(t, s)
+	if _, err := p.Install(context.Background(), request(), Options{ReplaceRelease: true}); err == nil || !strings.Contains(err.Error(), "read state") {
+		t.Fatalf("bad state: %v", err)
+	}
+	if urns, err := releaseURNs(apitype.UntypedDeployment{}); err != nil || urns != nil {
+		t.Fatalf("empty state: %v %v", urns, err)
 	}
 }
 

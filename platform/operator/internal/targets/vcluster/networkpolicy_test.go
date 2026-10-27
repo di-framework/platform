@@ -120,7 +120,7 @@ func TestEnsureOwnsTheHostNetworkPolicies(t *testing.T) {
 }
 
 func TestEnsureNeedsTheOperatorNamespace(t *testing.T) {
-	tg := &Target{Client: newClient(t), Helm: &fakeHelm{installed: map[string]map[string]any{}}}
+	tg := &Target{Client: newClient(t), Helm: &fakeHelm{installed: map[string]map[string]any{}}, OperatorUsername: operatorUser}
 	if _, err := tg.Ensure(context.Background(), instance("team-a", "one")); err == nil || !strings.Contains(err.Error(), "operator's namespace") {
 		t.Fatalf("Ensure without the operator namespace: %v", err)
 	}

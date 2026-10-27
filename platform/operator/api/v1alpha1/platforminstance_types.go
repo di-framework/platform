@@ -371,6 +371,9 @@ const (
 	ConditionInstalled = "Installed"
 	// ConditionReady is True when the instance is usable at spec.version.
 	ConditionReady = "Ready"
+	// ConditionOwnerServiceProtected is True while the admission policy that protects the
+	// vCluster's service/vcluster is installed (#466).
+	ConditionOwnerServiceProtected = "OwnerServiceProtected"
 	// ConditionConfigApplied is True once an install applied the spec's platform settings
 	// (tenants, users, tenantAuth, tenant host image) of the generation status.applied names.
 	ConditionConfigApplied = "ConfigApplied"
@@ -479,6 +482,10 @@ type TargetStatus struct {
 	// restarted the vCluster control plane for.
 	// +optional
 	ResyncServiceUID string `json:"resyncServiceUID,omitempty"`
+
+	// ResyncStarted is when the running resync restarted the vCluster control plane.
+	// +optional
+	ResyncStarted *metav1.Time `json:"resyncStarted,omitempty"`
 }
 
 // SecretReference names a Secret in the PlatformInstance's namespace.

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -109,6 +110,12 @@ type Target struct {
 	// connection with a 5 second timeout.
 	Dial func(ctx context.Context, address string) error
 
+	// ResyncTimeout bounds a resync: one waiting longer at the same stage is reported
+	// TargetUnreachable. Zero means no bound.
+	ResyncTimeout time.Duration
+	// Now is injectable for tests; nil uses time.Now.
+	Now func() time.Time
+
 	mu sync.Mutex
 	// failures counts consecutive failed API checks per host namespace.
 	failures map[string]int
@@ -138,6 +145,16 @@ var _ targets.Target = (*Target)(nil)
 // unreachable only after UnreachableAfter consecutive failed checks, so one slow dial doesn't
 // flip a ready instance.
 func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (targets.State, error) {
+	unprotected, err := t.applyAdmissionPolicy(ctx)
+	if err != nil {
+		return targets.State{}, err
+	}
+	st, err := t.ensure(ctx, inst)
+	st.Unprotected = unprotected
+	return st, err
+}
+
+func (t *Target) ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (targets.State, error) {
 	ns := HostNamespace(inst)
 	// The unreachable count is of consecutive checks: a round that stops before the check
 	// (repairing, control plane or Secret pending, an error) starts it over.
@@ -151,9 +168,6 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 		return targets.State{}, err
 	}
 	if err := t.applyNetworkPolicies(ctx, ns); err != nil {
-		return targets.State{}, err
-	}
-	if err := t.applyAdmissionPolicy(ctx); err != nil {
 		return targets.State{}, err
 	}
 	rel, err := t.Helm.Get(ctx, ns, ReleaseName)
@@ -208,7 +222,16 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 		if err := t.Helm.Repair(ctx, ns, ReleaseName); err != nil {
 			return targets.State{}, fmt.Errorf("re-apply vcluster release to recreate %s: %w", strings.Join(missing, ", "), err)
 		}
-		return targets.State{Reason: "Repairing", Message: fmt.Sprintf("re-applied the vcluster release in namespace %s to recreate %s", ns, strings.Join(missing, ", "))}, nil
+		msg := fmt.Sprintf("re-applied the vcluster release in namespace %s to recreate %s", ns, strings.Join(missing, ", "))
+		if inst.Status.Target.ServiceUID != "" && slices.Contains(missing, "service/"+ReleaseName) {
+			// The owner Service is new: start the resync in the same round (#466).
+			svc := objs[1]
+			if err := t.Client.Get(ctx, client.ObjectKeyFromObject(svc), svc); err != nil {
+				return targets.State{}, err
+			}
+			return t.resync(ctx, ns, string(svc.GetUID()), ReasonResyncing, msg+"; restarted the vcluster control plane to resync")
+		}
+		return targets.State{Reason: "Repairing", Message: msg}, nil
 	}
 	sts := objs[0].(*appsv1.StatefulSet)
 	uid := string(objs[1].GetUID())
@@ -223,7 +246,7 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 	}
 	if sts.Status.ReadyReplicas < 1 {
 		if resyncing {
-			return targets.State{Reason: ReasonResyncing, Message: "resyncing: vcluster control plane not ready"}, nil
+			return t.resyncWaiting(inst, "vcluster control plane not ready"), nil
 		}
 		return targets.State{Reason: "ControlPlanePending", Message: "vcluster control plane not ready"}, nil
 	}
@@ -232,7 +255,7 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 	if err := t.Client.Get(ctx, types.NamespacedName{Namespace: ns, Name: "vc-" + ReleaseName}, &secret); apierrors.IsNotFound(err) {
 		switch {
 		case resyncing:
-			return targets.State{Reason: ReasonResyncing, Message: fmt.Sprintf("resyncing: waiting for vcluster to recreate its kubeconfig Secret %s/vc-%s", ns, ReleaseName)}, nil
+			return t.resyncWaiting(inst, fmt.Sprintf("waiting for vcluster to recreate its kubeconfig Secret %s/vc-%s", ns, ReleaseName)), nil
 		case recorded != "" || inst.Status.InstalledVersion != "":
 			// It existed once: the syncer won't create it again without a restart.
 			return t.resync(ctx, ns, uid, ReasonKubeconfigMissing,
@@ -257,7 +280,7 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 	checked = true
 	if err := t.dial(ctx, address); err != nil {
 		if resyncing {
-			return targets.State{Reason: ReasonResyncing, Message: fmt.Sprintf("resyncing: waiting for the vcluster API %s: %v", server, err)}, nil
+			return t.resyncWaiting(inst, fmt.Sprintf("waiting for the vcluster API %s: %v", server, err)), nil
 		}
 		n := t.countFailure(ns)
 		if n < UnreachableAfter {
@@ -279,6 +302,21 @@ const (
 	// recreates it.
 	ReasonKubeconfigMissing = "KubeconfigMissing"
 )
+
+// resyncWaiting reports a resync waiting at stage; past ResyncTimeout it is TargetUnreachable.
+func (t *Target) resyncWaiting(inst *v1alpha1.PlatformInstance, stage string) targets.State {
+	started := inst.Status.Target.ResyncStarted
+	if t.ResyncTimeout > 0 && started != nil {
+		now := time.Now
+		if t.Now != nil {
+			now = t.Now
+		}
+		if since := now().Sub(started.Time); since > t.ResyncTimeout {
+			return targets.State{Reason: "TargetUnreachable", Message: fmt.Sprintf("resync started %s ago is stuck: %s", since.Round(time.Second), stage)}
+		}
+	}
+	return targets.State{Reason: ReasonResyncing, Message: "resyncing: " + stage}
+}
 
 // resync deletes the vCluster pod, which its StatefulSet recreates. The restarted syncer
 // writes its kubeconfig Secret again and syncs the virtual objects that still exist back to the

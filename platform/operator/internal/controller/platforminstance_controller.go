@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/recorder"
 
 	"github.com/di-framework/platform/operator/api/v1alpha1"
 	"github.com/di-framework/platform/operator/internal/installer"
@@ -47,7 +48,9 @@ type Reconciler struct {
 	client.Client
 	Target    targets.Target
 	Installer installer.Installer
-	Plan      plan.Config
+	// Recorder emits Events on PlatformInstances; nil emits none.
+	Recorder recorder.EventRecorder
+	Plan     plan.Config
 	// StorageRootBase is the node directory under which each instance gets its own storageRoot
 	// when spec.platform.storageRoot is empty.
 	StorageRootBase string
@@ -70,6 +73,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;create;update
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,verbs=get;create;update
@@ -133,6 +137,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 		return r.fail(ctx, &inst, v1alpha1.ConditionTargetReady, reason, msg, err)
 	}
+	if err := r.reportProtection(ctx, &inst, st.Unprotected); err != nil {
+		return ctrl.Result{}, err
+	}
 	obs.TargetReady = st.Ready
 	if st.Ready {
 		if err := r.writeKubeconfig(ctx, &inst, st.Kubeconfig); err != nil {
@@ -162,7 +169,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				s.KubeconfigSecretRef = nil
 			}
 			if st.ResyncStarted != "" {
+				now := metav1.NewTime(r.now())
 				s.Target.ResyncServiceUID = st.ResyncStarted
+				s.Target.ResyncStarted = &now
 			}
 			setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionFalse, st.Reason, st.Message)
 			setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionFalse, "TargetPending", "waiting for the target cluster")
@@ -191,6 +200,31 @@ func (r *Reconciler) markReady(ctx context.Context, inst *v1alpha1.PlatformInsta
 		s.Target.ServiceUID = st.ServiceUID
 		setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionTrue, "Ready", "target cluster answers")
 		setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionTrue, "Ready", "instance is ready")
+	})
+}
+
+// ReasonAdmissionPolicyUnavailable (on OwnerServiceProtected) reports an API server without
+// admission policies, so service/vcluster can be deleted (#466).
+const ReasonAdmissionPolicyUnavailable = "AdmissionPolicyUnavailable"
+
+// reportProtection sets OwnerServiceProtected when it changes, with a Warning Event when the
+// target couldn't protect its owner Service.
+func (r *Reconciler) reportProtection(ctx context.Context, inst *v1alpha1.PlatformInstance, unprotected string) error {
+	status, reason, msg := metav1.ConditionTrue, "AdmissionPolicyInstalled", "an admission policy denies deleting service/vcluster"
+	if unprotected != "" {
+		status, reason, msg = metav1.ConditionFalse, ReasonAdmissionPolicyUnavailable, unprotected
+	}
+	if c := meta.FindStatusCondition(inst.Status.Conditions, v1alpha1.ConditionOwnerServiceProtected); c != nil && c.Status == status && c.Reason == reason {
+		return nil
+	}
+	if unprotected != "" {
+		log.FromContext(ctx).Info("owner Service unprotected", "reason", unprotected)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(inst, nil, corev1.EventTypeWarning, ReasonAdmissionPolicyUnavailable, "Protect", "%s", unprotected)
+		}
+	}
+	return r.patchStatus(ctx, inst, func(s *v1alpha1.PlatformInstanceStatus) {
+		setCondition(s, inst.Generation, v1alpha1.ConditionOwnerServiceProtected, status, reason, msg)
 	})
 }
 
@@ -228,7 +262,7 @@ func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstanc
 	// A repair, and a retry after a failed install, refresh first: the failed run may have left
 	// resources Pulumi hasn't recorded.
 	refresh := d.Action == plan.Repair || d.Reason == plan.ReasonRetry || st.Resynced
-	res, err := r.Installer.Install(installCtx, req, installer.Options{Refresh: refresh})
+	res, err := r.Installer.Install(installCtx, req, installer.Options{Refresh: refresh, ReplaceRelease: st.Resynced})
 	if errors.Is(err, installer.ErrHostImageNotApproved) {
 		return r.failConfig(ctx, inst, v1alpha1.ReasonTenantHostImageUnsupported,
 			fmt.Sprintf("%v. spec.platform.tenantHostImage is empty, so the operator's default would be used: set spec.platform.tenantHostImage, or a spec.version that approves it", err), err)

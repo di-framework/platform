@@ -106,11 +106,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	review, err := clientset.AuthenticationV1().SelfSubjectReviews().Create(context.Background(), &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+	reviewCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	review, err := clientset.AuthenticationV1().SelfSubjectReviews().Create(reviewCtx, &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+	cancel()
 	if err != nil {
 		return fmt.Errorf("look up the operator's username: %w", err)
 	}
 	operatorUser := review.Status.UserInfo.Username
+	slog.Info("operator user, allowed to delete service/vcluster", "username", operatorUser)
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: *metricsAddr},
@@ -142,7 +145,10 @@ func run() error {
 			Helm:              &vcluster.Helm{Config: cfg, Log: slog.Default()},
 			OperatorNamespace: operatorNS,
 			OperatorUsername:  operatorUser,
+			// A resync waiting longer than three repair intervals is reported unreachable.
+			ResyncTimeout: 3 * *repairInterval,
 		},
+		Recorder: mgr.GetEventRecorder("platform-operator"),
 		Installer: &installer.Pulumi{
 			StateDir:   *stateDir,
 			Passphrase: strings.TrimSpace(string(passphrase)),

@@ -6,8 +6,10 @@ import (
 	"strconv"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // HostNamespaceLabel marks an instance host namespace. The admission policy that protects
@@ -84,10 +86,22 @@ func AdmissionPolicy(operatorUsername string) (*admissionregistrationv1.Validati
 }
 
 // applyAdmissionPolicy creates the policy and its binding, or puts back a deleted or edited one.
-func (t *Target) applyAdmissionPolicy(ctx context.Context) error {
+// On an API server without admissionregistration.k8s.io/v1 admission policies (before
+// Kubernetes 1.30) it returns why instead of an error, so instances still reconcile unprotected.
+func (t *Target) applyAdmissionPolicy(ctx context.Context) (string, error) {
 	if t.OperatorUsername == "" {
-		return fmt.Errorf("the operator's username is unknown")
+		return "", fmt.Errorf("the operator's username is unknown")
 	}
+	err := t.writeAdmissionPolicy(ctx)
+	if meta.IsNoMatchError(err) {
+		msg := fmt.Sprintf("service/vcluster is not protected: the API server has no admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy (Kubernetes 1.30 or later): %v", err)
+		log.FromContext(ctx).Info(msg)
+		return msg, nil
+	}
+	return "", err
+}
+
+func (t *Target) writeAdmissionPolicy(ctx context.Context) error {
 	wantPolicy, wantBinding := AdmissionPolicy(t.OperatorUsername)
 	policy := &admissionregistrationv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: wantPolicy.Name}}
 	if _, err := controllerutil.CreateOrUpdate(ctx, t.Client, policy, func() error {

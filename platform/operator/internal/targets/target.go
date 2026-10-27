@@ -30,6 +30,9 @@ type State struct {
 	// Resynced is true when Ready after a resync: the controller then runs a full install with
 	// a refresh, so the platform's objects lost before the resync are created again.
 	Resynced bool
+	// Unprotected is set when the target couldn't install the protection of its owner Service
+	// (the API server lacks admission policies); the controller reports it and carries on.
+	Unprotected string
 }
 
 // Target creates, reports and deletes one instance's cluster.

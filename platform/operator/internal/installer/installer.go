@@ -48,6 +48,11 @@ type Options struct {
 	// Refresh reads the live cluster into the state before the up, so the up repairs drift
 	// (hand-deleted or edited resources). The periodic repair sets it.
 	Refresh bool
+	// ReplaceRelease makes the up replace the platform's Helm Release (the runtime-operator chart
+	// that renders the wasmcloud-*-tls Secrets). The Release's Helm record lives inside the
+	// target, so after the target lost the chart's objects (#466) a refresh still finds it and a
+	// plain up changes nothing; a replace installs the chart again.
+	ReplaceRelease bool
 }
 
 // State is the installer's view of an instance without running an update.

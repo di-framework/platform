@@ -11,12 +11,14 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/auto"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/optdestroy"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/optrefresh"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/optremove"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/optup"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
@@ -93,6 +95,10 @@ type stack interface {
 	GetAllConfig(ctx context.Context) (auto.ConfigMap, error)
 	RemoveAllConfig(ctx context.Context, keys []string) error
 	Up(ctx context.Context) error
+	// UpReplacing runs up and replaces the resources with the given URNs.
+	UpReplacing(ctx context.Context, urns []string) error
+	// Export returns the stack's state.
+	Export(ctx context.Context) (apitype.UntypedDeployment, error)
 	Refresh(ctx context.Context) error
 	Cancel(ctx context.Context) error
 	Destroy(ctx context.Context) error
@@ -137,10 +143,50 @@ func (p *Pulumi) Install(ctx context.Context, req Request, opts Options) (Result
 			return Result{}, err
 		}
 	}
-	if err := p.withLockRecovery(ctx, s, stateDir, "up", s.Up); err != nil {
+	up := s.Up
+	if opts.ReplaceRelease {
+		dep, err := s.Export(ctx)
+		if err != nil {
+			return Result{}, fmt.Errorf("export state: %w", err)
+		}
+		urns, err := releaseURNs(dep)
+		if err != nil {
+			return Result{}, err
+		}
+		p.logf("up: replacing %v\n", urns)
+		up = func(ctx context.Context) error { return s.UpReplacing(ctx, urns) }
+	}
+	if err := p.withLockRecovery(ctx, s, stateDir, "up", up); err != nil {
 		return Result{}, err
 	}
 	return result(ctx, s)
+}
+
+// PlatformRelease is the Pulumi name of the platform's Helm Release (the runtime-operator chart).
+const PlatformRelease = "wasmcloud"
+
+const releaseType = "kubernetes:helm.sh/v3:Release"
+
+// releaseURNs finds the platform Release in the state. None (no install yet) replaces nothing.
+func releaseURNs(dep apitype.UntypedDeployment) ([]string, error) {
+	var state struct {
+		Resources []struct {
+			URN  string `json:"urn"`
+			Type string `json:"type"`
+		} `json:"resources"`
+	}
+	if len(dep.Deployment) > 0 {
+		if err := json.Unmarshal(dep.Deployment, &state); err != nil {
+			return nil, fmt.Errorf("read state: %w", err)
+		}
+	}
+	var urns []string
+	for _, r := range state.Resources {
+		if r.Type == releaseType && strings.HasSuffix(r.URN, "::"+PlatformRelease) {
+			urns = append(urns, r.URN)
+		}
+	}
+	return urns, nil
 }
 
 // Status reports whether install state exists and the last outputs, without an update.
@@ -362,6 +408,13 @@ func (a *autoStack) RemoveAllConfig(ctx context.Context, keys []string) error {
 func (a *autoStack) Up(ctx context.Context) error {
 	_, err := a.s.Up(ctx, optup.ProgressStreams(a.log), optup.ErrorProgressStreams(a.log))
 	return err
+}
+func (a *autoStack) UpReplacing(ctx context.Context, urns []string) error {
+	_, err := a.s.Up(ctx, optup.Replace(urns), optup.ProgressStreams(a.log), optup.ErrorProgressStreams(a.log))
+	return err
+}
+func (a *autoStack) Export(ctx context.Context) (apitype.UntypedDeployment, error) {
+	return a.s.Export(ctx)
 }
 func (a *autoStack) Refresh(ctx context.Context) error {
 	_, err := a.s.Refresh(ctx, optrefresh.ProgressStreams(a.log), optrefresh.ErrorProgressStreams(a.log))

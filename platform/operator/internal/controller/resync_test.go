@@ -64,7 +64,7 @@ func TestResyncForcesAnInstall(t *testing.T) {
 	h.now = h.now.Add(time.Minute)
 	h.reconcile()
 	inst = h.get()
-	if len(h.in.installs) != 2 || !h.in.options[1].Refresh {
+	if len(h.in.installs) != 2 || !h.in.options[1].Refresh || !h.in.options[1].ReplaceRelease || h.in.options[0].ReplaceRelease {
 		t.Fatalf("installs %d options %+v", len(h.in.installs), h.in.options)
 	}
 	if inst.Status.Target != (v1alpha1.TargetStatus{ServiceUID: "uid-b"}) ||
