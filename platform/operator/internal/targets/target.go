@@ -21,6 +21,15 @@ type State struct {
 	Reason string
 	// Message is a readable detail when not Ready.
 	Message string
+	// ServiceUID identifies the target's API Service when Ready. The controller records it in
+	// status.target.serviceUID once the platform is installed on it.
+	ServiceUID string
+	// ResyncStarted is set when the target restarted its control plane to resync it; the
+	// controller records it in status.target.resyncServiceUID.
+	ResyncStarted string
+	// Resynced is true when Ready after a resync: the controller then runs a full install with
+	// a refresh, so the platform's objects lost before the resync are created again.
+	Resynced bool
 }
 
 // Target creates, reports and deletes one instance's cluster.

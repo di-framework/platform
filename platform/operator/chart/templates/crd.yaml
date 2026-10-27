@@ -539,6 +539,23 @@ spec:
                 - Failed
                 - Deleting
                 type: string
+              target:
+                description: Target is what the operator recorded about the instance's
+                  target cluster.
+                properties:
+                  resyncServiceUID:
+                    description: |-
+                      ResyncServiceUID is set while a resync is running: the uid of the service/vcluster it
+                      restarted the vCluster control plane for.
+                    type: string
+                  serviceUID:
+                    description: |-
+                      ServiceUID is the uid of the vCluster's service/vcluster when the platform was last
+                      installed or resynced. vCluster makes that Service the owner of every object it syncs into
+                      the host namespace, so a different uid means the synced state was garbage-collected and
+                      the instance needs a resync (#466).
+                    type: string
+                type: object
             type: object
         type: object
         x-kubernetes-validations:

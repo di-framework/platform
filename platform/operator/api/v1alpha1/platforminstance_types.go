@@ -430,6 +430,10 @@ type PlatformInstanceStatus struct {
 	// +optional
 	LastRepair *metav1.Time `json:"lastRepair,omitempty"`
 
+	// Target is what the operator recorded about the instance's target cluster.
+	// +optional
+	Target TargetStatus `json:"target,omitempty"`
+
 	// Conditions carry readable reasons for each part of the reconcile.
 	// +listType=map
 	// +listMapKey=type
@@ -460,6 +464,21 @@ type AppliedConfig struct {
 	// With spec.platform.tenantHostImage empty, later installs keep using it.
 	// +optional
 	TenantHostImage string `json:"tenantHostImage,omitempty"`
+}
+
+// TargetStatus is what the operator recorded about an instance's target.
+type TargetStatus struct {
+	// ServiceUID is the uid of the vCluster's service/vcluster when the platform was last
+	// installed or resynced. vCluster makes that Service the owner of every object it syncs into
+	// the host namespace, so a different uid means the synced state was garbage-collected and
+	// the instance needs a resync (#466).
+	// +optional
+	ServiceUID string `json:"serviceUID,omitempty"`
+
+	// ResyncServiceUID is set while a resync is running: the uid of the service/vcluster it
+	// restarted the vCluster control plane for.
+	// +optional
+	ResyncServiceUID string `json:"resyncServiceUID,omitempty"`
 }
 
 // SecretReference names a Secret in the PlatformInstance's namespace.

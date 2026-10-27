@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,11 +11,15 @@ import (
 	"strings"
 	"time"
 
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -95,6 +100,17 @@ func run() error {
 		}
 	}
 	cfg := ctrl.GetConfigOrDie()
+	// The admission policy that protects service/vcluster (#466) lets the operator's own user
+	// delete it; ask the API server who that is.
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return err
+	}
+	review, err := clientset.AuthenticationV1().SelfSubjectReviews().Create(context.Background(), &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("look up the operator's username: %w", err)
+	}
+	operatorUser := review.Status.UserInfo.Username
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: *metricsAddr},
@@ -110,7 +126,8 @@ func run() error {
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
 			&corev1.Secret{}: {Label: labels.SelectorFromSet(controller.ManagedLabels)},
 		}},
-		Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}, &corev1.Service{}, &corev1.Namespace{}, &batchv1.Job{}, &corev1.Pod{}, &networkingv1.NetworkPolicy{}}}},
+		Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}, &corev1.Service{}, &corev1.Namespace{}, &batchv1.Job{}, &corev1.Pod{}, &networkingv1.NetworkPolicy{},
+			&admissionregistrationv1.ValidatingAdmissionPolicy{}, &admissionregistrationv1.ValidatingAdmissionPolicyBinding{}}}},
 	})
 	if err != nil {
 		return err
@@ -124,6 +141,7 @@ func run() error {
 			Client:            mgr.GetClient(),
 			Helm:              &vcluster.Helm{Config: cfg, Log: slog.Default()},
 			OperatorNamespace: operatorNS,
+			OperatorUsername:  operatorUser,
 		},
 		Installer: &installer.Pulumi{
 			StateDir:   *stateDir,

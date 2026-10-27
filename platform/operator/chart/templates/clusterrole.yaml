@@ -21,6 +21,7 @@ rules:
   - delete
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - ""
@@ -47,6 +48,15 @@ rules:
   - services
   verbs:
   - get
+- apiGroups:
+  - admissionregistration.k8s.io
+  resources:
+  - validatingadmissionpolicies
+  - validatingadmissionpolicybindings
+  verbs:
+  - create
+  - get
+  - update
 - apiGroups:
   - apps
   resources:

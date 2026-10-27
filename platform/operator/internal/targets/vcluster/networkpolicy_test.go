@@ -86,7 +86,7 @@ func TestEnsureOwnsTheHostNetworkPolicies(t *testing.T) {
 	ns := HostNamespace(inst)
 	helm := &fakeHelm{installed: map[string]map[string]any{}}
 	c := newClient(t)
-	tg := &Target{Client: c, Helm: helm, OperatorNamespace: operatorNS, Values: func(context.Context, *v1alpha1.PlatformInstance) (map[string]any, error) {
+	tg := &Target{Client: c, Helm: helm, OperatorNamespace: operatorNS, OperatorUsername: operatorUser, Values: func(context.Context, *v1alpha1.PlatformInstance) (map[string]any, error) {
 		return map[string]any{}, nil
 	}}
 	ctx := context.Background()
@@ -132,7 +132,7 @@ func TestApplyNetworkPoliciesReportsAWriteError(t *testing.T) {
 			return errors.New("denied")
 		},
 	})
-	tg := &Target{Client: c, OperatorNamespace: operatorNS}
+	tg := &Target{Client: c, OperatorNamespace: operatorNS, OperatorUsername: operatorUser}
 	if err := tg.applyNetworkPolicies(context.Background(), "pi-x"); err == nil || !strings.Contains(err.Error(), "network policy pi-x/"+PolicyDenyIngress+": denied") {
 		t.Fatalf("write error: %v", err)
 	}
