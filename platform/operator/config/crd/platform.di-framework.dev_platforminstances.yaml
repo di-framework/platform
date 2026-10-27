@@ -100,7 +100,279 @@ spec:
                       operator's per-instance default, which deletionPolicy Delete removes. The operator didn't
                       create a path set here, so it never removes it.
                     type: string
+                  tenantAuth:
+                    description: |-
+                      TenantAuth enables the per-tenant console and /v1 API against an OIDC issuer (the
+                      platform's `tenantAuth` config). Unset, tenants get no console.
+                    properties:
+                      clientId:
+                        description: ClientID is the console's confidential OAuth
+                          client (oauthClient.id).
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      clientSecretRef:
+                        description: |-
+                          ClientSecretRef names the Secret, in the PlatformInstance's namespace, and its key that
+                          hold the OAuth client secret.
+                        properties:
+                          key:
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          name:
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                      consolePublicUrl:
+                        description: ConsolePublicURL is the browser-visible console
+                          URL; {tenant} is replaced.
+                        maxLength: 2048
+                        pattern: ^https?://
+                        type: string
+                      controllerPublicUrl:
+                        description: ControllerPublicURL is the controller URL shown
+                          to users and CLIs; {tenant} is replaced.
+                        maxLength: 2048
+                        pattern: ^https?://
+                        type: string
+                      image:
+                        description: Image is the tenant-auth image, pinned by digest
+                          (<repository>@sha256:<digest>).
+                        maxLength: 512
+                        pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                        type: string
+                      issuer:
+                        description: Issuer is the OIDC issuer URL, as both pods and
+                          browsers name it.
+                        maxLength: 2048
+                        pattern: ^https?://
+                        type: string
+                      issuerIp:
+                        description: IssuerIP is the issuer's IPv4 when pods cannot
+                          resolve its hostname.
+                        maxLength: 15
+                        type: string
+                      issuerUpstream:
+                        description: |-
+                          IssuerUpstream is the in-cluster <service>.<namespace>[.svc...]:<port> a sidecar forwards a
+                          loopback issuer's port to.
+                        maxLength: 512
+                        type: string
+                      issuerUpstreamPodPort:
+                        description: IssuerUpstreamPodPort is the pod port behind
+                          issuerUpstream.
+                        format: int32
+                        maximum: 65535
+                        minimum: 1
+                        type: integer
+                      registry:
+                        description: Registry deploys each tenant's own OCI registry.
+                        properties:
+                          component:
+                            description: Component is the oci-registry component,
+                              pinned by digest.
+                            maxLength: 512
+                            pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                            type: string
+                          limits:
+                            description: Limits bound the controller's registry front.
+                            properties:
+                              maxBodyBytes:
+                                format: int64
+                                minimum: 1
+                                type: integer
+                              maxConcurrent:
+                                format: int64
+                                minimum: 1
+                                type: integer
+                              uploadIdleTimeoutMs:
+                                format: int64
+                                minimum: 1
+                                type: integer
+                              upstreamTimeoutMs:
+                                format: int64
+                                minimum: 1
+                                type: integer
+                            type: object
+                          publicUrl:
+                            description: PublicURL is the registry origin users log
+                              in to; {tenant} is replaced.
+                            maxLength: 2048
+                            pattern: ^https?://
+                            type: string
+                        required:
+                        - component
+                        type: object
+                    required:
+                    - image
+                    type: object
+                    x-kubernetes-validations:
+                    - message: tenantAuth needs issuer, clientId and clientSecretRef
+                        together
+                      rule: has(self.issuer) && has(self.clientId) && has(self.clientSecretRef)
+                  tenantHostImage:
+                    description: |-
+                      TenantHostImage is the platform's `tenantHostImage`. A change is applied by the next install
+                      and restarts the tenant hosts. Empty keeps the image status.applied.tenantHostImage recorded;
+                      a new instance records the operator's pinned exclusive host variant
+                      (ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive by digest; the spec.version package must
+                      list it as an approved host build), and an instance installed before this field existed keeps
+                      the platform's own default.
+                    maxLength: 512
+                    pattern: ^[^\s@]+(@sha256:[0-9a-f]{64})?$
+                    type: string
+                  tenantHostImagePullPolicy:
+                    description: |-
+                      TenantHostImagePullPolicy is the platform's `tenantHostImagePullPolicy` (the platform
+                      defaults to IfNotPresent).
+                    enum:
+                    - Always
+                    - IfNotPresent
+                    - Never
+                    type: string
+                  tenants:
+                    description: |-
+                      Tenants are the platform's tenants (its `tenants` config). A change on a Ready instance is
+                      applied by the install the spec change starts.
+                    items:
+                      description: Tenant is one entry of the platform's `tenants`
+                        config.
+                      properties:
+                        deletionPolicy:
+                          description: |-
+                            DeletionPolicy is what removing the tenant does to its data: Retain or Delete (the
+                            platform's default applies when unset).
+                          enum:
+                          - Retain
+                          - Delete
+                          type: string
+                        name:
+                          description: Name is 1-40 lowercase letters, digits and
+                            hyphens, starting with a letter.
+                          maxLength: 40
+                          pattern: ^[a-z][a-z0-9]*(-[a-z0-9]+)*$
+                          type: string
+                        resources:
+                          description: Resources are the tenant's quotas.
+                          properties:
+                            apiKeys:
+                              format: int32
+                              maximum: 10000
+                              minimum: 1
+                              type: integer
+                            backingServices:
+                              format: int32
+                              maximum: 100
+                              minimum: 1
+                              type: integer
+                            cpu:
+                              description: The bounds are the platform Tenant CRD's.
+                              maxLength: 32
+                              pattern: ^[0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|Ti)?$
+                              type: string
+                            memory:
+                              maxLength: 32
+                              pattern: ^[0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|Ti)?$
+                              type: string
+                            serviceBindings:
+                              format: int32
+                              maximum: 400
+                              minimum: 1
+                              type: integer
+                            workloads:
+                              format: int32
+                              maximum: 1000
+                              minimum: 1
+                              type: integer
+                          type: object
+                        runtime:
+                          description: Runtime sizes the tenant's hosts.
+                          properties:
+                            coreInstances:
+                              description: CoreInstances is WASH_CORE_INSTANCES for
+                                the tenant host (platform default 100).
+                              format: int32
+                              maximum: 10000
+                              minimum: 1
+                              type: integer
+                            replicas:
+                              format: int32
+                              maximum: 10
+                              minimum: 1
+                              type: integer
+                          type: object
+                        suspended:
+                          description: Suspended suspends the tenant.
+                          type: boolean
+                      required:
+                      - name
+                      type: object
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  users:
+                    description: Users are the platform's users and their tenant memberships
+                      (its `users` config).
+                    items:
+                      description: User is one entry of the platform's `users` config.
+                      properties:
+                        memberships:
+                          description: Memberships are the tenants the user belongs
+                            to, one entry per tenant.
+                          items:
+                            description: Membership puts a user in a tenant.
+                            properties:
+                              role:
+                                description: MembershipRole is a user's role in a
+                                  tenant.
+                                enum:
+                                - developer
+                                - viewer
+                                type: string
+                              tenant:
+                                description: Tenant names an entry of spec.platform.tenants.
+                                maxLength: 40
+                                type: string
+                            required:
+                            - role
+                            - tenant
+                            type: object
+                          maxItems: 16
+                          type: array
+                          x-kubernetes-list-map-keys:
+                          - tenant
+                          x-kubernetes-list-type: map
+                        name:
+                          description: Name is 1-40 lowercase letters, digits and
+                            hyphens, starting with a letter.
+                          maxLength: 40
+                          pattern: ^[a-z][a-z0-9]*(-[a-z0-9]+)*$
+                          type: string
+                        suspended:
+                          description: Suspended blocks the user's access.
+                          type: boolean
+                      required:
+                      - memberships
+                      - name
+                      type: object
+                    maxItems: 128
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
                 type: object
+                x-kubernetes-validations:
+                - message: every users[].memberships[].tenant must name an entry of
+                    tenants
+                  rule: '!has(self.users) || self.users.all(u, u.memberships.all(m,
+                    has(self.tenants) && self.tenants.exists(t, t.name == m.tenant)))'
               target:
                 description: Target is where the instance runs.
                 properties:
@@ -132,6 +404,37 @@ spec:
           status:
             description: PlatformInstanceStatus is the observed state of an instance.
             properties:
+              applied:
+                description: Applied summarizes the platform settings the last successful
+                  install applied.
+                properties:
+                  generation:
+                    description: Generation is the metadata.generation whose settings
+                      were applied.
+                    format: int64
+                    type: integer
+                  tenantAuthIssuer:
+                    description: TenantAuthIssuer is the applied tenantAuth issuer;
+                      empty without tenantAuth.
+                    type: string
+                  tenantHostImage:
+                    description: |-
+                      TenantHostImage is the applied tenant host image; empty means the platform's own default.
+                      With spec.platform.tenantHostImage empty, later installs keep using it.
+                    type: string
+                  tenants:
+                    description: Tenants is the number of applied tenants.
+                    format: int32
+                    type: integer
+                  users:
+                    description: Users is the number of applied users.
+                    format: int32
+                    type: integer
+                required:
+                - generation
+                - tenants
+                - users
+                type: object
               conditions:
                 description: Conditions carry readable reasons for each part of the
                   reconcile.

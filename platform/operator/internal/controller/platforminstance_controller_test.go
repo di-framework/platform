@@ -87,6 +87,8 @@ func newHarness(t *testing.T, policy v1alpha1.DeletionPolicy) *harness {
 		ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name, Generation: 1, UID: "uid-1"},
 		Spec: v1alpha1.PlatformInstanceSpec{
 			Version: "6.0.17", Target: v1alpha1.TargetSpec{Type: v1alpha1.TargetVCluster}, DeletionPolicy: policy,
+			// 6.0.17 predates the exclusive default (tenancy_test.go covers the default).
+			Platform: v1alpha1.PlatformSettings{TenantHostImage: testHostImage},
 		},
 	}
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(inst).WithStatusSubresource(inst).Build()
@@ -252,8 +254,10 @@ func TestInstallRequest(t *testing.T) {
 	want := map[string]any{
 		"namespace": "wasmcloud", "networkPolicyEngine": "existing", "httpNodePort": 0,
 		"storageRoot": "/var/lib/kubesolo/instances/team-a/one", "kubernetesEndpoint": "https://vcluster.pi-team-a-one.svc:443",
+		"tenants": []v1alpha1.Tenant{}, "users": []v1alpha1.User{}, "tenantHostImage": testHostImage,
 	}
-	if req.ID != "team-a.one" || req.Version != "6.0.17" || !reflect.DeepEqual(req.Settings, want) {
+	if req.ID != "team-a.one" || req.Version != "6.0.17" || !reflect.DeepEqual(req.Settings, want) || req.SecretSettings != nil ||
+		!reflect.DeepEqual(req.Unset, []string{"tenantAuth", "tenantAuthClientSecret", "tenantHostImage", "tenantHostImagePullPolicy"}) {
 		t.Fatalf("install request %+v", req)
 	}
 	if h.in.options[0].Refresh {

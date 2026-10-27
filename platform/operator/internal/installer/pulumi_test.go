@@ -19,6 +19,8 @@ type fakeStack struct {
 	calls     []string
 	fail      map[string][]error // per operation, one error per call (nil = success)
 	config    auto.ConfigMap
+	held      auto.ConfigMap // what GetAllConfig returns
+	removed   []string
 	outputs   auto.OutputMap
 	cancelErr error
 }
@@ -34,6 +36,13 @@ func (f *fakeStack) next(op string) error {
 func (f *fakeStack) SetAllConfig(_ context.Context, c auto.ConfigMap) error {
 	f.config = c
 	return f.next("config")
+}
+func (f *fakeStack) GetAllConfig(context.Context) (auto.ConfigMap, error) {
+	return f.held, f.next("getconfig")
+}
+func (f *fakeStack) RemoveAllConfig(_ context.Context, keys []string) error {
+	f.removed = append(f.removed, keys...)
+	return f.next("rmconfig")
 }
 func (f *fakeStack) Up(context.Context) error      { return f.next("up") }
 func (f *fakeStack) Refresh(context.Context) error { return f.next("refresh") }

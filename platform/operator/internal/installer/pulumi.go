@@ -30,8 +30,33 @@ const (
 	stackName   = "instance"
 )
 
-// program is the whole Pulumi program: the platform's existing-cluster entrypoint.
-const program = `export { schemaVersion, kubeconfig, namespace, endpoints, tenants, users } from '@di-framework/platform/existing';
+// program is the whole Pulumi program: the platform's existing-cluster entrypoint, plus, with
+// tenantAuth, the Secret in the platform namespace that tenantAuth.oauthClient.secretName names,
+// holding the client secret from the encrypted config key tenantAuthClientSecret.
+const program = `import { readFileSync } from 'node:fs';
+import * as k8s from '@pulumi/kubernetes';
+import * as pulumi from '@pulumi/pulumi';
+import { kubeconfig, namespace } from '@di-framework/platform/existing';
+
+export { schemaVersion, kubeconfig, namespace, endpoints, tenants, users } from '@di-framework/platform/existing';
+
+const config = new pulumi.Config();
+const clientSecret = config.getSecret('` + TenantAuthClientSecretKey + `');
+const tenantAuth = config.getObject<{ oauthClient?: { secretName?: string; secretKey?: string } }>('tenantAuth');
+if (clientSecret !== undefined && tenantAuth?.oauthClient?.secretName) {
+  const provider = new k8s.Provider('tenant-auth-oauth', {
+    kubeconfig: pulumi.secret(readFileSync(kubeconfig, 'utf8')),
+    enableServerSideApply: true,
+  });
+  new k8s.core.v1.Secret(
+    'tenant-auth-oauth',
+    {
+      metadata: { name: tenantAuth.oauthClient.secretName, namespace },
+      stringData: { [tenantAuth.oauthClient.secretKey ?? 'clientSecret']: clientSecret },
+    },
+    { provider },
+  );
+}
 `
 
 var (
@@ -65,6 +90,8 @@ type Pulumi struct {
 // stack is the part of auto.Stack the installer uses, so lock recovery is testable.
 type stack interface {
 	SetAllConfig(ctx context.Context, c auto.ConfigMap) error
+	GetAllConfig(ctx context.Context) (auto.ConfigMap, error)
+	RemoveAllConfig(ctx context.Context, keys []string) error
 	Up(ctx context.Context) error
 	Refresh(ctx context.Context) error
 	Cancel(ctx context.Context) error
@@ -86,6 +113,11 @@ func (p *Pulumi) Install(ctx context.Context, req Request, opts Options) (Result
 	if err := p.writeProject(ctx, req, projectDir, stateDir); err != nil {
 		return Result{}, err
 	}
+	if req.ApprovedHostImage != "" {
+		if err := checkApprovedHostImage(projectDir, req.Version, req.ApprovedHostImage); err != nil {
+			return Result{}, err
+		}
+	}
 	s, err := p.openStack(ctx, req.ID, projectDir, stateDir)
 	if err != nil {
 		return Result{}, err
@@ -96,6 +128,9 @@ func (p *Pulumi) Install(ctx context.Context, req Request, opts Options) (Result
 	}
 	if err := s.SetAllConfig(ctx, config); err != nil {
 		return Result{}, fmt.Errorf("set config: %w", err)
+	}
+	if err := unset(ctx, s, req, config); err != nil {
+		return Result{}, err
 	}
 	if opts.Refresh {
 		if err := p.withLockRecovery(ctx, s, stateDir, "refresh", s.Refresh); err != nil {
@@ -318,6 +353,12 @@ type autoStack struct {
 func (a *autoStack) SetAllConfig(ctx context.Context, c auto.ConfigMap) error {
 	return a.s.SetAllConfig(ctx, c)
 }
+func (a *autoStack) GetAllConfig(ctx context.Context) (auto.ConfigMap, error) {
+	return a.s.GetAllConfig(ctx)
+}
+func (a *autoStack) RemoveAllConfig(ctx context.Context, keys []string) error {
+	return a.s.RemoveAllConfig(ctx, keys)
+}
 func (a *autoStack) Up(ctx context.Context) error {
 	_, err := a.s.Up(ctx, optup.ProgressStreams(a.log), optup.ErrorProgressStreams(a.log))
 	return err
@@ -349,6 +390,46 @@ func validate(req Request) error {
 		if key == "kubeconfig" {
 			return fmt.Errorf("%w: settings must not set kubeconfig", ErrInvalidRequest)
 		}
+		if _, dup := req.SecretSettings[key]; dup {
+			return fmt.Errorf("%w: %s is both a setting and a secret setting", ErrInvalidRequest, key)
+		}
+	}
+	for key := range req.SecretSettings {
+		if key == "kubeconfig" {
+			return fmt.Errorf("%w: settings must not set kubeconfig", ErrInvalidRequest)
+		}
+	}
+	for _, key := range req.Unset {
+		if key == "kubeconfig" {
+			return fmt.Errorf("%w: kubeconfig can't be unset", ErrInvalidRequest)
+		}
+	}
+	return nil
+}
+
+// unset removes the req.Unset keys that the stack config holds and config doesn't set.
+func unset(ctx context.Context, s stack, req Request, config auto.ConfigMap) error {
+	if len(req.Unset) == 0 {
+		return nil
+	}
+	current, err := s.GetAllConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	var keys []string
+	for _, k := range req.Unset {
+		full := projectName + ":" + k
+		if _, held := current[full]; held {
+			if _, set := config[full]; !set {
+				keys = append(keys, full)
+			}
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	if err := s.RemoveAllConfig(ctx, keys); err != nil {
+		return fmt.Errorf("unset config: %w", err)
 	}
 	return nil
 }
@@ -373,6 +454,9 @@ func configMap(req Request, kubeconfigPath string) (auto.ConfigMap, error) {
 			s = string(b)
 		}
 		c[projectName+":"+k] = auto.ConfigValue{Value: s}
+	}
+	for k, v := range req.SecretSettings {
+		c[projectName+":"+k] = auto.ConfigValue{Value: v, Secret: true}
 	}
 	return c, nil
 }

@@ -184,6 +184,11 @@ func (r *Reconciler) markReady(ctx context.Context, inst *v1alpha1.PlatformInsta
 }
 
 func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstance, st targets.State, d plan.Decision) (ctrl.Result, error) {
+	req := r.request(inst, st)
+	image, err := r.tenancy(ctx, inst, &req)
+	if err != nil {
+		return r.failConfig(ctx, inst, v1alpha1.ReasonTenantAuthSecret, err.Error(), err)
+	}
 	if err := r.patchStatus(ctx, inst, func(s *v1alpha1.PlatformInstanceStatus) {
 		if d.Action == plan.Install {
 			s.Phase = v1alpha1.PhaseInstalling
@@ -203,7 +208,11 @@ func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstanc
 	// A repair, and a retry after a failed install, refresh first: the failed run may have left
 	// resources Pulumi hasn't recorded.
 	refresh := d.Action == plan.Repair || d.Reason == plan.ReasonRetry
-	res, err := r.Installer.Install(installCtx, r.request(inst, st), installer.Options{Refresh: refresh})
+	res, err := r.Installer.Install(installCtx, req, installer.Options{Refresh: refresh})
+	if errors.Is(err, installer.ErrHostImageNotApproved) {
+		return r.failConfig(ctx, inst, v1alpha1.ReasonTenantHostImageUnsupported,
+			fmt.Sprintf("%v. spec.platform.tenantHostImage is empty, so the operator's default would be used: set spec.platform.tenantHostImage, or a spec.version that approves it", err), err)
+	}
 	if err != nil {
 		return r.fail(ctx, inst, v1alpha1.ConditionInstalled, "InstallFailed",
 			fmt.Sprintf("%s of %s failed: %v", d.Reason, inst.Spec.Version, err), err)
@@ -215,9 +224,23 @@ func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstanc
 		s.InstalledVersion = inst.Spec.Version
 		s.LastRepair = &now
 		s.Endpoints = v1alpha1.Endpoints{Kubernetes: res.KubernetesEndpoint, HTTP: res.HTTPEndpoint}
+		s.Applied = applied(inst, image)
 		setCondition(s, inst.Generation, v1alpha1.ConditionInstalled, metav1.ConditionTrue, d.Reason, "platform "+inst.Spec.Version+" installed")
+		setCondition(s, inst.Generation, v1alpha1.ConditionConfigApplied, metav1.ConditionTrue, "Applied",
+			fmt.Sprintf("generation %d: %d tenant(s), %d user(s), tenantAuth issuer %q", s.Applied.Generation, s.Applied.Tenants, s.Applied.Users, s.Applied.TenantAuthIssuer))
 		setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionTrue, "Ready", "instance is ready")
 	})
+}
+
+// failConfig reports a config the install can't apply: ConfigApplied and Installed False with
+// reason, then fails like fail.
+func (r *Reconciler) failConfig(ctx context.Context, inst *v1alpha1.PlatformInstance, reason, msg string, cause error) (ctrl.Result, error) {
+	if err := r.patchStatus(ctx, inst, func(s *v1alpha1.PlatformInstanceStatus) {
+		setCondition(s, inst.Generation, v1alpha1.ConditionConfigApplied, metav1.ConditionFalse, reason, msg)
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.fail(ctx, inst, v1alpha1.ConditionInstalled, reason, msg, cause)
 }
 
 // reconcileDelete applies the deletion policy, then releases the finalizer. Delete removes the
