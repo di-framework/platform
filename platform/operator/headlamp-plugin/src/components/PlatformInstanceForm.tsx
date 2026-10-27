@@ -9,7 +9,7 @@ import MenuItem from '@mui/material/MenuItem';
 import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
 import { dump } from 'js-yaml';
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import type { Submission } from '../api';
 import {
   buildPlatformInstance,
@@ -67,6 +67,9 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
   const [busy, setBusy] = useState(false);
   const [serverError, setServerError] = useState<string | null>(null);
   const [showPreview, setShowPreview] = useState(false);
+  // Keys for rows added in the dialog; rows read from the object are keyed by their name.
+  const nextKey = useRef(0);
+  const newKey = () => `new-${nextKey.current++}`;
 
   const errors = useMemo(() => validateForm(form, mode), [form, mode]);
   const submission = useMemo<Submission>(
@@ -182,7 +185,14 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
     );
   }
 
-  const recordedHostImage = existing?.status?.applied?.tenantHostImage;
+  const applied = existing?.status?.applied;
+  // What an empty host image field keeps: the last applied image, the platform's own default for an
+  // instance installed before the operator recorded one, or the default a first install records.
+  const hostImageHelp = applied
+    ? applied.tenantHostImage
+      ? `Empty keeps the last applied image: ${applied.tenantHostImage}.`
+      : "Empty keeps the platform's own default."
+    : "Empty: a new instance records the operator's pinned default host image at its first install.";
   const tenantsError = errorFor('tenants');
   const usersError = errorFor('users');
 
@@ -253,12 +263,13 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
           DELETION_POLICIES,
           'Delete (API default) removes the cluster; Retain keeps it.',
         )}
-        <Typography variant="subtitle2" sx={{ mt: 2 }}>
+        <Typography variant="subtitle2" component="h3" sx={{ mt: 2 }}>
           Tenants (optional)
         </Typography>
         <Typography variant="caption" component="p">
           Up to {MAX_TENANTS}. A tenant's other settings (deletion policy, resources, runtime,
-          suspended) are kept as they are; set them in YAML.
+          suspended) are kept as they are; set them in YAML. An existing tenant can't be renamed:
+          the platform would remove it and create a new one, so remove it and add another instead.
         </Typography>
         {tenantsError && (
           <Typography variant="caption" color="error" component="p">
@@ -268,7 +279,7 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
         {form.tenants.map((tenant, i) => {
           const error = errorFor('tenants', `tenants.${i}.name`);
           return (
-            <Box key={i} sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
+            <Box key={tenant.key} sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
               <TextField
                 id={`pi-tenants-${i}-name`}
                 label={`Tenant ${i + 1} name`}
@@ -278,9 +289,14 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
                     rows.map((t, k) => (k === i ? { ...t, name: e.target.value } : t)),
                   )
                 }
-                disabled={busy}
+                disabled={busy || tenant.existing}
                 error={Boolean(error)}
-                helperText={error ?? '1-40 lowercase letters, digits and "-".'}
+                helperText={
+                  error ??
+                  (tenant.existing
+                    ? "Can't be renamed: removing it removes the tenant on the platform."
+                    : '1-40 lowercase letters, digits and "-".')
+                }
                 fullWidth
                 size="small"
                 margin="dense"
@@ -299,12 +315,14 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
         })}
         <Button
           size="small"
-          onClick={() => setList('tenants', (rows) => [...rows, { name: '', rest: {} }])}
+          onClick={() =>
+            setList('tenants', (rows) => [...rows, { name: '', rest: {}, key: newKey() }])
+          }
           disabled={busy || form.tenants.length >= MAX_TENANTS}
         >
           Add tenant
         </Button>
-        <Typography variant="subtitle2" sx={{ mt: 2 }}>
+        <Typography variant="subtitle2" component="h3" sx={{ mt: 2 }}>
           Users (optional)
         </Typography>
         <Typography variant="caption" component="p">
@@ -320,7 +338,7 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
           const nameError = errorFor('users', `users.${i}.name`);
           const membershipsError = errorFor('users', `users.${i}.memberships`);
           return (
-            <Box key={i} sx={{ pl: 1, borderLeft: 2, borderColor: 'divider', my: 1 }}>
+            <Box key={user.key} sx={{ pl: 1, borderLeft: 2, borderColor: 'divider', my: 1 }}>
               <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
                 <TextField
                   id={`pi-users-${i}-name`}
@@ -354,11 +372,11 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
                 const key = `users.${i}.memberships.${j}.tenant`;
                 const tenantError = errorFor('users', key) ?? errorFor('tenants', key);
                 return (
-                  <Box key={j} sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
+                  <Box key={m.key} sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
                     <TextField
                       id={`pi-users-${i}-memberships-${j}-tenant`}
                       select
-                      label="Tenant"
+                      label={`Tenant, membership ${j + 1} of user ${i + 1}`}
                       value={m.tenant}
                       onChange={(e) =>
                         setUser(i, (u) => ({
@@ -384,7 +402,7 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
                     <TextField
                       id={`pi-users-${i}-memberships-${j}-role`}
                       select
-                      label="Role"
+                      label={`Role, membership ${j + 1} of user ${i + 1}`}
                       value={m.role}
                       onChange={(e) =>
                         setUser(i, (u) => ({
@@ -437,6 +455,7 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
                             (name) => !u.memberships.some((x) => x.tenant === name),
                           ) ?? '',
                         role: 'viewer',
+                        key: newKey(),
                       },
                     ],
                   }))
@@ -451,13 +470,16 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
         <Button
           size="small"
           onClick={() =>
-            setList('users', (rows) => [...rows, { name: '', memberships: [], rest: {} }])
+            setList('users', (rows) => [
+              ...rows,
+              { name: '', memberships: [], rest: {}, key: newKey() },
+            ])
           }
           disabled={busy || form.users.length >= MAX_USERS}
         >
           Add user
         </Button>
-        <Typography variant="subtitle2" sx={{ mt: 2 }}>
+        <Typography variant="subtitle2" component="h3" sx={{ mt: 2 }}>
           Tenant auth (optional)
         </Typography>
         <Typography variant="caption" component="p">
@@ -541,15 +563,13 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
           'At least 1.',
           { inputProps: { inputMode: 'numeric' } },
         )}
-        <Typography variant="subtitle2" sx={{ mt: 2 }}>
+        <Typography variant="subtitle2" component="h3" sx={{ mt: 2 }}>
           Tenant hosts (optional)
         </Typography>
         {text(
           'tenantHostImage',
           'Tenant host image',
-          recordedHostImage
-            ? `Empty keeps the recorded default (status.applied.tenantHostImage): ${recordedHostImage}. A change restarts the tenant hosts.`
-            : "Empty: a new instance records the operator's pinned default host image at its first install. A change restarts the tenant hosts.",
+          `${hostImageHelp} A change restarts the tenant hosts.`,
         )}
         {select(
           'tenantHostImagePullPolicy',

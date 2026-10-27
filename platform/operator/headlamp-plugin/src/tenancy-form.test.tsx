@@ -107,14 +107,14 @@ describe('the tenancy sections of the form', () => {
     expect(screen.getByText(/Tenant name must be lowercase letters/)).toBeTruthy();
     expect(screen.getByText('User name is required.')).toBeTruthy();
     expect(
-      screen.getAllByText('Tenant auth needs issuer, client ID and client secret together.'),
+      screen.getAllByText('tenantAuth needs issuer, clientId and clientSecretRef together.'),
     ).toHaveLength(3);
     expect(screen.getByText('Tenant auth needs the tenant-auth image.')).toBeTruthy();
 
     type('tenants-0-name', 'acme');
     type('users-0-name', 'dev');
-    choose(/Tenant$/, 'acme');
-    choose(/Role/, 'developer');
+    choose(/^Tenant, membership/, 'acme');
+    choose(/^Role, membership/, 'developer');
     type('tenantAuthClientId', 'console');
     type('tenantAuthSecretName', 'tenant-auth-oauth');
     type('tenantAuthSecretKey', 'clientSecret');
@@ -151,7 +151,7 @@ describe('the tenancy sections of the form', () => {
         submit={submit}
       />,
     );
-    expect(screen.getByText(/Empty keeps the recorded default/).textContent).toContain(
+    expect(screen.getByText(/Empty keeps the last applied image/).textContent).toContain(
       'ghcr.io/di-framework/wash:recorded',
     );
     expect(input('tenantHostImage').disabled).toBe(false);
@@ -182,7 +182,9 @@ describe('the tenancy sections of the form', () => {
     click('Remove tenant 2');
     // The memberships keep naming globex, which is no longer a choice but still shows.
     expect(
-      screen.getAllByText('"globex" is not in Tenants: every membership must name a tenant.'),
+      screen.getAllByText(
+        '"globex" is not in Tenants: every users[].memberships[].tenant must name an entry of tenants.',
+      ),
     ).toHaveLength(2);
     expect(shown('users-0-memberships-1-tenant')).toBe('globex');
     await save('Save');
@@ -285,7 +287,7 @@ describe('the tenancy sections of the form', () => {
     expect(screen.getByText('At most 16 memberships per user.')).toBeTruthy();
   });
 
-  it('renames a tenant and edits one membership among several', async () => {
+  it('keeps existing tenant names read-only, and edits one membership among several', async () => {
     const old = live(tenancyFull);
     const submit = vi.fn().mockResolvedValue({});
     render(
@@ -297,12 +299,21 @@ describe('the tenancy sections of the form', () => {
         submit={submit}
       />,
     );
-    type('tenants-0-name', 'initech');
-    choose(/Tenant$/, 'initech', 0);
-    choose(/Role/, 'developer', 1);
+    // The platform has no rename: a new name would remove the tenant and create another.
+    expect(input('tenants-0-name').disabled).toBe(true);
+    expect(screen.getAllByText(/Can't be renamed/)).toHaveLength(2);
+    click('Add tenant');
+    expect(input('tenants-2-name').disabled).toBe(false);
+    type('tenants-2-name', 'initech');
+    choose(/^Tenant, membership 1 of user 1$/, 'initech');
+    choose(/^Role, membership 2 of user 1$/, 'developer');
     await save('Save');
     const updated = applyPatch(old, submit.mock.calls[0]?.[0].patch);
-    expect(updated.spec.platform?.tenants?.map((t) => t.name)).toStrictEqual(['initech', 'globex']);
+    expect(updated.spec.platform?.tenants?.map((t) => t.name)).toStrictEqual([
+      'acme',
+      'globex',
+      'initech',
+    ]);
     expect(updated.spec.platform?.tenants?.[0]?.runtime).toStrictEqual({
       replicas: 2,
       coreInstances: 200,
@@ -312,6 +323,20 @@ describe('the tenancy sections of the form', () => {
       { tenant: 'globex', role: 'developer' },
     ]);
     expect(updated.spec.platform?.users?.[1]).toStrictEqual(tenancyFull.spec.platform?.users?.[1]);
+  });
+
+  it("says an installed instance without a recorded host image keeps the platform's own default", () => {
+    render(
+      <PlatformInstanceFormDialog
+        open
+        mode="edit"
+        existing={live(tenancyMinimal)}
+        onClose={() => {}}
+        submit={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/Empty keeps the platform's own default\./)).toBeTruthy();
+    expect(screen.queryByText(/a new instance records/)).toBeNull();
   });
 
   it("adds a membership in the first tenant the user isn't in yet", () => {

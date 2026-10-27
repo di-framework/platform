@@ -599,9 +599,9 @@ describe('tenancy edits (#273, #442)', () => {
     form.tenants = form.tenants.filter((t) => t.name !== 'globex');
     expect(validateForm(form, 'edit')).toStrictEqual({
       'users.0.memberships.1.tenant':
-        '"globex" is not in Tenants: every membership must name a tenant.',
+        '"globex" is not in Tenants: every users[].memberships[].tenant must name an entry of tenants.',
       'users.1.memberships.0.tenant':
-        '"globex" is not in Tenants: every membership must name a tenant.',
+        '"globex" is not in Tenants: every users[].memberships[].tenant must name an entry of tenants.',
     });
     // Sent anyway, the apiserver's CEL rule would reject the update.
     const updated = applyPatch(old, editPatch(old, form));
@@ -699,6 +699,20 @@ describe('tenancy edits (#273, #442)', () => {
     });
   });
 
+  it('saves an object with empty tenants and users lists unchanged as an empty patch (W1)', () => {
+    for (const platform of [{ tenants: [] }, { users: [] }, { tenants: [], users: [] }]) {
+      const old = { ...live(minimal), spec: { ...minimal.spec, platform } };
+      expect(editPatch(old, formFromObject(old))).toStrictEqual([]);
+    }
+    // Adding to an empty list replaces it, guarded by a test of the empty list.
+    const old = { ...live(minimal), spec: { ...minimal.spec, platform: { tenants: [] } } };
+    const form = { ...formFromObject(old), tenants: [{ name: 'acme', rest: {} }] };
+    expect(editPatch(old, form)).toStrictEqual([
+      { op: 'test', path: '/spec/platform/tenants', value: [] },
+      { op: 'replace', path: '/spec/platform/tenants', value: [{ name: 'acme' }] },
+    ]);
+  });
+
   it('keeps tenantAuth fields the form does not know', () => {
     const old = live(tenancyFull);
     Object.assign(old.spec.platform?.tenantAuth ?? {}, { futureField: 'x' });
@@ -791,7 +805,7 @@ describe('tenancy validation', () => {
   });
 
   it('requires issuer, client ID, client secret and image together (CEL rule, required image)', () => {
-    const together = 'Tenant auth needs issuer, client ID and client secret together.';
+    const together = 'tenantAuth needs issuer, clientId and clientSecretRef together.';
     const emptyAuth = Object.fromEntries(TENANT_AUTH_FIELDS.map(({ field }) => [field, '']));
     expect(v({ ...emptyAuth, tenantAuthIssuer: 'https://login.example' })).toStrictEqual({
       tenantAuthClientId: together,

@@ -30,11 +30,19 @@ import {
 export interface TenantRow {
   name: string;
   rest: Record<string, unknown>;
+  /** A stable React key for the row (not sent). */
+  key?: string;
+  /**
+   * Set on rows read from the object (Edit). Their name is read-only: the platform has no rename,
+   * a changed name removes the old tenant and creates a new one.
+   */
+  existing?: true;
 }
 
 export interface MembershipRow {
   tenant: string;
   role: MembershipRole;
+  key?: string;
 }
 
 /** A users[] row: name and memberships, and the entry's other fields (suspended) kept as they are. */
@@ -42,6 +50,7 @@ export interface UserRow {
   name: string;
   memberships: MembershipRow[];
   rest: Record<string, unknown>;
+  key?: string;
 }
 
 /** Every text field is the text the user typed; an empty string means "not set". */
@@ -200,11 +209,21 @@ export function formFromObject(obj: PlatformInstanceObject): PlatformInstanceFor
     httpNodePort: gateway.httpNodePort === undefined ? '' : String(gateway.httpNodePort),
     httpEndpoint: gateway.httpEndpoint ?? '',
     deletionPolicy: obj.spec?.deletionPolicy ?? '',
-    tenants: (platform.tenants ?? []).map(({ name, ...rest }) => ({ name, rest })),
+    tenants: (platform.tenants ?? []).map(({ name, ...rest }) => ({
+      name,
+      rest,
+      key: `tenant-${name}`,
+      existing: true,
+    })),
     users: (platform.users ?? []).map(({ name, memberships, ...rest }) => ({
       name,
-      memberships: memberships.map(({ tenant, role }) => ({ tenant, role })),
+      memberships: memberships.map(({ tenant, role }) => ({
+        tenant,
+        role,
+        key: `membership-${tenant}`,
+      })),
       rest,
+      key: `user-${name}`,
     })),
     tenantHostImage: platform.tenantHostImage ?? '',
     tenantHostImagePullPolicy: platform.tenantHostImagePullPolicy ?? '',
@@ -336,6 +355,10 @@ function at(root: unknown, path: readonly string[]): unknown {
   return node;
 }
 
+function emptyListAsAbsent(value: unknown): unknown {
+  return Array.isArray(value) && value.length === 0 ? undefined : value;
+}
+
 /** Deep equality of JSON values, ignoring the order of object keys. */
 function same(a: unknown, b: unknown): boolean {
   return JSON.stringify(sortedKeys(a)) === JSON.stringify(sortedKeys(b));
@@ -348,7 +371,7 @@ function sortedKeys(value: unknown): unknown {
   if (value !== null && typeof value === 'object') {
     return Object.fromEntries(
       Object.keys(value)
-        .sort()
+        .sort((a, b) => a.localeCompare(b))
         .map((k) => [k, sortedKeys((value as Tree)[k])]),
     );
   }
@@ -433,9 +456,10 @@ export function editPatch(
   }
 
   for (const path of FORM_PATHS) {
+    // An empty list reads as an empty form list, which the form leaves out: the same thing.
     const oldValue = at(before, path);
     const newValue = at(after, path);
-    if (same(oldValue, newValue)) {
+    if (same(emptyListAsAbsent(oldValue), newValue)) {
       continue;
     }
     if (oldValue !== undefined) {
@@ -542,7 +566,8 @@ function validateTenantsAndUsers(form: PlatformInstanceForm, errors: FormErrors)
         errors[key] = 'Choose a tenant.';
       } else if (!tenantNames.has(m.tenant)) {
         // The CRD's CEL rule: every users[].memberships[].tenant must name an entry of tenants.
-        errors[key] = `"${m.tenant}" is not in Tenants: every membership must name a tenant.`;
+        errors[key] =
+          `"${m.tenant}" is not in Tenants: every users[].memberships[].tenant must name an entry of tenants.`;
       } else if (seen.has(m.tenant)) {
         errors[key] = `"${m.tenant}" is listed twice: one membership per tenant.`;
       }
@@ -556,7 +581,7 @@ function validateTenantAuth(form: PlatformInstanceForm, errors: FormErrors) {
   const value = (field: TextFormField) => form[field].trim();
   if (TENANT_AUTH_FIELDS.some(({ field }) => value(field))) {
     // The CRD's CEL rule (issuer, clientId and clientSecretRef together) and its required image.
-    const together = 'Tenant auth needs issuer, client ID and client secret together.';
+    const together = 'tenantAuth needs issuer, clientId and clientSecretRef together.';
     for (const field of [
       'tenantAuthIssuer',
       'tenantAuthClientId',
@@ -598,7 +623,7 @@ function validateTenantAuth(form: PlatformInstanceForm, errors: FormErrors) {
     }
   }
   if (value('tenantAuthIssuerIp').length > MAX_IPV4) {
-    errors.tenantAuthIssuerIp = `Must be an IPv4 address (at most ${MAX_IPV4} characters).`;
+    errors.tenantAuthIssuerIp = `Must be at most ${MAX_IPV4} characters (an IPv4 address).`;
   }
   if (value('tenantAuthIssuerUpstream').length > MAX_IMAGE) {
     errors.tenantAuthIssuerUpstream = `Must be at most ${MAX_IMAGE} characters.`;
