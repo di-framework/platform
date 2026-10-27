@@ -743,6 +743,17 @@ Node.js 22.19 or newer (`engines.node`). `@kubernetes/client-node` 2 loads ES mo
 `require`, and its `undici` 8 dependency declares `>=22.19`. Pulumi runs this package under
 whatever `node` is on `PATH`; `di-framework-kube` does not pin a version.
 
+## Known issues
+
+- **Restarts while NATS starts
+  ([#470](https://github.com/di-framework/platform/issues/470)).** On a fresh install the
+  `runtime-operator` and `hostgroup-default` pods may restart once or twice while NATS starts:
+  both exit when their first NATS connect fails, and the upstream `runtime-operator` chart
+  offers no startup wait. Tenant host pods are not affected by start-up ordering: their
+  `wait-for-nats` init container waits up to 10 minutes for the scheduler NATS and the
+  tenant's `di-nats` before the host starts. After that cap the init container exits 1 and
+  the pod restarts as usual.
+
 ## Development
 
 ```sh

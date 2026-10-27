@@ -6,7 +6,9 @@ import {
   type ControllerConfig,
   INSTALLATION,
   names,
+  natsHostPort,
   type Resource,
+  RUNTIME_NATS_IMAGE,
   type Tenant,
   tenantResources,
   VERSION,
@@ -162,7 +164,8 @@ describe('tenant host pod', () => {
 
   it('is unchanged when no workload asks for storage', () => {
     const spec = host([]);
-    expect(spec.initContainers).toBeUndefined();
+    // Only the NATS wait (#470); no storage chown step.
+    expect(spec.initContainers?.map((c) => c.name)).toEqual(['wait-for-nats']);
     expect(spec.volumes).toHaveLength(3);
     expect(hostStorage(tenant(), cfg, [])).toEqual({
       volumes: [],
@@ -186,7 +189,9 @@ describe('tenant host pod', () => {
     });
     // The host itself stays non-root with a read-only root filesystem.
     expect(spec.containers[0]?.securityContext).toMatchObject({ readOnlyRootFilesystem: true });
-    const init = spec.initContainers?.[0] as {
+    // The storage chown step follows the NATS wait (#470).
+    expect(spec.initContainers?.map((c) => c.name)[0]).toBe('wait-for-nats');
+    const init = spec.initContainers?.[1] as {
       command: string[];
       securityContext: Record<string, unknown>;
     };
@@ -203,6 +208,60 @@ describe('tenant host pod', () => {
       allowPrivilegeEscalation: false,
       capabilities: { drop: ['ALL'], add: ['CHOWN'] },
     });
+  });
+});
+
+describe('tenant host NATS wait (#470)', () => {
+  function initContainers(t: Tenant, schedulerNatsUrl = cfg.schedulerNatsUrl) {
+    const deployment = tenantResources(
+      t,
+      { ...cfg, schedulerNatsUrl },
+      { data: { 'ca.crt': 'x' } },
+      [],
+    ).find((r) => r.kind === 'Deployment' && r.metadata.name === 'hostgroup-tenant-alpha');
+    return (
+      (deployment as Resource).spec as {
+        template: { spec: { initContainers: Record<string, unknown>[] } };
+      }
+    ).template.spec.initContainers;
+  }
+
+  it('waits for the scheduler and data NATS before the host starts', () => {
+    const [wait] = initContainers(tenant(), 'nats://nats.wasmcloud.svc.cluster.local:4222');
+    expect(wait).toMatchObject({
+      name: 'wait-for-nats',
+      image: RUNTIME_NATS_IMAGE,
+      resources: {
+        requests: { cpu: '10m', memory: '16Mi' },
+        limits: { cpu: '100m', memory: '32Mi' },
+      },
+      securityContext: {
+        allowPrivilegeEscalation: false,
+        readOnlyRootFilesystem: true,
+        capabilities: { drop: ['ALL'] },
+      },
+    });
+    const command = wait?.command as string[];
+    expect(command.slice(0, 2)).toEqual(['sh', '-c']);
+    const script = command[2] as string;
+    expect(script).toContain(
+      'for t in nats.wasmcloud.svc.cluster.local:4222 di-nats.di-runtime-alpha.svc.cluster.local:4222; do',
+    );
+    expect(script).toContain('nc -z -w 2 "$h" "$p"');
+    expect(script).toContain('sleep 2');
+    expect(script).toContain('+ 600 ))');
+    expect(script).toContain('exit 1');
+  });
+
+  it('defaults to the NATS port when the URL names none', () => {
+    expect(natsHostPort('nats://nats.example')).toBe('nats.example:4222');
+    expect(natsHostPort('nats://nats.example:4333')).toBe('nats.example:4333');
+  });
+
+  it('still renders for a suspended tenant', () => {
+    const t = tenant(0);
+    t.spec.suspended = true;
+    expect(initContainers(t)[0]?.name).toBe('wait-for-nats');
   });
 });
 

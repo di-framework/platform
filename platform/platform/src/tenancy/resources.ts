@@ -388,8 +388,50 @@ export const RUNTIME_NATS_MAX_MEMORY_STORE = `${BACKING_SERVICE_MEMORY_LIMIT_MIB
 export const RUNTIME_NATS_CONFIG = 'di-nats-config';
 /** The `di-nats` image; its shell also runs the JetStream account init step (#159). */
 export const RUNTIME_NATS_IMAGE = 'nats:2.12.8-alpine';
+
 /** Pod template annotation carrying the server config digest, so a cap change restarts NATS. */
 export const RUNTIME_NATS_CONFIG_ANNOTATION = 'platform.di-framework.dev/nats-config-sha256';
+
+/** `host:port` of a `nats://` URL; NATS's default port when the URL names none. */
+export function natsHostPort(url: string): string {
+  const u = new URL(url);
+  return `${u.hostname}:${u.port || '4222'}`;
+}
+
+/**
+ * Init container that blocks until every `host:port` resolves and accepts a TCP connect,
+ * retrying every 2 s for up to 10 minutes (#470).
+ */
+export function waitForNatsContainer(targets: string[]) {
+  const script = [
+    'deadline=$(( $(date +%s) + 600 ))',
+    `for t in ${targets.join(' ')}; do`,
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion
+    '  h=${t%:*}; p=${t##*:}',
+    '  until nc -z -w 2 "$h" "$p" 2>/dev/null; do',
+    '    if ! nslookup "$h" >/dev/null 2>&1; then reason="DNS lookup failed"; else reason="TCP connect failed"; fi',
+    '    echo "waiting for NATS at $h:$p: $reason"',
+    '    if [ "$(date +%s)" -ge "$deadline" ]; then echo "gave up waiting for NATS at $h:$p"; exit 1; fi',
+    '    sleep 2',
+    '  done',
+    'done',
+  ].join('\n');
+  return {
+    name: 'wait-for-nats',
+    image: RUNTIME_NATS_IMAGE,
+    command: ['sh', '-c', script],
+    resources: {
+      requests: { cpu: '10m', memory: '16Mi' },
+      limits: { cpu: '100m', memory: '32Mi' },
+    },
+    securityContext: {
+      allowPrivilegeEscalation: false,
+      readOnlyRootFilesystem: true,
+      capabilities: { drop: ['ALL'] },
+    },
+  };
+}
+
 const BINARY_QUANTITY = /^([1-9][0-9]*)(Ki|Mi|Gi|Ti)?$/;
 const MIB = 2 ** 20;
 const BINARY_UNITS: Record<string, number> = {
@@ -1039,6 +1081,7 @@ function tenantResources(
 ): Resource[] {
   const n = names(tenant.metadata.name);
   const storage = hostStorage(tenant, cfg, storageKeys);
+  const dataNatsUrl = `nats://di-nats.${n.runtimeNamespace}.svc.cluster.local:4222`;
   const make = (
     apiVersion: string,
     kind: string,
@@ -1433,7 +1476,15 @@ function tenantResources(
               },
               // Persistent workload directories (#11) are created by DirectoryOrCreate as root;
               // this step hands each one to the host uid before the host starts.
-              ...(storage.initContainers.length ? { initContainers: storage.initContainers } : {}),
+              // wash exits on a failed first NATS connect, so the host waits for both NATS
+              // servers first and a startup race never counts as a restart (#470).
+              initContainers: [
+                waitForNatsContainer([
+                  natsHostPort(cfg.schedulerNatsUrl),
+                  natsHostPort(dataNatsUrl),
+                ]),
+                ...storage.initContainers,
+              ],
               containers: [
                 {
                   name: 'host',
@@ -1448,7 +1499,7 @@ function tenantResources(
                     '--scheduler-nats-tls-ca=/scheduler/ca.crt',
                     '--scheduler-nats-tls-cert=/scheduler/tls.crt',
                     '--scheduler-nats-tls-key=/scheduler/tls.key',
-                    `--data-nats-url=nats://di-nats.${n.runtimeNamespace}.svc.cluster.local:4222`,
+                    `--data-nats-url=${dataNatsUrl}`,
                     '--oci-cache-dir=/oci-cache',
                     '--http-addr=0.0.0.0:9191',
                     '--socket-egress=enforce',
