@@ -262,7 +262,7 @@ func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstanc
 	// A repair, and a retry after a failed install, refresh first: the failed run may have left
 	// resources Pulumi hasn't recorded.
 	refresh := d.Action == plan.Repair || d.Reason == plan.ReasonRetry || st.Resynced
-	res, err := r.Installer.Install(installCtx, req, installer.Options{Refresh: refresh, ReplaceRelease: st.Resynced})
+	res, err := r.Installer.Install(installCtx, req, installer.Options{Refresh: refresh, ReinstallRelease: st.Resynced})
 	if errors.Is(err, installer.ErrHostImageNotApproved) {
 		return r.failConfig(ctx, inst, v1alpha1.ReasonTenantHostImageUnsupported,
 			fmt.Sprintf("%v. spec.platform.tenantHostImage is empty, so the operator's default would be used: set spec.platform.tenantHostImage, or a spec.version that approves it", err), err)

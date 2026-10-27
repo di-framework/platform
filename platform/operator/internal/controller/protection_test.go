@@ -49,7 +49,7 @@ func TestResyncStartIsRecordedAndRepairsDontReplace(t *testing.T) {
 	h, _ := installedHarness(t)
 	h.now = h.now.Add(31 * time.Minute)
 	h.reconcile()
-	if len(h.in.options) != 2 || !h.in.options[1].Refresh || h.in.options[1].ReplaceRelease {
+	if len(h.in.options) != 2 || !h.in.options[1].Refresh || h.in.options[1].ReinstallRelease {
 		t.Fatalf("repair options %+v", h.in.options)
 	}
 	h.tg.state = targets.State{Reason: "Resyncing", ResyncStarted: "uid-b"}

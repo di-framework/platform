@@ -321,7 +321,9 @@ is gone, its host namespace). Don't delete the Service on its own.
 ### The admission policy
 
 The operator installs a cluster-scoped `ValidatingAdmissionPolicy` and binding,
-`platform-operator-protect-vcluster-service` (`admissionregistration.k8s.io/v1`, Kubernetes 1.30 or later),
+`platform-operator-protect-vcluster-service` (`admissionregistration.k8s.io/v1`, Kubernetes 1.30 or later;
+verified on KubeSolo v1.2.0, which ships Kubernetes v1.35.7 and serves it, with the operator's ServiceAccount
+`platform-operator`),
 that denies `DELETE` of a Service named `vcluster` in a namespace labelled
 `platform.di-framework.dev/host-namespace=true`. The operator labels every host namespace it creates, and
 labels an existing one on its next reconcile. The delete is allowed for the operator's own user (looked up at
@@ -352,14 +354,18 @@ differs on a later reconcile, or `vc-vcluster` is missing on an instance that ha
    back the virtual objects that still exist (`TargetReady=False/Resyncing`, or `KubeconfigMissing` for the
    round that starts it; `status.target.resyncServiceUID` and `resyncStarted` describe the running resync);
 3. waits for the control plane, the Secret and the API, then runs the platform install at once (not at the
-   next repair) with a refresh, **replacing the platform's Helm Release** (`wasmcloud`, the runtime-operator
-   chart). Its Helm record lives inside the instance and survived, so a plain `up` would find nothing to do;
-   the replace installs the chart again, which recreates the chart-rendered `wasmcloud-*-tls` Secrets. The
-   other Pulumi-managed objects come back through the refresh. A failed install keeps the resync pending and
-   is retried.
+   next repair). First it runs `helm uninstall` inside the instance on the platform's Helm Release (the
+   runtime-operator chart; name and namespace, `wasmcloud`, read from the install state; a release already
+   gone is fine). Its Helm record lives inside the instance and survived, so without that a refresh finds
+   it and `up` has nothing to do, and a Pulumi replace creates before it deletes, which Helm refuses for
+   the same release name. Then a refresh drops the Release from the state and `up` installs the chart
+   again, which recreates the chart-rendered `wasmcloud-*-tls` Secrets; the other Pulumi-managed objects
+   come back through the refresh. No such Release in the state is an error, not a plain `up`. A failed
+   install keeps the resync pending and is retried.
 
-A resync that waits at one stage for longer than three repair intervals is reported as
-`TargetReady=False/TargetUnreachable`, naming the stage.
+A resync still waiting (for the control plane, the Secret or the API) more than three repair intervals
+after it started, measured from `status.target.resyncStarted`, is reported as
+`TargetReady=False/TargetUnreachable`, naming the stage it is waiting at.
 
 Secrets that components inside the instance generated at runtime (tenant-auth signing keys, for example) are
 not in any chart or Pulumi program: they are lost for good, and whatever they protected (issued tokens,

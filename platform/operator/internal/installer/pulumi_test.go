@@ -7,11 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/auto"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
+	"helm.sh/helm/v3/pkg/storage/driver"
 )
 
 var errLocked = errors.New("the stack is currently locked by 1 lock(s)")
@@ -26,7 +28,8 @@ type fakeStack struct {
 	outputs   auto.OutputMap
 	cancelErr error
 	state     apitype.UntypedDeployment
-	replaced  []string
+	// onUp, when set, decides whether an up succeeds (after the scripted failures).
+	onUp func() error
 }
 
 func (f *fakeStack) next(op string) error {
@@ -48,12 +51,13 @@ func (f *fakeStack) RemoveAllConfig(_ context.Context, keys []string) error {
 	f.removed = append(f.removed, keys...)
 	return f.next("rmconfig")
 }
-func (f *fakeStack) Up(context.Context) error      { return f.next("up") }
-func (f *fakeStack) Refresh(context.Context) error { return f.next("refresh") }
-func (f *fakeStack) UpReplacing(_ context.Context, urns []string) error {
-	f.replaced = urns
-	return f.next("up-replace")
+func (f *fakeStack) Up(context.Context) error {
+	if err := f.next("up"); err != nil || f.onUp == nil {
+		return err
+	}
+	return f.onUp()
 }
+func (f *fakeStack) Refresh(context.Context) error { return f.next("refresh") }
 func (f *fakeStack) Export(context.Context) (apitype.UntypedDeployment, error) {
 	return f.state, f.next("export")
 }
@@ -168,38 +172,109 @@ func TestRepairRefreshesBeforeUp(t *testing.T) {
 
 const releaseState = `{"resources":[
  {"urn":"urn:pulumi:instance::platform-instance::pulumi:pulumi:Stack::platform-instance-instance","type":"pulumi:pulumi:Stack"},
- {"urn":"urn:pulumi:instance::platform-instance::kubernetes:helm.sh/v3:Release::wasmcloud","type":"kubernetes:helm.sh/v3:Release"},
- {"urn":"urn:pulumi:instance::platform-instance::kubernetes:helm.sh/v3:Release::other","type":"kubernetes:helm.sh/v3:Release"},
+ {"urn":"urn:pulumi:instance::platform-instance::kubernetes:helm.sh/v3:Release::other","type":"kubernetes:helm.sh/v3:Release","outputs":{"name":"other","namespace":"x"}},
+ {"urn":"urn:pulumi:instance::platform-instance::kubernetes:helm.sh/v3:Release::wasmcloud","type":"kubernetes:helm.sh/v3:Release","outputs":{"name":"wasmcloud","namespace":"wasmcloud"}},
  {"urn":"urn:pulumi:instance::platform-instance::kubernetes:core/v1:Secret::wasmcloud","type":"kubernetes:core/v1:Secret"}]}`
 
-// A resync (#466) replaces the platform Release, found in the state, after the refresh.
-func TestResyncReplacesThePlatformRelease(t *testing.T) {
-	s := &fakeStack{fail: map[string][]error{}, state: apitype.UntypedDeployment{Deployment: json.RawMessage(releaseState)}}
+// helmTarget stands in for Helm inside the instance: the old release blocks a new install of
+// the same name, as Helm does, so an up that doesn't follow the uninstall fails.
+type helmTarget struct {
+	deployed   bool
+	calls      *[]string
+	uninstalls []string
+	err        error
+}
+
+func (h *helmTarget) uninstall(_ context.Context, kubeconfig []byte, ns, name string) error {
+	*h.calls = append(*h.calls, "uninstall")
+	h.uninstalls = append(h.uninstalls, string(kubeconfig)+"|"+ns+"/"+name)
+	if h.err != nil {
+		return h.err
+	}
+	h.deployed = false
+	return nil
+}
+
+func (h *helmTarget) up() error {
+	if h.deployed {
+		return errors.New("cannot re-use a name that is still in use")
+	}
+	h.deployed = true
+	return nil
+}
+
+func resyncStack(t *testing.T, state string) (*Pulumi, *fakeStack, *helmTarget) {
+	t.Helper()
+	s := &fakeStack{fail: map[string][]error{}, state: apitype.UntypedDeployment{Deployment: json.RawMessage(state)}}
+	h := &helmTarget{deployed: true, calls: &s.calls}
+	s.onUp = h.up
 	p, _ := newTestPulumi(t, s)
-	if _, err := p.Install(context.Background(), request(), Options{Refresh: true, ReplaceRelease: true}); err != nil {
+	p.uninstallRelease = h.uninstall
+	return p, s, h
+}
+
+// A resync (#466) uninstalls the platform Release inside the instance, named in the state, then
+// refreshes (dropping it from the state) and runs up, which installs it again.
+func TestResyncReinstallsThePlatformRelease(t *testing.T) {
+	p, s, h := resyncStack(t, releaseState)
+	if _, err := p.Install(context.Background(), request(), Options{ReinstallRelease: true}); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"config", "refresh", "export", "up-replace", "outputs"}; !reflect.DeepEqual(s.calls, want) {
+	if want := []string{"config", "export", "uninstall", "refresh", "up", "outputs"}; !reflect.DeepEqual(s.calls, want) {
 		t.Fatalf("calls %v, want %v", s.calls, want)
 	}
-	if want := []string{"urn:pulumi:instance::platform-instance::kubernetes:helm.sh/v3:Release::wasmcloud"}; !reflect.DeepEqual(s.replaced, want) {
-		t.Fatalf("replaced %v, want %v", s.replaced, want)
+	if want := []string{"apiVersion: v1\n|wasmcloud/wasmcloud"}; !reflect.DeepEqual(h.uninstalls, want) {
+		t.Fatalf("uninstalls %q, want %q", h.uninstalls, want)
 	}
 }
 
-func TestResyncReplaceErrors(t *testing.T) {
+// Without the uninstall, the up fails the way Helm does while the old release is deployed.
+func TestUpFailsWhileTheOldReleaseIsDeployed(t *testing.T) {
+	p, _, _ := resyncStack(t, releaseState)
+	if _, err := p.Install(context.Background(), request(), Options{Refresh: true}); err == nil || !strings.Contains(err.Error(), "still in use") {
+		t.Fatalf("up over a deployed release: %v", err)
+	}
+}
+
+// A release already gone in the instance is fine.
+func TestResyncToleratesAMissingRelease(t *testing.T) {
+	p, _, h := resyncStack(t, releaseState)
+	h.err = driver.ErrReleaseNotFound
+	h.deployed = false
+	if _, err := p.Install(context.Background(), request(), Options{ReinstallRelease: true}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResyncReinstallErrors(t *testing.T) {
 	s := &fakeStack{fail: map[string][]error{"export": {errors.New("no state")}}}
 	p, _ := newTestPulumi(t, s)
-	if _, err := p.Install(context.Background(), request(), Options{ReplaceRelease: true}); err == nil || err.Error() != "export state: no state" {
+	if _, err := p.Install(context.Background(), request(), Options{ReinstallRelease: true}); err == nil || err.Error() != "export state: no state" {
 		t.Fatalf("export error: %v", err)
 	}
-	s = &fakeStack{fail: map[string][]error{}, state: apitype.UntypedDeployment{Deployment: json.RawMessage("[")}}
-	p, _ = newTestPulumi(t, s)
-	if _, err := p.Install(context.Background(), request(), Options{ReplaceRelease: true}); err == nil || !strings.Contains(err.Error(), "read state") {
+	p, _, _ = resyncStack(t, "[")
+	if _, err := p.Install(context.Background(), request(), Options{ReinstallRelease: true}); err == nil || !strings.Contains(err.Error(), "read state") {
 		t.Fatalf("bad state: %v", err)
 	}
-	if urns, err := releaseURNs(apitype.UntypedDeployment{}); err != nil || urns != nil {
-		t.Fatalf("empty state: %v %v", urns, err)
+	// No Release in the state: an error, not a plain up.
+	p, s, _ = resyncStack(t, `{"resources":[]}`)
+	if _, err := p.Install(context.Background(), request(), Options{ReinstallRelease: true}); err == nil || err.Error() != `reinstall: no Helm Release "wasmcloud" in the install state` || slices.Contains(s.calls, "up") {
+		t.Fatalf("no release: %v (calls %v)", err, s.calls)
+	}
+	p, _, h := resyncStack(t, releaseState)
+	h.err = errors.New("forbidden")
+	if _, err := p.Install(context.Background(), request(), Options{ReinstallRelease: true}); err == nil || err.Error() != "reinstall: helm uninstall wasmcloud/wasmcloud: forbidden" {
+		t.Fatalf("uninstall error: %v", err)
+	}
+	if rel, err := platformRelease(apitype.UntypedDeployment{}); err != nil || rel != nil {
+		t.Fatalf("empty state: %v %v", rel, err)
+	}
+}
+
+// The default uninstall reads the kubeconfig; a bad one is an error before any Helm call.
+func TestHelmUninstallNeedsAKubeconfig(t *testing.T) {
+	if err := helmUninstall(context.Background(), []byte("not: [a kubeconfig"), "wasmcloud", "wasmcloud"); err == nil {
+		t.Fatal("bad kubeconfig accepted")
 	}
 }
 

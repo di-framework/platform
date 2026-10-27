@@ -21,6 +21,10 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
+	"helm.sh/helm/v3/pkg/storage/driver"
+	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/di-framework/platform/operator/internal/targets/vcluster"
 )
 
 // DefaultNPM is npm in the operator image (node:22 alpine).
@@ -82,6 +86,8 @@ type Pulumi struct {
 
 	// npmInstall installs the project's dependencies; nil runs `npm install`.
 	npmInstall func(ctx context.Context, dir string) error
+	// uninstallRelease uninstalls a Helm release in the target; nil uses Helm.
+	uninstallRelease func(ctx context.Context, kubeconfig []byte, namespace, name string) error
 	// open opens the instance's stack; nil uses the Automation API.
 	open func(ctx context.Context, p *Pulumi, id, projectDir, stateDir string) (stack, error)
 	// locked reports a stack-lock conflict; nil uses auto.IsConcurrentUpdateError, which matches
@@ -95,8 +101,6 @@ type stack interface {
 	GetAllConfig(ctx context.Context) (auto.ConfigMap, error)
 	RemoveAllConfig(ctx context.Context, keys []string) error
 	Up(ctx context.Context) error
-	// UpReplacing runs up and replaces the resources with the given URNs.
-	UpReplacing(ctx context.Context, urns []string) error
 	// Export returns the stack's state.
 	Export(ctx context.Context) (apitype.UntypedDeployment, error)
 	Refresh(ctx context.Context) error
@@ -138,28 +142,57 @@ func (p *Pulumi) Install(ctx context.Context, req Request, opts Options) (Result
 	if err := unset(ctx, s, req, config); err != nil {
 		return Result{}, err
 	}
-	if opts.Refresh {
+	if opts.ReinstallRelease {
+		if err := p.uninstallPlatformRelease(ctx, s, req); err != nil {
+			return Result{}, err
+		}
+	}
+	// The refresh after the uninstall drops the Release from the state, so the up creates it.
+	if opts.Refresh || opts.ReinstallRelease {
 		if err := p.withLockRecovery(ctx, s, stateDir, "refresh", s.Refresh); err != nil {
 			return Result{}, err
 		}
 	}
-	up := s.Up
-	if opts.ReplaceRelease {
-		dep, err := s.Export(ctx)
-		if err != nil {
-			return Result{}, fmt.Errorf("export state: %w", err)
-		}
-		urns, err := releaseURNs(dep)
-		if err != nil {
-			return Result{}, err
-		}
-		p.logf("up: replacing %v\n", urns)
-		up = func(ctx context.Context) error { return s.UpReplacing(ctx, urns) }
-	}
-	if err := p.withLockRecovery(ctx, s, stateDir, "up", up); err != nil {
+	if err := p.withLockRecovery(ctx, s, stateDir, "up", s.Up); err != nil {
 		return Result{}, err
 	}
 	return result(ctx, s)
+}
+
+// uninstallPlatformRelease removes the platform Release, named in the state, from the target.
+// A Release already gone is fine; one missing from the state is an error, since a plain up would
+// then leave the chart's lost objects missing.
+func (p *Pulumi) uninstallPlatformRelease(ctx context.Context, s stack, req Request) error {
+	dep, err := s.Export(ctx)
+	if err != nil {
+		return fmt.Errorf("export state: %w", err)
+	}
+	rel, err := platformRelease(dep)
+	if err != nil {
+		return err
+	}
+	if rel == nil {
+		p.logf("reinstall: no %s Release in the state\n", PlatformRelease)
+		return fmt.Errorf("reinstall: no Helm Release %q in the install state", PlatformRelease)
+	}
+	p.logf("reinstall: helm uninstall %s -n %s\n", rel.Name, rel.Namespace)
+	uninstall := p.uninstallRelease
+	if uninstall == nil {
+		uninstall = helmUninstall
+	}
+	if err := uninstall(ctx, req.Kubeconfig, rel.Namespace, rel.Name); err != nil && !errors.Is(err, driver.ErrReleaseNotFound) {
+		return fmt.Errorf("reinstall: helm uninstall %s/%s: %w", rel.Namespace, rel.Name, err)
+	}
+	return nil
+}
+
+// helmUninstall uninstalls a release in the cluster kubeconfig addresses.
+func helmUninstall(ctx context.Context, kubeconfig []byte, namespace, name string) error {
+	cfg, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+	if err != nil {
+		return err
+	}
+	return (&vcluster.Helm{Config: cfg}).Uninstall(ctx, namespace, name)
 }
 
 // PlatformRelease is the Pulumi name of the platform's Helm Release (the runtime-operator chart).
@@ -167,12 +200,19 @@ const PlatformRelease = "wasmcloud"
 
 const releaseType = "kubernetes:helm.sh/v3:Release"
 
-// releaseURNs finds the platform Release in the state. None (no install yet) replaces nothing.
-func releaseURNs(dep apitype.UntypedDeployment) ([]string, error) {
+// helmRelease is a Helm release's name and namespace.
+type helmRelease struct{ Name, Namespace string }
+
+// platformRelease finds the platform Release in the state, or nil.
+func platformRelease(dep apitype.UntypedDeployment) (*helmRelease, error) {
 	var state struct {
 		Resources []struct {
-			URN  string `json:"urn"`
-			Type string `json:"type"`
+			URN     string `json:"urn"`
+			Type    string `json:"type"`
+			Outputs struct {
+				Name      string `json:"name"`
+				Namespace string `json:"namespace"`
+			} `json:"outputs"`
 		} `json:"resources"`
 	}
 	if len(dep.Deployment) > 0 {
@@ -180,13 +220,12 @@ func releaseURNs(dep apitype.UntypedDeployment) ([]string, error) {
 			return nil, fmt.Errorf("read state: %w", err)
 		}
 	}
-	var urns []string
 	for _, r := range state.Resources {
-		if r.Type == releaseType && strings.HasSuffix(r.URN, "::"+PlatformRelease) {
-			urns = append(urns, r.URN)
+		if r.Type == releaseType && strings.HasSuffix(r.URN, "::"+PlatformRelease) && r.Outputs.Name != "" {
+			return &helmRelease{Name: r.Outputs.Name, Namespace: r.Outputs.Namespace}, nil
 		}
 	}
-	return urns, nil
+	return nil, nil
 }
 
 // Status reports whether install state exists and the last outputs, without an update.
@@ -407,10 +446,6 @@ func (a *autoStack) RemoveAllConfig(ctx context.Context, keys []string) error {
 }
 func (a *autoStack) Up(ctx context.Context) error {
 	_, err := a.s.Up(ctx, optup.ProgressStreams(a.log), optup.ErrorProgressStreams(a.log))
-	return err
-}
-func (a *autoStack) UpReplacing(ctx context.Context, urns []string) error {
-	_, err := a.s.Up(ctx, optup.Replace(urns), optup.ProgressStreams(a.log), optup.ErrorProgressStreams(a.log))
 	return err
 }
 func (a *autoStack) Export(ctx context.Context) (apitype.UntypedDeployment, error) {
