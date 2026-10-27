@@ -1,12 +1,11 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
+import { platformNamespacePeer, tenantNamespacesPeer } from '../platform-ingress';
 import {
   GATEWAY_NAME,
   GATEWAY_POD_LABELS,
-  INSTALLATION,
   NAMESPACE_ROLE,
-  TENANT,
   type TenantAuthRoutes,
 } from '../tenancy/resources';
 import type { GatewayConfig } from './gateway';
@@ -237,17 +236,15 @@ export function gatewayServiceSpec(nodePort: number) {
 
 /** Gateway egress: cluster DNS and host group HTTP only (default and tenant runtimes), plus the
  * routed tenant console (8787), controller (8788) and registry front (8790) ports when
- * tenant-auth routes are set.
+ * tenant-auth routes are set. Ingress is open only when `published` (a NodePort is set).
  * Tenant runtimes admit it through their own `di-tenant-gateway` / `tenant-*-gateway` policies. */
 export function gatewayNetworkPolicySpec(
   namespace: string,
   installation: string,
   tenantAuthRoutes: TenantAuthRoutes = {},
+  published = false,
 ) {
-  const tenantNamespaces: Selector = {
-    matchLabels: { [INSTALLATION]: installation },
-    matchExpressions: [{ key: TENANT, operator: 'Exists' }],
-  };
+  const tenantNamespaces: Selector = tenantNamespacesPeer(installation);
   const routed = [
     ...(tenantAuthRoutes.console ? [['tenant-console', 8787] as const] : []),
     ...(tenantAuthRoutes.controller ? [['tenant-controller', 8788] as const] : []),
@@ -277,7 +274,21 @@ export function gatewayNetworkPolicySpec(
   return {
     podSelector: { matchLabels: GATEWAY_POD_LABELS },
     policyTypes: ['Ingress', 'Egress'],
-    ingress: [{ ports: [{ protocol: 'TCP', port: GATEWAY_PORT }] }],
+    // Published through a NodePort, the gateway is the instance's entry point and admits any
+    // source. Otherwise only this instance's platform and tenant namespaces reach it (#457).
+    ingress: [
+      {
+        ...(published
+          ? {}
+          : {
+              from: [
+                platformNamespacePeer(namespace),
+                { namespaceSelector: tenantNamespacesPeer(installation) },
+              ],
+            }),
+        ports: [{ protocol: 'TCP', port: GATEWAY_PORT }],
+      },
+    ],
     egress: [
       {
         to: [

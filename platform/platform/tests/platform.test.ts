@@ -70,6 +70,10 @@ test('administrator overrides cannot enable shared hosts or escape watched names
     defaults,
   );
   expect(values.operator).toEqual(defaults.operator);
+  // The chart's open ingress policies stay off; the platform renders its own (#462).
+  expect(platformValues({ networkPolicy: { enabled: true } }, defaults).networkPolicy).toEqual({
+    enabled: false,
+  });
   expect(values.runtime).toEqual({
     resources: { limits: { memory: '3Gi' }, requests: { cpu: '250m' } },
   });

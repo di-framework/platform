@@ -828,6 +828,23 @@ still grants `pods/portforward` so developers can reach runtime pods (including
 backends) from their kubeconfig — consistent with the within-tenant Secret access
 model, not a claim of developer-proof network isolation.
 
+Platform namespace ingress (#462): the wasmCloud chart's own NetworkPolicies admit their
+ports from any source, so the platform turns them off (`networkPolicy.enabled: false`, enforced
+over values overrides) and renders its own. Every ingress rule names its peers by namespace
+label, never a bare rule or `namespaceSelector: {}`:
+
+| Policy | Pods, ports | Admits |
+| --- | --- | --- |
+| `di-platform-nats`, `di-tenant-scheduler` | NATS, 4222 | platform namespace pods; this installation's tenant host groups |
+| `di-platform-hostgroup-default` | default host group, 9191 (`wasmcloud-http` 80 targets it) | platform namespace pods (the gateway) |
+| `di-platform-runtime-operator` | runtime-operator, 8082 and 8443 | platform namespace pods |
+| `di-platform-gateway` | gateway, 8080 (Service port 80) | any source when published (`httpNodePort` set); otherwise the platform namespace and this installation's tenant namespaces (#457) |
+
+On a host shared by vCluster instances, vCluster's policy sync rewrites each namespace
+selector into the instance's own `vcluster.loft.sh/ns-label-vcluster-x-<hash>` pod labels, so
+these peers match only the same instance's pods; a rule without `from` would admit every
+instance's. Only a published gateway is reachable from other instances.
+
 ### Installation ownership and lifecycle
 
 - **CRDs** are installed before any class or tenant CRs. Pulumi marks CRDs
