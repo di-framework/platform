@@ -122,6 +122,13 @@ const ready: PlatformInstanceObject = {
     lastRepair: '2026-10-25T10:00:00Z',
     endpoints: { kubernetes: 'https://10.0.0.1:6443', http: 'javascript:alert(1)' },
     kubeconfigSecretRef: { name: 'full-instance-kubeconfig' },
+    applied: {
+      generation: 3,
+      tenants: 2,
+      users: 1,
+      tenantAuthIssuer: 'https://login.example',
+      tenantHostImage: 'localhost/wash:dev',
+    },
   },
 };
 
@@ -244,6 +251,10 @@ describe('detail', () => {
     expect(rowValue('Storage root')).toBe('/var/lib/di-framework/team-b/full-instance');
     expect(rowValue('Gateway NodePort')).toBe('30080');
     expect(rowValue('Last repair')).toBe('2026-10-25T10:00:00Z');
+    expect(rowValue('Applied tenants')).toBe('2');
+    expect(rowValue('Applied users')).toBe('1');
+    expect(rowValue('Applied tenant auth issuer')).toBe('https://login.example');
+    expect(rowValue('Applied tenant host image')).toBe('localhost/wash:dev');
     expect(screen.getByRole('link').getAttribute('href')).toBe('https://10.0.0.1:6443');
     expect(screen.getByText('javascript:alert(1)').tagName).toBe('CODE');
     expect(screen.getByRole('button', { name: 'Show kubeconfig' })).toBeTruthy();
@@ -263,7 +274,22 @@ describe('detail', () => {
     expect(rowValue('Storage root')).toBe('(operator default)');
     expect(rowValue('Gateway NodePort')).toBe('-');
     expect(rowValue('Last repair')).toBe('-');
+    expect(rowValue('Applied tenants')).toBe('-');
+    expect(rowValue('Applied users')).toBe('-');
+    expect(rowValue('Applied tenant auth issuer')).toBe('-');
+    expect(rowValue('Applied tenant host image')).toBe('-');
     expect(screen.getByText(/hasn't published a kubeconfig/)).toBeTruthy();
+  });
+
+  it('shows an applied install without tenantAuth or a recorded host image (#442)', () => {
+    h.item = new PlatformInstance({
+      ...ready,
+      status: { ...ready.status, applied: { generation: 3, tenants: 0, users: 0 } },
+    } as never);
+    render(<PlatformInstanceDetail />);
+    expect(rowValue('Applied tenants')).toBe('0');
+    expect(rowValue('Applied tenant auth issuer')).toBe('-');
+    expect(rowValue('Applied tenant host image')).toBe("(platform's own default)");
   });
 
   it('shows dashes when the spec is missing entirely', () => {

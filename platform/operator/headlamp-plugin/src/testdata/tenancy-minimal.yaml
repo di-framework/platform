@@ -1,0 +1,17 @@
+# The smallest tenancy settings the form makes: one tenant and one user in it. No tenantAuth, and
+# no host image, so the operator's recorded default applies.
+apiVersion: platform.di-framework.dev/v1alpha1
+kind: PlatformInstance
+metadata:
+  name: tenancy-minimal
+  namespace: team-d
+spec:
+  version: 6.0.20
+  target:
+    type: vcluster
+  platform:
+    tenants:
+      - name: acme
+    users:
+      - name: dev
+        memberships: [{ tenant: acme, role: viewer }]

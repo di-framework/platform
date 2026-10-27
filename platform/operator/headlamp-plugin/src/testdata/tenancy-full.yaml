@@ -1,0 +1,47 @@
+# Every tenancy field the form edits, plus tenant and user fields it keeps as they are
+# (deletionPolicy, resources, runtime, suspended).
+apiVersion: platform.di-framework.dev/v1alpha1
+kind: PlatformInstance
+metadata:
+  name: tenancy-full
+  namespace: team-e
+spec:
+  version: 6.0.20
+  target:
+    type: vcluster
+  platform:
+    tenants:
+      - name: acme
+        deletionPolicy: Retain
+        resources: { workloads: 10, cpu: 500m, memory: 1Gi }
+        runtime: { replicas: 2, coreInstances: 200 }
+      - name: globex
+        suspended: true
+    users:
+      - name: dev
+        memberships:
+          - { tenant: acme, role: developer }
+          - { tenant: globex, role: viewer }
+      - name: auditor
+        suspended: true
+        memberships: [{ tenant: globex, role: viewer }]
+    tenantAuth:
+      issuer: https://login.example
+      clientId: platform-console
+      clientSecretRef: { name: tenant-auth-oauth, key: clientSecret }
+      image: ghcr.io/di-framework/tenant-auth@sha256:455af084f57e60a54b16b6f5c4f39fcafb0593612fb036e1b099b88423147a30
+      issuerIp: 10.0.0.53
+      issuerUpstream: login.idp.svc.cluster.local:443
+      issuerUpstreamPodPort: 8443
+      consolePublicUrl: https://{tenant}.console.example
+      controllerPublicUrl: https://{tenant}.api.example
+      registry:
+        component: ghcr.io/di-framework/oci-registry@sha256:6fea016378c3c6313427f2d6df0fed5ca369ab8f5676eb49d99844625312bb80
+        publicUrl: https://{tenant}.registry.example
+        limits:
+          maxBodyBytes: 1073741824
+          maxConcurrent: 8
+          uploadIdleTimeoutMs: 30000
+          upstreamTimeoutMs: 60000
+    tenantHostImage: localhost/wash:dev
+    tenantHostImagePullPolicy: Never
