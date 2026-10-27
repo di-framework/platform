@@ -1226,6 +1226,53 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     expect('workflow_dispatch' in release.on).toBe(true);
   });
 
+  test('a second run for a tag queues, then refuses a version already released (#485)', () => {
+    expect(release.concurrency).toEqual({
+      group: 'release-${{ github.ref }}',
+      'cancel-in-progress': false,
+    });
+    const first = steps('build')[0];
+    expect(first?.name).toBe('Refuse a version that is already released');
+    expect(first?.if).toBe("github.ref_type == 'tag'");
+
+    const base = mkdtempSync(join(tmpdir(), 'release-refuse-'));
+    const bin = join(base, 'bin');
+    // gh release view succeeds when `release` exists; npm view prints the version when `npm`
+    // exists, and otherwise fails like the registry does for a missing version.
+    stubCommand(bin, 'gh', `[ -f "${base}/release" ]`);
+    stubCommand(
+      bin,
+      'npm',
+      `if [ -f "${base}/npm" ]; then echo 1.2.3; else echo "npm error code E404" >&2; exit 1; fi`,
+    );
+    const refuse = () => {
+      const result = Bun.spawnSync(['bash', '-c', first?.run ?? ''], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: {
+          ...env,
+          PATH: `${bin}:${process.env.PATH}`,
+          GITHUB_REF_NAME: 'v1.2.3',
+          RUNNER_TEMP: base,
+        },
+      });
+      return { exitCode: result.exitCode, stdout: result.stdout.toString() };
+    };
+
+    // Nothing published yet (also a first run that failed before publishing): it goes on.
+    expect(refuse()).toEqual({ exitCode: 0, stdout: 'v1.2.3 is not released yet\n' });
+
+    writeFileSync(join(base, 'npm'), '');
+    const onNpm = refuse();
+    expect(onNpm.exitCode).toBe(1);
+    expect(onNpm.stdout).toContain('::error::@di-framework/platform@1.2.3 is already on npm');
+
+    writeFileSync(join(base, 'release'), '');
+    const released = refuse();
+    expect(released.exitCode).toBe(1);
+    expect(released.stdout).toContain('::error::GitHub Release v1.2.3 already exists');
+  });
+
   test('build, publish and github-release run in that order; chart runs after build, before the Release', () => {
     expect(Object.keys(release.jobs).sort()).toEqual([
       'build',
@@ -1594,11 +1641,13 @@ describe('Auto Tag tags a release when its PR merges instead of waiting for it (
     expect(autoTag.jobs.tag?.needs).toBeUndefined();
     expect(autoTag.jobs['release-pr']?.needs).toBe('tag');
     expect(allRuns).not.toMatch(/\bsleep\b|gh pr view "\$PR"|mergedAt/);
-    // A workflow-level group would let PR-close runs cancel a pending release run, and one
-    // group for every tag job would let a merge run replace a pending push run.
+    // A workflow-level group would let PR-close runs cancel a pending release run, and the
+    // release-pr job's own `auto-tag` group would deadlock under it. The tag jobs of every run
+    // share one group, so a release merge's push and pull_request runs never tag and dispatch
+    // concurrently (#485).
     expect(autoTag.concurrency).toBeUndefined();
     expect(autoTag.jobs.tag).toMatchObject({
-      concurrency: { group: 'auto-tag-tag-${{ github.event_name }}', 'cancel-in-progress': false },
+      concurrency: { group: 'auto-tag-tag', 'cancel-in-progress': false },
     });
     expect(autoTag.jobs['release-pr']).toMatchObject({
       concurrency: { group: 'auto-tag', 'cancel-in-progress': false },
@@ -1833,6 +1882,22 @@ describe('Auto Tag tags a release when its PR merges instead of waiting for it (
       });
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toContain('Tag v1.0.1 was pushed by another run; nothing to do.');
+      expect(dispatches(box)).toEqual([]);
+    });
+
+    test('a Release run that exists by the time of the dispatch is not dispatched again (#485)', () => {
+      // Two runs that tag in the same second push byte-identical tag objects, so the second
+      // push succeeds as a no-op; only the Release run the first one dispatched tells them apart.
+      const box = sandbox();
+      const result = run(box, { EVENT: 'push' }, () => {
+        writeFileSync(join(box.base, 'runs.json'), '[{"databaseId":1}]');
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.out.action).toBe('tag');
+      expect(remoteTag(box, 'v1.0.1')).toBe(box.release);
+      expect(result.stdout).toContain(
+        'A Release run already exists for v1.0.1; not dispatching another.',
+      );
       expect(dispatches(box)).toEqual([]);
     });
 
