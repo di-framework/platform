@@ -18,7 +18,7 @@ spec:
   platform:                # optional
     networkPolicyEngine: existing
     gateway:
-      httpNodePort: 0
+      httpNodePort: 30080                        # publishes the gateway; 0 keeps it in-instance only
       httpEndpoint: http://apps.example:30080   # public base URL; reported in status.endpoints.http
   deletionPolicy: Delete   # or Retain
 ```
@@ -281,16 +281,18 @@ back by the next round (and so by the next repair); an unchanged one is not writ
 
 What this isolates: pods of another instance, and pods in any other host namespace, can't reach this
 instance's `wasmcloud` services (NATS, host group, runtime-operator, `wasmcloud-http`), its CoreDNS, its vCluster
-API or its kubelet port. The platform's own synced policies keep isolating its tenant namespaces as before.
+API or its kubelet port. The platform's own synced policies name their peers by namespace (platform #462), so they keep isolating its tenant namespaces and admit no other instance.
 
 What it doesn't:
 
 - **Egress** is not restricted here; it stays as the platform's synced policies set it (DNS to the host's
   `kube-system/kube-dns` on 53 among it).
-- **The HTTP gateway.** The platform's synced `di-platform-gateway` policy admits its HTTP port from any
-  source, with no peers, so that `gateway.httpNodePort` traffic from outside the cluster arrives. Policies add
-  up, so the default deny doesn't close it, and pods of other instances can reach the gateway pods too, as anyone
-  can through the NodePort. The NodePort path itself needs no host-namespace rule.
+- **The HTTP gateway, when published.** With `gateway.httpNodePort` set, the platform's synced
+  `di-platform-gateway` policy admits its HTTP port from any source, with no peers, so NodePort traffic from
+  outside the cluster arrives. Policies add up, so the default deny doesn't close it, and pods of other instances
+  can reach the gateway pods too, as anyone can through the NodePort. With `httpNodePort: 0` the policy admits
+  only the instance's platform and tenant namespaces (platform #457), so nothing outside the instance, an
+  ingress controller included, reaches the gateway; a public `httpEndpoint` then needs a NodePort.
 - **Other in-cluster clients of the vCluster API.** Only the operator's namespace is admitted to port 8443.
   Anything else in the cluster that uses an instance kubeconfig must run in that namespace or use
   `kubectl port-forward`, which goes through the kubelet and the container runtime into the pod and so isn't

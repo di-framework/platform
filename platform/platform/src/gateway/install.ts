@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
-import { platformNamespacePeer, tenantNamespacesPeer } from '../platform-ingress';
+import { platformNamespacePeer, tenantNamespacesSelector } from '../platform-ingress';
 import {
   GATEWAY_NAME,
   GATEWAY_POD_LABELS,
@@ -244,7 +244,7 @@ export function gatewayNetworkPolicySpec(
   tenantAuthRoutes: TenantAuthRoutes = {},
   published = false,
 ) {
-  const tenantNamespaces: Selector = tenantNamespacesPeer(installation);
+  const tenantNamespaces: Selector = tenantNamespacesSelector(installation);
   const routed = [
     ...(tenantAuthRoutes.console ? [['tenant-console', 8787] as const] : []),
     ...(tenantAuthRoutes.controller ? [['tenant-controller', 8788] as const] : []),
@@ -283,7 +283,7 @@ export function gatewayNetworkPolicySpec(
           : {
               from: [
                 platformNamespacePeer(namespace),
-                { namespaceSelector: tenantNamespacesPeer(installation) },
+                { namespaceSelector: tenantNamespacesSelector(installation) },
               ],
             }),
         ports: [{ protocol: 'TCP', port: GATEWAY_PORT }],

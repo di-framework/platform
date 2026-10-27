@@ -2,7 +2,11 @@ import { describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { GATEWAY_NAME, GATEWAY_PORT } from '../src/gateway/install';
-import { platformIngressPolicies, RUNTIME_OPERATOR_SERVICE_PORT } from '../src/platform-ingress';
+import {
+  extraHostGroupsWarning,
+  platformIngressPolicies,
+  RUNTIME_OPERATOR_SERVICE_PORT,
+} from '../src/platform-ingress';
 import { INSTALLATION, TENANT } from '../src/tenancy/resources';
 
 const root = join(import.meta.dir, '..');
@@ -67,7 +71,18 @@ describe('platform namespace ingress (#462)', () => {
       ingress: [
         {
           from: [
-            platformPeer,
+            {
+              ...platformPeer,
+              podSelector: {
+                matchExpressions: [
+                  {
+                    key: 'wasmcloud.com/name',
+                    operator: 'In',
+                    values: ['hostgroup', 'runtime-operator'],
+                  },
+                ],
+              },
+            },
             {
               namespaceSelector: tenantNamespaces,
               podSelector: { matchLabels: { 'wasmcloud.com/name': 'hostgroup' } },
@@ -108,6 +123,7 @@ describe('platform namespace ingress (#462)', () => {
         if (exempt.includes(policy.metadata.name)) continue;
         expect(rule.from?.length, policy.metadata.name).toBeGreaterThan(0);
         expect(JSON.stringify(rule.from)).not.toContain('"namespaceSelector":{}');
+        expect(JSON.stringify(rule.from)).not.toContain('0.0.0.0/0');
       }
     return platform;
   };
@@ -121,4 +137,15 @@ describe('platform namespace ingress (#462)', () => {
     const gateway = platform.find((p) => p.metadata.name === GATEWAY_NAME);
     expect(gateway?.spec.ingress).toEqual([{ ports: [{ protocol: 'TCP', port: GATEWAY_PORT }] }]);
   }, 60_000);
+
+  it('warns about host groups a values override adds', () => {
+    expect(extraHostGroupsWarning(undefined)).toBeUndefined();
+    expect(extraHostGroupsWarning({ runtime: { hostGroups: 'x' } })).toBeUndefined();
+    expect(
+      extraHostGroupsWarning({ runtime: { hostGroups: [{ name: 'default' }] } }),
+    ).toBeUndefined();
+    expect(
+      extraHostGroupsWarning({ runtime: { hostGroups: [{ name: 'default' }, { name: 'gpu' }] } }),
+    ).toContain('(gpu) that get no ingress NetworkPolicy');
+  });
 });

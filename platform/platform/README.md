@@ -654,7 +654,11 @@ kubectl delete namespace di-tenant-alpha di-runtime-alpha di-apikeys-alpha
 `runtimeNats` (see [Runtime NATS storage caps](#runtime-nats-storage-caps)),
 and administrator `values` are optional. `tenants`, `users`,
 `tenantHostImage`, and `tenantHostImagePullPolicy` use the same declarations as the
-local entrypoint. NodePort zero makes the HTTP gateway ClusterIP. Registry installation is off
+local entrypoint. NodePort zero (the default here) makes the HTTP gateway ClusterIP, and its
+NetworkPolicy then admits only the platform and tenant namespaces (#457): an ingress controller
+or any other proxy in another namespace that fronts the gateway can no longer reach it, so set
+`httpNodePort` to publish it. Values overrides that add host groups get a warning: the platform
+renders an ingress policy for the `default` host group only. Registry installation is off
 for existing clusters. `insecureRegistry` gives the platform host group
 `--allow-insecure-registries`; tenant hosts get `--insecure-registry` only for each
 `insecureRegistries` entry (a list of `host[:port]`, spelled exactly as workload references spell
@@ -835,7 +839,7 @@ label, never a bare rule or `namespaceSelector: {}`:
 
 | Policy | Pods, ports | Admits |
 | --- | --- | --- |
-| `di-platform-nats`, `di-tenant-scheduler` | NATS, 4222 | platform namespace pods; this installation's tenant host groups |
+| `di-platform-nats`, `di-tenant-scheduler` | NATS, 4222 | the platform namespace's host group and runtime-operator pods; this installation's tenant host groups |
 | `di-platform-hostgroup-default` | default host group, 9191 (`wasmcloud-http` 80 targets it) | platform namespace pods (the gateway) |
 | `di-platform-runtime-operator` | runtime-operator, 8082 and 8443 | platform namespace pods |
 | `di-platform-gateway` | gateway, 8080 (Service port 80) | any source when published (`httpNodePort` set); otherwise the platform namespace and this installation's tenant namespaces (#457) |

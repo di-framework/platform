@@ -18,7 +18,7 @@ import {
 } from './insecure-registries';
 import { tenantKubeconfig } from './kubeconfig';
 import { installNetworkPolicy } from './network-policy';
-import { platformIngressPolicies } from './platform-ingress';
+import { extraHostGroupsWarning, platformIngressPolicies } from './platform-ingress';
 import {
   declarations,
   installTenancy,
@@ -201,6 +201,8 @@ export function validatePlatformConfig(args: PlatformConfigArgs): ValidatedPlatf
       `tenantAuth.${notDerived.join(', tenantAuth.')} not derived from routeUrlPattern ${routeUrlPattern} ` +
         '(only http://{host}.{tenant}.localhost[:<port>] is routed to tenant-auth); the 127.0.0.1 defaults apply',
     );
+  const extraHostGroups = extraHostGroupsWarning(args.values);
+  if (extraHostGroups) warnings.push(extraHostGroups);
   const runtimeNats = args.runtimeNats ?? config.getObject<RuntimeNatsConfig>('runtimeNats');
   assertRuntimeNatsConfig(runtimeNats);
   const backingServiceClasses = resolveBackingServiceClasses(config);
