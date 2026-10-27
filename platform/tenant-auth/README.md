@@ -98,7 +98,7 @@ checks (close and reopen it) before merging. **Pin consumers by digest**, never 
 published:
 
 ```yaml
-image: ghcr.io/di-framework/tenant-auth@sha256:7ea1bcbe5ded849f8df80f53423ff2c5fff6dbce3870267e748374b84ae85370
+image: ghcr.io/di-framework/tenant-auth@sha256:ede9577238b304dc87a19cf69bd20bfc00889116b17da12c2e98e2c97657a715
 ```
 
 Publishing needs the organization to allow Actions to write packages (issue #13).
@@ -142,7 +142,7 @@ controller point at it with platform config:
 
 ```yaml
 tenantAuth:
-  image: ghcr.io/di-framework/tenant-auth@sha256:7ea1bcbe5ded849f8df80f53423ff2c5fff6dbce3870267e748374b84ae85370
+  image: ghcr.io/di-framework/tenant-auth@sha256:ede9577238b304dc87a19cf69bd20bfc00889116b17da12c2e98e2c97657a715
   issuer: http://identity.identity.localhost:28280
   issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80
   issuerUpstreamPodPort: 8080
