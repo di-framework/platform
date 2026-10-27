@@ -8,19 +8,13 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - events
-  verbs:
-  - create
-  - patch
-- apiGroups:
-  - ""
-  resources:
   - namespaces
   verbs:
   - create
   - delete
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - ""
@@ -47,6 +41,23 @@ rules:
   - services
   verbs:
   - get
+- apiGroups:
+  - ""
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - admissionregistration.k8s.io
+  resources:
+  - validatingadmissionpolicies
+  - validatingadmissionpolicybindings
+  verbs:
+  - create
+  - get
+  - update
 - apiGroups:
   - apps
   resources:

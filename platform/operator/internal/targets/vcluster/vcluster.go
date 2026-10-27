@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -102,9 +103,18 @@ type Target struct {
 	// OperatorNamespace is the operator's own namespace, which the host-namespace
 	// NetworkPolicies admit to the vCluster API.
 	OperatorNamespace string
+	// OperatorUsername is the operator's own user (system:serviceaccount:<ns>:<name>), which the
+	// admission policy lets delete service/vcluster.
+	OperatorUsername string
 	// Dial checks that the vCluster API answers at address (host:port); nil opens a TCP
 	// connection with a 5 second timeout.
 	Dial func(ctx context.Context, address string) error
+
+	// ResyncTimeout bounds a resync: one waiting longer at the same stage is reported
+	// TargetUnreachable. Zero means no bound.
+	ResyncTimeout time.Duration
+	// Now is injectable for tests; nil uses time.Now.
+	Now func() time.Time
 
 	mu sync.Mutex
 	// failures counts consecutive failed API checks per host namespace.
@@ -135,6 +145,16 @@ var _ targets.Target = (*Target)(nil)
 // unreachable only after UnreachableAfter consecutive failed checks, so one slow dial doesn't
 // flip a ready instance.
 func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (targets.State, error) {
+	unprotected, err := t.applyAdmissionPolicy(ctx)
+	if err != nil {
+		return targets.State{}, err
+	}
+	st, err := t.ensure(ctx, inst)
+	st.Unprotected = unprotected
+	return st, err
+}
+
+func (t *Target) ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (targets.State, error) {
 	ns := HostNamespace(inst)
 	// The unreachable count is of consecutive checks: a round that stops before the check
 	// (repairing, control plane or Secret pending, an error) starts it over.
@@ -185,8 +205,9 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 		return targets.State{}, fmt.Errorf("%w: vcluster release was %s (%s); removed it to install again", ErrReinstalling, rel.Status, rel.Description)
 	}
 
+	objs := releaseObjects(ns)
 	var missing []string
-	for _, obj := range releaseObjects(ns) {
+	for _, obj := range objs {
 		if err := t.Client.Get(ctx, client.ObjectKeyFromObject(obj), obj); apierrors.IsNotFound(err) {
 			kind := "service"
 			if _, ok := obj.(*appsv1.StatefulSet); ok {
@@ -201,19 +222,47 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 		if err := t.Helm.Repair(ctx, ns, ReleaseName); err != nil {
 			return targets.State{}, fmt.Errorf("re-apply vcluster release to recreate %s: %w", strings.Join(missing, ", "), err)
 		}
-		return targets.State{Reason: "Repairing", Message: fmt.Sprintf("re-applied the vcluster release in namespace %s to recreate %s", ns, strings.Join(missing, ", "))}, nil
+		msg := fmt.Sprintf("re-applied the vcluster release in namespace %s to recreate %s", ns, strings.Join(missing, ", "))
+		if inst.Status.Target.ServiceUID != "" && slices.Contains(missing, "service/"+ReleaseName) {
+			// The owner Service is new: start the resync in the same round (#466).
+			svc := objs[1]
+			if err := t.Client.Get(ctx, client.ObjectKeyFromObject(svc), svc); err != nil {
+				return targets.State{}, err
+			}
+			return t.resync(ctx, ns, string(svc.GetUID()), ReasonResyncing, msg+"; restarted the vcluster control plane to resync")
+		}
+		return targets.State{Reason: "Repairing", Message: msg}, nil
 	}
-	sts := releaseObjects(ns)[0].(*appsv1.StatefulSet)
-	if err := t.Client.Get(ctx, client.ObjectKeyFromObject(sts), sts); err != nil {
-		return targets.State{}, err
+	sts := objs[0].(*appsv1.StatefulSet)
+	uid := string(objs[1].GetUID())
+	// vCluster owns every object it syncs into the host namespace through service/vcluster
+	// (#466). A replaced Service means they were garbage-collected, and the syncer only
+	// regenerates its kubeconfig Secret when it starts: restart it, then reinstall the platform.
+	recorded := inst.Status.Target.ServiceUID
+	resyncing := uid != "" && inst.Status.Target.ResyncServiceUID == uid
+	if recorded != "" && uid != recorded && !resyncing {
+		return t.resync(ctx, ns, uid, ReasonResyncing,
+			fmt.Sprintf("service %s/%s was replaced (uid %s, was %s), which garbage-collected the objects vcluster synced; restarted the vcluster control plane to resync", ns, ReleaseName, uid, recorded))
 	}
 	if sts.Status.ReadyReplicas < 1 {
+		if resyncing {
+			return t.resyncWaiting(inst, "vcluster control plane not ready"), nil
+		}
 		return targets.State{Reason: "ControlPlanePending", Message: "vcluster control plane not ready"}, nil
 	}
 
 	var secret corev1.Secret
 	if err := t.Client.Get(ctx, types.NamespacedName{Namespace: ns, Name: "vc-" + ReleaseName}, &secret); apierrors.IsNotFound(err) {
-		return targets.State{Reason: "KubeconfigPending", Message: "vcluster kubeconfig Secret not created yet"}, nil
+		switch {
+		case resyncing:
+			return t.resyncWaiting(inst, fmt.Sprintf("waiting for vcluster to recreate its kubeconfig Secret %s/vc-%s", ns, ReleaseName)), nil
+		case recorded != "" || inst.Status.InstalledVersion != "":
+			// It existed once: the syncer won't create it again without a restart.
+			return t.resync(ctx, ns, uid, ReasonKubeconfigMissing,
+				fmt.Sprintf("vcluster kubeconfig Secret %s/vc-%s is missing; resync pending", ns, ReleaseName))
+		default:
+			return targets.State{Reason: "KubeconfigPending", Message: "vcluster kubeconfig Secret not created yet"}, nil
+		}
 	} else if err != nil {
 		return targets.State{}, err
 	}
@@ -227,9 +276,12 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 	if err != nil {
 		return targets.State{}, fmt.Errorf("vcluster kubeconfig: %w", err)
 	}
-	ready := targets.State{Ready: true, Kubeconfig: kubeconfig, Server: server}
+	ready := targets.State{Ready: true, Kubeconfig: kubeconfig, Server: server, ServiceUID: uid, Resynced: resyncing}
 	checked = true
 	if err := t.dial(ctx, address); err != nil {
+		if resyncing {
+			return t.resyncWaiting(inst, fmt.Sprintf("waiting for the vcluster API %s: %v", server, err)), nil
+		}
 		n := t.countFailure(ns)
 		if n < UnreachableAfter {
 			log.FromContext(ctx).Info("vcluster API check failed", "endpoint", server, "failures", n, "error", err.Error())
@@ -239,6 +291,43 @@ func (t *Target) Ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 	}
 	t.resetFailures(ns)
 	return ready, nil
+}
+
+// Reasons the target reports while it resyncs an instance whose synced objects were lost (#466).
+const (
+	// ReasonResyncing: the control plane was restarted and the platform is reinstalled once it
+	// answers.
+	ReasonResyncing = "Resyncing"
+	// ReasonKubeconfigMissing: the kubeconfig Secret existed and was deleted; a restart
+	// recreates it.
+	ReasonKubeconfigMissing = "KubeconfigMissing"
+)
+
+// resyncWaiting reports a resync waiting at stage; past ResyncTimeout it is TargetUnreachable.
+func (t *Target) resyncWaiting(inst *v1alpha1.PlatformInstance, stage string) targets.State {
+	started := inst.Status.Target.ResyncStarted
+	if t.ResyncTimeout > 0 && started != nil {
+		now := time.Now
+		if t.Now != nil {
+			now = t.Now
+		}
+		if since := now().Sub(started.Time); since > t.ResyncTimeout {
+			return targets.State{Reason: "TargetUnreachable", Message: fmt.Sprintf("resync started %s ago is stuck: %s", since.Round(time.Second), stage)}
+		}
+	}
+	return targets.State{Reason: ReasonResyncing, Message: "resyncing: " + stage}
+}
+
+// resync deletes the vCluster pod, which its StatefulSet recreates. The restarted syncer
+// writes its kubeconfig Secret again and syncs the virtual objects that still exist back to the
+// host namespace.
+func (t *Target) resync(ctx context.Context, ns, uid, reason, msg string) (targets.State, error) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: ReleaseName + "-0"}}
+	if err := t.Client.Delete(ctx, pod); client.IgnoreNotFound(err) != nil {
+		return targets.State{}, fmt.Errorf("restart %s/%s to resync: %w", ns, pod.Name, err)
+	}
+	log.FromContext(ctx).Info("resyncing vcluster", "namespace", ns, "reason", reason)
+	return targets.State{Reason: reason, Message: msg, ResyncStarted: uid}, nil
 }
 
 // UnreachableAfter is how many consecutive failed API checks report the target unreachable.
@@ -295,7 +384,7 @@ func (t *Target) claimNamespace(ctx context.Context, inst *v1alpha1.PlatformInst
 	if apierrors.IsNotFound(err) {
 		namespace = corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
 			Name:        ns,
-			Labels:      map[string]string{"app.kubernetes.io/managed-by": "platform-operator"},
+			Labels:      map[string]string{"app.kubernetes.io/managed-by": "platform-operator", HostNamespaceLabel: "true"},
 			Annotations: map[string]string{OwnerAnnotation: owner(inst)},
 		}}
 		err = t.Client.Create(ctx, &namespace)
@@ -308,7 +397,19 @@ func (t *Target) claimNamespace(ctx context.Context, inst *v1alpha1.PlatformInst
 	if err != nil {
 		return err
 	}
-	return checkOwner(inst, &namespace)
+	if err := checkOwner(inst, &namespace); err != nil {
+		return err
+	}
+	if namespace.Labels[HostNamespaceLabel] == "true" {
+		return nil
+	}
+	// A namespace created before the label existed: the admission policy covers labelled ones.
+	base := namespace.DeepCopy()
+	if namespace.Labels == nil {
+		namespace.Labels = map[string]string{}
+	}
+	namespace.Labels[HostNamespaceLabel] = "true"
+	return t.Client.Patch(ctx, &namespace, client.MergeFrom(base))
 }
 
 func owner(inst *v1alpha1.PlatformInstance) string { return inst.Namespace + "/" + inst.Name }

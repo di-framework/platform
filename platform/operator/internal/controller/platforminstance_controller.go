@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/recorder"
 
 	"github.com/di-framework/platform/operator/api/v1alpha1"
 	"github.com/di-framework/platform/operator/internal/installer"
@@ -47,7 +48,9 @@ type Reconciler struct {
 	client.Client
 	Target    targets.Target
 	Installer installer.Installer
-	Plan      plan.Config
+	// Recorder emits Events on PlatformInstances; nil emits none.
+	Recorder recorder.EventRecorder
+	Plan     plan.Config
 	// StorageRootBase is the node directory under which each instance gets its own storageRoot
 	// when spec.platform.storageRoot is empty.
 	StorageRootBase string
@@ -67,11 +70,13 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=platform.di-framework.dev,resources=platforminstances/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=platform.di-framework.dev,resources=platforminstances/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;create;update
+// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,verbs=get;create;update
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;create;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=list;delete
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
@@ -132,6 +137,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 		return r.fail(ctx, &inst, v1alpha1.ConditionTargetReady, reason, msg, err)
 	}
+	if err := r.reportProtection(ctx, &inst, st.Unprotected); err != nil {
+		return ctrl.Result{}, err
+	}
 	obs.TargetReady = st.Ready
 	if st.Ready {
 		if err := r.writeKubeconfig(ctx, &inst, st.Kubeconfig); err != nil {
@@ -140,6 +148,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	d := plan.Next(obs, r.Plan)
+	if st.Ready && st.Resynced && d.Action == plan.Wait {
+		// The target was resynced after its synced objects were lost (#466): run the install
+		// now instead of at the next repair, so the platform's Secrets and ConfigMaps come back.
+		d = plan.Decision{Action: plan.Repair, Reason: ReasonResync}
+	}
 	log.FromContext(ctx).V(1).Info("decision", "action", d.Action, "reason", d.Reason)
 	switch d.Action {
 	case plan.EnsureTarget:
@@ -155,22 +168,27 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			if !keepRef {
 				s.KubeconfigSecretRef = nil
 			}
+			if st.ResyncStarted != "" {
+				now := metav1.NewTime(r.now())
+				s.Target.ResyncServiceUID = st.ResyncStarted
+				s.Target.ResyncStarted = &now
+			}
 			setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionFalse, st.Reason, st.Message)
 			setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionFalse, "TargetPending", "waiting for the target cluster")
 		})
 	case plan.Install, plan.Repair:
 		return r.install(ctx, &inst, st, d)
 	default: // plan.Wait
-		return ctrl.Result{RequeueAfter: d.RequeueAfter}, r.markReady(ctx, &inst)
+		return ctrl.Result{RequeueAfter: d.RequeueAfter}, r.markReady(ctx, &inst, st)
 	}
 }
 
 // markReady puts back the Ready status when the instance is installed and its target answers
 // again after a transient failure, which leaves phase and conditions behind until the next
 // repair otherwise.
-func (r *Reconciler) markReady(ctx context.Context, inst *v1alpha1.PlatformInstance) error {
+func (r *Reconciler) markReady(ctx context.Context, inst *v1alpha1.PlatformInstance, st targets.State) error {
 	s := inst.Status
-	if s.Phase == v1alpha1.PhaseReady && s.KubeconfigSecretRef != nil &&
+	if s.Phase == v1alpha1.PhaseReady && s.KubeconfigSecretRef != nil && s.Target.ServiceUID == st.ServiceUID &&
 		meta.IsStatusConditionTrue(s.Conditions, v1alpha1.ConditionTargetReady) &&
 		meta.IsStatusConditionTrue(s.Conditions, v1alpha1.ConditionReady) {
 		return nil
@@ -178,10 +196,40 @@ func (r *Reconciler) markReady(ctx context.Context, inst *v1alpha1.PlatformInsta
 	return r.patchStatus(ctx, inst, func(s *v1alpha1.PlatformInstanceStatus) {
 		s.Phase = v1alpha1.PhaseReady
 		s.KubeconfigSecretRef = &v1alpha1.SecretReference{Name: kubeconfigSecretName(inst)}
+		// An instance installed before the uid was recorded gets it here.
+		s.Target.ServiceUID = st.ServiceUID
 		setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionTrue, "Ready", "target cluster answers")
 		setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionTrue, "Ready", "instance is ready")
 	})
 }
+
+// ReasonAdmissionPolicyUnavailable (on OwnerServiceProtected) reports an API server without
+// admission policies, so service/vcluster can be deleted (#466).
+const ReasonAdmissionPolicyUnavailable = "AdmissionPolicyUnavailable"
+
+// reportProtection sets OwnerServiceProtected when it changes, with a Warning Event when the
+// target couldn't protect its owner Service.
+func (r *Reconciler) reportProtection(ctx context.Context, inst *v1alpha1.PlatformInstance, unprotected string) error {
+	status, reason, msg := metav1.ConditionTrue, "AdmissionPolicyInstalled", "an admission policy denies deleting service/vcluster"
+	if unprotected != "" {
+		status, reason, msg = metav1.ConditionFalse, ReasonAdmissionPolicyUnavailable, unprotected
+	}
+	if c := meta.FindStatusCondition(inst.Status.Conditions, v1alpha1.ConditionOwnerServiceProtected); c != nil && c.Status == status && c.Reason == reason {
+		return nil
+	}
+	if unprotected != "" {
+		log.FromContext(ctx).Info("owner Service unprotected", "reason", unprotected)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(inst, nil, corev1.EventTypeWarning, ReasonAdmissionPolicyUnavailable, "Protect", "%s", unprotected)
+		}
+	}
+	return r.patchStatus(ctx, inst, func(s *v1alpha1.PlatformInstanceStatus) {
+		setCondition(s, inst.Generation, v1alpha1.ConditionOwnerServiceProtected, status, reason, msg)
+	})
+}
+
+// ReasonResync is the Installed reason of the install that follows a target resync (#466).
+const ReasonResync = "Resync"
 
 func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstance, st targets.State, d plan.Decision) (ctrl.Result, error) {
 	req := r.request(inst, st)
@@ -194,7 +242,13 @@ func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstanc
 			s.Phase = v1alpha1.PhaseInstalling
 		}
 		s.KubeconfigSecretRef = &v1alpha1.SecretReference{Name: kubeconfigSecretName(inst)}
-		setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionTrue, "Ready", "target cluster answers")
+		if st.Resynced {
+			// Ready again only once the platform is reinstalled on the resynced target.
+			setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionFalse, "Resyncing",
+				"vcluster resynced; reinstalling the platform to recreate the objects it lost")
+		} else {
+			setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionTrue, "Ready", "target cluster answers")
+		}
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -207,8 +261,8 @@ func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstanc
 	}
 	// A repair, and a retry after a failed install, refresh first: the failed run may have left
 	// resources Pulumi hasn't recorded.
-	refresh := d.Action == plan.Repair || d.Reason == plan.ReasonRetry
-	res, err := r.Installer.Install(installCtx, req, installer.Options{Refresh: refresh})
+	refresh := d.Action == plan.Repair || d.Reason == plan.ReasonRetry || st.Resynced
+	res, err := r.Installer.Install(installCtx, req, installer.Options{Refresh: refresh, ReinstallRelease: st.Resynced})
 	if errors.Is(err, installer.ErrHostImageNotApproved) {
 		return r.failConfig(ctx, inst, v1alpha1.ReasonTenantHostImageUnsupported,
 			fmt.Sprintf("%v. spec.platform.tenantHostImage is empty, so the operator's default would be used: set spec.platform.tenantHostImage, or a spec.version that approves it", err), err)
@@ -225,6 +279,8 @@ func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstanc
 		s.LastRepair = &now
 		s.Endpoints = v1alpha1.Endpoints{Kubernetes: res.KubernetesEndpoint, HTTP: res.HTTPEndpoint}
 		s.Applied = applied(inst, image)
+		s.Target = v1alpha1.TargetStatus{ServiceUID: st.ServiceUID}
+		setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionTrue, "Ready", "target cluster answers")
 		setCondition(s, inst.Generation, v1alpha1.ConditionInstalled, metav1.ConditionTrue, d.Reason, "platform "+inst.Spec.Version+" installed")
 		setCondition(s, inst.Generation, v1alpha1.ConditionConfigApplied, metav1.ConditionTrue, "Applied",
 			fmt.Sprintf("generation %d: %d tenant(s), %d user(s), tenantAuth issuer %q", s.Applied.Generation, s.Applied.Tenants, s.Applied.Users, s.Applied.TenantAuthIssuer))

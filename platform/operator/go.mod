@@ -3,6 +3,7 @@ module github.com/di-framework/platform/operator
 go 1.26.6
 
 require (
+	github.com/google/cel-go v0.29.2
 	github.com/pulumi/pulumi/sdk/v3 v3.270.0
 	helm.sh/helm/v3 v3.22.1
 	k8s.io/api v0.37.1

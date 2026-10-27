@@ -163,10 +163,12 @@ the Kubernetes endpoint and the kubeconfig.
 characters.
 
 Status carries `phase` (`Provisioning`, `Installing`, `Ready`, `Failed`, `Deleting`) and the `TargetReady`,
-`Installed` and `Ready` conditions, each with a readable reason and message. While the target isn't ready,
+`Installed` and `Ready` conditions (and `OwnerServiceProtected`, see [Destructive operations](#destructive-operations)), each with a readable reason and message. While the target isn't ready,
 `TargetReady` is `False` with `ControlPlanePending` (the vCluster StatefulSet isn't ready), `Repairing` (a
 missing release object is being recreated), `RolledBack` (a failed or interrupted repair was rolled back),
-`KubeconfigPending` (vCluster's kubeconfig Secret doesn't exist yet) or `TargetUnreachable` (the Secret
+`KubeconfigPending` (vCluster's kubeconfig Secret doesn't exist yet), `KubeconfigMissing` (the Secret
+existed and was deleted; a resync starts), `Resyncing` (see [Destructive operations](#destructive-operations))
+or `TargetUnreachable` (the Secret
 exists but the vCluster API, named in the message, failed 3 consecutive checks; a single failed check
 changes nothing). While the instance's kubeconfig Secret exists, `kubeconfigSecretRef` keeps pointing at it.
 
@@ -304,6 +306,75 @@ What it doesn't:
   node) is admitted by kube-router's local-node rule. NodePort traffic from outside keeps its source address
   (the NAT happens after the policy check) and is admitted only by a rule with no peers, such as the
   gateway's.
+
+## Destructive operations
+
+vCluster (0.37.3) sets the `ownerReferences` of **every object it syncs into the host namespace** to the
+instance's `service/vcluster`: the synced pods, Services, ConfigMaps, Secrets (the platform's
+`wasmcloud-*-tls` among them), NetworkPolicies and its own kubeconfig Secret `vc-vcluster`. Deleting that
+Service makes the garbage collector delete all of them, vCluster then deletes the virtual copies of the
+Secrets and ConfigMaps, and `vc-vcluster` is only written again when the syncer restarts (#466).
+
+The way to remove `service/vcluster` is to delete the PlatformInstance (or, for an instance whose operator
+is gone, its host namespace). Don't delete the Service on its own.
+
+### The admission policy
+
+The operator installs a cluster-scoped `ValidatingAdmissionPolicy` and binding,
+`platform-operator-protect-vcluster-service` (`admissionregistration.k8s.io/v1`, Kubernetes 1.30 or later;
+verified on KubeSolo v1.2.0, which ships Kubernetes v1.35.7 and serves it, with the operator's ServiceAccount
+`platform-operator`),
+that denies `DELETE` of a Service named `vcluster` in a namespace labelled
+`platform.di-framework.dev/host-namespace=true`. The operator labels every host namespace it creates, and
+labels an existing one on its next reconcile. The delete is allowed for the operator's own user (looked up at
+start with a `SelfSubjectReview` and logged; `helm uninstall` runs as it when a PlatformInstance is deleted)
+and while the namespace is terminating (the namespace controller removing its contents).
+
+A deleted or edited policy or binding comes back on the instance's next reconcile (a target poll, a watch
+event or the next repair), not immediately; until then the Service is unprotected. On an API server without
+admission policies the operator logs it, emits a `Warning` Event `AdmissionPolicyUnavailable` on each
+PlatformInstance, sets `OwnerServiceProtected=False/AdmissionPolicyUnavailable` and carries on; otherwise
+`OwnerServiceProtected` is `True`.
+
+The policy and binding are created by the operator, not by its chart, so `helm uninstall` of the operator
+leaves them. Remove them by hand once no instance is left:
+
+```sh
+kubectl delete validatingadmissionpolicybinding platform-operator-protect-vcluster-service
+kubectl delete validatingadmissionpolicy platform-operator-protect-vcluster-service
+```
+
+### Resync when the policy was bypassed
+
+The operator records the Service's uid in `status.target.serviceUID` at the first install. When the uid
+differs on a later reconcile, or `vc-vcluster` is missing on an instance that had it, the operator:
+
+1. re-applies the Helm release if the Service is gone (#453), and in the same round
+2. deletes `vcluster-0`, which its StatefulSet recreates, so the syncer writes `vc-vcluster` again and syncs
+   back the virtual objects that still exist (`TargetReady=False/Resyncing`, or `KubeconfigMissing` for the
+   round that starts it; `status.target.resyncServiceUID` and `resyncStarted` describe the running resync);
+3. waits for the control plane, the Secret and the API, then runs the platform install at once (not at the
+   next repair). First it runs `helm uninstall` inside the instance on the platform's Helm Release (the
+   runtime-operator chart; name and namespace, `wasmcloud`, read from the install state; a release already
+   gone is fine). Its Helm record lives inside the instance and survived, so without that a refresh finds
+   it and `up` has nothing to do, and a Pulumi replace creates before it deletes, which Helm refuses for
+   the same release name. Then a refresh drops the Release from the state and `up` installs the chart
+   again, which recreates the chart-rendered `wasmcloud-*-tls` Secrets; the other Pulumi-managed objects
+   come back through the refresh. A failed install keeps the resync pending and is retried: the retry finds
+   the Release already gone from the state (the earlier refresh dropped it), skips the uninstall and runs
+   the refresh and `up` again. An `up` that leaves no such Release in the state is an error. Helm's
+   uninstall doesn't wait for the old release's objects to be gone before the `up` installs the chart again;
+   Layer 4 (gate 4.10) checks that the reinstall comes up cleanly.
+
+A resync still waiting (for the control plane, the Secret or the API) more than three repair intervals
+after it started, measured from `status.target.resyncStarted`, is reported as
+`TargetReady=False/TargetUnreachable`, naming the stage it is waiting at.
+
+Secrets that components inside the instance generated at runtime (tenant-auth signing keys, for example) are
+not in any chart or Pulumi program: they are lost for good, and whatever they protected (issued tokens,
+sessions) has to be issued again.
+
+An unchanged uid changes nothing.
 
 ## Running it
 

@@ -86,7 +86,7 @@ func TestEnsureOwnsTheHostNetworkPolicies(t *testing.T) {
 	ns := HostNamespace(inst)
 	helm := &fakeHelm{installed: map[string]map[string]any{}}
 	c := newClient(t)
-	tg := &Target{Client: c, Helm: helm, OperatorNamespace: operatorNS, Values: func(context.Context, *v1alpha1.PlatformInstance) (map[string]any, error) {
+	tg := &Target{Client: c, Helm: helm, OperatorNamespace: operatorNS, OperatorUsername: operatorUser, Values: func(context.Context, *v1alpha1.PlatformInstance) (map[string]any, error) {
 		return map[string]any{}, nil
 	}}
 	ctx := context.Background()
@@ -120,7 +120,7 @@ func TestEnsureOwnsTheHostNetworkPolicies(t *testing.T) {
 }
 
 func TestEnsureNeedsTheOperatorNamespace(t *testing.T) {
-	tg := &Target{Client: newClient(t), Helm: &fakeHelm{installed: map[string]map[string]any{}}}
+	tg := &Target{Client: newClient(t), Helm: &fakeHelm{installed: map[string]map[string]any{}}, OperatorUsername: operatorUser}
 	if _, err := tg.Ensure(context.Background(), instance("team-a", "one")); err == nil || !strings.Contains(err.Error(), "operator's namespace") {
 		t.Fatalf("Ensure without the operator namespace: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestApplyNetworkPoliciesReportsAWriteError(t *testing.T) {
 			return errors.New("denied")
 		},
 	})
-	tg := &Target{Client: c, OperatorNamespace: operatorNS}
+	tg := &Target{Client: c, OperatorNamespace: operatorNS, OperatorUsername: operatorUser}
 	if err := tg.applyNetworkPolicies(context.Background(), "pi-x"); err == nil || !strings.Contains(err.Error(), "network policy pi-x/"+PolicyDenyIngress+": denied") {
 		t.Fatalf("write error: %v", err)
 	}

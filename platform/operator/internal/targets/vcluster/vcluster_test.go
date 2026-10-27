@@ -140,7 +140,7 @@ func TestEnsure(t *testing.T) {
 	helm := &fakeHelm{installed: map[string]map[string]any{}}
 	c := newClient(t)
 	var dialed string
-	tg := &Target{Client: c, Helm: helm, OperatorNamespace: operatorNS, Values: func(_ context.Context, i *v1alpha1.PlatformInstance) (map[string]any, error) {
+	tg := &Target{Client: c, Helm: helm, OperatorNamespace: operatorNS, OperatorUsername: operatorUser, Values: func(_ context.Context, i *v1alpha1.PlatformInstance) (map[string]any, error) {
 		return map[string]any{"marker": i.Name}, nil
 	}, Dial: func(_ context.Context, address string) error { dialed = address; return nil }}
 	ctx := context.Background()
@@ -198,7 +198,7 @@ func readyInstance(t *testing.T) (*Target, *fakeHelm, *v1alpha1.PlatformInstance
 	if err := c.Status().Update(context.Background(), sts); err != nil {
 		t.Fatal(err)
 	}
-	return &Target{Client: c, Helm: helm, OperatorNamespace: operatorNS, Dial: answers}, helm, inst, sts
+	return &Target{Client: c, Helm: helm, OperatorNamespace: operatorNS, OperatorUsername: operatorUser, Dial: answers}, helm, inst, sts
 }
 
 // A hand-deleted release object (Layer 4 deleted service/vcluster) is recreated by re-applying
@@ -403,7 +403,7 @@ func TestEnsureReinstallsAFailedRelease(t *testing.T) {
 		inst := instance("team-a", "one")
 		ns := HostNamespace(inst)
 		helm := &fakeHelm{installed: map[string]map[string]any{ns: {}}, status: map[string]string{ns: status}}
-		tg := &Target{Client: newClient(t, ownedNamespace(inst)), Helm: helm, OperatorNamespace: operatorNS, Values: func(context.Context, *v1alpha1.PlatformInstance) (map[string]any, error) {
+		tg := &Target{Client: newClient(t, ownedNamespace(inst)), Helm: helm, OperatorNamespace: operatorNS, OperatorUsername: operatorUser, Values: func(context.Context, *v1alpha1.PlatformInstance) (map[string]any, error) {
 			return map[string]any{}, nil
 		}}
 		// An error, so a release that fails every time backs off instead of cycling every poll.
@@ -430,7 +430,7 @@ func TestInstancesNeverShareAHostNamespace(t *testing.T) {
 	theirs := ownedNamespace(b)
 	theirs.Name = HostNamespace(a)
 	helm := &fakeHelm{installed: map[string]map[string]any{theirs.Name: {}}}
-	tg := &Target{Client: newClient(t, theirs), Helm: helm, OperatorNamespace: operatorNS}
+	tg := &Target{Client: newClient(t, theirs), Helm: helm, OperatorNamespace: operatorNS, OperatorUsername: operatorUser}
 	if _, err := tg.Ensure(context.Background(), a); err == nil || !strings.Contains(err.Error(), "team/a-one") {
 		t.Fatalf("Ensure into another instance's namespace: %v", err)
 	}
@@ -460,7 +460,7 @@ func TestClaimChecksANamespaceCreatedInTheRace(t *testing.T) {
 		},
 	})
 	helm := &fakeHelm{installed: map[string]map[string]any{}}
-	tg := &Target{Client: racy, Helm: helm, OperatorNamespace: operatorNS, Values: func(context.Context, *v1alpha1.PlatformInstance) (map[string]any, error) {
+	tg := &Target{Client: racy, Helm: helm, OperatorNamespace: operatorNS, OperatorUsername: operatorUser, Values: func(context.Context, *v1alpha1.PlatformInstance) (map[string]any, error) {
 		return map[string]any{}, nil
 	}}
 	if _, err := tg.Ensure(context.Background(), a); err == nil || !strings.Contains(err.Error(), "someone/else") || len(helm.installed) != 0 {
@@ -473,7 +473,7 @@ func TestDelete(t *testing.T) {
 	ns := HostNamespace(inst)
 	helm := &fakeHelm{installed: map[string]map[string]any{ns: {}}}
 	c := newClient(t, ownedNamespace(inst))
-	tg := &Target{Client: c, Helm: helm, OperatorNamespace: operatorNS}
+	tg := &Target{Client: c, Helm: helm, OperatorNamespace: operatorNS, OperatorUsername: operatorUser}
 
 	done, err := tg.Delete(context.Background(), inst)
 	if err != nil || done {
