@@ -4,7 +4,7 @@ image:
   # scripts/pin-artifact.ts) rewrites this line with the digest each publish produced. Override it
   # at install time with --set image.digest=sha256:<64 hex>. The chart refuses to render anything
   # else, and the release workflow skips publishing the chart (with a warning) unless it is pinned.
-  digest: sha256:bd2c02c4f809ac92b2711408396b6690c12d8f6305e92f5ef2a32356d2283abd
+  digest: sha256:d7ba6f1642cbdd18b9b23912b85f0f1e859924cf9b7b6b1a4c366fac3bba9e4d
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
