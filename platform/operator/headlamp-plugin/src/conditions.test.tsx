@@ -24,6 +24,14 @@ const conditions: Condition[] = [
   },
   { type: 'Custom', status: 'Unknown', reason: 'Waiting', message: '', lastTransitionTime: T },
   {
+    type: 'ConfigApplied',
+    status: 'False',
+    reason: 'TenantAuthSecretUnavailable',
+    message: 'Secret team-a/tenant-auth-oauth has no key clientSecret',
+    lastTransitionTime: T,
+    observedGeneration: 3,
+  },
+  {
     type: 'Installed',
     status: 'False',
     reason: 'Installing',
@@ -42,10 +50,11 @@ const conditions: Condition[] = [
 ];
 
 describe('conditionRows', () => {
-  it('orders TargetReady, Installed, Ready first, then the rest by type', () => {
+  it('orders TargetReady, Installed, ConfigApplied, Ready first, then the rest by type', () => {
     expect(conditionRows(instance(conditions)).map((r) => r.type)).toEqual([
       'TargetReady',
       'Installed',
+      'ConfigApplied',
       'Ready',
       'Custom',
     ]);
@@ -88,10 +97,15 @@ describe('ConditionsTable', () => {
     const custom = screen.getByTestId('condition-Custom');
     expect(within(custom).getAllByText('-')).toHaveLength(1);
 
+    const config = screen.getByTestId('condition-ConfigApplied');
+    expect(within(config).getByText('TenantAuthSecretUnavailable')).toBeTruthy();
+    expect(config.textContent).toContain('has no key clientSecret');
+
     const order = screen.getAllByTestId(/^condition-/).map((el) => el.dataset.testid);
     expect(order).toEqual([
       'condition-TargetReady',
       'condition-Installed',
+      'condition-ConfigApplied',
       'condition-Ready',
       'condition-Custom',
     ]);

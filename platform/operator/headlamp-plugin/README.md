@@ -22,7 +22,40 @@ it does, `kubectl apply` of the same YAML does too.
   must be reopened, instead of overwriting someone else's change. A status write by the operator
   doesn't block an edit of existing fields. A validation error (`… is invalid: …`) is shown as the
   apiserver sent it. **Show patch** shows the operations.
-- **Detail view**: spec and status, endpoints, conditions with reasons and messages, recent Events,
+- **Tenancy sections** of both forms, for the `spec.platform` tenancy settings (see the
+  [operator README](../README.md)):
+  - **Tenants**: a list of names (up to 32). A tenant's other fields (`deletionPolicy`,
+    `resources`, `runtime`, `suspended`) aren't shown and are kept as they are; set them in YAML.
+    On Edit, existing tenant names are read-only: the platform has no rename, so a changed name
+    would remove the old tenant (its namespaces deleted or kept per its `deletionPolicy`) and
+    create a new one. Remove the tenant and add another to do that explicitly; new rows are
+    editable. A tenant removed and added back under the same name keeps its other settings.
+  - **Users**: name and memberships (up to 128 users, 16 memberships each), each membership a
+    tenant chosen from the Tenants rows and a role (`developer` or `viewer`). `suspended` is kept.
+  - **Tenant auth**: issuer, client ID, the client secret as a reference to a Secret name and key
+    in the instance's namespace (the form never reads or sends the secret value), the tenant-auth
+    image, and the advanced fields (issuer upstream, its pod port, issuer IP, console and
+    controller public URLs, registry component, public URL and limits). All empty leaves
+    `tenantAuth` out.
+  - **Tenant hosts**: the host image (editable) and its pull policy. On Edit the help text says
+    what an empty field keeps: the last applied image (`status.applied.tenantHostImage`), or the
+    platform's own default for an instance installed before the operator recorded one.
+
+  Before sending, the form checks what the CRD would: the name pattern and 40-character limit,
+  unique names, the list limits, the URL and digest patterns and lengths, that issuer, client ID,
+  client secret and image go together (the `tenantAuth` CEL rule plus the required image), that
+  the registry has its component, and that every membership names a tenant in the list (the
+  memberships CEL rule), so removing a tenant a user is still in is rejected until those
+  memberships go too. On Edit, `tenants` and `users` are each patched as a whole list (`test` of
+  the old list, then `replace`): a row's index isn't a stable identity. So a concurrent change to
+  any tenant or user, even an unrelated row, makes Save fail with the "changed since you opened
+  it" message; reopen the form to retry. An empty list (`tenants: []`) saved unchanged stays as it
+  is. The `tenantAuth` fields are
+  patched one by one like the other fields, removing `clientSecretRef`, `registry` and
+  `tenantAuth` when they end up empty.
+- **Detail view**: spec and status, what the last install applied (`status.applied`: tenant and
+  user counts, tenant auth issuer, tenant host image), endpoints, conditions with reasons and
+  messages (`ConfigApplied` among them), recent Events,
   and the instance kubeconfig from `status.kubeconfigSecretRef`. The Secret is read only when you
   click Show or Download, through Headlamp's API proxy with your own credentials, so RBAC on the
   Secret decides. A 403 says which permission is missing. The kubeconfig is never cached: it stays in
@@ -49,7 +82,7 @@ bun run start     # watch mode for a local Headlamp (see Headlamp's plugin docs)
 ```
 
 `src/mapping.ts` is the pure form-to-object mapping. `src/mapping.test.ts` checks it against the YAML
-fixtures in `src/testdata/` (minimal, full and partial spec), which are validated against the CRD's
+fixtures in `src/testdata/` (minimal, full and partial spec, and minimal, full and #442 tenancy settings), which are validated against the CRD's
 `openAPIV3Schema` (read from `../config/crd`, with Ajv, and closed with `additionalProperties: false`
 so a field the apiserver would prune fails) and its CEL rules.
 

@@ -33,7 +33,58 @@ export const PHASES = [
 export type Phase = (typeof PHASES)[number];
 
 /** The condition types the operator reports, in reconcile order. */
-export const CONDITION_TYPES = ['TargetReady', 'Installed', 'Ready'] as const;
+export const CONDITION_TYPES = ['TargetReady', 'Installed', 'ConfigApplied', 'Ready'] as const;
+
+export const MEMBERSHIP_ROLES = ['developer', 'viewer'] as const;
+export type MembershipRole = (typeof MEMBERSHIP_ROLES)[number];
+
+export const PULL_POLICIES = ['Always', 'IfNotPresent', 'Never'] as const;
+export type PullPolicy = (typeof PULL_POLICIES)[number];
+
+/** The CRD's limits on spec.platform.tenants, users and users[].memberships. */
+export const MAX_TENANTS = 32;
+export const MAX_USERS = 128;
+export const MAX_MEMBERSHIPS = 16;
+
+/** One entry of spec.platform.tenants; the form edits only the name and keeps the rest. */
+export interface TenantSettings {
+  name: string;
+  [key: string]: unknown;
+}
+
+export interface Membership {
+  tenant: string;
+  role: MembershipRole;
+}
+
+/** One entry of spec.platform.users; the form keeps fields it doesn't show (suspended). */
+export interface UserSettings {
+  name: string;
+  memberships: Membership[];
+  [key: string]: unknown;
+}
+
+export interface TenantAuthSettings {
+  issuer?: string;
+  clientId?: string;
+  clientSecretRef?: { name: string; key: string };
+  image?: string;
+  issuerIp?: string;
+  issuerUpstream?: string;
+  issuerUpstreamPodPort?: number;
+  consolePublicUrl?: string;
+  controllerPublicUrl?: string;
+  registry?: {
+    component?: string;
+    publicUrl?: string;
+    limits?: {
+      maxBodyBytes?: number;
+      maxConcurrent?: number;
+      uploadIdleTimeoutMs?: number;
+      upstreamTimeoutMs?: number;
+    };
+  };
+}
 
 export interface GatewaySettings {
   httpNodePort?: number;
@@ -44,6 +95,11 @@ export interface PlatformSettings {
   networkPolicyEngine?: NetworkPolicyEngine;
   storageRoot?: string;
   gateway?: GatewaySettings;
+  tenants?: TenantSettings[];
+  users?: UserSettings[];
+  tenantAuth?: TenantAuthSettings;
+  tenantHostImage?: string;
+  tenantHostImagePullPolicy?: PullPolicy;
 }
 
 export interface PlatformInstanceSpec {
@@ -70,6 +126,14 @@ export interface PlatformInstanceStatus {
   endpoints?: { kubernetes?: string; http?: string };
   kubeconfigSecretRef?: { name: string };
   lastRepair?: string;
+  /** What the last successful install applied (#442). */
+  applied?: {
+    generation: number;
+    tenants: number;
+    users: number;
+    tenantAuthIssuer?: string;
+    tenantHostImage?: string;
+  };
   conditions?: Condition[];
 }
 

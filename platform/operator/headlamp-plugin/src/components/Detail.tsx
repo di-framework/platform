@@ -83,6 +83,19 @@ export function PlatformInstanceDetail() {
             value: spec?.platform?.gateway?.httpNodePort ?? '-',
           },
           { name: 'Last repair', value: status.lastRepair ?? '-' },
+          // What the last successful install applied (status.applied, #442).
+          { name: 'Applied tenants', value: status.applied?.tenants ?? '-' },
+          { name: 'Applied users', value: status.applied?.users ?? '-' },
+          {
+            name: 'Applied tenant auth issuer',
+            value: status.applied?.tenantAuthIssuer || '-',
+          },
+          {
+            name: 'Applied tenant host image',
+            value: status.applied
+              ? status.applied.tenantHostImage || "(platform's own default)"
+              : '-',
+          },
         ];
       }}
       extraSections={(item: PlatformInstance) =>
