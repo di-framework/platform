@@ -156,24 +156,39 @@ func (p *Pulumi) Install(ctx context.Context, req Request, opts Options) (Result
 	if err := p.withLockRecovery(ctx, s, stateDir, "up", s.Up); err != nil {
 		return Result{}, err
 	}
+	if opts.ReinstallRelease {
+		// The up must have installed the Release again; a program without it would leave the
+		// chart's lost objects missing.
+		rel, err := p.stateRelease(ctx, s)
+		if err != nil {
+			return Result{}, err
+		}
+		if rel == nil {
+			return Result{}, fmt.Errorf("reinstall: no Helm Release %q in the install state after up", PlatformRelease)
+		}
+	}
 	return result(ctx, s)
 }
 
-// uninstallPlatformRelease removes the platform Release, named in the state, from the target.
-// A Release already gone is fine; one missing from the state is an error, since a plain up would
-// then leave the chart's lost objects missing.
-func (p *Pulumi) uninstallPlatformRelease(ctx context.Context, s stack, req Request) error {
+func (p *Pulumi) stateRelease(ctx context.Context, s stack) (*helmRelease, error) {
 	dep, err := s.Export(ctx)
 	if err != nil {
-		return fmt.Errorf("export state: %w", err)
+		return nil, fmt.Errorf("export state: %w", err)
 	}
-	rel, err := platformRelease(dep)
+	return platformRelease(dep)
+}
+
+// uninstallPlatformRelease removes the platform Release, named in the state, from the target.
+// A Release already gone is fine. One already missing from the state was uninstalled by an
+// earlier round whose up failed: there is nothing to uninstall, and the up installs it.
+func (p *Pulumi) uninstallPlatformRelease(ctx context.Context, s stack, req Request) error {
+	rel, err := p.stateRelease(ctx, s)
 	if err != nil {
 		return err
 	}
 	if rel == nil {
-		p.logf("reinstall: no %s Release in the state\n", PlatformRelease)
-		return fmt.Errorf("reinstall: no Helm Release %q in the install state", PlatformRelease)
+		p.logf("reinstall: no %s Release in the state (an earlier round uninstalled it); skipping the uninstall\n", PlatformRelease)
+		return nil
 	}
 	p.logf("reinstall: helm uninstall %s -n %s\n", rel.Name, rel.Namespace)
 	uninstall := p.uninstallRelease

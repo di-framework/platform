@@ -30,6 +30,8 @@ type fakeStack struct {
 	state     apitype.UntypedDeployment
 	// onUp, when set, decides whether an up succeeds (after the scripted failures).
 	onUp func() error
+	// onRefresh, when set, runs after a successful refresh.
+	onRefresh func()
 }
 
 func (f *fakeStack) next(op string) error {
@@ -57,7 +59,13 @@ func (f *fakeStack) Up(context.Context) error {
 	}
 	return f.onUp()
 }
-func (f *fakeStack) Refresh(context.Context) error { return f.next("refresh") }
+func (f *fakeStack) Refresh(context.Context) error {
+	if err := f.next("refresh"); err != nil || f.onRefresh == nil {
+		return err
+	}
+	f.onRefresh()
+	return nil
+}
 func (f *fakeStack) Export(context.Context) (apitype.UntypedDeployment, error) {
 	return f.state, f.next("export")
 }
@@ -180,6 +188,7 @@ const releaseState = `{"resources":[
 // the same name, as Helm does, so an up that doesn't follow the uninstall fails.
 type helmTarget struct {
 	deployed   bool
+	stack      *fakeStack
 	calls      *[]string
 	uninstalls []string
 	err        error
@@ -200,8 +209,20 @@ func (h *helmTarget) up() error {
 		return errors.New("cannot re-use a name that is still in use")
 	}
 	h.deployed = true
+	if h.stack != nil {
+		h.stack.state = apitype.UntypedDeployment{Deployment: json.RawMessage(releaseState)}
+	}
 	return nil
 }
+
+// refresh drops an uninstalled Release from the state, as Pulumi's refresh does.
+func (h *helmTarget) refresh() {
+	if !h.deployed && h.stack != nil {
+		h.stack.state = apitype.UntypedDeployment{Deployment: json.RawMessage(noReleaseState)}
+	}
+}
+
+const noReleaseState = `{"resources":[{"urn":"urn:pulumi:instance::platform-instance::pulumi:pulumi:Stack::platform-instance-instance","type":"pulumi:pulumi:Stack"}]}`
 
 func resyncStack(t *testing.T, state string) (*Pulumi, *fakeStack, *helmTarget) {
 	t.Helper()
@@ -220,11 +241,33 @@ func TestResyncReinstallsThePlatformRelease(t *testing.T) {
 	if _, err := p.Install(context.Background(), request(), Options{ReinstallRelease: true}); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"config", "export", "uninstall", "refresh", "up", "outputs"}; !reflect.DeepEqual(s.calls, want) {
+	if want := []string{"config", "export", "uninstall", "refresh", "up", "export", "outputs"}; !reflect.DeepEqual(s.calls, want) {
 		t.Fatalf("calls %v, want %v", s.calls, want)
 	}
 	if want := []string{"apiVersion: v1\n|wasmcloud/wasmcloud"}; !reflect.DeepEqual(h.uninstalls, want) {
 		t.Fatalf("uninstalls %q, want %q", h.uninstalls, want)
+	}
+}
+
+// The first up after the uninstall fails; the refresh had already dropped the Release from the
+// state, so the next round skips the uninstall and its up installs the Release.
+func TestResyncRetryAfterAFailedUp(t *testing.T) {
+	p, s, h := resyncStack(t, releaseState)
+	h.stack = s
+	s.onRefresh = h.refresh
+	s.fail["up"] = []error{errors.New("timed out")}
+	if _, err := p.Install(context.Background(), request(), Options{ReinstallRelease: true}); err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("first round: %v", err)
+	}
+	s.calls = nil
+	if _, err := p.Install(context.Background(), request(), Options{ReinstallRelease: true}); err != nil {
+		t.Fatalf("retry round: %v", err)
+	}
+	if want := []string{"config", "export", "refresh", "up", "export", "outputs"}; !reflect.DeepEqual(s.calls, want) {
+		t.Fatalf("retry calls %v, want %v", s.calls, want)
+	}
+	if len(h.uninstalls) != 1 || !h.deployed {
+		t.Fatalf("uninstalls %v, deployed %v", h.uninstalls, h.deployed)
 	}
 }
 
@@ -256,10 +299,15 @@ func TestResyncReinstallErrors(t *testing.T) {
 	if _, err := p.Install(context.Background(), request(), Options{ReinstallRelease: true}); err == nil || !strings.Contains(err.Error(), "read state") {
 		t.Fatalf("bad state: %v", err)
 	}
-	// No Release in the state: an error, not a plain up.
-	p, s, _ = resyncStack(t, `{"resources":[]}`)
-	if _, err := p.Install(context.Background(), request(), Options{ReinstallRelease: true}); err == nil || err.Error() != `reinstall: no Helm Release "wasmcloud" in the install state` || slices.Contains(s.calls, "up") {
-		t.Fatalf("no release: %v (calls %v)", err, s.calls)
+	// An up that leaves no Release in the state is an error.
+	p, s, _ = resyncStack(t, noReleaseState)
+	s.onUp = nil
+	if _, err := p.Install(context.Background(), request(), Options{ReinstallRelease: true}); err == nil || err.Error() != `reinstall: no Helm Release "wasmcloud" in the install state after up` || slices.Contains(s.calls, "uninstall") {
+		t.Fatalf("no release after up: %v (calls %v)", err, s.calls)
+	}
+	s.fail["export"] = []error{nil, errors.New("export failed")}
+	if _, err := p.Install(context.Background(), request(), Options{ReinstallRelease: true}); err == nil || err.Error() != "export state: export failed" {
+		t.Fatalf("export after up: %v", err)
 	}
 	p, _, h := resyncStack(t, releaseState)
 	h.err = errors.New("forbidden")

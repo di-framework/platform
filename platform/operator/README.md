@@ -360,8 +360,11 @@ differs on a later reconcile, or `vc-vcluster` is missing on an instance that ha
    it and `up` has nothing to do, and a Pulumi replace creates before it deletes, which Helm refuses for
    the same release name. Then a refresh drops the Release from the state and `up` installs the chart
    again, which recreates the chart-rendered `wasmcloud-*-tls` Secrets; the other Pulumi-managed objects
-   come back through the refresh. No such Release in the state is an error, not a plain `up`. A failed
-   install keeps the resync pending and is retried.
+   come back through the refresh. A failed install keeps the resync pending and is retried: the retry finds
+   the Release already gone from the state (the earlier refresh dropped it), skips the uninstall and runs
+   the refresh and `up` again. An `up` that leaves no such Release in the state is an error. Helm's
+   uninstall doesn't wait for the old release's objects to be gone before the `up` installs the chart again;
+   Layer 4 (gate 4.10) checks that the reinstall comes up cleanly.
 
 A resync still waiting (for the control plane, the Secret or the API) more than three repair intervals
 after it started, measured from `status.target.resyncStarted`, is reported as

@@ -90,4 +90,13 @@ func TestFailedResyncInstallStaysPending(t *testing.T) {
 	if conditionReason(inst, v1alpha1.ConditionTargetReady) != "Resyncing" || inst.Status.Target.ServiceUID == "uid-b" {
 		t.Fatalf("failed resync install %+v", inst.Status)
 	}
+	// The retry round succeeds and clears the resync marker.
+	h.in.err = nil
+	h.now = h.now.Add(time.Minute)
+	h.reconcile()
+	inst = h.get()
+	if inst.Status.Target != (v1alpha1.TargetStatus{ServiceUID: "uid-b"}) || !h.in.options[len(h.in.options)-1].ReinstallRelease ||
+		!meta.IsStatusConditionTrue(inst.Status.Conditions, v1alpha1.ConditionTargetReady) {
+		t.Fatalf("retry %+v", inst.Status)
+	}
 }
