@@ -245,6 +245,132 @@ describe('tenant and user resource reconciliation', () => {
     }
   });
 
+  describe('a Tenant the LIST does not return (#474)', () => {
+    function staleList(api: MemoryApi, getTenant?: (path: string) => Promise<unknown>) {
+      const call = api.call.bind(api);
+      let stale = true;
+      spyOn(api, 'call').mockImplementation((async (
+        method: string,
+        path: string,
+        body?: unknown,
+      ) => {
+        if (stale && method === 'GET' && /\/tenants\?labelSelector=/.test(path))
+          return { items: [] };
+        if (stale && method === 'GET' && getTenant && /\/tenants\/alpha$/.test(path))
+          return getTenant(path);
+        return call(method, path, body);
+      }) as typeof api.call);
+      return (value: boolean) => {
+        stale = value;
+      };
+    }
+
+    it('reconciles a Tenant found by GET and warns once per occurrence', async () => {
+      const { api, controller, t, u } = prepare();
+      api.seed({
+        apiVersion: VERSION,
+        kind: 'BackingService',
+        metadata: { name: 'db', namespace: names('alpha').namespace },
+        spec: {},
+      });
+      const setStale = staleList(api);
+      const reconcile = spyOn(controller, 'reconcileTenant').mockResolvedValue();
+      const services = spyOn(
+        controller as unknown as { reconcileBackingService: () => Promise<void> },
+        'reconcileBackingService',
+      ).mockResolvedValue();
+      const warn = spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await controller.tick();
+        await controller.tick();
+        expect(reconcile).toHaveBeenCalledTimes(2);
+        expect(reconcile.mock.calls[0]?.[0].metadata.name).toBe(t.metadata.name);
+        expect(services).toHaveBeenCalledTimes(2);
+        const user = api.objects.get(key(u)) as unknown as User;
+        expect(user.status?.conditions?.[0]?.reason).not.toBe('TenantNotReady');
+        const stale = (m: unknown) => String(m).startsWith('Tenant list stale');
+        const empty = (m: unknown) => String(m).startsWith('Tenant list empty');
+        expect(warn.mock.calls.filter(([m]) => stale(m))).toEqual([
+          ['Tenant list stale: alpha found by GET; reconciling it'],
+        ]);
+        expect(warn.mock.calls.filter(([m]) => empty(m))).toEqual([
+          ['Tenant list empty while 1 User(s) exist; the API may be serving a stale cache'],
+        ]);
+        // The LIST recovers: the flags clear, so a later recurrence is reported again.
+        setStale(false);
+        await controller.tick();
+        expect(warn).toHaveBeenCalledTimes(2);
+        setStale(true);
+        await controller.tick();
+        expect(warn).toHaveBeenCalledTimes(4);
+      } finally {
+        reconcile.mockRestore();
+        services.mockRestore();
+        warn.mockRestore();
+      }
+    });
+
+    it('leaves the User TenantNotReady when the GET finds no Tenant', async () => {
+      const { api, controller, u } = prepare();
+      staleList(api, async (path) => {
+        throw new ApiError(404, `GET ${path} returned 404`);
+      });
+      const reconcile = spyOn(controller, 'reconcileTenant').mockResolvedValue();
+      const warn = spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await controller.tick();
+        expect(reconcile).not.toHaveBeenCalled();
+        const user = api.objects.get(key(u)) as unknown as User;
+        expect(user.status?.conditions?.[0]?.reason).toBe('TenantNotReady');
+      } finally {
+        reconcile.mockRestore();
+        warn.mockRestore();
+      }
+    });
+
+    it('ignores a Tenant found by GET that belongs to another installation', async () => {
+      const { api, controller, t, u } = prepare();
+      staleList(api, async () => ({
+        ...t,
+        metadata: { ...t.metadata, labels: { ...t.metadata.labels, [INSTALLATION]: 'other' } },
+      }));
+      const reconcile = spyOn(controller, 'reconcileTenant').mockResolvedValue();
+      const warn = spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await controller.tick();
+        expect(reconcile).not.toHaveBeenCalled();
+        expect(warn.mock.calls.some(([m]) => String(m).startsWith('Tenant list stale'))).toBe(
+          false,
+        );
+        const user = api.objects.get(key(u)) as unknown as User;
+        expect(user.status?.conditions?.[0]?.reason).toBe('TenantNotReady');
+      } finally {
+        reconcile.mockRestore();
+        warn.mockRestore();
+      }
+    });
+
+    it('logs a failed GET and completes the tick', async () => {
+      const { api, controller, u } = prepare();
+      staleList(api, async (path) => {
+        throw new ApiError(500, `GET ${path} returned 500`);
+      });
+      const warn = spyOn(console, 'warn').mockImplementation(() => {});
+      const log = spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await controller.tick();
+        expect(log).toHaveBeenCalledWith(
+          'Tenant/alpha: GET after a LIST miss failed: GET /apis/platform.di-framework.dev/v1alpha1/tenants/alpha returned 500',
+        );
+        const user = api.objects.get(key(u)) as unknown as User;
+        expect(user.status?.conditions?.[0]?.reason).toBe('TenantNotReady');
+      } finally {
+        warn.mockRestore();
+        log.mockRestore();
+      }
+    });
+  });
+
   it('separates runtime credentials and data backends from the workload namespace', () => {
     const resources = tenantResources(tenant(), cfg, { data: { 'tls.key': 'private' } });
     expect(

@@ -2536,6 +2536,61 @@ export class Controller {
       if (!projected.has(name)) this.logWriteFailures.delete(name);
   }
 
+  /** Tenants already reported as missing from the LIST but found by GET (#474). */
+  private readonly staleTenantsLogged = new Set<string>();
+  /** Whether an empty Tenant LIST next to existing Users was already reported (#474). */
+  private emptyTenantListLogged = false;
+  /**
+   * The API server can keep answering a LIST from a stale watch cache while a GET by name finds
+   * the object (#474). Tenants that Users or tenant namespaces reference but the LIST missed are
+   * read by name and appended to `tenants`, so they reconcile this tick. A Tenant that nothing
+   * references stays invisible while the list is stale.
+   */
+  private async recoverUnlistedTenants(
+    tenants: Tenant[],
+    users: User[],
+    services: BackingService[],
+    bindings: ServiceBinding[],
+  ): Promise<void> {
+    if (tenants.length === 0 && users.length > 0) {
+      if (!this.emptyTenantListLogged)
+        console.warn(
+          `Tenant list empty while ${users.length} User(s) exist; the API may be serving a stale cache`,
+        );
+      this.emptyTenantListLogged = true;
+    } else this.emptyTenantListLogged = false;
+    const listed = new Set(tenants.map((t) => t.metadata.name));
+    const referenced = new Set<string>();
+    for (const user of users)
+      for (const membership of user.spec.memberships) referenced.add(membership.tenant);
+    for (const value of [...services, ...bindings]) {
+      const name = tenantNameFromNamespace(value.metadata.namespace);
+      if (name) referenced.add(name);
+    }
+    const recovered = new Set<string>();
+    for (const name of referenced) {
+      if (listed.has(name)) continue;
+      let tenant: Tenant | undefined;
+      try {
+        tenant = await this.get<Tenant>(
+          `${collection(VERSION, 'Tenant')}/${encodeURIComponent(name)}`,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`Tenant/${name}: GET after a LIST miss failed: ${message}`);
+        continue;
+      }
+      if (tenant?.metadata.labels?.[INSTALLATION] !== this.cfg.installation) continue;
+      if (!this.staleTenantsLogged.has(name))
+        console.warn(`Tenant list stale: ${name} found by GET; reconciling it`);
+      recovered.add(name);
+      tenants.push({ ...tenant, apiVersion: VERSION, kind: 'Tenant' });
+    }
+    for (const name of this.staleTenantsLogged)
+      if (!recovered.has(name)) this.staleTenantsLogged.delete(name);
+    for (const name of recovered) this.staleTenantsLogged.add(name);
+  }
+
   async tick(): Promise<void> {
     const tenants = await this.list<Tenant>(VERSION, 'Tenant', {
       [INSTALLATION]: this.cfg.installation,
@@ -2548,6 +2603,7 @@ export class Controller {
     // installation labels until the controller owns their infra.
     const services = await this.list<BackingService>(VERSION, 'BackingService', {});
     const bindings = await this.list<ServiceBinding>(VERSION, 'ServiceBinding', {});
+    await this.recoverUnlistedTenants(tenants, users, services, bindings);
     const tenantByName = new Map(tenants.map((t) => [t.metadata.name, t]));
     this.forgetTenants(tenants);
     for (const value of [...tenants, ...users]) {
