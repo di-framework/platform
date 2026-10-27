@@ -5,7 +5,8 @@ name: Auto Tag
 #               release/v* PR is merged, on a schedule (every 30 minutes) to tag releases merged
 #               by GITHUB_TOKEN (which fire no push or pull_request events), and before release-pr
 #               in every other run. Idempotent: when the tag already exists at the release commit
-#               it only dispatches release.yml again if no Release run exists for the tag. A
+#               it only dispatches release.yml again if no Release run exists for the tag. Tag jobs
+#               of all runs share one concurrency group, so they run one at a time (#485). A
 #               scheduled run when nothing needs tagging exits quietly (action=none). Schedules
 #               run only from the default branch; if disabled by GitHub (after 60 days of
 #               inactivity), re-enable the workflow first, then dispatch with `tag_only: true`.
@@ -66,11 +67,17 @@ jobs:
       (github.event.pull_request.merged == true &&
       startsWith(github.event.pull_request.head.ref, 'release/v') &&
       github.event.pull_request.head.repo.full_name == github.repository)
-    # One group per event, so a release PR's merge run never replaces a pending push run (whose
-    # release-pr job would then never bump). Concurrent tag pushes are safe: the loser's push is
-    # rejected and it exits.
+    # One group for the tag jobs of every run (#485). Merging a release PR fires a push run and a
+    # pull_request run in the same second; run concurrently, both tagged, the two tag objects were
+    # byte-identical (same message, commit and tagger second), so the second push succeeded as a
+    # no-op and both dispatched Release. Serialized, the second finds the tag and the Release run
+    # and does nothing. Not the release-pr job's `auto-tag` group (nor a workflow-level one): a
+    # run would then wait on itself. GitHub keeps one pending job per group and cancels the older
+    # pending one, which drops a pending push run's release-pr only when a third tag job queues
+    # behind it. A release merge's push run opens no release PR, so nothing is lost there; any
+    # other lost bump is recovered by dispatching this workflow.
     concurrency:
-      group: auto-tag-tag-${{ github.event_name }}
+      group: auto-tag-tag
       cancel-in-progress: false
     permissions:
       contents: write # push the tag
@@ -183,6 +190,9 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git tag -a "v$VERSION" -m "Release v$VERSION" "$COMMIT"
+            # An identical tag object pushed by another run makes this push a successful no-op,
+            # so a successful push does not prove this run created the tag: the check below
+            # still decides whether to dispatch (#485).
             if ! git push origin "refs/tags/v$VERSION"; then
               # Another run pushed it first and dispatches Release. If its dispatch failed, the
               # next run (or a tag_only dispatch) finds no Release run and dispatches.
@@ -194,6 +204,14 @@ jobs:
               exit 1
             fi
             echo "Tagged $COMMIT as v$VERSION"
+          fi
+
+          # Dispatch only when no Release run exists for the tag, whichever run pushed it. The
+          # recovery case (tag exists, no Release run) still dispatches.
+          RUNS=$(gh run list --workflow release.yml --branch "v$VERSION" --limit 1 --json databaseId | jq length)
+          if [ "$RUNS" != "0" ]; then
+            echo "A Release run already exists for v$VERSION; not dispatching another."
+            exit 0
           fi
 
           # GITHUB_TOKEN tag pushes do not fire `on: push: tags`; workflow_dispatch does.

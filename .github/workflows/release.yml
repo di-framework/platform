@@ -20,6 +20,15 @@ on:
 #                   (#272). Only this job holds packages: write.
 # The pglite wasm npm receives is the one `make smoke` tested: it is not rebuilt after the smoke
 # test, and both jobs compare its sha256 inside the packed tarball with the tested file's.
+#
+# One run per ref at a time (#485): a second run for the same tag queues behind the first instead
+# of racing it on npm, GHCR and the GitHub Release, and its build job then stops at its first step
+# if the first run already published. A run that failed before publishing can be dispatched again;
+# one that failed after publishing is resumed with "Re-run failed jobs", which does not re-run build.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -35,6 +44,32 @@ jobs:
       artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
       plugin_sha256: ${{ steps.plugin.outputs.sha256 }}
     steps:
+      # A backstop against a second Release run for a tag (#485); Auto Tag dispatches once per tag.
+      # A run that failed before publishing left neither behind, so it passes. npm can take a few
+      # minutes to show a new version, so this does not replace the concurrency group above.
+      - name: Refuse a version that is already released
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::GitHub Release v$VERSION already exists; not releasing it again. Use Re-run failed jobs on the original run instead."
+            exit 1
+          fi
+          if PUBLISHED="$(npm view "@di-framework/platform@$VERSION" version 2>"$RUNNER_TEMP/npm-view.err")"; then
+            if [ "$PUBLISHED" = "$VERSION" ]; then
+              echo "::error::@di-framework/platform@$VERSION is already on npm; not releasing it again. Use Re-run failed jobs on the original run instead."
+              exit 1
+            fi
+          elif ! grep -q E404 "$RUNNER_TEMP/npm-view.err"; then
+            cat "$RUNNER_TEMP/npm-view.err" >&2
+            echo "::warning::could not check npm for @di-framework/platform@$VERSION; continuing (the publish step skips versions already on npm)"
+          fi
+          echo "v$VERSION is not released yet"
+
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
