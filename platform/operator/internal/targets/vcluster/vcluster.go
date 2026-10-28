@@ -171,7 +171,7 @@ func (t *Target) ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 	// A resync after the host namespace was deleted (#490) runs on the vCluster installed in the
 	// namespace created again; it reports Resyncing until that vCluster answers.
 	hostResync := inst.Status.Target.ResyncServiceUID == ResyncHostNamespace
-	if err := t.applyNetworkPolicies(ctx, ns); err != nil {
+	if err := t.applyNetworkPolicies(ctx, ns, inst.Spec.Platform.TenantAuth); err != nil {
 		return targets.State{}, err
 	}
 	rel, err := t.Helm.Get(ctx, ns, ReleaseName)

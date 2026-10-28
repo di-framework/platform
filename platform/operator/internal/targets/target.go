@@ -8,6 +8,9 @@ import (
 	"github.com/di-framework/platform/operator/api/v1alpha1"
 )
 
+// PlatformNamespace is the namespace the platform is installed into, inside the target.
+const PlatformNamespace = "wasmcloud"
+
 // State is a target's readiness this round.
 type State struct {
 	// Ready is true once the target cluster answers and Kubeconfig is set.

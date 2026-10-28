@@ -1,0 +1,119 @@
+- metadata:
+    labels:
+      app.kubernetes.io/managed-by: platform-operator
+    name: platform-operator-deny-ingress
+    namespace: NS
+  spec:
+    podSelector: {}
+    policyTypes:
+      - Ingress
+- metadata:
+    labels:
+      app.kubernetes.io/managed-by: platform-operator
+    name: platform-operator-allow-control-plane
+    namespace: NS
+  spec:
+    ingress:
+      - from:
+          - podSelector:
+              matchLabels:
+                vcluster.loft.sh/managed-by: vcluster
+        ports:
+          - port: 8443
+            protocol: TCP
+    podSelector:
+      matchExpressions:
+        - key: vcluster.loft.sh/managed-by
+          operator: DoesNotExist
+      matchLabels:
+        app: vcluster
+        release: vcluster
+    policyTypes:
+      - Ingress
+- metadata:
+    labels:
+      app.kubernetes.io/managed-by: platform-operator
+    name: platform-operator-allow-dns
+    namespace: NS
+  spec:
+    ingress:
+      - from:
+          - podSelector:
+              matchLabels:
+                vcluster.loft.sh/managed-by: vcluster
+        ports:
+          - port: 53
+            protocol: UDP
+          - port: 53
+            protocol: TCP
+    podSelector:
+      matchLabels:
+        k8s-app: kube-dns
+        vcluster.loft.sh/managed-by: vcluster
+        vcluster.loft.sh/namespace: kube-system
+    policyTypes:
+      - Ingress
+- metadata:
+    labels:
+      app.kubernetes.io/managed-by: platform-operator
+    name: platform-operator-allow-issuer
+    namespace: NS
+  spec:
+    ingress:
+      - from:
+          - podSelector:
+              matchLabels:
+                platform.di-framework.dev/component: tenant-auth
+                vcluster.loft.sh/managed-by: vcluster
+        ports:
+          - port: 80
+            protocol: TCP
+          - port: 8080
+            protocol: TCP
+    podSelector:
+      matchLabels:
+        vcluster.loft.sh/managed-by: vcluster
+        vcluster.loft.sh/namespace: pg-stub-oidc
+    policyTypes:
+      - Ingress
+- metadata:
+    labels:
+      app.kubernetes.io/managed-by: platform-operator
+    name: platform-operator-allow-same-namespace
+    namespace: NS
+  spec:
+    ingress:
+      - from:
+          - podSelector:
+              matchExpressions:
+                - key: vcluster.loft.sh/managed-by
+                  operator: DoesNotExist
+              matchLabels:
+                app: vcluster
+                release: vcluster
+    podSelector: {}
+    policyTypes:
+      - Ingress
+- metadata:
+    labels:
+      app.kubernetes.io/managed-by: platform-operator
+    name: platform-operator-allow-operator
+    namespace: NS
+  spec:
+    ingress:
+      - from:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: platform-operator
+        ports:
+          - port: 8443
+            protocol: TCP
+    podSelector:
+      matchExpressions:
+        - key: vcluster.loft.sh/managed-by
+          operator: DoesNotExist
+      matchLabels:
+        app: vcluster
+        release: vcluster
+    policyTypes:
+      - Ingress

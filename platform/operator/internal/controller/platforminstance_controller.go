@@ -45,7 +45,7 @@ const KubeconfigKey = "kubeconfig"
 var ManagedLabels = map[string]string{"app.kubernetes.io/managed-by": "platform-operator"}
 
 // PlatformNamespace is the namespace the platform is installed into, inside the target.
-const PlatformNamespace = "wasmcloud"
+const PlatformNamespace = targets.PlatformNamespace
 
 // Reconciler reconciles PlatformInstances.
 //
@@ -94,7 +94,7 @@ type APIReader interface {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;create;update
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;create;update;delete
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,verbs=get;create;update
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;create;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;delete
