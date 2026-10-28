@@ -387,3 +387,67 @@ func TestDockerfileBakesTheProject(t *testing.T) {
 		}
 	}
 }
+
+// entries lists a directory's names; a missing directory has none.
+func entries(t *testing.T, dir string) []string {
+	t.Helper()
+	des, err := os.ReadDir(dir)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	names := []string{}
+	for _, d := range des {
+		names = append(names, d.Name())
+	}
+	return names
+}
+
+func TestCopyBakedProjectIsAtomic(t *testing.T) {
+	baked := t.TempDir()
+	write(t, filepath.Join(baked, "node_modules", "a", "index.js"), "new")
+	write(t, filepath.Join(baked, "node_modules", "b", "index.js"), "new")
+	write(t, filepath.Join(baked, "package-lock.json"), "{}")
+
+	orig := copyTreeFn
+	t.Cleanup(func() { copyTreeFn = orig })
+	// Copy part of the tree, then fail as a full disk would.
+	copyTreeFn = func(src, dst string) error {
+		if err := copyTree(filepath.Join(src, "a"), filepath.Join(dst, "a")); err != nil {
+			return err
+		}
+		return errors.New("no space left on device")
+	}
+
+	for _, previous := range []bool{true, false} {
+		project := t.TempDir()
+		want := []string{}
+		if previous {
+			write(t, filepath.Join(project, "node_modules", "old", "index.js"), "old")
+			want = []string{"node_modules"}
+		}
+		if err := copyBakedProject(baked, project); err == nil {
+			t.Fatal("copyBakedProject succeeded despite the injected failure")
+		}
+		if got := entries(t, project); !slices.Equal(got, want) {
+			t.Errorf("previous=%v: project holds %v, want %v (no temp dir, no lockfile)", previous, got, want)
+		}
+		if previous {
+			if got := entries(t, filepath.Join(project, "node_modules")); !slices.Equal(got, []string{"old"}) {
+				t.Errorf("previous node_modules changed: %v", got)
+			}
+		}
+	}
+
+	copyTreeFn = orig
+	project := t.TempDir()
+	write(t, filepath.Join(project, "node_modules", "old", "index.js"), "old")
+	if err := copyBakedProject(baked, project); err != nil {
+		t.Fatal(err)
+	}
+	if got := entries(t, filepath.Join(project, "node_modules")); !slices.Equal(got, []string{"a", "b"}) {
+		t.Errorf("node_modules holds %v, want [a b]", got)
+	}
+	if got := entries(t, project); !slices.Equal(got, []string{"node_modules", "package-lock.json"}) {
+		t.Errorf("project holds %v", got)
+	}
+}

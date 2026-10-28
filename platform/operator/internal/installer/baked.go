@@ -132,16 +132,28 @@ func installedVersion(projectDir string) (string, error) {
 }
 
 // copyBakedProject replaces projectDir's node_modules and package-lock.json with the baked ones.
+// node_modules is copied into a temporary sibling directory (same filesystem) and renamed into
+// place, so a copy that fails midway leaves the previous node_modules (or its absence) untouched.
 func copyBakedProject(baked, projectDir string) error {
 	dst := filepath.Join(projectDir, "node_modules")
-	if err := os.RemoveAll(dst); err != nil {
+	tmp, err := os.MkdirTemp(projectDir, ".node_modules-")
+	if err != nil {
 		return err
 	}
-	if err := copyTree(filepath.Join(baked, "node_modules"), dst); err != nil {
-		return err
+	if err := copyTreeFn(filepath.Join(baked, "node_modules"), tmp); err != nil {
+		return errors.Join(err, os.RemoveAll(tmp))
+	}
+	if err := os.RemoveAll(dst); err != nil {
+		return errors.Join(err, os.RemoveAll(tmp))
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		return errors.Join(err, os.RemoveAll(tmp))
 	}
 	return copyFile(filepath.Join(baked, "package-lock.json"), filepath.Join(projectDir, "package-lock.json"), 0o600)
 }
+
+// copyTreeFn is copyTree; tests replace it to inject a copy failure.
+var copyTreeFn = copyTree
 
 // copyTree copies a directory of regular files, directories and symlinks (node_modules/.bin).
 func copyTree(src, dst string) error {
