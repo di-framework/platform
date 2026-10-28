@@ -28,10 +28,20 @@ interface Answer {
   body: string;
 }
 
+/** Waits for `socket` to close, or fails after `ms`. */
+const closedWithin = (socket: Socket, ms: number) =>
+  new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`still open after ${ms} ms`)), ms);
+    socket.once('close', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+
 /**
- * The whoami listener as the controller runs it (platform#113): TLS with the controller
- * certificate, which the registry verifies against the tenant CA under the Service name it calls,
- * and plain HTTP on the same port for a registry still configured with `http://` during an upgrade.
+ * The whoami listener as the controller runs it (platform#113): TLS only, with the controller
+ * certificate, which the registry verifies against the tenant CA under the Service name it calls.
+ * The plain-HTTP fallback for registries configured with `http://` is gone (`:drop-relay`).
  */
 describe('whoami listener over TLS (#113)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'whoami-listener-'));
@@ -42,7 +52,11 @@ describe('whoami listener over TLS (#113)', () => {
   const leaf = leafCertificate(CONTROLLER_NAME, [CONTROLLER_NAME], [], 30, ca.cert, ca.key);
   const config = configFromEnv({
     TENANT_CONTROLLER_TENANT: 'acme',
+    TENANT_CONTROLLER_TLS_CERT: '/tls/tls.crt',
+    TENANT_CONTROLLER_TLS_KEY: '/tls/tls.key',
     TENANT_CONTROLLER_WHOAMI_PORT: '8789',
+    // Once the opt-in to refuse plain HTTP; no longer read, so `false` keeps nothing open.
+    TENANT_CONTROLLER_WHOAMI_TLS_ONLY: 'false',
     TENANT_CONTROLLER_REGISTRY_HOST: 'registry',
     TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE: tokenFile,
   });
@@ -58,21 +72,23 @@ describe('whoami listener over TLS (#113)', () => {
     } as never,
     {} as never,
   );
+  let handled = 0;
+  const counted = {
+    handleWhoami: (request: Request) => {
+      handled++;
+      return controller.handleWhoami(request);
+    },
+  };
   const tls = { cert: leaf.cert, key: leaf.key };
-  let both: RegistryListener;
-  let tlsOnly: RegistryListener;
-  let plainOnly: RegistryListener;
+  let listener: RegistryListener;
   let log: ReturnType<typeof spyOn>;
 
   beforeAll(async () => {
     log = spyOn(console, 'log').mockImplementation(() => {});
-    const local = { ...config, host: '127.0.0.1' };
-    both = await serveWhoamiListener(controller, local, 0, tls);
-    tlsOnly = await serveWhoamiListener(controller, { ...local, whoamiTlsOnly: true }, 0, tls);
-    plainOnly = await serveWhoamiListener(controller, local, 0, undefined);
+    listener = await serveWhoamiListener(counted, { ...config, host: '127.0.0.1' }, 0, tls);
   });
   afterAll(async () => {
-    await Promise.all([both.stop(), tlsOnly.stop(), plainOnly.stop()]);
+    await listener.stop();
     log.mockRestore();
     rmSync(dir, { recursive: true, force: true });
   });
@@ -108,32 +124,35 @@ describe('whoami listener over TLS (#113)', () => {
     });
 
   test('answers over TLS with the controller certificate, verified by the tenant CA', async () => {
-    const answer = await call(true, both.port);
+    const answer = await call(true, listener.port);
     expect(answer.status).toBe(200);
     expect(JSON.parse(answer.body)).toMatchObject({ user: HOST_PULL_USER, via: 'host-pull' });
   });
 
-  test('still answers plain HTTP on the same port for a registry not yet switched', async () => {
-    const answer = await call(false, both.port);
-    expect(answer.status).toBe(200);
-    expect(JSON.parse(answer.body)).toMatchObject({ user: HOST_PULL_USER, via: 'host-pull' });
+  test('refuses plain HTTP without reaching the handler, with no setting to allow it', async () => {
+    const before = handled;
+    await expect(call(false, listener.port)).rejects.toThrow();
+    // A host pull token sent in cleartext is never checked, so nothing answers it.
+    const socket = connect(listener.port, '127.0.0.1');
+    socket.on('error', () => {});
+    let raw = '';
+    socket.on('data', (chunk: Buffer) => {
+      raw += chunk;
+    });
+    socket.write(
+      `GET /v1/auth/whoami HTTP/1.1\r\nHost: ${CONTROLLER_NAME}\r\n` +
+        `Authorization: Bearer ${TOKEN}\r\nConnection: close\r\n\r\n`,
+    );
+    await closedWithin(socket, 5_000);
+    expect(raw).toBe('');
+    expect(handled).toBe(before);
+    expect((await call(true, listener.port)).status).toBe(200);
+    expect(handled).toBe(before + 1);
   });
 
-  test('serves the same contract over both: 404 elsewhere, 401 for a bad token', async () => {
-    for (const secure of [true, false]) {
-      expect((await call(secure, both.port, '/v2/')).status).toBe(404);
-      expect((await call(secure, both.port, '/v1/auth/whoami', 'Bearer nope')).status).toBe(401);
-    }
-  });
-
-  test('a TLS-only listener refuses plain HTTP', async () => {
-    expect((await call(true, tlsOnly.port)).status).toBe(200);
-    await expect(call(false, tlsOnly.port)).rejects.toThrow();
-  });
-
-  test('without a certificate the listener stays plain HTTP', async () => {
-    expect((await call(false, plainOnly.port)).status).toBe(200);
-    await expect(call(true, plainOnly.port)).rejects.toThrow();
+  test('serves its contract over TLS: 404 elsewhere, 401 for a bad token', async () => {
+    expect((await call(true, listener.port, '/v2/')).status).toBe(404);
+    expect((await call(true, listener.port, '/v1/auth/whoami', 'Bearer nope')).status).toBe(401);
   });
 
   test('a certificate without the Service name fails verification', async () => {
@@ -145,73 +164,45 @@ describe('whoami listener over TLS (#113)', () => {
       ca.cert,
       ca.key,
     );
-    const listener = await serveWhoamiListener(
-      controller,
-      { host: '127.0.0.1', whoamiTlsOnly: true },
-      0,
-      other,
-    );
+    const misnamed = await serveWhoamiListener(controller, { host: '127.0.0.1' }, 0, other);
     try {
       // Refused for the name alone: the chain itself verifies against the tenant CA.
-      await expect(call(true, listener.port)).rejects.toMatchObject({
+      await expect(call(true, misnamed.port)).rejects.toMatchObject({
         code: 'ERR_TLS_CERT_ALTNAME_INVALID',
       });
     } finally {
-      await listener.stop();
+      await misnamed.stop();
     }
+  });
+
+  test('refuses to start without a certificate instead of skipping the listener', () => {
+    expect(() => serveWhoamiListener(controller, { host: '127.0.0.1' }, 0, undefined)).toThrow(
+      'serves TLS only',
+    );
   });
 
   test('fails to start on a taken port, leaving nothing listening', async () => {
     await expect(
-      serveWhoamiListener(controller, { host: '127.0.0.1' }, both.port, tls),
+      serveWhoamiListener(controller, { host: '127.0.0.1' }, listener.port, tls),
     ).rejects.toThrow();
-    expect((await call(true, both.port)).status).toBe(200);
+    expect((await call(true, listener.port)).status).toBe(200);
   });
 
   test('a client that goes away before sending anything is dropped', async () => {
-    const socket = connect(both.port, '127.0.0.1');
+    const socket = connect(listener.port, '127.0.0.1');
     await new Promise<void>((resolve) => socket.once('connect', () => resolve()));
     socket.destroy();
-    expect((await call(false, both.port)).status).toBe(200);
-  });
-
-  test('a plain client that half-closes after its request still gets the response', async () => {
-    const socket = connect(both.port, '127.0.0.1');
-    let raw = '';
-    socket.on('data', (chunk: Buffer) => {
-      raw += chunk;
-    });
-    const ended = new Promise<void>((resolve, reject) => {
-      socket.once('end', () => resolve());
-      socket.once('error', reject);
-    });
-    socket.end(
-      `GET /v1/auth/whoami HTTP/1.1\r\nHost: ${CONTROLLER_NAME}\r\n` +
-        `Authorization: Bearer ${TOKEN}\r\nConnection: close\r\n\r\n`,
-    );
-    await ended;
-    socket.destroy();
-    expect(raw).toStartWith('HTTP/1.1 200');
-    expect(raw).toContain(HOST_PULL_USER);
+    expect((await call(true, listener.port)).status).toBe(200);
   });
 });
 
-/** Waits for `socket` to close, or fails after `ms`. */
-const closedWithin = (socket: Socket, ms: number) =>
-  new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`still open after ${ms} ms`)), ms);
-    socket.once('close', () => {
-      clearTimeout(timer);
-      resolve();
-    });
-  });
-
 /**
- * The relay behind `acceptPlainHttp` (#329): it bounds connections and idleness on the client
- * side, and passes the client's own address to the handler, so it is safe on listeners that read
- * it (the registry front and pull listeners pass it on).
+ * The relay behind `requestTimeoutSeconds` (#329): it bounds connections and idleness on the
+ * client side, serves one protocol per listener, and passes the client's own address to the
+ * handler, so it is safe on listeners that read it (the registry front and pull listeners pass it
+ * on).
  */
-describe('TLS and plain HTTP relay (#329)', () => {
+describe('request deadline relay (#329)', () => {
   const ca = caCertificate('relay CA', 30);
   const leaf = leafCertificate(
     'localhost',
@@ -226,8 +217,7 @@ describe('TLS and plain HTTP relay (#329)', () => {
     serveRegistryListener({
       hostname: '127.0.0.1',
       port: 0,
-      tls,
-      acceptPlainHttp: true,
+      requestTimeoutSeconds: 30,
       idleTimeoutSeconds: 120,
       maxRequestBodySize: 1024,
       fetch: (request, server) =>
@@ -286,27 +276,26 @@ describe('TLS and plain HTTP relay (#329)', () => {
     }
   });
 
-  test("hands the handler the client's address over both protocols, not the hop's", async () => {
+  test("hands the handler the client's address over either protocol, not the hop's", async () => {
     // On ::1 the client's address differs from the relay hop's (127.0.0.1).
-    const listener = await serve({ hostname: '::1' });
-    try {
-      for (const secure of [true, false])
+    for (const secure of [true, false]) {
+      const listener = await serve({ hostname: '::1', tls: secure ? tls : undefined });
+      try {
         expect(JSON.parse(await ask(secure, '::1', listener.port))).toEqual({ address: '::1' });
-    } finally {
-      await listener.stop();
+      } finally {
+        await listener.stop();
+      }
     }
   });
 
-  test('keeps a TLS hop and a plain hop open at once, each with its own client address', async () => {
-    // Dual-stack: the plain client comes from 127.0.0.1, the TLS client from ::1.
-    const listener = await serve({ hostname: '::' });
-    const plainSocket = connect(listener.port, '127.0.0.1');
-    const tlsSocket = tlsConnect({
-      host: '::1',
-      port: listener.port,
-      ca: ca.cert,
-      servername: 'localhost',
-    });
+  test('keeps two hops open at once, each with its own client address', async () => {
+    // Dual-stack: one client comes from 127.0.0.1, the other from ::1.
+    const listener = await serve({ hostname: '::', tls });
+    const open = (host: string) =>
+      tlsConnect({ host, port: listener.port, ca: ca.cert, servername: 'localhost' });
+    const v4 = open('127.0.0.1');
+    const v6 = open('::1');
+    const sockets = [v4, v6];
     const answer = (socket: Socket) =>
       new Promise<string>((resolve, reject) => {
         let raw = '';
@@ -324,18 +313,16 @@ describe('TLS and plain HTTP relay (#329)', () => {
         socket.write('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n');
       });
     try {
-      await Promise.all([
-        new Promise((resolve) => plainSocket.once('connect', resolve)),
-        new Promise((resolve) => tlsSocket.once('secureConnect', resolve)),
-      ]);
+      await Promise.all(
+        sockets.map((socket) => new Promise((resolve) => socket.once('secureConnect', resolve))),
+      );
       // Both hops stay open across both requests, and twice over in alternation.
       for (let round = 0; round < 2; round++) {
-        expect(JSON.parse(await answer(tlsSocket))).toEqual({ address: '::1' });
-        expect(JSON.parse(await answer(plainSocket)).address).toEndWith('127.0.0.1');
+        expect(JSON.parse(await answer(v6))).toEqual({ address: '::1' });
+        expect(JSON.parse(await answer(v4)).address).toEndWith('127.0.0.1');
       }
     } finally {
-      plainSocket.destroy();
-      tlsSocket.destroy();
+      for (const socket of sockets) socket.destroy();
       await listener.stop();
     }
   });
@@ -356,9 +343,9 @@ describe('TLS and plain HTTP relay (#329)', () => {
     }
   });
 
-  test('with requestTimeoutSeconds, a TLS-only or plain-only listener serves only its protocol', async () => {
-    const tlsOnly = await serve({ acceptPlainHttp: false, requestTimeoutSeconds: 5 });
-    const plainOnly = await serve({ tls: undefined, requestTimeoutSeconds: 5 });
+  test('a TLS listener and a plain listener each serve only their own protocol', async () => {
+    const tlsOnly = await serve({ tls });
+    const plainOnly = await serve();
     try {
       expect(JSON.parse(await ask(true, '127.0.0.1', tlsOnly.port))).toEqual({
         address: '127.0.0.1',
@@ -370,6 +357,28 @@ describe('TLS and plain HTTP relay (#329)', () => {
       await expect(ask(true, '127.0.0.1', plainOnly.port)).rejects.toThrow();
     } finally {
       await Promise.all([tlsOnly.stop(), plainOnly.stop()]);
+    }
+  });
+
+  test('a client that half-closes after its request still gets the response', async () => {
+    const listener = await serve();
+    const socket = connect(listener.port, '127.0.0.1');
+    let raw = '';
+    socket.on('data', (chunk: Buffer) => {
+      raw += chunk;
+    });
+    const ended = new Promise<void>((resolve, reject) => {
+      socket.once('end', () => resolve());
+      socket.once('error', reject);
+    });
+    try {
+      socket.end('GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');
+      await ended;
+      expect(raw).toStartWith('HTTP/1.1 200');
+      expect(raw).toContain('127.0.0.1');
+    } finally {
+      socket.destroy();
+      await listener.stop();
     }
   });
 
@@ -404,20 +413,8 @@ describe('TLS and plain HTTP relay (#329)', () => {
   }, 10_000);
 });
 
-/** The relay's per-listener table of client addresses (#329 review W1). */
+/** The relay's table of client addresses (#329 review W1). */
 describe('HopAddresses', () => {
-  test('the same local port to two inner listeners keeps two addresses', () => {
-    const secure = new HopAddresses();
-    const plain = new HopAddresses();
-    const releaseSecure = secure.claim(40000, '10.0.0.1');
-    plain.claim(40000, '10.0.0.2');
-    expect(secure.lookup(40000)).toBe('10.0.0.1');
-    expect(plain.lookup(40000)).toBe('10.0.0.2');
-    releaseSecure();
-    expect(secure.lookup(40000)).toBeUndefined();
-    expect(plain.lookup(40000)).toBe('10.0.0.2');
-  });
-
   test("a reused port's new entry survives the old hop's release", () => {
     const hops = new HopAddresses();
     const releaseOld = hops.claim(40001, '10.0.0.1');

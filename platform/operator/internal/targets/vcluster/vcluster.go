@@ -164,7 +164,8 @@ func (t *Target) ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 			t.resetFailures(ns)
 		}
 	}()
-	if st, stop, err := t.claimNamespace(ctx, inst, ns); stop || err != nil {
+	namespace, st, stop, err := t.claimNamespace(ctx, inst, ns)
+	if stop || err != nil {
 		return st, err
 	}
 	// A resync after the host namespace was deleted (#490) runs on the vCluster installed in the
@@ -236,7 +237,7 @@ func (t *Target) ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 			if err := t.Client.Get(ctx, client.ObjectKeyFromObject(svc), svc); err != nil {
 				return targets.State{}, err
 			}
-			return t.resync(ctx, ns, string(svc.GetUID()), ReasonResyncing, msg+"; restarted the vcluster control plane to resync")
+			return t.resync(ctx, namespace, string(svc.GetUID()), ReasonResyncing, msg+"; restarted the vcluster control plane to resync")
 		}
 		return targets.State{Reason: "Repairing", Message: msg}, nil
 	}
@@ -254,8 +255,14 @@ func (t *Target) ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 	// regenerates its kubeconfig Secret when it starts: restart it, then reinstall the platform.
 	recorded := inst.Status.Target.ServiceUID
 	resyncing := uid != "" && inst.Status.Target.ResyncServiceUID == uid
+	if markUID, _, ok := restartMark(namespace); ok && markUID == inst.Status.Target.ResyncServiceUID {
+		// The status records the resync the mark answers, and guards it from here (#503).
+		if err := t.clearRestartMark(ctx, namespace); err != nil {
+			return targets.State{}, err
+		}
+	}
 	if recorded != "" && uid != recorded && !resyncing {
-		return t.resync(ctx, ns, uid, ReasonResyncing,
+		return t.resync(ctx, namespace, uid, ReasonResyncing,
 			fmt.Sprintf("service %s/%s was replaced (uid %s, was %s), which garbage-collected the objects vcluster synced; restarted the vcluster control plane to resync", ns, ReleaseName, uid, recorded))
 	}
 	if sts.Status.ReadyReplicas < 1 {
@@ -272,13 +279,33 @@ func (t *Target) ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 			return t.resyncWaiting(inst, fmt.Sprintf("waiting for vcluster to recreate its kubeconfig Secret %s/vc-%s", ns, ReleaseName)), nil
 		case recorded != "" || inst.Status.InstalledVersion != "":
 			// It existed once: the syncer won't create it again without a restart.
-			return t.resync(ctx, ns, uid, ReasonKubeconfigMissing,
+			return t.resync(ctx, namespace, uid, ReasonKubeconfigMissing,
 				fmt.Sprintf("vcluster kubeconfig Secret %s/vc-%s is missing; resync pending", ns, ReleaseName))
 		default:
 			return targets.State{Reason: "KubeconfigPending", Message: "vcluster kubeconfig Secret not created yet"}, nil
 		}
 	} else if err != nil {
 		return targets.State{}, err
+	}
+	// The restarted syncer wrote its Secret: whatever restart the mark records has taken effect,
+	// and a later loss is a new one (#503). Clear only once the pod running is not the one the mark
+	// names, for this Service, so a Secret that predates the restart never drops the guard.
+	if markUID, markPod, ok := restartMark(namespace); ok && markUID == uid {
+		var pod corev1.Pod
+		err := t.Client.Get(ctx, types.NamespacedName{Namespace: ns, Name: ReleaseName + "-0"}, &pod)
+		if client.IgnoreNotFound(err) != nil {
+			return targets.State{}, fmt.Errorf("look up %s/%s-0: %w", ns, ReleaseName, err)
+		}
+		if err == nil && string(pod.UID) != markPod {
+			if err := t.clearRestartMark(ctx, namespace); err != nil {
+				return targets.State{}, err
+			}
+		}
+	} else if ok {
+		// A mark for a Service that is gone: it guards nothing.
+		if err := t.clearRestartMark(ctx, namespace); err != nil {
+			return targets.State{}, err
+		}
 	}
 	raw := secret.Data["config"]
 	if len(raw) == 0 {
@@ -351,16 +378,90 @@ func (t *Target) resyncWaiting(inst *v1alpha1.PlatformInstance, stage string) ta
 	return targets.State{Reason: ReasonResyncing, Message: "resyncing: " + stage}
 }
 
+// RestartAnnotation on a host namespace records the vCluster pod restart a resync started:
+// "<service uid>/<uid of the pod deleted>" (#503). The controller records the resync in the
+// instance status after Ensure returns; when that write fails, the next round sees no resync,
+// and the mark keeps it from deleting the restarted pod a second time. It lives on the host
+// namespace, which the operator owns: the pod it describes is replaced by the restart, and a
+// namespace created again after a delete (#490) starts without it.
+const RestartAnnotation = "platform.di-framework.dev/resync-restart"
+
+// restartMark returns the owner Service uid and deleted pod uid the namespace's RestartAnnotation
+// records.
+func restartMark(namespace *corev1.Namespace) (serviceUID, podUID string, ok bool) {
+	v, ok := namespace.Annotations[RestartAnnotation]
+	if !ok {
+		return "", "", false
+	}
+	serviceUID, podUID, _ = strings.Cut(v, "/")
+	return serviceUID, podUID, true
+}
+
+// setRestartMark records on the host namespace that the pod podUID is restarted for the resync
+// of serviceUID.
+func (t *Target) setRestartMark(ctx context.Context, namespace *corev1.Namespace, serviceUID, podUID string) error {
+	base := namespace.DeepCopy()
+	if namespace.Annotations == nil {
+		namespace.Annotations = map[string]string{}
+	}
+	namespace.Annotations[RestartAnnotation] = serviceUID + "/" + podUID
+	if err := t.Client.Patch(ctx, namespace, client.MergeFrom(base)); err != nil {
+		return fmt.Errorf("record the vcluster restart on namespace %s: %w", namespace.Name, err)
+	}
+	return nil
+}
+
+// clearRestartMark removes the namespace's RestartAnnotation, if it has one.
+func (t *Target) clearRestartMark(ctx context.Context, namespace *corev1.Namespace) error {
+	if _, _, ok := restartMark(namespace); !ok {
+		return nil
+	}
+	base := namespace.DeepCopy()
+	delete(namespace.Annotations, RestartAnnotation)
+	if err := t.Client.Patch(ctx, namespace, client.MergeFrom(base)); err != nil {
+		return fmt.Errorf("clear the vcluster restart mark on namespace %s: %w", namespace.Name, err)
+	}
+	return nil
+}
+
 // resync deletes the vCluster pod, which its StatefulSet recreates. The restarted syncer
 // writes its kubeconfig Secret again and syncs the virtual objects that still exist back to the
-// host namespace.
-func (t *Target) resync(ctx context.Context, ns, uid, reason, msg string) (targets.State, error) {
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: ReleaseName + "-0"}}
-	if err := t.Client.Delete(ctx, pod); client.IgnoreNotFound(err) != nil {
+// host namespace. The restart is recorded on the host namespace first (RestartAnnotation), so a
+// resync the controller failed to record restarts the pod once: a later round that finds the
+// mark for uid and a pod other than the one it deleted (or none yet) reports the resync again
+// without a second delete (#503).
+func (t *Target) resync(ctx context.Context, namespace *corev1.Namespace, uid, reason, msg string) (targets.State, error) {
+	ns := namespace.Name
+	state := targets.State{Reason: reason, Message: msg, ResyncStarted: uid}
+	pod := &corev1.Pod{}
+	key := types.NamespacedName{Namespace: ns, Name: ReleaseName + "-0"}
+	err := t.Client.Get(ctx, key, pod)
+	if client.IgnoreNotFound(err) != nil {
+		return targets.State{}, fmt.Errorf("look up %s to resync: %w", key, err)
+	}
+	podGone := err != nil
+	if markUID, markPod, ok := restartMark(namespace); ok && markUID == uid && (podGone || string(pod.UID) != markPod) {
+		log.FromContext(ctx).Info("vcluster already restarted for this resync", "namespace", ns, "reason", reason, "serviceUID", uid)
+		return state, nil
+	}
+	if podGone {
+		// Nothing to delete: the StatefulSet is creating the pod, which starts a new syncer.
+		if err := t.setRestartMark(ctx, namespace, uid, ""); err != nil {
+			return targets.State{}, err
+		}
+		log.FromContext(ctx).Info("resyncing vcluster", "namespace", ns, "reason", reason)
+		return state, nil
+	}
+	if err := t.setRestartMark(ctx, namespace, uid, string(pod.UID)); err != nil {
+		return targets.State{}, err
+	}
+	// Delete only the pod the mark names: a newer one is already the restart.
+	err = t.Client.Delete(ctx, pod, client.Preconditions{UID: &pod.UID})
+	if client.IgnoreNotFound(err) != nil && !apierrors.IsConflict(err) {
 		return targets.State{}, fmt.Errorf("restart %s/%s to resync: %w", ns, pod.Name, err)
 	}
 	log.FromContext(ctx).Info("resyncing vcluster", "namespace", ns, "reason", reason)
-	return targets.State{Reason: reason, Message: msg, ResyncStarted: uid}, nil
+	return state, nil
 }
 
 // UnreachableAfter is how many consecutive failed API checks report the target unreachable.
@@ -410,46 +511,50 @@ func (t *Target) values(ctx context.Context, inst *v1alpha1.PlatformInstance) (m
 }
 
 // claimNamespace creates the host namespace annotated with its owner, or checks that an existing
-// one belongs to inst. stop is set, with the state to report, while the namespace of an instance
-// that had a vCluster is terminating or gone (#490): nothing is created in a terminating
-// namespace, and a deleted one is created again only once the resync is recorded.
-func (t *Target) claimNamespace(ctx context.Context, inst *v1alpha1.PlatformInstance, ns string) (st targets.State, stop bool, err error) {
-	var namespace corev1.Namespace
-	err = t.Client.Get(ctx, types.NamespacedName{Name: ns}, &namespace)
+// one belongs to inst, and returns it. The bool (stop) is set, with the state to report and no
+// namespace, while the namespace of an instance that had a vCluster is terminating or gone
+// (#490): nothing is created in a terminating namespace, and a deleted one is created again only
+// once the resync is recorded.
+func (t *Target) claimNamespace(ctx context.Context, inst *v1alpha1.PlatformInstance, ns string) (*corev1.Namespace, targets.State, bool, error) {
+	namespace := &corev1.Namespace{}
+	err := t.Client.Get(ctx, types.NamespacedName{Name: ns}, namespace)
 	if err != nil && !apierrors.IsNotFound(err) {
-		return targets.State{}, false, err
+		return nil, targets.State{}, false, err
 	}
 	gone := err != nil
 	if !gone {
-		if err := checkOwner(inst, &namespace); err != nil {
-			return targets.State{}, false, err
+		if err := checkOwner(inst, namespace); err != nil {
+			return nil, targets.State{}, false, err
 		}
 	}
 	if gone || namespace.DeletionTimestamp != nil {
 		if st, stop := t.hostNamespaceLost(inst, ns, gone); stop {
-			return st, true, nil
+			return nil, st, true, nil
 		}
 	}
 	if gone {
-		namespace = corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		namespace = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
 			Name:        ns,
 			Labels:      map[string]string{"app.kubernetes.io/managed-by": "platform-operator", HostNamespaceLabel: "true"},
 			Annotations: map[string]string{OwnerAnnotation: owner(inst)},
 		}}
-		err = t.Client.Create(ctx, &namespace)
+		err = t.Client.Create(ctx, namespace)
+		if err == nil {
+			return namespace, targets.State{}, false, nil
+		}
 		if !apierrors.IsAlreadyExists(err) {
-			return targets.State{}, false, err
+			return nil, targets.State{}, false, err
 		}
 		// Someone created it between the read and the create; it must still be ours.
-		if err := t.Client.Get(ctx, types.NamespacedName{Name: ns}, &namespace); err != nil {
-			return targets.State{}, false, err
+		if err := t.Client.Get(ctx, types.NamespacedName{Name: ns}, namespace); err != nil {
+			return nil, targets.State{}, false, err
 		}
-		if err := checkOwner(inst, &namespace); err != nil {
-			return targets.State{}, false, err
+		if err := checkOwner(inst, namespace); err != nil {
+			return nil, targets.State{}, false, err
 		}
 	}
 	if namespace.Labels[HostNamespaceLabel] == "true" {
-		return targets.State{}, false, nil
+		return namespace, targets.State{}, false, nil
 	}
 	// A namespace created before the label existed: the admission policy covers labelled ones.
 	base := namespace.DeepCopy()
@@ -457,7 +562,10 @@ func (t *Target) claimNamespace(ctx context.Context, inst *v1alpha1.PlatformInst
 		namespace.Labels = map[string]string{}
 	}
 	namespace.Labels[HostNamespaceLabel] = "true"
-	return targets.State{}, false, t.Client.Patch(ctx, &namespace, client.MergeFrom(base))
+	if err := t.Client.Patch(ctx, namespace, client.MergeFrom(base)); err != nil {
+		return nil, targets.State{}, false, err
+	}
+	return namespace, targets.State{}, false, nil
 }
 
 // hostNamespaceLost decides what a terminating (gone false) or deleted (gone true) host namespace

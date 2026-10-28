@@ -21,7 +21,7 @@ func resyncInstance(t *testing.T) (*Target, *v1alpha1.PlatformInstance, *appsv1.
 	tg, _, inst, sts := readyInstance(t)
 	ns := HostNamespace(inst)
 	ctx := context.Background()
-	if err := tg.Client.Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: ReleaseName + "-0"}}); err != nil {
+	if err := tg.Client.Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: ReleaseName + "-0", UID: "pod-uid-1"}}); err != nil {
 		t.Fatal(err)
 	}
 	// The fake client sets no uids; the API server does.

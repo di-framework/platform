@@ -278,7 +278,7 @@ describe('wasmcloud:secrets bind-time config (#83 W1)', () => {
     namespace: 'wasmcloud',
     package: 'secrets',
     interfaces: ['store', 'reveal'],
-    config: { 'tenant-controller-url': 'http://tenant-controller.di-runtime-alpha.svc:8789' },
+    config: { 'tenant-controller-url': 'https://tenant-controller.di-runtime-alpha.svc:8789' },
     ...extra,
   });
   const blobstoreNats = (config: Record<string, string> = {}): HostInterfaceLike => ({
