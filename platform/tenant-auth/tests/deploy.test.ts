@@ -1630,7 +1630,12 @@ describe('/v1/deploy', () => {
       await deployed(withReplicas(3));
       const response = await post('/v1/deployments/rollback', { env: 'prod', service: 'web' });
       expect(response.status).toBe(202);
-      expect(await response.json()).toMatchObject({ id: 'web-prod.3', status: 'pending' });
+      // The response names the restored revision, not only the new one (platform#417).
+      expect(await response.json()).toMatchObject({
+        id: 'web-prod.3',
+        status: 'pending',
+        rollbackOf: 'web-prod.1',
+      });
       expect(appliedReplicas()).toBe(1);
       const applied = JSON.parse(patches().at(-1)?.body ?? '') as {
         spec: { template: { spec: Json } };
@@ -1645,12 +1650,31 @@ describe('/v1/deploy', () => {
       const { items } = (await (await get('/v1/deployments?env=prod&service=web')).json()) as {
         items: Json[];
       };
-      expect(items.map((item) => [item.id, item.status])).toEqual([
-        ['web-prod.3', 'pending'],
-        ['web-prod.2', 'rolled-back'],
-        ['web-prod.1', 'pending'],
+      expect(items.map((item) => [item.id, item.status, item.rollbackOf])).toEqual([
+        ['web-prod.3', 'pending', 'web-prod.1'],
+        ['web-prod.2', 'rolled-back', undefined],
+        ['web-prod.1', 'pending', undefined],
       ]);
       expect(log).toHaveBeenCalledWith(expect.stringContaining('"deploy.rolled-back"'));
+    });
+
+    test('a malformed rollback-of annotation is omitted from the list', async () => {
+      await deployed(withReplicas(1));
+      const object = revision('web-prod.1') as { metadata: { annotations: Json } };
+      for (const value of [
+        'web-prod.1 x',
+        'web-prod.1\n',
+        'Web-prod.1',
+        'web-dev.1',
+        'web-prod.0',
+      ]) {
+        object.metadata.annotations['platform.di-framework.dev/rollback-of'] = value;
+        const { items } = (await (await get('/v1/deployments?env=prod&service=web')).json()) as {
+          items: Json[];
+        };
+        expect(items[0]?.id).toBe('web-prod.1');
+        expect(items[0]).not.toHaveProperty('rollbackOf');
+      }
     });
 
     test('rollback --to re-applies the named revision', async () => {

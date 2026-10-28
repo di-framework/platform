@@ -199,7 +199,7 @@ export function validatePlatformConfig(args: PlatformConfigArgs): ValidatedPlatf
   if (routeUrlPattern !== undefined && notDerived.length)
     warnings.push(
       `tenantAuth.${notDerived.join(', tenantAuth.')} not derived from routeUrlPattern ${routeUrlPattern} ` +
-        '(only http://{host}.{tenant}.localhost[:<port>] is routed to tenant-auth); the 127.0.0.1 defaults apply',
+        '(only http://{host}.{tenant}.localhost[:<port>] is routed to tenant-auth); the port-forward defaults apply',
     );
   const extraHostGroups = extraHostGroupsWarning(args.values);
   if (extraHostGroups) warnings.push(extraHostGroups);

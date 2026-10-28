@@ -737,7 +737,11 @@ async function dispatch(parsed: Parsed, io: Io): Promise<number> {
           io,
           flags,
           deployment,
-          () => `${deployment.service} in ${env}: rolling back to ${deployment.id}`,
+          // A controller older than `rollbackOf` names only the new revision it created.
+          () =>
+            deployment.rollbackOf
+              ? `${deployment.service} in ${env}: rolling back to ${deployment.rollbackOf} (as revision ${deployment.id})`
+              : `${deployment.service} in ${env}: rolling back as revision ${deployment.id}`,
         );
         return 0;
       }
