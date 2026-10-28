@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -141,11 +142,8 @@ func TestRestartMarkRetriesAFailedDelete(t *testing.T) {
 	ns := HostNamespace(inst)
 	ctx := context.Background()
 	inst.Status.Target.ServiceUID = "old-uid"
-	live := tg.Client
-	tg.Client = interceptor.NewClient(live.(client.WithWatch), interceptor.Funcs{
-		Delete: func(context.Context, client.WithWatch, client.Object, ...client.DeleteOption) error {
-			return errors.New("forbidden")
-		},
+	live := interceptDeletes(tg, func(client.WithWatch, client.Object, *client.DeleteOptions) error {
+		return errors.New("forbidden")
 	})
 	if _, err := tg.Ensure(ctx, inst); err == nil || !podExists(t, live, ns) {
 		t.Fatalf("failed delete: %v", err)
@@ -153,6 +151,53 @@ func TestRestartMarkRetriesAFailedDelete(t *testing.T) {
 	tg.Client = live
 	if st, err := tg.Ensure(ctx, inst); err != nil || st.ResyncStarted != uid || podExists(t, live, ns) {
 		t.Fatalf("retry: %+v %v", st, err)
+	}
+}
+
+// interceptDeletes routes the target's deletes to del, with their options applied, and returns
+// the client underneath.
+func interceptDeletes(tg *Target, del func(client.WithWatch, client.Object, *client.DeleteOptions) error) client.Client {
+	live := tg.Client
+	tg.Client = interceptor.NewClient(live.(client.WithWatch), interceptor.Funcs{
+		Delete: func(_ context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			return del(c, obj, (&client.DeleteOptions{}).ApplyOptions(opts))
+		},
+	})
+	return live
+}
+
+// The restart deletes only the pod the mark names (#503): the Delete carries that pod's uid as a
+// precondition. A Conflict means the StatefulSet already replaced it, which is the restart: the
+// resync goes on without an error, and the next round leaves the new pod alone.
+func TestRestartDeleteIsPreconditionedOnTheMarkedPod(t *testing.T) {
+	tg, inst, _, uid := resyncInstance(t)
+	ns := HostNamespace(inst)
+	ctx := context.Background()
+	inst.Status.Target.ServiceUID = "old-uid"
+	var preconditions []*metav1.Preconditions
+	live := interceptDeletes(tg, func(c client.WithWatch, obj client.Object, opts *client.DeleteOptions) error {
+		preconditions = append(preconditions, opts.Preconditions)
+		// The StatefulSet replaced the pod between the read and the delete.
+		if err := c.Delete(ctx, obj); err != nil {
+			t.Fatal(err)
+		}
+		restartPod(t, c, ns, "pod-uid-2")
+		return apierrors.NewConflict(corev1.Resource("pods"), obj.GetName(),
+			errors.New("Precondition failed: UID in precondition: pod-uid-1, UID in object meta: pod-uid-2"))
+	})
+
+	st, err := tg.Ensure(ctx, inst)
+	if err != nil || st.Reason != ReasonResyncing || st.ResyncStarted != uid {
+		t.Fatalf("conflict on the restart: %+v %v", st, err)
+	}
+	if len(preconditions) != 1 || preconditions[0] == nil || preconditions[0].UID == nil || *preconditions[0].UID != "pod-uid-1" {
+		t.Fatalf("pod delete preconditions %+v, want uid pod-uid-1", preconditions)
+	}
+	if mark, _ := markOf(t, live, ns); mark != uid+"/pod-uid-1" {
+		t.Fatalf("restart mark %q", mark)
+	}
+	if st, err = tg.Ensure(ctx, inst); err != nil || st.ResyncStarted != uid || len(preconditions) != 1 || podUID(t, live, ns) != "pod-uid-2" {
+		t.Fatalf("after the conflict: %+v %v, %d deletes", st, err, len(preconditions))
 	}
 }
 
