@@ -282,31 +282,68 @@ the host-side synced ConfigMap, so changing them means recreating the instance.
 
 ## Host-namespace isolation
 
-vCluster syncs the platform's NetworkPolicies to the host, but those cover the tenant namespaces, not the
-instance's `wasmcloud` namespace, its CoreDNS or the vCluster control plane. So the operator owns three
-NetworkPolicies in every instance host namespace (`pi-<namespace>-<name>-<hash>`), labelled
-`app.kubernetes.io/managed-by: platform-operator` (#452):
+vCluster syncs the platform's NetworkPolicies to the host, and they govern the platform's pods inside the
+instance: NATS, the host groups, the runtime-operator, the gateway and the tenant namespaces. They don't cover
+the vCluster control plane, the instance's CoreDNS or the instance's other namespaces. So the operator owns
+these NetworkPolicies in every instance host namespace (`pi-<namespace>-<name>-<hash>`), labelled
+`app.kubernetes.io/managed-by: platform-operator` (#452, #535):
 
 - `platform-operator-deny-ingress`: every pod in the namespace is selected for ingress, so nothing gets in that
   no policy allows;
-- `platform-operator-allow-same-namespace`: pods of the same host namespace get in, which covers the instance's
-  own synced pods, its CoreDNS, and its vCluster control plane reaching synced pods and serving the kubelet port
-  (10250) of its `vcluster-node-*` Services;
-- `platform-operator-allow-operator`: the operator's own namespace gets
-  in to the vCluster API (`app=vcluster` pods, port 8443 behind `svc/vcluster:443`), for the target check and
-  the installs.
+- `platform-operator-allow-control-plane`: the instance's synced pods get in to the vCluster control plane on
+  port 8443, which serves both the API (`svc/vcluster:443`) and the kubelet port (10250) of the
+  `vcluster-node-*` Services;
+- `platform-operator-allow-dns`: the instance's synced pods get in to its CoreDNS on 53 (UDP and TCP);
+- `platform-operator-allow-platform-nats`: pods of the instance's `wasmcloud` namespace get in to its NATS
+  (`wasmcloud.com/name=nats`) on 4222. The platform creates its own NATS policies only after the wasmcloud Helm
+  release, which waits for `hostgroup-default` and `runtime-operator`, and those need NATS; without this rule a
+  fresh install never becomes Ready. Both sides are selected by `vcluster.loft.sh/namespace`, which the syncer
+  sets from the pod's real namespace;
+- `platform-operator-allow-issuer`, only while `tenantAuth.issuerUpstream` is set: the platform's tenant-auth
+  pods (`platform.di-framework.dev/component=tenant-auth`) get in to the pods of the namespace `issuerUpstream`
+  names, on its port and on `issuerUpstreamPodPort`, which the platform opens on the egress side. The syncer
+  copies that label unchanged, so any pod of the instance can forge it: the rule only ever opens a namespace
+  the platform doesn't use. It is not rendered when `issuerUpstream` names the platform namespace
+  (`wasmcloud`, also the default with no namespace), `kube-system`, a `di-*` namespace the platform creates
+  (`di-tenant-*`, `di-runtime-*`, `di-apikeys-*`, ...), or an empty one;
+- `platform-operator-allow-same-namespace`: the vCluster control plane gets in to every pod of the namespace,
+  for the API server's calls into synced pods (admission webhooks, for example) and its own peers;
+- `platform-operator-allow-operator`: the operator's own namespace gets in to the vCluster API (port 8443), for
+  the target check and the installs.
+
+The policies select pods by vCluster 0.37.3's labels. The control plane is `app=vcluster,release=vcluster`
+without `vcluster.loft.sh/managed-by`. The syncer sets `vcluster.loft.sh/managed-by=vcluster` on every synced pod,
+together with `vcluster.loft.sh/namespace=<virtual namespace>`, and copies the pod's other labels; it rewrites
+the pod's own `release` and `vcluster.loft.sh/*` labels to hashed keys. CoreDNS is the
+synced pod labelled `k8s-app=kube-dns` in the virtual `kube-system`. A pod inside the instance that copies the
+control plane's labels loses `release=vcluster` and still carries `vcluster.loft.sh/managed-by`, so it gets none
+of the control plane's access.
 
 The target applies them on every reconcile, before the vCluster is installed, so a deleted or edited policy is
-back by the next round (and so by the next repair); an unchanged one is not written.
+back by the next round (and so by the next repair). An unchanged policy is not written; one whose spec differs is
+updated in place, the narrow allows before `platform-operator-allow-same-namespace`.
 
-What this isolates: pods of another instance, and pods in any other host namespace, can't reach this
-instance's `wasmcloud` services (NATS, host group, runtime-operator, `wasmcloud-http`), its CoreDNS, its vCluster
-API or its kubelet port. The platform's own synced policies name their peers by namespace (platform #462), so they keep isolating its tenant namespaces and admit no other instance.
+What this isolates:
+
+- Pods of another instance, and pods in any other host namespace, can't reach this instance's `wasmcloud`
+  services (NATS, host group, runtime-operator, `wasmcloud-http`), its CoreDNS, its vCluster API or its kubelet
+  port. The platform's own synced policies name their peers by namespace (platform #462), so they admit no
+  other instance either.
+- Inside the instance, the operator lets pods reach only DNS, the API and the issuer, plus the control plane's
+  own calls. The platform's synced policies decide the rest, so a pod in a namespace that is neither the
+  platform's nor a tenant's can't reach the gateway, a tenant's host group (`di-tenant-gateway`) or NATS.
 
 What it doesn't:
 
-- **Egress** is not restricted here; it stays as the platform's synced policies set it (DNS to the host's
-  `kube-system/kube-dns` on 53 among it).
+- **Egress** is not restricted here; it stays as the platform's synced policies set it (DNS to the instance's
+  CoreDNS on 53 among it).
+- **Pods inside the instance that no policy admits.** The default deny selects every pod of the instance. A pod in
+  a namespace with no NetworkPolicy admitting its clients (anything deployed next to the platform, apart from the
+  `issuerUpstream`) can't be reached from the instance's other pods. To open it, add a NetworkPolicy inside the
+  instance; vCluster syncs it to the host, where it applies.
+- **The API server as a proxy.** The control plane reaches every pod of the instance. So a client allowed the
+  `services/proxy` or `pods/proxy` subresource inside the instance reaches pods through the vCluster API. That is
+  governed by RBAC inside the instance, not by NetworkPolicy.
 - **The HTTP gateway, when published.** With `gateway.httpNodePort` set, the platform's synced
   `di-platform-gateway` policy admits its HTTP port from any source, with no peers, so NodePort traffic from
   outside the cluster arrives. Policies add up, so the default deny doesn't close it, and pods of other instances
