@@ -36,8 +36,8 @@ the vCluster. Its pods run on the host's node and program the same iptables and 
 kube-router, so the two race and can undo the host's enforcement of the instance's policies (#456).
 
 The CRD refuses `kube-router` for the `vcluster` target (the only target in v1alpha1) with a CEL rule:
-`kubectl apply` and the Headlamp form fail with "platform.networkPolicyEngine kube-router is not supported on
-the vcluster target ... Use existing". An instance stored with `kube-router` before the rule keeps working and
+`kubectl apply` fails with "platform.networkPolicyEngine kube-router is not supported on the vcluster target
+... Use existing", and the Headlamp form doesn't offer `kube-router`. An instance stored with `kube-router` before the rule keeps working and
 can still be updated while it keeps the value; the rule only stops a new instance from choosing it and an
 existing one from switching to it. Moving such an instance to `existing` puts it on the supported setup; it
 can't switch back.
@@ -442,6 +442,8 @@ once (Package settings, then Change visibility), because Layer 4 (#274) pulls th
 
 The operator needs:
 
+- **Kubernetes 1.30 or later.** The CRD's `networkPolicyEngine` transition rule uses `optionalOldSelf`, which
+  older API servers drop, so the CRD apply fails there.
 - **cluster-admin.** The vCluster chart creates RBAC, workloads and Services in each instance namespace, and
   Helm needs every permission it grants. `config/rbac/role.yaml` lists what the controller itself uses;
   narrowing the chart's needs is follow-up work.

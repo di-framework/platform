@@ -238,7 +238,9 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
           'networkPolicyEngine',
           'Network policy engine',
           networkPolicyEngineChoices(storedEngine),
-          "Left empty, the API default (existing) applies. kube-router isn't offered on vcluster: the host cluster enforces NetworkPolicy.",
+          storedEngine === 'kube-router'
+            ? 'Left empty, the API default (existing) applies. kube-router is offered only because this instance already uses it; once changed, it is refused on vcluster.'
+            : "Left empty, the API default (existing) applies. kube-router isn't offered on vcluster: the host cluster enforces NetworkPolicy.",
         )}
         {text(
           'storageRoot',

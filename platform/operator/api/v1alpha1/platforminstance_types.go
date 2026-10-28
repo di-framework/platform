@@ -94,7 +94,8 @@ type TargetSpec struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.users) || self.users.all(u, u.memberships.all(m, has(self.tenants) && self.tenants.exists(t, t.name == m.tenant)))",message="every users[].memberships[].tenant must name an entry of tenants"
 type PlatformSettings struct {
 	// NetworkPolicyEngine is existing (default: the target enforces NetworkPolicy) or
-	// kube-router (the platform runs its own policy controller).
+	// kube-router (the platform runs its own policy controller). kube-router is refused on the
+	// vcluster target for new instances and for switching to it (#456).
 	// +kubebuilder:default=existing
 	// +optional
 	NetworkPolicyEngine NetworkPolicyEngine `json:"networkPolicyEngine,omitempty"`

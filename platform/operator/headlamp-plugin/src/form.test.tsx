@@ -201,6 +201,17 @@ describe('PlatformInstanceFormDialog', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     });
     expect(submit).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/already uses it/)).toBeTruthy();
+    // The engine is kept as is (no op on it); only the version changes.
+    expect(submit.mock.calls[0]?.[0]).toStrictEqual({
+      mode: 'edit',
+      namespace: 'team-b',
+      name: 'full-instance',
+      patch: [
+        { op: 'test', path: '/spec/version', value: '6.0.18-rc.1' },
+        { op: 'replace', path: '/spec/version', value: '6.0.19' },
+      ],
+    });
   });
 
   it('shows the conflict message when the object changed since the dialog opened', async () => {
