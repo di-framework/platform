@@ -333,11 +333,39 @@ jobs:
       - name: Build and test tenant OCI registry component
         run: make -C platform/oci-registry test lint build
 
+  # T07 / #397: reserved for the registry-nats tests; other workflow work leaves this job alone.
+  # Runs the registry migration Job as rendered (pinned nats-box, uid 65532, its workingDir)
+  # against a throwaway nats-server under runc, entering the working directory as root before
+  # dropping privileges, so it fails if the Job spec loses `workingDir: /tmp` (#391).
+  registry-nats-smoke:
+    name: Registry migration smoke (uid 65532)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.3'
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run the migration Job as uid 65532 against nats-server
+        env:
+          REGISTRY_NATS_SMOKE: '1'
+          CONTAINER_RUNTIME: docker
+        run: bun test platform/platform/tests/registry-nats-smoke.test.ts
+
   # The required check: green only when every job above is.
   build-and-test:
     name: Test
     # headlamp-plugin skips its steps, and succeeds, when a PR doesn't touch the plugin or the CRD.
-    needs: [typescript, components, headlamp-plugin]
+    needs: [typescript, components, headlamp-plugin, registry-nats-smoke]
     # always(): a failed or cancelled job must fail this check, not skip it (a skip passes).
     if: always()
     runs-on: ubuntu-latest
