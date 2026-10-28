@@ -155,14 +155,19 @@ export const WHOAMI_REQUEST_TIMEOUT_SECONDS = 30;
 /**
  * The whoami listener (platform#83) on `port`: TLS only, with the controller certificate
  * (platform#113), which the tenant hosts trust through `--http-client-ca-path`. A plain-HTTP
- * connection is closed without reaching the handler (platform#113 `:drop-relay`).
+ * connection is closed without reaching the handler (platform#113 `:drop-relay`). Without a
+ * certificate it throws rather than skip the listener, like `configFromEnv` refuses to start.
  */
 export function serveWhoamiListener(
   controller: Pick<Controller, 'handleWhoami'>,
   config: Pick<ControllerConfig, 'host'>,
   port: number,
-  tls: { cert: string; key: string },
+  tls: { cert: string; key: string } | undefined,
 ): Promise<RegistryListener> {
+  if (!tls)
+    throw new Error(
+      'the whoami listener serves TLS only: TENANT_CONTROLLER_WHOAMI_PORT needs TENANT_CONTROLLER_TLS_CERT and TENANT_CONTROLLER_TLS_KEY',
+    );
   return serveRegistryListener({
     hostname: config.host,
     port,
@@ -1439,9 +1444,8 @@ if (import.meta.main) {
     idleTimeout: 120,
     fetch: (request, server) => controller.handle(request, server),
   });
-  // `configFromEnv` refuses a whoami port without a certificate, so `tls` is set with it.
-  if (config.whoamiPort && tls)
-    await serveWhoamiListener(controller, config, config.whoamiPort, tls);
+  // `configFromEnv` refuses a whoami port without a certificate; the listener throws as well.
+  if (config.whoamiPort) await serveWhoamiListener(controller, config, config.whoamiPort, tls);
   // The registry listeners run on `node:http`, not `Bun.serve`, so a streamed blob keeps the
   // registry's `Content-Length` (#197; see `registry-listener.ts`).
   if (config.registryFrontPort)

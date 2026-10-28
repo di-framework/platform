@@ -175,6 +175,12 @@ describe('whoami listener over TLS (#113)', () => {
     }
   });
 
+  test('refuses to start without a certificate instead of skipping the listener', () => {
+    expect(() => serveWhoamiListener(controller, { host: '127.0.0.1' }, 0, undefined)).toThrow(
+      'serves TLS only',
+    );
+  });
+
   test('fails to start on a taken port, leaving nothing listening', async () => {
     await expect(
       serveWhoamiListener(controller, { host: '127.0.0.1' }, listener.port, tls),

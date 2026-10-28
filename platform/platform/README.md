@@ -244,11 +244,13 @@ and port as before, so they do not change. A later release refuses plain HTTP on
   platform always mounts the controller certificate, so a platform-run controller is not
   affected. The whoami port, its Service port and the NetworkPolicy that admits only the tenant's
   host pods to it are unchanged.
-- **Upgrading from before v6.0.15.** Upgrade the platform package in the same update as (or
-  before) `tenantAuth.image`: a registry still configured with `http://…:8789` cannot reach a
-  controller running this image and answers requests that need authorization with `503` until
-  its config names `https://`. See
-  [Upgrading to a whoami listener that refuses plain HTTP](#upgrading-to-a-whoami-listener-that-refuses-plain-http-329).
+- **Upgrading from before v6.0.15.** Upgrade to a v6.0.15-or-later release first, then to this
+  one. An install older than v6.0.15 runs a tenant-auth image that serves only plain HTTP on
+  `8789`, so a registry switched to `https://` cannot reach it, whichever of the platform package
+  and `tenantAuth.image` changes first, and answers requests that need authorization with `503`
+  until both have rolled. Going through v6.0.15 or later first avoids that window, as
+  [Upgrading to a whoami listener that refuses plain HTTP](#upgrading-to-a-whoami-listener-that-refuses-plain-http-329)
+  describes.
 
 #### Upgrading to tenant-auth URLs derived from `routeUrlPattern` (#128)
 
