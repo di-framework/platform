@@ -370,11 +370,42 @@ A resync still waiting (for the control plane, the Secret or the API) more than 
 after it started, measured from `status.target.resyncStarted`, is reported as
 `TargetReady=False/TargetUnreachable`, naming the stage it is waiting at.
 
-Secrets that components inside the instance generated at runtime (tenant-auth signing keys, for example) are
-not in any chart or Pulumi program: they are lost for good, and whatever they protected (issued tokens,
-sessions) has to be issued again.
-
 An unchanged uid changes nothing.
+
+#### What a resync doesn't bring back
+
+A resync restores what the platform installs: the vCluster release, the platform's Helm Release and the
+objects its Pulumi program manages. The platform's own controllers also write some synced objects again on
+their next pass (the tenancy controller reissues `tenant-controller-tls` from its CA, for example). Every other
+ConfigMap and Secret inside the instance that vCluster synced to the host was garbage-collected with its host
+copy, and vCluster deleted the virtual copy too, so it is gone in both places and nothing outside the platform
+creates it again. vCluster (0.37.3, as the operator installs it) syncs only the ConfigMaps and Secrets a pod
+uses (`sync.toHost.configMaps.all` and `secrets.all` are `false`), so only those are lost; one no pod uses
+isn't affected:
+
+- **ConfigMaps and Secrets that pods use and that you or your tenants created inside the instance**, with `kubectl` against an
+  instance or tenant kubeconfig, with your own Helm charts or manifests, or by any controller other than the
+  platform. Pods that mount one stay in `ContainerCreating` (`MountVolume.SetUp failed … configmap … not
+  found`) until it is applied again, and whatever depends on those pods stays down with them. Layer 4 run 4
+  (v6.0.22) saw this with an OIDC issuer that ran inside the instance: its ConfigMap was gone after every
+  owner-Service resync, the issuer pod never started, and tenant-console, which waits for OIDC discovery of
+  `tenantAuth.issuer`, kept restarting until the ConfigMap was applied again.
+- **Secrets that a component inside the instance generated at runtime and that a pod mounts** (a workload's
+  own keys or credentials, for example). They aren't in any chart or Pulumi program: they are lost for good,
+  and whatever they protected (issued tokens, sessions) has to be issued again.
+
+So:
+
+- Keep what the platform depends on outside the instance: run the OIDC issuer named by `tenantAuth.issuer`
+  (and any other service the platform or your tenants need) in the host cluster or elsewhere, not inside the
+  instance. The tenant-auth OAuth client secret is safe: the operator reads it from `clientSecretRef` in the
+  PlatformInstance's namespace and the Pulumi program writes the copy, `platform-operator-tenant-auth`, again.
+- Keep the manifests for anything you create inside an instance, and apply them again once the resync is
+  done (`Ready=True`, with `Installed` at reason `Resync`).
+
+Deleting only `vc-vcluster` (`KubeconfigMissing`) restarts the syncer without touching `service/vcluster`, so
+nothing is garbage-collected and nothing else is lost. The admission policy above makes the owner-Service
+path a bypass-only one; this section describes what happens when it is bypassed.
 
 ## Running it
 
