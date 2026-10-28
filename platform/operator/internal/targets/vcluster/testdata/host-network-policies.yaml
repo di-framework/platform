@@ -56,6 +56,28 @@
 - metadata:
     labels:
       app.kubernetes.io/managed-by: platform-operator
+    name: platform-operator-allow-platform-nats
+    namespace: NS
+  spec:
+    ingress:
+      - from:
+          - podSelector:
+              matchLabels:
+                vcluster.loft.sh/managed-by: vcluster
+                vcluster.loft.sh/namespace: wasmcloud
+        ports:
+          - port: 4222
+            protocol: TCP
+    podSelector:
+      matchLabels:
+        vcluster.loft.sh/managed-by: vcluster
+        vcluster.loft.sh/namespace: wasmcloud
+        wasmcloud.com/name: nats
+    policyTypes:
+      - Ingress
+- metadata:
+    labels:
+      app.kubernetes.io/managed-by: platform-operator
     name: platform-operator-allow-issuer
     namespace: NS
   spec:

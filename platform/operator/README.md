@@ -294,6 +294,11 @@ these NetworkPolicies in every instance host namespace (`pi-<namespace>-<name>-<
   port 8443, which serves both the API (`svc/vcluster:443`) and the kubelet port (10250) of the
   `vcluster-node-*` Services;
 - `platform-operator-allow-dns`: the instance's synced pods get in to its CoreDNS on 53 (UDP and TCP);
+- `platform-operator-allow-platform-nats`: pods of the instance's `wasmcloud` namespace get in to its NATS
+  (`wasmcloud.com/name=nats`) on 4222. The platform creates its own NATS policies only after the wasmcloud Helm
+  release, which waits for `hostgroup-default` and `runtime-operator`, and those need NATS; without this rule a
+  fresh install never becomes Ready. Both sides are selected by `vcluster.loft.sh/namespace`, which the syncer
+  sets from the pod's real namespace;
 - `platform-operator-allow-issuer`, only while `tenantAuth.issuerUpstream` is set: the platform's tenant-auth
   pods (`platform.di-framework.dev/component=tenant-auth`) get in to the pods of the namespace `issuerUpstream`
   names, on its port and on `issuerUpstreamPodPort`, which the platform opens on the egress side. The syncer
@@ -326,17 +331,10 @@ What this isolates:
   other instance either.
 - Inside the instance, the operator lets pods reach only DNS, the API and the issuer, plus the control plane's
   own calls. The platform's synced policies decide the rest, so a pod in a namespace that is neither the
-  platform's nor a tenant's can't reach the gateway, a tenant's host group (`di-tenant-gateway`) or NATS,
-  unless it forges labels (see #540 below).
+  platform's nor a tenant's can't reach the gateway, a tenant's host group (`di-tenant-gateway`) or NATS.
 
 What it doesn't:
 
-- **Forged labels against the platform's tenant-namespace peers** (#540). On the vCluster target, vCluster
-  translates the platform's synced `namespaceSelector`s into pod-label selectors on
-  `vcluster.loft.sh/ns-label-*` keys, and copies such labels from a virtual pod that sets them on itself. Until
-  #540 is fixed, a pod inside the instance that can set arbitrary labels can match the platform's
-  tenant-namespace peers (for example `di-platform-gateway` and `di-platform-nats`). Peers named by
-  `kubernetes.io/metadata.name`, such as `di-tenant-gateway` for the tenant host groups, are not affected.
 - **Egress** is not restricted here; it stays as the platform's synced policies set it (DNS to the instance's
   CoreDNS on 53 among it).
 - **Pods inside the instance that no policy admits.** The default deny selects every pod of the instance. A pod in

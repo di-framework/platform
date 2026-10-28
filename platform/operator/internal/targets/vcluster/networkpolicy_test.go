@@ -56,8 +56,8 @@ func policyNames(policies []*networkingv1.NetworkPolicy) []string {
 // The issuer policy exists only with an issuerUpstream, and every narrow allow comes before the
 // same-namespace policy, so narrowing an old broad one never drops DNS or the API.
 func TestNetworkPolicyOrder(t *testing.T) {
-	base := []string{PolicyDenyIngress, PolicyControlPlane, PolicyDNS, PolicySameNamespace, PolicyOperator}
-	withIssuer := []string{PolicyDenyIngress, PolicyControlPlane, PolicyDNS, PolicyIssuer, PolicySameNamespace, PolicyOperator}
+	base := []string{PolicyDenyIngress, PolicyControlPlane, PolicyDNS, PolicyPlatformNATS, PolicySameNamespace, PolicyOperator}
+	withIssuer := []string{PolicyDenyIngress, PolicyControlPlane, PolicyDNS, PolicyPlatformNATS, PolicyIssuer, PolicySameNamespace, PolicyOperator}
 	for _, tc := range []struct {
 		name string
 		auth *v1alpha1.TenantAuth
@@ -124,13 +124,15 @@ var (
 	probePod        = synced("l4-probe", nil)
 	// spoofedPod copies the control plane's labels. A real synced pod can't keep release=vcluster
 	// (the syncer rewrites it), so this is stricter than a cluster allows.
-	spoofedPod    = synced("l4-probe", map[string]string{"app": "vcluster", "release": "vcluster", "k8s-app": "kube-dns"})
-	tenantAuthPod = synced("di-runtime-a", map[string]string{"app": "tenant-console", labelComponent: "tenant-auth"})
-	gatewayPod    = synced("wasmcloud", map[string]string{"app": "di-platform-gateway"})
-	natsPod       = synced("wasmcloud", map[string]string{"wasmcloud.com/name": "nats"})
-	tenantHostPod = synced("di-runtime-a", map[string]string{"wasmcloud.com/name": "hostgroup", "wasmcloud.com/hostgroup": "tenant-a"})
-	coreDNSPod    = synced("kube-system", map[string]string{"k8s-app": "kube-dns"})
-	issuerPod     = synced("pg-stub-oidc", map[string]string{"app": "stub-oidc"})
+	spoofedPod      = synced("l4-probe", map[string]string{"app": "vcluster", "release": "vcluster", "k8s-app": "kube-dns"})
+	tenantAuthPod   = synced("di-runtime-a", map[string]string{"app": "tenant-console", labelComponent: "tenant-auth"})
+	gatewayPod      = synced("wasmcloud", map[string]string{"app": "di-platform-gateway"})
+	natsPod         = synced("wasmcloud", map[string]string{"wasmcloud.com/name": "nats"})
+	platformHostPod = synced("wasmcloud", map[string]string{"wasmcloud.com/name": "hostgroup", "wasmcloud.com/hostgroup": "default"})
+	runtimeOpPod    = synced("wasmcloud", map[string]string{"wasmcloud.com/name": "runtime-operator"})
+	tenantHostPod   = synced("di-runtime-a", map[string]string{"wasmcloud.com/name": "hostgroup", "wasmcloud.com/hostgroup": "tenant-a"})
+	coreDNSPod      = synced("kube-system", map[string]string{"k8s-app": "kube-dns"})
+	issuerPod       = synced("pg-stub-oidc", map[string]string{"app": "stub-oidc"})
 	// forgedAuthPod sets the tenant-auth component label on itself, which the syncer copies.
 	forgedAuthPod = synced("l4-probe", map[string]string{labelComponent: "tenant-auth"})
 )
@@ -198,6 +200,11 @@ func TestNetworkPoliciesInsideTheInstance(t *testing.T) {
 		{"control plane to tenant host", controlPlanePod, tenantHostPod, []string{"*"}},
 		{"control plane to itself", controlPlanePod, controlPlanePod, []string{"*"}},
 		{"tenant host to NATS", tenantHostPod, natsPod, nil},
+		{"platform host group to NATS (fresh install)", platformHostPod, natsPod, []string{"TCP/4222"}},
+		{"runtime-operator to NATS (fresh install)", runtimeOpPod, natsPod, []string{"TCP/4222"}},
+		{"gateway to NATS", gatewayPod, natsPod, []string{"TCP/4222"}},
+		{"platform host group to tenant host", platformHostPod, tenantHostPod, nil},
+		{"forged NATS label in l4-probe to NATS", synced("l4-probe", map[string]string{"wasmcloud.com/name": "nats"}), natsPod, nil},
 		{"gateway to tenant host", gatewayPod, tenantHostPod, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -246,7 +253,7 @@ func TestEnsureOwnsTheHostNetworkPolicies(t *testing.T) {
 		t.Fatal(err)
 	}
 	var list networkingv1.NetworkPolicyList
-	if err := c.List(ctx, &list, client.InNamespace(ns)); err != nil || len(list.Items) != 5 {
+	if err := c.List(ctx, &list, client.InNamespace(ns)); err != nil || len(list.Items) != 6 {
 		t.Fatalf("policies in %s: %d %v", ns, len(list.Items), err)
 	}
 	same := policy(t, c, ns, PolicySameNamespace)
@@ -313,7 +320,7 @@ func TestEnsureNarrowsAnOldSameNamespacePolicyInPlace(t *testing.T) {
 		t.Fatalf("same-namespace policy not narrowed in place: uid %s labels %v spec %+v", got.UID, got.Labels, got.Spec)
 	}
 	wantWrites := []string{
-		"create " + PolicyDenyIngress, "create " + PolicyControlPlane, "create " + PolicyDNS, "create " + PolicyIssuer,
+		"create " + PolicyDenyIngress, "create " + PolicyControlPlane, "create " + PolicyDNS, "create " + PolicyPlatformNATS, "create " + PolicyIssuer,
 		"update " + PolicySameNamespace, "create " + PolicyOperator,
 	}
 	if !slices.Equal(writes, wantWrites) {

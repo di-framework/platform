@@ -32,6 +32,11 @@ const (
 	PolicyControlPlane = "platform-operator-allow-control-plane"
 	// PolicyDNS admits the instance's synced pods to its CoreDNS on 53.
 	PolicyDNS = "platform-operator-allow-dns"
+	// PolicyPlatformNATS admits the pods of the instance's platform namespace to its NATS on 4222.
+	// The platform creates its own NATS policies only after the wasmcloud Helm release, which
+	// waits for hostgroup-default and runtime-operator, and those need NATS: without this a fresh
+	// install never becomes Ready (#535).
+	PolicyPlatformNATS = "platform-operator-allow-platform-nats"
 	// PolicyIssuer admits the instance's tenant-auth pods to the pods of the namespace
 	// spec.tenantAuth.issuerUpstream names, on its ports. Only with an issuerUpstream.
 	PolicyIssuer = "platform-operator-allow-issuer"
@@ -48,6 +53,9 @@ const (
 // the vcluster-node-* Services' 10250.
 const vclusterAPIPort = 8443
 
+// natsPort is the NATS client port of the runtime-operator chart's nats Deployment.
+const natsPort = 4222
+
 // Labels of the vCluster 0.37.3 chart and syncer. The chart labels the control plane's pods
 // app=vcluster,release=<release> (templates/statefulset.yaml) and its own optional policies
 // select the synced pods by vcluster.loft.sh/managed-by=<release> (templates/networkpolicy.yaml).
@@ -61,6 +69,9 @@ const (
 	// labelComponent is the platform's component label; its tenant-auth pods carry
 	// component=tenant-auth and are the ones whose egress reaches the issuerUpstream.
 	labelComponent = "platform.di-framework.dev/component"
+	// labelWasmcloudName is the runtime-operator chart's (2.8.0) pod label; its NATS pods carry
+	// wasmcloud.com/name=nats (templates/nats/deployment.yaml).
+	labelWasmcloudName = "wasmcloud.com/name"
 	// platformNamespacePrefix starts every namespace the platform creates for its tenants and
 	// their backing services (di-tenant-*, di-runtime-*, di-apikeys-*, di-bs-*, ...).
 	platformNamespacePrefix = "di-"
@@ -162,6 +173,9 @@ func NetworkPolicies(hostNamespace, operatorNamespace string, auth *v1alpha1.Ten
 		}),
 		allow(PolicyDNS, syncedPods(map[string]string{"k8s-app": "kube-dns", labelVirtualNamespace: "kube-system"}), networkingv1.NetworkPolicyIngressRule{
 			From: from(syncedPods(nil)), Ports: append(ports(corev1.ProtocolUDP, 53), ports(corev1.ProtocolTCP, 53)...),
+		}),
+		allow(PolicyPlatformNATS, syncedPods(map[string]string{labelVirtualNamespace: targets.PlatformNamespace, labelWasmcloudName: "nats"}), networkingv1.NetworkPolicyIngressRule{
+			From: from(syncedPods(map[string]string{labelVirtualNamespace: targets.PlatformNamespace})), Ports: ports(corev1.ProtocolTCP, natsPort),
 		}),
 	}
 	if ns, issuerPorts, ok := issuerUpstream(auth); ok && issuerNamespaceOpenable(ns) {
