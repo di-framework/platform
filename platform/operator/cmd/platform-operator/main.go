@@ -133,8 +133,10 @@ func run() error {
 		// Namespace reads go there too, so the host namespace owner check never sees a stale copy,
 		// and so do the storage cleanup Job reads, which the operator polls instead of watching,
 		// and the host-namespace NetworkPolicy reads, so the cache never holds every policy.
+		// The watch on host namespaces (#490) caches only those, by their label.
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
-			&corev1.Secret{}: {Label: labels.SelectorFromSet(controller.ManagedLabels)},
+			&corev1.Secret{}:    {Label: labels.SelectorFromSet(controller.ManagedLabels)},
+			&corev1.Namespace{}: {Label: labels.SelectorFromSet(map[string]string{vcluster.HostNamespaceLabel: "true"})},
 		}},
 		Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}, &corev1.Service{}, &corev1.Namespace{}, &batchv1.Job{}, &corev1.Pod{}, &networkingv1.NetworkPolicy{},
 			&admissionregistrationv1.ValidatingAdmissionPolicy{}, &admissionregistrationv1.ValidatingAdmissionPolicyBinding{}}}},

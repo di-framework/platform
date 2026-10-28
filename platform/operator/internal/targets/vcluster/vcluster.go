@@ -164,9 +164,12 @@ func (t *Target) ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 			t.resetFailures(ns)
 		}
 	}()
-	if err := t.claimNamespace(ctx, inst, ns); err != nil {
-		return targets.State{}, err
+	if st, stop, err := t.claimNamespace(ctx, inst, ns); stop || err != nil {
+		return st, err
 	}
+	// A resync after the host namespace was deleted (#490) runs on the vCluster installed in the
+	// namespace created again; it reports Resyncing until that vCluster answers.
+	hostResync := inst.Status.Target.ResyncServiceUID == ResyncHostNamespace
 	if err := t.applyNetworkPolicies(ctx, ns); err != nil {
 		return targets.State{}, err
 	}
@@ -186,7 +189,11 @@ func (t *Target) ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 		if err := t.Helm.Install(ctx, ns, ReleaseName, chart, values); err != nil {
 			return targets.State{}, fmt.Errorf("install vcluster %s: %w", ChartVersion, err)
 		}
-		return targets.State{Reason: "Creating", Message: fmt.Sprintf("installed vcluster %s in namespace %s", ChartVersion, ns)}, nil
+		msg := fmt.Sprintf("installed vcluster %s in namespace %s", ChartVersion, ns)
+		if hostResync {
+			return targets.State{Reason: ReasonResyncing, Message: "resyncing: host namespace was deleted; " + msg}, nil
+		}
+		return targets.State{Reason: "Creating", Message: msg}, nil
 	}
 	if rel.Status != "deployed" && rel.Status != "pending-install" && rel.Revision > 1 {
 		// A repair (or rollback) that failed or was interrupted: the instance had a working
@@ -235,6 +242,13 @@ func (t *Target) ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 	}
 	sts := objs[0].(*appsv1.StatefulSet)
 	uid := string(objs[1].GetUID())
+	if hostResync && uid != "" {
+		// The vCluster is new, so there is nothing to restart: its syncer writes the kubeconfig
+		// Secret when it first starts. The resync goes on under its Service's uid, like one
+		// after an owner-Service delete.
+		return targets.State{Reason: ReasonResyncing, ResyncStarted: uid,
+			Message: fmt.Sprintf("resyncing: vcluster created again in host namespace %s (service uid %s); the platform is installed again once it answers", ns, uid)}, nil
+	}
 	// vCluster owns every object it syncs into the host namespace through service/vcluster
 	// (#466). A replaced Service means they were garbage-collected, and the syncer only
 	// regenerates its kubeconfig Secret when it starts: restart it, then reinstall the platform.
@@ -301,7 +315,26 @@ const (
 	// ReasonKubeconfigMissing: the kubeconfig Secret existed and was deleted; a restart
 	// recreates it.
 	ReasonKubeconfigMissing = "KubeconfigMissing"
+	// ReasonHostNamespaceDeleted: the host namespace of an instance that had a vCluster is
+	// terminating or gone, and with it the vCluster and its data (#490). The resync creates the
+	// namespace and the vCluster again once it is gone, and the platform is installed again.
+	ReasonHostNamespaceDeleted = "HostNamespaceDeleted"
+	// ReasonHostNamespaceTerminating: the host namespace of an instance that never had a
+	// vCluster is terminating; it is created again once it is gone.
+	ReasonHostNamespaceTerminating = "HostNamespaceTerminating"
 )
+
+// ResyncHostNamespace is the status.target.resyncServiceUID a resync after a host-namespace
+// delete starts with (#490). The vCluster that replaces the lost one has no Service yet; once it
+// has, the resync goes on under that Service's uid.
+const ResyncHostNamespace = "host-namespace-deleted"
+
+// hadTarget reports whether the instance had a vCluster: one that answered, or a platform
+// installed on one.
+func hadTarget(inst *v1alpha1.PlatformInstance) bool {
+	s := inst.Status
+	return s.Target.ServiceUID != "" || s.InstalledVersion != "" || s.KubeconfigSecretRef != nil
+}
 
 // resyncWaiting reports a resync waiting at stage; past ResyncTimeout it is TargetUnreachable.
 func (t *Target) resyncWaiting(inst *v1alpha1.PlatformInstance, stage string) targets.State {
@@ -377,11 +410,27 @@ func (t *Target) values(ctx context.Context, inst *v1alpha1.PlatformInstance) (m
 }
 
 // claimNamespace creates the host namespace annotated with its owner, or checks that an existing
-// one belongs to inst.
-func (t *Target) claimNamespace(ctx context.Context, inst *v1alpha1.PlatformInstance, ns string) error {
+// one belongs to inst. stop is set, with the state to report, while the namespace of an instance
+// that had a vCluster is terminating or gone (#490): nothing is created in a terminating
+// namespace, and a deleted one is created again only once the resync is recorded.
+func (t *Target) claimNamespace(ctx context.Context, inst *v1alpha1.PlatformInstance, ns string) (st targets.State, stop bool, err error) {
 	var namespace corev1.Namespace
-	err := t.Client.Get(ctx, types.NamespacedName{Name: ns}, &namespace)
-	if apierrors.IsNotFound(err) {
+	err = t.Client.Get(ctx, types.NamespacedName{Name: ns}, &namespace)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return targets.State{}, false, err
+	}
+	gone := err != nil
+	if !gone {
+		if err := checkOwner(inst, &namespace); err != nil {
+			return targets.State{}, false, err
+		}
+	}
+	if gone || namespace.DeletionTimestamp != nil {
+		if st, stop := t.hostNamespaceLost(inst, ns, gone); stop {
+			return st, true, nil
+		}
+	}
+	if gone {
 		namespace = corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
 			Name:        ns,
 			Labels:      map[string]string{"app.kubernetes.io/managed-by": "platform-operator", HostNamespaceLabel: "true"},
@@ -389,19 +438,18 @@ func (t *Target) claimNamespace(ctx context.Context, inst *v1alpha1.PlatformInst
 		}}
 		err = t.Client.Create(ctx, &namespace)
 		if !apierrors.IsAlreadyExists(err) {
-			return err
+			return targets.State{}, false, err
 		}
 		// Someone created it between the read and the create; it must still be ours.
-		err = t.Client.Get(ctx, types.NamespacedName{Name: ns}, &namespace)
-	}
-	if err != nil {
-		return err
-	}
-	if err := checkOwner(inst, &namespace); err != nil {
-		return err
+		if err := t.Client.Get(ctx, types.NamespacedName{Name: ns}, &namespace); err != nil {
+			return targets.State{}, false, err
+		}
+		if err := checkOwner(inst, &namespace); err != nil {
+			return targets.State{}, false, err
+		}
 	}
 	if namespace.Labels[HostNamespaceLabel] == "true" {
-		return nil
+		return targets.State{}, false, nil
 	}
 	// A namespace created before the label existed: the admission policy covers labelled ones.
 	base := namespace.DeepCopy()
@@ -409,7 +457,31 @@ func (t *Target) claimNamespace(ctx context.Context, inst *v1alpha1.PlatformInst
 		namespace.Labels = map[string]string{}
 	}
 	namespace.Labels[HostNamespaceLabel] = "true"
-	return t.Client.Patch(ctx, &namespace, client.MergeFrom(base))
+	return targets.State{}, false, t.Client.Patch(ctx, &namespace, client.MergeFrom(base))
+}
+
+// hostNamespaceLost decides what a terminating (gone false) or deleted (gone true) host namespace
+// means. For an instance that had a vCluster it starts a resync, like an owner-Service delete
+// (#490): the vCluster, its data and its CA are gone, so the controller drops the install state
+// that refers to them (TargetLost) and installs the platform again on the vCluster created in its
+// place. stop is false when the namespace is gone and may be created now.
+func (t *Target) hostNamespaceLost(inst *v1alpha1.PlatformInstance, ns string, gone bool) (targets.State, bool) {
+	what := "is terminating"
+	if gone {
+		what = "was deleted"
+	}
+	if hadTarget(inst) && inst.Status.Target.ResyncServiceUID != ResyncHostNamespace {
+		return targets.State{Reason: ReasonHostNamespaceDeleted, ResyncStarted: ResyncHostNamespace, TargetLost: true,
+			Message: fmt.Sprintf("host namespace %s %s, with the vcluster and its data; resyncing: the namespace and the vcluster are created again once it is gone, then the platform is installed again", ns, what)}, true
+	}
+	if gone {
+		return targets.State{}, false
+	}
+	stage := fmt.Sprintf("host namespace %s is terminating; it is created again once it is gone", ns)
+	if inst.Status.Target.ResyncServiceUID == ResyncHostNamespace {
+		return t.resyncWaiting(inst, stage), true
+	}
+	return targets.State{Reason: ReasonHostNamespaceTerminating, Message: stage}, true
 }
 
 func owner(inst *v1alpha1.PlatformInstance) string { return inst.Namespace + "/" + inst.Name }

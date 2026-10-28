@@ -11,21 +11,44 @@ import {
 
 // Runs the migration Job's script against a stubbed `nats` CLI and `sleep` (#388). nats-box runs
 // it with busybox sh, so the cases also run under `busybox sh` where the runner has busybox.
+// registry-nats-smoke.test.ts runs it against a real nats-server in the pinned image (#397).
 
 const PASSWORD = 'rSENTINELpasswordSENTINELpasswordSENTINEL0000';
 const REFUSED = 'nats: error: setup failed: nats: no servers available for connection';
+const DENIED = 'nats: error: setup failed: nats: Authorization Violation';
+/** What nats CLI 0.5.0 prints, exiting 1, for `kv get` on a bucket that does not exist. */
+const NO_BUCKET = 'nats: error: nats: bucket not found';
+/** What nats CLI 0.5.0 prints, exiting 1, for `kv get` on a key that does not exist. */
+const NO_KEY = 'nats: error: nats: key not found';
+const busybox = spawnSync('busybox', ['true']).error === undefined;
+
+/**
+ * Writes a `nats` stub running `body` (each call is logged to `calls` without its environment)
+ * and a `sleep` stub that only logs its delay to `sleeps`.
+ */
+function stubCli(dir: string, body: string) {
+  writeFileSync(join(dir, 'nats'), `#!/bin/sh\necho "$*" >> "${dir}/calls"\n${body}`);
+  writeFileSync(join(dir, 'sleep'), `#!/bin/sh\necho "$1" >> "${dir}/sleeps"\n`);
+  chmodSync(join(dir, 'nats'), 0o755);
+  chmodSync(join(dir, 'sleep'), 0o755);
+}
+
+/** The `account info` answer: the registry login lands in REGISTRY, anonymous ones in `anonymous`. */
+const accountInfo = (anonymous: string) => `  "account info")
+    if [ -n "$NATS_USER" ]; then account=REGISTRY; else account=${anonymous}; fi
+    echo "Account Information"
+    echo "                        Account: $account ($account)"
+    ;;`;
 
 /**
  * A `nats` stub: the first `refusals` connections fail like a pod whose network policy is not
  * programmed yet, then `account info` reports the account the login lands in and the marker
- * says the migration is complete. Every call is logged without its environment.
+ * says the migration is complete.
  */
 function stub(dir: string, refusals: number, anonymousAccount = 'TENANT', refusal = REFUSED) {
-  writeFileSync(
-    join(dir, 'nats'),
-    `#!/bin/sh
-echo "$*" >> "${dir}/calls"
-count=$(cat "${dir}/count" 2>/dev/null || echo 0)
+  stubCli(
+    dir,
+    `count=$(cat "${dir}/count" 2>/dev/null || echo 0)
 count=$((count + 1))
 echo "$count" > "${dir}/count"
 if [ "$count" -le ${refusals} ]; then
@@ -33,39 +56,40 @@ if [ "$count" -le ${refusals} ]; then
   exit 1
 fi
 case "$*" in
-  "account info")
-    if [ -n "$NATS_USER" ]; then account=REGISTRY; else account=${anonymousAccount}; fi
-    echo "Account Information"
-    echo "                        Account: $account ($account)"
-    ;;
+${accountInfo(anonymousAccount)}
   "stream ls --names") echo KV_di-platform-migrations ;;
   "kv get di-platform-migrations registry-object-store --raw") echo complete ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 `,
   );
-  writeFileSync(join(dir, 'sleep'), `#!/bin/sh\necho "$1" >> "${dir}/sleeps"\n`);
-  chmodSync(join(dir, 'nats'), 0o755);
-  chmodSync(join(dir, 'sleep'), 0o755);
 }
+
+/**
+ * A `nats` stub whose logins land in the right accounts at once; `cases` are further `case`
+ * branches on the arguments. Anything else fails as unexpected.
+ */
+const connected = (cases: string) => (dir: string) =>
+  stubCli(
+    dir,
+    `case "$*" in
+${accountInfo('TENANT')}
+${cases}
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+`,
+  );
 
 const dirs: string[] = [];
 afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-const DENIED = 'nats: error: setup failed: nats: Authorization Violation';
-const busybox = spawnSync('busybox', ['true']).error === undefined;
-
-function run(
-  refusals: number,
-  anonymousAccount?: string,
-  refusal?: string,
-  shell: string[] = ['bash', '-c'],
-) {
+/** Runs the migration script in `shell` with the stubs `prepare` writes into a fresh directory. */
+function runScript(prepare: (dir: string) => void, shell: string[] = ['bash', '-c']) {
   const dir = mkdtempSync(join(tmpdir(), 'registry-migrate-'));
   dirs.push(dir);
-  stub(dir, refusals, anonymousAccount, refusal);
+  prepare(dir);
   const child = spawnSync(shell[0] ?? 'bash', [...shell.slice(1), REGISTRY_NATS_MIGRATION_SCRIPT], {
     encoding: 'utf8',
     env: {
@@ -88,74 +112,60 @@ function run(
   };
 }
 
+function run(
+  refusals: number,
+  anonymousAccount?: string,
+  refusal?: string,
+  shell: string[] = ['bash', '-c'],
+) {
+  return runScript((dir) => stub(dir, refusals, anonymousAccount, refusal), shell);
+}
+
 describe('registry migration script: working directory fix (#391)', () => {
   it('fails immediately when nats CLI exits 1 on schema validation error', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'registry-migrate-'));
-    dirs.push(dir);
     const SCHEMA_ERROR =
       'nats: error: server response is not a valid "io.nats.jetstream.api.v1.stream_names_response" message: could not load schema {}\\n: stat .: permission denied';
-    writeFileSync(
-      join(dir, 'nats'),
-      `#!/bin/sh
-case "$*" in
-  "account info")
-    if [ -n "$NATS_USER" ]; then echo "Account Information"; echo "Account: REGISTRY (REGISTRY)"; else echo "Account Information"; echo "Account: TENANT (TENANT)"; fi
-    ;;
-  "stream ls --names") printf '%s\\n' '${SCHEMA_ERROR}' >&2; exit 1 ;;
-  *) echo "unexpected: $*" >&2; exit 2 ;;
-esac
-`,
+    const result = runScript(
+      connected(`  "stream ls --names") printf '%s\\n' '${SCHEMA_ERROR}' >&2; exit 1 ;;`),
     );
-    chmodSync(join(dir, 'nats'), 0o755);
-    const child = spawnSync('bash', ['-c', REGISTRY_NATS_MIGRATION_SCRIPT], {
-      encoding: 'utf8',
-      env: {
-        PATH: `${dir}:${process.env.PATH}`,
-        HOME: dir,
-        TMPDIR: dir,
-        NATS_URL: 'nats://di-nats.di-runtime-alpha.svc.cluster.local:4222',
-        REGISTRY_USER: 'registry',
-        REGISTRY_PASSWORD: PASSWORD,
-      },
-    });
-    expect(child.status).not.toBe(0);
-    expect(`${child.stdout}${child.stderr}`).toContain('could not load schema');
-    expect(`${child.stdout}${child.stderr}`).toContain('permission denied');
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('could not load schema');
+    expect(result.stderr).toContain('permission denied');
+    expect(result.calls.at(-1)).toBe('stream ls --names');
   });
 
   it('proceeds with migration when marker bucket does not exist on first run', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'registry-migrate-'));
-    dirs.push(dir);
-    writeFileSync(
-      join(dir, 'nats'),
-      `#!/bin/sh
-case "$*" in
-  "account info")
-    if [ -n "$NATS_USER" ]; then echo "Account Information"; echo "Account: REGISTRY (REGISTRY)"; else echo "Account Information"; echo "Account: TENANT (TENANT)"; fi
-    ;;
-  "stream ls --names") echo "" ;;
-  "object add oci-registry") ;;
+    // `kv get` is never asked on first run (no KV stream listed); if it were, it would fail like
+    // the real CLI on a missing bucket.
+    const result = runScript(
+      connected(`  "stream ls --names") echo "" ;;
+  "kv get di-platform-migrations registry-object-store --raw") echo "${NO_BUCKET}" >&2; exit 1 ;;
   "kv add di-platform-migrations") ;;
-  "kv put di-platform-migrations registry-object-store complete") ;;
-  *) echo "unexpected: $*" >&2; exit 2 ;;
-esac
-`,
+  "kv put di-platform-migrations registry-object-store complete") ;;`),
     );
-    chmodSync(join(dir, 'nats'), 0o755);
-    const child = spawnSync('bash', ['-c', REGISTRY_NATS_MIGRATION_SCRIPT], {
-      encoding: 'utf8',
-      env: {
-        PATH: `${dir}:${process.env.PATH}`,
-        HOME: dir,
-        TMPDIR: dir,
-        NATS_URL: 'nats://di-nats.di-runtime-alpha.svc.cluster.local:4222',
-        REGISTRY_USER: 'registry',
-        REGISTRY_PASSWORD: PASSWORD,
-      },
-    });
-    expect(child.status).toBe(0);
-    expect(child.stdout).toContain('registry migration: no source store');
-    expect(child.stdout).toContain('registry migration: complete');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('registry migration: no source store');
+    expect(result.stdout).toContain('registry migration: complete');
+    expect(result.calls).not.toContain('kv get di-platform-migrations registry-object-store --raw');
+    expect(result.calls).toContain('kv add di-platform-migrations');
+    expect(result.calls.at(-1)).toBe(
+      'kv put di-platform-migrations registry-object-store complete',
+    );
+    expect(`${result.stdout}${result.stderr}`).not.toContain(PASSWORD);
+  });
+
+  it('proceeds when the marker bucket exists but holds no marker yet', () => {
+    // A run that created the bucket but failed before `kv put`: `kv get` fails on the key.
+    const result = runScript(
+      connected(`  "stream ls --names") echo KV_di-platform-migrations ;;
+  "kv get di-platform-migrations registry-object-store --raw") echo "${NO_KEY}" >&2; exit 1 ;;
+  "kv put di-platform-migrations registry-object-store complete") ;;`),
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('registry migration: no source store');
+    expect(result.stdout).toContain('registry migration: complete');
+    expect(result.calls).toContain('kv get di-platform-migrations registry-object-store --raw');
+    expect(result.calls).not.toContain('kv add di-platform-migrations');
   });
 });
 

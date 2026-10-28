@@ -481,6 +481,8 @@ export interface components {
             createdAt: string;
             /** Format: date-time */
             readyAt?: string;
+            /** @description On a rollback, the id of the earlier deployment whose content this one restores. */
+            rollbackOf?: string;
         };
         DeploymentList: {
             items: components["schemas"]["Deployment"][];
@@ -736,6 +738,8 @@ export interface operations {
                         createdAt: string;
                         /** Format: date-time */
                         readyAt?: string;
+                        /** @description On a rollback, the id of the earlier deployment whose content this one restores. */
+                        rollbackOf?: string;
                     };
                 };
             };
@@ -937,6 +941,8 @@ export interface operations {
                         createdAt: string;
                         /** Format: date-time */
                         readyAt?: string;
+                        /** @description On a rollback, the id of the earlier deployment whose content this one restores. */
+                        rollbackOf?: string;
                     };
                 };
             };

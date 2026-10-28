@@ -3,7 +3,7 @@ import { X509Certificate } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { caPermittedDns, certificateNames } from '../../src/tenancy/tls';
+import { caConstraints, caPermittedDns, certificateNames } from '../../src/tenancy/tls';
 
 /**
  * The OpenSSL binary the tests run, by absolute path rather than through `PATH`: OpenSSL 3 on the
@@ -45,7 +45,8 @@ const PEM_CERTIFICATE = /-----BEGIN CERTIFICATE-----[^-]+-----END CERTIFICATE---
 
 /**
  * True when every DNS name `leaf` (PEM) carries lies within the permitted DNS subtrees of
- * `anchor`'s name constraints, or `anchor` has none (#365). `node:crypto` does not apply name
+ * `anchor`'s name constraints, and it names no IP address when those exclude them all (#381), or
+ * `anchor` has none (#365). `node:crypto` does not apply name
  * constraints (`X509Certificate.verify` checks only the signature, `checkIssued` only the issuer
  * link), so the helper checks them itself, matching names on its own rather than with the
  * production matcher; {@link opensslVerifies} checks the same paths with OpenSSL.
@@ -53,11 +54,12 @@ const PEM_CERTIFICATE = /-----BEGIN CERTIFICATE-----[^-]+-----END CERTIFICATE---
 export function withinNameConstraints(leaf: string, anchor: string): boolean {
   const permitted = caPermittedDns(anchor)?.map((base) => base.toLowerCase());
   const under = (dns: string, base: string) => dns === base || dns.endsWith(`.${base}`);
+  const names = certificateNames(leaf);
   return (
     !permitted ||
-    (certificateNames(leaf)?.dns ?? []).every((dns) =>
-      permitted.some((base) => under(dns.toLowerCase(), base)),
-    )
+    ((names?.dns ?? []).every((dns) => permitted.some((base) => under(dns.toLowerCase(), base))) &&
+      // An anchor that excludes every IP address admits no leaf naming one (#381).
+      !(caConstraints(anchor)?.excludesIps && names?.ips.length))
   );
 }
 

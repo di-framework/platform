@@ -1,8 +1,9 @@
 import { X509Certificate } from 'node:crypto';
 import {
+  type CaConstraints,
   type CertNames,
   caCertificate,
-  caPermittedDns,
+  caConstraints,
   certificateValid,
   holdsCaKey,
   type KeyPair,
@@ -37,11 +38,20 @@ export interface ControllerCas {
   previous?: string;
 }
 
-/** What a new tenant controller CA is: its subject and the only DNS names it permits (#365). */
+/**
+ * What a new tenant controller CA is: its subject, the only DNS names it permits (#365) and
+ * whether it permits IP addresses (#381).
+ */
 export interface CaProfile {
   commonName: string;
   /** The DNS names the serving leaf needs; the CA's name constraints permit exactly these. */
   dnsNames: string[];
+  /**
+   * The IP addresses the serving leaf needs (an IP-literal public URL). None or absent, the CA
+   * excludes every IP address; otherwise IP addresses are left unconstrained, since BoringSSL
+   * rejects a leaf that names one under any IP constraint (#381).
+   */
+  ipAddresses?: string[];
 }
 
 /** What is stored, each part possibly missing or unreadable. */
@@ -63,18 +73,30 @@ const usable = (stored: Partial<KeyPair> | undefined, now: Date): KeyPair | unde
 /** Days since `cert` was issued. */
 const ageDays = (cert: string, now: Date) =>
   (now.getTime() - new Date(new X509Certificate(cert).validFrom).getTime()) / DAY_MS;
-/** DNS names as one string, whatever their order or case; '' for none (an unconstrained CA). */
-const nameKey = (names: string[] | undefined) =>
-  names
-    ? JSON.stringify(
-        [...new Set(names.map((n) => n.toLowerCase()))].sort((a, b) => a.localeCompare(b)),
-      )
-    : '';
-/** The permitted DNS names of `ca` as one string ({@link nameKey}). */
-const permittedKey = (ca: string) => nameKey(caPermittedDns(ca));
 /**
- * True when `current` permits other names than `old` did (#365): `current` succeeded it because
- * the names changed, or `old` had no name constraints.
+ * Name constraints as one string: the DNS names whatever their order or case, and whether every
+ * IP address is excluded; '' for none (an unconstrained CA).
+ */
+const nameKey = (constraints: CaConstraints | undefined) =>
+  constraints
+    ? JSON.stringify([
+        [...new Set(constraints.dns.map((n) => n.toLowerCase()))].sort((a, b) =>
+          a.localeCompare(b),
+        ),
+        constraints.excludesIps,
+      ])
+    : '';
+/** The name constraints of `ca` as one string ({@link nameKey}). */
+const permittedKey = (ca: string) => nameKey(caConstraints(ca));
+/** True when a CA for `profile` excludes every IP address (#381). */
+const excludesIps = (profile: CaProfile) => !profile.ipAddresses?.length;
+/** The name constraints a CA for `profile` carries, as one string ({@link nameKey}). */
+const profileKey = (profile: CaProfile) =>
+  nameKey({ dns: profile.dnsNames, excludesIps: excludesIps(profile) });
+/**
+ * True when `current` permits other names than `old` did (#365, #381): `current` succeeded it
+ * because the names changed (or whether IP addresses are permitted), or `old` had no name
+ * constraints.
  */
 const renamed = (old: string, current: string) => permittedKey(old) !== permittedKey(current);
 /** True when `cert` is a CA certificate that has not expired (so it parses). */
@@ -126,8 +148,10 @@ const keptAsPrevious = (old: string | undefined, current: string, now: Date): ol
  * 3. **Retire.** `previous` leaves the bundle when it expires. No leaf it signed outlives it, so
  *    nothing still needs it.
  *
- * Every CA this creates permits only the DNS names `profile.dnsNames` (#365). A current CA that
- * permits other names, or has no name constraints (a CA from before #365), goes through the same
+ * Every CA this creates permits only the DNS names `profile.dnsNames` (#365) and, unless
+ * `profile.ipAddresses` names one, no IP address (#381). A current CA that permits other names,
+ * differs in whether it permits IP addresses (a CA from before #381), or has no name constraints
+ * (a CA from before #365), goes through the same
  * three steps at once, whatever its age: a successor for the names wanted now is published, and
  * switched to after the overlap. Until then the leaf keeps the names it had, so no host goes dark,
  * plus those wanted that the current CA permits ({@link leafNames}). A published successor for
@@ -145,7 +169,8 @@ const keptAsPrevious = (old: string | undefined, current: string, now: Date): ol
  * revoked (README, "CA rotation").
  */
 export function rotateCas(stored: StoredCas, profile: CaProfile, now: Date): ControllerCas {
-  const fresh = () => caCertificate(profile.commonName, CA_DAYS, now, profile.dnsNames);
+  const fresh = () =>
+    caCertificate(profile.commonName, CA_DAYS, now, profile.dnsNames, excludesIps(profile));
   const current = usable(stored.current, now);
   const next = usable(stored.next, now);
   if (!current) {
@@ -163,7 +188,7 @@ export function rotateCas(stored: StoredCas, profile: CaProfile, now: Date): Con
   };
   // A successor for names no longer wanted never signed, so it is dropped.
   const wanted = (ca: KeyPair | undefined) =>
-    ca && permittedKey(ca.cert) === nameKey(profile.dnsNames) ? ca : undefined;
+    ca && permittedKey(ca.cert) === profileKey(profile) ? ca : undefined;
   const renew = !wanted(current) || !certificateValid(current.cert, CA_RENEW_DAYS, now);
   return advance(cas, wanted(next) ?? (renew ? fresh() : undefined), fresh, now);
 }
@@ -190,6 +215,8 @@ function advance(
  * the names the current leaf `served` already carries, those the signing CA permits. Removed names
  * thus stay served until the switch (the CA that signs still permits them) and added ones are
  * served as soon as a CA that signs permits them. Without a successor the leaf names `wanted`.
+ * An IP address is kept only while the signing CA permits IP addresses: a leaf signed by a CA that
+ * excludes them (#381) names none, so `127.0.0.1` leaves the leaf at the switch to such a CA.
  */
 export function leafNames(cas: ControllerCas, wanted: CertNames, served?: CertNames): CertNames {
   const union = (a: string[], b: string[] = []) => [...new Set([...a, ...b])];
