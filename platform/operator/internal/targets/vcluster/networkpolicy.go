@@ -32,10 +32,12 @@ const (
 	PolicyControlPlane = "platform-operator-allow-control-plane"
 	// PolicyDNS admits the instance's synced pods to its CoreDNS on 53.
 	PolicyDNS = "platform-operator-allow-dns"
-	// PolicyPlatformNATS admits the pods of the instance's platform namespace to its NATS on 4222.
-	// The platform creates its own NATS policies only after the wasmcloud Helm release, which
-	// waits for hostgroup-default and runtime-operator, and those need NATS: without this a fresh
-	// install never becomes Ready (#535).
+	// PolicyPlatformNATS admits the host group and runtime-operator pods of the instance's
+	// platform namespace to its NATS on 4222. The platform creates its own NATS policies only
+	// after the wasmcloud Helm release, which waits for hostgroup-default and runtime-operator, and
+	// those need NATS: without this a fresh install never becomes Ready (#535). It admits a subset
+	// of what the platform's di-platform-nats admits (platform-ingress.ts), so it adds no NATS
+	// client once that policy exists.
 	PolicyPlatformNATS = "platform-operator-allow-platform-nats"
 	// PolicyIssuer admits the instance's tenant-auth pods to the pods of the namespace
 	// spec.tenantAuth.issuerUpstream names, on its ports. Only with an issuerUpstream.
@@ -69,11 +71,13 @@ const (
 	// labelComponent is the platform's component label; its tenant-auth pods carry
 	// component=tenant-auth and are the ones whose egress reaches the issuerUpstream.
 	labelComponent = "platform.di-framework.dev/component"
-	// labelWasmcloudName is the runtime-operator chart's (2.8.0) pod label; its NATS pods carry
-	// wasmcloud.com/name=nats (templates/nats/deployment.yaml).
+	// labelWasmcloudName is the runtime-operator chart's (2.8.0) pod label: wasmcloud.com/name=nats
+	// on its NATS pods (templates/nats/deployment.yaml), =hostgroup on its host group pods
+	// (templates/runtime/deployment.yaml) and =runtime-operator on the operator's
+	// (templates/operator/deployment.yaml).
 	labelWasmcloudName = "wasmcloud.com/name"
-	// platformNamespacePrefix starts every namespace the platform creates for its tenants and
-	// their backing services (di-tenant-*, di-runtime-*, di-apikeys-*, di-bs-*, ...).
+	// platformNamespacePrefix starts every namespace the platform creates for its tenants
+	// (di-tenant-*, di-runtime-*, di-apikeys-*, ...).
 	platformNamespacePrefix = "di-"
 )
 
@@ -97,6 +101,18 @@ func syncedPods(labels map[string]string) *metav1.LabelSelector {
 		match[k] = v
 	}
 	return &metav1.LabelSelector{MatchLabels: match}
+}
+
+// natsClientPods selects the platform namespace's host group and runtime-operator pods, the
+// platform-namespace NATS clients di-platform-nats admits. Only a pod of the platform namespace
+// carries vcluster.loft.sh/namespace=wasmcloud, so a wasmcloud.com/name forged elsewhere matches
+// nothing.
+func natsClientPods() *metav1.LabelSelector {
+	pods := syncedPods(map[string]string{labelVirtualNamespace: targets.PlatformNamespace})
+	pods.MatchExpressions = []metav1.LabelSelectorRequirement{
+		{Key: labelWasmcloudName, Operator: metav1.LabelSelectorOpIn, Values: []string{"hostgroup", "runtime-operator"}},
+	}
+	return pods
 }
 
 // ports lists the ports of one protocol.
@@ -175,7 +191,7 @@ func NetworkPolicies(hostNamespace, operatorNamespace string, auth *v1alpha1.Ten
 			From: from(syncedPods(nil)), Ports: append(ports(corev1.ProtocolUDP, 53), ports(corev1.ProtocolTCP, 53)...),
 		}),
 		allow(PolicyPlatformNATS, syncedPods(map[string]string{labelVirtualNamespace: targets.PlatformNamespace, labelWasmcloudName: "nats"}), networkingv1.NetworkPolicyIngressRule{
-			From: from(syncedPods(map[string]string{labelVirtualNamespace: targets.PlatformNamespace})), Ports: ports(corev1.ProtocolTCP, natsPort),
+			From: from(natsClientPods()), Ports: ports(corev1.ProtocolTCP, natsPort),
 		}),
 	}
 	if ns, issuerPorts, ok := issuerUpstream(auth); ok && issuerNamespaceOpenable(ns) {

@@ -62,6 +62,12 @@
     ingress:
       - from:
           - podSelector:
+              matchExpressions:
+                - key: wasmcloud.com/name
+                  operator: In
+                  values:
+                    - hostgroup
+                    - runtime-operator
               matchLabels:
                 vcluster.loft.sh/managed-by: vcluster
                 vcluster.loft.sh/namespace: wasmcloud

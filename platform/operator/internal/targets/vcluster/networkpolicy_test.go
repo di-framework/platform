@@ -127,6 +127,7 @@ var (
 	spoofedPod      = synced("l4-probe", map[string]string{"app": "vcluster", "release": "vcluster", "k8s-app": "kube-dns"})
 	tenantAuthPod   = synced("di-runtime-a", map[string]string{"app": "tenant-console", labelComponent: "tenant-auth"})
 	gatewayPod      = synced("wasmcloud", map[string]string{"app": "di-platform-gateway"})
+	controllerPod   = synced("wasmcloud", map[string]string{"app": "di-platform-controller"})
 	natsPod         = synced("wasmcloud", map[string]string{"wasmcloud.com/name": "nats"})
 	platformHostPod = synced("wasmcloud", map[string]string{"wasmcloud.com/name": "hostgroup", "wasmcloud.com/hostgroup": "default"})
 	runtimeOpPod    = synced("wasmcloud", map[string]string{"wasmcloud.com/name": "runtime-operator"})
@@ -202,9 +203,12 @@ func TestNetworkPoliciesInsideTheInstance(t *testing.T) {
 		{"tenant host to NATS", tenantHostPod, natsPod, nil},
 		{"platform host group to NATS (fresh install)", platformHostPod, natsPod, []string{"TCP/4222"}},
 		{"runtime-operator to NATS (fresh install)", runtimeOpPod, natsPod, []string{"TCP/4222"}},
-		{"gateway to NATS", gatewayPod, natsPod, []string{"TCP/4222"}},
+		{"gateway to NATS (before the platform's policies)", gatewayPod, natsPod, nil},
+		{"platform controller to NATS (before the platform's policies)", controllerPod, natsPod, nil},
 		{"platform host group to tenant host", platformHostPod, tenantHostPod, nil},
 		{"forged NATS label in l4-probe to NATS", synced("l4-probe", map[string]string{"wasmcloud.com/name": "nats"}), natsPod, nil},
+		{"forged host group label in l4-probe to NATS", synced("l4-probe", map[string]string{"wasmcloud.com/name": "hostgroup"}), natsPod, nil},
+		{"forged runtime-operator label in l4-probe to NATS", synced("l4-probe", map[string]string{"wasmcloud.com/name": "runtime-operator"}), natsPod, nil},
 		{"gateway to tenant host", gatewayPod, tenantHostPod, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
