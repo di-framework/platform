@@ -27,6 +27,8 @@ export interface Termination {
   tool?: string;
   format?: string;
   error?: string;
+  /** The failing tool's own output (its last line), so an operator sees why it failed. */
+  detail?: string;
   /** Workload volumes (#232). */
   fileCount?: number;
   encfsKcv?: string;
@@ -335,8 +337,71 @@ async function execConnected(
  * Restores are not idempotent (a rerun appends again), so they never go through `execConnected`:
  * a read-only probe waits for the connection, then the restore runs exactly once.
  */
-async function probeConnected(io: AgentIo, argv: string[]): Promise<boolean> {
-  return (await execConnected(io, argv)).code === 0;
+async function probeConnected(io: AgentIo, argv: string[]): Promise<ExecResult> {
+  return execConnected(io, argv);
+}
+
+const DETAIL_LIMIT = 300;
+
+/** Code points, not UTF-16 units, so a cut never splits a surrogate pair. */
+function bound(line: string): string {
+  return Array.from(line).slice(0, DETAIL_LIMIT).join('');
+}
+
+/**
+ * The last line that carries a cause. Indented lines are continuations or hints (psql 18 follows
+ * `connection to server ... failed: Connection refused` with an indented "Is the server running"
+ * hint), so they are used only when nothing else was printed.
+ */
+function lastLine(text: string, keep: (line: string) => boolean = () => true): string | undefined {
+  const lines = text.split('\n').filter((line) => line.trim() && keep(line.trim()));
+  const cause = lines.filter((line) => !/^\s/.test(line)).at(-1) ?? lines.at(-1);
+  return cause?.trim();
+}
+
+/**
+ * How a step's output becomes {@link Termination.detail}. A step that sees tenant data must not
+ * copy it into the record, which ends up in the BackupRestore status:
+ * - `tool`: the last line, stderr first, then stdout (redis-cli reports connection errors there).
+ *   Probes, `tar` and `nats account restore`: hosts, stream and file names only.
+ * - `pg_restore`: only its own `pg_restore: ...` lines; `DETAIL:`/`CONTEXT:` lines can quote rows.
+ * - `redis-pipe`: the server's error replies echo the command's arguments (tenant keys and
+ *   values), so only the leading error code of stderr's last line plus stdout's
+ *   `errors: N, replies: M` summary.
+ * - `none`: nothing (rdb conversion, whose output can carry the data being converted).
+ */
+type DetailMode = 'tool' | 'pg_restore' | 'redis-pipe' | 'none';
+
+function toolDetail(
+  result: Pick<ExecResult, 'stdout' | 'stderr'>,
+  mode: DetailMode,
+): string | undefined {
+  let line: string | undefined;
+  if (mode === 'tool') line = lastLine(result.stderr) ?? lastLine(result.stdout);
+  else if (mode === 'pg_restore')
+    line = lastLine(result.stderr, (text) => text.startsWith('pg_restore:'));
+  else if (mode === 'redis-pipe') {
+    const code = lastLine(result.stderr)?.match(/^[A-Z]+(?=\s|$)/)?.[0];
+    const summary = lastLine(result.stdout, (text) => /^errors: \d+, replies: \d+$/.test(text));
+    line = [code, summary].filter(Boolean).join(' ') || undefined;
+  }
+  return line === undefined ? undefined : bound(line);
+}
+
+/**
+ * A restore step failed (#398). `RestorePrepareFailed`: the downloaded file could not be prepared
+ * (rdb conversion, tar) before the target was contacted. `TargetUnreachable`: the read-only probe
+ * never succeeded (unreachable, or the login was rejected). In both, nothing was written.
+ * `RestoreFailed`: the restore itself ran and failed, so the target may hold part of the data.
+ */
+function restoreError(
+  io: AgentIo,
+  request: AgentRequest,
+  error: 'RestorePrepareFailed' | 'TargetUnreachable' | 'RestoreFailed',
+  result: ExecResult,
+  mode: DetailMode = 'tool',
+): Promise<number> {
+  return finish(io, request.terminationLog, { ok: false, error, detail: toolDetail(result, mode) });
 }
 
 async function dumpPostgres(io: AgentIo, request: AgentRequest): Promise<number> {
@@ -533,7 +598,7 @@ async function restorePostgres(io: AgentIo, request: AgentRequest): Promise<numb
   const file = `${request.workdir}/data.dump`;
   const failed = await download(io, request, 'data.dump', file);
   if (failed !== undefined) return failed;
-  const reachable = await probeConnected(io, [
+  const probe = await probeConnected(io, [
     'psql',
     '-h',
     request.host,
@@ -546,7 +611,7 @@ async function restorePostgres(io: AgentIo, request: AgentRequest): Promise<numb
     '-c',
     'SELECT 1',
   ]);
-  if (!reachable) return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  if (probe.code !== 0) return restoreError(io, request, 'TargetUnreachable', probe);
   const result = await io.exec([
     'pg_restore',
     '-h',
@@ -561,8 +626,7 @@ async function restorePostgres(io: AgentIo, request: AgentRequest): Promise<numb
     '--no-acl',
     file,
   ]);
-  if (result.code !== 0)
-    return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  if (result.code !== 0) return restoreError(io, request, 'RestoreFailed', result, 'pg_restore');
   return finish(io, request.terminationLog, { ok: true, tool: 'pg_restore', format: 'custom' });
 }
 
@@ -572,11 +636,12 @@ async function restoreRedis(io: AgentIo, request: AgentRequest): Promise<number>
   const failed = await download(io, request, 'dump.rdb', rdb);
   if (failed !== undefined) return failed;
   const converted = await io.exec(['rdb', '--command', 'protocol', rdb]);
+  // No detail: rdb's output can carry the data being converted.
   if (converted.code !== 0)
-    return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+    return restoreError(io, request, 'RestorePrepareFailed', converted, 'none');
   await io.writeFile(resp, converted.stdout);
   await io.remove(rdb);
-  const reachable = await probeConnected(io, [
+  const probe = await probeConnected(io, [
     'redis-cli',
     '-h',
     request.host,
@@ -584,12 +649,11 @@ async function restoreRedis(io: AgentIo, request: AgentRequest): Promise<number>
     request.port,
     'PING',
   ]);
-  if (!reachable) return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  if (probe.code !== 0) return restoreError(io, request, 'TargetUnreachable', probe);
   const loaded = await io.exec(['redis-cli', '-h', request.host, '-p', request.port, '--pipe'], {
     input: converted.stdout,
   });
-  if (loaded.code !== 0)
-    return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  if (loaded.code !== 0) return restoreError(io, request, 'RestoreFailed', loaded, 'redis-pipe');
   return finish(io, request.terminationLog, { ok: true, tool: 'redis-cli', format: 'resp' });
 }
 
@@ -598,12 +662,11 @@ async function restoreNats(io: AgentIo, request: AgentRequest): Promise<number> 
   const failed = await download(io, request, 'js-backup.tar', archive);
   if (failed !== undefined) return failed;
   const extracted = await io.exec(['tar', '-C', request.workdir, '-xf', archive]);
-  if (extracted.code !== 0)
-    return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  if (extracted.code !== 0) return restoreError(io, request, 'RestorePrepareFailed', extracted);
   await io.remove(archive);
   const server = `${request.host}:${request.port}`;
-  const reachable = await probeConnected(io, ['nats', '--server', server, 'account', 'info']);
-  if (!reachable) return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  const probe = await probeConnected(io, ['nats', '--server', server, 'account', 'info']);
+  if (probe.code !== 0) return restoreError(io, request, 'TargetUnreachable', probe);
   const restored = await io.exec([
     'nats',
     '--server',
@@ -612,8 +675,7 @@ async function restoreNats(io: AgentIo, request: AgentRequest): Promise<number> 
     'restore',
     `${request.workdir}/js-backup`,
   ]);
-  if (restored.code !== 0)
-    return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  if (restored.code !== 0) return restoreError(io, request, 'RestoreFailed', restored);
   return finish(io, request.terminationLog, { ok: true, tool: 'nats', format: 'account-backup' });
 }
 

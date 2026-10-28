@@ -46,6 +46,17 @@ interface Result {
   tool?: string;
   format?: string;
   error?: string;
+  /** The failing tool's last line (backup agent restores, #398). */
+  detail?: string;
+}
+
+/**
+ * The agent's code (`RestorePrepareFailed`, `TargetUnreachable`: nothing written; `RestoreFailed`:
+ * the target may hold part of the data), with the tool's line.
+ */
+function restoreMessage(parsed: Result | undefined): string {
+  const error = parsed?.error ?? 'restore failed';
+  return parsed?.detail ? `${error}: ${parsed.detail}` : error;
 }
 
 function resultOf(message: string | undefined): Result | undefined {
@@ -326,7 +337,7 @@ function observe(world: World, actions: Action[]): void {
             ? {
                 phase: 'Failed',
                 reason: parsed?.error ?? 'RestoreFailed',
-                message: parsed?.error ?? 'restore failed',
+                message: restoreMessage(parsed),
               }
             : { phase: 'Succeeded', reason: 'Completed', message: 'restore completed' },
         });
