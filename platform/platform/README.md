@@ -501,22 +501,6 @@ that names an IP address under any IP address constraint. No rotation starts and
 change for such an install unless the URL changes, so logins to `https://127.0.0.1:8788` keep
 verifying.
 
-**Downgrading** to a package without this change after the switch breaks the controller's TLS: the
-older package always adds `127.0.0.1` to the leaf, which the CA then signing excludes, so every
-client rejects it. Downgrade before the switch, or replace the CA after the downgrade as for a
-revocation (see "Revoking a compromised CA").
-
-**Downgrading before the switch** keeps TLS intact, but the older package does not see the
-published successor as renamed: about every 30 days it replaces it with a fresh successor instead
-of switching, and each time the bundle changes, so the tenant hosts and console restart monthly.
-After such a downgrade, remove the successor from the CA Secret in the platform namespace (it has
-not signed anything, so nothing depends on it):
-
-```sh
-kubectl -n <platform-namespace> patch secret tenant-controller-ca-<tenant> --type=json \
-  -p '[{"op":"remove","path":"/data/next.crt"},{"op":"remove","path":"/data/next.key"}]'
-```
-
 #### Upgrading to API keys in their own namespace (#379)
 
 Tenant API keys move from `di-runtime-<tenant>` to a new namespace, `di-apikeys-<tenant>`, and the
