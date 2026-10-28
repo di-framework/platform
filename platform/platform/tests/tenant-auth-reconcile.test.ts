@@ -1766,6 +1766,51 @@ describe('reconcileTenant with tenant-auth', () => {
       }
     });
 
+  for (const [label, tenantAuth] of [
+    [
+      'an explicit 127.0.0.1 controller URL',
+      { ...auth, controllerPublicUrl: 'https://127.0.0.1:8788' },
+    ],
+    ['an explicit IPv4 controller URL', { ...auth, controllerPublicUrl: 'https://10.1.2.3:8788' }],
+    [
+      'an explicit IPv4 registry URL and no controller URL',
+      {
+        ...auth,
+        registry: {
+          component: `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}`,
+          publicUrl: 'https://10.1.2.3:8790',
+        },
+      },
+    ],
+  ] as [string, TenantAuthConfig][])
+    it(`upgrades main's CA and leaf with no rotation or reissue for ${label} (#381 C1)`, async () => {
+      const { api, pass } = rotationHarness();
+      const ipUrl: ControllerConfig = { ...cfg, tenantAuth };
+      await pass(0, ipUrl);
+      // Seed what main issues today: a #365 CA (DNS-constrained, IP addresses unconstrained)
+      // issued 100 days ago, serving a leaf that names 127.0.0.1 first plus any IPv4 literal.
+      const wanted = tenantControllerCertNames('alpha', tenantAuth);
+      const issued = new Date(new Date('2026-10-14T00:00:00Z').getTime() - 100 * 86_400_000);
+      const ca = caCertificate('tenant-controller CA', CA_DAYS, issued, wanted.dns);
+      const mainIps = [...new Set(['127.0.0.1', ...wanted.ips])];
+      const leaf = leafCertificate('x', wanted.dns, mainIps, 365, ca.cert, ca.key, issued);
+      api.objects.get(caKeyPath)!.data = { 'ca.crt': encode(ca.cert), 'ca.key': encode(ca.key) };
+      api.objects.get(tlsPath)!.data = {
+        'tls.crt': encode(leaf.cert),
+        'tls.key': encode(leaf.key),
+        'ca.crt': encode(ca.cert),
+      };
+      for (const day of [1, 100, 100 + CA_OVERLAP_DAYS + 1, 100 + 2 * CA_OVERLAP_DAYS + 1]) {
+        const later = await pass(day, ipUrl);
+        expect(later.keys['next.crt']).toBeUndefined();
+        expect(later.keys['previous.crt']).toBeUndefined();
+        expect(decode(later.keys, 'ca.crt')).toBe(ca.cert);
+        expect(later.leaf).toBe(leaf.cert);
+        expect(later.bundle).toBe(ca.cert);
+        expect(certificateNames(later.leaf)?.ips).toContain('127.0.0.1');
+      }
+    });
+
   const tenantAuthObjects = (api: MemoryApi) =>
     [...api.objects.values()].filter((r) => r.metadata.labels?.[COMPONENT] === 'tenant-auth');
 

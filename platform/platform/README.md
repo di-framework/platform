@@ -494,10 +494,10 @@ same steps as the #365 upgrade above:
 - **About day 60, retire.** The old CA leaves the bundle.
 
 **To keep an IP-literal URL**, set it explicitly (`tenantAuth.controllerPublicUrl` or
-`tenantAuth.registry.publicUrl`, as for the #128 upgrade; IPv4 or bracketed IPv6, such as
-`https://[fd00::1]:8788`): the leaf then names that address and, as before this version,
-`127.0.0.1`, and the CA leaves IP addresses unconstrained, since Bun's TLS client rejects a leaf
-that names an IP address under any IP address constraint. No rotation starts and the leaf does not
+`tenantAuth.registry.publicUrl`, as for the #128 upgrade; IPv6 literal URLs are not supported by
+Bun-based clients, which cannot verify an IPv6 address in a certificate): the leaf then names that
+address and, as before this version, `127.0.0.1`, and the CA leaves IP addresses unconstrained,
+since Bun's TLS client rejects a leaf that names an IP address under any IP address constraint. No rotation starts and the leaf does not
 change for such an install unless the URL changes, so logins to `https://127.0.0.1:8788` keep
 verifying.
 
