@@ -698,7 +698,11 @@ export class Controller {
     const wanted = tenantControllerCertNames(name, auth);
     const cas = rotateCas(
       stored,
-      { commonName: `tenant-controller CA (${runtimeNamespace})`, dnsNames: wanted.dns },
+      {
+        commonName: `tenant-controller CA (${runtimeNamespace})`,
+        dnsNames: wanted.dns,
+        ipAddresses: wanted.ips,
+      },
       now,
     );
     const ca = {
