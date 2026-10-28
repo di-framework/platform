@@ -288,9 +288,24 @@ func (t *Target) ensure(ctx context.Context, inst *v1alpha1.PlatformInstance) (t
 		return targets.State{}, err
 	}
 	// The restarted syncer wrote its Secret: whatever restart the mark records has taken effect,
-	// and a later loss is a new one (#503).
-	if err := t.clearRestartMark(ctx, namespace); err != nil {
-		return targets.State{}, err
+	// and a later loss is a new one (#503). Clear only once the pod running is not the one the mark
+	// names, for this Service, so a Secret that predates the restart never drops the guard.
+	if markUID, markPod, ok := restartMark(namespace); ok && markUID == uid {
+		var pod corev1.Pod
+		err := t.Client.Get(ctx, types.NamespacedName{Namespace: ns, Name: ReleaseName + "-0"}, &pod)
+		if client.IgnoreNotFound(err) != nil {
+			return targets.State{}, fmt.Errorf("look up %s/%s-0: %w", ns, ReleaseName, err)
+		}
+		if err == nil && string(pod.UID) != markPod {
+			if err := t.clearRestartMark(ctx, namespace); err != nil {
+				return targets.State{}, err
+			}
+		}
+	} else if ok {
+		// A mark for a Service that is gone: it guards nothing.
+		if err := t.clearRestartMark(ctx, namespace); err != nil {
+			return targets.State{}, err
+		}
 	}
 	raw := secret.Data["config"]
 	if len(raw) == 0 {

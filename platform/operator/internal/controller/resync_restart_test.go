@@ -102,3 +102,85 @@ func TestResyncStartPatchFailureRestartsOnce(t *testing.T) {
 		t.Fatalf("restart mark left after the resync: %q", n.Annotations[vcluster.RestartAnnotation])
 	}
 }
+
+// The Service-replaced resync with the old kubeconfig Secret still present, and the status patch
+// failing for several rounds after the delete (#517 review): no round may clear the restart mark
+// before the restart is recorded, so the restarted pod is never deleted a second time.
+func TestResyncUnrecordedWithOldSecretRestartsOnce(t *testing.T) {
+	h := newNSHarness(t, "")
+	h.installed()
+	ns := h.ns()
+	ctx := context.Background()
+	podKey := client.ObjectKey{Namespace: ns, Name: vcluster.ReleaseName + "-0"}
+	var pod corev1.Pod
+	if err := h.c.Get(ctx, podKey, &pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.UID = "pod-uid-1"
+	if err := h.c.Update(ctx, &pod); err != nil {
+		t.Fatal(err)
+	}
+	var secret corev1.Secret
+	if err := h.c.Get(ctx, client.ObjectKey{Namespace: ns, Name: "vc-" + vcluster.ReleaseName}, &secret); err != nil {
+		t.Fatalf("the old kubeconfig Secret must be present for this sequence: %v", err)
+	}
+
+	restarts, failPatches := 0, 0
+	c := interceptor.NewClient(h.c.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if err := c.Delete(ctx, obj, opts...); err != nil {
+				return err
+			}
+			if _, ok := obj.(*corev1.Pod); ok {
+				restarts++
+				if restarts == 1 {
+					failPatches = 3
+				}
+				return c.Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+					Namespace: podKey.Namespace, Name: podKey.Name, UID: types.UID(fmt.Sprintf("pod-uid-%d", restarts+1))}})
+			}
+			return nil
+		},
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, p client.Patch, opts ...client.SubResourcePatchOption) error {
+			if failPatches > 0 && sub == "status" {
+				failPatches--
+				return errors.New("etcdserver: request timed out")
+			}
+			return c.SubResource(sub).Patch(ctx, obj, p, opts...)
+		},
+	})
+	h.r.Client, h.r.APIReader = c, c
+	h.r.Target.(*vcluster.Target).Client = c
+
+	var svc corev1.Service
+	if err := h.c.Get(ctx, client.ObjectKey{Namespace: ns, Name: vcluster.ReleaseName}, &svc); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.c.Delete(ctx, &svc); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.c.Create(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: vcluster.ReleaseName, UID: "svc-uid-new"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range 3 {
+		h.step()
+		if restarts != 1 || h.get().Status.Target.ResyncServiceUID != "" {
+			t.Fatalf("round %d with a failed status patch: %d restarts, target %+v", i+1, restarts, h.get().Status.Target)
+		}
+		if n := h.namespace(ns); n.Annotations[vcluster.RestartAnnotation] == "" {
+			t.Fatalf("round %d cleared the restart mark before the resync was recorded", i+1)
+		}
+	}
+	for range 6 {
+		h.step()
+	}
+	inst := h.get()
+	if restarts != 1 || len(h.in.installs) != 2 || !meta.IsStatusConditionTrue(inst.Status.Conditions, v1alpha1.ConditionReady) ||
+		inst.Status.Target != (v1alpha1.TargetStatus{ServiceUID: "svc-uid-new"}) {
+		t.Fatalf("after the resync: %d restarts, %d installs, errors %v, status %+v", restarts, len(h.in.installs), h.errs, inst.Status)
+	}
+	if n := h.namespace(ns); n.Annotations[vcluster.RestartAnnotation] != "" {
+		t.Fatalf("restart mark left after the resync: %q", n.Annotations[vcluster.RestartAnnotation])
+	}
+}
