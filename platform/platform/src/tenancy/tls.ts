@@ -82,21 +82,28 @@ const keyUsage = (...bits: number[]) => {
 };
 const NAME_CONSTRAINTS = '2.5.29.30';
 /**
+ * The excluded IP address subtrees that cover every address (#381): `0.0.0.0/0` and `::/0`, each
+ * written as RFC 5280 §4.2.1.10 says (the address, then the mask, both all zero).
+ */
+const EVERY_IP = [Buffer.alloc(8), Buffer.alloc(32)];
+/**
  * A critical (RFC 5280 §4.2.1.10) nameConstraints extension whose permitted subtrees are exactly
  * the DNS names `permittedDns`. A DNS subtree also admits names below it (`a.localhost` under
- * `localhost`). IP addresses are left unconstrained: BoringSSL (Bun's TLS client) rejects every
- * chain in which an IP address SAN meets an IP address constraint, and the controller's leaf names
- * `127.0.0.1`.
+ * `localhost`). With `excludeIps` its excluded subtrees cover every IPv4 and IPv6 address, so no
+ * certificate it signs may name one (#381). Without it IP addresses are left unconstrained:
+ * BoringSSL (Bun's TLS client) rejects every chain in which an IP address SAN meets an IP address
+ * constraint, so a CA whose leaf must name an IP address cannot constrain them at all.
  */
-const nameConstraints = (permittedDns: string[]) => {
+const nameConstraints = (permittedDns: string[], excludeIps: boolean) => {
   if (permittedDns.length === 0) throw new Error('name constraints need a permitted DNS name');
   // An empty subtree permits every name and a leading-dot one only subdomains (RFC 5280); neither
   // is a leaf name, and clients disagree on the latter, so they are never written.
   const odd = permittedDns.find((dns) => dns === '' || dns.startsWith('.'));
   if (odd !== undefined) throw new Error(`not a permitted DNS name: '${odd}'`);
+  const excluded = excludeIps ? [der(0xa1, ...EVERY_IP.map((ip) => seq(der(0x87, ip))))] : [];
   return extension(
     NAME_CONSTRAINTS,
-    seq(der(0xa0, ...permittedDns.map((dns) => seq(der(0x82, Buffer.from(dns)))))),
+    seq(der(0xa0, ...permittedDns.map((dns) => seq(der(0x82, Buffer.from(dns))))), ...excluded),
     true,
   );
 };
@@ -205,29 +212,39 @@ function selfIssued(
  * A P-256 certificate authority: a self-signed certificate that may only sign end-entity
  * certificates (`CA:TRUE, pathlen:0`, keyUsage `keyCertSign, cRLSign`, an SKI) and carries no SANs.
  * With `permittedDns`, a critical nameConstraints extension limits the DNS names any certificate
- * it signs may carry to those and the names below them (#365).
+ * it signs may carry to those and the names below them (#365); with `excludeIps` too, it may sign
+ * no certificate that names an IP address (#381).
  */
 export function caCertificate(
   commonName: string,
   days: number,
   now: Date = new Date(),
   permittedDns?: string[],
+  excludeIps = false,
 ): KeyPair {
   return selfIssued(commonName, days, now, (publicKey) => [
     extension('2.5.29.19', seq(BOOLEAN_TRUE, der(0x02, Buffer.from([0]))), true),
     keyUsage(5, 6),
     subjectKeyId(publicKey),
-    ...(permittedDns ? [nameConstraints(permittedDns)] : []),
+    ...(permittedDns ? [nameConstraints(permittedDns, excludeIps)] : []),
   ]);
 }
 
+/** What a CA's name constraints allow, as far as {@link caCertificate} writes them. */
+export interface CaConstraints {
+  /** The permitted DNS subtrees. */
+  dns: string[];
+  /** True when every IPv4 and IPv6 address is excluded (#381). */
+  excludesIps: boolean;
+}
+
 /**
- * The permitted DNS subtrees of `ca`'s name constraints (#365); undefined when it has no name
- * constraints or does not parse, and none (`[]`, so it permits no DNS name) when the extension
- * itself does not parse. Only what {@link caCertificate} writes is read: other name forms and
- * excluded subtrees are ignored.
+ * The name constraints of `ca` (#365, #381); undefined when it has none or does not parse, and
+ * the narrowest reading (no DNS name, no IP address) when the extension itself does not parse.
+ * Only what {@link caCertificate} writes is read: other name forms, and excluded subtrees other
+ * than those covering every IP address, are ignored.
  */
-export function caPermittedDns(ca: string): string[] | undefined {
+export function caConstraints(ca: string): CaConstraints | undefined {
   let found: Buffer | undefined;
   try {
     const tbs = children(new X509Certificate(ca).raw)[0] as Buffer;
@@ -241,18 +258,31 @@ export function caPermittedDns(ca: string): string[] | undefined {
   }
   if (!found) return undefined;
   try {
-    const permitted = children(contents(children(found).at(-1) as Buffer)).filter(
-      (part) => part[0] === 0xa0,
-    );
-    return permitted
-      .flatMap((subtrees) => children(subtrees).map((subtree) => children(subtree)[0] as Buffer))
+    const parts = children(contents(children(found).at(-1) as Buffer));
+    // The base names of the permitted ([0]) or excluded ([1]) subtrees.
+    const bases = (tag: number) =>
+      parts
+        .filter((part) => part[0] === tag)
+        .flatMap((subtrees) => children(subtrees).map((subtree) => children(subtree)[0] as Buffer));
+    const dns = bases(0xa0)
       .filter((base) => base[0] === 0x82)
       .map((base) => contents(base).toString('latin1'));
+    const excludedIps = bases(0xa1)
+      .filter((base) => base[0] === 0x87)
+      .map(contents);
+    return { dns, excludesIps: EVERY_IP.every((ip) => excludedIps.some((x) => x.equals(ip))) };
   } catch {
     // Constrained, but not readably: fail closed.
-    return [];
+    return { dns: [], excludesIps: true };
   }
 }
+
+/**
+ * The permitted DNS subtrees of `ca`'s name constraints (#365); undefined when it has no name
+ * constraints or does not parse, and none (`[]`, so it permits no DNS name) when the extension
+ * itself does not parse ({@link caConstraints}).
+ */
+export const caPermittedDns = (ca: string): string[] | undefined => caConstraints(ca)?.dns;
 
 /**
  * True when the DNS name `dns` lies in the permitted subtree `subtree` (RFC 5280 §4.2.1.10),
@@ -268,15 +298,15 @@ export const inDnsSubtree = (dns: string, subtree: string): boolean => {
 
 /**
  * The part of `names` a certificate signed by `ca` may carry under its name constraints (#365):
- * the DNS names within its permitted subtrees, and every IP address (they are not constrained).
- * All of `names` when `ca` has no name constraints.
+ * the DNS names within its permitted subtrees, and every IP address unless it excludes them all
+ * (#381). All of `names` when `ca` has no name constraints.
  */
 export function namesPermittedBy(ca: string, names: CertNames): CertNames {
-  const permitted = caPermittedDns(ca);
-  if (!permitted) return names;
+  const constraints = caConstraints(ca);
+  if (!constraints) return names;
   return {
-    dns: names.dns.filter((dns) => permitted.some((base) => inDnsSubtree(dns, base))),
-    ips: names.ips,
+    dns: names.dns.filter((dns) => constraints.dns.some((base) => inDnsSubtree(dns, base))),
+    ips: constraints.excludesIps ? [] : names.ips,
   };
 }
 

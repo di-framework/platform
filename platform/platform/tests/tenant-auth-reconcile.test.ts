@@ -52,6 +52,7 @@ import {
 } from '../src/tenancy/resources';
 import {
   caCertificate,
+  caConstraints,
   caPermittedDns,
   certificateNames,
   certificateValid,
@@ -61,7 +62,7 @@ import {
   selfSignedCertificate,
   serialNumber,
 } from '../src/tenancy/tls';
-import { verifiesAt as verifies, withinNameConstraints } from './support/tls';
+import { opensslVerifies, verifiesAt as verifies, withinNameConstraints } from './support/tls';
 
 const IMAGE = `ghcr.io/di-framework/tenant-auth@sha256:${'a'.repeat(64)}`;
 const auth: TenantAuthConfig = {
@@ -358,7 +359,7 @@ describe('tenantAuthResources', () => {
       TENANT_CONSOLE_HOST: '0.0.0.0',
       TENANT_CONSOLE_CLIENT_ID: 'access',
       TENANT_CONSOLE_PUBLIC_URL: 'http://console.alpha.localhost:28180',
-      TENANT_CONSOLE_CONTROLLER_PUBLIC_URL: 'https://127.0.0.1:8788',
+      TENANT_CONSOLE_CONTROLLER_PUBLIC_URL: 'https://localhost:8788',
       TENANT_CONSOLE_CONTROLLER_URL: 'https://tenant-controller:8788',
     });
     expect(console.spec.template.spec.containers[0]!.env).toContainEqual({
@@ -717,7 +718,7 @@ describe('controller certificate', () => {
         'tenant-controller.di-runtime-alpha.svc.cluster.local',
         'localhost',
       ],
-      ips: ['127.0.0.1'],
+      ips: [],
     });
     expect(
       tenantControllerCertNames('alpha', {
@@ -728,7 +729,7 @@ describe('controller certificate', () => {
     expect(
       tenantControllerCertNames('alpha', { ...auth, controllerPublicUrl: 'https://10.1.2.3:8788' })
         .ips,
-    ).toEqual(['127.0.0.1', '10.1.2.3']);
+    ).toEqual(['10.1.2.3']);
     expect(
       tenantControllerCertNames('alpha', { ...auth, controllerPublicUrl: 'https://[::1]:8788' }),
     ).toEqual(tenantControllerCertNames('alpha'));
@@ -1678,6 +1679,51 @@ describe('reconcileTenant with tenant-auth', () => {
     overlaps(published, switched);
   });
 
+  it('drops 127.0.0.1 and rolls to a CA excluding IP addresses through the overlap (#381)', async () => {
+    const { pass, overlaps } = rotationHarness();
+    // Before #381 the leaf always named 127.0.0.1, so its CA left IP addresses unconstrained, as
+    // it still does for an explicit IP-literal public URL.
+    const ipUrl: ControllerConfig = {
+      ...cfg,
+      tenantAuth: { ...auth, controllerPublicUrl: 'https://127.0.0.1:8788' },
+    };
+    const sans = (leaf: string) => new X509Certificate(leaf).subjectAltName ?? '';
+    const before = await pass(0, ipUrl);
+    const a = decode(before.keys, 'ca.crt');
+    expect(caConstraints(a)?.excludesIps).toBe(false);
+    expect(sans(before.leaf)).toContain('IP Address:127.0.0.1');
+    // Publish: B excludes every IP address; A's leaf, with 127.0.0.1, is served until the switch.
+    const published = await pass(100);
+    expect(published.leaf).toBe(before.leaf);
+    const b = decode(published.keys, 'next.crt');
+    expect(caConstraints(b)).toEqual({
+      dns: tenantControllerCertNames('alpha', auth).dns,
+      excludesIps: true,
+    });
+    expect(published.bundle).toBe(a + b);
+    overlaps(before, published);
+    // Switch: B signs a leaf that names no IP address; the bundle bytes stay.
+    const switched = await pass(100 + CA_OVERLAP_DAYS + 1);
+    expect(issuedBy(b, switched.leaf, switched.leafKey)).toBe(true);
+    expect(sans(switched.leaf)).not.toContain('IP Address');
+    expect(switched.bundle).toBe(published.bundle);
+    overlaps(published, switched);
+    const retired = await pass(100 + 2 * CA_OVERLAP_DAYS + 1);
+    expect(retired.bundle).toBe(b);
+    overlaps(switched, retired);
+    // A leaf naming an IP address fails against B, independently of this repository's checks.
+    const ipLeaf = leafCertificate(
+      'x',
+      ['localhost'],
+      ['127.0.0.1'],
+      30,
+      b,
+      decode(retired.keys, 'ca.key'),
+      new Date('2027-03-01T00:00:00Z'),
+    );
+    expect(opensslVerifies(ipLeaf.cert, b, new Date('2027-03-02T00:00:00Z'))).toBe(false);
+  });
+
   const tenantAuthObjects = (api: MemoryApi) =>
     [...api.objects.values()].filter((r) => r.metadata.labels?.[COMPONENT] === 'tenant-auth');
 
@@ -2326,7 +2372,7 @@ describe('tenant registry (#83:reconcile)', () => {
     );
     expect(
       tenantRegistryPublicUrl('alpha', { ...auth, registry: { component: COMPONENT_REF } }),
-    ).toBe('https://127.0.0.1:8790');
+    ).toBe('https://localhost:8790');
   });
 
   it('renders the registry workload, the whoami listener and the registry front', () => {

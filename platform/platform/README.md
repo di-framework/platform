@@ -249,7 +249,8 @@ and port as before, so they do not change. A later release refuses plain HTTP on
     OAuth callback becomes `http://console.<tenant>.localhost:<port>/oidc/callback`.
   - Controller: users and CLIs are shown `https://controller.<tenant>.localhost:<port>` instead
     of `https://127.0.0.1:8788`. The controller certificate is reissued with that name; it still
-    covers `127.0.0.1`, so existing port-forward kubeconfigs keep working.
+    covers `localhost` (and, until #381, `127.0.0.1`), so existing port-forward kubeconfigs keep
+    working.
   - Registry: users log in to `https://registry.<tenant>.localhost:<port>` instead of
     `https://127.0.0.1:8790`.
   - Workload hosts: the gateway routes `console.<tenant>.localhost`,
@@ -467,6 +468,41 @@ rejects it. Do not change those URLs while downgraded. If they did change, eithe
   hosts are served from the switch on, 30 days later) and rotates to a CA for the new names; or
 - replace the CA at once as for a revocation (see "Revoking a compromised CA"), after which every
   host, console and kubeconfig needs the new bundle.
+
+#### Upgrading to tenant controller CAs that exclude IP addresses (#381)
+
+The controller's serving certificate no longer names `127.0.0.1`, and each tenant controller CA
+now excludes every IP address (see "IP addresses" under
+[Tenant controller and console](#tenant-controller-and-console)). The default public URLs move to
+DNS names with them: with neither `tenantAuth.controllerPublicUrl` nor a routable
+`routeUrlPattern`, users and CLIs are shown `https://localhost:8788` instead of
+`https://127.0.0.1:8788`, and the registry front `https://localhost:8790` instead of
+`https://127.0.0.1:8790`. The port-forward is unchanged (`kubectl port-forward` listens on both
+loopback addresses). Installs whose controller and registry URLs are DNS names already (every
+install with a derived `routeUrlPattern` URL) see no URL change.
+
+The first pass after `pulumi up` starts a rotation for every tenant with tenant-auth, through the
+same steps as the #365 upgrade above:
+
+- **Day 0, publish.** A successor that excludes IP addresses joins `tenant-controller-ca`; the
+  hosts and console restart. The leaf, still naming `127.0.0.1`, does not change.
+- **About day 30, switch.** The successor signs a leaf without `127.0.0.1`. From here on **a
+  kubeconfig or CLI that reaches the controller as `https://127.0.0.1:8788` stops verifying**:
+  switch it to `https://localhost:8788` (`di-tenant login --controller https://localhost:8788`),
+  together with the bundle, within those 30 days. Registry logins to `127.0.0.1:8790` likewise
+  move to `localhost:8790`.
+- **About day 60, retire.** The old CA leaves the bundle.
+
+**To keep an IP-literal URL**, set it explicitly (`tenantAuth.controllerPublicUrl` or
+`tenantAuth.registry.publicUrl`, as for the #128 upgrade): the leaf then names that address and
+the CA leaves IP addresses unconstrained, as before this version, since Bun's TLS client rejects a
+leaf that names an IP address under any IP address constraint. No rotation starts for such an
+install unless the URL changes.
+
+**Downgrading** to a package without this change after the switch breaks the controller's TLS: the
+older package always adds `127.0.0.1` to the leaf, which the CA then signing excludes, so every
+client rejects it. Downgrade before the switch, or replace the CA after the downgrade as for a
+revocation (see "Revoking a compromised CA").
 
 #### Upgrading to API keys in their own namespace (#379)
 
@@ -1388,10 +1424,10 @@ tenantAuth:
   issuerUpstreamPodPort: 8080                                # optional, the pod port behind it
   issuerIp: 192.0.2.7                                        # optional, when pods cannot resolve the issuer
   consolePublicUrl: http://console.{tenant}.localhost:28180  # optional; default derived from routeUrlPattern, else http://127.0.0.1:8787
-  controllerPublicUrl: https://controller.{tenant}.localhost:28180  # optional; default derived from routeUrlPattern, else https://127.0.0.1:8788
+  controllerPublicUrl: https://controller.{tenant}.localhost:28180  # optional; default derived from routeUrlPattern, else https://localhost:8788
   registry:                                                  # optional: each tenant's own OCI registry (#83)
     component: ghcr.io/di-framework/oci-registry@sha256:a99201b51a1481df0241e4d364e6156da3f18d196d6d83162b76e9a8b812222e  # required, pinned by digest
-    publicUrl: https://registry.{tenant}.localhost:28180     # optional; default derived from routeUrlPattern, else https://127.0.0.1:8790
+    publicUrl: https://registry.{tenant}.localhost:28180     # optional; default derived from routeUrlPattern, else https://localhost:8790
     limits:                                                  # optional; each field optional, defaults shown
       maxBodyBytes: 536870912                                # TENANT_CONTROLLER_REGISTRY_MAX_BODY_BYTES
       upstreamTimeoutMs: 60000                               # TENANT_CONTROLLER_REGISTRY_UPSTREAM_TIMEOUT_MS
@@ -1508,12 +1544,17 @@ tenantAuth:
   that trust this tenant's CA accept such a certificate, and they resolve `*.localhost` to
   loopback (RFC 6761), so it only helps an attacker already on the client's own loopback.
 
-  **IP addresses are not constrained yet.** The CA can sign a certificate for any IP address, and
-  every party that trusts it accepts one, including the hosts' outgoing HTTPS to `https://<ip>`.
-  BoringSSL, which Bun's TLS client uses, rejects every chain in which an IP address SAN meets an
-  IP address constraint (even a permitted one), and the leaf always names `127.0.0.1`.
-  [#381](https://github.com/di-framework/platform/issues/381) tracks dropping that SAN when the
-  public URLs are DNS names and then excluding all IP addresses.
+  **IP addresses (#381).** The leaf names no IP address: in-cluster clients use the Service
+  names, and a port-forward is reached as `localhost` (the default public URLs are
+  `https://localhost:8788` and `https://localhost:8790`). Each CA therefore also excludes every
+  IP address (`0.0.0.0/0` and `::/0` as excluded subtrees), so a leaked tenant CA key cannot
+  impersonate `https://<ip>` to the hosts' outgoing HTTPS either; Bun, Go, rustls and OpenSSL
+  all reject a leaf that names one. The exception is an IP-literal `controllerPublicUrl` or
+  `registry.publicUrl` set explicitly: the leaf must then name that address, and BoringSSL (Bun's
+  TLS client) rejects every chain in which an IP address SAN meets an IP address constraint (even
+  a permitted one), so that installation's CA leaves IP addresses unconstrained, as before #381.
+  Whether IP addresses are excluded is part of what a CA permits, so switching between an
+  IP-literal and a DNS URL rotates the CA like any other change of names (below).
 
   The permitted names come from `routeUrlPattern`, `controllerPublicUrl` and the registry URL, so
   changing them changes what the CA must permit. That starts a rotation through the same three
@@ -1571,7 +1612,8 @@ tenantAuth:
   wins, including a `127.0.0.1` one that keeps that host on a port-forward. Only an
   `http://{host}.{tenant}.localhost[:<port>]` pattern is derived from, since only those hosts
   are routed to the pair; with any other pattern (`https://`, another domain) the unset URLs
-  keep the `127.0.0.1` defaults, as before, and `createPlatform` logs a warning naming them.
+  keep the port-forward defaults (`http://127.0.0.1:8787`, `https://localhost:8788`,
+  `https://localhost:8790`), as before, and `createPlatform` logs a warning naming them.
   The console's public URL is the one its OAuth redirects use, so the shared OAuth client must
   accept the derived console callback; see
   [Upgrading to tenant-auth URLs derived from `routeUrlPattern`](#upgrading-to-tenant-auth-urls-derived-from-routeurlpattern-128).
@@ -1585,7 +1627,7 @@ tenantAuth:
   the gateway pods, each to its own port, and the gateway's egress gains only those two ports
   in this installation's tenant namespaces. A routed label takes that host away from tenant
   workloads (`console.<tenant>.localhost` no longer reaches `di-http`). Explicit `127.0.0.1`
-  URLs, other hosts, and any URL while no gateway is published (the `127.0.0.1` defaults then
+  URLs, other hosts, and any URL while no gateway is published (the port-forward defaults then
   apply) stay unrouted. A gateway-shaped URL the gateway cannot route (wrong scheme, port, or a
   host shared by both) is reported on `TenantAuthReady` with reason `RouteError`; `Ready` is
   unaffected. The routes are config, not per-Tenant objects: the gateway policies carry the
@@ -1635,7 +1677,7 @@ tenantAuth:
     controller, and answers plain HTTP for it with `400`. The gateway knows the registry's
     HTTP host whenever a registry is configured, so that `400` holds even when users reach the
     registry by port-forward (`kubectl port-forward svc/tenant-controller 8790`, the default
-    `https://127.0.0.1:8790` when no gateway is published). Credentials therefore never cross plain HTTP off-cluster; the
+    `https://localhost:8790` when no gateway is published). Credentials therefore never cross plain HTTP off-cluster; the
     front-to-host and registry-to-controller hops are plain HTTP on the pod network, as the
     gateway-to-host hop already is. The alternative, terminating TLS at the gateway, would put
     every tenant's private key in the platform namespace; TLS passthrough keeps keys per tenant.

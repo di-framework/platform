@@ -156,7 +156,8 @@ export interface TenantAuthConfig {
   /**
    * Controller URL shown to users and CLIs; `{tenant}` is replaced. Unset, `createPlatform`
    * derives `https://controller.{tenant}.localhost:<port>` from an
-   * `http://{host}.{tenant}.localhost` `routeUrlPattern`; otherwise `https://127.0.0.1:8788`.
+   * `http://{host}.{tenant}.localhost` `routeUrlPattern`; otherwise `https://localhost:8788`
+   * (#381: a DNS name, so the controller CA can exclude IP addresses).
    */
   controllerPublicUrl?: string;
   /** Each tenant's own OCI registry (#83); absent, no registry is deployed. */
@@ -175,7 +176,7 @@ export interface TenantRegistryConfig {
    * Registry origin users log in to; `{tenant}` is replaced. `https://<label>.{tenant}.localhost:<port>`
    * on the gateway port is routed through the gateway (TLS passthrough to the registry front).
    * Unset, `createPlatform` derives `https://registry.{tenant}.localhost:<port>` from an
-   * `http://{host}.{tenant}.localhost` `routeUrlPattern`; otherwise `https://127.0.0.1:8790`, a
+   * `http://{host}.{tenant}.localhost` `routeUrlPattern`; otherwise `https://localhost:8790`, a
    * port-forward to the registry front.
    */
   publicUrl?: string;
@@ -207,7 +208,8 @@ export const WHOAMI_PORT = 8789;
 export const REGISTRY_FRONT_PORT = 8790;
 /** The registry WorkloadDeployment in each tenant namespace. */
 export const REGISTRY_WORKLOAD = 'di-tenant-registry';
-const DEFAULT_REGISTRY_URL = `https://127.0.0.1:${REGISTRY_FRONT_PORT}`;
+/** A port-forward to the registry front, named by DNS like the controller's default (#381). */
+const DEFAULT_REGISTRY_URL = `https://localhost:${REGISTRY_FRONT_PORT}`;
 /**
  * The controller's pull-only listener for the tenant's own hosts (#83 `:host-pull`): GET and HEAD
  * forwarded like the registry front, always TLS with the controller certificate. Tenant hosts
@@ -544,7 +546,7 @@ const DEFAULT_PORTS: Record<string, string> = { http: '80', https: '443' };
  * when the gateway is published (`routeUrlPattern`, which must be `http://`, since a TLS
  * terminator in front of the gateway breaks controller passthrough) on the same effective port
  * (scheme defaults applied: http 80, https 443) and the scheme fits (console `http`, controller
- * `https`). Schemes and hosts are compared in lower case. Any other URL (the `127.0.0.1`
+ * `https`). Schemes and hosts are compared in lower case. Any other URL (the loopback
  * defaults), or any URL while no gateway is published, is left unrouted; a gateway-shaped URL the
  * published gateway cannot route is returned as a problem for `TenantAuthReady`. `urls` holds the
  * normalized (lower-case) public URL of each routed host.
@@ -624,7 +626,7 @@ export function unsetPublicUrls(auth: TenantAuthConfig | undefined): string[] {
  * on the gateway port (`:80` when the pattern names none). Explicit URLs are kept as given. Only
  * an `http://{host}.{tenant}.localhost[:<port>]` pattern is derived from, since only those hosts
  * are routed to the pair; with any other pattern, no `tenantAuth`, no `routeUrlPattern`, or every
- * URL set, `auth` is returned unchanged and the `127.0.0.1` defaults apply, as before.
+ * URL set, `auth` is returned unchanged and the loopback defaults apply, as before.
  */
 export function withDerivedPublicUrls(
   auth: TenantAuthConfig | undefined,
@@ -1782,13 +1784,20 @@ function userTokenSecretName(user: string, tenant: string): string {
 function loopbackHost(host: string): boolean {
   return host === 'localhost' || host === '127.0.0.1' || host.endsWith('.localhost');
 }
+/**
+ * The controller URL users and CLIs see when `controllerPublicUrl` is unset: a port-forward,
+ * named by DNS so the controller's leaf needs no IP address and its CA can exclude them (#381).
+ */
+const DEFAULT_CONTROLLER_URL = 'https://localhost:8788';
 /** The controller URL users and CLIs see; `{tenant}` is replaced. */
 function tenantControllerPublicUrl(tenant: string, auth: TenantAuthConfig | undefined): string {
-  return expandTenant(auth?.controllerPublicUrl ?? 'https://127.0.0.1:8788', tenant);
+  return expandTenant(auth?.controllerPublicUrl ?? DEFAULT_CONTROLLER_URL, tenant);
 }
 /**
- * Names the controller's serving certificate covers: in-cluster, through a port-forward and the
- * host of `controllerPublicUrl`, so CLIs verify the hostname they were given.
+ * Names the controller's serving certificate covers: in-cluster, through a port-forward
+ * (`localhost`) and the host of `controllerPublicUrl`, so CLIs verify the hostname they were
+ * given. It names an IP address only for an IP-literal public URL set explicitly; otherwise it
+ * names none, and the controller CA excludes every IP address (#381).
  */
 function tenantControllerCertNames(
   tenant: string,
@@ -1802,7 +1811,7 @@ function tenantControllerCertNames(
     `tenant-controller.${ns}.svc.cluster.local`,
     'localhost',
   ];
-  const ips = ['127.0.0.1'];
+  const ips: string[] = [];
   const host = URL.canParse(tenantControllerPublicUrl(tenant, auth))
     ? new URL(tenantControllerPublicUrl(tenant, auth)).hostname
     : '';
