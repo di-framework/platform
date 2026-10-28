@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -123,5 +124,61 @@ func TestUpdateInstanceMovesExpectation(t *testing.T) {
 	}
 	if v, _ := h.expectation(); v != inst.ResourceVersion {
 		t.Fatalf("expectation at %q, want the written version %q", v, inst.ResourceVersion)
+	}
+}
+
+// The round right after the first install can read a cached instance from before the install's
+// status patch: no Installed condition, so the plan would install again and rewrite lastRepair
+// (#487). The install expects its status write, so that round reads past the cache and waits.
+func TestFirstInstallStaleCacheDoesNotInstallAgain(t *testing.T) {
+	h := newHarness(t, "")
+	h.r.APIReader = h.c
+	h.readyTarget()
+	h.reconcile() // finalizer
+	stale := h.get()
+	h.reconcile() // first install
+	installed := h.get()
+	if len(h.in.installs) != 1 || installed.Status.LastRepair == nil {
+		t.Fatalf("first install: %d installs, status %+v", len(h.in.installs), installed.Status)
+	}
+
+	h.r.Client = staleCache(h.c.(client.WithWatch), stale)
+	h.now = h.now.Add(2 * time.Second)
+	h.reconcile()
+	if len(h.in.installs) != 1 {
+		t.Fatalf("a stale cache installed again: %d installs, options %+v", len(h.in.installs), h.in.options)
+	}
+	inst := h.get()
+	if !inst.Status.LastRepair.Equal(installed.Status.LastRepair) || inst.Status.Phase != v1alpha1.PhaseReady ||
+		conditionReason(inst, v1alpha1.ConditionInstalled) != "FirstInstall" {
+		t.Fatalf("after the stale round lastRepair %v (install %v), status %+v",
+			inst.Status.LastRepair, installed.Status.LastRepair, inst.Status)
+	}
+}
+
+// The same holds for a repair: a cache still holding the old lastRepair would plan a second
+// repair at once (#487).
+func TestRepairStaleCacheDoesNotRepairAgain(t *testing.T) {
+	h := newHarness(t, "")
+	h.r.APIReader = h.c
+	h.readyTarget()
+	h.reconcile()
+	h.reconcile()
+	stale := h.get()
+	h.now = h.now.Add(h.r.Plan.RepairInterval + time.Minute)
+	h.reconcile() // repair
+	repaired := h.get()
+	if len(h.in.installs) != 2 || !h.in.options[1].Refresh {
+		t.Fatalf("repair: %d installs, options %+v", len(h.in.installs), h.in.options)
+	}
+
+	h.r.Client = staleCache(h.c.(client.WithWatch), stale)
+	h.now = h.now.Add(2 * time.Second)
+	h.reconcile()
+	if len(h.in.installs) != 2 {
+		t.Fatalf("a stale cache repaired again: %d installs", len(h.in.installs))
+	}
+	if got := h.get().Status.LastRepair; !got.Equal(repaired.Status.LastRepair) {
+		t.Fatalf("lastRepair %v, want the repair's %v", got, repaired.Status.LastRepair)
 	}
 }
