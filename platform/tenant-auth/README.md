@@ -418,6 +418,8 @@ service and env; annotations `revision-state` and `component`, plus `data.bundle
 sha256 in `data.digest`). Within a service/env the integer `<n>` alone orders revisions and
 picks the rollback target; across services the list orders by `created-at`, then name. Lists
 read metadata only (`PartialObjectMetadataList`); rollback fetches the one bundle it re-applies.
+A rollback revision also carries the `rollback-of` annotation naming the revision it restores,
+which `/v1` lists expose as `rollbackOf` when it is a valid revision id.
 
 A deploy runs in this order: prune, reserve the revision as `pending` (on a 409 it takes the
 next `<n>`, at most `RESERVE_ATTEMPTS` times, then answers 409), apply, mark it `live` and the

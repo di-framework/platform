@@ -1658,6 +1658,25 @@ describe('/v1/deploy', () => {
       expect(log).toHaveBeenCalledWith(expect.stringContaining('"deploy.rolled-back"'));
     });
 
+    test('a malformed rollback-of annotation is omitted from the list', async () => {
+      await deployed(withReplicas(1));
+      const object = revision('web-prod.1') as { metadata: { annotations: Json } };
+      for (const value of [
+        'web-prod.1 x',
+        'web-prod.1\n',
+        'Web-prod.1',
+        'web-dev.1',
+        'web-prod.0',
+      ]) {
+        object.metadata.annotations['platform.di-framework.dev/rollback-of'] = value;
+        const { items } = (await (await get('/v1/deployments?env=prod&service=web')).json()) as {
+          items: Json[];
+        };
+        expect(items[0]?.id).toBe('web-prod.1');
+        expect(items[0]).not.toHaveProperty('rollbackOf');
+      }
+    });
+
     test('rollback --to re-applies the named revision', async () => {
       await deployed(withReplicas(1));
       await deployed(withReplicas(2));
