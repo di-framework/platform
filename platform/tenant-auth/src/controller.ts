@@ -8,6 +8,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
+import { BackgroundDiscovery, type DiscoveryBackoff } from './discovery-retry.ts';
 import { AuthError, IdentityResolver, type Principal } from './identity.ts';
 import {
   ApiKeyMigrationPending,
@@ -31,7 +32,7 @@ import {
   type UserResource,
   type UserTokens,
 } from './kube.ts';
-import { discover, type ProviderMetadata } from './oidc.ts';
+import type { ProviderMetadata } from './oidc.ts';
 import { type RegistryListener, serveRegistryListener } from './registry-listener.ts';
 import { controllerSecretReader } from './v1/context.ts';
 import { serveV1, TITLES } from './v1/index.ts';
@@ -50,7 +51,7 @@ export interface ControllerConfig {
   platformNamespace: string;
   issuer: string;
   /** Wait between issuer discovery attempts; doubles from `initialMs` up to `maxMs`. */
-  discoveryBackoff?: { initialMs: number; maxMs: number };
+  discoveryBackoff?: DiscoveryBackoff;
   host: string;
   port: number;
   tlsCert?: string;
@@ -725,26 +726,13 @@ export function parseSideContentLength(value: string | null): string | undefined
   return Number.isSafeInteger(Number(value)) ? String(Number(value)) : undefined;
 }
 
-/** Pending until the issuer answers; `retryAfterSeconds` is the wait until the next attempt. */
-type DiscoveryState =
-  | { status: 'pending'; retryAfterSeconds: number }
-  | { status: 'complete'; provider: ProviderMetadata };
-
-const DISCOVERY_BACKOFF_DEFAULT = { initialMs: 1_000, maxMs: 30_000 };
-
 export class Controller {
   private readonly serviceAccountTokens = new Map<string, { token: string; expiresAt: number }>();
   /** Where proxy sessions forward to; only overridden by tests. */
   proxyUpstream: (tenant: string) => string = tenantUpstream;
-  private discoveryState: DiscoveryState;
-  private readonly discoveryAbort = new AbortController();
-  private discoveryTimer: ReturnType<typeof setTimeout> | undefined;
-  private wakeDiscoverySleep: (() => void) | undefined;
-  private markDiscovered: () => void = () => {};
+  private readonly discovery: BackgroundDiscovery;
   /** Resolves once the issuer has been discovered (or the controller was stopped). */
-  readonly discovered: Promise<void> = new Promise((resolve) => {
-    this.markDiscovered = resolve;
-  });
+  readonly discovered: Promise<void>;
 
   constructor(
     readonly config: ControllerConfig,
@@ -753,15 +741,21 @@ export class Controller {
     readonly identity: IdentityResolver,
     readonly keys: KeyStore,
   ) {
-    this.discoveryState = provider
-      ? { status: 'complete', provider }
-      : { status: 'pending', retryAfterSeconds: 1 };
-    if (provider) this.markDiscovered();
+    this.discovery = new BackgroundDiscovery(
+      {
+        issuer: config.issuer,
+        backoff: config.discoveryBackoff,
+        audit: (event, fields) => this.audit(event, fields),
+        onDiscovered: (found) => this.identity.setProvider(found),
+      },
+      provider,
+    );
+    this.discovered = this.discovery.discovered;
   }
 
   /** Provider metadata; null until discovery completes. */
   get provider(): ProviderMetadata | null {
-    return this.discoveryState.status === 'complete' ? this.discoveryState.provider : null;
+    return this.discovery.provider;
   }
 
   /**
@@ -787,70 +781,28 @@ export class Controller {
       new IdentityResolver(kube, null, config.tenant, keys),
       keys,
     );
-    void controller.discoverInBackground();
+    void controller.discovery.run();
     return controller;
   }
 
   /** Stops background discovery: aborts an in-flight attempt and clears the retry timer. */
   stop(): void {
-    this.discoveryAbort.abort();
-    clearTimeout(this.discoveryTimer);
-    this.wakeDiscoverySleep?.();
-    this.markDiscovered();
-  }
-
-  /**
-   * Attempts discovery until it succeeds or the controller stops. The wait between attempts
-   * doubles from `initialMs` up to `maxMs`; it never gives up, since the issuer may come up at
-   * any time and the controller has to recover without a restart.
-   */
-  private async discoverInBackground(): Promise<void> {
-    const { initialMs, maxMs } = this.config.discoveryBackoff ?? DISCOVERY_BACKOFF_DEFAULT;
-    const signal = this.discoveryAbort.signal;
-    for (let attempt = 0; !signal.aborted; attempt++) {
-      try {
-        const provider = await discover(this.config.issuer, 1, signal);
-        this.discoveryState = { status: 'complete', provider };
-        this.identity.setProvider(provider);
-        this.audit('discovery.succeeded', { issuer: this.config.issuer });
-        this.markDiscovered();
-        return;
-      } catch (error) {
-        if (signal.aborted) return;
-        const delayMs = Math.min(maxMs, initialMs * 2 ** attempt);
-        this.discoveryState = {
-          status: 'pending',
-          retryAfterSeconds: Math.max(1, Math.ceil(delayMs / 1000)),
-        };
-        this.audit('discovery.failed', {
-          error: (error as Error).message,
-          issuer: this.config.issuer,
-          retryInMs: delayMs,
-        });
-        await this.sleepUnlessStopped(delayMs);
-      }
-    }
-  }
-
-  private sleepUnlessStopped(ms: number): Promise<void> {
-    return new Promise((resolve) => {
-      this.wakeDiscoverySleep = resolve;
-      this.discoveryTimer = setTimeout(resolve, ms);
-    });
+    this.discovery.stop();
   }
 
   private isDiscoveryReady(): boolean {
-    return this.discoveryState.status === 'complete';
+    return this.discovery.state.status === 'complete';
   }
 
   private getProvider(): ProviderMetadata {
-    if (this.discoveryState.status === 'complete') return this.discoveryState.provider;
+    const state = this.discovery.state;
+    if (state.status === 'complete') return state.provider;
     throw new Error('issuer discovery is not yet complete');
   }
 
   private serviceUnavailableUntilDiscovery(): Response {
-    const retryAfter =
-      this.discoveryState.status === 'pending' ? this.discoveryState.retryAfterSeconds : 1;
+    const state = this.discovery.state;
+    const retryAfter = state.status === 'pending' ? state.retryAfterSeconds : 1;
     const response = problem(
       503,
       'Service Unavailable',

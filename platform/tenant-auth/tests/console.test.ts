@@ -358,10 +358,15 @@ describe('Console', () => {
   let app: Console;
   beforeAll(async () => {
     app = await Console.start(config());
+    await app.discovered;
   });
 
   test('serves health and CLI discovery', async () => {
-    expect(await (await get(app, '/healthz')).json()).toEqual({ ok: true, tenant: 'acme' });
+    expect(await (await get(app, '/healthz')).json()).toEqual({
+      ok: true,
+      tenant: 'acme',
+      discoveryReady: true,
+    });
     expect(await (await get(app, '/cli/info')).json()).toEqual({
       account: 'acme',
       issuer: issuer.url,
@@ -596,6 +601,7 @@ describe('session refresh', () => {
   let app: Console;
   beforeAll(async () => {
     app = await Console.start(config());
+    await app.discovered;
   });
 
   test('concurrent requests near expiry share exactly one refresh', async () => {
@@ -666,6 +672,7 @@ describe('unexpected failures', () => {
   let app: Console;
   beforeAll(async () => {
     app = await Console.start(config());
+    await app.discovered;
   });
 
   test('the 500 page does not leak the error text', async () => {
@@ -709,5 +716,113 @@ describe('unexpected failures', () => {
     const response = await post(app, '/cli/exchange', 'not json');
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ error: 'internal error' });
+  });
+});
+
+/**
+ * #489: the console serves while its issuer is unreachable and recovers without a restart,
+ * instead of exiting after a discovery retry budget (which crash-looped the pod).
+ */
+describe('Console.start with the issuer unreachable at first', () => {
+  let issuerUp = false;
+  let gate: FakeServer;
+  let app: Console;
+  let server: ReturnType<typeof Bun.serve>;
+  let startedIn: number;
+
+  beforeAll(async () => {
+    // Answers 503 until `issuerUp`, then serves the fake issuer's own discovery document.
+    gate = serve((request) => {
+      if (!issuerUp) return json({ error: 'starting' }, 503);
+      if (request.pathname === '/.well-known/openid-configuration')
+        return fetch(`${issuer.url}/.well-known/openid-configuration`);
+      return json({}, 404);
+    });
+    log.mockClear();
+    const began = performance.now();
+    app = await Console.start({
+      ...config({ issuer: gate.url }),
+      discoveryBackoff: { initialMs: 10, maxMs: 40 },
+    });
+    startedIn = performance.now() - began;
+    server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: (r) => app.handle(r) });
+  });
+  afterAll(() => {
+    app.stop();
+    server.stop(true);
+    gate.stop();
+  });
+
+  test('start returns at once and /healthz serves over HTTP, reporting discovery pending', async () => {
+    expect(startedIn).toBeLessThan(1_000);
+    expect(app.provider).toBeNull();
+    const health = await fetch(`http://127.0.0.1:${server.port}/healthz`);
+    expect(health.status).toBe(200);
+    expect(await health.json()).toEqual({ ok: true, tenant: 'acme', discoveryReady: false });
+    await until(() => JSON.stringify(log.mock.calls).includes('discovery.failed'));
+  });
+
+  test('issuer-independent routes still answer', async () => {
+    expect(await (await get(app, '/cli/info')).json()).toMatchObject({
+      account: 'acme',
+      issuer: gate.url,
+    });
+    const landing = await get(app, '/');
+    expect(landing.status).toBe(200);
+    const body = await landing.text();
+    expect(body).toContain('Sign-in is unavailable');
+    expect(body).not.toContain('>Sign in</button>');
+    expect((await get(app, '/cli/anything')).status).toBe(401);
+  });
+
+  test('issuer-dependent routes answer 503 with Retry-After, not an error page or a 401', async () => {
+    const login = await get(app, '/login');
+    expect(login.status).toBe(503);
+    expect(Number(login.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
+    const page = await login.text();
+    expect(page).toContain('Sign-in unavailable');
+    expect(page).not.toContain('Something went wrong');
+
+    for (const path of ['/cli/refresh', '/cli/logout']) {
+      const response = await post(app, path, JSON.stringify({ refreshToken: 'rt' }));
+      expect(response.status).toBe(503);
+      expect(Number(response.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
+      expect(await response.json()).toEqual({
+        error: 'the identity provider is not reachable yet; retry shortly',
+      });
+    }
+  });
+
+  test('the same console recovers when the issuer comes up, without a restart', async () => {
+    issuerUp = true;
+    await app.discovered;
+    expect(app.provider?.issuer).toBe(issuer.url);
+    expect(await (await get(app, '/healthz')).json()).toMatchObject({ discoveryReady: true });
+    expect(JSON.stringify(log.mock.calls)).toContain('discovery.succeeded');
+    const landing = await (await get(app, '/')).text();
+    expect(landing).not.toContain('Sign-in is unavailable');
+    expect(landing).toContain('>Sign in</button>');
+    const cookie = await session(app);
+    expect((await get(app, '/members', { cookie })).status).toBe(200);
+  });
+
+  test('stop() ends discovery for a console whose issuer never answers', async () => {
+    const down = await Console.start({
+      ...config({ issuer: 'http://127.0.0.1:1' }),
+      discoveryBackoff: { initialMs: 10, maxMs: 40 },
+    });
+    const failures = () =>
+      log.mock.calls.filter(
+        ([line]) =>
+          String(line).includes('discovery.failed') && String(line).includes('127.0.0.1:1'),
+      ).length;
+    await until(() => failures() > 0);
+    down.stop();
+    await down.discovered;
+    const atStop = failures();
+    // Longer than maxMs: a loop still running would log another attempt in this window.
+    await Bun.sleep(100);
+    expect(failures()).toBe(atStop);
+    expect(down.provider).toBeNull();
   });
 });

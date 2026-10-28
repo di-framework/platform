@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { loadPins } from './lib/versions.ts';
 import {
+  checkPreviousPgVersion,
   DATABASE_MARKER,
   databaseArgs,
   PACKAGE_PROVIDER,
@@ -25,6 +26,15 @@ describe('cross-version smoke step', () => {
 
   test('refuses to run without the pins', () => {
     expect(() => previousRelease({})).toThrow('missing pin PGLITE_UPGRADE_FROM_VERSION');
+  });
+
+  test('compares the PG_VERSION major and reports it as a major', async () => {
+    const release = previousRelease(await loadPins(resolve(import.meta.dir, '..')));
+    expect(() => checkPreviousPgVersion('17', release)).not.toThrow();
+    expect(() => checkPreviousPgVersion('16', release)).toThrow(
+      'previous release wrote PG_VERSION 16, expected major version 17 ' +
+        '(6.0.15 ships PostgreSQL 17.5)',
+    );
   });
 });
 
