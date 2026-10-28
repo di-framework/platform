@@ -274,13 +274,13 @@ func (r *Reconciler) cleanStorage(ctx context.Context, inst *v1alpha1.PlatformIn
 	if succeeded {
 		// Recorded, so the release that waits for the Job's pod never starts a second Job.
 		inst.Annotations[AnnotationStorageCleaned] = string(inst.UID)
-		return true, 0, r.Update(ctx, inst)
+		return true, 0, r.updateInstance(ctx, inst)
 	}
 	failures, _ := strconv.Atoi(inst.Annotations[AnnotationCleanupFailures])
 	failures++
 	inst.Annotations[AnnotationCleanupFailures] = strconv.Itoa(failures)
 	inst.Annotations[AnnotationCleanupFailedAt] = r.now().UTC().Format(time.RFC3339)
-	if err := r.Update(ctx, inst); err != nil {
+	if err := r.updateInstance(ctx, inst); err != nil {
 		return false, 0, err
 	}
 	wait := cleanupBackoff(failures)
