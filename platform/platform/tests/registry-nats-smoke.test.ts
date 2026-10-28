@@ -28,12 +28,11 @@ import {
  * config, with a seeded registry object store in the TENANT account, and checks that the store
  * moved to REGISTRY.
  *
- * runc enters the working directory as root and only then drops to the pod's user, so a
- * container without `workingDir` starts as uid 65532 in nats-box's WORKDIR `/root` (0700), where
- * the nats CLI fails with `stat .: permission denied` (#391). podman/crun falls back to another
- * directory instead, so the smoke reproduces runc on any runtime: the container starts as root
- * (in `workingDir` when the Job sets one, else in the image's WORKDIR) and `setpriv` then drops
- * to the Job's `runAsUser` / `runAsGroup`. The check fails if the Job spec loses `workingDir`.
+ * The container runs as the pod does: as the Job's `runAsUser` / `runAsGroup`, with a read-only
+ * root filesystem, an emptyDir-like tmpfs at /tmp, all capabilities dropped and no privilege
+ * escalation. The runtime enters the working directory (the Job's `workingDir`, else the image's
+ * WORKDIR `/root`, mode 0700) before switching user, as runc does, so a Job without `workingDir`
+ * fails with `stat .: permission denied` (#391). The check fails if the Job spec loses `workingDir`.
  *
  * It needs docker or podman and pulls two images, so it runs only with REGISTRY_NATS_SMOKE=1 (the
  * `registry-nats-smoke` job in .github/workflows/ci.yml). CONTAINER_RUNTIME picks the runtime;
@@ -263,31 +262,31 @@ nats object ls ${REGISTRY_BUCKET} --names`);
       env[e.name] = Buffer.from(secret.data[ref.key] ?? '', 'base64').toString();
       flags.push('-e', e.name);
     }
-    // nats-box's busybox has `su` but no numeric-uid switcher, and `su` needs a passwd entry, so
-    // the root filesystem stays writable for that one line (the pod's is read-only; uid 65532
-    // cannot write outside /tmp either way).
     const [shell, flag, script] = migrate.command;
     expect([shell, flag]).toEqual(['sh', '-c']);
-    const dropToJobUser = `echo "job:x:${user}:${group}::/tmp:/bin/sh" >> /etc/passwd
-exec su -p -s /bin/sh job -c "$1"`;
     const result = container(
       [
         'run',
         '--rm',
         '--network',
         network,
+        // As in the pod: the Job's user, read-only root fs, no capabilities, no escalation.
+        '--user',
+        `${user}:${group}`,
+        '--read-only',
+        '--cap-drop',
+        'ALL',
+        '--security-opt',
+        'no-new-privileges',
         // As in the pod: an emptyDir /tmp (world-writable).
         '--tmpfs',
         '/tmp:rw,mode=1777',
         ...(migrate.workingDir ? ['--workdir', migrate.workingDir] : []),
         ...flags,
-        // Start as root in the working directory, then drop to the Job's user, like runc.
         '--entrypoint',
         'sh',
         migrate.image,
         '-c',
-        dropToJobUser,
-        'drop-to-job-user',
         script ?? '',
       ],
       env,

@@ -135,7 +135,8 @@ describe('registry migration script: working directory fix (#391)', () => {
   });
 
   it('proceeds with migration when marker bucket does not exist on first run', () => {
-    // Like the real CLI, `kv get` on a missing bucket prints the error and exits 1.
+    // `kv get` is never asked on first run (no KV stream listed); if it were, it would fail like
+    // the real CLI on a missing bucket.
     const result = runScript(
       connected(`  "stream ls --names") echo "" ;;
   "kv get di-platform-migrations registry-object-store --raw") echo "${NO_BUCKET}" >&2; exit 1 ;;
@@ -145,6 +146,7 @@ describe('registry migration script: working directory fix (#391)', () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('registry migration: no source store');
     expect(result.stdout).toContain('registry migration: complete');
+    expect(result.calls).not.toContain('kv get di-platform-migrations registry-object-store --raw');
     expect(result.calls).toContain('kv add di-platform-migrations');
     expect(result.calls.at(-1)).toBe(
       'kv put di-platform-migrations registry-object-store complete',
