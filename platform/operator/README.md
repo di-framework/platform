@@ -434,7 +434,8 @@ ghcr.io/di-framework/platform-operator@sha256:0e5e223ba7332670e203072080fcf584d0
 ```
 
 Each publish is also tagged with its commit SHA and `src-<hash>` (the hash of its inputs); only the digest is
-immutable.
+immutable. Each release builds its own image (see [Default platform version](#default-platform-version)),
+tagged `v<version>`; the published chart of that version pins it by digest.
 
 ### Default platform version
 
@@ -458,11 +459,18 @@ installs without egress.
   (`$PULUMI_HOME/plugins`, under `/home/node` in the chart), which stays writable for other versions.
 - An instance at the default version gets a copy of the baked `node_modules` in its project on the state
   volume; any other version runs `npm install` there, as before, and Pulumi downloads the plugins it lacks.
-- The release PR moves the pin to the newest published release (`bun scripts/operator-project.ts bump`,
-  which rewrites the lockfile and `plugins.txt`). That is the release before the one the PR publishes, which
-  is not on npm until its tag is released. The release PR is merged by the Auto Tag bot, which starts no
-  image build, so the next image publish (the next push to main that changes the operator's image inputs)
-  carries the new pin; until then the pinned image bakes the previous one.
+- **Release N bakes N.** The operator chart published with release N (`oci://ghcr.io/di-framework/charts/platform-operator`
+  at version N) runs an image whose default platform version is `@di-framework/platform` N, the same version as
+  the chart, the Headlamp plugin and the npm packages of that release. An instance at N installs offline; an
+  instance at any other version runs `npm install`. `release.yml` does this after it has published N to npm: it
+  pins the project to exactly N (`bun scripts/operator-project.ts bump N`, which rewrites the lockfile and
+  `plugins.txt`), builds the image from the tag's source with only that change (the binary is compiled in the
+  same build, so it embeds the `package.json` it bakes), checks that the image bakes N, tags the index `vN`,
+  and packages chart N with that image's digest instead of the one in `chart/values.yaml`.
+- The same release opens the bot PR `chore(operator): bake @di-framework/platform N` (branch
+  `bot/operator-project`), which moves main's pin to N. Once it merges, the next image from main (and its pin
+  PR, which updates `chart/values.yaml` and the reference above) bakes N too. Until then main's images bake the
+  previous release.
 
 The first publish creates the `platform-operator` GHCR package as private. An org admin must make it public
 once (Package settings, then Change visibility), because Layer 4 (#274) pulls the image anonymously.

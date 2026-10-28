@@ -19,7 +19,15 @@
 # its Pulumi plugins (#431), from platform/operator/internal/installer/project: `npm ci` against the
 # committed lockfile, and each plugin checked against the sha256 in plugins.txt. Both are fetched at
 # build time, so the build needs npm and get.pulumi.com; an instance at another version still runs
-# npm install. The release PR moves the pin (scripts/operator-project.ts bump).
+# npm install. The images built here are main's (dev) images and bake whatever main pins.
+#
+# Releases do not use these images: release.yml builds its own after publishing to npm, from the
+# tag plus only the pin moved to the release (scripts/operator-project.ts bump <version>), tags that
+# index v<version> and packages chart <version> with its digest, so chart N's image bakes
+# @di-framework/platform N. Its per-arch images are pushed by digest and it never writes the
+# buildcache-* tags, so this workflow and a release never move each other's tags and need no shared
+# concurrency group. Its project-pr job then opens
+# bot/operator-project moving main's pin to the release; merging that runs this workflow.
 #
 # Permissions: workflow default contents: read. check-source reads packages; build and merge push
 # (packages: write). Only pin holds contents: write and pull-requests: write.

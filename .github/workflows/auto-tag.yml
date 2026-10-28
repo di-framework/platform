@@ -338,12 +338,6 @@ jobs:
           bun scripts/artifacthub-plugin.ts write "$NEXT"
           git add platform/operator/chart/values.yaml platform/operator/headlamp-plugin/artifacthub
 
-          # The operator image bakes its default platform version (#431): pin it to the newest
-          # published release (never this one, which is not on npm until its tag is released),
-          # with its lockfile and the Pulumi plugin digests. A current pin changes nothing.
-          bun scripts/operator-project.ts bump
-          git add platform/operator/internal/installer/project
-
           git add package.json bun.lock
           # Workspace manifests are not all under packages/.
           git ls-files -m -- '*package.json' | while IFS= read -r f; do

@@ -286,7 +286,7 @@ describe('platform-operator chart', () => {
       image: { repository: string; digest: string };
     };
     expect(values.image.repository).toBe('ghcr.io/di-framework/platform-operator');
-    // A placeholder must never reach a release: the chart job skips an unpinned digest.
+    // The source tree's chart renders as is; a release replaces this with its own image's digest.
     expect(values.image.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
     // The image pin PR rewrites values.yaml along with the README, so the pin cannot go stale.
     expect(ARTIFACTS['platform-operator']?.map((t) => t.file)).toContain(

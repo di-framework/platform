@@ -134,6 +134,46 @@ describe('bump', () => {
     }
   });
 
+  test('bump <version> (what release.yml runs) pins exactly that version, never npm latest', async () => {
+    const root = scratch();
+    try {
+      const dir = join(root, PROJECT_DIR);
+      const current = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).dependencies[
+        PLATFORM_PACKAGE
+      ] as string;
+      const [major, minor, patch] = current.split('.').map(Number);
+      const release = `${major}.${minor}.${(patch as number) + 1}`;
+      const locked: string[] = [];
+      const code = await main(['bump', release], root, {
+        latest: () => {
+          throw new Error('npm latest must not be asked for an explicit version');
+        },
+        lock: (d) => {
+          const v = JSON.parse(readFileSync(join(d, 'package.json'), 'utf8')).dependencies[
+            PLATFORM_PACKAGE
+          ];
+          locked.push(v);
+          writeFileSync(join(d, 'package-lock.json'), lockFor(v, { kubernetes: '4.40.0' }));
+        },
+        checksums: async (name, v) => checksums(name, v),
+      });
+      expect(code).toBe(0);
+      expect(locked).toEqual([release]);
+      const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+      expect(pkg.dependencies[PLATFORM_PACKAGE]).toBe(release);
+      const lock = JSON.parse(readFileSync(join(dir, 'package-lock.json'), 'utf8'));
+      expect(lock.packages[`node_modules/${PLATFORM_PACKAGE}`].version).toBe(release);
+      // Only the platform pin moves: every other dependency is kept as committed.
+      const committed = JSON.parse(read(`${PROJECT_DIR}/package.json`));
+      expect({ ...pkg.dependencies, [PLATFORM_PACKAGE]: undefined }).toEqual({
+        ...committed.dependencies,
+        [PLATFORM_PACKAGE]: undefined,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('a current pin changes nothing and fetches no checksums', async () => {
     const root = scratch();
     try {

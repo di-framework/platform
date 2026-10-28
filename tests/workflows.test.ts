@@ -1273,28 +1273,226 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     expect(released.stdout).toContain('::error::GitHub Release v1.2.3 already exists');
   });
 
-  test('build, publish and github-release run in that order; chart runs after build, before the Release', () => {
+  test('build → publish → bake → operator-image → operator-index → chart → github-release, then project-pr (#431)', () => {
     expect(Object.keys(release.jobs).sort()).toEqual([
+      'bake',
       'build',
       'chart',
       'github-release',
+      'operator-image',
+      'operator-index',
+      'project-pr',
       'publish',
     ]);
     expect(release.jobs.publish?.needs).toBe('build');
+    // The operator image bakes the release, which only exists once publish has put it on npm.
+    expect(release.jobs.bake?.needs).toBe('publish');
+    expect(release.jobs['operator-image']?.needs).toBe('bake');
+    expect(release.jobs['operator-index']?.needs).toEqual(['bake', 'operator-image']);
+    // The chart pins that index, so chart N's image bakes N.
+    expect(release.jobs.chart?.needs).toEqual(['build', 'operator-index']);
     // The GitHub Release is announced only once the npm packages and the chart are both out; it
     // needs build for the Headlamp plugin's sha256 (#435).
     expect(release.jobs['github-release']?.needs).toEqual(['build', 'publish', 'chart']);
-    expect(release.jobs['github-release']?.if).toBe("github.ref_type == 'tag'");
-    expect(release.jobs.chart?.needs).toBe('build');
-    expect(release.jobs.chart?.if).toBe("github.ref_type == 'tag'");
+    expect(release.jobs['project-pr']?.needs).toBe('chart');
+    for (const job of [
+      'bake',
+      'operator-image',
+      'operator-index',
+      'chart',
+      'github-release',
+      'project-pr',
+    ]) {
+      expect(release.jobs[job]?.if).toBe("github.ref_type == 'tag'");
+    }
   });
 
-  test('only publish holds an OIDC token, only github-release can write contents', () => {
+  test('only publish holds an OIDC token; only the image and chart jobs push packages; least privilege', () => {
     expect(release.permissions).toEqual({ contents: 'read' });
     expect(release.jobs.build?.permissions).toEqual({ contents: 'read' });
     expect(release.jobs.publish?.permissions).toEqual({ contents: 'read', 'id-token': 'write' });
     expect(release.jobs['github-release']?.permissions).toEqual({ contents: 'write' });
-    expect(release.jobs.chart?.permissions).toEqual({ contents: 'read', packages: 'write' });
+    expect(release.jobs.bake?.permissions).toEqual({ contents: 'read' });
+    for (const job of ['operator-image', 'operator-index', 'chart']) {
+      expect(release.jobs[job]?.permissions).toEqual({ contents: 'read', packages: 'write' });
+    }
+    expect(release.jobs['project-pr']?.permissions).toEqual({
+      contents: 'write',
+      'pull-requests': 'write',
+    });
+  });
+
+  test('every action the release operator jobs use is pinned by SHA (#431)', () => {
+    for (const job of ['bake', 'operator-image', 'operator-index', 'chart', 'project-pr']) {
+      const refs = uses(job).filter(Boolean);
+      expect(refs.length).toBeGreaterThan(0);
+      for (const ref of refs) expect(ref).toMatch(/@[0-9a-f]{40}$/);
+    }
+  });
+
+  test('bake pins exactly the released version after publish, and nothing outside the project (#431)', () => {
+    const bump = steps('bake').find((s) => s.id === 'bump');
+    const run = bump?.run ?? '';
+    expect(run).toContain('VERSION="${GITHUB_REF_NAME#v}"');
+    expect(run).toContain('bun scripts/operator-project.ts bump "$VERSION"');
+    // Never npm's `latest`: a bare bump would.
+    expect(run).not.toMatch(/operator-project\.ts bump\s*$/m);
+    expect(bump?.env?.NPM_CONFIG_PREFER_ONLINE).toBe('true');
+    expect(run).toContain('.dependencies["@di-framework/platform"]');
+    expect(run).toContain('.packages["node_modules/@di-framework/platform"].version');
+    expect(run).toContain('the bump changed files outside $PROJECT');
+    expect(release.jobs.bake?.outputs).toEqual({
+      version: '${{ steps.bump.outputs.version }}',
+      project_sha256: '${{ steps.bump.outputs.project_sha256 }}',
+    });
+    const upload = steps('bake').find((s) => s.uses?.startsWith('actions/upload-artifact@'));
+    expect(upload?.with?.name).toBe('operator-project');
+    expect(upload?.with?.path?.trim().split('\n')).toEqual(
+      ['package.json', 'package-lock.json', 'plugins.txt'].map(
+        (f) => `platform/operator/internal/installer/project/${f}`,
+      ),
+    );
+  });
+
+  test('bake retries the bump until npm serves the release, and refuses anything but exactly it', () => {
+    const run = steps('bake').find((s) => s.id === 'bump')?.run ?? '';
+    const PROJECT = 'platform/operator/internal/installer/project';
+    /**
+     * Runs the bump step in a scratch checkout. The stubbed `bun scripts/operator-project.ts bump`
+     * fails until its `ok`-th call (npm not serving the version yet), then writes `pin` into the
+     * project, and `extra` outside it when set.
+     */
+    const bake = (ok: number, pin = '9.9.9', extra = false) => {
+      const base = mkdtempSync(join(tmpdir(), 'release-bake-'));
+      const repo = join(base, 'repo');
+      const bin = join(base, 'bin');
+      mkdirSync(join(repo, PROJECT), { recursive: true });
+      for (const f of ['package.json', 'package-lock.json', 'plugins.txt']) {
+        writeFileSync(join(repo, PROJECT, f), read(`${PROJECT}/${f}`));
+      }
+      git(repo, 'init', '-q');
+      git(repo, 'add', '.');
+      git(repo, 'commit', '-qm', 'init');
+      stubCommand(
+        bin,
+        'bun',
+        `n=$(cat "${base}/tries" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "${base}/tries"
+[ "$n" -ge ${ok} ] || exit 1
+[ "$1 $2 $3" = "scripts/operator-project.ts bump 9.9.9" ] || exit 2
+${extra ? 'echo x > stray.txt' : ''}
+cd ${PROJECT}
+jq '.dependencies["@di-framework/platform"]="${pin}"' package.json > p && mv p package.json
+jq '.packages["node_modules/@di-framework/platform"].version="${pin}"' package-lock.json > l && mv l package-lock.json`,
+      );
+      stubCommand(bin, 'sleep', 'exit 0');
+      const output = join(base, 'github-output');
+      writeFileSync(output, '');
+      const result = Bun.spawnSync(['bash', '-c', run], {
+        cwd: repo,
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: {
+          ...env,
+          PATH: `${bin}:${process.env.PATH}`,
+          GITHUB_REF_NAME: 'v9.9.9',
+          GITHUB_OUTPUT: output,
+        },
+      });
+      return {
+        code: result.exitCode,
+        stdout: result.stdout.toString(),
+        tries: Number(readFileSync(join(base, 'tries'), 'utf8')),
+        output: readFileSync(output, 'utf8'),
+      };
+    };
+
+    const pinned = bake(3);
+    expect(pinned.code).toBe(0);
+    expect(pinned.tries).toBe(3);
+    expect(pinned.output).toMatch(/^version=9\.9\.9\nproject_sha256=[0-9a-f]{64}\n$/);
+
+    const never = bake(99);
+    expect(never.code).toBe(1);
+    expect(never.tries).toBe(20);
+    expect(never.stdout).toContain('::error::could not pin');
+    expect(never.output).toBe('');
+
+    const other = bake(1, '9.9.8');
+    expect(other.code).toBe(1);
+    expect(other.stdout).toContain('pins 9.9.8 and locks 9.9.8, not the release 9.9.9');
+
+    const outside = bake(1, '9.9.9', true);
+    expect(outside.code).toBe(1);
+    expect(outside.stdout).toContain('the bump changed files outside');
+  });
+
+  test('operator-image builds the tag plus only the bake files, by digest, and checks the image bakes the release (#431)', () => {
+    const job = release.jobs['operator-image'];
+    expect(job?.strategy?.matrix).toEqual({
+      include: [
+        { arch: 'amd64', platform: 'linux/amd64', runner: 'ubuntu-24.04' },
+        { arch: 'arm64', platform: 'linux/arm64', runner: 'ubuntu-24.04-arm' },
+      ],
+    });
+    const all = steps('operator-image');
+    const index = (pred: (s: (typeof all)[number]) => boolean) => all.findIndex(pred);
+    const apply = index((s) => s.name === 'Apply the release pin');
+    const build = index((s) => s.id === 'build');
+    const check = index((s) => s.name === 'Check the image bakes the release');
+    expect(apply).toBeGreaterThan(-1);
+    expect(build).toBeGreaterThan(apply);
+    expect(check).toBeGreaterThan(build);
+    expect(all[apply]?.env).toEqual({
+      VERSION: '${{ needs.bake.outputs.version }}',
+      PROJECT_SHA256: '${{ needs.bake.outputs.project_sha256 }}',
+    });
+    expect(all[apply]?.run).toContain('differs from the one bake pinned');
+    expect(all[apply]?.run).toContain('the build context differs from $GITHUB_REF_NAME outside');
+    const b = all[build]?.with ?? {};
+    expect(b.context).toBe('platform/operator');
+    expect(b.outputs).toContain('push-by-digest=true');
+    // Reads main's cache, never writes it: the main-branch workflow owns the buildcache-* tags.
+    expect(b['cache-to']).toBeUndefined();
+    expect(b.labels).toContain(
+      'org.opencontainers.image.version=${{ needs.bake.outputs.version }}',
+    );
+    const c = all[check]?.run ?? '';
+    expect(c).toContain(
+      '/opt/platform-operator/project/node_modules/@di-framework/platform/package.json',
+    );
+    expect(c).toContain('"$baked" != "$VERSION"');
+    expect(c).toContain(
+      'cmp "$RUNNER_TEMP/baked-package.json" platform/operator/internal/installer/project/package.json',
+    );
+  });
+
+  test('operator-index tags only v<version>, and the main-branch workflow never writes a v* tag (#431)', () => {
+    const run = runs('operator-index');
+    expect(run).toContain('--tag "ghcr.io/di-framework/platform-operator:v${VERSION}"');
+    expect(run.match(/--tag /g)).toHaveLength(1);
+    expect(run).not.toMatch(/src-|GITHUB_SHA|oras tag/);
+    expect(release.jobs['operator-index']?.outputs).toEqual({
+      digest: '${{ steps.index.outputs.digest }}',
+    });
+    const dev = read('.github/workflows/platform-operator-image.yml');
+    expect(dev).not.toMatch(/platform-operator:v/);
+    expect(parse('.github/workflows/platform-operator-image.yml').concurrency.group).not.toBe(
+      release.concurrency.group,
+    );
+  });
+
+  test('project-pr moves main to exactly the release, never backwards, on its own bot branch (#431)', () => {
+    const job = release.jobs['project-pr'];
+    const checkout = job?.steps?.find((s) => s.uses?.startsWith('actions/checkout@'));
+    expect(checkout?.with?.ref).toBe('main');
+    const run = runs('project-pr');
+    expect(run).toContain('bun scripts/operator-project.ts bump "$VERSION"');
+    expect(run).toContain('branch=bot/operator-project');
+    expect(run).toContain('sort -V');
+    expect(run.indexOf('sort -V')).toBeLessThan(run.indexOf('operator-project.ts bump'));
+    expect(run).toContain('A maintainer has to approve and run this PR');
+    // Not the main-branch image pin PR's branch.
+    expect(run).not.toContain('bot/pin-platform-operator');
   });
 
   test('chart packages the operator chart at the tag version and pushes it to GHCR (#272)', () => {
@@ -1330,47 +1528,49 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     expect(chart).not.toMatch(/\bmake\b|docker|bun install|helm dependency/);
   });
 
-  test('an unpinned image.digest skips the chart with a warning; a pinned one packages and pushes (W5)', () => {
+  test("chart packages image.digest = operator-index's release image, before packaging; nothing else (#431)", () => {
     const chartSteps = steps('chart');
     const pin = chartSteps.find((s) => s.id === 'pin');
     const pinIndex = chartSteps.indexOf(pin as never);
+    expect(pin?.env).toEqual({ DIGEST: '${{ needs.operator-index.outputs.digest }}' });
     for (const name of ['Package the chart', 'Push the chart to GHCR']) {
       const step = chartSteps.find((s) => s.name === name);
       expect(chartSteps.indexOf(step as never)).toBeGreaterThan(pinIndex);
-      expect(step?.if).toBe("steps.pin.outputs.pinned == 'true'");
+      expect(step?.if).toBeUndefined();
     }
-    // github-release still runs: the skip is a success, not a failure.
-    expect(release.jobs['github-release']?.needs).toContain('chart');
     const values = read('platform/operator/chart/values.yaml');
-    const runPin = (digest: string) => {
+    const runPin = (digest: string, text = values) => {
       const dir = mkdtempSync(join(tmpdir(), 'chart-pin-'));
       mkdirSync(join(dir, 'platform/operator/chart'), { recursive: true });
-      writeFileSync(
-        join(dir, 'platform/operator/chart/values.yaml'),
-        values.replace(/^ {2}digest: .*$/m, `  digest: ${digest}`),
-      );
-      const output = join(dir, 'github-output');
-      writeFileSync(output, '');
+      mkdirSync(join(dir, 'tmp'));
+      writeFileSync(join(dir, 'platform/operator/chart/values.yaml'), text);
       const result = Bun.spawnSync(['bash', '-c', pin?.run ?? 'exit 1'], {
         cwd: dir,
-        env: { ...process.env, GITHUB_OUTPUT: output },
+        env: { ...process.env, DIGEST: digest, RUNNER_TEMP: join(dir, 'tmp') },
       });
       return {
         code: result.exitCode,
         stdout: result.stdout.toString(),
-        output: readFileSync(output, 'utf8'),
+        values: readFileSync(join(dir, 'platform/operator/chart/values.yaml'), 'utf8'),
       };
     };
-    // A placeholder (the chart's value before its first pin): skipped, exit 0, with a warning.
-    const skipped = runPin('sha256:<pinned by the platform-operator image pin PR>');
-    expect(skipped.code).toBe(0);
-    expect(skipped.output).toBe('pinned=false\n');
-    expect(skipped.stdout).toContain('::warning::chart not published');
-    const pinned = runPin(`sha256:${'0'.repeat(64)}`);
+    const digest = `sha256:${'a'.repeat(64)}`;
+    const pinned = runPin(digest);
     expect(pinned.code).toBe(0);
-    expect(pinned.output).toBe('pinned=true\n');
-    expect(pinned.stdout).not.toContain('::warning::');
-    expect(runPin(`sha256:${'0'.repeat(63)}`).output).toBe('pinned=false\n');
+    // Only the image digest line changes.
+    expect(pinned.values).toBe(values.replace(/^ {2}digest: .*$/m, `  digest: ${digest}`));
+    expect(pinned.values).not.toBe(values);
+    // No digest from operator-index (or a malformed one): the chart is not published.
+    for (const bad of ['', `sha256:${'0'.repeat(63)}`, 'latest']) {
+      const failed = runPin(bad);
+      expect(failed.code).toBe(1);
+      expect(failed.stdout).toContain('::error::operator-index returned no image digest');
+      expect(failed.values).toBe(values);
+    }
+    // values.yaml must have exactly one digest line to rewrite.
+    const two = runPin(digest, `${values}  digest: sha256:${'b'.repeat(64)}\n`);
+    expect(two.code).toBe(1);
+    expect(two.stdout).toContain('must have exactly one image digest line');
   });
 
   test('build packs the Headlamp plugin at a tag and verifies its Artifact Hub entry (#435)', () => {

@@ -325,17 +325,17 @@ describe('the workflows keep bun.lock in step with the release bump', () => {
     expect(steps.find(node)?.with?.['node-version']).toBe(ciNode?.with?.['node-version']);
   });
 
-  test("Auto Tag moves the operator image's baked platform to the newest published release (#431)", () => {
-    const pr = steps.map((s) => s.run ?? '').find((r) => r.includes('git commit')) ?? '';
-    const order = [
-      'bun scripts/operator-project.ts bump\n',
-      'git add platform/operator/internal/installer/project\n',
-      'git commit',
-    ].map((s) => pr.indexOf(s));
-    expect(order.every((i) => i > -1)).toBe(true);
-    expect([...order].sort((a, b) => a - b)).toEqual(order);
-    // Never "$NEXT": that version is not on npm until the tag is released.
-    expect(pr).not.toMatch(/operator-project\.ts bump .*NEXT/);
+  test("Auto Tag leaves the operator image's baked platform alone; release.yml pins it after publish (#431)", () => {
+    // The release PR's version is not on npm until its tag is released, and pinning npm's latest
+    // there would ship chart N with N-1 baked. release.yml's bake job pins N once it is published.
+    const prRuns = steps.map((s) => s.run ?? '').join('\n');
+    expect(prRuns).not.toContain('operator-project.ts');
+    expect(prRuns).not.toContain('platform/operator/internal/installer/project');
+    const bake =
+      parse('release.yml')
+        .jobs.bake?.steps.map((s) => s.run ?? '')
+        .join('\n') ?? '';
+    expect(bake).toContain('bun scripts/operator-project.ts bump "$VERSION"');
   });
 
   test('the Test workflow checks bun.lock on every PR, release/v* included', () => {

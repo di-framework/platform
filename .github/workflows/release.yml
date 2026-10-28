@@ -16,8 +16,19 @@ on:
 #   github-release  creates the GitHub Release for a tag and attaches the Headlamp plugin tarball
 #                   the build job packed and checked against its Artifact Hub entry (#435), byte
 #                   for byte. Only this job holds contents: write.
-#   chart           packages the operator Helm chart at the tag's version and pushes it to GHCR
-#                   (#272). Only this job holds packages: write.
+#   bake            after publish, pins the operator's baked install project to the version just
+#                   published (scripts/operator-project.ts bump <version>: package.json, lockfile,
+#                   plugins.txt) and uploads those three files (#431). No write permission.
+#   operator-image  builds the operator image on each arch from the tag's source plus only that
+#                   pin, pushes it by digest and checks it bakes the released version.
+#   operator-index  joins the two into one index tagged v<version>; its digest is the release's.
+#   chart           packages the operator Helm chart at the tag's version with image.digest set to
+#                   operator-index's digest and pushes it to GHCR (#272). Chart N's image bakes
+#                   @di-framework/platform N. operator-image, operator-index and chart are the
+#                   only jobs with packages: write.
+#   project-pr      opens bot/operator-project, a PR moving main's baked install project to the
+#                   release, so the next image from main embeds it too. contents: write and
+#                   pull-requests: write, nothing else.
 # The pglite wasm npm receives is the one `make smoke` tested: it is not rebuilt after the smoke
 # test, and both jobs compare its sha256 inside the packed tarball with the tested file's.
 #
@@ -280,13 +291,309 @@ jobs:
       - name: Publish packages to npm
         run: bun scripts/publish-workspace.ts --publish-packed "$RUNNER_TEMP/npm-packages"
 
+  # The operator image bakes one install project, its default platform version (#431). Release N's
+  # image bakes @di-framework/platform N, which only exists once publish has put it on npm, so the
+  # pin moves here and not in the release PR. The bump is the only change to the tag's source:
+  # operator-image refuses any other. Only tags: a dispatch on a branch has no release version.
+  bake:
+    name: Pin the operator's baked platform to the release
+    needs: publish
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      project_sha256: ${{ steps.bump.outputs.project_sha256 }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.3'
+
+      # The bump relocks with `npm install --package-lock-only`.
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.x'
+
+      # npm can take a few minutes to serve a version it has just published, so the bump is retried
+      # (prefer-online: no cached packument). Exactly the released version: never npm's `latest`.
+      - name: Pin the baked install project to the released version
+        id: bump
+        env:
+          NPM_CONFIG_PREFER_ONLINE: 'true'
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          PROJECT=platform/operator/internal/installer/project
+          for attempt in $(seq 1 20); do
+            if bun scripts/operator-project.ts bump "$VERSION"; then
+              break
+            fi
+            if [ "$attempt" = 20 ]; then
+              echo "::error::could not pin the operator's baked install project to @di-framework/platform@$VERSION"
+              exit 1
+            fi
+            echo "attempt $attempt failed; npm may not serve $VERSION yet, retrying in 30s"
+            sleep 30
+          done
+          pinned="$(jq -er '.dependencies["@di-framework/platform"]' "$PROJECT/package.json")"
+          locked="$(jq -er '.packages["node_modules/@di-framework/platform"].version' "$PROJECT/package-lock.json")"
+          if [ "$pinned" != "$VERSION" ] || [ "$locked" != "$VERSION" ]; then
+            echo "::error::the baked install project pins $pinned and locks $locked, not the release $VERSION"
+            exit 1
+          fi
+          changed="$(git status --porcelain --untracked-files=all | grep -v " $PROJECT/" || true)"
+          if [ -n "$changed" ]; then
+            echo "::error::the bump changed files outside $PROJECT:"
+            echo "$changed"
+            exit 1
+          fi
+          sum="$(cd "$PROJECT" && sha256sum package.json package-lock.json plugins.txt | sha256sum | cut -d' ' -f1)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "project_sha256=$sum" >> "$GITHUB_OUTPUT"
+          git diff --stat
+          echo "Baked install project pinned to @di-framework/platform@$VERSION (files sha256:$sum)"
+
+      - name: Upload the baked install project
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: operator-project
+          path: |
+            platform/operator/internal/installer/project/package.json
+            platform/operator/internal/installer/project/package-lock.json
+            platform/operator/internal/installer/project/plugins.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  # The tag's source plus bake's three files, on native amd64 and arm64 runners like
+  # platform-operator-image.yml. The binary is compiled in the same build from the same
+  # package.json, so it embeds the version the image bakes. Pushed by digest only: the per-arch
+  # images get no tag, and the registry cache is read but never written, so this never moves a tag
+  # the main-branch image workflow uses (<sha>, src-<hash>, buildcache-*).
+  operator-image:
+    name: Build the release operator image on ${{ matrix.platform }}
+    needs: bake
+    if: github.ref_type == 'tag'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Require di-framework/platform
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY}" != "di-framework/platform" ]]; then
+            echo "::error::This job publishes ghcr.io/di-framework/platform-operator and only runs in di-framework/platform"
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the baked install project
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: operator-project
+          path: ${{ runner.temp }}/operator-project
+
+      # The build context is the tag's source with only the three pinned files replaced.
+      - name: Apply the release pin
+        env:
+          VERSION: ${{ needs.bake.outputs.version }}
+          PROJECT_SHA256: ${{ needs.bake.outputs.project_sha256 }}
+        run: |
+          set -euo pipefail
+          PROJECT=platform/operator/internal/installer/project
+          if [ "$VERSION" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::bake pinned $VERSION, not the release ${GITHUB_REF_NAME#v}"
+            exit 1
+          fi
+          for f in package.json package-lock.json plugins.txt; do
+            cp "$RUNNER_TEMP/operator-project/$f" "$PROJECT/$f"
+          done
+          sum="$(cd "$PROJECT" && sha256sum package.json package-lock.json plugins.txt | sha256sum | cut -d' ' -f1)"
+          if [[ ! "$PROJECT_SHA256" =~ ^[0-9a-f]{64}$ || "$sum" != "$PROJECT_SHA256" ]]; then
+            echo "::error::downloaded install project ($sum) differs from the one bake pinned ($PROJECT_SHA256)"
+            exit 1
+          fi
+          changed="$(git status --porcelain --untracked-files=all | grep -v " $PROJECT/" || true)"
+          if [ -n "$changed" ]; then
+            echo "::error::the build context differs from $GITHUB_REF_NAME outside $PROJECT:"
+            echo "$changed"
+            exit 1
+          fi
+          git diff --stat
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: platform/operator
+          platforms: ${{ matrix.platform }}
+          provenance: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/di-framework/platform
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.bake.outputs.version }}
+            org.opencontainers.image.description=di-framework platform operator (PlatformInstance controller)
+          outputs: type=image,name=ghcr.io/di-framework/platform-operator,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=ghcr.io/di-framework/platform-operator:buildcache-${{ matrix.arch }}
+
+      # Runs the pushed image on this runner's arch: it must bake the released platform from the
+      # same package.json the binary embeds.
+      - name: Check the image bakes the release
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ needs.bake.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::build did not return a digest"
+            exit 1
+          fi
+          image="ghcr.io/di-framework/platform-operator@${DIGEST}"
+          baked="$(docker run --rm --pull always --entrypoint node "$image" -p \
+            "require('/opt/platform-operator/project/node_modules/@di-framework/platform/package.json').version")"
+          if [ "$baked" != "$VERSION" ]; then
+            echo "::error::$image bakes @di-framework/platform@$baked, not the release $VERSION"
+            exit 1
+          fi
+          docker run --rm --entrypoint cat "$image" /opt/platform-operator/project/package.json \
+            > "$RUNNER_TEMP/baked-package.json"
+          if ! cmp "$RUNNER_TEMP/baked-package.json" platform/operator/internal/installer/project/package.json; then
+            echo "::error::$image bakes a package.json other than the one its binary was built with"
+            exit 1
+          fi
+          echo "$image bakes @di-framework/platform@$baked"
+          mkdir -p "${RUNNER_TEMP}/digests"
+          : > "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: operator-release-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests
+          if-no-files-found: error
+          retention-days: 7
+
+  # One multi-arch index for the release, tagged v<version> (a tag the main-branch workflow never
+  # writes). Its digest is what chart N pins.
+  operator-index:
+    name: Publish the release operator index
+    needs: [bake, operator-image]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+    steps:
+      - name: Download amd64 digest
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: operator-release-digest-amd64
+          path: ${{ runner.temp }}/digests
+
+      - name: Download arm64 digest
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: operator-release-digest-arm64
+          path: ${{ runner.temp }}/digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push the index
+        id: index
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          VERSION: ${{ needs.bake.outputs.version }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find . -type f | sort)
+          if (( ${#files[@]} != 2 )); then
+            echo "::error::expected 2 image digests, found ${#files[@]}"
+            exit 1
+          fi
+          args=()
+          for file in "${files[@]}"; do
+            hex="$(basename "${file}")"
+            if [[ ! "${hex}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::unexpected digest file ${hex}"
+              exit 1
+            fi
+            args+=("ghcr.io/di-framework/platform-operator@sha256:${hex}")
+          done
+          docker buildx imagetools create \
+            --metadata-file "${RUNNER_TEMP}/operator-index.json" \
+            --tag "ghcr.io/di-framework/platform-operator:v${VERSION}" \
+            "${args[@]}"
+          digest="$(jq -er '.["containerimage.descriptor"].digest' "${RUNNER_TEMP}/operator-index.json")"
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::manifest list did not return an index digest"
+            exit 1
+          fi
+          pinned="ghcr.io/di-framework/platform-operator@${digest}"
+          docker buildx imagetools inspect --raw "${pinned}" > "${RUNNER_TEMP}/index.json"
+          jq -e '[.manifests[] | select(.platform.os != "unknown") | .platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]' "${RUNNER_TEMP}/index.json"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          {
+            echo '### Release operator image'
+            echo
+            # shellcheck disable=SC2016 # the backticks are Markdown, not expansions
+            printf '```\n%s\n```\n' "${pinned}"
+            echo
+            echo "Tagged \`v${VERSION}\`; bakes @di-framework/platform@${VERSION}. Both linux/amd64 and linux/arm64 are included."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
   # The platform operator's Helm chart (#272), at the release's version, pushed as an OCI chart to
   # ghcr.io/di-framework/charts/platform-operator. Only tags: a dispatch on a branch has no
-  # release version. It packages the chart as checked in (Headlamp is vendored in charts/), so it
-  # builds and fetches nothing else.
+  # release version. It packages the chart as checked in (Headlamp is vendored in charts/), with
+  # image.digest set to the release image operator-index pushed, so chart N runs an operator that
+  # bakes @di-framework/platform N. It builds and fetches nothing else.
   chart:
     name: Publish the operator Helm chart
-    needs: build
+    needs: [build, operator-index]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
@@ -311,26 +618,35 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/helm" --strip-components=1 linux-amd64/helm
           echo "$RUNNER_TEMP/helm" >> "$GITHUB_PATH"
 
-      # The release version is the tag without its `v`, and must be the version package.json
-      # carries at that tag.
-      # Until the image pin PR rewrites the placeholder in values.yaml, the chart cannot install
-      # (it refuses an unpinned image.digest), so it is not published, but the release goes on:
-      # npm and the GitHub Release do not wait for the operator image pin.
-      - name: Check the operator image digest is pinned
+      # The chart pins the release's own image, not main's latest image from values.yaml: that one
+      # bakes an older platform (#431).
+      - name: Pin the release operator image
         id: pin
+        env:
+          DIGEST: ${{ needs.operator-index.outputs.digest }}
         run: |
           set -euo pipefail
-          DIGEST="$(sed -n 's/^  digest: *//p' platform/operator/chart/values.yaml)"
-          if [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "pinned=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::chart not published: image.digest in platform/operator/chart/values.yaml is not pinned yet (${DIGEST})"
-            echo "pinned=false" >> "$GITHUB_OUTPUT"
+          VALUES=platform/operator/chart/values.yaml
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::operator-index returned no image digest (${DIGEST}); not publishing the chart"
+            exit 1
           fi
+          if [ "$(grep -c '^  digest: ' "$VALUES")" != 1 ]; then
+            echo "::error::$VALUES must have exactly one image digest line"
+            exit 1
+          fi
+          sed "s/^  digest: .*$/  digest: ${DIGEST}/" "$VALUES" > "$RUNNER_TEMP/values.yaml"
+          mv "$RUNNER_TEMP/values.yaml" "$VALUES"
+          if [ "$(sed -n 's/^  digest: *//p' "$VALUES")" != "$DIGEST" ]; then
+            echo "::error::could not pin $VALUES to ${DIGEST}"
+            exit 1
+          fi
+          echo "The chart pins ghcr.io/di-framework/platform-operator@${DIGEST}"
 
+      # The release version is the tag without its `v`, and must be the version package.json
+      # carries at that tag.
       - name: Package the chart
         id: package
-        if: steps.pin.outputs.pinned == 'true'
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
@@ -360,7 +676,6 @@ jobs:
       # helm 3 packaging is not reproducible and helm push overwrites a tag, so a re-run would
       # replace a released chart with different bytes. Push only when the version is not there yet.
       - name: Push the chart to GHCR
-        if: steps.pin.outputs.pinned == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TARBALL: ${{ steps.package.outputs.tarball }}
@@ -440,3 +755,86 @@ jobs:
               echo "Uploaded $NAME to $TAG"
             fi
           done
+
+  # Moves main's baked install project to the release, so the next operator image built from main
+  # (platform-operator-image.yml) embeds and bakes it too. The PR is bot/operator-project; it is
+  # opened with GITHUB_TOKEN, so a maintainer starts its CI and merges it, and that merge (a push to
+  # main changing an image input) publishes the next main image and its pin PR. Main is bumped on
+  # its own package.json, so a template change made there since the tag is kept. A main that
+  # already pins this release or a newer one is left alone.
+  project-pr:
+    name: Open the baked platform PR for main
+    needs: chart
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.3'
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.x'
+
+      - name: Open or update the PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NPM_CONFIG_PREFER_ONLINE: 'true'
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          PROJECT=platform/operator/internal/installer/project
+          branch=bot/operator-project
+          current="$(jq -er '.dependencies["@di-framework/platform"]' "$PROJECT/package.json")"
+          newest="$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -n 1)"
+          if [ "$current" = "$VERSION" ] || [ "$newest" != "$VERSION" ]; then
+            echo "::notice::main already bakes @di-framework/platform@$current; no PR for $VERSION"
+            exit 0
+          fi
+          bun scripts/operator-project.ts bump "$VERSION"
+          if git diff --quiet; then
+            echo "::notice::main's baked install project is already at $VERSION"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          title="chore(operator): bake @di-framework/platform ${VERSION}"
+          git switch -C "$branch"
+          git add "$PROJECT"
+          git commit -m "$title"
+          git push --force origin "HEAD:refs/heads/${branch}"
+          body="${RUNNER_TEMP}/operator-project-pr.md"
+          # shellcheck disable=SC2016 # the backticks are Markdown, not expansions
+          {
+            echo "Release ${GITHUB_REF_NAME} published \`@di-framework/platform@${VERSION}\`, and its chart runs an operator image that bakes it ([run](${RUN_URL}))."
+            echo "This moves main's baked install project (\`${PROJECT}\`) to ${VERSION} with \`bun scripts/operator-project.ts bump ${VERSION}\`, so the next operator image built from main embeds and bakes it too (#431)."
+            echo
+            git diff --stat HEAD~1 HEAD
+            echo
+            echo '**A maintainer has to approve and run this PR'"'"'s workflows before it can merge.**'
+            echo 'It was opened with `GITHUB_TOKEN`, and GitHub does not trigger workflows for pull requests'
+            echo 'that `GITHUB_TOKEN` creates or updates, so no checks start on their own. Close and reopen'
+            echo 'the PR (or push a commit to the branch) to run CI. Merging it publishes the next operator'
+            echo 'image from main, and that opens its pin PR.'
+          } > "${body}"
+          existing="$(BRANCH="${branch}" gh pr list --head "${branch}" --base main --state open \
+            --json number,author,headRefName \
+            --jq 'map(select(.author.login == "app/github-actions" and .headRefName == env.BRANCH)) | .[0].number // empty')"
+          if [[ -n "${existing}" ]]; then
+            gh pr edit "${existing}" --title "${title}" --body-file "${body}"
+            echo "Updated PR #${existing}"
+          else
+            gh pr create --base main --head "${branch}" --title "${title}" --body-file "${body}"
+          fi

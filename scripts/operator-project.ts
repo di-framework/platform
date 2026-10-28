@@ -7,15 +7,15 @@
  * an instance installs without npm or the Pulumi plugin host. The operator embeds it, and the image
  * bakes the project and its Pulumi plugins from these files, so the three cannot disagree.
  *
- * The release PR (auto-tag.yml) runs:
- *   bun scripts/operator-project.ts bump
- *     pins @di-framework/platform to the newest published release (npm's `latest`), which is never
- *     the release the PR is about to publish: that one is not on npm until its tag is released.
- *     Rewrites package-lock.json (`npm install --package-lock-only`) and plugins.txt from each
- *     @pulumi provider's checksums on its GitHub release. A pin that is already current changes
- *     nothing.
  *   bun scripts/operator-project.ts bump <version>
- *     pins an exact published version instead.
+ *     pins @di-framework/platform to exactly that published version. Rewrites package-lock.json
+ *     (`npm install --package-lock-only`) and plugins.txt from each @pulumi provider's checksums on
+ *     its GitHub release. A pin that is already current changes nothing. release.yml runs it with
+ *     the release's own version once publish has put it on npm: the `bake` job, whose files the
+ *     release's operator image is built with (so chart N bakes N), and the `project-pr` job, which
+ *     opens the PR moving main to it.
+ *   bun scripts/operator-project.ts bump
+ *     pins npm's `latest` instead (by hand).
  *   Either form refuses a version older than the current pin (a dist-tag rollback, or a manual
  *   bump ahead of `latest`), so the baked default never moves backwards.
  *
