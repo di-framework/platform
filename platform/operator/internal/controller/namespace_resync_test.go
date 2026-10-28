@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -94,11 +96,13 @@ users:
 
 // stateInstaller keeps install state the way Pulumi does: it holds the credentials of the
 // cluster it was created against, and an update against a cluster with other credentials fails
-// as the refresh did in Layer 4 run 4 (#490). Uninstall drops it.
+// as the refresh did in Layer 4 run 4 (#490). Uninstall drops it, unless failUninstalls is set:
+// that many Uninstall calls fail and keep it.
 type stateInstaller struct {
-	state      []byte
-	installs   []installer.Options
-	uninstalls []installer.UninstallOptions
+	state          []byte
+	installs       []installer.Options
+	uninstalls     []installer.UninstallOptions
+	failUninstalls int
 }
 
 func (s *stateInstaller) Install(_ context.Context, req installer.Request, opts installer.Options) (installer.Result, error) {
@@ -113,6 +117,10 @@ func (s *stateInstaller) Status(context.Context, installer.Request) (installer.S
 	return installer.State{Exists: s.state != nil}, nil
 }
 func (s *stateInstaller) Uninstall(_ context.Context, _ installer.Request, opts installer.UninstallOptions) error {
+	if s.failUninstalls > 0 {
+		s.failUninstalls--
+		return errors.New("pulumi: the state backend is unavailable")
+	}
 	s.state = nil
 	s.uninstalls = append(s.uninstalls, opts)
 	return nil
@@ -226,6 +234,26 @@ func (h *nsHarness) installed() *v1alpha1.PlatformInstance {
 	return inst
 }
 
+// assertHostResynced checks the end of a host-namespace resync: the install state dropped once,
+// one reinstall (Installed=Resync) on the second vCluster, created in the namespace ns made
+// again, the instance Ready on it, and no restart of its control plane.
+func (h *nsHarness) assertHostResynced(ns string) *v1alpha1.PlatformInstance {
+	h.t.Helper()
+	inst := h.get()
+	if len(h.in.installs) != 2 || !h.in.installs[1].Refresh || !h.in.installs[1].ReinstallRelease {
+		h.t.Fatalf("want one reinstall: %+v", h.in.installs)
+	}
+	if conditionReason(inst, v1alpha1.ConditionInstalled) != ReasonResync ||
+		!meta.IsStatusConditionTrue(inst.Status.Conditions, v1alpha1.ConditionReady) ||
+		inst.Status.Phase != v1alpha1.PhaseReady || inst.Status.Target != (v1alpha1.TargetStatus{ServiceUID: "svc-uid-2"}) {
+		h.t.Fatalf("after the resync: %+v", inst.Status)
+	}
+	if n := h.namespace(ns); n == nil || n.DeletionTimestamp != nil || h.helm.n != 2 || h.podDeletes != 0 || len(h.in.uninstalls) != 1 {
+		h.t.Fatalf("namespace %+v, %d vclusters, %d pod restarts, %d state drops", n, h.helm.n, h.podDeletes, len(h.in.uninstalls))
+	}
+	return inst
+}
+
 // Deleting an installed instance's host namespace (#490) is a resync, like an owner-Service
 // delete: Ready drops in the first round that sees the namespace terminating and the stale
 // install state is dropped; nothing is created while it terminates; once it is gone the namespace
@@ -265,21 +293,10 @@ func TestHostNamespaceDeleteResyncs(t *testing.T) {
 	for range 6 {
 		h.step()
 	}
-	inst = h.get()
 	if len(h.errs) != 0 {
 		t.Fatalf("errors during the resync: %v", h.errs)
 	}
-	if len(h.in.installs) != 2 || !h.in.installs[1].Refresh || !h.in.installs[1].ReinstallRelease {
-		t.Fatalf("want one reinstall: %+v", h.in.installs)
-	}
-	if conditionReason(inst, v1alpha1.ConditionInstalled) != ReasonResync ||
-		!meta.IsStatusConditionTrue(inst.Status.Conditions, v1alpha1.ConditionReady) ||
-		inst.Status.Phase != v1alpha1.PhaseReady || inst.Status.Target != (v1alpha1.TargetStatus{ServiceUID: "svc-uid-2"}) {
-		t.Fatalf("after the resync: %+v", inst.Status)
-	}
-	if n := h.namespace(ns); n == nil || n.DeletionTimestamp != nil || h.helm.n != 2 || h.podDeletes != 0 || len(h.in.uninstalls) != 1 {
-		t.Fatalf("namespace %+v, %d vclusters, %d pod restarts, %d state drops", n, h.helm.n, h.podDeletes, len(h.in.uninstalls))
-	}
+	inst = h.assertHostResynced(ns)
 	var secret corev1.Secret
 	if err := h.c.Get(context.Background(), client.ObjectKey{Namespace: key.Namespace, Name: kubeconfigSecretName(inst)}, &secret); err != nil ||
 		!bytes.Contains(secret.Data[KubeconfigKey], []byte(base64.StdEncoding.EncodeToString([]byte("ca-2")))) {
@@ -348,4 +365,59 @@ func TestHostNamespaceDeleteStaleCache(t *testing.T) {
 		!meta.IsStatusConditionTrue(inst.Status.Conditions, v1alpha1.ConditionReady) || len(h.errs) != 0 || h.podDeletes != 0 {
 		t.Fatalf("after the resync: %d installs, %d pod restarts, errors %v, status %+v", len(h.in.installs), h.podDeletes, h.errs, inst.Status)
 	}
+}
+
+// Dropping the install state of the lost target fails (#514): the instance reports the failure
+// and records no resync marker, so the namespace isn't created again on top of the stale state.
+// Each round retries the drop; once it succeeds, the resync goes on to one reinstall.
+func TestHostNamespaceDeleteRetriesAFailedStateDrop(t *testing.T) {
+	h := newNSHarness(t, "")
+	h.installed()
+	ns := h.ns()
+	h.in.failUninstalls = 2
+	rec := events.NewFakeRecorder(20)
+	h.r.Recorder = rec
+	h.hold()
+	if err := h.c.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+		t.Fatal(err)
+	}
+	h.release(ns) // gone with the vCluster before the first round
+
+	for i := range 2 {
+		h.step()
+		inst := h.get()
+		ready := meta.FindStatusCondition(inst.Status.Conditions, v1alpha1.ConditionTargetReady)
+		if len(h.errs) != i+1 || inst.Status.Phase != v1alpha1.PhaseFailed || ready == nil ||
+			ready.Reason != "HostNamespaceDeleted" || !strings.Contains(ready.Message, "dropping the install state of the lost target failed") ||
+			meta.IsStatusConditionTrue(inst.Status.Conditions, v1alpha1.ConditionReady) {
+			t.Fatalf("round %d: errors %v, status %+v", i+1, h.errs, inst.Status)
+		}
+		if inst.Status.Target.ResyncServiceUID != "" || h.namespace(ns) != nil || h.in.state == nil ||
+			len(h.in.uninstalls) != 0 || len(h.in.installs) != 1 || h.helm.n != 1 {
+			t.Fatalf("round %d: marker %q, namespace %v, %d state drops, %d installs, %d vclusters", i+1,
+				inst.Status.Target.ResyncServiceUID, h.namespace(ns), len(h.in.uninstalls), len(h.in.installs), h.helm.n)
+		}
+	}
+
+	h.errs = nil
+	h.step()
+	if got := h.get().Status.Target.ResyncServiceUID; got != vcluster.ResyncHostNamespace || len(h.in.uninstalls) != 1 || h.in.state != nil {
+		t.Fatalf("drop succeeded: marker %q, %d state drops", got, len(h.in.uninstalls))
+	}
+	// Each attempt is announced with a Warning Event.
+	if len(rec.Events) != 3 {
+		t.Fatalf("events %d, want one per attempt (3)", len(rec.Events))
+	}
+	for i := range 3 {
+		if e := <-rec.Events; !strings.HasPrefix(e, "Warning HostNamespaceDeleted") {
+			t.Fatalf("event %d: %q", i+1, e)
+		}
+	}
+	for range 6 {
+		h.step()
+	}
+	if len(h.errs) != 0 {
+		t.Fatalf("errors during the resync: %v", h.errs)
+	}
+	h.assertHostResynced(ns)
 }

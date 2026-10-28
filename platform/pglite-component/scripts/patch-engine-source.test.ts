@@ -386,6 +386,147 @@ describe('requirePgpCfbFix', () => {
     expect(() => requirePgpCfbFix(noted)).not.toThrow();
   });
 
+  // #513: the C a compiler would see, not the text, decides. Each case below
+  // was accepted by the #504 checker although the compiled code lacks the fix.
+  const loop = '\twhile (len > 0 && ctx->pos > 0)\n';
+  const mix = '\tmix_data_t\tmix = ctx->resync ? mix_encrypt_resync : mix_encrypt_normal;\n';
+  const encryptReturn =
+    '\treturn cfb_process(ctx, data, len, dst, mix,\n\t\t\t\t\t   0 /* never ignore cipher failures for encrypt */ );\n}';
+  const ignoring = 'pgp_cfb_encrypt may ignore cipher failures (PostgreSQL 17.11, CVE-2026-14663)';
+
+  test('S1: refuses an error check commented out by // comments continued with a backslash', () => {
+    const fullCheck =
+      '\t\tif (err && !ignore_cipher_failure)\n\t\t\tereport(ERROR,\n\t\t\t\t\t(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),\n\t\t\t\t\t errmsg("encrypt error: %s", px_strerror(err))));\n';
+    const spliced = editedPgpCfb(
+      fullCheck,
+      '\t\t// spliced \\\n\t\tif (err && !ignore_cipher_failure) // \\\n\t\t\tereport(ERROR, // \\\n\t\t\t\t\t(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION), // \\\n\t\t\t\t\t errmsg("encrypt error: %s", px_strerror(err))));\n',
+    );
+    expect(() => requirePgpCfbFix(spliced)).toThrow(missing);
+    // Without the comments, a continuation is only layout.
+    const continued = editedPgpCfb(
+      PGP_CFB_ERROR_CHECK,
+      '\t\tif (err && \\\n!ignore_cipher_failure)\n\t\t\tereport(ERROR,\n',
+    );
+    expect(() => requirePgpCfbFix(continued)).not.toThrow();
+  });
+
+  test('S2: refuses an unchecked encrypt call between comment markers inside string literals', () => {
+    const hidden = editedPgpCfb(
+      loop,
+      `\telog(DEBUG1, "/*");\n\tpx_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, NULL);\n\telog(DEBUG1, "*/");\n${loop}`,
+    );
+    expect(() => requirePgpCfbFix(hidden)).toThrow('1 of 2 px_cipher_encrypt calls recognised');
+    // Comment markers in literals are text, so they cut nothing either.
+    const literals = editedPgpCfb(loop, `\telog(DEBUG1, "http://x /*", '"', '\\'');\n${loop}`);
+    expect(() => requirePgpCfbFix(literals)).not.toThrow();
+  });
+
+  test('S3: refuses an encrypt call assigned to another variable whose name ends in err', () => {
+    const myerr = editedPgpCfb(
+      PGP_CFB_ENCRYPT_CALL,
+      PGP_CFB_ENCRYPT_CALL.replace('err =', 'myerr ='),
+    );
+    expect(() => requirePgpCfbFix(myerr)).toThrow('0 of 1 px_cipher_encrypt calls recognised');
+    const member = editedPgpCfb(
+      PGP_CFB_ENCRYPT_CALL,
+      PGP_CFB_ENCRYPT_CALL.replace('err =', 'ctx->err ='),
+    );
+    expect(() => requirePgpCfbFix(member)).toThrow('0 of 1 px_cipher_encrypt calls recognised');
+  });
+
+  test('S3: inspects pgp_cfb_encrypt, not an earlier function whose name ends in pgp_cfb_encrypt', () => {
+    const decoy = editedPgpCfb(
+      'int\npgp_cfb_encrypt(',
+      'static int\nold_pgp_cfb_encrypt(PGP_CFB *ctx)\n{\n\treturn cfb_process(ctx, NULL, 0, NULL, NULL, 0);\n}\n\nint\npgp_cfb_encrypt(',
+    );
+    expect(() => requirePgpCfbFix(decoy)).not.toThrow();
+    const ignored = decoy.replace(
+      encryptReturn,
+      '\treturn cfb_process(ctx, data, len, dst, mix, 1);\n}',
+    );
+    expect(ignored).not.toBe(decoy);
+    expect(() => requirePgpCfbFix(ignored)).toThrow(ignoring);
+  });
+
+  test('S4: checks the last argument of each cfb_process call, not of the expression around it', () => {
+    const comma = editedPgpCfb(
+      encryptReturn,
+      '\treturn (cfb_process(ctx, data, len, dst, mix, 1), 0);\n}',
+    );
+    expect(() => requirePgpCfbFix(comma)).toThrow(ignoring);
+    const sum = editedPgpCfb(
+      encryptReturn,
+      '\treturn cfb_process(ctx, data, len, dst, mix, 1) + cfb_process(ctx, data, 0, dst, mix, 0);\n}',
+    );
+    expect(() => requirePgpCfbFix(sum)).toThrow(ignoring);
+    // Nested calls and commas inside an argument are part of that argument.
+    const nested = editedPgpCfb(
+      encryptReturn,
+      '\treturn cfb_process(ctx, f(data, 1), len, dst, mix, 0);\n}',
+    );
+    expect(() => requirePgpCfbFix(nested)).not.toThrow();
+  });
+
+  test('S5: inspects all of pgp_cfb_encrypt, past its first nested block', () => {
+    const later = editedPgpCfb(
+      mix,
+      `${mix}\tif (ctx->resync)\n\t{\n\t\treturn cfb_process(ctx, data, len, dst, mix, 0);\n\t}\n\tif (len)\n\t\treturn cfb_process(ctx, data, len, dst, mix, 1);\n`,
+    );
+    expect(() => requirePgpCfbFix(later)).toThrow(ignoring);
+    const guarded = editedPgpCfb(mix, `${mix}\tif (len == 0)\n\t{\n\t\treturn 0;\n\t}\n`);
+    expect(() => requirePgpCfbFix(guarded)).not.toThrow();
+  });
+
+  test('W1: splices a backslash followed by spaces or tabs before the newline', () => {
+    const fullCheck =
+      '\t\tif (err && !ignore_cipher_failure)\n\t\t\tereport(ERROR,\n\t\t\t\t\t(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),\n\t\t\t\t\t errmsg("encrypt error: %s", px_strerror(err))));\n';
+    const spliced = editedPgpCfb(
+      fullCheck,
+      '\t\t// see below \\ \n\t\tif (err && !ignore_cipher_failure) // \\ \n\t\t\tereport(ERROR, // \\\t\n\t\t\t\t\t(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION), // \\ \r\n\t\t\t\t\t errmsg("encrypt error: %s", px_strerror(err))));\n',
+    );
+    expect(() => requirePgpCfbFix(spliced)).toThrow(missing);
+  });
+
+  test('W2: refuses a $ decoy name and a parenthesised pgp_cfb_encrypt definition', () => {
+    const header = 'int\npgp_cfb_encrypt(';
+    const decoy = editedPgpCfb(
+      header,
+      'static int\nold$pgp_cfb_encrypt(PGP_CFB *ctx)\n{\n\treturn cfb_process(ctx, NULL, 0, NULL, NULL, 0);\n}\n\nint\n(pgp_cfb_encrypt)(',
+    ).replace(encryptReturn, '\treturn cfb_process(ctx, data, len, dst, mix, 1);\n}');
+    expect(() => requirePgpCfbFix(decoy)).toThrow(ignoring);
+    // `old$pgp_cfb_encrypt` is one identifier, not a definition of pgp_cfb_encrypt.
+    const dollar = editedPgpCfb(
+      header,
+      'static int\nold$pgp_cfb_encrypt(PGP_CFB *ctx)\n{\n\treturn cfb_process(ctx, NULL, 0, NULL, NULL, 1);\n}\n\nint\npgp_cfb_encrypt(',
+    );
+    expect(() => requirePgpCfbFix(dollar)).not.toThrow();
+  });
+
+  test('W3: reads digraphs as the brackets they spell', () => {
+    const digraph = editedPgpCfb(
+      mix,
+      `${mix}\n\tif (len == 0) <% return cfb_process(ctx, data, len, dst, mix, 0); }\n\treturn cfb_process(ctx, data, len, dst, mix, 1);\n}\nstatic int\nunused(void)\n{\n`,
+    );
+    expect(() => requirePgpCfbFix(digraph)).toThrow(ignoring);
+    const balanced = editedPgpCfb(mix, `${mix}\tif (len == 0) <% return 0; %>\n`);
+    expect(() => requirePgpCfbFix(balanced)).not.toThrow();
+  });
+
+  test('refuses preprocessor conditionals inside pgp_cfb_encrypt', () => {
+    for (const directive of ['#if 0', '#ifdef X', '#ifndef X', '%:if 0']) {
+      const conditional = editedPgpCfb(mix, `${mix}${directive}\n\t}\n#endif\n`);
+      expect(() => requirePgpCfbFix(conditional)).toThrow(ignoring);
+    }
+  });
+
+  test('refuses truncated input with an unclosed bracket', () => {
+    const call = 'return cfb_process(ctx, data, len, dst, mix,';
+    const cut = UPSTREAM_PGP_CFB.indexOf(call);
+    expect(cut).toBeGreaterThan(0);
+    const truncated = UPSTREAM_PGP_CFB.slice(0, cut + 'return cfb_process(ctx, data'.length);
+    expect(() => requirePgpCfbFix(truncated)).toThrow(ignoring);
+  });
+
   test('names what to inspect when the expected pattern is not recognised', () => {
     expect(() => requirePgpCfbFix(UNFIXED_PGP_CFB)).toThrow(
       'not in the expected pattern (0 of 1 px_cipher_encrypt calls recognised as checked)',
