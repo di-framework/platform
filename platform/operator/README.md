@@ -294,11 +294,14 @@ these NetworkPolicies in every instance host namespace (`pi-<namespace>-<name>-<
   port 8443, which serves both the API (`svc/vcluster:443`) and the kubelet port (10250) of the
   `vcluster-node-*` Services;
 - `platform-operator-allow-dns`: the instance's synced pods get in to its CoreDNS on 53 (UDP and TCP);
-- `platform-operator-allow-platform-nats`: pods of the instance's `wasmcloud` namespace get in to its NATS
+- `platform-operator-allow-platform-nats`: the host group and runtime-operator pods of the instance's
+  `wasmcloud` namespace (`wasmcloud.com/name` in `hostgroup`, `runtime-operator`) get in to its NATS
   (`wasmcloud.com/name=nats`) on 4222. The platform creates its own NATS policies only after the wasmcloud Helm
   release, which waits for `hostgroup-default` and `runtime-operator`, and those need NATS; without this rule a
-  fresh install never becomes Ready. Both sides are selected by `vcluster.loft.sh/namespace`, which the syncer
-  sets from the pod's real namespace;
+  fresh install never becomes Ready. It admits a subset of what the platform's `di-platform-nats` admits, so the
+  gateway and the platform controller are not NATS clients. Both sides are also selected by
+  `vcluster.loft.sh/namespace=wasmcloud`, which the syncer sets from the pod's real namespace, so a pod elsewhere
+  that sets `wasmcloud.com/name` on itself gets nothing;
 - `platform-operator-allow-issuer`, only while `tenantAuth.issuerUpstream` is set: the platform's tenant-auth
   pods (`platform.di-framework.dev/component=tenant-auth`) get in to the pods of the namespace `issuerUpstream`
   names, on its port and on `issuerUpstreamPodPort`, which the platform opens on the egress side. The syncer
@@ -329,8 +332,8 @@ What this isolates:
   services (NATS, host group, runtime-operator, `wasmcloud-http`), its CoreDNS, its vCluster API or its kubelet
   port. The platform's own synced policies name their peers by namespace (platform #462), so they admit no
   other instance either.
-- Inside the instance, the operator lets pods reach only DNS, the API and the issuer, plus the control plane's
-  own calls. The platform's synced policies decide the rest, so a pod in a namespace that is neither the
+- Inside the instance, the operator lets pods reach only DNS, the API and the issuer, and lets the `wasmcloud`
+  host group and runtime-operator reach NATS, plus the control plane's own calls. The platform's synced policies decide the rest, so a pod in a namespace that is neither the
   platform's nor a tenant's can't reach the gateway, a tenant's host group (`di-tenant-gateway`) or NATS.
 
 What it doesn't:
