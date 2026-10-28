@@ -83,9 +83,19 @@ type Pulumi struct {
 	Log io.Writer
 	// NPM is the absolute path of npm; empty uses DefaultNPM.
 	NPM string
+	// BakedProject is the install project the image baked for DefaultVersion (package.json,
+	// package-lock.json and node_modules); empty uses DefaultBakedProject. An instance at the version
+	// it holds gets a copy of it instead of `npm install`.
+	BakedProject string
+	// BakedPlugins holds the Pulumi plugins the image baked, linked into Pulumi's plugin cache
+	// before each operation; empty uses DefaultBakedPlugins.
+	BakedPlugins string
 
 	// npmInstall installs the project's dependencies; nil runs `npm install`.
 	npmInstall func(ctx context.Context, dir string) error
+	// pluginCache is Pulumi's plugin cache directory; nil uses workspace.GetPluginDir
+	// ($PULUMI_HOME/plugins).
+	pluginCache func() (string, error)
 	// uninstallRelease uninstalls a Helm release in the target; nil uses Helm.
 	uninstallRelease func(ctx context.Context, kubeconfig []byte, namespace, name string) error
 	// open opens the instance's stack; nil uses the Automation API.
@@ -360,21 +370,13 @@ func (p *Pulumi) writeProject(ctx context.Context, req Request, projectDir, stat
 			return err
 		}
 	}
-	pkg, err := json.MarshalIndent(map[string]any{
-		"private": true,
-		"main":    "index.ts",
-		"dependencies": map[string]string{
-			"@di-framework/platform": req.Version,
-			"typescript":             "5.9.3",
-			"@types/node":            "22.18.0",
-		},
-	}, "", "  ")
+	pkg, err := projectPackageJSON(req.Version)
 	if err != nil {
 		return err
 	}
 	tsconfig := `{"compilerOptions":{"target":"ES2022","module":"commonjs","moduleResolution":"node","strict":true,"skipLibCheck":true,"esModuleInterop":true},"include":["index.ts"]}` + "\n"
 	files := map[string][]byte{
-		"package.json":  append(pkg, '\n'),
+		"package.json":  pkg,
 		"index.ts":      []byte(program),
 		"tsconfig.json": []byte(tsconfig),
 		"kubeconfig":    req.Kubeconfig,
@@ -393,14 +395,50 @@ func (p *Pulumi) writeProject(ctx context.Context, req Request, projectDir, stat
 			return nil
 		}
 	}
+	if err := p.installDependencies(ctx, req.Version, projectDir); err != nil {
+		return fmt.Errorf("install @di-framework/platform@%s: %w", req.Version, err)
+	}
+	return os.WriteFile(stamp, []byte(req.Version), 0o600)
+}
+
+// installDependencies installs the project's node_modules: a copy of the baked project when the
+// image baked this version, so the install needs no npm registry, and `npm install` otherwise.
+func (p *Pulumi) installDependencies(ctx context.Context, version, projectDir string) error {
+	baked, why := p.bakedProject(version)
+	if baked != "" {
+		p.logf("installing %s@%s from the operator image (%s)\n", PlatformPackage, version, baked)
+		return copyBakedProject(baked, projectDir)
+	}
+	p.logf("installing %s@%s with npm: %s\n", PlatformPackage, version, why)
 	install := p.npmInstall
 	if install == nil {
 		install = p.runNPM
 	}
-	if err := install(ctx, projectDir); err != nil {
-		return fmt.Errorf("install @di-framework/platform@%s: %w", req.Version, err)
+	return install(ctx, projectDir)
+}
+
+// linkPlugins links the baked Pulumi plugins into Pulumi's plugin cache. A failure only costs the
+// download it would have saved, so it is logged, not returned.
+func (p *Pulumi) linkPlugins() {
+	baked := p.BakedPlugins
+	if baked == "" {
+		baked = DefaultBakedPlugins
 	}
-	return os.WriteFile(stamp, []byte(req.Version), 0o600)
+	cacheDir := p.pluginCache
+	if cacheDir == nil {
+		cacheDir = workspace.GetPluginDir
+	}
+	cache, err := cacheDir()
+	if err == nil {
+		var linked []string
+		linked, err = linkBakedPlugins(baked, cache)
+		for _, name := range linked {
+			p.logf("linked the baked Pulumi plugin %s into %s\n", name, cache)
+		}
+	}
+	if err != nil {
+		p.logf("baked Pulumi plugins not linked (Pulumi downloads what it needs): %v\n", err)
+	}
 }
 
 func (p *Pulumi) runNPM(ctx context.Context, dir string) error {
@@ -418,6 +456,7 @@ func (p *Pulumi) runNPM(ctx context.Context, dir string) error {
 }
 
 func (p *Pulumi) openStack(ctx context.Context, id, projectDir, stateDir string) (stack, error) {
+	p.linkPlugins()
 	if p.open != nil {
 		return p.open(ctx, p, id, projectDir, stateDir)
 	}

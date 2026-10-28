@@ -325,6 +325,19 @@ describe('the workflows keep bun.lock in step with the release bump', () => {
     expect(steps.find(node)?.with?.['node-version']).toBe(ciNode?.with?.['node-version']);
   });
 
+  test("Auto Tag moves the operator image's baked platform to the newest published release (#431)", () => {
+    const pr = steps.map((s) => s.run ?? '').find((r) => r.includes('git commit')) ?? '';
+    const order = [
+      'bun scripts/operator-project.ts bump\n',
+      'git add platform/operator/internal/installer/project\n',
+      'git commit',
+    ].map((s) => pr.indexOf(s));
+    expect(order.every((i) => i > -1)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // Never "$NEXT": that version is not on npm until the tag is released.
+    expect(pr).not.toMatch(/operator-project\.ts bump .*NEXT/);
+  });
+
   test('the Test workflow checks bun.lock on every PR, release/v* included', () => {
     const runs = ciSteps.map((s) => s.run ?? '');
     const install = runs.indexOf('bun install --frozen-lockfile');

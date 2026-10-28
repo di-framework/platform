@@ -434,8 +434,35 @@ ghcr.io/di-framework/platform-operator@sha256:0e5e223ba7332670e203072080fcf584d0
 ```
 
 Each publish is also tagged with its commit SHA and `src-<hash>` (the hash of its inputs); only the digest is
-immutable. The image doesn't yet carry the pinned `@di-framework/platform` package or the Pulumi Kubernetes
-provider plugin, so each instance's first install downloads both. Baking them in is tracked in #431.
+immutable.
+
+### Default platform version
+
+The image also bakes one install project: `@di-framework/platform` at the operator's **default platform
+version** with its dependencies, and the Pulumi resource plugins those need (`kubernetes` and `command`), so an
+instance at that version installs with neither npm nor the Pulumi plugin host reachable (#431). The version is
+the `@di-framework/platform` pin in
+[`internal/installer/project/package.json`](internal/installer/project/package.json); the operator logs it at
+startup (`default platform version`). `spec.version` stays required: the default is only the version that
+installs without egress.
+
+- The operator embeds that `package.json`, and the image installs it with `npm ci` against the committed
+  `package-lock.json` (every package checked against its integrity, install scripts skipped) at
+  `/opt/platform-operator/project` (`--baked-project`). Every instance's `package.json` is the same file with
+  the platform set to its `spec.version`, so the baked project is used only when the dependencies match
+  exactly.
+- The plugins are listed with their sha256 in `internal/installer/project/plugins.txt`, downloaded from
+  get.pulumi.com at build time, checked, and baked at `/opt/platform-operator/pulumi-plugins`
+  (`--baked-plugins`). The build fails when a `@pulumi/*` provider package in the lockfile has no plugin
+  there. Before each Pulumi operation the installer links them into Pulumi's plugin cache
+  (`$PULUMI_HOME/plugins`, under `/home/node` in the chart), which stays writable for other versions.
+- An instance at the default version gets a copy of the baked `node_modules` in its project on the state
+  volume; any other version runs `npm install` there, as before, and Pulumi downloads the plugins it lacks.
+- The release PR moves the pin to the newest published release (`bun scripts/operator-project.ts bump`,
+  which rewrites the lockfile and `plugins.txt`). That is the release before the one the PR publishes, which
+  is not on npm until its tag is released. The release PR is merged by the Auto Tag bot, which starts no
+  image build, so the next image publish (the next push to main that changes the operator's image inputs)
+  carries the new pin; until then the pinned image bakes the previous one.
 
 The first publish creates the `platform-operator` GHCR package as private. An org admin must make it public
 once (Package settings, then Change visibility), because Layer 4 (#274) pulls the image anonymously.
@@ -449,8 +476,9 @@ The operator needs:
   narrowing the chart's needs is follow-up work.
 - **a host policy engine.** Instances run with `networkPolicyEngine: existing`, so the host cluster must enforce
   NetworkPolicy (see [Network policy engine](#network-policy-engine)).
-- **egress to npm, the Pulumi plugin host and the platform's images**, since each install runs `npm install`
-  and fetches the Pulumi Kubernetes provider plugin.
+- **egress to the platform's images.** An instance at the [default platform version](#default-platform-version)
+  needs nothing else; one at any other version also needs npm (each install runs `npm install`) and the Pulumi
+  plugin host (get.pulumi.com or the providers' GitHub releases) for the provider plugins its packages need.
 - **its own namespace**, which every instance host namespace admits to the vCluster API (see
   [Host-namespace isolation](#host-namespace-isolation)): read from its service account, or
   `--cleanup-namespace` when run outside a cluster.

@@ -1,0 +1,9 @@
+# The Pulumi resource plugins the operator image bakes for this project (#431): one line per plugin
+# and architecture, `<name> <version> <arch> <sha256 of pulumi-resource-<name>-v<version>-linux-<arch>.tar.gz>`.
+# The versions are the @pulumi/<name> versions in package-lock.json; the digests are from each
+# provider's GitHub release (pulumi-<name>_<version>_checksums.txt). Written by
+# `bun scripts/operator-project.ts bump`; installer tests and the image build check them.
+command 1.2.1 amd64 71377999d1da39f54e94d9fe2950f6bb9a0a090a577094866373397dcad2e800
+command 1.2.1 arm64 d294ee36cc97499bc8c5d7905c6affeb4b768af50c26d6aeaa9a8f38d06fa558
+kubernetes 4.34.2 amd64 b2a3471a897d8d4aa5c6f0ea2933d363dfa72bee8ed651a16246a09e3e728bb6
+kubernetes 4.34.2 arm64 1456c1f9624c4cd68caf03928d4c34d6807cbe668fd917c6220ecc09eab70d26

@@ -231,11 +231,11 @@ describe('platform-operator chart', () => {
     const args = container.args as string[];
     const names = args.map((arg) => /^--([a-z-]+)=/.exec(arg)?.[1]);
     for (const name of names) expect(defined).toContain(name as string);
-    // npm keeps its image default, and cleanup-namespace (#426) defaults to the operator's own
-    // namespace unless cleanupNamespace is set; everything else is set from values.
-    expect(names.sort()).toEqual(
-      defined.filter((f) => f !== 'npm' && f !== 'cleanup-namespace').sort(),
-    );
+    // npm and the baked project and plugins (#431) keep their image defaults, and cleanup-namespace
+    // (#426) defaults to the operator's own namespace unless cleanupNamespace is set; everything
+    // else is set from values.
+    const imageDefaults = ['npm', 'baked-project', 'baked-plugins', 'cleanup-namespace'];
+    expect(names.sort()).toEqual(defined.filter((f) => !imageDefaults.includes(f)).sort());
     // Nothing reads POD_NAMESPACE: the operator takes its namespace from the ServiceAccount.
     expect(container.env).toBeUndefined();
     expect(args).toContain('--state-dir=/var/lib/platform-operator');
