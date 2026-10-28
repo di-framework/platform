@@ -50,14 +50,17 @@ export class FakeIdentityAdmin {
 
   /** The in-memory {@link OAuthClientRegistry} over this store. */
   registry(): OAuthClientRegistry {
+    /** Runs `operation` as a promise, so a thrown admin error becomes a rejection. */
+    const later = <T>(operation: () => T): Promise<T> => Promise.resolve().then(operation);
     return {
-      create: async (spec, key) =>
-        this.create({ ...spec, browser: spec.redirectUris.length > 0 }, key),
-      get: async (clientId) => this.get(clientId),
-      rotate: async (clientId, version, key) => this.rotate(clientId, { version }, key),
-      delete: async (clientId) => {
-        if (this.clients.has(clientId)) this.revoke(clientId);
-      },
+      create: (spec, key) =>
+        later(() => this.create({ ...spec, browser: spec.redirectUris.length > 0 }, key)),
+      get: (clientId) => later(() => this.get(clientId)),
+      rotate: (clientId, version, key) => later(() => this.rotate(clientId, { version }, key)),
+      delete: (clientId) =>
+        later(() => {
+          if (this.clients.has(clientId)) this.revoke(clientId);
+        }),
     };
   }
 
@@ -202,8 +205,9 @@ function normalise(raw: Record<string, unknown>): CreateRequest {
 
 /** `OAuthService.same`: the replayed create asked for the same client. */
 function same(existing: StoredClient, request: CreateRequest): boolean {
+  const sorted = (items: string[]) => [...items].sort((a, b) => a.localeCompare(b)).join('\n');
   const sameSet = (left: string[], right: string[]) =>
-    left.length === right.length && [...left].sort().join('\n') === [...right].sort().join('\n');
+    left.length === right.length && sorted(left) === sorted(right);
   return (
     existing.clientId === request.clientId &&
     existing.organizationSlug === request.organizationSlug &&

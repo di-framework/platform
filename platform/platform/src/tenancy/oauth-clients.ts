@@ -301,7 +301,9 @@ export class HttpOAuthClientRegistry implements OAuthClientRegistry {
     body?: unknown,
     allowed: number[] = [],
   ): Promise<Response> {
-    const url = `${this.options.baseUrl.replace(/\/+$/, '')}/api/admin/oauth-clients${path}`;
+    let origin = this.options.baseUrl;
+    while (origin.endsWith('/')) origin = origin.slice(0, -1);
+    const url = `${origin}/api/admin/oauth-clients${path}`;
     const headers: Record<string, string> = {
       authorization: `Bearer ${await this.options.token()}`,
       accept: 'application/json',

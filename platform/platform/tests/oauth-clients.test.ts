@@ -227,7 +227,7 @@ describe('tenant OAuth clients', () => {
   });
 
   it('lists the #48 guesses in one place', () => {
-    expect(PROVISIONAL_48.length).toBe(4);
+    expect(PROVISIONAL_48).toHaveLength(4);
   });
 });
 
