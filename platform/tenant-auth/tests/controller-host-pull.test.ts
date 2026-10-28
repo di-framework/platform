@@ -19,6 +19,8 @@ describe('host pull', () => {
   writeFileSync(tokenFile, `${TOKEN}\n`);
   const env = {
     TENANT_CONTROLLER_TENANT: 'acme',
+    TENANT_CONTROLLER_TLS_CERT: '/tls/tls.crt',
+    TENANT_CONTROLLER_TLS_KEY: '/tls/tls.key',
     TENANT_CONTROLLER_WHOAMI_PORT: '8789',
     TENANT_CONTROLLER_REGISTRY_FRONT_PORT: '8790',
     TENANT_CONTROLLER_REGISTRY_PULL_PORT: '8791',

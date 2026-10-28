@@ -74,16 +74,10 @@ export interface ControllerConfig {
   /**
    * Listener serving only `GET /v1/auth/whoami`, for the tenant registry component on the
    * tenant's hosts (platform#83). NetworkPolicy admits only the host pods to it. Unset: none.
-   * With `tlsCert` and `tlsKey` it serves TLS with the same certificate as `port` (platform#113)
-   * and, unless `whoamiTlsOnly`, plain HTTP on the same port too, so a registry still configured
-   * with an `http://` URL keeps working during an upgrade. Without them: plain HTTP only.
+   * TLS only, with the same certificate as `port` (platform#113), so it needs `tlsCert` and
+   * `tlsKey`; a plain-HTTP connection is closed without reaching the handler.
    */
   whoamiPort?: number;
-  /**
-   * Refuse plain HTTP on the whoami listener (`TENANT_CONTROLLER_WHOAMI_TLS_ONLY=true`): only
-   * TLS connections are served. Default false. Has no effect without a certificate.
-   */
-  whoamiTlsOnly?: boolean;
   /**
    * TLS listener (same certificate as `port`) that fronts the tenant registry: every request is
    * forwarded to the tenant hosts with `Host: registryHost`. The gateway passes TLS for the
@@ -147,7 +141,8 @@ export const WHOAMI_MAX_BODY_BYTES = 1024;
 
 /**
  * Most connections the whoami listener holds at once. Only the tenant hosts' registry calls it;
- * each connection is relayed and holds three sockets (see `RegistryListenerOptions`).
+ * each connection is relayed for its request deadline and holds three sockets (see
+ * `RegistryListenerOptions`).
  */
 export const WHOAMI_MAX_CONNECTIONS = 256;
 
@@ -158,22 +153,20 @@ export const WHOAMI_MAX_CONNECTIONS = 256;
 export const WHOAMI_REQUEST_TIMEOUT_SECONDS = 30;
 
 /**
- * The whoami listener (platform#83) on `port`: with `tls`, TLS with the controller certificate
- * (platform#113), which the tenant hosts trust through `--http-client-ca-path`, and plain HTTP on
- * the same port unless `whoamiTlsOnly`, for a registry whose config still names `http://` while
- * an upgrade rolls out. Without `tls`, plain HTTP as before.
+ * The whoami listener (platform#83) on `port`: TLS only, with the controller certificate
+ * (platform#113), which the tenant hosts trust through `--http-client-ca-path`. A plain-HTTP
+ * connection is closed without reaching the handler (platform#113 `:drop-relay`).
  */
 export function serveWhoamiListener(
   controller: Pick<Controller, 'handleWhoami'>,
-  config: Pick<ControllerConfig, 'host' | 'whoamiTlsOnly'>,
+  config: Pick<ControllerConfig, 'host'>,
   port: number,
-  tls: { cert: string; key: string } | undefined,
+  tls: { cert: string; key: string },
 ): Promise<RegistryListener> {
   return serveRegistryListener({
     hostname: config.host,
     port,
     tls,
-    acceptPlainHttp: !config.whoamiTlsOnly,
     // Token refreshes through the identity guest can take longer than Bun's 10 s default.
     idleTimeoutSeconds: 120,
     maxRequestBodySize: WHOAMI_MAX_BODY_BYTES,
@@ -529,6 +522,15 @@ export function configFromEnv(env = process.env): ControllerConfig {
     return value;
   };
   const tenant = required('TENANT_CONTROLLER_TENANT');
+  const whoamiPort = optionalPort(
+    env.TENANT_CONTROLLER_WHOAMI_PORT,
+    'TENANT_CONTROLLER_WHOAMI_PORT',
+  );
+  // The whoami listener serves TLS only (platform#113), so it cannot run without a certificate.
+  if (whoamiPort && !(env.TENANT_CONTROLLER_TLS_CERT && env.TENANT_CONTROLLER_TLS_KEY))
+    throw new Error(
+      'TENANT_CONTROLLER_WHOAMI_PORT needs TENANT_CONTROLLER_TLS_CERT and TENANT_CONTROLLER_TLS_KEY: the whoami listener serves TLS only',
+    );
   return {
     tenant,
     kubeconfig: env.TENANT_CONTROLLER_KUBECONFIG,
@@ -542,8 +544,7 @@ export function configFromEnv(env = process.env): ControllerConfig {
     tokenTtlSeconds: Number(env.TENANT_CONTROLLER_TOKEN_TTL ?? 3600),
     cliClientId: env.TENANT_CONTROLLER_CLI_CLIENT_ID ?? 'tenant-cli',
     registryUrl: registryOrigin(env.TENANT_CONTROLLER_REGISTRY_URL, tenant),
-    whoamiPort: optionalPort(env.TENANT_CONTROLLER_WHOAMI_PORT, 'TENANT_CONTROLLER_WHOAMI_PORT'),
-    whoamiTlsOnly: env.TENANT_CONTROLLER_WHOAMI_TLS_ONLY === 'true',
+    whoamiPort,
     registryFrontPort: optionalPort(
       env.TENANT_CONTROLLER_REGISTRY_FRONT_PORT,
       'TENANT_CONTROLLER_REGISTRY_FRONT_PORT',
@@ -1438,7 +1439,9 @@ if (import.meta.main) {
     idleTimeout: 120,
     fetch: (request, server) => controller.handle(request, server),
   });
-  if (config.whoamiPort) await serveWhoamiListener(controller, config, config.whoamiPort, tls);
+  // `configFromEnv` refuses a whoami port without a certificate, so `tls` is set with it.
+  if (config.whoamiPort && tls)
+    await serveWhoamiListener(controller, config, config.whoamiPort, tls);
   // The registry listeners run on `node:http`, not `Bun.serve`, so a streamed blob keeps the
   // registry's `Content-Length` (#197; see `registry-listener.ts`).
   if (config.registryFrontPort)

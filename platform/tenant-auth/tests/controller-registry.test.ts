@@ -19,6 +19,8 @@ describe('registry listeners', () => {
   };
   const config = configFromEnv({
     TENANT_CONTROLLER_TENANT: 'acme',
+    TENANT_CONTROLLER_TLS_CERT: '/tls/tls.crt',
+    TENANT_CONTROLLER_TLS_KEY: '/tls/tls.key',
     TENANT_CONTROLLER_WHOAMI_PORT: '8789',
     TENANT_CONTROLLER_REGISTRY_FRONT_PORT: '8790',
     TENANT_CONTROLLER_REGISTRY_HOST: 'registry',
@@ -102,6 +104,32 @@ describe('registry listeners', () => {
       expect(() =>
         configFromEnv({ TENANT_CONTROLLER_TENANT: 'acme', TENANT_CONTROLLER_WHOAMI_PORT: bad }),
       ).toThrow('TENANT_CONTROLLER_WHOAMI_PORT must be a TCP port');
+  });
+
+  test('refuses a whoami port without a certificate: the listener serves TLS only (#113)', () => {
+    const tls = {
+      TENANT_CONTROLLER_TLS_CERT: '/tls/tls.crt',
+      TENANT_CONTROLLER_TLS_KEY: '/tls/tls.key',
+    };
+    for (const [name, value] of Object.entries(tls))
+      expect(() =>
+        configFromEnv({
+          TENANT_CONTROLLER_TENANT: 'acme',
+          TENANT_CONTROLLER_WHOAMI_PORT: '8789',
+          [name]: value,
+        }),
+      ).toThrow(
+        'TENANT_CONTROLLER_WHOAMI_PORT needs TENANT_CONTROLLER_TLS_CERT and TENANT_CONTROLLER_TLS_KEY',
+      );
+    // The variable that once kept plain HTTP open is no longer read.
+    const config = configFromEnv({
+      TENANT_CONTROLLER_TENANT: 'acme',
+      TENANT_CONTROLLER_WHOAMI_PORT: '8789',
+      TENANT_CONTROLLER_WHOAMI_TLS_ONLY: 'false',
+      ...tls,
+    });
+    expect(config.whoamiPort).toBe(8789);
+    expect(config).not.toHaveProperty('whoamiTlsOnly');
   });
 
   test('whoami answers the principal, as on the main listener', async () => {

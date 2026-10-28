@@ -201,8 +201,7 @@ export interface TenantRegistryLimits {
 }
 /**
  * The controller's listener serving only `GET /v1/auth/whoami` (#83): TLS only, with the
- * controller certificate (#113); the platform renders `TENANT_CONTROLLER_WHOAMI_TLS_ONLY=true`
- * (#329), since every registry it renders calls `https://`.
+ * controller certificate (#113). Every registry the platform renders calls it over `https://`.
  */
 export const WHOAMI_PORT = 8789;
 /** The controller's TLS front for the tenant registry (#83). */
@@ -2368,10 +2367,8 @@ function tenantAuthResources(
         TENANT_CONTROLLER_TLS_KEY: '/tls/tls.key',
         ...(registry
           ? {
+              // TLS only, with the certificate above (#113): plain HTTP is never served on it.
               TENANT_CONTROLLER_WHOAMI_PORT: String(WHOAMI_PORT),
-              // Every registry the platform renders calls whoami over https (#113), so the
-              // listener refuses plain HTTP (#329).
-              TENANT_CONTROLLER_WHOAMI_TLS_ONLY: 'true',
               TENANT_CONTROLLER_REGISTRY_HOST: registryHost,
               TENANT_CONTROLLER_REGISTRY_PULL_HOST: registryPullHost(name),
               ...registryLimitsEnv(registry.limits),
