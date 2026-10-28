@@ -130,6 +130,36 @@ func TestTenancyRules(t *testing.T) {
 	}
 }
 
+// #456: a kube-router inside the vCluster would race the host's kube-router on the same node, so
+// the vcluster target refuses it. An instance stored with kube-router before the rule can still be
+// updated while it keeps the value.
+func TestNetworkPolicyEngineRule(t *testing.T) {
+	const want = "platform.networkPolicyEngine kube-router is not supported on the vcluster target"
+	engine := func(e string) string { return base + "  platform: {networkPolicyEngine: " + e + "}\n" }
+	kubeRouter, existing := engine("kube-router"), engine("existing")
+	stored := strings.Replace(kubeRouter, "6.0.17", "6.0.16", 1)
+	for name, tc := range map[string]struct{ obj, old, want string }{
+		"create with existing":                  {obj: existing},
+		"create with no engine":                 {obj: base},
+		"create with kube-router":               {obj: kubeRouter, want: want},
+		"update existing to kube-router":        {obj: kubeRouter, old: existing, want: want},
+		"update unset to kube-router":           {obj: kubeRouter, old: base, want: want},
+		"update stored kube-router":             {obj: kubeRouter, old: stored},
+		"update stored kube-router to existing": {obj: existing, old: kubeRouter},
+		"update existing":                       {obj: strings.Replace(existing, "6.0.17", "6.0.18", 1), old: existing},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := celErrors(t, tc.obj, tc.old)
+			if tc.want == "" && got != "" {
+				t.Fatalf("unexpected errors: %s", got)
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("errors %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // schemaErrors runs the CRD's OpenAPI schema (types, bounds, patterns) as the apiserver does.
 func schemaErrors(t *testing.T, obj string) string {
 	t.Helper()

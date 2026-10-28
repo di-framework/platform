@@ -45,9 +45,25 @@ const (
 // +kubebuilder:validation:Enum=existing;kube-router
 type NetworkPolicyEngine string
 
+const (
+	// NetworkPolicyExisting leaves NetworkPolicy enforcement to the target cluster. On the
+	// vcluster target that is the host cluster's engine (kube-router on KubeSolo).
+	NetworkPolicyExisting NetworkPolicyEngine = "existing"
+	// NetworkPolicyKubeRouter makes the platform install its own kube-router. The vcluster target
+	// refuses it for new instances (#456): a second kube-router inside the vCluster runs on the
+	// host's node and programs the same iptables and ipset chains as the host's engine, racing its
+	// enforcement of the operator's per-instance NetworkPolicies.
+	NetworkPolicyKubeRouter NetworkPolicyEngine = "kube-router"
+)
+
 // PlatformInstanceSpec is the desired platform instance. The target and storageRoot are fixed at
 // creation: the operator would otherwise lose track of the cluster and data it made.
+//
+// platform.networkPolicyEngine kube-router is refused on the vcluster target. An instance stored
+// with kube-router before that rule can still be updated while it keeps the value; it can't be set
+// anew, and an instance moved to existing can't go back.
 // +kubebuilder:validation:XValidation:rule="self.target == oldSelf.target",message="target is immutable"
+// +kubebuilder:validation:XValidation:rule="!(self.target.type == 'vcluster' && has(self.platform) && has(self.platform.networkPolicyEngine) && self.platform.networkPolicyEngine == 'kube-router') || (oldSelf.hasValue() && has(oldSelf.value().platform) && has(oldSelf.value().platform.networkPolicyEngine) && oldSelf.value().platform.networkPolicyEngine == 'kube-router')",message="platform.networkPolicyEngine kube-router is not supported on the vcluster target: it would run a second kube-router on the host's node and race the host's enforcement of the instance's NetworkPolicies. Use existing (the host cluster's policy engine enforces them)",optionalOldSelf=true
 // +kubebuilder:validation:XValidation:rule="has(self.platform) && has(self.platform.storageRoot) ? has(oldSelf.platform) && has(oldSelf.platform.storageRoot) && oldSelf.platform.storageRoot == self.platform.storageRoot : !(has(oldSelf.platform) && has(oldSelf.platform.storageRoot))",message="platform.storageRoot is immutable"
 type PlatformInstanceSpec struct {
 	// Version is the exact @di-framework/platform package version to install, for example 6.0.17.

@@ -20,6 +20,7 @@ import {
   type PlatformInstanceForm as FormState,
   formFromObject,
   isDisabled,
+  networkPolicyEngineChoices,
   type TextFormField,
   validateForm,
 } from '../mapping';
@@ -30,7 +31,6 @@ import {
   MAX_TENANTS,
   MAX_USERS,
   MEMBERSHIP_ROLES,
-  NETWORK_POLICY_ENGINES,
   type PlatformInstanceObject,
   PULL_POLICIES,
   TARGET_TYPES,
@@ -71,7 +71,8 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
   const nextKey = useRef(0);
   const newKey = () => `new-${nextKey.current++}`;
 
-  const errors = useMemo(() => validateForm(form, mode), [form, mode]);
+  const storedEngine = existing?.spec?.platform?.networkPolicyEngine;
+  const errors = useMemo(() => validateForm(form, mode, storedEngine), [form, mode, storedEngine]);
   const submission = useMemo<Submission>(
     () =>
       mode === 'edit' && existing
@@ -156,6 +157,7 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
 
   function select(field: TextFormField, label: string, options: readonly string[], helper: string) {
     const optional = field !== 'targetType';
+    const error = errorFor(field);
     return (
       <TextField
         id={`pi-${field}`}
@@ -164,7 +166,8 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
         value={form[field]}
         onChange={(e) => set(field, e.target.value as never)}
         disabled={isDisabled(field, mode) || busy}
-        helperText={helper}
+        error={Boolean(error)}
+        helperText={error ?? helper}
         fullWidth
         size="small"
         margin="dense"
@@ -234,8 +237,8 @@ export function PlatformInstanceFormDialog(props: PlatformInstanceFormProps) {
         {select(
           'networkPolicyEngine',
           'Network policy engine',
-          NETWORK_POLICY_ENGINES,
-          'Left empty, the API default applies.',
+          networkPolicyEngineChoices(storedEngine),
+          "Left empty, the API default (existing) applies. kube-router isn't offered on vcluster: the host cluster enforces NetworkPolicy.",
         )}
         {text(
           'storageRoot',

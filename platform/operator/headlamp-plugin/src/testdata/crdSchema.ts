@@ -113,6 +113,7 @@ export function crdCelRules(): string[] {
 export const EMULATED_CEL_RULES: readonly string[] = [
   'self.metadata.name.size() <= 63',
   'self.target == oldSelf.target',
+  "!(self.target.type == 'vcluster' && has(self.platform) && has(self.platform.networkPolicyEngine) && self.platform.networkPolicyEngine == 'kube-router') || (oldSelf.hasValue() && has(oldSelf.value().platform) && has(oldSelf.value().platform.networkPolicyEngine) && oldSelf.value().platform.networkPolicyEngine == 'kube-router')",
   'has(self.platform) && has(self.platform.storageRoot) ? has(oldSelf.platform) && has(oldSelf.platform.storageRoot) && oldSelf.platform.storageRoot == self.platform.storageRoot : !(has(oldSelf.platform) && has(oldSelf.platform.storageRoot))',
   '!has(self.users) || self.users.all(u, u.memberships.all(m, has(self.tenants) && self.tenants.exists(t, t.name == m.tenant)))',
   'has(self.issuer) && has(self.clientId) && has(self.clientSecretRef)',
@@ -123,6 +124,7 @@ interface CelSubject {
   spec: {
     target: unknown;
     platform?: {
+      networkPolicyEngine?: string;
       storageRoot?: string;
       tenants?: { name: string }[];
       users?: { memberships: { tenant: string }[] }[];
@@ -153,15 +155,27 @@ function tenancyErrors(obj: CelSubject): string[] {
   return errors;
 }
 
+/** The CRD's networkPolicyEngine message (#456). */
+export const KUBE_ROUTER_MESSAGE =
+  'platform.networkPolicyEngine kube-router is not supported on the vcluster target';
+
 /**
- * The CRD's CEL rules, written out: the name length on every write, and on update the immutable
- * target and storageRoot (the storageRoot rule exactly as the CRD states it, including "can't be
- * added later").
+ * The CRD's CEL rules, written out: the name length on every write, kube-router refused on the
+ * vcluster target unless the old object already had it (#456, an optionalOldSelf rule), and on
+ * update the immutable target and storageRoot (the storageRoot rule exactly as the CRD states it,
+ * including "can't be added later").
  */
 export function celErrors(obj: CelSubject, old?: CelSubject): string[] {
   const errors: string[] = tenancyErrors(obj);
   if (obj.metadata.name.length > MAX_NAME_LENGTH) {
     errors.push('name must be at most 63 characters');
+  }
+  const kubeRouter = (o?: CelSubject) =>
+    (o?.spec.target as { type?: string } | undefined)?.type === 'vcluster' &&
+    o?.spec.platform?.networkPolicyEngine === 'kube-router';
+  const hadKubeRouter = old?.spec.platform?.networkPolicyEngine === 'kube-router';
+  if (kubeRouter(obj) && !hadKubeRouter) {
+    errors.push(KUBE_ROUTER_MESSAGE);
   }
   if (old) {
     if (JSON.stringify(obj.spec.target) !== JSON.stringify(old.spec.target)) {
