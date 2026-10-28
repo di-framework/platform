@@ -13,6 +13,7 @@ import {
   projectedRing,
   type WorkloadIdentity,
 } from '../../platform/src/tenancy/log-projection.ts';
+import { BackgroundDiscovery, type DiscoveryBackoff } from './discovery-retry.ts';
 import {
   keys as keysPage,
   landing,
@@ -25,7 +26,6 @@ import {
 import type { ApiKey, IssuedApiKey } from './keys.ts';
 import {
   authorizationUrl,
-  discover,
   exchangeCode,
   type ProviderMetadata,
   pkce,
@@ -35,7 +35,6 @@ import {
   type TokenResponse,
   verifyIdToken,
 } from './oidc.ts';
-
 export interface ConsoleConfig {
   tenant: string;
   controllerUrl: string;
@@ -50,7 +49,7 @@ export interface ConsoleConfig {
   port: number;
   publicUrl: string;
   /** Wait between issuer discovery attempts; doubles from `initialMs` up to `maxMs`. */
-  discoveryBackoff?: { initialMs: number; maxMs: number };
+  discoveryBackoff?: DiscoveryBackoff;
 }
 
 export function configFromEnv(env = process.env): ConsoleConfig {
@@ -92,13 +91,6 @@ const FLOW_COOKIE = 'tenant_console_flow';
 const SESSION_COOKIE = 'tenant_console_session';
 const PLATFORM_API = '/apis/platform.di-framework.dev/v1alpha1';
 const WASMCLOUD_API = '/apis/runtime.wasmcloud.dev/v1alpha1';
-
-const DISCOVERY_BACKOFF_DEFAULT = { initialMs: 1_000, maxMs: 30_000 };
-
-/** Pending until the issuer answers; `retryAfterSeconds` is the wait until the next attempt. */
-type DiscoveryState =
-  | { status: 'pending'; retryAfterSeconds: number }
-  | { status: 'complete'; provider: ProviderMetadata };
 
 /** Thrown by a route that needs the issuer while discovery is still pending (#489). */
 class DiscoveryPending extends Error {
@@ -175,11 +167,7 @@ export class Console {
    * whole family when an old one is replayed, so concurrent requests must share a single refresh.
    */
   private readonly refreshing = new Map<string, Promise<boolean>>();
-  private discoveryState: DiscoveryState;
-  private readonly discoveryAbort = new AbortController();
-  private discoveryTimer: ReturnType<typeof setTimeout> | undefined;
-  private wakeDiscoverySleep: (() => void) | undefined;
-  private readonly markDiscovered: () => void;
+  private readonly discovery: BackgroundDiscovery;
   /** Resolves once the issuer has been discovered (or the console was stopped). */
   readonly discovered: Promise<void>;
 
@@ -187,18 +175,20 @@ export class Console {
     readonly config: ConsoleConfig,
     provider: ProviderMetadata | null,
   ) {
-    const { promise, resolve } = Promise.withResolvers<void>();
-    this.discovered = promise;
-    this.markDiscovered = resolve;
-    this.discoveryState = provider
-      ? { status: 'complete', provider }
-      : { status: 'pending', retryAfterSeconds: 1 };
-    if (provider) this.markDiscovered();
+    this.discovery = new BackgroundDiscovery(
+      {
+        issuer: config.issuer,
+        backoff: config.discoveryBackoff,
+        audit: (event, fields) => this.audit(event, fields),
+      },
+      provider,
+    );
+    this.discovered = this.discovery.discovered;
   }
 
   /** Provider metadata; null until discovery completes. */
   get provider(): ProviderMetadata | null {
-    return this.discoveryState.status === 'complete' ? this.discoveryState.provider : null;
+    return this.discovery.provider;
   }
 
   /**
@@ -208,56 +198,20 @@ export class Console {
    */
   static async start(config: ConsoleConfig): Promise<Console> {
     const app = new Console(config, null);
-    void app.discoverInBackground();
+    void app.discovery.run();
     return app;
   }
 
   /** Stops background discovery: aborts an in-flight attempt and clears the retry timer. */
   stop(): void {
-    this.discoveryAbort.abort();
-    clearTimeout(this.discoveryTimer);
-    this.wakeDiscoverySleep?.();
-    this.markDiscovered();
-  }
-
-  /**
-   * Attempts discovery until it succeeds or the console stops. The wait between attempts doubles
-   * from `initialMs` up to `maxMs`; it never gives up, since the issuer may come up at any time.
-   */
-  private async discoverInBackground(): Promise<void> {
-    const { initialMs, maxMs } = this.config.discoveryBackoff ?? DISCOVERY_BACKOFF_DEFAULT;
-    const signal = this.discoveryAbort.signal;
-    for (let attempt = 0; !signal.aborted; attempt++) {
-      try {
-        const provider = await discover(this.config.issuer, 1, signal);
-        this.discoveryState = { status: 'complete', provider };
-        this.audit('discovery.succeeded', { issuer: this.config.issuer });
-        this.markDiscovered();
-        return;
-      } catch (error) {
-        if (signal.aborted) return;
-        const delayMs = Math.min(maxMs, initialMs * 2 ** attempt);
-        this.discoveryState = {
-          status: 'pending',
-          retryAfterSeconds: Math.max(1, Math.ceil(delayMs / 1000)),
-        };
-        this.audit('discovery.failed', {
-          error: (error as Error).message,
-          issuer: this.config.issuer,
-          retryInMs: delayMs,
-        });
-        await new Promise<void>((resolve) => {
-          this.wakeDiscoverySleep = resolve;
-          this.discoveryTimer = setTimeout(resolve, delayMs);
-        });
-      }
-    }
+    this.discovery.stop();
   }
 
   /** The issuer's metadata, for a route that needs it; throws while discovery is pending. */
   private get metadata(): ProviderMetadata {
-    if (this.discoveryState.status === 'complete') return this.discoveryState.provider;
-    throw new DiscoveryPending(this.discoveryState.retryAfterSeconds);
+    const state = this.discovery.state;
+    if (state.status === 'complete') return state.provider;
+    throw new DiscoveryPending(state.retryAfterSeconds);
   }
 
   /** 503 with Retry-After for a route that needs the issuer before it has been discovered. */
@@ -390,7 +344,7 @@ export class Console {
         return json({
           ok: true,
           tenant: this.config.tenant,
-          discoveryReady: this.discoveryState.status === 'complete',
+          discoveryReady: this.provider !== null,
         });
       if (route === 'GET /cli/info')
         return json({
@@ -423,6 +377,7 @@ export class Console {
             this.provider
               ? undefined
               : 'Sign-in is unavailable until the identity provider answers. Try again shortly.',
+            this.provider !== null,
           ),
         );
       }

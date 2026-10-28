@@ -769,7 +769,9 @@ describe('Console.start with the issuer unreachable at first', () => {
     });
     const landing = await get(app, '/');
     expect(landing.status).toBe(200);
-    expect(await landing.text()).toContain('Sign-in is unavailable');
+    const body = await landing.text();
+    expect(body).toContain('Sign-in is unavailable');
+    expect(body).not.toContain('>Sign in</button>');
     expect((await get(app, '/cli/anything')).status).toBe(401);
   });
 
@@ -797,7 +799,9 @@ describe('Console.start with the issuer unreachable at first', () => {
     expect(app.provider?.issuer).toBe(issuer.url);
     expect(await (await get(app, '/healthz')).json()).toMatchObject({ discoveryReady: true });
     expect(JSON.stringify(log.mock.calls)).toContain('discovery.succeeded');
-    expect(await (await get(app, '/')).text()).not.toContain('Sign-in is unavailable');
+    const landing = await (await get(app, '/')).text();
+    expect(landing).not.toContain('Sign-in is unavailable');
+    expect(landing).toContain('>Sign in</button>');
     const cookie = await session(app);
     expect((await get(app, '/members', { cookie })).status).toBe(200);
   });
@@ -807,9 +811,18 @@ describe('Console.start with the issuer unreachable at first', () => {
       ...config({ issuer: 'http://127.0.0.1:1' }),
       discoveryBackoff: { initialMs: 10, maxMs: 40 },
     });
-    await Bun.sleep(30);
+    const failures = () =>
+      log.mock.calls.filter(
+        ([line]) =>
+          String(line).includes('discovery.failed') && String(line).includes('127.0.0.1:1'),
+      ).length;
+    await until(() => failures() > 0);
     down.stop();
     await down.discovered;
+    const atStop = failures();
+    // Longer than maxMs: a loop still running would log another attempt in this window.
+    await Bun.sleep(100);
+    expect(failures()).toBe(atStop);
     expect(down.provider).toBeNull();
   });
 });
