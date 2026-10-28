@@ -14,17 +14,24 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/recorder"
 
 	"github.com/di-framework/platform/operator/api/v1alpha1"
 	"github.com/di-framework/platform/operator/internal/installer"
 	"github.com/di-framework/platform/operator/internal/plan"
 	"github.com/di-framework/platform/operator/internal/targets"
+	"github.com/di-framework/platform/operator/internal/targets/vcluster"
 )
 
 // Finalizer holds a PlatformInstance until its deletion policy has been applied.
@@ -104,8 +111,36 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.PlatformInstance{}).
 		Owns(&corev1.Secret{}).
+		// A host namespace that starts terminating or is gone wakes its instance at once, so Ready
+		// drops while the namespace goes instead of at the next poll (#490).
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(hostNamespaceOwner),
+			builder.WithPredicates(hostNamespaceGoing)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: n}).
 		Complete(r)
+}
+
+// hostNamespaceGoing passes the events of a host namespace that is terminating or deleted. The
+// operator creates and labels host namespaces itself, so their other events carry nothing new.
+var hostNamespaceGoing = predicate.Funcs{
+	CreateFunc:  func(event.CreateEvent) bool { return false },
+	GenericFunc: func(event.GenericEvent) bool { return false },
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		return isHostNamespace(e.ObjectNew) && e.ObjectNew.GetDeletionTimestamp() != nil
+	},
+	DeleteFunc: func(e event.DeleteEvent) bool { return isHostNamespace(e.Object) },
+}
+
+func isHostNamespace(obj client.Object) bool {
+	return obj.GetLabels()[vcluster.HostNamespaceLabel] == "true"
+}
+
+// hostNamespaceOwner maps a host namespace to the PlatformInstance its owner annotation names.
+func hostNamespaceOwner(_ context.Context, obj client.Object) []reconcile.Request {
+	ns, name, ok := strings.Cut(obj.GetAnnotations()[vcluster.OwnerAnnotation], "/")
+	if !ok || ns == "" || name == "" {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}}}
 }
 
 // Reconcile moves one PlatformInstance a step towards its spec.
@@ -188,6 +223,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	log.FromContext(ctx).V(1).Info("decision", "action", d.Action, "reason", d.Reason)
 	switch d.Action {
 	case plan.EnsureTarget:
+		if st.TargetLost {
+			if err := r.dropInstallState(ctx, &inst, st); err != nil {
+				return r.fail(ctx, &inst, v1alpha1.ConditionTargetReady, st.Reason,
+					fmt.Sprintf("%s; dropping the install state of the lost target failed: %v", st.Message, err), err)
+			}
+		}
 		// The reference stays while the Secret exists: it still holds the instance's kubeconfig.
 		var secret corev1.Secret
 		err := r.Get(ctx, client.ObjectKey{Namespace: inst.Namespace, Name: kubeconfigSecretName(&inst)}, &secret)
@@ -206,7 +247,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				s.Target.ResyncStarted = &now
 			}
 			setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionFalse, st.Reason, st.Message)
-			setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionFalse, "TargetPending", "waiting for the target cluster")
+			if st.TargetLost {
+				setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionFalse, st.Reason, st.Message)
+			} else {
+				setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionFalse, "TargetPending", "waiting for the target cluster")
+			}
 		})
 		if err == nil && st.ResyncStarted != "" {
 			// The target restarted its control plane for this uid. A round that read the
@@ -219,6 +264,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	default: // plan.Wait
 		return ctrl.Result{RequeueAfter: d.RequeueAfter}, r.markReady(ctx, &inst, st)
 	}
+}
+
+// dropInstallState removes the install state of a target that was deleted with its data outside
+// the operator (#490), without a destroy: nothing of it is left. The state holds the lost
+// cluster's credentials, against which every later refresh fails; without it the resync installs
+// the platform from scratch on the cluster created in its place.
+func (r *Reconciler) dropInstallState(ctx context.Context, inst *v1alpha1.PlatformInstance, st targets.State) error {
+	log.FromContext(ctx).Info("target lost; dropping its install state", "reason", st.Reason, "message", st.Message)
+	if r.Recorder != nil {
+		r.Recorder.Eventf(inst, nil, corev1.EventTypeWarning, st.Reason, "Resync", "%s", st.Message)
+	}
+	return r.Installer.Uninstall(ctx, r.request(inst, targets.State{}), installer.UninstallOptions{})
 }
 
 // resyncDone re-reads the instance past the cache and returns it when its resync marker for uid
