@@ -374,21 +374,25 @@ An unchanged uid changes nothing.
 
 #### What a resync doesn't bring back
 
-A resync restores only what the platform installs: the vCluster release, the platform's Helm Release and the
-objects its Pulumi program manages. Every other ConfigMap and Secret inside the instance that vCluster synced
-to the host was garbage-collected with its host copy, and vCluster deleted the virtual copy too, so it is
-gone in both places and nothing creates it again:
+A resync restores what the platform installs: the vCluster release, the platform's Helm Release and the
+objects its Pulumi program manages. The platform's own controllers also write some synced objects again on
+their next pass (the tenancy controller reissues `tenant-controller-tls` from its CA, for example). Every other
+ConfigMap and Secret inside the instance that vCluster synced to the host was garbage-collected with its host
+copy, and vCluster deleted the virtual copy too, so it is gone in both places and nothing outside the platform
+creates it again. vCluster (0.37.3, as the operator installs it) syncs only the ConfigMaps and Secrets a pod
+uses (`sync.toHost.configMaps.all` and `secrets.all` are `false`), so only those are lost; one no pod uses
+isn't affected:
 
-- **ConfigMaps and Secrets you or your tenants created inside the instance**, with `kubectl` against an
+- **ConfigMaps and Secrets that pods use and that you or your tenants created inside the instance**, with `kubectl` against an
   instance or tenant kubeconfig, with your own Helm charts or manifests, or by any controller other than the
   platform. Pods that mount one stay in `ContainerCreating` (`MountVolume.SetUp failed … configmap … not
   found`) until it is applied again, and whatever depends on those pods stays down with them. Layer 4 run 4
   (v6.0.22) saw this with an OIDC issuer that ran inside the instance: its ConfigMap was gone after every
   owner-Service resync, the issuer pod never started, and tenant-console, which waits for OIDC discovery of
   `tenantAuth.issuer`, kept restarting until the ConfigMap was applied again.
-- **Secrets that components inside the instance generated at runtime** (tenant-auth signing keys, for
-  example). They aren't in any chart or Pulumi program: they are lost for good, and whatever they protected
-  (issued tokens, sessions) has to be issued again.
+- **Secrets that a component inside the instance generated at runtime and that a pod mounts** (a workload's
+  own keys or credentials, for example). They aren't in any chart or Pulumi program: they are lost for good,
+  and whatever they protected (issued tokens, sessions) has to be issued again.
 
 So:
 
