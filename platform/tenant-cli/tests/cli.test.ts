@@ -612,8 +612,12 @@ describe('run', () => {
       'GET /v1/deployments': () => json({ items }),
       'GET /v1/deployments/stats': () =>
         json({ env: 'prod', services: 2, deployments: 5, ready: 4, failed: 1 }),
-      'POST /v1/deployments/rollback': (call: Recorded) =>
-        json({ id: (call.body as { to?: string }).to ?? 'previous', service: 'web' }, 202),
+      // The restored revision travels as `rollbackOf`; `id` is the new revision (platform#417).
+      // Without `to`, this fake is a controller older than `rollbackOf`.
+      'POST /v1/deployments/rollback': (call: Recorded) => {
+        const { to } = call.body as { to?: string };
+        return json({ id: 'web-prod.4', service: 'web', ...(to ? { rollbackOf: to } : {}) }, 202);
+      },
     });
     expect(await run(['deployments', 'list', '--env', 'prod'], io(fetch))).toBe(0);
     expect(out.at(-1)).toBe('no deployments in prod');
@@ -626,11 +630,15 @@ describe('run', () => {
     expect(out.at(-1)).toBe('prod: 2 services, 5 deployments, 4 ready, 1 failed');
     expect(
       await run(
-        ['deployments', 'rollback', '--env', 'prod', '--service', 'web', '--to', 'd0'],
+        ['deployments', 'rollback', '--env', 'prod', '--service', 'web', '--to', 'web-prod.1'],
         io(fetch),
       ),
     ).toBe(0);
-    expect(out.at(-1)).toBe('web in prod: rolling back to d0');
+    expect(out.at(-1)).toBe('web in prod: rolling back to web-prod.1 (as revision web-prod.4)');
+    expect(
+      await run(['deployments', 'rollback', '--env', 'prod', '--service', 'web'], io(fetch)),
+    ).toBe(0);
+    expect(out.at(-1)).toBe('web in prod: rolling back as revision web-prod.4');
   });
 
   test('secrets and vars read values from a file or stdin, never the command line', async () => {
