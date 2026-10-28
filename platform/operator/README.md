@@ -299,8 +299,8 @@ these NetworkPolicies in every instance host namespace (`pi-<namespace>-<name>-<
   names, on its port and on `issuerUpstreamPodPort`, which the platform opens on the egress side. The syncer
   copies that label unchanged, so any pod of the instance can forge it: the rule only ever opens a namespace
   the platform doesn't use. It is not rendered when `issuerUpstream` names the platform namespace
-  (`wasmcloud`, also the default with no namespace), a `di-*` namespace the platform creates for a tenant or
-  user, or an empty one;
+  (`wasmcloud`, also the default with no namespace), `kube-system`, a `di-*` namespace the platform creates
+  (`di-tenant-*`, `di-runtime-*`, `di-apikeys-*`, ...), or an empty one;
 - `platform-operator-allow-same-namespace`: the vCluster control plane gets in to every pod of the namespace,
   for the API server's calls into synced pods (admission webhooks, for example) and its own peers;
 - `platform-operator-allow-operator`: the operator's own namespace gets in to the vCluster API (port 8443), for
@@ -337,7 +337,6 @@ What it doesn't:
   #540 is fixed, a pod inside the instance that can set arbitrary labels can match the platform's
   tenant-namespace peers (for example `di-platform-gateway` and `di-platform-nats`). Peers named by
   `kubernetes.io/metadata.name`, such as `di-tenant-gateway` for the tenant host groups, are not affected.
-
 - **Egress** is not restricted here; it stays as the platform's synced policies set it (DNS to the instance's
   CoreDNS on 53 among it).
 - **Pods inside the instance that no policy admits.** The default deny selects every pod of the instance. A pod in

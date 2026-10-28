@@ -70,6 +70,7 @@ func TestNetworkPolicyOrder(t *testing.T) {
 		{"issuer in wasmcloud", &v1alpha1.TenantAuth{IssuerUpstream: "issuer.wasmcloud.svc:80"}, base},
 		{"issuer in a tenant namespace", &v1alpha1.TenantAuth{IssuerUpstream: "issuer.di-tenant-a:80"}, base},
 		{"issuer in a runtime namespace", &v1alpha1.TenantAuth{IssuerUpstream: "issuer.di-runtime-a:80"}, base},
+		{"issuer in kube-system", &v1alpha1.TenantAuth{IssuerUpstream: "issuer.kube-system:80"}, base},
 		{"issuer with an empty namespace", &v1alpha1.TenantAuth{IssuerUpstream: "issuer.:80"}, base},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

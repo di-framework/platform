@@ -62,7 +62,7 @@ const (
 	// component=tenant-auth and are the ones whose egress reaches the issuerUpstream.
 	labelComponent = "platform.di-framework.dev/component"
 	// platformNamespacePrefix starts every namespace the platform creates for its tenants and
-	// users (di-tenant-*, di-runtime-*, di-apikeys-*, di-user-*, ...).
+	// their backing services (di-tenant-*, di-runtime-*, di-apikeys-*, di-bs-*, ...).
 	platformNamespacePrefix = "di-"
 )
 
@@ -127,9 +127,10 @@ func issuerUpstream(auth *v1alpha1.TenantAuth) (namespace string, issuerPorts []
 // issuerNamespaceOpenable reports whether PolicyIssuer may open a namespace. Its source label
 // (component=tenant-auth) is copied unchanged by the syncer, so any pod of the instance can forge
 // it: the rule may only open a namespace the platform doesn't use. Not the platform namespace,
-// not one the platform creates for a tenant or user, and not an empty one.
+// not kube-system (the instance's CoreDNS), not a di-* namespace the platform creates, and not
+// an empty one.
 func issuerNamespaceOpenable(namespace string) bool {
-	return namespace != "" && namespace != targets.PlatformNamespace && !strings.HasPrefix(namespace, platformNamespacePrefix)
+	return namespace != "" && namespace != targets.PlatformNamespace && namespace != "kube-system" && !strings.HasPrefix(namespace, platformNamespacePrefix)
 }
 
 // NetworkPolicies renders the host-namespace policies for one instance, in the order they are
