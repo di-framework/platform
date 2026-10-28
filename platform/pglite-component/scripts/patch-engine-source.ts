@@ -259,23 +259,118 @@ export function patchDlfcn(text: string): string {
  *   with nothing but whitespace and comments in between,
  * - and pgp_cfb_encrypt never ignores them (every cfb_process call in it
  *   passes 0 as ignore_cipher_failure).
- * Line endings, indentation and comments do not matter to the check.
+ * The check compares C tokens (see cTokens), so line endings, indentation,
+ * line continuations and comments do not matter to it.
  */
 export const PGP_CFB_ENCRYPT_CALL =
   '\t\terr = px_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);\n';
 export const PGP_CFB_ERROR_CHECK = '\t\tif (err && !ignore_cipher_failure)\n\t\t\tereport(ERROR,\n';
 
-/** C source without comments, so annotations cannot hide or fake code. */
-const stripCComments = (text: string): string => text.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, ' ');
+/**
+ * One C token. Group 1 is whitespace or a comment, which is dropped; an
+ * unterminated block comment runs to the end of the file. The rest are kept:
+ * a string or character literal with its escapes (whole, so comment markers
+ * inside it stay text; unterminated, it ends with its line), an identifier, a
+ * number, or a punctuator.
+ */
+const C_TOKEN =
+  /(\s+|\/\/[^\n]*|\/\*[\s\S]*?(?:\*\/|$))|"(?:\\[\s\S]|[^"\\\n])*"?|'(?:\\[\s\S]|[^'\\\n])*'?|[A-Za-z_]\w*|\.?\d[\w.]*|->|\+\+|--|<<=|>>=|\.\.\.|&&|\|\||##|[<>=!+\-*/%&|^]=|<<|>>|[\s\S]/y;
 
-/** C source without comments or any whitespace (CRLF, indentation), for layout-independent matching. */
-const compactC = (text: string): string => stripCComments(text).replace(/\s+/g, '');
+/**
+ * C source as the compiler tokenizes it: backslash-newline continuations are
+ * spliced first (translation phase 2, so a `//` comment ending in `\` also
+ * comments out the next line), then whitespace and comments are dropped
+ * outside string and character literals. Comparing whole tokens keeps
+ * identifier boundaries, so `myerr` is not `err`.
+ */
+function cTokens(text: string): string[] {
+  const source = text.replace(/\\\r?\n/g, '');
+  const tokens: string[] = [];
+  C_TOKEN.lastIndex = 0;
+  for (let m = C_TOKEN.exec(source); m !== null; m = C_TOKEN.exec(source)) {
+    if (m[1] === undefined) tokens.push(m[0]);
+  }
+  return tokens;
+}
 
-/** The encrypt call directly followed by its error check, in compact form. */
-const PGP_CFB_CHECKED_CALL = compactC(PGP_CFB_ENCRYPT_CALL + PGP_CFB_ERROR_CHECK);
+const CLOSERS: Record<string, string> = { '(': ')', '[': ']', '{': '}' };
 
-/** pgp_cfb_encrypt's body, in compact form. */
-const PGP_CFB_ENCRYPT_BODY = /pgp_cfb_encrypt\([^)]*\)\{([^}]*)\}/;
+/** Index of the token closing the bracket at `open`, or -1 if it is unclosed or mismatched. */
+function closingIndex(tokens: string[], open: number): number {
+  const expected: string[] = [];
+  for (let i = open; i < tokens.length; i++) {
+    const token = tokens[i] as string;
+    const closer = CLOSERS[token];
+    if (closer !== undefined) {
+      expected.push(closer);
+    } else if (token === ')' || token === ']' || token === '}') {
+      if (expected.pop() !== token) return -1;
+      if (expected.length === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/** The top-level arguments of the call whose `(` is at `open`, each as tokens; undefined if unclosed. */
+function callArguments(tokens: string[], open: number): string[][] | undefined {
+  const close = closingIndex(tokens, open);
+  if (close < 0) return undefined;
+  const args: string[][] = [[]];
+  for (let i = open + 1; i < close; i++) {
+    const token = tokens[i] as string;
+    if (token === ',') {
+      args.push([]);
+      continue;
+    }
+    // A nested bracket is part of the current argument, commas and all.
+    const end = CLOSERS[token] === undefined ? i : closingIndex(tokens, i);
+    (args.at(-1) as string[]).push(...tokens.slice(i, end + 1));
+    i = end;
+  }
+  return args;
+}
+
+/** The body (the tokens inside its braces) of every definition of function `name`. */
+function functionBodies(tokens: string[], name: string): string[][] {
+  const bodies: string[][] = [];
+  for (const [i, token] of tokens.entries()) {
+    if (token !== name || tokens[i + 1] !== '(') continue;
+    const params = closingIndex(tokens, i + 1);
+    if (params < 0 || tokens[params + 1] !== '{') continue; // a call or a declaration
+    const end = closingIndex(tokens, params + 1);
+    bodies.push(tokens.slice(params + 2, end < 0 ? tokens.length : end));
+  }
+  return bodies;
+}
+
+/** The encrypt call directly followed by its error check, as tokens. */
+const PGP_CFB_CHECKED_CALL = cTokens(PGP_CFB_ENCRYPT_CALL + PGP_CFB_ERROR_CHECK);
+
+/** Tokens a statement may follow, so the call assigns `err` itself and not, say, `ctx->err`. */
+const STATEMENT_BOUNDARY = new Set([';', '{', '}']);
+
+/** How many checked encrypt calls `tokens` has: PGP_CFB_CHECKED_CALL runs that start a statement. */
+function countCheckedCalls(tokens: string[]): number {
+  let count = 0;
+  for (let i = 0; i + PGP_CFB_CHECKED_CALL.length <= tokens.length; i++) {
+    const startsStatement = i === 0 || STATEMENT_BOUNDARY.has(tokens[i - 1] as string);
+    if (startsStatement && PGP_CFB_CHECKED_CALL.every((token, j) => tokens[i + j] === token))
+      count++;
+  }
+  return count;
+}
+
+/** Whether `body` calls cfb_process, and every reference to it is a call whose last argument is exactly `0`. */
+function neverIgnoresFailures(body: string[]): boolean {
+  let calls = 0;
+  for (const [i, token] of body.entries()) {
+    if (token !== 'cfb_process') continue;
+    const last = body[i + 1] === '(' ? callArguments(body, i + 1)?.at(-1) : undefined;
+    if (last?.length !== 1 || last[0] !== '0') return false;
+    calls++;
+  }
+  return calls > 0;
+}
 
 const PGP_CFB_INSPECT =
   'inspect cfb_process and pgp_cfb_encrypt in contrib/pgcrypto/pgp-cfb.c, and update requirePgpCfbFix ' +
@@ -283,9 +378,11 @@ const PGP_CFB_INSPECT =
 
 /** Fail unless pgcrypto's PGP CFB mode raises an ERROR when encryption fails (see above). */
 export function requirePgpCfbFix(text: string): void {
-  const calls = stripCComments(text).match(/\bpx_cipher_encrypt\s*\(/g)?.length ?? 0;
-  const compact = compactC(text);
-  const checked = compact.split(PGP_CFB_CHECKED_CALL).length - 1;
+  const tokens = cTokens(text);
+  const calls = tokens.filter(
+    (token, i) => token === 'px_cipher_encrypt' && tokens[i + 1] === '(',
+  ).length;
+  const checked = countCheckedCalls(tokens);
   if (calls === 0 || checked !== calls) {
     throw new Error(
       'pgp-cfb.c: the PGP CFB cipher error check (PostgreSQL 17.11, CVE-2026-14663) is missing ' +
@@ -293,10 +390,8 @@ export function requirePgpCfbFix(text: string): void {
         `Blowfish and CAST5 would encrypt to plaintext; ${PGP_CFB_INSPECT}`,
     );
   }
-  const body = compact.match(PGP_CFB_ENCRYPT_BODY)?.[1] ?? '';
-  // No \b: compacting joins `return` and `cfb_process`.
-  const processCalls = body.match(/cfb_process\([^;]*\)/g) ?? [];
-  if (processCalls.length === 0 || !processCalls.every((call) => call.endsWith(',0)'))) {
+  const bodies = functionBodies(tokens, 'pgp_cfb_encrypt');
+  if (bodies.length === 0 || !bodies.every(neverIgnoresFailures)) {
     throw new Error(
       'pgp-cfb.c: pgp_cfb_encrypt may ignore cipher failures (PostgreSQL 17.11, CVE-2026-14663): ' +
         'every cfb_process call in it must pass 0 as ignore_cipher_failure; ' +
