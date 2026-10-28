@@ -234,6 +234,24 @@ and port as before, so they do not change. A later release refuses plain HTTP on
   [Upgrading to TLS on the controller's whoami listener](#upgrading-to-tls-on-the-controllers-whoami-listener-113)
   for the image order.
 
+#### Upgrading to a whoami listener with no plain-HTTP fallback (#113)
+
+- **Who is affected.** Installs with config `tenantAuth.registry` set.
+- **What changes.** The tenant-auth image serves the whoami listener (`8789`) over TLS only and
+  no longer reads `TENANT_CONTROLLER_WHOAMI_TLS_ONLY`; the platform stops rendering it, so the
+  `tenant-controller` Deployment rolls once. A controller with `TENANT_CONTROLLER_WHOAMI_PORT` set
+  but no `TENANT_CONTROLLER_TLS_CERT` and `TENANT_CONTROLLER_TLS_KEY` refuses to start; the
+  platform always mounts the controller certificate, so a platform-run controller is not
+  affected. The whoami port, its Service port and the NetworkPolicy that admits only the tenant's
+  host pods to it are unchanged.
+- **Upgrading from before v6.0.15.** Upgrade to a v6.0.15-or-later release first, then to this
+  one. An install older than v6.0.15 runs a tenant-auth image that serves only plain HTTP on
+  `8789`, so a registry switched to `https://` cannot reach it, whichever of the platform package
+  and `tenantAuth.image` changes first, and answers requests that need authorization with `503`
+  until both have rolled. Going through v6.0.15 or later first avoids that window, as
+  [Upgrading to a whoami listener that refuses plain HTTP](#upgrading-to-a-whoami-listener-that-refuses-plain-http-329)
+  describes.
+
 #### Upgrading to tenant-auth URLs derived from `routeUrlPattern` (#128)
 
 - **Who is affected.** Installs with config `tenantAuth` set, at least one of
@@ -1644,8 +1662,8 @@ tenantAuth:
   (`--http-client-ca-path`), so the registry verifies it like any other TLS server and the user's
   credential no longer crosses the pod network in cleartext on this hop. The listener serves
   nothing but `GET /v1/auth/whoami` (same answer as `8788`, problem+json errors), over TLS only:
-  the platform renders `TENANT_CONTROLLER_WHOAMI_TLS_ONLY=true` (see
-  [Upgrading to a whoami listener that refuses plain HTTP](#upgrading-to-a-whoami-listener-that-refuses-plain-http-329)).
+  a plain-HTTP connection is closed without an answer, and no setting reopens it (see
+  [Upgrading to a whoami listener with no plain-HTTP fallback](#upgrading-to-a-whoami-listener-with-no-plain-http-fallback-113)).
   The hop from the registry front (`8790`) to the tenant host is still plain HTTP. Admission admits `wasmcloud:secrets` from the platform controller
   only, so a tenant cannot repoint the callback; the component's only egress is that URL
   (`allowedHosts`), and the egress reconcile leaves it alone.
