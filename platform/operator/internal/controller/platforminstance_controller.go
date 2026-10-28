@@ -11,6 +11,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -46,8 +47,8 @@ const PlatformNamespace = "wasmcloud"
 // recovery relies on both.
 type Reconciler struct {
 	client.Client
-	// APIReader reads the instance past the cache before a resync reinstall (#472); nil skips
-	// that check.
+	// APIReader reads the instance past the cache before a resync reinstall (#472) and while the
+	// cache lags a status write the next round must see (#481, #487); nil skips those checks.
 	APIReader APIReader
 	Target    targets.Target
 	Installer installer.Installer
@@ -67,6 +68,9 @@ type Reconciler struct {
 	InstallTimeout time.Duration
 	// Now is injectable for tests; nil uses time.Now.
 	Now func() time.Time
+
+	// writes are the status writes the next rounds must see (see fresh).
+	writes expectedWrites
 }
 
 // APIReader reads objects from the API server; client.Reader satisfies it.
@@ -108,6 +112,12 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var inst v1alpha1.PlatformInstance
 	if err := r.Get(ctx, req.NamespacedName, &inst); err != nil {
+		if apierrors.IsNotFound(err) {
+			r.writes.forget(req.NamespacedName)
+		}
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if err := r.fresh(ctx, &inst); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if inst.Spec.Target.Type != v1alpha1.TargetVCluster {
@@ -185,7 +195,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			return ctrl.Result{}, err
 		}
 		keepRef := err == nil
-		return ctrl.Result{RequeueAfter: d.RequeueAfter}, r.patchStatus(ctx, &inst, func(s *v1alpha1.PlatformInstanceStatus) {
+		err = r.patchStatus(ctx, &inst, func(s *v1alpha1.PlatformInstanceStatus) {
 			s.Phase = v1alpha1.PhaseProvisioning
 			if !keepRef {
 				s.KubeconfigSecretRef = nil
@@ -198,6 +208,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionFalse, st.Reason, st.Message)
 			setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionFalse, "TargetPending", "waiting for the target cluster")
 		})
+		if err == nil && st.ResyncStarted != "" {
+			// The target restarted its control plane for this uid. A round that read the
+			// instance without this marker would restart it again (#481).
+			r.expectWrite(&inst)
+		}
+		return ctrl.Result{RequeueAfter: d.RequeueAfter}, err
 	case plan.Install, plan.Repair:
 		return r.install(ctx, &inst, st, d)
 	default: // plan.Wait
@@ -312,7 +328,7 @@ func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstanc
 			fmt.Sprintf("%s of %s failed: %v", d.Reason, inst.Spec.Version, err), err)
 	}
 	now := metav1.NewTime(r.now())
-	return ctrl.Result{RequeueAfter: r.Plan.RepairInterval}, r.patchStatus(ctx, inst, func(s *v1alpha1.PlatformInstanceStatus) {
+	err = r.patchStatus(ctx, inst, func(s *v1alpha1.PlatformInstanceStatus) {
 		s.Phase = v1alpha1.PhaseReady
 		s.ObservedGeneration = inst.Generation
 		s.InstalledVersion = inst.Spec.Version
@@ -326,6 +342,14 @@ func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstanc
 			fmt.Sprintf("generation %d: %d tenant(s), %d user(s), tenantAuth issuer %q", s.Applied.Generation, s.Applied.Tenants, s.Applied.Users, s.Applied.TenantAuthIssuer))
 		setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionTrue, "Ready", "instance is ready")
 	})
+	if err == nil {
+		// The status patches at the start of the install queued another round, which runs as
+		// soon as this one returns and can read the instance from before this patch: no
+		// Installed condition or the old lastRepair, so it would install or repair again at
+		// once (#487).
+		r.expectWrite(inst)
+	}
+	return ctrl.Result{RequeueAfter: r.Plan.RepairInterval}, err
 }
 
 // failConfig reports a config the install can't apply: ConfigApplied and Installed False with
@@ -495,13 +519,21 @@ func (r *Reconciler) fail(ctx context.Context, inst *v1alpha1.PlatformInstance, 
 func (r *Reconciler) patchFinalizers(ctx context.Context, inst *v1alpha1.PlatformInstance, change func(client.Object, string) bool) error {
 	base := inst.DeepCopy()
 	change(inst, Finalizer)
-	return r.Patch(ctx, inst, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	if err := r.Patch(ctx, inst, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+		return err
+	}
+	r.writes.wrote(inst)
+	return nil
 }
 
 func (r *Reconciler) patchStatus(ctx context.Context, inst *v1alpha1.PlatformInstance, mutate func(*v1alpha1.PlatformInstanceStatus)) error {
 	base := inst.DeepCopy()
 	mutate(&inst.Status)
-	return r.Status().Patch(ctx, inst, client.MergeFrom(base))
+	if err := r.Status().Patch(ctx, inst, client.MergeFrom(base)); err != nil {
+		return err
+	}
+	r.writes.wrote(inst)
+	return nil
 }
 
 func setCondition(s *v1alpha1.PlatformInstanceStatus, gen int64, typ string, status metav1.ConditionStatus, reason, msg string) {
