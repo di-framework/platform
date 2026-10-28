@@ -506,6 +506,16 @@ Console: `GET /login` (+ `cli_callback`, `cli_state`), `GET /oidc/callback`, `GE
 `GET /cli/info`, `POST /cli/exchange`, `POST /cli/refresh`, `POST /cli/logout` (unused by any client in this repo now that the prototype CLI is removed); pages `/`,
 `/logs/:deployment` (lines of one WorkloadDeployment; the overview groups deployments by application and env), `/members`, `/keys`, `POST /keys`, `POST /keys/:id/revoke`.
 
+Issuer outages (platform#489): the console and the controller both start serving before OIDC
+discovery succeeds and retry it in the background (backoff doubling from 1 s to 30 s, without a
+retry budget), so an unreachable issuer no longer crash-loops either pod. While discovery is
+pending, `GET /healthz` (console) and `GET /-/healthz` (controller) answer `200` with
+`discoveryReady: false`, so the pod stays Ready; each failed attempt logs a `discovery.failed`
+line and success logs `discovery.succeeded`. On the console, `/cli/info` and the landing page
+(with a "Sign-in is unavailable" notice) keep working, and the routes that need the issuer
+(`/login`, `/cli/refresh`, and `/cli/logout` with a refresh token) answer `503` with
+`Retry-After`; `/cli/refresh` does not report the login as expired. Once the issuer answers, the same process recovers without a restart.
+
 ## Verified against `di-framework-kube` (instance `authproto`, tenant `acme`)
 
 With both services running as pods in `di-runtime-acme` and reached over port-forward: kubectl identifies as `system:serviceaccount:wasmcloud:di-user-alice` through the controller;

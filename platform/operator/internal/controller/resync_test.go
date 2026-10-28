@@ -206,3 +206,87 @@ func TestResyncReasonWhenRepairIsDue(t *testing.T) {
 		t.Fatalf("Installed reason %q, want %q", got, ReasonResync)
 	}
 }
+
+// resyncTarget restarts the control plane, as the vCluster target does, when the owner Service
+// uid is neither the recorded one nor the resync in progress, and counts the restarts.
+type resyncTarget struct {
+	uid      string
+	restarts int
+}
+
+func (t *resyncTarget) Ensure(_ context.Context, inst *v1alpha1.PlatformInstance) (targets.State, error) {
+	s := inst.Status.Target
+	switch {
+	case s.ResyncServiceUID == t.uid:
+		return targets.State{Reason: "Resyncing", Message: "resyncing: vcluster control plane not ready"}, nil
+	case s.ServiceUID != "" && s.ServiceUID != t.uid:
+		t.restarts++
+		return targets.State{Reason: "Resyncing", Message: "service replaced", ResyncStarted: t.uid}, nil
+	}
+	return targets.State{Ready: true, Kubeconfig: []byte("kubeconfig-bytes"), ServiceUID: t.uid}, nil
+}
+
+func (t *resyncTarget) Delete(context.Context, *v1alpha1.PlatformInstance) (bool, error) {
+	return true, nil
+}
+
+// countingReader counts the reads past the cache.
+type countingReader struct {
+	client.Reader
+	gets int
+}
+
+func (c *countingReader) Get(ctx context.Context, k client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	c.gets++
+	return c.Reader.Get(ctx, k, obj, opts...)
+}
+
+// The round after a resync started can read a cached instance without the resync marker. The
+// controller reads it past the cache instead, so the target doesn't restart the control plane a
+// second time (#481); once the cache has the marker, rounds read the cache only.
+func TestResyncStartStaleCacheRestartsOnce(t *testing.T) {
+	h := newHarness(t, "")
+	reader := &countingReader{Reader: h.c}
+	h.r.APIReader = reader
+	h.readyTarget()
+	h.tg.state.ServiceUID = "uid-a"
+	h.reconcile()
+	h.reconcile()
+	before := h.get()
+	if before.Status.Target.ServiceUID != "uid-a" {
+		t.Fatalf("install did not record the uid: %+v", before.Status.Target)
+	}
+
+	tg := &resyncTarget{uid: "uid-b"}
+	h.r.Target = tg
+	h.now = h.now.Add(time.Minute)
+	h.reconcile()
+	if got := h.get().Status.Target.ResyncServiceUID; tg.restarts != 1 || got != "uid-b" {
+		t.Fatalf("resync start: %d restarts, marker %q", tg.restarts, got)
+	}
+
+	// The cache still serves the instance from before the resync marker was recorded.
+	h.r.Client = staleCache(h.c.(client.WithWatch), before)
+	for range 2 {
+		h.now = h.now.Add(h.r.Plan.TargetPoll)
+		h.reconcile()
+	}
+	if tg.restarts != 1 {
+		t.Fatalf("a stale cache restarted the control plane %d times", tg.restarts)
+	}
+	inst := h.get()
+	if inst.Status.Target.ResyncServiceUID != "uid-b" || conditionReason(inst, v1alpha1.ConditionTargetReady) != "Resyncing" {
+		t.Fatalf("after stale rounds %+v", inst.Status)
+	}
+
+	// The cache catches up: the expectation closes and later rounds don't read past it.
+	h.r.Client = h.c
+	h.now = h.now.Add(h.r.Plan.TargetPoll)
+	h.reconcile()
+	reads := reader.gets
+	h.now = h.now.Add(h.r.Plan.TargetPoll)
+	h.reconcile()
+	if tg.restarts != 1 || reader.gets != reads {
+		t.Fatalf("after catching up: %d restarts, %d extra reads", tg.restarts, reader.gets-reads)
+	}
+}
