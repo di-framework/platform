@@ -4,11 +4,11 @@
 |---|---|
 | Issue | #200 (follow-up to #199, refs #138) |
 | Roadmap | v0.1 #499, epic E4 #497, lane T08, milestone `#200:design` |
-| Status | **Design, revised after review on PR #530.** Owner decisions of 2026-10-28 and the engineering answers are recorded in section 13. No code changes. Implementation waits for this note to merge. |
+| Status | **Design, revised twice after review on PR #530.** Owner decisions of 2026-10-28, the engineering answers and the decisions taken after the second review are recorded in section 13. No code changes. Implementation waits for this note to merge. |
 | Related | #206 (codec 3, absorbs #244; its default flip waits on gate G04 = identity-server#71) |
 | Crate | `platform/pglite-encfs`; the Tenant setting (9.1) also touches `platform/platform/src/tenancy` |
 
-All `file:line` references are relative to `platform/pglite-encfs/` unless they start with `platform/platform/`. They were checked against `origin/main` `981fed0`; `platform/pglite-encfs` has not changed since `73cfb85`, which the first version of this note cited.
+All `file:line` references are relative to `platform/pglite-encfs/` unless they start with `platform/platform/`. They were checked against `origin/main` `981fed0`; `platform/pglite-encfs` has not changed since `73cfb85`, which the first version of this note cited. References into `platform/tenant-auth/` start with that path.
 
 ## 1. Summary
 
@@ -19,9 +19,9 @@ This note specifies **codec 4**, an integrity mode for whole data directories:
 - A write never touches the slot that holds the unit's last durable version. A torn write can then only destroy the version being written, so **every unit write is atomic**, and fsynced data survives any torn write.
 - On a cold cache the writer authenticates the pair before it picks a target, so a torn slot that claims a newer generation can never steer a write onto the durable slot (6.3, C13).
 - A random 192-bit nonce per slot write keeps nonces unique across crashes and retries.
-- Each file carries an authenticated, lazily updated **durable-size watermark** (5.6). A unit below it that has no valid slot was erased, and the read fails with `io`. A unit above it may legitimately have no valid slot after an ordinary crash, and it reads as zeros, as an unsynced plaintext extension does.
+- Each file carries an authenticated, lazily updated **durable-size watermark** (5.6) in its own 4 KiB page after the header. A unit below it that has no valid slot was erased, and the read fails with `io`. A unit above it may legitimately have no valid slot after an ordinary crash, and it reads as zeros, as an unsynced plaintext extension does.
 
-Codec 4 is a new codec id in the existing header format. It does not change codecs 2 and 3, the #206 rollout, or the G04 flip. A directory is either all XTS (codec 2/3) or all codec 4, and every file in an integrity directory uses two slots (O1). An integrity directory carries a new root marker, so older builds refuse the whole directory before they touch anything. Integrity is switched on by a Tenant setting that the platform renders into the workload, and only when a directory is initialised empty (O3). Existing directories move to codec 4 only through `pg_dump` and restore into a freshly initialised directory (O4).
+Codec 4 is a new codec id in the existing header format. It does not change codecs 2 and 3, the #206 rollout, or the G04 flip. A directory is either all XTS (codec 2/3) or all codec 4, and every file in an integrity directory uses two slots (O1). An integrity directory carries a new root marker, so older builds refuse the whole directory before they touch anything. Integrity is switched on by a Tenant setting that the platform renders into the workload's storage: a platform-run init step writes an **integrity reservation marker** into a new, empty directory before the host starts, and encfs initialises an integrity directory only from that marker (O3). No tenant-writable input (environment variable, ConfigMap, Secret) selects the mode. The platform records each storage key's mode from what the init step observes on disk, so the record is authoritative per directory. Existing directories move to codec 4 only through `pg_dump` and restore into a freshly initialised directory, which can be a new storage key of the same Tenant (O4).
 
 ## 2. The current on-disk format
 
@@ -75,13 +75,17 @@ The gaps this note addresses:
 - **Binding files to paths.** A whole file moved to another path still opens there (README "Threat model"). Codec 4 binds slots to the file id, not the path.
 - **Converting XTS directories in place.** Codec 2/3 files are never re-encrypted in place (README "Codecs and migration"), and a directory never mixes XTS and codec-4 files (O4).
 - **Hiding metadata** (names, sizes, access patterns).
-- **Changing the default** for any deployment. Integrity is chosen per Tenant and applies only to directories initialised after it is set (O3).
+- **Changing the default** for any deployment. Integrity is chosen per Tenant and applies only to storage keys first recorded after it is set (O3, 9.1).
 - **Cross-unit atomicity.** A write that spans units is atomic per unit, not as a whole, as with plaintext pages.
 
 ## 4. Assumptions
 
-- **A1 Atomic write units.** After a power loss, each aligned atomic write unit of the storage stack that an in-flight write touches holds either its old or its new contents. The unit is the device's atomic write size or the page-cache writeback granularity, whichever is larger: 512 bytes on some devices, 4 KiB on 4Kn devices and for Linux page-cache writeback. A write that covers only part of a unit rewrites the whole unit, with the uncovered bytes unchanged. This is the model `scripts/lib/tear.ts:1-8` uses at 512 bytes, and the one PostgreSQL relies on for `pg_control`. Section 7 ("Shared atomic units") shows why codec 4 needs nothing finer.
-- **A2 Tears stay inside the touched units.** Atomic units that no in-flight write touches keep their contents. Bytes of a touched unit that the write does not cover are, by A1, either their old value or the identical value in the new image.
+- **A1 Atomic write units.** Two separate facts, both needed:
+  - **Tears happen at the device's atomic unit.** After a power loss, each aligned atomic unit of the device that an in-flight write touches holds either its old or its new contents. That unit is 512 bytes on many devices (common NVMe drives report an atomic write unit of one logical block, AWUPF 0) and 4 KiB on 4Kn devices. This is the model `scripts/lib/tear.ts:1-8` uses at 512 bytes, and the one PostgreSQL relies on for `pg_control`.
+  - **Writes are widened to the writeback block.** Linux page-cache writeback sends whole 4 KiB pages to the device. The bytes of such a page that the write did not cover come from the page cache. A widened write can still tear at every device atomic unit inside it; widening does not make the 4 KiB page atomic.
+
+  The design's argument works at any atomic-unit size, and the harness tests 512 bytes and 4 KiB (12.2). Section 7 ("Shared atomic units") shows why codec 4 needs nothing finer.
+- **A2 Tears stay inside the touched units.** Device atomic units that no in-flight write (widened as above) touches keep their contents. Bytes of a touched unit that the write does not cover are, by A1, either their on-disk value or the page-cache value written with the widened page. For bytes of a **durable** neighbour, a slot or watermark record that holds a version made durable by a completed sync and not written since (6.2 never targets such a slot), the page cache equals the disk, so the two are identical. For bytes of a **pending** neighbour, written since the last sync, the page cache may differ from the disk, so a tear can expose a mix of that neighbour's own unsynced write. The neighbour then fails authentication and its unit falls back to its durable slot, which C2 already allows for an unsynced version.
 - **A3 Honest sync.** When host `sync` or `sync-data` returns success, everything written to the file before it is durable. Two host facts bound this:
   - On macOS, `fsync` does not flush the device cache without `F_FULLFSYNC`. The platform runs on Linux; a macOS development host does not meet A3, and its crash results prove nothing.
   - On Linux, after writeback fails with `EIO`, a later `fsync` can return success for pages that were never written. The design relies on PostgreSQL treating an fsync failure as fatal (`data_sync_retry = off`, the default): it PANICs and recovers from WAL. encfs adds its own fail-stop: after a host `sync` or `sync-data` of a file fails, every later write to that file fails with `io` until the instance restarts (6.6).
@@ -95,7 +99,8 @@ The first version of this note assumed ordered size updates (old A5). Review sho
 ### 5.1 Header and codec id
 
 - **Header:** unchanged: same 152 bytes, format version 1, **codec byte 4** (`src/header.rs:7-17`). The codec byte stays in the wrap's AAD, so a file cannot be relabelled between codecs without the key (`src/header.rs:315-327`).
-- **Header block.** The rest of the 4 KiB header block, unused today, holds the two watermark records (5.6) at bytes 2048..2112 and 3072..3136. Both lie in 512-byte sectors that the header's bytes 0..152 do not use. Rotation writes only bytes 0..152 (`src/component.rs:590-593`), so it never touches them.
+- **Layout of a codec-4 file:** `[header page: 4096][watermark page: 4096][pair 0][pair 1]...`. The header page is the same 4 KiB block as today, zero after byte 152. The **watermark page** at bytes 4096..8192 holds the two watermark records (5.6), record 0 at 4096..4160 and record 1 at 6144..6208, each in its own 512-byte sector; the rest of the page is zero and ignored. Pairs start at byte 8192.
+- **Why a separate page.** Record writes are routine (one per sync interval per written file, 5.6), while the header is written once and rewritten only by a rare key rotation. With the records in their own page, no record write ever rewrites, widens into or shares a device atomic unit with the header, at 512 bytes or at 4 KiB, so the wrapped DEK is outside the blast radius of every record write (section 7). Rotation writes only bytes 0..152 of the header page (`src/component.rs:590-593`), so it never touches the records. The page costs 4 KiB per file (11).
 - **Codec 1 stays retired.** It was the spike's AEAD layout, so reusing it could make leftover spike files parse.
 - **DEK:** unchanged: 64 random bytes per file (`src/header.rs:44-45`). Codec 4 derives two 32-byte keys with HKDF-SHA256 (`ikm = DEK`, `salt = "di-framework/encfs/v1"`, the salt the KEK derivation uses, `src/keys.rs:36`, under distinct info strings): `aead_key` with info `"codec4-aead"` for slots, and `wm_key` with info `"codec4-watermark"` for watermark records. The XTS key halves have no meaning in codec 4. HKDF instead of `DEK[..32]` keeps a future Merkle or MAC key (rollback protection) derivable from the same DEK.
 
@@ -103,7 +108,7 @@ The first version of this note assumed ordered size updates (old A5). Review sho
 
 - **Unit size 8192** logical bytes, separate from XTS's 4096 (`src/codec.rs:41`). 8 KiB matches PostgreSQL's `BLCKSZ` and `XLOG_BLCKSZ`, so a relation, SLRU or WAL page write is exactly one slot write (Q1).
 - **Slot:** a 64-byte slot header followed by an 8192-byte ciphertext area, **8256 bytes** in total. Slots are compact, not padded to sector or page boundaries (Q2, section 7).
-- **Pair:** unit `u` owns slot A at `4096 + u × 16512` and slot B at `4096 + u × 16512 + 8256`. A pair is 16512 bytes. The stride is fixed, so the position of every unit is known without reading anything.
+- **Pair:** unit `u` owns slot A at `8192 + u × 16512` and slot B at `8192 + u × 16512 + 8256`. A pair is 16512 bytes. The stride is fixed, so the position of every unit is known without reading anything. Because 8192 is a multiple of 4096, the alignment of every slot is the same as it would be after a single 4 KiB header (section 7).
 
 | slot bytes | field | notes |
 |---|---|---|
@@ -137,7 +142,7 @@ The logical size can no longer be computed from the host size alone (`src/file.r
 - Absent pairs are never `io`, whatever `D` says. A host file shorter than `D` units was truncated, which is a non-goal, or a shrink's watermark write and truncate were reordered before the shrink's sync (6.4), which is legitimate.
 - Corrupting the trailing pairs of a file therefore shrinks it silently only above `D`. Below `D` it is detected.
 
-**Cost and caching.** The size of a codec-4 file needs the header block (header plus watermark records, one 4 KiB read) and the last pair (one read of up to 16512 bytes), plus one more pair read per dropped trailing pair. encfs caches the size in the per-file state (6.1), so `stat` on an open descriptor costs nothing after the first computation. `stat-at` by path has no descriptor and no file id. It first calls the host's `metadata-hash-at` (one host call, already passed through at `src/component.rs:1182-1194`) and looks the size up by host identity (6.1). Only on a miss does it open the file and pay the header-block read and the last-pair read, then cache the result. Section 11 counts this.
+**Cost and caching.** The size of a codec-4 file needs the header page and the watermark page (one contiguous 8 KiB read) and the last pair (one read of up to 16512 bytes), plus one more pair read per dropped trailing pair. encfs caches the size in the per-file state (6.1), so `stat` on an open descriptor costs nothing after the first computation. `stat-at` by path has no descriptor and no file id. It first calls the host's `metadata-hash-at` (one host call, already passed through at `src/component.rs:1182-1194`) and looks the size up by host identity (6.1). Only on a miss does it open the file and pay the 8 KiB header-and-watermark read and the last-pair read, then cache the result. Section 11 counts this.
 
 ### 5.4 Nonces
 
@@ -165,7 +170,7 @@ The table is symmetric in A and B. "Invalid" covers all-zero bytes, holes, torn 
 
 Each codec-4 file carries a watermark `D`: a count of units such that every unit `u < D` had a valid slot on disk when a sync of the file last completed before `D` was written. Under the durable-slot invariant (6.2) such a unit keeps a valid slot through any later crash, so a unit below `D` without one was erased.
 
-**Records.** Two 64-byte records in the header block, record 0 at byte 2048 and record 1 at byte 3072:
+**Records.** Two 64-byte records in the watermark page (5.1), record 0 at byte 4096 and record 1 at byte 6144:
 
 | record bytes | field | notes |
 |---|---|---|
@@ -176,22 +181,24 @@ Each codec-4 file carries a watermark `D`: a count of units such that every unit
 | 56..64 | reserved, zero | authenticated |
 
 - **AAD** = `"DIPGWM04"` ‖ file id ‖ record index (u8) ‖ record bytes 0..16 ‖ record bytes 56..64. A record cannot be moved to the other position, to another file or into a slot.
-- **Selection.** A record is valid if `seq ≠ 0`, the reserved bytes are zero and the tag verifies. The watermark is the valid record with the higher `seq`; equal `seq` in two valid records is `io`. **No valid record** fails the file with `io`: it cannot arise from a crash, because every codec-4 file is born with a durable record (below) and the record that holds the last durable value is never the target of a write.
-- **Birth.** When encfs seals a codec-4 header, the 4 KiB block it writes and syncs (`src/component.rs:351-356`) also carries record 0 with `seq = 1, D = 0`. A file that has a header therefore always has a durable, valid watermark.
+- **Selection.** A record is valid if it lies entirely within the host file, `seq ≠ 0`, the reserved bytes are zero and the tag verifies. The watermark is the valid record with the higher `seq`; equal `seq` in two valid records is `io`.
+- **Birth.** When encfs seals a codec-4 header, it writes the header page and the watermark page as one 8 KiB block, with record 0 set to `seq = 1, D = 0`, and syncs it before any pair is written, as it does for the 4 KiB header block today (`src/component.rs:351-356`).
+- **Interrupted birth.** A crash before that sync may leave the header page without the watermark page, or with record 0 torn (A5 orders nothing before a sync). No pair can exist then, because pairs are written only after the birth sync. So a codec-4 file with a valid header, no valid record and a host size of at most 8192 bytes is an interrupted birth: it reads as empty with `D = 0`, and its first write re-seals record 0 (`seq = 1, D = 0`) in the watermark page and syncs, before any pair, exactly as a birth does. This is the codec-4 analogue of the existing fresh-header rule (`src/header.rs:78-113`).
+- **No valid record with a pair present** (host size above 8192) fails the file with `io`. It cannot arise from a crash: the birth sync made record 0 durable before any pair existed, and the record that holds the last durable value is never the target of a write.
 
-**Two-slot rule for records.** Record writes follow the same durable-slot rule as units (6.2), with one file-level `wm_pending` bit: while `wm_pending` is set, a record write overwrites the pending record; when it is clear, it writes the other one. A torn record write fails authentication and the reader falls back to the other record, which holds the last durable watermark. The new `seq` is the winner's `seq + 1`.
+**Two-slot rule for records.** Record writes follow the same durable-slot rule as units (6.2), with one file-level `wm_pending` bit: while `wm_pending` is set, a record write overwrites the pending record; when it is clear, it writes the other one. A torn record write fails authentication and the reader falls back to the other record, which holds the last durable watermark. The new `seq` is the winner's `seq + 1`. A record write is one 64-byte `pwrite` into its own 512-byte sector of the watermark page; it never touches the header page or a pair.
 
 **Advancing.** `D` only ever claims units whose data was durable before the claim was written:
 
-1. When a host `sync` or `sync-data` of the file succeeds (6.3 "Sync"), encfs computes a candidate `D'`. It starts at the current `D` and extends over consecutive units `u` that have a valid winner known in the per-file state, are not pending (the sync just cleared them) and lie inside the logical size.
-2. A unit above `D` that this instance has not touched blocks the extension until it is verified. At each successful sync encfs verifies at most 256 such pairs (4 MiB of reads), in order. A verified pair with a valid winner extends `D'`. A pair with no valid slot is a hole from an earlier crash (C14); it already reads as zeros, so encfs writes a sealed zero unit into it (generation 1, slot A). The visible content does not change, and the unit joins `D'` after the next sync.
-3. If `D' > D`, encfs writes the new record **lazily**: with the next write to that file, as one extra 64-byte `pwrite`, or when the file's last descriptor is dropped. The record write itself is pending (`wm_pending = true`) until the next successful sync. No fsync is added.
+1. When a host `sync` or `sync-data` of the file succeeds (6.3 "Sync"), encfs computes a candidate `D'`. It starts at the current `D` and extends over consecutive units `u` that have a valid winner known in the per-file state, are not pending (the sync just cleared them) and lie inside the logical size. The new candidate **replaces** any candidate not yet written; it is never merged with an older one by taking the maximum.
+2. A unit above `D` without a `known` valid winner blocks the extension until it is verified. That covers units this instance has not touched, and units it touched whose entry was dropped because they have no valid slot (6.6 (e)). At each successful sync encfs verifies at most 256 such pairs (4 MiB of reads), in order. A verified pair with a valid winner extends `D'`. A pair with no valid slot is a hole, from an earlier crash (C14) or from a failed write (6.6 (e)); it already reads as zeros, so encfs writes a sealed zero unit into it (generation 1, slot A, through the write path). The visible content does not change, and the unit joins `D'` after the next sync. A hole stays a hole, and keeps blocking `D`, only until that fill or a rewrite of the unit is synced.
+3. If `D' > D`, encfs writes the new record **lazily**: with the next write to that file, as one extra 64-byte `pwrite` after the unit writes, or, if no write comes first, immediately before the host call of the next `sync` or `sync-data` of that file, which then makes it durable. The record write itself is pending (`wm_pending = true`) until the next successful sync. Nothing is written when a descriptor is closed or the file's state is dropped: a clean file's unwritten candidate is simply discarded with its state, which leaves the older, lower `D` in force and only delays erasure detection for the units of the last sync interval until the file is written or synced again. So the watermark adds no fsync and never leaves a closed, clean file dirty: a record written before a sync is made durable by that same sync.
 
 A crash before the record write, or one that tears it, leaves the previous `D`, which is lower and still true. A record never claims more than was durable, so `D` is safe at every crash point.
 
-**Lowering.** A shrink lowers `D` to the new number of units before it truncates, and syncs before the next write (6.4).
+**Lowering.** A shrink discards any unwritten candidate `D'`, lowers `D` to the new number of units before it truncates, and syncs before the next write (6.4). A candidate computed before a shrink can therefore never be written after a later re-extension.
 
-**What the watermark costs and leaves out.** One 64-byte write per sync interval per written file, and at most 256 pair reads per sync while `D` catches up after a restart. Units written since the last advance are protected against crashes, not against erasure (non-goals). Replaying an older record lowers `D`; that is rollback (Q14).
+**What the watermark costs and leaves out.** 4 KiB of space per file (the watermark page), one 64-byte write per sync interval per written file, and at most 256 pair reads per sync while `D` catches up after a restart. Units written since the last advance are protected against crashes, not against erasure (non-goals). Replaying an older record lowers `D`; that is rollback (Q14).
 
 ## 6. Write protocol
 
@@ -230,10 +237,10 @@ For `write(offset, data)`, and for zero-fill, which already goes through the sam
 3. **W2, build the plaintext.** A partially covered unit is read-modify-write from the winner. A unit with no valid slot has no old plaintext: above `D` it is taken as zeros, as a read would return it; below `D` a partial write fails with `io` (erasure), and a whole-unit write is allowed, so WAL redo can overwrite such a page with a full-page image. The erasure was already logged when W1 found it.
 4. **W3, choose the target slot and generation** (6.2).
 5. **W4, seal.** Draw a fresh nonce, then encrypt and authenticate to produce `slot header ‖ ciphertext`.
-6. **W5, write.** One host `pwrite` per unit, at the target slot's offset, `64 + len` bytes. WASI 0.2 has no `pwritev`, and slots of neighbouring units are not contiguous, so a multi-unit write costs one host call per unit (11). The exception is an extension: the slot-A images of new units and the zero slot-B gaps between them are contiguous and go out as one `pwrite`. This is an optimisation only; nothing depends on the order in which those bytes reach the disk (A5, C14). If a lazy watermark record write is due (5.6 step 3), it is one more 64-byte `pwrite` after the unit writes.
+6. **W5, write.** One host `pwrite` per unit, at the target slot's offset, `64 + len` bytes. WASI 0.2 has no `pwritev`, and slots of neighbouring units are not contiguous, so a multi-unit write costs one host call per unit (11). The exception is an extension: the slot-A images of new units and the zero slot-B gaps between them are contiguous and go out as one `pwrite`. This is an optimisation only; nothing depends on the order in which those bytes reach the disk (A5, C14). If a lazy watermark record write is due (5.6 step 3), it is one more 64-byte `pwrite` into the watermark page after the unit writes.
 7. **W6, update the state.** Set `winner = target`, `pending = true`, `known = true`, `dirty = true`, and update the size. If W5 failed, follow 6.6 (e) instead.
 
-**Sync.** `sync` and `sync-data` still pass through (`src/component.rs:1041-1043`, `src/component.rs:1087-1089`). When the host call succeeds, encfs clears every `pending` bit of that file, clears `wm_pending` and `dirty`, sets `synced_once`, and computes the candidate watermark (5.6). On failure it sets `failed`, changes nothing else, and returns the error (A3).
+**Sync.** `sync` and `sync-data` still pass through (`src/component.rs:1041-1043`, `src/component.rs:1087-1089`). If a candidate watermark from the previous sync is still unwritten, encfs first writes its record (5.6 step 3), so this sync makes it durable. When the host call succeeds, encfs clears every `pending` bit of that file, clears `wm_pending` and `dirty`, sets `synced_once`, and computes the next candidate watermark, replacing any older one (5.6). On failure it sets `failed`, changes nothing else, and returns the error (A3).
 
 **Barriers.** Codec 4 adds exactly two kinds of fsync: W0, once per written file per instance, and one after each shrink (6.4). Otherwise it imposes no ordering between writes, and correctness rests on the invariant, the watermark and A1–A4.
 
@@ -245,8 +252,8 @@ No resize relies on the filesystem ordering a size change against data (A5).
 - **Append that adds units:** write the last unit with `len = 8192`, then the new units. They may reach the disk in any order (C7, C14).
 - **Grow with `set_size`:** zero-fill through the write path, as today (`src/file.rs:136-141`).
 - **Every shrink** follows three steps:
-  1. **Lower the watermark.** If `D` exceeds the number of units that remain (`k` for a shrink to a unit boundary at `k × 8192`, `k + 1` for a shrink to inside unit `k`), write a record with the lower `D` (5.6, two-slot rule).
-  2. **Truncate.** Host `set_size` to the end of the last remaining pair: `4096 + k × 16512` for a unit boundary, `4096 + (k + 1) × 16512` for a shrink inside unit `k`. A truncate to 0 is `set_size(4096)` and keeps the header and its records, as today (`src/header.rs:27-28`).
+  1. **Lower the watermark.** Discard any unwritten candidate `D'`. If `D` exceeds the number of units that remain (`k` for a shrink to a unit boundary at `k × 8192`, `k + 1` for a shrink to inside unit `k`), write a record with the lower `D` (5.6, two-slot rule).
+  2. **Truncate.** Host `set_size` to the end of the last remaining pair: `8192 + k × 16512` for a unit boundary, `8192 + (k + 1) × 16512` for a shrink inside unit `k`. A truncate to 0 is `set_size(8192)` and keeps the header page and the watermark page, as XTS keeps its header today (`src/header.rs:27-28`).
   3. **Sync.** Host `sync-data` on the file, then clear `pending` and `dirty` as for any sync. The next write to the file, including step 4, waits for it.
   4. **Shrink inside a unit only:** write unit `k` with the new `len` through the write path. Its target follows 6.2 as for any write.
 
@@ -272,9 +279,16 @@ The target rule (6.2) is only as good as `pending`. If it is wrongly clear, a wr
 - **(b) Entries created by reads.** A read that resolves a unit which is not `known` records it with `pending = false`. That is correct because of (c): a unit without an entry was not written since the last successful sync of this file, so its on-disk winner is either the durable version from that sync or, before W0 has run, a version that W0 will make durable before the first write. A read never overwrites an existing entry.
 - **(c) Dropping state.** The bitmap has no per-unit eviction, so a `pending` bit can only disappear with the whole file state. State is kept while the file is `dirty` (6.1). To drop the state of a dirty file, for example under a limit on open files' memory, encfs first calls host `sync-data` on it; if that fails, it keeps the state and sets `failed`. A clean file's state can be dropped freely; if it is recreated, W0 runs again because `synced_once` is part of the dropped state.
 - **(d) Last descriptor closed.** Covered by (c): closing does not drop the state of a dirty file.
-- **(e) W5 fails** (`ENOSPC`, a short write, any host error): the target slot now holds unknown bytes.
-  - If the target was the other slot (`pending` was clear), the winner is unchanged and durable; the state stays as it was.
-  - If the target was the pending winner, the pending version is lost on disk. encfs re-reads the pair, re-selects (5.5) and records the result with `pending = false`, which is now true: the remaining valid slot is the durable one, because 6.2 never targeted it. A read then returns the **durable** version, so the last acknowledged unsynced write to that unit disappears in a live instance. That is acceptable: the failed write returned an error, PostgreSQL keeps the page dirty in shared buffers and retries the write with the newest contents, and a failed WAL write PANICs. The retry targets the slot that failed (6.2, `pending` clear means "the other slot"), with a fresh nonce.
+- **(e) W5 fails** (`ENOSPC`, a short write, any host error): the target slot now holds unknown bytes. The host may even have written all of them before it reported the error. encfs does not guess which: it re-reads the pair, re-selects (5.5), and records
+  - `winner` = the re-selected winner, and
+  - **`pending = (re-selected winner == failed target)`**.
+
+  This holds whether or not the failed write landed, and whichever slot was targeted:
+  - The failed target is never the slot that held the durable version (6.2). So if re-selection picks the target, its bytes landed but were never synced, and `pending = true` makes the next write overwrite it, never the durable slot.
+  - If re-selection picks the other slot, that slot is the one 6.2 protected. It holds the durable version, or, when `pending` was clear, the unchanged durable winner. `pending = false` is then true, and the next write targets the failed slot again (6.2, "the other slot"), with a fresh nonce.
+  - If the target was the pending winner and its version did not land, a read returns the **durable** version, so the last acknowledged unsynced write to that unit disappears in a live instance. That is acceptable: the failed write returned an error, PostgreSQL keeps the page dirty in shared buffers and retries the write with the newest contents, and a failed WAL write PANICs.
+  - If re-selection finds **no valid slot** (a new unit whose first write failed), there is nothing durable to protect: the entry is dropped (not `known`), the unit reads as zeros above `D`, and 5.6 step 2 treats it as a hole.
+  - If the re-read itself fails, the entry is dropped and `synced_once` is cleared, so the next write to the file runs W0 and syncs before it trusts any bit again.
 - **(f) Shrinks.** Step 3 of 6.4 syncs, so the bits of surviving units are clear and correct; removed units lose their state with their pairs.
 - **(g) W0 coverage.** Every write path, including a shrink's slot write, sealed zero units and record writes, runs W0 (6.3 W1).
 - **(h) Failed sync.** The bits stay set, and `failed` stops further writes (A3), so no write ever consults a bit whose meaning a failed sync made uncertain.
@@ -294,7 +308,8 @@ These cases assume A1–A5. "Previous" means the version in the durable slot. `D
 | C5 | a write spanning several units, each landed, torn or lost independently | each unit independently | each unit is its old or new version (G3). There is no cross-unit atomicity, as with plaintext pages |
 | C6 | append inside the last unit | one slot | old length and contents, or new: **no garble** (G4, compare #206's 31 and 15 bytes) |
 | C7 | append that adds units, unsynced, persisted out of order | the last unit old or full; new trailing pairs present, torn or absent | trailing pairs without a valid slot are dropped, so the size is the old one or an intermediate one. A former last unit with `len < 8192` followed by a valid unit reads as zeros up to 8192 (5.3) |
-| C8 | write of a fresh file's first unit, header synced | header with record 0, plus a torn or absent slot A | an empty file (`D = 0`). The header still follows the fresh/sealed rules (`src/header.rs:78-113`) |
+| C8 | write of a fresh file's first unit, header and watermark page synced | header, record 0, plus a torn or absent slot A | an empty file (`D = 0`). The header still follows the fresh/sealed rules (`src/header.rs:78-113`) |
+| C8a | birth of a codec-4 file, before its sync | header page present or not; watermark page absent, zero or torn | zero header: fresh. In an integrity directory every file is codec 4, so the "no room for data" bound of `classify` (`src/header.rs:102-104`) is 8192 there instead of 4096. Header without a valid record, size ≤ 8192: an interrupted birth, read as empty with `D = 0`; the first write re-seals record 0 and syncs (5.6) |
 | C9 | shrink inside a unit, after the shrink's sync and before the slot write is durable | pairs beyond unit `k` gone; unit `k`'s old slot | the unit-aligned size `(k + 1) × 8192`, old valid bytes. After the slot write: the new size (6.4) |
 | C10 | rewriting the same unit twice without a sync, torn on the second write | durable slot untouched; the pending slot torn | the last **durable** version. The issue's "older generation" rule would lose it here (6.2) |
 | C11 | during a sync | pending slots and a pending record durable or not | per unit, the newest version that reached the disk, never older than the previous sync; `D` old or new, both true. W0 makes the next instance safe |
@@ -323,12 +338,17 @@ Plaintext only promises sector-level old-or-new pages here. Codec 4 is strictly 
 
 **Shared atomic units.** Slots are compact, so their boundaries do not fall on atomic-unit boundaries:
 
-- The pair stride is 16512 = 32 × 512 + 128 and the slot size 8256 = 16 × 512 + 64. Slot A of unit `u` starts at an offset ≡ 128·u (mod 512) and slot B at ≡ 128·u + 64 (mod 512). Slot A starts on a 512-byte boundary only for `u ≡ 0 (mod 4)`, slot B never; at 4 KiB granularity slot A starts on a boundary only for `u ≡ 0 (mod 32)`.
+- Pairs start at byte 8192, a multiple of 4096. The pair stride is 16512 = 32 × 512 + 128 and the slot size 8256 = 16 × 512 + 64. Slot A of unit `u` starts at an offset ≡ 128·u (mod 512) and slot B at ≡ 128·u + 64 (mod 512). Slot A starts on a 512-byte boundary only for `u ≡ 0 (mod 4)`, slot B never; at 4 KiB granularity slot A starts on a boundary only for `u ≡ 0 (mod 32)`.
 - So nearly every slot boundary lies inside an atomic unit: slot A of `u` shares one with slot B of `u`, and slot B of `u` shares one with slot A of `u + 1`. A slot write therefore rewrites an atomic unit that also holds the edge of a neighbouring slot, which may belong to another unit and may be that unit's durable slot. With 4 KiB units, the shared unit holds up to 4032 bytes of the neighbour.
-- **Under A1 this is safe at any granularity.** The bytes of the neighbour inside the shared unit are identical in the old and the new image of that unit, because the write does not cover them and the page cache rewrites them unchanged. Old-or-new of the whole unit therefore leaves the neighbour's bytes as they were. The argument does not depend on the size of the atomic unit, only on A1 holding at whatever size it is.
-- **If A1 fails** (a unit returns neither its old nor its new contents, for example a device that garbles sectors in flight), the target fails authentication as in C2, **and the neighbouring slot can be damaged too**. If that neighbour is a durable slot, its unit has lost its durable version. Codec 4 then reports `io` for it below `D` (or zeros above it) instead of returning wrong data. Plaintext and XTS lose the same bytes silently, and PostgreSQL's `pg_control` has the same dependency. This note does not claim more than A1.
+- **Under A1 this is safe at any granularity.** A durable neighbour's bytes inside the shared unit are identical in the old and the new image of that unit: the write does not cover them, and the page cache, which supplies them for a widened write, equals the disk for a slot not written since the last sync (A2). Old-or-new of the whole unit therefore leaves a durable neighbour's bytes as they were. A pending neighbour may come back as a mix of its own unsynced write, fails authentication and falls back to its unit's durable slot (A2, C2). The argument does not depend on the size of the atomic unit, only on A1 holding at whatever size it is.
+- **If A1 fails** (a unit returns neither its old nor its new contents, for example a device that garbles sectors in flight), the target fails authentication as in C2, **and whatever shares the damaged atomic unit can be damaged too**. The blast radius of each kind of write is:
+  - **A slot write:** the neighbouring slots inside its first and last atomic units, or, when writeback widens it (A1), inside its first and last 4 KiB pages. If such a neighbour is a durable slot, its unit has lost its durable version. Codec 4 then reports `io` for it below `D` (or zeros above it) instead of returning wrong data. A slot write never reaches the header page or the watermark page, because pairs start at 8192.
+  - **A watermark record write:** the watermark page only. Writeback widens a record write to the whole watermark page (A1), so the other record is in flight too and can be damaged, whatever the device's atomic unit; only a device written without page-cache widening and atomic at 512 bytes keeps it out of reach. With both records invalid and pairs present, the file fails with `io` (5.6): detected, never wrong data. The header, and with it the wrapped DEK, is on a different page and out of reach. The header page is in flight only during a birth or a rotation, not during routine record writes. Recovering such a file (re-sealing record 0 with `D = 0`, which restarts erasure detection) is an explicit operator step for a future repair tool, not something encfs does on its own.
+  - **A header write** (birth, rare rotation): the header page only, as today.
+
+  Plaintext and XTS lose the same bytes silently, and PostgreSQL's `pg_control` has the same dependency. This note does not claim more than A1.
 - **Padding does not remove the dependency.** Padding slots to 8704 bytes (17 sectors) would align them only to 512 bytes, which buys nothing where the atomic unit is 4 KiB. Independence there needs slots padded to 12288 bytes, about 3× the data. Neither is adopted (Q2).
-- The watermark records share the header block's atomic unit at 4 KiB granularity (they use separate 512-byte sectors from the header and from each other). The same argument applies: the header bytes are identical in both images. Header rotation already rewrites bytes inside that unit in place (`src/component.rs:590-593`).
+- The watermark records live in their own page (5.1), so no record write shares an atomic unit with the header or a slot at either granularity. The records share the watermark page with each other at 4 KiB, and the argument above covers that: a record holding the durable `D` is not written while it is durable, so its bytes are identical in both images.
 
 ## 8. Read protocol
 
@@ -361,78 +381,129 @@ Whole-unit writes over an erased unit still work, so WAL redo can overwrite it w
 
 ### 9.1 Integrity is a Tenant setting (O3)
 
-Integrity is per directory and chosen once, when the directory is initialised. The owner decided (O3) that the first implementation switches it on through a **Tenant setting that the platform renders into the pglite workload**, not through a build flag alone.
+Integrity is per directory and chosen once, when the directory is initialised. The owner decided (O3) that the first implementation switches it on through a **Tenant setting that the platform renders into the pglite workload's storage**, not through a build flag alone. The first revision of this note rendered the setting as an environment variable. The second review showed that tenants can set that variable too, and that the per-Tenant record missed directories that exist on disk (W1 and W2 of the second review), so this section was redesigned.
 
-**Tenant field.** `spec.storage.integrity` on the `Tenant` CRD (`platform/platform/src/tenancy/resources.ts:47-66` for `TenantSpec`, `platform/platform/src/tenancy/resources.ts:803-830` for the schema):
+**Why not an environment variable.** A tenant can put a variable into a guest's environment through paths that go through neither the controller nor tenant-auth:
+
+- The `di-developer` Role can create and update WorkloadDeployments, ConfigMaps (including `di-vars-<env>`) and Secrets (including `<workload>-secrets`) directly (`platform/platform/src/tenancy/resources.ts:1108-1124`). `<workload>-secrets` is written by the app's own tooling (`platform/tenant-auth/README.md:399-400`).
+- A WorkloadDeployment may carry inline `localResources.environment.config` variables (`platform/platform/tests/workload-storage.test.ts:82`). tenant-auth's `inject` passes a bundle's `environment` through and replaces only `configFrom` and `secretFrom` (`platform/tenant-auth/src/v1/deploy.ts:237-262`), and the WorkloadDeployment policy constrains only those two references (`platform/platform/src/tenancy/admission.ts:717-728`).
+
+Reserving the name would need a CEL rule for inline config, new policies on `configmaps` and `secrets` in every tenant namespace, a duplicate-variable rule in encfs, and a statement about how wasmCloud merges the three sources. Every new configuration source would reopen the gap. The design instead takes the mode out of the guest's environment altogether. **No environment variable selects the mode.**
+
+**Overview.** The platform reserves, the marker decides, and observation records:
+
+1. **Setting.** `spec.storage.integrity` on the `Tenant` CRD selects the mode for storage keys the platform has not recorded yet.
+2. **Reservation.** Before the tenant host starts, a platform-run init step writes an **integrity reservation marker** into each new, empty directory whose key is recorded as `AEAD`.
+3. **Decision.** encfs decides from the root marker alone. A reservation in a root without data initialises an integrity directory; every other root decides as today.
+4. **Observation.** The same init step classifies every directory of the Tenant on the node, and the controller records each key's actual mode from that.
+
+**Tenant field.** `spec.storage.integrity` (`platform/platform/src/tenancy/resources.ts:47-66` for `TenantSpec`, `platform/platform/src/tenancy/resources.ts:803-830` for the schema):
 
 - enum `Off` | `AEAD`, default `Off`, inside a new `storage` object with `default: {}`, following the style of `deletionPolicy` (`Retain` | `Delete`);
-- it applies to the Tenant's workload storage directories (`di-framework.dev/persistent-storage`, `platform/platform/src/tenancy/workload-storage.ts:1-11`), the directories that pglite workloads use for their data.
+- it applies to the Tenant's workload storage directories (`di-framework.dev/persistent-storage`, `platform/platform/src/tenancy/workload-storage.ts:1-11`), the directories that pglite workloads use for their data;
+- it is an operator setting: tenant users have no Role on Tenant objects, and the per-tenant controller may only `get` its own Tenant (`platform/platform/src/tenancy/resources.ts:2140-2142`);
+- it may change at any time. A change applies only to keys recorded after it; recorded keys keep their mode (below).
 
-**Recording which mode each directory got.** The controller records, per workload storage key, the mode it rendered when it first gave a workload that directory: `status.storage.directories[] = { key, integrity }`. The record is written **before** the first storage patch for that key (`storagePatch`, `platform/platform/src/tenancy/workload-storage.ts:181-214`, applied by `reconcileWorkloadStorage`, `platform/platform/src/tenancy/controller.ts:2255-2272`). A guest sees the directory only through that patch's preopen, so encfs can initialise a directory only after its mode is recorded. On upgrade, the controller backfills `integrity: Off` for every key whose workload already carries the controller's storage volume: those directories exist and are XTS (or plaintext).
+**The init step.** The tenant host pod already runs a platform-rendered init container, `storage-owner`, with a fixed image and every storage directory mounted, before the host container starts (`platform/platform/src/tenancy/workload-storage.ts:106-150`, placed in the host pod at `platform/platform/src/tenancy/resources.ts:1479-1489`). The host pod lives in the tenant's runtime namespace, where tenant users can only read pods and logs and port-forward (`platform/platform/src/tenancy/resources.ts:1139-1151`), so no tenant can change its spec or arguments. A second init container, `storage-mode`, runs after `storage-owner`:
 
-**Immutability once a directory is initialised.** A ValidatingAdmissionPolicy on `tenants`, next to the existing tenancy policies (`platform/platform/src/tenancy/admission.ts:490-510`, which today bind only tenant namespaces; Tenant is cluster-scoped, so this one needs its own binding), refuses an update that changes `spec.storage.integrity` while `oldObject.status.storage.directories` is non-empty. Message: "spec.storage.integrity cannot change after workload storage exists (keys: …); integrity applies only to new, empty directories. Migrate with pg_dump and restore (design-200 section 10)." Before any directory exists, the field may change freely. A CRD transition rule (`self == oldSelf`) is not used, because it cannot see whether a directory exists.
+- **Identity.** It uses the same fixed image and runs as the host uid (65532, `HOST_UID`) with no capabilities. `storage-owner` has already handed each directory to that uid; root without `CAP_DAC_OVERRIDE`, which `storage-owner` does not have, could not write into it.
+- **Mounts.** The same per-key mounts as `storage-owner`, plus the Tenant's workloads root `<storageRoot>/di-tenants/<tenant uid>/workloads` (`nodeStoragePath`, `platform/platform/src/tenancy/workload-storage.ts:98-100`), mounted read-only. That root covers only this Tenant's directories.
+- **Arguments.** The keys to reserve, rendered by the controller: every mounted key whose record selects `AEAD` (below). The list changes only when a key is first mounted, which already changes the host pod's volumes and rolls it.
+- **Reservation.** For each key on that list whose directory is empty, ignoring `lost+found` and the marker names as `is_volume_metadata` does (`src/marker.rs:26-28`), it writes the reservation marker to `.di-encfs.tmp`, syncs it and renames it over `.di-encfs`. That is the discipline `write_marker` uses (`src/component.rs:479-497`), so the marker is never partial. The step never writes into a non-empty directory and never changes an existing marker. If a reservation cannot be written, the step exits non-zero and the host does not start, so a key selected as `AEAD` is never handed to a guest unreserved.
+- **Observation.** It lists every directory under the workloads root whose name is a valid storage key, plus every mounted key. It classifies each one from the marker's magic, length and flags only, never reading data files or key material: `empty`, `unencrypted` (entries, no marker), `xts`, `aead`, `reserved` (a reservation and nothing else) or `other`. It prints one line per directory and a final `done count=N`.
+- **Reporting.** The controller reads that output with `pods/log` once per host pod uid and checks the count. It holds `pods/log get` cluster-wide (`platform/platform/src/tenancy/install.ts:198-202`, `platform/platform/src/tenancy/controller.ts:387-391`) and already lists the tenant's host pods (`platform/platform/src/tenancy/controller.ts:445-458`). Logs have no size limit that matters here, unlike a 4 KiB termination message. The output names only directory names and classes, which tenant users can already read through `di-runtime-viewer`.
 
-**Set on a Tenant whose directory already exists.** The admission policy refuses it. If the field changes anyway (the policy not installed, or status lost and backfilled later), the controller:
+A key's directory reaches a guest only through a host pod whose spec mounts it (`platform/platform/src/tenancy/resources.ts:1085`, `platform/platform/src/tenancy/workload-storage.ts:110-150`), and then through the controller's storage patch (`storagePatch`, `platform/platform/src/tenancy/workload-storage.ts:181-214`, applied by `reconcileWorkloadStorage`, `platform/platform/src/tenancy/controller.ts:2255-2272`). So every new directory passes through the init step before any guest can open it. `storagePatch` itself does not change: it renders no variable.
 
-- keeps rendering the **recorded** mode for every existing key, never the new one;
-- sets a Tenant condition `StorageIntegrity` with `status: False`, reason `IntegrityLocked`, and a message naming the keys whose recorded mode differs from the spec and pointing to section 10. With every recorded mode equal to the spec, the condition is `True`, reason `AsSpecified`.
+**Records.** `status.storage.directories[]` holds one entry per storage key, `{ key, requested, integrity, observed }`:
 
-New keys created after the change get the spec's mode. Each directory is homogeneous, which is what G1 needs.
+- **`requested`** (`Off` | `AEAD`): the controller writes it from `spec.storage.integrity` **before** it renders a host pod that mounts the key (write-ahead). It is absent on an entry created from the listing.
+- **`integrity`** (`Off` | `AEAD`): the directory's actual mode, set once from the init step's first report on a mounted key, which the step makes after any reservation: `aead` and `reserved` give `AEAD`; `xts` and `unencrypted` give `Off`; an `empty` directory the step did not reserve gives `Off`, because without a reservation encfs initialises XTS. `other` leaves it unset and raises the condition below. Until the first report it is unset.
+- **`observed`**: the latest classification, updated after every host pod start.
 
-**Rendering into the workload.** For each storage workload whose key is recorded as `AEAD`, `storagePatch` adds `DI_PGLITE_INTEGRITY=1` as an inline variable to the `localResources.environment` of each component; for `Off` it renders nothing. It is a controller-owned field like the volume and the preopen:
+A directory found by the listing that has no entry and is not `empty` gets an entry with `integrity` set from its observation. Examples are a key whose workloads were deleted before the writer release, or one deleted since. An empty, unrecorded directory gets no entry; it is free until a workload asks for that key. This is the backfill: it covers every directory on the node, not only those of deployed workloads. At the writer release the host pod template gains `storage-mode`, so every Tenant's host pod rolls once and lists its directories.
 
-- the WorkloadDeployment admission policy refuses a tenant update that adds, removes or changes it, as it does for the controller's volumes (`platform/platform/src/tenancy/admission.ts:240-267`, `platform/platform/src/tenancy/admission.ts:626-727`);
-- tenant-auth's deploy and vars APIs reserve the name, so it cannot arrive through `di-vars-<env>` or a tenant Secret (`platform/tenant-auth`).
+**Precedence**, highest first, for what an empty directory becomes:
 
-**What encfs does with the variable.** `DI_PGLITE_INTEGRITY` is hidden from the engine like the key variables (`src/keys.rs:40-44` gains it). It is read once, at the root decision (`src/marker.rs:192-221`):
+1. **The directory's contents.** The platform never changes an existing marker or a non-empty directory, and encfs decides from the marker (table below). A non-empty directory keeps its mode whatever a record or the spec says.
+2. **The key's recorded `integrity`**, once set.
+3. **The key's recorded `requested`**, while `integrity` is unset.
+4. **`spec.storage.integrity`**, read only at the moment a key is first recorded.
 
-| root marker | `DI_PGLITE_INTEGRITY` | decision |
+The init step reserves a key exactly when its directory is empty and the first of `integrity` and `requested` that is set says `AEAD`. Nothing a tenant writes appears on this list. If a guest's environment carries a variable named `DI_PGLITE_INTEGRITY`, encfs logs that the mode is chosen by the platform and ignores it.
+
+**Per-key immutability.** A ValidatingAdmissionPolicy on `tenants/status` protects the records. It gets its own binding, because Tenant is cluster-scoped and the existing tenancy policies bind only tenant namespaces (`platform/platform/src/tenancy/admission.ts:490-510`). On every update, the controller's included, it requires three things:
+
+- every old entry is still present, with the same `key` and `requested`;
+- an `integrity` that was set is unchanged;
+- a new entry is added only with `requested` or `integrity` set.
+
+Records are therefore never pruned while the Tenant exists. Directories are keyed by the Tenant's uid (`platform/platform/src/tenancy/workload-storage.ts:98-100`), so a recreated Tenant gets new directories and starts with no records. No Tenant-level rule on `spec.storage.integrity` is needed, because a spec change cannot reach a recorded key. The first revision's policy refused any change once a directory existed. That made O4's migration need a whole new Tenant. Per-key records allow migration to a new key of the same Tenant instead (section 10).
+
+**Condition** `StorageIntegrity` on the Tenant:
+
+- `Unknown`, reason `AwaitingObservation`, while the current host pod's listing has not been read, or a mounted key still has `integrity` unset. This is the state from the writer release until the first listing, and after each new key until its host pod start is reported.
+- `False`, reason `IntegrityNotApplied`, naming the keys whose `integrity` differs from their own `requested`: the key was requested as `AEAD`, but its directory already held XTS or plaintext data. The directory keeps its mode, and section 10 is the way to migrate it. This replaces the first revision's `IntegrityLocked`.
+- `False`, reason `IntegrityMismatch`, naming the keys whose `observed` class contradicts their recorded `integrity`, for example an `AEAD` directory now observed as `xts`, `unencrypted` or `other`, an `Off` directory now observed as `aead`, or a mounted key observed as `other`. Something other than encfs rewrote it (see "What a tenant can do" below).
+- `True`, reason `AsRecorded`, otherwise. Keys recorded `Off` under a spec that now says `AEAD`, as after a migration, are expected and are not a condition. `status.storage.directories` lists them.
+
+**What encfs does with the marker.** It reads the root marker once, at the root decision (`src/marker.rs:192-221`). Every row assumes a configured key; without one the root locks as `NoKey`, as today. The rows are disjoint: each root falls into exactly one marker form and one data column.
+
+| root marker (`.di-encfs`) | root has data | decision |
 |---|---|---|
-| absent (or short) in a root without data | `1` | initialise an **integrity** directory: write `DIPGKEY2` |
-| absent (or short) in a root without data | absent or `0` | initialise an XTS directory, as today |
-| `DIPGKEY1` (XTS directory) | `1` | **refuse**: lock the preopen with a new `Lock::IntegrityRequested` before any mutation, logged as "integrity requested for an existing XTS directory; migrate with pg_dump/restore" |
-| `DIPGKEY1` | absent or `0` | XTS, as today |
-| `DIPGKEY2` (integrity directory) | any | integrity: the marker decides. A missing variable is logged, not acted on, because reading an integrity directory as such never weakens it |
-| any | another value | refuse (lock), fail closed |
-| absent, root with data | any | `Unencrypted` lock, as today |
+| absent | no | initialise an XTS directory, as today |
+| absent | yes | `Unencrypted` lock, as today |
+| shorter than 24 bytes | no | initialise an XTS directory, as today (`src/marker.rs:203-205`). A reservation is written by rename and is never short |
+| shorter than 24 bytes | yes | `CorruptMarker` lock, as today |
+| `DIPGKEY1 ‖ KCV`, 24 bytes | either | XTS: the KCV decides `Ready`, `Rotate` or `WrongKey`, as today |
+| `DIPGKEY2` reservation: 25 bytes, zero KCV, flags `0b11` | no | initialise an **integrity** directory: replace the reservation with the keyed `DIPGKEY2` marker (temporary file and rename), then proceed |
+| `DIPGKEY2` reservation | yes | lock with the new `Lock::ReservedWithData`. Something other than encfs wrote into a reserved directory |
+| `DIPGKEY2 ‖ KCV ‖ flags`, 25 bytes, flags `0b01` | either | integrity: the KCV decides `Ready`, `Rotate` or `WrongKey` |
+| anything else: another magic or length, `DIPGKEY2` with other flags, or a reservation with a non-zero KCV | either | `CorruptMarker` lock, fail closed |
 
-The variable is honoured **only when an empty directory is initialised**; on an existing directory the marker always decides, and the only case it acts on is refusing to proceed when the platform asks for integrity on an XTS directory.
+"Root has data" means any entry other than `lost+found` and the marker names (`src/marker.rs:26-28`, `src/component.rs:469`). The mode is never read from anywhere but the marker, so there is no case in which a request for integrity meets an existing XTS directory, and the first revision's `Lock::IntegrityRequested` is dropped.
 
-**Marker.** XTS directories keep `DIPGKEY1 ‖ KCV`, 24 bytes (`src/marker.rs:16-17`). Integrity directories get `DIPGKEY2 ‖ KCV ‖ flags`, 25 bytes, where `flags` is a bit set: bit 0 = codec 4; any unknown bit fails closed (Q4). **Format constraint: a `DIPGKEY2` marker must be at least 24 bytes (`MARKER_LEN`) long.** Builds without codec 4 re-initialise a marker shorter than 24 bytes in a root without data (`src/marker.rs:203-205`), which would overwrite the integrity marker. At 24 bytes or more they lock it as `CorruptMarker`, because the magic differs (`src/marker.rs:206-207`), and `read_marker` reads at most 25 bytes, so a longer marker is seen as 25 bytes and also locked (`src/component.rs:452-466`).
+**Marker.** XTS directories keep `DIPGKEY1 ‖ KCV`, 24 bytes (`src/marker.rs:16-17`). Integrity directories get `DIPGKEY2 ‖ KCV ‖ flags`, 25 bytes. `flags` is a bit set: bit 0 = codec 4, bit 1 = reservation (the KCV is unset and must be zero); any other bit fails closed (Q4).
 
-**Older builds fail closed on an integrity directory (G6).** `decide` locks the whole preopen before anything is written (`src/marker.rs:192-221`); `open_root` runs in `get_directories` before pglite gets a descriptor (`src/component.rs:847-866`). No codec-4 file is ever opened by a build that cannot read it. That differs from codec 3's rollback, which relies on PostgreSQL panicking on the first codec-3 file (README "Codecs and migration"). The lock message says "corrupt", which is misleading, but that cannot be changed for builds already deployed. The codec-4 release's message names the mode instead.
+- **The reservation** is a constant 25-byte string, `DIPGKEY2`, 16 zero bytes and `0x03`. It carries no key material, so the platform can write it without the Tenant's key.
+- **Format constraint: every `DIPGKEY2` marker, the reservation included, must be at least 24 bytes (`MARKER_LEN`) long.** Builds without codec 4 re-initialise a marker shorter than 24 bytes in a root without data (`src/marker.rs:203-205`), which would overwrite the integrity marker. At 24 bytes or more they lock it as `CorruptMarker`, because the magic differs (`src/marker.rs:206-207`). `read_marker` reads at most 25 bytes, so a longer marker is seen as 25 bytes and also locked (`src/component.rs:452-466`).
+- **Hidden from pglite.** encfs refuses the marker names to pglite (`src/marker.rs:39-41`), so a guest that runs encfs cannot remove a reservation before encfs reads it. `open_root` runs in `get_directories` before pglite gets a descriptor (`src/component.rs:847-866`).
 
-**The codec-4 writer is in the default published build.** Because a Tenant setting can turn integrity on, every published encfs build from the writer release on (9.3) contains the codec-4 writer; there is no `write-codec-4` cargo feature. The build still creates XTS directories unless the variable asks for integrity at initialisation, so this changes no default. A build older than the reader release ignores the variable and would initialise an XTS directory for an `AEAD` Tenant. Two measures close that:
+**Older builds fail closed (G6).** A build without codec 4 locks both an integrity directory and a reservation as `CorruptMarker`, before anything is written (`src/marker.rs:192-221`). No codec-4 file is ever opened by a build that cannot read it, and no build initialises an XTS directory in a reserved one. That differs from codec 3's rollback, which relies on PostgreSQL panicking on the first codec-3 file (README "Codecs and migration"). The lock message says "corrupt", which is misleading, but that cannot be changed for builds already deployed. The codec-4 release's message names the mode instead.
 
-- the custom section advertises `integrity=1` (9.3), and tenant-auth's deploy path refuses a storage workload for an `AEAD` Tenant whose pglite component does not advertise it (`platform/tenant-auth`; this needs the custom-section parser of Q11);
-- `make smoke` checks that an integrity directory's marker is `DIPGKEY2` (12.3).
+**What a tenant can do.** Nothing a tenant writes selects the mode. The platform cannot stop a tenant from running its own code against its own directory: the guest component is the tenant's. A guest built without encfs, or with a modified encfs, can delete a reservation or write any bytes into the directory. That affects only the tenant's own data, and it cannot make the record wrong silently. The next host pod start observes the directory, and the condition reports `IntegrityMismatch`, or `IntegrityNotApplied` for a key whose `integrity` was still unset. A stale encfs pin, older than the reader release, locks a reserved directory instead of initialising XTS there. That holds whether the WorkloadDeployment came through tenant-auth or straight from kubectl, so no deploy-time version check is required. One is still useful for an earlier error message (9.3, Q11).
 
-**Rotation must keep the mode.** `write_marker` currently encodes only the KCV (`src/component.rs:481-497`). The rotation sweep must rewrite `DIPGKEY2` with its flags.
+**Outside the platform** (local development, `make smoke`, other hosts), an integrity directory is created by writing the 25 reservation bytes as `.di-encfs` into an empty directory before the first start. A CLI helper for this is a follow-up in the CLI plugin's repository.
+
+**The codec-4 writer is in the default published build.** Because a Tenant setting can turn integrity on, every published encfs build from the writer release on (9.3) contains the codec-4 writer; there is no `write-codec-4` cargo feature. The build still creates XTS directories unless a reservation asks for integrity, so this changes no default.
+
+**Rotation must keep the mode.** `write_marker` currently encodes only the KCV (`src/component.rs:481-497`). The rotation sweep must rewrite a keyed `DIPGKEY2` marker with its flags. A reservation is never rotated: encfs replaces it at initialisation, before any key could be rotated.
 
 **Inside an integrity directory**, every new file is codec 4, and an XTS file is refused with `io`. A fresh directory has none; they can only be copied in.
+
+**Node-local directories.** Storage directories are hostPaths on the node that runs the single host replica (`platform/platform/src/tenancy/controller.ts:2243-2248` refuses storage for more than one replica). The listing reports that node's directories. If the host pod moves to another node, an empty directory there is reserved according to its key's record, so the record stays consistent. Moving data between nodes is outside this note, as it is for #11 today.
 
 ### 9.2 Code that changes when this is implemented
 
 In `platform/pglite-encfs`:
 
 - `src/codec.rs`: `Codec::TwoSlotAead = 4` in `id` and `from_id`. Codec 1 stays rejected.
-- `src/header.rs`: parse accepts 4. Update the tests that assert 4 is unsupported (`src/header.rs:282-290`, `src/codec.rs:235-237`).
-- `src/file.rs`: it assumes a length-preserving layout throughout (`src/file.rs:3-5`, `src/file.rs:77-90`, `src/file.rs:153-209`). Codec 4 gets its own module (working name `src/slots.rs`) behind a small layout trait, so the XTS path and its fixtures (`src/file.rs:713-811`) stay byte-identical. The watermark records live in the same module.
-- `src/component.rs`: `guest_stat`, `stat` and `stat-at` stop deriving the size from the host size for codec-4 files (`src/component.rs:166-181`, `src/component.rs:1096-1106`); the per-file state keyed by (file id, `metadata-hash`) and the host-identity size cache (5.3, 6.1); clearing pending bits and advancing the watermark on sync; the `failed` fail-stop; header sealing with record 0 (`src/component.rs:341-364`).
-- `src/marker.rs`: the `DIPGKEY2` form with its flags byte, `Lock::IntegrityRequested`, and the table in 9.1.
-- `src/keys.rs`: hide `DI_PGLITE_INTEGRITY` (`src/keys.rs:40-44`).
+- `src/header.rs`: parse accepts 4. Update the tests that assert 4 is unsupported (`src/header.rs:282-290`, `src/codec.rs:235-237`). In an integrity directory, `classify`'s "no room for data" bound is 8192 (`src/header.rs:102-104`, C8a).
+- `src/file.rs`: it assumes a length-preserving layout throughout (`src/file.rs:3-5`, `src/file.rs:77-90`, `src/file.rs:153-209`). Codec 4 gets its own module (working name `src/slots.rs`) behind a small layout trait, so the XTS path and its fixtures (`src/file.rs:713-811`) stay byte-identical. The watermark page and its records live in the same module.
+- `src/component.rs`: `guest_stat`, `stat` and `stat-at` stop deriving the size from the host size for codec-4 files (`src/component.rs:166-181`, `src/component.rs:1096-1106`); the per-file state keyed by (file id, `metadata-hash`) and the host-identity size cache (5.3, 6.1); writing a due watermark record before a sync, clearing pending bits and computing the next candidate after it; the `failed` fail-stop; sealing the 8 KiB header-and-watermark block with record 0 (`src/component.rs:341-364`).
+- `src/marker.rs`: the keyed and reservation `DIPGKEY2` forms with their flags byte, `Lock::ReservedWithData`, the reader release's `Lock::IntegrityUnsupported` (9.3), and the table in 9.1. No environment variable is added, so `src/keys.rs` does not change.
 - `Cargo.toml`: no new feature; the codec-4 writer is always compiled (9.1).
 - `scripts/smoke.ts`: the codec census only accepts 2 and 3 (`scripts/smoke.ts:252-265`).
 - `scripts/lib/tear.ts`: tears are cut at XTS page offsets after the header (`scripts/lib/tear.ts:34-81`). For codec 4 they must be cut inside the slot that changed.
 
 **Cross-lane scope (future implementation, coordinate with T03 and T10).** The Tenant setting touches files that other lanes own:
 
-- `platform/platform/src/tenancy/resources.ts`: `TenantSpec.storage.integrity`, the CRD schema, and `status.storage.directories`;
-- `platform/platform/src/tenancy/workload-storage.ts`: `storagePatch` renders `DI_PGLITE_INTEGRITY` from the recorded mode;
-- `platform/platform/src/tenancy/controller.ts`: write-ahead recording in `reconcileWorkloadStorage`, the upgrade backfill, and the `StorageIntegrity` condition;
-- `platform/platform/src/tenancy/admission.ts`: the Tenant update policy and the WorkloadDeployment rule for the controller-owned variable;
-- `platform/tenant-auth`: reserving the variable name in the deploy and vars APIs, and the deploy-time `integrity=` check;
-- the platform docs and the CLI plugin examples, in follow-up commits in their own repositories.
+- `platform/platform/src/tenancy/resources.ts`: `TenantSpec.storage.integrity`, the CRD schema, `status.storage.directories` with `{ key, requested, integrity, observed }`, and passing the reserve list and the workloads root into the host pod (`resources.ts:1085`, `resources.ts:1479-1489`);
+- `platform/platform/src/tenancy/workload-storage.ts`: `hostStorage` gains the `storage-mode` init container and the read-only workloads-root mount (`workload-storage.ts:106-150`). `storagePatch` is unchanged;
+- `platform/platform/src/tenancy/controller.ts`: write-ahead `requested` before a key is mounted, reading the `storage-mode` output per host pod uid, recording `integrity` and `observed`, and the `StorageIntegrity` condition;
+- `platform/platform/src/tenancy/admission.ts`: the per-key policy on `tenants/status` with its own binding. No WorkloadDeployment, ConfigMap or Secret rule is needed, because no tenant-writable source carries the mode;
+- `platform/tenant-auth`: nothing required. An optional deploy-time warning for a pin that does not advertise `integrity=1` needs the custom-section parser of Q11;
+- the platform docs and the CLI plugin examples (including the reservation helper), in follow-up commits in their own repositories.
 
 These changes ship in the writer release (9.3), not in the reader release.
 
@@ -443,22 +514,28 @@ These changes ship in the writer release (9.3), not in the reader release.
   - Codec 4 changes no default and no existing directory. Its rollback story is the marker (9.1), not the custom section.
   - The T08 order stays `#200:design` → #206.
 - **Two-step rollout, as in #206:**
-  1. **Reader release:** reads codec 4 and the `DIPGKEY2` marker, but cannot create them. If `DI_PGLITE_INTEGRITY=1` reaches it on an empty directory, it refuses (lock) instead of creating an XTS directory.
-  2. **Writer release:** the codec-4 writer in the default published build, plus the Tenant field, the controller and admission changes, and the tenant-auth checks (9.2). A Tenant can opt in from this release on.
+  1. **Reader release:** reads codec 4 and the keyed `DIPGKEY2` marker, but cannot create them. On a reservation in a root without data it locks with `Lock::IntegrityUnsupported` instead of creating an XTS directory.
+  2. **Writer release:** the codec-4 writer in the default published build, plus the Tenant field, the `storage-mode` init step, the controller and the admission change (9.2). A Tenant can opt in from this release on.
 
   An integrity directory must never be opened by a build older than step 1. The marker makes that fail closed.
-- **Custom section.** It is a fixed 40-byte `format=1 codec=aes-256-xts write-codec=N` today (`src/component.rs:64-75`). A codec-4-capable build also advertises `read-codecs=2,3,4 integrity=1`, so deploy tooling can refuse a pin that cannot read a directory's mode. identity-server#71 is still open; the decision (Q11) is to ask it now to accept unknown keys and a variable-length section, so codec 4 needs no further gate.
+- **Custom section.** It is a fixed 40-byte `format=1 codec=aes-256-xts write-codec=N` today (`src/component.rs:64-75`). A codec-4-capable build also advertises `read-codecs=2,3,4 integrity=1`, so deploy tooling can warn early about a pin that cannot read a directory's mode. Correctness does not depend on it: such a pin locks a reserved or integrity directory (9.1). identity-server#71 is still open; the decision (Q11) is to ask it now to accept unknown keys and a variable-length section, so codec 4 needs no further gate.
 - **Codec 4 removes the #206 problem only for integrity directories.** XTS directories still need codec 3 and its flip.
 
 ## 10. Migration and compatibility (O4)
 
-- **Existing files are never converted in place, and directories are never mixed.** An XTS directory moves to integrity mode only by **`pg_dump` from the XTS instance and restore into a new instance whose directory was initialised empty in integrity mode**: a new Tenant created with `spec.storage.integrity: AEAD`, or a new workload storage key of a Tenant that has no storage yet. This is the documented path at ship time.
+- **Existing files are never converted in place, and directories are never mixed.** An XTS directory moves to integrity mode only by **`pg_dump` from the XTS instance and restore into a new instance whose directory was initialised empty in integrity mode**. This is the documented path at ship time. Within one Tenant it runs:
+  1. An operator sets `spec.storage.integrity: AEAD` on the Tenant. Recorded keys keep their mode (9.1, per-key records), so nothing existing changes.
+  2. The tenant deploys the new instance under a **new storage key**, a `di-framework.dev/workload` label value (or name) not used before (`storageKey`, `platform/platform/src/tenancy/workload-storage.ts:74-80`). The controller records it with `requested: AEAD`, the init step reserves its empty directory, and encfs initialises it as an integrity directory.
+  3. `pg_dump` from the old instance, restore into the new one, and move traffic.
+  4. Delete the old workload. Its directory and its `Off` record stay. Records are never pruned, and removing node data is outside this note.
+
+  No new Tenant, namespace, API key or membership is needed. A new Tenant created with `AEAD` also works. The spec stays `AEAD` for every later new key unless the operator sets it back; that changes no recorded key.
 - **The offline copy tool stays on #199** (README "Rotation" and "Codecs and migration"). Codec 4 does not wait for it.
-- **Mixed directories are refused.** An XTS directory never gets codec-4 files for new data (9.1: `DIPGKEY1` with the variable set locks), and an integrity directory refuses XTS files with `io`. A mixed directory could not claim G1.
+- **Mixed directories are refused.** An XTS directory never gets codec-4 files for new data (9.1: encfs decides from the marker alone, and the platform reserves only empty directories), and an integrity directory refuses XTS files with `io`. A mixed directory could not claim G1.
 - **Codec 2/3 fixtures** (`src/testdata/codec2`, `src/file.rs:713-768`) must keep reading and rewriting byte-identically. The XTS code path is not touched.
-- **Downgrade:** a build that cannot read codec 4 sees an integrity directory as `CorruptMarker` and locks it (9.1). Rollback after an integrity directory exists means rolling forward to a codec-4 reader, or restoring a pre-migration snapshot of the XTS directory.
-- **Key rotation:** unchanged for headers (`src/header.rs:189-201`); it writes only the 152 header bytes, so the watermark records survive. The sweep must rewrite the `DIPGKEY2` marker with its flags.
-- **Interface:** the WIT package and the encfs exports are unchanged. The rollout is gated by the release steps, the markers and the Tenant setting.
+- **Downgrade:** a build that cannot read codec 4 sees an integrity directory, or a reservation, as `CorruptMarker` and locks it (9.1). Rollback after an integrity directory exists means rolling forward to a codec-4 reader, or restoring a pre-migration snapshot of the XTS directory.
+- **Key rotation:** unchanged for headers (`src/header.rs:189-201`); it writes only the 152 header bytes of the header page, so the watermark page is never touched. The sweep must rewrite a keyed `DIPGKEY2` marker with its flags.
+- **Interface:** the WIT package and the encfs exports are unchanged. The rollout is gated by the release steps, the markers, the init step and the Tenant setting.
 
 ## 11. Performance and space
 
@@ -466,14 +543,14 @@ These are estimates to be checked against the README benchmark, which the issue'
 
 **Space.** Every file in an integrity directory uses two slots (O1). The pair stride is fixed (5.2), and an extension writes the slot-A images together with the zero slot-B gaps between them (W5), so every unit but the last occupies a full pair from its **first** write:
 
-- A file of `n` units has `st_size = 4096 + (n − 1) × 16512 + 64 + len(n − 1)` before its last unit's slot B is first written, and `4096 + (n − 1) × 16512 + 8256 + 64 + len(n − 1)` after. Allocated blocks track `st_size`, because the gaps are written, not left as holes.
-- **Multi-unit files cost about 2.016× from their first write**, whether or not their pages are ever rewritten. Only the last unit, and therefore a single-unit file, costs about 1× (`4096 + 64 + len`, close to XTS's `4096 + len`) until it is rewritten.
-- **WAL segments double at creation.** PostgreSQL pre-zeroes each 16 MiB segment (2048 units), so a segment is `4096 + 2047 × 16512 + 8256 = 33,812,416` bytes (about 32.2 MiB) as soon as it exists, against 16 MiB plus 4 KiB with XTS.
-- **README cluster** (1516 files, 32.9 MB plaintext, 40.0 MB with XTS): nearly all of the data sits in multi-unit files, so expect about 2.0 × 32.9 MB of data plus 1516 × 4 KiB = 6.2 MB of headers, less the last-unit savings: **roughly 68–72 MB**, about 1.7–1.8× XTS. The first version's 60 MB lower bound was too low.
+- A file of `n` units has `st_size = 8192 + (n − 1) × 16512 + 64 + len(n − 1)` before its last unit's slot B is first written, and `8192 + (n − 1) × 16512 + 8256 + 64 + len(n − 1)` after. The first 8192 bytes are the header page and the watermark page (5.1). Allocated blocks track `st_size`, because the gaps and the watermark page are written, not left as holes.
+- **Multi-unit files cost about 2.016× from their first write**, whether or not their pages are ever rewritten. Only the last unit, and therefore a single-unit file, costs about 1× plus the extra 4 KiB page (`8192 + 64 + len`, against XTS's `4096 + len`) until it is rewritten.
+- **WAL segments double at creation.** PostgreSQL pre-zeroes each 16 MiB segment (2048 units), so a segment is `8192 + 2047 × 16512 + 8256 = 33,816,512` bytes (about 32.25 MiB) as soon as it exists, against 16 MiB plus 4 KiB with XTS.
+- **README cluster** (1516 files, 32.9 MB plaintext, 40.0 MB with XTS): nearly all of the data sits in multi-unit files, so expect about 2.0 × 32.9 MB of data plus 1516 × 8 KiB = 12.4 MB of header and watermark pages, less the last-unit savings: **roughly 74–78 MB**, about 1.85–1.95× XTS. The separate watermark page adds about 6.2 MB of that (1516 × 4 KiB). The first version's 60 MB lower bound was too low.
 - **Sparse gaps** (separate `pwrite`s per new unit, leaving slot-B regions as holes until first written) are not adopted. Only the whole 4 KiB pages inside an 8256-byte gap could be holes, about one per gap, which saves roughly a quarter of the allocation; `st_size` stays the same; and a bulk extension would cost one host call per unit instead of one per extension.
 - The alternative of two slots only for in-place-rewritten files was rejected (O1): it would turn crash-torn free-space-map or relation pages into `io`, which `RBM_ZERO_ON_ERROR` does not absorb.
 
-**Host calls.** WASI 0.2 has no `pwritev`, and the slots of neighbouring units are not contiguous. A logical write of `k` whole units, such as a multi-page WAL flush or a bulk relation write, becomes `k` host `pwrite` calls instead of one today; only extensions coalesce (W5). The commit-path and bulk-load estimates below include this. The watermark adds one 64-byte `pwrite` per sync interval per written file.
+**Host calls.** WASI 0.2 has no `pwritev`, and the slots of neighbouring units are not contiguous. A logical write of `k` whole units, such as a multi-page WAL flush or a bulk relation write, becomes `k` host `pwrite` calls instead of one today; only extensions coalesce (W5). The commit-path and bulk-load estimates below include this. The watermark adds one 64-byte `pwrite` per sync interval per written file, into the watermark page.
 
 **Commit path** (an 8 KiB WAL write plus fsync, `+32%` over plaintext with XTS):
 
@@ -482,7 +559,7 @@ These are estimates to be checked against the README benchmark, which the issue'
 - The fsync count does not change, apart from one W0 fsync per file per instance and one per shrink.
 - Expected: **within noise of XTS**, because fsync dominates.
 
-**`stat` and `stat-at`.** `stat` on a descriptor is free after the first size computation. `stat-at` costs one host `metadata-hash-at` call plus a cache lookup; on a miss it adds an open, the 4 KiB header-block read and the last-pair read, then caches the size (5.3). PostgreSQL stats relation segments often, so `stat-at` on cold and warm caches joins the benchmark list.
+**`stat` and `stat-at`.** `stat` on a descriptor is free after the first size computation. `stat-at` costs one host `metadata-hash-at` call plus a cache lookup; on a miss it adds an open, the 8 KiB header-and-watermark read and the last-pair read, then caches the size (5.3). PostgreSQL stats relation segments often, so `stat-at` on cold and warm caches joins the benchmark list.
 
 **CPU:**
 
@@ -514,10 +591,11 @@ These are estimates to be checked against the README benchmark, which the issue'
 - **Slot codec:** round trips for every `len` class (1, 15, 16, 8191, 8192); AEAD known answers from an independent reference (libsodium or Node `crypto`), kept with the existing KATs (`src/testdata/xts-kat.txt`); both HKDF derivations pinned.
 - **Binding:** swapping slots A and B, moving a slot to another unit or file, and editing `generation`, `len`, the reserved bytes, the nonce, the tag or any ciphertext byte must each fail authentication. The same for watermark records: swapping records 0 and 1, moving a record to another file, editing `seq` or `D`.
 - **Selection:** the full table in 5.5, including equal generations, generation 0, a slot past the end of the file, a `len` out of range, and a torn slot claiming the higher generation.
-- **Size and watermark:** trailing invalid pairs above `D` dropped; an interior pair without a valid slot reads as zeros above `D` and fails with `io` below it; a trailing invalid pair below `D` fails with `io`; absent pairs below `D` are never `io`; both records invalid fails the file; `D` advances only after a sync and only over verified units; holes above `D` are filled with sealed zero units and then covered.
-- **The invariant:** a model test that drives write, write, sync, write sequences, including shrinks, failed writes (6.6 (e)) and dropped state (6.6 (c)), and asserts that the durable slot is never the target.
+- **Size and watermark:** trailing invalid pairs above `D` dropped; an interior pair without a valid slot reads as zeros above `D` and fails with `io` below it; a trailing invalid pair below `D` fails with `io`; absent pairs below `D` are never `io`; both records invalid fails the file when a pair is present, and an interrupted birth (valid header, no valid record, size ≤ 8192) reads as empty and is re-sealed on the first write (C8a); `D` advances only after a sync and only over verified units; a new candidate replaces an unwritten one, and a shrink discards it; a due record is written with the next write or before the next sync, never at close; holes above `D`, including a unit whose first write failed (6.6 (e)), are filled with sealed zero units and then covered.
+- **The invariant:** a model test that drives write, write, sync, write sequences, including shrinks, failed writes (6.6 (e)) and dropped state (6.6 (c)), and asserts that the durable slot is never the target. Failed writes are injected both as "nothing landed" and as "all bytes landed, error reported", for a pending and for a clean unit, and the test checks `pending = (re-selected winner == failed target)`.
 - **Cold-cache target choice (C13):** a pair with a torn higher-claimed slot and a valid lower one; a whole-unit write must target the torn slot.
-- **Markers:** the v1 `decide` (`src/marker.rs:192-221`) fed a 25-byte `DIPGKEY2` marker with `has_data` false and true must return `Locked(CorruptMarker)`; the new `decide` covers every row of the table in 9.1, including unknown flag bits.
+- **Markers:** the v1 `decide` (`src/marker.rs:192-221`) fed a 25-byte keyed `DIPGKEY2` marker, and the 25-byte reservation, with `has_data` false and true must return `Locked(CorruptMarker)`; the new `decide` covers every row of the table in 9.1, including unknown flag bits, a reservation with a non-zero KCV, and a reservation in a root with data.
+- **Layout:** pairs start at 8192; a record write touches only its 64 bytes of the watermark page; header rotation leaves the watermark page byte-identical.
 - **Plaintext model:** extend `matches_a_plaintext_model_under_random_operations` (`src/file.rs:813-869`) to codec 4 with the existing `XorShift` generator (`src/file.rs:271-283`). No new dependency is needed (Q15).
 - **Unchanged XTS behaviour:** the existing codec-2/3 tests and fixtures pass unchanged.
 
@@ -526,7 +604,7 @@ These are estimates to be checked against the README benchmark, which the issue'
 Replace the narrow `Crashing` storage (`src/file.rs:479-498`) with a **recording storage**. It logs every `write_at`, `set_len` and `sync` and keeps two images: the durable one (as of the last sync) and the volatile one. A crash is simulated by building candidate disks from the durable image plus a selection of the operations since the last sync:
 
 1. **Every write boundary:** after each operation, persist an in-order prefix of the unsynced operations.
-2. **Every tear,** at two granularities, 512 bytes and 4 KiB (A1): for the operation in flight, every unit cut, new prefix with old suffix and old prefix with new suffix, and for writes of up to 32 units, every subset of units. This includes **extending writes**: an extension can persist a later unit while an earlier one stays a hole, zeros or old bytes, with the file length already advanced. A shared unit takes the neighbour's bytes from the volatile image, which equals the old one (section 7).
+2. **Every tear,** at 512-byte and 4 KiB atomic units, and for writes widened to whole 4 KiB pages that tear at 512 bytes (A1): for the operation in flight, every unit cut, new prefix with old suffix and old prefix with new suffix, and for writes of up to 32 units, every subset of units. This includes **extending writes**: an extension can persist a later unit while an earlier one stays a hole, zeros or old bytes, with the file length already advanced. A shared unit takes the neighbour's bytes from the volatile (page-cache) image. For a durable neighbour that equals the on-disk image (A2). For a pending neighbour it may differ, so the harness enumerates both the neighbour's on-disk bytes and its volatile bytes in each shared unit, and expects the neighbour's unit to read as its durable version or as the pending one (C2).
 3. **Reordering:** every subset of up to 8 unsynced operations, and a random sample beyond that, to model page-cache writeback order, `set_len` included (C5, C7, C14, C16). Nothing is reordered across a sync.
 4. **Restart:** reopen with an empty cache, which exercises W0 and W1's authenticated choice, and continue the workload after the crash, then crash again (C13).
 
@@ -550,7 +628,7 @@ Workloads:
 
 ### 12.3 `make smoke`
 
-- **Integrity directory:** the full pglite suite on a directory initialised with `DI_PGLITE_INTEGRITY=1`, with every file checked to be codec 4 and the marker to be `DIPGKEY2`.
+- **Integrity directory:** the full pglite suite on a directory initialised from a reservation marker (9.1), with every file checked to be codec 4 and the marker to be the keyed `DIPGKEY2`.
 - **Torn-write matrix:** the three existing cases (`scripts/smoke.ts:627-660`), with `tear.ts` taught to cut inside the slot that changed. Add:
   - a fourth case, the WAL tail page rewritten twice without an fsync in between (C10);
   - a fifth, a torn `pg_internal.init` style unaligned append (C6);
@@ -560,12 +638,20 @@ Workloads:
   - flipping one ciphertext byte of a relation page in a stopped directory fails with `io` on access;
   - zeroing both slots of a relation page below the watermark fails with `io` on access;
   - replacing a slot with an older valid copy returns the older version, which documents the non-goal.
-- **Mode selection:** `DI_PGLITE_INTEGRITY=1` on an existing XTS directory locks it, byte-identical; an unknown value locks.
+- **Mode selection:** a reservation in a root with data locks it (`ReservedWithData`), byte-identical; a `DIPGKEY2` marker with an unknown flag bit or a reservation with a non-zero KCV locks; a `DI_PGLITE_INTEGRITY` variable in the environment changes nothing (an empty root still becomes XTS, and is only logged).
 - **Downgrade:** a build without a codec-4 reader, and the published v1, refuse an integrity directory with the marker lock and leave it byte-identical.
 - **Coexistence:** an XTS directory opened by the codec-4 build is unchanged (no codec-4 files, codec counts as today).
 - **Benchmark:** the list in section 11.
 
-The tenancy changes of 9.1 get their own tests in `platform/platform` when they are implemented: the CRD default, the admission refusal after a directory is recorded, write-ahead recording, the backfill, the condition and the rendered variable.
+The tenancy changes of 9.1 get their own tests in `platform/platform` when they are implemented:
+
+- the CRD default;
+- write-ahead `requested` before a key is mounted;
+- the rendered `storage-mode` init container (identity, mounts, reserve list) and its classification script against fixture directories: empty, `lost+found` only, unencrypted, XTS, keyed, reserved, reserved with data, and corrupt;
+- recording `integrity` from the report, including directories found only by the listing (the backfill), and the `done count` check;
+- the per-key `tenants/status` policy: removing an entry, changing `requested`, or changing a set `integrity` is refused, the controller's requests included;
+- a spec change after keys are recorded, which leaves them unchanged and applies to a new key (the section 10 migration);
+- each `StorageIntegrity` reason.
 
 ## 13. Decisions
 
@@ -573,15 +659,15 @@ The tenancy changes of 9.1 get their own tests in `platform/platform` when they 
 
 - **O1 (Q3) Scope: two slots for every file** in an integrity directory. The owner accepts about 2× on-disk size for multi-unit files (11). Single-slot AEAD for relations was rejected because crash-torn FSM or relation pages would become `io`, which `RBM_ZERO_ON_ERROR` does not absorb.
 - **O2 (Q6 + Q14) Crash promise: an authenticated, lazily updated durable-size watermark** (5.6). A unit with no valid slot below the watermark fails with `io` (erasure detected); above it, it reads as zeros (crash). Rollback protection stays a separate issue (non-goals).
-- **O3 (Q4) Switch: a Tenant/platform setting rendered into the workload, in the first implementation** (9.1): `spec.storage.integrity` (`Off` | `AEAD`), immutable once a workload storage directory is recorded, rendered as `DI_PGLITE_INTEGRITY=1`, honoured only when encfs initialises an empty directory, refused with a lock and the `StorageIntegrity` condition on an existing directory. The codec-4 writer is in the default published build from the writer release on.
-- **O4 (Q10) Migration: `pg_dump` and restore** into a freshly initialised integrity directory (10). The offline copy tool stays on #199. Mixed XTS/codec-4 directories are refused.
+- **O3 (Q4) Switch: a Tenant/platform setting rendered into the workload, in the first implementation** (9.1): `spec.storage.integrity` (`Off` | `AEAD`). The codec-4 writer is in the default published build from the writer release on. The mechanism was revised after the second review (13.4): the platform renders the setting as a reservation marker that a platform-run init step writes into new, empty directories, not as an environment variable. Each storage key's mode is recorded from observation and immutable per key, so the spec selects the mode only for keys recorded after it changes.
+- **O4 (Q10) Migration: `pg_dump` and restore** into a freshly initialised integrity directory (10). With per-key records that directory can be a new storage key of the same Tenant (13.4). The offline copy tool stays on #199. Mixed XTS/codec-4 directories are refused.
 
 ### 13.2 Engineering decisions
 
 1. **Q1 Unit size: 8 KiB**, PostgreSQL's `BLCKSZ`, one slot write per page write.
 2. **Q2 Slot alignment: compact 8256-byte slots**, with A1 stated at the device's atomic write unit (4, section 7). Padding to 512 bytes buys nothing on 4 KiB atomic units, and 4 KiB alignment would cost about 3×.
 3. **Q3:** see O1.
-4. **Q4:** see O3. The `DIPGKEY2` marker carries a flags bit set, and unknown bits fail closed (9.1).
+4. **Q4:** see O3. The `DIPGKEY2` marker carries a flags bit set (bit 0 codec 4, bit 1 reservation), and unknown bits fail closed (9.1).
 5. **Q5 Nonces: a random 24-byte draw per slot and record write** (5.4).
 6. **Q6:** see O2.
 7. **Q7 Shrink inside a unit:** a `sync-data` between the truncate and the slot write (6.4 step 3), which also makes generation restarts safe. No journal.
@@ -598,4 +684,10 @@ The tenancy changes of 9.1 get their own tests in `platform/platform` when they 
 ### 13.3 Settled without change
 
 - Nonce collision bound (about 2^-97 after 2^48 writes per key), the slot AAD (domain ‖ file id ‖ unit ‖ slot ‖ generation ‖ length ‖ reserved) and the per-file HKDF key, with the salt shared with the KEK derivation under distinct info strings, are sufficient against slot, unit and file swapping (5.2, 5.4).
-- The `DIPGKEY2` fail-closed claim holds for markers of at least 24 bytes (9.1).
+- The `DIPGKEY2` fail-closed claim holds for markers of at least 24 bytes, the 25-byte reservation included (9.1).
+
+### 13.4 Decisions after the second review
+
+- **Mode source (W1).** The mode is not carried in any environment variable. A platform-run init step (`storage-mode`) in the tenant host pod writes a 25-byte `DIPGKEY2` reservation into a new, empty directory whose key is recorded as `AEAD`. encfs decides from the root marker alone. This was chosen over reserving a variable in every tenant-writable source, an admission rule per source, because that needs rules on WorkloadDeployments, ConfigMaps and Secrets plus a stated wasmCloud merge order, and every future source would reopen the gap. Precedence is explicit in 9.1: directory contents, then recorded `integrity`, then recorded `requested`, then the spec at first recording. A tenant can still run its own non-encfs code against its own directory; observation reports that as `IntegrityMismatch` or `IntegrityNotApplied`, and stale encfs pins lock instead of initialising XTS.
+- **Recording and backfill (W2).** The init step lists the Tenant's whole workloads root on the node read-only and classifies every directory by its marker. The controller reads the result from the init container's log and records each key's actual mode, including directories of deleted workloads. Records are per key, write-ahead for `requested`, set once for `integrity`, never pruned while the Tenant exists, and protected by a per-key policy on `tenants/status`. `spec.storage.integrity` may change at any time and applies only to keys recorded later. That allows the O4 migration into a new key of the same Tenant, which resolves the conflict with O4.
+- **Watermark placement (W3).** The records move to their own 4 KiB watermark page (bytes 4096..8192, records at 4096 and 6144). Pairs start at 8192, which costs about 4 KiB per file (about 6.2 MB on the README cluster). No record write can reach the header and its wrapped DEK. Under an A1 failure, a record write can damage only the other record, which makes the file fail with `io`, never return wrong data (section 7).
