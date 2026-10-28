@@ -942,8 +942,10 @@ instance's. Only a published gateway is reachable from other instances.
   that one list serves both this and the `Retain` removal warning (#245). A preview reads it
   too, so its diff shows the namespaces the `up` will apply, and an info line appears only for
   a tenant that is actually being removed; if a preview cannot list the Tenants, it warns and
-  shows the declared tenants only. When the kubeconfig is not known yet (a first preview of a
-  cluster this program creates), the preview shows the values as unknown. The Tenant list is
+  shows the declared tenants only. Whenever the kubeconfig is not known during a preview (for
+  example, the first preview of a cluster this program creates, or a kubeconfig that comes from a
+  resource with pending changes), the preview shows the values as unknown and the Release as
+  updated, even if the `up` then changes nothing. The Tenant list is
   retried up to three times (0.5 s, 1 s, 2 s apart,
   and no retry starts more than 15 s after the first attempt) on HTTP 429/5xx and connection
   errors, including undici's `UND_ERR_SOCKET`/`UND_ERR_CONNECT_TIMEOUT` and Bun's

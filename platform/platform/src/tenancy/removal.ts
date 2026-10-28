@@ -55,17 +55,19 @@ export function tenantListerFromKubeconfig(kubeconfig: string, context?: string)
  * Warns for each live Tenant that has no `tenants` entry and will be removed with Retain. A
  * cluster that cannot be read yet (first install, CRD not present) has nothing to remove, so a
  * read failure is logged at debug level and never fails the update.
+ *
+ * `list` returns the installation's Tenants and takes no arguments: the caller passes the run's
+ * shared Tenant snapshot (#245), which is already scoped to one installation.
  */
 export async function warnRemovedTenants(args: {
-  installation: string;
   declared: string[];
-  list: TenantLister;
+  list: () => Promise<LiveTenant[]>;
   warn: (message: string) => void;
   debug?: (message: string) => void;
 }): Promise<string[]> {
   let live: LiveTenant[];
   try {
-    live = await args.list(args.installation);
+    live = await args.list();
   } catch (error) {
     args.debug?.(`Skipping tenant removal check: ${(error as Error).message}`);
     return [];
