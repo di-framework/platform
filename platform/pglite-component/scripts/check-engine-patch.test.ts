@@ -8,13 +8,17 @@ import {
   LINK_PLPGSQL,
   PG_BACKEND_END,
   PG_BACKEND_START,
-  PGP_CFB_UPSTREAM_FIX,
   PQCOMM_END,
   PQCOMM_FALLBACK_START,
   STUBS_REALLOC_ANCHOR,
 } from './patch-engine-source.ts';
 
 const pkgDir = resolve(import.meta.dir, '..');
+
+/** pgcrypto's PGP CFB mode, verbatim from PostgreSQL REL_17_11. */
+const UPSTREAM_PGP_CFB = await Bun.file(
+  join(import.meta.dir, 'testdata/pgp-cfb-REL_17_11.c'),
+).text();
 
 /** The smallest tree that carries every anchor patch-engine-source.ts edits. */
 async function engineTree(dir: string, pgpCfb: string): Promise<void> {
@@ -65,7 +69,7 @@ describe('patchEngineTree', () => {
   test('runs every engine source edit on a tree that carries all anchors', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'df-pglite-check-patch.'));
     try {
-      await engineTree(dir, `\twhile (1)\n\t{\n${PGP_CFB_UPSTREAM_FIX}\t}\n`);
+      await engineTree(dir, UPSTREAM_PGP_CFB);
       await patchEngineTree(dir, pkgDir);
       const read = (name: string) => Bun.file(join(dir, name)).text();
       expect(await read('pglite-wasm/pg_main.c')).toContain('application session defaults');

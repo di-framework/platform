@@ -8,6 +8,7 @@ import {
   checkTagCommit,
   ENGINE_SOURCE_PATCH,
   ENGINE_TREE_MARKER,
+  fetchRecipe,
   gitEnv,
   type PostgresSource,
   PREPARED_CHECKOUT,
@@ -15,6 +16,8 @@ import {
   patchUpstreamBuild,
   postgresSource,
   prepareEngineTree,
+  RECIPE_PATCH_HINT,
+  REPLAY_PATCH_HINT,
   recipePatches,
   STAMP_FILES,
   sourceDateEpoch,
@@ -205,6 +208,21 @@ describe('patchDoesNotApply', () => {
     expect(error.message).toEndWith('\nerror: patch failed: a.c:1');
     expect(patchDoesNotApply('x.patch', source, '  ').message).toEndWith('README.md.');
   });
+
+  test('points a failing wasipg recipe patch at the recipe pin, not at our WASI patch', () => {
+    const error = patchDoesNotApply(
+      'wasipg build/patches/0001-sjlj.patch',
+      source,
+      'error: patch failed: b.c:2\n',
+      RECIPE_PATCH_HINT,
+    );
+    expect(error.message).toContain(
+      'wasipg build/patches/0001-sjlj.patch no longer applies to PostgreSQL REL_17_11',
+    );
+    expect(error.message).toContain('PGLITE_SOURCE_REF in scripts/tool-versions.env');
+    expect(error.message).not.toContain(REPLAY_PATCH_HINT);
+    expect(error.message).toEndWith('\nerror: patch failed: b.c:2');
+  });
 });
 
 /** git for test fixtures: no GIT_* from a hook (pre-push runs this suite), no user config. */
@@ -256,6 +274,51 @@ describe('gitEnv', () => {
       expect(await Bun.file(join(tree, 'a.c')).text()).toBe('int b;\n');
       // The decoy repository is untouched: no remote, no objects fetched.
       delete process.env.GIT_DIR;
+      expect((await $`git -C ${decoy} remote`.env(fixtureGitEnv).text()).trim()).toBe('');
+      expect(
+        (await $`git -C ${decoy} config --get core.bare`.env(fixtureGitEnv).text()).trim(),
+      ).toBe('true');
+    } finally {
+      if (saved === undefined) delete process.env.GIT_DIR;
+      else process.env.GIT_DIR = saved;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a hook-style GIT_DIR cannot redirect fetchRecipe at another repository', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'df-pglite-gitenv-recipe-test.'));
+    const saved = process.env.GIT_DIR;
+    try {
+      // A local "wasipg" with the files fetchRecipe checks out.
+      const wasipg = join(dir, 'wasipg');
+      await mkdir(join(wasipg, 'build', 'patches'), { recursive: true });
+      await $`git -C ${wasipg} init -q`.env(fixtureGitEnv);
+      await Bun.write(join(wasipg, 'build', 'build.sh'), '#!/bin/sh\n');
+      await Bun.write(join(wasipg, 'build', 'patches', '0001-sjlj.patch'), 'patch\n');
+      await Bun.write(join(wasipg, 'NOTICE'), 'notice\n');
+      await Bun.write(join(wasipg, 'LICENSE'), 'license\n');
+      await $`git -C ${wasipg} add -A`.env(fixtureGitEnv);
+      await $`git -C ${wasipg} -c user.name=t -c user.email=t@example.invalid commit -q -m recipe`.env(
+        { ...fixtureGitEnv, GIT_COMMITTER_DATE: '1754000000 +0000' },
+      );
+      await $`git -C ${wasipg} tag recipe-pin`.env(fixtureGitEnv);
+
+      const decoy = join(dir, 'decoy.git');
+      await $`git init -q --bare ${decoy}`.env(fixtureGitEnv);
+      process.env.GIT_DIR = decoy;
+      const sourceDir = join(dir, 'source');
+      const epoch = await fetchRecipe(sourceDir, 'recipe-pin', `file://${wasipg}`);
+      expect(epoch).toBe('1754000000');
+      expect(await Bun.file(join(sourceDir, 'build', 'patches', '0001-sjlj.patch')).text()).toBe(
+        'patch\n',
+      );
+      expect(await Bun.file(join(sourceDir, 'NOTICE')).text()).toBe('notice\n');
+      expect(await Bun.file(join(sourceDir, 'LICENSE')).text()).toBe('license\n');
+      // The recipe has its own repository, and the decoy is untouched.
+      delete process.env.GIT_DIR;
+      expect(
+        (await $`git -C ${sourceDir} remote get-url origin`.env(fixtureGitEnv).text()).trim(),
+      ).toBe(`file://${wasipg}`);
       expect((await $`git -C ${decoy} remote`.env(fixtureGitEnv).text()).trim()).toBe('');
       expect(
         (await $`git -C ${decoy} config --get core.bare`.env(fixtureGitEnv).text()).trim(),
@@ -336,6 +399,16 @@ describe('prepareEngineTree', () => {
       await expect(
         prepareEngineTree(tree, pinned, join(recipe, '0002-second.patch'), recipe),
       ).rejects.toThrow(`${ENGINE_SOURCE_PATCH} no longer applies`);
+
+      // A stale recipe patch names the recipe pin, not our WASI patch.
+      await Bun.write(join(recipe, '0001-first.patch'), diff('a.c', 'int x;', 'int c;'));
+      const stale = await prepareEngineTree(tree, pinned, replay, recipe).catch((e: Error) => e);
+      expect(stale).toBeInstanceOf(Error);
+      expect((stale as Error).message).toContain(
+        'wasipg build/patches/0001-first.patch no longer applies',
+      );
+      expect((stale as Error).message).toContain(RECIPE_PATCH_HINT);
+      expect((stale as Error).message).not.toContain(REPLAY_PATCH_HINT);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
