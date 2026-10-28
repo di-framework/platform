@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/di-framework/platform/operator/api/v1alpha1"
@@ -72,6 +73,10 @@ func (r *Reconciler) fresh(ctx context.Context, inst *v1alpha1.PlatformInstance)
 	}
 	var live v1alpha1.PlatformInstance
 	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(inst), &live); err != nil {
+		if apierrors.IsNotFound(err) {
+			// The instance is gone; nothing remains to wait for.
+			r.writes.forget(client.ObjectKeyFromObject(inst))
+		}
 		return err
 	}
 	*inst = live
@@ -87,4 +92,14 @@ func (r *Reconciler) expectWrite(inst *v1alpha1.PlatformInstance) {
 	if r.APIReader != nil {
 		r.writes.expect(inst)
 	}
+}
+
+// updateInstance updates inst and moves an open expectation to the written version, so every
+// write of the instance keeps the guard in fresh current.
+func (r *Reconciler) updateInstance(ctx context.Context, inst *v1alpha1.PlatformInstance) error {
+	if err := r.Update(ctx, inst); err != nil {
+		return err
+	}
+	r.writes.wrote(inst)
+	return nil
 }
