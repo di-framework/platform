@@ -66,6 +66,11 @@ func TestNetworkPolicyOrder(t *testing.T) {
 		{"no tenantAuth", nil, base},
 		{"external issuer", &v1alpha1.TenantAuth{Issuer: "https://id.example.com"}, base},
 		{"issuerUpstream", stubIssuer, withIssuer},
+		{"issuer in the platform namespace", &v1alpha1.TenantAuth{IssuerUpstream: "issuer:80"}, base},
+		{"issuer in wasmcloud", &v1alpha1.TenantAuth{IssuerUpstream: "issuer.wasmcloud.svc:80"}, base},
+		{"issuer in a tenant namespace", &v1alpha1.TenantAuth{IssuerUpstream: "issuer.di-tenant-a:80"}, base},
+		{"issuer in a runtime namespace", &v1alpha1.TenantAuth{IssuerUpstream: "issuer.di-runtime-a:80"}, base},
+		{"issuer with an empty namespace", &v1alpha1.TenantAuth{IssuerUpstream: "issuer.:80"}, base},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := policyNames(NetworkPolicies("pi-x", operatorNS, tc.auth)); !slices.Equal(got, tc.want) {
@@ -89,6 +94,7 @@ func TestIssuerUpstream(t *testing.T) {
 		{"issuer", 0, "wasmcloud", []int32{80}},
 		{"issuer.idp:http", 9000, "idp", []int32{9000}},
 		{"issuer.idp:http", 0, "", nil},
+		{"issuer.:80", 0, "", []int32{80}},
 	} {
 		t.Run(fmt.Sprintf("%s/%d", tc.upstream, tc.podPort), func(t *testing.T) {
 			ns, ports, ok := issuerUpstream(&v1alpha1.TenantAuth{IssuerUpstream: tc.upstream, IssuerUpstreamPodPort: tc.podPort})
@@ -115,13 +121,17 @@ func synced(virtualNamespace string, extra map[string]string) map[string]string 
 var (
 	controlPlanePod = map[string]string{"app": "vcluster", "release": "vcluster", "statefulset.kubernetes.io/pod-name": "vcluster-0"}
 	probePod        = synced("l4-probe", nil)
-	spoofedPod      = synced("l4-probe", map[string]string{"app": "vcluster", "release": "vcluster", "k8s-app": "kube-dns"})
-	tenantAuthPod   = synced("di-runtime-a", map[string]string{"app": "tenant-console", labelComponent: "tenant-auth"})
-	gatewayPod      = synced("wasmcloud", map[string]string{"app": "di-platform-gateway"})
-	natsPod         = synced("wasmcloud", map[string]string{"wasmcloud.com/name": "nats"})
-	tenantHostPod   = synced("di-runtime-a", map[string]string{"wasmcloud.com/name": "hostgroup", "wasmcloud.com/hostgroup": "tenant-a"})
-	coreDNSPod      = synced("kube-system", map[string]string{"k8s-app": "kube-dns"})
-	issuerPod       = synced("pg-stub-oidc", map[string]string{"app": "stub-oidc"})
+	// spoofedPod copies the control plane's labels. A real synced pod can't keep release=vcluster
+	// (the syncer rewrites it), so this is stricter than a cluster allows.
+	spoofedPod    = synced("l4-probe", map[string]string{"app": "vcluster", "release": "vcluster", "k8s-app": "kube-dns"})
+	tenantAuthPod = synced("di-runtime-a", map[string]string{"app": "tenant-console", labelComponent: "tenant-auth"})
+	gatewayPod    = synced("wasmcloud", map[string]string{"app": "di-platform-gateway"})
+	natsPod       = synced("wasmcloud", map[string]string{"wasmcloud.com/name": "nats"})
+	tenantHostPod = synced("di-runtime-a", map[string]string{"wasmcloud.com/name": "hostgroup", "wasmcloud.com/hostgroup": "tenant-a"})
+	coreDNSPod    = synced("kube-system", map[string]string{"k8s-app": "kube-dns"})
+	issuerPod     = synced("pg-stub-oidc", map[string]string{"app": "stub-oidc"})
+	// forgedAuthPod sets the tenant-auth component label on itself, which the syncer copies.
+	forgedAuthPod = synced("l4-probe", map[string]string{labelComponent: "tenant-auth"})
 )
 
 func matches(t *testing.T, s *metav1.LabelSelector, pod map[string]string) bool {
@@ -180,6 +190,9 @@ func TestNetworkPoliciesInsideTheInstance(t *testing.T) {
 		{"spoofed control plane to tenant host", spoofedPod, tenantHostPod, nil},
 		{"tenant-auth to issuer", tenantAuthPod, issuerPod, []string{"TCP/80", "TCP/8080"}},
 		{"tenant-auth to gateway", tenantAuthPod, gatewayPod, nil},
+		{"forged tenant-auth to issuer", forgedAuthPod, issuerPod, []string{"TCP/80", "TCP/8080"}},
+		{"forged tenant-auth to gateway", forgedAuthPod, gatewayPod, nil},
+		{"forged tenant-auth to NATS", forgedAuthPod, natsPod, nil},
 		{"control plane to NATS", controlPlanePod, natsPod, []string{"*"}},
 		{"control plane to tenant host", controlPlanePod, tenantHostPod, []string{"*"}},
 		{"control plane to itself", controlPlanePod, controlPlanePod, []string{"*"}},
@@ -191,6 +204,17 @@ func TestNetworkPoliciesInsideTheInstance(t *testing.T) {
 				t.Fatalf("admitted %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// #535 W1: with the issuer named in the platform namespace, a forged tenant-auth label opens
+// nothing there, the gateway included.
+func TestNetworkPoliciesIssuerInThePlatformNamespace(t *testing.T) {
+	policies := NetworkPolicies("pi-x", operatorNS, &v1alpha1.TenantAuth{IssuerUpstream: "di-platform-gateway.wasmcloud:8080"})
+	for _, dst := range []map[string]string{gatewayPod, natsPod, tenantHostPod} {
+		if got := admitted(t, policies, forgedAuthPod, dst); got != nil {
+			t.Fatalf("forged tenant-auth admitted %v to %v", got, dst)
+		}
 	}
 }
 

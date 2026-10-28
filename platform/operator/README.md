@@ -296,7 +296,11 @@ these NetworkPolicies in every instance host namespace (`pi-<namespace>-<name>-<
 - `platform-operator-allow-dns`: the instance's synced pods get in to its CoreDNS on 53 (UDP and TCP);
 - `platform-operator-allow-issuer`, only while `tenantAuth.issuerUpstream` is set: the platform's tenant-auth
   pods (`platform.di-framework.dev/component=tenant-auth`) get in to the pods of the namespace `issuerUpstream`
-  names, on its port and on `issuerUpstreamPodPort`, which the platform opens on the egress side;
+  names, on its port and on `issuerUpstreamPodPort`, which the platform opens on the egress side. The syncer
+  copies that label unchanged, so any pod of the instance can forge it: the rule only ever opens a namespace
+  the platform doesn't use. It is not rendered when `issuerUpstream` names the platform namespace
+  (`wasmcloud`, also the default with no namespace), a `di-*` namespace the platform creates for a tenant or
+  user, or an empty one;
 - `platform-operator-allow-same-namespace`: the vCluster control plane gets in to every pod of the namespace,
   for the API server's calls into synced pods (admission webhooks, for example) and its own peers;
 - `platform-operator-allow-operator`: the operator's own namespace gets in to the vCluster API (port 8443), for
@@ -304,9 +308,11 @@ these NetworkPolicies in every instance host namespace (`pi-<namespace>-<name>-<
 
 The policies select pods by vCluster 0.37.3's labels. The control plane is `app=vcluster,release=vcluster`
 without `vcluster.loft.sh/managed-by`. The syncer sets `vcluster.loft.sh/managed-by=vcluster` on every synced pod,
-together with `vcluster.loft.sh/namespace=<virtual namespace>`, and keeps the pod's own labels. CoreDNS is the
+together with `vcluster.loft.sh/namespace=<virtual namespace>`, and copies the pod's other labels; it rewrites
+the pod's own `release` and `vcluster.loft.sh/*` labels to hashed keys. CoreDNS is the
 synced pod labelled `k8s-app=kube-dns` in the virtual `kube-system`. A pod inside the instance that copies the
-control plane's labels still carries `vcluster.loft.sh/managed-by`, so it gets none of the control plane's access.
+control plane's labels loses `release=vcluster` and still carries `vcluster.loft.sh/managed-by`, so it gets none
+of the control plane's access.
 
 The target applies them on every reconcile, before the vCluster is installed, so a deleted or edited policy is
 back by the next round (and so by the next repair). An unchanged policy is not written; one whose spec differs is
@@ -320,9 +326,17 @@ What this isolates:
   other instance either.
 - Inside the instance, the operator lets pods reach only DNS, the API and the issuer, plus the control plane's
   own calls. The platform's synced policies decide the rest, so a pod in a namespace that is neither the
-  platform's nor a tenant's can't reach the gateway, a tenant's host group (`di-tenant-gateway`) or NATS.
+  platform's nor a tenant's can't reach the gateway, a tenant's host group (`di-tenant-gateway`) or NATS,
+  unless it forges labels (see #540 below).
 
 What it doesn't:
+
+- **Forged labels against the platform's tenant-namespace peers** (#540). On the vCluster target, vCluster
+  translates the platform's synced `namespaceSelector`s into pod-label selectors on
+  `vcluster.loft.sh/ns-label-*` keys, and copies such labels from a virtual pod that sets them on itself. Until
+  #540 is fixed, a pod inside the instance that can set arbitrary labels can match the platform's
+  tenant-namespace peers (for example `di-platform-gateway` and `di-platform-nats`). Peers named by
+  `kubernetes.io/metadata.name`, such as `di-tenant-gateway` for the tenant host groups, are not affected.
 
 - **Egress** is not restricted here; it stays as the platform's synced policies set it (DNS to the instance's
   CoreDNS on 53 among it).

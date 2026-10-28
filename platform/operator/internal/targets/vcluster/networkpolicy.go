@@ -51,21 +51,25 @@ const vclusterAPIPort = 8443
 // Labels of the vCluster 0.37.3 chart and syncer. The chart labels the control plane's pods
 // app=vcluster,release=<release> (templates/statefulset.yaml) and its own optional policies
 // select the synced pods by vcluster.loft.sh/managed-by=<release> (templates/networkpolicy.yaml).
-// The syncer also sets vcluster.loft.sh/namespace to a synced pod's virtual namespace and keeps
-// its virtual labels, so the CoreDNS the operator deploys keeps k8s-app=kube-dns.
+// The syncer also sets vcluster.loft.sh/namespace to a synced pod's virtual namespace and copies
+// its other virtual labels, so the CoreDNS the operator deploys keeps k8s-app=kube-dns. It
+// rewrites a virtual pod's own release and vcluster.loft.sh/* labels to hashed keys, so no synced
+// pod carries release=vcluster or sets its own managed-by or namespace.
 const (
 	labelManagedBy        = "vcluster.loft.sh/managed-by"
 	labelVirtualNamespace = "vcluster.loft.sh/namespace"
 	// labelComponent is the platform's component label; its tenant-auth pods carry
 	// component=tenant-auth and are the ones whose egress reaches the issuerUpstream.
 	labelComponent = "platform.di-framework.dev/component"
+	// platformNamespacePrefix starts every namespace the platform creates for its tenants and
+	// users (di-tenant-*, di-runtime-*, di-apikeys-*, di-user-*, ...).
+	platformNamespacePrefix = "di-"
 )
 
 var managedBy = map[string]string{"app.kubernetes.io/managed-by": "platform-operator"}
 
-// controlPlanePods selects the vCluster control plane. Synced pods keep their virtual labels, so
-// one labelled app=vcluster,release=vcluster inside the instance is told apart by the
-// managed-by label the syncer gives every synced pod.
+// controlPlanePods selects the vCluster control plane. A synced pod can't match it: the syncer
+// rewrites its release label, and gives it the managed-by label the selector excludes.
 func controlPlanePods() *metav1.LabelSelector {
 	return &metav1.LabelSelector{
 		MatchLabels: map[string]string{"app": "vcluster", "release": ReleaseName},
@@ -95,16 +99,17 @@ func ports(protocol corev1.Protocol, numbers ...int32) []networkingv1.NetworkPol
 }
 
 // issuerUpstream reads spec.tenantAuth.issuerUpstream (<service>.<namespace>[.svc...]:<port>)
-// the way the platform does for the tenant-auth egress: the namespace is the host's second
-// label (the platform namespace when there is none), the port defaults to 80, and the pod port
-// behind it is added. ok is false without an issuerUpstream or a usable port.
+// the way the platform does for the tenant-auth egress (tenancy/resources.ts): the namespace is
+// the host's second label, the platform namespace when there is none and "" when it is empty
+// ("issuer.:80"); the port defaults to 80, and the pod port behind it is added. ok is false
+// without an issuerUpstream or a usable port.
 func issuerUpstream(auth *v1alpha1.TenantAuth) (namespace string, issuerPorts []int32, ok bool) {
 	if auth == nil || auth.IssuerUpstream == "" {
 		return "", nil, false
 	}
 	host, port, found := strings.Cut(auth.IssuerUpstream, ":")
 	namespace = targets.PlatformNamespace
-	if labels := strings.Split(host, "."); len(labels) > 1 && labels[1] != "" {
+	if labels := strings.Split(host, "."); len(labels) > 1 {
 		namespace = labels[1]
 	}
 	if !found {
@@ -117,6 +122,14 @@ func issuerUpstream(auth *v1alpha1.TenantAuth) (namespace string, issuerPorts []
 		issuerPorts = append(issuerPorts, p)
 	}
 	return namespace, issuerPorts, len(issuerPorts) > 0
+}
+
+// issuerNamespaceOpenable reports whether PolicyIssuer may open a namespace. Its source label
+// (component=tenant-auth) is copied unchanged by the syncer, so any pod of the instance can forge
+// it: the rule may only open a namespace the platform doesn't use. Not the platform namespace,
+// not one the platform creates for a tenant or user, and not an empty one.
+func issuerNamespaceOpenable(namespace string) bool {
+	return namespace != "" && namespace != targets.PlatformNamespace && !strings.HasPrefix(namespace, platformNamespacePrefix)
 }
 
 // NetworkPolicies renders the host-namespace policies for one instance, in the order they are
@@ -150,7 +163,7 @@ func NetworkPolicies(hostNamespace, operatorNamespace string, auth *v1alpha1.Ten
 			From: from(syncedPods(nil)), Ports: append(ports(corev1.ProtocolUDP, 53), ports(corev1.ProtocolTCP, 53)...),
 		}),
 	}
-	if ns, issuerPorts, ok := issuerUpstream(auth); ok {
+	if ns, issuerPorts, ok := issuerUpstream(auth); ok && issuerNamespaceOpenable(ns) {
 		policies = append(policies, allow(PolicyIssuer, syncedPods(map[string]string{labelVirtualNamespace: ns}), networkingv1.NetworkPolicyIngressRule{
 			From: from(syncedPods(map[string]string{labelComponent: "tenant-auth"})), Ports: ports(corev1.ProtocolTCP, issuerPorts...),
 		}))
@@ -169,7 +182,7 @@ func NetworkPolicies(hostNamespace, operatorNamespace string, auth *v1alpha1.Ten
 // applyNetworkPolicies creates the host-namespace policies, or puts back a deleted or edited
 // one, and updates an existing one whose spec changed (an instance created by an older
 // operator) in place. An unchanged policy is not written. PolicyIssuer is deleted when the
-// instance no longer sets an issuerUpstream.
+// instance no longer sets an issuerUpstream, or one in a namespace it may not open.
 func (t *Target) applyNetworkPolicies(ctx context.Context, ns string, auth *v1alpha1.TenantAuth) error {
 	if t.OperatorNamespace == "" {
 		return fmt.Errorf("the operator's namespace is unknown")
