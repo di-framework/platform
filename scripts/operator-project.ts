@@ -16,6 +16,8 @@
  *     nothing.
  *   bun scripts/operator-project.ts bump <version>
  *     pins an exact published version instead.
+ *   Either form refuses a version older than the current pin (a dist-tag rollback, or a manual
+ *   bump ahead of `latest`), so the baked default never moves backwards.
  *
  * Only node builtins and the npm CLI.
  */
@@ -39,6 +41,17 @@ export function assertVersion(version: string | undefined): string {
     throw new Error(`expected a release version like 6.0.22, got ${JSON.stringify(version)}`);
   }
   return version;
+}
+
+/** Compares two release versions (major.minor.patch): negative when a is older than b. */
+export function compareVersions(a: string, b: string): number {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
 }
 
 type Manifest = { dependencies: Record<string, string> } & Record<string, unknown>;
@@ -145,6 +158,10 @@ export async function bump(root: string, wanted: string | undefined, deps = npmD
   const dir = join(root, PROJECT_DIR);
   const pkgPath = join(dir, 'package.json');
   const before = readFileSync(pkgPath, 'utf8');
+  const pinned = (JSON.parse(before) as Manifest).dependencies?.[PLATFORM_PACKAGE];
+  if (pinned && /^\d+\.\d+\.\d+$/.test(pinned) && compareVersions(version, pinned) < 0) {
+    throw new Error(`refusing to move the pin back from ${pinned} to ${version}`);
+  }
   const after = setPlatformVersion(before, version);
   if (after !== before) writeFileSync(pkgPath, after);
   deps.lock(dir);

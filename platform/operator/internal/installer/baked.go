@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sync"
 )
 
 // The operator image bakes one install project (#431): project/package.json and
@@ -191,6 +192,9 @@ func copyFile(src, dst string, perm fs.FileMode) error {
 	return out.Close()
 }
 
+// linkMu serializes linkBakedPlugins across reconciles in this process.
+var linkMu sync.Mutex
+
 // pluginDirName matches a plugin directory in Pulumi's plugin cache: <kind>-<name>-v<version>.
 var pluginDirName = regexp.MustCompile(`^(resource|language|analyzer|converter|tool)-[a-zA-Z0-9][a-zA-Z0-9-_.]*-v[0-9]+\.[0-9]+\.[0-9]+$`)
 
@@ -200,7 +204,12 @@ var pluginDirName = regexp.MustCompile(`^(resource|language|analyzer|converter|t
 // lists only real directories, and skips one with a <dir>.partial marker, which is held while the
 // links are made, so an interrupted link is redone instead of used. Plugins already in the cache
 // are left alone.
+//
+// Calls are serialized (linkMu): concurrent reconciles share one cache, and the check-then-make
+// sequence is not atomic between goroutines. A plugin already linked is a no-op.
 func linkBakedPlugins(baked, cache string) ([]string, error) {
+	linkMu.Lock()
+	defer linkMu.Unlock()
 	entries, err := os.ReadDir(baked)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil

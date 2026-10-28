@@ -9,6 +9,7 @@ import {
   bakedPlugins,
   bump,
   checksumsUrl,
+  compareVersions,
   main,
   PLATFORM_PACKAGE,
   PROJECT_DIR,
@@ -152,6 +153,38 @@ describe('bump', () => {
       expect(
         ['package.json', 'plugins.txt'].map((f) => readFileSync(join(dir, f), 'utf8')),
       ).toEqual(before);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('compareVersions orders release versions numerically', () => {
+    expect(compareVersions('6.0.9', '6.0.10')).toBeLessThan(0);
+    expect(compareVersions('6.1.0', '6.0.22')).toBeGreaterThan(0);
+    expect(compareVersions('6.0.22', '6.0.22')).toBe(0);
+  });
+
+  test('refuses to move the pin to an older version and changes nothing', async () => {
+    const root = scratch();
+    try {
+      const dir = join(root, PROJECT_DIR);
+      const files = ['package.json', 'package-lock.json', 'plugins.txt'];
+      const before = files.map((f) => readFileSync(join(dir, f), 'utf8'));
+      const pinned = JSON.parse(before[0] as string).dependencies[PLATFORM_PACKAGE] as string;
+      const deps = {
+        latest: () => '0.0.1',
+        lock: () => {
+          throw new Error('not relocked');
+        },
+        checksums: async () => {
+          throw new Error('not fetched');
+        },
+      };
+      await expect(bump(root, undefined, deps)).rejects.toThrow(
+        `refusing to move the pin back from ${pinned} to 0.0.1`,
+      );
+      await expect(bump(root, '0.0.1', deps)).rejects.toThrow('refusing to move the pin back');
+      expect(files.map((f) => readFileSync(join(dir, f), 'utf8'))).toEqual(before);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

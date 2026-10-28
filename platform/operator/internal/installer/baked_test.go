@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/auto"
@@ -236,6 +238,44 @@ func TestLinkBakedPlugins(t *testing.T) {
 	}
 }
 
+// Concurrent reconciles link into one empty cache (pod start with several instances): no caller
+// fails, exactly one links each plugin, and the cache ends complete. Run with -race.
+func TestLinkBakedPluginsConcurrent(t *testing.T) {
+	_, plugins := bake(t, DefaultVersion)
+	name := "resource-kubernetes-v4.34.2"
+	for round := 0; round < 50; round++ {
+		cache := filepath.Join(t.TempDir(), "plugins")
+		var wg sync.WaitGroup
+		var linked atomic.Int32
+		errs := make(chan error, 16)
+		for range 16 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				got, err := linkBakedPlugins(plugins, cache)
+				if err != nil {
+					errs <- err
+				}
+				linked.Add(int32(len(got)))
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("round %d: %v", round, err)
+		}
+		if n := linked.Load(); n != 1 {
+			t.Fatalf("round %d: linked %d times", round, n)
+		}
+		if _, err := os.Stat(filepath.Join(cache, name+".partial")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("round %d: .partial left (%v)", round, err)
+		}
+		if _, err := os.Stat(filepath.Join(cache, name, "pulumi-resource-kubernetes")); err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+	}
+}
+
 func TestPluginLinkFailureIsOnlyLogged(t *testing.T) {
 	_, plugins := bake(t, DefaultVersion)
 	var log bytes.Buffer
@@ -340,7 +380,7 @@ func TestDockerfileBakesTheProject(t *testing.T) {
 		`echo "$sum  /tmp/$tgz" | sha256sum -c -`,
 		"WORKDIR " + DefaultBakedProject,
 		"COPY --from=project " + DefaultBakedProject + " " + DefaultBakedProject,
-		"COPY --from=build " + DefaultBakedPlugins + " " + DefaultBakedPlugins,
+		"COPY --from=plugins " + DefaultBakedPlugins + " " + DefaultBakedPlugins,
 	} {
 		if !strings.Contains(dockerfile, want) {
 			t.Errorf("Dockerfile lacks %q", want)
