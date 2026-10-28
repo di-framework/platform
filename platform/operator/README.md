@@ -26,6 +26,22 @@ spec:
 `kubectl get pi -A` shows the requested and installed versions and the phase. The instance's admin
 kubeconfig is in the Secret named by `status.kubeconfigSecretRef` (`<name>-kubeconfig`, key `kubeconfig`).
 
+## Network policy engine
+
+`spec.platform.networkPolicyEngine: existing` (the default) is the supported value on KubeSolo, and the only one
+a new instance accepts. The vCluster syncs the instance's NetworkPolicies to the host, and the host's policy
+engine (kube-router on KubeSolo) enforces them alongside the operator's
+[host-namespace policies](#host-namespace-isolation). `kube-router` would install a second kube-router inside
+the vCluster. Its pods run on the host's node and program the same iptables and ipset chains as the host's
+kube-router, so the two race and can undo the host's enforcement of the instance's policies (#456).
+
+The CRD refuses `kube-router` for the `vcluster` target (the only target in v1alpha1) with a CEL rule:
+`kubectl apply` fails with "platform.networkPolicyEngine kube-router is not supported on the vcluster target
+... Use existing", and the Headlamp form doesn't offer `kube-router`. An instance stored with `kube-router` before the rule keeps working and
+can still be updated while it keeps the value; the rule only stops a new instance from choosing it and an
+existing one from switching to it. Moving such an instance to `existing` puts it on the supported setup; it
+can't switch back.
+
 ## Tenancy settings
 
 `spec.platform` also carries the instance's tenants, users, `tenantAuth` and tenant host image, so an instance
@@ -426,11 +442,13 @@ once (Package settings, then Change visibility), because Layer 4 (#274) pulls th
 
 The operator needs:
 
+- **Kubernetes 1.30 or later.** The CRD's `networkPolicyEngine` transition rule uses `optionalOldSelf`, which
+  older API servers drop, so the CRD apply fails there.
 - **cluster-admin.** The vCluster chart creates RBAC, workloads and Services in each instance namespace, and
   Helm needs every permission it grants. `config/rbac/role.yaml` lists what the controller itself uses;
   narrowing the chart's needs is follow-up work.
 - **a host policy engine.** Instances run with `networkPolicyEngine: existing`, so the host cluster must enforce
-  NetworkPolicy.
+  NetworkPolicy (see [Network policy engine](#network-policy-engine)).
 - **egress to npm, the Pulumi plugin host and the platform's images**, since each install runs `npm install`
   and fetches the Pulumi Kubernetes provider plugin.
 - **its own namespace**, which every instance host namespace admits to the vCluster API (see

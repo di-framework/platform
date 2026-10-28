@@ -16,6 +16,7 @@ import {
   MAX_TENANTS,
   MAX_USERS,
   type MembershipRole,
+  NETWORK_POLICY_ENGINES,
   type NetworkPolicyEngine,
   PLURAL,
   type PlatformInstanceObject,
@@ -671,9 +672,38 @@ function validateTenantAuth(form: PlatformInstanceForm, errors: FormErrors) {
   }
 }
 
-/** Client-side checks mirroring the CRD, so most mistakes show before the request. */
-export function validateForm(form: PlatformInstanceForm, mode: FormMode): FormErrors {
+/**
+ * The networkPolicyEngine values the form offers on the vcluster target (v1alpha1's only target):
+ * just `existing`. The CRD refuses `kube-router` there (#456), because a second kube-router inside
+ * the vCluster would race the host's kube-router over the instance's NetworkPolicies. An instance
+ * stored with `kube-router` before that rule keeps it as a choice on edit, as the CRD allows.
+ */
+export function networkPolicyEngineChoices(
+  stored?: NetworkPolicyEngine,
+): readonly NetworkPolicyEngine[] {
+  return NETWORK_POLICY_ENGINES.filter((e) => e !== 'kube-router' || stored === 'kube-router');
+}
+
+/**
+ * Client-side checks mirroring the CRD, so most mistakes show before the request. `stored` is the
+ * edited object's networkPolicyEngine: an instance that already has `kube-router` passes, as the
+ * CRD lets it.
+ */
+export function validateForm(
+  form: PlatformInstanceForm,
+  mode: FormMode,
+  stored?: NetworkPolicyEngine,
+): FormErrors {
   const errors: FormErrors = {};
+
+  if (
+    form.networkPolicyEngine &&
+    !networkPolicyEngineChoices(mode === 'edit' ? stored : undefined).includes(
+      form.networkPolicyEngine,
+    )
+  ) {
+    errors.networkPolicyEngine = `Network policy engine ${form.networkPolicyEngine} isn't supported on the ${form.targetType} target: the host cluster enforces NetworkPolicy. Use existing.`;
+  }
 
   if (mode === 'create') {
     const name = form.name.trim();

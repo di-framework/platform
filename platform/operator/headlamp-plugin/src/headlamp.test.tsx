@@ -247,7 +247,7 @@ describe('detail', () => {
     expect(rowValue('Installed version')).toBe('6.0.18-rc.1');
     expect(rowValue('Target')).toBe('vcluster');
     expect(rowValue('Deletion policy')).toBe('Retain');
-    expect(rowValue('Network policy engine')).toBe('kube-router');
+    expect(rowValue('Network policy engine')).toBe('existing');
     expect(rowValue('Storage root')).toBe('/var/lib/di-framework/team-b/full-instance');
     expect(rowValue('Gateway NodePort')).toBe('30080');
     expect(rowValue('Last repair')).toBe('2026-10-25T10:00:00Z');

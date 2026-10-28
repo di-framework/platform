@@ -157,6 +157,63 @@ describe('PlatformInstanceFormDialog', () => {
     });
   });
 
+  it("doesn't offer kube-router on create (#456)", () => {
+    render(
+      <PlatformInstanceFormDialog
+        open
+        mode="create"
+        defaultNamespace="team-a"
+        onClose={() => {}}
+        submit={vi.fn()}
+      />,
+    );
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: /Network policy engine/ }));
+    const options = screen.getAllByRole('option').map((o) => o.textContent);
+    expect(options).toStrictEqual(['(API default)', 'existing']);
+    expect(screen.getByText(/kube-router isn't offered on vcluster/)).toBeTruthy();
+  });
+
+  it('keeps kube-router on edit of an instance that already has it (#456)', async () => {
+    const live = {
+      ...full,
+      metadata: { ...full.metadata, resourceVersion: '9' },
+      spec: {
+        ...full.spec,
+        platform: { ...full.spec.platform, networkPolicyEngine: 'kube-router' },
+      },
+    } as PlatformInstanceObject;
+    const submit = vi.fn().mockResolvedValue({});
+    render(
+      <PlatformInstanceFormDialog
+        open
+        mode="edit"
+        existing={live}
+        onClose={() => {}}
+        submit={submit}
+      />,
+    );
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: /Network policy engine/ }));
+    const options = screen.getAllByRole('option').map((o) => o.textContent);
+    expect(options).toStrictEqual(['(API default)', 'existing', 'kube-router']);
+    fireEvent.click(screen.getByRole('option', { name: 'kube-router' }));
+    type('version', '6.0.19');
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    });
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/already uses it/)).toBeTruthy();
+    // The engine is kept as is (no op on it); only the version changes.
+    expect(submit.mock.calls[0]?.[0]).toStrictEqual({
+      mode: 'edit',
+      namespace: 'team-b',
+      name: 'full-instance',
+      patch: [
+        { op: 'test', path: '/spec/version', value: '6.0.18-rc.1' },
+        { op: 'replace', path: '/spec/version', value: '6.0.19' },
+      ],
+    });
+  });
+
   it('shows the conflict message when the object changed since the dialog opened', async () => {
     const live = { ...full, metadata: { ...full.metadata, resourceVersion: '9' } };
     const submit = vi.fn().mockRejectedValue(new Error(CONFLICT_MESSAGE));
