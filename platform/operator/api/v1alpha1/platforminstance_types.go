@@ -496,7 +496,10 @@ type TargetStatus struct {
 	ServiceUID string `json:"serviceUID,omitempty"`
 
 	// ResyncServiceUID is set while a resync is running: the uid of the service/vcluster it
-	// restarted the vCluster control plane for.
+	// restarted the vCluster control plane for. A resync after the host namespace was deleted
+	// starts with the marker "host-namespace-deleted" instead, while the namespace terminates and
+	// until the vCluster created again in its place has a service/vcluster; the field then holds
+	// that Service's uid (#490).
 	// +optional
 	ResyncServiceUID string `json:"resyncServiceUID,omitempty"`
 
