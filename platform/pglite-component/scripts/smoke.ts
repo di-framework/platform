@@ -131,6 +131,20 @@ export function previousRelease(pins: Pins): PreviousRelease {
   };
 }
 
+/**
+ * PG_VERSION holds only the major version ("17"), so compare majors and say
+ * so: the release's full version ("17.5") is not what the file should hold.
+ */
+export function checkPreviousPgVersion(pgVersion: string, release: PreviousRelease): void {
+  const major = release.postgres.split('.')[0];
+  if (pgVersion !== major) {
+    throw new Error(
+      `previous release wrote PG_VERSION ${pgVersion}, expected major version ${major} ` +
+        `(${release.version} ships PostgreSQL ${release.postgres})`,
+    );
+  }
+}
+
 /** Path of the provider component inside the published npm tarball. */
 export const PACKAGE_PROVIDER = 'package/dist/di-framework-pglite.wasm';
 
@@ -173,9 +187,7 @@ async function upgradeSmoke(ctx: Context, consumer: string, composed: string, sm
       `upgrade-write-${release.version}`,
     );
     const pgVersion = (await Bun.file(join(dataDir, 'pglite', 'data', 'PG_VERSION')).text()).trim();
-    if (pgVersion !== release.postgres.split('.')[0]) {
-      throw new Error(`previous release wrote PG_VERSION ${pgVersion}, not ${release.postgres}`);
-    }
+    checkPreviousPgVersion(pgVersion, release);
     await expectMarker(dataDir, null, `after ${release.version}`);
     // upgrade-read asserts that `none` still selects template1 here (#212).
     await runMode(ctx, composed, smokeDir, 'upgrade-read', mount);

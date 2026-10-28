@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | Base | [postgres/postgres](https://github.com/postgres/postgres) tag `REL_17_11`, commit `083ac033419f690758508e08c1736089384bbee8` (pinned in `scripts/tool-versions.env`) |
-| Changes | [electric-sql/postgres-pglite](https://github.com/electric-sql/postgres-pglite) `REL_17_5` (`5e2f3df4`, the same commit as upstream `REL_17_5`) → `REL_17_5_WASM-pglite` (`2194acf3`) |
+| Changes | [electric-sql/postgres-pglite](https://github.com/electric-sql/postgres-pglite) merge base `5e2f3df4` (upstream `REL_17_5`) → `REL_17_5_WASM-pglite` (`2194acf3`) |
 | Size | 118 files: 79 modified, 39 added (`wasm-build.sh`, `wasm-build/`, `pglite-wasm/`, `src/template/wasi`, …). No binary files. |
 
 Why: Electric's newer branches (`REL_17_7_pglite`, `REL_18_*-pglite`) are Emscripten-only and dropped the WASI build, and no WASI branch exists past 17.5. Replaying the 17.5 WASI changes onto the upstream release keeps every PostgreSQL 17 security fix (#383). PostgreSQL 18 is tracked in #401.

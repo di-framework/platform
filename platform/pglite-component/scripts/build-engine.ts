@@ -187,13 +187,29 @@ export function checkTagCommit(source: PostgresSource, fetched: string): void {
   }
 }
 
+/** What to do when our WASI replay patch (ENGINE_SOURCE_PATCH) no longer applies. */
+export const REPLAY_PATCH_HINT =
+  'After a base bump, regenerate engine/patches/postgresql-*-wasi.patch as described in ' +
+  'engine/patches/README.md.';
+
+/** What to do when one of the pinned wasipg recipe's build/patches no longer applies. */
+export const RECIPE_PATCH_HINT =
+  'This patch comes from the pinned wasipg recipe (PGLITE_SOURCE_REF in ' +
+  'scripts/tool-versions.env), not from engine/patches, so regenerating the WASI patch does ' +
+  'not fix it: check whether a PGLITE_SOURCE_REF bump changed build/patches, or whether the ' +
+  'base bump moved the code the patch touches.';
+
 /** The error shown when a patch no longer applies, with what to do about it. */
-export function patchDoesNotApply(patch: string, source: PostgresSource, gitOutput: string): Error {
+export function patchDoesNotApply(
+  patch: string,
+  source: PostgresSource,
+  gitOutput: string,
+  hint: string = REPLAY_PATCH_HINT,
+): Error {
   const detail = gitOutput.trim() ? `\n${gitOutput.trim()}` : '';
   return new Error(
     `${patch} no longer applies to PostgreSQL ${source.tag} (${source.commit.slice(0, 10)}). ` +
-      'After a base bump, regenerate engine/patches/postgresql-*-wasi.patch as described in ' +
-      `engine/patches/README.md.${detail}`,
+      `${hint}${detail}`,
   );
 }
 
@@ -203,13 +219,14 @@ export async function applyCheckedPatch(
   patchFile: string,
   label: string,
   source: PostgresSource,
+  hint: string = REPLAY_PATCH_HINT,
 ): Promise<void> {
   const check = await $`git -C ${tree} apply --check --whitespace=nowarn ${patchFile}`
     .env(gitEnv())
     .nothrow()
     .quiet();
   if (check.exitCode !== 0) {
-    throw patchDoesNotApply(label, source, `${check.stdout}${check.stderr}`);
+    throw patchDoesNotApply(label, source, `${check.stdout}${check.stderr}`, hint);
   }
   await $`git -C ${tree} apply --whitespace=nowarn ${patchFile}`.env(gitEnv()).quiet();
 }
@@ -244,21 +261,32 @@ export async function prepareEngineTree(
     await $`git -C ${tree} rev-parse ${'FETCH_HEAD^{commit}'}`.env(gitEnv()).text(),
   );
   await $`git -C ${tree} checkout -q FETCH_HEAD`.env(gitEnv());
-  await applyCheckedPatch(tree, replayPatch, ENGINE_SOURCE_PATCH, source);
+  await applyCheckedPatch(tree, replayPatch, ENGINE_SOURCE_PATCH, source, REPLAY_PATCH_HINT);
   for (const patch of await recipePatches(recipePatchDir)) {
-    await applyCheckedPatch(tree, patch, `wasipg build/patches/${patch.split('/').pop()}`, source);
+    await applyCheckedPatch(
+      tree,
+      patch,
+      `wasipg build/patches/${patch.split('/').pop()}`,
+      source,
+      RECIPE_PATCH_HINT,
+    );
   }
   await Bun.write(join(tree, ENGINE_TREE_MARKER), `${source.tag} ${source.commit}\n`);
 }
 
+/** The wasipg build recipe the engine is built with. */
+export const WASIPG_REPO = 'https://github.com/moznion/wasipg.git';
+
 /** Fetch the pinned wasipg recipe (build/, NOTICE, LICENSE) into `sourceDir`; returns its commit time. */
-export async function fetchRecipe(sourceDir: string, sourceRef: string): Promise<string> {
+export async function fetchRecipe(
+  sourceDir: string,
+  sourceRef: string,
+  repo: string = WASIPG_REPO,
+): Promise<string> {
   if (!(await isDirectory(join(sourceDir, '.git')))) {
     await mkdir(sourceDir, { recursive: true });
     await $`git -C ${sourceDir} init -q`.env(gitEnv());
-    await $`git -C ${sourceDir} remote add origin https://github.com/moznion/wasipg.git`.env(
-      gitEnv(),
-    );
+    await $`git -C ${sourceDir} remote add origin ${repo}`.env(gitEnv());
   }
   await $`git -C ${sourceDir} fetch --depth 1 origin ${sourceRef}`.env(gitEnv());
   await $`git -C ${sourceDir} checkout FETCH_HEAD -- build NOTICE LICENSE`.env(gitEnv());

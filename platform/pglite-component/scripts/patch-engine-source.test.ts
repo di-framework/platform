@@ -24,7 +24,8 @@ import {
   LINK_PLPGSQL,
   PG_BACKEND_END,
   PG_BACKEND_START,
-  PGP_CFB_UPSTREAM_FIX,
+  PGP_CFB_ENCRYPT_CALL,
+  PGP_CFB_ERROR_CHECK,
   PQCOMM_END,
   PQCOMM_FALLBACK_START,
   parseSourceArgs,
@@ -89,36 +90,24 @@ const UPSTREAM_DLFCN = [
   '',
 ].join('\n');
 
-/** pgcrypto's PGP CFB mode as PostgreSQL 17.11 ships it (abridged). */
-const UPSTREAM_PGP_CFB = [
-  'static int',
-  'cfb_process(PGP_CFB *ctx, const uint8 *data, int len, uint8 *dst,',
-  '\t\t\tmix_data_t mix_data)',
-  '{',
-  '\twhile (len > 0)',
-  '\t{',
-  '\t\tunsigned\trlen;',
-  '\t\tint\t\t\terr;',
-  '',
-  '\t\terr = px_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);',
-  '\t\tif (err)',
-  '\t\t\tereport(ERROR,',
-  '\t\t\t\t\t(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),',
-  '\t\t\t\t\t errmsg("encrypt error: %s", px_strerror(err))));',
-  '\t}',
-  '\treturn 0;',
-  '}',
-  '',
-].join('\n');
+/** pgcrypto's PGP CFB mode, verbatim from PostgreSQL REL_17_11 (083ac03341). */
+const UPSTREAM_PGP_CFB = await Bun.file(
+  join(import.meta.dir, 'testdata/pgp-cfb-REL_17_11.c'),
+).text();
 
-/** The same loop before 17.11: the encrypt result is ignored. */
-const UNFIXED_PGP_CFB = [
-  '\twhile (len > 0)',
-  '\t{',
-  '\t\tpx_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);',
-  '\t}',
-  '',
-].join('\n');
+/** The upstream file with `from` replaced by `to`; `from` must occur exactly once. */
+function editedPgpCfb(from: string, to: string): string {
+  if (UPSTREAM_PGP_CFB.split(from).length !== 2) {
+    throw new Error(`fixture edit anchor not found exactly once: ${JSON.stringify(from)}`);
+  }
+  return UPSTREAM_PGP_CFB.replace(from, () => to);
+}
+
+/** The encrypt loop before 17.11: the encrypt result is ignored. */
+const UNFIXED_PGP_CFB = editedPgpCfb(
+  PGP_CFB_ENCRYPT_CALL,
+  '\t\tpx_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);\n',
+);
 
 /** pglite-wasm/pgl_initdb.c around the initdb include (abridged). */
 const UPSTREAM_PGL_INITDB = [
@@ -314,14 +303,52 @@ describe('patchPgcrypto', () => {
 });
 
 describe('requirePgpCfbFix', () => {
-  test('accepts the upstream PGP CFB error check', () => {
-    expect(UPSTREAM_PGP_CFB).toContain(PGP_CFB_UPSTREAM_FIX);
+  test('accepts PostgreSQL 17.11 pgp-cfb.c as upstream ships it', () => {
+    expect(UPSTREAM_PGP_CFB).toContain(PGP_CFB_ENCRYPT_CALL);
+    expect(UPSTREAM_PGP_CFB).toContain(PGP_CFB_ERROR_CHECK);
     expect(() => requirePgpCfbFix(UPSTREAM_PGP_CFB)).not.toThrow();
   });
 
+  test('accepts the error check without the comment above it', () => {
+    const bare = UPSTREAM_PGP_CFB.replace(/\n\t\t\/\*\n\t\t \* XXX Ignoring[\s\S]*?\*\/\n/, '');
+    expect(bare).not.toContain('XXX Ignoring');
+    expect(() => requirePgpCfbFix(bare)).not.toThrow();
+  });
+
+  const missing =
+    'pgp-cfb.c: the PGP CFB cipher error check (PostgreSQL 17.11, CVE-2026-14663) is missing';
+
   test('refuses a base whose PGP CFB mode ignores cipher failures', () => {
-    expect(() => requirePgpCfbFix(UNFIXED_PGP_CFB)).toThrow(
-      'pgp-cfb.c: the PGP CFB cipher error check (PostgreSQL 17.11, CVE-2026-14663) is missing',
+    expect(() => requirePgpCfbFix(UNFIXED_PGP_CFB)).toThrow(missing);
+  });
+
+  test('refuses a base that keeps the encrypt result but never checks it', () => {
+    const unchecked = editedPgpCfb(PGP_CFB_ERROR_CHECK, '\t\tif (0)\n\t\t\tereport(ERROR,\n');
+    expect(unchecked).toContain(PGP_CFB_ENCRYPT_CALL);
+    expect(() => requirePgpCfbFix(unchecked)).toThrow(missing);
+  });
+
+  test('refuses a base whose error check does not directly follow the encrypt call', () => {
+    const late = editedPgpCfb(PGP_CFB_ERROR_CHECK, `\t\terr = 0;\n${PGP_CFB_ERROR_CHECK}`);
+    expect(() => requirePgpCfbFix(late)).toThrow(missing);
+  });
+
+  test('refuses a base with a second, unchecked encrypt call', () => {
+    const loop = '\twhile (len > 0 && ctx->pos > 0)\n';
+    const twice = editedPgpCfb(
+      loop,
+      `\tpx_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, NULL);\n\n${loop}`,
+    );
+    expect(() => requirePgpCfbFix(twice)).toThrow(missing);
+  });
+
+  test('refuses a base whose encrypt path may ignore cipher failures', () => {
+    const ignoring = editedPgpCfb(
+      '0 /* never ignore cipher failures for encrypt */ );',
+      'ctx->ignore_decrypt_cipher_failure);',
+    );
+    expect(() => requirePgpCfbFix(ignoring)).toThrow(
+      'pgp-cfb.c: pgp_cfb_encrypt may ignore cipher failures (PostgreSQL 17.11, CVE-2026-14663)',
     );
   });
 
