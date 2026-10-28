@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/auto"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 )
 
 var errNoRegistry = errors.New("npm: getaddrinfo ENOTFOUND registry.npmjs.org")
@@ -132,6 +133,61 @@ func TestInstallAtTheDefaultVersionNeedsNoNPM(t *testing.T) {
 	}
 	if *npm != 0 {
 		t.Fatalf("npm ran %d times after node_modules went missing, want 0", *npm)
+	}
+}
+
+// A lost target (#490, #514 S4) drops the install state with Uninstall, which removes the whole
+// instance directory, the npm project with it. The resync's reinstall at the default version then
+// copies the baked project again instead of running `npm install`, and finds the baked plugins in
+// Pulumi's cache, linking them again if the cache lost them too.
+func TestResyncAfterUninstallReusesTheBake(t *testing.T) {
+	project, plugins := bake(t, DefaultVersion)
+	s := &fakeStack{fail: map[string][]error{}, outputs: auto.OutputMap{}}
+	h := &helmTarget{stack: s, calls: &s.calls}
+	s.onUp, s.onRefresh = h.up, h.refresh
+	p, npm, cache := offlinePulumi(t, s, project, plugins)
+	p.uninstallRelease = h.uninstall
+	req := request()
+	req.Version = DefaultVersion
+	if _, err := p.Install(context.Background(), req, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The target is lost: the controller drops the install state (no destroy), and the new
+	// cluster comes up empty.
+	if err := p.Uninstall(context.Background(), req, UninstallOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	projectDir, _ := p.dirs(req.ID)
+	if _, err := os.Stat(projectDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("project left behind by Uninstall: %v", err)
+	}
+	plugin := filepath.Join(cache, "resource-kubernetes-v4.34.2")
+	if _, err := os.Stat(filepath.Join(plugin, "pulumi-resource-kubernetes")); err != nil {
+		t.Fatalf("Uninstall touched Pulumi's plugin cache: %v", err)
+	}
+	rm(t, plugin)
+	h.deployed, s.state = false, apitype.UntypedDeployment{}
+
+	// The resync's reinstall, with the options the controller passes after a target loss.
+	s.calls = nil
+	if _, err := p.Install(context.Background(), req, Options{Refresh: true, ReinstallRelease: true}); err != nil {
+		t.Fatalf("resync reinstall with npm unreachable: %v", err)
+	}
+	if *npm != 0 {
+		t.Fatalf("npm ran %d times, want 0", *npm)
+	}
+	if want := []string{"config", "export", "refresh", "up", "export", "outputs"}; !slices.Equal(s.calls, want) {
+		t.Fatalf("calls %v, want %v", s.calls, want)
+	}
+	if got, err := installedVersion(projectDir); err != nil || got != DefaultVersion {
+		t.Fatalf("installed %q (%v), want the baked %s", got, err, DefaultVersion)
+	}
+	if b, _ := os.ReadFile(filepath.Join(projectDir, ".installed-version")); string(b) != DefaultVersion {
+		t.Fatalf("stamp %q", b)
+	}
+	if target, err := os.Readlink(filepath.Join(plugin, "pulumi-resource-kubernetes")); err != nil || target != filepath.Join(plugins, "resource-kubernetes-v4.34.2", "pulumi-resource-kubernetes") {
+		t.Fatalf("plugin not linked again: %q (%v)", target, err)
 	}
 }
 
