@@ -236,6 +236,11 @@ objects() {
 # A new pod's traffic to di-nats is refused until the network policy engine has programmed the
 # pod (about a second under kube-router), so wait for the first registry login (#388). Only a
 # failure to reach di-nats is retried; anything else (such as a rejected login) fails at once.
+# The later setup steps (account checks, stream and marker reads) fail fast on purpose: once this
+# login succeeded the pod's traffic is admitted, so the startup refusal cannot recur, and the
+# account checks and a rejected login are configuration errors that no wait fixes (#398). A
+# genuinely transient error later on (di-nats restarting, say) fails this pod; the Job's
+# backoffLimit starts a fresh one, and every step is safe to repeat.
 waited=0
 delay=1
 attempt=1

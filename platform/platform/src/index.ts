@@ -334,19 +334,20 @@ export function createPlatform(args: PlatformArgs) {
 
   // The installation's Tenants, listed once per run with the admin kubeconfig and shared by the
   // watched namespaces (#227) and the Retain removal check (#228), in preview too, so both decide
-  // from one snapshot (#245). Without `kubeconfig` nothing is listed.
+  // from one snapshot (#245). The snapshot is built in one `apply` on the admin kubeconfig and
+  // context, so both consumers read it with the same credentials by construction. Without
+  // `kubeconfig` nothing is listed.
   const adminKubeconfig = args.kubeconfig;
-  const kubeconfigAccess =
-    adminKubeconfig === undefined ? undefined : pulumi.all([adminKubeconfig, args.kubeContext]);
-  let liveTenants: TenantSnapshot | undefined;
-  const tenantSnapshot = (kubeconfig: string, context: string | undefined): TenantSnapshot => {
-    liveTenants ??= sharedTenantList(
-      // async, so an unusable kubeconfig rejects into each caller's error handling.
-      async (installation) => tenantListerFromKubeconfig(kubeconfig, context)(installation),
-      scope,
-    );
-    return liveTenants;
-  };
+  const tenantSnapshot: pulumi.Output<TenantSnapshot> | undefined =
+    adminKubeconfig === undefined
+      ? undefined
+      : pulumi.all([adminKubeconfig, args.kubeContext]).apply(([kubeconfig, context]) =>
+          sharedTenantList(
+            // async, so an unusable kubeconfig rejects into each caller's error handling.
+            async (installation) => tenantListerFromKubeconfig(kubeconfig, context)(installation),
+            scope,
+          ),
+        );
 
   // A removed tenant's runtime namespace stays watched while Pulumi deletes its Tenant, which it
   // does after this Helm update (#227).
@@ -360,14 +361,10 @@ export function createPlatform(args: PlatformArgs) {
       log: { info: (m) => pulumi.log.info(m), warn: (m) => pulumi.log.warn(m) },
     });
   const watchedNamespaces: pulumi.Input<string[]> =
-    kubeconfigAccess === undefined
+    tenantSnapshot === undefined
       ? resolveHostNamespaces()
       : // The namespace list is not secret, though the kubeconfig it was read with is.
-        pulumi.unsecret(
-          kubeconfigAccess.apply(([kubeconfig, context]) =>
-            resolveHostNamespaces(tenantSnapshot(kubeconfig, context)),
-          ),
-        );
+        pulumi.unsecret(tenantSnapshot.apply(resolveHostNamespaces));
 
   const wasmcloud = new k8s.helm.v3.Release(
     'wasmcloud',
@@ -502,12 +499,10 @@ export function createPlatform(args: PlatformArgs) {
   // Warn before Pulumi deletes a Tenant that has no entry and whose live policy is Retain (#228).
   // Skipped without `kubeconfig`: the program has no way to read the cluster then. Reads the
   // same Tenant list as the watched namespaces (#245).
-  const removalNotice = kubeconfigAccess?.apply(([kubeconfig, context]) =>
+  const removalNotice = tenantSnapshot?.apply((list) =>
     warnRemovedTenants({
-      installation: scope,
       declared: declared.tenants.map((t) => t.name),
-      // The shared list is already for this installation.
-      list: tenantSnapshot(kubeconfig, context),
+      list,
       warn: (message) => pulumi.log.warn(message),
       debug: (message) => pulumi.log.debug(message),
     }),

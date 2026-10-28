@@ -191,7 +191,6 @@ test('the Tenant list is read once per run and shared by both callers (#245)', a
   const [namespaces, notices] = await Promise.all([
     operatorHostNamespaces(args({ tenants }, log)),
     warnRemovedTenants({
-      installation: 'di-test',
       declared: ['alpha'],
       list: tenants,
       warn: (m) => warnings.push(m),
@@ -222,7 +221,6 @@ test('a shared list failure keeps how each caller handles it: up fails, the Reta
   const { log } = recorder();
   const debug: string[] = [];
   const notices = await warnRemovedTenants({
-    installation: 'di-test',
     declared: ['alpha'],
     list: tenants,
     warn: () => {},
@@ -254,7 +252,7 @@ test('a transient failure is retried once for both callers, not per caller (#245
   const { log } = recorder();
   const [hostNamespaces, notices] = await Promise.allSettled([
     operatorHostNamespaces(args({ tenants }, log)),
-    warnRemovedTenants({ installation: 'di-test', declared: [], list: tenants, warn: () => {} }),
+    warnRemovedTenants({ declared: [], list: tenants, warn: () => {} }),
   ]);
   expect(hostNamespaces.status).toBe('rejected');
   expect(notices).toEqual({ status: 'fulfilled', value: [] });
