@@ -1432,7 +1432,7 @@ script is removed:
 
 ```yaml
 tenantAuth:
-  image: ghcr.io/di-framework/tenant-auth@sha256:ede9577238b304dc87a19cf69bd20bfc00889116b17da12c2e98e2c97657a715   # required, pinned by digest
+  image: ghcr.io/di-framework/tenant-auth@sha256:a7c29cd6e9878232315b8fca06ab751758248b64838c180c9901a0a7a4e45ec0   # required, pinned by digest
   issuer: http://identity.acme.localhost:28180               # identity-server, as pods and browsers name it
   oauthClient: { id: access, secretName: tenant-auth-oauth } # Secret in the platform namespace; key `clientSecret`
   issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80  # optional, for a loopback issuer
