@@ -186,16 +186,25 @@ describe('Retain removal warning (#228)', () => {
   it('takes the live policy, not the declaration', async () => {
     const warned: string[] = [];
     await warnRemovedTenants({
-      installation: 'inst',
       declared: [],
-      list: async (installation) => {
-        expect(installation).toBe('inst');
-        return [live('alpha', 'Retain'), live('beta', 'Delete')];
-      },
+      list: async () => [live('alpha', 'Retain'), live('beta', 'Delete')],
       warn: (m) => warned.push(m),
     });
     expect(warned).toHaveLength(1);
     expect(warned[0]).toContain('di-tenant-alpha');
+  });
+  it("reads the run's Tenant snapshot without passing it arguments (#245)", async () => {
+    // The snapshot is already scoped to one installation, so the check must not hand it one.
+    const calls: unknown[][] = [];
+    await warnRemovedTenants({
+      declared: [],
+      list: async (...args: unknown[]) => {
+        calls.push(args);
+        return [];
+      },
+      warn: () => {},
+    });
+    expect(calls.map((a) => a.length)).toEqual([0]);
   });
   it('warns during preview too, and never fails when the cluster cannot be read', async () => {
     const prior = pulumi.runtime.isDryRun;
@@ -204,7 +213,6 @@ describe('Retain removal warning (#228)', () => {
       (pulumi.runtime as { isDryRun: () => boolean }).isDryRun = () => true;
       expect(
         await warnRemovedTenants({
-          installation: 'inst',
           declared: [],
           list: async () => [live('alpha')],
           warn: () => {},
@@ -215,7 +223,6 @@ describe('Retain removal warning (#228)', () => {
     }
     expect(
       await warnRemovedTenants({
-        installation: 'inst',
         declared: [],
         list: async () => {
           throw new Error('no CRD');
