@@ -204,7 +204,7 @@ TENANT_CONTROLLER_TLS_CERT=controller.crt TENANT_CONTROLLER_TLS_KEY=controller.k
 
 # console
 TENANT_CONSOLE_TENANT=acme TENANT_CONSOLE_CLIENT_ID=tenant-auth TENANT_CONSOLE_CLIENT_SECRET=… \
-TENANT_CONSOLE_CONTROLLER_URL=https://127.0.0.1:8788 TENANT_CONSOLE_CONTROLLER_CA=controller.crt bun src/console.ts
+TENANT_CONSOLE_CONTROLLER_URL=https://localhost:8788 TENANT_CONSOLE_CONTROLLER_CA=controller.crt bun src/console.ts
 ```
 
 `bun run start` runs the controller and `bun run start:console` the console.
@@ -223,7 +223,7 @@ renaming or removing one is a breaking change.
 | `TENANT_CONTROLLER_TOKEN_TTL` | `3600` | Lifetime of the ServiceAccount tokens it forwards with |
 | `TENANT_CONTROLLER_CLI_CLIENT_ID` | `tenant-cli` | The identity server's public native client that `GET /v1/auth/info` names for the tenant CLI |
 | `TENANT_CONSOLE_CLIENT_ID`, `_CLIENT_SECRET` | `tenant-auth`, required | The console's confidential OAuth client |
-| `TENANT_CONSOLE_CONTROLLER_URL`, `_CONTROLLER_CA` | `https://127.0.0.1:8788` | How the console reaches the controller |
+| `TENANT_CONSOLE_CONTROLLER_URL`, `_CONTROLLER_CA` | `https://localhost:8788` | How the console reaches the controller |
 | `TENANT_CONSOLE_CONTROLLER_PUBLIC_URL` | `TENANT_CONSOLE_CONTROLLER_URL` | Controller URL the console shows to users and CLIs |
 | `KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT_HTTPS` | set by Kubernetes, `443` | In-cluster API server when no kubeconfig is given |
 | `TENANT_CONTROLLER_HOST`, `TENANT_CONTROLLER_PORT` | `127.0.0.1`, `8788` | Controller listen address |
