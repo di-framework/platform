@@ -342,6 +342,59 @@ describe('requirePgpCfbFix', () => {
     expect(() => requirePgpCfbFix(twice)).toThrow(missing);
   });
 
+  test('refuses a second, unchecked encrypt call written with a space before its parenthesis', () => {
+    const loop = '\twhile (len > 0 && ctx->pos > 0)\n';
+    const spaced = editedPgpCfb(
+      loop,
+      `\tpx_cipher_encrypt (ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, NULL);\n\n${loop}`,
+    );
+    expect(() => requirePgpCfbFix(spaced)).toThrow('1 of 2 px_cipher_encrypt calls recognised');
+  });
+
+  test('refuses a pgp_cfb_encrypt with an earlier cfb_process call that ignores failures', () => {
+    const mix = '\tmix_data_t\tmix = ctx->resync ? mix_encrypt_resync : mix_encrypt_normal;\n';
+    const early = editedPgpCfb(
+      mix,
+      `${mix}\n\tif (ctx->resync)\n\t\treturn cfb_process(ctx, data, len, dst, mix, 1);\n`,
+    );
+    expect(() => requirePgpCfbFix(early)).toThrow(
+      'pgp_cfb_encrypt may ignore cipher failures (PostgreSQL 17.11, CVE-2026-14663)',
+    );
+  });
+
+  test('accepts the fix with CRLF line endings', () => {
+    expect(() => requirePgpCfbFix(UPSTREAM_PGP_CFB.replace(/\n/g, '\r\n'))).not.toThrow();
+  });
+
+  test('accepts the fix re-indented with spaces', () => {
+    expect(() => requirePgpCfbFix(UPSTREAM_PGP_CFB.replace(/\t/g, '    '))).not.toThrow();
+  });
+
+  test('accepts // and /* */ comments between the encrypt call and its error check', () => {
+    const commented = editedPgpCfb(
+      PGP_CFB_ERROR_CHECK,
+      `\t\t// keep the result\n\t\t/* and check it */\n${PGP_CFB_ERROR_CHECK}`,
+    );
+    expect(() => requirePgpCfbFix(commented)).not.toThrow();
+  });
+
+  test('does not count an encrypt call that only appears in a comment', () => {
+    const noted = editedPgpCfb(
+      PGP_CFB_ERROR_CHECK,
+      `\t\t// px_cipher_encrypt(ctx->ciph, ...) result is checked below\n${PGP_CFB_ERROR_CHECK}`,
+    );
+    expect(() => requirePgpCfbFix(noted)).not.toThrow();
+  });
+
+  test('names what to inspect when the expected pattern is not recognised', () => {
+    expect(() => requirePgpCfbFix(UNFIXED_PGP_CFB)).toThrow(
+      'not in the expected pattern (0 of 1 px_cipher_encrypt calls recognised as checked)',
+    );
+    expect(() => requirePgpCfbFix(UNFIXED_PGP_CFB)).toThrow(
+      'inspect cfb_process and pgp_cfb_encrypt in contrib/pgcrypto/pgp-cfb.c',
+    );
+  });
+
   test('refuses a base whose encrypt path may ignore cipher failures', () => {
     const ignoring = editedPgpCfb(
       '0 /* never ignore cipher failures for encrypt */ );',

@@ -256,39 +256,51 @@ export function patchDlfcn(text: string): string {
  * The fix has three parts, and a base must carry all of them:
  * - cfb_process keeps px_cipher_encrypt's result (PGP_CFB_ENCRYPT_CALL),
  * - then raises an ERROR on it unless failures are ignored (PGP_CFB_ERROR_CHECK),
- *   with nothing but comments in between,
- * - and pgp_cfb_encrypt never ignores them (passes 0 as ignore_cipher_failure).
+ *   with nothing but whitespace and comments in between,
+ * - and pgp_cfb_encrypt never ignores them (every cfb_process call in it
+ *   passes 0 as ignore_cipher_failure).
+ * Line endings, indentation and comments do not matter to the check.
  */
 export const PGP_CFB_ENCRYPT_CALL =
   '\t\terr = px_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);\n';
 export const PGP_CFB_ERROR_CHECK = '\t\tif (err && !ignore_cipher_failure)\n\t\t\tereport(ERROR,\n';
 
-const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/** C source without comments, so annotations cannot hide or fake code. */
+const stripCComments = (text: string): string => text.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, ' ');
 
-/** The encrypt call followed by its error check; only whitespace and comments may sit between. */
-const PGP_CFB_CHECKED_CALL = new RegExp(
-  `${escapeRegExp(PGP_CFB_ENCRYPT_CALL)}(?:\\s|/\\*[\\s\\S]*?\\*/)*${escapeRegExp(PGP_CFB_ERROR_CHECK)}`,
-  'g',
-);
+/** C source without comments or any whitespace (CRLF, indentation), for layout-independent matching. */
+const compactC = (text: string): string => stripCComments(text).replace(/\s+/g, '');
 
-/** pgp_cfb_encrypt hands cfb_process 0 as its last (ignore_cipher_failure) argument. */
-const PGP_CFB_ENCRYPT_NEVER_IGNORES =
-  /\npgp_cfb_encrypt\([^)]*\)\s*\{[^}]*\breturn cfb_process\([^;]*,\s*0\s*(?:\/\*[^*]*\*\/\s*)?\)\s*;/;
+/** The encrypt call directly followed by its error check, in compact form. */
+const PGP_CFB_CHECKED_CALL = compactC(PGP_CFB_ENCRYPT_CALL + PGP_CFB_ERROR_CHECK);
+
+/** pgp_cfb_encrypt's body, in compact form. */
+const PGP_CFB_ENCRYPT_BODY = /pgp_cfb_encrypt\([^)]*\)\{([^}]*)\}/;
+
+const PGP_CFB_INSPECT =
+  'inspect cfb_process and pgp_cfb_encrypt in contrib/pgcrypto/pgp-cfb.c, and update requirePgpCfbFix ' +
+  '(platform/pglite-component/scripts/patch-engine-source.ts) if upstream only changed their form';
 
 /** Fail unless pgcrypto's PGP CFB mode raises an ERROR when encryption fails (see above). */
 export function requirePgpCfbFix(text: string): void {
-  const calls = text.split('px_cipher_encrypt(').length - 1;
-  const checked = text.match(PGP_CFB_CHECKED_CALL)?.length ?? 0;
+  const calls = stripCComments(text).match(/\bpx_cipher_encrypt\s*\(/g)?.length ?? 0;
+  const compact = compactC(text);
+  const checked = compact.split(PGP_CFB_CHECKED_CALL).length - 1;
   if (calls === 0 || checked !== calls) {
     throw new Error(
-      'pgp-cfb.c: the PGP CFB cipher error check (PostgreSQL 17.11, CVE-2026-14663) is missing; ' +
-        'Blowfish and CAST5 would encrypt to plaintext',
+      'pgp-cfb.c: the PGP CFB cipher error check (PostgreSQL 17.11, CVE-2026-14663) is missing ' +
+        `or not in the expected pattern (${checked} of ${calls} px_cipher_encrypt calls recognised as checked); ` +
+        `Blowfish and CAST5 would encrypt to plaintext; ${PGP_CFB_INSPECT}`,
     );
   }
-  if (!PGP_CFB_ENCRYPT_NEVER_IGNORES.test(text)) {
+  const body = compact.match(PGP_CFB_ENCRYPT_BODY)?.[1] ?? '';
+  // No \b: compacting joins `return` and `cfb_process`.
+  const processCalls = body.match(/cfb_process\([^;]*\)/g) ?? [];
+  if (processCalls.length === 0 || !processCalls.every((call) => call.endsWith(',0)'))) {
     throw new Error(
-      'pgp-cfb.c: pgp_cfb_encrypt may ignore cipher failures (PostgreSQL 17.11, CVE-2026-14663); ' +
-        'Blowfish and CAST5 would encrypt to plaintext',
+      'pgp-cfb.c: pgp_cfb_encrypt may ignore cipher failures (PostgreSQL 17.11, CVE-2026-14663): ' +
+        'every cfb_process call in it must pass 0 as ignore_cipher_failure; ' +
+        `Blowfish and CAST5 would encrypt to plaintext; ${PGP_CFB_INSPECT}`,
     );
   }
 }
