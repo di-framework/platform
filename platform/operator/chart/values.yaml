@@ -3,7 +3,8 @@ image:
   # The operator image is always pulled by digest, never by tag. The operator image pin PR (#271,
   # scripts/pin-artifact.ts) rewrites this line with the digest each publish produced. Override it
   # at install time with --set image.digest=sha256:<64 hex>. The chart refuses to render anything
-  # else, and the release workflow skips publishing the chart (with a warning) unless it is pinned.
+  # else. A published chart N carries instead the digest of release N's own image, which bakes
+  # @di-framework/platform N (release.yml sets this line when it packages the chart, #431).
   digest: sha256:0e5e223ba7332670e203072080fcf584d08b696f7f214c6a3a0826900dd9c7d7
   pullPolicy: IfNotPresent
 imagePullSecrets: []
@@ -25,7 +26,8 @@ installTimeout: 30m
 repairInterval: 30m
 # How often a target that is still coming up is checked.
 targetPoll: 10s
-# Instances reconciled in parallel. Each install runs `npm install` and Pulumi in the operator pod.
+# Instances reconciled in parallel. Each install runs Pulumi in the operator pod, and `npm install`
+# unless the instance is at the image's default platform version (see the operator README).
 maxConcurrentInstalls: 2
 # Where the operator runs the Jobs that remove a deleted instance's default storageRoot
 # (--cleanup-namespace, from #426). Empty (the default) passes no flag and the operator uses its own
@@ -37,7 +39,8 @@ extraArgs: []
 
 # There are no values for the vCluster chart version, the vCluster values or a default platform
 # version: the operator embeds the digest-checked vCluster chart and its KubeSolo defaults, and each
-# PlatformInstance names its own spec.version. They change with the operator image.
+# PlatformInstance names its own spec.version. The image bakes one platform version, its default, which
+# installs without npm or the Pulumi plugin host. They change with the operator image.
 
 # The operator's Pulumi state: per instance, the install project and a file backend. Losing it
 # means Pulumi forgets what it installed, so the claim is kept on `helm uninstall`

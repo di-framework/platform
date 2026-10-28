@@ -51,6 +51,8 @@ func run() error {
 		stateDir        = flag.String("state-dir", "/var/lib/platform-operator", "directory (the operator's PVC) for per-instance install projects and state")
 		passphraseFile  = flag.String("passphrase-file", "/etc/platform-operator/passphrase", "file holding the passphrase that encrypts install state secrets")
 		npm             = flag.String("npm", installer.DefaultNPM, "absolute path of npm")
+		bakedProject    = flag.String("baked-project", installer.DefaultBakedProject, "install project the image baked for the default platform version; an instance at that version installs from it without npm")
+		bakedPlugins    = flag.String("baked-plugins", installer.DefaultBakedPlugins, "Pulumi plugins the image baked, linked into Pulumi's plugin cache")
 		storageRootBase = flag.String("storage-root-base", "/var/lib/kubesolo/instances", "node directory under which each instance gets its own storageRoot")
 		cleanupNS       = flag.String("cleanup-namespace", "", "namespace for the Jobs that remove a deleted instance's default storageRoot (default: the operator's own namespace)")
 		repairInterval  = flag.Duration("repair-interval", 30*time.Minute, "how often a ready instance gets a refresh and up to repair drift")
@@ -118,6 +120,7 @@ func run() error {
 	}
 	operatorUser := review.Status.UserInfo.Username
 	slog.Info("operator user, allowed to delete service/vcluster", "username", operatorUser)
+	slog.Info("default platform version, installed from the image without npm", "version", installer.DefaultVersion, "bakedProject", *bakedProject)
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: *metricsAddr},
@@ -157,10 +160,12 @@ func run() error {
 		},
 		Recorder: mgr.GetEventRecorder("platform-operator"),
 		Installer: &installer.Pulumi{
-			StateDir:   *stateDir,
-			Passphrase: strings.TrimSpace(string(passphrase)),
-			Log:        os.Stderr,
-			NPM:        *npm,
+			StateDir:     *stateDir,
+			Passphrase:   strings.TrimSpace(string(passphrase)),
+			Log:          os.Stderr,
+			NPM:          *npm,
+			BakedProject: *bakedProject,
+			BakedPlugins: *bakedPlugins,
 		},
 		Plan:             plan.Config{RepairInterval: *repairInterval, TargetPoll: *targetPoll},
 		StorageRootBase:  *storageRootBase,

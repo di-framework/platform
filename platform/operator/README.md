@@ -434,8 +434,43 @@ ghcr.io/di-framework/platform-operator@sha256:0e5e223ba7332670e203072080fcf584d0
 ```
 
 Each publish is also tagged with its commit SHA and `src-<hash>` (the hash of its inputs); only the digest is
-immutable. The image doesn't yet carry the pinned `@di-framework/platform` package or the Pulumi Kubernetes
-provider plugin, so each instance's first install downloads both. Baking them in is tracked in #431.
+immutable. Each release builds its own image (see [Default platform version](#default-platform-version)),
+tagged `v<version>`; the published chart of that version pins it by digest.
+
+### Default platform version
+
+The image also bakes one install project: `@di-framework/platform` at the operator's **default platform
+version** with its dependencies, and the Pulumi resource plugins those need (`kubernetes` and `command`), so an
+instance at that version installs with neither npm nor the Pulumi plugin host reachable (#431). The version is
+the `@di-framework/platform` pin in
+[`internal/installer/project/package.json`](internal/installer/project/package.json); the operator logs it at
+startup (`default platform version`). `spec.version` stays required: the default is only the version that
+installs without egress.
+
+- The operator embeds that `package.json`, and the image installs it with `npm ci` against the committed
+  `package-lock.json` (every package checked against its integrity, install scripts skipped) at
+  `/opt/platform-operator/project` (`--baked-project`). Every instance's `package.json` is the same file with
+  the platform set to its `spec.version`, so the baked project is used only when the dependencies match
+  exactly.
+- The plugins are listed with their sha256 in `internal/installer/project/plugins.txt`, downloaded from
+  get.pulumi.com at build time, checked, and baked at `/opt/platform-operator/pulumi-plugins`
+  (`--baked-plugins`). The build fails when a `@pulumi/*` provider package in the lockfile has no plugin
+  there. Before each Pulumi operation the installer links them into Pulumi's plugin cache
+  (`$PULUMI_HOME/plugins`, under `/home/node` in the chart), which stays writable for other versions.
+- An instance at the default version gets a copy of the baked `node_modules` in its project on the state
+  volume; any other version runs `npm install` there, as before, and Pulumi downloads the plugins it lacks.
+- **Release N bakes N.** The operator chart published with release N (`oci://ghcr.io/di-framework/charts/platform-operator`
+  at version N) runs an image whose default platform version is `@di-framework/platform` N, the same version as
+  the chart, the Headlamp plugin and the npm packages of that release. An instance at N installs offline; an
+  instance at any other version runs `npm install`. `release.yml` does this after it has published N to npm: it
+  pins the project to exactly N (`bun scripts/operator-project.ts bump N`, which rewrites the lockfile and
+  `plugins.txt`), builds the image from the tag's source with only that change (the binary is compiled in the
+  same build, so it embeds the `package.json` it bakes), checks that the image bakes N, tags the index `vN`,
+  and packages chart N with that image's digest instead of the one in `chart/values.yaml`.
+- The same release opens the bot PR `chore(operator): bake @di-framework/platform N` (branch
+  `bot/operator-project`), which moves main's pin to N. Once it merges, the next image from main (and its pin
+  PR, which updates `chart/values.yaml` and the reference above) bakes N too. Until then main's images bake the
+  previous release.
 
 The first publish creates the `platform-operator` GHCR package as private. An org admin must make it public
 once (Package settings, then Change visibility), because Layer 4 (#274) pulls the image anonymously.
@@ -449,8 +484,9 @@ The operator needs:
   narrowing the chart's needs is follow-up work.
 - **a host policy engine.** Instances run with `networkPolicyEngine: existing`, so the host cluster must enforce
   NetworkPolicy (see [Network policy engine](#network-policy-engine)).
-- **egress to npm, the Pulumi plugin host and the platform's images**, since each install runs `npm install`
-  and fetches the Pulumi Kubernetes provider plugin.
+- **egress to the platform's images.** An instance at the [default platform version](#default-platform-version)
+  needs nothing else; one at any other version also needs npm (each install runs `npm install`) and the Pulumi
+  plugin host (get.pulumi.com or the providers' GitHub releases) for the provider plugins its packages need.
 - **its own namespace**, which every instance host namespace admits to the vCluster API (see
   [Host-namespace isolation](#host-namespace-isolation)): read from its service account, or
   `--cleanup-namespace` when run outside a cluster.

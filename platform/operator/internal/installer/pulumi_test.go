@@ -82,8 +82,13 @@ func (f *fakeStack) Remove(context.Context) error { return f.next("remove") }
 func newTestPulumi(t *testing.T, s *fakeStack) (*Pulumi, *int) {
 	t.Helper()
 	npm := 0
+	none := filepath.Join(t.TempDir(), "not-baked")
+	cache := t.TempDir()
 	return &Pulumi{
-		StateDir: t.TempDir(),
+		StateDir:     t.TempDir(),
+		BakedProject: none,
+		BakedPlugins: none,
+		pluginCache:  func() (string, error) { return cache, nil },
 		npmInstall: func(_ context.Context, dir string) error {
 			npm++
 			pkg := filepath.Join(dir, "node_modules", "@di-framework", "platform")
