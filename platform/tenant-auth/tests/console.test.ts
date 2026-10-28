@@ -306,8 +306,8 @@ describe('configFromEnv', () => {
       configFromEnv({ TENANT_CONSOLE_TENANT: 'acme', TENANT_CONSOLE_CLIENT_SECRET: 's' }),
     ).toEqual({
       tenant: 'acme',
-      controllerUrl: 'https://127.0.0.1:8788',
-      controllerPublicUrl: 'https://127.0.0.1:8788',
+      controllerUrl: 'https://localhost:8788',
+      controllerPublicUrl: 'https://localhost:8788',
       controllerCa: undefined,
       issuer: 'http://localhost:4180',
       clientId: 'tenant-auth',
@@ -316,6 +316,16 @@ describe('configFromEnv', () => {
       port: 8787,
       publicUrl: 'http://127.0.0.1:8787',
     });
+  });
+  test('defaults the controller URLs to localhost, which the IP-free controller CA can name (#381)', () => {
+    const loaded = configFromEnv({
+      TENANT_CONSOLE_TENANT: 'acme',
+      TENANT_CONSOLE_CLIENT_SECRET: 's',
+    });
+    for (const url of [loaded.controllerUrl, loaded.controllerPublicUrl]) {
+      expect(new URL(url).hostname).toBe('localhost');
+      expect(url).not.toMatch(/\d+\.\d+\.\d+\.\d+|\[/);
+    }
   });
   test('reads overrides and the controller CA file', () => {
     const dir = mkdtempSync(join(tmpdir(), 'console-ca-'));

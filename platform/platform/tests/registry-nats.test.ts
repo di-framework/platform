@@ -419,10 +419,11 @@ describe('registry NATS account rendering (#159)', () => {
     expect((container as unknown as { resources: { limits: unknown } }).resources.limits).toEqual(
       REGISTRY_NATS_MIGRATION_LIMITS,
     );
-    // The /tmp volume must be writable by uid 65532 for the nats CLI and script temp files.
+    // The /tmp volume must be writable by uid 65532 for the nats CLI and script temp files: an
+    // emptyDir (world-writable), not a path from the image or the node.
     expect(
       (pod.spec.volumes as unknown as Array<{ name: string }>).find((v) => v.name === 'tmp'),
-    ).toBeDefined();
+    ).toMatchObject({ name: 'tmp', emptyDir: {} });
     expect(
       (
         container?.volumeMounts as unknown as Array<{

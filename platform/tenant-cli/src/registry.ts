@@ -148,7 +148,7 @@ function writeConfig(path: string, config: DockerConfig): void {
 /**
  * The sha256 of an `auths` entry as JSON: recorded with the account at `registry login`, so a
  * logout only removes the entry while it is still the one this CLI wrote. Docker keys entries by
- * host alone, and tenants often share one (`127.0.0.1:<port>`), so another account's login or a
+ * host alone, and tenants often share one (`localhost:<port>`), so another account's login or a
  * manual `docker login` may have replaced it since.
  */
 export function entryFingerprint(entry: unknown): string {
