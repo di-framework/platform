@@ -740,6 +740,35 @@ describe('reconcile', () => {
       }),
     );
     expect(JSON.stringify(failedRestore)).toContain('RestoreFailed');
+    // An unreachable target keeps its own reason, and the message carries the tool's line (#398).
+    const unreachable = reconcile(
+      world({
+        restores: [{ name: 'r', sourceBackupName: 'b', targetServiceName: 'cache' }],
+        jobs: [
+          {
+            name: 'probe-failed',
+            backupKind: 'restore',
+            serviceName: 'cache',
+            phase: 'Failed',
+            backupName: 'r',
+            message: JSON.stringify({
+              ok: false,
+              error: 'TargetUnreachable',
+              detail: 'Could not connect to Redis',
+            }),
+          },
+        ],
+      }),
+    );
+    expect(unreachable).toContainEqual({
+      type: 'restore-status',
+      name: 'r',
+      status: {
+        phase: 'Failed',
+        reason: 'TargetUnreachable',
+        message: 'TargetUnreachable: Could not connect to Redis',
+      },
+    });
     const failures = Array.from({ length: 6 }, (_, index) => ({
       name: `f${index}`,
       serviceName: 'orders',

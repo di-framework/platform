@@ -100,6 +100,14 @@ function fsTools(files: Map<string, Uint8Array>) {
   };
 }
 
+/** Connection retries wait without sleeping. Call `mockRestore()` on the result when done. */
+function instantTimers() {
+  return spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void) => {
+    queueMicrotask(handler);
+    return 0;
+  }) as unknown as typeof setTimeout);
+}
+
 function wrote(files: Map<string, Uint8Array>, path: string): string {
   return Buffer.from(files.get(path) ?? []).toString('utf8');
 }
@@ -217,10 +225,7 @@ describe('backup-agent kinds', () => {
 
   test('probes, nats dumps and restores retry a connection the policy has not admitted yet', async () => {
     // A new pod's first connections are refused until its network policy is programmed (#388).
-    const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void) => {
-      queueMicrotask(handler);
-      return 0;
-    }) as unknown as typeof setTimeout);
+    const timer = instantTimers();
     const archive = (files: Map<string, Uint8Array>, argv: string[]) => {
       if (argv[0] === 'tar' && argv.includes('-cf')) {
         files.set(argv[argv.indexOf('-cf') + 1] ?? '', Buffer.from('tar-bytes'));
@@ -508,6 +513,84 @@ describe('backup-agent kinds', () => {
     const missing = harness(() => ({ code: 1, stdout: '', stderr: 'missing' }));
     expect(await runAgent(request({ kind: 'restore-postgres' }), missing.io)).toBe(1);
     expect(wrote(missing.files, '/work/termination')).toContain('DownloadFailed');
+  });
+
+  test('an unreachable restore target is TargetUnreachable, not RestoreFailed (#398)', async () => {
+    const restores = [
+      {
+        kind: 'restore-postgres',
+        port: '5432',
+        probe: (argv: string[]) => argv[0] === 'psql',
+        restore: (argv: string[]) => argv[0] === 'pg_restore',
+      },
+      {
+        kind: 'restore-redis',
+        port: '6379',
+        probe: (argv: string[]) => argv.includes('PING'),
+        restore: (argv: string[]) => argv.includes('--pipe'),
+      },
+      {
+        kind: 'restore-nats',
+        port: '4222',
+        probe: (argv: string[]) => argv.includes('info'),
+        restore: (argv: string[]) => argv.includes('restore'),
+      },
+    ] as const;
+    const termination = (files: Map<string, Uint8Array>) =>
+      JSON.parse(wrote(files, '/work/termination'));
+    for (const { kind, port, probe, restore } of restores) {
+      // The probe never got through: the target was not touched, and the tool says why.
+      const rejected = harness((argv) =>
+        probe(argv)
+          ? { code: 1, stdout: '', stderr: 'connecting\nFATAL: password authentication failed\n' }
+          : { code: 0, stdout: 'RESP', stderr: '' },
+      );
+      expect(await runAgent(request({ kind, port }), rejected.io)).toBe(1);
+      expect(rejected.calls.some((call) => restore(call.argv))).toBe(false);
+      expect(termination(rejected.files)).toEqual({
+        ok: false,
+        error: 'TargetUnreachable',
+        detail: 'FATAL: password authentication failed',
+      });
+
+      // The probe passed and the restore itself broke.
+      const broke = harness((argv) =>
+        restore(argv)
+          ? { code: 1, stdout: '', stderr: `${kind}: error: could not execute query` }
+          : { code: 0, stdout: 'RESP', stderr: '' },
+      );
+      expect(await runAgent(request({ kind, port }), broke.io)).toBe(1);
+      expect(termination(broke.files)).toEqual({
+        ok: false,
+        error: 'RestoreFailed',
+        detail: `${kind}: error: could not execute query`,
+      });
+    }
+
+    // redis-cli prints a refused connection on stdout; the detail is bounded.
+    const refused = harness((argv) =>
+      argv.includes('PING')
+        ? { code: 1, stdout: `Could not connect to Redis ${'x'.repeat(400)}`, stderr: '' }
+        : { code: 0, stdout: 'RESP', stderr: '' },
+    );
+    const timer = instantTimers();
+    try {
+      expect(await runAgent(request({ kind: 'restore-redis', port: '6379' }), refused.io)).toBe(1);
+    } finally {
+      timer.mockRestore();
+    }
+    expect(refused.calls.filter((call) => call.argv.includes('PING'))).toHaveLength(8);
+    const unreachable = termination(refused.files);
+    expect(unreachable.error).toBe('TargetUnreachable');
+    expect(unreachable.detail).toStartWith('Could not connect to Redis');
+    expect(unreachable.detail).toHaveLength(300);
+
+    // A failed RDB conversion never copies the converted data into the record.
+    const convert = harness((argv) =>
+      argv[0] === 'rdb' ? { code: 1, stdout: 'tenant-data', stderr: '' } : ok(),
+    );
+    expect(await runAgent(request({ kind: 'restore-redis', port: '6379' }), convert.io)).toBe(1);
+    expect(termination(convert.files)).toEqual({ ok: false, error: 'RestoreFailed' });
   });
 
   test('gc deletes listed keys and skips a blank list', async () => {

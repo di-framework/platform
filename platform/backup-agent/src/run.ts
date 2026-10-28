@@ -27,6 +27,8 @@ export interface Termination {
   tool?: string;
   format?: string;
   error?: string;
+  /** The failing tool's own output (its last line), so an operator sees why it failed. */
+  detail?: string;
   /** Workload volumes (#232). */
   fileCount?: number;
   encfsKcv?: string;
@@ -335,8 +337,39 @@ async function execConnected(
  * Restores are not idempotent (a rerun appends again), so they never go through `execConnected`:
  * a read-only probe waits for the connection, then the restore runs exactly once.
  */
-async function probeConnected(io: AgentIo, argv: string[]): Promise<boolean> {
-  return (await execConnected(io, argv)).code === 0;
+async function probeConnected(io: AgentIo, argv: string[]): Promise<ExecResult> {
+  return execConnected(io, argv);
+}
+
+const DETAIL_LIMIT = 300;
+
+function lastLine(text: string): string | undefined {
+  return text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .at(-1);
+}
+
+/**
+ * The last line the tool printed, bounded, for {@link Termination.detail}: stderr first, then
+ * stdout (redis-cli reports connection errors there).
+ */
+function toolDetail(result: Pick<ExecResult, 'stdout' | 'stderr'>): string | undefined {
+  return (lastLine(result.stderr) ?? lastLine(result.stdout))?.slice(0, DETAIL_LIMIT);
+}
+
+/**
+ * A restore step failed. `TargetUnreachable` means the read-only probe never got through, so the
+ * target was not touched; `RestoreFailed` means a restore step ran and failed (#398).
+ */
+function restoreError(
+  io: AgentIo,
+  request: AgentRequest,
+  error: 'TargetUnreachable' | 'RestoreFailed',
+  result: ExecResult,
+): Promise<number> {
+  return finish(io, request.terminationLog, { ok: false, error, detail: toolDetail(result) });
 }
 
 async function dumpPostgres(io: AgentIo, request: AgentRequest): Promise<number> {
@@ -533,7 +566,7 @@ async function restorePostgres(io: AgentIo, request: AgentRequest): Promise<numb
   const file = `${request.workdir}/data.dump`;
   const failed = await download(io, request, 'data.dump', file);
   if (failed !== undefined) return failed;
-  const reachable = await probeConnected(io, [
+  const probe = await probeConnected(io, [
     'psql',
     '-h',
     request.host,
@@ -546,7 +579,7 @@ async function restorePostgres(io: AgentIo, request: AgentRequest): Promise<numb
     '-c',
     'SELECT 1',
   ]);
-  if (!reachable) return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  if (probe.code !== 0) return restoreError(io, request, 'TargetUnreachable', probe);
   const result = await io.exec([
     'pg_restore',
     '-h',
@@ -561,8 +594,7 @@ async function restorePostgres(io: AgentIo, request: AgentRequest): Promise<numb
     '--no-acl',
     file,
   ]);
-  if (result.code !== 0)
-    return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  if (result.code !== 0) return restoreError(io, request, 'RestoreFailed', result);
   return finish(io, request.terminationLog, { ok: true, tool: 'pg_restore', format: 'custom' });
 }
 
@@ -572,11 +604,12 @@ async function restoreRedis(io: AgentIo, request: AgentRequest): Promise<number>
   const failed = await download(io, request, 'dump.rdb', rdb);
   if (failed !== undefined) return failed;
   const converted = await io.exec(['rdb', '--command', 'protocol', rdb]);
+  // Only stderr: rdb's stdout is the converted data.
   if (converted.code !== 0)
-    return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+    return restoreError(io, request, 'RestoreFailed', { ...converted, stdout: '' });
   await io.writeFile(resp, converted.stdout);
   await io.remove(rdb);
-  const reachable = await probeConnected(io, [
+  const probe = await probeConnected(io, [
     'redis-cli',
     '-h',
     request.host,
@@ -584,12 +617,11 @@ async function restoreRedis(io: AgentIo, request: AgentRequest): Promise<number>
     request.port,
     'PING',
   ]);
-  if (!reachable) return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  if (probe.code !== 0) return restoreError(io, request, 'TargetUnreachable', probe);
   const loaded = await io.exec(['redis-cli', '-h', request.host, '-p', request.port, '--pipe'], {
     input: converted.stdout,
   });
-  if (loaded.code !== 0)
-    return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  if (loaded.code !== 0) return restoreError(io, request, 'RestoreFailed', loaded);
   return finish(io, request.terminationLog, { ok: true, tool: 'redis-cli', format: 'resp' });
 }
 
@@ -598,12 +630,11 @@ async function restoreNats(io: AgentIo, request: AgentRequest): Promise<number> 
   const failed = await download(io, request, 'js-backup.tar', archive);
   if (failed !== undefined) return failed;
   const extracted = await io.exec(['tar', '-C', request.workdir, '-xf', archive]);
-  if (extracted.code !== 0)
-    return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  if (extracted.code !== 0) return restoreError(io, request, 'RestoreFailed', extracted);
   await io.remove(archive);
   const server = `${request.host}:${request.port}`;
-  const reachable = await probeConnected(io, ['nats', '--server', server, 'account', 'info']);
-  if (!reachable) return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  const probe = await probeConnected(io, ['nats', '--server', server, 'account', 'info']);
+  if (probe.code !== 0) return restoreError(io, request, 'TargetUnreachable', probe);
   const restored = await io.exec([
     'nats',
     '--server',
@@ -612,8 +643,7 @@ async function restoreNats(io: AgentIo, request: AgentRequest): Promise<number> 
     'restore',
     `${request.workdir}/js-backup`,
   ]);
-  if (restored.code !== 0)
-    return finish(io, request.terminationLog, { ok: false, error: 'RestoreFailed' });
+  if (restored.code !== 0) return restoreError(io, request, 'RestoreFailed', restored);
   return finish(io, request.terminationLog, { ok: true, tool: 'nats', format: 'account-backup' });
 }
 
