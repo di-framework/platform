@@ -183,7 +183,9 @@ Status carries `phase` (`Provisioning`, `Installing`, `Ready`, `Failed`, `Deleti
 `TargetReady` is `False` with `ControlPlanePending` (the vCluster StatefulSet isn't ready), `Repairing` (a
 missing release object is being recreated), `RolledBack` (a failed or interrupted repair was rolled back),
 `KubeconfigPending` (vCluster's kubeconfig Secret doesn't exist yet), `KubeconfigMissing` (the Secret
-existed and was deleted; a resync starts), `Resyncing` (see [Destructive operations](#destructive-operations))
+existed and was deleted; a resync starts), `HostNamespaceDeleted` (the host namespace is terminating or gone;
+a resync starts), `HostNamespaceTerminating` (the host namespace of an instance that never had a vCluster is
+terminating), `Resyncing` (see [Destructive operations](#destructive-operations))
 or `TargetUnreachable` (the Secret
 exists but the vCluster API, named in the message, failed 3 consecutive checks; a single failed check
 changes nothing). While the instance's kubeconfig Secret exists, `kubeconfigSecretRef` keeps pointing at it.
@@ -331,8 +333,28 @@ instance's `service/vcluster`: the synced pods, Services, ConfigMaps, Secrets (t
 Service makes the garbage collector delete all of them, vCluster then deletes the virtual copies of the
 Secrets and ConfigMaps, and `vc-vcluster` is only written again when the syncer restarts (#466).
 
-The way to remove `service/vcluster` is to delete the PlatformInstance (or, for an instance whose operator
-is gone, its host namespace). Don't delete the Service on its own.
+The way to remove `service/vcluster` is to delete the PlatformInstance. Don't delete the Service on its own.
+
+**Deleting an instance's host namespace** (`pi-<namespace>-<name>-<hash>`) deletes its vCluster and the
+vCluster's data. The operator treats it as a resync, like a deleted `service/vcluster` (#490). As soon as the
+namespace starts terminating (the operator watches its host namespaces), `TargetReady` and `Ready` turn
+`False` with reason `HostNamespaceDeleted`, a `Warning` Event of that reason is emitted, and the operator
+drops the install state of the lost vCluster (it holds the old cluster's credentials, against which every
+later install would fail). `status.target.resyncServiceUID` holds the marker `host-namespace-deleted` until
+the new vCluster has its `service/vcluster`. That reason is reported for the first round only: after it `Ready` is `False` with reason
+`TargetPending` and `TargetReady` is `False` with reason `Resyncing` while the namespace terminates and the
+operator creates the namespace and a new vCluster again. Once that vCluster has its `service/vcluster`, the
+resync goes on under that Service's uid (see [Resync when the policy was
+bypassed](#resync-when-the-policy-was-bypassed)); there is nothing to restart, since the new vCluster's
+syncer writes `vc-vcluster` when it first starts. Once the vCluster answers, the operator installs the
+platform again: `Installed` turns `True` with reason `Resync`, and the kubeconfig Secret holds the new
+vCluster's credentials. Workloads and data inside the old vCluster are not restored. Tenant data the platform
+keeps in node `hostPath`s under the instance's `storageRoot` is not removed by the namespace delete (see
+[Tenant data after Delete](#tenant-data-after-delete)). A namespace stuck terminating (a finalizer that never
+clears) is reported as `TargetReady=False/TargetUnreachable` once the resync has waited longer than the
+resync timeout (three repair intervals). A host namespace of an instance that never had a vCluster is only
+created again once it is gone (`TargetReady=False/HostNamespaceTerminating` meanwhile). To remove an
+instance, delete the PlatformInstance, not its namespace.
 
 ### The admission policy
 
@@ -368,7 +390,11 @@ differs on a later reconcile, or `vc-vcluster` is missing on an instance that ha
 1. re-applies the Helm release if the Service is gone (#453), and in the same round
 2. deletes `vcluster-0`, which its StatefulSet recreates, so the syncer writes `vc-vcluster` again and syncs
    back the virtual objects that still exist (`TargetReady=False/Resyncing`, or `KubeconfigMissing` for the
-   round that starts it; `status.target.resyncServiceUID` and `resyncStarted` describe the running resync);
+   round that starts it; `status.target.resyncServiceUID` and `resyncStarted` describe the running resync).
+   Before the delete it records the restart on the host namespace in the annotation
+   `platform.di-framework.dev/resync-restart` (`<service uid>/<pod uid>`, the pod part empty when there was no pod to delete), so a round whose status write
+   failed doesn't restart the pod a second time (#503). It removes the annotation once the status records
+   the resync or the restarted syncer has written `vc-vcluster`. Don't edit or remove it by hand;
 3. waits for the control plane, the Secret and the API, then runs the platform install at once (not at the
    next repair). First it runs `helm uninstall` inside the instance on the platform's Helm Release (the
    runtime-operator chart; name and namespace, `wasmcloud`, read from the install state; a release already
