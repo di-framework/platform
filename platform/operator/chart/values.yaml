@@ -5,7 +5,7 @@ image:
   # at install time with --set image.digest=sha256:<64 hex>. The chart refuses to render anything
   # else. A published chart N carries instead the digest of release N's own image, which bakes
   # @di-framework/platform N (release.yml sets this line when it packages the chart, #431).
-  digest: sha256:59fac428a73d7e3f6fd2c6c4a9b218e82c7db092ada7364e469fdb03a9c07efd
+  digest: sha256:7c5553ced76d281fa168d550a13301956f6fe6f7d7f3a225a0c38313ca9893b1
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
