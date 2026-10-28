@@ -2516,7 +2516,6 @@ describe('tenant registry (#83:reconcile)', () => {
     const controller = find(resources, 'Deployment', 'tenant-controller') as Deployment;
     expect(env(controller)).toMatchObject({
       TENANT_CONTROLLER_WHOAMI_PORT: '8789',
-      TENANT_CONTROLLER_WHOAMI_TLS_ONLY: 'true',
       TENANT_CONTROLLER_REGISTRY_FRONT_PORT: '8790',
       TENANT_CONTROLLER_REGISTRY_HOST: 'registry',
       TENANT_CONTROLLER_REGISTRY_URL: 'https://registry.alpha.localhost:28180',
@@ -2579,7 +2578,6 @@ describe('tenant registry (#83:reconcile)', () => {
     );
     expect(closed).toMatchObject({
       TENANT_CONTROLLER_WHOAMI_PORT: '8789',
-      TENANT_CONTROLLER_WHOAMI_TLS_ONLY: 'true',
       TENANT_CONTROLLER_REGISTRY_HOST: 'registry',
     });
     expect(closed).not.toHaveProperty('TENANT_CONTROLLER_REGISTRY_FRONT_PORT');
@@ -2667,7 +2665,7 @@ describe('tenant registry (#83:reconcile)', () => {
       expect(tenantControllerCertNames(name).dns).toContain(registryWhoamiHost(name));
   });
 
-  it('the rendered controller serves whoami over TLS only, with no plain-HTTP relay (#329)', async () => {
+  it('the rendered controller serves whoami over TLS only, with no plain-HTTP relay or flag (#113)', async () => {
     const rendered = env(
       find(
         tenantAuthResources(tenant(), registryCfg, { ...inputs, registryServing: true }),
@@ -2678,7 +2676,9 @@ describe('tenant registry (#83:reconcile)', () => {
     // The controller's own reading of the rendered env: only the bind address and port differ.
     const config = controllerConfigFromEnv({ ...rendered, TENANT_CONTROLLER_HOST: '127.0.0.1' });
     expect(config.whoamiPort).toBe(8789);
-    expect(config.whoamiTlsOnly).toBe(true);
+    // TLS is the only mode (#113 `:drop-relay`): no switch is rendered that could reopen plain HTTP.
+    expect(rendered).not.toHaveProperty('TENANT_CONTROLLER_WHOAMI_TLS_ONLY');
+    expect(config).not.toHaveProperty('whoamiTlsOnly');
     const name = registryWhoamiHost('alpha');
     const names = tenantControllerCertNames('alpha', withRegistry);
     const ca = caCertificate('tenant-controller CA (di-runtime-alpha)', 30);

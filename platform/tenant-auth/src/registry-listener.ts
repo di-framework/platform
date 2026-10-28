@@ -13,10 +13,10 @@
  * flow resets, a request body cap that also applies to chunked bodies (413), the client address,
  * and a request signal that aborts when the client goes away.
  *
- * The whoami listener uses it too (platform#113): over TLS, and for callers still configured with
- * an `http://` URL during an upgrade, over plain HTTP on the same port (`acceptPlainHttp`). The
- * relay that serves both passes the client's own address on to the handler, so the option is safe
- * on any listener that reads it.
+ * The whoami listener uses it too (platform#113), over TLS only: the plain-HTTP fallback it kept
+ * for registries still configured with `http://` is gone (platform#113 `:drop-relay`). Its
+ * request deadline runs through a relay that passes the client's own address on to the handler,
+ * so that is safe on any listener that reads it.
  */
 import {
   createServer as createHttpServer,
@@ -38,27 +38,19 @@ export interface RegistryListenerOptions {
   hostname: string;
   /** TCP port; 0 picks a free one (see {@link RegistryListener.port}). */
   port: number;
-  /** PEM certificate and key; plain HTTP without them. */
+  /** PEM certificate and key; plain HTTP without them. One protocol per listener, never both. */
   tls?: { cert: string; key: string };
   /**
-   * With `tls`, also answer plain-HTTP clients on the same port: a connection whose first byte
-   * opens a TLS handshake is served over TLS, any other over plain HTTP. Each protocol is served
-   * by its own listener on loopback; the handler still sees the client's own address, not the
-   * loopback hop's. Without `tls` it changes nothing.
-   */
-  acceptPlainHttp?: boolean;
-  /**
    * Most client connections held open at once; further ones are closed as they arrive. Unset: no
-   * limit. When relayed (`acceptPlainHttp`, `requestTimeoutSeconds`), each one holds three
-   * sockets (client, relay hop, and the inner listener's end of it), so this bounds three times as
-   * many descriptors.
+   * limit. When relayed (`requestTimeoutSeconds`), each one holds three sockets (client, relay
+   * hop, and the inner listener's end of it), so this bounds three times as many descriptors.
    */
   maxConnections?: number;
   /**
    * Once a client sends data, an answer has to start within this long or the connection is
    * closed, so a client trickling its request cannot hold a connection. Every request on a
-   * connection gets the same deadline. With it, every connection is relayed as with
-   * `acceptPlainHttp`: `node:http` under Bun does not enforce its own request timeouts. Unset:
+   * connection gets the same deadline. With it, every connection is relayed through a loopback
+   * listener: `node:http` under Bun does not enforce its own request timeouts. Unset:
    * only idleness ends a request, as long uploads need.
    */
   requestTimeoutSeconds?: number;
@@ -81,8 +73,7 @@ const NO_BODY = new Set([204, 205, 304]);
 export async function serveRegistryListener(
   options: RegistryListenerOptions,
 ): Promise<RegistryListener> {
-  if ((options.tls && options.acceptPlainHttp) || options.requestTimeoutSeconds !== undefined)
-    return serveRelayed(options);
+  if (options.requestTimeoutSeconds !== undefined) return serveRelayed(options);
   return serveSingle(options);
 }
 
@@ -93,8 +84,7 @@ const TLS_HANDSHAKE = 0x16;
 const CLOSE_GRACE_MS = 5_000;
 
 /**
- * The client address behind each relay hop to one inner listener, by the hop's local port. A
- * local port is unique only per destination, so each inner listener has its own table, and a
+ * The client address behind each relay hop to the inner listener, by the hop's local port. A
  * hop's release removes only its own entry: the port may already name a newer hop.
  */
 export class HopAddresses {
@@ -115,40 +105,31 @@ export class HopAddresses {
 }
 
 /**
- * Connections relayed, by their first byte, to a loopback listener for their protocol: TLS (with
- * `tls`) and plain HTTP (without `tls`, or with `acceptPlainHttp`). A first byte for a protocol
- * not served closes the connection. The relay is what bounds the client side: `maxConnections`,
- * the idle timeout, and `requestTimeoutSeconds`.
+ * Connections relayed to a loopback listener for the one protocol served: TLS with `tls`, plain
+ * HTTP without. A connection whose first byte is for the other protocol (a TLS handshake to a
+ * plain listener, anything else to a TLS one) is closed without reaching the handler. The relay
+ * is what bounds the client side: `maxConnections`, the idle timeout, and `requestTimeoutSeconds`.
  *
  * A client may half-close once its request is sent (`allowHalfOpen`): its end is passed on to the
- * inner listener and the response still comes back. The inner listeners hand the handler the
+ * inner listener and the response still comes back. The inner listener hands the handler the
  * client's address rather than loopback, through {@link HopAddresses}.
  *
- * The inner listeners have no connection cap of their own: they listen on loopback only, so
- * besides the relay (bounded by `maxConnections`) only processes in the same network namespace
- * reach them.
+ * The inner listener has no connection cap of its own: it listens on loopback only, so besides
+ * the relay (bounded by `maxConnections`) only processes in the same network namespace reach it.
  */
 async function serveRelayed(options: RegistryListenerOptions): Promise<RegistryListener> {
-  const inner = {
-    ...options,
-    hostname: '127.0.0.1',
-    port: 0,
-    acceptPlainHttp: false,
-    maxConnections: undefined,
-    requestTimeoutSeconds: undefined,
-  };
-  // Loopback on a free port each: these do not fail where the public port could.
-  const listen = async (tls: RegistryListenerOptions['tls']) => {
-    const hops = new HopAddresses();
-    const listener = await serveSingle({ ...inner, tls }, (socket) =>
-      hops.lookup(socket.remotePort),
-    );
-    return { listener, hops };
-  };
-  const secure = options.tls ? await listen(options.tls) : undefined;
-  const plain = !options.tls || options.acceptPlainHttp ? await listen(undefined) : undefined;
-  const stopInner = () =>
-    Promise.all([secure?.listener.stop(), plain?.listener.stop()]).then(() => {});
+  const hops = new HopAddresses();
+  // Loopback on a free port: this does not fail where the public port could.
+  const inner = await serveSingle(
+    {
+      ...options,
+      hostname: '127.0.0.1',
+      port: 0,
+      maxConnections: undefined,
+      requestTimeoutSeconds: undefined,
+    },
+    (socket) => hops.lookup(socket.remotePort),
+  );
   const requestTimeoutMs =
     options.requestTimeoutSeconds === undefined ? undefined : options.requestTimeoutSeconds * 1000;
   const sockets = new Set<Socket>();
@@ -173,12 +154,11 @@ async function serveRelayed(options: RegistryListenerOptions): Promise<RegistryL
     client.once('end', ended);
     client.once('data', (first: Buffer) => {
       client.off('end', ended);
-      const target = first[0] === TLS_HANDSHAKE ? secure : plain;
-      if (!target) return client.destroy();
+      if ((first[0] === TLS_HANDSHAKE) !== !!options.tls) return client.destroy();
       client.pause();
       sent();
       client.on('data', sent);
-      const upstream = connect(target.listener.port, '127.0.0.1');
+      const upstream = connect(inner.port, '127.0.0.1');
       sockets.add(upstream);
       let release = () => {};
       upstream.on('data', answered);
@@ -197,7 +177,7 @@ async function serveRelayed(options: RegistryListenerOptions): Promise<RegistryL
       client.once('close', () => upstream.destroy());
       upstream.once('connect', () => {
         if (upstream.localPort !== undefined && client.remoteAddress)
-          release = target.hops.claim(upstream.localPort, client.remoteAddress);
+          release = hops.claim(upstream.localPort, client.remoteAddress);
         upstream.write(first);
         client.pipe(upstream);
         upstream.pipe(client);
@@ -213,7 +193,7 @@ async function serveRelayed(options: RegistryListenerOptions): Promise<RegistryL
       resolve();
     });
   }).catch(async (error) => {
-    await stopInner();
+    await inner.stop();
     throw error;
   });
   const address = server.address();
@@ -224,13 +204,13 @@ async function serveRelayed(options: RegistryListenerOptions): Promise<RegistryL
         server.close(() => resolve());
         for (const socket of sockets) socket.destroy();
       });
-      await stopInner();
+      await inner.stop();
     },
   };
 }
 
 /**
- * One `node:http(s)` server. `addressOf`, set for the relay's inner listeners, names the client
+ * One `node:http(s)` server. `addressOf`, set for the relay's inner listener, names the client
  * behind a connection; without it the connection's own peer address is the client's.
  */
 async function serveSingle(

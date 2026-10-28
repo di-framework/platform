@@ -97,7 +97,7 @@ type APIReader interface {
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;create;update
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,verbs=get;create;update
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;create;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=list;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;delete
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // The vCluster chart creates RBAC, workloads and Services in each instance namespace; Helm needs
 // every permission it grants. v1alpha1 binds the operator to cluster-admin for that (see README).
