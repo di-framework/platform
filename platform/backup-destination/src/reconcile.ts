@@ -50,7 +50,10 @@ interface Result {
   detail?: string;
 }
 
-/** `TargetUnreachable` (the probe never got through) or `RestoreFailed`, with the tool's line. */
+/**
+ * The agent's code (`RestorePrepareFailed`, `TargetUnreachable`: nothing written; `RestoreFailed`:
+ * the target may hold part of the data), with the tool's line.
+ */
 function restoreMessage(parsed: Result | undefined): string {
   const error = parsed?.error ?? 'restore failed';
   return parsed?.detail ? `${error}: ${parsed.detail}` : error;

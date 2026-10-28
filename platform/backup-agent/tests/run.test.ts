@@ -542,7 +542,11 @@ describe('backup-agent kinds', () => {
       // The probe never got through: the target was not touched, and the tool says why.
       const rejected = harness((argv) =>
         probe(argv)
-          ? { code: 1, stdout: '', stderr: 'connecting\nFATAL: password authentication failed\n' }
+          ? {
+              code: 1,
+              stdout: '',
+              stderr: 'connecting\nFATAL: password authentication failed\n',
+            }
           : { code: 0, stdout: 'RESP', stderr: '' },
       );
       expect(await runAgent(request({ kind, port }), rejected.io)).toBe(1);
@@ -552,20 +556,124 @@ describe('backup-agent kinds', () => {
         error: 'TargetUnreachable',
         detail: 'FATAL: password authentication failed',
       });
-
-      // The probe passed and the restore itself broke.
-      const broke = harness((argv) =>
-        restore(argv)
-          ? { code: 1, stdout: '', stderr: `${kind}: error: could not execute query` }
-          : { code: 0, stdout: 'RESP', stderr: '' },
-      );
-      expect(await runAgent(request({ kind, port }), broke.io)).toBe(1);
-      expect(termination(broke.files)).toEqual({
-        ok: false,
-        error: 'RestoreFailed',
-        detail: `${kind}: error: could not execute query`,
-      });
     }
+
+    // psql 18's refused connection (captured from postgres:18): the cause, not the trailing hint.
+    const psql = harness((argv) =>
+      argv[0] === 'psql'
+        ? {
+            code: 2,
+            stdout: '',
+            stderr:
+              'psql: error: connection to server at "127.0.0.1", port 5432 failed: Connection refused\n' +
+              '\tIs the server running on that host and accepting TCP/IP connections?\n',
+          }
+        : ok(),
+    );
+    const psqlTimer = instantTimers();
+    try {
+      expect(await runAgent(request({ kind: 'restore-postgres', port: '5432' }), psql.io)).toBe(1);
+    } finally {
+      psqlTimer.mockRestore();
+    }
+    expect(termination(psql.files)).toEqual({
+      ok: false,
+      error: 'TargetUnreachable',
+      detail:
+        'psql: error: connection to server at "127.0.0.1", port 5432 failed: Connection refused',
+    });
+    // Only hint lines: the hint is still better than nothing.
+    const hintOnly = harness((argv) =>
+      argv.includes('info') ? { code: 1, stdout: '', stderr: '  only a hint\n' } : ok(),
+    );
+    expect(await runAgent(request({ kind: 'restore-nats', port: '4222' }), hintOnly.io)).toBe(1);
+    expect(termination(hintOnly.files).detail).toBe('only a hint');
+
+    // The probe passed and the restore itself broke.
+    const broken = [
+      {
+        kind: 'restore-postgres',
+        port: '5432',
+        restore: (argv: string[]) => argv[0] === 'pg_restore',
+        // DETAIL lines quote row values; only pg_restore's own lines reach the record.
+        stderr:
+          'pg_restore: error: could not execute query: ERROR:  duplicate key value violates unique constraint "users_pkey"\n' +
+          'DETAIL:  Key (email)=(alice-secret@example.com) already exists.\n' +
+          'Command was: COPY public.users (id, email) FROM stdin;\n',
+        detail:
+          'pg_restore: error: could not execute query: ERROR:  duplicate key value violates unique constraint "users_pkey"',
+      },
+      {
+        kind: 'restore-nats',
+        port: '4222',
+        restore: (argv: string[]) => argv.includes('restore'),
+        stderr: 'nats: error: restore failed: stream ORDERS already exists\n',
+        detail: 'nats: error: restore failed: stream ORDERS already exists',
+      },
+    ] as const;
+    for (const { kind, port, restore, stderr, detail } of broken) {
+      const broke = harness((argv) => (restore(argv) ? { code: 1, stdout: '', stderr } : ok()));
+      expect(await runAgent(request({ kind, port }), broke.io)).toBe(1);
+      expect(termination(broke.files)).toEqual({ ok: false, error: 'RestoreFailed', detail });
+    }
+    const pgOther = harness((argv) =>
+      argv[0] === 'pg_restore' ? { code: 1, stdout: '', stderr: 'DETAIL:  Key (id)=(7)\n' } : ok(),
+    );
+    expect(await runAgent(request({ kind: 'restore-postgres', port: '5432' }), pgOther.io)).toBe(1);
+    expect(termination(pgOther.files)).toEqual({ ok: false, error: 'RestoreFailed' });
+
+    // redis-cli --pipe (captured from redis:7.4.5): error replies echo tenant keys and values on
+    // stderr. Only the error code and the stdout summary reach the record.
+    const pipe = harness((argv) =>
+      argv.includes('--pipe')
+        ? {
+            code: 1,
+            stdout:
+              'All data transferred. Waiting for the last reply...\n' +
+              'Last reply received from server.\nerrors: 1, replies: 2\n',
+            stderr:
+              "ERR unknown command 'NOTCMD', with args beginning with: 'alice-secret' 'card-411111111111111'\n",
+          }
+        : { code: 0, stdout: 'RESP', stderr: '' },
+    );
+    expect(await runAgent(request({ kind: 'restore-redis', port: '6379' }), pipe.io)).toBe(1);
+    const piped = wrote(pipe.files, '/work/termination');
+    expect(piped).not.toContain('alice-secret');
+    expect(piped).not.toContain('card-');
+    expect(piped).not.toContain('NOTCMD');
+    expect(JSON.parse(piped)).toEqual({
+      ok: false,
+      error: 'RestoreFailed',
+      detail: 'ERR errors: 1, replies: 2',
+    });
+    const pipeQuiet = harness((argv) =>
+      argv.includes('--pipe')
+        ? { code: 1, stdout: '', stderr: "'tenant-key' lowercase\n" }
+        : { code: 0, stdout: 'RESP', stderr: '' },
+    );
+    expect(await runAgent(request({ kind: 'restore-redis', port: '6379' }), pipeQuiet.io)).toBe(1);
+    expect(termination(pipeQuiet.files)).toEqual({ ok: false, error: 'RestoreFailed' });
+
+    // Truncation counts code points, never leaving half a surrogate pair.
+    const emoji = harness((argv) =>
+      argv.includes('info') ? { code: 1, stdout: '', stderr: '\u{1F600}'.repeat(400) } : ok(),
+    );
+    expect(await runAgent(request({ kind: 'restore-nats', port: '4222' }), emoji.io)).toBe(1);
+    expect(termination(emoji.files).detail).toBe('\u{1F600}'.repeat(300));
+
+    // A failed tar happens before the target is contacted: nothing was written.
+    const tar = harness((argv) =>
+      argv[0] === 'tar'
+        ? { code: 2, stdout: '', stderr: 'tar: Unexpected EOF in archive\n' }
+        : ok(),
+    );
+    expect(await runAgent(request({ kind: 'restore-nats', port: '4222' }), tar.io)).toBe(1);
+    expect(tar.calls.some((call) => call.argv[0] === 'nats')).toBe(false);
+    expect(termination(tar.files)).toEqual({
+      ok: false,
+      error: 'RestorePrepareFailed',
+      detail: 'tar: Unexpected EOF in archive',
+    });
 
     // redis-cli prints a refused connection on stdout; the detail is bounded.
     const refused = harness((argv) =>
@@ -587,10 +695,11 @@ describe('backup-agent kinds', () => {
 
     // A failed RDB conversion never copies the converted data into the record.
     const convert = harness((argv) =>
-      argv[0] === 'rdb' ? { code: 1, stdout: 'tenant-data', stderr: '' } : ok(),
+      argv[0] === 'rdb' ? { code: 1, stdout: 'tenant-data', stderr: 'tenant-data' } : ok(),
     );
     expect(await runAgent(request({ kind: 'restore-redis', port: '6379' }), convert.io)).toBe(1);
-    expect(termination(convert.files)).toEqual({ ok: false, error: 'RestoreFailed' });
+    expect(convert.calls.some((call) => call.argv[0] === 'redis-cli')).toBe(false);
+    expect(termination(convert.files)).toEqual({ ok: false, error: 'RestorePrepareFailed' });
   });
 
   test('gc deletes listed keys and skips a blank list', async () => {
