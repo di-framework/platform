@@ -340,8 +340,8 @@ vCluster's data. The operator treats it as a resync, like a deleted `service/vcl
 namespace starts terminating (the operator watches its host namespaces), `TargetReady` and `Ready` turn
 `False` with reason `HostNamespaceDeleted`, a `Warning` Event of that reason is emitted, and the operator
 drops the install state of the lost vCluster (it holds the old cluster's credentials, against which every
-later install would fail). `status.target.resyncServiceUID` holds the marker `host-namespace-deleted` from
-then on. That reason is reported for the first round only: after it `Ready` is `False` with reason
+later install would fail). `status.target.resyncServiceUID` holds the marker `host-namespace-deleted` until
+the new vCluster has its `service/vcluster`. That reason is reported for the first round only: after it `Ready` is `False` with reason
 `TargetPending` and `TargetReady` is `False` with reason `Resyncing` while the namespace terminates and the
 operator creates the namespace and a new vCluster again. Once that vCluster has its `service/vcluster`, the
 resync goes on under that Service's uid (see [Resync when the policy was
@@ -392,7 +392,7 @@ differs on a later reconcile, or `vc-vcluster` is missing on an instance that ha
    back the virtual objects that still exist (`TargetReady=False/Resyncing`, or `KubeconfigMissing` for the
    round that starts it; `status.target.resyncServiceUID` and `resyncStarted` describe the running resync).
    Before the delete it records the restart on the host namespace in the annotation
-   `platform.di-framework.dev/resync-restart` (`<service uid>/<pod uid>`), so a round whose status write
+   `platform.di-framework.dev/resync-restart` (`<service uid>/<pod uid>`, the pod part empty when there was no pod to delete), so a round whose status write
    failed doesn't restart the pod a second time (#503). It removes the annotation once the status records
    the resync or the restarted syncer has written `vc-vcluster`. Don't edit or remove it by hand;
 3. waits for the control plane, the Secret and the API, then runs the platform install at once (not at the
