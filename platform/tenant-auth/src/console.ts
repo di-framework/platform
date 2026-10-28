@@ -52,6 +52,13 @@ export interface ConsoleConfig {
   discoveryBackoff?: DiscoveryBackoff;
 }
 
+/**
+ * Where the console reaches the controller when `TENANT_CONSOLE_CONTROLLER_URL` is unset. A DNS
+ * name, not `127.0.0.1`: tenant controller CAs exclude IP addresses (#381), so the controller's
+ * certificate names `localhost` and no IP literal verifies against it.
+ */
+const DEFAULT_CONTROLLER_URL = 'https://localhost:8788';
+
 export function configFromEnv(env = process.env): ConsoleConfig {
   const required = (name: string) => {
     const value = env[name];
@@ -62,14 +69,11 @@ export function configFromEnv(env = process.env): ConsoleConfig {
   const port = Number(env.TENANT_CONSOLE_PORT ?? 8787);
   return {
     tenant: required('TENANT_CONSOLE_TENANT'),
-    controllerUrl: (env.TENANT_CONSOLE_CONTROLLER_URL ?? 'https://127.0.0.1:8788').replace(
-      /\/$/,
-      '',
-    ),
+    controllerUrl: (env.TENANT_CONSOLE_CONTROLLER_URL ?? DEFAULT_CONTROLLER_URL).replace(/\/$/, ''),
     controllerPublicUrl: (
       env.TENANT_CONSOLE_CONTROLLER_PUBLIC_URL ??
       env.TENANT_CONSOLE_CONTROLLER_URL ??
-      'https://127.0.0.1:8788'
+      DEFAULT_CONTROLLER_URL
     ).replace(/\/$/, ''),
     controllerCa: env.TENANT_CONSOLE_CONTROLLER_CA
       ? readFileSync(env.TENANT_CONSOLE_CONTROLLER_CA, 'utf8')
