@@ -48,12 +48,13 @@ function chrome(who: Who, active: string, body: string): string {
   ${body}`;
 }
 
-export function landing(account: string, error?: string): string {
+/** The sign-in page; `signIn: false` leaves out the button (sign-in is unavailable, #489). */
+export function landing(account: string, error?: string, signIn = true): string {
   return page(
     `${account} console`,
     `<h1>${e(account)}</h1><p class="muted">Tenant console. Sign in with your identity to continue.</p>
     ${error ? `<p class="banner error">${e(error)}</p>` : ''}
-    <p><a href="/login"><button type="button">Sign in</button></a></p>`,
+    ${signIn ? '<p><a href="/login"><button type="button">Sign in</button></a></p>' : ''}`,
   );
 }
 
