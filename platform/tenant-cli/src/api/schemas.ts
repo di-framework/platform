@@ -157,6 +157,11 @@ export const schemas = {
       component: { $ref: '#/components/schemas/ComponentReference' },
       createdAt: dateTime,
       readyAt: dateTime,
+      rollbackOf: {
+        type: 'string',
+        description:
+          'On a rollback, the id of the earlier deployment whose content this one restores.',
+      },
     },
     required: ['id', 'service', 'env', 'status', 'component', 'createdAt'],
   },

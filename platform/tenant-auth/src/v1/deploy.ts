@@ -663,8 +663,9 @@ function liveStatus(workload: KubeObject | undefined): Live {
 const sha256 = (text: string) =>
   `sha256:${new Bun.CryptoHasher('sha256').update(text).digest('hex')}`;
 
-/** The contract's `Deployment` for one revision. */
+/** The contract's `Deployment` for one revision; `rollbackOf` names the revision it restores. */
 function deployment(revision: Revision, { status, readyAt }: Live) {
+  const rollbackOf = revision.object.metadata.annotations?.[ROLLBACK_OF];
   return {
     id: revision.id,
     service: revision.service,
@@ -673,6 +674,7 @@ function deployment(revision: Revision, { status, readyAt }: Live) {
     component: revision.component,
     createdAt: revision.createdAt,
     ...(readyAt ? { readyAt } : {}),
+    ...(rollbackOf ? { rollbackOf } : {}),
   };
 }
 
