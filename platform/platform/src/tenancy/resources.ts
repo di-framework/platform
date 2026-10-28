@@ -22,6 +22,7 @@ import {
   registryNatsAuthDigest,
   registryNatsSecretData,
 } from './registry-nats';
+import { canonicalIp } from './tls';
 import { hostStorage } from './workload-storage';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json | undefined };
 export interface Metadata {
@@ -1796,8 +1797,8 @@ function tenantControllerPublicUrl(tenant: string, auth: TenantAuthConfig | unde
 /**
  * Names the controller's serving certificate covers: in-cluster, through a port-forward
  * (`localhost`) and the host of `controllerPublicUrl`, so CLIs verify the hostname they were
- * given. It names an IP address only for an IP-literal public URL set explicitly; otherwise it
- * names none, and the controller CA excludes every IP address (#381).
+ * given. It names IP addresses (IPv4 or IPv6, plus `127.0.0.1`) only for an IP-literal public URL
+ * set explicitly; otherwise it names none, and the controller CA excludes every IP address (#381).
  */
 function tenantControllerCertNames(
   tenant: string,
@@ -1822,8 +1823,12 @@ function tenantControllerCertNames(
       : '';
   for (const name of [host, registry]) {
     if (/^\d+\.\d+\.\d+\.\d+$/.test(name)) ips.push(name);
-    else if (name && !name.startsWith('[')) dns.push(name);
+    else if (name.startsWith('[')) ips.push(canonicalIp(name.slice(1, -1)));
+    else if (name) dns.push(name);
   }
+  // An IP-literal URL keeps the CA open to IP addresses, so the leaf keeps naming `127.0.0.1` as it
+  // did before #381: CLIs logged in to `https://127.0.0.1:8788` keep verifying, with no rotation.
+  if (ips.length > 0) ips.unshift('127.0.0.1');
   // The hosts' pull Service (#83 `:host-pull`) serves it too.
   if (auth?.registry)
     dns.push(registryPullHost(tenant), `${registryPullHost(tenant)}.cluster.local`);

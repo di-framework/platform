@@ -107,12 +107,41 @@ const nameConstraints = (permittedDns: string[], excludeIps: boolean) => {
     true,
   );
 };
+/**
+ * The octets of a dotted IPv4 address or a (bracketless, possibly `::`-compressed) IPv6 address,
+ * as a subjectAltName iPAddress carries them.
+ */
+function ipAddressBytes(ip: string): Buffer {
+  if (!ip.includes(':')) return Buffer.from(ip.split('.').map(Number));
+  const [head = '', tail] = ip.split('::');
+  const groups = (part: string) => (part ? part.split(':') : []);
+  const hi = groups(head);
+  const lo = tail === undefined ? [] : groups(tail);
+  const all = [...hi, ...Array(8 - hi.length - lo.length).fill('0'), ...lo];
+  return Buffer.from(
+    all.flatMap((g) => [(Number.parseInt(g, 16) >> 8) & 0xff, Number.parseInt(g, 16) & 0xff]),
+  );
+}
+/**
+ * `ip` as {@link certificateNames} reads it back from a certificate: IPv4 unchanged, IPv6 as eight
+ * upper-case hex groups without leading zeros or `::` (`FD00:0:0:0:0:0:0:1`).
+ */
+export function canonicalIp(ip: string): string {
+  if (!ip.includes(':')) return ip;
+  const b = ipAddressBytes(ip);
+  return Array.from({ length: 8 }, (_, i) =>
+    b
+      .readUInt16BE(i * 2)
+      .toString(16)
+      .toUpperCase(),
+  ).join(':');
+}
 const subjectAltName = (dnsNames: string[], ipAddresses: string[]) =>
   extension(
     '2.5.29.17',
     seq(
       ...dnsNames.map((dns) => der(0x82, Buffer.from(dns))),
-      ...ipAddresses.map((ip) => der(0x87, Buffer.from(ip.split('.').map(Number)))),
+      ...ipAddresses.map((ip) => der(0x87, ipAddressBytes(ip))),
     ),
   );
 const pem = (label: string, body: Buffer): string =>

@@ -678,6 +678,8 @@ describe('tenant controller CA excludes IP addresses (#381)', () => {
     ];
     const a = steady.cas.current.cert;
     expect(sans(steady.leaf)).toContain('IP Address:127.0.0.1');
+    // While the leaf wants an IP address (an IP-literal URL) the IP-open CA is kept: no rotation.
+    expect(steady.cas.next).toBeUndefined();
     // Publish: the successor excludes IP addresses; A's leaf, with 127.0.0.1, is still served.
     expect(published.cas.current.cert).toBe(a);
     expect(caConstraints(published.cas.next?.cert ?? '')).toEqual({

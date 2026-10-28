@@ -729,10 +729,16 @@ describe('controller certificate', () => {
     expect(
       tenantControllerCertNames('alpha', { ...auth, controllerPublicUrl: 'https://10.1.2.3:8788' })
         .ips,
-    ).toEqual(['10.1.2.3']);
+    ).toEqual(['127.0.0.1', '10.1.2.3']);
+    // IPv6 literals are named too, as certificateNames reads them back.
     expect(
-      tenantControllerCertNames('alpha', { ...auth, controllerPublicUrl: 'https://[::1]:8788' }),
-    ).toEqual(tenantControllerCertNames('alpha'));
+      tenantControllerCertNames('alpha', { ...auth, controllerPublicUrl: 'https://[fd00::1]:8788' })
+        .ips,
+    ).toEqual(['127.0.0.1', 'FD00:0:0:0:0:0:0:1']);
+    expect(
+      tenantControllerCertNames('alpha', { ...auth, controllerPublicUrl: 'https://[::1]:8788' })
+        .dns,
+    ).toEqual(tenantControllerCertNames('alpha').dns);
     expect(
       tenantControllerCertNames('alpha', { ...auth, controllerPublicUrl: 'not a url' }),
     ).toEqual(tenantControllerCertNames('alpha'));
@@ -1723,6 +1729,42 @@ describe('reconcileTenant with tenant-auth', () => {
     );
     expect(opensslVerifies(ipLeaf.cert, b, new Date('2027-03-02T00:00:00Z'))).toBe(false);
   });
+
+  for (const [label, tenantAuth] of [
+    [
+      'an explicit IP-literal controller URL',
+      { ...auth, controllerPublicUrl: 'https://10.1.2.3:8788' },
+    ],
+    [
+      'an explicit IP-literal registry URL and no controller URL',
+      {
+        ...auth,
+        registry: {
+          component: `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}`,
+          publicUrl: 'https://10.1.2.3:8790',
+        },
+      },
+    ],
+    [
+      'an explicit IPv6-literal controller URL',
+      { ...auth, controllerPublicUrl: 'https://[fd00::1]:8788' },
+    ],
+  ] as [string, TenantAuthConfig][])
+    it(`keeps 127.0.0.1 and an IP-permitting CA, with no rotation, for ${label} (#381)`, async () => {
+      const { pass } = rotationHarness();
+      const ipUrl: ControllerConfig = { ...cfg, tenantAuth };
+      const sans = (leaf: string) => new X509Certificate(leaf).subjectAltName ?? '';
+      const before = await pass(0, ipUrl);
+      expect(caConstraints(decode(before.keys, 'ca.crt'))?.excludesIps).toBe(false);
+      // As before #381: CLIs logged in to https://127.0.0.1:8788 keep verifying.
+      expect(sans(before.leaf)).toContain('IP Address:127.0.0.1');
+      for (const day of [100, 100 + CA_OVERLAP_DAYS + 1, 100 + 2 * CA_OVERLAP_DAYS + 1]) {
+        const later = await pass(day, ipUrl);
+        expect(later.keys['next.crt']).toBeUndefined();
+        expect(later.leaf).toBe(before.leaf);
+        expect(later.bundle).toBe(before.bundle);
+      }
+    });
 
   const tenantAuthObjects = (api: MemoryApi) =>
     [...api.objects.values()].filter((r) => r.metadata.labels?.[COMPONENT] === 'tenant-auth');

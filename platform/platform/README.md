@@ -494,15 +494,28 @@ same steps as the #365 upgrade above:
 - **About day 60, retire.** The old CA leaves the bundle.
 
 **To keep an IP-literal URL**, set it explicitly (`tenantAuth.controllerPublicUrl` or
-`tenantAuth.registry.publicUrl`, as for the #128 upgrade): the leaf then names that address and
-the CA leaves IP addresses unconstrained, as before this version, since Bun's TLS client rejects a
-leaf that names an IP address under any IP address constraint. No rotation starts for such an
-install unless the URL changes.
+`tenantAuth.registry.publicUrl`, as for the #128 upgrade; IPv4 or bracketed IPv6, such as
+`https://[fd00::1]:8788`): the leaf then names that address and, as before this version,
+`127.0.0.1`, and the CA leaves IP addresses unconstrained, since Bun's TLS client rejects a leaf
+that names an IP address under any IP address constraint. No rotation starts and the leaf does not
+change for such an install unless the URL changes, so logins to `https://127.0.0.1:8788` keep
+verifying.
 
 **Downgrading** to a package without this change after the switch breaks the controller's TLS: the
 older package always adds `127.0.0.1` to the leaf, which the CA then signing excludes, so every
 client rejects it. Downgrade before the switch, or replace the CA after the downgrade as for a
 revocation (see "Revoking a compromised CA").
+
+**Downgrading before the switch** keeps TLS intact, but the older package does not see the
+published successor as renamed: about every 30 days it replaces it with a fresh successor instead
+of switching, and each time the bundle changes, so the tenant hosts and console restart monthly.
+After such a downgrade, remove the successor from the CA Secret in the platform namespace (it has
+not signed anything, so nothing depends on it):
+
+```sh
+kubectl -n <platform-namespace> patch secret tenant-controller-ca-<tenant> --type=json \
+  -p '[{"op":"remove","path":"/data/next.crt"},{"op":"remove","path":"/data/next.key"}]'
+```
 
 #### Upgrading to API keys in their own namespace (#379)
 
@@ -1548,9 +1561,10 @@ tenantAuth:
   names, and a port-forward is reached as `localhost` (the default public URLs are
   `https://localhost:8788` and `https://localhost:8790`). Each CA therefore also excludes every
   IP address (`0.0.0.0/0` and `::/0` as excluded subtrees), so a leaked tenant CA key cannot
-  impersonate `https://<ip>` to the hosts' outgoing HTTPS either; Bun, Go, rustls and OpenSSL
-  all reject a leaf that names one. The exception is an IP-literal `controllerPublicUrl` or
-  `registry.publicUrl` set explicitly: the leaf must then name that address, and BoringSSL (Bun's
+  impersonate `https://<ip>` to the hosts' outgoing HTTPS either; Bun and OpenSSL reject a leaf
+  that names one (tested). The exception is an IP-literal (IPv4 or IPv6) `controllerPublicUrl` or
+  `registry.publicUrl` set explicitly: the leaf must then name that address (and `127.0.0.1`, as
+  before #381), and BoringSSL (Bun's
   TLS client) rejects every chain in which an IP address SAN meets an IP address constraint (even
   a permitted one), so that installation's CA leaves IP addresses unconstrained, as before #381.
   Whether IP addresses are excluded is part of what a CA permits, so switching between an
