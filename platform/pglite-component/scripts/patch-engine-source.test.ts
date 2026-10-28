@@ -477,6 +477,56 @@ describe('requirePgpCfbFix', () => {
     expect(() => requirePgpCfbFix(guarded)).not.toThrow();
   });
 
+  test('W1: splices a backslash followed by spaces or tabs before the newline', () => {
+    const fullCheck =
+      '\t\tif (err && !ignore_cipher_failure)\n\t\t\tereport(ERROR,\n\t\t\t\t\t(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),\n\t\t\t\t\t errmsg("encrypt error: %s", px_strerror(err))));\n';
+    const spliced = editedPgpCfb(
+      fullCheck,
+      '\t\t// see below \\ \n\t\tif (err && !ignore_cipher_failure) // \\ \n\t\t\tereport(ERROR, // \\\t\n\t\t\t\t\t(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION), // \\ \r\n\t\t\t\t\t errmsg("encrypt error: %s", px_strerror(err))));\n',
+    );
+    expect(() => requirePgpCfbFix(spliced)).toThrow(missing);
+  });
+
+  test('W2: refuses a $ decoy name and a parenthesised pgp_cfb_encrypt definition', () => {
+    const header = 'int\npgp_cfb_encrypt(';
+    const decoy = editedPgpCfb(
+      header,
+      'static int\nold$pgp_cfb_encrypt(PGP_CFB *ctx)\n{\n\treturn cfb_process(ctx, NULL, 0, NULL, NULL, 0);\n}\n\nint\n(pgp_cfb_encrypt)(',
+    ).replace(encryptReturn, '\treturn cfb_process(ctx, data, len, dst, mix, 1);\n}');
+    expect(() => requirePgpCfbFix(decoy)).toThrow(ignoring);
+    // `old$pgp_cfb_encrypt` is one identifier, not a definition of pgp_cfb_encrypt.
+    const dollar = editedPgpCfb(
+      header,
+      'static int\nold$pgp_cfb_encrypt(PGP_CFB *ctx)\n{\n\treturn cfb_process(ctx, NULL, 0, NULL, NULL, 1);\n}\n\nint\npgp_cfb_encrypt(',
+    );
+    expect(() => requirePgpCfbFix(dollar)).not.toThrow();
+  });
+
+  test('W3: reads digraphs as the brackets they spell', () => {
+    const digraph = editedPgpCfb(
+      mix,
+      `${mix}\n\tif (len == 0) <% return cfb_process(ctx, data, len, dst, mix, 0); }\n\treturn cfb_process(ctx, data, len, dst, mix, 1);\n}\nstatic int\nunused(void)\n{\n`,
+    );
+    expect(() => requirePgpCfbFix(digraph)).toThrow(ignoring);
+    const balanced = editedPgpCfb(mix, `${mix}\tif (len == 0) <% return 0; %>\n`);
+    expect(() => requirePgpCfbFix(balanced)).not.toThrow();
+  });
+
+  test('refuses preprocessor conditionals inside pgp_cfb_encrypt', () => {
+    for (const directive of ['#if 0', '#ifdef X', '#ifndef X', '%:if 0']) {
+      const conditional = editedPgpCfb(mix, `${mix}${directive}\n\t}\n#endif\n`);
+      expect(() => requirePgpCfbFix(conditional)).toThrow(ignoring);
+    }
+  });
+
+  test('refuses truncated input with an unclosed bracket', () => {
+    const call = 'return cfb_process(ctx, data, len, dst, mix,';
+    const cut = UPSTREAM_PGP_CFB.indexOf(call);
+    expect(cut).toBeGreaterThan(0);
+    const truncated = UPSTREAM_PGP_CFB.slice(0, cut + 'return cfb_process(ctx, data'.length);
+    expect(() => requirePgpCfbFix(truncated)).toThrow(ignoring);
+  });
+
   test('names what to inspect when the expected pattern is not recognised', () => {
     expect(() => requirePgpCfbFix(UNFIXED_PGP_CFB)).toThrow(
       'not in the expected pattern (0 of 1 px_cipher_encrypt calls recognised as checked)',

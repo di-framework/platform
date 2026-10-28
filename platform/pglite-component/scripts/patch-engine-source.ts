@@ -260,7 +260,18 @@ export function patchDlfcn(text: string): string {
  * - and pgp_cfb_encrypt never ignores them (every cfb_process call in it
  *   passes 0 as ignore_cipher_failure).
  * The check compares C tokens (see cTokens), so line endings, indentation,
- * line continuations and comments do not matter to it.
+ * line continuations, digraphs and comments do not matter to it.
+ *
+ * Threat model: this runs only against the pinned upstream
+ * contrib/pgcrypto/pgp-cfb.c, when the engine base is bumped. It is a tripwire
+ * for upstream changes to the fix, not a defence against adversarial C, so it
+ * fails closed on forms upstream does not use (a parenthesised or otherwise
+ * unusual `pgp_cfb_encrypt` name, preprocessor conditionals in its body,
+ * `else`/label/declaration before the encrypt call). Known limits it does not
+ * detect: macro aliasing (a #define that renames px_cipher_encrypt,
+ * cfb_process or the constants), a direct `ctx->ciph->encrypt(…)` call that
+ * skips the px_cipher_encrypt macro, and `ignore_cipher_failure = 1;`
+ * assigned inside cfb_process.
  */
 export const PGP_CFB_ENCRYPT_CALL =
   '\t\terr = px_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);\n';
@@ -274,21 +285,33 @@ export const PGP_CFB_ERROR_CHECK = '\t\tif (err && !ignore_cipher_failure)\n\t\t
  * number, or a punctuator.
  */
 const C_TOKEN =
-  /(\s+|\/\/[^\n]*|\/\*[\s\S]*?(?:\*\/|$))|"(?:\\[\s\S]|[^"\\\n])*"?|'(?:\\[\s\S]|[^'\\\n])*'?|[A-Za-z_]\w*|\.?\d[\w.]*|->|\+\+|--|<<=|>>=|\.\.\.|&&|\|\||##|[<>=!+\-*/%&|^]=|<<|>>|[\s\S]/y;
+  /(\s+|\/\/[^\n]*|\/\*[\s\S]*?(?:\*\/|$))|"(?:\\[\s\S]|[^"\\\n])*"?|'(?:\\[\s\S]|[^'\\\n])*'?|[A-Za-z_$][\w$]*|\.?\d[\w.]*|%:%:|<%|%>|<:|:>|%:|->|\+\+|--|<<=|>>=|\.\.\.|&&|\|\||##|[<>=!+\-*/%&|^]=|<<|>>|[\s\S]/y;
+
+/** Digraphs (C99 6.4.6) and the punctuators they spell. */
+const DIGRAPHS: Record<string, string> = {
+  '<%': '{',
+  '%>': '}',
+  '<:': '[',
+  ':>': ']',
+  '%:': '#',
+  '%:%:': '##',
+};
 
 /**
  * C source as the compiler tokenizes it: backslash-newline continuations are
- * spliced first (translation phase 2, so a `//` comment ending in `\` also
+ * spliced first, also with horizontal whitespace before the newline as GCC
+ * and clang do (translation phase 2, so a `//` comment ending in `\` also
  * comments out the next line), then whitespace and comments are dropped
- * outside string and character literals. Comparing whole tokens keeps
+ * outside string and character literals, and digraphs become the
+ * punctuators they spell. Comparing whole tokens keeps
  * identifier boundaries, so `myerr` is not `err`.
  */
 function cTokens(text: string): string[] {
-  const source = text.replace(/\\\r?\n/g, '');
+  const source = text.replace(/\\[ \t\f\v]*\r?\n/g, '');
   const tokens: string[] = [];
   C_TOKEN.lastIndex = 0;
   for (let m = C_TOKEN.exec(source); m !== null; m = C_TOKEN.exec(source)) {
-    if (m[1] === undefined) tokens.push(m[0]);
+    if (m[1] === undefined) tokens.push(DIGRAPHS[m[0]] ?? m[0]);
   }
   return tokens;
 }
@@ -372,6 +395,15 @@ function neverIgnoresFailures(body: string[]): boolean {
   return calls > 0;
 }
 
+const CONDITIONAL_DIRECTIVES = new Set(['if', 'ifdef', 'ifndef', 'elif', 'else', 'endif']);
+
+/** Whether `body` has a preprocessor conditional, which can hide code or braces from the scan. */
+function hasConditional(body: string[]): boolean {
+  return body.some(
+    (token, i) => token === '#' && CONDITIONAL_DIRECTIVES.has(body[i + 1] as string),
+  );
+}
+
 const PGP_CFB_INSPECT =
   'inspect cfb_process and pgp_cfb_encrypt in contrib/pgcrypto/pgp-cfb.c, and update requirePgpCfbFix ' +
   '(platform/pglite-component/scripts/patch-engine-source.ts) if upstream only changed their form';
@@ -390,8 +422,16 @@ export function requirePgpCfbFix(text: string): void {
         `Blowfish and CAST5 would encrypt to plaintext; ${PGP_CFB_INSPECT}`,
     );
   }
+  // Every pgp_cfb_encrypt must be a plain `name(`: a parenthesised name such
+  // as `int (pgp_cfb_encrypt)(…) { … }` would hide a definition from the scan.
+  const unusual = tokens.some((token, i) => token === 'pgp_cfb_encrypt' && tokens[i + 1] !== '(');
   const bodies = functionBodies(tokens, 'pgp_cfb_encrypt');
-  if (bodies.length === 0 || !bodies.every(neverIgnoresFailures)) {
+  if (
+    unusual ||
+    bodies.length === 0 ||
+    bodies.some(hasConditional) ||
+    !bodies.every(neverIgnoresFailures)
+  ) {
     throw new Error(
       'pgp-cfb.c: pgp_cfb_encrypt may ignore cipher failures (PostgreSQL 17.11, CVE-2026-14663): ' +
         'every cfb_process call in it must pass 0 as ignore_cipher_failure; ' +
