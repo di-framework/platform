@@ -48,7 +48,7 @@ const PlatformNamespace = "wasmcloud"
 type Reconciler struct {
 	client.Client
 	// APIReader reads the instance past the cache before a resync reinstall (#472) and while the
-	// cache lags a status write the next round must see (#481); nil skips those checks.
+	// cache lags a status write the next round must see (#481, #487); nil skips those checks.
 	APIReader APIReader
 	Target    targets.Target
 	Installer installer.Installer
@@ -328,7 +328,7 @@ func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstanc
 			fmt.Sprintf("%s of %s failed: %v", d.Reason, inst.Spec.Version, err), err)
 	}
 	now := metav1.NewTime(r.now())
-	return ctrl.Result{RequeueAfter: r.Plan.RepairInterval}, r.patchStatus(ctx, inst, func(s *v1alpha1.PlatformInstanceStatus) {
+	err = r.patchStatus(ctx, inst, func(s *v1alpha1.PlatformInstanceStatus) {
 		s.Phase = v1alpha1.PhaseReady
 		s.ObservedGeneration = inst.Generation
 		s.InstalledVersion = inst.Spec.Version
@@ -342,6 +342,14 @@ func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstanc
 			fmt.Sprintf("generation %d: %d tenant(s), %d user(s), tenantAuth issuer %q", s.Applied.Generation, s.Applied.Tenants, s.Applied.Users, s.Applied.TenantAuthIssuer))
 		setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionTrue, "Ready", "instance is ready")
 	})
+	if err == nil {
+		// The status patches at the start of the install queued another round, which runs as
+		// soon as this one returns and can read the instance from before this patch: no
+		// Installed condition or the old lastRepair, so it would install or repair again at
+		// once (#487).
+		r.expectWrite(inst)
+	}
+	return ctrl.Result{RequeueAfter: r.Plan.RepairInterval}, err
 }
 
 // failConfig reports a config the install can't apply: ConfigApplied and Installed False with
