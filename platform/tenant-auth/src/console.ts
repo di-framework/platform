@@ -49,6 +49,8 @@ export interface ConsoleConfig {
   host: string;
   port: number;
   publicUrl: string;
+  /** Wait between issuer discovery attempts; doubles from `initialMs` up to `maxMs`. */
+  discoveryBackoff?: { initialMs: number; maxMs: number };
 }
 
 export function configFromEnv(env = process.env): ConsoleConfig {
@@ -90,6 +92,20 @@ const FLOW_COOKIE = 'tenant_console_flow';
 const SESSION_COOKIE = 'tenant_console_session';
 const PLATFORM_API = '/apis/platform.di-framework.dev/v1alpha1';
 const WASMCLOUD_API = '/apis/runtime.wasmcloud.dev/v1alpha1';
+
+const DISCOVERY_BACKOFF_DEFAULT = { initialMs: 1_000, maxMs: 30_000 };
+
+/** Pending until the issuer answers; `retryAfterSeconds` is the wait until the next attempt. */
+type DiscoveryState =
+  | { status: 'pending'; retryAfterSeconds: number }
+  | { status: 'complete'; provider: ProviderMetadata };
+
+/** Thrown by a route that needs the issuer while discovery is still pending (#489). */
+class DiscoveryPending extends Error {
+  constructor(readonly retryAfterSeconds: number) {
+    super('issuer discovery is pending');
+  }
+}
 
 class HttpError extends Error {
   constructor(
@@ -159,14 +175,105 @@ export class Console {
    * whole family when an old one is replayed, so concurrent requests must share a single refresh.
    */
   private readonly refreshing = new Map<string, Promise<boolean>>();
+  private discoveryState: DiscoveryState;
+  private readonly discoveryAbort = new AbortController();
+  private discoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  private wakeDiscoverySleep: (() => void) | undefined;
+  private readonly markDiscovered: () => void;
+  /** Resolves once the issuer has been discovered (or the console was stopped). */
+  readonly discovered: Promise<void>;
 
   constructor(
     readonly config: ConsoleConfig,
-    readonly provider: ProviderMetadata,
-  ) {}
+    provider: ProviderMetadata | null,
+  ) {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    this.discovered = promise;
+    this.markDiscovered = resolve;
+    this.discoveryState = provider
+      ? { status: 'complete', provider }
+      : { status: 'pending', retryAfterSeconds: 1 };
+    if (provider) this.markDiscovered();
+  }
 
+  /** Provider metadata; null until discovery completes. */
+  get provider(): ProviderMetadata | null {
+    return this.discoveryState.status === 'complete' ? this.discoveryState.provider : null;
+  }
+
+  /**
+   * Builds the console and discovers the issuer in the background. It resolves at once, so the
+   * console serves `/healthz` and its issuer-independent routes while the issuer is unreachable
+   * and recovers without a restart once it answers (#489), as the controller does (#225).
+   */
   static async start(config: ConsoleConfig): Promise<Console> {
-    return new Console(config, await discover(config.issuer));
+    const app = new Console(config, null);
+    void app.discoverInBackground();
+    return app;
+  }
+
+  /** Stops background discovery: aborts an in-flight attempt and clears the retry timer. */
+  stop(): void {
+    this.discoveryAbort.abort();
+    clearTimeout(this.discoveryTimer);
+    this.wakeDiscoverySleep?.();
+    this.markDiscovered();
+  }
+
+  /**
+   * Attempts discovery until it succeeds or the console stops. The wait between attempts doubles
+   * from `initialMs` up to `maxMs`; it never gives up, since the issuer may come up at any time.
+   */
+  private async discoverInBackground(): Promise<void> {
+    const { initialMs, maxMs } = this.config.discoveryBackoff ?? DISCOVERY_BACKOFF_DEFAULT;
+    const signal = this.discoveryAbort.signal;
+    for (let attempt = 0; !signal.aborted; attempt++) {
+      try {
+        const provider = await discover(this.config.issuer, 1, signal);
+        this.discoveryState = { status: 'complete', provider };
+        this.audit('discovery.succeeded', { issuer: this.config.issuer });
+        this.markDiscovered();
+        return;
+      } catch (error) {
+        if (signal.aborted) return;
+        const delayMs = Math.min(maxMs, initialMs * 2 ** attempt);
+        this.discoveryState = {
+          status: 'pending',
+          retryAfterSeconds: Math.max(1, Math.ceil(delayMs / 1000)),
+        };
+        this.audit('discovery.failed', {
+          error: (error as Error).message,
+          issuer: this.config.issuer,
+          retryInMs: delayMs,
+        });
+        await new Promise<void>((resolve) => {
+          this.wakeDiscoverySleep = resolve;
+          this.discoveryTimer = setTimeout(resolve, delayMs);
+        });
+      }
+    }
+  }
+
+  /** The issuer's metadata, for a route that needs it; throws while discovery is pending. */
+  private get metadata(): ProviderMetadata {
+    if (this.discoveryState.status === 'complete') return this.discoveryState.provider;
+    throw new DiscoveryPending(this.discoveryState.retryAfterSeconds);
+  }
+
+  /** 503 with Retry-After for a route that needs the issuer before it has been discovered. */
+  private discoveryPending(api: boolean, pending: DiscoveryPending): Response {
+    const headers = { 'Retry-After': String(pending.retryAfterSeconds) };
+    return api
+      ? json({ error: 'the identity provider is not reachable yet; retry shortly' }, 503, headers)
+      : html(
+          message(
+            'Sign-in unavailable',
+            'The console cannot reach the identity provider yet. Try again shortly.',
+            true,
+          ),
+          503,
+          headers,
+        );
   }
 
   audit(event: string, fields: Record<string, unknown> = {}): void {
@@ -252,7 +359,7 @@ export class Console {
   private async refresh(sid: string, session: Session, refreshToken: string): Promise<boolean> {
     try {
       const fresh = fromTokens(
-        await refreshTokens(this.provider, {
+        await refreshTokens(this.metadata, {
           clientId: this.config.clientId,
           clientSecret: this.config.clientSecret,
           refreshToken,
@@ -278,7 +385,13 @@ export class Console {
     const route = `${request.method} ${url.pathname}`;
     const api = url.pathname.startsWith('/cli/');
     try {
-      if (route === 'GET /healthz') return json({ ok: true, tenant: this.config.tenant });
+      // Serving while the issuer is unreachable: `discoveryReady` says whether sign-in works.
+      if (route === 'GET /healthz')
+        return json({
+          ok: true,
+          tenant: this.config.tenant,
+          discoveryReady: this.discoveryState.status === 'complete',
+        });
       if (route === 'GET /cli/info')
         return json({
           account: this.config.tenant,
@@ -302,8 +415,17 @@ export class Console {
               clear,
             );
       }
-      if (!session)
-        return api ? json({ error: 'not signed in' }, 401) : html(landing(this.config.tenant));
+      if (!session) {
+        if (api) return json({ error: 'not signed in' }, 401);
+        return html(
+          landing(
+            this.config.tenant,
+            this.provider
+              ? undefined
+              : 'Sign-in is unavailable until the identity provider answers. Try again shortly.',
+          ),
+        );
+      }
       if (route === 'GET /') return await this.overview(session);
       if (route === 'GET /keys') return await this.keys(session);
       if (route === 'POST /keys') return await this.createKey(request, session);
@@ -314,6 +436,7 @@ export class Console {
       if (logs?.[1]) return await this.logs(session, logs[1]);
       return html(message('Not found', `${url.pathname} is not a page here.`, true), 404);
     } catch (error) {
+      if (error instanceof DiscoveryPending) return this.discoveryPending(api, error);
       // A 5xx (the controller or identity provider failing) can carry upstream text: like any
       // unexpected error, its detail stays in the log and the user sees a generic page.
       if (error instanceof HttpError && error.status < 500) {
@@ -360,7 +483,7 @@ export class Console {
     };
     const id = randomToken(24);
     this.flows.set(id, flow);
-    const location = authorizationUrl(this.provider, {
+    const location = authorizationUrl(this.metadata, {
       clientId: this.config.clientId,
       redirectUri: this.redirectUri,
       scope: 'openid profile email offline_access',
@@ -382,7 +505,7 @@ export class Console {
     const code = url.searchParams.get('code');
     if (!code || url.searchParams.get('state') !== flow.state)
       throw new HttpError(400, 'the login response does not match the attempt');
-    const response = await exchangeCode(this.provider, {
+    const response = await exchangeCode(this.metadata, {
       clientId: this.config.clientId,
       clientSecret: this.config.clientSecret,
       redirectUri: this.redirectUri,
@@ -390,7 +513,7 @@ export class Console {
       codeVerifier: flow.verifier,
     });
     if (!response.id_token) throw new HttpError(502, 'identity provider returned no ID token');
-    await verifyIdToken(response.id_token, this.provider, {
+    await verifyIdToken(response.id_token, this.metadata, {
       clientId: this.config.clientId,
       nonce: flow.nonce,
     });
@@ -425,7 +548,7 @@ export class Console {
     this.sessions.delete(sid);
     if (session?.refreshToken)
       void revokeToken(
-        this.provider,
+        this.metadata,
         this.config.clientId,
         this.config.clientSecret,
         session.refreshToken,
@@ -453,9 +576,11 @@ export class Console {
   private async cliRefresh(request: Request): Promise<Response> {
     const { refreshToken } = (await request.json()) as { refreshToken?: string };
     if (!refreshToken) throw new HttpError(400, 'refreshToken is required');
+    // Outside the try: a pending discovery is a 503 to retry, not an expired login.
+    const metadata = this.metadata;
     let response: TokenResponse;
     try {
-      response = await refreshTokens(this.provider, {
+      response = await refreshTokens(metadata, {
         clientId: this.config.clientId,
         clientSecret: this.config.clientSecret,
         refreshToken,
@@ -476,7 +601,7 @@ export class Console {
     const { refreshToken } = (await request.json()) as { refreshToken?: string };
     if (refreshToken)
       await revokeToken(
-        this.provider,
+        this.metadata,
         this.config.clientId,
         this.config.clientSecret,
         refreshToken,
@@ -610,6 +735,8 @@ export class Console {
 
 if (import.meta.main) {
   const config = configFromEnv();
+  // Resolves at once: discovery continues in the background, so the console serves (degraded)
+  // while the issuer is unreachable instead of exiting (#489).
   const app = await Console.start(config);
   Bun.serve({
     hostname: config.host,
@@ -623,5 +750,6 @@ if (import.meta.main) {
     url: config.publicUrl,
     issuer: config.issuer,
     controller: config.controllerUrl,
+    discoveryReady: app.provider !== null,
   });
 }
