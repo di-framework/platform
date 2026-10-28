@@ -9,7 +9,7 @@ spec:
   target:
     type: vcluster
   platform:
-    networkPolicyEngine: kube-router
+    networkPolicyEngine: existing
     storageRoot: /var/lib/di-framework/team-b/full-instance
     gateway:
       httpNodePort: 30080

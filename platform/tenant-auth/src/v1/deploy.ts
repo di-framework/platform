@@ -493,6 +493,13 @@ const bindingsPath = (tenant: string) =>
   `/apis/${BINDING_API}/namespaces/di-tenant-${tenant}/servicebindings`;
 const validService = (service: unknown): service is string =>
   typeof service === 'string' && DNS_LABEL.test(service) && service.length <= 40;
+const REVISION_NUMBER = /^[1-9][0-9]{0,8}$/;
+/** Whether `id` is a revision id `<service>-<env>.<n>`, checked like `parseRevision` checks labels. */
+const validRevisionId = (id: unknown): id is string => {
+  if (typeof id !== 'string') return false;
+  const match = /^(.*)-(prod|staging)\.([^.]*)$/.exec(id);
+  return !!match && validService(match[1]) && REVISION_NUMBER.test(match[3] ?? '');
+};
 const INVALID_SERVICE = 'service must be a DNS label of at most 40 characters';
 const groupOf = (revision: { service: string; env: string }) =>
   `${revision.service}-${revision.env}`;
@@ -508,7 +515,7 @@ function parseRevision(object: RevisionObject): Revision | undefined {
     return undefined;
   };
   const label = labels[REVISION] ?? '';
-  if (!/^[1-9][0-9]{0,8}$/.test(label)) return skip(`${REVISION} is not a positive integer`);
+  if (!REVISION_NUMBER.test(label)) return skip(`${REVISION} is not a positive integer`);
   const service = labels[SERVICE_LABEL];
   const env = labels[ENV];
   if (!validService(service) || (env !== 'prod' && env !== 'staging'))
@@ -663,8 +670,9 @@ function liveStatus(workload: KubeObject | undefined): Live {
 const sha256 = (text: string) =>
   `sha256:${new Bun.CryptoHasher('sha256').update(text).digest('hex')}`;
 
-/** The contract's `Deployment` for one revision. */
+/** The contract's `Deployment` for one revision; `rollbackOf` names the revision it restores. */
 function deployment(revision: Revision, { status, readyAt }: Live) {
+  const rollbackOf = revision.object.metadata.annotations?.[ROLLBACK_OF];
   return {
     id: revision.id,
     service: revision.service,
@@ -673,6 +681,7 @@ function deployment(revision: Revision, { status, readyAt }: Live) {
     component: revision.component,
     createdAt: revision.createdAt,
     ...(readyAt ? { readyAt } : {}),
+    ...(validRevisionId(rollbackOf) ? { rollbackOf } : {}),
   };
 }
 

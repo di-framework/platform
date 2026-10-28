@@ -14,6 +14,7 @@ import { controllerTrustBundle } from '../src/tenancy/resources';
 import {
   type CertNames,
   caCertificate,
+  caConstraints,
   caPermittedDns,
   holdsCaKey,
   inDnsSubtree,
@@ -28,8 +29,11 @@ const DAY = 86_400_000;
 const NAME = 'tenant-controller CA (di-runtime-alpha)';
 const NAMES = ['tenant-controller', 'localhost'];
 const PROFILE = { commonName: NAME, dnsNames: NAMES };
-/** A tenant controller CA for `NAMES`, as the controller creates it. */
-const tenantCa = (days: number, now: Date, names = NAMES) => caCertificate(NAME, days, now, names);
+/** A tenant controller CA for `NAMES` and no IP address, as the controller creates it (#381). */
+const tenantCa = (days: number, now: Date, names = NAMES) =>
+  caCertificate(NAME, days, now, names, true);
+/** A tenant controller CA from #365, before #381: it leaves IP addresses unconstrained. */
+const ipOpenCa = (days: number, now: Date, names = NAMES) => caCertificate(NAME, days, now, names);
 const t0 = new Date('2026-10-14T00:00:00Z');
 const at = (days: number) => new Date(t0.getTime() + days * DAY);
 const bundle = (cas: ControllerCas) =>
@@ -54,19 +58,23 @@ interface Step {
   leaf: string;
 }
 /**
- * Reconcile passes from `start` on the days given, each with the DNS names wanted then (the leaf
- * also names `127.0.0.1`). Like the controller, a pass issues a leaf for {@link leafNames} when
- * there is none, when the signing CA changes, or when those names change.
+ * Reconcile passes from `start` on the days given, each with the DNS names and IP addresses
+ * wanted then (none unless given, as the controller wants since #381). Like the controller, a
+ * pass issues a leaf for {@link leafNames} when there is none, when the signing CA changes, or
+ * when those names change.
  */
-const walk = (start: ControllerCas, plan: [day: number, names: string[]][]): Step[] => {
+const walk = (
+  start: ControllerCas,
+  plan: [day: number, names: string[], ips?: string[]][],
+): Step[] => {
   const steps: Step[] = [];
   let [cas, leaf] = [start, ''];
   let served: CertNames | undefined;
-  for (const [day, dnsNames] of plan) {
+  for (const [day, dnsNames, ips = []] of plan) {
     const now = at(day);
-    const next = rotateCas(stored(cas), { commonName: NAME, dnsNames }, now);
+    const next = rotateCas(stored(cas), { commonName: NAME, dnsNames, ipAddresses: ips }, now);
     const kept = next.current.cert === cas.current.cert ? served : undefined;
-    const names = leafNames(next, { dns: dnsNames, ips: ['127.0.0.1'] }, kept);
+    const names = leafNames(next, { dns: dnsNames, ips }, kept);
     if (!kept || JSON.stringify(names) !== JSON.stringify(kept)) {
       const { cert, key } = next.current;
       leaf = leafCertificate('localhost', names.dns, names.ips, 365, cert, key, now).cert;
@@ -93,8 +101,17 @@ const expectNoTrustGap = (steps: Step[]) => {
       }
   }
 };
-/** Serves a leaf `signer` issues for `dns` and `ips`, and fetches it over TLS trusting `ca`. */
-const handshake = async (signer: KeyPair, ca: string, dns = ['localhost'], ips: string[] = []) => {
+/**
+ * Serves a leaf `signer` issues for `dns` and `ips`, and fetches it over TLS from `host` trusting
+ * `ca`.
+ */
+const handshake = async (
+  signer: KeyPair,
+  ca: string,
+  dns = ['localhost'],
+  ips: string[] = [],
+  host = 'localhost',
+) => {
   // Real time, so the handshake's own clock agrees with the certificates.
   const leaf = leafCertificate('localhost', dns, ips, 30, signer.cert, signer.key);
   const server = Bun.serve({
@@ -104,7 +121,7 @@ const handshake = async (signer: KeyPair, ca: string, dns = ['localhost'], ips: 
     fetch: () => new Response('ok'),
   });
   try {
-    const response = await fetch(`https://localhost:${server.port}/`, { tls: { ca } });
+    const response = await fetch(`https://${host}:${server.port}/`, { tls: { ca } });
     return await response.text();
   } catch {
     return 'rejected';
@@ -304,7 +321,7 @@ describe('tenant controller CA name constraints (#365)', () => {
   const profile = (dnsNames: string[]) => ({ commonName: NAME, dnsNames });
 
   it('writes a critical nameConstraints extension permitting only the given DNS names', () => {
-    const ca = tenantCa(CA_DAYS, t0);
+    const ca = ipOpenCa(CA_DAYS, t0);
     expect(caPermittedDns(ca.cert)).toEqual(NAMES);
     // Read back independently of the parser above.
     const text = Bun.spawnSync([OPENSSL, 'x509', '-noout', '-text'], {
@@ -344,7 +361,7 @@ describe('tenant controller CA name constraints (#365)', () => {
   });
 
   it('refuses a leaf naming a DNS name outside the constraints', () => {
-    const ca = tenantCa(CA_DAYS, t0);
+    const ca = ipOpenCa(CA_DAYS, t0);
     const evil = ['localhost', 'evil.example'];
     const outside = leafCertificate('x', evil, [], 30, ca.cert, ca.key, t0);
     // node:crypto applies no name constraints: the signature and issuer link check out.
@@ -374,7 +391,7 @@ describe('tenant controller CA name constraints (#365)', () => {
   });
 
   it('keeps of the names wanted those the signing CA permits, and every IP address', () => {
-    const ca = tenantCa(CA_DAYS, t0);
+    const ca = ipOpenCa(CA_DAYS, t0);
     const wanted: CertNames = { dns: MOVED, ips: ['127.0.0.1', '10.1.2.3'] };
     expect(namesPermittedBy(ca.cert, wanted)).toEqual({ dns: NAMES, ips: wanted.ips });
     expect(namesPermittedBy(caCertificate(NAME, CA_DAYS, t0).cert, wanted)).toEqual(wanted);
@@ -540,7 +557,7 @@ describe('tenant controller CA name constraints (#365)', () => {
     expect(published.cas.current).toEqual(legacy);
     const successor = published.cas.next as KeyPair;
     expect(caPermittedDns(successor.cert)).toEqual(NAMES);
-    expect(sans(published.leaf)).toBe('DNS:tenant-controller, DNS:localhost, IP Address:127.0.0.1');
+    expect(sans(published.leaf)).toBe('DNS:tenant-controller, DNS:localhost');
     expect(switched.cas).toEqual({ current: successor, previous: legacy.cert });
     expect(kept.cas).toEqual(switched.cas);
     expect(retired.cas).toEqual({ current: successor });
@@ -554,5 +571,145 @@ describe('tenant controller CA name constraints (#365)', () => {
     const later = (days: number) => rotateCas(stored(replaced), PROFILE, at(100 + days)).previous;
     expect(later(2 * CA_OVERLAP_DAYS - 1)).toBe(legacy.cert);
     expect(later(2 * CA_OVERLAP_DAYS + 1)).toBeUndefined();
+  });
+});
+
+describe('tenant controller CA excludes IP addresses (#381)', () => {
+  const sans = (leaf: string) => new X509Certificate(leaf).subjectAltName ?? '';
+  const ipLeaf = (ca: KeyPair, ips = ['127.0.0.1']) =>
+    leafCertificate('x', NAMES, ips, 30, ca.cert, ca.key, t0).cert;
+  const toPem = (der: Buffer) =>
+    `-----BEGIN CERTIFICATE-----\n${der.toString('base64')}\n-----END CERTIFICATE-----\n`;
+
+  it('writes excluded subtrees covering every IPv4 and IPv6 address, and reads them back', () => {
+    const ca = tenantCa(CA_DAYS, t0);
+    expect(caConstraints(ca.cert)).toEqual({ dns: NAMES, excludesIps: true });
+    // Read back independently of the parser above.
+    const text = Bun.spawnSync([OPENSSL, 'x509', '-noout', '-text'], {
+      stdin: Buffer.from(ca.cert),
+    }).stdout.toString();
+    // OpenSSL and LibreSSL may spell the all-zero IPv6 address differently (`::` or `0:0:...`).
+    expect(text).toMatch(/Excluded:\s+IP:0\.0\.0\.0\/0\.0\.0\.0\s+IP:[0:]+\/[0:]+\s/);
+    expect(caConstraints(ipOpenCa(CA_DAYS, t0).cert)).toEqual({ dns: NAMES, excludesIps: false });
+    expect(caConstraints(caCertificate(NAME, CA_DAYS, t0).cert)).toBeUndefined();
+    expect(caConstraints('garbage')).toBeUndefined();
+  });
+
+  it('reads a CA that excludes only some addresses as permitting IP addresses', () => {
+    // Give the IPv6 subtree a /8 mask: not every address is excluded any more.
+    const der = Buffer.from(new X509Certificate(tenantCa(CA_DAYS, t0).cert).raw).toString('hex');
+    const v6 = `8720${'00'.repeat(32)}`;
+    const narrowed = der.replace(v6, `8720${'00'.repeat(16)}ff${'00'.repeat(15)}`);
+    expect(narrowed).not.toBe(der);
+    expect(caConstraints(toPem(Buffer.from(narrowed, 'hex')))?.excludesIps).toBe(false);
+  });
+
+  it('excludes every IP address when the name constraints do not parse (fails closed)', () => {
+    const ca = tenantCa(CA_DAYS, t0, ['zzzz']);
+    const der = Buffer.from(new X509Certificate(ca.cert).raw).toString('hex');
+    const pem = toPem(Buffer.from(der.replace('82047a7a7a7a', '82887a7a7a7a'), 'hex'));
+    expect(caConstraints(pem)).toEqual({ dns: [], excludesIps: true });
+    expect(namesPermittedBy(pem, { dns: [], ips: ['127.0.0.1'] }).ips).toEqual([]);
+  });
+
+  it('refuses a leaf with an IP address, in OpenSSL and the X.509 helper', () => {
+    const ca = tenantCa(CA_DAYS, t0);
+    for (const ips of [['127.0.0.1'], ['10.1.2.3']]) {
+      const leaf = ipLeaf(ca, ips);
+      expect(withinNameConstraints(leaf, ca.cert)).toBe(false);
+      expect(verifiesAt(leaf, ca.cert, at(1))).toBe(false);
+      expect(opensslVerifies(leaf, ca.cert, at(1))).toBe(false);
+    }
+    const plain = leafCertificate('x', NAMES, [], 30, ca.cert, ca.key, t0).cert;
+    expect(verifiesAt(plain, ca.cert, at(1))).toBe(true);
+    expect(opensslVerifies(plain, ca.cert, at(1))).toBe(true);
+    // The CA from before #381 accepts the same leaf.
+    const open = ipOpenCa(CA_DAYS, t0);
+    expect(opensslVerifies(ipLeaf(open), open.cert, at(1))).toBe(true);
+  });
+
+  it("is enforced by Bun's TLS client, which accepts the controller's leaf by DNS name", async () => {
+    const ca = caCertificate('A', 30, new Date(), NAMES, true);
+    expect(await handshake(ca, ca.cert, NAMES)).toBe('ok');
+    expect(await handshake(ca, ca.cert, NAMES, ['127.0.0.1'])).toBe('rejected');
+    expect(await handshake(ca, ca.cert, NAMES, ['127.0.0.1'], '127.0.0.1')).toBe('rejected');
+    // During the rotation the bundle holds both CAs under the same subject: a leaf with an IP
+    // address from the CA before #381 still verifies, and so does the new CA's leaf.
+    const open = caCertificate('A', 30, new Date(), NAMES);
+    expect(await handshake(open, open.cert + ca.cert, NAMES, ['127.0.0.1'])).toBe('ok');
+    expect(await handshake(open, ca.cert + open.cert, NAMES, ['127.0.0.1'])).toBe('ok');
+    expect(await handshake(ca, open.cert + ca.cert, NAMES)).toBe('ok');
+  });
+
+  it('drops IP addresses from the leaf names a CA excluding them signs', () => {
+    const wanted: CertNames = { dns: NAMES, ips: ['127.0.0.1'] };
+    expect(namesPermittedBy(tenantCa(CA_DAYS, t0).cert, wanted)).toEqual({ dns: NAMES, ips: [] });
+    expect(leafNames({ current: tenantCa(CA_DAYS, t0) }, wanted)).toEqual({ dns: NAMES, ips: [] });
+  });
+
+  it('creates a CA that excludes IP addresses unless the leaf needs one', () => {
+    const excluding = rotateCas({}, PROFILE, t0).current.cert;
+    expect(caConstraints(excluding)?.excludesIps).toBe(true);
+    const empty = rotateCas({}, { ...PROFILE, ipAddresses: [] }, t0).current.cert;
+    expect(caConstraints(empty)?.excludesIps).toBe(true);
+    // An IP-literal public URL keeps IP addresses unconstrained: Bun rejects any IP constraint.
+    const open = rotateCas({}, { ...PROFILE, ipAddresses: ['10.1.2.3'] }, t0).current.cert;
+    expect(caConstraints(open)).toEqual({ dns: NAMES, excludesIps: false });
+  });
+
+  it('rolls a CA from before #381 to one excluding IP addresses with no trust gap', () => {
+    const steps = walk({ current: ipOpenCa(CA_DAYS, t0) }, [
+      // Before the upgrade the leaf names 127.0.0.1.
+      [100, NAMES, ['127.0.0.1']],
+      [101, NAMES],
+      [101 + CA_OVERLAP_DAYS - 1, NAMES],
+      [101 + CA_OVERLAP_DAYS + 1, NAMES],
+      [101 + 2 * CA_OVERLAP_DAYS - 1, NAMES],
+      [101 + 2 * CA_OVERLAP_DAYS + 1, NAMES],
+    ]);
+    expectNoTrustGap(steps);
+    const [steady, published, waiting, switched, kept, retired] = steps as Step[] as [
+      Step,
+      Step,
+      Step,
+      Step,
+      Step,
+      Step,
+    ];
+    const a = steady.cas.current.cert;
+    expect(sans(steady.leaf)).toContain('IP Address:127.0.0.1');
+    // While the leaf wants an IP address (an IP-literal URL) the IP-open CA is kept: no rotation.
+    expect(steady.cas.next).toBeUndefined();
+    // Publish: the successor excludes IP addresses; A's leaf, with 127.0.0.1, is still served.
+    expect(published.cas.current.cert).toBe(a);
+    expect(caConstraints(published.cas.next?.cert ?? '')).toEqual({
+      dns: NAMES,
+      excludesIps: true,
+    });
+    expect(published.leaf).toBe(steady.leaf);
+    expect(waiting.cas).toEqual(published.cas);
+    // Switch: the successor signs a leaf without IP addresses; A stays for the overlap.
+    expect(switched.cas).toEqual({ current: published.cas.next as KeyPair, previous: a });
+    expect(bundle(switched.cas)).toBe(bundle(published.cas));
+    expect(sans(switched.leaf)).toBe('DNS:tenant-controller, DNS:localhost');
+    expect(kept.cas).toEqual(switched.cas);
+    // Retire: the leaf with 127.0.0.1 no longer verifies, in OpenSSL either.
+    expect(retired.cas).toEqual({ current: published.cas.next as KeyPair });
+    expect(opensslVerifies(steady.leaf, bundle(retired.cas), retired.at)).toBe(false);
+  });
+
+  it('rolls to a CA permitting IP addresses when an IP-literal public URL is set', () => {
+    const steps = walk({ current: tenantCa(CA_DAYS, t0) }, [
+      [100, NAMES],
+      [101, NAMES, ['10.1.2.3']],
+      [101 + CA_OVERLAP_DAYS + 1, NAMES, ['10.1.2.3']],
+      [101 + 2 * CA_OVERLAP_DAYS + 1, NAMES, ['10.1.2.3']],
+    ]);
+    expectNoTrustGap(steps);
+    const [, published, switched] = steps as [Step, Step, Step];
+    // The current CA excludes IP addresses, so the new address waits for the switch.
+    expect(sans(published.leaf)).not.toContain('IP Address');
+    expect(caConstraints(published.cas.next?.cert ?? '')?.excludesIps).toBe(false);
+    expect(sans(switched.leaf)).toContain('IP Address:10.1.2.3');
   });
 });

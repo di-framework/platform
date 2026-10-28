@@ -15,6 +15,7 @@ import {
   IMMUTABLE_ON_EDIT,
   isDisabled,
   type JsonPatchOp,
+  networkPolicyEngineChoices,
   objectPath,
   type PlatformInstanceForm,
   TENANT_AUTH_FIELDS,
@@ -25,6 +26,7 @@ import {
   celErrors,
   crdCelRules,
   EMULATED_CEL_RULES,
+  KUBE_ROUTER_MESSAGE,
   loadCrd,
   schemaErrors,
 } from './testdata/crdSchema';
@@ -54,7 +56,7 @@ const typed: Record<keyof typeof fixtures, PlatformInstanceForm> = {
     namespace: 'team-b',
     version: '6.0.18-rc.1',
     targetType: 'vcluster',
-    networkPolicyEngine: 'kube-router',
+    networkPolicyEngine: 'existing',
     storageRoot: '/var/lib/di-framework/team-b/full-instance',
     httpNodePort: '30080',
     httpEndpoint: 'http://apps.example:30080',
@@ -968,5 +970,55 @@ describe('validation', () => {
       expect(validateForm(form, 'create')).toEqual({});
       expect(schemaErrors(buildPlatformInstance(form))).toEqual([]);
     }
+  });
+});
+
+describe('networkPolicyEngine on the vcluster target (#456)', () => {
+  type Subject = Parameters<typeof celErrors>[0];
+  const withEngine = (engine?: 'existing' | 'kube-router', version = '6.0.17') => {
+    const obj = structuredClone(minimal);
+    obj.spec.version = version;
+    if (engine) {
+      obj.spec.platform = { ...obj.spec.platform, networkPolicyEngine: engine };
+    }
+    return obj as unknown as Subject;
+  };
+
+  it('offers only existing, plus kube-router for an instance that already has it', () => {
+    expect(networkPolicyEngineChoices()).toStrictEqual(['existing']);
+    expect(networkPolicyEngineChoices('existing')).toStrictEqual(['existing']);
+    expect(networkPolicyEngineChoices('kube-router')).toStrictEqual(['existing', 'kube-router']);
+  });
+
+  it('refuses kube-router on create and on an instance that did not have it', () => {
+    const form: PlatformInstanceForm = {
+      ...emptyForm('team-a'),
+      name: 'one',
+      version: '6.0.17',
+      networkPolicyEngine: 'kube-router',
+    };
+    expect(validateForm(form, 'create').networkPolicyEngine).toMatch(/Use existing/);
+    expect(validateForm(form, 'edit', 'existing').networkPolicyEngine).toMatch(/Use existing/);
+    expect(validateForm(form, 'edit').networkPolicyEngine).toMatch(/Use existing/);
+    expect(validateForm(form, 'edit', 'kube-router')).toEqual({});
+    // A create can't borrow a stored value.
+    expect(validateForm(form, 'create', 'kube-router').networkPolicyEngine).toBeDefined();
+    // What the form refuses, the CRD refuses.
+    expect(schemaErrors(buildPlatformInstance(form))).toEqual([]);
+    expect(celErrors(buildPlatformInstance(form) as unknown as Subject)).toEqual([
+      KUBE_ROUTER_MESSAGE,
+    ]);
+  });
+
+  it('emulates the CRD rule: new kube-router refused, stored kube-router kept', () => {
+    expect(celErrors(withEngine('existing'))).toEqual([]);
+    expect(celErrors(withEngine())).toEqual([]);
+    expect(celErrors(withEngine('kube-router'))).toEqual([KUBE_ROUTER_MESSAGE]);
+    expect(celErrors(withEngine('kube-router'), withEngine('existing'))).toEqual([
+      KUBE_ROUTER_MESSAGE,
+    ]);
+    expect(celErrors(withEngine('kube-router'), withEngine())).toEqual([KUBE_ROUTER_MESSAGE]);
+    expect(celErrors(withEngine('kube-router', '6.0.18'), withEngine('kube-router'))).toEqual([]);
+    expect(celErrors(withEngine('existing'), withEngine('kube-router'))).toEqual([]);
   });
 });

@@ -55,6 +55,10 @@ spec:
             description: |-
               PlatformInstanceSpec is the desired platform instance. The target and storageRoot are fixed at
               creation: the operator would otherwise lose track of the cluster and data it made.
+
+              platform.networkPolicyEngine kube-router is refused on the vcluster target. An instance stored
+              with kube-router before that rule can still be updated while it keeps the value; it can't be set
+              anew, and an instance moved to existing can't go back.
             properties:
               deletionPolicy:
                 default: Delete
@@ -89,7 +93,8 @@ spec:
                     default: existing
                     description: |-
                       NetworkPolicyEngine is existing (default: the target enforces NetworkPolicy) or
-                      kube-router (the platform runs its own policy controller).
+                      kube-router (the platform runs its own policy controller). kube-router is refused on the
+                      vcluster target for new instances and for switching to it (#456).
                     enum:
                     - existing
                     - kube-router
@@ -397,6 +402,15 @@ spec:
             x-kubernetes-validations:
             - message: target is immutable
               rule: self.target == oldSelf.target
+            - message: 'platform.networkPolicyEngine kube-router is not supported
+                on the vcluster target: it would run a second kube-router on the host''s
+                node and race the host''s enforcement of the instance''s NetworkPolicies.
+                Use existing (the host cluster''s policy engine enforces them)'
+              optionalOldSelf: true
+              rule: '!(self.target.type == ''vcluster'' && has(self.platform) && has(self.platform.networkPolicyEngine)
+                && self.platform.networkPolicyEngine == ''kube-router'') || (oldSelf.hasValue()
+                && has(oldSelf.value().platform) && has(oldSelf.value().platform.networkPolicyEngine)
+                && oldSelf.value().platform.networkPolicyEngine == ''kube-router'')'
             - message: platform.storageRoot is immutable
               rule: 'has(self.platform) && has(self.platform.storageRoot) ? has(oldSelf.platform)
                 && has(oldSelf.platform.storageRoot) && oldSelf.platform.storageRoot
