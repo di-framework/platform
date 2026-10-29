@@ -433,7 +433,6 @@ describe('tenant RBAC, quotas, admission policies, and network isolation', () =>
       'test-backend-config',
       'test-backingservices',
       'test-managed-config-keys',
-      'test-managed-secret-keys',
       'test-reserved-workloads',
       'test-servicebindings',
       'test-services',
