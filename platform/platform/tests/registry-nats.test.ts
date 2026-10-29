@@ -831,8 +831,8 @@ describe('registry blobstore credential keys admission (#159)', () => {
 });
 
 describe('controller-managed ConfigMaps and Secrets never carry the credential keys (#159)', () => {
-  const spec = policy('managed-config-keys');
-  const rule = must(spec.validations[0], 'managed-config-keys rule');
+  const rule = must(policy('managed-config-keys').validations[0], 'managed-config-keys rule');
+  const secretRule = must(policy('managed-secret-keys').validations[0], 'managed-secret-keys rule');
   const cases: [
     string,
     Record<string, unknown> | undefined,
@@ -852,6 +852,7 @@ describe('controller-managed ConfigMaps and Secrets never carry the credential k
 
   it('matches the mirror for every requester, ConfigMaps and Secrets alike', () => {
     expect(rule.message).toBe(MANAGED_CONFIG_KEYS_MESSAGE);
+    expect(secretRule.message).toBe(MANAGED_CONFIG_KEYS_MESSAGE);
     const deny = (
       name: string,
       data?: Record<string, unknown>,
@@ -866,25 +867,36 @@ describe('controller-managed ConfigMaps and Secrets never carry the credential k
         };
         const actual = allowed(rule.expression, { request: { userInfo: { username } }, object });
         expect(actual).toBe(!deny(name, data, binaryData));
+        // A Secret has no binaryData field: its rule reads data only.
+        const secret = { metadata: { name }, ...(data ? { data } : {}) };
+        const secretActual = allowed(secretRule.expression, {
+          request: { userInfo: { username } },
+          object: secret,
+        });
+        expect(secretActual).toBe(!deny(name, data));
       }
+    expect(secretRule.expression).not.toContain('binaryData');
     expect(
       cases.filter(([n, d, b]) => !managedConfigKeysAllowed({ name: n, data: d, binaryData: b })),
     ).toHaveLength(4);
   });
 
-  it('applies to ConfigMaps and Secrets on create and update, in tenant namespaces', () => {
-    const value = policyResource('managed-config-keys');
-    expect(
-      (value.spec as { matchConstraints: { resourceRules: unknown[] } }).matchConstraints
-        .resourceRules,
-    ).toEqual([
-      {
-        apiGroups: [''],
-        apiVersions: ['v1'],
-        operations: ['CREATE', 'UPDATE'],
-        resources: ['configmaps', 'secrets'],
-      },
-    ]);
+  it('applies to ConfigMaps and Secrets on create and update, one policy per kind', () => {
+    for (const [name, resource] of [
+      ['managed-config-keys', 'configmaps'],
+      ['managed-secret-keys', 'secrets'],
+    ] as const)
+      expect(
+        (policyResource(name).spec as { matchConstraints: { resourceRules: unknown[] } })
+          .matchConstraints.resourceRules,
+      ).toEqual([
+        {
+          apiGroups: [''],
+          apiVersions: ['v1'],
+          operations: ['CREATE', 'UPDATE'],
+          resources: [resource],
+        },
+      ]);
   });
 });
 
