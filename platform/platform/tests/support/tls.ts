@@ -147,6 +147,14 @@ export function opensslClientLeaf(
   ca: { cert: string; key: string },
   subjectAltName: string,
 ): string {
+  return opensslClientPair(ca, subjectAltName).cert;
+}
+
+/** {@link opensslClientLeaf} with its private key, for a client that presents it (#541 m2). */
+export function opensslClientPair(
+  ca: { cert: string; key: string },
+  subjectAltName: string,
+): { cert: string; key: string } {
   const dir = mkdtempSync(join(tmpdir(), 'ca-forge-'));
   try {
     const at = (name: string) => join(dir, name);
@@ -189,7 +197,10 @@ export function opensslClientLeaf(
       '-out',
       at('leaf.pem'),
     );
-    return readFileSync(at('leaf.pem'), 'utf8');
+    return {
+      cert: readFileSync(at('leaf.pem'), 'utf8'),
+      key: readFileSync(at('leaf.key'), 'utf8'),
+    };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

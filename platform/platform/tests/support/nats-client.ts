@@ -26,7 +26,7 @@ export class NatsClient {
   closed = false;
   closeReason = '';
   private buffer = '';
-  private pongs: (() => void)[] = [];
+  private readonly pongs: (() => void)[] = [];
   private nextSid = 1;
 
   private constructor(private readonly socket: TLSSocket) {}
@@ -128,9 +128,8 @@ export class NatsClient {
     return sid;
   }
   pub(subject: string, payload = '', reply?: string): void {
-    this.socket.write(
-      `PUB ${subject}${reply ? ` ${reply}` : ''} ${Buffer.byteLength(payload)}\r\n${payload}\r\n`,
-    );
+    const head = [subject, reply, Buffer.byteLength(payload)].filter((part) => part !== undefined);
+    this.socket.write(`PUB ${head.join(' ')}\r\n${payload}\r\n`);
   }
   /** Round-trips a PING, so everything sent before it has been processed. False when closed. */
   flush(): Promise<boolean> {

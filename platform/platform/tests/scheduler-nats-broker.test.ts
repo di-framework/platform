@@ -7,6 +7,7 @@ import {
   type IdentityRecord,
   natsServerLeaf,
   newSchedulerCa,
+  PLATFORM_SUBTREE,
   type PlatformRole,
   platformClientLeaf,
   platformUser,
@@ -24,12 +25,17 @@ import {
   GOLDEN_RECORD,
   GOLDEN_TENANTS,
 } from './support/scheduler-accounts';
+import { opensslClientPair } from './support/tls';
 
 /**
  * The scheduler NATS broker test (#541 m2, design-541 §8.2): nats-server 2.12.8, pinned by
  * digest, serving the golden `accounts.conf` behind freshly minted scheduler CAs, with the static
  * server settings of §4.1 (`verify_and_map`, both CAs, JetStream at server level) and no network
  * policy. It checks the authorization matrix, forged certificates, and reloads.
+ *
+ * The server runs with `debug: true` here only (never in a rendered production config), because
+ * nats-server logs why it refused a TLS handshake at debug level only; the forged-certificate
+ * cases assert that reason.
  *
  * It needs docker or podman and pulls one image, so it runs only with SCHEDULER_NATS_BROKER=1 (the
  * `scheduler-nats-broker` job in .github/workflows/ci.yml); plain `bun test` skips it.
@@ -47,6 +53,7 @@ const server = `scheduler-nats-broker-${randomBytes(4).toString('hex')}`;
 const DIR = '/tmp/nats';
 const ACCOUNTS = `${DIR}/accounts/accounts.conf`;
 const SERVER_CONF = `port: 4222
+debug: true
 pid_file: "/tmp/nats.pid"
 tls {
   cert_file: "${DIR}/server.crt"
@@ -90,6 +97,8 @@ function reload(accounts: string) {
     { ACCOUNTS: accounts },
   );
 }
+/** The server's log so far (nats-server logs to stderr). */
+const serverLog = () => container(['logs', server]).stderr;
 const until = async (check: () => boolean | Promise<boolean>, ms = 10_000) => {
   const end = Date.now() + ms;
   while (Date.now() < end) {
@@ -143,6 +152,30 @@ async function refused(credentials: Credentials): Promise<string> {
   }
   return result.refused;
 }
+/**
+ * Connects with `credentials`, expects a refusal during the TLS handshake, and returns the
+ * server's `TLS handshake error` log lines for it, which name the x509 reason.
+ */
+async function tlsRefusal(credentials: Credentials): Promise<string> {
+  const before = serverLog().length;
+  expect(await refused(credentials)).toMatch(/^(tls|closed)/);
+  let lines = '';
+  await until(() => {
+    lines = serverLog()
+      .slice(before)
+      .split('\n')
+      .filter((line) => line.includes('TLS handshake error'))
+      .join('\n');
+    return lines !== '';
+  });
+  return lines;
+}
+const UNKNOWN_AUTHORITY = 'x509: certificate signed by unknown authority';
+const NOT_A_CA = 'x509: invalid signature: parent certificate cannot sign this kind of certificate';
+const NAME_CONSTRAINTS =
+  'x509: a root or intermediate certificate is not authorized to sign for this name';
+const EXPIRED = 'x509: certificate has expired or is not yet valid';
+const KEY_USAGE = 'x509: certificate specifies an incompatible key usage';
 
 describe.skipIf(!enabled)('scheduler NATS broker (#541 m2, design-541 §8.2)', () => {
   const golden = readFileSync(GOLDEN_FILE, 'utf8');
@@ -340,22 +373,24 @@ describe.skipIf(!enabled)('scheduler NATS broker (#541 m2, design-541 §8.2)', (
 
     it('a CA that is not the tenant CA, claiming a recorded user', async () => {
       expect(
-        await refused(creds(clientLeaf(tenantHostUser('b', GOLDEN_IDS.bHosts), foreignTenant))),
-      ).toMatch(/^(tls|closed)/);
+        await tlsRefusal(creds(clientLeaf(tenantHostUser('b', GOLDEN_IDS.bHosts), foreignTenant))),
+      ).toContain(UNKNOWN_AUTHORITY);
       expect(
-        await refused(
+        await tlsRefusal(
           creds(clientLeaf(tenantOperatorUser('a', GOLDEN_IDS.aOperator), foreignPlatform)),
         ),
-      ).toMatch(/^(tls|closed)/);
+      ).toContain(UNKNOWN_AUTHORITY);
     });
 
     it("a tenant host's own certificate used as a CA to claim another tenant", async () => {
+      const forged = clientLeaf(tenantHostUser('b', GOLDEN_IDS.bHosts), aHostLeaf);
+      // The chain is sent, so the server reaches the host certificate and refuses it as a CA.
       expect(
-        await refused(creds(clientLeaf(tenantHostUser('b', GOLDEN_IDS.bHosts), aHostLeaf))),
-      ).toMatch(/^(tls|closed)/);
+        await tlsRefusal(creds({ cert: forged.cert + aHostLeaf.cert, key: forged.key })),
+      ).toContain(NOT_A_CA);
     });
 
-    it('a tenant CA certificate claiming another tenant, or an unrecorded issuance', async () => {
+    it('a tenant CA certificate claiming an unrecorded issuance of another tenant or its own', async () => {
       expect(
         await refused(creds(clientLeaf(tenantHostUser('b', 'bbbbbbbbbbbbbbbf'), tenantCa))),
       ).toBe('Authorization Violation');
@@ -370,22 +405,38 @@ describe.skipIf(!enabled)('scheduler NATS broker (#541 m2, design-541 §8.2)', (
         platformUser('operator', GOLDEN_IDS.platformOperator),
         'aaaaaaaaaaaaaaa1.di-tenant-a.tenants.scheduler.example',
       ])
-        expect(await refused(creds(clientLeaf(user, tenantCa)))).toMatch(/^(tls|closed)/);
+        expect(await tlsRefusal(creds(clientLeaf(user, tenantCa)))).toContain(NAME_CONSTRAINTS);
+    });
+
+    it('a tenant CA certificate naming a platform user as a URI or email SAN', async () => {
+      const user = platformUser('operator', GOLDEN_IDS.platformOperator);
+      for (const san of [
+        `URI:https://${user}/`,
+        `URI:https://${PLATFORM_SUBTREE}/x`,
+        `email:x@${user}`,
+        `email:${user}@${PLATFORM_SUBTREE}`,
+      ])
+        expect([san, await tlsRefusal(creds(opensslClientPair(tenantCa, san)))]).toEqual([
+          san,
+          expect.stringContaining(NAME_CONSTRAINTS),
+        ]);
     });
 
     it('an expired certificate of a recorded user', async () => {
       const issued = new Date(now.getTime() - (SCHEDULER_LEAF_DAYS + 1) * 86_400_000);
       expect(
-        await refused(creds(clientLeaf(tenantHostUser('a', GOLDEN_IDS.aHosts), tenantCa, issued))),
-      ).toMatch(/^(tls|closed)/);
+        await tlsRefusal(
+          creds(clientLeaf(tenantHostUser('a', GOLDEN_IDS.aHosts), tenantCa, issued)),
+        ),
+      ).toContain(EXPIRED);
     });
 
     it('a server-auth certificate, and one with no user name', async () => {
       expect(
-        await refused(
+        await tlsRefusal(
           creds(clientLeaf(tenantHostUser('a', GOLDEN_IDS.aHosts), tenantCa, now, 'server')),
         ),
-      ).toMatch(/^(tls|closed)/);
+      ).toContain(KEY_USAGE);
       expect(
         await refused(
           creds(
@@ -461,8 +512,19 @@ describe.skipIf(!enabled)('scheduler NATS broker (#541 m2, design-541 §8.2)', (
         `{ user: "${bUser}" }\n      { user: "${tenantHostUser('d', dHosts)}"`,
       );
       expect(colliding).not.toBe(withD);
+      const before = serverLog().length;
       reload(colliding);
-      await Bun.sleep(1_000);
+      // The server refuses the whole file and keeps serving the previous configuration.
+      let failure = '';
+      expect(
+        await until(() => {
+          failure = serverLog().slice(before);
+          return failure.includes('[ERR]');
+        }),
+      ).toBe(true);
+      // The line named depends on the server's account order, so only the file is matched.
+      expect(failure).toContain(`[ERR] Failed to reload server configuration: ${ACCOUNTS}:`);
+      expect(failure).toContain(`Duplicate user "${bUser}" detected`);
       expect(await refused(host('d', dHosts))).toBe('Authorization Violation');
       for (const client of [aHost, bHost, bOperator]) expect(await client.flush()).toBe(true);
     });
