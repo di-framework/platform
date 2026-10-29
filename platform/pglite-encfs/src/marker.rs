@@ -5,8 +5,26 @@
 //! whole preopen before any mutation. That matters: pglite re-extracts its
 //! runtime files with `open(CREATE|TRUNCATE)` at every start, so a per-file
 //! check alone would let a wrong-key start overwrite correctly encrypted files.
+//!
+//! The marker also fixes the directory's mode ([`Mode`]); nothing else does
+//! (#200, design note section 9.1):
+//!
+//! - `DIPGKEY1 ‖ KCV` (24 bytes): an XTS directory (codecs 2 and 3).
+//! - `DIPGKEY2 ‖ KCV ‖ flags` (25 bytes): an integrity directory. `flags` is a
+//!   bit set: bit 0 = codec 4, bit 1 = reservation. A keyed marker has flags
+//!   `0b01`. The reservation ([`RESERVATION`]: `DIPGKEY2`, 16 zero bytes,
+//!   `0b11`) carries no key material: the platform writes it into a new, empty
+//!   directory to ask for integrity. Any other flag bit fails closed.
+//!
+//! Every `DIPGKEY2` form is at least [`MARKER_LEN`] bytes long, so builds that
+//! do not know it lock it as corrupt instead of initialising an XTS directory
+//! over it. This build reads integrity directories but cannot create them: a
+//! reservation in a root without data locks with [`Lock::IntegrityUnsupported`].
 
+use crate::codec::Codec;
+use crate::header::HEADER_LEN;
 use crate::keys::{Kcv, KeyRing, KCV_LEN};
+use crate::slots::PAIRS_START;
 
 /// File name of the marker, hidden from listings of the root.
 pub const MARKER_NAME: &str = ".di-encfs";
@@ -15,6 +33,50 @@ pub const MARKER_NAME: &str = ".di-encfs";
 pub const MARKER_TMP_NAME: &str = ".di-encfs.tmp";
 pub const MARKER_MAGIC: &[u8; 8] = b"DIPGKEY1";
 pub const MARKER_LEN: usize = MARKER_MAGIC.len() + KCV_LEN;
+/// Magic of the integrity markers, keyed and reservation.
+pub const MARKER2_MAGIC: &[u8; 8] = b"DIPGKEY2";
+/// `DIPGKEY2 ‖ KCV ‖ flags`.
+pub const MARKER2_LEN: usize = MARKER_LEN + 1;
+/// Flag bit 0: the directory's files are codec 4.
+pub const FLAG_CODEC4: u8 = 0b01;
+/// Flag bit 1: a reservation; the KCV is unset and must be zero.
+pub const FLAG_RESERVATION: u8 = 0b10;
+/// How many bytes of a marker to read: one more than the longest form, so a
+/// longer file is never mistaken for a valid marker.
+pub const MARKER_READ_LEN: usize = MARKER2_LEN + 1;
+
+/// The integrity reservation: `DIPGKEY2`, a zero KCV and flags `0b11`.
+pub const RESERVATION: [u8; MARKER2_LEN] = *b"DIPGKEY2\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x03";
+
+/// How a directory's files are encrypted, fixed by its marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// AES-256-XTS files, codec 2 or 3 (`DIPGKEY1`).
+    Xts,
+    /// Codec-4 files only (keyed `DIPGKEY2`, #200).
+    Integrity,
+}
+
+impl Mode {
+    /// Whether a file of `codec` may live in a directory of this mode: a
+    /// directory never mixes XTS and codec-4 files.
+    pub fn admits(self, codec: Codec) -> bool {
+        match self {
+            Mode::Xts => codec.is_xts(),
+            Mode::Integrity => codec == Codec::TwoSlotAead,
+        }
+    }
+
+    /// A file no longer than this holds no data (see
+    /// [`crate::header::classify_in`]): 4096 for XTS; 12288 in an integrity
+    /// directory, after the header page and the two watermark pages (C8a).
+    pub fn data_start(self) -> u64 {
+        match self {
+            Mode::Xts => HEADER_LEN,
+            Mode::Integrity => PAIRS_START,
+        }
+    }
+}
 
 /// The directory ext4 volume roots (PVCs) always carry. fsck reconnects
 /// orphaned inodes there, so on an encrypted volume it can hold sealed files
@@ -127,23 +189,61 @@ pub fn may_reach_marker<N: Namespace>(
     }
 }
 
-pub fn encode(kcv: &Kcv) -> [u8; MARKER_LEN] {
-    let mut bytes = [0u8; MARKER_LEN];
-    bytes[..MARKER_MAGIC.len()].copy_from_slice(MARKER_MAGIC);
-    bytes[MARKER_MAGIC.len()..].copy_from_slice(kcv);
+/// The keyed marker of a directory of `mode` under the key with `kcv`:
+/// `DIPGKEY1 ‖ KCV`, or `DIPGKEY2 ‖ KCV ‖ 0b01`. Rotation writes the marker in
+/// the directory's own mode, so an integrity directory keeps its flags.
+pub fn encode(mode: Mode, kcv: &Kcv) -> Vec<u8> {
+    let magic = match mode {
+        Mode::Xts => MARKER_MAGIC,
+        Mode::Integrity => MARKER2_MAGIC,
+    };
+    let mut bytes = [&magic[..], kcv].concat();
+    if mode == Mode::Integrity {
+        bytes.push(FLAG_CODEC4);
+    }
     bytes
+}
+
+/// What a marker of at least [`MARKER_LEN`] bytes is.
+#[derive(Debug, PartialEq, Eq)]
+enum Form<'a> {
+    Keyed { mode: Mode, kcv: &'a [u8] },
+    Reservation,
+    Corrupt,
+}
+
+fn form(marker: &[u8]) -> Form<'_> {
+    if marker.len() == MARKER_LEN && marker.starts_with(MARKER_MAGIC) {
+        return Form::Keyed {
+            mode: Mode::Xts,
+            kcv: &marker[MARKER_MAGIC.len()..],
+        };
+    }
+    if marker.len() != MARKER2_LEN || !marker.starts_with(MARKER2_MAGIC) {
+        return Form::Corrupt;
+    }
+    let kcv = &marker[MARKER2_MAGIC.len()..MARKER_LEN];
+    match marker[MARKER_LEN] {
+        FLAG_CODEC4 => Form::Keyed {
+            mode: Mode::Integrity,
+            kcv,
+        },
+        _ if marker == RESERVATION => Form::Reservation,
+        // Unknown bits, or a reservation with a KCV: fail closed.
+        _ => Form::Corrupt,
+    }
 }
 
 /// What to do with a preopen root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootDecision {
     /// The marker matches the current key.
-    Ready,
-    /// Empty directory: write the marker for the current key, then use it.
+    Ready(Mode),
+    /// Empty directory: write the XTS marker for the current key, then use it.
     Initialize,
     /// The marker matches the previous key: re-wrap every file header under the
-    /// current key, then flip the marker.
-    Rotate,
+    /// current key, then flip the marker in the same mode.
+    Rotate(Mode),
     /// Refuse every operation on this preopen.
     Locked(Lock),
 }
@@ -156,8 +256,15 @@ pub enum Lock {
     WrongKey,
     /// Data without a marker: an unencrypted directory (refused, never migrated in place).
     Unencrypted,
-    /// The marker exists but is not a marker.
+    /// The marker exists but is not a marker this build knows: another magic
+    /// or length, unknown `DIPGKEY2` flags, or a reservation with a KCV.
     CorruptMarker,
+    /// An integrity reservation in a root without data. Initialising it needs
+    /// the codec-4 writer, which this build does not have (#200).
+    IntegrityUnsupported,
+    /// An integrity reservation next to data: something other than encfs
+    /// wrote into a reserved directory.
+    ReservedWithData,
 }
 
 impl Lock {
@@ -174,6 +281,12 @@ impl Lock {
                 "the data directory has data but no encryption marker (an unencrypted directory); refusing. Migrate it offline into an empty directory first"
             }
             Lock::CorruptMarker => "the encryption marker (.di-encfs) is corrupt; refusing",
+            Lock::IntegrityUnsupported => {
+                "the data directory is reserved for integrity mode (codec 4); this build reads integrity directories but cannot initialise one, so it refuses. Deploy an encfs build with the codec-4 writer"
+            }
+            Lock::ReservedWithData => {
+                "the data directory is reserved for integrity mode (codec 4) but already holds data that encfs did not write; refusing"
+            }
         }
     }
 
@@ -183,12 +296,15 @@ impl Lock {
     }
 }
 
-/// Decide from the marker contents (`None` when absent) and whether the root
-/// has other entries (see [`is_volume_metadata`]).
+/// Decide from the marker contents (`None` when absent; read up to
+/// [`MARKER_READ_LEN`] bytes) and whether the root has other entries (see
+/// [`is_volume_metadata`]). This is the table of section 9.1 of the #200
+/// design note, for a build that reads codec 4 but cannot create it.
 ///
 /// An empty or short marker in a root without data is what a crash during the
 /// first start could leave behind before markers were written atomically; it
-/// is initialized again rather than reported as corrupt.
+/// is initialized again rather than reported as corrupt. A reservation is
+/// written by rename and is never short.
 pub fn decide(keys: &KeyRing, marker: Option<&[u8]>, has_data: bool) -> RootDecision {
     let Some(current) = keys.current() else {
         return RootDecision::Locked(Lock::NoKey);
@@ -203,17 +319,19 @@ pub fn decide(keys: &KeyRing, marker: Option<&[u8]>, has_data: bool) -> RootDeci
     if marker.len() < MARKER_LEN && !has_data {
         return RootDecision::Initialize;
     }
-    if marker.len() != MARKER_LEN || &marker[..MARKER_MAGIC.len()] != MARKER_MAGIC {
-        return RootDecision::Locked(Lock::CorruptMarker);
-    }
-    let kcv = &marker[MARKER_MAGIC.len()..];
+    let (mode, kcv) = match form(marker) {
+        Form::Keyed { mode, kcv } => (mode, kcv),
+        Form::Reservation if has_data => return RootDecision::Locked(Lock::ReservedWithData),
+        Form::Reservation => return RootDecision::Locked(Lock::IntegrityUnsupported),
+        Form::Corrupt => return RootDecision::Locked(Lock::CorruptMarker),
+    };
     if current.matches(kcv) {
-        RootDecision::Ready
+        RootDecision::Ready(mode)
     } else if keys
         .previous()
         .is_some_and(|previous| previous.matches(kcv))
     {
-        RootDecision::Rotate
+        RootDecision::Rotate(mode)
     } else {
         RootDecision::Locked(Lock::WrongKey)
     }
@@ -233,19 +351,23 @@ mod tests {
     }
 
     fn marker(b: u8) -> [u8; MARKER_LEN] {
-        encode(kek(b).kcv())
+        encode(Mode::Xts, kek(b).kcv()).try_into().unwrap()
+    }
+
+    fn integrity(b: u8) -> [u8; MARKER2_LEN] {
+        encode(Mode::Integrity, kek(b).kcv()).try_into().unwrap()
     }
 
     #[test]
     fn matching_marker_is_ready() {
         assert_eq!(
             decide(&ring(Some(1), None), Some(&marker(1)), true),
-            RootDecision::Ready
+            RootDecision::Ready(Mode::Xts)
         );
         // The same key in both variables is not a rotation.
         assert_eq!(
             decide(&ring(Some(1), Some(1)), Some(&marker(1)), true),
-            RootDecision::Ready
+            RootDecision::Ready(Mode::Xts)
         );
     }
 
@@ -281,7 +403,7 @@ mod tests {
         );
         assert_eq!(
             decide(&ring(Some(2), Some(1)), Some(&marker(1)), true),
-            RootDecision::Rotate
+            RootDecision::Rotate(Mode::Xts)
         );
         assert_eq!(
             decide(&ring(Some(2), Some(3)), Some(&marker(1)), true),
@@ -325,6 +447,139 @@ mod tests {
             RootDecision::Locked(Lock::NoKey)
         );
         assert!(is_volume_metadata(MARKER_NAME) && is_volume_metadata(MARKER_TMP_NAME));
+    }
+
+    #[test]
+    fn integrity_marker_layout() {
+        let keyed = integrity(1);
+        assert_eq!(&keyed[..8], b"DIPGKEY2");
+        assert_eq!(&keyed[8..24], kek(1).kcv());
+        assert_eq!(keyed[24], 0b01);
+        assert_eq!(&RESERVATION[..8], b"DIPGKEY2");
+        assert_eq!(RESERVATION[8..24], [0; 16]);
+        assert_eq!(RESERVATION[24], 0b11);
+        assert_eq!(MARKER_READ_LEN, 26);
+        // The format constraint of section 9.1: every DIPGKEY2 form is at
+        // least MARKER_LEN bytes, so older builds never re-initialise it.
+        assert!(keyed.len() >= MARKER_LEN && RESERVATION.len() >= MARKER_LEN);
+    }
+
+    /// The marker rule of every build before this one (`decide` at
+    /// `src/marker.rs:192-221` on `origin/main` `d182bea`), frozen.
+    fn decide_without_codec_4(marker: &[u8], has_data: bool) -> Option<Lock> {
+        if marker.len() < MARKER_LEN && !has_data {
+            return None;
+        }
+        (marker.len() != MARKER_LEN || !marker.starts_with(MARKER_MAGIC))
+            .then_some(Lock::CorruptMarker)
+    }
+
+    #[test]
+    fn older_builds_lock_every_integrity_marker() {
+        // G6: a build without codec 4 refuses an integrity directory and a
+        // reservation before it writes anything, with or without data.
+        let mut longer = integrity(1).to_vec();
+        longer.push(0);
+        for m in [&integrity(1)[..], &RESERVATION[..], &longer[..]] {
+            for has_data in [false, true] {
+                assert_eq!(
+                    decide_without_codec_4(m, has_data),
+                    Some(Lock::CorruptMarker),
+                    "{m:?} {has_data}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keyed_integrity_markers_decide_by_kcv() {
+        for has_data in [false, true] {
+            assert_eq!(
+                decide(&ring(Some(1), None), Some(&integrity(1)), has_data),
+                RootDecision::Ready(Mode::Integrity)
+            );
+            assert_eq!(
+                decide(&ring(Some(2), Some(1)), Some(&integrity(1)), has_data),
+                RootDecision::Rotate(Mode::Integrity)
+            );
+            assert_eq!(
+                decide(&ring(Some(2), Some(3)), Some(&integrity(1)), has_data),
+                RootDecision::Locked(Lock::WrongKey)
+            );
+            assert_eq!(
+                decide(&ring(None, Some(1)), Some(&integrity(1)), has_data),
+                RootDecision::Locked(Lock::NoKey)
+            );
+        }
+    }
+
+    #[test]
+    fn a_reservation_locks_in_this_build() {
+        // Reader release (section 9.3 step 1): never an XTS directory in a
+        // reserved root.
+        assert_eq!(
+            decide(&ring(Some(1), None), Some(&RESERVATION), false),
+            RootDecision::Locked(Lock::IntegrityUnsupported)
+        );
+        assert_eq!(
+            decide(&ring(Some(1), None), Some(&RESERVATION), true),
+            RootDecision::Locked(Lock::ReservedWithData)
+        );
+        assert_eq!(
+            decide(&ring(None, None), Some(&RESERVATION), false),
+            RootDecision::Locked(Lock::NoKey)
+        );
+        for lock in [Lock::IntegrityUnsupported, Lock::ReservedWithData] {
+            assert!(!lock.is_access_error());
+            assert!(lock.message().contains("integrity mode (codec 4)"));
+        }
+    }
+
+    #[test]
+    fn unknown_integrity_marker_forms_fail_closed() {
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        // Every flags byte but 0b01 and the reservation's 0b11, keyed or not.
+        for flags in (0..=u8::MAX).filter(|f| *f != FLAG_CODEC4) {
+            let mut keyed = integrity(1);
+            keyed[MARKER_LEN] = flags;
+            cases.push(keyed.to_vec());
+            if flags != FLAG_CODEC4 | FLAG_RESERVATION {
+                let mut reserved = RESERVATION;
+                reserved[MARKER_LEN] = flags;
+                cases.push(reserved.to_vec());
+            }
+        }
+        // A reservation with a non-zero KCV, in any byte.
+        for at in MARKER2_MAGIC.len()..MARKER_LEN {
+            let mut reserved = RESERVATION;
+            reserved[at] = 1;
+            cases.push(reserved.to_vec());
+        }
+        // Another length: DIPGKEY2 at 24 or 26 bytes, DIPGKEY1 at 25.
+        cases.push(integrity(1)[..MARKER_LEN].to_vec());
+        cases.push([&integrity(1)[..], &[0]].concat());
+        cases.push([&RESERVATION[..], &[0]].concat());
+        cases.push([&marker(1)[..], &[FLAG_CODEC4]].concat());
+        for m in &cases {
+            for has_data in [false, true] {
+                assert_eq!(
+                    decide(&ring(Some(1), None), Some(m), has_data),
+                    RootDecision::Locked(Lock::CorruptMarker),
+                    "{m:?} {has_data}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mode_admits_only_its_own_codecs() {
+        assert!(Mode::Xts.admits(Codec::XtsStealing) && Mode::Xts.admits(Codec::XtsTail));
+        assert!(!Mode::Xts.admits(Codec::TwoSlotAead));
+        assert!(Mode::Integrity.admits(Codec::TwoSlotAead));
+        assert!(!Mode::Integrity.admits(Codec::XtsStealing));
+        assert!(!Mode::Integrity.admits(Codec::XtsTail));
+        assert_eq!(Mode::Xts.data_start(), 4096);
+        assert_eq!(Mode::Integrity.data_start(), 12288);
     }
 
     #[test]

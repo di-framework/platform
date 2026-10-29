@@ -12,7 +12,7 @@ guest.wasm ──di-framework:pglite/database──▶ pglite.wasm ──wasi:fi
 
 Published as `ghcr.io/di-framework/pglite-encfs@sha256:3613eab40e1ee2c2457c0fb4870190d7b6b54ba11c8b6747b269f807e49ad435`. The publish workflow rewrites this pin after every publish. The moving tags are the commit SHA and the WIT package version (`0.1.0`); only the digest is immutable.
 
-Design and spike: #199. The integrity (AEAD) mode is a follow-up: #200.
+Design and spike: #199. The integrity (AEAD) mode is #200, designed in [docs/design-200-two-slot-aead.md](docs/design-200-two-slot-aead.md). This release reads integrity directories but cannot create them; see [Integrity directories](#integrity-directories-codec-4).
 
 ## Composition
 
@@ -56,6 +56,10 @@ Before pglite can touch a preopen, encfs checks the `.di-encfs` marker at its ro
 | marker matches neither key | **refused** (`access`) |
 | `DI_PGLITE_KEY` missing or invalid | **refused** (`access`) |
 | data but no marker: an unencrypted directory | **refused** (`io`) |
+| integrity marker (`DIPGKEY2`, flags `0b01`) matching a key | start (or rotate) read-only, see [Integrity directories](#integrity-directories-codec-4) |
+| integrity reservation (`DIPGKEY2`, zero KCV, flags `0b11`), no other data | **refused** (`io`): this build cannot initialise an integrity directory |
+| integrity reservation next to other data | **refused** (`io`) |
+| any other marker: another magic or length, unknown `DIPGKEY2` flags, a reservation with a KCV | **refused** (`io`, "corrupt") |
 
 - **A refusal changes nothing.** It locks the whole preopen before anything is written. pglite surfaces it as `open-failed(...)`, and encfs prints the reason to stderr (for example, `pglite-encfs: the data directory was encrypted with a different key ...`).
 - **No partial encryption.** encfs never encrypts an existing plaintext directory in place, and never accepts a mix of plaintext and encrypted files.
@@ -96,7 +100,7 @@ Notes:
 |---|---|
 | 0..8 | magic `DIPGENC1` |
 | 8 | format version (1) |
-| 9 | codec: 2 = AES-256-XTS with ciphertext stealing (v1), 3 = AES-256-XTS with a length-independent tail (#206) |
+| 9 | codec: 2 = AES-256-XTS with ciphertext stealing (v1), 3 = AES-256-XTS with a length-independent tail (#206), 4 = two-slot AEAD, integrity directories only (#200) |
 | 16..32 | random file id |
 | 32..48 | KCV of the wrapping key |
 | 48..72 | XChaCha20 nonce |
@@ -123,6 +127,21 @@ Data units:
   - **Chosen bit flips (malleability).** Anyone who can write the volume can flip chosen plaintext bits in the last at most 15 bytes of any unaligned file, where XTS would randomize the whole 16-byte block. Under codec 2 that applied only to files under 16 bytes. This is bit-precise tampering, on top of the general "no integrity" statement below.
   - **No leak on append-only growth.** Each keystream byte then only ever covers one plaintext byte.
 - Logical sizes are capped at 1 TiB, and one write or `set-size` may zero-fill at most 1 GiB past the end of file (`file-too-large` otherwise).
+
+### Integrity directories (codec 4)
+
+An integrity directory carries the marker `DIPGKEY2 ‖ KCV ‖ flags` (25 bytes, flags `0b01`), and every file in it is codec 4. The platform asks for one by writing the reservation `DIPGKEY2`, 16 zero bytes, `0x03` into a new, empty directory; nothing in the environment selects the mode. The format, the crash analysis and the rollout are in [docs/design-200-two-slot-aead.md](docs/design-200-two-slot-aead.md). In short:
+
+```
+[header page: 4096][watermark record 0: 4096][watermark record 1: 4096][pair 0: 16512][pair 1]...
+pair u = slot A ‖ slot B, each 64 bytes of metadata plus up to 8192 bytes of XChaCha20-Poly1305 ciphertext
+```
+
+- Each 8 KiB unit has two slots; a read returns the slot with the higher generation whose tag verifies over the file id, unit, slot, generation and length. Slot and record keys are HKDF-SHA256 outputs of the file's DEK (`info = "codec4-aead"`, `"codec4-watermark"`).
+- The authenticated durable-size watermark `D` tells a crash from tampering: a unit below `D` with no valid slot was erased and reads fail with `io`; above `D` it was lost in a crash and reads as zeros, as plaintext would.
+- Integrity failures are logged as `<path>: unit <n> has no valid slot below the durable-size watermark ...; refusing` and returned as `io`.
+
+**This release is the reader release** (section 9.3 of the design note). It reads codec-4 files and the keyed marker, rotates their keys (rewriting only the 152 header bytes and keeping the marker's flags), and reports their sizes. It cannot create an integrity directory, so a reservation locks instead of becoming an XTS directory. Every write, resize or truncating open in an integrity directory fails with `io` (`integrity (codec-4) directories are read-only in this build`), and a codec-4 file in an XTS directory, or an XTS file in an integrity directory, is refused with `io`. Builds older than this one lock both integrity markers as corrupt before they write anything. The codec-4 writer, and the platform setting that reserves directories, come with the writer release.
 
 ### Crash consistency
 

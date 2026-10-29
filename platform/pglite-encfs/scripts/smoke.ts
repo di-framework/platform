@@ -55,6 +55,16 @@ const HEADER_LEN = 4096;
 const FILE_MAGIC = 'DIPGENC1';
 const MARKER_FILE = '.di-encfs';
 const MARKER_MAGIC = 'DIPGKEY1';
+/** Integrity markers (#200): `DIPGKEY2 ‖ KCV ‖ flags`, flags bit 0 codec 4, bit 1 reservation. */
+const MARKER2_MAGIC = 'DIPGKEY2';
+const FLAG_CODEC4 = 0b01;
+const FLAG_RESERVATION = 0b10;
+/** The integrity reservation the platform writes into an empty directory: a zero KCV, flags 0b11. */
+const RESERVATION = Buffer.concat([
+  Buffer.from(MARKER2_MAGIC),
+  Buffer.alloc(16),
+  Buffer.from([FLAG_CODEC4 | FLAG_RESERVATION]),
+]);
 const CUSTOM_SECTION = 'di-framework:pglite-encfs';
 /** Header byte 9; see src/header.rs. */
 const CODEC_AT = 9;
@@ -79,6 +89,15 @@ interface Keys {
 }
 
 /** Key-check value, as derived by src/keys.rs. */
+/** A keyed `DIPGKEY2` marker for `base64Key` with `flags` (FLAG_CODEC4 for a valid one). */
+function integrityMarker(base64Key: string, flags: number): Buffer {
+  return Buffer.concat([
+    Buffer.from(MARKER2_MAGIC),
+    keyCheckValue(base64Key),
+    Buffer.from([flags]),
+  ]);
+}
+
 export function keyCheckValue(base64Key: string): Buffer {
   // Node's base64 decoder accepts both alphabets, like the component.
   const master = Buffer.from(base64Key, 'base64');
@@ -568,6 +587,34 @@ export async function smoke(ctx: Context): Promise<void> {
     // A plaintext directory is refused, not migrated or mixed.
     await h.refused(enc, plain, A, 'no encryption marker');
 
+    // Integrity mode (#200), reader release: this build reads codec 4 but
+    // cannot initialise an integrity directory. A reservation in an empty
+    // root locks instead of becoming an XTS directory, a reservation next to
+    // data locks too, and unknown flags fail closed, all byte-identical.
+    const integrity = join(work, 'integrity');
+    await mkdir(integrity);
+    await writeFile(join(integrity, MARKER_FILE), RESERVATION);
+    await h.refused(enc, integrity, A, 'reserved for integrity mode (codec 4); this build reads');
+    await writeFile(join(integrity, 'PG_VERSION'), '17\n');
+    await h.refused(enc, integrity, A, 'already holds data that encfs did not write');
+    await rm(join(integrity, 'PG_VERSION'));
+    await writeFile(join(integrity, MARKER_FILE), integrityMarker(keyA, 0b101));
+    await h.refused(enc, integrity, A, 'the encryption marker (.di-encfs) is corrupt');
+    await writeFile(join(integrity, MARKER_FILE), integrityMarker(keyA, FLAG_CODEC4));
+    await h.refused(enc, integrity, B, 'encrypted with a different key');
+    // A keyed integrity root opens, and every write into it is refused: no
+    // codec-4 file and no XTS file is ever created there.
+    const readOnly = await h.run(enc, integrity, 'refused', A, 'refused ok');
+    if (!readOnly.includes('integrity (codec-4) directories are read-only in this build'))
+      throw new Error('a write into an integrity directory was not refused');
+    for (const file of await regularFiles(integrity)) {
+      if (file !== join(integrity, MARKER_FILE) && (await readFile(file)).length > 0)
+        throw new Error(`${relative(integrity, file)}: written in an integrity directory`);
+    }
+    if (!(await readFile(join(integrity, MARKER_FILE))).equals(integrityMarker(keyA, FLAG_CODEC4)))
+      throw new Error('the integrity marker changed');
+    log('integrity directories: reservation locked, keyed root read-only, unknown flags refused');
+
     // A plaintext file inside an encrypted directory is refused, never read or
     // rewritten. postgresql.auto.conf is optional, so PostgreSQL logs the I/O
     // error and starts without it.
@@ -733,6 +780,18 @@ export async function smoke(ctx: Context): Promise<void> {
       await v1Component(ctx, smokeDir),
       composed.consumer,
     );
+    // G6 (#200): v1 locks a reservation and a keyed integrity marker as
+    // corrupt before it writes anything, with or without data.
+    for (const marker of [RESERVATION, integrityMarker(keyA, FLAG_CODEC4)]) {
+      const reserved = join(work, 'v1-integrity');
+      await mkdir(reserved);
+      await writeFile(join(reserved, MARKER_FILE), marker);
+      await h.refused(v1, reserved, A, 'the encryption marker (.di-encfs) is corrupt');
+      await writeFile(join(reserved, 'PG_VERSION'), '17\n');
+      await h.refused(v1, reserved, A, 'the encryption marker (.di-encfs) is corrupt');
+      await rm(reserved, { recursive: true, force: true });
+    }
+
     const legacy = join(work, 'legacy');
     await mkdir(legacy);
     await h.run(v1, legacy, 'write', A, 'smoke ok');

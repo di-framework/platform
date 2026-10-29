@@ -29,7 +29,9 @@
 //!   length, so a length change re-encrypts the last full block and the partial
 //!   one (up to 31 durable bytes at risk on a crash, see `file`).
 //!
-//! No integrity: XTS does not detect tampering (see #200 for the AEAD mode).
+//! No integrity: XTS does not detect tampering. Codec 4 ([`Codec::TwoSlotAead`],
+//! #200) is the integrity mode; its units are not XTS and live in
+//! [`crate::slots`].
 
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::{Aes256, Block};
@@ -57,6 +59,9 @@ pub enum Codec {
     XtsStealing,
     /// Codec 3: XTS on complete blocks, length-independent tail keystream.
     XtsTail,
+    /// Codec 4 (#200): two XChaCha20-Poly1305 slots per 8 KiB unit, only in
+    /// integrity directories. This build reads it and never creates it.
+    TwoSlotAead,
 }
 
 impl Codec {
@@ -73,17 +78,24 @@ impl Codec {
         match self {
             Codec::XtsStealing => 2,
             Codec::XtsTail => 3,
+            Codec::TwoSlotAead => 4,
         }
     }
 
     /// The codec for a header's codec byte. Codec 1 was the AEAD prototype
-    /// (#200) and is not accepted.
+    /// of the #199 spike and stays retired, so leftover spike files never parse.
     pub fn from_id(id: u8) -> Option<Codec> {
         match id {
             2 => Some(Codec::XtsStealing),
             3 => Some(Codec::XtsTail),
+            4 => Some(Codec::TwoSlotAead),
             _ => None,
         }
+    }
+
+    /// Whether the file's units are AES-256-XTS ([`UnitCipher`]).
+    pub fn is_xts(self) -> bool {
+        matches!(self, Codec::XtsStealing | Codec::XtsTail)
     }
 }
 
@@ -105,7 +117,10 @@ pub struct UnitCipher {
 }
 
 impl UnitCipher {
+    /// The XTS cipher of a codec-2 or codec-3 file. Codec 4 has no XTS units;
+    /// asking for them is a bug.
     pub fn new(codec: Codec, dek: &[u8; DEK_LEN]) -> UnitCipher {
+        assert!(codec.is_xts(), "{codec:?} has no XTS units");
         let (data_key, tweak_key) = dek.split_at(DEK_LEN / 2);
         let data = Aes256::new(data_key.into());
         let tweak_key = Aes256::new(tweak_key.into());
@@ -136,6 +151,7 @@ impl UnitCipher {
                 }
                 self.xor_tail(unit, full.len() / AES_BLOCK, tail);
             }
+            Codec::TwoSlotAead => unreachable!("`new` refuses codec 4"),
         }
     }
 
@@ -155,6 +171,7 @@ impl UnitCipher {
                 }
                 self.xor_tail(unit, full.len() / AES_BLOCK, tail);
             }
+            Codec::TwoSlotAead => unreachable!("`new` refuses codec 4"),
         }
     }
 
@@ -229,10 +246,13 @@ mod tests {
         assert_eq!(Codec::NEW_FILES, expected);
         assert_eq!(Codec::XtsStealing.id(), 2);
         assert_eq!(Codec::XtsTail.id(), 3);
-        for codec in CODECS {
+        assert_eq!(Codec::TwoSlotAead.id(), 4);
+        for codec in [Codec::XtsStealing, Codec::XtsTail, Codec::TwoSlotAead] {
             assert_eq!(Codec::from_id(codec.id()), Some(codec));
         }
-        for id in [0, 1, 4, 0xFF] {
+        assert!(CODECS.iter().all(|c| c.is_xts()) && !Codec::TwoSlotAead.is_xts());
+        // 1 was the #199 spike's AEAD layout and stays retired.
+        for id in [0, 1, 5, 0xFF] {
             assert_eq!(Codec::from_id(id), None, "codec {id}");
         }
         assert_eq!(cipher(1).codec(), expected);
@@ -445,6 +465,12 @@ mod tests {
     #[should_panic(expected = "a data unit holds")]
     fn oversized_units_are_a_bug() {
         cipher(1).encrypt(0, &mut [0u8; 4097]);
+    }
+
+    #[test]
+    #[should_panic(expected = "has no XTS units")]
+    fn codec_4_has_no_xts_cipher() {
+        cipher_with(Codec::TwoSlotAead, 1);
     }
 
     #[test]

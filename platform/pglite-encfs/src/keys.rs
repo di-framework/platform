@@ -33,7 +33,8 @@ pub const KCV_LEN: usize = 16;
 /// Key-check value: identifies a master key without revealing it.
 pub type Kcv = [u8; KCV_LEN];
 
-const HKDF_SALT: &[u8] = b"di-framework/encfs/v1";
+/// Shared with the codec-4 key derivation (`crate::slots`), under its own info strings.
+pub(crate) const HKDF_SALT: &[u8] = b"di-framework/encfs/v1";
 const HKDF_INFO_KEK: &[u8] = b"kek";
 const HKDF_INFO_KCV: &[u8] = b"key-check-value";
 

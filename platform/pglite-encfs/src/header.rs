@@ -8,7 +8,7 @@
 //! |----------|--------------------------------------------|
 //! | 0..8     | magic `DIPGENC1`                           |
 //! | 8        | format version (1)                         |
-//! | 9        | codec (2 or 3, see below)                  |
+//! | 9        | codec (2, 3 or 4, see below)               |
 //! | 10..16   | reserved, zero                             |
 //! | 16..32   | file id (random)                           |
 //! | 32..48   | key-check value of the wrapping key        |
@@ -17,11 +17,13 @@
 //! | 136..152 | wrap tag (Poly1305); AAD = bytes 0..32     |
 //!
 //! Codec ids ([`Codec`]): 2 is AES-256-XTS with ciphertext stealing (v1),
-//! 3 is AES-256-XTS with a length-independent tail keystream (#206). New files
-//! get [`Codec::NEW_FILES`]. A file keeps the codec it was created with for its
-//! whole lifetime: the header is never rewritten except for its wrap, and the
-//! codec byte is part of the AAD, so it cannot be changed without the key.
-//! Codec 1 was the AEAD prototype (#200) and is not accepted.
+//! 3 is AES-256-XTS with a length-independent tail keystream (#206), 4 is the
+//! two-slot AEAD of integrity directories (#200, [`crate::slots`]; this build
+//! reads it but never creates it). New files get [`Codec::NEW_FILES`]. A file
+//! keeps the codec it was created with for its whole lifetime: the header is
+//! never rewritten except for its wrap, and the codec byte is part of the AAD,
+//! so it cannot be changed without the key. Codec 1 was the AEAD prototype of
+//! the #199 spike and is not accepted.
 //!
 //! The DEK is random per file rather than derived from the path, so renames
 //! keep working and a copied file gets a fresh key. The header is written once
@@ -34,6 +36,7 @@ use zeroize::Zeroizing;
 
 use crate::codec::Codec;
 use crate::keys::{Kek, KCV_LEN};
+use crate::marker::Mode;
 
 /// Physical offset of the first data unit.
 pub const HEADER_LEN: u64 = 4096;
@@ -86,8 +89,13 @@ pub enum HeaderState {
     Sealed(Header),
 }
 
+/// Classify a regular file of an XTS directory; see [`classify_in`].
+pub fn classify(start: &[u8], physical: u64) -> Result<HeaderState, HeaderError> {
+    classify_in(start, physical, Mode::Xts)
+}
+
 /// Classify a regular file of `physical` bytes whose first bytes are `start`
-/// (up to [`HEADER_USED`] of them).
+/// (up to [`HEADER_USED`] of them), in a directory of `mode`.
 ///
 /// Anything else without a valid header is refused: a zero header on a file
 /// longer than [`HEADER_LEN`] (it may hold data; the header is synced before
@@ -97,11 +105,13 @@ pub enum HeaderState {
 /// [`HeaderError::Stub`] so the operator learns they hold no encrypted data.
 ///
 /// Only the first [`HEADER_USED`] bytes are inspected: a file of at most
-/// [`HEADER_LEN`] bytes whose first [`HEADER_USED`] bytes are zero is fresh
-/// whatever the rest holds.
-pub fn classify(start: &[u8], physical: u64) -> Result<HeaderState, HeaderError> {
+/// [`Mode::data_start`] bytes ([`HEADER_LEN`] for XTS) whose first
+/// [`HEADER_USED`] bytes are zero is fresh whatever the rest holds. In an
+/// integrity directory data starts after the header page and the two
+/// watermark pages, so the bound is 12288 there (#200 C8a).
+pub fn classify_in(start: &[u8], physical: u64, mode: Mode) -> Result<HeaderState, HeaderError> {
     let start = &start[..start.len().min(HEADER_USED)];
-    let no_room_for_data = physical <= HEADER_LEN;
+    let no_room_for_data = physical <= mode.data_start();
     if no_room_for_data && start.iter().all(|&b| b == 0) {
         return Ok(HeaderState::Fresh);
     }
@@ -279,8 +289,8 @@ mod tests {
             Header::parse(&bytes[..HEADER_USED - 1]).unwrap_err(),
             HeaderError::NotEncrypted
         );
-        for codec in [0, 1, 4, 0xFF] {
-            // 1 is the AEAD prototype; 4 and up are not defined yet.
+        for codec in [0, 1, 5, 0xFF] {
+            // 1 is the #199 spike's AEAD prototype; 5 and up are not defined.
             let mut other = bytes;
             other[9] = codec;
             assert_eq!(
@@ -300,8 +310,8 @@ mod tests {
     }
 
     #[test]
-    fn both_xts_codecs_parse_and_keep_their_id() {
-        for codec in [Codec::XtsStealing, Codec::XtsTail] {
+    fn every_codec_parses_and_keeps_its_id() {
+        for codec in [Codec::XtsStealing, Codec::XtsTail, Codec::TwoSlotAead] {
             let header = Header::seal(&kek(1), codec, &[0xAB; 16], &dek(), &[3; NONCE_LEN]);
             assert_eq!(header.as_bytes()[9], codec.id());
             let parsed = Header::parse(header.as_bytes()).unwrap();
@@ -419,6 +429,37 @@ mod tests {
         assert_eq!(
             classify(&[0u8; HEADER_USED], HEADER_LEN),
             Ok(HeaderState::Fresh)
+        );
+    }
+
+    #[test]
+    fn integrity_directories_have_room_for_the_watermark_pages() {
+        // C8a: a zero start up to 12288 bytes is an interrupted birth in an
+        // integrity directory, and may hold data in an XTS one.
+        for physical in [HEADER_LEN + 1, 8192, 12288] {
+            assert_eq!(
+                classify_in(&[0u8; HEADER_USED], physical, Mode::Integrity),
+                Ok(HeaderState::Fresh),
+                "{physical}"
+            );
+            assert_eq!(
+                classify_in(&[0u8; HEADER_USED], physical, Mode::Xts),
+                Err(HeaderError::NotEncrypted),
+                "{physical}"
+            );
+        }
+        assert_eq!(
+            classify_in(&[0u8; HEADER_USED], 12289, Mode::Integrity),
+            Err(HeaderError::NotEncrypted)
+        );
+        assert_eq!(
+            classify_in(&[b'x'; HEADER_USED], 12288, Mode::Integrity),
+            Err(HeaderError::Stub)
+        );
+        let header = Header::seal(&kek(1), Codec::TwoSlotAead, &[1; 16], &dek(), &[3; 24]);
+        assert_eq!(
+            classify_in(header.as_bytes(), 12288 + 100, Mode::Integrity),
+            Ok(HeaderState::Sealed(header))
         );
     }
 
