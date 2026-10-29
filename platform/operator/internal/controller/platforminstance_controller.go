@@ -322,10 +322,6 @@ func setTargetPending(s *v1alpha1.PlatformInstanceStatus, gen int64, st targets.
 		setCondition(s, gen, v1alpha1.ConditionReady, metav1.ConditionFalse, st.Reason, st.Message)
 		return
 	}
-	if s.Target.ResyncServiceUID == vcluster.ResyncHostNamespace && s.Target.ResyncCause == "" {
-		// A host-namespace resync recorded by an operator that didn't keep the cause.
-		s.Target.ResyncCause = vcluster.ReasonHostNamespaceDeleted
-	}
 	if s.Target.ResyncCause == "" {
 		setCondition(s, gen, v1alpha1.ConditionTargetReady, metav1.ConditionFalse, st.Reason, st.Message)
 		setCondition(s, gen, v1alpha1.ConditionReady, metav1.ConditionFalse, "TargetPending", "waiting for the target cluster")

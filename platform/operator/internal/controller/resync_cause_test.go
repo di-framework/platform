@@ -50,11 +50,12 @@ func assertCauseNamed(t *testing.T, round int, inst *v1alpha1.PlatformInstance) 
 	}
 }
 
-// stepUntilReady runs up to max rounds, releasing ns before round releaseAt, and calls each with
-// the instance of every round that ends not Ready. It returns whether the instance became Ready.
-func (h *nsHarness) stepUntilReady(ns string, releaseAt, max int, each func(round int, inst *v1alpha1.PlatformInstance)) bool {
+// stepUntilReady runs at most the given number of rounds, releasing ns before round releaseAt,
+// and calls each with the instance of every round that ends not Ready. It returns whether the
+// instance became Ready.
+func (h *nsHarness) stepUntilReady(ns string, releaseAt, rounds int, each func(round int, inst *v1alpha1.PlatformInstance)) bool {
 	h.t.Helper()
-	for round := 1; round <= max; round++ {
+	for round := 1; round <= rounds; round++ {
 		if round == releaseAt {
 			h.release(ns)
 		}
@@ -134,30 +135,6 @@ func TestHostNamespaceResyncFailedInstallKeepsCause(t *testing.T) {
 		t.Fatalf("after the retry: installs %+v, status %+v", h.in.installs, inst.Status)
 	}
 	assertCauseCleared(t, inst)
-}
-
-// An instance a host-namespace resync started under an operator that didn't record the cause
-// (an upgrade mid-resync) gets it from the host-namespace marker.
-func TestHostNamespaceResyncMarkerFillsTheCause(t *testing.T) {
-	h := newNSHarness(t, "")
-	h.installed()
-	h.deleteHostNamespace()
-	h.step()
-	inst := h.get()
-	base := inst.DeepCopy()
-	inst.Status.Target.ResyncCause = ""
-	if err := h.c.Status().Patch(context.Background(), inst, client.MergeFrom(base)); err != nil {
-		t.Fatal(err)
-	}
-	if h.get().Status.Target.ResyncCause != "" {
-		t.Fatal("cause not removed for the test")
-	}
-	h.step()
-	inst = h.get()
-	if inst.Status.Target.ResyncServiceUID != vcluster.ResyncHostNamespace {
-		t.Fatalf("marker gone: %+v", inst.Status.Target)
-	}
-	assertCauseNamed(t, 2, inst)
 }
 
 // A host-namespace resync past its timeout reads as stuck in Ready too, with its cause.
