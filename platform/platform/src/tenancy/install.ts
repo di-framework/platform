@@ -58,6 +58,8 @@ export const CONTROLLER_SCRIPT_MODULES = [
   'admission',
   'egress',
   'backing-services',
+  'storage-mode',
+  'storage-records',
   'workload-storage',
   'tls',
   'ca-rotation',

@@ -174,6 +174,8 @@ describe('backing-service install', () => {
       'admission',
       'egress',
       'backing-services',
+      'storage-mode',
+      'storage-records',
       'workload-storage',
       'tls',
       'ca-rotation',
@@ -202,6 +204,8 @@ describe('backing-service install', () => {
       'registry-nats.js',
       'resources.js',
       'service-binding-reconcile.js',
+      'storage-mode.js',
+      'storage-records.js',
       'tls.js',
       'workload-storage.js',
     ]);

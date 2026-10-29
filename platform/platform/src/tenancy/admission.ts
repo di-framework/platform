@@ -11,7 +11,14 @@ import {
   ROUTES_CONFIG_NAME,
   TENANT,
 } from './resources';
-import { HOST_MOUNT_ROOT } from './workload-storage';
+import type { StorageRecord, StorageRecords } from './storage-records';
+import {
+  HOST_MOUNT_ROOT,
+  STORAGE_ANNOTATION,
+  STORAGE_FORMAT_ANNOTATION,
+  STORAGE_FORMAT_PGLITE_ENCFS,
+  STORAGE_MOUNT_ANNOTATION,
+} from './workload-storage';
 
 /** Controller-managed ConfigMap prefix for BackingService backend config (#450). */
 export const BS_CONFIG_PREFIX = 'di-bs-';
@@ -264,6 +271,148 @@ export function workloadVolumesAllowed(input: {
       mounts.length === 0 ||
       (kept && mounts.every((mount) => volumes.some((volume) => volume.name === mount.name))),
   );
+}
+
+export const STORAGE_FORMAT_VALUE_MESSAGE = `${STORAGE_FORMAT_ANNOTATION} accepts only "${STORAGE_FORMAT_PGLITE_ENCFS}"`;
+export const STORAGE_FORMAT_STORAGE_MESSAGE = `${STORAGE_FORMAT_ANNOTATION} requires ${STORAGE_ANNOTATION}: "true"`;
+export const STORAGE_FORMAT_ACTORS_MESSAGE = `${STORAGE_FORMAT_ANNOTATION} cannot be combined with ${STORAGE_MOUNT_ANNOTATION}: /data/actors`;
+export const STORAGE_FORMAT_IMMUTABLE_MESSAGE = `${STORAGE_FORMAT_ANNOTATION} cannot be added, removed or changed after creation`;
+
+/**
+ * Mirrors the four `storage-format` rules of the workloads policy (#200, design-200 §9.1). The
+ * first three apply only on CREATE and on an UPDATE that changes the annotation, because a
+ * ValidatingAdmissionPolicy does not ratchet: a workload that carried the annotation before these
+ * rules keeps updating. The fourth refuses every change on UPDATE except removing a value other
+ * than `pglite-encfs`, which never declared a kind. Returns the messages of the rules it breaks.
+ */
+export function workloadStorageFormatDenials(input: {
+  operation: 'CREATE' | 'UPDATE';
+  annotations?: Record<string, string>;
+  oldAnnotations?: Record<string, string>;
+}): string[] {
+  const annotations = input.annotations ?? {};
+  const old = input.operation === 'UPDATE' ? (input.oldAnnotations ?? {}) : {};
+  const has = Object.hasOwn(annotations, STORAGE_FORMAT_ANNOTATION);
+  const had = Object.hasOwn(old, STORAGE_FORMAT_ANNOTATION);
+  const value = has ? annotations[STORAGE_FORMAT_ANNOTATION] : '';
+  const oldValue = had ? old[STORAGE_FORMAT_ANNOTATION] : '';
+  const changed = has !== had || value !== oldValue;
+  if (!changed) return [];
+  const denials: string[] = [];
+  if (has && value !== STORAGE_FORMAT_PGLITE_ENCFS) denials.push(STORAGE_FORMAT_VALUE_MESSAGE);
+  if (has && annotations[STORAGE_ANNOTATION] !== 'true')
+    denials.push(STORAGE_FORMAT_STORAGE_MESSAGE);
+  if (has && annotations[STORAGE_MOUNT_ANNOTATION] === '/data/actors')
+    denials.push(STORAGE_FORMAT_ACTORS_MESSAGE);
+  if (input.operation === 'UPDATE' && !(had && !has && oldValue !== STORAGE_FORMAT_PGLITE_ENCFS))
+    denials.push(STORAGE_FORMAT_IMMUTABLE_MESSAGE);
+  return denials;
+}
+
+export const STORAGE_RECORDS_KEPT_MESSAGE =
+  'status.storage.keys: a recorded key keeps its kind, requested and mode, and only an absent entry may be removed';
+export const STORAGE_RECORDS_NEW_MESSAGE =
+  'status.storage.keys: a new PgliteEncfs entry needs requested or mode, and only PgliteEncfs entries carry requested';
+export const STORAGE_RECORDS_AEAD_MESSAGE =
+  'status.storage.keys: only a PgliteEncfs entry can have mode AEAD';
+
+/** Mirrors the `tenant-storage-records` policy on `tenants/status` (#200, design-200 §9.1). */
+export function storageRecordsDenials(
+  old: StorageRecords | undefined,
+  next: StorageRecords | undefined,
+): string[] {
+  const o = old ?? {};
+  const n = next ?? {};
+  const kept = (a: StorageRecord, b: StorageRecord) =>
+    b.kind === a.kind &&
+    (a.requested === undefined) === (b.requested === undefined) &&
+    (a.requested === undefined || b.requested === a.requested) &&
+    (a.mode === undefined || b.mode === a.mode);
+  const denials: string[] = [];
+  if (
+    !Object.entries(o).every(([k, a]) =>
+      Object.hasOwn(n, k) ? kept(a, n[k] as StorageRecord) : a.observed === 'absent',
+    )
+  )
+    denials.push(STORAGE_RECORDS_KEPT_MESSAGE);
+  if (
+    !Object.entries(n).every(
+      ([k, b]) =>
+        Object.hasOwn(o, k) ||
+        (b.kind === 'PgliteEncfs'
+          ? b.requested !== undefined || b.mode !== undefined
+          : b.requested === undefined),
+    )
+  )
+    denials.push(STORAGE_RECORDS_NEW_MESSAGE);
+  if (!Object.values(n).every((b) => b.mode !== 'AEAD' || b.kind === 'PgliteEncfs'))
+    denials.push(STORAGE_RECORDS_AEAD_MESSAGE);
+  return denials;
+}
+
+/**
+ * Per-key immutability of `status.storage.keys` (#200). Its own binding: a `namespaceSelector`
+ * never excludes a cluster-scoped Tenant, so the binding has none and the policy matches only
+ * `tenants/status`. It applies to every update, the controller's included.
+ */
+function storageRecordsPolicyResources(installation: string): Resource[] {
+  const fullName = `${installation}-tenant-storage-records`;
+  const O = 'oldObject.status.storage.keys';
+  const N = 'object.status.storage.keys';
+  const hasO =
+    'has(oldObject.status) && has(oldObject.status.storage) && has(oldObject.status.storage.keys)';
+  const hasN =
+    'has(object.status) && has(object.status.storage) && has(object.status.storage.keys)';
+  // `[m[k]].all(a, …)` names the entry, so every has() is on a field of a variable.
+  const kept = `b.kind == a.kind && has(b.requested) == has(a.requested) &&
+    (!has(a.requested) || b.requested == a.requested) &&
+    (!has(a.mode) || (has(b.mode) && b.mode == a.mode))`;
+  return [
+    {
+      apiVersion: 'admissionregistration.k8s.io/v1',
+      kind: 'ValidatingAdmissionPolicy',
+      metadata: { name: fullName },
+      spec: {
+        failurePolicy: 'Fail',
+        matchConstraints: {
+          resourceRules: [
+            {
+              apiGroups: [GROUP],
+              apiVersions: ['*'],
+              operations: ['UPDATE'],
+              resources: ['tenants/status'],
+            },
+          ],
+        },
+        validations: [
+          {
+            expression: `!(${hasO}) || ${O}.all(k, [${O}[k]].all(a,
+              ((${hasN}) && k in ${N}) ? [${N}[k]].all(b, ${kept}) :
+                (has(a.observed) && a.observed == 'absent')))`,
+            message: STORAGE_RECORDS_KEPT_MESSAGE,
+          },
+          {
+            expression: `!(${hasN}) || ${N}.all(k, ((${hasO}) && k in ${O}) ||
+              [${N}[k]].all(b, b.kind == 'PgliteEncfs'
+                ? (has(b.requested) || has(b.mode))
+                : !has(b.requested)))`,
+            message: STORAGE_RECORDS_NEW_MESSAGE,
+          },
+          {
+            expression: `!(${hasN}) || ${N}.all(k, [${N}[k]].all(b,
+              !has(b.mode) || b.mode != 'AEAD' || b.kind == 'PgliteEncfs'))`,
+            message: STORAGE_RECORDS_AEAD_MESSAGE,
+          },
+        ],
+      },
+    },
+    {
+      apiVersion: 'admissionregistration.k8s.io/v1',
+      kind: 'ValidatingAdmissionPolicyBinding',
+      metadata: { name: fullName },
+      spec: { policyName: fullName, validationActions: ['Deny'] },
+    },
+  ];
 }
 
 /** Platform workload storage directories (#11), the only host paths a workload volume may name. */
@@ -665,8 +814,57 @@ function workloadPolicy(namespace: string): AdmissionPolicy {
         name: 'oldLocals',
         expression: `request.operation != 'UPDATE' ? [] : ${localsOf('oldObject.spec.template.spec')}`,
       },
+      // The storage-format annotation (#200): whether it is set, its value, and the same on
+      // the old object. Absent reads as ''.
+      {
+        name: 'hasFormat',
+        expression: `has(object.metadata.annotations) &&
+          '${STORAGE_FORMAT_ANNOTATION}' in object.metadata.annotations`,
+      },
+      {
+        name: 'format',
+        expression: `variables.hasFormat ? object.metadata.annotations['${STORAGE_FORMAT_ANNOTATION}'] : ''`,
+      },
+      {
+        name: 'hadFormat',
+        expression: `request.operation == 'UPDATE' && has(oldObject.metadata.annotations) &&
+          '${STORAGE_FORMAT_ANNOTATION}' in oldObject.metadata.annotations`,
+      },
+      {
+        name: 'oldFormat',
+        expression: `variables.hadFormat ? oldObject.metadata.annotations['${STORAGE_FORMAT_ANNOTATION}'] : ''`,
+      },
+      {
+        name: 'formatChanged',
+        expression:
+          'variables.hasFormat != variables.hadFormat || variables.format != variables.oldFormat',
+      },
     ],
     validations: [
+      // Only CREATE and an UPDATE that changes the annotation: a policy does not ratchet.
+      {
+        expression: `!variables.formatChanged || !variables.hasFormat ||
+          variables.format == '${STORAGE_FORMAT_PGLITE_ENCFS}'`,
+        message: STORAGE_FORMAT_VALUE_MESSAGE,
+      },
+      {
+        expression: `!variables.formatChanged || !variables.hasFormat ||
+          ('${STORAGE_ANNOTATION}' in object.metadata.annotations &&
+            object.metadata.annotations['${STORAGE_ANNOTATION}'] == 'true')`,
+        message: STORAGE_FORMAT_STORAGE_MESSAGE,
+      },
+      {
+        expression: `!variables.formatChanged || !variables.hasFormat ||
+          !('${STORAGE_MOUNT_ANNOTATION}' in object.metadata.annotations) ||
+          object.metadata.annotations['${STORAGE_MOUNT_ANNOTATION}'] != '/data/actors'`,
+        message: STORAGE_FORMAT_ACTORS_MESSAGE,
+      },
+      {
+        expression: `request.operation != 'UPDATE' || !variables.formatChanged ||
+          (variables.hadFormat && !variables.hasFormat &&
+            variables.oldFormat != '${STORAGE_FORMAT_PGLITE_ENCFS}')`,
+        message: STORAGE_FORMAT_IMMUTABLE_MESSAGE,
+      },
       {
         expression: `has(variables.w.environment) &&
           variables.w.environment == object.metadata.namespace &&
@@ -1175,5 +1373,8 @@ export function admissionResources(
       ],
     },
   ];
-  return policies.flatMap((policy) => policyResources(installation, policy));
+  return [
+    ...policies.flatMap((policy) => policyResources(installation, policy)),
+    ...storageRecordsPolicyResources(installation),
+  ];
 }

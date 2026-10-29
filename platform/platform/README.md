@@ -1305,6 +1305,26 @@ It carries no `volumes`, `volumeMounts`, or host paths.
 - A redeploy that rewrites the component list drops the preopen until the next
   controller tick (about 3 s) puts it back.
 
+#### Storage integrity (pglite-encfs)
+
+- A workload declares that its directory is a pglite data directory under encfs with
+  `di-framework.dev/storage-format: pglite-encfs`. Admission accepts only that value, requires
+  `persistent-storage: "true"`, refuses it with `storage-mount: /data/actors`, and refuses
+  adding, removing or changing it on update.
+- The Tenant's `spec.storage.integrity` (`Off`, default, or `AEAD`) chooses the mode of
+  pglite-encfs keys recorded after it is set. A recorded key keeps its mode.
+- Each key is recorded in `status.storage.keys` (`kind`, `requested`, `mode`, `observed`) before
+  the host mounts it. A key used by declared and undeclared workloads is not mounted for the
+  workloads that disagree with its record.
+- A `storage-mode` init container runs after `storage-owner` as uid 65532. It writes the
+  integrity reservation marker into each empty directory of a key requested as `AEAD`, without
+  following links, and lists every directory under the Tenant's workloads root. The controller
+  reads that listing from the pod log and reports the `StorageIntegrity` condition
+  (`AsRecorded`, `AwaitingObservation`, `ObservationFailed`, `StorageKindConflict`,
+  `RecordLimitReached`, `IntegrityMismatch`, `IntegrityNotApplied`, `StorageRecordsForeign`).
+- The controller copies the records into the `di-storage-records` ConfigMap (`data.keys`) in
+  `di-runtime-<name>` for the backup operator. It never overwrites one it did not create.
+
 ### Tenant HTTP gateway
 
 The published HTTP port (NodePort `httpNodePort`, 30180 locally) belongs to the
