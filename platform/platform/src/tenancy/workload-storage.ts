@@ -1,4 +1,6 @@
+import { NODE_IMAGE } from './node-image';
 import type { ControllerConfig, Resource, Tenant } from './resources';
+import { storageModeCommand } from './storage-mode';
 
 /**
  * Platform-managed persistent directory for tenant workloads (#11).
@@ -11,6 +13,13 @@ import type { ControllerConfig, Resource, Tenant } from './resources';
 
 export const STORAGE_ANNOTATION = 'di-framework.dev/persistent-storage';
 export const STORAGE_MOUNT_ANNOTATION = 'di-framework.dev/storage-mount';
+/**
+ * Declares that a workload's storage directory is a pglite data directory under encfs (#200).
+ * Only its keys are reserved for `spec.storage.integrity: AEAD`; admission accepts only
+ * {@link STORAGE_FORMAT_PGLITE_ENCFS} and never lets an update add, remove or change it.
+ */
+export const STORAGE_FORMAT_ANNOTATION = 'di-framework.dev/storage-format';
+export const STORAGE_FORMAT_PGLITE_ENCFS = 'pglite-encfs';
 /** Guest preopen paths the platform accepts. Actor workloads keep their state under /data/actors. */
 export const GUEST_MOUNT_PATHS = ['/data', '/data/actors'] as const;
 /** Where the tenant host container sees each workload directory. */
@@ -20,6 +29,14 @@ export const WORKLOAD_VOLUME = 'di-storage';
 export const HOST_UID = 65532;
 /** Fixed image for the ownership init step — never tenant-supplied. */
 export const STORAGE_INIT_IMAGE = 'busybox:1.37.0';
+/**
+ * Fixed image for the `storage-mode` init step (#200), pinned by digest — never tenant-supplied.
+ * It runs {@link storageModeCommand}, the program's own source, with Node.
+ */
+export const STORAGE_MODE_IMAGE = NODE_IMAGE;
+/** Where `storage-mode` sees the Tenant's whole workloads root, read-only. */
+export const WORKLOADS_ROOT_MOUNT = '/var/lib/di-framework/tenant-workloads';
+const WORKLOADS_ROOT_VOLUME = 'ws-root';
 /** Field manager for the controller's WorkloadDeployment patch. */
 export const STORAGE_FIELD_MANAGER = 'di-platform-storage';
 
@@ -96,7 +113,12 @@ export function storageKeys(workloads: WorkloadDeployment[]): string[] {
 }
 
 export function nodeStoragePath(tenant: Tenant, cfg: ControllerConfig, key: string): string {
-  return `${cfg.storageRoot ?? '/var/lib/k0s'}/di-tenants/${tenant.metadata.uid}/workloads/${key}`;
+  return `${nodeWorkloadsRoot(tenant, cfg)}/${key}`;
+}
+
+/** The node directory that holds every storage directory of the Tenant, and only those. */
+export function nodeWorkloadsRoot(tenant: Tenant, cfg: ControllerConfig): string {
+  return `${cfg.storageRoot ?? '/var/lib/k0s'}/di-tenants/${tenant.metadata.uid}/workloads`;
 }
 
 export function hostStoragePath(key: string): string {
@@ -104,48 +126,83 @@ export function hostStoragePath(key: string): string {
 }
 
 /**
- * Host pod additions for the given keys: one DirectoryOrCreate volume and mount per key,
- * plus a root init container that hands each directory (not its contents) to the host uid.
+ * Host pod additions for the given keys: one DirectoryOrCreate volume and mount per key, a root
+ * init container that hands each directory (not its contents) to the host uid, and the
+ * `storage-mode` init step (#200). That step always runs, keys or not: it reserves the empty
+ * directories of `reserve` and lists every directory under the Tenant's workloads root, which it
+ * mounts read-only, for the controller's records.
  */
 export function hostStorage(
   tenant: Tenant,
   cfg: ControllerConfig,
   keys: string[],
+  reserve: string[] = [],
 ): {
   volumes: Record<string, unknown>[];
   volumeMounts: Record<string, unknown>[];
   initContainers: Record<string, unknown>[];
 } {
-  if (keys.length === 0) return { volumes: [], volumeMounts: [], initContainers: [] };
   const volumes = keys.map((key) => ({
     name: `ws-${key}`,
     hostPath: { path: nodeStoragePath(tenant, cfg, key), type: 'DirectoryOrCreate' },
   }));
   const volumeMounts = keys.map((key) => ({ name: `ws-${key}`, mountPath: hostStoragePath(key) }));
-  return {
-    volumes,
+  const resources = {
+    requests: { cpu: '10m', memory: '16Mi' },
+    limits: { cpu: '100m', memory: '32Mi' },
+  };
+  const owner = {
+    name: 'storage-owner',
+    image: STORAGE_INIT_IMAGE,
+    imagePullPolicy: 'IfNotPresent',
+    command: ['chown', `${HOST_UID}:${HOST_UID}`, ...keys.map(hostStoragePath)],
+    securityContext: {
+      runAsUser: 0,
+      runAsGroup: 0,
+      runAsNonRoot: false,
+      allowPrivilegeEscalation: false,
+      readOnlyRootFilesystem: true,
+      capabilities: { drop: ['ALL'], add: ['CHOWN'] },
+    },
+    resources,
     volumeMounts,
-    initContainers: [
+  };
+  const mode = {
+    name: 'storage-mode',
+    image: STORAGE_MODE_IMAGE,
+    imagePullPolicy: 'IfNotPresent',
+    command: storageModeCommand(),
+    args: [
+      `--root=${WORKLOADS_ROOT_MOUNT}`,
+      `--mounts=${HOST_MOUNT_ROOT}`,
+      `--keys=${keys.join(',')}`,
+      `--reserve=${reserve.filter((key) => keys.includes(key)).join(',')}`,
+    ],
+    terminationMessagePolicy: 'File',
+    securityContext: {
+      runAsUser: HOST_UID,
+      runAsGroup: HOST_UID,
+      runAsNonRoot: true,
+      allowPrivilegeEscalation: false,
+      readOnlyRootFilesystem: true,
+      capabilities: { drop: ['ALL'] },
+    },
+    resources: { requests: resources.requests, limits: { cpu: '200m', memory: '96Mi' } },
+    volumeMounts: [
+      ...volumeMounts,
+      { name: WORKLOADS_ROOT_VOLUME, mountPath: WORKLOADS_ROOT_MOUNT, readOnly: true },
+    ],
+  };
+  return {
+    volumes: [
+      ...volumes,
       {
-        name: 'storage-owner',
-        image: STORAGE_INIT_IMAGE,
-        imagePullPolicy: 'IfNotPresent',
-        command: ['chown', `${HOST_UID}:${HOST_UID}`, ...keys.map(hostStoragePath)],
-        securityContext: {
-          runAsUser: 0,
-          runAsGroup: 0,
-          runAsNonRoot: false,
-          allowPrivilegeEscalation: false,
-          readOnlyRootFilesystem: true,
-          capabilities: { drop: ['ALL'], add: ['CHOWN'] },
-        },
-        resources: {
-          requests: { cpu: '10m', memory: '16Mi' },
-          limits: { cpu: '100m', memory: '32Mi' },
-        },
-        volumeMounts,
+        name: WORKLOADS_ROOT_VOLUME,
+        hostPath: { path: nodeWorkloadsRoot(tenant, cfg), type: 'DirectoryOrCreate' },
       },
     ],
+    volumeMounts,
+    initContainers: keys.length > 0 ? [owner, mode] : [mode],
   };
 }
 

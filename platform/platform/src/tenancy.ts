@@ -44,6 +44,7 @@ export {
   tenantObject,
 } from './tenancy/install';
 
+import { NODE_IMAGE } from './tenancy/node-image';
 import { tenantAuthReadsApiKeyNamespace } from './tenant-auth-images';
 
 export interface UserDeclaration extends UserSpec {
@@ -284,7 +285,7 @@ export function installTenancy(args: {
             containers: [
               {
                 name: 'controller',
-                image: 'node:22.18.0-alpine3.22',
+                image: NODE_IMAGE,
                 command: ['node', '/controller/controller.js'],
                 env: [
                   {

@@ -162,16 +162,23 @@ describe('tenant host pod', () => {
     expect(strategy(['mesh'])).toEqual(expected);
   });
 
-  it('is unchanged when no workload asks for storage', () => {
+  it('lists the workloads root without a chown step when no workload asks for storage', () => {
     const spec = host([]);
-    // Only the NATS wait (#470); no storage chown step.
-    expect(spec.initContainers?.map((c) => c.name)).toEqual(['wait-for-nats']);
-    expect(spec.volumes).toHaveLength(3);
-    expect(hostStorage(tenant(), cfg, [])).toEqual({
-      volumes: [],
-      volumeMounts: [],
-      initContainers: [],
-    });
+    // The NATS wait (#470), then only the storage-mode listing (#200); no storage chown step.
+    expect(spec.initContainers?.map((c) => c.name)).toEqual(['wait-for-nats', 'storage-mode']);
+    expect(spec.volumes).toHaveLength(4);
+    const storage = hostStorage(tenant(), cfg, []);
+    expect(storage.volumeMounts).toEqual([]);
+    expect(storage.volumes).toEqual([
+      {
+        name: 'ws-root',
+        hostPath: {
+          path: '/var/lib/k0s/di-tenants/alpha-uid/workloads',
+          type: 'DirectoryOrCreate',
+        },
+      },
+    ]);
+    expect(storage.initContainers.map((c) => c.name)).toEqual(['storage-mode']);
   });
 
   it('mounts one DirectoryOrCreate directory per key and chowns only those paths', () => {
@@ -377,7 +384,9 @@ describe('Controller.reconcileWorkloadStorage', () => {
       workload('mesh-collector', { workload: 'mesh' }),
       workload('stateless', { storage: false }),
     ];
-    await new Controller(api, cfg).reconcileWorkloadStorage(tenant());
+    // Only a key recorded with the workload's kind gets the patch (#200).
+    const recorded = { ...tenant(), status: { storage: { keys: { mesh: { kind: 'Other' } } } } };
+    await new Controller(api, cfg).reconcileWorkloadStorage(recorded);
     expect(api.patches).toHaveLength(1);
     expect(api.patches[0]?.path).toBe(
       `/apis/runtime.wasmcloud.dev/v1alpha1/namespaces/di-tenant-alpha/workloaddeployments/mesh-collector?fieldManager=${STORAGE_FIELD_MANAGER}`,

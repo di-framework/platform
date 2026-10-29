@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
 import { platformNamespacePeer, tenantNamespacesSelector } from '../platform-ingress';
+import { NODE_IMAGE } from '../tenancy/node-image';
 import {
   GATEWAY_NAME,
   GATEWAY_POD_LABELS,
@@ -189,7 +190,7 @@ export function gatewayDeploymentSpec(
           {
             name: 'gateway',
             // The controller image: no extra pull for the gateway.
-            image: 'node:22.18.0-alpine3.22',
+            image: NODE_IMAGE,
             command: ['node', '/gateway/gateway.js'],
             env: [{ name: 'GATEWAY_CONFIG', value: JSON.stringify(config) }],
             ports: [{ name: 'http', containerPort: GATEWAY_PORT }],

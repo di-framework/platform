@@ -22,6 +22,12 @@ import {
   registryNatsAuthDigest,
   registryNatsSecretData,
 } from './registry-nats';
+import {
+  STORAGE_INTEGRITY_MODES,
+  STORAGE_RECORD_LIMIT,
+  type StorageIntegrity,
+  type StorageRecords,
+} from './storage-records';
 import { canonicalIp } from './tls';
 import { hostStorage } from './workload-storage';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json | undefined };
@@ -35,6 +41,7 @@ export interface Metadata {
   annotations?: Record<string, string>;
   finalizers?: string[];
   deletionTimestamp?: string;
+  creationTimestamp?: string;
 }
 export interface Condition {
   type: string;
@@ -62,6 +69,13 @@ export interface TenantSpec {
     serviceBindings?: number;
     /** Max API keys of the tenant: `count/secrets` in `di-apikeys-<tenant>` (default 1000, #379). */
     apiKeys?: number;
+  };
+  storage?: {
+    /**
+     * The mode new pglite-encfs storage keys get (#200): `AEAD` reserves each new, empty
+     * directory for an integrity directory. Recorded keys keep their mode. Default `Off`.
+     */
+    integrity?: StorageIntegrity;
   };
 }
 export const CORE_INSTANCES = { default: 100, minimum: 1, maximum: 10000 } as const;
@@ -834,6 +848,13 @@ const crds = [
             apiKeys: { type: 'integer', ...API_KEYS_LIMITS, default: DEFAULT_API_KEYS },
           },
         },
+        storage: {
+          type: 'object',
+          default: {},
+          properties: {
+            integrity: { type: 'string', enum: [...STORAGE_INTEGRITY_MODES], default: 'Off' },
+          },
+        },
       },
     },
     {
@@ -845,6 +866,29 @@ const crds = [
       apiKeysMigrated: { type: 'boolean' },
       hostgroup: { type: 'string' },
       httpService: { type: 'string' },
+      // Per-key storage records (#200), immutable per key under the tenant-storage-records policy.
+      storage: {
+        type: 'object',
+        properties: {
+          keys: {
+            type: 'object',
+            maxProperties: STORAGE_RECORD_LIMIT,
+            additionalProperties: {
+              type: 'object',
+              required: ['kind'],
+              properties: {
+                kind: { type: 'string', enum: ['PgliteEncfs', 'Other'] },
+                requested: { type: 'string', enum: [...STORAGE_INTEGRITY_MODES] },
+                mode: { type: 'string', enum: ['XTS', 'AEAD', 'NotEncfs'] },
+                observed: {
+                  type: 'string',
+                  enum: ['empty', 'unencrypted', 'xts', 'aead', 'reserved', 'other', 'absent'],
+                },
+              },
+            },
+          },
+        },
+      },
     },
   ),
   crd(
@@ -1085,9 +1129,11 @@ function tenantResources(
   hostPull?: HostPull,
   /** The registry's NATS account (#159); absent, `di-nats` has the `TENANT` account only. */
   registryNats?: RegistryNats,
+  /** Mounted keys `storage-mode` reserves when their directory is empty (#200). */
+  storageReserve: string[] = [],
 ): Resource[] {
   const n = names(tenant.metadata.name);
-  const storage = hostStorage(tenant, cfg, storageKeys);
+  const storage = hostStorage(tenant, cfg, storageKeys, storageReserve);
   const dataNatsUrl = `nats://di-nats.${n.runtimeNamespace}.svc.cluster.local:4222`;
   const make = (
     apiVersion: string,
@@ -2559,6 +2605,37 @@ function registryWorkload(
   return value;
 }
 
+/** The copy of the storage records the backup operator reads (#200, design-200 §9.4). */
+export const STORAGE_RECORDS_CONFIG = 'di-storage-records';
+
+/**
+ * `di-storage-records` in the runtime namespace: `kind`, `requested` and `mode` per key, as
+ * `keys`. Written through `ensure`, so a copy someone else created is never adopted.
+ */
+function storageRecordsConfigMap(
+  tenant: Tenant,
+  installation: string,
+  records: StorageRecords,
+): Resource {
+  const copy = Object.fromEntries(
+    Object.entries(records)
+      .sort(([a], [b]) => (a < b ? -1 : 1))
+      .map(([key, { kind, requested, mode }]) => [
+        key,
+        { kind, ...(requested ? { requested } : {}), ...(mode ? { mode } : {}) },
+      ]),
+  );
+  return resource(
+    tenant,
+    installation,
+    'v1',
+    'ConfigMap',
+    STORAGE_RECORDS_CONFIG,
+    names(tenant.metadata.name).runtimeNamespace,
+    { data: { keys: JSON.stringify(copy) } },
+  );
+}
+
 export type {
   BackingCapability,
   BackingProvider,
@@ -2616,6 +2693,7 @@ export {
   registryWorkload,
   resource,
   runtimeQuota,
+  storageRecordsConfigMap,
   TENANT,
   TENANT_CONTROLLER_CA_KEY_SECRET,
   tenantAuthResources,

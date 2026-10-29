@@ -17,6 +17,7 @@ import {
   validateRouteAliases,
   validateRouteUrlPattern,
 } from '../src/gateway/install';
+import { NODE_IMAGE } from '../src/tenancy/node-image';
 import { INSTALLATION, NAMESPACE_ROLE, TENANT } from '../src/tenancy/resources';
 
 describe('route URL pattern', () => {
@@ -77,7 +78,7 @@ describe('gateway resources', () => {
     expect(spec.selector.matchLabels).toEqual({ app: GATEWAY_NAME });
     expect(pod.automountServiceAccountToken).toBe(false);
     expect(pod.securityContext).toMatchObject({ runAsNonRoot: true, runAsUser: 1000 });
-    expect(container.image).toBe('node:22.18.0-alpine3.22');
+    expect(container.image).toBe(NODE_IMAGE);
     expect(container.command).toEqual(['node', '/gateway/gateway.js']);
     expect(container.securityContext).toEqual({
       allowPrivilegeEscalation: false,

@@ -1823,7 +1823,7 @@ describe('reconcileTenant with tenant-auth', () => {
     const { tenantAuth: _, ...plain } = cfg;
     await new Controller(api, plain).reconcileTenant(t, []);
     expect(tenantAuthObjects(api)).toEqual([]);
-    expect(t.status?.conditions?.map((c) => c.type)).toEqual(['Ready']);
+    expect(t.status?.conditions?.map((c) => c.type)).toEqual(['Ready', 'StorageIntegrity']);
     const quota = api.objects.get(
       `${collection('v1', 'ResourceQuota', 'di-runtime-alpha')}/di-runtime-quota`,
     ) as unknown as { spec: { hard: Record<string, string> } };
@@ -1879,7 +1879,7 @@ describe('reconcileTenant with tenant-auth', () => {
       console.error = log;
     }
     expect(errors).toEqual(['Tenant/alpha tenant-auth: forbidden']);
-    expect(t.status?.conditions?.map((c) => c.type)).toEqual(['Ready']);
+    expect(t.status?.conditions?.map((c) => c.type)).toEqual(['Ready', 'StorageIntegrity']);
   });
 
   for (const deletionPolicy of ['Delete', 'Retain'] as const)

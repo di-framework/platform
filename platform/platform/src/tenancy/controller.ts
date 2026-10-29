@@ -109,6 +109,8 @@ import {
   runtimeQuota,
   type ServiceBinding,
   type SizingParameters,
+  STORAGE_RECORDS_CONFIG,
+  storageRecordsConfigMap,
   TENANT,
   TENANT_CONTROLLER_CA_KEY_SECRET,
   type Tenant,
@@ -136,10 +138,19 @@ import {
   serviceBindingResources,
   sharedBindingConflict,
 } from './service-binding-reconcile';
+import {
+  integrityCondition,
+  type Observation,
+  parseListing,
+  planStorage,
+  recordsPatch,
+  type StoragePlan,
+  type StorageRecords,
+  storageAllowed,
+} from './storage-records';
 import { certificateNames, certificateValid, holdsCaKey, issuedBy, leafCertificate } from './tls';
 import {
   STORAGE_FIELD_MANAGER,
-  storageKeys,
   storagePatch,
   type WorkloadDeployment,
   wantsStorage,
@@ -303,6 +314,8 @@ export class ApiError extends Error {
  * Reported on `TenantAuthReady` (reason `ControllerCaNotOwned`) and logged once, not every pass.
  */
 export class ControllerCaRefused extends Error {}
+/** `ensure` refused an existing object it did not write (another owner or installation). */
+export class AdoptionRefused extends Error {}
 export class KubernetesApi implements Api {
   private readonly directory = '/var/run/secrets/kubernetes.io/serviceaccount';
   async call<T>(
@@ -496,7 +509,7 @@ export class Controller {
           ) &&
           !sameBinding))
     ) {
-      throw new Error(
+      throw new AdoptionRefused(
         `Refusing to adopt ${value.kind} ${value.metadata.namespace ?? ''}/${value.metadata.name}`,
       );
     }
@@ -748,6 +761,9 @@ export class Controller {
    * tenants that are gone are dropped by tick (#131).
    */
   private readonly hostPulls = new Map<string, HostPull | undefined>();
+  /** The last `storage-mode` listing read, per Tenant uid, with the host pod uid it came from. */
+  /** Per Tenant uid: the last listing read, and the `<pod uid>/<restartCount>` run it came from. */
+  private readonly storageListings = new Map<string, { pod: string; observation: Observation }>();
   /**
    * How the tenant hosts pull from the registry (#83 `:host-pull`), decided from desired state
    * (W1 of the review): wired while `tenantAuth.registry` is set, the registry is deployed and
@@ -995,6 +1011,9 @@ export class Controller {
       `${collection('v1', 'Secret', this.cfg.namespace)}/wasmcloud-runtime-tls`,
     );
     const workloads = await this.storageWorkloads(tenant);
+    // Records are written before any host pod that mounts their keys is rendered (#200).
+    const observation = await this.observeStorage(tenant);
+    const storage = await this.recordStorage(tenant, workloads, observation);
     const registryDeployed = await this.registryDeployed(tenant);
     // A failed lookup here is reported on TenantAuthReady, not as a reconcile error (S6 of the
     // #83 `:host-pull` review): the hosts keep the last wiring, or are left untouched this tick.
@@ -1014,12 +1033,13 @@ export class Controller {
       tenant,
       this.cfg,
       secret,
-      storageKeys(workloads),
+      storage.mounted,
       await this.tenantAuthDeployed(tenant),
       registryDeployed,
       await this.tenantAuthNetworkApplied(tenant),
       hostPull,
       registryNats,
+      storage.reserve,
     ).filter(
       (value) =>
         hostsKnown ||
@@ -1027,7 +1047,16 @@ export class Controller {
     );
     let ready = !!secret;
     let failure: unknown;
+    let foreignRecords: string | undefined;
     try {
+      // The backup operator's copy of the records (design-200 §9.4). One someone else created
+      // is never adopted: it stays, and StorageIntegrity names it.
+      try {
+        await this.ensure(storageRecordsConfigMap(tenant, this.cfg.installation, storage.records));
+      } catch (error) {
+        if (!(error instanceof AdoptionRefused)) throw error;
+        foreignRecords = `ConfigMap ${n.runtimeNamespace}/${STORAGE_RECORDS_CONFIG} was not written by this controller and was left in place; the backup operator refuses restores until it is removed`;
+      }
       if (!this.cfg.routeUrlPattern) await this.removeRoutes(tenant);
       for (const value of desired) {
         const applied = await this.ensure(value);
@@ -1074,11 +1103,18 @@ export class Controller {
       this.logWriteFailures.get(tenant.metadata.name),
       tenant.metadata.generation ?? 1,
     );
-    const others = [...(auth ? [auth] : []), ...(logs ? [logs] : [])];
+    const integrity: Condition = {
+      type: 'StorageIntegrity',
+      ...integrityCondition(storage, observation, foreignRecords),
+      observedGeneration: tenant.metadata.generation ?? 1,
+      lastTransitionTime: new Date().toISOString(),
+    };
+    const others = [...(auth ? [auth] : []), ...(logs ? [logs] : []), integrity];
+    const records = { storage: { keys: storage.records } };
     if (failure) {
       const message = failure instanceof Error ? failure.message : 'Reconciliation failed';
       console.error(`Tenant/${tenant.metadata.name}: ${message}`);
-      await this.status(tenant, false, 'ReconcileError', message, {}, others);
+      await this.status(tenant, false, 'ReconcileError', message, records, others);
       return;
     }
     await this.status(
@@ -1097,9 +1133,126 @@ export class Controller {
         ...(this.cfg.tenantAuth && tenant.metadata.uid && this.apiKeysMoved.has(tenant.metadata.uid)
           ? { apiKeysMigrated: true }
           : {}),
+        ...records,
       },
       others,
     );
+  }
+
+  /**
+   * What the current host pod's `storage-mode` step reported (#200): its listing, read once per
+   * host pod uid through `pods/log`, or its termination message when it failed.
+   */
+  private async observeStorage(tenant: Tenant): Promise<Observation> {
+    const n = names(tenant.metadata.name);
+    const pod = (await this.liveHostPods(n))
+      .filter((p) => !p.metadata.deletionTimestamp)
+      .sort((a, b) =>
+        String(b.metadata.creationTimestamp ?? '').localeCompare(
+          String(a.metadata.creationTimestamp ?? ''),
+        ),
+      )[0];
+    if (!pod?.metadata.uid) return { state: 'pending' };
+    type Terminated = { exitCode: number; message?: string; reason?: string };
+    const step = (
+      pod.status as
+        | {
+            initContainerStatuses?: {
+              name: string;
+              restartCount?: number;
+              state?: { terminated?: Terminated };
+              lastState?: { terminated?: Terminated };
+            }[];
+          }
+        | undefined
+    )?.initContainerStatuses?.find((c) => c.name === 'storage-mode');
+    // One read per run of the step: a re-run in the same pod bumps its restartCount.
+    const run = `${pod.metadata.uid}/${step?.restartCount ?? 0}`;
+    const cached = this.storageListings.get(tenant.metadata.uid ?? '');
+    if (cached?.pod === run) return cached.observation;
+    const terminated = step?.state?.terminated ?? step?.lastState?.terminated;
+    if (!terminated) return { state: 'pending' };
+    if (terminated.exitCode !== 0) {
+      const cause = terminated.message?.trim() || terminated.reason || 'no termination message';
+      return {
+        state: 'failed',
+        message: `storage-mode in ${pod.metadata.name} exited ${terminated.exitCode}: ${cause}`,
+      };
+    }
+    if (!step?.state?.terminated) return { state: 'pending' };
+    let text: string | undefined;
+    try {
+      text = await this.api.call<string>(
+        'GET',
+        `${collection('v1', 'Pod', n.runtimeNamespace)}/${encodeURIComponent(pod.metadata.name)}/log?container=storage-mode`,
+      );
+    } catch (error) {
+      // Not cached: the next tick reads the log again. The plan is safe without a listing.
+      const cause = error instanceof Error ? error.message : String(error);
+      return {
+        state: 'failed',
+        message: `storage-mode listing of ${pod.metadata.name} could not be read: ${cause}`,
+      };
+    }
+    const listing = parseListing(String(text ?? ''));
+    const observation: Observation = listing
+      ? { state: 'read', listing }
+      : {
+          state: 'failed',
+          message: `storage-mode in ${pod.metadata.name} printed an incomplete listing`,
+        };
+    if (listing) this.storageListings.set(tenant.metadata.uid ?? '', { pod: run, observation });
+    return observation;
+  }
+
+  /**
+   * Plan the storage records and write them into `status.storage.keys` ahead of the host pod
+   * that mounts their keys (#200, design-200 §9.1).
+   */
+  private async recordStorage(
+    tenant: Tenant,
+    workloads: WorkloadDeployment[],
+    observation: Observation,
+  ): Promise<StoragePlan> {
+    const old = Controller.storageRecords(tenant);
+    const plan = planStorage({
+      records: old,
+      workloads,
+      integrity: tenant.spec.storage?.integrity ?? 'Off',
+      listing: observation.state === 'read' ? observation.listing : undefined,
+    });
+    const patch = recordsPatch(old, plan.records);
+    if (!patch) return plan;
+    let updated: Tenant | undefined;
+    try {
+      updated = await this.api.call<Tenant | undefined>(
+        'PATCH',
+        `${location(tenant)}/status`,
+        {
+          metadata: { resourceVersion: tenant.metadata.resourceVersion },
+          status: { storage: { keys: patch } },
+        },
+        'application/merge-patch+json',
+      );
+    } catch (error) {
+      // A refused or failed patch is reported on StorageIntegrity and the rest of the tenant
+      // still reconciles; only keys whose old record agrees with the plan are mounted.
+      const agrees = (key: string) => old[key]?.kind === plan.records[key]?.kind;
+      return {
+        ...plan,
+        records: old,
+        mounted: plan.mounted.filter(agrees),
+        reserve: plan.reserve.filter(agrees),
+        unwritten: `storage records could not be written: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    if (updated?.metadata) tenant.metadata = updated.metadata;
+    tenant.status = { ...tenant.status, storage: { keys: plan.records } };
+    return plan;
+  }
+
+  private static storageRecords(tenant: Tenant): StorageRecords {
+    return (tenant.status?.storage as { keys?: StorageRecords } | undefined)?.keys ?? {};
   }
   /**
    * The tenant's controller and console (#58), reconciled apart from the tenant itself: a
@@ -2258,7 +2411,10 @@ export class Controller {
    * fields; admission only lets their updates keep them unchanged.
    */
   async reconcileWorkloadStorage(tenant: Tenant): Promise<void> {
+    const records = Controller.storageRecords(tenant);
     for (const workload of await this.storageWorkloads(tenant)) {
+      // A workload whose key is unrecorded, or recorded with the other kind, gets no preopen.
+      if (!storageAllowed(records, workload)) continue;
       const patch = storagePatch(workload);
       if (!patch) continue;
       await this.api.call(
@@ -2533,6 +2689,9 @@ export class Controller {
         .map((tenant) => tenant.metadata.name),
     );
     for (const name of this.hostPulls.keys()) if (!listed.has(name)) this.hostPulls.delete(name);
+    const uids = new Set(tenants.map((tenant) => tenant.metadata.uid ?? ''));
+    for (const uid of this.storageListings.keys())
+      if (!uids.has(uid)) this.storageListings.delete(uid);
     for (const name of this.caRefusals.keys()) if (!listed.has(name)) this.caRefusals.delete(name);
     for (const name of this.logCursors.keys())
       if (!projected.has(name)) this.logCursors.delete(name);
