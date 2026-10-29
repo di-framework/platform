@@ -91,6 +91,11 @@ export interface ControllerConfig {
   hostImagePullPolicy?: string;
   schedulerNatsUrl: string;
   /**
+   * Names of the Tenants this installation declares (#544). The controller GETs any of them that
+   * a stale Tenant LIST misses, so a first install reconciles its Tenant before any User exists.
+   */
+  tenants?: string[];
+  /**
    * Exact `host[:port]` registries tenant hosts pull from over plain HTTP, one
    * `--insecure-registry` each (wash patch 0002): the platform registry on local installs. Every
    * other pull, the tenant registry's pull listener included, stays TLS.

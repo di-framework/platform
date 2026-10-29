@@ -295,6 +295,10 @@ export function installTenancy(args: {
                       hostImage: args.hostImage,
                       hostImagePullPolicy: args.hostImagePullPolicy,
                       schedulerNatsUrl: `nats://nats.${namespace}.svc.cluster.local:4222`,
+                      // Sorted, so reordering the config does not restart the controller (#544).
+                      tenants: args.tenants
+                        .map((tenant) => tenant.name)
+                        .sort((a, b) => a.localeCompare(b)),
                       insecureRegistries: args.insecureRegistries ?? [],
                       storageRoot: args.storageRoot,
                       routeUrlPattern: args.routeUrlPattern,
