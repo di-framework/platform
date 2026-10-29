@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { acceptedModes, storageRecordsOf } from '../src/storage-records.ts';
+import { acceptedModes, recordFor, storageRecordsOf } from '../src/storage-records.ts';
 
 const EXPECTED = { installation: 'di', ownerUid: 'uid-tenant' };
 const LABELS = {
@@ -36,6 +36,29 @@ describe('di-storage-records (#553)', () => {
       },
     });
     expect(storageRecordsOf(map({}), EXPECTED)).toEqual({ state: 'present', keys: {} });
+  });
+
+  test('keys named like Object.prototype members are own keys only', () => {
+    const empty = storageRecordsOf(map({}), EXPECTED);
+    if (empty.state !== 'present') throw new Error('expected present');
+    for (const key of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+      expect(recordFor(empty.keys, key)).toBeUndefined();
+    }
+    const named = storageRecordsOf(
+      map(
+        '{"__proto__":{"kind":"Other","mode":"XTS"},"constructor":{"kind":"PgliteEncfs","requested":"AEAD"},"toString":{"kind":"Other"}}',
+      ),
+      EXPECTED,
+    );
+    if (named.state !== 'present') throw new Error('expected present');
+    expect(recordFor(named.keys, '__proto__')).toEqual({ kind: 'Other', mode: 'XTS' });
+    expect(recordFor(named.keys, 'constructor')).toEqual({
+      kind: 'PgliteEncfs',
+      requested: 'AEAD',
+    });
+    expect(recordFor(named.keys, 'toString')).toEqual({ kind: 'Other' });
+    expect(Object.getPrototypeOf(named.keys)).toBeNull();
+    expect(Object.keys(named.keys).sort()).toEqual(['__proto__', 'constructor', 'toString']);
   });
 
   test('a copy without the controller labels is untrusted, never absent', () => {

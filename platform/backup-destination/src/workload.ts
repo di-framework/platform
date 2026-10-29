@@ -35,7 +35,13 @@ import {
 } from './model.ts';
 import { destinationParts } from './reconcile.ts';
 import { isDue, previousFire, validCron } from './schedule.ts';
-import { acceptedModes, type EncfsMode, STORAGE_RECORDS } from './storage-records.ts';
+import {
+  acceptedModes,
+  type EncfsMode,
+  recordFor,
+  STORAGE_RECORDS,
+  type StorageRecords,
+} from './storage-records.ts';
 
 /**
  * Cold copies of tenant workload volumes (#232).
@@ -261,7 +267,11 @@ export function resolveVolume(world: World, workloadName: string): Resolved | Pr
 
 /** Volume steps run only on state that was read in full this tick. */
 export function volumeStateKnown(world: World): boolean {
-  return world.workloads !== undefined && world.ledger !== undefined;
+  return (
+    world.workloads !== undefined &&
+    world.ledger !== undefined &&
+    world.storageRecords !== undefined
+  );
 }
 
 function seconds(from: string | undefined, to: string): number {
@@ -1335,16 +1345,34 @@ export function startRestore(world: World, restore: RestoreView): Action[] {
     return fail('TargetMismatch', 'source backup is not a workload-volume backup');
   }
   const prefix = backup.objectKey.replace(/\/[^/]+$/, '');
+  const backupMode = backup.volume?.encfsMode;
+  // Computed once per tick: `extra` and `check` both read it.
+  let modes: EncfsMode[] | Problem | undefined;
+  const modesFor = (key: string) => {
+    modes ??= targetModes(world, backupMode as string, key); // only after the encfsMode check
+    return modes;
+  };
   return begin(
     world,
     restore,
     (volume) => restoreOperation(world, { ...restore, volume }),
     (resolved) => {
-      const modes = targetModes(world, backup.volume?.encfsMode, resolved.key);
-      return { objectPrefix: prefix, ...(Array.isArray(modes) ? { targetModes: modes } : {}) };
+      const accepted = modesFor(resolved.key);
+      return {
+        objectPrefix: prefix,
+        ...(Array.isArray(accepted) ? { targetModes: accepted } : {}),
+      };
     },
     // Known before any downtime: the agent would only refuse it after the scale-down.
     (resolved) => {
+      // The agent refuses a manifest without encfsMode (ManifestInvalid); there are no
+      // backups from before encfsMode, so design-200 §9.4's older-manifest rule is not kept.
+      if (!backupMode) {
+        return {
+          reason: 'ManifestInvalid',
+          message: `source backup ${backup.name} records no encfsMode; it cannot be restored`,
+        };
+      }
       if (
         restore.expectedKcv &&
         backup.volume?.encfsKcv &&
@@ -1352,8 +1380,8 @@ export function startRestore(world: World, restore: RestoreView): Action[] {
       ) {
         return { reason: 'KcvMismatch', message: 'expectedKcv is not the KCV the backup recorded' };
       }
-      const modes = targetModes(world, backup.volume?.encfsMode, resolved.key);
-      return Array.isArray(modes) ? undefined : modes;
+      const accepted = modesFor(resolved.key);
+      return Array.isArray(accepted) ? undefined : accepted;
     },
   );
 }
@@ -1364,21 +1392,16 @@ const MIGRATION =
 /**
  * The backup modes the restore target accepts, from the platform's storage records
  * (design-200 §9.4 "Restore" step 1), or why the restore cannot start. Without records (an
- * older controller) the backup's own mode is passed, so the agent still checks the disk;
- * a backup without a recorded mode skips the check and passes none.
+ * older controller) the backup's own mode is passed, so the agent still checks the disk.
+ * Only called once the volume state, records included, is known.
  */
-function targetModes(
-  world: World,
-  backupMode: string | undefined,
-  key: string,
-): EncfsMode[] | undefined | Problem {
-  if (!backupMode) return undefined;
-  const records = world.storageRecords ?? { state: 'absent' };
+function targetModes(world: World, backupMode: string, key: string): EncfsMode[] | Problem {
+  const records = world.storageRecords as StorageRecords;
   if (records.state === 'absent') return [backupMode as EncfsMode];
   if (records.state !== 'present') {
     return { reason: 'StorageRecordsUntrusted', message: records.message };
   }
-  const record = records.keys[key];
+  const record = recordFor(records.keys, key);
   if (!record) {
     return {
       reason: 'TargetNotRecorded',
@@ -1397,10 +1420,15 @@ function targetModes(
 /** The next requested workload operation to start: restores first, then the oldest backup. */
 export function startNext(world: World): Action[] {
   if (!volumeStateKnown(world)) return [];
-  const restore = world.restores.find(
+  const restores = world.restores.filter(
     (item) => item.targetWorkloadName && !item.phase && !item.deleting,
   );
-  if (restore) return startRestore(world, restore);
+  for (const restore of restores) {
+    const actions = startRestore(world, restore);
+    // A restore already reported as waiting for its record does not hold the queue: the next
+    // restore or backup gets this tick, and the waiting one is checked again on every tick.
+    if (actions.length > 0 || restore.reason !== 'TargetNotRecorded') return actions;
+  }
   const pending = world.backups
     .filter((item) => item.source && !item.phase && !item.deleting)
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.name.localeCompare(b.name))[0];

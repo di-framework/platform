@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { backupVolume, probePlacement, restoreVolume } from './volume.ts';
+import { backupVolume, ENCFS_MODES, probePlacement, restoreVolume } from './volume.ts';
 
 export const TERMINATION_LIMIT = 4096;
 
@@ -169,6 +169,11 @@ export function parseRequest(env: Record<string, string | undefined>): AgentRequ
   if (!BACKUP_KINDS.includes(kind as BackupKind)) {
     return { ok: false, error: 'UnknownKind' };
   }
+  const targetModes = env.BACKUP_TARGET_MODES ? env.BACKUP_TARGET_MODES.split(',') : undefined;
+  // An unknown or empty segment would silently narrow the accepted set.
+  if (targetModes?.some((mode) => !ENCFS_MODES.has(mode))) {
+    return { ok: false, error: 'BadTargetModes' };
+  }
   return {
     kind: kind as BackupKind,
     host: env.BACKUP_HOST ?? '',
@@ -192,7 +197,7 @@ export function parseRequest(env: Record<string, string | undefined>): AgentRequ
     targetRoot: env.BACKUP_TARGET_ROOT,
     force: env.BACKUP_FORCE === 'true',
     expectedKcv: env.BACKUP_EXPECTED_KCV || undefined,
-    targetModes: env.BACKUP_TARGET_MODES ? env.BACKUP_TARGET_MODES.split(',') : undefined,
+    targetModes,
     probePaths: env.BACKUP_PROBE_PATHS,
   };
 }

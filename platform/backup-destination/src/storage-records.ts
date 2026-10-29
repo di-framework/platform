@@ -7,10 +7,11 @@
  * Everything about that shape is read here, so a change to it stays in this file.
  */
 
+import { OWNER_UID_LABEL } from './model.ts';
+
 /** The ConfigMap the platform controller writes in `di-runtime-<tenant>`. */
 export const STORAGE_RECORDS = 'di-storage-records';
 export const INSTALLATION_LABEL = 'platform.di-framework.dev/installation';
-const OWNER_UID_LABEL = 'platform.di-framework.dev/owner-uid';
 
 export const ENCFS_MODES = ['XTS', 'AEAD', 'NotEncfs'] as const;
 export type EncfsMode = (typeof ENCFS_MODES)[number];
@@ -90,13 +91,22 @@ export function storageRecordsOf(
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     return invalid('keys is not an object');
   }
-  const keys: Record<string, StorageRecord> = {};
+  // No prototype: tenants choose key names, so `constructor` or `__proto__` must stay plain keys.
+  const keys: Record<string, StorageRecord> = Object.create(null);
   for (const [key, value] of Object.entries(parsed)) {
     const record = recordOf(value);
     if (!record) return invalid(`entry ${JSON.stringify(key)} is not a storage record`);
     keys[key] = record;
   }
   return { state: 'present', keys };
+}
+
+/** A key's own record, never something inherited from Object.prototype. */
+export function recordFor(
+  records: Record<string, StorageRecord>,
+  key: string,
+): StorageRecord | undefined {
+  return Object.hasOwn(records, key) ? records[key] : undefined;
 }
 
 /** The backup modes a key's record accepts (design-200 §9.4, the restore table). */

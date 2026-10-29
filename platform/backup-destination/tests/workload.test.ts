@@ -1319,7 +1319,7 @@ function succeededSource(): BackupView {
     objectKey:
       'di-framework/alpha/workload-volumes/identity/uid-identity/20261013T020000Z/data.tar',
     source: { kind: 'workload-volume' as const, workloadName: 'identity' },
-    volume: { encfsKcv: '00112233445566778899aabbccddeeff' },
+    volume: { encfsKcv: '00112233445566778899aabbccddeeff', encfsMode: 'XTS' },
   };
 }
 
@@ -1490,7 +1490,7 @@ describe('restore into a workload volume', () => {
   describe('checked against di-storage-records before anything stops (#553)', () => {
     const modeSource = (encfsMode?: string) => ({
       ...source,
-      volume: { ...source.volume, ...(encfsMode ? { encfsMode } : {}) },
+      volume: { encfsKcv: source.volume?.encfsKcv, ...(encfsMode ? { encfsMode } : {}) },
     });
     const present = (keys: Record<string, StorageRecord>): StorageRecords => ({
       state: 'present',
@@ -1523,9 +1523,30 @@ describe('restore into a workload volume', () => {
     test("absent: no record check, the backup's own mode goes to the agent", () => {
       expect(restoreEnv(modeSource('XTS'), { state: 'absent' })).toBe('XTS');
       expect(restoreEnv(modeSource('AEAD'))).toBe('AEAD');
-      // A backup without a recorded mode skips the check and passes none.
-      expect(restoreEnv(modeSource(), { state: 'absent' })).toBeUndefined();
-      expect(restoreEnv(modeSource(), present({}))).toBeUndefined();
+    });
+
+    test('a backup without encfsMode is refused before anything stops', () => {
+      for (const records of [{ state: 'absent' } as const, present({})]) {
+        expect(refused(modeSource(), records)).toMatchObject({
+          phase: 'Failed',
+          reason: 'ManifestInvalid',
+          message: expect.stringContaining('records no encfsMode'),
+        });
+      }
+    });
+
+    test('a restore waiting for its record does not hold back a queued backup', () => {
+      const backup = modeSource('XTS');
+      const cluster = new Cluster(volumeWorld({ backups: [backup], storageRecords: present({}) }));
+      requestRestore(cluster, backup);
+      cluster.tick();
+      expect(cluster.world.restores[0]).toMatchObject({ reason: 'TargetNotRecorded' });
+      cluster.apply([requestBackup(cluster.world, must(cluster.world.destination), 'identity')]);
+      cluster.tick();
+      expect(cluster.world.restores[0]?.phase).toBeUndefined();
+      expect(cluster.world.backups.find((item) => item.name !== backup.name)).toMatchObject({
+        phase: 'Running',
+      });
     });
 
     test('untrusted or malformed records refuse the restore, naming the object', () => {

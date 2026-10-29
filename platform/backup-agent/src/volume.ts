@@ -40,7 +40,7 @@ const FLAG_RESERVATION = 0b10;
 
 /** How encfs encrypts a directory's files; `NotEncfs` is a directory without a marker. */
 export type EncfsMode = 'XTS' | 'AEAD' | 'NotEncfs';
-const ENCFS_MODES: ReadonlySet<string> = new Set(['XTS', 'AEAD', 'NotEncfs']);
+export const ENCFS_MODES: ReadonlySet<string> = new Set(['XTS', 'AEAD', 'NotEncfs']);
 
 /** What a marker file holds, from its magic, length and flags only (design-200 §9.1). */
 export type MarkerForm =
