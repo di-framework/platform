@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { NODE_IMAGE } from '../src/node-image';
+import { NODE_IMAGE } from '../src/tenancy/node-image';
 import { STORAGE_MODE_IMAGE } from '../src/tenancy/workload-storage';
 
 describe('NODE_IMAGE', () => {

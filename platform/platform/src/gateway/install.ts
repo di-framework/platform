@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
-import { NODE_IMAGE } from '../node-image';
 import { platformNamespacePeer, tenantNamespacesSelector } from '../platform-ingress';
+import { NODE_IMAGE } from '../tenancy/node-image';
 import {
   GATEWAY_NAME,
   GATEWAY_POD_LABELS,

@@ -1,4 +1,4 @@
-import { NODE_IMAGE } from '../node-image';
+import { NODE_IMAGE } from './node-image';
 import type { ControllerConfig, Resource, Tenant } from './resources';
 import { storageModeCommand } from './storage-mode';
 

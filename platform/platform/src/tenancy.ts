@@ -44,7 +44,7 @@ export {
   tenantObject,
 } from './tenancy/install';
 
-import { NODE_IMAGE } from './node-image';
+import { NODE_IMAGE } from './tenancy/node-image';
 import { tenantAuthReadsApiKeyNamespace } from './tenant-auth-images';
 
 export interface UserDeclaration extends UserSpec {

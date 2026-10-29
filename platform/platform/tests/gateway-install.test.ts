@@ -17,7 +17,7 @@ import {
   validateRouteAliases,
   validateRouteUrlPattern,
 } from '../src/gateway/install';
-import { NODE_IMAGE } from '../src/node-image';
+import { NODE_IMAGE } from '../src/tenancy/node-image';
 import { INSTALLATION, NAMESPACE_ROLE, TENANT } from '../src/tenancy/resources';
 
 describe('route URL pattern', () => {
