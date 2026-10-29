@@ -275,7 +275,7 @@ How the pieces give the properties:
   - The only pod that runs there is the bootstrap Job, and it mounts nothing from the namespace. vCluster syncs only Secrets a pod uses (`vcluster: values.yaml:26-30`), so these Secrets stay out of the host namespace on the vCluster target. **V**
   - The platform controller reads it.
 - **The identity record.** `di-scheduler-identities` holds one entry per client identity:
-  - for each tenant, `<t>/hosts` and `<t>/operator`;
+  - for each tenant, `tenant/<t>/hosts` and `tenant/<t>/operator` (their own prefix, so no Tenant name can collide with a platform key);
   - for the platform, `platform/operator`, `platform/host` and `platform/data`.
 
   Each entry is `{ current: <id>, previous?: <id>, previousUntil?: <time> }`.
@@ -323,10 +323,10 @@ Removal therefore runs in the fixed order below. The controller never skips a st
 
 | Step | `Delete` policy | `Retain` policy | Done when | Layer 4 |
 |---|---|---|---|---|
-| R1 | Drop the `<t>/hosts` entry and the host user from the next render | same | the reload is applied | 7a |
+| R1 | Drop the `tenant/<t>/hosts` entry and the host user from the next render | same | the reload is applied | 7a |
 | R2 | Scale the tenant host Deployment (and the other tenant workloads today's sweep stops) to zero, and wait for the host pods to be gone. The tenant operator Deployment in `di-operator-<t>` is excluded and stays at one ready replica | same (today's Retain wait, `controller.ts:931-976`, with the exclusion below) | no host pod in `di-runtime-<t>`, terminating pods included (#245), and no Host in `di-operator-<t>` (the operator's pod-host and Host finalizers have run) | 7b |
 | R3 | Delete the tenant's WorkloadDeployments, and wait for the operator to remove its finalizers | Scale the tenant operator to zero and wait for its pod to be gone. Then the controller removes the operator's finalizers from every remaining `runtime.wasmcloud.dev` object in `di-tenant-<t>` | `Delete`: no `runtime.wasmcloud.dev` object that carries an operator finalizer remains in `di-tenant-<t>`. An Artifact, if one ever exists, keeps R3 in `RemovalStuck` until it is deleted; no path creates one today. `Retain`: no such object carries an operator finalizer | 7c |
-| R4 | Drop the `<t>/operator` entry and the whole `T_di-tenant-<t>` account from the next render | same | the reload is applied, and the operator user is refused | 7d |
+| R4 | Drop the `tenant/<t>/operator` entry and the whole `T_di-tenant-<t>` account from the next render | same | the reload is applied, and the operator user is refused | 7d |
 | R5 | Delete the three RoleBindings to the tenant-operator ClusterRoles (the first step that removes them; `revoke` skips them before this), then `di-operator-<t>` | same. In the retained `di-tenant-<t>` and `di-runtime-<t>` the RoleBindings are deleted too, so a re-created Tenant starts clean | no such RoleBinding remains, and `di-operator-<t>` is gone | 7e |
 | R6 | Delete the tenant's namespaces, as today (`controller.ts:915-929`) | keep them, as today | namespaces gone, or present and unchanged | 7f |
 | R7 | Remove the Tenant's finalizer | same | the Tenant is gone | 7g |

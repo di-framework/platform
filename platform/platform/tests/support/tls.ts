@@ -67,9 +67,15 @@ export function withinNameConstraints(leaf: string, anchor: string): boolean {
  * True when `openssl verify` accepts `leaf` (PEM) as a TLS server certificate, strictly
  * (`-x509_strict`), against the PEM trust bundle `bundle` at time `at`. OpenSSL applies name
  * constraints itself, so this is an oracle independent of this repository's X.509 code. LibreSSL
- * has no `-verify_hostname`; {@link verifiesAt} checks the host name.
+ * has no `-verify_hostname`; {@link verifiesAt} checks the host name. With `purpose` `sslclient`
+ * it checks a TLS client certificate instead (#541).
  */
-export function opensslVerifies(leaf: string, bundle: string, at: Date): boolean {
+export function opensslVerifies(
+  leaf: string,
+  bundle: string,
+  at: Date,
+  purpose: 'sslserver' | 'sslclient' = 'sslserver',
+): boolean {
   const dir = mkdtempSync(join(tmpdir(), 'ca-verify-'));
   try {
     writeFileSync(join(dir, 'leaf.pem'), leaf);
@@ -78,7 +84,7 @@ export function opensslVerifies(leaf: string, bundle: string, at: Date): boolean
       'verify',
       '-x509_strict',
       '-purpose',
-      'sslserver',
+      purpose,
       '-attime',
       String(Math.floor(at.getTime() / 1000)),
       '-CAfile',
@@ -129,4 +135,62 @@ export function verifiesAt(leaf: string, bundle: string, at: Date): boolean {
         withinNameConstraints(leaf, anchor.toString()),
     )
   );
+}
+
+/**
+ * A TLS client certificate that `ca` (PEM certificate and key) signs with the OpenSSL CLI, naming
+ * exactly `subjectAltName` (OpenSSL syntax, for example `email:a@b` or `URI:https://b`). It stands
+ * for a certificate issued outside this repository's X.509 code, such as by a bug or a stolen CA
+ * key, so the name constraints of `ca` are checked against forms the platform never issues (#541).
+ */
+export function opensslClientLeaf(
+  ca: { cert: string; key: string },
+  subjectAltName: string,
+): string {
+  const dir = mkdtempSync(join(tmpdir(), 'ca-forge-'));
+  try {
+    const at = (name: string) => join(dir, name);
+    writeFileSync(at('ca.pem'), ca.cert);
+    writeFileSync(at('ca.key'), ca.key);
+    writeFileSync(
+      at('ext.cnf'),
+      [
+        '[v3]',
+        'basicConstraints=critical,CA:FALSE',
+        'keyUsage=critical,digitalSignature',
+        'extendedKeyUsage=clientAuth',
+        'subjectKeyIdentifier=hash',
+        'authorityKeyIdentifier=keyid',
+        `subjectAltName=${subjectAltName}`,
+        '',
+      ].join('\n'),
+    );
+    const run = (...args: string[]) => execFileSync(OPENSSL, args, { stdio: 'ignore' });
+    run('ecparam', '-name', 'prime256v1', '-genkey', '-noout', '-out', at('leaf.key'));
+    run('req', '-new', '-key', at('leaf.key'), '-subj', '/CN=forged', '-out', at('leaf.csr'));
+    run(
+      'x509',
+      '-req',
+      '-in',
+      at('leaf.csr'),
+      '-CA',
+      at('ca.pem'),
+      '-CAkey',
+      at('ca.key'),
+      '-sha256',
+      '-set_serial',
+      '4660',
+      '-days',
+      '2',
+      '-extfile',
+      at('ext.cnf'),
+      '-extensions',
+      'v3',
+      '-out',
+      at('leaf.pem'),
+    );
+    return readFileSync(at('leaf.pem'), 'utf8');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
