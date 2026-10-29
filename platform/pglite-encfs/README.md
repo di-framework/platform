@@ -10,7 +10,7 @@
 guest.wasm ──di-framework:pglite/database──▶ pglite.wasm ──wasi:filesystem, io, cli…──▶ pglite-encfs.wasm ──▶ host (wash / wasmtime)
 ```
 
-Published as `ghcr.io/di-framework/pglite-encfs@sha256:b15f4cd88cd012eb17d340aeed4205557dfd88e693ca9f723a2f02bd8ad78c97`. The publish workflow rewrites this pin after every publish. The moving tags are the commit SHA and the WIT package version (`0.1.0`); only the digest is immutable.
+Published as `ghcr.io/di-framework/pglite-encfs@sha256:c53bd5e23678c9d9a0b038c9903d2b47e8457a09ac842322f4c2b805df6c546d`. The publish workflow rewrites this pin after every publish. The moving tags are the commit SHA and the WIT package version (`0.1.0`); only the digest is immutable.
 
 Design and spike: #199. The integrity (AEAD) mode is #200, designed in [docs/design-200-two-slot-aead.md](docs/design-200-two-slot-aead.md). This release reads integrity directories but cannot create them; see [Integrity directories](#integrity-directories-codec-4).
 
