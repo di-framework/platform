@@ -218,6 +218,35 @@ export const PLACEMENT_RETRY = 'di-framework.dev/placement-retry';
 const NUDGE_HOST_SETTLE_MS = 1_000;
 /** How old an unplaced Workload must be before it is nudged (S2 of the #418 review). */
 const NUDGE_WORKLOAD_MIN_AGE_MS = 5_000;
+/** Whether `time` is unset or at least `ms` before `now`. */
+function olderThan(time: string | undefined, ms: number, now: number): boolean {
+  return !time || now - Date.parse(time) >= ms;
+}
+/** The sorted uids of the hosts Ready for {@link NUDGE_HOST_SETTLE_MS}, joined; empty if none (#418). */
+function settledHostKey(readyHosts: Resource[], now: number): string {
+  return readyHosts
+    .filter((h) =>
+      olderThan(
+        (h.status as { conditions?: Condition[] } | undefined)?.conditions?.find(
+          (c) => c.type === 'Ready',
+        )?.lastTransitionTime,
+        NUDGE_HOST_SETTLE_MS,
+        now,
+      ),
+    )
+    .map((h) => h.metadata.uid ?? h.metadata.name)
+    .sort((a, b) => a.localeCompare(b))
+    .join(',');
+}
+/** Whether an unplaced, live, old-enough Workload still lacks the nudge for `host` (#418). */
+function needsNudge(workload: WorkloadObject, host: string, now: number): boolean {
+  return (
+    !workload.status?.hostId &&
+    !workload.metadata.deletionTimestamp &&
+    workload.metadata.annotations?.[PLACEMENT_RETRY] !== host &&
+    olderThan(workload.metadata.creationTimestamp, NUDGE_WORKLOAD_MIN_AGE_MS, now)
+  );
+}
 /** The controlling owner of `value` of `kind`, as the wasmCloud operator sets it. */
 function controllerOf(value: WorkloadObject, kind: string) {
   return value.metadata.ownerReferences?.find(
@@ -935,20 +964,7 @@ export class Controller {
    */
   private async nudgeUnplaced(namespace: string, readyHosts: Resource[]): Promise<void> {
     const now = this.now().getTime();
-    const olderThan = (time: string | undefined, ms: number) =>
-      !time || now - Date.parse(time) >= ms;
-    const host = readyHosts
-      .filter((h) =>
-        olderThan(
-          (h.status as { conditions?: Condition[] } | undefined)?.conditions?.find(
-            (c) => c.type === 'Ready',
-          )?.lastTransitionTime,
-          NUDGE_HOST_SETTLE_MS,
-        ),
-      )
-      .map((h) => h.metadata.uid ?? h.metadata.name)
-      .sort()
-      .join(',');
+    const host = settledHostKey(readyHosts, now);
     if (!host) return;
     let workloads: WorkloadObject[];
     try {
@@ -965,29 +981,30 @@ export class Controller {
       return;
     }
     for (const workload of workloads) {
-      if (
-        workload.status?.hostId ||
-        workload.metadata.deletionTimestamp ||
-        workload.metadata.annotations?.[PLACEMENT_RETRY] === host ||
-        !olderThan(workload.metadata.creationTimestamp, NUDGE_WORKLOAD_MIN_AGE_MS)
-      )
-        continue;
-      try {
-        await this.api.call(
-          'PATCH',
-          `${location(workload)}?fieldManager=di-platform-controller`,
-          { metadata: { annotations: { [PLACEMENT_RETRY]: host } } },
-          'application/merge-patch+json',
-        );
-      } catch (error) {
-        if (error instanceof ApiError && error.code === 404) continue;
-        const failure = `${namespace}/${workload.metadata.name}@${host}`;
-        if (this.nudgeFailures.has(failure)) continue;
-        this.nudgeFailures.add(failure);
-        console.warn(
-          `Placement nudge of Workload ${failure} failed: ${error instanceof Error ? error.message : error}`,
-        );
-      }
+      if (needsNudge(workload, host, now)) await this.nudgeWorkload(namespace, workload, host);
+    }
+  }
+  /** Sets {@link PLACEMENT_RETRY} on one Workload; see {@link nudgeUnplaced} for failures. */
+  private async nudgeWorkload(
+    namespace: string,
+    workload: WorkloadObject,
+    host: string,
+  ): Promise<void> {
+    try {
+      await this.api.call(
+        'PATCH',
+        `${location(workload)}?fieldManager=di-platform-controller`,
+        { metadata: { annotations: { [PLACEMENT_RETRY]: host } } },
+        'application/merge-patch+json',
+      );
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 404) return;
+      const failure = `${namespace}/${workload.metadata.name}@${host}`;
+      if (this.nudgeFailures.has(failure)) return;
+      this.nudgeFailures.add(failure);
+      console.warn(
+        `Placement nudge of Workload ${failure} failed: ${error instanceof Error ? error.message : error}`,
+      );
     }
   }
   /** How the registry workload reaches `di-nats` for {@link registryNats} (#159). */
