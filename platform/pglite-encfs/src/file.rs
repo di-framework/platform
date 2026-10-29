@@ -268,16 +268,16 @@ pub(crate) mod tests {
         data
     }
 
-    /// Small deterministic generator for the model test.
-    struct XorShift(u64);
+    /// Small deterministic generator for the model tests (Q15: no proptest).
+    pub(crate) struct XorShift(pub u64);
     impl XorShift {
-        fn next(&mut self) -> u64 {
+        pub fn next(&mut self) -> u64 {
             self.0 ^= self.0 << 13;
             self.0 ^= self.0 >> 7;
             self.0 ^= self.0 << 17;
             self.0
         }
-        fn below(&mut self, n: u64) -> u64 {
+        pub fn below(&mut self, n: u64) -> u64 {
             self.next() % n
         }
     }

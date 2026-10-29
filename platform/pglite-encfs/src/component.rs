@@ -10,6 +10,13 @@
 //! - Single-threaded, one instance per data directory: the same exclusive
 //!   ownership pglite already requires. File headers are created and the
 //!   cipher cache is filled without locking.
+//! - Each preopen's marker fixes its mode ([`Mode`]). An XTS directory holds
+//!   codec-2/3 files only; an integrity directory holds codec-4 files only
+//!   (#200). This build reads codec-4 files but cannot write file data in an
+//!   integrity directory: writes, resizes and truncating opens of its files
+//!   fail with `io`. Directory operations (create, mkdir, rename, unlink,
+//!   symlink) pass through. The codec-4 writer comes in the writer release
+//!   (design note section 9.3).
 
 mod bindings {
     wit_bindgen::generate!({
@@ -53,11 +60,14 @@ use xfs::ErrorCode;
 use crate::codec::{Codec, UnitCipher};
 use crate::file::{logical_size, EncryptedFile, FileError, Storage};
 use crate::header::{
-    classify, FileId, Header, HeaderError, HeaderState, DEK_LEN, HEADER_LEN, HEADER_USED,
+    classify_in, FileId, Header, HeaderError, HeaderState, DEK_LEN, HEADER_LEN, HEADER_USED,
 };
 use crate::keys::{is_key_variable, Kek, KeyRing};
-use crate::marker::{self, Lock, RootDecision, MARKER_LEN, MARKER_NAME, MARKER_TMP_NAME};
+use crate::marker::{
+    self, Lock, Mode, RootDecision, MARKER_NAME, MARKER_READ_LEN, MARKER_TMP_NAME,
+};
 use crate::rotation;
+use crate::slots::{Layout, SlotError, SlotFile, SlotKeys};
 
 type R<T> = Result<T, ErrorCode>;
 
@@ -83,7 +93,27 @@ struct State {
     keys: KeyRing,
     /// Full header bytes → unwrapped cipher. Keyed by the whole header, not
     /// the file id, so every header in use has been authenticated.
-    ciphers: RefCell<BTreeMap<[u8; HEADER_USED], Rc<UnitCipher>>>,
+    ciphers: RefCell<BTreeMap<[u8; HEADER_USED], Rc<FileCipher>>>,
+}
+
+/// The keys of one file, by its codec.
+enum FileCipher {
+    /// Codecs 2 and 3 (boxed: the AES key schedules dwarf the slot keys).
+    Xts(Box<UnitCipher>),
+    /// Codec 4: the slot and record keys, and the file id they bind to.
+    Slots { keys: SlotKeys, file_id: FileId },
+}
+
+impl FileCipher {
+    fn new(header: &Header, dek: &[u8; DEK_LEN]) -> FileCipher {
+        match header.codec() {
+            Codec::TwoSlotAead => FileCipher::Slots {
+                keys: SlotKeys::derive(dek),
+                file_id: header.file_id(),
+            },
+            codec => FileCipher::Xts(Box::new(UnitCipher::new(codec, dek))),
+        }
+    }
 }
 
 thread_local! {
@@ -197,6 +227,16 @@ fn file_error(path: &str, error: FileError<hfs::ErrorCode>) -> ErrorCode {
     }
 }
 
+fn slot_error(path: &str, error: SlotError<hfs::ErrorCode>) -> ErrorCode {
+    match error {
+        SlotError::Storage(code) => host(code),
+        SlotError::Integrity(integrity) => {
+            log(&format!("{path}: {}; refusing", integrity.describe()));
+            ErrorCode::Io
+        }
+    }
+}
+
 fn header_error(path: &str, error: HeaderError) -> ErrorCode {
     match error {
         HeaderError::WrongKey => {
@@ -290,10 +330,26 @@ pub struct File {
     host: hfs::Descriptor,
     flags: xfs::DescriptorFlags,
     path: String,
-    cipher: RefCell<Option<Rc<UnitCipher>>>,
+    /// The mode of the preopen the file was opened under.
+    mode: Mode,
+    cipher: RefCell<Option<Rc<FileCipher>>>,
+    /// A codec-4 file's watermark and size, computed once: this build never
+    /// writes codec-4 files, so they cannot change under it.
+    layout: Cell<Option<Layout>>,
 }
 
 impl File {
+    fn new(host: hfs::Descriptor, flags: xfs::DescriptorFlags, path: String, mode: Mode) -> File {
+        File {
+            host,
+            flags,
+            path,
+            mode,
+            cipher: RefCell::default(),
+            layout: Cell::default(),
+        }
+    }
+
     fn writable(&self) -> bool {
         self.flags.contains(xfs::DescriptorFlags::WRITE)
     }
@@ -303,9 +359,10 @@ impl File {
     }
 
     /// The file's cipher, or `None` while it is fresh: empty, or left with a
-    /// short or zero header by a crash during its creation (see [`classify`]).
-    /// `access` for another key, `io` for plaintext, foreign or damaged files.
-    fn cipher(&self) -> R<Option<Rc<UnitCipher>>> {
+    /// short or zero header by a crash during its creation (see
+    /// [`classify_in`]). `access` for another key, `io` for plaintext, foreign
+    /// or damaged files, and for a codec its directory's mode does not admit.
+    fn cipher(&self) -> R<Option<Rc<FileCipher>>> {
         if let Some(cipher) = self.cipher.borrow().as_ref() {
             return Ok(Some(cipher.clone()));
         }
@@ -314,10 +371,25 @@ impl File {
             return Ok(None);
         }
         let start = read_header(&self.host).map_err(host)?;
-        let header = match classify(&start, physical).map_err(|e| header_error(&self.path, e))? {
+        let header = match classify_in(&start, physical, self.mode)
+            .map_err(|e| header_error(&self.path, e))?
+        {
             HeaderState::Fresh => return Ok(None),
             HeaderState::Sealed(header) => header,
         };
+        if !self.mode.admits(header.codec()) {
+            // A directory never mixes XTS and codec-4 files (#200).
+            log(&format!(
+                "{}: codec {} file in an {} directory; refusing",
+                self.path,
+                header.codec().id(),
+                match self.mode {
+                    Mode::Xts => "XTS",
+                    Mode::Integrity => "integrity",
+                }
+            ));
+            return Err(ErrorCode::Io);
+        }
         let state = state();
         let kek = current_key(&state)?;
         let cached = state.ciphers.borrow().get(header.as_bytes()).cloned();
@@ -326,7 +398,7 @@ impl File {
             Some(cipher) => cipher,
             None => {
                 let dek = header.open(kek).map_err(|e| header_error(&self.path, e))?;
-                let cipher = Rc::new(UnitCipher::new(header.codec(), &dek));
+                let cipher = Rc::new(FileCipher::new(&header, &dek));
                 state
                     .ciphers
                     .borrow_mut()
@@ -338,10 +410,28 @@ impl File {
         Ok(Some(cipher))
     }
 
-    /// The cipher for a write, sealing a fresh header first. The header is
+    /// Refuse a write this build cannot make: file data (a write, a resize
+    /// or a truncating open) in an integrity directory, whose files are
+    /// codec 4. Directory operations are not refused. Logged once: the
+    /// engine retries.
+    fn refuse_integrity_write(&self) -> ErrorCode {
+        log_once(
+            "integrity-no-writer",
+            &format!(
+                "{}: this build cannot write codec-4 file data (no codec-4 writer); refusing the write",
+                self.path
+            ),
+        );
+        ErrorCode::Io
+    }
+
+    /// The XTS cipher for a write, sealing a fresh header first. The header is
     /// synced before any data can follow it, so a crash never leaves data
-    /// behind a missing header.
-    fn cipher_for_write(&self) -> R<Rc<UnitCipher>> {
+    /// behind a missing header. Fails in an integrity directory.
+    fn cipher_for_write(&self) -> R<Rc<FileCipher>> {
+        if self.mode == Mode::Integrity {
+            return Err(self.refuse_integrity_write());
+        }
         if let Some(cipher) = self.cipher()? {
             return Ok(cipher);
         }
@@ -354,7 +444,10 @@ impl File {
         block[..HEADER_USED].copy_from_slice(header.as_bytes());
         HostStorage(&self.host).write_at(0, &block).map_err(host)?;
         self.host.sync_data().map_err(host)?;
-        let cipher = Rc::new(UnitCipher::new(Codec::NEW_FILES, &dek));
+        let cipher = Rc::new(FileCipher::Xts(Box::new(UnitCipher::new(
+            Codec::NEW_FILES,
+            &dek,
+        ))));
         state
             .ciphers
             .borrow_mut()
@@ -363,8 +456,34 @@ impl File {
         Ok(cipher)
     }
 
+    /// A codec-4 file's watermark and logical size (design note 5.3).
+    fn layout(&self, slots: &SlotFile<HostStorage>) -> R<Layout> {
+        if let Some(layout) = self.layout.get() {
+            return Ok(layout);
+        }
+        let layout = slots.layout().map_err(|e| slot_error(&self.path, e))?;
+        self.layout.set(Some(layout));
+        Ok(layout)
+    }
+
     fn size(&self) -> R<u64> {
-        Ok(logical_size(self.physical_size()?))
+        if self.mode == Mode::Xts {
+            // Length-preserving: no key needed.
+            return Ok(logical_size(self.physical_size()?));
+        }
+        match self.cipher()?.as_deref() {
+            Some(FileCipher::Slots { keys, file_id }) => {
+                let storage = HostStorage(&self.host);
+                let slots = SlotFile {
+                    keys,
+                    file_id: *file_id,
+                    storage: &storage,
+                };
+                Ok(self.layout(&slots)?.size)
+            }
+            // Fresh; `cipher` refuses XTS files here.
+            _ => Ok(0),
+        }
     }
 
     fn read(&self, len: u64, offset: u64) -> R<(Vec<u8>, bool)> {
@@ -372,12 +491,33 @@ impl File {
             return Ok((Vec::new(), true));
         };
         let storage = HostStorage(&self.host);
-        EncryptedFile {
-            cipher: &cipher,
-            storage: &storage,
+        match &*cipher {
+            FileCipher::Xts(cipher) => EncryptedFile {
+                cipher,
+                storage: &storage,
+            }
+            .read(len, offset)
+            .map_err(|e| file_error(&self.path, e)),
+            FileCipher::Slots { keys, file_id } => {
+                let slots = SlotFile {
+                    keys,
+                    file_id: *file_id,
+                    storage: &storage,
+                };
+                let layout = self.layout(&slots)?;
+                slots
+                    .read(layout, len, offset)
+                    .map_err(|e| slot_error(&self.path, e))
+            }
         }
-        .read(len, offset)
-        .map_err(|e| file_error(&self.path, e))
+    }
+
+    /// The XTS cipher of a file this build may write.
+    fn xts<'c>(&self, cipher: &'c FileCipher) -> R<&'c UnitCipher> {
+        match cipher {
+            FileCipher::Xts(cipher) => Ok(cipher),
+            FileCipher::Slots { .. } => Err(self.refuse_integrity_write()),
+        }
     }
 
     fn write(&self, data: &[u8], offset: u64) -> R<u64> {
@@ -390,7 +530,7 @@ impl File {
         let cipher = self.cipher_for_write()?;
         let storage = HostStorage(&self.host);
         EncryptedFile {
-            cipher: &cipher,
+            cipher: self.xts(&cipher)?,
             storage: &storage,
         }
         .write(offset, data)
@@ -409,7 +549,7 @@ impl File {
         };
         let storage = HostStorage(&self.host);
         EncryptedFile {
-            cipher: &cipher,
+            cipher: self.xts(&cipher)?,
             storage: &storage,
         }
         .set_size(size)
@@ -419,24 +559,29 @@ impl File {
 
 // ------------------------------------------------------------------ preopen roots
 
-/// Check a preopen before pglite may touch it (see [`crate::marker`]).
-fn open_root(dir: &hfs::Descriptor) -> Result<(), ErrorCode> {
+/// Check a preopen before pglite may touch it (see [`crate::marker`]), and
+/// return its mode.
+fn open_root(dir: &hfs::Descriptor) -> Result<Mode, ErrorCode> {
     let state = state();
     let marker = read_marker(dir)?;
     let has_data = root_has_data(dir)?;
     match marker::decide(&state.keys, marker.as_deref(), has_data) {
-        RootDecision::Ready => Ok(()),
-        RootDecision::Initialize => write_marker(dir, current_key(&state)?),
-        RootDecision::Rotate => {
+        RootDecision::Ready(mode) => Ok(mode),
+        RootDecision::Initialize => {
+            write_marker(dir, Mode::Xts, current_key(&state)?)?;
+            Ok(Mode::Xts)
+        }
+        RootDecision::Rotate(mode) => {
             let (current, previous) = (
                 current_key(&state)?,
                 state.keys.previous().ok_or(ErrorCode::Access)?,
             );
-            let sweep = rewrap_tree(dir, previous, current)?;
+            let sweep = rewrap_tree(dir, mode, previous, current)?;
             dir.sync().map_err(host)?;
-            write_marker(dir, current)?;
+            // The marker keeps its mode (and an integrity marker its flags).
+            write_marker(dir, mode, current)?;
             log(&sweep.completion_message());
-            Ok(())
+            Ok(mode)
         }
         RootDecision::Locked(lock) => {
             log_once("root-locked", lock.message());
@@ -457,7 +602,7 @@ fn read_marker(dir: &hfs::Descriptor) -> R<Option<Vec<u8>>> {
         hfs::DescriptorFlags::READ,
     ) {
         Ok(file) => HostStorage(&file)
-            .read_at(0, MARKER_LEN as u64 + 1)
+            .read_at(0, MARKER_READ_LEN as u64)
             .map(Some)
             .map_err(host),
         Err(hfs::ErrorCode::NoEntry) => Ok(None),
@@ -476,9 +621,9 @@ fn root_has_data(dir: &hfs::Descriptor) -> R<bool> {
     Ok(false)
 }
 
-/// Write the marker for `kek` atomically: a synced temporary file renamed
-/// over the marker, then a directory sync.
-fn write_marker(dir: &hfs::Descriptor, kek: &Kek) -> R<()> {
+/// Write the marker of a `mode` directory for `kek` atomically: a synced
+/// temporary file renamed over the marker, then a directory sync.
+fn write_marker(dir: &hfs::Descriptor, mode: Mode, kek: &Kek) -> R<()> {
     let file = dir
         .open_at(
             hfs::PathFlags::empty(),
@@ -488,7 +633,7 @@ fn write_marker(dir: &hfs::Descriptor, kek: &Kek) -> R<()> {
         )
         .map_err(host)?;
     HostStorage(&file)
-        .write_at(0, &marker::encode(kek.kcv()))
+        .write_at(0, &marker::encode(mode, kek.kcv()))
         .map_err(host)?;
     file.sync().map_err(host)?;
     dir.rename_at(MARKER_TMP_NAME, dir, MARKER_NAME)
@@ -500,8 +645,8 @@ fn write_marker(dir: &hfs::Descriptor, kek: &Kek) -> R<()> {
 const SKIPPED_LOG_LIMIT: usize = 50;
 
 /// Run the rotation sweep (see [`crate::rotation`]) over a preopen root.
-fn rewrap_tree(dir: &hfs::Descriptor, from: &Kek, to: &Kek) -> R<rotation::Sweep> {
-    let sweep = rotation::rewrap_tree(&HostDir::Borrowed(dir), from, to, &mut || random())
+fn rewrap_tree(dir: &hfs::Descriptor, mode: Mode, from: &Kek, to: &Kek) -> R<rotation::Sweep> {
+    let sweep = rotation::rewrap_tree(&HostDir::Borrowed(dir), mode, from, to, &mut || random())
         .map_err(|error| match error {
             rotation::SweepError::Host(error) => host(error),
             rotation::SweepError::Header { path, error } => header_error(&path, error),
@@ -629,6 +774,8 @@ pub enum Descriptor {
         root: bool,
         /// The preopen root's identity, `None` if the host could not tell.
         root_id: Option<DirId>,
+        /// The preopen's mode, from its marker.
+        mode: Mode,
     },
     /// A preopen that failed its key check: data and namespace operations fail.
     Locked {
@@ -850,7 +997,7 @@ impl xpre::Guest for Component {
             .into_iter()
             .map(|(dir, path)| {
                 let descriptor = match open_root(&dir) {
-                    Ok(()) => {
+                    Ok(mode) => {
                         let flags = dir
                             .get_flags()
                             .map(guest_flags)
@@ -861,6 +1008,7 @@ impl xpre::Guest for Component {
                             flags,
                             root: true,
                             root_id,
+                            mode,
                         }
                     }
                     Err(error) => Descriptor::Locked { host: dir, error },
@@ -916,6 +1064,37 @@ impl Descriptor {
             Descriptor::Passthrough { root_id, .. } => *root_id,
             _ => None,
         }
+    }
+
+    /// The mode of the preopen this descriptor was opened under. A locked
+    /// preopen has none; [`Descriptor::guard`] refuses it first.
+    fn mode(&self) -> Mode {
+        match self {
+            Descriptor::Passthrough { mode, .. } => *mode,
+            Descriptor::File(file) => file.mode,
+            Descriptor::Locked { .. } => Mode::Xts,
+        }
+    }
+
+    /// The logical size of the regular file at `path` in an integrity
+    /// directory: codec-4 sizes need the file's slots (design note 5.3).
+    fn integrity_size_at(&self, path_flags: xfs::PathFlags, path: &str) -> R<u64> {
+        let fd = self
+            .host()
+            .open_at(
+                host_path_flags(path_flags),
+                path,
+                hfs::OpenFlags::empty(),
+                hfs::DescriptorFlags::READ,
+            )
+            .map_err(host)?;
+        File::new(
+            fd,
+            xfs::DescriptorFlags::READ,
+            path.to_string(),
+            Mode::Integrity,
+        )
+        .size()
     }
 }
 
@@ -1094,15 +1273,30 @@ impl xfs::GuestDescriptor for Descriptor {
     }
 
     fn stat(&self) -> R<xfs::DescriptorStat> {
-        self.host().stat().map(guest_stat).map_err(host)
+        let stat = self.host().stat().map(guest_stat).map_err(host)?;
+        match self {
+            Descriptor::File(file) if file.mode == Mode::Integrity => Ok(xfs::DescriptorStat {
+                size: file.size()?,
+                ..stat
+            }),
+            _ => Ok(stat),
+        }
     }
 
     fn stat_at(&self, path_flags: xfs::PathFlags, path: String) -> R<xfs::DescriptorStat> {
         self.guard(Some(&path))?;
-        self.host()
+        let stat = self
+            .host()
             .stat_at(host_path_flags(path_flags), &path)
             .map(guest_stat)
-            .map_err(host)
+            .map_err(host)?;
+        if self.mode() == Mode::Integrity && stat.type_ == xfs::DescriptorType::RegularFile {
+            return Ok(xfs::DescriptorStat {
+                size: self.integrity_size_at(path_flags, &path)?,
+                ..stat
+            });
+        }
+        Ok(stat)
     }
 
     fn open_at(
@@ -1139,14 +1333,10 @@ impl xfs::GuestDescriptor for Descriptor {
                 flags,
                 root,
                 root_id,
+                mode: self.mode(),
             }));
         }
-        let file = File {
-            host: fd,
-            flags,
-            path,
-            cipher: RefCell::default(),
-        };
+        let file = File::new(fd, flags, path, self.mode());
         // Refuse another key's or a plaintext file before anything can change it.
         if file.cipher()?.is_none() {
             current_key(&state())?;

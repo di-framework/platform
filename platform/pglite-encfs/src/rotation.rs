@@ -13,9 +13,9 @@
 //! operator can find the exact file (relation file names repeat across
 //! databases).
 
-use crate::header::{classify, Header, HeaderError, HeaderState, NONCE_LEN};
+use crate::header::{classify_in, Header, HeaderError, HeaderState, NONCE_LEN};
 use crate::keys::Kek;
-use crate::marker::{is_marker_name, LOST_AND_FOUND};
+use crate::marker::{is_marker_name, Mode, LOST_AND_FOUND};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntryType {
@@ -143,16 +143,20 @@ impl Sweep {
     }
 }
 
-/// Re-wrap every header under the preopen root `root` from `from` to `to`.
-/// Headers already under `to` are skipped, so an interrupted sweep resumes.
-/// The markers are not visited; `lost+found` at the root is swept best-effort.
+/// Re-wrap every header under the preopen root `root`, a directory of
+/// `mode`, from `from` to `to`. Headers already under `to` are skipped, so an
+/// interrupted sweep resumes. The markers are not visited; `lost+found` at
+/// the root is swept best-effort. A re-wrap writes only the header's used
+/// bytes, so a codec-4 file's watermark pages are never touched.
 pub fn rewrap_tree<D: Dir>(
     root: &D,
+    mode: Mode,
     from: &Kek,
     to: &Kek,
     nonce: &mut dyn FnMut() -> [u8; NONCE_LEN],
 ) -> Result<Sweep, SweepError<D::Error>> {
     let mut sweeper = Sweeper {
+        mode,
         from,
         to,
         nonce,
@@ -182,6 +186,7 @@ enum Failure<E> {
 }
 
 struct Sweeper<'a> {
+    mode: Mode,
     from: &'a Kek,
     to: &'a Kek,
     nonce: &'a mut dyn FnMut() -> [u8; NONCE_LEN],
@@ -271,7 +276,7 @@ impl Sweeper<'_> {
             return Ok(Outcome::NoHeader);
         }
         let start = file.read_start().map_err(Failure::Host)?;
-        let header = match classify(&start, physical).map_err(Failure::Header)? {
+        let header = match classify_in(&start, physical, self.mode).map_err(Failure::Header)? {
             HeaderState::Fresh => return Ok(Outcome::NoHeader),
             HeaderState::Sealed(header) => header,
         };
@@ -404,9 +409,49 @@ mod tests {
     }
 
     fn sweep(root: &Node) -> Result<Sweep, SweepError<&'static str>> {
-        rewrap_tree(&MemDir(entries(root)), &kek(1), &kek(2), &mut || {
+        sweep_in(root, Mode::Xts)
+    }
+
+    fn sweep_in(root: &Node, mode: Mode) -> Result<Sweep, SweepError<&'static str>> {
+        rewrap_tree(&MemDir(entries(root)), mode, &kek(1), &kek(2), &mut || {
             [9; NONCE_LEN]
         })
+    }
+
+    #[test]
+    fn integrity_directories_rotate_without_touching_the_watermark_pages() {
+        // A codec-4 file: header page, two record pages, one pair. Rotation
+        // rewrites the header's used bytes only (#200 section 10).
+        let header = Header::seal(&kek(1), Codec::TwoSlotAead, &[4; 16], &[4; 64], &[7; 24]);
+        let mut bytes: Vec<u8> = (0..12288 + 200).map(|i| (i % 251) as u8).collect();
+        bytes[..HEADER_USED].copy_from_slice(header.as_bytes());
+        bytes[HEADER_USED..HEADER_LEN as usize].fill(0);
+        let tree = dir([
+            ("PG_VERSION", file(&bytes)),
+            // A crash during a birth in an integrity directory: zero header,
+            // no room for a pair yet (C8a). XTS would refuse it as plaintext.
+            ("fresh", file(&[0u8; 12288])),
+        ]);
+        let swept = sweep_in(&tree, Mode::Integrity).unwrap();
+        assert_eq!(swept.rewrapped, 1);
+        let Node::File(after) = at(&tree, "PG_VERSION") else {
+            panic!("not a file")
+        };
+        let after = after.borrow();
+        assert_eq!(&after[32..48], kek(2).kcv());
+        assert_eq!(after[HEADER_USED..], bytes[HEADER_USED..]);
+        let rotated = Header::parse(&after[..HEADER_USED]).unwrap();
+        assert_eq!(rotated.codec(), Codec::TwoSlotAead);
+        assert_eq!(rotated.open(&kek(2)).unwrap().as_slice(), &[4; 64]);
+        // The same zero file is refused in an XTS directory.
+        let tree = dir([("fresh", file(&[0u8; 12288]))]);
+        assert_eq!(
+            sweep_in(&tree, Mode::Xts).unwrap_err(),
+            SweepError::Header {
+                path: "fresh".into(),
+                error: HeaderError::NotEncrypted
+            }
+        );
     }
 
     fn data_tree(lost_and_found: Node) -> Node {
