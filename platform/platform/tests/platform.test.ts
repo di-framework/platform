@@ -920,6 +920,11 @@ test('install routes tenant-auth hosts derived from routeUrlPattern through the 
   });
   // The controller is told which Tenants to GET when a stale LIST misses them (#544).
   expect(derived.platformConfig?.tenants).toEqual(['identity', 'identity-pg']);
+  const reordered = gatewayInstall(
+    { tenantAuth, tenants: [{ name: 'identity-pg' }, { name: 'identity' }] },
+    pattern,
+  );
+  expect(reordered.platformConfig?.tenants).toEqual(['identity', 'identity-pg']);
   // Not a listed tenant-auth build, so API keys stay where they are (#379).
   expect(derived.platformConfig?.tenantAuthReadsApiKeyNamespace).toBe(false);
   // The platform controller renders the console and controller from the same derived URLs.

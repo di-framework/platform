@@ -344,6 +344,29 @@ describe('tenant and user resource reconciliation', () => {
         const { controller, reconcile, warn } = firstInstall(async (path) => {
           throw new ApiError(404, `GET ${path} returned 404`);
         });
+        const error = spyOn(console, 'error').mockImplementation(() => {});
+        try {
+          await controller.tick();
+          expect(reconcile).not.toHaveBeenCalled();
+          expect(warn).not.toHaveBeenCalled();
+          expect(error).not.toHaveBeenCalled();
+        } finally {
+          reconcile.mockRestore();
+          warn.mockRestore();
+          error.mockRestore();
+        }
+      });
+
+      it("skips a declared name that matches another installation's Tenant", async () => {
+        let tenantOf: Tenant | undefined;
+        const { t, controller, reconcile, warn } = firstInstall(async () => ({
+          ...tenantOf,
+          metadata: {
+            ...tenantOf?.metadata,
+            labels: { ...tenantOf?.metadata.labels, [INSTALLATION]: 'other' },
+          },
+        }));
+        tenantOf = t;
         try {
           await controller.tick();
           expect(reconcile).not.toHaveBeenCalled();
