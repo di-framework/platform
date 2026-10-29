@@ -53,6 +53,8 @@ class MemoryApi implements Api {
   operations: { method: string; path: string; body?: unknown }[] = [];
   logs = new Map<string, string>();
   failConfigMap = false;
+  failStatus = false;
+  failLog = false;
   seed(value: Resource | Tenant): void {
     this.objects.set(key(value), structuredClone(value) as Resource);
   }
@@ -60,6 +62,7 @@ class MemoryApi implements Api {
     this.operations.push({ method, path, body });
     const url = new URL(path, 'https://kubernetes');
     if (method === 'GET' && url.pathname.endsWith('/log')) {
+      if (this.failLog) throw new ApiError(502, 'kubelet unreachable');
       return (this.logs.get(url.pathname) ?? '') as T;
     }
     if (method === 'GET' && url.searchParams.has('labelSelector')) {
@@ -78,6 +81,11 @@ class MemoryApi implements Api {
       } as T;
     }
     const status = url.pathname.endsWith('/status');
+    // The records patch alone: the condition write that follows carries no storage keys.
+    const recordsOnly = !(body as { status?: { conditions?: unknown } } | undefined)?.status
+      ?.conditions;
+    if (status && this.failStatus && recordsOnly)
+      throw new ApiError(422, 'ValidatingAdmissionPolicy denied');
     const target = url.pathname.replace(/\/status$/, '');
     const existing = this.objects.get(target);
     if (method === 'GET') {
@@ -398,6 +406,65 @@ describe('storage records in the tenant reconcile (#200)', () => {
     expect(t.status?.conditions?.find((c) => c.type === 'Ready')?.reason).not.toBe(
       'ReconcileError',
     );
+  });
+
+  it('reports refused records on StorageIntegrity and still reconciles the tenant (W1)', async () => {
+    const { api, controller, t } = prepare(tenant('AEAD'));
+    api.seed(workload('db', { pglite: true }));
+    await controller.reconcileTenant(t, []);
+    api.seed(workload('act', { mount: '/data/actors' }));
+    api.failStatus = true;
+    await controller.reconcileTenant(t, []);
+    expect(records(api)).toEqual({ db: { kind: 'PgliteEncfs', requested: 'AEAD' } });
+    expect(condition(t)).toMatchObject({
+      status: 'False',
+      reason: 'RecordsNotWritten',
+      message: expect.stringContaining('storage records could not be written'),
+    });
+    expect(t.status?.conditions?.find((c) => c.type === 'Ready')?.reason).not.toBe(
+      'ReconcileError',
+    );
+    // Only the key whose old record agrees is mounted; the unrecorded one waits.
+    const mode = hostSpec(api).initContainers.find((c) => c.name === 'storage-mode');
+    expect(mode?.args).toContain('--keys=db');
+    expect(mode?.args).toContain('--reserve=db');
+  });
+
+  it('reports a failed log read as ObservationFailed and reads it again next tick', async () => {
+    const { api, controller, t } = prepare();
+    api.seed(workload('db', { pglite: true }));
+    api.seed(hostPod('p1', { state: { terminated: { exitCode: 0 } } }));
+    api.logs.set(logPath('p1'), 'db empty\ndone count=1');
+    api.failLog = true;
+    await controller.reconcileTenant(t, []);
+    expect(condition(t)).toMatchObject({
+      status: 'False',
+      reason: 'ObservationFailed',
+      message: expect.stringContaining('storage-mode listing of host-p1 could not be read'),
+    });
+    expect(t.status?.conditions?.find((c) => c.type === 'Ready')?.reason).not.toBe(
+      'ReconcileError',
+    );
+    api.failLog = false;
+    await controller.reconcileTenant(t, []);
+    expect(records(api)?.db?.observed).toBe('empty');
+  });
+
+  it('forgets the cached listing of a tenant that is gone', async () => {
+    const { api, controller, t } = prepare();
+    api.seed(workload('db', { pglite: true }));
+    api.seed(hostPod('p1', { state: { terminated: { exitCode: 0 } } }));
+    api.logs.set(logPath('p1'), 'db empty\ndone count=1');
+    await controller.reconcileTenant(t, []);
+    const internals = controller as unknown as {
+      storageListings: Map<string, unknown>;
+      forgetTenants(tenants: Tenant[]): void;
+    };
+    expect([...internals.storageListings.keys()]).toEqual(['alpha-uid']);
+    internals.forgetTenants([t]);
+    expect(internals.storageListings.size).toBe(1);
+    internals.forgetTenants([]);
+    expect(internals.storageListings.size).toBe(0);
   });
 
   it('reports any other failure to write the copy as a reconcile error', async () => {

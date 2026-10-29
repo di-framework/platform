@@ -170,7 +170,10 @@ export function storageMode(args: string[], sys: StorageModeSystem): number {
   return 1;
 }
 
-/** The init container's command: {@link storageMode}'s own source, run by Node. */
+/**
+ * The init container's command: {@link storageMode}'s own source, run by Node. It ends in `--`, so
+ * the container's `args` reach the program and not Node's option parser.
+ */
 export function storageModeCommand(): string[] {
   return [
     'node',
@@ -181,5 +184,7 @@ export function storageModeCommand(): string[] {
   at: (fd) => '/proc/self/fd/' + fd,
   terminationLog: '/dev/termination-log',
 });`,
+    // Without it Node parses the step's `--root=…` arguments as its own options and exits 9.
+    '--',
   ];
 }

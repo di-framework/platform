@@ -1320,7 +1320,7 @@ It carries no `volumes`, `volumeMounts`, or host paths.
   integrity reservation marker into each empty directory of a key requested as `AEAD`, without
   following links, and lists every directory under the Tenant's workloads root. The controller
   reads that listing from the pod log and reports the `StorageIntegrity` condition
-  (`AsRecorded`, `AwaitingObservation`, `ObservationFailed`, `StorageKindConflict`,
+  (`AsRecorded`, `AwaitingObservation`, `ObservationFailed`, `RecordsNotWritten`, `StorageKindConflict`,
   `RecordLimitReached`, `IntegrityMismatch`, `IntegrityNotApplied`, `StorageRecordsForeign`).
 - The controller copies the records into the `di-storage-records` ConfigMap (`data.keys`) in
   `di-runtime-<name>` for the backup operator. It never overwrites one it did not create.

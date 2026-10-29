@@ -3,11 +3,17 @@ import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { classifyDirectory } from '../../backup-agent/src/volume';
+import type { ControllerConfig, Tenant } from '../src/tenancy/resources';
 import {
   type StorageModeSystem,
   storageMode,
   storageModeCommand,
 } from '../src/tenancy/storage-mode';
+import {
+  HOST_MOUNT_ROOT,
+  hostStorage,
+  WORKLOADS_ROOT_MOUNT,
+} from '../src/tenancy/workload-storage';
 
 const KCV = '0123456789abcdef0123456789abcdef';
 const xts = () => Buffer.concat([Buffer.from('DIPGKEY1'), Buffer.from(KCV, 'hex')]);
@@ -267,4 +273,56 @@ describe('storage-mode command', () => {
     // It parses as a script on its own: nothing outside the function is referenced.
     expect(() => new Function('require', 'process', source as string)).not.toThrow();
   });
+
+  // The init container's exact command and args, run by a real Node. It reaches entries through
+  // `/proc/self/fd`, so it runs where that exists (Linux, as in CI and in the pod).
+  it.skipIf(process.platform !== 'linux')(
+    'runs as the rendered init container with Node (C1)',
+    () => {
+      const node = Bun.which('node');
+      expect(node).toBeTruthy();
+      const work = fs.mkdtempSync(path.join(tmpdir(), 'pr563-storage-mode-'));
+      try {
+        const root = path.join(work, 'root');
+        fs.mkdirSync(root);
+        fs.mkdirSync(path.join(root, 'db'));
+        fs.mkdirSync(path.join(root, 'act'));
+        fs.writeFileSync(path.join(root, 'act', 'data'), 'x');
+        fs.mkdirSync(path.join(root, 'old'));
+        fs.writeFileSync(path.join(root, 'old', '.di-encfs'), xts());
+        const tenant = { metadata: { name: 'alpha', uid: 'alpha-uid' }, spec: {} } as Tenant;
+        const cfg = { installation: 'test', namespace: 'wasmcloud' } as ControllerConfig;
+        const run = (keys: string[], reserve: string[]) => {
+          const step = hostStorage(tenant, cfg, keys, reserve).initContainers.find(
+            (c) => c.name === 'storage-mode',
+          ) as { command: string[]; args: string[] };
+          // Only the mount points move into the temporary workspace; the argv stays as rendered.
+          const args = step.args.map((arg) =>
+            arg.replace(WORKLOADS_ROOT_MOUNT, root).replace(HOST_MOUNT_ROOT, root),
+          );
+          const [, ...rest] = step.command;
+          const out = Bun.spawnSync([node as string, ...rest, ...args], { cwd: work });
+          return {
+            code: out.exitCode,
+            stdout: out.stdout.toString(),
+            stderr: out.stderr.toString(),
+          };
+        };
+        const ok = run(['act', 'db'], ['db']);
+        expect(ok.stderr).toBe('');
+        expect(ok.stdout).toBe('act unencrypted\ndb reserved\nold xts\ndone count=3\n');
+        expect(ok.code).toBe(0);
+        expect(fs.readFileSync(path.join(root, 'db', '.di-encfs'))).toEqual(RESERVATION);
+        expect(fs.statSync(path.join(root, 'db', '.di-encfs')).mode & 0o777).toBe(0o600);
+        // A refusal: a directory at the marker name of a key to reserve.
+        fs.mkdirSync(path.join(root, 'pg'));
+        fs.mkdirSync(path.join(root, 'pg', '.di-encfs'));
+        const refused = run(['pg'], ['pg']);
+        expect(refused.stdout).toContain('pg other non-regular entry at a marker name\n');
+        expect(refused.code).not.toBe(0);
+      } finally {
+        fs.rmSync(work, { recursive: true, force: true });
+      }
+    },
+  );
 });

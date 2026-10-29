@@ -1,3 +1,4 @@
+import { NODE_IMAGE } from '../node-image';
 import type { ControllerConfig, Resource, Tenant } from './resources';
 import { storageModeCommand } from './storage-mode';
 
@@ -32,8 +33,7 @@ export const STORAGE_INIT_IMAGE = 'busybox:1.37.0';
  * Fixed image for the `storage-mode` init step (#200), pinned by digest — never tenant-supplied.
  * It runs {@link storageModeCommand}, the program's own source, with Node.
  */
-export const STORAGE_MODE_IMAGE =
-  'node:22.18.0-alpine3.22@sha256:1b2479dd35a99687d6638f5976fd235e26c5b37e8122f786fcd5fe231d63de5b';
+export const STORAGE_MODE_IMAGE = NODE_IMAGE;
 /** Where `storage-mode` sees the Tenant's whole workloads root, read-only. */
 export const WORKLOADS_ROOT_MOUNT = '/var/lib/di-framework/tenant-workloads';
 const WORKLOADS_ROOT_VOLUME = 'ws-root';

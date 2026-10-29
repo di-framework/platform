@@ -1174,10 +1174,20 @@ export class Controller {
       };
     }
     if (!step?.state?.terminated) return { state: 'pending' };
-    const text = await this.api.call<string>(
-      'GET',
-      `${collection('v1', 'Pod', n.runtimeNamespace)}/${encodeURIComponent(pod.metadata.name)}/log?container=storage-mode`,
-    );
+    let text: string | undefined;
+    try {
+      text = await this.api.call<string>(
+        'GET',
+        `${collection('v1', 'Pod', n.runtimeNamespace)}/${encodeURIComponent(pod.metadata.name)}/log?container=storage-mode`,
+      );
+    } catch (error) {
+      // Not cached: the next tick reads the log again. The plan is safe without a listing.
+      const cause = error instanceof Error ? error.message : String(error);
+      return {
+        state: 'failed',
+        message: `storage-mode listing of ${pod.metadata.name} could not be read: ${cause}`,
+      };
+    }
     const listing = parseListing(String(text ?? ''));
     const observation: Observation = listing
       ? { state: 'read', listing }
@@ -1208,15 +1218,29 @@ export class Controller {
     });
     const patch = recordsPatch(old, plan.records);
     if (!patch) return plan;
-    const updated = await this.api.call<Tenant | undefined>(
-      'PATCH',
-      `${location(tenant)}/status`,
-      {
-        metadata: { resourceVersion: tenant.metadata.resourceVersion },
-        status: { storage: { keys: patch } },
-      },
-      'application/merge-patch+json',
-    );
+    let updated: Tenant | undefined;
+    try {
+      updated = await this.api.call<Tenant | undefined>(
+        'PATCH',
+        `${location(tenant)}/status`,
+        {
+          metadata: { resourceVersion: tenant.metadata.resourceVersion },
+          status: { storage: { keys: patch } },
+        },
+        'application/merge-patch+json',
+      );
+    } catch (error) {
+      // A refused or failed patch is reported on StorageIntegrity and the rest of the tenant
+      // still reconciles; only keys whose old record agrees with the plan are mounted.
+      const agrees = (key: string) => old[key]?.kind === plan.records[key]?.kind;
+      return {
+        ...plan,
+        records: old,
+        mounted: plan.mounted.filter(agrees),
+        reserve: plan.reserve.filter(agrees),
+        unwritten: `storage records could not be written: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
     if (updated?.metadata) tenant.metadata = updated.metadata;
     tenant.status = { ...tenant.status, storage: { keys: plan.records } };
     return plan;
@@ -2660,6 +2684,9 @@ export class Controller {
         .map((tenant) => tenant.metadata.name),
     );
     for (const name of this.hostPulls.keys()) if (!listed.has(name)) this.hostPulls.delete(name);
+    const uids = new Set(tenants.map((tenant) => tenant.metadata.uid ?? ''));
+    for (const uid of this.storageListings.keys())
+      if (!uids.has(uid)) this.storageListings.delete(uid);
     for (const name of this.caRefusals.keys()) if (!listed.has(name)) this.caRefusals.delete(name);
     for (const name of this.logCursors.keys())
       if (!projected.has(name)) this.logCursors.delete(name);

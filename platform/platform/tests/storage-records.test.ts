@@ -265,7 +265,7 @@ describe('storage records (#200)', () => {
       status: 'False',
       reason: 'ObservationFailed',
       message:
-        'pg: no room (also StorageKindConflict: 1, IntegrityMismatch: 1, StorageRecordsForeign: 1)',
+        'pg: no room (also StorageKindConflict: 1, IntegrityMismatch: 1, StorageRecordsForeign: foreign)',
     });
     expect(integrityCondition(plan, { state: 'read', listing: new Map() }, 'foreign').reason).toBe(
       'StorageKindConflict',
@@ -568,6 +568,16 @@ describe('tenants/status storage records policy (#200)', () => {
         { db: 'reserved', act: 'empty', old: 'xts' },
       ],
       [[workload('db', { pglite: true })], { db: 'aead', old: 'xts' }],
+      [[workload('db', { pglite: true })], { db: 'aead' }],
+      [[workload('db', { pglite: true })], { db: 'aead' }],
+      // W1: a directory reported gone and then found again, with a different class, keeps its
+      // record and is never pruned and backfilled in one pass.
+      [
+        [workload('db', { pglite: true }), workload('pg', { pglite: true })],
+        { db: 'aead', pg: 'reserved' },
+      ],
+      [[workload('db', { pglite: true })], { db: 'aead' }],
+      [[workload('db', { pglite: true })], { db: 'aead', pg: 'unencrypted' }],
       [[workload('db', { pglite: true })], { db: 'aead' }],
       [[workload('db', { pglite: true })], { db: 'aead' }],
     ];

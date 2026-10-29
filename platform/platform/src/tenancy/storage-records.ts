@@ -100,6 +100,8 @@ export interface StoragePlan {
   conflicts: string[];
   /** `RecordLimitReached` messages. */
   limited: string[];
+  /** Why the records could not be written (`RecordsNotWritten`); the plan then keeps the old ones. */
+  unwritten?: string;
 }
 
 /** Whether `workload` may get the storage patch for its key under `records`. */
@@ -126,8 +128,10 @@ export function planStorage({
   }
   const records: StorageRecords = {};
   // An entry is removed only once a listing reported its directory gone and no workload uses it.
+  // One the current listing reports again is kept, so it is never pruned and backfilled in the
+  // same pass: the records policy would refuse that patch as a changed kind.
   for (const [key, record] of Object.entries(old)) {
-    if (record.observed === 'absent' && !byKey.has(key)) continue;
+    if (record.observed === 'absent' && !byKey.has(key) && !listing?.has(key)) continue;
     records[key] = { ...record };
   }
   const conflicts: string[] = [];
@@ -238,6 +242,7 @@ export function integrityCondition(
       : plan.mounted;
   const reasons: [string, 'False' | 'Unknown', string[]][] = [
     ['ObservationFailed', 'False', observation.state === 'failed' ? [observation.message] : []],
+    ['RecordsNotWritten', 'False', plan.unwritten ? [plan.unwritten] : []],
     ['StorageKindConflict', 'False', plan.conflicts],
     ['RecordLimitReached', 'False', plan.limited],
     ['IntegrityMismatch', 'False', mismatch],
@@ -264,7 +269,12 @@ export function integrityCondition(
   }
   const others = applying
     .slice(1)
-    .map(([reason, , items]) => `${reason}: ${items.length}`)
+    // A foreign copy is named wherever it ranks: nothing else in the status says which object.
+    .map(([reason, , items]) =>
+      reason === 'StorageRecordsForeign'
+        ? `${reason}: ${items.join('; ')}`
+        : `${reason}: ${items.length}`,
+    )
     .join(', ');
   return {
     status: first[1],
