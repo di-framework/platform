@@ -1095,19 +1095,33 @@ export function managedConfigKeysAllowed(input: {
   return !keys.some((key) => (NATS_CREDENTIAL_KEYS as readonly string[]).includes(key));
 }
 
-function managedConfigKeysPolicy(): AdmissionPolicy {
+/**
+ * The `managed-config-keys` rule for ConfigMaps and its `managed-secret-keys` twin for Secrets.
+ * One policy per kind, because the API server type-checks a rule against every kind its policy
+ * matches and a Secret has no `binaryData`.
+ */
+function managedConfigKeysPolicies(): AdmissionPolicy[] {
+  return [
+    managedKeysPolicy('managed-config-keys', 'configmaps', ['data', 'binaryData']),
+    managedKeysPolicy('managed-secret-keys', 'secrets', ['data']),
+  ];
+}
+
+function managedKeysPolicy(name: string, resource: string, fields: string[]): AdmissionPolicy {
   const keys = JSON.stringify(NATS_CREDENTIAL_KEYS).replaceAll('"', "'");
+  const clean = fields
+    .map((f) => `(!has(object.${f}) || !object.${f}.exists(k, k in ${keys}))`)
+    .join(' &&\n          ');
   return {
-    name: 'managed-config-keys',
+    name,
     apiGroups: [''],
     apiVersions: ['v1'],
-    resources: ['configmaps', 'secrets'],
+    resources: [resource],
     validations: [
       {
         expression: `!(object.metadata.name.startsWith('${BS_CONFIG_PREFIX}') ||
             object.metadata.name.startsWith('${BINDING_CONFIG_PREFIX}')) || (
-          (!has(object.data) || !object.data.exists(k, k in ${keys})) &&
-          (!has(object.binaryData) || !object.binaryData.exists(k, k in ${keys})))`,
+          ${clean})`,
         message: MANAGED_CONFIG_KEYS_MESSAGE,
       },
     ],
@@ -1315,7 +1329,7 @@ export function admissionResources(
     workloadPolicy(namespace),
     reservedWorkloadPolicy(namespace, registryHost),
     backendConfigPolicy(namespace),
-    managedConfigKeysPolicy(),
+    ...managedConfigKeysPolicies(),
     tenantSecretDeletePolicy(namespace),
     tenantSecretUpdatePolicy(namespace),
     tenantControllerSecretsPolicy(),

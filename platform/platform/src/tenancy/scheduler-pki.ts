@@ -272,10 +272,10 @@ export function parseIdentityRecord(text: string): IdentityRecord {
       Object.keys(e).every((field) => ['current', 'previous', 'previousUntil'].includes(field)) &&
       typeof e.current === 'string' &&
       ISSUANCE_ID.test(e.current) &&
+      (e.previous === undefined) === (e.previousUntil === undefined) &&
       (e.previous === undefined ||
-        (typeof e.previous === 'string' && ISSUANCE_ID.test(e.previous))) &&
-      (e.previousUntil === undefined ||
-        (e.previous !== undefined &&
+        (typeof e.previous === 'string' &&
+          ISSUANCE_ID.test(e.previous) &&
           typeof e.previousUntil === 'string' &&
           !Number.isNaN(Date.parse(e.previousUntil))));
     if (!valid) throw new Error(`${SCHEDULER_IDENTITIES} has an invalid entry '${key}'`);

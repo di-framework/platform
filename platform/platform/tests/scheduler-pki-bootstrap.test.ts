@@ -66,6 +66,8 @@ describe('scheduler PKI bootstrap objects (#541, O4)', () => {
       `Namespace /${PKI}`,
       'ValidatingAdmissionPolicy /di-test-scheduler-pki-writes',
       'ValidatingAdmissionPolicyBinding /di-test-scheduler-pki-writes',
+      'ValidatingAdmissionPolicy /di-test-scheduler-pki-configmap-writes',
+      'ValidatingAdmissionPolicyBinding /di-test-scheduler-pki-configmap-writes',
       `NetworkPolicy ${PKI}/di-scheduler-pki-deny-ingress`,
       `ServiceAccount ${PKI}/di-scheduler-pki`,
       `Role ${PKI}/di-scheduler-pki`,
@@ -202,48 +204,76 @@ interface Policy {
 }
 
 describe('scheduler PKI writes policy (#541, W4)', () => {
-  const policy = one('ValidatingAdmissionPolicy') as unknown as Policy;
-  const [condition] = policy.spec.matchConditions as [{ expression: string }];
-  const [rule] = policy.spec.validations as [{ expression: string; message: string }];
+  const policies = find('ValidatingAdmissionPolicy') as unknown as (Policy & Resource)[];
+  const bindings = find('ValidatingAdmissionPolicyBinding');
   const JOB_USER = `system:serviceaccount:${PKI}:${SCHEDULER_PKI_NAME}`;
+  /** The one policy whose resourceRules match `resource`; a write is admitted by its rule. */
+  const policyFor = (resource: 'secrets' | 'configmaps') => {
+    const [found, ...more] = policies.filter((p) =>
+      p.spec.matchConstraints.resourceRules.some((r) => r.resources.includes(resource)),
+    );
+    if (!found || more.length) throw new Error(`expected one policy for ${resource}`);
+    return found;
+  };
   const admit = (
     namespace: string,
     resource: 'secrets' | 'configmaps',
     object: Record<string, unknown>,
   ) =>
-    evaluate(rule.expression, {
-      request: { namespace, resource: { resource }, userInfo: { username: JOB_USER } },
-      object: { metadata: {}, ...object },
-    });
+    policyFor(resource).spec.validations.every(
+      (rule) =>
+        evaluate(rule.expression, {
+          request: { namespace, resource: { resource }, userInfo: { username: JOB_USER } },
+          object: { metadata: {}, ...object },
+        }) === true,
+    );
   const named = (name: string, type?: string) => ({
     metadata: { name },
     ...(type === undefined ? {} : { type }),
   });
 
-  it('matches only the Job ServiceAccount, in the two namespaces, and fails closed', () => {
+  it('has one policy per kind, each binding the Job ServiceAccount in two namespaces', () => {
     expect(schedulerPkiUser('wasmcloud')).toBe(JOB_USER);
-    expect(policy.spec.failurePolicy).toBe('Fail');
-    expect(policy.spec.matchConstraints.namespaceSelector.matchExpressions).toEqual([
-      { key: 'kubernetes.io/metadata.name', operator: 'In', values: ['wasmcloud', PKI] },
+    expect(policies.map((p) => p.metadata.name)).toEqual([
+      'di-test-scheduler-pki-writes',
+      'di-test-scheduler-pki-configmap-writes',
     ]);
-    expect(policy.spec.matchConstraints.resourceRules).toMatchObject([
-      { apiGroups: [''], operations: ['CREATE', 'UPDATE'], resources: ['secrets', 'configmaps'] },
-    ]);
-    expect(evaluate(condition.expression, { request: { userInfo: { username: JOB_USER } } })).toBe(
-      true,
+    expect(policyFor('secrets').metadata.name).toBe('di-test-scheduler-pki-writes');
+    expect(policyFor('configmaps').metadata.name).toBe('di-test-scheduler-pki-configmap-writes');
+    for (const policy of policies) {
+      expect(policy.spec.failurePolicy).toBe('Fail');
+      expect(policy.spec.matchConstraints.namespaceSelector.matchExpressions).toEqual([
+        { key: 'kubernetes.io/metadata.name', operator: 'In', values: ['wasmcloud', PKI] },
+      ]);
+      expect(policy.spec.matchConstraints.resourceRules).toHaveLength(1);
+      expect(policy.spec.matchConstraints.resourceRules[0]).toMatchObject({
+        apiGroups: [''],
+        operations: ['CREATE', 'UPDATE'],
+      });
+      expect(policy.spec.matchConstraints.resourceRules[0]?.resources).toHaveLength(1);
+      const [condition] = policy.spec.matchConditions as [{ expression: string }];
+      expect(
+        evaluate(condition.expression, { request: { userInfo: { username: JOB_USER } } }),
+      ).toBe(true);
+      expect(
+        evaluate(condition.expression, {
+          request: {
+            userInfo: { username: 'system:serviceaccount:wasmcloud:di-platform-controller' },
+          },
+        }),
+      ).toBe(false);
+      expect(policy.spec.validations.map((v) => v.message)).toEqual([SCHEDULER_PKI_WRITES_MESSAGE]);
+    }
+    expect(bindings.map((b) => b.spec as unknown)).toEqual(
+      policies.map((p) => ({ policyName: p.metadata.name, validationActions: ['Deny'] })),
     );
-    expect(
-      evaluate(condition.expression, {
-        request: {
-          userInfo: { username: 'system:serviceaccount:wasmcloud:di-platform-controller' },
-        },
-      }),
-    ).toBe(false);
-    expect(rule.message).toBe(SCHEDULER_PKI_WRITES_MESSAGE);
-    expect(one('ValidatingAdmissionPolicyBinding').spec as unknown).toEqual({
-      policyName: 'di-test-scheduler-pki-writes',
-      validationActions: ['Deny'],
-    });
+  });
+
+  it('reads object.type only in the policy that matches Secrets alone (it type-checks)', () => {
+    const configMapRule = policyFor('configmaps').spec.validations[0]?.expression ?? '';
+    expect(configMapRule).not.toContain('object.type');
+    expect(configMapRule).not.toContain('request.resource');
+    expect(policyFor('secrets').spec.validations[0]?.expression).toContain('object.type');
   });
 
   it('admits the named objects of their expected types', () => {
@@ -280,6 +310,10 @@ describe('scheduler PKI writes policy (#541, W4)', () => {
       ['wasmcloud', 'configmaps', named('other')],
       ['wasmcloud', 'secrets', named('di-scheduler-nats-accounts', 'Opaque')],
       ['wasmcloud', 'configmaps', { metadata: { generateName: 'di-scheduler-nats-accounts' } }],
+      [PKI, 'configmaps', named('di-scheduler-ca')],
+      ['wasmcloud', 'configmaps', named('di-scheduler-nats-tls')],
+      [PKI, 'secrets', named('di-scheduler-identities', 'Opaque')],
+      [PKI, 'configmaps', {}],
       [PKI, 'secrets', { metadata: { generateName: 'di-scheduler-ca' }, type: 'Opaque' }],
     ] as const)
       expect(admit(namespace, resource, object as Record<string, unknown>)).toBe(false);
@@ -347,6 +381,8 @@ describe('installSchedulerPki', () => {
     const prerequisites = [
       'scheduler-pki-validatingadmissionpolicy-cluster-di-test-scheduler-pki-writes',
       'scheduler-pki-validatingadmissionpolicybinding-cluster-di-test-scheduler-pki-writes',
+      'scheduler-pki-validatingadmissionpolicy-cluster-di-test-scheduler-pki-configmap-writes',
+      'scheduler-pki-validatingadmissionpolicybinding-cluster-di-test-scheduler-pki-configmap-writes',
       `scheduler-pki-networkpolicy-${PKI}-di-scheduler-pki-deny-ingress`,
       `scheduler-pki-serviceaccount-${PKI}-di-scheduler-pki`,
       `scheduler-pki-role-${PKI}-di-scheduler-pki`,

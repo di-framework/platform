@@ -332,7 +332,11 @@ describe('identity record', () => {
       previousUntil: '2026-10-29T00:10:00.000Z',
     },
     'platform/data': { current: '4444444444444444' },
-    'tenant/alpha/hosts': { current: '5555555555555555', previous: '6666666666666666' },
+    'tenant/alpha/hosts': {
+      current: '5555555555555555',
+      previous: '6666666666666666',
+      previousUntil: '2026-10-29T00:10:00Z',
+    },
   };
 
   it('serializes sorted and byte-stable, and parses back what it wrote', () => {
@@ -391,6 +395,7 @@ describe('identity record', () => {
       'tenant/delta/hosts': { current: '1111111111111111', extra: 'x' },
       'tenant/eps/hosts': { current: '1111111111111111', previous: 'zz' },
       'tenant/zeta/hosts': { current: '1111111111111111', previousUntil: '2026-10-29T00:00:00Z' },
+      'tenant/iota/hosts': { current: '1111111111111111', previous: '2222222222222222' },
       'tenant/eta/hosts': {
         current: '1111111111111111',
         previous: '2222222222222222',

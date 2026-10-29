@@ -47,11 +47,11 @@ export const SCHEDULER_PKI_WRITES_MESSAGE =
   'the scheduler PKI Job may write only its named Secrets and ConfigMaps, of their expected types';
 
 /**
- * The CEL rule of {@link schedulerPkiWritesPolicy}: which objects the Job's ServiceAccount may
- * create or update. In the PKI namespace, the `Opaque` Secret `di-scheduler-ca` and the ConfigMap
- * `di-scheduler-identities`; in the platform namespace, the `kubernetes.io/tls` scheduler Secrets
- * and the ConfigMap `di-scheduler-nats-accounts` (#541 m2).
- * Nothing else, and never a `kubernetes.io/service-account-token` Secret (W4, design-541 §4.5).
+ * The Secret rule of {@link schedulerPkiWritesPolicy}: which Secrets the Job's ServiceAccount may
+ * create or update. In the PKI namespace, the `Opaque` Secret `di-scheduler-ca`; in the platform
+ * namespace, the `kubernetes.io/tls` scheduler Secrets. Nothing else, and never a
+ * `kubernetes.io/service-account-token` Secret (W4, design-541 §4.5). Its policy matches only
+ * Secrets, so `object.type` type-checks.
  */
 export function schedulerPkiWritesRule(namespace: string): string {
   const pki = schedulerPkiNamespace(namespace);
@@ -62,25 +62,57 @@ export function schedulerPkiWritesRule(namespace: string): string {
   const named = 'has(object.metadata.name)';
   const typed = (type: string) => `has(object.type) && object.type == '${type}'`;
   return [
-    `(request.namespace == '${pki}' && request.resource.resource == 'secrets' && ${named} &&`,
+    `(request.namespace == '${pki}' && ${named} &&`,
     `  object.metadata.name == '${SCHEDULER_CA_SECRET}' && ${typed('Opaque')}) ||`,
-    `(request.namespace == '${pki}' && request.resource.resource == 'configmaps' && ${named} &&`,
+    `(request.namespace == '${namespace}' && ${named} &&`,
+    `  object.metadata.name in [${names}] && ${typed('kubernetes.io/tls')})`,
+  ].join('\n');
+}
+
+/**
+ * The ConfigMap rule of {@link schedulerPkiWritesPolicy}: in the PKI namespace, only the
+ * ConfigMap `di-scheduler-identities`; in the platform namespace, only the ConfigMap
+ * `di-scheduler-nats-accounts` (#541 m2). A ConfigMap has no `type`, so this rule has a policy of
+ * its own that matches only ConfigMaps.
+ */
+export function schedulerPkiConfigMapWritesRule(namespace: string): string {
+  const pki = schedulerPkiNamespace(namespace);
+  const named = 'has(object.metadata.name)';
+  return [
+    `(request.namespace == '${pki}' && ${named} &&`,
     `  object.metadata.name == '${SCHEDULER_IDENTITIES}') ||`,
-    `(request.namespace == '${namespace}' && request.resource.resource == 'secrets' && ${named} &&`,
-    `  object.metadata.name in [${names}] && ${typed('kubernetes.io/tls')}) ||`,
-    `(request.namespace == '${namespace}' && request.resource.resource == 'configmaps' && ${named} &&`,
+    `(request.namespace == '${namespace}' && ${named} &&`,
     `  object.metadata.name == '${SCHEDULER_NATS_ACCOUNTS}')`,
   ].join('\n');
 }
 
 /**
- * The admission policy and binding that confine the Job's writes (W4). RBAC cannot scope
+ * The admission policies and bindings that confine the Job's writes (W4). RBAC cannot scope
  * `create` by name, so the Job's ServiceAccount could otherwise create any Secret in both
- * namespaces, including a token Secret for another ServiceAccount. The policy matches only that
- * ServiceAccount, in only those two namespaces, and fails closed.
+ * namespaces, including a token Secret for another ServiceAccount. Each policy matches only that
+ * ServiceAccount, in only those two namespaces, and fails closed. There is one policy per
+ * resource kind, because the API server type-checks a rule against every kind its policy
+ * matches: `object.type` exists on a Secret, not on a ConfigMap.
  */
 export function schedulerPkiWritesPolicy(namespace: string, installation: string): Resource[] {
-  const name = `${installation}-scheduler-pki-writes`;
+  return [
+    ...pkiWritesPolicy(namespace, installation, `${installation}-scheduler-pki-writes`, {
+      resource: 'secrets',
+      expression: schedulerPkiWritesRule(namespace),
+    }),
+    ...pkiWritesPolicy(namespace, installation, `${installation}-scheduler-pki-configmap-writes`, {
+      resource: 'configmaps',
+      expression: schedulerPkiConfigMapWritesRule(namespace),
+    }),
+  ];
+}
+
+function pkiWritesPolicy(
+  namespace: string,
+  installation: string,
+  name: string,
+  rule: { resource: 'secrets' | 'configmaps'; expression: string },
+): Resource[] {
   const labels = { [INSTALLATION]: installation, [COMPONENT]: SCHEDULER_PKI_COMPONENT };
   return [
     {
@@ -104,7 +136,7 @@ export function schedulerPkiWritesPolicy(namespace: string, installation: string
               apiGroups: [''],
               apiVersions: ['v1'],
               operations: ['CREATE', 'UPDATE'],
-              resources: ['secrets', 'configmaps'],
+              resources: [rule.resource],
             },
           ],
         },
@@ -114,9 +146,7 @@ export function schedulerPkiWritesPolicy(namespace: string, installation: string
             expression: `request.userInfo.username == '${schedulerPkiUser(namespace)}'`,
           },
         ],
-        validations: [
-          { expression: schedulerPkiWritesRule(namespace), message: SCHEDULER_PKI_WRITES_MESSAGE },
-        ],
+        validations: [{ expression: rule.expression, message: SCHEDULER_PKI_WRITES_MESSAGE }],
       },
     },
     {
