@@ -324,20 +324,21 @@ Removal therefore runs in the fixed order below. The controller never skips a st
 | Step | `Delete` policy | `Retain` policy | Done when | Layer 4 |
 |---|---|---|---|---|
 | R1 | Drop the `<t>/hosts` entry and the host user from the next render | same | the reload is applied | 7a |
-| R2 | Scale the tenant host Deployment to zero, and wait for the host pods to be gone | same (today's Retain wait, `controller.ts:931-976`) | no host pod in `di-runtime-<t>`, terminating pods included (#245), and no Host in `di-operator-<t>` (the operator's pod-host and Host finalizers have run) | 7b |
-| R3 | Delete the tenant's WorkloadDeployments, and wait for the operator to remove its finalizers | Scale the tenant operator to zero and wait for its pod to be gone. Then the controller removes the operator's finalizers from every remaining `runtime.wasmcloud.dev` object in `di-tenant-<t>` | `Delete`: no `runtime.wasmcloud.dev` object in `di-tenant-<t>`. `Retain`: no such object carries an operator finalizer | 7c |
+| R2 | Scale the tenant host Deployment (and the other tenant workloads today's sweep stops) to zero, and wait for the host pods to be gone. The tenant operator Deployment in `di-operator-<t>` is excluded and stays at one ready replica | same (today's Retain wait, `controller.ts:931-976`, with the exclusion below) | no host pod in `di-runtime-<t>`, terminating pods included (#245), and no Host in `di-operator-<t>` (the operator's pod-host and Host finalizers have run) | 7b |
+| R3 | Delete the tenant's WorkloadDeployments, and wait for the operator to remove its finalizers | Scale the tenant operator to zero and wait for its pod to be gone. Then the controller removes the operator's finalizers from every remaining `runtime.wasmcloud.dev` object in `di-tenant-<t>` | `Delete`: no `runtime.wasmcloud.dev` object that carries an operator finalizer remains in `di-tenant-<t>` (Artifacts without one are not waited for). `Retain`: no such object carries an operator finalizer | 7c |
 | R4 | Drop the `<t>/operator` entry and the whole `T_di-tenant-<t>` account from the next render | same | the reload is applied, and the operator user is refused | 7d |
 | R5 | Delete the three RoleBindings to the tenant-operator ClusterRoles, then `di-operator-<t>` | same. In the retained `di-tenant-<t>` and `di-runtime-<t>` the RoleBindings are deleted too, so a re-created Tenant starts clean | no such RoleBinding remains, and `di-operator-<t>` is gone | 7e |
 | R6 | Delete the tenant's namespaces, as today (`controller.ts:915-929`) | keep them, as today | namespaces gone, or present and unchanged | 7f |
 | R7 | Remove the Tenant's finalizer | same | the Tenant is gone | 7g |
 
+- **R2 must not stop the operator.** Today's sweep lists every Deployment with the installation and owner labels, cluster-wide, and patches each to `replicas: 0` (`controller.ts:933-953`). The tenant operator Deployment carries those labels too (`resources.ts:891-897`). If R2 reused the sweep unchanged, the operator would go to zero with the hosts, the pod-host finalizers would never be released, no Host would be deleted, and R2 would end in `RemovalStuck` on every removal. The implementation therefore changes the sweep to skip Deployments in `di-operator-<t>` (by namespace, and by a dedicated component label as a second guard). Under both policies the operator stays at one ready replica until R3 (`Retain`, which scales it to zero itself) or until R4/R5 (`Delete`). A unit test covers the exclusion (8.1).
 - **Stuck steps.** Each step has a 15-minute deadline. When a deadline passes, the controller sets the Tenant condition `RemovalStuck`, with `reason` set to the step ID and a message naming the objects that remain, such as Workloads that still carry a finalizer. It keeps retrying the same step and never moves on by force. Once the cause is cleared, for example a foreign finalizer, removal continues. Layer 4 step 7h induces this case.
 - **What `Retain` leaves behind.** The retained WorkloadDeployments, WorkloadReplicaSets, Workloads and Artifacts in `di-tenant-<t>` are inert:
   - no operator watches them;
   - they carry no operator finalizer, so the namespace can still be deleted by hand.
 
-  If the Tenant is re-created, its new operator watches `di-tenant-<t>` again and reconciles them from scratch. **U**: that the 2.8.0 operator re-adds missing finalizers on reconcile, as controller-runtime's usual pattern does. Layer 4 step 7i checks this.
-- **RBAC for R3.** Under `Retain`, removing finalizers needs `patch` on `workloads`, `workloadreplicasets` and `artifacts`. Today the controller holds `patch` only on `workloaddeployments`, and read access to the other three (`platform/platform/src/tenancy/install.ts:221-231`). Its ClusterRole gains `patch` on those three.
+  If the Tenant is re-created, its new operator watches `di-tenant-<t>` again and reconciles them from scratch. The 2.8.0 operator re-adds a missing finalizer on every reconcile of an object that is not being deleted (`runtime-operator: api/condition/conditioned_reconciler.go:65-80`, `HandleFinalizer`, verified at tag `runtime-operator/v2.8.0`). Layer 4 step 7i stays as the live check.
+- **RBAC for R3.** Under `Retain`, removing finalizers needs `patch` on `workloads` and `artifacts`. In 2.8.0 only Hosts, Workloads and Artifacts carry operator finalizers (`SetFinalizer` in `host_controller.go:156`, `workload_controller.go:470`, `artifact_controller.go:103`), so `workloadreplicasets` needs no `patch`. Today the controller holds `patch` only on `workloaddeployments`, and read access to the others (`platform/platform/src/tenancy/install.ts:221-231`). Its ClusterRole gains `patch` on `workloads` and `artifacts`.
 - **The operator after R1.** Its commands to hosts time out, because no host can connect any more. Its finalizers only delete Kubernetes objects (`host_controller.go:102-124`), so they need no host.
 
 **Lifetimes** (O3):
@@ -457,7 +458,7 @@ The platform controller renders, for each Tenant, the same objects the chart ren
 - **`platform/platform/src/watched-namespaces.ts`.** `hostNamespaces` becomes the platform namespace only. The tenant list it computes no longer feeds the chart.
 - **`platform/platform/src/tenancy/install.ts`.**
   - Add `bind` on `clusterroles`, limited by `resourceNames` to the three tenant-operator ClusterRoles, with no `escalate` (4.6).
-  - Add `patch` on `workloads`, `workloadreplicasets` and `artifacts`, for removal step R3 (4.5).
+  - Add `patch` on `workloads` and `artifacts`, for removal step R3 (4.5).
 - **`platform/platform/src/tenancy/tls.ts`.** Email and URI name constraints, and a client-auth leaf.
 - **`platform/platform/src/tenancy/`.** A new `scheduler-nats.ts`, plus changes to `controller.ts` and `resources.ts`:
   - the identity record, issuance and rotation;
@@ -517,7 +518,7 @@ It meets P1-P3 only while it runs correctly. It is a new process that sees every
   - A golden file is shared with the broker test.
 - **Identity record and issuance.**
   - The record is written before issuance, and every client certificate (host, operator, platform) gets a new ID.
-  - Removal follows R1-R7 in order for both policies. Each step is a separate test: its precondition, the step's action, and the condition set at its deadline. A test with a stubbed API verifies that no namespace delete is issued before R5 has completed.
+  - Removal follows R1-R7 in order for both policies. Each step is a separate test: its precondition, the step's action, and the condition set at its deadline. A test with a stubbed API verifies that no namespace delete is issued before R5 has completed. Another verifies that the R2 sweep never patches the Deployment in `di-operator-<t>`, under both policies.
   - Leaves carry the client-auth EKU and the right SAN form.
   - Both CAs carry their name constraints: the tenant CA refuses every name under `platform.scheduler.di-framework.invalid`, and operator certificates come only from the platform CA.
   - Lifetimes are as specified.
@@ -573,9 +574,9 @@ Two tenants and the platform host group:
    - A host rollout held back on purpose raises `SchedulerIdentityRenewalStalled` and keeps both users.
 7. **Removal, both policies, step by step.** Delete tenant B with `Delete`, and tenant C with `Retain`. After each step of the 4.5 removal sequence, record:
    - **7a (R1).** The host certificate gets `Authorization Violation`. The operator stays connected.
-   - **7b (R2).** No host pod remains in `di-runtime-*`, and no Host remains in `di-operator-*`. The operator is still connected and bound.
+   - **7b (R2).** No host pod remains in `di-runtime-*`, and no Host remains in `di-operator-*`. The operator is still connected and bound, and at one ready replica.
    - **7c (R3).**
-     - B: no `runtime.wasmcloud.dev` object remains in `di-tenant-b`.
+     - B: no `runtime.wasmcloud.dev` object carrying an operator finalizer remains in `di-tenant-b`.
      - C: the operator Deployment is at zero, the WorkloadDeployments remain, and no object carries an operator finalizer.
    - **7d (R4).** The operator certificate gets `Authorization Violation`.
    - **7e (R5).** No RoleBinding to a tenant-operator ClusterRole remains in the tenant's namespaces, and `di-operator-*` is gone.
@@ -632,16 +633,26 @@ Two tenants and the platform host group:
 - a cross-account `_INBOX` publish is refused;
 - adding a tenant by reload delivers its heartbeats only to its own operator.
 
-## 10. Open questions for the owner
+## 10. Owner decisions and open questions
 
-Each question has a recommendation. Section 4 is written as if the recommendations are accepted.
+The owner approved the following on 2026-10-29. They are decided, not open:
 
-- **O1 `hostgroup-default`.** Keep it, served by the chart's operator in its own account, or remove the platform host group? *Recommendation: keep it (4.7).* The gateway's default backend and platform-namespace workloads depend on it.
-- **O2 CA layout.** One platform CA, or a platform CA plus a name-constrained tenant CA? *Recommendation: two CAs (4.5).* No tenant host issuance can then produce an operator identity.
-- **O3 Leaf lifetime.** 90 days renewed at 30 days left, or shorter? *Recommendation: 90/30.* Each host renewal rolls the tenant's hosts, which are replaced without a surge (`resources.ts:1436-1442`), and revocation never depends on lifetime.
-- **O4 Bootstrap.** A one-shot PKI Job before the Helm release, or keys generated by the Pulumi program? *Recommendation: the Job (4.5).* It keeps keys out of Pulumi state.
-- **O5 JetStream.** Keep it for `DATA` only, or turn it off? *Recommendation: `DATA` only.* No scheduler identity uses it, and whether any `hostgroup-default` workload does is unknown.
-- **O6 Where tenant operators run.** In a dedicated `di-operator-<t>` namespace, or in `di-runtime-<t>`? *Recommendation: the dedicated namespace (4.6).* No tenant role or backup Job reaches the operator's pod or ServiceAccount there, and the operator stays outside the tenant's quota. The cost is one namespace per tenant.
+- **Cost of not forking.** One runtime-operator pod plus one namespace per tenant is accepted as the cost of running the upstream operator unmodified.
+- **O6:** tenant operators run in a dedicated `di-operator-<t>` namespace.
+- **O1:** keep `hostgroup-default`.
+- **O2:** two CAs.
+- **O3:** 90-day certificates, renewed at 30 days left.
+- **O4:** a one-shot PKI bootstrap Job.
+- **O5:** JetStream only on the `DATA` account.
+
+The entries below keep the original question and reasoning for reference. O7 remains as recommended.
+
+- **O1 `hostgroup-default`.** *Decided 2026-10-29.* Keep it, served by the chart's operator in its own account, or remove the platform host group? *Recommendation: keep it (4.7).* The gateway's default backend and platform-namespace workloads depend on it.
+- **O2 CA layout.** *Decided 2026-10-29.* One platform CA, or a platform CA plus a name-constrained tenant CA? *Recommendation: two CAs (4.5).* No tenant host issuance can then produce an operator identity.
+- **O3 Leaf lifetime.** *Decided 2026-10-29.* 90 days renewed at 30 days left, or shorter? *Recommendation: 90/30.* Each host renewal rolls the tenant's hosts, which are replaced without a surge (`resources.ts:1436-1442`), and revocation never depends on lifetime.
+- **O4 Bootstrap.** *Decided 2026-10-29.* A one-shot PKI Job before the Helm release, or keys generated by the Pulumi program? *Recommendation: the Job (4.5).* It keeps keys out of Pulumi state.
+- **O5 JetStream.** *Decided 2026-10-29.* Keep it for `DATA` only, or turn it off? *Recommendation: `DATA` only.* No scheduler identity uses it, and whether any `hostgroup-default` workload does is unknown.
+- **O6 Where tenant operators run.** *Decided 2026-10-29.* In a dedicated `di-operator-<t>` namespace, or in `di-runtime-<t>`? *Recommendation: the dedicated namespace (4.6).* No tenant role or backup Job reaches the operator's pod or ServiceAccount there, and the operator stays outside the tenant's quota. The cost is one namespace per tenant.
 - **O7 vCluster exposure.** *Recommendation: close the log, operator-Secret-read and token-placement classes in this work (4.9).* Host-side `pi-*` RBAC and the platform controller's cluster-wide Secret read are parked for v0.2, as the owner directed.
 
 ## 11. Unverified items
@@ -658,7 +669,7 @@ These are marked **U** above. The implementation or Layer 4 must confirm them:
 8. The upstream documentation statements in 2.4.
 9. Whether any `hostgroup-default` workload uses JetStream (O5).
 10. The client library for the broker test (8.2).
-11. That the 2.8.0 operator re-adds missing finalizers on reconcile, which re-adding a retained tenant (4.5) relies on.
+11. Closed: the 2.8.0 operator re-adds missing finalizers on reconcile (`conditioned_reconciler.go:65-80`, verified at `runtime-operator/v2.8.0`); Layer 4 step 7i remains the live check.
 
 ## Appendix A. The probe's exact configuration (option (a))
 
