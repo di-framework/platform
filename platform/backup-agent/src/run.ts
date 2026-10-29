@@ -32,6 +32,7 @@ export interface Termination {
   /** Workload volumes (#232). */
   fileCount?: number;
   encfsKcv?: string;
+  encfsMode?: string;
   imageDigest?: string;
   replacedPath?: string;
   /** A restore that stopped part-way: the staging directory it left, relative to the root. */
@@ -103,8 +104,8 @@ export interface AgentIo {
   /** Delete one file (never a directory). A missing file is not an error. */
   unlink(path: string): Promise<void>;
   mkdir(path: string): Promise<void>;
-  /** Every entry under `root`, depth first, links not followed. */
-  scan(root: string): Promise<TreeEntry[]>;
+  /** Every entry under `root` (or only its own, with `top`), depth first, links not followed. */
+  scan(root: string, top?: boolean): Promise<TreeEntry[]>;
   /** Hex sha256 of a file, streamed. */
   hash(path: string): Promise<string>;
   /** Entry names directly in `path`. */

@@ -320,11 +320,14 @@ interface Operation {
 interface JobResult {
   ok?: boolean;
   error?: string;
+  /** The agent's explanation, e.g. both modes of a ModeMismatch. */
+  detail?: string;
   digest?: string;
   bytes?: number;
   objectKey?: string;
   fileCount?: number;
   encfsKcv?: string;
+  encfsMode?: string;
   imageDigest?: string;
   replacedPath?: string;
   restoringPath?: string;
@@ -455,6 +458,7 @@ function scaleUp(world: World, op: Operation, jobs: JobView[]): Action[] {
           : {}),
         ...(outcome.fileCount !== undefined ? { fileCount: outcome.fileCount } : {}),
         ...(outcome.encfsKcv ? { encfsKcv: outcome.encfsKcv } : {}),
+        ...(outcome.encfsMode ? { encfsMode: outcome.encfsMode } : {}),
         ...(outcome.imageDigest ? { imageDigest: outcome.imageDigest } : {}),
         ...(outcome.replacedPath ? { replacedPath: outcome.replacedPath } : {}),
         ...(outcome.restoringPath ? { restoringPath: outcome.restoringPath } : {}),
@@ -948,6 +952,7 @@ function backupOperation(world: World, backup: BackupView): Operation {
         objectKey: result.objectKey,
         fileCount: result.fileCount,
         encfsKcv: result.encfsKcv,
+        encfsMode: result.encfsMode,
         imageDigest: result.imageDigest,
       };
     },
@@ -1012,7 +1017,7 @@ function restoreOperation(world: World, restore: RestoreView): Operation {
       if (job.phase !== 'Succeeded' || result.ok !== true) {
         const reason = failure(job, 'RestoreFailed');
         return {
-          ...failed(reason, reason),
+          ...failed(reason, result.detail ? `${reason}: ${result.detail}` : reason),
           // Where the old data went, or the staging directory, if the move stopped part-way.
           ...(result.replacedPath ? { replacedPath: result.replacedPath } : {}),
           ...(result.restoringPath ? { restoringPath: result.restoringPath } : {}),
@@ -1024,6 +1029,7 @@ function restoreOperation(world: World, restore: RestoreView): Operation {
         message: `restored ${result.fileCount ?? 0} files`,
         fileCount: result.fileCount,
         encfsKcv: result.encfsKcv,
+        encfsMode: result.encfsMode,
         ...(result.replacedPath ? { replacedPath: result.replacedPath } : {}),
       };
     },

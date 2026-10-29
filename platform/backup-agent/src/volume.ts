@@ -22,10 +22,40 @@ import { type TarEntry, TarReader } from './tar.ts';
  * to 0 and waited for its instances to go; this process only reads the volume (a read-only
  * hostPath mount) and writes to the destination, or, for a restore, fills a directory the
  * workload is not running on. It never decrypts anything: the bytes are copied as stored, and
- * the only thing read from the encfs marker is its key check value.
+ * only the encfs marker is read: its form gives the directory's mode and key check value.
  */
 
 export const ENCFS_MARKER = '.di-encfs';
+/** encfs writes the marker through this name and a rename (`pglite-encfs/src/marker.rs`). */
+export const ENCFS_MARKER_TMP = '.di-encfs.tmp';
+export const LOST_AND_FOUND = 'lost+found';
+/** `DIPGKEY1 ‖ KCV`: an XTS directory (codec 2/3). */
+const XTS_MAGIC = 'DIPGKEY1';
+/** `DIPGKEY2 ‖ KCV ‖ flags`: an integrity directory (codec 4, #200). */
+const AEAD_MAGIC = 'DIPGKEY2';
+const XTS_MARKER_LEN = 24;
+const AEAD_MARKER_LEN = 25;
+const FLAG_CODEC4 = 0b01;
+const FLAG_RESERVATION = 0b10;
+
+/** How encfs encrypts a directory's files; `NotEncfs` is a directory without a marker. */
+export type EncfsMode = 'XTS' | 'AEAD' | 'NotEncfs';
+const ENCFS_MODES: ReadonlySet<string> = new Set(['XTS', 'AEAD', 'NotEncfs']);
+
+/** What a marker file holds, from its magic, length and flags only (design-200 §9.1). */
+export type MarkerForm =
+  | { form: 'xts'; kcv: string }
+  | { form: 'integrity'; kcv: string }
+  | { form: 'reserved' }
+  | { form: 'corrupt' };
+
+/**
+ * A directory's class, as the platform's `storage-mode` step reports it (design-200 §9.1, §9.4):
+ * `empty` has no entry besides a real `lost+found` directory; `reserved` holds a reservation and
+ * nothing else; `corrupt` is any other marker form, a reservation beside data, or a link or other
+ * non-regular entry at a marker name. A corrupt directory has no mode and fails closed.
+ */
+export type DirectoryClass = 'empty' | 'unencrypted' | 'xts' | 'integrity' | 'reserved' | 'corrupt';
 /** The tenant host runs as this uid (platform `workload-storage.ts` HOST_UID). */
 export const HOST_UID = 65532;
 export const ARCHIVE = 'data.tar';
@@ -68,8 +98,12 @@ export interface VolumeManifest {
   fileCount: number;
   directoryCount: number;
   bytes: number;
-  /** Hex of bytes 8..24 of `.di-encfs`, or null when the volume has no marker. */
+  /** Hex of bytes 8..24 of `.di-encfs`, or null when the volume has no keyed marker. */
   encfsKcv: string | null;
+  /** The directory's mode; a restore only goes into a target of the same mode. */
+  encfsMode: EncfsMode;
+  /** The marker is the platform's reservation: an integrity directory encfs has not keyed yet. */
+  encfsReservation: boolean;
   /** Entries not owned by the host uid; a restore gives every entry its recorded owner. */
   foreignOwners: number;
   archive: typeof ARCHIVE;
@@ -83,10 +117,66 @@ class VolumeError extends Error {
   }
 }
 
-/** The encfs key check value: bytes 8..24 of the marker, hex. */
-export function kcvOf(marker: Uint8Array): string {
-  if (marker.byteLength < 24) throw new VolumeError('EncfsMarkerInvalid');
-  return Buffer.from(marker.subarray(8, 24)).toString('hex');
+/**
+ * Classify `.di-encfs` bytes the way encfs does (`pglite-encfs/src/marker.rs`): exact lengths,
+ * the reservation is `DIPGKEY2`, 16 zero bytes and `0x03`, and unknown flag bits, a reservation
+ * with a KCV, or any other magic or length are corrupt.
+ */
+export function markerForm(marker: Uint8Array): MarkerForm {
+  const bytes = Buffer.from(marker);
+  const magic = bytes.subarray(0, 8).toString('latin1');
+  const kcv = bytes.subarray(8, 24).toString('hex');
+  if (bytes.byteLength === XTS_MARKER_LEN && magic === XTS_MAGIC) return { form: 'xts', kcv };
+  if (bytes.byteLength !== AEAD_MARKER_LEN || magic !== AEAD_MAGIC) return { form: 'corrupt' };
+  const flags = bytes[XTS_MARKER_LEN];
+  if (flags === FLAG_CODEC4) return { form: 'integrity', kcv };
+  if (flags === (FLAG_CODEC4 | FLAG_RESERVATION) && /^0+$/.test(kcv)) return { form: 'reserved' };
+  return { form: 'corrupt' };
+}
+
+/** Classify a directory from its entries (only the top level counts) and its marker. */
+export async function classifyDirectory(
+  entries: Pick<TreeEntry, 'path' | 'type'>[],
+  readMarker: () => Promise<Uint8Array>,
+): Promise<DirectoryClass> {
+  const top = entries.filter((entry) => !entry.path.includes('/'));
+  const markers = top.filter(
+    (entry) => entry.path === ENCFS_MARKER || entry.path === ENCFS_MARKER_TMP,
+  );
+  if (markers.some((entry) => entry.type !== 'file')) return 'corrupt';
+  const data = top.filter(
+    (entry) =>
+      entry.path !== ENCFS_MARKER && !(entry.path === LOST_AND_FOUND && entry.type === 'directory'),
+  );
+  if (!top.some((entry) => entry.path === ENCFS_MARKER)) {
+    return data.length === 0 ? 'empty' : 'unencrypted';
+  }
+  const marker = markerForm(await readMarker());
+  if (marker.form === 'reserved') return data.length === 0 ? 'reserved' : 'corrupt';
+  return marker.form;
+}
+
+/** The mode of a class; a corrupt directory has none. */
+export function modeOf(found: DirectoryClass): EncfsMode | undefined {
+  if (found === 'xts') return 'XTS';
+  if (found === 'integrity' || found === 'reserved') return 'AEAD';
+  if (found === 'corrupt') return undefined;
+  return 'NotEncfs';
+}
+
+interface MarkerState {
+  found: DirectoryClass;
+  kcv: string | null;
+}
+
+async function markerState(io: AgentIo, root: string, entries: TreeEntry[]): Promise<MarkerState> {
+  let bytes: Uint8Array = new Uint8Array();
+  const found = await classifyDirectory(entries, async () => {
+    bytes = await io.readFile(`${root}/${ENCFS_MARKER}`);
+    return bytes;
+  });
+  const marker = markerForm(bytes);
+  return { found, kcv: 'kcv' in marker ? marker.kcv : null };
 }
 
 export function imageDigestOf(image: string | undefined): string | null {
@@ -110,9 +200,14 @@ interface Tree {
 /** Regular files and directories only: a link or device in a volume is refused, not followed. */
 async function readTree(io: AgentIo, root: string): Promise<Tree> {
   const entries = await io.scan(root);
-  if (entries.some((entry) => entry.type !== 'file' && entry.type !== 'directory')) {
-    throw new VolumeError('UnsupportedEntry');
+  const unsupported = entries.filter(
+    (entry) => entry.type !== 'file' && entry.type !== 'directory',
+  );
+  // A link at a marker name is a marker problem first (design-200 §9.4), then a link.
+  if (unsupported.some((entry) => entry.path === ENCFS_MARKER || entry.path === ENCFS_MARKER_TMP)) {
+    throw new VolumeError('EncfsMarkerInvalid');
   }
+  if (unsupported.length > 0) throw new VolumeError('UnsupportedEntry');
   return {
     files: entries.filter((entry) => entry.type === 'file'),
     directories: entries.filter((entry) => entry.type === 'directory'),
@@ -222,11 +317,11 @@ export async function backupVolume(io: AgentIo, request: AgentRequest): Promise<
   if (missing) return fail(missing);
   if (!safeKey(objectKey(request, ARCHIVE))) return fail('PvcPathInvalid');
   let before: Tree;
-  let encfsKcv: string | null;
+  let state: MarkerState;
   try {
     before = await readTree(io, source);
-    const marked = before.files.some((file) => file.path === ENCFS_MARKER);
-    encfsKcv = marked ? kcvOf(await io.readFile(`${source}/${ENCFS_MARKER}`)) : null;
+    state = await markerState(io, source, [...before.files, ...before.directories]);
+    if (state.found === 'corrupt') throw new VolumeError('EncfsMarkerInvalid');
   } catch (error) {
     return fail(error instanceof VolumeError ? error.code : 'SourceUnreadable');
   }
@@ -277,7 +372,9 @@ export async function backupVolume(io: AgentIo, request: AgentRequest): Promise<
     fileCount: files.length,
     directoryCount: directories.length,
     bytes: files.reduce((total, file) => total + file.size, 0),
-    encfsKcv,
+    encfsKcv: state.kcv,
+    encfsMode: modeOf(state.found) as EncfsMode,
+    encfsReservation: state.found === 'reserved',
     foreignOwners: [...files, ...directories].filter(
       (entry) => entry.uid !== HOST_UID || entry.gid !== HOST_UID,
     ).length,
@@ -309,6 +406,7 @@ export async function backupVolume(io: AgentIo, request: AgentRequest): Promise<
     format: 'workload-volume',
     fileCount: manifest.fileCount,
     ...(manifest.encfsKcv ? { encfsKcv: manifest.encfsKcv } : {}),
+    encfsMode: manifest.encfsMode,
     ...(manifest.imageDigest ? { imageDigest: manifest.imageDigest } : {}),
   });
 }
@@ -344,6 +442,12 @@ export function parseManifest(text: string): VolumeManifest | undefined {
   );
   if (!filesValid || !directoriesValid) return undefined;
   if (parsed.encfsKcv !== null && !/^[0-9a-f]{32}$/.test(String(parsed.encfsKcv))) return undefined;
+  if (!ENCFS_MODES.has(String(parsed.encfsMode))) return undefined;
+  if (typeof parsed.encfsReservation !== 'boolean') return undefined;
+  // A keyed directory has a KCV; a reservation (AEAD only) and an unmarked directory have none.
+  const keyed = parsed.encfsMode !== 'NotEncfs' && !parsed.encfsReservation;
+  if (keyed !== (parsed.encfsKcv !== null)) return undefined;
+  if (parsed.encfsReservation && parsed.encfsMode !== 'AEAD') return undefined;
   return parsed as VolumeManifest;
 }
 
@@ -422,22 +526,13 @@ async function verify(
     if (sizes.get(file.path) !== file.size) return 'HashMismatch';
     if ((await io.hash(`${root}/${file.path}`)) !== file.sha256) return 'HashMismatch';
   }
-  if (sizes.has(ENCFS_MARKER) !== (manifest.encfsKcv !== null)) return 'KcvMismatch';
-  if (manifest.encfsKcv !== null) {
-    const kcv = await io
-      .readFile(`${root}/${ENCFS_MARKER}`)
-      .then(kcvOf)
-      .catch(() => undefined);
-    if (kcv !== manifest.encfsKcv) return 'KcvMismatch';
-  }
+  // The extracted marker must have the recorded mode, not only the recorded KCV.
+  const state = await markerState(io, root, [...tree.files, ...tree.directories]);
+  if (state.found === 'corrupt') return 'EncfsMarkerInvalid';
+  if (modeOf(state.found) !== manifest.encfsMode) return 'ModeMismatch';
+  if ((state.found === 'reserved') !== manifest.encfsReservation) return 'ModeMismatch';
+  if (state.kcv !== manifest.encfsKcv) return 'KcvMismatch';
   return undefined;
-}
-
-async function markerKcv(io: AgentIo, path: string): Promise<string | undefined> {
-  return io
-    .readFile(path)
-    .then(kcvOf)
-    .catch(() => undefined);
 }
 
 /** Every restored entry gets the owner the manifest recorded; older manifests mean the host uid. */
@@ -448,9 +543,19 @@ async function restoreOwners(io: AgentIo, target: string, manifest: VolumeManife
   }
 }
 
+/** Move entries one at a time, in order: a failure stops the rest. */
+function moveAll(io: AgentIo, names: string[], from: string, to: string): Promise<void> {
+  return names.reduce(
+    (moved, name) => moved.then(() => io.rename(`${from}/${name}`, `${to}/${name}`)),
+    Promise.resolve(),
+  );
+}
+
 export async function restoreVolume(io: AgentIo, request: AgentRequest): Promise<number> {
-  const fail = (error: string, paths: { replacedPath?: string; restoringPath?: string } = {}) =>
-    finish(io, request.terminationLog, { ok: false, error, ...paths });
+  const fail = (
+    error: string,
+    extra: { replacedPath?: string; restoringPath?: string; detail?: string } = {},
+  ) => finish(io, request.terminationLog, { ok: false, error, ...extra });
   const key = request.storageKey ?? '';
   const root = request.targetRoot;
   if (!root || key.length > 50 || !STORAGE_KEY.test(key)) return fail('MissingTarget');
@@ -469,7 +574,19 @@ export async function restoreVolume(io: AgentIo, request: AgentRequest): Promise
     await io.mkdir(target);
     existing = [];
   }
-  if (existing.length > 0 && !request.force) return fail('TargetNotEmpty');
+  // The target's mode decides what it may receive. An empty target, or one holding only the
+  // platform's reservation, takes a restore without `force`; the reservation is not a key.
+  let prior: MarkerState = { found: 'empty', kcv: null };
+  if (existing.length > 0) {
+    try {
+      prior = await markerState(io, target, await io.scan(target, true));
+    } catch {
+      return fail('TargetUnreadable');
+    }
+  }
+  if (prior.found === 'corrupt') return fail('EncfsMarkerInvalid');
+  const vacant = prior.found === 'empty' || prior.found === 'reserved';
+  if (!vacant && !request.force) return fail('TargetNotEmpty');
   const meta = `${request.workdir}/${MANIFEST}`;
   const sums = `${request.workdir}/${SUMS}`;
   if ((await get(io, request, MANIFEST, meta)).code !== 0) return fail('DownloadFailed');
@@ -479,13 +596,23 @@ export async function restoreVolume(io: AgentIo, request: AgentRequest): Promise
   if (Buffer.from(await io.readFile(sums)).toString('utf8') !== sumsText(manifest.files)) {
     return fail('ManifestInvalid');
   }
+  // A vacant target keeps its `lost+found`, unless the backup brings one: then the target's goes
+  // aside like forced data, so the move never collides with it part-way.
+  const bringsLostFound = manifest.directories.some((entry) => entry.path === LOST_AND_FOUND);
+  const occupied = vacant
+    ? existing.filter((name) => name === LOST_AND_FOUND && bringsLostFound)
+    : existing;
+  // A restore never changes a directory's mode: encfs fixes it when the directory is created.
+  const targetMode = modeOf(prior.found) as EncfsMode;
+  if (prior.found !== 'empty' && targetMode !== manifest.encfsMode) {
+    return fail('ModeMismatch', {
+      detail: `backup is ${manifest.encfsMode}, target is ${targetMode}; a restore keeps the mode`,
+    });
+  }
   if (request.expectedKcv && manifest.encfsKcv !== request.expectedKcv) return fail('KcvMismatch');
   // Replacing data encrypted under one key with data under another would leave the workload
   // unable to open it. Only an explicit expectedKcv may change the key.
-  const previous = existing.includes(ENCFS_MARKER)
-    ? await markerKcv(io, `${target}/${ENCFS_MARKER}`)
-    : undefined;
-  if (previous && previous !== manifest.encfsKcv && !request.expectedKcv) {
+  if (prior.kcv && prior.kcv !== manifest.encfsKcv && !request.expectedKcv) {
     return fail('KcvMismatch');
   }
   const rejected = await inspectArchive(io, request, manifest);
@@ -506,14 +633,12 @@ export async function restoreVolume(io: AgentIo, request: AgentRequest): Promise
   const relative = (path: string | undefined) => path?.slice(root.length + 1);
   try {
     // Entries move, not the directory: the tenant host pod has `<key>` itself bind-mounted.
-    if (existing.length > 0) {
+    if (occupied.length > 0) {
       replacedPath = `${root}/${key}.replaced-${stamp}`;
       await io.mkdir(replacedPath);
-      for (const name of existing) await io.rename(`${target}/${name}`, `${replacedPath}/${name}`);
+      await moveAll(io, occupied, target, replacedPath);
     }
-    for (const name of await io.list(staging)) {
-      await io.rename(`${staging}/${name}`, `${target}/${name}`);
-    }
+    await moveAll(io, await io.list(staging), staging, target);
     await io.remove(staging);
   } catch {
     // Part-way: say where everything is. Nothing is deleted; the README says how to clean up.
@@ -533,6 +658,7 @@ export async function restoreVolume(io: AgentIo, request: AgentRequest): Promise
     format: 'workload-volume',
     fileCount: manifest.fileCount,
     ...(manifest.encfsKcv ? { encfsKcv: manifest.encfsKcv } : {}),
+    encfsMode: manifest.encfsMode,
     ...(replacedPath ? { replacedPath: relative(replacedPath) } : {}),
   });
 }
