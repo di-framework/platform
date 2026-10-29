@@ -180,6 +180,36 @@ function accounts(
   return result.filter((account) => account.users.length > 0);
 }
 
+/** The problems of each Tenant's account name and replicas; `names` holds the names so far. */
+function tenantProblems(tenants: AccountsTenant[], names: Set<string>): AccountsProblem[] {
+  const problems: AccountsProblem[] = [];
+  for (const { metadata, spec } of tenants) {
+    const tenant = metadata.name;
+    const account = `T_di-tenant-${tenant}`;
+    if (tenant.length > MAX_TENANT_NAME || !TENANT_NAME.test(tenant))
+      problems.push({
+        reason: 'InvalidAccountName',
+        tenant,
+        message: `Tenant '${tenant}' does not give a valid account name`,
+      });
+    else if (names.has(account))
+      problems.push({
+        reason: 'InvalidAccountName',
+        tenant,
+        message: `account ${account} of Tenant '${tenant}' is not unique`,
+      });
+    names.add(account);
+    const replicas = spec?.runtime?.replicas ?? MIN_REPLICAS;
+    if (!Number.isInteger(replicas) || replicas < MIN_REPLICAS || replicas > MAX_REPLICAS)
+      problems.push({
+        reason: 'InvalidReplicas',
+        tenant,
+        message: `Tenant '${tenant}' has replicas outside ${MIN_REPLICAS}-${MAX_REPLICAS}`,
+      });
+  }
+  return problems;
+}
+
 function validate(
   namespace: string,
   tenants: AccountsTenant[],
@@ -191,33 +221,7 @@ function validate(
       reason: 'InvalidAccountName',
       message: `the platform namespace '${namespace}' does not give a valid account name`,
     });
-  const names = new Set([`T_${namespace}`]);
-  for (const { metadata, spec } of tenants) {
-    const account = `T_di-tenant-${metadata.name}`;
-    if (metadata.name.length > MAX_TENANT_NAME || !TENANT_NAME.test(metadata.name))
-      problems.push({
-        reason: 'InvalidAccountName',
-        tenant: metadata.name,
-        message: `Tenant '${metadata.name}' does not give a valid account name`,
-      });
-    else if (names.has(account))
-      problems.push({
-        reason: 'InvalidAccountName',
-        tenant: metadata.name,
-        message: `account ${account} of Tenant '${metadata.name}' is not unique`,
-      });
-    names.add(account);
-    const replicas = spec?.runtime?.replicas;
-    if (
-      replicas !== undefined &&
-      !(Number.isInteger(replicas) && replicas >= MIN_REPLICAS && replicas <= MAX_REPLICAS)
-    )
-      problems.push({
-        reason: 'InvalidReplicas',
-        tenant: metadata.name,
-        message: `Tenant '${metadata.name}' has replicas outside ${MIN_REPLICAS}-${MAX_REPLICAS}`,
-      });
-  }
+  problems.push(...tenantProblems(tenants, new Set([`T_${namespace}`])));
   if (problems.length > 0) return problems;
   const seen = new Set<string>();
   for (const account of rendered)
