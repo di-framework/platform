@@ -33,7 +33,13 @@ import {
  * imports nothing else, so these keys are written here rather than imported from `resources`
  * (a test keeps them equal).
  */
-export const SCHEDULER_PKI_MODULES = ['tls', 'ca-rotation', 'scheduler-pki', 'scheduler-pki-job'];
+export const SCHEDULER_PKI_MODULES = [
+  'tls',
+  'ca-rotation',
+  'scheduler-pki',
+  'scheduler-nats',
+  'scheduler-pki-job',
+];
 const INSTALLATION = 'platform.di-framework.dev/installation';
 const COMPONENT = 'platform.di-framework.dev/component';
 

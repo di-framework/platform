@@ -108,7 +108,7 @@ describe('scheduler PKI bootstrap objects (#541, O4)', () => {
       },
     ]);
     expect(one('Role', 'wasmcloud').rules).toEqual([
-      { apiGroups: [''], resources: ['secrets'], verbs: ['create'] },
+      { apiGroups: [''], resources: ['secrets', 'configmaps'], verbs: ['create'] },
       {
         apiGroups: [''],
         resources: ['secrets'],
@@ -119,6 +119,12 @@ describe('scheduler PKI bootstrap objects (#541, O4)', () => {
           'di-scheduler-operator-tls',
           'di-scheduler-platform-host-tls',
         ],
+      },
+      {
+        apiGroups: [''],
+        resources: ['configmaps'],
+        verbs: ['get'],
+        resourceNames: ['di-scheduler-nats-accounts'],
       },
     ]);
     for (const ns of [PKI, 'wasmcloud'])
@@ -250,6 +256,8 @@ describe('scheduler PKI writes policy (#541, W4)', () => {
       'di-scheduler-data-tls',
     ])
       expect(admit('wasmcloud', 'secrets', named(name, 'kubernetes.io/tls'))).toBe(true);
+    // #541 m2: the accounts file, in the platform namespace.
+    expect(admit('wasmcloud', 'configmaps', named('di-scheduler-nats-accounts'))).toBe(true);
   });
 
   it('refuses token Secrets, other names, other types and the wrong namespace', () => {
@@ -268,6 +276,10 @@ describe('scheduler PKI writes policy (#541, W4)', () => {
       ['wasmcloud', 'secrets', named('di-scheduler-ca', 'Opaque')],
       [PKI, 'configmaps', named('other')],
       ['wasmcloud', 'configmaps', named('di-scheduler-identities')],
+      [PKI, 'configmaps', named('di-scheduler-nats-accounts')],
+      ['wasmcloud', 'configmaps', named('other')],
+      ['wasmcloud', 'secrets', named('di-scheduler-nats-accounts', 'Opaque')],
+      ['wasmcloud', 'configmaps', { metadata: { generateName: 'di-scheduler-nats-accounts' } }],
       [PKI, 'secrets', { metadata: { generateName: 'di-scheduler-ca' }, type: 'Opaque' }],
     ] as const)
       expect(admit(namespace, resource, object as Record<string, unknown>)).toBe(false);

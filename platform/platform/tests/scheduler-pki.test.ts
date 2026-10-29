@@ -786,7 +786,8 @@ describe('scheduler-pki entry point', () => {
       `wrote ${NS}/di-scheduler-operator-tls`,
       `wrote ${NS}/di-scheduler-platform-host-tls`,
       `wrote ${NS}/di-scheduler-data-tls`,
-      'scheduler PKI ready (6 written)',
+      `wrote ${NS}/di-scheduler-nats-accounts`,
+      'scheduler PKI ready (7 written)',
     ]);
     expect(lines.join('\n')).not.toContain('BEGIN');
   });

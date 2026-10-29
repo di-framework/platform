@@ -6,6 +6,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { request } from 'node:https';
+import { bootstrapSchedulerAccounts } from './scheduler-nats';
 import { bootstrapSchedulerPki, type PkiApi, schedulerPkiConfig } from './scheduler-pki';
 
 /** A Kubernetes API error: the method, path and status only. */
@@ -71,7 +72,10 @@ export async function main(
   config: string | undefined = process.env.SCHEDULER_PKI_CONFIG,
   print: (line: string) => void = console.log,
 ): Promise<void> {
-  const written = await bootstrapSchedulerPki(api, schedulerPkiConfig(config));
+  const settings = schedulerPkiConfig(config);
+  const written = await bootstrapSchedulerPki(api, settings);
+  // The accounts file last: it is rendered from the record the PKI step completed.
+  written.push(...(await bootstrapSchedulerAccounts(api, settings)));
   for (const name of written) print(`wrote ${name}`);
   print(`scheduler PKI ready (${written.length} written)`);
 }

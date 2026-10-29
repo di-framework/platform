@@ -5,6 +5,7 @@ import type * as pulumi from '@pulumi/pulumi';
 import { controllerScriptHash } from './tenancy/install';
 import { NODE_IMAGE } from './tenancy/node-image';
 import { COMPONENT, INSTALLATION, NAMESPACE_ROLE, type Resource } from './tenancy/resources';
+import { SCHEDULER_NATS_ACCOUNTS } from './tenancy/scheduler-nats';
 import {
   codeUnitOrder,
   PLATFORM_SECRETS,
@@ -43,12 +44,13 @@ export const schedulerPkiUser = (namespace: string): string =>
 
 /** The refusal of {@link schedulerPkiWritesPolicy}. */
 export const SCHEDULER_PKI_WRITES_MESSAGE =
-  'the scheduler PKI Job may write only its named Secrets and ConfigMap, of their expected types';
+  'the scheduler PKI Job may write only its named Secrets and ConfigMaps, of their expected types';
 
 /**
  * The CEL rule of {@link schedulerPkiWritesPolicy}: which objects the Job's ServiceAccount may
  * create or update. In the PKI namespace, the `Opaque` Secret `di-scheduler-ca` and the ConfigMap
- * `di-scheduler-identities`; in the platform namespace, the `kubernetes.io/tls` scheduler Secrets.
+ * `di-scheduler-identities`; in the platform namespace, the `kubernetes.io/tls` scheduler Secrets
+ * and the ConfigMap `di-scheduler-nats-accounts` (#541 m2).
  * Nothing else, and never a `kubernetes.io/service-account-token` Secret (W4, design-541 §4.5).
  */
 export function schedulerPkiWritesRule(namespace: string): string {
@@ -65,7 +67,9 @@ export function schedulerPkiWritesRule(namespace: string): string {
     `(request.namespace == '${pki}' && request.resource.resource == 'configmaps' && ${named} &&`,
     `  object.metadata.name == '${SCHEDULER_IDENTITIES}') ||`,
     `(request.namespace == '${namespace}' && request.resource.resource == 'secrets' && ${named} &&`,
-    `  object.metadata.name in [${names}] && ${typed('kubernetes.io/tls')})`,
+    `  object.metadata.name in [${names}] && ${typed('kubernetes.io/tls')}) ||`,
+    `(request.namespace == '${namespace}' && request.resource.resource == 'configmaps' && ${named} &&`,
+    `  object.metadata.name == '${SCHEDULER_NATS_ACCOUNTS}')`,
   ].join('\n');
 }
 
@@ -203,12 +207,18 @@ export function schedulerPkiBootstrap(
       },
     ]),
     ...role(namespace, [
-      { apiGroups: [''], resources: ['secrets'], verbs: ['create'] },
+      { apiGroups: [''], resources: ['secrets', 'configmaps'], verbs: ['create'] },
       {
         apiGroups: [''],
         resources: ['secrets'],
         verbs: ['get'],
         resourceNames: Object.values(PLATFORM_SECRETS).sort(codeUnitOrder),
+      },
+      {
+        apiGroups: [''],
+        resources: ['configmaps'],
+        verbs: ['get'],
+        resourceNames: [SCHEDULER_NATS_ACCOUNTS],
       },
     ]),
     {
