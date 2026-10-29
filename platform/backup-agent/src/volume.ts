@@ -40,7 +40,7 @@ const FLAG_RESERVATION = 0b10;
 
 /** How encfs encrypts a directory's files; `NotEncfs` is a directory without a marker. */
 export type EncfsMode = 'XTS' | 'AEAD' | 'NotEncfs';
-const ENCFS_MODES: readonly string[] = ['XTS', 'AEAD', 'NotEncfs'];
+const ENCFS_MODES: ReadonlySet<string> = new Set(['XTS', 'AEAD', 'NotEncfs']);
 
 /** What a marker file holds, from its magic, length and flags only (design-200 §9.1). */
 export type MarkerForm =
@@ -200,9 +200,14 @@ interface Tree {
 /** Regular files and directories only: a link or device in a volume is refused, not followed. */
 async function readTree(io: AgentIo, root: string): Promise<Tree> {
   const entries = await io.scan(root);
-  if (entries.some((entry) => entry.type !== 'file' && entry.type !== 'directory')) {
-    throw new VolumeError('UnsupportedEntry');
+  const unsupported = entries.filter(
+    (entry) => entry.type !== 'file' && entry.type !== 'directory',
+  );
+  // A link at a marker name is a marker problem first (design-200 §9.4), then a link.
+  if (unsupported.some((entry) => entry.path === ENCFS_MARKER || entry.path === ENCFS_MARKER_TMP)) {
+    throw new VolumeError('EncfsMarkerInvalid');
   }
+  if (unsupported.length > 0) throw new VolumeError('UnsupportedEntry');
   return {
     files: entries.filter((entry) => entry.type === 'file'),
     directories: entries.filter((entry) => entry.type === 'directory'),
@@ -437,7 +442,7 @@ export function parseManifest(text: string): VolumeManifest | undefined {
   );
   if (!filesValid || !directoriesValid) return undefined;
   if (parsed.encfsKcv !== null && !/^[0-9a-f]{32}$/.test(String(parsed.encfsKcv))) return undefined;
-  if (!ENCFS_MODES.includes(String(parsed.encfsMode))) return undefined;
+  if (!ENCFS_MODES.has(String(parsed.encfsMode))) return undefined;
   if (typeof parsed.encfsReservation !== 'boolean') return undefined;
   // A keyed directory has a KCV; a reservation (AEAD only) and an unmarked directory have none.
   const keyed = parsed.encfsMode !== 'NotEncfs' && !parsed.encfsReservation;
@@ -538,6 +543,14 @@ async function restoreOwners(io: AgentIo, target: string, manifest: VolumeManife
   }
 }
 
+/** Move entries one at a time, in order: a failure stops the rest. */
+function moveAll(io: AgentIo, names: string[], from: string, to: string): Promise<void> {
+  return names.reduce(
+    (moved, name) => moved.then(() => io.rename(`${from}/${name}`, `${to}/${name}`)),
+    Promise.resolve(),
+  );
+}
+
 export async function restoreVolume(io: AgentIo, request: AgentRequest): Promise<number> {
   const fail = (
     error: string,
@@ -566,15 +579,14 @@ export async function restoreVolume(io: AgentIo, request: AgentRequest): Promise
   let prior: MarkerState = { found: 'empty', kcv: null };
   if (existing.length > 0) {
     try {
-      prior = await markerState(io, target, await io.scan(target));
+      prior = await markerState(io, target, await io.scan(target, true));
     } catch {
       return fail('TargetUnreadable');
     }
   }
   if (prior.found === 'corrupt') return fail('EncfsMarkerInvalid');
   const vacant = prior.found === 'empty' || prior.found === 'reserved';
-  const occupied = vacant ? [] : existing;
-  if (occupied.length > 0 && !request.force) return fail('TargetNotEmpty');
+  if (!vacant && !request.force) return fail('TargetNotEmpty');
   const meta = `${request.workdir}/${MANIFEST}`;
   const sums = `${request.workdir}/${SUMS}`;
   if ((await get(io, request, MANIFEST, meta)).code !== 0) return fail('DownloadFailed');
@@ -584,6 +596,12 @@ export async function restoreVolume(io: AgentIo, request: AgentRequest): Promise
   if (Buffer.from(await io.readFile(sums)).toString('utf8') !== sumsText(manifest.files)) {
     return fail('ManifestInvalid');
   }
+  // A vacant target keeps its `lost+found`, unless the backup brings one: then the target's goes
+  // aside like forced data, so the move never collides with it part-way.
+  const bringsLostFound = manifest.directories.some((entry) => entry.path === LOST_AND_FOUND);
+  const occupied = vacant
+    ? existing.filter((name) => name === LOST_AND_FOUND && bringsLostFound)
+    : existing;
   // A restore never changes a directory's mode: encfs fixes it when the directory is created.
   const targetMode = modeOf(prior.found) as EncfsMode;
   if (prior.found !== 'empty' && targetMode !== manifest.encfsMode) {
@@ -618,11 +636,9 @@ export async function restoreVolume(io: AgentIo, request: AgentRequest): Promise
     if (occupied.length > 0) {
       replacedPath = `${root}/${key}.replaced-${stamp}`;
       await io.mkdir(replacedPath);
-      for (const name of occupied) await io.rename(`${target}/${name}`, `${replacedPath}/${name}`);
+      await moveAll(io, occupied, target, replacedPath);
     }
-    for (const name of await io.list(staging)) {
-      await io.rename(`${staging}/${name}`, `${target}/${name}`);
-    }
+    await moveAll(io, await io.list(staging), staging, target);
     await io.remove(staging);
   } catch {
     // Part-way: say where everything is. Nothing is deleted; the README says how to clean up.

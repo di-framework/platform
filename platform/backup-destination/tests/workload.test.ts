@@ -1372,13 +1372,19 @@ describe('restore into a workload volume', () => {
     cluster.finishJob('Succeeded', {
       ok: true,
       fileCount: 3,
+      encfsMode: 'AEAD',
       replacedPath: 'identity.replaced-20261013T033003Z',
     });
     const done = cluster.tick();
     expect(scaled(done)).toEqual([{ type: 'scale-workload', name: 'identity', replicas: 2 }]);
     expect(restore()).toMatchObject({
       phase: 'Succeeded',
-      volume: { stage: 'Done', replacedPath: 'identity.replaced-20261013T033003Z', fileCount: 3 },
+      volume: {
+        stage: 'Done',
+        replacedPath: 'identity.replaced-20261013T033003Z',
+        fileCount: 3,
+        encfsMode: 'AEAD',
+      },
     });
     expect(cluster.replicas()).toBe(2);
   });
@@ -1396,6 +1402,28 @@ describe('restore into a workload volume', () => {
     cluster.finishJob('Failed', { ok: false, error: 'TargetNotEmpty' });
     cluster.tick();
     expect(cluster.world.restores[0]).toMatchObject({ phase: 'Failed', reason: 'TargetNotEmpty' });
+    expect(cluster.replicas()).toBe(2);
+  });
+
+  test('a cross-mode restore fails with both modes in the status message (#553)', () => {
+    const cluster = new Cluster(volumeWorld({ backups: [source] }));
+    cluster.apply(
+      handle('POST', '/restores', `source=${source.name}&workload=identity`, cluster.world).actions,
+    );
+    stopped(cluster);
+    cluster.instances('identity', 0);
+    cluster.tick();
+    cluster.finishJob('Failed', {
+      ok: false,
+      error: 'ModeMismatch',
+      detail: 'backup is XTS, target is AEAD; a restore keeps the mode',
+    });
+    cluster.tick();
+    expect(cluster.world.restores[0]).toMatchObject({
+      phase: 'Failed',
+      reason: 'ModeMismatch',
+      message: 'ModeMismatch: backup is XTS, target is AEAD; a restore keeps the mode',
+    });
     expect(cluster.replicas()).toBe(2);
   });
 

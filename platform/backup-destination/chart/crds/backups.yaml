@@ -288,7 +288,7 @@ spec:
                     objectPrefix: { type: string }
                     fileCount: { type: integer }
                     encfsKcv: { type: string }
-                    encfsMode: { type: string }
+                    encfsMode: { type: string, enum: [XTS, AEAD, NotEncfs] }
                     imageDigest: { type: string }
                     replacedPath: { type: string }
 ---
@@ -384,6 +384,6 @@ spec:
                     objectPrefix: { type: string }
                     fileCount: { type: integer }
                     encfsKcv: { type: string }
-                    encfsMode: { type: string }
+                    encfsMode: { type: string, enum: [XTS, AEAD, NotEncfs] }
                     imageDigest: { type: string }
                     replacedPath: { type: string }

@@ -320,6 +320,8 @@ interface Operation {
 interface JobResult {
   ok?: boolean;
   error?: string;
+  /** The agent's explanation, e.g. both modes of a ModeMismatch. */
+  detail?: string;
   digest?: string;
   bytes?: number;
   objectKey?: string;
@@ -1015,7 +1017,7 @@ function restoreOperation(world: World, restore: RestoreView): Operation {
       if (job.phase !== 'Succeeded' || result.ok !== true) {
         const reason = failure(job, 'RestoreFailed');
         return {
-          ...failed(reason, reason),
+          ...failed(reason, result.detail ? `${reason}: ${result.detail}` : reason),
           // Where the old data went, or the staging directory, if the move stopped part-way.
           ...(result.replacedPath ? { replacedPath: result.replacedPath } : {}),
           ...(result.restoringPath ? { restoringPath: result.restoringPath } : {}),
@@ -1027,6 +1029,7 @@ function restoreOperation(world: World, restore: RestoreView): Operation {
         message: `restored ${result.fileCount ?? 0} files`,
         fileCount: result.fileCount,
         encfsKcv: result.encfsKcv,
+        encfsMode: result.encfsMode,
         ...(result.replacedPath ? { replacedPath: result.replacedPath } : {}),
       };
     },

@@ -895,6 +895,32 @@ describe('encfs directory modes (#553)', () => {
     expect((await termination()).replacedPath).toBe('identity.replaced-20261014T093000Z');
   });
 
+  test('a reserved target moves its own lost+found aside when the backup brings one', async () => {
+    await rm(source, { recursive: true });
+    await mkdir(join(source, 'lost+found'), { recursive: true });
+    await writeFile(join(source, 'lost+found', '#12'), 'from backup');
+    await writeFile(join(source, '.di-encfs'), integrity(KCV));
+    await writeFile(join(source, 'PG_VERSION'), '17\n');
+    await backupToClaim();
+    const target = join(workloads, 'identity');
+    await mkdir(join(target, 'lost+found'), { recursive: true });
+    await writeFile(join(target, 'lost+found', '#7'), 'fsck found me');
+    await writeFile(join(target, '.di-encfs'), RESERVATION);
+    expect(await runAgent(restore(), io())).toBe(0);
+    expect((await termination()).replacedPath).toBe('identity.replaced-20261014T093000Z');
+    const aside = join(workloads, 'identity.replaced-20261014T093000Z');
+    expect(await readFile(join(aside, 'lost+found', '#7'), 'utf8')).toBe('fsck found me');
+    expect(await readdir(aside)).toEqual(['lost+found']);
+    expect(await tree(target)).toEqual(await tree(source));
+  });
+
+  test('a symlinked marker in a backup source is a marker problem', async () => {
+    await rm(join(source, '.di-encfs'));
+    await symlink('/etc/passwd', join(source, '.di-encfs'));
+    expect(await runAgent(request(), io())).toBe(1);
+    expect((await termination()).error).toBe('EncfsMarkerInvalid');
+  });
+
   test('round-trips a reservation-only directory', async () => {
     await rm(source, { recursive: true });
     await mkdir(source);

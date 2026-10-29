@@ -104,8 +104,8 @@ export interface AgentIo {
   /** Delete one file (never a directory). A missing file is not an error. */
   unlink(path: string): Promise<void>;
   mkdir(path: string): Promise<void>;
-  /** Every entry under `root`, depth first, links not followed. */
-  scan(root: string): Promise<TreeEntry[]>;
+  /** Every entry under `root` (or only its own, with `top`), depth first, links not followed. */
+  scan(root: string, top?: boolean): Promise<TreeEntry[]>;
   /** Hex sha256 of a file, streamed. */
   hash(path: string): Promise<string>;
   /** Entry names directly in `path`. */

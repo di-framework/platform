@@ -23,7 +23,7 @@ export function byName(a: string, b: string): number {
 }
 
 /** Walk `root` without following links. Paths are relative and use `/`. */
-async function scan(root: string): Promise<TreeEntry[]> {
+async function scan(root: string, top = false): Promise<TreeEntry[]> {
   const found: TreeEntry[] = [];
   async function visit(relative: string): Promise<void> {
     const names = (await readdir(relative ? `${root}/${relative}` : root)).sort(byName);
@@ -48,7 +48,7 @@ async function scan(root: string): Promise<TreeEntry[]> {
         uid: info.uid,
         gid: info.gid,
       });
-      if (type === 'directory') await visit(path);
+      if (type === 'directory' && !top) await visit(path);
     }
   }
   await visit('');
