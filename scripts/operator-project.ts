@@ -153,9 +153,29 @@ type Deps = {
 
 /** npm's error output for a version it does not serve (yet): a 404 packument or no matching version. */
 export const NOT_SERVED = /\bE404\b|\bETARGET\b|No matching version|No match found for version/;
-/** npm's error output for a registry or network failure a retry can fix. */
-export const TRANSIENT =
-  /\bE5\d\d\b|\bETIMEDOUT\b|\bECONNRESET\b|\bECONNREFUSED\b|\bEAI_AGAIN\b|\bENOTFOUND\b|\bsocket hang up\b/;
+/**
+ * npm's error output for a registry or network failure a retry can fix: a 5xx or 429 (rate limited),
+ * a dropped, refused, timed-out or unreachable connection, or a truncated registry response.
+ */
+export const TRANSIENT = new RegExp(
+  [
+    String.raw`\bE5\d\d\b`,
+    String.raw`\bE429\b`,
+    String.raw`\bETIMEDOUT\b`,
+    String.raw`\bERR_SOCKET_TIMEOUT\b`,
+    String.raw`\bECONNRESET\b`,
+    String.raw`\bECONNREFUSED\b`,
+    String.raw`\bECONNABORTED\b`,
+    String.raw`\bEPIPE\b`,
+    String.raw`\bENETUNREACH\b`,
+    String.raw`\bEHOSTUNREACH\b`,
+    String.raw`\bEAI_AGAIN\b`,
+    String.raw`\bENOTFOUND\b`,
+    String.raw`\bFETCH_ERROR\b`,
+    'invalid json response body',
+    'socket hang up',
+  ].join('|'),
+);
 
 /** Runs a command; its stderr is echoed and returned for classifying a failure. */
 const run = (cmd: string, args: string[], cwd?: string) => {
@@ -197,7 +217,9 @@ export const npmDeps: Deps = {
     } catch (error) {
       throw new RetryableError(`${url}: ${(error as Error).message}`);
     }
-    if (res.status >= 500) throw new RetryableError(`${url}: HTTP ${res.status}`);
+    if (res.status >= 500 || res.status === 429) {
+      throw new RetryableError(`${url}: HTTP ${res.status}`);
+    }
     if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
     return res.text();
   },

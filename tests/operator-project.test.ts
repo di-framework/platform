@@ -340,6 +340,23 @@ describe('bump', () => {
     expect(retryable('npm error code E503')).toBe(true);
     expect(retryable('npm error code ECONNRESET')).toBe(true);
     expect(retryable('npm error code EAI_AGAIN')).toBe(true);
+    for (const stderr of [
+      'npm error code E429\nnpm error 429 Too Many Requests',
+      'npm error code ERR_SOCKET_TIMEOUT',
+      'npm error code ECONNABORTED',
+      'npm error code EPIPE',
+      'npm error code ENETUNREACH',
+      'npm error code EHOSTUNREACH',
+      'npm error code ETIMEDOUT',
+      'npm error code ECONNREFUSED',
+      'npm error code ENOTFOUND',
+      'npm error code FETCH_ERROR',
+      'npm error invalid json response body at https://registry.npmjs.org/x reason: Unexpected end',
+      'npm error socket hang up',
+    ]) {
+      expect([stderr, retryable(stderr)]).toEqual([stderr, true]);
+    }
+    expect(retryable('npm error code E403')).toBe(false);
     expect(retryable('npm error code ERESOLVE')).toBe(false);
     expect(retryable('npm error code EINTEGRITY')).toBe(false);
     expect(retryable('')).toBe(false);
@@ -429,7 +446,7 @@ describe('npmDeps against a stubbed npm and GitHub (#523)', () => {
     }
   });
 
-  test('checksums retries a network failure or a 5xx, not a 404', async () => {
+  test('checksums retries a network failure, a 5xx or a 429, not a 404 or 403', async () => {
     const respond = (impl: () => Promise<Response>) =>
       spyOn(globalThis, 'fetch').mockImplementation(impl as unknown as typeof fetch);
     const outcome = async (impl: () => Promise<Response>) => {
@@ -449,6 +466,12 @@ describe('npmDeps against a stubbed npm and GitHub (#523)', () => {
     expect(await outcome(async () => new Response('', { status: 502 }))).toBeInstanceOf(
       RetryableError,
     );
+    // GitHub's rate limit.
+    expect(await outcome(async () => new Response('', { status: 429 }))).toBeInstanceOf(
+      RetryableError,
+    );
+    const forbidden = await outcome(async () => new Response('', { status: 403 }));
+    expect(forbidden).not.toBeInstanceOf(RetryableError);
     const missing = await outcome(async () => new Response('', { status: 404 }));
     expect(missing).not.toBeInstanceOf(RetryableError);
     expect(String(missing)).toContain('HTTP 404');

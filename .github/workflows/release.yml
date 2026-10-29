@@ -582,13 +582,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The index carries bake's project-sha256 as an annotation, like the per-arch label (#523).
       - name: Create and push the index
         id: index
         working-directory: ${{ runner.temp }}/digests
         env:
           VERSION: ${{ needs.bake.outputs.version }}
+          PROJECT_SHA256: ${{ needs.bake.outputs.project_sha256 }}
         run: |
           set -euo pipefail
+          if [[ ! "$PROJECT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::bake returned no project-sha256 (${PROJECT_SHA256})"
+            exit 1
+          fi
           mapfile -t files < <(find . -type f | sort)
           if (( ${#files[@]} != 2 )); then
             echo "::error::expected 2 image digests, found ${#files[@]}"
@@ -606,6 +612,7 @@ jobs:
           docker buildx imagetools create \
             --metadata-file "${RUNNER_TEMP}/operator-index.json" \
             --tag "ghcr.io/di-framework/platform-operator:v${VERSION}" \
+            --annotation "index:dev.di-framework.platform-operator.project-sha256=${PROJECT_SHA256}" \
             "${args[@]}"
           digest="$(jq -er '.["containerimage.descriptor"].digest' "${RUNNER_TEMP}/operator-index.json")"
           if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -615,6 +622,7 @@ jobs:
           pinned="ghcr.io/di-framework/platform-operator@${digest}"
           docker buildx imagetools inspect --raw "${pinned}" > "${RUNNER_TEMP}/index.json"
           jq -e '[.manifests[] | select(.platform.os != "unknown") | .platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]' "${RUNNER_TEMP}/index.json"
+          jq -e --arg sum "$PROJECT_SHA256" '.annotations["dev.di-framework.platform-operator.project-sha256"] == $sum' "${RUNNER_TEMP}/index.json"
           echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
           {
             echo '### Release operator image'
@@ -803,10 +811,11 @@ jobs:
   # are, so main's next image installs exactly what the vN image does (#523). Otherwise (a template
   # change made on main since the tag) main is bumped on its own package.json, which keeps it.
   # It never moves backwards (#523): a main that already pins this release or a newer one gets no
-  # PR, and an open bot PR that main has passed is closed; an open bot PR that moves main to a newer
-  # release than this one is left alone (two tags close together, or "Re-run failed jobs" on an
-  # older release). The push is leased on the branch as read, so a newer release's project-pr that
-  # pushes in between is never overwritten.
+  # PR, and a bot branch main has passed is deleted (closing its PR); a bot branch that moves main
+  # to a newer release than this one is left alone, with or without its PR yet (two tags close
+  # together, or "Re-run failed jobs" on an older release). Every push and delete is leased on the
+  # branch as read, so a newer release's project-pr that pushes in between is never overwritten.
+  # A re-run after bake's artifact expired (7 days) bumps main's own files instead.
   project-pr:
     name: Open the baked platform PR for main
     needs: [bake, chart]
@@ -832,7 +841,10 @@ jobs:
         with:
           node-version: '24.x'
 
+      # The artifact is kept 7 days: a later "Re-run failed jobs" finds none and bumps main's own.
       - name: Download the baked install project
+        id: baked
+        continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: operator-project
@@ -844,6 +856,7 @@ jobs:
           NPM_CONFIG_PREFER_ONLINE: 'true'
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           PROJECT_SHA256: ${{ needs.bake.outputs.project_sha256 }}
+          BAKED_OUTCOME: ${{ steps.baked.outcome }}
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
@@ -854,52 +867,70 @@ jobs:
           pin() { jq -er '.dependencies["@di-framework/platform"]' "$1"; }
           # newer A B: A is a later release than B.
           newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]; }
-          # The open bot PR (existing), the branch's commit (lease; empty when there is no branch), the
-          # release the branch moves main to (branch_pin), and that release only while a PR is open
-          # (bot_pin).
+          # The open bot PR (existing), the branch's commit (lease; empty when there is no branch) and
+          # the release the branch moves main to (branch_pin). A branch is pushed before its PR is
+          # opened, so a branch without a PR may be a newer release's project-pr in flight.
           read_bot() {
             existing="$(BRANCH="${branch}" gh pr list --head "${branch}" --base main --state open \
               --json number,author,headRefName \
               --jq 'map(select(.author.login == "app/github-actions" and .headRefName == env.BRANCH)) | .[0].number // empty')"
             lease=''
             branch_pin=''
-            bot_pin=''
             if git fetch --quiet --depth=1 origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" 2>/dev/null; then
               lease="$(git rev-parse "refs/remotes/origin/${branch}")"
               branch_pin="$(git show "refs/remotes/origin/${branch}:${PROJECT}/package.json" | pin /dev/stdin)"
-              if [[ -n "${existing}" ]]; then bot_pin="${branch_pin}"; fi
             fi
           }
           read_bot
           current="$(pin "$PROJECT/package.json")"
           if ! newer "$VERSION" "$current"; then
             echo "::notice::main already bakes @di-framework/platform@$current; no PR for $VERSION"
-            if [[ -n "${existing}" && -n "${bot_pin}" ]] && ! newer "$bot_pin" "$current"; then
-              gh pr close "${existing}" --delete-branch \
-                --comment "Superseded: main already bakes \`@di-framework/platform@${current}\` (${GITHUB_REF_NAME}, [run](${RUN_URL}))."
-              echo "Closed PR #${existing} (bakes ${bot_pin}): main is already at ${current}"
+            # A bot branch main has passed is deleted, leased on the commit read above, so a newer
+            # release that pushed it in between keeps it. Deleting the head branch closes its PR.
+            if [[ -n "${branch_pin}" ]] && ! newer "$branch_pin" "$current"; then
+              if git push --force-with-lease="refs/heads/${branch}:${lease}" origin ":refs/heads/${branch}"; then
+                echo "Deleted ${branch} (bakes ${branch_pin}): main is already at ${current}"
+                if [[ -n "${existing}" ]]; then
+                  gh pr close "${existing}" \
+                    --comment "Superseded: main already bakes \`@di-framework/platform@${current}\` (${GITHUB_REF_NAME}, [run](${RUN_URL}))." \
+                    || echo "::notice::PR #${existing} was already closed with its branch"
+                fi
+              else
+                read_bot
+                echo "::notice::${branch} moved to @di-framework/platform@${branch_pin:-none} during this run; leaving it"
+              fi
             fi
             exit 0
           fi
-          if [[ -n "${bot_pin}" ]] && newer "$bot_pin" "$VERSION"; then
-            echo "::notice::PR #${existing} already moves main to @di-framework/platform@$bot_pin, newer than $VERSION; leaving it"
+          if [[ -n "${branch_pin}" ]] && newer "$branch_pin" "$VERSION"; then
+            echo "::notice::${branch} (PR #${existing:-none yet}) already moves main to @di-framework/platform@$branch_pin, newer than $VERSION; leaving it"
             exit 0
           fi
           # bake's files, as the vN image was built with them, when main's project is still the tag's
-          # (bake changed only the pin and what follows from it); otherwise main's own, bumped.
-          sum="$(cd "$BAKED" && sha256sum "${FILES[@]}" | sha256sum | cut -d' ' -f1)"
-          if [[ ! "$PROJECT_SHA256" =~ ^[0-9a-f]{64}$ || "$sum" != "$PROJECT_SHA256" ]]; then
-            echo "::error::downloaded install project ($sum) differs from the one bake pinned ($PROJECT_SHA256)"
-            exit 1
+          # (bake changed only the pin and what follows from it); otherwise main's own, bumped. A
+          # re-run after the artifact expired has no bake files and bumps main's own.
+          use_baked=true
+          if [[ "${BAKED_OUTCOME}" != success ]] || ! (cd "$BAKED" && ls "${FILES[@]}") >/dev/null 2>&1; then
+            echo "::notice::the operator-project artifact from bake is not available (it is kept 7 days); bumping main's own"
+            use_baked=false
+          else
+            sum="$(cd "$BAKED" && sha256sum "${FILES[@]}" | sha256sum | cut -d' ' -f1)"
+            if [[ ! "$PROJECT_SHA256" =~ ^[0-9a-f]{64}$ || "$sum" != "$PROJECT_SHA256" ]]; then
+              echo "::error::downloaded install project ($sum) differs from the one bake pinned ($PROJECT_SHA256)"
+              exit 1
+            fi
+            git fetch --quiet --depth=1 origin "$GITHUB_SHA"
+            if ! git diff --quiet "$GITHUB_SHA" HEAD -- "$PROJECT"; then
+              echo "::notice::main's $PROJECT differs from ${GITHUB_REF_NAME}'s; bumping main's own"
+              use_baked=false
+            fi
           fi
-          git fetch --quiet --depth=1 origin "$GITHUB_SHA"
-          if git diff --quiet "$GITHUB_SHA" HEAD -- "$PROJECT"; then
+          if [[ "${use_baked}" = true ]]; then
             for f in "${FILES[@]}"; do cp "$BAKED/$f" "$PROJECT/$f"; done
             source="the files the ${GITHUB_REF_NAME} operator image was built with, unchanged (project-sha256 \`${PROJECT_SHA256}\`)"
           else
-            echo "::notice::main's $PROJECT differs from ${GITHUB_REF_NAME}'s; bumping main's own"
             bun scripts/operator-project.ts bump "$VERSION"
-            source="\`bun scripts/operator-project.ts bump ${VERSION}\` on main, whose project differs from ${GITHUB_REF_NAME}'s"
+            source="\`bun scripts/operator-project.ts bump ${VERSION}\` on main (main's project differs from ${GITHUB_REF_NAME}'s, or bake's files have expired)"
           fi
           if git diff --quiet; then
             echo "::notice::main's baked install project is already at $VERSION"
