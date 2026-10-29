@@ -1,10 +1,13 @@
 package vcluster
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"reflect"
 	"regexp"
@@ -71,10 +74,12 @@ func TestInstanceValuesMatchTheLayer3PassingValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The one addition since that run: the .svc names the operator's kubeconfig addresses.
-	// That run reached the vCluster through a port-forward, so it needed only 127.0.0.1.
+	// The additions since that run. The .svc names the operator's kubeconfig addresses: that
+	// run reached the vCluster through a port-forward, so it needed only 127.0.0.1.
 	sans := proven["controlPlane"].(map[string]any)["proxy"].(map[string]any)
 	sans["extraSANs"] = append(sans["extraSANs"].([]any), "vcluster.vc-pgvc.svc", "vcluster.vc-pgvc.svc.cluster.local")
+	// ServiceAccount tokens in host Secrets instead of host pod annotations (#541).
+	proven["sync"].(map[string]any)["toHost"].(map[string]any)["pods"] = map[string]any{"useSecretsForSATokens": true}
 	want, have := normalize(t, proven), normalize(t, got)
 	wantCorefile, wantManifests := coredns(t, want)
 	haveCorefile, haveManifests := coredns(t, have)
@@ -94,6 +99,64 @@ func TestInstanceValuesMatchTheLayer3PassingValues(t *testing.T) {
 	data := haveManifests[3]["data"].(map[string]any)
 	if !bytes.Equal([]byte(data["Corefile"].(string)), []byte(haveCorefile)) {
 		t.Fatalf("manifest ConfigMap Corefile differs from overwriteConfig:\n%q\n%q", data["Corefile"], haveCorefile)
+	}
+}
+
+// chartValues reads values.yaml out of the embedded chart archive.
+func chartValues(t *testing.T) map[string]any {
+	t.Helper()
+	archive, err := Chart()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(archive))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(gz)
+	for {
+		h, err := tr.Next()
+		if err != nil {
+			t.Fatalf("vcluster/values.yaml not in the embedded chart: %v", err)
+		}
+		if h.Name != "vcluster/values.yaml" {
+			continue
+		}
+		raw, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var values map[string]any
+		if err := yaml.Unmarshal(raw, &values); err != nil {
+			t.Fatal(err)
+		}
+		return values
+	}
+}
+
+// pods returns sync.toHost.pods of a values map, or nil when a level is missing.
+func pods(v map[string]any) map[string]any {
+	sync, _ := v["sync"].(map[string]any)
+	toHost, _ := sync["toHost"].(map[string]any)
+	p, _ := toHost["pods"].(map[string]any)
+	return p
+}
+
+// Without useSecretsForSATokens the syncer writes each virtual ServiceAccount token into a
+// vcluster.loft.sh/token-* annotation on the synced host pod (#541, design note 4.9).
+func TestInstanceValuesKeepServiceAccountTokensOffHostPods(t *testing.T) {
+	// The key exists at this path in the pinned chart, off by default, so a chart bump that
+	// moves or renames it fails here rather than being silently ignored.
+	def, ok := pods(chartValues(t))["useSecretsForSATokens"]
+	if !ok || def != false {
+		t.Fatalf("chart %s sync.toHost.pods.useSecretsForSATokens = %v (present %t), want the key with default false", ChartVersion, def, ok)
+	}
+	got, err := InstanceValues("10.43.0.10", "vc-pgvc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := pods(normalize(t, got))["useSecretsForSATokens"]; v != true {
+		t.Fatalf("sync.toHost.pods.useSecretsForSATokens = %v, want true", v)
 	}
 }
 
