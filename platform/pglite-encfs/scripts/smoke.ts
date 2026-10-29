@@ -88,7 +88,6 @@ interface Keys {
   previous?: string;
 }
 
-/** Key-check value, as derived by src/keys.rs. */
 /** A keyed `DIPGKEY2` marker for `base64Key` with `flags` (FLAG_CODEC4 for a valid one). */
 function integrityMarker(base64Key: string, flags: number): Buffer {
   return Buffer.concat([
@@ -98,6 +97,7 @@ function integrityMarker(base64Key: string, flags: number): Buffer {
   ]);
 }
 
+/** Key-check value, as derived by src/keys.rs. */
 export function keyCheckValue(base64Key: string): Buffer {
   // Node's base64 decoder accepts both alphabets, like the component.
   const master = Buffer.from(base64Key, 'base64');
@@ -110,6 +110,15 @@ async function regularFiles(root: string): Promise<string[]> {
     .filter((e) => e.isFile())
     .map((e) => join(e.parentPath, e.name))
     .sort();
+}
+
+/** Every regular file under `root`, by relative path, with its content. */
+async function fileContents(root: string): Promise<Map<string, Buffer>> {
+  const contents = new Map<string, Buffer>();
+  for (const file of await regularFiles(root)) {
+    contents.set(relative(root, file), await readFile(file));
+  }
+  return contents;
 }
 
 /** Hash of every path and its content: proves a refused start changed nothing. */
@@ -602,10 +611,12 @@ export async function smoke(ctx: Context): Promise<void> {
     await h.refused(enc, integrity, A, 'the encryption marker (.di-encfs) is corrupt');
     await writeFile(join(integrity, MARKER_FILE), integrityMarker(keyA, FLAG_CODEC4));
     await h.refused(enc, integrity, B, 'encrypted with a different key');
-    // A keyed integrity root opens, and every write into it is refused: no
-    // codec-4 file and no XTS file is ever created there.
-    const readOnly = await h.run(enc, integrity, 'refused', A, 'refused ok');
-    if (!readOnly.includes('integrity (codec-4) directories are read-only in this build'))
+    // A keyed integrity root opens, and every write of file data into it is
+    // refused: no codec-4 file and no XTS file gets a header there. Directory
+    // operations (create, mkdir, rename, unlink) still pass through, so empty
+    // files may appear.
+    const noWriter = await h.run(enc, integrity, 'refused', A, 'refused ok');
+    if (!noWriter.includes('this build cannot write codec-4 file data'))
       throw new Error('a write into an integrity directory was not refused');
     for (const file of await regularFiles(integrity)) {
       if (file !== join(integrity, MARKER_FILE) && (await readFile(file)).length > 0)
@@ -613,7 +624,48 @@ export async function smoke(ctx: Context): Promise<void> {
     }
     if (!(await readFile(join(integrity, MARKER_FILE))).equals(integrityMarker(keyA, FLAG_CODEC4)))
       throw new Error('the integrity marker changed');
-    log('integrity directories: reservation locked, keyed root read-only, unknown flags refused');
+
+    // Rotation keeps the mode: the marker is rewritten as a keyed DIPGKEY2
+    // marker with flags 0b01 under the new key, never as DIPGKEY1.
+    const rotating = join(work, 'integrity-rotate');
+    await mkdir(rotating);
+    await writeFile(join(rotating, MARKER_FILE), integrityMarker(keyA, FLAG_CODEC4));
+    const rotationLog = await h.run(
+      enc,
+      rotating,
+      'refused',
+      { current: keyB, previous: keyA },
+      'refused ok',
+    );
+    if (!rotationLog.includes('key rotation complete'))
+      throw new Error('an integrity directory was not rotated');
+    if (!(await readFile(join(rotating, MARKER_FILE))).equals(integrityMarker(keyB, FLAG_CODEC4)))
+      throw new Error('rotation did not keep the integrity marker and its flags');
+    await rm(rotating, { recursive: true, force: true });
+
+    // An XTS file in an integrity directory is refused with io and never
+    // read or rewritten: a directory never mixes XTS and codec-4 files.
+    // Directory operations pass through, so pglite may leave empty files.
+    const xtsInIntegrity = join(work, 'integrity-xts');
+    await cp(data, xtsInIntegrity, { recursive: true });
+    await writeFile(join(xtsInIntegrity, MARKER_FILE), integrityMarker(keyA, FLAG_CODEC4));
+    const xtsBefore = await fileContents(xtsInIntegrity);
+    const xtsLog = await h.run(enc, xtsInIntegrity, 'refused', A, 'refused ok');
+    if (!xtsLog.includes(`codec ${CODEC_TAIL} file in an integrity directory; refusing`))
+      throw new Error('an XTS file in an integrity directory was not refused');
+    const xtsAfter = await fileContents(xtsInIntegrity);
+    for (const [file, bytes] of xtsBefore) {
+      if (!xtsAfter.get(file)?.equals(bytes))
+        throw new Error(`${file}: changed in an integrity directory`);
+    }
+    for (const [file, bytes] of xtsAfter) {
+      if (!xtsBefore.has(file) && bytes.length > 0)
+        throw new Error(`${file}: written in an integrity directory`);
+    }
+    await rm(xtsInIntegrity, { recursive: true, force: true });
+    log(
+      'integrity directories: reservation locked, file data writes refused, unknown flags refused, rotation keeps the mode, XTS files refused',
+    );
 
     // A plaintext file inside an encrypted directory is refused, never read or
     // rewritten. postgresql.auto.conf is optional, so PostgreSQL logs the I/O

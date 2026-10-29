@@ -56,7 +56,7 @@ Before pglite can touch a preopen, encfs checks the `.di-encfs` marker at its ro
 | marker matches neither key | **refused** (`access`) |
 | `DI_PGLITE_KEY` missing or invalid | **refused** (`access`) |
 | data but no marker: an unencrypted directory | **refused** (`io`) |
-| integrity marker (`DIPGKEY2`, flags `0b01`) matching a key | start (or rotate) read-only, see [Integrity directories](#integrity-directories-codec-4) |
+| integrity marker (`DIPGKEY2`, flags `0b01`) matching a key | start (or rotate); file data cannot be written yet, see [Integrity directories](#integrity-directories-codec-4) |
 | integrity reservation (`DIPGKEY2`, zero KCV, flags `0b11`), no other data | **refused** (`io`): this build cannot initialise an integrity directory |
 | integrity reservation next to other data | **refused** (`io`) |
 | any other marker: another magic or length, unknown `DIPGKEY2` flags, a reservation with a KCV | **refused** (`io`, "corrupt") |
@@ -141,7 +141,7 @@ pair u = slot A ‖ slot B, each 64 bytes of metadata plus up to 8192 bytes of X
 - The authenticated durable-size watermark `D` tells a crash from tampering: a unit below `D` with no valid slot was erased and reads fail with `io`; above `D` it was lost in a crash and reads as zeros, as plaintext would.
 - Integrity failures are logged as `<path>: unit <n> has no valid slot below the durable-size watermark ...; refusing` and returned as `io`.
 
-**This release is the reader release** (section 9.3 of the design note). It reads codec-4 files and the keyed marker, rotates their keys (rewriting only the 152 header bytes and keeping the marker's flags), and reports their sizes. It cannot create an integrity directory, so a reservation locks instead of becoming an XTS directory. Every write, resize or truncating open in an integrity directory fails with `io` (`integrity (codec-4) directories are read-only in this build`), and a codec-4 file in an XTS directory, or an XTS file in an integrity directory, is refused with `io`. Builds older than this one lock both integrity markers as corrupt before they write anything. The codec-4 writer, and the platform setting that reserves directories, come with the writer release.
+**This release is the reader release** (section 9.3 of the design note). It reads codec-4 files and the keyed marker, rotates their keys (rewriting only the 152 header bytes and keeping the marker's flags), and reports their sizes. It cannot create an integrity directory, so a reservation locks instead of becoming an XTS directory. It cannot write file data in an integrity directory either: a write, a resize or a truncating open of a file there fails with `io` (`this build cannot write codec-4 file data`). Directory operations (create, mkdir, rename, unlink, symlink) pass through, so empty files can appear. A codec-4 file in an XTS directory, or an XTS file in an integrity directory, is refused with `io`. The codec-4 writer, and the platform setting that reserves directories, come with the writer release.
 
 ### Crash consistency
 

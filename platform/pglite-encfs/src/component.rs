@@ -12,9 +12,11 @@
 //!   cipher cache is filled without locking.
 //! - Each preopen's marker fixes its mode ([`Mode`]). An XTS directory holds
 //!   codec-2/3 files only; an integrity directory holds codec-4 files only
-//!   (#200). This build reads codec-4 files and refuses every write to an
-//!   integrity directory with `io`: the codec-4 writer comes in a later
-//!   release (design note section 9.3).
+//!   (#200). This build reads codec-4 files but cannot write file data in an
+//!   integrity directory: writes, resizes and truncating opens of its files
+//!   fail with `io`. Directory operations (create, mkdir, rename, unlink,
+//!   symlink) pass through. The codec-4 writer comes in the writer release
+//!   (design note section 9.3).
 
 mod bindings {
     wit_bindgen::generate!({
@@ -408,14 +410,16 @@ impl File {
         Ok(Some(cipher))
     }
 
-    /// Refuse a write this build cannot make: anything in an integrity
-    /// directory, whose files are codec 4. Logged once: the engine retries.
+    /// Refuse a write this build cannot make: file data (a write, a resize
+    /// or a truncating open) in an integrity directory, whose files are
+    /// codec 4. Directory operations are not refused. Logged once: the
+    /// engine retries.
     fn refuse_integrity_write(&self) -> ErrorCode {
         log_once(
-            "integrity-read-only",
+            "integrity-no-writer",
             &format!(
-            "{}: integrity (codec-4) directories are read-only in this build, which has no codec-4 writer; refusing the write",
-            self.path
+                "{}: this build cannot write codec-4 file data (no codec-4 writer); refusing the write",
+                self.path
             ),
         );
         ErrorCode::Io
