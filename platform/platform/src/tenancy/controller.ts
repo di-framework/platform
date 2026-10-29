@@ -924,7 +924,8 @@ export class Controller {
    * Re-queues the tenant's unplaced Workloads once a Ready host exists (#418). The upstream
    * workload controller does not watch Hosts and retries a Workload that found no host only on
    * its 30 s timer, but its Workload watch has no predicate, so a metadata change enqueues it at
-   * once. The annotation names the Ready host, so each Workload is patched once per host.
+   * once. The annotation names the set of Ready hosts, so each Workload is patched once per set
+   * and again whenever any host joins or leaves it.
    *
    * Best-effort: it never throws. A Workload that is gone (404) is skipped, and any other failure
    * is logged once per Workload and host. A host is used only once it has been Ready for
@@ -946,7 +947,8 @@ export class Controller {
         ),
       )
       .map((h) => h.metadata.uid ?? h.metadata.name)
-      .sort()[0];
+      .sort()
+      .join(',');
     if (!host) return;
     let workloads: WorkloadObject[];
     try {

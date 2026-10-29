@@ -931,6 +931,17 @@ describe('placement nudge after a tenant host becomes Ready (#418)', () => {
     expect(annotation('unplaced')).toBe('host-uid-0');
   });
 
+  it('re-nudges when another host joins the Ready set', async () => {
+    const { api, controller, t, patches, annotation } = setup();
+    await controller.reconcileTenant(t);
+    const second = structuredClone(api.objects.get(hostPath) as Resource);
+    second.metadata = { ...second.metadata, name: 'alpha-host-2', uid: 'host-uid-2' };
+    api.seed(second);
+    await controller.reconcileTenant(t);
+    expect(patches()).toHaveLength(2);
+    expect(annotation('unplaced')).toBe('host-uid-1,host-uid-2');
+  });
+
   it('patches nothing without a Ready host', async () => {
     const { controller, t, patches } = setup(false);
     await controller.reconcileTenant(t);
