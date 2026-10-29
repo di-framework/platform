@@ -361,11 +361,38 @@ jobs:
           CONTAINER_RUNTIME: docker
         run: bun test platform/platform/tests/registry-nats-smoke.test.ts
 
+  # #541 m2: the scheduler NATS broker test (design-541 section 8.2). Runs nats-server 2.12.8, pinned
+  # by digest, with the golden accounts.conf and freshly minted scheduler CAs, and checks the
+  # authorization matrix, forged certificates and reloads. Plain `bun test` skips it.
+  scheduler-nats-broker:
+    name: Scheduler NATS broker test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.3'
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run the broker test against nats-server
+        env:
+          SCHEDULER_NATS_BROKER: '1'
+          CONTAINER_RUNTIME: docker
+        run: bun test platform/platform/tests/scheduler-nats-broker.test.ts
+
   # The required check: green only when every job above is.
   build-and-test:
     name: Test
     # headlamp-plugin skips its steps, and succeeds, when a PR doesn't touch the plugin or the CRD.
-    needs: [typescript, components, headlamp-plugin, registry-nats-smoke]
+    needs: [typescript, components, headlamp-plugin, registry-nats-smoke, scheduler-nats-broker]
     # always(): a failed or cancelled job must fail this check, not skip it (a skip passes).
     if: always()
     runs-on: ubuntu-latest

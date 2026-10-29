@@ -5,6 +5,7 @@ import type * as pulumi from '@pulumi/pulumi';
 import { controllerScriptHash } from './tenancy/install';
 import { NODE_IMAGE } from './tenancy/node-image';
 import { COMPONENT, INSTALLATION, NAMESPACE_ROLE, type Resource } from './tenancy/resources';
+import { SCHEDULER_NATS_ACCOUNTS } from './tenancy/scheduler-nats';
 import {
   codeUnitOrder,
   PLATFORM_SECRETS,
@@ -43,7 +44,7 @@ export const schedulerPkiUser = (namespace: string): string =>
 
 /** The refusal of {@link schedulerPkiWritesPolicy}. */
 export const SCHEDULER_PKI_WRITES_MESSAGE =
-  'the scheduler PKI Job may write only its named Secrets and ConfigMap, of their expected types';
+  'the scheduler PKI Job may write only its named Secrets and ConfigMaps, of their expected types';
 
 /**
  * The Secret rule of {@link schedulerPkiWritesPolicy}: which Secrets the Job's ServiceAccount may
@@ -70,7 +71,8 @@ export function schedulerPkiWritesRule(namespace: string): string {
 
 /**
  * The ConfigMap rule of {@link schedulerPkiWritesPolicy}: in the PKI namespace, only the
- * ConfigMap `di-scheduler-identities`. A ConfigMap has no `type`, so this rule has a policy of
+ * ConfigMap `di-scheduler-identities`; in the platform namespace, only the ConfigMap
+ * `di-scheduler-nats-accounts` (#541 m2). A ConfigMap has no `type`, so this rule has a policy of
  * its own that matches only ConfigMaps.
  */
 export function schedulerPkiConfigMapWritesRule(namespace: string): string {
@@ -78,7 +80,9 @@ export function schedulerPkiConfigMapWritesRule(namespace: string): string {
   const named = 'has(object.metadata.name)';
   return [
     `(request.namespace == '${pki}' && ${named} &&`,
-    `  object.metadata.name == '${SCHEDULER_IDENTITIES}')`,
+    `  object.metadata.name == '${SCHEDULER_IDENTITIES}') ||`,
+    `(request.namespace == '${namespace}' && ${named} &&`,
+    `  object.metadata.name == '${SCHEDULER_NATS_ACCOUNTS}')`,
   ].join('\n');
 }
 
@@ -233,12 +237,18 @@ export function schedulerPkiBootstrap(
       },
     ]),
     ...role(namespace, [
-      { apiGroups: [''], resources: ['secrets'], verbs: ['create'] },
+      { apiGroups: [''], resources: ['secrets', 'configmaps'], verbs: ['create'] },
       {
         apiGroups: [''],
         resources: ['secrets'],
         verbs: ['get'],
         resourceNames: Object.values(PLATFORM_SECRETS).sort(codeUnitOrder),
+      },
+      {
+        apiGroups: [''],
+        resources: ['configmaps'],
+        verbs: ['get'],
+        resourceNames: [SCHEDULER_NATS_ACCOUNTS],
       },
     ]),
     {
