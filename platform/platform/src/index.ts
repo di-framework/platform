@@ -20,6 +20,7 @@ import { tenantKubeconfig } from './kubeconfig';
 import { natsPostrenderer } from './nats-log-level';
 import { installNetworkPolicy } from './network-policy';
 import { extraHostGroupsWarning, platformIngressPolicies } from './platform-ingress';
+import { installSchedulerPki, loadSchedulerPkiScripts } from './scheduler-pki-bootstrap';
 import {
   declarations,
   installTenancy,
@@ -39,6 +40,7 @@ import {
   userTokenSecretName,
   withDerivedPublicUrls,
 } from './tenancy/resources';
+import { schedulerPkiNamespace } from './tenancy/scheduler-pki';
 import { tenantAuthReadsApiKeyNamespace } from './tenant-auth-images';
 import { secretReaderFromKubeconfig } from './token-secret-reader';
 import { waitForTokenSecret } from './token-wait';
@@ -168,6 +170,8 @@ export function validatePlatformConfig(args: PlatformConfigArgs): ValidatedPlatf
   const config = args.config ?? new pulumi.Config();
   const declared = declarations(config);
   const namespace = args.namespace ?? 'wasmcloud';
+  // Throws when `<namespace>-scheduler-pki` is not a valid namespace name (#541).
+  schedulerPkiNamespace(namespace);
   const warnings: string[] = [];
   const routeUrlPattern = validateRouteUrlPattern(args.routeUrlPattern);
   const insecureRegistries = tenantInsecureRegistries({
@@ -333,6 +337,16 @@ export function createPlatform(args: PlatformArgs) {
 
   const tenantNamespaces = seedTenantNamespaces(declared.tenants, scope, provider);
 
+  // The scheduler NATS CAs, identity record and platform identities (#541), created by a one-shot
+  // Job before the release, so no key enters Pulumi state.
+  const schedulerPki = installSchedulerPki({
+    namespace: namespaceName,
+    installation: scope,
+    provider,
+    dependsOn: [namespaceResource],
+    scripts: loadSchedulerPkiScripts(),
+  });
+
   // The installation's Tenants, listed once per run with the admin kubeconfig and shared by the
   // watched namespaces (#227) and the Retain removal check (#228), in preview too, so both decide
   // from one snapshot (#245). The snapshot is built in one `apply` on the admin kubeconfig and
@@ -409,6 +423,7 @@ export function createPlatform(args: PlatformArgs) {
       provider,
       dependsOn: [
         namespaceResource,
+        schedulerPki,
         ...(registryService ? [registryService] : []),
         ...tenantNamespaces,
       ],
