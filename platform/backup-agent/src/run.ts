@@ -32,6 +32,7 @@ export interface Termination {
   /** Workload volumes (#232). */
   fileCount?: number;
   encfsKcv?: string;
+  encfsMode?: string;
   imageDigest?: string;
   replacedPath?: string;
   /** A restore that stopped part-way: the staging directory it left, relative to the root. */

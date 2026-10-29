@@ -325,6 +325,7 @@ interface JobResult {
   objectKey?: string;
   fileCount?: number;
   encfsKcv?: string;
+  encfsMode?: string;
   imageDigest?: string;
   replacedPath?: string;
   restoringPath?: string;
@@ -455,6 +456,7 @@ function scaleUp(world: World, op: Operation, jobs: JobView[]): Action[] {
           : {}),
         ...(outcome.fileCount !== undefined ? { fileCount: outcome.fileCount } : {}),
         ...(outcome.encfsKcv ? { encfsKcv: outcome.encfsKcv } : {}),
+        ...(outcome.encfsMode ? { encfsMode: outcome.encfsMode } : {}),
         ...(outcome.imageDigest ? { imageDigest: outcome.imageDigest } : {}),
         ...(outcome.replacedPath ? { replacedPath: outcome.replacedPath } : {}),
         ...(outcome.restoringPath ? { restoringPath: outcome.restoringPath } : {}),
@@ -948,6 +950,7 @@ function backupOperation(world: World, backup: BackupView): Operation {
         objectKey: result.objectKey,
         fileCount: result.fileCount,
         encfsKcv: result.encfsKcv,
+        encfsMode: result.encfsMode,
         imageDigest: result.imageDigest,
       };
     },

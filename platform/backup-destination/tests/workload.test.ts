@@ -43,6 +43,7 @@ const OK = {
   objectKey: 'di-framework/alpha/workload-volumes/identity/uid-identity/20261013T033003Z/data.tar',
   fileCount: 1767,
   encfsKcv: '00112233445566778899aabbccddeeff',
+  encfsMode: 'XTS',
   imageDigest: `sha256:${'ab'.repeat(32)}`,
 };
 
@@ -204,6 +205,7 @@ describe('cold copy of a workload volume', () => {
         stage: 'Done',
         fileCount: 1767,
         encfsKcv: OK.encfsKcv,
+        encfsMode: 'XTS',
         imageDigest: OK.imageDigest,
         scaleDownSeconds: 39,
       },

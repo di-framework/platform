@@ -23,8 +23,10 @@ import {
   runAgent,
 } from '../src/run.ts';
 import {
+  classifyDirectory,
   imageDigestOf,
-  kcvOf,
+  markerForm,
+  modeOf,
   parseManifest,
   sumsText,
   type VolumeManifest,
@@ -64,9 +66,20 @@ afterEach(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
+/**
+ * Marker byte layouts, as `pglite-encfs/src/marker.rs` writes and reads them (#200, #551):
+ * `DIPGKEY1 ‖ KCV` (24 bytes) for XTS, `DIPGKEY2 ‖ KCV ‖ 0x01` (25) for an integrity directory,
+ * and the reservation `DIPGKEY2 ‖ 16 zero bytes ‖ 0x03` the platform writes before encfs keys it.
+ */
 function marker(kcv: string): Buffer {
-  return Buffer.concat([Buffer.from('DIENCFS1'), Buffer.from(kcv, 'hex'), Buffer.alloc(8)]);
+  return Buffer.concat([Buffer.from('DIPGKEY1'), Buffer.from(kcv, 'hex')]);
 }
+
+function integrity(kcv: string, flags = 0x01): Buffer {
+  return Buffer.concat([Buffer.from('DIPGKEY2'), Buffer.from(kcv, 'hex'), Buffer.from([flags])]);
+}
+
+const RESERVATION = integrity('00'.repeat(16), 0x03);
 
 function sha(bytes: Uint8Array | string): string {
   return createHash('sha256').update(bytes).digest('hex');
@@ -210,7 +223,7 @@ describe('workload volume backup', () => {
       encfsKcv: KCV,
       imageDigest: `sha256:${'ab'.repeat(32)}`,
       objectKey: `${PREFIX}/data.tar`,
-      bytes: 8192 + 3 + 0 + 32,
+      bytes: 8192 + 3 + 0 + 24,
     });
     const manifest = await manifestAt(claim);
     expect(manifest).toMatchObject({
@@ -468,7 +481,7 @@ describe('workload volume restore', () => {
       JSON.stringify({ ...manifest, encfsKcv: null }),
     );
     expect(await runAgent(restore(), io())).toBe(1);
-    expect((await termination()).error).toBe('KcvMismatch');
+    expect((await termination()).error).toBe('ManifestInvalid');
     expect(existsSync(join(workloads, 'identity.restoring-20261014T093000Z'))).toBe(false);
   });
 
@@ -569,6 +582,7 @@ describe('workload volume restore', () => {
       throw new Error('EPERM');
     };
     await rm(join(workloads, 'identity.restoring-20261014T093000Z'), { recursive: true });
+    await writeFile(join(target, '.di-encfs'), marker(KCV));
     await writeFile(join(target, 'newer'), 'newer');
     expect(
       await runAgent(restore({ force: true, stamp: '2026-10-15T00:00:00Z' }), ownersAfterForce),
@@ -686,8 +700,6 @@ describe('workload volume restore', () => {
 
 describe('volume helpers and node io', () => {
   test('KCV, digest, sums, and manifest parsing', () => {
-    expect(kcvOf(marker(KCV))).toBe(KCV);
-    expect(() => kcvOf(Buffer.alloc(23))).toThrow('EncfsMarkerInvalid');
     expect(imageDigestOf(IMAGE)).toBe(`sha256:${'ab'.repeat(32)}`);
     expect(imageDigestOf(undefined)).toBeNull();
     expect(sumsText([{ path: 'a', size: 0, mode: 0o644, sha256: 'f'.repeat(64) }])).toBe(
@@ -698,8 +710,17 @@ describe('volume helpers and node io', () => {
       files: [{ path: 'a/b', size: 1, sha256: 'a'.repeat(64) }],
       directories: [{ path: 'a' }],
       encfsKcv: null,
+      encfsMode: 'NotEncfs',
+      encfsReservation: false,
     };
     expect(parseManifest(JSON.stringify(good))).toBeDefined();
+    for (const fine of [
+      { encfsMode: 'XTS', encfsKcv: KCV },
+      { encfsMode: 'AEAD', encfsKcv: KCV },
+      { encfsMode: 'AEAD', encfsReservation: true },
+    ]) {
+      expect(parseManifest(JSON.stringify({ ...good, ...fine }))).toBeDefined();
+    }
     for (const bad of [
       'null',
       JSON.stringify({ ...good, files: 'x' }),
@@ -711,6 +732,13 @@ describe('volume helpers and node io', () => {
       JSON.stringify({ ...good, directories: [{ path: '/etc' }] }),
       JSON.stringify({ ...good, directories: [null] }),
       JSON.stringify({ ...good, encfsKcv: 'short' }),
+      JSON.stringify({ ...good, encfsMode: undefined }),
+      JSON.stringify({ ...good, encfsMode: 'Other' }),
+      JSON.stringify({ ...good, encfsReservation: 'no' }),
+      JSON.stringify({ ...good, encfsKcv: KCV }),
+      JSON.stringify({ ...good, encfsMode: 'XTS' }),
+      JSON.stringify({ ...good, encfsReservation: true }),
+      JSON.stringify({ ...good, encfsMode: 'AEAD', encfsReservation: true, encfsKcv: KCV }),
     ]) {
       expect(parseManifest(bad)).toBeUndefined();
     }
@@ -754,3 +782,238 @@ describe('volume helpers and node io', () => {
     await expect(real.exec(['/nonexistent/tool'])).rejects.toThrow();
   });
 });
+
+describe('encfs directory modes (#553)', () => {
+  test('classifies marker bytes with exact lengths and fails closed on anything else', () => {
+    expect(markerForm(marker(KCV))).toEqual({ form: 'xts', kcv: KCV });
+    expect(markerForm(integrity(KCV))).toEqual({ form: 'integrity', kcv: KCV });
+    expect(markerForm(RESERVATION)).toEqual({ form: 'reserved' });
+    for (const bad of [
+      Buffer.alloc(0),
+      Buffer.from('short'),
+      Buffer.concat([marker(KCV), Buffer.from([0x01])]),
+      marker(KCV).subarray(0, 23),
+      Buffer.concat([Buffer.from('DIPGKEY2'), Buffer.from(KCV, 'hex')]),
+      Buffer.concat([integrity(KCV), Buffer.from([0])]),
+      Buffer.concat([Buffer.from('DIPGKEY3'), Buffer.from(KCV, 'hex'), Buffer.from([1])]),
+      integrity(KCV, 0x00),
+      integrity(KCV, 0x02),
+      integrity(KCV, 0x03),
+      integrity(KCV, 0x05),
+      integrity('00'.repeat(16), 0x01 | 0x80),
+      integrity('00'.repeat(16), 0x02),
+    ]) {
+      expect(markerForm(bad)).toEqual({ form: 'corrupt' });
+    }
+    // A zero KCV with the codec-4 bit alone is a keyed marker, not a reservation.
+    expect(markerForm(integrity('00'.repeat(16)))).toEqual({
+      form: 'integrity',
+      kcv: '00'.repeat(16),
+    });
+  });
+
+  test('classifies directories the way storage-mode does', async () => {
+    const file = (path: string) => ({ path, type: 'file' as const });
+    const dir = (path: string) => ({ path, type: 'directory' as const });
+    const of = (bytes: Uint8Array) => async () => bytes;
+    const never = async (): Promise<Uint8Array> => {
+      throw new Error('not read');
+    };
+    const cases: [Parameters<typeof classifyDirectory>[0], () => Promise<Uint8Array>, string][] = [
+      [[], never, 'empty'],
+      [[dir('lost+found'), file('lost+found/x')], never, 'empty'],
+      [[file('lost+found')], never, 'unencrypted'],
+      [[file('PG_VERSION')], never, 'unencrypted'],
+      [[file('.di-encfs'), dir('base')], of(marker(KCV)), 'xts'],
+      [[file('.di-encfs'), file('PG_VERSION')], of(integrity(KCV)), 'integrity'],
+      [[file('.di-encfs')], of(RESERVATION), 'reserved'],
+      [[dir('lost+found'), file('.di-encfs')], of(RESERVATION), 'reserved'],
+      [[file('.di-encfs'), file('PG_VERSION')], of(RESERVATION), 'corrupt'],
+      [[file('.di-encfs'), file('.di-encfs.tmp')], of(RESERVATION), 'corrupt'],
+      [[file('.di-encfs')], of(integrity(KCV, 0x07)), 'corrupt'],
+      [[{ path: '.di-encfs', type: 'symlink' }], never, 'corrupt'],
+      [[file('.di-encfs'), dir('.di-encfs.tmp')], never, 'corrupt'],
+    ];
+    for (const [entries, read, expected] of cases) {
+      expect(await classifyDirectory(entries, read)).toBe(expected as never);
+    }
+    expect(modeOf('xts')).toBe('XTS');
+    expect(modeOf('integrity')).toBe('AEAD');
+    expect(modeOf('reserved')).toBe('AEAD');
+    expect(modeOf('empty')).toBe('NotEncfs');
+    expect(modeOf('unencrypted')).toBe('NotEncfs');
+    expect(modeOf('corrupt')).toBeUndefined();
+  });
+
+  test('records the mode in the manifest for XTS, integrity, reserved, and unmarked sources', async () => {
+    const run = async () => {
+      expect(await runAgent(request(), io())).toBe(0);
+      const manifest = await manifestAt(claim);
+      return [manifest.encfsMode, manifest.encfsReservation, manifest.encfsKcv];
+    };
+    expect(await run()).toEqual(['XTS', false, KCV]);
+    expect((await termination()).encfsMode).toBe('XTS');
+    await writeFile(join(source, '.di-encfs'), integrity(KCV));
+    expect(await run()).toEqual(['AEAD', false, KCV]);
+    await rm(join(source, '.di-encfs'));
+    expect(await run()).toEqual(['NotEncfs', false, null]);
+    await rm(source, { recursive: true });
+    await mkdir(source);
+    await writeFile(join(source, '.di-encfs'), RESERVATION);
+    expect(await run()).toEqual(['AEAD', true, null]);
+    expect((await termination()).encfsKcv).toBeUndefined();
+
+    // A reservation beside data, or a marker with unknown flags, fails closed.
+    await writeFile(join(source, 'PG_VERSION'), '17\n');
+    expect(await runAgent(request(), io())).toBe(1);
+    expect((await termination()).error).toBe('EncfsMarkerInvalid');
+    await writeFile(join(source, '.di-encfs'), integrity(KCV, 0x05));
+    expect(await runAgent(request(), io())).toBe(1);
+    expect((await termination()).error).toBe('EncfsMarkerInvalid');
+  });
+
+  test('round-trips an integrity directory, also into a reserved target without force', async () => {
+    await writeFile(join(source, '.di-encfs'), integrity(KCV));
+    await backupToClaim();
+    const original = await tree(source);
+    expect(await runAgent(restore(), io())).toBe(0);
+    expect(await termination()).toMatchObject({ ok: true, encfsKcv: KCV, encfsMode: 'AEAD' });
+    expect(await tree(join(workloads, 'identity'))).toEqual(original);
+
+    // The reservation is neither data nor a key: no TargetNotEmpty, no KcvMismatch, nothing aside.
+    const target = join(workloads, 'identity');
+    await rm(target, { recursive: true });
+    await mkdir(join(target, 'lost+found'), { recursive: true });
+    await writeFile(join(target, '.di-encfs'), RESERVATION);
+    expect(await runAgent(restore(), io())).toBe(0);
+    expect((await termination()).replacedPath).toBeUndefined();
+    expect(await tree(target)).toEqual({ ...original, 'lost+found': '<dir>' });
+    expect(await readdir(workloads)).toEqual(['identity']);
+
+    // Same mode, forced over existing integrity data.
+    expect(await runAgent(restore({ force: true }), io())).toBe(0);
+    expect((await termination()).replacedPath).toBe('identity.replaced-20261014T093000Z');
+  });
+
+  test('round-trips a reservation-only directory', async () => {
+    await rm(source, { recursive: true });
+    await mkdir(source);
+    await writeFile(join(source, '.di-encfs'), RESERVATION);
+    await backupToClaim();
+    expect(await runAgent(restore(), io())).toBe(0);
+    expect(sha(await readFile(join(workloads, 'identity', '.di-encfs')))).toBe(sha(RESERVATION));
+  });
+
+  test('refuses a cross-mode restore before anything moves', async () => {
+    await backupToClaim();
+    const target = join(workloads, 'identity');
+    await mkdir(target);
+    // XTS backup over a reserved (AEAD) target, with the same KCV everywhere.
+    await writeFile(join(target, '.di-encfs'), RESERVATION);
+    const refused = io();
+    expect(await runAgent(restore({ force: true }), refused)).toBe(1);
+    expect(await termination()).toMatchObject({
+      error: 'ModeMismatch',
+      detail: 'backup is XTS, target is AEAD; a restore keeps the mode',
+    });
+    expect(refused.calls.some((argv) => argv[0] === 'tar')).toBe(false);
+    // XTS backup over an integrity directory.
+    await writeFile(join(target, '.di-encfs'), integrity(KCV));
+    await writeFile(join(target, 'PG_VERSION'), '17\n');
+    expect(await runAgent(restore({ force: true, expectedKcv: KCV }), io())).toBe(1);
+    expect((await termination()).error).toBe('ModeMismatch');
+    // XTS backup over an unmarked directory.
+    await rm(join(target, '.di-encfs'));
+    expect(await runAgent(restore({ force: true }), io())).toBe(1);
+    expect((await termination()).detail).toBe(
+      'backup is XTS, target is NotEncfs; a restore keeps the mode',
+    );
+    expect(await readFile(join(target, 'PG_VERSION'), 'utf8')).toBe('17\n');
+
+    // An integrity backup over an XTS directory.
+    await writeFile(join(source, '.di-encfs'), integrity(KCV));
+    await backupToClaim();
+    await writeFile(join(target, '.di-encfs'), marker(KCV));
+    expect(await runAgent(restore({ force: true }), io())).toBe(1);
+    expect((await termination()).detail).toBe(
+      'backup is AEAD, target is XTS; a restore keeps the mode',
+    );
+  });
+
+  test('refuses a corrupt target marker and an extracted marker that contradicts the manifest', async () => {
+    await backupToClaim();
+    const target = join(workloads, 'identity');
+    await mkdir(target);
+    await writeFile(join(target, '.di-encfs'), integrity(KCV, 0x09));
+    expect(await runAgent(restore({ force: true }), io())).toBe(1);
+    expect((await termination()).error).toBe('EncfsMarkerInvalid');
+    await rm(join(target, '.di-encfs'));
+    await symlink('/etc/passwd', join(target, '.di-encfs'));
+    expect(await runAgent(restore({ force: true }), io())).toBe(1);
+    expect((await termination()).error).toBe('EncfsMarkerInvalid');
+    await rm(target, { recursive: true });
+
+    // The manifest claims another mode than the archived marker has.
+    const manifest = await manifestAt(claim);
+    const forge = (fields: Partial<VolumeManifest>) =>
+      writeFile(join(claim, PREFIX, 'manifest.json'), JSON.stringify({ ...manifest, ...fields }));
+    await forge({ encfsMode: 'AEAD' });
+    expect(await runAgent(restore(), io())).toBe(1);
+    expect((await termination()).error).toBe('ModeMismatch');
+    expect(existsSync(join(workloads, 'identity.restoring-20261014T093000Z'))).toBe(false);
+    await forge({ encfsMode: 'AEAD', encfsReservation: true, encfsKcv: null });
+    expect(await runAgent(restore(), io())).toBe(1);
+    expect((await termination()).error).toBe('ModeMismatch');
+  });
+
+  test('refuses an archived marker that is corrupt or not the recorded reservation', async () => {
+    await rm(source, { recursive: true });
+    await mkdir(source);
+    await writeFile(join(source, '.di-encfs'), RESERVATION);
+    await backupToClaim();
+    const manifest = await manifestAt(claim);
+    const forge = (fields: Partial<VolumeManifest>) =>
+      writeFile(join(claim, PREFIX, 'manifest.json'), JSON.stringify({ ...manifest, ...fields }));
+    await forge({ encfsReservation: false, encfsKcv: KCV });
+    expect(await runAgent(restore(), io())).toBe(1);
+    expect((await termination()).error).toBe('ModeMismatch');
+
+    // Swap the archived marker for a corrupt one of the same size, with a matching manifest hash.
+    const corrupt = integrity(KCV, 0x07);
+    await writeFile(join(source, '.di-encfs'), corrupt);
+    const files = manifest.files.map((file) =>
+      file.path === '.di-encfs' ? { ...file, sha256: sha(corrupt) } : file,
+    );
+    await run([
+      'tar',
+      '--numeric-owner',
+      '-C',
+      source,
+      '-cf',
+      join(claim, PREFIX, 'data.tar'),
+      '.',
+    ]);
+    await writeFile(join(claim, PREFIX, 'SHA256SUMS'), sumsText(files));
+    await forge({ files });
+    expect(await runAgent(restore(), io())).toBe(1);
+    expect((await termination()).error).toBe('EncfsMarkerInvalid');
+  });
+
+  test('a restore target that cannot be scanned is unreadable, not empty', async () => {
+    await backupToClaim();
+    const target = join(workloads, 'identity');
+    await mkdir(target);
+    await writeFile(join(target, 'PG_VERSION'), '17\n');
+    const broken = io();
+    broken.scan = async () => {
+      throw new Error('EIO');
+    };
+    expect(await runAgent(restore({ force: true }), broken)).toBe(1);
+    expect((await termination()).error).toBe('TargetUnreadable');
+  });
+});
+
+async function run(argv: string[]): Promise<void> {
+  const result = await nodeIo().exec(argv, { env: { COPYFILE_DISABLE: '1' } });
+  expect(result.code).toBe(0);
+}

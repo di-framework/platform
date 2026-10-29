@@ -111,6 +111,7 @@ export interface VolumeOutcome {
   objectKey?: string;
   fileCount?: number;
   encfsKcv?: string;
+  encfsMode?: string;
   imageDigest?: string;
   replacedPath?: string;
   restoringPath?: string;
@@ -144,6 +145,7 @@ export interface VolumeProgress {
   objectPrefix?: string;
   fileCount?: number;
   encfsKcv?: string;
+  encfsMode?: string;
   imageDigest?: string;
   replacedPath?: string;
   restoringPath?: string;

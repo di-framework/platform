@@ -288,6 +288,7 @@ spec:
                     objectPrefix: { type: string }
                     fileCount: { type: integer }
                     encfsKcv: { type: string }
+                    encfsMode: { type: string }
                     imageDigest: { type: string }
                     replacedPath: { type: string }
 ---
@@ -383,5 +384,6 @@ spec:
                     objectPrefix: { type: string }
                     fileCount: { type: integer }
                     encfsKcv: { type: string }
+                    encfsMode: { type: string }
                     imageDigest: { type: string }
                     replacedPath: { type: string }
