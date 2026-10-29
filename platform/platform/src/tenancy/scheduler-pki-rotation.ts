@@ -144,7 +144,8 @@ export function identityTransition(
     ...(stalled ? { stalled } : {}),
   });
   if (entry.previous === undefined) return keep(entry);
-  const passed = !(now.getTime() < Date.parse(entry.previousUntil ?? ''));
+  const until = Date.parse(entry.previousUntil ?? '');
+  const passed = Number.isNaN(until) || now.getTime() >= until;
   if (observed.client === 'operator') return keep(passed ? drop(entry) : entry);
   const { rollout } = observed;
   if (rollout?.complete && rollout.digest === secret.digest) return keep(drop(entry));
