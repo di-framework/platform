@@ -384,8 +384,10 @@ later install would fail). `status.target.resyncServiceUID` holds the marker `ho
 the new vCluster has its `service/vcluster`. `status.target.resyncCause` is `HostNamespaceDeleted` for the
 whole resync (#536): while the namespace terminates and the operator creates the namespace and a new vCluster
 again, `TargetReady` is `False` with reason `Resyncing` and a message that starts `host namespace was deleted`,
-and `Ready` stays `False` with reason `HostNamespaceDeleted`. Both conditions name the cause until the
-instance is `Ready` again, which clears `resyncCause`. A resync after a deleted `service/vcluster` sets no
+and `Ready` stays `False` with reason `HostNamespaceDeleted` and the same message (a resync past its timeout
+says it is stuck there). A round that fails during the resync, such as a failed reinstall
+(`InstallFailed`), keeps its own reason and starts both messages with `host namespace was deleted`. Both
+conditions name the cause until the instance is `Ready` again, which clears `resyncCause`. A resync after a deleted `service/vcluster` sets no
 `resyncCause`; its `Ready` reason is `TargetPending`. Once that vCluster has its `service/vcluster`, the
 resync goes on under that Service's uid (see [Resync when the policy was
 bypassed](#resync-when-the-policy-was-bypassed)); there is nothing to restart, since the new vCluster's

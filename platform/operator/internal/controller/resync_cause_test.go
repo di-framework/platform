@@ -25,6 +25,58 @@ func conditionMessage(inst *v1alpha1.PlatformInstance, cond string) string {
 	return ""
 }
 
+// deleteHostNamespace holds the installed instance's host namespace and deletes it, so it stays
+// terminating until release. It returns the namespace.
+func (h *nsHarness) deleteHostNamespace() string {
+	h.t.Helper()
+	ns := h.ns()
+	h.hold()
+	if err := h.c.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+		h.t.Fatal(err)
+	}
+	return ns
+}
+
+// assertCauseNamed checks a round of a host-namespace resync before Ready: the cause recorded,
+// Ready False with it, and TargetReady naming it (as its reason in the round that sees the
+// delete, in its message after).
+func assertCauseNamed(t *testing.T, round int, inst *v1alpha1.PlatformInstance) {
+	t.Helper()
+	named := conditionReason(inst, v1alpha1.ConditionTargetReady) == vcluster.ReasonHostNamespaceDeleted ||
+		strings.Contains(conditionMessage(inst, v1alpha1.ConditionTargetReady), hostNamespaceCause)
+	if !named || inst.Status.Target.ResyncCause != vcluster.ReasonHostNamespaceDeleted ||
+		conditionReason(inst, v1alpha1.ConditionReady) != vcluster.ReasonHostNamespaceDeleted {
+		t.Fatalf("round %d lost the cause: %+v", round, inst.Status)
+	}
+}
+
+// stepUntilReady runs up to max rounds, releasing ns before round releaseAt, and calls each with
+// the instance of every round that ends not Ready. It returns whether the instance became Ready.
+func (h *nsHarness) stepUntilReady(ns string, releaseAt, max int, each func(round int, inst *v1alpha1.PlatformInstance)) bool {
+	h.t.Helper()
+	for round := 1; round <= max; round++ {
+		if round == releaseAt {
+			h.release(ns)
+		}
+		h.step()
+		inst := h.get()
+		if meta.IsStatusConditionTrue(inst.Status.Conditions, v1alpha1.ConditionReady) {
+			return true
+		}
+		each(round, inst)
+	}
+	return false
+}
+
+// assertCauseCleared checks the instance, Ready after a host-namespace resync, no longer names it.
+func assertCauseCleared(t *testing.T, inst *v1alpha1.PlatformInstance) {
+	t.Helper()
+	if inst.Status.Target.ResyncCause != "" || conditionReason(inst, v1alpha1.ConditionReady) != "Ready" ||
+		strings.Contains(conditionMessage(inst, v1alpha1.ConditionTargetReady), hostNamespaceCause) {
+		t.Fatalf("cause left after Ready: %+v", inst.Status)
+	}
+}
+
 // The cause of a host-namespace resync stays in status for every round of it (#536): the
 // rounds after the one that saw the delete report TargetReady=Resyncing, and still name the
 // host-namespace delete in TargetReady and Ready until the instance is Ready again. Ready clears
@@ -32,46 +84,97 @@ func conditionMessage(inst *v1alpha1.PlatformInstance, cond string) string {
 func TestHostNamespaceDeleteCauseStaysUntilReady(t *testing.T) {
 	h := newNSHarness(t, "")
 	h.installed()
-	ns := h.ns()
-	h.hold()
-	if err := h.c.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
-		t.Fatal(err)
-	}
+	ns := h.deleteHostNamespace()
 
-	resyncing, ready := 0, false
-	for round := 1; round <= 12; round++ {
-		if round == 4 {
-			h.release(ns)
-		}
-		h.step()
-		inst := h.get()
-		if meta.IsStatusConditionTrue(inst.Status.Conditions, v1alpha1.ConditionReady) {
-			ready = true
-			break
-		}
+	resyncing := 0
+	ready := h.stepUntilReady(ns, 4, 12, func(round int, inst *v1alpha1.PlatformInstance) {
 		if conditionReason(inst, v1alpha1.ConditionTargetReady) == vcluster.ReasonResyncing {
 			resyncing++
 		}
-		// The round that sees the delete reports it as the TargetReady reason; the later ones
-		// name it in the TargetReady message.
-		named := conditionReason(inst, v1alpha1.ConditionTargetReady) == vcluster.ReasonHostNamespaceDeleted ||
-			strings.Contains(conditionMessage(inst, v1alpha1.ConditionTargetReady), hostNamespaceCause)
-		if !named || inst.Status.Target.ResyncCause != vcluster.ReasonHostNamespaceDeleted ||
-			conditionReason(inst, v1alpha1.ConditionReady) != vcluster.ReasonHostNamespaceDeleted {
-			t.Fatalf("round %d lost the cause: %+v", round, inst.Status)
-		}
-	}
+		assertCauseNamed(t, round, inst)
+	})
 	if !ready || resyncing < 2 || len(h.errs) != 0 {
 		t.Fatalf("ready %v after %d Resyncing rounds, errors %v", ready, resyncing, h.errs)
 	}
-	inst := h.assertHostResynced(ns)
-	if inst.Status.Target.ResyncCause != "" || conditionReason(inst, v1alpha1.ConditionReady) != "Ready" ||
-		strings.Contains(conditionMessage(inst, v1alpha1.ConditionTargetReady), hostNamespaceCause) {
-		t.Fatalf("cause left after Ready: %+v", inst.Status)
+	assertCauseCleared(t, h.assertHostResynced(ns))
+	h.step()
+	if inst := h.get(); inst.Status.Target.ResyncCause != "" || len(h.in.installs) != 2 {
+		t.Fatalf("round after Ready: %d installs, status %+v", len(h.in.installs), inst.Status)
+	}
+}
+
+// A reinstall that fails during a host-namespace resync keeps the cause: Ready reports the
+// failure (InstallFailed) and names the namespace delete in its message, and the retry clears it
+// once the instance is Ready.
+func TestHostNamespaceResyncFailedInstallKeepsCause(t *testing.T) {
+	h := newNSHarness(t, "")
+	h.installed()
+	ns := h.deleteHostNamespace()
+	h.in.failInstalls = 1
+
+	failed := 0
+	ready := h.stepUntilReady(ns, 3, 12, func(round int, inst *v1alpha1.PlatformInstance) {
+		if conditionReason(inst, v1alpha1.ConditionReady) != "InstallFailed" {
+			assertCauseNamed(t, round, inst)
+			return
+		}
+		failed++
+		if inst.Status.Target.ResyncCause != vcluster.ReasonHostNamespaceDeleted ||
+			!strings.HasPrefix(conditionMessage(inst, v1alpha1.ConditionReady), hostNamespaceCause+"; ") ||
+			!strings.Contains(conditionMessage(inst, v1alpha1.ConditionTargetReady), hostNamespaceCause) {
+			t.Fatalf("round %d: failed reinstall dropped the cause: %+v", round, inst.Status)
+		}
+	})
+	if !ready || failed != 1 || len(h.errs) != 1 {
+		t.Fatalf("ready %v after %d failed rounds, errors %v", ready, failed, h.errs)
+	}
+	// The round after the failure retries the reinstall on the new vCluster.
+	inst := h.get()
+	if len(h.in.installs) != 2 || !h.in.installs[1].ReinstallRelease || inst.Status.Target != (v1alpha1.TargetStatus{ServiceUID: "svc-uid-2"}) {
+		t.Fatalf("after the retry: installs %+v, status %+v", h.in.installs, inst.Status)
+	}
+	assertCauseCleared(t, inst)
+}
+
+// An instance a host-namespace resync started under an operator that didn't record the cause
+// (an upgrade mid-resync) gets it from the host-namespace marker.
+func TestHostNamespaceResyncMarkerFillsTheCause(t *testing.T) {
+	h := newNSHarness(t, "")
+	h.installed()
+	h.deleteHostNamespace()
+	h.step()
+	inst := h.get()
+	base := inst.DeepCopy()
+	inst.Status.Target.ResyncCause = ""
+	if err := h.c.Status().Patch(context.Background(), inst, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	if h.get().Status.Target.ResyncCause != "" {
+		t.Fatal("cause not removed for the test")
 	}
 	h.step()
-	if inst = h.get(); inst.Status.Target.ResyncCause != "" || len(h.in.installs) != 2 {
-		t.Fatalf("round after Ready: %d installs, status %+v", len(h.in.installs), inst.Status)
+	inst = h.get()
+	if inst.Status.Target.ResyncServiceUID != vcluster.ResyncHostNamespace {
+		t.Fatalf("marker gone: %+v", inst.Status.Target)
+	}
+	assertCauseNamed(t, 2, inst)
+}
+
+// A host-namespace resync past its timeout reads as stuck in Ready too, with its cause.
+func TestStuckHostNamespaceResyncReadsAsStuck(t *testing.T) {
+	h := newNSHarness(t, "")
+	h.r.Target.(*vcluster.Target).ResyncTimeout = time.Minute
+	h.installed()
+	h.deleteHostNamespace()
+	h.step()
+	h.now = h.now.Add(2 * time.Minute)
+	h.step()
+	inst := h.get()
+	msg := conditionMessage(inst, v1alpha1.ConditionReady)
+	if conditionReason(inst, v1alpha1.ConditionTargetReady) != "TargetUnreachable" ||
+		conditionReason(inst, v1alpha1.ConditionReady) != vcluster.ReasonHostNamespaceDeleted ||
+		!strings.HasPrefix(msg, hostNamespaceCause+"; ") || !strings.Contains(msg, "is stuck") {
+		t.Fatalf("stuck resync: %+v", inst.Status)
 	}
 }
 
