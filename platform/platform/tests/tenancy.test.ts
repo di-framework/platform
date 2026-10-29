@@ -4,6 +4,7 @@ import {
   ApiError,
   Controller,
   collection,
+  PLACEMENT_RETRY,
   summarizeConflict,
 } from '../src/tenancy/controller';
 import {
@@ -847,5 +848,71 @@ describe('tenant and user resource reconciliation', () => {
     expect(t.metadata.finalizers).toContain(FINALIZER);
     await controller.reconcileTenant(t);
     expect(t.metadata.finalizers).not.toContain(FINALIZER);
+  });
+});
+
+describe('placement nudge after a tenant host becomes Ready (#418)', () => {
+  const workloads = '/apis/runtime.wasmcloud.dev/v1alpha1/namespaces/di-tenant-alpha/workloads';
+  function setup(hostReady = true) {
+    const { api, controller, t } = prepare();
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'Namespace',
+      metadata: {
+        name: names('alpha').namespace,
+        labels: { [INSTALLATION]: 'test', [TENANT]: 'alpha' },
+      },
+    });
+    const host = api.objects.get(
+      '/apis/runtime.wasmcloud.dev/v1alpha1/namespaces/wasmcloud/hosts/alpha-host',
+    )!;
+    host.metadata.uid = 'host-uid-1';
+    if (!hostReady)
+      host.status = { conditions: [{ type: 'Ready', status: 'False', reason: 'NotReady' }] };
+    const workload = (name: string, extra: Partial<Resource> = {}) =>
+      api.seed({
+        apiVersion: 'runtime.wasmcloud.dev/v1alpha1',
+        kind: 'Workload',
+        metadata: { name, namespace: 'di-tenant-alpha' },
+        ...extra,
+      });
+    workload('unplaced', { status: { conditions: [] } });
+    workload('placed', { status: { hostId: 'host-id' } });
+    workload('deleting', {
+      metadata: {
+        name: 'deleting',
+        namespace: 'di-tenant-alpha',
+        deletionTimestamp: '2026-01-01T00:00:00Z',
+      },
+    });
+    const patches = () =>
+      api.operations.filter((o) => o.method === 'PATCH' && o.path.startsWith(workloads));
+    return { api, controller, t, patches };
+  }
+
+  it('annotates an unplaced workload exactly once per Ready host and leaves placed ones alone', async () => {
+    const { api, controller, t, patches } = setup();
+    await controller.reconcileTenant(t);
+    expect(patches()).toEqual([{ method: 'PATCH', path: `${workloads}/unplaced` }]);
+    expect(api.objects.get(`${workloads}/unplaced`)?.metadata.annotations?.[PLACEMENT_RETRY]).toBe(
+      'host-uid-1',
+    );
+    expect(api.objects.get(`${workloads}/placed`)?.metadata.annotations).toBeUndefined();
+    // The next poll does not patch it again.
+    await controller.reconcileTenant(t);
+    expect(patches()).toHaveLength(1);
+  });
+
+  it('patches nothing without a Ready host', async () => {
+    const { controller, t, patches } = setup(false);
+    await controller.reconcileTenant(t);
+    expect(patches()).toEqual([]);
+  });
+
+  it('skips suspended tenants', async () => {
+    const { controller, t, patches } = setup();
+    t.spec.suspended = true;
+    await controller.reconcileTenant(t);
+    expect(patches()).toEqual([]);
   });
 });

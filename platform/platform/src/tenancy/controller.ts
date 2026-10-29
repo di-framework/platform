@@ -212,6 +212,8 @@ type WorkloadObject = Resource & {
   spec?: { replicas?: number };
   status?: Record<string, unknown> & { observedGeneration?: number };
 };
+/** Annotation that re-queues an unplaced Workload once its tenant has a Ready host (#418). */
+export const PLACEMENT_RETRY = 'di-framework.dev/placement-retry';
 /** The controlling owner of `value` of `kind`, as the wasmCloud operator sets it. */
 function controllerOf(value: WorkloadObject, kind: string) {
   return value.metadata.ownerReferences?.find(
@@ -912,6 +914,36 @@ export class Controller {
       );
     });
   }
+  /**
+   * Re-queues the tenant's unplaced Workloads once a Ready host exists (#418). The upstream
+   * workload controller does not watch Hosts and retries a Workload that found no host only on
+   * its 30 s timer, but its Workload watch has no predicate, so a metadata change enqueues it at
+   * once. The annotation names the Ready host, so each Workload is patched once per host.
+   */
+  private async nudgeUnplaced(namespace: string, readyHosts: Resource[]): Promise<void> {
+    const host = readyHosts.map((h) => h.metadata.uid ?? h.metadata.name).sort()[0];
+    if (!host) return;
+    const workloads = await this.list<WorkloadObject>(
+      'runtime.wasmcloud.dev/v1alpha1',
+      'Workload',
+      {},
+      namespace,
+    );
+    for (const workload of workloads) {
+      if (
+        workload.status?.hostId ||
+        workload.metadata.deletionTimestamp ||
+        workload.metadata.annotations?.[PLACEMENT_RETRY] === host
+      )
+        continue;
+      await this.api.call(
+        'PATCH',
+        location(workload),
+        { metadata: { annotations: { [PLACEMENT_RETRY]: host } } },
+        'application/merge-patch+json',
+      );
+    }
+  }
   /** How the registry workload reaches `di-nats` for {@link registryNats} (#159). */
   private static registryNatsMode(state: RegistryNats | undefined): RegistryNatsMode | undefined {
     if (!state || state.stage === 'rollout') return undefined;
@@ -1075,14 +1107,15 @@ export class Controller {
         const hosts = await this.list<Resource>('runtime.wasmcloud.dev/v1alpha1', 'Host', {
           hostgroup: n.hostgroup,
         });
-        ready =
-          hosts.filter(
-            (h) =>
-              h.environment === n.namespace &&
-              (h.status as { conditions?: Condition[] } | undefined)?.conditions?.some(
-                (c) => c.type === 'Ready' && c.status === 'True',
-              ),
-          ).length >= (tenant.spec.runtime?.replicas ?? 1);
+        const readyHosts = hosts.filter(
+          (h) =>
+            h.environment === n.namespace &&
+            (h.status as { conditions?: Condition[] } | undefined)?.conditions?.some(
+              (c) => c.type === 'Ready' && c.status === 'True',
+            ),
+        );
+        ready = readyHosts.length >= (tenant.spec.runtime?.replicas ?? 1);
+        await this.nudgeUnplaced(n.namespace, readyHosts);
       }
     } catch (error) {
       failure = error;
