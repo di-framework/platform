@@ -21,6 +21,10 @@ const CoreDNSImage = "docker.io/coredns/coredns:1.14.2@sha256:e7e6440cfd1e919280
 //     default (k8s-app=vcluster-kube-dns on 1053) is dropped by the platform's DNS egress
 //     NetworkPolicies, which allow k8s-app in (kube-dns, coredns) on port 53.
 //   - CoreDNS forwards to the host's kube-dns: KubeSolo nodes have an empty resolv.conf.
+//   - Virtual ServiceAccount tokens reach synced host pods through a host Secret per pod, not
+//     a pod annotation (sync.toHost.pods.useSecretsForSATokens, #541). By default the syncer
+//     writes each token into a vcluster.loft.sh/token-* annotation on the host pod, where
+//     anyone who can read pods in the host namespace sees it.
 //   - The proxy certificate also names the instance's Service by its .svc names, which the
 //     operator's kubeconfig uses (vCluster's own SANs stop at "<release>.<namespace>"), and
 //     127.0.0.1 and localhost for port-forwarded access.
@@ -39,6 +43,7 @@ func InstanceValues(hostDNS, hostNamespace string) (map[string]any, error) {
 		"sync": map[string]any{
 			"toHost": map[string]any{
 				"networkPolicies": map[string]any{"enabled": true},
+				"pods":            map[string]any{"useSecretsForSATokens": true},
 			},
 		},
 		"controlPlane": map[string]any{

@@ -435,7 +435,7 @@ The platform controller renders, for each Tenant, the same objects the chart ren
 |---|---|
 | Message payloads in scheduler NATS logs | **Closed.** #552 drops the flags on the chart's server. The platform-owned server runs without `-D`/`-V` (4.1). |
 | Runtime-operator Secret read beyond the namespaces it serves | **Closed.** The chart's operator watches only the platform namespace, and each tenant operator watches only its own tenant namespace, all through namespaced Roles (4.1, 4.6). No operator can read `<platform-ns>-scheduler-pki`. |
-| Virtual ServiceAccount token placement on synced pods | **Closed.** The operator's vCluster values set `sync.toHost.pods.useSecretsForSATokens: true` (`vcluster: values.yaml:46-48`; `platform/operator/internal/targets/vcluster/defaults.go:30-60`). This covers every synced pod, including the platform controller (the CA issuer) and every runtime-operator. **U**: the effect on the operator's tests and on a running instance. |
+| Virtual ServiceAccount token placement on synced pods | **Closed for every instance created by an operator release that includes this value.** It lands ahead of the other m7 work, so that it ships no later than the first operator image whose baked `@di-framework/platform` contains m1's CA key (#567 review S5). The operator's vCluster values set `sync.toHost.pods.useSecretsForSATokens: true` (vCluster 0.37.3 `values.yaml:46-48`; `platform/operator/internal/targets/vcluster/defaults.go:46`). Without it, the 0.37.3 syncer writes each virtual token into a `vcluster.loft.sh/token-*` annotation on the host pod, readable by anyone who can read pods in the host namespace. With it, the token goes into an Opaque host Secret per pod, owned by the pod, and the projected volume reads that Secret (`pkg/controllers/resources/pods/translate/translator.go:618-660`, `pkg/controllers/resources/pods/token/sa_token_secret.go:58-96` at `v0.37.3`). This covers every synced pod, including the platform controller (the CA issuer) and every runtime-operator. The values apply when the operator installs the vCluster release, so an instance created earlier keeps the annotations until it is recreated. Reading the token Secret needs host Secret read in the `pi-*` namespace, which is the parked host-RBAC class below. The operator's tests cover the rendered value and its key in the pinned chart; **U**: the effect on a running instance (Layer 3, 8.3). |
 | The shared platform key in tenant runtime namespaces and their synced copies | **Closed.** Each tenant's copy is only its own host identity (P6). |
 | CA keys in synced Secrets or in Helm manifests | **Closed.** No pod mounts a CA key, and no key is in a Helm manifest (4.5). |
 | Synced platform identities that pods must mount, and host-side RBAC in `pi-*` | **Parked for v0.2.** Host `edit`/`admin` in a `pi-*` namespace is equivalent to instance admin. |
@@ -471,7 +471,7 @@ The platform controller renders, for each Tenant, the same objects the chart ren
   - the Host lookup in the readiness check, and the certificate-digest annotation;
   - removal of the `wasmcloud-runtime-tls` copy.
 - **`platform/platform/src/platform-ingress.ts`, `tenancy.ts`.** The NATS ingress rule admits the tenant operators.
-- **`platform/operator/internal/targets/vcluster/defaults.go`.** `useSecretsForSATokens`.
+- **`platform/operator/internal/targets/vcluster/defaults.go`.** `useSecretsForSATokens` (landed early, #567 review S5).
 - **`platform/platform/README.md`.** The scheduler bus, its identities, and the per-tenant operators.
 
 No new image is built or pinned. The per-tenant operators use the upstream image the chart already uses.
@@ -665,7 +665,7 @@ These are marked **U** above. The implementation or Layer 4 must confirm them:
 2. That wash exits and restarts on a failed first connect, and how it reconnects after a certificate change (4.4).
 3. That the Pulumi Kubernetes provider awaits the bootstrap Job's completion (4.5).
 4. That Helm keeps a pod-template annotation the controller adds to `hostgroup-default` (4.5).
-5. The effect of `useSecretsForSATokens: true` on the operator's tests and on a running instance (4.9).
+5. The effect of `useSecretsForSATokens: true` on a running instance (4.9). The operator's tests pass with it.
 6. The account `limits` sizes (4.3).
 7. Option (b)'s added latency (7). This needs checking only if (b) is reconsidered.
 8. The upstream documentation statements in 2.4.
