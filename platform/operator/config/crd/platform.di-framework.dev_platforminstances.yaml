@@ -555,6 +555,12 @@ spec:
                 description: Target is what the operator recorded about the instance's
                   target cluster.
                 properties:
+                  resyncCause:
+                    description: |-
+                      ResyncCause is set while a resync that follows the loss of the target cluster is running:
+                      the reason that started it, such as HostNamespaceDeleted. The Ready and TargetReady
+                      conditions name it until the instance is Ready again, when it is cleared (#536).
+                    type: string
                   resyncServiceUID:
                     description: |-
                       ResyncServiceUID is set while a resync is running: the uid of the service/vcluster it

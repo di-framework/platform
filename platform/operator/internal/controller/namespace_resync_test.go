@@ -97,15 +97,20 @@ users:
 // stateInstaller keeps install state the way Pulumi does: it holds the credentials of the
 // cluster it was created against, and an update against a cluster with other credentials fails
 // as the refresh did in Layer 4 run 4 (#490). Uninstall drops it, unless failUninstalls is set:
-// that many Uninstall calls fail and keep it.
+// that many Uninstall calls fail and keep it. failInstalls Install calls fail likewise.
 type stateInstaller struct {
 	state          []byte
 	installs       []installer.Options
 	uninstalls     []installer.UninstallOptions
 	failUninstalls int
+	failInstalls   int
 }
 
 func (s *stateInstaller) Install(_ context.Context, req installer.Request, opts installer.Options) (installer.Result, error) {
+	if s.failInstalls > 0 {
+		s.failInstalls--
+		return installer.Result{}, errors.New("pulumi up failed")
+	}
 	if s.state != nil && !bytes.Equal(s.state, req.Kubeconfig) {
 		return installer.Result{}, errors.New(`refresh: failed to verify candidate authority certificate "kubernetes": unreachable cluster (PULUMI_K8S_DELETE_UNREACHABLE)`)
 	}
