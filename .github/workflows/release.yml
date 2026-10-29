@@ -27,8 +27,9 @@ on:
 #                   @di-framework/platform N. operator-image, operator-index and chart are the
 #                   only jobs with packages: write.
 #   project-pr      opens bot/operator-project, a PR moving main's baked install project to the
-#                   release, so the next image from main embeds it too. contents: write and
-#                   pull-requests: write, nothing else.
+#                   release (bake's files when main's project is still the tag's), so the next
+#                   image from main embeds it too. Never moves the bot PR backwards, and closes one
+#                   main has passed (#523). contents: write and pull-requests: write, nothing else.
 # The pglite wasm npm receives is the one `make smoke` tested: it is not rebuilt after the smoke
 # test, and both jobs compare its sha256 inside the packed tarball with the tested file's.
 #
@@ -55,6 +56,19 @@ jobs:
       artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
       plugin_sha256: ${{ steps.plugin.outputs.sha256 }}
     steps:
+      # Only vX.Y.Z tags release (#523). The operator image bakes the version just published, and
+      # scripts/operator-project.ts pins only X.Y.Z, so a prerelease tag would put its packages on
+      # npm and then fail at bake with no image, chart or GitHub Release. Refuse it before publish.
+      - name: Refuse a tag that is not a release version
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag $GITHUB_REF_NAME is not vX.Y.Z; prerelease and other tags are not released (nothing was published)"
+            exit 1
+          fi
+          echo "$GITHUB_REF_NAME is a release tag"
+
       # A backstop against a second Release run for a tag (#485); Auto Tag dispatches once per tag.
       # A run that failed before publishing left neither behind, so it passes. npm can take a few
       # minutes to show a new version, so this does not replace the concurrency group above.
@@ -325,6 +339,8 @@ jobs:
 
       # npm can take a few minutes to serve a version it has just published, so the bump is retried
       # (prefer-online: no cached packument). Exactly the released version: never npm's `latest`.
+      # Only exit 75 is retried (#523): npm does not serve the version yet, or the registry failed
+      # in a way a retry can fix. A refusal (exit 2) or any other failure stops at once.
       - name: Pin the baked install project to the released version
         id: bump
         env:
@@ -334,8 +350,14 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           PROJECT=platform/operator/internal/installer/project
           for attempt in $(seq 1 20); do
-            if bun scripts/operator-project.ts bump "$VERSION"; then
+            code=0
+            bun scripts/operator-project.ts bump "$VERSION" || code=$?
+            if [ "$code" = 0 ]; then
               break
+            fi
+            if [ "$code" != 75 ]; then
+              echo "::error::could not pin the operator's baked install project to @di-framework/platform@$VERSION (exit $code; not retried)"
+              exit 1
             fi
             if [ "$attempt" = 20 ]; then
               echo "::error::could not pin the operator's baked install project to @di-framework/platform@$VERSION"
@@ -455,6 +477,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The revision is the tag's commit, but the three project files differ from it: the
+      # project-sha256 label ties the image to bake's files (#523). Recompute it from the files with
+      # `(cd platform/operator/internal/installer/project && sha256sum package.json
+      # package-lock.json plugins.txt | sha256sum)`.
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -467,15 +493,17 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.bake.outputs.version }}
             org.opencontainers.image.description=di-framework platform operator (PlatformInstance controller)
+            dev.di-framework.platform-operator.project-sha256=${{ needs.bake.outputs.project_sha256 }}
           outputs: type=image,name=ghcr.io/di-framework/platform-operator,push-by-digest=true,name-canonical=true,push=true
           cache-from: type=registry,ref=ghcr.io/di-framework/platform-operator:buildcache-${{ matrix.arch }}
 
-      # Runs the pushed image on this runner's arch: it must bake the released platform from the
-      # same package.json the binary embeds.
+      # Runs the pushed image on this runner's arch: it must bake the released platform, its binary
+      # must default to it (--print-default-version, #523), and it must carry bake's project-sha256.
       - name: Check the image bakes the release
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
           VERSION: ${{ needs.bake.outputs.version }}
+          PROJECT_SHA256: ${{ needs.bake.outputs.project_sha256 }}
         run: |
           set -euo pipefail
           if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -495,7 +523,18 @@ jobs:
             echo "::error::$image bakes a package.json other than the one its binary was built with"
             exit 1
           fi
-          echo "$image bakes @di-framework/platform@$baked"
+          # The version compiled into the binary, not only the package.json beside it.
+          compiled="$(docker run --rm "$image" --print-default-version)"
+          if [ "$compiled" != "$VERSION" ]; then
+            echo "::error::$image's platform-operator defaults to @di-framework/platform@$compiled, not the release $VERSION"
+            exit 1
+          fi
+          label="$(docker image inspect --format '{{ index .Config.Labels "dev.di-framework.platform-operator.project-sha256" }}' "$image")"
+          if [[ ! "$PROJECT_SHA256" =~ ^[0-9a-f]{64}$ || "$label" != "$PROJECT_SHA256" ]]; then
+            echo "::error::$image is labelled project-sha256=$label, not bake's $PROJECT_SHA256"
+            exit 1
+          fi
+          echo "$image bakes @di-framework/platform@$baked, its binary defaults to $compiled, project-sha256=$label"
           mkdir -p "${RUNNER_TEMP}/digests"
           : > "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
 
@@ -650,8 +689,8 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::tag ${GITHUB_REF_NAME} is not v<semver>"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} is not vX.Y.Z"
             exit 1
           fi
           PACKAGE_VERSION="$(jq -er .version package.json)"
@@ -759,12 +798,18 @@ jobs:
   # Moves main's baked install project to the release, so the next operator image built from main
   # (platform-operator-image.yml) embeds and bakes it too. The PR is bot/operator-project; it is
   # opened with GITHUB_TOKEN, so a maintainer starts its CI and merges it, and that merge (a push to
-  # main changing an image input) publishes the next main image and its pin PR. Main is bumped on
-  # its own package.json, so a template change made there since the tag is kept. A main that
-  # already pins this release or a newer one is left alone.
+  # main changing an image input) publishes the next main image and its pin PR.
+  # When main's three project files are still the tag's, the PR commits bake's three files as they
+  # are, so main's next image installs exactly what the vN image does (#523). Otherwise (a template
+  # change made on main since the tag) main is bumped on its own package.json, which keeps it.
+  # It never moves backwards (#523): a main that already pins this release or a newer one gets no
+  # PR, and an open bot PR that main has passed is closed; an open bot PR that moves main to a newer
+  # release than this one is left alone (two tags close together, or "Re-run failed jobs" on an
+  # older release). The push is leased on the branch as read, so a newer release's project-pr that
+  # pushes in between is never overwritten.
   project-pr:
     name: Open the baked platform PR for main
-    needs: chart
+    needs: [bake, chart]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -787,26 +832,84 @@ jobs:
         with:
           node-version: '24.x'
 
+      - name: Download the baked install project
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: operator-project
+          path: ${{ runner.temp }}/operator-project
+
       - name: Open or update the PR
         env:
           GH_TOKEN: ${{ github.token }}
           NPM_CONFIG_PREFER_ONLINE: 'true'
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PROJECT_SHA256: ${{ needs.bake.outputs.project_sha256 }}
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           PROJECT=platform/operator/internal/installer/project
+          BAKED="${RUNNER_TEMP}/operator-project"
+          FILES=(package.json package-lock.json plugins.txt)
           branch=bot/operator-project
-          current="$(jq -er '.dependencies["@di-framework/platform"]' "$PROJECT/package.json")"
-          newest="$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -n 1)"
-          if [ "$current" = "$VERSION" ] || [ "$newest" != "$VERSION" ]; then
+          pin() { jq -er '.dependencies["@di-framework/platform"]' "$1"; }
+          # newer A B: A is a later release than B.
+          newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]; }
+          # The open bot PR (existing), the branch's commit (lease; empty when there is no branch), the
+          # release the branch moves main to (branch_pin), and that release only while a PR is open
+          # (bot_pin).
+          read_bot() {
+            existing="$(BRANCH="${branch}" gh pr list --head "${branch}" --base main --state open \
+              --json number,author,headRefName \
+              --jq 'map(select(.author.login == "app/github-actions" and .headRefName == env.BRANCH)) | .[0].number // empty')"
+            lease=''
+            branch_pin=''
+            bot_pin=''
+            if git fetch --quiet --depth=1 origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" 2>/dev/null; then
+              lease="$(git rev-parse "refs/remotes/origin/${branch}")"
+              branch_pin="$(git show "refs/remotes/origin/${branch}:${PROJECT}/package.json" | pin /dev/stdin)"
+              if [[ -n "${existing}" ]]; then bot_pin="${branch_pin}"; fi
+            fi
+          }
+          read_bot
+          current="$(pin "$PROJECT/package.json")"
+          if ! newer "$VERSION" "$current"; then
             echo "::notice::main already bakes @di-framework/platform@$current; no PR for $VERSION"
+            if [[ -n "${existing}" && -n "${bot_pin}" ]] && ! newer "$bot_pin" "$current"; then
+              gh pr close "${existing}" --delete-branch \
+                --comment "Superseded: main already bakes \`@di-framework/platform@${current}\` (${GITHUB_REF_NAME}, [run](${RUN_URL}))."
+              echo "Closed PR #${existing} (bakes ${bot_pin}): main is already at ${current}"
+            fi
             exit 0
           fi
-          bun scripts/operator-project.ts bump "$VERSION"
+          if [[ -n "${bot_pin}" ]] && newer "$bot_pin" "$VERSION"; then
+            echo "::notice::PR #${existing} already moves main to @di-framework/platform@$bot_pin, newer than $VERSION; leaving it"
+            exit 0
+          fi
+          # bake's files, as the vN image was built with them, when main's project is still the tag's
+          # (bake changed only the pin and what follows from it); otherwise main's own, bumped.
+          sum="$(cd "$BAKED" && sha256sum "${FILES[@]}" | sha256sum | cut -d' ' -f1)"
+          if [[ ! "$PROJECT_SHA256" =~ ^[0-9a-f]{64}$ || "$sum" != "$PROJECT_SHA256" ]]; then
+            echo "::error::downloaded install project ($sum) differs from the one bake pinned ($PROJECT_SHA256)"
+            exit 1
+          fi
+          git fetch --quiet --depth=1 origin "$GITHUB_SHA"
+          if git diff --quiet "$GITHUB_SHA" HEAD -- "$PROJECT"; then
+            for f in "${FILES[@]}"; do cp "$BAKED/$f" "$PROJECT/$f"; done
+            source="the files the ${GITHUB_REF_NAME} operator image was built with, unchanged (project-sha256 \`${PROJECT_SHA256}\`)"
+          else
+            echo "::notice::main's $PROJECT differs from ${GITHUB_REF_NAME}'s; bumping main's own"
+            bun scripts/operator-project.ts bump "$VERSION"
+            source="\`bun scripts/operator-project.ts bump ${VERSION}\` on main, whose project differs from ${GITHUB_REF_NAME}'s"
+          fi
           if git diff --quiet; then
             echo "::notice::main's baked install project is already at $VERSION"
             exit 0
+          fi
+          changed="$(git status --porcelain --untracked-files=all | grep -v " $PROJECT/" || true)"
+          if [ -n "$changed" ]; then
+            echo "::error::the PR would change files outside $PROJECT:"
+            echo "$changed"
+            exit 1
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -814,12 +917,21 @@ jobs:
           git switch -C "$branch"
           git add "$PROJECT"
           git commit -m "$title"
-          git push --force origin "HEAD:refs/heads/${branch}"
+          # Leased on the branch as read above (absent: it must still be absent).
+          if ! git push --force-with-lease="refs/heads/${branch}:${lease}" origin "HEAD:refs/heads/${branch}"; then
+            read_bot
+            if [[ -n "${branch_pin}" ]] && ! newer "$VERSION" "$branch_pin"; then
+              echo "::notice::${branch} moved to @di-framework/platform@$branch_pin during this run; leaving it"
+              exit 0
+            fi
+            echo "::error::could not push ${branch}"
+            exit 1
+          fi
           body="${RUNNER_TEMP}/operator-project-pr.md"
           # shellcheck disable=SC2016 # the backticks are Markdown, not expansions
           {
             echo "Release ${GITHUB_REF_NAME} published \`@di-framework/platform@${VERSION}\`, and its chart runs an operator image that bakes it ([run](${RUN_URL}))."
-            echo "This moves main's baked install project (\`${PROJECT}\`) to ${VERSION} with \`bun scripts/operator-project.ts bump ${VERSION}\`, so the next operator image built from main embeds and bakes it too (#431)."
+            echo "This moves main's baked install project (\`${PROJECT}\`) to ${VERSION}, so the next operator image built from main embeds and bakes it too (#431). The files are ${source}."
             echo
             git diff --stat HEAD~1 HEAD
             echo
@@ -829,9 +941,6 @@ jobs:
             echo 'the PR (or push a commit to the branch) to run CI. Merging it publishes the next operator'
             echo 'image from main, and that opens its pin PR.'
           } > "${body}"
-          existing="$(BRANCH="${branch}" gh pr list --head "${branch}" --base main --state open \
-            --json number,author,headRefName \
-            --jq 'map(select(.author.login == "app/github-actions" and .headRefName == env.BRANCH)) | .[0].number // empty')"
           if [[ -n "${existing}" ]]; then
             gh pr edit "${existing}" --title "${title}" --body-file "${body}"
             echo "Updated PR #${existing}"
