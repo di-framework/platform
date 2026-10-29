@@ -12,11 +12,14 @@
 //!   cipher cache is filled without locking.
 //! - Each preopen's marker fixes its mode ([`Mode`]). An XTS directory holds
 //!   codec-2/3 files only; an integrity directory holds codec-4 files only
-//!   (#200). This build reads codec-4 files but cannot write file data in an
-//!   integrity directory: writes, resizes and truncating opens of its files
-//!   fail with `io`. Directory operations (create, mkdir, rename, unlink,
-//!   symlink) pass through. The codec-4 writer comes in the writer release
-//!   (design note section 9.3).
+//!   (#200). A reservation marker in a root without data initialises an
+//!   integrity directory; nothing else, no environment variable included,
+//!   selects the mode.
+//! - Codec-4 files keep per-file state ([`FileState`], design note 6.1),
+//!   shared by every descriptor of the inode and keyed by its host identity
+//!   (`metadata-hash`) and file id. It is kept while a descriptor is open or
+//!   the file is dirty, and dropped when encfs unlinks or renames over the
+//!   inode's last name.
 
 mod bindings {
     wit_bindgen::generate!({
@@ -61,28 +64,36 @@ use crate::codec::{Codec, UnitCipher};
 use crate::file::{logical_size, EncryptedFile, FileError, Storage};
 use crate::header::{
     classify_in, FileId, Header, HeaderError, HeaderState, DEK_LEN, HEADER_LEN, HEADER_USED,
+    NONCE_LEN,
 };
 use crate::keys::{is_key_variable, Kek, KeyRing};
 use crate::marker::{
     self, Lock, Mode, RootDecision, MARKER_NAME, MARKER_READ_LEN, MARKER_TMP_NAME,
 };
 use crate::rotation;
-use crate::slots::{Layout, SlotError, SlotFile, SlotKeys};
+use crate::slots::{SlotError, SlotFile, SlotKeys};
+use crate::writer::{birth_block, Durable, FileState, IntegrityFile};
 
 type R<T> = Result<T, ErrorCode>;
 
 /// Lets a deploy check that a composed provider really contains this layer;
 /// the section survives `wac plug`, which nests the component unchanged.
-/// `write-codec=N`: the codec this build creates new files with. 3 (#206) can
-/// only be read by builds that know codec 3. Advisory: nothing parses the value
-/// yet.
+/// `write-codec=N`: the codec this build creates new files with in XTS
+/// directories. 3 (#206) can only be read by builds that know codec 3.
+/// `read-codecs=2,3,4 integrity=1`: this build reads codec 4 and creates
+/// integrity directories from a reservation (#200, design note 9.3).
+/// Advisory: nothing parses the value yet.
 #[used]
 #[link_section = "di-framework:pglite-encfs"]
-static BUILD_MARKER: [u8; 40] = if cfg!(feature = "write-codec-3") {
-    *b"format=1 codec=aes-256-xts write-codec=3"
+static BUILD_MARKER: [u8; 70] = if cfg!(feature = "write-codec-3") {
+    *b"format=1 codec=aes-256-xts write-codec=3 read-codecs=2,3,4 integrity=1"
 } else {
-    *b"format=1 codec=aes-256-xts write-codec=2"
+    *b"format=1 codec=aes-256-xts write-codec=2 read-codecs=2,3,4 integrity=1"
 };
+
+/// Not read by encfs: the platform chooses the mode with a reservation
+/// marker (design note 9.1). Its presence is only logged.
+const IGNORED_INTEGRITY_VARIABLE: &str = "DI_PGLITE_INTEGRITY";
 
 /// Write buffers that stream writers may hand over at once.
 const STREAM_WRITE_BUDGET: u64 = 1 << 20;
@@ -119,13 +130,26 @@ impl FileCipher {
 thread_local! {
     static STATE: OnceCell<Rc<State>> = const { OnceCell::new() };
     static LOGGED: RefCell<BTreeSet<&'static str>> = const { RefCell::new(BTreeSet::new()) };
+    /// The state of each codec-4 file in use, by the host identity of its
+    /// inode (design note 6.1).
+    static FILES: RefCell<BTreeMap<DirId, Rc<RefCell<FileState>>>> =
+        const { RefCell::new(BTreeMap::new()) };
 }
 
 /// Keys are read from the host environment once, on first use.
 fn state() -> Rc<State> {
     STATE.with(|cell| {
         cell.get_or_init(|| {
-            let keys = KeyRing::from_environment(henv::get_environment(), &mut |m| log(&m));
+            let environment = henv::get_environment();
+            if environment
+                .iter()
+                .any(|(name, _)| name == IGNORED_INTEGRITY_VARIABLE)
+            {
+                log(&format!(
+                    "{IGNORED_INTEGRITY_VARIABLE} is ignored: the platform chooses integrity mode with a reservation marker, never an environment variable"
+                ));
+            }
+            let keys = KeyRing::from_environment(environment, &mut |m| log(&m));
             Rc::new(State {
                 keys,
                 ciphers: RefCell::default(),
@@ -234,6 +258,13 @@ fn slot_error(path: &str, error: SlotError<hfs::ErrorCode>) -> ErrorCode {
             log(&format!("{path}: {}; refusing", integrity.describe()));
             ErrorCode::Io
         }
+        SlotError::TooLarge => ErrorCode::FileTooLarge,
+        SlotError::FailStopped => {
+            log(&format!(
+                "{path}: a host sync of this file failed earlier; refusing writes and syncs until restart"
+            ));
+            ErrorCode::Io
+        }
     }
 }
 
@@ -319,6 +350,16 @@ impl Storage for HostStorage<'_> {
     }
 }
 
+impl Durable for HostStorage<'_> {
+    fn sync_data(&self) -> Result<(), hfs::ErrorCode> {
+        self.0.sync_data()
+    }
+
+    fn sync_all(&self) -> Result<(), hfs::ErrorCode> {
+        self.0.sync()
+    }
+}
+
 fn read_header(descriptor: &hfs::Descriptor) -> Result<Vec<u8>, hfs::ErrorCode> {
     HostStorage(descriptor).read_at(0, HEADER_USED as u64)
 }
@@ -333,9 +374,38 @@ pub struct File {
     /// The mode of the preopen the file was opened under.
     mode: Mode,
     cipher: RefCell<Option<Rc<FileCipher>>>,
-    /// A codec-4 file's watermark and size, computed once: this build never
-    /// writes codec-4 files, so they cannot change under it.
-    layout: Cell<Option<Layout>>,
+    /// A codec-4 file's state, shared with every descriptor of the inode,
+    /// and the host identity it is filed under in [`FILES`].
+    state: RefCell<Option<(DirId, Rc<RefCell<FileState>>)>>,
+}
+
+impl Drop for File {
+    /// The last descriptor of a clean file drops its state (6.1); a dirty or
+    /// fail-stopped file keeps it, so no `pending` bit and no fail-stop is
+    /// lost (6.6 (c), (d)).
+    fn drop(&mut self) {
+        let Some((id, state)) = self.state.get_mut().take() else {
+            return;
+        };
+        let keep = {
+            let state = state.borrow();
+            state.is_dirty() || state.has_failed()
+        };
+        if keep {
+            return;
+        }
+        FILES.with(|files| {
+            let mut files = files.borrow_mut();
+            // Only this descriptor and the map hold it.
+            if files
+                .get(&id)
+                .is_some_and(|filed| Rc::ptr_eq(filed, &state))
+                && Rc::strong_count(&state) == 2
+            {
+                files.remove(&id);
+            }
+        });
+    }
 }
 
 impl File {
@@ -346,7 +416,7 @@ impl File {
             path,
             mode,
             cipher: RefCell::default(),
-            layout: Cell::default(),
+            state: RefCell::default(),
         }
     }
 
@@ -410,28 +480,10 @@ impl File {
         Ok(Some(cipher))
     }
 
-    /// Refuse a write this build cannot make: file data (a write, a resize
-    /// or a truncating open) in an integrity directory, whose files are
-    /// codec 4. Directory operations are not refused. Logged once: the
-    /// engine retries.
-    fn refuse_integrity_write(&self) -> ErrorCode {
-        log_once(
-            "integrity-no-writer",
-            &format!(
-                "{}: this build cannot write codec-4 file data (no codec-4 writer); refusing the write",
-                self.path
-            ),
-        );
-        ErrorCode::Io
-    }
-
     /// The XTS cipher for a write, sealing a fresh header first. The header is
     /// synced before any data can follow it, so a crash never leaves data
-    /// behind a missing header. Fails in an integrity directory.
+    /// behind a missing header.
     fn cipher_for_write(&self) -> R<Rc<FileCipher>> {
-        if self.mode == Mode::Integrity {
-            return Err(self.refuse_integrity_write());
-        }
         if let Some(cipher) = self.cipher()? {
             return Ok(cipher);
         }
@@ -456,67 +508,146 @@ impl File {
         Ok(cipher)
     }
 
-    /// A codec-4 file's watermark and logical size (design note 5.3).
-    fn layout(&self, slots: &SlotFile<HostStorage>) -> R<Layout> {
-        if let Some(layout) = self.layout.get() {
-            return Ok(layout);
+    /// The host identity of the file's inode (design note 6.1). Codec-4
+    /// state cannot be shared safely without it, so its absence is `io`.
+    fn host_id(&self) -> R<DirId> {
+        self.host.metadata_hash().map(dir_id).map_err(|error| {
+            log(&format!(
+                "{}: the host cannot identify the file ({error:?}); refusing",
+                self.path
+            ));
+            ErrorCode::Io
+        })
+    }
+
+    /// Bring a codec-4 file into existence (5.6 "Birth"): the header page
+    /// and both record pages as one 12 KiB block, record 0 sealed as
+    /// `seq = 1, D = 0`, synced before any pair is written.
+    fn birth(&self) -> R<Rc<FileCipher>> {
+        let state = state();
+        let kek = current_key(&state)?;
+        let id = self.host_id()?;
+        let file_id: FileId = random();
+        let dek = Zeroizing::new(random::<DEK_LEN>());
+        let header = Header::seal(kek, Codec::TwoSlotAead, &file_id, &dek, &random());
+        let keys = SlotKeys::derive(&dek);
+        let (block, record) = birth_block(&keys, &file_id, header.as_bytes(), &random());
+        HostStorage(&self.host).write_at(0, &block).map_err(host)?;
+        self.host.sync_data().map_err(host)?;
+        let cipher = Rc::new(FileCipher::Slots { keys, file_id });
+        state
+            .ciphers
+            .borrow_mut()
+            .insert(*header.as_bytes(), cipher.clone());
+        *self.cipher.borrow_mut() = Some(cipher.clone());
+        let filed = Rc::new(RefCell::new(FileState::born(file_id, record)));
+        FILES.with(|files| files.borrow_mut().insert(id, filed.clone()));
+        *self.state.borrow_mut() = Some((id, filed));
+        Ok(cipher)
+    }
+
+    /// The state of this codec-4 file: this descriptor's, another
+    /// descriptor's of the same inode, or read from disk (5.3).
+    fn file_state(&self, keys: &SlotKeys, file_id: FileId) -> R<Rc<RefCell<FileState>>> {
+        if let Some((_, state)) = self.state.borrow().as_ref() {
+            return Ok(state.clone());
         }
-        let layout = slots.layout().map_err(|e| slot_error(&self.path, e))?;
-        self.layout.set(Some(layout));
-        Ok(layout)
+        let id = self.host_id()?;
+        let filed = FILES
+            .with(|files| files.borrow().get(&id).cloned())
+            .filter(|state| state.borrow().file_id() == file_id);
+        let state = match filed {
+            Some(state) => state,
+            None => {
+                let storage = HostStorage(&self.host);
+                let layout = SlotFile {
+                    keys,
+                    file_id,
+                    storage: &storage,
+                }
+                .layout()
+                .map_err(|e| slot_error(&self.path, e))?;
+                let state = Rc::new(RefCell::new(FileState::loaded(file_id, layout)));
+                FILES.with(|files| files.borrow_mut().insert(id, state.clone()));
+                state
+            }
+        };
+        *self.state.borrow_mut() = Some((id, state.clone()));
+        Ok(state)
+    }
+
+    /// Run `op` on this codec-4 file through its state. `None` while the
+    /// file is fresh, unless `birth` asks to create it first.
+    fn integrity<T>(
+        &self,
+        birth: bool,
+        op: impl FnOnce(
+            &mut IntegrityFile<HostStorage, fn() -> [u8; NONCE_LEN]>,
+        ) -> Result<T, SlotError<hfs::ErrorCode>>,
+    ) -> R<Option<T>> {
+        let cipher = match self.cipher()? {
+            Some(cipher) => cipher,
+            None if birth => self.birth()?,
+            None => return Ok(None),
+        };
+        let FileCipher::Slots { keys, file_id } = &*cipher else {
+            // `cipher` refuses XTS files in an integrity directory.
+            return Err(ErrorCode::Io);
+        };
+        let state = self.file_state(keys, *file_id)?;
+        let storage = HostStorage(&self.host);
+        let mut nonces: fn() -> [u8; NONCE_LEN] = random::<NONCE_LEN>;
+        let mut state = state.borrow_mut();
+        let mut file = IntegrityFile {
+            file: SlotFile {
+                keys,
+                file_id: *file_id,
+                storage: &storage,
+            },
+            state: &mut state,
+            nonces: &mut nonces,
+            writable: self.writable(),
+        };
+        op(&mut file)
+            .map(Some)
+            .map_err(|e| slot_error(&self.path, e))
     }
 
     fn size(&self) -> R<u64> {
-        if self.mode == Mode::Xts {
+        match self.mode {
             // Length-preserving: no key needed.
-            return Ok(logical_size(self.physical_size()?));
-        }
-        match self.cipher()?.as_deref() {
-            Some(FileCipher::Slots { keys, file_id }) => {
-                let storage = HostStorage(&self.host);
-                let slots = SlotFile {
-                    keys,
-                    file_id: *file_id,
-                    storage: &storage,
-                };
-                Ok(self.layout(&slots)?.size)
-            }
-            // Fresh; `cipher` refuses XTS files here.
-            _ => Ok(0),
+            Mode::Xts => Ok(logical_size(self.physical_size()?)),
+            Mode::Integrity => Ok(self.integrity(false, |f| Ok(f.size()))?.unwrap_or(0)),
         }
     }
 
     fn read(&self, len: u64, offset: u64) -> R<(Vec<u8>, bool)> {
+        if self.mode == Mode::Integrity {
+            return Ok(self
+                .integrity(false, |f| f.read(len, offset))?
+                .unwrap_or((Vec::new(), true)));
+        }
         let Some(cipher) = self.cipher()? else {
             return Ok((Vec::new(), true));
         };
+        let FileCipher::Xts(cipher) = &*cipher else {
+            return Err(ErrorCode::Io);
+        };
         let storage = HostStorage(&self.host);
-        match &*cipher {
-            FileCipher::Xts(cipher) => EncryptedFile {
-                cipher,
-                storage: &storage,
-            }
-            .read(len, offset)
-            .map_err(|e| file_error(&self.path, e)),
-            FileCipher::Slots { keys, file_id } => {
-                let slots = SlotFile {
-                    keys,
-                    file_id: *file_id,
-                    storage: &storage,
-                };
-                let layout = self.layout(&slots)?;
-                slots
-                    .read(layout, len, offset)
-                    .map_err(|e| slot_error(&self.path, e))
-            }
+        EncryptedFile {
+            cipher,
+            storage: &storage,
         }
+        .read(len, offset)
+        .map_err(|e| file_error(&self.path, e))
     }
 
-    /// The XTS cipher of a file this build may write.
+    /// The XTS cipher of a file in an XTS directory.
     fn xts<'c>(&self, cipher: &'c FileCipher) -> R<&'c UnitCipher> {
         match cipher {
             FileCipher::Xts(cipher) => Ok(cipher),
-            FileCipher::Slots { .. } => Err(self.refuse_integrity_write()),
+            // `cipher` refuses codec-4 files in an XTS directory.
+            FileCipher::Slots { .. } => Err(ErrorCode::Io),
         }
     }
 
@@ -526,6 +657,10 @@ impl File {
         }
         if data.is_empty() {
             return Ok(0);
+        }
+        if self.mode == Mode::Integrity {
+            self.integrity(true, |f| f.write(offset, data))?;
+            return Ok(data.len() as u64);
         }
         let cipher = self.cipher_for_write()?;
         let storage = HostStorage(&self.host);
@@ -542,6 +677,10 @@ impl File {
         if !self.writable() {
             return Err(ErrorCode::BadDescriptor);
         }
+        if self.mode == Mode::Integrity {
+            self.integrity(size > 0, |f| f.set_size(size))?;
+            return Ok(());
+        }
         let cipher = match self.cipher()? {
             Some(cipher) => cipher,
             None if size == 0 => return Ok(()),
@@ -555,6 +694,61 @@ impl File {
         .set_size(size)
         .map_err(|e| file_error(&self.path, e))
     }
+
+    /// `sync` (`all`) or `sync-data`. For a codec-4 file every successful
+    /// sync, through any descriptor of the inode, clears the `pending` bits
+    /// and advances the watermark (6.3 "Sync"); a failed one stops writes
+    /// (A3). A file with no state has nothing pending.
+    fn sync(&self, all: bool) -> R<()> {
+        let passthrough = || {
+            if all {
+                self.host.sync()
+            } else {
+                self.host.sync_data()
+            }
+            .map_err(host)
+        };
+        if self.mode == Mode::Xts {
+            return passthrough();
+        }
+        let filed = match self.state.borrow().as_ref() {
+            Some((_, state)) => Some(state.clone()),
+            None => match self.cipher()?.as_deref() {
+                Some(FileCipher::Slots { file_id, .. }) => {
+                    let id = self.host_id()?;
+                    FILES
+                        .with(|files| files.borrow().get(&id).cloned())
+                        .filter(|state| state.borrow().file_id() == *file_id)
+                }
+                _ => None,
+            },
+        };
+        if filed.is_none() {
+            return passthrough();
+        }
+        self.integrity(false, |f| f.sync(all))?;
+        Ok(())
+    }
+}
+
+/// Forget the state of an inode encfs is about to remove (design note 6.1),
+/// so a reused inode number never inherits it. Only when `path` names the
+/// inode's last link: with another name left, the inode lives on.
+fn doomed_inode(dir: &hfs::Descriptor, path: &str) -> Option<DirId> {
+    let stat = dir.stat_at(hfs::PathFlags::empty(), path).ok()?;
+    (stat.type_ == hfs::DescriptorType::RegularFile && stat.link_count == 1)
+        .then(|| {
+            dir.metadata_hash_at(hfs::PathFlags::empty(), path)
+                .ok()
+                .map(dir_id)
+        })
+        .flatten()
+}
+
+fn forget_inode(id: Option<DirId>) {
+    if let Some(id) = id {
+        FILES.with(|files| files.borrow_mut().remove(&id));
+    }
 }
 
 // ------------------------------------------------------------------ preopen roots
@@ -567,9 +761,11 @@ fn open_root(dir: &hfs::Descriptor) -> Result<Mode, ErrorCode> {
     let has_data = root_has_data(dir)?;
     match marker::decide(&state.keys, marker.as_deref(), has_data) {
         RootDecision::Ready(mode) => Ok(mode),
-        RootDecision::Initialize => {
-            write_marker(dir, Mode::Xts, current_key(&state)?)?;
-            Ok(Mode::Xts)
+        // An empty root, or a reservation in a root without data: the keyed
+        // marker of that mode replaces whatever was there by rename.
+        RootDecision::Initialize(mode) => {
+            write_marker(dir, mode, current_key(&state)?)?;
+            Ok(mode)
         }
         RootDecision::Rotate(mode) => {
             let (current, previous) = (
@@ -1218,7 +1414,10 @@ impl xfs::GuestDescriptor for Descriptor {
     }
 
     fn sync_data(&self) -> R<()> {
-        self.host().sync_data().map_err(host)
+        match self {
+            Descriptor::File(file) => file.sync(false),
+            _ => self.host().sync_data().map_err(host),
+        }
     }
 
     fn get_flags(&self) -> R<xfs::DescriptorFlags> {
@@ -1264,7 +1463,10 @@ impl xfs::GuestDescriptor for Descriptor {
     }
 
     fn sync(&self) -> R<()> {
-        self.host().sync().map_err(host)
+        match self {
+            Descriptor::File(file) => file.sync(true),
+            _ => self.host().sync().map_err(host),
+        }
     }
 
     fn create_directory_at(&self, path: String) -> R<()> {
@@ -1291,10 +1493,17 @@ impl xfs::GuestDescriptor for Descriptor {
             .map(guest_stat)
             .map_err(host)?;
         if self.mode() == Mode::Integrity && stat.type_ == xfs::DescriptorType::RegularFile {
-            return Ok(xfs::DescriptorStat {
-                size: self.integrity_size_at(path_flags, &path)?,
-                ..stat
-            });
+            // A file in use: its state has the size (5.3).
+            let filed = self
+                .host()
+                .metadata_hash_at(host_path_flags(path_flags), &path)
+                .ok()
+                .and_then(|hash| FILES.with(|files| files.borrow().get(&dir_id(hash)).cloned()));
+            let size = match filed {
+                Some(state) => state.borrow().size(),
+                None => self.integrity_size_at(path_flags, &path)?,
+            };
+            return Ok(xfs::DescriptorStat { size, ..stat });
         }
         Ok(stat)
     }
@@ -1356,9 +1565,21 @@ impl xfs::GuestDescriptor for Descriptor {
         self.guard(Some(&old_path))?;
         let target = new_descriptor.get::<Descriptor>();
         target.guard(Some(&new_path))?;
+        // A rename over a codec-4 file removes that inode, unless both names
+        // are links to the same one.
+        let doomed = (target.mode() == Mode::Integrity)
+            .then(|| doomed_inode(target.host(), &new_path))
+            .flatten()
+            .filter(|&doomed| {
+                self.host()
+                    .metadata_hash_at(hfs::PathFlags::empty(), &old_path)
+                    .map_or(true, |hash| dir_id(hash) != doomed)
+            });
         self.host()
             .rename_at(&old_path, target.host(), &new_path)
-            .map_err(host)
+            .map_err(host)?;
+        forget_inode(doomed);
+        Ok(())
     }
 
     fn metadata_hash(&self) -> R<xfs::MetadataHashValue> {
@@ -1407,7 +1628,12 @@ impl xfs::GuestDescriptor for Descriptor {
 
     fn unlink_file_at(&self, path: String) -> R<()> {
         self.guard(Some(&path))?;
-        self.host().unlink_file_at(&path).map_err(host)
+        let doomed = (self.mode() == Mode::Integrity)
+            .then(|| doomed_inode(self.host(), &path))
+            .flatten();
+        self.host().unlink_file_at(&path).map_err(host)?;
+        forget_inode(doomed);
+        Ok(())
     }
 }
 

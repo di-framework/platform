@@ -8,7 +8,9 @@
 //!   during rotation), the KEK and key-check value derived from it.
 //! - [`header`]: the per-file header holding a random DEK wrapped by the KEK.
 //! - [`codec`]: AES-256-XTS over 4 KiB units (codecs 2 and 3).
-//! - [`slots`]: codec 4 (#200), two AEAD slots per 8 KiB unit; read only in this build.
+//! - [`slots`]: codec 4 (#200), two AEAD slots per 8 KiB unit: format and reads.
+//! - [`writer`]: the codec-4 write protocol and per-file state of integrity
+//!   directories.
 //! - [`file`]: logical reads, writes and resizes over the physical file.
 //! - [`marker`]: the key marker that locks a preopen before anything is touched,
 //!   and fixes its mode (XTS or integrity).
@@ -25,6 +27,10 @@ pub mod keys;
 pub mod marker;
 pub mod rotation;
 pub mod slots;
+pub mod writer;
+
+#[cfg(test)]
+mod crash_tests;
 
 #[cfg(target_arch = "wasm32")]
 mod component;

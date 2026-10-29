@@ -46,3 +46,10 @@ strip = "debuginfo"
 
 [profile.dev]
 panic = "abort"
+
+# The crash harness (src/crash_tests.rs) builds and reads tens of thousands
+# of candidate disks; unoptimised it takes many minutes.
+[profile.test]
+opt-level = 2
+debug-assertions = true
+overflow-checks = true

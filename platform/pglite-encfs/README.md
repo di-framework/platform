@@ -141,11 +141,17 @@ pair u = slot A ‖ slot B, each 64 bytes of metadata plus up to 8192 bytes of X
 - The authenticated durable-size watermark `D` tells a crash from tampering: a unit below `D` with no valid slot was erased and reads fail with `io`; above `D` it was lost in a crash and reads as zeros, as plaintext would.
 - Integrity failures are logged as `<path>: unit <n> has no valid slot below the durable-size watermark ...; refusing` and returned as `io`.
 
-**This release is the reader release** (section 9.3 of the design note). It reads codec-4 files and the keyed marker, rotates their keys (rewriting only the 152 header bytes and keeping the marker's flags), and reports their sizes. It cannot create an integrity directory, so a reservation locks instead of becoming an XTS directory. It cannot write file data in an integrity directory either: a write, a resize or a truncating open of a file there fails with `io` (`this build cannot write codec-4 file data`). Directory operations (create, mkdir, rename, unlink, symlink) pass through, so empty files can appear. A codec-4 file in an XTS directory, or an XTS file in an integrity directory, is refused with `io`. The codec-4 writer, and the platform setting that reserves directories, come with the writer release.
+This build writes codec 4 (section 9.3 of the design note). A reservation in an empty root becomes an integrity directory: the first open writes the keyed marker (flags `0b01`) with the same temporary-file and sync discipline as an XTS marker, and every file created there is codec 4. A reservation next to data that encfs did not write is refused, byte-identical. XTS directories and their defaults (codec 3 for new files, codec 2 kept) do not change.
+
+- **Write path** (section 6). Before its first write in each instance, encfs syncs the file once (W0), so the winners already on disk are durable. A write then goes to the slot that does not hold the durable version, with a generation one above the winner, and the watermark moves up only after a successful sync. A failed host write re-reads the pair and re-selects; a failed host sync marks the file failed, and its later writes and syncs return `io` until encfs restarts (fail-stop, A3).
+- **Shrink.** The watermark is lowered and the file synced around the truncation, so a truncated unit is never mistaken for an erased one.
+- **Cost.** Each 8 KiB unit takes 16512 bytes on disk (two slots with 64 bytes of metadata each). Codec 4 adds one fsync per written file per instance and one per shrink.
+- Setting `DI_PGLITE_INTEGRITY` changes nothing; encfs logs that it ignores it. Only the marker selects the mode.
+- A codec-4 file in an XTS directory, or an XTS file in an integrity directory, is refused with `io`.
 
 ### Crash consistency
 
-- **Write path.** encfs caches nothing. Each logical write becomes one host `pwrite`, after a read-modify-write of a partial first or last unit, and `sync`/`sync-data` pass straight through. PostgreSQL's fsync ordering is therefore preserved.
+- **Write path.** In an XTS directory encfs caches nothing. Each logical write becomes one host `pwrite`, after a read-modify-write of a partial first or last unit, and `sync`/`sync-data` pass straight through. PostgreSQL's fsync ordering is therefore preserved.
 - **Torn writes, whole blocks.** XTS encrypts each 16-byte block independently and deterministically. A write of whole 16-byte blocks torn at a sector boundary therefore decrypts to old sectors followed by new sectors, which is exactly what PostgreSQL expects from a plain disk. Relation and WAL I/O is always in whole 8 KiB pages.
   - Already-durable WAL records keep identical ciphertext when the WAL tail page is rewritten.
   - `make smoke` checks three power-loss tears; in each, the fsynced commit survives:

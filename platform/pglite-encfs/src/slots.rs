@@ -1,8 +1,8 @@
-//! Codec 4 (#200): two XChaCha20-Poly1305 slots per 8 KiB unit, read side.
+//! Codec 4 (#200): two XChaCha20-Poly1305 slots per 8 KiB unit: the format,
+//! sealing and the read side. The write protocol is [`crate::writer`].
 //!
 //! The design is `docs/design-200-two-slot-aead.md`; section numbers below
-//! refer to it. This build reads codec-4 files and never writes them (the
-//! reader release of section 9.3); the writer comes in a later release.
+//! refer to it.
 //!
 //! Physical layout (5.1, 5.2):
 //!
@@ -41,7 +41,7 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::file::Storage;
-use crate::header::{FileId, DEK_LEN, HEADER_LEN};
+use crate::header::{FileId, DEK_LEN, HEADER_LEN, NONCE_LEN};
 use crate::keys::HKDF_SALT;
 
 /// Logical bytes per unit: PostgreSQL's `BLCKSZ` (Q1).
@@ -85,7 +85,7 @@ pub enum Slot {
 }
 
 impl Slot {
-    fn other(self) -> Slot {
+    pub fn other(self) -> Slot {
         match self {
             Slot::A => Slot::B,
             Slot::B => Slot::A,
@@ -178,14 +178,14 @@ fn claimed_generation(bytes: &[u8]) -> u64 {
 }
 
 /// A slot that authenticated: its generation and plaintext.
-struct Opened {
-    generation: u64,
-    plain: Vec<u8>,
+pub(crate) struct Opened {
+    pub generation: u64,
+    pub plain: Vec<u8>,
 }
 
 /// Verify one slot (5.5). `bytes` is what the host file holds from the slot's
 /// start, cut at the end of the file.
-fn open_slot(
+pub(crate) fn open_slot(
     keys: &SlotKeys,
     file_id: &FileId,
     unit: u64,
@@ -220,6 +220,13 @@ pub enum Integrity {
     NoWatermark,
     /// Both watermark records are valid with the same `seq` (5.6).
     EqualWatermarks,
+    /// A winner this instance authenticated or wrote no longer verifies: the
+    /// volume changed under encfs (6.6 (a)).
+    Changed { unit: u64 },
+    /// A write would need generation `u64::MAX + 1` (5.2).
+    GenerationExhausted { unit: u64 },
+    /// A watermark record would need `seq = u64::MAX + 1` (5.2).
+    SequenceExhausted,
 }
 
 impl Integrity {
@@ -239,6 +246,15 @@ impl Integrity {
                 "both durable-size watermark records are valid with the same sequence (tampered)"
                     .to_string()
             }
+            Integrity::Changed { unit } => format!(
+                "unit {unit} no longer authenticates although this instance verified or wrote it (the volume changed under encfs)"
+            ),
+            Integrity::GenerationExhausted { unit } => {
+                format!("unit {unit} has no generation left to write")
+            }
+            Integrity::SequenceExhausted => {
+                "the durable-size watermark has no sequence number left to write".to_string()
+            }
         }
     }
 }
@@ -247,6 +263,12 @@ impl Integrity {
 pub enum SlotError<E> {
     Storage(E),
     Integrity(Integrity),
+    /// The write would pass [`crate::file::MAX_SIZE`] or zero-fill more than
+    /// [`crate::file::MAX_GAP`].
+    TooLarge,
+    /// A host sync of the file failed in this instance: writes and syncs are
+    /// refused until it restarts (A3, 6.5).
+    FailStopped,
 }
 
 impl<E> From<E> for SlotError<E> {
@@ -349,6 +371,8 @@ pub struct Layout {
     pub durable_units: u64,
     /// The logical size (5.3).
     pub size: u64,
+    /// The winning watermark record; `None` for an interrupted birth (C8a).
+    pub record: Option<Watermark>,
 }
 
 /// An open codec-4 file.
@@ -359,13 +383,13 @@ pub struct SlotFile<'a, S: Storage> {
 }
 
 impl<S: Storage> SlotFile<'_, S> {
-    fn read_pairs(&self, first: u64, count: u64) -> SlotResult<Vec<u8>, S::Error> {
+    pub fn read_pairs(&self, first: u64, count: u64) -> SlotResult<Vec<u8>, S::Error> {
         Ok(self
             .storage
             .read_at(slot_offset(first, Slot::A), count * PAIR_LEN)?)
     }
 
-    fn select(&self, unit: u64, pair: &[u8]) -> SlotResult<Option<Winner>, S::Error> {
+    pub fn select(&self, unit: u64, pair: &[u8]) -> SlotResult<Option<Winner>, S::Error> {
         select(self.keys, &self.file_id, unit, pair).map_err(SlotError::Integrity)
     }
 
@@ -374,31 +398,34 @@ impl<S: Storage> SlotFile<'_, S> {
         let physical = self.storage.size()?;
         let span = RECORD_AT[1] - RECORD_AT[0] + RECORD_LEN as u64;
         let pages = self.storage.read_at(RECORD_AT[0], span)?;
-        let durable_units = match select_watermark(self.keys, &self.file_id, &pages) {
-            Ok(Some(watermark)) => watermark.durable_units,
+        let record = match select_watermark(self.keys, &self.file_id, &pages) {
+            Ok(Some(watermark)) => Some(watermark),
             // An interrupted birth: no pair can exist yet (C8a).
-            Ok(None) if physical <= PAIRS_START => 0,
+            Ok(None) if physical <= PAIRS_START => None,
             Ok(None) => return Err(SlotError::Integrity(Integrity::NoWatermark)),
             Err(integrity) => return Err(SlotError::Integrity(integrity)),
         };
+        let durable_units = record.map_or(0, |r| r.durable_units);
+        Ok(Layout {
+            durable_units,
+            size: self.size_below(physical, durable_units)?,
+            record,
+        })
+    }
+
+    /// The logical size of a file of `physical` bytes under the watermark
+    /// `durable_units` (5.3): walk back from the last pair present.
+    pub fn size_below(&self, physical: u64, durable_units: u64) -> SlotResult<u64, S::Error> {
         for unit in (0..pairs_present(physical)).rev() {
             let pair = self.read_pairs(unit, 1)?;
             match self.select(unit, &pair)? {
-                Some(winner) => {
-                    return Ok(Layout {
-                        durable_units,
-                        size: unit * UNIT + winner.plain.len() as u64,
-                    })
-                }
+                Some(winner) => return Ok(unit * UNIT + winner.plain.len() as u64),
                 // A trailing pair of an unsynced extension (C7, C14).
                 None if unit >= durable_units => {}
                 None => return Err(SlotError::Integrity(Integrity::Erased { unit })),
             }
         }
-        Ok(Layout {
-            durable_units,
-            size: 0,
-        })
+        Ok(0)
     }
 
     /// Read up to `len` bytes at `offset` of a file with `layout`, with one
@@ -438,57 +465,56 @@ impl<S: Storage> SlotFile<'_, S> {
     }
 }
 
-/// Test-only writer helpers: they build codec-4 images for the reader's
-/// tests and fixtures. This build ships no codec-4 writer.
+fn seal(cipher: &XChaCha20Poly1305, head: &mut [u8], aad: &[u8], body: &mut [u8]) {
+    let tag = cipher
+        .encrypt_in_place_detached(XNonce::from_slice(&head[NONCE]), aad, body)
+        .expect("XChaCha20-Poly1305 seals any unit");
+    head[TAG].copy_from_slice(&tag);
+}
+
+/// The `64 + len` bytes of `slot` of `unit` holding `plain` (5.2, W4).
+pub(crate) fn seal_slot(
+    keys: &SlotKeys,
+    file_id: &FileId,
+    unit: u64,
+    slot: Slot,
+    generation: u64,
+    plain: &[u8],
+    nonce: &[u8; NONCE_LEN],
+) -> Vec<u8> {
+    let mut head = [0u8; SLOT_HEADER];
+    head[COUNTER].copy_from_slice(&generation.to_le_bytes());
+    head[SLOT_LEN_FIELD].copy_from_slice(&(plain.len() as u32).to_le_bytes());
+    head[NONCE].copy_from_slice(nonce);
+    let mut body = plain.to_vec();
+    let aad = aad(SLOT_DOMAIN, file_id, &slot_position(unit, slot), &head);
+    seal(&keys.slots, &mut head, &aad, &mut body);
+    [&head[..], &body].concat()
+}
+
+/// The 64 bytes of watermark record `index` (5.6).
+pub(crate) fn seal_record(
+    keys: &SlotKeys,
+    file_id: &FileId,
+    index: u8,
+    seq: u64,
+    durable_units: u64,
+    nonce: &[u8; NONCE_LEN],
+) -> [u8; RECORD_LEN] {
+    let mut record = [0u8; RECORD_LEN];
+    record[COUNTER].copy_from_slice(&seq.to_le_bytes());
+    record[DURABLE_UNITS].copy_from_slice(&durable_units.to_le_bytes());
+    record[NONCE].copy_from_slice(nonce);
+    let aad = aad(RECORD_DOMAIN, file_id, &[index], &record);
+    seal(&keys.records, &mut record, &aad, &mut []);
+    record
+}
+
+/// Test-only image helpers: they build codec-4 files byte by byte for the
+/// reader's tests and fixtures, independently of the write protocol.
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
-    use crate::header::NONCE_LEN;
-
-    fn seal(cipher: &XChaCha20Poly1305, head: &mut [u8], aad: &[u8], body: &mut [u8]) {
-        let tag = cipher
-            .encrypt_in_place_detached(XNonce::from_slice(&head[NONCE]), aad, body)
-            .expect("XChaCha20-Poly1305 seals any unit");
-        head[TAG].copy_from_slice(&tag);
-    }
-
-    /// The `64 + len` bytes of a slot holding `plain`.
-    pub fn seal_slot(
-        keys: &SlotKeys,
-        file_id: &FileId,
-        unit: u64,
-        slot: Slot,
-        generation: u64,
-        plain: &[u8],
-        nonce: &[u8; NONCE_LEN],
-    ) -> Vec<u8> {
-        let mut head = [0u8; SLOT_HEADER];
-        head[COUNTER].copy_from_slice(&generation.to_le_bytes());
-        head[SLOT_LEN_FIELD].copy_from_slice(&(plain.len() as u32).to_le_bytes());
-        head[NONCE].copy_from_slice(nonce);
-        let mut body = plain.to_vec();
-        let aad = aad(SLOT_DOMAIN, file_id, &slot_position(unit, slot), &head);
-        seal(&keys.slots, &mut head, &aad, &mut body);
-        [&head[..], &body].concat()
-    }
-
-    /// The 64 bytes of watermark record `index`.
-    pub fn seal_record(
-        keys: &SlotKeys,
-        file_id: &FileId,
-        index: u8,
-        seq: u64,
-        durable_units: u64,
-        nonce: &[u8; NONCE_LEN],
-    ) -> [u8; RECORD_LEN] {
-        let mut record = [0u8; RECORD_LEN];
-        record[COUNTER].copy_from_slice(&seq.to_le_bytes());
-        record[DURABLE_UNITS].copy_from_slice(&durable_units.to_le_bytes());
-        record[NONCE].copy_from_slice(nonce);
-        let aad = aad(RECORD_DOMAIN, file_id, &[index], &record);
-        seal(&keys.records, &mut record, &aad, &mut []);
-        record
-    }
 
     /// A physical codec-4 file under construction, with a deterministic nonce
     /// per seal.
@@ -930,7 +956,12 @@ mod tests {
             layout,
             Layout {
                 durable_units: 3,
-                size: data.len() as u64
+                size: data.len() as u64,
+                record: Some(Watermark {
+                    record: 1,
+                    seq: 2,
+                    durable_units: 3
+                }),
             }
         );
         assert_eq!(f.read(layout, 0, 5).unwrap(), (vec![], false));
@@ -962,7 +993,8 @@ mod tests {
                 f.layout(),
                 Ok(Layout {
                     durable_units: 0,
-                    size: 0
+                    size: 0,
+                    record: None,
                 }),
                 "{physical}"
             );
@@ -1132,7 +1164,12 @@ mod tests {
             layout,
             Layout {
                 durable_units: 2,
-                size: 3 * 8192 + 1000
+                size: 3 * 8192 + 1000,
+                record: Some(Watermark {
+                    record: 1,
+                    seq: 2,
+                    durable_units: 2
+                }),
             }
         );
         assert_eq!(f.read(layout, layout.size, 0).unwrap(), (plain, true));
@@ -1192,6 +1229,7 @@ mod tests {
         let layout = Layout {
             durable_units: 0,
             size: 10,
+            record: None,
         };
         assert_eq!(f.read(layout, 5, 0), Err(SlotError::Storage("read failed")));
     }
