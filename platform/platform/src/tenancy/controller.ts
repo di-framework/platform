@@ -1183,7 +1183,24 @@ export class Controller {
               (c) => c.type === 'Ready' && c.status === 'True',
             ),
         );
-        await this.nudgeUnplaced(n.namespace, readyHosts);
+        // A Host whose pod is terminating or gone is never a nudge target: the upstream
+        // scheduler would place Workloads on a host that is about to stop (#418).
+        const pods = await this.list<Resource>(
+          'v1',
+          'Pod',
+          { 'wasmcloud.com/hostgroup': n.hostgroup },
+          n.runtimeNamespace,
+        );
+        const liveIps = new Set(
+          pods.flatMap((p) => {
+            const ip = (p.status as { podIP?: string } | undefined)?.podIP;
+            return ip && !p.metadata.deletionTimestamp ? [ip] : [];
+          }),
+        );
+        await this.nudgeUnplaced(
+          n.namespace,
+          readyHosts.filter((h) => liveIps.has(h.hostname as string)),
+        );
         ready &&= readyHosts.length >= (tenant.spec.runtime?.replicas ?? 1);
       } catch (error) {
         // Reported only when it decides readiness; a tenant that is not ready yet waits anyway.

@@ -454,6 +454,13 @@ describe('tenant and user resource reconciliation', () => {
     expect(text).toContain('--environment=di-tenant-alpha');
     expect(text).toContain('--socket-egress=enforce');
     expect(text).toContain('nats://di-nats.di-runtime-alpha.svc.cluster.local:4222');
+    // wash (PID 1) handles only SIGINT; the preStop stops it at once on a pod delete (#418).
+    const container = (
+      host.spec as { template: { spec: { containers: Record<string, unknown>[] } } }
+    ).template.spec.containers.find((c) => c.name === 'host');
+    expect(container?.lifecycle).toEqual({
+      preStop: { exec: { command: ['/bin/kill', '-INT', '1'] } },
+    });
     const appRoles = resources.filter(
       (r) => r.kind === 'Role' && r.metadata.namespace === 'di-tenant-alpha',
     );
@@ -866,6 +873,10 @@ describe('placement nudge after a tenant host becomes Ready (#418)', () => {
     });
     const host = api.objects.get(hostPath)!;
     host.metadata.uid = 'host-uid-1';
+    host.hostname = '10.0.0.1';
+    const pod = (name: string, ip: string, terminating = false) =>
+      api.seed({ ...hostPod(name, 'alpha', { terminating }), status: { podIP: ip } });
+    pod('host-pod-1', '10.0.0.1');
     if (!hostReady)
       host.status = { conditions: [{ type: 'Ready', status: 'False', reason: 'NotReady' }] };
     const workload = (name: string, extra: Partial<Resource> = {}) =>
@@ -907,7 +918,7 @@ describe('placement nudge after a tenant host becomes Ready (#418)', () => {
         },
       );
     };
-    return { api, controller, t, workload, patches, annotation, reason, failing };
+    return { api, controller, t, workload, pod, patches, annotation, reason, failing };
   }
 
   it('annotates an unplaced workload exactly once per Ready host and leaves placed ones alone', async () => {
@@ -940,6 +951,30 @@ describe('placement nudge after a tenant host becomes Ready (#418)', () => {
     await controller.reconcileTenant(t);
     expect(patches()).toHaveLength(2);
     expect(annotation('unplaced')).toBe('host-uid-1,host-uid-2');
+  });
+
+  it('leaves a Ready host out of the nudge while its pod is terminating (#418)', async () => {
+    const { api, controller, t, pod, patches, annotation } = setup();
+    pod('host-pod-1', '10.0.0.1', true);
+    await controller.reconcileTenant(t);
+    expect(patches()).toEqual([]);
+    // Its replacement's host is nudged alone once Ready.
+    const next = structuredClone(api.objects.get(hostPath) as Resource);
+    next.metadata = { ...next.metadata, name: 'alpha-host-2', uid: 'host-uid-2' };
+    next.hostname = '10.0.0.2';
+    api.seed(next);
+    pod('host-pod-2', '10.0.0.2');
+    await controller.reconcileTenant(t);
+    expect(annotation('unplaced')).toBe('host-uid-2');
+  });
+
+  it('leaves a Ready host out of the nudge when no pod has its IP', async () => {
+    const { api, controller, t, patches } = setup();
+    api.objects.delete(`${collection('v1', 'Pod', names('alpha').runtimeNamespace)}/host-pod-1`);
+    // A pod without an IP yet matches no host either.
+    api.seed(hostPod('host-pod-3', 'alpha'));
+    await controller.reconcileTenant(t);
+    expect(patches()).toEqual([]);
   });
 
   it('patches nothing without a Ready host', async () => {

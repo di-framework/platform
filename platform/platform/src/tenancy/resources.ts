@@ -1586,6 +1586,10 @@ function tenantResources(
                   ],
                   ports: [{ name: 'http', containerPort: 9191 }],
                   readinessProbe: { tcpSocket: { port: 'http' }, initialDelaySeconds: 5 },
+                  // wash is PID 1 and only handles SIGINT, so it ignores the kubelet's SIGTERM and
+                  // keeps heartbeating (re-registering its Host) for the whole grace period. This
+                  // stops it at once when the pod is deleted (#418).
+                  lifecycle: { preStop: { exec: { command: ['/bin/kill', '-INT', '1'] } } },
                   resources: {
                     requests: { cpu: '250m', memory: '256Mi' },
                     limits: { cpu: '1', memory: '2Gi' },
