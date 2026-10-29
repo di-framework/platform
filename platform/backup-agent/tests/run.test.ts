@@ -155,6 +155,12 @@ describe('termination and request parsing', () => {
       destinationType: 'pvc',
       pvcMountPath: '/mnt/backup',
     });
+    expect(pvc).toMatchObject({ targetModes: undefined });
+    const modes = parseRequest({
+      BACKUP_KIND: 'restore-workload-volume',
+      BACKUP_TARGET_MODES: 'XTS,AEAD',
+    });
+    expect(modes).toMatchObject({ targetModes: ['XTS', 'AEAD'] });
   });
 
   test('rclone env enables path-style only when an endpoint is set', () => {

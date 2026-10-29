@@ -609,6 +609,12 @@ export async function restoreVolume(io: AgentIo, request: AgentRequest): Promise
       detail: `backup is ${manifest.encfsMode}, target is ${targetMode}; a restore keeps the mode`,
     });
   }
+  // The storage record decides too: a directory that contradicts it is not restored into.
+  if (prior.found !== 'empty' && request.targetModes && !request.targetModes.includes(targetMode)) {
+    return fail('ModeMismatch', {
+      detail: `target is ${targetMode}, its storage record accepts ${request.targetModes.join(' or ')}`,
+    });
+  }
   if (request.expectedKcv && manifest.encfsKcv !== request.expectedKcv) return fail('KcvMismatch');
   // Replacing data encrypted under one key with data under another would leave the workload
   // unable to open it. Only an explicit expectedKcv may change the key.

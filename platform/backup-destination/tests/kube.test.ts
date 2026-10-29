@@ -86,7 +86,27 @@ const routes = new Map<string, unknown>([
   ],
   [
     '/apis/apps/v1/namespaces/di-runtime-alpha/deployments/hostgroup-tenant-alpha',
-    { metadata: { labels: { 'platform.di-framework.dev/owner-uid': TENANT_UID } } },
+    {
+      metadata: {
+        labels: {
+          'platform.di-framework.dev/installation': 'di',
+          'platform.di-framework.dev/owner-uid': TENANT_UID,
+        },
+      },
+    },
+  ],
+  // The platform controller's storage records (#553), with its labels.
+  [
+    '/api/v1/namespaces/di-runtime-alpha/configmaps/di-storage-records',
+    {
+      metadata: {
+        labels: {
+          'platform.di-framework.dev/installation': 'di',
+          'platform.di-framework.dev/owner-uid': TENANT_UID,
+        },
+      },
+      data: { keys: JSON.stringify({ identity: { kind: 'PgliteEncfs', requested: 'Off' } }) },
+    },
   ],
   // W6: a ledger in the tenant namespace (an earlier build's, or one a tenant user forged) is
   // never read; only the runtime namespace's counts.
@@ -304,6 +324,10 @@ describe('loading workload volume state', () => {
       { name: 'host-new', node: undefined, ready: false, hostPaths: [] },
     ]);
     expect(loaded.tenantUid).toBe(TENANT_UID);
+    expect(loaded.storageRecords).toEqual({
+      state: 'present',
+      keys: { identity: { kind: 'PgliteEncfs', requested: 'Off' } },
+    });
     expect(loaded.storageRoot).toBe('/var/lib/kubesolo');
     expect(loaded.backups[0]).toMatchObject({
       source: { kind: 'workload-volume', workloadName: 'identity' },
@@ -398,6 +422,7 @@ describe('loading workload volume state', () => {
       '/workloads',
       '/deployments/hostgroup',
       `/configmaps/${LEDGER}`,
+      '/configmaps/di-storage-records',
     ]) {
       for (const error of [
         new KubeError(503, 'unavailable'),
@@ -407,6 +432,7 @@ describe('loading workload volume state', () => {
         const loaded = await loadWorld(failing(fragment, error), 'di-tenant-alpha', 'i', NOW);
         expect(loaded.workloads).toBeUndefined();
         expect(loaded.ledger).toBeUndefined();
+        expect(loaded.storageRecords).toBeUndefined();
         // Services are still backed up: the rest of the world loads.
         expect(loaded.backups).toHaveLength(2);
       }
@@ -427,6 +453,17 @@ describe('loading workload volume state', () => {
     );
     expect(noHost.workloads).toHaveLength(3);
     expect(noHost.tenantUid).toBeUndefined();
+    // Without the host Deployment's labels, records cannot be tied to the controller.
+    expect(noHost.storageRecords?.state).toBe('untrusted');
+    // An older controller writes no records: the check is skipped, not failed.
+    const noRecords = await loadWorld(
+      failing('/configmaps/di-storage-records', new KubeError(404, 'not found')),
+      'di-tenant-alpha',
+      'i',
+      NOW,
+    );
+    expect(noRecords.storageRecords).toEqual({ state: 'absent' });
+    expect(noRecords.workloads).toHaveLength(3);
     // A list the rest of the world needs still fails the whole tick.
     await expect(
       loadWorld(failing('/backups', new KubeError(500, 'down')), 'di-tenant-alpha', 'i', NOW),

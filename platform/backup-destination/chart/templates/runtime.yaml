@@ -34,6 +34,12 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create"]
+  # The platform controller's copy of the Tenant's storage records (#553): a restore is checked
+  # against the target key's recorded encfs mode before anything stops. Read-only, one name.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["di-storage-records"]
+    verbs: ["get"]
   # Events on that ledger (#254): an entry the sweeper drops without scaling, or gives back
   # after its destination is gone, is reported here, where tenant roles read events.
   - apiGroups: [""]

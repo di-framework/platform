@@ -66,6 +66,11 @@ export interface AgentRequest {
   force?: boolean;
   /** The KCV the restored marker must carry, when the operator names one. */
   expectedKcv?: string;
+  /**
+   * restore-workload-volume: the on-disk modes the target may have, from the operator's check
+   * of the platform's storage records (#553). Unset: the target must have the backup's mode.
+   */
+  targetModes?: string[];
   /** probe-placement: directories that must exist on this node, `:`-separated. */
   probePaths?: string;
 }
@@ -187,6 +192,7 @@ export function parseRequest(env: Record<string, string | undefined>): AgentRequ
     targetRoot: env.BACKUP_TARGET_ROOT,
     force: env.BACKUP_FORCE === 'true',
     expectedKcv: env.BACKUP_EXPECTED_KCV || undefined,
+    targetModes: env.BACKUP_TARGET_MODES ? env.BACKUP_TARGET_MODES.split(',') : undefined,
     probePaths: env.BACKUP_PROBE_PATHS,
   };
 }

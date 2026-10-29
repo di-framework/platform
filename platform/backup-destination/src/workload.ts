@@ -35,6 +35,7 @@ import {
 } from './model.ts';
 import { destinationParts } from './reconcile.ts';
 import { isDue, previousFire, validCron } from './schedule.ts';
+import { acceptedModes, type EncfsMode, STORAGE_RECORDS } from './storage-records.ts';
 
 /**
  * Cold copies of tenant workload volumes (#232).
@@ -64,7 +65,8 @@ interface Resolved {
   uid: string;
 }
 
-type Problem = { reason: string; message: string };
+/** Why an operation does not start. `wait`: not terminal, checked again on the next tick. */
+type Problem = { reason: string; message: string; wait?: boolean };
 
 /**
  * A WorkloadDeployment the platform owns (#83): the tenant registry, or anything labelled as a
@@ -1050,6 +1052,9 @@ function restoreOperation(world: World, restore: RestoreView): Operation {
           ...(restore.expectedKcv
             ? [{ name: 'BACKUP_EXPECTED_KCV', value: restore.expectedKcv }]
             : []),
+          ...(volume.targetModes
+            ? [{ name: 'BACKUP_TARGET_MODES', value: volume.targetModes.join(',') }]
+            : []),
         ],
       }),
     probe: () =>
@@ -1229,10 +1234,16 @@ export function releaseOrphans(world: World): Action[] {
 
 function begin(
   world: World,
-  view: { name: string; objectUid?: string; finalizers?: string[]; resourceVersion?: string },
+  view: {
+    name: string;
+    objectUid?: string;
+    finalizers?: string[];
+    resourceVersion?: string;
+    reason?: string;
+  },
   build: (volume: VolumeProgress) => Operation,
   extra: (resolved: Resolved) => Partial<VolumeProgress>,
-  check?: () => Problem | undefined,
+  check?: (resolved: Resolved) => Problem | undefined,
 ): Action[] {
   const shell = build({});
   const name = shell.workloadName;
@@ -1250,7 +1261,13 @@ function begin(
           message: `WorkloadDeployment ${name} is not a source of BackupDestination ${world.destination?.name ?? ''}`,
         };
   const resolved = resolveVolume(world, name);
-  const problem = scope ?? ('reason' in resolved ? resolved : check?.());
+  const problem = scope ?? ('reason' in resolved ? resolved : check?.(resolved));
+  if (problem?.wait) {
+    // Reported once; the request stays unstarted and is checked again on every tick.
+    return view.reason === problem.reason
+      ? []
+      : [shell.status({ reason: problem.reason, message: problem.message })];
+  }
   if (problem) {
     return [shell.status({ phase: 'Failed', reason: problem.reason, message: problem.message })];
   }
@@ -1322,15 +1339,59 @@ export function startRestore(world: World, restore: RestoreView): Action[] {
     world,
     restore,
     (volume) => restoreOperation(world, { ...restore, volume }),
-    () => ({ objectPrefix: prefix }),
+    (resolved) => {
+      const modes = targetModes(world, backup.volume?.encfsMode, resolved.key);
+      return { objectPrefix: prefix, ...(Array.isArray(modes) ? { targetModes: modes } : {}) };
+    },
     // Known before any downtime: the agent would only refuse it after the scale-down.
-    () =>
-      restore.expectedKcv &&
-      backup.volume?.encfsKcv &&
-      restore.expectedKcv !== backup.volume.encfsKcv
-        ? { reason: 'KcvMismatch', message: 'expectedKcv is not the KCV the backup recorded' }
-        : undefined,
+    (resolved) => {
+      if (
+        restore.expectedKcv &&
+        backup.volume?.encfsKcv &&
+        restore.expectedKcv !== backup.volume.encfsKcv
+      ) {
+        return { reason: 'KcvMismatch', message: 'expectedKcv is not the KCV the backup recorded' };
+      }
+      const modes = targetModes(world, backup.volume?.encfsMode, resolved.key);
+      return Array.isArray(modes) ? undefined : modes;
+    },
   );
+}
+
+const MIGRATION =
+  'a restore keeps the mode; to change it, pg_dump and restore into a new storage key (platform/pglite-encfs/docs/design-200-two-slot-aead.md section 10)';
+
+/**
+ * The backup modes the restore target accepts, from the platform's storage records
+ * (design-200 §9.4 "Restore" step 1), or why the restore cannot start. Without records (an
+ * older controller) the backup's own mode is passed, so the agent still checks the disk;
+ * a backup without a recorded mode skips the check and passes none.
+ */
+function targetModes(
+  world: World,
+  backupMode: string | undefined,
+  key: string,
+): EncfsMode[] | undefined | Problem {
+  if (!backupMode) return undefined;
+  const records = world.storageRecords ?? { state: 'absent' };
+  if (records.state === 'absent') return [backupMode as EncfsMode];
+  if (records.state !== 'present') {
+    return { reason: 'StorageRecordsUntrusted', message: records.message };
+  }
+  const record = records.keys[key];
+  if (!record) {
+    return {
+      reason: 'TargetNotRecorded',
+      message: `storage key ${key} is not in ${STORAGE_RECORDS} yet; checked again on the next tick`,
+      wait: true,
+    };
+  }
+  const accepted = acceptedModes(record);
+  if (accepted.includes(backupMode as EncfsMode)) return accepted;
+  return {
+    reason: 'ModeMismatch',
+    message: `backup is ${backupMode}, storage key ${key} accepts ${accepted.join(' or ')}; ${MIGRATION}`,
+  };
 }
 
 /** The next requested workload operation to start: restores first, then the oldest backup. */

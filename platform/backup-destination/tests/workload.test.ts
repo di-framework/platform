@@ -16,6 +16,7 @@ import {
   type World,
 } from '../src/model.ts';
 import { reconcile, reconcileAll } from '../src/reconcile.ts';
+import type { StorageRecord, StorageRecords } from '../src/storage-records.ts';
 import {
   backupKeys,
   expiredVolumeBackups,
@@ -1484,6 +1485,116 @@ describe('restore into a workload volume', () => {
     expect(cluster.world.restores[0]).toMatchObject({ phase: 'Failed', reason: 'KcvMismatch' });
     expect(cluster.log.some((action) => action.type === 'scale-workload')).toBe(false);
     expect(cluster.world.jobs).toEqual([]);
+  });
+
+  describe('checked against di-storage-records before anything stops (#553)', () => {
+    const modeSource = (encfsMode?: string) => ({
+      ...source,
+      volume: { ...source.volume, ...(encfsMode ? { encfsMode } : {}) },
+    });
+    const present = (keys: Record<string, StorageRecord>): StorageRecords => ({
+      state: 'present',
+      keys,
+    });
+    const requestRestore = (cluster: Cluster, backup: BackupView) =>
+      cluster.apply(
+        handle('POST', '/restores', `source=${backup.name}&workload=identity`, cluster.world)
+          .actions,
+      );
+    const restoreEnv = (backup: BackupView, storageRecords?: StorageRecords) => {
+      const cluster = new Cluster(
+        volumeWorld({ backups: [backup], ...(storageRecords ? { storageRecords } : {}) }),
+      );
+      requestRestore(cluster, backup);
+      stopped(cluster);
+      cluster.instances('identity', 0);
+      const text = JSON.stringify(job(cluster.tick(), 'volume-restore'));
+      return text.match(/\{"name":"BACKUP_TARGET_MODES","value":"([^"]*)"\}/)?.[1];
+    };
+    const refused = (backup: BackupView, storageRecords: StorageRecords) => {
+      const cluster = new Cluster(volumeWorld({ backups: [backup], storageRecords }));
+      requestRestore(cluster, backup);
+      cluster.tick();
+      expect(cluster.log.some((action) => action.type === 'scale-workload')).toBe(false);
+      expect(cluster.world.jobs).toEqual([]);
+      return cluster.world.restores[0];
+    };
+
+    test("absent: no record check, the backup's own mode goes to the agent", () => {
+      expect(restoreEnv(modeSource('XTS'), { state: 'absent' })).toBe('XTS');
+      expect(restoreEnv(modeSource('AEAD'))).toBe('AEAD');
+      // A backup without a recorded mode skips the check and passes none.
+      expect(restoreEnv(modeSource(), { state: 'absent' })).toBeUndefined();
+      expect(restoreEnv(modeSource(), present({}))).toBeUndefined();
+    });
+
+    test('untrusted or malformed records refuse the restore, naming the object', () => {
+      for (const state of ['untrusted', 'invalid'] as const) {
+        expect(
+          refused(modeSource('XTS'), { state, message: 'ConfigMap di-storage-records is bad' }),
+        ).toMatchObject({
+          phase: 'Failed',
+          reason: 'StorageRecordsUntrusted',
+          message: 'ConfigMap di-storage-records is bad',
+        });
+      }
+    });
+
+    test('every row of the restore table', () => {
+      const accepts = (backupMode: string, record: StorageRecord) =>
+        restoreEnv(modeSource(backupMode), present({ identity: record }));
+      expect(accepts('XTS', { kind: 'Other', mode: 'XTS' })).toBe('XTS');
+      expect(accepts('AEAD', { kind: 'PgliteEncfs', requested: 'AEAD' })).toBe('AEAD');
+      expect(accepts('XTS', { kind: 'PgliteEncfs', requested: 'Off' })).toBe('XTS,AEAD');
+      expect(accepts('AEAD', { kind: 'PgliteEncfs', requested: 'Off' })).toBe('XTS,AEAD');
+      expect(accepts('NotEncfs', { kind: 'Other' })).toBe('XTS,NotEncfs');
+      expect(accepts('XTS', { kind: 'Other' })).toBe('XTS,NotEncfs');
+      const mismatch = (backupMode: string, record: StorageRecord) =>
+        refused(modeSource(backupMode), present({ identity: record }));
+      expect(
+        mismatch('XTS', { kind: 'PgliteEncfs', requested: 'AEAD', mode: 'AEAD' }),
+      ).toMatchObject({
+        phase: 'Failed',
+        reason: 'ModeMismatch',
+        message: expect.stringMatching(
+          /^backup is XTS, storage key identity accepts AEAD; .*design-200-two-slot-aead\.md section 10/,
+        ),
+      });
+      expect(mismatch('XTS', { kind: 'PgliteEncfs', requested: 'AEAD' })).toMatchObject({
+        reason: 'ModeMismatch',
+      });
+      expect(mismatch('NotEncfs', { kind: 'PgliteEncfs', requested: 'Off' })).toMatchObject({
+        reason: 'ModeMismatch',
+        message: expect.stringContaining(
+          'backup is NotEncfs, storage key identity accepts XTS or AEAD',
+        ),
+      });
+      expect(mismatch('AEAD', { kind: 'Other' })).toMatchObject({ reason: 'ModeMismatch' });
+    });
+
+    test('a key not in the copy yet waits, then starts once it is recorded', () => {
+      const backup = modeSource('XTS');
+      const cluster = new Cluster(volumeWorld({ backups: [backup], storageRecords: present({}) }));
+      requestRestore(cluster, backup);
+      cluster.tick();
+      expect(cluster.world.restores[0]).toMatchObject({
+        reason: 'TargetNotRecorded',
+        message: expect.stringContaining('storage key identity is not in di-storage-records'),
+      });
+      expect(cluster.world.restores[0]?.phase).toBeUndefined();
+      // Reported once, not rewritten every tick.
+      expect(cluster.tick()).not.toContainEqual(
+        expect.objectContaining({ type: 'restore-status' }),
+      );
+      expect(cluster.world.jobs).toEqual([]);
+      expect(cluster.log.some((action) => action.type === 'scale-workload')).toBe(false);
+      cluster.world.storageRecords = present({ identity: { kind: 'Other', mode: 'XTS' } });
+      cluster.tick();
+      expect(cluster.world.restores[0]).toMatchObject({
+        phase: 'Running',
+        volume: { targetModes: ['XTS'] },
+      });
+    });
   });
 
   test('refuses sources it cannot restore from', () => {

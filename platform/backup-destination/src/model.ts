@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { StorageRecords } from './storage-records.ts';
 
 export const GROUP = 'platform.di-framework.dev';
 export const VERSION = `${GROUP}/v1alpha1`;
@@ -146,6 +147,8 @@ export interface VolumeProgress {
   fileCount?: number;
   encfsKcv?: string;
   encfsMode?: string;
+  /** A restore's accepted target modes, checked up front and passed to the agent (#553). */
+  targetModes?: string[];
   imageDigest?: string;
   replacedPath?: string;
   restoringPath?: string;
@@ -351,6 +354,8 @@ export interface World {
   workloads?: WorkloadView[];
   /** The held-replicas ledger; undefined exactly when `workloads` is. */
   ledger?: Ledger;
+  /** The platform's `di-storage-records` (#553); undefined exactly when `workloads` is. */
+  storageRecords?: StorageRecords;
   /** Tenant host pods and the hostPath directories they mount. */
   hosts?: HostView[];
   /** The Tenant's uid, which names its node directories. */

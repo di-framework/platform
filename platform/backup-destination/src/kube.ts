@@ -25,6 +25,12 @@ import {
   type WorkloadView,
   type World,
 } from './model.ts';
+import {
+  INSTALLATION_LABEL,
+  STORAGE_RECORDS,
+  type StorageRecords,
+  storageRecordsOf,
+} from './storage-records.ts';
 
 const RUNTIME = '/apis/runtime.wasmcloud.dev/v1alpha1';
 
@@ -297,11 +303,12 @@ async function volumeState(
   instances?: unknown;
   hostgroup?: unknown;
   ledger?: Ledger;
+  storageRecords?: StorageRecords;
 }> {
   const tenant = tenantNamespace.slice('di-tenant-'.length);
   const runtime = `${RUNTIME}/namespaces/${tenantNamespace}`;
   try {
-    const [deployments, replicaSets, instances, hostgroup, ledger] = await Promise.all([
+    const [deployments, replicaSets, instances, hostgroup, ledger, records] = await Promise.all([
       client.get(`${runtime}/workloaddeployments`),
       client.get(`${runtime}/workloadreplicasets`),
       client.get(`${runtime}/workloads`),
@@ -313,8 +320,24 @@ async function volumeState(
       // The runtime namespace, where tenant users cannot write ConfigMaps (W6). A ledger an
       // earlier build left in the tenant namespace is never read.
       absentOn404(client.get(`/api/v1/namespaces/${runtimeNamespace}/configmaps/${LEDGER}`)),
+      // The platform controller's copy of the Tenant's storage records (#553). 404 is an older
+      // controller; any other failure leaves volume state unknown.
+      absentOn404(
+        client.get(`/api/v1/namespaces/${runtimeNamespace}/configmaps/${STORAGE_RECORDS}`),
+      ),
     ]);
-    return { deployments, replicaSets, instances, hostgroup, ledger: ledgerOf(ledger) };
+    const labels = (hostgroup as Item | undefined)?.metadata?.labels ?? {};
+    return {
+      deployments,
+      replicaSets,
+      instances,
+      hostgroup,
+      ledger: ledgerOf(ledger),
+      storageRecords: storageRecordsOf(records, {
+        installation: labels[INSTALLATION_LABEL],
+        ownerUid: labels[OWNER_UID_LABEL],
+      }),
+    };
   } catch (error) {
     console.error(
       `workload volume state unknown, volume steps wait: ${error instanceof Error ? error.message : 'read failed'}`,
@@ -529,6 +552,7 @@ export async function loadWorld(
       ? {
           workloads: workloadViews(volumes.deployments, volumes.replicaSets, volumes.instances),
           ledger: volumes.ledger,
+          storageRecords: volumes.storageRecords,
         }
       : {}),
     hosts: hostViews(pods, `tenant-${tenant}`),
