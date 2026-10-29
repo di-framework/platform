@@ -295,6 +295,7 @@ export function installTenancy(args: {
                       hostImage: args.hostImage,
                       hostImagePullPolicy: args.hostImagePullPolicy,
                       schedulerNatsUrl: `nats://nats.${namespace}.svc.cluster.local:4222`,
+                      tenants: args.tenants.map((tenant) => tenant.name),
                       insecureRegistries: args.insecureRegistries ?? [],
                       storageRoot: args.storageRoot,
                       routeUrlPattern: args.routeUrlPattern,

@@ -310,6 +310,51 @@ describe('tenant and user resource reconciliation', () => {
       }
     });
 
+    describe('a declared Tenant before any User exists (#544)', () => {
+      function firstInstall(getTenant?: (path: string) => Promise<unknown>) {
+        const { api, t, u } = prepare();
+        api.objects.delete(key(u));
+        staleList(api, getTenant);
+        const controller = new Controller(api, { ...cfg, tenants: [t.metadata.name] });
+        return {
+          t,
+          controller,
+          reconcile: spyOn(controller, 'reconcileTenant').mockResolvedValue(),
+          warn: spyOn(console, 'warn').mockImplementation(() => {}),
+        };
+      }
+
+      it('reconciles the declared Tenant found by GET on the first tick', async () => {
+        const { t, controller, reconcile, warn } = firstInstall();
+        try {
+          await controller.tick();
+          await controller.tick();
+          expect(reconcile).toHaveBeenCalledTimes(2);
+          expect(reconcile.mock.calls[0]?.[0].metadata.name).toBe(t.metadata.name);
+          expect(warn.mock.calls).toEqual([
+            ['Tenant list stale: alpha found by GET; reconciling it'],
+          ]);
+        } finally {
+          reconcile.mockRestore();
+          warn.mockRestore();
+        }
+      });
+
+      it('reconciles nothing when the GET finds no declared Tenant', async () => {
+        const { controller, reconcile, warn } = firstInstall(async (path) => {
+          throw new ApiError(404, `GET ${path} returned 404`);
+        });
+        try {
+          await controller.tick();
+          expect(reconcile).not.toHaveBeenCalled();
+          expect(warn).not.toHaveBeenCalled();
+        } finally {
+          reconcile.mockRestore();
+          warn.mockRestore();
+        }
+      });
+    });
+
     it('leaves the User TenantNotReady when the GET finds no Tenant', async () => {
       const { api, controller, u } = prepare();
       staleList(api, async (path) => {

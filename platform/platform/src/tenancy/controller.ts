@@ -2546,9 +2546,10 @@ export class Controller {
   private emptyTenantListLogged = false;
   /**
    * The API server can keep answering a LIST from a stale watch cache while a GET by name finds
-   * the object (#474). Tenants that Users or tenant namespaces reference but the LIST missed are
-   * read by name and appended to `tenants`, so they reconcile this tick. A Tenant that nothing
-   * references stays invisible while the list is stale.
+   * the object (#474). Tenants that the installation declares (#544), or that Users or tenant
+   * namespaces reference, but the LIST missed are read by name and appended to `tenants`, so they
+   * reconcile this tick. A Tenant that nothing declares or references stays invisible while the
+   * list is stale.
    */
   private async recoverUnlistedTenants(
     tenants: Tenant[],
@@ -2564,7 +2565,7 @@ export class Controller {
       this.emptyTenantListLogged = true;
     } else this.emptyTenantListLogged = false;
     const listed = new Set(tenants.map((t) => t.metadata.name));
-    const referenced = new Set<string>();
+    const referenced = new Set<string>(this.cfg.tenants);
     for (const user of users)
       for (const membership of user.spec.memberships) referenced.add(membership.tenant);
     for (const value of [...services, ...bindings]) {
