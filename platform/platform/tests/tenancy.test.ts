@@ -853,6 +853,7 @@ describe('tenant and user resource reconciliation', () => {
 
 describe('placement nudge after a tenant host becomes Ready (#418)', () => {
   const workloads = '/apis/runtime.wasmcloud.dev/v1alpha1/namespaces/di-tenant-alpha/workloads';
+  const hostPath = '/apis/runtime.wasmcloud.dev/v1alpha1/namespaces/wasmcloud/hosts/alpha-host';
   function setup(hostReady = true) {
     const { api, controller, t } = prepare();
     api.seed({
@@ -863,9 +864,7 @@ describe('placement nudge after a tenant host becomes Ready (#418)', () => {
         labels: { [INSTALLATION]: 'test', [TENANT]: 'alpha' },
       },
     });
-    const host = api.objects.get(
-      '/apis/runtime.wasmcloud.dev/v1alpha1/namespaces/wasmcloud/hosts/alpha-host',
-    )!;
+    const host = api.objects.get(hostPath)!;
     host.metadata.uid = 'host-uid-1';
     if (!hostReady)
       host.status = { conditions: [{ type: 'Ready', status: 'False', reason: 'NotReady' }] };
@@ -886,21 +885,50 @@ describe('placement nudge after a tenant host becomes Ready (#418)', () => {
       },
     });
     const patches = () =>
-      api.operations.filter((o) => o.method === 'PATCH' && o.path.startsWith(workloads));
-    return { api, controller, t, patches };
+      api.operations
+        .filter((o) => o.method === 'PATCH' && o.path.startsWith(workloads))
+        .map((o) => o.path.slice(workloads.length + 1));
+    const annotation = (name: string) =>
+      api.objects.get(`${workloads}/${name}`)?.metadata.annotations?.[PLACEMENT_RETRY];
+    const reason = () =>
+      (api.objects.get(key(t))?.status as { conditions?: { reason: string }[] } | undefined)
+        ?.conditions?.[0]?.reason;
+    /** Fails calls that `match`, passing every other call through. */
+    const failing = (match: (method: string, path: string) => ApiError | undefined) => {
+      const call = api.call.bind(api);
+      return spyOn(api, 'call').mockImplementation(
+        async (method: string, path: string, body?: unknown) => {
+          const error = match(method, path);
+          if (error) {
+            api.operations.push({ method, path });
+            throw error;
+          }
+          return call(method, path, body);
+        },
+      );
+    };
+    return { api, controller, t, workload, patches, annotation, reason, failing };
   }
 
   it('annotates an unplaced workload exactly once per Ready host and leaves placed ones alone', async () => {
-    const { api, controller, t, patches } = setup();
+    const { api, controller, t, patches, annotation, reason } = setup();
     await controller.reconcileTenant(t);
-    expect(patches()).toEqual([{ method: 'PATCH', path: `${workloads}/unplaced` }]);
-    expect(api.objects.get(`${workloads}/unplaced`)?.metadata.annotations?.[PLACEMENT_RETRY]).toBe(
-      'host-uid-1',
-    );
+    expect(patches()).toEqual(['unplaced?fieldManager=di-platform-controller']);
+    expect(annotation('unplaced')).toBe('host-uid-1');
     expect(api.objects.get(`${workloads}/placed`)?.metadata.annotations).toBeUndefined();
+    expect(reason()).toBe('Reconciled');
     // The next poll does not patch it again.
     await controller.reconcileTenant(t);
     expect(patches()).toHaveLength(1);
+  });
+
+  it('re-nudges a still unplaced workload when a new host uid becomes Ready', async () => {
+    const { api, controller, t, patches, annotation } = setup();
+    await controller.reconcileTenant(t);
+    api.objects.get(hostPath)!.metadata.uid = 'host-uid-0';
+    await controller.reconcileTenant(t);
+    expect(patches()).toHaveLength(2);
+    expect(annotation('unplaced')).toBe('host-uid-0');
   });
 
   it('patches nothing without a Ready host', async () => {
@@ -914,5 +942,129 @@ describe('placement nudge after a tenant host becomes Ready (#418)', () => {
     t.spec.suspended = true;
     await controller.reconcileTenant(t);
     expect(patches()).toEqual([]);
+  });
+
+  it('waits for a freshly Ready host and leaves workloads younger than 5 s alone', async () => {
+    const { api, controller, t, workload, patches } = setup();
+    const now = new Date().toISOString();
+    workload('young', {
+      metadata: { name: 'young', namespace: 'di-tenant-alpha', creationTimestamp: now },
+    });
+    api.objects.get(hostPath)!.status = {
+      conditions: [{ type: 'Ready', status: 'True', lastTransitionTime: now }],
+    };
+    await controller.reconcileTenant(t);
+    expect(patches()).toEqual([]);
+    api.objects.get(hostPath)!.status = {
+      conditions: [{ type: 'Ready', status: 'True', lastTransitionTime: '2026-01-01T00:00:00Z' }],
+    };
+    await controller.reconcileTenant(t);
+    expect(patches()).toEqual(['unplaced?fieldManager=di-platform-controller']);
+  });
+
+  it('ignores a 404 and still nudges the remaining workloads', async () => {
+    const { controller, t, workload, patches, annotation, reason, failing } = setup();
+    workload('later', { status: { conditions: [] } });
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    failing((method, path) =>
+      method === 'PATCH' && path.startsWith(`${workloads}/unplaced`)
+        ? new ApiError(404, 'Not found')
+        : undefined,
+    );
+    try {
+      await controller.reconcileTenant(t);
+      expect(patches()).toEqual([
+        'unplaced?fieldManager=di-platform-controller',
+        'later?fieldManager=di-platform-controller',
+      ]);
+      expect(annotation('later')).toBe('host-uid-1');
+      expect(reason()).toBe('Reconciled');
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('logs any other patch failure once per workload and host without failing the reconcile', async () => {
+    const { controller, t, workload, patches, annotation, reason, failing } = setup();
+    workload('later', { status: { conditions: [] } });
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    failing((method, path) =>
+      method === 'PATCH' && path.startsWith(`${workloads}/unplaced`)
+        ? new ApiError(403, 'Forbidden')
+        : undefined,
+    );
+    try {
+      await controller.reconcileTenant(t);
+      await controller.reconcileTenant(t);
+      expect(patches().filter((p) => p.startsWith('unplaced'))).toHaveLength(2);
+      expect(annotation('later')).toBe('host-uid-1');
+      expect(reason()).toBe('Reconciled');
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]![0]).toContain('di-tenant-alpha/unplaced@host-uid-1');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('logs a failed Workload list without failing the reconcile', async () => {
+    const { controller, t, patches, reason, failing } = setup();
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    failing((method, path) =>
+      method === 'GET' && path.startsWith(workloads) ? new ApiError(500, 'boom') : undefined,
+    );
+    try {
+      await controller.reconcileTenant(t);
+      expect(patches()).toEqual([]);
+      expect(reason()).toBe('Reconciled');
+      expect(warn.mock.calls[0]![0]).toContain('listing Workloads failed: boom');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('nudges while a non-host Deployment is not ready, and the tenant stays Provisioning', async () => {
+    const { api, controller, t, patches, reason } = setup();
+    const call = api.call.bind(api);
+    spyOn(api, 'call').mockImplementation(async (method: string, path: string, body?: unknown) => {
+      const value = (await call(method, path, body)) as Resource;
+      if (method === 'PATCH' && /\/deployments\/di-redis(\?|$)/.test(path))
+        value.status = { observedGeneration: 1, readyReplicas: 0 };
+      return value as never;
+    });
+    await controller.reconcileTenant(t);
+    expect(patches()).toEqual(['unplaced?fieldManager=di-platform-controller']);
+    expect(reason()).toBe('Provisioning');
+  });
+
+  it('nudges after an apply failure in the same pass', async () => {
+    const { controller, t, patches, reason, failing } = setup();
+    const log = spyOn(console, 'error').mockImplementation(() => {});
+    failing((method, path) =>
+      method === 'PATCH' && /\/deployments\/hostgroup-/.test(path)
+        ? new ApiError(409, 'conflict')
+        : undefined,
+    );
+    try {
+      await controller.reconcileTenant(t);
+      expect(patches()).toEqual(['unplaced?fieldManager=di-platform-controller']);
+      expect(reason()).toBe('ReconcileError');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('reports a failed Host list only when it decides readiness', async () => {
+    const { controller, t, reason, failing } = setup();
+    const log = spyOn(console, 'error').mockImplementation(() => {});
+    failing((method, path) =>
+      method === 'GET' && path.includes('/hosts?') ? new ApiError(500, 'hosts down') : undefined,
+    );
+    try {
+      await controller.reconcileTenant(t);
+      expect(reason()).toBe('ReconcileError');
+    } finally {
+      log.mockRestore();
+    }
   });
 });

@@ -214,6 +214,10 @@ type WorkloadObject = Resource & {
 };
 /** Annotation that re-queues an unplaced Workload once its tenant has a Ready host (#418). */
 export const PLACEMENT_RETRY = 'di-framework.dev/placement-retry';
+/** How long a Host must have been Ready before it is used for the nudge (S1 of the #418 review). */
+const NUDGE_HOST_SETTLE_MS = 1_000;
+/** How old an unplaced Workload must be before it is nudged (S2 of the #418 review). */
+const NUDGE_WORKLOAD_MIN_AGE_MS = 5_000;
 /** The controlling owner of `value` of `kind`, as the wasmCloud operator sets it. */
 function controllerOf(value: WorkloadObject, kind: string) {
   return value.metadata.ownerReferences?.find(
@@ -914,34 +918,74 @@ export class Controller {
       );
     });
   }
+  /** Workload/host pairs whose nudge PATCH failed and was logged, so each is logged once (#418). */
+  private readonly nudgeFailures = new Set<string>();
   /**
    * Re-queues the tenant's unplaced Workloads once a Ready host exists (#418). The upstream
    * workload controller does not watch Hosts and retries a Workload that found no host only on
    * its 30 s timer, but its Workload watch has no predicate, so a metadata change enqueues it at
    * once. The annotation names the Ready host, so each Workload is patched once per host.
+   *
+   * Best-effort: it never throws. A Workload that is gone (404) is skipped, and any other failure
+   * is logged once per Workload and host. A host is used only once it has been Ready for
+   * {@link NUDGE_HOST_SETTLE_MS}, so the operator's informer cache has seen it, and a Workload is
+   * nudged only once it is {@link NUDGE_WORKLOAD_MIN_AGE_MS} old, so new ones the operator is still
+   * placing are left alone; both are retried on the next poll.
    */
   private async nudgeUnplaced(namespace: string, readyHosts: Resource[]): Promise<void> {
-    const host = readyHosts.map((h) => h.metadata.uid ?? h.metadata.name).sort()[0];
+    const now = this.now().getTime();
+    const olderThan = (time: string | undefined, ms: number) =>
+      !time || now - Date.parse(time) >= ms;
+    const host = readyHosts
+      .filter((h) =>
+        olderThan(
+          (h.status as { conditions?: Condition[] } | undefined)?.conditions?.find(
+            (c) => c.type === 'Ready',
+          )?.lastTransitionTime,
+          NUDGE_HOST_SETTLE_MS,
+        ),
+      )
+      .map((h) => h.metadata.uid ?? h.metadata.name)
+      .sort()[0];
     if (!host) return;
-    const workloads = await this.list<WorkloadObject>(
-      'runtime.wasmcloud.dev/v1alpha1',
-      'Workload',
-      {},
-      namespace,
-    );
+    let workloads: WorkloadObject[];
+    try {
+      workloads = await this.list<WorkloadObject>(
+        'runtime.wasmcloud.dev/v1alpha1',
+        'Workload',
+        {},
+        namespace,
+      );
+    } catch (error) {
+      console.warn(
+        `Placement nudge in ${namespace}: listing Workloads failed: ${error instanceof Error ? error.message : error}`,
+      );
+      return;
+    }
     for (const workload of workloads) {
       if (
         workload.status?.hostId ||
         workload.metadata.deletionTimestamp ||
-        workload.metadata.annotations?.[PLACEMENT_RETRY] === host
+        workload.metadata.annotations?.[PLACEMENT_RETRY] === host ||
+        !olderThan(workload.metadata.creationTimestamp, NUDGE_WORKLOAD_MIN_AGE_MS)
       )
         continue;
-      await this.api.call(
-        'PATCH',
-        location(workload),
-        { metadata: { annotations: { [PLACEMENT_RETRY]: host } } },
-        'application/merge-patch+json',
-      );
+      try {
+        await this.api.call(
+          'PATCH',
+          `${location(workload)}?fieldManager=di-platform-controller`,
+          { metadata: { annotations: { [PLACEMENT_RETRY]: host } } },
+          'application/merge-patch+json',
+        );
+      } catch (error) {
+        if (error instanceof ApiError && error.code === 404) continue;
+        const failure = `${namespace}/${workload.metadata.name}@${host}`;
+        if (this.nudgeFailures.has(failure)) continue;
+        this.nudgeFailures.add(failure);
+        console.warn(
+          `Placement nudge of Workload ${failure} failed: ${error instanceof Error ? error.message : error}`,
+        );
+      }
     }
   }
   /** How the registry workload reaches `di-nats` for {@link registryNats} (#159). */
@@ -1103,7 +1147,13 @@ export class Controller {
             (spec.replicas !== 0 || (status?.replicas ?? 0) === 0);
         }
       }
-      if (ready && !tenant.spec.suspended && !tenant.metadata.deletionTimestamp) {
+    } catch (error) {
+      failure = error;
+    }
+    // Placement depends on Host readiness alone, as the operator's findFreeHost decides it, so
+    // the nudge runs even when another Deployment is not ready or the apply above failed (#418).
+    if (!tenant.spec.suspended && !tenant.metadata.deletionTimestamp) {
+      try {
         const hosts = await this.list<Resource>('runtime.wasmcloud.dev/v1alpha1', 'Host', {
           hostgroup: n.hostgroup,
         });
@@ -1114,11 +1164,12 @@ export class Controller {
               (c) => c.type === 'Ready' && c.status === 'True',
             ),
         );
-        ready = readyHosts.length >= (tenant.spec.runtime?.replicas ?? 1);
         await this.nudgeUnplaced(n.namespace, readyHosts);
+        ready &&= readyHosts.length >= (tenant.spec.runtime?.replicas ?? 1);
+      } catch (error) {
+        // Reported only when it decides readiness; a tenant that is not ready yet waits anyway.
+        if (ready) failure ??= error;
       }
-    } catch (error) {
-      failure = error;
     }
     // Apart from the apply, so neither failure holds the other back. A cleanup failure is
     // reported unless the apply already failed, and the cleanup is retried on the next pass.
