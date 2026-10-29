@@ -233,6 +233,12 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
       verbs: ['get', 'list', 'watch'],
     },
     {
+      // Merge-patches the placement-retry annotation onto unplaced Workloads (#418).
+      apiGroups: ['runtime.wasmcloud.dev'],
+      resources: ['workloads'],
+      verbs: ['patch'],
+    },
+    {
       apiGroups: ['apps'],
       resources: ['deployments'],
       verbs: ['get', 'list', 'watch', 'create', 'patch', 'update', 'delete'],

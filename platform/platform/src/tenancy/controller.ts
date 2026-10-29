@@ -212,6 +212,41 @@ type WorkloadObject = Resource & {
   spec?: { replicas?: number };
   status?: Record<string, unknown> & { observedGeneration?: number };
 };
+/** Annotation that re-queues an unplaced Workload once its tenant has a Ready host (#418). */
+export const PLACEMENT_RETRY = 'di-framework.dev/placement-retry';
+/** How long a Host must have been Ready before it is used for the nudge (S1 of the #418 review). */
+const NUDGE_HOST_SETTLE_MS = 1_000;
+/** How old an unplaced Workload must be before it is nudged (S2 of the #418 review). */
+const NUDGE_WORKLOAD_MIN_AGE_MS = 5_000;
+/** Whether `time` is unset or at least `ms` before `now`. */
+function olderThan(time: string | undefined, ms: number, now: number): boolean {
+  return !time || now - Date.parse(time) >= ms;
+}
+/** The sorted uids of the hosts Ready for {@link NUDGE_HOST_SETTLE_MS}, joined; empty if none (#418). */
+function settledHostKey(readyHosts: Resource[], now: number): string {
+  return readyHosts
+    .filter((h) =>
+      olderThan(
+        (h.status as { conditions?: Condition[] } | undefined)?.conditions?.find(
+          (c) => c.type === 'Ready',
+        )?.lastTransitionTime,
+        NUDGE_HOST_SETTLE_MS,
+        now,
+      ),
+    )
+    .map((h) => h.metadata.uid ?? h.metadata.name)
+    .sort((a, b) => a.localeCompare(b))
+    .join(',');
+}
+/** Whether an unplaced, live, old-enough Workload still lacks the nudge for `host` (#418). */
+function needsNudge(workload: WorkloadObject, host: string, now: number): boolean {
+  return (
+    !workload.status?.hostId &&
+    !workload.metadata.deletionTimestamp &&
+    workload.metadata.annotations?.[PLACEMENT_RETRY] !== host &&
+    olderThan(workload.metadata.creationTimestamp, NUDGE_WORKLOAD_MIN_AGE_MS, now)
+  );
+}
 /** The controlling owner of `value` of `kind`, as the wasmCloud operator sets it. */
 function controllerOf(value: WorkloadObject, kind: string) {
   return value.metadata.ownerReferences?.find(
@@ -912,6 +947,66 @@ export class Controller {
       );
     });
   }
+  /** Workload/host pairs whose nudge PATCH failed and was logged, so each is logged once (#418). */
+  private readonly nudgeFailures = new Set<string>();
+  /**
+   * Re-queues the tenant's unplaced Workloads once a Ready host exists (#418). The upstream
+   * workload controller does not watch Hosts and retries a Workload that found no host only on
+   * its 30 s timer, but its Workload watch has no predicate, so a metadata change enqueues it at
+   * once. The annotation names the set of Ready hosts, so each Workload is patched once per set
+   * and again whenever any host joins or leaves it.
+   *
+   * Best-effort: it never throws. A Workload that is gone (404) is skipped, and any other failure
+   * is logged once per Workload and host. A host is used only once it has been Ready for
+   * {@link NUDGE_HOST_SETTLE_MS}, so the operator's informer cache has seen it, and a Workload is
+   * nudged only once it is {@link NUDGE_WORKLOAD_MIN_AGE_MS} old, so new ones the operator is still
+   * placing are left alone; both are retried on the next poll.
+   */
+  private async nudgeUnplaced(namespace: string, readyHosts: Resource[]): Promise<void> {
+    const now = this.now().getTime();
+    const host = settledHostKey(readyHosts, now);
+    if (!host) return;
+    let workloads: WorkloadObject[];
+    try {
+      workloads = await this.list<WorkloadObject>(
+        'runtime.wasmcloud.dev/v1alpha1',
+        'Workload',
+        {},
+        namespace,
+      );
+    } catch (error) {
+      console.warn(
+        `Placement nudge in ${namespace}: listing Workloads failed: ${error instanceof Error ? error.message : error}`,
+      );
+      return;
+    }
+    for (const workload of workloads) {
+      if (needsNudge(workload, host, now)) await this.nudgeWorkload(namespace, workload, host);
+    }
+  }
+  /** Sets {@link PLACEMENT_RETRY} on one Workload; see {@link nudgeUnplaced} for failures. */
+  private async nudgeWorkload(
+    namespace: string,
+    workload: WorkloadObject,
+    host: string,
+  ): Promise<void> {
+    try {
+      await this.api.call(
+        'PATCH',
+        `${location(workload)}?fieldManager=di-platform-controller`,
+        { metadata: { annotations: { [PLACEMENT_RETRY]: host } } },
+        'application/merge-patch+json',
+      );
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 404) return;
+      const failure = `${namespace}/${workload.metadata.name}@${host}`;
+      if (this.nudgeFailures.has(failure)) return;
+      this.nudgeFailures.add(failure);
+      console.warn(
+        `Placement nudge of Workload ${failure} failed: ${error instanceof Error ? error.message : error}`,
+      );
+    }
+  }
   /** How the registry workload reaches `di-nats` for {@link registryNats} (#159). */
   private static registryNatsMode(state: RegistryNats | undefined): RegistryNatsMode | undefined {
     if (!state || state.stage === 'rollout') return undefined;
@@ -1071,21 +1166,29 @@ export class Controller {
             (spec.replicas !== 0 || (status?.replicas ?? 0) === 0);
         }
       }
-      if (ready && !tenant.spec.suspended && !tenant.metadata.deletionTimestamp) {
+    } catch (error) {
+      failure = error;
+    }
+    // Placement depends on Host readiness alone, as the operator's findFreeHost decides it, so
+    // the nudge runs even when another Deployment is not ready or the apply above failed (#418).
+    if (!tenant.spec.suspended && !tenant.metadata.deletionTimestamp) {
+      try {
         const hosts = await this.list<Resource>('runtime.wasmcloud.dev/v1alpha1', 'Host', {
           hostgroup: n.hostgroup,
         });
-        ready =
-          hosts.filter(
-            (h) =>
-              h.environment === n.namespace &&
-              (h.status as { conditions?: Condition[] } | undefined)?.conditions?.some(
-                (c) => c.type === 'Ready' && c.status === 'True',
-              ),
-          ).length >= (tenant.spec.runtime?.replicas ?? 1);
+        const readyHosts = hosts.filter(
+          (h) =>
+            h.environment === n.namespace &&
+            (h.status as { conditions?: Condition[] } | undefined)?.conditions?.some(
+              (c) => c.type === 'Ready' && c.status === 'True',
+            ),
+        );
+        await this.nudgeUnplaced(n.namespace, readyHosts);
+        ready &&= readyHosts.length >= (tenant.spec.runtime?.replicas ?? 1);
+      } catch (error) {
+        // Reported only when it decides readiness; a tenant that is not ready yet waits anyway.
+        if (ready) failure ??= error;
       }
-    } catch (error) {
-      failure = error;
     }
     // Apart from the apply, so neither failure holds the other back. A cleanup failure is
     // reported unless the apply already failed, and the cleanup is retried on the next pass.
