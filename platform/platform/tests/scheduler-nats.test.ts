@@ -5,6 +5,7 @@ import {
   type AccountsRender,
   type AccountsTenant,
   bootstrapSchedulerAccounts,
+  REFUSED_FOR_OTHER,
   renderSchedulerAccounts,
   SCHEDULER_ACCOUNTS_CONDITION,
   SCHEDULER_NATS_ACCOUNTS,
@@ -158,20 +159,72 @@ describe('scheduler NATS accounts file (#541 m2, design-541 §4.2-4.4)', () => {
     expect(
       text(renderSchedulerAccounts(GOLDEN_NAMESPACE, GOLDEN_TENANTS, forced, GOLDEN_NOW)),
     ).not.toContain(previous);
-    // Hosts keep their previous user until the rollout is observed: no previousUntil.
-    const hosts = {
+    // An operator entry without a usable previousUntil counts as passed.
+    const unusable = {
       ...GOLDEN_RECORD,
-      'tenant/b/hosts': { current: GOLDEN_IDS.bHosts, previous: 'bbbbbbbbbbbbbbb9' },
-    };
+      'tenant/a/operator': { ...GOLDEN_RECORD['tenant/a/operator'], previousUntil: 'never' },
+    } as IdentityRecord;
     expect(
-      text(renderSchedulerAccounts(GOLDEN_NAMESPACE, GOLDEN_TENANTS, hosts, new Date(9e15))),
-    ).toContain('bbbbbbbbbbbbbbb9.di-tenant-b.tenants.');
+      text(renderSchedulerAccounts(GOLDEN_NAMESPACE, GOLDEN_TENANTS, unusable, GOLDEN_NOW)),
+    ).not.toContain(previous);
+  });
+
+  it('cuts off operators at previousUntil but never hosts (§4.5)', () => {
+    const until = '2026-10-29T12:10:00Z';
+    const late = new Date('2026-10-29T13:00:00Z');
+    const record: IdentityRecord = {
+      ...GOLDEN_RECORD,
+      'tenant/b/hosts': {
+        current: GOLDEN_IDS.bHosts,
+        previous: 'bbbbbbbbbbbbbbb9',
+        previousUntil: until,
+      },
+      'tenant/b/operator': {
+        current: GOLDEN_IDS.bOperator,
+        previous: 'bbbbbbbbbbbbbbb8',
+        previousUntil: until,
+      },
+      'platform/host': {
+        current: GOLDEN_IDS.platformHost,
+        previous: '0000000000000009',
+        previousUntil: until,
+      },
+      'platform/data': {
+        current: GOLDEN_IDS.platformData,
+        previous: '0000000000000008',
+        previousUntil: until,
+      },
+      'platform/operator': {
+        current: GOLDEN_IDS.platformOperator,
+        previous: '0000000000000007',
+        previousUntil: until,
+      },
+    };
+    const conf = text(renderSchedulerAccounts(GOLDEN_NAMESPACE, GOLDEN_TENANTS, record, late));
+    for (const host of [
+      'bbbbbbbbbbbbbbb9.di-tenant-b.tenants.',
+      `${GOLDEN_IDS.bHosts}.di-tenant-b.tenants.`,
+      '0000000000000009.host.platform.',
+      '0000000000000008.data.platform.',
+    ])
+      expect(conf).toContain(host);
+    expect(conf).not.toContain('bbbbbbbbbbbbbbb8.operator.');
+    expect(conf).not.toContain('0000000000000007.operator.');
+    const early = text(
+      renderSchedulerAccounts(GOLDEN_NAMESPACE, GOLDEN_TENANTS, record, GOLDEN_NOW),
+    );
+    expect(early).toContain('bbbbbbbbbbbbbbb8.operator.');
+    expect(early).toContain('0000000000000007.operator.');
   });
 
   it('refuses a duplicate user and names the offending Tenant', () => {
     const duplicate = {
       ...GOLDEN_RECORD,
-      'tenant/b/hosts': { current: GOLDEN_IDS.bHosts, previous: GOLDEN_IDS.bHosts },
+      'tenant/b/hosts': {
+        current: GOLDEN_IDS.bHosts,
+        previous: GOLDEN_IDS.bHosts,
+        previousUntil: '2026-10-29T12:10:00Z',
+      },
     };
     expect(
       problems(renderSchedulerAccounts(GOLDEN_NAMESPACE, GOLDEN_TENANTS, duplicate, GOLDEN_NOW)),
@@ -182,16 +235,54 @@ describe('scheduler NATS accounts file (#541 m2, design-541 §4.2-4.4)', () => {
         message: `user '${GOLDEN_IDS.bHosts}.di-tenant-b.tenants.scheduler.di-framework.invalid' appears more than once`,
       },
     ]);
+  });
+
+  it('refuses a duplicate account name', () => {
     const twice = [...GOLDEN_TENANTS, { metadata: { name: 'a' } }];
     expect(
-      problems(renderSchedulerAccounts(GOLDEN_NAMESPACE, twice, GOLDEN_RECORD, GOLDEN_NOW)).map(
-        (p) => [p.reason, p.tenant],
-      ),
+      problems(renderSchedulerAccounts(GOLDEN_NAMESPACE, twice, GOLDEN_RECORD, GOLDEN_NOW)),
     ).toEqual([
-      ['DuplicateSchedulerUser', 'a'],
-      ['DuplicateSchedulerUser', 'a'],
-      ['DuplicateSchedulerUser', 'a'],
+      {
+        reason: 'InvalidAccountName',
+        tenant: 'a',
+        message: "account T_di-tenant-a of Tenant 'a' is not unique",
+      },
     ]);
+    // A platform namespace named like a tenant account collides with that Tenant.
+    expect(
+      problems(renderSchedulerAccounts('di-tenant-b', GOLDEN_TENANTS, GOLDEN_RECORD, GOLDEN_NOW)),
+    ).toEqual([
+      {
+        reason: 'InvalidAccountName',
+        tenant: 'b',
+        message: "account T_di-tenant-b of Tenant 'b' is not unique",
+      },
+    ]);
+  });
+
+  it('refuses replicas outside the CRD bounds', () => {
+    for (const replicas of [0, 11, 1.5, Number.NaN])
+      expect(
+        problems(
+          renderSchedulerAccounts(
+            GOLDEN_NAMESPACE,
+            [{ metadata: { name: 'a' }, spec: { runtime: { replicas } } }],
+            GOLDEN_RECORD,
+            GOLDEN_NOW,
+          ),
+        ),
+      ).toEqual([
+        { reason: 'InvalidReplicas', tenant: 'a', message: "Tenant 'a' has replicas outside 1-10" },
+      ]);
+    for (const replicas of [1, 10])
+      text(
+        renderSchedulerAccounts(
+          GOLDEN_NAMESPACE,
+          [{ metadata: { name: 'a' }, spec: { runtime: { replicas } } }],
+          GOLDEN_RECORD,
+          GOLDEN_NOW,
+        ),
+      );
   });
 
   it('refuses a user that does not match its pattern', () => {
@@ -247,10 +338,12 @@ describe('scheduler NATS accounts file (#541 m2, design-541 §4.2-4.4)', () => {
       observedGeneration: 3,
       lastTransitionTime: GOLDEN_NOW.toISOString(),
     });
-    expect(schedulerAccountsCondition(found, 'a', 1, GOLDEN_NOW)).toMatchObject({
-      reason: 'InvalidSchedulerUser',
-      message: `${SCHEDULER_NATS_ACCOUNTS} was not written: platform`,
-    });
+    // A Tenant with no problem of its own learns nothing about another identity.
+    for (const list of [found, []])
+      expect(schedulerAccountsCondition(list, 'a', 1, GOLDEN_NOW)).toMatchObject({
+        reason: REFUSED_FOR_OTHER,
+        message: `${SCHEDULER_NATS_ACCOUNTS} was not written: refused because of another identity`,
+      });
   });
 });
 
@@ -335,7 +428,11 @@ describe('bootstrapSchedulerAccounts (#541 m2)', () => {
     const bad = withRecord('not json');
     await expect(bootstrapSchedulerAccounts(bad, config)).rejects.toThrow(SCHEDULER_IDENTITIES);
     const dup = withRecord({
-      'platform/host': { current: '0000000000000002', previous: '0000000000000002' },
+      'platform/host': {
+        current: '0000000000000002',
+        previous: '0000000000000002',
+        previousUntil: '2026-10-29T12:10:00Z',
+      },
     });
     await expect(bootstrapSchedulerAccounts(dup, config)).rejects.toThrow(
       `${SCHEDULER_NATS_ACCOUNTS} was not written: user '0000000000000002.host.platform`,

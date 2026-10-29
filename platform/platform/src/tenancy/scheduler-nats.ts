@@ -66,7 +66,11 @@ export interface AccountsTenant {
 
 /** Why a render was refused: the offending Tenant, when there is one. */
 export interface AccountsProblem {
-  reason: 'InvalidAccountName' | 'InvalidSchedulerUser' | 'DuplicateSchedulerUser';
+  reason:
+    | 'InvalidAccountName'
+    | 'InvalidReplicas'
+    | 'InvalidSchedulerUser'
+    | 'DuplicateSchedulerUser';
   tenant?: string;
   message: string;
 }
@@ -79,16 +83,16 @@ const OPERATOR_PERMISSIONS =
   'permissions: { publish: { allow: ["runtime.host.*.>"] }, ' +
   'subscribe: { allow: ["runtime.operator.heartbeat.>", "_INBOX.>"] } }';
 
-const literal = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const literal = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
 const ID = '[0-9a-f]{16}';
-const TAIL = 'scheduler\\.di-framework\\.invalid$';
+const TAIL = String.raw`scheduler\.di-framework\.invalid$`;
 /** The §4.4 user-name patterns. */
 export const USER_PATTERNS = {
   tenantHost: (tenant: string) =>
-    new RegExp(`^${ID}\\.di-tenant-${literal(tenant)}\\.tenants\\.${TAIL}`),
+    new RegExp(String.raw`^${ID}\.di-tenant-${literal(tenant)}\.tenants\.${TAIL}`),
   tenantOperator: (tenant: string) =>
-    new RegExp(`^${ID}\\.operator\\.di-tenant-${literal(tenant)}\\.platform\\.${TAIL}`),
-  platform: new RegExp(`^${ID}\\.(operator|host|data)\\.platform\\.${TAIL}`),
+    new RegExp(String.raw`^${ID}\.operator\.di-tenant-${literal(tenant)}\.platform\.${TAIL}`),
+  platform: new RegExp(String.raw`^${ID}\.(operator|host|data)\.platform\.${TAIL}`),
 };
 /** A Tenant name (`validName` in `resources.ts`), so `T_di-tenant-<t>` is a valid account name. */
 const TENANT_NAME = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
@@ -96,6 +100,9 @@ const MAX_TENANT_NAME = 40;
 /** A namespace name (a DNS label), so `T_<platform-ns>` is a valid account name. */
 const NAMESPACE_NAME = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
 const MAX_NAMESPACE_NAME = 63;
+/** The Tenant CRD's bounds on `spec.runtime.replicas`, checked again before they reach the file. */
+const MIN_REPLICAS = 1;
+const MAX_REPLICAS = 10;
 
 interface User {
   name: string;
@@ -110,13 +117,17 @@ interface Account {
   tenant?: string;
 }
 
-/** The users of `entry`: current, and previous while it is kept (never after `previousUntil`). */
-function issuances(entry: IdentityEntry | undefined, now: Date): string[] {
+/**
+ * The users of `entry`: current, and previous while the record holds it. For an operator
+ * (`cutOff`), previous is rendered only before `previousUntil`; a missing or unparseable
+ * `previousUntil` counts as passed. Hosts are never cut off by `previousUntil` (§4.5): their
+ * previous user stays until the identity record drops it.
+ */
+function issuances(entry: IdentityEntry | undefined, now: Date, cutOff: boolean): string[] {
   if (!entry) return [];
-  const keep =
-    entry.previous !== undefined &&
-    (entry.previousUntil === undefined || Date.parse(entry.previousUntil) > now.getTime());
-  return keep ? [entry.current, entry.previous as string] : [entry.current];
+  if (entry.previous === undefined) return [entry.current];
+  const keep = !cutOff || now.getTime() < Date.parse(entry.previousUntil ?? '');
+  return keep ? [entry.current, entry.previous] : [entry.current];
 }
 
 function accounts(
@@ -126,7 +137,7 @@ function accounts(
   now: Date,
 ): Account[] {
   const platform = (role: PlatformRole, permissions?: string): User[] =>
-    issuances(record[platformIdentity(role)], now).map((id) => ({
+    issuances(record[platformIdentity(role)], now, role === 'operator').map((id) => ({
       name: platformUser(role, id),
       permissions,
       pattern: USER_PATTERNS.platform,
@@ -150,13 +161,13 @@ function accounts(
           `max_subscriptions: ${TENANT_MAX_SUBSCRIPTIONS}, max_payload: ${TENANT_MAX_PAYLOAD} }`,
       ],
       users: [
-        ...issuances(record[tenantIdentity(t, 'hosts')], now).map((id) => ({
+        ...issuances(record[tenantIdentity(t, 'hosts')], now, false).map((id) => ({
           name: tenantHostUser(t, id),
           permissions: HOST_PERMISSIONS,
           pattern: USER_PATTERNS.tenantHost(t),
           tenant: t,
         })),
-        ...issuances(record[tenantIdentity(t, 'operator')], now).map((id) => ({
+        ...issuances(record[tenantIdentity(t, 'operator')], now, true).map((id) => ({
           name: tenantOperatorUser(t, id),
           permissions: OPERATOR_PERMISSIONS,
           pattern: USER_PATTERNS.tenantOperator(t),
@@ -180,13 +191,33 @@ function validate(
       reason: 'InvalidAccountName',
       message: `the platform namespace '${namespace}' does not give a valid account name`,
     });
-  for (const { metadata } of tenants)
+  const names = new Set([`T_${namespace}`]);
+  for (const { metadata, spec } of tenants) {
+    const account = `T_di-tenant-${metadata.name}`;
     if (metadata.name.length > MAX_TENANT_NAME || !TENANT_NAME.test(metadata.name))
       problems.push({
         reason: 'InvalidAccountName',
         tenant: metadata.name,
         message: `Tenant '${metadata.name}' does not give a valid account name`,
       });
+    else if (names.has(account))
+      problems.push({
+        reason: 'InvalidAccountName',
+        tenant: metadata.name,
+        message: `account ${account} of Tenant '${metadata.name}' is not unique`,
+      });
+    names.add(account);
+    const replicas = spec?.runtime?.replicas;
+    if (
+      replicas !== undefined &&
+      !(Number.isInteger(replicas) && replicas >= MIN_REPLICAS && replicas <= MAX_REPLICAS)
+    )
+      problems.push({
+        reason: 'InvalidReplicas',
+        tenant: metadata.name,
+        message: `Tenant '${metadata.name}' has replicas outside ${MIN_REPLICAS}-${MAX_REPLICAS}`,
+      });
+  }
   if (problems.length > 0) return problems;
   const seen = new Set<string>();
   for (const account of rendered)
@@ -226,23 +257,29 @@ export function renderSchedulerAccounts(
     '# Rendered by the platform controller (design-541 sections 4.2-4.4). Do not edit.',
   ];
   lines.push('accounts {');
-  for (const account of rendered.sort((a, b) => codeUnitOrder(a.name, b.name))) {
+  rendered.sort((a, b) => codeUnitOrder(a.name, b.name));
+  for (const account of rendered) {
     lines.push(`  ${account.name}: {`);
     for (const line of account.head) lines.push(`    ${line}`);
     lines.push('    users: [');
-    for (const user of account.users.sort((a, b) => codeUnitOrder(a.name, b.name)))
-      lines.push(
-        `      { user: "${user.name}"${user.permissions ? `, ${user.permissions}` : ''} }`,
-      );
+    account.users.sort((a, b) => codeUnitOrder(a.name, b.name));
+    for (const user of account.users) {
+      const fields = [`user: "${user.name}"`, user.permissions].filter(Boolean);
+      lines.push(`      { ${fields.join(', ')} }`);
+    }
     lines.push('    ]', '  }');
   }
   lines.push('}');
   return { text: `${lines.join('\n')}\n` };
 }
 
+/** The condition reason of a Tenant refused only because of another identity's problem. */
+export const REFUSED_FOR_OTHER = 'RefusedForAnotherIdentity';
+
 /**
- * The Tenant condition for a refused render: the first problem naming `tenant`, or the first
- * problem when none does. The controller sets it (from m6); the previous file keeps serving.
+ * The Tenant condition for a refused render: the first problem naming `tenant`, or a generic
+ * refusal that names no other Tenant's user when none does. The controller sets it (from m6); the
+ * previous file keeps serving.
  */
 export function schedulerAccountsCondition(
   problems: AccountsProblem[],
@@ -250,7 +287,10 @@ export function schedulerAccountsCondition(
   observedGeneration: number,
   now: Date,
 ): Condition {
-  const problem = (problems.find((p) => p.tenant === tenant) ?? problems[0]) as AccountsProblem;
+  const problem = problems.find((p) => p.tenant === tenant) ?? {
+    reason: REFUSED_FOR_OTHER,
+    message: 'refused because of another identity',
+  };
   return {
     type: SCHEDULER_ACCOUNTS_CONDITION,
     status: 'False',
@@ -262,7 +302,7 @@ export function schedulerAccountsCondition(
 }
 
 const configMapPath = (ns: string, name = '') =>
-  `/api/v1/namespaces/${ns}/configmaps${name ? `/${name}` : ''}`;
+  `/api/v1/namespaces/${[ns, 'configmaps', name].filter(Boolean).join('/')}`;
 
 /**
  * Creates {@link SCHEDULER_NATS_ACCOUNTS} in the platform namespace with no tenants, rendered from
