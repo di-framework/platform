@@ -12,6 +12,7 @@ import {
 import {
   type IdentityObservation,
   identityTransition,
+  issuanceIdOf,
   RENEWAL_OVERLAP_MS,
   RENEWAL_STALLED,
   ROTATE_ANNOTATION,
@@ -31,7 +32,8 @@ const counter = () => {
 };
 const OLD = 'aaaaaaaaaaaaaaaa';
 const PREV = 'bbbbbbbbbbbbbbbb';
-const fresh = { notAfter: at(60 * DAY), digest: 'd1' };
+const left = (ms: number, id = OLD) => ({ notAfter: at(ms), digest: 'd1', id });
+const fresh = { notAfter: at(60 * DAY), digest: 'd1', id: OLD };
 const operator = (o: Partial<IdentityObservation> = {}): IdentityObservation => ({
   client: 'operator',
   secret: fresh,
@@ -111,8 +113,6 @@ describe('scheduler identity forced rotation', () => {
 });
 
 describe('scheduler identity routine renewal', () => {
-  const left = (ms: number) => ({ notAfter: at(ms), digest: 'd1' });
-
   it('keeps a certificate with more than 30 days left', () => {
     const t = identityTransition({ current: OLD }, operator({ secret: left(30 * DAY + 1) }), now);
     expect(t.action).toBe('keep');
@@ -142,7 +142,7 @@ describe('scheduler identity routine renewal', () => {
     const expired = identityTransition({ current: OLD }, host({ secret: left(-DAY) }), now);
     expect(expired.reason).toBe('renewal');
     expect(expired.annotate).toBeUndefined();
-    const issued = { notAfter: at(SCHEDULER_LEAF_DAYS * DAY), digest: 'd1' };
+    const issued = { notAfter: at(SCHEDULER_LEAF_DAYS * DAY), digest: 'd1', id: OLD };
     const keep = identityTransition(
       { current: OLD },
       operator({ secret: issued }),
@@ -158,7 +158,8 @@ describe('scheduler identity routine renewal', () => {
     const ids = new Set<string>();
     let entry: IdentityEntry = { current: OLD };
     for (let i = 0; i < 3; i++) {
-      entry = identityTransition(entry, operator({ secret: left(DAY) }), now, random).entry;
+      const secret = left(DAY, entry.current);
+      entry = identityTransition(entry, operator({ secret }), now, random).entry;
       ids.add(entry.current);
     }
     expect(ids.size).toBe(3);
@@ -220,10 +221,67 @@ describe('scheduler identity renewal overlap: hosts', () => {
     expect(RENEWAL_STALLED).toBe('SchedulerIdentityRenewalStalled');
   });
 
-  it('keeps both users when no rollout was observed at all', () => {
-    const t = identityTransition(renewing(-1), host({ rollout: undefined }), now);
+  it('keeps both users when no rollout was observed, stalled past previousUntil', () => {
+    const before = identityTransition(renewing(1), host({ rollout: undefined }), now);
+    expect(before.entry).toEqual(renewing(1));
+    expect(before.stalled).toBeUndefined();
+    const unnamed = identityTransition(renewing(-1), host({ rollout: undefined }), now);
+    expect(unnamed.entry).toEqual(renewing(-1));
+    expect(unnamed.stalled).toBeUndefined();
+    const named = host({ rollout: undefined, deployment: 'hostgroup-tenant-a' });
+    const t = identityTransition(renewing(-1), named, now);
     expect(t.entry).toEqual(renewing(-1));
-    expect(t.stalled).toBeUndefined();
+    expect(t.stalled).toEqual({ type: RENEWAL_STALLED, deployment: 'hostgroup-tenant-a' });
+  });
+
+  it('treats a missing or invalid previousUntil as passed', () => {
+    const incomplete = host({
+      rollout: { deployment: 'hostgroup-tenant-a', digest: 'd0', complete: false },
+    });
+    for (const previousUntil of [undefined, 'not a time']) {
+      const entry: IdentityEntry = { current: OLD, previous: PREV, previousUntil };
+      expect(identityTransition(entry, operator(), now).entry).toEqual({ current: OLD });
+      const h = identityTransition(entry, incomplete, now);
+      expect(h.entry).toEqual(entry);
+      expect(h.stalled).toEqual({ type: RENEWAL_STALLED, deployment: 'hostgroup-tenant-a' });
+    }
+  });
+});
+
+describe('scheduler identity pending issuance', () => {
+  it('reads the issuance ID from a leaf DNS name', () => {
+    expect(issuanceIdOf(`${OLD}.operator.platform.x`)).toBe(OLD);
+    expect(issuanceIdOf('nats.ns.svc')).toBeUndefined();
+  });
+
+  it('retries a renewal that did not land for the same ID, keeping previous', () => {
+    const renewal = identityTransition(
+      { current: OLD },
+      operator({ secret: left(DAY) }),
+      now,
+      counter(),
+    );
+    expect(renewal.entry).toEqual({
+      current: '0101010101010101',
+      previous: OLD,
+      previousUntil: '2026-10-29T12:10:00.000Z',
+    });
+    const retry = identityTransition(
+      renewal.entry,
+      operator({ secret: left(DAY) }),
+      at(RENEWAL_OVERLAP_MS),
+      counter(),
+    );
+    expect(retry).toEqual({ entry: renewal.entry, action: 'issue', reason: 'pending' });
+  });
+
+  it('drops previous for neither client while the Secret holds the old certificate', () => {
+    const old = { ...fresh, id: PREV };
+    const incomplete = { deployment: 'hostgroup-tenant-a', digest: 'd1', complete: true };
+    for (const o of [operator({ secret: old }), host({ secret: old, rollout: incomplete })]) {
+      const t = identityTransition(renewing(-DAY), o, now);
+      expect(t).toEqual({ entry: renewing(-DAY), action: 'issue', reason: 'pending' });
+    }
   });
 });
 

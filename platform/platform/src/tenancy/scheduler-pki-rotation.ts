@@ -15,16 +15,24 @@
  * - **Routine renewal**: the certificate has at most {@link SCHEDULER_LEAF_RENEW_DAYS} days left.
  *   A new current ID, the old one kept as `previous` until `previousUntil` (now +
  *   {@link RENEWAL_OVERLAP_MS}).
- * - **Operators** drop `previous` at `previousUntil`.
+ * - **Pending issuance**: the Secret's certificate carries another ID than the recorded `current`
+ *   (the record was written but issuance did not land). The certificate is re-issued for the
+ *   recorded `current`; no new ID is drawn and `previous` stays, so the ID the live certificate
+ *   carries never leaves the record.
+ * - **Operators** drop `previous` at `previousUntil`, once the Secret carries `current`.
  * - **Hosts** drop `previous` only once the rollout of the current certificate is observed
  *   ({@link SCHEDULER_TLS_ANNOTATION} on the pod template, all replicas updated and ready). Past
- *   `previousUntil` without that, both users stay and {@link RENEWAL_STALLED} is reported.
+ *   `previousUntil` without that, both users stay and {@link RENEWAL_STALLED} is reported, also
+ *   when no rollout was observed at all (it then names the expected Deployment).
+ *
+ * A missing or unparseable `previousUntil` counts as passed, so such an entry still converges.
  */
 import { createHash } from 'node:crypto';
 import {
   codeUnitOrder,
   type IdentityEntry,
   type IdentityRecord,
+  ISSUANCE_ID,
   newIssuanceId,
   SCHEDULER_LEAF_RENEW_DAYS,
 } from './scheduler-pki';
@@ -43,9 +51,20 @@ const DAY_MS = 86_400_000;
 export const schedulerCertDigest = (cert: string): string =>
   createHash('sha256').update(cert).digest('hex');
 
-/** True when the Tenant's rotation annotation differs from the value last handled. */
+/**
+ * True when the Tenant's rotation annotation differs from the value last handled; removing the
+ * annotation counts as a change. The handled value is stored by the m6 wiring in Tenant status,
+ * written after the record and before issuance, so an interrupted forced rotation repeats at most
+ * once.
+ */
 export const rotationRequested = (annotation?: string, handled?: string): boolean =>
   (annotation ?? '') !== (handled ?? '');
+
+/** The issuance ID a leaf's DNS SAN (its NATS user) carries. */
+export const issuanceIdOf = (user: string): string | undefined => {
+  const id = user.split('.', 1)[0] as string;
+  return ISSUANCE_ID.test(id) ? id : undefined;
+};
 
 /** Who presents the identity: an operator reconnects by itself; hosts must be rolled. */
 export type IdentityClient = 'operator' | 'host';
@@ -53,10 +72,15 @@ export type IdentityClient = 'operator' | 'host';
 /** What was observed of one identity. */
 export interface IdentityObservation {
   client: IdentityClient;
-  /** The identity's Secret; undefined when it is missing. */
-  secret?: { notAfter: Date; digest: string };
+  /**
+   * The identity's Secret; undefined when it is missing. `id` is the issuance ID its certificate
+   * carries ({@link issuanceIdOf} of the leaf's DNS SAN).
+   */
+  secret?: { notAfter: Date; digest: string; id: string };
   /** A forced rotation was requested (see {@link rotationRequested}). */
   forced?: boolean;
+  /** Hosts only: the Deployment expected to present the identity, named when no rollout is seen. */
+  deployment?: string;
   /** Hosts only: the Deployment that presents the identity, and its observed rollout. */
   rollout?: {
     deployment: string;
@@ -67,7 +91,7 @@ export interface IdentityObservation {
   };
 }
 
-export type IdentityReason = 'new' | 'forced' | 'missing' | 'renewal' | 'current';
+export type IdentityReason = 'new' | 'forced' | 'missing' | 'pending' | 'renewal' | 'current';
 
 /** The outcome of one identity's transition. */
 export interface IdentityTransition {
@@ -75,7 +99,11 @@ export interface IdentityTransition {
   /** `issue` a certificate for `entry.current` (after the record is written), or `keep` it. */
   action: 'issue' | 'keep';
   reason: IdentityReason;
-  /** Hosts only: the pod-template annotation to set, when the Secret holds a certificate. */
+  /**
+   * Hosts only: the pod-template annotation to set, when the Secret holds the certificate of
+   * `entry.current`. Absent on `issue`: the new certificate's digest is not known before issuance,
+   * so the caller sets {@link schedulerCertDigest} of the issued certificate in the same reconcile.
+   */
   annotate?: { [SCHEDULER_TLS_ANNOTATION]: string };
   /** Set when a host renewal has stalled; names the Deployment. */
   stalled?: { type: typeof RENEWAL_STALLED; deployment: string };
@@ -95,6 +123,7 @@ export function identityTransition(
   if (observed.forced) return { entry: { current: id() }, action: 'issue', reason: 'forced' };
   const { secret } = observed;
   if (!secret) return { entry: { current: id() }, action: 'issue', reason: 'missing' };
+  if (secret.id !== entry.current) return { entry, action: 'issue', reason: 'pending' };
   const annotate =
     observed.client === 'host' ? { [SCHEDULER_TLS_ANNOTATION]: secret.digest } : undefined;
   if (secret.notAfter.getTime() <= now.getTime() + SCHEDULER_LEAF_RENEW_DAYS * DAY_MS)
@@ -115,12 +144,12 @@ export function identityTransition(
     ...(stalled ? { stalled } : {}),
   });
   if (entry.previous === undefined) return keep(entry);
-  const until = Date.parse(entry.previousUntil ?? '');
-  if (observed.client === 'operator') return keep(now.getTime() >= until ? drop(entry) : entry);
-  const rollout = observed.rollout;
+  const passed = !(now.getTime() < Date.parse(entry.previousUntil ?? ''));
+  if (observed.client === 'operator') return keep(passed ? drop(entry) : entry);
+  const { rollout } = observed;
   if (rollout?.complete && rollout.digest === secret.digest) return keep(drop(entry));
-  if (now.getTime() >= until && rollout)
-    return keep(entry, { type: RENEWAL_STALLED, deployment: rollout.deployment });
+  const deployment = rollout?.deployment ?? observed.deployment;
+  if (passed && deployment) return keep(entry, { type: RENEWAL_STALLED, deployment });
   return keep(entry);
 }
 
