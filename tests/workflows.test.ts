@@ -1231,7 +1231,8 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
       group: 'release-${{ github.ref }}',
       'cancel-in-progress': false,
     });
-    const first = steps('build')[0];
+    // Second only to the tag check (#523): both run before anything is built or published.
+    const first = steps('build')[1];
     expect(first?.name).toBe('Refuse a version that is already released');
     expect(first?.if).toBe("github.ref_type == 'tag'");
 
@@ -1273,6 +1274,26 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     expect(released.stdout).toContain('::error::GitHub Release v1.2.3 already exists');
   });
 
+  test('only a vX.Y.Z tag releases: a prerelease tag stops before anything is published (#523)', () => {
+    const first = steps('build')[0];
+    expect(first?.name).toBe('Refuse a tag that is not a release version');
+    expect(first?.if).toBe("github.ref_type == 'tag'");
+    const check = (tag: string) =>
+      Bun.spawnSync(['bash', '-c', first?.run ?? ''], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: { ...env, GITHUB_REF_NAME: tag },
+      });
+    expect(check('v6.0.24').exitCode).toBe(0);
+    for (const tag of ['v6.0.24-rc.1', 'v6.0', '6.0.24', 'v6.0.24.1', 'vX.Y.Z']) {
+      const r = check(tag);
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout.toString()).toContain(`::error::tag ${tag} is not vX.Y.Z`);
+    }
+    // The chart agrees: it packages only X.Y.Z.
+    expect(runs('chart')).toContain('if [[ ! "$VERSION" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then');
+  });
+
   test('build → publish → bake → operator-image → operator-index → chart → github-release, then project-pr (#431)', () => {
     expect(Object.keys(release.jobs).sort()).toEqual([
       'bake',
@@ -1294,7 +1315,8 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     // The GitHub Release is announced only once the npm packages and the chart are both out; it
     // needs build for the Headlamp plugin's sha256 (#435).
     expect(release.jobs['github-release']?.needs).toEqual(['build', 'publish', 'chart']);
-    expect(release.jobs['project-pr']?.needs).toBe('chart');
+    // project-pr commits bake's files (#523), once the chart is out.
+    expect(release.jobs['project-pr']?.needs).toEqual(['bake', 'chart']);
     for (const job of [
       'bake',
       'operator-image',
@@ -1359,10 +1381,10 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
     const PROJECT = 'platform/operator/internal/installer/project';
     /**
      * Runs the bump step in a scratch checkout. The stubbed `bun scripts/operator-project.ts bump`
-     * fails until its `ok`-th call (npm not serving the version yet), then writes `pin` into the
-     * project, and `extra` outside it when set.
+     * exits `fail` until its `ok`-th call (75: npm not serving the version yet), then writes `pin`
+     * into the project, and `extra` outside it when set.
      */
-    const bake = (ok: number, pin = '9.9.9', extra = false) => {
+    const bake = (ok: number, pin = '9.9.9', extra = false, fail = 75) => {
       const base = mkdtempSync(join(tmpdir(), 'release-bake-'));
       const repo = join(base, 'repo');
       const bin = join(base, 'bin');
@@ -1377,7 +1399,7 @@ describe('release.yml publishes the tested npm tarballs byte for byte (#168)', (
         bin,
         'bun',
         `n=$(cat "${base}/tries" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "${base}/tries"
-[ "$n" -ge ${ok} ] || exit 1
+[ "$n" -ge ${ok} ] || exit ${fail}
 [ "$1 $2 $3" = "scripts/operator-project.ts bump 9.9.9" ] || exit 2
 ${extra ? 'echo x > stray.txt' : ''}
 cd ${PROJECT}
@@ -1416,6 +1438,15 @@ jq '.packages["node_modules/@di-framework/platform"].version="${pin}"' package-l
     expect(never.tries).toBe(20);
     expect(never.stdout).toContain('::error::could not pin');
     expect(never.output).toBe('');
+
+    // Only exit 75 is retried (#523): a refusal (2) or any other failure stops at once.
+    for (const fail of [1, 2]) {
+      const refused = bake(3, '9.9.9', false, fail);
+      expect(refused.code).toBe(1);
+      expect(refused.tries).toBe(1);
+      expect(refused.stdout).toContain(`(exit ${fail}; not retried)`);
+      expect(refused.output).toBe('');
+    }
 
     const other = bake(1, '9.9.8');
     expect(other.code).toBe(1);
@@ -1464,12 +1495,33 @@ jq '.packages["node_modules/@di-framework/platform"].version="${pin}"' package-l
     expect(c).toContain(
       'cmp "$RUNNER_TEMP/baked-package.json" platform/operator/internal/installer/project/package.json',
     );
+    // The version compiled into the binary, and the label tying the image to bake's files (#523).
+    expect(c).toContain('docker run --rm "$image" --print-default-version');
+    expect(c).toContain('"$compiled" != "$VERSION"');
+    expect(b.labels).toContain(
+      'dev.di-framework.platform-operator.project-sha256=${{ needs.bake.outputs.project_sha256 }}',
+    );
+    expect(all[check]?.env?.PROJECT_SHA256).toBe('${{ needs.bake.outputs.project_sha256 }}');
+    expect(c).toContain('index .Config.Labels "dev.di-framework.platform-operator.project-sha256"');
+    expect(c).toContain('"$label" != "$PROJECT_SHA256"');
+    expect(read('platform/operator/cmd/platform-operator/main.go')).toContain(
+      'flag.Bool("print-default-version"',
+    );
   });
 
   test('operator-index tags only v<version>, and the main-branch workflow never writes a v* tag (#431)', () => {
     const run = runs('operator-index');
     expect(run).toContain('--tag "ghcr.io/di-framework/platform-operator:v${VERSION}"');
     expect(run.match(/--tag /g)).toHaveLength(1);
+    // The index carries bake's project-sha256 too, checked after the push (#523).
+    expect(run).toContain(
+      '--annotation "index:dev.di-framework.platform-operator.project-sha256=${PROJECT_SHA256}"',
+    );
+    expect(run).toContain(
+      '.annotations["dev.di-framework.platform-operator.project-sha256"] == $sum',
+    );
+    const index = steps('operator-index').find((s) => s.id === 'index');
+    expect(index?.env?.PROJECT_SHA256).toBe('${{ needs.bake.outputs.project_sha256 }}');
     expect(run).not.toMatch(/src-|GITHUB_SHA|oras tag/);
     expect(release.jobs['operator-index']?.outputs).toEqual({
       digest: '${{ steps.index.outputs.digest }}',
@@ -1493,6 +1545,278 @@ jq '.packages["node_modules/@di-framework/platform"].version="${pin}"' package-l
     expect(run).toContain('A maintainer has to approve and run this PR');
     // Not the main-branch image pin PR's branch.
     expect(run).not.toContain('bot/pin-platform-operator');
+    // bake's files (#523), checked against bake's sha256.
+    const download = job?.steps?.find((s) => s.uses?.startsWith('actions/download-artifact@'));
+    expect(download?.with?.name).toBe('operator-project');
+    // A re-run after the 7-day artifact expired falls back to the bump on main (review S2).
+    expect((download as { 'continue-on-error'?: boolean })['continue-on-error']).toBe(true);
+    expect(download?.id).toBe('baked');
+    const open = job?.steps?.find((s) => s.name === 'Open or update the PR');
+    expect(open?.env?.PROJECT_SHA256).toBe('${{ needs.bake.outputs.project_sha256 }}');
+  });
+
+  describe('project-pr against a sandbox origin (#523)', () => {
+    const run = steps('project-pr').find((s) => s.name === 'Open or update the PR')?.run ?? '';
+    const PROJECT = 'platform/operator/internal/installer/project';
+    const FILES = ['package.json', 'package-lock.json', 'plugins.txt'];
+    const pkg = (pin: string, extra: Record<string, string> = {}) =>
+      `${JSON.stringify({ private: true, dependencies: { '@di-framework/platform': pin, '@pulumi/pulumi': '3.0.0', ...extra } }, null, 2)}\n`;
+    const project = (pin: string, extra: Record<string, string> = {}) => ({
+      'package.json': pkg(pin, extra),
+      'package-lock.json': `lock ${pin}\n`,
+      'plugins.txt': `plugins ${pin}\n`,
+    });
+    const writeProject = (dir: string, files: Record<string, string>) => {
+      mkdirSync(join(dir, PROJECT), { recursive: true });
+      for (const [f, text] of Object.entries(files)) writeFileSync(join(dir, PROJECT, f), text);
+    };
+    const pinOf = (text: string) => JSON.parse(text).dependencies['@di-framework/platform'];
+
+    /**
+     * A sandbox origin whose main is the tag's commit (main pins `main`, plus `mainChanged` commits
+     * after the tag), an optional bot/operator-project branch pinning `branch` with an open PR #7
+     * when `open`, and bake's artifact for release 1.0.2 (the bake job's files: lockfile and
+     * plugins.txt differ from what a bump on main would write), or none when `expired`. The stubbed
+     * `bun` bump writes the pin. With `race`, a bot branch pinning `race` is pushed while the job
+     * runs, as a newer release's project-pr would: during the bump (`raceAt: 'bun'`), or right
+     * after the job has read the bot branch, when it reads main's pin (`raceAt: 'jq'`).
+     */
+    const projectPr = (opts: {
+      main?: string;
+      mainChanged?: boolean;
+      branch?: string;
+      open?: boolean;
+      race?: string;
+      raceAt?: 'bun' | 'jq';
+      expired?: boolean;
+    }) => {
+      const { base, origin, work } = sandboxClone('release-project-pr-');
+      writeProject(work, project(opts.main ?? '1.0.0'));
+      git(work, 'add', '.');
+      git(work, 'commit', '-qm', 'tag');
+      const tagSha = git(work, 'rev-parse', 'HEAD');
+      if (opts.mainChanged) {
+        writeProject(work, { 'package.json': pkg(opts.main ?? '1.0.0', { extra: '1.0.0' }) });
+        git(work, 'commit', '-qam', 'template change on main');
+      }
+      git(work, 'push', '-q', 'origin', 'HEAD:refs/heads/main');
+      const pushBranch = (pin: string) => {
+        const side = join(base, `side-${pin}`);
+        git(base, 'clone', '-q', origin, side);
+        writeProject(side, project(pin));
+        git(side, 'commit', '-qam', `bot ${pin}`);
+        git(side, 'push', '-qf', 'origin', 'HEAD:refs/heads/bot/operator-project');
+      };
+      if (opts.branch) pushBranch(opts.branch);
+      const branchBefore = opts.branch
+        ? git(origin, 'rev-parse', 'refs/heads/bot/operator-project')
+        : '';
+
+      const temp = join(base, 'temp');
+      const baked = {
+        'package.json': pkg('1.0.2'),
+        'package-lock.json': 'lock 1.0.2 from bake\n',
+        'plugins.txt': 'plugins 1.0.2 from bake\n',
+      };
+      mkdirSync(join(temp, 'operator-project'), { recursive: true });
+      if (!opts.expired) {
+        for (const [f, text] of Object.entries(baked))
+          writeFileSync(join(temp, 'operator-project', f), text);
+      }
+      const sum = Bun.spawnSync(
+        ['bash', '-c', 'sha256sum package.json package-lock.json plugins.txt | sha256sum'],
+        { cwd: join(temp, 'operator-project') },
+      )
+        .stdout.toString()
+        .split(' ')[0];
+
+      const bin = join(base, 'bin');
+      const log = join(base, 'calls.log');
+      writeFileSync(log, '');
+      // `gh pr close` fails as it does on a PR GitHub already closed with its deleted branch.
+      stubCommand(
+        bin,
+        'gh',
+        `if [ "$1 $2" = "pr list" ]; then ${opts.open ? 'echo 7' : 'true'}; else echo "gh $*" >> "${log}"; [ "$1 $2" != "pr close" ] || exit 1; fi`,
+      );
+      const race = `(cd "${base}/side-race" && git push -qf origin HEAD:refs/heads/bot/operator-project)`;
+      const raceAt = opts.race ? (opts.raceAt ?? 'bun') : undefined;
+      if (raceAt === 'jq') {
+        const jq = Bun.which('jq') ?? 'jq';
+        stubCommand(
+          bin,
+          'jq',
+          `if [ "$3" = "${PROJECT}/package.json" ] && [ ! -f "${base}/raced" ]; then touch "${base}/raced"; ${race}; fi
+exec "${jq}" "$@"`,
+        );
+      }
+      stubCommand(
+        bin,
+        'bun',
+        `echo "bun $*" >> "${log}"
+${raceAt === 'bun' ? race : ''}
+cd ${PROJECT}
+jq --arg v "$3" '.dependencies["@di-framework/platform"]=$v' package.json > p && mv p package.json
+echo "lock $3 from main" > package-lock.json`,
+      );
+      if (opts.race) {
+        const side = join(base, 'side-race');
+        git(base, 'clone', '-q', origin, side);
+        writeProject(side, project(opts.race));
+        git(side, 'commit', '-qam', `bot ${opts.race}`);
+      }
+
+      const result = Bun.spawnSync(['bash', '-c', run], {
+        cwd: work,
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: {
+          ...env,
+          PATH: `${bin}:${process.env.PATH}`,
+          GITHUB_REF_NAME: 'v1.0.2',
+          GITHUB_SHA: tagSha,
+          RUNNER_TEMP: temp,
+          RUN_URL: 'https://example.invalid/run',
+          PROJECT_SHA256: sum ?? '',
+          BAKED_OUTCOME: opts.expired ? 'failure' : 'success',
+        },
+      });
+      const branchAfter = Bun.spawnSync(
+        ['git', 'rev-parse', '--verify', '-q', 'refs/heads/bot/operator-project'],
+        { cwd: origin, env },
+      )
+        .stdout.toString()
+        .trim();
+      const show = (f: string) =>
+        branchAfter ? `${git(origin, 'show', `${branchAfter}:${PROJECT}/${f}`)}\n` : '';
+      return {
+        code: result.exitCode,
+        out: result.stdout.toString() + result.stderr.toString(),
+        calls: readFileSync(log, 'utf8'),
+        moved: branchAfter !== branchBefore,
+        files: Object.fromEntries(FILES.map((f) => [f, show(f)])),
+        baked,
+      };
+    };
+
+    test("commits bake's files as they are when main's project is still the tag's (S3)", () => {
+      const r = projectPr({});
+      expect(r.code).toBe(0);
+      expect(r.files).toEqual(r.baked);
+      expect(r.calls).not.toContain('bun ');
+      expect(r.calls).toContain('gh pr create --base main --head bot/operator-project');
+    });
+
+    test('bumps main on its own files when main changed the project since the tag (S3)', () => {
+      const r = projectPr({ mainChanged: true });
+      expect(r.code).toBe(0);
+      expect(r.out).toContain('differs from v1.0.2');
+      expect(r.calls).toContain('bun scripts/operator-project.ts bump 1.0.2');
+      expect(pinOf(r.files['package.json'] ?? '')).toBe('1.0.2');
+      expect(JSON.parse(r.files['package.json'] ?? '').dependencies.extra).toBe('1.0.0');
+      expect(r.files['package-lock.json']).toBe('lock 1.0.2 from main\n');
+    });
+
+    test("re-run after bake's artifact expired bumps main's own files (review S2)", () => {
+      const r = projectPr({ expired: true });
+      expect(r.code).toBe(0);
+      expect(r.out).toContain('the operator-project artifact from bake is not available');
+      expect(r.calls).toContain('bun scripts/operator-project.ts bump 1.0.2');
+      expect(pinOf(r.files['package.json'] ?? '')).toBe('1.0.2');
+      expect(r.files['package-lock.json']).toBe('lock 1.0.2 from main\n');
+      expect(r.calls).toContain('gh pr create');
+    });
+
+    test('never moves an open bot PR back to an older release (S1)', () => {
+      const r = projectPr({ branch: '1.0.3', open: true });
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(
+        'bot/operator-project (PR #7) already moves main to @di-framework/platform@1.0.3',
+      );
+      expect(r.moved).toBe(false);
+      expect(r.calls).toBe('');
+    });
+
+    test('moves an open bot PR forward from an older release', () => {
+      const r = projectPr({ branch: '1.0.1', open: true });
+      expect(r.code).toBe(0);
+      expect(r.moved).toBe(true);
+      expect(r.files).toEqual(r.baked);
+      expect(r.calls).toContain('gh pr edit 7');
+      expect(r.calls).not.toContain('gh pr create');
+    });
+
+    test('a newer bot branch with no PR yet (a newer release in flight) is left alone (W1)', () => {
+      const r = projectPr({ branch: '1.0.3' });
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(
+        'bot/operator-project (PR #none yet) already moves main to @di-framework/platform@1.0.3',
+      );
+      expect(r.moved).toBe(false);
+      expect(pinOf(r.files['package.json'] ?? '')).toBe('1.0.3');
+      expect(r.calls).toBe('');
+    });
+
+    test('a leftover older bot branch without an open PR is overwritten', () => {
+      const r = projectPr({ branch: '1.0.1' });
+      expect(r.code).toBe(0);
+      expect(r.moved).toBe(true);
+      expect(r.files).toEqual(r.baked);
+      expect(r.calls).toContain('gh pr create');
+    });
+
+    test('deletes a bot branch main has already passed, then closes its PR (S1, W2)', () => {
+      for (const main of ['1.0.2', '1.0.3']) {
+        const r = projectPr({ main, branch: '1.0.1', open: true });
+        expect(r.code).toBe(0);
+        expect(r.out).toContain(`main already bakes @di-framework/platform@${main}`);
+        expect(r.out).toContain(`Deleted bot/operator-project (bakes 1.0.1)`);
+        // Deleted by the leased push; then the "Superseded" comment, posted on its own so it lands
+        // although GitHub already closed the PR with its branch (round 2 S2), then the close.
+        expect(r.files['package.json']).toBe('');
+        expect(r.calls.split('\n').filter(Boolean)).toEqual([
+          `gh pr comment 7 --body Superseded: main already bakes \`@di-framework/platform@${main}\` (v1.0.2, [run](https://example.invalid/run)).`,
+          'gh pr close 7',
+        ]);
+        expect(r.out).toContain('PR #7 was already closed with its branch');
+      }
+      // A leftover branch main has passed, with no PR: deleted, nothing to close.
+      const leftover = projectPr({ main: '1.0.2', branch: '1.0.1' });
+      expect(leftover.code).toBe(0);
+      expect(leftover.files['package.json']).toBe('');
+      expect(leftover.calls).toBe('');
+      // A newer release's branch is kept even when main is at this release.
+      const newer = projectPr({ main: '1.0.2', branch: '1.0.3' });
+      expect(newer.code).toBe(0);
+      expect(newer.moved).toBe(false);
+      expect(newer.calls).toBe('');
+      // A main at the release with no bot branch: nothing to do.
+      const none = projectPr({ main: '1.0.2' });
+      expect(none.code).toBe(0);
+      expect(none.calls).toBe('');
+    });
+
+    test('a newer release pushing the bot branch before the delete keeps it (leased delete, W2)', () => {
+      const r = projectPr({
+        main: '1.0.2',
+        branch: '1.0.1',
+        open: true,
+        race: '1.0.3',
+        raceAt: 'jq',
+      });
+      expect(r.code).toBe(0);
+      expect(r.out).toContain('moved to @di-framework/platform@1.0.3 during this run');
+      expect(pinOf(r.files['package.json'] ?? '')).toBe('1.0.3');
+      expect(r.calls).toBe('');
+    });
+
+    test('a newer release pushing the bot branch during this run wins (leased push, S1)', () => {
+      const r = projectPr({ mainChanged: true, race: '1.0.3' });
+      expect(r.code).toBe(0);
+      expect(r.out).toContain('moved to @di-framework/platform@1.0.3 during this run');
+      expect(pinOf(r.files['package.json'] ?? '')).toBe('1.0.3');
+      expect(r.calls).not.toContain('gh pr');
+    });
   });
 
   test('chart packages the operator chart at the tag version and pushes it to GHCR (#272)', () => {

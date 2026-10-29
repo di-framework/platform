@@ -10,11 +10,16 @@ import {
   bump,
   checksumsUrl,
   compareVersions,
+  EXIT_REFUSED,
+  EXIT_RETRY,
   main,
+  npmDeps,
+  npmFailure,
   PLATFORM_PACKAGE,
   PROJECT_DIR,
   parseChecksums,
   providers,
+  RetryableError,
   renderPlugins,
   setPlatformVersion,
 } from '../scripts/operator-project';
@@ -109,6 +114,9 @@ describe('bump', () => {
       const fetched: string[] = [];
       const r = await bump(root, undefined, {
         latest: () => '6.9.0',
+        published: () => {
+          throw new Error('npm latest is published by definition');
+        },
         lock: (dir) => {
           const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
           const version = pkg.dependencies[PLATFORM_PACKAGE];
@@ -148,6 +156,7 @@ describe('bump', () => {
         latest: () => {
           throw new Error('npm latest must not be asked for an explicit version');
         },
+        published: (v) => v === release,
         lock: (d) => {
           const v = JSON.parse(readFileSync(join(d, 'package.json'), 'utf8')).dependencies[
             PLATFORM_PACKAGE
@@ -184,6 +193,7 @@ describe('bump', () => {
         latest: () => {
           throw new Error('not asked');
         },
+        published: () => true,
         lock: () => {},
         checksums: async () => {
           throw new Error('not fetched');
@@ -213,6 +223,9 @@ describe('bump', () => {
       const pinned = JSON.parse(before[0] as string).dependencies[PLATFORM_PACKAGE] as string;
       const deps = {
         latest: () => '0.0.1',
+        published: () => {
+          throw new Error('not asked: the downgrade is refused first');
+        },
         lock: () => {
           throw new Error('not relocked');
         },
@@ -230,17 +243,237 @@ describe('bump', () => {
     }
   });
 
-  test('main refuses an unknown command or a non-release version', async () => {
+  test('main refuses an unknown command, a non-release or prerelease version: exit 2, never retried (#523)', async () => {
     const err = spyOn(console, 'error').mockImplementation(() => {});
     try {
-      expect(await main(['pin'])).toBe(1);
-      expect(await main(['bump', 'latest'], scratch())).toBe(1);
+      expect(EXIT_REFUSED).toBe(2);
+      expect(await main(['pin'])).toBe(EXIT_REFUSED);
+      expect(await main(['bump', 'latest'], scratch())).toBe(EXIT_REFUSED);
+      expect(await main(['bump', '6.0.24-rc.1'], scratch())).toBe(EXIT_REFUSED);
       expect(err.mock.calls.map((c) => String(c[0]))).toEqual([
         '::error::unknown command "pin"',
         '::error::expected a release version like 6.0.22, got "latest"',
+        '::error::expected a release version like 6.0.22, got "6.0.24-rc.1"',
       ]);
     } finally {
       err.mockRestore();
     }
+  });
+
+  /** Deps for an explicit bump to a version npm serves only when `served` says so. */
+  const depsFor = (served: () => boolean, lock: (dir: string) => void = () => {}) => ({
+    latest: () => {
+      throw new Error('not asked');
+    },
+    published: served,
+    lock,
+    checksums: async (name: string, v: string) => checksums(name, v),
+  });
+  const nextRelease = (root: string) => {
+    const pinned = JSON.parse(readFileSync(join(root, PROJECT_DIR, 'package.json'), 'utf8'))
+      .dependencies[PLATFORM_PACKAGE] as string;
+    const [major, minor, patch] = pinned.split('.').map(Number);
+    return `${major}.${minor}.${(patch as number) + 1}`;
+  };
+
+  test('a version npm does not serve yet exits 75, which release.yml retries, and changes nothing (#523)', async () => {
+    const root = scratch();
+    const err = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(EXIT_RETRY).toBe(75);
+      const dir = join(root, PROJECT_DIR);
+      const files = ['package.json', 'package-lock.json', 'plugins.txt'];
+      const before = files.map((f) => readFileSync(join(dir, f), 'utf8'));
+      const release = nextRelease(root);
+      const code = await main(
+        ['bump', release],
+        root,
+        depsFor(
+          () => false,
+          () => {
+            throw new Error('not relocked');
+          },
+        ),
+      );
+      expect(code).toBe(EXIT_RETRY);
+      expect(String(err.mock.calls[0]?.[0])).toBe(
+        `::notice::npm does not serve ${PLATFORM_PACKAGE}@${release} yet (retryable)`,
+      );
+      expect(files.map((f) => readFileSync(join(dir, f), 'utf8'))).toEqual(before);
+    } finally {
+      err.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('a relock npm cannot resolve yet is retryable; any other relock failure exits 1 (#523)', async () => {
+    const root = scratch();
+    const err = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const release = nextRelease(root);
+      const retry = depsFor(
+        () => true,
+        () => {
+          throw npmFailure('npm install', 1, 'npm error code ETARGET\nnpm error notarget');
+        },
+      );
+      expect(await main(['bump', release], root, retry)).toBe(EXIT_RETRY);
+      const broken = depsFor(
+        () => true,
+        () => {
+          throw npmFailure('npm install', 1, 'npm error code ERESOLVE');
+        },
+      );
+      expect(await main(['bump', release], scratch(), broken)).toBe(1);
+    } finally {
+      err.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('npmFailure retries only a version not served yet or a registry failure (#523)', () => {
+    const retryable = (stderr: string) => npmFailure('npm x', 1, stderr) instanceof RetryableError;
+    expect(retryable('npm error code E404\nnpm error 404 No match found for version 9.9.9')).toBe(
+      true,
+    );
+    expect(retryable('npm error code ETARGET')).toBe(true);
+    expect(retryable('npm error code E503')).toBe(true);
+    expect(retryable('npm error code ECONNRESET')).toBe(true);
+    expect(retryable('npm error code EAI_AGAIN')).toBe(true);
+    for (const stderr of [
+      'npm error code E429\nnpm error 429 Too Many Requests',
+      'npm error code ERR_SOCKET_TIMEOUT',
+      'npm error code ECONNABORTED',
+      'npm error code EPIPE',
+      'npm error code ENETUNREACH',
+      'npm error code EHOSTUNREACH',
+      'npm error code ETIMEDOUT',
+      'npm error code ECONNREFUSED',
+      'npm error code ENOTFOUND',
+      'npm error code FETCH_ERROR',
+      'npm error invalid json response body at https://registry.npmjs.org/x reason: Unexpected end',
+      'npm error socket hang up',
+    ]) {
+      expect([stderr, retryable(stderr)]).toEqual([stderr, true]);
+    }
+    expect(retryable('npm error code E403')).toBe(false);
+    expect(retryable('npm error code ERESOLVE')).toBe(false);
+    expect(retryable('npm error code EINTEGRITY')).toBe(false);
+    expect(retryable('')).toBe(false);
+  });
+});
+
+describe('npmDeps against a stubbed npm and GitHub (#523)', () => {
+  /**
+   * Runs fn with an `npm` on PATH that prints `stdout`, writes `stderr` and exits `code`, and
+   * records its arguments.
+   */
+  const withNpm = <T>(code: number, stdout: string, stderr: string, fn: (log: string) => T): T => {
+    const bin = mkdtempSync(join(tmpdir(), 'operator-project-npm-'));
+    const log = join(bin, 'calls.log');
+    writeFileSync(
+      join(bin, 'npm'),
+      `#!/bin/sh\necho "$*" >> "${log}"\nprintf '%s' '${stdout}'\nprintf '%s' '${stderr}' >&2\nexit ${code}\n`,
+      { mode: 0o755 },
+    );
+    const path = process.env.PATH;
+    process.env.PATH = `${bin}:${path}`;
+    const write = spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      return fn(log);
+    } finally {
+      write.mockRestore();
+      process.env.PATH = path;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  };
+
+  test('latest is npm view <package> version; a failure is classified', () => {
+    withNpm(0, '6.0.30\n', '', (log) => {
+      expect(npmDeps.latest()).toBe('6.0.30');
+      expect(readFileSync(log, 'utf8')).toContain(`view ${PLATFORM_PACKAGE} version`);
+    });
+    withNpm(1, '', 'npm error code ECONNRESET', () => {
+      expect(() => npmDeps.latest()).toThrow(RetryableError);
+    });
+    withNpm(1, '', 'npm error code EACCES', () => {
+      const error = (() => {
+        try {
+          npmDeps.latest();
+        } catch (e) {
+          return e;
+        }
+      })();
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(RetryableError);
+    });
+  });
+
+  test('published is true only for exactly that version; E404 is "not yet"; other errors throw', () => {
+    withNpm(0, '9.9.9\n', '', (log) => {
+      expect(npmDeps.published('9.9.9')).toBe(true);
+      expect(readFileSync(log, 'utf8')).toContain(`view ${PLATFORM_PACKAGE}@9.9.9 version`);
+    });
+    withNpm(0, '', '', () => expect(npmDeps.published('9.9.9')).toBe(false));
+    withNpm(1, '', 'npm error code E404\nnpm error 404 No match found for version 9.9.9', () =>
+      expect(npmDeps.published('9.9.9')).toBe(false),
+    );
+    withNpm(1, '', 'npm error code E503', () =>
+      expect(() => npmDeps.published('9.9.9')).toThrow(RetryableError),
+    );
+    withNpm(1, '', 'npm error code EACCES', () =>
+      expect(() => npmDeps.published('9.9.9')).toThrow('exited 1'),
+    );
+  });
+
+  test('lock relocks in the project directory; a version npm cannot resolve yet is retryable', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-project-lock-'));
+    try {
+      withNpm(0, '', '', (log) => {
+        npmDeps.lock(dir);
+        expect(readFileSync(log, 'utf8')).toContain(
+          'install --package-lock-only --ignore-scripts --no-audit --no-fund',
+        );
+      });
+      withNpm(1, '', 'npm error code ETARGET', () =>
+        expect(() => npmDeps.lock(dir)).toThrow(RetryableError),
+      );
+      withNpm(1, '', 'npm error code ERESOLVE', () =>
+        expect(() => npmDeps.lock(dir)).toThrow('exited 1'),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('checksums retries a network failure, a 5xx or a 429, not a 404 or 403', async () => {
+    const respond = (impl: () => Promise<Response>) =>
+      spyOn(globalThis, 'fetch').mockImplementation(impl as unknown as typeof fetch);
+    const outcome = async (impl: () => Promise<Response>) => {
+      const f = respond(impl);
+      try {
+        return await npmDeps.checksums('command', '1.2.1').catch((e: unknown) => e);
+      } finally {
+        f.mockRestore();
+      }
+    };
+    expect(await outcome(async () => new Response('sums'))).toBe('sums');
+    const network = await outcome(async () => {
+      throw new Error('socket hang up');
+    });
+    expect(network).toBeInstanceOf(RetryableError);
+    expect(String(network)).toContain(checksumsUrl('command', '1.2.1'));
+    expect(await outcome(async () => new Response('', { status: 502 }))).toBeInstanceOf(
+      RetryableError,
+    );
+    // GitHub's rate limit.
+    expect(await outcome(async () => new Response('', { status: 429 }))).toBeInstanceOf(
+      RetryableError,
+    );
+    const forbidden = await outcome(async () => new Response('', { status: 403 }));
+    expect(forbidden).not.toBeInstanceOf(RetryableError);
+    const missing = await outcome(async () => new Response('', { status: 404 }));
+    expect(missing).not.toBeInstanceOf(RetryableError);
+    expect(String(missing)).toContain('HTTP 404');
   });
 });

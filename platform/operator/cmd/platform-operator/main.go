@@ -62,10 +62,17 @@ func run() error {
 		leaderElect     = flag.Bool("leader-elect", true, "run one active operator through a Lease")
 		metricsAddr     = flag.String("metrics-bind-address", ":8080", "metrics endpoint")
 		probeAddr       = flag.String("health-probe-bind-address", ":8081", "health and readiness endpoints")
+		printDefault    = flag.Bool("print-default-version", false, "print the default platform version compiled into this binary (the version the image bakes) and exit")
 	)
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+	// The release checks the version compiled into the binary with this, not only the baked
+	// package.json beside it (#523). It needs no cluster, passphrase or state directory.
+	if *printDefault {
+		_, err := fmt.Fprintln(os.Stdout, installer.DefaultVersion)
+		return err
+	}
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	// log/slog (the operator user line, the Helm wrapper) writes through the same zap logger, so
 	// its lines land in the pod log (#473).

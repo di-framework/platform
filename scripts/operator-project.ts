@@ -12,12 +12,18 @@
  *     (`npm install --package-lock-only`) and plugins.txt from each @pulumi provider's checksums on
  *     its GitHub release. A pin that is already current changes nothing. release.yml runs it with
  *     the release's own version once publish has put it on npm: the `bake` job, whose files the
- *     release's operator image is built with (so chart N bakes N), and the `project-pr` job, which
- *     opens the PR moving main to it.
+ *     release's operator image is built with (so chart N bakes N). The `project-pr` job, which
+ *     opens the PR moving main to it, commits bake's files as they are when main's project files
+ *     are still the tag's, and runs this bump on main only when they are not.
  *   bun scripts/operator-project.ts bump
  *     pins npm's `latest` instead (by hand).
  *   Either form refuses a version older than the current pin (a dist-tag rollback, or a manual
  *   bump ahead of `latest`), so the baked default never moves backwards.
+ *
+ * Exit codes (#523): 0 pinned (or already current); 75 (EX_TEMPFAIL) npm does not serve the
+ * version yet, or the registry or GitHub failed in a way a retry can fix, so release.yml's bake
+ * retries; 2 refused (not an X.Y.Z release version, or older than the pin), which no retry
+ * changes; 1 any other failure, also not retried.
  *
  * Only node builtins and the npm CLI.
  */
@@ -36,9 +42,21 @@ export const PLUGINS_HEADER = `# The Pulumi resource plugins the operator image 
 # \`bun scripts/operator-project.ts bump\`; installer tests and the image build check them.
 `;
 
+/** Exit code for a failure a later attempt can fix: npm not serving the version yet (#523). */
+export const EXIT_RETRY = 75;
+/** Exit code for a refusal no retry changes: a non-release version or a downgrade (#523). */
+export const EXIT_REFUSED = 2;
+
+/** A failure a retry can fix: the version is not on npm yet, or the registry was unreachable. */
+export class RetryableError extends Error {}
+/** A refusal no retry changes. */
+export class RefusedError extends Error {}
+
 export function assertVersion(version: string | undefined): string {
   if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
-    throw new Error(`expected a release version like 6.0.22, got ${JSON.stringify(version)}`);
+    throw new RefusedError(
+      `expected a release version like 6.0.22, got ${JSON.stringify(version)}`,
+    );
   }
   return version;
 }
@@ -127,27 +145,82 @@ export function bakedPlugins(text: string): Map<string, string> {
 
 type Deps = {
   latest: () => string;
+  /** Whether npm serves exactly this platform version. */
+  published: (version: string) => boolean;
   lock: (dir: string) => void;
   checksums: (name: string, version: string) => Promise<string>;
 };
 
+/** npm's error output for a version it does not serve (yet): a 404 packument or no matching version. */
+export const NOT_SERVED = /\bE404\b|\bETARGET\b|No matching version|No match found for version/;
+/**
+ * npm's error output for a registry or network failure a retry can fix: a 5xx or 429 (rate limited),
+ * a dropped, refused, timed-out or unreachable connection, or a truncated registry response.
+ */
+export const TRANSIENT = new RegExp(
+  [
+    String.raw`\bE5\d\d\b`,
+    String.raw`\bE429\b`,
+    String.raw`\bETIMEDOUT\b`,
+    String.raw`\bERR_SOCKET_TIMEOUT\b`,
+    String.raw`\bECONNRESET\b`,
+    String.raw`\bECONNREFUSED\b`,
+    String.raw`\bECONNABORTED\b`,
+    String.raw`\bEPIPE\b`,
+    String.raw`\bENETUNREACH\b`,
+    String.raw`\bEHOSTUNREACH\b`,
+    String.raw`\bEAI_AGAIN\b`,
+    String.raw`\bENOTFOUND\b`,
+    String.raw`\bFETCH_ERROR\b`,
+    'invalid json response body',
+    'socket hang up',
+  ].join('|'),
+);
+
+/** Runs a command; its stderr is echoed and returned for classifying a failure. */
 const run = (cmd: string, args: string[], cwd?: string) => {
-  const r = spawnSync(cmd, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
-  if (r.status !== 0) throw new Error(`${cmd} ${args.join(' ')} exited ${r.status}`);
-  return r.stdout.trim();
+  const r = spawnSync(cmd, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  if (r.stderr) process.stderr.write(r.stderr);
+  return { status: r.status, stdout: r.stdout.trim(), stderr: r.stderr ?? '' };
 };
 
+/** The error for a failed npm command: retryable when npm does not serve the version yet. */
+export function npmFailure(what: string, status: number | null, stderr: string): Error {
+  const message = `${what} exited ${status}`;
+  return NOT_SERVED.test(stderr) || TRANSIENT.test(stderr)
+    ? new RetryableError(message)
+    : new Error(message);
+}
+
 export const npmDeps: Deps = {
-  latest: () => run('npm', ['view', PLATFORM_PACKAGE, 'version']),
-  lock: (dir) =>
-    void run(
-      'npm',
-      ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'],
-      dir,
-    ),
+  latest: () => {
+    const r = run('npm', ['view', PLATFORM_PACKAGE, 'version']);
+    if (r.status !== 0) throw npmFailure(`npm view ${PLATFORM_PACKAGE}`, r.status, r.stderr);
+    return r.stdout;
+  },
+  published: (version) => {
+    const r = run('npm', ['view', `${PLATFORM_PACKAGE}@${version}`, 'version']);
+    if (r.status === 0) return r.stdout === version;
+    if (NOT_SERVED.test(r.stderr)) return false;
+    throw npmFailure(`npm view ${PLATFORM_PACKAGE}@${version}`, r.status, r.stderr);
+  },
+  lock: (dir) => {
+    const args = ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'];
+    const r = run('npm', args, dir);
+    if (r.status !== 0) throw npmFailure(`npm ${args.join(' ')}`, r.status, r.stderr);
+  },
   checksums: async (name, version) => {
-    const res = await fetch(checksumsUrl(name, version));
-    if (!res.ok) throw new Error(`${checksumsUrl(name, version)}: HTTP ${res.status}`);
+    const url = checksumsUrl(name, version);
+    let res: Response;
+    try {
+      res = await fetch(url);
+    } catch (error) {
+      throw new RetryableError(`${url}: ${(error as Error).message}`);
+    }
+    if (res.status >= 500 || res.status === 429) {
+      throw new RetryableError(`${url}: HTTP ${res.status}`);
+    }
+    if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
     return res.text();
   },
 };
@@ -160,7 +233,11 @@ export async function bump(root: string, wanted: string | undefined, deps = npmD
   const before = readFileSync(pkgPath, 'utf8');
   const pinned = (JSON.parse(before) as Manifest).dependencies?.[PLATFORM_PACKAGE];
   if (pinned && /^\d+\.\d+\.\d+$/.test(pinned) && compareVersions(version, pinned) < 0) {
-    throw new Error(`refusing to move the pin back from ${pinned} to ${version}`);
+    throw new RefusedError(`refusing to move the pin back from ${pinned} to ${version}`);
+  }
+  // npm can take minutes to serve a version it has just published: release.yml retries this.
+  if (wanted !== undefined && !deps.published(version)) {
+    throw new RetryableError(`npm does not serve ${PLATFORM_PACKAGE}@${version} yet`);
   }
   const after = setPlatformVersion(before, version);
   if (after !== before) writeFileSync(pkgPath, after);
@@ -185,7 +262,7 @@ export async function bump(root: string, wanted: string | undefined, deps = npmD
 export async function main(argv: string[], root = process.cwd(), deps = npmDeps): Promise<number> {
   const [command, version] = argv;
   try {
-    if (command !== 'bump') throw new Error(`unknown command ${JSON.stringify(command)}`);
+    if (command !== 'bump') throw new RefusedError(`unknown command ${JSON.stringify(command)}`);
     const r = await bump(root, version, deps);
     console.log(
       r.changed
@@ -194,8 +271,14 @@ export async function main(argv: string[], root = process.cwd(), deps = npmDeps)
     );
     return 0;
   } catch (error) {
-    console.error(`::error::${(error as Error).message}`);
-    return 1;
+    const message = (error as Error).message;
+    if (error instanceof RetryableError) {
+      // A notice, not an error: release.yml retries, and the last attempt reports the failure.
+      console.error(`::notice::${message} (retryable)`);
+      return EXIT_RETRY;
+    }
+    console.error(`::error::${message}`);
+    return error instanceof RefusedError ? EXIT_REFUSED : 1;
   }
 }
 

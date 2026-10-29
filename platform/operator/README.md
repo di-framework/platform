@@ -531,12 +531,19 @@ installs without egress.
   instance at any other version runs `npm install`. `release.yml` does this after it has published N to npm: it
   pins the project to exactly N (`bun scripts/operator-project.ts bump N`, which rewrites the lockfile and
   `plugins.txt`), builds the image from the tag's source with only that change (the binary is compiled in the
-  same build, so it embeds the `package.json` it bakes), checks that the image bakes N, tags the index `vN`,
-  and packages chart N with that image's digest instead of the one in `chart/values.yaml`.
+  same build, so it embeds the `package.json` it bakes), checks that the image bakes N and that its binary
+  defaults to N (`platform-operator --print-default-version`), tags the index `vN`, and packages chart N with
+  that image's digest instead of the one in `chart/values.yaml`. The image's
+  `dev.di-framework.platform-operator.project-sha256` label (and the same annotation on the `vN` index) is the
+  sha256 of the three pinned files (`sha256sum package.json package-lock.json plugins.txt | sha256sum` in the
+  project directory). Only `vX.Y.Z` tags release; a prerelease tag stops before anything is published.
 - The same release opens the bot PR `chore(operator): bake @di-framework/platform N` (branch
-  `bot/operator-project`), which moves main's pin to N. Once it merges, the next image from main (and its pin
-  PR, which updates `chart/values.yaml` and the reference above) bakes N too. Until then main's images bake the
-  previous release.
+  `bot/operator-project`), which moves main's pin to N. It commits the same three files the image was built
+  with when main's project files are still the tag's (otherwise, or once those files have expired after 7
+  days, it bumps main's own). It never moves the bot branch back to an older release, and deletes one that
+  main has already passed (closing its PR); every push and delete is leased on the branch as read. Once it
+  merges, the next image from main (and its pin PR, which updates `chart/values.yaml` and the reference above)
+  bakes N too. Until then main's images bake the previous release.
 
 The first publish creates the `platform-operator` GHCR package as private. An org admin must make it public
 once (Package settings, then Change visibility), because Layer 4 (#274) pulls the image anonymously.

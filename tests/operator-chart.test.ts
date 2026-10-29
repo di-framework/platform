@@ -233,8 +233,14 @@ describe('platform-operator chart', () => {
     for (const name of names) expect(defined).toContain(name as string);
     // npm and the baked project and plugins (#431) keep their image defaults, and cleanup-namespace
     // (#426) defaults to the operator's own namespace unless cleanupNamespace is set; everything
-    // else is set from values.
-    const imageDefaults = ['npm', 'baked-project', 'baked-plugins', 'cleanup-namespace'];
+    // else is set from values. print-default-version (#523) is a release check that exits at once.
+    const imageDefaults = [
+      'npm',
+      'baked-project',
+      'baked-plugins',
+      'cleanup-namespace',
+      'print-default-version',
+    ];
     expect(names.sort()).toEqual(defined.filter((f) => !imageDefaults.includes(f)).sort());
     // Nothing reads POD_NAMESPACE: the operator takes its namespace from the ServiceAccount.
     expect(container.env).toBeUndefined();
