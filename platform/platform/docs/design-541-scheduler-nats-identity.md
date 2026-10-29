@@ -4,7 +4,7 @@
 |---|---|
 | Issue | #541 (part of epic #495, E2 Tenant isolation and transport; found during the #535 check) |
 | Related | #535, #540, #542 (network policy on the scheduler NATS); #552 (scheduler NATS without debug/trace logging) |
-| Status | **Design, revision 3.** Revised after review round 1 on PR #558 and after the owner's decision not to fork the runtime-operator. No code changes. Implementation waits for this note to merge. |
+| Status | **Design, revision 4.** Revised after review rounds 1 and 2 on PR #558, and after the owner's decision not to fork the runtime-operator. No code changes. Implementation waits for this note to merge. |
 | Scope | `platform/platform` (scheduler NATS, PKI, tenant host and per-tenant operator wiring), and one vCluster value in `platform/operator`. Upstream wash and runtime-operator stay unpatched, apart from the existing wash fork in `platform/tenant-host/`. |
 | Constraints from the owner | No users yet: no rollout phases, no tenant-by-tenant migration, no compatibility shims, no release notes. The shared certificate is replaced outright. The gap is fixed, not documented away. The runtime-operator is not forked. |
 
@@ -39,7 +39,9 @@ The end state, with upstream wash and runtime-operator unmodified:
   - watches only `di-tenant-<t>`, and manages host pods only in `di-runtime-<t>`.
 
   It can hear only its tenant's heartbeats, reach only its tenant's hosts, read only its tenant's Secrets, and place only its tenant's workloads. The chart's own operator keeps serving the platform namespace and `hostgroup-default`.
-- **Per-tenant host certificates from a platform-issued, name-constrained tenant CA.** Each certificate is bound to a fresh NATS user name per issuance, and current and previous issuances are recorded in controller-owned state. Removing a tenant, or force-rotating its identity, revokes the old user in the next reload. A routine renewal keeps the previous user for at most 10 minutes.
+- **Per-issuance client identities.** Tenant hosts get certificates from a platform-issued, name-constrained tenant CA. Operators and platform clients get theirs from the platform CA. Every client certificate is bound to a fresh NATS user name per issuance, and the current and previous issuances are recorded in controller-owned state.
+  - Force-rotating an identity revokes the old user in the next reload. A routine renewal keeps the previous user for at most 10 minutes.
+  - Removing a tenant revokes its host user at once. Its operator user stays until the operator has cleared the tenant's finalizers, and then the account is dropped.
 - **The shared certificate and the chart's CA are gone.** No tenant namespace receives a platform key. The CA keys live in a namespace that no pod and no workload can reach.
 
 **What was compared.** Section 7 compares this option, (a), with a platform-owned relay (b) and broker isolation alone (c).
@@ -114,8 +116,10 @@ Tenants have no distinct NATS identity. A single operator hears every heartbeat 
 - **P4 Least privilege for every identity.** On the broker, each user can publish and subscribe only to the subjects its role needs (4.3). In Kubernetes, each operator can read only its own tenant's namespaces (4.6).
 - **P5 Independent lifecycle and prompt revocation.**
   - Issuing, rotating or removing one tenant's identity reloads the server without disconnecting any other tenant.
-  - Removal and forced rotation revoke the old identity in the next reload. Its connections are dropped, and its certificate is refused even though it is still valid.
-  - A routine renewal keeps the previous identity for at most 10 minutes while hosts roll, then revokes it the same way.
+  - This applies to every client identity: tenant hosts, tenant operators, the platform operator, `hostgroup-default` and `DATA`.
+  - Forced rotation revokes the old identity in the next reload. Its connections are dropped, and its certificate is refused even though it is still valid.
+  - A routine renewal keeps the previous identity for at most 10 minutes while clients reconnect or roll, then revokes it the same way.
+  - Removing a tenant revokes its host identity in the next reload. The tenant's operator identity stays until that operator has finished the tenant's cleanup (4.5, "Removal"), and is then revoked the same way.
   - No identity outlives its record until certificate expiry.
 - **P6 No shared secrets in tenant namespaces.** A tenant runtime namespace holds only that tenant's own key and the public CA bundle that verifies the server.
 - **P7 Issuance cannot escape its scope.** The CA that signs tenant host certificates can sign only names inside the tenant subtree, so neither a bug nor a stolen tenant CA key can produce an operator's or the platform's identity.
@@ -165,11 +169,15 @@ The Helm values below are enforced in `platformValues` (`platform/platform/src/v
 
 | Account | Users | Serves |
 |---|---|---|
-| `T_<platform-ns>` (default `T_wasmcloud`) | `host.platform.scheduler.di-framework.invalid` (`hostgroup-default`), `operator.platform.scheduler.di-framework.invalid` (the chart's operator) | The platform namespace (4.7). |
-| `T_di-tenant-<t>`, one per tenant | `<issuance-id>.di-tenant-<t>.tenants.scheduler.di-framework.invalid` (the tenant's hosts: the current user, plus the previous one during a routine renewal), `operator.di-tenant-<t>.platform.scheduler.di-framework.invalid` (the tenant's operator) | Tenant `<t>`. |
-| `DATA` | `data.platform.scheduler.di-framework.invalid` | The data connection of `hostgroup-default`. It has no other users, so it cannot see scheduler traffic. |
+| `T_<platform-ns>` (default `T_wasmcloud`) | `<id>.host.platform.scheduler.di-framework.invalid` (`hostgroup-default`), `<id>.operator.platform.scheduler.di-framework.invalid` (the chart's operator) | The platform namespace (4.7). |
+| `T_di-tenant-<t>`, one per tenant | `<id>.di-tenant-<t>.tenants.scheduler.di-framework.invalid` (the tenant's hosts), `<id>.operator.di-tenant-<t>.platform.scheduler.di-framework.invalid` (the tenant's operator) | Tenant `<t>`. |
+| `DATA` | `<id>.data.platform.scheduler.di-framework.invalid` | The data connection of `hostgroup-default`. It has no other users, so it cannot see scheduler traffic. |
+
+`<id>` is a 16-hex-character issuance ID (4.5). Each role has its current user, plus its previous user during a routine renewal.
 
 No account imports or exports anything. Every value of `<t>` is a DNS label (`validName`, `resources.ts:886-890`), so every account name is valid.
+
+The broker probes used fixed operator and platform names. The design prefixes them with an issuance ID, which changes only the user string the server maps (4.5).
 
 ### 4.3 Permissions and limits
 
@@ -186,14 +194,14 @@ accounts {
           subscribe: { allow: ["runtime.host.*.>"] }
           allow_responses: { max: 1, expires: "2m" }
         } }
-      { user: "operator.di-tenant-a.platform.scheduler.di-framework.invalid",
+      { user: "<issuance-id>.operator.di-tenant-a.platform.scheduler.di-framework.invalid",
         permissions: {
           publish:   { allow: ["runtime.host.*.>"] }
           subscribe: { allow: ["runtime.operator.heartbeat.>", "_INBOX.>"] }
         } }
     ]
   }
-  DATA: { jetstream: enabled, users: [ { user: "data.platform.scheduler.di-framework.invalid" } ] }
+  DATA: { jetstream: enabled, users: [ { user: "<issuance-id>.data.platform.scheduler.di-framework.invalid" } ] }
 }
 ```
 
@@ -218,7 +226,8 @@ How the pieces give the properties:
 - **Inputs.** The Tenant list, the identity record and the platform namespace. Nothing comes from tenant-writable input.
 - **Validation.** Before writing, the controller checks:
   - each tenant host user against `^[0-9a-f]{16}\.di-tenant-<t>\.tenants\.scheduler\.di-framework\.invalid$`;
-  - each operator user against `^operator\.di-tenant-<t>\.platform\.scheduler\.di-framework\.invalid$`;
+  - each tenant operator user against `^[0-9a-f]{16}\.operator\.di-tenant-<t>\.platform\.scheduler\.di-framework\.invalid$`;
+  - each platform user against `^[0-9a-f]{16}\.(operator|host|data)\.platform\.scheduler\.di-framework\.invalid$`;
   - that all users are unique, and that every account name is valid.
 
   nats-server refuses a reload with a duplicate user as a whole and keeps the previous configuration (**P**). The controller therefore refuses to write instead, and reports the offending Tenant in a condition. A write is never partial, because the whole file is one ConfigMap key.
@@ -250,11 +259,11 @@ How the pieces give the properties:
 | Identity | NATS user (DNS SAN) | Secret | Mounted by |
 |---|---|---|---|
 | NATS server | the `nats` Service names | `di-scheduler-nats-tls` (platform ns; its `ca_file` key holds both CAs) | `nats` |
-| Platform operator | `operator.platform.scheduler.di-framework.invalid` | `di-scheduler-operator-tls` (platform ns) | the chart's `runtime-operator` |
-| Platform host group | `host.platform.scheduler.di-framework.invalid` | `di-scheduler-platform-host-tls` (platform ns) | `hostgroup-default` |
-| Platform data | `data.platform.scheduler.di-framework.invalid` | `di-scheduler-data-tls` (platform ns) | `hostgroup-default` |
-| Tenant `<t>` operator | `operator.di-tenant-<t>.platform.scheduler.di-framework.invalid` | `di-scheduler-operator-tls` (`di-operator-<t>`) | the tenant's operator |
-| Tenant `<t>` hosts | `<issuance-id>.di-tenant-<t>.tenants.scheduler.di-framework.invalid` | `di-scheduler-tls` (`di-runtime-<t>`) | `hostgroup-tenant-<t>` |
+| Platform operator | `<id>.operator.platform.scheduler.di-framework.invalid` | `di-scheduler-operator-tls` (platform ns) | the chart's `runtime-operator` |
+| Platform host group | `<id>.host.platform.scheduler.di-framework.invalid` | `di-scheduler-platform-host-tls` (platform ns) | `hostgroup-default` |
+| Platform data | `<id>.data.platform.scheduler.di-framework.invalid` | `di-scheduler-data-tls` (platform ns) | `hostgroup-default` |
+| Tenant `<t>` operator | `<id>.operator.di-tenant-<t>.platform.scheduler.di-framework.invalid` | `di-scheduler-operator-tls` (`di-operator-<t>`) | the tenant's operator |
+| Tenant `<t>` hosts | `<id>.di-tenant-<t>.tenants.scheduler.di-framework.invalid` | `di-scheduler-tls` (`di-runtime-<t>`) | `hostgroup-tenant-<t>` |
 | Both CA keys | none | `di-scheduler-ca` (`<platform-ns>-scheduler-pki`) | **no pod** |
 | Identity record | none | ConfigMap `di-scheduler-identities` (`<platform-ns>-scheduler-pki`) | **no pod** |
 
@@ -262,28 +271,48 @@ How the pieces give the properties:
   - No operator watches it, so no WorkloadDeployment `secretFrom` can name anything in it.
   - The only pod that runs there is the bootstrap Job, and it mounts nothing from the namespace. vCluster syncs only Secrets a pod uses (`vcluster: values.yaml:26-30`), so these Secrets stay out of the host namespace on the vCluster target. **V**
   - The platform controller reads it.
-- **The identity record.** `di-scheduler-identities` holds one entry per tenant: `{ current: <issuance-id>, previous?: <issuance-id>, previousUntil?: <time> }`.
-  - The controller writes it before it issues a certificate or renders accounts, and never reads identities back from tenant namespaces.
-  - `<issuance-id>` is 16 random hex characters, new for every host certificate, so a user name names exactly one certificate.
-  - Operator user names are fixed per tenant. An operator renewal needs no overlap, because nats.go reloads the certificate files on every handshake (`nats.go: nats.go:1212-1234`; `nats.ClientCert` at `wasmcloud: runtime-operator/cmd/main.go:189`). **V**
+- **The identity record.** `di-scheduler-identities` holds one entry per client identity:
+  - for each tenant, `<t>/hosts` and `<t>/operator`;
+  - for the platform, `platform/operator`, `platform/host` and `platform/data`.
 
-**Revocation and rotation** (P5):
+  Each entry is `{ current: <id>, previous?: <id>, previousUntil?: <time>, state?: draining }`.
+  - The controller writes the record before it issues a certificate or renders accounts, and it never reads identities back from tenant namespaces. The bootstrap Job writes the first platform entries.
+  - `<id>` is 16 random hex characters, new for every client certificate, so a user name names exactly one certificate.
 
-- **Removal.** Deleting a Tenant drops its account from the next render. The reload disconnects its hosts and its operator, and their certificates are refused from then on. **P** The controller then deletes `di-operator-<t>`.
-- **Forced rotation.** Changing the Tenant annotation `platform.di-framework.dev/rotate-scheduler-identity`, or deleting `di-scheduler-tls`, starts it. The controller:
+**Revocation and rotation** (P5). The same rules apply to every entry in the record.
+
+- **Forced rotation.** Either of these starts it:
+  - changing the Tenant annotation `platform.di-framework.dev/rotate-scheduler-identity`, which rotates both of the tenant's entries;
+  - deleting the identity's Secret.
+
+  The controller:
   1. records a new current ID with no previous;
-  2. issues the new certificate;
+  2. issues the new certificate into the Secret;
   3. renders accounts without the old user;
   4. rolls the hosts.
 
-  The old identity is refused from that reload on. This mirrors how deleting the registry pull Secret rotates its token (`controller.ts:735-739`).
+  The old identity is refused from that reload on. An operator whose user was removed reconnects with the new certificate files. nats.go reads them on every handshake (`nats.go: nats.go:1212-1234`; the operator uses `nats.ClientCert` at `wasmcloud: runtime-operator/cmd/main.go:189`). If the kubelet has not synced the Secret yet, the operator's connection closes and its liveness probe restarts it (`cmd/main.go:340-357`). The restarted process reads the synced files. This mirrors how deleting the registry pull Secret rotates its token (`controller.ts:735-739`).
 - **Routine renewal.** The controller:
   1. records the new current ID, sets `previous`, and sets `previousUntil` to now + 10 minutes;
   2. issues the certificate;
-  3. renders both users;
-  4. rolls only that tenant's host Deployment through a certificate-digest pod annotation (the registry-CA pattern, `resources.ts:1456-1466`).
+  3. renders both users.
 
-  `previous` is dropped as soon as the rollout has finished (as the readiness gate at `controller.ts:1028-1042` checks), or at `previousUntil`, whichever comes first.
+  Hosts roll through a certificate-digest pod annotation (the registry-CA pattern, `resources.ts:1456-1466`). An operator keeps its connection and reconnects as the new user once the previous one is dropped.
+
+  `previous` is dropped when it is no longer in use, or at `previousUntil`, whichever comes first:
+  - for hosts, once the rollout has finished, as the readiness gate at `controller.ts:1028-1042` checks;
+  - for operators, at `previousUntil`, which leaves the kubelet time to sync the Secret.
+- **Removal** (Tenant deletion, under either deletion policy). The tenant's operator must keep running until it has cleared its finalizers:
+  - the pod-host finalizer on `di-runtime-<t>` pods (`host_pod_controller.go:65-90`);
+  - the Workload finalizers in `di-tenant-<t>`.
+
+  Dropping its user would close its NATS connection for good. nats.go gives up after repeated authorization errors (`nats.go: nats.go:4085-4086`). The operator would then crash-loop, because its liveness check fails on a closed connection (`cmd/main.go:340-357`) and a fresh start exits when it cannot connect (`operator.go:71-74`, `cmd/main.go:305-307`). The controller's existing deletion waits (`controller.ts:915-929` for `Delete`, `:954-959` for `Retain`) would then never finish. Removal therefore runs in this order:
+  1. The `<t>/hosts` entry and the host user leave the next render. The tenant's host connections are refused from that reload on. **P**
+  2. The `<t>/operator` entry is marked `state: draining`, and its user stays in `T_di-tenant-<t>`.
+  3. The controller waits until no host pod remains in `di-runtime-<t>` and no `runtime.wasmcloud.dev` object remains in `di-tenant-<t>` or `di-operator-<t>`.
+  4. Only then does it drop the `<t>/operator` entry and the whole `T_di-tenant-<t>` account, and delete `di-operator-<t>`.
+
+  The draining operator can no longer reach any host, so its commands time out. Its finalizers only delete Kubernetes objects (`host_controller.go:102-124`), which needs no host.
 
 **Lifetimes** (O3):
 - **CAs.** 10 years, rotated with the controller's existing CA machinery (`platform/platform/src/tenancy/ca-rotation.ts:13-25,140-215`). `ca_file` and each `ca.crt` carry the current and next CA.
@@ -311,6 +340,8 @@ The platform controller renders, for each Tenant, the same objects the chart ren
 
 - **Deployment `runtime-operator`.**
   - The upstream image the chart uses (`chart: templates/operator/deployment.yaml:39`, `ghcr.io/wasmcloud/runtime-operator:2.8.0`), pinned by digest and unmodified.
+  - The image tag is derived from `WASMCLOUD_OPERATOR_VERSION` (`platform/platform/src/index.ts:255`), the same constant that pins the chart. The CRDs come once from that chart's `crds/`, so every operator matches them. A unit test fails if the tag and the chart version drift apart, and the image digest is pinned next to the constant.
+  - `automountServiceAccountToken: true`, as the chart sets (`chart: values.yaml:124`). The token mount also provides the namespace file that leader election reads.
   - One replica, with the chart's security context and resources (`chart: values.yaml:113-144`).
   - `OPERATOR_NAMESPACE=di-operator-<t>`.
   - Arguments:
@@ -320,26 +351,33 @@ The platform controller renders, for each Tenant, the same objects the chart ren
     - `-metrics-bind-address=0`, which disables metrics (`wasmcloud: runtime-operator/cmd/main.go:86-87`), so no metrics ClusterRole is needed.
 
   These flags never change during the tenant's life, so a tenant change restarts only that tenant's operator.
-- **ServiceAccount and RBAC.** Namespaced Roles only, mirroring the chart:
-  - leases, events, pods and Hosts in `di-operator-<t>` (`chart: templates/operator/role.yaml`);
-  - the workload CRDs, ConfigMaps, Secrets, Services, EndpointSlices and events in `di-tenant-<t>` (`workload-crd-role.yaml`, `workload-namespace-role.yaml`, `endpointslice-role.yaml`);
-  - pods in `di-runtime-<t>` (`host-pod-role.yaml`).
+- **ServiceAccount and RBAC.** Pulumi renders three fixed ClusterRoles. Each copies the rules of the chart's operator Roles for one kind of namespace:
+  - `di-tenant-operator-self`: leases, events, pods, Hosts and their status and finalizers (`chart: templates/operator/role.yaml`), bound in `di-operator-<t>`;
+  - `di-tenant-operator-workloads`: the workload CRDs and their status and finalizers; ConfigMaps, Secrets, Services, `services/finalizers` and events; EndpointSlices, including the `restricted` subresources (`workload-crd-role.yaml`, `workload-namespace-role.yaml`, `endpointslice-role.yaml`), bound in `di-tenant-<t>`;
+  - `di-tenant-operator-hosts`: pods (`host-pod-role.yaml`), bound in `di-runtime-<t>`.
 
-  Each operator can read only its own tenant's Secrets.
-- **NATS identity.** `di-scheduler-operator-tls` in `di-operator-<t>`, user `operator.di-tenant-<t>.platform.scheduler.di-framework.invalid`, in account `T_di-tenant-<t>` (4.2).
+  The controller creates only RoleBindings to these ClusterRoles, one in each of the tenant's three namespaces. A RoleBinding grants a ClusterRole's rules only inside its own namespace, so each operator can read only its own tenant's Secrets.
+
+  The controller has no `escalate`, and it holds none of these rules (`platform/platform/src/tenancy/install.ts:245-257`). It therefore gets `bind` on `clusterroles` limited by `resourceNames` to exactly these three names, beside the existing `bind` on `roles` limited to `CONTROLLER_BOUND_ROLES` (`install.ts:90-97,252-257`). A unit test checks that the controller's rules authorize every binding it writes, and that its `bind` names exactly the three ClusterRoles.
+- **NATS identity.** `di-scheduler-operator-tls` in `di-operator-<t>`, user `<id>.operator.di-tenant-<t>.platform.scheduler.di-framework.invalid`, in account `T_di-tenant-<t>` (4.2), rotated and revoked through the identity record (4.5).
 
 **Why several operators can coexist.** Each of these points is **V** in the 2.8.0 source.
 - **CRDs.** All CRDs are namespaced (`chart: crds/*.yaml:15-17`) and installed once, by the platform's Helm release. Every operator runs the same image, so all agree on the CRD version.
 - **Hosts.** Each operator creates and caches Hosts only in its own `OPERATOR_NAMESPACE` (`cmd/main.go:160-166,280-283`). Tenants therefore never share a Host store, a Host name or a host-ID index.
 - **Workloads.** The workload cache is limited to `-watch-namespaces` (`cmd/main.go:252-255`). Exactly one operator watches each namespace: the chart's operator watches the platform namespace, and each tenant's operator watches its own tenant namespace. The host finalizer lists Workloads by host ID through that cache (`host_controller.go:102-124`), so it sees only its own tenant's Workloads.
 - **Pods.** The pod cache is limited to the operator's namespace and `-host-namespaces` (`cmd/main.go:262-283`).
-- **Leader election.** The lease `d34db3ef.wasmcloud.dev` (`cmd/main.go:292`) lives in each operator's own namespace, so the operators never contend. **U**: that controller-runtime defaults the lease namespace to the pod's namespace.
+- **Leader election.** The lease `d34db3ef.wasmcloud.dev` (`cmd/main.go:292`) lives in each operator's own namespace, so the operators never contend. controller-runtime v0.24.1 defaults the lease namespace to the ServiceAccount's namespace file (`controller-runtime: pkg/leaderelection/leader_election.go:84-86,136-151`), which the token mount provides. **V**
 - **Webhooks.** The operator registers no admission webhooks, and the chart renders no webhook configuration (`chart: templates/`). The webhook server it constructs serves nothing (`cmd/main.go:225-227`).
 - **Cluster-scoped objects.** None per tenant, because metrics are off. The CRDs and the chart's own metrics ClusterRoles exist once.
 
 **What changes for the tenant's existing objects.**
 - **The controller's host check.** Its readiness check that the tenant's hosts are registered (`controller.ts:1045-1052`) lists Hosts in `di-operator-<t>` instead of the platform namespace.
-- **Network policy.** The platform's NATS ingress rule (`platform-ingress.ts:56-77`, `tenancy.ts:213-247`) also admits pods labelled `wasmcloud.com/name=runtime-operator` in namespaces that carry the installation and tenant labels and `namespace-role: operator`. On the vCluster target that rule is synced, and policies are additive, so no operator-repository change is needed (`networkpolicy.go:110-116`). The namespace's egress allows the API server and `nats` 4222. Its ingress allows nothing except kubelet probes.
+- **Network policy.** The platform's NATS ingress rule (`platform-ingress.ts:56-77`, `tenancy.ts:213-247`) also admits pods labelled `wasmcloud.com/name=runtime-operator` in namespaces that carry the installation and tenant labels and `namespace-role: operator`. On the vCluster target that rule is synced, and policies are additive, so no operator-repository change is needed (`networkpolicy.go:110-116`). The namespace's egress allows exactly three destinations:
+  - the API server;
+  - cluster DNS on 53/UDP and 53/TCP, as `di-tenant-network` allows (`resources.ts:1016-1040`), so the operator can resolve `nats.<platform-ns>.svc.cluster.local`;
+  - `nats` on 4222.
+
+  Its ingress allows nothing except kubelet probes.
 - **Why a separate namespace rather than `di-runtime-<t>`.** Tenant roles can read pod logs and port-forward in `di-runtime-<t>` (`resources.ts:1139-1151`), and backup Jobs are created there (`platform/backup-destination/chart/templates/runtime.yaml:1-60`). A pod created there could use the operator's ServiceAccount. `di-operator-<t>` has no tenant role bindings and no other workloads, and its operator does not count against the tenant's runtime quota (`resources.ts:940-1002`).
 
 **Cost per tenant.** One pod with a 100m CPU request, a 64Mi memory request and a 192Mi memory limit (`chart: values.yaml:117-122`). It idles at about 19Mi (the chart's own note, `values.yaml:113`). It also adds one NATS connection, one namespace, about six Roles and bindings, and one certificate. The platform budgets this outside the tenant's quotas.
@@ -386,14 +424,17 @@ The platform controller renders, for each Tenant, the same objects the chart ren
 
 - **`platform/platform/src/index.ts`, `values.ts`.**
   - The chart values (4.1).
+  - The three fixed tenant-operator ClusterRoles (4.6), and the pinned tenant-operator image derived from `WASMCLOUD_OPERATOR_VERSION`.
   - The NATS resources, the PKI namespace, and the bootstrap Job and its RBAC, all ordered before the Helm release.
   - Removal of the #552 `postrender`.
 - **`platform/platform/src/watched-namespaces.ts`.** `hostNamespaces` becomes the platform namespace only. The tenant list it computes no longer feeds the chart.
+- **`platform/platform/src/tenancy/install.ts`.** Add `bind` on `clusterroles`, limited by `resourceNames` to the three tenant-operator ClusterRoles, and no `escalate` (4.6).
 - **`platform/platform/src/tenancy/tls.ts`.** Email and URI name constraints, and a client-auth leaf.
 - **`platform/platform/src/tenancy/`.** A new `scheduler-nats.ts`, plus changes to `controller.ts` and `resources.ts`:
   - the identity record, issuance and rotation;
   - the accounts renderer and its validation;
-  - the per-tenant `di-operator-<t>` namespace, operator Deployment, ServiceAccount, Roles and certificate;
+  - the per-tenant `di-operator-<t>` namespace, operator Deployment, ServiceAccount, RoleBindings to the fixed ClusterRoles, and certificate;
+  - the removal order: host user first, operator user and `di-operator-<t>` after the tenant's finalizers have run (4.5);
   - the Host lookup in the readiness check, and the certificate-digest annotation;
   - removal of the `wasmcloud-runtime-tls` copy.
 - **`platform/platform/src/platform-ingress.ts`, `tenancy.ts`.** The NATS ingress rule admits the tenant operators.
@@ -445,15 +486,19 @@ It meets P1-P3 only while it runs correctly. It is a new process that sees every
   - The user-name patterns and uniqueness are enforced, and a bad entry blocks the write with a condition.
   - A golden file is shared with the broker test.
 - **Identity record and issuance.**
-  - The record is written before issuance, and every host issue gets a new ID.
+  - The record is written before issuance, and every client certificate (host, operator, platform) gets a new ID.
+  - During removal the host entry is dropped first. The operator entry stays `draining` until no host pod and no `runtime.wasmcloud.dev` object remains, and only then is the account dropped.
   - Leaves carry the client-auth EKU and the right SAN form.
-  - Both CAs carry their name constraints: the tenant CA refuses `operator.*` names, and operator certificates come only from the platform CA.
+  - Both CAs carry their name constraints: the tenant CA refuses every name under `platform.scheduler.di-framework.invalid`, and operator certificates come only from the platform CA.
   - Lifetimes are as specified.
   - Every Secret carries `ca.crt`.
 - **Per-tenant operator manifests.**
   - The flags (`-watch-namespaces=di-tenant-<t>`, `-host-namespaces=di-runtime-<t>`, `-allow-shared-hosts=false`, `-metrics-bind-address=0`) and `OPERATOR_NAMESPACE` are set.
   - The upstream image is pinned by digest.
-  - RBAC is namespaced only and limited to the tenant's three namespaces.
+  - The operator's access comes only from RoleBindings, in the tenant's three namespaces, to the three fixed ClusterRoles.
+  - The controller's own rules authorize every binding it writes, and its `bind` names exactly those three ClusterRoles, with no `escalate`.
+  - The image tag equals `WASMCLOUD_OPERATOR_VERSION`, so a drift fails the test.
+  - The egress rule allows the API server, DNS on 53/UDP and 53/TCP, and `nats` 4222.
   - The namespace labels and the NATS ingress rule admit the operator.
 - **Chart values.**
   - `nats.enabled=false`, `generate=false`, the Secret names, and `watchNamespaces` and `hostNamespaces` set to the platform namespace are all enforced over `args.values`.
@@ -467,7 +512,10 @@ A CI job runs nats-server 2.12.8, pinned by image digest, with the golden `accou
 - forged certificates;
 - adding a tenant by reload with no disconnect for others;
 - a colliding user refusing the reload as a whole;
-- removal and rotation disconnecting only the affected identity, which is then refused.
+- removal and rotation disconnecting only the affected identity, which is then refused;
+- removing an account closes an operator connection that uses the operator's own connect options (`wasmcloud: runtime-operator/pkg/wasmbus/nats.go:30-41`), which shows why removal drains the operator first (4.5);
+- a `max_connections` refusal for an account at its limit, with other accounts untouched;
+- a publish to another account's `_INBOX` reply subject is refused.
 
 **U**: whether the client test is written with the Bun NATS client or in Go.
 
@@ -477,7 +525,11 @@ Two tenants and the platform host group:
 - each tenant's operator registers its hosts in `di-operator-<t>`;
 - workloads are placed and run on each;
 - the chart's operator registers only `hostgroup-default`;
-- Layer 3 passes.
+- Layer 3 passes;
+- deleting a tenant completes under both deletion policies, `Delete` and `Retain`:
+  - the host user is refused at once;
+  - the tenant's operator clears the host pod and Workload finalizers;
+  - then the account and `di-operator-<t>` are gone.
 
 ### 8.4 Layer 4, against the broker with tenant A's credentials
 
@@ -487,9 +539,13 @@ Two tenants and the platform host group:
 2. **Refused subscriptions.** Subscribe to `>`, `runtime.operator.heartbeat.>` and `_INBOX.>`. Each gets `Permissions Violation for Subscription`.
 3. **Non-delivery of B's commands.** Subscribe to `runtime.host.*.>`, which is allowed. While it is open, deploy a workload in tenant B whose `secretFrom` value is a unique marker, and one in tenant A. A's subscription receives A's `workload.start` (positive control) and nothing with B's marker.
 4. **Heartbeats stay in A.** Publish heartbeats that claim B's environment, reuse a host ID registered in B, and report one of B's pod IPs. B's operator logs nothing about them, and B's Hosts in `di-operator-b` are unchanged. A's operator may record the forged host, but it places no B workload: A's operator does not watch `di-tenant-b`.
-5. **Forced rotation.** Force a new identity for A. A's old certificate gets `Authorization Violation` from that reload on, and A keeps scheduling. B shows no reconnect and no restart.
-6. **Routine renewal.** Renew A's certificate. The previous user is gone once the rollout finishes, and within 10 minutes in any case.
-7. **Removal.** Delete tenant B. B's hosts and operator are disconnected, and B's certificate gets `Authorization Violation`. `di-operator-b` is gone. A shows no reconnect and no restart.
+5. **Forced rotation.** Force new identities for A (hosts and operator). A's old host and operator certificates each get `Authorization Violation` from that reload on, and A keeps scheduling. B shows no reconnect and no restart.
+6. **Routine renewal.** Renew A's host and operator certificates. Each previous user is gone once it is no longer used, and within 10 minutes in any case.
+7. **Removal, under both deletion policies.** Delete tenant B with `Delete`, and a tenant C with `Retain`. In each case:
+   - B's host certificate gets `Authorization Violation` at once;
+   - B's operator stays connected until the host pods and `runtime.wasmcloud.dev` objects are gone, and its finalizers complete;
+   - then B's operator is disconnected and `di-operator-b` is gone;
+   - A shows no reconnect and no restart.
 8. **Keys and certificates.** `di-scheduler-tls` in A and in B have different public-key fingerprints. Neither `wasmcloud-runtime-tls` nor `wasmcloud-ca` exists.
 9. **Logs.** After a deploy, the NATS pod's log has no `MSG_PAYLOAD` lines.
 10. **Operator RBAC.** Check `kubectl auth can-i get secrets` as each operator's ServiceAccount:
@@ -533,7 +589,11 @@ Two tenants and the platform host group:
 - a removed user's still-valid certificate is refused;
 - `allow_responses` `max: 1` holds, and a publish to another account's reply subject is refused.
 
-**Independent probe.** The round-1 reviewer's probe, 40 of 40 checks, confirms the same server behaviour.
+**Independent probes.** The round-1 reviewer's probe (40 of 40 checks) confirms the same server behaviour. The round-2 reviewer's probe of Appendix A (38 of 38) adds four results:
+- the operator-option connection closes when its account is removed;
+- `max_connections` is enforced;
+- a cross-account `_INBOX` publish is refused;
+- adding a tenant by reload delivers its heartbeats only to its own operator.
 
 ## 10. Open questions for the owner
 
@@ -555,13 +615,12 @@ These are marked **U** above. The implementation or Layer 4 must confirm them:
 2. That wash exits and restarts on a failed first connect, and how it reconnects after a certificate change (4.4).
 3. That the Pulumi Kubernetes provider awaits the bootstrap Job's completion (4.5).
 4. That Helm keeps a pod-template annotation the controller adds to `hostgroup-default` (4.5).
-5. That controller-runtime places each operator's leader-election lease in that operator's own namespace (4.6).
-6. The effect of `useSecretsForSATokens: true` on the operator's tests and on a running instance (4.9).
-7. The account `limits` sizes (4.3).
-8. Option (b)'s added latency (7). This needs checking only if (b) is reconsidered.
-9. The upstream documentation statements in 2.4.
-10. Whether any `hostgroup-default` workload uses JetStream (O5).
-11. The client library for the broker test (8.2).
+5. The effect of `useSecretsForSATokens: true` on the operator's tests and on a running instance (4.9).
+6. The account `limits` sizes (4.3).
+7. Option (b)'s added latency (7). This needs checking only if (b) is reconsidered.
+8. The upstream documentation statements in 2.4.
+9. Whether any `hostgroup-default` workload uses JetStream (O5).
+10. The client library for the broker test (8.2).
 
 ## Appendix A. The probe's exact configuration (option (a))
 
