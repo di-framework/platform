@@ -314,6 +314,8 @@ export class ApiError extends Error {
  * Reported on `TenantAuthReady` (reason `ControllerCaNotOwned`) and logged once, not every pass.
  */
 export class ControllerCaRefused extends Error {}
+/** `ensure` refused an existing object it did not write (another owner or installation). */
+export class AdoptionRefused extends Error {}
 export class KubernetesApi implements Api {
   private readonly directory = '/var/run/secrets/kubernetes.io/serviceaccount';
   async call<T>(
@@ -507,7 +509,7 @@ export class Controller {
           ) &&
           !sameBinding))
     ) {
-      throw new Error(
+      throw new AdoptionRefused(
         `Refusing to adopt ${value.kind} ${value.metadata.namespace ?? ''}/${value.metadata.name}`,
       );
     }
@@ -760,6 +762,7 @@ export class Controller {
    */
   private readonly hostPulls = new Map<string, HostPull | undefined>();
   /** The last `storage-mode` listing read, per Tenant uid, with the host pod uid it came from. */
+  /** Per Tenant uid: the last listing read, and the `<pod uid>/<restartCount>` run it came from. */
   private readonly storageListings = new Map<string, { pod: string; observation: Observation }>();
   /**
    * How the tenant hosts pull from the registry (#83 `:host-pull`), decided from desired state
@@ -1051,7 +1054,7 @@ export class Controller {
       try {
         await this.ensure(storageRecordsConfigMap(tenant, this.cfg.installation, storage.records));
       } catch (error) {
-        if (!(error instanceof Error && error.message.startsWith('Refusing to adopt'))) throw error;
+        if (!(error instanceof AdoptionRefused)) throw error;
         foreignRecords = `ConfigMap ${n.runtimeNamespace}/${STORAGE_RECORDS_CONFIG} was not written by this controller and was left in place; the backup operator refuses restores until it is removed`;
       }
       if (!this.cfg.routeUrlPattern) await this.removeRoutes(tenant);
@@ -1150,20 +1153,23 @@ export class Controller {
         ),
       )[0];
     if (!pod?.metadata.uid) return { state: 'pending' };
-    const cached = this.storageListings.get(tenant.metadata.uid ?? '');
-    if (cached?.pod === pod.metadata.uid) return cached.observation;
     type Terminated = { exitCode: number; message?: string; reason?: string };
     const step = (
       pod.status as
         | {
             initContainerStatuses?: {
               name: string;
+              restartCount?: number;
               state?: { terminated?: Terminated };
               lastState?: { terminated?: Terminated };
             }[];
           }
         | undefined
     )?.initContainerStatuses?.find((c) => c.name === 'storage-mode');
+    // One read per run of the step: a re-run in the same pod bumps its restartCount.
+    const run = `${pod.metadata.uid}/${step?.restartCount ?? 0}`;
+    const cached = this.storageListings.get(tenant.metadata.uid ?? '');
+    if (cached?.pod === run) return cached.observation;
     const terminated = step?.state?.terminated ?? step?.lastState?.terminated;
     if (!terminated) return { state: 'pending' };
     if (terminated.exitCode !== 0) {
@@ -1195,8 +1201,7 @@ export class Controller {
           state: 'failed',
           message: `storage-mode in ${pod.metadata.name} printed an incomplete listing`,
         };
-    if (listing)
-      this.storageListings.set(tenant.metadata.uid ?? '', { pod: pod.metadata.uid, observation });
+    if (listing) this.storageListings.set(tenant.metadata.uid ?? '', { pod: run, observation });
     return observation;
   }
 

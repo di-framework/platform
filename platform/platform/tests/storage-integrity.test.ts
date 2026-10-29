@@ -303,6 +303,13 @@ describe('storage records in the tenant reconcile (#200)', () => {
     expect(api.operations.filter((o) => o.path.includes('/log')).map((o) => o.path)).toEqual([
       `${logPath('p1')}?container=storage-mode`,
     ]);
+    // A re-run of the step in the same pod (its restartCount moves) is read again.
+    const rerun = hostPod('p1', { state: { terminated: { exitCode: 0 } } });
+    (rerun.status as { initContainerStatuses: { restartCount?: number }[] })
+      .initContainerStatuses[0]!.restartCount = 1;
+    api.seed(rerun);
+    await controller.reconcileTenant(t, []);
+    expect(api.operations.filter((o) => o.path.includes('/log')).length).toBe(2);
     // A newer host pod's listing marks the directory that is gone, then the entry is pruned.
     api.seed(hostPod('p2', { state: { terminated: { exitCode: 0 } } }, '2026-10-29T01:00:00Z'));
     api.logs.set(logPath('p2'), 'act unencrypted\ndb aead\ndone count=2');
