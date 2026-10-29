@@ -17,6 +17,7 @@ import {
   tenantInsecureRegistries,
 } from './insecure-registries';
 import { tenantKubeconfig } from './kubeconfig';
+import { natsPostrenderer } from './nats-log-level';
 import { installNetworkPolicy } from './network-policy';
 import { extraHostGroupsWarning, platformIngressPolicies } from './platform-ingress';
 import {
@@ -377,6 +378,8 @@ export function createPlatform(args: PlatformArgs) {
       atomic: true,
       cleanupOnFail: true,
       timeout: args.timeoutSeconds ?? 600,
+      // The chart starts its scheduler NATS with `-DV`; run it at the normal log level (#550).
+      postrender: natsPostrenderer(),
       values: pulumi.output(watchedNamespaces).apply((hostNamespaces) =>
         platformValues(args.values ?? {}, {
           gateway: { enabled: false },

@@ -115,6 +115,13 @@ test('published implementation provisions tenancy and isolation for an existing 
     hostNamespaces: ['wasmcloud', 'di-runtime-alpha'],
   });
   expect(release?.inputs.values.runtime.extraArgs).toEqual([]);
+  // The release post-renders the chart so its scheduler NATS drops `-DV` (#550).
+  const patched = execFileSync(release?.inputs.postrender, {
+    input: readFileSync(join(import.meta.dir, 'fixtures/runtime-operator-nats-deployment.yaml')),
+    encoding: 'utf8',
+  });
+  expect(patched).toContain('- /nats-config/nats-server.conf');
+  expect(patched).not.toContain('-DV');
   const firewall = resources.find((r) => r.type === 'kubernetes:apps/v1:DaemonSet');
   expect(firewall?.inputs.spec.template.spec.containers[0].args).toEqual([
     '--run-router=false',
