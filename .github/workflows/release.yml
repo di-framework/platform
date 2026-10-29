@@ -890,10 +890,13 @@ jobs:
             if [[ -n "${branch_pin}" ]] && ! newer "$branch_pin" "$current"; then
               if git push --force-with-lease="refs/heads/${branch}:${lease}" origin ":refs/heads/${branch}"; then
                 echo "Deleted ${branch} (bakes ${branch_pin}): main is already at ${current}"
+                # The comment is posted on its own, after the leased delete (a PR a newer release took
+                # over is never told it is superseded): GitHub usually closes the PR with its branch,
+                # and `gh pr close --comment` on a closed PR would drop the comment.
                 if [[ -n "${existing}" ]]; then
-                  gh pr close "${existing}" \
-                    --comment "Superseded: main already bakes \`@di-framework/platform@${current}\` (${GITHUB_REF_NAME}, [run](${RUN_URL}))." \
-                    || echo "::notice::PR #${existing} was already closed with its branch"
+                  gh pr comment "${existing}" \
+                    --body "Superseded: main already bakes \`@di-framework/platform@${current}\` (${GITHUB_REF_NAME}, [run](${RUN_URL}))."
+                  gh pr close "${existing}" || echo "::notice::PR #${existing} was already closed with its branch"
                 fi
               else
                 read_bot

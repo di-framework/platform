@@ -1633,10 +1633,11 @@ jq '.packages["node_modules/@di-framework/platform"].version="${pin}"' package-l
       const bin = join(base, 'bin');
       const log = join(base, 'calls.log');
       writeFileSync(log, '');
+      // `gh pr close` fails as it does on a PR GitHub already closed with its deleted branch.
       stubCommand(
         bin,
         'gh',
-        `if [ "$1 $2" = "pr list" ]; then ${opts.open ? 'echo 7' : 'true'}; else echo "gh $*" >> "${log}"; fi`,
+        `if [ "$1 $2" = "pr list" ]; then ${opts.open ? 'echo 7' : 'true'}; else echo "gh $*" >> "${log}"; [ "$1 $2" != "pr close" ] || exit 1; fi`,
       );
       const race = `(cd "${base}/side-race" && git push -qf origin HEAD:refs/heads/bot/operator-project)`;
       const raceAt = opts.race ? (opts.raceAt ?? 'bun') : undefined;
@@ -1770,10 +1771,14 @@ echo "lock $3 from main" > package-lock.json`,
         expect(r.code).toBe(0);
         expect(r.out).toContain(`main already bakes @di-framework/platform@${main}`);
         expect(r.out).toContain(`Deleted bot/operator-project (bakes 1.0.1)`);
-        // Deleted by the leased push; the close only comments.
+        // Deleted by the leased push; then the "Superseded" comment, posted on its own so it lands
+        // although GitHub already closed the PR with its branch (round 2 S2), then the close.
         expect(r.files['package.json']).toBe('');
-        expect(r.calls).toContain('gh pr close 7 --comment');
-        expect(r.calls).not.toContain('--delete-branch');
+        expect(r.calls.split('\n').filter(Boolean)).toEqual([
+          `gh pr comment 7 --body Superseded: main already bakes \`@di-framework/platform@${main}\` (v1.0.2, [run](https://example.invalid/run)).`,
+          'gh pr close 7',
+        ]);
+        expect(r.out).toContain('PR #7 was already closed with its branch');
       }
       // A leftover branch main has passed, with no PR: deleted, nothing to close.
       const leftover = projectPr({ main: '1.0.2', branch: '1.0.1' });
