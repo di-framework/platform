@@ -506,6 +506,12 @@ type TargetStatus struct {
 	// ResyncStarted is when the running resync restarted the vCluster control plane.
 	// +optional
 	ResyncStarted *metav1.Time `json:"resyncStarted,omitempty"`
+
+	// ResyncCause is set while a resync that follows the loss of the target cluster is running:
+	// the reason that started it, such as HostNamespaceDeleted. The Ready and TargetReady
+	// conditions name it until the instance is Ready again, when it is cleared (#536).
+	// +optional
+	ResyncCause string `json:"resyncCause,omitempty"`
 }
 
 // SecretReference names a Secret in the PlatformInstance's namespace.

@@ -246,10 +246,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				s.Target.ResyncServiceUID = st.ResyncStarted
 				s.Target.ResyncStarted = &now
 			}
-			setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionFalse, st.Reason, st.Message)
-			if st.TargetLost {
+			switch {
+			case st.TargetLost:
+				// The cause stays in status for the whole resync, which later rounds report
+				// as Resyncing (#536).
+				s.Target.ResyncCause = st.Reason
+				setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionFalse, st.Reason, st.Message)
 				setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionFalse, st.Reason, st.Message)
-			} else {
+			case s.Target.ResyncCause != "":
+				setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionFalse, st.Reason, withResyncCause(s, st.Message))
+				setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionFalse, s.Target.ResyncCause,
+					withResyncCause(s, "resyncing: waiting for the target cluster"))
+			default:
+				setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionFalse, st.Reason, st.Message)
 				setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionFalse, "TargetPending", "waiting for the target cluster")
 			}
 		})
@@ -301,7 +310,7 @@ func (r *Reconciler) resyncDone(ctx context.Context, inst *v1alpha1.PlatformInst
 // repair otherwise.
 func (r *Reconciler) markReady(ctx context.Context, inst *v1alpha1.PlatformInstance, st targets.State) error {
 	s := inst.Status
-	if s.Phase == v1alpha1.PhaseReady && s.KubeconfigSecretRef != nil && s.Target.ServiceUID == st.ServiceUID &&
+	if s.Phase == v1alpha1.PhaseReady && s.KubeconfigSecretRef != nil && s.Target.ServiceUID == st.ServiceUID && s.Target.ResyncCause == "" &&
 		meta.IsStatusConditionTrue(s.Conditions, v1alpha1.ConditionTargetReady) &&
 		meta.IsStatusConditionTrue(s.Conditions, v1alpha1.ConditionReady) {
 		return nil
@@ -311,9 +320,30 @@ func (r *Reconciler) markReady(ctx context.Context, inst *v1alpha1.PlatformInsta
 		s.KubeconfigSecretRef = &v1alpha1.SecretReference{Name: kubeconfigSecretName(inst)}
 		// An instance installed before the uid was recorded gets it here.
 		s.Target.ServiceUID = st.ServiceUID
+		s.Target.ResyncCause = ""
 		setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionTrue, "Ready", "target cluster answers")
 		setCondition(s, inst.Generation, v1alpha1.ConditionReady, metav1.ConditionTrue, "Ready", "instance is ready")
 	})
+}
+
+// resyncCauses are the readable forms of the status.target.resyncCause values a target reports.
+var resyncCauses = map[string]string{vcluster.ReasonHostNamespaceDeleted: "host namespace was deleted"}
+
+// withResyncCause prefixes msg with the cause of the running resync, if one is recorded, so the
+// conditions say why the instance resyncs until it is Ready again (#536).
+func withResyncCause(s *v1alpha1.PlatformInstanceStatus, msg string) string {
+	cause := s.Target.ResyncCause
+	if cause == "" {
+		return msg
+	}
+	text, ok := resyncCauses[cause]
+	if !ok {
+		text = cause
+	}
+	if strings.Contains(msg, text) {
+		return msg
+	}
+	return text + "; " + msg
 }
 
 // ReasonAdmissionPolicyUnavailable (on OwnerServiceProtected) reports an API server without
@@ -358,7 +388,7 @@ func (r *Reconciler) install(ctx context.Context, inst *v1alpha1.PlatformInstanc
 		if st.Resynced {
 			// Ready again only once the platform is reinstalled on the resynced target.
 			setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionFalse, "Resyncing",
-				"vcluster resynced; reinstalling the platform to recreate the objects it lost")
+				withResyncCause(s, "vcluster resynced; reinstalling the platform to recreate the objects it lost"))
 		} else {
 			setCondition(s, inst.Generation, v1alpha1.ConditionTargetReady, metav1.ConditionTrue, "Ready", "target cluster answers")
 		}
