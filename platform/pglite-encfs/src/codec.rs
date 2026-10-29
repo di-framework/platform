@@ -60,7 +60,7 @@ pub enum Codec {
     /// Codec 3: XTS on complete blocks, length-independent tail keystream.
     XtsTail,
     /// Codec 4 (#200): two XChaCha20-Poly1305 slots per 8 KiB unit, only in
-    /// integrity directories. This build reads it and never creates it.
+    /// integrity directories, where every new file gets it.
     TwoSlotAead,
 }
 

@@ -18,8 +18,9 @@
 //!
 //! Every `DIPGKEY2` form is at least [`MARKER_LEN`] bytes long, so builds that
 //! do not know it lock it as corrupt instead of initialising an XTS directory
-//! over it. This build reads integrity directories but cannot create them: a
-//! reservation in a root without data locks with [`Lock::IntegrityUnsupported`].
+//! over it. A reservation in a root without data initialises an integrity
+//! directory: the keyed `DIPGKEY2` marker replaces it by rename. Nothing else
+//! selects the mode, no environment variable included.
 
 use crate::codec::Codec;
 use crate::header::HEADER_LEN;
@@ -239,8 +240,10 @@ fn form(marker: &[u8]) -> Form<'_> {
 pub enum RootDecision {
     /// The marker matches the current key.
     Ready(Mode),
-    /// Empty directory: write the XTS marker for the current key, then use it.
-    Initialize,
+    /// Write the keyed marker of this mode for the current key, then use the
+    /// directory: XTS for an empty root, integrity for a reservation in a
+    /// root without data.
+    Initialize(Mode),
     /// The marker matches the previous key: re-wrap every file header under the
     /// current key, then flip the marker in the same mode.
     Rotate(Mode),
@@ -259,9 +262,6 @@ pub enum Lock {
     /// The marker exists but is not a marker this build knows: another magic
     /// or length, unknown `DIPGKEY2` flags, or a reservation with a KCV.
     CorruptMarker,
-    /// An integrity reservation in a root without data. Initialising it needs
-    /// the codec-4 writer, which this build does not have (#200).
-    IntegrityUnsupported,
     /// An integrity reservation next to data: something other than encfs
     /// wrote into a reserved directory.
     ReservedWithData,
@@ -281,9 +281,6 @@ impl Lock {
                 "the data directory has data but no encryption marker (an unencrypted directory); refusing. Migrate it offline into an empty directory first"
             }
             Lock::CorruptMarker => "the encryption marker (.di-encfs) is corrupt; refusing",
-            Lock::IntegrityUnsupported => {
-                "the data directory is reserved for integrity mode (codec 4); this build reads integrity directories but cannot initialise one, so it refuses. Deploy an encfs build with the codec-4 writer"
-            }
             Lock::ReservedWithData => {
                 "the data directory is reserved for integrity mode (codec 4) but already holds data that encfs did not write; refusing"
             }
@@ -299,7 +296,7 @@ impl Lock {
 /// Decide from the marker contents (`None` when absent; read up to
 /// [`MARKER_READ_LEN`] bytes) and whether the root has other entries (see
 /// [`is_volume_metadata`]). This is the table of section 9.1 of the #200
-/// design note, for a build that reads codec 4 but cannot create it.
+/// design note.
 ///
 /// An empty or short marker in a root without data is what a crash during the
 /// first start could leave behind before markers were written atomically; it
@@ -313,16 +310,16 @@ pub fn decide(keys: &KeyRing, marker: Option<&[u8]>, has_data: bool) -> RootDeci
         return if has_data {
             RootDecision::Locked(Lock::Unencrypted)
         } else {
-            RootDecision::Initialize
+            RootDecision::Initialize(Mode::Xts)
         };
     };
     if marker.len() < MARKER_LEN && !has_data {
-        return RootDecision::Initialize;
+        return RootDecision::Initialize(Mode::Xts);
     }
     let (mode, kcv) = match form(marker) {
         Form::Keyed { mode, kcv } => (mode, kcv),
         Form::Reservation if has_data => return RootDecision::Locked(Lock::ReservedWithData),
-        Form::Reservation => return RootDecision::Locked(Lock::IntegrityUnsupported),
+        Form::Reservation => return RootDecision::Initialize(Mode::Integrity),
         Form::Corrupt => return RootDecision::Locked(Lock::CorruptMarker),
     };
     if current.matches(kcv) {
@@ -375,7 +372,7 @@ mod tests {
     fn empty_root_is_initialized_and_data_without_marker_is_refused() {
         assert_eq!(
             decide(&ring(Some(1), None), None, false),
-            RootDecision::Initialize
+            RootDecision::Initialize(Mode::Xts)
         );
         assert_eq!(
             decide(&ring(Some(1), None), None, true),
@@ -439,7 +436,7 @@ mod tests {
         for m in [&b""[..], &marker(1)[..MARKER_LEN - 1], &marker(1)[..8]] {
             assert_eq!(
                 decide(&ring(Some(1), None), Some(m), false),
-                RootDecision::Initialize
+                RootDecision::Initialize(Mode::Xts)
             );
         }
         assert_eq!(
@@ -514,13 +511,16 @@ mod tests {
     }
 
     #[test]
-    fn a_reservation_locks_in_this_build() {
-        // Reader release (section 9.3 step 1): never an XTS directory in a
-        // reserved root.
-        assert_eq!(
-            decide(&ring(Some(1), None), Some(&RESERVATION), false),
-            RootDecision::Locked(Lock::IntegrityUnsupported)
-        );
+    fn a_reservation_initialises_an_integrity_directory() {
+        // Writer release (section 9.3 step 2): a reservation in a root
+        // without data becomes an integrity directory, under any key, and
+        // never an XTS one; next to data it locks.
+        for current in [1, 2] {
+            assert_eq!(
+                decide(&ring(Some(current), Some(3)), Some(&RESERVATION), false),
+                RootDecision::Initialize(Mode::Integrity)
+            );
+        }
         assert_eq!(
             decide(&ring(Some(1), None), Some(&RESERVATION), true),
             RootDecision::Locked(Lock::ReservedWithData)
@@ -529,9 +529,86 @@ mod tests {
             decide(&ring(None, None), Some(&RESERVATION), false),
             RootDecision::Locked(Lock::NoKey)
         );
-        for lock in [Lock::IntegrityUnsupported, Lock::ReservedWithData] {
-            assert!(!lock.is_access_error());
-            assert!(lock.message().contains("integrity mode (codec 4)"));
+        assert!(!Lock::ReservedWithData.is_access_error());
+        assert!(Lock::ReservedWithData
+            .message()
+            .contains("integrity mode (codec 4)"));
+        // What replaces the reservation is the keyed marker of that mode,
+        // which then opens the directory as an integrity one.
+        let keyed = encode(Mode::Integrity, kek(1).kcv());
+        assert_eq!(keyed, integrity(1));
+        assert_eq!(
+            decide(&ring(Some(1), None), Some(&keyed), false),
+            RootDecision::Ready(Mode::Integrity)
+        );
+    }
+
+    #[test]
+    fn every_row_of_the_marker_table() {
+        // Section 9.1: each root falls into exactly one row.
+        let k = ring(Some(1), Some(2));
+        let mut keyed_reservation = RESERVATION;
+        keyed_reservation[MARKER2_MAGIC.len()..MARKER_LEN].copy_from_slice(kek(1).kcv());
+        let mut unknown_bit = integrity(1);
+        unknown_bit[MARKER_LEN] |= 0b100;
+        let rows: [(Option<&[u8]>, bool, RootDecision); 14] = [
+            (None, false, RootDecision::Initialize(Mode::Xts)),
+            (None, true, RootDecision::Locked(Lock::Unencrypted)),
+            (
+                Some(&marker(1)[..10]),
+                false,
+                RootDecision::Initialize(Mode::Xts),
+            ),
+            (
+                Some(&marker(1)[..10]),
+                true,
+                RootDecision::Locked(Lock::CorruptMarker),
+            ),
+            (Some(&marker(1)), false, RootDecision::Ready(Mode::Xts)),
+            (Some(&marker(2)), true, RootDecision::Rotate(Mode::Xts)),
+            (
+                Some(&RESERVATION),
+                false,
+                RootDecision::Initialize(Mode::Integrity),
+            ),
+            (
+                Some(&RESERVATION),
+                true,
+                RootDecision::Locked(Lock::ReservedWithData),
+            ),
+            (
+                Some(&integrity(1)),
+                false,
+                RootDecision::Ready(Mode::Integrity),
+            ),
+            (
+                Some(&integrity(2)),
+                true,
+                RootDecision::Rotate(Mode::Integrity),
+            ),
+            (
+                Some(&integrity(3)),
+                true,
+                RootDecision::Locked(Lock::WrongKey),
+            ),
+            (
+                Some(&keyed_reservation),
+                false,
+                RootDecision::Locked(Lock::CorruptMarker),
+            ),
+            (
+                Some(&unknown_bit),
+                false,
+                RootDecision::Locked(Lock::CorruptMarker),
+            ),
+            (
+                Some(b"DIPGKEY9xxxxxxxxxxxxxxxxx"),
+                false,
+                RootDecision::Locked(Lock::CorruptMarker),
+            ),
+        ];
+        for (m, has_data, expected) in rows {
+            assert_eq!(decide(&k, m, has_data), expected, "{m:?} {has_data}");
         }
     }
 

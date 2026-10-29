@@ -18,8 +18,8 @@
 //!
 //! Codec ids ([`Codec`]): 2 is AES-256-XTS with ciphertext stealing (v1),
 //! 3 is AES-256-XTS with a length-independent tail keystream (#206), 4 is the
-//! two-slot AEAD of integrity directories (#200, [`crate::slots`]; this build
-//! reads it but never creates it). New files get [`Codec::NEW_FILES`]. A file
+//! two-slot AEAD of integrity directories (#200, [`crate::slots`] and
+//! [`crate::writer`]; every new file there gets it). New files get [`Codec::NEW_FILES`]. A file
 //! keeps the codec it was created with for its whole lifetime: the header is
 //! never rewritten except for its wrap, and the codec byte is part of the AAD,
 //! so it cannot be changed without the key. Codec 1 was the AEAD prototype of
