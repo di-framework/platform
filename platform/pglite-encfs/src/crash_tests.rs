@@ -80,7 +80,17 @@ pub(crate) struct Rec {
     pub ops: RefCell<Vec<(Op, Vec<u8>)>>,
     /// Epochs that ended with a sync since they were last taken.
     pub finished: RefCell<Vec<Epoch>>,
+    /// Fail the next write, whatever it writes.
     pub fail_write: Cell<Option<Fail>>,
+    /// Fail the next write into the header or record pages: a watermark
+    /// record write (W2 of the review: `fail_write` always hits the slot
+    /// write a record write follows).
+    pub fail_record_write: Cell<Option<Fail>>,
+    /// Reads that fail right after the next injected write failure, so the
+    /// re-read of 6.6 (e) fails too.
+    pub unread_after_failure: Cell<u32>,
+    /// Reads still to fail.
+    pub reads_fail: Cell<u32>,
     pub fail_sync: Cell<bool>,
     pub syncs: Cell<u32>,
     /// Every write, `(offset, length)`, for layout tests.
@@ -97,6 +107,9 @@ impl Rec {
             ops: RefCell::default(),
             finished: RefCell::default(),
             fail_write: Cell::new(None),
+            fail_record_write: Cell::new(None),
+            unread_after_failure: Cell::new(0),
+            reads_fail: Cell::new(0),
             fail_sync: Cell::new(false),
             syncs: Cell::new(0),
             writes: RefCell::default(),
@@ -167,6 +180,10 @@ impl Storage for Rec {
     }
 
     fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, ()> {
+        if self.reads_fail.get() > 0 {
+            self.reads_fail.set(self.reads_fail.get() - 1);
+            return Err(());
+        }
         let bytes = self.volatile.borrow();
         let start = (offset as usize).min(bytes.len());
         let end = (offset + len).min(bytes.len() as u64) as usize;
@@ -178,7 +195,13 @@ impl Storage for Rec {
             check_durable_slots(keys, &self.durable.borrow(), offset, data.len());
         }
         self.writes.borrow_mut().push((offset, data.len()));
-        let fail = self.fail_write.take();
+        let fail = match self.fail_write.take() {
+            None if offset < PAIRS_START => self.fail_record_write.take(),
+            fail => fail,
+        };
+        if fail.is_some() {
+            self.reads_fail.set(self.unread_after_failure.take());
+        }
         let landed = match fail {
             None | Some(Fail::All) => data,
             Some(Fail::Half) => &data[..data.len() / 2],
@@ -501,6 +524,8 @@ pub(crate) struct Checker {
     /// The most units durable at any completed sync.
     pub max_durable_units: u64,
     pub disks: usize,
+    /// Failure steps whose failure was injected, outside restarted runs.
+    pub injected: usize,
     pub rng: XorShift,
 }
 
@@ -511,6 +536,7 @@ impl Checker {
             sealed: HashMap::new(),
             max_durable_units: 0,
             disks: 0,
+            injected: 0,
             rng: XorShift(seed),
         }
     }
@@ -629,11 +655,86 @@ pub(crate) enum Step {
     Drop,
     /// A write whose host write fails (6.6 (e)).
     FailingWrite(Fail, u64, Vec<u8>),
+    /// A write whose host write fails and whose re-read fails too, so the
+    /// writer cannot know the unit's bit (6.6 (e), last case).
+    UnreadFailingWrite(Fail, u64, Vec<u8>),
+    /// A step during which the next watermark record write fails (6.6 (e)
+    /// for records); with `true`, the re-read after it fails too. The step
+    /// must be a write, a resize or a sync. After a restart no record may be
+    /// due; the step then runs as it is.
+    FailingRecord(Fail, bool, Box<Step>),
 }
 
 fn pattern(len: usize, seed: u64) -> Vec<u8> {
     let mut rng = XorShift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     (0..len).map(|_| rng.next() as u8 | 1).collect()
+}
+
+/// Run one step; `expected` becomes the content a successful step leaves.
+/// Returns the result and whether an injected failure was reported, so the
+/// content is not compared.
+fn perform(
+    bench: &mut Bench,
+    step: &Step,
+    expected: &mut Vec<u8>,
+    ctx: &str,
+) -> (Result<(), SlotError<()>>, bool) {
+    match step {
+        Step::Write(offset, data) => {
+            let end = *offset as usize + data.len();
+            if expected.len() < end {
+                expected.resize(end, 0);
+            }
+            expected[*offset as usize..end].copy_from_slice(data);
+            (bench.write(*offset, data), false)
+        }
+        Step::SetSize(size) => {
+            expected.resize(*size as usize, 0);
+            (bench.set_size(*size), false)
+        }
+        Step::Sync => (bench.sync(), false),
+        Step::Drop => (bench.drop_state(), false),
+        Step::FailingWrite(fail, offset, data) | Step::UnreadFailingWrite(fail, offset, data) => {
+            bench.rec.fail_write.set(Some(*fail));
+            if matches!(step, Step::UnreadFailingWrite(..)) {
+                bench.rec.unread_after_failure.set(1);
+            }
+            let result = bench.write(*offset, data);
+            assert!(
+                result.is_err(),
+                "{ctx}: the injected failure was not reported"
+            );
+            assert_eq!(
+                bench.rec.reads_fail.get(),
+                0,
+                "{ctx}: the re-read was not made"
+            );
+            (Ok(()), true)
+        }
+        Step::FailingRecord(fail, unread, inner) => {
+            bench.rec.fail_record_write.set(Some(*fail));
+            if *unread {
+                bench.rec.unread_after_failure.set(1);
+            }
+            let (result, _) = perform(bench, inner, expected, ctx);
+            let injected = bench.rec.fail_record_write.take().is_none();
+            if !injected {
+                // No record was due: nothing failed.
+                bench.rec.unread_after_failure.set(0);
+                return (result, false);
+            }
+            assert!(
+                result.is_err(),
+                "{ctx}: the injected record failure was not reported"
+            );
+            assert_eq!(
+                bench.rec.reads_fail.get(),
+                0,
+                "{ctx}: the re-read was not made"
+            );
+            (Ok(()), true)
+        }
+    }
 }
 
 /// Run `steps` on `bench`, checking every crash after each step, and, down
@@ -644,31 +745,10 @@ pub(crate) fn run(checker: &mut Checker, mut bench: Bench, steps: &[Step], depth
         let ctx = format!("{name} step {i} {}", describe(step));
         let before = bench.rec.ops.borrow().len();
         let mut expected = model.clone();
-        let result = match step {
-            Step::Write(offset, data) => {
-                let end = *offset as usize + data.len();
-                if expected.len() < end {
-                    expected.resize(end, 0);
-                }
-                expected[*offset as usize..end].copy_from_slice(data);
-                bench.write(*offset, data)
-            }
-            Step::SetSize(size) => {
-                expected.resize(*size as usize, 0);
-                bench.set_size(*size)
-            }
-            Step::Sync => bench.sync(),
-            Step::Drop => bench.drop_state(),
-            Step::FailingWrite(fail, offset, data) => {
-                bench.rec.fail_write.set(Some(*fail));
-                let result = bench.write(*offset, data);
-                assert!(
-                    result.is_err(),
-                    "{ctx}: the injected failure was not reported"
-                );
-                Ok(())
-            }
-        };
+        let (result, failed) = perform(&mut bench, step, &mut expected, &ctx);
+        if failed && !name.contains("restart") {
+            checker.injected += 1;
+        }
         result.unwrap_or_else(|e| panic!("{ctx}: {e:?}"));
         // Check every crash since the step began.
         let finished: Vec<Epoch> = bench.rec.finished.borrow_mut().drain(..).collect();
@@ -687,7 +767,7 @@ pub(crate) fn run(checker: &mut Checker, mut bench: Bench, steps: &[Step], depth
             now,
             "{ctx}: state and disk disagree"
         );
-        if !matches!(step, Step::FailingWrite(..)) {
+        if !failed {
             assert_eq!(now, expected, "{ctx}: wrong content");
         }
         model = now;
@@ -720,6 +800,17 @@ fn describe(step: &Step) -> String {
         Step::FailingWrite(fail, offset, data) => {
             format!("failing write ({fail:?}) {offset}+{}", data.len())
         }
+        Step::UnreadFailingWrite(fail, offset, data) => {
+            format!(
+                "failing write ({fail:?}, re-read fails) {offset}+{}",
+                data.len()
+            )
+        }
+        Step::FailingRecord(fail, unread, inner) => format!(
+            "{} with a failing record write ({fail:?}{})",
+            describe(inner),
+            if *unread { ", re-read fails" } else { "" }
+        ),
     }
 }
 
@@ -733,10 +824,11 @@ mod workloads {
         Step::Write(offset, pattern(len, seed))
     }
 
-    fn check(steps: &[Step], depth: u32, name: &str) -> usize {
+    /// Run `steps` from a birth; returns the checker (disks, injections).
+    fn check(steps: &[Step], depth: u32, name: &str) -> Checker {
         let mut checker = Checker::new(keys(), 0xC0FF_EE11_D00D_F00D);
         run(&mut checker, Bench::born(), steps, depth, name);
-        checker.disks
+        checker
     }
 
     #[test]
@@ -756,7 +848,7 @@ mod workloads {
             w(U, U as usize, 7),
             Step::Sync,
         ];
-        assert!(check(&steps, 1, "wal tail") > 1000);
+        assert!(check(&steps, 1, "wal tail").disks > 1000);
     }
 
     #[test]
@@ -839,6 +931,84 @@ mod workloads {
         check(&steps, 1, "failed writes");
     }
 
+    fn failing_record(fail: Fail, unread: bool, step: Step) -> Step {
+        Step::FailingRecord(fail, unread, Box::new(step))
+    }
+
+    #[test]
+    fn failed_record_writes() {
+        // 6.6 (e) for watermark records: a lazy record write that fails with
+        // nothing, everything or half of it landed, over a clean record (the
+        // write targets the other record) and over a pending one (the write
+        // overwrites it); then the retry, and tears of everything after.
+        // Each record write is checked against the durable record as it is
+        // issued, so `wm_pending` wrong either way fails here.
+        let mut steps = Vec::new();
+        for (round, fail) in [Fail::Nothing, Fail::All, Fail::Half]
+            .into_iter()
+            .enumerate()
+        {
+            let base = round as u64 * 3 * U;
+            let seed = 10 * round as u64;
+            steps.extend([
+                // A clean record: the sync leaves a candidate due, and the
+                // next write's record write targets the other record.
+                w(base, 2 * U as usize, seed + 1),
+                Step::Sync,
+                failing_record(fail, false, w(base + 10, 100, seed + 2)),
+                // The retry writes the candidate, or finds it written.
+                w(base + 20, 100, seed + 3),
+                Step::Sync,
+                // A pending record: a third unit, a sync, and a write that
+                // carries its record; then a shrink to two units lowers the
+                // watermark by overwriting that unsynced record.
+                w(base + 2 * U, U as usize, seed + 4),
+                Step::Sync,
+                w(base + 30, 10, seed + 5),
+                failing_record(fail, false, Step::SetSize(base + U + 5)),
+                Step::SetSize(base + U + 5),
+                w(base + U + 5, 2 * U as usize, seed + 6),
+                Step::Sync,
+            ]);
+        }
+        steps.push(Step::Sync);
+        // Every failure step failed: none ran without a record write due.
+        assert_eq!(check(&steps, 1, "failed record writes").injected, 6);
+    }
+
+    #[test]
+    fn failed_rereads() {
+        // 6.6 (e), last case: the re-read after a failed slot or record
+        // write fails too, so no bit can be known; the writer syncs before
+        // it trusts one again (W0), and reloads the record and size.
+        let steps = [
+            w(0, 2 * U as usize, 1),
+            Step::Sync,
+            // A clean unit whose write landed: B now wins unsynced.
+            Step::UnreadFailingWrite(Fail::All, 0, pattern(U as usize, 2)),
+            w(0, U as usize, 3),
+            Step::UnreadFailingWrite(Fail::Half, U, pattern(U as usize, 4)),
+            w(U, 100, 5),
+            Step::Sync,
+            Step::UnreadFailingWrite(Fail::Nothing, 2 * U, pattern(U as usize, 6)),
+            w(2 * U, 10, 7),
+            Step::Sync,
+            // A record write that landed, its re-read failed.
+            w(3 * U, 100, 8),
+            Step::Sync,
+            failing_record(Fail::All, true, w(0, 50, 9)),
+            w(60, 50, 10),
+            Step::Sync,
+            // A sync's own record write that did not land, re-read failed.
+            w(4 * U, 100, 11),
+            Step::Sync,
+            failing_record(Fail::Nothing, true, Step::Sync),
+            Step::Sync,
+            Step::Sync,
+        ];
+        assert_eq!(check(&steps, 1, "failed re-reads").injected, 5);
+    }
+
     #[test]
     fn random_sequences() {
         for seed in 1..=4u64 {
@@ -862,11 +1032,15 @@ mod workloads {
                     _ => {
                         let fail = [Fail::Nothing, Fail::All, Fail::Half][rng.below(3) as usize];
                         let offset = rng.below(size + 1);
-                        Step::FailingWrite(
-                            fail,
-                            offset,
-                            pattern(1 + rng.below(U) as usize, rng.next()),
-                        )
+                        let data = pattern(1 + rng.below(U) as usize, rng.next());
+                        match rng.below(4) {
+                            0 | 1 => Step::FailingWrite(fail, offset, data),
+                            2 => Step::UnreadFailingWrite(fail, offset, data),
+                            _ => {
+                                size = size.max(offset + data.len() as u64);
+                                failing_record(fail, rng.below(2) == 1, Step::Write(offset, data))
+                            }
+                        }
                     }
                 };
                 steps.push(step);

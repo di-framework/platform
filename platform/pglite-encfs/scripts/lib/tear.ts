@@ -175,3 +175,144 @@ export function tearFirstSlot(before: Uint8Array, after: Uint8Array): Tear | nul
   }
   return null;
 }
+
+/** Two slots per unit: slot A, then slot B. */
+export const PAIR_LEN = 2 * SLOT_LEN;
+
+/** Where `slot` (0 = A, 1 = B) of `unit` starts (src/slots.rs `slot_offset`). */
+export function slotOffset(unit: number, slot: 0 | 1): number {
+  return PAIRS_START + unit * PAIR_LEN + slot * SLOT_LEN;
+}
+
+/** The generation `slot` of `unit` claims; 0 when the slot is past the end. */
+export function claimedGeneration(image: Uint8Array, unit: number, slot: 0 | 1): bigint {
+  const start = slotOffset(unit, slot);
+  return start + 8 <= image.length ? generation(image, start) : 0n;
+}
+
+/** The `len` field of a slot (bytes 8..12, little endian); 0 past the end. */
+export function slotLength(image: Uint8Array, start: number): number {
+  if (start + 12 > image.length) return 0;
+  return new DataView(image.buffer, image.byteOffset + start + 8, 4).getUint32(0, true);
+}
+
+/**
+ * The slot of `unit` that a rewrite of its durable version targets (design
+ * note 6.2): the one that does not claim the higher generation. On a disk
+ * nobody tampered with, the higher claim is the winner.
+ */
+export function rewriteTarget(image: Uint8Array, unit: number): 0 | 1 {
+  return claimedGeneration(image, unit, 1) > claimedGeneration(image, unit, 0) ? 0 : 1;
+}
+
+/** The pairs of a codec-4 image that hold both slots. */
+function wholePairs(image: Uint8Array): number {
+  return Math.max(0, Math.floor((image.length - PAIRS_START) / PAIR_LEN));
+}
+
+/**
+ * Codec 4: tear the first rewrite of a durable unit. The image is `before`,
+ * except that in the first pair whose rewrite target (the slot that is not
+ * the winner in `before`) changed in `after`, that slot takes the sectors of
+ * `after` up to a sector boundary inside its changes. Unlike
+ * {@link tearFirstSlot}, this also tears a pair whose two slots both changed
+ * (a sync came in between): the target was written first, so its tear is the
+ * crash state right after the first rewrite, with the winner of `before`
+ * untouched.
+ */
+export function tearRewriteTarget(before: Uint8Array, after: Uint8Array): Tear | null {
+  if (before.length !== after.length) return null;
+  for (let unit = 0; unit < wholePairs(before); unit++) {
+    const start = slotOffset(unit, rewriteTarget(before, unit));
+    const torn = tearSlot(before, after, [start, start + SLOT_LEN]);
+    if (torn) return torn;
+  }
+  return null;
+}
+
+/**
+ * Codec 4: tear one slot write. The image is `before`, except that `slot`
+ * takes the sectors of `after` up to a sector boundary inside its changes.
+ * Null when the slot did not change, or its changes fit in one sector.
+ */
+export function tearSlot(
+  before: Uint8Array,
+  after: Uint8Array,
+  slot: [number, number],
+): Tear | null {
+  if (before.length !== after.length || slot[1] > after.length) return null;
+  if (firstDifference(before.subarray(...slot), after.subarray(...slot)) < 0) return null;
+  const tearAt = tearPoint(before, after, slot);
+  if (tearAt === null) return null;
+  const bytes = Uint8Array.from(before);
+  bytes.set(after.subarray(slot[0], tearAt), slot[0]);
+  return { bytes, page: slot, tearAt };
+}
+
+/**
+ * The watermark `D` a codec-4 image claims: the durable-unit count of the
+ * record with the higher `seq` (src/slots.rs). Read without the key, so it
+ * is only meaningful on an image nobody tampered with.
+ */
+export function claimedWatermark(image: Uint8Array): bigint {
+  const record = (at: number) => {
+    if (at + 16 > image.length) return { seq: 0n, units: 0n };
+    const view = new DataView(image.buffer, image.byteOffset + at, 16);
+    return { seq: view.getBigUint64(0, true), units: view.getBigUint64(8, true) };
+  };
+  const [zero, one] = [record(4096), record(8192)];
+  return (one.seq > zero.seq ? one : zero).units;
+}
+
+/**
+ * Codec 4, C10: one unit rewritten twice without a sync, the second write
+ * torn. `first` and `second` are two continuations of `before` that both
+ * rewrote the same durable unit, so their copies of its rewrite target are
+ * two writes to that slot, sealed with different nonces. The image is
+ * `before`, except that the target holds the sectors of `first` up to a
+ * sector boundary and those of `second` from it on: neither write's tag
+ * verifies, and the winner of `before` is untouched.
+ */
+export function tearSecondRewrite(
+  before: Uint8Array,
+  first: Uint8Array,
+  second: Uint8Array,
+): Tear | null {
+  if (before.length !== first.length || before.length !== second.length) return null;
+  for (let unit = 0; unit < wholePairs(before); unit++) {
+    const start = slotOffset(unit, rewriteTarget(before, unit));
+    const slot: [number, number] = [start, start + SLOT_LEN];
+    const changed = (image: Uint8Array) =>
+      firstDifference(before.subarray(...slot), image.subarray(...slot)) >= 0;
+    if (!changed(first) || !changed(second)) continue;
+    const tearAt = tearPoint(first, second, slot);
+    if (tearAt === null) continue;
+    const bytes = Uint8Array.from(before);
+    bytes.set(first.subarray(start, tearAt), start);
+    bytes.set(second.subarray(tearAt, slot[1]), tearAt);
+    return { bytes, page: slot, tearAt };
+  }
+  return null;
+}
+
+/**
+ * Codec 4, C6: an unaligned append inside the last unit, torn. The last
+ * pair's winner (the slot the append wrote) keeps its first sector, with the
+ * slot header, and its sectors from the next boundary on did not reach the
+ * disk: zeros, as past the old end of the file. The file length did. Null
+ * when the last unit is full, so no append inside it can be in flight.
+ */
+export function tearLastAppend(image: Uint8Array): Tear | null {
+  const pairs = Math.ceil((image.length - PAIRS_START) / PAIR_LEN);
+  if (pairs < 1) return null;
+  const unit = pairs - 1;
+  const start = slotOffset(unit, rewriteTarget(image, unit) === 0 ? 1 : 0);
+  const len = slotLength(image, start);
+  if (len === 0 || len >= PAGE) return null;
+  const end = Math.min(start + 64 + len, image.length);
+  const tearAt = roundUp(start + 64 + 1);
+  if (tearAt >= end) return null;
+  const bytes = Uint8Array.from(image);
+  bytes.fill(0, tearAt, end);
+  return { bytes, page: [start, end], tearAt };
+}

@@ -183,6 +183,14 @@ impl FileState {
         self.failed
     }
 
+    /// A3 for a host sync encfs made of this file outside the state (a
+    /// birth's, or one through a descriptor that held no state): nothing a
+    /// later sync reports can be trusted, so writes and syncs stop until
+    /// restart (6.5).
+    pub fn fail_stop(&mut self) {
+        self.failed = true;
+    }
+
     fn known(&self, unit: u64) -> Option<Slot> {
         self.known.get(unit).then(|| {
             if self.winner_b.get(unit) {
@@ -849,6 +857,9 @@ impl<S: Durable, N: Nonces> IntegrityFile<'_, S, N> {
         let physical = self.file.storage.size()?;
         if physical > end {
             if let Err(error) = self.file.storage.set_len(end) {
+                // The truncate may have happened: the removed units' bits go
+                // with it, and W0 syncs before any bit is trusted again.
+                self.state.drop_from(remaining);
                 self.state.reload = true;
                 self.state.synced_once = false;
                 return Err(SlotError::Storage(error));
@@ -901,6 +912,30 @@ impl<S: Durable, N: Nonces> IntegrityFile<'_, S, N> {
     }
 }
 
+/// Bring a codec-4 file into existence (5.6 "Birth"): write its birth block
+/// and sync it before any pair can follow. Returns the new file's state.
+/// When the write fails there is no state: the header may or may not have
+/// landed, and the next write re-seals record 0 (C8a). When the sync fails,
+/// the state is returned fail-stopped with the error (A3, 6.5), for the
+/// caller to keep before it reports the failure: a later sync of the same
+/// pages can report success although they never reached the disk.
+pub fn give_birth<S: Durable>(
+    storage: &S,
+    keys: &crate::slots::SlotKeys,
+    file_id: FileId,
+    header: &[u8],
+    nonce: &[u8; NONCE_LEN],
+) -> Result<FileState, (S::Error, Option<Box<FileState>>)> {
+    let (block, record) = birth_block(keys, &file_id, header, nonce);
+    storage.write_at(0, &block).map_err(|error| (error, None))?;
+    let mut state = FileState::born(file_id, record);
+    if let Err(error) = storage.sync_data() {
+        state.fail_stop();
+        return Err((error, Some(Box::new(state))));
+    }
+    Ok(state)
+}
+
 /// The 12 KiB birth block of a codec-4 file (5.6 "Birth"): the header page
 /// with `header`, record 0 sealed as `seq = 1, D = 0`, record page 1 zero.
 pub fn birth_block(
@@ -940,6 +975,14 @@ impl FileState {
 
     pub(crate) fn synced_once(&self) -> bool {
         self.synced_once
+    }
+
+    pub(crate) fn wm_pending(&self) -> bool {
+        self.wm_pending
+    }
+
+    pub(crate) fn record(&self) -> Option<Watermark> {
+        self.record
     }
 }
 
@@ -1419,6 +1462,166 @@ mod tests {
         assert_eq!(bench.rec.syncs.get(), syncs + 1);
         // After W0's sync slot A is durable, so the write takes B.
         assert_eq!(last_slot_write(&bench), slot_write(0, Slot::B, U));
+    }
+
+    #[test]
+    fn failed_record_writes_are_pending_exactly_when_their_target_won() {
+        // 6.6 (e) for records, for a clean record (the write targets the
+        // other one) and a pending one (the write overwrites it), with
+        // nothing, everything or half of it landed. The retry never targets
+        // the durable record (the storage guard checks every write).
+        for pending_before in [false, true] {
+            for fail in [Fail::Nothing, Fail::All, Fail::Half] {
+                let case = format!("pending {pending_before}, {fail:?}");
+                let mut bench = Bench::born();
+                bench.write(0, &pattern(3 * U, 1)).unwrap();
+                bench.sync().unwrap();
+                // Record 0 (the birth's) is durable; record 1 is the target.
+                if pending_before {
+                    // Write record 1 now, then lower the watermark over it.
+                    bench.write(0, b"a").unwrap();
+                    assert!(bench.state.wm_pending(), "{case}");
+                    assert_eq!(bench.state.record().unwrap().record, 1, "{case}");
+                }
+                bench.rec.fail_record_write.set(Some(fail));
+                let result = if pending_before {
+                    bench.set_size(UNIT + 1)
+                } else {
+                    bench.write(0, b"b")
+                };
+                assert!(result.is_err(), "{case}");
+                assert!(bench.rec.fail_record_write.get().is_none(), "{case}");
+                assert_eq!(last_write(&bench), (RECORD_AT[1], RECORD_LEN), "{case}");
+                // Re-selected from disk: record 1 wins when the failed write
+                // landed, or left the pending record it overwrote intact.
+                let landed = fail == Fail::All || (pending_before && fail == Fail::Nothing);
+                let winner = bench.state.record().unwrap();
+                assert_eq!(winner.record, u8::from(landed), "{case}");
+                assert_eq!(bench.state.wm_pending(), landed, "{case}");
+                assert_eq!(
+                    logical(&bench.keys, &bench.volatile()).unwrap().1.record,
+                    Some(winner),
+                    "{case}"
+                );
+                // Continue: a record write still due goes to record 1 again,
+                // overwriting a pending one or retrying the other one, and
+                // the watermark catches up (the guard checks every write).
+                let writes = bench.rec.writes.borrow().len();
+                let units = if pending_before {
+                    bench.set_size(UNIT + 1).unwrap();
+                    2
+                } else {
+                    bench.write(1, b"c").unwrap();
+                    3
+                };
+                for &(at, len) in &bench.rec.writes.borrow()[writes..] {
+                    assert!(
+                        at >= PAIRS_START || (at, len) == (RECORD_AT[1], RECORD_LEN),
+                        "{case}"
+                    );
+                }
+                for _ in 0..3 {
+                    bench.sync().unwrap();
+                }
+                assert_eq!(durable_watermark(&bench), units, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_reread_after_a_failed_write_syncs_before_the_next_write() {
+        // 6.6 (e), last case: the write landed in B, which now wins
+        // unsynced, and its re-read failed. The unit's bit cannot be known,
+        // so the next write runs W0 first; without it, B would be taken for
+        // clean and the write would overwrite durable A.
+        let mut bench = Bench::born();
+        bench.write(0, &pattern(U, 1)).unwrap();
+        bench.sync().unwrap();
+        bench.rec.fail_write.set(Some(Fail::All));
+        bench.rec.unread_after_failure.set(1);
+        assert!(bench.write(0, &pattern(U, 2)).is_err());
+        assert_eq!(bench.rec.reads_fail.get(), 0);
+        assert_eq!(bench.state.unit(0), None);
+        assert!(!bench.state.synced_once());
+        let syncs = bench.rec.syncs.get();
+        bench.write(0, &pattern(U, 3)).unwrap();
+        assert_eq!(bench.rec.syncs.get(), syncs + 1);
+        // W0 made B durable, so the write takes A.
+        assert_eq!(last_slot_write(&bench), slot_write(0, Slot::A, U));
+        assert_eq!(bench.read_all().unwrap(), pattern(U, 3));
+        // The same for a record write whose re-read fails: W0 runs, then the
+        // record and size are reloaded from disk.
+        bench.write(UNIT, b"y").unwrap();
+        bench.sync().unwrap();
+        assert_eq!(bench.state.candidate(), Some(2));
+        bench.rec.fail_record_write.set(Some(Fail::All));
+        bench.rec.unread_after_failure.set(1);
+        assert!(bench.write(0, b"x").is_err());
+        assert_eq!(bench.rec.reads_fail.get(), 0);
+        assert!(!bench.state.synced_once());
+        let syncs = bench.rec.syncs.get();
+        bench.write(UNIT + 1, b"z").unwrap();
+        assert_eq!(bench.rec.syncs.get(), syncs + 1);
+        // The landed record, read back: D = 2, written before W0's sync.
+        let durable = logical(&bench.keys, &bench.rec.durable.borrow()).unwrap().1;
+        assert_eq!(bench.state.record(), durable.record);
+        assert_eq!(durable.durable_units, 2);
+        bench.sync().unwrap();
+        assert_eq!(
+            logical(&bench.keys, &bench.rec.durable.borrow()).unwrap().0,
+            [&b"x"[..], &pattern(U, 3)[1..], b"yz"].concat()
+        );
+    }
+
+    #[test]
+    fn a_birth_whose_sync_fails_is_fail_stopped() {
+        // A3 and 6.5 for the birth's own sync: the state comes back failed,
+        // so no pair follows a header and record 0 that may not be durable.
+        let keys = keys();
+        let rec = crate::crash_tests::Rec::new(Vec::new(), Some(keys.clone()));
+        rec.fail_sync.set(true);
+        let nonce = [7u8; NONCE_LEN];
+        let (error, state) = give_birth(&rec, &keys, FILE_ID, b"header", &nonce).unwrap_err();
+        assert_eq!(error, ());
+        let state = state.expect("the birth block was written");
+        assert!(state.has_failed());
+        let mut bench = Bench {
+            keys,
+            rec,
+            state: *state,
+            nonces: Counter::default(),
+            writable: true,
+        };
+        assert_eq!(bench.write(0, b"data"), Err(SlotError::FailStopped));
+        assert_eq!(bench.sync(), Err(SlotError::FailStopped));
+        assert_eq!(bench.read_all().unwrap(), b"");
+        // A failed write leaves no state; a birth that succeeds is synced.
+        let rec = crate::crash_tests::Rec::new(Vec::new(), None);
+        rec.fail_write.set(Some(Fail::Half));
+        assert!(matches!(
+            give_birth(&rec, &bench.keys, FILE_ID, b"header", &nonce),
+            Err(((), None))
+        ));
+        let rec = crate::crash_tests::Rec::new(Vec::new(), None);
+        let state = give_birth(&rec, &bench.keys, FILE_ID, b"header", &nonce).unwrap();
+        assert!(!state.has_failed() && state.synced_once());
+        assert_eq!(rec.syncs.get(), 1);
+        assert_eq!(*rec.durable.borrow(), *rec.volatile.borrow());
+    }
+
+    #[test]
+    fn a_fail_stop_from_outside_the_state_stops_writes() {
+        // W3 of the review: a sync that failed through a descriptor with no
+        // state fail-stops the state loaded afterwards; reads keep working.
+        let mut bench = Bench::born();
+        bench.write(0, b"data").unwrap();
+        bench.sync().unwrap();
+        bench.drop_state().unwrap();
+        bench.state.fail_stop();
+        assert_eq!(bench.write(0, b"more"), Err(SlotError::FailStopped));
+        assert_eq!(bench.set_size(1), Err(SlotError::FailStopped));
+        assert_eq!(bench.sync(), Err(SlotError::FailStopped));
+        assert_eq!(bench.read_all().unwrap(), b"data");
     }
 
     #[test]

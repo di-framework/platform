@@ -32,10 +32,14 @@
  *        codec-3 files.
  *   8. Integrity directories (#200). A reservation becomes a keyed integrity
  *      directory that runs the whole suite on codec-4 files only, in both
- *      variants, keeps its fsynced commits through torn slot writes, rotates
- *      in place and is refused by v1. A reservation next to data, unknown
- *      flags and the wrong key are refused byte-identically, and
- *      DI_PGLITE_INTEGRITY is ignored with a log line.
+ *      variants, keeps its fsynced commits through torn slot writes (the
+ *      three spike cases, C10, C13, C6 and C14 of the design note), detects
+ *      a flipped byte and an erased page below the watermark, documents that
+ *      an older slot copy reads as the older page, rotates in place and is
+ *      refused by v1. A reservation next to data, unknown flags and the
+ *      wrong key are refused byte-identically, DI_PGLITE_INTEGRITY is ignored
+ *      with a log line, and XTS files under a replaced marker are refused
+ *      without touching pglite/data/.
  *
  * pglite: $PGLITE_ENCFS_PGLITE_WASM, else ../pglite-component/dist (make build there).
  * v1 encfs: $PGLITE_ENCFS_V1_WASM, else fetched anonymously from ghcr.io by its
@@ -50,7 +54,23 @@ import { join, relative } from 'node:path';
 import { $ } from 'bun';
 import { build } from './build.ts';
 import { type Context, logger, RUST_TARGET, run, WASM_FILE } from './lib/env.ts';
-import { tearFirstRewrite, tearFirstSlot, tearLastSlot, tearLastWrite } from './lib/tear.ts';
+import {
+  claimedGeneration,
+  claimedWatermark,
+  PAIR_LEN,
+  PAIRS_START,
+  SLOT_LEN,
+  slotOffset,
+  type Tear,
+  tearFirstRewrite,
+  tearFirstSlot,
+  tearLastAppend,
+  tearLastSlot,
+  tearLastWrite,
+  tearRewriteTarget,
+  tearSecondRewrite,
+  tearSlot,
+} from './lib/tear.ts';
 import { compositionProblems, worldItems } from './lib/wit.ts';
 
 const log = logger('smoke');
@@ -436,6 +456,250 @@ async function tear(
   throw new Error(`no changed file matches ${pattern}`);
 }
 
+/**
+ * Tear one file under `base` into a copy at `out`: the first file matching
+ * `pattern`, in path order, for which `torn` returns a tear.
+ */
+async function tearWith(
+  base: string,
+  out: string,
+  pattern: RegExp,
+  torn: (rel: string, bytes: Uint8Array) => Promise<Tear | null>,
+): Promise<{ rel: string; tear: Tear; describe: string }> {
+  await snapshot(base, out);
+  for (const file of await regularFiles(base)) {
+    const rel = relative(base, file);
+    if (!pattern.test(rel)) continue;
+    const tear = await torn(rel, await readFile(file));
+    if (!tear) continue;
+    await writeFile(join(out, rel), tear.bytes);
+    return { rel, tear, describe: `${rel} slot [${tear.page.join(', ')}) torn at ${tear.tearAt}` };
+  }
+  throw new Error(`no file matching ${pattern} can be torn`);
+}
+
+/** The bytes of `rel` under `dir`, or null when it does not exist there. */
+async function bytesOf(dir: string, rel: string): Promise<Buffer | null> {
+  return readFile(join(dir, rel)).catch(() => null);
+}
+
+const WAL_SEGMENTS = /^pglite\/data\/pg_wal\/0/;
+
+/**
+ * The crash cases of design note 12.3 beyond the three slot tears (C10, C13,
+ * C6, C14), each on a copy. `i1` holds commit A, fsynced; `i2` is `i1` after
+ * a restart and commit B; `integrity` is `i2` after a clean restart, with
+ * `ab` committed.
+ */
+async function crashCases(
+  h: Harness,
+  enc: string,
+  keys: Keys,
+  work: string,
+  integrity: string,
+  i1: string,
+  i2: string,
+  ab: { a: number; b: number },
+): Promise<void> {
+  const expectAb = async (dir: string, name: string, a: number, b: number) => {
+    const output = await h.run(enc, dir, 'check-ab', keys, /^check-ab /);
+    const result = checkAb(output);
+    if (result.a !== a || result.b !== b)
+      throw new Error(`integrity, ${name}: expected A=${a} B=${b}, got ${JSON.stringify(result)}`);
+    if (/; refusing$/m.test(output)) throw new Error(`integrity, ${name}: encfs refused a file`);
+  };
+
+  // C10: the WAL page holding commit A rewritten twice without an fsync,
+  // the second write torn. Two restarts of i1 each rewrite that page once
+  // (the end-of-recovery record) into the slot that does not hold commit A,
+  // with different nonces; the crash disk holds the first sectors of one
+  // write and the rest of the other there. Neither verifies, and the
+  // durable slot still holds commit A.
+  const i2b = await snapshot(i1, join(work, 'i2b'));
+  await h.run(enc, i2b, 'commit-b', keys, 'commit-b ok');
+  const c10 = join(work, 'integrity-c10');
+  const twice = await tearWith(i1, c10, WAL_SEGMENTS, async (rel, before) => {
+    const [first, second] = [await bytesOf(i2, rel), await bytesOf(i2b, rel)];
+    return first && second && tearSecondRewrite(before, first, second);
+  });
+  log(`integrity, C10 WAL page rewritten twice, second write torn: ${twice.describe}`);
+  await expectAb(c10, 'C10', 1, 0);
+  await rm(c10, { recursive: true, force: true });
+  await rm(i2b, { recursive: true, force: true });
+
+  // C13: that rewrite torn, so the slot claims the newer generation; a
+  // restart; the whole-unit rewrite of the same WAL page must authenticate
+  // the pair and target the torn slot again (durable generation + 1), never
+  // the slot holding commit A; then that write is torn too.
+  const c13 = join(work, 'integrity-c13');
+  const torn = await tearWith(i1, c13, WAL_SEGMENTS, async (rel, before) => {
+    const after = await bytesOf(i2, rel);
+    return after && tearRewriteTarget(before, after);
+  });
+  const unit = Math.floor((torn.tear.page[0] - PAIRS_START) / PAIR_LEN);
+  const target = torn.tear.page[0] === slotOffset(unit, 0) ? 0 : 1;
+  const durable = target === 0 ? 1 : 0;
+  const pre = await readFile(join(c13, torn.rel));
+  if (claimedGeneration(pre, unit, target) <= claimedGeneration(pre, unit, durable))
+    throw new Error('C13: the torn slot does not claim the newer generation');
+  const restarted = await snapshot(c13, join(work, 'integrity-c13-restarted'));
+  await h.run(enc, restarted, 'commit-b', keys, 'commit-b ok');
+  const post = await readFile(join(restarted, torn.rel));
+  const [start, end] = torn.tear.page;
+  if (pre.subarray(start, end).equals(post.subarray(start, end)))
+    throw new Error(
+      `C13: the rewrite after the restart did not target the torn slot of unit ${unit}`,
+    );
+  const expected = claimedGeneration(pre, unit, durable) + 1n;
+  if (claimedGeneration(post, unit, target) !== expected)
+    throw new Error(
+      `C13: the rewrite of unit ${unit} claims generation ${claimedGeneration(post, unit, target)}, expected ${expected}`,
+    );
+  const again = tearSlot(pre, post, torn.tear.page);
+  if (!again) throw new Error('C13: the second rewrite cannot be torn');
+  await writeFile(join(c13, torn.rel), again.bytes);
+  log(
+    `integrity, C13 tear, restart, rewrite (generation ${expected}, same slot), tear again: ${torn.describe}, then at ${again.tearAt}`,
+  );
+  await expectAb(c13, 'C13', 1, 0);
+  await rm(c13, { recursive: true, force: true });
+  await rm(restarted, { recursive: true, force: true });
+
+  // C6: a torn unaligned append, pg_internal.init style: pglite writes the
+  // relcache init files in pieces without an fsync, so their last slot is
+  // short and above D. Its data sectors lost, the unit drops from the file:
+  // never garbled bytes (#206), never io, and PostgreSQL rebuilds the file.
+  const c6 = await snapshot(integrity, join(work, 'integrity-c6'));
+  const appends: string[] = [];
+  for (const file of await regularFiles(c6)) {
+    if (!file.endsWith('/pg_internal.init')) continue;
+    const bytes = await readFile(file);
+    const last = Math.ceil((bytes.length - PAIRS_START) / PAIR_LEN) - 1;
+    const tear = tearLastAppend(bytes);
+    if (!tear || BigInt(last) < claimedWatermark(bytes)) continue;
+    await writeFile(file, tear.bytes);
+    appends.push(`${relative(c6, file)} unit ${last} torn at ${tear.tearAt}`);
+  }
+  if (appends.length === 0) throw new Error('C6: no pg_internal.init ends in a short slot above D');
+  log(`integrity, C6 torn appends: ${appends.join('; ')}`);
+  await expectAb(c6, 'C6', ab.a, ab.b);
+  await rm(c6, { recursive: true, force: true });
+
+  // C14: a relation fork extension persisted out of order. Free-space-map
+  // forks are extended by three zero pages at once; on the crash disk the
+  // middle pair is a hole above D while the last one is valid. It reads as
+  // 8192 zeros, a new page to PostgreSQL, not io; an insert searches the
+  // markers table's map, and every commit is still there.
+  const c14 = await snapshot(integrity, join(work, 'integrity-c14'));
+  const holes: string[] = [];
+  for (const file of await regularFiles(c14)) {
+    if (!file.endsWith('_fsm')) continue;
+    const bytes = await readFile(file);
+    const pairs = Math.ceil((bytes.length - PAIRS_START) / PAIR_LEN);
+    const lastValid = claimedGeneration(bytes, 2, 0) > 0n || claimedGeneration(bytes, 2, 1) > 0n;
+    if (pairs < 3 || claimedWatermark(bytes) > 1n || !lastValid) continue;
+    bytes.fill(0, slotOffset(1, 0), slotOffset(2, 0));
+    await writeFile(file, bytes);
+    holes.push(relative(c14, file));
+  }
+  if (holes.length === 0) throw new Error('C14: no free-space map with three pairs above D');
+  log(`integrity, C14: unit 1 of ${holes.length} free-space maps a hole above D`);
+  await h.run(enc, c14, 'commit-a', keys, 'commit-a ok');
+  await expectAb(c14, 'C14', ab.a + 1, ab.b);
+  await rm(c14, { recursive: true, force: true });
+}
+
+/** The markers table's heap, by path: the only relation file with the marker rows in the plaintext control. */
+async function markerHeap(plain: string): Promise<string> {
+  const heaps: string[] = [];
+  for (const file of await regularFiles(join(plain, 'pglite', 'data', 'base'))) {
+    if ((await readFile(file)).includes(ROW_MARKER)) heaps.push(relative(plain, file));
+  }
+  if (heaps.length !== 1) throw new Error(`expected one markers heap, found ${heaps.join(', ')}`);
+  return heaps[0] as string;
+}
+
+/**
+ * The tamper cases of design note 12.3, on copies of a stopped integrity
+ * directory, against the markers table's heap (`heap`, the same relation
+ * file as in the plaintext control, which ran the same statements).
+ */
+async function tamperCases(
+  h: Harness,
+  enc: string,
+  keys: Keys,
+  work: string,
+  integrity: string,
+  older: string,
+  heap: string,
+): Promise<void> {
+  const bytes = await readFile(join(integrity, heap)).catch(() => null);
+  if (!bytes || bytes.length < HEADER_LEN || bytes[CODEC_AT] !== CODEC_SLOTS)
+    throw new Error(`${heap}: not a codec-4 file in the integrity directory`);
+  const below = Number(claimedWatermark(bytes));
+  const pairs = Math.ceil((bytes.length - PAIRS_START) / PAIR_LEN);
+  if (below < 2) throw new Error(`${heap}: D = ${below}, expected two units below it`);
+  const claims = (unit: number) => [0, 1].map((s) => claimedGeneration(bytes, unit, s as 0 | 1));
+  const erased = (unit: number) =>
+    `${heap}: unit ${unit} has no valid slot below the durable-size watermark`;
+  const tampered = async (name: string, change: (copy: Buffer) => void) => {
+    const dir = await snapshot(integrity, join(work, `integrity-tamper-${name}`));
+    const copy = Buffer.from(bytes);
+    change(copy);
+    await writeFile(join(dir, heap), copy);
+    return dir;
+  };
+
+  // One flipped ciphertext byte in the only valid slot of a page below D.
+  const single = [...Array(below).keys()].find((u) => claims(u).filter((g) => g > 0n).length === 1);
+  if (single === undefined) throw new Error(`${heap}: no unit below D with a single valid slot`);
+  const slot = (claims(single)[0] ?? 0n) > 0n ? 0 : 1;
+  const flipped = await tampered('flip', (copy) => {
+    const at = slotOffset(single, slot) + 64 + 100;
+    copy[at] = (copy[at] ?? 0) ^ 1;
+  });
+  await h.fails(enc, flipped, 'marker-read', keys, erased(single), /^marker-read ok$/);
+  await rm(flipped, { recursive: true, force: true });
+
+  // Both slots of a page below D zeroed.
+  const zeroedUnit = below - 1;
+  const zeroed = await tampered('zero', (copy) =>
+    copy.fill(0, slotOffset(zeroedUnit, 0), Math.min(slotOffset(zeroedUnit + 1, 0), copy.length)),
+  );
+  await h.fails(enc, zeroed, 'marker-read', keys, erased(zeroedUnit), /^marker-read ok$/);
+  await rm(zeroed, { recursive: true, force: true });
+
+  // The winner of a page replaced by an older valid copy of the same slot,
+  // from an earlier snapshot: the other slot, older than the replaced
+  // winner, wins, and the older page reads without an error. Commit B,
+  // checkpointed only into the newer page, is gone: rollback within a file
+  // is a non-goal (design note 3).
+  const earlier = await readFile(join(older, heap));
+  const rollback = [...Array(pairs).keys()].find((u) => {
+    const [a, b] = claims(u);
+    if (!a || !b) return false;
+    const w = b > a ? 1 : 0;
+    const old = claimedGeneration(earlier, u, w);
+    return old > 0n && old < (w === 1 ? a : b);
+  });
+  if (rollback === undefined) throw new Error(`${heap}: no page with an older copy of its winner`);
+  const winner = (claims(rollback)[1] ?? 0n) > (claims(rollback)[0] ?? 0n) ? 1 : 0;
+  const rolledBack = await tampered('older', (copy) => {
+    const at = slotOffset(rollback, winner);
+    copy.set(earlier.subarray(at, at + SLOT_LEN), at);
+  });
+  const output = await h.run(enc, rolledBack, 'check-ab', keys, /^check-ab /);
+  const result = checkAb(output);
+  if (result.b !== 0 || /; refusing$/m.test(output))
+    throw new Error(
+      `older slot copy: expected commit B gone without an error, got ${JSON.stringify(result)}`,
+    );
+  await rm(rolledBack, { recursive: true, force: true });
+  log(
+    `integrity tamper: a flipped byte (unit ${single}) and both slots zeroed (unit ${zeroedUnit}) below D = ${below} fail with io; an older copy of unit ${rollback}'s winner reads as the older page (A=${result.a} B=${result.b}), the documented non-goal`,
+  );
+}
+
 function checkAb(output: string): { a: number; b: number } {
   const match = /^check-ab A=(\d+) B=(\d+)$/m.exec(output);
   if (!match) throw new Error('no check-ab result');
@@ -745,6 +1009,8 @@ export async function smoke(ctx: Context): Promise<void> {
         throw new Error(`integrity, ${c.name}: fsynced commit A lost (${JSON.stringify(result)})`);
       await rm(out, { recursive: true, force: true });
     }
+    await crashCases(h, enc, A, work, integrity, i1, i2, integrityAb);
+    await tamperCases(h, enc, A, work, integrity, i1, await markerHeap(plain));
     await rm(i1, { recursive: true, force: true });
     await rm(i2, { recursive: true, force: true });
 
@@ -770,11 +1036,13 @@ export async function smoke(ctx: Context): Promise<void> {
     await h.refused(enc, integrity, A, 'encrypted with a different key');
 
     // An XTS file in an integrity directory is refused with io and never
-    // read or rewritten: every changed file must be empty or carry a new
-    // codec-4 header (encfs never rewrites a header in place, so an XTS file
-    // it had touched would keep its XTS header). Directory operations pass
-    // through, so pglite may unlink such a file and create a codec-4 one in
-    // its place.
+    // read, truncated or rewritten. The directory is an XTS cluster under a
+    // replaced marker, which is tampering: encfs never creates an XTS file
+    // there. The data it protects stays as it was: every file is still
+    // there, everything under pglite/data/ is byte-identical, and the only
+    // changes are pglite's runtime files (share/, lib/ and the like, which
+    // it unlinks and extracts again at every start through pass-through
+    // directory operations), each now a codec-4 file.
     const xtsInIntegrity = join(work, 'integrity-xts');
     await cp(data, xtsInIntegrity, { recursive: true });
     await writeFile(join(xtsInIntegrity, MARKER_FILE), integrityMarker(keyA, FLAG_CODEC4));
@@ -783,14 +1051,34 @@ export async function smoke(ctx: Context): Promise<void> {
     if (!xtsLog.includes(`codec ${CODEC_TAIL} file in an integrity directory; refusing`))
       throw new Error('an XTS file in an integrity directory was not refused');
     const xtsAfter = await fileContents(xtsInIntegrity);
+    const RUNTIME = 'pglite/runtime/';
+    const isCodec4 = (bytes: Buffer) =>
+      bytes.length >= HEADER_LEN && bytes[CODEC_AT] === CODEC_SLOTS;
     let replaced = 0;
-    for (const [file, bytes] of xtsAfter) {
-      if (xtsBefore.get(file)?.equals(bytes)) continue;
-      if (bytes.length > 0 && (bytes.length < HEADER_LEN || bytes[CODEC_AT] !== CODEC_SLOTS))
-        throw new Error(`${file}: an XTS file was changed in an integrity directory`);
+    let untouchedData = 0;
+    for (const [file, bytes] of xtsBefore) {
+      const after = xtsAfter.get(file);
+      if (!after) throw new Error(`${file}: removed from an integrity directory holding XTS files`);
+      if (after.equals(bytes)) {
+        if (file.startsWith('pglite/data/')) untouchedData++;
+        continue;
+      }
+      if (!file.startsWith(RUNTIME))
+        throw new Error(`${file}: changed outside ${RUNTIME} in an integrity directory`);
+      if (!isCodec4(after)) throw new Error(`${file}: rewritten, but not as a codec-4 file`);
       replaced++;
     }
-    log(`XTS files in an integrity directory refused; ${replaced} replaced by new codec-4 files`);
+    for (const [file, bytes] of xtsAfter) {
+      if (xtsBefore.has(file)) continue;
+      if (!file.startsWith(RUNTIME) || !isCodec4(bytes))
+        throw new Error(`${file}: created in an integrity directory holding XTS files`);
+      replaced++;
+    }
+    if (untouchedData < 100)
+      throw new Error(`only ${untouchedData} files under pglite/data/; expected a cluster`);
+    log(
+      `XTS files in an integrity directory refused: every file kept, ${untouchedData} under pglite/data/ byte-identical, ${replaced} runtime files now codec 4`,
+    );
     await rm(xtsInIntegrity, { recursive: true, force: true });
     log(
       'integrity directories: reservation initialised, codec 4 only, torn slots keep commits, refusals byte-identical, rotation keeps the mode, XTS files refused',

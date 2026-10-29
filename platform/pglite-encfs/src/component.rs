@@ -72,7 +72,7 @@ use crate::marker::{
 };
 use crate::rotation;
 use crate::slots::{SlotError, SlotFile, SlotKeys};
-use crate::writer::{birth_block, Durable, FileState, IntegrityFile};
+use crate::writer::{give_birth, Durable, FileState, IntegrityFile};
 
 type R<T> = Result<T, ErrorCode>;
 
@@ -134,6 +134,14 @@ thread_local! {
     /// inode (design note 6.1).
     static FILES: RefCell<BTreeMap<DirId, Rc<RefCell<FileState>>>> =
         const { RefCell::new(BTreeMap::new()) };
+    /// Inodes in an integrity directory whose host sync failed while encfs
+    /// held no state for them (A3, 6.5): every state filed for them later is
+    /// fail-stopped, and no birth runs on them, until restart.
+    static FAIL_STOPPED: RefCell<BTreeSet<DirId>> = const { RefCell::new(BTreeSet::new()) };
+}
+
+fn is_fail_stopped(id: &DirId) -> bool {
+    FAIL_STOPPED.with(|failed| failed.borrow().contains(id))
 }
 
 /// Keys are read from the host environment once, on first use.
@@ -522,28 +530,54 @@ impl File {
 
     /// Bring a codec-4 file into existence (5.6 "Birth"): the header page
     /// and both record pages as one 12 KiB block, record 0 sealed as
-    /// `seq = 1, D = 0`, synced before any pair is written.
+    /// `seq = 1, D = 0`, synced before any pair is written. A failed sync
+    /// files the state fail-stopped (A3), so no pair ever follows a header
+    /// and record 0 that may not have reached the disk.
     fn birth(&self) -> R<Rc<FileCipher>> {
         let state = state();
         let kek = current_key(&state)?;
         let id = self.host_id()?;
+        if is_fail_stopped(&id) {
+            return Err(slot_error(&self.path, SlotError::FailStopped));
+        }
         let file_id: FileId = random();
         let dek = Zeroizing::new(random::<DEK_LEN>());
         let header = Header::seal(kek, Codec::TwoSlotAead, &file_id, &dek, &random());
         let keys = SlotKeys::derive(&dek);
-        let (block, record) = birth_block(&keys, &file_id, header.as_bytes(), &random());
-        HostStorage(&self.host).write_at(0, &block).map_err(host)?;
-        self.host.sync_data().map_err(host)?;
+        let storage = HostStorage(&self.host);
+        let (born, failure) =
+            match give_birth(&storage, &keys, file_id, header.as_bytes(), &random()) {
+                Ok(born) => (born, None),
+                Err((error, None)) => return Err(host(error)),
+                Err((error, Some(failed))) => (*failed, Some(error)),
+            };
         let cipher = Rc::new(FileCipher::Slots { keys, file_id });
         state
             .ciphers
             .borrow_mut()
             .insert(*header.as_bytes(), cipher.clone());
         *self.cipher.borrow_mut() = Some(cipher.clone());
-        let filed = Rc::new(RefCell::new(FileState::born(file_id, record)));
+        let filed = Rc::new(RefCell::new(born));
         FILES.with(|files| files.borrow_mut().insert(id, filed.clone()));
         *self.state.borrow_mut() = Some((id, filed));
-        Ok(cipher)
+        match failure {
+            Some(error) => Err(host(error)),
+            None => Ok(cipher),
+        }
+    }
+
+    /// A3 for a host sync of a file in an integrity directory that failed
+    /// while encfs held no state for it: the inode is fail-stopped until
+    /// restart (6.5). An inode the host cannot identify gets no state
+    /// either, so nothing can be written to it.
+    fn fail_stop(&self) {
+        if let Ok(id) = self.host_id() {
+            log(&format!(
+                "{}: a host sync failed; refusing writes and syncs until restart",
+                self.path
+            ));
+            FAIL_STOPPED.with(|failed| failed.borrow_mut().insert(id));
+        }
     }
 
     /// The state of this codec-4 file: this descriptor's, another
@@ -572,6 +606,9 @@ impl File {
                 state
             }
         };
+        if is_fail_stopped(&id) {
+            state.borrow_mut().fail_stop();
+        }
         *self.state.borrow_mut() = Some((id, state.clone()));
         Ok(state)
     }
@@ -698,7 +735,8 @@ impl File {
     /// `sync` (`all`) or `sync-data`. For a codec-4 file every successful
     /// sync, through any descriptor of the inode, clears the `pending` bits
     /// and advances the watermark (6.3 "Sync"); a failed one stops writes
-    /// (A3). A file with no state has nothing pending.
+    /// (A3). A file with no state has nothing pending, but a failed sync of
+    /// it still stops every later write and birth (6.5).
     fn sync(&self, all: bool) -> R<()> {
         let passthrough = || {
             if all {
@@ -724,7 +762,7 @@ impl File {
             },
         };
         if filed.is_none() {
-            return passthrough();
+            return passthrough().inspect_err(|_| self.fail_stop());
         }
         self.integrity(false, |f| f.sync(all))?;
         Ok(())
@@ -748,6 +786,7 @@ fn doomed_inode(dir: &hfs::Descriptor, path: &str) -> Option<DirId> {
 fn forget_inode(id: Option<DirId>) {
     if let Some(id) = id {
         FILES.with(|files| files.borrow_mut().remove(&id));
+        FAIL_STOPPED.with(|failed| failed.borrow_mut().remove(&id));
     }
 }
 
@@ -1294,8 +1333,14 @@ impl Descriptor {
     }
 }
 
-/// What the host identifies a file or directory by: its `metadata-hash`, which
-/// wasmtime derives from the device and inode.
+/// What the host identifies a file or directory by: its `metadata-hash`.
+/// wasmtime-wasi 48.0.1, the pinned host, derives it from the device and
+/// inode numbers (`meta_identity` in `src/filesystem/unix.rs`), hashed with
+/// `std::collections::hash_map::DefaultHasher::new()`, whose keys are fixed,
+/// and the upper half is the lower one xor a constant
+/// (`MetadataHashValue::new` in `src/filesystem.rs`). Writes do not change
+/// it; a host built with another Rust release may hash differently, which
+/// only matters within one instance (6.1).
 type DirId = (u64, u64);
 
 fn dir_id(hash: hfs::MetadataHashValue) -> DirId {
@@ -1565,6 +1610,12 @@ impl xfs::GuestDescriptor for Descriptor {
         self.guard(Some(&old_path))?;
         let target = new_descriptor.get::<Descriptor>();
         target.guard(Some(&new_path))?;
+        // An XTS directory never holds codec-4 files and an integrity one
+        // never holds XTS files: a rename between preopens of different
+        // modes would mix them (#200).
+        if self.mode() != target.mode() {
+            return Err(ErrorCode::CrossDevice);
+        }
         // A rename over a codec-4 file removes that inode, unless both names
         // are links to the same one.
         let doomed = (target.mode() == Mode::Integrity)
