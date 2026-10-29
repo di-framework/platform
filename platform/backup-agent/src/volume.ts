@@ -40,7 +40,7 @@ const FLAG_RESERVATION = 0b10;
 
 /** How encfs encrypts a directory's files; `NotEncfs` is a directory without a marker. */
 export type EncfsMode = 'XTS' | 'AEAD' | 'NotEncfs';
-const ENCFS_MODES: ReadonlySet<string> = new Set(['XTS', 'AEAD', 'NotEncfs']);
+export const ENCFS_MODES: ReadonlySet<string> = new Set(['XTS', 'AEAD', 'NotEncfs']);
 
 /** What a marker file holds, from its magic, length and flags only (design-200 §9.1). */
 export type MarkerForm =
@@ -607,6 +607,12 @@ export async function restoreVolume(io: AgentIo, request: AgentRequest): Promise
   if (prior.found !== 'empty' && targetMode !== manifest.encfsMode) {
     return fail('ModeMismatch', {
       detail: `backup is ${manifest.encfsMode}, target is ${targetMode}; a restore keeps the mode`,
+    });
+  }
+  // The storage record decides too: a directory that contradicts it is not restored into.
+  if (prior.found !== 'empty' && request.targetModes && !request.targetModes.includes(targetMode)) {
+    return fail('ModeMismatch', {
+      detail: `target is ${targetMode}, its storage record accepts ${request.targetModes.join(' or ')}`,
     });
   }
   if (request.expectedKcv && manifest.encfsKcv !== request.expectedKcv) return fail('KcvMismatch');

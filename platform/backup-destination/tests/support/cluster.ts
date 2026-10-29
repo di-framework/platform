@@ -66,6 +66,7 @@ export function volumeWorld(overrides: Partial<World> = {}): World {
     destinations: [destination],
     workloads: [workload()],
     ledger: { entries: {} },
+    storageRecords: { state: 'absent' },
     hosts: [{ name: 'hostgroup-tenant-alpha-0', node: 'node-a', ready: true, hostPaths: [VOLUME] }],
     tenantUid: TENANT_UID,
     storageRoot: '/var/lib/kubesolo',

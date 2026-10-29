@@ -385,5 +385,11 @@ spec:
                     fileCount: { type: integer }
                     encfsKcv: { type: string }
                     encfsMode: { type: string, enum: [XTS, AEAD, NotEncfs] }
+                    # The target modes the storage records accept, passed to the agent (#553).
+                    targetModes:
+                      type: array
+                      maxItems: 3
+                      x-kubernetes-list-type: set
+                      items: { type: string, enum: [XTS, AEAD, NotEncfs] }
                     imageDigest: { type: string }
                     replacedPath: { type: string }

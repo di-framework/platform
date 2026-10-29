@@ -47,7 +47,7 @@ function source(): BackupView {
     objectKey:
       'di-framework/alpha/workload-volumes/identity/uid-identity/20261013T020000Z/data.tar',
     source: { kind: 'workload-volume', workloadName: 'identity' },
-    volume: { encfsKcv: '00112233445566778899aabbccddeeff' },
+    volume: { encfsKcv: '00112233445566778899aabbccddeeff', encfsMode: 'XTS' },
   };
 }
 

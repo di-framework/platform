@@ -966,6 +966,27 @@ describe('encfs directory modes (#553)', () => {
     );
   });
 
+  test('refuses a target whose on-disk mode its storage record does not accept (#553)', async () => {
+    await backupToClaim();
+    const target = join(workloads, 'identity');
+    await mkdir(target);
+    await writeFile(join(target, '.di-encfs'), marker(KCV));
+    await writeFile(join(target, 'PG_VERSION'), '16\n');
+    // Same mode as the backup, but the record says the key is AEAD.
+    const refused = io();
+    expect(await runAgent(restore({ force: true, targetModes: ['AEAD'] }), refused)).toBe(1);
+    expect(await termination()).toMatchObject({
+      error: 'ModeMismatch',
+      detail: 'target is XTS, its storage record accepts AEAD',
+    });
+    expect(refused.calls.some((argv) => argv[0] === 'tar')).toBe(false);
+    expect(await readFile(join(target, 'PG_VERSION'), 'utf8')).toBe('16\n');
+    // An accepted mode restores; an empty target passes whatever the record holds.
+    expect(await runAgent(restore({ force: true, targetModes: ['XTS', 'AEAD'] }), io())).toBe(0);
+    await rm(target, { recursive: true });
+    expect(await runAgent(restore({ targetModes: ['AEAD'] }), io())).toBe(0);
+  });
+
   test('refuses a corrupt target marker and an extracted marker that contradicts the manifest', async () => {
     await backupToClaim();
     const target = join(workloads, 'identity');

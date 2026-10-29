@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { backupVolume, probePlacement, restoreVolume } from './volume.ts';
+import { backupVolume, ENCFS_MODES, probePlacement, restoreVolume } from './volume.ts';
 
 export const TERMINATION_LIMIT = 4096;
 
@@ -66,6 +66,11 @@ export interface AgentRequest {
   force?: boolean;
   /** The KCV the restored marker must carry, when the operator names one. */
   expectedKcv?: string;
+  /**
+   * restore-workload-volume: the on-disk modes the target may have, from the operator's check
+   * of the platform's storage records (#553). Unset: the target must have the backup's mode.
+   */
+  targetModes?: string[];
   /** probe-placement: directories that must exist on this node, `:`-separated. */
   probePaths?: string;
 }
@@ -164,6 +169,11 @@ export function parseRequest(env: Record<string, string | undefined>): AgentRequ
   if (!BACKUP_KINDS.includes(kind as BackupKind)) {
     return { ok: false, error: 'UnknownKind' };
   }
+  const targetModes = env.BACKUP_TARGET_MODES ? env.BACKUP_TARGET_MODES.split(',') : undefined;
+  // An unknown or empty segment would silently narrow the accepted set.
+  if (targetModes?.some((mode) => !ENCFS_MODES.has(mode))) {
+    return { ok: false, error: 'BadTargetModes' };
+  }
   return {
     kind: kind as BackupKind,
     host: env.BACKUP_HOST ?? '',
@@ -187,6 +197,7 @@ export function parseRequest(env: Record<string, string | undefined>): AgentRequ
     targetRoot: env.BACKUP_TARGET_ROOT,
     force: env.BACKUP_FORCE === 'true',
     expectedKcv: env.BACKUP_EXPECTED_KCV || undefined,
+    targetModes,
     probePaths: env.BACKUP_PROBE_PATHS,
   };
 }

@@ -362,6 +362,11 @@ describe('backup-destination chart', () => {
       'resources: ["configmaps"]\n    resourceNames: ["di-backup-held-replicas"]\n    verbs: ["get", "patch"]',
     );
     expect(runtime).toContain('resources: ["configmaps"]\n    verbs: ["create"]');
+    // The platform's storage records (#553): read-only, that one name, in the runtime namespace.
+    expect(runtime).toContain(
+      'resources: ["configmaps"]\n    resourceNames: ["di-storage-records"]\n    verbs: ["get"]',
+    );
+    expect(rendered.stdout.match(/di-storage-records/g)?.length).toBe(1);
     expect(tenant).not.toContain('configmaps');
     // Ledger Events (#254) are created where the ledger is, and nowhere else.
     expect(runtime).toContain('resources: ["events"]\n    verbs: ["create"]');
