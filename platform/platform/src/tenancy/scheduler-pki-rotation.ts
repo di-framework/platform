@@ -17,13 +17,15 @@
  *   {@link RENEWAL_OVERLAP_MS}).
  * - **Pending issuance**: the Secret's certificate carries another ID than the recorded `current`
  *   (the record was written but issuance did not land). The certificate is re-issued for the
- *   recorded `current`; no new ID is drawn and `previous` stays, so the ID the live certificate
- *   carries never leaves the record.
+ *   recorded `current`; no new ID is drawn and `previous` stays, with `previousUntil` moved to now
+ *   + {@link RENEWAL_OVERLAP_MS}, so the ID the live certificate carries never leaves the record
+ *   and the overlap counts from the issuance that lands.
  * - **Operators** drop `previous` at `previousUntil`, once the Secret carries `current`.
  * - **Hosts** drop `previous` only once the rollout of the current certificate is observed
  *   ({@link SCHEDULER_TLS_ANNOTATION} on the pod template, all replicas updated and ready). Past
  *   `previousUntil` without that, both users stay and {@link RENEWAL_STALLED} is reported, also
- *   when no rollout was observed at all (it then names the expected Deployment).
+ *   when no rollout was observed at all (it then names the expected Deployment, which a host
+ *   observation must always carry).
  *
  * A missing or unparseable `previousUntil` counts as passed, so such an entry still converges.
  */
@@ -69,19 +71,31 @@ export const issuanceIdOf = (user: string): string | undefined => {
 /** Who presents the identity: an operator reconnects by itself; hosts must be rolled. */
 export type IdentityClient = 'operator' | 'host';
 
-/** What was observed of one identity. */
-export interface IdentityObservation {
-  client: IdentityClient;
+interface ObservationBase {
   /**
    * The identity's Secret; undefined when it is missing. `id` is the issuance ID its certificate
-   * carries ({@link issuanceIdOf} of the leaf's DNS SAN).
+   * carries ({@link issuanceIdOf} of the leaf's DNS SAN), undefined when it carries none.
    */
-  secret?: { notAfter: Date; digest: string; id: string };
+  secret?: { notAfter: Date; digest: string; id?: string };
   /** A forced rotation was requested (see {@link rotationRequested}). */
   forced?: boolean;
-  /** Hosts only: the Deployment expected to present the identity, named when no rollout is seen. */
-  deployment?: string;
-  /** Hosts only: the Deployment that presents the identity, and its observed rollout. */
+}
+
+/** What was observed of an operator identity. */
+export interface OperatorObservation extends ObservationBase {
+  client: 'operator';
+}
+
+/** What was observed of a host identity. */
+export interface HostObservation extends ObservationBase {
+  client: 'host';
+  /**
+   * The Deployment expected to present the identity (`hostgroup-tenant-<t>`, or
+   * `hostgroup-default` for platform hosts), named in a stall when no rollout is seen. Required,
+   * so a stalled renewal can never stay silent for lack of a name.
+   */
+  deployment: string;
+  /** The Deployment that presents the identity, and its observed rollout. */
   rollout?: {
     deployment: string;
     /** The {@link SCHEDULER_TLS_ANNOTATION} value of its pod template. */
@@ -90,6 +104,9 @@ export interface IdentityObservation {
     complete: boolean;
   };
 }
+
+/** What was observed of one identity. */
+export type IdentityObservation = OperatorObservation | HostObservation;
 
 export type IdentityReason = 'new' | 'forced' | 'missing' | 'pending' | 'renewal' | 'current';
 
@@ -123,7 +140,19 @@ export function identityTransition(
   if (observed.forced) return { entry: { current: id() }, action: 'issue', reason: 'forced' };
   const { secret } = observed;
   if (!secret) return { entry: { current: id() }, action: 'issue', reason: 'missing' };
-  if (secret.id !== entry.current) return { entry, action: 'issue', reason: 'pending' };
+  if (secret.id !== entry.current) {
+    // The overlap must count from the issuance that actually lands, so every pending retry moves
+    // previousUntil to now + RENEWAL_OVERLAP_MS: the user the live certificate carries stays
+    // rendered while issuance fails, and hosts start their stall clock at issuance. Setting it on
+    // every pending reconcile (not only when the window runs short) is the only way to guarantee
+    // the full 10 minutes after a late issuance; it costs one record write per retry, and each
+    // retry issues a certificate anyway. A record without `previous` is returned unchanged.
+    const next =
+      entry.previous === undefined
+        ? entry
+        : { ...entry, previousUntil: new Date(now.getTime() + RENEWAL_OVERLAP_MS).toISOString() };
+    return { entry: next, action: 'issue', reason: 'pending' };
+  }
   const annotate =
     observed.client === 'host' ? { [SCHEDULER_TLS_ANNOTATION]: secret.digest } : undefined;
   if (secret.notAfter.getTime() <= now.getTime() + SCHEDULER_LEAF_RENEW_DAYS * DAY_MS)
@@ -150,7 +179,7 @@ export function identityTransition(
   const { rollout } = observed;
   if (rollout?.complete && rollout.digest === secret.digest) return keep(drop(entry));
   const deployment = rollout?.deployment ?? observed.deployment;
-  if (passed && deployment) return keep(entry, { type: RENEWAL_STALLED, deployment });
+  if (passed) return keep(entry, { type: RENEWAL_STALLED, deployment });
   return keep(entry);
 }
 
