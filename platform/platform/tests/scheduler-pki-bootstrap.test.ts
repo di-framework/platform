@@ -8,11 +8,14 @@ import {
   SCHEDULER_PKI_JOB,
   SCHEDULER_PKI_JOB_TTL_SECONDS,
   SCHEDULER_PKI_NAME,
+  SCHEDULER_PKI_WRITES_MESSAGE,
   schedulerPkiBootstrap,
+  schedulerPkiUser,
 } from '../src/scheduler-pki-bootstrap';
 import { controllerScriptHash } from '../src/tenancy/install';
 import { NODE_IMAGE } from '../src/tenancy/node-image';
 import { COMPONENT, INSTALLATION, NAMESPACE_ROLE, type Resource } from '../src/tenancy/resources';
+import { evaluate } from './support/cel';
 
 const SCRIPTS = { 'scheduler-pki-job.js': '// job', 'scheduler-pki.js': '// pki' };
 const objects = schedulerPkiBootstrap('wasmcloud', 'di-test', SCRIPTS);
@@ -61,6 +64,8 @@ describe('scheduler PKI bootstrap objects (#541, O4)', () => {
       objects.map((o) => `${o.kind} ${o.metadata.namespace ?? ''}/${o.metadata.name}`),
     ).toEqual([
       `Namespace /${PKI}`,
+      'ValidatingAdmissionPolicy /di-test-scheduler-pki-writes',
+      'ValidatingAdmissionPolicyBinding /di-test-scheduler-pki-writes',
       `NetworkPolicy ${PKI}/di-scheduler-pki-deny-ingress`,
       `ServiceAccount ${PKI}/di-scheduler-pki`,
       `Role ${PKI}/di-scheduler-pki`,
@@ -129,6 +134,10 @@ describe('scheduler PKI bootstrap objects (#541, O4)', () => {
     expect(objects.some((o) => o.kind.startsWith('Cluster'))).toBe(false);
   });
 
+  it('is not awaited, so it cannot fail `pulumi up` before m6 (W1)', () => {
+    expect(one('Job').metadata.annotations).toEqual({ 'pulumi.com/skipAwait': 'true' });
+  });
+
   it('runs the controller image and scripts once, mounting no Secret', () => {
     expect(one('ConfigMap').data).toEqual(SCRIPTS);
     const job = one('Job');
@@ -167,6 +176,101 @@ describe('scheduler PKI bootstrap objects (#541, O4)', () => {
 
   it('refuses a platform namespace whose PKI namespace name does not fit', () => {
     expect(() => schedulerPkiBootstrap('a'.repeat(50), 'di-test', SCRIPTS)).toThrow('at most 63');
+  });
+});
+
+// --- Admission of the Job's writes (W4) -----------------------------------------------------
+
+interface Policy {
+  spec: {
+    failurePolicy: string;
+    matchConstraints: {
+      namespaceSelector: {
+        matchExpressions: { key: string; operator: string; values: string[] }[];
+      };
+      resourceRules: { apiGroups: string[]; operations: string[]; resources: string[] }[];
+    };
+    matchConditions: { expression: string }[];
+    validations: { expression: string; message: string }[];
+  };
+}
+
+describe('scheduler PKI writes policy (#541, W4)', () => {
+  const policy = one('ValidatingAdmissionPolicy') as unknown as Policy;
+  const [condition] = policy.spec.matchConditions as [{ expression: string }];
+  const [rule] = policy.spec.validations as [{ expression: string; message: string }];
+  const JOB_USER = `system:serviceaccount:${PKI}:${SCHEDULER_PKI_NAME}`;
+  const admit = (
+    namespace: string,
+    resource: 'secrets' | 'configmaps',
+    object: Record<string, unknown>,
+  ) =>
+    evaluate(rule.expression, {
+      request: { namespace, resource: { resource }, userInfo: { username: JOB_USER } },
+      object: { metadata: {}, ...object },
+    });
+  const named = (name: string, type?: string) => ({
+    metadata: { name },
+    ...(type === undefined ? {} : { type }),
+  });
+
+  it('matches only the Job ServiceAccount, in the two namespaces, and fails closed', () => {
+    expect(schedulerPkiUser('wasmcloud')).toBe(JOB_USER);
+    expect(policy.spec.failurePolicy).toBe('Fail');
+    expect(policy.spec.matchConstraints.namespaceSelector.matchExpressions).toEqual([
+      { key: 'kubernetes.io/metadata.name', operator: 'In', values: ['wasmcloud', PKI] },
+    ]);
+    expect(policy.spec.matchConstraints.resourceRules).toMatchObject([
+      { apiGroups: [''], operations: ['CREATE', 'UPDATE'], resources: ['secrets', 'configmaps'] },
+    ]);
+    expect(evaluate(condition.expression, { request: { userInfo: { username: JOB_USER } } })).toBe(
+      true,
+    );
+    expect(
+      evaluate(condition.expression, {
+        request: {
+          userInfo: { username: 'system:serviceaccount:wasmcloud:di-platform-controller' },
+        },
+      }),
+    ).toBe(false);
+    expect(rule.message).toBe(SCHEDULER_PKI_WRITES_MESSAGE);
+    expect(one('ValidatingAdmissionPolicyBinding').spec as unknown).toEqual({
+      policyName: 'di-test-scheduler-pki-writes',
+      validationActions: ['Deny'],
+    });
+  });
+
+  it('admits the named objects of their expected types', () => {
+    expect(admit(PKI, 'secrets', named('di-scheduler-ca', 'Opaque'))).toBe(true);
+    expect(admit(PKI, 'configmaps', named('di-scheduler-identities'))).toBe(true);
+    for (const name of [
+      'di-scheduler-nats-tls',
+      'di-scheduler-operator-tls',
+      'di-scheduler-platform-host-tls',
+      'di-scheduler-data-tls',
+    ])
+      expect(admit('wasmcloud', 'secrets', named(name, 'kubernetes.io/tls'))).toBe(true);
+  });
+
+  it('refuses token Secrets, other names, other types and the wrong namespace', () => {
+    const token = 'kubernetes.io/service-account-token';
+    for (const [namespace, resource, object] of [
+      ['wasmcloud', 'secrets', named('di-scheduler-nats-tls', token)],
+      ['wasmcloud', 'secrets', named('controller-token', token)],
+      [PKI, 'secrets', named('di-scheduler-ca', token)],
+      [PKI, 'secrets', named('job-token', token)],
+      ['wasmcloud', 'secrets', named('di-scheduler-nats-tls', 'Opaque')],
+      ['wasmcloud', 'secrets', named('di-scheduler-nats-tls')],
+      ['wasmcloud', 'secrets', named('other-tls', 'kubernetes.io/tls')],
+      [PKI, 'secrets', named('di-scheduler-ca', 'kubernetes.io/tls')],
+      [PKI, 'secrets', named('di-scheduler-ca')],
+      [PKI, 'secrets', named('di-scheduler-nats-tls', 'kubernetes.io/tls')],
+      ['wasmcloud', 'secrets', named('di-scheduler-ca', 'Opaque')],
+      [PKI, 'configmaps', named('other')],
+      ['wasmcloud', 'configmaps', named('di-scheduler-identities')],
+      [PKI, 'secrets', { metadata: { generateName: 'di-scheduler-ca' }, type: 'Opaque' }],
+    ] as const)
+      expect(admit(namespace, resource, object as Record<string, unknown>)).toBe(false);
   });
 });
 
@@ -229,6 +333,8 @@ describe('installSchedulerPki', () => {
     const ns = 'scheduler-pki-namespace-cluster-wasmcloud-scheduler-pki';
     const job = `scheduler-pki-job-${PKI}-${SCHEDULER_PKI_JOB}`;
     const prerequisites = [
+      'scheduler-pki-validatingadmissionpolicy-cluster-di-test-scheduler-pki-writes',
+      'scheduler-pki-validatingadmissionpolicybinding-cluster-di-test-scheduler-pki-writes',
       `scheduler-pki-networkpolicy-${PKI}-di-scheduler-pki-deny-ingress`,
       `scheduler-pki-serviceaccount-${PKI}-di-scheduler-pki`,
       `scheduler-pki-role-${PKI}-di-scheduler-pki`,
@@ -249,7 +355,7 @@ describe('installSchedulerPki', () => {
   });
 });
 
-it('createPlatform runs the bootstrap Job before the Helm release', () => {
+it('createPlatform installs the bootstrap Job, and the Helm release does not wait for it (W1)', () => {
   const output = execFileSync(
     'node',
     [
@@ -268,6 +374,8 @@ it('createPlatform runs the bootstrap Job before the Helm release', () => {
     pulumi.runtime.runInPulumiStack(async () => {
       const platform = require('./dist').createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test' });
       await new Promise(r => platform.release.urn.apply(r));
+      // The release no longer waits for the Job, so wait for the Job's own registration.
+      while (!registered['scheduler-pki-job-${PKI}-${SCHEDULER_PKI_JOB}']) await new Promise(r => setTimeout(r, 10));
     }).then(() => console.log(JSON.stringify(registered))).catch(e => {console.error(e);process.exitCode=1;});
   `,
     ],
@@ -276,9 +384,9 @@ it('createPlatform runs the bootstrap Job before the Helm release', () => {
   const all = JSON.parse(output) as Record<string, { type: string; dependencies: string[] }>;
   const job = `scheduler-pki-job-${PKI}-${SCHEDULER_PKI_JOB}`;
   expect(all[job]?.type).toBe('kubernetes:batch/v1:Job');
-  expect(
-    all.wasmcloud?.dependencies.filter((urn) => urn.endsWith(`kubernetes:batch/v1:Job::${job}`)),
-  ).toHaveLength(1);
+  // Until m6 mounts its Secrets, the release must not be gated on the Job (m6 restores this).
+  expect(all.wasmcloud?.dependencies.length).toBeGreaterThan(0);
+  expect(all.wasmcloud?.dependencies.filter((urn) => urn.includes('scheduler-pki'))).toEqual([]);
   // The Job's scripts are the controller's, read from the package build.
   const scripts = all[`scheduler-pki-configmap-${PKI}-di-scheduler-pki`];
   expect(scripts?.type).toBe('kubernetes:core/v1:ConfigMap');

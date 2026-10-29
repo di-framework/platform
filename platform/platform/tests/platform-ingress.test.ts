@@ -35,8 +35,6 @@ function renderPolicies(httpNodePort: number): Policy[] {
     pulumi.runtime.runInPulumiStack(async () => {
       const platform = require('./dist').createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', httpNodePort:${httpNodePort} });
       await platform.namespace.promise();
-      // The policies wait for the release, which waits for the scheduler PKI Job (#541).
-      await new Promise(r => platform.release.urn.apply(r));
       const sentinel = new k8s.core.v1.Namespace('sentinel', {}, { provider: new k8s.Provider('sentinel-provider', {}) });
       await new Promise(r => sentinel.urn.apply(r));
     }).then(() => {

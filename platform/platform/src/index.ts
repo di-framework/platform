@@ -338,8 +338,8 @@ export function createPlatform(args: PlatformArgs) {
   const tenantNamespaces = seedTenantNamespaces(declared.tenants, scope, provider);
 
   // The scheduler NATS CAs, identity record and platform identities (#541), created by a one-shot
-  // Job before the release, so no key enters Pulumi state.
-  const schedulerPki = installSchedulerPki({
+  // Job, so no key enters Pulumi state. Until m6 mounts its Secrets the release does not wait for it.
+  installSchedulerPki({
     namespace: namespaceName,
     installation: scope,
     provider,
@@ -423,7 +423,6 @@ export function createPlatform(args: PlatformArgs) {
       provider,
       dependsOn: [
         namespaceResource,
-        schedulerPki,
         ...(registryService ? [registryService] : []),
         ...tenantNamespaces,
       ],

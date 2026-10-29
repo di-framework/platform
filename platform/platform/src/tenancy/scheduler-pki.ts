@@ -226,13 +226,23 @@ export interface IdentityEntry {
   previous?: string;
   previousUntil?: string;
 }
-/** The identity record: `platform/<role>` and `<tenant>/hosts`, `<tenant>/operator` entries. */
+/**
+ * The identity record: `platform/<role>` and `tenant/<tenant>/hosts`, `tenant/<tenant>/operator`
+ * entries. Tenant keys carry their own prefix, so no Tenant name (`platform` included) can name a
+ * platform entry.
+ */
 export type IdentityRecord = Record<string, IdentityEntry>;
 
 /** The record key of the platform identity `role`. */
 export const platformIdentity = (role: PlatformRole): string => `platform/${role}`;
+/** The record key of tenant `tenant`'s hosts or runtime-operator. */
+export const tenantIdentity = (tenant: string, kind: 'hosts' | 'operator'): string =>
+  `tenant/${tenant}/${kind}`;
 const RECORD_KEY =
-  /^(platform\/(operator|host|data)|[a-z]([-a-z0-9]*[a-z0-9])?\/(hosts|operator))$/;
+  /^(platform\/(operator|host|data)|tenant\/[a-z]([-a-z0-9]*[a-z0-9])?\/(hosts|operator))$/;
+
+/** Code-unit order, independent of the runtime's locale, so sorted output is byte-stable. */
+export const codeUnitOrder = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 /**
  * The identity record in `text`. Throws, naming no value, on anything that is not a record this
@@ -271,7 +281,7 @@ export function parseIdentityRecord(text: string): IdentityRecord {
 export function serializeIdentityRecord(record: IdentityRecord): string {
   const sorted = Object.fromEntries(
     Object.keys(record)
-      .sort()
+      .sort(codeUnitOrder)
       .map((key) => {
         const { current, previous, previousUntil } = record[key] as IdentityEntry;
         return [
@@ -320,8 +330,155 @@ export function schedulerPkiConfig(text: string | undefined): SchedulerPkiConfig
 }
 
 interface Stored {
-  metadata?: { resourceVersion?: string };
+  metadata?: { resourceVersion?: string; [field: string]: unknown };
   data?: Record<string, string>;
+  [field: string]: unknown;
+}
+
+/** What the bootstrap's steps share: the API, where things live, and what was written. */
+interface Run {
+  api: PkiApi;
+  namespace: string;
+  pki: string;
+  now: Date;
+  random: (size: number) => Buffer;
+  metadata: (ns: string, name: string) => Resource['metadata'];
+  create: (path: string, value: Resource) => Promise<void>;
+  created: string[];
+}
+
+const secretPath = (ns: string, name = '') =>
+  `/api/v1/namespaces/${ns}/secrets${name ? `/${name}` : ''}`;
+const configMapPath = (ns: string, name = '') =>
+  `/api/v1/namespaces/${ns}/configmaps${name ? `/${name}` : ''}`;
+
+/** The stored CAs, or new ones written to `di-scheduler-ca` when nothing issued earlier remains. */
+async function loadOrCreateCas(
+  run: Run,
+  storedCas: Stored | undefined,
+  storedRecord: Stored | undefined,
+  present: Set<string>,
+): Promise<SchedulerCas> {
+  const { pki, namespace, now } = run;
+  if (storedCas) {
+    const read = (key: string) => {
+      const value = storedCas.data?.[key];
+      return value === undefined ? undefined : Buffer.from(value, 'base64').toString('utf8');
+    };
+    const loaded = {} as SchedulerCas;
+    for (const kind of ['platform', 'tenant'] as const) {
+      const ca = { cert: read(CA_KEYS[kind].cert), key: read(CA_KEYS[kind].key) };
+      const fault = schedulerCaFault(kind, namespace, ca, now);
+      if (fault) throw new SchedulerPkiRefused(`${pki}/${SCHEDULER_CA_SECRET}: ${fault}`);
+      loaded[kind] = ca as KeyPair;
+    }
+    return loaded;
+  }
+  const roles: (PlatformRole | 'server')[] = ['server', ...PLATFORM_ROLES];
+  const remaining = [
+    ...(storedRecord ? [`${pki}/${SCHEDULER_IDENTITIES}`] : []),
+    ...roles.filter((role) => present.has(role)).map((role) => PLATFORM_SECRETS[role]),
+  ];
+  if (remaining.length > 0)
+    throw new SchedulerPkiRefused(
+      `${pki}/${SCHEDULER_CA_SECRET} is missing, but scheduler identities issued under it ` +
+        `remain (${remaining.join(', ')}); delete them to bootstrap a new scheduler PKI`,
+    );
+  const cas = {
+    platform: newSchedulerCa('platform', namespace, now),
+    tenant: newSchedulerCa('tenant', namespace, now),
+  };
+  const data: Record<string, string> = {};
+  for (const kind of ['platform', 'tenant'] as const) {
+    data[CA_KEYS[kind].cert] = Buffer.from(cas[kind].cert).toString('base64');
+    data[CA_KEYS[kind].key] = Buffer.from(cas[kind].key).toString('base64');
+  }
+  await run.create(secretPath(pki), {
+    apiVersion: 'v1',
+    kind: 'Secret',
+    metadata: run.metadata(pki, SCHEDULER_CA_SECRET),
+    type: 'Opaque',
+    data,
+  } as Resource);
+  return cas;
+}
+
+/**
+ * The record with a new issuance ID for each missing platform identity, written before any
+ * certificate is issued. A stored record is updated from the stored object, changing only
+ * `identities.json`, and only under its `resourceVersion`, so a record changed since it was read
+ * is not overwritten and other writers' labels, annotations and keys survive.
+ */
+async function updateRecord(
+  run: Run,
+  storedRecord: Stored | undefined,
+  present: Set<string>,
+): Promise<{ record: IdentityRecord; issue: PlatformRole[] }> {
+  const { pki } = run;
+  const record: IdentityRecord = storedRecord
+    ? parseIdentityRecord(storedRecord.data?.[IDENTITIES_KEY] ?? '')
+    : {};
+  const issue = PLATFORM_ROLES.filter((role) => !present.has(role));
+  const unrecorded = PLATFORM_ROLES.filter(
+    (role) => present.has(role) && !record[platformIdentity(role)],
+  );
+  if (unrecorded.length > 0)
+    throw new SchedulerPkiRefused(
+      `${unrecorded.map((role) => PLATFORM_SECRETS[role]).join(', ')} exist without an entry in ` +
+        `${pki}/${SCHEDULER_IDENTITIES}; delete them to issue new identities`,
+    );
+  if (issue.length === 0) return { record, issue };
+  for (const role of issue) record[platformIdentity(role)] = { current: newIssuanceId(run.random) };
+  const text = serializeIdentityRecord(record);
+  if (!storedRecord) {
+    await run.create(configMapPath(pki), {
+      apiVersion: 'v1',
+      kind: 'ConfigMap',
+      metadata: run.metadata(pki, SCHEDULER_IDENTITIES),
+      data: { [IDENTITIES_KEY]: text },
+    } as Resource);
+    return { record, issue };
+  }
+  if (!storedRecord.metadata?.resourceVersion)
+    throw new SchedulerPkiRefused(
+      `${pki}/${SCHEDULER_IDENTITIES} was read without a resourceVersion, so it is not updated`,
+    );
+  await run.api.call('PUT', configMapPath(pki, SCHEDULER_IDENTITIES), {
+    ...storedRecord,
+    data: { ...storedRecord.data, [IDENTITIES_KEY]: text },
+  });
+  run.created.push(`${pki}/${SCHEDULER_IDENTITIES} (updated)`);
+  return { record, issue };
+}
+
+/** The platform Secrets that are missing: the NATS server's, and one per role in `issue`. */
+async function issueMissing(
+  run: Run,
+  cas: SchedulerCas,
+  record: IdentityRecord,
+  issue: PlatformRole[],
+  present: Set<string>,
+): Promise<void> {
+  const { namespace, now } = run;
+  const secret = (role: PlatformRole | 'server', leaf: KeyPair, bundle: string) =>
+    run.create(secretPath(namespace), {
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: run.metadata(namespace, PLATFORM_SECRETS[role]),
+      type: 'kubernetes.io/tls',
+      data: tlsSecretData(leaf, bundle),
+    } as Resource);
+  if (!present.has('server'))
+    // The server verifies clients of both CAs; clients verify the server against the platform CA.
+    await secret(
+      'server',
+      natsServerLeaf(namespace, cas.platform, now),
+      `${cas.platform.cert}${cas.tenant.cert}`,
+    );
+  for (const role of issue) {
+    const id = (record[platformIdentity(role)] as IdentityEntry).current;
+    await secret(role, platformClientLeaf(role, id, cas.platform, now), cas.platform.cert);
+  }
 }
 
 /**
@@ -348,125 +505,38 @@ export async function bootstrapSchedulerPki(
 ): Promise<string[]> {
   const { installation, namespace } = config;
   const pki = schedulerPkiNamespace(namespace);
+  const created: string[] = [];
+  const run: Run = {
+    api,
+    namespace,
+    pki,
+    now,
+    random,
+    created,
+    metadata: (ns, name) => ({
+      name,
+      namespace: ns,
+      labels: { [INSTALLATION]: installation, [COMPONENT]: SCHEDULER_PKI_COMPONENT },
+    }),
+    create: async (path, value) => {
+      await api.call('POST', path, value);
+      created.push(`${value.metadata.namespace}/${value.metadata.name}`);
+    },
+  };
   const get = (path: string) =>
     api.call<Stored>('GET', path).catch((error: { code?: number }) => {
       if (error?.code === 404) return undefined;
       throw error;
     });
-  const secretPath = (ns: string, name = '') =>
-    `/api/v1/namespaces/${ns}/secrets${name ? `/${name}` : ''}`;
-  const recordPath = (name = '') => `/api/v1/namespaces/${pki}/configmaps${name ? `/${name}` : ''}`;
-  const metadata = (ns: string, name: string) => ({
-    name,
-    namespace: ns,
-    labels: { [INSTALLATION]: installation, [COMPONENT]: SCHEDULER_PKI_COMPONENT },
-  });
-  const created: string[] = [];
-  const create = async (path: string, value: Resource) => {
-    await api.call('POST', path, value);
-    created.push(`${value.metadata.namespace}/${value.metadata.name}`);
-  };
 
   const storedCas = await get(secretPath(pki, SCHEDULER_CA_SECRET));
-  const storedRecord = await get(recordPath(SCHEDULER_IDENTITIES));
-  const roles: (PlatformRole | 'server')[] = ['server', ...PLATFORM_ROLES];
+  const storedRecord = await get(configMapPath(pki, SCHEDULER_IDENTITIES));
   const present = new Set<string>();
-  for (const role of roles)
+  for (const role of ['server', ...PLATFORM_ROLES] as const)
     if (await get(secretPath(namespace, PLATFORM_SECRETS[role]))) present.add(role);
 
-  let cas: SchedulerCas;
-  if (!storedCas) {
-    const remaining = [
-      ...(storedRecord ? [`${pki}/${SCHEDULER_IDENTITIES}`] : []),
-      ...roles.filter((role) => present.has(role)).map((role) => PLATFORM_SECRETS[role]),
-    ];
-    if (remaining.length > 0)
-      throw new SchedulerPkiRefused(
-        `${pki}/${SCHEDULER_CA_SECRET} is missing, but scheduler identities issued under it ` +
-          `remain (${remaining.join(', ')}); delete them to bootstrap a new scheduler PKI`,
-      );
-    cas = {
-      platform: newSchedulerCa('platform', namespace, now),
-      tenant: newSchedulerCa('tenant', namespace, now),
-    };
-    const data: Record<string, string> = {};
-    for (const kind of ['platform', 'tenant'] as const) {
-      data[CA_KEYS[kind].cert] = Buffer.from(cas[kind].cert).toString('base64');
-      data[CA_KEYS[kind].key] = Buffer.from(cas[kind].key).toString('base64');
-    }
-    await create(secretPath(pki), {
-      apiVersion: 'v1',
-      kind: 'Secret',
-      metadata: metadata(pki, SCHEDULER_CA_SECRET),
-      type: 'Opaque',
-      data,
-    } as Resource);
-  } else {
-    const read = (key: string) => {
-      const value = storedCas.data?.[key];
-      return value === undefined ? undefined : Buffer.from(value, 'base64').toString('utf8');
-    };
-    const loaded = {} as SchedulerCas;
-    for (const kind of ['platform', 'tenant'] as const) {
-      const ca = { cert: read(CA_KEYS[kind].cert), key: read(CA_KEYS[kind].key) };
-      const fault = schedulerCaFault(kind, namespace, ca, now);
-      if (fault) throw new SchedulerPkiRefused(`${pki}/${SCHEDULER_CA_SECRET}: ${fault}`);
-      loaded[kind] = ca as KeyPair;
-    }
-    cas = loaded;
-  }
-
-  const record: IdentityRecord = storedRecord
-    ? parseIdentityRecord(storedRecord.data?.[IDENTITIES_KEY] ?? '')
-    : {};
-  const issue = PLATFORM_ROLES.filter((role) => !present.has(role));
-  const unrecorded = PLATFORM_ROLES.filter(
-    (role) => present.has(role) && !record[platformIdentity(role)],
-  );
-  if (unrecorded.length > 0)
-    throw new SchedulerPkiRefused(
-      `${unrecorded.map((role) => PLATFORM_SECRETS[role]).join(', ')} exist without an entry in ` +
-        `${pki}/${SCHEDULER_IDENTITIES}; delete them to issue new identities`,
-    );
-  for (const role of issue) record[platformIdentity(role)] = { current: newIssuanceId(random) };
-  if (issue.length > 0) {
-    const body = {
-      apiVersion: 'v1',
-      kind: 'ConfigMap',
-      metadata: {
-        ...metadata(pki, SCHEDULER_IDENTITIES),
-        ...(storedRecord?.metadata?.resourceVersion
-          ? { resourceVersion: storedRecord.metadata.resourceVersion }
-          : {}),
-      },
-      data: { [IDENTITIES_KEY]: serializeIdentityRecord(record) },
-    } as Resource;
-    if (storedRecord) {
-      // Optimistic concurrency: a record changed since it was read is not overwritten.
-      await api.call('PUT', recordPath(SCHEDULER_IDENTITIES), body);
-      created.push(`${pki}/${SCHEDULER_IDENTITIES} (updated)`);
-    } else await create(recordPath(), body);
-  }
-
-  const platformBundle = cas.platform.cert;
-  const secret = (role: PlatformRole | 'server', leaf: KeyPair, bundle: string) =>
-    create(secretPath(namespace), {
-      apiVersion: 'v1',
-      kind: 'Secret',
-      metadata: metadata(namespace, PLATFORM_SECRETS[role]),
-      type: 'kubernetes.io/tls',
-      data: tlsSecretData(leaf, bundle),
-    } as Resource);
-  if (!present.has('server'))
-    // The server verifies clients of both CAs; clients verify the server against the platform CA.
-    await secret(
-      'server',
-      natsServerLeaf(namespace, cas.platform, now),
-      `${cas.platform.cert}${cas.tenant.cert}`,
-    );
-  for (const role of issue) {
-    const id = (record[platformIdentity(role)] as IdentityEntry).current;
-    await secret(role, platformClientLeaf(role, id, cas.platform, now), platformBundle);
-  }
+  const cas = await loadOrCreateCas(run, storedCas, storedRecord, present);
+  const { record, issue } = await updateRecord(run, storedRecord, present);
+  await issueMissing(run, cas, record, issue, present);
   return created;
 }

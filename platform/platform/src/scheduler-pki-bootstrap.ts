@@ -6,6 +6,7 @@ import { controllerScriptHash } from './tenancy/install';
 import { NODE_IMAGE } from './tenancy/node-image';
 import { COMPONENT, INSTALLATION, NAMESPACE_ROLE, type Resource } from './tenancy/resources';
 import {
+  codeUnitOrder,
   PLATFORM_SECRETS,
   SCHEDULER_CA_SECRET,
   SCHEDULER_IDENTITIES,
@@ -36,6 +37,93 @@ export const SCHEDULER_PKI_JOB = 'di-scheduler-pki-bootstrap';
  */
 export const SCHEDULER_PKI_JOB_TTL_SECONDS = 600;
 
+/** The Job's ServiceAccount as the API server names it in `request.userInfo.username`. */
+export const schedulerPkiUser = (namespace: string): string =>
+  `system:serviceaccount:${schedulerPkiNamespace(namespace)}:${SCHEDULER_PKI_NAME}`;
+
+/** The refusal of {@link schedulerPkiWritesPolicy}. */
+export const SCHEDULER_PKI_WRITES_MESSAGE =
+  'the scheduler PKI Job may write only its named Secrets and ConfigMap, of their expected types';
+
+/**
+ * The CEL rule of {@link schedulerPkiWritesPolicy}: which objects the Job's ServiceAccount may
+ * create or update. In the PKI namespace, the `Opaque` Secret `di-scheduler-ca` and the ConfigMap
+ * `di-scheduler-identities`; in the platform namespace, the `kubernetes.io/tls` scheduler Secrets.
+ * Nothing else, and never a `kubernetes.io/service-account-token` Secret (W4, design-541 §4.5).
+ */
+export function schedulerPkiWritesRule(namespace: string): string {
+  const pki = schedulerPkiNamespace(namespace);
+  const names = Object.values(PLATFORM_SECRETS)
+    .sort(codeUnitOrder)
+    .map((name) => `'${name}'`)
+    .join(', ');
+  const named = 'has(object.metadata.name)';
+  const typed = (type: string) => `has(object.type) && object.type == '${type}'`;
+  return [
+    `(request.namespace == '${pki}' && request.resource.resource == 'secrets' && ${named} &&`,
+    `  object.metadata.name == '${SCHEDULER_CA_SECRET}' && ${typed('Opaque')}) ||`,
+    `(request.namespace == '${pki}' && request.resource.resource == 'configmaps' && ${named} &&`,
+    `  object.metadata.name == '${SCHEDULER_IDENTITIES}') ||`,
+    `(request.namespace == '${namespace}' && request.resource.resource == 'secrets' && ${named} &&`,
+    `  object.metadata.name in [${names}] && ${typed('kubernetes.io/tls')})`,
+  ].join('\n');
+}
+
+/**
+ * The admission policy and binding that confine the Job's writes (W4). RBAC cannot scope
+ * `create` by name, so the Job's ServiceAccount could otherwise create any Secret in both
+ * namespaces, including a token Secret for another ServiceAccount. The policy matches only that
+ * ServiceAccount, in only those two namespaces, and fails closed.
+ */
+export function schedulerPkiWritesPolicy(namespace: string, installation: string): Resource[] {
+  const name = `${installation}-scheduler-pki-writes`;
+  const labels = { [INSTALLATION]: installation, [COMPONENT]: SCHEDULER_PKI_COMPONENT };
+  return [
+    {
+      apiVersion: 'admissionregistration.k8s.io/v1',
+      kind: 'ValidatingAdmissionPolicy',
+      metadata: { name, labels },
+      spec: {
+        failurePolicy: 'Fail',
+        matchConstraints: {
+          namespaceSelector: {
+            matchExpressions: [
+              {
+                key: 'kubernetes.io/metadata.name',
+                operator: 'In',
+                values: [namespace, schedulerPkiNamespace(namespace)],
+              },
+            ],
+          },
+          resourceRules: [
+            {
+              apiGroups: [''],
+              apiVersions: ['v1'],
+              operations: ['CREATE', 'UPDATE'],
+              resources: ['secrets', 'configmaps'],
+            },
+          ],
+        },
+        matchConditions: [
+          {
+            name: 'scheduler-pki-job',
+            expression: `request.userInfo.username == '${schedulerPkiUser(namespace)}'`,
+          },
+        ],
+        validations: [
+          { expression: schedulerPkiWritesRule(namespace), message: SCHEDULER_PKI_WRITES_MESSAGE },
+        ],
+      },
+    },
+    {
+      apiVersion: 'admissionregistration.k8s.io/v1',
+      kind: 'ValidatingAdmissionPolicyBinding',
+      metadata: { name, labels },
+      spec: { policyName: name, validationActions: ['Deny'] },
+    },
+  ];
+}
+
 /**
  * The scheduler PKI namespace and the one-shot bootstrap Job that fills it (#541, O4), in the
  * order they are applied. The Job runs the controller's image with the scheduler PKI scripts
@@ -44,9 +132,10 @@ export const SCHEDULER_PKI_JOB_TTL_SECONDS = 600;
  * identity record and the platform's scheduler Secrets when missing, and overwrites nothing, so
  * no key enters Pulumi state.
  *
- * RBAC `resourceNames` cannot restrict `create`, so the Job's ServiceAccount may create any Secret
- * or ConfigMap in the PKI namespace and any Secret in the platform namespace (design-541 §4.5,
- * "RBAC, as it really is"). It reads and updates only the named objects. The ServiceAccount
+ * RBAC `resourceNames` cannot restrict `create`, so the Role grants `create` on Secrets and
+ * ConfigMaps (design-541 §4.5, "RBAC, as it really is"), and {@link schedulerPkiWritesPolicy}
+ * refuses every write but the Job's named objects of their expected types. It reads and updates
+ * only the named objects. The ServiceAccount
  * mounts no token by default; only the Job's pod receives one. The PKI namespace admits no
  * ingress, and nothing else runs there.
  */
@@ -84,6 +173,8 @@ export function schedulerPkiBootstrap(
         annotations: { 'pulumi.com/skipAwait': 'true' },
       },
     },
+    // Before anything the Job could write with: it confines the Job's `create` (W4).
+    ...schedulerPkiWritesPolicy(namespace, installation),
     {
       apiVersion: 'networking.k8s.io/v1',
       kind: 'NetworkPolicy',
@@ -117,7 +208,7 @@ export function schedulerPkiBootstrap(
         apiGroups: [''],
         resources: ['secrets'],
         verbs: ['get'],
-        resourceNames: Object.values(PLATFORM_SECRETS).sort(),
+        resourceNames: Object.values(PLATFORM_SECRETS).sort(codeUnitOrder),
       },
     ]),
     {
@@ -129,7 +220,11 @@ export function schedulerPkiBootstrap(
     {
       apiVersion: 'batch/v1',
       kind: 'Job',
-      metadata: meta(SCHEDULER_PKI_JOB),
+      metadata: {
+        ...meta(SCHEDULER_PKI_JOB),
+        // Until m6 nothing reads the Job's output, so it must not fail `pulumi up` (#541 W1).
+        annotations: { 'pulumi.com/skipAwait': 'true' },
+      },
       spec: {
         backoffLimit: 4,
         activeDeadlineSeconds: 300,
@@ -180,8 +275,9 @@ export function schedulerPkiBootstrap(
 }
 
 /**
- * Applies {@link schedulerPkiBootstrap}: the namespace first, then the Job's RBAC, code and
- * policy, then the Job. It returns the Job, which the Helm release depends on.
+ * Applies {@link schedulerPkiBootstrap}: the namespace first, then the Job's admission policy,
+ * RBAC, code and network policy, then the Job. It returns the Job. Until m6 the Helm release does
+ * not depend on it, and the Job is not awaited (#541 W1).
  */
 export function installSchedulerPki(args: {
   namespace: string;
@@ -202,6 +298,8 @@ export function installSchedulerPki(args: {
     ) => pulumi.CustomResource
   > = {
     Namespace: k8s.core.v1.Namespace,
+    ValidatingAdmissionPolicy: k8s.admissionregistration.v1.ValidatingAdmissionPolicy,
+    ValidatingAdmissionPolicyBinding: k8s.admissionregistration.v1.ValidatingAdmissionPolicyBinding,
     NetworkPolicy: k8s.networking.v1.NetworkPolicy,
     ServiceAccount: k8s.core.v1.ServiceAccount,
     Role: k8s.rbac.v1.Role,

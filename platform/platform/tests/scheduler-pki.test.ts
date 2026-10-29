@@ -4,6 +4,7 @@ import { COMPONENT, INSTALLATION } from '../src/tenancy/resources';
 import {
   bootstrapSchedulerPki,
   CA_KEYS,
+  codeUnitOrder,
   IDENTITIES_KEY,
   type IdentityRecord,
   ISSUANCE_ID,
@@ -32,6 +33,7 @@ import {
   serializeIdentityRecord,
   TENANT_SUBTREE,
   tenantHostUser,
+  tenantIdentity,
   tenantOperatorUser,
   tlsSecretData,
 } from '../src/tenancy/scheduler-pki';
@@ -324,22 +326,22 @@ describe('scheduler CAs (O2, O3)', () => {
 describe('identity record', () => {
   const record: IdentityRecord = {
     'platform/host': { current: '1111111111111111' },
-    'alpha/operator': {
+    'tenant/alpha/operator': {
       current: '2222222222222222',
       previous: '3333333333333333',
       previousUntil: '2026-10-29T00:10:00.000Z',
     },
     'platform/data': { current: '4444444444444444' },
-    'alpha/hosts': { current: '5555555555555555', previous: '6666666666666666' },
+    'tenant/alpha/hosts': { current: '5555555555555555', previous: '6666666666666666' },
   };
 
   it('serializes sorted and byte-stable, and parses back what it wrote', () => {
     const text = serializeIdentityRecord(record);
     expect(Object.keys(JSON.parse(text))).toEqual([
-      'alpha/hosts',
-      'alpha/operator',
       'platform/data',
       'platform/host',
+      'tenant/alpha/hosts',
+      'tenant/alpha/operator',
     ]);
     const shuffled = Object.fromEntries(Object.entries(record).reverse());
     expect(serializeIdentityRecord(shuffled)).toBe(text);
@@ -348,25 +350,53 @@ describe('identity record', () => {
     expect(platformIdentity('operator')).toBe('platform/operator');
   });
 
+  it('sorts by code unit, not by locale', () => {
+    expect(['b', 'B', 'a', 'A', '-', '_'].sort(codeUnitOrder)).toEqual([
+      '-',
+      'A',
+      'B',
+      '_',
+      'a',
+      'b',
+    ]);
+    expect(codeUnitOrder('a', 'a')).toBe(0);
+  });
+
+  it('gives tenant entries their own prefix, so a Tenant named platform cannot collide (W2)', () => {
+    expect(tenantIdentity('platform', 'operator')).toBe('tenant/platform/operator');
+    expect(tenantIdentity('platform', 'hosts')).toBe('tenant/platform/hosts');
+    const both: IdentityRecord = {
+      [platformIdentity('operator')]: { current: '1111111111111111' },
+      [tenantIdentity('platform', 'operator')]: { current: '2222222222222222' },
+      [tenantIdentity('platform', 'hosts')]: { current: '3333333333333333' },
+    };
+    expect(Object.keys(parseIdentityRecord(serializeIdentityRecord(both)))).toHaveLength(3);
+    // The unprefixed tenant forms are not record keys, so `platform/hosts` is not a tenant entry.
+    for (const key of ['platform/hosts', 'alpha/hosts', 'alpha/operator', 'tenant/platform/data'])
+      expect(() =>
+        parseIdentityRecord(JSON.stringify({ [key]: { current: '1111111111111111' } })),
+      ).toThrow(`has an invalid entry '${key}'`);
+  });
+
   it('refuses anything it did not write, naming the entry but no value', () => {
     for (const text of ['', 'nope', '[]', 'null', '"x"'])
       expect(() => parseIdentityRecord(text)).toThrow('does not hold a JSON identity record');
     const bad: Record<string, unknown> = {
       'platform/server': { current: '1111111111111111' },
-      'Alpha/hosts': { current: '1111111111111111' },
-      'alpha/other': { current: '1111111111111111' },
-      'alpha/hosts': { current: 'ABCDEFABCDEFABCD' },
-      'beta/hosts': { current: '1111' },
-      'gamma/hosts': null,
-      'delta/hosts': { current: '1111111111111111', extra: 'x' },
-      'eps/hosts': { current: '1111111111111111', previous: 'zz' },
-      'zeta/hosts': { current: '1111111111111111', previousUntil: '2026-10-29T00:00:00Z' },
-      'eta/hosts': {
+      'tenant/Alpha/hosts': { current: '1111111111111111' },
+      'tenant/alpha/other': { current: '1111111111111111' },
+      'tenant/alpha/hosts': { current: 'ABCDEFABCDEFABCD' },
+      'tenant/beta/hosts': { current: '1111' },
+      'tenant/gamma/hosts': null,
+      'tenant/delta/hosts': { current: '1111111111111111', extra: 'x' },
+      'tenant/eps/hosts': { current: '1111111111111111', previous: 'zz' },
+      'tenant/zeta/hosts': { current: '1111111111111111', previousUntil: '2026-10-29T00:00:00Z' },
+      'tenant/eta/hosts': {
         current: '1111111111111111',
         previous: '2222222222222222',
         previousUntil: 'not a time',
       },
-      'theta/hosts': 'x',
+      'tenant/theta/hosts': 'x',
     };
     for (const [key, entry] of Object.entries(bad)) {
       const thrown = (() => {
@@ -575,11 +605,36 @@ describe('scheduler PKI bootstrap', () => {
     await bootstrapSchedulerPki(api, config, t0);
     const stored = api.get(recordPath);
     const record = readRecord(api);
-    record['alpha/hosts'] = { current: 'abcdefabcdefabcd' };
+    record['tenant/alpha/hosts'] = { current: 'abcdefabcdefabcd' };
     stored.data = { [IDENTITIES_KEY]: serializeIdentityRecord(record) };
     api.objects.delete(leafPath('data'));
     await bootstrapSchedulerPki(api, config, at(1));
-    expect(readRecord(api)['alpha/hosts']).toEqual({ current: 'abcdefabcdefabcd' });
+    expect(readRecord(api)['tenant/alpha/hosts']).toEqual({ current: 'abcdefabcdefabcd' });
+  });
+
+  it('updates the record from the stored object, keeping its labels and other keys (S4)', async () => {
+    const api = new FakeApi();
+    await bootstrapSchedulerPki(api, config, t0);
+    const stored = api.get(recordPath);
+    stored.metadata.labels = { ...stored.metadata.labels, extra: 'kept' };
+    stored.data = { ...stored.data, 'other.json': '{}' };
+    api.objects.delete(leafPath('data'));
+    await bootstrapSchedulerPki(api, config, at(1));
+    const now = api.get(recordPath);
+    expect(now.metadata.labels?.extra).toBe('kept');
+    expect(now.data?.['other.json']).toBe('{}');
+  });
+
+  it('refuses to update a record read without a resourceVersion (S4)', async () => {
+    const api = new FakeApi();
+    await bootstrapSchedulerPki(api, config, t0);
+    api.get(recordPath).metadata.resourceVersion = undefined;
+    api.objects.delete(leafPath('data'));
+    await expect(bootstrapSchedulerPki(api, config, at(1))).rejects.toThrow(
+      'read without a resourceVersion',
+    );
+    expect(api.calls.filter((c) => c.startsWith('PUT'))).toEqual([]);
+    expect(api.objects.has(leafPath('data'))).toBe(false);
   });
 
   it('issues a missing server Secret without touching the record', async () => {
