@@ -4,7 +4,7 @@
 |---|---|
 | Issue | #541 (part of epic #495, E2 Tenant isolation and transport; found during the #535 check) |
 | Related | #535, #540, #542 (network policy on the scheduler NATS); #552 (scheduler NATS without debug/trace logging) |
-| Status | **Design, revision 4.** Revised after review rounds 1 and 2 on PR #558, and after the owner's decision not to fork the runtime-operator. No code changes. Implementation waits for this note to merge. |
+| Status | **Design, revision 5.** Revised after review rounds 1 to 3 on PR #558, and after the owner's decision not to fork the runtime-operator. No code changes. Implementation waits for this note to merge. |
 | Scope | `platform/platform` (scheduler NATS, PKI, tenant host and per-tenant operator wiring), and one vCluster value in `platform/operator`. Upstream wash and runtime-operator stay unpatched, apart from the existing wash fork in `platform/tenant-host/`. |
 | Constraints from the owner | No users yet: no rollout phases, no tenant-by-tenant migration, no compatibility shims, no release notes. The shared certificate is replaced outright. The gap is fixed, not documented away. The runtime-operator is not forked. |
 
@@ -40,8 +40,9 @@ The end state, with upstream wash and runtime-operator unmodified:
 
   It can hear only its tenant's heartbeats, reach only its tenant's hosts, read only its tenant's Secrets, and place only its tenant's workloads. The chart's own operator keeps serving the platform namespace and `hostgroup-default`.
 - **Per-issuance client identities.** Tenant hosts get certificates from a platform-issued, name-constrained tenant CA. Operators and platform clients get theirs from the platform CA. Every client certificate is bound to a fresh NATS user name per issuance, and the current and previous issuances are recorded in controller-owned state.
-  - Force-rotating an identity revokes the old user in the next reload. A routine renewal keeps the previous user for at most 10 minutes.
-  - Removing a tenant revokes its host user at once. Its operator user stays until the operator has cleared the tenant's finalizers, and then the account is dropped.
+  - Force-rotating an identity revokes the old user in the next reload.
+  - A routine renewal keeps the previous user only until its clients have moved to the new one: at most 10 minutes for operators, and until their rollout is observed for hosts.
+  - Removing a tenant revokes its host user at once, then drains and removes the tenant's operator in a fixed, checked sequence (4.5, "Removal sequence").
 - **The shared certificate and the chart's CA are gone.** No tenant namespace receives a platform key. The CA keys live in a namespace that no pod and no workload can reach.
 
 **What was compared.** Section 7 compares this option, (a), with a platform-owned relay (b) and broker isolation alone (c).
@@ -118,8 +119,10 @@ Tenants have no distinct NATS identity. A single operator hears every heartbeat 
   - Issuing, rotating or removing one tenant's identity reloads the server without disconnecting any other tenant.
   - This applies to every client identity: tenant hosts, tenant operators, the platform operator, `hostgroup-default` and `DATA`.
   - Forced rotation revokes the old identity in the next reload. Its connections are dropped, and its certificate is refused even though it is still valid.
-  - A routine renewal keeps the previous identity for at most 10 minutes while clients reconnect or roll, then revokes it the same way.
-  - Removing a tenant revokes its host identity in the next reload. The tenant's operator identity stays until that operator has finished the tenant's cleanup (4.5, "Removal"), and is then revoked the same way.
+  - A routine renewal keeps the previous identity only while its clients move to the new one, then revokes it the same way.
+    - Operators reconnect by themselves, so their previous identity is kept for at most 10 minutes.
+    - Hosts, both tenant hosts and `hostgroup-default` with its `DATA` connection, move only when their pods roll. Their previous identity is kept until the rollout is observed. A condition reports a rollout that has not finished after 10 minutes.
+  - Removing a tenant revokes its host identity in the next reload. The tenant's operator identity stays until that operator has finished the tenant's cleanup, and is then revoked the same way (4.5, "Removal sequence").
   - No identity outlives its record until certificate expiry.
 - **P6 No shared secrets in tenant namespaces.** A tenant runtime namespace holds only that tenant's own key and the public CA bundle that verifies the server.
 - **P7 Issuance cannot escape its scope.** The CA that signs tenant host certificates can sign only names inside the tenant subtree, so neither a bug nor a stolen tenant CA key can produce an operator's or the platform's identity.
@@ -275,7 +278,7 @@ How the pieces give the properties:
   - for each tenant, `<t>/hosts` and `<t>/operator`;
   - for the platform, `platform/operator`, `platform/host` and `platform/data`.
 
-  Each entry is `{ current: <id>, previous?: <id>, previousUntil?: <time>, state?: draining }`.
+  Each entry is `{ current: <id>, previous?: <id>, previousUntil?: <time> }`.
   - The controller writes the record before it issues a certificate or renders accounts, and it never reads identities back from tenant namespaces. The bootstrap Job writes the first platform entries.
   - `<id>` is 16 random hex characters, new for every client certificate, so a user name names exactly one certificate.
 
@@ -297,27 +300,50 @@ How the pieces give the properties:
   2. issues the certificate;
   3. renders both users.
 
-  Hosts roll through a certificate-digest pod annotation (the registry-CA pattern, `resources.ts:1456-1466`). An operator keeps its connection and reconnects as the new user once the previous one is dropped.
+  What happens next depends on the client:
+  - **Operators** (tenant and platform) keep their connection and reconnect as the new user once the previous one is dropped. For them, `previous` is dropped at `previousUntil`, which gives the kubelet time to sync the Secret.
+  - **Hosts** (tenant host groups, and `hostgroup-default` with its `DATA` connection). wash does not swap certificates on an established connection, so the controller rolls the host Deployment first:
+    - tenant hosts through a certificate-digest pod annotation (the registry-CA pattern, `resources.ts:1456-1466`);
+    - `hostgroup-default` through a pod-template annotation (see "Lifetimes" below).
 
-  `previous` is dropped when it is no longer in use, or at `previousUntil`, whichever comes first:
-  - for hosts, once the rollout has finished, as the readiness gate at `controller.ts:1028-1042` checks;
-  - for operators, at `previousUntil`, which leaves the kubelet time to sync the Secret.
-- **Removal** (Tenant deletion, under either deletion policy). The tenant's operator must keep running until it has cleared its finalizers:
-  - the pod-host finalizer on `di-runtime-<t>` pods (`host_pod_controller.go:65-90`);
-  - the Workload finalizers in `di-tenant-<t>`.
+    `previous` is dropped only once the rollout is observed. That means `observedGeneration` is current and all replicas are updated and ready, which is what the readiness gate at `controller.ts:1028-1042` checks. `previousUntil` does not apply to hosts.
 
-  Dropping its user would close its NATS connection for good. nats.go gives up after repeated authorization errors (`nats.go: nats.go:4085-4086`). The operator would then crash-loop, because its liveness check fails on a closed connection (`cmd/main.go:340-357`) and a fresh start exits when it cannot connect (`operator.go:71-74`, `cmd/main.go:305-307`). The controller's existing deletion waits (`controller.ts:915-929` for `Delete`, `:954-959` for `Retain`) would then never finish. Removal therefore runs in this order:
-  1. The `<t>/hosts` entry and the host user leave the next render. The tenant's host connections are refused from that reload on. **P**
-  2. The `<t>/operator` entry is marked `state: draining`, and its user stays in `T_di-tenant-<t>`.
-  3. The controller waits until no host pod remains in `di-runtime-<t>` and no `runtime.wasmcloud.dev` object remains in `di-tenant-<t>` or `di-operator-<t>`.
-  4. Only then does it drop the `<t>/operator` entry and the whole `T_di-tenant-<t>` account, and delete `di-operator-<t>`.
+    If the rollout has not finished after 10 minutes, the controller keeps both users and reports `SchedulerIdentityRenewalStalled` with the Deployment's name. For tenant hosts this is a Tenant condition; for the platform host it goes to the controller's log and status. A host is therefore never cut off by a routine renewal. A forced rotation still revokes immediately.
 
-  The draining operator can no longer reach any host, so its commands time out. Its finalizers only delete Kubernetes objects (`host_controller.go:102-124`), which needs no host.
+**Removal sequence.** This runs when a Tenant has a `deletionTimestamp`, under either deletion policy. The tenant's operator must stay connected and bound until it has cleared its own finalizers:
+- the pod-host finalizer on `di-runtime-<t>` pods (`host_pod_controller.go:65-90`);
+- the Host finalizer, which deletes Workloads by host ID (`host_controller.go:102-124`);
+- the finalizers on the workload objects in `di-tenant-<t>`.
+
+Two things must not happen early:
+- **Dropping the operator's NATS user.** That closes its connection for good. nats.go gives up after repeated authorization errors (`nats.go: nats.go:4085-4087`), and the operator then crash-loops (`cmd/main.go:340-357`, `operator.go:71-74`, `cmd/main.go:305-307`).
+- **Deleting a namespace.** That can remove the RoleBindings the operator depends on, in no guaranteed order.
+
+Removal therefore runs in the fixed order below. The controller never skips a step, and it never deletes a tenant namespace before the earlier steps are complete.
+
+| Step | `Delete` policy | `Retain` policy | Done when | Layer 4 |
+|---|---|---|---|---|
+| R1 | Drop the `<t>/hosts` entry and the host user from the next render | same | the reload is applied | 7a |
+| R2 | Scale the tenant host Deployment to zero, and wait for the host pods to be gone | same (today's Retain wait, `controller.ts:931-976`) | no host pod in `di-runtime-<t>`, terminating pods included (#245), and no Host in `di-operator-<t>` (the operator's pod-host and Host finalizers have run) | 7b |
+| R3 | Delete the tenant's WorkloadDeployments, and wait for the operator to remove its finalizers | Scale the tenant operator to zero and wait for its pod to be gone. Then the controller removes the operator's finalizers from every remaining `runtime.wasmcloud.dev` object in `di-tenant-<t>` | `Delete`: no `runtime.wasmcloud.dev` object in `di-tenant-<t>`. `Retain`: no such object carries an operator finalizer | 7c |
+| R4 | Drop the `<t>/operator` entry and the whole `T_di-tenant-<t>` account from the next render | same | the reload is applied, and the operator user is refused | 7d |
+| R5 | Delete the three RoleBindings to the tenant-operator ClusterRoles, then `di-operator-<t>` | same. In the retained `di-tenant-<t>` and `di-runtime-<t>` the RoleBindings are deleted too, so a re-created Tenant starts clean | no such RoleBinding remains, and `di-operator-<t>` is gone | 7e |
+| R6 | Delete the tenant's namespaces, as today (`controller.ts:915-929`) | keep them, as today | namespaces gone, or present and unchanged | 7f |
+| R7 | Remove the Tenant's finalizer | same | the Tenant is gone | 7g |
+
+- **Stuck steps.** Each step has a 15-minute deadline. When a deadline passes, the controller sets the Tenant condition `RemovalStuck`, with `reason` set to the step ID and a message naming the objects that remain, such as Workloads that still carry a finalizer. It keeps retrying the same step and never moves on by force. Once the cause is cleared, for example a foreign finalizer, removal continues. Layer 4 step 7h induces this case.
+- **What `Retain` leaves behind.** The retained WorkloadDeployments, WorkloadReplicaSets, Workloads and Artifacts in `di-tenant-<t>` are inert:
+  - no operator watches them;
+  - they carry no operator finalizer, so the namespace can still be deleted by hand.
+
+  If the Tenant is re-created, its new operator watches `di-tenant-<t>` again and reconciles them from scratch. **U**: that the 2.8.0 operator re-adds missing finalizers on reconcile, as controller-runtime's usual pattern does. Layer 4 step 7i checks this.
+- **RBAC for R3.** Under `Retain`, removing finalizers needs `patch` on `workloads`, `workloadreplicasets` and `artifacts`. Today the controller holds `patch` only on `workloaddeployments`, and read access to the other three (`platform/platform/src/tenancy/install.ts:221-231`). Its ClusterRole gains `patch` on those three.
+- **The operator after R1.** Its commands to hosts time out, because no host can connect any more. Its finalizers only delete Kubernetes objects (`host_controller.go:102-124`), so they need no host.
 
 **Lifetimes** (O3):
 - **CAs.** 10 years, rotated with the controller's existing CA machinery (`platform/platform/src/tenancy/ca-rotation.ts:13-25,140-215`). `ca_file` and each `ca.crt` carry the current and next CA.
 - **Leaves.** 90 days, renewed when 30 days remain (`ca-rotation.ts:20`). Revocation never waits for expiry.
-- **`hostgroup-default` renewal.** It restarts through a pod-template annotation. **U**: that Helm keeps an annotation it did not render.
+- **`hostgroup-default` renewal.** It follows the host rule above: the controller rolls it first, and drops `previous` only once the rollout is observed. **U**: that Helm keeps a pod-template annotation it did not render. If Helm does not keep it, the controller restarts the Deployment by deleting its pods one at a time, under the same rule.
 - **Server renewal.** The server reloads its certificate when the reloader sees the Secret change.
 
 **Bootstrap** (O4):
@@ -354,6 +380,7 @@ The platform controller renders, for each Tenant, the same objects the chart ren
 - **ServiceAccount and RBAC.** Pulumi renders three fixed ClusterRoles. Each copies the rules of the chart's operator Roles for one kind of namespace:
   - `di-tenant-operator-self`: leases, events, pods, Hosts and their status and finalizers (`chart: templates/operator/role.yaml`), bound in `di-operator-<t>`;
   - `di-tenant-operator-workloads`: the workload CRDs and their status and finalizers; ConfigMaps, Secrets, Services, `services/finalizers` and events; EndpointSlices, including the `restricted` subresources (`workload-crd-role.yaml`, `workload-namespace-role.yaml`, `endpointslice-role.yaml`), bound in `di-tenant-<t>`;
+  - both of those also get `events.k8s.io` `events` create and patch. The operator records events through `mgr.GetEventRecorder` (`wasmcloud: runtime-operator/operator.go:110`), which controller-runtime v0.24.1 sends to the events/v1 API (`pkg/cluster/cluster.go:288-298`). The chart grants only core events, so its own operator's events/v1 writes are refused, and warnings such as `CrossEnvironmentSchedulingDenied` stay invisible;
   - `di-tenant-operator-hosts`: pods (`host-pod-role.yaml`), bound in `di-runtime-<t>`.
 
   The controller creates only RoleBindings to these ClusterRoles, one in each of the tenant's three namespaces. A RoleBinding grants a ClusterRole's rules only inside its own namespace, so each operator can read only its own tenant's Secrets.
@@ -428,13 +455,16 @@ The platform controller renders, for each Tenant, the same objects the chart ren
   - The NATS resources, the PKI namespace, and the bootstrap Job and its RBAC, all ordered before the Helm release.
   - Removal of the #552 `postrender`.
 - **`platform/platform/src/watched-namespaces.ts`.** `hostNamespaces` becomes the platform namespace only. The tenant list it computes no longer feeds the chart.
-- **`platform/platform/src/tenancy/install.ts`.** Add `bind` on `clusterroles`, limited by `resourceNames` to the three tenant-operator ClusterRoles, and no `escalate` (4.6).
+- **`platform/platform/src/tenancy/install.ts`.**
+  - Add `bind` on `clusterroles`, limited by `resourceNames` to the three tenant-operator ClusterRoles, with no `escalate` (4.6).
+  - Add `patch` on `workloads`, `workloadreplicasets` and `artifacts`, for removal step R3 (4.5).
 - **`platform/platform/src/tenancy/tls.ts`.** Email and URI name constraints, and a client-auth leaf.
 - **`platform/platform/src/tenancy/`.** A new `scheduler-nats.ts`, plus changes to `controller.ts` and `resources.ts`:
   - the identity record, issuance and rotation;
   - the accounts renderer and its validation;
   - the per-tenant `di-operator-<t>` namespace, operator Deployment, ServiceAccount, RoleBindings to the fixed ClusterRoles, and certificate;
-  - the removal order: host user first, operator user and `di-operator-<t>` after the tenant's finalizers have run (4.5);
+  - the removal sequence R1-R7, with per-step deadlines and the `RemovalStuck` condition (4.5);
+  - host-first routine renewal with `SchedulerIdentityRenewalStalled` (4.5);
   - the Host lookup in the readiness check, and the certificate-digest annotation;
   - removal of the `wasmcloud-runtime-tls` copy.
 - **`platform/platform/src/platform-ingress.ts`, `tenancy.ts`.** The NATS ingress rule admits the tenant operators.
@@ -487,7 +517,7 @@ It meets P1-P3 only while it runs correctly. It is a new process that sees every
   - A golden file is shared with the broker test.
 - **Identity record and issuance.**
   - The record is written before issuance, and every client certificate (host, operator, platform) gets a new ID.
-  - During removal the host entry is dropped first. The operator entry stays `draining` until no host pod and no `runtime.wasmcloud.dev` object remains, and only then is the account dropped.
+  - Removal follows R1-R7 in order for both policies. Each step is a separate test: its precondition, the step's action, and the condition set at its deadline. A test with a stubbed API verifies that no namespace delete is issued before R5 has completed.
   - Leaves carry the client-auth EKU and the right SAN form.
   - Both CAs carry their name constraints: the tenant CA refuses every name under `platform.scheduler.di-framework.invalid`, and operator certificates come only from the platform CA.
   - Lifetimes are as specified.
@@ -526,10 +556,7 @@ Two tenants and the platform host group:
 - workloads are placed and run on each;
 - the chart's operator registers only `hostgroup-default`;
 - Layer 3 passes;
-- deleting a tenant completes under both deletion policies, `Delete` and `Retain`:
-  - the host user is refused at once;
-  - the tenant's operator clears the host pod and Workload finalizers;
-  - then the account and `di-operator-<t>` are gone.
+- deleting a tenant completes under both deletion policies, `Delete` and `Retain`, through steps R1-R7 (4.5).
 
 ### 8.4 Layer 4, against the broker with tenant A's credentials
 
@@ -540,12 +567,22 @@ Two tenants and the platform host group:
 3. **Non-delivery of B's commands.** Subscribe to `runtime.host.*.>`, which is allowed. While it is open, deploy a workload in tenant B whose `secretFrom` value is a unique marker, and one in tenant A. A's subscription receives A's `workload.start` (positive control) and nothing with B's marker.
 4. **Heartbeats stay in A.** Publish heartbeats that claim B's environment, reuse a host ID registered in B, and report one of B's pod IPs. B's operator logs nothing about them, and B's Hosts in `di-operator-b` are unchanged. A's operator may record the forged host, but it places no B workload: A's operator does not watch `di-tenant-b`.
 5. **Forced rotation.** Force new identities for A (hosts and operator). A's old host and operator certificates each get `Authorization Violation` from that reload on, and A keeps scheduling. B shows no reconnect and no restart.
-6. **Routine renewal.** Renew A's host and operator certificates. Each previous user is gone once it is no longer used, and within 10 minutes in any case.
-7. **Removal, under both deletion policies.** Delete tenant B with `Delete`, and a tenant C with `Retain`. In each case:
-   - B's host certificate gets `Authorization Violation` at once;
-   - B's operator stays connected until the host pods and `runtime.wasmcloud.dev` objects are gone, and its finalizers complete;
-   - then B's operator is disconnected and `di-operator-b` is gone;
-   - A shows no reconnect and no restart.
+6. **Routine renewal.** Renew A's host and operator certificates, and the platform host's.
+   - The hosts and `hostgroup-default` roll before their previous users are dropped. No live host connection gets `Authorization Violation`.
+   - The operator's previous user is gone within 10 minutes, after one reconnect.
+   - A host rollout held back on purpose raises `SchedulerIdentityRenewalStalled` and keeps both users.
+7. **Removal, both policies, step by step.** Delete tenant B with `Delete`, and tenant C with `Retain`. After each step of the 4.5 removal sequence, record:
+   - **7a (R1).** The host certificate gets `Authorization Violation`. The operator stays connected.
+   - **7b (R2).** No host pod remains in `di-runtime-*`, and no Host remains in `di-operator-*`. The operator is still connected and bound.
+   - **7c (R3).**
+     - B: no `runtime.wasmcloud.dev` object remains in `di-tenant-b`.
+     - C: the operator Deployment is at zero, the WorkloadDeployments remain, and no object carries an operator finalizer.
+   - **7d (R4).** The operator certificate gets `Authorization Violation`.
+   - **7e (R5).** No RoleBinding to a tenant-operator ClusterRole remains in the tenant's namespaces, and `di-operator-*` is gone.
+   - **7f (R6).** B's namespaces are gone. C's are present, and a manual delete of `di-tenant-c` completes.
+   - **7g (R7).** Both Tenants are gone. Tenant A shows no reconnect and no restart throughout.
+   - **7h (stuck step).** On a third tenant, add a foreign finalizer to one Workload, then delete the Tenant. After the deadline, `RemovalStuck` names the step and the Workload. Removing the foreign finalizer lets removal complete.
+   - **7i (re-adding).** Re-create C. Its new operator reconciles the retained WorkloadDeployments and places them.
 8. **Keys and certificates.** `di-scheduler-tls` in A and in B have different public-key fingerprints. Neither `wasmcloud-runtime-tls` nor `wasmcloud-ca` exists.
 9. **Logs.** After a deploy, the NATS pod's log has no `MSG_PAYLOAD` lines.
 10. **Operator RBAC.** Check `kubectl auth can-i get secrets` as each operator's ServiceAccount:
@@ -621,6 +658,7 @@ These are marked **U** above. The implementation or Layer 4 must confirm them:
 8. The upstream documentation statements in 2.4.
 9. Whether any `hostgroup-default` workload uses JetStream (O5).
 10. The client library for the broker test (8.2).
+11. That the 2.8.0 operator re-adds missing finalizers on reconcile, which re-adding a retained tenant (4.5) relies on.
 
 ## Appendix A. The probe's exact configuration (option (a))
 
