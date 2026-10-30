@@ -778,7 +778,7 @@ describe('backing service reconciliation', () => {
     const original = api.call.bind(api);
     api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
       const result = await original<T>(method, path, body);
-      if (method === 'PATCH' && path === key(stock)) {
+      if (method === 'PATCH' && path.split('?')[0] === key(stock)) {
         (result as BackingService).metadata.deletionTimestamp = '2026-09-15T00:00:00Z';
       }
       return result;

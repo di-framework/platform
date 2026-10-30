@@ -186,6 +186,8 @@ describe('backing-service install', () => {
       'service-binding-reconcile',
       'postgres',
       'log-projection',
+      'tenant-operator-names',
+      'removal-sequence',
       'controller',
     ]);
     for (const name of CONTROLLER_SCRIPT_MODULES) {
@@ -204,10 +206,12 @@ describe('backing-service install', () => {
       'node-image.js',
       'postgres.js',
       'registry-nats.js',
+      'removal-sequence.js',
       'resources.js',
       'service-binding-reconcile.js',
       'storage-mode.js',
       'storage-records.js',
+      'tenant-operator-names.js',
       'tls.js',
       'workload-storage.js',
     ]);

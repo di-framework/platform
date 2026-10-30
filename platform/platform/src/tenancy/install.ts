@@ -71,6 +71,8 @@ export const CONTROLLER_SCRIPT_MODULES = [
   'service-binding-reconcile',
   'postgres',
   'log-projection',
+  'tenant-operator-names',
+  'removal-sequence',
   'controller',
 ] as const;
 
@@ -234,9 +236,10 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
       verbs: ['get', 'list', 'watch'],
     },
     {
-      // Merge-patches the placement-retry annotation onto unplaced Workloads (#418).
+      // Merge-patches the placement-retry annotation onto unplaced Workloads (#418), and removes
+      // the operator's finalizers from Workloads and Artifacts in removal step R3 (design-541 §4.5).
       apiGroups: ['runtime.wasmcloud.dev'],
-      resources: ['workloads'],
+      resources: ['workloads', 'artifacts'],
       verbs: ['patch'],
     },
     {
