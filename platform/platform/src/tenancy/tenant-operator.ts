@@ -7,6 +7,7 @@
  * #541 m3 renders these objects; the controller does not apply them yet (m6).
  */
 import {
+  COMPONENT,
   INSTALLATION,
   labels,
   NAMESPACE_ROLE,
@@ -16,6 +17,19 @@ import {
   type Tenant,
 } from './resources';
 import { PLATFORM_SECRETS } from './scheduler-pki';
+import {
+  operatorNamespace,
+  TENANT_OPERATOR_CLUSTER_ROLES,
+  TENANT_OPERATOR_COMPONENT,
+  TENANT_OPERATOR_NAME,
+} from './tenant-operator-names';
+
+export {
+  operatorNamespace,
+  TENANT_OPERATOR_CLUSTER_ROLES,
+  TENANT_OPERATOR_COMPONENT,
+  TENANT_OPERATOR_NAME,
+};
 
 /** The runtime-operator Helm chart version the platform installs, and the operator image tag. */
 export const WASMCLOUD_OPERATOR_VERSION = '2.8.0';
@@ -36,24 +50,12 @@ export function runtimeOperatorImage(version: string = WASMCLOUD_OPERATOR_VERSIO
   return `${RUNTIME_OPERATOR_REPOSITORY}:${version}@${digest}`;
 }
 
-/** The three fixed ClusterRoles every tenant operator is bound to, one per kind of namespace. */
-export const TENANT_OPERATOR_CLUSTER_ROLES = {
-  /** Bound in `di-operator-<t>`. */
-  self: 'di-tenant-operator-self',
-  /** Bound in `di-tenant-<t>`. */
-  workloads: 'di-tenant-operator-workloads',
-  /** Bound in `di-runtime-<t>`. */
-  hosts: 'di-tenant-operator-hosts',
-} as const;
 export type TenantOperatorScope = keyof typeof TENANT_OPERATOR_CLUSTER_ROLES;
 
-export const TENANT_OPERATOR_NAME = 'runtime-operator';
 /** The pod label the chart's operator carries, which the platform NATS ingress rule selects. */
 export const TENANT_OPERATOR_POD_LABELS = { 'wasmcloud.com/name': TENANT_OPERATOR_NAME };
 export const TENANT_OPERATOR_HEALTH_PORT = 8082;
 const CERT_DIR = '/operator-cert';
-
-export const operatorNamespace = (tenant: string): string => `di-operator-${tenant}`;
 
 type Rule = { apiGroups: string[]; resources: string[]; verbs: string[] };
 const WASMCLOUD = 'runtime.wasmcloud.dev';
@@ -252,6 +254,8 @@ export function tenantOperatorResources(tenant: Tenant, cfg: TenantOperatorConfi
       },
     },
   });
+
+  deployment.metadata.labels![COMPONENT] = TENANT_OPERATOR_COMPONENT;
 
   const egress: unknown[] = [];
   if (cfg.apiServer.addresses.length)

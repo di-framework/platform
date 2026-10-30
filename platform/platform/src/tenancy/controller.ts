@@ -83,6 +83,16 @@ import {
   registryNatsAuthDigest,
 } from './registry-nats';
 import {
+  bindsTenantOperatorRole,
+  isTenantOperatorBinding,
+  REMOVAL_STEP_ANNOTATION,
+  type RemovalStep,
+  remainingSummary,
+  removalProgress,
+  removalStuckCondition,
+  sweepsDeployment,
+} from './removal-sequence';
+import {
   assertTenantAuthConfig,
   type BackingService,
   type BackingServiceClass,
@@ -148,6 +158,7 @@ import {
   type StorageRecords,
   storageAllowed,
 } from './storage-records';
+import { operatorNamespace } from './tenant-operator-names';
 import { certificateNames, certificateValid, holdsCaKey, issuedBy, leafCertificate } from './tls';
 import {
   STORAGE_FIELD_MANAGER,
@@ -182,6 +193,7 @@ const plurals: Record<string, string> = {
   WorkloadDeployment: 'workloaddeployments',
   WorkloadReplicaSet: 'workloadreplicasets',
   Workload: 'workloads',
+  Artifact: 'artifacts',
   Job: 'jobs',
 };
 type RolloutDeployment = Resource & {
@@ -618,13 +630,183 @@ export class Controller {
     );
     value.status = status;
   }
-  private async revoke(labels: Record<string, string>): Promise<void> {
+  private async revoke(
+    labels: Record<string, string>,
+    keep: (binding: Resource) => boolean = () => false,
+  ): Promise<void> {
     for (const kind of ['RoleBinding', 'ClusterRoleBinding'])
       for (const binding of await this.list<Resource>('rbac.authorization.k8s.io/v1', kind, {
         [INSTALLATION]: this.cfg.installation,
         ...labels,
       }))
-        await this.remove(binding);
+        if (!keep(binding)) await this.remove(binding);
+  }
+  /**
+   * Removal of a Tenant with a `deletionTimestamp`: steps R1-R7 in order (design-541 §4.5). Each
+   * pass re-checks the steps from R1 and stops at the first that is not complete; nothing is ever
+   * skipped. A step left incomplete past its deadline sets `RemovalStuck` (reason: the step ID)
+   * and is retried, never forced.
+   */
+  private async removeTenant(tenant: Tenant): Promise<void> {
+    const steps: [RemovalStep, () => Promise<string[]>][] = [
+      // The R1 and R4 reload-applied checks and the R3 Retain finalizer removal arrive with m6.
+      ['R1', async () => []],
+      ['R2', () => this.removalStopHosts(tenant)],
+      ['R3', () => this.removalWorkloads(tenant)],
+      ['R4', async () => []],
+      ['R5', () => this.removalOperator(tenant)],
+      ['R6', () => this.removalNamespaces(tenant)],
+    ];
+    for (const [step, run] of steps) {
+      const remaining = await run();
+      if (remaining.length === 0) continue;
+      await this.removalBlocked(tenant, step, remaining);
+      return;
+    }
+    // R7.
+    await this.finalizer(tenant, false);
+  }
+  /** Records the step removal waits on, and reports it (with `RemovalStuck` past its deadline). */
+  private async removalBlocked(
+    tenant: Tenant,
+    step: RemovalStep,
+    remaining: string[],
+  ): Promise<void> {
+    const recorded = tenant.metadata.annotations?.[REMOVAL_STEP_ANNOTATION];
+    const progress = removalProgress(recorded, step, this.now());
+    if (recorded !== progress.annotation) {
+      const updated = await this.api.call<Tenant>(
+        'PATCH',
+        location(tenant),
+        { metadata: { annotations: { [REMOVAL_STEP_ANNOTATION]: progress.annotation } } },
+        'application/merge-patch+json',
+      );
+      tenant.metadata = updated.metadata;
+    }
+    const n = names(tenant.metadata.name);
+    const policy = tenant.spec.deletionPolicy ?? 'Retain';
+    const pods = remaining.filter((r) => r.startsWith('pod/'));
+    const hostPods = pods.length === remaining.length;
+    await this.status(
+      tenant,
+      false,
+      hostPods ? 'WaitingForHostPods' : 'Removing',
+      hostPods
+        ? `${policy}: waiting for host pods in ${n.runtimeNamespace} to be gone before removing the Tenant: ${remainingSummary(pods.map((r) => r.slice('pod/'.length)))}`
+        : `${policy}: removal step ${step} waits for ${remainingSummary(remaining)}`,
+      {},
+      progress.stuck
+        ? [removalStuckCondition(step, remaining, progress.since, tenant.metadata.generation ?? 1)]
+        : [],
+    );
+  }
+  /**
+   * R2: scale the tenant's Deployments to zero, except its own runtime-operator, and wait for
+   * the host pods (terminating ones included, #245) and the Hosts in `di-operator-<t>` to be gone.
+   */
+  private async removalStopHosts(tenant: Tenant): Promise<string[]> {
+    const t = tenant.metadata.name;
+    const n = names(t);
+    const remaining: string[] = [];
+    const deployments = await this.list<Resource>('apps/v1', 'Deployment', {
+      [INSTALLATION]: this.cfg.installation,
+      [OWNER]: tenant.metadata.uid!,
+    });
+    for (const deployment of deployments.filter((d) => sweepsDeployment(d, t))) {
+      const updated = await this.api.call<Resource>(
+        'PATCH',
+        `${location(deployment)}?fieldManager=di-platform-controller`,
+        {
+          metadata: { resourceVersion: deployment.metadata.resourceVersion },
+          spec: { replicas: 0 },
+        },
+        'application/merge-patch+json',
+      );
+      const status = updated.status as
+        | { observedGeneration?: number; replicas?: number }
+        | undefined;
+      if (
+        status?.observedGeneration !== updated.metadata.generation ||
+        (status?.replicas ?? 0) !== 0
+      )
+        remaining.push(`deployment/${deployment.metadata.namespace}/${deployment.metadata.name}`);
+    }
+    if (remaining.length) return remaining;
+    // `status.replicas` leaves out terminating pods, so also wait for the live host pods to be
+    // gone (#245). The wasmCloud operator clears their pod-host finalizer only while it watches
+    // the runtime namespace. The list is read-only and scoped to this tenant's runtime namespace
+    // and hostgroup.
+    for (const pod of await this.liveHostPods(n)) remaining.push(`pod/${pod.metadata.name}`);
+    for (const host of await this.list<Resource>(
+      'runtime.wasmcloud.dev/v1alpha1',
+      'Host',
+      {},
+      operatorNamespace(t),
+    ))
+      remaining.push(`host/${host.metadata.name}`);
+    return remaining;
+  }
+  /**
+   * R3 under `Delete`: delete the tenant's WorkloadDeployments, then wait until no
+   * `runtime.wasmcloud.dev` object in `di-tenant-<t>` carries a finalizer and no Artifact remains.
+   * Under `Retain` m5 keeps today's path; the finalizer removal arrives with m6.
+   */
+  private async removalWorkloads(tenant: Tenant): Promise<string[]> {
+    if (tenant.spec.deletionPolicy !== 'Delete') return [];
+    const n = names(tenant.metadata.name);
+    const list = (kind: string) =>
+      this.list<Resource>('runtime.wasmcloud.dev/v1alpha1', kind, {}, n.namespace);
+    for (const deployment of await list('WorkloadDeployment'))
+      if (!deployment.metadata.deletionTimestamp) await this.remove(deployment);
+    const remaining: string[] = [];
+    for (const kind of ['WorkloadDeployment', 'WorkloadReplicaSet', 'Workload', 'Artifact'])
+      for (const value of await list(kind))
+        if (kind === 'Artifact' || value.metadata.finalizers?.length)
+          remaining.push(`${kind.toLowerCase()}/${value.metadata.name}`);
+    return remaining;
+  }
+  /**
+   * R5: delete the RoleBindings to the tenant-operator ClusterRoles (under both policies, so a
+   * re-created Tenant starts clean), then `di-operator-<t>`.
+   */
+  private async removalOperator(tenant: Tenant): Promise<string[]> {
+    const t = tenant.metadata.name;
+    const bindings = async () =>
+      (
+        await this.list<Resource>('rbac.authorization.k8s.io/v1', 'RoleBinding', {
+          [INSTALLATION]: this.cfg.installation,
+          [TENANT]: t,
+        })
+      ).filter(bindsTenantOperatorRole);
+    for (const binding of await bindings()) await this.remove(binding);
+    const remaining = (await bindings()).map(
+      (b) => `rolebinding/${b.metadata.namespace}/${b.metadata.name}`,
+    );
+    if (remaining.length) return remaining;
+    const ns = operatorNamespace(t);
+    if (await this.removeOwnedNamespace(tenant, ns)) remaining.push(`namespace/${ns}`);
+    return remaining;
+  }
+  /** R6: under `Delete`, delete the tenant's namespaces as before; `Retain` keeps them. */
+  private async removalNamespaces(tenant: Tenant): Promise<string[]> {
+    if (tenant.spec.deletionPolicy !== 'Delete') return [];
+    const n = names(tenant.metadata.name);
+    const remaining: string[] = [];
+    for (const name of [n.namespace, n.runtimeNamespace, n.apiKeysNamespace])
+      if (await this.removeOwnedNamespace(tenant, name)) remaining.push(`namespace/${name}`);
+    return remaining;
+  }
+  /** Deletes namespace `name` if it exists and this Tenant owns it; true while it exists. */
+  private async removeOwnedNamespace(tenant: Tenant, name: string): Promise<boolean> {
+    const namespace = await this.get<Resource>(`${collection('v1', 'Namespace')}/${name}`);
+    if (!namespace) return false;
+    if (
+      namespace.metadata.labels?.[OWNER] !== tenant.metadata.uid ||
+      namespace.metadata.labels?.[INSTALLATION] !== this.cfg.installation
+    )
+      throw new Error(`Refusing to delete foreign namespace ${name}`);
+    await this.remove(namespace);
+    return true;
   }
   /**
    * What {@link tenantAuthResources} needs from the cluster: the tenant's members (from
@@ -1017,73 +1199,15 @@ export class Controller {
     if (!tenant.metadata.deletionTimestamp) await this.finalizer(tenant, true);
     const n = names(tenant.metadata.name);
     if (tenant.spec.suspended || tenant.metadata.deletionTimestamp)
-      await this.revoke({ [TENANT]: tenant.metadata.name });
+      // S1: the tenant operator keeps its RoleBindings until removal step R5 (design-541 §4.5).
+      await this.revoke({ [TENANT]: tenant.metadata.name }, (binding) =>
+        isTenantOperatorBinding(binding, tenant.metadata.name),
+      );
     // Namespace deletion does not reach the cluster-scoped and platform-namespace RBAC.
     if (tenant.metadata.deletionTimestamp) {
       this.tenantAuthClean = false;
       await this.removeTenantAuth(tenant);
-    }
-    if (tenant.metadata.deletionTimestamp && tenant.spec.deletionPolicy === 'Delete') {
-      let remaining = false;
-      for (const name of [n.namespace, n.runtimeNamespace, n.apiKeysNamespace]) {
-        const namespace = await this.get<Resource>(`${collection('v1', 'Namespace')}/${name}`);
-        if (!namespace) continue;
-        if (
-          namespace.metadata.labels?.[OWNER] !== tenant.metadata.uid ||
-          namespace.metadata.labels?.[INSTALLATION] !== this.cfg.installation
-        )
-          throw new Error(`Refusing to delete foreign namespace ${name}`);
-        await this.remove(namespace);
-        remaining = true;
-      }
-      if (!remaining) await this.finalizer(tenant, false);
-      return;
-    }
-    if (tenant.metadata.deletionTimestamp) {
-      let stopped = true;
-      const deployments = await this.list<Resource>('apps/v1', 'Deployment', {
-        [INSTALLATION]: this.cfg.installation,
-        [OWNER]: tenant.metadata.uid!,
-      });
-      for (const deployment of deployments) {
-        const updated = await this.api.call<Resource>(
-          'PATCH',
-          `${location(deployment)}?fieldManager=di-platform-controller`,
-          {
-            metadata: { resourceVersion: deployment.metadata.resourceVersion },
-            spec: { replicas: 0 },
-          },
-          'application/merge-patch+json',
-        );
-        const status = updated.status as
-          | { observedGeneration?: number; replicas?: number }
-          | undefined;
-        stopped &&=
-          status?.observedGeneration === updated.metadata.generation &&
-          (status?.replicas ?? 0) === 0;
-      }
-      // `status.replicas` leaves out terminating pods, so also wait for the live host pods to
-      // be gone (#245). The wasmCloud operator clears their pod-host finalizer only while it
-      // watches the runtime namespace, and the next `up` stops watching it once this Tenant is
-      // gone. The list is read-only and scoped to this tenant's runtime namespace and hostgroup.
-      if (!stopped) return;
-      const pods = await this.liveHostPods(n);
-      if (pods.length > 0) {
-        // Sorted, so the message (and the status write) only changes when the pods do.
-        const shown = pods
-          .map((pod) => pod.metadata.name)
-          .sort((a, b) => a.localeCompare(b))
-          .slice(0, 5);
-        if (pods.length > shown.length) shown.push(`and ${pods.length - shown.length} more`);
-        await this.status(
-          tenant,
-          false,
-          'WaitingForHostPods',
-          `Retain: waiting for host pods in ${n.runtimeNamespace} to be gone before removing the Tenant: ${shown.join(', ')}`,
-        );
-        return;
-      }
-      await this.finalizer(tenant, false);
+      await this.removeTenant(tenant);
       return;
     }
     for (const name of [n.namespace, n.runtimeNamespace, n.apiKeysNamespace]) {

@@ -298,6 +298,11 @@ const RBAC_OWNERS = [
   'controller:Controller.ensure',
   'controller:Controller.revoke',
   'controller:Controller.reconcileUser',
+  // Read-only matches of the tenant operator's bindings to its fixed ClusterRoles, which revoke
+  // keeps and removal step R5 deletes (#541 m5, design-541 §4.5).
+  'removal-sequence:bindsTenantOperatorRole',
+  'removal-sequence:isTenantOperatorBinding',
+  'controller:Controller.removalOperator',
   // The kinds of the leftover log reader that pruneLogReader deletes when this installation owns it.
   'controller:LOG_READER_KINDS',
 ];
