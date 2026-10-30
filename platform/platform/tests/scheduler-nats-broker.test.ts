@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { SCHEDULER_NATS_IMAGE, schedulerNatsServerConfig } from '../src/scheduler-nats-server';
 import { type AccountsRender, renderSchedulerAccounts } from '../src/tenancy/scheduler-nats';
 import {
   type IdentityRecord,
@@ -41,8 +42,7 @@ import { opensslClientPair } from './support/tls';
  * `scheduler-nats-broker` job in .github/workflows/ci.yml); plain `bun test` skips it.
  * CONTAINER_RUNTIME picks the runtime; docker is the default when it is on PATH.
  */
-const SCHEDULER_NATS_TEST_IMAGE =
-  'docker.io/library/nats:2.12.8-alpine@sha256:6b2156f7491cdeddfa8b7ca15cd6fd59b9cabadec5019e933c65c01cf82b1c5f';
+const SCHEDULER_NATS_TEST_IMAGE = SCHEDULER_NATS_IMAGE;
 
 const enabled = process.env.SCHEDULER_NATS_BROKER === '1';
 const runtime = !enabled
@@ -52,18 +52,13 @@ const runtime = !enabled
 const server = `scheduler-nats-broker-${randomBytes(4).toString('hex')}`;
 const DIR = '/tmp/nats';
 const ACCOUNTS = `${DIR}/accounts/accounts.conf`;
-const SERVER_CONF = `port: 4222
-debug: true
-pid_file: "/tmp/nats.pid"
-tls {
-  cert_file: "${DIR}/server.crt"
-  key_file: "${DIR}/server.key"
-  ca_file: "${DIR}/ca.crt"
-  verify_and_map: true
-}
-jetstream { store_dir: "/tmp/js" }
-include "accounts/accounts.conf"
-`;
+/** The rendered production config (m6b), with debug logging and the container's paths. */
+const SERVER_CONF = `debug: true\n${schedulerNatsServerConfig()
+  .replace('/var/run/nats/nats.pid', '/tmp/nats.pid')
+  .replace('/nats-cert/tls.crt', `${DIR}/server.crt`)
+  .replace('/nats-cert/tls.key', `${DIR}/server.key`)
+  .replace('/nats-cert/ca.crt', `${DIR}/ca.crt`)
+  .replace('/data/jetstream', '/tmp/js')}`;
 
 function container(args: string[], env: Record<string, string> = {}) {
   const child = spawnSync(runtime, args, {

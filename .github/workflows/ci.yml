@@ -386,7 +386,7 @@ jobs:
         env:
           SCHEDULER_NATS_BROKER: '1'
           CONTAINER_RUNTIME: docker
-        run: bun test platform/platform/tests/scheduler-nats-broker.test.ts
+        run: bun test platform/platform/tests/scheduler-nats-broker.test.ts platform/platform/tests/scheduler-nats-server.test.ts
 
   # The required check: green only when every job above is.
   build-and-test:

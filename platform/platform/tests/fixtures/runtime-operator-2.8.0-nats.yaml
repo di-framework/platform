@@ -1,0 +1,205 @@
+# The `nats` objects of `helm template wasmcloud <chart> --namespace wasmcloud` for the
+# runtime-operator chart 2.8.0 with default values, copied verbatim (biome reformats only quotes,
+# trailing whitespace and list indentation) from
+# `helm pull oci://ghcr.io/wasmcloud/charts/runtime-operator --version 2.8.0`
+# (chart digest sha256:63e87326539df1146bf2fe9f12982d4eb5cfb4704252067d4a6932478bb34912).
+# The platform-owned server (#541 m6b) keeps the Service and pod labels identical.
+# Source: runtime-operator/templates/nats/networkpolicy.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nats
+  namespace: wasmcloud
+  labels:
+    wasmcloud.com/name: nats
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+spec:
+  podSelector:
+    matchLabels:
+      wasmcloud.com/name: nats
+  policyTypes:
+    - Ingress
+  ingress:
+    # Client connections from the operator, host runtimes, and the gateway.
+    - ports:
+        - port: 4222
+          protocol: TCP
+
+---
+# Source: runtime-operator/templates/nats/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wasmcloud-runtime-operator-nats
+  namespace: wasmcloud
+  labels:
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+automountServiceAccountToken: false
+
+---
+# Source: runtime-operator/templates/nats/config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats
+  namespace: wasmcloud
+  labels:
+    wasmcloud.com/name: nats
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+data:
+  nats-server.conf: |
+    port: 4222
+    jetstream {
+      # Writable emptyDir (see nats/deployment.yaml) so JetStream works under a
+      # read-only root filesystem.
+      store_dir: "/data/jetstream"
+    }
+    tls {
+      cert_file: /nats-cert/tls.crt
+      key_file: /nats-cert/tls.key
+      ca_file: /nats-cert/ca.crt
+      verify_and_map: true
+    }
+
+    authorization {
+      users = [
+        { user: "wasmcloud-operator" },
+        { user: "wasmcloud-runtime" },
+        { user: "wasmcloud-data" }
+      ]
+    }
+---
+# Source: runtime-operator/templates/nats/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  namespace: wasmcloud
+  labels:
+    wasmcloud.com/name: nats
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+spec:
+  selector:
+    wasmcloud.com/name: nats
+  type: ClusterIP
+  ports:
+    - port: 4222
+      targetPort: tcp-nats
+      protocol: TCP
+      name: tcp-nats
+---
+# Source: runtime-operator/templates/nats/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats
+  namespace: wasmcloud
+  labels:
+    wasmcloud.com/name: nats
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      wasmcloud.com/name: nats
+  template:
+    metadata:
+      labels:
+        wasmcloud.com/name: nats
+        helm.sh/chart: runtime-operator-2.8.0
+        app.kubernetes.io/name: runtime-operator
+        app.kubernetes.io/instance: wasmcloud
+        app.kubernetes.io/version: '2.8.0'
+        app.kubernetes.io/managed-by: Helm
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: nats-config
+          configMap:
+            name: nats
+        # Writable scratch dir so the container can run with a read-only root fs.
+        - name: tmp
+          emptyDir: {}
+        # JetStream store dir (see nats/config.yaml store_dir).
+        - name: jetstream
+          emptyDir: {}
+        - name: nats-cert
+          secret:
+            secretName: wasmcloud-nats-tls
+      serviceAccountName: wasmcloud-runtime-operator-nats
+
+      containers:
+        - name: nats
+          image: docker.io/nats:2.12.8-alpine
+          args:
+            - '-DV'
+            - '-c'
+            - '/nats-config/nats-server.conf'
+          imagePullPolicy: Always
+          volumeMounts:
+            - name: nats-config
+              mountPath: /nats-config
+            - name: tmp
+              mountPath: /tmp
+            - name: jetstream
+              mountPath: /data/jetstream
+            - name: nats-cert
+              mountPath: /nats-cert
+          ports:
+            - name: tcp-nats
+              containerPort: 4222
+          livenessProbe:
+            tcpSocket:
+              port: tcp-nats
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: tcp-nats
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            limits:
+              memory: 128Mi
+            requests:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 0
+---
