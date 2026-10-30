@@ -96,22 +96,16 @@ describe('runtime-operator version and image pin', () => {
     );
   });
 
-  it('ignores any chart version a caller passes alongside the config (m6a)', () => {
-    const overridden = render({ ...cfg, chartVersion: '2.9.0' } as typeof cfg);
-    const deployment = overridden.find((o) => o.kind === 'Deployment') as unknown as {
-      spec: { template: { spec: PodSpec } };
-    };
-    expect(deployment.spec.template.spec.containers[0]?.image).toBe(
-      runtimeOperatorImage(WASMCLOUD_OPERATOR_VERSION),
-    );
-  });
-
   it('installs the chart at the same constant', () => {
     const index = readFileSync(path.join(import.meta.dir, '../src/index.ts'), 'utf8');
     expect(index).toContain(
       "import { WASMCLOUD_OPERATOR_VERSION } from './tenancy/tenant-operator'",
     );
-    expect(index).toContain('version: args.chartVersion ?? WASMCLOUD_OPERATOR_VERSION');
+    expect(index).toContain(
+      "chart: 'oci://ghcr.io/wasmcloud/charts/runtime-operator',\n      version: WASMCLOUD_OPERATOR_VERSION,",
+    );
+    // No option overrides the pinned chart (#541 m6a).
+    expect(index).not.toMatch(/chartVersion|args\.chart\b/);
     expect(index).not.toMatch(/const WASMCLOUD_OPERATOR_VERSION/);
   });
 });
@@ -515,6 +509,15 @@ describe('tenant-operator binding admission (#541 m3 W1)', () => {
         for (const username of [CONTROLLER, ADMIN])
           expect(rb(ns, binding(role), username, undefined, bad)).toBe(false);
     }
+  });
+
+  it('names the required namespace labels in the denial message (m6a)', () => {
+    expect(policyFor('rolebindings').spec.validations[0]?.message).toBe(
+      'The tenant-operator ClusterRoles may only be bound by a RoleBinding in the tenant namespace ' +
+        'of their kind, labelled platform.di-framework.dev/installation=<installation> and ' +
+        'platform.di-framework.dev/tenant=<tenant>, to the ServiceAccount runtime-operator in ' +
+        'di-operator-<tenant> of the same tenant',
+    );
   });
 
   it('refuses any subject but the same tenant operator ServiceAccount', () => {

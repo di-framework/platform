@@ -348,7 +348,9 @@ export const TENANT_OPERATOR_BINDING_PREFIXES: Readonly<Record<TenantOperatorSco
 };
 export const TENANT_OPERATOR_BINDING_MESSAGE =
   'The tenant-operator ClusterRoles may only be bound by a RoleBinding in the tenant namespace of ' +
-  'their kind, to the ServiceAccount runtime-operator in di-operator-<tenant> of the same tenant';
+  'their kind, labelled ' +
+  `${INSTALLATION}=<installation> and ${TENANT}=<tenant>, ` +
+  'to the ServiceAccount runtime-operator in di-operator-<tenant> of the same tenant';
 export const TENANT_OPERATOR_CLUSTER_ROLE_MESSAGE =
   'The platform controller may not create, change or delete the tenant-operator ClusterRoles';
 

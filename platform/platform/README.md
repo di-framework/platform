@@ -699,12 +699,11 @@ kubectl delete namespace di-tenant-alpha di-runtime-alpha di-apikeys-alpha
 ## Existing-cluster configuration
 
 `kubeconfig` is required (a local file path); `context`, `namespace`, `release`,
-`chart`, `chartVersion`, `httpNodePort`, `timeoutSeconds`, `insecureRegistry`, `insecureRegistries`,
+`httpNodePort`, `timeoutSeconds`, `insecureRegistry`, `insecureRegistries`,
 `storageRoot`, `networkPolicyEngine`, `kubernetesEndpoint`, `httpEndpoint`, `routeUrlPattern`,
 `egressAllowedDestinations`, `routeAliases` (see [Gateway route aliases](#gateway-route-aliases)),
 `runtimeNats` (see [Runtime NATS storage caps](#runtime-nats-storage-caps)),
-and administrator `values` are optional (`chartVersion` may only be the runtime-operator version
-whose image the package pins, `2.8.0`). `tenants`, `users`,
+and administrator `values` are optional. `tenants`, `users`,
 `tenantHostImage`, and `tenantHostImagePullPolicy` use the same declarations as the
 local entrypoint. NodePort zero (the default here) makes the HTTP gateway ClusterIP, and its
 NetworkPolicy then admits only the platform and tenant namespaces (#457): an ingress controller

@@ -62,8 +62,6 @@ export interface PlatformArgs {
   config?: pulumi.Config;
   namespace?: string;
   release?: string;
-  chart?: string;
-  chartVersion?: string;
   timeoutSeconds?: number;
   httpNodePort?: number;
   registry?: boolean;
@@ -171,12 +169,6 @@ export function validatePlatformConfig(args: PlatformConfigArgs): ValidatedPlatf
   const config = args.config ?? new pulumi.Config();
   const declared = declarations(config);
   const namespace = args.namespace ?? 'wasmcloud';
-  // The tenant operators run the image pinned for WASMCLOUD_OPERATOR_VERSION; a chart at another
-  // version would run a different operator beside them (#541 m6a).
-  if (args.chartVersion !== undefined && args.chartVersion !== WASMCLOUD_OPERATOR_VERSION)
-    throw new Error(
-      `chartVersion must be ${WASMCLOUD_OPERATOR_VERSION}, the runtime-operator version whose image is pinned (got ${args.chartVersion})`,
-    );
   // Throws when `<namespace>-scheduler-pki` is not a valid namespace name (#541).
   schedulerPkiNamespace(namespace);
   const warnings: string[] = [];
@@ -393,8 +385,9 @@ export function createPlatform(args: PlatformArgs) {
       name: args.release ?? 'wasmcloud',
       namespace: namespaceName,
       createNamespace: false,
-      chart: args.chart ?? 'oci://ghcr.io/wasmcloud/charts/runtime-operator',
-      version: args.chartVersion ?? WASMCLOUD_OPERATOR_VERSION,
+      // Always the pinned version, whose operator image the tenant operators run (#541 m6a).
+      chart: 'oci://ghcr.io/wasmcloud/charts/runtime-operator',
+      version: WASMCLOUD_OPERATOR_VERSION,
       atomic: true,
       cleanupOnFail: true,
       timeout: args.timeoutSeconds ?? 600,
