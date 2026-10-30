@@ -295,3 +295,142 @@ describe('UserProvidedServiceInfoCreator', () => {
     expect(creator.accept({ name: 'orphan', label: '', credentials: {} })).toBe(true);
   });
 });
+
+describe('AmqpServiceInfoCreator edge cases', () => {
+  const creator = new AmqpServiceInfoCreator();
+
+  it('reads the url credential when uris and uri are absent', () => {
+    const info = creator.createServiceInfo({
+      name: 'mq',
+      label: 'rabbitmq',
+      credentials: { url: 'amqp://u:p@mq.internal:5673/vh' },
+    });
+    expect(info.uri).toBe('amqp://u:p@mq.internal:5673/vh');
+    expect(info.host).toBe('mq.internal');
+    expect(info.port).toBe(5673);
+    expect(info.virtualHost).toBe('vh');
+  });
+
+  it('uses the tls flag when ssl is absent and leaves ssl unset otherwise', () => {
+    const withTls = creator.createServiceInfo({
+      name: 'mq',
+      label: 'rabbitmq',
+      credentials: { hostname: 'h', tls: true },
+    });
+    expect(withTls.ssl).toBe(true);
+
+    const sslWins = creator.createServiceInfo({
+      name: 'mq',
+      label: 'rabbitmq',
+      credentials: { hostname: 'h', ssl: false, tls: true },
+    });
+    expect(sslWins.ssl).toBe(false);
+
+    const neither = creator.createServiceInfo({
+      name: 'mq',
+      label: 'rabbitmq',
+      credentials: { hostname: 'h' },
+    });
+    expect(neither.ssl).toBeUndefined();
+  });
+
+  it('keeps discrete credentials when the URI cannot be parsed', () => {
+    const info = creator.createServiceInfo({
+      name: 'mq',
+      label: 'rabbitmq',
+      credentials: { uri: 'not a url', hostname: 'fallback-host', port: 1234 },
+    });
+    expect(info.host).toBe('fallback-host');
+    expect(info.port).toBe(1234);
+  });
+});
+
+describe('BlobStorageServiceInfoCreator edge cases', () => {
+  const creator = new BlobStorageServiceInfoCreator();
+
+  it('reads aws_secret_access_key and camelCase pathStyle', () => {
+    const info = creator.createServiceInfo({
+      name: 's3',
+      label: 's3',
+      credentials: { bucket: 'b', aws_secret_access_key: 'shh', pathStyle: true },
+    });
+    expect(info.secretAccessKey).toBe('shh');
+    expect(info.pathStyle).toBe(true);
+  });
+
+  it('keeps discrete credentials when an s3:// URI cannot be parsed', () => {
+    const info = creator.createServiceInfo({
+      name: 's3',
+      label: 's3',
+      credentials: { bucket: 'kept', uri: 's3://bad host/x' },
+    });
+    expect(info.bucketName).toBe('kept');
+    expect(info.uri).toBe('s3://bad host/x');
+  });
+
+  it('prefixes https:// to a bare endpoint when building the URI', () => {
+    const info = creator.createServiceInfo({
+      name: 's3',
+      label: 's3',
+      credentials: { bucket: 'b', endpoint: 'minio.internal:9000' },
+    });
+    expect(info.uri).toBe('https://minio.internal:9000/b');
+  });
+});
+
+describe('RedisServiceInfoCreator edge cases', () => {
+  const creator = new RedisServiceInfoCreator();
+
+  it('uses the ssl flag when tls is absent', () => {
+    const info = creator.createServiceInfo({
+      name: 'cache',
+      label: 'redis',
+      credentials: { host: 'r', ssl: true },
+    });
+    expect(info.tls).toBe(true);
+  });
+
+  it('keeps discrete credentials when the URI cannot be parsed', () => {
+    const info = creator.createServiceInfo({
+      name: 'cache',
+      label: 'redis',
+      credentials: { uri: 'not a url', host: 'fallback-host', port: 6380 },
+    });
+    expect(info.host).toBe('fallback-host');
+    expect(info.port).toBe(6380);
+  });
+});
+
+describe('RelationalServiceInfoCreator edge cases', () => {
+  const creator = new RelationalServiceInfoCreator();
+
+  it('reads sslmode=require from a JDBC URI', () => {
+    const info = creator.createServiceInfo({
+      name: 'db',
+      label: 'postgresql',
+      credentials: { uri: 'jdbc:postgresql://pg.internal:5432/app?sslmode=require' },
+    });
+    expect(info.host).toBe('pg.internal');
+    expect(info.ssl).toBe(true);
+  });
+
+  it('keeps discrete credentials when a JDBC URI cannot be parsed', () => {
+    const info = creator.createServiceInfo({
+      name: 'db',
+      label: 'postgresql',
+      credentials: { uri: 'jdbc:not a url', hostname: 'fallback-host', port: 6543 },
+    });
+    expect(info.host).toBe('fallback-host');
+    expect(info.port).toBe(6543);
+  });
+
+  it('keeps discrete credentials when a plain URI cannot be parsed', () => {
+    const info = creator.createServiceInfo({
+      name: 'db',
+      label: 'postgresql',
+      credentials: { uri: 'not a url', hostname: 'fallback-host', port: 6543 },
+    });
+    expect(info.host).toBe('fallback-host');
+    expect(info.port).toBe(6543);
+  });
+});
