@@ -101,7 +101,8 @@ export const PKI_RETRY_BUDGET_MS = 120_000;
 /**
  * Retries each call on a transient error (#583). Every other error, such as 403, 404 or 409,
  * passes on at once, so create-if-missing stays as it is: a create retried after an ambiguous
- * failure that did land gets 409, and the bootstrap then reads and keeps what is there.
+ * failure that did land gets 409, which fails this pod; the next Job pod reads and keeps what is
+ * there. Each retry logs one line: method, path without query, error class, attempt and wait.
  */
 export class RetryingApi implements PkiApi {
   constructor(
@@ -109,11 +110,13 @@ export class RetryingApi implements PkiApi {
     private readonly sleep: (ms: number) => Promise<void> = (ms) =>
       new Promise((resolve) => setTimeout(resolve, ms)),
     private readonly now: () => number = Date.now,
+    private readonly log: (line: string) => void = console.log,
   ) {}
   async call<T>(method: string, path: string, body?: unknown): Promise<T> {
     const started = this.now();
+    const route = `${method} ${path.split('?')[0]}`;
     let delay = PKI_RETRY_FIRST_DELAY_MS;
-    for (;;) {
+    for (let attempt = 1; ; attempt++) {
       try {
         return await this.api.call<T>(method, path, body);
       } catch (error) {
@@ -121,8 +124,9 @@ export class RetryingApi implements PkiApi {
         if (kind === undefined) throw error;
         if (this.now() - started + delay > PKI_RETRY_BUDGET_MS)
           throw new Error(
-            `${method} ${path.split('?')[0]} still failing with ${kind} after ${Math.round((this.now() - started) / 1000)} s of retries`,
+            `${route} still failing with ${kind} after ${Math.round((this.now() - started) / 1000)} s of retries`,
           );
+        this.log(`retrying ${route} after ${kind} (attempt ${attempt}) in ${delay} ms`);
         await this.sleep(delay);
         delay = Math.min(delay * 2, PKI_RETRY_MAX_DELAY_MS);
       }

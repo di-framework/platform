@@ -876,10 +876,19 @@ describe('scheduler-pki connection retry (#583)', () => {
     const refusing = new RefusingApi(store, 5);
     const c = clock();
     const lines: string[] = [];
-    await main(new RetryingApi(refusing, c.sleep, c.now), JSON.stringify(config), (l) =>
-      lines.push(l),
+    const retries: string[] = [];
+    await main(
+      new RetryingApi(refusing, c.sleep, c.now, (l) => retries.push(l)),
+      JSON.stringify(config),
+      (l) => lines.push(l),
     );
     expect(c.waits).toEqual([250, 500, 1000, 2000, 4000]);
+    // One line per retry: method, path without query, class, attempt and wait; nothing else.
+    expect(retries).toHaveLength(5);
+    expect(retries[0]).toMatch(
+      /^retrying GET \/api\/v1\/[^?\s]+ after ECONNREFUSED \(attempt 1\) in 250 ms$/,
+    );
+    expect(retries[4]).toMatch(/ after ECONNREFUSED \(attempt 5\) in 4000 ms$/);
     expect(lines.at(-1)).toBe('scheduler PKI ready (7 written)');
     // The same calls, each once, as a run that was never refused.
     const plain = new FakeApi();
@@ -891,7 +900,12 @@ describe('scheduler-pki connection retry (#583)', () => {
   it('caps the backoff at 5 s and gives up after the budget with the error class', async () => {
     const store = new FakeApi();
     const c = clock();
-    const api = new RetryingApi(new RefusingApi(store, Number.POSITIVE_INFINITY), c.sleep, c.now);
+    const api = new RetryingApi(
+      new RefusingApi(store, Number.POSITIVE_INFINITY),
+      c.sleep,
+      c.now,
+      () => {},
+    );
     const error = (await main(api, JSON.stringify(config), () => {}).catch(
       (e: Error) => e,
     )) as Error;
@@ -908,7 +922,7 @@ describe('scheduler-pki connection retry (#583)', () => {
     const refusing = new RefusingApi(new FakeApi(), 1, 403);
     const c = clock();
     await expect(
-      main(new RetryingApi(refusing, c.sleep, c.now), JSON.stringify(config), () => {}),
+      main(new RetryingApi(refusing, c.sleep, c.now, () => {}), JSON.stringify(config), () => {}),
     ).rejects.toMatchObject({ code: 403 });
     expect(refusing.attempts).toBe(1);
     expect(c.waits).toEqual([]);
@@ -917,9 +931,13 @@ describe('scheduler-pki connection retry (#583)', () => {
   it('waits on the real clock by default', async () => {
     const refusing = new RefusingApi(new FakeApi(), 1, 'ECONNRESET');
     const started = Date.now();
-    await new RetryingApi(refusing).call('POST', `/api/v1/namespaces/${PKI}/configmaps`, {
-      metadata: { name: 'x' },
-    });
+    await new RetryingApi(refusing, undefined, undefined, () => {}).call(
+      'POST',
+      `/api/v1/namespaces/${PKI}/configmaps`,
+      {
+        metadata: { name: 'x' },
+      },
+    );
     expect(Date.now() - started).toBeGreaterThanOrEqual(200);
     expect(refusing.attempts).toBe(2);
   });

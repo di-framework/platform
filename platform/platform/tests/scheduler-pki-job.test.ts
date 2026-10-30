@@ -8,7 +8,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadSchedulerPkiScripts } from '../src/scheduler-pki-bootstrap';
 import { SCHEDULER_PKI_MODULES } from '../src/tenancy/scheduler-pki';
-import { InClusterApi, PkiApiError, reportFailure } from '../src/tenancy/scheduler-pki-job';
+import {
+  InClusterApi,
+  main,
+  PkiApiError,
+  RetryingApi,
+  reportFailure,
+  transientClass,
+} from '../src/tenancy/scheduler-pki-job';
 
 const distTenancy = join(import.meta.dir, '..', 'dist', 'tenancy');
 
@@ -132,12 +139,77 @@ describe('scheduler PKI in-cluster API', () => {
     ] as const) {
       const t = transport(200, '', failure);
       try {
-        await expect(new InClusterApi().call('GET', '/api/v1')).rejects.toThrow(message);
+        const error = await new InClusterApi().call('GET', '/api/v1').catch((e: Error) => e);
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toBe(message);
+        // A timed-out request carries the code that makes it retryable (#583).
+        if (failure === 'timeout') expect(transientClass(error)).toBe('ETIMEDOUT');
       } finally {
         t.restore();
       }
     }
   });
+
+  it('retries a timed-out request until the budget runs out', async () => {
+    const t = transport(200, '', 'timeout');
+    let now = 0;
+    const retries: string[] = [];
+    try {
+      const api = new RetryingApi(
+        new InClusterApi(),
+        async (ms) => {
+          now += ms;
+        },
+        () => now,
+        (line) => retries.push(line),
+      );
+      await expect(api.call('GET', '/api/v1/x?q=1')).rejects.toThrow(
+        /^GET \/api\/v1\/x still failing with ETIMEDOUT after \d+ s of retries$/,
+      );
+      expect(retries[0]).toBe('retrying GET /api/v1/x after ETIMEDOUT (attempt 1) in 250 ms');
+    } finally {
+      t.restore();
+    }
+  });
+});
+
+it('main retries by default: a refused first connection is retried before the run goes on', async () => {
+  spyOn(fs, 'readFileSync').mockImplementation((() => 'x') as unknown as typeof fs.readFileSync);
+  const log = spyOn(console, 'log').mockImplementation(() => {});
+  let requests = 0;
+  const request = spyOn(https, 'request').mockImplementation(((
+    _opts: https.RequestOptions,
+    callback: (res: IncomingMessage) => void,
+  ) => {
+    const n = ++requests;
+    const req = Object.assign(new EventEmitter(), {
+      setTimeout: () => {},
+      end: () => {
+        if (n === 1)
+          return req.emit(
+            'error',
+            Object.assign(new Error('connect ECONNREFUSED 10.0.0.1:443'), { code: 'ECONNREFUSED' }),
+          );
+        // Then a status that is not retried, so the run stops at once.
+        const res = Object.assign(new EventEmitter(), { statusCode: 403, setEncoding: () => {} });
+        callback(res as unknown as IncomingMessage);
+        res.emit('end');
+      },
+    });
+    return req;
+  }) as unknown as typeof https.request);
+  try {
+    const config = JSON.stringify({ installation: 'di', namespace: 'wasmcloud' });
+    await expect(main(undefined, config, () => {})).rejects.toMatchObject({ code: 403 });
+    expect(requests).toBe(2);
+    expect(log.mock.calls[0]?.[0]).toMatch(
+      /^retrying GET \S+ after ECONNREFUSED \(attempt 1\) in 250 ms$/,
+    );
+  } finally {
+    (fs.readFileSync as unknown as { mockRestore(): void }).mockRestore();
+    log.mockRestore();
+    request.mockRestore();
+  }
 });
 
 it('reports a failed run with its message and exit code 1', () => {
