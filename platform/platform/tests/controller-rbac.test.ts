@@ -5,8 +5,11 @@ import { MEMBERS_CONFIG, publishedMembers } from '../../tenant-auth/src/kube';
 import { admissionResources } from '../src/tenancy/admission';
 import { type Api, ApiError, Controller, collection } from '../src/tenancy/controller';
 import {
+  AGGREGATE_LABEL_PREFIX,
+  CONTROLLER_CLUSTER_RBAC_MESSAGE,
   CONTROLLER_SCRIPT_MODULES,
   type ControllerClusterRoleRule,
+  controllerClusterRbacPolicies,
   controllerClusterRoleRules,
   controllerNamespaceRoleRules,
 } from '../src/tenancy/install';
@@ -31,6 +34,7 @@ import {
   tenantOperatorResources,
 } from '../src/tenancy/tenant-operator';
 import { caCertificate, leafCertificate } from '../src/tenancy/tls';
+import { evaluate } from './support/cel';
 
 // #115: the platform controller writes tenant RBAC without `escalate` and binds only named Roles.
 // Everything below is computed from the objects the controller renders, so a new Role, binding
@@ -1204,5 +1208,170 @@ describe('platform controller RBAC at runtime (#321)', () => {
     );
     const alpha = written.findLast((o) => ref(o) === 'ClusterRole /di-tenant-controller-alpha');
     expect(rulesOf(alpha as Resource).every((rule) => covers(cluster, rule))).toBe(false);
+  });
+});
+
+// #586: the controller's ClusterRole cannot name the per-tenant ClusterRoles and bindings it
+// writes, so admission limits its writes of either kind to `di-tenant-controller-<t>` objects of
+// its own installation.
+describe('controller ClusterRole and ClusterRoleBinding writes (#586)', () => {
+  type Policy = {
+    kind: string;
+    metadata: { name: string; labels: Record<string, string> };
+    spec: {
+      failurePolicy: string;
+      matchConstraints: { resourceRules: { operations: string[]; resources: string[] }[] };
+      matchConditions: { name: string; expression: string }[];
+      validations: { expression: string; message: string }[];
+    };
+  };
+  const all = controllerClusterRbacPolicies('test', 'wasmcloud') as unknown as Policy[];
+  const policies = all.filter((p) => p.kind === 'ValidatingAdmissionPolicy');
+  const CONTROLLER = 'system:serviceaccount:wasmcloud:di-platform-controller';
+  const ADMIN = 'kubernetes-admin';
+  const plural = { ClusterRole: 'clusterroles', ClusterRoleBinding: 'clusterrolebindings' };
+  type Kind = keyof typeof plural;
+  /** Evaluates the policy for `kind` as the API server does. */
+  const admit = (
+    kind: Kind,
+    operation: 'CREATE' | 'UPDATE' | 'DELETE',
+    name: string,
+    object: unknown,
+    oldObject: unknown,
+    username = CONTROLLER,
+  ): boolean => {
+    const policy = policies.find((p) =>
+      p.spec.matchConstraints.resourceRules.some((r) => r.resources.includes(plural[kind])),
+    ) as Policy;
+    const ctx = {
+      request: { operation, name, userInfo: { username } },
+      object: operation === 'DELETE' ? null : object,
+      oldObject: operation === 'CREATE' ? null : oldObject,
+    };
+    if (!policy.spec.matchConditions.every((c) => evaluate(c.expression, ctx) === true))
+      return true;
+    return policy.spec.validations.every((v) => evaluate(v.expression, ctx) === true);
+  };
+  const writes = (kind: Kind, o: unknown, username?: string) =>
+    (['CREATE', 'UPDATE', 'DELETE'] as const).map((op) =>
+      admit(kind, op, (o as Resource).metadata.name, o, o, username),
+    );
+  const cluster = rendered(['alpha', 'beta']).filter(
+    (o) => o.kind === 'ClusterRole' || o.kind === 'ClusterRoleBinding',
+  );
+
+  it('has one Deny-bound, fail-closed policy per kind for every write', () => {
+    expect(policies.map((p) => p.metadata.name)).toEqual([
+      'test-controller-clusterroles',
+      'test-controller-clusterrolebindings',
+    ]);
+    for (const p of policies) {
+      expect(p.spec.failurePolicy).toBe('Fail');
+      expect(p.metadata.labels).toEqual({ [INSTALLATION]: 'test' });
+      expect(p.spec.matchConstraints.resourceRules[0]?.operations).toEqual([
+        'CREATE',
+        'UPDATE',
+        'DELETE',
+      ]);
+      expect(p.spec.validations[0]?.message).toBe(CONTROLLER_CLUSTER_RBAC_MESSAGE);
+    }
+    expect(
+      all
+        .filter((p) => p.kind === 'ValidatingAdmissionPolicyBinding')
+        .map((b) => (b.spec as unknown as { policyName: string }).policyName),
+    ).toEqual(policies.map((p) => p.metadata.name));
+  });
+
+  it('admits every ClusterRole and ClusterRoleBinding the controller renders', () => {
+    expect([...new Set(cluster.map((o) => `${o.kind}/${o.metadata.name}`))].sort()).toEqual([
+      'ClusterRole/di-tenant-controller-alpha',
+      'ClusterRole/di-tenant-controller-beta',
+      'ClusterRoleBinding/di-tenant-controller-alpha',
+      'ClusterRoleBinding/di-tenant-controller-beta',
+    ]);
+    for (const o of cluster) expect(writes(o.kind as Kind, o)).toEqual([true, true, true]);
+  });
+
+  it('refuses the controller any write of a built-in or foreign ClusterRole', () => {
+    for (const name of ['cluster-admin', 'edit', 'admin', 'view', 'test-controller']) {
+      const metadata = { name, labels: { 'kubernetes.io/bootstrapping': 'rbac-defaults' } };
+      const crb = { metadata, roleRef: { apiGroup: RBAC_GROUP, kind: 'ClusterRole', name } };
+      expect(writes('ClusterRole', { metadata })).toEqual([false, false, false]);
+      expect(writes('ClusterRoleBinding', crb)).toEqual([false, false, false]);
+      // Other users are left to RBAC.
+      expect(writes('ClusterRole', { metadata }, ADMIN)).toEqual([true, true, true]);
+    }
+  });
+
+  it('refuses a prefixed name without, or with another, installation label', () => {
+    const own = cluster.find((o) => o.kind === 'ClusterRole') as Resource;
+    const unlabelled = { ...own, metadata: { name: own.metadata.name } };
+    const other = { ...own, metadata: { ...own.metadata, labels: { [INSTALLATION]: 'prod' } } };
+    for (const o of [unlabelled, other])
+      expect(writes('ClusterRole', o)).toEqual([false, false, false]);
+    // Neither relabelling one of its own away nor adopting a foreign one.
+    expect(admit('ClusterRole', 'UPDATE', own.metadata.name, other, own)).toBe(false);
+    expect(admit('ClusterRole', 'UPDATE', own.metadata.name, own, other)).toBe(false);
+  });
+
+  it('refuses an installation-labelled object whose name lacks the prefix', () => {
+    const labels = { [INSTALLATION]: 'test' };
+    const roles = tenantOperatorClusterRoles('test');
+    expect(roles.map((r) => r.metadata.name)).toHaveLength(3);
+    for (const role of roles) {
+      expect(role.metadata.labels?.[INSTALLATION]).toBe('test');
+      expect(writes('ClusterRole', role)).toEqual([false, false, false]);
+    }
+    // Neither another name of the installation nor a near miss without the trailing dash.
+    for (const name of ['test-controller', 'di-tenant-controllerx', 'di-tenant-alpha']) {
+      const metadata = { name, labels };
+      const crb = { metadata, roleRef: { apiGroup: RBAC_GROUP, kind: 'ClusterRole', name } };
+      expect(writes('ClusterRole', { metadata })).toEqual([false, false, false]);
+      expect(writes('ClusterRoleBinding', crb)).toEqual([false, false, false]);
+    }
+  });
+
+  it('refuses aggregation labels or rules on its own ClusterRoles', () => {
+    const own = cluster.find((o) => o.kind === 'ClusterRole') as Resource;
+    const name = own.metadata.name;
+    expect(
+      Object.keys(own.metadata.labels ?? {}).some((k) => k.startsWith(AGGREGATE_LABEL_PREFIX)),
+    ).toBe(false);
+    expect('aggregationRule' in own).toBe(false);
+    const aggregated = {
+      ...own,
+      metadata: {
+        ...own.metadata,
+        labels: { ...own.metadata.labels, [`${AGGREGATE_LABEL_PREFIX}view`]: 'true' },
+      },
+    };
+    const rule = {
+      ...own,
+      aggregationRule: { clusterRoleSelectors: [{ matchLabels: { x: 'y' } }] },
+    };
+    for (const o of [aggregated, rule]) {
+      expect(admit('ClusterRole', 'CREATE', name, o, null)).toBe(false);
+      expect(admit('ClusterRole', 'UPDATE', name, o, own)).toBe(false);
+      // Removing it again, or deleting the role, stays allowed.
+      expect(admit('ClusterRole', 'UPDATE', name, own, o)).toBe(true);
+      expect(admit('ClusterRole', 'DELETE', name, null, o)).toBe(true);
+      expect(admit('ClusterRole', 'CREATE', name, o, null, ADMIN)).toBe(true);
+    }
+  });
+
+  it('refuses a di-tenant-controller binding to any other ClusterRole', () => {
+    const own = cluster.find((o) => o.kind === 'ClusterRoleBinding') as Resource & {
+      roleRef: Record<string, string>;
+    };
+    for (const roleRef of [
+      { ...own.roleRef, name: 'cluster-admin' },
+      { ...own.roleRef, name: 'di-tenant-controller-beta' },
+      { ...own.roleRef, kind: 'Role' },
+      { ...own.roleRef, apiGroup: 'example.com' },
+    ]) {
+      const o = { ...own, roleRef };
+      expect(admit('ClusterRoleBinding', 'CREATE', own.metadata.name, o, null)).toBe(false);
+      expect(admit('ClusterRoleBinding', 'UPDATE', own.metadata.name, o, own)).toBe(false);
+    }
   });
 });

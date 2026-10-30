@@ -281,6 +281,8 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
     },
     // Each tenant controller's `di-tenant-controller-<t>` ClusterRole and its binding (#58). The
     // controller already holds every permission they grant, so it needs no bind or escalate.
+    // The names are per tenant, so `resourceNames` cannot scope these verbs; the admission
+    // policies in `controllerClusterRbacPolicies` limit the writes to those objects (#586).
     {
       apiGroups: ['rbac.authorization.k8s.io'],
       resources: ['clusterroles', 'clusterrolebindings'],
@@ -310,4 +312,82 @@ export function loadControllerScripts(tenancyDir: string = __dirname): Record<st
 
 export function controllerScriptHash(scripts: Record<string, string>): string {
   return createHash('sha256').update(JSON.stringify(scripts)).digest('hex');
+}
+
+/** The name prefix of the only ClusterRoles and ClusterRoleBindings the controller writes (#586). */
+export const CONTROLLER_CLUSTER_RBAC_PREFIX = 'di-tenant-controller-';
+/** The label prefix that aggregates a ClusterRole's rules into another (#586). */
+export const AGGREGATE_LABEL_PREFIX = 'rbac.authorization.k8s.io/aggregate-to-';
+export const CONTROLLER_CLUSTER_RBAC_MESSAGE =
+  'The platform controller may only create, change or delete the di-tenant-controller-<tenant> ' +
+  'ClusterRoles and ClusterRoleBindings of its own installation, without aggregation';
+
+/**
+ * Admission for the controller's ClusterRole and ClusterRoleBinding writes (#586). Its RBAC grant
+ * cannot name the per-tenant `di-tenant-controller-<tenant>` objects (`resourceNames` has no
+ * wildcard), so these policies, one per kind, refuse the controller every create, change or
+ * delete of any other ClusterRole or ClusterRoleBinding: the name must carry
+ * {@link CONTROLLER_CLUSTER_RBAC_PREFIX}, the object (old and new) must carry this installation's
+ * label, a binding must refer to the ClusterRole of its own name, and a ClusterRole may carry no
+ * aggregation label or rule.
+ */
+export function controllerClusterRbacPolicies(installation: string, namespace: string): Resource[] {
+  const labelled = (o: string) =>
+    `has(${o}.metadata.labels) && '${INSTALLATION}' in ${o}.metadata.labels &&
+      ${o}.metadata.labels['${INSTALLATION}'] == '${installation}'`;
+  const common = `request.name.startsWith('${CONTROLLER_CLUSTER_RBAC_PREFIX}') &&
+    (request.operation == 'DELETE' || (${labelled('object')})) &&
+    (request.operation == 'CREATE' || (${labelled('oldObject')}))`;
+  const policies = [
+    {
+      // An aggregation label or rule would merge rules into, or out of, other ClusterRoles.
+      resource: 'clusterroles',
+      expression: `${common} && (request.operation == 'DELETE' ||
+        (!has(object.aggregationRule) && (!has(object.metadata.labels) ||
+          !object.metadata.labels.exists(k, k.startsWith('${AGGREGATE_LABEL_PREFIX}')))))`,
+    },
+    {
+      resource: 'clusterrolebindings',
+      expression: `${common} && (request.operation == 'DELETE' ||
+        (object.roleRef.apiGroup == 'rbac.authorization.k8s.io' &&
+          object.roleRef.kind == 'ClusterRole' && object.roleRef.name == request.name))`,
+    },
+  ];
+  const labels = { [INSTALLATION]: installation };
+  return policies.flatMap(({ resource, expression }) => {
+    const name = `${installation}-controller-${resource}`;
+    return [
+      {
+        apiVersion: 'admissionregistration.k8s.io/v1',
+        kind: 'ValidatingAdmissionPolicy',
+        metadata: { name, labels },
+        spec: {
+          failurePolicy: 'Fail',
+          matchConstraints: {
+            resourceRules: [
+              {
+                apiGroups: ['rbac.authorization.k8s.io'],
+                apiVersions: ['v1'],
+                operations: ['CREATE', 'UPDATE', 'DELETE'],
+                resources: [resource],
+              },
+            ],
+          },
+          matchConditions: [
+            {
+              name: 'platform-controller',
+              expression: `request.userInfo.username == 'system:serviceaccount:${namespace}:di-platform-controller'`,
+            },
+          ],
+          validations: [{ expression, message: CONTROLLER_CLUSTER_RBAC_MESSAGE }],
+        },
+      },
+      {
+        apiVersion: 'admissionregistration.k8s.io/v1',
+        kind: 'ValidatingAdmissionPolicyBinding',
+        metadata: { name, labels },
+        spec: { policyName: name, validationActions: ['Deny'] },
+      },
+    ] as Resource[];
+  });
 }

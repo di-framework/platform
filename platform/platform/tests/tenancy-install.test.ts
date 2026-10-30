@@ -164,6 +164,11 @@ describe('installTenancy controller RBAC wiring', () => {
         urnOf(`validatingadmissionpolicy-di-test-tenant-operator-${kind}`),
         urnOf(`validatingadmissionpolicybinding-di-test-tenant-operator-${kind}`),
       ]),
+      // And the policies limiting its ClusterRole and ClusterRoleBinding writes (#586).
+      ...['clusterroles', 'clusterrolebindings'].flatMap((kind) => [
+        urnOf(`validatingadmissionpolicy-di-test-controller-${kind}`),
+        urnOf(`validatingadmissionpolicybinding-di-test-controller-${kind}`),
+      ]),
     ]);
     expect(dependsOn('clusterrolebinding-di-test-controller')).toEqual(
       expect.arrayContaining([
