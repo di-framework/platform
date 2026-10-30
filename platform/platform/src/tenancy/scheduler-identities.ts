@@ -138,9 +138,37 @@ export function tenantIdentities(tenant: string): Identity[] {
   ];
 }
 
+/** True when this installation wrote `value` for the Tenant `uid` (its installation and owner labels). */
+export function ownedBy(
+  value: { metadata: { labels?: Record<string, string> } } | undefined,
+  installation: string,
+  uid: string | undefined,
+): boolean {
+  const labels = value?.metadata.labels;
+  return labels?.[INSTALLATION] === installation && labels?.[OWNER] === uid;
+}
+
+/** True when `secret` is a scheduler identity this installation issued for the Tenant `uid`. */
+export function ownsIdentitySecret(
+  secret: { metadata: { labels?: Record<string, string> } } | undefined,
+  installation: string,
+  uid: string | undefined,
+): boolean {
+  return (
+    ownedBy(secret, installation, uid) &&
+    secret?.metadata.labels?.[COMPONENT] === SCHEDULER_IDENTITY_COMPONENT
+  );
+}
+
 export class TenantSchedulerIdentities {
   /** The pending state last logged per tenant, so each change is logged once. */
   private readonly logged = new Map<string, string>();
+  /**
+   * Per tenant, a rotation whose handled value the API server did not keep in status (a Tenant CRD
+   * older than this controller prunes it). It is treated as handled, so it is not repeated on every
+   * poll.
+   */
+  private readonly unpersisted = new Map<string, string>();
   constructor(
     private readonly api: IdentityApi,
     private readonly cfg: { installation: string; namespace: string },
@@ -160,6 +188,8 @@ export class TenantSchedulerIdentities {
   /** Drops the in-memory state of tenants no longer listed. */
   forget(listed: ReadonlySet<string>): void {
     for (const name of this.logged.keys()) if (!listed.has(name)) this.logged.delete(name);
+    for (const name of this.unpersisted.keys())
+      if (!listed.has(name)) this.unpersisted.delete(name);
   }
 
   /**
@@ -230,15 +260,6 @@ export class TenantSchedulerIdentities {
       cas[kind] = ca as KeyPair;
     }
     return cas;
-  }
-
-  private owned(tenant: Tenant, secret: Stored): boolean {
-    const labels = secret.metadata.labels;
-    return (
-      labels?.[INSTALLATION] === this.cfg.installation &&
-      labels?.[OWNER] === tenant.metadata.uid &&
-      labels?.[COMPONENT] === SCHEDULER_IDENTITY_COMPONENT
-    );
   }
 
   /** What `secret` shows of `identity`: its expiry, digest and the ID it carries, if it verifies. */
@@ -320,7 +341,15 @@ export class TenantSchedulerIdentities {
     // The operator's identity waits for `di-operator-<t>`, which the cut-over (m6e) creates.
     const identities: Identity[] = [];
     for (const identity of tenantIdentities(t))
-      if (identity.kind === 'hosts' || (await this.get(namespacePath(identity.namespace))))
+      if (
+        identity.kind === 'hosts' ||
+        // Only into a namespace this installation created for the Tenant, as R5 deletes it.
+        ownedBy(
+          await this.get<Stored>(namespacePath(identity.namespace)),
+          this.cfg.installation,
+          tenant.metadata.uid,
+        )
+      )
         identities.push(identity);
     const hosts = await this.hostRollout(tenant);
     const listed = (
@@ -336,12 +365,12 @@ export class TenantSchedulerIdentities {
       (value?.status?.schedulerIdentity as SchedulerIdentityStatus | undefined)?.rotation;
     // A Tenant from a stale LIST may lack the rotation already handled, so a requested rotation is
     // confirmed against a fresh read before it draws new IDs.
-    const forced =
-      rotationRequested(rotation, handled(tenant)) &&
-      rotationRequested(
-        rotation,
-        handled(await this.get<Tenant>(`/apis/${VERSION}/tenants/${encodeURIComponent(t)}`)),
-      );
+    const requested =
+      this.unpersisted.get(t) !== rotation && rotationRequested(rotation, handled(tenant));
+    const current = requested
+      ? await this.get<Tenant>(`/apis/${VERSION}/tenants/${encodeURIComponent(t)}`)
+      : undefined;
+    const forced = requested && rotationRequested(rotation, handled(current));
     const observed: Record<string, IdentityObservation> = {};
     for (const identity of identities) {
       const secret = listed.find(
@@ -362,7 +391,7 @@ export class TenantSchedulerIdentities {
     if (issuing().length > 0) {
       for (const identity of identities.filter((i) => issuing().includes(i.key))) {
         const secret = await this.get<Stored>(secretPath(identity.namespace, identity.name));
-        if (secret && !this.owned(tenant, secret))
+        if (secret && !ownsIdentitySecret(secret, this.cfg.installation, tenant.metadata.uid))
           return {
             pending: {
               reason: 'SecretNotOwned',
@@ -392,13 +421,15 @@ export class TenantSchedulerIdentities {
         'PATCH',
         `/apis/${VERSION}/tenants/${encodeURIComponent(t)}/status`,
         {
-          metadata: { resourceVersion: tenant.metadata.resourceVersion },
+          // The fresh read's, so a stale LIST does not make this write conflict.
+          metadata: { resourceVersion: current?.metadata.resourceVersion },
           status: { schedulerIdentity: { rotation } },
         },
         'application/merge-patch+json',
       );
       tenant.metadata = updated.metadata;
       tenant.status = { ...tenant.status, schedulerIdentity: { rotation } };
+      if (handled(updated) !== rotation) this.unpersisted.set(t, rotation);
     }
     for (const identity of identities) {
       if (!issuing().includes(identity.key)) continue;
@@ -437,7 +468,17 @@ export class TenantSchedulerIdentities {
       if (existing) await this.api.call('PUT', secretPath(identity.namespace, identity.name), body);
       else await this.api.call('POST', secretPath(identity.namespace), body);
     }
-    return next.stalled.length > 0 ? { stalled: hosts.deployment } : {};
+    return {
+      ...(next.stalled.length > 0 ? { stalled: hosts.deployment } : {}),
+      ...(this.unpersisted.get(t) === rotation
+        ? {
+            pending: {
+              reason: 'RotationNotPersisted',
+              message: `The API server did not keep status.schedulerIdentity.rotation, so the Tenant CRD may predate this controller; the rotation was applied once and is not repeated`,
+            },
+          }
+        : {}),
+    };
   }
 
   /**

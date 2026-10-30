@@ -34,8 +34,10 @@ const PKI = 'wasmcloud-scheduler-pki';
 const RUNTIME = names('alpha').runtimeNamespace;
 const recordPath = `/api/v1/namespaces/${PKI}/configmaps/${SCHEDULER_IDENTITIES}`;
 const hostPath = `/api/v1/namespaces/${RUNTIME}/secrets/${TENANT_HOST_SECRET}`;
+const operatorPath = '/api/v1/namespaces/di-operator-alpha/secrets/di-scheduler-operator-tls';
 const tenantPath = `${collection(VERSION, 'Tenant')}/alpha`;
 const START = new Date('2026-10-30T00:00:00Z');
+const clock = { now: START };
 
 const key = (v: { apiVersion: string; kind: string; metadata: Resource['metadata'] }) =>
   `${collection(v.apiVersion, v.kind, v.metadata.namespace)}/${v.metadata.name}`;
@@ -165,7 +167,7 @@ async function prepare(options: { pki: boolean }) {
     api,
     cfg,
     async () => [],
-    () => START,
+    () => clock.now,
   );
   return { api, controller };
 }
@@ -175,6 +177,7 @@ const condition = (api: MemoryApi, type: string) =>
 
 let warn: ReturnType<typeof spyOn>;
 beforeEach(() => {
+  clock.now = START;
   warn = spyOn(console, 'warn').mockImplementation(() => {});
 });
 afterEach(() => warn.mockRestore());
@@ -212,13 +215,36 @@ describe('controller tick: tenant scheduler identities (#541 m6c)', () => {
     expect(warn).toHaveBeenCalledTimes(1);
   });
 
-  it('issues nothing for a suspended Tenant', async () => {
+  it('keeps issuing and renewing for a suspended Tenant, whose operator keeps running', async () => {
     const { api, controller } = await prepare({ pki: true });
     const t = stored(api);
     t.spec.suspended = true;
     api.seed(t);
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'Namespace',
+      metadata: {
+        name: 'di-operator-alpha',
+        labels: { [INSTALLATION]: 'test', [OWNER]: 'alpha-uid' },
+      },
+    });
     await controller.tick();
-    expect(api.objects.has(hostPath)).toBe(false);
+    expect(api.objects.has(hostPath)).toBe(true);
+    expect(api.objects.has(operatorPath)).toBe(true);
+    const id = parseIdentityRecord(
+      (api.objects.get(recordPath) as unknown as { data: Record<string, string> }).data[
+        IDENTITIES_KEY
+      ] as string,
+    )['tenant/alpha/operator']?.current;
+    clock.now = new Date(START.getTime() + 61 * 86_400_000);
+    await controller.tick();
+    const renewed = parseIdentityRecord(
+      (api.objects.get(recordPath) as unknown as { data: Record<string, string> }).data[
+        IDENTITIES_KEY
+      ] as string,
+    )['tenant/alpha/operator'];
+    expect(renewed?.previous).toBe(id as string);
+    expect(renewed?.current).not.toBe(id as string);
   });
 
   it('keeps the handled rotation in the status it writes', async () => {
@@ -233,6 +259,15 @@ describe('controller tick: tenant scheduler identities (#541 m6c)', () => {
     for (let i = 0; i < 3; i++) await controller.tick();
     expect(api.identityWrites()).toEqual([]);
     expect(stored(api).status?.schedulerIdentity).toEqual({ rotation: 'r1' });
+    // Every status the controller writes after the rotation carries the handled value.
+    const statusWrites = api.operations.filter(
+      (o) => o.method === 'PATCH' && o.path === `${tenantPath}/status`,
+    );
+    expect(statusWrites.length).toBeGreaterThan(0);
+    for (const write of statusWrites)
+      expect((write.body as { status: Record<string, unknown> }).status.schedulerIdentity).toEqual({
+        rotation: 'r1',
+      });
   });
 
   it('drops the record entries and deletes the hosts identity during removal, never a foreign Secret', async () => {

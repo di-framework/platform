@@ -138,7 +138,11 @@ import {
   VERSION,
   validName,
 } from './resources';
-import { TENANT_HOST_SECRET, TenantSchedulerIdentities } from './scheduler-identities';
+import {
+  ownsIdentitySecret,
+  TENANT_HOST_SECRET,
+  TenantSchedulerIdentities,
+} from './scheduler-identities';
 import {
   assertSafeBindingStatus,
   bindingProjectionName,
@@ -801,10 +805,7 @@ export class Controller {
     const identity = await this.get<Resource>(
       `${collection('v1', 'Secret', names(t).runtimeNamespace)}/${TENANT_HOST_SECRET}`,
     );
-    if (
-      identity?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
-      identity.metadata.labels[OWNER] === tenant.metadata.uid
-    )
+    if (identity && ownsIdentitySecret(identity, this.cfg.installation, tenant.metadata.uid))
       await this.remove(identity);
     const remaining = (await bindings()).map(
       (b) => `rolebinding/${b.metadata.namespace}/${b.metadata.name}`,
@@ -1371,9 +1372,10 @@ export class Controller {
     } catch (error) {
       failure ??= error;
     }
-    // Issued apart from the apply, which a failed host Deployment must not hold back. Inert until
-    // the cut-over: no pod mounts these identities yet (#541 m6c).
-    const identity = tenant.spec.suspended ? [] : await this.identities.reconcile(tenant);
+    // Issued apart from the apply, which a failed host Deployment must not hold back, and also while
+    // suspended: the tenant operator keeps running then (design-541 §4.5), so its identity must not
+    // expire. Inert until the cut-over: no pod mounts these identities yet (#541 m6c).
+    const identity = await this.identities.reconcile(tenant);
     // Tenant-auth is independent of the tenant's own objects: a failed apply above (such as a
     // hostgroup 409) must not keep it from reconciling or from reporting TenantAuthReady (#121).
     let auth = await this.reconcileTenantAuth(tenant, users);
@@ -1392,7 +1394,8 @@ export class Controller {
     const others = [...(auth ? [auth] : []), ...(logs ? [logs] : []), integrity, ...identity];
     const records = {
       storage: { keys: storage.records },
-      // The rotation last handled (#541 m6c), kept so an unchanged status is not written again.
+      // The rotation last handled (#541 m6c), carried into every status write so the controller
+      // never writes a status that lacks it.
       ...(tenant.status?.schedulerIdentity
         ? { schedulerIdentity: tenant.status.schedulerIdentity }
         : {}),

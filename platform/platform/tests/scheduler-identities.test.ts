@@ -37,7 +37,7 @@ import {
   SCHEDULER_TLS_ANNOTATION,
   schedulerCertDigest,
 } from '../src/tenancy/scheduler-pki-rotation';
-import { certificateNames, issuedBy } from '../src/tenancy/tls';
+import { certificateNames, issuedBy, leafCertificate } from '../src/tenancy/tls';
 
 // #541 m6c: the controller issues each tenant's scheduler NATS identities (design-541 §4.5).
 
@@ -83,6 +83,8 @@ class FakeApi implements IdentityApi {
   private version = 1;
   /** The Secret LIST answers from this snapshot instead of the store (a stale cache). */
   staleSecrets?: Stored[];
+  /** The status PATCH keeps nothing of `schedulerIdentity`, as a CRD without the field prunes it. */
+  pruneSchedulerIdentity = false;
   /** Fails every call with this method and path. */
   failing?: { method: string; path: string; code: number };
   seed(path: string, value: Stored): void {
@@ -147,6 +149,7 @@ class FakeApi implements IdentityApi {
         metadata: { ...found.metadata, resourceVersion: String(this.version++) },
         status: { ...found.status, ...value.status },
       };
+      if (this.pruneSchedulerIdentity) delete next.status.schedulerIdentity;
       this.objects.set(target, next);
       return structuredClone(next) as T;
     }
@@ -189,7 +192,10 @@ async function cluster(options: { operatorNamespace?: boolean } = {}) {
   api.seed(nsPath(PKI), { metadata: { name: PKI } });
   await bootstrapSchedulerPki(api, { installation: INSTALL, namespace: NS }, T0);
   api.seed(tenantPath, tenant() as unknown as Stored);
-  if (options.operatorNamespace) api.seed(nsPath(OPERATOR_NS), { metadata: { name: OPERATOR_NS } });
+  if (options.operatorNamespace)
+    api.seed(nsPath(OPERATOR_NS), {
+      metadata: { name: OPERATOR_NS, labels: { [INSTALLATION]: INSTALL, [OWNER]: 'alpha-uid' } },
+    });
   api.calls.length = 0;
   const identities = new TenantSchedulerIdentities(
     api,
@@ -395,21 +401,26 @@ describe('tenant scheduler identity issuance (#541 m6c)', () => {
     clock.now = new Date(T0.getTime() + 61 * DAY);
     await identities.reconcile(tenant());
     const digest = schedulerCertDigest(api.data(hostPath, 'tls.crt'));
-    const rollout = (complete: boolean) =>
+    const rollout = (status: Record<string, number>) =>
       api.seed(deploymentPath, {
         metadata: { name: 'hostgroup-tenant-alpha', generation: 2 } as Stored['metadata'],
         spec: {
           replicas: 1,
           template: { metadata: { annotations: { [SCHEDULER_TLS_ANNOTATION]: digest } } },
         },
-        status: complete
-          ? { observedGeneration: 2, updatedReplicas: 1, readyReplicas: 1 }
-          : { observedGeneration: 1 },
+        status,
       });
-    rollout(false);
-    await identities.reconcile(tenant());
-    expect(api.record()['tenant/alpha/hosts']?.previous).toBeDefined();
-    rollout(true);
+    // Not observed yet, then updated but not ready, then updated and ready but stale: kept.
+    for (const status of <Record<string, number>[]>[
+      { observedGeneration: 1 },
+      { observedGeneration: 2, updatedReplicas: 1, readyReplicas: 0 },
+      { observedGeneration: 2, updatedReplicas: 0, readyReplicas: 1 },
+    ]) {
+      rollout(status);
+      await identities.reconcile(tenant());
+      expect(api.record()['tenant/alpha/hosts']?.previous).toBeDefined();
+    }
+    rollout({ observedGeneration: 2, updatedReplicas: 1, readyReplicas: 1 });
     expect(await identities.reconcile(tenant())).toEqual([]);
     expect(api.record()['tenant/alpha/hosts']?.previous).toBeUndefined();
     api.seed(deploymentPath, { metadata: { name: 'hostgroup-tenant-alpha' } });
@@ -519,6 +530,82 @@ describe('tenant scheduler identity issuance (#541 m6c)', () => {
     expect(api.writes()).toEqual([`PUT ${hostPath}`]);
     expect(userOf(api, hostPath)).toEqual([tenantHostUser('alpha', 'cccccccccccccccc')]);
     expect(id).not.toBe('cccccccccccccccc');
+  });
+
+  it('re-issues a certificate from the tenant CA that names another tenant with the recorded ID', async () => {
+    const { api, identities } = await cluster();
+    await identities.reconcile(tenant());
+    const id = api.record()['tenant/alpha/hosts']?.current as string;
+    const tenantCa = ca(api, 'tenant');
+    const beta = tenantHostUser('beta', id);
+    const leaf = leafCertificate(beta, [beta], [], 90, tenantCa.cert, tenantCa.key, T0, 'client');
+    const secret = api.objects.get(hostPath) as Stored;
+    secret.data = {
+      ...secret.data,
+      'tls.crt': Buffer.from(leaf.cert).toString('base64'),
+      'tls.key': Buffer.from(leaf.key).toString('base64'),
+    };
+    api.calls.length = 0;
+    await identities.reconcile(tenant());
+    expect(api.writes()).toEqual([`PUT ${hostPath}`]);
+    expect(userOf(api, hostPath)).toEqual([tenantHostUser('alpha', id)]);
+  });
+
+  it('issues no operator identity into a di-operator-<t> this installation did not create for the Tenant', async () => {
+    for (const labels of <Record<string, string>[]>[
+      {},
+      { [INSTALLATION]: 'other', [OWNER]: 'alpha-uid' },
+      { [INSTALLATION]: INSTALL, [OWNER]: 'other-uid' },
+    ]) {
+      const { api, identities } = await cluster();
+      api.seed(nsPath(OPERATOR_NS), { metadata: { name: OPERATOR_NS, labels } });
+      expect(await identities.reconcile(tenant())).toEqual([]);
+      expect(api.objects.has(operatorPath)).toBe(false);
+      expect(api.record()['tenant/alpha/operator']).toBeUndefined();
+      expect(api.writes().filter((w) => w.includes(OPERATOR_NS))).toEqual([]);
+    }
+  });
+
+  it('applies a rotation once when the API server does not keep the handled value, and says so once', async () => {
+    const { api, identities } = await cluster();
+    await identities.reconcile(tenant());
+    api.pruneSchedulerIdentity = true;
+    const t = tenant({ [ROTATE_ANNOTATION]: 'r1' });
+    api.seed(tenantPath, structuredClone(t) as unknown as Stored);
+    const before = api.record()['tenant/alpha/hosts']?.current;
+    api.calls.length = 0;
+    const [pending] = await identities.reconcile(tenant({ [ROTATE_ANNOTATION]: 'r1' }));
+    expect(pending).toMatchObject({
+      type: SCHEDULER_IDENTITY_PENDING,
+      reason: 'RotationNotPersisted',
+    });
+    const rotated = api.record()['tenant/alpha/hosts']?.current;
+    expect(rotated).not.toBe(before as string);
+    expect(userOf(api, hostPath)).toEqual([tenantHostUser('alpha', rotated as string)]);
+    // Later polls (each from a LIST without the handled value) neither rotate nor write.
+    api.calls.length = 0;
+    for (let i = 0; i < 4; i++) {
+      const [again] = await identities.reconcile(tenant({ [ROTATE_ANNOTATION]: 'r1' }));
+      expect(again?.reason).toBe('RotationNotPersisted');
+    }
+    expect(api.writes()).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    // A new rotation value is applied again; forgetting the tenant clears the memory.
+    identities.forget(new Set(['alpha']));
+    identities.forget(new Set());
+    api.calls.length = 0;
+    await identities.reconcile(tenant({ [ROTATE_ANNOTATION]: 'r1' }));
+    expect(api.writes()).toContain(`PATCH ${tenantPath}/status`);
+  });
+
+  it('sends the fresh Tenant resourceVersion with the rotation, so a stale LIST does not conflict', async () => {
+    const { api, identities } = await cluster();
+    await identities.reconcile(tenant());
+    api.seed(tenantPath, tenant({ [ROTATE_ANNOTATION]: 'r1' }) as unknown as Stored);
+    const stale = tenant({ [ROTATE_ANNOTATION]: 'r1' });
+    stale.metadata.resourceVersion = '0';
+    expect(await identities.reconcile(stale)).toEqual([]);
+    expect(api.objects.get(tenantPath)?.status?.schedulerIdentity).toEqual({ rotation: 'r1' });
   });
 
   it('refuses to issue over a Secret it did not write', async () => {
