@@ -699,7 +699,7 @@ kubectl delete namespace di-tenant-alpha di-runtime-alpha di-apikeys-alpha
 ## Existing-cluster configuration
 
 `kubeconfig` is required (a local file path); `context`, `namespace`, `release`,
-`chart`, `chartVersion`, `httpNodePort`, `timeoutSeconds`, `insecureRegistry`, `insecureRegistries`,
+`httpNodePort`, `timeoutSeconds`, `insecureRegistry`, `insecureRegistries`,
 `storageRoot`, `networkPolicyEngine`, `kubernetesEndpoint`, `httpEndpoint`, `routeUrlPattern`,
 `egressAllowedDestinations`, `routeAliases` (see [Gateway route aliases](#gateway-route-aliases)),
 `runtimeNats` (see [Runtime NATS storage caps](#runtime-nats-storage-caps)),

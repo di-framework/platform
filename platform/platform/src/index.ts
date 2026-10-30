@@ -62,8 +62,6 @@ export interface PlatformArgs {
   config?: pulumi.Config;
   namespace?: string;
   release?: string;
-  chart?: string;
-  chartVersion?: string;
   timeoutSeconds?: number;
   httpNodePort?: number;
   registry?: boolean;
@@ -387,8 +385,9 @@ export function createPlatform(args: PlatformArgs) {
       name: args.release ?? 'wasmcloud',
       namespace: namespaceName,
       createNamespace: false,
-      chart: args.chart ?? 'oci://ghcr.io/wasmcloud/charts/runtime-operator',
-      version: args.chartVersion ?? WASMCLOUD_OPERATOR_VERSION,
+      // Always the pinned version, whose operator image the tenant operators run (#541 m6a).
+      chart: 'oci://ghcr.io/wasmcloud/charts/runtime-operator',
+      version: WASMCLOUD_OPERATOR_VERSION,
       atomic: true,
       cleanupOnFail: true,
       timeout: args.timeoutSeconds ?? 600,

@@ -37,8 +37,6 @@ const platform = createPlatform({
   config,
   namespace: config.get('namespace'),
   release: config.get('release'),
-  chart: config.get('chart'),
-  chartVersion: config.get('chartVersion'),
   timeoutSeconds: config.getNumber('timeoutSeconds') ?? 1200,
   httpNodePort: config.getNumber('httpNodePort') ?? 0,
   insecureRegistry: config.getBoolean('insecureRegistry') ?? false,

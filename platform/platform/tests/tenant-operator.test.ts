@@ -19,6 +19,7 @@ import {
   RUNTIME_OPERATOR_REPOSITORY,
   runtimeOperatorImage,
   TENANT_OPERATOR_CLUSTER_ROLES,
+  TENANT_OPERATOR_NOT_READY,
   type TenantOperatorScope,
   tenantOperatorBindingPolicies,
   tenantOperatorClusterRoleRules,
@@ -41,7 +42,12 @@ const cfg = {
   namespace: 'wasmcloud',
   apiServer: { addresses: ['10.0.0.1', 'fd00::1'], port: 6443 },
 };
-const objects = tenantOperatorResources(tenant, cfg);
+const render = (config = cfg) => {
+  const rendered = tenantOperatorResources(tenant, config);
+  if (!rendered.ready) throw new Error(rendered.message);
+  return rendered.resources;
+};
+const objects = render();
 const find = (kind: string, name: string, namespace?: string) => {
   const found = objects.filter(
     (o) => o.kind === kind && o.metadata.name === name && o.metadata.namespace === namespace,
@@ -95,7 +101,11 @@ describe('runtime-operator version and image pin', () => {
     expect(index).toContain(
       "import { WASMCLOUD_OPERATOR_VERSION } from './tenancy/tenant-operator'",
     );
-    expect(index).toContain('version: args.chartVersion ?? WASMCLOUD_OPERATOR_VERSION');
+    expect(index).toContain(
+      "chart: 'oci://ghcr.io/wasmcloud/charts/runtime-operator',\n      version: WASMCLOUD_OPERATOR_VERSION,",
+    );
+    // No option overrides the pinned chart (#541 m6a).
+    expect(index).not.toMatch(/chartVersion|args\.chart\b/);
     expect(index).not.toMatch(/const WASMCLOUD_OPERATOR_VERSION/);
   });
 });
@@ -227,14 +237,17 @@ describe('tenant operator manifests', () => {
     });
   });
 
-  it('omits the API server rule while its endpoints are unknown', () => {
-    const rendered = tenantOperatorResources(tenant, {
-      ...cfg,
-      apiServer: { addresses: [], port: 6443 },
+  it('renders nothing, reporting not ready, while the API server endpoints are unknown (m6a)', () => {
+    expect(
+      tenantOperatorResources(tenant, { ...cfg, apiServer: { addresses: [], port: 6443 } }),
+    ).toEqual({
+      ready: false,
+      reason: TENANT_OPERATOR_NOT_READY.apiServerUnknown,
+      message: 'the kubernetes EndpointSlice lists no API server address',
     });
-    const policy = rendered.find((o) => o.metadata.name === 'di-operator-egress') as Resource;
-    const egress = (policy.spec as { egress: { ports: { port: number }[] }[] }).egress;
-    expect(egress.map((rule) => rule.ports.map((p) => p.port))).toEqual([[53, 53], [4222]]);
+    expect(TENANT_OPERATOR_NOT_READY.apiServerUnknown).toBe('ApiServerEndpointsUnknown');
+    const ready = tenantOperatorResources(tenant, cfg);
+    expect(ready.ready).toBe(true);
   });
 
   it('admits no ingress', () => {
@@ -341,13 +354,39 @@ describe('tenant-operator binding admission (#541 m3 W1)', () => {
     expect(found).toHaveLength(1);
     return found[0] as Policy;
   };
+  /** The labels the controller sets on a tenant's namespaces (installation and tenant). */
+  const tenantLabels = (namespace: string): Record<string, string> => ({
+    [INSTALLATION]: 'test',
+    [OWNER]: 'uid',
+    [TENANT]: namespace.replace(/^di-(operator|tenant|runtime)-/, ''),
+  });
+  /**
+   * `namespaceObject` as the API server passes it: null for cluster-scoped requests, otherwise the
+   * namespace, labelled by default as the controller labels a tenant's namespaces. A `null` label
+   * set means a namespace without labels.
+   */
+  const namespaceObjectFor = (
+    namespace: string,
+    labels: Record<string, string> | null | undefined,
+  ) => {
+    if (!namespace) return null;
+    const metadata: Record<string, unknown> = { name: namespace };
+    if (labels !== null) metadata.labels = labels ?? tenantLabels(namespace);
+    return { metadata };
+  };
   /**
    * Evaluates a policy as the API server does: matchConstraints operations, then matchConditions,
    * then variables, then rules.
    */
   const admit = (
     resource: 'rolebindings' | 'clusterrolebindings' | 'clusterroles',
-    request: { operation?: string; namespace?: string; name?: string; username?: string },
+    request: {
+      operation?: string;
+      namespace?: string;
+      name?: string;
+      username?: string;
+      namespaceLabels?: Record<string, string> | null;
+    },
     object: Record<string, unknown> | null,
   ): boolean => {
     const policy = policyFor(resource);
@@ -362,6 +401,7 @@ describe('tenant-operator binding admission (#541 m3 W1)', () => {
         userInfo: { username: request.username ?? CONTROLLER },
       },
       object,
+      namespaceObject: namespaceObjectFor(request.namespace ?? '', request.namespaceLabels),
     };
     if (!(policy.spec.matchConditions ?? []).every((c) => evaluate(c.expression, ctx) === true))
       return true;
@@ -387,7 +427,8 @@ describe('tenant-operator binding admission (#541 m3 W1)', () => {
     object: Record<string, unknown>,
     username?: string,
     operation?: string,
-  ) => admit('rolebindings', { namespace, username, operation }, object);
+    namespaceLabels?: Record<string, string> | null,
+  ) => admit('rolebindings', { namespace, username, operation, namespaceLabels }, object);
 
   it('has one policy per kind, failing closed, each with a Deny binding', () => {
     expect(policies.map((p) => p.metadata.name)).toEqual([
@@ -444,6 +485,39 @@ describe('tenant-operator binding admission (#541 m3 W1)', () => {
         expect(rb(ns, binding(role))).toBe(false);
         expect(rb(ns, binding(role), ADMIN)).toBe(false);
       }
+  });
+
+  it("refuses them in a tenant namespace without this installation's and tenant's labels (m6a)", () => {
+    const { self, workloads, hosts } = TENANT_OPERATOR_CLUSTER_ROLES;
+    for (const [role, ns] of [
+      [self, 'di-operator-alpha'],
+      [workloads, 'di-tenant-alpha'],
+      [hosts, 'di-runtime-alpha'],
+    ] as const) {
+      const labels = tenantLabels(ns);
+      expect(rb(ns, binding(role), undefined, undefined, labels)).toBe(true);
+      const { [INSTALLATION]: _i, ...noInstallation } = labels;
+      const { [TENANT]: _t, ...noTenant } = labels;
+      for (const bad of [
+        null,
+        {},
+        noInstallation,
+        noTenant,
+        { ...labels, [INSTALLATION]: 'other' },
+        { ...labels, [TENANT]: 'beta' },
+      ])
+        for (const username of [CONTROLLER, ADMIN])
+          expect(rb(ns, binding(role), username, undefined, bad)).toBe(false);
+    }
+  });
+
+  it('names the required namespace labels in the denial message (m6a)', () => {
+    expect(policyFor('rolebindings').spec.validations[0]?.message).toBe(
+      'The tenant-operator ClusterRoles may only be bound by a RoleBinding in the tenant namespace ' +
+        'of their kind, labelled platform.di-framework.dev/installation=<installation> and ' +
+        'platform.di-framework.dev/tenant=<tenant>, to the ServiceAccount runtime-operator in ' +
+        'di-operator-<tenant> of the same tenant',
+    );
   });
 
   it('refuses any subject but the same tenant operator ServiceAccount', () => {
