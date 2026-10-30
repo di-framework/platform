@@ -47,7 +47,7 @@ import {
   type KeyPair,
   leafCertificate,
 } from '../src/tenancy/tls';
-import { OPENSSL, opensslClientLeaf, opensslVerifies } from './support/tls';
+import { OPENSSL, opensslClientLeaf, opensslVerifies, opensslVerifyError } from './support/tls';
 
 const DAY = 86_400_000;
 const NS = 'wasmcloud';
@@ -56,6 +56,14 @@ const t0 = new Date('2026-10-29T00:00:00Z');
 const at = (days: number) => new Date(t0.getTime() + days * DAY);
 const platformCa = newSchedulerCa('platform', NS, t0);
 const tenantCa = newSchedulerCa('tenant', NS, t0);
+/**
+ * A leaf forged with the OpenSSL CLI, valid over the test's fixed window rather than from the
+ * wall clock, so that verifying it at `at(1)` never fails for being not yet valid or expired.
+ */
+const forge = (ca: { cert: string; key: string }, san: string) =>
+  opensslClientLeaf(ca, san, { notBefore: t0, notAfter: at(2) });
+/** `openssl verify` output for a name-constraint refusal, under OpenSSL 3 and LibreSSL. */
+const NAME_CONSTRAINT_REFUSAL = /subtree violation|name constraint/i;
 const LIBRESSL = Bun.spawnSync([OPENSSL, 'version']).stdout.toString().includes('LibreSSL');
 const opensslText = (cert: string) =>
   Bun.spawnSync([OPENSSL, 'x509', '-noout', '-text'], {
@@ -193,6 +201,12 @@ describe('scheduler CAs (O2, O3)', () => {
     expect(days(tenantHostLeaf('alpha', 'b'.repeat(16)).cert)).toBeCloseTo(90 + backdate, 5);
   });
 
+  it('forges leaves valid at the verification time, whatever the wall clock', () => {
+    const leaf = new X509Certificate(forge(tenantCa, 'DNS:nats'));
+    expect(new Date(leaf.validFrom).getTime()).toBeLessThanOrEqual(at(1).getTime());
+    expect(new Date(leaf.validTo).getTime()).toBeGreaterThanOrEqual(at(1).getTime());
+  });
+
   it('the tenant CA refuses every name under the platform subtree, in every SAN form', () => {
     const id = 'c'.repeat(16);
     const forged = [
@@ -208,8 +222,8 @@ describe('scheduler CAs (O2, O3)', () => {
     for (const san of forged)
       expect([
         san,
-        opensslVerifies(opensslClientLeaf(tenantCa, san), tenantCa.cert, at(1), 'sslclient'),
-      ]).toEqual([san, false]);
+        opensslVerifyError(forge(tenantCa, san), tenantCa.cert, at(1), 'sslclient'),
+      ]).toEqual([san, expect.stringMatching(NAME_CONSTRAINT_REFUSAL)]);
     // Positive controls: the same forging path within the tenant subtree verifies. LibreSSL (the
     // macOS binary) refuses every URI name under a URI constraint, so that control runs only on
     // OpenSSL (CI); the refusals above hold under both.
@@ -220,7 +234,7 @@ describe('scheduler CAs (O2, O3)', () => {
     ])
       expect([
         san,
-        opensslVerifies(opensslClientLeaf(tenantCa, san), tenantCa.cert, at(1), 'sslclient'),
+        opensslVerifies(forge(tenantCa, san), tenantCa.cert, at(1), 'sslclient'),
       ]).toEqual([san, true]);
   });
 
@@ -235,11 +249,11 @@ describe('scheduler CAs (O2, O3)', () => {
     ])
       expect([
         san,
-        opensslVerifies(opensslClientLeaf(platformCa, san), platformCa.cert, at(1), 'sslclient'),
-      ]).toEqual([san, false]);
+        opensslVerifyError(forge(platformCa, san), platformCa.cert, at(1), 'sslclient'),
+      ]).toEqual([san, expect.stringMatching(NAME_CONSTRAINT_REFUSAL)]);
     expect(
       opensslVerifies(
-        opensslClientLeaf(platformCa, `DNS:${tenantOperatorUser('alpha', id)}`),
+        forge(platformCa, `DNS:${tenantOperatorUser('alpha', id)}`),
         platformCa.cert,
         at(1),
         'sslclient',

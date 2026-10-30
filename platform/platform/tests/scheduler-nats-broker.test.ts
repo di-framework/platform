@@ -416,10 +416,17 @@ describe.skipIf(!enabled)('scheduler NATS broker (#541 m2, design-541 §8.2)', (
         `email:x@${user}`,
         `email:${user}@${PLATFORM_SUBTREE}`,
       ])
-        expect([san, await tlsRefusal(creds(opensslClientPair(tenantCa, san)))]).toEqual([
+        expect([
           san,
-          expect.stringContaining(NAME_CONSTRAINTS),
-        ]);
+          await tlsRefusal(
+            creds(
+              opensslClientPair(tenantCa, san, {
+                notBefore: new Date(now.getTime() - 86_400_000),
+                notAfter: new Date(now.getTime() + 86_400_000),
+              }),
+            ),
+          ),
+        ]).toEqual([san, expect.stringContaining(NAME_CONSTRAINTS)]);
     });
 
     it('an expired certificate of a recorded user', async () => {
