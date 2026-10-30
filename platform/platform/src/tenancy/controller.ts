@@ -150,6 +150,7 @@ import {
   SCHEDULER_ACCOUNTS_CONDITION,
   schedulerAccountsCondition,
 } from './scheduler-nats';
+import { PlatformSchedulerIdentities } from './scheduler-platform-identities';
 import {
   assertSafeBindingStatus,
   bindingProjectionName,
@@ -497,7 +498,10 @@ export class Controller {
   ) {
     this.identities = new TenantSchedulerIdentities(api, cfg, now);
     this.accounts = new SchedulerAccountsWriter(api, cfg, now);
+    this.platformIdentities = new PlatformSchedulerIdentities(api, cfg, now);
   }
+  /** Renewal of the platform's own scheduler NATS identities (#541 m6e-A). */
+  private readonly platformIdentities: PlatformSchedulerIdentities;
   /** Issuance of each tenant's scheduler NATS identities (#541 m6c). */
   private readonly identities: TenantSchedulerIdentities;
   /** The scheduler NATS accounts file (#541 m6d). */
@@ -3108,6 +3112,7 @@ export class Controller {
         }
       }
     }
+    await this.platformIdentities.reconcile();
     // After issuance and removal, so this pass's record changes reach the file (#541 m6d).
     this.accountsProblems = await this.accounts.reconcile(tenants);
     for (const tenant of tenants) {
