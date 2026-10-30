@@ -41,6 +41,7 @@ import {
   withDerivedPublicUrls,
 } from './tenancy/resources';
 import { schedulerPkiNamespace } from './tenancy/scheduler-pki';
+import { WASMCLOUD_OPERATOR_VERSION } from './tenancy/tenant-operator';
 import { tenantAuthReadsApiKeyNamespace } from './tenant-auth-images';
 import { secretReaderFromKubeconfig } from './token-secret-reader';
 import { waitForTokenSecret } from './token-wait';
@@ -257,7 +258,6 @@ export function createPlatform(args: PlatformArgs) {
   const provider = args.provider;
   const scope = args.installation;
   const REGISTRY_IMAGE = 'docker.io/library/registry:3.1.1';
-  const WASMCLOUD_OPERATOR_VERSION = '2.8.0';
   const REGISTRY_NODE_PORT = args.registryNodePort ?? 30500;
   const HTTP_NODE_PORT = args.httpNodePort ?? 30180;
   const networkPolicy =

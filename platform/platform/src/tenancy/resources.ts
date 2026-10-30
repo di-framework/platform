@@ -2690,6 +2690,7 @@ export {
   GATEWAY_POD_LABELS,
   GROUP,
   INSTALLATION,
+  labels,
   NAMESPACE_ROLE,
   names,
   OWNER,

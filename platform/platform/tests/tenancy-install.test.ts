@@ -4,6 +4,10 @@ import * as pulumi from '@pulumi/pulumi';
 import { declarations, installTenancy, seedTenantNamespaces } from '../src/tenancy';
 import * as install from '../src/tenancy/install';
 import { INSTALLATION, TENANT } from '../src/tenancy/resources';
+import {
+  TENANT_OPERATOR_CLUSTER_ROLES,
+  tenantOperatorClusterRoleRules,
+} from '../src/tenancy/tenant-operator';
 
 // The Pulumi wiring of the platform controller's own RBAC (#115, #321): which objects
 // `installTenancy` creates, with which rules, and in which order `pulumi up` applies them.
@@ -115,6 +119,21 @@ describe('installTenancy controller RBAC wiring', () => {
     });
   });
 
+  it('installs the three tenant-operator ClusterRoles and binds none of them (#541 m3)', () => {
+    const rules = tenantOperatorClusterRoleRules();
+    for (const [scope, name] of Object.entries(TENANT_OPERATOR_CLUSTER_ROLES))
+      expect(registered.get(`clusterrole-${name}`)?.inputs).toMatchObject({
+        metadata: { name, labels: { [INSTALLATION]: 'di-test' } },
+        rules: rules[scope as keyof typeof rules],
+      });
+    const operatorRoles: string[] = Object.values(TENANT_OPERATOR_CLUSTER_ROLES);
+    const refs = [...registered.values()]
+      .filter((r) => r.type.endsWith('Binding'))
+      .map((r) => (r.inputs.roleRef as { name?: string } | undefined)?.name);
+    expect(refs.length).toBeGreaterThan(0);
+    for (const name of refs) expect(operatorRoles).not.toContain(name);
+  });
+
   it('holds TokenRequest only through a Role in its own namespace', () => {
     expect(registered.get('role-di-test-controller')?.inputs).toMatchObject({
       metadata: { name: 'di-test-controller', namespace: 'wasmcloud' },
@@ -138,8 +157,13 @@ describe('installTenancy controller RBAC wiring', () => {
     );
     // The ClusterRole holds no `escalate` (#115), so the running controller must already hold
     // TokenRequest in its namespace when `pulumi up` updates it.
+    // The tenant-operator admission policies confine its `bind` before it holds it (#541 m3).
     expect(dependsOn('clusterrole-di-test-controller')).toEqual([
       urnOf('rolebinding-di-test-controller'),
+      ...['clusterrolebindings', 'rolebindings', 'clusterroles'].flatMap((kind) => [
+        urnOf(`validatingadmissionpolicy-di-test-tenant-operator-${kind}`),
+        urnOf(`validatingadmissionpolicybinding-di-test-tenant-operator-${kind}`),
+      ]),
     ]);
     expect(dependsOn('clusterrolebinding-di-test-controller')).toEqual(
       expect.arrayContaining([
@@ -163,6 +187,10 @@ describe('installTenancy controller RBAC wiring', () => {
       r.type.startsWith('kubernetes:rbac.authorization.k8s.io/'),
     );
     expect(rbac.map((r) => r.name).sort()).toEqual([
+      // The tenant operators' fixed ClusterRoles (#541 m3), not the controller's: unbound here.
+      'clusterrole-di-tenant-operator-hosts',
+      'clusterrole-di-tenant-operator-self',
+      'clusterrole-di-tenant-operator-workloads',
       'clusterrole-di-test-controller',
       'clusterrolebinding-di-test-controller',
       'role-di-test-controller',

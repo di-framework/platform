@@ -1,0 +1,123 @@
+# The `rules:` of the runtime-operator chart 2.8.0 operator Roles, copied verbatim from
+# `helm pull oci://ghcr.io/wasmcloud/charts/runtime-operator --version 2.8.0`
+# (chart digest sha256:63e87326539df1146bf2fe9f12982d4eb5cfb4704252067d4a6932478bb34912),
+# grouped by the tenant-operator ClusterRole that carries them (design-541 §4.6).
+self:
+  # templates/operator/role.yaml
+  - apiGroups: ['coordination.k8s.io']
+    resources: ['leases']
+    verbs: ['get', 'list', 'watch', 'create', 'update', 'patch', 'delete']
+  - apiGroups: ['']
+    resources: ['events']
+    verbs: ['create', 'patch']
+  - apiGroups: ['']
+    resources: ['pods']
+    verbs: ['get', 'list', 'patch', 'watch']
+  - apiGroups: ['runtime.wasmcloud.dev']
+    resources: ['hosts', 'hosts/finalizers']
+    verbs: ['get', 'list', 'watch', 'create', 'update', 'patch', 'delete']
+  - apiGroups: ['runtime.wasmcloud.dev']
+    resources: ['hosts/status']
+    verbs: ['get', 'update', 'patch']
+workloads:
+  # templates/operator/workload-crd-role.yaml
+  - apiGroups:
+      - runtime.wasmcloud.dev
+    resources:
+      - artifacts
+      - workloads
+      - workloadreplicasets
+      - workloaddeployments
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - runtime.wasmcloud.dev
+    resources:
+      - artifacts/status
+      - workloads/status
+      - workloadreplicasets/status
+      - workloaddeployments/status
+    verbs:
+      - get
+      - update
+      - patch
+  - apiGroups:
+      - runtime.wasmcloud.dev
+    resources:
+      - artifacts/finalizers
+      - workloads/finalizers
+      - workloadreplicasets/finalizers
+      - workloaddeployments/finalizers
+    verbs:
+      - update
+  # templates/operator/workload-namespace-role.yaml
+  - apiGroups:
+      - ''
+    resources:
+      - configmaps
+      - secrets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ''
+    resources:
+      - events
+    verbs:
+      - create
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - ''
+    resources:
+      - services
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ''
+    resources:
+      - services/finalizers
+    verbs:
+      - update
+  # templates/operator/endpointslice-role.yaml
+  - apiGroups:
+      - discovery.k8s.io
+    resources:
+      - endpointslices
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - discovery.k8s.io
+    resources:
+      - endpointslices/restricted
+    verbs:
+      - create
+  - apiGroups:
+      - ''
+    resources:
+      - endpoints/restricted
+    verbs:
+      - create
+hosts:
+  # templates/operator/host-pod-role.yaml
+  - apiGroups: ['']
+    resources: ['pods']
+    verbs: ['get', 'list', 'patch', 'watch']
