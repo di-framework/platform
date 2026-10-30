@@ -57,6 +57,14 @@ export const SCHEDULER_ACCOUNTS_CONDITION = 'SchedulerAccounts';
 export const TENANT_MAX_SUBSCRIPTIONS = 64;
 export const TENANT_MAX_PAYLOAD = 1048576;
 export const tenantMaxConnections = (replicas: number): number => 2 * replicas + 4;
+/**
+ * The `DATA` account's JetStream limits (#541 m6d, O5). They equal the server-wide caps of the m6b
+ * `nats` server (`JETSTREAM_MAX_MEMORY_STORE`, `JETSTREAM_MAX_FILE_STORE` in
+ * `scheduler-nats-server.ts`), so the only JetStream account can never reserve more than the
+ * server holds; a test keeps them within those caps.
+ */
+export const DATA_MAX_MEMORY = '32M';
+export const DATA_MAX_FILE = '1G';
 
 /** A Tenant as the renderer reads it: its name and its host replicas. */
 export interface AccountsTenant {
@@ -70,7 +78,8 @@ export interface AccountsProblem {
     | 'InvalidAccountName'
     | 'InvalidReplicas'
     | 'InvalidSchedulerUser'
-    | 'DuplicateSchedulerUser';
+    | 'DuplicateSchedulerUser'
+    | 'EmptyPlatformAccount';
   tenant?: string;
   message: string;
 }
@@ -148,7 +157,11 @@ function accounts(
       head: [],
       users: [...platform('host', HOST_PERMISSIONS), ...platform('operator', OPERATOR_PERMISSIONS)],
     },
-    { name: DATA_ACCOUNT, head: ['jetstream: enabled'], users: platform('data') },
+    {
+      name: DATA_ACCOUNT,
+      head: [`jetstream: { max_mem: ${DATA_MAX_MEMORY}, max_file: ${DATA_MAX_FILE} }`],
+      users: platform('data'),
+    },
   ];
   for (const tenant of tenants) {
     const t = tenant.metadata.name;
@@ -240,6 +253,14 @@ function validate(
         });
       seen.add(user.name);
     }
+  // The platform accounts are never optional: without their users the platform hosts, the chart's
+  // operator or the data connection would be shut out on the next reload.
+  for (const name of [`T_${namespace}`, DATA_ACCOUNT])
+    if (!rendered.some((account) => account.name === name))
+      problems.push({
+        reason: 'EmptyPlatformAccount',
+        message: `account ${name} has no users in the identity record`,
+      });
   return problems;
 }
 

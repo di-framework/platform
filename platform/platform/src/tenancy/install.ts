@@ -76,6 +76,8 @@ export const CONTROLLER_SCRIPT_MODULES = [
   'scheduler-pki',
   'scheduler-pki-rotation',
   'scheduler-identities',
+  'scheduler-nats',
+  'scheduler-accounts',
   'controller',
 ] as const;
 
