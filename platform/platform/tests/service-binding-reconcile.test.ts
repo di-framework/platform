@@ -656,6 +656,22 @@ describe('service binding reconciliation edges (#587)', () => {
     expect(b.status?.conditions?.[0]?.reason).toBe('Ready');
   });
 
+  it('skips non-string data values of a connection Secret without echoing them', async () => {
+    const { api, controller, t } = prepare();
+    const stock = readyService('stock', 'keyvalue');
+    const b = kv();
+    api.seed(b);
+    const secret = conn({ backend: 'redis', password: 'live-password' }, true) as Resource & {
+      data: Record<string, unknown>;
+    };
+    secret.data.token = 424242;
+    api.seed(secret);
+    await controller.reconcileServiceBinding(b, t, stock, [b]);
+    expect(api.objects.get(creds)?.stringData).toEqual({ password: 'live-password' });
+    expect(b.status?.conditions?.[0]?.reason).toBe('Ready');
+    expect(JSON.stringify(b.status)).not.toContain('424242');
+  });
+
   it('drops its credential Secret once the credentials are rotated away, keeping foreign ones', async () => {
     const { api, controller, t } = prepare();
     const stock = readyService('stock', 'keyvalue');

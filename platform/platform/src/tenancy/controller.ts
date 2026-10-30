@@ -19,6 +19,7 @@ import {
   endpointFor,
   RUNTIME_DATA_NATS,
   type RuntimeProvider,
+  refuseReservedNames,
   resolveBackingSizing,
   resolveClass,
   tenantNameFromNamespace,
@@ -2385,6 +2386,7 @@ export class Controller {
   ): Promise<{ ready: boolean; failure?: DeploymentFailure }> {
     let ready = true;
     let failure: DeploymentFailure | undefined;
+    refuseReservedNames(desired);
     for (const value of desired) {
       const applied = await this.ensure(value, false, false, fetched);
       if (value.kind !== 'Deployment') continue;
@@ -2526,6 +2528,7 @@ export class Controller {
     else if (connSecret?.data) {
       serviceConn = {};
       for (const [key, value] of Object.entries(connSecret.data)) {
+        if (typeof value !== 'string') continue;
         serviceConn[key] = Buffer.from(value, 'base64').toString('utf8');
       }
     }

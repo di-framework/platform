@@ -12,6 +12,7 @@ import {
   parseCpu,
   parseMemory,
   RUNTIME_DATA_NATS,
+  refuseReservedNames,
   resolveBackingSizing,
   resolveClass,
   SERVICE,
@@ -684,7 +685,7 @@ describe('backing service reconciliation', () => {
     expect(api.objects.has('/apis/apps/v1/namespaces/di-runtime-alpha/deployments/di-redis')).toBe(
       true,
     );
-    const refreshed = api.objects.get(key(stock)) as unknown as BackingService | undefined;
+    const refreshed = api.objects.get(key(stock)) as BackingService | undefined;
     expect(refreshed?.status?.conditions?.[0]?.reason).toBe('Ready');
   });
 
@@ -1079,5 +1080,41 @@ describe('backing service storage root (#226)', () => {
     expect(liveBackingServiceHostPath(resources[0], service)).toBe(
       '/var/lib/kubesolo/di-tenants/alpha-uid/bs-stock',
     );
+  });
+});
+
+describe('reserved runtime names (#587)', () => {
+  const reserved = (kind: string, name: string): Resource =>
+    ({
+      apiVersion: kind === 'Deployment' ? 'apps/v1' : 'v1',
+      kind,
+      metadata: { name, namespace: 'di-runtime-alpha' },
+    }) as Resource;
+
+  it('refuses reserved names for every kind and accepts backing-service names', () => {
+    expect(() => refuseReservedNames([reserved('Deployment', RUNTIME_DATA_NATS)])).toThrow(
+      `Refusing to provision reserved name ${RUNTIME_DATA_NATS}`,
+    );
+    expect(() => refuseReservedNames([reserved('Service', TRANSITIONAL_REDIS)])).toThrow(
+      `Refusing to provision reserved name ${TRANSITIONAL_REDIS}`,
+    );
+    expect(() => refuseReservedNames([reserved('Secret', 'di-scheduler-tls')])).toThrow(
+      'Refusing to provision reserved name di-scheduler-tls',
+    );
+    expect(() => refuseReservedNames([reserved('Service', 'di-bs-stock')])).not.toThrow();
+  });
+
+  it('writes nothing when the desired set contains a reserved name', async () => {
+    const { api, controller } = prepare();
+    const apply = (
+      controller as unknown as {
+        applyBackingServiceResources: (desired: Resource[]) => Promise<unknown>;
+      }
+    ).applyBackingServiceResources.bind(controller);
+    api.operations.length = 0;
+    await expect(
+      apply([reserved('Service', 'di-bs-stock'), reserved('Deployment', RUNTIME_DATA_NATS)]),
+    ).rejects.toThrow(`Refusing to provision reserved name ${RUNTIME_DATA_NATS}`);
+    expect(api.operations).toEqual([]);
   });
 });

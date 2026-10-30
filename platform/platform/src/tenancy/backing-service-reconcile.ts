@@ -59,6 +59,13 @@ const RESERVED_RUNTIME_NAMES = new Set([
   'di-runtime',
 ]);
 
+/** Throws before any write when a desired resource would claim a reserved runtime name. */
+function refuseReservedNames(resources: readonly Resource[]): void {
+  for (const resource of resources)
+    if (RESERVED_RUNTIME_NAMES.has(resource.metadata.name))
+      throw new Error(`Refusing to provision reserved name ${resource.metadata.name}`);
+}
+
 function backingServiceResourceName(serviceName: string): string {
   return `di-bs-${serviceName}`;
 }
@@ -474,6 +481,7 @@ export {
   RESERVED_RUNTIME_NAMES,
   RUNTIME_DATA_NATS,
   type RuntimeProvider,
+  refuseReservedNames,
   resolveBackingSizing,
   resolveClass,
   SERVICE,
