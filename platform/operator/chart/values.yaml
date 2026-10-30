@@ -144,6 +144,6 @@ headlamp:
       plugins:
         - name: di-framework-platform
           source: https://artifacthub.io/packages/headlamp/di-framework-platform/di-framework-platform
-          version: 6.0.25
+          version: 6.0.26
     version: 0.1.1
     baseImage: node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53
