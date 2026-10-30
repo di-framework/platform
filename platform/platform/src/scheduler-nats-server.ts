@@ -46,6 +46,17 @@ const JETSTREAM_DIR = '/data/jetstream';
 /** Relative to the config file's directory, where the accounts ConfigMap is projected. */
 const ACCOUNTS_PATH = `accounts/${ACCOUNTS_KEY}`;
 
+/**
+ * JetStream limits. nats-server sizes its defaults from the node, not the container's cgroup, so
+ * without them one `DATA` memory stream could grow past the 128Mi limit and OOM-kill the only
+ * scheduler NATS, and a file stream could fill the node's disk through the emptyDir. The memory
+ * store stays at a quarter of the container limit; the file store matches the emptyDir's
+ * `sizeLimit`. To be tuned against Layer 3. The `DATA` account's own limits are m2's file (m6d).
+ */
+export const JETSTREAM_MAX_MEMORY_STORE = '32M';
+export const JETSTREAM_MAX_FILE_STORE = '1G';
+export const JETSTREAM_VOLUME_SIZE_LIMIT = '1Gi';
+
 /** The static server configuration. Only a `pulumi up` changes it. */
 export function schedulerNatsServerConfig(): string {
   return `port: ${SCHEDULER_NATS_PORT}
@@ -58,6 +69,8 @@ tls {
 }
 jetstream {
   store_dir: "${JETSTREAM_DIR}"
+  max_memory_store: ${JETSTREAM_MAX_MEMORY_STORE}
+  max_file_store: ${JETSTREAM_MAX_FILE_STORE}
 }
 include "${ACCOUNTS_PATH}"
 `;
@@ -70,7 +83,15 @@ export interface SchedulerNatsServerConfig {
   release?: string;
 }
 
-/** The labels the chart puts on its `nats` objects and pods, so selectors and policies match. */
+/**
+ * The pod label every selector and policy keys on: the chart's Service and Deployment selectors,
+ * `tenancy.ts`, `platform-ingress.ts`, the tenant operator egress and the vCluster target's
+ * `allow-platform-nats`. The pod template carries only this, so a runtime-operator bump does not
+ * roll the server.
+ */
+export const SCHEDULER_NATS_POD_LABELS = { 'wasmcloud.com/name': SCHEDULER_NATS_NAME };
+
+/** The labels the chart puts on its `nats` objects, kept on the objects' own metadata. */
 export function schedulerNatsLabels(release = 'wasmcloud'): Record<string, string> {
   return {
     'wasmcloud.com/name': SCHEDULER_NATS_NAME,
@@ -100,7 +121,7 @@ const containerSecurityContext = {
 export function schedulerNatsServerResources(cfg: SchedulerNatsServerConfig): Manifest[] {
   const labels = schedulerNatsLabels(cfg.release);
   const metadata = (name: string) => ({ name, namespace: cfg.namespace, labels });
-  const selector = { 'wasmcloud.com/name': SCHEDULER_NATS_NAME };
+  const selector = SCHEDULER_NATS_POD_LABELS;
   const watched = [
     `${CONFIG_DIR}/${SCHEDULER_NATS_CONFIG_KEY}`,
     `${CONFIG_DIR}/${ACCOUNTS_PATH}`,
@@ -134,7 +155,7 @@ export function schedulerNatsServerResources(cfg: SchedulerNatsServerConfig): Ma
         replicas: 1,
         selector: { matchLabels: selector },
         template: {
-          metadata: { labels },
+          metadata: { labels: SCHEDULER_NATS_POD_LABELS },
           spec: {
             automountServiceAccountToken: false,
             serviceAccountName: SCHEDULER_NATS_SERVICE_ACCOUNT,
@@ -173,7 +194,7 @@ export function schedulerNatsServerResources(cfg: SchedulerNatsServerConfig): Ma
               { name: 'nats-cert', secret: { secretName: PLATFORM_SECRETS.server } },
               { name: 'pid', emptyDir: {} },
               { name: 'tmp', emptyDir: {} },
-              { name: 'jetstream', emptyDir: {} },
+              { name: 'jetstream', emptyDir: { sizeLimit: JETSTREAM_VOLUME_SIZE_LIMIT } },
             ],
             containers: [
               {

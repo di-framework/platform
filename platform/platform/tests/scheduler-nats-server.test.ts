@@ -50,7 +50,11 @@ describe('identical to the chart where clients and policies look', () => {
     expect(deployment.metadata).toEqual(theirs.metadata);
     expect(deployment.spec.replicas).toBe(theirs.spec.replicas);
     expect(deployment.spec.selector).toEqual(theirs.spec.selector);
-    expect(deployment.spec.template.metadata.labels).toEqual(theirs.spec.template.metadata.labels);
+    // Only the label every selector and policy keys on, which is the chart's selector too, so a
+    // runtime-operator bump does not roll the server.
+    expect(theirs.spec.selector.matchLabels).toEqual({ 'wasmcloud.com/name': 'nats' });
+    expect(chartOf('Service').spec.selector).toEqual({ 'wasmcloud.com/name': 'nats' });
+    expect(deployment.spec.template.metadata.labels).toEqual({ 'wasmcloud.com/name': 'nats' });
     const chartNats = theirs.spec.template.spec.containers[0];
     expect(container('nats').ports).toEqual(chartNats.ports);
     expect(container('nats').livenessProbe).toEqual(chartNats.livenessProbe);
@@ -73,6 +77,48 @@ describe('identical to the chart where clients and policies look', () => {
 });
 
 describe('the server', () => {
+  it('renders exactly the static config of design-541 §4.1, with no other listener', () => {
+    // Pinned whole: an added `http`, `websocket`, `allow_non_tls` or `no_auth_user` fails here.
+    expect(config).toBe(`port: 4222
+pid_file: "/var/run/nats/nats.pid"
+tls {
+  cert_file: "/nats-cert/tls.crt"
+  key_file: "/nats-cert/tls.key"
+  ca_file: "/nats-cert/ca.crt"
+  verify_and_map: true
+}
+jetstream {
+  store_dir: "/data/jetstream"
+  max_memory_store: 32M
+  max_file_store: 1G
+}
+include "accounts/accounts.conf"
+`);
+  });
+
+  it('mounts exactly the volumes each container needs', () => {
+    const shared = [
+      { name: 'nats-config', mountPath: '/nats-config', readOnly: true },
+      { name: 'nats-cert', mountPath: '/nats-cert', readOnly: true },
+      { name: 'pid', mountPath: '/var/run/nats' },
+    ];
+    expect(container('nats').volumeMounts).toEqual([
+      ...shared,
+      { name: 'tmp', mountPath: '/tmp' },
+      { name: 'jetstream', mountPath: '/data/jetstream' },
+    ]);
+    expect(container('reloader').volumeMounts).toEqual(shared);
+    expect(pod.volumes.map((v: Doc) => v.name)).toEqual([
+      'nats-config',
+      'nats-cert',
+      'pid',
+      'tmp',
+      'jetstream',
+    ]);
+    expect(pod.volumes).toContainEqual({ name: 'pid', emptyDir: {} });
+    expect(pod.volumes).toContainEqual({ name: 'tmp', emptyDir: {} });
+  });
+
   it('runs the pinned nats-server without debug or trace flags', () => {
     expect(SCHEDULER_NATS_IMAGE).toMatch(
       /^docker\.io\/library\/nats:2\.12\.8-alpine@sha256:[0-9a-f]{64}$/,
@@ -122,7 +168,9 @@ describe('the server', () => {
   });
 
   it('enables JetStream at server level only, on the chart store, for the DATA account', () => {
-    expect(config).toContain('jetstream {\n  store_dir: "/data/jetstream"\n}');
+    expect(config).toContain(
+      'jetstream {\n  store_dir: "/data/jetstream"\n  max_memory_store: 32M\n  max_file_store: 1G\n}',
+    );
     // Only the accounts file turns it on per account, and only for DATA (O5).
     expect(accounts.match(/jetstream: enabled/g)).toHaveLength(1);
     expect(accounts).toMatch(/DATA: \{\n\s*jetstream: enabled/);
@@ -130,7 +178,9 @@ describe('the server', () => {
       name: 'jetstream',
       mountPath: '/data/jetstream',
     });
-    expect(pod.volumes).toContainEqual({ name: 'jetstream', emptyDir: {} });
+    // The file store fits the emptyDir; the memory store stays well under the 128Mi limit.
+    expect(pod.volumes).toContainEqual({ name: 'jetstream', emptyDir: { sizeLimit: '1Gi' } });
+    expect(container('nats').resources.limits.memory).toBe('128Mi');
   });
 
   it('has a token-less ServiceAccount', () => {
@@ -150,6 +200,10 @@ describe('the reloader', () => {
     expect(reloader.image).toBe(SCHEDULER_NATS_RELOADER_IMAGE);
     expect(pod.shareProcessNamespace).toBe(true);
     expect(reloader.securityContext).toEqual(container('nats').securityContext);
+    expect(reloader.resources).toEqual({
+      limits: { memory: '32Mi' },
+      requests: { cpu: '10m', memory: '16Mi' },
+    });
   });
 
   it('watches the config, the accounts file and the certificate, and signals via the pid file', () => {
@@ -168,10 +222,6 @@ describe('the reloader', () => {
       '-config',
       '/nats-cert/ca.crt',
     ]);
-    for (const name of ['nats-config', 'nats-cert', 'pid']) {
-      const mount = (c: Doc) => c.volumeMounts.find((m: Doc) => m.name === name);
-      expect(mount(reloader)).toEqual(mount(container('nats')));
-    }
   });
 });
 
