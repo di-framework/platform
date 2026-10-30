@@ -96,7 +96,7 @@ interface Identity {
   name: string;
   user: (id: string) => string;
 }
-interface Stored {
+export interface Stored {
   metadata: {
     name: string;
     namespace?: string;
@@ -106,7 +106,7 @@ interface Stored {
   };
   data?: Record<string, string>;
 }
-interface Pending {
+export interface Pending {
   reason: string;
   message: string;
 }
@@ -117,6 +117,148 @@ const configMapPath = (ns: string, name: string) => `/api/v1/namespaces/${ns}/co
 const namespacePath = (name: string) => `/api/v1/namespaces/${name}`;
 const decode = (value: string | undefined) =>
   value === undefined ? undefined : Buffer.from(value, 'base64').toString('utf8');
+
+/** The object at `path`, or undefined when the API server answers 404. */
+export async function getIfExists<T>(api: IdentityApi, path: string): Promise<T | undefined> {
+  try {
+    return await api.call<T>('GET', path);
+  } catch (error) {
+    if ((error as { code?: number })?.code === 404) return undefined;
+    throw error;
+  }
+}
+
+/**
+ * What a client identity's `secret` shows on top of `base`: its expiry, digest and the ID it
+ * carries, if it verifies against `caCert` with its key and names `user(id)`. A certificate that
+ * does not verify carries no usable ID, so it is re-issued for the recorded one.
+ */
+export function observeIdentity<B extends IdentityObservation>(
+  base: B,
+  secret: { data?: Record<string, string> } | undefined,
+  caCert: string,
+  user: (id: string) => string,
+): B {
+  if (!secret) return { ...base, secret: undefined };
+  const cert = decode(secret.data?.['tls.crt']) ?? '';
+  const key = decode(secret.data?.['tls.key']) ?? '';
+  if (!issuedBy(caCert, cert, key))
+    return { ...base, secret: { notAfter: new Date(0), digest: '' } };
+  const dns = certificateNames(cert)?.dns ?? [];
+  const id = dns.length === 1 ? issuanceIdOf(dns[0] as string) : undefined;
+  return {
+    ...base,
+    secret: {
+      notAfter: new Date(new X509Certificate(cert).validTo),
+      digest: schedulerCertDigest(cert),
+      ...(id && dns[0] === user(id) ? { id } : {}),
+    },
+  };
+}
+
+/** The fields of a host group Deployment that its rollout observation reads. */
+export interface HostDeployment {
+  metadata: { generation?: number };
+  spec?: {
+    replicas?: number;
+    template?: { metadata?: { annotations?: Record<string, string> } };
+  };
+  status?: {
+    observedGeneration?: number;
+    updatedReplicas?: number;
+    readyReplicas?: number;
+  };
+}
+
+/**
+ * A host identity's observation base from Deployment `deployment` as read (`value`, undefined when
+ * absent): its rollout of the certificate whose digest the pod-template `annotation` carries.
+ */
+export function hostRolloutOf(
+  value: HostDeployment | undefined,
+  deployment: string,
+  annotation: string = SCHEDULER_TLS_ANNOTATION,
+): HostObservation {
+  if (!value) return { client: 'host', deployment };
+  const replicas = value.spec?.replicas ?? 1;
+  const digest = value.spec?.template?.metadata?.annotations?.[annotation];
+  return {
+    client: 'host',
+    deployment,
+    rollout: {
+      deployment,
+      ...(digest ? { digest } : {}),
+      complete:
+        value.status?.observedGeneration === value.metadata.generation &&
+        (value.status?.updatedReplicas ?? 0) === replicas &&
+        (value.status?.readyReplicas ?? 0) === replicas,
+    },
+  };
+}
+
+/** The path of Deployment `name` in `namespace`. */
+export const deploymentPath = (namespace: string, name: string) =>
+  `/apis/apps/v1/namespaces/${namespace}/deployments/${name}`;
+
+/** A host identity's observation base: Deployment `deployment` and its rollout of the certificate. */
+export async function observeHostRollout(
+  api: IdentityApi,
+  namespace: string,
+  deployment: string,
+): Promise<HostObservation> {
+  const value = await getIfExists<HostDeployment>(api, deploymentPath(namespace, deployment));
+  return hostRolloutOf(value, deployment);
+}
+
+/** The scheduler CAs, or why they cannot sign yet. */
+export type SchedulerCasRead = Record<SchedulerCaKind, KeyPair> | Pending;
+
+/**
+ * Both scheduler CAs from `<namespace>-scheduler-pki/di-scheduler-ca`, or why they cannot sign
+ * yet. Key material stays in memory and out of every message.
+ */
+export async function readSchedulerCas(
+  api: IdentityApi,
+  namespace: string,
+  now: Date,
+): Promise<SchedulerCasRead> {
+  const pki = schedulerPkiNamespace(namespace);
+  const secret = await getIfExists<Stored>(api, secretPath(pki, SCHEDULER_CA_SECRET));
+  if (!secret)
+    return {
+      reason: 'CaNotReady',
+      message: `Waiting for the scheduler PKI bootstrap Job to create ${pki}/${SCHEDULER_CA_SECRET}`,
+    };
+  const cas = {} as Record<SchedulerCaKind, KeyPair>;
+  for (const kind of ['platform', 'tenant'] as const) {
+    const ca = {
+      cert: decode(secret.data?.[CA_KEYS[kind].cert]),
+      key: decode(secret.data?.[CA_KEYS[kind].key]),
+    };
+    const fault = schedulerCaFault(kind, namespace, ca, now);
+    if (fault) return { reason: 'CaNotReady', message: `${pki}/${SCHEDULER_CA_SECRET}: ${fault}` };
+    cas[kind] = ca as KeyPair;
+  }
+  return cas;
+}
+
+/**
+ * Replaces the identity record read as `stored` with `record`, under `stored`'s resourceVersion,
+ * so a record changed since it was read is not overwritten.
+ */
+export async function putIdentityRecord(
+  api: IdentityApi,
+  pki: string,
+  stored: Stored,
+  record: IdentityRecord,
+): Promise<void> {
+  await api.call('PUT', configMapPath(pki, SCHEDULER_IDENTITIES), {
+    apiVersion: 'v1',
+    kind: 'ConfigMap',
+    ...stored,
+    data: { ...stored.data, [IDENTITIES_KEY]: serializeIdentityRecord(record) },
+  });
+}
 
 /** The tenant's two identities: its hosts (tenant CA) and its runtime-operator (platform CA). */
 export function tenantIdentities(tenant: string): Identity[] {
@@ -178,13 +320,8 @@ export class TenantSchedulerIdentities {
     private readonly random?: (size: number) => Buffer,
   ) {}
 
-  private async get<T>(path: string): Promise<T | undefined> {
-    try {
-      return await this.api.call<T>('GET', path);
-    } catch (error) {
-      if ((error as { code?: number })?.code === 404) return undefined;
-      throw error;
-    }
+  private get<T>(path: string): Promise<T | undefined> {
+    return getIfExists<T>(this.api, path);
   }
 
   /** Drops the in-memory state of tenants no longer listed. */
@@ -241,87 +378,28 @@ export class TenantSchedulerIdentities {
     ];
   }
 
-  /** The CAs, or why they cannot sign yet. Key material stays in memory and out of every message. */
-  private async cas(): Promise<Record<SchedulerCaKind, KeyPair> | Pending> {
-    const pki = schedulerPkiNamespace(this.cfg.namespace);
-    const secret = await this.get<Stored>(secretPath(pki, SCHEDULER_CA_SECRET));
-    if (!secret)
-      return {
-        reason: 'CaNotReady',
-        message: `Waiting for the scheduler PKI bootstrap Job to create ${pki}/${SCHEDULER_CA_SECRET}`,
-      };
-    const cas = {} as Record<SchedulerCaKind, KeyPair>;
-    for (const kind of ['platform', 'tenant'] as const) {
-      const ca = {
-        cert: decode(secret.data?.[CA_KEYS[kind].cert]),
-        key: decode(secret.data?.[CA_KEYS[kind].key]),
-      };
-      const fault = schedulerCaFault(kind, this.cfg.namespace, ca, this.now());
-      if (fault)
-        return { reason: 'CaNotReady', message: `${pki}/${SCHEDULER_CA_SECRET}: ${fault}` };
-      cas[kind] = ca as KeyPair;
-    }
-    return cas;
+  private cas(): Promise<SchedulerCasRead> {
+    return readSchedulerCas(this.api, this.cfg.namespace, this.now());
   }
 
-  /** What `secret` shows of `identity`: its expiry, digest and the ID it carries, if it verifies. */
   private observe(
     identity: Identity,
     secret: Stored | undefined,
     cas: Record<SchedulerCaKind, KeyPair>,
     hosts: HostObservation | undefined,
   ): IdentityObservation {
-    const base = hosts ?? { client: 'operator' as const };
-    if (!secret) return { ...base, secret: undefined };
-    const cert = decode(secret.data?.['tls.crt']) ?? '';
-    const key = decode(secret.data?.['tls.key']) ?? '';
-    // A certificate that does not verify against its CA with its key carries no usable ID, so it
-    // is re-issued for the recorded one.
-    if (!issuedBy(cas[identity.ca].cert, cert, key))
-      return { ...base, secret: { notAfter: new Date(0), digest: '' } };
-    const dns = certificateNames(cert)?.dns ?? [];
-    const id = dns.length === 1 ? issuanceIdOf(dns[0] as string) : undefined;
-    return {
-      ...base,
-      secret: {
-        notAfter: new Date(new X509Certificate(cert).validTo),
-        digest: schedulerCertDigest(cert),
-        ...(id && dns[0] === identity.user(id) ? { id } : {}),
-      },
-    };
+    return observeIdentity<IdentityObservation>(
+      hosts ?? { client: 'operator' },
+      secret,
+      cas[identity.ca].cert,
+      identity.user,
+    );
   }
 
   /** The hosts' observation base: the hostgroup Deployment and its rollout of the certificate. */
-  private async hostRollout(tenant: Tenant): Promise<HostObservation> {
+  private hostRollout(tenant: Tenant): Promise<HostObservation> {
     const n = names(tenant.metadata.name);
-    const deployment = `hostgroup-${n.hostgroup}`;
-    const value = await this.get<{
-      metadata: { generation?: number };
-      spec?: {
-        replicas?: number;
-        template?: { metadata?: { annotations?: Record<string, string> } };
-      };
-      status?: {
-        observedGeneration?: number;
-        updatedReplicas?: number;
-        readyReplicas?: number;
-      };
-    }>(`/apis/apps/v1/namespaces/${n.runtimeNamespace}/deployments/${deployment}`);
-    if (!value) return { client: 'host', deployment };
-    const replicas = value.spec?.replicas ?? 1;
-    const digest = value.spec?.template?.metadata?.annotations?.[SCHEDULER_TLS_ANNOTATION];
-    return {
-      client: 'host',
-      deployment,
-      rollout: {
-        deployment,
-        ...(digest ? { digest } : {}),
-        complete:
-          value.status?.observedGeneration === value.metadata.generation &&
-          (value.status?.updatedReplicas ?? 0) === replicas &&
-          (value.status?.readyReplicas ?? 0) === replicas,
-      },
-    };
+    return observeHostRollout(this.api, n.runtimeNamespace, `hostgroup-${n.hostgroup}`);
   }
 
   private async issue(tenant: Tenant): Promise<{ pending?: Pending; stalled?: string }> {
@@ -417,12 +495,7 @@ export class TenantSchedulerIdentities {
     // The record first: a user name then always names exactly one certificate.
     const text = serializeIdentityRecord(next.record);
     if (text !== serializeIdentityRecord(record))
-      await this.api.call('PUT', configMapPath(pki, SCHEDULER_IDENTITIES), {
-        apiVersion: 'v1',
-        kind: 'ConfigMap',
-        ...stored,
-        data: { ...stored.data, [IDENTITIES_KEY]: text },
-      });
+      await putIdentityRecord(this.api, pki, stored, next.record);
     // After the record and before issuance, so an interrupted forced rotation repeats at most once.
     if (forcedKinds.length > 0) {
       // The kinds already handled are sent too, so the write never depends on a deep merge.
@@ -511,11 +584,6 @@ export class TenantSchedulerIdentities {
     const key = tenantIdentity(tenant, kind);
     if (!record[key]) return;
     delete record[key];
-    await this.api.call('PUT', configMapPath(pki, SCHEDULER_IDENTITIES), {
-      apiVersion: 'v1',
-      kind: 'ConfigMap',
-      ...stored,
-      data: { ...stored.data, [IDENTITIES_KEY]: serializeIdentityRecord(record) },
-    });
+    await putIdentityRecord(this.api, pki, stored, record);
   }
 }

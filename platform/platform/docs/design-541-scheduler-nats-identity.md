@@ -308,7 +308,7 @@ How the pieces give the properties:
 
     `previous` is dropped only once the rollout is observed. That means `observedGeneration` is current and all replicas are updated and ready, which is what the readiness gate at `controller.ts:1028-1042` checks. `previousUntil` does not apply to hosts.
 
-    If the rollout has not finished after 10 minutes, the controller keeps both users and reports `SchedulerIdentityRenewalStalled` with the Deployment's name. For tenant hosts this is a Tenant condition; for the platform host it goes to the controller's log and status. A host is therefore never cut off by a routine renewal. A forced rotation still revokes immediately.
+    If the rollout has not finished after 10 minutes, the controller keeps both users and reports `SchedulerIdentityRenewalStalled` with the Deployment's name. For tenant hosts this is a Tenant condition; for the platform host it goes to the controller's log (there is no platform status object to carry it). A host is therefore never cut off by a routine renewal. A forced rotation still revokes immediately.
 
 **Removal sequence.** This runs when a Tenant has a `deletionTimestamp`, under either deletion policy. The tenant's operator must stay connected and bound until it has cleared its own finalizers:
 - the pod-host finalizer on `di-runtime-<t>` pods (`host_pod_controller.go:65-90`);
