@@ -273,5 +273,5 @@ describe.if(broker)('the real nats-server', () => {
     );
     expect(`${result.stdout}${result.stderr}`).toContain('configuration file');
     expect(result.status).toBe(0);
-  });
+  }, 300_000); // covers a cold image pull (spawnSync allows 300 s)
 });
