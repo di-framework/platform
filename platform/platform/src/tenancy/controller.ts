@@ -139,6 +139,11 @@ import {
   validName,
 } from './resources';
 import {
+  ownsIdentitySecret,
+  TENANT_HOST_SECRET,
+  TenantSchedulerIdentities,
+} from './scheduler-identities';
+import {
   assertSafeBindingStatus,
   bindingProjectionName,
   bindingSecretName,
@@ -482,7 +487,11 @@ export class Controller {
     private readonly resolveName: (name: string) => Promise<string[]> = resolveIpv4,
     /** The clock certificate issuance and CA rotation (#170) read. */
     private readonly now: () => Date = () => new Date(),
-  ) {}
+  ) {
+    this.identities = new TenantSchedulerIdentities(api, cfg, now);
+  }
+  /** Issuance of each tenant's scheduler NATS identities (#541 m6c). */
+  private readonly identities: TenantSchedulerIdentities;
   private async get<T>(path: string): Promise<T | undefined> {
     try {
       return await this.api.call<T>('GET', path);
@@ -660,11 +669,12 @@ export class Controller {
    */
   private async removeTenant(tenant: Tenant): Promise<void> {
     const steps: [RemovalStep, () => Promise<string[]>][] = [
-      // The R1 and R4 reload-applied checks and the R3 Retain finalizer removal arrive with m6.
-      ['R1', () => Promise.resolve([])],
+      // R1 and R4 drop the record entries; their reload-applied checks and the R3 Retain
+      // finalizer removal arrive with the cut-over (m6e).
+      ['R1', () => this.identities.drop(tenant.metadata.name, 'hosts').then(() => [])],
       ['R2', () => this.removalStopHosts(tenant)],
       ['R3', () => this.removalWorkloads(tenant)],
-      ['R4', () => Promise.resolve([])],
+      ['R4', () => this.identities.drop(tenant.metadata.name, 'operator').then(() => [])],
       ['R5', () => this.removalOperator(tenant)],
       ['R6', () => this.removalNamespaces(tenant)],
     ];
@@ -790,6 +800,13 @@ export class Controller {
         })
       ).filter(bindsTenantOperatorRole);
     for (const binding of await bindings()) await this.remove(binding);
+    // The hosts' scheduler identity, which a retained runtime namespace would otherwise keep; the
+    // operator's goes with `di-operator-<t>` below.
+    const identity = await this.get<Resource>(
+      `${collection('v1', 'Secret', names(t).runtimeNamespace)}/${TENANT_HOST_SECRET}`,
+    );
+    if (identity && ownsIdentitySecret(identity, this.cfg.installation, tenant.metadata.uid))
+      await this.remove(identity);
     const remaining = (await bindings()).map(
       (b) => `rolebinding/${b.metadata.namespace}/${b.metadata.name}`,
     );
@@ -1355,6 +1372,10 @@ export class Controller {
     } catch (error) {
       failure ??= error;
     }
+    // Issued apart from the apply, which a failed host Deployment must not hold back, and also while
+    // suspended: the tenant operator keeps running then (design-541 §4.5), so its identity must not
+    // expire. Inert until the cut-over: no pod mounts these identities yet (#541 m6c).
+    const identity = await this.identities.reconcile(tenant);
     // Tenant-auth is independent of the tenant's own objects: a failed apply above (such as a
     // hostgroup 409) must not keep it from reconciling or from reporting TenantAuthReady (#121).
     let auth = await this.reconcileTenantAuth(tenant, users);
@@ -1370,8 +1391,15 @@ export class Controller {
       observedGeneration: tenant.metadata.generation ?? 1,
       lastTransitionTime: new Date().toISOString(),
     };
-    const others = [...(auth ? [auth] : []), ...(logs ? [logs] : []), integrity];
-    const records = { storage: { keys: storage.records } };
+    const others = [...(auth ? [auth] : []), ...(logs ? [logs] : []), integrity, ...identity];
+    const records = {
+      storage: { keys: storage.records },
+      // The rotation last handled (#541 m6c), carried into every status write so the controller
+      // never writes a status that lacks it.
+      ...(tenant.status?.schedulerIdentity
+        ? { schedulerIdentity: tenant.status.schedulerIdentity }
+        : {}),
+    };
     if (failure) {
       const message = failure instanceof Error ? failure.message : 'Reconciliation failed';
       console.error(`Tenant/${tenant.metadata.name}: ${message}`);
@@ -2954,6 +2982,7 @@ export class Controller {
     for (const uid of this.storageListings.keys())
       if (!uids.has(uid)) this.storageListings.delete(uid);
     for (const name of this.caRefusals.keys()) if (!listed.has(name)) this.caRefusals.delete(name);
+    this.identities.forget(listed);
     for (const name of this.logCursors.keys())
       if (!projected.has(name)) this.logCursors.delete(name);
     for (const name of this.logWriteFailures.keys())

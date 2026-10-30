@@ -266,7 +266,7 @@ How the pieces give the properties:
 | Platform host group | `<id>.host.platform.scheduler.di-framework.invalid` | `di-scheduler-platform-host-tls` (platform ns) | `hostgroup-default` |
 | Platform data | `<id>.data.platform.scheduler.di-framework.invalid` | `di-scheduler-data-tls` (platform ns) | `hostgroup-default` |
 | Tenant `<t>` operator | `<id>.operator.di-tenant-<t>.platform.scheduler.di-framework.invalid` | `di-scheduler-operator-tls` (`di-operator-<t>`) | the tenant's operator |
-| Tenant `<t>` hosts | `<id>.di-tenant-<t>.tenants.scheduler.di-framework.invalid` | `di-scheduler-tls` (`di-runtime-<t>`) | `hostgroup-tenant-<t>` |
+| Tenant `<t>` hosts | `<id>.di-tenant-<t>.tenants.scheduler.di-framework.invalid` | `di-scheduler-host-tls` (`di-runtime-<t>`) | `hostgroup-tenant-<t>` |
 | Both CA keys | none | `di-scheduler-ca` (`<platform-ns>-scheduler-pki`) | **no pod** |
 | Identity record | none | ConfigMap `di-scheduler-identities` (`<platform-ns>-scheduler-pki`) | **no pod** |
 
@@ -425,9 +425,9 @@ The platform controller renders, for each Tenant, the same objects the chart ren
 ### 4.8 Tenant hosts
 
 - `controller.ts:994-996` stops reading `wasmcloud-runtime-tls`. The controller issues the tenant host certificate instead (4.5). The readiness gate (`controller.ts:1028-1042`) requires that certificate where it now requires the copied Secret, and it requires the tenant operator's Deployment to be ready.
-- `di-scheduler-tls` holds only the tenant's own key and certificate and the platform CA bundle (P6). Flags, mount path and URL stay the same (`resources.ts:1495-1505,1548,1573`).
+- `di-scheduler-host-tls` holds only the tenant's own key and certificate and the platform CA bundle (P6). It is not `di-scheduler-tls` because, until the cut-over, that name holds the controller's copy of `wasmcloud-runtime-tls`, which the hosts mount and the controller re-applies on every pass; the controller issues the identity under the new name from m6c on. m6e mounts `di-scheduler-host-tls` in place of the copy and deletes the copied `di-scheduler-tls`. Flags, mount path and URL stay the same (`resources.ts:1495-1505,1548,1573`).
 - The host pod template gets the certificate-digest annotation (4.5).
-- A pod that mounts `di-scheduler-tls` holds one tenant's host identity, which reaches only that tenant's operator.
+- A pod that mounts `di-scheduler-host-tls` holds one tenant's host identity, which reaches only that tenant's operator.
 
 ### 4.9 Platform-side exposure on the vCluster target: closed or parked
 
@@ -563,7 +563,7 @@ Two tenants and the platform host group:
 
 ### 8.4 Layer 4, against the broker with tenant A's credentials
 
-**Setup.** The client is a pod in `di-runtime-a` labelled `wasmcloud.com/name=hostgroup`. It mounts `di-scheduler-tls` read-only and runs a digest-pinned NATS CLI image. The platform's NATS ingress rule admits it, so network policy cannot mask a missing broker permission. The harness creates it with the instance admin kubeconfig. For each step, record the broker's exact response.
+**Setup.** The client is a pod in `di-runtime-a` labelled `wasmcloud.com/name=hostgroup`. It mounts `di-scheduler-host-tls` read-only and runs a digest-pinned NATS CLI image. The platform's NATS ingress rule admits it, so network policy cannot mask a missing broker permission. The harness creates it with the instance admin kubeconfig. For each step, record the broker's exact response.
 
 1. **Refused publishes.** Publish to `runtime.host.<A-host-id>.workload.status`, `runtime.host.<B-host-id>.workload.status`, `$JS.API.INFO` and `_INBOX.x`. Each gets `Permissions Violation for Publish`.
 2. **Refused subscriptions.** Subscribe to `>`, `runtime.operator.heartbeat.>` and `_INBOX.>`. Each gets `Permissions Violation for Subscription`.
@@ -586,7 +586,7 @@ Two tenants and the platform host group:
    - **7g (R7).** Both Tenants are gone. Tenant A shows no reconnect and no restart throughout.
    - **7h (stuck step).** On a third tenant, add a foreign finalizer to one Workload, then delete the Tenant. After the deadline, `RemovalStuck` names the step and the Workload. Removing the foreign finalizer lets removal complete.
    - **7i (re-adding).** Re-create C. Its new operator reconciles the retained WorkloadDeployments and places them.
-8. **Keys and certificates.** `di-scheduler-tls` in A and in B have different public-key fingerprints. Neither `wasmcloud-runtime-tls` nor `wasmcloud-ca` exists.
+8. **Keys and certificates.** `di-scheduler-host-tls` in A and in B have different public-key fingerprints. Neither `wasmcloud-runtime-tls`, `wasmcloud-ca` nor a copied `di-scheduler-tls` exists.
 9. **Logs.** After a deploy, the NATS pod's log has no `MSG_PAYLOAD` lines.
 10. **Operator RBAC.** Check `kubectl auth can-i get secrets` as each operator's ServiceAccount:
     - tenant A's operator: `yes` in `di-tenant-a`; `no` in `di-tenant-b`, `di-runtime-a`, `kube-system` and `<platform-ns>-scheduler-pki`;
