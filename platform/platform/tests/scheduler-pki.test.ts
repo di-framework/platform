@@ -37,7 +37,12 @@ import {
   tenantOperatorUser,
   tlsSecretData,
 } from '../src/tenancy/scheduler-pki';
-import { main } from '../src/tenancy/scheduler-pki-job';
+import {
+  main,
+  PKI_RETRY_BUDGET_MS,
+  RetryingApi,
+  transientClass,
+} from '../src/tenancy/scheduler-pki-job';
 import {
   caCertificate,
   caConstraints,
@@ -815,5 +820,107 @@ describe('scheduler-pki entry point', () => {
     const api = new FakeApi();
     await expect(main(api, undefined, () => {})).rejects.toThrow('Missing SCHEDULER_PKI_CONFIG');
     expect(api.calls).toEqual([]);
+  });
+});
+
+describe('scheduler-pki connection retry (#583)', () => {
+  /** Refuses the first `refusals` connections, then lets every call through to `inner`. */
+  class RefusingApi implements PkiApi {
+    attempts = 0;
+    constructor(
+      readonly inner: FakeApi,
+      private refusals: number,
+      private readonly code: string | number = 'ECONNREFUSED',
+    ) {}
+    call<T>(method: string, path: string, body?: unknown): Promise<T> {
+      this.attempts++;
+      if (this.refusals > 0) {
+        this.refusals--;
+        const error =
+          typeof this.code === 'number'
+            ? Object.assign(new Error(`${method} ${path} returned ${this.code}`), {
+                code: this.code,
+              })
+            : Object.assign(new Error(`connect ${this.code} 10.0.0.1:443`), { code: this.code });
+        return Promise.reject(error);
+      }
+      return this.inner.call<T>(method, path, body);
+    }
+  }
+  /** A clock the injected sleep advances, so no test waits. */
+  function clock() {
+    let t = 0;
+    const waits: number[] = [];
+    return {
+      waits,
+      now: () => t,
+      sleep: async (ms: number) => {
+        waits.push(ms);
+        t += ms;
+      },
+    };
+  }
+
+  it('classifies connection codes and 429/5xx as transient, other statuses not', () => {
+    for (const code of ['ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'ETIMEDOUT'])
+      expect(transientClass({ code })).toBe(code);
+    expect(transientClass({ code: 503 })).toBe('HTTP 503');
+    expect(transientClass({ code: 429 })).toBe('HTTP 429');
+    for (const code of [403, 404, 409, 'ENOENT', undefined])
+      expect(transientClass({ code })).toBeUndefined();
+    expect(transientClass(null)).toBeUndefined();
+  });
+
+  it('retries refused connections and writes everything once', async () => {
+    const store = new FakeApi();
+    const refusing = new RefusingApi(store, 5);
+    const c = clock();
+    const lines: string[] = [];
+    await main(new RetryingApi(refusing, c.sleep, c.now), JSON.stringify(config), (l) =>
+      lines.push(l),
+    );
+    expect(c.waits).toEqual([250, 500, 1000, 2000, 4000]);
+    expect(lines.at(-1)).toBe('scheduler PKI ready (7 written)');
+    // The same calls, each once, as a run that was never refused.
+    const plain = new FakeApi();
+    await main(plain, JSON.stringify(config), () => {});
+    expect(store.calls).toEqual(plain.calls);
+    expect(store.objects.size).toBe(7);
+  });
+
+  it('caps the backoff at 5 s and gives up after the budget with the error class', async () => {
+    const store = new FakeApi();
+    const c = clock();
+    const api = new RetryingApi(new RefusingApi(store, Number.POSITIVE_INFINITY), c.sleep, c.now);
+    const error = (await main(api, JSON.stringify(config), () => {}).catch(
+      (e: Error) => e,
+    )) as Error;
+    expect(error.message).toMatch(
+      /^GET \/api\/v1\/\S+ still failing with ECONNREFUSED after \d+ s of retries$/,
+    );
+    expect(Math.max(...c.waits)).toBe(5000);
+    expect(c.now()).toBeLessThanOrEqual(PKI_RETRY_BUDGET_MS);
+    expect(c.now()).toBeGreaterThan(PKI_RETRY_BUDGET_MS - 5000);
+    expect(store.calls).toEqual([]);
+  });
+
+  it('does not retry HTTP 403', async () => {
+    const refusing = new RefusingApi(new FakeApi(), 1, 403);
+    const c = clock();
+    await expect(
+      main(new RetryingApi(refusing, c.sleep, c.now), JSON.stringify(config), () => {}),
+    ).rejects.toMatchObject({ code: 403 });
+    expect(refusing.attempts).toBe(1);
+    expect(c.waits).toEqual([]);
+  });
+
+  it('waits on the real clock by default', async () => {
+    const refusing = new RefusingApi(new FakeApi(), 1, 'ECONNRESET');
+    const started = Date.now();
+    await new RetryingApi(refusing).call('POST', `/api/v1/namespaces/${PKI}/configmaps`, {
+      metadata: { name: 'x' },
+    });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(200);
+    expect(refusing.attempts).toBe(2);
   });
 });
