@@ -323,8 +323,6 @@ function backingServiceResources(
     throw new Error('PostgreSQL requires the dedicated credentials and PVC reconciliation helpers');
   if (cls.spec.provider === 'platform') throw new Error('Egress services provision no backend');
   const resourceName = backingServiceResourceName(service.metadata.name);
-  if (RESERVED_RUNTIME_NAMES.has(resourceName))
-    throw new Error(`Refusing to provision reserved name ${resourceName}`);
   const n = names(tenant.metadata.name);
   const suspended = !!tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
   const replicas = suspended || service.metadata.deletionTimestamp ? 0 : 1;

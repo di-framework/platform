@@ -392,6 +392,24 @@ describe('workload volume backup', () => {
     expect(await runAgent(request(), gone)).toBe(1);
     expect((await termination()).error).toBe('SourceChanged');
   });
+
+  test('fails and discards the archive when tar exits 0 on a truncated stream', async () => {
+    // Only the first header reaches the reader: tar "succeeded" but the archive has no end.
+    const truncated = io();
+    const pipe = truncated.pipe.bind(truncated);
+    truncated.pipe = (from, to, inspect) => {
+      let seen = 0;
+      return pipe(from, to, (chunk) => {
+        const kept = chunk.subarray(0, Math.max(0, 512 - seen));
+        seen += chunk.length;
+        if (kept.length) inspect?.(kept);
+      });
+    };
+    expect(await runAgent(request(), truncated)).toBe(1);
+    expect((await termination()).error).toBe('ArchiveInvalid');
+    expect(existsSync(join(claim, PREFIX, 'data.tar'))).toBe(false);
+    expect(existsSync(join(claim, PREFIX, 'data.tar.partial'))).toBe(false);
+  });
 });
 
 async function tree(dir: string): Promise<Record<string, string>> {

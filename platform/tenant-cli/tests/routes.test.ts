@@ -11,6 +11,28 @@ test('every contract operation has exactly one route', () => {
   expect(match('POST', '/v1/deployments')).toBeUndefined();
 });
 
+test('a body stream that fails while being read is not turned into a 400', async () => {
+  const failure = new Error('client connection reset');
+  const handlers = useContainer().resolve(TenantControllerHandlers);
+  const original = handlers.setSecret;
+  let reached = false;
+  handlers.setSecret = (async () => {
+    reached = true;
+    return new Response(null, { status: 204 });
+  }) as never;
+  try {
+    const request = new Request('http://controller.test/v1/secrets/db?env=prod', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: new ReadableStream({ pull: (c) => c.error(failure) }),
+    });
+    await expect(dispatch(request)).rejects.toBe(failure);
+    expect(reached).toBe(false);
+  } finally {
+    handlers.setSecret = original;
+  }
+});
+
 test('requests that name no operation are left to the caller', async () => {
   expect(await dispatch(new Request('http://controller.test/v1/unknown'))).toBeUndefined();
 });

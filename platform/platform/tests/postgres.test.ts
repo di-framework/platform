@@ -297,6 +297,90 @@ describe('dedicated PostgreSQL', () => {
       '2Gi',
     );
   });
+  test('refuses to grow a PVC without a storage class', async () => {
+    const t = setup();
+    await t.reconcile();
+    const pvc = t.get('PersistentVolumeClaim', postgresNames(t.s).pvc)!;
+    expect((pvc.spec as { storageClassName?: string }).storageClassName).toBeUndefined();
+    t.s.spec.parameters = { storage: '2Gi' };
+    await t.reconcile();
+    expect(condition(t.s)?.message).toBe(
+      'StorageExpansionUnsupported: StorageClass (none) does not allow expansion',
+    );
+  });
+  test('resolves a credentials create that races another writer (409)', async () => {
+    const t = setup();
+    const n = postgresNames(t.s);
+    const credentialsAt = `${collection('v1', 'Secret', ns)}`;
+    const original = t.api.call.bind(t.api);
+    let racer: ((body: Resource) => Promise<void>) | undefined;
+    t.api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      const value = body as Resource | undefined;
+      if (method === 'POST' && path === credentialsAt && value?.metadata.name === n.credentials) {
+        await racer?.(value);
+        throw new ApiError(409, 'AlreadyExists');
+      }
+      return original<T>(method, path, body);
+    };
+    // The racer's Secret vanished again before it could be read: the conflict is reported.
+    await t.reconcile();
+    expect(condition(t.s)).toMatchObject({ reason: 'Failed', message: 'AlreadyExists' });
+    // A racer that is not this service: its Secret is not adopted.
+    racer = async (body) => {
+      t.api.seed({ ...body, metadata: { ...body.metadata, labels: { [OWNER]: 'other' } } });
+    };
+    await t.reconcile();
+    expect(condition(t.s)?.message).toBe(`Refusing to adopt Secret ${n.credentials}`);
+    t.api.objects.delete(key(t.get('Secret', n.credentials)!));
+    // An earlier pass of this controller: its Secret is used as is.
+    let written: Resource | undefined;
+    racer = async (body) => {
+      written = body;
+      t.api.seed(body);
+    };
+    await t.reconcile();
+    expect(condition(t.s)?.status).toBe('True');
+    expect(secretData(t.get('Secret', n.credentials)!)).toEqual(secretData(written!));
+  });
+  test('refuses to delete a resource of the service outside its runtime namespace', async () => {
+    const t = setup();
+    await t.reconcile();
+    t.api.seed({
+      apiVersion: 'v1',
+      kind: 'ConfigMap',
+      metadata: {
+        name: 'planted',
+        namespace: 'elsewhere',
+        labels: { [INSTALLATION]: cfg.installation, [OWNER]: t.s.metadata.uid! },
+      },
+    });
+    t.s.metadata.deletionTimestamp = new Date().toISOString();
+    await expect(t.reconcile()).rejects.toThrow('PostgreSQL resource namespace mismatch');
+    expect(t.get('ConfigMap', 'planted', 'elsewhere')).toBeDefined();
+    expect(t.s.metadata.finalizers).toContain(FINALIZER);
+  });
+  test('reports a PostgreSQL binding whose connection Secret is missing', async () => {
+    const t = setup();
+    await t.reconcile();
+    t.api.objects.delete(key(t.get('Secret', postgresNames(t.s).connection)!));
+    const binding: ServiceBinding = {
+      apiVersion: VERSION,
+      kind: 'ServiceBinding',
+      metadata: { name: 'orders-client', namespace: names('alpha').namespace, uid: 'binding-uid' },
+      spec: { bindingName: 'orders-db', serviceName: 'orders', capability: 'postgres' },
+    };
+    t.api.seed(binding);
+    await t.controller.reconcileServiceBinding(binding, tenant, t.s, [binding]);
+    expect(binding.status?.conditions?.[0]).toMatchObject({
+      status: 'False',
+      reason: 'CredentialsMissing',
+      message: 'PostgreSQL connection Secret is missing; restore the runtime credentials',
+    });
+    expect(binding.status).toMatchObject({ serviceRef: { name: 'orders' } });
+    expect(
+      t.get('Secret', bindingSecretName('orders-db'), names('alpha').namespace),
+    ).toBeUndefined();
+  });
   test('refuses foreign resources and reports credential creation failures', async () => {
     const t = setup();
     const n = postgresNames(t.s);

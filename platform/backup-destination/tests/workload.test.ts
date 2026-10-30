@@ -1520,6 +1520,24 @@ describe('restore into a workload volume', () => {
       return cluster.world.restores[0];
     };
 
+    test('a running restore that recorded no target modes leaves the mode check to the disk', () => {
+      const backup = modeSource('XTS');
+      const cluster = new Cluster(volumeWorld({ backups: [backup], storageRecords: present({}) }));
+      requestRestore(cluster, backup);
+      cluster.world.storageRecords = present({ identity: { kind: 'Other', mode: 'XTS' } });
+      cluster.tick();
+      const running = must(cluster.world.restores[0]);
+      expect(running.volume?.targetModes).toEqual(['XTS']);
+      // Its recorded status names no accepted modes.
+      delete running.volume?.targetModes;
+      stopped(cluster);
+      cluster.instances('identity', 0);
+      const body = job(cluster.tick(), 'volume-restore');
+      const text = JSON.stringify(body);
+      expect(text).toContain('"BACKUP_TARGET_ROOT"');
+      expect(text).not.toContain('BACKUP_TARGET_MODES');
+    });
+
     test("absent: no record check, the backup's own mode goes to the agent", () => {
       expect(restoreEnv(modeSource('XTS'), { state: 'absent' })).toBe('XTS');
       expect(restoreEnv(modeSource('AEAD'))).toBe('AEAD');

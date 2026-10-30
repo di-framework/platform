@@ -1154,6 +1154,107 @@ describe('platform controller RBAC at runtime (#321)', () => {
     ).toEqual([{ apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list'] }]);
   });
 
+  /** TenantAuthReady of alpha as stored. */
+  const tenantAuthReady = (api: RecordingApi) =>
+    (
+      api.objects.get(`${collection(VERSION, 'Tenant')}/alpha`)?.status as
+        | { conditions?: { type: string; reason: string; message: string }[] }
+        | undefined
+    )?.conditions?.find((c) => c.type === 'TenantAuthReady');
+  const keyAt = (api: RecordingApi, namespace: string, id: string) =>
+    api.objects.get(`${collection('v1', 'Secret', namespace)}/di-apikey-${id}`);
+
+  it('reports a failed read of the legacy keys and still reconciles the rest', async () => {
+    const api = new FailOnceApi(
+      (method, path) =>
+        method === 'GET' && path.startsWith('/api/v1/namespaces/di-runtime-alpha/secrets?'),
+      'key list failed',
+    );
+    const { controller, tenants, users } = setup(api);
+    const alpha = tenants[0] as Tenant;
+    const error = console.error;
+    console.error = () => {};
+    try {
+      await controller.reconcileTenant(alpha, users);
+    } finally {
+      console.error = error;
+    }
+    expect(tenantAuthReady(api)).toMatchObject({
+      reason: 'ApiKeyMigrationFailed',
+      message: 'API keys not moved to di-apikeys-alpha: key list failed',
+    });
+    // Nothing was moved; the rest still reconciled, keeping the read rule on the old namespace.
+    for (const id of LEGACY_KEYS) expect(keyAt(api, 'di-runtime-alpha', id)).toBeDefined();
+    expect(
+      rulesOf(
+        api.objects.get(
+          `${collection(`${RBAC_GROUP}/v1`, 'Role', 'di-runtime-alpha')}/tenant-controller-keys`,
+        ) as Resource,
+      ).filter((r) => r.resources.includes('secrets')),
+    ).toEqual([{ apiGroups: [''], resources: ['secrets'], verbs: ['get', 'list'] }]);
+  });
+
+  /** Lets `create` of a key copy hit an existing copy (409), or fail outright with `status`. */
+  class CopyCreateApi extends RecordingApi {
+    conflicts = 0;
+    constructor(private readonly status?: number) {
+      super();
+    }
+    override async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+      if (method === 'POST' && path === '/api/v1/namespaces/di-apikeys-alpha/secrets') {
+        if (this.status) throw new ApiError(this.status, 'copy create failed');
+        // An earlier, interrupted pass already wrote this copy.
+        await super.call<T>(method, path, body);
+        try {
+          return await super.call<T>(method, path, body);
+        } catch (error) {
+          if (error instanceof ApiError && error.code === 409) this.conflicts++;
+          throw error;
+        }
+      }
+      return super.call<T>(method, path, body);
+    }
+  }
+  it('accepts a key copy that already exists (409) when it matches the original', async () => {
+    const api = new CopyCreateApi();
+    const { controller, tenants, users } = setup(api);
+    const alpha = tenants[0] as Tenant;
+    const log = console.log;
+    console.log = () => {};
+    try {
+      for (let pass = 0; pass < 2; pass++) await controller.reconcileTenant(alpha, users);
+    } finally {
+      console.log = log;
+    }
+    expect(api.conflicts).toBe(LEGACY_KEYS.length);
+    for (const id of LEGACY_KEYS) {
+      expect(keyAt(api, 'di-runtime-alpha', id)).toBeUndefined();
+      expect(keyAt(api, 'di-apikeys-alpha', id)).toBeDefined();
+    }
+    expect(tenantAuthReady(api)?.reason).not.toBe('ApiKeyMigrationFailed');
+  });
+
+  it('keeps the original and reports a key copy create that fails with another status', async () => {
+    const api = new CopyCreateApi(500);
+    const { controller, tenants, users } = setup(api);
+    const alpha = tenants[0] as Tenant;
+    const error = console.error;
+    console.error = () => {};
+    try {
+      for (let pass = 0; pass < 2; pass++) await controller.reconcileTenant(alpha, users);
+    } finally {
+      console.error = error;
+    }
+    for (const id of LEGACY_KEYS) {
+      expect(keyAt(api, 'di-runtime-alpha', id)).toBeDefined();
+      expect(keyAt(api, 'di-apikeys-alpha', id)).toBeUndefined();
+    }
+    expect(tenantAuthReady(api)).toMatchObject({
+      reason: 'ApiKeyMigrationFailed',
+      message: expect.stringContaining(`di-apikey-${LEGACY_KEYS[0]}: copy create failed`),
+    });
+  });
+
   /** Reconciles alpha once against `api`, with the controller's error log silenced. */
   async function reconcileAlpha(api: RecordingApi) {
     const { controller, tenants, users } = setup(api);

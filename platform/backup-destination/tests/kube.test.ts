@@ -576,6 +576,13 @@ describe('applying actions', () => {
     await expect(
       applyActions(answer(409), world, [{ type: 'scale-workload', name: 'x', replicas: 2 }]),
     ).rejects.toThrow('failed 409');
+    // The ignored status is per call: a 404 on a create and a 409 on a delete still stop.
+    await expect(
+      applyActions(answer(404), world, [{ type: 'create-backup', body: {} }]),
+    ).rejects.toThrow('failed 404');
+    await expect(
+      applyActions(answer(409), world, [{ type: 'delete-backup', name: 'b' }]),
+    ).rejects.toThrow('failed 409');
   });
 
   test('W7: a 409 on a volume Job is ours only when the existing Job carries our owner uid', async () => {

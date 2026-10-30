@@ -406,4 +406,26 @@ describe('backing service helpers', () => {
     expect(statusContainsCredentials({ password: 'secret' })).toBe(true);
     expect(statusContainsCredentials({ endpoint: { url: 'redis://:pass@host' } })).toBe(true);
   });
+
+  it('rejects unknown visibility, invalid names and deletion policies (#587)', () => {
+    expect(
+      validateClassSpec({ type: 'keyvalue', provider: 'redis', visibility: 'Everyone' as never }),
+    ).toBe('visibility must be AllTenants or SelectedTenants');
+    expect(validateServiceSpec({ type: 'keyvalue', className: 'Bad_Class' })).toBe(
+      'className must be a valid DNS label',
+    );
+    expect(validateServiceSpec({ type: 'keyvalue', className: '' })).toBeUndefined();
+    expect(validateServiceSpec({ type: 'keyvalue', deletionPolicy: 'Delete' })).toBeUndefined();
+    expect(validateServiceSpec({ type: 'keyvalue', deletionPolicy: 'Orphan' as never })).toBe(
+      'deletionPolicy must be Retain or Delete',
+    );
+    expect(
+      validateBindingSpec({
+        serviceName: 'stock',
+        bindingName: 'stock',
+        capability: 'keyvalue',
+        workloadName: 'Bad_Workload',
+      }),
+    ).toBe('workloadName must be a valid DNS label');
+  });
 });

@@ -2388,8 +2388,6 @@ export class Controller {
     for (const value of desired) {
       const applied = await this.ensure(value, false, false, fetched);
       if (value.kind !== 'Deployment') continue;
-      if (applied.metadata.name === RUNTIME_DATA_NATS)
-        throw new Error(`Refusing to manage runtime data plane ${RUNTIME_DATA_NATS}`);
       const spec = applied.spec as { replicas: number };
       const status = applied.status as
         | { observedGeneration?: number; readyReplicas?: number; replicas?: number }
@@ -2528,11 +2526,7 @@ export class Controller {
     else if (connSecret?.data) {
       serviceConn = {};
       for (const [key, value] of Object.entries(connSecret.data)) {
-        try {
-          serviceConn[key] = Buffer.from(value, 'base64').toString('utf8');
-        } catch {
-          /* ignore undecodable */
-        }
+        serviceConn[key] = Buffer.from(value, 'base64').toString('utf8');
       }
     }
 

@@ -588,3 +588,121 @@ describe('service binding reconciliation', () => {
     });
   });
 });
+
+describe('service binding reconciliation edges (#587)', () => {
+  const creds = '/api/v1/namespaces/di-tenant-alpha/secrets/di-binding-stock-creds';
+  const conn = (data: Record<string, string>, encoded: boolean): Resource =>
+    ({
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: {
+        name: 'di-bs-stock-conn',
+        namespace: names('alpha').runtimeNamespace,
+        labels: { [INSTALLATION]: 'test' },
+      },
+      ...(encoded
+        ? {
+            data: Object.fromEntries(
+              Object.entries(data).map(([k, v]) => [k, Buffer.from(v).toString('base64')]),
+            ),
+          }
+        : { stringData: data }),
+    }) as Resource;
+  const kv = () =>
+    binding('bind-stock', { serviceName: 'stock', bindingName: 'stock', capability: 'keyvalue' });
+
+  it('refuses a ServiceBinding outside its tenant namespace', async () => {
+    const { api, controller, t } = prepare();
+    const stray = kv();
+    stray.metadata.namespace = 'di-tenant-beta';
+    await expect(
+      controller.reconcileServiceBinding(stray, t, readyService('stock', 'keyvalue'), [stray]),
+    ).rejects.toThrow('ServiceBinding bind-stock must live in tenant namespace di-tenant-alpha');
+    expect(api.operations).toEqual([]);
+  });
+
+  it('fails a binding whose bindingName a peer already holds for another service', async () => {
+    const { api, controller, t } = prepare();
+    const holder = binding('a-holder', {
+      serviceName: 'other',
+      bindingName: 'stock',
+      capability: 'keyvalue',
+    });
+    const late = kv();
+    api.seed(late);
+    await controller.reconcileServiceBinding(late, t, readyService('stock', 'keyvalue'), [
+      holder,
+      late,
+    ]);
+    expect(late.status).toMatchObject({ serviceRef: { name: 'stock' } });
+    expect(late.status?.conditions?.[0]).toMatchObject({
+      status: 'False',
+      reason: 'Failed',
+      message: 'bindingName stock already bound to service other',
+    });
+    expect(api.objects.has('/api/v1/namespaces/di-tenant-alpha/configmaps/di-binding-stock')).toBe(
+      false,
+    );
+  });
+
+  it('decodes base64 data of a live connection Secret', async () => {
+    const { api, controller, t } = prepare();
+    const stock = readyService('stock', 'keyvalue');
+    const b = kv();
+    api.seed(b);
+    api.seed(conn({ backend: 'redis', password: 'live-password' }, true));
+    await controller.reconcileServiceBinding(b, t, stock, [b]);
+    expect(api.objects.get(creds)?.stringData).toEqual({ password: 'live-password' });
+    expect(b.status?.conditions?.[0]?.reason).toBe('Ready');
+  });
+
+  it('drops its credential Secret once the credentials are rotated away, keeping foreign ones', async () => {
+    const { api, controller, t } = prepare();
+    const stock = readyService('stock', 'keyvalue');
+    const b = kv();
+    api.seed(b);
+    api.seed(conn({ backend: 'redis', password: 'old-password' }, false));
+    await controller.reconcileServiceBinding(b, t, stock, [b]);
+    expect(api.objects.get(creds)?.metadata.labels?.[OWNER]).toBe('bind-stock-uid');
+    api.seed(conn({ backend: 'redis' }, false));
+    await controller.reconcileServiceBinding(b, t, stock, [b]);
+    expect(api.objects.has(creds)).toBe(false);
+
+    // The same name written by another installation is not this binding's to remove.
+    const foreign = {
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: {
+        name: 'di-binding-stock-creds',
+        namespace: 'di-tenant-alpha',
+        labels: { [INSTALLATION]: 'other', [OWNER]: 'bind-stock-uid' },
+      },
+    } as Resource;
+    api.seed(foreign);
+    await controller.reconcileServiceBinding(b, t, stock, [b]);
+    expect(api.objects.get(creds)?.metadata.labels?.[INSTALLATION]).toBe('other');
+    // Nor is one owned by an unrelated uid.
+    api.seed({
+      ...foreign,
+      metadata: { ...foreign.metadata, labels: { [INSTALLATION]: 'test', [OWNER]: 'someone' } },
+    });
+    await controller.reconcileServiceBinding(b, t, stock, [b]);
+    expect(api.objects.get(creds)?.metadata.labels?.[OWNER]).toBe('someone');
+  });
+
+  it('keeps the projection but reports Suspended for a suspended tenant', async () => {
+    const { api, controller, t } = prepare();
+    t.spec.suspended = true;
+    const b = kv();
+    api.seed(b);
+    await controller.reconcileServiceBinding(b, t, readyService('stock', 'keyvalue'), [b]);
+    expect(b.status?.conditions?.[0]).toMatchObject({
+      status: 'False',
+      reason: 'Suspended',
+      message: 'Tenant suspended; binding projection retained',
+    });
+    expect(api.objects.has('/api/v1/namespaces/di-tenant-alpha/configmaps/di-binding-stock')).toBe(
+      true,
+    );
+  });
+});
