@@ -341,16 +341,22 @@ describe('tenant-operator binding admission (#541 m3 W1)', () => {
     expect(found).toHaveLength(1);
     return found[0] as Policy;
   };
-  /** Evaluates a policy as the API server does: matchConditions, then variables, then rules. */
+  /**
+   * Evaluates a policy as the API server does: matchConstraints operations, then matchConditions,
+   * then variables, then rules.
+   */
   const admit = (
     resource: 'rolebindings' | 'clusterrolebindings' | 'clusterroles',
     request: { operation?: string; namespace?: string; name?: string; username?: string },
     object: Record<string, unknown> | null,
   ): boolean => {
     const policy = policyFor(resource);
+    const operation = request.operation ?? 'CREATE';
+    if (!policy.spec.matchConstraints.resourceRules.some((r) => r.operations.includes(operation)))
+      return true;
     const ctx: Record<string, unknown> = {
       request: {
-        operation: request.operation ?? 'CREATE',
+        operation,
         namespace: request.namespace ?? '',
         name: request.name ?? '',
         userInfo: { username: request.username ?? CONTROLLER },
@@ -376,8 +382,12 @@ describe('tenant-operator binding admission (#541 m3 W1)', () => {
     roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind, name: role },
     subjects,
   });
-  const rb = (namespace: string, object: Record<string, unknown>, username?: string) =>
-    admit('rolebindings', { namespace, username }, object);
+  const rb = (
+    namespace: string,
+    object: Record<string, unknown>,
+    username?: string,
+    operation?: string,
+  ) => admit('rolebindings', { namespace, username, operation }, object);
 
   it('has one policy per kind, failing closed, each with a Deny binding', () => {
     expect(policies.map((p) => p.metadata.name)).toEqual([
@@ -454,6 +464,30 @@ describe('tenant-operator binding admission (#541 m3 W1)', () => {
     expect(rb('di-tenant-alpha', { roleRef: binding(role).roleRef })).toBe(false);
   });
 
+  it('re-validates the subjects when an existing tenant-operator RoleBinding is updated', () => {
+    const role = TENANT_OPERATOR_CLUSTER_ROLES.workloads;
+    const own = {
+      kind: 'ServiceAccount',
+      name: 'runtime-operator',
+      namespace: 'di-operator-alpha',
+    };
+    expect(rb('di-tenant-alpha', binding(role), undefined, 'UPDATE')).toBe(true);
+    for (const subjects of [
+      [own, { kind: 'ServiceAccount', name: 'di-platform-controller', namespace: 'wasmcloud' }],
+      [own, { kind: 'Group', name: 'system:authenticated' }],
+      [{ ...own, namespace: 'di-operator-beta' }],
+      [],
+    ])
+      for (const username of [CONTROLLER, ADMIN])
+        expect(rb('di-tenant-alpha', binding(role, subjects), username, 'UPDATE')).toBe(false);
+  });
+
+  it('does not evaluate operations outside its match constraints', () => {
+    expect(
+      rb('kube-system', binding(TENANT_OPERATOR_CLUSTER_ROLES.self), undefined, 'DELETE'),
+    ).toBe(true);
+  });
+
   it('leaves RoleBindings to other roles to RBAC', () => {
     expect(rb('kube-system', binding('view'))).toBe(true);
     expect(rb('kube-system', binding(TENANT_OPERATOR_CLUSTER_ROLES.self, undefined, 'Role'))).toBe(
@@ -465,6 +499,8 @@ describe('tenant-operator binding admission (#541 m3 W1)', () => {
     for (const role of Object.values(TENANT_OPERATOR_CLUSTER_ROLES))
       for (const username of [CONTROLLER, ADMIN])
         expect(admit('clusterrolebindings', { username }, binding(role))).toBe(false);
+    for (const role of Object.values(TENANT_OPERATOR_CLUSTER_ROLES))
+      expect(admit('clusterrolebindings', { operation: 'UPDATE' }, binding(role))).toBe(false);
     expect(admit('clusterrolebindings', {}, binding('di-test-controller'))).toBe(true);
     expect(
       admit('clusterrolebindings', {}, binding(TENANT_OPERATOR_CLUSTER_ROLES.self, [], 'Role')),

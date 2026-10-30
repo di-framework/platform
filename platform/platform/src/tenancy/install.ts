@@ -267,7 +267,9 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
     },
     // Each tenant operator's RoleBindings to the three fixed tenant-operator ClusterRoles
     // (#541, design-541 §4.6). The controller holds none of their rules, so it may bind exactly
-    // these names; still no `escalate`.
+    // these names; still no `escalate`. RBAC alone does not scope where: the admission policies in
+    // `tenantOperatorBindingPolicies` confine these binds to the tenant namespaces and to the
+    // tenant's own operator ServiceAccount, and deny ClusterRoleBindings to them.
     {
       apiGroups: ['rbac.authorization.k8s.io'],
       resources: ['clusterroles'],
