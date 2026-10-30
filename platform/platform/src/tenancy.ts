@@ -4,6 +4,7 @@ import { admissionResources } from './tenancy/admission';
 import {
   assertTenantDeclaration,
   type BackingServiceClassDeclaration,
+  controllerClusterRbacPolicies,
   controllerClusterRoleRules,
   controllerNamespaceRoleRules,
   controllerScriptHash,
@@ -187,9 +188,11 @@ export function installTenancy(args: {
   );
   // They confine the controller's `bind` on the tenant-operator ClusterRoles, so they precede
   // the ClusterRole that grants it (#541 m3).
-  const operatorBindingPolicies = tenantOperatorBindingPolicies(installation, namespace).map(
-    (value) => createCustom(value),
-  );
+  const operatorBindingPolicies = [
+    ...tenantOperatorBindingPolicies(installation, namespace),
+    // They limit its ClusterRole and ClusterRoleBinding writes to its own (#586).
+    ...controllerClusterRbacPolicies(installation, namespace),
+  ].map((value) => createCustom(value));
   // The ClusterRole drops `escalate` (#115), so it waits for the namespaced TokenRequest grant:
   // the running controller keeps writing the per-tenant TokenRequest Roles across `pulumi up`.
   const role = createCustom(
