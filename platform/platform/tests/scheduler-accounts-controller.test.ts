@@ -1,14 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
-import { type Api, ApiError, Controller, collection } from '../src/tenancy/controller';
-import {
-  type ControllerConfig,
-  FINALIZER,
-  INSTALLATION,
-  OWNER,
-  type Resource,
-  type Tenant,
-  VERSION,
-} from '../src/tenancy/resources';
+import { ApiError, Controller } from '../src/tenancy/controller';
+import { FINALIZER, INSTALLATION, OWNER, type Tenant } from '../src/tenancy/resources';
 import { SchedulerAccountsWriter } from '../src/tenancy/scheduler-accounts';
 import {
   ACCOUNTS_KEY,
@@ -21,106 +13,28 @@ import {
   IDENTITIES_KEY,
   type IdentityRecord,
   parseIdentityRecord,
-  SCHEDULER_IDENTITIES,
   serializeIdentityRecord,
 } from '../src/tenancy/scheduler-pki';
+import {
+  cfg,
+  condition as conditionOf,
+  MemoryApi,
+  PKI,
+  prepare as prepareHarness,
+  recordPath,
+  START,
+  stored,
+  tenant,
+} from './support/controller-harness';
 
 // #541 m6d: the controller's tick renders `di-scheduler-nats-accounts` from the Tenant list and the
 // identity record, writes it only when it changed, and refuses a render the m2 validation rejects
-// (design-541 §4.4). The in-memory API server is the m6c test's.
+// (design-541 §4.4).
 
-const cfg: ControllerConfig = {
-  installation: 'test',
-  namespace: 'wasmcloud',
-  hostImage: 'wash:test',
-  schedulerNatsUrl: 'nats://nats:4222',
-};
-const PKI = 'wasmcloud-scheduler-pki';
-const recordPath = `/api/v1/namespaces/${PKI}/configmaps/${SCHEDULER_IDENTITIES}`;
 const accountsPath = `/api/v1/namespaces/${cfg.namespace}/configmaps/${SCHEDULER_NATS_ACCOUNTS}`;
-const tenantPath = `${collection(VERSION, 'Tenant')}/alpha`;
-const START = new Date('2026-10-30T00:00:00Z');
 const clock = { now: START };
 
-const key = (v: { apiVersion: string; kind: string; metadata: Resource['metadata'] }) =>
-  `${collection(v.apiVersion, v.kind, v.metadata.namespace)}/${v.metadata.name}`;
-
-/** An in-memory API server for the controller's tick and the bootstrap's create and update calls. */
-class MemoryApi implements Api {
-  objects = new Map<string, Resource>();
-  operations: { method: string; path: string; body?: unknown }[] = [];
-  private version = 1;
-  seed(value: Resource | Tenant): void {
-    this.objects.set(key(value), {
-      ...structuredClone(value),
-      metadata: { ...value.metadata, resourceVersion: String(this.version++) },
-    } as Resource);
-  }
-  async call<T>(method: string, path: string, body?: unknown): Promise<T> {
-    this.operations.push({ method, path, body });
-    const url = new URL(path, 'https://kubernetes');
-    const data = structuredClone(body) as Resource;
-    const notFound = () => new ApiError(404, 'Not found');
-    if (method === 'GET' && url.searchParams.has('labelSelector')) {
-      const selector = url.searchParams.get('labelSelector') ?? '';
-      const labels = selector ? selector.split(',').map((v) => v.split('=')) : [];
-      return {
-        items: [...this.objects.values()]
-          .filter(
-            (v) =>
-              (collection(v.apiVersion, v.kind) === url.pathname ||
-                collection(v.apiVersion, v.kind, v.metadata.namespace) === url.pathname) &&
-              labels.every(([k, x]) => v.metadata.labels?.[k as string] === x),
-          )
-          .map(({ apiVersion: _v, kind: _k, ...item }) => structuredClone(item)),
-      } as T;
-    }
-    const target = url.pathname.replace(/\/status$/, '');
-    const existing = this.objects.get(target);
-    if (method === 'GET') {
-      if (!existing) throw notFound();
-      return structuredClone(existing) as T;
-    }
-    if (method === 'DELETE') {
-      if (!existing) throw notFound();
-      this.objects.delete(target);
-      return {} as T;
-    }
-    const stamp = (value: Resource) => {
-      value.metadata.resourceVersion = String(this.version++);
-      this.objects.set(key(value), value);
-      return structuredClone(value) as T;
-    };
-    if (method === 'POST') return stamp(data);
-    if (method === 'PUT') {
-      if (!existing) throw notFound();
-      if (data.metadata.resourceVersion !== existing.metadata.resourceVersion)
-        throw new ApiError(409, 'Conflict');
-      return stamp(data);
-    }
-    if (method === 'PATCH') {
-      const rv = data.metadata?.resourceVersion;
-      if (existing && rv && rv !== existing.metadata.resourceVersion)
-        throw new ApiError(409, 'Conflict');
-      const value = {
-        ...existing,
-        ...data,
-        metadata: { ...existing?.metadata, ...data.metadata },
-        ...(path.split('?')[0]?.endsWith('/status')
-          ? { status: { ...(existing?.status as object), ...(data.status as object) } }
-          : {}),
-      } as Resource;
-      value.metadata.uid ??= `${value.metadata.name}-uid`;
-      value.metadata.generation ??= 1;
-      if (value.kind === 'Deployment')
-        value.status = {
-          observedGeneration: value.metadata.generation,
-          replicas: (value.spec as { replicas: number }).replicas,
-        };
-      return stamp(value);
-    }
-    throw new Error(`Unexpected ${method}`);
-  }
+class AccountsApi extends MemoryApi {
   /** Writes of the accounts ConfigMap. */
   accountsWrites(): string[] {
     return this.operations
@@ -134,47 +48,13 @@ class MemoryApi implements Api {
   }
 }
 
-function tenant(): Tenant {
-  return {
-    apiVersion: VERSION,
-    kind: 'Tenant',
-    metadata: {
-      name: 'alpha',
-      uid: 'alpha-uid',
-      generation: 1,
-      labels: { [INSTALLATION]: 'test' },
-    },
-    spec: {},
-  };
-}
-
-async function prepare() {
-  const api = new MemoryApi();
-  api.seed(tenant());
-  api.seed({
-    apiVersion: 'v1',
-    kind: 'Secret',
-    metadata: { name: 'wasmcloud-runtime-tls', namespace: cfg.namespace },
-    data: { 'ca.crt': 'test' },
-  });
-  api.seed({ apiVersion: 'v1', kind: 'Namespace', metadata: { name: PKI } });
-  await bootstrapSchedulerPki(api, cfg, START);
-  const controller = new Controller(
-    api,
-    cfg,
-    async () => [],
-    () => clock.now,
-  );
-  return { api, controller };
-}
-const stored = (api: MemoryApi) => api.objects.get(tenantPath) as unknown as Tenant;
-const condition = (api: MemoryApi) =>
-  stored(api).status?.conditions?.find((c) => c.type === SCHEDULER_ACCOUNTS_CONDITION);
-const file = (api: MemoryApi) =>
+const prepare = () => prepareHarness(new AccountsApi(), { pki: true }, () => clock.now);
+const condition = (api: AccountsApi) => conditionOf(api, SCHEDULER_ACCOUNTS_CONDITION);
+const file = (api: AccountsApi) =>
   (api.objects.get(accountsPath) as unknown as { data: Record<string, string> } | undefined)?.data[
     ACCOUNTS_KEY
   ];
-const record = (api: MemoryApi): IdentityRecord =>
+const record = (api: AccountsApi): IdentityRecord =>
   parseIdentityRecord(
     (api.objects.get(recordPath) as unknown as { data: Record<string, string> }).data[
       IDENTITIES_KEY
@@ -187,7 +67,7 @@ const setRecord = (api: MemoryApi, value: IdentityRecord) => {
 };
 const users = (text: string | undefined) =>
   [...(text ?? '').matchAll(/user: "([^"]+)"/g)].map((m) => m[1] as string);
-const ownOperatorNamespace = (api: MemoryApi) =>
+const ownOperatorNamespace = (api: AccountsApi) =>
   api.seed({
     apiVersion: 'v1',
     kind: 'Namespace',
@@ -230,9 +110,16 @@ describe('controller tick: scheduler NATS accounts file (#541 m6d)', () => {
     expect(text).toContain('jetstream: { max_mem: 32M, max_file: 1G }');
     expect(api.objects.get(accountsPath)?.metadata.labels?.[INSTALLATION]).toBe('test');
     expect(condition(api)).toBeUndefined();
+    // A healthy start is logged once.
+    const rendered = () =>
+      log.mock.calls.filter(
+        (c: unknown[]) => c[0] === `${SCHEDULER_NATS_ACCOUNTS} is rendered from the record`,
+      );
+    expect(rendered()).toHaveLength(1);
     api.operations.length = 0;
     for (let i = 0; i < 6; i++) await controller.tick();
     expect(api.accountsWrites()).toEqual([]);
+    expect(rendered()).toHaveLength(1);
   });
 
   it('adds the user of an identity issued later, in the same tick', async () => {
@@ -316,6 +203,110 @@ describe('controller tick: scheduler NATS accounts file (#541 m6d)', () => {
     expect(file(api)).toBe(before);
   });
 
+  /** A refusal held across ticks: `platform/data` names the same user twice. */
+  async function refused() {
+    const { api, controller } = await prepare();
+    await controller.tick();
+    const bad = record(api);
+    const data = bad['platform/data'] as { current: string };
+    bad['platform/data'] = {
+      current: data.current,
+      previous: data.current,
+      previousUntil: '2027-01-01T00:00:00Z',
+    };
+    setRecord(api, bad);
+    await controller.tick();
+    await controller.tick();
+    const held = condition(api);
+    expect(held).toMatchObject({ status: 'False', reason: REFUSED_FOR_OTHER });
+    return { api, held };
+  }
+  const tenantStatusWrites = (api: AccountsApi) =>
+    api.operations.filter((o) => o.method === 'PATCH' && o.path.endsWith('/alpha/status'));
+
+  it('keeps a standing refusal and its lastTransitionTime across a controller restart', async () => {
+    const { api, held } = await refused();
+    clock.now = new Date(START.getTime() + 60_000);
+    const restarted = new Controller(
+      api,
+      cfg,
+      async () => [],
+      () => clock.now,
+    );
+    for (let i = 0; i < 3; i++) {
+      await restarted.tick();
+      expect(condition(api)).toEqual(held);
+    }
+  });
+
+  it('keeps a standing refusal untouched while the record cannot be read', async () => {
+    const { api, held } = await refused();
+    clock.now = new Date(START.getTime() + 60_000);
+    const call = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      if (method === 'GET' && path === recordPath) throw new ApiError(500, 'unavailable');
+      return call<T>(method, path, body);
+    };
+    // The cluster without a controller in memory: a fresh one starts during the outage too.
+    for (const controller of [
+      new Controller(
+        api,
+        cfg,
+        async () => [],
+        () => clock.now,
+      ),
+      new Controller(
+        api,
+        cfg,
+        async () => [],
+        () => clock.now,
+      ),
+    ])
+      for (let i = 0; i < 2; i++) {
+        await controller.tick();
+        expect(condition(api)).toEqual(held);
+      }
+    expect(tenantStatusWrites(api).length).toBeGreaterThan(0);
+  });
+
+  it('renders a suspended Tenant, whose operator keeps running (§4.5)', async () => {
+    const { api, controller } = await prepare();
+    ownOperatorNamespace(api);
+    await controller.tick();
+    const t = stored(api);
+    t.spec.suspended = true;
+    api.seed(t);
+    for (let i = 0; i < 3; i++) await controller.tick();
+    const ids = record(api);
+    expect(users(file(api))).toEqual(
+      expect.arrayContaining([
+        `${ids['tenant/alpha/hosts']?.current}.di-tenant-alpha.tenants.scheduler.di-framework.invalid`,
+        `${ids['tenant/alpha/operator']?.current}.operator.di-tenant-alpha.platform.scheduler.di-framework.invalid`,
+      ]),
+    );
+  });
+
+  it('renders a deleting Tenant until removal drops its record entries', async () => {
+    const { api, controller } = await prepare();
+    await controller.tick();
+    const before = file(api);
+    // R1/R4 cannot drop the entries (their record write conflicts), so the deleting Tenant's users
+    // stay in the file.
+    const call = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      if (method === 'PUT' && path === recordPath) throw new ApiError(409, 'Conflict');
+      return call<T>(method, path, body);
+    };
+    const t = stored(api);
+    t.metadata.deletionTimestamp = START.toISOString();
+    api.seed(t);
+    for (let i = 0; i < 3; i++) await controller.tick();
+    expect(stored(api).metadata.deletionTimestamp).toBeDefined();
+    expect(record(api)['tenant/alpha/hosts']).toBeDefined();
+    expect(file(api)).toBe(before);
+    expect(file(api)).toContain('T_di-tenant-alpha');
+  });
+
   it('names the offending Tenant in its condition', async () => {
     const { api, controller } = await prepare();
     await controller.tick();
@@ -342,16 +333,18 @@ describe('controller tick: scheduler NATS accounts file (#541 m6d)', () => {
 describe('SchedulerAccountsWriter (#541 m6d)', () => {
   const tenants = [tenant()];
   it('does nothing without a PKI namespace or before the record exists', async () => {
-    const api = new MemoryApi();
+    const api = new AccountsApi();
     const writer = new SchedulerAccountsWriter(api, cfg, () => START);
     expect(await writer.reconcile(tenants)).toEqual([]);
     api.seed({ apiVersion: 'v1', kind: 'Namespace', metadata: { name: PKI } });
     expect(await writer.reconcile(tenants)).toEqual([]);
     expect(api.operations.filter((o) => o.method !== 'GET')).toEqual([]);
+    // No record yet is not a failure.
+    expect(error).not.toHaveBeenCalled();
   });
 
-  it('logs a failed write once, reports no problems and recovers', async () => {
-    const api = new MemoryApi();
+  it('logs a failed read once, reports it as unknown and recovers', async () => {
+    const api = new AccountsApi();
     api.seed({ apiVersion: 'v1', kind: 'Namespace', metadata: { name: PKI } });
     await bootstrapSchedulerPki(api, cfg, START);
     const call = api.call.bind(api);
@@ -363,8 +356,8 @@ describe('SchedulerAccountsWriter (#541 m6d)', () => {
       return call<T>(method, path, body);
     };
     const writer = new SchedulerAccountsWriter(api, cfg, () => START);
-    expect(await writer.reconcile(tenants)).toEqual([]);
-    expect(await writer.reconcile(tenants)).toEqual([]);
+    expect(await writer.reconcile(tenants)).toBeUndefined();
+    expect(await writer.reconcile(tenants)).toBeUndefined();
     expect(error).toHaveBeenCalledTimes(1);
     expect(String(error.mock.calls[0]?.[0])).toContain('could not be written: unreadable');
     fail = false;
@@ -374,7 +367,7 @@ describe('SchedulerAccountsWriter (#541 m6d)', () => {
   });
 
   it('passes a 403 on the write to the log', async () => {
-    const api = new MemoryApi();
+    const api = new AccountsApi();
     api.seed({ apiVersion: 'v1', kind: 'Namespace', metadata: { name: PKI } });
     await bootstrapSchedulerPki(api, cfg, START);
     const call = api.call.bind(api);
@@ -383,7 +376,7 @@ describe('SchedulerAccountsWriter (#541 m6d)', () => {
       return call<T>(method, path, body);
     };
     const writer = new SchedulerAccountsWriter(api, cfg, () => START);
-    expect(await writer.reconcile(tenants)).toEqual([]);
+    expect(await writer.reconcile(tenants)).toBeUndefined();
     expect(String(error.mock.calls[0]?.[0])).toContain('Forbidden');
     expect(api.objects.has(accountsPath)).toBe(false);
   });

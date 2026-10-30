@@ -204,7 +204,7 @@ accounts {
         } }
     ]
   }
-  DATA: { jetstream: enabled, users: [ { user: "<issuance-id>.data.platform.scheduler.di-framework.invalid" } ] }
+  DATA: { jetstream: { max_mem: 32M, max_file: 1G }, users: [ { user: "<issuance-id>.data.platform.scheduler.di-framework.invalid" } ] }
 }
 ```
 

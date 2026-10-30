@@ -144,7 +144,11 @@ import {
   TENANT_HOST_SECRET,
   TenantSchedulerIdentities,
 } from './scheduler-identities';
-import { type AccountsProblem, schedulerAccountsCondition } from './scheduler-nats';
+import {
+  type AccountsProblem,
+  SCHEDULER_ACCOUNTS_CONDITION,
+  schedulerAccountsCondition,
+} from './scheduler-nats';
 import {
   assertSafeBindingStatus,
   bindingProjectionName,
@@ -497,8 +501,12 @@ export class Controller {
   private readonly identities: TenantSchedulerIdentities;
   /** The scheduler NATS accounts file (#541 m6d). */
   private readonly accounts: SchedulerAccountsWriter;
-  /** The problems of the last refused accounts render, reported on every Tenant; empty when written. */
-  private accountsProblems: AccountsProblem[] = [];
+  /**
+   * The problems of the last accounts render, reported on every Tenant: empty when it was written,
+   * undefined while unknown (before the first render since start, or after a failed read), when
+   * each Tenant keeps the `SchedulerAccounts` condition it has.
+   */
+  private accountsProblems: AccountsProblem[] | undefined;
   private async get<T>(path: string): Promise<T | undefined> {
     try {
       return await this.api.call<T>('GET', path);
@@ -1399,8 +1407,12 @@ export class Controller {
       lastTransitionTime: new Date().toISOString(),
     };
     // A refused accounts render (#541 m6d), from the last pass: the previous file keeps serving.
-    const accounts =
-      this.accountsProblems.length > 0
+    const kept = tenant.status?.conditions?.find((c) => c.type === SCHEDULER_ACCOUNTS_CONDITION);
+    const accounts = !this.accountsProblems
+      ? kept
+        ? [kept]
+        : []
+      : this.accountsProblems.length > 0
         ? [
             schedulerAccountsCondition(
               this.accountsProblems,

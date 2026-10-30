@@ -1,123 +1,29 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
-import { type Api, ApiError, Controller, collection } from '../src/tenancy/controller';
-import {
-  type ControllerConfig,
-  FINALIZER,
-  INSTALLATION,
-  names,
-  OWNER,
-  type Resource,
-  type Tenant,
-  VERSION,
-} from '../src/tenancy/resources';
+import { FINALIZER, INSTALLATION, names, OWNER, type Resource } from '../src/tenancy/resources';
 import {
   SCHEDULER_IDENTITY_PENDING,
   TENANT_HOST_SECRET,
 } from '../src/tenancy/scheduler-identities';
+import { IDENTITIES_KEY, parseIdentityRecord } from '../src/tenancy/scheduler-pki';
 import {
-  bootstrapSchedulerPki,
-  IDENTITIES_KEY,
-  parseIdentityRecord,
-  SCHEDULER_IDENTITIES,
-} from '../src/tenancy/scheduler-pki';
+  condition,
+  MemoryApi,
+  prepare as prepareHarness,
+  recordPath,
+  START,
+  stored,
+  tenantPath,
+} from './support/controller-harness';
 
 // #541 m6c: the controller's tick issues tenant scheduler identities and never loops on its own
 // writes (design-541 §4.5).
 
-const cfg: ControllerConfig = {
-  installation: 'test',
-  namespace: 'wasmcloud',
-  hostImage: 'wash:test',
-  schedulerNatsUrl: 'nats://nats:4222',
-};
-const PKI = 'wasmcloud-scheduler-pki';
 const RUNTIME = names('alpha').runtimeNamespace;
-const recordPath = `/api/v1/namespaces/${PKI}/configmaps/${SCHEDULER_IDENTITIES}`;
 const hostPath = `/api/v1/namespaces/${RUNTIME}/secrets/${TENANT_HOST_SECRET}`;
 const operatorPath = '/api/v1/namespaces/di-operator-alpha/secrets/di-scheduler-operator-tls';
-const tenantPath = `${collection(VERSION, 'Tenant')}/alpha`;
-const START = new Date('2026-10-30T00:00:00Z');
 const clock = { now: START };
 
-const key = (v: { apiVersion: string; kind: string; metadata: Resource['metadata'] }) =>
-  `${collection(v.apiVersion, v.kind, v.metadata.namespace)}/${v.metadata.name}`;
-
-/** An in-memory API server for the controller's tick and the bootstrap's create and update calls. */
-class MemoryApi implements Api {
-  objects = new Map<string, Resource>();
-  operations: { method: string; path: string; body?: unknown }[] = [];
-  private version = 1;
-  seed(value: Resource | Tenant): void {
-    this.objects.set(key(value), {
-      ...structuredClone(value),
-      metadata: { ...value.metadata, resourceVersion: String(this.version++) },
-    } as Resource);
-  }
-  async call<T>(method: string, path: string, body?: unknown): Promise<T> {
-    this.operations.push({ method, path, body });
-    const url = new URL(path, 'https://kubernetes');
-    const data = structuredClone(body) as Resource;
-    const notFound = () => new ApiError(404, 'Not found');
-    if (method === 'GET' && url.searchParams.has('labelSelector')) {
-      const selector = url.searchParams.get('labelSelector') ?? '';
-      const labels = selector ? selector.split(',').map((v) => v.split('=')) : [];
-      return {
-        items: [...this.objects.values()]
-          .filter(
-            (v) =>
-              (collection(v.apiVersion, v.kind) === url.pathname ||
-                collection(v.apiVersion, v.kind, v.metadata.namespace) === url.pathname) &&
-              labels.every(([k, x]) => v.metadata.labels?.[k as string] === x),
-          )
-          .map(({ apiVersion: _v, kind: _k, ...item }) => structuredClone(item)),
-      } as T;
-    }
-    const target = url.pathname.replace(/\/status$/, '');
-    const existing = this.objects.get(target);
-    if (method === 'GET') {
-      if (!existing) throw notFound();
-      return structuredClone(existing) as T;
-    }
-    if (method === 'DELETE') {
-      if (!existing) throw notFound();
-      this.objects.delete(target);
-      return {} as T;
-    }
-    const stamp = (value: Resource) => {
-      value.metadata.resourceVersion = String(this.version++);
-      this.objects.set(key(value), value);
-      return structuredClone(value) as T;
-    };
-    if (method === 'POST') return stamp(data);
-    if (method === 'PUT') {
-      if (!existing) throw notFound();
-      if (data.metadata.resourceVersion !== existing.metadata.resourceVersion)
-        throw new ApiError(409, 'Conflict');
-      return stamp(data);
-    }
-    if (method === 'PATCH') {
-      const rv = data.metadata?.resourceVersion;
-      if (existing && rv && rv !== existing.metadata.resourceVersion)
-        throw new ApiError(409, 'Conflict');
-      const value = {
-        ...existing,
-        ...data,
-        metadata: { ...existing?.metadata, ...data.metadata },
-        ...(path.split('?')[0]?.endsWith('/status')
-          ? { status: { ...(existing?.status as object), ...(data.status as object) } }
-          : {}),
-      } as Resource;
-      value.metadata.uid ??= `${value.metadata.name}-uid`;
-      value.metadata.generation ??= 1;
-      if (value.kind === 'Deployment')
-        value.status = {
-          observedGeneration: value.metadata.generation,
-          replicas: (value.spec as { replicas: number }).replicas,
-        };
-      return stamp(value);
-    }
-    throw new Error(`Unexpected ${method}`);
-  }
+class IdentityApi extends MemoryApi {
   /**
    * Writes of the identity record, the identity Secrets and the handled rotation. The controller's
    * own Tenant status write is not counted: whether it repeats depends on how this fake orders
@@ -138,42 +44,8 @@ class MemoryApi implements Api {
   }
 }
 
-function tenant(): Tenant {
-  return {
-    apiVersion: VERSION,
-    kind: 'Tenant',
-    metadata: {
-      name: 'alpha',
-      uid: 'alpha-uid',
-      generation: 1,
-      labels: { [INSTALLATION]: 'test' },
-    },
-    spec: {},
-  };
-}
-
-async function prepare(options: { pki: boolean }) {
-  const api = new MemoryApi();
-  api.seed(tenant());
-  api.seed({
-    apiVersion: 'v1',
-    kind: 'Secret',
-    metadata: { name: 'wasmcloud-runtime-tls', namespace: cfg.namespace },
-    data: { 'ca.crt': 'test' },
-  });
-  api.seed({ apiVersion: 'v1', kind: 'Namespace', metadata: { name: PKI } });
-  if (options.pki) await bootstrapSchedulerPki(api, cfg, START);
-  const controller = new Controller(
-    api,
-    cfg,
-    async () => [],
-    () => clock.now,
-  );
-  return { api, controller };
-}
-const stored = (api: MemoryApi) => api.objects.get(tenantPath) as unknown as Tenant;
-const condition = (api: MemoryApi, type: string) =>
-  stored(api).status?.conditions?.find((c) => c.type === type);
+const prepare = (options: { pki: boolean }) =>
+  prepareHarness(new IdentityApi(), options, () => clock.now);
 
 let warn: ReturnType<typeof spyOn>;
 beforeEach(() => {

@@ -14,6 +14,8 @@
  *   `SchedulerAccounts` condition on each Tenant.
  * - **Nothing to do** while the installation has no scheduler PKI, or before the bootstrap Job has
  *   written the identity record.
+ * - **Unknown.** A failed read or write returns undefined, so the caller keeps the condition it
+ *   reported before instead of clearing it.
  *
  * Each state change is logged once. Inert until the cut-over (m6e): the chart's NATS does not read
  * this file.
@@ -47,8 +49,8 @@ const configMapPath = (ns: string, name = '') =>
   `/api/v1/namespaces/${ns}/configmaps${name ? `/${name}` : ''}`;
 
 export class SchedulerAccountsWriter {
-  /** The state last logged, so each change is logged once. */
-  private logged = '';
+  /** The state last logged, so each change is logged once; undefined before the first pass. */
+  private logged: string | undefined;
   constructor(
     private readonly api: AccountsApi,
     private readonly cfg: { installation: string; namespace: string },
@@ -73,9 +75,10 @@ export class SchedulerAccountsWriter {
   /**
    * Renders and, when it changed, writes the accounts file. Returns the problems of a refused
    * render, or an empty list. Never throws: a failed read or write is logged and retried on the
-   * next pass, and reports no problems, since it says nothing about the record.
+   * next pass, and returns undefined, since it says nothing about the record; the caller then
+   * keeps whatever it reported before.
    */
-  async reconcile(tenants: Tenant[]): Promise<AccountsProblem[]> {
+  async reconcile(tenants: Tenant[]): Promise<AccountsProblem[] | undefined> {
     try {
       const problems = await this.write(tenants);
       if (problems.length > 0)
@@ -87,23 +90,24 @@ export class SchedulerAccountsWriter {
           ),
         );
       else
-        this.log('', () => console.log(`${SCHEDULER_NATS_ACCOUNTS} is rendered from the record`));
+        this.log('rendered', () =>
+          console.log(`${SCHEDULER_NATS_ACCOUNTS} is rendered from the record`),
+        );
       return problems;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.log(`failed: ${message}`, () =>
         console.error(`${SCHEDULER_NATS_ACCOUNTS} could not be written: ${message}`),
       );
-      return [];
+      return undefined;
     }
   }
 
   private async write(tenants: Tenant[]): Promise<AccountsProblem[]> {
     const { namespace, installation } = this.cfg;
     const pki = schedulerPkiNamespace(namespace);
-    // No PKI namespace: this installation has no scheduler PKI. No record: the bootstrap Job has
-    // not run yet, and issuance reports that on each Tenant.
-    if (!(await this.get(`/api/v1/namespaces/${pki}`))) return [];
+    // No record: the installation has no scheduler PKI, or the bootstrap Job has not run yet, which
+    // issuance reports on each Tenant.
     const record = await this.get<Stored>(configMapPath(pki, SCHEDULER_IDENTITIES));
     if (!record) return [];
     const rendered = renderSchedulerAccounts(
