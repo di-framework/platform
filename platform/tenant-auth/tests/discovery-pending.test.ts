@@ -111,6 +111,12 @@ describe('Controller.start with the issuer unreachable at first', () => {
     expect(info.status).toBe(503);
     expect(Number(info.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
 
+    const authed = await fetch(`http://127.0.0.1:${main.port}/-/whoami`, {
+      headers: { authorization: 'Bearer an-identity-access-token' },
+    });
+    expect(authed.status).toBe(503);
+    expect(Number(authed.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
+
     const identityToken = await whoamiCall('Bearer an-identity-access-token');
     expect(identityToken.status).toBe(503);
     expect(Number(identityToken.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);

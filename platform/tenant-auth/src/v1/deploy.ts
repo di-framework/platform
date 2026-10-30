@@ -254,9 +254,8 @@ function inject(template: Json, sources: ConfigRefs): Json {
   };
   return {
     ...template,
-    ...(Array.isArray(template.components)
-      ? { components: template.components.map(withSources) }
-      : {}),
+    // `invalid` has already required a non-empty components array.
+    components: (template.components as unknown[]).map(withSources),
     ...(isObject(template.service) ? { service: withSources(template.service) } : {}),
   };
 }

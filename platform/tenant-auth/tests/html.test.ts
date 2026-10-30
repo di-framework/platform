@@ -71,6 +71,19 @@ describe('overview', () => {
     expect(html).toContain('<a href="/keys">API keys</a>');
   });
 
+  test('orders deployments of the same application and env by name', () => {
+    const html = overview(
+      who,
+      [
+        { name: 'web-b', application: 'web', env: 'prod' },
+        { name: 'web-a', application: 'web', env: 'prod' },
+      ],
+      [],
+    );
+    expect(html.indexOf('>web-a</a>')).toBeGreaterThan(-1);
+    expect(html.indexOf('>web-a</a>')).toBeLessThan(html.indexOf('>web-b</a>'));
+  });
+
   test('shows empty states', () => {
     const html = overview(who, [], []);
     expect(html).toContain('No deployments.');

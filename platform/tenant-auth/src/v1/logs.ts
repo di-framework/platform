@@ -252,13 +252,9 @@ export function listEvents(list: ConfigMapList): ProjectedLogEvent[] {
   return items.flatMap((configMap) => logEvents(configMap, moved)).sort(byTime);
 }
 
-/** Resolves after `ms`, or as soon as the signal aborts. */
+/** Resolves after `ms`, or as soon as the signal aborts; its caller checks `aborted` first. */
 const sleep = (ms: number, signal: AbortSignal) =>
   new Promise<void>((resolve) => {
-    if (signal.aborted) {
-      resolve();
-      return;
-    }
     const onAbort = () => {
       clearTimeout(timer);
       resolve();
