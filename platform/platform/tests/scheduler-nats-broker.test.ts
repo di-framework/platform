@@ -1,7 +1,9 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { SCHEDULER_NATS_IMAGE, schedulerNatsServerConfig } from '../src/scheduler-nats-server';
 import { type AccountsRender, renderSchedulerAccounts } from '../src/tenancy/scheduler-nats';
 import {
@@ -123,6 +125,42 @@ const PERMISSION_SUB = (subject: string) =>
   `Permissions Violation for Subscription to "${subject}"`;
 
 let port = 0;
+
+/**
+ * A connection made by `tests/support/operator-nats` (Go): the wasmCloud runtime-operator v2.8.0's
+ * own nats.go version and connect options, reconnect forever included (§8.2). `events` are the
+ * lines it prints: "connected", then "disconnected: …", "reconnected", "error: …", "closed: …".
+ */
+interface OperatorConnection {
+  events: string[];
+  stop(): void;
+}
+const goDir = join(import.meta.dir, 'support', 'operator-nats');
+let goWork = '';
+function operatorNats(credentials: Credentials): OperatorConnection {
+  const dir = mkdtempSync(join(goWork, 'creds-'));
+  for (const [name, value] of Object.entries(credentials)) writeFileSync(join(dir, name), value);
+  const child = Bun.spawn(
+    [
+      join(goWork, 'operator-nats'),
+      `127.0.0.1:${port}`,
+      ...['ca', 'cert', 'key'].map((name) => join(dir, name)),
+      'runtime.operator.heartbeat.>',
+    ],
+    { stdin: 'pipe', stdout: 'pipe', stderr: 'inherit' },
+  );
+  const events: string[] = [];
+  void (async () => {
+    let buffered = '';
+    for await (const chunk of child.stdout) {
+      buffered += new TextDecoder().decode(chunk);
+      const lines = buffered.split('\n');
+      buffered = lines.pop() ?? '';
+      events.push(...lines);
+    }
+  })();
+  return { events, stop: () => void child.stdin.end() };
+}
 /** Clients closed after each test, so no account reaches its connection limit by accident. */
 const open: NatsClient[] = [];
 /** Clients kept across the reload tests. */
@@ -212,6 +250,13 @@ describe.skipIf(!enabled)('scheduler NATS broker (#541 m2, design-541 §8.2)', (
     );
     const mapped = mustRun(['port', server, '4222/tcp']).stdout.trim().split('\n')[0] ?? '';
     port = Number(mapped.slice(mapped.lastIndexOf(':') + 1));
+    goWork = mkdtempSync(join(tmpdir(), 'operator-nats-'));
+    const built = spawnSync('go', ['build', '-o', join(goWork, 'operator-nats'), '.'], {
+      cwd: goDir,
+      encoding: 'utf8',
+      timeout: 300_000,
+    });
+    if (built.status !== 0) throw new Error(`go build failed: ${built.stderr}`);
     const ready = await until(() => admitted(platform('host', GOLDEN_IDS.platformHost)), 60_000);
     if (!ready) throw new Error(`nats-server did not start: ${container(['logs', server]).stderr}`);
   }, 300_000);
@@ -223,6 +268,7 @@ describe.skipIf(!enabled)('scheduler NATS broker (#541 m2, design-541 §8.2)', (
 
   afterAll(() => {
     for (const client of kept) client.close();
+    if (goWork) rmSync(goWork, { recursive: true, force: true });
     if (enabled) container(['rm', '-f', server]);
   });
 
@@ -549,6 +595,39 @@ describe.skipIf(!enabled)('scheduler NATS broker (#541 m2, design-541 §8.2)', (
       expect(await aHost.flush()).toBe(true);
       expect(await cHost.flush()).toBe(true);
     });
+
+    it("removing a tenant closes its operator's connection made with the runtime-operator's own options", async () => {
+      // The operator reconnects forever (MaxReconnects(-1)): the removed account's user must end
+      // closed, not reconnecting, and the other tenant's operator connection stays up.
+      const removed = operatorNats(operator('c', cOperator));
+      const other = operatorNats(operator('a', GOLDEN_IDS.aOperator));
+      try {
+        expect(await until(() => removed.events.includes('connected'), 30_000)).toBe(true);
+        expect(await until(() => other.events.includes('connected'), 30_000)).toBe(true);
+        reload(
+          text(
+            renderSchedulerAccounts(
+              GOLDEN_NAMESPACE,
+              GOLDEN_TENANTS.filter((t) => t.metadata.name !== 'b'),
+              GOLDEN_RECORD,
+              now,
+            ),
+          ),
+        );
+        expect(await until(() => removed.events.some((e) => e.startsWith('closed:')), 30_000)).toBe(
+          true,
+        );
+        expect(removed.events.find((e) => e.startsWith('closed:'))).toBe(
+          'closed: nats: Authorization Violation',
+        );
+        expect(await refused(operator('c', cOperator))).toBe('Authorization Violation');
+        expect(other.events).toEqual(['connected']);
+        expect(await aHost.flush()).toBe(true);
+      } finally {
+        removed.stop();
+        other.stop();
+      }
+    }, 60_000);
 
     it('a forced rotation disconnects only the old identity, which is then refused', async () => {
       const aOld = await connect(operator('a', GOLDEN_IDS.aOperator));
