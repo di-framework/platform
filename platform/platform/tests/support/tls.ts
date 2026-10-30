@@ -76,6 +76,20 @@ export function opensslVerifies(
   at: Date,
   purpose: 'sslserver' | 'sslclient' = 'sslserver',
 ): boolean {
+  return opensslVerifyError(leaf, bundle, at, purpose) === undefined;
+}
+
+/**
+ * Why `openssl verify` refuses `leaf` (its output), or `undefined` when it accepts it, with the
+ * arguments of {@link opensslVerifies}. Tests of a refusal assert its reason with it, so a leaf
+ * refused for another reason (such as not yet valid) cannot pass for a name-constraint refusal.
+ */
+export function opensslVerifyError(
+  leaf: string,
+  bundle: string,
+  at: Date,
+  purpose: 'sslserver' | 'sslclient' = 'sslserver',
+): string | undefined {
   const dir = mkdtempSync(join(tmpdir(), 'ca-verify-'));
   try {
     writeFileSync(join(dir, 'leaf.pem'), leaf);
@@ -92,7 +106,7 @@ export function opensslVerifies(
       join(dir, 'leaf.pem'),
     ]);
     if (result.error) throw result.error;
-    return result.status === 0;
+    return result.status === 0 ? undefined : `${result.stdout}${result.stderr}`;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -146,14 +160,28 @@ export function verifiesAt(leaf: string, bundle: string, at: Date): boolean {
 export function opensslClientLeaf(
   ca: { cert: string; key: string },
   subjectAltName: string,
+  validity: Validity,
 ): string {
-  return opensslClientPair(ca, subjectAltName).cert;
+  return opensslClientPair(ca, subjectAltName, validity).cert;
 }
 
-/** {@link opensslClientLeaf} with its private key, for a client that presents it (#541 m2). */
+/** The validity period of a forged leaf: explicit, so it never depends on the wall clock. */
+export interface Validity {
+  notBefore: Date;
+  notAfter: Date;
+}
+
+/** `date` in the `YYMMDDHHMMSSZ` form of `openssl ca -startdate/-enddate` (UTCTime). */
+const utcTime = (date: Date) => `${date.toISOString().slice(2, 19).replace(/[-T:]/g, '')}Z`;
+
+/**
+ * {@link opensslClientLeaf} with its private key, for a client that presents it (#541 m2). It
+ * signs with `openssl ca`, whose `-startdate`/`-enddate` both OpenSSL 3 and LibreSSL support.
+ */
 export function opensslClientPair(
   ca: { cert: string; key: string },
   subjectAltName: string,
+  validity: Validity,
 ): { cert: string; key: string } {
   const dir = mkdtempSync(join(tmpdir(), 'ca-forge-'));
   try {
@@ -173,23 +201,44 @@ export function opensslClientPair(
         '',
       ].join('\n'),
     );
+    writeFileSync(at('index.txt'), '');
+    writeFileSync(at('serial'), '1234\n');
+    writeFileSync(
+      at('ca.cnf'),
+      [
+        '[ca]',
+        'default_ca=forge',
+        '[forge]',
+        `database=${at('index.txt')}`,
+        `new_certs_dir=${dir}`,
+        `serial=${at('serial')}`,
+        'policy=any',
+        'default_md=sha256',
+        'unique_subject=no',
+        '[any]',
+        'commonName=supplied',
+        '',
+      ].join('\n'),
+    );
     const run = (...args: string[]) => execFileSync(OPENSSL, args, { stdio: 'ignore' });
     run('ecparam', '-name', 'prime256v1', '-genkey', '-noout', '-out', at('leaf.key'));
     run('req', '-new', '-key', at('leaf.key'), '-subj', '/CN=forged', '-out', at('leaf.csr'));
     run(
-      'x509',
-      '-req',
+      'ca',
+      '-batch',
+      '-notext',
+      '-config',
+      at('ca.cnf'),
       '-in',
       at('leaf.csr'),
-      '-CA',
+      '-cert',
       at('ca.pem'),
-      '-CAkey',
+      '-keyfile',
       at('ca.key'),
-      '-sha256',
-      '-set_serial',
-      '4660',
-      '-days',
-      '2',
+      '-startdate',
+      utcTime(validity.notBefore),
+      '-enddate',
+      utcTime(validity.notAfter),
       '-extfile',
       at('ext.cnf'),
       '-extensions',
