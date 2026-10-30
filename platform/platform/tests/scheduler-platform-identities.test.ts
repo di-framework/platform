@@ -4,10 +4,14 @@ import type { Resource } from '../src/tenancy/resources';
 import {
   CA_KEYS,
   IDENTITIES_KEY,
+  natsServerLeaf,
   natsServiceNames,
+  newSchedulerCa,
   PLATFORM_SECRETS,
   parseIdentityRecord,
+  platformClientLeaf,
   SCHEDULER_CA_SECRET,
+  tlsSecretData,
 } from '../src/tenancy/scheduler-pki';
 import {
   SCHEDULER_TLS_ANNOTATION,
@@ -16,6 +20,7 @@ import {
 import {
   PLATFORM_HOST_DEPLOYMENT,
   PlatformSchedulerIdentities,
+  SCHEDULER_DATA_TLS_ANNOTATION,
 } from '../src/tenancy/scheduler-platform-identities';
 import { certificateNames, issuedBy } from '../src/tenancy/tls';
 import {
@@ -69,14 +74,23 @@ const record = (api: MemoryApi) => parseIdentityRecord(data(api, recordPath)[IDE
 const cert = (api: MemoryApi, name: string) => decode(data(api, secretPath(name))['tls.crt']);
 
 /** hostgroup-default with its template annotation and a completed (or held) rollout. */
-function seedDeployment(api: MemoryApi, digest?: string, complete = true): void {
+function seedDeployment(
+  api: MemoryApi,
+  digest?: string,
+  complete = true,
+  dataDigest?: string,
+): void {
+  const annotations = {
+    ...(digest ? { [SCHEDULER_TLS_ANNOTATION]: digest } : {}),
+    ...(dataDigest ? { [SCHEDULER_DATA_TLS_ANNOTATION]: dataDigest } : {}),
+  };
   api.seed({
     apiVersion: 'apps/v1',
     kind: 'Deployment',
     metadata: { name: PLATFORM_HOST_DEPLOYMENT, namespace: NS, generation: 2 },
     spec: {
       replicas: 1,
-      template: { metadata: digest ? { annotations: { [SCHEDULER_TLS_ANNOTATION]: digest } } : {} },
+      template: { metadata: { annotations } },
     },
     status: {
       observedGeneration: 2,
@@ -85,12 +99,29 @@ function seedDeployment(api: MemoryApi, digest?: string, complete = true): void 
     },
   } as unknown as Resource);
 }
-const annotation = (api: MemoryApi) =>
+const annotation = (api: MemoryApi, name = SCHEDULER_TLS_ANNOTATION) =>
   (
     api.objects.get(deploymentPath) as unknown as {
       spec: { template: { metadata: { annotations?: Record<string, string> } } };
     }
-  ).spec.template.metadata.annotations?.[SCHEDULER_TLS_ANNOTATION];
+  ).spec.template.metadata.annotations?.[name];
+const patches = (api: PlatformApi) =>
+  api.platformWrites().filter((w) => w === `PATCH ${deploymentPath}`).length;
+const digestOf = (api: MemoryApi, role: 'host' | 'data') =>
+  schedulerCertDigest(cert(api, PLATFORM_SECRETS[role]));
+/** Replaces the `platform/data` leaf with one for its recorded ID issued `days` days before START. */
+function ageData(api: MemoryApi, days: number): void {
+  const ca = data(api, `/api/v1/namespaces/${PKI}/secrets/${SCHEDULER_CA_SECRET}`);
+  const platformCa = {
+    cert: decode(ca[CA_KEYS.platform.cert]),
+    key: decode(ca[CA_KEYS.platform.key]),
+  };
+  const id = record(api)['platform/data']?.current as string;
+  const leaf = platformClientLeaf('data', id, platformCa, new Date(START.getTime() - days * DAY));
+  const path = secretPath(PLATFORM_SECRETS.data);
+  const secret = api.objects.get(path) as Resource;
+  api.seed({ ...secret, data: tlsSecretData(leaf, platformCa.cert) } as unknown as Resource);
+}
 
 let warn: ReturnType<typeof spyOn>;
 const warned = (text: string) =>
@@ -153,7 +184,7 @@ describe('controller tick: platform scheduler identities (#541 m6e-A)', () => {
     expect(writes.filter((w) => w === `PATCH ${deploymentPath}`)).toHaveLength(1);
 
     // The rollout completes; past previousUntil every previous is dropped once, then nothing.
-    seedDeployment(api, digest);
+    seedDeployment(api, digest, true, digestOf(api, 'data'));
     clock.now = new Date(START.getTime() + 61 * DAY + 11 * 60_000);
     api.operations.length = 0;
     await controller.tick();
@@ -260,6 +291,81 @@ describe('controller tick: platform scheduler identities (#541 m6e-A)', () => {
     await new PlatformSchedulerIdentities(api, cfg, () => clock.now).reconcile();
     expect(api.operations.every((o) => o.method === 'GET')).toBe(true);
     expect(warned('Platform scheduler identities')).toBe(0);
+  });
+
+  it('still rolls hostgroup-default after a restart between the Secret write and the PATCH', async () => {
+    const { api, controller } = await prepare();
+    seedDeployment(api);
+    clock.now = new Date(START.getTime() + 61 * DAY);
+    api.failOnce.add(`PATCH ${deploymentPath}`);
+    await controller.tick();
+    expect(annotation(api)).toBeUndefined();
+    // A new process: nothing of the failed PATCH is held in memory.
+    await new PlatformSchedulerIdentities(api, cfg, () => clock.now).reconcile();
+    expect(annotation(api)).toBe(digestOf(api, 'host'));
+    expect(annotation(api, SCHEDULER_DATA_TLS_ANNOTATION)).toBe(digestOf(api, 'data'));
+  });
+
+  it('keeps platform/data previous past previousUntil while the rollout is held', async () => {
+    const { api, controller } = await prepare();
+    seedDeployment(api);
+    clock.now = new Date(START.getTime() + 61 * DAY);
+    api.operations.length = 0;
+    await controller.tick();
+    expect(patches(api)).toBe(1);
+    seedDeployment(api, digestOf(api, 'host'), false, digestOf(api, 'data'));
+    clock.now = new Date(clock.now.getTime() + 11 * 60_000);
+    await controller.tick();
+    expect(record(api)['platform/host']?.previous).toBeDefined();
+    expect(record(api)['platform/data']?.previous).toBeDefined();
+    expect(record(api)['platform/operator']?.previous).toBeUndefined();
+    expect(warned('has not rolled out')).toBe(1);
+    // Once both certificates have rolled out, both previous are dropped.
+    seedDeployment(api, digestOf(api, 'host'), true, digestOf(api, 'data'));
+    api.operations.length = 0;
+    await controller.tick();
+    expect(record(api)['platform/data']?.previous).toBeUndefined();
+    expect(record(api)['platform/host']?.previous).toBeUndefined();
+    expect(patches(api)).toBe(0);
+  });
+
+  it('rolls hostgroup-default on a data-only renewal, keeping the host annotation', async () => {
+    const { api, controller } = await prepare();
+    await controller.tick();
+    const host = digestOf(api, 'host');
+    seedDeployment(api, host, true, digestOf(api, 'data'));
+    ageData(api, 70);
+    api.operations.length = 0;
+    await controller.tick();
+    const writes = api.platformWrites();
+    expect(writes).toContain(`PUT ${secretPath(PLATFORM_SECRETS.data)}`);
+    expect(writes).not.toContain(`PUT ${secretPath(PLATFORM_SECRETS.host)}`);
+    expect(patches(api)).toBe(1);
+    expect(annotation(api, SCHEDULER_DATA_TLS_ANNOTATION)).toBe(digestOf(api, 'data'));
+    expect(annotation(api)).toBe(host);
+    expect(record(api)['platform/data']?.previous).toBeDefined();
+  });
+
+  it('sends one PATCH with both annotations when host and data renew in one tick', async () => {
+    const { api, controller } = await prepare();
+    seedDeployment(api);
+    clock.now = new Date(START.getTime() + 61 * DAY);
+    api.operations.length = 0;
+    await controller.tick();
+    expect(patches(api)).toBe(1);
+    expect(annotation(api)).toBe(digestOf(api, 'host'));
+    expect(annotation(api, SCHEDULER_DATA_TLS_ANNOTATION)).toBe(digestOf(api, 'data'));
+  });
+
+  it('re-issues a server leaf from a foreign CA exactly once', async () => {
+    const { api, controller } = await prepare();
+    const path = secretPath(PLATFORM_SECRETS.server);
+    const foreign = natsServerLeaf(NS, newSchedulerCa('platform', NS, START), START);
+    const secret = api.objects.get(path) as Resource;
+    api.seed({ ...secret, data: tlsSecretData(foreign, foreign.cert) } as unknown as Resource);
+    api.operations.length = 0;
+    for (let i = 0; i < 4; i++) await controller.tick();
+    expect(api.platformWrites().filter((w) => w === `PUT ${path}`)).toHaveLength(1);
   });
 
   it('logs a non-Error failure', async () => {

@@ -11,10 +11,16 @@
  * - **Record first.** The identity record is written before any client certificate is issued, so a
  *   user name always names exactly one certificate; a Secret is written under the resourceVersion
  *   it was read with.
- * - **`hostgroup-default`.** After a `platform/host` renewal the Deployment is rolled by a
- *   pod-template annotation PATCH carrying {@link schedulerCertDigest} of the new certificate,
- *   and only if it exists. `previous` is dropped once that rollout is observed; past
- *   `previousUntil` without it, the stall is logged once.
+ * - **`hostgroup-default`** presents `platform/host` and, on its DATA connection, `platform/data`,
+ *   so both follow the host rule: each `previous` is dropped only once the Deployment has rolled
+ *   out that role's current certificate, whose {@link schedulerCertDigest} its pod template
+ *   carries ({@link SCHEDULER_TLS_ANNOTATION} for host, {@link SCHEDULER_DATA_TLS_ANNOTATION} for
+ *   data). Both annotations go in one PATCH, after a renewal of either role, and only if the
+ *   Deployment exists. Whether a roll is still due is derived from persisted state (an entry with
+ *   `previous`, a Secret carrying `current`, a template digest that differs), so a restart between
+ *   the Secret write and the PATCH still rolls. Past `previousUntil` without the rollout the stall
+ *   is logged once. Without the Deployment, `previous` stays recorded (and its user rendered) until
+ *   the next renewal, as for a tenant whose host group is absent.
  * - **Failures** are logged once per distinct message and retried on the next tick; nothing here
  *   retries within a tick, and a steady state writes nothing.
  *
@@ -24,9 +30,11 @@
 import { X509Certificate } from 'node:crypto';
 import { COMPONENT, INSTALLATION } from './resources';
 import {
+  deploymentPath,
   getIfExists,
+  type HostDeployment,
+  hostRolloutOf,
   type IdentityApi,
-  observeHostRollout,
   observeIdentity,
   putIdentityRecord,
   readSchedulerCas,
@@ -34,6 +42,7 @@ import {
 } from './scheduler-identities';
 import {
   IDENTITIES_KEY,
+  type IdentityRecord,
   natsServerLeaf,
   PLATFORM_ROLES,
   PLATFORM_SECRETS,
@@ -52,6 +61,7 @@ import {
 } from './scheduler-pki';
 import {
   type IdentityObservation,
+  type IdentityTransition,
   recordTransition,
   SCHEDULER_TLS_ANNOTATION,
   schedulerCertDigest,
@@ -60,18 +70,40 @@ import { issuedBy, type KeyPair } from './tls';
 
 /** The chart's platform host group, which presents `platform/host` and `platform/data`. */
 export const PLATFORM_HOST_DEPLOYMENT = 'hostgroup-default';
+/** The pod-template annotation carrying the digest of the `platform/data` certificate. */
+export const SCHEDULER_DATA_TLS_ANNOTATION = 'platform.di-framework.dev/scheduler-data-tls-sha256';
+/** The pod-template annotation each host-group role's certificate digest goes in. */
+const ROLL_ANNOTATIONS: Partial<Record<PlatformRole, string>> = {
+  host: SCHEDULER_TLS_ANNOTATION,
+  data: SCHEDULER_DATA_TLS_ANNOTATION,
+};
 const DAY_MS = 86_400_000;
 
 const secretPath = (ns: string, name: string) => `/api/v1/namespaces/${ns}/secrets/${name}`;
 const decode = (value: string | undefined) => Buffer.from(value ?? '', 'base64').toString('utf8');
+
+/** What one tick read: the CAs, the record and `hostgroup-default`. */
+interface Context {
+  pki: string;
+  now: Date;
+  cas: SchedulerCas;
+  stored: Stored;
+  record: IdentityRecord;
+  deployment: HostDeployment | undefined;
+}
+
+/** A host-group annotation the Deployment should carry, and whether it must be rolled to it. */
+interface RollTarget {
+  annotation: string;
+  digest: string;
+  due: boolean;
+}
 
 export class PlatformSchedulerIdentities {
   /** The problem last logged ('' for none), so each change is logged once. */
   private logged = '';
   /** True while the `hostgroup-default` stall has been logged and not yet cleared. */
   private stallLogged = false;
-  /** The digest of an issued `platform/host` certificate whose rollout PATCH has not landed. */
-  private roll: string | undefined;
 
   constructor(
     private readonly api: IdentityApi,
@@ -115,89 +147,127 @@ export class PlatformSchedulerIdentities {
   }
 
   /**
-   * Renews the due identities. Without a PKI namespace, a usable CA or the record there is nothing
-   * to renew: the bootstrap Job has not run, and each Tenant already reports that as
+   * The tick's context. Without a PKI namespace, a usable CA or the record there is nothing to
+   * renew: the bootstrap Job has not run, and each Tenant already reports that as
    * `SchedulerIdentityPending`, so it is not logged again here.
    */
-  private async renew(): Promise<void> {
+  private async context(): Promise<Context | undefined> {
     const { namespace } = this.cfg;
     const pki = schedulerPkiNamespace(namespace);
-    if (!(await getIfExists(this.api, `/api/v1/namespaces/${pki}`))) return;
+    if (!(await getIfExists(this.api, `/api/v1/namespaces/${pki}`))) return undefined;
     const now = this.now();
     const cas = await readSchedulerCas(this.api, namespace, now);
-    if ('reason' in cas) return;
+    if ('reason' in cas) return undefined;
     const stored = await getIfExists<Stored>(
       this.api,
       `/api/v1/namespaces/${pki}/configmaps/${SCHEDULER_IDENTITIES}`,
     );
-    if (!stored) return;
+    if (!stored) return undefined;
     const record = parseIdentityRecord(stored.data?.[IDENTITIES_KEY] ?? '');
+    const deployment = await getIfExists<HostDeployment>(
+      this.api,
+      deploymentPath(namespace, PLATFORM_HOST_DEPLOYMENT),
+    );
+    return { pki, now, cas, stored, record, deployment };
+  }
 
-    const hosts = await observeHostRollout(this.api, namespace, PLATFORM_HOST_DEPLOYMENT);
+  /** Renews the due identities, then the server leaf, then rolls `hostgroup-default`. */
+  private async renew(): Promise<void> {
+    const ctx = await this.context();
+    if (!ctx) return;
+    const { secrets, observed } = await this.observe(ctx);
+    const next = recordTransition(ctx.record, observed, ctx.now, this.random);
+    // The record first: a user name then always names exactly one certificate.
+    if (serializeIdentityRecord(next.record) !== serializeIdentityRecord(ctx.record))
+      await putIdentityRecord(this.api, ctx.pki, ctx.stored, next.record);
+    const targets: RollTarget[] = [];
+    for (const [key, transition] of next.transitions) {
+      const { role, secret } = secrets.get(key) as { role: PlatformRole; secret: Stored };
+      const target = await this.apply(ctx, role, secret, transition);
+      if (target) targets.push(target);
+    }
+    await this.renewServer(ctx.cas, ctx.now);
+    await this.rollHosts(ctx.deployment, targets);
+    this.logStall(next.stalled.length > 0);
+  }
+
+  /** The owned, recorded platform Secrets, and their observations. */
+  private async observe(ctx: Context) {
     const secrets = new Map<string, { role: PlatformRole; secret: Stored }>();
     const observed: Record<string, IdentityObservation> = {};
     for (const role of PLATFORM_ROLES) {
       const key = platformIdentity(role);
       const secret = await getIfExists<Stored>(
         this.api,
-        secretPath(namespace, PLATFORM_SECRETS[role]),
+        secretPath(this.cfg.namespace, PLATFORM_SECRETS[role]),
       );
-      if (!this.owned(secret) || !record[key]) continue;
+      if (!this.owned(secret) || !ctx.record[key]) continue;
       secrets.set(key, { role, secret });
+      const annotation = ROLL_ANNOTATIONS[role];
       observed[key] = observeIdentity<IdentityObservation>(
-        role === 'host' ? hosts : { client: 'operator' },
+        annotation
+          ? hostRolloutOf(ctx.deployment, PLATFORM_HOST_DEPLOYMENT, annotation)
+          : { client: 'operator' },
         secret,
-        cas.platform.cert,
+        ctx.cas.platform.cert,
         (id) => platformUser(role, id),
       );
     }
-    const next = recordTransition(record, observed, now, this.random);
-    // The record first: a user name then always names exactly one certificate.
-    if (serializeIdentityRecord(next.record) !== serializeIdentityRecord(record))
-      await putIdentityRecord(this.api, pki, stored, next.record);
-    let annotate: string | undefined;
-    for (const [key, transition] of next.transitions) {
-      const { role, secret } = secrets.get(key) as { role: PlatformRole; secret: Stored };
-      if (transition.action === 'keep') {
-        annotate ??= transition.annotate?.[SCHEDULER_TLS_ANNOTATION];
-        continue;
-      }
-      const leaf = platformClientLeaf(role, transition.entry.current, cas.platform, now);
-      await this.put(secret, leaf, cas.platform.cert);
-      if (role === 'host') this.roll = schedulerCertDigest(leaf.cert);
-    }
-    await this.renewServer(cas, now);
-    await this.rollHosts(hosts, this.roll ?? annotate);
-    const stalled = next.stalled.length > 0;
-    if (stalled && !this.stallLogged)
-      console.warn(
-        `Platform scheduler identities: Deployment ${namespace}/${PLATFORM_HOST_DEPLOYMENT} has not rolled out the renewed scheduler certificate; the previous user stays admitted`,
-      );
-    this.stallLogged = stalled;
+    return { secrets, observed };
   }
 
   /**
-   * Rolls `hostgroup-default` to the certificate `digest`: only if it exists, and only after a
-   * renewal issued here or once its template already carries another digest (a PATCH that
-   * failed after issuance in an earlier run), so a Deployment never annotated is not restarted.
+   * Issues `role`'s certificate when `transition` says so. For a host-group role, returns the
+   * annotation the Deployment should carry. It is due after an issuance, and otherwise while the
+   * template differs from it and either a `previous` waits for the roll (persisted, so a restart
+   * before the PATCH still rolls) or the template already carries another digest.
+   */
+  private async apply(
+    ctx: Context,
+    role: PlatformRole,
+    secret: Stored,
+    transition: IdentityTransition,
+  ): Promise<RollTarget | undefined> {
+    const annotation = ROLL_ANNOTATIONS[role];
+    if (transition.action === 'issue') {
+      const leaf = platformClientLeaf(role, transition.entry.current, ctx.cas.platform, ctx.now);
+      await this.put(secret, leaf, ctx.cas.platform.cert);
+      return annotation
+        ? { annotation, digest: schedulerCertDigest(leaf.cert), due: true }
+        : undefined;
+    }
+    const digest = transition.annotate?.[SCHEDULER_TLS_ANNOTATION];
+    if (!annotation || !digest) return undefined;
+    const carried = ctx.deployment?.spec?.template?.metadata?.annotations?.[annotation];
+    const waiting = transition.entry.previous !== undefined || carried !== undefined;
+    return { annotation, digest, due: waiting && carried !== digest };
+  }
+
+  /**
+   * Rolls `hostgroup-default` when any of `targets` is due, setting every target annotation in one
+   * PATCH; only if it exists, so a Deployment never installed is not created.
    */
   private async rollHosts(
-    hosts: Awaited<ReturnType<typeof observeHostRollout>>,
-    digest: string | undefined,
+    deployment: HostDeployment | undefined,
+    targets: RollTarget[],
   ): Promise<void> {
-    const { rollout } = hosts;
-    if (!rollout || !digest || rollout.digest === digest) {
-      if (rollout) this.roll = undefined;
-      return;
-    }
-    if (!this.roll && rollout.digest === undefined) return;
+    if (!deployment || !targets.some((t) => t.due)) return;
+    const annotations = Object.fromEntries(targets.map((t) => [t.annotation, t.digest]));
     await this.api.call(
       'PATCH',
-      `/apis/apps/v1/namespaces/${this.cfg.namespace}/deployments/${PLATFORM_HOST_DEPLOYMENT}`,
-      { spec: { template: { metadata: { annotations: { [SCHEDULER_TLS_ANNOTATION]: digest } } } } },
+      deploymentPath(this.cfg.namespace, PLATFORM_HOST_DEPLOYMENT),
+      { spec: { template: { metadata: { annotations } } } },
       'application/merge-patch+json',
     );
-    this.roll = undefined;
+  }
+
+  /** Logs a `hostgroup-default` stall once, until it clears. */
+  private logStall(stalled: boolean): void {
+    if (stalled && !this.stallLogged)
+      console.warn(
+        `Platform scheduler identities: Deployment ${this.cfg.namespace}/${PLATFORM_HOST_DEPLOYMENT} has not rolled out the renewed scheduler certificate; the previous user stays admitted`,
+      );
+    this.stallLogged = stalled;
   }
 
   /**

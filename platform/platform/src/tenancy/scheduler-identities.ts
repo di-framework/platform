@@ -156,27 +156,32 @@ export function observeIdentity<B extends IdentityObservation>(
   };
 }
 
-/** A host identity's observation base: Deployment `deployment` and its rollout of the certificate. */
-export async function observeHostRollout(
-  api: IdentityApi,
-  namespace: string,
+/** The fields of a host group Deployment that its rollout observation reads. */
+export interface HostDeployment {
+  metadata: { generation?: number };
+  spec?: {
+    replicas?: number;
+    template?: { metadata?: { annotations?: Record<string, string> } };
+  };
+  status?: {
+    observedGeneration?: number;
+    updatedReplicas?: number;
+    readyReplicas?: number;
+  };
+}
+
+/**
+ * A host identity's observation base from Deployment `deployment` as read (`value`, undefined when
+ * absent): its rollout of the certificate whose digest the pod-template `annotation` carries.
+ */
+export function hostRolloutOf(
+  value: HostDeployment | undefined,
   deployment: string,
-): Promise<HostObservation> {
-  const value = await getIfExists<{
-    metadata: { generation?: number };
-    spec?: {
-      replicas?: number;
-      template?: { metadata?: { annotations?: Record<string, string> } };
-    };
-    status?: {
-      observedGeneration?: number;
-      updatedReplicas?: number;
-      readyReplicas?: number;
-    };
-  }>(api, `/apis/apps/v1/namespaces/${namespace}/deployments/${deployment}`);
+  annotation: string = SCHEDULER_TLS_ANNOTATION,
+): HostObservation {
   if (!value) return { client: 'host', deployment };
   const replicas = value.spec?.replicas ?? 1;
-  const digest = value.spec?.template?.metadata?.annotations?.[SCHEDULER_TLS_ANNOTATION];
+  const digest = value.spec?.template?.metadata?.annotations?.[annotation];
   return {
     client: 'host',
     deployment,
@@ -189,6 +194,20 @@ export async function observeHostRollout(
         (value.status?.readyReplicas ?? 0) === replicas,
     },
   };
+}
+
+/** The path of Deployment `name` in `namespace`. */
+export const deploymentPath = (namespace: string, name: string) =>
+  `/apis/apps/v1/namespaces/${namespace}/deployments/${name}`;
+
+/** A host identity's observation base: Deployment `deployment` and its rollout of the certificate. */
+export async function observeHostRollout(
+  api: IdentityApi,
+  namespace: string,
+  deployment: string,
+): Promise<HostObservation> {
+  const value = await getIfExists<HostDeployment>(api, deploymentPath(namespace, deployment));
+  return hostRolloutOf(value, deployment);
 }
 
 /** The scheduler CAs, or why they cannot sign yet. */
