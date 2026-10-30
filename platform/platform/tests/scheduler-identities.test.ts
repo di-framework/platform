@@ -650,6 +650,24 @@ describe('tenant scheduler identity issuance (#541 m6c)', () => {
     expect(api.writes()).toEqual([]);
   });
 
+  it('keeps the pruned-rotation memory of a Tenant that stays listed across ticks', async () => {
+    const { api, identities } = await cluster();
+    await identities.reconcile(tenant());
+    api.pruneSchedulerIdentity = true;
+    api.seed(tenantPath, tenant({ [ROTATE_ANNOTATION]: 'r1' }) as unknown as Stored);
+    api.calls.length = 0;
+    // Each tick forgets only Tenants that are no longer listed; alpha stays listed.
+    for (let i = 0; i < 4; i++) {
+      identities.forget(new Set(['alpha']));
+      const t = tenant({ [ROTATE_ANNOTATION]: 'r1' });
+      t.metadata.resourceVersion = api.objects.get(tenantPath)?.metadata.resourceVersion;
+      const [pending] = await identities.reconcile(t);
+      expect(pending?.reason).toBe('RotationNotPersisted');
+    }
+    expect(api.writes().filter((w) => w === `PATCH ${tenantPath}/status`)).toHaveLength(1);
+    expect(api.writes().filter((w) => w === `PUT ${recordPath}`)).toHaveLength(1);
+  });
+
   it('sends the fresh Tenant resourceVersion with the rotation, so a stale LIST does not conflict', async () => {
     const { api, identities } = await cluster();
     await identities.reconcile(tenant());
