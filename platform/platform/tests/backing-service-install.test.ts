@@ -191,6 +191,8 @@ describe('backing-service install', () => {
       'scheduler-pki',
       'scheduler-pki-rotation',
       'scheduler-identities',
+      'scheduler-nats',
+      'scheduler-accounts',
       'controller',
     ]);
     for (const name of CONTROLLER_SCRIPT_MODULES) {
@@ -211,7 +213,9 @@ describe('backing-service install', () => {
       'registry-nats.js',
       'removal-sequence.js',
       'resources.js',
+      'scheduler-accounts.js',
       'scheduler-identities.js',
+      'scheduler-nats.js',
       'scheduler-pki-rotation.js',
       'scheduler-pki.js',
       'service-binding-reconcile.js',

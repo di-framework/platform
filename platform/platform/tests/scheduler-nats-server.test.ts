@@ -171,9 +171,10 @@ include "accounts/accounts.conf"
     expect(config).toContain(
       'jetstream {\n  store_dir: "/data/jetstream"\n  max_memory_store: 32M\n  max_file_store: 1G\n}',
     );
-    // Only the accounts file turns it on per account, and only for DATA (O5).
-    expect(accounts.match(/jetstream: enabled/g)).toHaveLength(1);
-    expect(accounts).toMatch(/DATA: \{\n\s*jetstream: enabled/);
+    // Only the accounts file turns it on per account, and only for DATA (O5), within the server
+    // caps (m6d).
+    expect(accounts.match(/jetstream:/g)).toHaveLength(1);
+    expect(accounts).toMatch(/DATA: \{\n\s*jetstream: \{ max_mem: 32M, max_file: 1G \}/);
     expect(container('nats').volumeMounts).toContainEqual({
       name: 'jetstream',
       mountPath: '/data/jetstream',

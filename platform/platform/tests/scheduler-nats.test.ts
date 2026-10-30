@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
+import { JETSTREAM_MAX_FILE_STORE, JETSTREAM_MAX_MEMORY_STORE } from '../src/scheduler-nats-server';
 import {
   ACCOUNTS_KEY,
   type AccountsRender,
   type AccountsTenant,
   bootstrapSchedulerAccounts,
+  DATA_MAX_FILE,
+  DATA_MAX_MEMORY,
   REFUSED_FOR_OTHER,
   renderSchedulerAccounts,
   SCHEDULER_ACCOUNTS_CONDITION,
@@ -83,9 +86,11 @@ describe('scheduler NATS accounts file (#541 m2, design-541 §4.2-4.4)', () => {
     const conf = text(golden());
     const accounts = accountsOf(conf);
     for (const [name, block] of Object.entries(accounts)) {
-      expect(block.includes('jetstream: enabled')).toBe(name === 'DATA');
+      expect(block.includes('jetstream:')).toBe(name === 'DATA');
       expect(block.includes('limits:')).toBe(name.startsWith('T_di-tenant-'));
     }
+    // m6d: DATA's JetStream is bounded by the m6b server caps.
+    expect(accounts.DATA).toContain('jetstream: { max_mem: 32M, max_file: 1G }');
     expect(accounts['T_di-tenant-a']).toContain(
       'limits: { max_connections: 8, max_subscriptions: 64, max_payload: 1048576 }',
     );
@@ -121,18 +126,17 @@ describe('scheduler NATS accounts file (#541 m2, design-541 §4.2-4.4)', () => {
     }
   });
 
-  it('drops a removed Tenant, record entries without a Tenant, and accounts without users', () => {
+  it('drops a removed Tenant, record entries without a Tenant, and tenant accounts without users', () => {
     const [b] = GOLDEN_TENANTS as [AccountsTenant];
     const conf = text(renderSchedulerAccounts(GOLDEN_NAMESPACE, [b], GOLDEN_RECORD, GOLDEN_NOW));
     expect(conf).not.toContain('di-tenant-a');
     const withoutOperator = { ...GOLDEN_RECORD };
     delete withoutOperator['tenant/b/operator'];
     delete withoutOperator['tenant/b/hosts'];
-    delete withoutOperator['platform/data'];
     const accounts = accountsOf(
       text(renderSchedulerAccounts(GOLDEN_NAMESPACE, [b], withoutOperator, GOLDEN_NOW)),
     );
-    expect(Object.keys(accounts)).toEqual(['T_wasmcloud']);
+    expect(Object.keys(accounts)).toEqual(['DATA', 'T_wasmcloud']);
     // R1: the host entry is gone, the operator stays.
     const r1 = { ...GOLDEN_RECORD };
     delete r1['tenant/b/hosts'];
@@ -300,6 +304,33 @@ describe('scheduler NATS accounts file (#541 m2, design-541 §4.2-4.4)', () => {
       expect(problem?.tenant).toBe(key.startsWith('tenant/') ? 'a' : undefined);
       expect(problem?.message).toContain(`user '${id}.`);
     }
+  });
+
+  it('refuses a record that leaves a platform account without users (m6d)', () => {
+    for (const [keys, accounts] of [
+      [['platform/data'], ['DATA']],
+      [['platform/host', 'platform/operator'], ['T_wasmcloud']],
+    ] as const) {
+      const bad: IdentityRecord = { ...GOLDEN_RECORD };
+      for (const key of keys) delete bad[key];
+      expect(
+        problems(renderSchedulerAccounts(GOLDEN_NAMESPACE, GOLDEN_TENANTS, bad, GOLDEN_NOW)),
+      ).toEqual(
+        accounts.map((name) => ({
+          reason: 'EmptyPlatformAccount',
+          message: `account ${name} has no users in the identity record`,
+        })),
+      );
+    }
+  });
+
+  it('keeps the DATA JetStream limits within the m6b server caps (m6d)', () => {
+    const bytes = (size: string) => {
+      const [, n, unit] = /^(\d+)([MG])$/.exec(size) as RegExpExecArray;
+      return Number(n) * (unit === 'G' ? 1024 ** 3 : 1024 ** 2);
+    };
+    expect(bytes(DATA_MAX_MEMORY)).toBeLessThanOrEqual(bytes(JETSTREAM_MAX_MEMORY_STORE));
+    expect(bytes(DATA_MAX_FILE)).toBeLessThanOrEqual(bytes(JETSTREAM_MAX_FILE_STORE));
   });
 
   it('refuses names that give invalid account names, before any user is checked', () => {

@@ -138,11 +138,17 @@ import {
   VERSION,
   validName,
 } from './resources';
+import { SchedulerAccountsWriter } from './scheduler-accounts';
 import {
   ownsIdentitySecret,
   TENANT_HOST_SECRET,
   TenantSchedulerIdentities,
 } from './scheduler-identities';
+import {
+  type AccountsProblem,
+  SCHEDULER_ACCOUNTS_CONDITION,
+  schedulerAccountsCondition,
+} from './scheduler-nats';
 import {
   assertSafeBindingStatus,
   bindingProjectionName,
@@ -489,9 +495,18 @@ export class Controller {
     private readonly now: () => Date = () => new Date(),
   ) {
     this.identities = new TenantSchedulerIdentities(api, cfg, now);
+    this.accounts = new SchedulerAccountsWriter(api, cfg, now);
   }
   /** Issuance of each tenant's scheduler NATS identities (#541 m6c). */
   private readonly identities: TenantSchedulerIdentities;
+  /** The scheduler NATS accounts file (#541 m6d). */
+  private readonly accounts: SchedulerAccountsWriter;
+  /**
+   * The problems of the last accounts render, reported on every Tenant: empty when it was written,
+   * undefined while unknown (before the first render since start, or after a failed read), when
+   * each Tenant keeps the `SchedulerAccounts` condition it has.
+   */
+  private accountsProblems: AccountsProblem[] | undefined;
   private async get<T>(path: string): Promise<T | undefined> {
     try {
       return await this.api.call<T>('GET', path);
@@ -1391,7 +1406,29 @@ export class Controller {
       observedGeneration: tenant.metadata.generation ?? 1,
       lastTransitionTime: new Date().toISOString(),
     };
-    const others = [...(auth ? [auth] : []), ...(logs ? [logs] : []), integrity, ...identity];
+    // A refused accounts render (#541 m6d), from the last pass: the previous file keeps serving.
+    const kept = tenant.status?.conditions?.find((c) => c.type === SCHEDULER_ACCOUNTS_CONDITION);
+    const accounts = !this.accountsProblems
+      ? kept
+        ? [kept]
+        : []
+      : this.accountsProblems.length > 0
+        ? [
+            schedulerAccountsCondition(
+              this.accountsProblems,
+              tenant.metadata.name,
+              tenant.metadata.generation ?? 1,
+              this.now(),
+            ),
+          ]
+        : [];
+    const others = [
+      ...(auth ? [auth] : []),
+      ...(logs ? [logs] : []),
+      integrity,
+      ...identity,
+      ...accounts,
+    ];
     const records = {
       storage: { keys: storage.records },
       // The rotation last handled (#541 m6c), carried into every status write so the controller
@@ -3074,6 +3111,8 @@ export class Controller {
         }
       }
     }
+    // After issuance and removal, so this pass's record changes reach the file (#541 m6d).
+    this.accountsProblems = await this.accounts.reconcile(tenants);
     for (const tenant of tenants) {
       if (tenant.spec.suspended || tenant.metadata.deletionTimestamp) continue;
       try {
