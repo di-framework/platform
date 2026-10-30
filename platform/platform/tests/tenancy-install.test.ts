@@ -157,8 +157,13 @@ describe('installTenancy controller RBAC wiring', () => {
     );
     // The ClusterRole holds no `escalate` (#115), so the running controller must already hold
     // TokenRequest in its namespace when `pulumi up` updates it.
+    // The tenant-operator admission policies confine its `bind` before it holds it (#541 m3).
     expect(dependsOn('clusterrole-di-test-controller')).toEqual([
       urnOf('rolebinding-di-test-controller'),
+      ...['clusterrolebindings', 'rolebindings', 'clusterroles'].flatMap((kind) => [
+        urnOf(`validatingadmissionpolicy-di-test-tenant-operator-${kind}`),
+        urnOf(`validatingadmissionpolicybinding-di-test-tenant-operator-${kind}`),
+      ]),
     ]);
     expect(dependsOn('clusterrolebinding-di-test-controller')).toEqual(
       expect.arrayContaining([

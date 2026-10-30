@@ -305,3 +305,120 @@ export function tenantOperatorResources(tenant: Tenant, cfg: TenantOperatorConfi
     ...policies,
   ];
 }
+
+/** The namespace prefix each tenant-operator ClusterRole may be bound in: `<prefix><tenant>`. */
+export const TENANT_OPERATOR_BINDING_PREFIXES: Readonly<Record<TenantOperatorScope, string>> = {
+  self: 'di-operator-',
+  workloads: 'di-tenant-',
+  hosts: 'di-runtime-',
+};
+export const TENANT_OPERATOR_BINDING_MESSAGE =
+  'The tenant-operator ClusterRoles may only be bound by a RoleBinding in the tenant namespace of ' +
+  'their kind, to the ServiceAccount runtime-operator in di-operator-<tenant> of the same tenant';
+export const TENANT_OPERATOR_CLUSTER_ROLE_MESSAGE =
+  'The platform controller may not create, change or delete the tenant-operator ClusterRoles';
+
+const RBAC_GROUP = 'rbac.authorization.k8s.io';
+const ROLE_NAMES = `[${Object.values(TENANT_OPERATOR_CLUSTER_ROLES)
+  .map((name) => `'${name}'`)
+  .join(', ')}]`;
+const OPERATOR_ROLE_REF = `object.roleRef.apiGroup == '${RBAC_GROUP}' &&
+  object.roleRef.kind == 'ClusterRole' && object.roleRef.name in ${ROLE_NAMES}`;
+
+interface BindingPolicy {
+  name: string;
+  operations: string[];
+  matchConditions?: { name: string; expression: string }[];
+  variables?: { name: string; expression: string }[];
+  expression: string;
+  message: string;
+}
+
+/**
+ * Admission for the controller's `bind` on the three tenant-operator ClusterRoles (#541 m3 W1).
+ * RBAC cannot limit `bind` to a namespace, a subject or RoleBindings, so these policies, one per
+ * resource kind so that each type-checks against its own schema, refuse, for every user:
+ * - every ClusterRoleBinding to the three;
+ * - a RoleBinding to one of them outside `<prefix><t>` for its kind
+ *   ({@link TENANT_OPERATOR_BINDING_PREFIXES}), or to any subject but exactly
+ *   `di-operator-<t>/runtime-operator` of the same tenant;
+ * - and, for the platform controller, any create, change or delete of the three ClusterRoles, so
+ *   it can neither relabel them into an aggregated role nor replace their rules.
+ */
+export function tenantOperatorBindingPolicies(installation: string, namespace: string): Resource[] {
+  const prefixes = (Object.keys(TENANT_OPERATOR_CLUSTER_ROLES) as TenantOperatorScope[])
+    .map(
+      (scope) =>
+        `'${TENANT_OPERATOR_CLUSTER_ROLES[scope]}': '${TENANT_OPERATOR_BINDING_PREFIXES[scope]}'`,
+    )
+    .join(', ');
+  const policies: BindingPolicy[] = [
+    {
+      name: 'clusterrolebindings',
+      operations: ['CREATE', 'UPDATE'],
+      expression: `!(${OPERATOR_ROLE_REF})`,
+      message: TENANT_OPERATOR_BINDING_MESSAGE,
+    },
+    {
+      name: 'rolebindings',
+      operations: ['CREATE', 'UPDATE'],
+      matchConditions: [{ name: 'tenant-operator-role', expression: OPERATOR_ROLE_REF }],
+      variables: [
+        { name: 'prefix', expression: `{${prefixes}}[object.roleRef.name]` },
+        {
+          name: 'tenant',
+          expression: `request.namespace.startsWith(variables.prefix) ?
+            request.namespace.substring(size(variables.prefix)) : ''`,
+        },
+      ],
+      expression: `variables.tenant != '' &&
+        has(object.subjects) && size(object.subjects) == 1 &&
+        object.subjects.all(s, s.kind == 'ServiceAccount' &&
+          s.name == '${TENANT_OPERATOR_NAME}' && has(s.namespace) &&
+          s.namespace == '${operatorNamespace('')}' + variables.tenant)`,
+      message: TENANT_OPERATOR_BINDING_MESSAGE,
+    },
+    {
+      name: 'clusterroles',
+      operations: ['CREATE', 'UPDATE', 'DELETE'],
+      matchConditions: [
+        { name: 'tenant-operator-role', expression: `request.name in ${ROLE_NAMES}` },
+      ],
+      expression: `request.userInfo.username != 'system:serviceaccount:${namespace}:di-platform-controller'`,
+      message: TENANT_OPERATOR_CLUSTER_ROLE_MESSAGE,
+    },
+  ];
+  const labels = { [INSTALLATION]: installation };
+  return policies.flatMap((policy) => {
+    const name = `${installation}-tenant-operator-${policy.name}`;
+    return [
+      {
+        apiVersion: 'admissionregistration.k8s.io/v1',
+        kind: 'ValidatingAdmissionPolicy',
+        metadata: { name, labels },
+        spec: {
+          failurePolicy: 'Fail',
+          matchConstraints: {
+            resourceRules: [
+              {
+                apiGroups: [RBAC_GROUP],
+                apiVersions: ['v1'],
+                operations: policy.operations,
+                resources: [policy.name],
+              },
+            ],
+          },
+          ...(policy.matchConditions ? { matchConditions: policy.matchConditions } : {}),
+          ...(policy.variables ? { variables: policy.variables } : {}),
+          validations: [{ expression: policy.expression, message: policy.message }],
+        },
+      },
+      {
+        apiVersion: 'admissionregistration.k8s.io/v1',
+        kind: 'ValidatingAdmissionPolicyBinding',
+        metadata: { name, labels },
+        spec: { policyName: name, validationActions: ['Deny'] },
+      },
+    ];
+  });
+}

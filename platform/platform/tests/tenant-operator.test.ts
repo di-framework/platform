@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
+import { load } from 'js-yaml';
 import { controllerClusterRoleRules } from '../src/tenancy/install';
 import {
   INSTALLATION,
@@ -18,11 +19,14 @@ import {
   RUNTIME_OPERATOR_REPOSITORY,
   runtimeOperatorImage,
   TENANT_OPERATOR_CLUSTER_ROLES,
+  type TenantOperatorScope,
+  tenantOperatorBindingPolicies,
   tenantOperatorClusterRoleRules,
   tenantOperatorClusterRoles,
   tenantOperatorResources,
   WASMCLOUD_OPERATOR_VERSION,
 } from '../src/tenancy/tenant-operator';
+import { evaluate } from './support/cel';
 
 // #541 m3: the per-tenant runtime-operator manifests (design-541 §4.6, §8.1).
 
@@ -67,6 +71,7 @@ const spec = deployment.spec as {
 };
 const pod = spec.template.spec;
 const container = pod.containers[0] as Container;
+type Rule = { apiGroups: string[]; resources: string[]; verbs: string[] };
 
 describe('runtime-operator version and image pin', () => {
   it('pins exactly the chart version, by digest', () => {
@@ -245,64 +250,24 @@ describe('tenant-operator ClusterRoles', () => {
   const RBAC = 'rbac.authorization.k8s.io';
 
   it('copies the chart 2.8.0 operator Roles, plus events/v1 create and patch', () => {
-    const edit = ['create', 'delete', 'get', 'list', 'patch', 'update', 'watch'];
-    const kinds = ['artifacts', 'workloads', 'workloadreplicasets', 'workloaddeployments'];
+    // The chart's own `rules:`, verbatim, grouped by ClusterRole.
+    const chart = load(
+      readFileSync(
+        path.join(import.meta.dir, 'fixtures/runtime-operator-2.8.0-roles.yaml'),
+        'utf8',
+      ),
+    ) as Record<TenantOperatorScope, Rule[]>;
     const eventsV1 = {
       apiGroups: ['events.k8s.io'],
       resources: ['events'],
       verbs: ['create', 'patch'],
     };
-    expect(tenantOperatorClusterRoleRules()).toEqual({
-      // chart: templates/operator/role.yaml
-      self: [
-        { apiGroups: ['coordination.k8s.io'], resources: ['leases'], verbs: edit },
-        { apiGroups: [''], resources: ['events'], verbs: ['create', 'patch'] },
-        { apiGroups: [''], resources: ['pods'], verbs: ['get', 'list', 'patch', 'watch'] },
-        {
-          apiGroups: ['runtime.wasmcloud.dev'],
-          resources: ['hosts', 'hosts/finalizers'],
-          verbs: edit,
-        },
-        {
-          apiGroups: ['runtime.wasmcloud.dev'],
-          resources: ['hosts/status'],
-          verbs: ['get', 'update', 'patch'],
-        },
-        eventsV1,
-      ],
-      // chart: workload-crd-role.yaml, workload-namespace-role.yaml, endpointslice-role.yaml
-      workloads: [
-        { apiGroups: ['runtime.wasmcloud.dev'], resources: kinds, verbs: edit },
-        {
-          apiGroups: ['runtime.wasmcloud.dev'],
-          resources: kinds.map((k) => `${k}/status`),
-          verbs: ['get', 'update', 'patch'],
-        },
-        {
-          apiGroups: ['runtime.wasmcloud.dev'],
-          resources: kinds.map((k) => `${k}/finalizers`),
-          verbs: ['update'],
-        },
-        { apiGroups: [''], resources: ['configmaps', 'secrets'], verbs: ['get', 'list', 'watch'] },
-        {
-          apiGroups: [''],
-          resources: ['events'],
-          verbs: ['create', 'get', 'list', 'patch', 'update', 'watch'],
-        },
-        { apiGroups: [''], resources: ['services'], verbs: ['get', 'list', 'watch'] },
-        { apiGroups: [''], resources: ['services/finalizers'], verbs: ['update'] },
-        { apiGroups: ['discovery.k8s.io'], resources: ['endpointslices'], verbs: edit },
-        {
-          apiGroups: ['discovery.k8s.io'],
-          resources: ['endpointslices/restricted'],
-          verbs: ['create'],
-        },
-        { apiGroups: [''], resources: ['endpoints/restricted'], verbs: ['create'] },
-        eventsV1,
-      ],
-      // chart: host-pod-role.yaml
-      hosts: [{ apiGroups: [''], resources: ['pods'], verbs: ['get', 'list', 'patch', 'watch'] }],
-    });
+    // Only the verb order may differ from the chart.
+    const normalize = (rules: Rule[]) => rules.map((r) => ({ ...r, verbs: [...r.verbs].sort() }));
+    const actual = tenantOperatorClusterRoleRules();
+    expect(normalize(actual.self)).toEqual(normalize([...chart.self, eventsV1]));
+    expect(normalize(actual.workloads)).toEqual(normalize([...chart.workloads, eventsV1]));
+    expect(normalize(actual.hosts)).toEqual(normalize(chart.hosts));
   });
 
   it('grants nothing cluster-wide in kind: no wildcards, no RBAC, no Secret writes', () => {
@@ -343,5 +308,176 @@ describe('tenant-operator ClusterRoles', () => {
         ],
       },
     ]);
+  });
+});
+
+describe('tenant-operator binding admission (#541 m3 W1)', () => {
+  type Policy = {
+    kind: string;
+    metadata: { name: string; labels: Record<string, string> };
+    spec: {
+      failurePolicy: string;
+      matchConstraints: {
+        resourceRules: {
+          apiGroups: string[];
+          apiVersions: string[];
+          operations: string[];
+          resources: string[];
+        }[];
+      };
+      matchConditions?: { name: string; expression: string }[];
+      variables?: { name: string; expression: string }[];
+      validations: { expression: string; message: string }[];
+    };
+  };
+  const all = tenantOperatorBindingPolicies('test', 'wasmcloud') as unknown as Policy[];
+  const policies = all.filter((p) => p.kind === 'ValidatingAdmissionPolicy');
+  const CONTROLLER = 'system:serviceaccount:wasmcloud:di-platform-controller';
+  const ADMIN = 'kubernetes-admin';
+  const policyFor = (resource: string) => {
+    const found = policies.filter((p) =>
+      p.spec.matchConstraints.resourceRules.some((r) => r.resources.includes(resource)),
+    );
+    expect(found).toHaveLength(1);
+    return found[0] as Policy;
+  };
+  /** Evaluates a policy as the API server does: matchConditions, then variables, then rules. */
+  const admit = (
+    resource: 'rolebindings' | 'clusterrolebindings' | 'clusterroles',
+    request: { operation?: string; namespace?: string; name?: string; username?: string },
+    object: Record<string, unknown> | null,
+  ): boolean => {
+    const policy = policyFor(resource);
+    const ctx: Record<string, unknown> = {
+      request: {
+        operation: request.operation ?? 'CREATE',
+        namespace: request.namespace ?? '',
+        name: request.name ?? '',
+        userInfo: { username: request.username ?? CONTROLLER },
+      },
+      object,
+    };
+    if (!(policy.spec.matchConditions ?? []).every((c) => evaluate(c.expression, ctx) === true))
+      return true;
+    const variables: Record<string, unknown> = {};
+    for (const v of policy.spec.variables ?? [])
+      variables[v.name] = evaluate(v.expression, { ...ctx, variables });
+    return policy.spec.validations.every(
+      (rule) => evaluate(rule.expression, { ...ctx, variables }) === true,
+    );
+  };
+  const binding = (
+    role: string,
+    subjects: unknown[] = [
+      { kind: 'ServiceAccount', name: 'runtime-operator', namespace: 'di-operator-alpha' },
+    ],
+    kind = 'ClusterRole',
+  ) => ({
+    roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind, name: role },
+    subjects,
+  });
+  const rb = (namespace: string, object: Record<string, unknown>, username?: string) =>
+    admit('rolebindings', { namespace, username }, object);
+
+  it('has one policy per kind, failing closed, each with a Deny binding', () => {
+    expect(policies.map((p) => p.metadata.name)).toEqual([
+      'test-tenant-operator-clusterrolebindings',
+      'test-tenant-operator-rolebindings',
+      'test-tenant-operator-clusterroles',
+    ]);
+    for (const policy of policies) {
+      expect(policy.spec.failurePolicy).toBe('Fail');
+      expect(policy.metadata.labels).toEqual({ [INSTALLATION]: 'test' });
+      expect(policy.spec.matchConstraints.resourceRules).toHaveLength(1);
+      expect(policy.spec.matchConstraints.resourceRules[0]?.apiGroups).toEqual([
+        'rbac.authorization.k8s.io',
+      ]);
+    }
+    expect(policyFor('clusterroles').spec.matchConstraints.resourceRules[0]?.operations).toEqual([
+      'CREATE',
+      'UPDATE',
+      'DELETE',
+    ]);
+    expect(all.filter((p) => p.kind === 'ValidatingAdmissionPolicyBinding')).toEqual(
+      policies.map(
+        (p) =>
+          ({
+            apiVersion: 'admissionregistration.k8s.io/v1',
+            kind: 'ValidatingAdmissionPolicyBinding',
+            metadata: { name: p.metadata.name, labels: { [INSTALLATION]: 'test' } },
+            spec: { policyName: p.metadata.name, validationActions: ['Deny'] },
+          }) as unknown as Policy,
+      ),
+    );
+  });
+
+  it('admits exactly the rendered RoleBindings of tenantOperatorResources', () => {
+    const rendered = objects.filter((o) => o.kind === 'RoleBinding');
+    expect(rendered).toHaveLength(3);
+    for (const o of rendered) expect(rb(o.metadata.namespace as string, o)).toBe(true);
+  });
+
+  it('pairs each ClusterRole with the namespace kind §4.6 assigns it', () => {
+    const { self, workloads, hosts } = TENANT_OPERATOR_CLUSTER_ROLES;
+    for (const [role, allowed] of [
+      [self, 'di-operator-alpha'],
+      [workloads, 'di-tenant-alpha'],
+      [hosts, 'di-runtime-alpha'],
+    ] as const)
+      for (const ns of ['di-operator-alpha', 'di-tenant-alpha', 'di-runtime-alpha'])
+        expect(rb(ns, binding(role))).toBe(ns === allowed);
+  });
+
+  it('refuses the tenant-operator ClusterRoles outside the tenant namespaces, for any user', () => {
+    for (const ns of ['kube-system', 'default', 'wasmcloud', 'di-tenant-', 'di-operator-'])
+      for (const role of Object.values(TENANT_OPERATOR_CLUSTER_ROLES)) {
+        expect(rb(ns, binding(role))).toBe(false);
+        expect(rb(ns, binding(role), ADMIN)).toBe(false);
+      }
+  });
+
+  it('refuses any subject but the same tenant operator ServiceAccount', () => {
+    const role = TENANT_OPERATOR_CLUSTER_ROLES.workloads;
+    const sa = (name: string, namespace?: string) => ({ kind: 'ServiceAccount', name, namespace });
+    for (const subjects of [
+      [sa('di-platform-controller', 'wasmcloud')],
+      [sa('runtime-operator', 'di-operator-beta')],
+      [sa('runtime-operator', 'wasmcloud')],
+      [sa('default', 'di-operator-alpha')],
+      [{ kind: 'ServiceAccount', name: 'runtime-operator' }],
+      [{ kind: 'User', name: 'runtime-operator', namespace: 'di-operator-alpha' }],
+      [{ kind: 'Group', name: 'system:serviceaccounts' }],
+      [sa('runtime-operator', 'di-operator-alpha'), sa('runtime-operator', 'di-operator-alpha')],
+      [],
+    ])
+      expect(rb('di-tenant-alpha', binding(role, subjects))).toBe(false);
+    expect(rb('di-tenant-alpha', { roleRef: binding(role).roleRef })).toBe(false);
+  });
+
+  it('leaves RoleBindings to other roles to RBAC', () => {
+    expect(rb('kube-system', binding('view'))).toBe(true);
+    expect(rb('kube-system', binding(TENANT_OPERATOR_CLUSTER_ROLES.self, undefined, 'Role'))).toBe(
+      true,
+    );
+  });
+
+  it('refuses every ClusterRoleBinding to the three, for any user', () => {
+    for (const role of Object.values(TENANT_OPERATOR_CLUSTER_ROLES))
+      for (const username of [CONTROLLER, ADMIN])
+        expect(admit('clusterrolebindings', { username }, binding(role))).toBe(false);
+    expect(admit('clusterrolebindings', {}, binding('di-test-controller'))).toBe(true);
+    expect(
+      admit('clusterrolebindings', {}, binding(TENANT_OPERATOR_CLUSTER_ROLES.self, [], 'Role')),
+    ).toBe(true);
+  });
+
+  it('refuses the controller any write to the three ClusterRoles, and only to them', () => {
+    for (const name of Object.values(TENANT_OPERATOR_CLUSTER_ROLES))
+      for (const operation of ['CREATE', 'UPDATE', 'DELETE']) {
+        const object = operation === 'DELETE' ? null : { metadata: { name } };
+        expect(admit('clusterroles', { operation, name }, object)).toBe(false);
+        expect(admit('clusterroles', { operation, name, username: ADMIN }, object)).toBe(true);
+      }
+    expect(admit('clusterroles', { operation: 'UPDATE', name: 'edit' }, {})).toBe(true);
   });
 });

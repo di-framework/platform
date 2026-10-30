@@ -27,7 +27,10 @@ import {
   VERSION,
   validName,
 } from './tenancy/resources';
-import { tenantOperatorClusterRoles } from './tenancy/tenant-operator';
+import {
+  tenantOperatorBindingPolicies,
+  tenantOperatorClusterRoles,
+} from './tenancy/tenant-operator';
 
 export {
   type BackingClassConfig,
@@ -182,6 +185,11 @@ export function installTenancy(args: {
     },
     [namespaceRole, serviceAccount],
   );
+  // They confine the controller's `bind` on the tenant-operator ClusterRoles, so they precede
+  // the ClusterRole that grants it (#541 m3).
+  const operatorBindingPolicies = tenantOperatorBindingPolicies(installation, namespace).map(
+    (value) => createCustom(value),
+  );
   // The ClusterRole drops `escalate` (#115), so it waits for the namespaced TokenRequest grant:
   // the running controller keeps writing the per-tenant TokenRequest Roles across `pulumi up`.
   const role = createCustom(
@@ -191,7 +199,7 @@ export function installTenancy(args: {
       metadata: { name: `${installation}-controller` },
       rules: controllerClusterRoleRules(),
     },
-    [namespaceBinding],
+    [namespaceBinding, ...operatorBindingPolicies],
   );
   // The three fixed tenant-operator ClusterRoles (#541, design-541 §4.6). Nothing binds them
   // cluster-wide; the controller binds them per tenant with RoleBindings only.
