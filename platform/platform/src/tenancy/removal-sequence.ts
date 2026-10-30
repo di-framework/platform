@@ -26,7 +26,8 @@ export const REMOVAL_STUCK = 'RemovalStuck';
 
 /**
  * Where removal stands on `step`, given the Tenant's current annotation. A different (or no)
- * recorded step starts the step's clock now; the same step keeps its start. `stuck` once the
+ * recorded step, or a start in the future, starts the step's clock now; the same step keeps its
+ * start. `stuck` once the
  * deadline has passed.
  */
 export function removalProgress(
@@ -37,7 +38,9 @@ export function removalProgress(
   const [recorded, at] = (annotation ?? '').split('@');
   const parsed = at ? new Date(at) : undefined;
   const since =
-    recorded === step && parsed && !Number.isNaN(parsed.getTime()) ? parsed : new Date(now);
+    recorded === step && parsed && !Number.isNaN(parsed.getTime()) && parsed <= now
+      ? parsed
+      : new Date(now);
   return {
     annotation: `${step}@${since.toISOString()}`,
     since,

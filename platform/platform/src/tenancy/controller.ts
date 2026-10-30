@@ -348,6 +348,17 @@ export function summarizeConflict(body: string): string | undefined {
     ? `${summary.slice(0, CONFLICT_SUMMARY_LIMIT)}...`
     : summary;
 }
+/** The field manager for the controller's own patches (Tenant metadata, Deployments, Workloads). */
+const CONTROLLER_FIELD_MANAGER = 'di-platform-controller';
+
+/** What {@link Controller.removeOwnedNamespace} found: gone, being deleted, or not this Tenant's. */
+type NamespaceRemoval = 'gone' | 'deleting' | 'foreign';
+
+/** The remaining-item entry for a namespace a removal step still waits on. */
+function namespaceRemaining(state: Exclude<NamespaceRemoval, 'gone'>, name: string): string {
+  return state === 'foreign' ? `foreign-namespace/${name}` : `namespace/${name}`;
+}
+
 export class ApiError extends Error {
   constructor(
     public readonly code: number,
@@ -570,7 +581,7 @@ export class Controller {
     }
     return this.api.call<Resource>(
       'PATCH',
-      `${location(value)}?fieldManager=di-platform-controller`,
+      `${location(value)}?fieldManager=${CONTROLLER_FIELD_MANAGER}`,
       value,
       'application/apply-patch+yaml',
     );
@@ -581,7 +592,7 @@ export class Controller {
     if (JSON.stringify(old) !== JSON.stringify(finalizers)) {
       const updated = await this.api.call<Owned>(
         'PATCH',
-        location(value),
+        `${location(value)}?fieldManager=${CONTROLLER_FIELD_MANAGER}`,
         { metadata: { resourceVersion: value.metadata.resourceVersion, finalizers } },
         'application/merge-patch+json',
       );
@@ -650,10 +661,10 @@ export class Controller {
   private async removeTenant(tenant: Tenant): Promise<void> {
     const steps: [RemovalStep, () => Promise<string[]>][] = [
       // The R1 and R4 reload-applied checks and the R3 Retain finalizer removal arrive with m6.
-      ['R1', async () => []],
+      ['R1', () => Promise.resolve([])],
       ['R2', () => this.removalStopHosts(tenant)],
       ['R3', () => this.removalWorkloads(tenant)],
-      ['R4', async () => []],
+      ['R4', () => Promise.resolve([])],
       ['R5', () => this.removalOperator(tenant)],
       ['R6', () => this.removalNamespaces(tenant)],
     ];
@@ -677,7 +688,7 @@ export class Controller {
     if (recorded !== progress.annotation) {
       const updated = await this.api.call<Tenant>(
         'PATCH',
-        location(tenant),
+        `${location(tenant)}?fieldManager=${CONTROLLER_FIELD_MANAGER}`,
         { metadata: { annotations: { [REMOVAL_STEP_ANNOTATION]: progress.annotation } } },
         'application/merge-patch+json',
       );
@@ -715,7 +726,7 @@ export class Controller {
     for (const deployment of deployments.filter((d) => sweepsDeployment(d, t))) {
       const updated = await this.api.call<Resource>(
         'PATCH',
-        `${location(deployment)}?fieldManager=di-platform-controller`,
+        `${location(deployment)}?fieldManager=${CONTROLLER_FIELD_MANAGER}`,
         {
           metadata: { resourceVersion: deployment.metadata.resourceVersion },
           spec: { replicas: 0 },
@@ -784,7 +795,8 @@ export class Controller {
     );
     if (remaining.length) return remaining;
     const ns = operatorNamespace(t);
-    if (await this.removeOwnedNamespace(tenant, ns)) remaining.push(`namespace/${ns}`);
+    const state = await this.removeOwnedNamespace(tenant, ns);
+    if (state !== 'gone') remaining.push(namespaceRemaining(state, ns));
     return remaining;
   }
   /** R6: under `Delete`, delete the tenant's namespaces as before; `Retain` keeps them. */
@@ -792,21 +804,26 @@ export class Controller {
     if (tenant.spec.deletionPolicy !== 'Delete') return [];
     const n = names(tenant.metadata.name);
     const remaining: string[] = [];
-    for (const name of [n.namespace, n.runtimeNamespace, n.apiKeysNamespace])
-      if (await this.removeOwnedNamespace(tenant, name)) remaining.push(`namespace/${name}`);
+    for (const name of [n.namespace, n.runtimeNamespace, n.apiKeysNamespace]) {
+      const state = await this.removeOwnedNamespace(tenant, name);
+      if (state !== 'gone') remaining.push(namespaceRemaining(state, name));
+    }
     return remaining;
   }
-  /** Deletes namespace `name` if it exists and this Tenant owns it; true while it exists. */
-  private async removeOwnedNamespace(tenant: Tenant, name: string): Promise<boolean> {
+  /**
+   * Deletes namespace `name` if it exists and this Tenant owns it. A namespace this Tenant does
+   * not own is never deleted: it is reported as `foreign`, so the step waits on it.
+   */
+  private async removeOwnedNamespace(tenant: Tenant, name: string): Promise<NamespaceRemoval> {
     const namespace = await this.get<Resource>(`${collection('v1', 'Namespace')}/${name}`);
-    if (!namespace) return false;
+    if (!namespace) return 'gone';
     if (
       namespace.metadata.labels?.[OWNER] !== tenant.metadata.uid ||
       namespace.metadata.labels?.[INSTALLATION] !== this.cfg.installation
     )
-      throw new Error(`Refusing to delete foreign namespace ${name}`);
+      return 'foreign';
     await this.remove(namespace);
-    return true;
+    return 'deleting';
   }
   /**
    * What {@link tenantAuthResources} needs from the cluster: the tenant's members (from
@@ -1175,7 +1192,7 @@ export class Controller {
     try {
       await this.api.call(
         'PATCH',
-        `${location(workload)}?fieldManager=di-platform-controller`,
+        `${location(workload)}?fieldManager=${CONTROLLER_FIELD_MANAGER}`,
         { metadata: { annotations: { [PLACEMENT_RETRY]: host } } },
         'application/merge-patch+json',
       );
@@ -2254,7 +2271,7 @@ export class Controller {
       }
       const updated = await this.api.call<Resource>(
         'PATCH',
-        `${location(deployment)}?fieldManager=di-platform-controller`,
+        `${location(deployment)}?fieldManager=${CONTROLLER_FIELD_MANAGER}`,
         {
           metadata: { resourceVersion: deployment.metadata.resourceVersion },
           spec: { replicas: 0 },

@@ -233,6 +233,13 @@ describe('removal sequence helpers (#541 m5)', () => {
     });
     expect(removalProgress('R2@garbage', 'R2', due)).toMatchObject({ since: due, stuck: false });
     expect(removalProgress('R2', 'R2', due)).toMatchObject({ since: due, stuck: false });
+    // S2: a start in the future (a hand edit) is not trusted; the clock restarts now.
+    const future = `R2@${new Date(due.getTime() + 60_000).toISOString()}`;
+    expect(removalProgress(future, 'R2', due)).toMatchObject({
+      annotation: `R2@${due.toISOString()}`,
+      since: due,
+      stuck: false,
+    });
   });
   it('builds RemovalStuck with the step as reason and the remaining objects in the message', () => {
     const remaining = ['workload/b', 'workload/a', 'c', 'd', 'e', 'f', 'g'];
@@ -555,15 +562,67 @@ describe('Tenant removal R1-R7 (#541 m5)', () => {
     expect(deletes((p) => p.includes('/runtime.wasmcloud.dev/'))).toEqual([]);
   });
 
-  it('R5 refuses a foreign di-operator namespace and never deletes the tenant namespaces', async () => {
-    const { api, t, operatorNs, deleting, reconcile, deletes } = await prepare('Delete');
+  it('R5 waits on a foreign di-operator namespace, records the step and sets RemovalStuck, never deleting it', async () => {
+    const { api, clock, t, operatorNs, deleting, reconcile, deletes } = await prepare('Delete');
     api.seed({ ...operatorNs, metadata: { ...operatorNs.metadata, labels: {} } });
     deleting();
-    await expect(reconcile()).rejects.toThrow(
-      'Refusing to delete foreign namespace di-operator-alpha',
+    await reconcile();
+    expect(t.metadata.annotations?.[REMOVAL_STEP_ANNOTATION]).toBe(`R5@${START.toISOString()}`);
+    expect(condition(t, 'Ready')?.message).toBe(
+      'Delete: removal step R5 waits for foreign-namespace/di-operator-alpha',
     );
-    expect(deletes((p) => tenantNamespaces().includes(p))).toEqual([]);
+    expect(condition(t, REMOVAL_STUCK)).toBeUndefined();
+    clock.now = new Date(START.getTime() + REMOVAL_STEP_DEADLINE_MS);
+    await reconcile();
+    expect(condition(t, REMOVAL_STUCK)).toMatchObject({
+      status: 'True',
+      reason: 'R5',
+      message: expect.stringContaining('remaining: foreign-namespace/di-operator-alpha'),
+    });
+    expect(api.has(operatorNs)).toBe(true);
+    expect(deletes((p) => p.startsWith(collection('v1', 'Namespace')))).toEqual([]);
     expect(t.metadata.finalizers).toContain(FINALIZER);
+  });
+
+  it('R6 waits on a foreign tenant namespace and never deletes it', async () => {
+    const { api, clock, t, deleting, reconcile, deletes } = await prepare('Delete');
+    const runtime = tenantNamespaces()[1]!;
+    const ns = api.objects.get(runtime)!;
+    ns.metadata.labels = { ...ns.metadata.labels, [OWNER]: 'someone-else' };
+    deleting();
+    await reconcile();
+    await reconcile();
+    expect(t.metadata.annotations?.[REMOVAL_STEP_ANNOTATION]).toStartWith('R6@');
+    await reconcile();
+    expect(condition(t, 'Ready')?.message).toBe(
+      'Delete: removal step R6 waits for foreign-namespace/di-runtime-alpha',
+    );
+    clock.now = new Date(START.getTime() + REMOVAL_STEP_DEADLINE_MS);
+    await reconcile();
+    expect(condition(t, REMOVAL_STUCK)).toMatchObject({ reason: 'R6' });
+    expect(api.objects.has(runtime)).toBe(true);
+    expect(deletes((p) => p === runtime)).toEqual([]);
+    expect(t.metadata.finalizers).toContain(FINALIZER);
+  });
+
+  it('patches the removal-step annotation and the finalizer as di-platform-controller', async () => {
+    const { api, t, deleting, reconcile, drain } = await prepare('Retain');
+    api.seed(hostPod('host-1'));
+    deleting();
+    await reconcile();
+    api.objects.delete(key(hostPod('host-1')));
+    await drain();
+    const tenantPatches = api.operations.filter(
+      (o) => o.method === 'PATCH' && new URL(o.path, 'https://k').pathname === key(t),
+    );
+    const annotation = tenantPatches.find(
+      (o) => (o.body as Resource).metadata?.annotations?.[REMOVAL_STEP_ANNOTATION],
+    );
+    const finalizer = tenantPatches.find((o) => (o.body as Resource).metadata?.finalizers);
+    for (const op of [annotation, finalizer])
+      expect(new URL(op!.path, 'https://k').searchParams.get('fieldManager')).toBe(
+        'di-platform-controller',
+      );
   });
 
   it('R5 reports the bindings and namespace it is removing while they remain', async () => {
