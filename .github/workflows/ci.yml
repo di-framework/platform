@@ -379,6 +379,13 @@ jobs:
         with:
           bun-version: '1.4.4'
 
+      # Builds tests/support/operator-nats: the runtime-operator's own nats.go connect options.
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: platform/platform/tests/support/operator-nats/go.mod
+          cache-dependency-path: platform/platform/tests/support/operator-nats/go.sum
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 

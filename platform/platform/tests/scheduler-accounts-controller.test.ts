@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import { ApiError, Controller } from '../src/tenancy/controller';
 import { FINALIZER, INSTALLATION, OWNER, type Tenant } from '../src/tenancy/resources';
-import { SchedulerAccountsWriter } from '../src/tenancy/scheduler-accounts';
+import { SchedulerAccountsWriter, WRITE_FAILING } from '../src/tenancy/scheduler-accounts';
 import {
   ACCOUNTS_KEY,
   REFUSED_FOR_OTHER,
@@ -379,5 +379,164 @@ describe('SchedulerAccountsWriter (#541 m6d)', () => {
     expect(await writer.reconcile(tenants)).toBeUndefined();
     expect(String(error.mock.calls[0]?.[0])).toContain('Forbidden');
     expect(api.objects.has(accountsPath)).toBe(false);
+  });
+});
+
+describe('SchedulerAccounts=Unknown after a persistent read or write failure (#602 S8)', () => {
+  const MINUTE = 60_000;
+  const at = (minutes: number) => {
+    clock.now = new Date(START.getTime() + minutes * MINUTE);
+  };
+  const since = (minutes: number) => new Date(START.getTime() + minutes * MINUTE).toISOString();
+  type Fault = (method: string, path: string) => unknown;
+  /**
+   * A controller whose accounts file was written once and that has a change to write, whose API
+   * calls then throw what `fault.on` returns for them (nothing when undefined).
+   */
+  async function failing(fault: { on: Fault }) {
+    const { api, controller } = await prepare();
+    await controller.tick();
+    ownOperatorNamespace(api);
+    const call = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      const thrown = fault.on(method, path);
+      if (thrown !== undefined) throw thrown;
+      return call<T>(method, path, body);
+    };
+    return { api, controller };
+  }
+  const onWrite =
+    (thrown: unknown): Fault =>
+    (method, path) =>
+      method === 'PUT' && path === accountsPath ? thrown : undefined;
+  const onRecord =
+    (thrown: unknown): Fault =>
+    (method, path) =>
+      method === 'GET' && path === recordPath ? thrown : undefined;
+  const unknown = (code: string, from = 0) => ({
+    type: SCHEDULER_ACCOUNTS_CONDITION,
+    status: 'Unknown' as const,
+    reason: WRITE_FAILING,
+    message: `${SCHEDULER_NATS_ACCOUNTS} could not be read or written for 15 minutes: ${code}`,
+    observedGeneration: 1,
+    lastTransitionTime: since(from + 15),
+  });
+  const refuse = (api: AccountsApi) => {
+    const bad = record(api);
+    const data = bad['platform/data'] as { current: string };
+    bad['platform/data'] = {
+      current: data.current,
+      previous: data.current,
+      previousUntil: '2027-01-01T00:00:00Z',
+    };
+    setRecord(api, bad);
+  };
+
+  for (const [code, thrown] of [
+    [403, new ApiError(403, 'Forbidden: {"message":"a response body"}')],
+    [409, new ApiError(409, 'Conflict')],
+  ] as const)
+    it(`reports a persistent ${code} on the write past the deadline with only the status`, async () => {
+      const { api, controller } = await failing({ on: onWrite(thrown) });
+      await controller.tick();
+      at(14);
+      await controller.tick();
+      expect(condition(api)).toBeUndefined();
+      at(15);
+      await controller.tick();
+      expect(condition(api)).toEqual(unknown(`HTTP ${code}`));
+    });
+
+  it('reports a persistent read failure by its error code', async () => {
+    const outage = Object.assign(new Error('connect ECONNREFUSED 10.0.0.1:443'), {
+      code: 'ECONNREFUSED',
+    });
+    const { api, controller } = await failing({ on: onRecord(outage) });
+    await controller.tick();
+    at(20);
+    await controller.tick();
+    expect(condition(api)).toEqual(unknown('ECONNREFUSED'));
+  });
+
+  it('names an error with no status or code only as unknown', async () => {
+    const { api, controller } = await failing({ on: onWrite('opaque') });
+    await controller.tick();
+    at(15);
+    await controller.tick();
+    expect(condition(api)).toEqual(unknown('unknown error'));
+  });
+
+  it('clears on recovery, and a later failure starts a new run', async () => {
+    const fault = { on: onWrite(new ApiError(403, 'Forbidden')) };
+    const { api, controller } = await failing(fault);
+    await controller.tick();
+    at(16);
+    await controller.tick();
+    expect(condition(api)?.status).toBe('Unknown');
+    fault.on = () => undefined;
+    // A tick's Tenant status shows the previous tick's result.
+    await controller.tick();
+    await controller.tick();
+    expect(condition(api)).toBeUndefined();
+    fault.on = onRecord(new ApiError(500, 'unavailable'));
+    at(17);
+    await controller.tick();
+    at(31);
+    await controller.tick();
+    expect(condition(api)).toBeUndefined();
+    at(32);
+    await controller.tick();
+    expect(condition(api)).toEqual(unknown('HTTP 500', 17));
+  });
+
+  it('re-arms the clock on a controller restart mid-failure', async () => {
+    const { api, controller } = await failing({ on: onWrite(new ApiError(403, 'Forbidden')) });
+    await controller.tick();
+    at(10);
+    const restarted = new Controller(
+      api,
+      cfg,
+      async () => [],
+      () => clock.now,
+    );
+    await restarted.tick();
+    at(20);
+    await restarted.tick();
+    expect(condition(api)).toBeUndefined();
+    at(25);
+    await restarted.tick();
+    expect(condition(api)).toEqual(unknown('HTTP 403', 10));
+  });
+
+  it('reports a refusal over a failure past the deadline', async () => {
+    const { api, controller } = await failing({ on: onWrite(new ApiError(403, 'Forbidden')) });
+    await controller.tick();
+    at(16);
+    await controller.tick();
+    expect(condition(api)?.status).toBe('Unknown');
+    // The render is now refused: a known result, for which nothing is written.
+    refuse(api);
+    await controller.tick();
+    await controller.tick();
+    expect(condition(api)).toMatchObject({ status: 'False', reason: REFUSED_FOR_OTHER });
+  });
+
+  it('carries the previous condition before the deadline', async () => {
+    const fault: { on: Fault } = { on: () => undefined };
+    const { api, controller } = await failing(fault);
+    refuse(api);
+    await controller.tick();
+    await controller.tick();
+    const held = condition(api);
+    expect(held).toMatchObject({ status: 'False', reason: REFUSED_FOR_OTHER });
+    fault.on = onRecord(new ApiError(500, 'unavailable'));
+    for (const minutes of [1, 8, 15]) {
+      at(minutes);
+      await controller.tick();
+      expect(condition(api)).toEqual(held);
+    }
+    at(16);
+    await controller.tick();
+    expect(condition(api)).toEqual(unknown('HTTP 500', 1));
   });
 });
