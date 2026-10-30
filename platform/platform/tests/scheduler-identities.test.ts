@@ -610,10 +610,16 @@ describe('tenant scheduler identity issuance (#541 m6c)', () => {
 
   it('refuses to issue over a Secret it did not write', async () => {
     const { api, identities } = await cluster();
-    api.seed(hostPath, { metadata: { name: TENANT_HOST_SECRET, namespace: RUNTIME, labels: {} } });
-    const [pending] = await identities.reconcile(tenant());
-    expect(pending).toMatchObject({ type: SCHEDULER_IDENTITY_PENDING, reason: 'SecretNotOwned' });
-    expect(api.writes()).toEqual([]);
+    // No labels, and (S6) this installation's and Tenant's labels without the component label.
+    for (const labels of <Record<string, string>[]>[
+      {},
+      { [INSTALLATION]: INSTALL, [OWNER]: 'alpha-uid', [TENANT]: 'alpha' },
+    ]) {
+      api.seed(hostPath, { metadata: { name: TENANT_HOST_SECRET, namespace: RUNTIME, labels } });
+      const [pending] = await identities.reconcile(tenant());
+      expect(pending).toMatchObject({ type: SCHEDULER_IDENTITY_PENDING, reason: 'SecretNotOwned' });
+      expect(api.writes()).toEqual([]);
+    }
   });
 
   it('reports a failing issuance as pending, without throwing', async () => {

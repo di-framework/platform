@@ -271,13 +271,17 @@ describe('controller tick: tenant scheduler identities (#541 m6c)', () => {
   });
 
   it('drops the record entries and deletes the hosts identity during removal, never a foreign Secret', async () => {
-    for (const foreign of [false, true]) {
+    // Ours; another installation's; and (S6) ours by installation and owner but without the
+    // scheduler-identity component label.
+    for (const labels of <(Record<string, string> | undefined)[]>[
+      undefined,
+      { [INSTALLATION]: 'other' },
+      { [INSTALLATION]: 'test', [OWNER]: 'alpha-uid' },
+    ]) {
+      const foreign = labels !== undefined;
       const { api, controller } = await prepare({ pki: true });
       await controller.tick();
-      if (foreign) {
-        const secret = api.objects.get(hostPath) as Resource;
-        secret.metadata.labels = { [INSTALLATION]: 'other' };
-      }
+      if (labels) (api.objects.get(hostPath) as Resource).metadata.labels = labels;
       const t = stored(api);
       t.metadata.deletionTimestamp = START.toISOString();
       api.seed(t);
