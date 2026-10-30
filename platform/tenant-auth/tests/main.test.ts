@@ -82,7 +82,7 @@ describe('controller main', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  test('serves the API over TLS on the configured port', async () => {
+  test('serves the API over TLS on the bound port', async () => {
     const health = await fetch(`https://127.0.0.1:${mainPort}/-/healthz`, insecure);
     expect(health.status).toBe(200);
     expect(await health.json()).toMatchObject({ ok: true, tenant: 'acme' });
@@ -152,7 +152,7 @@ describe('controller main', () => {
 
 /** The console process entry point. */
 describe('console main', () => {
-  test('serves on the configured port and audits the start while discovery is pending', async () => {
+  test('serves on the bound port and audits the start while discovery is pending', async () => {
     const started = await consoleMain(
       consoleConfig({
         TENANT_CONSOLE_TENANT: 'acme',
