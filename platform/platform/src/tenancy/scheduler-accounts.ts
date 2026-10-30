@@ -15,16 +15,22 @@
  * - **Nothing to do** while the installation has no scheduler PKI, or before the bootstrap Job has
  *   written the identity record.
  * - **Unknown.** A failed read or write returns undefined, so the caller keeps the condition it
- *   reported before instead of clearing it.
+ *   reported before instead of clearing it. Once an unbroken run of failures has lasted
+ *   {@link REMOVAL_STEP_DEADLINE_MS}, {@link SchedulerAccountsWriter.failingCondition} reports
+ *   `SchedulerAccounts=Unknown` (reason `WriteFailing`, #602 S8) with only the HTTP status or
+ *   error code. Any known result (written, unchanged, refused) ends the run; a restart starts the
+ *   clock again.
  *
  * Each state change is logged once. Inert until the cut-over (m6e): the chart's NATS does not read
  * this file.
  */
-import { COMPONENT, INSTALLATION, type Resource, type Tenant } from './resources';
+import { REMOVAL_STEP_DEADLINE_MS } from './removal-sequence';
+import { COMPONENT, type Condition, INSTALLATION, type Resource, type Tenant } from './resources';
 import {
   ACCOUNTS_KEY,
   type AccountsProblem,
   renderSchedulerAccounts,
+  SCHEDULER_ACCOUNTS_CONDITION,
   SCHEDULER_NATS_ACCOUNTS,
 } from './scheduler-nats';
 import {
@@ -48,9 +54,24 @@ interface Stored {
 const configMapPath = (ns: string, name = '') =>
   `/api/v1/namespaces/${ns}/configmaps${name ? `/${name}` : ''}`;
 
+/** The `SchedulerAccounts` reason once reads or writes have failed past the deadline (#602 S8). */
+export const WRITE_FAILING = 'WriteFailing';
+
+/**
+ * What a failure is reported as: the HTTP status of an API error, or the error code of a network
+ * one. Never its message, which can carry a response body.
+ */
+function failureCode(error: unknown): string {
+  const code = (error as { code?: unknown } | undefined)?.code;
+  if (typeof code === 'number') return `HTTP ${code}`;
+  return typeof code === 'string' ? code : 'unknown error';
+}
+
 export class SchedulerAccountsWriter {
   /** The state last logged, so each change is logged once; undefined before the first pass. */
   private logged: string | undefined;
+  /** Since when, and with what, every read or write has failed; undefined after a known result. */
+  private failing: { since: Date; code: string } | undefined;
   constructor(
     private readonly api: AccountsApi,
     private readonly cfg: { installation: string; namespace: string },
@@ -73,6 +94,25 @@ export class SchedulerAccountsWriter {
   }
 
   /**
+   * The `SchedulerAccounts=Unknown` condition once an unbroken run of failed reads or writes has
+   * lasted {@link REMOVAL_STEP_DEADLINE_MS}, with the last failure's code; undefined before that,
+   * when the caller keeps the condition it has.
+   */
+  failingCondition(observedGeneration: number): Condition | undefined {
+    if (!this.failing) return undefined;
+    const deadline = this.failing.since.getTime() + REMOVAL_STEP_DEADLINE_MS;
+    if (this.now().getTime() < deadline) return undefined;
+    return {
+      type: SCHEDULER_ACCOUNTS_CONDITION,
+      status: 'Unknown',
+      reason: WRITE_FAILING,
+      message: `${SCHEDULER_NATS_ACCOUNTS} could not be read or written for ${REMOVAL_STEP_DEADLINE_MS / 60_000} minutes: ${this.failing.code}`,
+      observedGeneration,
+      lastTransitionTime: new Date(deadline).toISOString(),
+    };
+  }
+
+  /**
    * Renders and, when it changed, writes the accounts file. Returns the problems of a refused
    * render, or an empty list. Never throws: a failed read or write is logged and retried on the
    * next pass, and returns undefined, since it says nothing about the record; the caller then
@@ -81,6 +121,7 @@ export class SchedulerAccountsWriter {
   async reconcile(tenants: Tenant[]): Promise<AccountsProblem[] | undefined> {
     try {
       const problems = await this.write(tenants);
+      this.failing = undefined;
       if (problems.length > 0)
         this.log(`refused: ${problems.map((p) => p.message).join('; ')}`, () =>
           console.warn(
@@ -96,6 +137,7 @@ export class SchedulerAccountsWriter {
       return problems;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      this.failing = { since: this.failing?.since ?? this.now(), code: failureCode(error) };
       this.log(`failed: ${message}`, () =>
         console.error(`${SCHEDULER_NATS_ACCOUNTS} could not be written: ${message}`),
       );

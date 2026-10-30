@@ -1409,20 +1409,23 @@ export class Controller {
     };
     // A refused accounts render (#541 m6d), from the last pass: the previous file keeps serving.
     const kept = tenant.status?.conditions?.find((c) => c.type === SCHEDULER_ACCOUNTS_CONDITION);
-    const accounts = !this.accountsProblems
-      ? kept
-        ? [kept]
-        : []
-      : this.accountsProblems.length > 0
-        ? [
-            schedulerAccountsCondition(
-              this.accountsProblems,
-              tenant.metadata.name,
-              tenant.metadata.generation ?? 1,
-              this.now(),
-            ),
-          ]
-        : [];
+    const failing = this.accounts.failingCondition(tenant.metadata.generation ?? 1);
+    const accounts = failing
+      ? [failing]
+      : !this.accountsProblems
+        ? kept
+          ? [kept]
+          : []
+        : this.accountsProblems.length > 0
+          ? [
+              schedulerAccountsCondition(
+                this.accountsProblems,
+                tenant.metadata.name,
+                tenant.metadata.generation ?? 1,
+                this.now(),
+              ),
+            ]
+          : [];
     const others = [
       ...(auth ? [auth] : []),
       ...(logs ? [logs] : []),
