@@ -501,7 +501,7 @@ linux/arm64. `.github/workflows/platform-operator-image.yml` publishes it from m
 this reference and the chart's `image.digest` (`chart/values.yaml`) to the new digest:
 
 ```text
-ghcr.io/di-framework/platform-operator@sha256:75e3b40914e8cee65dd3a6224bdbb65775dbd3e32175e2733f5eb4e4fb9e94a6
+ghcr.io/di-framework/platform-operator@sha256:0f032c13d462126e6b60775f87ce08f7456c531aa8d1d418a041e46a16aac3e5
 ```
 
 Each publish is also tagged with its commit SHA and `src-<hash>` (the hash of its inputs); only the digest is
