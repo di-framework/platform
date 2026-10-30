@@ -864,6 +864,8 @@ const crds = [
       // Set once every API key is out of the runtime namespace (#379); tenant-auth then stops
       // reading the old layout.
       apiKeysMigrated: { type: 'boolean' },
+      // The rotate-scheduler-identity annotation value last handled (#541 m6c).
+      schedulerIdentity: { type: 'object', properties: { rotation: { type: 'string' } } },
       hostgroup: { type: 'string' },
       httpService: { type: 'string' },
       // Per-key storage records (#200), immutable per key under the tenant-storage-records policy.

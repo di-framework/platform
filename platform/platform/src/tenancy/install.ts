@@ -73,6 +73,9 @@ export const CONTROLLER_SCRIPT_MODULES = [
   'log-projection',
   'tenant-operator-names',
   'removal-sequence',
+  'scheduler-pki',
+  'scheduler-pki-rotation',
+  'scheduler-identities',
   'controller',
 ] as const;
 
