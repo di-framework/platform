@@ -184,6 +184,33 @@ test('existing-cluster entrypoint refuses invalid platform input before its prov
   }
 }, 120_000);
 
+test('validatePlatformConfig refuses a chartVersion other than the pinned operator version (#541 m6a)', () => {
+  const output = execFileSync(
+    'node',
+    [
+      '-e',
+      `
+    const pulumi = require('@pulumi/pulumi');
+    pulumi.runtime.setAllConfig({});
+    const { validatePlatformConfig } = require('./dist');
+    const run = chartVersion => {
+      try { validatePlatformConfig({ installation: 'di-test', config: new pulumi.Config(), chartVersion }); }
+      catch (e) { return e.message; }
+      return 'ok';
+    };
+    console.log(JSON.stringify({ pinned: run('2.8.0'), unset: run(undefined), other: run('2.9.0') }));
+  `,
+    ],
+    { cwd: root, encoding: 'utf8' },
+  );
+  expect(JSON.parse(output)).toEqual({
+    pinned: 'ok',
+    unset: 'ok',
+    other:
+      'chartVersion must be 2.8.0, the runtime-operator version whose image is pinned (got 2.9.0)',
+  });
+}, 60_000);
+
 test('the generated project runs the packaged local entrypoint, so it validates first too', () => {
   const template = readFileSync(join(root, 'assets/platform/index.ts.tmpl'), 'utf8');
   const code = template.split('\n').filter((line) => line.trim() && !line.trim().startsWith('//'));

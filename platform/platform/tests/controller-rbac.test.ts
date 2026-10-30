@@ -107,10 +107,16 @@ function rendered(names: string[]): Resource[] {
       // While API keys are still being moved out of the runtime namespace (#379).
       ...tenantAuthResources(t, cfg, { ...inputs, legacyApiKeys: true }),
       // The tenant operator's bindings (#541 m3); Pulumi installs the ClusterRoles they refer to.
-      ...tenantOperatorResources(t, { ...cfg, apiServer: inputs.apiServer }),
+      ...operatorResources(t),
     ]),
     ...users.flatMap((u) => userResources(u, tenants, cfg)),
   ].filter((r) => r.apiVersion.startsWith(`${RBAC_GROUP}/`));
+}
+
+function operatorResources(t: Tenant): Resource[] {
+  const rendered = tenantOperatorResources(t, { ...cfg, apiServer: inputs.apiServer });
+  if (!rendered.ready) throw new Error(rendered.message);
+  return rendered.resources;
 }
 
 const matches = (values: string[], value: string) => values.includes(value) || values.includes('*');

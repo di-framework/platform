@@ -45,6 +45,12 @@ const operatorCfg = {
   namespace: 'wasmcloud',
   apiServer: { addresses: ['10.0.0.1'], port: 6443 },
 };
+/** The rendered operator; the config lists API server endpoints, so it is always ready. */
+const operatorObjects = (t: Tenant): Resource[] => {
+  const rendered = tenantOperatorResources(t, operatorCfg);
+  if (!rendered.ready) throw new Error(rendered.message);
+  return rendered.resources;
+};
 const WASMCLOUD = 'runtime.wasmcloud.dev/v1alpha1';
 const START = new Date('2026-10-29T00:00:00Z');
 
@@ -172,7 +178,7 @@ async function prepare(policy: 'Retain' | 'Delete' = 'Retain') {
     data: { 'ca.crt': 'test' },
   });
   await controller.reconcileTenant(t);
-  const operator = tenantOperatorResources(t, operatorCfg);
+  const operator = operatorObjects(t);
   for (const value of operator) api.seed(value);
   const operatorBindings = operator.filter((r) => r.kind === 'RoleBinding');
   const operatorDeployment = operator.find((r) => r.kind === 'Deployment')!;
@@ -255,9 +261,7 @@ describe('removal sequence helpers (#541 m5)', () => {
   });
   it('S1: keeps a binding only when its roleRef AND its subject are the tenant operator', () => {
     const t = tenant();
-    const [binding] = tenantOperatorResources(t, operatorCfg).filter(
-      (r) => r.kind === 'RoleBinding',
-    );
+    const [binding] = operatorObjects(t).filter((r) => r.kind === 'RoleBinding');
     expect(isTenantOperatorBinding(binding!, 'alpha')).toBe(true);
     // The other tenant's operator is not this tenant's.
     expect(isTenantOperatorBinding(binding!, 'beta')).toBe(false);
@@ -317,19 +321,17 @@ describe('removal sequence helpers (#541 m5)', () => {
     expect(sweepsDeployment({ ...d('x'), metadata: { name: 'x' } }, 'alpha')).toBe(true);
   });
   it('the operator Deployment carries the component label', () => {
-    const deployment = tenantOperatorResources(tenant(), operatorCfg).find(
-      (r) => r.kind === 'Deployment',
-    )!;
+    const deployment = operatorObjects(tenant()).find((r) => r.kind === 'Deployment')!;
     expect(deployment.metadata.labels?.[COMPONENT]).toBe(TENANT_OPERATOR_COMPONENT);
   });
 });
 
 describe('S2: the tenant operator is rendered whatever the suspension state (#541 m5)', () => {
   it('renders the same Deployment at one replica and the same bindings when suspended', () => {
-    const active = tenantOperatorResources(tenant(), operatorCfg);
+    const active = operatorObjects(tenant());
     const t = tenant();
     t.spec.suspended = true;
-    const suspended = tenantOperatorResources(t, operatorCfg);
+    const suspended = operatorObjects(t);
     expect(suspended).toEqual(active);
     const deployment = suspended.find((r) => r.kind === 'Deployment')!;
     expect((deployment.spec as { replicas: number }).replicas).toBe(1);

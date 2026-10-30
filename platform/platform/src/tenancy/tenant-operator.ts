@@ -14,6 +14,7 @@ import {
   names,
   type Resource,
   resource,
+  TENANT,
   type Tenant,
 } from './resources';
 import { PLATFORM_SECRETS } from './scheduler-pki';
@@ -144,11 +145,39 @@ export interface TenantOperatorConfig {
   apiServer: { addresses: string[]; port: number };
 }
 
+/** Why {@link tenantOperatorResources} rendered nothing; the caller retries on a later tick. */
+export const TENANT_OPERATOR_NOT_READY = {
+  /** The `kubernetes` EndpointSlice has no addresses, so the egress policy would lack its API rule. */
+  apiServerUnknown: 'ApiServerEndpointsUnknown',
+} as const;
+
+/**
+ * The rendered operator, or why it cannot be rendered yet. Never a partial set: an egress policy
+ * without the API-server rule would cut the operator off from the API (#541 m6a).
+ */
+export type TenantOperatorRender =
+  | { ready: true; resources: Resource[] }
+  | {
+      ready: false;
+      reason: (typeof TENANT_OPERATOR_NOT_READY)[keyof typeof TENANT_OPERATOR_NOT_READY];
+      message: string;
+    };
+
 /**
  * The tenant's operator: its namespace, ServiceAccount, Deployment, the RoleBindings to the three
  * fixed ClusterRoles in the tenant's three namespaces, and the namespace's network policies.
+ * Not ready while the API-server endpoints are unknown.
  */
-export function tenantOperatorResources(tenant: Tenant, cfg: TenantOperatorConfig): Resource[] {
+export function tenantOperatorResources(
+  tenant: Tenant,
+  cfg: TenantOperatorConfig,
+): TenantOperatorRender {
+  if (!cfg.apiServer.addresses.length)
+    return {
+      ready: false,
+      reason: TENANT_OPERATOR_NOT_READY.apiServerUnknown,
+      message: 'the kubernetes EndpointSlice lists no API server address',
+    };
   const t = tenant.metadata.name;
   const n = names(t);
   const ns = operatorNamespace(t);
@@ -257,15 +286,13 @@ export function tenantOperatorResources(tenant: Tenant, cfg: TenantOperatorConfi
 
   deployment.metadata.labels![COMPONENT] = TENANT_OPERATOR_COMPONENT;
 
-  const egress: unknown[] = [];
-  if (cfg.apiServer.addresses.length)
-    egress.push({
+  const egress: unknown[] = [
+    {
       to: cfg.apiServer.addresses.map((ip) => ({
         ipBlock: { cidr: `${ip}/${ip.includes(':') ? 128 : 32}` },
       })),
       ports: [{ protocol: 'TCP', port: cfg.apiServer.port }],
-    });
-  egress.push(
+    },
     {
       to: [
         {
@@ -289,7 +316,7 @@ export function tenantOperatorResources(tenant: Tenant, cfg: TenantOperatorConfi
       ],
       ports: [{ protocol: 'TCP', port: 4222 }],
     },
-  );
+  ];
   const policies = [
     make('networking.k8s.io/v1', 'NetworkPolicy', 'di-operator-egress', ns, {
       spec: { podSelector: {}, policyTypes: ['Egress'], egress },
@@ -301,13 +328,16 @@ export function tenantOperatorResources(tenant: Tenant, cfg: TenantOperatorConfi
     }),
   ];
 
-  return [
-    namespace,
-    make('v1', 'ServiceAccount', TENANT_OPERATOR_NAME, ns, {}),
-    ...bindings,
-    deployment,
-    ...policies,
-  ];
+  return {
+    ready: true,
+    resources: [
+      namespace,
+      make('v1', 'ServiceAccount', TENANT_OPERATOR_NAME, ns, {}),
+      ...bindings,
+      deployment,
+      ...policies,
+    ],
+  };
 }
 
 /** The namespace prefix each tenant-operator ClusterRole may be bound in: `<prefix><tenant>`. */
@@ -344,7 +374,8 @@ interface BindingPolicy {
  * resource kind so that each type-checks against its own schema, refuse, for every user:
  * - every ClusterRoleBinding to the three;
  * - a RoleBinding to one of them outside `<prefix><t>` for its kind
- *   ({@link TENANT_OPERATOR_BINDING_PREFIXES}), or to any subject but exactly
+ *   ({@link TENANT_OPERATOR_BINDING_PREFIXES}), in a namespace without this installation's and
+ *   tenant `<t>`'s labels (the controller sets them on all three, #541 m6a), or to any subject but exactly
  *   `di-operator-<t>/runtime-operator` of the same tenant;
  * - and, for the platform controller, any create, change or delete of the three ClusterRoles, so
  *   it can neither relabel them into an aggregated role nor replace their rules.
@@ -376,6 +407,11 @@ export function tenantOperatorBindingPolicies(installation: string, namespace: s
         },
       ],
       expression: `variables.tenant != '' &&
+        namespaceObject != null && has(namespaceObject.metadata.labels) &&
+        '${INSTALLATION}' in namespaceObject.metadata.labels &&
+        namespaceObject.metadata.labels['${INSTALLATION}'] == '${installation}' &&
+        '${TENANT}' in namespaceObject.metadata.labels &&
+        namespaceObject.metadata.labels['${TENANT}'] == variables.tenant &&
         has(object.subjects) && size(object.subjects) == 1 &&
         object.subjects.all(s, s.kind == 'ServiceAccount' &&
           s.name == '${TENANT_OPERATOR_NAME}' && has(s.namespace) &&
