@@ -143,3 +143,63 @@ describe('ServiceInfoCreatorRegistry', () => {
     expect(r1).toBe(r2);
   });
 });
+
+describe('ServiceInfoCreatorRegistry edge cases', () => {
+  const custom = (label: string, accepts = 'redis'): CloudFoundryServiceInfoCreator => ({
+    accept: (s: RawVcapServiceData) => s.label === accepts,
+    createServiceInfo: (s: RawVcapServiceData) => ({
+      id: s.name,
+      name: s.name,
+      label,
+      tags: [],
+      credentials: {},
+    }),
+  });
+  const redis = { name: 'cache', label: 'redis', credentials: { uri: 'redis://h' } };
+
+  it('checks low-priority creators after the built-ins', () => {
+    const registry = new ServiceInfoCreatorRegistry();
+    registry.registerCreator(custom('low'), { priority: 'low' });
+    expect(registry.createServiceInfo(redis).label).toBe('redis');
+    registry.registerCreator(custom('low-custom', 'custom-db'), { priority: 'low' });
+    const customDb = { name: 'x', label: 'custom-db', credentials: { uri: 'custom://h' } };
+    expect(registry.createServiceInfo(customDb).label).toBe('low-custom');
+    registry.registerCreator(custom('high'));
+    expect(registry.createServiceInfo(redis).label).toBe('high');
+  });
+
+  it('skips creators whose accept throws', () => {
+    const registry = new ServiceInfoCreatorRegistry();
+    registry.registerCreator({
+      accept: () => {
+        throw new Error('boom');
+      },
+      createServiceInfo: () => {
+        throw new Error('unreachable');
+      },
+    });
+    expect(registry.createServiceInfo(redis).label).toBe('redis');
+  });
+
+  it('returns no services for invalid VCAP_SERVICES in the process env', () => {
+    const original = process.env.VCAP_SERVICES;
+    process.env.VCAP_SERVICES = '{invalid';
+    try {
+      expect(new ServiceInfoCreatorRegistry().parseVcapServices()).toEqual([]);
+    } finally {
+      if (original === undefined) delete process.env.VCAP_SERVICES;
+      else process.env.VCAP_SERVICES = original;
+    }
+  });
+
+  it('accepts an already-parsed VCAP_SERVICES object', () => {
+    const parsed = new ServiceInfoCreatorRegistry().parseVcapServices({
+      VCAP_SERVICES: { redis: [redis] },
+    });
+    expect(parsed.map((s) => s.name)).toEqual(['cache']);
+  });
+
+  it('returns no services when the JSON is not an object', () => {
+    expect(new ServiceInfoCreatorRegistry().parseVcapServices('42')).toEqual([]);
+  });
+});

@@ -4,6 +4,7 @@ import {
   getDefaultEnvironment,
   resetDefaultEnvironment,
 } from '../src/environment.ts';
+import type { BlobStorageServiceInfo } from '../src/types.ts';
 
 describe('CloudFoundryEnvironment', () => {
   it('should discover application info and services in Cloud Foundry mode', () => {
@@ -166,5 +167,67 @@ describe('CloudFoundryEnvironment', () => {
     const env2 = getDefaultEnvironment();
     expect(env1).toBe(env2);
     resetDefaultEnvironment();
+  });
+});
+
+describe('CloudFoundryEnvironment service filters', () => {
+  const services = {
+    postgresql: [
+      { name: 'db', label: 'postgresql', credentials: { uri: 'postgres://h/d' } },
+      { name: 'db-b', label: 'postgresql', credentials: { uri: 'postgres://h2/d2' } },
+    ],
+    redis: [
+      { name: 'cache', label: 'redis', credentials: { uri: 'redis://h:6379' } },
+      { name: 'cache-b', label: 'redis', credentials: { uri: 'redis://h2:6379' } },
+    ],
+    rabbitmq: [
+      { name: 'mq', label: 'rabbitmq', credentials: { uri: 'amqp://h/v' } },
+      { name: 'mq-b', label: 'rabbitmq', credentials: { uri: 'amqp://h2/v' } },
+    ],
+    s3: [
+      { name: 'files', label: 's3', credentials: { bucket: 'b' } },
+      { name: 'files-b', label: 's3', credentials: { bucket: 'b2' } },
+    ],
+  };
+  const env = new CloudFoundryEnvironment({
+    env: { VCAP_SERVICES: JSON.stringify(services) },
+    localFallback: false,
+  });
+
+  it('filters by name string and name pattern', () => {
+    expect(env.getServiceInfos({ name: 'cache' }).map((s) => s.name)).toEqual(['cache']);
+    expect(env.getServiceInfos({ name: /^(db|mq)$/ }).map((s) => s.name)).toEqual(['db', 'mq']);
+  });
+
+  it('returns the typed service an object filter selects, not the first of its kind', () => {
+    expect(env.getRelationalServiceInfo({ name: 'db-b' })?.name).toBe('db-b');
+    expect(env.getRedisServiceInfo({ name: 'cache-b' })?.name).toBe('cache-b');
+    expect(env.getAmqpServiceInfo({ name: 'mq-b' })?.name).toBe('mq-b');
+    expect(env.getBlobStorageServiceInfo({ name: 'files-b' })?.name).toBe('files-b');
+  });
+});
+
+describe('CloudFoundryEnvironment local blob storage fallback', () => {
+  const blob = (vars: Record<string, string>) =>
+    new CloudFoundryEnvironment({
+      env: vars,
+    }).getBlobStorageServiceInfo() as BlobStorageServiceInfo;
+
+  it('reads secondary endpoint, region and key variables', () => {
+    const info = blob({
+      S3_BUCKET: 'b',
+      AWS_ENDPOINT_URL: 'http://minio:9000',
+      AWS_DEFAULT_REGION: 'eu-west-1',
+      S3_ACCESS_KEY: 'ak',
+      S3_SECRET_KEY: 'sk',
+    });
+    expect(info.endpoint).toBe('http://minio:9000');
+    expect(info.region).toBe('eu-west-1');
+    expect(info.accessKeyId).toBe('ak');
+    expect(info.secretAccessKey).toBe('sk');
+  });
+
+  it('defaults the region to us-east-1', () => {
+    expect(blob({ S3_BUCKET: 'b' }).region).toBe('us-east-1');
   });
 });

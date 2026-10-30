@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { afterEach, describe, expect, it, spyOn } from 'bun:test';
 import { Container as CoreContainer, useContainer } from '@di-framework/core/container';
 import { Container } from '@di-framework/core/decorators';
 import {
@@ -250,13 +250,22 @@ describe('option forwarding and global container', () => {
 
   it('resolves property bindings from the global container when none is given', () => {
     const sentinel: CloudflareBindingInfo = { name: 'GLOBAL_ONLY', kind: 'kv', binding: sessions };
-    useContainer().registerFactory(cloudflareBindingToken('GLOBAL_ONLY'), () => sentinel);
+    const global = useContainer();
+    const resolve = global.resolve.bind(global);
+    const token = cloudflareBindingToken('GLOBAL_ONLY');
+    // Stub resolve on the global container (restored below) instead of registering a factory on it.
+    const spy = spyOn(global, 'resolve').mockImplementation(((t: unknown) =>
+      t === token ? sentinel : resolve(t as string)) as typeof global.resolve);
+    try {
+      class GlobalConsumer {
+        @CloudflareBinding('GLOBAL_ONLY', { bindings: {} })
+        kv!: CloudflareBindingInfo;
+      }
 
-    class GlobalConsumer {
-      @CloudflareBinding('GLOBAL_ONLY', { bindings: {} })
-      kv!: CloudflareBindingInfo;
+      expect(new GlobalConsumer().kv).toBe(sentinel);
+      expect(spy).toHaveBeenCalledWith(token);
+    } finally {
+      spy.mockRestore();
     }
-
-    expect(new GlobalConsumer().kv).toBe(sentinel);
   });
 });

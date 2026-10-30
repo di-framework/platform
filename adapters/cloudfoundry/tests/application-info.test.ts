@@ -102,3 +102,12 @@ describe('parseVcapApplication', () => {
     ).toBeUndefined();
   });
 });
+
+describe('parseVcapApplication edge cases', () => {
+  it('drops application URIs that are neither a list nor a string', () => {
+    const info = parseVcapApplication({
+      VCAP_APPLICATION: { name: 'app', application_uris: 42 },
+    });
+    expect(info?.applicationUris).toEqual([]);
+  });
+});
