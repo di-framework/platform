@@ -316,9 +316,11 @@ export function controllerScriptHash(scripts: Record<string, string>): string {
 
 /** The name prefix of the only ClusterRoles and ClusterRoleBindings the controller writes (#586). */
 export const CONTROLLER_CLUSTER_RBAC_PREFIX = 'di-tenant-controller-';
+/** The label prefix that aggregates a ClusterRole's rules into another (#586). */
+export const AGGREGATE_LABEL_PREFIX = 'rbac.authorization.k8s.io/aggregate-to-';
 export const CONTROLLER_CLUSTER_RBAC_MESSAGE =
   'The platform controller may only create, change or delete the di-tenant-controller-<tenant> ' +
-  'ClusterRoles and ClusterRoleBindings of its own installation';
+  'ClusterRoles and ClusterRoleBindings of its own installation, without aggregation';
 
 /**
  * Admission for the controller's ClusterRole and ClusterRoleBinding writes (#586). Its RBAC grant
@@ -326,7 +328,8 @@ export const CONTROLLER_CLUSTER_RBAC_MESSAGE =
  * wildcard), so these policies, one per kind, refuse the controller every create, change or
  * delete of any other ClusterRole or ClusterRoleBinding: the name must carry
  * {@link CONTROLLER_CLUSTER_RBAC_PREFIX}, the object (old and new) must carry this installation's
- * label, and a binding must refer to the ClusterRole of its own name.
+ * label, a binding must refer to the ClusterRole of its own name, and a ClusterRole may carry no
+ * aggregation label or rule.
  */
 export function controllerClusterRbacPolicies(installation: string, namespace: string): Resource[] {
   const labelled = (o: string) =>
@@ -336,7 +339,13 @@ export function controllerClusterRbacPolicies(installation: string, namespace: s
     (request.operation == 'DELETE' || (${labelled('object')})) &&
     (request.operation == 'CREATE' || (${labelled('oldObject')}))`;
   const policies = [
-    { resource: 'clusterroles', expression: common },
+    {
+      // An aggregation label or rule would merge rules into, or out of, other ClusterRoles.
+      resource: 'clusterroles',
+      expression: `${common} && (request.operation == 'DELETE' ||
+        (!has(object.aggregationRule) && (!has(object.metadata.labels) ||
+          !object.metadata.labels.exists(k, k.startsWith('${AGGREGATE_LABEL_PREFIX}')))))`,
+    },
     {
       resource: 'clusterrolebindings',
       expression: `${common} && (request.operation == 'DELETE' ||

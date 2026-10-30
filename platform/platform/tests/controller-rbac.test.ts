@@ -5,6 +5,7 @@ import { MEMBERS_CONFIG, publishedMembers } from '../../tenant-auth/src/kube';
 import { admissionResources } from '../src/tenancy/admission';
 import { type Api, ApiError, Controller, collection } from '../src/tenancy/controller';
 import {
+  AGGREGATE_LABEL_PREFIX,
   CONTROLLER_CLUSTER_RBAC_MESSAGE,
   CONTROLLER_SCRIPT_MODULES,
   type ControllerClusterRoleRule,
@@ -1311,6 +1312,51 @@ describe('controller ClusterRole and ClusterRoleBinding writes (#586)', () => {
     // Neither relabelling one of its own away nor adopting a foreign one.
     expect(admit('ClusterRole', 'UPDATE', own.metadata.name, other, own)).toBe(false);
     expect(admit('ClusterRole', 'UPDATE', own.metadata.name, own, other)).toBe(false);
+  });
+
+  it('refuses an installation-labelled object whose name lacks the prefix', () => {
+    const labels = { [INSTALLATION]: 'test' };
+    const roles = tenantOperatorClusterRoles('test');
+    expect(roles.map((r) => r.metadata.name)).toHaveLength(3);
+    for (const role of roles) {
+      expect(role.metadata.labels?.[INSTALLATION]).toBe('test');
+      expect(writes('ClusterRole', role)).toEqual([false, false, false]);
+    }
+    // Neither another name of the installation nor a near miss without the trailing dash.
+    for (const name of ['test-controller', 'di-tenant-controllerx', 'di-tenant-alpha']) {
+      const metadata = { name, labels };
+      const crb = { metadata, roleRef: { apiGroup: RBAC_GROUP, kind: 'ClusterRole', name } };
+      expect(writes('ClusterRole', { metadata })).toEqual([false, false, false]);
+      expect(writes('ClusterRoleBinding', crb)).toEqual([false, false, false]);
+    }
+  });
+
+  it('refuses aggregation labels or rules on its own ClusterRoles', () => {
+    const own = cluster.find((o) => o.kind === 'ClusterRole') as Resource;
+    const name = own.metadata.name;
+    expect(
+      Object.keys(own.metadata.labels ?? {}).some((k) => k.startsWith(AGGREGATE_LABEL_PREFIX)),
+    ).toBe(false);
+    expect('aggregationRule' in own).toBe(false);
+    const aggregated = {
+      ...own,
+      metadata: {
+        ...own.metadata,
+        labels: { ...own.metadata.labels, [`${AGGREGATE_LABEL_PREFIX}view`]: 'true' },
+      },
+    };
+    const rule = {
+      ...own,
+      aggregationRule: { clusterRoleSelectors: [{ matchLabels: { x: 'y' } }] },
+    };
+    for (const o of [aggregated, rule]) {
+      expect(admit('ClusterRole', 'CREATE', name, o, null)).toBe(false);
+      expect(admit('ClusterRole', 'UPDATE', name, o, own)).toBe(false);
+      // Removing it again, or deleting the role, stays allowed.
+      expect(admit('ClusterRole', 'UPDATE', name, own, o)).toBe(true);
+      expect(admit('ClusterRole', 'DELETE', name, null, o)).toBe(true);
+      expect(admit('ClusterRole', 'CREATE', name, o, null, ADMIN)).toBe(true);
+    }
   });
 
   it('refuses a di-tenant-controller binding to any other ClusterRole', () => {
