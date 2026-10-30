@@ -20,7 +20,7 @@ import type { Resource, Tenant } from '../../platform/src/tenancy/resources.ts';
 import { Controller, configFromEnv } from '../src/controller.ts';
 import type { Principal } from '../src/identity.ts';
 import { KubeClient } from '../src/kube.ts';
-import { listEvents, logEvents, timing } from '../src/v1/logs.ts';
+import { listEvents, logEvents, logs, timing } from '../src/v1/logs.ts';
 import { type FakeServer, json, type Recorded, serve } from './support/servers.ts';
 
 const configMap = (application: string, lines: string[], failures?: unknown, rv = '1') => ({
@@ -898,4 +898,23 @@ test('a partial migration serves every line once, before and after the retry (#3
   expect([...configMaps.keys()].sort()).toEqual(['di-logs-web.prod', 'di-logs-web.staging']);
   expect(served('staging')).toEqual(['staging up']);
   expect(served('prod')).toEqual(['prod up', 'prod again']);
+});
+
+describe('the logs handler on its own', () => {
+  // The contract's route already refuses an unknown env; the handler refuses it too, before any
+  // cluster call, should it ever be reached with one.
+  test('refuses an env outside ENVS without calling the cluster', async () => {
+    const asUser = () => {
+      throw new Error('the cluster must not be called');
+    };
+    const response = (await logs.logs?.(
+      undefined,
+      { request: { params: { service: 'web' }, query: { env: 'dev' } } } as never,
+      { asUser } as never,
+    )) as Response;
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as { detail: string }).detail).toBe(
+      'env must be one of prod, staging',
+    );
+  });
 });

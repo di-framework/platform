@@ -160,6 +160,17 @@ describe('host pulls wait for the registry', () => {
         new Response('not json', { status: 503, headers: { 'content-type': 'application/json' } }),
       ),
     ).toBe(false);
+    // A body that fails mid-read is not UNAVAILABLE.
+    const failing = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.error(new Error('connection reset'));
+      },
+    });
+    expect(
+      await registryUnavailable(
+        new Response(failing, { status: 503, headers: { 'content-type': 'application/json' } }),
+      ),
+    ).toBe(false);
     // An oversized body is not read to the end.
     const padding = 'x'.repeat(32 * 1024);
     expect(

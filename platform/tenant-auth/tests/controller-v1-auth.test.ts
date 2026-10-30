@@ -248,6 +248,17 @@ describe('Kubernetes proxy refusals keep the Status shape', () => {
     });
   });
 
+  test('an unknown /-/ path of an authenticated caller is a 404 Status', async () => {
+    const response = await call('/-/nope', 'Bearer refused');
+    expect(response.status).toBe(404);
+    expect(await response.json()).toMatchObject({
+      kind: 'Status',
+      code: 404,
+      reason: 'NotFound',
+      message: '/-/nope is not a controller endpoint',
+    });
+  });
+
   test('the controller endpoints under /-/ keep the Status shape', async () => {
     const response = await call('/-/whoami');
     expect(response.status).toBe(401);

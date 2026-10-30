@@ -692,12 +692,12 @@ export class Console {
   }
 }
 
-if (import.meta.main) {
-  const config = configFromEnv();
+/** The process entry point: starts the console from `config` and serves it. */
+export async function main(config: ConsoleConfig) {
   // Resolves at once: discovery continues in the background, so the console serves (degraded)
   // while the issuer is unreachable instead of exiting (#489).
   const app = await Console.start(config);
-  Bun.serve({
+  const server = Bun.serve({
     hostname: config.host,
     port: config.port,
     // The OIDC callback waits for the identity server's token exchange, which verifies the
@@ -711,4 +711,7 @@ if (import.meta.main) {
     controller: config.controllerUrl,
     discoveryReady: app.provider !== null,
   });
+  return { app, server };
 }
+
+if (import.meta.main) await main(configFromEnv());

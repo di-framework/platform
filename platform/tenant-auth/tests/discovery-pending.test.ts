@@ -2,9 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { dump } from 'js-yaml';
 import { Controller, configFromEnv } from '../src/controller.ts';
-import { type FakeServer, json, serve } from './support/servers.ts';
+import { type FakeServer, json, serve, writeKubeconfig } from './support/servers.ts';
 
 /** Polls until `condition` holds; fails the test (by throwing) after `timeoutMs`. */
 async function eventually(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
@@ -50,15 +49,7 @@ describe('Controller.start with the issuer unreachable at first', () => {
     });
     api = serve(() => json({}));
     dir = mkdtempSync(join(tmpdir(), 'discovery-pending-'));
-    writeFileSync(
-      join(dir, 'kubeconfig'),
-      dump({
-        'current-context': 'x',
-        contexts: [{ name: 'x', context: { cluster: 'c', user: 'u' } }],
-        clusters: [{ name: 'c', cluster: { server: api.url } }],
-        users: [{ name: 'u', user: { token: 't' } }],
-      }),
-    );
+    writeKubeconfig(join(dir, 'kubeconfig'), api.url);
     writeFileSync(join(dir, 'host-pull'), HOST_PULL);
 
     const began = performance.now();
@@ -110,6 +101,12 @@ describe('Controller.start with the issuer unreachable at first', () => {
     const info = await mainCall('/v1/auth/info');
     expect(info.status).toBe(503);
     expect(Number(info.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
+
+    const authed = await fetch(`http://127.0.0.1:${main.port}/-/whoami`, {
+      headers: { authorization: 'Bearer an-identity-access-token' },
+    });
+    expect(authed.status).toBe(503);
+    expect(Number(authed.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
 
     const identityToken = await whoamiCall('Bearer an-identity-access-token');
     expect(identityToken.status).toBe(503);

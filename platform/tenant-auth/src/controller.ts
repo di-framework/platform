@@ -800,12 +800,6 @@ export class Controller {
     return this.discovery.state.status === 'complete';
   }
 
-  private getProvider(): ProviderMetadata {
-    const state = this.discovery.state;
-    if (state.status === 'complete') return state.provider;
-    throw new Error('issuer discovery is not yet complete');
-  }
-
   private serviceUnavailableUntilDiscovery(): Response {
     const state = this.discovery.state;
     const retryAfter = state.status === 'pending' ? state.retryAfterSeconds : 1;
@@ -869,10 +863,11 @@ export class Controller {
     }
     // The one public operation of the `/v1` contract: what a CLI needs before it has a credential.
     if (request.method === 'GET' && url.pathname === '/v1/auth/info') {
-      if (!this.isDiscoveryReady()) return this.serviceUnavailableUntilDiscovery();
+      const state = this.discovery.state;
+      if (state.status !== 'complete') return this.serviceUnavailableUntilDiscovery();
       return json({
         account: this.config.tenant,
-        issuer: this.getProvider().issuer,
+        issuer: state.provider.issuer,
         clientId: this.config.cliClientId,
       });
     }
@@ -1429,14 +1424,14 @@ export class Controller {
   }
 }
 
-if (import.meta.main) {
-  const config = configFromEnv();
+/** The process entry point: starts the controller from `config` and binds its listeners. */
+export async function main(config: ControllerConfig) {
   const controller = await Controller.start(config);
   const tls =
     config.tlsCert && config.tlsKey
       ? { cert: readFileSync(config.tlsCert, 'utf8'), key: readFileSync(config.tlsKey, 'utf8') }
       : undefined;
-  Bun.serve({
+  const server = Bun.serve({
     hostname: config.host,
     port: config.port,
     tls,
@@ -1445,30 +1440,34 @@ if (import.meta.main) {
     fetch: (request, server) => controller.handle(request, server),
   });
   // `configFromEnv` refuses a whoami port without a certificate; the listener throws as well.
-  if (config.whoamiPort) await serveWhoamiListener(controller, config, config.whoamiPort, tls);
+  const whoami = config.whoamiPort
+    ? await serveWhoamiListener(controller, config, config.whoamiPort, tls)
+    : undefined;
   // The registry listeners run on `node:http`, not `Bun.serve`, so a streamed blob keeps the
   // registry's `Content-Length` (#197; see `registry-listener.ts`).
-  if (config.registryFrontPort)
-    await serveRegistryListener({
-      hostname: config.host,
-      port: config.registryFrontPort,
-      tls,
-      // Bounded (W2 of the platform#83 review): data flow resets the idle timeout, and bodies
-      // beyond the cap are refused here too when they are chunked.
-      idleTimeoutSeconds: REGISTRY_IDLE_TIMEOUT_SECONDS,
-      maxRequestBodySize: config.registryMaxBodyBytes,
-      fetch: (request, server) => controller.handleRegistry(request, server),
-    });
+  const registryFront = config.registryFrontPort
+    ? await serveRegistryListener({
+        hostname: config.host,
+        port: config.registryFrontPort,
+        tls,
+        // Bounded (W2 of the platform#83 review): data flow resets the idle timeout, and bodies
+        // beyond the cap are refused here too when they are chunked.
+        idleTimeoutSeconds: REGISTRY_IDLE_TIMEOUT_SECONDS,
+        maxRequestBodySize: config.registryMaxBodyBytes,
+        fetch: (request, server) => controller.handleRegistry(request, server),
+      })
+    : undefined;
   // The tenant hosts' pulls (platform#83 `:host-pull`): TLS unless they pull over plain HTTP.
-  if (config.registryPullPort)
-    await serveRegistryListener({
-      hostname: config.host,
-      port: config.registryPullPort,
-      tls: config.registryPullTls ? tls : undefined,
-      idleTimeoutSeconds: REGISTRY_IDLE_TIMEOUT_SECONDS,
-      maxRequestBodySize: REGISTRY_PULL_MAX_BODY_BYTES,
-      fetch: (request, server) => controller.handleRegistryPull(request, server),
-    });
+  const registryPull = config.registryPullPort
+    ? await serveRegistryListener({
+        hostname: config.host,
+        port: config.registryPullPort,
+        tls: config.registryPullTls ? tls : undefined,
+        idleTimeoutSeconds: REGISTRY_IDLE_TIMEOUT_SECONDS,
+        maxRequestBodySize: REGISTRY_PULL_MAX_BODY_BYTES,
+        fetch: (request, server) => controller.handleRegistryPull(request, server),
+      })
+    : undefined;
   controller.audit('controller.started', {
     url: `${tls ? 'https' : 'http'}://${config.host}:${config.port}`,
     issuer: config.issuer,
@@ -1478,4 +1477,7 @@ if (import.meta.main) {
     registryFrontPort: config.registryFrontPort,
     registryPullPort: config.registryPullPort,
   });
+  return { controller, server, whoami, registryFront, registryPull };
 }
+
+if (import.meta.main) await main(configFromEnv());

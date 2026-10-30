@@ -1,3 +1,5 @@
+import { writeFileSync } from 'node:fs';
+import { dump } from 'js-yaml';
 /** A local HTTP server for tests: records every request and answers through one handler. */
 export interface Recorded {
   method: string;
@@ -42,3 +44,16 @@ export function serve(handler: Handler): FakeServer {
 
 export const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+
+/** Writes a kubeconfig at `path` whose only context talks to `server` with a static token. */
+export function writeKubeconfig(path: string, server: string): void {
+  writeFileSync(
+    path,
+    dump({
+      'current-context': 'x',
+      contexts: [{ name: 'x', context: { cluster: 'c', user: 'u' } }],
+      clusters: [{ name: 'c', cluster: { server } }],
+      users: [{ name: 'u', user: { token: 't' } }],
+    }),
+  );
+}
