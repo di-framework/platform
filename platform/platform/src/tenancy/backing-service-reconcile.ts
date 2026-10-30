@@ -59,6 +59,13 @@ const RESERVED_RUNTIME_NAMES = new Set([
   'di-runtime',
 ]);
 
+/** Throws before any write when a desired resource would claim a reserved runtime name. */
+function refuseReservedNames(resources: readonly Resource[]): void {
+  for (const resource of resources)
+    if (RESERVED_RUNTIME_NAMES.has(resource.metadata.name))
+      throw new Error(`Refusing to provision reserved name ${resource.metadata.name}`);
+}
+
 function backingServiceResourceName(serviceName: string): string {
   return `di-bs-${serviceName}`;
 }
@@ -323,8 +330,6 @@ function backingServiceResources(
     throw new Error('PostgreSQL requires the dedicated credentials and PVC reconciliation helpers');
   if (cls.spec.provider === 'platform') throw new Error('Egress services provision no backend');
   const resourceName = backingServiceResourceName(service.metadata.name);
-  if (RESERVED_RUNTIME_NAMES.has(resourceName))
-    throw new Error(`Refusing to provision reserved name ${resourceName}`);
   const n = names(tenant.metadata.name);
   const suspended = !!tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
   const replicas = suspended || service.metadata.deletionTimestamp ? 0 : 1;
@@ -476,6 +481,7 @@ export {
   RESERVED_RUNTIME_NAMES,
   RUNTIME_DATA_NATS,
   type RuntimeProvider,
+  refuseReservedNames,
   resolveBackingSizing,
   resolveClass,
   SERVICE,

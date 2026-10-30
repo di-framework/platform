@@ -12,6 +12,7 @@ import {
   parseCpu,
   parseMemory,
   RUNTIME_DATA_NATS,
+  refuseReservedNames,
   resolveBackingSizing,
   resolveClass,
   SERVICE,
@@ -840,6 +841,163 @@ describe('backing service reconciliation', () => {
   });
 });
 
+describe('backing service guards (#587)', () => {
+  it('rejects a class whose provider does not serve its type', () => {
+    const odd = seedClass('keyvalue', { provider: 'nats' });
+    expect(resolveClass(backingService('stock', 'keyvalue'), [odd], 'alpha')).toEqual({
+      error: `class ${DEFAULT_CLASS_NAMES.keyvalue} has incompatible provider`,
+    });
+  });
+
+  it('leaves PostgreSQL to its dedicated helpers', () => {
+    const cls = { ...seedClass('keyvalue'), spec: defaultClassSeed('postgres') };
+    expect(() =>
+      backingServiceResources(backingService('orders', 'keyvalue'), tenant(), cls, cfg, {
+        storage: '1Gi',
+        memory: '128Mi',
+        cpu: '250m',
+      }),
+    ).toThrow('PostgreSQL requires the dedicated credentials and PVC reconciliation helpers');
+  });
+
+  it('refuses a BackingService outside its tenant namespace', async () => {
+    const { api, controller, t, classes } = prepare();
+    const stray = backingService('stock', 'keyvalue');
+    stray.metadata.namespace = 'di-tenant-beta';
+    await expect(controller.reconcileBackingService(stray, t, classes)).rejects.toThrow(
+      'BackingService stock must live in tenant namespace di-tenant-alpha',
+    );
+    expect(api.operations).toEqual([]);
+  });
+
+  it('refuses to stop the runtime data NATS even when it carries the service labels', async () => {
+    const { api, controller, t, classes } = prepare();
+    const stock = backingService('stock', 'keyvalue');
+    api.seed(stock);
+    await controller.reconcileBackingService(stock, t, classes);
+    api.seed({
+      apiVersion: 'apps/v1',
+      kind: 'Deployment',
+      metadata: {
+        name: RUNTIME_DATA_NATS,
+        namespace: names('alpha').runtimeNamespace,
+        labels: { [INSTALLATION]: 'test', [OWNER]: 'stock-uid' },
+      },
+      spec: { replicas: 1 },
+    } as Resource);
+    stock.metadata.deletionTimestamp = new Date().toISOString();
+    stock.spec.deletionPolicy = 'Retain';
+    await expect(controller.reconcileBackingService(stock, t, classes)).rejects.toThrow(
+      `Refusing to manage runtime data plane ${RUNTIME_DATA_NATS}`,
+    );
+    const nats = api.objects.get(
+      `/apis/apps/v1/namespaces/di-runtime-alpha/deployments/${RUNTIME_DATA_NATS}`,
+    );
+    expect(nats?.spec).toEqual({ replicas: 1 });
+    expect(stock.metadata.finalizers).toContain(FINALIZER);
+  });
+});
+
+describe('tick failure handling (#587)', () => {
+  /** `prepare()` plus what a tick needs to reach alpha's services and bindings. */
+  function prepareTick() {
+    const prepared = prepare();
+    const { api } = prepared;
+    for (const name of [names('alpha').namespace, names('alpha').runtimeNamespace])
+      api.seed({
+        apiVersion: 'v1',
+        kind: 'Namespace',
+        metadata: { name, labels: { [INSTALLATION]: 'test', [OWNER]: 'alpha-uid' } },
+      });
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: { name: 'wasmcloud-runtime-tls', namespace: cfg.namespace },
+      data: { 'ca.crt': 'test' },
+    });
+    return prepared;
+  }
+  const binding = (): Resource =>
+    ({
+      apiVersion: VERSION,
+      kind: 'ServiceBinding',
+      metadata: { name: 'stock-client', namespace: names('alpha').namespace, generation: 1 },
+      spec: { serviceName: 'stock', bindingName: 'stock', capability: 'keyvalue' },
+    }) as unknown as Resource;
+  const bindingPath = `${collection(VERSION, 'ServiceBinding', names('alpha').namespace)}/stock-client`;
+
+  async function tickLogged(controller: Controller): Promise<string[]> {
+    const lines: string[] = [];
+    const error = console.error;
+    console.error = (line: string) => lines.push(line);
+    try {
+      await controller.tick();
+    } finally {
+      console.error = error;
+    }
+    return lines;
+  }
+
+  it('marks a BackingService and a ServiceBinding Failed when their reconcile throws', async () => {
+    const { api, controller } = prepareTick();
+    const stock = backingService('stock', 'keyvalue');
+    delete stock.metadata.uid;
+    api.seed(stock);
+    api.seed(binding());
+    const lines = await tickLogged(controller);
+    expect(lines).toContain(
+      'BackingService/di-tenant-alpha/stock: BackingService is missing metadata.uid',
+    );
+    expect(lines).toContain(
+      'ServiceBinding/di-tenant-alpha/stock-client: ServiceBinding is missing metadata.uid',
+    );
+    const service = api.objects.get(key(stock)) as unknown as BackingService;
+    expect(service.status).toMatchObject({ runtimeNamespace: 'di-runtime-alpha' });
+    expect(service.status?.conditions?.[0]).toMatchObject({
+      status: 'False',
+      reason: 'Failed',
+      message: 'BackingService is missing metadata.uid',
+    });
+    const failed = api.objects.get(bindingPath) as Resource & {
+      status: { serviceRef: unknown; conditions: { reason: string; message: string }[] };
+    };
+    // The refreshed service (its status write stamped a uid here) names the ref.
+    expect(failed.status.serviceRef).toEqual({
+      name: 'stock',
+      uid: 'stock-created-uid',
+      generation: 1,
+    });
+    expect(failed.status.conditions[0]).toMatchObject({
+      reason: 'Failed',
+      message: 'ServiceBinding is missing metadata.uid',
+    });
+  });
+
+  it('keeps ticking when the Failed status cannot be written either', async () => {
+    const { api, controller } = prepareTick();
+    const stock = backingService('stock', 'keyvalue');
+    delete stock.metadata.uid;
+    api.seed(stock);
+    api.seed(binding());
+    const original = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      if (method === 'PATCH' && /\/(backingservices|servicebindings)\/[^/]+\/status/.test(path))
+        throw new ApiError(500, 'status write failed');
+      return original<T>(method, path, body);
+    };
+    const lines = await tickLogged(controller);
+    expect(
+      lines.filter((l) => l.startsWith('BackingService/') || l.startsWith('ServiceBinding/')),
+    ).toHaveLength(2);
+    expect((api.objects.get(key(stock)) as unknown as BackingService).status).toBeUndefined();
+    expect(api.objects.get(bindingPath)?.status).toBeUndefined();
+    // The tenant itself was still reconciled after both failures.
+    expect(api.objects.has('/apis/apps/v1/namespaces/di-runtime-alpha/deployments/di-nats')).toBe(
+      true,
+    );
+  });
+});
+
 describe('backing service storage root (#226)', () => {
   const deploymentPath = '/apis/apps/v1/namespaces/di-runtime-alpha/deployments/di-bs-stock';
 
@@ -922,5 +1080,41 @@ describe('backing service storage root (#226)', () => {
     expect(liveBackingServiceHostPath(resources[0], service)).toBe(
       '/var/lib/kubesolo/di-tenants/alpha-uid/bs-stock',
     );
+  });
+});
+
+describe('reserved runtime names (#587)', () => {
+  const reserved = (kind: string, name: string): Resource =>
+    ({
+      apiVersion: kind === 'Deployment' ? 'apps/v1' : 'v1',
+      kind,
+      metadata: { name, namespace: 'di-runtime-alpha' },
+    }) as Resource;
+
+  it('refuses reserved names for every kind and accepts backing-service names', () => {
+    expect(() => refuseReservedNames([reserved('Deployment', RUNTIME_DATA_NATS)])).toThrow(
+      `Refusing to provision reserved name ${RUNTIME_DATA_NATS}`,
+    );
+    expect(() => refuseReservedNames([reserved('Service', TRANSITIONAL_REDIS)])).toThrow(
+      `Refusing to provision reserved name ${TRANSITIONAL_REDIS}`,
+    );
+    expect(() => refuseReservedNames([reserved('Secret', 'di-scheduler-tls')])).toThrow(
+      'Refusing to provision reserved name di-scheduler-tls',
+    );
+    expect(() => refuseReservedNames([reserved('Service', 'di-bs-stock')])).not.toThrow();
+  });
+
+  it('writes nothing when the desired set contains a reserved name', async () => {
+    const { api, controller } = prepare();
+    const apply = (
+      controller as unknown as {
+        applyBackingServiceResources: (desired: Resource[]) => Promise<unknown>;
+      }
+    ).applyBackingServiceResources.bind(controller);
+    api.operations.length = 0;
+    await expect(
+      apply([reserved('Service', 'di-bs-stock'), reserved('Deployment', RUNTIME_DATA_NATS)]),
+    ).rejects.toThrow(`Refusing to provision reserved name ${RUNTIME_DATA_NATS}`);
+    expect(api.operations).toEqual([]);
   });
 });
