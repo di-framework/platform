@@ -347,18 +347,23 @@ export function installSchedulerPki(args: {
     ConfigMap: k8s.core.v1.ConfigMap,
     Job: k8s.batch.v1.Job,
   };
-  const create = (value: Resource, dependsOn: pulumi.Resource[], deleteBeforeReplace = false) => {
+  // `deleteBeforeReplace` stays unset unless given: the Kubernetes provider then deletes a
+  // fixed-name object before creating its replacement. An explicit `false` overrides that, and
+  // replacing the code ConfigMap collides with the old one ("already exists", #594).
+  const create = (value: Resource, dependsOn: pulumi.Resource[], deleteBeforeReplace?: true) => {
     const Kind = kinds[value.kind] as (typeof kinds)[string];
     return new Kind(
       `scheduler-pki-${value.kind.toLowerCase()}-${value.metadata.namespace ?? 'cluster'}-${value.metadata.name}`,
       value as never,
-      { provider: args.provider, dependsOn, deleteBeforeReplace },
+      { provider: args.provider, dependsOn, ...(deleteBeforeReplace && { deleteBeforeReplace }) },
     );
   };
   const [namespace, ...rest] = objects as [Resource, ...Resource[]];
   const pki = create(namespace, args.dependsOn);
   const job = rest.pop() as Resource;
   const prerequisites = rest.map((value) => create(value, [pki, ...args.dependsOn]));
-  // A changed Job is replaced under the same name, so the old one goes first.
+  // A changed Job is replaced under the same name, so the old one goes first. Its pod template
+  // carries the scripts' hash, so changed scripts replace the Job and it runs them once more; it
+  // creates only missing PKI objects, so the re-run changes nothing that exists.
   return create(job, prerequisites, true);
 }

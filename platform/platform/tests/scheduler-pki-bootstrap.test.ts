@@ -146,6 +146,15 @@ describe('scheduler PKI bootstrap objects (#541, O4)', () => {
     expect(one('Job').metadata.annotations).toEqual({ 'pulumi.com/skipAwait': 'true' });
   });
 
+  it('changes the Job template when the scripts change, so an upgrade re-runs it (#594)', () => {
+    const jobFor = (scripts: Record<string, string>) =>
+      schedulerPkiBootstrap('wasmcloud', 'di-test', scripts).find((o) => o.kind === 'Job')
+        ?.spec as { template: unknown };
+    const changed = { ...SCRIPTS, 'scheduler-pki-job.js': '// job, retrying' };
+    expect(jobFor(changed).template).not.toEqual(jobFor(SCRIPTS).template);
+    expect(jobFor({ ...SCRIPTS }).template).toEqual(jobFor(SCRIPTS).template);
+  });
+
   it('runs the controller image and scripts once, mounting no Secret', () => {
     expect(one('ConfigMap').data).toEqual(SCRIPTS);
     const job = one('Job');
@@ -327,10 +336,11 @@ interface RegisterRequest {
   getType(): string;
   getDependenciesList(): string[];
   getDeletebeforereplace(): boolean;
+  getDeletebeforereplacedefined(): boolean;
 }
 const registered = new Map<
   string,
-  { type: string; dependencies: string[]; deleteBeforeReplace: boolean }
+  { type: string; dependencies: string[]; deleteBeforeReplace: boolean | undefined }
 >();
 const urnOf = (name: string) => {
   const found = registered.get(name);
@@ -359,7 +369,9 @@ describe('installSchedulerPki', () => {
       registered.set(request.getName(), {
         type: request.getType(),
         dependencies: request.getDependenciesList(),
-        deleteBeforeReplace: request.getDeletebeforereplace(),
+        deleteBeforeReplace: request.getDeletebeforereplacedefined()
+          ? request.getDeletebeforereplace()
+          : undefined,
       });
       return register(request, callback);
     };
@@ -396,7 +408,8 @@ describe('installSchedulerPki', () => {
       expect(registered.get(name)?.dependencies.sort()).toEqual(
         [urnOf(ns), urnOf('wasmcloud')].sort(),
       );
-      expect(registered.get(name)?.deleteBeforeReplace).toBe(false);
+      // Unset, so the provider replaces a fixed-name object delete-first (#594).
+      expect(registered.get(name)?.deleteBeforeReplace).toBeUndefined();
     }
     expect(registered.get(job)?.dependencies.sort()).toEqual(prerequisites.map(urnOf).sort());
     expect(registered.get(job)?.deleteBeforeReplace).toBe(true);
