@@ -1,0 +1,677 @@
+# `helm template wasmcloud <chart> --namespace wasmcloud -f runtime-operator-2.8.0-platform.values.json`
+# for the runtime-operator chart 2.8.0 (chart digest
+# sha256:63e87326539df1146bf2fe9f12982d4eb5cfb4704252067d4a6932478bb34912), copied verbatim: the
+# release createPlatform installs since #541 m6e. The values file is platformHelmValues('wasmcloud').
+---
+# Source: runtime-operator/templates/operator/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wasmcloud-runtime-operator
+  namespace: wasmcloud
+  labels:
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+automountServiceAccountToken: true
+
+---
+# Source: runtime-operator/templates/runtime/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wasmcloud-runtime-operator-runtime
+  namespace: wasmcloud
+  labels:
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+automountServiceAccountToken: false
+
+---
+# Source: runtime-operator/templates/operator/clusterrole-metrics.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: wasmcloud-runtime-operator-metrics-reader
+  labels:
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+  annotations: {}
+rules:
+  - nonResourceURLs:
+      - /metrics
+    verbs: ['get']
+
+---
+# Source: runtime-operator/templates/operator/clusterrole-metrics.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: wasmcloud-runtime-operator-metrics-auth
+  labels:
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+  annotations: {}
+rules:
+  - apiGroups: ['authentication.k8s.io']
+    resources: ['tokenreviews']
+    verbs: ['create']
+  - apiGroups: ['authorization.k8s.io']
+    resources: ['subjectaccessreviews']
+    verbs: ['create']
+
+---
+# Source: runtime-operator/templates/operator/clusterrolebinding-metrics.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wasmcloud-runtime-operator-metrics-auth
+  labels:
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+  annotations: {}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: wasmcloud-runtime-operator-metrics-auth
+subjects:
+  - kind: ServiceAccount
+    name: wasmcloud-runtime-operator
+    namespace: wasmcloud
+
+---
+# Source: runtime-operator/templates/operator/endpointslice-role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wasmcloud-runtime-operator-endpointslice
+  namespace: wasmcloud
+  labels:
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+rules:
+  - apiGroups:
+      - discovery.k8s.io
+    resources:
+      - endpointslices
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  # endpointslices/restricted is a virtual resource that has no impact to non-OpenShift clusters.
+  # The operator needs this permission to create EndpointSlices in OpenShift clusters that have
+  # the restricted API enabled.
+  - apiGroups:
+      - discovery.k8s.io
+    resources:
+      - endpointslices/restricted
+    verbs:
+      - create
+  - apiGroups:
+      - ''
+    resources:
+      - endpoints/restricted
+    verbs:
+      - create
+---
+# Source: runtime-operator/templates/operator/role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wasmcloud-runtime-operator-leader-election
+  namespace: wasmcloud
+  labels:
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+  annotations: {}
+rules:
+  - apiGroups: ['coordination.k8s.io']
+    resources: ['leases']
+    verbs: ['get', 'list', 'watch', 'create', 'update', 'patch', 'delete']
+  - apiGroups: ['']
+    resources: ['events']
+    verbs: ['create', 'patch']
+  - apiGroups: ['']
+    resources: ['pods']
+    verbs: ['get', 'list', 'patch', 'watch']
+  # Host CRDs always live in the operator's own namespace, so Host
+  # CRUD is granted via this namespaced Role rather than a ClusterRole.
+  - apiGroups: ['runtime.wasmcloud.dev']
+    resources: ['hosts', 'hosts/finalizers']
+    verbs: ['get', 'list', 'watch', 'create', 'update', 'patch', 'delete']
+  - apiGroups: ['runtime.wasmcloud.dev']
+    resources: ['hosts/status']
+    verbs: ['get', 'update', 'patch']
+
+---
+# Source: runtime-operator/templates/operator/workload-crd-role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wasmcloud-runtime-operator-workload-crd
+  namespace: wasmcloud
+  labels:
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+rules:
+  - apiGroups:
+      - runtime.wasmcloud.dev
+    resources:
+      - artifacts
+      - workloads
+      - workloadreplicasets
+      - workloaddeployments
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - runtime.wasmcloud.dev
+    resources:
+      - artifacts/status
+      - workloads/status
+      - workloadreplicasets/status
+      - workloaddeployments/status
+    verbs:
+      - get
+      - update
+      - patch
+  # Required so the operator can stamp ownerReferences with blockOwnerDeletion=true
+  # on child objects — the GC admission plugin checks `update` on <owner>/finalizers.
+  - apiGroups:
+      - runtime.wasmcloud.dev
+    resources:
+      - artifacts/finalizers
+      - workloads/finalizers
+      - workloadreplicasets/finalizers
+      - workloaddeployments/finalizers
+    verbs:
+      - update
+---
+# Source: runtime-operator/templates/operator/workload-namespace-role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wasmcloud-runtime-operator-workload-namespace
+  namespace: wasmcloud
+  labels:
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+rules:
+  - apiGroups:
+      - ''
+    resources:
+      - configmaps
+      - secrets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ''
+    resources:
+      - events
+    verbs:
+      - create
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - ''
+    resources:
+      - services
+    verbs:
+      - get
+      - list
+      - watch
+  # The route controller stamps EndpointSlices with a Service ownerRef +
+  # blockOwnerDeletion=true, so the GC admission plugin requires `update`
+  # on services/finalizers.
+  - apiGroups:
+      - ''
+    resources:
+      - services/finalizers
+    verbs:
+      - update
+---
+# Source: runtime-operator/templates/operator/endpointslice-role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wasmcloud-runtime-operator-endpointslice
+  namespace: wasmcloud
+  labels:
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wasmcloud-runtime-operator-endpointslice
+subjects:
+  - kind: ServiceAccount
+    name: wasmcloud-runtime-operator
+    namespace: wasmcloud
+
+---
+# Source: runtime-operator/templates/operator/rolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wasmcloud-runtime-operator-leader-election
+  namespace: wasmcloud
+  labels:
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+  annotations: {}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wasmcloud-runtime-operator-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: wasmcloud-runtime-operator
+    namespace: wasmcloud
+
+---
+# Source: runtime-operator/templates/operator/workload-crd-role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wasmcloud-runtime-operator-workload-crd
+  namespace: wasmcloud
+  labels:
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wasmcloud-runtime-operator-workload-crd
+subjects:
+  - kind: ServiceAccount
+    name: wasmcloud-runtime-operator
+    namespace: wasmcloud
+
+---
+# Source: runtime-operator/templates/operator/workload-namespace-role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wasmcloud-runtime-operator-workload-namespace
+  namespace: wasmcloud
+  labels:
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wasmcloud-runtime-operator-workload-namespace
+subjects:
+  - kind: ServiceAccount
+    name: wasmcloud-runtime-operator
+    namespace: wasmcloud
+
+---
+# Source: runtime-operator/templates/operator/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: runtime-operator
+  namespace: wasmcloud
+  labels:
+    wasmcloud.com/name: runtime-operator
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+spec:
+  selector:
+    wasmcloud.com/name: runtime-operator
+  type: ClusterIP
+  ports:
+    - port: 8443
+      targetPort: https
+      protocol: TCP
+      name: https
+---
+# Source: runtime-operator/templates/runtime/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hostgroup-default
+  namespace: wasmcloud
+  labels:
+    wasmcloud.com/name: hostgroup
+    wasmcloud.com/hostgroup: default
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+spec:
+  selector:
+    wasmcloud.com/name: hostgroup
+    wasmcloud.com/hostgroup: default
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 9191
+      targetPort: http
+      protocol: TCP
+
+---
+# Source: runtime-operator/templates/operator/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runtime-operator
+  namespace: wasmcloud
+  labels:
+    wasmcloud.com/name: runtime-operator
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      wasmcloud.com/name: runtime-operator
+  template:
+    metadata:
+      labels:
+        wasmcloud.com/name: runtime-operator
+        helm.sh/chart: runtime-operator-2.8.0
+        app.kubernetes.io/name: runtime-operator
+        app.kubernetes.io/instance: wasmcloud
+        app.kubernetes.io/version: '2.8.0'
+        app.kubernetes.io/managed-by: Helm
+    spec:
+      automountServiceAccountToken: true
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: operator-cert
+          secret:
+            secretName: di-scheduler-operator-tls
+      serviceAccountName: wasmcloud-runtime-operator
+
+      containers:
+        - name: runtime-operator
+          image: ghcr.io/wasmcloud/runtime-operator:2.8.0
+          args:
+            - '-nats-url=nats://nats.wasmcloud.svc.cluster.local:4222'
+            - '-nats-ca=/operator-cert/ca.crt'
+            - '-nats-client-cert=/operator-cert/tls.crt'
+            - '-nats-client-key=/operator-cert/tls.key'
+            - '-watch-namespaces=wasmcloud'
+            - '-allow-shared-hosts=false'
+            # Always leader-gate the operator. Harmless at the default
+            # replicas: 1, and required if replicas is ever raised.
+            - '-leader-elect'
+          env:
+            - name: OPERATOR_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          imagePullPolicy: Always
+          volumeMounts:
+            - name: operator-cert
+              mountPath: /operator-cert
+              readOnly: true
+          resources:
+            limits:
+              memory: 192Mi
+            requests:
+              cpu: 100m
+              memory: 64Mi
+          ports:
+            - name: health
+              containerPort: 8082
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 0
+---
+# Source: runtime-operator/templates/runtime/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hostgroup-default
+  namespace: wasmcloud
+  labels:
+    wasmcloud.com/name: hostgroup
+    wasmcloud.com/hostgroup: default
+    helm.sh/chart: runtime-operator-2.8.0
+    app.kubernetes.io/name: runtime-operator
+    app.kubernetes.io/instance: wasmcloud
+    app.kubernetes.io/version: '2.8.0'
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      wasmcloud.com/name: hostgroup
+      wasmcloud.com/hostgroup: default
+  template:
+    metadata:
+      labels:
+        wasmcloud.com/name: hostgroup
+        wasmcloud.com/hostgroup: default
+        helm.sh/chart: runtime-operator-2.8.0
+        app.kubernetes.io/name: runtime-operator
+        app.kubernetes.io/instance: wasmcloud
+        app.kubernetes.io/version: '2.8.0'
+        app.kubernetes.io/managed-by: Helm
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: oci-cache
+          emptyDir: {}
+        # wash creates its data/config/cache directories under $HOME (set to /tmp
+        # below), so the host needs a writable /tmp to run with a read-only root
+        # filesystem.
+        - name: tmp
+          emptyDir: {}
+        - name: runtime-cert
+          secret:
+            secretName: di-scheduler-platform-host-tls
+        - name: data-cert
+          secret:
+            secretName: di-scheduler-data-tls
+      serviceAccountName: wasmcloud-runtime-operator-runtime
+
+      containers:
+        - name: host
+          image: ghcr.io/wasmcloud/wash:2.8.0
+          env:
+            # wash resolves its XDG data/config/cache dirs under $HOME; point it
+            # at the writable /tmp emptyDir so the host runs with a read-only root
+            # filesystem. A user-supplied runtime.env HOME (below) overrides this.
+            - name: HOME
+              value: /tmp
+            - name: WASMCLOUD_HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: WASMCLOUD_HOST_ENVIRONMENT
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: WASH_HOST_MAX_GUEST_MEMORY
+              value: '2Gi'
+            - name: WASH_DEFAULT_HEAP_MEMORY
+              value: '512MiB'
+            - name: WASH_CORE_INSTANCES
+              value: '100'
+          args:
+            - 'host'
+            - '--host-name=$(WASMCLOUD_HOST_IP)'
+            - '--host-group=default'
+            - '--environment=$(WASMCLOUD_HOST_ENVIRONMENT)'
+            - '--scheduler-nats-url=nats://nats.wasmcloud.svc.cluster.local:4222'
+            - '--scheduler-nats-tls-ca=/runtime-cert/ca.crt'
+            - '--scheduler-nats-tls-cert=/runtime-cert/tls.crt'
+            - '--scheduler-nats-tls-key=/runtime-cert/tls.key'
+            - '--data-nats-url=nats://nats.wasmcloud.svc.cluster.local:4222'
+            - '--data-nats-tls-ca=/data-cert/ca.crt'
+            - '--data-nats-tls-cert=/data-cert/tls.crt'
+            - '--data-nats-tls-key=/data-cert/tls.key'
+            - '--oci-cache-dir=/oci-cache'
+            - '--http-addr=0.0.0.0:9191'
+          imagePullPolicy: Always
+          volumeMounts:
+            - name: oci-cache
+              mountPath: /oci-cache
+            - name: tmp
+              mountPath: /tmp
+            - name: runtime-cert
+              mountPath: /runtime-cert
+              readOnly: true
+            - name: data-cert
+              mountPath: /data-cert
+              readOnly: true
+          resources:
+            limits:
+              memory: 2Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          ports:
+            - name: http
+              containerPort: 9191
+              protocol: TCP
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 0
+
+---
+# Source: runtime-operator/templates/operator/endpointslice-role.yaml
+# The EndpointSlice controller only needs access within the watched namespaces.
+# These permissions are granted with a namespaced Role + RoleBinding per watched
+# namespace (rather than a ClusterRole) so that installing in watchNamespaces mode
+# requires no cluster-scoped RBAC. When watchNamespaces is empty (watch all
+# namespaces), the main ClusterRole covers endpointslices instead.
+
+---
+# Source: runtime-operator/templates/operator/workload-crd-role.yaml
+# When operator.watchNamespaces is set, the operator's workload-side CRD access
+# (artifacts / workloads / workloadreplicasets / workloaddeployments, plus their
+# /status and /finalizers subresources) is scoped to each watched namespace via a
+# Role + RoleBinding rather than the cluster-wide ClusterRole in clusterrole.yaml.
+# The informer cache is likewise scoped to these namespaces via
+# cacheOpts.DefaultNamespaces (see runtime-operator/cmd/main.go), so namespaced
+# RBAC is sufficient for the controllers' list/watch.
+#
+# Host CRDs are intentionally excluded — Host objects always live in the
+# operator's own namespace and are granted via the namespaced Role in role.yaml.
+
+---
+# Source: runtime-operator/templates/operator/workload-namespace-role.yaml
+# When operator.watchNamespaces is set, the operator only ever reads
+# configmaps/secrets/services and records events in those namespaces — every
+# Get on these resources is keyed by the workload's own namespace, and the
+# informer cache is scoped via cacheOpts.DefaultNamespaces. These permissions
+# are granted with a namespaced Role + RoleBinding per watched namespace (rather
+# than a ClusterRole) so that installing in watchNamespaces mode requires no
+# cluster-scoped RBAC. When watchNamespaces is empty (watch all namespaces),
+# these rules live on the main ClusterRole instead.

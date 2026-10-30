@@ -17,6 +17,7 @@ import {
   STORAGE_FORMAT_ANNOTATION,
   STORAGE_MOUNT_ANNOTATION,
 } from '../src/tenancy/workload-storage';
+import { cutoverSeeds } from './support/cutover';
 
 const cfg: ControllerConfig = {
   installation: 'test',
@@ -122,6 +123,7 @@ class MemoryApi implements Api {
           value.status = {
             observedGeneration: 1,
             readyReplicas: (value.spec as { replicas: number }).replicas,
+            updatedReplicas: (value.spec as { replicas: number }).replicas,
           };
       }
       this.objects.set(target, value);
@@ -202,12 +204,7 @@ function hostPod(
 function prepare(t: Tenant = tenant()) {
   const api = new MemoryApi();
   api.seed(t);
-  api.seed({
-    apiVersion: 'v1',
-    kind: 'Secret',
-    metadata: { name: 'wasmcloud-runtime-tls', namespace: cfg.namespace },
-    data: { 'ca.crt': 'test' },
-  });
+  for (const value of cutoverSeeds(t, cfg.installation)) api.seed(value);
   return { api, controller: new Controller(api, cfg), t };
 }
 

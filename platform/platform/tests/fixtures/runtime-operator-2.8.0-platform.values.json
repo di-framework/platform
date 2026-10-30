@@ -1,0 +1,61 @@
+{
+  "gateway": {
+    "enabled": false
+  },
+  "runtime": {
+    "extraArgs": [],
+    "resources": {
+      "requests": {
+        "cpu": "250m",
+        "memory": "256Mi"
+      },
+      "limits": {
+        "memory": "2Gi"
+      },
+      "defaultHeapMemory": "512MiB",
+      "coreInstances": "100"
+    },
+    "hostGroups": [
+      {
+        "name": "default",
+        "replicas": 1,
+        "service": {
+          "type": "ClusterIP"
+        },
+        "webgpu": {
+          "enabled": false
+        },
+        "http": {
+          "enabled": true,
+          "port": 9191
+        }
+      }
+    ]
+  },
+  "operator": {
+    "allowSharedHosts": false,
+    "watchNamespaces": ["wasmcloud"],
+    "hostNamespaces": ["wasmcloud"]
+  },
+  "networkPolicy": {
+    "enabled": false
+  },
+  "nats": {
+    "enabled": false
+  },
+  "global": {
+    "tls": {
+      "enabled": true
+    },
+    "nats": {
+      "schedulerUrl": "",
+      "dataUrl": ""
+    },
+    "certificates": {
+      "generate": false,
+      "operatorCertSecretName": "di-scheduler-operator-tls",
+      "runtimeCertSecretName": "di-scheduler-platform-host-tls",
+      "dataCertSecretName": "di-scheduler-data-tls"
+    }
+  }
+}

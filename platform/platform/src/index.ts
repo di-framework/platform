@@ -17,9 +17,9 @@ import {
   tenantInsecureRegistries,
 } from './insecure-registries';
 import { tenantKubeconfig } from './kubeconfig';
-import { natsPostrenderer } from './nats-log-level';
 import { installNetworkPolicy } from './network-policy';
 import { extraHostGroupsWarning, platformIngressPolicies } from './platform-ingress';
+import { installSchedulerNats } from './scheduler-nats-install';
 import { installSchedulerPki, loadSchedulerPkiScripts } from './scheduler-pki-bootstrap';
 import {
   declarations,
@@ -45,12 +45,8 @@ import { WASMCLOUD_OPERATOR_VERSION } from './tenancy/tenant-operator';
 import { tenantAuthReadsApiKeyNamespace } from './tenant-auth-images';
 import { secretReaderFromKubeconfig } from './token-secret-reader';
 import { waitForTokenSecret } from './token-wait';
-import { platformValues } from './values';
-import {
-  operatorHostNamespaces,
-  sharedTenantList,
-  type TenantSnapshot,
-} from './watched-namespaces';
+import { platformHelmValues } from './values';
+import { sharedTenantList, type TenantSnapshot } from './watched-namespaces';
 
 export { platformRegistryPullHost, tenantInsecureRegistries } from './insecure-registries';
 export { kubeconfigServer, type TenantKubeconfigArgs, tenantKubeconfig } from './kubeconfig';
@@ -106,10 +102,10 @@ export interface PlatformArgs {
    * is Ready, the program polls the Kubernetes API with this kubeconfig (and `kubeContext`) until
    * the user's token Secret has `data.token`. The ambient `$KUBECONFIG` is never read. If the
    * kubeconfig uses an `exec` credential plugin, that plugin runs for these reads as it does for
-   * `provider`. Once per update or preview it also lists the installation's Tenants, so a removed
-   * tenant's runtime namespace stays watched by the wasmCloud operator until its Tenant is deleted
-   * (#227) and a Retain removal is announced (#228); without it, only declared tenants are
-   * watched.
+   * `provider`. Once per update or preview it also lists the installation's Tenants, so a Retain
+   * removal is announced (#228). The scheduler NATS Service `nats` is applied through a provider
+   * built from it, which adopts the chart's Service of an earlier release in place (#541 m6e);
+   * without it, an upgrade from such a release fails on that Service.
    */
   kubeconfig?: pulumi.Input<string>;
   /** Context of `kubeconfig` that `provider` uses; defaults to the kubeconfig's current context. */
@@ -156,6 +152,8 @@ export interface ValidatedPlatformConfig {
   runtimeNats: RuntimeNatsConfig | undefined;
   backingServiceClasses: ReturnType<typeof resolveBackingServiceClasses>;
   routeAliases: ReturnType<typeof validateRouteAliases>;
+  /** The runtime-operator chart values, with the platform's settings enforced (design-541 §4.1). */
+  helmValues: Record<string, unknown>;
   /** Warnings about accepted input; `createPlatform` logs them. */
   warnings: string[];
 }
@@ -214,6 +212,8 @@ export function validatePlatformConfig(args: PlatformConfigArgs): ValidatedPlatf
     throw new Error('createPlatform: apiServer requires kubeconfig (the one provider uses)');
   // Gateway routes for each tenant's console and controller hosts (#58).
   const { routes: tenantAuthRouteHosts } = tenantAuthRoutes(tenantAuth, routeUrlPattern);
+  // Throws on a host group override the platform cannot secure (#541 m6e).
+  const helmValues = platformHelmValues(namespace, args.values, args.insecureRegistry);
   // Gateway route aliases (#217): validated and normalized once, before any resource.
   const routeAliases = validateRouteAliases(routeAliasesInput(args, config), {
     tenantAuthRoutes: tenantAuthRouteHosts,
@@ -231,6 +231,7 @@ export function validatePlatformConfig(args: PlatformConfigArgs): ValidatedPlatf
     runtimeNats,
     backingServiceClasses,
     routeAliases,
+    helmValues,
     warnings,
   };
 }
@@ -250,6 +251,7 @@ export function createPlatform(args: PlatformArgs) {
     runtimeNats,
     backingServiceClasses,
     routeAliases,
+    helmValues,
     warnings,
   } = validatePlatformConfig(args);
   for (const warning of warnings) pulumi.log.warn(warning);
@@ -333,22 +335,32 @@ export function createPlatform(args: PlatformArgs) {
       })()
     : undefined;
 
-  const tenantNamespaces = seedTenantNamespaces(declared.tenants, scope, provider);
+  // Kept in state as before; the release no longer waits for them, since the chart's operator
+  // serves only the platform namespace (#541 m6e).
+  seedTenantNamespaces(declared.tenants, scope, provider);
 
   // The scheduler NATS CAs, identity record and platform identities (#541), created by a one-shot
-  // Job, so no key enters Pulumi state. Until m6 mounts its Secrets the release does not wait for it.
-  installSchedulerPki({
+  // Job, so no key enters Pulumi state. Awaited: everything below mounts its Secrets.
+  const schedulerPki = installSchedulerPki({
     namespace: namespaceName,
     installation: scope,
     provider,
     dependsOn: [namespaceResource],
     scripts: loadSchedulerPkiScripts(),
   });
+  // The platform-owned scheduler NATS, Ready before the release stops rendering the chart's, then
+  // the Service `nats` it takes over (#541 m6e).
+  const schedulerNats = installSchedulerNats({
+    namespace: namespaceName,
+    release: args.release,
+    provider,
+    kubeconfig: args.kubeconfig,
+    kubeContext: args.kubeContext,
+    dependsOn: [namespaceResource, schedulerPki],
+  });
 
-  // The installation's Tenants, listed once per run with the admin kubeconfig and shared by the
-  // watched namespaces (#227) and the Retain removal check (#228), in preview too, so both decide
-  // from one snapshot (#245). The snapshot is built in one `apply` on the admin kubeconfig and
-  // context, so both consumers read it with the same credentials by construction. Without
+  // The installation's Tenants, listed once per run with the admin kubeconfig for the Retain
+  // removal check (#228), in preview too, retrying transient failures (#245). Without
   // `kubeconfig` nothing is listed.
   const adminKubeconfig = args.kubeconfig;
   const tenantSnapshot: pulumi.Output<TenantSnapshot> | undefined =
@@ -362,23 +374,6 @@ export function createPlatform(args: PlatformArgs) {
           ),
         );
 
-  // A removed tenant's runtime namespace stays watched while Pulumi deletes its Tenant, which it
-  // does after this Helm update (#227).
-  const resolveHostNamespaces = (tenants?: TenantSnapshot) =>
-    operatorHostNamespaces({
-      platformNamespace: namespaceName,
-      installation: scope,
-      declared: declared.tenants.map((t) => t.name),
-      dryRun: pulumi.runtime.isDryRun(),
-      tenants,
-      log: { info: (m) => pulumi.log.info(m), warn: (m) => pulumi.log.warn(m) },
-    });
-  const watchedNamespaces: pulumi.Input<string[]> =
-    tenantSnapshot === undefined
-      ? resolveHostNamespaces()
-      : // The namespace list is not secret, though the kubeconfig it was read with is.
-        pulumi.unsecret(tenantSnapshot.apply(resolveHostNamespaces));
-
   const wasmcloud = new k8s.helm.v3.Release(
     'wasmcloud',
     {
@@ -391,39 +386,19 @@ export function createPlatform(args: PlatformArgs) {
       atomic: true,
       cleanupOnFail: true,
       timeout: args.timeoutSeconds ?? 600,
-      // The chart starts its scheduler NATS with `-DV`; run it at the normal log level (#550).
-      postrender: natsPostrenderer(),
-      values: pulumi.output(watchedNamespaces).apply((hostNamespaces) =>
-        platformValues(args.values ?? {}, {
-          gateway: { enabled: false },
-          operator: { allowSharedHosts: false, hostNamespaces },
-          runtime: {
-            extraArgs: args.insecureRegistry ? ['--allow-insecure-registries'] : [],
-            resources: {
-              requests: { cpu: '250m', memory: '256Mi' },
-              limits: { memory: '2Gi' },
-              defaultHeapMemory: '512MiB',
-              coreInstances: '100',
-            },
-            hostGroups: [
-              {
-                name: 'default',
-                replicas: 1,
-                service: { type: 'ClusterIP' },
-                webgpu: { enabled: false },
-                http: { enabled: true, port: 9191 },
-              },
-            ],
-          },
-        }),
-      ),
+      // Static: the chart's operator serves only the platform namespace (design-541 §4.1), so a
+      // tenant change never restarts it. No post-renderer: the chart renders no NATS.
+      values: helmValues,
     },
     {
       provider,
+      // The server and Service `nats` first: the chart's operator and host group exit or wait
+      // until their first connect to it succeeds, within the release's atomic wait.
       dependsOn: [
         namespaceResource,
         ...(registryService ? [registryService] : []),
-        ...tenantNamespaces,
+        schedulerPki,
+        ...schedulerNats.resources,
       ],
     },
   );

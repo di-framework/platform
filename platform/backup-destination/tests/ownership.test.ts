@@ -99,7 +99,7 @@ describe('W6: the held-replicas ledger is out of tenant reach and checked anyway
       },
       spec: {},
     };
-    const roles = tenantResources(tenant, cfg, { data: { 'tls.key': 'x' } }).filter(
+    const roles = tenantResources(tenant, cfg, { digest: 'test' }).filter(
       (item) => item.kind === 'Role',
     );
     const configMapVerbs = (namespace: string) =>

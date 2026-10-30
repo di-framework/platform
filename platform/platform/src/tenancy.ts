@@ -1,5 +1,6 @@
 import * as k8s from '@pulumi/kubernetes';
 import type * as pulumi from '@pulumi/pulumi';
+import { tenantOperatorsPeer } from './platform-ingress';
 import { admissionResources } from './tenancy/admission';
 import {
   assertTenantDeclaration,
@@ -255,6 +256,8 @@ export function installTenancy(args: {
               },
               podSelector: { matchLabels: { 'wasmcloud.com/name': 'hostgroup' } },
             },
+            // Each tenant's own runtime-operator (#541 m6e).
+            tenantOperatorsPeer(installation),
           ],
           ports: [{ protocol: 'TCP', port: 4222 }],
         },

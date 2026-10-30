@@ -26,6 +26,7 @@ import {
   OWNER,
   type Resource,
   TENANT,
+  TENANT_HOST_SECRET,
   type Tenant,
   VERSION,
 } from './resources';
@@ -67,12 +68,10 @@ export interface IdentityApi {
 }
 
 /**
- * The tenant hosts' identity Secret, in `di-runtime-<t>`. The design names it `di-scheduler-tls`,
- * but until the cut-over (m6e) that name holds the controller's copy of the chart's
- * `wasmcloud-runtime-tls`, which the hosts mount; issuing into it would replace their live
- * certificate. The identity is therefore issued under its own name, which m6e mounts.
+ * The tenant hosts' identity Secret, in `di-runtime-<t>`. Not `di-scheduler-tls`, which held the
+ * controller's copy of the chart's `wasmcloud-runtime-tls` until the cut-over (m6e) deletes it.
  */
-export const TENANT_HOST_SECRET = 'di-scheduler-host-tls';
+export { TENANT_HOST_SECRET };
 /** The tenant runtime-operator's identity Secret, in `di-operator-<t>`. */
 export const TENANT_OPERATOR_SECRET = PLATFORM_SECRETS.operator;
 /** The component label on both identity Secrets; the LIST that observes them selects it. */
@@ -335,14 +334,15 @@ export class TenantSchedulerIdentities {
    * Issues, renews and rotates the tenant's identities, and returns the conditions to report:
    * {@link SCHEDULER_IDENTITY_PENDING} while issuance cannot proceed, and {@link RENEWAL_STALLED}
    * while a host renewal's rollout is not observed. Never throws: a failure becomes the pending
-   * condition, retried on the next poll.
+   * condition, retried on the next poll. With `only`, just that identity: a Tenant being removed
+   * keeps its operator's until R4 after R1 dropped its hosts' (#541 m6e).
    */
-  async reconcile(tenant: Tenant): Promise<Condition[]> {
+  async reconcile(tenant: Tenant, only?: Kind): Promise<Condition[]> {
     const name = tenant.metadata.name;
     let pending: Pending | undefined;
     let stalled: string | undefined;
     try {
-      ({ pending, stalled } = await this.issue(tenant));
+      ({ pending, stalled } = await this.issue(tenant, only));
     } catch (error) {
       pending = {
         reason: 'IssuanceFailed',
@@ -402,7 +402,10 @@ export class TenantSchedulerIdentities {
     return observeHostRollout(this.api, n.runtimeNamespace, `hostgroup-${n.hostgroup}`);
   }
 
-  private async issue(tenant: Tenant): Promise<{ pending?: Pending; stalled?: string }> {
+  private async issue(
+    tenant: Tenant,
+    only?: Kind,
+  ): Promise<{ pending?: Pending; stalled?: string }> {
     const t = tenant.metadata.name;
     const pki = schedulerPkiNamespace(this.cfg.namespace);
     // No PKI namespace: this installation has no scheduler PKI to wait for.
@@ -418,9 +421,9 @@ export class TenantSchedulerIdentities {
         },
       };
     const record: IdentityRecord = parseIdentityRecord(stored.data?.[IDENTITIES_KEY] ?? '');
-    // The operator's identity waits for `di-operator-<t>`, which the cut-over (m6e) creates.
+    // The operator's identity waits for `di-operator-<t>`, which the controller creates (m6e).
     const identities: Identity[] = [];
-    for (const identity of tenantIdentities(t))
+    for (const identity of tenantIdentities(t).filter((i) => !only || i.kind === only))
       if (
         identity.kind === 'hosts' ||
         // Only into a namespace this installation created for the Tenant, as R5 deletes it.

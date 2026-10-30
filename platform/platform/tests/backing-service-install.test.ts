@@ -187,6 +187,7 @@ describe('backing-service install', () => {
       'postgres',
       'log-projection',
       'tenant-operator-names',
+      'tenant-operator',
       'removal-sequence',
       'scheduler-pki',
       'scheduler-pki-rotation',
@@ -224,6 +225,7 @@ describe('backing-service install', () => {
       'storage-mode.js',
       'storage-records.js',
       'tenant-operator-names.js',
+      'tenant-operator.js',
       'tls.js',
       'workload-storage.js',
     ]);

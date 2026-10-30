@@ -365,7 +365,7 @@ describe('hostInterfaceAllowed edge denials', () => {
 
 describe('tenant RBAC, quotas, admission policies, and network isolation', () => {
   it('grants developers edit and viewers read for BackingService and ServiceBinding', () => {
-    const resources = tenantResources(tenant(), cfg, { data: { 'tls.key': 'private' } });
+    const resources = tenantResources(tenant(), cfg, { digest: 'test' });
     const developer = resources.find(
       (r) => r.kind === 'Role' && r.metadata.name === 'di-developer',
     ) as unknown as { rules: { apiGroups: string[]; resources: string[]; verbs: string[] }[] };
@@ -391,7 +391,7 @@ describe('tenant RBAC, quotas, admission policies, and network isolation', () =>
 
   it('makes Secrets write-only for developers and invisible to viewers (#112)', () => {
     type Rule = { apiGroups: string[]; resources: string[]; verbs: string[] };
-    const resources = tenantResources(tenant(), cfg, { data: { 'tls.key': 'private' } });
+    const resources = tenantResources(tenant(), cfg, { digest: 'test' });
     const rules = (name: string) =>
       resources
         .filter((r) => r.kind === 'Role' && r.metadata.name === name)
@@ -497,7 +497,7 @@ describe('tenant RBAC, quotas, admission policies, and network isolation', () =>
   });
 
   it('isolates backing-service pods to hostgroup ingress while retaining port-forward RBAC', () => {
-    const resources = tenantResources(tenant(), cfg, { data: { 'tls.key': 'x' } });
+    const resources = tenantResources(tenant(), cfg, { digest: 'test' });
     const backendNet = resources.find(
       (r) => r.kind === 'NetworkPolicy' && r.metadata.name === 'di-bs-backend-network',
     ) as unknown as {

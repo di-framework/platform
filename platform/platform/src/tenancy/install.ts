@@ -72,6 +72,7 @@ export const CONTROLLER_SCRIPT_MODULES = [
   'postgres',
   'log-projection',
   'tenant-operator-names',
+  'tenant-operator',
   'removal-sequence',
   'scheduler-pki',
   'scheduler-pki-rotation',

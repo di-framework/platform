@@ -2,14 +2,14 @@
  * The platform-owned scheduler NATS server (#541 m6b, design-541 §4.1-4.4).
  *
  * {@link schedulerNatsServerResources} renders the manifests that replace the runtime-operator
- * chart's `nats` server at the cut-over (m6e); nothing installs them yet:
+ * chart's `nats` server; `createPlatform` installs them before the Helm release (m6e):
  *
  * - ConfigMap {@link SCHEDULER_NATS_CONFIG}: the static `nats-server.conf`, which includes
  *   `accounts.conf` from the ConfigMap `di-scheduler-nats-accounts` (m2, written by the platform
  *   controller only), serves TLS from the server Secret `di-scheduler-nats-tls` (m1) with
  *   `verify_and_map`, and enables JetStream at server level, which only the `DATA` account uses
  *   (O5). No debug or trace logging (#550).
- * - Deployment `nats`: the chart's workload (one replica, port 4222, probes, security contexts,
+ * - Deployment `di-scheduler-nats`: the chart's workload (one replica, port 4222, probes, security contexts,
  *   resources, JetStream `emptyDir`) plus the upstream config reloader in a shared process
  *   namespace, which signals the server when the config, the accounts file or the certificate
  *   changes. Both images are pinned by digest.
@@ -29,8 +29,13 @@ export const SCHEDULER_NATS_IMAGE =
 export const SCHEDULER_NATS_RELOADER_IMAGE =
   'docker.io/natsio/nats-server-config-reloader:0.24.0@sha256:d758a82a9c20337e46c2f7356a413faa52cf4d6b02497c3ad81f72f1ba106464';
 
-/** The name of the chart's server Deployment and Service, and its pod label value. */
+/** The name of the chart's server Service, and its pod label value. */
 export const SCHEDULER_NATS_NAME = 'nats';
+/**
+ * The platform's server Deployment. Not the chart's `nats`, so it never collides with the chart's
+ * Deployment while an upgrade hands the server over (m6e).
+ */
+export const SCHEDULER_NATS_DEPLOYMENT = 'di-scheduler-nats';
 /** The ConfigMap holding the static `nats-server.conf`. */
 export const SCHEDULER_NATS_CONFIG = 'di-scheduler-nats';
 export const SCHEDULER_NATS_SERVICE_ACCOUNT = 'di-scheduler-nats';
@@ -150,7 +155,7 @@ export function schedulerNatsServerResources(cfg: SchedulerNatsServerConfig): Ma
     {
       apiVersion: 'apps/v1',
       kind: 'Deployment',
-      metadata: metadata(SCHEDULER_NATS_NAME),
+      metadata: metadata(SCHEDULER_NATS_DEPLOYMENT),
       spec: {
         replicas: 1,
         selector: { matchLabels: selector },

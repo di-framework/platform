@@ -22,6 +22,7 @@ import {
   registryNatsAuthDigest,
   registryNatsSecretData,
 } from './registry-nats';
+import { SCHEDULER_TLS_ANNOTATION } from './scheduler-pki-rotation';
 import {
   STORAGE_INTEGRITY_MODES,
   STORAGE_RECORD_LIMIT,
@@ -737,6 +738,16 @@ const GATEWAY_POD_LABELS = { app: GATEWAY_NAME };
 const ROUTES_CONFIG_NAME = 'di-platform-routes';
 const GROUP = 'platform.di-framework.dev';
 const VERSION = `${GROUP}/v1alpha1`;
+/**
+ * The tenant hosts' scheduler identity Secret in `di-runtime-<t>`, issued by the controller
+ * (#541 m6c) and mounted by the host group (m6e).
+ */
+export const TENANT_HOST_SECRET = 'di-scheduler-host-tls';
+/**
+ * The controller's copy of the chart's `wasmcloud-runtime-tls` that host groups mounted before
+ * #541 m6e. The controller deletes it once no pod mounts it.
+ */
+export const SCHEDULER_TLS_COPY = 'di-scheduler-tls';
 /** The host template annotation carrying the digest of the tenant CA the hosts trust. */
 export const REGISTRY_CA_ANNOTATION = `${GROUP}/registry-ca-sha256`;
 const INSTALLATION = `${GROUP}/installation`;
@@ -1120,7 +1131,11 @@ function tenantNetworkEgress(tenant: string, cfg: ControllerConfig): unknown[] {
 function tenantResources(
   tenant: Tenant,
   cfg: ControllerConfig,
-  schedulerSecret?: { data: Record<string, string> },
+  /**
+   * The digest of the hosts' current scheduler certificate (`schedulerCertDigest` of
+   * {@link TENANT_HOST_SECRET}'s `tls.crt`); absent, no host group is rendered (#541 m6e).
+   */
+  schedulerTls?: { digest: string },
   storageKeys: string[] = [],
   tenantAuthQuota = false,
   registryQuota = false,
@@ -1479,13 +1494,7 @@ function tenantResources(
       }),
     );
   }
-  if (schedulerSecret) {
-    result.push(
-      make('v1', 'Secret', 'di-scheduler-tls', n.runtimeNamespace, {
-        type: 'Opaque',
-        data: schedulerSecret.data,
-      }),
-    );
+  if (schedulerTls) {
     result.push(
       make('apps/v1', 'Deployment', `hostgroup-${n.hostgroup}`, n.runtimeNamespace, {
         spec: {
@@ -1509,18 +1518,15 @@ function tenantResources(
           template: {
             metadata: {
               labels: { 'wasmcloud.com/hostgroup': n.hostgroup, 'wasmcloud.com/name': 'hostgroup' },
-              ...(hostPull?.caDigest || registryAuth
-                ? {
-                    annotations: {
-                      ...(hostPull?.caDigest
-                        ? { [REGISTRY_CA_ANNOTATION]: hostPull.caDigest }
-                        : {}),
-                      // A rotated registry password rolls the hosts (#159): the registry's pooled
-                      // blobstore connection would reconnect with the password it read at first.
-                      ...(registryAuth ? { [REGISTRY_NATS_AUTH_ANNOTATION]: registryAuth } : {}),
-                    },
-                  }
-                : {}),
+              annotations: {
+                // A new scheduler certificate rolls the hosts, which the identity record observes
+                // before it drops the previous user (#541 m4/m6e).
+                [SCHEDULER_TLS_ANNOTATION]: schedulerTls.digest,
+                ...(hostPull?.caDigest ? { [REGISTRY_CA_ANNOTATION]: hostPull.caDigest } : {}),
+                // A rotated registry password rolls the hosts (#159): the registry's pooled
+                // blobstore connection would reconnect with the password it read at first.
+                ...(registryAuth ? { [REGISTRY_NATS_AUTH_ANNOTATION]: registryAuth } : {}),
+              },
             },
             spec: {
               serviceAccountName: 'di-runtime',
@@ -1630,7 +1636,7 @@ function tenantResources(
                 },
               ],
               volumes: [
-                { name: 'scheduler', secret: { secretName: 'di-scheduler-tls' } },
+                { name: 'scheduler', secret: { secretName: TENANT_HOST_SECRET } },
                 { name: 'tmp', emptyDir: {} },
                 { name: 'cache', emptyDir: {} },
                 ...(hostPull

@@ -7,7 +7,7 @@ import {
   platformIngressPolicies,
   RUNTIME_OPERATOR_SERVICE_PORT,
 } from '../src/platform-ingress';
-import { INSTALLATION, TENANT } from '../src/tenancy/resources';
+import { INSTALLATION, NAMESPACE_ROLE, TENANT } from '../src/tenancy/resources';
 
 const root = join(import.meta.dir, '..');
 
@@ -35,6 +35,8 @@ function renderPolicies(httpNodePort: number): Policy[] {
     pulumi.runtime.runInPulumiStack(async () => {
       const platform = require('./dist').createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', httpNodePort:${httpNodePort} });
       await platform.namespace.promise();
+      // The policies follow the release, which now waits for the scheduler NATS (#541 m6e).
+      await platform.release.urn.promise();
       const sentinel = new k8s.core.v1.Namespace('sentinel', {}, { provider: new k8s.Provider('sentinel-provider', {}) });
       await new Promise(r => sentinel.urn.apply(r));
     }).then(() => {
@@ -86,6 +88,14 @@ describe('platform namespace ingress (#462)', () => {
             {
               namespaceSelector: tenantNamespaces,
               podSelector: { matchLabels: { 'wasmcloud.com/name': 'hostgroup' } },
+            },
+            // Each tenant's own runtime-operator (#541 m6e, design-541 §4.6).
+            {
+              namespaceSelector: {
+                matchLabels: { [INSTALLATION]: 'di-test', [NAMESPACE_ROLE]: 'operator' },
+                matchExpressions: [{ key: TENANT, operator: 'Exists' }],
+              },
+              podSelector: { matchLabels: { 'wasmcloud.com/name': 'runtime-operator' } },
             },
           ],
           ports: [{ protocol: 'TCP', port: 4222 }],
