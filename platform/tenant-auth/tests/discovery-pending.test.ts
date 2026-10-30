@@ -2,9 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { dump } from 'js-yaml';
 import { Controller, configFromEnv } from '../src/controller.ts';
-import { type FakeServer, json, serve } from './support/servers.ts';
+import { type FakeServer, json, serve, writeKubeconfig } from './support/servers.ts';
 
 /** Polls until `condition` holds; fails the test (by throwing) after `timeoutMs`. */
 async function eventually(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
@@ -50,15 +49,7 @@ describe('Controller.start with the issuer unreachable at first', () => {
     });
     api = serve(() => json({}));
     dir = mkdtempSync(join(tmpdir(), 'discovery-pending-'));
-    writeFileSync(
-      join(dir, 'kubeconfig'),
-      dump({
-        'current-context': 'x',
-        contexts: [{ name: 'x', context: { cluster: 'c', user: 'u' } }],
-        clusters: [{ name: 'c', cluster: { server: api.url } }],
-        users: [{ name: 'u', user: { token: 't' } }],
-      }),
-    );
+    writeKubeconfig(join(dir, 'kubeconfig'), api.url);
     writeFileSync(join(dir, 'host-pull'), HOST_PULL);
 
     const began = performance.now();

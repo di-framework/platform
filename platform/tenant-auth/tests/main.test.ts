@@ -2,11 +2,10 @@ import { afterAll, beforeAll, describe, expect, type Mock, spyOn, test } from 'b
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { dump } from 'js-yaml';
 import { caCertificate, leafCertificate } from '../../platform/src/tenancy/tls.ts';
 import { configFromEnv as consoleConfig, main as consoleMain } from '../src/console.ts';
 import { configFromEnv as controllerConfig, main as controllerMain } from '../src/controller.ts';
-import { type FakeServer, json, serve } from './support/servers.ts';
+import { type FakeServer, json, serve, writeKubeconfig } from './support/servers.ts';
 
 /**
  * A TCP port that was free a moment ago, for the optional listeners, where `0` means "disabled".
@@ -48,15 +47,7 @@ describe('controller main', () => {
   beforeAll(async () => {
     api = serve(() => json({}));
     dir = mkdtempSync(join(tmpdir(), 'controller-main-'));
-    writeFileSync(
-      join(dir, 'kubeconfig'),
-      dump({
-        'current-context': 'x',
-        contexts: [{ name: 'x', context: { cluster: 'c', user: 'u' } }],
-        clusters: [{ name: 'c', cluster: { server: api.url } }],
-        users: [{ name: 'u', user: { token: 't' } }],
-      }),
-    );
+    writeKubeconfig(join(dir, 'kubeconfig'), api.url);
     const ca = caCertificate('controller-main test CA', 1);
     const leaf = leafCertificate('localhost', ['localhost'], ['127.0.0.1'], 1, ca.cert, ca.key);
     writeFileSync(join(dir, 'tls.crt'), leaf.cert);
