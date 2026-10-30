@@ -192,11 +192,22 @@ describe('tenant-auth configuration', () => {
     const cluster = rules.filter(
       (r) => r.resources.includes('clusterroles') || r.resources.includes('clusterrolebindings'),
     );
-    expect(cluster).toHaveLength(1);
-    expect(cluster[0]?.resources).toEqual(['clusterroles', 'clusterrolebindings']);
-    expect(cluster[0]?.verbs).toEqual(['get', 'list', 'create', 'patch', 'delete']);
-    // Never cluster-admin by proxy: no rule lets it bind or escalate cluster-scoped roles.
-    for (const verb of ['bind', 'escalate']) expect(cluster[0]?.verbs).not.toContain(verb);
+    expect(cluster).toHaveLength(2);
+    expect(cluster[1]?.resources).toEqual(['clusterroles', 'clusterrolebindings']);
+    expect(cluster[1]?.verbs).toEqual(['get', 'list', 'create', 'patch', 'delete']);
+    // Never cluster-admin by proxy: no escalate, and `bind` on ClusterRoles only for the three
+    // tenant-operator ClusterRoles, by name (#541 m3).
+    for (const verb of ['bind', 'escalate']) expect(cluster[1]?.verbs).not.toContain(verb);
+    expect(cluster[0]).toEqual({
+      apiGroups: ['rbac.authorization.k8s.io'],
+      resources: ['clusterroles'],
+      verbs: ['bind'],
+      resourceNames: [
+        'di-tenant-operator-self',
+        'di-tenant-operator-workloads',
+        'di-tenant-operator-hosts',
+      ],
+    });
     // Nor namespaced ones (#115): no escalate, and bind only on named Roles.
     expect(rules.flatMap((r) => r.verbs)).not.toContain('escalate');
     for (const rule of rules.filter((r) => r.verbs.includes('bind')))

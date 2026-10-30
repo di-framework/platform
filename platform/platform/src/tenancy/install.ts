@@ -15,6 +15,7 @@ import {
   VERSION,
   validName,
 } from './resources';
+import { TENANT_OPERATOR_CLUSTER_ROLES } from './tenant-operator';
 
 /** One `tenants` Pulumi config entry, for example `{ name: identity, runtime: { coreInstances: 300 } }`. */
 export interface TenantDeclaration extends TenantSpec {
@@ -263,6 +264,15 @@ export function controllerClusterRoleRules(): ControllerClusterRoleRule[] {
       resources: ['roles'],
       verbs: ['bind'],
       resourceNames: [...CONTROLLER_BOUND_ROLES],
+    },
+    // Each tenant operator's RoleBindings to the three fixed tenant-operator ClusterRoles
+    // (#541, design-541 §4.6). The controller holds none of their rules, so it may bind exactly
+    // these names; still no `escalate`.
+    {
+      apiGroups: ['rbac.authorization.k8s.io'],
+      resources: ['clusterroles'],
+      verbs: ['bind'],
+      resourceNames: Object.values(TENANT_OPERATOR_CLUSTER_ROLES),
     },
     // Each tenant controller's `di-tenant-controller-<t>` ClusterRole and its binding (#58). The
     // controller already holds every permission they grant, so it needs no bind or escalate.

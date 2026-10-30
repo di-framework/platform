@@ -25,6 +25,11 @@ import {
   userResources,
   VERSION,
 } from '../src/tenancy/resources';
+import {
+  TENANT_OPERATOR_CLUSTER_ROLES,
+  tenantOperatorClusterRoles,
+  tenantOperatorResources,
+} from '../src/tenancy/tenant-operator';
 import { caCertificate, leafCertificate } from '../src/tenancy/tls';
 
 // #115: the platform controller writes tenant RBAC without `escalate` and binds only named Roles.
@@ -97,6 +102,8 @@ function rendered(names: string[]): Resource[] {
       ...tenantAuthResources(t, cfg, inputs),
       // While API keys are still being moved out of the runtime namespace (#379).
       ...tenantAuthResources(t, cfg, { ...inputs, legacyApiKeys: true }),
+      // The tenant operator's bindings (#541 m3); Pulumi installs the ClusterRoles they refer to.
+      ...tenantOperatorResources(t, { ...cfg, apiServer: inputs.apiServer }),
     ]),
     ...users.flatMap((u) => userResources(u, tenants, cfg)),
   ].filter((r) => r.apiVersion.startsWith(`${RBAC_GROUP}/`));
@@ -196,21 +203,38 @@ describe('platform controller RBAC (#115)', () => {
   it('lists every fixed-name Role it binds, and nothing else, in bind resourceNames', () => {
     const fixed = fixedNameBindings(objects);
     expect(fixed.size).toBeGreaterThan(0);
-    // Fixed-name bindings all refer to Roles (no cluster-wide bind on ClusterRoles).
-    expect([...fixed].every((ref) => ref.startsWith('Role/'))).toBe(true);
-    const names = bindNames();
-    expect(new Set(names)).toEqual(new Set([...fixed].map((ref) => ref.slice('Role/'.length))));
+    // Fixed-name bindings refer to Roles, or to the three tenant-operator ClusterRoles (#541).
+    const operatorRoles = Object.values(TENANT_OPERATOR_CLUSTER_ROLES);
     expect(
-      controllerClusterRoleRules().some(
-        (r) => r.verbs.includes('bind') && !r.resources.every((x) => x === 'roles'),
+      [...fixed].every(
+        (ref) =>
+          ref.startsWith('Role/') ||
+          operatorRoles.includes(ref.slice('ClusterRole/'.length) as never),
       ),
-    ).toBe(false);
+    ).toBe(true);
+    const names = bindNames();
+    expect(new Set(names)).toEqual(
+      new Set([...fixed].map((ref) => ref.slice(ref.indexOf('/') + 1))),
+    );
+    const binds = controllerClusterRoleRules().filter((r) => r.verbs.includes('bind'));
+    expect(binds.filter((r) => !r.resources.every((x) => x === 'roles'))).toEqual([
+      {
+        apiGroups: [RBAC_GROUP],
+        resources: ['clusterroles'],
+        verbs: ['bind'],
+        resourceNames: operatorRoles,
+      },
+    ]);
   });
 
   it('may create every binding it renders', () => {
     for (const binding of bindings) {
       const ref = roleRefOf(binding);
-      const target = referenced(objects, binding);
+      // Pulumi installs the tenant-operator ClusterRoles; the controller only binds them.
+      const target = referenced(
+        [...objects, ...tenantOperatorClusterRoles(cfg.installation)],
+        binding,
+      );
       expect(target, `${binding.kind} ${binding.metadata.name}`).toBeDefined();
       const resource = ref.kind === 'Role' ? 'roles' : 'clusterroles';
       const namespace = binding.kind === 'RoleBinding' ? binding.metadata.namespace : undefined;
