@@ -80,10 +80,12 @@ export const SCHEDULER_IDENTITY_COMPONENT = 'scheduler-identity';
 /** The Tenant condition set while an identity cannot be issued (the CA is not ready, or a write failed). */
 export const SCHEDULER_IDENTITY_PENDING = 'SchedulerIdentityPending';
 
-/** What the controller keeps in Tenant status: the rotation annotation value last handled. */
-export interface SchedulerIdentityStatus {
-  rotation: string;
-}
+/**
+ * What the controller keeps in Tenant status: per identity kind, the rotation annotation value
+ * last handled. Per kind, because an identity out of scope when the rotation is requested (the
+ * operator's, before `di-operator-<t>` exists) must still be rotated once it comes into scope.
+ */
+export type SchedulerIdentityStatus = Partial<Record<Kind, string>>;
 
 type Kind = 'hosts' | 'operator';
 interface Identity {
@@ -164,9 +166,9 @@ export class TenantSchedulerIdentities {
   /** The pending state last logged per tenant, so each change is logged once. */
   private readonly logged = new Map<string, string>();
   /**
-   * Per tenant, a rotation whose handled value the API server did not keep in status (a Tenant CRD
-   * older than this controller prunes it). It is treated as handled, so it is not repeated on every
-   * poll.
+   * Per `<tenant>/<kind>`, a rotation whose handled value the API server did not keep in status (a
+   * Tenant CRD older than this controller prunes it). It is treated as handled, so it is not
+   * repeated on every poll.
    */
   private readonly unpersisted = new Map<string, string>();
   constructor(
@@ -188,8 +190,8 @@ export class TenantSchedulerIdentities {
   /** Drops the in-memory state of tenants no longer listed. */
   forget(listed: ReadonlySet<string>): void {
     for (const name of this.logged.keys()) if (!listed.has(name)) this.logged.delete(name);
-    for (const name of this.unpersisted.keys())
-      if (!listed.has(name)) this.unpersisted.delete(name);
+    for (const key of this.unpersisted.keys())
+      if (!listed.has(key.slice(0, key.lastIndexOf('/')))) this.unpersisted.delete(key);
   }
 
   /**
@@ -361,16 +363,22 @@ export class TenantSchedulerIdentities {
       )
     ).items;
     const rotation = tenant.metadata.annotations?.[ROTATE_ANNOTATION] ?? '';
-    const handled = (value: Tenant | undefined) =>
-      (value?.status?.schedulerIdentity as SchedulerIdentityStatus | undefined)?.rotation;
-    // A Tenant from a stale LIST may lack the rotation already handled, so a requested rotation is
-    // confirmed against a fresh read before it draws new IDs.
-    const requested =
-      this.unpersisted.get(t) !== rotation && rotationRequested(rotation, handled(tenant));
-    const current = requested
-      ? await this.get<Tenant>(`/apis/${VERSION}/tenants/${encodeURIComponent(t)}`)
-      : undefined;
-    const forced = requested && rotationRequested(rotation, handled(current));
+    const handled = (value: Tenant | undefined, kind: Kind) =>
+      (value?.status?.schedulerIdentity as SchedulerIdentityStatus | undefined)?.[kind];
+    const unpersisted = (kind: Kind) => this.unpersisted.get(`${t}/${kind}`) === rotation;
+    // Only identities in scope are rotated and marked handled, each kind on its own. A Tenant from
+    // a stale LIST may lack the rotation already handled, so a requested rotation is confirmed
+    // against a fresh read before it draws new IDs.
+    const requested = identities
+      .map((identity) => identity.kind)
+      .filter((kind) => !unpersisted(kind) && rotationRequested(rotation, handled(tenant, kind)));
+    const current =
+      requested.length > 0
+        ? await this.get<Tenant>(`/apis/${VERSION}/tenants/${encodeURIComponent(t)}`)
+        : undefined;
+    const forcedKinds = requested.filter((kind) =>
+      rotationRequested(rotation, handled(current, kind)),
+    );
     const observed: Record<string, IdentityObservation> = {};
     for (const identity of identities) {
       const secret = listed.find(
@@ -378,7 +386,7 @@ export class TenantSchedulerIdentities {
       );
       observed[identity.key] = {
         ...this.observe(identity, secret, cas, identity.kind === 'hosts' ? hosts : undefined),
-        ...(forced ? { forced } : {}),
+        ...(forcedKinds.includes(identity.kind) ? { forced: true } : {}),
       };
     }
     let next = recordTransition(record, observed, this.now(), this.random);
@@ -401,7 +409,7 @@ export class TenantSchedulerIdentities {
         fresh.set(identity.key, secret);
         observed[identity.key] = {
           ...this.observe(identity, secret, cas, identity.kind === 'hosts' ? hosts : undefined),
-          ...(forced ? { forced } : {}),
+          ...(forcedKinds.includes(identity.kind) ? { forced: true } : {}),
         };
       }
       next = recordTransition(record, observed, this.now(), this.random);
@@ -416,20 +424,29 @@ export class TenantSchedulerIdentities {
         data: { ...stored.data, [IDENTITIES_KEY]: text },
       });
     // After the record and before issuance, so an interrupted forced rotation repeats at most once.
-    if (forced) {
+    if (forcedKinds.length > 0) {
+      // The kinds already handled are sent too, so the write never depends on a deep merge.
+      const marked = {
+        ...(current?.status?.schedulerIdentity as SchedulerIdentityStatus | undefined),
+        ...Object.fromEntries(forcedKinds.map((kind) => [kind, rotation])),
+      };
       const updated = await this.api.call<Tenant>(
         'PATCH',
         `/apis/${VERSION}/tenants/${encodeURIComponent(t)}/status`,
         {
           // The fresh read's, so a stale LIST does not make this write conflict.
           metadata: { resourceVersion: current?.metadata.resourceVersion },
-          status: { schedulerIdentity: { rotation } },
+          status: { schedulerIdentity: marked },
         },
         'application/merge-patch+json',
       );
       tenant.metadata = updated.metadata;
-      tenant.status = { ...tenant.status, schedulerIdentity: { rotation } };
-      if (handled(updated) !== rotation) this.unpersisted.set(t, rotation);
+      tenant.status = {
+        ...tenant.status,
+        schedulerIdentity: { ...(tenant.status?.schedulerIdentity as object), ...marked },
+      };
+      for (const kind of forcedKinds)
+        if (handled(updated, kind) !== rotation) this.unpersisted.set(`${t}/${kind}`, rotation);
     }
     for (const identity of identities) {
       if (!issuing().includes(identity.key)) continue;
@@ -470,11 +487,11 @@ export class TenantSchedulerIdentities {
     }
     return {
       ...(next.stalled.length > 0 ? { stalled: hosts.deployment } : {}),
-      ...(this.unpersisted.get(t) === rotation
+      ...(identities.some((identity) => unpersisted(identity.kind))
         ? {
             pending: {
               reason: 'RotationNotPersisted',
-              message: `The API server did not keep status.schedulerIdentity.rotation, so the Tenant CRD may predate this controller; the rotation was applied once and is not repeated`,
+              message: `The API server did not keep status.schedulerIdentity, so the Tenant CRD may predate this controller; the rotation was applied once and is not repeated`,
             },
           }
         : {}),

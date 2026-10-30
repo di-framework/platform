@@ -450,8 +450,11 @@ describe('tenant scheduler identity issuance (#541 m6c)', () => {
       expect(after[key]?.current).not.toBe(before[key]?.current as string);
       expect(after[key]?.previous).toBeUndefined();
     }
-    expect(t.status?.schedulerIdentity).toEqual({ rotation: 'r1' });
-    expect(api.objects.get(tenantPath)?.status?.schedulerIdentity).toEqual({ rotation: 'r1' });
+    expect(t.status?.schedulerIdentity).toEqual({ hosts: 'r1', operator: 'r1' });
+    expect(api.objects.get(tenantPath)?.status?.schedulerIdentity).toEqual({
+      hosts: 'r1',
+      operator: 'r1',
+    });
     // Handled: later polls write nothing.
     api.calls.length = 0;
     for (let i = 0; i < 3; i++) await identities.reconcile(t);
@@ -462,7 +465,7 @@ describe('tenant scheduler identity issuance (#541 m6c)', () => {
     const { api, identities } = await cluster();
     await identities.reconcile(tenant());
     const stored = api.objects.get(tenantPath) as Stored;
-    api.objects.set(tenantPath, { ...stored, status: { schedulerIdentity: { rotation: 'r1' } } });
+    api.objects.set(tenantPath, { ...stored, status: { schedulerIdentity: { hosts: 'r1' } } });
     api.calls.length = 0;
     await identities.reconcile(tenant({ [ROTATE_ANNOTATION]: 'r1' }));
     expect(api.writes()).toEqual([]);
@@ -598,6 +601,55 @@ describe('tenant scheduler identity issuance (#541 m6c)', () => {
     expect(api.writes()).toContain(`PATCH ${tenantPath}/status`);
   });
 
+  it('rotates the operator once di-operator-<t> comes into scope after the rotation was requested', async () => {
+    const { api, identities } = await cluster({ operatorNamespace: true });
+    await identities.reconcile(tenant());
+    const before = api.record();
+    // The operator namespace drops out of scope (here: it loses this installation's labels).
+    const ns = api.objects.get(nsPath(OPERATOR_NS)) as Stored;
+    const owned = ns.metadata.labels;
+    ns.metadata.labels = {};
+    const latest = () => {
+      const t = tenant({ [ROTATE_ANNOTATION]: 'r1' });
+      const live = api.objects.get(tenantPath) as unknown as Tenant;
+      t.metadata.resourceVersion = live.metadata.resourceVersion;
+      t.status = live.status;
+      return t;
+    };
+    api.seed(tenantPath, tenant({ [ROTATE_ANNOTATION]: 'r1' }) as unknown as Stored);
+    await identities.reconcile(latest());
+    const hostsRotated = api.record()['tenant/alpha/hosts']?.current;
+    expect(hostsRotated).not.toBe(before['tenant/alpha/hosts']?.current as string);
+    expect(api.record()['tenant/alpha/operator']).toEqual(before['tenant/alpha/operator'] as never);
+    expect(api.objects.get(tenantPath)?.status?.schedulerIdentity).toEqual({ hosts: 'r1' });
+    // While it stays out of scope, nothing more happens.
+    api.calls.length = 0;
+    await identities.reconcile(latest());
+    expect(api.writes()).toEqual([]);
+    // Back in scope: the operator is rotated, once; the hosts are not rotated again.
+    ns.metadata.labels = owned;
+    api.calls.length = 0;
+    await identities.reconcile(latest());
+    expect(api.writes()).toEqual([
+      `PUT ${recordPath}`,
+      `PATCH ${tenantPath}/status`,
+      `PUT ${operatorPath}`,
+    ]);
+    const after = api.record();
+    expect(after['tenant/alpha/operator']?.current).not.toBe(
+      before['tenant/alpha/operator']?.current as string,
+    );
+    expect(after['tenant/alpha/operator']?.previous).toBeUndefined();
+    expect(after['tenant/alpha/hosts']?.current).toBe(hostsRotated as string);
+    expect(api.objects.get(tenantPath)?.status?.schedulerIdentity).toEqual({
+      hosts: 'r1',
+      operator: 'r1',
+    });
+    api.calls.length = 0;
+    for (let i = 0; i < 3; i++) await identities.reconcile(latest());
+    expect(api.writes()).toEqual([]);
+  });
+
   it('sends the fresh Tenant resourceVersion with the rotation, so a stale LIST does not conflict', async () => {
     const { api, identities } = await cluster();
     await identities.reconcile(tenant());
@@ -605,7 +657,7 @@ describe('tenant scheduler identity issuance (#541 m6c)', () => {
     const stale = tenant({ [ROTATE_ANNOTATION]: 'r1' });
     stale.metadata.resourceVersion = '0';
     expect(await identities.reconcile(stale)).toEqual([]);
-    expect(api.objects.get(tenantPath)?.status?.schedulerIdentity).toEqual({ rotation: 'r1' });
+    expect(api.objects.get(tenantPath)?.status?.schedulerIdentity).toEqual({ hosts: 'r1' });
   });
 
   it('refuses to issue over a Secret it did not write', async () => {

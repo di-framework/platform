@@ -253,12 +253,12 @@ describe('controller tick: tenant scheduler identities (#541 m6c)', () => {
     t.metadata.annotations = { 'platform.di-framework.dev/rotate-scheduler-identity': 'r1' };
     api.seed(t);
     await controller.tick();
-    expect(stored(api).status?.schedulerIdentity).toEqual({ rotation: 'r1' });
+    expect(stored(api).status?.schedulerIdentity).toEqual({ hosts: 'r1' });
     await controller.tick();
     api.operations.length = 0;
     for (let i = 0; i < 3; i++) await controller.tick();
     expect(api.identityWrites()).toEqual([]);
-    expect(stored(api).status?.schedulerIdentity).toEqual({ rotation: 'r1' });
+    expect(stored(api).status?.schedulerIdentity).toEqual({ hosts: 'r1' });
     // Every status the controller writes after the rotation carries the handled value.
     const statusWrites = api.operations.filter(
       (o) => o.method === 'PATCH' && o.path === `${tenantPath}/status`,
@@ -266,7 +266,7 @@ describe('controller tick: tenant scheduler identities (#541 m6c)', () => {
     expect(statusWrites.length).toBeGreaterThan(0);
     for (const write of statusWrites)
       expect((write.body as { status: Record<string, unknown> }).status.schedulerIdentity).toEqual({
-        rotation: 'r1',
+        hosts: 'r1',
       });
   });
 
