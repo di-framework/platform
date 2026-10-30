@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { Container as CoreContainer } from '@di-framework/core/container';
+import { Container as CoreContainer, useContainer } from '@di-framework/core/container';
 import { Container } from '@di-framework/core/decorators';
 import {
   bindCloudflareBindings,
@@ -16,6 +16,7 @@ import {
   resetCloudflareBindings,
   setCloudflareBindings,
 } from '../src/environment.ts';
+import { BindingClassifierRegistry } from '../src/spi/registry.ts';
 import type { CloudflareBindingInfo, D1BindingInfo, KvBindingInfo } from '../src/types.ts';
 
 const fn = () => undefined;
@@ -231,5 +232,31 @@ describe('bindCloudflareBindings and decorators', () => {
       else process.env.CLOUDFLARE_BINDINGS = original;
       resetCloudflareBindings();
     }
+  });
+});
+
+describe('option forwarding and global container', () => {
+  it('classifies lookups with the registry passed in options', () => {
+    const viaDefaults = lookupCloudflareBinding('SESSIONS', { bindings: { SESSIONS: sessions } });
+    expect((viaDefaults as CloudflareBindingInfo).kind).toBe('kv');
+
+    const viaEmpty = lookupCloudflareBinding('SESSIONS', {
+      bindings: { SESSIONS: sessions },
+      registry: new BindingClassifierRegistry(false),
+    }) as CloudflareBindingInfo;
+    expect(viaEmpty.kind).toBe('unknown');
+    expect(viaEmpty.binding).toBe(sessions);
+  });
+
+  it('resolves property bindings from the global container when none is given', () => {
+    const sentinel: CloudflareBindingInfo = { name: 'GLOBAL_ONLY', kind: 'kv', binding: sessions };
+    useContainer().registerFactory(cloudflareBindingToken('GLOBAL_ONLY'), () => sentinel);
+
+    class GlobalConsumer {
+      @CloudflareBinding('GLOBAL_ONLY', { bindings: {} })
+      kv!: CloudflareBindingInfo;
+    }
+
+    expect(new GlobalConsumer().kv).toBe(sentinel);
   });
 });
