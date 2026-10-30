@@ -83,7 +83,7 @@ jobs:
         if: steps.changes.outputs.run == 'true'
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: '1.4.3'
+          bun-version: '1.4.4'
 
       # The package step gzips with Node's zlib, so its sha256 depends on the Node version: pin it.
       - name: Setup Node
@@ -161,7 +161,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: '1.4.3'
+          bun-version: '1.4.4'
 
       - name: Install SQLite build toolchain
         run: |
@@ -293,7 +293,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: '1.4.3'
+          bun-version: '1.4.4'
 
       - name: Install SQLite build toolchain
         run: |
@@ -350,7 +350,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: '1.4.3'
+          bun-version: '1.4.4'
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -377,7 +377,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: '1.4.3'
+          bun-version: '1.4.4'
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
