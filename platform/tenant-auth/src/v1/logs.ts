@@ -252,7 +252,10 @@ export function listEvents(list: ConfigMapList): ProjectedLogEvent[] {
   return items.flatMap((configMap) => logEvents(configMap, moved)).sort(byTime);
 }
 
-/** Resolves after `ms`, or as soon as the signal aborts; its caller checks `aborted` first. */
+/**
+ * Resolves after `ms`, or as soon as the signal aborts. The caller checks `aborted` first: a
+ * signal that is already aborted never fires `abort`, so this then waits out the full `ms`.
+ */
 const sleep = (ms: number, signal: AbortSignal) =>
   new Promise<void>((resolve) => {
     const onAbort = () => {
