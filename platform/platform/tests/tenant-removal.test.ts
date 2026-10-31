@@ -4,6 +4,7 @@ import { controllerClusterRoleRules } from '../src/tenancy/install';
 import {
   bindsTenantOperatorRole,
   isTenantOperatorBinding,
+  OPERATOR_FINALIZERS,
   REMOVAL_STEP_ANNOTATION,
   REMOVAL_STEP_DEADLINE_MS,
   REMOVAL_STEPS,
@@ -26,11 +27,20 @@ import {
   VERSION,
 } from '../src/tenancy/resources';
 import {
+  ACCOUNTS_KEY,
+  accountsNamesTenantAccount,
+  accountsNamesTenantHost,
+  renderSchedulerAccounts,
+  SCHEDULER_NATS_ACCOUNTS,
+} from '../src/tenancy/scheduler-nats';
+import type { IdentityRecord } from '../src/tenancy/scheduler-pki';
+import {
   operatorNamespace,
   TENANT_OPERATOR_CLUSTER_ROLES,
   TENANT_OPERATOR_COMPONENT,
   tenantOperatorResources,
 } from '../src/tenancy/tenant-operator';
+import { GOLDEN_IDS } from './support/scheduler-accounts';
 
 // #541 m5: the removal sequence R1-R7, the R2 sweep exclusion, S1 and S2 (design-541 §4.5, §8.1).
 
@@ -52,6 +62,7 @@ const operatorObjects = (t: Tenant): Resource[] => {
   return rendered.resources;
 };
 const WASMCLOUD = 'runtime.wasmcloud.dev/v1alpha1';
+const [WORKLOAD_FINALIZER, ARTIFACT_FINALIZER] = OPERATOR_FINALIZERS as [string, string];
 const START = new Date('2026-10-29T00:00:00Z');
 
 function tenant(name = 'alpha'): Tenant {
@@ -209,6 +220,8 @@ async function prepare(policy: 'Retain' | 'Delete' = 'Retain') {
   };
 }
 const condition = (t: Tenant, type: string) => t.status?.conditions?.find((c) => c.type === type);
+const replicas = (api: FakeApi, deployment: Resource) =>
+  (api.objects.get(key(deployment))!.spec as { replicas: number }).replicas;
 const tenantNamespaces = (t = 'alpha') => {
   const n = names(t);
   return [n.namespace, n.runtimeNamespace, n.apiKeysNamespace].map(
@@ -552,16 +565,137 @@ describe('Tenant removal R1-R7 (#541 m5)', () => {
     expect(t.metadata.finalizers ?? []).not.toContain(FINALIZER);
   });
 
-  it("Retain R3: m5 keeps today's path and leaves workload objects alone", async () => {
-    const { api, t, deleting, drain, deletes } = await prepare('Retain');
-    const wd = wasmcloud('WorkloadDeployment', 'app', ['runtime.wasmcloud.dev/finalizer']);
-    const held = wasmcloud('Workload', 'app-x', ['runtime.wasmcloud.dev/finalizer']);
-    for (const v of [wd, held]) api.seed(v);
+  it('Retain R3: scales the operator to zero, waits for its pod, then removes only the operator finalizers', async () => {
+    const { api, t, operatorDeployment, deleting, reconcile, drain, deletes } =
+      await prepare('Retain');
+    const wd = wasmcloud('WorkloadDeployment', 'app', ['example.com/kept']);
+    const workload = wasmcloud('Workload', 'app-x', [WORKLOAD_FINALIZER]);
+    const artifact = wasmcloud('Artifact', 'blob', [ARTIFACT_FINALIZER]);
+    const free = wasmcloud('Workload', 'app-y');
+    for (const v of [wd, workload, artifact, free]) api.seed(v);
+    for (const v of [workload, artifact])
+      api.objects.get(key(v))!.metadata.resourceVersion = `${v.metadata.name}-rv`;
+    const operatorPod: Resource = {
+      apiVersion: 'v1',
+      kind: 'Pod',
+      metadata: { name: 'operator-1', namespace: operatorNamespace('alpha') },
+    };
+    api.seed(operatorPod);
     deleting();
+    await reconcile();
+    // The operator is at zero and its pod still runs: nothing is patched in di-tenant-alpha.
+    expect(replicas(api, operatorDeployment)).toBe(0);
+    expect(condition(t, 'Ready')).toMatchObject({
+      message: 'Retain: removal step R3 waits for pod/di-operator-alpha/operator-1',
+    });
+    expect(api.objects.get(key(workload))!.metadata.finalizers).toEqual([WORKLOAD_FINALIZER]);
+    // Not re-applied at one replica while R3 waits.
+    await reconcile();
+    expect(replicas(api, operatorDeployment)).toBe(0);
+    api.objects.delete(key(operatorPod));
+    api.operations = [];
     await drain();
     expect(t.metadata.finalizers ?? []).not.toContain(FINALIZER);
-    expect(api.has(wd) && api.has(held)).toBe(true);
+    const patches = api.operations.filter(
+      (o) => o.method === 'PATCH' && o.path.includes('/runtime.wasmcloud.dev/'),
+    );
+    expect(patches.map((o) => [o.path.split('?')[0], o.body])).toEqual([
+      [key(workload), { metadata: { resourceVersion: 'app-x-rv', finalizers: [] } }],
+      [key(artifact), { metadata: { resourceVersion: 'blob-rv', finalizers: [] } }],
+    ]);
+    // Retained, never deleted; the WorkloadDeployment's own finalizer is not the operator's.
+    expect(api.has(wd) && api.has(workload) && api.has(artifact)).toBe(true);
+    expect(api.objects.get(key(wd))!.metadata.finalizers).toEqual(['example.com/kept']);
     expect(deletes((p) => p.includes('/runtime.wasmcloud.dev/'))).toEqual([]);
+  });
+
+  it('Retain R3: waits while the operator Deployment has not reported zero replicas', async () => {
+    const { api, t, operatorDeployment, deleting, reconcile } = await prepare('Retain');
+    const original = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      const result = await original<Resource>(method, path, body);
+      if (method === 'PATCH' && path.startsWith(key(operatorDeployment)))
+        result.status = { observedGeneration: 1, replicas: 1 };
+      return result as T;
+    };
+    deleting();
+    await reconcile();
+    expect(condition(t, 'Ready')).toMatchObject({
+      message: `Retain: removal step R3 waits for deployment/di-operator-alpha/${operatorDeployment.metadata.name}`,
+    });
+  });
+
+  it('Retain R3: a resourceVersion conflict is retried on the next pass', async () => {
+    const { api, t, deleting, reconcile, drain } = await prepare('Retain');
+    const workload = wasmcloud('Workload', 'app-x', [WORKLOAD_FINALIZER]);
+    api.seed(workload);
+    const original = api.call.bind(api);
+    let conflicts = 1;
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      if (method === 'PATCH' && path.startsWith(key(workload)) && conflicts-- > 0)
+        throw new ApiError(409, 'Conflict');
+      return original<T>(method, path, body);
+    };
+    deleting();
+    await reconcile();
+    expect(condition(t, 'Ready')).toMatchObject({
+      message: 'Retain: removal step R3 waits for workload/app-x',
+    });
+    expect(api.objects.get(key(workload))!.metadata.finalizers).toEqual([WORKLOAD_FINALIZER]);
+    await drain();
+    expect(api.objects.get(key(workload))!.metadata.finalizers).toEqual([]);
+    expect(t.metadata.finalizers ?? []).not.toContain(FINALIZER);
+  });
+
+  it('Retain R3: another API error is raised as a reconcile error', async () => {
+    const { api, t, deleting, reconcile } = await prepare('Retain');
+    const workload = wasmcloud('Workload', 'app-x', [WORKLOAD_FINALIZER]);
+    api.seed(workload);
+    const original = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      if (method === 'PATCH' && path.startsWith(key(workload)))
+        throw new ApiError(403, 'Forbidden');
+      return original<T>(method, path, body);
+    };
+    deleting();
+    await expect(reconcile()).rejects.toThrow('Forbidden');
+    expect(t.metadata.finalizers).toContain(FINALIZER);
+  });
+
+  it('Retain R3: a foreign finalizer is never removed and sets RemovalStuck naming it until it is gone', async () => {
+    const { api, clock, t, deleting, reconcile, drain } = await prepare('Retain');
+    const workload = wasmcloud('Workload', 'app-x', [WORKLOAD_FINALIZER, 'example.com/foreign']);
+    api.seed(workload);
+    deleting();
+    await reconcile();
+    // The operator's finalizer goes; the foreign one stays and is named.
+    expect(api.objects.get(key(workload))!.metadata.finalizers).toEqual(['example.com/foreign']);
+    expect(condition(t, 'Ready')).toMatchObject({
+      message: 'Retain: removal step R3 waits for workload/app-x (finalizer example.com/foreign)',
+    });
+    clock.now = new Date(START.getTime() + REMOVAL_STEP_DEADLINE_MS);
+    await reconcile();
+    expect(condition(t, REMOVAL_STUCK)).toMatchObject({
+      reason: 'R3',
+      message: expect.stringContaining('remaining: workload/app-x (finalizer example.com/foreign)'),
+    });
+    expect(api.objects.get(key(workload))!.metadata.finalizers).toEqual(['example.com/foreign']);
+    api.objects.get(key(workload))!.metadata.finalizers = [];
+    await reconcile();
+    expect(condition(t, REMOVAL_STUCK)).toBeUndefined();
+    await drain();
+    expect(t.metadata.finalizers ?? []).not.toContain(FINALIZER);
+  });
+
+  it('Delete R3 never scales the tenant operator or patches finalizers', async () => {
+    const { api, operatorDeployment, deleting, reconcile } = await prepare('Delete');
+    const workload = wasmcloud('Workload', 'app-x', [WORKLOAD_FINALIZER]);
+    api.seed(workload);
+    deleting();
+    await reconcile();
+    await reconcile();
+    expect(replicas(api, operatorDeployment)).toBe(1);
+    expect(api.objects.get(key(workload))!.metadata.finalizers).toEqual([WORKLOAD_FINALIZER]);
   });
 
   it('R5 waits on a foreign di-operator namespace, records the step and sets RemovalStuck, never deleting it', async () => {
@@ -681,4 +815,85 @@ describe('controller RBAC for removal (#541 m5)', () => {
     // The rule names no other verb than patch.
     expect(rules.find((r) => r.resources.includes('artifacts'))?.verbs).toEqual(['patch']);
   });
+});
+
+/** The record of the platform identities, plus `alpha`'s `kinds`. */
+const record = (...kinds: ('hosts' | 'operator')[]): IdentityRecord => ({
+  'platform/data': { current: GOLDEN_IDS.platformData },
+  'platform/host': { current: GOLDEN_IDS.platformHost },
+  'platform/operator': { current: GOLDEN_IDS.platformOperator },
+  ...Object.fromEntries(
+    kinds.map((kind) => [
+      `tenant/alpha/${kind}`,
+      { current: kind === 'hosts' ? GOLDEN_IDS.aHosts : GOLDEN_IDS.aOperator },
+    ]),
+  ),
+});
+/** The accounts file the controller would write for Tenant `t` and `value`. */
+function accountsFile(t: Tenant, value: IdentityRecord): Resource {
+  const rendered = renderSchedulerAccounts(cfg.namespace, [t], value, START);
+  if (!('text' in rendered)) throw new Error('refused');
+  return {
+    apiVersion: 'v1',
+    kind: 'ConfigMap',
+    metadata: { name: SCHEDULER_NATS_ACCOUNTS, namespace: cfg.namespace },
+    data: { [ACCOUNTS_KEY]: rendered.text },
+  } as Resource;
+}
+
+describe('R1 and R4 wait for the written accounts file (#541 m6e-D)', () => {
+  it('reads the tenant hosts users and account with the renderer format', () => {
+    const t = tenant();
+    const text = (accountsFile(t, record('hosts', 'operator')).data as Record<string, string>)[
+      ACCOUNTS_KEY
+    ]!;
+    expect(accountsNamesTenantHost(text, 'alpha')).toBe(true);
+    expect(accountsNamesTenantAccount(text, 'alpha')).toBe(true);
+    // A tenant whose name extends alpha's is another tenant.
+    expect(accountsNamesTenantHost(text, 'alpha-x')).toBe(false);
+    expect(accountsNamesTenantAccount(text, 'alpha-x')).toBe(false);
+    const operatorOnly = (accountsFile(t, record('operator')).data as Record<string, string>)[
+      ACCOUNTS_KEY
+    ]!;
+    expect(accountsNamesTenantHost(operatorOnly, 'alpha')).toBe(false);
+    expect(accountsNamesTenantAccount(operatorOnly, 'alpha')).toBe(true);
+  });
+
+  for (const policy of ['Retain', 'Delete'] as const)
+    it(`${policy}: R1 waits while the hosts user is written, R4 while the account is, each with RemovalStuck at its deadline`, async () => {
+      const { api, clock, t, operatorDeployment, deleting, reconcile, drain } =
+        await prepare(policy);
+      const file = `${cfg.namespace}/${SCHEDULER_NATS_ACCOUNTS}`;
+      api.seed(accountsFile(t, record('hosts', 'operator')));
+      deleting();
+      await reconcile();
+      expect(condition(t, 'Ready')).toMatchObject({
+        message: `${policy}: removal step R1 waits for ${file}: hosts of alpha`,
+      });
+      // The operator stays applied at one replica through R1.
+      expect(replicas(api, operatorDeployment)).toBe(1);
+      clock.now = new Date(START.getTime() + REMOVAL_STEP_DEADLINE_MS);
+      await reconcile();
+      expect(condition(t, REMOVAL_STUCK)).toMatchObject({
+        reason: 'R1',
+        message: expect.stringContaining(`remaining: ${file}: hosts of alpha`),
+      });
+      expect(t.metadata.finalizers).toContain(FINALIZER);
+      // The hosts user is gone from the written file: R1-R3 complete, R4 waits for the account.
+      api.seed(accountsFile(t, record('operator')));
+      await reconcile();
+      expect(condition(t, REMOVAL_STUCK)).toBeUndefined();
+      expect(t.metadata.annotations?.[REMOVAL_STEP_ANNOTATION]).toBe(
+        `R4@${clock.now.toISOString()}`,
+      );
+      expect(condition(t, 'Ready')).toMatchObject({
+        message: `${policy}: removal step R4 waits for ${file}: account T_di-tenant-alpha`,
+      });
+      clock.now = new Date(clock.now.getTime() + REMOVAL_STEP_DEADLINE_MS);
+      await reconcile();
+      expect(condition(t, REMOVAL_STUCK)).toMatchObject({ reason: 'R4' });
+      api.seed(accountsFile(t, record()));
+      await drain();
+      expect(t.metadata.finalizers ?? []).not.toContain(FINALIZER);
+    });
 });
