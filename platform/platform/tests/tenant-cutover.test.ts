@@ -9,13 +9,18 @@ import {
   TENANT,
   TENANT_HOST_SECRET,
 } from '../src/tenancy/resources';
-import { IDENTITIES_KEY, parseIdentityRecord } from '../src/tenancy/scheduler-pki';
+import {
+  bootstrapSchedulerPki,
+  IDENTITIES_KEY,
+  parseIdentityRecord,
+} from '../src/tenancy/scheduler-pki';
 import {
   SCHEDULER_TLS_ANNOTATION,
   schedulerCertDigest,
 } from '../src/tenancy/scheduler-pki-rotation';
 import { TENANT_OPERATOR_PROPAGATION_MS } from '../src/tenancy/tenant-operator';
 import {
+  cfg,
   MemoryApi,
   prepare as prepareHarness,
   recordPath,
@@ -301,6 +306,55 @@ describe('per-tenant gating (#541 m6e)', () => {
       expect(hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION]).toBe('kept');
     });
 
+    // W1 of the #613 round-3 review: a template rendered while suspended with an empty digest has
+    // not moved; unsuspended, it is held at zero until the operator is Ready, then rolls once.
+    /** Ticks with the operator held, then released; the distinct `replicas:digest` templates seen. */
+    const rollout = async (api: CutoverApi, controller: { tick(): Promise<void> }) => {
+      const seen: string[] = [];
+      const record = () => {
+        const value = `${hostReplicas(api)}:${hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION]}`;
+        if (seen.at(-1) !== value) seen.push(value);
+      };
+      api.held.add('runtime-operator');
+      record();
+      for (let i = 0; i < 4; i++) {
+        await controller.tick();
+        record();
+        advance(TENANT_OPERATOR_PROPAGATION_MS);
+      }
+      expect(seen).toEqual(['0:']);
+      api.held.delete('runtime-operator');
+      await controller.tick();
+      record();
+      await controller.tick();
+      record();
+      return seen;
+    };
+
+    it('holds hosts unsuspended after a suspended first tick until the operator is Ready, then rolls once', async () => {
+      const { api, controller } = await prepare();
+      api.seed(legacyHosts(2));
+      tenantSpec(api).suspended = true;
+      await controller.tick();
+      expect(hostReplicas(api)).toBe(0);
+      tenantSpec(api).suspended = false;
+      const seen = await rollout(api, controller);
+      expect(seen).toEqual(['0:', `1:${schedulerCertDigest(hostCert(api))}`]);
+    });
+
+    it('holds hosts suspended before issuance until the operator is Ready, then rolls once', async () => {
+      const { api, controller } = await prepare(false);
+      api.seed(legacyHosts(2));
+      tenantSpec(api).suspended = true;
+      await controller.tick();
+      await controller.tick();
+      tenantSpec(api).suspended = false;
+      await controller.tick();
+      await bootstrapSchedulerPki(api, cfg, clock.now);
+      const seen = await rollout(api, controller);
+      expect(seen).toEqual(['0:', `1:${schedulerCertDigest(hostCert(api))}`]);
+    });
+
     it('still holds hosts that mount the copy, and creates none, until the operator is Ready', async () => {
       const { api, controller } = await prepare();
       api.held.add('runtime-operator');
@@ -428,6 +482,20 @@ describe('hosts on di-scheduler-host-tls (#541 m6e)', () => {
     // Issuance refuses the foreign Secret (SecretNotOwned), and the hosts are not rendered from it.
     await controller.tick();
     expect(api.objects.has(hostsPath)).toBe(false);
+  });
+
+  // S1 of the #613 round-3 review: a suspended Tenant whose host identity is not issued is not Ready.
+  it('reports a suspended Tenant without an issued host identity not Ready', async () => {
+    const { api, controller } = await prepare();
+    await throughPropagation(controller);
+    registerHost(api);
+    (stored(api).spec as { suspended?: boolean }).suspended = true;
+    await controller.tick();
+    await controller.tick();
+    expect(readyCondition(api)).toMatchObject({ status: 'True', reason: 'Suspended' });
+    api.objects.delete(hostSecretPath);
+    await controller.tick();
+    expect(readyCondition(api)).toMatchObject({ status: 'False', reason: 'Suspended' });
   });
 
   // P2 of the #613 round-2 review: Ready needs the operator Ready, not only the hosts.

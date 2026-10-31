@@ -1457,11 +1457,12 @@ export class Controller {
     }
     if (tenant.spec.suspended) return { digest, issued: true };
     const template = await live();
-    const moved = mountsSecret(template?.spec, TENANT_HOST_SECRET);
+    // A template rendered while suspended with no digest (`''`) has not moved (W1 of the #613
+    // round-3 review): it waits for the operator and rolls once onto the issued digest.
+    const annotation = template?.metadata?.annotations?.[SCHEDULER_TLS_ANNOTATION];
+    const moved = Boolean(annotation) && mountsSecret(template?.spec, TENANT_HOST_SECRET);
     if (!operatorReady && !moved) return { issued: true };
-    const rendered = moved
-      ? template?.metadata?.annotations?.[SCHEDULER_TLS_ANNOTATION]
-      : undefined;
+    const rendered = moved ? annotation : undefined;
     // The first move waits for nothing more: the hosts' identity is issued with the operator's,
     // whose own wait has passed, since it is Ready.
     if (rendered === undefined || rendered === digest) return { digest, issued: true };
