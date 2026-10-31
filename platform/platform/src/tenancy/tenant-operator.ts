@@ -33,11 +33,11 @@ export {
 };
 
 /**
- * How long the controller waits, once the accounts file it wrote names a tenant operator's user,
- * before it first creates that operator's Deployment (#541 m6e, owner decision 1). Nothing reports
- * when NATS has loaded the file: the kubelet refreshes a mounted ConfigMap within about a minute
- * (its sync period plus the ConfigMap cache TTL), then the reloader signals the server. An
- * operator started earlier would be refused and exit on its first connect.
+ * How long the controller waits, once the accounts file it wrote names a scheduler identity's user,
+ * before it writes that user's certificate into the identity's Secret (#541 m6e-E, owner decision
+ * 1). Nothing reports when NATS has loaded the file: the kubelet refreshes a mounted ConfigMap
+ * within about a minute (its sync period plus the ConfigMap cache TTL), then the reloader signals
+ * the server. A client started earlier on that certificate would be refused at its first connect.
  */
 export const TENANT_OPERATOR_PROPAGATION_MS = 120_000;
 

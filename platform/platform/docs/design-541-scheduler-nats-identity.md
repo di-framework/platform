@@ -288,21 +288,30 @@ How the pieces give the properties:
 
 **Revocation and rotation** (P5). The same rules apply to every entry in the record.
 
+**A Secret holds only an admitted certificate (#541 m6e-E).** Pods mount the identity Secrets by name, so any pod that starts (a resume, a replica change, a crash, an eviction) reads whatever the Secret holds at that moment. A pod-template annotation only triggers a roll; it cannot choose the certificate. So for every scheduler identity the controller issues (tenant hosts, tenant operators, and `platform/{operator,host,data}`) the order is:
+1. write the record, which adds the new user to the next accounts render;
+2. write the accounts file that names the new user;
+3. wait until the written file has named the user for 120 s (`TENANT_OPERATOR_PROPAGATION_MS`; nothing reports when NATS has loaded it, owner decision 1). The clock is in memory and starts when the controller first sees the user named; a restarted controller waits again;
+4. only then write the certificate into the Secret;
+5. roll, as before (the host digest annotation, the `hostgroup-default` PATCH).
+
+At every moment the Secret therefore holds a certificate whose user has propagated, or the `previous` user of a routine renewal, which stays admitted throughout. The NATS server leaf is not a NATS user (clients verify it against the platform CA, which does not change), so it is re-issued without the wait. The tenant operator Deployment is created only once its Secret exists, so it never starts before its user has propagated. The host Deployment takes the Secret's digest at once: a moved template no longer holds a renewed digest back, and the first move onto `di-scheduler-host-tls` waits for the operator and for the Secret, which closes the gap of a host Secret re-issued while the template had not moved (probe B1 of the #613 review). While a pending issuance waits, every pass moves `previousUntil` to now + 10 minutes, so the overlap and the host stall clock count from the issuance that lands and the wait never causes a false `SchedulerIdentityRenewalStalled`.
+
 - **Forced rotation.** Either of these starts it:
   - changing the Tenant annotation `platform.di-framework.dev/rotate-scheduler-identity`, which rotates both of the tenant's entries;
   - deleting the identity's Secret.
 
   The controller:
-  1. records a new current ID with no previous;
-  2. issues the new certificate into the Secret;
-  3. renders accounts without the old user;
+  1. records a new current ID with no previous, and renders accounts without the old user;
+  2. deletes the Secret if it still holds the old certificate, whose user is now revoked;
+  3. once the new user has propagated (above), issues the new certificate into the Secret;
   4. rolls the hosts.
 
-  The old identity is refused from that reload on. An operator whose user was removed reconnects with the new certificate files. nats.go reads them on every handshake (`nats.go: nats.go:1212-1234`; the operator uses `nats.ClientCert` at `wasmcloud: runtime-operator/cmd/main.go:189`). If the kubelet has not synced the Secret yet, the operator's connection closes and its liveness probe restarts it (`cmd/main.go:340-357`). The restarted process reads the synced files. This mirrors how deleting the registry pull Secret rotates its token (`controller.ts:735-739`).
+  The old identity is refused from that reload on. There is no certificate to fall back on: a pod that starts during the wait waits for the Secret volume, which the kubelet retries, and starts once the new certificate is written. A Deployment whose identity is not issued is left as it is meanwhile. While the Secret is absent the controller remembers, in memory, the ID it waits to issue, so the missing Secret is not taken for a new forced rotation; a restarted controller draws one more ID and waits again. An operator whose user was removed reconnects with the new certificate files. nats.go reads them on every handshake (`nats.go: nats.go:1212-1234`; the operator uses `nats.ClientCert` at `wasmcloud: runtime-operator/cmd/main.go:189`). If the kubelet has not synced the Secret yet, the operator's connection closes and its liveness probe restarts it (`cmd/main.go:340-357`). The restarted process reads the synced files. This mirrors how deleting the registry pull Secret rotates its token (`controller.ts:735-739`).
 - **Routine renewal.** The controller:
   1. records the new current ID, sets `previous`, and sets `previousUntil` to now + 10 minutes;
-  2. issues the certificate;
-  3. renders both users.
+  2. renders both users, and keeps the previous certificate in the Secret;
+  3. once the new user has propagated, issues the certificate; `previousUntil` is then now + 10 minutes.
 
   What happens next depends on the client:
   - **Operators** (tenant and platform) keep their connection and reconnect as the new user once the previous one is dropped. For them, `previous` is dropped at `previousUntil`, which gives the kubelet time to sync the Secret.

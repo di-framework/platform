@@ -15,6 +15,7 @@ import {
   parseIdentityRecord,
   serializeIdentityRecord,
 } from '../src/tenancy/scheduler-pki';
+import { TENANT_OPERATOR_PROPAGATION_MS } from '../src/tenancy/tenant-operator';
 import {
   cfg,
   condition as conditionOf,
@@ -139,11 +140,18 @@ describe('controller tick: scheduler NATS accounts file (#541 m6d)', () => {
   it('keeps a previous operator user during the overlap and drops it after previousUntil', async () => {
     const { api, controller } = await prepare();
     ownOperatorNamespace(api);
-    await controller.tick();
+    // Recorded, seen named, then issued after the wait (m6e-E); the renewal goes the same way.
+    const propagate = async () => {
+      await controller.tick();
+      await controller.tick();
+      clock.now = new Date(clock.now.getTime() + TENANT_OPERATOR_PROPAGATION_MS);
+      await controller.tick();
+    };
+    await propagate();
     const first = record(api)['tenant/alpha/operator']?.current as string;
     const user = `${first}.operator.di-tenant-alpha.platform.scheduler.di-framework.invalid`;
     clock.now = new Date(START.getTime() + 61 * 86_400_000);
-    await controller.tick();
+    await propagate();
     const entry = record(api)['tenant/alpha/operator'];
     expect(entry?.previous).toBe(first);
     expect(users(file(api))).toContain(user);

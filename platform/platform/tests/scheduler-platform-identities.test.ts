@@ -22,6 +22,7 @@ import {
   PlatformSchedulerIdentities,
   SCHEDULER_DATA_TLS_ANNOTATION,
 } from '../src/tenancy/scheduler-platform-identities';
+import { TENANT_OPERATOR_PROPAGATION_MS } from '../src/tenancy/tenant-operator';
 import { certificateNames, issuedBy } from '../src/tenancy/tls';
 import {
   cfg,
@@ -31,6 +32,7 @@ import {
   recordPath,
   START,
 } from './support/controller-harness';
+import { PropagationInvariant } from './support/propagation-invariant';
 
 // #541 m6e-A: the controller's tick renews the platform's own scheduler identities and the NATS
 // server leaf (design-541 §4.5), and rolls hostgroup-default after a platform/host renewal.
@@ -62,6 +64,19 @@ class PlatformApi extends MemoryApi {
       )
       .map((o) => `${o.method} ${o.path}`);
   }
+}
+
+const advance = (ms: number) => {
+  clock.now = new Date(clock.now.getTime() + ms);
+};
+/**
+ * The ticks after the one that recorded a renewal: the next one sees the new users in the accounts
+ * file that tick wrote, and the one after the wait writes their Secrets (m6e-E).
+ */
+async function propagate(controller: { tick(): Promise<void> }) {
+  await controller.tick();
+  advance(TENANT_OPERATOR_PROPAGATION_MS);
+  await controller.tick();
 }
 
 const prepare = (options: { pki: boolean } = { pki: true }) =>
@@ -151,6 +166,12 @@ describe('controller tick: platform scheduler identities (#541 m6e-A)', () => {
 
     clock.now = new Date(START.getTime() + 61 * DAY);
     await controller.tick();
+    // The record and the server leaf, which is no NATS user; no client Secret before the wait.
+    expect(api.platformWrites()).toEqual([
+      `PUT ${recordPath}`,
+      `PUT ${secretPath(PLATFORM_SECRETS.server)}`,
+    ]);
+    await propagate(controller);
     const writes = api.platformWrites();
     for (const path of platformPaths)
       expect(writes.filter((w) => w === `PUT ${path}`)).toHaveLength(1);
@@ -185,7 +206,7 @@ describe('controller tick: platform scheduler identities (#541 m6e-A)', () => {
 
     // The rollout completes; past previousUntil every previous is dropped once, then nothing.
     seedDeployment(api, digest, true, digestOf(api, 'data'));
-    clock.now = new Date(START.getTime() + 61 * DAY + 11 * 60_000);
+    advance(11 * 60_000);
     api.operations.length = 0;
     await controller.tick();
     expect(api.platformWrites()).toEqual([`PUT ${recordPath}`]);
@@ -201,9 +222,10 @@ describe('controller tick: platform scheduler identities (#541 m6e-A)', () => {
     const { api, controller } = await prepare();
     clock.now = new Date(START.getTime() + 61 * DAY);
     await controller.tick();
+    await propagate(controller);
     expect(api.operations.some((o) => o.path === deploymentPath && o.method !== 'GET')).toBe(false);
     expect(api.objects.has(deploymentPath)).toBe(false);
-    clock.now = new Date(clock.now.getTime() + 11 * 60_000);
+    advance(11 * 60_000);
     for (let i = 0; i < 4; i++) await controller.tick();
     expect(warned(`Deployment ${NS}/${PLATFORM_HOST_DEPLOYMENT} has not rolled out`)).toBe(1);
     expect(record(api)['platform/host']?.previous).toBeDefined();
@@ -216,8 +238,9 @@ describe('controller tick: platform scheduler identities (#541 m6e-A)', () => {
     clock.now = new Date(START.getTime() + 61 * DAY);
     const host = secretPath(PLATFORM_SECRETS.host);
     api.failOnce.add(`PUT ${host}`);
-    api.operations.length = 0;
     await controller.tick();
+    api.operations.length = 0;
+    await propagate(controller);
     expect(api.platformWrites().filter((w) => w === `PUT ${host}`)).toHaveLength(1);
     expect(warned('Platform scheduler identities: renewal failed: Injected failure')).toBe(1);
     expect(annotation(api)).toBeUndefined();
@@ -240,6 +263,7 @@ describe('controller tick: platform scheduler identities (#541 m6e-A)', () => {
     clock.now = new Date(START.getTime() + 61 * DAY);
     api.failOnce.add(`PATCH ${deploymentPath}`);
     await controller.tick();
+    await propagate(controller);
     expect(annotation(api)).toBeUndefined();
     await controller.tick();
     expect(annotation(api)).toBe(schedulerCertDigest(cert(api, PLATFORM_SECRETS.host)));
@@ -264,6 +288,7 @@ describe('controller tick: platform scheduler identities (#541 m6e-A)', () => {
     clock.now = new Date(START.getTime() + 61 * DAY);
     api.operations.length = 0;
     await controller.tick();
+    await propagate(controller);
     const writes = api.platformWrites();
     expect(writes).toContain(`PUT ${secretPath(PLATFORM_SECRETS.host)}`);
     expect(writes.filter((w) => w.includes(PLATFORM_SECRETS.operator))).toEqual([]);
@@ -299,6 +324,7 @@ describe('controller tick: platform scheduler identities (#541 m6e-A)', () => {
     clock.now = new Date(START.getTime() + 61 * DAY);
     api.failOnce.add(`PATCH ${deploymentPath}`);
     await controller.tick();
+    await propagate(controller);
     expect(annotation(api)).toBeUndefined();
     // A new process: nothing of the failed PATCH is held in memory.
     await new PlatformSchedulerIdentities(api, cfg, () => clock.now).reconcile();
@@ -312,9 +338,10 @@ describe('controller tick: platform scheduler identities (#541 m6e-A)', () => {
     clock.now = new Date(START.getTime() + 61 * DAY);
     api.operations.length = 0;
     await controller.tick();
+    await propagate(controller);
     expect(patches(api)).toBe(1);
     seedDeployment(api, digestOf(api, 'host'), false, digestOf(api, 'data'));
-    clock.now = new Date(clock.now.getTime() + 11 * 60_000);
+    advance(11 * 60_000);
     await controller.tick();
     expect(record(api)['platform/host']?.previous).toBeDefined();
     expect(record(api)['platform/data']?.previous).toBeDefined();
@@ -337,6 +364,7 @@ describe('controller tick: platform scheduler identities (#541 m6e-A)', () => {
     ageData(api, 70);
     api.operations.length = 0;
     await controller.tick();
+    await propagate(controller);
     const writes = api.platformWrites();
     expect(writes).toContain(`PUT ${secretPath(PLATFORM_SECRETS.data)}`);
     expect(writes).not.toContain(`PUT ${secretPath(PLATFORM_SECRETS.host)}`);
@@ -352,6 +380,7 @@ describe('controller tick: platform scheduler identities (#541 m6e-A)', () => {
     clock.now = new Date(START.getTime() + 61 * DAY);
     api.operations.length = 0;
     await controller.tick();
+    await propagate(controller);
     expect(patches(api)).toBe(1);
     expect(annotation(api)).toBe(digestOf(api, 'host'));
     expect(annotation(api, SCHEDULER_DATA_TLS_ANNOTATION)).toBe(digestOf(api, 'data'));
@@ -375,5 +404,39 @@ describe('controller tick: platform scheduler identities (#541 m6e-A)', () => {
     };
     await new PlatformSchedulerIdentities(api, cfg, () => clock.now).reconcile();
     expect(warned('renewal failed: boom')).toBe(1);
+  });
+});
+
+// #541 m6e-E: the platform Secrets keep the previous certificate until the renewed user has been in
+// the accounts file for the wait, and hostgroup-default rolls only then.
+describe('platform identity Secrets after propagation (#541 m6e-E)', () => {
+  it('keeps every renewed role on its previous certificate until its user propagated', async () => {
+    const { api, controller } = await prepare();
+    seedDeployment(api);
+    await controller.tick();
+    const invariant = new PropagationInvariant(api, () => clock.now);
+    const tick = async () => {
+      await controller.tick();
+      invariant.check();
+    };
+    const before = Object.fromEntries(
+      (['operator', 'host', 'data'] as const).map((role) => [
+        role,
+        cert(api, PLATFORM_SECRETS[role]),
+      ]),
+    );
+    clock.now = new Date(START.getTime() + 61 * DAY);
+    await tick();
+    await tick();
+    advance(TENANT_OPERATOR_PROPAGATION_MS - 1);
+    await tick();
+    for (const role of ['operator', 'host', 'data'] as const)
+      expect(cert(api, PLATFORM_SECRETS[role])).toBe(before[role] as string);
+    expect(annotation(api)).toBeUndefined();
+    advance(1);
+    await tick();
+    for (const role of ['operator', 'host', 'data'] as const)
+      expect(cert(api, PLATFORM_SECRETS[role])).not.toBe(before[role] as string);
+    expect(annotation(api)).toBe(digestOf(api, 'host'));
   });
 });

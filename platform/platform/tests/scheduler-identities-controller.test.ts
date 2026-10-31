@@ -5,6 +5,7 @@ import {
   TENANT_HOST_SECRET,
 } from '../src/tenancy/scheduler-identities';
 import { IDENTITIES_KEY, parseIdentityRecord } from '../src/tenancy/scheduler-pki';
+import { TENANT_OPERATOR_PROPAGATION_MS } from '../src/tenancy/tenant-operator';
 import {
   condition,
   MemoryApi,
@@ -44,6 +45,17 @@ class IdentityApi extends MemoryApi {
   }
 }
 
+/**
+ * Ticks until issued: the first records the users and writes the accounts file, the next sees them
+ * named, and the one after the wait writes the Secrets (m6e-E).
+ */
+async function issue(controller: { tick(): Promise<void> }) {
+  await controller.tick();
+  await controller.tick();
+  clock.now = new Date(clock.now.getTime() + TENANT_OPERATOR_PROPAGATION_MS);
+  await controller.tick();
+}
+
 const prepare = (options: { pki: boolean }) =>
   prepareHarness(new IdentityApi(), options, () => clock.now);
 
@@ -57,7 +69,7 @@ afterEach(() => warn.mockRestore());
 describe('controller tick: tenant scheduler identities (#541 m6c)', () => {
   it('issues once and then writes neither the identity, the record nor the rotation over many ticks', async () => {
     const { api, controller } = await prepare({ pki: true });
-    await controller.tick();
+    await issue(controller);
     const record = parseIdentityRecord(
       (api.objects.get(recordPath) as unknown as { data: Record<string, string> }).data[
         IDENTITIES_KEY
@@ -66,7 +78,7 @@ describe('controller tick: tenant scheduler identities (#541 m6c)', () => {
     expect(record['tenant/alpha/hosts']?.current).toMatch(/^[0-9a-f]{16}$/);
     expect(api.objects.get(hostPath)?.metadata.labels?.[OWNER]).toBe('alpha-uid');
     expect(condition(api, SCHEDULER_IDENTITY_PENDING)).toBeUndefined();
-    // The first tick wrote the record, the Secret and the status; let one more settle the status.
+    // Issuance wrote the record, the Secret and the status; let one more tick settle the status.
     await controller.tick();
     api.operations.length = 0;
     for (let i = 0; i < 6; i++) await controller.tick();
@@ -100,7 +112,7 @@ describe('controller tick: tenant scheduler identities (#541 m6c)', () => {
         labels: { [INSTALLATION]: 'test', [OWNER]: 'alpha-uid' },
       },
     });
-    await controller.tick();
+    await issue(controller);
     expect(api.objects.has(hostPath)).toBe(true);
     expect(api.objects.has(operatorPath)).toBe(true);
     const id = parseIdentityRecord(
@@ -152,7 +164,7 @@ describe('controller tick: tenant scheduler identities (#541 m6c)', () => {
     ]) {
       const foreign = labels !== undefined;
       const { api, controller } = await prepare({ pki: true });
-      await controller.tick();
+      await issue(controller);
       if (labels) (api.objects.get(hostPath) as Resource).metadata.labels = labels;
       const t = stored(api);
       t.metadata.deletionTimestamp = START.toISOString();

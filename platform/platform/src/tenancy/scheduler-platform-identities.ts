@@ -21,6 +21,12 @@
  *   the Secret write and the PATCH still rolls. Past `previousUntil` without the rollout the stall
  *   is logged once. Without the Deployment, `previous` stays recorded (and its user rendered) until
  *   the next renewal, as for a tenant whose host group is absent.
+ * - **Secret after propagation (m6e-E).** The pods mount these Secrets by name, so a renewed
+ *   certificate is written only once its user has propagated ({@link AccountsPropagation}); until
+ *   then the Secret keeps the previous certificate, whose user stays admitted, and the roll waits
+ *   with it. These Secrets are never deleted: they are renewed, never force-rotated here.
+ * - **The server leaf** is not a NATS user: clients verify it against the platform CA, which does
+ *   not change, so it is re-issued without the wait.
  * - **Failures** are logged once per distinct message and retried on the next tick; nothing here
  *   retries within a tick, and a steady state writes nothing.
  *
@@ -66,6 +72,7 @@ import {
   SCHEDULER_TLS_ANNOTATION,
   schedulerCertDigest,
 } from './scheduler-pki-rotation';
+import { AccountsPropagation, type Propagation } from './scheduler-propagation';
 import { issuedBy, type KeyPair } from './tls';
 
 /** The chart's platform host group, which presents `platform/host` and `platform/data`. */
@@ -110,6 +117,7 @@ export class PlatformSchedulerIdentities {
     private readonly cfg: { installation: string; namespace: string },
     private readonly now: () => Date,
     private readonly random?: (size: number) => Buffer,
+    private readonly propagation: Propagation = new AccountsPropagation(api, cfg.namespace, now),
   ) {}
 
   /** Renews what is due. Never throws: a failure is logged once and retried on the next tick. */
@@ -181,8 +189,15 @@ export class PlatformSchedulerIdentities {
     if (serializeIdentityRecord(next.record) !== serializeIdentityRecord(ctx.record))
       await putIdentityRecord(this.api, ctx.pki, ctx.stored, next.record);
     const targets: RollTarget[] = [];
+    const issuing = next.transitions.some(([, t]) => t.action === 'issue');
+    const propagated = issuing ? await this.propagation.read() : () => false;
     for (const [key, transition] of next.transitions) {
       const { role, secret } = secrets.get(key) as { role: PlatformRole; secret: Stored };
+      if (
+        transition.action === 'issue' &&
+        !propagated(platformUser(role, transition.entry.current))
+      )
+        continue;
       const target = await this.apply(ctx, role, secret, transition);
       if (target) targets.push(target);
     }

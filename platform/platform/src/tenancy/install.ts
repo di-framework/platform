@@ -76,6 +76,7 @@ export const CONTROLLER_SCRIPT_MODULES = [
   'removal-sequence',
   'scheduler-pki',
   'scheduler-pki-rotation',
+  'scheduler-propagation',
   'scheduler-identities',
   'scheduler-platform-identities',
   'scheduler-nats',

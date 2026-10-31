@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import { X509Certificate } from 'node:crypto';
-import { ApiError, collection } from '../src/tenancy/controller';
+import { ApiError, Controller, collection } from '../src/tenancy/controller';
 import {
   INSTALLATION,
   names,
@@ -32,6 +32,7 @@ import {
   tenantPath,
 } from './support/controller-harness';
 import { API_SERVER_SLICE } from './support/cutover';
+import { PropagationInvariant } from './support/propagation-invariant';
 
 // #541 m6e: the controller applies each tenant's own runtime-operator, then moves its hosts onto
 // the issued identity `di-scheduler-host-tls`, then deletes the copy of `wasmcloud-runtime-tls`.
@@ -52,7 +53,11 @@ const advance = (ms: number) => {
 class CutoverApi extends MemoryApi {
   /** Deployment names whose rollout does not complete. */
   held = new Set<string>();
+  /** The host Deployment's applies fail, as a refused apply does (probe B1 of the #613 review). */
+  refuseHosts = false;
   override async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+    if (this.refuseHosts && method === 'PATCH' && path.startsWith(`${hostsPath}?`))
+      throw new ApiError(422, 'host apply refused');
     const result = await super.call<Resource>(method, path, body);
     if (method === 'PATCH' && path.includes('/deployments/') && !path.includes('/status')) {
       const target = new URL(path, 'https://kubernetes').pathname;
@@ -77,17 +82,36 @@ class CutoverApi extends MemoryApi {
   }
 }
 
+/**
+ * The harness with the m6e-E invariant checked after every tick: each identity Secret holds a
+ * certificate whose user has propagated, or the previous user, still admitted.
+ */
 const prepare = async (pki = true) => {
   const { api, controller } = await prepareHarness(new CutoverApi(), { pki }, () => clock.now);
   api.seed(API_SERVER_SLICE);
-  return { api, controller };
+  const invariant = checked(api, controller);
+  return { api, controller, invariant };
 };
+function checked(api: MemoryApi, controller: { tick(): Promise<void> }) {
+  const invariant = new PropagationInvariant(api, () => clock.now);
+  const tick = controller.tick.bind(controller);
+  controller.tick = async () => {
+    await tick();
+    invariant.check();
+  };
+  return invariant;
+}
 
-/** Ticks until the operator Deployment exists: issuance, the accounts write, the wait. */
+/**
+ * Ticks until the operator Deployment exists: the record and the accounts write, the tick that
+ * sees the users named, the one after the wait that writes the Secrets (m6e-E), and the one that
+ * creates the operator now that its Secret exists.
+ */
 async function throughPropagation(controller: { tick(): Promise<void> }) {
   await controller.tick();
   await controller.tick();
   advance(TENANT_OPERATOR_PROPAGATION_MS);
+  await controller.tick();
   await controller.tick();
 }
 
@@ -155,7 +179,7 @@ afterEach(() => {
 });
 
 describe('per-tenant gating (#541 m6e)', () => {
-  it('applies the operator objects in order, the Deployment only after its accounts propagated, then the hosts', async () => {
+  it('applies the operator objects in order, the Deployment only once its Secret holds a propagated user, then the hosts', async () => {
     const { api, controller } = await prepare();
     await controller.tick();
     const first = api.applies();
@@ -169,18 +193,24 @@ describe('per-tenant gating (#541 m6e)', () => {
       `${collection('networking.k8s.io/v1', 'NetworkPolicy', OPERATOR_NS)}/di-operator-egress`,
       `${collection('networking.k8s.io/v1', 'NetworkPolicy', OPERATOR_NS)}/di-operator-ingress`,
     ]);
-    // No operator before its identity is in the written accounts file, so no hosts either.
+    // The tick recorded the identities and wrote the accounts file; no Secret before the wait
+    // (m6e-E), so no operator and no hosts either.
+    expect(api.objects.has(operatorSecretPath)).toBe(false);
+    expect(api.objects.has(hostSecretPath)).toBe(false);
     expect(api.objects.has(operatorPath)).toBe(false);
     expect(api.objects.has(hostsPath)).toBe(false);
-    // The tick issued the operator's identity into its namespace and wrote the accounts file.
-    expect(api.objects.has(operatorSecretPath)).toBe(true);
-    // The file names it now; the wait starts here.
+    // The file names the users now; the wait starts here.
     await controller.tick();
-    expect(api.objects.has(operatorPath)).toBe(false);
     advance(TENANT_OPERATOR_PROPAGATION_MS - 1);
     await controller.tick();
+    expect(api.objects.has(operatorSecretPath)).toBe(false);
     expect(api.objects.has(operatorPath)).toBe(false);
     advance(1);
+    await controller.tick();
+    // Both Secrets are written at the end of the pass, after the operator's apply.
+    expect(api.objects.has(operatorSecretPath)).toBe(true);
+    expect(api.objects.has(hostSecretPath)).toBe(true);
+    expect(api.objects.has(operatorPath)).toBe(false);
     api.operations.length = 0;
     await controller.tick();
     const applies = api.applies();
@@ -248,11 +278,13 @@ describe('per-tenant gating (#541 m6e)', () => {
       api.objects.delete(hostSecretPath);
       await controller.tick();
       await controller.tick();
-      // S2: held until the new user has propagated. A deleted Secret keeps no previous user, so
-      // the running pods are refused at the next reload; the hold only spares new pods a refused
-      // start.
+      // m6e-E: no Secret until the new user has propagated, so a pod that starts meanwhile waits
+      // for the volume; the template is left as it is.
+      expect(api.objects.has(hostSecretPath)).toBe(false);
       expect(hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION]).toBe(before);
       advance(TENANT_OPERATOR_PROPAGATION_MS);
+      await controller.tick();
+      expect(api.objects.has(hostSecretPath)).toBe(true);
       await controller.tick();
       const after = hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION];
       expect(after).not.toBe(before);
@@ -360,7 +392,7 @@ describe('per-tenant gating (#541 m6e)', () => {
     });
 
     it('holds hosts suspended before issuance until the operator is Ready, then rolls once', async () => {
-      const { api, controller } = await prepare(false);
+      const { api, controller, invariant } = await prepare(false);
       api.seed(legacyHosts(2));
       tenantSpec(api).suspended = true;
       await controller.tick();
@@ -368,6 +400,7 @@ describe('per-tenant gating (#541 m6e)', () => {
       tenantSpec(api).suspended = false;
       await controller.tick();
       await bootstrapSchedulerPki(api, cfg, clock.now);
+      invariant.trust();
       const seen = await rollout(api, controller);
       expect(seen).toEqual(['0:', `1:${schedulerCertDigest(hostCert(api))}`]);
     });
@@ -404,11 +437,11 @@ describe('per-tenant gating (#541 m6e)', () => {
     });
   });
 
-  it('restarts the wait when the file names another operator user, and when it drops it', async () => {
+  it('restarts the wait when the file stops naming the operator user', async () => {
     const { api, controller } = await prepare();
     await controller.tick();
     await controller.tick();
-    // The accounts file loses the operator (a refused render keeps an older one): no operator.
+    // The accounts file loses the operator (a refused render keeps an older one): no Secret.
     const accountsPath = `${collection('v1', 'ConfigMap', 'wasmcloud')}/di-scheduler-nats-accounts`;
     const accounts = api.objects.get(accountsPath) as Resource;
     const text = (accounts.data as Record<string, string>)['accounts.conf'] as string;
@@ -417,12 +450,18 @@ describe('per-tenant gating (#541 m6e)', () => {
       '.gone.',
     );
     advance(TENANT_OPERATOR_PROPAGATION_MS);
-    // This pass reads the edited file before the writer restores it, so the wait restarts.
+    // This pass reads the edited file before the writer restores it, so the wait restarts. The
+    // hosts user stayed named, so its Secret is written.
     await controller.tick();
-    expect(api.objects.has(operatorPath)).toBe(false);
+    expect(api.objects.has(operatorSecretPath)).toBe(false);
+    expect(api.objects.has(hostSecretPath)).toBe(true);
     await controller.tick();
-    expect(api.objects.has(operatorPath)).toBe(false);
-    advance(TENANT_OPERATOR_PROPAGATION_MS);
+    advance(TENANT_OPERATOR_PROPAGATION_MS - 1);
+    await controller.tick();
+    expect(api.objects.has(operatorSecretPath)).toBe(false);
+    advance(1);
+    await controller.tick();
+    expect(api.objects.has(operatorSecretPath)).toBe(true);
     await controller.tick();
     expect(api.objects.has(operatorPath)).toBe(true);
   });
@@ -454,6 +493,10 @@ describe('per-tenant gating (#541 m6e)', () => {
     });
     await controller.tick();
     expect(readyCondition(api)).toMatchObject({ status: 'False', reason: 'ReconcileError' });
+    await controller.tick();
+    advance(TENANT_OPERATOR_PROPAGATION_MS);
+    await controller.tick();
+    expect(readyCondition(api)).toMatchObject({ status: 'False', reason: 'ReconcileError' });
     expect(api.objects.has(hostSecretPath)).toBe(true);
   });
 });
@@ -472,9 +515,9 @@ describe('hosts on di-scheduler-host-tls (#541 m6e)', () => {
       schedulerCertDigest(hostCert(api)),
     );
     // Deleting the Secret re-issues it with no previous user, so the running pods are refused
-    // at the next accounts reload. The hosts keep their template until the new user has been in
-    // the accounts file for the propagation wait (S2 of the #613 review), so the new pods are not
-    // refused at start, then roll onto it.
+    // at the next accounts reload. The Secret is written only once the new user has been in the
+    // accounts file for the propagation wait (m6e-E), so new pods wait for the volume rather than
+    // being refused at start; the template is left as it is meanwhile, then rolls onto it.
     const before = template.metadata.annotations[SCHEDULER_TLS_ANNOTATION];
     api.objects.delete(hostSecretPath);
     await controller.tick();
@@ -482,8 +525,12 @@ describe('hosts on di-scheduler-host-tls (#541 m6e)', () => {
     expect(hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION]).toBe(before);
     advance(TENANT_OPERATOR_PROPAGATION_MS - 1);
     await controller.tick();
+    expect(api.objects.has(hostSecretPath)).toBe(false);
     expect(hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION]).toBe(before);
     advance(1);
+    await controller.tick();
+    expect(api.objects.has(hostSecretPath)).toBe(true);
+    expect(hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION]).toBe(before);
     await controller.tick();
     const after = hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION];
     expect(after).not.toBe(before);
@@ -707,6 +754,11 @@ describe('a Tenant being deleted keeps its operator through R3 (owner decision 4
     expect(record(api)['tenant/alpha/operator']).toBeDefined();
     api.objects.delete(operatorSecretPath);
     await controller.tick();
+    // Re-issued once its new user has propagated (m6e-E).
+    expect(api.objects.has(operatorSecretPath)).toBe(false);
+    await controller.tick();
+    advance(TENANT_OPERATOR_PROPAGATION_MS);
+    await controller.tick();
     expect(api.objects.has(operatorSecretPath)).toBe(true);
     // The hosts' identity is not issued again.
     expect(record(api)['tenant/alpha/hosts']).toBeUndefined();
@@ -758,7 +810,7 @@ describe('a Tenant being deleted keeps its operator through R3 (owner decision 4
   });
 });
 
-it('forgets the propagation wait of a Tenant that is gone', async () => {
+it('waits again for a re-created Tenant', async () => {
   const { api, controller } = await prepare();
   await controller.tick();
   await controller.tick();
@@ -857,13 +909,20 @@ describe('host gating matrix (#541 m6e)', () => {
       },
     }) as unknown as Resource;
 
-  /** The tenant with its operator in `operator` state, before the observed tick. */
+  /**
+   * The tenant with its host identity issued and its operator in `operator` state, before the
+   * observed tick. `missing`: the API server endpoints are unknown, so the operator is never
+   * applied (nor its identity issued).
+   */
   const withOperator = async (operator: Operator) => {
     const { api, controller } = await prepare();
     registerHost(api);
     if (operator === 'not Ready') api.held.add('runtime-operator');
-    if (operator === 'missing') await controller.tick();
-    else await throughPropagation(controller);
+    if (operator === 'missing')
+      api.objects.delete(
+        `${collection('discovery.k8s.io/v1', 'EndpointSlice', 'default')}/kubernetes`,
+      );
+    await throughPropagation(controller);
     return { api, controller };
   };
 
@@ -953,9 +1012,16 @@ describe('host gating matrix (#541 m6e)', () => {
     expect(seen).toEqual(['1:d', '0:d', '0:d', '1:d', '1:d']);
   });
 
-  // W1 of the #613 round-5 review: a moved template renewed or rotated while suspended, then
-  // unsuspended inside the wait, keeps its old digest until the hosts user has propagated.
-  /** `replicas:old|new` after each tick, every 20 s from suspension, unsuspended 40 s after `renew`. */
+  // W1 of the #613 round-6 review (m6e-E): a pod that starts reads the Secret, whatever the
+  // template's annotation says. So the trace records, per tick, the replicas and the certificate
+  // the Secret holds (`old`, `new`, or `none` while it waits), and the template's digest. The
+  // invariant check after every tick asserts that what the Secret holds has propagated, or is the
+  // previous user still admitted.
+  const certOf = (api: CutoverApi, old: string) => {
+    if (!api.objects.has(hostSecretPath)) return 'none';
+    return schedulerCertDigest(hostCert(api)) === old ? 'old' : 'new';
+  };
+  /** `replicas:secret:template` after each tick, every 20 s from the change, unsuspended at the third. */
   const renewSuspended = async (renew: (api: CutoverApi) => void) => {
     const { api, controller } = await withOperator('Ready');
     const old = seedHosts(api, 'moved');
@@ -969,31 +1035,34 @@ describe('host gating matrix (#541 m6e)', () => {
       await controller.tick();
       const [replicas] = observe(api, old);
       const annotation = hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION];
-      seen.push(`${replicas}:${annotation === old ? 'old' : 'new'}`);
+      seen.push(`${replicas}:${certOf(api, old)}:${annotation === old ? 'old' : 'new'}`);
       advance(20_000);
     }
     return seen;
   };
-  // Issued at the end of the first tick; the wait (120 s) passes at the seventh, then the new digest rolls.
-  const HELD_THEN_ROLLED = [
-    '0:old',
-    '0:old',
-    '1:old',
-    '1:old',
-    '1:old',
-    '1:old',
-    '1:old',
-    '1:new',
-    '1:new',
+  // No previous user: the Secret is gone from the first tick until the new user has been named for
+  // the wait (seen at the second tick, 20 s in; written at the end of the eighth, 140 s in). The
+  // unsuspended Tenant's hosts stay at zero meanwhile (no issued identity: left as it is), then
+  // start once, on the new certificate.
+  const REVOKED_THEN_ISSUED = [
+    '0:none:old',
+    '0:none:old',
+    '0:none:old',
+    '0:none:old',
+    '0:none:old',
+    '0:none:old',
+    '0:none:old',
+    '0:new:old',
+    '1:new:new',
   ];
 
-  it('suspended, the host Secret deleted, then unsuspended: the new digest waits for its accounts', async () => {
+  it('suspended, the host Secret deleted, then unsuspended: hosts start once, on the propagated certificate', async () => {
     expect(await renewSuspended((api) => api.objects.delete(hostSecretPath))).toEqual(
-      HELD_THEN_ROLLED,
+      REVOKED_THEN_ISSUED,
     );
   });
 
-  it('suspended, a forced rotation, then unsuspended: the new digest waits for its accounts', async () => {
+  it('suspended, a forced rotation, then unsuspended: the revoked certificate leaves the Secret at once', async () => {
     expect(
       await renewSuspended((api) => {
         stored(api).metadata.annotations = {
@@ -1001,10 +1070,10 @@ describe('host gating matrix (#541 m6e)', () => {
           [ROTATE_ANNOTATION]: 'r1',
         };
       }),
-    ).toEqual(HELD_THEN_ROLLED);
+    ).toEqual(REVOKED_THEN_ISSUED);
   });
 
-  it('suspended across a routine renewal, then unsuspended: the new digest waits for its accounts', async () => {
+  it('suspended across a routine renewal, then unsuspended: hosts start on the previous certificate, still admitted', async () => {
     expect(
       await renewSuspended((api) => {
         const notAfter = new X509Certificate(hostCert(api)).validTo;
@@ -1012,6 +1081,193 @@ describe('host gating matrix (#541 m6e)', () => {
           new Date(notAfter).getTime() - SCHEDULER_LEAF_RENEW_DAYS * 86_400_000 + 1000,
         );
       }),
-    ).toEqual(HELD_THEN_ROLLED);
+    ).toEqual([
+      '0:old:old',
+      '0:old:old',
+      '1:old:old',
+      '1:old:old',
+      '1:old:old',
+      '1:old:old',
+      '1:old:old',
+      '1:new:old',
+      '1:new:new',
+    ]);
+  });
+});
+
+// #541 m6e-E: an identity Secret holds only a certificate whose user has propagated, or the
+// previous user still admitted (checked after every tick by `prepare`). These are the sequences of
+// the #613 round-5 (B1) and round-6 (R1-R6) probes; R1-R3 are the `renewSuspended` cases above.
+describe('renewed Secrets only after their user propagated (#541 m6e-E)', () => {
+  const spec = (api: MemoryApi) =>
+    stored(api).spec as { suspended?: boolean; runtime?: { replicas?: number } };
+  const secretOf = (api: MemoryApi, old: string) => {
+    if (!api.objects.has(hostSecretPath)) return 'none';
+    return schedulerCertDigest(hostCert(api)) === old ? 'old' : 'new';
+  };
+  /** `replicas:volume:secret:template` of the host Deployment, `old`/`new` against `old`. */
+  const row = (api: MemoryApi, old: string) => {
+    const replicas = ((api.objects.get(hostsPath) as Resource).spec as { replicas: number })
+      .replicas;
+    const template = hostTemplate(api);
+    const volume = template.spec.volumes.find((v) => v.name === 'scheduler')?.secret?.secretName;
+    const digest = template.metadata?.annotations?.[SCHEDULER_TLS_ANNOTATION];
+    const named = digest === old ? 'old' : 'new';
+    return [
+      replicas,
+      volume === TENANT_HOST_SECRET ? 'host' : 'copy',
+      secretOf(api, old),
+      digest === undefined ? '-' : named,
+    ].join(':');
+  };
+  /** Cut over and moved: the operator Ready, the hosts on the issued certificate. */
+  const moved = async () => {
+    const { api, controller } = await prepare();
+    await throughPropagation(controller);
+    return { api, controller, old: schedulerCertDigest(hostCert(api)) };
+  };
+  const rotate = (api: MemoryApi, value: string) => {
+    stored(api).metadata.annotations = { [ROTATE_ANNOTATION]: value };
+  };
+  /** Ticks `count` times, 20 s apart, after `before(i)`; the rows after each. */
+  const run = async (
+    api: MemoryApi,
+    controller: { tick(): Promise<void> },
+    old: string,
+    count: number,
+    before: (i: number) => void = () => {},
+  ) => {
+    const seen: string[] = [];
+    for (let i = 0; i < count; i++) {
+      advance(20_000);
+      before(i);
+      await controller.tick();
+      seen.push(row(api, old));
+    }
+    return seen;
+  };
+
+  it('B1: a host Secret re-issued before the first move is written only after its user propagated', async () => {
+    const { api, controller } = await prepare();
+    api.seed({
+      apiVersion: 'apps/v1',
+      kind: 'Deployment',
+      metadata: { name: `hostgroup-${n.hostgroup}`, namespace: n.runtimeNamespace, labels: owned },
+      spec: {
+        replicas: 2,
+        template: {
+          spec: { volumes: [{ name: 'scheduler', secret: { secretName: SCHEDULER_TLS_COPY } }] },
+        },
+      },
+    } as unknown as Resource);
+    api.refuseHosts = true;
+    await throughPropagation(controller);
+    const old = schedulerCertDigest(hostCert(api));
+    // Not moved, the operator Ready: the Secret is re-issued, then the host apply recovers.
+    api.objects.delete(hostSecretPath);
+    await controller.tick();
+    api.refuseHosts = false;
+    // Left on the copy while no Secret exists; the first move takes the propagated certificate.
+    expect(await run(api, controller, old, 8)).toEqual([
+      '2:copy:none:-',
+      '2:copy:none:-',
+      '2:copy:none:-',
+      '2:copy:none:-',
+      '2:copy:none:-',
+      '2:copy:none:-',
+      '2:copy:new:-',
+      '1:host:new:new',
+    ]);
+  });
+
+  it('R4: running, a forced rotation, replicas raised inside the wait: no pod reads a revoked or unloaded certificate', async () => {
+    const { api, controller, old } = await moved();
+    rotate(api, 'r1');
+    const seen = await run(api, controller, old, 9, (i) => {
+      if (i === 2) spec(api).runtime = { replicas: 2 };
+    });
+    // The revoked certificate leaves the Secret at the first tick, and the Deployment is left as it
+    // is meanwhile (no issued identity), so the second replica comes with the new certificate.
+    expect(seen).toEqual([
+      '1:host:none:old',
+      '1:host:none:old',
+      '1:host:none:old',
+      '1:host:none:old',
+      '1:host:none:old',
+      '1:host:none:old',
+      '1:host:none:old',
+      '1:host:new:old',
+      '2:host:new:new',
+    ]);
+  });
+
+  it('R5: suspended, the Secret deleted and unsuspended in one tick, then a controller restart', async () => {
+    const { api, controller, old } = await moved();
+    spec(api).suspended = true;
+    await controller.tick();
+    api.objects.delete(hostSecretPath);
+    spec(api).suspended = false;
+    await controller.tick();
+    advance(60_000);
+    // A new process does not know the recorded ID waits: it draws another and waits again.
+    const restarted = new Controller(
+      api,
+      cfg,
+      async () => [],
+      () => clock.now,
+    );
+    checked(api, restarted);
+    expect(await run(api, restarted, old, 9)).toEqual([
+      '0:host:none:old',
+      '0:host:none:old',
+      '0:host:none:old',
+      '0:host:none:old',
+      '0:host:none:old',
+      '0:host:none:old',
+      '0:host:none:old',
+      '0:host:new:old',
+      '1:host:new:new',
+    ]);
+  });
+
+  it('R6: the operator not Ready, suspended, a forced rotation, then unsuspended', async () => {
+    const { api, controller, old } = await moved();
+    api.held.add('runtime-operator');
+    spec(api).suspended = true;
+    await controller.tick();
+    rotate(api, 'r1');
+    await controller.tick();
+    const seen = await run(api, controller, old, 9, (i) => {
+      if (i === 0) spec(api).suspended = false;
+    });
+    // A moved template is applied whatever the operator does; the hosts wait only for the Secret.
+    expect(seen).toEqual([
+      '0:host:none:old',
+      '0:host:none:old',
+      '0:host:none:old',
+      '0:host:none:old',
+      '0:host:none:old',
+      '0:host:none:old',
+      '0:host:new:old',
+      '1:host:new:new',
+      '1:host:new:new',
+    ]);
+  });
+
+  it('keeps the operator Secret on its previous certificate through a renewal, then writes the new one', async () => {
+    const { api, controller } = await moved();
+    const operatorCert = () =>
+      ((api.objects.get(operatorSecretPath) as Resource).data as Record<string, string>)['tls.crt'];
+    const first = operatorCert();
+    const notAfter = new X509Certificate(hostCert(api)).validTo;
+    clock.now = new Date(Date.parse(notAfter) - SCHEDULER_LEAF_RENEW_DAYS * 86_400_000 + 1000);
+    await controller.tick();
+    await controller.tick();
+    advance(TENANT_OPERATOR_PROPAGATION_MS - 1);
+    await controller.tick();
+    expect(operatorCert()).toBe(first);
+    advance(1);
+    await controller.tick();
+    expect(operatorCert()).not.toBe(first);
   });
 });

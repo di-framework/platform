@@ -37,6 +37,7 @@ import {
   SCHEDULER_TLS_ANNOTATION,
   schedulerCertDigest,
 } from '../src/tenancy/scheduler-pki-rotation';
+import type { Propagation } from '../src/tenancy/scheduler-propagation';
 import { certificateNames, issuedBy, leafCertificate } from '../src/tenancy/tls';
 
 // #541 m6c: the controller issues each tenant's scheduler NATS identities (design-541 §4.5).
@@ -139,6 +140,11 @@ class FakeApi implements IdentityApi {
       this.objects.set(path, value);
       return structuredClone(value) as T;
     }
+    if (method === 'DELETE') {
+      if (!this.objects.has(path)) throw error(404);
+      this.objects.delete(path);
+      return {} as T;
+    }
     if (method === 'PATCH' && path.endsWith('/status')) {
       const target = path.slice(0, -'/status'.length);
       const found = this.objects.get(target);
@@ -180,6 +186,11 @@ function tenant(annotations: Record<string, string> = {}): Tenant {
 
 /** A clock the tests move. */
 const clock = { now: T0 };
+/**
+ * Every user counts as propagated: these tests are about what is issued, not when. The wait before
+ * a Secret is written (m6e-E) is tested in `scheduler-propagation.test.ts` and the controller tests.
+ */
+const PROPAGATED: Propagation = { read: async () => () => true };
 /** Deterministic issuance IDs: 0101.., 0202.., ... */
 function counter() {
   let n = 0;
@@ -187,7 +198,7 @@ function counter() {
 }
 
 /** A cluster with the PKI namespace, both CAs and the record, as the bootstrap Job leaves it. */
-async function cluster(options: { operatorNamespace?: boolean } = {}) {
+async function cluster(options: { operatorNamespace?: boolean; propagation?: Propagation } = {}) {
   const api = new FakeApi();
   api.seed(nsPath(PKI), { metadata: { name: PKI } });
   await bootstrapSchedulerPki(api, { installation: INSTALL, namespace: NS }, T0);
@@ -202,6 +213,7 @@ async function cluster(options: { operatorNamespace?: boolean } = {}) {
     { installation: INSTALL, namespace: NS },
     () => clock.now,
     counter(),
+    options.propagation ?? PROPAGATED,
   );
   return { api, identities };
 }
@@ -248,6 +260,8 @@ describe('tenant scheduler identity issuance (#541 m6c)', () => {
       api,
       { installation: INSTALL, namespace: NS },
       () => clock.now,
+      undefined,
+      PROPAGATED,
     );
     const conditions = [];
     for (let i = 0; i < 4; i++) conditions.push(await identities.reconcile(tenant()));
@@ -744,5 +758,154 @@ describe('tenant scheduler identity issuance (#541 m6c)', () => {
     identities.forget(new Set());
     await identities.reconcile(tenant());
     expect(warn).toHaveBeenCalledTimes(2);
+  });
+});
+
+// #541 m6e-E: a certificate is written into its Secret only once its user has propagated; until
+// then the Secret keeps only a certificate whose user is still admitted.
+describe('tenant identity Secrets after propagation (#541 m6e-E)', () => {
+  /** Propagation the test opens: closed, no user counts as propagated. */
+  class Gate implements Propagation {
+    open = false;
+    async read() {
+      return () => this.open;
+    }
+  }
+  const gated = async (options: { operatorNamespace?: boolean } = {}) => {
+    const gate = new Gate();
+    const { api, identities } = await cluster({ ...options, propagation: gate });
+    return { api, identities, gate };
+  };
+  const secretsPath = `/api/v1/namespaces/${RUNTIME}/secrets`;
+
+  it('writes the first certificate only once its user has propagated', async () => {
+    const { api, identities, gate } = await gated();
+    for (let i = 0; i < 3; i++) await identities.reconcile(tenant());
+    expect(api.writes()).toEqual([`PUT ${recordPath}`]);
+    expect(api.objects.has(hostPath)).toBe(false);
+    const id = api.record()['tenant/alpha/hosts']?.current as string;
+    gate.open = true;
+    await identities.reconcile(tenant());
+    // The recorded ID, not another one.
+    expect(userOf(api, hostPath)).toEqual([tenantHostUser('alpha', id)]);
+    expect(api.writes()).toEqual([`PUT ${recordPath}`, `POST ${secretsPath}`]);
+  });
+
+  it('keeps the previous certificate in the Secret through a renewal, then writes the new one', async () => {
+    const { api, identities, gate } = await gated();
+    gate.open = true;
+    await identities.reconcile(tenant());
+    const before = api.data(hostPath, 'tls.crt');
+    const old = api.record()['tenant/alpha/hosts']?.current as string;
+    gate.open = false;
+    clock.now = new Date(T0.getTime() + 61 * DAY);
+    api.calls.length = 0;
+    await identities.reconcile(tenant());
+    expect(api.writes()).toEqual([`PUT ${recordPath}`]);
+    expect(api.data(hostPath, 'tls.crt')).toBe(before);
+    expect(api.record()['tenant/alpha/hosts']?.previous).toBe(old);
+    // A wait longer than the overlap: previousUntil follows the pending issuance, so the previous
+    // user stays rendered and no stall is reported.
+    clock.now = new Date(clock.now.getTime() + RENEWAL_OVERLAP_MS + 60_000);
+    expect(await identities.reconcile(tenant())).toEqual([]);
+    expect(api.record()['tenant/alpha/hosts']?.previous).toBe(old);
+    gate.open = true;
+    expect(await identities.reconcile(tenant())).toEqual([]);
+    expect(api.data(hostPath, 'tls.crt')).not.toBe(before);
+    expect(api.record()['tenant/alpha/hosts']).toMatchObject({
+      previous: old,
+      previousUntil: new Date(clock.now.getTime() + RENEWAL_OVERLAP_MS).toISOString(),
+    });
+  });
+
+  it('deletes the Secret of a forced rotation at once, and issues the recorded ID after the wait', async () => {
+    const { api, identities, gate } = await gated();
+    gate.open = true;
+    await identities.reconcile(tenant());
+    gate.open = false;
+    const t = tenant({ [ROTATE_ANNOTATION]: 'r1' });
+    api.seed(tenantPath, structuredClone(t) as unknown as Stored);
+    api.calls.length = 0;
+    await identities.reconcile(t);
+    expect(api.writes()).toEqual([
+      `PUT ${recordPath}`,
+      `PATCH ${tenantPath}/status`,
+      `DELETE ${hostPath}`,
+    ]);
+    const id = api.record()['tenant/alpha/hosts']?.current as string;
+    // While it waits, the missing Secret draws no new ID.
+    api.calls.length = 0;
+    for (let i = 0; i < 3; i++) await identities.reconcile(t);
+    expect(api.writes()).toEqual([]);
+    expect(api.record()['tenant/alpha/hosts']?.current).toBe(id);
+    gate.open = true;
+    await identities.reconcile(t);
+    expect(api.writes()).toEqual([`POST ${secretsPath}`]);
+    expect(userOf(api, hostPath)).toEqual([tenantHostUser('alpha', id)]);
+    // Issued: a Secret deleted after that is a new rotation again.
+    api.objects.delete(hostPath);
+    gate.open = false;
+    await identities.reconcile(t);
+    expect(api.record()['tenant/alpha/hosts']?.current).not.toBe(id);
+  });
+
+  it('draws one ID for a Secret deleted out of band, and none while it waits', async () => {
+    const { api, identities, gate } = await gated();
+    gate.open = true;
+    await identities.reconcile(tenant());
+    gate.open = false;
+    api.objects.delete(hostPath);
+    await identities.reconcile(tenant());
+    const id = api.record()['tenant/alpha/hosts']?.current as string;
+    api.calls.length = 0;
+    for (let i = 0; i < 3; i++) await identities.reconcile(tenant());
+    expect(api.writes()).toEqual([]);
+    expect(api.record()['tenant/alpha/hosts']?.current).toBe(id);
+    // A Tenant that is forgotten (gone from the list) waits from scratch: a new ID.
+    identities.forget(new Set(['beta']));
+    await identities.reconcile(tenant());
+    expect(api.record()['tenant/alpha/hosts']?.current).not.toBe(id);
+  });
+
+  it('keeps the wait of a listed Tenant when others are forgotten', async () => {
+    const { api, identities } = await gated();
+    await identities.reconcile(tenant());
+    const id = api.record()['tenant/alpha/hosts']?.current as string;
+    identities.forget(new Set(['alpha']));
+    await identities.reconcile(tenant());
+    expect(api.record()['tenant/alpha/hosts']?.current).toBe(id);
+  });
+
+  it('deletes a certificate that does not verify while the recorded ID waits', async () => {
+    const { api, identities, gate } = await gated();
+    gate.open = true;
+    await identities.reconcile(tenant());
+    gate.open = false;
+    // Another CA's leaf for the recorded user: not admitted, so not left for a pod to read.
+    const id = api.record()['tenant/alpha/hosts']?.current as string;
+    const other = await cluster();
+    const foreign = leafCertificate(
+      tenantHostUser('alpha', id),
+      [tenantHostUser('alpha', id)],
+      [],
+      SCHEDULER_LEAF_DAYS,
+      ca(other.api, 'tenant').cert,
+      ca(other.api, 'tenant').key,
+      T0,
+      'client',
+    );
+    const secret = api.objects.get(hostPath) as Stored;
+    api.seed(hostPath, {
+      ...secret,
+      data: {
+        ...secret.data,
+        'tls.crt': Buffer.from(foreign.cert).toString('base64'),
+        'tls.key': Buffer.from(foreign.key).toString('base64'),
+      },
+    });
+    api.calls.length = 0;
+    await identities.reconcile(tenant());
+    expect(api.writes()).toEqual([`DELETE ${hostPath}`]);
+    expect(api.record()['tenant/alpha/hosts']?.current).toBe(id);
   });
 });
