@@ -118,6 +118,7 @@ import {
   registryHttpHost,
   resource,
   runtimeQuota,
+  SCHEDULER_TLS_COPY,
   type ServiceBinding,
   type SizingParameters,
   STORAGE_RECORDS_CONFIG,
@@ -141,15 +142,29 @@ import {
 } from './resources';
 import { SchedulerAccountsWriter } from './scheduler-accounts';
 import {
+  hostRolloutOf,
   ownsIdentitySecret,
   TENANT_HOST_SECRET,
   TenantSchedulerIdentities,
 } from './scheduler-identities';
 import {
+  ACCOUNTS_KEY,
   type AccountsProblem,
+  accountsNamesUser,
   SCHEDULER_ACCOUNTS_CONDITION,
+  SCHEDULER_NATS_ACCOUNTS,
   schedulerAccountsCondition,
 } from './scheduler-nats';
+import {
+  IDENTITIES_KEY,
+  parseIdentityRecord,
+  SCHEDULER_IDENTITIES,
+  schedulerPkiNamespace,
+  tenantHostUser,
+  tenantIdentity,
+  tenantOperatorUser,
+} from './scheduler-pki';
+import { SCHEDULER_TLS_ANNOTATION, schedulerCertDigest } from './scheduler-pki-rotation';
 import { PlatformSchedulerIdentities } from './scheduler-platform-identities';
 import {
   assertSafeBindingStatus,
@@ -171,6 +186,7 @@ import {
   type StorageRecords,
   storageAllowed,
 } from './storage-records';
+import { TENANT_OPERATOR_PROPAGATION_MS, tenantOperatorResources } from './tenant-operator';
 import { operatorNamespace } from './tenant-operator-names';
 import { certificateNames, certificateValid, holdsCaKey, issuedBy, leafCertificate } from './tls';
 import {
@@ -479,6 +495,33 @@ const LOG_READER_KINDS = [
   ['rbac.authorization.k8s.io/v1', 'Role'],
 ] as const;
 
+type PodSpecVolumes = {
+  volumes?: {
+    secret?: { secretName?: string };
+    projected?: { sources?: { secret?: { name?: string } }[] };
+  }[];
+};
+
+/** A host Deployment's pod template, as {@link Controller.hostTlsFor} reads it. */
+type HostTemplate = {
+  metadata?: { annotations?: Record<string, string> };
+  spec?: PodSpecVolumes;
+};
+
+/** True when a pod spec mounts Secret `name`, directly or projected. */
+function mountsSecret(spec: PodSpecVolumes | undefined, name: string): boolean {
+  return (spec?.volumes ?? []).some(
+    (v) =>
+      v.secret?.secretName === name ||
+      !!v.projected?.sources?.some((source) => source.secret?.name === name),
+  );
+}
+
+/** True when `pod` mounts the pre-cut-over copy {@link SCHEDULER_TLS_COPY} (#541 m6e). */
+function mountsSchedulerTlsCopy(pod: Resource): boolean {
+  return mountsSecret(pod.spec as PodSpecVolumes | undefined, SCHEDULER_TLS_COPY);
+}
+
 export class Controller {
   /**
    * Newest TracingLogger timestamp already projected, per tenant, host pod uid, and projection
@@ -506,6 +549,14 @@ export class Controller {
   private readonly identities: TenantSchedulerIdentities;
   /** The scheduler NATS accounts file (#541 m6d). */
   private readonly accounts: SchedulerAccountsWriter;
+  /**
+   * Per tenant, the operator user the written accounts file was first seen to name, and when; the
+   * operator Deployment is created {@link TENANT_OPERATOR_PROPAGATION_MS} later (#541 m6e).
+   */
+  private readonly accountsSeen = new Map<
+    string,
+    Partial<Record<'hosts' | 'operator', { user: string; since: number }>>
+  >();
   /**
    * The problems of the last accounts render, reported on every Tenant: empty when it was written,
    * undefined while unknown (before the first render since start, or after a failed read), when
@@ -701,6 +752,9 @@ export class Controller {
     for (const [step, run] of steps) {
       const remaining = await run();
       if (remaining.length === 0) continue;
+      // Through R3 the tenant's own operator clears its host pods' and Workloads' finalizers, so it
+      // keeps running and keeps its identity (owner decision 4); R4 then drops it.
+      if (step === 'R1' || step === 'R2' || step === 'R3') await this.keepTenantOperator(tenant);
       await this.removalBlocked(tenant, step, remaining);
       return;
     }
@@ -827,6 +881,11 @@ export class Controller {
     );
     if (identity && ownsIdentitySecret(identity, this.cfg.installation, tenant.metadata.uid))
       await this.remove(identity);
+    // A copy of `wasmcloud-runtime-tls` left from before the cut-over (#541 m6e).
+    const copy = await this.get<Resource>(
+      `${collection('v1', 'Secret', names(t).runtimeNamespace)}/${SCHEDULER_TLS_COPY}`,
+    );
+    if (copy && this.ownsCopy(copy, tenant)) await this.remove(copy);
     const remaining = (await bindings()).map(
       (b) => `rolebinding/${b.metadata.namespace}/${b.metadata.name}`,
     );
@@ -883,17 +942,7 @@ export class Controller {
           .filter((m) => m.tenant === name)
           .map((m) => ({ name: u.metadata.name, role: m.role, suspended: !!u.spec.suspended })),
       );
-    const slices = (
-      await this.list<
-        Resource & { endpoints?: { addresses: string[] }[]; ports?: { port: number }[] }
-      >('discovery.k8s.io/v1', 'EndpointSlice', { 'kubernetes.io/service-name': 'kubernetes' })
-    ).filter((s) => s.metadata.namespace === 'default');
-    const apiServer = {
-      addresses: [
-        ...new Set(slices.flatMap((s) => (s.endpoints ?? []).flatMap((e) => e.addresses))),
-      ],
-      port: slices[0]?.ports?.[0]?.port ?? 443,
-    };
+    const apiServer = await this.apiServerEndpoints();
     const tls = await this.controllerTls(tenant, auth, fetched);
     const oauth = await this.get<{ data?: Record<string, string> }>(
       `${collection('v1', 'Secret', this.cfg.namespace)}/${auth.oauthClient.secretName}`,
@@ -904,6 +953,30 @@ export class Controller {
       tls,
       clientSecret: oauth?.data?.[auth.oauthClient.secretKey ?? 'clientSecret'],
       ...(auth.registry ? { hostPullToken: await this.hostPullToken(name) } : {}),
+    };
+  }
+  /** {@link apiServerEndpoints} of the running {@link tick}, read once for every Tenant. */
+  private tickApiServer?: { read?: Promise<{ addresses: string[]; port: number }> };
+  /**
+   * The API server's addresses and port, from the `kubernetes` EndpointSlices in `default`: read
+   * once per {@link tick}, and on every call outside one.
+   */
+  private apiServerEndpoints(): Promise<{ addresses: string[]; port: number }> {
+    if (!this.tickApiServer) return this.readApiServerEndpoints();
+    this.tickApiServer.read ??= this.readApiServerEndpoints();
+    return this.tickApiServer.read;
+  }
+  private async readApiServerEndpoints(): Promise<{ addresses: string[]; port: number }> {
+    const slices = (
+      await this.list<
+        Resource & { endpoints?: { addresses: string[] }[]; ports?: { port: number }[] }
+      >('discovery.k8s.io/v1', 'EndpointSlice', { 'kubernetes.io/service-name': 'kubernetes' })
+    ).filter((s) => s.metadata.namespace === 'default');
+    return {
+      addresses: [
+        ...new Set(slices.flatMap((s) => (s.endpoints ?? []).flatMap((e) => e.addresses))),
+      ],
+      port: slices[0]?.ports?.[0]?.port ?? 443,
     };
   }
   /**
@@ -1248,6 +1321,184 @@ export class Controller {
     if (!state || state.stage === 'rollout') return undefined;
     return state.stage === 'migrated' && state.credentials ? 'credentials' : 'stopped';
   }
+  /**
+   * True once the accounts file this controller wrote has named the current user of the tenant's
+   * `kind` identity for {@link TENANT_OPERATOR_PROPAGATION_MS}. Nothing reports when NATS has
+   * loaded the file (owner decision 1), so a client whose new certificate names that user, and
+   * which exits when its first connect is refused, starts only after that fixed wait (#541 m6e):
+   * the operator's creation, and every move of the hosts to a new certificate (S2 of the #613
+   * review). In memory: a restarted controller waits once more.
+   */
+  private async accountsLoaded(t: string, kind: 'hosts' | 'operator'): Promise<boolean> {
+    const record = await this.get<{ data?: Record<string, string> }>(
+      `${collection('v1', 'ConfigMap', schedulerPkiNamespace(this.cfg.namespace))}/${SCHEDULER_IDENTITIES}`,
+    );
+    const id = parseIdentityRecord(record?.data?.[IDENTITIES_KEY] ?? '')[tenantIdentity(t, kind)]
+      ?.current;
+    const accounts = id
+      ? await this.get<{ data?: Record<string, string> }>(
+          `${collection('v1', 'ConfigMap', this.cfg.namespace)}/${SCHEDULER_NATS_ACCOUNTS}`,
+        )
+      : undefined;
+    const userOf = kind === 'hosts' ? tenantHostUser : tenantOperatorUser;
+    const user = id ? userOf(t, id) : '';
+    const seen = this.accountsSeen.get(t) ?? {};
+    this.accountsSeen.set(t, seen);
+    if (!id || !accountsNamesUser(accounts?.data?.[ACCOUNTS_KEY] ?? '', user)) {
+      delete seen[kind];
+      return false;
+    }
+    const now = this.now().getTime();
+    const since = seen[kind]?.user === user ? seen[kind].since : undefined;
+    if (since === undefined) {
+      seen[kind] = { user, since: now };
+      return false;
+    }
+    return now - since >= TENANT_OPERATOR_PROPAGATION_MS;
+  }
+  /**
+   * Applies the tenant's runtime-operator in `di-operator-<t>` (#541 m6e, design-541 §4.6), one
+   * object at a time: the Namespace, ServiceAccount and RoleBindings, then its policies, then the
+   * Deployment. A Deployment that does not exist yet is created only once its accounts have
+   * propagated ({@link accountsLoaded}); one that exists is always applied, suspended or
+   * not (S2). Returns whether the operator is Ready; not while the API server's endpoints are
+   * unknown, when nothing is applied.
+   */
+  private async applyTenantOperator(tenant: Tenant): Promise<boolean> {
+    const t = tenant.metadata.name;
+    const rendered = tenantOperatorResources(tenant, {
+      installation: this.cfg.installation,
+      namespace: this.cfg.namespace,
+      apiServer: await this.apiServerEndpoints(),
+    });
+    if (!rendered.ready) return false;
+    const deployment = rendered.resources.at(-1) as Resource;
+    for (const value of rendered.resources.slice(0, -1)) await this.ensure(value);
+    if (
+      !(await this.get<Resource>(location(deployment))) &&
+      !(await this.accountsLoaded(t, 'operator'))
+    )
+      return false;
+    const applied = await this.ensure(deployment);
+    return hostRolloutOf(applied as never, deployment.metadata.name).rollout?.complete === true;
+  }
+  /**
+   * While removal is at R3 or earlier, the operator objects stay applied and the operator's
+   * identity keeps being issued (owner decision 4). A failure is logged, not raised: removal keeps
+   * reporting its step.
+   */
+  private async keepTenantOperator(tenant: Tenant): Promise<void> {
+    try {
+      await this.applyTenantOperator(tenant);
+    } catch (error) {
+      console.warn(
+        `Tenant/${tenant.metadata.name}: keeping its runtime-operator during removal failed: ${error instanceof Error ? error.message : error}`,
+      );
+    }
+    await this.identities.reconcile(tenant, 'operator');
+  }
+  /**
+   * `schedulerCertDigest` of the hosts' current scheduler certificate, read fresh from
+   * {@link TENANT_HOST_SECRET}; undefined until the controller has issued it.
+   */
+  private async hostTlsDigest(tenant: Tenant): Promise<string | undefined> {
+    const secret = await this.get<Resource & { data?: Record<string, string> }>(
+      `${collection('v1', 'Secret', names(tenant.metadata.name).runtimeNamespace)}/${TENANT_HOST_SECRET}`,
+    );
+    const cert = secret?.data?.['tls.crt'];
+    if (!cert || !ownsIdentitySecret(secret, this.cfg.installation, tenant.metadata.uid))
+      return undefined;
+    return schedulerCertDigest(Buffer.from(cert, 'base64').toString('utf8'));
+  }
+  /**
+   * The host certificate digest the host Deployment is rendered with, or undefined to leave the
+   * live Deployment untouched (#541 m6e).
+   * - The live template has "moved" once it mounts {@link TENANT_HOST_SECRET} and carries a
+   *   non-empty digest. A moved template is applied with its digest whatever the operator does, so
+   *   suspension, replica changes and renewals are never held (W1 of the #613 review).
+   * - The first move waits for the tenant's operator to be Ready. The hosts' identity is issued
+   *   with the operator's, whose own accounts wait has then passed. Until then a running Tenant's
+   *   host Deployment is left as it is, and a suspended Tenant's is rendered at zero replicas on
+   *   {@link TENANT_HOST_SECRET} with the digest `''`, which has not moved. So unsuspending it
+   *   cannot start hosts before their operator (W1 of the #613 round-3 and round-4 reviews). Once
+   *   the move is allowed, the template is rendered with the issued digest, suspended (zero
+   *   replicas) or not.
+   * - A renewed or rotated certificate reaches the template only once its user has propagated
+   *   ({@link accountsLoaded}); until then the template keeps the digest it has, so new pods are
+   *   not refused at their first connect (S2 of the #613 review). For a routine renewal the old
+   *   certificate's user stays admitted until the rollout completes (`identityTransition`), so
+   *   the running pods keep working. A forced rotation or a deleted Secret keeps no previous
+   *   user: the running pods are refused at the next accounts reload, and the hosts stay down
+   *   for up to the wait plus a tick before the new pods roll. That trade avoids new pods that
+   *   are refused at start and crash-loop. The wait counts against a renewal's stall window
+   *   (`previousUntil`, issuance plus ten minutes), leaving the rollout about 477 s; a tenant
+   *   with many replicas can report `SchedulerIdentityRenewalStalled` briefly, which clears once
+   *   the rollout completes and drops nothing. Kept so: measuring from the template change would
+   *   need one more persisted timestamp for a condition that is only a report.
+   * - A suspended Tenant whose host identity is not issued is rendered at zero replicas with the
+   *   live template's digest if it has moved, or none, so its pre-cut-over hosts stop too (S2 of
+   *   the #613 round-2 and round-5 reviews). A running one is left as it is. `issued` is false in
+   *   both cases.
+   */
+  private async hostTlsFor(
+    tenant: Tenant,
+    operatorReady: boolean,
+  ): Promise<{ digest?: string; issued: boolean }> {
+    const digest = await this.hostTlsDigest(tenant);
+    const n = names(tenant.metadata.name);
+    const live = async () =>
+      (
+        (
+          await this.get<Resource>(
+            `${collection('apps/v1', 'Deployment', n.runtimeNamespace)}/hostgroup-${n.hostgroup}`,
+          )
+        )?.spec as { template?: HostTemplate } | undefined
+      )?.template;
+    if (digest === undefined && !tenant.spec.suspended) return { issued: false };
+    const template = await live();
+    const annotation = template?.metadata?.annotations?.[SCHEDULER_TLS_ANNOTATION];
+    // A template rendered while suspended with no digest (`''`) has not moved (W1 of the #613
+    // round-3 review): it waits for the operator and rolls once onto the issued digest.
+    const moved = Boolean(annotation) && mountsSecret(template?.spec, TENANT_HOST_SECRET);
+    // Suspended without an issued identity, only a moved template keeps its digest (S2 of the
+    // #613 round-5 review).
+    if (digest === undefined) return { digest: moved ? annotation : '', issued: false };
+    // Suspended, a template that has not moved gets the issued digest only once the first move is
+    // allowed, so unsuspending it cannot skip the operator (W1 of the #613 round-4 review). A moved
+    // one takes a renewed digest only after the accounts wait below (W1 of round 5).
+    if (tenant.spec.suspended && !moved)
+      return { digest: operatorReady ? digest : '', issued: true };
+    if (!operatorReady && !moved) return { issued: true };
+    // The first move waits for nothing more: the hosts' identity is issued with the operator's,
+    // whose own wait has passed, since it is Ready.
+    if (!moved || annotation === digest) return { digest, issued: true };
+    const loaded = await this.accountsLoaded(tenant.metadata.name, 'hosts');
+    return { digest: loaded ? digest : annotation, issued: true };
+  }
+  /** A `di-scheduler-tls` this controller copied for the Tenant: its installation and owner labels. */
+  private ownsCopy(copy: Resource, tenant: Tenant): boolean {
+    return (
+      copy.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+      copy.metadata.labels?.[OWNER] === tenant.metadata.uid
+    );
+  }
+  /**
+   * Deletes the tenant's copy of `wasmcloud-runtime-tls` once nothing can still use it (#541 m6e):
+   * the host Deployment has rolled out the template that mounts {@link TENANT_HOST_SECRET}, no pod
+   * in `di-runtime-<t>` (terminating ones included) mounts the copy, and the copy carries this
+   * installation's and Tenant's owner labels.
+   */
+  private async removeSchedulerTlsCopy(tenant: Tenant, hosts: Resource): Promise<void> {
+    if (!hostRolloutOf(hosts as never, hosts.metadata.name).rollout?.complete) return;
+    const n = names(tenant.metadata.name);
+    const copy = await this.get<Resource>(
+      `${collection('v1', 'Secret', n.runtimeNamespace)}/${SCHEDULER_TLS_COPY}`,
+    );
+    if (!copy || !this.ownsCopy(copy, tenant)) return;
+    const pods = await this.list<Resource>('v1', 'Pod', {}, n.runtimeNamespace);
+    if (pods.some(mountsSchedulerTlsCopy)) return;
+    await this.remove(copy);
+  }
   async reconcileTenant(tenant: Tenant, users?: User[]): Promise<void> {
     if (!validName(tenant.metadata.name)) throw new Error('Invalid tenant name');
     if (!tenant.metadata.deletionTimestamp) await this.finalizer(tenant, true);
@@ -1278,11 +1529,18 @@ export class Controller {
       if (name === n.runtimeNamespace) namespace.metadata.labels![NAMESPACE_ROLE] = 'runtime';
       await this.ensure(namespace, true);
     }
+    // The tenant's own operator first; its hosts follow once it is Ready (#541 m6e). A failure is
+    // reported like a failed apply below.
+    let operatorReady = false;
+    let failure: unknown;
+    try {
+      operatorReady = await this.applyTenantOperator(tenant);
+    } catch (error) {
+      failure = error;
+    }
     // Everything above and these reads can still throw before the try block below; such a
     // failure rejects the tick and skips tenant-auth until the next poll.
-    const secret = await this.get<{ data: Record<string, string> }>(
-      `${collection('v1', 'Secret', this.cfg.namespace)}/wasmcloud-runtime-tls`,
-    );
+    const { digest: hostTls, issued: hostIssued } = await this.hostTlsFor(tenant, operatorReady);
     const workloads = await this.storageWorkloads(tenant);
     // Records are written before any host pod that mounts their keys is rendered (#200).
     const observation = await this.observeStorage(tenant);
@@ -1305,7 +1563,7 @@ export class Controller {
     const desired = tenantResources(
       tenant,
       this.cfg,
-      secret,
+      hostTls === undefined ? undefined : { digest: hostTls },
       storage.mounted,
       await this.tenantAuthDeployed(tenant),
       registryDeployed,
@@ -1318,8 +1576,10 @@ export class Controller {
         hostsKnown ||
         !(value.kind === 'Deployment' && value.metadata.name === `hostgroup-${n.hostgroup}`),
     );
-    let ready = !!secret;
-    let failure: unknown;
+    const hostgroup = `hostgroup-${n.hostgroup}`;
+    // Ready needs the operator Ready and the hosts on their own identity (#541 m6e).
+    let ready = operatorReady && hostIssued && hostTls !== undefined;
+    let hosts: Resource | undefined;
     let foreignRecords: string | undefined;
     try {
       // The backup operator's copy of the records (design-200 §9.4). One someone else created
@@ -1333,6 +1593,7 @@ export class Controller {
       if (!this.cfg.routeUrlPattern) await this.removeRoutes(tenant);
       for (const value of desired) {
         const applied = await this.ensure(value);
+        if (value.kind === 'Deployment' && value.metadata.name === hostgroup) hosts = applied;
         if (value.kind === 'Deployment') {
           const spec = applied.spec as { replicas: number };
           const status = applied.status as
@@ -1344,17 +1605,26 @@ export class Controller {
             (spec.replicas !== 0 || (status?.replicas ?? 0) === 0);
         }
       }
+      if (hosts) {
+        // Rolled: every replica runs the template with the current certificate (#541 m6e).
+        ready &&= hostRolloutOf(hosts as never, hostgroup).rollout?.complete === true;
+        await this.removeSchedulerTlsCopy(tenant, hosts);
+      }
     } catch (error) {
-      failure = error;
+      failure ??= error;
     }
     // Placement depends on Host readiness alone, as the operator's findFreeHost decides it, so
     // the nudge runs even when another Deployment is not ready or the apply above failed (#418).
     if (!tenant.spec.suspended && !tenant.metadata.deletionTimestamp) {
       try {
-        const hosts = await this.list<Resource>('runtime.wasmcloud.dev/v1alpha1', 'Host', {
-          hostgroup: n.hostgroup,
-        });
-        const readyHosts = hosts.filter(
+        // The tenant operator registers its Hosts in its own namespace (design-541 §4.6).
+        const registered = await this.list<Resource>(
+          'runtime.wasmcloud.dev/v1alpha1',
+          'Host',
+          { hostgroup: n.hostgroup },
+          operatorNamespace(tenant.metadata.name),
+        );
+        const readyHosts = registered.filter(
           (h) =>
             h.environment === n.namespace &&
             (h.status as { conditions?: Condition[] } | undefined)?.conditions?.some(
@@ -1394,7 +1664,7 @@ export class Controller {
     }
     // Issued apart from the apply, which a failed host Deployment must not hold back, and also while
     // suspended: the tenant operator keeps running then (design-541 §4.5), so its identity must not
-    // expire. Inert until the cut-over: no pod mounts these identities yet (#541 m6c).
+    // expire. The hosts' digest annotation follows a renewal on the next pass (#541 m6e).
     const identity = await this.identities.reconcile(tenant);
     // Tenant-auth is independent of the tenant's own objects: a failed apply above (such as a
     // hostgroup 409) must not keep it from reconciling or from reporting TenantAuthReady (#121).
@@ -3024,6 +3294,8 @@ export class Controller {
       if (!uids.has(uid)) this.storageListings.delete(uid);
     for (const name of this.caRefusals.keys()) if (!listed.has(name)) this.caRefusals.delete(name);
     this.identities.forget(listed);
+    for (const name of this.accountsSeen.keys())
+      if (!listed.has(name)) this.accountsSeen.delete(name);
     for (const name of this.logCursors.keys())
       if (!projected.has(name)) this.logCursors.delete(name);
     for (const name of this.logWriteFailures.keys())
@@ -3087,6 +3359,14 @@ export class Controller {
   }
 
   async tick(): Promise<void> {
+    this.tickApiServer = {};
+    try {
+      await this.tickOnce();
+    } finally {
+      this.tickApiServer = undefined;
+    }
+  }
+  private async tickOnce(): Promise<void> {
     const tenants = await this.list<Tenant>(VERSION, 'Tenant', {
       [INSTALLATION]: this.cfg.installation,
     });

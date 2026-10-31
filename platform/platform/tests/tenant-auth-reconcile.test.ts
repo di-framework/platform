@@ -51,6 +51,10 @@ import {
   withDerivedPublicUrls,
 } from '../src/tenancy/resources';
 import {
+  SCHEDULER_TLS_ANNOTATION,
+  schedulerCertDigest,
+} from '../src/tenancy/scheduler-pki-rotation';
+import {
   caCertificate,
   caConstraints,
   caPermittedDns,
@@ -62,6 +66,7 @@ import {
   selfSignedCertificate,
   serialNumber,
 } from '../src/tenancy/tls';
+import { cutoverSeeds, HOST_CERT } from './support/cutover';
 import { opensslVerifies, verifiesAt as verifies, withinNameConstraints } from './support/tls';
 
 const IMAGE = `ghcr.io/di-framework/tenant-auth@sha256:${'a'.repeat(64)}`;
@@ -842,6 +847,7 @@ class MemoryApi implements Api {
         readyReplicas: this.notReady.has(value.metadata.name)
           ? 0
           : (value.spec as { replicas: number }).replicas,
+        updatedReplicas: (value.spec as { replicas: number }).replicas,
       };
     this.objects.set(target, value);
     return structuredClone(value) as T;
@@ -851,18 +857,17 @@ function prepare() {
   const api = new MemoryApi();
   const t = tenant();
   api.seed(t);
+  for (const value of cutoverSeeds(t, 'test')) api.seed(value);
   api.seed({
     apiVersion: 'runtime.wasmcloud.dev/v1alpha1',
     kind: 'Host',
-    metadata: { name: 'alpha-host', namespace: 'wasmcloud', labels: { hostgroup: 'tenant-alpha' } },
+    metadata: {
+      name: 'alpha-host',
+      namespace: 'di-operator-alpha',
+      labels: { hostgroup: 'tenant-alpha' },
+    },
     environment: 'di-tenant-alpha',
     status: { conditions: ready },
-  });
-  api.seed({
-    apiVersion: 'v1',
-    kind: 'Secret',
-    metadata: { name: 'wasmcloud-runtime-tls', namespace: 'wasmcloud' },
-    data: { 'ca.crt': 'test' },
   });
   api.seed({
     apiVersion: 'v1',
@@ -3142,7 +3147,7 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     (Array.isArray(resources)
       ? find(resources, 'Deployment', 'hostgroup-tenant-alpha')
       : resources.objects.get(hostPath)) as unknown as Deployment;
-  const schedulerSecret = { data: { 'ca.crt': 'test' } };
+  const schedulerSecret = { digest: 'test' };
   const rulesOf = (role: Resource | undefined) =>
     (role as unknown as { rules: { resources: string[]; verbs: string[] }[] }).rules;
 
@@ -3290,7 +3295,8 @@ describe('tenant registry host pull (#83:host-pull)', () => {
   it('configures the hosts with the Docker config and, over TLS, the tenant CA', () => {
     const none = host(tenantResources(tenant(), tlsCfg, schedulerSecret));
     expect(env(none)).not.toHaveProperty('DOCKER_CONFIG');
-    expect(none.spec.template.metadata.annotations).toBeUndefined();
+    // Only the scheduler certificate's digest (#541 m6e).
+    expect(none.spec.template.metadata.annotations).toEqual({ [SCHEDULER_TLS_ANNOTATION]: 'test' });
     const noneArgs = none.spec.template.spec.containers[0]!.args as string[];
     expect(noneArgs.filter((arg) => arg.includes('ca-path'))).toEqual([]);
     expect(JSON.stringify(none.spec.template.spec.volumes)).not.toContain('registry-');
@@ -3313,6 +3319,7 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     expect(container.args).not.toContain('--allow-insecure-registries');
     expect(env(withCa).DOCKER_CONFIG).toBe('/registry-auth');
     expect(withCa.spec.template.metadata.annotations).toEqual({
+      [SCHEDULER_TLS_ANNOTATION]: 'test',
       'platform.di-framework.dev/registry-ca-sha256': 'abc',
     });
     expect(container.volumeMounts).toEqual(
@@ -3406,6 +3413,7 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     expect(env(host(api)).DOCKER_CONFIG).toBe('/registry-auth');
     const ca = (api.objects.get(caPath)!.data as Record<string, string>)['ca.crt']!;
     expect(host(api).spec.template.metadata.annotations).toEqual({
+      [SCHEDULER_TLS_ANNOTATION]: schedulerCertDigest(HOST_CERT),
       'platform.di-framework.dev/registry-ca-sha256': tlsCertDigest(ca),
     });
     const template = JSON.stringify(host(api).spec.template);
@@ -3505,7 +3513,9 @@ describe('tenant registry host pull (#83:host-pull)', () => {
       api.objects.delete(hostPath);
       await new Controller(api, tlsCfg).reconcileTenant(t, []);
       expect(env(host(api)).DOCKER_CONFIG).toBe('/registry-auth');
-      expect(host(api).spec.template.metadata.annotations).toBeUndefined();
+      expect(host(api).spec.template.metadata.annotations).toEqual({
+        [SCHEDULER_TLS_ANNOTATION]: schedulerCertDigest(HOST_CERT),
+      });
     } finally {
       api.fail = undefined;
       console.error = log;

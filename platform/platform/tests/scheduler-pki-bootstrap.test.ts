@@ -142,8 +142,8 @@ describe('scheduler PKI bootstrap objects (#541, O4)', () => {
     expect(objects.some((o) => o.kind.startsWith('Cluster'))).toBe(false);
   });
 
-  it('is not awaited, so it cannot fail `pulumi up` before m6 (W1)', () => {
-    expect(one('Job').metadata.annotations).toEqual({ 'pulumi.com/skipAwait': 'true' });
+  it('is awaited, and an unfinished one is replaced on the next `up` (#541 m6e, #567 S2)', () => {
+    expect(one('Job').metadata.annotations).toEqual({ 'pulumi.com/replaceUnready': 'true' });
   });
 
   it('changes the Job template when the scripts change, so an upgrade re-runs it (#594)', () => {
@@ -415,47 +415,6 @@ describe('installSchedulerPki', () => {
     expect(registered.get(job)?.deleteBeforeReplace).toBe(true);
   });
 });
-
-it('createPlatform installs the bootstrap Job, and the Helm release does not wait for it (W1)', () => {
-  const output = execFileSync(
-    'node',
-    [
-      '-e',
-      `
-    const pulumi = require('@pulumi/pulumi');
-    const k8s = require('@pulumi/kubernetes');
-    const registered = {};
-    pulumi.runtime.setMocks({ newResource: a => ({id:a.name, state:a.inputs}), call: a => a.inputs }, 'project', 'test', false);
-    const monitor = pulumi.runtime.getMonitor();
-    const register = monitor.registerResource.bind(monitor);
-    monitor.registerResource = (request, callback) => {
-      registered[request.getName()] = { type: request.getType(), dependencies: request.getDependenciesList() };
-      return register(request, callback);
-    };
-    pulumi.runtime.runInPulumiStack(async () => {
-      const platform = require('./dist').createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test' });
-      await new Promise(r => platform.release.urn.apply(r));
-      // The release no longer waits for the Job, so wait for the Job's own registration.
-      while (!registered['scheduler-pki-job-${PKI}-${SCHEDULER_PKI_JOB}']) await new Promise(r => setTimeout(r, 10));
-    }).then(() => console.log(JSON.stringify(registered))).catch(e => {console.error(e);process.exitCode=1;});
-  `,
-    ],
-    { cwd: join(import.meta.dir, '..'), encoding: 'utf8' },
-  );
-  const all = JSON.parse(output) as Record<string, { type: string; dependencies: string[] }>;
-  const job = `scheduler-pki-job-${PKI}-${SCHEDULER_PKI_JOB}`;
-  expect(all[job]?.type).toBe('kubernetes:batch/v1:Job');
-  // Until m6 mounts its Secrets, the release must not be gated on the Job (m6 restores this).
-  expect(all.wasmcloud?.dependencies.length).toBeGreaterThan(0);
-  expect(all.wasmcloud?.dependencies.filter((urn) => urn.includes('scheduler-pki'))).toEqual([]);
-  // The Job's scripts are the controller's, read from the package build.
-  const scripts = all[`scheduler-pki-configmap-${PKI}-di-scheduler-pki`];
-  expect(scripts?.type).toBe('kubernetes:core/v1:ConfigMap');
-  expect(all[`scheduler-pki-namespace-cluster-${PKI}`]?.type).toBe('kubernetes:core/v1:Namespace');
-  expect(all[`scheduler-pki-role-wasmcloud-di-scheduler-pki`]?.type).toBe(
-    'kubernetes:rbac.authorization.k8s.io/v1:Role',
-  );
-}, 60_000);
 
 it('createPlatform refuses a namespace too long for its PKI namespace before any resource', () => {
   const output = execFileSync(

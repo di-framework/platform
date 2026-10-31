@@ -6,6 +6,7 @@ import * as path from 'node:path';
 import { loadAll } from 'js-yaml';
 import {
   SCHEDULER_NATS_CONFIG,
+  SCHEDULER_NATS_DEPLOYMENT,
   SCHEDULER_NATS_IMAGE,
   SCHEDULER_NATS_RELOADER_IMAGE,
   schedulerNatsLabels,
@@ -44,10 +45,12 @@ describe('identical to the chart where clients and policies look', () => {
     expect(ours.spec).toEqual(theirs.spec);
   });
 
-  it('keeps the workload kind, name, labels, selector, replicas and ports', () => {
+  it('keeps the workload kind, labels, selector, replicas and ports, under its own name', () => {
     const theirs = chartOf('Deployment');
     expect(deployment.kind).toBe(theirs.kind);
-    expect(deployment.metadata).toEqual(theirs.metadata);
+    // Not the chart's `nats`, so both run side by side while an upgrade hands over (#541 m6e).
+    expect(deployment.metadata).toEqual({ ...theirs.metadata, name: SCHEDULER_NATS_DEPLOYMENT });
+    expect(SCHEDULER_NATS_DEPLOYMENT).toBe('di-scheduler-nats');
     expect(deployment.spec.replicas).toBe(theirs.spec.replicas);
     expect(deployment.spec.selector).toEqual(theirs.spec.selector);
     // Only the label every selector and policy keys on, which is the chart's selector too, so a

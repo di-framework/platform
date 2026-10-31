@@ -16,6 +16,7 @@ import {
   OWNER,
   type Resource,
   TENANT,
+  TENANT_HOST_SECRET,
   type Tenant,
   tenantResources,
   USER,
@@ -24,6 +25,7 @@ import {
   userTokenSecretName,
   VERSION,
 } from '../src/tenancy/resources';
+import { cutoverSeeds } from './support/cutover';
 
 const cfg: ControllerConfig = {
   installation: 'test',
@@ -114,6 +116,7 @@ class MemoryApi implements Api {
         value.status = {
           observedGeneration: 1,
           readyReplicas: (value.spec as { replicas: number }).replicas,
+          updatedReplicas: (value.spec as { replicas: number }).replicas,
         };
       this.objects.set(target, value);
       return structuredClone(value) as T;
@@ -145,6 +148,8 @@ function hostPod(
     ...(options.phase ? { status: { phase: options.phase } } : {}),
   };
 }
+const hostPath =
+  '/apis/runtime.wasmcloud.dev/v1alpha1/namespaces/di-operator-alpha/hosts/alpha-host';
 function prepare(): { api: MemoryApi; controller: Controller; t: Tenant; u: User } {
   const api = new MemoryApi();
   const t = tenant();
@@ -154,16 +159,15 @@ function prepare(): { api: MemoryApi; controller: Controller; t: Tenant; u: User
   api.seed({
     apiVersion: 'runtime.wasmcloud.dev/v1alpha1',
     kind: 'Host',
-    metadata: { name: 'alpha-host', namespace: 'wasmcloud', labels: { hostgroup: 'tenant-alpha' } },
+    metadata: {
+      name: 'alpha-host',
+      namespace: 'di-operator-alpha',
+      labels: { hostgroup: 'tenant-alpha' },
+    },
     environment: 'di-tenant-alpha',
     status: { conditions: ready },
   });
-  api.seed({
-    apiVersion: 'v1',
-    kind: 'Secret',
-    metadata: { name: 'wasmcloud-runtime-tls', namespace: cfg.namespace },
-    data: { 'ca.crt': 'test' },
-  });
+  for (const value of cutoverSeeds(t, cfg.installation)) api.seed(value);
   return { api, controller: new Controller(api, cfg), t, u };
 }
 
@@ -441,7 +445,7 @@ describe('tenant and user resource reconciliation', () => {
   });
 
   it('separates runtime credentials and data backends from the workload namespace', () => {
-    const resources = tenantResources(tenant(), cfg, { data: { 'tls.key': 'private' } });
+    const resources = tenantResources(tenant(), cfg, { digest: 'test' });
     expect(
       resources
         .filter((r) => r.kind === 'Secret')
@@ -657,12 +661,16 @@ describe('tenant and user resource reconciliation', () => {
     const secrets = () =>
       [...api.objects.values()].filter((r) => r.kind === 'Secret' && r.metadata.labels?.[OWNER]);
     expect(secrets().map((r) => r.metadata.name)).toEqual([
+      TENANT_HOST_SECRET,
       'di-user-alice-alpha-token',
       'di-user-alice-beta-token',
     ]);
     u.spec.memberships = [{ tenant: 'beta', role: 'viewer' }];
     await controller.reconcileUser(u, [t, beta]);
-    expect(secrets().map((r) => r.metadata.name)).toEqual(['di-user-alice-beta-token']);
+    expect(secrets().map((r) => r.metadata.name)).toEqual([
+      TENANT_HOST_SECRET,
+      'di-user-alice-beta-token',
+    ]);
   });
   it('keeps memberships and token Secrets while a granted tenant is Not Ready (#119)', async () => {
     const { api, controller, t, u } = prepare();
@@ -739,21 +747,27 @@ describe('tenant and user resource reconciliation', () => {
     const { api, controller, t, u } = prepare();
     await controller.reconcileTenant(t);
     await controller.reconcileUser(u, [t]);
+    // The tenant operator has released its host (#541 m6e).
+    api.objects.delete(hostPath);
     t.metadata.deletionTimestamp = new Date().toISOString();
     api.seed(t);
     await controller.reconcileTenant(t);
     expect(api.objects.has('/api/v1/namespaces/di-tenant-alpha')).toBe(true);
+    // Every Deployment but the tenant's own operator, which R2 never sweeps.
     expect(
       [...api.objects.values()]
-        .filter((r) => r.kind === 'Deployment')
+        .filter((r) => r.kind === 'Deployment' && r.metadata.namespace !== 'di-operator-alpha')
         .every((r) => (r.spec as { replicas: number }).replicas === 0),
     ).toBe(true);
+    // R5 deleted di-operator-<t> and waits for it to be gone, which the next pass sees.
+    await controller.reconcileTenant(t);
     expect([...api.objects.values()].filter((r) => r.kind === 'RoleBinding')).toHaveLength(0);
     expect(t.metadata.finalizers).not.toContain(FINALIZER);
   });
   it('keeps the Retain finalizer until the host pods are gone, terminating ones included (#245)', async () => {
     const { api, controller, t } = prepare();
     await controller.reconcileTenant(t);
+    api.objects.delete(hostPath);
     const n = names('alpha');
     // The Deployments already report zero replicas; a terminating host pod is still there.
     api.seed(hostPod('hostgroup-terminating', 'alpha', { terminating: true, phase: 'Running' }));
@@ -788,6 +802,8 @@ describe('tenant and user resource reconciliation', () => {
     await controller.reconcileTenant(t);
     expect(t.metadata.finalizers).toContain(FINALIZER);
     api.objects.delete(`/api/v1/namespaces/${n.runtimeNamespace}/pods/hostgroup-terminating`);
+    // R5 deletes di-operator-<t>, which the next pass sees gone.
+    await controller.reconcileTenant(t);
     await controller.reconcileTenant(t);
     expect(t.metadata.finalizers).not.toContain(FINALIZER);
     expect(api.objects.has(`/api/v1/namespaces/${n.runtimeNamespace}`)).toBe(true);
@@ -798,6 +814,7 @@ describe('tenant and user resource reconciliation', () => {
   it('under Retain, finished host pods do not hold the Tenant; running, pending and unknown ones do (#245)', async () => {
     const { api, controller, t } = prepare();
     await controller.reconcileTenant(t);
+    api.objects.delete(hostPath);
     const n = names('alpha');
     const pod = (name: string) => `/api/v1/namespaces/${n.runtimeNamespace}/pods/${name}`;
     for (const name of ['running', 'pending', 'unknown', 'no-status', 'r5', 'r6']) {
@@ -821,6 +838,7 @@ describe('tenant and user resource reconciliation', () => {
       api.objects.delete(pod(name));
     }
     await controller.reconcileTenant(t);
+    await controller.reconcileTenant(t);
     expect(t.metadata.finalizers).not.toContain(FINALIZER);
     // Only finished pods were left; the controller still deletes nothing under Retain.
     expect(api.objects.has(pod('evicted'))).toBe(true);
@@ -832,6 +850,7 @@ describe('tenant and user resource reconciliation', () => {
   it('a terminating host pod holds the Retain Tenant even in a finished phase (#245)', async () => {
     const { api, controller, t } = prepare();
     await controller.reconcileTenant(t);
+    api.objects.delete(hostPath);
     api.seed(hostPod('evicted-terminating', 'alpha', { terminating: true, phase: 'Failed' }));
     t.metadata.deletionTimestamp = new Date().toISOString();
     api.seed(t);
@@ -846,9 +865,13 @@ describe('tenant and user resource reconciliation', () => {
     const live = () =>
       namespaces.filter((name) => api.objects.has(`${collection('v1', 'Namespace')}/${name}`));
     expect(live()).toEqual(namespaces);
+    api.objects.delete(hostPath);
     t.spec.deletionPolicy = 'Delete';
     t.metadata.deletionTimestamp = new Date().toISOString();
     api.seed(t);
+    // R5 deletes di-operator-<t> first, R6 the others once it is gone.
+    await controller.reconcileTenant(t);
+    expect(live()).toEqual(namespaces);
     await controller.reconcileTenant(t);
     // The API-key namespace (#379) goes with the others.
     expect(live()).toEqual([]);
@@ -860,7 +883,6 @@ describe('tenant and user resource reconciliation', () => {
 
 describe('placement nudge after a tenant host becomes Ready (#418)', () => {
   const workloads = '/apis/runtime.wasmcloud.dev/v1alpha1/namespaces/di-tenant-alpha/workloads';
-  const hostPath = '/apis/runtime.wasmcloud.dev/v1alpha1/namespaces/wasmcloud/hosts/alpha-host';
   function setup(hostReady = true) {
     const { api, controller, t } = prepare();
     api.seed({

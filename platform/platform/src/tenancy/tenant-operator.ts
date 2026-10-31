@@ -4,7 +4,7 @@
  * upstream process flags and environment, exactly as runtime-operator chart 2.8.0 renders its own
  * operator with `watchNamespaces` set (`templates/operator/deployment.yaml`).
  *
- * #541 m3 renders these objects; the controller does not apply them yet (m6).
+ * #541 m3 renders these objects; the controller applies them per tenant (m6e).
  */
 import {
   COMPONENT,
@@ -31,6 +31,15 @@ export {
   TENANT_OPERATOR_COMPONENT,
   TENANT_OPERATOR_NAME,
 };
+
+/**
+ * How long the controller waits, once the accounts file it wrote names a tenant operator's user,
+ * before it first creates that operator's Deployment (#541 m6e, owner decision 1). Nothing reports
+ * when NATS has loaded the file: the kubelet refreshes a mounted ConfigMap within about a minute
+ * (its sync period plus the ConfigMap cache TTL), then the reloader signals the server. An
+ * operator started earlier would be refused and exit on its first connect.
+ */
+export const TENANT_OPERATOR_PROPAGATION_MS = 120_000;
 
 /** The runtime-operator Helm chart version the platform installs, and the operator image tag. */
 export const WASMCLOUD_OPERATOR_VERSION = '2.8.0';
@@ -164,9 +173,9 @@ export type TenantOperatorRender =
     };
 
 /**
- * The tenant's operator: its namespace, ServiceAccount, Deployment, the RoleBindings to the three
- * fixed ClusterRoles in the tenant's three namespaces, and the namespace's network policies.
- * Not ready while the API-server endpoints are unknown.
+ * The tenant's operator, in apply order: its namespace, ServiceAccount, the RoleBindings to the
+ * three fixed ClusterRoles in the tenant's three namespaces, the namespace's network policies, and
+ * last its Deployment. Not ready while the API-server endpoints are unknown.
  */
 export function tenantOperatorResources(
   tenant: Tenant,
@@ -328,14 +337,16 @@ export function tenantOperatorResources(
     }),
   ];
 
+  // In apply order (#541 m6e): the labelled Namespace before the RoleBindings its binding policies
+  // check, and the Deployment last, once its access and policies are in place.
   return {
     ready: true,
     resources: [
       namespace,
       make('v1', 'ServiceAccount', TENANT_OPERATOR_NAME, ns, {}),
       ...bindings,
-      deployment,
       ...policies,
+      deployment,
     ],
   };
 }

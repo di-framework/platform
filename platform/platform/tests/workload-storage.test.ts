@@ -134,7 +134,7 @@ describe('storage keys and paths', () => {
 
 describe('tenant host pod', () => {
   function host(keys: string[]) {
-    const deployment = tenantResources(tenant(), cfg, { data: { 'ca.crt': 'x' } }, keys).find(
+    const deployment = tenantResources(tenant(), cfg, { digest: 'test' }, keys).find(
       (r) => r.kind === 'Deployment' && r.metadata.name === 'hostgroup-tenant-alpha',
     );
     return ((deployment as Resource).spec as { template: { spec: Record<string, unknown> } })
@@ -149,7 +149,7 @@ describe('tenant host pod', () => {
     const strategy = (keys: string[]) =>
       (
         (
-          tenantResources(tenant(), cfg, { data: { 'ca.crt': 'x' } }, keys).find(
+          tenantResources(tenant(), cfg, { digest: 'test' }, keys).find(
             (r) => r.kind === 'Deployment' && r.metadata.name === 'hostgroup-tenant-alpha',
           ) as Resource
         ).spec as { strategy?: unknown }
@@ -223,7 +223,7 @@ describe('tenant host NATS wait (#470)', () => {
     const deployment = tenantResources(
       t,
       { ...cfg, schedulerNatsUrl },
-      { data: { 'ca.crt': 'x' } },
+      { digest: 'test' },
       [],
     ).find((r) => r.kind === 'Deployment' && r.metadata.name === 'hostgroup-tenant-alpha');
     return (

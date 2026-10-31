@@ -13,6 +13,7 @@ import {
   controllerClusterRoleRules,
   controllerNamespaceRoleRules,
 } from '../src/tenancy/install';
+import { bindsTenantOperatorRole } from '../src/tenancy/removal-sequence';
 import {
   type ControllerConfig,
   INSTALLATION,
@@ -35,6 +36,7 @@ import {
 } from '../src/tenancy/tenant-operator';
 import { caCertificate, leafCertificate } from '../src/tenancy/tls';
 import { evaluate } from './support/cel';
+import { cutoverSeeds } from './support/cutover';
 
 // #115: the platform controller writes tenant RBAC without `escalate` and binds only named Roles.
 // Everything below is computed from the objects the controller renders, so a new Role, binding
@@ -315,6 +317,12 @@ const RBAC_OWNERS = [
   'controller:Controller.removalOperator',
   // The kinds of the leftover log reader that pruneLogReader deletes when this installation owns it.
   'controller:LOG_READER_KINDS',
+  // The tenant operator's renderer and its fixed ClusterRoles, which the controller applies since
+  // #541 m6e; the runtime checks below cover the bindings it writes.
+  'tenant-operator:OPERATOR_ROLE_REF',
+  'tenant-operator:RBAC_GROUP',
+  'tenant-operator:tenantOperatorClusterRoles',
+  'tenant-operator:tenantOperatorResources',
 ];
 /** The RBAC API group, a quoted RBAC kind, or an RBAC kind used as an object key. */
 const RBAC_MENTION = [
@@ -739,6 +747,9 @@ describe('platform controller RBAC at runtime (#321)', () => {
       carol,
     ];
     for (const value of [...tenants, ...users]) api.seed(value);
+    for (const t of tenants) for (const value of cutoverSeeds(t, cfg.installation)) api.seed(value);
+    // Pulumi creates the fixed tenant-operator ClusterRoles (design-541 §4.6).
+    for (const value of tenantOperatorClusterRoles(cfg.installation)) api.seed(value);
     // Ready hosts, so the tenants turn Ready and their members are bound.
     for (const t of tenants)
       api.seed({
@@ -746,18 +757,12 @@ describe('platform controller RBAC at runtime (#321)', () => {
         kind: 'Host',
         metadata: {
           name: `${t.metadata.name}-host`,
-          namespace: cfg.namespace,
+          namespace: `di-operator-${t.metadata.name}`,
           labels: { hostgroup: `tenant-${t.metadata.name}` },
         },
         environment: `di-tenant-${t.metadata.name}`,
         status: { conditions: ready },
       });
-    api.seed({
-      apiVersion: 'v1',
-      kind: 'Secret',
-      metadata: { name: 'wasmcloud-runtime-tls', namespace: cfg.namespace },
-      data: { 'ca.crt': 'dGVzdA==' },
-    });
     api.seed({
       apiVersion: 'v1',
       kind: 'Secret',
@@ -848,8 +853,14 @@ describe('platform controller RBAC at runtime (#321)', () => {
     // beta (suspended) keeps its Roles but gets no tenant-controller or member bindings.
     expect(names.has('ClusterRole /di-tenant-controller-beta')).toBe(true);
     expect(names.has('ClusterRoleBinding /di-tenant-controller-beta')).toBe(false);
+    // Only its own operator's binding, which suspension keeps (S2).
     expect(
-      written.some((o) => o.kind === 'RoleBinding' && o.metadata.namespace === 'di-tenant-beta'),
+      written.some(
+        (o) =>
+          o.kind === 'RoleBinding' &&
+          o.metadata.namespace === 'di-tenant-beta' &&
+          !bindsTenantOperatorRole(o),
+      ),
     ).toBe(false);
     // gamma has no members: no users rule and an empty TokenRequest Role.
     const gamma = written.findLast((o) => ref(o) === 'ClusterRole /di-tenant-controller-gamma');

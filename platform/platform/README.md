@@ -127,6 +127,19 @@ The order matters. If step 3 runs before the controller owns the value (step 2),
 `kubectl-set` leaves `WASH_CORE_INSTANCES` unowned, and the next apply sets `"100"`,
 rolling the host back from 300.
 
+#### A failed `runtime-operator` release
+
+`pulumi up` waits up to `timeoutSeconds` (600 by default) for the `runtime-operator` Helm
+release to become ready. If it does not, `up` fails and the release stays at its failed
+revision: it is not rolled back. Fix the cause and run `pulumi up` again; it upgrades the
+release from where it stopped. Every other step of the scheduler NATS install (the PKI Job,
+`di-scheduler-nats` and the Service `nats`) is idempotent, so a re-run converges.
+
+Pass `kubeconfig` (the admin kubeconfig, which `existing` requires) when you call
+`createPlatform` directly. The Service `nats` is applied through a provider of its own built
+from it, which takes over the Service an earlier chart release created and keeps its UID and
+ClusterIP. Without it, `up` of an installation whose chart created that Service fails at it.
+
 #### Upgrading to a version that adds a Tenant spec field
 
 `pulumi up` cannot add a Tenant spec field to the CRD and set it on an existing Tenant in
@@ -796,14 +809,17 @@ whatever `node` is on `PATH`; `di-framework-kube` does not pin a version.
 
 ## Known issues
 
-- **Restarts while NATS starts
-  ([#470](https://github.com/di-framework/platform/issues/470)).** On a fresh install the
-  `runtime-operator` and `hostgroup-default` pods may restart once or twice while NATS starts:
-  both exit when their first NATS connect fails, and the upstream `runtime-operator` chart
-  offers no startup wait. Tenant host pods are not affected by start-up ordering: their
-  `wait-for-nats` init container waits up to 10 minutes for the scheduler NATS and the
-  tenant's `di-nats` before the host starts. After that cap the init container exits 1 and
-  the pod restarts as usual.
+- **Tenant operator restarts after its first start (#541).** The platform-owned scheduler NATS
+  (`di-scheduler-nats`) is Ready before the `runtime-operator` release is applied, so the
+  platform operator and `hostgroup-default` connect on their first try. A tenant's own
+  `runtime-operator` exits when its first NATS connect is refused, and nothing reports when
+  NATS has loaded the accounts file that admits it. The controller therefore creates it only
+  after the written file has named its user for 120 seconds, and moves the tenant's hosts to a
+  renewed or rotated certificate only after the same wait for the new user. If NATS loads the
+  file later than that, the operator restarts until it does. Tenant host pods are not affected
+  by start-up ordering: their `wait-for-nats` init container waits up to 10 minutes for the
+  scheduler NATS and the tenant's `di-nats` before the host starts. After that cap the init
+  container exits 1 and the pod restarts as usual.
 
 ## Development
 
@@ -931,28 +947,15 @@ instance's. Only a published gateway is reachable from other instances.
   and `controller.js` requires `resources.js`, `backing-service-reconcile.js`, and
   `service-binding-reconcile.js` and `postgres.js`. There is no runtime `transpileModule` or
   PLATFORM_TS_ASSETS allowlist for these modules.
-- **Removing a tenant** from config: Pulumi updates the wasmCloud Helm release before it
-  deletes the Tenant, and the runtime operator must keep watching `di-runtime-<tenant>` to
-  release its host pods' finalizers while the controller drains the tenant (#227). So on
-  `pulumi up` the operator's `hostNamespaces` list the declared tenants plus every Tenant of
-  the installation that still exists, read with the admin `kubeconfig`. The namespace stops
-  being watched on the next `up`, after the Tenant is gone. Under either `deletionPolicy` the
-  Tenant is removed once its host pods are gone (`Retain` keeps only the namespaces and data),
-  so a retained namespace is not watched. The Tenants are listed once per `up` or preview and
-  that one list serves both this and the `Retain` removal warning (#245). A preview reads it
-  too, so its diff shows the namespaces the `up` will apply, and an info line appears only for
-  a tenant that is actually being removed; if a preview cannot list the Tenants, it warns and
-  shows the declared tenants only. Whenever the kubeconfig is not known during a preview (for
-  example, the first preview of a cluster this program creates, or a kubeconfig that comes from a
-  resource with pending changes), the preview shows the values as unknown and the Release as
-  updated, even if the `up` then changes nothing. The Tenant list is
-  retried up to three times (0.5 s, 1 s, 2 s apart,
-  and no retry starts more than 15 s after the first attempt) on HTTP 429/5xx and connection
-  errors, including undici's `UND_ERR_SOCKET`/`UND_ERR_CONNECT_TIMEOUT` and Bun's
-  `ConnectionRefused`-style codes; a failure that remains fails `up` with `Cannot list
-  the Tenants of installation <name> ... (#227): <HTTP status or error code>`. An error without
-  either, such as an unusable kubeconfig, names its class and what to check in the kubeconfig
-  (#245).
+- **Removing a tenant** from config changes no Helm value: the chart's `runtime-operator`
+  watches and hosts only the platform namespace, and each tenant's own operator in
+  `di-operator-<tenant>` releases its host pods' finalizers while the controller drains the
+  tenant (#541). With the admin `kubeconfig`, the Tenants of the installation are listed once
+  per `up` or preview for the `Retain` removal warning (#228, #245), retried up to three times
+  (0.5 s, 1 s, 2 s apart, and no retry starts more than 15 s after the first attempt) on HTTP
+  429/5xx and connection errors, including undici's `UND_ERR_SOCKET`/`UND_ERR_CONNECT_TIMEOUT`
+  and Bun's `ConnectionRefused`-style codes. A list that still fails skips the warning (logged at
+  debug level) and never fails `up`.
 - Scheduler/control-plane NATS remains distinct from application messaging
   `BackingService` instances.
 - **Blobstore** services (`blobstore-nats`) run the same JetStream NATS image as messaging.

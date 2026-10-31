@@ -262,8 +262,9 @@ export function schedulerPkiBootstrap(
       kind: 'Job',
       metadata: {
         ...meta(SCHEDULER_PKI_JOB),
-        // Until m6 nothing reads the Job's output, so it must not fail `pulumi up` (#541 W1).
-        annotations: { 'pulumi.com/skipAwait': 'true' },
+        // Awaited: the scheduler NATS and the Helm release mount its Secrets (#541 m6e). A Job left
+        // unfinished by an interrupted `up` is replaced on the next one rather than awaited (#567 S2).
+        annotations: { 'pulumi.com/replaceUnready': 'true' },
       },
       spec: {
         backoffLimit: 4,
@@ -316,8 +317,8 @@ export function schedulerPkiBootstrap(
 
 /**
  * Applies {@link schedulerPkiBootstrap}: the namespace first, then the Job's admission policy,
- * RBAC, code and network policy, then the Job. It returns the Job. Until m6 the Helm release does
- * not depend on it, and the Job is not awaited (#541 W1).
+ * RBAC, code and network policy, then the Job. It returns the Job, which Pulumi awaits: the
+ * scheduler NATS and the Helm release depend on it (#541 m6e).
  */
 export function installSchedulerPki(args: {
   namespace: string;

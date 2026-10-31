@@ -130,9 +130,10 @@ describe('tenant operator manifests', () => {
       'RoleBinding di-operator-alpha/di-tenant-operator-self',
       'RoleBinding di-tenant-alpha/di-tenant-operator-workloads',
       'RoleBinding di-runtime-alpha/di-tenant-operator-hosts',
-      'Deployment di-operator-alpha/runtime-operator',
       'NetworkPolicy di-operator-alpha/di-operator-egress',
       'NetworkPolicy di-operator-alpha/di-operator-ingress',
+      // Last, in apply order: once its access and policies are in place (#541 m6e).
+      'Deployment di-operator-alpha/runtime-operator',
     ]);
     for (const o of objects)
       expect(o.metadata.labels).toMatchObject({

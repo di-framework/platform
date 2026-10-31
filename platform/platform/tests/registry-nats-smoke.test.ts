@@ -107,21 +107,11 @@ function render(): Resource[] {
       'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:e27812beefa4ff8ad7a6ae6f5c64eaf67d6d4719ed36c5880bda6106e24b84ab',
     schedulerNatsUrl: 'nats://nats:4222',
   };
-  return tenantResources(
-    tenant,
-    cfg,
-    { data: { 'ca.crt': 'smoke' } },
-    [],
-    false,
-    false,
-    false,
-    undefined,
-    {
-      password: PASSWORD,
-      stage: 'migrating',
-      credentials: true,
-    },
-  );
+  return tenantResources(tenant, cfg, { digest: 'test' }, [], false, false, false, undefined, {
+    password: PASSWORD,
+    stage: 'migrating',
+    credentials: true,
+  });
 }
 
 function find<T extends Resource>(resources: Resource[], kind: string, name: string): T {

@@ -6,8 +6,9 @@ import {
   extraHostGroupsWarning,
   platformIngressPolicies,
   RUNTIME_OPERATOR_SERVICE_PORT,
+  tenantOperatorsPeer,
 } from '../src/platform-ingress';
-import { INSTALLATION, TENANT } from '../src/tenancy/resources';
+import { INSTALLATION, NAMESPACE_ROLE, TENANT } from '../src/tenancy/resources';
 
 const root = join(import.meta.dir, '..');
 
@@ -35,6 +36,8 @@ function renderPolicies(httpNodePort: number): Policy[] {
     pulumi.runtime.runInPulumiStack(async () => {
       const platform = require('./dist').createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', httpNodePort:${httpNodePort} });
       await platform.namespace.promise();
+      // The policies follow the release, which now waits for the scheduler NATS (#541 m6e).
+      await platform.release.urn.promise();
       const sentinel = new k8s.core.v1.Namespace('sentinel', {}, { provider: new k8s.Provider('sentinel-provider', {}) });
       await new Promise(r => sentinel.urn.apply(r));
     }).then(() => {
@@ -87,6 +90,14 @@ describe('platform namespace ingress (#462)', () => {
               namespaceSelector: tenantNamespaces,
               podSelector: { matchLabels: { 'wasmcloud.com/name': 'hostgroup' } },
             },
+            // Each tenant's own runtime-operator (#541 m6e, design-541 §4.6).
+            {
+              namespaceSelector: {
+                matchLabels: { [INSTALLATION]: 'di-test', [NAMESPACE_ROLE]: 'operator' },
+                matchExpressions: [{ key: TENANT, operator: 'Exists' }],
+              },
+              podSelector: { matchLabels: { 'wasmcloud.com/name': 'runtime-operator' } },
+            },
           ],
           ports: [{ protocol: 'TCP', port: 4222 }],
         },
@@ -129,7 +140,11 @@ describe('platform namespace ingress (#462)', () => {
   };
 
   it('renders no open ingress rule in the platform namespace when the gateway is unpublished', () => {
-    walk(renderPolicies(0), []);
+    const platform = walk(renderPolicies(0), []);
+    // The tenancy's NATS policy admits each tenant's own runtime-operator (#541 m6e, S3 of the
+    // #613 review), next to the platform and tenant host groups.
+    const scheduler = platform.find((p) => p.metadata.name === 'di-tenant-scheduler');
+    expect(scheduler?.spec.ingress?.[0]?.from).toContainEqual(tenantOperatorsPeer('di-test'));
   }, 60_000);
 
   it('leaves only the published gateway open', () => {

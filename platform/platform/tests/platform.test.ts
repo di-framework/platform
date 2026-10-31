@@ -1,10 +1,10 @@
-import { expect, test } from 'bun:test';
+import { describe, expect, it, test } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PLATFORM_SECRETS } from '../src/tenancy/scheduler-pki';
 import { platformValues } from '../src/values';
-import { RUNTIME_OPERATOR_RENDER } from './fixtures/runtime-operator-render';
 import { selfSignedCert } from './support/tls';
 
 const root = join(import.meta.dir, '..');
@@ -60,28 +60,204 @@ const TENANT_API = `
 
 test('administrator overrides cannot enable shared hosts or escape watched namespaces', () => {
   const defaults = {
-    operator: { allowSharedHosts: false, hostNamespaces: ['wasmcloud', 'di-runtime-alpha'] },
     runtime: { resources: { limits: { memory: '2Gi' }, requests: { cpu: '250m' } } },
+  };
+  const platform = {
+    allowSharedHosts: false,
+    watchNamespaces: ['wasmcloud'],
+    hostNamespaces: ['wasmcloud'],
   };
   const values = platformValues(
     {
-      operator: { allowSharedHosts: true, hostNamespaces: ['other'] },
+      operator: { allowSharedHosts: true, hostNamespaces: ['other'], watchNamespaces: [] },
       runtime: { resources: { limits: { memory: '3Gi' } } },
     },
     defaults,
+    'wasmcloud',
   );
-  expect(values.operator).toEqual(defaults.operator);
+  expect(values.operator).toEqual(platform);
   // The chart's open ingress policies stay off; the platform renders its own (#462).
-  expect(platformValues({ networkPolicy: { enabled: true } }, defaults).networkPolicy).toEqual({
-    enabled: false,
-  });
+  expect(
+    platformValues({ networkPolicy: { enabled: true } }, defaults, 'wasmcloud').networkPolicy,
+  ).toEqual({ enabled: false });
   expect(values.runtime).toEqual({
     resources: { limits: { memory: '3Gi' }, requests: { cpu: '250m' } },
   });
-  expect(platformValues({ operator: null }, defaults).operator).toEqual(defaults.operator);
-  expect(() => platformValues(JSON.parse('{"__proto__":{}}'), defaults)).toThrow(
+  expect(platformValues({ operator: null }, defaults, 'wasmcloud').operator).toEqual(platform);
+  expect(() => platformValues(JSON.parse('{"__proto__":{}}'), defaults, 'wasmcloud')).toThrow(
     'Invalid values key',
   );
+});
+
+describe('chart values enforced over args.values (design-541 §4.1, §8.1)', () => {
+  const hostile = {
+    nats: { enabled: true, podLabels: { a: 'b' } },
+    global: {
+      tls: { enabled: false },
+      nats: { schedulerUrl: 'nats://elsewhere:4222', dataUrl: 'nats://elsewhere:4222' },
+      certificates: {
+        generate: true,
+        caSecretName: 'mine',
+        operatorCertSecretName: 'wasmcloud-operator-tls',
+        runtimeCertSecretName: 'wasmcloud-runtime-tls',
+        dataCertSecretName: 'wasmcloud-data-tls',
+      },
+      image: { registry: 'mirror.example' },
+    },
+    operator: { watchNamespaces: ['di-tenant-alpha'], hostNamespaces: ['di-runtime-alpha'] },
+  };
+  const values = platformValues(hostile, {}, 'wasmcloud') as Record<string, any>;
+
+  it('renders no chart NATS, keeping unrelated keys', () => {
+    expect(values.nats).toEqual({ enabled: false, podLabels: { a: 'b' } });
+  });
+
+  it('mounts the platform-issued Secrets over TLS and generates no certificate', () => {
+    expect(values.global.tls).toEqual({ enabled: true });
+    expect(values.global.certificates).toEqual({
+      generate: false,
+      caSecretName: 'mine',
+      operatorCertSecretName: 'di-scheduler-operator-tls',
+      runtimeCertSecretName: 'di-scheduler-platform-host-tls',
+      dataCertSecretName: 'di-scheduler-data-tls',
+    });
+    // The names the PKI bootstrap Job writes.
+    expect(values.global.certificates.operatorCertSecretName).toBe(PLATFORM_SECRETS.operator);
+    expect(values.global.certificates.runtimeCertSecretName).toBe(PLATFORM_SECRETS.host);
+    expect(values.global.certificates.dataCertSecretName).toBe(PLATFORM_SECRETS.data);
+    expect(values.global.image).toEqual({ registry: 'mirror.example' });
+  });
+
+  it('points every client at the platform namespace server', () => {
+    expect(values.global.nats).toEqual({ schedulerUrl: '', dataUrl: '' });
+  });
+
+  it('serves only the platform namespace', () => {
+    expect(values.operator.watchNamespaces).toEqual(['wasmcloud']);
+    expect(values.operator.hostNamespaces).toEqual(['wasmcloud']);
+    expect(platformValues({}, {}, 'other').operator).toMatchObject({
+      watchNamespaces: ['other'],
+      hostNamespaces: ['other'],
+    });
+  });
+
+  it('accepts host groups in the platform namespace', () => {
+    const groups = [
+      { name: 'default' },
+      { name: 'a', namespace: '' },
+      { name: 'b', namespace: 'wasmcloud' },
+    ];
+    expect(
+      (platformValues({ runtime: { hostGroups: groups } }, {}, 'wasmcloud').runtime as any)
+        .hostGroups,
+    ).toEqual(groups);
+  });
+
+  it('refuses a host group in another namespace', () => {
+    expect(() =>
+      platformValues(
+        { runtime: { hostGroups: [{ name: 'gpu', namespace: 'di-runtime-alpha' }] } },
+        {},
+        'wasmcloud',
+      ),
+    ).toThrow(
+      'values.runtime.hostGroups gpu: namespace di-runtime-alpha is not the platform namespace wasmcloud',
+    );
+  });
+
+  it('refuses a host group with its own NATS URLs', () => {
+    for (const url of ['schedulerNatsUrl', 'dataNatsUrl'])
+      expect(() =>
+        platformValues(
+          { runtime: { hostGroups: [{ name: 'gpu', [url]: 'nats://elsewhere:4222' }] } },
+          {},
+          'wasmcloud',
+        ),
+      ).toThrow('values.runtime.hostGroups gpu: schedulerNatsUrl and dataNatsUrl cannot be set');
+  });
+
+  // #613 W3: the chart appends extraArgs and env after the flags and env it renders from the
+  // enforced settings (chart 2.8.0 operator/deployment.yaml, runtime/deployment.yaml).
+  const operatorFlags = [
+    '-nats-url=nats://other:4222',
+    '--nats-url=nats://other:4222',
+    '-nats-url',
+    '-nats-ca=/x',
+    '-nats-client-cert=/x',
+    '-nats-client-key=/x',
+    '-nats-creds=/x',
+    '-nats-tls-first',
+    '-watch-namespaces=',
+    '-host-namespaces=di-runtime-alpha',
+    '-allow-shared-hosts=true',
+    '--allow-shared-hosts',
+  ];
+  const hostFlags = [
+    '--scheduler-nats-url=nats://other:4222',
+    '--scheduler-nats-url',
+    '--scheduler-nats-tls-ca=/x',
+    '--scheduler-nats-tls-cert=/x',
+    '--scheduler-nats-tls-key=/x',
+    '--data-nats-url=nats://other:4222',
+    '--data-nats-tls-ca=/x',
+    '--data-nats-tls-cert=/x',
+    '--data-nats-tls-key=/x',
+  ];
+
+  it('refuses operator extraArgs that set an enforced flag', () => {
+    for (const arg of operatorFlags)
+      expect(() =>
+        platformValues({ operator: { extraArgs: ['-json-log', arg] } }, {}, 'wasmcloud'),
+      ).toThrow(
+        `values.operator.extraArgs: ${arg} sets a flag the platform enforces (design-541 §4.1); remove it`,
+      );
+  });
+
+  it('refuses host extraArgs that set an enforced flag, chart-wide or per group', () => {
+    for (const arg of hostFlags) {
+      expect(() => platformValues({ runtime: { extraArgs: [arg] } }, {}, 'wasmcloud')).toThrow(
+        `values.runtime.extraArgs: ${arg} sets a flag the platform enforces`,
+      );
+      expect(() =>
+        platformValues(
+          { runtime: { hostGroups: [{ name: 'gpu', extraArgs: ['--log-level=debug', arg] }] } },
+          {},
+          'wasmcloud',
+        ),
+      ).toThrow(`values.runtime.hostGroups gpu: extraArgs: ${arg} sets a flag`);
+    }
+  });
+
+  it('refuses env entries that override an enforced setting', () => {
+    expect(() =>
+      platformValues(
+        { operator: { env: [{ name: 'OPERATOR_NAMESPACE', value: 'di-runtime-alpha' }] } },
+        {},
+        'wasmcloud',
+      ),
+    ).toThrow('values.operator.env: OPERATOR_NAMESPACE is set by the platform');
+  });
+
+  it('keeps extraArgs and env that set other flags', () => {
+    const values = platformValues(
+      {
+        operator: {
+          extraArgs: ['-json-log', '-metrics-secure=true', 'positional'],
+          env: [{ name: 'GOMAXPROCS', value: '2' }],
+        },
+        runtime: {
+          extraArgs: ['--allow-insecure-registries', 7],
+          env: [{ name: 'RUST_LOG', value: 'info' }],
+          hostGroups: [{ name: 'gpu', extraArgs: ['--wasi-webgpu'], env: [{ value: 'unnamed' }] }],
+        },
+      },
+      {},
+      'wasmcloud',
+    ) as Record<string, any>;
+    expect(values.operator.extraArgs).toEqual(['-json-log', '-metrics-secure=true', 'positional']);
+    expect(values.runtime.extraArgs).toEqual(['--allow-insecure-registries', 7]);
+    expect(values.runtime.hostGroups[0].extraArgs).toEqual(['--wasi-webgpu']);
+  });
 });
 
 test('published implementation provisions tenancy and isolation for an existing cluster', () => {
@@ -111,19 +287,21 @@ test('published implementation provisions tenancy and isolation for an existing 
   );
   const resources = JSON.parse(output) as { type: string; name: string; inputs: any }[];
   const release = resources.find((r) => r.type === 'kubernetes:helm.sh/v3:Release');
+  // Static: the chart's operator serves only the platform namespace (#541 m6e).
   expect(release?.inputs.values.operator).toEqual({
     allowSharedHosts: false,
-    hostNamespaces: ['wasmcloud', 'di-runtime-alpha'],
+    watchNamespaces: ['wasmcloud'],
+    hostNamespaces: ['wasmcloud'],
   });
   expect(release?.inputs.values.runtime.extraArgs).toEqual([]);
-  // The release post-renders the chart so its scheduler NATS drops `-DV` (#550).
-  const patched = execFileSync(release?.inputs.postrender, {
-    input: RUNTIME_OPERATOR_RENDER,
-    encoding: 'utf8',
-  });
-  expect(patched).toContain('- /nats-config/nats-server.conf');
-  expect(release?.inputs.postrender).toMatch(/nats-postrender-[0-9a-f]{16}$/);
-  expect(patched).not.toContain('-DV');
+  // The chart renders no NATS, so nothing post-renders it (#550 is moot).
+  expect(release?.inputs.postrender).toBeUndefined();
+  // Retryable by re-running `pulumi up`, not by Helm's rollback, which cannot restore a release
+  // whose Service `nats` the platform keeps (#613 W2). Still awaited, within a timeout.
+  expect(release?.inputs.atomic).toBeUndefined();
+  expect(release?.inputs.skipAwait).toBe(false);
+  expect(release?.inputs.cleanupOnFail).toBe(true);
+  expect(release?.inputs.timeout).toBe(600);
   const firewall = resources.find((r) => r.type === 'kubernetes:apps/v1:DaemonSet');
   expect(firewall?.inputs.spec.template.spec.containers[0].args).toEqual([
     '--run-router=false',
@@ -570,6 +748,7 @@ function operatorNamespaces(options: {
     startTenantApi().then(() => pulumi.runtime.runInPulumiStack(async () => {
       const platform = require('./dist').createPlatform({ provider:new k8s.Provider('test', {}), installation:'di-test', kubeconfig: pulumi.secret(tenantApiKubeconfig) });
       await platform.release.urn.promise();
+      await platform.removalNotice.promise();
     })).then(() => {
       const release = resources.find(r => r.type === 'kubernetes:helm.sh/v3:Release');
       console.log(JSON.stringify({ hits: tenantHits, hostNamespaces: release.inputs.values.operator.hostNamespaces }));
@@ -598,63 +777,36 @@ function operatorNamespaces(options: {
   };
 }
 
-test('removing a tenant keeps its runtime namespace watched until its Tenant is gone (#227)', () => {
-  // The up that drops beta from config: Pulumi updates the release before it deletes the Tenant,
-  // so the operator must still watch di-runtime-beta to release its host pods' finalizers.
-  const removing = operatorNamespaces({ declared: ['alpha'], cluster: ['alpha', 'beta'] });
-  expect(removing.failure).toBeUndefined();
-  expect(removing.hostNamespaces).toEqual(['wasmcloud', 'di-runtime-alpha', 'di-runtime-beta']);
-  // Listed once through tenancy/removal's lister and shared with the #228 Retain check, which
-  // warns from the same snapshot (#245).
-  expect(removing.hits).toEqual([TENANT_LIST_PATH]);
-  expect(removing.log).toContain('Tenant beta is no longer declared but still exists');
-  expect(removing.log).toContain('Tenant beta is being removed with deletionPolicy Retain');
-  // The next up, after the Tenant is gone: the namespace stops being watched.
-  const removed = operatorNamespaces({ declared: ['alpha'], cluster: ['alpha'] });
-  expect(removed.hostNamespaces).toEqual(['wasmcloud', 'di-runtime-alpha']);
-  expect(removed.log).not.toContain('no longer declared');
+test('the Tenant list feeds only the Retain check; the operator serves the platform namespace (#541 m6e)', () => {
+  // The chart's operator never watches a tenant namespace any more (design-541 §4.1): each tenant's
+  // own operator releases its host pods' finalizers, so removing a tenant changes no Helm value.
+  for (const dryRun of [false, true]) {
+    const removing = operatorNamespaces({
+      declared: ['alpha'],
+      cluster: ['alpha', 'beta'],
+      dryRun,
+    });
+    expect(removing.failure).toBeUndefined();
+    expect(removing.hostNamespaces).toEqual(['wasmcloud']);
+    // Listed once through tenancy/removal's lister for the #228 Retain check (#245).
+    expect(removing.hits).toEqual([TENANT_LIST_PATH]);
+    expect(removing.log).toContain('Tenant beta is being removed with deletionPolicy Retain');
+    expect(removing.log).not.toContain('(#227)');
+  }
 }, 60_000);
 
-test('preview reads the shared Tenant list once, so its diff matches the up (#245)', () => {
-  const preview = operatorNamespaces({
-    declared: ['alpha'],
-    cluster: ['alpha', 'beta'],
-    dryRun: true,
-  });
-  expect(preview.failure).toBeUndefined();
-  // beta still exists, so preview keeps watching di-runtime-beta exactly as the up will.
-  expect(preview.hostNamespaces).toEqual(['wasmcloud', 'di-runtime-alpha', 'di-runtime-beta']);
-  expect(preview.hits).toEqual([TENANT_LIST_PATH]);
-  expect(preview.log).toContain('Tenant beta is no longer declared but still exists');
-  expect(preview.log).toContain('Tenant beta is being removed with deletionPolicy Retain');
-  // Nothing is logged about watched namespaces when no tenant is being removed.
-  const unchanged = operatorNamespaces({ declared: ['alpha'], cluster: ['alpha'], dryRun: true });
-  expect(unchanged.hostNamespaces).toEqual(['wasmcloud', 'di-runtime-alpha']);
-  expect(unchanged.hits).toEqual([TENANT_LIST_PATH]);
-  expect(unchanged.log).not.toContain('(#227)');
-}, 60_000);
-
-test('a preview that cannot list Tenants shows the declared tenants with a warning (#245)', () => {
-  const preview = operatorNamespaces({
-    declared: ['alpha'],
-    cluster: ['beta'],
-    dryRun: true,
-    status: 403,
-  });
-  expect(preview.failure).toBeUndefined();
-  expect(preview.hostNamespaces).toEqual(['wasmcloud', 'di-runtime-alpha']);
-  expect(preview.hits).toEqual([TENANT_LIST_PATH]);
-  expect(preview.log).toContain('Preview cannot list the Tenants of installation di-test');
-  expect(preview.log).toContain('(#227): HTTP 403');
-  expect(preview.log).not.toContain('secret detail');
-}, 60_000);
-
-test('an unreadable Tenant list fails the update with a clear message, not a shrunk list', () => {
-  const failed = operatorNamespaces({ declared: ['alpha'], cluster: ['beta'], status: 403 });
-  expect(failed.failure).toContain(
-    "Cannot list the Tenants of installation di-test, which keep a removed tenant's runtime namespace watched by the wasmCloud operator until the Tenant is deleted (#227): HTTP 403",
-  );
-  expect(failed.failure).not.toContain('secret detail');
+test('an unreadable Tenant list skips the Retain check and fails nothing (#541 m6e)', () => {
+  for (const dryRun of [false, true]) {
+    const failed = operatorNamespaces({
+      declared: ['alpha'],
+      cluster: ['beta'],
+      status: 403,
+      dryRun,
+    });
+    expect(failed.failure).toBeUndefined();
+    expect(failed.hostNamespaces).toEqual(['wasmcloud']);
+    expect(failed.log).not.toContain('secret detail');
+  }
 }, 60_000);
 
 /** The one request that lists the installation's Tenants. */

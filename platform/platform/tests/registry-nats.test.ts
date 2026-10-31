@@ -62,6 +62,7 @@ import {
 import { caCertificate, leafCertificate } from '../src/tenancy/tls';
 import { HOST_MOUNT_ROOT, storagePatch } from '../src/tenancy/workload-storage';
 import { evaluate } from './support/cel';
+import { cutoverSeeds } from './support/cutover';
 
 const PASSWORD = newRegistryNatsPassword();
 /** `value`, or a failed test when it is missing. */
@@ -114,7 +115,7 @@ function tenant(spec: Tenant['spec'] = {}): Tenant {
     status: { conditions: [readyCondition] },
   };
 }
-const schedulerSecret = { data: { 'ca.crt': 'test' } };
+const schedulerSecret = { digest: 'test' };
 type Container = {
   name: string;
   image: string;
@@ -1052,17 +1053,19 @@ function cluster(config: ControllerConfig = cfg) {
   const api = new FakeApi();
   const t = tenant();
   api.seed(t);
+  for (const value of cutoverSeeds(t, 'test')) api.seed(value);
   api.seed({
     apiVersion: 'runtime.wasmcloud.dev/v1alpha1',
     kind: 'Host',
-    metadata: { name: 'alpha-host', namespace: 'wasmcloud', labels: { hostgroup: 'tenant-alpha' } },
+    metadata: {
+      name: 'alpha-host',
+      namespace: 'di-operator-alpha',
+      labels: { hostgroup: 'tenant-alpha' },
+    },
     environment: 'di-tenant-alpha',
     status: { conditions: [readyCondition] },
   });
-  for (const [name, data] of [
-    ['wasmcloud-runtime-tls', { 'ca.crt': 'test' }],
-    ['tenant-auth-oauth', { clientSecret: 'c2hhcmVk' }],
-  ] as const)
+  for (const [name, data] of [['tenant-auth-oauth', { clientSecret: 'c2hhcmVk' }]] as const)
     api.seed({
       apiVersion: 'v1',
       kind: 'Secret',

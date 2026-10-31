@@ -16,6 +16,7 @@ import {
   INSTALLATION,
   type RegistryNats,
   type Resource,
+  TENANT_HOST_SECRET,
   type Tenant,
   type TenantAuthConfig,
   tenantAuthResources,
@@ -334,7 +335,7 @@ describe('platform-owned Secret names avoid the workload Secret suffixes (#325)'
     const rendered = [
       ...tenantResources(tenant, cfg),
       // Positional flags after the registry data are the optional tenant features (stage, TLS, pull).
-      ...tenantResources(tenant, cfg, { data: { 'ca.crt': 'test' } }, [], true, true, true, {}),
+      ...tenantResources(tenant, cfg, { digest: 'test' }, [], true, true, true, {}),
       ...(['migrating', 'rollout', 'migrated'] as const).flatMap((stage) =>
         tenantResources(tenant, cfg, undefined, [], true, true, true, {}, registryNats(stage)),
       ),
@@ -361,13 +362,15 @@ describe('platform-owned Secret names avoid the workload Secret suffixes (#325)'
       names.add(pg.connection);
     }
     names.add(RUNTIME_SECRET);
+    // Issued by the controller rather than rendered (#541 m6c), and mounted by the hosts (m6e).
+    names.add(TENANT_HOST_SECRET);
     names.add(apiKeySecretName('0123456789abcdef'));
     for (const env of DEPLOY_ENVS)
       for (const name of ['db', 'secrets', 'a-control']) names.add(secretObjectName(name, env));
     // The scan has to see the Secrets it is about, so a fixture cannot silently drop them.
     for (const expected of [
       'di-nats-registry',
-      'di-scheduler-tls',
+      TENANT_HOST_SECRET,
       'tenant-controller-tls',
       // In the platform namespace since #170, so no workload can name it; checked all the same.
       'tenant-controller-ca-alpha',

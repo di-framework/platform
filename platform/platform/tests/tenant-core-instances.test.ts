@@ -41,7 +41,7 @@ function tenant(spec: TenantSpec): Tenant {
   };
 }
 function coreInstances(spec: TenantSpec): string | undefined {
-  const host = tenantResources(tenant(spec), cfg, { data: {} }).find(
+  const host = tenantResources(tenant(spec), cfg, { digest: 'test' }).find(
     (r) => r.kind === 'Deployment' && r.metadata.name === 'hostgroup-tenant-alpha',
   ) as unknown as HostDeployment;
   return host.spec.template.spec.containers

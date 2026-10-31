@@ -1,4 +1,4 @@
-import { INSTALLATION, TENANT } from './tenancy/resources';
+import { INSTALLATION, NAMESPACE_ROLE, TENANT } from './tenancy/resources';
 
 type Peer = {
   namespaceSelector: {
@@ -29,14 +29,30 @@ export function tenantNamespacesSelector(installation: string): Peer['namespaceS
   };
 }
 
+/**
+ * The tenant runtime-operators (#541 m6e, design-541 §4.6): pods labelled as the runtime-operator
+ * in this installation's `di-operator-<t>` namespaces, which carry the installation and tenant
+ * labels and `namespace-role: operator`. They connect to the scheduler NATS `nats` on 4222.
+ */
+export function tenantOperatorsPeer(installation: string): Peer {
+  return {
+    namespaceSelector: {
+      matchLabels: { [INSTALLATION]: installation, [NAMESPACE_ROLE]: 'operator' },
+      matchExpressions: [{ key: TENANT, operator: 'Exists' }],
+    },
+    podSelector: { matchLabels: { 'wasmcloud.com/name': 'runtime-operator' } },
+  };
+}
+
 /** The runtime-operator Service port the chart opens next to 8082 (`operator.service.port`). */
 export const RUNTIME_OPERATOR_SERVICE_PORT = 8443;
 
 /** Ingress policies for the wasmCloud chart's pods in the platform namespace. They replace the
  * chart's own (`networkPolicy.enabled: false` in the Helm values), which admit their ports from
  * any source (#462).
- * - `nats` 4222: the host group and runtime-operator pods of the platform namespace and this
- *   installation's tenant host groups, which schedule over it (`schedulerNatsUrl`).
+ * - `nats` 4222: the host group and runtime-operator pods of the platform namespace, this
+ *   installation's tenant host groups, which schedule over it (`schedulerNatsUrl`), and its tenant
+ *   runtime-operators ({@link tenantOperatorsPeer}).
  * - `hostgroup-default` 9191 (also `wasmcloud-http` 80, which targets it): the platform
  *   namespace, i.e. the gateway.
  * - `runtime-operator` 8082 and 8443: the platform namespace. Kubelet probes are not subject to
@@ -73,6 +89,7 @@ export function platformIngressPolicies(namespace: string, installation: string)
           namespaceSelector: tenantNamespacesSelector(installation),
           podSelector: { matchLabels: { 'wasmcloud.com/name': 'hostgroup' } },
         },
+        tenantOperatorsPeer(installation),
       ],
       [4222],
     ),
