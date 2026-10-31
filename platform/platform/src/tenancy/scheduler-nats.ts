@@ -103,6 +103,8 @@ export const USER_PATTERNS = {
     new RegExp(String.raw`^${ID}\.operator\.di-tenant-${literal(tenant)}\.platform\.${TAIL}`),
   platform: new RegExp(String.raw`^${ID}\.(operator|host|data)\.platform\.${TAIL}`),
 };
+/** Tenant `tenant`'s account. */
+const tenantAccount = (tenant: string): string => `T_di-tenant-${tenant}`;
 /** A Tenant name (`validName` in `resources.ts`), so `T_di-tenant-<t>` is a valid account name. */
 const TENANT_NAME = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
 const MAX_TENANT_NAME = 40;
@@ -167,7 +169,7 @@ function accounts(
     const t = tenant.metadata.name;
     const replicas = tenant.spec?.runtime?.replicas ?? 1;
     result.push({
-      name: `T_di-tenant-${t}`,
+      name: tenantAccount(t),
       tenant: t,
       head: [
         `limits: { max_connections: ${tenantMaxConnections(replicas)}, ` +
@@ -198,7 +200,7 @@ function tenantProblems(tenants: AccountsTenant[], names: Set<string>): Accounts
   const problems: AccountsProblem[] = [];
   for (const { metadata, spec } of tenants) {
     const tenant = metadata.name;
-    const account = `T_di-tenant-${tenant}`;
+    const account = tenantAccount(tenant);
     if (tenant.length > MAX_TENANT_NAME || !TENANT_NAME.test(tenant))
       problems.push({
         reason: 'InvalidAccountName',
@@ -284,7 +286,7 @@ export function renderSchedulerAccounts(
   lines.push('accounts {');
   rendered.sort((a, b) => codeUnitOrder(a.name, b.name));
   for (const account of rendered) {
-    lines.push(`  ${account.name}: {`);
+    lines.push(accountLine(account.name));
     for (const line of account.head) lines.push(`    ${line}`);
     lines.push('    users: [');
     account.users.sort((a, b) => codeUnitOrder(a.name, b.name));
@@ -300,6 +302,27 @@ export function renderSchedulerAccounts(
 
 /** A user's line in the rendered file, by its name. */
 const userField = (name: string): string => `user: "${name}"`;
+/** An account's opening line in the rendered file, by its name. */
+const accountLine = (name: string): string => `  ${name}: {`;
+
+/**
+ * True when an accounts file {@link renderSchedulerAccounts} rendered still admits a host of
+ * `tenant`. Removal step R1 is complete once the written file no longer does (design-541 §4.5).
+ */
+export function accountsNamesTenantHost(text: string, tenant: string): boolean {
+  const pattern = USER_PATTERNS.tenantHost(tenant);
+  return [...text.matchAll(new RegExp(userField('([^"]*)'), 'g'))].some((match) =>
+    pattern.test(match[1] ?? ''),
+  );
+}
+
+/**
+ * True when an accounts file {@link renderSchedulerAccounts} rendered still has `tenant`'s account
+ * `T_di-tenant-<t>`. Removal step R4 is complete once the written file no longer does.
+ */
+export function accountsNamesTenantAccount(text: string, tenant: string): boolean {
+  return text.split('\n').includes(accountLine(tenantAccount(tenant)));
+}
 
 /**
  * True when an accounts file {@link renderSchedulerAccounts} rendered names `user`. The

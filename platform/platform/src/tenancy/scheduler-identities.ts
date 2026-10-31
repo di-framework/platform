@@ -655,16 +655,21 @@ export class TenantSchedulerIdentities {
   /**
    * Removal steps R1 (`hosts`) and R4 (`operator`): drop the tenant's entry from the record, so the
    * next accounts render leaves its user out. Done once the record holds no such entry; nothing to
-   * do while the PKI does not exist.
+   * do while the PKI does not exist. Returns whether the PKI (its identity record) exists.
    */
-  async drop(tenant: string, kind: Kind): Promise<void> {
+  async drop(tenant: string, kind: Kind): Promise<boolean> {
     const pki = schedulerPkiNamespace(this.cfg.namespace);
     const stored = await this.get<Stored>(configMapPath(pki, SCHEDULER_IDENTITIES));
-    if (!stored) return;
+    if (!stored) return false;
     const record = parseIdentityRecord(stored.data?.[IDENTITIES_KEY] ?? '');
     const key = tenantIdentity(tenant, kind);
-    if (!record[key]) return;
+    // A dropped identity waits for nothing: forget its Secret-deleted ID and propagation clock now
+    // rather than when the tenant stops being listed.
+    this.awaiting.delete(key);
+    this.waits.done(key);
+    if (!record[key]) return true;
     delete record[key];
     await putIdentityRecord(this.api, pki, stored, record);
+    return true;
   }
 }

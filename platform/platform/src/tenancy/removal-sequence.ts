@@ -4,8 +4,8 @@
  * own runtime-operator running and bound until R5 (the R2 sweep exclusion and the `revoke` keep
  * rule, review suggestion S1).
  *
- * #541 m5. The R1 and R4 reload-applied checks and the R3 `Retain` finalizer removal move to m6;
- * until then those steps pass through and `Retain` keeps today's path.
+ * #541 m5; m6e-D adds the R1 and R4 checks on the written accounts file and the R3 `Retain`
+ * finalizer removal.
  */
 import { COMPONENT, type Condition, GROUP, type Resource } from './resources';
 import {
@@ -118,4 +118,23 @@ export function sweepsDeployment(deployment: Resource, tenant: string): boolean 
     deployment.metadata.namespace !== operatorNamespace(tenant) &&
     deployment.metadata.labels?.[COMPONENT] !== TENANT_OPERATOR_COMPONENT
   );
+}
+
+/**
+ * The finalizers the runtime-operator (v2.8.0) sets on Workloads and Artifacts
+ * (`workload_controller.go`, `artifact_controller.go`). Under `Retain`, R3 removes these and only
+ * these once the tenant operator is gone.
+ */
+export const OPERATOR_FINALIZERS: readonly string[] = [
+  'runtime.wasmcloud.dev/workload-finalizer',
+  'runtime.wasmcloud.dev/artifact-finalizer',
+];
+
+/** Splits `finalizers` into the ones R3 keeps and whether it removes any operator finalizer. */
+export function withoutOperatorFinalizers(finalizers: string[]): {
+  kept: string[];
+  removes: boolean;
+} {
+  const kept = finalizers.filter((f) => !OPERATOR_FINALIZERS.includes(f));
+  return { kept, removes: kept.length !== finalizers.length };
 }
