@@ -383,7 +383,11 @@ export function createPlatform(args: PlatformArgs) {
       // Always the pinned version, whose operator image the tenant operators run (#541 m6a).
       chart: 'oci://ghcr.io/wasmcloud/charts/runtime-operator',
       version: WASMCLOUD_OPERATOR_VERSION,
-      atomic: true,
+      // Not atomic: Helm's rollback cannot restore a release whose Service `nats` the platform
+      // keeps (#613 W2). A failed upgrade stays failed and forward; the next `pulumi up` upgrades
+      // it again (Pulumi retries a resource with init errors, Helm upgrades a failed release).
+      // Still awaited, within `timeout`.
+      skipAwait: false,
       cleanupOnFail: true,
       timeout: args.timeoutSeconds ?? 600,
       // Static: the chart's operator serves only the platform namespace (design-541 §4.1), so a
@@ -393,7 +397,7 @@ export function createPlatform(args: PlatformArgs) {
     {
       provider,
       // The server and Service `nats` first: the chart's operator and host group exit or wait
-      // until their first connect to it succeeds, within the release's atomic wait.
+      // until their first connect to it succeeds, within the release's wait.
       dependsOn: [
         namespaceResource,
         ...(registryService ? [registryService] : []),

@@ -18,6 +18,7 @@
  *   `wasmcloud.com/name: nats` keep working after the handover.
  * - A ServiceAccount without a token.
  */
+import type * as k8s from '@pulumi/kubernetes';
 import { ACCOUNTS_KEY, SCHEDULER_NATS_ACCOUNTS } from './tenancy/scheduler-nats';
 import { PLATFORM_SECRETS } from './tenancy/scheduler-pki';
 import { WASMCLOUD_OPERATOR_VERSION } from './tenancy/tenant-operator';
@@ -115,6 +116,14 @@ type Manifest = {
   [key: string]: unknown;
 };
 
+/** The rendered objects, each typed as the Pulumi resource input it is applied as. */
+export type SchedulerNatsServerManifests = [
+  Manifest & k8s.types.input.core.v1.ConfigMap,
+  Manifest & k8s.types.input.core.v1.ServiceAccount,
+  Manifest & k8s.types.input.apps.v1.Deployment,
+  Manifest & k8s.types.input.core.v1.Service,
+];
+
 const containerSecurityContext = {
   allowPrivilegeEscalation: false,
   capabilities: { drop: ['ALL'] },
@@ -123,7 +132,9 @@ const containerSecurityContext = {
 };
 
 /** The ConfigMap, ServiceAccount, Deployment and Service of the platform-owned `nats` server. */
-export function schedulerNatsServerResources(cfg: SchedulerNatsServerConfig): Manifest[] {
+export function schedulerNatsServerResources(
+  cfg: SchedulerNatsServerConfig,
+): SchedulerNatsServerManifests {
   const labels = schedulerNatsLabels(cfg.release);
   const metadata = (name: string) => ({ name, namespace: cfg.namespace, labels });
   const selector = SCHEDULER_NATS_POD_LABELS;

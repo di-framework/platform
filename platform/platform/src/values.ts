@@ -6,6 +6,54 @@ const object = (value: unknown): Values =>
   value && typeof value === 'object' && !Array.isArray(value) ? (value as Values) : {};
 
 /**
+ * The flags the chart renders from the enforced settings, by name or name prefix. The chart
+ * appends `extraArgs` after them, and the last value wins (Go's `flag`) or the duplicate aborts
+ * (clap), so an `extraArgs` entry naming one is refused.
+ * - Operator (runtime-operator v2.8.0 `cmd/main.go`): every `-nats-*` (URL, CA, client cert and
+ *   key, creds, TLS-first), `-watch-namespaces`, `-host-namespaces`, `-allow-shared-hosts`.
+ * - Host (chart 2.8.0 `runtime/deployment.yaml`): every `--scheduler-nats-*` and `--data-nats-*`
+ *   (URL, TLS CA, cert and key).
+ */
+const OPERATOR_FLAGS = [
+  /^nats-/,
+  /^watch-namespaces$/,
+  /^host-namespaces$/,
+  /^allow-shared-hosts$/,
+];
+const HOST_FLAGS = [/^scheduler-nats-/, /^data-nats-/];
+/**
+ * The environment the enforced settings depend on: the operator's own namespace, its Host store
+ * (`OPERATOR_NAMESPACE`, rendered before `operator.env`, whose later entry wins), and the
+ * `WASH_*` fallbacks of the host's NATS flags.
+ */
+const OPERATOR_ENV = [/^OPERATOR_NAMESPACE$/];
+const HOST_ENV = [/^WASH_SCHEDULER_NATS_/, /^WASH_DATA_NATS_/];
+
+/** A command-line argument's flag name: `-name`, `--name`, `-name=value` or `--name=value`. */
+const flagName = (arg: unknown): string | undefined => {
+  const match = /^--?([^=]+)/.exec(String(arg));
+  return match?.[1];
+};
+
+function refuseEnforced(where: string, args: unknown, enforced: RegExp[]): void {
+  for (const arg of Array.isArray(args) ? args : []) {
+    const name = flagName(arg);
+    if (name && enforced.some((pattern) => pattern.test(name)))
+      throw new Error(
+        `${where}: ${String(arg)} sets a flag the platform enforces (design-541 §4.1); remove it`,
+      );
+  }
+}
+
+function refuseEnforcedEnv(where: string, env: unknown, enforced: RegExp[]): void {
+  for (const entry of Array.isArray(env) ? env : []) {
+    const name = String(object(entry).name);
+    if (enforced.some((pattern) => pattern.test(name)))
+      throw new Error(`${where}: ${name} is set by the platform (design-541 §4.1); remove it`);
+  }
+}
+
+/**
  * Merge administrator overrides, then enforce platform-owned security settings (design-541 §4.1):
  * - the chart renders no scheduler NATS (`nats.enabled=false`), generates no CA or certificate,
  *   and mounts the platform-issued Secrets, always over TLS;
@@ -13,7 +61,8 @@ const object = (value: unknown): Values =>
  * - every client uses the chart's default `nats.<namespace>` URL, the platform-owned server.
  *
  * Throws when an override moves a host group out of the platform namespace or points it at
- * another NATS, which the platform cannot secure.
+ * another NATS, which the platform cannot secure, or when an `extraArgs` or `env` entry would
+ * override one of these settings.
  */
 export function platformValues(overrides: Values, defaults: Values, namespace: string): Values {
   const result = merge(defaults, overrides);
@@ -37,10 +86,24 @@ export function platformValues(overrides: Values, defaults: Values, namespace: s
     runtimeCertSecretName: PLATFORM_SECRETS.host,
     dataCertSecretName: PLATFORM_SECRETS.data,
   };
+  refuseEnforced('values.operator.extraArgs', operator.extraArgs, OPERATOR_FLAGS);
+  refuseEnforcedEnv('values.operator.env', operator.env, OPERATOR_ENV);
   const runtime = object(result.runtime);
+  refuseEnforced('values.runtime.extraArgs', runtime.extraArgs, HOST_FLAGS);
+  refuseEnforcedEnv('values.runtime.env', runtime.env, HOST_ENV);
   const groups = Array.isArray(runtime.hostGroups) ? runtime.hostGroups : [];
   for (const group of groups) {
     const { name, namespace: groupNamespace, schedulerNatsUrl, dataNatsUrl } = object(group);
+    refuseEnforced(
+      `values.runtime.hostGroups ${String(name)}: extraArgs`,
+      object(group).extraArgs,
+      HOST_FLAGS,
+    );
+    refuseEnforcedEnv(
+      `values.runtime.hostGroups ${String(name)}: env`,
+      object(group).env,
+      HOST_ENV,
+    );
     if (groupNamespace && groupNamespace !== namespace)
       throw new Error(
         `values.runtime.hostGroups ${String(name)}: namespace ${String(groupNamespace)} is not the platform namespace ${namespace}`,

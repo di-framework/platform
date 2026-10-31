@@ -175,6 +175,101 @@ describe('chart values enforced over args.values (design-541 §4.1, §8.1)', () 
         ),
       ).toThrow('values.runtime.hostGroups gpu: schedulerNatsUrl and dataNatsUrl cannot be set');
   });
+
+  // #613 W3: the chart appends extraArgs and env after the flags and env it renders from the
+  // enforced settings (chart 2.8.0 operator/deployment.yaml, runtime/deployment.yaml).
+  const operatorFlags = [
+    '-nats-url=nats://other:4222',
+    '--nats-url=nats://other:4222',
+    '-nats-url',
+    '-nats-ca=/x',
+    '-nats-client-cert=/x',
+    '-nats-client-key=/x',
+    '-nats-creds=/x',
+    '-nats-tls-first',
+    '-watch-namespaces=',
+    '-host-namespaces=di-runtime-alpha',
+    '-allow-shared-hosts=true',
+    '--allow-shared-hosts',
+  ];
+  const hostFlags = [
+    '--scheduler-nats-url=nats://other:4222',
+    '--scheduler-nats-url',
+    '--scheduler-nats-tls-ca=/x',
+    '--scheduler-nats-tls-cert=/x',
+    '--scheduler-nats-tls-key=/x',
+    '--data-nats-url=nats://other:4222',
+    '--data-nats-tls-ca=/x',
+    '--data-nats-tls-cert=/x',
+    '--data-nats-tls-key=/x',
+  ];
+
+  it('refuses operator extraArgs that set an enforced flag', () => {
+    for (const arg of operatorFlags)
+      expect(() =>
+        platformValues({ operator: { extraArgs: ['-json-log', arg] } }, {}, 'wasmcloud'),
+      ).toThrow(
+        `values.operator.extraArgs: ${arg} sets a flag the platform enforces (design-541 §4.1); remove it`,
+      );
+  });
+
+  it('refuses host extraArgs that set an enforced flag, chart-wide or per group', () => {
+    for (const arg of hostFlags) {
+      expect(() => platformValues({ runtime: { extraArgs: [arg] } }, {}, 'wasmcloud')).toThrow(
+        `values.runtime.extraArgs: ${arg} sets a flag the platform enforces`,
+      );
+      expect(() =>
+        platformValues(
+          { runtime: { hostGroups: [{ name: 'gpu', extraArgs: ['--log-level=debug', arg] }] } },
+          {},
+          'wasmcloud',
+        ),
+      ).toThrow(`values.runtime.hostGroups gpu: extraArgs: ${arg} sets a flag`);
+    }
+  });
+
+  it('refuses env entries that override an enforced setting', () => {
+    expect(() =>
+      platformValues(
+        { operator: { env: [{ name: 'OPERATOR_NAMESPACE', value: 'di-runtime-alpha' }] } },
+        {},
+        'wasmcloud',
+      ),
+    ).toThrow('values.operator.env: OPERATOR_NAMESPACE is set by the platform');
+    for (const name of ['WASH_SCHEDULER_NATS_URL', 'WASH_DATA_NATS_TLS_CA']) {
+      expect(() =>
+        platformValues({ runtime: { env: [{ name, value: 'x' }] } }, {}, 'wasmcloud'),
+      ).toThrow(`values.runtime.env: ${name} is set by the platform`);
+      expect(() =>
+        platformValues(
+          { runtime: { hostGroups: [{ name: 'gpu', env: [{ name, value: 'x' }] }] } },
+          {},
+          'wasmcloud',
+        ),
+      ).toThrow(`values.runtime.hostGroups gpu: env: ${name} is set by the platform`);
+    }
+  });
+
+  it('keeps extraArgs and env that set other flags', () => {
+    const values = platformValues(
+      {
+        operator: {
+          extraArgs: ['-json-log', '-metrics-secure=true', 'positional'],
+          env: [{ name: 'GOMAXPROCS', value: '2' }],
+        },
+        runtime: {
+          extraArgs: ['--allow-insecure-registries', 7],
+          env: [{ name: 'RUST_LOG', value: 'info' }],
+          hostGroups: [{ name: 'gpu', extraArgs: ['--wasi-webgpu'], env: [{ value: 'unnamed' }] }],
+        },
+      },
+      {},
+      'wasmcloud',
+    ) as Record<string, any>;
+    expect(values.operator.extraArgs).toEqual(['-json-log', '-metrics-secure=true', 'positional']);
+    expect(values.runtime.extraArgs).toEqual(['--allow-insecure-registries', 7]);
+    expect(values.runtime.hostGroups[0].extraArgs).toEqual(['--wasi-webgpu']);
+  });
 });
 
 test('published implementation provisions tenancy and isolation for an existing cluster', () => {
@@ -213,6 +308,12 @@ test('published implementation provisions tenancy and isolation for an existing 
   expect(release?.inputs.values.runtime.extraArgs).toEqual([]);
   // The chart renders no NATS, so nothing post-renders it (#550 is moot).
   expect(release?.inputs.postrender).toBeUndefined();
+  // Retryable by re-running `pulumi up`, not by Helm's rollback, which cannot restore a release
+  // whose Service `nats` the platform keeps (#613 W2). Still awaited, within a timeout.
+  expect(release?.inputs.atomic).toBeUndefined();
+  expect(release?.inputs.skipAwait).toBe(false);
+  expect(release?.inputs.cleanupOnFail).toBe(true);
+  expect(release?.inputs.timeout).toBe(600);
   const firewall = resources.find((r) => r.type === 'kubernetes:apps/v1:DaemonSet');
   expect(firewall?.inputs.spec.template.spec.containers[0].args).toEqual([
     '--run-router=false',

@@ -6,6 +6,7 @@ import {
   extraHostGroupsWarning,
   platformIngressPolicies,
   RUNTIME_OPERATOR_SERVICE_PORT,
+  tenantOperatorsPeer,
 } from '../src/platform-ingress';
 import { INSTALLATION, NAMESPACE_ROLE, TENANT } from '../src/tenancy/resources';
 
@@ -139,7 +140,11 @@ describe('platform namespace ingress (#462)', () => {
   };
 
   it('renders no open ingress rule in the platform namespace when the gateway is unpublished', () => {
-    walk(renderPolicies(0), []);
+    const platform = walk(renderPolicies(0), []);
+    // The tenancy's NATS policy admits each tenant's own runtime-operator (#541 m6e, S3 of the
+    // #613 review), next to the platform and tenant host groups.
+    const scheduler = platform.find((p) => p.metadata.name === 'di-tenant-scheduler');
+    expect(scheduler?.spec.ingress?.[0]?.from).toContainEqual(tenantOperatorsPeer('di-test'));
   }, 60_000);
 
   it('leaves only the published gateway open', () => {

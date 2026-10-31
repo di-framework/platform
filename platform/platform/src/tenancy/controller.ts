@@ -150,6 +150,7 @@ import {
 import {
   ACCOUNTS_KEY,
   type AccountsProblem,
+  accountsNamesUser,
   SCHEDULER_ACCOUNTS_CONDITION,
   SCHEDULER_NATS_ACCOUNTS,
   schedulerAccountsCondition,
@@ -159,10 +160,11 @@ import {
   parseIdentityRecord,
   SCHEDULER_IDENTITIES,
   schedulerPkiNamespace,
+  tenantHostUser,
   tenantIdentity,
   tenantOperatorUser,
 } from './scheduler-pki';
-import { schedulerCertDigest } from './scheduler-pki-rotation';
+import { SCHEDULER_TLS_ANNOTATION, schedulerCertDigest } from './scheduler-pki-rotation';
 import { PlatformSchedulerIdentities } from './scheduler-platform-identities';
 import {
   assertSafeBindingStatus,
@@ -493,24 +495,31 @@ const LOG_READER_KINDS = [
   ['rbac.authorization.k8s.io/v1', 'Role'],
 ] as const;
 
+type PodSpecVolumes = {
+  volumes?: {
+    secret?: { secretName?: string };
+    projected?: { sources?: { secret?: { name?: string } }[] };
+  }[];
+};
+
+/** A host Deployment's pod template, as {@link Controller.hostTlsFor} reads it. */
+type HostTemplate = {
+  metadata?: { annotations?: Record<string, string> };
+  spec?: PodSpecVolumes;
+};
+
+/** True when a pod spec mounts Secret `name`, directly or projected. */
+function mountsSecret(spec: PodSpecVolumes | undefined, name: string): boolean {
+  return (spec?.volumes ?? []).some(
+    (v) =>
+      v.secret?.secretName === name ||
+      !!v.projected?.sources?.some((source) => source.secret?.name === name),
+  );
+}
+
 /** True when `pod` mounts the pre-cut-over copy {@link SCHEDULER_TLS_COPY} (#541 m6e). */
 function mountsSchedulerTlsCopy(pod: Resource): boolean {
-  const volumes =
-    (
-      pod.spec as
-        | {
-            volumes?: {
-              secret?: { secretName?: string };
-              projected?: { sources?: { secret?: { name?: string } }[] };
-            }[];
-          }
-        | undefined
-    )?.volumes ?? [];
-  return volumes.some(
-    (v) =>
-      v.secret?.secretName === SCHEDULER_TLS_COPY ||
-      !!v.projected?.sources?.some((source) => source.secret?.name === SCHEDULER_TLS_COPY),
-  );
+  return mountsSecret(pod.spec as PodSpecVolumes | undefined, SCHEDULER_TLS_COPY);
 }
 
 export class Controller {
@@ -544,7 +553,10 @@ export class Controller {
    * Per tenant, the operator user the written accounts file was first seen to name, and when; the
    * operator Deployment is created {@link TENANT_OPERATOR_PROPAGATION_MS} later (#541 m6e).
    */
-  private readonly operatorAccounts = new Map<string, { user: string; since: number }>();
+  private readonly accountsSeen = new Map<
+    string,
+    Partial<Record<'hosts' | 'operator', { user: string; since: number }>>
+  >();
   /**
    * The problems of the last accounts render, reported on every Tenant: empty when it was written,
    * undefined while unknown (before the first render since start, or after a failed read), when
@@ -943,8 +955,18 @@ export class Controller {
       ...(auth.registry ? { hostPullToken: await this.hostPullToken(name) } : {}),
     };
   }
-  /** The API server's addresses and port, from the `kubernetes` EndpointSlices in `default`. */
-  private async apiServerEndpoints(): Promise<{ addresses: string[]; port: number }> {
+  /** {@link apiServerEndpoints} of the running {@link tick}, read once for every Tenant. */
+  private tickApiServer?: { read?: Promise<{ addresses: string[]; port: number }> };
+  /**
+   * The API server's addresses and port, from the `kubernetes` EndpointSlices in `default`: read
+   * once per {@link tick}, and on every call outside one.
+   */
+  private apiServerEndpoints(): Promise<{ addresses: string[]; port: number }> {
+    if (!this.tickApiServer) return this.readApiServerEndpoints();
+    this.tickApiServer.read ??= this.readApiServerEndpoints();
+    return this.tickApiServer.read;
+  }
+  private async readApiServerEndpoints(): Promise<{ addresses: string[]; port: number }> {
     const slices = (
       await this.list<
         Resource & { endpoints?: { addresses: string[] }[]; ports?: { port: number }[] }
@@ -1300,41 +1322,44 @@ export class Controller {
     return state.stage === 'migrated' && state.credentials ? 'credentials' : 'stopped';
   }
   /**
-   * True once the accounts file this controller wrote has named the tenant operator's current user
-   * for {@link TENANT_OPERATOR_PROPAGATION_MS}. Nothing reports when NATS has loaded the file
-   * (owner decision 1), so the operator, which exits when its first connect is refused, is created
-   * only after that fixed wait (#541 m6e).
+   * True once the accounts file this controller wrote has named the current user of the tenant's
+   * `kind` identity for {@link TENANT_OPERATOR_PROPAGATION_MS}. Nothing reports when NATS has
+   * loaded the file (owner decision 1), so a client whose new certificate names that user, and
+   * which exits when its first connect is refused, starts only after that fixed wait (#541 m6e):
+   * the operator's creation, and every move of the hosts to a new certificate (S2 of the #613
+   * review). In memory: a restarted controller waits once more.
    */
-  private async operatorAccountsLoaded(t: string): Promise<boolean> {
+  private async accountsLoaded(t: string, kind: 'hosts' | 'operator'): Promise<boolean> {
     const record = await this.get<{ data?: Record<string, string> }>(
       `${collection('v1', 'ConfigMap', schedulerPkiNamespace(this.cfg.namespace))}/${SCHEDULER_IDENTITIES}`,
     );
-    const id = parseIdentityRecord(record?.data?.[IDENTITIES_KEY] ?? '')[
-      tenantIdentity(t, 'operator')
-    ]?.current;
+    const id = parseIdentityRecord(record?.data?.[IDENTITIES_KEY] ?? '')[tenantIdentity(t, kind)]
+      ?.current;
     const accounts = id
       ? await this.get<{ data?: Record<string, string> }>(
           `${collection('v1', 'ConfigMap', this.cfg.namespace)}/${SCHEDULER_NATS_ACCOUNTS}`,
         )
       : undefined;
-    const user = id ? tenantOperatorUser(t, id) : '';
-    if (!accounts?.data?.[ACCOUNTS_KEY]?.includes(`user: "${user}"`)) {
-      this.operatorAccounts.delete(t);
+    const user = id ? (kind === 'hosts' ? tenantHostUser : tenantOperatorUser)(t, id) : '';
+    const seen = this.accountsSeen.get(t) ?? {};
+    this.accountsSeen.set(t, seen);
+    if (!id || !accountsNamesUser(accounts?.data?.[ACCOUNTS_KEY] ?? '', user)) {
+      delete seen[kind];
       return false;
     }
     const now = this.now().getTime();
-    const seen = this.operatorAccounts.get(t);
-    if (seen?.user !== user) {
-      this.operatorAccounts.set(t, { user, since: now });
+    const since = seen[kind]?.user === user ? seen[kind].since : undefined;
+    if (since === undefined) {
+      seen[kind] = { user, since: now };
       return false;
     }
-    return now - seen.since >= TENANT_OPERATOR_PROPAGATION_MS;
+    return now - since >= TENANT_OPERATOR_PROPAGATION_MS;
   }
   /**
    * Applies the tenant's runtime-operator in `di-operator-<t>` (#541 m6e, design-541 §4.6), one
    * object at a time: the Namespace, ServiceAccount and RoleBindings, then its policies, then the
    * Deployment. A Deployment that does not exist yet is created only once its accounts have
-   * propagated ({@link operatorAccountsLoaded}); one that exists is always applied, suspended or
+   * propagated ({@link accountsLoaded}); one that exists is always applied, suspended or
    * not (S2). Returns whether the operator is Ready; not while the API server's endpoints are
    * unknown, when nothing is applied.
    */
@@ -1350,7 +1375,7 @@ export class Controller {
     for (const value of rendered.resources.slice(0, -1)) await this.ensure(value);
     if (
       !(await this.get<Resource>(location(deployment))) &&
-      !(await this.operatorAccountsLoaded(t))
+      !(await this.accountsLoaded(t, 'operator'))
     )
       return false;
     const applied = await this.ensure(deployment);
@@ -1383,6 +1408,36 @@ export class Controller {
     if (!cert || !ownsIdentitySecret(secret, this.cfg.installation, tenant.metadata.uid))
       return undefined;
     return schedulerCertDigest(Buffer.from(cert, 'base64').toString('utf8'));
+  }
+  /**
+   * The host certificate digest the host Deployment is rendered with, or undefined to leave the
+   * live Deployment untouched (#541 m6e).
+   * - Only the first move onto {@link TENANT_HOST_SECRET} waits for the tenant's operator to be
+   *   Ready. Once the live Deployment mounts it, or while the Tenant is suspended (zero replicas),
+   *   the Deployment keeps being applied whatever the operator does, so suspension, replica
+   *   changes and renewals are never held (W1 of the #613 review).
+   * - A renewed or rotated certificate reaches the template only once its user has propagated
+   *   ({@link accountsLoaded}); until then the template keeps the digest it has. The old
+   *   certificate's user stays admitted until the rollout completes (`identityTransition`), so the
+   *   running pods keep working, and the new pods are not refused (S2 of the #613 review).
+   */
+  private async hostTlsFor(tenant: Tenant, operatorReady: boolean): Promise<string | undefined> {
+    const digest = await this.hostTlsDigest(tenant);
+    if (digest === undefined || tenant.spec.suspended) return digest;
+    const n = names(tenant.metadata.name);
+    const live = await this.get<Resource>(
+      `${collection('apps/v1', 'Deployment', n.runtimeNamespace)}/hostgroup-${n.hostgroup}`,
+    );
+    const template = (live?.spec as { template?: HostTemplate } | undefined)?.template;
+    const moved = mountsSecret(template?.spec, TENANT_HOST_SECRET);
+    if (!operatorReady && !moved) return undefined;
+    const rendered = moved
+      ? template?.metadata?.annotations?.[SCHEDULER_TLS_ANNOTATION]
+      : undefined;
+    // The first move waits for nothing more: the hosts' identity is issued with the operator's,
+    // whose own wait has passed, since it is Ready.
+    if (rendered === undefined || rendered === digest) return digest;
+    return (await this.accountsLoaded(tenant.metadata.name, 'hosts')) ? digest : rendered;
   }
   /** A `di-scheduler-tls` this controller copied for the Tenant: its installation and owner labels. */
   private ownsCopy(copy: Resource, tenant: Tenant): boolean {
@@ -1449,7 +1504,7 @@ export class Controller {
     }
     // Everything above and these reads can still throw before the try block below; such a
     // failure rejects the tick and skips tenant-auth until the next poll.
-    const hostTls = operatorReady ? await this.hostTlsDigest(tenant) : undefined;
+    const hostTls = await this.hostTlsFor(tenant, operatorReady);
     const workloads = await this.storageWorkloads(tenant);
     // Records are written before any host pod that mounts their keys is rendered (#200).
     const observation = await this.observeStorage(tenant);
@@ -1487,7 +1542,7 @@ export class Controller {
     );
     const hostgroup = `hostgroup-${n.hostgroup}`;
     // Ready needs the operator Ready and the hosts on their own identity (#541 m6e).
-    let ready = hostTls !== undefined;
+    let ready = operatorReady && hostTls !== undefined;
     let hosts: Resource | undefined;
     let foreignRecords: string | undefined;
     try {
@@ -3203,8 +3258,8 @@ export class Controller {
       if (!uids.has(uid)) this.storageListings.delete(uid);
     for (const name of this.caRefusals.keys()) if (!listed.has(name)) this.caRefusals.delete(name);
     this.identities.forget(listed);
-    for (const name of this.operatorAccounts.keys())
-      if (!listed.has(name)) this.operatorAccounts.delete(name);
+    for (const name of this.accountsSeen.keys())
+      if (!listed.has(name)) this.accountsSeen.delete(name);
     for (const name of this.logCursors.keys())
       if (!projected.has(name)) this.logCursors.delete(name);
     for (const name of this.logWriteFailures.keys())
@@ -3268,6 +3323,14 @@ export class Controller {
   }
 
   async tick(): Promise<void> {
+    this.tickApiServer = {};
+    try {
+      await this.tickOnce();
+    } finally {
+      this.tickApiServer = undefined;
+    }
+  }
+  private async tickOnce(): Promise<void> {
     const tenants = await this.list<Tenant>(VERSION, 'Tenant', {
       [INSTALLATION]: this.cfg.installation,
     });

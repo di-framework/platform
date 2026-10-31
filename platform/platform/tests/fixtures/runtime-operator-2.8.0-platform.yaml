@@ -1,7 +1,8 @@
 # `helm template wasmcloud <chart> --namespace wasmcloud -f runtime-operator-2.8.0-platform.values.json`
 # for the runtime-operator chart 2.8.0 (chart digest
-# sha256:63e87326539df1146bf2fe9f12982d4eb5cfb4704252067d4a6932478bb34912), copied verbatim: the
-# release createPlatform installs since #541 m6e. The values file is platformHelmValues('wasmcloud').
+# sha256:63e87326539df1146bf2fe9f12982d4eb5cfb4704252067d4a6932478bb34912), reformatted (quote
+# style) but parse-equal to that output: the release createPlatform installs since #541 m6e. The
+# values file is platformHelmValues('wasmcloud').
 ---
 # Source: runtime-operator/templates/operator/serviceaccount.yaml
 apiVersion: v1

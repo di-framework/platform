@@ -81,7 +81,7 @@ describe('installSchedulerNats', () => {
         kubeconfig,
         kubeContext: 'admin',
         dependsOn: [namespace, job],
-      }).service;
+      }).deployment;
     };
     adopted = await capture('adopt', setup('kubeconfig: yes'));
     fresh = await capture('fresh', setup());
@@ -91,11 +91,12 @@ describe('installSchedulerNats', () => {
     const [config, account, deployment] = schedulerNatsServerResources({ namespace: 'wasmcloud' });
     const job = urn('adopt', 'kubernetes:batch/v1:Job', 'pki');
     const ns = urn('adopt', 'kubernetes:core/v1:Namespace', 'wasmcloud');
+    const service = urn('adopt', 'kubernetes:core/v1:Service', 'scheduler-nats-service');
     for (const [name, value] of [
       ['scheduler-nats-config', config],
       ['scheduler-nats-account', account],
     ] as const) {
-      expect(adopted.get(name)?.dependencies.sort()).toEqual([job, ns].sort());
+      expect(adopted.get(name)?.dependencies.sort()).toEqual([job, ns, service].sort());
       expect(adopted.get(name)?.inputs.metadata).toEqual(value?.metadata);
     }
     const workload = [...adopted.entries()].find(
@@ -111,29 +112,42 @@ describe('installSchedulerNats', () => {
       expect.arrayContaining([
         job,
         ns,
+        service,
         urn('adopt', 'kubernetes:core/v1:ConfigMap', 'scheduler-nats-config'),
         urn('adopt', 'kubernetes:core/v1:ServiceAccount', 'scheduler-nats-account'),
       ]),
     );
   });
 
-  it('adopts the Service `nats` after the Deployment, through a provider used for it alone', () => {
+  it('adopts the Service `nats` before the server, through a provider used for it alone', () => {
     const service = adopted.get('scheduler-nats-service');
     const rendered = schedulerNatsServerResources({ namespace: 'wasmcloud' })[3];
     expect(service?.type).toBe('kubernetes:core/v1:Service');
     // The chart's metadata and spec, plus the keep annotation.
     expect(service?.inputs.spec).toEqual(rendered?.spec);
-    expect(service?.inputs.metadata).toEqual({ ...rendered?.metadata, annotations: HELM_KEEP });
+    // Not awaited: on a fresh install it has no endpoints before the server is Ready.
+    expect(service?.inputs.metadata).toEqual({
+      ...rendered?.metadata,
+      annotations: { ...HELM_KEEP, 'pulumi.com/skipAwait': 'true' },
+    });
     expect(HELM_KEEP).toEqual({ 'helm.sh/resource-policy': 'keep' });
-    expect(service?.dependencies).toEqual([
-      urn('adopt', 'kubernetes:apps/v1:Deployment', 'scheduler-nats'),
-    ]);
+    // Before the server: an upgrade that cannot adopt it fails before any traffic moves.
+    expect(service?.dependencies.sort()).toEqual(
+      [
+        urn('adopt', 'kubernetes:batch/v1:Job', 'pki'),
+        urn('adopt', 'kubernetes:core/v1:Namespace', 'wasmcloud'),
+      ].sort(),
+    );
     const adopt = adopted.get('scheduler-nats-service');
     const provider = [...adopted.entries()].find(
       ([name, r]) => r.type === 'pulumi:providers:kubernetes' && name === 'scheduler-nats-adopt',
     )?.[1];
+    // The admin kubeconfig enters the state as a secret (C1 of the #613 review).
+    expect(provider?.inputs.kubeconfig).toEqual({
+      [pulumi.runtime.specialSigKey]: pulumi.runtime.specialSecretSig,
+      value: 'kubeconfig: yes',
+    });
     expect(provider?.inputs).toMatchObject({
-      kubeconfig: 'kubeconfig: yes',
       context: 'admin',
       enableServerSideApply: 'true',
       upsertExistingObjects: 'true',
@@ -200,11 +214,10 @@ it('createPlatform orders PKI Job, NATS, Service `nats`, release, ingress and te
   const nats = ['scheduler-nats-config', 'scheduler-nats-account', 'scheduler-nats-service'].map(
     urnOf,
   );
-  // The NATS waits for the Job; the Service for the server.
+  // The NATS waits for the Job; the server for the adopted Service.
   expect(all['scheduler-nats-config']?.dependencies).toContain(urnOf(job));
-  expect(all['scheduler-nats-service']?.dependencies).toEqual([
-    inStack('kubernetes:apps/v1:Deployment', 'scheduler-nats'),
-  ]);
+  expect(all['scheduler-nats-service']?.dependencies).toContain(urnOf(job));
+  expect(all['scheduler-nats']?.dependencies).toContain(urnOf('scheduler-nats-service'));
   // The release waits for all of them, not for the tenant namespaces, and has no post-renderer.
   const release = all.wasmcloud;
   expect(release?.type).toBe('kubernetes:helm.sh/v3:Release');

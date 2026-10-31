@@ -197,6 +197,90 @@ describe('per-tenant gating (#541 m6e)', () => {
     expect(api.objects.has(hostsPath)).toBe(true);
   });
 
+  // W1 of the #613 review: only the first move onto di-scheduler-host-tls waits for the operator.
+  describe('once the hosts are on their own identity, an unready operator holds nothing', () => {
+    const tenantSpec = (api: MemoryApi) =>
+      (
+        api.objects.get(tenantPath) as unknown as {
+          spec: { suspended?: boolean; runtime?: { replicas?: number } };
+        }
+      ).spec;
+    const hostReplicas = (api: MemoryApi) =>
+      (api.objects.get(hostsPath)?.spec as { replicas: number } | undefined)?.replicas;
+    /** Steady state, then the operator's rollout held. */
+    const cutOverThenHold = async () => {
+      const { api, controller } = await prepare();
+      await throughPropagation(controller);
+      expect(hostReplicas(api)).toBe(1);
+      api.held.add('runtime-operator');
+      await controller.tick();
+      return { api, controller };
+    };
+
+    it("scales a suspended Tenant's hosts to zero", async () => {
+      const { api, controller } = await cutOverThenHold();
+      tenantSpec(api).suspended = true;
+      await controller.tick();
+      await controller.tick();
+      expect(hostReplicas(api)).toBe(0);
+    });
+
+    it('applies a replica change', async () => {
+      const { api, controller } = await cutOverThenHold();
+      tenantSpec(api).runtime = { ...tenantSpec(api).runtime, replicas: 3 };
+      await controller.tick();
+      expect(hostReplicas(api)).toBe(3);
+      // Not Ready: the operator is not.
+      expect(readyCondition(api)).toMatchObject({ status: 'False' });
+    });
+
+    it('rolls a renewed certificate', async () => {
+      const { api, controller } = await cutOverThenHold();
+      const before = hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION];
+      api.objects.delete(hostSecretPath);
+      await controller.tick();
+      await controller.tick();
+      // S2: held until the new user has propagated; the old one stays admitted meanwhile.
+      expect(hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION]).toBe(before);
+      advance(TENANT_OPERATOR_PROPAGATION_MS);
+      await controller.tick();
+      const after = hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION];
+      expect(after).not.toBe(before);
+      expect(after).toBe(schedulerCertDigest(hostCert(api)));
+    });
+
+    it('still holds hosts that mount the copy, and creates none, until the operator is Ready', async () => {
+      const { api, controller } = await prepare();
+      api.held.add('runtime-operator');
+      await throughPropagation(controller);
+      // A pre-cut-over host Deployment on the copy is left as it is.
+      const legacy = {
+        apiVersion: 'apps/v1',
+        kind: 'Deployment',
+        metadata: {
+          name: `hostgroup-${n.hostgroup}`,
+          namespace: n.runtimeNamespace,
+          labels: owned,
+        },
+        spec: {
+          replicas: 1,
+          template: {
+            spec: { volumes: [{ name: 'scheduler', secret: { secretName: SCHEDULER_TLS_COPY } }] },
+          },
+        },
+      } as unknown as Resource;
+      api.seed(legacy);
+      await controller.tick();
+      expect(JSON.stringify(api.objects.get(hostsPath))).toContain(SCHEDULER_TLS_COPY);
+      api.held.delete('runtime-operator');
+      await controller.tick();
+      expect(hostTemplate(api).spec.volumes).toContainEqual({
+        name: 'scheduler',
+        secret: { secretName: TENANT_HOST_SECRET },
+      });
+    });
+  });
+
   it('restarts the wait when the file names another operator user, and when it drops it', async () => {
     const { api, controller } = await prepare();
     await controller.tick();
@@ -264,10 +348,18 @@ describe('hosts on di-scheduler-host-tls (#541 m6e)', () => {
     expect(template.metadata.annotations[SCHEDULER_TLS_ANNOTATION]).toBe(
       schedulerCertDigest(hostCert(api)),
     );
-    // A forced rotation re-issues the Secret; the next pass rolls the hosts onto it.
+    // A forced rotation re-issues the Secret. The hosts keep their template, whose user stays
+    // admitted, until the new user has been in the accounts file for the propagation wait
+    // (S2 of the #613 review), then roll onto it.
     const before = template.metadata.annotations[SCHEDULER_TLS_ANNOTATION];
     api.objects.delete(hostSecretPath);
     await controller.tick();
+    await controller.tick();
+    expect(hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION]).toBe(before);
+    advance(TENANT_OPERATOR_PROPAGATION_MS - 1);
+    await controller.tick();
+    expect(hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION]).toBe(before);
+    advance(1);
     await controller.tick();
     const after = hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION];
     expect(after).not.toBe(before);

@@ -289,13 +289,24 @@ export function renderSchedulerAccounts(
     lines.push('    users: [');
     account.users.sort((a, b) => codeUnitOrder(a.name, b.name));
     for (const user of account.users) {
-      const fields = [`user: "${user.name}"`, user.permissions].filter(Boolean);
+      const fields = [userField(user.name), user.permissions].filter(Boolean);
       lines.push(`      { ${fields.join(', ')} }`);
     }
     lines.push('    ]', '  }');
   }
   lines.push('}');
   return { text: `${lines.join('\n')}\n` };
+}
+
+/** A user's line in the rendered file, by its name. */
+const userField = (name: string): string => `user: "${name}"`;
+
+/**
+ * True when an accounts file {@link renderSchedulerAccounts} rendered names `user`. The
+ * controller's propagation wait starts from it, so it reads the renderer's own line format.
+ */
+export function accountsNamesUser(text: string, user: string): boolean {
+  return text.includes(userField(user));
 }
 
 /** The condition reason of a Tenant refused only because of another identity's problem. */

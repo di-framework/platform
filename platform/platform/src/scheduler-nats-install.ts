@@ -1,5 +1,5 @@
 import * as k8s from '@pulumi/kubernetes';
-import type * as pulumi from '@pulumi/pulumi';
+import * as pulumi from '@pulumi/pulumi';
 import { schedulerNatsServerResources } from './scheduler-nats-server';
 
 /**
@@ -7,6 +7,9 @@ import { schedulerNatsServerResources } from './scheduler-nats-server';
  * object whose live copy carries this annotation.
  */
 export const HELM_KEEP = { 'helm.sh/resource-policy': 'keep' } as const;
+
+/** Pulumi's annotation that skips its readiness wait for the annotated object. */
+const SKIP_AWAIT = 'pulumi.com/skipAwait';
 
 export interface SchedulerNatsInstallArgs {
   namespace: string;
@@ -42,28 +45,41 @@ export function installSchedulerNats(args: SchedulerNatsInstallArgs): {
   const [config, account, workload, serviceManifest] = schedulerNatsServerResources({
     namespace: args.namespace,
     release: args.release,
-  }) as unknown as [never, never, never, Record<string, Record<string, unknown>>];
-  const opts = { provider: args.provider, dependsOn: args.dependsOn };
-  const configMap = new k8s.core.v1.ConfigMap('scheduler-nats-config', config, opts);
-  const serviceAccount = new k8s.core.v1.ServiceAccount('scheduler-nats-account', account, opts);
-  const deployment = new k8s.apps.v1.Deployment('scheduler-nats', workload, {
-    ...opts,
-    dependsOn: [...args.dependsOn, configMap, serviceAccount],
   });
+  if (args.kubeconfig === undefined)
+    pulumi.log.warn(
+      'installSchedulerNats: no kubeconfig, so the Service `nats` is created, not adopted; an upgrade of an install whose chart rendered it fails at that Service',
+    );
   const adopt =
     args.kubeconfig === undefined
       ? args.provider
       : new k8s.Provider('scheduler-nats-adopt', {
-          kubeconfig: args.kubeconfig,
+          // A secret, like every admin kubeconfig: provider inputs go to the state as they are.
+          kubeconfig: pulumi.secret(args.kubeconfig),
           context: args.kubeContext,
           enableServerSideApply: true,
           upsertExistingObjects: true,
         });
-  const metadata = serviceManifest.metadata as Record<string, unknown>;
+  // Adopted first, so an upgrade that cannot adopt it fails before the new server takes traffic.
+  // Not awaited: on a fresh install it has no endpoints until the server below is Ready, and the
+  // release waits for that server.
   const service = new k8s.core.v1.Service(
     'scheduler-nats-service',
-    { ...serviceManifest, metadata: { ...metadata, annotations: HELM_KEEP } } as never,
-    { provider: adopt, dependsOn: [deployment] },
+    {
+      ...serviceManifest,
+      metadata: {
+        ...serviceManifest.metadata,
+        annotations: { ...HELM_KEEP, [SKIP_AWAIT]: 'true' },
+      },
+    },
+    { provider: adopt, dependsOn: args.dependsOn },
   );
-  return { deployment, service, resources: [configMap, serviceAccount, deployment, service] };
+  const opts = { provider: args.provider, dependsOn: [...args.dependsOn, service] };
+  const configMap = new k8s.core.v1.ConfigMap('scheduler-nats-config', config, opts);
+  const serviceAccount = new k8s.core.v1.ServiceAccount('scheduler-nats-account', account, opts);
+  const deployment = new k8s.apps.v1.Deployment('scheduler-nats', workload, {
+    ...opts,
+    dependsOn: [...opts.dependsOn, configMap, serviceAccount],
+  });
+  return { deployment, service, resources: [service, configMap, serviceAccount, deployment] };
 }

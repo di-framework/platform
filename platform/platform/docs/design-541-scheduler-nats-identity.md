@@ -131,7 +131,7 @@ Tenants have no distinct NATS identity. A single operator hears every heartbeat 
 
 ### 4.1 The scheduler NATS leaves the chart, and the chart's operator serves only the platform namespace
 
-The Helm values below are enforced in `platformValues` (`platform/platform/src/values.ts:2-17`), so `args.values` cannot undo them. All are **V** against a `helm template` render of chart 2.8.0 with these values. The render has no NATS resources, no `wasmcloud-ca` and no generated certificates. It has per-namespace Roles, and only the metrics ClusterRoles remain.
+The Helm values below are enforced in `platformValues` (`platform/platform/src/values.ts`), so `args.values` cannot undo them. It also refuses `operator.extraArgs`, `runtime.extraArgs` and `runtime.hostGroups[].extraArgs` entries that set an enforced flag, which the chart appends after the flags it renders (`chart: templates/operator/deployment.yaml:57-59`, `env` after `OPERATOR_NAMESPACE` at `:61-67`, `templates/runtime/deployment.yaml:241-248`): the operator's `-nats-*`, `-watch-namespaces`, `-host-namespaces` and `-allow-shared-hosts` (runtime-operator v2.8.0 `cmd/main.go:90-143`), and the host's `--scheduler-nats-*` and `--data-nats-*`. It refuses `OPERATOR_NAMESPACE` in `operator.env`, and the host flags' `WASH_SCHEDULER_NATS_*`/`WASH_DATA_NATS_*` fallbacks in `runtime.env` and `runtime.hostGroups[].env`. All are **V** against a `helm template` render of chart 2.8.0 with these values. The render has no NATS resources, no `wasmcloud-ca` and no generated certificates. It has per-namespace Roles, and only the metrics ClusterRoles remain.
 
 | Value | Setting | Effect |
 |---|---|---|
@@ -142,13 +142,13 @@ The Helm values below are enforced in `platformValues` (`platform/platform/src/v
 | `operator.watchNamespaces` | the platform namespace only | Namespaced Roles replace the chart ClusterRole's cluster-wide Secret read (`chart: templates/operator/clusterrole.yaml:1`, `workload-namespace-role.yaml:1-30`). |
 | `operator.hostNamespaces` | the platform namespace only | The chart's operator manages only `hostgroup-default`'s pods. |
 
-**No restarts on tenant changes.** Both lists are now static. Adding or removing a tenant therefore no longer changes the chart's operator Deployment. Today it does, through `hostNamespaces` (`platform/platform/src/watched-namespaces.ts:150-200`) and the `-host-namespaces` process flag (`chart: templates/operator/deployment.yaml:50-51`). Each tenant's own operator has fixed flags for its whole life (4.6).
+**No restarts on tenant changes.** Both lists are now static. Adding or removing a tenant therefore never changes the chart's operator Deployment or its `-host-namespaces` process flag (`chart: templates/operator/deployment.yaml:50-51`), and the release's values do not depend on the Tenant list. Each tenant's own operator has fixed flags for its whole life (4.6).
 
 **Service and labels stay the same.** The platform-owned server keeps the Service name `nats`, port 4222 and the pod label `wasmcloud.com/name: nats`. These are what the chart's default `schedulerUrl` (`chart: templates/_helpers.tpl:172`) and the tenant hosts' URL (`platform/platform/src/tenancy.ts:297`) resolve to. The platform's policies (`platform/platform/src/platform-ingress.ts:56-77`, `platform/platform/src/tenancy.ts:213-247`) and the vCluster target's `allow-platform-nats` policy (`platform/operator/internal/targets/vcluster/networkpolicy.go:110-116,193`) select the same labels. The #552 post-renderer is removed together with the chart's NATS.
 
 **Pulumi-managed resources** in the platform namespace, created before the Helm release:
 
-- **Deployment `nats`.**
+- **Deployment `di-scheduler-nats`.** Its own name, so it never collides with the chart's `nats` Deployment it replaces; the pod label stays `wasmcloud.com/name: nats`.
   - One replica, image `nats:2.12.8-alpine` pinned by digest.
   - Arguments `-c /etc/nats/nats-server.conf` only, with no `-D` or `-V`.
   - The chart's hardened security context (`chart: values.yaml:74-92`) and `automountServiceAccountToken: false`.
@@ -162,7 +162,11 @@ The Helm values below are enforced in `platformValues` (`platform/platform/src/v
   - `include "accounts/accounts.conf"`.
 
   Only `pulumi up` changes it.
-- **Service `nats`**, port 4222, and a ServiceAccount without a token.
+- **Service `nats`**, port 4222, with the chart's metadata, selector and port, and a ServiceAccount without a token.
+  - It is applied first, before the server, through a Pulumi provider of its own built from the admin `kubeconfig` (server-side apply, `upsertExistingObjects: true`, the kubeconfig a Pulumi secret). That provider adopts the chart's Service of an existing install in place, so its UID and ClusterIP survive, and serves this object only: everything else still fails on an object it did not create. Without `kubeconfig` the Service is created through the main provider, which works on a fresh install only, and `createPlatform` warns.
+  - It carries `helm.sh/resource-policy: keep`, so the Helm upgrade that stops rendering it leaves it alone, and `pulumi.com/skipAwait`, since on a fresh install it has no endpoints until the server is Ready. The release waits for the server instead.
+- **Order in one `pulumi up`.** PKI Job (awaited) → Service `nats` → ConfigMap, ServiceAccount and Deployment `di-scheduler-nats` (awaited Ready) → Helm release → platform ingress policies → tenancy.
+- **The release is not `atomic`.** Helm's rollback cannot restore a release whose Service `nats` is kept live but is no longer in the failed revision: `Rollback` updates without adopting existing objects and stops at that Service. The release is awaited within `timeoutSeconds` with `cleanupOnFail`. A failed upgrade stays at its failed revision, and the next `pulumi up` upgrades it again: Pulumi re-runs the update of a resource with init errors (`pulumi` v3.272.0 `pkg/resource/deploy/step_generator.go:2290-2306`; provider 4.34.2 `helm_release.go:1178-1210` returns a partial error), and Helm upgrades a release whose last revision failed (Helm v3.20.2 `pkg/action/upgrade.go:219-238`), adopting the objects the failed revision created (`:346-351`).
 - **Namespace `<platform-ns>-scheduler-pki`** for the CA keys and the identity record (4.5).
 - **JetStream**, enabled at server level with the same `emptyDir` store as today (`chart: templates/nats/deployment.yaml:37-38,59-60`), for the `DATA` account only (O5).
 
@@ -350,14 +354,14 @@ Removal therefore runs in the fixed order below. The controller never skips a st
 - **Server renewal.** The server reloads its certificate when the reloader sees the Secret change.
 
 **Bootstrap** (O4):
-- **Why a Job.** The `nats` Deployment, the chart's operator and `hostgroup-default` must be ready before the Helm release finishes (`atomic: true`, `index.ts:377`). The controller is deployed after the release.
+- **Why a Job.** The `di-scheduler-nats` Deployment, the chart's operator and `hostgroup-default` must be ready before the Helm release's wait ends (4.1). The controller is deployed after the release.
 - **What it does.** A one-shot Job in `<platform-ns>-scheduler-pki` runs the controller's image and code with a `scheduler-pki` entry point. It creates whatever is missing:
   - `di-scheduler-ca` and `di-scheduler-identities`;
   - the four platform leaf Secrets in the platform namespace;
   - `di-scheduler-nats-accounts`, with no tenants.
 
   It overwrites nothing that exists, and no key enters Pulumi state.
-- **Ordering.** The NATS Deployment and the Helm release both `dependsOn` the Job. **U**: that the Pulumi Kubernetes provider awaits the Job's completion; if it does not, the Job is wrapped in an explicit wait.
+- **Ordering.** The NATS objects and the Helm release both `dependsOn` the Job. **V**: the provider awaits a `batch/v1` Job's completion (provider 4.34.2 `pkg/await/awaiters.go:154-159,195`); the Job sets no `skipAwait`, and `pulumi.com/replaceUnready` replaces a Job that failed instead of waiting on it again.
 - **RBAC, as it really is.** RBAC `resourceNames` cannot restrict `create`. The Job's ServiceAccount therefore holds namespace-wide `create` on Secrets and ConfigMaps in the PKI and platform namespaces, plus `get` by `resourceNames`. This is accepted explicitly:
   - the ServiceAccount has no long-lived token, and only the Job's pod receives one;
   - the Job sets `ttlSecondsAfterFinished`;
@@ -663,7 +667,7 @@ These are marked **U** above. The implementation or Layer 4 must confirm them:
 
 1. The reloader image's flags, and the kubelet's propagation delay for ConfigMaps and Secrets (4.1, 4.4, 8.4 step 11).
 2. That wash exits and restarts on a failed first connect, and how it reconnects after a certificate change (4.4).
-3. That the Pulumi Kubernetes provider awaits the bootstrap Job's completion (4.5).
+3. ~~That the Pulumi Kubernetes provider awaits the bootstrap Job's completion (4.5).~~ **V** (4.5).
 4. That Helm keeps a pod-template annotation the controller adds to `hostgroup-default` (4.5).
 5. The effect of `useSecretsForSATokens: true` on a running instance (4.9). The operator's tests pass with it.
 6. The account `limits` sizes (4.3).
