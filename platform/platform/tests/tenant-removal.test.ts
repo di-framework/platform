@@ -145,6 +145,10 @@ class FakeApi implements Api {
       this.objects.set(target, value);
       return structuredClone(value) as T;
     }
+    if (method === 'PUT') {
+      this.objects.set(target, data);
+      return structuredClone(data) as T;
+    }
     throw new Error(`Unexpected ${method}`);
   }
 }
@@ -918,6 +922,8 @@ describe('R1 and R4 wait for the written accounts file (#541 m6e-D)', () => {
         await prepare(policy);
       const file = `${cfg.namespace}/${SCHEDULER_NATS_ACCOUNTS}`;
       api.seed(accountsFile(t, record('hosts', 'operator')));
+      // Scaled to zero out of band: R1 re-applies it.
+      (api.objects.get(key(operatorDeployment))!.spec as { replicas: number }).replicas = 0;
       deleting();
       await reconcile();
       expect(condition(t, 'Ready')).toMatchObject({
@@ -979,6 +985,15 @@ describe('removal round-1 review of #614 (#541 m6e-D)', () => {
       message: 'Retain: removal step R3 waits for pod/di-operator-alpha/running',
     });
     api.objects.delete(key(pod('running', 'Running')));
+    // A finished pod still terminating (its finalizer not yet cleared) holds R3 too.
+    const stopping = pod('stopping', 'Failed');
+    stopping.metadata.deletionTimestamp = START.toISOString();
+    api.seed(stopping);
+    await reconcile();
+    expect(condition(t, 'Ready')).toMatchObject({
+      message: 'Retain: removal step R3 waits for pod/di-operator-alpha/stopping',
+    });
+    api.objects.delete(key(stopping));
     await drain();
     expect(t.metadata.finalizers ?? []).not.toContain(FINALIZER);
   });
@@ -986,7 +1001,8 @@ describe('removal round-1 review of #614 (#541 m6e-D)', () => {
   for (const missing of ['ConfigMap', 'key'] as const)
     it(`W2: with a scheduler PKI, a missing accounts ${missing} holds R1 until RemovalStuck`, async () => {
       const { api, clock, t, deleting, reconcile } = await prepare('Retain');
-      seedRecord(api, record());
+      // The tenant's entries are still issued, so R1's drop deletes the hosts entry first.
+      seedRecord(api, record('hosts', 'operator'));
       if (missing === 'key')
         api.seed({
           apiVersion: 'v1',
@@ -999,6 +1015,12 @@ describe('removal round-1 review of #614 (#541 m6e-D)', () => {
       expect(condition(t, 'Ready')).toMatchObject({
         message: `Retain: removal step R1 waits for ${file}: not written`,
       });
+      const stored = api.objects.get(
+        `${collection('v1', 'ConfigMap', schedulerPkiNamespace(cfg.namespace))}/${SCHEDULER_IDENTITIES}`,
+      );
+      const left = JSON.parse((stored!.data as Record<string, string>)[IDENTITIES_KEY]!);
+      expect(left['tenant/alpha/hosts']).toBeUndefined();
+      expect(left['tenant/alpha/operator']).toBeDefined();
       clock.now = new Date(START.getTime() + REMOVAL_STEP_DEADLINE_MS);
       await reconcile();
       expect(condition(t, REMOVAL_STUCK)).toMatchObject({ reason: 'R1' });

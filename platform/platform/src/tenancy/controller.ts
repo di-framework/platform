@@ -262,7 +262,6 @@ export const PLACEMENT_RETRY = 'di-framework.dev/placement-retry';
 const NUDGE_HOST_SETTLE_MS = 1_000;
 /** How old an unplaced Workload must be before it is nudged (S2 of the #418 review). */
 const NUDGE_WORKLOAD_MIN_AGE_MS = 5_000;
-/** Whether `time` is unset or at least `ms` before `now`. */
 /**
  * Whether removal waits for `pod`: a terminating one (its finalizer still has to clear) or one not
  * yet finished. A finished pod (`Succeeded` or `Failed`, e.g. evicted) can no longer write
@@ -273,6 +272,7 @@ function isLivePod(pod: Resource): boolean {
   const phase = (pod.status as { phase?: string } | undefined)?.phase;
   return phase !== 'Succeeded' && phase !== 'Failed';
 }
+/** Whether `time` is unset or at least `ms` before `now`. */
 function olderThan(time: string | undefined, ms: number, now: number): boolean {
   return !time || now - Date.parse(time) >= ms;
 }
