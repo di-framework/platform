@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
+import { X509Certificate } from 'node:crypto';
 import { ApiError, collection } from '../src/tenancy/controller';
 import {
   INSTALLATION,
@@ -13,8 +14,10 @@ import {
   bootstrapSchedulerPki,
   IDENTITIES_KEY,
   parseIdentityRecord,
+  SCHEDULER_LEAF_RENEW_DAYS,
 } from '../src/tenancy/scheduler-pki';
 import {
+  ROTATE_ANNOTATION,
   SCHEDULER_TLS_ANNOTATION,
   schedulerCertDigest,
 } from '../src/tenancy/scheduler-pki-rotation';
@@ -769,7 +772,7 @@ it('forgets the propagation wait of a Tenant that is gone', async () => {
   expect(api.objects.has(operatorPath)).toBe(false);
 });
 
-// The gating of the host Deployment in `hostTlsFor` over every state it can meet (#613 round 4).
+// The gating of the host Deployment in `hostTlsFor` over every state it can meet (#613 rounds 4, 5).
 // Invariants:
 // - I1: hosts never run on di-scheduler-host-tls before the tenant operator is Ready and the
 //   hosts user has propagated, unless their template has already moved.
@@ -781,10 +784,11 @@ it('forgets the propagation wait of a Tenant that is gone', async () => {
 describe('host gating matrix (#541 m6e)', () => {
   type Operator = 'missing' | 'not Ready' | 'Ready';
   /**
-   * `none`: no host Secret, template on the copy. Issued, not moved: `copy` (template on the copy),
+   * `none`: no host Secret, template on the copy; `foreign`: the same with another digest `old`
+   * (S2 of the #613 round-5 review). Issued, not moved: `copy` (template on the copy),
    * `annotated` (on the copy with another digest `old`), `empty` (on the issued Secret, digest '').
    */
-  type Identity = 'none' | 'copy' | 'annotated' | 'empty' | 'moved';
+  type Identity = 'none' | 'foreign' | 'copy' | 'annotated' | 'empty' | 'moved';
   /** Replicas, mounted Secret, digest (`d` the issued one, `-` none), Tenant Ready. */
   type Cell = [number, 'copy' | 'host', '-' | '' | 'd' | 'old', 'True' | 'False'];
   const ON_COPY: Cell = [2, 'copy', '-', 'False'];
@@ -796,6 +800,7 @@ describe('host gating matrix (#541 m6e)', () => {
   const OFF_MOVED_READY: Cell = [0, 'host', 'd', 'True'];
   const unready: Record<Identity, Cell> = {
     none: ON_COPY,
+    foreign: ON_ANNOTATED_COPY,
     copy: ON_COPY,
     annotated: ON_ANNOTATED_COPY,
     empty: HELD_EMPTY,
@@ -803,6 +808,7 @@ describe('host gating matrix (#541 m6e)', () => {
   };
   const suspendedUnready: Record<Identity, Cell> = {
     none: HELD_EMPTY,
+    foreign: HELD_EMPTY,
     copy: HELD_EMPTY,
     annotated: HELD_EMPTY,
     empty: HELD_EMPTY,
@@ -814,6 +820,7 @@ describe('host gating matrix (#541 m6e)', () => {
       'not Ready': unready,
       Ready: {
         none: ON_COPY,
+        foreign: ON_ANNOTATED_COPY,
         copy: MOVED_READY,
         annotated: MOVED_READY,
         empty: MOVED_READY,
@@ -825,6 +832,7 @@ describe('host gating matrix (#541 m6e)', () => {
       'not Ready': suspendedUnready,
       Ready: {
         none: HELD_EMPTY,
+        foreign: HELD_EMPTY,
         copy: OFF_MOVED_READY,
         annotated: OFF_MOVED_READY,
         empty: OFF_MOVED_READY,
@@ -861,14 +869,15 @@ describe('host gating matrix (#541 m6e)', () => {
 
   const seedHosts = (api: CutoverApi, identity: Identity) => {
     const digest = schedulerCertDigest(hostCert(api));
-    if (identity === 'none') api.objects.delete(hostSecretPath);
+    if (identity === 'none' || identity === 'foreign') api.objects.delete(hostSecretPath);
     api.seed(
       {
         none: hosts(2, SCHEDULER_TLS_COPY),
+        foreign: hosts(2, SCHEDULER_TLS_COPY, 'old'),
         copy: hosts(2, SCHEDULER_TLS_COPY),
         annotated: hosts(2, SCHEDULER_TLS_COPY, 'old'),
         empty: hosts(0, TENANT_HOST_SECRET, ''),
-        moved: hosts(1, TENANT_HOST_SECRET, digest),
+        moved: hosts(2, TENANT_HOST_SECRET, digest),
       }[identity],
     );
     return digest;
@@ -942,5 +951,67 @@ describe('host gating matrix (#541 m6e)', () => {
   it('suspend and unsuspend while the operator is not Ready: moved hosts keep their digest', async () => {
     const seen = await trace('moved', 'not Ready', [stay, suspendStep, wait, unsuspendStep, wait]);
     expect(seen).toEqual(['1:d', '0:d', '0:d', '1:d', '1:d']);
+  });
+
+  // W1 of the #613 round-5 review: a moved template renewed or rotated while suspended, then
+  // unsuspended inside the wait, keeps its old digest until the hosts user has propagated.
+  /** `replicas:old|new` after each tick, every 20 s from suspension, unsuspended 40 s after `renew`. */
+  const renewSuspended = async (renew: (api: CutoverApi) => void) => {
+    const { api, controller } = await withOperator('Ready');
+    const old = seedHosts(api, 'moved');
+    await controller.tick();
+    suspend(api, true);
+    await controller.tick();
+    renew(api);
+    const seen: string[] = [];
+    for (let i = 0; i < 9; i++) {
+      if (i === 2) suspend(api, false);
+      await controller.tick();
+      const [replicas] = observe(api, old);
+      const annotation = hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION];
+      seen.push(`${replicas}:${annotation === old ? 'old' : 'new'}`);
+      advance(20_000);
+    }
+    return seen;
+  };
+  // Issued at the end of the first tick; the wait (120 s) passes at the seventh, then the new digest rolls.
+  const HELD_THEN_ROLLED = [
+    '0:old',
+    '0:old',
+    '1:old',
+    '1:old',
+    '1:old',
+    '1:old',
+    '1:old',
+    '1:new',
+    '1:new',
+  ];
+
+  it('suspended, the host Secret deleted, then unsuspended: the new digest waits for its accounts', async () => {
+    expect(await renewSuspended((api) => api.objects.delete(hostSecretPath))).toEqual(
+      HELD_THEN_ROLLED,
+    );
+  });
+
+  it('suspended, a forced rotation, then unsuspended: the new digest waits for its accounts', async () => {
+    expect(
+      await renewSuspended((api) => {
+        stored(api).metadata.annotations = {
+          ...stored(api).metadata.annotations,
+          [ROTATE_ANNOTATION]: 'r1',
+        };
+      }),
+    ).toEqual(HELD_THEN_ROLLED);
+  });
+
+  it('suspended across a routine renewal, then unsuspended: the new digest waits for its accounts', async () => {
+    expect(
+      await renewSuspended((api) => {
+        const notAfter = new X509Certificate(hostCert(api)).validTo;
+        clock.now = new Date(
+          new Date(notAfter).getTime() - SCHEDULER_LEAF_RENEW_DAYS * 86_400_000 + 1000,
+        );
+      }),
+    ).toEqual(HELD_THEN_ROLLED);
   });
 });

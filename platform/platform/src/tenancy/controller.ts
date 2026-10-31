@@ -1436,8 +1436,9 @@ export class Controller {
    *   the rollout completes and drops nothing. Kept so: measuring from the template change would
    *   need one more persisted timestamp for a condition that is only a report.
    * - A suspended Tenant whose host identity is not issued is rendered at zero replicas with the
-   *   live template's digest, or none, so its pre-cut-over hosts stop too (S2 of the #613 round-2
-   *   review). A running one is left as it is. `issued` is false in both cases.
+   *   live template's digest if it has moved, or none, so its pre-cut-over hosts stop too (S2 of
+   *   the #613 round-2 and round-5 reviews). A running one is left as it is. `issued` is false in
+   *   both cases.
    */
   private async hostTlsFor(
     tenant: Tenant,
@@ -1453,23 +1454,20 @@ export class Controller {
           )
         )?.spec as { template?: HostTemplate } | undefined
       )?.template;
-    if (digest === undefined) {
-      if (!tenant.spec.suspended) return { issued: false };
-      const template = await live();
-      return {
-        digest: template?.metadata?.annotations?.[SCHEDULER_TLS_ANNOTATION] ?? '',
-        issued: false,
-      };
-    }
+    if (digest === undefined && !tenant.spec.suspended) return { issued: false };
     const template = await live();
     const annotation = template?.metadata?.annotations?.[SCHEDULER_TLS_ANNOTATION];
     // A template rendered while suspended with no digest (`''`) has not moved (W1 of the #613
     // round-3 review): it waits for the operator and rolls once onto the issued digest.
     const moved = Boolean(annotation) && mountsSecret(template?.spec, TENANT_HOST_SECRET);
+    // Suspended without an issued identity, only a moved template keeps its digest (S2 of the
+    // #613 round-5 review).
+    if (digest === undefined) return { digest: moved ? annotation : '', issued: false };
     // Suspended, a template that has not moved gets the issued digest only once the first move is
-    // allowed, so unsuspending it cannot skip the operator (W1 of the #613 round-4 review).
-    if (tenant.spec.suspended)
-      return { digest: moved || operatorReady ? digest : '', issued: true };
+    // allowed, so unsuspending it cannot skip the operator (W1 of the #613 round-4 review). A moved
+    // one takes a renewed digest only after the accounts wait below (W1 of round 5).
+    if (tenant.spec.suspended && !moved)
+      return { digest: operatorReady ? digest : '', issued: true };
     if (!operatorReady && !moved) return { issued: true };
     // The first move waits for nothing more: the hosts' identity is issued with the operator's,
     // whose own wait has passed, since it is Ready.
