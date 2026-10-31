@@ -1413,10 +1413,16 @@ export class Controller {
   /**
    * The host certificate digest the host Deployment is rendered with, or undefined to leave the
    * live Deployment untouched (#541 m6e).
-   * - Only the first move onto {@link TENANT_HOST_SECRET} waits for the tenant's operator to be
-   *   Ready. Once the live Deployment mounts it, or while the Tenant is suspended (zero replicas),
-   *   the Deployment keeps being applied whatever the operator does, so suspension, replica
-   *   changes and renewals are never held (W1 of the #613 review).
+   * - The live template has "moved" once it mounts {@link TENANT_HOST_SECRET} and carries a
+   *   non-empty digest. A moved template is applied with its digest whatever the operator does, so
+   *   suspension, replica changes and renewals are never held (W1 of the #613 review).
+   * - The first move waits for the tenant's operator to be Ready. The hosts' identity is issued
+   *   with the operator's, whose own accounts wait has then passed. Until then a running Tenant's
+   *   host Deployment is left as it is, and a suspended Tenant's is rendered at zero replicas on
+   *   {@link TENANT_HOST_SECRET} with the digest `''`, which has not moved. So unsuspending it
+   *   cannot start hosts before their operator (W1 of the #613 round-3 and round-4 reviews). Once
+   *   the move is allowed, the template is rendered with the issued digest, suspended (zero
+   *   replicas) or not.
    * - A renewed or rotated certificate reaches the template only once its user has propagated
    *   ({@link accountsLoaded}); until then the template keeps the digest it has, so new pods are
    *   not refused at their first connect (S2 of the #613 review). For a routine renewal the old
@@ -1431,7 +1437,7 @@ export class Controller {
    *   need one more persisted timestamp for a condition that is only a report.
    * - A suspended Tenant whose host identity is not issued is rendered at zero replicas with the
    *   live template's digest, or none, so its pre-cut-over hosts stop too (S2 of the #613 round-2
-   *   review); `issued` is false then.
+   *   review). A running one is left as it is. `issued` is false in both cases.
    */
   private async hostTlsFor(
     tenant: Tenant,
@@ -1455,19 +1461,21 @@ export class Controller {
         issued: false,
       };
     }
-    if (tenant.spec.suspended) return { digest, issued: true };
     const template = await live();
+    const annotation = template?.metadata?.annotations?.[SCHEDULER_TLS_ANNOTATION];
     // A template rendered while suspended with no digest (`''`) has not moved (W1 of the #613
     // round-3 review): it waits for the operator and rolls once onto the issued digest.
-    const annotation = template?.metadata?.annotations?.[SCHEDULER_TLS_ANNOTATION];
     const moved = Boolean(annotation) && mountsSecret(template?.spec, TENANT_HOST_SECRET);
+    // Suspended, a template that has not moved gets the issued digest only once the first move is
+    // allowed, so unsuspending it cannot skip the operator (W1 of the #613 round-4 review).
+    if (tenant.spec.suspended)
+      return { digest: moved || operatorReady ? digest : '', issued: true };
     if (!operatorReady && !moved) return { issued: true };
-    const rendered = moved ? annotation : undefined;
     // The first move waits for nothing more: the hosts' identity is issued with the operator's,
     // whose own wait has passed, since it is Ready.
-    if (rendered === undefined || rendered === digest) return { digest, issued: true };
+    if (!moved || annotation === digest) return { digest, issued: true };
     const loaded = await this.accountsLoaded(tenant.metadata.name, 'hosts');
-    return { digest: loaded ? digest : rendered, issued: true };
+    return { digest: loaded ? digest : annotation, issued: true };
   }
   /** A `di-scheduler-tls` this controller copied for the Tenant: its installation and owner labels. */
   private ownsCopy(copy: Resource, tenant: Tenant): boolean {

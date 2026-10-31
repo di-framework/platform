@@ -342,6 +342,20 @@ describe('per-tenant gating (#541 m6e)', () => {
       expect(seen).toEqual(['0:', `1:${schedulerCertDigest(hostCert(api))}`]);
     });
 
+    // W1 of the #613 round-4 review: a second suspended tick sees the issued digest; it must not
+    // move the template before the operator is Ready.
+    it('holds hosts suspended for two first ticks until the operator is Ready, then rolls once', async () => {
+      const { api, controller } = await prepare();
+      api.seed(legacyHosts(2));
+      tenantSpec(api).suspended = true;
+      await controller.tick();
+      await controller.tick();
+      expect(hostReplicas(api)).toBe(0);
+      tenantSpec(api).suspended = false;
+      const seen = await rollout(api, controller);
+      expect(seen).toEqual(['0:', `1:${schedulerCertDigest(hostCert(api))}`]);
+    });
+
     it('holds hosts suspended before issuance until the operator is Ready, then rolls once', async () => {
       const { api, controller } = await prepare(false);
       api.seed(legacyHosts(2));
@@ -753,4 +767,180 @@ it('forgets the propagation wait of a Tenant that is gone', async () => {
   advance(TENANT_OPERATOR_PROPAGATION_MS);
   await controller.tick();
   expect(api.objects.has(operatorPath)).toBe(false);
+});
+
+// The gating of the host Deployment in `hostTlsFor` over every state it can meet (#613 round 4).
+// Invariants:
+// - I1: hosts never run on di-scheduler-host-tls before the tenant operator is Ready and the
+//   hosts user has propagated, unless their template has already moved.
+// - I2: a suspended Tenant has zero host replicas.
+// - I3: a moved template (it mounts di-scheduler-host-tls and carries a non-empty digest) never
+//   loses its digest, and rolls again only for a renewal.
+// - I4: Ready needs the operator Ready, the host identity issued and the hosts rolled; a
+//   suspended Tenant reports Ready (reason Suspended) on the same terms.
+describe('host gating matrix (#541 m6e)', () => {
+  type Operator = 'missing' | 'not Ready' | 'Ready';
+  /**
+   * `none`: no host Secret, template on the copy. Issued, not moved: `copy` (template on the copy),
+   * `annotated` (on the copy with another digest `old`), `empty` (on the issued Secret, digest '').
+   */
+  type Identity = 'none' | 'copy' | 'annotated' | 'empty' | 'moved';
+  /** Replicas, mounted Secret, digest (`d` the issued one, `-` none), Tenant Ready. */
+  type Cell = [number, 'copy' | 'host', '-' | '' | 'd' | 'old', 'True' | 'False'];
+  const ON_COPY: Cell = [2, 'copy', '-', 'False'];
+  const ON_ANNOTATED_COPY: Cell = [2, 'copy', 'old', 'False'];
+  const HELD_EMPTY: Cell = [0, 'host', '', 'False'];
+  const MOVED_UNREADY: Cell = [1, 'host', 'd', 'False'];
+  const MOVED_READY: Cell = [1, 'host', 'd', 'True'];
+  const OFF_MOVED_UNREADY: Cell = [0, 'host', 'd', 'False'];
+  const OFF_MOVED_READY: Cell = [0, 'host', 'd', 'True'];
+  const unready: Record<Identity, Cell> = {
+    none: ON_COPY,
+    copy: ON_COPY,
+    annotated: ON_ANNOTATED_COPY,
+    empty: HELD_EMPTY,
+    moved: MOVED_UNREADY,
+  };
+  const suspendedUnready: Record<Identity, Cell> = {
+    none: HELD_EMPTY,
+    copy: HELD_EMPTY,
+    annotated: HELD_EMPTY,
+    empty: HELD_EMPTY,
+    moved: OFF_MOVED_UNREADY,
+  };
+  const expected: Record<'running' | 'suspended', Record<Operator, Record<Identity, Cell>>> = {
+    running: {
+      missing: unready,
+      'not Ready': unready,
+      Ready: {
+        none: ON_COPY,
+        copy: MOVED_READY,
+        annotated: MOVED_READY,
+        empty: MOVED_READY,
+        moved: MOVED_READY,
+      },
+    },
+    suspended: {
+      missing: suspendedUnready,
+      'not Ready': suspendedUnready,
+      Ready: {
+        none: HELD_EMPTY,
+        copy: OFF_MOVED_READY,
+        annotated: OFF_MOVED_READY,
+        empty: OFF_MOVED_READY,
+        moved: OFF_MOVED_READY,
+      },
+    },
+  };
+
+  const hosts = (replicas: number, secretName: string, digest?: string) =>
+    ({
+      apiVersion: 'apps/v1',
+      kind: 'Deployment',
+      metadata: { name: `hostgroup-${n.hostgroup}`, namespace: n.runtimeNamespace, labels: owned },
+      spec: {
+        replicas,
+        template: {
+          ...(digest === undefined
+            ? {}
+            : { metadata: { annotations: { [SCHEDULER_TLS_ANNOTATION]: digest } } }),
+          spec: { volumes: [{ name: 'scheduler', secret: { secretName } }] },
+        },
+      },
+    }) as unknown as Resource;
+
+  /** The tenant with its operator in `operator` state, before the observed tick. */
+  const withOperator = async (operator: Operator) => {
+    const { api, controller } = await prepare();
+    registerHost(api);
+    if (operator === 'not Ready') api.held.add('runtime-operator');
+    if (operator === 'missing') await controller.tick();
+    else await throughPropagation(controller);
+    return { api, controller };
+  };
+
+  const seedHosts = (api: CutoverApi, identity: Identity) => {
+    const digest = schedulerCertDigest(hostCert(api));
+    if (identity === 'none') api.objects.delete(hostSecretPath);
+    api.seed(
+      {
+        none: hosts(2, SCHEDULER_TLS_COPY),
+        copy: hosts(2, SCHEDULER_TLS_COPY),
+        annotated: hosts(2, SCHEDULER_TLS_COPY, 'old'),
+        empty: hosts(0, TENANT_HOST_SECRET, ''),
+        moved: hosts(1, TENANT_HOST_SECRET, digest),
+      }[identity],
+    );
+    return digest;
+  };
+
+  const observe = (api: CutoverApi, digest: string): Cell => {
+    const template = hostTemplate(api);
+    const annotation = template.metadata?.annotations?.[SCHEDULER_TLS_ANNOTATION];
+    const secret = template.spec.volumes.find((v) => v.name === 'scheduler')?.secret?.secretName;
+    return [
+      (api.objects.get(hostsPath)?.spec as { replicas: number } | undefined)?.replicas ?? -1,
+      secret === TENANT_HOST_SECRET ? 'host' : 'copy',
+      annotation === undefined ? '-' : annotation === digest ? 'd' : (annotation as ''),
+      readyCondition(api)?.status as 'True' | 'False',
+    ];
+  };
+  const suspend = (api: CutoverApi, value: boolean) => {
+    (stored(api).spec as { suspended?: boolean }).suspended = value;
+  };
+
+  for (const [state, operators] of Object.entries(expected))
+    for (const [operator, identities] of Object.entries(operators))
+      for (const [identity, cell] of Object.entries(identities))
+        it(`${state}, operator ${operator}, identity ${identity}: ${cell.join(' ')}`, async () => {
+          const { api, controller } = await withOperator(operator as Operator);
+          const digest = seedHosts(api, identity as Identity);
+          suspend(api, state === 'suspended');
+          await controller.tick();
+          expect(observe(api, digest)).toEqual(cell);
+        });
+
+  /** `replicas:digest` after each step and its tick, `d` for the issued digest. */
+  const trace = async (
+    identity: Identity,
+    operator: Operator,
+    steps: ((api: CutoverApi) => void)[],
+  ) => {
+    const { api, controller } = await withOperator(operator);
+    seedHosts(api, identity);
+    const seen: string[] = [];
+    for (const step of steps) {
+      step(api);
+      await controller.tick();
+      const [replicas, , digest] = observe(api, schedulerCertDigest(hostCert(api)));
+      seen.push(`${replicas}:${digest}`);
+    }
+    return seen;
+  };
+  const stay = () => {};
+  const wait = () => advance(TENANT_OPERATOR_PROPAGATION_MS);
+  const suspendStep = (api: CutoverApi) => suspend(api, true);
+  const unsuspendStep = (api: CutoverApi) => {
+    suspend(api, false);
+    wait();
+  };
+  const release = (api: CutoverApi) => api.held.delete('runtime-operator');
+
+  it('suspend and unsuspend while the operator is not Ready: hosts on the copy are held, then roll once', async () => {
+    const seen = await trace('copy', 'not Ready', [
+      stay,
+      suspendStep,
+      wait,
+      unsuspendStep,
+      wait,
+      release,
+      stay,
+    ]);
+    expect(seen).toEqual(['2:-', '0:', '0:', '0:', '0:', '1:d', '1:d']);
+  });
+
+  it('suspend and unsuspend while the operator is not Ready: moved hosts keep their digest', async () => {
+    const seen = await trace('moved', 'not Ready', [stay, suspendStep, wait, unsuspendStep, wait]);
+    expect(seen).toEqual(['1:d', '0:d', '0:d', '1:d', '1:d']);
+  });
 });
