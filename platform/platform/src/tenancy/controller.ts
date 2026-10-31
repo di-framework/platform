@@ -146,6 +146,7 @@ import {
   hostRolloutOf,
   ownsIdentitySecret,
   TENANT_HOST_SECRET,
+  TENANT_OPERATOR_SECRET,
   TenantSchedulerIdentities,
 } from './scheduler-identities';
 import {
@@ -153,20 +154,10 @@ import {
   type AccountsProblem,
   accountsNamesTenantAccount,
   accountsNamesTenantHost,
-  accountsNamesUser,
   SCHEDULER_ACCOUNTS_CONDITION,
   SCHEDULER_NATS_ACCOUNTS,
   schedulerAccountsCondition,
 } from './scheduler-nats';
-import {
-  IDENTITIES_KEY,
-  parseIdentityRecord,
-  SCHEDULER_IDENTITIES,
-  schedulerPkiNamespace,
-  tenantHostUser,
-  tenantIdentity,
-  tenantOperatorUser,
-} from './scheduler-pki';
 import { SCHEDULER_TLS_ANNOTATION, schedulerCertDigest } from './scheduler-pki-rotation';
 import { PlatformSchedulerIdentities } from './scheduler-platform-identities';
 import {
@@ -189,7 +180,7 @@ import {
   type StorageRecords,
   storageAllowed,
 } from './storage-records';
-import { TENANT_OPERATOR_PROPAGATION_MS, tenantOperatorResources } from './tenant-operator';
+import { tenantOperatorResources } from './tenant-operator';
 import { operatorNamespace, TENANT_OPERATOR_NAME } from './tenant-operator-names';
 import { certificateNames, certificateValid, holdsCaKey, issuedBy, leafCertificate } from './tls';
 import {
@@ -562,14 +553,6 @@ export class Controller {
   private readonly identities: TenantSchedulerIdentities;
   /** The scheduler NATS accounts file (#541 m6d). */
   private readonly accounts: SchedulerAccountsWriter;
-  /**
-   * Per tenant, the operator user the written accounts file was first seen to name, and when; the
-   * operator Deployment is created {@link TENANT_OPERATOR_PROPAGATION_MS} later (#541 m6e).
-   */
-  private readonly accountsSeen = new Map<
-    string,
-    Partial<Record<'hosts' | 'operator', { user: string; since: number }>>
-  >();
   /**
    * The problems of the last accounts render, reported on every Tenant: empty when it was written,
    * undefined while unknown (before the first render since start, or after a failed read), when
@@ -1408,46 +1391,12 @@ export class Controller {
     return state.stage === 'migrated' && state.credentials ? 'credentials' : 'stopped';
   }
   /**
-   * True once the accounts file this controller wrote has named the current user of the tenant's
-   * `kind` identity for {@link TENANT_OPERATOR_PROPAGATION_MS}. Nothing reports when NATS has
-   * loaded the file (owner decision 1), so a client whose new certificate names that user, and
-   * which exits when its first connect is refused, starts only after that fixed wait (#541 m6e):
-   * the operator's creation, and every move of the hosts to a new certificate (S2 of the #613
-   * review). In memory: a restarted controller waits once more.
-   */
-  private async accountsLoaded(t: string, kind: 'hosts' | 'operator'): Promise<boolean> {
-    const record = await this.get<{ data?: Record<string, string> }>(
-      `${collection('v1', 'ConfigMap', schedulerPkiNamespace(this.cfg.namespace))}/${SCHEDULER_IDENTITIES}`,
-    );
-    const id = parseIdentityRecord(record?.data?.[IDENTITIES_KEY] ?? '')[tenantIdentity(t, kind)]
-      ?.current;
-    const accounts = id
-      ? await this.get<{ data?: Record<string, string> }>(
-          `${collection('v1', 'ConfigMap', this.cfg.namespace)}/${SCHEDULER_NATS_ACCOUNTS}`,
-        )
-      : undefined;
-    const userOf = kind === 'hosts' ? tenantHostUser : tenantOperatorUser;
-    const user = id ? userOf(t, id) : '';
-    const seen = this.accountsSeen.get(t) ?? {};
-    this.accountsSeen.set(t, seen);
-    if (!id || !accountsNamesUser(accounts?.data?.[ACCOUNTS_KEY] ?? '', user)) {
-      delete seen[kind];
-      return false;
-    }
-    const now = this.now().getTime();
-    const since = seen[kind]?.user === user ? seen[kind].since : undefined;
-    if (since === undefined) {
-      seen[kind] = { user, since: now };
-      return false;
-    }
-    return now - since >= TENANT_OPERATOR_PROPAGATION_MS;
-  }
-  /**
    * Applies the tenant's runtime-operator in `di-operator-<t>` (#541 m6e, design-541 §4.6), one
    * object at a time: the Namespace, ServiceAccount and RoleBindings, then its policies, then the
-   * Deployment. A Deployment that does not exist yet is created only once its accounts have
-   * propagated ({@link accountsLoaded}); one that exists is always applied, suspended or
-   * not (S2). Returns whether the operator is Ready; not while the API server's endpoints are
+   * Deployment. A Deployment that does not exist yet is created only once the operator's identity
+   * Secret exists, which issuance writes only after its user has propagated (m6e-E), so the
+   * operator never starts on a user NATS has not loaded and no pod waits on a missing volume; one
+   * that exists is always applied, suspended or not (S2). Returns whether the operator is Ready; not while the API server's endpoints are
    * unknown, when nothing is applied.
    */
   private async applyTenantOperator(tenant: Tenant): Promise<boolean> {
@@ -1462,7 +1411,13 @@ export class Controller {
     for (const value of rendered.resources.slice(0, -1)) await this.ensure(value);
     if (
       !(await this.get<Resource>(location(deployment))) &&
-      !(await this.accountsLoaded(t, 'operator'))
+      !ownsIdentitySecret(
+        await this.get<Resource>(
+          `${collection('v1', 'Secret', operatorNamespace(t))}/${TENANT_OPERATOR_SECRET}`,
+        ),
+        this.cfg.installation,
+        tenant.metadata.uid,
+      )
     )
       return false;
     const applied = await this.ensure(deployment);
@@ -1509,18 +1464,12 @@ export class Controller {
    *   cannot start hosts before their operator (W1 of the #613 round-3 and round-4 reviews). Once
    *   the move is allowed, the template is rendered with the issued digest, suspended (zero
    *   replicas) or not.
-   * - A renewed or rotated certificate reaches the template only once its user has propagated
-   *   ({@link accountsLoaded}); until then the template keeps the digest it has, so new pods are
-   *   not refused at their first connect (S2 of the #613 review). For a routine renewal the old
-   *   certificate's user stays admitted until the rollout completes (`identityTransition`), so
-   *   the running pods keep working. A forced rotation or a deleted Secret keeps no previous
-   *   user: the running pods are refused at the next accounts reload, and the hosts stay down
-   *   for up to the wait plus a tick before the new pods roll. That trade avoids new pods that
-   *   are refused at start and crash-loop. The wait counts against a renewal's stall window
-   *   (`previousUntil`, issuance plus ten minutes), leaving the rollout about 477 s; a tenant
-   *   with many replicas can report `SchedulerIdentityRenewalStalled` briefly, which clears once
-   *   the rollout completes and drops nothing. Kept so: measuring from the template change would
-   *   need one more persisted timestamp for a condition that is only a report.
+   * - Nothing here waits for a renewed or rotated certificate (m6e-E): issuance writes a
+   *   certificate into {@link TENANT_HOST_SECRET} only once its user has propagated, so whatever
+   *   the Secret holds, and therefore whatever a starting pod reads, is admitted. The template
+   *   takes the Secret's digest at once. A forced rotation or a deleted Secret keeps no previous
+   *   user: the Secret is absent during the wait, the template is left as it is (`issued` false),
+   *   and pods that start meanwhile wait for the volume.
    * - A suspended Tenant whose host identity is not issued is rendered at zero replicas with the
    *   live template's digest if it has moved, or none, so its pre-cut-over hosts stop too (S2 of
    *   the #613 round-2 and round-5 reviews). A running one is left as it is. `issued` is false in
@@ -1550,16 +1499,12 @@ export class Controller {
     // #613 round-5 review).
     if (digest === undefined) return { digest: moved ? annotation : '', issued: false };
     // Suspended, a template that has not moved gets the issued digest only once the first move is
-    // allowed, so unsuspending it cannot skip the operator (W1 of the #613 round-4 review). A moved
-    // one takes a renewed digest only after the accounts wait below (W1 of round 5).
+    // allowed, so unsuspending it cannot skip the operator (W1 of the #613 round-4 review).
     if (tenant.spec.suspended && !moved)
       return { digest: operatorReady ? digest : '', issued: true };
     if (!operatorReady && !moved) return { issued: true };
-    // The first move waits for nothing more: the hosts' identity is issued with the operator's,
-    // whose own wait has passed, since it is Ready.
-    if (!moved || annotation === digest) return { digest, issued: true };
-    const loaded = await this.accountsLoaded(tenant.metadata.name, 'hosts');
-    return { digest: loaded ? digest : annotation, issued: true };
+    // The Secret holds only a propagated certificate (m6e-E), so the digest is never held back.
+    return { digest, issued: true };
   }
   /** A `di-scheduler-tls` this controller copied for the Tenant: its installation and owner labels. */
   private ownsCopy(copy: Resource, tenant: Tenant): boolean {
@@ -1692,7 +1637,8 @@ export class Controller {
         }
       }
       if (hosts) {
-        // Rolled: every replica runs the template with the current certificate (#541 m6e).
+        // Rolled: every replica runs the rendered template, which carries the digest of the
+        // certificate the Secret holds (#541 m6e, m6e-E).
         ready &&= hostRolloutOf(hosts as never, hostgroup).rollout?.complete === true;
         await this.removeSchedulerTlsCopy(tenant, hosts);
       }
@@ -3380,8 +3326,6 @@ export class Controller {
       if (!uids.has(uid)) this.storageListings.delete(uid);
     for (const name of this.caRefusals.keys()) if (!listed.has(name)) this.caRefusals.delete(name);
     this.identities.forget(listed);
-    for (const name of this.accountsSeen.keys())
-      if (!listed.has(name)) this.accountsSeen.delete(name);
     for (const name of this.logCursors.keys())
       if (!projected.has(name)) this.logCursors.delete(name);
     for (const name of this.logWriteFailures.keys())
