@@ -3,6 +3,7 @@ import { SCHEDULER_IDENTITY_COMPONENT } from '../../src/tenancy/scheduler-identi
 import { ACCOUNTS_KEY, SCHEDULER_NATS_ACCOUNTS } from '../../src/tenancy/scheduler-nats';
 import {
   IDENTITIES_KEY,
+  type IdentityRecord,
   PLATFORM_SECRETS,
   parseIdentityRecord,
   tenantIdentity,
@@ -13,8 +14,10 @@ import { certificateNames } from '../../src/tenancy/tls';
 import { cfg, type MemoryApi, recordPath } from './controller-harness';
 
 const accountsPath = `/api/v1/namespaces/${cfg.namespace}/configmaps/${SCHEDULER_NATS_ACCOUNTS}`;
-const platformPaths = (['operator', 'host', 'data'] as const).map(
-  (role) => `/api/v1/namespaces/${cfg.namespace}/secrets/${PLATFORM_SECRETS[role]}`,
+const platformPaths = new Set(
+  (['operator', 'host', 'data'] as const).map(
+    (role) => `/api/v1/namespaces/${cfg.namespace}/secrets/${PLATFORM_SECRETS[role]}`,
+  ),
 );
 
 /**
@@ -49,7 +52,7 @@ export class PropagationInvariant {
       ([path, value]) =>
         value.kind === 'Secret' &&
         (value.metadata.labels?.[COMPONENT] === SCHEDULER_IDENTITY_COMPONENT ||
-          platformPaths.includes(path)),
+          platformPaths.has(path)),
     );
   }
 
@@ -59,20 +62,33 @@ export class PropagationInvariant {
     ] as string;
   }
 
-  /** The violations at this moment, one line per Secret; empty when the invariant holds. */
-  violations(): string[] {
+  /** The users the written file names; each one's clock starts at the first check that sees it. */
+  private named(now: number): Set<string> {
     const text = this.text() ?? '';
     const named = new Set([...text.matchAll(/user: "([^"]+)"/g)].map((m) => m[1] as string));
-    const now = this.now().getTime();
     for (const user of this.since.keys()) if (!named.has(user)) this.since.delete(user);
     for (const user of named)
       if (!this.since.has(user))
         this.since.set(user, this.preexisting.has(user) ? Number.NEGATIVE_INFINITY : now);
+    return named;
+  }
+
+  private record(): IdentityRecord {
     const stored = (this.api.objects.get(recordPath)?.data as Record<string, string> | undefined)?.[
       IDENTITIES_KEY
     ];
-    const record = stored ? parseIdentityRecord(stored) : {};
-    const previous = new Set(Object.values(record).map((entry) => entry.previous));
+    return stored ? parseIdentityRecord(stored) : {};
+  }
+
+  /** The violations at this moment, one line per Secret; empty when the invariant holds. */
+  violations(): string[] {
+    const now = this.now().getTime();
+    const named = this.named(now);
+    const record = this.record();
+    // Only recorded `previous` IDs: a user that carries no issuance ID is never one of them.
+    const previous = new Set(
+      Object.values(record).flatMap((entry) => (entry.previous ? [entry.previous] : [])),
+    );
     const found: string[] = [];
     for (const [path, secret] of this.secrets()) {
       // A tenant identity whose entry removal dropped (R1, R4) is revoked on purpose, once its
@@ -82,14 +98,10 @@ export class PropagationInvariant {
       if (tenant && !record[tenantIdentity(tenant, kind)]) continue;
       const user = userOf(secret);
       const age = now - (this.since.get(user) ?? now);
-      const admitted = named.has(user);
-      const ok =
-        admitted &&
-        (age >= TENANT_OPERATOR_PROPAGATION_MS || previous.has(issuanceIdOf(user) as string));
-      if (!ok)
-        found.push(
-          `${path}: ${admitted ? `named for ${age / 1000} s` : 'not in the accounts file'}`,
-        );
+      const id = issuanceIdOf(user);
+      if (!named.has(user)) found.push(`${path}: not in the accounts file`);
+      else if (age < TENANT_OPERATOR_PROPAGATION_MS && !(id && previous.has(id)))
+        found.push(`${path}: named for ${age / 1000} s`);
     }
     return found;
   }

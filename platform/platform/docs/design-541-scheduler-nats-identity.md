@@ -295,17 +295,20 @@ How the pieces give the properties:
 4. only then write the certificate into the Secret;
 5. roll, as before (the host digest annotation, the `hostgroup-default` PATCH).
 
-At every moment the Secret therefore holds a certificate whose user has propagated, or the `previous` user of a routine renewal, which stays admitted throughout. The NATS server leaf is not a NATS user (clients verify it against the platform CA, which does not change), so it is re-issued without the wait. The tenant operator Deployment is created only once its Secret exists, so it never starts before its user has propagated. The host Deployment takes the Secret's digest at once: a moved template no longer holds a renewed digest back, and the first move onto `di-scheduler-host-tls` waits for the operator and for the Secret, which closes the gap of a host Secret re-issued while the template had not moved (probe B1 of the #613 review). While a pending issuance waits, every pass moves `previousUntil` to now + 10 minutes, so the overlap and the host stall clock count from the issuance that lands and the wait never causes a false `SchedulerIdentityRenewalStalled`.
+At every moment the Secret therefore holds a certificate whose user has propagated, or the `previous` user of a routine renewal, which stays admitted throughout. The NATS server leaf is not a NATS user (clients verify it against the platform CA, which does not change), so it is re-issued without the wait. The tenant operator Deployment is created only once its Secret exists, so it never starts before its user has propagated. The host Deployment takes the Secret's digest at once: a moved template no longer holds a renewed digest back, and the first move onto `di-scheduler-host-tls` waits for the operator and for the Secret, which closes the gap of a host Secret re-issued while the template had not moved (probe B1 of the #613 review). While a pending issuance waits, every pass moves `previousUntil` to now + 10 minutes, so the overlap and the host stall clock count from the issuance that lands and the wait never causes a false `SchedulerIdentityRenewalStalled`. That also means a wait that never ends (a refused render, a persistent accounts write failure) would never stall, so a wait longer than those 10 minutes is reported itself: `SchedulerIdentityPending` with reason `WaitingForAccounts` and the time the wait began on the Tenant, and one log line per platform identity. `SchedulerAccounts` (m6e-B) reports the cause.
 
 - **Forced rotation.** Either of these starts it:
   - changing the Tenant annotation `platform.di-framework.dev/rotate-scheduler-identity`, which rotates both of the tenant's entries;
   - deleting the identity's Secret.
 
   The controller:
-  1. records a new current ID with no previous, and renders accounts without the old user;
-  2. deletes the Secret if it still holds the old certificate, whose user is now revoked;
-  3. once the new user has propagated (above), issues the new certificate into the Secret;
-  4. rolls the hosts.
+  1. deletes the Secret if it still holds the old certificate, before anything else is written: until the DELETE succeeds, the record still names the old user, so it stays rendered;
+  2. records a new current ID with no previous, so the next accounts render drops the old user;
+  3. marks the rotation handled in Tenant status;
+  4. once the new user has propagated (above), issues the new certificate into the Secret;
+  5. rolls the hosts.
+
+  Each step can fail, and the next pass retries. None leaves a Secret holding a user the accounts file no longer names: if the DELETE fails, nothing is written and the old user stays admitted; if the record write fails after it, the Secret is only absent and the next pass draws an ID for it; if the status write or the propagation read fails after the record, the Secret is already gone.
 
   The old identity is refused from that reload on. There is no certificate to fall back on: a pod that starts during the wait waits for the Secret volume, which the kubelet retries, and starts once the new certificate is written. A Deployment whose identity is not issued is left as it is meanwhile. While the Secret is absent the controller remembers, in memory, the ID it waits to issue, so the missing Secret is not taken for a new forced rotation; a restarted controller draws one more ID and waits again. An operator whose user was removed reconnects with the new certificate files. nats.go reads them on every handshake (`nats.go: nats.go:1212-1234`; the operator uses `nats.ClientCert` at `wasmcloud: runtime-operator/cmd/main.go:189`). If the kubelet has not synced the Secret yet, the operator's connection closes and its liveness probe restarts it (`cmd/main.go:340-357`). The restarted process reads the synced files. This mirrors how deleting the registry pull Secret rotates its token (`controller.ts:735-739`).
 - **Routine renewal.** The controller:

@@ -22,6 +22,7 @@ import {
   PlatformSchedulerIdentities,
   SCHEDULER_DATA_TLS_ANNOTATION,
 } from '../src/tenancy/scheduler-platform-identities';
+import { PROPAGATION_OVERDUE_MS } from '../src/tenancy/scheduler-propagation';
 import { TENANT_OPERATOR_PROPAGATION_MS } from '../src/tenancy/tenant-operator';
 import { certificateNames, issuedBy } from '../src/tenancy/tls';
 import {
@@ -438,5 +439,33 @@ describe('platform identity Secrets after propagation (#541 m6e-E)', () => {
     for (const role of ['operator', 'host', 'data'] as const)
       expect(cert(api, PLATFORM_SECRETS[role])).not.toBe(before[role] as string);
     expect(annotation(api)).toBe(digestOf(api, 'host'));
+  });
+
+  it('logs each role waiting past the bound once, keeps previous, and writes once it propagates', async () => {
+    const { api, controller } = await prepare();
+    seedDeployment(api);
+    await controller.tick();
+    const gate = { open: false };
+    const identities = new PlatformSchedulerIdentities(api, cfg, () => clock.now, undefined, {
+      read: async () => () => gate.open,
+    });
+    const before = cert(api, PLATFORM_SECRETS.host);
+    clock.now = new Date(START.getTime() + 61 * DAY);
+    const start = clock.now;
+    await identities.reconcile();
+    advance(PROPAGATION_OVERDUE_MS - 1);
+    await identities.reconcile();
+    expect(warned('has waited since')).toBe(0);
+    advance(1);
+    for (let i = 0; i < 3; i++) await identities.reconcile();
+    // One line per waiting role, not one per tick; the previous users stay recorded.
+    expect(warned(`has waited since ${start.toISOString()}`)).toBe(3);
+    for (const role of ['operator', 'host', 'data'] as const)
+      expect(record(api)[`platform/${role}`]?.previous).toBeDefined();
+    expect(cert(api, PLATFORM_SECRETS.host)).toBe(before);
+    gate.open = true;
+    await identities.reconcile();
+    expect(cert(api, PLATFORM_SECRETS.host)).not.toBe(before);
+    expect(warned('has waited since')).toBe(3);
   });
 });

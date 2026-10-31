@@ -9,7 +9,14 @@
  * first sees the user named, never earlier than the write; a restarted controller waits once more.
  */
 import { ACCOUNTS_KEY, accountsNamesUser, SCHEDULER_NATS_ACCOUNTS } from './scheduler-nats';
+import { RENEWAL_OVERLAP_MS } from './scheduler-pki-rotation';
 import { TENANT_OPERATOR_PROPAGATION_MS } from './tenant-operator';
+
+/**
+ * A wait for propagation longer than this is reported: the bound `previousUntil` would have set
+ * for a renewal whose certificate was written at once.
+ */
+export const PROPAGATION_OVERDUE_MS = RENEWAL_OVERLAP_MS;
 
 /** The Kubernetes API call the clock makes; the controller's `KubernetesApi` is one. */
 interface ReadApi {
@@ -55,5 +62,34 @@ export class AccountsPropagation implements Propagation {
       this.since.set(user, since);
       return now - since >= TENANT_OPERATOR_PROPAGATION_MS;
     };
+  }
+}
+
+/**
+ * How long each identity has waited for its user to propagate (#541 m6e-E). While a renewal
+ * waits, every pass moves `previousUntil` forward, so the renewal stall never fires for it; past
+ * {@link PROPAGATION_OVERDUE_MS} the wait itself is reported. In memory: a restarted controller
+ * counts again from its first pass.
+ */
+export class PropagationWaits {
+  /** Per record key, the user it waits for and when this process first saw it wait. */
+  private readonly since = new Map<string, { user: string; at: number }>();
+
+  /** Notes that `key` waits for `user`; once the wait is overdue, returns when it began. */
+  overdue(key: string, user: string, now: Date): Date | undefined {
+    const seen = this.since.get(key);
+    const at = seen?.user === user ? seen.at : now.getTime();
+    this.since.set(key, { user, at });
+    return now.getTime() - at >= PROPAGATION_OVERDUE_MS ? new Date(at) : undefined;
+  }
+
+  /** `key` no longer waits. */
+  done(key: string): void {
+    this.since.delete(key);
+  }
+
+  /** Forgets every key not in `keys`. */
+  retain(keys: ReadonlySet<string>): void {
+    for (const key of this.since.keys()) if (!keys.has(key)) this.since.delete(key);
   }
 }

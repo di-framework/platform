@@ -10,11 +10,13 @@ import {
   TENANT,
   TENANT_HOST_SECRET,
 } from '../src/tenancy/resources';
+import { ACCOUNTS_KEY, SCHEDULER_NATS_ACCOUNTS } from '../src/tenancy/scheduler-nats';
 import {
   bootstrapSchedulerPki,
   IDENTITIES_KEY,
   parseIdentityRecord,
   SCHEDULER_LEAF_RENEW_DAYS,
+  tenantIdentity,
 } from '../src/tenancy/scheduler-pki';
 import {
   ROTATE_ANNOTATION,
@@ -22,6 +24,7 @@ import {
   schedulerCertDigest,
 } from '../src/tenancy/scheduler-pki-rotation';
 import { TENANT_OPERATOR_PROPAGATION_MS } from '../src/tenancy/tenant-operator';
+import { selfSignedCertificate } from '../src/tenancy/tls';
 import {
   cfg,
   MemoryApi,
@@ -55,9 +58,15 @@ class CutoverApi extends MemoryApi {
   held = new Set<string>();
   /** The host Deployment's applies fail, as a refused apply does (probe B1 of the #613 review). */
   refuseHosts = false;
+  /** Calls `<METHOD> <path>` (query string ignored) whose next call fails with the given code. */
+  failing = new Map<string, number>();
   override async call<T>(method: string, path: string, body?: unknown): Promise<T> {
     if (this.refuseHosts && method === 'PATCH' && path.startsWith(`${hostsPath}?`))
       throw new ApiError(422, 'host apply refused');
+    const call = `${method} ${path.split('?')[0]}`;
+    const code = this.failing.get(call);
+    this.failing.delete(call);
+    if (code) throw new ApiError(code, 'injected failure');
     const result = await super.call<Resource>(method, path, body);
     if (method === 'PATCH' && path.includes('/deployments/') && !path.includes('/status')) {
       const target = new URL(path, 'https://kubernetes').pathname;
@@ -92,8 +101,15 @@ const prepare = async (pki = true) => {
   const invariant = checked(api, controller);
   return { api, controller, invariant };
 };
-function checked(api: MemoryApi, controller: { tick(): Promise<void> }) {
-  const invariant = new PropagationInvariant(api, () => clock.now);
+/**
+ * Runs `invariant` after every tick of `controller`. A restarted controller is given the existing
+ * one: a new invariant would trust every certificate already in a Secret.
+ */
+function checked(
+  api: MemoryApi,
+  controller: { tick(): Promise<void> },
+  invariant = new PropagationInvariant(api, () => clock.now),
+) {
   const tick = controller.tick.bind(controller);
   controller.tick = async () => {
     await tick();
@@ -810,17 +826,29 @@ describe('a Tenant being deleted keeps its operator through R3 (owner decision 4
   });
 });
 
+const operatorEntry = (api: MemoryApi) =>
+  parseIdentityRecord(
+    ((api.objects.get(recordPath) as Resource).data as Record<string, string>)[
+      IDENTITIES_KEY
+    ] as string,
+  )[tenantIdentity('alpha', 'operator')];
+
 it('waits again for a re-created Tenant', async () => {
   const { api, controller } = await prepare();
   await controller.tick();
   await controller.tick();
+  const waited = operatorEntry(api)?.current;
+  expect(waited).toBeDefined();
   api.objects.delete(tenantPath);
   await controller.tick();
-  // Re-created: the wait starts over.
+  // Re-created: the wait starts over, for a new ID, so no Secret is written when the old one's
+  // wait would have ended.
   const { tenant } = await import('./support/controller-harness');
   api.seed(tenant());
   advance(TENANT_OPERATOR_PROPAGATION_MS);
   await controller.tick();
+  expect(operatorEntry(api)?.current).not.toBe(waited as string);
+  expect(api.objects.has(operatorSecretPath)).toBe(false);
   expect(api.objects.has(operatorPath)).toBe(false);
 });
 
@@ -1122,9 +1150,9 @@ describe('renewed Secrets only after their user propagated (#541 m6e-E)', () => 
   };
   /** Cut over and moved: the operator Ready, the hosts on the issued certificate. */
   const moved = async () => {
-    const { api, controller } = await prepare();
+    const { api, controller, invariant } = await prepare();
     await throughPropagation(controller);
-    return { api, controller, old: schedulerCertDigest(hostCert(api)) };
+    return { api, controller, invariant, old: schedulerCertDigest(hostCert(api)) };
   };
   const rotate = (api: MemoryApi, value: string) => {
     stored(api).metadata.annotations = { [ROTATE_ANNOTATION]: value };
@@ -1201,8 +1229,36 @@ describe('renewed Secrets only after their user propagated (#541 m6e-E)', () => 
     ]);
   });
 
+  const restart = (api: MemoryApi) =>
+    new Controller(
+      api,
+      cfg,
+      async () => [],
+      () => clock.now,
+    );
+
+  it('carries the invariant across a restart, so a Secret written before it is still checked', async () => {
+    const { api, invariant } = await moved();
+    // At the restart, the Secret holds a certificate whose user the file named only just now.
+    const planted = selfSignedCertificate('planted', ['planted.alpha'], [], 1, clock.now);
+    (api.objects.get(hostSecretPath) as Resource).data = {
+      'tls.crt': Buffer.from(planted.cert).toString('base64'),
+      'tls.key': Buffer.from(planted.key).toString('base64'),
+    };
+    const accounts = api.objects.get(
+      `/api/v1/namespaces/${cfg.namespace}/configmaps/${SCHEDULER_NATS_ACCOUNTS}`,
+    ) as Resource;
+    const data = accounts.data as Record<string, string>;
+    data[ACCOUNTS_KEY] = `${data[ACCOUNTS_KEY]}\n{ user: "planted.alpha" }`;
+    // A fresh invariant trusts it; the carried one does not.
+    expect(new PropagationInvariant(api, () => clock.now).violations()).toEqual([]);
+    const restarted = restart(api);
+    checked(api, restarted, invariant);
+    expect(invariant.violations()).toEqual([`${hostSecretPath}: named for 0 s`]);
+  });
+
   it('R5: suspended, the Secret deleted and unsuspended in one tick, then a controller restart', async () => {
-    const { api, controller, old } = await moved();
+    const { api, controller, invariant, old } = await moved();
     spec(api).suspended = true;
     await controller.tick();
     api.objects.delete(hostSecretPath);
@@ -1210,13 +1266,8 @@ describe('renewed Secrets only after their user propagated (#541 m6e-E)', () => 
     await controller.tick();
     advance(60_000);
     // A new process does not know the recorded ID waits: it draws another and waits again.
-    const restarted = new Controller(
-      api,
-      cfg,
-      async () => [],
-      () => clock.now,
-    );
-    checked(api, restarted);
+    const restarted = restart(api);
+    checked(api, restarted, invariant);
     expect(await run(api, restarted, old, 9)).toEqual([
       '0:host:none:old',
       '0:host:none:old',
@@ -1252,6 +1303,33 @@ describe('renewed Secrets only after their user propagated (#541 m6e-E)', () => 
       '1:host:new:new',
       '1:host:new:new',
     ]);
+  });
+
+  describe('a forced rotation whose call fails keeps the invariant after every tick (W1)', () => {
+    const tenantStatus = '/apis/platform.di-framework.dev/v1alpha1/tenants/alpha/status';
+    const accounts = `/api/v1/namespaces/${cfg.namespace}/configmaps/di-scheduler-nats-accounts`;
+    const cases: [string, string, number][] = [
+      ['the host Secret DELETE', `DELETE ${hostSecretPath}`, 409],
+      ['the host Secret DELETE', `DELETE ${hostSecretPath}`, 500],
+      ['the operator Secret DELETE', `DELETE ${operatorSecretPath}`, 409],
+      ['the record PUT', `PUT ${recordPath}`, 409],
+      ['the record PUT', `PUT ${recordPath}`, 500],
+      ['the status PATCH', `PATCH ${tenantStatus}`, 409],
+      ['the status PATCH', `PATCH ${tenantStatus}`, 500],
+      ['the accounts read', `GET ${accounts}`, 500],
+    ];
+    for (const [what, call, code] of cases)
+      it(`${what} fails with ${code} once`, async () => {
+        const { api, controller, old } = await moved();
+        rotate(api, 'r1');
+        api.failing.set(call, code);
+        // `checked` runs the invariant after this tick and after every one below.
+        await controller.tick();
+        expect(api.failing.size).toBe(0);
+        const seen = await run(api, controller, old, 10);
+        // The rotation still completes: the hosts end on a new certificate.
+        expect(seen.at(-1)).toBe('1:host:new:new');
+      });
   });
 
   it('keeps the operator Secret on its previous certificate through a renewal, then writes the new one', async () => {

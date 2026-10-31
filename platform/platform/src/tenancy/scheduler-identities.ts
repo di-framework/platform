@@ -22,6 +22,9 @@
  *   so pods that start meanwhile wait for the Secret volume instead of being refused. While a
  *   deleted Secret waits, its recorded ID is kept in memory, so it is not mistaken for a missing
  *   Secret that needs a new ID; after a restart it is, which only draws one more ID and waits again.
+ *   Such a Secret is deleted before the record that drops its user is written, so a failure at any
+ *   later step leaves no Secret holding a user the accounts file no longer names. A wait longer
+ *   than {@link PROPAGATION_OVERDUE_MS} is reported as `WaitingForAccounts`.
  *
  * Inert until the cut-over (m6e): no pod mounts these Secrets yet. CA keys are held in memory only
  * for signing, and nothing here logs a key, a certificate or an issuance ID.
@@ -39,6 +42,7 @@ import {
   type Tenant,
   VERSION,
 } from './resources';
+import { SCHEDULER_ACCOUNTS_CONDITION, SCHEDULER_NATS_ACCOUNTS } from './scheduler-nats';
 import {
   CA_KEYS,
   IDENTITIES_KEY,
@@ -69,7 +73,8 @@ import {
   SCHEDULER_TLS_ANNOTATION,
   schedulerCertDigest,
 } from './scheduler-pki-rotation';
-import { AccountsPropagation, type Propagation } from './scheduler-propagation';
+import { AccountsPropagation, type Propagation, PropagationWaits } from './scheduler-propagation';
+import { TENANT_OPERATOR_PROPAGATION_MS } from './tenant-operator';
 import { operatorNamespace } from './tenant-operator-names';
 import { certificateNames, issuedBy, type KeyPair, leafCertificate } from './tls';
 
@@ -325,6 +330,8 @@ export class TenantSchedulerIdentities {
   private readonly unpersisted = new Map<string, string>();
   /** Per record key, the recorded ID whose Secret was deleted to wait for propagation. */
   private readonly awaiting = new Map<string, string>();
+  /** Per record key, how long its user has waited to propagate. */
+  private readonly waits = new PropagationWaits();
   constructor(
     private readonly api: IdentityApi,
     private readonly cfg: { installation: string; namespace: string },
@@ -344,6 +351,7 @@ export class TenantSchedulerIdentities {
       if (!listed.has(key.slice(0, key.lastIndexOf('/')))) this.unpersisted.delete(key);
     const keys = new Set([...listed].flatMap((t) => tenantIdentities(t).map((i) => i.key)));
     for (const key of this.awaiting.keys()) if (!keys.has(key)) this.awaiting.delete(key);
+    this.waits.retain(keys);
   }
 
   /**
@@ -526,10 +534,35 @@ export class TenantSchedulerIdentities {
       }
       next = recordTransition(record, observed, this.now(), this.random);
     }
-    // The record first: a user name then always names exactly one certificate.
+    // A Secret whose certificate's user the record is about to stop naming is deleted before
+    // anything is written: until the DELETE succeeds the record still names that user, so it stays
+    // rendered. A pod that starts after it waits for the volume instead of presenting a revoked
+    // user. A Secret holding `previous` (a routine renewal) is kept: that user stays admitted.
+    const revoked = identities.filter((identity) => {
+      const existing = fresh.get(identity.key);
+      const held = observed[identity.key]?.secret?.id;
+      return (
+        existing !== undefined &&
+        issuing().includes(identity.key) &&
+        (held === undefined || held !== next.record[identity.key]?.previous)
+      );
+    });
+    await Promise.all(
+      revoked.map(async (identity) => {
+        const existing = fresh.get(identity.key) as Stored;
+        await this.api.call('DELETE', secretPath(identity.namespace, identity.name), {
+          preconditions: { resourceVersion: existing.metadata.resourceVersion },
+        });
+        fresh.set(identity.key, undefined);
+      }),
+    );
+    // Then the record: a user name then always names exactly one certificate.
     const text = serializeIdentityRecord(next.record);
     if (text !== serializeIdentityRecord(record))
       await putIdentityRecord(this.api, pki, stored, next.record);
+    // Without a Secret, the recorded ID is remembered so the next pass does not draw another.
+    for (const key of issuing())
+      if (!fresh.get(key)) this.awaiting.set(key, (next.record[key] as IdentityEntry).current);
     // After the record and before issuance, so an interrupted forced rotation repeats at most once.
     if (forcedKinds.length > 0) {
       // The kinds already handled are sent too, so the write never depends on a deep merge.
@@ -556,23 +589,21 @@ export class TenantSchedulerIdentities {
         if (handled(updated, kind) !== rotation) this.unpersisted.set(`${t}/${kind}`, rotation);
     }
     const propagated = issuing().length > 0 ? await this.propagation.read() : () => false;
+    let waiting: Pending | undefined;
     for (const identity of identities) {
-      if (!issuing().includes(identity.key)) continue;
-      const entry = next.record[identity.key] as IdentityEntry;
-      const id = entry.current;
-      const user = identity.user(id);
+      if (!issuing().includes(identity.key)) {
+        this.waits.done(identity.key);
+        continue;
+      }
+      const user = identity.user((next.record[identity.key] as IdentityEntry).current);
       const existing = fresh.get(identity.key);
       if (!propagated(user)) {
-        // A Secret whose certificate's user is no longer admitted is deleted: a pod that starts
-        // then waits for the volume instead of presenting a revoked user.
-        // Without a Secret, the recorded ID is remembered so the next pass does not draw another.
-        const held = observed[identity.key]?.secret?.id;
-        const revoked = existing !== undefined && (held === undefined || held !== entry.previous);
-        if (revoked)
-          await this.api.call('DELETE', secretPath(identity.namespace, identity.name), {
-            preconditions: { resourceVersion: existing.metadata.resourceVersion },
-          });
-        if (revoked || !existing) this.awaiting.set(identity.key, id);
+        const since = this.waits.overdue(identity.key, user, this.now());
+        if (since)
+          waiting ??= {
+            reason: 'WaitingForAccounts',
+            message: `Secret ${identity.namespace}/${identity.name} has waited since ${since.toISOString()} for ${SCHEDULER_NATS_ACCOUNTS} to name its new user for ${TENANT_OPERATOR_PROPAGATION_MS / 1000} s; see the ${SCHEDULER_ACCOUNTS_CONDITION} condition`,
+          };
         continue;
       }
       const ca = cas[identity.ca];
@@ -607,17 +638,17 @@ export class TenantSchedulerIdentities {
       if (existing) await this.api.call('PUT', secretPath(identity.namespace, identity.name), body);
       else await this.api.call('POST', secretPath(identity.namespace), body);
       this.awaiting.delete(identity.key);
+      this.waits.done(identity.key);
     }
+    const pending: Pending | undefined = identities.some((identity) => unpersisted(identity.kind))
+      ? {
+          reason: 'RotationNotPersisted',
+          message: `The API server did not keep status.schedulerIdentity, so the Tenant CRD may predate this controller; the rotation was applied once and is not repeated`,
+        }
+      : waiting;
     return {
       ...(next.stalled.length > 0 ? { stalled: hosts.deployment } : {}),
-      ...(identities.some((identity) => unpersisted(identity.kind))
-        ? {
-            pending: {
-              reason: 'RotationNotPersisted',
-              message: `The API server did not keep status.schedulerIdentity, so the Tenant CRD may predate this controller; the rotation was applied once and is not repeated`,
-            },
-          }
-        : {}),
+      ...(pending ? { pending } : {}),
     };
   }
 

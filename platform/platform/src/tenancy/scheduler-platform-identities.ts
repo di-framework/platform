@@ -46,6 +46,7 @@ import {
   readSchedulerCas,
   type Stored,
 } from './scheduler-identities';
+import { SCHEDULER_NATS_ACCOUNTS } from './scheduler-nats';
 import {
   IDENTITIES_KEY,
   type IdentityRecord,
@@ -72,7 +73,7 @@ import {
   SCHEDULER_TLS_ANNOTATION,
   schedulerCertDigest,
 } from './scheduler-pki-rotation';
-import { AccountsPropagation, type Propagation } from './scheduler-propagation';
+import { AccountsPropagation, type Propagation, PropagationWaits } from './scheduler-propagation';
 import { issuedBy, type KeyPair } from './tls';
 
 /** The chart's platform host group, which presents `platform/host` and `platform/data`. */
@@ -111,6 +112,9 @@ export class PlatformSchedulerIdentities {
   private logged = '';
   /** True while the `hostgroup-default` stall has been logged and not yet cleared. */
   private stallLogged = false;
+  /** Per record key, how long its renewed user has waited to propagate, and which were logged. */
+  private readonly waits = new PropagationWaits();
+  private readonly waitLogged = new Set<string>();
 
   constructor(
     private readonly api: IdentityApi,
@@ -193,11 +197,13 @@ export class PlatformSchedulerIdentities {
     const propagated = issuing ? await this.propagation.read() : () => false;
     for (const [key, transition] of next.transitions) {
       const { role, secret } = secrets.get(key) as { role: PlatformRole; secret: Stored };
-      if (
-        transition.action === 'issue' &&
-        !propagated(platformUser(role, transition.entry.current))
-      )
+      const user = platformUser(role, transition.entry.current);
+      if (transition.action === 'issue' && !propagated(user)) {
+        this.logWait(key, user, ctx.now);
         continue;
+      }
+      this.waits.done(key);
+      this.waitLogged.delete(key);
       const target = await this.apply(ctx, role, secret, transition);
       if (target) targets.push(target);
     }
@@ -273,6 +279,16 @@ export class PlatformSchedulerIdentities {
       deploymentPath(this.cfg.namespace, PLATFORM_HOST_DEPLOYMENT),
       { spec: { template: { metadata: { annotations } } } },
       'application/merge-patch+json',
+    );
+  }
+
+  /** Logs once that `key`'s user has waited past the bound to propagate, until it is written. */
+  private logWait(key: string, user: string, now: Date): void {
+    const since = this.waits.overdue(key, user, now);
+    if (!since || this.waitLogged.has(key)) return;
+    this.waitLogged.add(key);
+    console.warn(
+      `Platform scheduler identities: ${key} has waited since ${since.toISOString()} for ${SCHEDULER_NATS_ACCOUNTS} to name its renewed user; the previous certificate stays in its Secret`,
     );
   }
 

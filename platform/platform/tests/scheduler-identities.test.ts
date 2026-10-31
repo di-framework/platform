@@ -453,11 +453,14 @@ describe('tenant scheduler identity issuance (#541 m6c)', () => {
     api.seed(tenantPath, structuredClone(t) as unknown as Stored);
     t.metadata.resourceVersion = api.objects.get(tenantPath)?.metadata.resourceVersion;
     await identities.reconcile(t);
+    // The revoked certificates' Secrets go first, before the record stops naming their users.
     expect(api.writes()).toEqual([
+      `DELETE ${hostPath}`,
+      `DELETE ${operatorPath}`,
       `PUT ${recordPath}`,
       `PATCH ${tenantPath}/status`,
-      `PUT ${hostPath}`,
-      `PUT ${operatorPath}`,
+      `POST /api/v1/namespaces/${RUNTIME}/secrets`,
+      `POST /api/v1/namespaces/di-operator-alpha/secrets`,
     ]);
     const after = api.record();
     for (const key of ['tenant/alpha/hosts', 'tenant/alpha/operator']) {
@@ -525,7 +528,10 @@ describe('tenant scheduler identity issuance (#541 m6c)', () => {
     (secret.data as Record<string, string>)['tls.crt'] = Buffer.from('garbage').toString('base64');
     api.calls.length = 0;
     await identities.reconcile(tenant());
-    expect(api.writes()).toEqual([`PUT ${hostPath}`]);
+    expect(api.writes()).toEqual([
+      `DELETE ${hostPath}`,
+      `POST /api/v1/namespaces/${RUNTIME}/secrets`,
+    ]);
     expect(userOf(api, hostPath)).toEqual([tenantHostUser('alpha', id)]);
   });
 
@@ -544,7 +550,10 @@ describe('tenant scheduler identity issuance (#541 m6c)', () => {
     await identities.reconcile(tenant());
     // The Secret carries `id`, the record `cccc…`: the issuance is pending, so it is retried for
     // the recorded ID without a new one.
-    expect(api.writes()).toEqual([`PUT ${hostPath}`]);
+    expect(api.writes()).toEqual([
+      `DELETE ${hostPath}`,
+      `POST /api/v1/namespaces/${RUNTIME}/secrets`,
+    ]);
     expect(userOf(api, hostPath)).toEqual([tenantHostUser('alpha', 'cccccccccccccccc')]);
     expect(id).not.toBe('cccccccccccccccc');
   });
@@ -564,7 +573,10 @@ describe('tenant scheduler identity issuance (#541 m6c)', () => {
     };
     api.calls.length = 0;
     await identities.reconcile(tenant());
-    expect(api.writes()).toEqual([`PUT ${hostPath}`]);
+    expect(api.writes()).toEqual([
+      `DELETE ${hostPath}`,
+      `POST /api/v1/namespaces/${RUNTIME}/secrets`,
+    ]);
     expect(userOf(api, hostPath)).toEqual([tenantHostUser('alpha', id)]);
   });
 
@@ -645,9 +657,10 @@ describe('tenant scheduler identity issuance (#541 m6c)', () => {
     api.calls.length = 0;
     await identities.reconcile(latest());
     expect(api.writes()).toEqual([
+      `DELETE ${operatorPath}`,
       `PUT ${recordPath}`,
       `PATCH ${tenantPath}/status`,
-      `PUT ${operatorPath}`,
+      `POST /api/v1/namespaces/di-operator-alpha/secrets`,
     ]);
     const after = api.record();
     expect(after['tenant/alpha/operator']?.current).not.toBe(
@@ -804,10 +817,20 @@ describe('tenant identity Secrets after propagation (#541 m6e-E)', () => {
     expect(api.writes()).toEqual([`PUT ${recordPath}`]);
     expect(api.data(hostPath, 'tls.crt')).toBe(before);
     expect(api.record()['tenant/alpha/hosts']?.previous).toBe(old);
-    // A wait longer than the overlap: previousUntil follows the pending issuance, so the previous
-    // user stays rendered and no stall is reported.
-    clock.now = new Date(clock.now.getTime() + RENEWAL_OVERLAP_MS + 60_000);
+    // Up to the overlap the wait reports nothing.
+    const waitStart = clock.now;
+    clock.now = new Date(waitStart.getTime() + RENEWAL_OVERLAP_MS - 1);
     expect(await identities.reconcile(tenant())).toEqual([]);
+    // A wait longer than the overlap: previousUntil follows the pending issuance, so the previous
+    // user stays rendered and the renewal stall cannot fire; the wait itself is reported.
+    clock.now = new Date(waitStart.getTime() + RENEWAL_OVERLAP_MS + 60_000);
+    expect(await identities.reconcile(tenant())).toEqual([
+      expect.objectContaining({
+        type: SCHEDULER_IDENTITY_PENDING,
+        reason: 'WaitingForAccounts',
+        message: expect.stringContaining(`since ${waitStart.toISOString()}`),
+      }),
+    ]);
     expect(api.record()['tenant/alpha/hosts']?.previous).toBe(old);
     gate.open = true;
     expect(await identities.reconcile(tenant())).toEqual([]);
@@ -828,9 +851,9 @@ describe('tenant identity Secrets after propagation (#541 m6e-E)', () => {
     api.calls.length = 0;
     await identities.reconcile(t);
     expect(api.writes()).toEqual([
+      `DELETE ${hostPath}`,
       `PUT ${recordPath}`,
       `PATCH ${tenantPath}/status`,
-      `DELETE ${hostPath}`,
     ]);
     const id = api.record()['tenant/alpha/hosts']?.current as string;
     // While it waits, the missing Secret draws no new ID.
