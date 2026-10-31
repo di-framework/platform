@@ -1340,7 +1340,8 @@ export class Controller {
           `${collection('v1', 'ConfigMap', this.cfg.namespace)}/${SCHEDULER_NATS_ACCOUNTS}`,
         )
       : undefined;
-    const user = id ? (kind === 'hosts' ? tenantHostUser : tenantOperatorUser)(t, id) : '';
+    const userOf = kind === 'hosts' ? tenantHostUser : tenantOperatorUser;
+    const user = id ? userOf(t, id) : '';
     const seen = this.accountsSeen.get(t) ?? {};
     this.accountsSeen.set(t, seen);
     if (!id || !accountsNamesUser(accounts?.data?.[ACCOUNTS_KEY] ?? '', user)) {
@@ -1417,27 +1418,55 @@ export class Controller {
    *   the Deployment keeps being applied whatever the operator does, so suspension, replica
    *   changes and renewals are never held (W1 of the #613 review).
    * - A renewed or rotated certificate reaches the template only once its user has propagated
-   *   ({@link accountsLoaded}); until then the template keeps the digest it has. The old
-   *   certificate's user stays admitted until the rollout completes (`identityTransition`), so the
-   *   running pods keep working, and the new pods are not refused (S2 of the #613 review).
+   *   ({@link accountsLoaded}); until then the template keeps the digest it has, so new pods are
+   *   not refused at their first connect (S2 of the #613 review). For a routine renewal the old
+   *   certificate's user stays admitted until the rollout completes (`identityTransition`), so
+   *   the running pods keep working. A forced rotation or a deleted Secret keeps no previous
+   *   user: the running pods are refused at the next accounts reload, and the hosts stay down
+   *   for up to the wait plus a tick before the new pods roll. That trade avoids new pods that
+   *   are refused at start and crash-loop. The wait counts against a renewal's stall window
+   *   (`previousUntil`, issuance plus ten minutes), leaving the rollout about 477 s; a tenant
+   *   with many replicas can report `SchedulerIdentityRenewalStalled` briefly, which clears once
+   *   the rollout completes and drops nothing. Kept so: measuring from the template change would
+   *   need one more persisted timestamp for a condition that is only a report.
+   * - A suspended Tenant whose host identity is not issued is rendered at zero replicas with the
+   *   live template's digest, or none, so its pre-cut-over hosts stop too (S2 of the #613 round-2
+   *   review); `issued` is false then.
    */
-  private async hostTlsFor(tenant: Tenant, operatorReady: boolean): Promise<string | undefined> {
+  private async hostTlsFor(
+    tenant: Tenant,
+    operatorReady: boolean,
+  ): Promise<{ digest?: string; issued: boolean }> {
     const digest = await this.hostTlsDigest(tenant);
-    if (digest === undefined || tenant.spec.suspended) return digest;
     const n = names(tenant.metadata.name);
-    const live = await this.get<Resource>(
-      `${collection('apps/v1', 'Deployment', n.runtimeNamespace)}/hostgroup-${n.hostgroup}`,
-    );
-    const template = (live?.spec as { template?: HostTemplate } | undefined)?.template;
+    const live = async () =>
+      (
+        (
+          await this.get<Resource>(
+            `${collection('apps/v1', 'Deployment', n.runtimeNamespace)}/hostgroup-${n.hostgroup}`,
+          )
+        )?.spec as { template?: HostTemplate } | undefined
+      )?.template;
+    if (digest === undefined) {
+      if (!tenant.spec.suspended) return { issued: false };
+      const template = await live();
+      return {
+        digest: template?.metadata?.annotations?.[SCHEDULER_TLS_ANNOTATION] ?? '',
+        issued: false,
+      };
+    }
+    if (tenant.spec.suspended) return { digest, issued: true };
+    const template = await live();
     const moved = mountsSecret(template?.spec, TENANT_HOST_SECRET);
-    if (!operatorReady && !moved) return undefined;
+    if (!operatorReady && !moved) return { issued: true };
     const rendered = moved
       ? template?.metadata?.annotations?.[SCHEDULER_TLS_ANNOTATION]
       : undefined;
     // The first move waits for nothing more: the hosts' identity is issued with the operator's,
     // whose own wait has passed, since it is Ready.
-    if (rendered === undefined || rendered === digest) return digest;
-    return (await this.accountsLoaded(tenant.metadata.name, 'hosts')) ? digest : rendered;
+    if (rendered === undefined || rendered === digest) return { digest, issued: true };
+    const loaded = await this.accountsLoaded(tenant.metadata.name, 'hosts');
+    return { digest: loaded ? digest : rendered, issued: true };
   }
   /** A `di-scheduler-tls` this controller copied for the Tenant: its installation and owner labels. */
   private ownsCopy(copy: Resource, tenant: Tenant): boolean {
@@ -1504,7 +1533,7 @@ export class Controller {
     }
     // Everything above and these reads can still throw before the try block below; such a
     // failure rejects the tick and skips tenant-auth until the next poll.
-    const hostTls = await this.hostTlsFor(tenant, operatorReady);
+    const { digest: hostTls, issued: hostIssued } = await this.hostTlsFor(tenant, operatorReady);
     const workloads = await this.storageWorkloads(tenant);
     // Records are written before any host pod that mounts their keys is rendered (#200).
     const observation = await this.observeStorage(tenant);
@@ -1542,7 +1571,7 @@ export class Controller {
     );
     const hostgroup = `hostgroup-${n.hostgroup}`;
     // Ready needs the operator Ready and the hosts on their own identity (#541 m6e).
-    let ready = operatorReady && hostTls !== undefined;
+    let ready = operatorReady && hostIssued && hostTls !== undefined;
     let hosts: Resource | undefined;
     let foreignRecords: string | undefined;
     try {

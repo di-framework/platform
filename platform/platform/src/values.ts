@@ -23,11 +23,11 @@ const OPERATOR_FLAGS = [
 const HOST_FLAGS = [/^scheduler-nats-/, /^data-nats-/];
 /**
  * The environment the enforced settings depend on: the operator's own namespace, its Host store
- * (`OPERATOR_NAMESPACE`, rendered before `operator.env`, whose later entry wins), and the
- * `WASH_*` fallbacks of the host's NATS flags.
+ * (`OPERATOR_NAMESPACE`, rendered before `operator.env`, whose later entry wins). The host's NATS
+ * flags have no environment fallback in wash v2.8.0 (`crates/wash/src/cli/host.rs:22-58`), so no
+ * host env is refused.
  */
 const OPERATOR_ENV = [/^OPERATOR_NAMESPACE$/];
-const HOST_ENV = [/^WASH_SCHEDULER_NATS_/, /^WASH_DATA_NATS_/];
 
 /** A command-line argument's flag name: `-name`, `--name`, `-name=value` or `--name=value`. */
 const flagName = (arg: unknown): string | undefined => {
@@ -90,7 +90,6 @@ export function platformValues(overrides: Values, defaults: Values, namespace: s
   refuseEnforcedEnv('values.operator.env', operator.env, OPERATOR_ENV);
   const runtime = object(result.runtime);
   refuseEnforced('values.runtime.extraArgs', runtime.extraArgs, HOST_FLAGS);
-  refuseEnforcedEnv('values.runtime.env', runtime.env, HOST_ENV);
   const groups = Array.isArray(runtime.hostGroups) ? runtime.hostGroups : [];
   for (const group of groups) {
     const { name, namespace: groupNamespace, schedulerNatsUrl, dataNatsUrl } = object(group);
@@ -98,11 +97,6 @@ export function platformValues(overrides: Values, defaults: Values, namespace: s
       `values.runtime.hostGroups ${String(name)}: extraArgs`,
       object(group).extraArgs,
       HOST_FLAGS,
-    );
-    refuseEnforcedEnv(
-      `values.runtime.hostGroups ${String(name)}: env`,
-      object(group).env,
-      HOST_ENV,
     );
     if (groupNamespace && groupNamespace !== namespace)
       throw new Error(

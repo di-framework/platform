@@ -236,18 +236,6 @@ describe('chart values enforced over args.values (design-541 §4.1, §8.1)', () 
         'wasmcloud',
       ),
     ).toThrow('values.operator.env: OPERATOR_NAMESPACE is set by the platform');
-    for (const name of ['WASH_SCHEDULER_NATS_URL', 'WASH_DATA_NATS_TLS_CA']) {
-      expect(() =>
-        platformValues({ runtime: { env: [{ name, value: 'x' }] } }, {}, 'wasmcloud'),
-      ).toThrow(`values.runtime.env: ${name} is set by the platform`);
-      expect(() =>
-        platformValues(
-          { runtime: { hostGroups: [{ name: 'gpu', env: [{ name, value: 'x' }] }] } },
-          {},
-          'wasmcloud',
-        ),
-      ).toThrow(`values.runtime.hostGroups gpu: env: ${name} is set by the platform`);
-    }
   });
 
   it('keeps extraArgs and env that set other flags', () => {

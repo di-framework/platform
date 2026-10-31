@@ -240,13 +240,65 @@ describe('per-tenant gating (#541 m6e)', () => {
       api.objects.delete(hostSecretPath);
       await controller.tick();
       await controller.tick();
-      // S2: held until the new user has propagated; the old one stays admitted meanwhile.
+      // S2: held until the new user has propagated. A deleted Secret keeps no previous user, so
+      // the running pods are refused at the next reload; the hold only spares new pods a refused
+      // start.
       expect(hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION]).toBe(before);
       advance(TENANT_OPERATOR_PROPAGATION_MS);
       await controller.tick();
       const after = hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION];
       expect(after).not.toBe(before);
       expect(after).toBe(schedulerCertDigest(hostCert(api)));
+    });
+
+    const legacyHosts = (replicas: number) =>
+      ({
+        apiVersion: 'apps/v1',
+        kind: 'Deployment',
+        metadata: {
+          name: `hostgroup-${n.hostgroup}`,
+          namespace: n.runtimeNamespace,
+          labels: owned,
+        },
+        spec: {
+          replicas,
+          template: {
+            spec: { volumes: [{ name: 'scheduler', secret: { secretName: SCHEDULER_TLS_COPY } }] },
+          },
+        },
+      }) as unknown as Resource;
+
+    // P1 of the #613 round-2 review: suspended during the upgrade, before its operator is Ready.
+    it("scales a suspended Tenant's pre-cut-over hosts to zero while its operator is not Ready", async () => {
+      const { api, controller } = await prepare();
+      api.held.add('runtime-operator');
+      await throughPropagation(controller);
+      api.seed(legacyHosts(2));
+      await controller.tick();
+      expect(hostReplicas(api)).toBe(2);
+      tenantSpec(api).suspended = true;
+      await controller.tick();
+      await controller.tick();
+      expect(hostReplicas(api)).toBe(0);
+    });
+
+    // P3 of the #613 round-2 review: no host identity was ever issued.
+    it("scales a suspended Tenant's pre-cut-over hosts to zero when its host identity is not issued", async () => {
+      const { api, controller } = await prepare(false);
+      api.seed(legacyHosts(2));
+      await controller.tick();
+      expect(hostReplicas(api)).toBe(2);
+      tenantSpec(api).suspended = true;
+      await controller.tick();
+      await controller.tick();
+      expect(hostReplicas(api)).toBe(0);
+      expect(api.objects.has(hostSecretPath)).toBe(false);
+      // Rendered with no digest; the first issued one is rolled after its propagation wait.
+      expect(hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION]).toBe('');
+      // A Deployment already on the issued identity keeps the digest it carries.
+      hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION] = 'kept';
+      await controller.tick();
+      expect(hostTemplate(api).metadata.annotations[SCHEDULER_TLS_ANNOTATION]).toBe('kept');
     });
 
     it('still holds hosts that mount the copy, and creates none, until the operator is Ready', async () => {
@@ -348,9 +400,10 @@ describe('hosts on di-scheduler-host-tls (#541 m6e)', () => {
     expect(template.metadata.annotations[SCHEDULER_TLS_ANNOTATION]).toBe(
       schedulerCertDigest(hostCert(api)),
     );
-    // A forced rotation re-issues the Secret. The hosts keep their template, whose user stays
-    // admitted, until the new user has been in the accounts file for the propagation wait
-    // (S2 of the #613 review), then roll onto it.
+    // Deleting the Secret re-issues it with no previous user, so the running pods are refused
+    // at the next accounts reload. The hosts keep their template until the new user has been in
+    // the accounts file for the propagation wait (S2 of the #613 review), so the new pods are not
+    // refused at start, then roll onto it.
     const before = template.metadata.annotations[SCHEDULER_TLS_ANNOTATION];
     api.objects.delete(hostSecretPath);
     await controller.tick();
@@ -375,6 +428,41 @@ describe('hosts on di-scheduler-host-tls (#541 m6e)', () => {
     // Issuance refuses the foreign Secret (SecretNotOwned), and the hosts are not rendered from it.
     await controller.tick();
     expect(api.objects.has(hostsPath)).toBe(false);
+  });
+
+  // P2 of the #613 round-2 review: Ready needs the operator Ready, not only the hosts.
+  it('reports not Ready once the operator stops being Ready', async () => {
+    const { api, controller } = await prepare();
+    await throughPropagation(controller);
+    registerHost(api);
+    await controller.tick();
+    expect(readyCondition(api)).toMatchObject({ status: 'True', reason: 'Reconciled' });
+    api.held.add('runtime-operator');
+    await controller.tick();
+    await controller.tick();
+    expect(readyCondition(api)).toMatchObject({ status: 'False' });
+  });
+
+  // S4 of the #613 round-2 review: the API server's EndpointSlices are read once per tick.
+  it('reads the API server endpoints once per tick, for every Tenant', async () => {
+    const { api, controller } = await prepare();
+    const { tenant } = await import('./support/controller-harness');
+    const beta = tenant();
+    beta.metadata = { ...beta.metadata, name: 'beta', uid: 'beta-uid' };
+    api.seed(beta);
+    await throughPropagation(controller);
+    api.operations.length = 0;
+    await controller.tick();
+    const reads = api.operations.filter(
+      (o) => o.method === 'GET' && o.path.includes('/endpointslices'),
+    );
+    expect(reads).toHaveLength(1);
+    expect(api.objects.has(operatorPath)).toBe(true);
+    expect(
+      api.objects.has(
+        `${collection('apps/v1', 'Deployment', 'di-operator-beta')}/runtime-operator`,
+      ),
+    ).toBe(true);
   });
 
   it('looks the Hosts up in di-operator-<t> for the readiness gate', async () => {
