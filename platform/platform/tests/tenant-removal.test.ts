@@ -33,7 +33,12 @@ import {
   renderSchedulerAccounts,
   SCHEDULER_NATS_ACCOUNTS,
 } from '../src/tenancy/scheduler-nats';
-import type { IdentityRecord } from '../src/tenancy/scheduler-pki';
+import {
+  IDENTITIES_KEY,
+  type IdentityRecord,
+  SCHEDULER_IDENTITIES,
+  schedulerPkiNamespace,
+} from '../src/tenancy/scheduler-pki';
 import {
   operatorNamespace,
   TENANT_OPERATOR_CLUSTER_ROLES,
@@ -188,9 +193,23 @@ async function prepare(policy: 'Retain' | 'Delete' = 'Retain') {
     metadata: { name: 'wasmcloud-runtime-tls', namespace: cfg.namespace },
     data: { 'ca.crt': 'test' },
   });
+  // The API server's endpoints, so the controller renders and applies the operator (W3).
+  api.seed({
+    apiVersion: 'discovery.k8s.io/v1',
+    kind: 'EndpointSlice',
+    metadata: {
+      name: 'kubernetes',
+      namespace: 'default',
+      labels: { 'kubernetes.io/service-name': 'kubernetes' },
+    },
+    endpoints: [{ addresses: operatorCfg.apiServer.addresses }],
+    ports: [{ port: operatorCfg.apiServer.port }],
+  } as Resource);
   await controller.reconcileTenant(t);
   const operator = operatorObjects(t);
   for (const value of operator) api.seed(value);
+  // A pass with the operator in place applies it, as the controller does from m6 on.
+  await controller.reconcileTenant(t);
   const operatorBindings = operator.filter((r) => r.kind === 'RoleBinding');
   const operatorDeployment = operator.find((r) => r.kind === 'Deployment')!;
   const operatorNs = operator.find((r) => r.kind === 'Namespace')!;
@@ -383,11 +402,15 @@ describe('S2: the tenant operator is rendered whatever the suspension state (#54
       expect(deletes((p) => p === key(binding))).toEqual([]);
     }
     for (const binding of viewerBindings) expect(api.has(binding)).toBe(false);
-    expect(
-      api.operations.filter(
-        (o) => o.path.startsWith(key(operatorDeployment)) && o.method !== 'GET',
-      ),
-    ).toEqual([]);
+    // Applied whatever the suspension state, never scaled or deleted.
+    const operatorWrites = api.operations.filter(
+      (o) => o.path.startsWith(key(operatorDeployment)) && o.method !== 'GET',
+    );
+    expect(operatorWrites.length).toBeGreaterThan(0);
+    for (const o of operatorWrites) {
+      expect(o.method).toBe('PATCH');
+      expect((o.body as { spec: { replicas: number } }).spec.replicas).toBe(1);
+    }
     expect((api.objects.get(key(operatorDeployment))!.spec as { replicas: number }).replicas).toBe(
       1,
     );
@@ -407,8 +430,14 @@ describe('Tenant removal R1-R7 (#541 m5)', () => {
       deleting();
       api.operations = [];
       await reconcile();
+      // The scale-to-zero patches; the operator is only applied (at one replica) meanwhile.
       const patched = api.operations
-        .filter((o) => o.method === 'PATCH' && o.path.includes('/deployments/'))
+        .filter(
+          (o) =>
+            o.method === 'PATCH' &&
+            o.path.includes('/deployments/') &&
+            (o.body as { spec?: { replicas?: number } }).spec?.replicas === 0,
+        )
         .map((o) => o.path);
       expect(patched.length).toBeGreaterThan(0);
       expect(patched.some((p) => p.startsWith(key(operatorDeployment)))).toBe(false);
@@ -852,6 +881,30 @@ describe('R1 and R4 wait for the written accounts file (#541 m6e-D)', () => {
     // A tenant whose name extends alpha's is another tenant.
     expect(accountsNamesTenantHost(text, 'alpha-x')).toBe(false);
     expect(accountsNamesTenantAccount(text, 'alpha-x')).toBe(false);
+    // And the reverse: a file for `alpha-x` (or `ab`) only never names `alpha` (or `a`).
+    for (const [longer, shorter] of [
+      ['alpha-x', 'alpha'],
+      ['ab', 'a'],
+    ] as const) {
+      const other = tenant(longer);
+      const rendered = renderSchedulerAccounts(
+        cfg.namespace,
+        [other],
+        {
+          'platform/data': { current: GOLDEN_IDS.platformData },
+          'platform/host': { current: GOLDEN_IDS.platformHost },
+          'platform/operator': { current: GOLDEN_IDS.platformOperator },
+          [`tenant/${longer}/hosts`]: { current: GOLDEN_IDS.aHosts },
+          [`tenant/${longer}/operator`]: { current: GOLDEN_IDS.aOperator },
+        },
+        START,
+      );
+      if (!('text' in rendered)) throw new Error('refused');
+      expect(accountsNamesTenantHost(rendered.text, longer)).toBe(true);
+      expect(accountsNamesTenantAccount(rendered.text, longer)).toBe(true);
+      expect(accountsNamesTenantHost(rendered.text, shorter)).toBe(false);
+      expect(accountsNamesTenantAccount(rendered.text, shorter)).toBe(false);
+    }
     const operatorOnly = (accountsFile(t, record('operator')).data as Record<string, string>)[
       ACCOUNTS_KEY
     ]!;
@@ -896,4 +949,132 @@ describe('R1 and R4 wait for the written accounts file (#541 m6e-D)', () => {
       await drain();
       expect(t.metadata.finalizers ?? []).not.toContain(FINALIZER);
     });
+});
+
+describe('removal round-1 review of #614 (#541 m6e-D)', () => {
+  const file = `${cfg.namespace}/${SCHEDULER_NATS_ACCOUNTS}`;
+  const seedRecord = (api: FakeApi, value: IdentityRecord) =>
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'ConfigMap',
+      metadata: { name: SCHEDULER_IDENTITIES, namespace: schedulerPkiNamespace(cfg.namespace) },
+      data: { [IDENTITIES_KEY]: JSON.stringify(value) },
+    } as Resource);
+
+  it('W1: a finished (evicted) operator pod does not hold Retain R3; a running one does', async () => {
+    const { api, t, deleting, reconcile, drain } = await prepare('Retain');
+    const pod = (name: string, phase: string): Resource =>
+      ({
+        apiVersion: 'v1',
+        kind: 'Pod',
+        metadata: { name, namespace: operatorNamespace('alpha') },
+        status: { phase },
+      }) as Resource;
+    api.seed(pod('evicted', 'Failed'));
+    api.seed(pod('done', 'Succeeded'));
+    api.seed(pod('running', 'Running'));
+    deleting();
+    await reconcile();
+    expect(condition(t, 'Ready')).toMatchObject({
+      message: 'Retain: removal step R3 waits for pod/di-operator-alpha/running',
+    });
+    api.objects.delete(key(pod('running', 'Running')));
+    await drain();
+    expect(t.metadata.finalizers ?? []).not.toContain(FINALIZER);
+  });
+
+  for (const missing of ['ConfigMap', 'key'] as const)
+    it(`W2: with a scheduler PKI, a missing accounts ${missing} holds R1 until RemovalStuck`, async () => {
+      const { api, clock, t, deleting, reconcile } = await prepare('Retain');
+      seedRecord(api, record());
+      if (missing === 'key')
+        api.seed({
+          apiVersion: 'v1',
+          kind: 'ConfigMap',
+          metadata: { name: SCHEDULER_NATS_ACCOUNTS, namespace: cfg.namespace },
+          data: {},
+        } as Resource);
+      deleting();
+      await reconcile();
+      expect(condition(t, 'Ready')).toMatchObject({
+        message: `Retain: removal step R1 waits for ${file}: not written`,
+      });
+      clock.now = new Date(START.getTime() + REMOVAL_STEP_DEADLINE_MS);
+      await reconcile();
+      expect(condition(t, REMOVAL_STUCK)).toMatchObject({ reason: 'R1' });
+      expect(t.metadata.finalizers).toContain(FINALIZER);
+    });
+
+  it('W2: without a scheduler PKI, a missing accounts file passes R1 and R4', async () => {
+    const { api, t, deleting, drain } = await prepare('Retain');
+    deleting();
+    await drain();
+    expect(t.metadata.finalizers ?? []).not.toContain(FINALIZER);
+    expect(
+      api.operations.some((o) => o.method === 'PATCH' && o.path.includes(SCHEDULER_IDENTITIES)),
+    ).toBe(false);
+  });
+
+  it('W3: Retain R3 never re-applies the operator while its pod is still going', async () => {
+    const { api, t, operatorDeployment, deleting, reconcile } = await prepare('Retain');
+    // prepare() applied the operator through the controller, not only by seeding it.
+    expect(
+      api.operations.some(
+        (o) => o.method === 'PATCH' && o.path.startsWith(key(operatorDeployment)),
+      ),
+    ).toBe(true);
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'Pod',
+      metadata: { name: 'operator-1', namespace: operatorNamespace('alpha') },
+    } as Resource);
+    deleting();
+    await reconcile();
+    api.operations = [];
+    await reconcile();
+    await reconcile();
+    expect(condition(t, 'Ready')).toMatchObject({
+      message: 'Retain: removal step R3 waits for pod/di-operator-alpha/operator-1',
+    });
+    const writes = api.operations.filter(
+      (o) => o.method === 'PATCH' && o.path.startsWith(key(operatorDeployment)),
+    );
+    for (const o of writes) expect(o.body).toMatchObject({ spec: { replicas: 0 } });
+    expect(replicas(api, operatorDeployment)).toBe(0);
+  });
+
+  it('S2: the scale-to-zero patch is pinned to the read resourceVersion; a 409 is retried next pass', async () => {
+    const { api, t, operatorDeployment, deleting, reconcile, drain } = await prepare('Retain');
+    api.objects.get(key(operatorDeployment))!.metadata.resourceVersion = 'op-rv';
+    const original = api.call.bind(api);
+    let conflicts = 1;
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      const scale = (body as { spec?: { replicas?: number } } | undefined)?.spec?.replicas === 0;
+      if (method === 'PATCH' && path.startsWith(key(operatorDeployment)) && scale) {
+        expect(body).toEqual({ metadata: { resourceVersion: 'op-rv' }, spec: { replicas: 0 } });
+        if (conflicts-- > 0) throw new ApiError(409, 'Conflict');
+      }
+      return original<T>(method, path, body);
+    };
+    deleting();
+    await reconcile();
+    expect(condition(t, 'Ready')).toMatchObject({
+      message: `Retain: removal step R3 waits for deployment/di-operator-alpha/${operatorDeployment.metadata.name}`,
+    });
+    await drain();
+    expect(t.metadata.finalizers ?? []).not.toContain(FINALIZER);
+  });
+
+  it('S2: another error on the scale-to-zero patch is raised', async () => {
+    const { api, operatorDeployment, deleting, reconcile } = await prepare('Retain');
+    const original = api.call.bind(api);
+    api.call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+      const scale = (body as { spec?: { replicas?: number } } | undefined)?.spec?.replicas === 0;
+      if (method === 'PATCH' && path.startsWith(key(operatorDeployment)) && scale)
+        throw new ApiError(500, 'Boom');
+      return original<T>(method, path, body);
+    };
+    deleting();
+    await expect(reconcile()).rejects.toThrow('Boom');
+  });
 });

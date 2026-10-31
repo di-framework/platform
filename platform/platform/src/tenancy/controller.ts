@@ -263,6 +263,16 @@ const NUDGE_HOST_SETTLE_MS = 1_000;
 /** How old an unplaced Workload must be before it is nudged (S2 of the #418 review). */
 const NUDGE_WORKLOAD_MIN_AGE_MS = 5_000;
 /** Whether `time` is unset or at least `ms` before `now`. */
+/**
+ * Whether removal waits for `pod`: a terminating one (its finalizer still has to clear) or one not
+ * yet finished. A finished pod (`Succeeded` or `Failed`, e.g. evicted) can no longer write
+ * anything, and scaling to zero does not remove it.
+ */
+function isLivePod(pod: Resource): boolean {
+  if (pod.metadata.deletionTimestamp) return true;
+  const phase = (pod.status as { phase?: string } | undefined)?.phase;
+  return phase !== 'Succeeded' && phase !== 'Failed';
+}
 function olderThan(time: string | undefined, ms: number, now: number): boolean {
   return !time || now - Date.parse(time) >= ms;
 }
@@ -603,11 +613,7 @@ export class Controller {
       { 'wasmcloud.com/hostgroup': n.hostgroup, 'wasmcloud.com/name': 'hostgroup' },
       n.runtimeNamespace,
     );
-    return pods.filter((pod) => {
-      if (pod.metadata.deletionTimestamp) return true;
-      const phase = (pod.status as { phase?: string } | undefined)?.phase;
-      return phase !== 'Succeeded' && phase !== 'Failed';
-    });
+    return pods.filter(isLivePod);
   }
   private async remove(value: Resource): Promise<void> {
     try {
@@ -801,18 +807,25 @@ export class Controller {
   }
   /**
    * Patches `deployment` to zero replicas under the read's resourceVersion; true once it reports
-   * zero replicas for its current generation.
+   * zero replicas for its current generation. A resourceVersion conflict is "not yet".
    */
   private async scaledToZero(deployment: Resource): Promise<boolean> {
-    const updated = await this.api.call<Resource>(
-      'PATCH',
-      `${location(deployment)}?fieldManager=${CONTROLLER_FIELD_MANAGER}`,
-      {
-        metadata: { resourceVersion: deployment.metadata.resourceVersion },
-        spec: { replicas: 0 },
-      },
-      'application/merge-patch+json',
-    );
+    let updated: Resource;
+    try {
+      updated = await this.api.call<Resource>(
+        'PATCH',
+        `${location(deployment)}?fieldManager=${CONTROLLER_FIELD_MANAGER}`,
+        {
+          metadata: { resourceVersion: deployment.metadata.resourceVersion },
+          spec: { replicas: 0 },
+        },
+        'application/merge-patch+json',
+      );
+    } catch (error) {
+      // The deployment controller writes its status while it scales down: retry next pass.
+      if (error instanceof ApiError && error.code === 409) return false;
+      throw error;
+    }
     const status = updated.status as { observedGeneration?: number; replicas?: number } | undefined;
     return (
       status?.observedGeneration === updated.metadata.generation && (status?.replicas ?? 0) === 0
@@ -822,16 +835,19 @@ export class Controller {
    * R1 (`hosts`) and R4 (`operator`): drop the record entry, then wait until the written
    * {@link SCHEDULER_NATS_ACCOUNTS} no longer admits the tenant's hosts (R1) or no longer has its
    * account (R4). The file is read fresh; the tick writes it after removal, so a step completes on
-   * the pass after the write (owner decision 1: the written file is the signal).
+   * the pass after the write (owner decision 1: the written file is the signal). Only an
+   * installation without a scheduler PKI passes while the file is missing.
    */
   private async removalAccounts(tenant: Tenant, kind: 'hosts' | 'operator'): Promise<string[]> {
     const t = tenant.metadata.name;
-    await this.identities.drop(t, kind);
+    const pki = await this.identities.drop(t, kind);
     const accounts = await this.get<{ data?: Record<string, string> }>(
       `${collection('v1', 'ConfigMap', this.cfg.namespace)}/${SCHEDULER_NATS_ACCOUNTS}`,
     );
-    const text = accounts?.data?.[ACCOUNTS_KEY] ?? '';
+    const text = accounts?.data?.[ACCOUNTS_KEY];
     const file = `${this.cfg.namespace}/${SCHEDULER_NATS_ACCOUNTS}`;
+    // With a scheduler PKI, a file not written yet has dropped nothing: wait for the write.
+    if (text === undefined) return pki ? [`${file}: not written`] : [];
     if (kind === 'hosts') return accountsNamesTenantHost(text, t) ? [`${file}: hosts of ${t}`] : [];
     return accountsNamesTenantAccount(text, t) ? [`${file}: account T_di-tenant-${t}`] : [];
   }
@@ -884,7 +900,8 @@ export class Controller {
     return remaining;
   }
   /**
-   * R3 under `Retain`: scale the tenant operator to zero and wait for its pods to be gone, then
+   * R3 under `Retain`: scale the tenant operator to zero and wait for its live pods
+   * ({@link isLivePod}) to be gone, then
    * remove the operator's finalizers ({@link OPERATOR_FINALIZERS}) from the tenant's Workloads and
    * Artifacts, each under the read's resourceVersion (a conflict is retried on the next pass). Any
    * other finalizer is never removed: the step waits on it and names it.
@@ -896,7 +913,7 @@ export class Controller {
     );
     if (deployment && !(await this.scaledToZero(deployment)))
       return [`deployment/${ns}/${TENANT_OPERATOR_NAME}`];
-    const pods = await this.list<Resource>('v1', 'Pod', {}, ns);
+    const pods = (await this.list<Resource>('v1', 'Pod', {}, ns)).filter(isLivePod);
     if (pods.length) return pods.map((pod) => `pod/${ns}/${pod.metadata.name}`);
     const remaining: string[] = [];
     const n = names(tenant.metadata.name);
