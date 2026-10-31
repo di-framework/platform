@@ -92,6 +92,7 @@ import {
   removalProgress,
   removalStuckCondition,
   sweepsDeployment,
+  withoutOperatorFinalizers,
 } from './removal-sequence';
 import {
   assertTenantAuthConfig,
@@ -150,6 +151,8 @@ import {
 import {
   ACCOUNTS_KEY,
   type AccountsProblem,
+  accountsNamesTenantAccount,
+  accountsNamesTenantHost,
   accountsNamesUser,
   SCHEDULER_ACCOUNTS_CONDITION,
   SCHEDULER_NATS_ACCOUNTS,
@@ -187,7 +190,7 @@ import {
   storageAllowed,
 } from './storage-records';
 import { TENANT_OPERATOR_PROPAGATION_MS, tenantOperatorResources } from './tenant-operator';
-import { operatorNamespace } from './tenant-operator-names';
+import { operatorNamespace, TENANT_OPERATOR_NAME } from './tenant-operator-names';
 import { certificateNames, certificateValid, holdsCaKey, issuedBy, leafCertificate } from './tls';
 import {
   STORAGE_FIELD_MANAGER,
@@ -259,6 +262,16 @@ export const PLACEMENT_RETRY = 'di-framework.dev/placement-retry';
 const NUDGE_HOST_SETTLE_MS = 1_000;
 /** How old an unplaced Workload must be before it is nudged (S2 of the #418 review). */
 const NUDGE_WORKLOAD_MIN_AGE_MS = 5_000;
+/**
+ * Whether removal waits for `pod`: a terminating one (its finalizer still has to clear) or one not
+ * yet finished. A finished pod (`Succeeded` or `Failed`, e.g. evicted) can no longer write
+ * anything, and scaling to zero does not remove it.
+ */
+function isLivePod(pod: Resource): boolean {
+  if (pod.metadata.deletionTimestamp) return true;
+  const phase = (pod.status as { phase?: string } | undefined)?.phase;
+  return phase !== 'Succeeded' && phase !== 'Failed';
+}
 /** Whether `time` is unset or at least `ms` before `now`. */
 function olderThan(time: string | undefined, ms: number, now: number): boolean {
   return !time || now - Date.parse(time) >= ms;
@@ -600,11 +613,7 @@ export class Controller {
       { 'wasmcloud.com/hostgroup': n.hostgroup, 'wasmcloud.com/name': 'hostgroup' },
       n.runtimeNamespace,
     );
-    return pods.filter((pod) => {
-      if (pod.metadata.deletionTimestamp) return true;
-      const phase = (pod.status as { phase?: string } | undefined)?.phase;
-      return phase !== 'Succeeded' && phase !== 'Failed';
-    });
+    return pods.filter(isLivePod);
   }
   private async remove(value: Resource): Promise<void> {
     try {
@@ -740,12 +749,10 @@ export class Controller {
    */
   private async removeTenant(tenant: Tenant): Promise<void> {
     const steps: [RemovalStep, () => Promise<string[]>][] = [
-      // R1 and R4 drop the record entries; their reload-applied checks and the R3 Retain
-      // finalizer removal arrive with the cut-over (m6e).
-      ['R1', () => this.identities.drop(tenant.metadata.name, 'hosts').then(() => [])],
+      ['R1', () => this.removalAccounts(tenant, 'hosts')],
       ['R2', () => this.removalStopHosts(tenant)],
       ['R3', () => this.removalWorkloads(tenant)],
-      ['R4', () => this.identities.drop(tenant.metadata.name, 'operator').then(() => [])],
+      ['R4', () => this.removalAccounts(tenant, 'operator')],
       ['R5', () => this.removalOperator(tenant)],
       ['R6', () => this.removalNamespaces(tenant)],
     ];
@@ -753,8 +760,11 @@ export class Controller {
       const remaining = await run();
       if (remaining.length === 0) continue;
       // Through R3 the tenant's own operator clears its host pods' and Workloads' finalizers, so it
-      // keeps running and keeps its identity (owner decision 4); R4 then drops it.
-      if (step === 'R1' || step === 'R2' || step === 'R3') await this.keepTenantOperator(tenant);
+      // keeps running and keeps its identity (owner decision 4); R4 then drops it. Under `Retain`,
+      // R3 scales it to zero itself, so it is no longer applied there.
+      const retainR3 = step === 'R3' && tenant.spec.deletionPolicy !== 'Delete';
+      if ((step === 'R1' || step === 'R2' || step === 'R3') && !retainR3)
+        await this.keepTenantOperator(tenant);
       await this.removalBlocked(tenant, step, remaining);
       return;
     }
@@ -781,7 +791,7 @@ export class Controller {
     const n = names(tenant.metadata.name);
     const policy = tenant.spec.deletionPolicy ?? 'Retain';
     const pods = remaining.filter((r) => r.startsWith('pod/'));
-    const hostPods = pods.length === remaining.length;
+    const hostPods = step === 'R2' && pods.length === remaining.length;
     await this.status(
       tenant,
       false,
@@ -796,6 +806,52 @@ export class Controller {
     );
   }
   /**
+   * Patches `deployment` to zero replicas under the read's resourceVersion; true once it reports
+   * zero replicas for its current generation. A resourceVersion conflict is "not yet".
+   */
+  private async scaledToZero(deployment: Resource): Promise<boolean> {
+    let updated: Resource;
+    try {
+      updated = await this.api.call<Resource>(
+        'PATCH',
+        `${location(deployment)}?fieldManager=${CONTROLLER_FIELD_MANAGER}`,
+        {
+          metadata: { resourceVersion: deployment.metadata.resourceVersion },
+          spec: { replicas: 0 },
+        },
+        'application/merge-patch+json',
+      );
+    } catch (error) {
+      // The deployment controller writes its status while it scales down: retry next pass.
+      if (error instanceof ApiError && error.code === 409) return false;
+      throw error;
+    }
+    const status = updated.status as { observedGeneration?: number; replicas?: number } | undefined;
+    return (
+      status?.observedGeneration === updated.metadata.generation && (status?.replicas ?? 0) === 0
+    );
+  }
+  /**
+   * R1 (`hosts`) and R4 (`operator`): drop the record entry, then wait until the written
+   * {@link SCHEDULER_NATS_ACCOUNTS} no longer admits the tenant's hosts (R1) or no longer has its
+   * account (R4). The file is read fresh; the tick writes it after removal, so a step completes on
+   * the pass after the write (owner decision 1: the written file is the signal). Only an
+   * installation without a scheduler PKI passes while the file is missing.
+   */
+  private async removalAccounts(tenant: Tenant, kind: 'hosts' | 'operator'): Promise<string[]> {
+    const t = tenant.metadata.name;
+    const pki = await this.identities.drop(t, kind);
+    const accounts = await this.get<{ data?: Record<string, string> }>(
+      `${collection('v1', 'ConfigMap', this.cfg.namespace)}/${SCHEDULER_NATS_ACCOUNTS}`,
+    );
+    const text = accounts?.data?.[ACCOUNTS_KEY];
+    const file = `${this.cfg.namespace}/${SCHEDULER_NATS_ACCOUNTS}`;
+    // With a scheduler PKI, a file not written yet has dropped nothing: wait for the write.
+    if (text === undefined) return pki ? [`${file}: not written`] : [];
+    if (kind === 'hosts') return accountsNamesTenantHost(text, t) ? [`${file}: hosts of ${t}`] : [];
+    return accountsNamesTenantAccount(text, t) ? [`${file}: account T_di-tenant-${t}`] : [];
+  }
+  /**
    * R2: scale the tenant's Deployments to zero, except its own runtime-operator, and wait for
    * the host pods (terminating ones included, #245) and the Hosts in `di-operator-<t>` to be gone.
    */
@@ -807,25 +863,9 @@ export class Controller {
       [INSTALLATION]: this.cfg.installation,
       [OWNER]: tenant.metadata.uid!,
     });
-    for (const deployment of deployments.filter((d) => sweepsDeployment(d, t))) {
-      const updated = await this.api.call<Resource>(
-        'PATCH',
-        `${location(deployment)}?fieldManager=${CONTROLLER_FIELD_MANAGER}`,
-        {
-          metadata: { resourceVersion: deployment.metadata.resourceVersion },
-          spec: { replicas: 0 },
-        },
-        'application/merge-patch+json',
-      );
-      const status = updated.status as
-        | { observedGeneration?: number; replicas?: number }
-        | undefined;
-      if (
-        status?.observedGeneration !== updated.metadata.generation ||
-        (status?.replicas ?? 0) !== 0
-      )
+    for (const deployment of deployments.filter((d) => sweepsDeployment(d, t)))
+      if (!(await this.scaledToZero(deployment)))
         remaining.push(`deployment/${deployment.metadata.namespace}/${deployment.metadata.name}`);
-    }
     if (remaining.length) return remaining;
     // `status.replicas` leaves out terminating pods, so also wait for the live host pods to be
     // gone (#245). The wasmCloud operator clears their pod-host finalizer only while it watches
@@ -844,10 +884,9 @@ export class Controller {
   /**
    * R3 under `Delete`: delete the tenant's WorkloadDeployments, then wait until no
    * `runtime.wasmcloud.dev` object in `di-tenant-<t>` carries a finalizer and no Artifact remains.
-   * Under `Retain` m5 keeps today's path; the finalizer removal arrives with m6.
    */
   private async removalWorkloads(tenant: Tenant): Promise<string[]> {
-    if (tenant.spec.deletionPolicy !== 'Delete') return [];
+    if (tenant.spec.deletionPolicy !== 'Delete') return this.removalRetainedWorkloads(tenant);
     const n = names(tenant.metadata.name);
     const list = (kind: string) =>
       this.list<Resource>('runtime.wasmcloud.dev/v1alpha1', kind, {}, n.namespace);
@@ -859,6 +898,53 @@ export class Controller {
         if (kind === 'Artifact' || value.metadata.finalizers?.length)
           remaining.push(`${kind.toLowerCase()}/${value.metadata.name}`);
     return remaining;
+  }
+  /**
+   * R3 under `Retain`: scale the tenant operator to zero and wait for its live pods
+   * ({@link isLivePod}) to be gone, then
+   * remove the operator's finalizers ({@link OPERATOR_FINALIZERS}) from the tenant's Workloads and
+   * Artifacts, each under the read's resourceVersion (a conflict is retried on the next pass). Any
+   * other finalizer is never removed: the step waits on it and names it.
+   */
+  private async removalRetainedWorkloads(tenant: Tenant): Promise<string[]> {
+    const ns = operatorNamespace(tenant.metadata.name);
+    const deployment = await this.get<Resource>(
+      `${collection('apps/v1', 'Deployment', ns)}/${TENANT_OPERATOR_NAME}`,
+    );
+    if (deployment && !(await this.scaledToZero(deployment)))
+      return [`deployment/${ns}/${TENANT_OPERATOR_NAME}`];
+    const pods = (await this.list<Resource>('v1', 'Pod', {}, ns)).filter(isLivePod);
+    if (pods.length) return pods.map((pod) => `pod/${ns}/${pod.metadata.name}`);
+    const remaining: string[] = [];
+    const n = names(tenant.metadata.name);
+    for (const kind of ['Workload', 'Artifact'])
+      for (const value of await this.list<Resource>(
+        'runtime.wasmcloud.dev/v1alpha1',
+        kind,
+        {},
+        n.namespace,
+      )) {
+        const { kept, removes } = withoutOperatorFinalizers(value.metadata.finalizers ?? []);
+        const name = `${kind.toLowerCase()}/${value.metadata.name}`;
+        if (removes && !(await this.removeOperatorFinalizers(value, kept))) remaining.push(name);
+        for (const finalizer of kept) remaining.push(`${name} (finalizer ${finalizer})`);
+      }
+    return remaining;
+  }
+  /** Patches `value`'s finalizers to `kept`; false on a resourceVersion conflict. */
+  private async removeOperatorFinalizers(value: Resource, kept: string[]): Promise<boolean> {
+    try {
+      await this.api.call(
+        'PATCH',
+        `${location(value)}?fieldManager=${CONTROLLER_FIELD_MANAGER}`,
+        { metadata: { resourceVersion: value.metadata.resourceVersion, finalizers: kept } },
+        'application/merge-patch+json',
+      );
+      return true;
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 409) return false;
+      throw error;
+    }
   }
   /**
    * R5: delete the RoleBindings to the tenant-operator ClusterRoles (under both policies, so a

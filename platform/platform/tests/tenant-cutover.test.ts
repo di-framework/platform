@@ -687,6 +687,9 @@ describe('a Tenant being deleted keeps its operator through R3 (owner decision 4
       metadata: { deletionTimestamp?: string; finalizers?: string[] };
     };
     tenant.metadata.deletionTimestamp = '2026-10-30T01:00:00Z';
+    // R1 waits on this pass, which writes the accounts file without the hosts user (#541 m6e-D).
+    await controller.tick();
+    expect(stored(api).status?.conditions?.[0]?.message).toContain('removal step R1');
     api.operations.length = 0;
     return { api, controller };
   }
@@ -722,7 +725,11 @@ describe('a Tenant being deleted keeps its operator through R3 (owner decision 4
       `${collection('runtime.wasmcloud.dev/v1alpha1', 'Host', OPERATOR_NS)}/alpha-host`,
     );
     await controller.tick();
-    expect(api.applies()).not.toContain(operatorPath);
+    // Under Retain, R3 scales the operator to zero itself (#541 m6e-D); it is not applied again.
+    const writes = api.operations.filter(
+      (o) => o.method === 'PATCH' && o.path.startsWith(`${operatorPath}?`),
+    );
+    expect(writes.map((o) => (o.body as { spec?: unknown }).spec)).toEqual([{ replicas: 0 }]);
     expect(record(api)['tenant/alpha/operator']).toBeUndefined();
   });
 
@@ -752,6 +759,8 @@ describe('a Tenant being deleted keeps its operator through R3 (owner decision 4
         `${collection('runtime.wasmcloud.dev/v1alpha1', 'Host', OPERATOR_NS)}/alpha-host`,
       );
       api.seed(copy(labels));
+      // R4 completes on the pass after the accounts file drops the tenant's account.
+      await controller.tick();
       await controller.tick();
       expect(api.objects.has(copyPath)).toBe(!gone);
     }
