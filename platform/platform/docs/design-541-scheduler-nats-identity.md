@@ -355,7 +355,7 @@ Removal therefore runs in the fixed order below. The controller never skips a st
   - no operator watches them;
   - they carry no operator finalizer, so the namespace can still be deleted by hand.
 
-  If the Tenant is re-created, its new operator watches `di-tenant-<t>` again and reconciles them from scratch. The 2.8.0 operator re-adds a missing finalizer on every reconcile of an object that is not being deleted (`runtime-operator: api/condition/conditioned_reconciler.go:65-80`, `HandleFinalizer`, verified at tag `runtime-operator/v2.8.0`). Layer 4 step 7i stays as the live check.
+  A re-created Tenant does not adopt them. The kept namespaces stay labelled with the old Tenant UID, so a new Tenant with the same name is refused until they are deleted (README, "Tenant removal and namespace retention"). Retained objects are for recovering data by hand, not for re-adding the tenant. Layer 4 step 7i checks that refusal.
 - **RBAC for R3.** Under `Retain`, removing finalizers needs `patch` on `workloads` and `artifacts`. In 2.8.0 only Hosts, Workloads and Artifacts carry operator finalizers (`SetFinalizer` in `host_controller.go:156`, `workload_controller.go:470`, `artifact_controller.go:103`), so `workloadreplicasets` needs no `patch`. Today the controller holds `patch` only on `workloaddeployments`, and read access to the others (`platform/platform/src/tenancy/install.ts:221-231`). Its ClusterRole gains `patch` on `workloads` and `artifacts`.
 - **The operator after R1.** Its commands to hosts time out, because no host can connect any more. Its finalizers only delete Kubernetes objects (`host_controller.go:102-124`), so they need no host.
 
@@ -601,7 +601,7 @@ Two tenants and the platform host group:
    - **7f (R6).** B's namespaces are gone. C's are present, and a manual delete of `di-tenant-c` completes.
    - **7g (R7).** Both Tenants are gone. Tenant A shows no reconnect and no restart throughout.
    - **7h (stuck step).** On a third tenant, add a foreign finalizer to one Workload, then delete the Tenant. After the deadline, `RemovalStuck` names the step and the Workload. Removing the foreign finalizer lets removal complete.
-   - **7i (re-adding).** Re-create C. Its new operator reconciles the retained WorkloadDeployments and places them.
+   - **7i (re-adding).** Re-create C over its kept namespaces: `up` refuses it. After the kept namespaces are deleted, C is created again and becomes Ready.
 8. **Keys and certificates.** `di-scheduler-host-tls` in A and in B have different public-key fingerprints. Neither `wasmcloud-runtime-tls`, `wasmcloud-ca` nor a copied `di-scheduler-tls` exists.
 9. **Logs.** After a deploy, the NATS pod's log has no `MSG_PAYLOAD` lines.
 10. **Operator RBAC.** Check `kubectl auth can-i get secrets` as each operator's ServiceAccount:
