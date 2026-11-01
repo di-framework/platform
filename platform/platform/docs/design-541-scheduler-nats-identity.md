@@ -343,7 +343,7 @@ Removal therefore runs in the fixed order below. The controller never skips a st
 | R2 | Scale the tenant host Deployment (and the other tenant workloads today's sweep stops) to zero, and wait for the host pods to be gone. The tenant operator Deployment in `di-operator-<t>` is excluded and stays at one ready replica | same (today's Retain wait, `controller.ts:931-976`, with the exclusion below) | no host pod in `di-runtime-<t>`, terminating pods included (#245), and no Host in `di-operator-<t>` (the operator's pod-host and Host finalizers have run) | 7b |
 | R3 | Delete the tenant's WorkloadDeployments, and wait for the operator to remove its finalizers | Scale the tenant operator to zero and wait for its pod to be gone. Then the controller removes `runtime.wasmcloud.dev/workload-finalizer` and `runtime.wasmcloud.dev/artifact-finalizer` (runtime-operator 2.8.0) from the remaining Workloads and Artifacts in `di-tenant-<t>`, each with a merge PATCH under the read's `resourceVersion` (a conflict is retried on the next pass). Any other finalizer is never removed: R3 waits on it, names it, and reports `RemovalStuck` at its deadline | `Delete`: no `runtime.wasmcloud.dev` object that carries an operator finalizer remains in `di-tenant-<t>`. An Artifact, if one ever exists, keeps R3 in `RemovalStuck` until it is deleted; no path creates one today. `Retain`: no pod remains in `di-operator-<t>`, and no Workload or Artifact carries any finalizer | 7c |
 | R4 | Drop the `tenant/<t>/operator` entry and the whole `T_di-tenant-<t>` account from the next render | same | the written `di-scheduler-nats-accounts` no longer has the account `T_di-tenant-<t>` | 7d |
-| R5 | Delete the three RoleBindings to the tenant-operator ClusterRoles (the first step that removes them; `revoke` skips them before this), then `di-operator-<t>` | same. In the retained `di-tenant-<t>` and `di-runtime-<t>` the RoleBindings are deleted too, so a re-created Tenant starts clean | no such RoleBinding remains, and `di-operator-<t>` is gone | 7e |
+| R5 | Delete the three RoleBindings to the tenant-operator ClusterRoles (the first step that removes them; `revoke` skips them before this), then `di-operator-<t>` | same. In the retained `di-tenant-<t>` and `di-runtime-<t>` the RoleBindings are deleted too, so nothing in the kept namespaces still grants the removed operator access | no such RoleBinding remains, and `di-operator-<t>` is gone | 7e |
 | R6 | Delete the tenant's namespaces, as today (`controller.ts:915-929`) | keep them, as today | namespaces gone, or present and unchanged | 7f |
 | R7 | Remove the Tenant's finalizer | same | the Tenant is gone | 7g |
 
@@ -355,7 +355,7 @@ Removal therefore runs in the fixed order below. The controller never skips a st
   - no operator watches them;
   - they carry no operator finalizer, so the namespace can still be deleted by hand.
 
-  A re-created Tenant does not adopt them. The kept namespaces stay labelled with the old Tenant UID, so a new Tenant with the same name is refused until they are deleted (README, "Tenant removal and namespace retention"). Retained objects are for recovering data by hand, not for re-adding the tenant. Layer 4 step 7i checks that refusal.
+  A re-created Tenant does not adopt them. The kept namespaces stay labelled with the old Tenant UID, so a new Tenant with the same name is refused until they are deleted (README, "Tenant removal and namespace retention"). Two checks refuse it: `up` fails creating the Namespace (`namespaces "di-tenant-<t>" already exists`), and behind that the controller's owner-UID check refuses adoption. Retained objects are for recovering data by hand, not for re-adding the tenant. Layer 4 step 7i checks that refusal.
 - **RBAC for R3.** Under `Retain`, removing finalizers needs `patch` on `workloads` and `artifacts`. In 2.8.0 only Hosts, Workloads and Artifacts carry operator finalizers (`SetFinalizer` in `host_controller.go:156`, `workload_controller.go:470`, `artifact_controller.go:103`), so `workloadreplicasets` needs no `patch`. Today the controller holds `patch` only on `workloaddeployments`, and read access to the others (`platform/platform/src/tenancy/install.ts:221-231`). Its ClusterRole gains `patch` on `workloads` and `artifacts`.
 - **The operator after R1.** Its commands to hosts time out, because no host can connect any more. Its finalizers only delete Kubernetes objects (`host_controller.go:102-124`), so they need no host.
 
@@ -687,7 +687,7 @@ These are marked **U** above. The implementation or Layer 4 must confirm them:
 8. The upstream documentation statements in 2.4.
 9. Whether any `hostgroup-default` workload uses JetStream (O5).
 10. The client library for the broker test (8.2).
-11. Closed: the 2.8.0 operator re-adds missing finalizers on reconcile (`conditioned_reconciler.go:65-80`, verified at `runtime-operator/v2.8.0`); Layer 4 step 7i remains the live check.
+11. Closed: the 2.8.0 operator re-adds missing finalizers on reconcile (`conditioned_reconciler.go:65-80`, verified at `runtime-operator/v2.8.0`). No longer relevant: a re-created Tenant does not adopt retained objects (section 4, "What `Retain` leaves behind").
 
 ## Appendix A. The probe's exact configuration (option (a))
 
