@@ -683,17 +683,18 @@ Either policy runs the same ordered steps, R1 to R7, and never skips one. Each s
 deadline; past it the Tenant reports `RemovalStuck=True`, with the step ID as `reason` and the
 objects still pending in the message, and the step keeps retrying.
 
-- **R1**: drop the tenant's host identity from `di-scheduler-nats-accounts` and wait until the
-  written file no longer names it.
-- **R2**: scale the tenant's host Deployments and other workloads to zero, and wait for host pods
+- **R1**: drop the tenant's host identity from the identity record `di-scheduler-identities`, and
+  wait until the written `di-scheduler-nats-accounts` no longer names it.
+- **R2**: scale every Deployment the tenant owns, except its operator, to zero, and wait for host pods
   in `di-runtime-<name>` (terminating ones included) and Hosts in `di-operator-<name>` to be gone.
-  The tenant's operator is not scaled here, because it clears their finalizers.
-- **R3**. `Delete`: delete the WorkloadDeployments and wait for the operator to clear the finalizers
-  on what remains. `Retain`: scale the tenant operator to zero, then remove only
+  The operator is left running because it clears their finalizers.
+- **R3**: `Delete`: delete the WorkloadDeployments and wait for the operator to clear the finalizers
+  on what remains, until no Artifact is left. `Retain`: scale the tenant operator to zero, then remove only
   `runtime.wasmcloud.dev/workload-finalizer` and `runtime.wasmcloud.dev/artifact-finalizer` from the
   Workloads and Artifacts in `di-tenant-<name>`. Any other finalizer is never removed; R3 waits on
   it and names it.
-- **R4**: drop the operator's identity and its `T_di-tenant-<name>` account from the accounts file.
+- **R4**: drop the operator's identity from `di-scheduler-identities`, so its `T_di-tenant-<name>`
+  account leaves the accounts file.
 - **R5**: delete the RoleBindings to the tenant-operator ClusterRoles, the tenant's host identity
   Secret, and namespace `di-operator-<name>`.
 - **R6**: `Delete` removes the three tenant namespaces; `Retain` keeps them.
@@ -747,8 +748,8 @@ its own NATS account and its own runtime operator.
   ConfigMap `di-scheduler-nats-accounts` (key `accounts.conf`) is written only by the platform
   controller after bootstrap, so `pulumi up` never resets it. Secret `di-scheduler-nats-tls` holds
   the server certificate.
-- Two CAs are kept in `<platform-ns>-scheduler-pki`, in Secret `di-scheduler-ca`. No pod mounts that
-  namespace. The platform scheduler CA signs the server, the platform operator and host group, the
+- Two CAs are kept in `<platform-ns>-scheduler-pki`, in Secret `di-scheduler-ca`. No pod mounts its
+  Secrets or ConfigMaps. The platform scheduler CA signs the server, the platform operator and host group, the
   data connection and every tenant operator. The tenant scheduler CA signs tenant hosts only, and is
   name-constrained to their names. CAs last 10 years. Leaves last 90 days and are renewed when 30
   days remain, for platform identities too.
@@ -778,7 +779,9 @@ Renewal and rotation:
 
 - **Propagation wait.** A certificate is written into its Secret only after the accounts file has
   named its user for 120 s. Nothing reports when NATS loads the file, so that wait is the signal.
-  Until then the Secret keeps a certificate whose user is still admitted. A wait longer than 10
+  During a routine renewal the Secret keeps the previous certificate, whose user is still admitted,
+  until then. On a first issuance or a forced rotation the Secret is absent meanwhile (a forced
+  rotation deletes it first), and pods that start in that window wait for it. A wait longer than 10
   minutes is reported on a tenant's Tenant as `SchedulerIdentityPending` with reason
   `WaitingForAccounts`. Platform identities log one line instead.
 - **Routine renewal** records a new ID and keeps the old one as `previous`. Operators reconnect as
@@ -790,17 +793,19 @@ Renewal and rotation:
 - **Forced rotation** revokes the old user at the next accounts reload. Do it in one of two ways.
   Change the value of the Tenant annotation `platform.di-framework.dev/rotate-scheduler-identity`,
   which rotates both of the tenant's identities. Or delete the tenant's `di-scheduler-host-tls` or
-  `di-scheduler-operator-tls`. The controller issues the new certificate once its user has
-  propagated. Platform identities are renewed on the 90-day schedule but are not force-rotated, so
-  deleting their Secrets is not a rotation path.
+  `di-scheduler-operator-tls`. The controller issues the new certificate after the
+  propagation wait above. Platform identities are renewed on the 90-day schedule but are not force-rotated, so
+  do not delete their Secrets: the bootstrap Job creates them, and the controller does not
+  recreate a deleted one.
 
 ### Per-tenant operators
 
 Each tenant has one unmodified `runtime-operator` in namespace `di-operator-<t>`, labelled
-`namespace-role: operator`. Its flags are fixed for the tenant's life: `-watch-namespaces=di-tenant-<t>`,
+`platform.di-framework.dev/namespace-role: operator`. Its flags are fixed for the tenant's life: `-watch-namespaces=di-tenant-<t>`,
 `-host-namespaces=di-runtime-<t>`, `-allow-shared-hosts=false`, `-leader-elect`, and
-`-nats-url` pointing at the platform server. Metrics are off. Its RoleBindings exist only in the
-tenant's three namespaces, so it reads Secrets only there.
+`-nats-url` pointing at the platform server. Metrics are off. Its RoleBindings exist only in
+`di-operator-<t>`, `di-tenant-<t>` and `di-runtime-<t>`, and it can read Secrets only in
+`di-tenant-<t>`.
 
 - Tenant hosts register their Hosts only in `di-operator-<t>`. The controller's readiness check
   lists them there.
@@ -814,7 +819,7 @@ tenant's three namespaces, so it reads Secrets only there.
   platform operator and `hostgroup-default` share `T_<platform-ns>`, and never see tenant traffic.
 - A host user may publish only `runtime.operator.heartbeat.*`. It may subscribe only to
   `runtime.host.*.>`, and reply to at most one request, within 2 minutes. It cannot subscribe to
-  `_INBOX.>` and cannot publish to any other subject.
+  `_INBOX.>` and cannot publish anywhere else except that one reply.
 - An operator user publishes `runtime.host.*.>` and subscribes to `runtime.operator.heartbeat.>`
   and `_INBOX.>`.
 - Each tenant account has limits: `max_connections` of 2 times the host replicas plus 4, 64
