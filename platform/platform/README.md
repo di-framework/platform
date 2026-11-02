@@ -801,9 +801,9 @@ Renewal and rotation:
 - **CA expiry.** A leaf cannot outlive the CA that signs it, so in a scheduler CA's last 30 days a
   renewed leaf would be capped at the CA's expiry and due again at once. A leaf that already
   expires with its CA is therefore kept, not renewed. The Tenant reports `SchedulerCaExpiring` with
-  reason `CaExpiring`, naming the CA and its expiry. Platform identities and the NATS server leaf
-  log one warning instead. The scheduler CAs are not rotated yet; when a CA is replaced, the leaves
-  are re-issued from it and the condition clears.
+  reason `CaExpiring`, naming the CA and its expiry. Platform identities log one warning instead;
+  a capped NATS server leaf is kept silently. The scheduler CAs are not rotated yet; when a CA is
+  replaced, the leaves are re-issued from it and the condition clears.
 
 ### Per-tenant operators
 
