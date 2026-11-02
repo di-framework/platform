@@ -93,8 +93,7 @@ one of its input paths, unless `ghcr.io/di-framework/tenant-auth:src-<hash>` (a 
 committed inputs, `scripts/source-check.ts`) already exists. A manual run (`workflow_dispatch`)
 always builds. The workflow summary prints the reference, and a bot PR (`bot/pin-tenant-auth`,
 `chore: pin tenant-auth to <digest>`) updates the digest below and in `platform/platform/README.md`.
-GitHub does not run workflows on a PR that `GITHUB_TOKEN` opened, so a maintainer has to start its
-checks (close and reopen it) before merging. **Pin consumers by digest**, never by tag. Latest
+The PR is opened with the `BOT_PR_TOKEN` repository secret, so its checks start by themselves. **Pin consumers by digest**, never by tag. Latest
 published:
 
 ```yaml

@@ -41,7 +41,7 @@
 # Permissions: workflow default contents: read. check-source reads packages; build pushes the
 # per-arch images by digest and the registry cache, and merge pushes the tags, so both hold
 # packages: write; only pin holds contents: write and pull-requests: write.
-# Auth is GITHUB_TOKEN. No registry secret is stored.
+# Registry auth is GITHUB_TOKEN. The only stored secret, BOT_PR_TOKEN, opens the pin PR (#239).
 name: Publish tenant host image
 
 on:
@@ -469,6 +469,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up source check
         uses: ./.github/actions/setup-source-check
@@ -487,4 +489,4 @@ jobs:
           name: wash
           workflow: .github/workflows/tenant-host-image.yml
           pins: ${{ steps.pins.outputs.pins }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.BOT_PR_TOKEN }}

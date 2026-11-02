@@ -312,8 +312,9 @@ describe('the workflows keep bun.lock in step with the release bump', () => {
     };
     expect(bumpStep).not.toBe(prStep);
     expect(Object.keys(bumpStep.env ?? {})).not.toContain('GH_TOKEN');
-    expect(JSON.stringify(bumpStep)).not.toContain('github.token');
-    expect(prStep.env?.GH_TOKEN).toContain('github.token');
+    expect(JSON.stringify(bumpStep)).not.toMatch(/github\.token|BOT_PR_TOKEN/);
+    // A user's token, so the PR's CI starts and its auto-merge fires the tag run (#239).
+    expect(prStep.env?.GH_TOKEN).toMatch(/^\$\{\{ secrets\.BOT_PR_TOKEN \}\}$/);
     expect(prStep.run).toContain('git push');
     expect(prStep.run).not.toContain('bun ');
     // The plugin's package.json is added by the `*package.json` loop.

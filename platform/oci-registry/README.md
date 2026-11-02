@@ -268,9 +268,7 @@ recovers from the component), which the CNCF Wasm OCI layout requires for
 `wasip2`. The image is tagged with the
 commit SHA, and the job summary prints the manifest digest. After a publish, a
 bot PR (`bot/pin-oci-registry`, `chore: pin oci-registry to <digest>`) updates the
-digest below and in `platform/platform/README.md`; GitHub does not run workflows
-on a PR that `GITHUB_TOKEN` opened, so a maintainer has to start its checks
-(close and reopen it) before merging.
+digest below and in `platform/platform/README.md`; the PR is opened with the `BOT_PR_TOKEN` repository secret, so its checks start by themselves.
 
 #### One-time setup: give this repository write access to the package
 

@@ -67,6 +67,13 @@ function trackedFiles(): string[] {
 const CHECKED =
   "${{ !cancelled() && needs.check-source.result == 'success' && needs.check-source.outputs.skip != 'true' }}";
 
+/**
+ * How a bot branch is pushed with BOT_PR_TOKEN (#239): the github.com-scoped header
+ * scripts/source-check.ts uses (tokenConfig), built from GH_TOKEN, never on the command line.
+ */
+const BOT_PUSH_AUTH =
+  'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader';
+
 interface Spec {
   file: string;
   image: string;
@@ -410,7 +417,11 @@ describe.each(SPECS)('$file', (spec) => {
       expect(job.permissions?.['pull-requests'], name).toBeUndefined();
     }
     const open = pin?.steps?.find((s) => s.uses === './.github/actions/open-pin-pr');
-    expect(open?.with?.token).toBe('${{ secrets.GITHUB_TOKEN }}');
+    // A user's token, so the PR's CI starts on its own (#239); the checkout persists no
+    // credential, so the branch can only be pushed with it.
+    expect(open?.with?.token).toBe('${{ secrets.BOT_PR_TOKEN }}');
+    const checkout = pin?.steps?.find((s) => s.uses?.startsWith('actions/checkout@'));
+    expect(checkout?.with?.['persist-credentials']).toBe(false as never);
     expect(open?.with?.name).toBe(spec.pinName);
     expect(open?.with?.workflow).toBe(spec.file);
     // One PR per run: the pin job has no matrix.
@@ -490,8 +501,14 @@ describe.each(SPECS)('$file', (spec) => {
     expect(workflow.concurrency['cancel-in-progress']).toBe(false);
   });
 
-  test('uses no secret but GITHUB_TOKEN and pins every action by SHA', () => {
-    for (const [, name] of text.matchAll(/secrets\.(\w+)/g)) expect(name).toBe('GITHUB_TOKEN');
+  test('uses no secret but GITHUB_TOKEN, and BOT_PR_TOKEN only to open the pin PR; pins every action by SHA', () => {
+    for (const [, name] of text.matchAll(/secrets\.(\w+)/g)) {
+      expect(['GITHUB_TOKEN', 'BOT_PR_TOKEN']).toContain(name ?? '');
+    }
+    expect(text.match(/secrets\.BOT_PR_TOKEN/g)).toHaveLength(1);
+    for (const [name, job] of Object.entries(jobs)) {
+      expect(JSON.stringify(job).includes('BOT_PR_TOKEN'), name).toBe(name === 'pin');
+    }
     for (const [, ref] of text.matchAll(/uses:\s+(\S+)/g)) {
       if (ref?.startsWith('./')) continue;
       expect(ref).toMatch(/@[0-9a-f]{40}$/);
@@ -726,7 +743,7 @@ describe('composite actions', () => {
     expect(guard).toContain('SOURCE_CHECK_TOKEN: ${{ inputs.token }}');
   });
 
-  test('the pin PR is bot/pin-<name>, titled with the digest, and says CI needs a maintainer', () => {
+  test('the pin PR is bot/pin-<name>, titled with the digest, and says its CI starts by itself', () => {
     expect(open).toContain('branch="bot/pin-${NAME}"');
     expect(open).toContain('title="chore: pin ${summary[0]}"');
     expect(open).toContain('bun scripts/pin-artifact.ts "${args[@]}"');
@@ -734,10 +751,24 @@ describe('composite actions', () => {
       'bun scripts/source-check.ts --workflow "${WORKFLOW}" --image unused --stale-guard --no-registry',
     );
     expect(open).toContain('if [[ "${EVENT}" == "push" ]]; then');
-    expect(open).toContain('A maintainer has to approve and run this PR');
-    expect(open).toContain('GitHub does not trigger workflows for pull requests');
+    expect(open).toContain(
+      'Opened with the `BOT_PR_TOKEN` repository secret, so its checks start by themselves',
+    );
+    expect(open).not.toMatch(/approve and run|close and reopen|GITHUB_TOKEN` creates/i);
     expect(open).toContain('gh pr edit');
     expect(open).toContain('gh pr create --base main');
+  });
+
+  test('the pin PR is pushed, opened and matched as the token user, not github-actions[bot] (#239)', () => {
+    const step = (
+      Bun.YAML.parse(open) as { runs: { steps: { name: string; env?: Record<string, string> }[] } }
+    ).runs.steps.find((s) => s.name === 'Commit pins and open PR');
+    expect(step?.env?.GH_TOKEN).toBe('${{ inputs.token }}');
+    expect(step?.env?.SOURCE_CHECK_TOKEN).toBe('${{ inputs.token }}');
+    expect(open).toContain(BOT_PUSH_AUTH);
+    expect(open).toContain('me="$(gh api user --jq .login)"');
+    expect(open).toContain('.author.login == env.ME');
+    expect(open).not.toContain('app/github-actions');
   });
 
   test('pin actions and the Bun version by SHA and use no stored secret', () => {
@@ -1596,7 +1627,10 @@ jq '.packages["node_modules/@di-framework/platform"].version="${pin}"' package-l
     expect(run).toContain('branch=bot/operator-project');
     expect(run).toContain('sort -V');
     expect(run.indexOf('sort -V')).toBeLessThan(run.indexOf('operator-project.ts bump'));
-    expect(run).toContain('A maintainer has to approve and run this PR');
+    expect(run).toContain(
+      'Opened with the `BOT_PR_TOKEN` repository secret, so its checks start by themselves',
+    );
+    expect(run).not.toMatch(/approve and run|close and reopen/i);
     // Not the main-branch image pin PR's branch.
     expect(run).not.toContain('bot/pin-platform-operator');
     // bake's files (#523), checked against bake's sha256.
@@ -1688,10 +1722,11 @@ jq '.packages["node_modules/@di-framework/platform"].version="${pin}"' package-l
       const log = join(base, 'calls.log');
       writeFileSync(log, '');
       // `gh pr close` fails as it does on a PR GitHub already closed with its deleted branch.
+      // `api user` is the token's user, whose PRs the job matches (#239).
       stubCommand(
         bin,
         'gh',
-        `if [ "$1 $2" = "pr list" ]; then ${opts.open ? 'echo 7' : 'true'}; else echo "gh $*" >> "${log}"; [ "$1 $2" != "pr close" ] || exit 1; fi`,
+        `if [ "$1 $2" = "api user" ]; then echo pin-bot; elif [ "$1 $2" = "pr list" ]; then ${opts.open ? 'echo 7' : 'true'}; else echo "gh $*" >> "${log}"; [ "$1 $2" != "pr close" ] || exit 1; fi`,
       );
       const race = `(cd "${base}/side-race" && git push -qf origin HEAD:refs/heads/bot/operator-project)`;
       const raceAt = opts.race ? (opts.raceAt ?? 'bun') : undefined;
@@ -1729,6 +1764,8 @@ echo "lock $3 from main" > package-lock.json`,
           PATH: `${bin}:${process.env.PATH}`,
           GITHUB_REF_NAME: 'v1.0.2',
           GITHUB_SHA: tagSha,
+          // The push header built from it is scoped to github.com; the local origin ignores it.
+          GH_TOKEN: 'x',
           RUNNER_TEMP: temp,
           RUN_URL: 'https://example.invalid/run',
           PROJECT_SHA256: sum ?? '',
@@ -2279,9 +2316,16 @@ describe('Auto Tag tags a release when its PR merges instead of waiting for it (
   test('the README says what publishes a release and how to recover', () => {
     const readme = read('README.md');
     expect(readme).toContain('Merging the release PR is what publishes a release.');
-    expect(readme).toContain('If the PR was merged by a person, the tag job runs immediately');
-    expect(readme).toContain('the scheduled tag job catches it within about 30 minutes');
+    expect(readme).toContain(
+      'The tag job runs immediately on the merge, whether a person or auto-merge did it',
+    );
+    expect(readme).toContain('catches a release whose merge run was lost within about 30 minutes');
     expect(readme).toContain('`tag_only: true`');
+    // Bot PRs start their own CI (#239); what to do when the token expires.
+    expect(readme).toContain("The PR's checks start by themselves.");
+    expect(readme).toContain('opened with the `BOT_PR_TOKEN` repository secret');
+    expect(readme).toContain('When that token expires');
+    expect(readme).not.toMatch(/approve the pr's checks|close and reopen/i);
   });
 
   describe('the tag job scripts', () => {
@@ -2615,5 +2659,138 @@ describe('Auto Tag tags a release when its PR merges instead of waiting for it (
         expect(dispatches(box)).toEqual([]);
       });
     });
+  });
+});
+
+/**
+ * GitHub starts no workflow for a push or a PR made with GITHUB_TOKEN, so the bot PRs sat in
+ * action_required until a maintainer approved them (#239). The branch push and the PR now use
+ * BOT_PR_TOKEN, a user's fine-grained token stored as a repository secret, in exactly the jobs
+ * that open those PRs, and nowhere a pull_request event can reach.
+ */
+describe('bot PRs are opened with BOT_PR_TOKEN (#239)', () => {
+  const workflows = [...new Bun.Glob('.github/workflows/*.yml').scanSync({ cwd: repo })].sort();
+  const actions = [...new Bun.Glob('.github/actions/*/action.yml').scanSync({ cwd: repo })].sort();
+  const BOT_TOKEN = '${{ secrets.BOT_PR_TOKEN }}';
+  const stepsOf = (file: string) =>
+    Object.entries(parse(file).jobs).flatMap(([job, j]) =>
+      (j.steps ?? []).map((step) => ({ file, job, step })),
+    );
+  const steps = workflows.flatMap(stepsOf);
+  /** The jobs that reference the secret, as `<file>#<job>`. */
+  const holders = workflows.flatMap((file) =>
+    Object.entries(parse(file).jobs)
+      .filter(([, job]) => JSON.stringify(job).includes('BOT_PR_TOKEN'))
+      .map(([name]) => `${file}#${name}`),
+  );
+
+  test('exactly the PR-opening jobs hold the secret', () => {
+    expect(holders).toEqual([
+      '.github/workflows/auto-tag.yml#release-pr',
+      '.github/workflows/oci-registry-component.yml#pin',
+      '.github/workflows/pglite-component-publish.yml#pin',
+      '.github/workflows/pglite-encfs-publish.yml#pin',
+      '.github/workflows/platform-operator-image.yml#pin',
+      '.github/workflows/release.yml#project-pr',
+      '.github/workflows/tenant-auth-image.yml#pin',
+      '.github/workflows/tenant-host-image.yml#pin',
+    ]);
+    for (const spec of SPECS) expect(holders).toContain(`${spec.file}#pin`);
+    // Composite actions take the token as an input; the callers pass the secret.
+    for (const file of actions) expect(read(file)).not.toContain('secrets.');
+  });
+
+  test('no job a pull_request event can run holds the secret', () => {
+    for (const file of workflows) {
+      const workflow = parse(file);
+      const on = workflow.on as Record<string, unknown>;
+      const onPr = 'pull_request' in on || 'pull_request_target' in on;
+      for (const [name, job] of Object.entries(workflow.jobs)) {
+        if (!JSON.stringify(job).includes('BOT_PR_TOKEN')) continue;
+        if (!onPr) continue;
+        // auto-tag.yml: release-pr runs only on push and workflow_dispatch.
+        expect(job.if, `${file}#${name}`).toContain("github.event_name == 'push'");
+        expect(job.if, `${file}#${name}`).toContain("github.event_name == 'workflow_dispatch'");
+        expect(job.if, `${file}#${name}`).not.toContain('pull_request');
+      }
+    }
+  });
+
+  test('every gh pr create runs as the token user', () => {
+    const creates = steps.filter(({ step }) => (step.run ?? '').includes('gh pr create'));
+    expect(creates.map((c) => `${c.file}#${c.job}`)).toEqual([
+      '.github/workflows/auto-tag.yml#release-pr',
+      '.github/workflows/release.yml#project-pr',
+    ]);
+    for (const { step } of creates) expect(step.env?.GH_TOKEN).toBe(BOT_TOKEN);
+    const action = read('.github/actions/open-pin-pr/action.yml');
+    expect(action).toContain('gh pr create');
+    expect(action).toContain('GH_TOKEN: ${{ inputs.token }}');
+    const callers = steps.filter(({ step }) => step.uses === './.github/actions/open-pin-pr');
+    expect(callers).toHaveLength(SPECS.length);
+    for (const { step } of callers) expect(step.with?.token).toBe(BOT_TOKEN);
+  });
+
+  test('every push of a bot branch authenticates with the token, from a checkout that persisted none', () => {
+    const pushes = steps.filter(({ step }) =>
+      /git push .*(refs\/heads\/\$\{?branch\}?|refs\/heads\/\$BRANCH)/.test(step.run ?? ''),
+    );
+    expect(pushes.map((p) => `${p.file}#${p.job}`)).toEqual([
+      '.github/workflows/auto-tag.yml#release-pr',
+      '.github/workflows/release.yml#project-pr',
+    ]);
+    for (const { file, job, step } of pushes) {
+      expect(step.env?.GH_TOKEN, `${file}#${job}`).toBe(BOT_TOKEN);
+      expect(step.run, `${file}#${job}`).toContain(BOT_PUSH_AUTH);
+      expect(step.run, `${file}#${job}`).toContain(
+        `GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\\n')"`,
+      );
+      expect(step.run?.indexOf(BOT_PUSH_AUTH)).toBeLessThan(step.run?.indexOf('git push') ?? -1);
+    }
+    const action = read('.github/actions/open-pin-pr/action.yml');
+    expect(action).toContain(BOT_PUSH_AUTH);
+    expect(action.indexOf(BOT_PUSH_AUTH)).toBeLessThan(action.indexOf('git push --force origin'));
+    for (const holder of holders) {
+      const [file, job] = holder.split('#') as [string, string];
+      const checkout = parse(file).jobs[job]?.steps?.find((s) =>
+        s.uses?.startsWith('actions/checkout@'),
+      );
+      expect(checkout?.with?.['persist-credentials'], holder).toBe(false as never);
+    }
+    // The token is never printed: no `set -x` where it is in the environment.
+    for (const { step } of steps.filter(({ step }) => step.env?.GH_TOKEN === BOT_TOKEN)) {
+      expect(step.run).not.toMatch(/set -x|echo .*GH_TOKEN/);
+    }
+  });
+
+  test('the tag job still pushes the tag with GITHUB_TOKEN, so release.yml runs exactly once', () => {
+    const tag = parse('.github/workflows/auto-tag.yml').jobs.tag;
+    expect(JSON.stringify(tag)).not.toContain('BOT_PR_TOKEN');
+    for (const step of (tag?.steps ?? []).filter((s) => s.run)) {
+      expect(step.env?.GH_TOKEN).toBe('${{ github.token }}');
+    }
+    expect(JSON.stringify(tag)).not.toContain('persist-credentials');
+  });
+
+  test('the bot PRs say their checks start by themselves, and the docs no longer say to approve them', () => {
+    const files = [
+      'README.md',
+      'platform/oci-registry/README.md',
+      'platform/pglite-component/README.md',
+      'platform/tenant-auth/README.md',
+      'platform/tenant-host/README.md',
+      ...workflows,
+      ...actions,
+    ];
+    for (const file of files) {
+      expect(read(file), file).not.toMatch(
+        /close and reopen|approve and run|holds them for approval|does not (run|trigger) workflows (on|for) (a )?pull request/i,
+      );
+    }
+    for (const file of files.slice(1, 5)) {
+      expect(read(file), file).toContain(
+        'opened with the `BOT_PR_TOKEN` repository secret, so its checks start by themselves',
+      );
+    }
   });
 });

@@ -807,7 +807,8 @@ jobs:
 
   # Moves main's baked install project to the release, so the next operator image built from main
   # (platform-operator-image.yml) embeds and bakes it too. The PR is bot/operator-project; it is
-  # opened with GITHUB_TOKEN, so a maintainer starts its CI and merges it, and that merge (a push to
+  # pushed and opened with BOT_PR_TOKEN (a user's token; GITHUB_TOKEN's pushes and PRs fire no
+  # events, #239), so its CI starts on its own, a maintainer merges it, and that merge (a push to
   # main changing an image input) publishes the next main image and its pin PR.
   # When main's three project files are still the tag's, the PR commits bake's three files as they
   # are, so main's next image installs exactly what the vN image does (#523). Otherwise (a template
@@ -832,6 +833,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
+          persist-credentials: false
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -854,13 +856,19 @@ jobs:
 
       - name: Open or update the PR
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.BOT_PR_TOKEN }}
           NPM_CONFIG_PREFER_ONLINE: 'true'
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           PROJECT_SHA256: ${{ needs.bake.outputs.project_sha256 }}
           BAKED_OUTCOME: ${{ steps.baked.outcome }}
         run: |
           set -euo pipefail
+          # Every fetch, push and delete of the bot branch authenticates with BOT_PR_TOKEN (the
+          # checkout persisted no credential), through the same github.com-scoped header
+          # scripts/source-check.ts uses, never on the command line.
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          export GIT_CONFIG_VALUE_0
           VERSION="${GITHUB_REF_NAME#v}"
           PROJECT=platform/operator/internal/installer/project
           BAKED="${RUNNER_TEMP}/operator-project"
@@ -872,10 +880,16 @@ jobs:
           # The open bot PR (existing), the branch's commit (lease; empty when there is no branch) and
           # the release the branch moves main to (branch_pin). A branch is pushed before its PR is
           # opened, so a branch without a PR may be a newer release's project-pr in flight.
+          # The PRs this token opens are authored by its user, not github-actions[bot].
+          me="$(gh api user --jq .login)"
+          if [[ -z "${me}" ]]; then
+            echo "::error::could not read the user of the token (expired BOT_PR_TOKEN?)"
+            exit 1
+          fi
           read_bot() {
-            existing="$(BRANCH="${branch}" gh pr list --head "${branch}" --base main --state open \
+            existing="$(BRANCH="${branch}" ME="${me}" gh pr list --head "${branch}" --base main --state open \
               --json number,author,headRefName \
-              --jq 'map(select(.author.login == "app/github-actions" and .headRefName == env.BRANCH)) | .[0].number // empty')"
+              --jq 'map(select(.author.login == env.ME and .headRefName == env.BRANCH)) | .[0].number // empty')"
             lease=''
             branch_pin=''
             if git fetch --quiet --depth=1 origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" 2>/dev/null; then
@@ -971,11 +985,8 @@ jobs:
             echo
             git diff --stat HEAD~1 HEAD
             echo
-            echo '**A maintainer has to approve and run this PR'"'"'s workflows before it can merge.**'
-            echo 'It was opened with `GITHUB_TOKEN`, and GitHub does not trigger workflows for pull requests'
-            echo 'that `GITHUB_TOKEN` creates or updates, so no checks start on their own. Close and reopen'
-            echo 'the PR (or push a commit to the branch) to run CI. Merging it publishes the next operator'
-            echo 'image from main, and that opens its pin PR.'
+            echo 'Opened with the `BOT_PR_TOKEN` repository secret, so its checks start by themselves; review and'
+            echo 'merge as usual. Merging it publishes the next operator image from main, and that opens its pin PR.'
           } > "${body}"
           if [[ -n "${existing}" ]]; then
             gh pr edit "${existing}" --title "${title}" --body-file "${body}"
