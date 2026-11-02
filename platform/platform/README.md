@@ -679,6 +679,26 @@ not from your config at that moment.
   data lives in tenant-UID hostPath directories under the storage root, which namespace deletion
   does not erase.
 
+Either policy runs the same ordered steps, R1 to R7, and never skips one. Each step has a 15-minute
+deadline; past it the Tenant reports `RemovalStuck=True`, with the step ID as `reason` and the
+objects still pending in the message, and the step keeps retrying.
+
+- **R1**: drop the tenant's host identity from `di-scheduler-nats-accounts` and wait until the
+  written file no longer names it.
+- **R2**: scale the tenant's host Deployments and other workloads to zero, and wait for host pods
+  in `di-runtime-<name>` (terminating ones included) and Hosts in `di-operator-<name>` to be gone.
+  The tenant's operator is not scaled here, because it clears their finalizers.
+- **R3**. `Delete`: delete the WorkloadDeployments and wait for the operator to clear the finalizers
+  on what remains. `Retain`: scale the tenant operator to zero, then remove only
+  `runtime.wasmcloud.dev/workload-finalizer` and `runtime.wasmcloud.dev/artifact-finalizer` from the
+  Workloads and Artifacts in `di-tenant-<name>`. Any other finalizer is never removed; R3 waits on
+  it and names it.
+- **R4**: drop the operator's identity and its `T_di-tenant-<name>` account from the accounts file.
+- **R5**: delete the RoleBindings to the tenant-operator ClusterRoles, the tenant's host identity
+  Secret, and namespace `di-operator-<name>`.
+- **R6**: `Delete` removes the three tenant namespaces; `Retain` keeps them.
+- **R7**: remove the Tenant's finalizer.
+
 Kept namespaces stay labelled with the old Tenant UID. A new Tenant with the same name is not
 adopted over them and does not pick the old data back up, so re-adding a name after a Retain
 removal means deleting the kept namespaces first (below).
@@ -708,6 +728,97 @@ namespaces by hand after checking the installation and owner labels:
 kubectl get ns di-tenant-alpha di-runtime-alpha di-apikeys-alpha --show-labels
 kubectl delete namespace di-tenant-alpha di-runtime-alpha di-apikeys-alpha
 ```
+
+## Scheduler bus
+
+The scheduler NATS carries heartbeats from wasmCloud hosts to runtime operators, and the operators'
+commands back. The platform runs that server itself. The chart's NATS (`nats.enabled=false`) and
+its generated `wasmcloud-ca` (`global.certificates.generate=false`) are not used. Each tenant has
+its own NATS account and its own runtime operator.
+
+### Server and CAs
+
+- Deployment `di-scheduler-nats` runs one `nats-server` 2.12.8 replica in the platform namespace,
+  pinned by digest, with the upstream config reloader beside it. Its pod label is
+  `wasmcloud.com/name: nats`.
+- Service `nats` (port 4222) keeps the name that hosts and the chart's default URL resolve to. It
+  carries `helm.sh/resource-policy: keep`, so a Helm upgrade that stops rendering it leaves it alone.
+- ConfigMap `di-scheduler-nats` holds the static server config, which only `pulumi up` changes.
+  ConfigMap `di-scheduler-nats-accounts` (key `accounts.conf`) is written only by the platform
+  controller after bootstrap, so `pulumi up` never resets it. Secret `di-scheduler-nats-tls` holds
+  the server certificate.
+- Two CAs are kept in `<platform-ns>-scheduler-pki`, in Secret `di-scheduler-ca`. No pod mounts that
+  namespace. The platform scheduler CA signs the server, the platform operator and host group, the
+  data connection and every tenant operator. The tenant scheduler CA signs tenant hosts only, and is
+  name-constrained to their names. CAs last 10 years. Leaves last 90 days and are renewed when 30
+  days remain, for platform identities too.
+
+### Identities
+
+| Identity | Secret (namespace) | NATS account |
+| --- | --- | --- |
+| Platform operator (the chart's `runtime-operator`) | `di-scheduler-operator-tls` (platform namespace) | `T_<platform-ns>` |
+| Platform host group (`hostgroup-default`) | `di-scheduler-platform-host-tls` (platform namespace) | `T_<platform-ns>` |
+| Platform data connection | `di-scheduler-data-tls` (platform namespace) | `DATA` |
+| Tenant `<t>` operator | `di-scheduler-operator-tls` (`di-operator-<t>`) | `T_di-tenant-<t>` |
+| Tenant `<t>` hosts | `di-scheduler-host-tls` (`di-runtime-<t>`) | `T_di-tenant-<t>` |
+
+- Each Secret holds `tls.crt`, `tls.key` and `ca.crt`. Each client certificate carries a fresh
+  16-hex issuance ID in its NATS user name, so a user name names exactly one certificate.
+- ConfigMap `di-scheduler-identities` in `<platform-ns>-scheduler-pki` records, per identity,
+  `current`, and during a renewal `previous` and `previousUntil`. No pod mounts it.
+- `di-scheduler-nats-accounts` is rendered from the Tenant list and that record on every pass. It is
+  written only when its bytes change. The controller checks user names and their uniqueness first.
+  A refused render is not written, so the previous file keeps serving. The Tenant then reports
+  `SchedulerAccounts=False`, with the refusal as `reason` (for example `DuplicateSchedulerUser`). If
+  reads or writes fail for 15 minutes, it reports `SchedulerAccounts=Unknown` with reason
+  `WriteFailing`.
+
+Renewal and rotation:
+
+- **Propagation wait.** A certificate is written into its Secret only after the accounts file has
+  named its user for 120 s. Nothing reports when NATS loads the file, so that wait is the signal.
+  Until then the Secret keeps a certificate whose user is still admitted. A wait longer than 10
+  minutes is reported on a tenant's Tenant as `SchedulerIdentityPending` with reason
+  `WaitingForAccounts`. Platform identities log one line instead.
+- **Routine renewal** records a new ID and keeps the old one as `previous`. Operators reconnect as
+  the new user once `previous` is dropped at `previousUntil`, 10 minutes later. Hosts are rolled
+  first, through a certificate-digest pod annotation, and `previous` is dropped only once that
+  rollout is observed. If the rollout has not finished 10 minutes after the renewal, the Tenant
+  reports `SchedulerIdentityRenewalStalled` with the Deployment's name. For the platform host group
+  that goes to the controller log.
+- **Forced rotation** revokes the old user at the next accounts reload. Do it in one of two ways.
+  Change the value of the Tenant annotation `platform.di-framework.dev/rotate-scheduler-identity`,
+  which rotates both of the tenant's identities. Or delete the tenant's `di-scheduler-host-tls` or
+  `di-scheduler-operator-tls`. The controller issues the new certificate once its user has
+  propagated. Platform identities are renewed on the 90-day schedule but are not force-rotated, so
+  deleting their Secrets is not a rotation path.
+
+### Per-tenant operators
+
+Each tenant has one unmodified `runtime-operator` in namespace `di-operator-<t>`, labelled
+`namespace-role: operator`. Its flags are fixed for the tenant's life: `-watch-namespaces=di-tenant-<t>`,
+`-host-namespaces=di-runtime-<t>`, `-allow-shared-hosts=false`, `-leader-elect`, and
+`-nats-url` pointing at the platform server. Metrics are off. Its RoleBindings exist only in the
+tenant's three namespaces, so it reads Secrets only there.
+
+- Tenant hosts register their Hosts only in `di-operator-<t>`. The controller's readiness check
+  lists them there.
+- The chart's operator watches and hosts only the platform namespace, and `hostgroup-default` stays
+  on it. Adding or removing a tenant never restarts the chart's operator.
+
+### Isolation
+
+- Accounts import and export nothing. A command from one tenant's operator reaches only hosts in
+  that tenant's account, and only that tenant's operator receives its hosts' heartbeats. The
+  platform operator and `hostgroup-default` share `T_<platform-ns>`, and never see tenant traffic.
+- A host user may publish only `runtime.operator.heartbeat.*`. It may subscribe only to
+  `runtime.host.*.>`, and reply to at most one request, within 2 minutes. It cannot subscribe to
+  `_INBOX.>` and cannot publish to any other subject.
+- An operator user publishes `runtime.host.*.>` and subscribes to `runtime.operator.heartbeat.>`
+  and `_INBOX.>`.
+- Each tenant account has limits: `max_connections` of 2 times the host replicas plus 4, 64
+  subscriptions, and a 1 MiB payload.
 
 ## Existing-cluster configuration
 
