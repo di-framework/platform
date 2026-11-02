@@ -1,14 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
+import { X509Certificate } from 'node:crypto';
 import { FINALIZER, INSTALLATION, names, OWNER, type Resource } from '../src/tenancy/resources';
 import {
+  SCHEDULER_CA_EXPIRING,
   SCHEDULER_IDENTITY_PENDING,
   TENANT_HOST_SECRET,
 } from '../src/tenancy/scheduler-identities';
-import { IDENTITIES_KEY, parseIdentityRecord } from '../src/tenancy/scheduler-pki';
+import {
+  CA_KEYS,
+  IDENTITIES_KEY,
+  parseIdentityRecord,
+  SCHEDULER_CA_SECRET,
+} from '../src/tenancy/scheduler-pki';
 import { TENANT_OPERATOR_PROPAGATION_MS } from '../src/tenancy/tenant-operator';
 import {
   condition,
   MemoryApi,
+  PKI,
   prepare as prepareHarness,
   recordPath,
   START,
@@ -179,5 +187,59 @@ describe('controller tick: tenant scheduler identities (#541 m6c)', () => {
       expect(Object.keys(record).filter((k) => k.startsWith('tenant/'))).toEqual([]);
       expect(api.objects.has(hostPath)).toBe(foreign);
     }
+  });
+});
+
+describe('tenant identities in the CA last 30 days (#612)', () => {
+  it('issues each identity at most once, then writes nothing and reports SchedulerCaExpiring', async () => {
+    const { api, controller } = await prepare({ pki: true });
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'Namespace',
+      metadata: {
+        name: 'di-operator-alpha',
+        labels: { [INSTALLATION]: 'test', [OWNER]: 'alpha-uid' },
+      },
+    });
+    await issue(controller);
+    expect(api.objects.has(operatorPath)).toBe(true);
+    const ca = (
+      api.objects.get(`/api/v1/namespaces/${PKI}/secrets/${SCHEDULER_CA_SECRET}`) as unknown as {
+        data: Record<string, string>;
+      }
+    ).data;
+    const caEnd = (kind: 'platform' | 'tenant') =>
+      new Date(
+        new X509Certificate(Buffer.from(ca[CA_KEYS[kind].cert] as string, 'base64')).validTo,
+      ).getTime();
+    clock.now = new Date(Math.min(caEnd('platform'), caEnd('tenant')) - 20 * 86_400_000);
+    api.operations.length = 0;
+    await issue(controller);
+    await controller.tick();
+    const writes = (path: string) =>
+      api.operations.filter((o) => o.method !== 'GET' && o.path === path).length;
+    expect(writes(hostPath)).toBe(1);
+    expect(writes(operatorPath)).toBe(1);
+    expect(condition(api, SCHEDULER_CA_EXPIRING)).toMatchObject({
+      status: 'True',
+      reason: 'CaExpiring',
+    });
+    // The overlap ends and the platform's own identities (also capped now) settle once.
+    for (let i = 0; i < 3; i++) {
+      clock.now = new Date(clock.now.getTime() + 11 * 60_000);
+      await controller.tick();
+    }
+    expect(writes(hostPath) + writes(operatorPath)).toBe(2);
+    api.operations.length = 0;
+    for (let i = 0; i < 5; i++) {
+      clock.now = new Date(clock.now.getTime() + 86_400_000);
+      await controller.tick();
+    }
+    expect(api.identityWrites()).toEqual([]);
+    expect(writes(operatorPath)).toBe(0);
+    const logged = warn.mock.calls.filter(([m]: unknown[]) =>
+      String(m).includes('scheduler tenant CA expires'),
+    );
+    expect(logged).toHaveLength(1);
   });
 });

@@ -12,8 +12,10 @@
  * - **Forced rotation**: the Tenant annotation {@link ROTATE_ANNOTATION} changed, or the
  *   identity's Secret is missing. A new current ID, no previous, so the old user is revoked in the
  *   next reload.
- * - **Routine renewal**: the certificate has at most {@link SCHEDULER_LEAF_RENEW_DAYS} days left.
- *   A new current ID, the old one kept as `previous` until `previousUntil` (now +
+ * - **Routine renewal**: the certificate has at most {@link SCHEDULER_LEAF_RENEW_DAYS} days left
+ *   and expires before its CA does. A leaf capped at its CA's expiry is not renewed (a renewal
+ *   would be capped the same way, so every tick would re-issue it, #612); the transition reports
+ *   `caExpiring` instead. The scheduler CAs are not rotated yet. A new current ID, the old one kept as `previous` until `previousUntil` (now +
  *   {@link RENEWAL_OVERLAP_MS}).
  * - **Pending issuance**: the Secret's certificate carries another ID than the recorded `current`
  *   (the record was written but issuance did not land). The certificate is re-issued for the
@@ -76,7 +78,13 @@ interface ObservationBase {
    * The identity's Secret; undefined when it is missing. `id` is the issuance ID its certificate
    * carries ({@link issuanceIdOf} of the leaf's DNS SAN), undefined when it carries none.
    */
-  secret?: { notAfter: Date; digest: string; id?: string };
+  secret?: {
+    notAfter: Date;
+    digest: string;
+    id?: string;
+    /** The certificate expires when its CA does (a leaf never outlives its CA), #612. */
+    capped?: boolean;
+  };
   /** A forced rotation was requested (see {@link rotationRequested}). */
   forced?: boolean;
 }
@@ -124,6 +132,11 @@ export interface IdentityTransition {
   annotate?: { [SCHEDULER_TLS_ANNOTATION]: string };
   /** Set when a host renewal has stalled; names the Deployment. */
   stalled?: { type: typeof RENEWAL_STALLED; deployment: string };
+  /**
+   * Set when the certificate is due for renewal but already expires with its CA, so it is kept:
+   * the CA is approaching its expiry and must be replaced (#612).
+   */
+  caExpiring?: true;
 }
 
 const drop = ({ current }: IdentityEntry): IdentityEntry => ({ current });
@@ -155,7 +168,8 @@ export function identityTransition(
   }
   const annotate =
     observed.client === 'host' ? { [SCHEDULER_TLS_ANNOTATION]: secret.digest } : undefined;
-  if (secret.notAfter.getTime() <= now.getTime() + SCHEDULER_LEAF_RENEW_DAYS * DAY_MS)
+  const due = secret.notAfter.getTime() <= now.getTime() + SCHEDULER_LEAF_RENEW_DAYS * DAY_MS;
+  if (due && !secret.capped)
     return {
       entry: {
         current: id(),
@@ -171,6 +185,7 @@ export function identityTransition(
     reason: 'current' as const,
     ...(annotate ? { annotate } : {}),
     ...(stalled ? { stalled } : {}),
+    ...(due ? { caExpiring: true as const } : {}),
   });
   if (entry.previous === undefined) return keep(entry);
   const until = Date.parse(entry.previousUntil ?? '');
@@ -190,6 +205,8 @@ export interface RecordTransition {
   transitions: [string, IdentityTransition][];
   /** The stalled renewals, in code-unit order of their keys. */
   stalled: string[];
+  /** The keys kept because their certificate expires with its CA, in code-unit order. */
+  caExpiring: string[];
 }
 
 /**
@@ -206,11 +223,13 @@ export function recordTransition(
   const next: IdentityRecord = { ...record };
   const transitions: [string, IdentityTransition][] = [];
   const stalled: string[] = [];
+  const caExpiring: string[] = [];
   for (const key of Object.keys(observed).sort(codeUnitOrder)) {
     const t = identityTransition(record[key], observed[key] as IdentityObservation, now, random);
     next[key] = t.entry;
     transitions.push([key, t]);
     if (t.stalled) stalled.push(key);
+    if (t.caExpiring) caExpiring.push(key);
   }
-  return { record: next, transitions, stalled };
+  return { record: next, transitions, stalled, caExpiring };
 }

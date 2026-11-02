@@ -94,6 +94,11 @@ export const TENANT_OPERATOR_SECRET = PLATFORM_SECRETS.operator;
 export const SCHEDULER_IDENTITY_COMPONENT = 'scheduler-identity';
 /** The Tenant condition set while an identity cannot be issued (the CA is not ready, or a write failed). */
 export const SCHEDULER_IDENTITY_PENDING = 'SchedulerIdentityPending';
+/**
+ * The Tenant condition set while an identity's certificate is due for renewal but expires with
+ * its scheduler CA, so it is not renewed (#612): the CA must be replaced before it expires.
+ */
+export const SCHEDULER_CA_EXPIRING = 'SchedulerCaExpiring';
 
 /**
  * What the controller keeps in Tenant status: per identity kind, the rotation annotation value
@@ -143,6 +148,10 @@ export async function getIfExists<T>(api: IdentityApi, path: string): Promise<T 
   }
 }
 
+/** True when a leaf expiring at `notAfter` expires when `caCert` does: it cannot be renewed (#612). */
+export const cappedByCa = (notAfter: Date, caCert: string): boolean =>
+  notAfter.getTime() >= new Date(new X509Certificate(caCert).validTo).getTime();
+
 /**
  * What a client identity's `secret` shows on top of `base`: its expiry, digest and the ID it
  * carries, if it verifies against `caCert` with its key and names `user(id)`. A certificate that
@@ -161,12 +170,14 @@ export function observeIdentity<B extends IdentityObservation>(
     return { ...base, secret: { notAfter: new Date(0), digest: '' } };
   const dns = certificateNames(cert)?.dns ?? [];
   const id = dns.length === 1 ? issuanceIdOf(dns[0] as string) : undefined;
+  const notAfter = new Date(new X509Certificate(cert).validTo);
   return {
     ...base,
     secret: {
-      notAfter: new Date(new X509Certificate(cert).validTo),
+      notAfter,
       digest: schedulerCertDigest(cert),
       ...(id && dns[0] === user(id) ? { id } : {}),
+      ...(cappedByCa(notAfter, caCert) ? { capped: true } : {}),
     },
   };
 }
@@ -322,6 +333,8 @@ export function ownsIdentitySecret(
 export class TenantSchedulerIdentities {
   /** The pending state last logged per tenant, so each change is logged once. */
   private readonly logged = new Map<string, string>();
+  /** Tenants whose approaching scheduler CA expiry has been logged (#612). */
+  private readonly caLogged = new Set<string>();
   /**
    * Per `<tenant>/<kind>`, a rotation whose handled value the API server did not keep in status (a
    * Tenant CRD older than this controller prunes it). It is treated as handled, so it is not
@@ -347,6 +360,7 @@ export class TenantSchedulerIdentities {
   /** Drops the in-memory state of tenants no longer listed. */
   forget(listed: ReadonlySet<string>): void {
     for (const name of this.logged.keys()) if (!listed.has(name)) this.logged.delete(name);
+    for (const name of this.caLogged) if (!listed.has(name)) this.caLogged.delete(name);
     for (const key of this.unpersisted.keys())
       if (!listed.has(key.slice(0, key.lastIndexOf('/')))) this.unpersisted.delete(key);
     const keys = new Set([...listed].flatMap((t) => tenantIdentities(t).map((i) => i.key)));
@@ -365,8 +379,9 @@ export class TenantSchedulerIdentities {
     const name = tenant.metadata.name;
     let pending: Pending | undefined;
     let stalled: string | undefined;
+    let caExpiring: string | undefined;
     try {
-      ({ pending, stalled } = await this.issue(tenant, only));
+      ({ pending, stalled, caExpiring } = await this.issue(tenant, only));
     } catch (error) {
       pending = {
         reason: 'IssuanceFailed',
@@ -379,6 +394,9 @@ export class TenantSchedulerIdentities {
       else if (this.logged.has(name)) console.log(`Tenant/${name}: scheduler identities issued`);
       this.logged.set(name, state);
     }
+    if (caExpiring && !this.caLogged.has(name)) console.warn(`Tenant/${name}: ${caExpiring}`);
+    if (caExpiring) this.caLogged.add(name);
+    else this.caLogged.delete(name);
     const generation = tenant.metadata.generation ?? 1;
     const condition = (type: string, reason: string, message: string): Condition => ({
       type,
@@ -399,6 +417,7 @@ export class TenantSchedulerIdentities {
             ),
           ]
         : []),
+      ...(caExpiring ? [condition(SCHEDULER_CA_EXPIRING, 'CaExpiring', caExpiring)] : []),
     ];
   }
 
@@ -432,7 +451,7 @@ export class TenantSchedulerIdentities {
   private async issue(
     tenant: Tenant,
     only?: Kind,
-  ): Promise<{ pending?: Pending; stalled?: string }> {
+  ): Promise<{ pending?: Pending; stalled?: string; caExpiring?: string }> {
     const t = tenant.metadata.name;
     const pki = schedulerPkiNamespace(this.cfg.namespace);
     // No PKI namespace: this installation has no scheduler PKI to wait for.
@@ -646,8 +665,21 @@ export class TenantSchedulerIdentities {
           message: `The API server did not keep status.schedulerIdentity, so the Tenant CRD may predate this controller; the rotation was applied once and is not repeated`,
         }
       : waiting;
+    const expiring = identities.filter((i) => next.caExpiring.includes(i.key));
     return {
       ...(next.stalled.length > 0 ? { stalled: hosts.deployment } : {}),
+      ...(expiring.length > 0
+        ? {
+            caExpiring: `${[...new Set(expiring.map((i) => i.ca))]
+              .map(
+                (ca) =>
+                  `the scheduler ${ca} CA expires ${new X509Certificate(cas[ca].cert).validTo}`,
+              )
+              .join(
+                ', ',
+              )}; certificates it signs cannot outlive it, so they are not renewed until the CA is replaced`,
+          }
+        : {}),
       ...(pending ? { pending } : {}),
     };
   }
