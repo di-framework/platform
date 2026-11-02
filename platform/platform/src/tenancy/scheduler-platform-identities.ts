@@ -36,6 +36,7 @@
 import { X509Certificate } from 'node:crypto';
 import { COMPONENT, INSTALLATION } from './resources';
 import {
+  cappedByCa,
   deploymentPath,
   getIfExists,
   type HostDeployment,
@@ -112,6 +113,8 @@ export class PlatformSchedulerIdentities {
   private logged = '';
   /** True while the `hostgroup-default` stall has been logged and not yet cleared. */
   private stallLogged = false;
+  /** True while the platform CA's approaching expiry has been logged (#612). */
+  private caLogged = false;
   /** Per record key, how long its renewed user has waited to propagate, and which were logged. */
   private readonly waits = new PropagationWaits();
   private readonly waitLogged = new Set<string>();
@@ -210,6 +213,16 @@ export class PlatformSchedulerIdentities {
     await this.renewServer(ctx.cas, ctx.now);
     await this.rollHosts(ctx.deployment, targets);
     this.logStall(next.stalled.length > 0);
+    this.logCaExpiring(next.caExpiring.length > 0, ctx.cas.platform.cert);
+  }
+
+  /** Logs once that the platform CA caps the identities it signs, until it no longer does (#612). */
+  private logCaExpiring(expiring: boolean, ca: string): void {
+    if (expiring && !this.caLogged)
+      console.warn(
+        `Platform scheduler identities: the scheduler platform CA expires ${new X509Certificate(ca).validTo}; certificates it signs cannot outlive it, so they are not renewed until the CA is replaced`,
+      );
+    this.caLogged = expiring;
   }
 
   /** The owned, recorded platform Secrets, and their observations. */
@@ -303,7 +316,8 @@ export class PlatformSchedulerIdentities {
 
   /**
    * Re-issues the NATS server leaf in `di-scheduler-nats-tls` when it has at most
-   * {@link SCHEDULER_LEAF_RENEW_DAYS} days left or does not verify against the platform CA: same
+   * {@link SCHEDULER_LEAF_RENEW_DAYS} days left (unless it already expires with the CA, #612) or
+   * does not verify against the platform CA: same
    * CA, same Service names, and the bundle of both CAs, as the bootstrap writes it.
    */
   private async renewServer(cas: SchedulerCas, now: Date): Promise<void> {
@@ -314,11 +328,14 @@ export class PlatformSchedulerIdentities {
     );
     if (!this.owned(secret)) return;
     const cert = decode(secret.data?.['tls.crt']);
-    const valid =
-      issuedBy(cas.platform.cert, cert, decode(secret.data?.['tls.key'])) &&
-      new Date(new X509Certificate(cert).validTo).getTime() >
-        now.getTime() + SCHEDULER_LEAF_RENEW_DAYS * DAY_MS;
-    if (valid) return;
+    const valid = (pem: string) => {
+      const notAfter = new Date(new X509Certificate(pem).validTo);
+      return (
+        notAfter.getTime() > now.getTime() + SCHEDULER_LEAF_RENEW_DAYS * DAY_MS ||
+        cappedByCa(notAfter, cas.platform.cert)
+      );
+    };
+    if (issuedBy(cas.platform.cert, cert, decode(secret.data?.['tls.key'])) && valid(cert)) return;
     await this.put(
       secret,
       natsServerLeaf(namespace, cas.platform, now),

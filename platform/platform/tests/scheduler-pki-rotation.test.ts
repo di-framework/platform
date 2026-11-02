@@ -172,6 +172,33 @@ describe('scheduler identity routine renewal', () => {
   });
 });
 
+describe('scheduler identity capped by its CA (#612)', () => {
+  it('keeps a due certificate that expires with its CA and reports caExpiring', () => {
+    const capped = { ...left(20 * DAY), capped: true };
+    const t = identityTransition({ current: OLD }, host({ secret: capped }), now);
+    expect(t).toEqual({
+      entry: { current: OLD },
+      action: 'keep',
+      reason: 'current',
+      annotate: { [SCHEDULER_TLS_ANNOTATION]: 'd1' },
+      caExpiring: true,
+    });
+    const notDue = identityTransition(
+      { current: OLD },
+      operator({ secret: { ...fresh, capped: true } }),
+      now,
+    );
+    expect(notDue.caExpiring).toBeUndefined();
+    const next = recordTransition(
+      { 'a/x': { current: OLD }, 'a/y': { current: OLD } },
+      { 'a/y': operator({ secret: capped }), 'a/x': operator() },
+      now,
+    );
+    expect(next.caExpiring).toEqual(['a/y']);
+    expect(next.transitions.every(([, tr]) => tr.action === 'keep')).toBe(true);
+  });
+});
+
 describe('scheduler identity renewal overlap: operators', () => {
   it('keeps previous before previousUntil', () => {
     const t = identityTransition(renewing(1), operator(), now);

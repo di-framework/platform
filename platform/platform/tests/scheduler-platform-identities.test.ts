@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
+import { X509Certificate } from 'node:crypto';
 import { ApiError } from '../src/tenancy/controller';
 import type { Resource } from '../src/tenancy/resources';
 import {
@@ -467,5 +468,36 @@ describe('platform identity Secrets after propagation (#541 m6e-E)', () => {
     await identities.reconcile();
     expect(cert(api, PLATFORM_SECRETS.host)).not.toBe(before);
     expect(warned('has waited since')).toBe(3);
+  });
+});
+
+describe('platform identities in the CA last 30 days (#612)', () => {
+  it('issues each identity and the server leaf at most once, then writes nothing and logs once', async () => {
+    const { api, controller } = await prepare();
+    seedDeployment(api);
+    await controller.tick();
+    const ca = data(api, `/api/v1/namespaces/${PKI}/secrets/${SCHEDULER_CA_SECRET}`);
+    const caEnd = new Date(new X509Certificate(decode(ca[CA_KEYS.platform.cert])).validTo);
+    clock.now = new Date(caEnd.getTime() - 20 * DAY);
+    api.operations.length = 0;
+    await controller.tick();
+    await propagate(controller);
+    seedDeployment(api, digestOf(api, 'host'), true, digestOf(api, 'data'));
+    advance(11 * 60_000);
+    await controller.tick();
+    const writes = api.platformWrites();
+    for (const path of platformPaths)
+      expect(writes.filter((w) => w === `PUT ${path}`)).toHaveLength(1);
+    for (const role of ['operator', 'host', 'data', 'server'] as const)
+      expect(new Date(new X509Certificate(cert(api, PLATFORM_SECRETS[role])).validTo)).toEqual(
+        caEnd,
+      );
+    api.operations.length = 0;
+    for (let i = 0; i < 5; i++) {
+      advance(DAY);
+      await controller.tick();
+    }
+    expect(api.platformWrites()).toEqual([]);
+    expect(warned('the scheduler platform CA expires')).toBe(1);
   });
 });
