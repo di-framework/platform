@@ -4,10 +4,10 @@
   "type": "commonjs",
   "dependencies": {
     "@pulumi/kubernetes": "4.34.2",
-    "@pulumi/pulumi": "3.272.0"
+    "@pulumi/pulumi": "3.273.0"
   },
   "devDependencies": {
-    "@types/node": "26.6.5",
+    "@types/node": "26.6.6",
     "typescript": "~5.9.3"
   }
 }
