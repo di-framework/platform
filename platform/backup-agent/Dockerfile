@@ -1,6 +1,6 @@
 # Job image for tenant backing-service dumps and restores.
 # Publish is still local (`di-framework/backup-agent:dev`); GHCR digest pinning is a follow-on.
-FROM oven/bun:1.2.21 AS build
+FROM oven/bun:1.4.4 AS build
 WORKDIR /src
 COPY package.json ./
 COPY src ./src

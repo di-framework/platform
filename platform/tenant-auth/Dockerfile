@@ -8,14 +8,14 @@
 #   bun /app/console.js       (HTTP on TENANT_CONSOLE_PORT, default 8787)
 # Both run as the base image's `bun` user (uid/gid 1000) and work on a read-only root with a
 # writable /tmp. The environment contract is frozen in platform/tenant-auth/README.md.
-FROM --platform=$BUILDPLATFORM docker.io/oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f AS build
+FROM --platform=$BUILDPLATFORM docker.io/oven/bun:1.4.4-alpine@sha256:4cf82f5686b196504fe119db3fcd9185b191f82ece82c40680e597228ec6070a AS build
 WORKDIR /src
 COPY . .
 RUN bun install --frozen-lockfile --filter '@di-framework/tenant-auth'
 RUN bun build --target bun --outdir /out \
     platform/tenant-auth/src/controller.ts platform/tenant-auth/src/console.ts
 
-FROM docker.io/oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+FROM docker.io/oven/bun:1.4.4-alpine@sha256:4cf82f5686b196504fe119db3fcd9185b191f82ece82c40680e597228ec6070a
 LABEL org.opencontainers.image.source="https://github.com/di-framework/platform" \
       org.opencontainers.image.description="di-framework tenant-auth controller and console"
 COPY --from=build /out/controller.js /out/console.js /app/

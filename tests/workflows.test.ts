@@ -49,6 +49,11 @@ function read(path: string): string {
 function parse(path: string): Workflow {
   return Bun.YAML.parse(read(path)) as Workflow;
 }
+const isSetupBun = (s: { uses?: string }) => s.uses?.startsWith('oven-sh/setup-bun@') ?? false;
+/** The one Bun version the repository pins: ci.yml's, which every other pin follows (#608). */
+const CI_BUN_VERSION = Object.values(parse('.github/workflows/ci.yml').jobs)
+  .flatMap((job) => job.steps ?? [])
+  .find(isSetupBun)?.with?.['bun-version'];
 let tracked: string[] | undefined;
 /** The files git tracks, relative to the repository root. */
 function trackedFiles(): string[] {
@@ -738,12 +743,61 @@ describe('composite actions', () => {
   test('pin actions and the Bun version by SHA and use no stored secret', () => {
     for (const text of [open, setup, guard]) {
       expect(text).not.toContain('secrets.');
-      expect(text).toContain("bun-version: '1.4.2'");
+      expect(text).toContain(`bun-version: '${CI_BUN_VERSION}'`);
       for (const [, ref] of text.matchAll(/uses:\s+(\S+)/g)) {
         if (ref?.startsWith('./.github/actions/')) continue;
         expect(ref).toMatch(/@[0-9a-f]{40}$/);
       }
     }
+  });
+});
+
+describe('one Bun version across the repository (#608)', () => {
+  test('ci.yml pins an exact Bun version', () => {
+    expect(CI_BUN_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  test('every setup-bun step in a workflow or composite action pins that version', () => {
+    const files = [
+      ...new Bun.Glob('.github/workflows/*.yml').scanSync({ cwd: repo }),
+      ...new Bun.Glob('.github/actions/*/action.yml').scanSync({ cwd: repo }),
+    ].sort();
+    const pinned: string[] = [];
+    for (const file of files) {
+      const doc = Bun.YAML.parse(read(file)) as { jobs?: Record<string, Job>; runs?: Job };
+      const jobs = [...Object.values(doc.jobs ?? {}), ...(doc.runs ? [doc.runs] : [])];
+      for (const step of jobs.flatMap((job) => job.steps ?? []).filter(isSetupBun)) {
+        expect(step.with?.['bun-version'], file).toBe(CI_BUN_VERSION);
+        pinned.push(file);
+      }
+    }
+    // The sites #608 found drifting or unpinned.
+    expect(pinned).toContain('.github/workflows/release.yml');
+    expect(pinned).toContain('.github/workflows/pglite-component-publish.yml');
+    expect(pinned).toContain('.github/actions/open-pin-pr/action.yml');
+    const publish = parse('.github/workflows/release.yml').jobs.publish?.steps ?? [];
+    expect(publish.find(isSetupBun)?.with?.['bun-version']).toBe(CI_BUN_VERSION);
+  });
+
+  test('release.yml checks out by commit SHA in every job', () => {
+    for (const [name, job] of Object.entries(parse('.github/workflows/release.yml').jobs)) {
+      for (const step of job.steps ?? []) {
+        if (!step.uses?.startsWith('actions/checkout@')) continue;
+        expect(step.uses, name).toMatch(/^actions\/checkout@[0-9a-f]{40}$/);
+      }
+    }
+  });
+
+  test('the image Dockerfiles build on that same Bun (#608 item 4)', () => {
+    const froms = (file: string) =>
+      [...read(file).matchAll(/^FROM .*oven\/bun:(\S+)/gm)].map((m) => m[1]);
+    expect(froms('platform/backup-agent/Dockerfile')).toEqual([CI_BUN_VERSION]);
+    expect(froms('platform/backup-destination/Dockerfile')).toEqual([CI_BUN_VERSION]);
+    const alpine = froms('platform/tenant-auth/Dockerfile');
+    expect(alpine).toHaveLength(2);
+    for (const base of alpine)
+      expect(base).toMatch(new RegExp(`^${CI_BUN_VERSION}-alpine@sha256:[0-9a-f]{64}$`));
+    expect(new Set(alpine).size).toBe(1);
   });
 });
 
