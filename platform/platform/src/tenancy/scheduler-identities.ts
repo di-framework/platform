@@ -670,14 +670,12 @@ export class TenantSchedulerIdentities {
       ...(next.stalled.length > 0 ? { stalled: hosts.deployment } : {}),
       ...(expiring.length > 0
         ? {
-            caExpiring: `${[...new Set(expiring.map((i) => i.ca))]
-              .map(
+            caExpiring: caExpiringMessage(
+              [...new Set(expiring.map((i) => i.ca))].map(
                 (ca) =>
                   `the scheduler ${ca} CA expires ${new X509Certificate(cas[ca].cert).validTo}`,
-              )
-              .join(
-                ', ',
-              )}; certificates it signs cannot outlive it, so they are not renewed until the CA is replaced`,
+              ),
+            ),
           }
         : {}),
       ...(pending ? { pending } : {}),
@@ -704,4 +702,13 @@ export class TenantSchedulerIdentities {
     await putIdentityRecord(this.api, pki, stored, record);
     return true;
   }
+}
+
+/** The `SchedulerCaExpiring` message for one or more CA clauses, with matching grammar. */
+function caExpiringMessage(clauses: string[]): string {
+  const tail =
+    clauses.length === 1
+      ? 'certificates it signs cannot outlive it, so they are not renewed until the CA is replaced'
+      : 'certificates they sign cannot outlive them, so they are not renewed until the CAs are replaced';
+  return `${clauses.join(', ')}; ${tail}`;
 }

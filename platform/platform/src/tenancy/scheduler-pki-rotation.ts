@@ -13,10 +13,10 @@
  *   identity's Secret is missing. A new current ID, no previous, so the old user is revoked in the
  *   next reload.
  * - **Routine renewal**: the certificate has at most {@link SCHEDULER_LEAF_RENEW_DAYS} days left
- *   and expires before its CA does. A leaf capped at its CA's expiry is not renewed (a renewal
- *   would be capped the same way, so every tick would re-issue it, #612); the transition reports
- *   `caExpiring` instead. The scheduler CAs are not rotated yet. A new current ID, the old one kept as `previous` until `previousUntil` (now +
- *   {@link RENEWAL_OVERLAP_MS}).
+ *   and expires before its CA does. A new current ID, the old one kept as `previous` until
+ *   `previousUntil` (now + {@link RENEWAL_OVERLAP_MS}). A leaf capped at its CA's expiry is not
+ *   renewed (a renewal would be capped the same way, so every tick would re-issue it, #612); the
+ *   transition reports `caExpiring` instead. The scheduler CAs are not rotated yet (#629).
  * - **Pending issuance**: the Secret's certificate carries another ID than the recorded `current`
  *   (the record was written but issuance did not land). The certificate is re-issued for the
  *   recorded `current`; no new ID is drawn and `previous` stays, with `previousUntil` moved to now
@@ -141,6 +141,22 @@ export interface IdentityTransition {
 
 const drop = ({ current }: IdentityEntry): IdentityEntry => ({ current });
 
+/** A `keep` transition of `entry`, with only the optional fields that are set. */
+function kept(
+  entry: IdentityEntry,
+  extra: Pick<IdentityTransition, 'annotate' | 'stalled'> & { caExpiring: boolean },
+): IdentityTransition {
+  const { annotate, stalled, caExpiring } = extra;
+  return {
+    entry,
+    action: 'keep',
+    reason: 'current',
+    ...(annotate ? { annotate } : {}),
+    ...(stalled ? { stalled } : {}),
+    ...(caExpiring ? { caExpiring: true as const } : {}),
+  };
+}
+
 /** The next state of one identity entry. `random` supplies new issuance IDs. */
 export function identityTransition(
   entry: IdentityEntry | undefined,
@@ -179,14 +195,8 @@ export function identityTransition(
       action: 'issue',
       reason: 'renewal',
     };
-  const keep = (next: IdentityEntry, stalled?: IdentityTransition['stalled']) => ({
-    entry: next,
-    action: 'keep' as const,
-    reason: 'current' as const,
-    ...(annotate ? { annotate } : {}),
-    ...(stalled ? { stalled } : {}),
-    ...(due ? { caExpiring: true as const } : {}),
-  });
+  const keep = (next: IdentityEntry, stalled?: IdentityTransition['stalled']) =>
+    kept(next, { annotate, stalled, caExpiring: due });
   if (entry.previous === undefined) return keep(entry);
   const until = Date.parse(entry.previousUntil ?? '');
   const passed = Number.isNaN(until) || now.getTime() >= until;

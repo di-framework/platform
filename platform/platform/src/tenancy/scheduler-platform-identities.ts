@@ -328,14 +328,14 @@ export class PlatformSchedulerIdentities {
     );
     if (!this.owned(secret)) return;
     const cert = decode(secret.data?.['tls.crt']);
-    const valid = () => {
-      const notAfter = new Date(new X509Certificate(cert as string).validTo);
+    const valid = (pem: string) => {
+      const notAfter = new Date(new X509Certificate(pem).validTo);
       return (
         notAfter.getTime() > now.getTime() + SCHEDULER_LEAF_RENEW_DAYS * DAY_MS ||
         cappedByCa(notAfter, cas.platform.cert)
       );
     };
-    if (issuedBy(cas.platform.cert, cert, decode(secret.data?.['tls.key'])) && valid()) return;
+    if (issuedBy(cas.platform.cert, cert, decode(secret.data?.['tls.key'])) && valid(cert)) return;
     await this.put(
       secret,
       natsServerLeaf(namespace, cas.platform, now),

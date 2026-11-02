@@ -360,7 +360,7 @@ Removal therefore runs in the fixed order below. The controller never skips a st
 - **The operator after R1.** Its commands to hosts time out, because no host can connect any more. Its finalizers only delete Kubernetes objects (`host_controller.go:102-124`), so they need no host.
 
 **Lifetimes** (O3):
-- **CAs.** 10 years, rotated with the controller's existing CA machinery (`platform/platform/src/tenancy/ca-rotation.ts:13-25,140-215`). `ca_file` and each `ca.crt` carry the current and next CA.
+- **CAs.** 10 years (`SCHEDULER_CA_DAYS`, 3650 days), created once by `platform/platform/src/tenancy/scheduler-pki.ts` and not rotated today. Rotation with a current/next bundle in `ca_file` and each `ca.crt` is tracked in #629. Until then a leaf capped at its CA's expiry is not renewed; the Tenant reports `SchedulerCaExpiring` (platform identities log a warning) instead.
 - **Leaves.** 90 days, renewed when 30 days remain (`ca-rotation.ts:20`). Revocation never waits for expiry.
 - **`hostgroup-default` renewal.** It follows the host rule above: the controller rolls it first, and drops `previous` only once the rollout is observed. **U**: that Helm keeps a pod-template annotation it did not render. If Helm does not keep it, the controller restarts the Deployment by deleting its pods one at a time, under the same rule.
 - **Server renewal.** The server reloads its certificate when the reloader sees the Secret change.
