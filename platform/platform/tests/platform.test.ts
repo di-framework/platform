@@ -1,6 +1,6 @@
 import { describe, expect, it, test } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PLATFORM_SECRETS } from '../src/tenancy/scheduler-pki';
@@ -12,13 +12,9 @@ const root = join(import.meta.dir, '..');
 // Child-process helpers: a plain-HTTP fake Kubernetes API that lists the Tenants in $TENANTS (a JSON
 // array of names), or answers $TENANT_API_STATUS, and records every request path in `tenantHits`.
 // createPlatform lists the installation's Tenants with the provider kubeconfig on a real update
-// (#227). One fixed port keeps the kubeconfig, and so every command input, identical across runs.
-const TENANT_API_PORT = (() => {
-  const server = Bun.serve({ port: 0, fetch: () => new Response() });
-  const port = server.port;
-  server.stop(true);
-  return port;
-})();
+// (#227). Each child binds port 0 and writes the port it got into `tenantApiKubeconfig` (and into
+// $TENANT_API_KUBECONFIG_FILE when set), so no run can collide on a pre-picked port (#609).
+const TENANT_API_PORT = '__TENANT_API_PORT__';
 const TENANT_API_KUBECONFIG = [
   'apiVersion: v1',
   'kind: Config',
@@ -42,7 +38,8 @@ const TENANT_API_KUBECONFIG = [
 const TENANT_API = `
   const http = require('http');
   const tenantHits = [];
-  const tenantApiKubeconfig = ${JSON.stringify(TENANT_API_KUBECONFIG)};
+  let tenantApiKubeconfig;
+  let tenantApiUrl;
   function startTenantApi() {
     const server = http.createServer((req, res) => {
       tenantHits.push(req.url);
@@ -54,7 +51,13 @@ const TENANT_API = `
       if (res.statusCode !== 200) return res.end('{"kind":"Status","message":"secret detail"}');
       res.end(JSON.stringify({ items: JSON.parse(process.env.TENANTS || '[]').map(name => ({ metadata: { name } })) }));
     });
-    return new Promise(resolve => server.listen(${TENANT_API_PORT}, '127.0.0.1', () => { server.unref(); resolve(); }));
+    return new Promise(resolve => server.listen(0, '127.0.0.1', () => {
+      server.unref();
+      tenantApiUrl = 'http://127.0.0.1:' + server.address().port;
+      tenantApiKubeconfig = ${JSON.stringify(TENANT_API_KUBECONFIG)}.replace(${JSON.stringify(TENANT_API_PORT)}, String(server.address().port));
+      if (process.env.TENANT_API_KUBECONFIG_FILE) require('fs').writeFileSync(process.env.TENANT_API_KUBECONFIG_FILE, tenantApiKubeconfig);
+      resolve();
+    }));
   }
 `;
 
@@ -554,8 +557,8 @@ test('a valid tenant host allowlist still installs the kube-router network polic
 }, 60_000);
 
 test('existing entrypoint derives the route pattern from a loopback HTTP endpoint', () => {
+  // The child writes the kubeconfig once its fake Tenant API has bound a port.
   const kubeconfigFile = join(mkdtempSync(join(tmpdir(), 'existing-')), 'config');
-  writeFileSync(kubeconfigFile, TENANT_API_KUBECONFIG);
   const run = (config: Record<string, string>) =>
     JSON.parse(
       execFileSync(
@@ -580,7 +583,11 @@ test('existing entrypoint derives the route pattern from a loopback HTTP endpoin
     startTenantApi().then(() => pulumi.runtime.runInPulumiStack(async () => require('./dist/existing').routeUrlPattern)).then((pattern) => console.log(JSON.stringify(pattern ?? null))).catch(e => {console.error(e);process.exitCode=1;});
   `,
         ],
-        { cwd: root, encoding: 'utf8' },
+        {
+          cwd: root,
+          encoding: 'utf8',
+          env: { ...process.env, TENANT_API_KUBECONFIG_FILE: kubeconfigFile },
+        },
       ),
     );
   expect(run({ httpEndpoint: 'http://127.0.0.1:28089' })).toBe(
@@ -827,6 +834,7 @@ test('local entrypoint retains existing logical names and guarded Docker cleanup
   expect(existing).toContain('export const kubeconfigs = platform.kubeconfigs;');
 });
 
+// The fake Tenant API's bound port is written back as the placeholder, so two runs compare equal.
 function localResources(config: Record<string, string> = {}) {
   const output = execFileSync(
     'node',
@@ -841,7 +849,7 @@ function localResources(config: Record<string, string> = {}) {
       newResource: a => { resources.push(a); return {id:a.name, state:{...a.inputs, stdout:tenantApiKubeconfig, metadata:{...a.inputs.metadata, name:a.inputs.metadata?.name ?? a.name}}}; },
       call: a => a.inputs,
     }, 'project', 'test', false);
-    startTenantApi().then(() => pulumi.runtime.runInPulumiStack(() => require('./dist/local'))).then(async () => { await pulumi.runtime.disconnect(); console.log(JSON.stringify(resources)); }).catch(e => {console.error(e);process.exitCode=1;});
+    startTenantApi().then(() => pulumi.runtime.runInPulumiStack(() => require('./dist/local'))).then(async () => { await pulumi.runtime.disconnect(); console.log(JSON.stringify(resources).replaceAll(tenantApiUrl, ${JSON.stringify(`http://127.0.0.1:${TENANT_API_PORT}`)})); }).catch(e => {console.error(e);process.exitCode=1;});
   `,
     ],
     { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
