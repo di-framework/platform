@@ -404,10 +404,11 @@ interface OpenPr {
   headRefName: string;
   author: { login: string };
 }
+/** A PR the token's user opened (the stub `gh api user` below answers `pin-bot`, #239). */
 const botPr = (number: number, headRefName: string): OpenPr => ({
   number,
   headRefName,
-  author: { login: 'app/github-actions' },
+  author: { login: 'pin-bot' },
 });
 
 describe('.github/actions/open-pin-pr against a local origin', () => {
@@ -452,15 +453,16 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
       return first;
     });
     const bin = join(base, 'bin');
-    // A fake gh that records its arguments. `pr list` answers from $OPEN_PRS, a JSON list of
-    // {number, headRefName, author: {login}}, the way the real one does: `--head` is an exact
-    // match, except that `--author` switches to search, where `--head` is a prefix match. The
-    // `--jq` filter is applied with the caller's environment.
+    // A fake gh that records its arguments. `api user` is the token's user, `pin-bot`. `pr list`
+    // answers from $OPEN_PRS, a JSON list of {number, headRefName, author: {login}}, the way the
+    // real one does: `--head` is an exact match, except that `--author` switches to search, where
+    // `--head` is a prefix match. The `--jq` filter is applied with the caller's environment.
     stubCommand(
       bin,
       'gh',
       [
         `printf '%s\\n' "$*" >> "${base}/gh.log"`,
+        'if [[ "$1 $2" == "api user" ]]; then echo pin-bot; exit 0; fi',
         '[[ "$1 $2" == "pr list" ]] || exit 0',
         'head="" filter="." search=false',
         'while (( $# )); do',
@@ -514,6 +516,8 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
       run,
       pinOnMain,
       ghCalls,
+      /** The gh calls that could change something: all but the read-only lookups. */
+      ghWrites: () => ghCalls().filter((c) => !/^(pr list|api user)\b/.test(c)),
       /** A fresh checkout of the run's commit, as the next workflow run gets. */
       fresh: () => git(work, 'checkout', '-q', '-f', '--detach', first),
       branches: () => git(base, '--git-dir', origin, 'branch', '--list'),
@@ -549,7 +553,10 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
     expect(gh).toContain('pr list --head bot/pin-wash');
     expect(gh).toContain('pr create --base main --head bot/pin-wash');
     const body = readFileSync(join(box.base, 'pin-pr-body.md'), 'utf8');
-    expect(body).toContain('A maintainer has to approve and run this PR');
+    expect(body).toContain(
+      'Opened with the `BOT_PR_TOKEN` repository secret, so its checks start by themselves',
+    );
+    expect(body).not.toMatch(/approve and run|close and reopen/i);
   }, 20_000);
 
   test('a single pin is titled "chore: pin <artifact> to <digest>"', () => {
@@ -590,10 +597,11 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
     expect(result.stdout.toString()).toContain('Already pinned');
     expect(box.branches()).not.toContain('bot/pin-wash');
     // Only the read-only lookup of an open bot PR; nothing is opened, edited or closed.
-    expect(box.ghCalls().filter((c) => !c.startsWith('pr list'))).toEqual([]);
-    expect(box.ghCalls()).toHaveLength(1);
-    expect(box.ghCalls()[0]).toStartWith('pr list --head bot/pin-wash --base main --state open');
-    expect(box.ghCalls()[0]).not.toContain('--author');
+    expect(box.ghWrites()).toEqual([]);
+    const lists = box.ghCalls().filter((c) => c.startsWith('pr list'));
+    expect(lists).toHaveLength(1);
+    expect(lists[0]).toStartWith('pr list --head bot/pin-wash --base main --state open');
+    expect(lists[0]).not.toContain('--author');
   }, 20_000);
 
   test('main already pinned: an open pin PR for another build is closed with its branch (#173 W1)', () => {
@@ -645,7 +653,7 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
     const pinned = sandbox();
     pinned.pinOnMain('pglite-component', DIGEST);
     expect(pinned.run(`pglite-component ${DIGEST}`, 'push', others).exitCode).toBe(0);
-    expect(pinned.ghCalls().filter((c) => !c.startsWith('pr list'))).toEqual([]);
+    expect(pinned.ghWrites()).toEqual([]);
     const fresh = sandbox();
     const result = fresh.run(`pglite-component ${DIGEST}`, 'push', others);
     expect(result.exitCode, result.stderr.toString()).toBe(0);
@@ -660,7 +668,7 @@ describe('.github/actions/open-pin-pr against a local origin', () => {
     const box = sandbox();
     box.pinOnMain('pglite-component', DIGEST);
     expect(box.run(`pglite-component ${DIGEST}`, 'push', human).exitCode).toBe(0);
-    expect(box.ghCalls().filter((c) => !c.startsWith('pr list'))).toEqual([]);
+    expect(box.ghWrites()).toEqual([]);
     const fresh = sandbox();
     fresh.run(`pglite-component ${DIGEST}`, 'push', human);
     expect(fresh.ghCalls().some((c) => /^pr (edit|close) 5\b/.test(c))).toBe(false);

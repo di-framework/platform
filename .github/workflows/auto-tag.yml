@@ -2,9 +2,9 @@ name: Auto Tag
 
 # Two jobs, so no run waits for the release PR to merge (#214):
 #   tag         tags the merge commit of a release PR and dispatches release.yml. It runs when a
-#               release/v* PR is merged, on a schedule (every 30 minutes) to tag releases merged
-#               by GITHUB_TOKEN (which fire no push or pull_request events), and before release-pr
-#               in every other run. Idempotent: when the tag already exists at the release commit
+#               release/v* PR is merged, on a schedule (every 30 minutes) to tag a release whose
+#               merge run was lost, and before release-pr in every other run. Idempotent: when
+#               the tag already exists at the release commit
 #               it only dispatches release.yml again if no Release run exists for the tag. Tag jobs
 #               of all runs share one concurrency group, so they run one at a time (#485). A
 #               scheduled run when nothing needs tagging exits quietly (action=none). Schedules
@@ -13,10 +13,12 @@ name: Auto Tag
 #   release-pr  bumps the version, updates bun.lock, opens the release PR and enables
 #               auto-merge, then exits. Never runs on schedule or on a tag_only dispatch.
 #
-# What publishes a release: merging the release PR. Release PRs opened and auto-merged with
-# GITHUB_TOKEN fire no `push` or `pull_request` events, so the scheduled tag job catches them
-# within about 30 minutes. The tag job then tags the commit and dispatches release.yml (which
-# reads the tag and publishes). Use `tag_only: true` to tag and release sooner.
+# What publishes a release: merging the release PR. The release branch is pushed, the PR opened
+# and auto-merge enabled with BOT_PR_TOKEN, a user's fine-grained token (contents and
+# pull-requests on this repository), not GITHUB_TOKEN, whose pushes and PRs fire no events (#239):
+# the PR's CI starts on its own, and its merge fires the pull_request run that tags it. The
+# scheduled tag job is the fallback for a lost run. The tag job tags the commit and dispatches
+# release.yml (which reads the tag and publishes). Use `tag_only: true` to tag and release sooner.
 #
 # Recovery: dispatch this workflow with `tag_only: true`. It runs only the tag job: it tags the
 # version on main if needed and dispatches release.yml if no Release run exists for the tag. It
@@ -238,10 +240,13 @@ jobs:
       contents: write # push the release branch
       pull-requests: write # open the PR and enable auto-merge
     steps:
+      # No persisted credential: the push and the PR use BOT_PR_TOKEN in the last step only, and
+      # the fetches in between are anonymous (the repository is public).
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       # The same Node as the Headlamp plugin's CI job (ci.yml): the release PR packs the plugin
       # and records its sha256, and the gzip bytes come from Node's zlib (#435).
@@ -290,9 +295,9 @@ jobs:
           echo "branch=release/v$NEXT" >> "$GITHUB_OUTPUT"
           echo "Bumping $CURRENT -> $NEXT ($BUMP)"
 
-      # Bumps, packs the Headlamp plugin and commits without GH_TOKEN in the environment: the
-      # plugin's build tooling never sees the token (#435). Only the next step pushes and opens
-      # the PR with it.
+      # Bumps, packs the Headlamp plugin and commits without a token in the environment or the
+      # git config: the plugin's build tooling never sees one (#435). Only the next step pushes
+      # and opens the PR, with BOT_PR_TOKEN.
       - name: Bump versions and commit the release
         env:
           NEXT: ${{ steps.version.outputs.next }}
@@ -350,15 +355,22 @@ jobs:
           fi
           git commit -m "chore(release): v$NEXT"
 
+      # BOT_PR_TOKEN, a user's token, so the push and the PR fire the events that start the PR's
+      # CI and, on auto-merge, the pull_request run that tags the release (#239). GITHUB_TOKEN
+      # fires none. The git push authenticates through the same github.com-scoped header
+      # scripts/source-check.ts uses, never on the command line.
       - name: Open release PR
         id: pr
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.BOT_PR_TOKEN }}
           NEXT: ${{ steps.version.outputs.next }}
           CURRENT: ${{ steps.version.outputs.current }}
           BRANCH: ${{ steps.version.outputs.branch }}
         run: |
           set -euo pipefail
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          export GIT_CONFIG_VALUE_0
 
           # Refresh remote-tracking ref so --force-with-lease can replace a stale branch
           git fetch origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" 2>/dev/null || true
@@ -378,9 +390,12 @@ jobs:
                 "(\`mx build --sync-versions\`, packed-manifest audit, and" \
                 "\`npm publish --dry-run\`) before merge." \
                 "" \
-                "Merging this PR publishes \`v$NEXT\`: on merge, Auto Tag's scheduled tag job" \
-                "(every 30 minutes) tags the commit and dispatches the Release workflow. To tag" \
-                "and release sooner, dispatch Auto Tag with \`tag_only: true\`.")" \
+                "Merging this PR publishes \`v$NEXT\`: on merge, Auto Tag's tag job tags the" \
+                "commit and dispatches the Release workflow (its scheduled run, every 30 minutes," \
+                "catches a lost merge run; \`tag_only: true\` tags and releases sooner)." \
+                "" \
+                "Opened with the \`BOT_PR_TOKEN\` repository secret, so its checks start by" \
+                "themselves and auto-merge is enabled.")" \
               --base main \
               --head "$BRANCH"
             PR=$(gh pr view "$BRANCH" --json number --jq .number)
@@ -397,4 +412,4 @@ jobs:
 
           echo "### Release PR" >> "$GITHUB_STEP_SUMMARY"
           echo "Opened/updated PR #$PR for \`v$NEXT\`." >> "$GITHUB_STEP_SUMMARY"
-          echo "Auto-merges after the required checks pass; the tag job tags the merge." >> "$GITHUB_STEP_SUMMARY"
+          echo "Its checks start on their own (opened with BOT_PR_TOKEN); it auto-merges after they pass, and the tag job tags the merge." >> "$GITHUB_STEP_SUMMARY"

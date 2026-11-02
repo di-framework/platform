@@ -406,8 +406,7 @@ before `merge` moves the tags (so "Re-run failed jobs" on an older run is caught
 pin step, and the build job checks it too, so a stale re-run leaves the `buildcache-*` tags alone.
 A dispatch always builds. Each variant merges on its own, so one variant's failed build
 does not hold back the other; to publish and pin the failed variant, dispatch the workflow for it.
-GitHub does not run workflows on a PR that
-`GITHUB_TOKEN` opened, so a maintainer has to start its checks (close and reopen it) before merging.
+The PR is opened with the `BOT_PR_TOKEN` repository secret, so its checks start by themselves.
 
 Latest published images (multi-arch index digests; the bot PR keeps this table current):
 

@@ -31,7 +31,7 @@
 #
 # Permissions: workflow default contents: read. check-source reads packages; build and merge push
 # (packages: write). Only pin holds contents: write and pull-requests: write.
-# Auth is GITHUB_TOKEN. No registry secret is stored.
+# Registry auth is GITHUB_TOKEN. The only stored secret, BOT_PR_TOKEN, opens the pin PR (#239).
 name: Publish platform operator image
 
 on:
@@ -325,6 +325,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Open pin PR
         uses: ./.github/actions/open-pin-pr
@@ -332,4 +334,4 @@ jobs:
           name: platform-operator
           workflow: .github/workflows/platform-operator-image.yml
           pins: platform-operator ${{ needs.merge.outputs.digest || needs.check-source.outputs.digest }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.BOT_PR_TOKEN }}

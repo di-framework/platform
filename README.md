@@ -48,10 +48,12 @@ make smoke
 Merging the release PR is what publishes a release.
 
 1. A lockfile change on `main` (or a dispatch of **Auto Tag**) opens a `release/vX.Y.Z` PR with the version bump and enables auto-merge. The run then ends; it does not wait for the PR.
-2. Approve the PR's checks when GitHub holds them for approval. Once they pass, the PR merges.
-3. Auto Tag's `tag` job tags the merge commit as `vX.Y.Z` and dispatches `release.yml`, which publishes to npm and creates the GitHub Release. If the PR was merged by a person, the tag job runs immediately. If merged by `GITHUB_TOKEN` (auto-merge), the scheduled tag job catches it within about 30 minutes.
+2. The PR's checks start by themselves. Once they pass, the PR merges.
+3. Auto Tag's `tag` job tags the merge commit as `vX.Y.Z` and dispatches `release.yml`, which publishes to npm and creates the GitHub Release. The tag job runs immediately on the merge, whether a person or auto-merge did it; the scheduled tag job catches a release whose merge run was lost within about 30 minutes.
 
 The `tag` job only tags a commit that is the merge of a `release/vX.Y.Z` PR from this repository and that sets version `X.Y.Z`.
+
+Bot PRs (`release/v*`, `bot/pin-*`, `bot/operator-project`) are pushed and opened with the `BOT_PR_TOKEN` repository secret, a fine-grained token with Contents and Pull requests read/write on this repository only, so CI starts on them by itself (GitHub starts no workflow for pushes or PRs made with `GITHUB_TOKEN`). When that token expires, the step that pushes the branch or opens the PR fails with a 401 or 403: create a new token with the same scopes and replace the secret.
 
 Recovery: dispatch **Auto Tag** with `tag_only: true` to tag and release sooner. It tags the version on `main` if it is untagged, and dispatches `release.yml` if no Release run exists for that tag. It does not open a new release PR. If the scheduled tag job has been disabled by GitHub (after 60 days of inactivity), re-enable it first via the Actions tab or `gh workflow enable auto-tag.yml -R di-framework/platform`, then dispatch with `tag_only: true`. A Release run that exists but failed is not retried this way; re-run it from the Actions tab.
 

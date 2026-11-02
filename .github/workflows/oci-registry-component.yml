@@ -212,6 +212,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Open pin PR
         uses: ./.github/actions/open-pin-pr
@@ -219,4 +221,4 @@ jobs:
           name: oci-registry
           workflow: .github/workflows/oci-registry-component.yml
           pins: oci-registry ${{ needs.publish.outputs.digest || needs.check-source.outputs.digest }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.BOT_PR_TOKEN }}
