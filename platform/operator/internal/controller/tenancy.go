@@ -17,7 +17,7 @@ import (
 // is empty: the platform's exclusive host variant (patches 0001-0003), which the PGlite
 // exclusive-PGDATA workloads need. scripts/pin-artifact.ts moves it with the
 // wash-wasi-tls-exclusive pin.
-const DefaultTenantHostImage = "ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:6fea016378c3c6313427f2d6df0fed5ca369ab8f5676eb49d99844625312bb80"
+const DefaultTenantHostImage = "ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:fb1d4bd2d4cd2e3a9fd6b611121bdac26d1b5ca95896e5a4acfbb35439dc0465"
 
 // TenantAuthSecretName is the Secret, in the target's platform namespace, that holds the copy of
 // spec.platform.tenantAuth.clientSecretRef the install writes (key clientSecret).
