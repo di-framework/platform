@@ -16,6 +16,20 @@ const sortKeys = (value: unknown): unknown => {
   );
 };
 
+/** Tiny RFC 7386 merge for the fake: null deletes, objects merge, arrays and scalars replace. */
+const applyMergePatch = (base: unknown, patch: unknown): unknown => {
+  if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) return patch;
+  const result: Record<string, unknown> =
+    typeof base === 'object' && base !== null && !Array.isArray(base)
+      ? { ...(base as Record<string, unknown>) }
+      : {};
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === null) delete result[k];
+    else result[k] = applyMergePatch(result[k], v);
+  }
+  return result;
+};
+
 const userPath = `${collection(VERSION, 'User')}/bob`;
 
 /**
@@ -31,10 +45,10 @@ class SortedApi extends MemoryApi {
     const result = await super.call<T>(method, path, body);
     if (method === 'PATCH' && path.endsWith('/status')) {
       const target = path.replace(/\/status$/, '');
-      const merged = mergePatch(
+      const merged = applyMergePatch(
         (before as { status?: object } | undefined)?.status,
-        (body as { status: object }).status,
-      );
+        JSON.parse(JSON.stringify(body)).status,
+      ) as object;
       const object = this.objects.get(target) as { status?: object };
       object.status = merged;
       (result as { status?: object }).status = merged;
@@ -129,6 +143,7 @@ describe('mergePatch', () => {
     expect(mergePatch<unknown>(undefined, { a: { b: null, c: 1 } })).toEqual({ a: { c: 1 } });
     expect(mergePatch<unknown>([1], { a: 1 })).toEqual({ a: 1 });
     expect(mergePatch<unknown>({ a: 1 }, 'x')).toBe('x');
+    expect(mergePatch<unknown>({ a: 1, b: 2 }, { a: undefined, b: 3 })).toEqual({ a: 1, b: 3 });
   });
 });
 

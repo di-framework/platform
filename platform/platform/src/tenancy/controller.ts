@@ -3601,7 +3601,7 @@ export function reportFatal(
   status.exitCode = 1;
 }
 
-/** RFC 7386 merge patch: `null` deletes a key, objects merge, anything else replaces. */
+/** RFC 7386 merge patch: `null` deletes a key, `undefined` members are skipped (JSON drops them), objects merge, anything else replaces. */
 export function mergePatch<T>(base: T | undefined, patch: unknown): T {
   if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) return patch as T;
   const result: Record<string, unknown> =
@@ -3609,6 +3609,7 @@ export function mergePatch<T>(base: T | undefined, patch: unknown): T {
       ? { ...(base as Record<string, unknown>) }
       : {};
   for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined) continue;
     if (v === null) delete result[k];
     else result[k] = mergePatch(result[k], v);
   }
