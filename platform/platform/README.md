@@ -751,9 +751,9 @@ its own NATS account and its own runtime operator.
 - Two CAs are kept in `<platform-ns>-scheduler-pki`, in Secret `di-scheduler-ca`. No pod mounts its
   Secrets or ConfigMaps. The platform scheduler CA signs the server, the platform operator and host group, the
   data connection and every tenant operator. The tenant scheduler CA signs tenant hosts only, and is
-  name-constrained to their names. CAs last 10 years. Leaves last 90 days and are renewed when 30
-  days remain, for platform identities too, unless the leaf already expires with its CA (see
-  "CA expiry" below).
+  name-constrained to their names. CAs last 10 years and are rotated before they expire (see "CA
+  rotation" below). Leaves last 90 days and are renewed when 30 days remain, for platform
+  identities too, unless the leaf already expires with its CA (see "CA expiry" below).
 
 ### Identities
 
@@ -798,12 +798,20 @@ Renewal and rotation:
   propagation wait above. Platform identities are renewed on the 90-day schedule but are not force-rotated, so
   do not delete their Secrets: the bootstrap Job creates them, and the controller does not
   recreate a deleted one.
+- **CA rotation.** The controller rotates each scheduler CA through a current/next set kept in
+  `di-scheduler-ca` (keys `<kind>-ca.*`, `<kind>-next-ca.*` and `<kind>-previous-ca.crt`). 90 days
+  before a CA expires it publishes a successor. The server's `ca.crt` (its `ca_file`) carries every
+  CA of both sets at once, and each client Secret's `ca.crt` carries the platform set, delivered
+  by a routine renewal so hosts roll onto it. 30 days later the successor signs: every leaf the old
+  CA signed, the server's included, is renewed once against it, and the old CA stays trusted until
+  it expires, then leaves the bundles. A rotation the controller cannot write is logged and retried
+  on every pass; renewal goes on under the CA that still signs.
 - **CA expiry.** A leaf cannot outlive the CA that signs it, so in a scheduler CA's last 30 days a
   renewed leaf would be capped at the CA's expiry and due again at once. A leaf that already
-  expires with its CA is therefore kept, not renewed. The Tenant reports `SchedulerCaExpiring` with
-  reason `CaExpiring`, naming the CA and its expiry. Platform identities log one warning instead;
-  a capped NATS server leaf is kept silently. The scheduler CAs are not rotated yet; when a CA is
-  replaced, the leaves are re-issued from it and the condition clears.
+  expires with its CA is therefore kept, not renewed. This happens only while a rotation cannot be
+  written. The Tenant reports `SchedulerCaExpiring` with reason `CaExpiring`, naming the CA and its
+  expiry. Platform identities log one warning instead; a capped NATS server leaf is kept silently.
+  Once the successor signs, the leaves are renewed against it and the condition clears.
 
 ### Per-tenant operators
 

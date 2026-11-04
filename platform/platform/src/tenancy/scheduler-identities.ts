@@ -25,11 +25,16 @@
  *   Such a Secret is deleted before the record that drops its user is written, so a failure at any
  *   later step leaves no Secret holding a user the accounts file no longer names. A wait longer
  *   than {@link PROPAGATION_OVERDUE_MS} is reported as `WaitingForAccounts`.
+ * - **CA rotation (#629).** {@link loadSchedulerCas} advances the rotation of both scheduler CAs
+ *   before anything is observed, writing `di-scheduler-ca` when it changes. Each Secret's `ca.crt`
+ *   carries the whole platform CA set, so a client trusts a published successor before it signs.
+ *   A certificate from a CA that no longer signs, or whose bundle lacks a CA of the set, is renewed.
  *
  * Inert until the cut-over (m6e): no pod mounts these Secrets yet. CA keys are held in memory only
  * for signing, and nothing here logs a key, a certificate or an issuance ID.
  */
 import { X509Certificate } from 'node:crypto';
+import type { ControllerCas } from './ca-rotation';
 import {
   COMPONENT,
   type Condition,
@@ -44,19 +49,23 @@ import {
 } from './resources';
 import { SCHEDULER_ACCOUNTS_CONDITION, SCHEDULER_NATS_ACCOUNTS } from './scheduler-nats';
 import {
-  CA_KEYS,
   IDENTITIES_KEY,
   type IdentityEntry,
   type IdentityRecord,
+  nextSchedulerCas,
   PLATFORM_SECRETS,
   parseIdentityRecord,
+  readSchedulerCaSet,
   SCHEDULER_CA_SECRET,
   SCHEDULER_IDENTITIES,
   SCHEDULER_LEAF_DAYS,
   type SchedulerCaKind,
-  schedulerCaFault,
+  type SchedulerCas,
+  schedulerCaData,
+  schedulerClientBundle,
   schedulerPkiNamespace,
   serializeIdentityRecord,
+  storedSchedulerCas,
   tenantHostUser,
   tenantIdentity,
   tenantOperatorUser,
@@ -76,7 +85,7 @@ import {
 import { AccountsPropagation, type Propagation, PropagationWaits } from './scheduler-propagation';
 import { TENANT_OPERATOR_PROPAGATION_MS } from './tenant-operator';
 import { operatorNamespace } from './tenant-operator-names';
-import { certificateNames, issuedBy, type KeyPair, leafCertificate } from './tls';
+import { certificateNames, issuedBy, leafCertificate } from './tls';
 
 /** The Kubernetes API calls issuance makes; the controller's `KubernetesApi` is one. */
 export interface IdentityApi {
@@ -96,7 +105,8 @@ export const SCHEDULER_IDENTITY_COMPONENT = 'scheduler-identity';
 export const SCHEDULER_IDENTITY_PENDING = 'SchedulerIdentityPending';
 /**
  * The Tenant condition set while an identity's certificate is due for renewal but expires with
- * its scheduler CA, so it is not renewed (#612): the CA must be replaced before it expires.
+ * its scheduler CA, so it is not renewed (#612). The CA rotation (#629) replaces a CA long before
+ * that, so this is set only while a rotation cannot be written; it clears once the successor signs.
  */
 export const SCHEDULER_CA_EXPIRING = 'SchedulerCaExpiring';
 
@@ -152,22 +162,48 @@ export async function getIfExists<T>(api: IdentityApi, path: string): Promise<T 
 export const cappedByCa = (notAfter: Date, caCert: string): boolean =>
   notAfter.getTime() >= new Date(new X509Certificate(caCert).validTo).getTime();
 
+const PEM_CERTIFICATE = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g;
+/** The SHA-256 fingerprints of the certificates in the PEM `bundle`; unparseable blocks are skipped. */
+function fingerprints(bundle: string): Set<string> {
+  return new Set(
+    (bundle.match(PEM_CERTIFICATE) ?? []).flatMap((pem) => {
+      try {
+        return [new X509Certificate(pem).fingerprint256];
+      } catch {
+        return [];
+      }
+    }),
+  );
+}
+/** True when the PEM bundle `held` contains every certificate of `wanted`, in any order (#629). */
+export const bundleTrusts = (held: string, wanted: string): boolean => {
+  const have = fingerprints(held);
+  return [...fingerprints(wanted)].every((print) => have.has(print));
+};
+
 /**
  * What a client identity's `secret` shows on top of `base`: its expiry, digest and the ID it
- * carries, if it verifies against `caCert` with its key and names `user(id)`. A certificate that
- * does not verify carries no usable ID, so it is re-issued for the recorded one.
+ * carries, if it verifies with its key against a CA of `cas` that may have signed it (`current`,
+ * or `previous` during a rotation) and names `user(id)`. A certificate that does not verify carries
+ * no usable ID, so it is re-issued for the recorded one. One that `current` did not sign, or whose
+ * `ca.crt` lacks a certificate of `trust`, is `stale` and renewed (#629).
  */
 export function observeIdentity<B extends IdentityObservation>(
   base: B,
   secret: { data?: Record<string, string> } | undefined,
-  caCert: string,
+  cas: ControllerCas,
   user: (id: string) => string,
+  trust: string,
 ): B {
   if (!secret) return { ...base, secret: undefined };
   const cert = decode(secret.data?.['tls.crt']) ?? '';
   const key = decode(secret.data?.['tls.key']) ?? '';
-  if (!issuedBy(caCert, cert, key))
-    return { ...base, secret: { notAfter: new Date(0), digest: '' } };
+  const signer = [cas.current.cert, cas.previous].find(
+    (ca): ca is string => ca !== undefined && issuedBy(ca, cert, key),
+  );
+  if (!signer) return { ...base, secret: { notAfter: new Date(0), digest: '' } };
+  const stale =
+    signer !== cas.current.cert || !bundleTrusts(decode(secret.data?.['ca.crt']) ?? '', trust);
   const dns = certificateNames(cert)?.dns ?? [];
   const id = dns.length === 1 ? issuanceIdOf(dns[0] as string) : undefined;
   const notAfter = new Date(new X509Certificate(cert).validTo);
@@ -177,7 +213,8 @@ export function observeIdentity<B extends IdentityObservation>(
       notAfter,
       digest: schedulerCertDigest(cert),
       ...(id && dns[0] === user(id) ? { id } : {}),
-      ...(cappedByCa(notAfter, caCert) ? { capped: true } : {}),
+      ...(cappedByCa(notAfter, signer) ? { capped: true } : {}),
+      ...(stale ? { stale: true } : {}),
     },
   };
 }
@@ -236,36 +273,70 @@ export async function observeHostRollout(
   return hostRolloutOf(value, deployment);
 }
 
-/** The scheduler CAs, or why they cannot sign yet. */
-export type SchedulerCasRead = Record<SchedulerCaKind, KeyPair> | Pending;
+/**
+ * The scheduler CA sets to sign and trust with, or why they cannot sign yet. `rotationFailed` says
+ * why a due rotation was not written; `cas` is then the sets as stored.
+ */
+export type SchedulerCasRead = { cas: SchedulerCas; rotationFailed?: string } | Pending;
 
 /**
- * Both scheduler CAs from `<namespace>-scheduler-pki/di-scheduler-ca`, or why they cannot sign
- * yet. Key material stays in memory and out of every message.
+ * Both scheduler CA sets from `<namespace>-scheduler-pki/di-scheduler-ca`, after one rotation pass
+ * at `now` ({@link nextSchedulerCas}, #629), or why they cannot sign yet. A pass that changes a set
+ * (publishes a successor, switches to it, retires the old CA, or drops an unusable successor) is
+ * written under the resourceVersion it was read with, before any of it signs or is trusted: a CA
+ * whose key was never stored never signs. When that write fails, what is stored still signs and
+ * the rotation is retried on the next call. Key material stays in memory and out of every message.
  */
-export async function readSchedulerCas(
+export async function loadSchedulerCas(
   api: IdentityApi,
   namespace: string,
   now: Date,
 ): Promise<SchedulerCasRead> {
   const pki = schedulerPkiNamespace(namespace);
-  const secret = await getIfExists<Stored>(api, secretPath(pki, SCHEDULER_CA_SECRET));
+  const path = secretPath(pki, SCHEDULER_CA_SECRET);
+  const secret = await getIfExists<Stored>(api, path);
   if (!secret)
     return {
       reason: 'CaNotReady',
       message: `Waiting for the scheduler PKI bootstrap Job to create ${pki}/${SCHEDULER_CA_SECRET}`,
     };
-  const cas = {} as Record<SchedulerCaKind, KeyPair>;
-  for (const kind of ['platform', 'tenant'] as const) {
-    const ca = {
-      cert: decode(secret.data?.[CA_KEYS[kind].cert]),
-      key: decode(secret.data?.[CA_KEYS[kind].key]),
+  const sets = (
+    read: (kind: SchedulerCaKind) => ControllerCas | string,
+  ): SchedulerCas | Pending => {
+    const cas = {} as SchedulerCas;
+    for (const kind of ['platform', 'tenant'] as const) {
+      const set = read(kind);
+      if (typeof set === 'string')
+        return { reason: 'CaNotReady', message: `${pki}/${SCHEDULER_CA_SECRET}: ${set}` };
+      cas[kind] = set;
+    }
+    return cas;
+  };
+  const stored = (kind: SchedulerCaKind) => storedSchedulerCas(secret.data, kind);
+  const rotated = sets((kind) => nextSchedulerCas(kind, namespace, stored(kind), now));
+  if ('reason' in rotated) return rotated;
+  const data: Record<string, string> = { ...secret.data };
+  for (const kind of ['platform', 'tenant'] as const)
+    for (const [key, value] of Object.entries(schedulerCaData(kind, rotated[kind])))
+      if (value === undefined) delete data[key];
+      else data[key] = value;
+  const before = secret.data ?? {};
+  const changed =
+    Object.keys(data).length !== Object.keys(before).length ||
+    Object.entries(data).some(([key, value]) => before[key] !== value);
+  if (!changed) return { cas: rotated };
+  try {
+    await api.call('PUT', path, { apiVersion: 'v1', kind: 'Secret', ...secret, data });
+    return { cas: rotated };
+  } catch (error) {
+    const asStored = sets((kind) => readSchedulerCaSet(kind, namespace, stored(kind), now));
+    if ('reason' in asStored) return asStored;
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      cas: asStored,
+      rotationFailed: `rotating ${pki}/${SCHEDULER_CA_SECRET} failed: ${message}`,
     };
-    const fault = schedulerCaFault(kind, namespace, ca, now);
-    if (fault) return { reason: 'CaNotReady', message: `${pki}/${SCHEDULER_CA_SECRET}: ${fault}` };
-    cas[kind] = ca as KeyPair;
   }
-  return cas;
 }
 
 /**
@@ -421,8 +492,12 @@ export class TenantSchedulerIdentities {
     ];
   }
 
+  /**
+   * The CA sets, after this pass's rotation. A failed rotation write is not reported here: the
+   * platform identities, reconciled after every tenant in the same tick, retry and log it.
+   */
   private cas(): Promise<SchedulerCasRead> {
-    return readSchedulerCas(this.api, this.cfg.namespace, this.now());
+    return loadSchedulerCas(this.api, this.cfg.namespace, this.now());
   }
 
   /**
@@ -432,14 +507,20 @@ export class TenantSchedulerIdentities {
   private observe(
     identity: Identity,
     secret: Stored | undefined,
-    cas: Record<SchedulerCaKind, KeyPair>,
+    cas: SchedulerCas,
     hosts: HostObservation | undefined,
     record: IdentityRecord,
   ): IdentityObservation {
     const base = hosts ?? { client: 'operator' };
     if (!secret && this.awaiting.get(identity.key) === record[identity.key]?.current)
       return { ...base, secret: { notAfter: new Date(0), digest: '' } };
-    return observeIdentity<IdentityObservation>(base, secret, cas[identity.ca].cert, identity.user);
+    return observeIdentity<IdentityObservation>(
+      base,
+      secret,
+      cas[identity.ca],
+      identity.user,
+      schedulerClientBundle(cas),
+    );
   }
 
   /** The hosts' observation base: the hostgroup Deployment and its rollout of the certificate. */
@@ -456,8 +537,9 @@ export class TenantSchedulerIdentities {
     const pki = schedulerPkiNamespace(this.cfg.namespace);
     // No PKI namespace: this installation has no scheduler PKI to wait for.
     if (!(await this.get(namespacePath(pki)))) return {};
-    const cas = await this.cas();
-    if ('reason' in cas) return { pending: cas };
+    const loaded = await this.cas();
+    if ('reason' in loaded) return { pending: loaded };
+    const { cas } = loaded;
     const stored = await this.get<Stored>(configMapPath(pki, SCHEDULER_IDENTITIES));
     if (!stored)
       return {
@@ -625,7 +707,7 @@ export class TenantSchedulerIdentities {
           };
         continue;
       }
-      const ca = cas[identity.ca];
+      const ca = cas[identity.ca].current;
       const leaf = leafCertificate(
         user,
         [user],
@@ -651,8 +733,8 @@ export class TenantSchedulerIdentities {
           ...(existing ? { resourceVersion: existing.metadata.resourceVersion } : {}),
         },
         type: 'kubernetes.io/tls',
-        // Clients verify the server against the platform CA (design-541 §4.5).
-        data: tlsSecretData(leaf, cas.platform.cert),
+        // Clients verify the server against the platform CA set (design-541 §4.5, #629).
+        data: tlsSecretData(leaf, schedulerClientBundle(cas)),
       } as Resource;
       if (existing) await this.api.call('PUT', secretPath(identity.namespace, identity.name), body);
       else await this.api.call('POST', secretPath(identity.namespace), body);
@@ -673,7 +755,7 @@ export class TenantSchedulerIdentities {
             caExpiring: caExpiringMessage(
               [...new Set(expiring.map((i) => i.ca))].map(
                 (ca) =>
-                  `the scheduler ${ca} CA expires ${new X509Certificate(cas[ca].cert).validTo}`,
+                  `the scheduler ${ca} CA expires ${new X509Certificate(cas[ca].current.cert).validTo}`,
               ),
             ),
           }

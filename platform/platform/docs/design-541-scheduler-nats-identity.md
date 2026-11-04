@@ -158,7 +158,7 @@ The Helm values below are enforced in `platformValues` (`platform/platform/src/v
 - **ConfigMap `di-scheduler-nats`.** The static `nats-server.conf`:
   - `port` and `pid_file`;
   - a `tls` block with `verify_and_map: true`;
-  - `ca_file`, the bundle of the platform CA and the tenant CA, current and next of each;
+  - `ca_file`, the bundle of the platform CA and the tenant CA, previous, current and next of each (4.5, "Lifetimes");
   - `include "accounts/accounts.conf"`.
 
   Only `pulumi up` changes it.
@@ -261,7 +261,7 @@ How the pieces give the properties:
 - **`.invalid` names** (RFC 2606) never resolve and cannot be confused with a server name.
 - **`tls.ts` needs three additions.** `platform/platform/src/tenancy/tls.ts` already writes CA certificates with DNS name constraints and an IP exclusion (`tls.ts:83-110,247-260`). It needs a permitted email subtree, a permitted URI subtree, and a client-auth leaf: `leafCertificate` sets only `serverAuth` (`tls.ts:389`). **V**; **U** for Go's `clientAuth` EKU check in this note.
 
-**Identities.** Every Secret holds `tls.crt` and `tls.key`, and `ca.crt` with the platform CA bundle. The chart mounts `ca.crt` too (`chart: templates/operator/deployment.yaml:43`, `templates/runtime/deployment.yaml:197,203`).
+**Identities.** Every Secret holds `tls.crt` and `tls.key`, and `ca.crt` with the platform CA bundle (every CA of the platform set during a rotation, see "Lifetimes"). The chart mounts `ca.crt` too (`chart: templates/operator/deployment.yaml:43`, `templates/runtime/deployment.yaml:197,203`).
 
 | Identity | NATS user (DNS SAN) | Secret | Mounted by |
 |---|---|---|---|
@@ -295,7 +295,7 @@ How the pieces give the properties:
 4. only then write the certificate into the Secret;
 5. roll, as before (the host digest annotation, the `hostgroup-default` PATCH).
 
-At every moment the Secret therefore holds a certificate whose user has propagated, or the `previous` user of a routine renewal, which stays admitted throughout. The NATS server leaf is not a NATS user (clients verify it against the platform CA, which does not change), so it is re-issued without the wait. The tenant operator Deployment is created only once its Secret exists, so it never starts before its user has propagated. The host Deployment takes the Secret's digest at once: a moved template no longer holds a renewed digest back, and the first move onto `di-scheduler-host-tls` waits for the operator and for the Secret, which closes the gap of a host Secret re-issued while the template had not moved (probe B1 of the #613 review). While a pending issuance waits, every pass moves `previousUntil` to now + 10 minutes, so the overlap and the host stall clock count from the issuance that lands and the wait never causes a false `SchedulerIdentityRenewalStalled`. That also means a wait that never ends (a refused render, a persistent accounts write failure) would never stall, so a wait longer than those 10 minutes is reported itself: `SchedulerIdentityPending` with reason `WaitingForAccounts` and the time the wait began on the Tenant, and one log line per platform identity. `SchedulerAccounts` (m6e-B) reports the cause.
+At every moment the Secret therefore holds a certificate whose user has propagated, or the `previous` user of a routine renewal, which stays admitted throughout. The NATS server leaf is not a NATS user (clients verify it against the platform CA set they already trust), so it is re-issued without the wait. The tenant operator Deployment is created only once its Secret exists, so it never starts before its user has propagated. The host Deployment takes the Secret's digest at once: a moved template no longer holds a renewed digest back, and the first move onto `di-scheduler-host-tls` waits for the operator and for the Secret, which closes the gap of a host Secret re-issued while the template had not moved (probe B1 of the #613 review). While a pending issuance waits, every pass moves `previousUntil` to now + 10 minutes, so the overlap and the host stall clock count from the issuance that lands and the wait never causes a false `SchedulerIdentityRenewalStalled`. That also means a wait that never ends (a refused render, a persistent accounts write failure) would never stall, so a wait longer than those 10 minutes is reported itself: `SchedulerIdentityPending` with reason `WaitingForAccounts` and the time the wait began on the Tenant, and one log line per platform identity. `SchedulerAccounts` (m6e-B) reports the cause.
 
 - **Forced rotation.** Either of these starts it:
   - changing the Tenant annotation `platform.di-framework.dev/rotate-scheduler-identity`, which rotates both of the tenant's entries;
@@ -360,10 +360,15 @@ Removal therefore runs in the fixed order below. The controller never skips a st
 - **The operator after R1.** Its commands to hosts time out, because no host can connect any more. Its finalizers only delete Kubernetes objects (`host_controller.go:102-124`), so they need no host.
 
 **Lifetimes** (O3):
-- **CAs.** 10 years (`SCHEDULER_CA_DAYS`, 3650 days), created once by `platform/platform/src/tenancy/scheduler-pki.ts` and not rotated today. Rotation with a current/next bundle in `ca_file` and each `ca.crt` is tracked in #629. Until then a leaf capped at its CA's expiry is not renewed; the Tenant reports `SchedulerCaExpiring` (platform identities log a warning) instead.
+- **CAs.** 10 years (`SCHEDULER_CA_DAYS`, 3650 days). The bootstrap Job creates both once (`platform/platform/src/tenancy/scheduler-pki.ts`); the controller rotates each through a current/next set with the controller's CA machinery (`rotateCaSet` in `ca-rotation.ts`, `nextSchedulerCas` in `scheduler-pki.ts`, #629). Every pass, before any leaf is observed, `loadSchedulerCas` (`scheduler-identities.ts`) advances both sets and writes `di-scheduler-ca` under its resourceVersion when one changes; a CA never signs or is trusted before its key is stored. `di-scheduler-ca` holds, per kind, the signing CA (`<kind>-ca.crt`, `<kind>-ca.key`), the published successor (`<kind>-next-ca.crt`, `<kind>-next-ca.key`) and the replaced CA (`<kind>-previous-ca.crt`, no key). The steps:
+  1. **Publish.** `CA_RENEW_DAYS` (90) before a CA expires, a successor with the same name constraints is created. The server's `ca.crt` (its `ca_file`) carries both sets, oldest first, at once; the server leaf is re-issued with it, and the reloader picks it up. Each client Secret's `ca.crt` carries the platform set; a client whose `ca.crt` lacks a CA of that set is renewed routinely (new ID, `previous` kept), so hosts roll onto the new bundle (wash reads its CA file only at start) while the old CA still signs. A tenant CA successor changes no client bundle, since clients verify only the server.
+  2. **Switch.** Once the successor is `CA_OVERLAP_DAYS` (30) old, or at once when the signing CA has less than 30 days left, it signs and the old CA becomes `previous`. The bundle bytes stay the same. Every leaf the old CA signed verifies against `previous` and is renewed once against the new CA (the server leaf without the propagation wait), whatever its expiry.
+  3. **Retire.** `previous` leaves `di-scheduler-ca` and the server's bundle when it expires; no leaf it signed outlives it. Client Secrets are not re-issued for it: the expired CA leaves their `ca.crt` at their next renewal.
+
+  A successor without the kind's exact constraints is dropped and published again. A signing CA that fails its checks is replaced at once by a usable successor and not kept; without one the Tenant reports `SchedulerIdentityPending` (`CaNotReady`) as before. When the rotation cannot be written, the controller logs it once (platform identities' log line), retries every pass, and keeps issuing under the CA that still signs. Only then can a leaf be capped at its CA's expiry: such a leaf is not renewed, and the Tenant reports `SchedulerCaExpiring` (platform identities log a warning) until the successor signs and the leaf is renewed against it.
 - **Leaves.** 90 days, renewed when 30 days remain (`ca-rotation.ts:20`). Revocation never waits for expiry.
 - **`hostgroup-default` renewal.** It follows the host rule above: the controller rolls it first, and drops `previous` only once the rollout is observed. **U**: that Helm keeps a pod-template annotation it did not render. If Helm does not keep it, the controller restarts the Deployment by deleting its pods one at a time, under the same rule.
-- **Server renewal.** The server reloads its certificate when the reloader sees the Secret change.
+- **Server renewal.** The server reloads its certificate and `ca_file` when the reloader sees the Secret change. The server leaf is re-issued when 30 days remain, when the signing platform CA did not sign it, or when its `ca.crt` is not the bundle of both CA sets.
 
 **Bootstrap** (O4):
 - **Why a Job.** The `di-scheduler-nats` Deployment, the chart's operator and `hostgroup-default` must be ready before the Helm release's wait ends (4.1). The controller is deployed after the release.
@@ -541,6 +546,7 @@ It meets P1-P3 only while it runs correctly. It is a new process that sees every
   - Both CAs carry their name constraints: the tenant CA refuses every name under `platform.scheduler.di-framework.invalid`, and operator certificates come only from the platform CA.
   - Lifetimes are as specified.
   - Every Secret carries `ca.crt`.
+  - CA rotation (#629, `tests/scheduler-ca-rotation.test.ts`), for the platform and the tenant path: with the clock in a CA's renewal window, one successor is published, every leaf is re-signed once against it at the switch, later ticks write nothing, and the old CA leaves the bundles once it expires. A capped leaf is renewed once the rotation can be written, and `SchedulerCaExpiring` clears.
 - **Per-tenant operator manifests.**
   - The flags (`-watch-namespaces=di-tenant-<t>`, `-host-namespaces=di-runtime-<t>`, `-allow-shared-hosts=false`, `-metrics-bind-address=0`) and `OPERATOR_NAMESPACE` are set.
   - The upstream image is pinned by digest.

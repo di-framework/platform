@@ -1,0 +1,587 @@
+import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
+import { X509Certificate } from 'node:crypto';
+import { CA_OVERLAP_DAYS, CA_RENEW_DAYS, type ControllerCas } from '../src/tenancy/ca-rotation';
+import { ApiError } from '../src/tenancy/controller';
+import { INSTALLATION, names, OWNER, type Resource } from '../src/tenancy/resources';
+import {
+  bundleTrusts,
+  loadSchedulerCas,
+  observeIdentity,
+  SCHEDULER_CA_EXPIRING,
+  TENANT_HOST_SECRET,
+} from '../src/tenancy/scheduler-identities';
+import {
+  bootstrapSchedulerPki,
+  CA_KEYS,
+  newSchedulerCa,
+  nextSchedulerCas,
+  PLATFORM_SECRETS,
+  platformClientLeaf,
+  platformUser,
+  readSchedulerCaSet,
+  SCHEDULER_CA_DAYS,
+  SCHEDULER_CA_SECRET,
+  type SchedulerCaKind,
+  type SchedulerCas,
+  schedulerCaData,
+  schedulerCaFault,
+  schedulerClientBundle,
+  schedulerServerBundle,
+  storedSchedulerCas,
+  tlsSecretData,
+} from '../src/tenancy/scheduler-pki';
+import {
+  identityTransition,
+  type OperatorObservation,
+} from '../src/tenancy/scheduler-pki-rotation';
+import { TENANT_OPERATOR_PROPAGATION_MS } from '../src/tenancy/tenant-operator';
+import { caCertificate, issuedBy, type KeyPair } from '../src/tenancy/tls';
+import {
+  cfg,
+  condition,
+  MemoryApi,
+  PKI,
+  prepare as prepareHarness,
+  recordPath,
+  START,
+} from './support/controller-harness';
+
+// #629: both scheduler CAs rotate through a current/next set before they expire (design-541
+// §4.5 "Lifetimes"): publish a successor CA_RENEW_DAYS before expiry, trust both for
+// CA_OVERLAP_DAYS, switch and re-sign every leaf once, then retire the old CA when it expires.
+
+const DAY = 86_400_000;
+const NS = cfg.namespace;
+const KINDS = ['platform', 'tenant'] as const;
+const caPath = `/api/v1/namespaces/${PKI}/secrets/${SCHEDULER_CA_SECRET}`;
+const platformPath = (name: string) => `/api/v1/namespaces/${NS}/secrets/${name}`;
+const serverPath = platformPath(PLATFORM_SECRETS.server);
+const clientPaths = (['operator', 'host', 'data'] as const).map((r) =>
+  platformPath(PLATFORM_SECRETS[r]),
+);
+const hostPath = `/api/v1/namespaces/${names('alpha').runtimeNamespace}/secrets/${TENANT_HOST_SECRET}`;
+const operatorPath = '/api/v1/namespaces/di-operator-alpha/secrets/di-scheduler-operator-tls';
+const b64 = (text: string) => Buffer.from(text).toString('base64');
+const decode = (value: string | undefined) => Buffer.from(value ?? '', 'base64').toString('utf8');
+const print = (pem: string) => new X509Certificate(pem).fingerprint256;
+const endOf = (pem: string) => new Date(new X509Certificate(pem).validTo).getTime();
+const startOf = (pem: string) => new Date(new X509Certificate(pem).validFrom).getTime();
+
+/** A CA of `kind` that expires `days` days after `from`. */
+const caEnding = (kind: SchedulerCaKind, from: Date, days: number) =>
+  newSchedulerCa(kind, NS, new Date(from.getTime() - (SCHEDULER_CA_DAYS - days) * DAY));
+
+describe('nextSchedulerCas: the scheduler CA set (#629)', () => {
+  it('returns the fault of a missing signing CA without creating one', () => {
+    expect(nextSchedulerCas('platform', NS, {}, START)).toContain('missing');
+    expect(nextSchedulerCas('tenant', NS, { current: { cert: 'x' } }, START)).toContain('missing');
+  });
+  it('promotes a usable successor when the signing CA is unusable, without keeping the old one', () => {
+    for (const kind of KINDS) {
+      const next = caEnding(kind, START, 3000);
+      const expired = caEnding(kind, START, -1);
+      const set = nextSchedulerCas(kind, NS, { current: expired, next }, START) as ControllerCas;
+      expect(set).toEqual({ current: next });
+      // A successor of the other kind is not usable: the fault stays.
+      const other = caEnding(kind === 'platform' ? 'tenant' : 'platform', START, 3000);
+      expect(nextSchedulerCas(kind, NS, { current: expired, next: other }, START)).toContain(
+        'expired',
+      );
+    }
+  });
+
+  it('publishes one successor in the renewal window, switches after the overlap and retires the old CA at its expiry', () => {
+    for (const kind of KINDS) {
+      const old = caEnding(kind, START, 200);
+      const end = endOf(old.cert);
+      // Outside the window nothing changes.
+      expect(nextSchedulerCas(kind, NS, { current: old }, START)).toEqual({ current: old });
+      // Publish: a successor with the kind's exact constraints, the old CA still signs.
+      const publishAt = new Date(end - (CA_RENEW_DAYS - 1) * DAY);
+      const published = nextSchedulerCas(kind, NS, { current: old }, publishAt) as ControllerCas;
+      expect(published.current).toEqual(old);
+      const next = published.next as KeyPair;
+      expect(schedulerCaFault(kind, NS, next, publishAt)).toBeUndefined();
+      expect(endOf(next.cert)).toBeGreaterThan(end);
+      // Stable while it waits: the same successor, not another.
+      const waiting = new Date(publishAt.getTime() + (CA_OVERLAP_DAYS - 1) * DAY);
+      expect(nextSchedulerCas(kind, NS, published, waiting)).toEqual(published);
+      // Switch: the successor signs, the old CA is kept as previous until it expires.
+      const switchAt = new Date(startOf(next.cert) + (CA_OVERLAP_DAYS + 1) * DAY);
+      const switched = nextSchedulerCas(kind, NS, published, switchAt) as ControllerCas;
+      expect(switched).toEqual({ current: next, previous: old.cert });
+      expect(nextSchedulerCas(kind, NS, switched, new Date(end - DAY))).toEqual(switched);
+      // Retire.
+      expect(nextSchedulerCas(kind, NS, switched, new Date(end + 60_000))).toEqual({
+        current: next,
+      });
+    }
+  });
+
+  it('replaces a successor that does not carry the kind constraints', () => {
+    const old = caEnding('tenant', START, 60);
+    const wrong = caCertificate('stranger', SCHEDULER_CA_DAYS, START, ['example.com'], true);
+    const set = nextSchedulerCas('tenant', NS, { current: old, next: wrong }, START);
+    const next = (set as ControllerCas).next as KeyPair;
+    expect(print(next.cert)).not.toBe(print(wrong.cert));
+    expect(schedulerCaFault('tenant', NS, next, START)).toBeUndefined();
+    // Outside the window it is only dropped.
+    const fresh = caEnding('tenant', START, 3000);
+    expect(nextSchedulerCas('tenant', NS, { current: fresh, next: wrong }, START)).toEqual({
+      current: fresh,
+    });
+  });
+});
+
+describe('readSchedulerCaSet, storedSchedulerCas, schedulerCaData and the bundles (#629)', () => {
+  it('reads a set as stored, leaving out an unusable successor and a retired previous', () => {
+    const current = caEnding('platform', START, 3000);
+    const next = caEnding('platform', START, 3600);
+    const previous = caEnding('platform', START, 10).cert;
+    const retired = caEnding('platform', START, -1).cert;
+    expect(readSchedulerCaSet('platform', NS, { current, next, previous }, START)).toEqual({
+      current,
+      next,
+      previous,
+    });
+    expect(
+      readSchedulerCaSet(
+        'platform',
+        NS,
+        { current, next: { cert: next.cert }, previous: retired },
+        START,
+      ),
+    ).toEqual({ current });
+    expect(
+      readSchedulerCaSet('platform', NS, { current: next, previous: 'garbage' }, START),
+    ).toEqual({ current: next });
+    expect(readSchedulerCaSet('platform', NS, {}, START)).toContain('missing');
+  });
+
+  it('round-trips a set through the Secret data, and removes absent parts', () => {
+    const set: ControllerCas = {
+      current: caEnding('tenant', START, 3000),
+      next: caEnding('tenant', START, 3600),
+      previous: caEnding('tenant', START, 10).cert,
+    };
+    const data = schedulerCaData('tenant', set);
+    expect(Object.keys(data).sort()).toEqual(Object.values(CA_KEYS.tenant).sort());
+    expect(storedSchedulerCas(data as Record<string, string>, 'tenant')).toEqual(set);
+    const only = schedulerCaData('tenant', { current: set.current });
+    expect(only[CA_KEYS.tenant.nextCert]).toBeUndefined();
+    expect(only[CA_KEYS.tenant.previous]).toBeUndefined();
+    expect(storedSchedulerCas(undefined, 'tenant')).toEqual({ current: {} });
+    expect(storedSchedulerCas({ [CA_KEYS.tenant.nextKey]: b64('k') }, 'tenant').next).toEqual({
+      key: 'k',
+    });
+  });
+
+  it('bundles the platform set for clients and both sets for the server, oldest first', () => {
+    const cas: SchedulerCas = {
+      platform: { current: { cert: 'P1', key: '' }, next: { cert: 'P2', key: '' }, previous: 'P0' },
+      tenant: { current: { cert: 'T1', key: '' } },
+    };
+    expect(schedulerClientBundle(cas)).toBe('P0P1P2');
+    expect(schedulerServerBundle(cas)).toBe('P0P1P2T1');
+  });
+
+  it('bundleTrusts compares certificates by fingerprint, in any order, skipping unparseable blocks', () => {
+    const a = caEnding('platform', START, 3000).cert;
+    const b = caEnding('platform', START, 3100).cert;
+    const junk = '-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----\n';
+    expect(bundleTrusts(`${b}${a}`, `${a}${b}`)).toBe(true);
+    expect(bundleTrusts(`${junk}${a}`, a)).toBe(true);
+    expect(bundleTrusts(a, `${a}${b}`)).toBe(false);
+    expect(bundleTrusts('', a)).toBe(false);
+  });
+});
+
+describe('a leaf observed during a CA rotation (#629)', () => {
+  const old = caEnding('platform', START, 60);
+  const next = caEnding('platform', START, 3600);
+  const user = (id: string) => platformUser('operator', id);
+  const ID = 'aaaaaaaaaaaaaaaa';
+  const leafFrom = (ca: KeyPair, bundle: string) => ({
+    data: tlsSecretData(platformClientLeaf('operator', ID, ca, START), bundle),
+  });
+  const observe = (secret: { data: Record<string, string> }, cas: ControllerCas) =>
+    observeIdentity<OperatorObservation>(
+      { client: 'operator' },
+      secret,
+      cas,
+      user,
+      [cas.previous, cas.current.cert, cas.next?.cert].filter(Boolean).join(''),
+    );
+
+  it('is stale while its bundle lacks the published successor, and capped by its CA', () => {
+    const secret = observe(leafFrom(old, old.cert), { current: old, next }).secret;
+    expect(secret).toMatchObject({ id: ID, stale: true, capped: true });
+    const trusted = observe(leafFrom(old, `${old.cert}${next.cert}`), { current: old, next });
+    expect(trusted.secret?.stale).toBeUndefined();
+  });
+
+  it('is stale once the CA that signed it is only previous, and unusable once that CA is gone', () => {
+    const bundle = `${old.cert}${next.cert}`;
+    const secret = observe(leafFrom(old, bundle), { current: next, previous: old.cert }).secret;
+    expect(secret).toMatchObject({ id: ID, stale: true });
+    expect(observe(leafFrom(old, bundle), { current: next }).secret).toEqual({
+      notAfter: new Date(0),
+      digest: '',
+    });
+    expect(
+      observe(leafFrom(next, bundle), { current: next, previous: old.cert }).secret?.stale,
+    ).toBe(undefined);
+  });
+
+  it('a stale leaf is renewed even when capped, unlike a capped leaf that is only due', () => {
+    const notAfter = new Date(START.getTime() + 10 * DAY);
+    const capped = { notAfter, digest: 'd', id: ID, capped: true };
+    const random = () => Buffer.alloc(8, 7);
+    expect(
+      identityTransition({ current: ID }, { client: 'operator', secret: capped }, START, random),
+    ).toMatchObject({ action: 'keep', caExpiring: true });
+    expect(
+      identityTransition(
+        { current: ID },
+        { client: 'operator', secret: { ...capped, stale: true } },
+        START,
+        random,
+      ),
+    ).toMatchObject({ action: 'issue', reason: 'renewal', entry: { previous: ID } });
+  });
+});
+
+class RotationApi extends MemoryApi {
+  /** Refuses writes of `di-scheduler-ca` while set. */
+  refuseCa = false;
+  override async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+    if (this.refuseCa && method === 'PUT' && path === caPath) {
+      this.operations.push({ method, path, body });
+      throw new ApiError(409, 'Conflict');
+    }
+    return super.call<T>(method, path, body);
+  }
+  writes(path: string): number {
+    return this.operations.filter((o) => o.method !== 'GET' && o.path === path).length;
+  }
+}
+
+/** Seeds `di-scheduler-ca` with one set per kind, as the bootstrap or a rotation writes it. */
+function seedCas(api: MemoryApi, sets: SchedulerCas): void {
+  const data: Record<string, string> = {};
+  for (const kind of KINDS)
+    for (const [key, value] of Object.entries(schedulerCaData(kind, sets[kind])))
+      if (value !== undefined) data[key] = value;
+  api.seed({
+    apiVersion: 'v1',
+    kind: 'Secret',
+    metadata: { name: SCHEDULER_CA_SECRET, namespace: PKI },
+    type: 'Opaque',
+    data,
+  } as unknown as Resource);
+}
+const caData = (api: MemoryApi) =>
+  (api.objects.get(caPath) as unknown as { data: Record<string, string> }).data;
+const storedSet = (api: MemoryApi, kind: SchedulerCaKind) => storedSchedulerCas(caData(api), kind);
+
+describe('loadSchedulerCas (#629)', () => {
+  it('waits for the bootstrap, and reports a broken signing CA without writing', async () => {
+    const api = new RotationApi();
+    expect(await loadSchedulerCas(api, NS, START)).toMatchObject({ reason: 'CaNotReady' });
+    seedCas(api, {
+      platform: { current: caEnding('platform', START, 3000) },
+      tenant: { current: caEnding('platform', START, 3000) },
+    });
+    const read = await loadSchedulerCas(api, NS, START);
+    expect(read).toMatchObject({ reason: 'CaNotReady' });
+    expect((read as { message: string }).message).toContain('tenant CA does not carry');
+    expect(api.writes(caPath)).toBe(0);
+  });
+
+  it('writes a rotation once, under the read resourceVersion, and nothing while it is unchanged', async () => {
+    const api = new RotationApi();
+    const platform = caEnding('platform', START, 60);
+    const tenant = caEnding('tenant', START, 3000);
+    seedCas(api, { platform: { current: platform }, tenant: { current: tenant } });
+    const first = await loadSchedulerCas(api, NS, START);
+    expect(api.writes(caPath)).toBe(1);
+    const cas = (first as { cas: SchedulerCas }).cas;
+    expect(cas.platform.current).toEqual(platform);
+    expect(cas.tenant).toEqual({ current: tenant });
+    expect(storedSet(api, 'platform').next).toEqual(cas.platform.next as KeyPair);
+    expect(await loadSchedulerCas(api, NS, START)).toEqual({ cas });
+    expect(api.writes(caPath)).toBe(1);
+  });
+
+  it('keeps signing with the stored set when the rotation cannot be written', async () => {
+    const api = new RotationApi();
+    const platform = caEnding('platform', START, 60);
+    const tenant = caEnding('tenant', START, 3000);
+    seedCas(api, { platform: { current: platform }, tenant: { current: tenant } });
+    api.refuseCa = true;
+    const read = await loadSchedulerCas(api, NS, START);
+    expect(read).toEqual({
+      cas: { platform: { current: platform }, tenant: { current: tenant } },
+      rotationFailed: `rotating ${PKI}/${SCHEDULER_CA_SECRET} failed: Conflict`,
+    });
+    // Promoting a successor over an expired CA is not possible without the write.
+    seedCas(api, {
+      platform: {
+        current: caEnding('platform', START, -1),
+        next: caEnding('platform', START, 3000),
+      },
+      tenant: { current: tenant },
+    });
+    expect(await loadSchedulerCas(api, NS, START)).toMatchObject({ reason: 'CaNotReady' });
+  });
+});
+
+describe('the bootstrap Job during a rotation (#629)', () => {
+  it('signs with the signing CA and writes the bundles of each whole set', async () => {
+    const api = new RotationApi();
+    api.seed({ apiVersion: 'v1', kind: 'Namespace', metadata: { name: PKI } });
+    const sets: SchedulerCas = {
+      platform: {
+        current: caEnding('platform', START, 3000),
+        next: caEnding('platform', START, 3600),
+      },
+      tenant: {
+        current: caEnding('tenant', START, 3000),
+        previous: caEnding('tenant', START, 9).cert,
+      },
+    };
+    seedCas(api, sets);
+    await bootstrapSchedulerPki(api, cfg, START);
+    const secret = (path: string) =>
+      (api.objects.get(path) as unknown as { data: Record<string, string> }).data;
+    expect(decode(secret(serverPath)['ca.crt'])).toBe(schedulerServerBundle(sets));
+    for (const path of clientPaths) {
+      expect(decode(secret(path)['ca.crt'])).toBe(schedulerClientBundle(sets));
+      const data = secret(path);
+      expect(
+        issuedBy(sets.platform.current.cert, decode(data['tls.crt']), decode(data['tls.key'])),
+      ).toBe(true);
+    }
+    expect(api.writes(caPath)).toBe(0);
+  });
+});
+
+const clock = { now: START };
+let warn: ReturnType<typeof spyOn>;
+const warned = (text: string) =>
+  warn.mock.calls.filter(([message]: unknown[]) => String(message).includes(text)).length;
+beforeEach(() => {
+  clock.now = START;
+  warn = spyOn(console, 'warn').mockImplementation(() => {});
+});
+afterEach(() => warn.mockRestore());
+
+const at = (ms: number) => {
+  clock.now = new Date(ms);
+};
+/** The ticks of one renewal: record, the users named, the Secrets after the propagation wait. */
+async function settle(controller: { tick(): Promise<void> }) {
+  await controller.tick();
+  await controller.tick();
+  clock.now = new Date(clock.now.getTime() + TENANT_OPERATOR_PROPAGATION_MS);
+  await controller.tick();
+  clock.now = new Date(clock.now.getTime() + 11 * 60_000);
+  await controller.tick();
+}
+/** `ticks` more ticks, `step` ms apart; returns the writes they made to `paths` and the CA Secret. */
+async function quiet(
+  api: RotationApi,
+  controller: { tick(): Promise<void> },
+  paths: string[],
+  ticks: number,
+  step: number,
+) {
+  api.operations.length = 0;
+  for (let i = 0; i < ticks; i++) {
+    clock.now = new Date(clock.now.getTime() + step);
+    await controller.tick();
+  }
+  return [caPath, recordPath, ...paths].map(api.writes.bind(api)).reduce((a, b) => a + b, 0);
+}
+const secretOf = (api: MemoryApi, path: string) =>
+  (api.objects.get(path) as unknown as { data: Record<string, string> }).data;
+/** True when the leaf in `path` verifies against `ca` with its key. */
+const signedBy = (api: MemoryApi, path: string, ca: string) => {
+  const data = secretOf(api, path);
+  return issuedBy(ca, decode(data['tls.crt']), decode(data['tls.key']));
+};
+const trusted = (api: MemoryApi, path: string) =>
+  [
+    ...decode(secretOf(api, path)['ca.crt']).matchAll(
+      /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g,
+    ),
+  ].map(([pem]) => print(pem));
+
+/**
+ * A controller whose scheduler CAs, both expiring 100 days after START, were seeded before the
+ * bootstrap, so the leaves it issues at START are not capped. `tenant` adds the tenant's operator
+ * namespace, so both tenant identities are issued.
+ */
+async function prepare(tenant: boolean) {
+  const api = new RotationApi();
+  const old = {
+    platform: caEnding('platform', START, 100),
+    tenant: caEnding('tenant', START, 100),
+  };
+  seedCas(api, { platform: { current: old.platform }, tenant: { current: old.tenant } });
+  const { controller } = await prepareHarness(api, { pki: true }, () => clock.now);
+  if (tenant)
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'Namespace',
+      metadata: {
+        name: 'di-operator-alpha',
+        labels: { [INSTALLATION]: 'test', [OWNER]: 'alpha-uid' },
+      },
+    });
+  await settle(controller);
+  return { api, controller, old, end: endOf(old.platform.cert) };
+}
+
+describe('controller tick: the platform path rotates the platform scheduler CA (#629)', () => {
+  it('publishes one successor, re-signs each platform leaf and the server leaf once against it, then retires the old CA', async () => {
+    const { api, controller, old, end } = await prepare(false);
+    const leaves = [serverPath, ...clientPaths];
+    expect(await quiet(api, controller, leaves, 3, DAY)).toBe(0);
+
+    // Publish: one successor per kind; every bundle trusts it while the old CA still signs.
+    at(end - (CA_RENEW_DAYS - 1) * DAY);
+    api.operations.length = 0;
+    await settle(controller);
+    expect(api.writes(caPath)).toBe(1);
+    const next = {
+      platform: storedSet(api, 'platform').next as KeyPair,
+      tenant: storedSet(api, 'tenant').next as KeyPair,
+    };
+    for (const kind of KINDS)
+      expect(schedulerCaFault(kind, NS, next[kind], clock.now)).toBeUndefined();
+    for (const path of leaves) {
+      expect(api.writes(path)).toBe(1);
+      expect(signedBy(api, path, old.platform.cert)).toBe(true);
+      expect(trusted(api, path)).toContain(print(next.platform.cert));
+    }
+    expect(trusted(api, serverPath)).toContain(print(next.tenant.cert));
+    expect(await quiet(api, controller, leaves, 5, DAY)).toBe(0);
+
+    // Switch: the successor signs; every leaf the old CA signed is re-signed once against it.
+    at(startOf(next.platform.cert) + (CA_OVERLAP_DAYS + 1) * DAY);
+    api.operations.length = 0;
+    await settle(controller);
+    expect(api.writes(caPath)).toBe(1);
+    expect(storedSet(api, 'platform')).toEqual({
+      current: next.platform,
+      previous: old.platform.cert,
+    });
+    expect(storedSet(api, 'tenant')).toEqual({ current: next.tenant, previous: old.tenant.cert });
+    for (const path of leaves) {
+      expect(api.writes(path)).toBe(1);
+      expect(signedBy(api, path, next.platform.cert)).toBe(true);
+      expect(trusted(api, path)).toContain(print(old.platform.cert));
+    }
+    expect(warned('the scheduler platform CA expires')).toBe(0);
+    expect(await quiet(api, controller, leaves, 5, DAY)).toBe(0);
+
+    // Retire: the old CAs leave the CA Secret and the server's bundle; no client is re-issued.
+    at(end + 60 * 60_000);
+    api.operations.length = 0;
+    await controller.tick();
+    expect(api.writes(caPath)).toBe(1);
+    expect(storedSet(api, 'platform')).toEqual({ current: next.platform });
+    expect(storedSet(api, 'tenant')).toEqual({ current: next.tenant });
+    expect(api.writes(serverPath)).toBe(1);
+    expect(trusted(api, serverPath)).toEqual([print(next.platform.cert), print(next.tenant.cert)]);
+    for (const path of clientPaths) expect(api.writes(path)).toBe(0);
+    expect(await quiet(api, controller, leaves, 3, 60 * 60_000)).toBe(0);
+  });
+
+  it('renews capped leaves once the rotation can be written, and stops logging the CA expiry', async () => {
+    const { api, controller, end } = await prepare(false);
+    const leaves = [serverPath, ...clientPaths];
+    api.refuseCa = true;
+    at(end - 20 * DAY);
+    await settle(controller);
+    expect(warned('the scheduler platform CA expires')).toBe(1);
+    expect(warned('failed: Conflict')).toBe(1);
+    api.operations.length = 0;
+    for (let i = 0; i < 2; i++) await controller.tick();
+    for (const path of leaves) expect(api.writes(path)).toBe(0);
+    api.refuseCa = false;
+    api.operations.length = 0;
+    // Under 30 days left, the successor is published and switched to at once.
+    await settle(controller);
+    const current = storedSet(api, 'platform').current as KeyPair;
+    for (const path of leaves) {
+      expect(api.writes(path)).toBe(1);
+      expect(signedBy(api, path, current.cert)).toBe(true);
+    }
+    expect(await quiet(api, controller, leaves, 3, DAY)).toBe(0);
+    expect(warned('the scheduler platform CA expires')).toBe(1);
+  });
+});
+
+describe('controller tick: the tenant path rotates both scheduler CAs (#629)', () => {
+  it('publishes one successor, re-signs the host and operator leaves once against it, then retires the old CA', async () => {
+    const { api, controller, old, end } = await prepare(true);
+    const leaves = [hostPath, operatorPath];
+    expect(api.objects.has(hostPath) && api.objects.has(operatorPath)).toBe(true);
+    expect(await quiet(api, controller, leaves, 3, DAY)).toBe(0);
+
+    at(end - (CA_RENEW_DAYS - 1) * DAY);
+    api.operations.length = 0;
+    await settle(controller);
+    expect(api.writes(caPath)).toBe(1);
+    const next = {
+      platform: storedSet(api, 'platform').next as KeyPair,
+      tenant: storedSet(api, 'tenant').next as KeyPair,
+    };
+    // Each client's bundle gains the platform successor, so each is renewed once under the old CA.
+    for (const path of leaves) {
+      expect(api.writes(path)).toBe(1);
+      expect(trusted(api, path)).toEqual([print(old.platform.cert), print(next.platform.cert)]);
+    }
+    expect(signedBy(api, hostPath, old.tenant.cert)).toBe(true);
+    expect(signedBy(api, operatorPath, old.platform.cert)).toBe(true);
+    expect(await quiet(api, controller, leaves, 5, DAY)).toBe(0);
+
+    at(startOf(next.platform.cert) + (CA_OVERLAP_DAYS + 1) * DAY);
+    api.operations.length = 0;
+    await settle(controller);
+    expect(api.writes(caPath)).toBe(1);
+    for (const path of leaves) expect(api.writes(path)).toBe(1);
+    expect(signedBy(api, hostPath, next.tenant.cert)).toBe(true);
+    expect(signedBy(api, operatorPath, next.platform.cert)).toBe(true);
+    expect(condition(api, SCHEDULER_CA_EXPIRING)).toBeUndefined();
+    expect(await quiet(api, controller, leaves, 5, DAY)).toBe(0);
+
+    at(end + 60 * 60_000);
+    api.operations.length = 0;
+    await controller.tick();
+    expect(api.writes(caPath)).toBe(1);
+    expect(storedSet(api, 'tenant')).toEqual({ current: next.tenant });
+    expect(storedSet(api, 'platform')).toEqual({ current: next.platform });
+    for (const path of leaves) expect(api.writes(path)).toBe(0);
+    expect(trusted(api, serverPath)).toEqual([print(next.platform.cert), print(next.tenant.cert)]);
+    expect(await quiet(api, controller, leaves, 3, 60 * 60_000)).toBe(0);
+  });
+
+  it('renews capped leaves once the rotation can be written, and clears SchedulerCaExpiring', async () => {
+    const { api, controller, end } = await prepare(true);
+    const leaves = [hostPath, operatorPath];
+    api.refuseCa = true;
+    at(end - 20 * DAY);
+    await settle(controller);
+    expect(condition(api, SCHEDULER_CA_EXPIRING)).toMatchObject({ reason: 'CaExpiring' });
+    api.refuseCa = false;
+    api.operations.length = 0;
+    await settle(controller);
+    for (const path of leaves) expect(api.writes(path)).toBe(1);
+    expect(signedBy(api, hostPath, (storedSet(api, 'tenant').current as KeyPair).cert)).toBe(true);
+    expect(condition(api, SCHEDULER_CA_EXPIRING)).toBeUndefined();
+    expect(await quiet(api, controller, leaves, 3, DAY)).toBe(0);
+  });
+});

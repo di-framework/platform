@@ -25,8 +25,13 @@
  *   certificate is written only once its user has propagated ({@link AccountsPropagation}); until
  *   then the Secret keeps the previous certificate, whose user stays admitted, and the roll waits
  *   with it. These Secrets are never deleted: they are renewed, never force-rotated here.
- * - **The server leaf** is not a NATS user: clients verify it against the platform CA, which does
- *   not change, so it is re-issued without the wait.
+ * - **The server leaf** is not a NATS user: clients verify it against the platform CA set, so it is
+ *   re-issued without the wait.
+ * - **CA rotation (#629).** {@link loadSchedulerCas} advances the rotation of both scheduler CAs
+ *   first. A published successor joins the server's bundle at once and, through a renewal, each
+ *   client's `ca.crt`; after the switch every leaf the old CA signed, the server's included, is
+ *   re-signed by the new one. A rotation that cannot be written is logged and retried; renewal
+ *   goes on under the CA that still signs.
  * - **Failures** are logged once per distinct message and retried on the next tick; nothing here
  *   retries within a tick, and a steady state writes nothing.
  *
@@ -42,9 +47,9 @@ import {
   type HostDeployment,
   hostRolloutOf,
   type IdentityApi,
+  loadSchedulerCas,
   observeIdentity,
   putIdentityRecord,
-  readSchedulerCas,
   type Stored,
 } from './scheduler-identities';
 import { SCHEDULER_NATS_ACCOUNTS } from './scheduler-nats';
@@ -63,7 +68,9 @@ import {
   SCHEDULER_LEAF_RENEW_DAYS,
   SCHEDULER_PKI_COMPONENT,
   type SchedulerCas,
+  schedulerClientBundle,
   schedulerPkiNamespace,
+  schedulerServerBundle,
   serializeIdentityRecord,
   tlsSecretData,
 } from './scheduler-pki';
@@ -96,6 +103,8 @@ interface Context {
   pki: string;
   now: Date;
   cas: SchedulerCas;
+  /** Why this tick's CA rotation was not written, if it was not. */
+  rotationFailed?: string;
   stored: Stored;
   record: IdentityRecord;
   deployment: HostDeployment | undefined;
@@ -171,8 +180,9 @@ export class PlatformSchedulerIdentities {
     const pki = schedulerPkiNamespace(namespace);
     if (!(await getIfExists(this.api, `/api/v1/namespaces/${pki}`))) return undefined;
     const now = this.now();
-    const cas = await readSchedulerCas(this.api, namespace, now);
-    if ('reason' in cas) return undefined;
+    const loaded = await loadSchedulerCas(this.api, namespace, now);
+    if ('reason' in loaded) return undefined;
+    const { cas, rotationFailed } = loaded;
     const stored = await getIfExists<Stored>(
       this.api,
       `/api/v1/namespaces/${pki}/configmaps/${SCHEDULER_IDENTITIES}`,
@@ -183,7 +193,15 @@ export class PlatformSchedulerIdentities {
       this.api,
       deploymentPath(namespace, PLATFORM_HOST_DEPLOYMENT),
     );
-    return { pki, now, cas, stored, record, deployment };
+    return {
+      pki,
+      now,
+      cas,
+      ...(rotationFailed ? { rotationFailed } : {}),
+      stored,
+      record,
+      deployment,
+    };
   }
 
   /** Renews the due identities, then the server leaf, then rolls `hostgroup-default`. */
@@ -213,7 +231,9 @@ export class PlatformSchedulerIdentities {
     await this.renewServer(ctx.cas, ctx.now);
     await this.rollHosts(ctx.deployment, targets);
     this.logStall(next.stalled.length > 0);
-    this.logCaExpiring(next.caExpiring.length > 0, ctx.cas.platform.cert);
+    this.logCaExpiring(next.caExpiring.length > 0, ctx.cas.platform.current.cert);
+    // Logged once by `reconcile`, after this tick's renewals under the CA that still signs.
+    if (ctx.rotationFailed) throw new Error(ctx.rotationFailed);
   }
 
   /** Logs once that the platform CA caps the identities it signs, until it no longer does (#612). */
@@ -243,8 +263,9 @@ export class PlatformSchedulerIdentities {
           ? hostRolloutOf(ctx.deployment, PLATFORM_HOST_DEPLOYMENT, annotation)
           : { client: 'operator' },
         secret,
-        ctx.cas.platform.cert,
+        ctx.cas.platform,
         (id) => platformUser(role, id),
+        schedulerClientBundle(ctx.cas),
       );
     }
     return { secrets, observed };
@@ -264,8 +285,13 @@ export class PlatformSchedulerIdentities {
   ): Promise<RollTarget | undefined> {
     const annotation = ROLL_ANNOTATIONS[role];
     if (transition.action === 'issue') {
-      const leaf = platformClientLeaf(role, transition.entry.current, ctx.cas.platform, ctx.now);
-      await this.put(secret, leaf, ctx.cas.platform.cert);
+      const leaf = platformClientLeaf(
+        role,
+        transition.entry.current,
+        ctx.cas.platform.current,
+        ctx.now,
+      );
+      await this.put(secret, leaf, schedulerClientBundle(ctx.cas));
       return annotation
         ? { annotation, digest: schedulerCertDigest(leaf.cert), due: true }
         : undefined;
@@ -316,9 +342,10 @@ export class PlatformSchedulerIdentities {
 
   /**
    * Re-issues the NATS server leaf in `di-scheduler-nats-tls` when it has at most
-   * {@link SCHEDULER_LEAF_RENEW_DAYS} days left (unless it already expires with the CA, #612) or
-   * does not verify against the platform CA: same
-   * CA, same Service names, and the bundle of both CAs, as the bootstrap writes it.
+   * {@link SCHEDULER_LEAF_RENEW_DAYS} days left (unless it already expires with the CA, #612), does
+   * not verify against the signing platform CA (after a switch, #629), or its `ca.crt` is not the
+   * bundle of both CA sets (a successor was published or an old CA retired): signed by the signing
+   * platform CA, for the same Service names, with that bundle, as the bootstrap writes it.
    */
   private async renewServer(cas: SchedulerCas, now: Date): Promise<void> {
     const { namespace } = this.cfg;
@@ -332,14 +359,16 @@ export class PlatformSchedulerIdentities {
       const notAfter = new Date(new X509Certificate(pem).validTo);
       return (
         notAfter.getTime() > now.getTime() + SCHEDULER_LEAF_RENEW_DAYS * DAY_MS ||
-        cappedByCa(notAfter, cas.platform.cert)
+        cappedByCa(notAfter, cas.platform.current.cert)
       );
     };
-    if (issuedBy(cas.platform.cert, cert, decode(secret.data?.['tls.key'])) && valid(cert)) return;
-    await this.put(
-      secret,
-      natsServerLeaf(namespace, cas.platform, now),
-      `${cas.platform.cert}${cas.tenant.cert}`,
-    );
+    const bundle = schedulerServerBundle(cas);
+    if (
+      issuedBy(cas.platform.current.cert, cert, decode(secret.data?.['tls.key'])) &&
+      valid(cert) &&
+      decode(secret.data?.['ca.crt']) === bundle
+    )
+      return;
+    await this.put(secret, natsServerLeaf(namespace, cas.platform.current, now), bundle);
   }
 }

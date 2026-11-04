@@ -169,8 +169,32 @@ const keptAsPrevious = (old: string | undefined, current: string, now: Date): ol
  * revoked (README, "CA rotation").
  */
 export function rotateCas(stored: StoredCas, profile: CaProfile, now: Date): ControllerCas {
-  const fresh = () =>
-    caCertificate(profile.commonName, CA_DAYS, now, profile.dnsNames, excludesIps(profile));
+  return rotateCaSet(
+    stored,
+    {
+      fresh: () =>
+        caCertificate(profile.commonName, CA_DAYS, now, profile.dnsNames, excludesIps(profile)),
+      wanted: (ca) => permittedKey(ca.cert) === profileKey(profile),
+    },
+    now,
+  );
+}
+
+/** How a CA set creates a CA, and which of its CAs carry what is wanted now. */
+export interface CaSource {
+  /** A new CA, valid from now. */
+  fresh: () => KeyPair;
+  /** True when `ca` (whose key is its own) carries the name constraints wanted now. */
+  wanted: (ca: KeyPair) => boolean;
+}
+
+/**
+ * {@link rotateCas} for any CA set: the same publish, switch and retire steps, with the CAs that
+ * `source` creates and accepts. The scheduler CAs (#629) rotate through it with their own name
+ * constraints.
+ */
+export function rotateCaSet(stored: StoredCas, source: CaSource, now: Date): ControllerCas {
+  const { fresh } = source;
   const current = usable(stored.current, now);
   const next = usable(stored.next, now);
   if (!current) {
@@ -187,8 +211,7 @@ export function rotateCas(stored: StoredCas, profile: CaProfile, now: Date): Con
     ...(keptAsPrevious(stored.previous, current.cert, now) ? { previous: stored.previous } : {}),
   };
   // A successor for names no longer wanted never signed, so it is dropped.
-  const wanted = (ca: KeyPair | undefined) =>
-    ca && permittedKey(ca.cert) === profileKey(profile) ? ca : undefined;
+  const wanted = (ca: KeyPair | undefined) => (ca && source.wanted(ca) ? ca : undefined);
   const renew = !wanted(current) || !certificateValid(current.cert, CA_RENEW_DAYS, now);
   return advance(cas, wanted(next) ?? (renew ? fresh() : undefined), fresh, now);
 }
@@ -226,3 +249,10 @@ export function leafNames(cas: ControllerCas, wanted: CertNames, served?: CertNa
       : wanted;
   return namesPermittedBy(cas.current.cert, names);
 }
+
+/**
+ * The trust bundle of `cas`, oldest first: `previous`, `current`, `next`. Switching which CA signs
+ * keeps the same bytes, so only publishing a successor and retiring `previous` change it.
+ */
+export const caBundle = (cas: ControllerCas): string =>
+  [cas.previous, cas.current.cert, cas.next?.cert].filter(Boolean).join('');

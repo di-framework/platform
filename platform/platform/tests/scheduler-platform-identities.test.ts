@@ -49,8 +49,10 @@ const clock = { now: START };
 class PlatformApi extends MemoryApi {
   /** Calls to fail once, by `<method> <path>`. */
   failOnce = new Set<string>();
+  /** Calls to fail every time, by `<method> <path>`. */
+  failAlways = new Set<string>();
   override async call<T>(method: string, path: string, body?: unknown): Promise<T> {
-    if (this.failOnce.delete(`${method} ${path}`)) {
+    if (this.failOnce.delete(`${method} ${path}`) || this.failAlways.has(`${method} ${path}`)) {
       this.operations.push({ method, path, body });
       throw new ApiError(500, 'Injected failure');
     }
@@ -471,12 +473,15 @@ describe('platform identity Secrets after propagation (#541 m6e-E)', () => {
   });
 });
 
-describe('platform identities in the CA last 30 days (#612)', () => {
+describe('platform identities in the CA last 30 days, not rotated (#612)', () => {
   it('issues each identity and the server leaf at most once, then writes nothing and logs once', async () => {
     const { api, controller } = await prepare();
     seedDeployment(api);
     await controller.tick();
-    const ca = data(api, `/api/v1/namespaces/${PKI}/secrets/${SCHEDULER_CA_SECRET}`);
+    // The rotation (#629) cannot be written, so the CA that still signs caps every leaf.
+    const caPath = `/api/v1/namespaces/${PKI}/secrets/${SCHEDULER_CA_SECRET}`;
+    api.failAlways.add(`PUT ${caPath}`);
+    const ca = data(api, caPath);
     const caEnd = new Date(new X509Certificate(decode(ca[CA_KEYS.platform.cert])).validTo);
     clock.now = new Date(caEnd.getTime() - 20 * DAY);
     api.operations.length = 0;
@@ -499,5 +504,6 @@ describe('platform identities in the CA last 30 days (#612)', () => {
     }
     expect(api.platformWrites()).toEqual([]);
     expect(warned('the scheduler platform CA expires')).toBe(1);
+    expect(warned(`rotating ${PKI}/${SCHEDULER_CA_SECRET} failed`)).toBe(1);
   });
 });
