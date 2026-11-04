@@ -34,7 +34,7 @@
  * for signing, and nothing here logs a key, a certificate or an issuance ID.
  */
 import { X509Certificate } from 'node:crypto';
-import type { ControllerCas } from './ca-rotation';
+import { CA_SWITCH_DEADLINE_DAYS, type ControllerCas } from './ca-rotation';
 import {
   COMPONENT,
   type Condition,
@@ -277,9 +277,12 @@ export async function observeHostRollout(
 
 /**
  * The scheduler CA sets to sign and trust with, or why they cannot sign yet. `rotationFailed` says
- * why a due rotation was not written; `cas` is then the sets as stored.
+ * why a due rotation was not written; `cas` is then the sets as stored. `switchBlocked` says which
+ * holders a due switch waits for.
  */
-export type SchedulerCasRead = { cas: SchedulerCas; rotationFailed?: string } | Pending;
+export type SchedulerCasRead =
+  | { cas: SchedulerCas; rotationFailed?: string; switchBlocked?: string }
+  | Pending;
 
 /** Which installation's scheduler PKI, in which platform namespace. */
 export interface SchedulerPkiScope {
@@ -290,46 +293,76 @@ export interface SchedulerPkiScope {
 const KINDS = ['platform', 'tenant'] as const;
 
 /**
- * True when every holder of the scheduler bundles of `cas` (#629) carries them: the NATS server's
- * `ca.crt` the server bundle, and each client Secret of the installation (the platform's and every
- * tenant's) the client bundle, so none is `stale` by its bundle; and no identity of the record
- * still has `previous`, so every host has been observed rolling onto its renewed Secret and every
- * operator is past its overlap. A slow or stalled host rollout holds the switch (the deadline
- * bounds that wait). A Secret this installation did not write is not a holder. Read only when a
- * switch waits for nothing else.
+ * How long after `previousUntil` an identity whose renewal still keeps `previous` holds the switch
+ * of a scheduler CA (days). A healthy slow host rollout finishes well within it, so it still holds
+ * the switch; a host group that never completes its rollout (no Deployment, a template never moved,
+ * pods that cannot start) holds it no longer than this, not for the whole rotation (#629).
  */
-async function holdersTrust(
+export const CA_HOLD_GRACE_DAYS = 1;
+const DAY_MS = 86_400_000;
+/** The most holders a blocked switch names in its log line; the rest are counted. */
+const BLOCKING_NAMED = 10;
+
+/**
+ * The holders of the scheduler bundles of `cas` (#629) that do not carry them yet, by kind and
+ * place (never their contents); none when the switch may come:
+ * - the NATS server Secret, when its `ca.crt` lacks the server bundle;
+ * - each client Secret of the installation (the platform's and every tenant's) whose `ca.crt`
+ *   lacks the client bundle, so it is still `stale` by its bundle;
+ * - each identity of the record that still has `previous` (a host rollout not yet observed, an
+ *   operator within its overlap), until {@link CA_HOLD_GRACE_DAYS} after its `previousUntil`.
+ *
+ * A Secret this installation did not write is not a holder. Read only when a switch waits for
+ * nothing else.
+ */
+async function holdersBlocking(
   api: IdentityApi,
   scope: SchedulerPkiScope,
   cas: SchedulerCas,
-): Promise<boolean> {
+  now: Date,
+): Promise<string[]> {
   const { installation, namespace } = scope;
   const record = await getIfExists<Stored>(
     api,
     configMapPath(schedulerPkiNamespace(namespace), SCHEDULER_IDENTITIES),
   );
   const text = record?.data?.[IDENTITIES_KEY];
-  const overlapping = Object.values(text ? parseIdentityRecord(text) : {}).some(
-    (entry) => entry.previous !== undefined,
-  );
-  if (overlapping) return false;
-  const holds = (secret: Stored, bundle: string) =>
-    bundleTrusts(decode(secret.data?.['ca.crt']) ?? '', bundle);
+  const blocking = Object.entries(text ? parseIdentityRecord(text) : {})
+    .filter(
+      ([, entry]) =>
+        entry.previous !== undefined &&
+        now.getTime() < Date.parse(entry.previousUntil ?? '') + CA_HOLD_GRACE_DAYS * DAY_MS,
+    )
+    .map(([key]) => `identity ${key} (renewal in progress)`);
+  const lacks = (secret: Stored, bundle: string) =>
+    !bundleTrusts(decode(secret.data?.['ca.crt']) ?? '', bundle);
+  const where = (secret: Stored) => `${secret.metadata.namespace}/${secret.metadata.name}`;
   for (const name of Object.values(PLATFORM_SECRETS)) {
     const secret = await getIfExists<Stored>(api, secretPath(namespace, name));
     const labels = secret?.metadata.labels;
     if (labels?.[INSTALLATION] !== installation || labels[COMPONENT] !== SCHEDULER_PKI_COMPONENT)
       continue;
-    const bundle =
-      name === PLATFORM_SECRETS.server ? schedulerServerBundle(cas) : schedulerClientBundle(cas);
-    if (!holds(secret as Stored, bundle)) return false;
+    const server = name === PLATFORM_SECRETS.server;
+    if (lacks(secret as Stored, server ? schedulerServerBundle(cas) : schedulerClientBundle(cas)))
+      blocking.push(`${server ? 'server' : 'client'} Secret ${namespace}/${name} (ca.crt)`);
   }
   const selector = `${INSTALLATION}=${installation},${COMPONENT}=${SCHEDULER_IDENTITY_COMPONENT}`;
   const tenants = await api.call<{ items: Stored[] }>(
     'GET',
     `/api/v1/secrets?labelSelector=${encodeURIComponent(selector)}`,
   );
-  return tenants.items.every((secret) => holds(secret, schedulerClientBundle(cas)));
+  for (const secret of tenants.items)
+    if (lacks(secret, schedulerClientBundle(cas)))
+      blocking.push(`client Secret ${where(secret)} (ca.crt)`);
+  return blocking;
+}
+
+/** The log line of a switch that `blocking` holds, naming at most {@link BLOCKING_NAMED} of them. */
+function switchBlocked(blocking: string[]): string {
+  const sorted = [...blocking].sort((a, b) => a.localeCompare(b));
+  const named = sorted.slice(0, BLOCKING_NAMED).join(', ');
+  const more = sorted.length > BLOCKING_NAMED ? ` and ${sorted.length - BLOCKING_NAMED} more` : '';
+  return `the scheduler CA switch is due but waits for ${named}${more}; it comes once they carry the successor, at the latest ${CA_SWITCH_DEADLINE_DAYS} days before the signing CA expires`;
 }
 
 /**
@@ -338,7 +371,8 @@ async function holdersTrust(
  * (publishes a successor, switches to it, retires the old CA, or drops an unusable successor) is
  * written under the resourceVersion it was read with, before any of it signs or is trusted: a CA
  * whose key was never stored never signs. A switch that waits only for the holders of the bundles
- * reads them ({@link holdersTrust}) and comes once they all carry the successor. When the write
+ * reads them ({@link holdersBlocking}) and comes once none blocks it; until then `switchBlocked`
+ * names those that do. When the write
  * fails, what is stored still signs and the rotation is retried on the next call. Key material
  * stays in memory and out of every message.
  */
@@ -376,11 +410,12 @@ export async function loadSchedulerCas(
   // The same pass with every holder trusting: the holders are read only when that switches a set.
   const ready = rotate(true) as SchedulerCas;
   const unswitched = rotated;
-  if (
-    KINDS.some((kind) => ready[kind].current.cert !== unswitched[kind].current.cert) &&
-    (await holdersTrust(api, scope, unswitched))
-  )
-    rotated = ready;
+  let blocked: { switchBlocked: string } | undefined;
+  if (KINDS.some((kind) => ready[kind].current.cert !== unswitched[kind].current.cert)) {
+    const blocking = await holdersBlocking(api, scope, unswitched, now);
+    if (blocking.length === 0) rotated = ready;
+    else blocked = { switchBlocked: switchBlocked(blocking) };
+  }
   const data: Record<string, string> = { ...secret.data };
   for (const kind of KINDS)
     for (const [key, value] of Object.entries(schedulerCaData(kind, rotated[kind])))
@@ -390,32 +425,36 @@ export async function loadSchedulerCas(
   const changed =
     Object.keys(data).length !== Object.keys(before).length ||
     Object.entries(data).some(([key, value]) => before[key] !== value);
-  if (!changed) return { cas: rotated };
+  if (!changed) return { cas: rotated, ...blocked };
   try {
     await api.call('PUT', path, { apiVersion: 'v1', kind: 'Secret', ...secret, data });
-    return { cas: rotated };
+    return { cas: rotated, ...blocked };
   } catch (error) {
     const asStored = sets((kind) => readSchedulerCaSet(kind, namespace, stored(kind), now));
     if ('reason' in asStored) return asStored;
     const message = error instanceof Error ? error.message : String(error);
     return {
       cas: asStored,
+      ...blocked,
       rotationFailed: `the scheduler CA rotation write to ${pki}/${SCHEDULER_CA_SECRET} was refused (${message}); the stored CAs keep signing and the write will be retried on the next pass`,
     };
   }
 }
 
 /**
- * Logs a refused scheduler CA rotation write ({@link SchedulerCasRead}) once per distinct message,
- * prefixed with the pass that read it, until a pass reads the CAs without one.
+ * Logs what a scheduler CA read ({@link SchedulerCasRead}) reports, prefixed with the pass that
+ * read it: a refused rotation write, and a due switch its holders block. Each once per distinct
+ * message, until a pass reads the CAs without one.
  */
 export class RotationFailureLog {
-  private last = '';
+  private readonly last = { rotationFailed: '', switchBlocked: '' };
   constructor(private readonly source: string) {}
   report(read: SchedulerCasRead): void {
-    const failed = ('rotationFailed' in read && read.rotationFailed) || '';
-    if (failed && failed !== this.last) console.warn(`${this.source}: ${failed}`);
-    this.last = failed;
+    for (const field of ['rotationFailed', 'switchBlocked'] as const) {
+      const message = ('cas' in read && read[field]) || '';
+      if (message && message !== this.last[field]) console.warn(`${this.source}: ${message}`);
+      this.last[field] = message;
+    }
   }
 }
 

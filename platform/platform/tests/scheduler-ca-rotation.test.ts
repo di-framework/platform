@@ -10,6 +10,7 @@ import { ApiError } from '../src/tenancy/controller';
 import { COMPONENT, INSTALLATION, names, OWNER, type Resource } from '../src/tenancy/resources';
 import {
   bundleTrusts,
+  CA_HOLD_GRACE_DAYS,
   loadSchedulerCas,
   observeIdentity,
   SCHEDULER_CA_EXPIRING,
@@ -73,6 +74,7 @@ const clientPaths = (['operator', 'host', 'data'] as const).map((r) =>
 );
 const hostPath = `/api/v1/namespaces/${names('alpha').runtimeNamespace}/secrets/${TENANT_HOST_SECRET}`;
 const operatorPath = '/api/v1/namespaces/di-operator-alpha/secrets/di-scheduler-operator-tls';
+const tenantHosts = `/apis/apps/v1/namespaces/${names('alpha').runtimeNamespace}/deployments/hostgroup-${names('alpha').hostgroup}`;
 const b64 = (text: string) => Buffer.from(text).toString('base64');
 const decode = (value: string | undefined) => Buffer.from(value ?? '', 'base64').toString('utf8');
 const print = (pem: string) => new X509Certificate(pem).fingerprint256;
@@ -685,17 +687,16 @@ async function prepare(tenant: boolean) {
   // dropped: an entry with `previous` holds the switch (#629). The harness does not render the
   // tenant's host group, so after each tick its template takes the digest of the certificate in
   // the host Secret, as the controller renders it.
-  const tenantHosts = `/apis/apps/v1/namespaces/${names('alpha').runtimeNamespace}/deployments/hostgroup-${names('alpha').hostgroup}`;
   const controller = {
     async tick() {
       await harness.controller.tick();
       const secret = api.objects.get(hostPath) as unknown as
         | { data: Record<string, string> }
         | undefined;
-      const hosts = api.objects.get(tenantHosts) as unknown as {
-        spec: { template: { metadata: { annotations: Record<string, string> } } };
-      };
-      if (secret)
+      const hosts = api.objects.get(tenantHosts) as unknown as
+        | { spec: { template: { metadata: { annotations: Record<string, string> } } } }
+        | undefined;
+      if (secret && hosts)
         hosts.spec.template.metadata.annotations[SCHEDULER_TLS_ANNOTATION] = schedulerCertDigest(
           decode(secret.data['tls.crt']),
         );
@@ -857,6 +858,55 @@ describe('controller tick: the platform path rotates the platform scheduler CA (
 });
 
 describe('controller tick: the tenant path rotates both scheduler CAs (#629)', () => {
+  it('a tenant whose host group never rolls holds the switch only until previousUntil plus the grace, and is named once', async () => {
+    const { api, controller, old, end } = await prepare(true);
+    // The tenant's host group is gone, so no rollout of a renewed host certificate is observed
+    // and its entry keeps `previous`.
+    api.objects.delete(tenantHosts);
+    api.refuseCa = true;
+    at(end - 20 * DAY);
+    await settle(controller);
+    api.refuseCa = false;
+    await controller.tick();
+    const next = storedSet(api, 'platform').next as KeyPair;
+    await settle(controller);
+    const record = JSON.parse(
+      (api.objects.get(recordPath) as unknown as { data: Record<string, string> }).data[
+        IDENTITIES_KEY
+      ] as string,
+    ) as Record<string, { previous?: string; previousUntil?: string }>;
+    const hosts = record['tenant/alpha/hosts'];
+    expect(hosts?.previous).toBeDefined();
+    for (const [key, entry] of Object.entries(record))
+      if (key !== 'tenant/alpha/hosts') expect(entry.previous).toBeUndefined();
+    const until = Date.parse(hosts?.previousUntil as string);
+    // Every Secret carries the successor; only the stalled host renewal holds the switch.
+    at(until + CA_HOLD_GRACE_DAYS * DAY - 60_000);
+    await controller.tick();
+    await controller.tick();
+    expect(storedSet(api, 'platform').current).toEqual(old.platform);
+    const blocked =
+      'the scheduler CA switch is due but waits for identity tenant/alpha/hosts (renewal in progress);';
+    expect(warned(`Tenant scheduler identities: ${blocked}`)).toBe(1);
+    expect(warned(`Platform scheduler identities: ${blocked}`)).toBe(1);
+    // Past the grace it no longer holds: the switch comes, and every leaf is re-signed.
+    at(until + CA_HOLD_GRACE_DAYS * DAY);
+    await settle(controller);
+    expect(storedSet(api, 'platform')).toEqual({ current: next, previous: old.platform.cert });
+    await settle(controller);
+    const healthy = [serverPath, ...clientPaths, operatorPath];
+    for (const path of [...healthy, hostPath])
+      expect(
+        signedBy(
+          api,
+          path,
+          path === hostPath ? (storedSet(api, 'tenant').current as KeyPair).cert : next.cert,
+        ),
+      ).toBe(true);
+    expect(await quiet(api, controller, healthy, 3, DAY)).toBe(0);
+    expect(warned(`Tenant scheduler identities: ${blocked}`)).toBe(1);
+  });
+
   it('publishes one successor, re-signs the host and operator leaves once against it, then retires the old CA', async () => {
     const { api, controller, old, end } = await prepare(true);
     const leaves = [hostPath, operatorPath];
