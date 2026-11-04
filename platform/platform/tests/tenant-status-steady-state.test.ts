@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { collection, mergePatch, sameValue } from '../src/tenancy/controller';
 import { INSTALLATION, VERSION } from '../src/tenancy/resources';
-import { MemoryApi, prepare, START, stored, tenantPath } from './support/controller-harness';
+import { MemoryApi, prepare, START, stored } from './support/controller-harness';
 
 // #595: the API server returns status keys sorted, so the controller must compare the Tenant
 // status structurally or it PATCHes every Tenant's status on every tick.
