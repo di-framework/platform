@@ -30,8 +30,9 @@
  * - **CA rotation (#629).** {@link loadSchedulerCas} advances the rotation of both scheduler CAs
  *   first. A published successor joins the server's bundle at once and, through a renewal, each
  *   client's `ca.crt`; after the switch every leaf the old CA signed, the server's included, is
- *   re-signed by the new one. A rotation that cannot be written is logged and retried; renewal
- *   goes on under the CA that still signs.
+ *   re-signed by the new one. The switch waits until every holder carries the successor. A
+ *   rotation that cannot be written is logged once and retried; renewal goes on under the CA that
+ *   still signs.
  * - **Failures** are logged once per distinct message and retried on the next tick; nothing here
  *   retries within a tick, and a steady state writes nothing.
  *
@@ -50,6 +51,7 @@ import {
   loadSchedulerCas,
   observeIdentity,
   putIdentityRecord,
+  RotationFailureLog,
   type Stored,
 } from './scheduler-identities';
 import { SCHEDULER_NATS_ACCOUNTS } from './scheduler-nats';
@@ -103,8 +105,6 @@ interface Context {
   pki: string;
   now: Date;
   cas: SchedulerCas;
-  /** Why this tick's CA rotation was not written, if it was not. */
-  rotationFailed?: string;
   stored: Stored;
   record: IdentityRecord;
   deployment: HostDeployment | undefined;
@@ -127,6 +127,7 @@ export class PlatformSchedulerIdentities {
   /** Per record key, how long its renewed user has waited to propagate, and which were logged. */
   private readonly waits = new PropagationWaits();
   private readonly waitLogged = new Set<string>();
+  private readonly rotationLog = new RotationFailureLog('Platform scheduler identities');
 
   constructor(
     private readonly api: IdentityApi,
@@ -180,9 +181,11 @@ export class PlatformSchedulerIdentities {
     const pki = schedulerPkiNamespace(namespace);
     if (!(await getIfExists(this.api, `/api/v1/namespaces/${pki}`))) return undefined;
     const now = this.now();
-    const loaded = await loadSchedulerCas(this.api, namespace, now);
+    const loaded = await loadSchedulerCas(this.api, this.cfg, now);
+    // Before the record is read, so a refused rotation is seen even without it.
+    this.rotationLog.report(loaded);
     if ('reason' in loaded) return undefined;
-    const { cas, rotationFailed } = loaded;
+    const { cas } = loaded;
     const stored = await getIfExists<Stored>(
       this.api,
       `/api/v1/namespaces/${pki}/configmaps/${SCHEDULER_IDENTITIES}`,
@@ -197,7 +200,6 @@ export class PlatformSchedulerIdentities {
       pki,
       now,
       cas,
-      ...(rotationFailed ? { rotationFailed } : {}),
       stored,
       record,
       deployment,
@@ -232,8 +234,6 @@ export class PlatformSchedulerIdentities {
     await this.rollHosts(ctx.deployment, targets);
     this.logStall(next.stalled.length > 0);
     this.logCaExpiring(next.caExpiring.length > 0, ctx.cas.platform.current.cert);
-    // Logged once by `reconcile`, after this tick's renewals under the CA that still signs.
-    if (ctx.rotationFailed) throw new Error(ctx.rotationFailed);
   }
 
   /** Logs once that the platform CA caps the identities it signs, until it no longer does (#612). */

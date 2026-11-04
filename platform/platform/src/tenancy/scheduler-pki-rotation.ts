@@ -21,7 +21,10 @@
  * - **CA rotation** (#629): a certificate signed by a CA that no longer signs, or whose Secret's
  *   trust bundle lacks a CA of the current set, is `stale`. It is renewed as above whatever its
  *   expiry, capped or not, so each published successor reaches every client's bundle and each
- *   switch re-signs every leaf against the new CA, once.
+ *   switch re-signs every leaf against the new CA, once. Only once a renewal in progress is
+ *   complete, though: while the entry still has `previous` (a host rollout not yet observed, an
+ *   operator within `previousUntil`) the stale leaf is kept and renewed on a later pass, unless
+ *   the host group has no Deployment, so no pod presents either user.
  * - **Pending issuance**: the Secret's certificate carries another ID than the recorded `current`
  *   (the record was written but issuance did not land). The certificate is re-issued for the
  *   recorded `current`; no new ID is drawn and `previous` stays, with `previousUntil` moved to now
@@ -195,7 +198,10 @@ export function identityTransition(
   const annotate =
     observed.client === 'host' ? { [SCHEDULER_TLS_ANNOTATION]: secret.digest } : undefined;
   const due = secret.notAfter.getTime() <= now.getTime() + SCHEDULER_LEAF_RENEW_DAYS * DAY_MS;
-  if ((due && !secret.capped) || secret.stale)
+  // A stale leaf waits until a renewal in progress is complete (no `previous`), so the user its
+  // running pods present is never dropped (#629); a host group with no Deployment has no such pod.
+  const settled = entry.previous === undefined || (observed.client === 'host' && !observed.rollout);
+  if ((due && !secret.capped) || (secret.stale && settled))
     return {
       entry: {
         current: id(),

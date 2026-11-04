@@ -504,6 +504,9 @@ describe('platform identities in the CA last 30 days, not rotated (#612)', () =>
     }
     expect(api.platformWrites()).toEqual([]);
     expect(warned('the scheduler platform CA expires')).toBe(1);
-    expect(warned(`rotating ${PKI}/${SCHEDULER_CA_SECRET} failed`)).toBe(1);
+    // Once by each pass, the platform's and the tenants'.
+    const refused = `the scheduler CA rotation write to ${PKI}/${SCHEDULER_CA_SECRET} was refused`;
+    expect(warned(`Platform scheduler identities: ${refused}`)).toBe(1);
+    expect(warned(`Tenant scheduler identities: ${refused}`)).toBe(1);
   });
 });

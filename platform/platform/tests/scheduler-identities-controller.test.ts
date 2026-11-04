@@ -36,7 +36,11 @@ const caPath = `/api/v1/namespaces/${PKI}/secrets/${SCHEDULER_CA_SECRET}`;
 const clock = { now: START };
 
 class IdentityApi extends MemoryApi {
-  /** Refuses every write of `di-scheduler-ca`, so the scheduler CAs cannot be rotated (#629). */
+  /**
+   * Refuses every write of `di-scheduler-ca`, so the scheduler CAs cannot be rotated (#629). It
+   * throws before `super.call`, so the refused PUT is not in `operations`: each tick still makes
+   * one refused PUT per pass (every tenant pass and the platform pass), it is just not counted.
+   */
   refuseCaWrites = false;
   override async call<T>(method: string, path: string, body?: unknown): Promise<T> {
     if (this.refuseCaWrites && method === 'PUT' && path === caPath)

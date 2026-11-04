@@ -23,6 +23,13 @@ export const LEAF_RENEW_DAYS = 30;
  * least this many days, so the controller and hosts roll before it is retired.
  */
 export const MIN_POST_SWITCH_DAYS = CA_OVERLAP_DAYS / 2;
+/**
+ * A gated CA set ({@link CaSource.gate}) switches to a published successor this many days before
+ * its signing CA expires even while a holder still lacks the successor: the last resort, so a CA
+ * that expires never blocks the switch. Two days leave the controller a day of passes to re-sign
+ * every leaf against the successor before the old CA is gone.
+ */
+export const CA_SWITCH_DEADLINE_DAYS = 2;
 
 /**
  * The tenant controller's certificate authorities. Only `current` signs the serving leaf; the
@@ -129,7 +136,11 @@ const retainedUntil = (old: string, current: string): number => {
   return Math.min(oldEnd, created + days * DAY_MS);
 };
 /** Whether `old` is a CA that has not expired and stays `previous` beside `current` at `now`. */
-const keptAsPrevious = (old: string | undefined, current: string, now: Date): old is string =>
+export const keptAsPrevious = (
+  old: string | undefined,
+  current: string,
+  now: Date,
+): old is string =>
   old !== current && trustedCa(old, now) && now.getTime() < retainedUntil(old, current);
 
 /**
@@ -186,12 +197,20 @@ export interface CaSource {
   fresh: () => KeyPair;
   /** True when `ca` (whose key is its own) carries the name constraints wanted now. */
   wanted: (ca: KeyPair) => boolean;
+  /**
+   * Set for a CA set whose holders take up a published successor at their own pace (the scheduler
+   * CAs, #629): the switch then never comes in the pass that publishes the successor, and comes
+   * only once `holdersTrust` (every holder's trust bundle carries the successor) or, as a last
+   * resort, within {@link CA_SWITCH_DEADLINE_DAYS} of the signing CA's expiry. Absent, the switch
+   * follows the overlap alone and comes at once in the signing CA's last {@link LEAF_RENEW_DAYS}.
+   */
+  gate?: { holdersTrust: boolean };
 }
 
 /**
  * {@link rotateCas} for any CA set: the same publish, switch and retire steps, with the CAs that
  * `source` creates and accepts. The scheduler CAs (#629) rotate through it with their own name
- * constraints.
+ * constraints, and a switch gated on their holders ({@link CaSource.gate}).
  */
 export function rotateCaSet(stored: StoredCas, source: CaSource, now: Date): ControllerCas {
   const { fresh } = source;
@@ -213,24 +232,36 @@ export function rotateCaSet(stored: StoredCas, source: CaSource, now: Date): Con
   // A successor for names no longer wanted never signed, so it is dropped.
   const wanted = (ca: KeyPair | undefined) => (ca && source.wanted(ca) ? ca : undefined);
   const renew = !wanted(current) || !certificateValid(current.cert, CA_RENEW_DAYS, now);
-  return advance(cas, wanted(next) ?? (renew ? fresh() : undefined), fresh, now);
+  const published = wanted(next);
+  return advance(cas, published ?? (renew ? fresh() : undefined), !!published, source, now);
 }
 
-/** The switch step for `cas` (whose current CA can sign) and its published successor `next`. */
+/**
+ * The switch step for `cas` (whose current CA can sign) and its successor `next`, which was
+ * stored before this pass when `published`, or created in it.
+ */
 function advance(
   cas: ControllerCas,
   next: KeyPair | undefined,
-  fresh: () => KeyPair,
+  published: boolean,
+  source: CaSource,
   now: Date,
 ): ControllerCas {
   if (!next) return cas;
   const expiring = !certificateValid(cas.current.cert, LEAF_RENEW_DAYS, now);
-  if (!expiring && ageDays(next.cert, now) < CA_OVERLAP_DAYS) return { ...cas, next };
+  const due = expiring || ageDays(next.cert, now) >= CA_OVERLAP_DAYS;
+  if (source.gate) {
+    const deadline = !certificateValid(cas.current.cert, CA_SWITCH_DEADLINE_DAYS, now);
+    return published && (deadline || (due && source.gate.holdersTrust))
+      ? { current: next, previous: cas.current.cert }
+      : { ...cas, next };
+  }
+  if (!due) return { ...cas, next };
   const keptFor = (retainedUntil(cas.current.cert, next.cert) - now.getTime()) / DAY_MS;
   if (expiring || keptFor >= MIN_POST_SWITCH_DAYS)
     return { current: next, previous: cas.current.cert };
   // The old CA would leave the bundle too soon after the switch, while its leaf is still served.
-  return { ...cas, next: fresh() };
+  return { ...cas, next: source.fresh() };
 }
 
 /**

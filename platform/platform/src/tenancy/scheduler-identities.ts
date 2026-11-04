@@ -59,11 +59,13 @@ import {
   SCHEDULER_CA_SECRET,
   SCHEDULER_IDENTITIES,
   SCHEDULER_LEAF_DAYS,
+  SCHEDULER_PKI_COMPONENT,
   type SchedulerCaKind,
   type SchedulerCas,
   schedulerCaData,
   schedulerClientBundle,
   schedulerPkiNamespace,
+  schedulerServerBundle,
   serializeIdentityRecord,
   storedSchedulerCas,
   tenantHostUser,
@@ -279,19 +281,74 @@ export async function observeHostRollout(
  */
 export type SchedulerCasRead = { cas: SchedulerCas; rotationFailed?: string } | Pending;
 
+/** Which installation's scheduler PKI, in which platform namespace. */
+export interface SchedulerPkiScope {
+  installation: string;
+  namespace: string;
+}
+
+const KINDS = ['platform', 'tenant'] as const;
+
+/**
+ * True when every holder of the scheduler bundles of `cas` (#629) carries them: the NATS server's
+ * `ca.crt` the server bundle, and each client Secret of the installation (the platform's and every
+ * tenant's) the client bundle, so none is `stale` by its bundle; and no identity of the record is
+ * still within its renewal overlap (`previousUntil`), so a host has had that long to roll onto its
+ * renewed Secret and an operator to reconnect with it. A Secret this installation did not write is
+ * not a holder. Read only when a switch waits for nothing else.
+ */
+async function holdersTrust(
+  api: IdentityApi,
+  scope: SchedulerPkiScope,
+  cas: SchedulerCas,
+  now: Date,
+): Promise<boolean> {
+  const { installation, namespace } = scope;
+  const record = await getIfExists<Stored>(
+    api,
+    configMapPath(schedulerPkiNamespace(namespace), SCHEDULER_IDENTITIES),
+  );
+  const text = record?.data?.[IDENTITIES_KEY];
+  const overlapping = Object.values(text ? parseIdentityRecord(text) : {}).some(
+    (entry) =>
+      entry.previous !== undefined && Date.parse(entry.previousUntil ?? '') > now.getTime(),
+  );
+  if (overlapping) return false;
+  const holds = (secret: Stored, bundle: string) =>
+    bundleTrusts(decode(secret.data?.['ca.crt']) ?? '', bundle);
+  for (const name of Object.values(PLATFORM_SECRETS)) {
+    const secret = await getIfExists<Stored>(api, secretPath(namespace, name));
+    const labels = secret?.metadata.labels;
+    if (labels?.[INSTALLATION] !== installation || labels[COMPONENT] !== SCHEDULER_PKI_COMPONENT)
+      continue;
+    const bundle =
+      name === PLATFORM_SECRETS.server ? schedulerServerBundle(cas) : schedulerClientBundle(cas);
+    if (!holds(secret as Stored, bundle)) return false;
+  }
+  const selector = `${INSTALLATION}=${installation},${COMPONENT}=${SCHEDULER_IDENTITY_COMPONENT}`;
+  const tenants = await api.call<{ items: Stored[] }>(
+    'GET',
+    `/api/v1/secrets?labelSelector=${encodeURIComponent(selector)}`,
+  );
+  return tenants.items.every((secret) => holds(secret, schedulerClientBundle(cas)));
+}
+
 /**
  * Both scheduler CA sets from `<namespace>-scheduler-pki/di-scheduler-ca`, after one rotation pass
  * at `now` ({@link nextSchedulerCas}, #629), or why they cannot sign yet. A pass that changes a set
  * (publishes a successor, switches to it, retires the old CA, or drops an unusable successor) is
  * written under the resourceVersion it was read with, before any of it signs or is trusted: a CA
- * whose key was never stored never signs. When that write fails, what is stored still signs and
- * the rotation is retried on the next call. Key material stays in memory and out of every message.
+ * whose key was never stored never signs. A switch that waits only for the holders of the bundles
+ * reads them ({@link holdersTrust}) and comes once they all carry the successor. When the write
+ * fails, what is stored still signs and the rotation is retried on the next call. Key material
+ * stays in memory and out of every message.
  */
 export async function loadSchedulerCas(
   api: IdentityApi,
-  namespace: string,
+  scope: SchedulerPkiScope,
   now: Date,
 ): Promise<SchedulerCasRead> {
+  const { namespace } = scope;
   const pki = schedulerPkiNamespace(namespace);
   const path = secretPath(pki, SCHEDULER_CA_SECRET);
   const secret = await getIfExists<Stored>(api, path);
@@ -304,7 +361,7 @@ export async function loadSchedulerCas(
     read: (kind: SchedulerCaKind) => ControllerCas | string,
   ): SchedulerCas | Pending => {
     const cas = {} as SchedulerCas;
-    for (const kind of ['platform', 'tenant'] as const) {
+    for (const kind of KINDS) {
       const set = read(kind);
       if (typeof set === 'string')
         return { reason: 'CaNotReady', message: `${pki}/${SCHEDULER_CA_SECRET}: ${set}` };
@@ -313,10 +370,20 @@ export async function loadSchedulerCas(
     return cas;
   };
   const stored = (kind: SchedulerCaKind) => storedSchedulerCas(secret.data, kind);
-  const rotated = sets((kind) => nextSchedulerCas(kind, namespace, stored(kind), now));
+  const rotate = (trusted: boolean) =>
+    sets((kind) => nextSchedulerCas(kind, namespace, stored(kind), now, trusted));
+  let rotated = rotate(false);
   if ('reason' in rotated) return rotated;
+  // The same pass with every holder trusting: the holders are read only when that switches a set.
+  const ready = rotate(true) as SchedulerCas;
+  const unswitched = rotated;
+  if (
+    KINDS.some((kind) => ready[kind].current.cert !== unswitched[kind].current.cert) &&
+    (await holdersTrust(api, scope, unswitched, now))
+  )
+    rotated = ready;
   const data: Record<string, string> = { ...secret.data };
-  for (const kind of ['platform', 'tenant'] as const)
+  for (const kind of KINDS)
     for (const [key, value] of Object.entries(schedulerCaData(kind, rotated[kind])))
       if (value === undefined) delete data[key];
       else data[key] = value;
@@ -334,8 +401,22 @@ export async function loadSchedulerCas(
     const message = error instanceof Error ? error.message : String(error);
     return {
       cas: asStored,
-      rotationFailed: `rotating ${pki}/${SCHEDULER_CA_SECRET} failed: ${message}`,
+      rotationFailed: `the scheduler CA rotation write to ${pki}/${SCHEDULER_CA_SECRET} was refused (${message}); the stored CAs keep signing and the write will be retried on the next pass`,
     };
+  }
+}
+
+/**
+ * Logs a refused scheduler CA rotation write ({@link SchedulerCasRead}) once per distinct message,
+ * prefixed with the pass that read it, until a pass reads the CAs without one.
+ */
+export class RotationFailureLog {
+  private last = '';
+  constructor(private readonly source: string) {}
+  report(read: SchedulerCasRead): void {
+    const failed = ('rotationFailed' in read && read.rotationFailed) || '';
+    if (failed && failed !== this.last) console.warn(`${this.source}: ${failed}`);
+    this.last = failed;
   }
 }
 
@@ -416,6 +497,7 @@ export class TenantSchedulerIdentities {
   private readonly awaiting = new Map<string, string>();
   /** Per record key, how long its user has waited to propagate. */
   private readonly waits = new PropagationWaits();
+  private readonly rotationLog = new RotationFailureLog('Tenant scheduler identities');
   constructor(
     private readonly api: IdentityApi,
     private readonly cfg: { installation: string; namespace: string },
@@ -492,12 +574,11 @@ export class TenantSchedulerIdentities {
     ];
   }
 
-  /**
-   * The CA sets, after this pass's rotation. A failed rotation write is not reported here: the
-   * platform identities, reconciled after every tenant in the same tick, retry and log it.
-   */
-  private cas(): Promise<SchedulerCasRead> {
-    return loadSchedulerCas(this.api, this.cfg.namespace, this.now());
+  /** The CA sets, after this pass's rotation; a refused rotation write is logged once. */
+  private async cas(): Promise<SchedulerCasRead> {
+    const read = await loadSchedulerCas(this.api, this.cfg, this.now());
+    this.rotationLog.report(read);
+    return read;
   }
 
   /**

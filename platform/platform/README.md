@@ -802,10 +802,14 @@ Renewal and rotation:
   `di-scheduler-ca` (keys `<kind>-ca.*`, `<kind>-next-ca.*` and `<kind>-previous-ca.crt`). 90 days
   before a CA expires it publishes a successor. The server's `ca.crt` (its `ca_file`) carries every
   CA of both sets at once, and each client Secret's `ca.crt` carries the platform set, delivered
-  by a routine renewal so hosts roll onto it. 30 days later the successor signs: every leaf the old
-  CA signed, the server's included, is renewed once against it, and the old CA stays trusted until
-  it expires, then leaves the bundles. A rotation the controller cannot write is logged and retried
-  on every pass; renewal goes on under the CA that still signs.
+  by a routine renewal so hosts roll onto it. The successor signs 30 days later, and only once
+  every client Secret and the server carry it and no renewal is still in its overlap; never in the
+  pass that publishes it, even when a late rotation finds less than 30 days left. A client that
+  never takes it up delays the switch until 2 days before the old CA expires. Then every leaf the
+  old CA signed, the server's included, is renewed once against the successor, and the old CA
+  stays trusted until it expires, then leaves the bundles. A rotation the controller cannot write
+  is logged once (the CA rotation write was refused and will be retried) and retried on every
+  pass; renewal goes on under the CA that still signs.
 - **CA expiry.** A leaf cannot outlive the CA that signs it, so in a scheduler CA's last 30 days a
   renewed leaf would be capped at the CA's expiry and due again at once. A leaf that already
   expires with its CA is therefore kept, not renewed. This happens only while a rotation cannot be

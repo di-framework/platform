@@ -25,6 +25,7 @@ import {
   CA_DAYS,
   type ControllerCas,
   caBundle,
+  keptAsPrevious,
   LEAF_RENEW_DAYS,
   rotateCaSet,
   type StoredCas,
@@ -269,9 +270,9 @@ export function readSchedulerCaSet(
   return {
     current: stored.current as KeyPair,
     ...(next && !schedulerCaFault(kind, namespace, next, now) ? { next: next as KeyPair } : {}),
-    ...(previous && certificateValid(previous, 0, now) && caConstraints(previous)
-      ? { previous }
-      : {}),
+    // The rotation's own bound (`keptAsPrevious`), so the bundles are the same whether or not a
+    // rotation write lands.
+    ...(keptAsPrevious(previous, (stored.current as KeyPair).cert, now) ? { previous } : {}),
   };
 }
 
@@ -281,9 +282,12 @@ export function readSchedulerCaSet(
  *
  * 1. **Publish.** Within `CA_RENEW_DAYS` of the signing CA's expiry a successor is created. It
  *    joins every trust bundle while the current CA still signs.
- * 2. **Switch.** Once the successor is `CA_OVERLAP_DAYS` old (at once when the current CA has less
- *    than {@link LEAF_RENEW_DAYS} left) it signs, and the old CA becomes `previous`. Every leaf the
- *    old CA signed is then renewed against the new one.
+ * 2. **Switch.** Never in the pass that publishes the successor. Once it is `CA_OVERLAP_DAYS` old
+ *    (sooner when the current CA has less than {@link LEAF_RENEW_DAYS} left) and `holdersTrust`
+ *    (every client Secret's and the server's `ca.crt` carries it, see `loadSchedulerCas`), it
+ *    signs and the old CA becomes `previous`; within `CA_SWITCH_DEADLINE_DAYS` of the current
+ *    CA's expiry it signs whether or not they do. Every leaf the old CA signed is then renewed
+ *    against the new one.
  * 3. **Retire.** `previous` leaves the bundles when it expires.
  *
  * A successor that does not pass {@link schedulerCaFault} is dropped and a new one published. A
@@ -296,6 +300,7 @@ export function nextSchedulerCas(
   namespace: string,
   stored: StoredCas,
   now: Date,
+  holdersTrust = false,
 ): ControllerCas | string {
   const fault = (ca: Partial<KeyPair>) => schedulerCaFault(kind, namespace, ca, now);
   const currentFault = fault(stored.current ?? {});
@@ -303,7 +308,11 @@ export function nextSchedulerCas(
   if (currentFault && !next) return currentFault;
   return rotateCaSet(
     currentFault ? { next } : { current: stored.current, next, previous: stored.previous },
-    { fresh: () => newSchedulerCa(kind, namespace, now), wanted: (ca) => !fault(ca) },
+    {
+      fresh: () => newSchedulerCa(kind, namespace, now),
+      wanted: (ca) => !fault(ca),
+      gate: { holdersTrust },
+    },
     now,
   );
 }
