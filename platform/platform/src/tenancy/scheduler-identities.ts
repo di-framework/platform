@@ -292,16 +292,16 @@ const KINDS = ['platform', 'tenant'] as const;
 /**
  * True when every holder of the scheduler bundles of `cas` (#629) carries them: the NATS server's
  * `ca.crt` the server bundle, and each client Secret of the installation (the platform's and every
- * tenant's) the client bundle, so none is `stale` by its bundle; and no identity of the record is
- * still within its renewal overlap (`previousUntil`), so a host has had that long to roll onto its
- * renewed Secret and an operator to reconnect with it. A Secret this installation did not write is
- * not a holder. Read only when a switch waits for nothing else.
+ * tenant's) the client bundle, so none is `stale` by its bundle; and no identity of the record
+ * still has `previous`, so every host has been observed rolling onto its renewed Secret and every
+ * operator is past its overlap. A slow or stalled host rollout holds the switch (the deadline
+ * bounds that wait). A Secret this installation did not write is not a holder. Read only when a
+ * switch waits for nothing else.
  */
 async function holdersTrust(
   api: IdentityApi,
   scope: SchedulerPkiScope,
   cas: SchedulerCas,
-  now: Date,
 ): Promise<boolean> {
   const { installation, namespace } = scope;
   const record = await getIfExists<Stored>(
@@ -310,8 +310,7 @@ async function holdersTrust(
   );
   const text = record?.data?.[IDENTITIES_KEY];
   const overlapping = Object.values(text ? parseIdentityRecord(text) : {}).some(
-    (entry) =>
-      entry.previous !== undefined && Date.parse(entry.previousUntil ?? '') > now.getTime(),
+    (entry) => entry.previous !== undefined,
   );
   if (overlapping) return false;
   const holds = (secret: Stored, bundle: string) =>
@@ -379,7 +378,7 @@ export async function loadSchedulerCas(
   const unswitched = rotated;
   if (
     KINDS.some((kind) => ready[kind].current.cert !== unswitched[kind].current.cert) &&
-    (await holdersTrust(api, scope, unswitched, now))
+    (await holdersTrust(api, scope, unswitched))
   )
     rotated = ready;
   const data: Record<string, string> = { ...secret.data };

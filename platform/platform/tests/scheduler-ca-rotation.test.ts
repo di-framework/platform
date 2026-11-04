@@ -42,6 +42,8 @@ import {
   type HostObservation,
   identityTransition,
   type OperatorObservation,
+  SCHEDULER_TLS_ANNOTATION,
+  schedulerCertDigest,
 } from '../src/tenancy/scheduler-pki-rotation';
 import { PlatformSchedulerIdentities } from '../src/tenancy/scheduler-platform-identities';
 import { TENANT_OPERATOR_PROPAGATION_MS } from '../src/tenancy/tenant-operator';
@@ -364,7 +366,20 @@ class RotationApi extends MemoryApi {
       this.operations.push({ method, path, body });
       throw new ApiError(409, 'Conflict');
     }
-    return super.call<T>(method, path, body);
+    const result = await super.call<T>(method, path, body);
+    // Every Deployment rollout completes at once, as a kubelet would after the pods roll.
+    const deployment = this.objects.get(path.split('?')[0] as string) as
+      | (Resource & { spec?: { replicas?: number }; status?: Record<string, unknown> })
+      | undefined;
+    if (method === 'PATCH' && deployment?.kind === 'Deployment') {
+      const replicas = deployment.spec?.replicas ?? 1;
+      deployment.status = {
+        ...deployment.status,
+        updatedReplicas: replicas,
+        readyReplicas: replicas,
+      };
+    }
+    return result;
   }
   writes(path: string): number {
     return this.operations.filter((o) => o.method !== 'GET' && o.path === path).length;
@@ -466,7 +481,7 @@ describe('loadSchedulerCas: the switch waits for the holders (#629 W1)', () => {
       data: { 'ca.crt': b64(bundle) },
     }) as unknown as Resource;
 
-  it('switches when no holder exists, and waits while an identity is within its overlap', async () => {
+  it('switches when no holder exists, and waits while an identity still has previous, past previousUntil too', async () => {
     const api = new RotationApi();
     const { platform, next } = published(api);
     api.seed({
@@ -487,7 +502,21 @@ describe('loadSchedulerCas: the switch waits for the holders (#629 W1)', () => {
       cas: { platform: { current: platform, next } },
     });
     expect(api.writes(caPath)).toBe(0);
+    // Past previousUntil the renewal may still be rolling out (a slow or stalled host): it waits.
     const later = new Date(START.getTime() + 2 * 60_000);
+    expect(await loadSchedulerCas(api, cfg, later)).toMatchObject({
+      cas: { platform: { current: platform, next } },
+    });
+    expect(api.writes(caPath)).toBe(0);
+    // Once `previous` is dropped (the rollout was observed), it switches.
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'ConfigMap',
+      metadata: { name: SCHEDULER_IDENTITIES, namespace: PKI },
+      data: {
+        [IDENTITIES_KEY]: JSON.stringify({ 'platform/operator': { current: 'bbbbbbbbbbbbbbbb' } }),
+      },
+    } as unknown as Resource);
     expect(await loadSchedulerCas(api, cfg, later)).toMatchObject({
       cas: { platform: { current: next, previous: platform.cert } },
     });
@@ -651,7 +680,38 @@ async function prepare(tenant: boolean) {
     tenant: caEnding('tenant', START, 100),
   };
   seedCas(api, { platform: { current: old.platform }, tenant: { current: old.tenant } });
-  const { controller } = await prepareHarness(api, { pki: true }, () => clock.now);
+  const harness = await prepareHarness(api, { pki: true }, () => clock.now);
+  // The platform and the tenant host group, so each renewal's rollout is observed and `previous`
+  // dropped: an entry with `previous` holds the switch (#629). The harness does not render the
+  // tenant's host group, so after each tick its template takes the digest of the certificate in
+  // the host Secret, as the controller renders it.
+  const tenantHosts = `/apis/apps/v1/namespaces/${names('alpha').runtimeNamespace}/deployments/hostgroup-${names('alpha').hostgroup}`;
+  const controller = {
+    async tick() {
+      await harness.controller.tick();
+      const secret = api.objects.get(hostPath) as unknown as
+        | { data: Record<string, string> }
+        | undefined;
+      const hosts = api.objects.get(tenantHosts) as unknown as {
+        spec: { template: { metadata: { annotations: Record<string, string> } } };
+      };
+      if (secret)
+        hosts.spec.template.metadata.annotations[SCHEDULER_TLS_ANNOTATION] = schedulerCertDigest(
+          decode(secret.data['tls.crt']),
+        );
+    },
+  };
+  for (const [name, namespace] of [
+    ['hostgroup-default', NS],
+    [`hostgroup-${names('alpha').hostgroup}`, names('alpha').runtimeNamespace],
+  ] as const)
+    api.seed({
+      apiVersion: 'apps/v1',
+      kind: 'Deployment',
+      metadata: { name, namespace, generation: 1 },
+      spec: { replicas: 1, template: { metadata: { annotations: {} } } },
+      status: { observedGeneration: 1, updatedReplicas: 1, readyReplicas: 1 },
+    } as unknown as Resource);
   if (tenant)
     api.seed({
       apiVersion: 'v1',
@@ -760,10 +820,10 @@ describe('controller tick: the platform path rotates the platform scheduler CA (
       expect(api.writes(path)).toBe(2);
       expect(signedBy(api, path, next.cert)).toBe(true);
     }
-    // The leaves renewed for the bundle are capped again until the switch, so the expiry may be
-    // logged once more; after the switch it is not.
+    // The leaves renewed for the bundle are capped again until the switch, so the expiry is
+    // logged once more (twice in all); after the switch it is not.
     const logged = warned('the scheduler platform CA expires');
-    expect(logged).toBeLessThanOrEqual(2);
+    expect(logged).toBe(2);
     expect(await quiet(api, controller, leaves, 3, DAY)).toBe(0);
     expect(warned('the scheduler platform CA expires')).toBe(logged);
   });
