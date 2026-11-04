@@ -37,8 +37,9 @@ const clock = { now: START };
 class IdentityApi extends MemoryApi {
   /**
    * Writes of the identity record, the identity Secrets and the handled rotation. The controller's
-   * own Tenant status write is not counted: whether it repeats depends on how this fake orders
-   * status keys, not on issuance; the conditions issuance returns are stable (unit tests).
+   * own Tenant status write (the one carrying `conditions`) is not counted: it is a separate
+   * write whose steady state #595 and #630 test in tenant-status-steady-state.test.ts. Tests that
+   * check the status the controller writes assert on a write that carries `conditions`.
    */
   identityWrites(): string[] {
     return this.operations
@@ -161,6 +162,13 @@ describe('controller tick: tenant scheduler identities (#541 m6c)', () => {
       (o) => o.method === 'PATCH' && o.path === `${tenantPath}/status`,
     );
     expect(statusWrites.length).toBeGreaterThan(0);
+    // The marker PATCH also targets the Tenant status; at least one write must be the controller's
+    // own (it carries `conditions`).
+    expect(
+      statusWrites.some(
+        (o) => 'conditions' in (o.body as { status: Record<string, unknown> }).status,
+      ),
+    ).toBe(true);
     for (const write of statusWrites)
       expect((write.body as { status: Record<string, unknown> }).status.schedulerIdentity).toEqual({
         hosts: 'r1',

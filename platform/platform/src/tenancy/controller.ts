@@ -704,14 +704,16 @@ export class Controller {
         }),
       ],
     };
-    if (sameValue(value.status, status)) return;
+    // The server applies the patch as a merge patch: null deletes a key and absent keys stay.
+    const merged = mergePatch(value.status, status);
+    if (sameValue(value.status, merged)) return;
     await this.api.call(
       'PATCH',
       `${location(value)}/status`,
       { metadata: { resourceVersion: value.metadata.resourceVersion }, status },
       'application/merge-patch+json',
     );
-    value.status = status;
+    value.status = merged;
   }
   private async revoke(
     labels: Record<string, string>,
@@ -3597,6 +3599,20 @@ export function reportFatal(
 ): void {
   console.error(error.message);
   status.exitCode = 1;
+}
+
+/** RFC 7386 merge patch: `null` deletes a key, objects merge, anything else replaces. */
+export function mergePatch<T>(base: T | undefined, patch: unknown): T {
+  if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) return patch as T;
+  const result: Record<string, unknown> =
+    typeof base === 'object' && base !== null && !Array.isArray(base)
+      ? { ...(base as Record<string, unknown>) }
+      : {};
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === null) delete result[k];
+    else result[k] = mergePatch(result[k], v);
+  }
+  return result as T;
 }
 
 /**
