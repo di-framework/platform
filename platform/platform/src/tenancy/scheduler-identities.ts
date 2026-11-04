@@ -53,8 +53,10 @@ import {
   type IdentityEntry,
   type IdentityRecord,
   nextSchedulerCas,
+  PLATFORM_ROLES,
   PLATFORM_SECRETS,
   parseIdentityRecord,
+  platformIdentity,
   readSchedulerCaSet,
   SCHEDULER_CA_SECRET,
   SCHEDULER_IDENTITIES,
@@ -293,15 +295,60 @@ export interface SchedulerPkiScope {
 const KINDS = ['platform', 'tenant'] as const;
 
 /**
- * How long after `previousUntil` an identity whose renewal still keeps `previous` holds the switch
- * of a scheduler CA (days). A healthy slow host rollout finishes well within it, so it still holds
- * the switch; a host group that never completes its rollout (no Deployment, a template never moved,
- * pods that cannot start) holds it no longer than this, not for the whole rotation (#629).
+ * How long after its overlap ends an identity whose renewal still keeps `previous` holds the switch
+ * of a scheduler CA, and its client Secret with it (days). A healthy slow host rollout finishes
+ * well within it, so it still holds the switch; a host group that never completes its rollout (no
+ * Deployment, a template never moved, pods that cannot start) holds it no longer than this, not
+ * for the whole rotation (#629).
  */
 export const CA_HOLD_GRACE_DAYS = 1;
 const DAY_MS = 86_400_000;
 /** The most holders a blocked switch names in its log line; the rest are counted. */
 const BLOCKING_NAMED = 10;
+
+/**
+ * When each renewal that still keeps `previous` stops holding the switch of a scheduler CA (#629):
+ * {@link CA_HOLD_GRACE_DAYS} after its `previousUntil`, but never later than twice that after this
+ * controller first saw the renewal. A pending issuance (its certificate has not landed) moves
+ * `previousUntil` forward on every pass, so without that bound a renewal whose certificate never
+ * lands would hold the switch until the deadline; a healthy issuance lands within minutes, so the
+ * bound never shortens its hold. The first sighting is kept in memory: a restart starts it again,
+ * which delays the end of such a hold by at most one bound per restart.
+ */
+export class RenewalHolds {
+  private seen = new Map<string, number>();
+  /** Per key of `record` whose entry keeps `previous`, when it stops holding the switch (ms). */
+  until(record: IdentityRecord, now: Date): Map<string, number> {
+    const seen = new Map<string, number>();
+    const until = new Map<string, number>();
+    const grace = CA_HOLD_GRACE_DAYS * DAY_MS;
+    for (const [key, entry] of Object.entries(record)) {
+      if (entry.previous === undefined) continue;
+      const renewal = `${key} ${entry.current} ${entry.previous}`;
+      const first = this.seen.get(renewal) ?? now.getTime();
+      seen.set(renewal, first);
+      const overlapEnd = Date.parse(entry.previousUntil ?? '') || first;
+      until.set(key, Math.min(overlapEnd + grace, first + 2 * grace));
+    }
+    this.seen = seen;
+    return until;
+  }
+}
+
+/** The record key of the platform identity whose Secret is `name`, if one is. */
+const platformKey = (name: string) => {
+  const role = PLATFORM_ROLES.find((r) => PLATFORM_SECRETS[r] === name);
+  return role ? platformIdentity(role) : undefined;
+};
+/** The record key of the tenant identity whose Secret is `secret`, if one is. */
+const tenantKey = (secret: Stored) => {
+  const tenant = secret.metadata.labels?.[TENANT];
+  return tenant
+    ? tenantIdentities(tenant).find(
+        (i) => i.namespace === secret.metadata.namespace && i.name === secret.metadata.name,
+      )?.key
+    : undefined;
+};
 
 /**
  * The holders of the scheduler bundles of `cas` (#629) that do not carry them yet, by kind and
@@ -310,16 +357,19 @@ const BLOCKING_NAMED = 10;
  * - each client Secret of the installation (the platform's and every tenant's) whose `ca.crt`
  *   lacks the client bundle, so it is still `stale` by its bundle;
  * - each identity of the record that still has `previous` (a host rollout not yet observed, an
- *   operator within its overlap), until {@link CA_HOLD_GRACE_DAYS} after its `previousUntil`.
+ *   operator within its overlap), until `holds` says it stops holding ({@link RenewalHolds}).
  *
- * A Secret this installation did not write is not a holder. Read only when a switch waits for
- * nothing else.
+ * A client Secret whose identity has stopped holding is not a holder either: its stale renewal
+ * waits for that rollout (the user its running pods present is never dropped), so it may lack the
+ * bundle for as long as the rollout stalls. A Secret this installation did not write is not a
+ * holder. Read only when a switch waits for nothing else.
  */
 async function holdersBlocking(
   api: IdentityApi,
   scope: SchedulerPkiScope,
   cas: SchedulerCas,
   now: Date,
+  holds: RenewalHolds,
 ): Promise<string[]> {
   const { installation, namespace } = scope;
   const record = await getIfExists<Stored>(
@@ -327,13 +377,14 @@ async function holdersBlocking(
     configMapPath(schedulerPkiNamespace(namespace), SCHEDULER_IDENTITIES),
   );
   const text = record?.data?.[IDENTITIES_KEY];
-  const blocking = Object.entries(text ? parseIdentityRecord(text) : {})
-    .filter(
-      ([, entry]) =>
-        entry.previous !== undefined &&
-        now.getTime() < Date.parse(entry.previousUntil ?? '') + CA_HOLD_GRACE_DAYS * DAY_MS,
-    )
-    .map(([key]) => `identity ${key} (renewal in progress)`);
+  const until = holds.until(text ? parseIdentityRecord(text) : {}, now);
+  const holding = (key: string) => now.getTime() < (until.get(key) as number);
+  const blocking = [...until.keys()]
+    .filter(holding)
+    .map((key) => `identity ${key} (renewal in progress)`);
+  // A client Secret of a renewal past its hold no longer blocks.
+  const released = (key: string | undefined) =>
+    key !== undefined && until.has(key) && !holding(key);
   const lacks = (secret: Stored, bundle: string) =>
     !bundleTrusts(decode(secret.data?.['ca.crt']) ?? '', bundle);
   const where = (secret: Stored) => `${secret.metadata.namespace}/${secret.metadata.name}`;
@@ -343,7 +394,10 @@ async function holdersBlocking(
     if (labels?.[INSTALLATION] !== installation || labels[COMPONENT] !== SCHEDULER_PKI_COMPONENT)
       continue;
     const server = name === PLATFORM_SECRETS.server;
-    if (lacks(secret as Stored, server ? schedulerServerBundle(cas) : schedulerClientBundle(cas)))
+    if (
+      !released(platformKey(name)) &&
+      lacks(secret as Stored, server ? schedulerServerBundle(cas) : schedulerClientBundle(cas))
+    )
       blocking.push(`${server ? 'server' : 'client'} Secret ${namespace}/${name} (ca.crt)`);
   }
   const selector = `${INSTALLATION}=${installation},${COMPONENT}=${SCHEDULER_IDENTITY_COMPONENT}`;
@@ -352,7 +406,7 @@ async function holdersBlocking(
     `/api/v1/secrets?labelSelector=${encodeURIComponent(selector)}`,
   );
   for (const secret of tenants.items)
-    if (lacks(secret, schedulerClientBundle(cas)))
+    if (!released(tenantKey(secret)) && lacks(secret, schedulerClientBundle(cas)))
       blocking.push(`client Secret ${where(secret)} (ca.crt)`);
   return blocking;
 }
@@ -380,6 +434,7 @@ export async function loadSchedulerCas(
   api: IdentityApi,
   scope: SchedulerPkiScope,
   now: Date,
+  holds: RenewalHolds = new RenewalHolds(),
 ): Promise<SchedulerCasRead> {
   const { namespace } = scope;
   const pki = schedulerPkiNamespace(namespace);
@@ -412,7 +467,7 @@ export async function loadSchedulerCas(
   const unswitched = rotated;
   let blocked: { switchBlocked: string } | undefined;
   if (KINDS.some((kind) => ready[kind].current.cert !== unswitched[kind].current.cert)) {
-    const blocking = await holdersBlocking(api, scope, unswitched, now);
+    const blocking = await holdersBlocking(api, scope, unswitched, now, holds);
     if (blocking.length === 0) rotated = ready;
     else blocked = { switchBlocked: switchBlocked(blocking) };
   }
@@ -536,6 +591,7 @@ export class TenantSchedulerIdentities {
   /** Per record key, how long its user has waited to propagate. */
   private readonly waits = new PropagationWaits();
   private readonly rotationLog = new RotationFailureLog('Tenant scheduler identities');
+  private readonly holds = new RenewalHolds();
   constructor(
     private readonly api: IdentityApi,
     private readonly cfg: { installation: string; namespace: string },
@@ -614,7 +670,7 @@ export class TenantSchedulerIdentities {
 
   /** The CA sets, after this pass's rotation; a refused rotation write is logged once. */
   private async cas(): Promise<SchedulerCasRead> {
-    const read = await loadSchedulerCas(this.api, this.cfg, this.now());
+    const read = await loadSchedulerCas(this.api, this.cfg, this.now(), this.holds);
     this.rotationLog.report(read);
     return read;
   }

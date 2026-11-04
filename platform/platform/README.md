@@ -804,10 +804,11 @@ Renewal and rotation:
   CA of both sets at once, and each client Secret's `ca.crt` carries the platform set, delivered
   by a routine renewal so hosts roll onto it. The successor signs 30 days later, and only once
   every client Secret and the server carry it and no renewal still keeps its previous user (a
-  host rollout is observed complete, or 1 day has passed since the renewal's overlap ended);
-  never in the pass that publishes it, even when a late rotation finds less than 30 days left. A
-  client Secret that never takes it up delays the switch until 2 days before the old CA expires.
-  While a due switch waits, the controller logs once which holders it waits for. Then every leaf the
+  host rollout is observed complete, or 1 day has passed since the renewal's overlap ended, after
+  which that host's Secret no longer holds it either); never in the pass that publishes it, even
+  when a late rotation finds less than 30 days left. Any other client Secret that never takes it
+  up delays the switch until 2 days before the old CA expires. While a due switch waits, the
+  controller logs once which holders it waits for. Then every leaf the
   old CA signed, the server's included, is renewed once against the successor, and the old CA
   stays trusted until it expires, then leaves the bundles. A rotation the controller cannot write
   is logged once (the CA rotation write was refused and will be retried) and retried on every

@@ -51,6 +51,7 @@ import {
   loadSchedulerCas,
   observeIdentity,
   putIdentityRecord,
+  RenewalHolds,
   RotationFailureLog,
   type Stored,
 } from './scheduler-identities';
@@ -128,6 +129,7 @@ export class PlatformSchedulerIdentities {
   private readonly waits = new PropagationWaits();
   private readonly waitLogged = new Set<string>();
   private readonly rotationLog = new RotationFailureLog('Platform scheduler identities');
+  private readonly holds = new RenewalHolds();
 
   constructor(
     private readonly api: IdentityApi,
@@ -181,7 +183,7 @@ export class PlatformSchedulerIdentities {
     const pki = schedulerPkiNamespace(namespace);
     if (!(await getIfExists(this.api, `/api/v1/namespaces/${pki}`))) return undefined;
     const now = this.now();
-    const loaded = await loadSchedulerCas(this.api, this.cfg, now);
+    const loaded = await loadSchedulerCas(this.api, this.cfg, now, this.holds);
     // Before the record is read, so a refused rotation is seen even without it.
     this.rotationLog.report(loaded);
     if ('reason' in loaded) return undefined;

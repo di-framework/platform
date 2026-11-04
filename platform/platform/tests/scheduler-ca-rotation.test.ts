@@ -13,6 +13,7 @@ import {
   CA_HOLD_GRACE_DAYS,
   loadSchedulerCas,
   observeIdentity,
+  RenewalHolds,
   SCHEDULER_CA_EXPIRING,
   SCHEDULER_IDENTITY_COMPONENT,
   TENANT_HOST_SECRET,
@@ -560,6 +561,33 @@ describe('loadSchedulerCas: the switch waits for the holders (#629 W1)', () => {
   });
 });
 
+describe('RenewalHolds: how long a renewal holds the switch (#629)', () => {
+  it('ends a hold a grace after previousUntil, bounds one a pending issuance keeps moving, and forgets a finished renewal', () => {
+    const KEY = 'tenant/alpha/hosts';
+    const GRACE = CA_HOLD_GRACE_DAYS * DAY;
+    const t0 = START.getTime();
+    const record = (until?: number) => ({
+      [KEY]: {
+        current: 'bbbbbbbbbbbbbbbb',
+        previous: 'cccccccccccccccc',
+        ...(until === undefined ? {} : { previousUntil: new Date(until).toISOString() }),
+      },
+    });
+    const holds = new RenewalHolds();
+    expect(holds.until(record(t0 + 600_000), START).get(KEY)).toBe(t0 + 600_000 + GRACE);
+    // A pending issuance moves previousUntil on every pass: bounded from the first sighting.
+    const later = new Date(t0 + 3 * DAY);
+    expect(holds.until(record(later.getTime() + 600_000), later).get(KEY)).toBe(t0 + 2 * GRACE);
+    // A renewal no longer kept is forgotten, so a new one is timed from its own sighting.
+    expect(holds.until({ [KEY]: { current: 'bbbbbbbbbbbbbbbb' } }, later).size).toBe(0);
+    expect(holds.until(record(later.getTime() + 600_000), later).get(KEY)).toBe(
+      later.getTime() + 600_000 + GRACE,
+    );
+    // Without previousUntil, a grace after it was first seen.
+    expect(new RenewalHolds().until(record(), START).get(KEY)).toBe(t0 + GRACE);
+  });
+});
+
 describe('a refused rotation write (#629 S2)', () => {
   it('is logged once by the platform pass, also without the identity record, until it lands', async () => {
     const api = new RotationApi();
@@ -903,8 +931,52 @@ describe('controller tick: the tenant path rotates both scheduler CAs (#629)', (
           path === hostPath ? (storedSet(api, 'tenant').current as KeyPair).cert : next.cert,
         ),
       ).toBe(true);
-    expect(await quiet(api, controller, healthy, 3, DAY)).toBe(0);
+    expect(await quiet(api, controller, [...healthy, hostPath], 3, DAY)).toBe(0);
     expect(warned(`Tenant scheduler identities: ${blocked}`)).toBe(1);
+  });
+
+  it('a host rollout that never completes releases its stale Secret with its renewal, so the switch arrives at previousUntil plus the grace', async () => {
+    const { api, controller, old, end } = await prepare(true);
+    // The tenant's host group exists, but its rollout never completes (pods cannot start).
+    (
+      api.objects.get(tenantHosts) as unknown as { status: Record<string, number> }
+    ).status.readyReplicas = 0;
+    // The rotation writes are refused while the host's routine renewal comes due, so that
+    // renewal keeps `previous` when the successor is published; its stale-by-bundle renewal then
+    // waits for a rollout that never completes, and the host Secret never carries the successor.
+    api.refuseCa = true;
+    at(end - 25 * DAY);
+    await settle(controller);
+    const record = () =>
+      JSON.parse(
+        (api.objects.get(recordPath) as unknown as { data: Record<string, string> }).data[
+          IDENTITIES_KEY
+        ] as string,
+      ) as Record<string, { previous?: string; previousUntil?: string }>;
+    const until = Date.parse(record()['tenant/alpha/hosts']?.previousUntil as string);
+    api.refuseCa = false;
+    await controller.tick();
+    const next = storedSet(api, 'platform').next as KeyPair;
+    await settle(controller);
+    expect(trusted(api, hostPath)).not.toContain(print(next.cert));
+    for (const [key, entry] of Object.entries(record()))
+      if (key !== 'tenant/alpha/hosts') expect(entry.previous).toBeUndefined();
+    at(until + CA_HOLD_GRACE_DAYS * DAY - 60_000);
+    await controller.tick();
+    expect(storedSet(api, 'platform').current).toEqual(old.platform);
+    const blocked = `the scheduler CA switch is due but waits for client Secret ${names('alpha').runtimeNamespace}/${TENANT_HOST_SECRET} (ca.crt), identity tenant/alpha/hosts (renewal in progress);`;
+    expect(warned(`Tenant scheduler identities: ${blocked}`)).toBe(1);
+    expect(warned(`Platform scheduler identities: ${blocked}`)).toBe(1);
+    // Past the grace neither the renewal nor its Secret holds the switch; the host renewal is
+    // still not forced, so the user its running pods present stays.
+    at(until + CA_HOLD_GRACE_DAYS * DAY);
+    await controller.tick();
+    expect(storedSet(api, 'platform')).toEqual({ current: next, previous: old.platform.cert });
+    expect(record()['tenant/alpha/hosts']?.previous).toBeDefined();
+    await settle(controller);
+    const healthy = [serverPath, ...clientPaths, operatorPath];
+    for (const path of healthy) expect(signedBy(api, path, next.cert)).toBe(true);
+    expect(await quiet(api, controller, [...healthy, hostPath], 3, DAY)).toBe(0);
   });
 
   it('publishes one successor, re-signs the host and operator leaves once against it, then retires the old CA', async () => {
