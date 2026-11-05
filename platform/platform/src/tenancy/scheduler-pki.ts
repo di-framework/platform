@@ -13,10 +13,23 @@
  * {@link newIssuanceId} recorded in {@link SCHEDULER_IDENTITIES} before the certificate is
  * issued. The CA keys and the record live in {@link schedulerPkiNamespace}, which no pod mounts.
  *
+ * Both CAs rotate through a current/next set ({@link nextSchedulerCas}, `ca-rotation.ts`): the
+ * controller publishes a successor `CA_RENEW_DAYS` before a CA expires, switches the signing CA to
+ * it after `CA_OVERLAP_DAYS`, and retires the old CA when it expires (#629). The bootstrap creates
+ * the first CAs only and never rotates them.
+ *
  * Nothing here logs or returns key material, other than as the data of the Secrets it writes.
  */
 import { randomBytes } from 'node:crypto';
-import { CA_DAYS, LEAF_RENEW_DAYS } from './ca-rotation';
+import {
+  CA_DAYS,
+  type ControllerCas,
+  caBundle,
+  keptAsPrevious,
+  LEAF_RENEW_DAYS,
+  rotateCaSet,
+  type StoredCas,
+} from './ca-rotation';
 import type { Resource } from './resources';
 import {
   caCertificate,
@@ -63,10 +76,26 @@ export const SCHEDULER_CA_SECRET = 'di-scheduler-ca';
 export const SCHEDULER_IDENTITIES = 'di-scheduler-identities';
 /** The key of the identity record in {@link SCHEDULER_IDENTITIES}. */
 export const IDENTITIES_KEY = 'identities.json';
-/** The keys of {@link SCHEDULER_CA_SECRET}. */
+/**
+ * The keys of {@link SCHEDULER_CA_SECRET}, per CA: the signing CA (`cert`, `key`) and, during a
+ * rotation (#629), its published successor (`nextCert`, `nextKey`) and the CA it replaced
+ * (`previous`, certificate only: it never signs again).
+ */
 export const CA_KEYS = {
-  platform: { cert: 'platform-ca.crt', key: 'platform-ca.key' },
-  tenant: { cert: 'tenant-ca.crt', key: 'tenant-ca.key' },
+  platform: {
+    cert: 'platform-ca.crt',
+    key: 'platform-ca.key',
+    nextCert: 'platform-next-ca.crt',
+    nextKey: 'platform-next-ca.key',
+    previous: 'platform-previous-ca.crt',
+  },
+  tenant: {
+    cert: 'tenant-ca.crt',
+    key: 'tenant-ca.key',
+    nextCert: 'tenant-next-ca.crt',
+    nextKey: 'tenant-next-ca.key',
+    previous: 'tenant-previous-ca.crt',
+  },
 } as const;
 /** The value of the component label on everything the bootstrap writes. */
 export const SCHEDULER_PKI_COMPONENT = 'scheduler-pki';
@@ -156,8 +185,23 @@ export function newSchedulerCa(kind: SchedulerCaKind, namespace: string, now: Da
   });
 }
 
-/** Both scheduler CAs. */
-export type SchedulerCas = Record<SchedulerCaKind, KeyPair>;
+/**
+ * Both scheduler CA sets: per kind, the CA that signs (`current`) and, during a rotation, its
+ * successor (`next`) and the CA it replaced (`previous`).
+ */
+export type SchedulerCas = Record<SchedulerCaKind, ControllerCas>;
+
+/**
+ * What every scheduler client trusts (`ca.crt` of a client Secret): the platform CA set, oldest
+ * first, since clients verify only the NATS server, whose leaf the platform CA signs.
+ */
+export const schedulerClientBundle = (cas: SchedulerCas): string => caBundle(cas.platform);
+/**
+ * What the NATS server trusts (`ca.crt` of `di-scheduler-nats-tls`, its `ca_file`): both CA sets,
+ * platform first, since it verifies clients of both CAs.
+ */
+export const schedulerServerBundle = (cas: SchedulerCas): string =>
+  `${caBundle(cas.platform)}${caBundle(cas.tenant)}`;
 
 const sameSet = (a: string[], b: string[]) =>
   a.length === b.length && a.every((value) => b.includes(value));
@@ -187,6 +231,110 @@ export function schedulerCaFault(
   )
     return `the ${kind} CA does not carry the ${kind} scheduler name constraints`;
   return undefined;
+}
+
+/** The `kind` CA set as stored in {@link SCHEDULER_CA_SECRET}'s base64 `data`, each part possibly missing. */
+export function storedSchedulerCas(
+  data: Record<string, string> | undefined,
+  kind: SchedulerCaKind,
+): StoredCas {
+  const read = (key: string) => {
+    const value = data?.[key];
+    return value === undefined ? undefined : Buffer.from(value, 'base64').toString('utf8');
+  };
+  const keys = CA_KEYS[kind];
+  const next = { cert: read(keys.nextCert), key: read(keys.nextKey) };
+  const previous = read(keys.previous);
+  return {
+    current: { cert: read(keys.cert), key: read(keys.key) },
+    ...(next.cert || next.key ? { next } : {}),
+    ...(previous ? { previous } : {}),
+  };
+}
+
+/**
+ * The `kind` CA set exactly as stored, or why its signing CA cannot sign: `current` must pass
+ * {@link schedulerCaFault}; a `next` that does not is left out, and so is a `previous` that is no
+ * longer a CA certificate in force. Nothing is created or switched (the bootstrap Job reads this
+ * way, and the controller when it cannot write a rotation).
+ */
+export function readSchedulerCaSet(
+  kind: SchedulerCaKind,
+  namespace: string,
+  stored: StoredCas,
+  now: Date,
+): ControllerCas | string {
+  const fault = schedulerCaFault(kind, namespace, stored.current ?? {}, now);
+  if (fault) return fault;
+  const { next, previous } = stored;
+  return {
+    current: stored.current as KeyPair,
+    ...(next && !schedulerCaFault(kind, namespace, next, now) ? { next: next as KeyPair } : {}),
+    // The rotation's own bound (`keptAsPrevious`), so the bundles are the same whether or not a
+    // rotation write lands.
+    ...(keptAsPrevious(previous, (stored.current as KeyPair).cert, now) ? { previous } : {}),
+  };
+}
+
+/**
+ * The `kind` CA set after one rotation pass at `now` (#629): the steps of `rotateCas`
+ * (`ca-rotation.ts`) with the scheduler's own CAs.
+ *
+ * 1. **Publish.** Within `CA_RENEW_DAYS` of the signing CA's expiry a successor is created. It
+ *    joins every trust bundle while the current CA still signs.
+ * 2. **Switch.** Never in the pass that publishes the successor. Once it is `CA_OVERLAP_DAYS` old
+ *    (sooner when the current CA has less than {@link LEAF_RENEW_DAYS} left) and `holdersTrust`
+ *    (every client Secret's and the server's `ca.crt` carries it, see `loadSchedulerCas`), it
+ *    signs and the old CA becomes `previous`; within `CA_SWITCH_DEADLINE_DAYS` of the current
+ *    CA's expiry it signs whether or not they do. Every leaf the old CA signed is then renewed
+ *    against the new one.
+ * 3. **Retire.** `previous` leaves the bundles when it expires.
+ *
+ * A successor that does not pass {@link schedulerCaFault} is dropped and a new one published. A
+ * signing CA that does not pass it is replaced by a usable successor at once, and is not kept as
+ * `previous`; without a usable successor the fault is returned and nothing is created, as before
+ * (#541): a missing or broken scheduler CA is an operator's to look at.
+ */
+export function nextSchedulerCas(
+  kind: SchedulerCaKind,
+  namespace: string,
+  stored: StoredCas,
+  now: Date,
+  holdersTrust = false,
+): ControllerCas | string {
+  const fault = (ca: Partial<KeyPair>) => schedulerCaFault(kind, namespace, ca, now);
+  const currentFault = fault(stored.current ?? {});
+  const next = stored.next && !fault(stored.next) ? stored.next : undefined;
+  if (currentFault && !next) return currentFault;
+  return rotateCaSet(
+    currentFault ? { next } : { current: stored.current, next, previous: stored.previous },
+    {
+      fresh: () => newSchedulerCa(kind, namespace, now),
+      wanted: (ca) => !fault(ca),
+      gate: { holdersTrust },
+    },
+    now,
+  );
+}
+
+/**
+ * The base64 entries of {@link SCHEDULER_CA_SECRET} for `kind`'s set `cas`; a key whose part is
+ * absent maps to undefined, so the caller removes it.
+ */
+export function schedulerCaData(
+  kind: SchedulerCaKind,
+  cas: ControllerCas,
+): Record<string, string | undefined> {
+  const b64 = (text: string | undefined) =>
+    text === undefined ? undefined : Buffer.from(text).toString('base64');
+  const keys = CA_KEYS[kind];
+  return {
+    [keys.cert]: b64(cas.current.cert),
+    [keys.key]: b64(cas.current.key),
+    [keys.nextCert]: b64(cas.next?.cert),
+    [keys.nextKey]: b64(cas.next?.key),
+    [keys.previous]: b64(cas.previous),
+  };
 }
 
 /** A platform client identity: a client-auth leaf from the platform CA naming only its user. */
@@ -367,16 +515,13 @@ async function loadOrCreateCas(
 ): Promise<SchedulerCas> {
   const { pki, namespace, now } = run;
   if (storedCas) {
-    const read = (key: string) => {
-      const value = storedCas.data?.[key];
-      return value === undefined ? undefined : Buffer.from(value, 'base64').toString('utf8');
-    };
     const loaded = {} as SchedulerCas;
     for (const kind of ['platform', 'tenant'] as const) {
-      const ca = { cert: read(CA_KEYS[kind].cert), key: read(CA_KEYS[kind].key) };
-      const fault = schedulerCaFault(kind, namespace, ca, now);
-      if (fault) throw new SchedulerPkiRefused(`${pki}/${SCHEDULER_CA_SECRET}: ${fault}`);
-      loaded[kind] = ca as KeyPair;
+      const stored = storedSchedulerCas(storedCas.data, kind);
+      const set = readSchedulerCaSet(kind, namespace, stored, now);
+      if (typeof set === 'string')
+        throw new SchedulerPkiRefused(`${pki}/${SCHEDULER_CA_SECRET}: ${set}`);
+      loaded[kind] = set;
     }
     return loaded;
   }
@@ -390,14 +535,14 @@ async function loadOrCreateCas(
       `${pki}/${SCHEDULER_CA_SECRET} is missing, but scheduler identities issued under it ` +
         `remain (${remaining.join(', ')}); delete them to bootstrap a new scheduler PKI`,
     );
-  const cas = {
-    platform: newSchedulerCa('platform', namespace, now),
-    tenant: newSchedulerCa('tenant', namespace, now),
+  const cas: SchedulerCas = {
+    platform: { current: newSchedulerCa('platform', namespace, now) },
+    tenant: { current: newSchedulerCa('tenant', namespace, now) },
   };
   const data: Record<string, string> = {};
   for (const kind of ['platform', 'tenant'] as const) {
-    data[CA_KEYS[kind].cert] = Buffer.from(cas[kind].cert).toString('base64');
-    data[CA_KEYS[kind].key] = Buffer.from(cas[kind].key).toString('base64');
+    data[CA_KEYS[kind].cert] = Buffer.from(cas[kind].current.cert).toString('base64');
+    data[CA_KEYS[kind].key] = Buffer.from(cas[kind].current.key).toString('base64');
   }
   await run.create(secretPath(pki), {
     apiVersion: 'v1',
@@ -476,14 +621,19 @@ async function issueMissing(
     } as Resource);
   if (!present.has('server'))
     // The server verifies clients of both CAs; clients verify the server against the platform CA.
+    // During a rotation each bundle carries every CA of the set (#629).
     await secret(
       'server',
-      natsServerLeaf(namespace, cas.platform, now),
-      `${cas.platform.cert}${cas.tenant.cert}`,
+      natsServerLeaf(namespace, cas.platform.current, now),
+      schedulerServerBundle(cas),
     );
   for (const role of issue) {
     const id = (record[platformIdentity(role)] as IdentityEntry).current;
-    await secret(role, platformClientLeaf(role, id, cas.platform, now), cas.platform.cert);
+    await secret(
+      role,
+      platformClientLeaf(role, id, cas.platform.current, now),
+      schedulerClientBundle(cas),
+    );
   }
 }
 
@@ -492,7 +642,9 @@ async function issueMissing(
  * nothing that exists:
  *
  * 1. `di-scheduler-ca`, both CAs, when it is missing and nothing issued by an earlier CA exists.
- *    An existing CA Secret must hold both CAs with their exact name constraints.
+ *    An existing CA Secret must hold both signing CAs with their exact name constraints. The Job
+ *    never rotates them (the controller does, #629); it signs with the signing CA and writes the
+ *    bundles of each whole set.
  * 2. `di-scheduler-identities`: a new issuance ID for each platform identity whose Secret is
  *    missing, written before that certificate is issued. A missing Secret is a forced rotation
  *    of that identity, so it gets no previous ID. Other entries are kept as they are.

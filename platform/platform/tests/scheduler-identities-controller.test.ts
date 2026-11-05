@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import { X509Certificate } from 'node:crypto';
+import { ApiError } from '../src/tenancy/controller';
 import { FINALIZER, INSTALLATION, names, OWNER, type Resource } from '../src/tenancy/resources';
 import {
   SCHEDULER_CA_EXPIRING,
@@ -35,6 +36,17 @@ const caPath = `/api/v1/namespaces/${PKI}/secrets/${SCHEDULER_CA_SECRET}`;
 const clock = { now: START };
 
 class IdentityApi extends MemoryApi {
+  /**
+   * Refuses every write of `di-scheduler-ca`, so the scheduler CAs cannot be rotated (#629). It
+   * throws before `super.call`, so the refused PUT is not in `operations`: each tick still makes
+   * one refused PUT per pass (every tenant pass and the platform pass), it is just not counted.
+   */
+  refuseCaWrites = false;
+  override async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+    if (this.refuseCaWrites && method === 'PUT' && path === caPath)
+      throw new ApiError(409, 'Conflict');
+    return super.call<T>(method, path, body);
+  }
   /**
    * Writes of the identity record, the identity Secrets and the handled rotation. The controller's
    * own Tenant status write (the one carrying `conditions`) is not counted: it is a separate
@@ -204,8 +216,9 @@ describe('controller tick: tenant scheduler identities (#541 m6c)', () => {
 });
 
 /**
- * Issues the tenant identities, moves the clock into the scheduler CAs' last 30 days and ticks until
- * the capped leaves have settled; `api.operations` is then empty.
+ * Issues the tenant identities, moves the clock into the scheduler CAs' last 30 days with their
+ * rotation refused (#629) and ticks until the capped leaves have settled; `api.operations` is then
+ * empty.
  */
 async function settleInCaWindow() {
   const { api, controller } = await prepare({ pki: true });
@@ -219,6 +232,7 @@ async function settleInCaWindow() {
   });
   await issue(controller);
   expect(api.objects.has(operatorPath)).toBe(true);
+  api.refuseCaWrites = true;
   const ca = (api.objects.get(caPath) as unknown as { data: Record<string, string> }).data;
   const caEnd = (kind: 'platform' | 'tenant') =>
     new Date(

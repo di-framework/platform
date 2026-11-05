@@ -16,7 +16,15 @@
  *   and expires before its CA does. A new current ID, the old one kept as `previous` until
  *   `previousUntil` (now + {@link RENEWAL_OVERLAP_MS}). A leaf capped at its CA's expiry is not
  *   renewed (a renewal would be capped the same way, so every tick would re-issue it, #612); the
- *   transition reports `caExpiring` instead. The scheduler CAs are not rotated yet (#629).
+ *   transition reports `caExpiring` instead. A rotation of the scheduler CAs (#629) replaces such a
+ *   CA well before then.
+ * - **CA rotation** (#629): a certificate signed by a CA that no longer signs, or whose Secret's
+ *   trust bundle lacks a CA of the current set, is `stale`. It is renewed as above whatever its
+ *   expiry, capped or not, so each published successor reaches every client's bundle and each
+ *   switch re-signs every leaf against the new CA, once. Only once a renewal in progress is
+ *   complete, though: while the entry still has `previous` (a host rollout not yet observed, an
+ *   operator within `previousUntil`) the stale leaf is kept and renewed on a later pass, unless
+ *   the host group has no Deployment, so no pod presents either user.
  * - **Pending issuance**: the Secret's certificate carries another ID than the recorded `current`
  *   (the record was written but issuance did not land). The certificate is re-issued for the
  *   recorded `current`; no new ID is drawn and `previous` stays, with `previousUntil` moved to now
@@ -84,6 +92,11 @@ interface ObservationBase {
     id?: string;
     /** The certificate expires when its CA does (a leaf never outlives its CA), #612. */
     capped?: boolean;
+    /**
+     * The certificate was signed by a CA that no longer signs, or its Secret's trust bundle lacks
+     * a CA of the current set (#629): it is renewed even when capped.
+     */
+    stale?: boolean;
   };
   /** A forced rotation was requested (see {@link rotationRequested}). */
   forced?: boolean;
@@ -185,7 +198,10 @@ export function identityTransition(
   const annotate =
     observed.client === 'host' ? { [SCHEDULER_TLS_ANNOTATION]: secret.digest } : undefined;
   const due = secret.notAfter.getTime() <= now.getTime() + SCHEDULER_LEAF_RENEW_DAYS * DAY_MS;
-  if (due && !secret.capped)
+  // A stale leaf waits until a renewal in progress is complete (no `previous`), so the user its
+  // running pods present is never dropped (#629); a host group with no Deployment has no such pod.
+  const settled = entry.previous === undefined || (observed.client === 'host' && !observed.rollout);
+  if ((due && !secret.capped) || (secret.stale && settled))
     return {
       entry: {
         current: id(),
