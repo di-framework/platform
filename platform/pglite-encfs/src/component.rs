@@ -72,7 +72,7 @@ use crate::marker::{
 };
 use crate::rotation;
 use crate::slots::{SlotError, SlotFile, SlotKeys};
-use crate::writer::{give_birth, Durable, FileState, IntegrityFile};
+use crate::writer::{give_birth, Durable, FailStops, FileState, IntegrityFile};
 
 type R<T> = Result<T, ErrorCode>;
 
@@ -133,12 +133,13 @@ thread_local! {
         const { RefCell::new(BTreeMap::new()) };
     /// Inodes in an integrity directory whose host sync failed while encfs
     /// held no state for them (A3, 6.5): every state filed for them later is
-    /// fail-stopped, and no birth runs on them, until restart.
-    static FAIL_STOPPED: RefCell<BTreeSet<DirId>> = const { RefCell::new(BTreeSet::new()) };
+    /// fail-stopped, no birth runs on them, and a further sync of them is
+    /// refused before the host, until restart.
+    static FAIL_STOPPED: RefCell<FailStops<DirId>> = const { RefCell::new(FailStops::new()) };
 }
 
 fn is_fail_stopped(id: &DirId) -> bool {
-    FAIL_STOPPED.with(|failed| failed.borrow().contains(id))
+    FAIL_STOPPED.with(|failed| failed.borrow().is_stopped(id))
 }
 
 /// Keys are read from the host environment once, on first use.
@@ -563,20 +564,6 @@ impl File {
         }
     }
 
-    /// A3 for a host sync of a file in an integrity directory that failed
-    /// while encfs held no state for it: the inode is fail-stopped until
-    /// restart (6.5). An inode the host cannot identify gets no state
-    /// either, so nothing can be written to it.
-    fn fail_stop(&self) {
-        if let Ok(id) = self.host_id() {
-            log(&format!(
-                "{}: a host sync failed; refusing writes and syncs until restart",
-                self.path
-            ));
-            FAIL_STOPPED.with(|failed| failed.borrow_mut().insert(id));
-        }
-    }
-
     /// The state of this codec-4 file: this descriptor's, another
     /// descriptor's of the same inode, or read from disk (5.3).
     fn file_state(&self, keys: &SlotKeys, file_id: FileId) -> R<Rc<RefCell<FileState>>> {
@@ -733,7 +720,8 @@ impl File {
     /// sync, through any descriptor of the inode, clears the `pending` bits
     /// and advances the watermark (6.3 "Sync"); a failed one stops writes
     /// (A3). A file with no state has nothing pending, but a failed sync of
-    /// it still stops every later write and birth (6.5).
+    /// it still stops every later write, birth and sync of the inode (6.5),
+    /// and a sync of an inode stopped that way is refused before the host.
     fn sync(&self, all: bool) -> R<()> {
         let passthrough = || {
             if all {
@@ -741,25 +729,36 @@ impl File {
             } else {
                 self.host.sync_data()
             }
-            .map_err(host)
         };
         if self.mode == Mode::Xts {
-            return passthrough();
+            return passthrough().map_err(host);
         }
-        let filed = match self.state.borrow().as_ref() {
-            Some((_, state)) => Some(state.clone()),
-            None => match self.cipher()?.as_deref() {
-                Some(FileCipher::Slots { file_id, .. }) => {
-                    let id = self.host_id()?;
-                    FILES
+        let (id, filed) = match self.state.borrow().as_ref() {
+            Some((id, state)) => (*id, Some(state.clone())),
+            None => {
+                let id = self.host_id()?;
+                let filed = match self.cipher()?.as_deref() {
+                    Some(FileCipher::Slots { file_id, .. }) => FILES
                         .with(|files| files.borrow().get(&id).cloned())
-                        .filter(|state| state.borrow().file_id() == *file_id)
-                }
-                _ => None,
-            },
+                        .filter(|state| state.borrow().file_id() == *file_id),
+                    _ => None,
+                };
+                (id, filed)
+            }
         };
         if filed.is_none() {
-            return passthrough().inspect_err(|_| self.fail_stop());
+            // The host cannot re-enter encfs during its sync.
+            return FAIL_STOPPED
+                .with(|failed| failed.borrow_mut().stateless_sync(id, passthrough))
+                .map_err(|error| {
+                    if matches!(error, SlotError::Storage(_)) {
+                        log(&format!(
+                            "{}: a host sync failed; refusing writes and syncs until restart",
+                            self.path
+                        ));
+                    }
+                    slot_error(&self.path, error)
+                });
         }
         self.integrity(false, |f| f.sync(all))?;
         Ok(())
@@ -783,7 +782,7 @@ fn doomed_inode(dir: &hfs::Descriptor, path: &str) -> Option<DirId> {
 fn forget_inode(id: Option<DirId>) {
     if let Some(id) = id {
         FILES.with(|files| files.borrow_mut().remove(&id));
-        FAIL_STOPPED.with(|failed| failed.borrow_mut().remove(&id));
+        FAIL_STOPPED.with(|failed| failed.borrow_mut().forget(&id));
     }
 }
 

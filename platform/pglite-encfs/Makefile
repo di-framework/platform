@@ -6,6 +6,8 @@
 #   make smoke          compose with ../pglite-component/dist/di-framework-pglite.wasm and the
 #                       pglite smoke consumer, run the encryption matrix under wasmtime
 #                       (pglite from PGLITE_ENCFS_PGLITE_WASM, else `make -C ../pglite-component build`)
+#   make bench          the design note's section 11 benchmark (plaintext, XTS, codec 4) under
+#                       wasmtime; results in target/bench/run/results.md
 #   make compose PGLITE=path/to/di-framework-pglite.wasm OUT=path/to/pglite-enc.wasm
 #   make wit            print the WIT recovered from the built component
 #   make clean          remove target/ and dist/
@@ -19,7 +21,7 @@ SHELL := /usr/bin/env bash
 PGLITE ?= ../pglite-component/dist/di-framework-pglite.wasm
 OUT ?= dist/pglite-enc.wasm
 
-.PHONY: tools build unit smoke compose wit clean
+.PHONY: tools build unit smoke bench compose wit clean
 
 tools:
 	$(MAKE) -C ../pglite-component tools
@@ -32,6 +34,9 @@ unit:
 
 smoke: build
 	bun scripts/smoke.ts
+
+bench: build
+	bun scripts/bench.ts
 
 compose: build
 	PATH="$(abspath ../pglite-component/.tools/bin):$$PATH" wac plug --plug dist/pglite-encfs.wasm "$(PGLITE)" -o "$(OUT)"

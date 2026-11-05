@@ -207,7 +207,9 @@ These numbers come from the spike (#199): wasmtime 48.0.1, aarch64 macOS, a load
 - **Small OLTP databases.** A small, mostly cached database such as identity-server's mainly pays the initdb cost and a modest commit-path cost.
 - **Large databases.** Scan-heavy databases larger than shared buffers pay about 10x on uncached reads.
 
-The component is about 200 KB.
+The component is about 300 KB.
+
+**Codec 4 (integrity directories).** The same workloads plus multi-page commits, a bulk load with checkpoint, a scan in a fresh engine and cold and warm `stat-at`, for plaintext, XTS and codec 4 on one host, are recorded in section 11 of [the design note](docs/design-200-two-slot-aead.md). `make bench` re-runs them (`scripts/bench.ts` drives `tests/bench`, a consumer that times each phase inside the guest).
 
 ## Build and test
 
@@ -216,6 +218,8 @@ make tools    # pinned wasm-tools + wac (shared with ../pglite-component)
 make unit     # rustfmt, clippy (host + Wasm), host unit tests
 make smoke    # needs wasmtime 48 and ../pglite-component/dist (make -C ../pglite-component build),
               # or PGLITE_ENCFS_PGLITE_WASM=/path/to/di-framework-pglite.wasm
+make bench    # the design note's section 11 benchmark: plaintext, XTS and codec 4 under wasmtime
+              # (same inputs as make smoke); results in target/bench/run/results.md
 ```
 
 **Dependencies.** Every crate is pinned with `=`. Apart from `xts-mode`, the crypto crates (`aes`, `chacha20poly1305`, `hkdf`, `sha2`, `zeroize`) are RustCrypto. `xts-mode` is a small single-maintainer crate: before bumping it, re-run `make unit`. The known answers in `src/testdata/xts-kat.txt` must still pass: the full IEEE 1619 vector 10, codec-2 ciphertext-stealing lengths 16–4096 (an independent IEEE 1619 reference on OpenSSL AES-256-ECB), and codec-3 lengths 1–4096 (an independent reference on Node's AES-256-ECB with hand-written tweak doubling and tail keystream). Cross-check any new length class against such a reference first. `src/testdata/codec2/` holds files written by the v1 build, which must keep reading back exactly.
