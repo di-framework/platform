@@ -11,6 +11,7 @@ import {
   TENANT,
   type Tenant,
   VERSION,
+  waitForNatsContainer,
 } from '../src/tenancy/resources';
 import { PLATFORM_SECRETS } from '../src/tenancy/scheduler-pki';
 import {
@@ -20,6 +21,7 @@ import {
   runtimeOperatorImage,
   TENANT_OPERATOR_CLUSTER_ROLES,
   TENANT_OPERATOR_NOT_READY,
+  TENANT_OPERATOR_WAIT_CONTAINER,
   type TenantOperatorScope,
   tenantOperatorBindingPolicies,
   tenantOperatorClusterRoleRules,
@@ -67,6 +69,7 @@ type PodSpec = {
   automountServiceAccountToken: boolean;
   serviceAccountName: string;
   volumes: unknown[];
+  initContainers: { name: string; command: string[] }[];
   containers: Container[];
 };
 const deployment = find('Deployment', 'runtime-operator', 'di-operator-alpha');
@@ -257,6 +260,58 @@ describe('tenant operator manifests', () => {
       policyTypes: ['Ingress'],
       ingress: [],
     });
+  });
+});
+
+describe('tenant operator start wait (#623)', () => {
+  const SA = '/var/run/secrets/kubernetes.io/serviceaccount';
+  const [wait] = pod.initContainers;
+  const script = wait?.command[2] as string;
+
+  it('is the one init container, built like the hosts wait-for-nats (#470)', () => {
+    expect(pod.initContainers).toHaveLength(1);
+    expect(TENANT_OPERATOR_WAIT_CONTAINER).toBe('wait-for-nats-and-api');
+    const { name, command, ...rest } = wait as Record<string, unknown>;
+    const { name: hostName, command: hostCommand, ...hostRest } = waitForNatsContainer([]);
+    expect(name).toBe(TENANT_OPERATOR_WAIT_CONTAINER);
+    expect(hostName).toBe('wait-for-nats');
+    expect(rest).toEqual(hostRest);
+    expect((command as string[]).slice(0, 2)).toEqual(hostCommand.slice(0, 2));
+    expect(script.startsWith('deadline=$(( $(date +%s) + 600 ))\n')).toBe(true);
+  });
+
+  it('waits for the scheduler NATS the operator is told to use, with the hosts probe', () => {
+    const [, natsUrl] = (container.args[0] as string).split('=');
+    expect(natsUrl).toBe('nats://nats.wasmcloud.svc.cluster.local:4222');
+    expect(script).toContain('for t in nats.wasmcloud.svc.cluster.local:4222; do');
+    expect(script).toContain('nc -z -w 2 "$h" "$p"');
+    expect(script).toContain('gave up waiting for NATS at $h:$p"; exit 1');
+  });
+
+  it('then waits for GET /api to answer 200 over the API Service, as the operator calls it', () => {
+    expect(script.indexOf('waiting for NATS')).toBeLessThan(script.indexOf('waiting for the API'));
+    // The operator dials KUBERNETES_SERVICE_HOST:PORT (client-go in-cluster config), not DNS.
+    expect(script).toContain(
+      'api="$KUBERNETES_SERVICE_HOST"; case "$api" in *:*) api="[$api]";; esac',
+    );
+    expect(script).toContain('url="https://$api:$KUBERNETES_SERVICE_PORT/api"');
+    // The pod's own token and CA: no extra RBAC, and only the cluster CA is trusted.
+    expect(script).toContain(`--header "Authorization: Bearer $(cat ${SA}/token)"`);
+    expect(script).toContain(`SSL_CERT_FILE=${SA}/ca.crt SSL_CERT_DIR=${SA} timeout 10 wget -q`);
+    expect(script).not.toContain('no-check-certificate');
+    expect(script).toContain('echo "waiting for the API server at $url: $reason"');
+    expect(script).toContain('gave up waiting for the API server at $url"; exit 1');
+    expect(script.endsWith('\n  sleep 2\ndone')).toBe(true);
+  });
+
+  it('leaves the upstream operator container unmodified', () => {
+    expect(pod.containers).toHaveLength(1);
+    expect(container.image).toBe(runtimeOperatorImage());
+    expect(container.volumeMounts).toEqual([
+      { name: 'operator-cert', mountPath: '/operator-cert', readOnly: true },
+    ]);
+    expect(wait).not.toHaveProperty('volumeMounts');
+    expect(wait).not.toHaveProperty('env');
   });
 });
 

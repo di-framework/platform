@@ -12,10 +12,13 @@ import {
   labels,
   NAMESPACE_ROLE,
   names,
+  natsHostPort,
   type Resource,
   resource,
   TENANT,
   type Tenant,
+  waitForNatsSteps,
+  waitInitContainer,
 } from './resources';
 import { PLATFORM_SECRETS } from './scheduler-pki';
 import {
@@ -66,6 +69,38 @@ export type TenantOperatorScope = keyof typeof TENANT_OPERATOR_CLUSTER_ROLES;
 export const TENANT_OPERATOR_POD_LABELS = { 'wasmcloud.com/name': TENANT_OPERATOR_NAME };
 export const TENANT_OPERATOR_HEALTH_PORT = 8082;
 const CERT_DIR = '/operator-cert';
+/**
+ * The init container that holds the operator back until the scheduler NATS and the API server
+ * answer (#623). The upstream operator exits when either first call fails, and in a new pod's
+ * first seconds its network policy may not be programmed yet (#470), so without this wait every
+ * tenant operator restarted once or twice at start.
+ */
+export const TENANT_OPERATOR_WAIT_CONTAINER = 'wait-for-nats-and-api';
+/** Where the kubelet projects the pod's ServiceAccount token and the cluster CA. */
+const SERVICE_ACCOUNT_DIR = '/var/run/secrets/kubernetes.io/serviceaccount';
+
+/**
+ * Shell lines that block until `GET /api` on the in-cluster API Service answers 200, as the
+ * operator's own first call must (`failed to get server groups`, #623), retrying every 2 s until
+ * `$deadline`. The request goes where the operator's goes (`KUBERNETES_SERVICE_HOST:PORT`) and
+ * carries the pod's ServiceAccount token. busybox wget verifies TLS through OpenSSL's default
+ * store, which `SSL_CERT_FILE` and `SSL_CERT_DIR` redirect, so only the mounted cluster CA is
+ * trusted (the image's own bundle cannot vouch for the API server). `timeout` bounds each
+ * attempt, as `nc -w` does for NATS.
+ */
+function waitForApiServerSteps(): string[] {
+  const sa = SERVICE_ACCOUNT_DIR;
+  return [
+    'api="$KUBERNETES_SERVICE_HOST"; case "$api" in *:*) api="[$api]";; esac',
+    'url="https://$api:$KUBERNETES_SERVICE_PORT/api"',
+    `until reason=$(SSL_CERT_FILE=${sa}/ca.crt SSL_CERT_DIR=${sa} timeout 10 wget -q -O /dev/null -T 5 --header "Authorization: Bearer $(cat ${sa}/token)" "$url" 2>&1); do`,
+    '  [ -n "$reason" ] || reason="no answer within 10 s"',
+    '  echo "waiting for the API server at $url: $reason"',
+    '  if [ "$(date +%s)" -ge "$deadline" ]; then echo "gave up waiting for the API server at $url"; exit 1; fi',
+    '  sleep 2',
+    'done',
+  ];
+}
 
 type Rule = { apiGroups: string[]; resources: string[]; verbs: string[] };
 const WASMCLOUD = 'runtime.wasmcloud.dev';
@@ -225,6 +260,7 @@ export function tenantOperatorResources(
   );
 
   const podLabels = { ...labels(tenant, cfg.installation), ...TENANT_OPERATOR_POD_LABELS };
+  const natsUrl = `nats://nats.${cfg.namespace}.svc.cluster.local:4222`;
   const deployment = make('apps/v1', 'Deployment', TENANT_OPERATOR_NAME, ns, {
     spec: {
       replicas: 1,
@@ -243,13 +279,22 @@ export function tenantOperatorResources(
             seccompProfile: { type: 'RuntimeDefault' },
           },
           volumes: [{ name: 'operator-cert', secret: { secretName: PLATFORM_SECRETS.operator } }],
+          // The operator exits on a failed first NATS connect or API call, so the pod waits for
+          // both first and a start-up race never counts as a restart (#623). The operator itself
+          // stays the unmodified upstream image with the chart's flags.
+          initContainers: [
+            waitInitContainer(TENANT_OPERATOR_WAIT_CONTAINER, [
+              ...waitForNatsSteps([natsHostPort(natsUrl)]),
+              ...waitForApiServerSteps(),
+            ]),
+          ],
           containers: [
             {
               name: TENANT_OPERATOR_NAME,
               image: runtimeOperatorImage(),
               imagePullPolicy: 'IfNotPresent',
               args: [
-                `-nats-url=nats://nats.${cfg.namespace}.svc.cluster.local:4222`,
+                `-nats-url=${natsUrl}`,
                 `-nats-ca=${CERT_DIR}/ca.crt`,
                 `-nats-client-cert=${CERT_DIR}/tls.crt`,
                 `-nats-client-key=${CERT_DIR}/tls.key`,

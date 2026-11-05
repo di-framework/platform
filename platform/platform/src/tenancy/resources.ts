@@ -420,13 +420,15 @@ export function natsHostPort(url: string): string {
   return `${u.hostname}:${u.port || '4222'}`;
 }
 
+/** How long a `wait-for-*` init container retries before it exits 1 and the pod restarts. */
+const WAIT_INIT_DEADLINE_SECONDS = 600;
+
 /**
- * Init container that blocks until every `host:port` resolves and accepts a TCP connect,
- * retrying every 2 s for up to 10 minutes (#470).
+ * Shell lines that block until every `host:port` resolves and accepts a TCP connect, retrying
+ * every 2 s until `$deadline` (#470). Run them through {@link waitInitContainer}.
  */
-export function waitForNatsContainer(targets: string[]) {
-  const script = [
-    'deadline=$(( $(date +%s) + 600 ))',
+export function waitForNatsSteps(targets: string[]): string[] {
+  return [
     `for t in ${targets.join(' ')}; do`,
     // biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion
     '  h=${t%:*}; p=${t##*:}',
@@ -437,9 +439,19 @@ export function waitForNatsContainer(targets: string[]) {
     '    sleep 2',
     '  done',
     'done',
-  ].join('\n');
+  ];
+}
+
+/**
+ * Init container on the `di-nats` image that runs `steps` under one 10-minute deadline
+ * (`$deadline`, epoch seconds), so a start-up race never counts as a restart (#470, #623).
+ */
+export function waitInitContainer(name: string, steps: string[]) {
+  const script = [`deadline=$(( $(date +%s) + ${WAIT_INIT_DEADLINE_SECONDS} ))`, ...steps].join(
+    '\n',
+  );
   return {
-    name: 'wait-for-nats',
+    name,
     image: RUNTIME_NATS_IMAGE,
     command: ['sh', '-c', script],
     resources: {
@@ -452,6 +464,11 @@ export function waitForNatsContainer(targets: string[]) {
       capabilities: { drop: ['ALL'] },
     },
   };
+}
+
+/** The tenant hosts' `wait-for-nats` init container (#470). */
+export function waitForNatsContainer(targets: string[]) {
+  return waitInitContainer('wait-for-nats', waitForNatsSteps(targets));
 }
 
 const BINARY_QUANTITY = /^([1-9][0-9]*)(Ki|Mi|Gi|Ti)?$/;
