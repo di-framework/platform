@@ -947,17 +947,27 @@ whatever `node` is on `PATH`; `di-framework-kube` does not pin a version.
 
 ## Known issues
 
-- **Tenant operator restarts after its first start (#541).** The platform-owned scheduler NATS
-  (`di-scheduler-nats`) is Ready before the `runtime-operator` release is applied, so the
+- **Restarts at start and across a rotation (#541, #470, #623).** The platform-owned scheduler
+  NATS (`di-scheduler-nats`) is Ready before the `runtime-operator` release is applied, so the
   platform operator and `hostgroup-default` connect on their first try. A tenant's own
-  `runtime-operator` exits when its first NATS connect is refused, and nothing reports when
-  NATS has loaded the accounts file that admits it. The controller therefore creates it only
-  after the written file has named its user for 120 seconds, and moves the tenant's hosts to a
-  renewed or rotated certificate only after the same wait for the new user. If NATS loads the
-  file later than that, the operator restarts until it does. Tenant host pods are not affected
-  by start-up ordering: their `wait-for-nats` init container waits up to 10 minutes for the
-  scheduler NATS and the tenant's `di-nats` before the host starts. After that cap the init
-  container exits 1 and the pod restarts as usual.
+  `runtime-operator` exits when its first NATS connect or its first API call is refused, and
+  nothing reports when NATS has loaded the accounts file that admits it. The controller therefore
+  creates it only after the written file has named its user for 120 seconds, and moves the
+  tenant's hosts to a renewed or rotated certificate only after the same wait for the new user.
+  If NATS loads the file later than that, the operator restarts until it does. Neither tenant
+  pod is affected by start-up ordering (a new pod's network policy may not be programmed in its
+  first seconds): an init container waits up to 10 minutes before the main container starts.
+  After that cap the init container exits 1 and the pod restarts as usual.
+
+  | Pod | Init container | Waits for | Expected restarts at start |
+  | --- | --- | --- | --- |
+  | `hostgroup-tenant-<t>` | `wait-for-nats` | the scheduler NATS and the tenant's `di-nats` (TCP) | 0 |
+  | `di-operator-<t>/runtime-operator` | `wait-for-nats-and-api` | the scheduler NATS (TCP), then `GET /api` on the API Service answering 200 with the pod's ServiceAccount token, verified against the mounted cluster CA | 0 |
+  | `hostgroup-default`, the chart's operator | none | | 1 on an upgrade that switches the `nats` Service endpoint |
+
+  A forced scheduler-identity rotation still restarts the tenant operator through its liveness
+  probe while the Secret volume refreshes (design-541 §4.5); the init container does not change
+  that.
 
 ## Development
 

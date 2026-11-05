@@ -401,6 +401,7 @@ The platform controller renders, for each Tenant, the same objects the chart ren
     - `-metrics-bind-address=0`, which disables metrics (`wasmcloud: runtime-operator/cmd/main.go:86-87`), so no metrics ClusterRole is needed.
 
   These flags never change during the tenant's life, so a tenant change restarts only that tenant's operator.
+  - One init container, `wait-for-nats-and-api` (#623): the hosts' NATS wait (#470) for the scheduler NATS, then `GET /api` on the API Service with the pod's ServiceAccount token, verified against the mounted cluster CA, so the operator's first connect and first API call never race the namespace's network policy and a fresh operator starts with 0 restarts. The operator image and flags stay unmodified.
 - **ServiceAccount and RBAC.** Pulumi renders three fixed ClusterRoles. Each copies the rules of the chart's operator Roles for one kind of namespace:
   - `di-tenant-operator-self`: leases, events, pods, Hosts and their status and finalizers (`chart: templates/operator/role.yaml`), bound in `di-operator-<t>`;
   - `di-tenant-operator-workloads`: the workload CRDs and their status and finalizers; ConfigMaps, Secrets, Services, `services/finalizers` and events; EndpointSlices, including the `restricted` subresources (`workload-crd-role.yaml`, `workload-namespace-role.yaml`, `endpointslice-role.yaml`), bound in `di-tenant-<t>`;
