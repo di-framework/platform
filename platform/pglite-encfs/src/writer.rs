@@ -20,6 +20,8 @@
 //!   syncs (clears `synced_once`, so the next write runs W0) rather than
 //!   guessing.
 
+use std::collections::BTreeSet;
+
 use crate::file::{Storage, FILL_CHUNK, MAX_GAP, MAX_SIZE};
 use crate::header::{FileId, NONCE_LEN};
 use crate::slots::{
@@ -238,6 +240,49 @@ impl FileState {
         self.wm_pending = false;
         self.dirty = false;
         self.synced_once = true;
+    }
+}
+
+/// Inodes of an integrity directory whose host sync failed while encfs
+/// held no state for them (6.5): a sync through a descriptor with no state,
+/// or a birth's. Until restart, every state filed for such an inode is
+/// fail-stopped, no birth runs on it, and a further stateless sync is
+/// refused before it reaches the host, as the log line promises.
+#[derive(Debug, Default)]
+pub struct FailStops<Id: Ord>(BTreeSet<Id>);
+
+impl<Id: Ord> FailStops<Id> {
+    pub const fn new() -> Self {
+        FailStops(BTreeSet::new())
+    }
+
+    pub fn is_stopped(&self, id: &Id) -> bool {
+        self.0.contains(id)
+    }
+
+    pub fn stop(&mut self, id: Id) {
+        self.0.insert(id);
+    }
+
+    /// The inode is gone: a reused inode number must not inherit the stop.
+    pub fn forget(&mut self, id: &Id) {
+        self.0.remove(id);
+    }
+
+    /// A host sync through a descriptor that holds no state: refused for a
+    /// fail-stopped inode, otherwise `sync`, whose failure stops the inode.
+    pub fn stateless_sync<E>(
+        &mut self,
+        id: Id,
+        sync: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), SlotError<E>> {
+        if self.is_stopped(&id) {
+            return Err(SlotError::FailStopped);
+        }
+        sync().map_err(|error| {
+            self.stop(id);
+            SlotError::Storage(error)
+        })
     }
 }
 
@@ -858,7 +903,8 @@ impl<S: Durable, N: Nonces> IntegrityFile<'_, S, N> {
         if physical > end {
             if let Err(error) = self.file.storage.set_len(end) {
                 // The truncate may have happened: the removed units' bits go
-                // with it, and W0 syncs before any bit is trusted again.
+                // with it, whether or not it did (nothing may trust them
+                // again), and W0 syncs before any remaining bit is trusted.
                 self.state.drop_from(remaining);
                 self.state.reload = true;
                 self.state.synced_once = false;
@@ -1622,6 +1668,80 @@ mod tests {
         assert_eq!(bench.set_size(1), Err(SlotError::FailStopped));
         assert_eq!(bench.sync(), Err(SlotError::FailStopped));
         assert_eq!(bench.read_all().unwrap(), b"data");
+    }
+
+    #[test]
+    fn a_stateless_sync_of_a_fail_stopped_inode_is_refused_before_the_host() {
+        // S2 of the #564 re-review: a sync through a descriptor with no state
+        // fail-stops its inode when it fails, and a later one is refused with
+        // `FailStopped` without reaching the host, as the log line promises.
+        // Another inode is unaffected, and a forgotten inode syncs again.
+        let rec = crate::crash_tests::Rec::new(Vec::new(), None);
+        let mut stops = FailStops::default();
+        assert_eq!(stops.stateless_sync(7, || rec.sync_data()), Ok(()));
+        assert_eq!(rec.syncs.get(), 1);
+        rec.fail_sync.set(true);
+        assert_eq!(
+            stops.stateless_sync(7, || rec.sync_data()),
+            Err(SlotError::Storage(()))
+        );
+        assert!(stops.is_stopped(&7));
+        assert_eq!(
+            stops.stateless_sync(7, || rec.sync_data()),
+            Err(SlotError::FailStopped)
+        );
+        assert_eq!(rec.syncs.get(), 1, "the host was reached");
+        assert!(!stops.is_stopped(&8));
+        assert_eq!(stops.stateless_sync(8, || rec.sync_data()), Ok(()));
+        stops.forget(&7);
+        assert_eq!(stops.stateless_sync(7, || rec.sync_data()), Ok(()));
+        assert_eq!(rec.syncs.get(), 3);
+    }
+
+    #[test]
+    fn a_failed_shrink_syncs_before_the_next_write() {
+        // S1 of the #564 re-review, 6.4: a truncate that fails, whether or
+        // not it took effect, drops the removed units' bits; the next write
+        // runs W0 and reloads the size from disk before trusting any bit,
+        // and reports no `io`.
+        for truncated in [false, true] {
+            let mut bench = Bench::born();
+            let data = pattern(3 * U, 5);
+            bench.write(0, &data).unwrap();
+            bench.sync().unwrap();
+            let syncs = bench.rec.syncs.get();
+            bench.rec.fail_set_len.set(Some(truncated));
+            assert_eq!(bench.set_size(UNIT + 10), Err(SlotError::Storage(())));
+            assert!(
+                bench.rec.fail_set_len.get().is_none(),
+                "set_len was reached"
+            );
+            assert!(!bench.state.has_failed());
+            let end = PAIRS_START + 2 * PAIR_LEN;
+            assert_eq!(bench.rec.size().unwrap() == end, truncated);
+            assert_eq!(bench.rec.syncs.get(), syncs);
+            // The cut unit's bits are dropped either way; the kept ones stay.
+            assert!(bench.state.known(2).is_none());
+            assert!(bench.state.known(1).is_some());
+            // Re-extend over the cut: W0 first, then the write.
+            let at = 2 * UNIT + 5;
+            bench.write(at, b"tail").unwrap();
+            assert_eq!(bench.rec.syncs.get(), syncs + 1, "W0 ran");
+            let mut expected = data.clone();
+            if truncated {
+                expected.truncate(2 * U);
+                expected.resize(at as usize + 4, 0);
+            }
+            expected[at as usize..at as usize + 4].copy_from_slice(b"tail");
+            assert_eq!(bench.state.size(), expected.len() as u64);
+            assert_eq!(bench.read_all().unwrap(), expected);
+            assert_eq!(logical(&bench.keys, &bench.volatile()).unwrap().0, expected);
+            bench.sync().unwrap();
+            assert_eq!(
+                logical(&bench.keys, &bench.rec.durable.borrow()).unwrap().0,
+                expected
+            );
+        }
     }
 
     #[test]

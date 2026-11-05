@@ -682,7 +682,41 @@ These are estimates to be checked against the README benchmark, which the issue'
 
 **Memory:** the per-file bitmap (6.1), about 48 KiB per fully touched 1 GiB segment.
 
-**Benchmark list** (#200's acceptance criterion): the README table for plaintext, XTS and codec 4 on the same host, plus commit latency with multi-page WAL flushes, bulk load plus checkpoint, cold and warm `stat-at`, and on-disk size (`st_size` and allocated blocks) of the README cluster.
+**Benchmark list** (#200's acceptance criterion): the README table for plaintext, XTS and codec 4 on the same host, plus commit latency with multi-page WAL flushes, bulk load plus checkpoint, cold and warm `stat-at`, and on-disk size (`st_size` and allocated blocks) of the README cluster. Measured in 11.1.
+
+### 11.1 Measured (2026-11-05)
+
+`make bench` (`scripts/bench.ts` driving `tests/bench`, a consumer that times each phase inside the guest; one wasmtime process per phase, the same fixed workload for each column). Plaintext plugs pglite alone; XTS and codec 4 plug the encfs build of this branch (`write-codec=3`; codec 4 from a reservation marker) into pglite and, for the `stat-at` rows, into the consumer's own filesystem imports as well, so those rows time encfs's `stat-at` (the host's for plaintext). Host: Apple M3 Max, 16 cores, macOS (darwin 27.2.0, arm64), wasmtime 48.0.1, pglite `di-framework:pglite@0.2.0` (PostgreSQL 17.11, built 2026-10-29). Read the timings as ±20%, like the README's; the plaintext column matches the README baseline (initdb 20.7 s, inserts 1.58 s, bulk load 1.6–2.1 s there).
+
+| measurement | plaintext | pglite-encfs (XTS) | pglite-encfs (codec 4) |
+|---|---|---|---|
+| cold start + initdb (wall clock) | 18.64 s | 28.95 s (1.55×) | 32.87 s (1.76×) |
+| 3000 inserts, 10 per transaction | 1.38 s | 1.49 s (1.09×) | 2.02 s (1.47×) |
+| 3000 point selects (cached) | 106 ms | 110 ms (1.04×) | 109 ms (1.03×) |
+| 200 commits of one 24 KiB row (multi-page WAL flush) | 0.94 s | 1.21 s (1.28×) | 1.14 s (1.21×) |
+| bulk load 200k rows (47.2 MB table) | 1.57 s | 5.09 s (3.25×) | 2.86 s (1.83×) |
+| CHECKPOINT after the bulk load | 0.36 s | 0.90 s (2.49×) | 0.62 s (1.73×) |
+| restart (open after the bulk load) | 0.53 s | 2.15 s (4.02×) | 0.46 s (0.86×) |
+| scan of the bulk table, fresh engine | 251 ms | 2062 ms (8.22×) | 691 ms (2.75×) |
+| `stat-at`, cold (per file, 895 relation files) | 88.4 µs | 90.9 µs (1.03×) | 248.9 µs (2.82×) |
+| `stat-at`, repeated, file not held open (per file) | 90.0 µs | 90.2 µs (1.00×) | 255.0 µs (2.83×) |
+| `stat-at`, warm, file held open (per file) | 89.0 µs | 88.9 µs (1.00×) | 158.7 µs (1.78×) |
+| disk after initdb (1676 files), `st_size` | 32.2 MB | 38.4 MB (1.19×) | 76.6 MB (2.38×) |
+| disk after initdb, allocated | 33.5 MB | 40.7 MB (1.22×) | 86.2 MB (2.57×) |
+| disk after the run (1737 files), `st_size` | 132.2 MB | 138.6 MB (1.05×) | 279.0 MB (2.11×) |
+| disk after the run, allocated | 134.2 MB | 141.9 MB (1.06×) | 297.9 MB (2.22×) |
+
+The three `stat-at` rows were measured on the same build in a later `make bench` with `PGLITE_ENCFS_BENCH_PHASES=init,stat` (895 relation files of a fresh cluster), after the review of #652 found that the first version's second pass repeated the miss instead of hitting the per-file state; every other row is from the recorded run.
+
+Two earlier runs the same day gave the same ordering (every ratio here is against plaintext): one on a quiet host with the build before #646 (XTS writing codec 2; codec 4: inserts 1.25×, multi-page commits 1.15×, bulk load 1.71×, scan 2.68×; XTS: 1.20×, 1.45×, 3.30×, 7.52×), and one on a host shared with other builds (plaintext initdb 37 s; XTS's bulk load 4.45× and scan 7.45×, codec 4's 1.90× and 3.08×). Their two `stat-at` passes were both misses (codec 4: 231 and 221 µs on the quiet host, 342 and 223 µs on the loaded one) and are superseded by the three rows above. The sizes were identical in every run; the XTS restart of 2.15 s above was 0.62 s and 1.10 s in the other two.
+
+Against the estimates above:
+
+- **Commit path: within noise of XTS.** The fsync-bound insert row is the noisiest in the table: across the three runs codec 4 took between 0.75× and 1.36× XTS's time (1.47× plaintext here, 1.25× and 0.77× in the other runs), with no consistent direction; cached point selects are equal. The multi-page commits are consistently cheaper than XTS (1.21× plaintext against 1.28× here; 1.15× against 1.45×, and 1.47× against 1.95×, in the other runs), because each extra page is a cheaper seal.
+- **CPU: lower than XTS**, as expected. The bulk load (1.83× plaintext against 3.25×), its checkpoint (1.73× against 2.49×) and the uncached scan (2.75× against 8.22×, that is 0.34× XTS) show XChaCha20-Poly1305 beating software AES-XTS in Wasm by about 2–3× per byte, even though codec 4 reads both slots of every cold unit. The three runs agree on these rows within ±10%.
+- **`stat-at`.** Warm, the case PostgreSQL gets on the segments it holds open, a codec-4 `stat-at` costs 1.8× the host's (159 against 88 µs): the host `stat-at`, one `metadata-hash-at` and the lookup in the per-file state, as 5.3 says. Cold it costs 2.8× (249 µs): the miss adds the open, the 12 KiB header-and-records read and the last-pair read. A repeat on a file nobody holds open costs the same as cold (255 µs), because the state loaded for the temporary descriptor is dropped with it: 5.3's "then cache the result" holds only while a descriptor of the file is open, which is filed as #654. The S2 and S3 deferrals of the #564 re-review stand.
+- **Space.** The cluster right after initdb is 2.0× XTS by `st_size` (76.6 MB against 38.4 MB) and 2.1× by allocation, a little under the 80–84 MB estimated for the README cluster, because more of its files are single-unit than the estimate assumed. After the run (a 47 MB bulk table, 4.8 MB of TOAST and the WAL) it is 2.01× XTS by `st_size` and 2.10× by allocation, as the multi-unit cost of about 2.016× predicts.
+- **initdb** is 1.5–1.8× plaintext for both encrypted columns (codec 4 1.76× against XTS 1.55× here, 1.60× against 1.69× in the earlier quiet run), above the spike's +15%: both pay the per-file header sync (codec 4 also the record pages) and the host-call overhead of a 1676-file cluster, and the difference between them is within noise.
 
 ## 12. Test plan
 
