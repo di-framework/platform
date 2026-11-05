@@ -33,8 +33,9 @@ export interface Termination {
   fileCount?: number;
   encfsKcv?: string;
   encfsMode?: string;
-  /** PostgreSQL data directories the manifest records (#492). */
+  /** PostgreSQL data directories the manifest records (#492), and how many lack `pg_control`. */
   dataDirectories?: number;
+  incompleteDataDirectories?: number;
   imageDigest?: string;
   replacedPath?: string;
   /** A restore that stopped part-way: the staging directory it left, relative to the root. */

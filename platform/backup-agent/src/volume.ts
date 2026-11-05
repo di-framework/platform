@@ -13,6 +13,7 @@ import {
   rcloneEnv,
   remote,
   safeKey,
+  type Termination,
   type TreeEntry,
 } from './run.ts';
 import { type TarEntry, TarReader } from './tar.ts';
@@ -192,8 +193,10 @@ export function modeOf(found: DirectoryClass): EncfsMode | undefined {
 
 /**
  * The PostgreSQL data directories in a tree, from entry names alone: a directory holding a
- * regular `PG_VERSION` file. `readVersion` reads that file's content; pass it only for a
- * plaintext volume, where the content is a version and not ciphertext.
+ * regular `PG_VERSION` file, outside any data directory already found. PostgreSQL writes a
+ * `PG_VERSION` into every database directory under `base/` too (`CreateDirAndVersionFile`), so
+ * nothing nested inside a data directory is a candidate. `readVersion` reads that file's content;
+ * pass it only for a plaintext volume, where the content is a version and not ciphertext.
  */
 export async function dataDirectoriesOf(
   entries: Pick<TreeEntry, 'path' | 'type' | 'size'>[],
@@ -202,10 +205,16 @@ export async function dataDirectoriesOf(
   const files = new Map(
     entries.filter((entry) => entry.type === 'file').map((entry) => [entry.path, entry.size]),
   );
+  // By name, so a data directory is seen before anything inside it.
+  const directories = entries
+    .filter((entry) => entry.type === 'directory')
+    .sort((a, b) => byName(a.path, b.path));
   const found: DataDirectory[] = [];
-  for (const entry of entries) {
+  for (const entry of directories) {
     const version = `${entry.path}/${PG_VERSION}`;
-    if (entry.type !== 'directory' || !files.has(version)) continue;
+    if (!files.has(version) || found.some((data) => entry.path.startsWith(`${data.path}/`))) {
+      continue;
+    }
     let pgVersion: string | null = null;
     if (readVersion && (files.get(version) as number) <= PG_VERSION_MAX) {
       const text = Buffer.from(await readVersion(version))
@@ -220,7 +229,18 @@ export async function dataDirectoriesOf(
       applicationDatabase: files.has(`${entry.path}/${DATABASE_MARKER}`) ? 'postgres' : 'template1',
     });
   }
-  return found.sort((a, b) => byName(a.path, b.path));
+  return found;
+}
+
+/** Both counts of the termination record; incomplete ones are named only when there are any. */
+function dataDirectoryCounts(
+  dataDirectories: DataDirectory[],
+): Pick<Termination, 'dataDirectories' | 'incompleteDataDirectories'> {
+  const incomplete = dataDirectories.filter((data) => !data.complete).length;
+  return {
+    dataDirectories: dataDirectories.length,
+    ...(incomplete ? { incompleteDataDirectories: incomplete } : {}),
+  };
 }
 
 /** `PG_VERSION` is readable only where nothing is encrypted. */
@@ -479,7 +499,7 @@ export async function backupVolume(io: AgentIo, request: AgentRequest): Promise<
     fileCount: manifest.fileCount,
     ...(manifest.encfsKcv ? { encfsKcv: manifest.encfsKcv } : {}),
     encfsMode: manifest.encfsMode,
-    dataDirectories: manifest.dataDirectories.length,
+    ...dataDirectoryCounts(manifest.dataDirectories),
     ...(manifest.imageDigest ? { imageDigest: manifest.imageDigest } : {}),
   });
 }
@@ -765,7 +785,7 @@ export async function restoreVolume(io: AgentIo, request: AgentRequest): Promise
     fileCount: manifest.fileCount,
     ...(manifest.encfsKcv ? { encfsKcv: manifest.encfsKcv } : {}),
     encfsMode: manifest.encfsMode,
-    dataDirectories: manifest.dataDirectories.length,
+    ...dataDirectoryCounts(manifest.dataDirectories),
     ...(replacedPath ? { replacedPath: relative(replacedPath) } : {}),
   });
 }
