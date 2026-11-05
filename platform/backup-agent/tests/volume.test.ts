@@ -24,6 +24,9 @@ import {
 } from '../src/run.ts';
 import {
   classifyDirectory,
+  type DataDirectory,
+  dataDirectoriesOf,
+  type EncfsMode,
   imageDigestOf,
   markerForm,
   modeOf,
@@ -730,15 +733,31 @@ describe('volume helpers and node io', () => {
       encfsKcv: null,
       encfsMode: 'NotEncfs',
       encfsReservation: false,
+      dataDirectories: [],
     };
     expect(parseManifest(JSON.stringify(good))).toBeDefined();
+    const pgdata = { path: 'a', complete: true, pgVersion: null, applicationDatabase: 'postgres' };
     for (const fine of [
       { encfsMode: 'XTS', encfsKcv: KCV },
       { encfsMode: 'AEAD', encfsKcv: KCV },
       { encfsMode: 'AEAD', encfsReservation: true },
+      { dataDirectories: [pgdata] },
+      { dataDirectories: [{ ...pgdata, pgVersion: '17.5', applicationDatabase: 'template1' }] },
     ]) {
       expect(parseManifest(JSON.stringify({ ...good, ...fine }))).toBeDefined();
     }
+    // The record is kept in one field order, whatever order the file used.
+    const reordered = {
+      applicationDatabase: 'postgres',
+      pgVersion: '17',
+      complete: false,
+      path: 'a',
+    };
+    expect(
+      JSON.stringify(parseManifest(JSON.stringify({ ...good, dataDirectories: [reordered] }))),
+    ).toContain(
+      '[{"path":"a","complete":false,"pgVersion":"17","applicationDatabase":"postgres"}]',
+    );
     for (const bad of [
       'null',
       JSON.stringify({ ...good, files: 'x' }),
@@ -757,6 +776,16 @@ describe('volume helpers and node io', () => {
       JSON.stringify({ ...good, encfsMode: 'XTS' }),
       JSON.stringify({ ...good, encfsReservation: true }),
       JSON.stringify({ ...good, encfsMode: 'AEAD', encfsReservation: true, encfsKcv: KCV }),
+      JSON.stringify({ ...good, dataDirectories: undefined }),
+      JSON.stringify({ ...good, dataDirectories: [null] }),
+      JSON.stringify({ ...good, dataDirectories: [{ ...pgdata, path: '../x' }] }),
+      JSON.stringify({ ...good, dataDirectories: [{ ...pgdata, complete: 'yes' }] }),
+      JSON.stringify({ ...good, dataDirectories: [{ ...pgdata, pgVersion: 'seventeen' }] }),
+      JSON.stringify({ ...good, dataDirectories: [{ ...pgdata, pgVersion: undefined }] }),
+      JSON.stringify({
+        ...good,
+        dataDirectories: [{ ...pgdata, applicationDatabase: 'template0' }],
+      }),
     ]) {
       expect(parseManifest(bad)).toBeUndefined();
     }
@@ -1082,3 +1111,310 @@ async function run(argv: string[]): Promise<void> {
   const result = await nodeIo().exec(argv, { env: { COPYFILE_DISABLE: '1' } });
   expect(result.code).toBe(0);
 }
+
+describe('pglite data directories (#492)', () => {
+  /**
+   * The identity guest's volume as pglite-component lays it out: PGDATA at `<open root>/data`
+   * with the `di-framework-database` marker (#212), the provider's `runtime/` files beside it,
+   * and the encfs marker at the volume root (none for a plaintext volume).
+   */
+  async function pgliteVolume(encfs?: Buffer): Promise<void> {
+    await rm(source, { recursive: true });
+    const data = join(source, 'identity', 'data');
+    for (const dir of ['global', 'base/1', 'base/4', 'base/5', 'pg_wal'])
+      await mkdir(join(data, dir), { recursive: true });
+    await mkdir(join(source, 'identity', 'runtime', 'share'), { recursive: true });
+    await writeFile(join(data, 'PG_VERSION'), '17\n');
+    await writeFile(join(data, 'global', 'pg_control'), Buffer.alloc(8192, 1));
+    // Every database directory carries its own PG_VERSION, as PostgreSQL writes them.
+    for (const oid of ['1', '4', '5'])
+      await writeFile(join(data, 'base', oid, 'PG_VERSION'), '17\n');
+    await writeFile(join(data, 'base', '5', '1259'), Buffer.alloc(8192, 7));
+    await writeFile(join(data, 'pg_wal', '000000010000000000000001'), Buffer.alloc(16384, 9));
+    await writeFile(join(data, 'di-framework-database'), 'postgres\n');
+    await writeFile(
+      join(source, 'identity', 'runtime', 'share', 'postgresql.conf.sample'),
+      '# x\n',
+    );
+    if (encfs) await writeFile(join(source, '.di-encfs'), encfs);
+  }
+
+  const IDENTITY: DataDirectory = {
+    path: 'identity/data',
+    complete: true,
+    pgVersion: null,
+    applicationDatabase: 'postgres',
+  };
+
+  test('finds data directories from entry names, the way pglite-component boots them', async () => {
+    const file = (path: string, size = 3) => ({ path, type: 'file' as const, size });
+    const dir = (path: string) => ({ path, type: 'directory' as const, size: 0 });
+    const reads: string[] = [];
+    const versions: Record<string, string> = {
+      'z/data/PG_VERSION': '17\n',
+      'legacy/PG_VERSION': 'seventeen',
+      'a/PG_VERSION': '17.5',
+    };
+    const read = async (path: string) => {
+      reads.push(path);
+      return Buffer.from(versions[path] ?? '');
+    };
+    const entries = [
+      dir('z'),
+      dir('z/data'),
+      file('z/data/PG_VERSION'),
+      dir('z/data/global'),
+      file('z/data/global/pg_control', 8192),
+      file('z/data/di-framework-database', 9),
+      dir('z/runtime'),
+      dir('legacy'),
+      file('legacy/PG_VERSION', 9),
+      dir('legacy/global'),
+      file('legacy/global/pg_control', 8192),
+      dir('a'),
+      file('a/PG_VERSION', 4),
+      dir('a/global'),
+      // A directory named PG_VERSION, a pg_control that is a directory, and an oversized file.
+      dir('b'),
+      dir('b/PG_VERSION'),
+      dir('big'),
+      file('big/PG_VERSION', 17),
+      dir('big/global'),
+      dir('big/global/pg_control'),
+    ];
+    expect(await dataDirectoriesOf(entries, read)).toEqual([
+      { path: 'a', complete: false, pgVersion: '17.5', applicationDatabase: 'template1' },
+      { path: 'big', complete: false, pgVersion: null, applicationDatabase: 'template1' },
+      { path: 'legacy', complete: true, pgVersion: null, applicationDatabase: 'template1' },
+      { path: 'z/data', complete: true, pgVersion: '17', applicationDatabase: 'postgres' },
+    ]);
+    expect(reads).toEqual(['a/PG_VERSION', 'legacy/PG_VERSION', 'z/data/PG_VERSION']);
+    // Without a reader (an encrypted volume) nothing is read and no version is recorded.
+    expect((await dataDirectoriesOf(entries)).map((found) => found.pgVersion)).toEqual([
+      null,
+      null,
+      null,
+      null,
+    ]);
+    expect(await dataDirectoriesOf([dir('x'), file('x/PG_VERSION.bak')], read)).toEqual([]);
+    // Nothing inside a data directory is one: not the database directories under base/, nor a
+    // nested tree that looks like PGDATA. The order of the entries does not matter.
+    const nested = [
+      file('x/data/base/5/PG_VERSION'),
+      dir('x/data/base/5'),
+      file('x/data/sub/data/PG_VERSION'),
+      dir('x/data/sub/data'),
+      dir('x/data/base/1'),
+      file('x/data/base/1/PG_VERSION'),
+      file('x/data/global/pg_control', 8192),
+      dir('x/data/global'),
+      dir('x/data/base'),
+      dir('x/data/sub'),
+      file('x/data/PG_VERSION'),
+      dir('x/data'),
+      dir('x'),
+      // A sibling tree is its own data directory.
+      dir('x-two'),
+      file('x-two/PG_VERSION'),
+    ];
+    expect(await dataDirectoriesOf(nested)).toEqual([
+      { path: 'x-two', complete: false, pgVersion: null, applicationDatabase: 'template1' },
+      { path: 'x/data', complete: true, pgVersion: null, applicationDatabase: 'template1' },
+    ]);
+    // Once the parent is a data directory itself, x/data is inside it and no longer counts.
+    expect(await dataDirectoriesOf([...nested, file('x/PG_VERSION')])).toEqual([
+      { path: 'x', complete: false, pgVersion: null, applicationDatabase: 'template1' },
+      { path: 'x-two', complete: false, pgVersion: null, applicationDatabase: 'template1' },
+    ]);
+  });
+
+  /**
+   * The layout of a volume the provider itself wrote (`pglite-component/target/embedded-test-data3`
+   * after `make unit`, PostgreSQL 17): every directory, and the files that decide recognition plus
+   * one of each other kind. The 900-odd relation files under `base/<oid>/` are left out; one stands
+   * for them.
+   */
+  const EMBEDDED_TEST_DATA3 = {
+    directories: [
+      'pglite/data/pg_commit_ts',
+      'pglite/data/pg_dynshmem',
+      'pglite/data/pg_logical/mappings',
+      'pglite/data/pg_logical/snapshots',
+      'pglite/data/pg_notify',
+      'pglite/data/pg_replslot',
+      'pglite/data/pg_serial',
+      'pglite/data/pg_snapshots',
+      'pglite/data/pg_stat',
+      'pglite/data/pg_stat_tmp',
+      'pglite/data/pg_tblspc',
+      'pglite/data/pg_twophase',
+      'pglite/data/pg_wal/archive_status',
+      'pglite/data/pg_wal/summaries',
+    ],
+    files: [
+      'pglite/data/PG_VERSION',
+      'pglite/data/base/1/PG_VERSION',
+      'pglite/data/base/1/1259',
+      'pglite/data/base/4/PG_VERSION',
+      'pglite/data/base/4/1259',
+      'pglite/data/base/5/PG_VERSION',
+      'pglite/data/base/5/1259',
+      'pglite/data/global/pg_control',
+      'pglite/data/global/1213',
+      'pglite/data/pg_hba.conf',
+      'pglite/data/pg_ident.conf',
+      'pglite/data/pg_logical/replorigin_checkpoint',
+      'pglite/data/pg_multixact/members/0000',
+      'pglite/data/pg_multixact/offsets/0000',
+      'pglite/data/pg_subtrans/0000',
+      'pglite/data/pg_wal/000000010000000000000005',
+      'pglite/data/pg_xact/0000',
+      'pglite/data/postgresql.auto.conf',
+      'pglite/data/postgresql.conf',
+      'pglite/data/postmaster.pid',
+      'pglite/initdb.boot.txt',
+      'pglite/initdb.single.txt',
+      'pglite/runtime/bin/initdb',
+      'pglite/runtime/bin/postgres',
+      'pglite/runtime/lib/postgresql/plpgsql.so',
+      'pglite/runtime/locale',
+      'pglite/runtime/password',
+      'pglite/runtime/share/postgresql/extension/plpgsql.control',
+      'pglite/runtime/share/postgresql/postgres.bki',
+      'pglite/runtime/share/postgresql/timezonesets/Default',
+      'pglite/shm.0',
+      'pglite/shm.1',
+    ],
+  };
+
+  test('a volume the provider wrote holds exactly one data directory, and it is complete', async () => {
+    await rm(source, { recursive: true });
+    for (const dir of EMBEDDED_TEST_DATA3.directories) {
+      await mkdir(join(source, dir), { recursive: true });
+    }
+    // Empty files, except the four PG_VERSION files, which hold the major version as on disk.
+    for (const file of EMBEDDED_TEST_DATA3.files) {
+      await mkdir(join(source, file, '..'), { recursive: true });
+      await writeFile(join(source, file), file.endsWith('PG_VERSION') ? '17' : '');
+    }
+    const entries = await nodeIo().scan(source);
+    expect(entries.filter((entry) => entry.path.endsWith('PG_VERSION'))).toHaveLength(4);
+    const expected: DataDirectory[] = [
+      { path: 'pglite/data', complete: true, pgVersion: '17', applicationDatabase: 'template1' },
+    ];
+    expect(await dataDirectoriesOf(entries, (path) => readFile(join(source, path)))).toEqual(
+      expected,
+    );
+    // Through a backup of the plaintext volume, and through an encrypted one.
+    await backupToClaim();
+    expect(await termination()).toMatchObject({ ok: true, dataDirectories: 1 });
+    expect((await termination()).incompleteDataDirectories).toBeUndefined();
+    expect((await manifestAt(claim)).dataDirectories).toEqual(expected);
+    await writeFile(join(source, '.di-encfs'), marker(KCV));
+    await backupToClaim();
+    expect((await manifestAt(claim)).dataDirectories).toEqual(
+      expected.map((data) => ({ ...data, pgVersion: null })),
+    );
+  });
+
+  test('round-trips a pglite volume in plaintext, XTS and AEAD, reading PG_VERSION only in the clear', async () => {
+    const modes: [Buffer | undefined, EncfsMode, string | null][] = [
+      [undefined, 'NotEncfs', '17'],
+      [marker(KCV), 'XTS', null],
+      [integrity(KCV), 'AEAD', null],
+    ];
+    for (const [encfs, mode, pgVersion] of modes) {
+      await pgliteVolume(encfs);
+      await rm(claim, { recursive: true });
+      await mkdir(claim);
+      await backupToClaim();
+      expect(await termination()).toMatchObject({ ok: true, encfsMode: mode, dataDirectories: 1 });
+      const manifest = await manifestAt(claim);
+      expect(manifest.encfsMode).toBe(mode);
+      expect(manifest.dataDirectories).toEqual([{ ...IDENTITY, pgVersion }]);
+      expect(manifest.fileCount).toBe(9 + (encfs ? 1 : 0));
+      expect(manifest.bytes).toBe(3 * 4 + 8192 + 8192 + 16384 + 9 + 4 + (encfs?.length ?? 0));
+      expect((await termination()).incompleteDataDirectories).toBeUndefined();
+
+      await rm(join(workloads, 'identity'), { recursive: true, force: true });
+      expect(await runAgent(restore(), io())).toBe(0);
+      expect(await termination()).toMatchObject({ ok: true, encfsMode: mode, dataDirectories: 1 });
+      expect(await tree(join(workloads, 'identity'))).toEqual(await tree(source));
+    }
+  });
+
+  test('records an incomplete or legacy data directory instead of refusing it', async () => {
+    await pgliteVolume(marker(KCV));
+    await rm(join(source, 'identity', 'data', 'global', 'pg_control'));
+    await backupToClaim();
+    expect((await manifestAt(claim)).dataDirectories).toEqual([{ ...IDENTITY, complete: false }]);
+    await rm(join(source, 'identity', 'data', 'di-framework-database'));
+    await backupToClaim();
+    expect((await manifestAt(claim)).dataDirectories).toEqual([
+      { ...IDENTITY, complete: false, applicationDatabase: 'template1' },
+    ]);
+    // Several roots in one volume, and the restore reports every one of them.
+    await mkdir(join(source, 'orders', 'data'), { recursive: true });
+    await writeFile(join(source, 'orders', 'data', 'PG_VERSION'), '17\n');
+    await backupToClaim();
+    expect((await manifestAt(claim)).dataDirectories.map((found) => found.path)).toEqual([
+      'identity/data',
+      'orders/data',
+    ]);
+    expect(await runAgent(restore(), io())).toBe(0);
+    expect(await termination()).toMatchObject({ dataDirectories: 2, incompleteDataDirectories: 2 });
+  });
+
+  test('refuses a manifest whose data directories contradict the restored tree', async () => {
+    await pgliteVolume(marker(KCV));
+    await backupToClaim();
+    const path = join(claim, PREFIX, 'manifest.json');
+    const manifest = await manifestAt(claim);
+    const rewrite = (dataDirectories: unknown) =>
+      writeFile(path, JSON.stringify({ ...manifest, dataDirectories }));
+    // The hashes still match; only the record of what the tree is was changed.
+    await rewrite([{ ...IDENTITY, complete: false }]);
+    expect(await runAgent(restore(), io())).toBe(1);
+    expect((await termination()).error).toBe('ContentMismatch');
+    expect(await readdir(workloads)).toEqual(['identity']);
+    expect(await readdir(join(workloads, 'identity'))).toEqual([]);
+    await rewrite([]);
+    expect(await runAgent(restore(), io())).toBe(1);
+    expect((await termination()).error).toBe('ContentMismatch');
+    await rewrite(undefined);
+    expect(await runAgent(restore(), io())).toBe(1);
+    expect((await termination()).error).toBe('ManifestInvalid');
+    // Forced over live data: the refusal comes before anything moves, so the target keeps its
+    // entries and nothing is left beside it.
+    await rewrite([{ ...IDENTITY, applicationDatabase: 'template1' }]);
+    const target = join(workloads, 'identity');
+    await writeFile(join(target, '.di-encfs'), marker(KCV));
+    await writeFile(join(target, 'live'), 'still here');
+    const before = await tree(target);
+    expect(await runAgent(restore({ force: true }), io())).toBe(1);
+    expect((await termination()).error).toBe('ContentMismatch');
+    expect(await tree(target)).toEqual(before);
+    expect(await readdir(workloads)).toEqual(['identity']);
+    await rewrite(manifest.dataDirectories);
+    expect(await runAgent(restore({ force: true }), io())).toBe(0);
+    expect(await readdir(workloads)).toEqual(['identity', 'identity.replaced-20261014T093000Z']);
+  });
+
+  test("retention: gc removes a backup's three objects and the directories it emptied", async () => {
+    await pgliteVolume(integrity(KCV));
+    await backupToClaim();
+    expect((await readdir(join(claim, PREFIX))).sort()).toEqual([
+      'SHA256SUMS',
+      'data.tar',
+      'manifest.json',
+    ]);
+    // The operator names every object of an expired backup (platform/backup-destination).
+    const gcKeys = ['data.tar', 'SHA256SUMS', 'manifest.json']
+      .map((name) => `${PREFIX}/${name}`)
+      .join('\n');
+    expect(await runAgent(request({ kind: 'gc', gcKeys }), io())).toBe(0);
+    expect(await termination()).toMatchObject({ ok: true, format: 'delete' });
+    expect(await readdir(claim)).toEqual([]);
+    expect(await tree(source)).toMatchObject({ 'identity/data/PG_VERSION': sha('17\n') });
+  });
+});
