@@ -1,0 +1,22 @@
+[package]
+name = "pglite-encfs-bench"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Benchmark consumer: the section 11 workloads of the codec-4 design note against pglite, timed inside the guest (#200)."
+publish = false
+
+# Standalone, like tests/root-probe: scripts/bench.ts builds it.
+[workspace]
+
+[[bin]]
+name = "pglite-encfs-bench"
+path = "src/main.rs"
+
+[dependencies]
+wit-bindgen = { version = "=0.61.1", default-features = false, features = ["macros"] }
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+strip = "debuginfo"

@@ -657,6 +657,17 @@ image, existing keys keep working throughout:
   already moved stop working until you upgrade again (nothing is deleted). The older package
   leaves `di-apikeys-<tenant>` alone.
 
+### Controller request profile
+
+At steady state a tick reads each tenant's managed objects and writes nothing (#643): the
+controller keeps, per object, a hash of the body it last applied and the resourceVersion that
+apply returned, and skips the server-side apply while both still match the live object. Any
+difference (a changed rendering, an object someone else wrote or deleted, a Tenant generation
+change, a controller restart) applies the object in full, so a hand-edited or deleted object is
+repaired on the next tick as before. Every 30 minutes (`APPLY_RESYNC_INTERVAL_MS` in
+`src/tenancy/controller.ts`) the cache is dropped and every object is applied once more. Leader
+election lease renewals are unaffected.
+
 ### Tenant removal and namespace retention
 
 Each `tenants` entry takes `deletionPolicy` (`Retain` or `Delete`, default `Retain`). The
@@ -768,7 +779,8 @@ its own NATS account and its own runtime operator.
 - Each Secret holds `tls.crt`, `tls.key` and `ca.crt`. Each client certificate carries a fresh
   16-hex issuance ID in its NATS user name, so a user name names exactly one certificate.
 - ConfigMap `di-scheduler-identities` in `<platform-ns>-scheduler-pki` records, per identity,
-  `current`, and during a renewal `previous` and `previousUntil`. No pod mounts it.
+  `current`, and during a renewal `previous`, `previousSince` and `previousUntil`. No pod mounts
+  it.
 - `di-scheduler-nats-accounts` is rendered from the Tenant list and that record on every pass. It is
   written only when its bytes change. The controller checks user names and their uniqueness first.
   A refused render is not written, so the previous file keeps serving. The Tenant then reports
@@ -805,10 +817,15 @@ Renewal and rotation:
   by a routine renewal so hosts roll onto it. The successor signs 30 days later, and only once
   every client Secret and the server carry it and no renewal still keeps its previous user (a
   host rollout is observed complete, or 1 day has passed since the renewal's overlap ended, after
-  which that host's Secret no longer holds it either); never in the pass that publishes it, even
-  when a late rotation finds less than 30 days left. Any other client Secret that never takes it
-  up delays the switch until 2 days before the old CA expires. While a due switch waits, the
-  controller logs once which holders it waits for. Then every leaf the
+  which that host's Secret no longer holds it either; while a host group still has ready pods on
+  the previous user, 30 days since the renewal instead; a renewal whose certificate never lands
+  holds at most 2 days, counted from the renewal as the record keeps it, so a controller restart
+  does not extend it); never in the pass that publishes it, even when a late rotation finds less
+  than 30 days left. Any other client Secret that never takes it up delays the switch until 2
+  days before the old CA expires. Those holds gate the platform CA, which alone signs the server
+  leaf; the tenant CA's switch waits only for the server Secret to carry both sets. The platform
+  identities pass alone checks the holders, once per tick, and while a due switch waits it logs
+  once which holders it waits for. Then every leaf the
   old CA signed, the server's included, is renewed once against the successor, and the old CA
   stays trusted until it expires, then leaves the bundles. A rotation the controller cannot write
   is logged once (the CA rotation write was refused and will be retried) and retried on every
@@ -1625,8 +1642,9 @@ tenantAuth:
 
 - Placement and quota: both run in `di-runtime-<tenant>`, next to the `di-http` Service the
   controller proxies to, and `di-runtime-quota` grows by their limits (`500m` CPU, `448Mi`
-  memory, sidecar included), so `spec.resources` stays the tenant's budget for the host and
-  backing services. The tenant step keeps the base quota; only the tenant-auth step raises it,
+  memory, sidecar included) plus the hosts' TLS front sidecar (`100m`, `64Mi`, #113, see "TLS
+  and routing" under the Registry bullet below), so `spec.resources` stays the tenant's budget
+  for the host and backing services. The tenant step keeps the base quota; only the tenant-auth step raises it,
   right before it applies the pair, and it lowers it again if the pair does not exist after a
   failed apply. Quota changes do not evict running pods.
 - OAuth clients (#59): each tenant gets two clients of its own in the identity server, registered
@@ -1652,7 +1670,10 @@ tenantAuth:
   write them (#112); writes still go through as the calling user.
 - Network: `tenant-auth-egress` adds egress to the API server endpoints (EndpointSlice
   `default/kubernetes`, `/32` or `/128`), the issuer (upstream namespace or IP), the tenant's
-  host group on 9191 (`di-http`'s pod port) and DNS. The pair is not selected by
+  host group on 9443 (the TLS front in each host pod, `di-http`'s `https` port, #113) and DNS.
+  That rule names the port the controller dials; what keeps credentials off wash's plain 9191 is
+  the controller code, which dials `https://…:443` only, since the same-tenant egress rule of
+  `tenant-auth-network` (below) admits every port, as it does for all tenant pods. The pair is not selected by
   `di-tenant-network`; `tenant-auth-network` gives it the same egress that policy gives the
   tenant's other pods, and admits only the console to the controller's `8788` and, with a
   registry, only the tenant's host pods to the whoami listener (`8789`) and the pull listener
@@ -1665,8 +1686,10 @@ tenantAuth:
 - TLS: the platform controller generates a per-tenant P-256 CA (`CA:TRUE, pathlen:0`, valid ten
   years) and a leaf it signs (`CA:FALSE`, server auth, 365 days) for `tenant-controller` and the host
   of `controllerPublicUrl`. The leaf, its key and the CA that signed it (`ca.crt`) are in Secret
-  `tenant-controller-tls`; the console and the hosts pin only the trust bundle in ConfigMap
-  `tenant-controller-ca` (key `ca.crt`): the CA, plus the other CA during a rotation (below).
+  `tenant-controller-tls`, which the hosts' TLS front serves too (#113, see "TLS and routing"
+  under the Registry bullet below); the console, the controller and the hosts pin the trust
+  bundle in ConfigMap `tenant-controller-ca` (key `ca.crt`): the CA, plus the other CA during a
+  rotation (below).
   The CAs and their keys are in Secret `tenant-controller-ca-<tenant>` in the platform namespace
   (#170): `ca.crt` and `ca.key` sign the leaf, and during a rotation `next.crt`/`next.key` or
   `previous.crt` hold the other CA. No pod mounts it, and neither tenant members nor the tenant
@@ -1687,22 +1710,28 @@ tenantAuth:
   permits, see "Name constraints" below), or when it no longer
   verifies against the CA that signs. The leaf's `notAfter` never passes the CA's. Deleting
   `tenant-controller-tls` therefore issues only a new leaf under the same CA. A leaf renewal keeps
-  the CA, so hosts do not roll and kubeconfigs the console issued stay valid; the leaf digest in
-  both pod templates rolls the pair.
+  the CA, so kubeconfigs the console issued stay valid; the leaf digest rolls the pair
+  (`tls-cert-sha256`) and the hosts (`host-tls-sha256`, whose TLS front loads the leaf once at
+  start, #113). The leaf lives 365 days and is renewed 30 days before it expires, so that host
+  roll comes about every 335 days, plus once at a CA switch. The hosts also roll once right
+  after the tenant is created: the first pass renders them before the leaf exists, the second
+  adds the front (with a registry this is the pass that already rolls them for
+  `registry-ca-sha256`).
 
   **CA rotation.** A CA is replaced in three steps, so that while any rollout is under way every
   host, console and kubeconfig, old or new, still verifies the leaf any controller pod, old or
   new, serves:
   1. *Publish*, 90 days before the CA expires: a successor is created and added to the bundle,
      oldest first. The leaf does not change. The hosts roll on the bundle digest
-     (`registry-ca-sha256`) and the console on `ca-bundle-sha256`; kubeconfigs it issues from then
-     on carry both CAs.
+     (`registry-ca-sha256`) and the pair on `ca-bundle-sha256`; kubeconfigs the console issues
+     from then on carry both CAs.
   2. *Switch*, once the successor is 30 days old: it signs a new leaf and the old CA becomes
-     `previous.crt`. The bundle bytes do not change, so the hosts do not roll; the controller and
-     console roll for the new leaf. If the controller was not running in between and the old CA
-     has less than 30 days left, it switches in the same pass as it publishes.
+     `previous.crt`. The bundle bytes do not change; the controller, the console and the hosts
+     roll for the new leaf (`tls-cert-sha256`, `host-tls-sha256`). If the controller was not
+     running in between and the old CA has less than 30 days left, it switches in the same pass
+     as it publishes.
   3. *Retire*, when the old CA expires: it leaves the bundle (no leaf it signed outlives it), and
-     the hosts and console roll once more.
+     the hosts and the pair roll once more.
 
   A kubeconfig or `--ca-file` holding only the old CA stops verifying at the switch: fetch the
   bundle again (or `login` again) during the 30 days after it is published. The CA is replaced at
@@ -1842,7 +1871,8 @@ tenantAuth:
   nothing but `GET /v1/auth/whoami` (same answer as `8788`, problem+json errors), over TLS only:
   a plain-HTTP connection is closed without an answer, and no setting reopens it (see
   [Upgrading to a whoami listener with no plain-HTTP fallback](#upgrading-to-a-whoami-listener-with-no-plain-http-fallback-113)).
-  The hop from the registry front (`8790`) to the tenant host is still plain HTTP. Admission admits `wasmcloud:secrets` from the platform controller
+  The hop from the registry front (`8790`) to the tenant host is TLS as well (see "TLS and
+  routing" below). Admission admits `wasmcloud:secrets` from the platform controller
   only, so a tenant cannot repoint the callback; the component's only egress is that URL
   (`allowedHosts`), and the egress reconcile leaves it alone.
   - Reservation: the front sends every registry user's Basic credentials to whatever serves the
@@ -1871,9 +1901,28 @@ tenantAuth:
     controller, and answers plain HTTP for it with `400`. The gateway knows the registry's
     HTTP host whenever a registry is configured, so that `400` holds even when users reach the
     registry by port-forward (`kubectl port-forward svc/tenant-controller 8790`, the default
-    `https://localhost:8790` when no gateway is published). Credentials therefore never cross plain HTTP off-cluster; the
-    front-to-host and registry-to-controller hops are plain HTTP on the pod network, as the
-    gateway-to-host hop already is. The alternative, terminating TLS at the gateway, would put
+    `https://localhost:8790` when no gateway is published). Every hop that carries a registry
+    credential is TLS under the tenant CA (#113): client to front (`8790`, the controller leaf,
+    passed through by the gateway); front to tenant host (`di-http:443`, see below); registry to
+    the controller's whoami listener (`8789`, the controller leaf, verified through
+    `--http-client-ca-path`); and host to pull listener (`8791`). The front-to-host hop ends at
+    the `http-tls` sidecar of each host pod (`alpine/socat`, the issuer-proxy image), which
+    serves the same controller leaf from Secret `tenant-controller-tls` and relays to wash's
+    listener on loopback (`127.0.0.1:9191`, at most 64 connections at once). The controller
+    verifies it with the trust bundle (`TENANT_CONTROLLER_HOST_CA`, both CAs of a rotation) and
+    checks the certificate for its own Service name, `tenant-controller.di-runtime-<tenant>.svc`,
+    which the leaf always carries, rather than for the `di-http` name it dials: no name is added
+    to the certificate, so an existing tenant's leaf serves the front as it is, with no CA
+    rotation in between. The controller dials `https://…:443` only; `tenant-auth-egress` names
+    that port for the hosts, while the same-tenant egress rule of `tenant-auth-network` still
+    admits every port, as for all tenant pods. Likewise any same-tenant pod can reach `9443`,
+    as it can wash's `9191`; the front relays to that same listener, so this widens nothing. The
+    service proxy (`/v1/services/<service>/proxy/<id>`) takes the same hop. The sidecar loads
+    the leaf once at start, so a renewed leaf rolls the hosts (`host-tls-sha256`, about every
+    335 days). The one plain hop left on the pod network is the gateway's, to wash's
+    `9191` for routed tenant workloads, which carries no platform credential; CNI-level
+    encryption (WireGuard or IPsec between nodes) would cover that hop, and the TLS hops above
+    again. The alternative, terminating TLS at the gateway, would put
     every tenant's private key in the platform namespace; TLS passthrough keeps keys per tenant.
     Clients must trust the tenant's CA (ConfigMap `tenant-controller-ca`), as for the controller.
     The default `publicUrl` needs `pods/portforward` in `di-runtime-<tenant>`, which only

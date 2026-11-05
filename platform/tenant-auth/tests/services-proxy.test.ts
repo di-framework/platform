@@ -1,4 +1,6 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
+import { createServer as createHttpsServer } from 'node:https';
+import type { AddressInfo } from 'node:net';
 import { MAX_BODY_BYTES, ROUTES } from '@di-framework/tenant-cli/src/api/routes.ts';
 import { tenantUpstream as gatewayUpstream } from '../../platform/src/gateway/gateway.ts';
 import {
@@ -9,10 +11,13 @@ import {
   EGRESS_ENTRY_MAX_LENGTH,
   EGRESS_MAX_DESTINATIONS,
 } from '../../platform/src/tenancy/egress.ts';
+import { HOST_TLS_SERVICE_PORT } from '../../platform/src/tenancy/resources.ts';
+import { caCertificate, leafCertificate } from '../../platform/src/tenancy/tls.ts';
 import { Controller, configFromEnv } from '../src/controller.ts';
 import { AuthError, type Principal } from '../src/identity.ts';
 import { KubeClient } from '../src/kube.ts';
 import {
+  hostTlsServerName,
   PASSTHROUGH,
   type ProxySession,
   ProxySessions,
@@ -20,6 +25,7 @@ import {
   SERVICE_NAME,
   servePassthrough,
   tenantUpstream,
+  type UpstreamTls,
   upstreamRequestHeaders,
 } from '../src/v1/proxy.ts';
 import { DEFAULT_CLASSES } from '../src/v1/services.ts';
@@ -472,6 +478,43 @@ describe('services create and the service proxy', () => {
     };
     const at = (path: string) => `http://controller/v1/services/web/proxy/${session.id}${path}`;
 
+    test('verifies a TLS upstream with the tenant CA bundle, and refuses it without (platform#113)', async () => {
+      const ca = caCertificate('hosts test CA', 1);
+      // The controller leaf: it names the controller Service, never the `di-http` address.
+      const serverName = hostTlsServerName('acme');
+      const leaf = leafCertificate(serverName, [serverName], [], 1, ca.cert, ca.key);
+      const secure = createHttpsServer({ cert: leaf.cert, key: leaf.key }, (req, res) =>
+        res.end(`tls ${req.headers.host}`),
+      );
+      await new Promise<void>((resolve) => secure.listen(0, '127.0.0.1', resolve));
+      const origin = `https://127.0.0.1:${(secure.address() as AddressInfo).port}`;
+      const through = (tls?: UpstreamTls) => {
+        const request = new Request(at('/'));
+        const url = new URL(request.url);
+        return servePassthrough(request, url, PASSTHROUGH.exec(url.pathname) as RegExpExecArray, {
+          tenant: 'acme',
+          principal: alice,
+          upstream: origin,
+          tls,
+          audit: () => {},
+          sessions,
+        });
+      };
+      try {
+        const trusted = await through({ ca: ca.cert, serverName });
+        expect(trusted.status).toBe(200);
+        expect(await trusted.text()).toBe('tls web-prod');
+        // Without the bundle the front's certificate is not trusted: nothing reaches the service.
+        const untrusted = await through();
+        expect(untrusted.status).toBe(502);
+        // Nor with a name the certificate does not carry.
+        const misnamed = await through({ ca: ca.cert, serverName: 'other.di-runtime-acme.svc' });
+        expect(misnamed.status).toBe(502);
+      } finally {
+        secure.close();
+      }
+    });
+
     test('a streamed body over the limit without content-length is refused with 413', async () => {
       const chunk = new Uint8Array(512 * 1024);
       let sent = 0;
@@ -494,8 +537,8 @@ describe('services create and the service proxy', () => {
     });
   });
 
-  test('the default upstream is the tenant HTTP service', () => {
-    expect(tenantUpstream('acme')).toBe('http://di-http.di-runtime-acme.svc.cluster.local:80');
+  test('the default upstream is the tenant HTTP service, on its TLS port (platform#113)', () => {
+    expect(tenantUpstream('acme')).toBe('https://di-http.di-runtime-acme.svc.cluster.local:443');
   });
 
   /** `isForwardedRequest` in cli-plugin-platform `src/control/network.ts`. */
@@ -912,11 +955,15 @@ describe('services create and the service proxy', () => {
   });
 
   describe('pinned to the platform sources', () => {
-    test('tenantUpstream matches the tenant gateway', () => {
+    test('tenantUpstream is the tenant gateway’s Service, on its TLS port (platform#113)', () => {
       const ours = new URL(tenantUpstream('acme'));
       const gateway = gatewayUpstream('acme');
       expect(ours.hostname).toBe(gateway.hostname);
-      expect(Number(ours.port || 80)).toBe(gateway.port);
+      expect(ours.protocol).toBe('https:');
+      // The default https port, which `URL` leaves empty.
+      expect(Number(ours.port || 443)).toBe(HOST_TLS_SERVICE_PORT);
+      // The gateway keeps wash's plain port: its hop is not this one.
+      expect(gateway.port).toBe(80);
     });
 
     test('DEFAULT_CLASSES matches the platform default class names', () => {

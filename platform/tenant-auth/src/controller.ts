@@ -37,10 +37,13 @@ import { type RegistryListener, serveRegistryListener } from './registry-listene
 import { controllerSecretReader } from './v1/context.ts';
 import { serveV1, TITLES } from './v1/index.ts';
 import {
+  hostTlsServerName,
   PASSTHROUGH,
   servePassthrough,
   tenantUpstream,
+  type UpstreamTls,
   upstreamRequestHeaders,
+  upstreamTlsOptions,
 } from './v1/proxy.ts';
 
 export interface ControllerConfig {
@@ -134,6 +137,13 @@ export interface ControllerConfig {
    * listener answers it as a pull-only principal. Read on every call, so rotation needs no restart.
    */
   hostPullTokenFile?: string;
+  /**
+   * PEM bundle file the registry front and the service proxy verify the tenant hosts' TLS front
+   * with (`TENANT_CONTROLLER_HOST_CA`, platform#113 `:https-hop`): the tenant CA, plus the other
+   * CA during a rotation. The front's certificate is checked for the controller's own Service
+   * name (`hostTlsServerName`). Read once at start. Unset: the system roots and the URL's host.
+   */
+  hostCa?: string;
 }
 
 /** The whoami listener serves `GET` only, so it never needs a request body. */
@@ -588,6 +598,7 @@ export function configFromEnv(env = process.env): ControllerConfig {
     ),
     registryPullHost: env.TENANT_CONTROLLER_REGISTRY_PULL_HOST || undefined,
     hostPullTokenFile: env.TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE || undefined,
+    hostCa: env.TENANT_CONTROLLER_HOST_CA || undefined,
   };
 }
 
@@ -734,8 +745,14 @@ export function parseSideContentLength(value: string | null): string | undefined
 
 export class Controller {
   private readonly serviceAccountTokens = new Map<string, { token: string; expiresAt: number }>();
-  /** Where proxy sessions forward to; only overridden by tests. */
+  /** Where proxy sessions and the registry front forward to; only overridden by tests. */
   proxyUpstream: (tenant: string) => string = tenantUpstream;
+  /**
+   * How that upstream is verified (platform#113 `:https-hop`): the CA bundle of `hostCa`, which
+   * `main` reads, and the controller's own Service name, which the front's certificate (the
+   * controller leaf) always carries. Unset, the system roots and the URL's host.
+   */
+  upstreamTls?: UpstreamTls;
   private readonly discovery: BackgroundDiscovery;
   /** Resolves once the issuer has been discovered (or the controller was stopped). */
   readonly discovered: Promise<void>;
@@ -900,6 +917,7 @@ export class Controller {
           tenant: this.config.tenant,
           principal,
           upstream: this.proxyUpstream(this.config.tenant),
+          tls: this.upstreamTls,
           audit: (event, fields) => this.audit(event, fields),
           clientAddress,
         });
@@ -1137,6 +1155,7 @@ export class Controller {
         redirect: 'manual',
         decompress: false,
         signal,
+        tls: upstreamTlsOptions(this.upstreamTls),
       } as RequestInit);
     let upstream: Response;
     try {
@@ -1427,6 +1446,13 @@ export class Controller {
 /** The process entry point: starts the controller from `config` and binds its listeners. */
 export async function main(config: ControllerConfig) {
   const controller = await Controller.start(config);
+  // The hosts' TLS front is verified with the tenant CA bundle (platform#113), read once, for
+  // the controller's own name: the front serves the controller certificate.
+  if (config.hostCa)
+    controller.upstreamTls = {
+      ca: readFileSync(config.hostCa, 'utf8'),
+      serverName: hostTlsServerName(config.tenant),
+    };
   const tls =
     config.tlsCert && config.tlsKey
       ? { cert: readFileSync(config.tlsCert, 'utf8'), key: readFileSync(config.tlsKey, 'utf8') }

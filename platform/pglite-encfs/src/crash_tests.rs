@@ -92,6 +92,8 @@ pub(crate) struct Rec {
     /// Reads still to fail.
     pub reads_fail: Cell<u32>,
     pub fail_sync: Cell<bool>,
+    /// Fail the next `set_len`: `true` after it took effect, `false` before.
+    pub fail_set_len: Cell<Option<bool>>,
     pub syncs: Cell<u32>,
     /// Every write, `(offset, length)`, for layout tests.
     pub writes: RefCell<Vec<(u64, usize)>>,
@@ -111,6 +113,7 @@ impl Rec {
             unread_after_failure: Cell::new(0),
             reads_fail: Cell::new(0),
             fail_sync: Cell::new(false),
+            fail_set_len: Cell::new(None),
             syncs: Cell::new(0),
             writes: RefCell::default(),
             guard,
@@ -220,11 +223,17 @@ impl Storage for Rec {
     }
 
     fn set_len(&self, len: u64) -> Result<(), ()> {
-        let op = Op::SetLen(len);
-        apply(&mut self.volatile.borrow_mut(), &op);
-        let after = self.volatile.borrow().clone();
-        self.ops.borrow_mut().push((op, after));
-        Ok(())
+        let fail = self.fail_set_len.take();
+        if fail != Some(false) {
+            let op = Op::SetLen(len);
+            apply(&mut self.volatile.borrow_mut(), &op);
+            let after = self.volatile.borrow().clone();
+            self.ops.borrow_mut().push((op, after));
+        }
+        match fail {
+            None => Ok(()),
+            Some(_) => Err(()),
+        }
     }
 }
 

@@ -1220,7 +1220,7 @@ describe('controller: registry NATS account and migration (#159)', () => {
     set.status = { replicas: 0 };
     await controller.reconcileTenant(t, []);
     expect(jobOf(api)).toBeUndefined();
-    expect(quota(api)['limits.cpu']).toBe('2500m');
+    expect(quota(api)['limits.cpu']).toBe('2600m');
     // A status that lags the spec is not "stopped" either.
     api.objects.delete(workloadPath);
     const deployment = must(
@@ -1238,7 +1238,7 @@ describe('controller: registry NATS account and migration (#159)', () => {
     await controller.reconcileTenant(t, []);
     expect(jobOf(api)).toBeDefined();
     expect(registry(api).spec.replicas).toBe(0);
-    expect(quota(api)).toMatchObject({ 'limits.cpu': '2750m', 'limits.memory': '4672Mi' });
+    expect(quota(api)).toMatchObject({ 'limits.cpu': '2850m', 'limits.memory': '4736Mi' });
     expect(tenantAuthCondition(api)).toMatchObject({
       reason: 'RegistryMigrating',
       message: expect.stringContaining('is moving the registry store'),
@@ -1286,7 +1286,7 @@ describe('controller: registry NATS account and migration (#159)', () => {
       status: 'False',
       reason: 'Provisioning',
     });
-    expect(quota(api)['limits.cpu']).toBe('2500m');
+    expect(quota(api)['limits.cpu']).toBe('2600m');
     expect(password(api)).toBe(first);
 
     // Registry becomes Ready.

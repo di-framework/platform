@@ -67,21 +67,31 @@ class CutoverApi extends MemoryApi {
     const code = this.failing.get(call);
     this.failing.delete(call);
     if (code) throw new ApiError(code, 'injected failure');
+    const target = new URL(path, 'https://kubernetes').pathname;
+    const deployment = path.includes('/deployments/') && !path.includes('/status');
+    // The deployment controller wrote the rollout's status since the last read (#643: that moves
+    // the resourceVersion, which is what tells the controller the object changed under it).
+    if (deployment && method === 'GET') this.rollOut(target, true);
     const result = await super.call<Resource>(method, path, body);
-    if (method === 'PATCH' && path.includes('/deployments/') && !path.includes('/status')) {
-      const target = new URL(path, 'https://kubernetes').pathname;
-      const value = this.objects.get(target) as Resource;
-      const replicas = (value.spec as { replicas?: number } | undefined)?.replicas ?? 1;
-      const done = this.held.has(value.metadata.name) ? 0 : replicas;
-      value.status = {
-        observedGeneration: value.metadata.generation,
-        replicas,
-        updatedReplicas: done,
-        readyReplicas: done,
-      };
-      return structuredClone(value) as T;
-    }
+    if (deployment && method === 'PATCH') return structuredClone(this.rollOut(target, false)) as T;
     return result as T;
+  }
+  /** Sets the Deployment's status from `held`; `stamp` gives a changed status a new resourceVersion. */
+  private rollOut(target: string, stamp: boolean): Resource | undefined {
+    const value = this.objects.get(target) as Resource | undefined;
+    if (!value) return undefined;
+    const replicas = (value.spec as { replicas?: number } | undefined)?.replicas ?? 1;
+    const done = this.held.has(value.metadata.name) ? 0 : replicas;
+    const status = {
+      observedGeneration: value.metadata.generation,
+      replicas,
+      updatedReplicas: done,
+      readyReplicas: done,
+    };
+    if (JSON.stringify(value.status) === JSON.stringify(status)) return value;
+    value.status = status;
+    if (stamp) this.seed(value);
+    return this.objects.get(target) as Resource;
   }
   /** Paths of the server-side applies, in order. */
   applies(): string[] {
@@ -242,8 +252,10 @@ describe('per-tenant gating (#541 m6e)', () => {
     expect(api.objects.has(operatorPath)).toBe(true);
     expect(api.objects.has(hostsPath)).toBe(false);
     expect(readyCondition(api)).toMatchObject({ status: 'False' });
-    // An existing operator is applied on every pass, with no further wait.
+    // An existing operator is applied on every pass it changed under the controller (#643: an
+    // unchanged one is read, not re-applied), with no further wait.
     api.operations.length = 0;
+    api.seed(api.objects.get(operatorPath) as Resource);
     await controller.tick();
     expect(api.applies()).toContain(operatorPath);
     api.held.delete('runtime-operator');
@@ -765,6 +777,8 @@ describe('a Tenant being deleted keeps its operator through R3 (owner decision 4
 
   it('keeps applying the operator and issuing its identity while R2 waits for the hosts', async () => {
     const { api, controller } = await deleting();
+    // Moved by another writer, so the apply is due (#643).
+    api.seed(api.objects.get(operatorPath) as Resource);
     await controller.tick();
     expect(stored(api).status?.conditions?.[0]?.message).toContain('removal step R2');
     expect(api.applies()).toContain(operatorPath);
@@ -809,6 +823,8 @@ describe('a Tenant being deleted keeps its operator through R3 (owner decision 4
         throw new ApiError(500, 'boom');
       return call(method, path, body);
     });
+    // Moved by another writer, so the apply is due (#643).
+    api.seed(api.objects.get(`${collection('v1', 'Namespace')}/${OPERATOR_NS}`) as Resource);
     await controller.tick();
     expect(stored(api).status?.conditions?.[0]?.message).toContain('removal step R2');
     expect(logs[1]).toHaveBeenCalledWith(

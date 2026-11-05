@@ -9,15 +9,18 @@ export async function unit(ctx: Context): Promise<void> {
   await $`cargo fmt --check`;
   await $`cargo clippy --locked --lib --tests -- -D warnings`;
   await $`cargo clippy --locked --release --target ${RUST_TARGET} -- -D warnings`;
-  // The smoke root probe (tests/root-probe) is its own crate.
-  const probe = {
-    cwd: join(ctx.pkgDir, 'tests', 'root-probe'),
-    target: join(ctx.pkgDir, 'target', 'root-probe'),
-  };
-  await $`cargo fmt --check`.cwd(probe.cwd);
-  await $`cargo clippy --locked --release --target ${RUST_TARGET} -- -D warnings`
-    .cwd(probe.cwd)
-    .env({ ...ctx.env, CARGO_TARGET_DIR: probe.target });
+  // The smoke root probe (tests/root-probe) and the benchmark consumer
+  // (tests/bench) are their own crates.
+  for (const [name, target] of [
+    ['root-probe', RUST_TARGET],
+    ['bench', 'wasm32-wasip2'],
+  ] as const) {
+    const cwd = join(ctx.pkgDir, 'tests', name);
+    await $`cargo fmt --check`.cwd(cwd);
+    await $`cargo clippy --locked --release --target ${target} -- -D warnings`
+      .cwd(cwd)
+      .env({ ...ctx.env, CARGO_TARGET_DIR: join(ctx.pkgDir, 'target', name) });
+  }
   await $`cargo test --locked --lib`;
 }
 
