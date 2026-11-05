@@ -17,6 +17,7 @@ import { Controller, configFromEnv } from '../src/controller.ts';
 import { AuthError, type Principal } from '../src/identity.ts';
 import { KubeClient } from '../src/kube.ts';
 import {
+  hostTlsServerName,
   PASSTHROUGH,
   type ProxySession,
   ProxySessions,
@@ -24,6 +25,7 @@ import {
   SERVICE_NAME,
   servePassthrough,
   tenantUpstream,
+  type UpstreamTls,
   upstreamRequestHeaders,
 } from '../src/v1/proxy.ts';
 import { DEFAULT_CLASSES } from '../src/v1/services.ts';
@@ -478,13 +480,15 @@ describe('services create and the service proxy', () => {
 
     test('verifies a TLS upstream with the tenant CA bundle, and refuses it without (platform#113)', async () => {
       const ca = caCertificate('hosts test CA', 1);
-      const leaf = leafCertificate('di-http', ['localhost'], ['127.0.0.1'], 1, ca.cert, ca.key);
+      // The controller leaf: it names the controller Service, never the `di-http` address.
+      const serverName = hostTlsServerName('acme');
+      const leaf = leafCertificate(serverName, [serverName], [], 1, ca.cert, ca.key);
       const secure = createHttpsServer({ cert: leaf.cert, key: leaf.key }, (req, res) =>
         res.end(`tls ${req.headers.host}`),
       );
       await new Promise<void>((resolve) => secure.listen(0, '127.0.0.1', resolve));
       const origin = `https://127.0.0.1:${(secure.address() as AddressInfo).port}`;
-      const through = (tls?: { ca: string }) => {
+      const through = (tls?: UpstreamTls) => {
         const request = new Request(at('/'));
         const url = new URL(request.url);
         return servePassthrough(request, url, PASSTHROUGH.exec(url.pathname) as RegExpExecArray, {
@@ -497,12 +501,15 @@ describe('services create and the service proxy', () => {
         });
       };
       try {
-        const trusted = await through({ ca: ca.cert });
+        const trusted = await through({ ca: ca.cert, serverName });
         expect(trusted.status).toBe(200);
         expect(await trusted.text()).toBe('tls web-prod');
         // Without the bundle the front's certificate is not trusted: nothing reaches the service.
         const untrusted = await through();
         expect(untrusted.status).toBe(502);
+        // Nor with a name the certificate does not carry.
+        const misnamed = await through({ ca: ca.cert, serverName: 'other.di-runtime-acme.svc' });
+        expect(misnamed.status).toBe(502);
       } finally {
         secure.close();
       }

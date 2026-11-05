@@ -246,10 +246,12 @@ export const HOST_TLS_PORT = 9443;
 export const HOST_TLS_SERVICE_PORT = 443;
 /** Where the TLS front sidecar reads the controller leaf and key. */
 const HOST_TLS_MOUNT = '/host-tls';
-/** The name the controller reaches the hosts' TLS front by, which the controller certificate names. */
-export function hostHttpService(tenant: string): string {
-  return `di-http.${names(tenant).runtimeNamespace}.svc`;
-}
+/**
+ * Most connections the TLS front serves at once (socat forks one child per connection): above
+ * the registry front's concurrency cap, with room for proxy sessions, and bounded for its
+ * memory limit.
+ */
+const HOST_TLS_MAX_CONNECTIONS = 64;
 /** The Service hosts pull through: `<REGISTRY_PULL_SERVICE>.di-runtime-<tenant>.svc`. */
 export const REGISTRY_PULL_SERVICE = 'tenant-registry';
 /**
@@ -381,9 +383,11 @@ export interface HostPull {
 }
 /**
  * The hosts' TLS front (#113 `:https-hop`), rendered while tenant-auth is configured and the
- * controller leaf exists: the sidecar serves the leaf and key of `tenant-controller-tls`, which
- * names `di-http`. `leafDigest` is the leaf's digest; the sidecar loads it once at start, so a
- * renewed leaf rolls the hosts.
+ * controller leaf exists: the sidecar serves the leaf and key of `tenant-controller-tls`, and
+ * the controller checks it for its own Service name (which that leaf always carries) rather
+ * than the `di-http` name it dials, so no certificate name is added and no CA rotation starts.
+ * `leafDigest` is the leaf's digest; the sidecar loads it once at start, so a renewed leaf rolls
+ * the hosts.
  */
 export interface HostHttpTls {
   leafDigest: string;
@@ -751,6 +755,17 @@ const units: Record<string, number> = {
   Gi: 1024 ** 3 * 1000,
   Ti: 1024 ** 4 * 1000,
 };
+/** `quantity × count`, formatted as {@link addQuantity} formats a sum. */
+function multiplyQuantity(quantity: string, count: number, unit: 'm' | 'Mi'): string {
+  let total = `0${unit}`;
+  for (let i = 0; i < count; i++) total = addQuantity(total, quantity, unit);
+  return total;
+}
+/** The host group's replicas: `spec.runtime.replicas` (default 1); none while suspended or deleting. */
+function hostReplicas(tenant: Tenant): number {
+  const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
+  return suspended ? 0 : (tenant.spec.runtime?.replicas ?? 1);
+}
 /** `a + b` for quantities in the CRD's pattern; CPU comes back in millicores, memory in Mi. */
 export function addQuantity(a: string, b: string, unit: 'm' | 'Mi'): string {
   const value = (q: string) => {
@@ -1022,18 +1037,20 @@ function runtimeQuota(
   withMigration = false,
 ): Resource {
   const resources = tenant.spec.resources ?? {};
-  // The pair and the hosts' TLS front sidecar (#113), which runs only with tenant-auth.
+  // The pair and the hosts' TLS front sidecar (#113), which runs only with tenant-auth, once
+  // per host replica.
+  const replicas = hostReplicas(tenant);
   const cpu = withTenantAuth
     ? addQuantity(
         addQuantity(resources.cpu ?? '2', TENANT_AUTH_LIMITS.cpu, 'm'),
-        HOST_TLS_LIMITS.cpu,
+        multiplyQuantity(HOST_TLS_LIMITS.cpu, replicas, 'm'),
         'm',
       )
     : (resources.cpu ?? '2');
   const memory = withTenantAuth
     ? addQuantity(
         addQuantity(resources.memory ?? '4Gi', TENANT_AUTH_LIMITS.memory, 'Mi'),
-        HOST_TLS_LIMITS.memory,
+        multiplyQuantity(HOST_TLS_LIMITS.memory, replicas, 'Mi'),
         'Mi',
       )
     : (resources.memory ?? '4Gi');
@@ -1204,7 +1221,7 @@ function tenantResources(
     body: Record<string, unknown>,
   ) => resource(tenant, cfg.installation, apiVersion, kind, name, namespace, body);
   const suspended = tenant.spec.suspended || !!tenant.metadata.deletionTimestamp;
-  const replicas = suspended ? 0 : (tenant.spec.runtime?.replicas ?? 1);
+  const replicas = hostReplicas(tenant);
   // The migration Job (#159) is rendered, and its pod fits the runtime quota, only while the move
   // is under way.
   const migrationJob = registryNats?.stage === 'migrating' && !suspended;
@@ -1682,17 +1699,20 @@ function tenantResources(
                   ? [
                       {
                         // The TLS front of the hosts' HTTP port (#113 `:https-hop`): socat
-                        // terminates TLS with the controller leaf, which names `di-http`, and
-                        // relays to wash's plain listener on loopback, so the controller's
-                        // registry front and service proxy never send a credential in clear.
-                        // wash's own listener stays plain for the gateway (`di-tenant-gateway`).
+                        // terminates TLS with the controller leaf (checked by the controller for
+                        // its own Service name) and relays to wash's plain listener on loopback,
+                        // so the controller's registry front and service proxy never send a
+                        // credential in clear. wash's own listener stays plain for the gateway
+                        // (`di-tenant-gateway`).
                         name: 'http-tls',
                         image: ISSUER_PROXY_IMAGE,
                         args: [
-                          `OPENSSL-LISTEN:${HOST_TLS_PORT},fork,reuseaddr,cert=${HOST_TLS_MOUNT}/tls.crt,key=${HOST_TLS_MOUNT}/tls.key,verify=0`,
+                          `OPENSSL-LISTEN:${HOST_TLS_PORT},fork,max-children=${HOST_TLS_MAX_CONNECTIONS},reuseaddr,cert=${HOST_TLS_MOUNT}/tls.crt,key=${HOST_TLS_MOUNT}/tls.key,verify=0`,
                           'TCP:127.0.0.1:9191',
                         ],
                         ports: [{ name: 'https', containerPort: HOST_TLS_PORT }],
+                        // Each probe's connection is closed before a handshake, which socat logs
+                        // as a failed SSL_accept once per period: noise, not a failure.
                         readinessProbe: { tcpSocket: { port: 'https' } },
                         resources: {
                           requests: { cpu: '10m', memory: '16Mi' },
@@ -1973,9 +1993,6 @@ function tenantControllerCertNames(
     registryWhoamiHost(tenant),
     `tenant-controller.${ns}.svc.cluster.local`,
     'localhost',
-    // The hosts' TLS front serves the same leaf (#113 `:https-hop`).
-    hostHttpService(tenant),
-    `${hostHttpService(tenant)}.cluster.local`,
   ];
   const ips: string[] = [];
   const host = URL.canParse(tenantControllerPublicUrl(tenant, auth))
@@ -2270,8 +2287,10 @@ function tenantAuthResources(
     });
   egress.push(
     // The service proxy (#56) and the registry front (#83) reach the tenant hosts through
-    // `di-http`'s TLS port only (#113 `:https-hop`); NetworkPolicy sees the pod port after the
-    // Service's DNAT. wash's plain listener (9191) is not admitted from the controller.
+    // `di-http`'s TLS port (#113 `:https-hop`); NetworkPolicy sees the pod port after the
+    // Service's DNAT. This names the port the controller dials; it is not what keeps it off
+    // wash's plain 9191 (the same-tenant egress rule of `tenant-auth-network` admits every
+    // port), the controller code is: it only dials `https://…:443`.
     {
       to: [
         {

@@ -37,10 +37,13 @@ import { type RegistryListener, serveRegistryListener } from './registry-listene
 import { controllerSecretReader } from './v1/context.ts';
 import { serveV1, TITLES } from './v1/index.ts';
 import {
+  hostTlsServerName,
   PASSTHROUGH,
   servePassthrough,
   tenantUpstream,
+  type UpstreamTls,
   upstreamRequestHeaders,
+  upstreamTlsOptions,
 } from './v1/proxy.ts';
 
 export interface ControllerConfig {
@@ -137,7 +140,8 @@ export interface ControllerConfig {
   /**
    * PEM bundle file the registry front and the service proxy verify the tenant hosts' TLS front
    * with (`TENANT_CONTROLLER_HOST_CA`, platform#113 `:https-hop`): the tenant CA, plus the other
-   * CA during a rotation. Read once at start. Unset: the system roots only.
+   * CA during a rotation. The front's certificate is checked for the controller's own Service
+   * name (`hostTlsServerName`). Read once at start. Unset: the system roots and the URL's host.
    */
   hostCa?: string;
 }
@@ -745,9 +749,10 @@ export class Controller {
   proxyUpstream: (tenant: string) => string = tenantUpstream;
   /**
    * How that upstream is verified (platform#113 `:https-hop`): the CA bundle of `hostCa`, which
-   * `main` reads. Unset, the system roots only.
+   * `main` reads, and the controller's own Service name, which the front's certificate (the
+   * controller leaf) always carries. Unset, the system roots and the URL's host.
    */
-  upstreamTls?: { ca: string };
+  upstreamTls?: UpstreamTls;
   private readonly discovery: BackgroundDiscovery;
   /** Resolves once the issuer has been discovered (or the controller was stopped). */
   readonly discovered: Promise<void>;
@@ -1150,7 +1155,7 @@ export class Controller {
         redirect: 'manual',
         decompress: false,
         signal,
-        tls: this.upstreamTls,
+        tls: upstreamTlsOptions(this.upstreamTls),
       } as RequestInit);
     let upstream: Response;
     try {
@@ -1441,8 +1446,13 @@ export class Controller {
 /** The process entry point: starts the controller from `config` and binds its listeners. */
 export async function main(config: ControllerConfig) {
   const controller = await Controller.start(config);
-  // The hosts' TLS front is verified with the tenant CA bundle (platform#113), read once.
-  if (config.hostCa) controller.upstreamTls = { ca: readFileSync(config.hostCa, 'utf8') };
+  // The hosts' TLS front is verified with the tenant CA bundle (platform#113), read once, for
+  // the controller's own name: the front serves the controller certificate.
+  if (config.hostCa)
+    controller.upstreamTls = {
+      ca: readFileSync(config.hostCa, 'utf8'),
+      serverName: hostTlsServerName(config.tenant),
+    };
   const tls =
     config.tlsCert && config.tlsKey
       ? { cert: readFileSync(config.tlsCert, 'utf8'), key: readFileSync(config.tlsKey, 'utf8') }

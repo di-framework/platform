@@ -76,8 +76,11 @@ describe('controller main', () => {
     mainPort = started.server.port as number;
   });
 
-  test('reads the hosts’ CA bundle once at start (platform#113)', () => {
-    expect(started.controller.upstreamTls).toEqual({ ca: caPem });
+  test('reads the hosts’ CA bundle once at start, for the controller’s own name (platform#113)', () => {
+    expect(started.controller.upstreamTls).toEqual({
+      ca: caPem,
+      serverName: 'tenant-controller.di-runtime-acme.svc',
+    });
   });
 
   afterAll(async () => {

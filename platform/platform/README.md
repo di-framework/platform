@@ -1638,8 +1638,10 @@ tenantAuth:
   write them (#112); writes still go through as the calling user.
 - Network: `tenant-auth-egress` adds egress to the API server endpoints (EndpointSlice
   `default/kubernetes`, `/32` or `/128`), the issuer (upstream namespace or IP), the tenant's
-  host group on 9443 (the TLS front in each host pod, `di-http`'s `https` port; never wash's
-  plain 9191, #113) and DNS. The pair is not selected by
+  host group on 9443 (the TLS front in each host pod, `di-http`'s `https` port, #113) and DNS.
+  That rule names the port the controller dials; what keeps credentials off wash's plain 9191 is
+  the controller code, which dials `https://…:443` only, since the same-tenant egress rule of
+  `tenant-auth-network` (below) admits every port, as it does for all tenant pods. The pair is not selected by
   `di-tenant-network`; `tenant-auth-network` gives it the same egress that policy gives the
   tenant's other pods, and admits only the console to the controller's `8788` and, with a
   registry, only the tenant's host pods to the whoami listener (`8789`) and the pull listener
@@ -1678,7 +1680,11 @@ tenantAuth:
   `tenant-controller-tls` therefore issues only a new leaf under the same CA. A leaf renewal keeps
   the CA, so kubeconfigs the console issued stay valid; the leaf digest rolls the pair
   (`tls-cert-sha256`) and the hosts (`host-tls-sha256`, whose TLS front loads the leaf once at
-  start, #113).
+  start, #113). The leaf lives 365 days and is renewed 30 days before it expires, so that host
+  roll comes about every 335 days, plus once at a CA switch. The hosts also roll once right
+  after the tenant is created: the first pass renders them before the leaf exists, the second
+  adds the front (with a registry this is the pass that already rolls them for
+  `registry-ca-sha256`).
 
   **CA rotation.** A CA is replaced in three steps, so that while any rollout is under way every
   host, console and kubeconfig, old or new, still verifies the leaf any controller pod, old or
@@ -1869,13 +1875,19 @@ tenantAuth:
     the controller's whoami listener (`8789`, the controller leaf, verified through
     `--http-client-ca-path`); and host to pull listener (`8791`). The front-to-host hop ends at
     the `http-tls` sidecar of each host pod (`alpine/socat`, the issuer-proxy image), which
-    serves the same controller leaf (it names `di-http.di-runtime-<tenant>.svc`) from Secret
-    `tenant-controller-tls` and relays to wash's listener on loopback (`127.0.0.1:9191`); the
-    controller verifies it with the trust bundle (`TENANT_CONTROLLER_HOST_CA`, both CAs of a
-    rotation), and `tenant-auth-egress` admits it to the hosts on `9443` only, never on wash's
-    plain `9191`. The service proxy (`/v1/services/<service>/proxy/<id>`) takes the same hop.
-    The sidecar loads the leaf once at start, so a renewed leaf rolls the hosts
-    (`host-tls-sha256`). The one plain hop left on the pod network is the gateway's, to wash's
+    serves the same controller leaf from Secret `tenant-controller-tls` and relays to wash's
+    listener on loopback (`127.0.0.1:9191`, at most 64 connections at once). The controller
+    verifies it with the trust bundle (`TENANT_CONTROLLER_HOST_CA`, both CAs of a rotation) and
+    checks the certificate for its own Service name, `tenant-controller.di-runtime-<tenant>.svc`,
+    which the leaf always carries, rather than for the `di-http` name it dials: no name is added
+    to the certificate, so an existing tenant's leaf serves the front as it is, with no CA
+    rotation in between. The controller dials `https://…:443` only; `tenant-auth-egress` names
+    that port for the hosts, while the same-tenant egress rule of `tenant-auth-network` still
+    admits every port, as for all tenant pods. Likewise any same-tenant pod can reach `9443`,
+    as it can wash's `9191`; the front relays to that same listener, so this widens nothing. The
+    service proxy (`/v1/services/<service>/proxy/<id>`) takes the same hop. The sidecar loads
+    the leaf once at start, so a renewed leaf rolls the hosts (`host-tls-sha256`, about every
+    335 days). The one plain hop left on the pod network is the gateway's, to wash's
     `9191` for routed tenant workloads, which carries no platform credential; CNI-level
     encryption (WireGuard or IPsec between nodes) would cover that hop, and the TLS hops above
     again. The alternative, terminating TLS at the gateway, would put

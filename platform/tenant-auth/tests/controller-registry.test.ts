@@ -9,6 +9,7 @@ import {
   REGISTRY_IDLE_TIMEOUT_SECONDS,
 } from '../src/controller.ts';
 import { AuthError, type Principal } from '../src/identity.ts';
+import { hostTlsServerName, type UpstreamTls } from '../src/v1/proxy.ts';
 import { serve } from './support/servers.ts';
 
 /** The whoami-only listener and the registry front (platform#83). */
@@ -286,8 +287,11 @@ describe('registry listeners', () => {
   });
 
   describe('over TLS to the hosts (platform#113 :https-hop)', () => {
+    // The front serves the controller leaf, which names the controller Service and not the
+    // address the front is dialled at (`di-http`, here 127.0.0.1).
+    const serverName = hostTlsServerName('acme');
     const ca = caCertificate('hosts test CA', 1);
-    const leaf = leafCertificate('di-http', ['localhost'], ['127.0.0.1'], 1, ca.cert, ca.key);
+    const leaf = leafCertificate(serverName, [serverName], [], 1, ca.cert, ca.key);
     const secure = createHttpsServer({ cert: leaf.cert, key: leaf.key }, (req, res) => {
       res.writeHead(200, { 'content-type': 'text/plain' });
       res.end(`tls ${req.headers.host} ${req.method} ${req.url}`);
@@ -298,7 +302,7 @@ describe('registry listeners', () => {
       origin = `https://127.0.0.1:${(secure.address() as AddressInfo).port}`;
     });
     afterAll(() => secure.close());
-    const front = (tls?: { ca: string }) => {
+    const front = (tls?: UpstreamTls) => {
       const through = new Controller(
         config,
         {} as never,
@@ -315,8 +319,9 @@ describe('registry listeners', () => {
       );
     };
 
-    test('verifies the hosts with the configured CA bundle', async () => {
-      const response = await front({ ca: ca.cert });
+    test('verifies the hosts with the configured CA bundle, for the controller’s own name', async () => {
+      expect(serverName).toBe('tenant-controller.di-runtime-acme.svc');
+      const response = await front({ ca: ca.cert, serverName });
       expect(response.status).toBe(200);
       expect(await response.text()).toBe('tls registry GET /v2/app/tags/list');
     });
@@ -325,6 +330,11 @@ describe('registry listeners', () => {
       const response = await front();
       expect(response.status).toBe(502);
       expect(response.headers.get('content-type')).toBe('application/problem+json');
+    });
+
+    test('refuses a certificate that does not carry the expected name', async () => {
+      const response = await front({ ca: ca.cert, serverName: 'di-http.di-runtime-acme.svc' });
+      expect(response.status).toBe(502);
     });
   });
 
