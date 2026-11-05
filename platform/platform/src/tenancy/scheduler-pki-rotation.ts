@@ -13,10 +13,10 @@
  *   identity's Secret is missing. A new current ID, no previous, so the old user is revoked in the
  *   next reload.
  * - **Routine renewal**: the certificate has at most {@link SCHEDULER_LEAF_RENEW_DAYS} days left
- *   and expires before its CA does. A new current ID, the old one kept as `previous` until
- *   `previousUntil` (now + {@link RENEWAL_OVERLAP_MS}). A leaf capped at its CA's expiry is not
- *   renewed (a renewal would be capped the same way, so every tick would re-issue it, #612); the
- *   transition reports `caExpiring` instead. A rotation of the scheduler CAs (#629) replaces such a
+ *   and expires before its CA does. A new current ID, the old one kept as `previous` since
+ *   `previousSince` (now) until `previousUntil` (now + {@link RENEWAL_OVERLAP_MS}). A leaf capped
+ *   at its CA's expiry is not renewed (a renewal would be capped the same way, so every tick would
+ *   re-issue it, #612); the transition reports `caExpiring` instead. A rotation of the scheduler CAs (#629) replaces such a
  *   CA well before then.
  * - **CA rotation** (#629): a certificate signed by a CA that no longer signs, or whose Secret's
  *   trust bundle lacks a CA of the current set, is `stale`. It is renewed as above whatever its
@@ -29,7 +29,11 @@
  *   (the record was written but issuance did not land). The certificate is re-issued for the
  *   recorded `current`; no new ID is drawn and `previous` stays, with `previousUntil` moved to now
  *   + {@link RENEWAL_OVERLAP_MS}, so the ID the live certificate carries never leaves the record
- *   and the overlap counts from the issuance that lands.
+ *   and the overlap counts from the issuance that lands. `previousSince` never moves: it is how
+ *   long the renewal has been pending, which bounds how long it holds a scheduler CA switch
+ *   (`renewalHold` in `scheduler-identities.ts`, #642). An entry that keeps `previous` without it
+ *   (recorded before #642) gets it from its `previousUntil` less the overlap, the issuance time
+ *   already in the record, in the next pass that keeps the entry.
  * - **Operators** drop `previous` at `previousUntil`, once the Secret carries `current`.
  * - **Hosts** drop `previous` only once the rollout of the current certificate is observed
  *   ({@link SCHEDULER_TLS_ANNOTATION} on the pod template, all replicas updated and ready). Past
@@ -58,6 +62,10 @@ export const RENEWAL_STALLED = 'SchedulerIdentityRenewalStalled';
 /** How long a routine renewal keeps the previous user: 10 minutes. */
 export const RENEWAL_OVERLAP_MS = 10 * 60_000;
 const DAY_MS = 86_400_000;
+/** The chart's platform host group, which presents `platform/host` and `platform/data`. */
+export const PLATFORM_HOST_DEPLOYMENT = 'hostgroup-default';
+/** The pod-template annotation carrying the digest of the `platform/data` certificate. */
+export const SCHEDULER_DATA_TLS_ANNOTATION = 'platform.di-framework.dev/scheduler-data-tls-sha256';
 
 /** The digest {@link SCHEDULER_TLS_ANNOTATION} carries: sha256 of the certificate PEM, hex. */
 export const schedulerCertDigest = (cert: string): string =>
@@ -153,6 +161,17 @@ export interface IdentityTransition {
 }
 
 const drop = ({ current }: IdentityEntry): IdentityEntry => ({ current });
+/**
+ * `entry` with `previousSince` beside its `previous` when it lacks it: the issuance time its
+ * `previousUntil` was set from (or `now`, when that is unreadable), so a renewal recorded before
+ * #642 is bounded from a fixed time too, rather than from each pass that moves `previousUntil`.
+ */
+function sinceRecorded(entry: IdentityEntry, now: Date): IdentityEntry {
+  if (entry.previous === undefined || entry.previousSince !== undefined) return entry;
+  const issued = Date.parse(entry.previousUntil ?? '') - RENEWAL_OVERLAP_MS;
+  const since = Number.isNaN(issued) ? now.getTime() : issued;
+  return { ...entry, previousSince: new Date(since).toISOString() };
+}
 
 /** A `keep` transition of `entry`, with only the optional fields that are set. */
 function kept(
@@ -182,7 +201,8 @@ export function identityTransition(
   if (observed.forced) return { entry: { current: id() }, action: 'issue', reason: 'forced' };
   const { secret } = observed;
   if (!secret) return { entry: { current: id() }, action: 'issue', reason: 'missing' };
-  if (secret.id !== entry.current) {
+  const held = sinceRecorded(entry, now);
+  if (secret.id !== held.current) {
     // The overlap must count from the issuance that actually lands, so every pending retry moves
     // previousUntil to now + RENEWAL_OVERLAP_MS: the user the live certificate carries stays
     // rendered while issuance fails, and hosts start their stall clock at issuance. Setting it on
@@ -190,9 +210,9 @@ export function identityTransition(
     // the full 10 minutes after a late issuance; it costs one record write per retry, and each
     // retry issues a certificate anyway. A record without `previous` is returned unchanged.
     const next =
-      entry.previous === undefined
-        ? entry
-        : { ...entry, previousUntil: new Date(now.getTime() + RENEWAL_OVERLAP_MS).toISOString() };
+      held.previous === undefined
+        ? held
+        : { ...held, previousUntil: new Date(now.getTime() + RENEWAL_OVERLAP_MS).toISOString() };
     return { entry: next, action: 'issue', reason: 'pending' };
   }
   const annotate =
@@ -200,12 +220,13 @@ export function identityTransition(
   const due = secret.notAfter.getTime() <= now.getTime() + SCHEDULER_LEAF_RENEW_DAYS * DAY_MS;
   // A stale leaf waits until a renewal in progress is complete (no `previous`), so the user its
   // running pods present is never dropped (#629); a host group with no Deployment has no such pod.
-  const settled = entry.previous === undefined || (observed.client === 'host' && !observed.rollout);
+  const settled = held.previous === undefined || (observed.client === 'host' && !observed.rollout);
   if ((due && !secret.capped) || (secret.stale && settled))
     return {
       entry: {
         current: id(),
-        previous: entry.current,
+        previous: held.current,
+        previousSince: now.toISOString(),
         previousUntil: new Date(now.getTime() + RENEWAL_OVERLAP_MS).toISOString(),
       },
       action: 'issue',
@@ -213,15 +234,15 @@ export function identityTransition(
     };
   const keep = (next: IdentityEntry, stalled?: IdentityTransition['stalled']) =>
     kept(next, { annotate, stalled, caExpiring: due });
-  if (entry.previous === undefined) return keep(entry);
-  const until = Date.parse(entry.previousUntil ?? '');
+  if (held.previous === undefined) return keep(held);
+  const until = Date.parse(held.previousUntil ?? '');
   const passed = Number.isNaN(until) || now.getTime() >= until;
-  if (observed.client === 'operator') return keep(passed ? drop(entry) : entry);
+  if (observed.client === 'operator') return keep(passed ? drop(held) : held);
   const { rollout } = observed;
-  if (rollout?.complete && rollout.digest === secret.digest) return keep(drop(entry));
+  if (rollout?.complete && rollout.digest === secret.digest) return keep(drop(held));
   const deployment = rollout?.deployment ?? observed.deployment;
-  if (passed) return keep(entry, { type: RENEWAL_STALLED, deployment });
-  return keep(entry);
+  if (passed) return keep(held, { type: RENEWAL_STALLED, deployment });
+  return keep(held);
 }
 
 /** The transitions of several identities, by record key, and the record they produce. */

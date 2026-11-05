@@ -7,13 +7,21 @@ import {
   type ControllerCas,
 } from '../src/tenancy/ca-rotation';
 import { ApiError } from '../src/tenancy/controller';
-import { COMPONENT, INSTALLATION, names, OWNER, type Resource } from '../src/tenancy/resources';
+import {
+  COMPONENT,
+  INSTALLATION,
+  names,
+  OWNER,
+  type Resource,
+  TENANT,
+} from '../src/tenancy/resources';
 import {
   bundleTrusts,
   CA_HOLD_GRACE_DAYS,
+  hostsPresentPrevious,
   loadSchedulerCas,
   observeIdentity,
-  RenewalHolds,
+  renewalHold,
   SCHEDULER_CA_EXPIRING,
   SCHEDULER_IDENTITY_COMPONENT,
   TENANT_HOST_SECRET,
@@ -44,6 +52,8 @@ import {
   type HostObservation,
   identityTransition,
   type OperatorObservation,
+  RENEWAL_OVERLAP_MS,
+  SCHEDULER_DATA_TLS_ANNOTATION,
   SCHEDULER_TLS_ANNOTATION,
   schedulerCertDigest,
 } from '../src/tenancy/scheduler-pki-rotation';
@@ -559,32 +569,319 @@ describe('loadSchedulerCas: the switch waits for the holders (#629 W1)', () => {
       cas: { platform: { current: next, previous: platform.cert } },
     });
   });
-});
 
-describe('RenewalHolds: how long a renewal holds the switch (#629)', () => {
-  it('ends a hold a grace after previousUntil, bounds one a pending issuance keeps moving, and forgets a finished renewal', () => {
-    const KEY = 'tenant/alpha/hosts';
-    const GRACE = CA_HOLD_GRACE_DAYS * DAY;
-    const t0 = START.getTime();
-    const record = (until?: number) => ({
-      [KEY]: {
-        current: 'bbbbbbbbbbbbbbbb',
-        previous: 'cccccccccccccccc',
-        ...(until === undefined ? {} : { previousUntil: new Date(until).toISOString() }),
+  it('without the gate (the tenant pass) reads no holder and does not switch, but still switches at the deadline (#642)', async () => {
+    const api = new RotationApi();
+    const { platform, next } = published(api);
+    api.operations.length = 0;
+    expect(await loadSchedulerCas(api, cfg, START, false)).toEqual({
+      cas: {
+        platform: { current: platform, next },
+        tenant: storedSet(api, 'tenant') as ControllerCas,
       },
     });
-    const holds = new RenewalHolds();
-    expect(holds.until(record(t0 + 600_000), START).get(KEY)).toBe(t0 + 600_000 + GRACE);
-    // A pending issuance moves previousUntil on every pass: bounded from the first sighting.
-    const later = new Date(t0 + 3 * DAY);
-    expect(holds.until(record(later.getTime() + 600_000), later).get(KEY)).toBe(t0 + 2 * GRACE);
-    // A renewal no longer kept is forgotten, so a new one is timed from its own sighting.
-    expect(holds.until({ [KEY]: { current: 'bbbbbbbbbbbbbbbb' } }, later).size).toBe(0);
-    expect(holds.until(record(later.getTime() + 600_000), later).get(KEY)).toBe(
-      later.getTime() + 600_000 + GRACE,
+    // One read: the CA Secret. No record, no Secret, no LIST.
+    expect(api.operations.map((o) => `${o.method} ${o.path}`)).toEqual([`GET ${caPath}`]);
+    const deadline = new Date(endOf(platform.cert) - (CA_SWITCH_DEADLINE_DAYS - 0.5) * DAY);
+    expect(await loadSchedulerCas(api, cfg, deadline, false)).toMatchObject({
+      cas: { platform: { current: next, previous: platform.cert } },
+    });
+    expect(api.writes(caPath)).toBe(1);
+  });
+
+  /** A tenant host-group Deployment with `replicas`, `ready` of them, and its template annotation. */
+  const hostGroup = (
+    path: string,
+    replicas: number,
+    ready: number,
+    annotation: Record<string, string>,
+    complete = ready === replicas,
+  ) => {
+    const [namespace, name] = [path.split('/')[5] as string, path.split('/').pop() as string];
+    return {
+      apiVersion: 'apps/v1',
+      kind: 'Deployment',
+      metadata: { name, namespace, generation: 2 },
+      spec: { replicas, template: { metadata: { annotations: annotation } } },
+      status: {
+        observedGeneration: complete ? 2 : 1,
+        updatedReplicas: complete ? replicas : ready,
+        readyReplicas: ready,
+      },
+    } as unknown as Resource;
+  };
+  /** A tenant host Secret for `tenant` carrying `bundle` and a leaf whose digest is returned. */
+  const hostSecret = (tenant: string, bundle: string, leaf = `leaf of ${tenant}`) => {
+    const n = names(tenant);
+    api2.seed({
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: {
+        name: TENANT_HOST_SECRET,
+        namespace: n.runtimeNamespace,
+        labels: {
+          [INSTALLATION]: cfg.installation,
+          [COMPONENT]: SCHEDULER_IDENTITY_COMPONENT,
+          [TENANT]: tenant,
+        },
+      },
+      data: { 'tls.crt': b64(leaf), 'ca.crt': b64(bundle) },
+    } as unknown as Resource);
+    return schedulerCertDigest(leaf);
+  };
+  let api2: RotationApi;
+  const record = (entries: Record<string, unknown>) =>
+    api2.seed({
+      apiVersion: 'v1',
+      kind: 'ConfigMap',
+      metadata: { name: SCHEDULER_IDENTITIES, namespace: PKI },
+      data: { [IDENTITIES_KEY]: JSON.stringify(entries) },
+    } as unknown as Resource);
+  // Recorded at START, when the successor (published 31 days before) is already due.
+  const SINCE = START.getTime();
+  const renewal = {
+    current: 'bbbbbbbbbbbbbbbb',
+    previous: 'cccccccccccccccc',
+    previousSince: new Date(SINCE).toISOString(),
+    previousUntil: new Date(SINCE + RENEWAL_OVERLAP_MS).toISOString(),
+  };
+  const switched = async (at: Date) => {
+    api2.operations.length = 0;
+    const read = await loadSchedulerCas(api2, cfg, at);
+    return 'cas' in read && read.cas.platform.previous !== undefined
+      ? true
+      : (read as { switchBlocked?: string }).switchBlocked;
+  };
+
+  it('holds the switch up to CA_OVERLAP_DAYS after a renewal whose host group still has ready pods on the previous user (#642)', async () => {
+    api2 = new RotationApi();
+    const { platform, next } = published(api2);
+    const bundle = `${platform.cert}${next.cert}`;
+    const digest = hostSecret('alpha', bundle);
+    record({ 'tenant/alpha/hosts': renewal });
+    // Past the grace, a rollout in progress with a ready replica still holds.
+    const pastGrace = new Date(SINCE + RENEWAL_OVERLAP_MS + CA_HOLD_GRACE_DAYS * DAY);
+    api2.seed(hostGroup(tenantHosts, 2, 1, { [SCHEDULER_TLS_ANNOTATION]: digest }));
+    expect(await switched(pastGrace)).toBe(
+      `the scheduler CA switch is due but waits for identity tenant/alpha/hosts (renewal in progress; ready pods still present its previous user); it comes once they carry the successor, at the latest ${CA_SWITCH_DEADLINE_DAYS} days before the signing CA expires`,
     );
-    // Without previousUntil, a grace after it was first seen.
-    expect(new RenewalHolds().until(record(), START).get(KEY)).toBe(t0 + GRACE);
+    // The hold reads the Deployment once.
+    expect(api2.operations.filter((o) => o.path === tenantHosts)).toHaveLength(1);
+    // So does a template that moved but has not rolled (its digest is another certificate's).
+    api2.seed(hostGroup(tenantHosts, 2, 2, { [SCHEDULER_TLS_ANNOTATION]: 'other' }));
+    expect(await switched(pastGrace)).toContain('ready pods still present');
+    // The hold ends CA_OVERLAP_DAYS after the renewal was recorded, not after its overlap.
+    expect(await switched(new Date(SINCE + CA_OVERLAP_DAYS * DAY - 1))).toContain(
+      'ready pods still present',
+    );
+    expect(await switched(new Date(SINCE + CA_OVERLAP_DAYS * DAY))).toBe(true);
+  });
+
+  it('holds only to the grace when no ready pod can present the previous user (#642)', async () => {
+    api2 = new RotationApi();
+    const { platform, next } = published(api2);
+    const bundle = `${platform.cert}${next.cert}`;
+    const digest = hostSecret('alpha', bundle);
+    record({ 'tenant/alpha/hosts': renewal });
+    const beforeGrace = new Date(SINCE + RENEWAL_OVERLAP_MS + CA_HOLD_GRACE_DAYS * DAY - 1);
+    const pastGrace = new Date(SINCE + RENEWAL_OVERLAP_MS + CA_HOLD_GRACE_DAYS * DAY);
+    const normal = 'identity tenant/alpha/hosts (renewal in progress);';
+    // The rollout of the current certificate is complete: the next tenant pass drops previous.
+    api2.seed(hostGroup(tenantHosts, 2, 2, { [SCHEDULER_TLS_ANNOTATION]: digest }));
+    expect(await switched(beforeGrace)).toContain(normal);
+    expect(await switched(pastGrace)).toBe(true);
+    for (const seed of [
+      // Pods that cannot start: no replica is ready.
+      () => api2.seed(hostGroup(tenantHosts, 1, 0, { [SCHEDULER_TLS_ANNOTATION]: digest })),
+      // A template that never moved does not mount the identity.
+      () => api2.seed(hostGroup(tenantHosts, 2, 2, {})),
+      // No Deployment at all.
+      () => api2.objects.delete(tenantHosts),
+    ]) {
+      // Back to the unswitched set.
+      published(api2);
+      seed();
+      expect(await switched(beforeGrace)).toContain(normal);
+      expect(await switched(pastGrace)).toBe(true);
+    }
+  });
+
+  it('reads hostgroup-default for the platform host and data entries, and holds a host entry without its Secret too (#642)', async () => {
+    api2 = new RotationApi();
+    const { platform, next } = published(api2);
+    const bundle = `${platform.cert}${next.cert}`;
+    const platformHosts = `/apis/apps/v1/namespaces/${NS}/deployments/hostgroup-default`;
+    // The platform host group carries the data role's digest annotation; a tenant whose host
+    // Secret is absent (deleted for a propagation wait) still has ready pods on the old user.
+    api2.seed(hostGroup(platformHosts, 1, 1, { [SCHEDULER_DATA_TLS_ANNOTATION]: 'x' }, false));
+    api2.seed(hostGroup(tenantHosts, 1, 1, { [SCHEDULER_TLS_ANNOTATION]: 'y' }, false));
+    hostSecret('alpha', bundle);
+    const betaHosts = `/apis/apps/v1/namespaces/${names('beta').runtimeNamespace}/deployments/hostgroup-${names('beta').hostgroup}`;
+    api2.seed(hostGroup(betaHosts, 1, 1, { [SCHEDULER_TLS_ANNOTATION]: 'z' }, false));
+    record({
+      'platform/data': renewal,
+      'platform/operator': renewal,
+      'tenant/beta/hosts': renewal,
+    });
+    const pastGrace = new Date(SINCE + RENEWAL_OVERLAP_MS + CA_HOLD_GRACE_DAYS * DAY);
+    expect(await switched(pastGrace)).toBe(
+      `the scheduler CA switch is due but waits for identity platform/data (renewal in progress; ready pods still present its previous user), identity tenant/beta/hosts (renewal in progress; ready pods still present its previous user); it comes once they carry the successor, at the latest ${CA_SWITCH_DEADLINE_DAYS} days before the signing CA expires`,
+    );
+    const read = (path: string) => api2.operations.filter((o) => o.path === path).length;
+    expect([read(platformHosts), read(betaHosts), read(tenantHosts)]).toEqual([1, 1, 0]);
+  });
+
+  it('reads a host group once per Deployment, and only for an entry whose hold depends on it (#642 S1)', async () => {
+    api2 = new RotationApi();
+    const { platform, next } = published(api2);
+    const platformHosts = `/apis/apps/v1/namespaces/${NS}/deployments/hostgroup-default`;
+    api2.seed(hostGroup(platformHosts, 1, 1, { [SCHEDULER_DATA_TLS_ANNOTATION]: 'x' }, false));
+    api2.seed(hostGroup(tenantHosts, 2, 2, { [SCHEDULER_TLS_ANNOTATION]: 'y' }, false));
+    hostSecret('alpha', `${platform.cert}${next.cert}`);
+    const read = (path: string) => api2.operations.filter((o) => o.path === path).length;
+    // platform/host and platform/data share hostgroup-default: one read for both.
+    record({ 'platform/host': renewal, 'platform/data': renewal });
+    const pastGrace = new Date(SINCE + RENEWAL_OVERLAP_MS + CA_HOLD_GRACE_DAYS * DAY);
+    expect(await switched(pastGrace)).toContain(
+      'identity platform/data (renewal in progress; ready',
+    );
+    expect(read(platformHosts)).toBe(1);
+    // Before the grace the entry holds whatever its pods do; past the longer bound it holds
+    // whatever they do: neither reads the Deployment.
+    record({ 'tenant/alpha/hosts': renewal });
+    expect(await switched(new Date(SINCE + RENEWAL_OVERLAP_MS))).toContain(
+      'identity tenant/alpha/hosts (renewal in progress);',
+    );
+    expect(read(tenantHosts)).toBe(0);
+    expect(await switched(new Date(SINCE + CA_OVERLAP_DAYS * DAY))).toBe(true);
+    expect(read(tenantHosts)).toBe(0);
+  });
+
+  it('switches the tenant set on the server Secret alone: no record hold or client Secret gates it (#642 W1)', async () => {
+    // The reviewer's probe: the platform CA is not due, the tenant CA is (its successor is 31
+    // days old), the server carries both sets, and a tenant host group keeps 2/2 ready pods on an
+    // old-digest template. Only the platform CA signs the server leaf, so this switch breaks no
+    // pod, and the hold does not apply to it.
+    api2 = new RotationApi();
+    const platform = caEnding('platform', START, 3000);
+    const tenant = caEnding('tenant', START, 60);
+    const tenantNext = newSchedulerCa(
+      'tenant',
+      NS,
+      new Date(START.getTime() - (CA_OVERLAP_DAYS + 1) * DAY),
+    );
+    const sets: SchedulerCas = {
+      platform: { current: platform },
+      tenant: { current: tenant, next: tenantNext },
+    };
+    seedCas(api2, sets);
+    const pkiLabels = { [INSTALLATION]: cfg.installation, [COMPONENT]: 'scheduler-pki' };
+    api2.seed(holder(PLATFORM_SECRETS.server, NS, pkiLabels, schedulerServerBundle(sets)));
+    // A client Secret that lacks nothing it needs (clients trust only the platform set), and a
+    // host group whose ready pods still present the previous user.
+    hostSecret('alpha', platform.cert);
+    api2.seed(hostGroup(tenantHosts, 2, 2, { [SCHEDULER_TLS_ANNOTATION]: 'old' }));
+    record({ 'tenant/alpha/hosts': renewal });
+    const later = new Date(START.getTime() + DAY);
+    api2.operations.length = 0;
+    expect(await loadSchedulerCas(api2, cfg, later)).toMatchObject({
+      cas: {
+        platform: { current: platform },
+        tenant: { current: tenantNext, previous: tenant.cert },
+      },
+    });
+    // Only the server Secret was read for it: no record, no client Secret, no Deployment.
+    const reads = api2.operations.filter((o) => o.method === 'GET').map((o) => o.path);
+    expect(reads).toEqual([caPath, serverPath]);
+    // A server Secret that lacks the tenant successor holds it, and is the only holder named.
+    seedCas(api2, sets);
+    api2.seed(holder(PLATFORM_SECRETS.server, NS, pkiLabels, `${platform.cert}${tenant.cert}`));
+    expect(await loadSchedulerCas(api2, cfg, later)).toMatchObject({
+      cas: { tenant: { current: tenant, next: tenantNext } },
+      switchBlocked: `the scheduler CA switch is due but waits for server Secret ${NS}/${PLATFORM_SECRETS.server} (ca.crt); it comes once they carry the successor, at the latest ${CA_SWITCH_DEADLINE_DAYS} days before the signing CA expires`,
+    });
+  });
+
+  it('gates each kind on its own when both are due: the tenant set switches while a client holds the platform set (#642 W1)', async () => {
+    api2 = new RotationApi();
+    const platform = caEnding('platform', START, 60);
+    const tenant = caEnding('tenant', START, 60);
+    const at = new Date(START.getTime() - (CA_OVERLAP_DAYS + 1) * DAY);
+    const sets: SchedulerCas = {
+      platform: { current: platform, next: newSchedulerCa('platform', NS, at) },
+      tenant: { current: tenant, next: newSchedulerCa('tenant', NS, at) },
+    };
+    seedCas(api2, sets);
+    const pkiLabels = { [INSTALLATION]: cfg.installation, [COMPONENT]: 'scheduler-pki' };
+    api2.seed(holder(PLATFORM_SECRETS.server, NS, pkiLabels, schedulerServerBundle(sets)));
+    // The tenant host Secret lacks the platform successor: it holds the platform set only.
+    hostSecret('alpha', platform.cert);
+    const read = await loadSchedulerCas(api2, cfg, START);
+    expect(read).toMatchObject({
+      cas: {
+        platform: { current: platform, next: sets.platform.next },
+        tenant: { current: sets.tenant.next, previous: tenant.cert },
+      },
+      switchBlocked: `the scheduler CA switch is due but waits for client Secret ${names('alpha').runtimeNamespace}/${TENANT_HOST_SECRET} (ca.crt); it comes once they carry the successor, at the latest ${CA_SWITCH_DEADLINE_DAYS} days before the signing CA expires`,
+    });
+    expect(api2.writes(caPath)).toBe(1);
+    expect(storedSet(api2, 'tenant')).toEqual({ current: sets.tenant.next, previous: tenant.cert });
+    expect(storedSet(api2, 'platform')).toEqual(sets.platform);
+  });
+});
+
+describe('renewalHold: how long a renewal holds the switch (#629, #642)', () => {
+  const t0 = START.getTime();
+  const GRACE = CA_HOLD_GRACE_DAYS * DAY;
+  const entry = (since: number | undefined, until: number) => ({
+    current: 'bbbbbbbbbbbbbbbb',
+    previous: 'cccccccccccccccc',
+    ...(since === undefined ? {} : { previousSince: new Date(since).toISOString() }),
+    previousUntil: new Date(until).toISOString(),
+  });
+
+  it('ends a grace after previousUntil, at the latest twice that after previousSince, read from the record alone', () => {
+    expect(renewalHold(entry(t0, t0 + 600_000))).toBe(t0 + 600_000 + GRACE);
+    // A pending issuance moves previousUntil on every pass: bounded from previousSince, which the
+    // record keeps, so neither a later pass nor a restarted controller re-arms it.
+    const later = t0 + 3 * DAY;
+    expect(renewalHold(entry(t0, later + 600_000))).toBe(t0 + 2 * GRACE);
+    expect(renewalHold(entry(t0, later + 600_000))).toBe(renewalHold(entry(t0, t0 + 2 * DAY)));
+    // Recorded before previousSince was: bounded from the issuance time previousUntil was set from.
+    expect(renewalHold(entry(undefined, t0 + RENEWAL_OVERLAP_MS))).toBe(
+      t0 + RENEWAL_OVERLAP_MS + GRACE,
+    );
+    expect(renewalHold(entry(undefined, later + RENEWAL_OVERLAP_MS))).toBe(
+      later + RENEWAL_OVERLAP_MS + GRACE,
+    );
+    // Beside previous the record always holds a readable previousUntil; without one the hold is over.
+    expect(renewalHold({ current: 'bbbbbbbbbbbbbbbb', previous: 'cccccccccccccccc' })).toBeNaN();
+  });
+
+  it('ends CA_OVERLAP_DAYS after previousSince while ready pods still present the previous user', () => {
+    expect(renewalHold(entry(t0, t0 + 600_000), true)).toBe(t0 + CA_OVERLAP_DAYS * DAY);
+    expect(renewalHold(entry(t0, t0 + 3 * DAY), true)).toBe(t0 + CA_OVERLAP_DAYS * DAY);
+    expect(renewalHold(entry(undefined, t0 + RENEWAL_OVERLAP_MS), true)).toBe(
+      t0 + CA_OVERLAP_DAYS * DAY,
+    );
+  });
+
+  it('hostsPresentPrevious: a ready replica on a moved template whose rollout of the current certificate is not complete', () => {
+    const deployment = (ready: number, annotations: Record<string, string>, complete: boolean) => ({
+      metadata: { generation: 2 },
+      spec: { replicas: 2, template: { metadata: { annotations } } },
+      status: { observedGeneration: 2, updatedReplicas: complete ? 2 : 1, readyReplicas: ready },
+    });
+    const a = SCHEDULER_TLS_ANNOTATION;
+    const presents = (value: ReturnType<typeof deployment> | undefined, digest?: string) =>
+      hostsPresentPrevious(value, 'hostgroup-x', a, digest);
+    expect(presents(deployment(1, { [a]: 'd' }, false), 'd')).toBe(true);
+    expect(presents(deployment(2, { [a]: 'old' }, true), 'd')).toBe(true);
+    expect(presents(deployment(2, { [a]: 'd' }, false), undefined)).toBe(true);
+    expect(presents(deployment(2, { [a]: 'd' }, true), 'd')).toBe(false);
+    expect(presents(deployment(0, { [a]: 'd' }, false), 'd')).toBe(false);
+    expect(presents(deployment(2, {}, false), 'd')).toBe(false);
+    expect(presents(undefined, 'd')).toBe(false);
   });
 });
 
@@ -659,11 +956,12 @@ const at = (ms: number) => {
   clock.now = new Date(ms);
 };
 /**
- * The ticks of one renewal: record, the users named, the Secrets after the propagation wait, the
- * overlap. `check` runs after each tick.
+ * The ticks of one renewal: a switch, which the platform pass makes at the end of a tick (#642),
+ * then the record, the users named, the Secrets after the propagation wait, the overlap. `check`
+ * runs after each tick.
  */
 async function settle(controller: { tick(): Promise<void> }, check: () => void = () => {}) {
-  for (const step of [0, 0, TENANT_OPERATOR_PROPAGATION_MS, 11 * 60_000]) {
+  for (const step of [0, 0, 0, TENANT_OPERATOR_PROPAGATION_MS, 11 * 60_000]) {
     clock.now = new Date(clock.now.getTime() + step);
     await controller.tick();
     check();
@@ -915,7 +1213,8 @@ describe('controller tick: the tenant path rotates both scheduler CAs (#629)', (
     expect(storedSet(api, 'platform').current).toEqual(old.platform);
     const blocked =
       'the scheduler CA switch is due but waits for identity tenant/alpha/hosts (renewal in progress);';
-    expect(warned(`Tenant scheduler identities: ${blocked}`)).toBe(1);
+    // The platform pass alone reads the holders, once per tick, and logs once per blocked set.
+    expect(warned(`Tenant scheduler identities: ${blocked}`)).toBe(0);
     expect(warned(`Platform scheduler identities: ${blocked}`)).toBe(1);
     // Past the grace it no longer holds: the switch comes, and every leaf is re-signed.
     at(until + CA_HOLD_GRACE_DAYS * DAY);
@@ -932,7 +1231,7 @@ describe('controller tick: the tenant path rotates both scheduler CAs (#629)', (
         ),
       ).toBe(true);
     expect(await quiet(api, controller, [...healthy, hostPath], 3, DAY)).toBe(0);
-    expect(warned(`Tenant scheduler identities: ${blocked}`)).toBe(1);
+    expect(warned(`Platform scheduler identities: ${blocked}`)).toBe(1);
   });
 
   it('a host rollout that never completes releases its stale Secret with its renewal, so the switch arrives at previousUntil plus the grace', async () => {
@@ -965,7 +1264,7 @@ describe('controller tick: the tenant path rotates both scheduler CAs (#629)', (
     await controller.tick();
     expect(storedSet(api, 'platform').current).toEqual(old.platform);
     const blocked = `the scheduler CA switch is due but waits for client Secret ${names('alpha').runtimeNamespace}/${TENANT_HOST_SECRET} (ca.crt), identity tenant/alpha/hosts (renewal in progress);`;
-    expect(warned(`Tenant scheduler identities: ${blocked}`)).toBe(1);
+    expect(warned(`Tenant scheduler identities: ${blocked}`)).toBe(0);
     expect(warned(`Platform scheduler identities: ${blocked}`)).toBe(1);
     // Past the grace neither the renewal nor its Secret holds the switch; the host renewal is
     // still not forced, so the user its running pods present stays.
@@ -977,6 +1276,65 @@ describe('controller tick: the tenant path rotates both scheduler CAs (#629)', (
     const healthy = [serverPath, ...clientPaths, operatorPath];
     for (const path of healthy) expect(signedBy(api, path, next.cert)).toBe(true);
     expect(await quiet(api, controller, [...healthy, hostPath], 3, DAY)).toBe(0);
+  });
+
+  it('a host rollout whose old pods stay ready holds the switch past the grace, to the deadline at the latest (#642)', async () => {
+    const { api, controller, old, end } = await prepare(true);
+    // Two replicas; the replacement never becomes ready, so one old pod keeps serving with the
+    // bundle it started with. The harness moves the template's digest after each tick.
+    const hosts = api.objects.get(tenantHosts) as unknown as {
+      spec: { replicas: number };
+      status: Record<string, number>;
+    };
+    hosts.spec.replicas = 2;
+    hosts.status.updatedReplicas = 1;
+    hosts.status.readyReplicas = 1;
+    api.refuseCa = true;
+    at(end - 25 * DAY);
+    await settle(controller);
+    const record = () =>
+      JSON.parse(
+        (api.objects.get(recordPath) as unknown as { data: Record<string, string> }).data[
+          IDENTITIES_KEY
+        ] as string,
+      ) as Record<string, { previous?: string; previousSince?: string; previousUntil?: string }>;
+    const entry = record()['tenant/alpha/hosts'];
+    const since = Date.parse(entry?.previousSince as string);
+    const until = Date.parse(entry?.previousUntil as string);
+    // previousSince stays at the renewal; previousUntil followed the issuance that landed after
+    // the propagation wait.
+    expect(until - since).toBe(TENANT_OPERATOR_PROPAGATION_MS + RENEWAL_OVERLAP_MS);
+    api.refuseCa = false;
+    await controller.tick();
+    const next = storedSet(api, 'platform').next as KeyPair;
+    await settle(controller);
+    // Past the grace the switch is still held, and the log says why.
+    at(until + CA_HOLD_GRACE_DAYS * DAY);
+    await controller.tick();
+    await controller.tick();
+    expect(storedSet(api, 'platform').current).toEqual(old.platform);
+    const blocked = `the scheduler CA switch is due but waits for client Secret ${names('alpha').runtimeNamespace}/${TENANT_HOST_SECRET} (ca.crt), identity tenant/alpha/hosts (renewal in progress; ready pods still present its previous user);`;
+    expect(warned(`Platform scheduler identities: ${blocked}`)).toBe(1);
+    expect(warned('Tenant scheduler identities: the scheduler CA switch')).toBe(0);
+    // A restart keeps the same bound: the record carries it. The restarted pass logs the blocked
+    // set once itself.
+    const restarted = new PlatformSchedulerIdentities(api, cfg, () => clock.now);
+    await restarted.reconcile();
+    expect(storedSet(api, 'platform').current).toEqual(old.platform);
+    expect(warned(`Platform scheduler identities: ${blocked}`)).toBe(2);
+    // CA_OVERLAP_DAYS after the renewal is past the old CA's expiry, so the deadline switches.
+    expect(since + CA_OVERLAP_DAYS * DAY).toBeGreaterThan(end);
+    at(end - (CA_SWITCH_DEADLINE_DAYS + 0.5) * DAY);
+    await controller.tick();
+    expect(storedSet(api, 'platform').current).toEqual(old.platform);
+    expect(record()['tenant/alpha/hosts']?.previous).toBeDefined();
+    at(end - (CA_SWITCH_DEADLINE_DAYS - 0.5) * DAY);
+    await controller.tick();
+    expect(storedSet(api, 'platform')).toEqual({ current: next, previous: old.platform.cert });
+    await settle(controller);
+    for (const path of [serverPath, ...clientPaths, operatorPath])
+      expect(signedBy(api, path, next.cert)).toBe(true);
+    expect(warned(`Platform scheduler identities: ${blocked}`)).toBe(2);
   });
 
   it('publishes one successor, re-signs the host and operator leaves once against it, then retires the old CA', async () => {
@@ -1038,13 +1396,20 @@ describe('controller tick: the tenant path rotates both scheduler CAs (#629)', (
     expect(storedSet(api, 'platform').current).toEqual(old.platform);
     const next = storedSet(api, 'platform').next as KeyPair;
     const holders = [...clientPaths, ...leaves];
+    // The platform set waits for every client; the tenant set waits for the server alone, since
+    // its switch breaks no client (#642 W1), so it may switch while a client still lacks the
+    // platform successor.
     await settle(controller, () => {
       if (holders.every((path) => trusted(api, path).includes(print(next.cert)))) return;
-      expect(storedSet(api, 'tenant').current).toEqual(old.tenant);
+      expect(storedSet(api, 'platform').current).toEqual(old.platform);
       expect(signedBy(api, operatorPath, old.platform.cert)).toBe(true);
     });
     await settle(controller);
-    for (const path of leaves) expect(api.writes(path)).toBe(2);
+    expect(storedSet(api, 'tenant').previous).toBe(old.tenant.cert);
+    // The operator leaf: once for the bundle, once for the platform switch. The host leaf: once,
+    // since its bundle renewal lands after the tenant switch, already signed by the new tenant CA.
+    expect(api.writes(operatorPath)).toBe(2);
+    expect(api.writes(hostPath)).toBe(1);
     expect(signedBy(api, hostPath, (storedSet(api, 'tenant').current as KeyPair).cert)).toBe(true);
     expect(signedBy(api, operatorPath, next.cert)).toBe(true);
     expect(condition(api, SCHEDULER_CA_EXPIRING)).toBeUndefined();

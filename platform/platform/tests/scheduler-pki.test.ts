@@ -354,6 +354,7 @@ describe('identity record', () => {
     'tenant/alpha/hosts': {
       current: '5555555555555555',
       previous: '6666666666666666',
+      previousSince: '2026-10-29T00:00:00Z',
       previousUntil: '2026-10-29T00:10:00Z',
     },
   };
@@ -365,6 +366,18 @@ describe('identity record', () => {
       'platform/host',
       'tenant/alpha/hosts',
       'tenant/alpha/operator',
+    ]);
+    // `previousSince` (#642) is written between `previous` and `previousUntil`, and only when set.
+    expect(Object.keys(JSON.parse(text)['tenant/alpha/hosts'])).toEqual([
+      'current',
+      'previous',
+      'previousSince',
+      'previousUntil',
+    ]);
+    expect(Object.keys(JSON.parse(text)['tenant/alpha/operator'])).toEqual([
+      'current',
+      'previous',
+      'previousUntil',
     ]);
     const shuffled = Object.fromEntries(Object.entries(record).reverse());
     expect(serializeIdentityRecord(shuffled)).toBe(text);
@@ -421,6 +434,14 @@ describe('identity record', () => {
         previousUntil: 'not a time',
       },
       'tenant/theta/hosts': 'x',
+      // `previousSince` only beside `previous`, and readable (#642).
+      'tenant/kappa/hosts': { current: '1111111111111111', previousSince: '2026-10-29T00:00:00Z' },
+      'tenant/lambda/hosts': {
+        current: '1111111111111111',
+        previous: '2222222222222222',
+        previousSince: 'not a time',
+        previousUntil: '2026-10-29T00:00:00Z',
+      },
     };
     for (const [key, entry] of Object.entries(bad)) {
       const thrown = (() => {

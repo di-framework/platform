@@ -29,12 +29,15 @@
  *   before anything is observed, writing `di-scheduler-ca` when it changes. Each Secret's `ca.crt`
  *   carries the whole platform CA set, so a client trusts a published successor before it signs.
  *   A certificate from a CA that no longer signs, or whose bundle lacks a CA of the set, is renewed.
+ *   Whether the holders of the bundles let a due switch come is read by the platform pass alone,
+ *   once per tick ({@link renewalHold}, #642); the tenant pass publishes, retires and switches at
+ *   the deadline only.
  *
  * Inert until the cut-over (m6e): no pod mounts these Secrets yet. CA keys are held in memory only
  * for signing, and nothing here logs a key, a certificate or an issuance ID.
  */
 import { X509Certificate } from 'node:crypto';
-import { CA_SWITCH_DEADLINE_DAYS, type ControllerCas } from './ca-rotation';
+import { CA_OVERLAP_DAYS, CA_SWITCH_DEADLINE_DAYS, type ControllerCas } from './ca-rotation';
 import {
   COMPONENT,
   type Condition,
@@ -79,10 +82,13 @@ import {
   type HostObservation,
   type IdentityObservation,
   issuanceIdOf,
+  PLATFORM_HOST_DEPLOYMENT,
+  RENEWAL_OVERLAP_MS,
   RENEWAL_STALLED,
   ROTATE_ANNOTATION,
   recordTransition,
   rotationRequested,
+  SCHEDULER_DATA_TLS_ANNOTATION,
   SCHEDULER_TLS_ANNOTATION,
   schedulerCertDigest,
 } from './scheduler-pki-rotation';
@@ -299,7 +305,8 @@ const KINDS = ['platform', 'tenant'] as const;
  * of a scheduler CA, and its client Secret with it (days). A healthy slow host rollout finishes
  * well within it, so it still holds the switch; a host group that never completes its rollout (no
  * Deployment, a template never moved, pods that cannot start) holds it no longer than this, not
- * for the whole rotation (#629).
+ * for the whole rotation (#629). A host group whose ready pods still present the previous user
+ * holds it longer ({@link renewalHold}, #642).
  */
 export const CA_HOLD_GRACE_DAYS = 1;
 const DAY_MS = 86_400_000;
@@ -307,39 +314,51 @@ const DAY_MS = 86_400_000;
 const BLOCKING_NAMED = 10;
 
 /**
- * When each renewal that still keeps `previous` stops holding the switch of a scheduler CA (#629):
- * {@link CA_HOLD_GRACE_DAYS} after its `previousUntil`, but never later than twice that after this
- * controller first saw the renewal. A pending issuance (its certificate has not landed) moves
- * `previousUntil` forward on every pass, so without that bound a renewal whose certificate never
- * lands would hold the switch until the deadline; a healthy issuance lands within minutes, so the
- * bound never shortens its hold. The first sighting is kept in memory: a restart starts it again,
- * which delays the end of such a hold by at most one bound per restart.
+ * When `entry`, which keeps `previous`, stops holding the switch of a scheduler CA (ms since the
+ * epoch; #629, #642). Read from the record alone, so a controller restart cannot move it:
+ *
+ * - {@link CA_HOLD_GRACE_DAYS} after its `previousUntil`, but never later than twice that after
+ *   `previousSince`, the pass that recorded the renewal. A pending issuance (its certificate has
+ *   not landed) moves `previousUntil` forward on every pass, so without that bound a renewal whose
+ *   certificate never lands would hold the switch until the deadline; a healthy issuance lands
+ *   within minutes, so the bound never shortens its hold.
+ * - `CA_OVERLAP_DAYS` after `previousSince` while ready pods still `presented` the previous user
+ *   ({@link hostsPresentPrevious}): a pod trusts only the bundle it loaded at start, so a switch
+ *   before it rolls is a reconnect failure for it, not a stale record. The switch comes anyway
+ *   within `CA_SWITCH_DEADLINE_DAYS` of the signing CA's expiry (`advance`, `ca-rotation.ts`).
+ *
+ * An entry recorded before `previousSince` was (#642) is bounded from the issuance time its
+ * `previousUntil` was set from. Beside `previous` the record always holds a readable
+ * `previousUntil`; without one the hold counts as over, as the transitions count the overlap.
  */
-export class RenewalHolds {
-  private seen = new Map<string, number>();
-  /** Per key of `record` whose entry keeps `previous`, when it stops holding the switch (ms). */
-  until(record: IdentityRecord, now: Date): Map<string, number> {
-    const seen = new Map<string, number>();
-    const until = new Map<string, number>();
-    const grace = CA_HOLD_GRACE_DAYS * DAY_MS;
-    for (const [key, entry] of Object.entries(record)) {
-      if (entry.previous === undefined) continue;
-      const renewal = `${key} ${entry.current} ${entry.previous}`;
-      const first = this.seen.get(renewal) ?? now.getTime();
-      seen.set(renewal, first);
-      const overlapEnd = Date.parse(entry.previousUntil ?? '') || first;
-      until.set(key, Math.min(overlapEnd + grace, first + 2 * grace));
-    }
-    this.seen = seen;
-    return until;
-  }
+export function renewalHold(entry: IdentityEntry, presented = false): number {
+  const overlapEnd = Date.parse(entry.previousUntil ?? '');
+  const since = Date.parse(entry.previousSince ?? '') || overlapEnd - RENEWAL_OVERLAP_MS;
+  if (presented) return since + CA_OVERLAP_DAYS * DAY_MS;
+  const grace = CA_HOLD_GRACE_DAYS * DAY_MS;
+  return Math.min(overlapEnd + grace, since + 2 * grace);
 }
 
-/** The record key of the platform identity whose Secret is `name`, if one is. */
-const platformKey = (name: string) => {
-  const role = PLATFORM_ROLES.find((r) => PLATFORM_SECRETS[r] === name);
-  return role ? platformIdentity(role) : undefined;
-};
+/**
+ * True when pods of the host group Deployment `deployment` (read as `value`, undefined when
+ * absent) may still present the previous user of a renewal (#642): a replica is ready, the pod
+ * template carries the `annotation` (the controller renders the digest only on a template that
+ * mounts the identity Secret), and the rollout of the certificate the Secret holds (`digest`) is
+ * not complete. A ready pod may be a renewed one already, which only makes the hold longer than
+ * needed; the cost is the stalled host group's own, bounded by `CA_OVERLAP_DAYS`. Without the
+ * Deployment, with no ready replica, or with a template that never moved, no pod presents it.
+ */
+export function hostsPresentPrevious(
+  value: HostDeployment | undefined,
+  deployment: string,
+  annotation: string,
+  digest: string | undefined,
+): boolean {
+  if (!value || (value.status?.readyReplicas ?? 0) === 0) return false;
+  const { rollout } = hostRolloutOf(value, deployment, annotation);
+  return rollout?.digest !== undefined && !(rollout.complete && rollout.digest === digest);
+}
+
 /** The record key of the tenant identity whose Secret is `secret`, if one is. */
 const tenantKey = (secret: Stored) => {
   const tenant = secret.metadata.labels?.[TENANT];
@@ -349,56 +368,114 @@ const tenantKey = (secret: Stored) => {
       )?.key
     : undefined;
 };
+/** The host group that presents the identity `key`, when hosts do: its Deployment and digest annotation. */
+function hostGroupOf(
+  key: string,
+  namespace: string,
+): { namespace: string; name: string; annotation: string } | undefined {
+  if (key === platformIdentity('host') || key === platformIdentity('data'))
+    return {
+      namespace,
+      name: PLATFORM_HOST_DEPLOYMENT,
+      annotation:
+        key === platformIdentity('data') ? SCHEDULER_DATA_TLS_ANNOTATION : SCHEDULER_TLS_ANNOTATION,
+    };
+  const tenant = /^tenant\/([^/]+)\/hosts$/.exec(key)?.[1];
+  if (!tenant) return undefined;
+  const n = names(tenant);
+  return {
+    namespace: n.runtimeNamespace,
+    name: `hostgroup-${n.hostgroup}`,
+    annotation: SCHEDULER_TLS_ANNOTATION,
+  };
+}
+
+/** A Secret that must carry `bundle` before the switch, and the record key of its identity, if any. */
+interface Holder {
+  label: string;
+  key?: string;
+  secret: Stored;
+  bundle: string;
+}
+
+/** The holders that block each scheduler CA switch ({@link holdersBlocking}). */
+interface Blocking {
+  /** The NATS server Secret, when its `ca.crt` lacks the server bundle: holds both kinds. */
+  server: string[];
+  /** The client Secrets and record entries: hold the platform kind only. */
+  clients: string[];
+}
+
+/** The Secret at `path` when this installation's scheduler PKI bootstrap wrote it. */
+async function ownedPlatformSecret(
+  api: IdentityApi,
+  scope: SchedulerPkiScope,
+  name: string,
+): Promise<Stored | undefined> {
+  const secret = await getIfExists<Stored>(api, secretPath(scope.namespace, name));
+  const labels = secret?.metadata.labels;
+  return labels?.[INSTALLATION] === scope.installation &&
+    labels[COMPONENT] === SCHEDULER_PKI_COMPONENT
+    ? secret
+    : undefined;
+}
 
 /**
  * The holders of the scheduler bundles of `cas` (#629) that do not carry them yet, by kind and
  * place (never their contents); none when the switch may come:
- * - the NATS server Secret, when its `ca.crt` lacks the server bundle;
- * - each client Secret of the installation (the platform's and every tenant's) whose `ca.crt`
- *   lacks the client bundle, so it is still `stale` by its bundle;
- * - each identity of the record that still has `previous` (a host rollout not yet observed, an
- *   operator within its overlap), until `holds` says it stops holding ({@link RenewalHolds}).
+ * - the NATS server Secret, when its `ca.crt` lacks the server bundle: it holds the switch of
+ *   both kinds, since its `ca_file` must trust clients of either successor;
+ * - with `clients`, what holds the platform kind alone (#642 W1): only the platform CA signs the
+ *   server leaf, so only its switch can break a client that has not taken up the successor.
+ *   A tenant CA switch changes no client bundle and breaks no running pod, so it waits for the
+ *   server Secret only, and none of this is read for it:
+ *   - each client Secret of the installation (the platform's and every tenant's) whose `ca.crt`
+ *     lacks the client bundle, so it is still `stale` by its bundle;
+ *   - each identity of the record that still has `previous` (a host rollout not yet observed, an
+ *     operator within its overlap), until {@link renewalHold} says it stops holding: longer while
+ *     its host group's ready pods still present the previous user ({@link hostsPresentPrevious}).
+ *     The host group is read once per Deployment, and only for an entry whose verdict depends on
+ *     it (past the grace and within the longer bound).
  *
  * A client Secret whose identity has stopped holding is not a holder either: its stale renewal
  * waits for that rollout (the user its running pods present is never dropped), so it may lack the
  * bundle for as long as the rollout stalls. A Secret this installation did not write is not a
- * holder. Read only when a switch waits for nothing else.
+ * holder. Read only when a switch waits for nothing else, by the platform pass alone (#642).
  */
 async function holdersBlocking(
   api: IdentityApi,
   scope: SchedulerPkiScope,
   cas: SchedulerCas,
   now: Date,
-  holds: RenewalHolds,
-): Promise<string[]> {
+  clients: boolean,
+): Promise<Blocking> {
   const { installation, namespace } = scope;
-  const record = await getIfExists<Stored>(
+  const lacks = (secret: Stored, bundle: string) =>
+    !bundleTrusts(decode(secret.data?.['ca.crt']) ?? '', bundle);
+  const serverSecret = await ownedPlatformSecret(api, scope, PLATFORM_SECRETS.server);
+  const server =
+    serverSecret && lacks(serverSecret, schedulerServerBundle(cas))
+      ? [`server Secret ${namespace}/${PLATFORM_SECRETS.server} (ca.crt)`]
+      : [];
+  if (!clients) return { server, clients: [] };
+  const stored = await getIfExists<Stored>(
     api,
     configMapPath(schedulerPkiNamespace(namespace), SCHEDULER_IDENTITIES),
   );
-  const text = record?.data?.[IDENTITIES_KEY];
-  const until = holds.until(text ? parseIdentityRecord(text) : {}, now);
-  const holding = (key: string) => now.getTime() < (until.get(key) as number);
-  const blocking = [...until.keys()]
-    .filter(holding)
-    .map((key) => `identity ${key} (renewal in progress)`);
-  // A client Secret of a renewal past its hold no longer blocks.
-  const released = (key: string | undefined) =>
-    key !== undefined && until.has(key) && !holding(key);
-  const lacks = (secret: Stored, bundle: string) =>
-    !bundleTrusts(decode(secret.data?.['ca.crt']) ?? '', bundle);
-  const where = (secret: Stored) => `${secret.metadata.namespace}/${secret.metadata.name}`;
-  for (const name of Object.values(PLATFORM_SECRETS)) {
-    const secret = await getIfExists<Stored>(api, secretPath(namespace, name));
-    const labels = secret?.metadata.labels;
-    if (labels?.[INSTALLATION] !== installation || labels[COMPONENT] !== SCHEDULER_PKI_COMPONENT)
-      continue;
-    const server = name === PLATFORM_SECRETS.server;
-    if (
-      !released(platformKey(name)) &&
-      lacks(secret as Stored, server ? schedulerServerBundle(cas) : schedulerClientBundle(cas))
-    )
-      blocking.push(`${server ? 'server' : 'client'} Secret ${namespace}/${name} (ca.crt)`);
+  const text = stored?.data?.[IDENTITIES_KEY];
+  const record = text ? parseIdentityRecord(text) : {};
+  const bundle = schedulerClientBundle(cas);
+  const holders: Holder[] = [];
+  for (const role of PLATFORM_ROLES) {
+    const name = PLATFORM_SECRETS[role];
+    const secret = await ownedPlatformSecret(api, scope, name);
+    if (secret)
+      holders.push({
+        label: `client Secret ${namespace}/${name} (ca.crt)`,
+        key: platformIdentity(role),
+        secret,
+        bundle,
+      });
   }
   const selector = `${INSTALLATION}=${installation},${COMPONENT}=${SCHEDULER_IDENTITY_COMPONENT}`;
   const tenants = await api.call<{ items: Stored[] }>(
@@ -406,9 +483,57 @@ async function holdersBlocking(
     `/api/v1/secrets?labelSelector=${encodeURIComponent(selector)}`,
   );
   for (const secret of tenants.items)
-    if (!released(tenantKey(secret)) && lacks(secret, schedulerClientBundle(cas)))
-      blocking.push(`client Secret ${where(secret)} (ca.crt)`);
-  return blocking;
+    holders.push({
+      label: `client Secret ${secret.metadata.namespace}/${secret.metadata.name} (ca.crt)`,
+      key: tenantKey(secret),
+      secret,
+      bundle,
+    });
+  // The host groups whose ready pods decide a hold: past the grace, within the longer bound.
+  const renewals = Object.entries(record).filter(([, entry]) => entry.previous !== undefined);
+  const groups = new Map<string, { path: string; name: string; annotation: string }>();
+  for (const [key, entry] of renewals) {
+    const group = hostGroupOf(key, namespace);
+    if (group && now.getTime() >= renewalHold(entry) && now.getTime() < renewalHold(entry, true))
+      groups.set(key, { ...group, path: deploymentPath(group.namespace, group.name) });
+  }
+  const deployments = new Map(
+    await Promise.all(
+      [...new Set([...groups.values()].map((group) => group.path))].map(
+        async (path) => [path, await getIfExists<HostDeployment>(api, path)] as const,
+      ),
+    ),
+  );
+  // Until when each renewal that keeps `previous` holds the switch.
+  const until = new Map<string, number>();
+  const presenting = new Set<string>();
+  for (const [key, entry] of renewals) {
+    const group = groups.get(key);
+    const cert = decode(holders.find((h) => h.key === key)?.secret.data?.['tls.crt']);
+    const presented =
+      group !== undefined &&
+      hostsPresentPrevious(
+        deployments.get(group.path),
+        group.name,
+        group.annotation,
+        cert === undefined ? undefined : schedulerCertDigest(cert),
+      );
+    if (presented) presenting.add(key);
+    until.set(key, renewalHold(entry, presented));
+  }
+  const holding = (key: string) => now.getTime() < (until.get(key) as number);
+  const blocking = [...until.keys()]
+    .filter(holding)
+    .map(
+      (key) =>
+        `identity ${key} (renewal in progress${presenting.has(key) ? '; ready pods still present its previous user' : ''})`,
+    );
+  // A client Secret of a renewal past its hold no longer blocks.
+  const released = (key: string | undefined) =>
+    key !== undefined && until.has(key) && !holding(key);
+  for (const holder of holders)
+    if (!released(holder.key) && lacks(holder.secret, holder.bundle)) blocking.push(holder.label);
+  return { server, clients: blocking };
 }
 
 /** The log line of a switch that `blocking` holds, naming at most {@link BLOCKING_NAMED} of them. */
@@ -424,17 +549,20 @@ function switchBlocked(blocking: string[]): string {
  * at `now` ({@link nextSchedulerCas}, #629), or why they cannot sign yet. A pass that changes a set
  * (publishes a successor, switches to it, retires the old CA, or drops an unusable successor) is
  * written under the resourceVersion it was read with, before any of it signs or is trusted: a CA
- * whose key was never stored never signs. A switch that waits only for the holders of the bundles
- * reads them ({@link holdersBlocking}) and comes once none blocks it; until then `switchBlocked`
- * names those that do. When the write
- * fails, what is stored still signs and the rotation is retried on the next call. Key material
- * stays in memory and out of every message.
+ * whose key was never stored never signs. With `gate`, a switch that waits only for the holders of
+ * the bundles reads them ({@link holdersBlocking}) and comes, per kind, once none blocks that
+ * kind (the tenant set waits for the server Secret alone, #642 W1); until then `switchBlocked`
+ * names those that do. The platform pass passes it, once per tick after every
+ * tenant pass, so the holders are read once per tick and the reads see the Secrets the tick wrote
+ * (#642); a tenant pass does not, and only publishes, retires and switches at the deadline. When
+ * the write fails, what is stored still signs and the rotation is retried on the next call. Key
+ * material stays in memory and out of every message.
  */
 export async function loadSchedulerCas(
   api: IdentityApi,
   scope: SchedulerPkiScope,
   now: Date,
-  holds: RenewalHolds = new RenewalHolds(),
+  gate = true,
 ): Promise<SchedulerCasRead> {
   const { namespace } = scope;
   const pki = schedulerPkiNamespace(namespace);
@@ -463,13 +591,30 @@ export async function loadSchedulerCas(
   let rotated = rotate(false);
   if ('reason' in rotated) return rotated;
   // The same pass with every holder trusting: the holders are read only when that switches a set.
-  const ready = rotate(true) as SchedulerCas;
+  const ready = gate ? (rotate(true) as SchedulerCas) : rotated;
   const unswitched = rotated;
   let blocked: { switchBlocked: string } | undefined;
-  if (KINDS.some((kind) => ready[kind].current.cert !== unswitched[kind].current.cert)) {
-    const blocking = await holdersBlocking(api, scope, unswitched, now, holds);
-    if (blocking.length === 0) rotated = ready;
-    else blocked = { switchBlocked: switchBlocked(blocking) };
+  const switching = KINDS.filter(
+    (kind) => ready[kind].current.cert !== unswitched[kind].current.cert,
+  );
+  if (switching.length > 0) {
+    const holders = await holdersBlocking(
+      api,
+      scope,
+      unswitched,
+      now,
+      switching.includes('platform'),
+    );
+    const switched: SchedulerCas = { ...unswitched };
+    const held = new Set<string>();
+    for (const kind of switching) {
+      const blocking =
+        kind === 'platform' ? [...holders.server, ...holders.clients] : holders.server;
+      if (blocking.length === 0) switched[kind] = ready[kind];
+      for (const holder of blocking) held.add(holder);
+    }
+    rotated = switched;
+    if (held.size > 0) blocked = { switchBlocked: switchBlocked([...held]) };
   }
   const data: Record<string, string> = { ...secret.data };
   for (const kind of KINDS)
@@ -591,7 +736,6 @@ export class TenantSchedulerIdentities {
   /** Per record key, how long its user has waited to propagate. */
   private readonly waits = new PropagationWaits();
   private readonly rotationLog = new RotationFailureLog('Tenant scheduler identities');
-  private readonly holds = new RenewalHolds();
   constructor(
     private readonly api: IdentityApi,
     private readonly cfg: { installation: string; namespace: string },
@@ -668,9 +812,12 @@ export class TenantSchedulerIdentities {
     ];
   }
 
-  /** The CA sets, after this pass's rotation; a refused rotation write is logged once. */
+  /**
+   * The CA sets, after this pass's rotation; a refused rotation write is logged once. The switch
+   * gate is not evaluated here: the platform pass does that once per tick (#642).
+   */
   private async cas(): Promise<SchedulerCasRead> {
-    const read = await loadSchedulerCas(this.api, this.cfg, this.now(), this.holds);
+    const read = await loadSchedulerCas(this.api, this.cfg, this.now(), false);
     this.rotationLog.report(read);
     return read;
   }
