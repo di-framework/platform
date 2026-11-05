@@ -657,6 +657,17 @@ image, existing keys keep working throughout:
   already moved stop working until you upgrade again (nothing is deleted). The older package
   leaves `di-apikeys-<tenant>` alone.
 
+### Controller request profile
+
+At steady state a tick reads each tenant's managed objects and writes nothing (#643): the
+controller keeps, per object, a hash of the body it last applied and the resourceVersion that
+apply returned, and skips the server-side apply while both still match the live object. Any
+difference (a changed rendering, an object someone else wrote or deleted, a Tenant generation
+change, a controller restart) applies the object in full, so a hand-edited or deleted object is
+repaired on the next tick as before. Every 30 minutes (`APPLY_RESYNC_INTERVAL_MS` in
+`src/tenancy/controller.ts`) the cache is dropped and every object is applied once more. Leader
+election lease renewals are unaffected.
+
 ### Tenant removal and namespace retention
 
 Each `tenants` entry takes `deletionPolicy` (`Retain` or `Delete`, default `Retain`). The
