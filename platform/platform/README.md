@@ -811,8 +811,10 @@ Renewal and rotation:
   holds at most 2 days, counted from the renewal as the record keeps it, so a controller restart
   does not extend it); never in the pass that publishes it, even when a late rotation finds less
   than 30 days left. Any other client Secret that never takes it up delays the switch until 2
-  days before the old CA expires. The platform identities pass alone checks the holders, once per
-  tick, and while a due switch waits it logs once which holders it waits for. Then every leaf the
+  days before the old CA expires. Those holds gate the platform CA, which alone signs the server
+  leaf; the tenant CA's switch waits only for the server Secret to carry both sets. The platform
+  identities pass alone checks the holders, once per tick, and while a due switch waits it logs
+  once which holders it waits for. Then every leaf the
   old CA signed, the server's included, is renewed once against the successor, and the old CA
   stays trusted until it expires, then leaves the bundles. A rotation the controller cannot write
   is logged once (the CA rotation write was refused and will be retried) and retried on every

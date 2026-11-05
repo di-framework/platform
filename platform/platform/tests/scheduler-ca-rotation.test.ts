@@ -730,6 +730,104 @@ describe('loadSchedulerCas: the switch waits for the holders (#629 W1)', () => {
     const read = (path: string) => api2.operations.filter((o) => o.path === path).length;
     expect([read(platformHosts), read(betaHosts), read(tenantHosts)]).toEqual([1, 1, 0]);
   });
+
+  it('reads a host group once per Deployment, and only for an entry whose hold depends on it (#642 S1)', async () => {
+    api2 = new RotationApi();
+    const { platform, next } = published(api2);
+    const platformHosts = `/apis/apps/v1/namespaces/${NS}/deployments/hostgroup-default`;
+    api2.seed(hostGroup(platformHosts, 1, 1, { [SCHEDULER_DATA_TLS_ANNOTATION]: 'x' }, false));
+    api2.seed(hostGroup(tenantHosts, 2, 2, { [SCHEDULER_TLS_ANNOTATION]: 'y' }, false));
+    hostSecret('alpha', `${platform.cert}${next.cert}`);
+    const read = (path: string) => api2.operations.filter((o) => o.path === path).length;
+    // platform/host and platform/data share hostgroup-default: one read for both.
+    record({ 'platform/host': renewal, 'platform/data': renewal });
+    const pastGrace = new Date(SINCE + RENEWAL_OVERLAP_MS + CA_HOLD_GRACE_DAYS * DAY);
+    expect(await switched(pastGrace)).toContain(
+      'identity platform/data (renewal in progress; ready',
+    );
+    expect(read(platformHosts)).toBe(1);
+    // Before the grace the entry holds whatever its pods do; past the longer bound it holds
+    // whatever they do: neither reads the Deployment.
+    record({ 'tenant/alpha/hosts': renewal });
+    expect(await switched(new Date(SINCE + RENEWAL_OVERLAP_MS))).toContain(
+      'identity tenant/alpha/hosts (renewal in progress);',
+    );
+    expect(read(tenantHosts)).toBe(0);
+    expect(await switched(new Date(SINCE + CA_OVERLAP_DAYS * DAY))).toBe(true);
+    expect(read(tenantHosts)).toBe(0);
+  });
+
+  it('switches the tenant set on the server Secret alone: no record hold or client Secret gates it (#642 W1)', async () => {
+    // The reviewer's probe: the platform CA is not due, the tenant CA is (its successor is 31
+    // days old), the server carries both sets, and a tenant host group keeps 2/2 ready pods on an
+    // old-digest template. Only the platform CA signs the server leaf, so this switch breaks no
+    // pod, and the hold does not apply to it.
+    api2 = new RotationApi();
+    const platform = caEnding('platform', START, 3000);
+    const tenant = caEnding('tenant', START, 60);
+    const tenantNext = newSchedulerCa(
+      'tenant',
+      NS,
+      new Date(START.getTime() - (CA_OVERLAP_DAYS + 1) * DAY),
+    );
+    const sets: SchedulerCas = {
+      platform: { current: platform },
+      tenant: { current: tenant, next: tenantNext },
+    };
+    seedCas(api2, sets);
+    const pkiLabels = { [INSTALLATION]: cfg.installation, [COMPONENT]: 'scheduler-pki' };
+    api2.seed(holder(PLATFORM_SECRETS.server, NS, pkiLabels, schedulerServerBundle(sets)));
+    // A client Secret that lacks nothing it needs (clients trust only the platform set), and a
+    // host group whose ready pods still present the previous user.
+    hostSecret('alpha', platform.cert);
+    api2.seed(hostGroup(tenantHosts, 2, 2, { [SCHEDULER_TLS_ANNOTATION]: 'old' }));
+    record({ 'tenant/alpha/hosts': renewal });
+    const later = new Date(START.getTime() + DAY);
+    api2.operations.length = 0;
+    expect(await loadSchedulerCas(api2, cfg, later)).toMatchObject({
+      cas: {
+        platform: { current: platform },
+        tenant: { current: tenantNext, previous: tenant.cert },
+      },
+    });
+    // Only the server Secret was read for it: no record, no client Secret, no Deployment.
+    const reads = api2.operations.filter((o) => o.method === 'GET').map((o) => o.path);
+    expect(reads).toEqual([caPath, serverPath]);
+    // A server Secret that lacks the tenant successor holds it, and is the only holder named.
+    seedCas(api2, sets);
+    api2.seed(holder(PLATFORM_SECRETS.server, NS, pkiLabels, `${platform.cert}${tenant.cert}`));
+    expect(await loadSchedulerCas(api2, cfg, later)).toMatchObject({
+      cas: { tenant: { current: tenant, next: tenantNext } },
+      switchBlocked: `the scheduler CA switch is due but waits for server Secret ${NS}/${PLATFORM_SECRETS.server} (ca.crt); it comes once they carry the successor, at the latest ${CA_SWITCH_DEADLINE_DAYS} days before the signing CA expires`,
+    });
+  });
+
+  it('gates each kind on its own when both are due: the tenant set switches while a client holds the platform set (#642 W1)', async () => {
+    api2 = new RotationApi();
+    const platform = caEnding('platform', START, 60);
+    const tenant = caEnding('tenant', START, 60);
+    const at = new Date(START.getTime() - (CA_OVERLAP_DAYS + 1) * DAY);
+    const sets: SchedulerCas = {
+      platform: { current: platform, next: newSchedulerCa('platform', NS, at) },
+      tenant: { current: tenant, next: newSchedulerCa('tenant', NS, at) },
+    };
+    seedCas(api2, sets);
+    const pkiLabels = { [INSTALLATION]: cfg.installation, [COMPONENT]: 'scheduler-pki' };
+    api2.seed(holder(PLATFORM_SECRETS.server, NS, pkiLabels, schedulerServerBundle(sets)));
+    // The tenant host Secret lacks the platform successor: it holds the platform set only.
+    hostSecret('alpha', platform.cert);
+    const read = await loadSchedulerCas(api2, cfg, START);
+    expect(read).toMatchObject({
+      cas: {
+        platform: { current: platform, next: sets.platform.next },
+        tenant: { current: sets.tenant.next, previous: tenant.cert },
+      },
+      switchBlocked: `the scheduler CA switch is due but waits for client Secret ${names('alpha').runtimeNamespace}/${TENANT_HOST_SECRET} (ca.crt); it comes once they carry the successor, at the latest ${CA_SWITCH_DEADLINE_DAYS} days before the signing CA expires`,
+    });
+    expect(api2.writes(caPath)).toBe(1);
+    expect(storedSet(api2, 'tenant')).toEqual({ current: sets.tenant.next, previous: tenant.cert });
+    expect(storedSet(api2, 'platform')).toEqual(sets.platform);
+  });
 });
 
 describe('renewalHold: how long a renewal holds the switch (#629, #642)', () => {
@@ -1298,13 +1396,20 @@ describe('controller tick: the tenant path rotates both scheduler CAs (#629)', (
     expect(storedSet(api, 'platform').current).toEqual(old.platform);
     const next = storedSet(api, 'platform').next as KeyPair;
     const holders = [...clientPaths, ...leaves];
+    // The platform set waits for every client; the tenant set waits for the server alone, since
+    // its switch breaks no client (#642 W1), so it may switch while a client still lacks the
+    // platform successor.
     await settle(controller, () => {
       if (holders.every((path) => trusted(api, path).includes(print(next.cert)))) return;
-      expect(storedSet(api, 'tenant').current).toEqual(old.tenant);
+      expect(storedSet(api, 'platform').current).toEqual(old.platform);
       expect(signedBy(api, operatorPath, old.platform.cert)).toBe(true);
     });
     await settle(controller);
-    for (const path of leaves) expect(api.writes(path)).toBe(2);
+    expect(storedSet(api, 'tenant').previous).toBe(old.tenant.cert);
+    // The operator leaf: once for the bundle, once for the platform switch. The host leaf: once,
+    // since its bundle renewal lands after the tenant switch, already signed by the new tenant CA.
+    expect(api.writes(operatorPath)).toBe(2);
+    expect(api.writes(hostPath)).toBe(1);
     expect(signedBy(api, hostPath, (storedSet(api, 'tenant').current as KeyPair).cert)).toBe(true);
     expect(signedBy(api, operatorPath, next.cert)).toBe(true);
     expect(condition(api, SCHEDULER_CA_EXPIRING)).toBeUndefined();
