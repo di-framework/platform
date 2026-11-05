@@ -19,20 +19,17 @@
  *      lost+found (fragments there are left and reported), names a stub that
  *      stops it by its path from the root, resumes after a crash before the
  *      marker flips, and then refuses the old key.
- *   7. Codecs (#206). Two variants are built: the default (publishes; writes
- *      codec 2, so a rollback to it stays possible) and `write-codec-3`.
- *      - A fresh directory holds only the codec the variant writes.
+ *   7. Codecs (#206). The build writes codec 3 and its section says so.
+ *      - A fresh directory holds codec-3 files only.
  *      - A directory initialized by the published v1 build (codec 2) keeps
- *        working: the codec-3 variant reads it, writes to it, and creates
- *        codec-3 files next to the codec-2 ones.
+ *        working: this build reads it, writes to it, and creates codec-3
+ *        files next to the codec-2 ones.
  *      - Rollback: v1 over that mixed directory, after a clean shutdown and
  *        after an abrupt exit, must fail loudly (never start and lose
- *        commits), and the new builds then still recover every commit. The
- *        default variant also reads the mixed directory and never creates
- *        codec-3 files.
+ *        commits), and this build then still recovers every commit.
  *   8. Integrity directories (#200). A reservation becomes a keyed integrity
- *      directory that runs the whole suite on codec-4 files only, in both
- *      variants, keeps its fsynced commits through torn slot writes (the
+ *      directory that runs the whole suite on codec-4 files only, keeps its
+ *      fsynced commits through torn slot writes (the
  *      three spike cases, C10, C13, C6 and C14 of the design note), detects
  *      a flipped byte and an erased page below the watermark, documents that
  *      an older slot copy reads as the older page, rotates in place and is
@@ -706,17 +703,10 @@ function checkAb(output: string): { a: number; b: number } {
   return { a: Number(match[1]), b: Number(match[2]) };
 }
 
-async function compose(
-  ctx: Context,
-  smokeDir: string,
-  pglite: string,
-  encfs: string,
-  tag: string,
-  writeCodec: 2 | 3,
-) {
+async function compose(ctx: Context, smokeDir: string, pglite: string, encfs: string) {
   const witOf = async (wasm: string) =>
     worldItems(await $`wasm-tools component wit ${wasm}`.text());
-  const pgliteEnc = join(smokeDir, `pglite-enc-${tag}.wasm`);
+  const pgliteEnc = join(smokeDir, 'pglite-enc.wasm');
   await $`wac plug --plug ${encfs} ${pglite} -o ${pgliteEnc}`;
   await $`wasm-tools validate --features all ${pgliteEnc}`;
   const problems = compositionProblems(
@@ -729,15 +719,11 @@ async function compose(
   if (!provider.includes(CUSTOM_SECTION)) {
     throw new Error(`composed provider lacks the ${CUSTOM_SECTION} custom section`);
   }
-  const marker = `codec=aes-256-xts write-codec=${writeCodec}`;
-  const other = `write-codec=${writeCodec === 2 ? 3 : 2}`;
-  if (!provider.includes(marker) || provider.includes(other))
-    throw new Error(`composed provider (${tag}) does not advertise ${marker}`);
-  // The writer release (#200, design note 9.3): reads codec 4 and writes it
-  // in integrity directories, in every variant.
-  const integrity = `${marker} read-codecs=2,3,4 integrity=1`;
-  if (!provider.includes(integrity))
-    throw new Error(`composed provider (${tag}) does not advertise ${integrity}`);
+  // New files get codec 3 (#206); the build reads codec 4 and writes it in
+  // integrity directories (#200, design note 9.3).
+  const marker = 'codec=aes-256-xts write-codec=3 read-codecs=2,3,4 integrity=1';
+  if (!provider.includes(marker) || provider.includes('write-codec=2'))
+    throw new Error(`composed provider does not advertise ${marker}`);
   log(`interfaces match pglite; ${pgliteEnc}`);
 
   // The pglite smoke consumer, built from its own workspace with its own toolchain file.
@@ -747,8 +733,8 @@ async function compose(
     .env({ ...ctx.env, CARGO_TARGET_DIR: consumerTarget });
   const consumer = join(consumerTarget, 'wasm32-wasip2', 'release', 'pglite-smoke-consumer.wasm');
   const composed = {
-    encrypted: join(smokeDir, `encrypted-${tag}.wasm`),
-    plain: join(smokeDir, `plain-${tag}.wasm`),
+    encrypted: join(smokeDir, 'encrypted.wasm'),
+    plain: join(smokeDir, 'plain.wasm'),
   };
   for (const [out, provider] of [
     [composed.encrypted, pgliteEnc],
@@ -811,12 +797,9 @@ export async function smoke(ctx: Context): Promise<void> {
   await rm(smokeDir, { recursive: true, force: true });
   const logDir = join(smokeDir, 'logs');
   await mkdir(logDir, { recursive: true });
-  // `encfs` (dist/) is the default build, which writes codec 2; the matrix below
-  // runs on the opt-in write-codec-3 build so codec 3 stays fully covered.
-  const encfs3 = await build(ctx, { writeCodec3: true, outDir: join(smokeDir, 'codec3') });
-  const composedDefault = await compose(ctx, smokeDir, pglite, encfs, 'default', 2);
-  const composed = await compose(ctx, smokeDir, pglite, encfs3, 'codec3', 3);
-  const rootProbe = await composeProbe(ctx, smokeDir, encfs3);
+  // The whole matrix runs on dist/, the artifact that is published.
+  const composed = await compose(ctx, smokeDir, pglite, encfs);
+  const rootProbe = await composeProbe(ctx, smokeDir, encfs);
 
   // Standard base64 for A, unpadded base64url for B: both alphabets are accepted.
   const rawA = randomBytes(32);
@@ -870,18 +853,6 @@ export async function smoke(ctx: Context): Promise<void> {
       throw new Error(`a fresh directory is not all codec 3: ${describeCodecs(fresh)}`);
     log(`fresh directory: ${describeCodecs(fresh)}`);
 
-    // The default build writes codec 2 only: a deployment can roll back to it.
-    const dflt = join(work, 'default');
-    await mkdir(dflt);
-    await h.run(composedDefault.encrypted, dflt, 'write', A, 'smoke ok');
-    await h.run(composedDefault.encrypted, dflt, 'abrupt', A, 'abrupt ok');
-    await h.run(composedDefault.encrypted, dflt, 'read', A, 'restart ok');
-    const dfltHeaders = await assertEncrypted(dflt, keyCheckValue(keyA), raw);
-    const dfltCodecs = await codecCounts(dflt);
-    if (dfltCodecs.get(CODEC_STEALING) !== dfltHeaders)
-      throw new Error(`the default build wrote codec 3: ${describeCodecs(dfltCodecs)}`);
-    log(`default build, fresh directory: ${describeCodecs(dfltCodecs)}`);
-
     // Refusals leave the tree byte-identical.
     await h.refused(enc, data, B, 'encrypted with a different key');
     await h.refused(enc, data, {}, 'DI_PGLITE_KEY is not set or invalid');
@@ -919,7 +890,7 @@ export async function smoke(ctx: Context): Promise<void> {
     await rm(refusing, { recursive: true, force: true });
 
     // DI_PGLITE_INTEGRITY changes nothing and is logged: an empty root still
-    // becomes an XTS directory of the variant's codec.
+    // becomes a codec-3 XTS directory.
     const envOnly = join(work, 'integrity-env');
     await mkdir(envOnly);
     const IGNORED = 'DI_PGLITE_INTEGRITY is ignored';
@@ -960,23 +931,6 @@ export async function smoke(ctx: Context): Promise<void> {
     if (slotCodecs.get(CODEC_SLOTS) !== slotHeaders)
       throw new Error(`an integrity directory holds ${describeCodecs(slotCodecs)}`);
     log(`integrity directory: ${describeCodecs(slotCodecs)}, keyed marker, no plaintext`);
-
-    // The default variant writes integrity directories too: the writer is
-    // not behind a feature (9.3).
-    const integrityDefault = join(work, 'integrity-default');
-    await mkdir(integrityDefault);
-    await writeFile(join(integrityDefault, MARKER_FILE), RESERVATION);
-    await h.run(composedDefault.encrypted, integrityDefault, 'write', A, 'smoke ok');
-    await h.run(composedDefault.encrypted, integrityDefault, 'abrupt', A, 'abrupt ok');
-    await h.run(composedDefault.encrypted, integrityDefault, 'read', A, 'restart ok');
-    const defaultSlots = await assertEncrypted(integrityDefault, keyCheckValue(keyA), raw, keyedA);
-    const defaultSlotCodecs = await codecCounts(integrityDefault, [CODEC_SLOTS]);
-    if (defaultSlotCodecs.get(CODEC_SLOTS) !== defaultSlots)
-      throw new Error(`default build, integrity: ${describeCodecs(defaultSlotCodecs)}`);
-    // Both variants read each other's integrity directories.
-    await h.run(enc, integrityDefault, 'read', A, 'restart ok');
-    await rm(integrityDefault, { recursive: true, force: true });
-    log(`default build, integrity directory: ${describeCodecs(defaultSlotCodecs)}`);
 
     // Power-loss tears inside one changed slot (12.3): the slot fails its tag,
     // the other slot of the pair still holds the durable version, and the
@@ -1340,22 +1294,6 @@ export async function smoke(ctx: Context): Promise<void> {
     if (checkAb(await h.run(enc, narrow, 'check-ab', A, /^check-ab /)).a !== 1)
       throw new Error('narrow case: commit A lost after the v1 attempt');
     await rm(narrow, { recursive: true, force: true });
-
-    // The default build (writes codec 2) reads the mixed directory too, keeps
-    // every commit, and creates no codec-3 files.
-    const mixed = await codecCounts(legacy);
-    await h.run(composedDefault.encrypted, legacy, 'read', A, 'restart ok');
-    await h.run(composedDefault.encrypted, legacy, 'abrupt', A, 'abrupt ok');
-    await h.run(composedDefault.encrypted, legacy, 'marker-read', A, 'marker-read ok');
-    const viaDefault = checkAb(
-      await h.run(composedDefault.encrypted, legacy, 'check-ab', A, /^check-ab /),
-    );
-    if (viaDefault.a !== 1 || viaDefault.b !== 1)
-      throw new Error(`default build lost commits: ${JSON.stringify(viaDefault)}`);
-    const afterDefault = await codecCounts(legacy);
-    if ((afterDefault.get(CODEC_TAIL) ?? 0) > (mixed.get(CODEC_TAIL) ?? 0))
-      throw new Error(`the default build created codec-3 files: ${describeCodecs(afterDefault)}`);
-    log(`default build over the mixed directory: ${describeCodecs(afterDefault)}`);
   } finally {
     await rm(work, { recursive: true, force: true });
   }

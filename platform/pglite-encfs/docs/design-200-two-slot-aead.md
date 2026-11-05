@@ -5,7 +5,7 @@
 | Issue | #200 (follow-up to #199, refs #138) |
 | Roadmap | v0.1 #499, epic E4 #497, lane T08, milestone `#200:design` |
 | Status | **Design, revised three times after review on PR #530.** Owner decisions of 2026-10-28, the engineering answers and the decisions taken after the second and third reviews are recorded in section 13. No code changes. Implementation waits for this note to merge. |
-| Related | #206 (codec 3, absorbs #244; its default flip waits on gate G04 = identity-server#71) |
+| Related | #206 (codec 3, absorbs #244; codec 3 is the default for new XTS files since the #206 flip, which dropped gate G04, see 9.3) |
 | Crate | `platform/pglite-encfs`; the Tenant setting (9.1) also touches `platform/platform/src/tenancy`, and backup and restore (9.4) touch `platform/backup-agent` and `platform/backup-destination` |
 
 All `file:line` references are relative to `platform/pglite-encfs/` unless they start with `platform/`. They were checked against `origin/main` `d182bea`; `platform/pglite-encfs` has not changed since `73cfb85`, which the first version of this note cited.
@@ -30,7 +30,7 @@ Codec 4 is a new codec id in the existing header format. It does not change code
 - **Physical file.** `[header: 4096][unit 0][unit 1]...`, each unit 4096 bytes of ciphertext except a shorter last one (`src/file.rs:3-5`, `src/codec.rs:41`, `src/header.rs:38-39`). The layout is length-preserving: `logical size = physical size - 4096` (`src/file.rs:77-81`).
 - **Header.** 152 used bytes in a 4 KiB block: magic `DIPGENC1`, format version 1, codec byte, random file id, KCV, and the random 64-byte DEK wrapped with XChaCha20-Poly1305. The AAD is bytes 0..32, so the codec byte is authenticated (`src/header.rs:7-24`, `src/header.rs:203-214`). The header is written once as a full 4 KiB block, zero after byte 152, and synced before any data follows it (`src/component.rs:341-364`). `Header::parse` inspects only the first 152 bytes (`src/header.rs:141-154`). Rotation rewrites only the 152 used bytes (`src/component.rs:590-593`, `src/header.rs:26-29`, `src/header.rs:189-201`).
 - **Codec ids.** 2 is XTS with ciphertext stealing (v1). 3 is XTS with a length-independent tail keystream (#206). Codec 1 was the AEAD prototype from the #199 spike and is rejected (`src/codec.rs:53-87`, `src/header.rs:19-24`). Unknown codecs fail `Header::parse` as `Unsupported` (`src/header.rs:149-152`). A test pins that 1 and 4 are refused today (`src/header.rs:282-290`, `src/codec.rs:235-237`).
-- **New files.** `Codec::NEW_FILES` is codec 2, or codec 3 with the cargo feature `write-codec-3` (`src/codec.rs:62-69`, `Cargo.toml:33-38`). The composed component's custom section advertises it as `write-codec=N` (`src/component.rs:64-75`, README "Composition").
+- **New files.** `Codec::NEW_FILES` was codec 2, or codec 3 with the cargo feature `write-codec-3` (`src/codec.rs:62-69`, `Cargo.toml:33-38`), when this note was written; since the #206 flip it is codec 3 and the feature is gone. The composed component's custom section advertises it as `write-codec=N` (`src/component.rs:64-75`, README "Composition").
 - **Size from `stat`.** The guest's `stat` and `stat-at` derive a regular file's size from the host size alone, without opening it (`src/component.rs:166-181`, `src/component.rs:1096-1106`). Each read and write also stats the host file to find the logical size (`src/file.rs:99-101`, `src/component.rs:247-249`).
 
 ### 2.2 Write path
@@ -551,7 +551,7 @@ The tenancy changes ship in the writer release (9.3). The `backup-agent` and `ba
 ### 9.3 Relation to #206 and G04
 
 - **#206 does not wait for codec 4, and codec 4 does not wait for G04.**
-  - G04 (identity-server#71 parses and enforces `write-codec`, and a reader-capable encfs is deployed everywhere) gates only flipping the XTS default from codec 2 to 3.
+  - G04 (identity-server#71 parses and enforces `write-codec`, and a reader-capable encfs is deployed everywhere) gated only flipping the XTS default from codec 2 to 3. The flip landed with #206 without waiting for G04: no reader in this repository inspects the codec byte (backup-agent and the platform's storage records read the root marker only, and `DIPGKEY1` covers codecs 2 and 3), and there is no deployed directory to protect. identity-server#71 stays a deploy-time convenience, not a correctness gate.
   - Codec 4 changes no default and no existing directory. Its rollback story is the marker (9.1), not the custom section.
   - The T08 order stays `#200:design` → #206.
 - **Two-step rollout, as in #206:**
@@ -560,7 +560,7 @@ The tenancy changes ship in the writer release (9.3). The `backup-agent` and `ba
 
   An integrity directory must never be opened by a build older than step 1. The marker makes that fail closed.
 - **Custom section.** It is a fixed 40-byte `format=1 codec=aes-256-xts write-codec=N` today (`src/component.rs:64-75`). A codec-4-capable build also advertises `read-codecs=2,3,4 integrity=1`, so deploy tooling can warn early about a pin that cannot read a directory's mode. Correctness does not depend on it: such a pin locks a reserved or integrity directory (9.1). identity-server#71 is still open; the decision (Q11) is to ask it now to accept unknown keys and a variable-length section, so codec 4 needs no further gate.
-- **Codec 4 removes the #206 problem only for integrity directories.** XTS directories still need codec 3 and its flip.
+- **Codec 4 removes the #206 problem only for integrity directories.** XTS directories still need codec 3 and its flip. The codec-3 tail keystream has no counterpart in codec 4: a codec-4 unit is one AEAD ciphertext whose length is authenticated in the slot's metadata (5.2), so a length change never re-encrypts durable bytes under a different rule, and no partial-block encoding exists to share.
 
 ### 9.4 Backup and restore
 
