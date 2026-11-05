@@ -8,7 +8,10 @@
  *          one 24 KiB row each (multi-page WAL flushes)
  *   bulk   200k rows of about 240 bytes, then CHECKPOINT
  *   scan   a fresh engine opening the directory and scanning the bulk table
- *   stat   cold and warm `stat-at` on every relation file
+ *   stat   `stat-at` on every relation file: cold, repeated while nobody holds
+ *          the file open (a miss each time), and warm with the file held open
+ *
+ * PGLITE_ENCFS_BENCH_PHASES=init,stat (for example) re-runs only those rows.
  *
  * For the encrypted variants encfs is plugged into pglite and into the bench
  * component's own filesystem imports, so `stat` measures encfs's `stat-at`;
@@ -34,6 +37,24 @@ const RESERVATION = Buffer.concat([Buffer.from('DIPGKEY2'), Buffer.alloc(16), Bu
 const RUN_TIMEOUT_MS = 20 * 60 * 1000;
 const PHASES = ['init', 'oltp', 'bulk', 'scan', 'stat'] as const;
 type Phase = (typeof PHASES)[number];
+
+/**
+ * `PGLITE_ENCFS_BENCH_PHASES`, a comma-separated subset of the phases, re-runs
+ * only those rows (for example `init,stat`); `init` always runs first, and
+ * `scan` needs `bulk`. Skipped rows show as `—`.
+ */
+function selectedPhases(env: Record<string, string | undefined>): Phase[] {
+  const wanted = env.PGLITE_ENCFS_BENCH_PHASES;
+  if (!wanted) return [...PHASES];
+  const names = new Set(wanted.split(',').map((name) => name.trim()));
+  for (const name of names) {
+    if (!(PHASES as readonly string[]).includes(name))
+      throw new Error(`PGLITE_ENCFS_BENCH_PHASES: unknown phase ${JSON.stringify(name)}`);
+  }
+  names.add('init');
+  if (names.has('scan')) names.add('bulk');
+  return PHASES.filter((phase) => names.has(phase));
+}
 
 interface Variant {
   name: 'plaintext' | 'xts' | 'codec4';
@@ -146,7 +167,8 @@ function renderTable(results: Record<Variant['name'], Numbers>): string {
     ['restart (open after the bulk load)', 'scan_open_ms', seconds],
     ['scan of the bulk table, fresh engine', 'scan_scan_ms', millis],
     ['stat-at, cold (per file)', 'stat_cold_us', micros],
-    ['stat-at, warm (per file)', 'stat_warm_us', micros],
+    ['stat-at, repeated, file not held open (per file)', 'stat_miss_us', micros],
+    ['stat-at, warm, file held open (per file)', 'stat_warm_us', micros],
     ['disk after initdb, st_size', 'init_size', mb],
     ['disk after initdb, allocated', 'init_allocated', mb],
     ['disk after the run, st_size', 'final_size', mb],
@@ -155,6 +177,7 @@ function renderTable(results: Record<Variant['name'], Numbers>): string {
   const at = (n: Numbers, key: string) => n[key] ?? Number.NaN;
   const cell = (n: Numbers, key: string, fmt: (v: number) => string) => {
     const value = at(n, key);
+    if (Number.isNaN(value)) return '—';
     const base = at(results.plaintext, key);
     const ratio = n === results.plaintext || base === 0 ? '' : ` (${(value / base).toFixed(2)}×)`;
     return `${fmt(value)}${ratio}`;
@@ -195,6 +218,7 @@ export async function bench(ctx: Context): Promise<void> {
   await mkdir(logDir, { recursive: true });
   const { plain, encrypted } = await compose(ctx, outDir, pglite, encfs);
 
+  const phases = selectedPhases(ctx.env);
   const key = randomBytes(32).toString('base64');
   const variants: Variant[] = [
     { name: 'plaintext', composed: plain, reservation: false },
@@ -209,7 +233,7 @@ export async function bench(ctx: Context): Promise<void> {
       await mkdir(data);
       if (variant.reservation) await writeFile(join(data, MARKER_FILE), RESERVATION);
       const numbers: Numbers = {};
-      for (const phase of PHASES) {
+      for (const phase of phases) {
         const { wallMs, values } = await runPhase(ctx, logDir, variant, data, phase);
         numbers[`${phase}_wall_ms`] = wallMs;
         for (const [name, value] of Object.entries(values)) numbers[`${phase}_${name}`] = value;

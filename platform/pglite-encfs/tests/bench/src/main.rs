@@ -28,6 +28,9 @@ const WIDE_COMMITS: usize = 200;
 const WIDE_BYTES: usize = 24 * 1024;
 /// README: 200k rows of about 240 bytes (48 MB), then a checkpoint.
 const BULK_ROWS: i64 = 200_000;
+/// Files held open at once in the warm `stat-at` pass: under macOS's default
+/// soft limit of 256 descriptors per process.
+const OPEN_BATCH: usize = 128;
 
 fn ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
@@ -154,8 +157,14 @@ fn scan() {
 }
 
 /// `stat-at` on every relation file of every database, through this
-/// component's own filesystem imports: the first pass is cold (no state
-/// in this instance), the second warm (5.3).
+/// component's own filesystem imports (5.3). Three passes by path:
+/// `cold`, with no state anywhere; `miss`, the same again while nobody
+/// holds the files open, so every call is a full miss (open, the
+/// header-and-records read, the last-pair read; the state is dropped with
+/// the temporary descriptor); and `warm`, with the files held open and
+/// stat'ed once through their descriptors first, so their state is filed
+/// as it is for the segments PostgreSQL has open. The opens are batched
+/// under the host's descriptor limit.
 fn stat() {
     let mut files: Vec<PathBuf> = Vec::new();
     for database in std::fs::read_dir(format!("{ROOT}/data/base")).expect("base") {
@@ -167,23 +176,40 @@ fn stat() {
         }
     }
     files.sort();
-    let pass = || {
+    // Total microseconds and bytes of one by-path pass over `files`.
+    let by_path = |files: &[PathBuf]| {
         let started = Instant::now();
         let bytes: u64 = files
             .iter()
             .map(|file| std::fs::metadata(file).expect("stat").len())
             .sum();
-        (
-            started.elapsed().as_secs_f64() * 1e6 / files.len() as f64,
-            bytes,
-        )
+        (started.elapsed().as_secs_f64() * 1e6, bytes)
     };
-    let (cold_us, bytes) = pass();
-    let (warm_us, again) = pass();
+    let (cold, bytes) = by_path(&files);
+    let (miss, again) = by_path(&files);
     assert_eq!(bytes, again);
+    let (mut warm, mut held_bytes) = (0.0, 0);
+    for batch in files.chunks(OPEN_BATCH) {
+        let held: Vec<std::fs::File> = batch
+            .iter()
+            .map(|file| std::fs::File::open(file).expect("open"))
+            .collect();
+        for file in &held {
+            file.metadata().expect("stat through the descriptor");
+        }
+        let (us, b) = by_path(batch);
+        warm += us;
+        held_bytes += b;
+        drop(held);
+    }
+    assert_eq!(bytes, held_bytes);
+    let per_file = |total: f64| total / files.len() as f64;
     println!(
-        "bench stat files={} cold_us={cold_us:.1} warm_us={warm_us:.1} bytes={bytes}",
-        files.len()
+        "bench stat files={} cold_us={:.1} miss_us={:.1} warm_us={:.1} bytes={bytes}",
+        files.len(),
+        per_file(cold),
+        per_file(miss),
+        per_file(warm),
     );
 }
 

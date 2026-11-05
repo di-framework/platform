@@ -903,7 +903,8 @@ impl<S: Durable, N: Nonces> IntegrityFile<'_, S, N> {
         if physical > end {
             if let Err(error) = self.file.storage.set_len(end) {
                 // The truncate may have happened: the removed units' bits go
-                // with it, and W0 syncs before any bit is trusted again.
+                // with it, whether or not it did (nothing may trust them
+                // again), and W0 syncs before any remaining bit is trusted.
                 self.state.drop_from(remaining);
                 self.state.reload = true;
                 self.state.synced_once = false;
@@ -1711,11 +1712,17 @@ mod tests {
             let syncs = bench.rec.syncs.get();
             bench.rec.fail_set_len.set(Some(truncated));
             assert_eq!(bench.set_size(UNIT + 10), Err(SlotError::Storage(())));
-            assert!(bench.rec.fail_set_len.get().is_none(), "no truncate ran");
+            assert!(
+                bench.rec.fail_set_len.get().is_none(),
+                "set_len was reached"
+            );
             assert!(!bench.state.has_failed());
             let end = PAIRS_START + 2 * PAIR_LEN;
             assert_eq!(bench.rec.size().unwrap() == end, truncated);
             assert_eq!(bench.rec.syncs.get(), syncs);
+            // The cut unit's bits are dropped either way; the kept ones stay.
+            assert!(bench.state.known(2).is_none());
+            assert!(bench.state.known(1).is_some());
             // Re-extend over the cut: W0 first, then the write.
             let at = 2 * UNIT + 5;
             bench.write(at, b"tail").unwrap();
