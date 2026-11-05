@@ -7,6 +7,7 @@ import {
   configFromEnv as controllerConfigFromEnv,
   serveWhoamiListener,
 } from '../../tenant-auth/src/controller';
+import { hostTlsServerName } from '../../tenant-auth/src/v1/proxy';
 import { platformRegistryPullHost } from '../src/insecure-registries';
 import { CA_DAYS, CA_OVERLAP_DAYS, CA_RENEW_DAYS } from '../src/tenancy/ca-rotation';
 import {
@@ -24,6 +25,8 @@ import {
   CA_BUNDLE_ANNOTATION,
   COMPONENT,
   type ControllerConfig,
+  HOST_TLS_ANNOTATION,
+  HOST_TLS_LIMITS,
   INSTALLATION,
   ISSUER_PROXY_IMAGE,
   OWNER,
@@ -248,10 +251,11 @@ describe('tenant-auth quota', () => {
       'limits.cpu': '2',
       'limits.memory': '4Gi',
     });
-    expect(quota(cfg)).toMatchObject({ 'limits.cpu': '2500m', 'limits.memory': '4544Mi' });
+    // The pair's limits plus the hosts' TLS front sidecar (#113), which runs only with tenant-auth.
+    expect(quota(cfg)).toMatchObject({ 'limits.cpu': '2600m', 'limits.memory': '4608Mi' });
     expect(quota(cfg, { resources: { cpu: '3', memory: '1Gi' } })).toMatchObject({
-      'limits.cpu': '3500m',
-      'limits.memory': '1472Mi',
+      'limits.cpu': '3600m',
+      'limits.memory': '1536Mi',
     });
   });
 
@@ -321,8 +325,9 @@ describe('tenantAuthResources', () => {
       expect(d.spec.template.metadata.annotations).toEqual({
         [`${'platform.di-framework.dev'}/image-digest`]: `sha256:${'a'.repeat(64)}`,
         [`${'platform.di-framework.dev'}/tls-cert-sha256`]: tlsCertDigest(tls.cert),
-        // Only the console reads the trust bundle (#170).
-        ...(d === console ? { [CA_BUNDLE_ANNOTATION]: tlsCertDigest(tls.caCert) } : {}),
+        // Both read the trust bundle (#170): the console for kubeconfigs, the controller for
+        // the hosts' TLS front (#113).
+        [CA_BUNDLE_ANNOTATION]: tlsCertDigest(tls.caCert),
       });
       expect(d.spec.template.spec.automountServiceAccountToken).toBe(false);
       expect(d.spec.template.spec.containers[1]?.image).toBe(ISSUER_PROXY_IMAGE);
@@ -457,7 +462,9 @@ describe('tenantAuthResources', () => {
             },
           },
         ],
-        ports: [{ protocol: 'TCP', port: 9191 }],
+        // The hosts' TLS front (#113), the port the controller dials. (Keeping it off wash's
+        // plain 9191 is the controller code's doing: `tenant-auth-network` admits every port.)
+        ports: [{ protocol: 'TCP', port: 9443 }],
       },
       {
         to: [
@@ -1961,12 +1968,12 @@ describe('tenant-auth reconcile ordering (#121)', () => {
     ).toBeDefined();
     expect(tokenNames(api)).toEqual(['di-user-alice']);
     // The tenant step kept the base quota; the tenant-auth step raised it before the pair.
-    const raised = api.patches.indexOf(`${quotaPath} 2500m`);
+    const raised = api.patches.indexOf(`${quotaPath} 2600m`);
     const pair = api.patches.findIndex((p) => p.endsWith('/deployments/tenant-controller'));
     expect(api.patches.indexOf(`${quotaPath} 2`)).toBeLessThan(raised);
     expect(raised).toBeGreaterThan(-1);
     expect(raised).toBeLessThan(pair);
-    expect(cpu(api)).toBe('2500m');
+    expect(cpu(api)).toBe('2600m');
     // Member access still follows Ready alone, as before: a Not-Ready tenant grants no
     // bindings, and tenant-auth succeeding does not change that.
     await controller.reconcileUser(alice, [t]);
@@ -1979,12 +1986,12 @@ describe('tenant-auth reconcile ordering (#121)', () => {
     api.fail = undefined;
     await controller.reconcileTenant(t, [alice]);
     expect(conditions(t).Ready?.status).toBe('True');
-    expect(cpu(api)).toBe('2500m');
+    expect(cpu(api)).toBe('2600m');
     // A steady-state tick with the pair present never lowers the quota to the base value.
     const before = api.patches.length;
     await controller.reconcileTenant(t, [alice]);
     expect(api.patches.slice(before)).not.toContain(`${quotaPath} 2`);
-    expect(cpu(api)).toBe('2500m');
+    expect(cpu(api)).toBe('2600m');
     await controller.reconcileUser(alice, [t]);
     expect(
       [...api.objects.values()].some(
@@ -2018,7 +2025,7 @@ describe('tenant-auth reconcile ordering (#121)', () => {
     expect(c.Ready).toMatchObject({ status: 'False', reason: 'ReconcileError' });
     expect(c.TenantAuthReady).toMatchObject({ status: 'False', reason: 'ReconcileError' });
     // The raise landed, the lowering conflicted, and the next poll retries it.
-    expect(cpu(api)).toBe('2500m');
+    expect(cpu(api)).toBe('2600m');
   });
 });
 
@@ -3147,6 +3154,14 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     (Array.isArray(resources)
       ? find(resources, 'Deployment', 'hostgroup-tenant-alpha')
       : resources.objects.get(hostPath)) as unknown as Deployment;
+  /** The controller leaf the hosts' TLS front serves (#113). */
+  const leafOf = (api: MemoryApi) =>
+    decode(
+      (
+        api.objects.get(path('Secret', 'di-runtime-alpha', 'tenant-controller-tls'))!
+          .data as Record<string, string>
+      )['tls.crt']!,
+    );
   const schedulerSecret = { digest: 'test' };
   const rulesOf = (role: Resource | undefined) =>
     (role as unknown as { rules: { resources: string[]; verbs: string[] }[] }).rules;
@@ -3415,6 +3430,7 @@ describe('tenant registry host pull (#83:host-pull)', () => {
     expect(host(api).spec.template.metadata.annotations).toEqual({
       [SCHEDULER_TLS_ANNOTATION]: schedulerCertDigest(HOST_CERT),
       'platform.di-framework.dev/registry-ca-sha256': tlsCertDigest(ca),
+      [HOST_TLS_ANNOTATION]: tlsCertDigest(leafOf(api)),
     });
     const template = JSON.stringify(host(api).spec.template);
     // The token is kept across reconciles.
@@ -3515,6 +3531,8 @@ describe('tenant registry host pull (#83:host-pull)', () => {
       expect(env(host(api)).DOCKER_CONFIG).toBe('/registry-auth');
       expect(host(api).spec.template.metadata.annotations).toEqual({
         [SCHEDULER_TLS_ANNOTATION]: schedulerCertDigest(HOST_CERT),
+        // The leaf Secret is still there, so the TLS front (#113) is.
+        [HOST_TLS_ANNOTATION]: tlsCertDigest(leafOf(api)),
       });
     } finally {
       api.fail = undefined;
@@ -3681,5 +3699,274 @@ describe('tenant registry host pull (#83:host-pull)', () => {
         .flatMap((r) => r.verbs);
       for (const verb of used) expect(granted).toContain(verb as string);
     }
+  });
+});
+
+describe('tenant hosts TLS front (#113:https-hop)', () => {
+  const DAY = 86_400_000;
+  const hostPath = path('Deployment', 'di-runtime-alpha', 'hostgroup-tenant-alpha');
+  const leafPath = path('Secret', 'di-runtime-alpha', 'tenant-controller-tls');
+  const controllerPath = path('Deployment', 'di-runtime-alpha', 'tenant-controller');
+  const decode = (value: string) => Buffer.from(value, 'base64').toString();
+  const host = (api: MemoryApi) => api.objects.get(hostPath) as unknown as Deployment;
+  const leafOf = (api: MemoryApi) =>
+    decode((api.objects.get(leafPath)!.data as Record<string, string>)['tls.crt']!);
+  const front = (d: Deployment) =>
+    d.spec.template.spec.containers.find((c) => c.name === 'http-tls');
+  const digestOf = (d: Deployment) => d.spec.template.metadata.annotations[HOST_TLS_ANNOTATION];
+  const ports = (resources: Resource[]) =>
+    (find(resources, 'Service', 'di-http') as unknown as { spec: { ports: unknown[] } }).spec.ports;
+  const plainPort = { name: 'http', port: 80, targetPort: 9191 };
+  const silently = async (run: () => Promise<void>) => {
+    const error = console.error;
+    console.error = () => {};
+    try {
+      await run();
+    } finally {
+      console.error = error;
+    }
+  };
+
+  it('renders the front, its leaf volume and the Service port only with a leaf', () => {
+    const plain = tenantResources(tenant(), cfg, { digest: 'test' });
+    const hosts = find(plain, 'Deployment', 'hostgroup-tenant-alpha') as unknown as Deployment;
+    expect(front(hosts)).toBeUndefined();
+    expect(JSON.stringify(hosts.spec.template.spec.volumes)).not.toContain('tenant-controller-tls');
+    expect(hosts.spec.template.metadata.annotations).not.toHaveProperty(HOST_TLS_ANNOTATION);
+    expect(ports(plain)).toEqual([plainPort]);
+
+    const secured = tenantResources(
+      tenant(),
+      cfg,
+      { digest: 'test' },
+      [],
+      true,
+      false,
+      false,
+      undefined,
+      undefined,
+      [],
+      { leafDigest: 'leaf' },
+    );
+    const withFront = find(
+      secured,
+      'Deployment',
+      'hostgroup-tenant-alpha',
+    ) as unknown as Deployment;
+    // socat (the pinned issuer-proxy image) terminates TLS with the controller leaf and relays to
+    // wash's listener on loopback; a plain client of the front is refused by the handshake.
+    expect(front(withFront)).toEqual({
+      name: 'http-tls',
+      image: ISSUER_PROXY_IMAGE,
+      args: [
+        // `max-children` bounds the forks (one per connection) under the sidecar's memory limit.
+        'OPENSSL-LISTEN:9443,fork,max-children=64,reuseaddr,cert=/host-tls/tls.crt,key=/host-tls/tls.key,verify=0',
+        'TCP:127.0.0.1:9191',
+      ],
+      ports: [{ name: 'https', containerPort: 9443 }],
+      readinessProbe: { tcpSocket: { port: 'https' } },
+      resources: { requests: { cpu: '10m', memory: '16Mi' }, limits: HOST_TLS_LIMITS },
+      securityContext: {
+        allowPrivilegeEscalation: false,
+        readOnlyRootFilesystem: true,
+        capabilities: { drop: ['ALL'] },
+      },
+      volumeMounts: [{ name: 'host-tls', mountPath: '/host-tls', readOnly: true }],
+    } as unknown as Deployment['spec']['template']['spec']['containers'][number]);
+    // wash itself is unchanged: its plain listener stays for the gateway, and it never sees the key.
+    const wash = withFront.spec.template.spec.containers[0]!;
+    expect(wash.name).toBe('host');
+    expect(wash.args).toContain('--http-addr=0.0.0.0:9191');
+    expect(wash.volumeMounts.some((mount) => mount.name === 'host-tls')).toBe(false);
+    expect(withFront.spec.template.spec.volumes).toContainEqual({
+      name: 'host-tls',
+      secret: {
+        secretName: 'tenant-controller-tls',
+        defaultMode: 0o440,
+        items: [
+          { key: 'tls.crt', path: 'tls.crt' },
+          { key: 'tls.key', path: 'tls.key' },
+        ],
+      },
+    });
+    expect(digestOf(withFront)).toBe('leaf');
+    expect(ports(secured)).toEqual([plainPort, { name: 'https', port: 443, targetPort: 9443 }]);
+  });
+
+  it('points the controller at the TLS port only and gives it the trust bundle', () => {
+    const resources = tenantAuthResources(tenant(), cfg, inputs);
+    const controller = find(resources, 'Deployment', 'tenant-controller') as Deployment;
+    expect(env(controller).TENANT_CONTROLLER_HOST_CA).toBe('/ca/ca.crt');
+    expect(controller.spec.template.spec.containers[0]!.volumeMounts).toContainEqual({
+      name: 'ca',
+      mountPath: '/ca',
+      readOnly: true,
+    });
+    expect(controller.spec.template.spec.volumes).toContainEqual({
+      name: 'ca',
+      configMap: { name: 'tenant-controller-ca' },
+    });
+    // The console keeps its own bundle mount; only the controller gains the `ca` volume.
+    const console = find(resources, 'Deployment', 'tenant-console') as Deployment;
+    expect(console.spec.template.spec.volumes.some((v) => v.name === 'ca')).toBe(false);
+    // The controller's egress rule to the hosts names the front's port. (What keeps credentials
+    // off wash's 9191 is that the controller dials https only; the same-tenant egress rule of
+    // `tenant-auth-network` admits every port.)
+    const toHosts = egress(resources).filter((rule) =>
+      JSON.stringify(rule).includes('wasmcloud.com/hostgroup'),
+    ) as { ports: { port: number }[] }[];
+    expect(toHosts.flatMap((rule) => rule.ports.map((p) => p.port))).toEqual([9443]);
+    // The front is checked for the controller's own Service name, which the leaf always has:
+    // no `di-http` name is added, so no CA rotation (#365) stands between an upgrade and the hop.
+    const names = tenantControllerCertNames('alpha').dns;
+    expect(names).toContain(hostTlsServerName('alpha'));
+    expect(names.some((name) => name.startsWith('di-http'))).toBe(false);
+  });
+
+  it('counts the front sidecar once per host replica in the runtime quota', () => {
+    const render = (spec: Tenant['spec']) =>
+      tenantResources(
+        tenant(spec),
+        cfg,
+        { digest: 'test' },
+        [],
+        true,
+        false,
+        false,
+        undefined,
+        undefined,
+        [],
+        { leafDigest: 'leaf' },
+      );
+    const quota = (resources: Resource[]) =>
+      (
+        find(resources, 'ResourceQuota', 'di-runtime-quota') as unknown as {
+          spec: { hard: Record<string, string> };
+        }
+      ).spec.hard;
+    const scaled = render({ runtime: { replicas: 3 } });
+    const hosts = find(scaled, 'Deployment', 'hostgroup-tenant-alpha') as unknown as Deployment;
+    expect(hosts.spec.replicas).toBe(3);
+    // The pair's limits plus the sidecar's, once per host pod.
+    let cpu = addQuantity('2', TENANT_AUTH_LIMITS.cpu, 'm');
+    let memory = addQuantity('4Gi', TENANT_AUTH_LIMITS.memory, 'Mi');
+    const sidecar = front(hosts) as unknown as {
+      resources: { limits: { cpu: string; memory: string } };
+    };
+    for (let i = 0; i < hosts.spec.replicas; i++) {
+      cpu = addQuantity(cpu, sidecar.resources.limits.cpu, 'm');
+      memory = addQuantity(memory, sidecar.resources.limits.memory, 'Mi');
+    }
+    expect(quota(scaled)).toMatchObject({ 'limits.cpu': cpu, 'limits.memory': memory });
+    expect(quota(scaled)).toMatchObject({ 'limits.cpu': '2800m', 'limits.memory': '4736Mi' });
+    // Suspended, the hosts are scaled to zero and nothing is counted for them.
+    expect(quota(render({ runtime: { replicas: 3 }, suspended: true }))).toMatchObject({
+      'limits.cpu': '2500m',
+      'limits.memory': '4544Mi',
+    });
+  });
+
+  it('serves a tenant from before this change with its existing leaf: no reissue, no rotation', async () => {
+    // The stored leaf names the controller, not `di-http`: exactly what an upgrade finds.
+    const { api, t } = prepare();
+    const controller = new Controller(api, cfg);
+    await controller.reconcileTenant(t, []);
+    const leaf = leafOf(api);
+    const names = certificateNames(leaf)?.dns ?? [];
+    expect(names).toContain(hostTlsServerName('alpha'));
+    expect(names.some((name) => name.startsWith('di-http'))).toBe(false);
+    // The next pass renders the front with that leaf: the hosts roll once, the leaf stays.
+    await controller.reconcileTenant(t, []);
+    expect(front(host(api))).toBeDefined();
+    expect(digestOf(host(api))).toBe(tlsCertDigest(leaf));
+    expect(leafOf(api)).toBe(leaf);
+    const bundle = (
+      api.objects.get(path('ConfigMap', 'di-runtime-alpha', 'tenant-controller-ca'))!
+        .data as Record<string, string>
+    )['ca.crt']!;
+    expect(bundle.split('-----BEGIN CERTIFICATE-----').length - 1).toBe(1);
+    const template = JSON.stringify(host(api).spec.template);
+    await controller.reconcileTenant(t, []);
+    expect(leafOf(api)).toBe(leaf);
+    expect(JSON.stringify(host(api).spec.template)).toBe(template);
+  });
+
+  it('wires the front once the leaf exists and rolls the hosts when the leaf is renewed', async () => {
+    const { api, t } = prepare();
+    let clock = new Date('2026-10-14T00:00:00Z');
+    const controller = new Controller(api, cfg, undefined, () => clock);
+    await controller.reconcileTenant(t, []);
+    // The tenant step ran before the leaf existed; the tenant-auth step issued it.
+    expect(front(host(api))).toBeUndefined();
+    expect(api.objects.get(leafPath)).toBeDefined();
+    await controller.reconcileTenant(t, []);
+    const first = leafOf(api);
+    expect(front(host(api))).toBeDefined();
+    expect(digestOf(host(api))).toBe(tlsCertDigest(first));
+    expect(
+      env(api.objects.get(controllerPath) as unknown as Deployment).TENANT_CONTROLLER_HOST_CA,
+    ).toBe('/ca/ca.crt');
+    // Steady state: the template does not move.
+    const template = JSON.stringify(host(api).spec.template);
+    await controller.reconcileTenant(t, []);
+    expect(JSON.stringify(host(api).spec.template)).toBe(template);
+    // The leaf is renewed 30 days before it expires; the hosts roll onto its digest next pass.
+    clock = new Date(clock.getTime() + 340 * DAY);
+    await controller.reconcileTenant(t, []);
+    await controller.reconcileTenant(t, []);
+    const renewed = leafOf(api);
+    expect(renewed).not.toBe(first);
+    expect(digestOf(host(api))).toBe(tlsCertDigest(renewed));
+  });
+
+  it('keeps the front while the leaf Secret is missing, and drops it without a known leaf', async () => {
+    const { api, t } = prepare();
+    const controller = new Controller(api, cfg);
+    await controller.reconcileTenant(t, []);
+    await controller.reconcileTenant(t, []);
+    const template = JSON.stringify(host(api).spec.template);
+    expect(template).toContain(HOST_TLS_ANNOTATION);
+    await silently(async () => {
+      // Deleted to reissue, and the tenant-auth step cannot recreate it this tick.
+      api.fail = (method, p) =>
+        method === 'PATCH' && p === leafPath ? new ApiError(500, 'boom') : undefined;
+      api.objects.delete(leafPath);
+      await controller.reconcileTenant(t, []);
+      expect(JSON.stringify(host(api).spec.template)).toBe(template);
+      // A restarted controller reads the last digest from the host template.
+      await new Controller(api, cfg).reconcileTenant(t, []);
+      expect(JSON.stringify(host(api).spec.template)).toBe(template);
+      // With neither a leaf nor a template, the hosts have no front and the quota stays raised.
+      api.objects.delete(hostPath);
+      await new Controller(api, cfg).reconcileTenant(t, []);
+      expect(front(host(api))).toBeUndefined();
+      expect(digestOf(host(api))).toBeUndefined();
+    });
+    api.fail = undefined;
+    // Once the Secret is back, so is the front.
+    await controller.reconcileTenant(t, []);
+    await controller.reconcileTenant(t, []);
+    expect(digestOf(host(api))).toBe(tlsCertDigest(leafOf(api)));
+    // Without tenant-auth there is no controller to serve, so no front.
+    await new Controller(api, { ...cfg, tenantAuth: undefined }).reconcileTenant(t, []);
+    expect(front(host(api))).toBeUndefined();
+  });
+
+  it('leaves the hosts without a front for a leaf Secret this installation did not write', async () => {
+    const { api, t } = prepare();
+    api.seed({
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: {
+        name: 'tenant-controller-tls',
+        namespace: 'di-runtime-alpha',
+        labels: { [COMPONENT]: 'tenant-auth', [TENANT]: 'alpha' },
+      },
+      type: 'kubernetes.io/tls',
+      data: { 'tls.crt': Buffer.from(tls.cert).toString('base64') },
+    } as Resource);
+    await silently(() => new Controller(api, cfg).reconcileTenant(t, []));
+    expect(front(host(api))).toBeUndefined();
+    expect(digestOf(host(api))).toBeUndefined();
   });
 });

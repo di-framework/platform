@@ -103,6 +103,8 @@ import {
   type Condition,
   type ControllerConfig,
   FINALIZER,
+  HOST_TLS_ANNOTATION,
+  type HostHttpTls,
   type HostPull,
   INSTALLATION,
   NAMESPACE_ROLE,
@@ -1079,7 +1081,10 @@ export class Controller {
     // One GET per Secret: several keys are decoded from each.
     const secret = async (namespace: string, secretName: string) => {
       const path = `${collection('v1', 'Secret', namespace)}/${secretName}`;
-      const value = await this.get<Resource & { data?: Record<string, string> }>(path);
+      // The tenant step may have read the leaf Secret already this pass (`hostHttpTls`).
+      const value = fetched.has(path)
+        ? (fetched.get(path) as (Resource & { data?: Record<string, string> }) | undefined)
+        : await this.get<Resource & { data?: Record<string, string> }>(path);
       fetched.set(path, value);
       return value;
     };
@@ -1207,12 +1212,40 @@ export class Controller {
     if (cert) return { caDigest: tlsCertDigest(cert) };
     const known =
       this.hostPulls.get(tenant.metadata.name)?.caDigest ??
-      (
-        await this.get<{ spec?: { template?: { metadata?: Resource['metadata'] } } }>(
-          `${collection('apps/v1', 'Deployment', n.runtimeNamespace)}/hostgroup-${n.hostgroup}`,
-        )
-      )?.spec?.template?.metadata?.annotations?.[REGISTRY_CA_ANNOTATION];
+      (await this.hostTemplateAnnotation(n, REGISTRY_CA_ANNOTATION));
     return known ? { caDigest: known } : {};
+  }
+  /**
+   * The hosts' TLS front (#113 `:https-hop`): rendered while tenant-auth is configured and
+   * `tenant-controller-tls`, written by this installation for the Tenant, holds a leaf; its digest
+   * rolls the hosts when the leaf changes. While the Secret is missing (deleted to reissue the
+   * leaf) the digest the host template carries is kept, so the hosts roll once, onto the new leaf.
+   */
+  private async hostHttpTls(
+    tenant: Tenant,
+    /** The pass's reads, so the tenant-auth step reads the Secret once per pass (#170). */
+    fetched: Map<string, Resource | undefined>,
+  ): Promise<HostHttpTls | undefined> {
+    if (!this.cfg.tenantAuth) return undefined;
+    const n = names(tenant.metadata.name);
+    const path = `${collection('v1', 'Secret', n.runtimeNamespace)}/tenant-controller-tls`;
+    const secret = await this.get<Resource & { data?: Record<string, string> }>(path);
+    fetched.set(path, secret);
+    const cert = secret && this.ownsCopy(secret, tenant) ? secret.data?.['tls.crt'] : undefined;
+    if (cert) return { leafDigest: tlsCertDigest(Buffer.from(cert, 'base64').toString()) };
+    const known = await this.hostTemplateAnnotation(n, HOST_TLS_ANNOTATION);
+    return known ? { leafDigest: known } : undefined;
+  }
+  /** An annotation of the live host template; undefined without the Deployment or the annotation. */
+  private async hostTemplateAnnotation(
+    n: ReturnType<typeof names>,
+    annotation: string,
+  ): Promise<string | undefined> {
+    return (
+      await this.get<{ spec?: { template?: { metadata?: Resource['metadata'] } } }>(
+        `${collection('apps/v1', 'Deployment', n.runtimeNamespace)}/hostgroup-${n.hostgroup}`,
+      )
+    )?.spec?.template?.metadata?.annotations?.[annotation];
   }
   /** Set once the host image warning (#159) has been logged. */
   private registryNatsWarned = false;
@@ -1591,6 +1624,8 @@ export class Controller {
     }
     const hostsKnown = !hostPullFailure || this.hostPulls.has(tenant.metadata.name);
     const registryNats = await this.registryNats(tenant);
+    // Objects read this pass, shared with the tenant-auth step so it reads each once.
+    const fetched = new Map<string, Resource | undefined>();
     // The quota keeps the tenant-auth addition only while its Deployments exist; the
     // tenant-auth step below is the one that raises it (#121).
     const desired = tenantResources(
@@ -1604,6 +1639,7 @@ export class Controller {
       hostPull,
       registryNats,
       storage.reserve,
+      await this.hostHttpTls(tenant, fetched),
     ).filter(
       (value) =>
         hostsKnown ||
@@ -1702,7 +1738,7 @@ export class Controller {
     const identity = await this.identities.reconcile(tenant);
     // Tenant-auth is independent of the tenant's own objects: a failed apply above (such as a
     // hostgroup 409) must not keep it from reconciling or from reporting TenantAuthReady (#121).
-    let auth = await this.reconcileTenantAuth(tenant, users);
+    let auth = await this.reconcileTenantAuth(tenant, users, fetched);
     if (hostPullFailure && auth) auth = withHostPullFailure(auth, hostPullFailure);
     // A projection ConfigMap that keeps failing to be written (#316); absent otherwise.
     const logs = logWriteCondition(
@@ -1901,6 +1937,8 @@ export class Controller {
   private async reconcileTenantAuth(
     tenant: Tenant,
     users: User[] | undefined,
+    /** Objects the tenant step read this pass, reused by the inputs and the adoption check. */
+    fetched: Map<string, Resource | undefined>,
   ): Promise<Condition | undefined> {
     const condition = (ok: boolean, reason: string, message: string): Condition => ({
       type: 'TenantAuthReady',
@@ -1929,8 +1967,6 @@ export class Controller {
       const legacyApiKeys = !apiKeys.done;
       const registry = await this.registryState(tenant);
       const registryNats = await this.registryNats(tenant);
-      // Objects read while computing the inputs, reused by the adoption check below.
-      const fetched = new Map<string, Resource | undefined>();
       const desired = tenantAuthResources(tenant, this.cfg, {
         ...(await this.tenantAuthInputs(
           tenant,

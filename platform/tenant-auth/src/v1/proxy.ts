@@ -4,6 +4,7 @@
  * URL is not a contract operation. HTTP only; WebSocket and SPDY need a contract extension.
  */
 import { randomBytes } from 'node:crypto';
+import { checkServerIdentity } from 'node:tls';
 import { problem } from '@di-framework/tenant-cli/src/api/handlers.ts';
 import { MAX_BODY_BYTES } from '@di-framework/tenant-cli/src/api/routes.ts';
 import type { Principal } from '../identity.ts';
@@ -108,11 +109,41 @@ export class ProxySessions {
 export const proxySessions = new ProxySessions();
 
 /**
- * The tenant's HTTP upstream, as in `tenantUpstream` of `platform/src/gateway/gateway.ts`.
- * The controller needs NetworkPolicy egress to the hostgroup pods' port 9191 (platform#58).
+ * The tenant's HTTP upstream: the same `di-http` Service the platform gateway uses
+ * (`tenantUpstream` of `platform/src/gateway/gateway.ts`), on its TLS port (platform#113
+ * `:https-hop`), which the hosts' TLS front serves with the controller certificate. The
+ * controller needs NetworkPolicy egress to the hostgroup pods' port 9443 (platform#58) and
+ * verifies the front with `TENANT_CONTROLLER_HOST_CA` ({@link UpstreamTls}).
  */
 export const tenantUpstream = (tenant: string) =>
-  `http://di-http.di-runtime-${tenant}.svc.cluster.local:80`;
+  `https://di-http.di-runtime-${tenant}.svc.cluster.local:443`;
+
+/** How the hosts' TLS front is verified (platform#113): the tenant CA bundle and the leaf's name. */
+export interface UpstreamTls {
+  /** PEM bundle: the tenant CA, plus the other CA during a rotation. */
+  ca: string;
+  /** The name the front's certificate is checked for, instead of the URL's host. */
+  serverName: string;
+}
+
+/**
+ * The name the front's certificate is checked for: the controller's own Service, which the
+ * controller certificate always names, since the front serves that very certificate. So no name
+ * is added to the certificate for the `di-http` host the controller dials, and no CA rotation
+ * (whose name constraints would have to admit it) stands between an upgrade and a working hop.
+ */
+export const hostTlsServerName = (tenant: string) => `tenant-controller.di-runtime-${tenant}.svc`;
+
+/** Bun `fetch` TLS options for `tls`; none without it (the system roots and the URL's host). */
+export function upstreamTlsOptions(
+  tls: UpstreamTls | undefined,
+): { ca: string; checkServerIdentity: typeof checkServerIdentity } | undefined {
+  if (!tls) return undefined;
+  return {
+    ca: tls.ca,
+    checkServerIdentity: (_host, cert) => checkServerIdentity(tls.serverName, cert),
+  };
+}
 
 /**
  * Caller headers never forwarded to a service: credentials, identity, workload control,
@@ -239,6 +270,8 @@ export interface PassthroughOptions {
   tenant: string;
   principal: Principal;
   upstream: string;
+  /** How `upstream` is verified (platform#113). Unset: the system roots and the URL's host. */
+  tls?: UpstreamTls;
   audit(event: string, fields?: Record<string, unknown>): void;
   sessions?: ProxySessions;
   /** The idle timeout: how long the service may stay silent. */
@@ -300,7 +333,8 @@ export async function servePassthrough(
       // Pass encoded bytes through with their Content-Encoding intact.
       decompress: false,
       signal: idle.signal,
-    });
+      tls: upstreamTlsOptions(options.tls),
+    } as RequestInit);
   } catch (error) {
     disarm();
     options.audit('request.failed', {
