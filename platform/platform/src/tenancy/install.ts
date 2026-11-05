@@ -67,6 +67,7 @@ export const CONTROLLER_SCRIPT_MODULES = [
   'ca-rotation',
   'registry-nats',
   'resources',
+  'oauth-clients',
   'backing-service-reconcile',
   'service-binding-reconcile',
   'postgres',

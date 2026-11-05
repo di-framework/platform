@@ -1,16 +1,16 @@
 /**
  * Per-tenant OAuth clients (#59). Each tenant gets two clients in the identity server instead of
- * sharing the bootstrap `tenantAuth.oauthClient`: a confidential one for its console and a public
- * PKCE one for its CLI. Tenancy reconcile registers them through {@link OAuthClientRegistry}, an
- * injected seam, and removes them with the tenant.
+ * sharing the bootstrap `access` client: a confidential one for its console, whose secret lives in
+ * the tenant's `tenant-console-oauth` Secret ({@link CONSOLE_OAUTH_SECRET}), and a public PKCE one
+ * for its CLI, which the tenant controller names through `TENANT_CONTROLLER_CLI_CLIENT_ID`. Tenancy
+ * reconcile registers them through {@link OAuthClientRegistry} and removal step R6 revokes them.
  *
- * The contract follows the identity-server admin API (`/api/admin/oauth-clients`, schemas
- * `CreateOAuthClientRequest`, `OAuthClientResponse`, `OAuthClientSecretResponse`,
- * `RotateOAuthClientSecretRequest`) plus the fields di-framework/identity-server#48 proposes:
- * `audiences[]`, public PKCE clients, and a required `organizationSlug`. #48 has not merged, so
- * the wire names of those additions (`audiences`, `public`) are provisional. Until it is released
- * (gate G05) the tests run the contract against a fake admin API; nothing in the controller calls
- * this module yet. {@link PROVISIONAL_48} lists every guess made ahead of #48.
+ * The contract is the identity-server admin API, `/api/admin/oauth-clients` as
+ * di-framework/identity-server#48 ships it (`docs/admin-oauth-clients.md` there): `audiences[]`
+ * (token `aud` values), `tokenEndpointAuthMethod` (`client_secret_basic`, the default, or `none`
+ * for a public PKCE client on loopback `http` redirects), a required `organizationSlug`, and
+ * keyed creates and rotations. The tests run the contract against a fake admin API and, opt-in,
+ * against a real identity server (`oauth-clients.test.ts`).
  *
  * Idempotency: create and rotate send an `Idempotency-Key` derived from the tenant uid, the client
  * role and (for rotate) the rotation version ({@link tenantIdempotencyKey}). The identity server
@@ -20,32 +20,34 @@
  * Known limits:
  * - Drift is not corrected: an existing client's redirect URIs, scopes, audiences and organization
  *   are never compared with the spec. The admin API has `PUT /api/admin/oauth-clients/:id`
- *   (`UpdateOAuthClientRequest`); the wiring milestone adds `update` to the seam when it needs it.
+ *   (`UpdateOAuthClientRequest`, which needs `organizationSlug` and cannot change the auth
+ *   method); the seam gains `update` when something needs it.
  * - `delete` treats 404 as success, so a `baseUrl` with a wrong path prefix (the router answers
  *   404 for unknown `/api/*` paths) makes deletes look successful. `baseUrl` must be the origin.
  */
+import type { TenantAuthConfig } from './resources';
+import { tenantConsolePublicUrl, tenantControllerPublicUrl } from './resources';
 
-/**
- * Everything this module and the fake assume ahead of di-framework/identity-server#48. Adjust these
- * (and the cases marked `#48 provisional` in the contract suite) when #48 merges (G05).
- */
-export const PROVISIONAL_48 = [
-  'request/response field `audiences` (token aud values)',
-  'request/response field `public` (token endpoint auth `none`, no secret)',
-  '`organizationSlug` required on create (today the server stores null when missing)',
-  'rotating a public client answers 409 (today the server rotates it)',
-] as const;
+/** The runtime-namespace Secret holding the console client's id and secret. */
+export const CONSOLE_OAUTH_SECRET = 'tenant-console-oauth';
+/** What the console and the CLI request; both bootstrap clients had the same scopes. */
+export const TENANT_OAUTH_SCOPES = ['openid', 'profile', 'email', 'offline_access'] as const;
+/** The CLI's loopback callback; the port is matched at authorize time (RFC 8252). */
+export const CLI_REDIRECT_URI = 'http://127.0.0.1/callback';
 
 /** A client the registry should hold. */
 export interface OAuthClientSpec {
   clientId: string;
-  /** The tenant the client belongs to; #48 makes it required for tenant clients. */
+  /** The tenant the client belongs to; required by the admin API. */
   organizationSlug: string;
   redirectUris: string[];
   scopes: string[];
-  /** Token `aud` values (#48); the identity server defaults to `[clientId]`. */
+  /** Token `aud` values; the identity server defaults to `[clientId]`. */
   audiences: string[];
-  /** A public PKCE client (token endpoint auth `none`, #48) has no secret. */
+  /**
+   * A public PKCE client (`tokenEndpointAuthMethod: none`) has no secret; its redirect URIs must
+   * be loopback `http` URIs.
+   */
   public: boolean;
 }
 
@@ -146,6 +148,20 @@ export interface TenantOAuthOptions {
   audiences: string[];
 }
 
+/**
+ * The options reconcile registers a tenant's clients with: the console's `/oidc/callback` on its
+ * public URL, the CLI's loopback callback, the scopes both request, and the tenant controller's
+ * public URL as the token audience (it is the resource server both clients call).
+ */
+export function tenantOAuthOptions(tenant: string, auth: TenantAuthConfig): TenantOAuthOptions {
+  return {
+    consoleRedirectUris: [`${tenantConsolePublicUrl(tenant, auth)}/oidc/callback`],
+    cliRedirectUris: [CLI_REDIRECT_URI],
+    scopes: [...TENANT_OAUTH_SCOPES],
+    audiences: [tenantControllerPublicUrl(tenant, auth)],
+  };
+}
+
 /** The two clients a tenant should have. */
 export function tenantOAuthClients(
   tenant: TenantRef,
@@ -169,13 +185,31 @@ export function tenantOAuthClients(
 }
 
 /**
+ * The console secret `tenant-console-oauth` holds for `consoleClientId` (base64, as Secret data),
+ * or `undefined` when the Secret is missing, holds another client's secret (a tenant recreated
+ * under the same name in a retained namespace) or has none.
+ */
+export function storedConsoleSecret(
+  data: Record<string, string> | undefined,
+  consoleClientId: string,
+): string | undefined {
+  const clientId = Buffer.from(data?.clientId ?? '', 'base64').toString();
+  return clientId === consoleClientId && data?.clientSecret ? data.clientSecret : undefined;
+}
+
+/**
  * Makes sure the tenant's clients exist. A new console client returns its secret; an existing one
  * returns none unless `consoleSecretStored` is false (the secret was never stored, e.g. reconcile
  * stopped between create and writing `tenant-console-oauth`), in which case it is rotated to
  * `rotationVersion`. Creates and rotations are keyed, so a concurrent or repeated reconcile gets
- * the same secret back; a create that still loses a race (409) re-reads the client and carries on.
- * A revoked client throws {@link OAuthClientRevoked}: its id cannot be reused. The CLI client is
- * ensured first so a failure there cannot strand a fresh console secret.
+ * the same secret back. A keyed create that answers 409 is retried once before the client is
+ * re-read: on a database that commits every statement on its own (the wasmCloud guest) a create
+ * that loses a race with another reconcile's can answer 409 while the winner's idempotency record
+ * is not committed yet, and re-reading at once would rotate a console secret the winner is about
+ * to store. The retry replays the winner's 201 with the same secret; a 409 that persists (the id
+ * is taken under another key) re-reads the client and carries on. A revoked client throws
+ * {@link OAuthClientRevoked}: its id cannot be reused. The CLI client is ensured first so a
+ * failure there cannot strand a fresh console secret.
  */
 export async function ensureTenantOAuthClients(
   registry: OAuthClientRegistry,
@@ -196,37 +230,52 @@ export async function ensureTenantOAuthClients(
   const ensure = async (spec: OAuthClientSpec, role: 'console' | 'cli', needSecret: boolean) => {
     const found = await existing(spec, role, needSecret);
     if (found) return found;
-    try {
-      return await registry.create(spec, tenantIdempotencyKey(tenant, role, 'create'));
-    } catch (error) {
-      if (!(error instanceof OAuthClientConflict)) throw error;
-      const raced = await existing(spec, role, needSecret);
-      if (raced) return raced;
-      throw error;
+    const key = tenantIdempotencyKey(tenant, role, 'create');
+    let conflict: OAuthClientConflict | undefined;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await registry.create(spec, key);
+      } catch (error) {
+        if (!(error instanceof OAuthClientConflict)) throw error;
+        conflict = error;
+      }
     }
+    const raced = await existing(spec, role, needSecret);
+    if (raced) return raced;
+    throw conflict;
   };
   const cli = await ensure(specs.cli, 'cli', false);
   return { console: await ensure(specs.console, 'console', !options.consoleSecretStored), cli };
 }
 
-/** Revokes the tenant's clients; safe to repeat. */
+/**
+ * Revokes the tenant's clients, each on its own, and returns the ones that could not be revoked
+ * with why. Safe to repeat: a revoked or unknown id succeeds.
+ */
 export async function removeTenantOAuthClients(
   registry: OAuthClientRegistry,
   tenant: TenantRef,
-): Promise<void> {
+): Promise<{ clientId: string; error: unknown }[]> {
   const ids = tenantOAuthClientIds(tenant);
-  await registry.delete(ids.console);
-  await registry.delete(ids.cli);
+  const failed: { clientId: string; error: unknown }[] = [];
+  for (const clientId of [ids.console, ids.cli]) {
+    try {
+      await registry.delete(clientId);
+    } catch (error) {
+      failed.push({ clientId, error });
+    }
+  }
+  return failed;
 }
 
-/** `OAuthClientResponse` with the #48 additions. */
+/** `OAuthClientResponse` as identity-server#48 answers it. */
 interface OAuthClientResponse {
   client_id: string;
   organization_slug?: string | null;
   redirect_uris?: string[];
   scopes?: string[];
   audiences?: string[];
-  public?: boolean;
+  token_endpoint_auth_method?: 'client_secret_basic' | 'none';
   revoked_at?: string | null;
   created_at?: string;
 }
@@ -238,8 +287,13 @@ export interface HttpOAuthClientRegistryOptions {
    * path prefix answers 404, which `get` reports as missing and `delete` as success.
    */
   baseUrl: string;
-  /** The admin bearer token (the provisioner token in reconcile). */
+  /** The admin bearer token (the provisioner client's in reconcile). */
   token: () => string | Promise<string>;
+  /**
+   * Called when the admin API answers 401 for a token; the request is then sent once more with a
+   * fresh `token()`. For a cached token the identity server no longer knows (it restarted).
+   */
+  forgetToken?: () => void;
   fetch?: (request: Request) => Promise<Response>;
 }
 
@@ -257,7 +311,7 @@ export class HttpOAuthClientRegistry implements OAuthClientRegistry {
       redirectUris: spec.redirectUris,
       scopes: spec.scopes,
       audiences: spec.audiences,
-      public: spec.public,
+      tokenEndpointAuthMethod: spec.public ? 'none' : 'client_secret_basic',
       browser: spec.redirectUris.length > 0,
     });
     return credentials(response, await response.json(), spec.public);
@@ -274,7 +328,7 @@ export class HttpOAuthClientRegistry implements OAuthClientRegistry {
       redirectUris: body.redirect_uris ?? [],
       scopes: body.scopes ?? [],
       audiences: body.audiences ?? [],
-      public: body.public ?? false,
+      public: body.token_endpoint_auth_method === 'none',
       ...(body.revoked_at ? { revokedAt: body.revoked_at } : {}),
       ...(body.created_at ? { createdAt: body.created_at } : {}),
     };
@@ -301,31 +355,43 @@ export class HttpOAuthClientRegistry implements OAuthClientRegistry {
     body?: unknown,
     allowed: number[] = [],
   ): Promise<Response> {
-    let origin = this.options.baseUrl;
-    while (origin.endsWith('/')) origin = origin.slice(0, -1);
-    const url = `${origin}/api/admin/oauth-clients${path}`;
+    const url = `${trimSlashes(this.options.baseUrl)}/api/admin/oauth-clients${path}`;
+    let response = await this.send(method, url, idempotencyKey, body);
+    if (response.status === 401 && this.options.forgetToken) {
+      this.options.forgetToken();
+      response = await this.send(method, url, idempotencyKey, body);
+    }
+    if (response.ok || allowed.includes(response.status)) return response;
+    throw oauthAdminError(response.status, `${method} ${url}: HTTP ${response.status}`);
+  }
+
+  private async send(
+    method: string,
+    url: string,
+    idempotencyKey: string | undefined,
+    body: unknown,
+  ): Promise<Response> {
     const headers: Record<string, string> = {
       authorization: `Bearer ${await this.options.token()}`,
       accept: 'application/json',
     };
     if (body !== undefined) headers['content-type'] = 'application/json';
     if (idempotencyKey) headers['idempotency-key'] = idempotencyKey;
-    const response = await this.fetch(
+    return this.fetch(
       new Request(url, {
         method,
         headers,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       }),
     );
-    if (response.ok || allowed.includes(response.status)) return response;
-    throw oauthAdminError(response.status, `${method} ${url}: HTTP ${response.status}`);
   }
 }
 
 /**
  * The credentials in a create or rotate response. A public client must come back without a secret
  * and a confidential one with it; anything else means the server did not create what was asked
- * (e.g. a server before #48 ignores `public`), so it fails instead of dropping or missing a secret.
+ * (e.g. a server before #48 ignores the auth method), so it fails instead of dropping or missing a
+ * secret.
  */
 function credentials(response: Response, body: unknown, isPublic: boolean): OAuthClientCredentials {
   const value = body as { client_id: string; client_secret?: string };
@@ -339,4 +405,112 @@ function credentials(response: Response, body: unknown, isPublic: boolean): OAut
       `${where}: no client_secret for a confidential client`,
     );
   return { clientId: value.client_id, clientSecret: value.client_secret };
+}
+
+function trimSlashes(url: string): string {
+  let result = url;
+  while (result.endsWith('/')) result = result.slice(0, -1);
+  return result;
+}
+
+/** How the platform controller reaches the identity server and authenticates to its admin API. */
+export interface IdentityAdminOptions {
+  /** The issuer (`tenantAuth.issuer`): the token endpoint and the admin API live under it. */
+  issuer: string;
+  /**
+   * `tenantAuth.issuerUpstream`: the in-cluster `host[:port]` that requests to a loopback issuer
+   * are sent to instead, keeping the issuer's `Host` so the gateway routes them as a browser's.
+   */
+  upstream?: string;
+  /** The provisioner client (`AUTH_PROVISIONER_CLIENT_ID`); its secret is read when a token is minted. */
+  clientId: string;
+  clientSecret: () => Promise<string>;
+  fetch?: (request: Request) => Promise<Response>;
+  now?: () => number;
+}
+
+/** What the admin API needs: `admin:read` for reads and `admin:write` for writes. */
+export const ADMIN_SCOPE = 'admin:read admin:write';
+/** A token is minted again this long before it expires. */
+const TOKEN_SLACK_MS = 30_000;
+
+/**
+ * `fetch` with every request to the issuer's host sent to `upstream` instead, under the original
+ * `Host` header; without `upstream`, `fetcher` as given.
+ */
+export function upstreamFetch(
+  upstream: string | undefined,
+  fetcher: (request: Request) => Promise<Response> = (request) => fetch(request),
+): (request: Request) => Promise<Response> {
+  if (!upstream) return fetcher;
+  const [, hostname = '', port = ''] = /^(\[[^\]]+\]|[^:]+)(?::(\d+))?$/.exec(upstream) ?? [];
+  return async (request) => {
+    const url = new URL(request.url);
+    const headers = new Headers(request.headers);
+    headers.set('host', url.host);
+    url.hostname = hostname;
+    url.port = port;
+    const body = request.body ? await request.arrayBuffer() : undefined;
+    return fetcher(new Request(url, { method: request.method, headers, body }));
+  };
+}
+
+/**
+ * The provisioner client's access token for the admin API (`client_credentials`, as the identity
+ * server's own `gas` provider mints it), cached until shortly before it expires. `forget` drops
+ * the cached token so the next call mints a new one.
+ */
+export function provisionerToken(options: IdentityAdminOptions): {
+  get: () => Promise<string>;
+  forget: () => void;
+} {
+  const fetcher = upstreamFetch(options.upstream, options.fetch);
+  const now = options.now ?? Date.now;
+  const url = `${trimSlashes(options.issuer)}/oauth2/token`;
+  let cached: { token: string; expiresAt: number } | undefined;
+  return {
+    forget: () => {
+      cached = undefined;
+    },
+    get: async () => {
+      if (cached && cached.expiresAt - TOKEN_SLACK_MS > now()) return cached.token;
+      cached = undefined;
+      const secret = await options.clientSecret();
+      const basic = Buffer.from(
+        `${encodeURIComponent(options.clientId)}:${encodeURIComponent(secret)}`,
+      ).toString('base64');
+      const response = await fetcher(
+        new Request(url, {
+          method: 'POST',
+          headers: {
+            authorization: `Basic ${basic}`,
+            'content-type': 'application/x-www-form-urlencoded',
+            accept: 'application/json',
+          },
+          body: new URLSearchParams({ grant_type: 'client_credentials', scope: ADMIN_SCOPE }),
+        }),
+      );
+      if (!response.ok)
+        throw new OAuthAdminError(
+          response.status,
+          `POST ${url}: HTTP ${response.status} for provisioner client ${options.clientId}`,
+        );
+      const body = (await response.json()) as { access_token?: string; expires_in?: number };
+      if (!body.access_token)
+        throw new OAuthAdminError(response.status, `POST ${url}: no access_token in the response`);
+      cached = { token: body.access_token, expiresAt: now() + (body.expires_in ?? 0) * 1000 };
+      return cached.token;
+    },
+  };
+}
+
+/** The admin API behind `options.issuer`, authenticated as the provisioner client. */
+export function identityAdminRegistry(options: IdentityAdminOptions): OAuthClientRegistry {
+  const token = provisionerToken(options);
+  return new HttpOAuthClientRegistry({
+    baseUrl: options.issuer,
+    token: token.get,
+    forgetToken: token.forget,
+    fetch: upstreamFetch(options.upstream, options.fetch),
+  });
 }

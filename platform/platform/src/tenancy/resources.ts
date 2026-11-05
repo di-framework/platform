@@ -154,9 +154,10 @@ export interface TenantAuthConfig {
   /** identity-server issuer URL, as both pods and browsers name it. */
   issuer: string;
   /**
-   * Until per-tenant clients (#59), every console shares one confidential OAuth client. Its
-   * secret lives in a Secret in the platform namespace that the reconcile copies into each
-   * tenant's runtime namespace; the controller never reads the identity directory.
+   * The identity server's provisioner client (`AUTH_PROVISIONER_CLIENT_ID`, scopes `admin:read
+   * admin:write`), which the platform controller authenticates with to register each tenant's own
+   * OAuth clients (#59). Its secret lives in a Secret in the platform namespace (key `secretKey`,
+   * default `clientSecret`); it never reaches a tenant namespace.
    */
   oauthClient: { id: string; secretName: string; secretKey?: string };
   /**
@@ -301,8 +302,11 @@ export interface TenantAuthInputs {
     caNext?: { cert: string; key: string };
     caPrevious?: string;
   };
-  /** The shared OAuth client secret, base64 as read from the platform Secret; absent until it exists. */
-  clientSecret?: string;
+  /**
+   * The tenant's own OAuth clients (#59): the console's confidential client with its secret
+   * (base64, as Secret data) and the CLI's public PKCE client.
+   */
+  oauthClients: { consoleClientId: string; consoleClientSecret: string; cliClientId: string };
   /**
    * Whether the registry front may forward to the registry (W4/W6 of the #83 review): true only
    * when the tenant is not suspended and no other workload claims the registry host. Registry
@@ -1873,8 +1877,15 @@ function loopbackHost(host: string): boolean {
  */
 const DEFAULT_CONTROLLER_URL = 'https://localhost:8788';
 /** The controller URL users and CLIs see; `{tenant}` is replaced. */
-function tenantControllerPublicUrl(tenant: string, auth: TenantAuthConfig | undefined): string {
+export function tenantControllerPublicUrl(
+  tenant: string,
+  auth: TenantAuthConfig | undefined,
+): string {
   return expandTenant(auth?.controllerPublicUrl ?? DEFAULT_CONTROLLER_URL, tenant);
+}
+/** The console URL browsers see; `{tenant}` is replaced. */
+export function tenantConsolePublicUrl(tenant: string, auth: TenantAuthConfig): string {
+  return expandTenant(auth.consolePublicUrl ?? 'http://127.0.0.1:8787', tenant);
 }
 /**
  * Names the controller's serving certificate covers: in-cluster, through a port-forward
@@ -2148,8 +2159,6 @@ function tenantAuthResources(
       matchLabels: { 'wasmcloud.com/hostgroup': n.hostgroup, 'wasmcloud.com/name': 'hostgroup' },
     },
   };
-  const publicUrl = (pattern: string | undefined, fallback: string) =>
-    expandTenant(pattern ?? fallback, name);
   const [upstreamHost = '', upstreamPort = '80'] = (auth.issuerUpstream ?? '').split(':');
   const egress: unknown[] = [];
   if (inputs.apiServer.addresses.length)
@@ -2429,13 +2438,17 @@ function tenantAuthResources(
         data: registryPullSecretData(name, hostPullToken),
       }),
     );
-  if (inputs.clientSecret)
-    result.push(
-      make('v1', 'Secret', 'tenant-console-oauth', namespace, {
-        type: 'Opaque',
-        data: { clientSecret: inputs.clientSecret },
-      }),
-    );
+  // The tenant's own console client (#59); the id is kept with the secret so a reconcile can tell
+  // whether the stored secret belongs to the current client.
+  result.push(
+    make('v1', 'Secret', 'tenant-console-oauth', namespace, {
+      type: 'Opaque',
+      data: {
+        clientId: base64(inputs.oauthClients.consoleClientId),
+        clientSecret: inputs.oauthClients.consoleClientSecret,
+      },
+    }),
+  );
   result.push(
     deployment(
       'tenant-controller',
@@ -2448,6 +2461,8 @@ function tenantAuthResources(
         TENANT_CONTROLLER_PORT: '8788',
         TENANT_CONTROLLER_TLS_CERT: '/tls/tls.crt',
         TENANT_CONTROLLER_TLS_KEY: '/tls/tls.key',
+        // The tenant's own public PKCE client, which `/v1/auth/info` names for the CLI (#59).
+        TENANT_CONTROLLER_CLI_CLIENT_ID: inputs.oauthClients.cliClientId,
         ...(registry
           ? {
               // TLS only, with the certificate above (#113): plain HTTP is never served on it.
@@ -2500,10 +2515,10 @@ function tenantAuthResources(
       {
         TENANT_CONSOLE_TENANT: name,
         TENANT_CONSOLE_ISSUER: auth.issuer,
-        TENANT_CONSOLE_CLIENT_ID: auth.oauthClient.id,
+        TENANT_CONSOLE_CLIENT_ID: inputs.oauthClients.consoleClientId,
         TENANT_CONSOLE_HOST: '0.0.0.0',
         TENANT_CONSOLE_PORT: '8787',
-        TENANT_CONSOLE_PUBLIC_URL: publicUrl(auth.consolePublicUrl, 'http://127.0.0.1:8787'),
+        TENANT_CONSOLE_PUBLIC_URL: tenantConsolePublicUrl(name, auth),
         TENANT_CONSOLE_CONTROLLER_URL: 'https://tenant-controller:8788',
         TENANT_CONSOLE_CONTROLLER_PUBLIC_URL: tenantControllerPublicUrl(name, auth),
         TENANT_CONSOLE_CONTROLLER_CA: '/ca/ca.crt',

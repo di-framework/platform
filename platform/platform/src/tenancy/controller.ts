@@ -62,6 +62,17 @@ import {
   type WorkloadIdentity,
 } from './log-projection';
 import {
+  CONSOLE_OAUTH_SECRET,
+  ensureTenantOAuthClients,
+  identityAdminRegistry,
+  OAuthAdminError,
+  type OAuthClientRegistry,
+  removeTenantOAuthClients,
+  storedConsoleSecret,
+  tenantOAuthClientIds,
+  tenantOAuthOptions,
+} from './oauth-clients';
+import {
   assertPostgresOwner,
   ensurePostgresCredentials,
   ensurePostgresStorage,
@@ -542,6 +553,11 @@ export class Controller {
     private readonly resolveName: (name: string) => Promise<string[]> = resolveIpv4,
     /** The clock certificate issuance and CA rotation (#170) read. */
     private readonly now: () => Date = () => new Date(),
+    /**
+     * The identity admin seam for the per-tenant OAuth clients (#59); by default the admin API
+     * behind `tenantAuth.issuer`, authenticated as the provisioner client `tenantAuth.oauthClient`.
+     */
+    private oauthClients?: OAuthClientRegistry,
   ) {
     this.identities = new TenantSchedulerIdentities(api, cfg, now);
     this.accounts = new SchedulerAccountsWriter(api, cfg, now);
@@ -739,7 +755,15 @@ export class Controller {
       ['R3', () => this.removalWorkloads(tenant)],
       ['R4', () => this.removalAccounts(tenant, 'operator')],
       ['R5', () => this.removalOperator(tenant)],
-      ['R6', () => this.removalNamespaces(tenant)],
+      // The tenant's OAuth clients go with its namespaces (#59): identity-server state the pair,
+      // which `removeTenantAuth` deleted on the first pass, no longer uses.
+      [
+        'R6',
+        async () => [
+          ...(await this.removalOAuthClients(tenant)),
+          ...(await this.removalNamespaces(tenant)),
+        ],
+      ],
     ];
     for (const [step, run] of steps) {
       const remaining = await run();
@@ -966,6 +990,21 @@ export class Controller {
     if (state !== 'gone') remaining.push(namespaceRemaining(state, ns));
     return remaining;
   }
+  /**
+   * R6, with `tenantAuth` set: revoke the tenant's console and CLI clients in the identity server
+   * (#59). A client that could not be revoked is reported as `oauthclient/<id>` and retried on
+   * the next pass; revoked and unknown ids are done.
+   */
+  private async removalOAuthClients(tenant: Tenant): Promise<string[]> {
+    if (!this.cfg.tenantAuth) return [];
+    const ref = { name: tenant.metadata.name, uid: tenant.metadata.uid! };
+    const failed = await removeTenantOAuthClients(this.oauthClientRegistry(), ref);
+    for (const { clientId, error } of failed) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Tenant/${tenant.metadata.name} oauth client ${clientId}: ${message}`);
+    }
+    return failed.map(({ clientId }) => `oauthclient/${clientId}`);
+  }
   /** R6: under `Delete`, delete the tenant's namespaces as before; `Retain` keeps them. */
   private async removalNamespaces(tenant: Tenant): Promise<string[]> {
     if (tenant.spec.deletionPolicy !== 'Delete') return [];
@@ -996,7 +1035,7 @@ export class Controller {
    * What {@link tenantAuthResources} needs from the cluster: the tenant's members (from
    * the User CRs, so a membership change re-renders the TokenRequest `resourceNames` on the next
    * reconcile), the API server endpoints, the controller certificate (kept until 30 days before
-   * it expires) and the shared OAuth client secret from the platform namespace.
+   * it expires) and the tenant's own OAuth clients ({@link tenantOAuthClients}).
    */
   private async tenantAuthInputs(
     tenant: Tenant,
@@ -1015,16 +1054,76 @@ export class Controller {
       );
     const apiServer = await this.apiServerEndpoints();
     const tls = await this.controllerTls(tenant, auth, fetched);
-    const oauth = await this.get<{ data?: Record<string, string> }>(
-      `${collection('v1', 'Secret', this.cfg.namespace)}/${auth.oauthClient.secretName}`,
-    );
     return {
       members,
       apiServer,
       tls,
-      clientSecret: oauth?.data?.[auth.oauthClient.secretKey ?? 'clientSecret'],
+      oauthClients: await this.tenantOAuthClients(tenant, fetched),
       ...(auth.registry ? { hostPullToken: await this.hostPullToken(name) } : {}),
     };
+  }
+  /**
+   * The tenant's own OAuth clients (#59), registered in the identity server as the provisioner
+   * client: a confidential one for the console and a public PKCE one for the CLI. The console
+   * secret is written to `tenant-console-oauth` in the runtime namespace with the client id it
+   * belongs to; when the Secret already holds the current client's secret, the clients are only
+   * checked for existence (and a missing one is created again). A Secret that is missing, holds
+   * another client's secret (a tenant recreated under the same name in a retained namespace) or
+   * was not written by this installation for the Tenant gets the secret issued again: a keyed
+   * rotation whose version is the Tenant uid, so concurrent controllers agree on it. The Secret
+   * read here is recorded in `fetched`, so applying it later in the pass does not read it again.
+   */
+  private async tenantOAuthClients(
+    tenant: Tenant,
+    fetched: Map<string, Resource | undefined>,
+  ): Promise<TenantAuthInputs['oauthClients']> {
+    const auth = this.cfg.tenantAuth!;
+    const name = tenant.metadata.name;
+    const ref = { name, uid: tenant.metadata.uid! };
+    const ids = tenantOAuthClientIds(ref);
+    const path = `${collection('v1', 'Secret', names(name).runtimeNamespace)}/${CONSOLE_OAUTH_SECRET}`;
+    const secret = await this.get<Resource & { data?: Record<string, string> }>(path);
+    fetched.set(path, secret);
+    const owned =
+      secret?.metadata.labels?.[INSTALLATION] === this.cfg.installation &&
+      secret.metadata.labels[OWNER] === tenant.metadata.uid;
+    const stored = owned ? storedConsoleSecret(secret.data, ids.console) : undefined;
+    const clients = await ensureTenantOAuthClients(this.oauthClientRegistry(), ref, {
+      ...tenantOAuthOptions(name, auth),
+      consoleSecretStored: stored !== undefined,
+      rotationVersion: ref.uid,
+    });
+    // A secret comes back whenever the console client was created or rotated; it replaces the
+    // stored one (which belonged to a client that no longer exists). Otherwise the stored one is
+    // kept, and `stored` is defined: without it the client would have been rotated.
+    const consoleClientSecret = clients.console.clientSecret
+      ? Buffer.from(clients.console.clientSecret).toString('base64')
+      : (stored as string);
+    return { consoleClientId: ids.console, consoleClientSecret, cliClientId: ids.cli };
+  }
+  /** The identity admin seam: the one injected, else the admin API behind `tenantAuth.issuer`. */
+  private oauthClientRegistry(): OAuthClientRegistry {
+    const auth = this.cfg.tenantAuth!;
+    this.oauthClients ??= identityAdminRegistry({
+      issuer: auth.issuer,
+      ...(auth.issuerUpstream ? { upstream: auth.issuerUpstream } : {}),
+      clientId: auth.oauthClient.id,
+      clientSecret: () => this.provisionerSecret(auth),
+    });
+    return this.oauthClients;
+  }
+  /** The provisioner client's secret from the platform-namespace Secret `tenantAuth.oauthClient` names. */
+  private async provisionerSecret(auth: TenantAuthConfig): Promise<string> {
+    const { secretName, secretKey = 'clientSecret' } = auth.oauthClient;
+    const secret = await this.get<{ data?: Record<string, string> }>(
+      `${collection('v1', 'Secret', this.cfg.namespace)}/${secretName}`,
+    );
+    const value = secret?.data?.[secretKey];
+    if (!value)
+      throw new Error(
+        `Secret ${this.cfg.namespace}/${secretName} (tenantAuth.oauthClient.secretName) has no key ${secretKey}`,
+      );
+    return Buffer.from(value, 'base64').toString();
   }
   /** {@link apiServerEndpoints} of the running {@link tick}, read once for every Tenant. */
   private tickApiServer?: { read?: Promise<{ addresses: string[]; port: number }> };
@@ -2079,7 +2178,12 @@ export class Controller {
       } catch {
         /* The tenant step lowers it on the next poll. */
       }
-      return condition(false, refused ? 'ControllerCaNotOwned' : 'ReconcileError', message);
+      const reason = refused
+        ? 'ControllerCaNotOwned'
+        : error instanceof OAuthAdminError
+          ? 'OAuthClientError'
+          : 'ReconcileError';
+      return condition(false, reason, message);
     }
   }
   /**

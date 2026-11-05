@@ -12,7 +12,7 @@ import { CA_DAYS, CA_OVERLAP_DAYS, CA_RENEW_DAYS } from '../src/tenancy/ca-rotat
 import {
   type Api,
   ApiError,
-  Controller,
+  Controller as BaseController,
   collection,
   main,
   withHostPullFailure,
@@ -67,7 +67,23 @@ import {
   serialNumber,
 } from '../src/tenancy/tls';
 import { cutoverSeeds, HOST_CERT } from './support/cutover';
+import { FakeIdentityAdmin } from './support/fake-identity-admin';
 import { opensslVerifies, verifiesAt as verifies, withinNameConstraints } from './support/tls';
+
+/**
+ * The controller under test, registering the per-tenant OAuth clients (#59) in a fake identity
+ * server of its own; `tenant-oauth-clients.test.ts` covers that wiring and the HTTP default.
+ */
+class Controller extends BaseController {
+  constructor(
+    api: Api,
+    cfg: ControllerConfig,
+    resolveName?: (name: string) => Promise<string[]>,
+    now?: () => Date,
+  ) {
+    super(api, cfg, resolveName, now, new FakeIdentityAdmin().registry());
+  }
+}
 
 const IMAGE = `ghcr.io/di-framework/tenant-auth@sha256:${'a'.repeat(64)}`;
 const auth: TenantAuthConfig = {
@@ -131,7 +147,11 @@ const inputs: TenantAuthInputs = {
   ],
   apiServer: { addresses: ['10.0.0.1'], port: 6443 },
   tls,
-  clientSecret: 'c2VjcmV0',
+  oauthClients: {
+    consoleClientId: 'tenant-alpha-alphauid-console',
+    consoleClientSecret: 'c2VjcmV0',
+    cliClientId: 'tenant-alpha-alphauid-cli',
+  },
 };
 type Deployment = Resource & {
   spec: {
@@ -363,6 +383,7 @@ describe('tenantAuthResources', () => {
       TENANT_CONTROLLER_HOST: '0.0.0.0',
       TENANT_CONTROLLER_TLS_CERT: '/tls/tls.crt',
       TENANT_CONTROLLER_TLS_KEY: '/tls/tls.key',
+      TENANT_CONTROLLER_CLI_CLIENT_ID: 'tenant-alpha-alphauid-cli',
     });
     expect(controller.spec.template.spec.containers[0]!.volumeMounts).toContainEqual(
       expect.objectContaining({ mountPath: '/tls' }),
@@ -373,7 +394,7 @@ describe('tenantAuthResources', () => {
     });
     expect(env(console)).toMatchObject({
       TENANT_CONSOLE_HOST: '0.0.0.0',
-      TENANT_CONSOLE_CLIENT_ID: 'access',
+      TENANT_CONSOLE_CLIENT_ID: 'tenant-alpha-alphauid-console',
       TENANT_CONSOLE_PUBLIC_URL: 'http://console.alpha.localhost:28180',
       TENANT_CONSOLE_CONTROLLER_PUBLIC_URL: 'https://localhost:8788',
       TENANT_CONSOLE_CONTROLLER_URL: 'https://tenant-controller:8788',
@@ -383,6 +404,7 @@ describe('tenantAuthResources', () => {
       valueFrom: { secretKeyRef: { name: 'tenant-console-oauth', key: 'clientSecret' } },
     });
     expect(find(resources, 'Secret', 'tenant-console-oauth')?.data).toEqual({
+      clientId: Buffer.from('tenant-alpha-alphauid-console').toString('base64'),
       clientSecret: 'c2VjcmV0',
     });
     expect(find(resources, 'Secret', 'tenant-controller-tls')?.data).toEqual({
@@ -595,12 +617,8 @@ describe('tenantAuthResources', () => {
   });
 
   it('stops the pair and drops its bindings for a suspended tenant', () => {
-    const resources = tenantAuthResources(tenant({ suspended: true }), cfg, {
-      ...inputs,
-      clientSecret: undefined,
-    });
+    const resources = tenantAuthResources(tenant({ suspended: true }), cfg, inputs);
     expect(resources.some((r) => r.kind.endsWith('Binding'))).toBe(false);
-    expect(resources.some((r) => r.metadata.name === 'tenant-console-oauth')).toBe(false);
     for (const d of resources.filter((r) => r.kind === 'Deployment') as Deployment[])
       expect(d.spec.replicas).toBe(0);
   });
@@ -902,7 +920,7 @@ const tokenNames = (api: MemoryApi) =>
   )?.flatMap((r) => r.resourceNames);
 
 describe('reconcileTenant with tenant-auth', () => {
-  it('applies the pair with the copied OAuth secret and the cluster’s API server', async () => {
+  it('applies the pair with the tenant’s own console client and the cluster’s API server', async () => {
     const { api, controller, t } = prepare();
     api.notReady.add('tenant-console');
     await controller.reconcileTenant(t, [user('alice', ['alpha']), user('carol', ['beta'])]);
@@ -912,7 +930,10 @@ describe('reconcileTenant with tenant-auth', () => {
     expect(deployment.spec.template.spec.containers[0]!.image).toBe(IMAGE);
     expect(
       api.objects.get(path('Secret', 'di-runtime-alpha', 'tenant-console-oauth'))?.data,
-    ).toEqual({ clientSecret: 'c2hhcmVk' });
+    ).toEqual({
+      clientId: Buffer.from('tenant-alpha-alphauid-console').toString('base64'),
+      clientSecret: expect.stringMatching(/^[A-Za-z0-9+/=]+$/),
+    });
     const policy = api.objects.get(
       `${collection('networking.k8s.io/v1', 'NetworkPolicy', 'di-runtime-alpha')}/tenant-auth-egress`,
     ) as unknown as { spec: { egress: unknown[] } };
@@ -1499,15 +1520,11 @@ describe('reconcileTenant with tenant-auth', () => {
     expect(verifies(published.leaf, retired.bundle, at())).toBe(false);
   });
 
-  it('waits for the OAuth Secret, defaults the API port, and revokes the ClusterRoleBinding on suspend', async () => {
+  it('defaults the API port, and revokes the ClusterRoleBinding on suspend', async () => {
     const { api, controller, t } = prepare();
-    api.objects.delete(path('Secret', 'wasmcloud', 'tenant-auth-oauth'));
     for (const k of [...api.objects.keys()].filter((k) => k.includes('endpointslices')))
       api.objects.delete(k);
     await controller.reconcileTenant(t, []);
-    expect(
-      api.objects.get(path('Secret', 'di-runtime-alpha', 'tenant-console-oauth')),
-    ).toBeUndefined();
     const policy = api.objects.get(
       `${collection('networking.k8s.io/v1', 'NetworkPolicy', 'di-runtime-alpha')}/tenant-auth-egress`,
     ) as unknown as { spec: { egress: unknown[] } };
