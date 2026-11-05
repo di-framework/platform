@@ -53,7 +53,7 @@ export function tenantObject({ name, ...spec }: TenantDeclaration, installation:
 
 /** Controller ConfigMap modules. TypeScript emit does not bundle imports, so
  * `api-keys`, `admission`, `egress`, `backing-services`, `backing-service-reconcile`, `service-binding-reconcile`,
- * `registry-nats`, and `log-projection` must ship beside `resources` / `controller` (which require them at runtime). */
+ * `registry-nats`, `oauth-clients`, and `log-projection` must ship beside `resources` / `controller` (which require them at runtime). */
 export const CONTROLLER_SCRIPT_MODULES = [
   'api-keys',
   'admission',

@@ -1944,6 +1944,14 @@ function tenantControllerCaSecret(tenant: string): string {
 }
 /** Digest of the trust bundle on the console's pod template (#170). */
 export const CA_BUNDLE_ANNOTATION = `${GROUP}/ca-bundle-sha256`;
+/** The console pod template's digest of its OAuth client id and secret (#59). */
+export const CONSOLE_OAUTH_ANNOTATION = `${GROUP}/console-oauth-sha256`;
+/** {@link CONSOLE_OAUTH_ANNOTATION}'s value for the rendered client. */
+export function consoleOAuthDigest(clients: TenantAuthInputs['oauthClients']): string {
+  return createHash('sha256')
+    .update(`${clients.consoleClientId}\n${clients.consoleClientSecret}`)
+    .digest('hex');
+}
 /**
  * The PEM bundle clients trust (ConfigMap `tenant-controller-ca`): the CAs of `tls`, oldest first,
  * so switching which CA signs the leaf keeps the same bytes and does not roll the hosts.
@@ -2055,8 +2063,13 @@ function tenantAuthResources(
             annotations: {
               [`${GROUP}/image-digest`]: auth.image.split('@')[1],
               [`${GROUP}/tls-cert-sha256`]: tlsCertDigest(inputs.tls.cert),
+              // The console reads its client secret once at start too, so a secret issued
+              // again for the same client (#59) rolls it.
               ...(app === 'tenant-console'
-                ? { [CA_BUNDLE_ANNOTATION]: tlsCertDigest(controllerTrustBundle(inputs.tls)) }
+                ? {
+                    [CA_BUNDLE_ANNOTATION]: tlsCertDigest(controllerTrustBundle(inputs.tls)),
+                    [CONSOLE_OAUTH_ANNOTATION]: consoleOAuthDigest(inputs.oauthClients),
+                  }
                 : {}),
             },
           },
@@ -2448,8 +2461,6 @@ function tenantAuthResources(
         clientSecret: inputs.oauthClients.consoleClientSecret,
       },
     }),
-  );
-  result.push(
     deployment(
       'tenant-controller',
       8788,

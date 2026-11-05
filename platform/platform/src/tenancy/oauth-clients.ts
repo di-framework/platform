@@ -25,6 +25,8 @@
  * - `delete` treats 404 as success, so a `baseUrl` with a wrong path prefix (the router answers
  *   404 for unknown `/api/*` paths) makes deletes look successful. `baseUrl` must be the origin.
  */
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import type { TenantAuthConfig } from './resources';
 import { tenantConsolePublicUrl, tenantControllerPublicUrl } from './resources';
 
@@ -377,14 +379,27 @@ export class HttpOAuthClientRegistry implements OAuthClientRegistry {
     };
     if (body !== undefined) headers['content-type'] = 'application/json';
     if (idempotencyKey) headers['idempotency-key'] = idempotencyKey;
-    return this.fetch(
-      new Request(url, {
-        method,
-        headers,
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      }),
-    );
+    const request = new Request(url, {
+      method,
+      headers,
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    try {
+      return await this.fetch(request);
+    } catch (error) {
+      throw unreachable(request, error);
+    }
   }
+}
+
+/**
+ * A request that got no HTTP answer (DNS, connection, TLS, abort or timeout): an admin error with
+ * status 0, so reconcile reports it as an identity-server failure. Already typed errors pass.
+ */
+function unreachable(request: Request, error: unknown): OAuthAdminError {
+  if (error instanceof OAuthAdminError) return error;
+  const message = error instanceof Error ? error.message : String(error);
+  return new OAuthAdminError(0, `${request.method} ${request.url}: ${message}`);
 }
 
 /**
@@ -418,14 +433,17 @@ export interface IdentityAdminOptions {
   /** The issuer (`tenantAuth.issuer`): the token endpoint and the admin API live under it. */
   issuer: string;
   /**
-   * `tenantAuth.issuerUpstream`: the in-cluster `host[:port]` that requests to a loopback issuer
-   * are sent to instead, keeping the issuer's `Host` so the gateway routes them as a browser's.
+   * The `host[:port]` requests are sent to instead of the issuer's own, under the issuer's `Host`
+   * (and TLS server name), as the tenant pods' sidecar and `hostAliases` do; see
+   * {@link identityAdminUpstream}.
    */
   upstream?: string;
   /** The provisioner client (`AUTH_PROVISIONER_CLIENT_ID`); its secret is read when a token is minted. */
   clientId: string;
   clientSecret: () => Promise<string>;
   fetch?: (request: Request) => Promise<Response>;
+  /** How long one request may take (default {@link REQUEST_TIMEOUT_MS}). */
+  timeoutMs?: number;
   now?: () => number;
 }
 
@@ -433,26 +451,115 @@ export interface IdentityAdminOptions {
 export const ADMIN_SCOPE = 'admin:read admin:write';
 /** A token is minted again this long before it expires. */
 const TOKEN_SLACK_MS = 30_000;
+/**
+ * The limit on one token or admin request. Reconcile runs every tenant's calls in sequence, so
+ * an identity server that accepts connections and then hangs must not hold a tick for minutes.
+ */
+export const REQUEST_TIMEOUT_MS = 10_000;
 
 /**
- * `fetch` with every request to the issuer's host sent to `upstream` instead, under the original
- * `Host` header; without `upstream`, `fetcher` as given.
+ * Where the platform controller sends identity requests: `tenantAuth.issuerUpstream`, else
+ * `tenantAuth.issuerIp` with the issuer's port (what the tenant pods' sidecar targets and their
+ * `hostAliases` resolve to), else nothing, i.e. the issuer as named.
  */
-export function upstreamFetch(
-  upstream: string | undefined,
-  fetcher: (request: Request) => Promise<Response> = (request) => fetch(request),
+export function identityAdminUpstream(auth: TenantAuthConfig): string | undefined {
+  if (auth.issuerUpstream) return auth.issuerUpstream;
+  if (!auth.issuerIp) return undefined;
+  const issuer = new URL(auth.issuer);
+  return `${auth.issuerIp}:${issuer.port || (issuer.protocol === 'https:' ? 443 : 80)}`;
+}
+
+/** The fetch-like transport the admin registry and the token mint send through. */
+export interface AdminFetchOptions {
+  upstream?: string;
+  fetch?: (request: Request) => Promise<Response>;
+  timeoutMs?: number;
+}
+
+/**
+ * The transport for identity requests: every request is limited to `timeoutMs`, and one that gets
+ * no HTTP answer rejects with an {@link OAuthAdminError} of status 0. With `upstream`, requests go
+ * to that `host[:port]` over `node:http`/`node:https` under the issuer's `Host` header and TLS
+ * server name: the gateway routes by `Host`, and Node's `fetch` (the runtime the controller runs
+ * on) silently replaces an explicit `Host` with the connected host. Without `upstream`, `fetch`
+ * as given (the global one by default).
+ */
+export function adminFetch(
+  options: AdminFetchOptions = {},
 ): (request: Request) => Promise<Response> {
-  if (!upstream) return fetcher;
-  const [, hostname = '', port = ''] = /^(\[[^\]]+\]|[^:]+)(?::(\d+))?$/.exec(upstream) ?? [];
+  const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  const fetcher = options.fetch ?? ((request: Request) => fetch(request));
+  const [, hostname = '', port = ''] =
+    /^(\[[^\]]+\]|[^:]+)(?::(\d+))?$/.exec(options.upstream ?? '') ?? [];
   return async (request) => {
-    const url = new URL(request.url);
-    const headers = new Headers(request.headers);
-    headers.set('host', url.host);
-    url.hostname = hostname;
-    url.port = port;
-    const body = request.body ? await request.arrayBuffer() : undefined;
-    return fetcher(new Request(url, { method: request.method, headers, body }));
+    try {
+      if (options.upstream)
+        return await viaUpstream(request, hostname.replace(/^\[|\]$/g, ''), port, timeoutMs);
+      // The limit holds whether or not the fetch honours the signal.
+      const signal = AbortSignal.timeout(timeoutMs);
+      const expired = new Promise<never>((_, reject) =>
+        signal.addEventListener('abort', () => reject(signal.reason)),
+      );
+      return await Promise.race([fetcher(new Request(request, { signal })), expired]);
+    } catch (error) {
+      throw unreachable(request, error);
+    }
   };
+}
+
+/** `request` sent to `hostname:port` with `node:http(s)`, under the issuer's `Host` and server name. */
+async function viaUpstream(
+  request: Request,
+  hostname: string,
+  port: string,
+  timeoutMs: number,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const secure = url.protocol === 'https:';
+  const body = request.body ? Buffer.from(await request.arrayBuffer()) : undefined;
+  const headers: Record<string, string> = {};
+  request.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+  headers.host = url.host;
+  if (body) headers['content-length'] = String(body.byteLength);
+  return new Promise<Response>((resolve, reject) => {
+    const sent = (secure ? httpsRequest : httpRequest)(
+      {
+        hostname,
+        port: port || (secure ? 443 : 80),
+        method: request.method,
+        path: `${url.pathname}${url.search}`,
+        headers,
+        ...(secure ? { servername: url.hostname } : {}),
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('error', reject);
+        response.on('end', () => {
+          clearTimeout(timer);
+          const status = response.statusCode ?? 0;
+          const responseHeaders: [string, string][] = [];
+          for (const [key, value] of Object.entries(response.headers))
+            if (value !== undefined)
+              responseHeaders.push([key, Array.isArray(value) ? value.join(', ') : value]);
+          const payload =
+            chunks.length && ![204, 205, 304].includes(status) ? Buffer.concat(chunks) : null;
+          resolve(new Response(payload, { status, headers: responseHeaders }));
+        });
+      },
+    );
+    const timer = setTimeout(
+      () => sent.destroy(new Error(`timed out after ${timeoutMs} ms`)),
+      timeoutMs,
+    );
+    sent.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    sent.end(body);
+  });
 }
 
 /**
@@ -464,7 +571,7 @@ export function provisionerToken(options: IdentityAdminOptions): {
   get: () => Promise<string>;
   forget: () => void;
 } {
-  const fetcher = upstreamFetch(options.upstream, options.fetch);
+  const fetcher = adminFetch(options);
   const now = options.now ?? Date.now;
   const url = `${trimSlashes(options.issuer)}/oauth2/token`;
   let cached: { token: string; expiresAt: number } | undefined;
@@ -479,17 +586,21 @@ export function provisionerToken(options: IdentityAdminOptions): {
       const basic = Buffer.from(
         `${encodeURIComponent(options.clientId)}:${encodeURIComponent(secret)}`,
       ).toString('base64');
-      const response = await fetcher(
-        new Request(url, {
-          method: 'POST',
-          headers: {
-            authorization: `Basic ${basic}`,
-            'content-type': 'application/x-www-form-urlencoded',
-            accept: 'application/json',
-          },
-          body: new URLSearchParams({ grant_type: 'client_credentials', scope: ADMIN_SCOPE }),
-        }),
-      );
+      const request = new Request(url, {
+        method: 'POST',
+        headers: {
+          authorization: `Basic ${basic}`,
+          'content-type': 'application/x-www-form-urlencoded',
+          accept: 'application/json',
+        },
+        body: new URLSearchParams({ grant_type: 'client_credentials', scope: ADMIN_SCOPE }),
+      });
+      let response: Response;
+      try {
+        response = await fetcher(request);
+      } catch (error) {
+        throw unreachable(request, error);
+      }
       if (!response.ok)
         throw new OAuthAdminError(
           response.status,
@@ -511,6 +622,6 @@ export function identityAdminRegistry(options: IdentityAdminOptions): OAuthClien
     baseUrl: options.issuer,
     token: token.get,
     forgetToken: token.forget,
-    fetch: upstreamFetch(options.upstream, options.fetch),
+    fetch: adminFetch(options),
   });
 }

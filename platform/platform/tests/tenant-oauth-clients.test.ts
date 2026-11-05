@@ -2,13 +2,16 @@ import { afterAll, describe, expect, it } from 'bun:test';
 import { Controller, collection } from '../src/tenancy/controller';
 import {
   CONSOLE_OAUTH_SECRET,
+  OAuthAdminError,
   type OAuthClientRegistry,
   oauthAdminError,
   tenantOAuthClientIds,
 } from '../src/tenancy/oauth-clients';
 import { REMOVAL_STEP_DEADLINE_MS, REMOVAL_STUCK } from '../src/tenancy/removal-sequence';
 import {
+  CONSOLE_OAUTH_ANNOTATION,
   type ControllerConfig,
+  consoleOAuthDigest,
   FINALIZER,
   INSTALLATION,
   names,
@@ -50,7 +53,12 @@ const ready = [
   },
 ];
 type Deployment = Resource & {
-  spec: { template: { spec: { containers: { env: { name: string; value?: string }[] }[] } } };
+  spec: {
+    template: {
+      metadata?: { annotations?: Record<string, string> };
+      spec: { containers: { env: { name: string; value?: string }[] }[] };
+    };
+  };
 };
 
 function tenant(name: string, uid = `${name}-uid`): Tenant {
@@ -235,12 +243,25 @@ describe('per-tenant OAuth clients in reconcile (#59)', () => {
     const { api, fake, controller } = prepare({ tenants: [tenant('alpha')] });
     await controller.tick();
     const first = consoleSecret(api, 'alpha')!.data;
+    const digest = () =>
+      (api.objects.get(path('Deployment', runtime('alpha'), 'tenant-console')) as Deployment).spec
+        .template.metadata?.annotations?.[CONSOLE_OAUTH_ANNOTATION];
+    const firstDigest = digest();
+    expect(firstDigest).toBe(
+      consoleOAuthDigest({
+        consoleClientId: decode(first.clientId),
+        consoleClientSecret: first.clientSecret ?? '',
+        cliClientId: '',
+      }),
+    );
     // Lost between the create and the write: rotated, deterministically per Tenant.
     api.objects.delete(path('Secret', runtime('alpha'), CONSOLE_OAUTH_SECRET));
     await controller.tick();
     const rotated = consoleSecret(api, 'alpha')!.data;
     expect(rotated.clientId).toBe(first.clientId);
     expect(rotated.clientSecret).not.toBe(first.clientSecret);
+    // The console reads the secret once at start: the new secret rolls its pod template.
+    expect(digest()).not.toBe(firstDigest);
     await controller.tick();
     expect(consoleSecret(api, 'alpha')!.data).toEqual(rotated);
     api.objects.delete(path('Secret', runtime('alpha'), CONSOLE_OAUTH_SECRET));
@@ -345,6 +366,82 @@ describe('per-tenant OAuth clients in reconcile (#59)', () => {
         'Secret wasmcloud/tenant-auth-oauth (tenantAuth.oauthClient.secretName) has no key clientSecret',
     });
   });
+
+  it('reaches a non-loopback issuer through issuerIp, as the tenant pods do', async () => {
+    const fake = new FakeIdentityAdmin();
+    const server = fake.serve();
+    servers.push(server);
+    const byIp: TenantAuthConfig = {
+      ...auth,
+      issuer: `http://identity.acme.test:${server.port}`,
+      issuerIp: '127.0.0.1',
+    };
+    const { api, controller } = prepare({
+      http: true,
+      config: { ...cfg, tenantAuth: byIp },
+      tenants: [tenant('alpha')],
+    });
+    await controller.tick();
+    expect(fake.clients.size).toBe(2);
+    expect(new Set(fake.hosts)).toEqual(new Set([`identity.acme.test:${server.port}`]));
+    expect(condition(api, 'alpha', 'TenantAuthReady')).toMatchObject({ reason: 'Provisioning' });
+  });
+
+  it('reports an unreachable identity server as OAuthClientError', async () => {
+    const closed = new FakeIdentityAdmin().serve();
+    const port = closed.port;
+    closed.stop(true);
+    const { api, controller } = prepare({
+      http: true,
+      config: { ...cfg, tenantAuth: { ...auth, issuer: `http://127.0.0.1:${port}` } },
+      tenants: [tenant('alpha')],
+    });
+    await controller.tick();
+    expect(condition(api, 'alpha', 'TenantAuthReady')).toMatchObject({
+      status: 'False',
+      reason: 'OAuthClientError',
+      message: expect.stringContaining(`POST http://127.0.0.1:${port}/oauth2/token: `),
+    });
+    expect(api.objects.get(path('Deployment', runtime('alpha'), 'tenant-console'))).toBeUndefined();
+  });
+
+  it('waits out an unreachable identity server once per tick, not once per tenant', async () => {
+    const fake = new FakeIdentityAdmin();
+    const inner = fake.registry();
+    let down = false;
+    let calls = 0;
+    const registry: OAuthClientRegistry = {
+      ...inner,
+      get: (id) => {
+        calls += 1;
+        if (down) throw new OAuthAdminError(0, 'GET /api/admin/oauth-clients: timed out');
+        return inner.get(id);
+      },
+    };
+    const { api, controller } = prepare({ registry });
+    await controller.tick();
+    expect(fake.clients.size).toBe(4);
+    const before = calls;
+    down = true;
+    await controller.tick();
+    // One call found the server down; the other tenant's calls fail at once with that error.
+    expect(calls - before).toBe(1);
+    for (const name of ['alpha', 'beta'])
+      expect(condition(api, name, 'TenantAuthReady')).toMatchObject({
+        reason: 'OAuthClientError',
+        message: 'GET /api/admin/oauth-clients: timed out',
+      });
+    // Outside a tick there is no shared state: each reconcile tries on its own.
+    const after = calls;
+    await controller.reconcileTenant(structuredClone(live(api, 'alpha')), []);
+    await controller.reconcileTenant(structuredClone(live(api, 'beta')), []);
+    expect(calls - after).toBe(2);
+    // The next tick starts afresh.
+    down = false;
+    await controller.tick();
+    for (const name of ['alpha', 'beta'])
+      expect(condition(api, name, 'TenantAuthReady')).toMatchObject({ reason: 'Provisioning' });
+  });
 });
 
 describe('tenant removal revokes the OAuth clients (#59)', () => {
@@ -379,7 +476,10 @@ describe('tenant removal revokes the OAuth clients (#59)', () => {
     deleting(api, 'alpha', 'Retain');
     await until(controller, () => finalized(api, 'alpha'));
     expect(finalized(api, 'alpha')).toBe(true);
-    expect([...fake.clients.values()].every((client) => client.revokedAt)).toBe(true);
+    const ids = tenantOAuthClientIds({ name: 'alpha', uid: 'alpha-uid' });
+    expect(fake.clients.size).toBe(2);
+    expect(fake.clients.get(ids.console)?.revokedAt).toBeString();
+    expect(fake.clients.get(ids.cli)?.revokedAt).toBeString();
     expect(api.objects.has(`${collection('v1', 'Namespace')}/${runtime('alpha')}`)).toBe(true);
   });
 

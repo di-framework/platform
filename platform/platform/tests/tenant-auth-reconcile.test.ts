@@ -23,7 +23,9 @@ import {
   assertTenantAuthConfig,
   CA_BUNDLE_ANNOTATION,
   COMPONENT,
+  CONSOLE_OAUTH_ANNOTATION,
   type ControllerConfig,
+  consoleOAuthDigest,
   INSTALLATION,
   ISSUER_PROXY_IMAGE,
   OWNER,
@@ -341,8 +343,13 @@ describe('tenantAuthResources', () => {
       expect(d.spec.template.metadata.annotations).toEqual({
         [`${'platform.di-framework.dev'}/image-digest`]: `sha256:${'a'.repeat(64)}`,
         [`${'platform.di-framework.dev'}/tls-cert-sha256`]: tlsCertDigest(tls.cert),
-        // Only the console reads the trust bundle (#170).
-        ...(d === console ? { [CA_BUNDLE_ANNOTATION]: tlsCertDigest(tls.caCert) } : {}),
+        // Only the console reads the trust bundle (#170) and its OAuth client secret (#59).
+        ...(d === console
+          ? {
+              [CA_BUNDLE_ANNOTATION]: tlsCertDigest(tls.caCert),
+              [CONSOLE_OAUTH_ANNOTATION]: consoleOAuthDigest(inputs.oauthClients),
+            }
+          : {}),
       });
       expect(d.spec.template.spec.automountServiceAccountToken).toBe(false);
       expect(d.spec.template.spec.containers[1]?.image).toBe(ISSUER_PROXY_IMAGE);

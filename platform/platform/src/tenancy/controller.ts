@@ -65,6 +65,7 @@ import {
   CONSOLE_OAUTH_SECRET,
   ensureTenantOAuthClients,
   identityAdminRegistry,
+  identityAdminUpstream,
   OAuthAdminError,
   type OAuthClientRegistry,
   removeTenantOAuthClients,
@@ -1070,8 +1071,11 @@ export class Controller {
    * checked for existence (and a missing one is created again). A Secret that is missing, holds
    * another client's secret (a tenant recreated under the same name in a retained namespace) or
    * was not written by this installation for the Tenant gets the secret issued again: a keyed
-   * rotation whose version is the Tenant uid, so concurrent controllers agree on it. The Secret
-   * read here is recorded in `fetched`, so applying it later in the pass does not read it again.
+   * rotation whose version is the Tenant uid, so repeated recoveries converge on one secret. The
+   * controller is one replica under `Recreate` and ticks in sequence, so no second controller
+   * creates or rotates at the same time; were there one, a create and a rotation could still
+   * cross between the create and the Secret apply. The Secret read here is recorded in
+   * `fetched`, so applying it later in the pass does not read it again.
    */
   private async tenantOAuthClients(
     tenant: Tenant,
@@ -1101,16 +1105,46 @@ export class Controller {
       : (stored as string);
     return { consoleClientId: ids.console, consoleClientSecret, cliClientId: ids.cli };
   }
-  /** The identity admin seam: the one injected, else the admin API behind `tenantAuth.issuer`. */
+  /**
+   * The identity admin seam: the one injected, else the admin API behind `tenantAuth.issuer`,
+   * reached through `issuerUpstream` or `issuerIp` as the tenant pods reach the issuer. Every call
+   * goes through {@link identityCall}, so one tick waits out at most one unreachable server.
+   */
   private oauthClientRegistry(): OAuthClientRegistry {
     const auth = this.cfg.tenantAuth!;
+    const upstream = identityAdminUpstream(auth);
     this.oauthClients ??= identityAdminRegistry({
       issuer: auth.issuer,
-      ...(auth.issuerUpstream ? { upstream: auth.issuerUpstream } : {}),
+      ...(upstream ? { upstream } : {}),
       clientId: auth.oauthClient.id,
       clientSecret: () => this.provisionerSecret(auth),
     });
-    return this.oauthClients;
+    const registry = this.oauthClients;
+    this.identityRegistry ??= {
+      create: (spec, key) => this.identityCall(() => registry.create(spec, key)),
+      get: (id) => this.identityCall(() => registry.get(id)),
+      rotate: (id, version, key) => this.identityCall(() => registry.rotate(id, version, key)),
+      delete: (id) => this.identityCall(() => registry.delete(id)),
+    };
+    return this.identityRegistry;
+  }
+  /** {@link oauthClientRegistry}'s guarded view of the seam. */
+  private identityRegistry?: OAuthClientRegistry;
+  /**
+   * The identity server's state during the running {@link tick}: once a call got no HTTP answer
+   * (status 0: unreachable or timed out), the tick's later calls fail with that error at once,
+   * so every tenant reports `OAuthClientError` and only the first waits out the timeout.
+   */
+  private tickIdentity?: { down?: OAuthAdminError };
+  private async identityCall<T>(call: () => Promise<T>): Promise<T> {
+    if (this.tickIdentity?.down) throw this.tickIdentity.down;
+    try {
+      return await call();
+    } catch (error) {
+      if (this.tickIdentity && error instanceof OAuthAdminError && error.status === 0)
+        this.tickIdentity.down = error;
+      throw error;
+    }
   }
   /** The provisioner client's secret from the platform-namespace Secret `tenantAuth.oauthClient` names. */
   private async provisionerSecret(auth: TenantAuthConfig): Promise<string> {
@@ -2178,11 +2212,9 @@ export class Controller {
       } catch {
         /* The tenant step lowers it on the next poll. */
       }
-      const reason = refused
-        ? 'ControllerCaNotOwned'
-        : error instanceof OAuthAdminError
-          ? 'OAuthClientError'
-          : 'ReconcileError';
+      let reason = 'ReconcileError';
+      if (refused) reason = 'ControllerCaNotOwned';
+      else if (error instanceof OAuthAdminError) reason = 'OAuthClientError';
       return condition(false, reason, message);
     }
   }
@@ -3496,10 +3528,12 @@ export class Controller {
 
   async tick(): Promise<void> {
     this.tickApiServer = {};
+    this.tickIdentity = {};
     try {
       await this.tickOnce();
     } finally {
       this.tickApiServer = undefined;
+      this.tickIdentity = undefined;
     }
   }
   private async tickOnce(): Promise<void> {

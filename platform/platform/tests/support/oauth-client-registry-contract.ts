@@ -80,7 +80,7 @@ export function describeOAuthClientRegistryContract(
     it('refuses a public client whose redirect URIs are not loopback http', async () => {
       const https = { ...publicClient, redirectUris: ['https://127.0.0.1/callback'] };
       await expect(registry.create(https)).rejects.toMatchObject({ status: 400 });
-      const remote = { ...publicClient, redirectUris: ['http://127.0.0.1/cb', 'http://acme/cb'] };
+      const remote = { ...publicClient, redirectUris: ['http://127.0.0.1/cb', 'https://acme/cb'] };
       await expect(registry.create(remote)).rejects.toMatchObject({ status: 400 });
       const ipv6 = { ...publicClient, redirectUris: ['http://[::1]:9/callback'] };
       expect(await registry.create(ipv6)).toEqual({ clientId: publicClient.clientId });

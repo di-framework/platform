@@ -1,10 +1,16 @@
 import { afterAll, describe, expect, it } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { createServer, type Server } from 'node:http';
+import { join } from 'node:path';
+import { spawnEnv } from '../../../tests/helpers/spawn-env';
 import {
   ADMIN_SCOPE,
+  adminFetch,
   CLI_REDIRECT_URI,
   ensureTenantOAuthClients,
   HttpOAuthClientRegistry,
   identityAdminRegistry,
+  identityAdminUpstream,
   OAuthAdminError,
   OAuthClientConflict,
   OAuthClientNotFound,
@@ -12,20 +18,25 @@ import {
   OAuthClientRevoked,
   oauthAdminError,
   provisionerToken,
+  REQUEST_TIMEOUT_MS,
   removeTenantOAuthClients,
   storedConsoleSecret,
   TENANT_OAUTH_SCOPES,
   tenantOAuthClientIds,
   tenantOAuthClients,
   tenantOAuthOptions,
-  upstreamFetch,
 } from '../src/tenancy/oauth-clients';
 import { FakeIdentityAdmin } from './support/fake-identity-admin';
 import { describeOAuthClientRegistryContract } from './support/oauth-client-registry-contract';
 
 const servers: ReturnType<typeof Bun.serve>[] = [];
+const httpServers: Server[] = [];
 afterAll(() => {
   for (const server of servers) server.stop(true);
+  for (const server of httpServers) {
+    server.closeAllConnections();
+    server.close();
+  }
 });
 
 /** Admin requests against `fake` through the HTTP handler, for the contract's raw cases. */
@@ -91,6 +102,27 @@ describeOAuthClientRegistryContract(
     };
   },
   { skip: !realServer.url || !realServer.token },
+);
+/**
+ * The contract through {@link identityAdminRegistry}, i.e. with the provisioner token minted by
+ * `client_credentials` as the controller does, against the same real server: set
+ * `IDENTITY_PROVISIONER_CLIENT_ID` and `IDENTITY_PROVISIONER_CLIENT_SECRET` as well.
+ */
+const realProvisioner = {
+  clientId: process.env.IDENTITY_PROVISIONER_CLIENT_ID,
+  clientSecret: process.env.IDENTITY_PROVISIONER_CLIENT_SECRET,
+};
+describeOAuthClientRegistryContract(
+  'identityAdminRegistry against a real identity server, as the provisioner client',
+  () => ({
+    registry: identityAdminRegistry({
+      issuer: realServer.url ?? '',
+      clientId: realProvisioner.clientId ?? '',
+      clientSecret: async () => realProvisioner.clientSecret ?? '',
+    }),
+    organizationSlug: process.env.IDENTITY_ADMIN_ORG,
+  }),
+  { skip: !realServer.url || !realProvisioner.clientId || !realProvisioner.clientSecret },
 );
 
 const tenant = { name: 'acme', uid: '0a1b2c3d-4e5f-6789-abcd-ef0123456789' };
@@ -502,30 +534,201 @@ describe('identity admin access', () => {
     expect(await token.get()).toBe('minted-2');
   });
 
-  it('sends requests to the upstream under the issuer’s Host', async () => {
-    const seen: { url: string; host: string | null; body: string }[] = [];
-    const fetcher = async (request: Request) => {
-      seen.push({
-        url: request.url,
-        host: request.headers.get('host'),
-        body: await request.text(),
-      });
-      return new Response(null, { status: 204 });
+  it('derives the upstream from issuerUpstream, else issuerIp with the issuer port', () => {
+    const base = {
+      image: `ghcr.io/di-framework/tenant-auth@sha256:${'a'.repeat(64)}`,
+      oauthClient: { id: 'provisioner', secretName: 'tenant-auth-oauth' },
     };
-    const upstream = upstreamFetch('gateway.wasmcloud.svc:8080', fetcher);
     const issuer = 'http://identity.localhost:28180';
-    await upstream(new Request(`${issuer}/oauth2/token`, { method: 'POST', body: 'a=1' }));
-    await upstream(new Request(`${issuer}/api/admin/oauth-clients/x`));
-    const host = 'identity.localhost:28180';
+    expect(identityAdminUpstream({ ...base, issuer })).toBeUndefined();
+    expect(identityAdminUpstream({ ...base, issuer, issuerUpstream: 'gw.wasmcloud.svc:80' })).toBe(
+      'gw.wasmcloud.svc:80',
+    );
+    const ip = '192.0.2.7';
+    expect(identityAdminUpstream({ ...base, issuer, issuerUpstream: 'gw:80', issuerIp: ip })).toBe(
+      'gw:80',
+    );
+    expect(identityAdminUpstream({ ...base, issuer, issuerIp: ip })).toBe('192.0.2.7:28180');
+    expect(identityAdminUpstream({ ...base, issuer: 'https://id.example', issuerIp: ip })).toBe(
+      '192.0.2.7:443',
+    );
+    expect(identityAdminUpstream({ ...base, issuer: 'http://id.example', issuerIp: ip })).toBe(
+      '192.0.2.7:80',
+    );
+  });
+
+  /** A `node:http` server that records the `Host` of every request and answers `status`. */
+  async function hostLogger(status = 204, address = '127.0.0.1') {
+    const seen: { method: string; path: string; host: string | undefined; body: string }[] = [];
+    const server = createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk) => {
+        body += chunk;
+      });
+      req.on('end', () => {
+        seen.push({ method: req.method ?? '', path: req.url ?? '', host: req.headers.host, body });
+        res.writeHead(status, {
+          'content-type': 'application/json',
+          'x-seen': String(seen.length),
+        });
+        res.end(status === 204 ? undefined : '{"ok":true}');
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, address, resolve));
+    httpServers.push(server);
+    return { seen, port: (server.address() as { port: number }).port };
+  }
+
+  it('sends requests to the upstream over node:http under the issuer’s Host', async () => {
+    const { seen, port } = await hostLogger();
+    const send = adminFetch({ upstream: `127.0.0.1:${port}` });
+    const issuer = 'http://identity.localhost:28180';
+    const token = await send(
+      new Request(`${issuer}/oauth2/token?x=1`, {
+        method: 'POST',
+        headers: { authorization: 'Basic abc' },
+        body: 'a=1',
+      }),
+    );
+    expect(token.status).toBe(204);
+    expect(token.headers.get('x-seen')).toBe('1');
+    const read = await send(new Request(`${issuer}/api/admin/oauth-clients/x`));
+    expect(read.status).toBe(204);
     expect(seen).toEqual([
-      { url: 'http://gateway.wasmcloud.svc:8080/oauth2/token', host, body: 'a=1' },
-      { url: 'http://gateway.wasmcloud.svc:8080/api/admin/oauth-clients/x', host, body: '' },
+      { method: 'POST', path: '/oauth2/token?x=1', host: 'identity.localhost:28180', body: 'a=1' },
+      {
+        method: 'GET',
+        path: '/api/admin/oauth-clients/x',
+        host: 'identity.localhost:28180',
+        body: '',
+      },
     ]);
-    // Without a port the scheme's default applies; an IPv6 upstream keeps its brackets.
-    await upstreamFetch('gateway', fetcher)(new Request(`${issuer}/x`));
-    await upstreamFetch('[::1]:9', fetcher)(new Request(`${issuer}/y`));
-    expect(seen.slice(2).map((s) => s.url)).toEqual(['http://gateway/x', 'http://[::1]:9/y']);
-    expect(upstreamFetch(undefined, fetcher)).toBe(fetcher);
+    // A body comes back as a Response body; an IPv6 upstream keeps its address.
+    const { seen: more, port: other } = await hostLogger(200, '::1');
+    const answered = await adminFetch({ upstream: `[::1]:${other}` })(new Request(`${issuer}/y`));
+    expect(await answered.json()).toEqual({ ok: true });
+    expect(more.map((s) => s.host)).toEqual(['identity.localhost:28180']);
+  });
+
+  it('runs under node: the Host reaches the upstream from the built module', () => {
+    // The platform controller runs on Node, whose fetch replaces an explicit Host with the
+    // connected host; the built module is exercised there, against a server that logs the Host.
+    const built = join(import.meta.dir, '../dist/tenancy/oauth-clients.js');
+    const script = `
+      const { createServer } = require('node:http');
+      const { identityAdminRegistry } = require(${JSON.stringify(built)});
+      const hosts = [];
+      const server = createServer((req, res) => {
+        hosts.push(req.method + ' ' + req.url + ' host=' + req.headers.host);
+        if (req.url === '/oauth2/token') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ access_token: 't', expires_in: 600 }));
+        } else res.writeHead(404).end();
+      });
+      server.listen(0, '127.0.0.1', async () => {
+        const registry = identityAdminRegistry({
+          issuer: 'http://identity.acme.localhost:28180',
+          upstream: '127.0.0.1:' + server.address().port,
+          clientId: 'provisioner',
+          clientSecret: async () => 'secret',
+        });
+        const client = await registry.get('tenant-x-console');
+        console.log(JSON.stringify({ node: process.version, client, hosts }));
+        // Node keeps the client connection alive; exit instead of waiting for it to close.
+        process.exit(0);
+      });
+    `;
+    const result = spawnSync('node', ['-e', script], { env: spawnEnv, encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    const output = JSON.parse(result.stdout.trim()) as {
+      node: string;
+      client: unknown;
+      hosts: string[];
+    };
+    expect(output.node).toStartWith('v');
+    expect(output.client).toBeUndefined();
+    expect(output.hosts).toEqual([
+      'POST /oauth2/token host=identity.acme.localhost:28180',
+      'GET /api/admin/oauth-clients/tenant-x-console host=identity.acme.localhost:28180',
+    ]);
+  });
+
+  it('limits every request and reports no answer as an admin error with status 0', async () => {
+    const hanging = adminFetch({ fetch: () => new Promise<Response>(() => {}), timeoutMs: 20 });
+    const slow = hanging(new Request('http://identity.test/api/admin/oauth-clients/x'));
+    await expect(slow).rejects.toBeInstanceOf(OAuthAdminError);
+    await expect(slow).rejects.toMatchObject({ status: 0 });
+    const hangingUpstream = createServer(() => {});
+    await new Promise<void>((resolve) => hangingUpstream.listen(0, '127.0.0.1', resolve));
+    httpServers.push(hangingUpstream);
+    const port = (hangingUpstream.address() as { port: number }).port;
+    const stuck = adminFetch({ upstream: `127.0.0.1:${port}`, timeoutMs: 20 });
+    await expect(stuck(new Request('http://identity.test/oauth2/token'))).rejects.toThrow(
+      'POST http://identity.test/oauth2/token: timed out after 20 ms'.replace('POST', 'GET'),
+    );
+    const refused = adminFetch({ upstream: '127.0.0.1:1' });
+    await expect(refused(new Request('http://identity.test/x'))).rejects.toMatchObject({
+      status: 0,
+      message: expect.stringContaining('GET http://identity.test/x: '),
+    });
+    const failing = adminFetch({
+      fetch: async () => {
+        throw new TypeError('fetch failed');
+      },
+    });
+    await expect(failing(new Request('http://identity.test/x'))).rejects.toThrow(
+      'GET http://identity.test/x: fetch failed',
+    );
+    // The default limit applies to the plain fetch path: the request carries a timeout signal.
+    let signal: AbortSignal | null = null;
+    const plain = adminFetch({
+      fetch: async (request) => {
+        signal = request.signal;
+        return new Response(null, { status: 204 });
+      },
+    });
+    await plain(new Request('http://identity.test/x'));
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(REQUEST_TIMEOUT_MS).toBe(10_000);
+  });
+
+  it('reports a registry call or token mint that gets no answer as an admin error', async () => {
+    const registry = new HttpOAuthClientRegistry({
+      baseUrl: 'http://identity.test',
+      token: () => 't',
+      fetch: async () => {
+        throw new TypeError('fetch failed');
+      },
+    });
+    const failure = registry.get('x');
+    await expect(failure).rejects.toBeInstanceOf(OAuthAdminError);
+    await expect(failure).rejects.toMatchObject({
+      status: 0,
+      message: 'GET http://identity.test/api/admin/oauth-clients/x: fetch failed',
+    });
+    const token = provisionerToken({
+      issuer: 'http://identity.test',
+      clientId: 'p',
+      clientSecret: async () => 's',
+      fetch: async () => {
+        throw new TypeError('fetch failed');
+      },
+    });
+    await expect(token.get()).rejects.toMatchObject({
+      status: 0,
+      message: 'POST http://identity.test/oauth2/token: fetch failed',
+    });
+    // An error the transport already typed passes as it is.
+    const typed = provisionerToken({
+      issuer: 'http://identity.test',
+      clientId: 'p',
+      clientSecret: async () => 's',
+      fetch: async () => {
+        throw new OAuthAdminError(0, 'already typed');
+      },
+    });
+    await expect(typed.get()).rejects.toThrow('already typed');
   });
 
   it('builds the admin registry over the issuer, authenticated as the provisioner client', async () => {
