@@ -635,7 +635,7 @@ describe('tenant and user resource reconciliation', () => {
     expect(
       [...api.objects.values()].filter((r) => r.metadata.labels?.[OWNER] === u.metadata.uid),
     ).toHaveLength(0);
-    expect(u.status?.serviceAccount).toBeNull();
+    expect(u.status?.serviceAccount).toBeUndefined();
   });
   it('reports Ready only once Kubernetes populates every token Secret', async () => {
     const { api, controller, t, u } = prepare();
