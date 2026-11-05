@@ -1,4 +1,7 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
+import { createServer as createHttpsServer } from 'node:https';
+import type { AddressInfo } from 'node:net';
+import { caCertificate, leafCertificate } from '../../platform/src/tenancy/tls.ts';
 import {
   Controller,
   configFromEnv,
@@ -280,6 +283,49 @@ describe('registry listeners', () => {
       });
     }
     expect(hosts.requests.length).toBe(before);
+  });
+
+  describe('over TLS to the hosts (platform#113 :https-hop)', () => {
+    const ca = caCertificate('hosts test CA', 1);
+    const leaf = leafCertificate('di-http', ['localhost'], ['127.0.0.1'], 1, ca.cert, ca.key);
+    const secure = createHttpsServer({ cert: leaf.cert, key: leaf.key }, (req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end(`tls ${req.headers.host} ${req.method} ${req.url}`);
+    });
+    let origin = '';
+    beforeAll(async () => {
+      await new Promise<void>((resolve) => secure.listen(0, '127.0.0.1', resolve));
+      origin = `https://127.0.0.1:${(secure.address() as AddressInfo).port}`;
+    });
+    afterAll(() => secure.close());
+    const front = (tls?: { ca: string }) => {
+      const through = new Controller(
+        config,
+        {} as never,
+        { issuer: 'https://issuer.test' } as never,
+        {} as never,
+        {} as never,
+      );
+      through.proxyUpstream = () => origin;
+      through.upstreamTls = tls;
+      return through.handleRegistry(
+        new Request('https://registry.acme.localhost/v2/app/tags/list', {
+          headers: { authorization: 'Basic eDpvaw==' },
+        }),
+      );
+    };
+
+    test('verifies the hosts with the configured CA bundle', async () => {
+      const response = await front({ ca: ca.cert });
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe('tls registry GET /v2/app/tags/list');
+    });
+
+    test('refuses hosts whose certificate the bundle does not cover: 502, nothing forwarded', async () => {
+      const response = await front();
+      expect(response.status).toBe(502);
+      expect(response.headers.get('content-type')).toBe('application/problem+json');
+    });
   });
 
   test('an unreachable registry is a 502 problem', async () => {

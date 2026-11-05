@@ -108,11 +108,14 @@ export class ProxySessions {
 export const proxySessions = new ProxySessions();
 
 /**
- * The tenant's HTTP upstream, as in `tenantUpstream` of `platform/src/gateway/gateway.ts`.
- * The controller needs NetworkPolicy egress to the hostgroup pods' port 9191 (platform#58).
+ * The tenant's HTTP upstream: the same `di-http` Service the platform gateway uses
+ * (`tenantUpstream` of `platform/src/gateway/gateway.ts`), on its TLS port (platform#113
+ * `:https-hop`), which the hosts' TLS front serves with the controller certificate. The
+ * controller needs NetworkPolicy egress to the hostgroup pods' port 9443 (platform#58) and
+ * verifies the front with `TENANT_CONTROLLER_HOST_CA`.
  */
 export const tenantUpstream = (tenant: string) =>
-  `http://di-http.di-runtime-${tenant}.svc.cluster.local:80`;
+  `https://di-http.di-runtime-${tenant}.svc.cluster.local:443`;
 
 /**
  * Caller headers never forwarded to a service: credentials, identity, workload control,
@@ -239,6 +242,8 @@ export interface PassthroughOptions {
   tenant: string;
   principal: Principal;
   upstream: string;
+  /** How `upstream` is verified (platform#113): the tenant CA bundle. Unset: the system roots. */
+  tls?: { ca: string };
   audit(event: string, fields?: Record<string, unknown>): void;
   sessions?: ProxySessions;
   /** The idle timeout: how long the service may stay silent. */
@@ -300,7 +305,8 @@ export async function servePassthrough(
       // Pass encoded bytes through with their Content-Encoding intact.
       decompress: false,
       signal: idle.signal,
-    });
+      tls: options.tls,
+    } as RequestInit);
   } catch (error) {
     disarm();
     options.audit('request.failed', {

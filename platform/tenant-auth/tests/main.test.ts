@@ -43,6 +43,7 @@ describe('controller main', () => {
   let started: Awaited<ReturnType<typeof controllerMain>>;
   const ports = { whoami: 0, front: 0, pull: 0 };
   let mainPort: number;
+  let caPem = '';
 
   beforeAll(async () => {
     api = serve(() => json({}));
@@ -52,6 +53,8 @@ describe('controller main', () => {
     const leaf = leafCertificate('localhost', ['localhost'], ['127.0.0.1'], 1, ca.cert, ca.key);
     writeFileSync(join(dir, 'tls.crt'), leaf.cert);
     writeFileSync(join(dir, 'tls.key'), leaf.key);
+    writeFileSync(join(dir, 'ca.crt'), ca.cert);
+    caPem = ca.cert;
     for (const name of Object.keys(ports) as (keyof typeof ports)[]) ports[name] = freePort();
     started = await controllerMain(
       controllerConfig({
@@ -67,9 +70,14 @@ describe('controller main', () => {
         TENANT_CONTROLLER_REGISTRY_FRONT_PORT: String(ports.front),
         TENANT_CONTROLLER_REGISTRY_PULL_PORT: String(ports.pull),
         TENANT_CONTROLLER_REGISTRY_PULL_TLS: 'false',
+        TENANT_CONTROLLER_HOST_CA: join(dir, 'ca.crt'),
       }),
     );
     mainPort = started.server.port as number;
+  });
+
+  test('reads the hosts’ CA bundle once at start (platform#113)', () => {
+    expect(started.controller.upstreamTls).toEqual({ ca: caPem });
   });
 
   afterAll(async () => {

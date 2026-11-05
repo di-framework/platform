@@ -134,6 +134,12 @@ export interface ControllerConfig {
    * listener answers it as a pull-only principal. Read on every call, so rotation needs no restart.
    */
   hostPullTokenFile?: string;
+  /**
+   * PEM bundle file the registry front and the service proxy verify the tenant hosts' TLS front
+   * with (`TENANT_CONTROLLER_HOST_CA`, platform#113 `:https-hop`): the tenant CA, plus the other
+   * CA during a rotation. Read once at start. Unset: the system roots only.
+   */
+  hostCa?: string;
 }
 
 /** The whoami listener serves `GET` only, so it never needs a request body. */
@@ -588,6 +594,7 @@ export function configFromEnv(env = process.env): ControllerConfig {
     ),
     registryPullHost: env.TENANT_CONTROLLER_REGISTRY_PULL_HOST || undefined,
     hostPullTokenFile: env.TENANT_CONTROLLER_HOST_PULL_TOKEN_FILE || undefined,
+    hostCa: env.TENANT_CONTROLLER_HOST_CA || undefined,
   };
 }
 
@@ -734,8 +741,13 @@ export function parseSideContentLength(value: string | null): string | undefined
 
 export class Controller {
   private readonly serviceAccountTokens = new Map<string, { token: string; expiresAt: number }>();
-  /** Where proxy sessions forward to; only overridden by tests. */
+  /** Where proxy sessions and the registry front forward to; only overridden by tests. */
   proxyUpstream: (tenant: string) => string = tenantUpstream;
+  /**
+   * How that upstream is verified (platform#113 `:https-hop`): the CA bundle of `hostCa`, which
+   * `main` reads. Unset, the system roots only.
+   */
+  upstreamTls?: { ca: string };
   private readonly discovery: BackgroundDiscovery;
   /** Resolves once the issuer has been discovered (or the controller was stopped). */
   readonly discovered: Promise<void>;
@@ -900,6 +912,7 @@ export class Controller {
           tenant: this.config.tenant,
           principal,
           upstream: this.proxyUpstream(this.config.tenant),
+          tls: this.upstreamTls,
           audit: (event, fields) => this.audit(event, fields),
           clientAddress,
         });
@@ -1137,6 +1150,7 @@ export class Controller {
         redirect: 'manual',
         decompress: false,
         signal,
+        tls: this.upstreamTls,
       } as RequestInit);
     let upstream: Response;
     try {
@@ -1427,6 +1441,8 @@ export class Controller {
 /** The process entry point: starts the controller from `config` and binds its listeners. */
 export async function main(config: ControllerConfig) {
   const controller = await Controller.start(config);
+  // The hosts' TLS front is verified with the tenant CA bundle (platform#113), read once.
+  if (config.hostCa) controller.upstreamTls = { ca: readFileSync(config.hostCa, 'utf8') };
   const tls =
     config.tlsCert && config.tlsKey
       ? { cert: readFileSync(config.tlsCert, 'utf8'), key: readFileSync(config.tlsKey, 'utf8') }

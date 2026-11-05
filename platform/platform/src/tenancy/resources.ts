@@ -236,6 +236,20 @@ const DEFAULT_REGISTRY_URL = `https://localhost:${REGISTRY_FRONT_PORT}`;
  * allow plain HTTP only for the registries in `insecureRegistries` (#149), never this one.
  */
 export const REGISTRY_PULL_PORT = 8791;
+/**
+ * The TLS front of the tenant hosts' HTTP port (#113 `:https-hop`): a sidecar in each host pod
+ * that terminates TLS with the controller certificate and relays to wash's listener on loopback.
+ * The controller's registry front and service proxy reach the hosts only through it.
+ */
+export const HOST_TLS_PORT = 9443;
+/** The `di-http` Service port that targets {@link HOST_TLS_PORT}. */
+export const HOST_TLS_SERVICE_PORT = 443;
+/** Where the TLS front sidecar reads the controller leaf and key. */
+const HOST_TLS_MOUNT = '/host-tls';
+/** The name the controller reaches the hosts' TLS front by, which the controller certificate names. */
+export function hostHttpService(tenant: string): string {
+  return `di-http.${names(tenant).runtimeNamespace}.svc`;
+}
 /** The Service hosts pull through: `<REGISTRY_PULL_SERVICE>.di-runtime-<tenant>.svc`. */
 export const REGISTRY_PULL_SERVICE = 'tenant-registry';
 /**
@@ -364,6 +378,15 @@ export interface RegistryNats {
  */
 export interface HostPull {
   caDigest?: string;
+}
+/**
+ * The hosts' TLS front (#113 `:https-hop`), rendered while tenant-auth is configured and the
+ * controller leaf exists: the sidecar serves the leaf and key of `tenant-controller-tls`, which
+ * names `di-http`. `leafDigest` is the leaf's digest; the sidecar loads it once at start, so a
+ * renewed leaf rolls the hosts.
+ */
+export interface HostHttpTls {
+  leafDigest: string;
 }
 const TENANT_AUTH_IMAGE = /^[^@\s]+@sha256:[0-9a-f]{64}$/;
 /** Reject a tenant-auth config that would deploy an unpinned image or miss required fields. */
@@ -714,6 +737,11 @@ function routedTenantAuthUrls(tenant: string, cfg: ControllerConfig): Record<str
 }
 /** Container limits of one tenant-auth pair, counted on top of the tenant's own quota. */
 export const TENANT_AUTH_LIMITS = { cpu: '500m', memory: '448Mi' };
+/**
+ * Limits of the hosts' TLS front sidecar (#113 `:https-hop`), counted on top of the tenant's own
+ * quota with {@link TENANT_AUTH_LIMITS}: it runs only with tenant-auth.
+ */
+export const HOST_TLS_LIMITS = { cpu: '100m', memory: '64Mi' };
 /** Each suffix in thousandths of the base unit, so sums stay integers. */
 const units: Record<string, number> = {
   m: 1,
@@ -750,6 +778,8 @@ export const TENANT_HOST_SECRET = 'di-scheduler-host-tls';
 export const SCHEDULER_TLS_COPY = 'di-scheduler-tls';
 /** The host template annotation carrying the digest of the tenant CA the hosts trust. */
 export const REGISTRY_CA_ANNOTATION = `${GROUP}/registry-ca-sha256`;
+/** The host template annotation carrying the digest of the leaf the hosts' TLS front serves. */
+export const HOST_TLS_ANNOTATION = `${GROUP}/host-tls-sha256`;
 const INSTALLATION = `${GROUP}/installation`;
 const OWNER = `${GROUP}/owner-uid`;
 const TENANT = `${GROUP}/tenant`;
@@ -992,11 +1022,20 @@ function runtimeQuota(
   withMigration = false,
 ): Resource {
   const resources = tenant.spec.resources ?? {};
+  // The pair and the hosts' TLS front sidecar (#113), which runs only with tenant-auth.
   const cpu = withTenantAuth
-    ? addQuantity(resources.cpu ?? '2', TENANT_AUTH_LIMITS.cpu, 'm')
+    ? addQuantity(
+        addQuantity(resources.cpu ?? '2', TENANT_AUTH_LIMITS.cpu, 'm'),
+        HOST_TLS_LIMITS.cpu,
+        'm',
+      )
     : (resources.cpu ?? '2');
   const memory = withTenantAuth
-    ? addQuantity(resources.memory ?? '4Gi', TENANT_AUTH_LIMITS.memory, 'Mi')
+    ? addQuantity(
+        addQuantity(resources.memory ?? '4Gi', TENANT_AUTH_LIMITS.memory, 'Mi'),
+        HOST_TLS_LIMITS.memory,
+        'Mi',
+      )
     : (resources.memory ?? '4Gi');
   return resource(
     tenant,
@@ -1151,6 +1190,8 @@ function tenantResources(
   registryNats?: RegistryNats,
   /** Mounted keys `storage-mode` reserves when their directory is empty (#200). */
   storageReserve: string[] = [],
+  /** The hosts' TLS front (#113 `:https-hop`); absent, the hosts serve plain HTTP only. */
+  hostHttpTls?: HostHttpTls,
 ): Resource[] {
   const n = names(tenant.metadata.name);
   const storage = hostStorage(tenant, cfg, storageKeys, storageReserve);
@@ -1523,6 +1564,9 @@ function tenantResources(
                 // before it drops the previous user (#541 m4/m6e).
                 [SCHEDULER_TLS_ANNOTATION]: schedulerTls.digest,
                 ...(hostPull?.caDigest ? { [REGISTRY_CA_ANNOTATION]: hostPull.caDigest } : {}),
+                // The TLS front loads the controller leaf once at start (#113), so a renewed
+                // leaf rolls the hosts.
+                ...(hostHttpTls ? { [HOST_TLS_ANNOTATION]: hostHttpTls.leafDigest } : {}),
                 // A rotated registry password rolls the hosts (#159): the registry's pooled
                 // blobstore connection would reconnect with the password it read at first.
                 ...(registryAuth ? { [REGISTRY_NATS_AUTH_ANNOTATION]: registryAuth } : {}),
@@ -1634,6 +1678,37 @@ function tenantResources(
                     ...storage.volumeMounts,
                   ],
                 },
+                ...(hostHttpTls
+                  ? [
+                      {
+                        // The TLS front of the hosts' HTTP port (#113 `:https-hop`): socat
+                        // terminates TLS with the controller leaf, which names `di-http`, and
+                        // relays to wash's plain listener on loopback, so the controller's
+                        // registry front and service proxy never send a credential in clear.
+                        // wash's own listener stays plain for the gateway (`di-tenant-gateway`).
+                        name: 'http-tls',
+                        image: ISSUER_PROXY_IMAGE,
+                        args: [
+                          `OPENSSL-LISTEN:${HOST_TLS_PORT},fork,reuseaddr,cert=${HOST_TLS_MOUNT}/tls.crt,key=${HOST_TLS_MOUNT}/tls.key,verify=0`,
+                          'TCP:127.0.0.1:9191',
+                        ],
+                        ports: [{ name: 'https', containerPort: HOST_TLS_PORT }],
+                        readinessProbe: { tcpSocket: { port: 'https' } },
+                        resources: {
+                          requests: { cpu: '10m', memory: '16Mi' },
+                          limits: HOST_TLS_LIMITS,
+                        },
+                        securityContext: {
+                          allowPrivilegeEscalation: false,
+                          readOnlyRootFilesystem: true,
+                          capabilities: { drop: ['ALL'] },
+                        },
+                        volumeMounts: [
+                          { name: 'host-tls', mountPath: HOST_TLS_MOUNT, readOnly: true },
+                        ],
+                      },
+                    ]
+                  : []),
               ],
               volumes: [
                 { name: 'scheduler', secret: { secretName: TENANT_HOST_SECRET } },
@@ -1678,6 +1753,23 @@ function tenantResources(
                       },
                     ]
                   : []),
+                ...(hostHttpTls
+                  ? [
+                      {
+                        name: 'host-tls',
+                        // The controller leaf and key (#113); read by the TLS front only, never a
+                        // guest preopen. The hosts wait for the Secret rather than start without it.
+                        secret: {
+                          secretName: 'tenant-controller-tls',
+                          defaultMode: 0o440,
+                          items: [
+                            { key: 'tls.crt', path: 'tls.crt' },
+                            { key: 'tls.key', path: 'tls.key' },
+                          ],
+                        },
+                      },
+                    ]
+                  : []),
                 ...storage.volumes,
               ],
             },
@@ -1689,7 +1781,12 @@ function tenantResources(
       make('v1', 'Service', 'di-http', n.runtimeNamespace, {
         spec: {
           selector: { 'wasmcloud.com/hostgroup': n.hostgroup },
-          ports: [{ name: 'http', port: 80, targetPort: 9191 }],
+          ports: [
+            { name: 'http', port: 80, targetPort: 9191 },
+            ...(hostHttpTls
+              ? [{ name: 'https', port: HOST_TLS_SERVICE_PORT, targetPort: HOST_TLS_PORT }]
+              : []),
+          ],
         },
       }),
     );
@@ -1876,6 +1973,9 @@ function tenantControllerCertNames(
     registryWhoamiHost(tenant),
     `tenant-controller.${ns}.svc.cluster.local`,
     'localhost',
+    // The hosts' TLS front serves the same leaf (#113 `:https-hop`).
+    hostHttpService(tenant),
+    `${hostHttpService(tenant)}.cluster.local`,
   ];
   const ips: string[] = [];
   const host = URL.canParse(tenantControllerPublicUrl(tenant, auth))
@@ -2022,14 +2122,13 @@ function tenantAuthResources(
             labels: { app, [COMPONENT]: 'tenant-auth', [TENANT]: name },
             // The image reference rolls the pods; the digest is repeated here for operators. Both
             // binaries read the certificate (or CA) once at start, so its digest rolls the pair.
-            // The console also reads the trust bundle once and copies it into the kubeconfigs it
-            // issues, so a bundle change during a CA rotation (#170) rolls it too.
+            // Both also read the trust bundle once: the console copies it into the kubeconfigs it
+            // issues and the controller verifies the hosts' TLS front with it (#113), so a bundle
+            // change during a CA rotation (#170) rolls the pair too.
             annotations: {
               [`${GROUP}/image-digest`]: auth.image.split('@')[1],
               [`${GROUP}/tls-cert-sha256`]: tlsCertDigest(inputs.tls.cert),
-              ...(app === 'tenant-console'
-                ? { [CA_BUNDLE_ANNOTATION]: tlsCertDigest(controllerTrustBundle(inputs.tls)) }
-                : {}),
+              [CA_BUNDLE_ANNOTATION]: tlsCertDigest(controllerTrustBundle(inputs.tls)),
             },
           },
           spec: {
@@ -2082,6 +2181,8 @@ function tenantAuthResources(
                           mountPath: '/var/run/secrets/kubernetes.io/serviceaccount',
                           readOnly: true,
                         },
+                        // The trust bundle the controller verifies the hosts' TLS front with (#113).
+                        { name: 'ca', mountPath: '/ca', readOnly: true },
                       ]
                     : []),
                 ],
@@ -2107,7 +2208,12 @@ function tenantAuthResources(
             volumes: [
               { name: 'tmp', emptyDir: {} },
               { name: 'mounted', ...volume },
-              ...(app === 'tenant-controller' ? [serviceAccountVolume()] : []),
+              ...(app === 'tenant-controller'
+                ? [
+                    serviceAccountVolume(),
+                    { name: 'ca', configMap: { name: 'tenant-controller-ca' } },
+                  ]
+                : []),
             ],
           },
         },
@@ -2163,8 +2269,9 @@ function tenantAuthResources(
       ports: [{ protocol: 'TCP', port: issuerPort }],
     });
   egress.push(
-    // The service proxy (#56) reaches the tenant hosts through `di-http`; NetworkPolicy sees
-    // the pod port after the Service's DNAT, 9191.
+    // The service proxy (#56) and the registry front (#83) reach the tenant hosts through
+    // `di-http`'s TLS port only (#113 `:https-hop`); NetworkPolicy sees the pod port after the
+    // Service's DNAT. wash's plain listener (9191) is not admitted from the controller.
     {
       to: [
         {
@@ -2177,7 +2284,7 @@ function tenantAuthResources(
           },
         },
       ],
-      ports: [{ protocol: 'TCP', port: 9191 }],
+      ports: [{ protocol: 'TCP', port: HOST_TLS_PORT }],
     },
     {
       to: [
@@ -2431,6 +2538,9 @@ function tenantAuthResources(
         TENANT_CONTROLLER_PORT: '8788',
         TENANT_CONTROLLER_TLS_CERT: '/tls/tls.crt',
         TENANT_CONTROLLER_TLS_KEY: '/tls/tls.key',
+        // The trust bundle for the hosts' TLS front (#113 `:https-hop`): both CAs of a rotation,
+        // so a host still serving the previous leaf verifies while the hosts roll.
+        TENANT_CONTROLLER_HOST_CA: '/ca/ca.crt',
         ...(registry
           ? {
               // TLS only, with the certificate above (#113): plain HTTP is never served on it.
