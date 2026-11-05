@@ -87,7 +87,7 @@ jobs:
       pull-requests: read # find the PR a release commit was merged from
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
@@ -243,7 +243,7 @@ jobs:
       # No persisted credential: the push and the PR use BOT_PR_TOKEN in the last step only, and
       # the fetches in between are anonymous (the repository is public).
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false

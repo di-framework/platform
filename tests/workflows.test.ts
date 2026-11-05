@@ -810,13 +810,29 @@ describe('one Bun version across the repository (#608)', () => {
     expect(publish.find(isSetupBun)?.with?.['bun-version']).toBe(CI_BUN_VERSION);
   });
 
-  test('release.yml checks out by commit SHA in every job', () => {
-    for (const [name, job] of Object.entries(parse('.github/workflows/release.yml').jobs)) {
-      for (const step of job.steps ?? []) {
-        if (!step.uses?.startsWith('actions/checkout@')) continue;
-        expect(step.uses, name).toMatch(/^actions\/checkout@[0-9a-f]{40}$/);
+  test('every actions/checkout step in every workflow or composite action pins a commit SHA', () => {
+    const files = [
+      ...new Bun.Glob('.github/workflows/*.{yml,yaml}').scanSync({ cwd: repo }),
+      ...new Bun.Glob('.github/actions/*/action.{yml,yaml}').scanSync({ cwd: repo }),
+    ].sort();
+    const checked: string[] = [];
+    for (const file of files) {
+      const doc = Bun.YAML.parse(read(file)) as { jobs?: Record<string, Job>; runs?: Job };
+      const jobs = [
+        ...Object.entries(doc.jobs ?? {}),
+        ...(doc.runs ? [['runs', doc.runs] as const] : []),
+      ];
+      for (const [name, job] of jobs) {
+        for (const step of job.steps ?? []) {
+          if (!step.uses?.startsWith('actions/checkout@')) continue;
+          expect(step.uses, `${file} ${name}`).toMatch(/^actions\/checkout@[0-9a-f]{40}$/);
+          checked.push(file);
+        }
       }
     }
+    expect(checked).toContain('.github/workflows/release.yml');
+    expect(checked).toContain('.github/workflows/ci.yml');
+    expect(checked).toContain('.github/workflows/auto-tag.yml');
   });
 
   test('the image Dockerfiles build on that same Bun (#608 item 4)', () => {
