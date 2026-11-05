@@ -37,6 +37,7 @@ import {
 import { caCertificate, leafCertificate } from '../src/tenancy/tls';
 import { evaluate } from './support/cel';
 import { cutoverSeeds } from './support/cutover';
+import { FakeIdentityAdmin } from './support/fake-identity-admin';
 
 // #115: the platform controller writes tenant RBAC without `escalate` and binds only named Roles.
 // Everything below is computed from the objects the controller renders, so a new Role, binding
@@ -94,7 +95,11 @@ const inputs: TenantAuthInputs = {
   members: [member('alice'), member('bob'), member('carol', true)],
   apiServer: { addresses: ['10.0.0.1'], port: 6443 },
   tls: { ...leaf, caCert: ca.cert, caKey: ca.key },
-  clientSecret: 'c2VjcmV0',
+  oauthClients: {
+    consoleClientId: 'tenant-alpha-alphauid-console',
+    consoleClientSecret: 'c2VjcmV0',
+    cliClientId: 'tenant-alpha-alphauid-cli',
+  },
 };
 
 /** Every RBAC object the controller writes for these tenants and their members. */
@@ -812,7 +817,10 @@ describe('platform controller RBAC at runtime (#321)', () => {
         type: 'Opaque',
         data: { hash: Buffer.from(id).toString('base64') },
       });
-    return { api, controller: new Controller(api, config), tenants, users };
+    // The per-tenant OAuth clients (#59) go to a fake identity server, not through the API.
+    const identity = new FakeIdentityAdmin().registry();
+    const controller = new Controller(api, config, undefined, undefined, identity);
+    return { api, controller, tenants, users };
   }
   async function run() {
     const { api, controller, tenants, users } = setup();

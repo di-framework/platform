@@ -13,7 +13,7 @@ import {
 import {
   type Api,
   ApiError,
-  Controller,
+  Controller as BaseController,
   collection,
   registryNatsCondition,
 } from '../src/tenancy/controller';
@@ -63,7 +63,14 @@ import { caCertificate, leafCertificate } from '../src/tenancy/tls';
 import { HOST_MOUNT_ROOT, storagePatch } from '../src/tenancy/workload-storage';
 import { evaluate } from './support/cel';
 import { cutoverSeeds } from './support/cutover';
+import { FakeIdentityAdmin } from './support/fake-identity-admin';
 
+/** The controller under test, with the per-tenant OAuth clients (#59) in a fake identity server. */
+class Controller extends BaseController {
+  constructor(api: Api, cfg: ControllerConfig) {
+    super(api, cfg, undefined, undefined, new FakeIdentityAdmin().registry());
+  }
+}
 const PASSWORD = newRegistryNatsPassword();
 /** `value`, or a failed test when it is missing. */
 function must<T>(value: T | null | undefined, what: string): T {
@@ -184,7 +191,11 @@ const registryWorkload = (registryNats?: RegistryNatsMode) =>
       members: [{ name: 'alice', role: 'developer', suspended: false }],
       apiServer: { addresses: ['10.0.0.1'], port: 6443 },
       tls,
-      clientSecret: 'c2VjcmV0',
+      oauthClients: {
+        consoleClientId: 'tenant-alpha-alphauid-console',
+        consoleClientSecret: 'c2VjcmV0',
+        cliClientId: 'tenant-alpha-alphauid-cli',
+      },
       registryServing: true,
       ...(registryNats ? { registryNats } : {}),
     }),

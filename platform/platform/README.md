@@ -1624,7 +1624,7 @@ script is removed:
 tenantAuth:
   image: ghcr.io/di-framework/tenant-auth@sha256:8d0df56724551de54edcf2352e2d2f4856b2c10cbc67a031a511f3bc576e0bd0   # required, pinned by digest
   issuer: http://identity.acme.localhost:28180               # identity-server, as pods and browsers name it
-  oauthClient: { id: access, secretName: tenant-auth-oauth } # Secret in the platform namespace; key `clientSecret`
+  oauthClient: { id: provisioner, secretName: tenant-auth-oauth } # the identity server's provisioner client; its secret in a Secret in the platform namespace, key `clientSecret`
   issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80  # optional, for a loopback issuer
   issuerUpstreamPodPort: 8080                                # optional, the pod port behind it
   issuerIp: 192.0.2.7                                        # optional, when pods cannot resolve the issuer
@@ -1647,10 +1647,15 @@ tenantAuth:
   for the host and backing services. The tenant step keeps the base quota; only the tenant-auth step raises it,
   right before it applies the pair, and it lowers it again if the pair does not exist after a
   failed apply. Quota changes do not evict running pods.
-- OAuth client: until per-tenant clients (#59), every console shares one confidential client.
-  An administrator stores its secret in a Secret in the platform namespace; the reconcile
-  copies it into `tenant-console-oauth` in each runtime namespace. The controller never reads
-  the identity directory. Until that Secret exists the console Deployment cannot start.
+- OAuth clients (#59): each tenant gets two clients of its own in the identity server, registered
+  through its admin API as the provisioner client `tenantAuth.oauthClient` names (its secret is in
+  the platform-namespace Secret `tenantAuth.oauthClient.secretName`, key `clientSecret`): a
+  confidential client `tenant-<tenant>-<uid8>-console`, whose secret the reconcile writes to
+  Secret `tenant-console-oauth` in the runtime namespace (keys `clientId`, `clientSecret`) for the
+  console, and a public PKCE client `tenant-<tenant>-<uid8>-cli`, which the tenant controller
+  names to CLIs through `TENANT_CONTROLLER_CLI_CLIENT_ID`. A missing `tenant-console-oauth` gets
+  the console secret issued again; removal step R6 revokes both clients. Until the identity server
+  answers, `TenantAuthReady` is `False` with reason `OAuthClientError`.
 - RBAC: `di-tenant-controller-<tenant>` lets the controller ServiceAccount create tokens only
   for `di-user-<member>` of the tenant's active (not suspended, not deleted) members. The list
   is recomputed from the User CRs on every reconcile; with no members the Role has no rule.

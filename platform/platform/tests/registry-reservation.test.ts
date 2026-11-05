@@ -255,7 +255,11 @@ function renderedRegistryInterfaces(): HostInterfaceLike[] {
     members: [{ name: 'alice', role: 'developer', suspended: false }],
     apiServer: { addresses: ['10.0.0.1'], port: 6443 },
     tls,
-    clientSecret: 'c2VjcmV0',
+    oauthClients: {
+      consoleClientId: 'tenant-alpha-alphauid-console',
+      consoleClientSecret: 'c2VjcmV0',
+      cliClientId: 'tenant-alpha-alphauid-cli',
+    },
   }).find((r) => r.metadata.name === REGISTRY_WORKLOAD)!;
   return (rendered.spec as Workload['spec']).template.spec.hostInterfaces!;
 }
