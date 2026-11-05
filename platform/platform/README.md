@@ -768,7 +768,8 @@ its own NATS account and its own runtime operator.
 - Each Secret holds `tls.crt`, `tls.key` and `ca.crt`. Each client certificate carries a fresh
   16-hex issuance ID in its NATS user name, so a user name names exactly one certificate.
 - ConfigMap `di-scheduler-identities` in `<platform-ns>-scheduler-pki` records, per identity,
-  `current`, and during a renewal `previous` and `previousUntil`. No pod mounts it.
+  `current`, and during a renewal `previous`, `previousSince` and `previousUntil`. No pod mounts
+  it.
 - `di-scheduler-nats-accounts` is rendered from the Tenant list and that record on every pass. It is
   written only when its bytes change. The controller checks user names and their uniqueness first.
   A refused render is not written, so the previous file keeps serving. The Tenant then reports
@@ -805,10 +806,13 @@ Renewal and rotation:
   by a routine renewal so hosts roll onto it. The successor signs 30 days later, and only once
   every client Secret and the server carry it and no renewal still keeps its previous user (a
   host rollout is observed complete, or 1 day has passed since the renewal's overlap ended, after
-  which that host's Secret no longer holds it either); never in the pass that publishes it, even
-  when a late rotation finds less than 30 days left. Any other client Secret that never takes it
-  up delays the switch until 2 days before the old CA expires. While a due switch waits, the
-  controller logs once which holders it waits for. Then every leaf the
+  which that host's Secret no longer holds it either; while a host group still has ready pods on
+  the previous user, 30 days since the renewal instead; a renewal whose certificate never lands
+  holds at most 2 days, counted from the renewal as the record keeps it, so a controller restart
+  does not extend it); never in the pass that publishes it, even when a late rotation finds less
+  than 30 days left. Any other client Secret that never takes it up delays the switch until 2
+  days before the old CA expires. The platform identities pass alone checks the holders, once per
+  tick, and while a due switch waits it logs once which holders it waits for. Then every leaf the
   old CA signed, the server's included, is renewed once against the successor, and the old CA
   stays trusted until it expires, then leaves the bundles. A rotation the controller cannot write
   is logged once (the CA rotation write was refused and will be retried) and retried on every

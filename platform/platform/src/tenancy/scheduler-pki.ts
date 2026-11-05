@@ -284,10 +284,10 @@ export function readSchedulerCaSet(
  *    joins every trust bundle while the current CA still signs.
  * 2. **Switch.** Never in the pass that publishes the successor. Once it is `CA_OVERLAP_DAYS` old
  *    (sooner when the current CA has less than {@link LEAF_RENEW_DAYS} left) and `holdersTrust`
- *    (every client Secret's and the server's `ca.crt` carries it, see `loadSchedulerCas`), it
- *    signs and the old CA becomes `previous`; within `CA_SWITCH_DEADLINE_DAYS` of the current
- *    CA's expiry it signs whether or not they do. Every leaf the old CA signed is then renewed
- *    against the new one.
+ *    (every client Secret's and the server's `ca.crt` carries it and no renewal still holds it,
+ *    see `loadSchedulerCas`, which only the platform pass evaluates), it signs and the old CA
+ *    becomes `previous`; within `CA_SWITCH_DEADLINE_DAYS` of the current CA's expiry it signs
+ *    whether or not they do. Every leaf the old CA signed is then renewed against the new one.
  * 3. **Retire.** `previous` leaves the bundles when it expires.
  *
  * A successor that does not pass {@link schedulerCaFault} is dropped and a new one published. A
@@ -373,11 +373,13 @@ export function natsServerLeaf(namespace: string, platformCa: KeyPair, now: Date
 
 /**
  * One identity's entry in the record: its current issuance ID and, during a routine renewal, the
- * previous one and until when it is kept.
+ * previous one, since when it is kept (the pass that recorded the renewal; a pending issuance
+ * never moves it, #642) and until when.
  */
 export interface IdentityEntry {
   current: string;
   previous?: string;
+  previousSince?: string;
   previousUntil?: string;
 }
 /**
@@ -417,7 +419,9 @@ export function parseIdentityRecord(text: string): IdentityRecord {
       RECORD_KEY.test(key) &&
       typeof e === 'object' &&
       e !== null &&
-      Object.keys(e).every((field) => ['current', 'previous', 'previousUntil'].includes(field)) &&
+      Object.keys(e).every((field) =>
+        ['current', 'previous', 'previousSince', 'previousUntil'].includes(field),
+      ) &&
       typeof e.current === 'string' &&
       ISSUANCE_ID.test(e.current) &&
       (e.previous === undefined) === (e.previousUntil === undefined) &&
@@ -425,7 +429,12 @@ export function parseIdentityRecord(text: string): IdentityRecord {
         (typeof e.previous === 'string' &&
           ISSUANCE_ID.test(e.previous) &&
           typeof e.previousUntil === 'string' &&
-          !Number.isNaN(Date.parse(e.previousUntil))));
+          !Number.isNaN(Date.parse(e.previousUntil)))) &&
+      // Recorded only beside `previous`, by the pass that recorded the renewal (#642).
+      (e.previousSince === undefined ||
+        (e.previous !== undefined &&
+          typeof e.previousSince === 'string' &&
+          !Number.isNaN(Date.parse(e.previousSince))));
     if (!valid) throw new Error(`${SCHEDULER_IDENTITIES} has an invalid entry '${key}'`);
   }
   return value as IdentityRecord;
@@ -437,12 +446,13 @@ export function serializeIdentityRecord(record: IdentityRecord): string {
     Object.keys(record)
       .sort(codeUnitOrder)
       .map((key) => {
-        const { current, previous, previousUntil } = record[key] as IdentityEntry;
+        const { current, previous, previousSince, previousUntil } = record[key] as IdentityEntry;
         return [
           key,
           {
             current,
             ...(previous === undefined ? {} : { previous }),
+            ...(previousSince === undefined ? {} : { previousSince }),
             ...(previousUntil === undefined ? {} : { previousUntil }),
           },
         ];

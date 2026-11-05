@@ -54,6 +54,7 @@ const host = (o: Partial<HostObservation> = {}): HostObservation => ({
 const renewing = (untilMs: number): IdentityEntry => ({
   current: OLD,
   previous: PREV,
+  previousSince: at(untilMs - RENEWAL_OVERLAP_MS).toISOString(),
   previousUntil: at(untilMs).toISOString(),
 });
 
@@ -137,6 +138,7 @@ describe('scheduler identity routine renewal', () => {
       entry: {
         current: '0101010101010101',
         previous: OLD,
+        previousSince: '2026-10-29T12:00:00.000Z',
         previousUntil: '2026-10-29T12:10:00.000Z',
       },
       action: 'issue',
@@ -272,9 +274,42 @@ describe('scheduler identity renewal overlap: hosts', () => {
       const entry: IdentityEntry = { current: OLD, previous: PREV, previousUntil };
       expect(identityTransition(entry, operator(), now).entry).toEqual({ current: OLD });
       const h = identityTransition(entry, incomplete, now);
-      expect(h.entry).toEqual(entry);
+      // Without a readable previousUntil, `previousSince` is recorded as now (#642).
+      expect(h.entry).toEqual({ ...entry, previousSince: now.toISOString() });
       expect(h.stalled).toEqual({ type: RENEWAL_STALLED, deployment: 'hostgroup-tenant-a' });
     }
+  });
+
+  it('records previousSince from previousUntil for an entry that lacks it, and never moves it (#642)', () => {
+    // A renewal recorded before #642: `previousSince` is the issuance time its previousUntil was
+    // set from, written in the next pass that keeps the entry, so a restart does not re-time it.
+    const legacy: IdentityEntry = {
+      current: OLD,
+      previous: PREV,
+      previousUntil: at(RENEWAL_OVERLAP_MS).toISOString(),
+    };
+    const incomplete = host({
+      rollout: { deployment: 'hostgroup-tenant-a', digest: 'd0', complete: false },
+    });
+    const kept = identityTransition(legacy, incomplete, now);
+    expect(kept).toMatchObject({ action: 'keep', entry: renewing(RENEWAL_OVERLAP_MS) });
+    expect(identityTransition(legacy, operator(), now).entry).toEqual(renewing(RENEWAL_OVERLAP_MS));
+    // A pending issuance moves previousUntil on every pass, never previousSince.
+    const pending = identityTransition(
+      legacy,
+      operator({ secret: { ...fresh, id: PREV } }),
+      at(DAY),
+    );
+    expect(pending).toEqual({
+      entry: {
+        ...renewing(RENEWAL_OVERLAP_MS),
+        previousUntil: at(DAY + RENEWAL_OVERLAP_MS).toISOString(),
+      },
+      action: 'issue',
+      reason: 'pending',
+    });
+    // The rollout observed, everything beside `current` is dropped.
+    expect(identityTransition(renewing(1), host(), now).entry).toEqual({ current: OLD });
   });
 });
 
@@ -302,6 +337,7 @@ describe('scheduler identity pending issuance', () => {
     expect(renewal.entry).toEqual({
       current: '0101010101010101',
       previous: OLD,
+      previousSince: '2026-10-29T12:00:00.000Z',
       previousUntil: '2026-10-29T12:10:00.000Z',
     });
     const retry = identityTransition(
@@ -325,6 +361,7 @@ describe('scheduler identity pending issuance', () => {
     expect(retry.entry).toEqual({
       current: NEW,
       previous: OLD,
+      previousSince: '2026-10-29T12:00:00.000Z',
       previousUntil: '2026-10-29T12:25:00.000Z',
     });
     const landed = { notAfter: at(60 * DAY), digest: 'd2', id: NEW };
@@ -367,7 +404,7 @@ describe('scheduler identity pending issuance', () => {
     for (const o of [operator({ secret: old }), host({ secret: old, rollout: incomplete })]) {
       const t = identityTransition(renewing(-DAY), o, now);
       expect(t).toEqual({
-        entry: renewing(RENEWAL_OVERLAP_MS),
+        entry: { ...renewing(-DAY), previousUntil: at(RENEWAL_OVERLAP_MS).toISOString() },
         action: 'issue',
         reason: 'pending',
       });

@@ -30,9 +30,11 @@
  * - **CA rotation (#629).** {@link loadSchedulerCas} advances the rotation of both scheduler CAs
  *   first. A published successor joins the server's bundle at once and, through a renewal, each
  *   client's `ca.crt`; after the switch every leaf the old CA signed, the server's included, is
- *   re-signed by the new one. The switch waits until every holder carries the successor. A
- *   rotation that cannot be written is logged once and retried; renewal goes on under the CA that
- *   still signs.
+ *   re-signed by the new one. The switch waits until every holder carries the successor; this
+ *   pass is the one that reads the holders and switches (#642): the controller runs it once per
+ *   tick, after every tenant pass, so the gate is evaluated once per tick and sees the Secrets
+ *   the tick wrote. A rotation that cannot be written is logged once and retried; renewal goes on
+ *   under the CA that still signs.
  * - **Failures** are logged once per distinct message and retried on the next tick; nothing here
  *   retries within a tick, and a steady state writes nothing.
  *
@@ -51,7 +53,6 @@ import {
   loadSchedulerCas,
   observeIdentity,
   putIdentityRecord,
-  RenewalHolds,
   RotationFailureLog,
   type Stored,
 } from './scheduler-identities';
@@ -80,17 +81,17 @@ import {
 import {
   type IdentityObservation,
   type IdentityTransition,
+  PLATFORM_HOST_DEPLOYMENT,
   recordTransition,
+  SCHEDULER_DATA_TLS_ANNOTATION,
   SCHEDULER_TLS_ANNOTATION,
   schedulerCertDigest,
 } from './scheduler-pki-rotation';
 import { AccountsPropagation, type Propagation, PropagationWaits } from './scheduler-propagation';
 import { issuedBy, type KeyPair } from './tls';
 
-/** The chart's platform host group, which presents `platform/host` and `platform/data`. */
-export const PLATFORM_HOST_DEPLOYMENT = 'hostgroup-default';
-/** The pod-template annotation carrying the digest of the `platform/data` certificate. */
-export const SCHEDULER_DATA_TLS_ANNOTATION = 'platform.di-framework.dev/scheduler-data-tls-sha256';
+export { PLATFORM_HOST_DEPLOYMENT, SCHEDULER_DATA_TLS_ANNOTATION };
+
 /** The pod-template annotation each host-group role's certificate digest goes in. */
 const ROLL_ANNOTATIONS: Partial<Record<PlatformRole, string>> = {
   host: SCHEDULER_TLS_ANNOTATION,
@@ -129,7 +130,6 @@ export class PlatformSchedulerIdentities {
   private readonly waits = new PropagationWaits();
   private readonly waitLogged = new Set<string>();
   private readonly rotationLog = new RotationFailureLog('Platform scheduler identities');
-  private readonly holds = new RenewalHolds();
 
   constructor(
     private readonly api: IdentityApi,
@@ -183,7 +183,7 @@ export class PlatformSchedulerIdentities {
     const pki = schedulerPkiNamespace(namespace);
     if (!(await getIfExists(this.api, `/api/v1/namespaces/${pki}`))) return undefined;
     const now = this.now();
-    const loaded = await loadSchedulerCas(this.api, this.cfg, now, this.holds);
+    const loaded = await loadSchedulerCas(this.api, this.cfg, now);
     // Before the record is read, so a refused rotation is seen even without it.
     this.rotationLog.report(loaded);
     if ('reason' in loaded) return undefined;
