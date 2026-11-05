@@ -78,18 +78,15 @@ type R<T> = Result<T, ErrorCode>;
 
 /// Lets a deploy check that a composed provider really contains this layer;
 /// the section survives `wac plug`, which nests the component unchanged.
-/// `write-codec=N`: the codec this build creates new files with in XTS
-/// directories. 3 (#206) can only be read by builds that know codec 3.
-/// `read-codecs=2,3,4 integrity=1`: this build reads codec 4 and creates
-/// integrity directories from a reservation (#200, design note 9.3).
-/// Advisory: nothing parses the value yet.
+/// `read-codecs=2,3,4`: the codecs this build opens. A build can open every
+/// directory written by builds whose `write-codec` is in its list.
+/// `write-codec=3`: the codec new files get in XTS directories (#206).
+/// `integrity=1`: this build creates integrity directories from a reservation
+/// (#200, design note 9.3). Advisory: nothing parses the value yet.
 #[used]
 #[link_section = "di-framework:pglite-encfs"]
-static BUILD_MARKER: [u8; 70] = if cfg!(feature = "write-codec-3") {
-    *b"format=1 codec=aes-256-xts write-codec=3 read-codecs=2,3,4 integrity=1"
-} else {
-    *b"format=1 codec=aes-256-xts write-codec=2 read-codecs=2,3,4 integrity=1"
-};
+static BUILD_MARKER: [u8; 70] =
+    *b"format=1 codec=aes-256-xts write-codec=3 read-codecs=2,3,4 integrity=1";
 
 /// Not read by encfs: the platform chooses the mode with a reservation
 /// marker (design note 9.1). Its presence is only logged.

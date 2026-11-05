@@ -42,15 +42,8 @@ export async function ensureToolchain(ctx: Context): Promise<void> {
   }
 }
 
-/**
- * Build the component. The default writes codec 2 (rollback-safe, #206);
- * `writeCodec3` builds the opt-in variant, which goes to `outDir` instead of
- * dist/ so the published artifact stays the default one.
- */
-export async function build(
-  ctx: Context,
-  opts: { writeCodec3?: boolean; outDir?: string } = {},
-): Promise<string> {
+/** Build the component into dist/ (the published artifact). */
+export async function build(ctx: Context): Promise<string> {
   requireTools(ctx, ['wasm-tools']);
   await ensureToolchain(ctx);
   const { pkgDir } = ctx;
@@ -58,18 +51,15 @@ export async function build(
   // Reproducible paths in the artifact, as in ../pglite-component.
   const rustflags =
     `${ctx.env.RUSTFLAGS ?? ''} --remap-path-prefix=${pkgDir}=/di-framework-pglite-encfs --remap-path-prefix=${cargoHome}=/cargo`.trim();
-  const features = opts.writeCodec3 ? ['--features', 'write-codec-3'] : [];
-  const baseTarget = ctx.env.CARGO_TARGET_DIR ?? join(pkgDir, 'target');
-  // Separate target dir so the two variants never overwrite each other's core module.
-  const targetDir = opts.writeCodec3 ? join(baseTarget, 'write-codec-3') : baseTarget;
-  await $`cargo build --locked --release --target ${RUST_TARGET} ${features}`.env({
+  const targetDir = ctx.env.CARGO_TARGET_DIR ?? join(pkgDir, 'target');
+  await $`cargo build --locked --release --target ${RUST_TARGET}`.env({
     ...ctx.env,
     RUSTFLAGS: rustflags,
     CARGO_TARGET_DIR: targetDir,
   });
 
   const core = join(targetDir, RUST_TARGET, 'release', CORE_WASM);
-  const dist = opts.outDir ?? join(pkgDir, 'dist');
+  const dist = join(pkgDir, 'dist');
   await mkdir(dist, { recursive: true });
   const wasm = join(dist, WASM_FILE);
   await $`wasm-tools component new ${core} -o ${wasm}`;
@@ -93,7 +83,7 @@ export async function build(
     join(dist, 'BUILD-INFO.txt'),
     [
       `component:       di-framework:pglite-encfs@${version}`,
-      `format:          header v1, codec AES-256-XTS (4 KiB units), writes codec ${opts.writeCodec3 ? 3 : 2}`,
+      'format:          header v1, codec AES-256-XTS (4 KiB units), writes codec 3, reads 2, 3 and 4',
       'profile:         release',
       `built:           ${new Date().toISOString().replace(/\.\d+Z$/, 'Z')}`,
       `rustc:           ${rustc}`,

@@ -12,7 +12,7 @@
 //! A unit that ends mid-block (`len % 16 != 0`) is encoded by one of two
 //! codecs, chosen per file by the header's codec id ([`Codec`]):
 //!
-//! - **Codec 3, [`Codec::XtsTail`]** (written for new files since #206):
+//! - **Codec 3, [`Codec::XtsTail`]** (every new file, #206):
 //!   complete blocks are always plain XTS, without ciphertext stealing. The
 //!   trailing `len % 16` bytes are XORed with the length-independent keystream
 //!   block `AES_k2(unit ‖ block index ‖ "TAIL")` (see [`tail_input`]).
@@ -22,8 +22,8 @@
 //!   splits a block re-encrypts that block's durable partial bytes, at most 15.
 //!   Cost: the partial block is a deterministic XOR, so two versions of the same
 //!   tail block leak the XOR of their plaintexts.
-//! - **Codec 2, [`Codec::XtsStealing`]** (v1, still read and written for files
-//!   that carry it): a final partial unit of 16 bytes or more uses ciphertext
+//! - **Codec 2, [`Codec::XtsStealing`]** (v1; read, and written only to files
+//!   that already carry it): a final partial unit of 16 bytes or more uses ciphertext
 //!   stealing, and a unit shorter than one block is XORed with
 //!   `AES_k2(tweak(unit) ^ (0x80 | len) << 120)`. Both depend on the unit's
 //!   length, so a length change re-encrypts the last full block and the partial
@@ -65,13 +65,9 @@ pub enum Codec {
 }
 
 impl Codec {
-    /// The codec new files are created with: codec 2 unless the build has the
-    /// `write-codec-3` feature (every build reads both).
-    pub const NEW_FILES: Codec = if cfg!(feature = "write-codec-3") {
-        Codec::XtsTail
-    } else {
-        Codec::XtsStealing
-    };
+    /// The codec new files in an XTS directory are created with (#206). Codec
+    /// 2 is read, and written only to files that already carry it.
+    pub const NEW_FILES: Codec = Codec::XtsTail;
 
     /// The header's codec byte.
     pub fn id(self) -> u8 {
@@ -237,13 +233,8 @@ mod tests {
     }
 
     #[test]
-    fn codec_ids_round_trip_and_new_files_follow_the_feature() {
-        let expected = if cfg!(feature = "write-codec-3") {
-            Codec::XtsTail
-        } else {
-            Codec::XtsStealing
-        };
-        assert_eq!(Codec::NEW_FILES, expected);
+    fn codec_ids_round_trip_and_new_files_get_codec_3() {
+        assert_eq!(Codec::NEW_FILES, Codec::XtsTail);
         assert_eq!(Codec::XtsStealing.id(), 2);
         assert_eq!(Codec::XtsTail.id(), 3);
         assert_eq!(Codec::TwoSlotAead.id(), 4);
@@ -255,7 +246,7 @@ mod tests {
         for id in [0, 1, 5, 0xFF] {
             assert_eq!(Codec::from_id(id), None, "codec {id}");
         }
-        assert_eq!(cipher(1).codec(), expected);
+        assert_eq!(cipher(1).codec(), Codec::XtsTail);
     }
 
     #[test]

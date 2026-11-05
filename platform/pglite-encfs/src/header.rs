@@ -327,11 +327,7 @@ mod tests {
         // Swapping codec 3 for 2 (or back) would decode the tail differently;
         // the codec is in the AAD, so the wrap no longer opens.
         let mut bytes = *sealed().as_bytes();
-        bytes[9] = if Codec::NEW_FILES == Codec::XtsTail {
-            Codec::XtsStealing.id()
-        } else {
-            Codec::XtsTail.id()
-        };
+        bytes[9] = Codec::XtsStealing.id();
         let header = Header::parse(&bytes).unwrap();
         assert_eq!(header.open(&kek(1)).unwrap_err(), HeaderError::Tampered);
     }
