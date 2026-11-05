@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { request } from 'node:https';
 import { setTimeout } from 'node:timers/promises';
@@ -385,6 +385,25 @@ export function summarizeConflict(body: string): string | undefined {
 }
 /** The field manager for the controller's own patches (Tenant metadata, Deployments, Workloads). */
 const CONTROLLER_FIELD_MANAGER = 'di-platform-controller';
+/**
+ * How long the controller trusts its apply cache (#643) before it applies every managed object
+ * again: a drift the cache missed (an edit that left the resourceVersion the controller last saw,
+ * which the API server does not do) is repaired at the latest after this long.
+ */
+export const APPLY_RESYNC_INTERVAL_MS = 30 * 60_000;
+/** What the controller last applied to one managed object (#643). */
+type Applied = {
+  /** SHA-256 of the rendered apply body. */
+  hash: string;
+  /** The resourceVersion the apply returned; a live object past it was written by someone else. */
+  resourceVersion: string;
+  /** The object's owner and tenant labels, by which a Tenant generation change drops it. */
+  owner: string | undefined;
+  tenant: string | undefined;
+};
+function applyHash(value: Resource): string {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
 
 /** What {@link Controller.removeOwnedNamespace} found: gone, being deleted, or not this Tenant's. */
 type NamespaceRemoval = 'gone' | 'deleting' | 'foreign';
@@ -538,6 +557,20 @@ export class Controller {
   private readonly logCursors = new Map<string, Map<string, Map<string, string>>>();
   /** Last successful egress name resolution, kept so a failed lookup does not revoke. */
   private readonly egressAddresses = new Map<string, string[]>();
+  /**
+   * What was last applied to each managed object, by path (#643). {@link Controller.ensure} skips
+   * the server-side apply of an object whose rendered body is unchanged while the live object
+   * still holds the resourceVersion that apply returned; anything else (a changed body, an object
+   * written or deleted by someone else, a cache miss after a restart) is applied in full. A
+   * Tenant generation change drops its objects' entries, and every
+   * {@link APPLY_RESYNC_INTERVAL_MS} the whole cache is dropped, so drift repair never depends on
+   * the cache alone.
+   */
+  private readonly applied = new Map<string, Applied>();
+  /** When the apply cache was last dropped for a resync, by {@link Controller.now}. */
+  private lastApplyResync: number | undefined;
+  /** The generation of each Tenant the apply cache was last trusted for. */
+  private readonly appliedGenerations = new Map<string, number>();
   constructor(
     private readonly api: Api,
     private readonly cfg: ControllerConfig,
@@ -653,12 +686,28 @@ export class Controller {
       // roleRef is immutable. Remove the previous grant before changing roles.
       await this.remove(existing);
     }
-    return this.api.call<Resource>(
+    // Unchanged since the controller last applied it, and nobody else wrote it since (#643).
+    const hash = applyHash(value);
+    const last = this.applied.get(path);
+    if (
+      existing &&
+      last?.hash === hash &&
+      last.resourceVersion === existing.metadata.resourceVersion
+    )
+      return existing;
+    const applied = await this.api.call<Resource>(
       'PATCH',
       `${location(value)}?fieldManager=${CONTROLLER_FIELD_MANAGER}`,
       value,
       'application/apply-patch+yaml',
     );
+    this.applied.set(path, {
+      hash,
+      resourceVersion: applied.metadata.resourceVersion ?? '',
+      owner: value.metadata.labels?.[OWNER],
+      tenant: value.metadata.labels?.[TENANT],
+    });
+    return applied;
   }
   private async finalizer(value: Owned, add: boolean): Promise<void> {
     const old = value.metadata.finalizers ?? [];
@@ -3370,6 +3419,41 @@ export class Controller {
       if (!projected.has(name)) this.logWriteFailures.delete(name);
   }
 
+  /**
+   * Drop what the apply cache (#643) may no longer trust before this tick reconciles: everything
+   * once {@link APPLY_RESYNC_INTERVAL_MS} has passed since the last resync (or since start), the
+   * objects of every Tenant whose generation moved since the cache last saw it, and the entries
+   * of Tenants no longer listed.
+   */
+  private refreshApplyCache(tenants: readonly Tenant[]): void {
+    const now = this.now().getTime();
+    if (
+      this.lastApplyResync === undefined ||
+      now - this.lastApplyResync >= APPLY_RESYNC_INTERVAL_MS
+    ) {
+      this.applied.clear();
+      this.lastApplyResync = now;
+    }
+    const listed = new Map(tenants.map((tenant) => [tenant.metadata.name, tenant]));
+    for (const name of this.appliedGenerations.keys())
+      if (!listed.has(name)) this.appliedGenerations.delete(name);
+    const stale = new Set<string>();
+    for (const tenant of tenants) {
+      const generation = tenant.metadata.generation ?? 1;
+      if (this.appliedGenerations.get(tenant.metadata.name) !== generation) {
+        stale.add(tenant.metadata.name);
+        if (tenant.metadata.uid) stale.add(tenant.metadata.uid);
+      }
+      this.appliedGenerations.set(tenant.metadata.name, generation);
+    }
+    for (const [path, entry] of this.applied) {
+      const tenant = entry.tenant ?? '';
+      const owner = entry.owner ?? '';
+      if (stale.has(tenant) || stale.has(owner) || (tenant && !listed.has(tenant)))
+        this.applied.delete(path);
+    }
+  }
+
   /** Tenants already reported as missing from the LIST but found by GET (#474). */
   private readonly staleTenantsLogged = new Set<string>();
   /** Whether an empty Tenant LIST next to existing Users was already reported (#474). */
@@ -3449,6 +3533,7 @@ export class Controller {
     await this.recoverUnlistedTenants(tenants, users, services, bindings);
     const tenantByName = new Map(tenants.map((t) => [t.metadata.name, t]));
     this.forgetTenants(tenants);
+    this.refreshApplyCache(tenants);
     for (const value of [...tenants, ...users]) {
       try {
         if (value.kind === 'Tenant') await this.reconcileTenant(value as Tenant, users);
