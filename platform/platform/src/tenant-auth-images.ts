@@ -48,6 +48,8 @@ export const API_KEY_NAMESPACE_TENANT_AUTH_DIGESTS: readonly string[] = [
   'sha256:f7d3a56b7e7ec0e4641505b68634e8e0582e222620f84c3a802094977ada0897',
   // ghcr.io/di-framework/tenant-auth
   'sha256:8d0df56724551de54edcf2352e2d2f4856b2c10cbc67a031a511f3bc576e0bd0',
+  // ghcr.io/di-framework/tenant-auth
+  'sha256:350eeeed5cda78e4b2e3fb9f78a0779906434fa7c23813362aca8260adcf9c6d',
 ];
 
 /** Whether `image` is pinned by digest to one of `digests`. */
